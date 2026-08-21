@@ -1,0 +1,9 @@
+# Create batch_file with the checkpoint-compatible LeRobot preprocessing flow;
+# see docs/model_testing.md for the required tensor-key categories.
+[model]
+alias = "pi05-libero-finetuned"
+
+[request]
+batch_file = "assets/pi05_batch.pt"
+num_steps = 10
+prepare_graphs = false

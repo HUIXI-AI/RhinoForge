@@ -1,0 +1,9 @@
+# Replace the image path with a local RGB image.
+[model]
+alias = "qwen3-vl-2b"
+local_files_only = true
+
+[request]
+image = "assets/example.jpg"
+prompt = "Describe this image in one sentence."
+max_new_tokens = 32

@@ -1,0 +1,18 @@
+# This example returns normalized actions; it does not decode robot commands.
+[model]
+alias = "hy-embodied-0.5-vla-umi"
+dtype = "fp16"
+prefix_len = 240
+
+[request]
+images = [
+  "assets/top_head.jpg",
+  "assets/hand_left.jpg",
+  "assets/hand_right.jpg",
+]
+instruction = "Pick up the object on the table."
+state = [
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+]
+noise_seed = 0

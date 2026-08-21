@@ -1,0 +1,4 @@
+interface:
+  display_name: "RhinoForge Model Port"
+  short_description: "Assess and port inference models to RhinoForge"
+  default_prompt: "Use $rhinoforge-port to assess this model profile and identify the smallest verified porting path."

@@ -1,0 +1,7 @@
+# Replace the image path with a local RGB image.
+[model]
+alias = "dinov3-vit-b"
+local_files_only = true
+
+[request]
+image = "assets/example.jpg"

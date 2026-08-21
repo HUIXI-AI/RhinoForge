@@ -1,0 +1,9 @@
+# RhinoVLA construction and request preprocessing live in the model repository.
+[model]
+checkpoint = "models/rhinovla"
+runtime_factory = "your_package.runtime:create_rhino_vla_runtime"
+
+[runtime]
+
+[request]
+request_json = "requests/rhinovla.json"

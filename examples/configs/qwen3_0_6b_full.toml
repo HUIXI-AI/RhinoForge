@@ -1,0 +1,32 @@
+# Complete runner example. Runtime variables are applied before RhinoForge is
+# imported. See docs/runtime_config.md for every accepted variable.
+[runner]
+target = "causal_lm"
+
+[runner.env]
+RPU_LOG_LEVEL = 3
+RPU_WARMUP = 1
+
+[runner.torch_profile]
+enabled = false
+output = "profiles/qwen3_0_6b_torch.json"
+record_shapes = false
+profile_memory = false
+with_stack = false
+
+[runner.hw_profile]
+enabled = false
+output_dir = "profiles/qwen3_0_6b_hw"
+max_dumps = 32
+
+[rpu_execution.prefill]
+chunk_size = "auto"
+padding_budget = 64
+
+[model]
+alias = "qwen3-0.6b"
+local_files_only = true
+
+[generation]
+prompt = "Explain in one sentence what an inference backend does."
+max_new_tokens = 32

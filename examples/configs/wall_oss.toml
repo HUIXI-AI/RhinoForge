@@ -1,0 +1,18 @@
+# The checkpoint must include its processor and normalizer sidecars.
+[model]
+alias = "wall-oss-0.5"
+dataset_key = "berkeley_autolab_ur5"
+camera_names = ["face_view"]
+action_horizon = 32
+num_steps = 10
+max_seq_len = 2048
+
+[request]
+images = ["assets/front_camera.jpg"]
+instruction = "Pick up the object on the table."
+proprioception = [
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+]
+noise_seed = 0

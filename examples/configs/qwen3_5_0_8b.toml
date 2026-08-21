@@ -1,0 +1,8 @@
+# Paths are resolved from the directory where the command is run.
+[model]
+alias = "qwen3_5-0.8b"
+local_files_only = true
+
+[generation]
+prompt = "Explain in one sentence what an inference backend does."
+max_new_tokens = 32

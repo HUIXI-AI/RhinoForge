@@ -1,0 +1,73 @@
+[build-system]
+requires = [
+    "scikit-build-core>=0.12,<0.13",
+    "torch==2.10.0",
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "rhinoforge"
+version = "0.1.0"
+authors = [{name = "HUIXI-AI"}]
+description = "PyTorch inference backend and model deployment toolkit for the Rhino Processing Unit"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.12,<3.13"
+keywords = ["pytorch", "rpu", "inference", "transformers", "vla"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "huggingface-hub>=1.3,<2",
+    "numpy>=2.0,<2.3",
+    "safetensors>=0.4",
+    "torch==2.10.0",
+    "transformers==5.5.0",
+]
+
+[project.optional-dependencies]
+vision = [
+    "pillow>=11",
+    "torchvision==0.25.0",
+]
+vla = [
+    "diffusers==0.38.0",
+    "lerobot==0.6.1",
+    "omegaconf>=2.3,<3",
+    "pillow>=11",
+    "pyyaml>=6",
+    "scipy>=1.15,<2",
+    "torchvision==0.25.0",
+]
+dev = [
+    "build>=1.2",
+    "pytest>=8",
+]
+
+[tool.scikit-build]
+wheel.packages = ["python/rpu_backend"]
+build.verbose = true
+cmake.build-type = "Release"
+build.tool-args = ["-j24"]
+install.strip = true
+wheel.exclude = [
+    "tests/**",
+    "**/tests/**",
+    "debug/**",
+    "**/debug/**",
+    "**/*.pyc",
+    "**/*.bak*",
+    "**/*.log",
+]
+wheel.license-files = ["LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["python"]
+filterwarnings = ["error::pytest.PytestReturnNotNoneWarning"]

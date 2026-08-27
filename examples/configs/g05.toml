@@ -1,0 +1,23 @@
+# 单一完整模板 / Single complete template：注释行展示默认值，取消注释才覆盖运行时。
+# Public G0.5 integration boundary. Construct the policy with the pinned
+# OpenGalaxea implementation, then apply RhinoForge's continuous-action patch.
+[runner]
+target = "g05"
+
+[runner.env]
+RPU_LOG_LEVEL = 3 # 默认 3；允许 0..5；本入口只做配置/集成边界校验。
+# 其余 G0.5 profile 由官方模型仓库构造，RhinoForge 不猜测其参数。
+
+[runner.torch_profile]
+enabled = false # 默认 false；启用整次命令的 Torch profiler。
+output = "profiles/g05_torch.json" # 默认 profiles/torch_trace.json；Chrome trace 输出路径。
+record_shapes = false # 默认 false；记录算子输入 shape。
+profile_memory = false # 默认 false；记录内存事件。
+with_stack = false # 默认 false；记录 Python stack，开销更高。
+
+[model]
+alias = "g05-base"
+source = "OpenGalaxea/G05"
+revision = "e312be81e90c56a55bcb26b57429bd39a335b449"
+max_seq_len = 2048
+source_only_acknowledged = true

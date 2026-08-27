@@ -1,0 +1,76 @@
+# 单一完整模板 / Single complete template：注释行展示默认值，取消注释才覆盖运行时。
+# Complete Wall-OSS runner example. Profile selectors remain owned by the
+# policy; see the Wall-OSS section of docs/runtime_config.md before overriding.
+[runner]
+target = "wall_oss"
+
+[runner.env]
+# 通用参数 / Common。注释行给出默认值；取消注释才覆盖 facade 默认行为。
+RPU_LOG_LEVEL = 3 # 默认 3；允许 0..5；进程日志级别。
+# RPU_WARMUP = 0 # 默认 0；非负整数；模型构建后的预热 forward 次数。
+# RPU_MODEL_CACHE = "~/.cache/rhinoforge/models" # 默认模型别名缓存根目录。
+# HF_HOME / HF_HUB_CACHE / HUGGINGFACE_HUB_CACHE：默认继承 Hugging Face；自定义缓存位置时设置。
+# LKN_MAX_BATCH_ENTRIES = 65536 # 默认 65536；范围 1..4194304；Graph 提交容量。
+# LKN_KD_BUF_MB = 8 # 默认 8；范围 1..256 MiB；Graph 命令容量。
+# LKN_INSTR_BUF_MB = 64 # 默认 64；范围 1..1024 MiB；Graph 执行缓存容量。
+# RPU_KERNEL_LIB_PATH 由部署环境设置；runner 拒绝从 TOML 选择算子资产。
+# RPU_KVINSERT_V16 = true # 默认 true；允许 0/1；合法布局使用 16 行 KV insert，否则自动回退。
+RPU_WALL_OSS_FUSED_DENOISE = true # 全局默认 false，builder 默认 true；融合 action denoise。
+# RPU_WALL_OSS_DENOISE_UNROLL = true # 默认 true；全部 denoise step 录制为一个 Graph。
+# RPU_WALL_OSS_ATTN_TP8 = true # builder 默认 true；该 profile 的 8-core attention。
+# RPU_WALL_OSS_KVINSERT_PAD16 = true # 默认 true；prefix/KV 行对齐。
+# RPU_WALL_OSS_BATCH_VISION = true # 默认 true；合并兼容的同尺寸多图。
+# RPU_WALL_OSS_BATCH_MAX_SEQ = 768 # 默认 768；正整数；普通 Vision 合批序列上限。
+# RPU_WALL_OSS_DEVICE_PATCH_EMBED = true # 默认 true；RPU patch embedding。
+# RPU_WALL_OSS_FAST_PROCESSOR = true # 默认 true；自校验的快速 processor。
+# RPU_WALL_OSS_FAST_IMGPROC = true # 默认 true；直接 Torch 图像预处理。
+# RPU_WALL_OSS_PE_NORM_FOLD = true # 默认 true；快速图像路径折叠输入归一化。
+# RPU_WALL_OSS_ONDEVICE_EMBED = true # 默认 true；RPU 组装 token/vision embedding。
+# RPU_WALL_OSS_VISION_FUSED_MERGER = true # builder 默认 true；merger 纳入 Vision Graph。
+# RPU_WALL_OSS_VISION_ROPE_SPM = true # builder 默认 true；Vision RoPE 表保留在 SPM。
+# RPU_WALL_OSS_PARTIAL_MROPE = true # 默认 true 且模型要求开启；预计算多模态位置表。
+# RPU_WALL_OSS_FUSED_ASSEMBLE = true # builder 默认 true；合并 Vision reverse 与 assemble。
+# RPU_WALL_OSS_HOST_CACHE = true # 默认 true；缓存输入结构相关的主机中间量。
+# RPU_WALL_OSS_FAST_REPLAY = true # builder 默认 true；稳定签名下复用 Graph。
+# RPU_FASTREPLAY_SKIP_SYNC = true # builder 默认 true；仅与稳定 replay profile 配套。
+# RPU_DEEP_FAST_REPLAY = true # builder 默认 true；仅与稳定 replay profile 配套。
+# RPU_WALL_OSS_GENERIC_PROLOGUE = false # 默认 false；通用 LIBERO prompt；与 MULTISUITE 互斥。
+# RPU_WALL_OSS_MULTISUITE_PROLOGUE = false # 默认 false；四套件 prompt；与 GENERIC 互斥。
+# RPU_WALL_OSS_EXPERT0_DOWN_INT4 = true # 仅 W4A16 生效；默认 true；压缩 expert-0 down。
+
+[runner.torch_profile]
+enabled = false # 默认 false；启用整次命令的 Torch profiler。
+output = "profiles/wall_oss_torch.json" # 默认 profiles/torch_trace.json；Chrome trace 输出路径。
+record_shapes = false # 默认 false；记录算子输入 shape。
+profile_memory = false # 默认 false；记录内存事件。
+with_stack = false # 默认 false；记录 Python stack，开销更高。
+
+[rpu_execution.prefill]
+chunk_size = "auto" # 默认 auto；也可用满足模型约束的 16 倍数。
+padding_budget = 64 # 默认 64；非负整数；与 padding_rows 二选一。
+# padding_rows = "auto" # 默认 auto；也可指定非负整数；启用时删除 padding_budget。
+# Use padding_rows instead of padding_budget to request an exact row count.
+
+[rpu_execution.vision]
+chunk_size = "auto" # 默认 auto；也可用满足模型约束的 16 倍数。
+
+[rpu_execution.action]
+chunk_size = "auto" # 默认 auto；也可用满足模型约束的 16 倍数。
+
+[model]
+alias = "wall-oss-0.5"
+dataset_key = "berkeley_autolab_ur5"
+camera_names = ["face_view"]
+action_horizon = 32
+num_steps = 10
+max_seq_len = 2048
+
+[request]
+images = ["assets/front_camera.jpg"]
+instruction = "Pick up the object on the table."
+proprioception = [
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+]
+noise_seed = 0

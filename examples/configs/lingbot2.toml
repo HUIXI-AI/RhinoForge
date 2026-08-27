@@ -1,0 +1,76 @@
+# 单一完整模板 / Single complete template：注释行展示默认值，取消注释才覆盖运行时。
+# Public source-only LingBot-VLA-V2 example. This is not a Supported/GA or
+# robot-certified profile.
+[runner]
+target = "lingbot2"
+
+[runner.env]
+# 通用参数 / Common。注释行给出默认值；取消注释才覆盖 facade 默认行为。
+RPU_LOG_LEVEL = 3 # 默认 3；允许 0..5；进程日志级别。
+# RPU_WARMUP = 0 # 默认 0；非负整数；模型构建后的预热 forward 次数。
+# RPU_MODEL_CACHE = "~/.cache/rhinoforge/models" # 默认模型别名缓存根目录。
+# HF_HOME / HF_HUB_CACHE / HUGGINGFACE_HUB_CACHE：默认继承 Hugging Face；自定义缓存位置时设置。
+# LKN_MAX_BATCH_ENTRIES = 65536 # 默认 65536；范围 1..4194304；Graph 提交容量。
+# LKN_KD_BUF_MB = 8 # 默认 8；范围 1..256 MiB；Graph 命令容量。
+# LKN_INSTR_BUF_MB = 64 # 默认 64；范围 1..1024 MiB；Graph 执行缓存容量。
+# RPU_KERNEL_LIB_PATH 由部署环境设置；runner 拒绝从 TOML 选择算子资产。
+# RPU_KVINSERT_V16 = true # 默认 true；允许 0/1；合法布局使用 16 行 KV insert，否则自动回退。
+RPU_LINGBOT2_ALLOW_UNVALIDATED = true # 默认 false；进入受控评估。
+# RPU_LINGBOT2_DENOISE_UNROLL = true # generic/profile 默认 true。
+# RPU_LINGBOT2_EXPERT_REPLAY = true # facade 默认 true；expert replay。
+# RPU_LINGBOT2_FP16_TOP4 = true # facade 默认 true；FP16 top-4 router。
+# RPU_LINGBOT2_HOST_PREFIX_OPT = true # facade 默认 true；稳定 prefix owner/cache。
+# RPU_LINGBOT2_PREPROC = "exact" # 默认 exact；允许 exact,fast,legacy。
+# RPU_LINGBOT2_LEGACY_PREPROC = false # 默认 false；true 强制旧 preprocessing。
+# RPU_LINGBOT2_PREFILL_FAST_REPLAY = true # ordinary profile 默认 true。
+# RPU_LINGBOT2_VISION_FAST_REPLAY = true # ordinary profile 默认 true。
+# RPU_LINGBOT2_VLM_REPLAY = true # 默认随 HOST_PREFIX_OPT 开启。
+# 以下 selector 由 model.dtype profile 固定；列出用于版本定位，不要单独取消注释。
+# RPU_ADARMS_FUSED_BCAST = true # ordinary profile true；AdaRMS 广播融合。
+# RPU_KVINSERT_HYBRID_V16 = true # ordinary profile true；KV bulk+tail。
+# RPU_KVINSERT_HYBRID3_V16 = false # 默认 false；三段 KV insert profile selector。
+# RPU_LINGBOT2_ADARMS_DIRECT_SCHEDULE = false # 默认 false；与 DENOISE_UNROLL 互斥。
+# RPU_LINGBOT2_GROUPED_EXPERTS = true # ordinary W8 profile true；分组 expert 权重布局。
+# RPU_LINGBOT2_EXPERT_W8A16 = true # dtype=w8a16 时 true；expert 权重量化。
+# RPU_LINGBOT2_EXPERT_W4A16 = false # dtype=w4a16 时 true；与 W8 二选一。
+# RPU_LINGBOT2_BASE_W8A16 = true # W8/W4 profile true；共享 expert 权重量化。
+# RPU_LINGBOT2_PREFILL_W8A16 = true # W8/W4 profile true；prefill 权重量化。
+# RPU_LINGBOT2_PREFILL_W4A16 = false # 默认 false；保留的 sealed selector。
+# RPU_LINGBOT2_VISION_W8A16 = true # W8/W4 profile true；Vision 权重量化。
+# RPU_LINGBOT2_ENCODER_1THREAD = true # 默认 true；小型 host encoder 使用单线程。
+# RPU_LINGBOT2_QWEN3VL_BASE = "/path/to/qwen3-vl-4b-config" # 默认 registry；只读取 config。
+# RPU_QWEN3VL_VISION_BATCH = true # ordinary profile true。
+# RPU_QWEN3VL_VISION_BATCH_CAP = 3 # 默认 3；正整数；仅 Vision batch 开启时生效。
+# RPU_QWEN3VL_VISION_FUSED_MERGER = true # ordinary profile true；Vision Graph merger。
+# RPU_QWEN3VL_VISION_PATCH_EMBED_DEVICE = true # ordinary profile true。
+# RPU_QWEN3VL_VISION_ROPE_SPM = true # facade true；Vision RoPE 表留在 SPM。
+# RPU_WALL_OSS_FAST_REPLAY = true # FP16 profile fallback；稳定 Graph replay。
+# RPU_FASTREPLAY_SKIP_SYNC = true # 仅与稳定 replay profile 配套。
+
+[runner.torch_profile]
+enabled = false # 默认 false；启用整次命令的 Torch profiler。
+output = "profiles/lingbot2_torch.json" # 默认 profiles/torch_trace.json；Chrome trace 输出路径。
+record_shapes = false # 默认 false；记录算子输入 shape。
+profile_memory = false # 默认 false；记录内存事件。
+with_stack = false # 默认 false；记录 Python stack，开销更高。
+
+[model]
+alias = "lingbot-vla-v2-6b"
+dtype = "w8a16"
+n_cameras = 3
+image_size = 256
+max_lang_tokens = 72
+controlled_evaluation_acknowledged = true
+
+[request]
+images = [
+  "assets/top_head.jpg",
+  "assets/hand_left.jpg",
+  "assets/hand_right.jpg",
+]
+instruction = "Pick up the object on the table."
+proprioception = [
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+]
+noise_seed = 0

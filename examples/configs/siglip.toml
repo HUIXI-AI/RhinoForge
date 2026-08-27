@@ -1,0 +1,36 @@
+# 单一完整模板 / Single complete template：注释行展示默认值，取消注释才覆盖运行时。
+# Complete SigLIP component runner profile.
+[runner]
+target = "siglip"
+
+[runner.env]
+# 通用参数 / Common。注释行给出默认值；取消注释才覆盖 facade 默认行为。
+RPU_LOG_LEVEL = 3 # 默认 3；允许 0..5；进程日志级别。
+# RPU_WARMUP = 0 # 默认 0；非负整数；模型构建后的预热 forward 次数。
+# RPU_MODEL_CACHE = "~/.cache/rhinoforge/models" # 默认模型别名缓存根目录。
+# HF_HOME / HF_HUB_CACHE / HUGGINGFACE_HUB_CACHE：默认继承 Hugging Face；自定义缓存位置时设置。
+# LKN_MAX_BATCH_ENTRIES = 65536 # 默认 65536；范围 1..4194304；Graph 提交容量。
+# LKN_KD_BUF_MB = 8 # 默认 8；范围 1..256 MiB；Graph 命令容量。
+# LKN_INSTR_BUF_MB = 64 # 默认 64；范围 1..1024 MiB；Graph 执行缓存容量。
+# RPU_KERNEL_LIB_PATH 由部署环境设置；runner 拒绝从 TOML 选择算子资产。
+# RPU_PI05_SIGLIP_GRAPH = true # 默认 true；SigLIP encoder 使用 GraphCache。
+# RPU_PI05_SIGLIP_BATCH = true # 默认 true；合并兼容的多图输入。
+# RPU_PI05_SIGLIP_W8A16 = true # 默认按 bundle dtype 自动；仅用于有独立身份的 W8A16 bundle。
+# RPU_PI05_SIGLIP_W8A16_SCOPE = "all" # 默认 all；允许 all,row,out,fc2,none。
+# RPU_PI05_EMBED_PREFIX_PATCH = true # 默认 true；安装 SigLIP/Pi0.5 prefix patch。
+
+[runner.torch_profile]
+enabled = false # 默认 false；启用整次命令的 Torch profiler。
+output = "profiles/siglip_torch.json" # 默认 profiles/torch_trace.json；Chrome trace 输出路径。
+record_shapes = false # 默认 false；记录算子输入 shape。
+profile_memory = false # 默认 false；记录内存事件。
+with_stack = false # 默认 false；记录 Python stack，开销更高。
+
+[rpu_execution.vision]
+chunk_size = "auto" # 默认 auto；也可用满足模型约束的 16 倍数。
+
+[model]
+alias = "pi05-libero-finetuned"
+
+[request]
+images = ["assets/example.ppm"]

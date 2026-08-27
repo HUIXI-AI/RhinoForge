@@ -1,0 +1,119 @@
+{
+  "schema": "rhinoforge-public-models-v1",
+  "release": "1.0.0",
+  "scope": "Official public upstream identities used by RhinoForge source integrations. This file does not identify private, customer-supplied, or derived quantized assets.",
+  "models": [
+    {
+      "profile": "qwen3-0.6b",
+      "checkpoint": {"repository": "Qwen/Qwen3-0.6B", "revision": "c1899de289a04d12100db370d81485cdf75e47ca", "access": "public", "license": "Apache-2.0", "format": "safetensors"}
+    },
+    {
+      "profile": "qwen3-1.7b",
+      "checkpoint": {"repository": "Qwen/Qwen3-1.7B", "revision": "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e", "access": "public", "license": "Apache-2.0", "format": "safetensors"}
+    },
+    {
+      "profile": "qwen3-4b",
+      "checkpoint": {"repository": "Qwen/Qwen3-4B", "revision": "1cfa9a7208912126459214e8b04321603b3df60c", "access": "public", "license": "Apache-2.0", "format": "safetensors"}
+    },
+    {
+      "profile": "qwen3-8b",
+      "checkpoint": {"repository": "Qwen/Qwen3-8B", "revision": "b968826d9c46dd6066d109eabc6255188de91218", "access": "public", "license": "Apache-2.0", "format": "safetensors"}
+    },
+    {
+      "profile": "qwen3-14b",
+      "checkpoint": {"repository": "Qwen/Qwen3-14B", "revision": "40c069824f4251a91eefaf281ebe4c544efd3e18", "access": "public", "license": "Apache-2.0", "format": "safetensors"}
+    },
+    {
+      "profile": "qwen3-32b",
+      "checkpoint": {"repository": "Qwen/Qwen3-32B", "revision": "9216db5781bf21249d130ec9da846c4624c16137", "access": "public", "license": "Apache-2.0", "format": "safetensors"}
+    },
+    {
+      "profile": "qwen3.5-0.8b-text-and-vision",
+      "checkpoint": {"repository": "Qwen/Qwen3.5-0.8B", "revision": "2fc06364715b967f1860aea9cf38778875588b17", "access": "public", "license": "Apache-2.0", "format": "safetensors"}
+    },
+    {
+      "profile": "qwen3.5-2b-text-and-vision",
+      "checkpoint": {"repository": "Qwen/Qwen3.5-2B", "revision": "15852e8c16360a2fea060d615a32b45270f8a8fc", "access": "public", "license": "Apache-2.0", "format": "safetensors"}
+    },
+    {
+      "profile": "qwen3.5-4b-text-and-vision",
+      "checkpoint": {"repository": "Qwen/Qwen3.5-4B", "revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a", "access": "public", "license": "Apache-2.0", "format": "safetensors"}
+    },
+    {
+      "profile": "qwen3.5-9b-text-and-vision",
+      "checkpoint": {"repository": "Qwen/Qwen3.5-9B", "revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a", "access": "public", "license": "Apache-2.0", "format": "safetensors"}
+    },
+    {
+      "profile": "qwen3-vl-2b-instruct",
+      "checkpoint": {"repository": "Qwen/Qwen3-VL-2B-Instruct", "revision": "89644892e4d85e24eaac8bacfd4f463576704203", "access": "public", "license": "Apache-2.0", "format": "safetensors"}
+    },
+    {
+      "profile": "qwen3-vl-4b-instruct",
+      "checkpoint": {"repository": "Qwen/Qwen3-VL-4B-Instruct", "revision": "ebb281ec70b05090aa6165b016eac8ec08e71b17", "access": "public", "license": "Apache-2.0", "format": "safetensors"}
+    },
+    {
+      "profile": "qwen3-vl-8b-instruct",
+      "checkpoint": {"repository": "Qwen/Qwen3-VL-8B-Instruct", "revision": "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b", "access": "public", "license": "Apache-2.0", "format": "safetensors"}
+    },
+    {
+      "profile": "qwen3-vl-32b-instruct",
+      "checkpoint": {"repository": "Qwen/Qwen3-VL-32B-Instruct", "revision": "0cfaf48183f594c314753d30a4c4974bc75f3ccb", "access": "public", "license": "Apache-2.0", "format": "safetensors"}
+    },
+    {
+      "profile": "llama-3.2-1b",
+      "checkpoint": {"repository": "meta-llama/Llama-3.2-1B", "revision": "4e20de362430cd3b72f300e6b0f18e50e7166e08", "access": "manual-gated", "license": "Llama 3.2 Community License", "format": "safetensors"}
+    },
+    {
+      "profile": "pi0.5-base",
+      "checkpoint": {"repository": "lerobot/pi05_base", "revision": "b211f3d44c36b6acfcf7ae94a64e8e96f75a64ba", "access": "public", "license": "Gemma terms", "format": "safetensors-and-config"},
+      "implementation": {"repository": "huggingface/lerobot", "revision": "7e241bd630a3719a56157a497ce5d08f244784f1", "ref": "v0.6.1", "license": "Apache-2.0"}
+    },
+    {
+      "profile": "pi0.5-libero-v044",
+      "checkpoint": {"repository": "lerobot/pi05_libero_finetuned_v044", "revision": "8e174154ef5f6c60a8da12ae99c303d8963138c1", "access": "public", "license": "Gemma terms", "format": "safetensors-and-config"},
+      "implementation": {"repository": "huggingface/lerobot", "revision": "7e241bd630a3719a56157a497ce5d08f244784f1", "ref": "v0.6.1", "license": "Apache-2.0"}
+    },
+    {
+      "profile": "wall-oss-0.5",
+      "checkpoint": {"repository": "x-square-robot/wall-oss-0.5", "revision": "b7dc23a82dbf70a65859c9fdd596703234597028", "access": "public", "license": "not-declared-by-checkpoint-repository", "format": "safetensors-with-pytorch-pickle-normalizers"},
+      "implementation": {"repository": "X-Square-Robot/wall-x", "revision": "356bc45391c434f22a22f17bd1d0acd56f2acc87", "license": "Apache-2.0"}
+    },
+    {
+      "profile": "hy-embodied-0.5-vla-umi",
+      "checkpoint": {"repository": "tencent/Hy-Embodied-0.5-VLA-UMI", "revision": "3f53d1f8d2bc587c523cfdc9f1041ceee42c2524", "access": "public", "license": "Apache-2.0", "format": "safetensors-with-pytorch-pickle-normalization"}
+    },
+    {
+      "profile": "dinov3-vitb16-lvd1689m",
+      "checkpoint": {"repository": "facebook/dinov3-vitb16-pretrain-lvd1689m", "revision": "5931719e67bbdb9737e363e781fb0c67687896bc", "access": "manual-gated", "license": "DINOv3 License", "format": "safetensors"}
+    },
+    {
+      "profile": "gr00t-n1.7-3b",
+      "checkpoint": {"repository": "nvidia/GR00T-N1.7-3B", "revision": "2fc962b973bccdd5d8ce4f67cc63b264d6886495", "access": "public", "license": "NVIDIA Open Model License", "format": "safetensors-and-config"},
+      "implementation": {"repository": "NVIDIA/Isaac-GR00T", "revision": "23ace64f17aa5015259b8609d371eb61a357c776", "ref": "n1.7-release", "license": "Apache-2.0"}
+    },
+    {
+      "profile": "gemma-4-e4b-it",
+      "checkpoint": {"repository": "google/gemma-4-E4B-it", "revision": "ee0ef6023621cff504d758262d4e04895a5af4a2", "access": "public", "license": "Apache-2.0", "format": "safetensors"}
+    },
+    {
+      "profile": "rhinovla",
+      "checkpoint": {"repository": "HuixiAI/RhinoVLA", "revision": "7f3708650e302f395e7c63607b48b56fb96b8076", "access": "public", "license": "Apache-2.0", "format": "pytorch-pickle-checkpoint"},
+      "implementation": {"repository": "HUIXI-AI/RhinoVLA", "revision": "fce05e5859104c94544edc1f4380a677c3ebac4c", "license": "Apache-2.0"}
+    },
+    {
+      "profile": "lingbot-vla-v2-6b",
+      "checkpoint": {"repository": "robbyant/lingbot-vla-v2-6b", "revision": "11c703bf6a5c1f45b3b69168482da11fdbba53d7", "access": "public", "license": "Apache-2.0-declared-by-model-card", "format": "safetensors-and-config"},
+      "implementation": {"repository": "Robbyant/lingbot-vla-v2", "revision": "951475ae1b1d87553e7dc47c97b53a3d695c0d13", "license": "Apache-2.0"}
+    },
+    {
+      "profile": "galaxea-g0.5-base-continuous",
+      "checkpoint": {"repository": "OpenGalaxea/G05", "revision": "e312be81e90c56a55bcb26b57429bd39a335b449", "subfolder": "g05-base", "access": "auto-gated", "license": "G0.5 Community License (non-commercial)", "format": "pytorch-pickle-and-config"},
+      "implementation": {"repository": "OpenGalaxea/GalaxeaVLA", "revision": "89f2322b4ad016e192437adc1a2c253b05bab246", "license": "G0.5 Community License"}
+    },
+    {
+      "profile": "internvla-n1-with-navdp",
+      "checkpoint": {"repository": "InternRobotics/InternVLA-N1-w-NavDP", "revision": "6d48df24da45e8b31fdcef9572bbcbf68c0baf64", "access": "public", "license": "CC-BY-NC-SA-4.0-declared-by-model-card", "format": "safetensors-and-config"},
+      "implementation": {"repository": "InternRobotics/InternNav", "revision": "7a5c62400ac45b313d9b709c740b64191556a242", "license": "MIT"}
+    }
+  ]
+}

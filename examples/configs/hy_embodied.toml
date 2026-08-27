@@ -1,0 +1,71 @@
+# 单一完整模板 / Single complete template：注释行展示默认值，取消注释才覆盖运行时。
+# Complete Hy-Embodied runner example. This target has no rpu_execution table;
+# the public policy validates its model-owned runtime profile.
+[runner]
+target = "hy_embodied"
+
+[runner.env]
+# 通用参数 / Common。注释行给出默认值；取消注释才覆盖 facade 默认行为。
+RPU_LOG_LEVEL = 3 # 默认 3；允许 0..5；进程日志级别。
+# RPU_WARMUP = 0 # 默认 0；非负整数；模型构建后的预热 forward 次数。
+# RPU_MODEL_CACHE = "~/.cache/rhinoforge/models" # 默认模型别名缓存根目录。
+# HF_HOME / HF_HUB_CACHE / HUGGINGFACE_HUB_CACHE：默认继承 Hugging Face；自定义缓存位置时设置。
+# LKN_MAX_BATCH_ENTRIES = 65536 # 默认 65536；范围 1..4194304；Graph 提交容量。
+# LKN_KD_BUF_MB = 8 # 默认 8；范围 1..256 MiB；Graph 命令容量。
+# LKN_INSTR_BUF_MB = 64 # 默认 64；范围 1..1024 MiB；Graph 执行缓存容量。
+# RPU_KERNEL_LIB_PATH 由部署环境设置；runner 拒绝从 TOML 选择算子资产。
+# RPU_KVINSERT_V16 = true # 默认 true；允许 0/1；合法布局使用 16 行 KV insert，否则自动回退。
+# 以下为 policy 读取的公开 profile；dtype 决定量化默认值。
+# RPU_HY_VLA_DENOISE_UNROLL = true # policy 默认 true；整段 denoise Graph。
+# RPU_HY_VLA_VIT_PACKED = true # policy 默认 true；多相机一个 ViT forward。
+# RPU_HY_VLA_FUSED_MERGER = true # policy 默认 true；RPU merger。
+# RPU_HY_VLA_MERGER_IN_GRAPH = true # policy 默认 true；要求 FUSED_MERGER=true。
+# RPU_HY_VLA_PATCH_EMBED_IN_GRAPH = true # 默认 true；patch embedding 纳入 Graph。
+# RPU_HY_VLA_PROJ1_IN_MERGER = true # 默认 true；merger 内执行第一投影。
+# RPU_HY_VLA_PREFIX_TEMPLATE = true # 默认 true；复用 prefix 模板。
+# RPU_HY_VLA_PERSIST_HANDLES = true # policy 默认 true；也允许 vit,vlm,expert CSV。
+# RPU_HY_VLA_ATTN_TP8 = true # policy 默认 true；VLM/expert 8-core attention。
+# RPU_HY_VLA_FAST_REPLAY = true # policy 默认 true；也允许 vit,vlm,expert CSV。
+# RPU_HY_VLA_FAST_REPLAY_PRELOAD = true # policy 默认 true；与 FAST_REPLAY 配套。
+# RPU_HY_VLA_MASK_ONCE = true # policy 默认 true；每个 subsystem 复用稳定 mask。
+# RPU_HY_VLA_Q_INPLACE = true # policy 默认 true；Vision query 原位复用。
+# RPU_HY_VLA_KVPAD16 = true # policy 默认 true；ViT/expert KV 行对齐。
+# RPU_HY_VLA_SILU_MUL = "expert" # policy 默认 expert；允许 expert,vlm,true。
+# RPU_HY_VLA_PARTIAL_ROPE = "expert,vlm" # policy 默认 expert,vlm。
+# RPU_HY_VLA_PATCH_EMBED_MC = true # 未设置默认 8 cores；false 单 core。
+# RPU_HY_VLA_ACTION_MLP_MC = true # 未设置默认 8 cores；false 单 core。
+# RPU_HY_VLA_MOT_NORM_NOMERGE = "both" # 默认 both；允许 false,qkv,mlp,both。
+# RPU_HY_VLA_CACHING_ALLOC = true # 默认 true；缓存分配器。
+# RPU_HY_VLA_W8A16 = false # dtype=fp16 默认 false；也允许 vit,vlm,expert CSV。
+# RPU_HY_VLA_W4A16 = false # dtype=fp16 默认 false；同 scope 优先于 W8。
+# RPU_RMSNORM_VWARP = "auto" # policy 默认 auto；允许 0,16,32,auto。
+# RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN = true # policy 默认 true；多 subsystem 持久状态。
+# RPU_KVINSERT_HYBRID_V16 = true # policy 默认 true；非 16 对齐 KV bulk+tail。
+# RPU_KVINSERT_V16_ANY_TP = true # policy 默认 true；允许该 profile 的 KV 并行度。
+# RPU_FASTREPLAY_SKIP_SYNC = true # policy 默认 true；仅与稳定 replay profile 配套。
+# RPU_SKIP_IDLE_RECORD_FUNCTION = true # policy 默认 true；无 profiler 时省略空 trace 区间。
+
+[runner.torch_profile]
+enabled = false # 默认 false；启用整次命令的 Torch profiler。
+output = "profiles/hy_embodied_torch.json" # 默认 profiles/torch_trace.json；Chrome trace 输出路径。
+record_shapes = false # 默认 false；记录算子输入 shape。
+profile_memory = false # 默认 false；记录内存事件。
+with_stack = false # 默认 false；记录 Python stack，开销更高。
+
+[model]
+alias = "hy-embodied-0.5-vla-umi"
+dtype = "fp16"
+prefix_len = 240
+
+[request]
+images = [
+  "assets/top_head.jpg",
+  "assets/hand_left.jpg",
+  "assets/hand_right.jpg",
+]
+instruction = "Pick up the object on the table."
+state = [
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+]
+noise_seed = 0

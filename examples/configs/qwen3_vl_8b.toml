@@ -1,0 +1,44 @@
+# 单一完整模板 / Single complete template：注释行展示默认值，取消注释才覆盖运行时。
+# Qwen3-VL 8B Limited profile；精确 padded profile 的 4/4 numeric/task/Graph 已通过，包含 dual-full。
+[runner]
+target = "qwen3_vl"
+
+[runner.env]
+# 通用参数 / Common。注释行给出默认值；取消注释才覆盖 facade 默认行为。
+RPU_LOG_LEVEL = 3 # 默认 3；允许 0..5；进程日志级别。
+# RPU_WARMUP = 0 # 默认 0；非负整数；模型构建后的预热 forward 次数。
+# RPU_MODEL_CACHE = "~/.cache/rhinoforge/models" # 默认模型别名缓存根目录。
+# HF_HOME / HF_HUB_CACHE / HUGGINGFACE_HUB_CACHE：默认继承 Hugging Face；自定义缓存位置时设置。
+# LKN_MAX_BATCH_ENTRIES = 65536 # 默认 65536；范围 1..4194304；Graph 提交容量。
+# LKN_KD_BUF_MB = 8 # 默认 8；范围 1..256 MiB；Graph 命令容量。
+# LKN_INSTR_BUF_MB = 64 # 默认 64；范围 1..1024 MiB；Graph 执行缓存容量。
+# RPU_KERNEL_LIB_PATH 由部署环境设置；runner 拒绝从 TOML 选择算子资产。
+# RPU_KVINSERT_V16 = true # 默认 true；允许 0/1；合法布局使用 16 行 KV insert，否则自动回退。
+# RPU_QWEN3VL_VISION_BATCH = false # 默认 false；true 合并连续且同尺寸的多图 Vision 调用。
+# RPU_QWEN3VL_VISION_BATCH_CAP = 3 # 默认 3；正整数；仅合批开启时生效。
+# RPU_QWEN3VL_VISION_FUSED_MERGER = false # 默认 false；true 将 patch/deepstack merger 纳入 Graph。
+# RPU_QWEN3VL_VISION_ROPE_SPM = false # 默认 false；仅已验证 profile 开启 SPM RoPE 表路径。
+
+[runner.torch_profile]
+enabled = false # 默认 false；启用整次命令的 Torch profiler。
+output = "profiles/qwen3_vl_8b_torch.json" # 默认 profiles/torch_trace.json；Chrome trace 输出路径。
+record_shapes = false # 默认 false；记录算子输入 shape。
+profile_memory = false # 默认 false；记录内存事件。
+with_stack = false # 默认 false；记录 Python stack，开销更高。
+
+[rpu_execution.prefill]
+chunk_size = "auto" # 默认 auto；当前 8B envelope 的上限为 128。
+padding_budget = 64 # 默认 64；非负整数；与 padding_rows 二选一。
+# padding_rows = "auto" # 默认 auto；也可指定非负整数；启用时删除 padding_budget。
+
+[rpu_execution.vision]
+chunk_size = "auto" # 默认 auto；也可用满足模型约束的 16 倍数。
+
+[model]
+alias = "qwen3-vl-8b"
+local_files_only = true
+
+[request]
+image = "assets/example.ppm"
+prompt = "Describe this image in one sentence."
+max_new_tokens = 32

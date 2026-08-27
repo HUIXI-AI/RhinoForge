@@ -1,0 +1,42 @@
+# 单一完整模板 / Single complete template：注释行展示默认值，取消注释才覆盖运行时。
+# Source-only NavDP component for the public
+# InternRobotics/InternVLA-N1-w-NavDP checkpoint. The caller pins every asset;
+# this file intentionally does not claim the composite InternVLA E2E path.
+[runner]
+target = "internvla_navdp"
+
+[runner.env]
+# 通用参数 / Common。注释行给出默认值；取消注释才覆盖 facade 默认行为。
+RPU_LOG_LEVEL = 3 # 默认 3；允许 0..5；进程日志级别。
+# RPU_WARMUP = 0 # 默认 0；非负整数；模型构建后的预热 forward 次数。
+# RPU_MODEL_CACHE = "~/.cache/rhinoforge/models" # 默认模型别名缓存根目录。
+# HF_HOME / HF_HUB_CACHE / HUGGINGFACE_HUB_CACHE：默认继承 Hugging Face；自定义缓存位置时设置。
+# LKN_MAX_BATCH_ENTRIES = 65536 # 默认 65536；范围 1..4194304；Graph 提交容量。
+# LKN_KD_BUF_MB = 8 # 默认 8；范围 1..256 MiB；Graph 命令容量。
+# LKN_INSTR_BUF_MB = 64 # 默认 64；范围 1..1024 MiB；Graph 执行缓存容量。
+# RPU_KERNEL_LIB_PATH 由部署环境设置；runner 拒绝从 TOML 选择算子资产。
+# RPU_KVINSERT_V16 = true # 默认 true；允许 0/1；合法布局使用 16 行 KV insert，否则自动回退。
+RPU_INTERNVLA_N1_ALLOW_NUMERIC_BLOCKED = true # 默认 false；进入受控 InternVLA/NavDP。
+RPU_S2_SDPA_BF16 = false # 必须 false；当前算子资产不提供旧 BF16 路径。
+RPU_NAVDP_DENOISE_UNROLL = true # 默认 false；固定 denoise 循环纳入 Graph。
+RPU_NAVDP_BATCH = true # 默认 true；批处理 trajectory，首次调用后样本数固定。
+RPU_NAVDP_SPM_KV_BY_MHA = true # 默认 true；适用布局使用 SPM KV，否则自动 DDR。
+# RPU_INTERNVLA_DINO_FINAL_NORM_RPU = true # 默认 true；DINO final norm 在 RPU。
+# RPU_INTERNVLA_HOST_CACHE = true # 默认 true；复用稳定 host-to-RPU owner。
+
+[runner.torch_profile]
+enabled = false # 默认 false；启用整次命令的 Torch profiler。
+output = "profiles/internvla_navdp_torch.json" # 默认 profiles/torch_trace.json；Chrome trace 输出路径。
+record_shapes = false # 默认 false；记录算子输入 shape。
+profile_memory = false # 默认 false；记录内存事件。
+with_stack = false # 默认 false；记录 Python stack，开销更高。
+
+[model]
+alias = "internvla-n1-navdp"
+asset_manifest_json = "manifests/internvla_navdp.sha256.json"
+source_only_acknowledged = true
+
+[request]
+input_pt = "requests/internvla_navdp_embeddings.pt"
+sample_num = 4
+seed = 0

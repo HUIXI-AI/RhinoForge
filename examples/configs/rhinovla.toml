@@ -1,0 +1,47 @@
+# 单一完整模板 / Single complete template：注释行展示默认值，取消注释才覆盖运行时。
+# Complete RhinoVLA runner example. A non-empty [runtime] is passed unchanged
+# to the trusted model-repository factory; use only documented factory fields.
+[runner]
+target = "rhinovla"
+
+[runner.env]
+# 通用参数 / Common。注释行给出默认值；取消注释才覆盖 facade 默认行为。
+RPU_LOG_LEVEL = 3 # 默认 3；允许 0..5；进程日志级别。
+# LKN_MAX_BATCH_ENTRIES = 65536 # 默认 65536；范围 1..4194304；Graph 提交容量。
+# LKN_KD_BUF_MB = 8 # 默认 8；范围 1..256 MiB；Graph 命令容量。
+# LKN_INSTR_BUF_MB = 64 # 默认 64；范围 1..1024 MiB；Graph 执行缓存容量。
+# RPU_KERNEL_LIB_PATH 由部署环境设置；runner 拒绝从 TOML 选择算子资产。
+# 模型参数由 model.runtime_factory 的 capability handshake 声明并写在 [runtime]。
+# 未声明字段由 factory 拒绝；这里不复制模型仓库私有 harness 参数。
+# 后端公开且可由 factory 映射的参数（默认均 false；只使用 factory 声明的组合）：
+# RPU_RHINOVLA_DENOISE_STATIC_CONTEXT_CACHE = false # 缓存 denoise 静态上下文。
+# RPU_RHINOVLA_FUSED_ADARMS_GEMV = false # 融合每层 AdaRMS projection。
+# RPU_RHINOVLA_PRECOMPUTE_ADARMS = false # 使用 factory 提供的预计算 AdaRMS 表。
+# RPU_RHINOVLA_PRECOMPUTE_TIME_PROJ = false # 使用预计算 time projection。
+# RPU_RHINOVLA_FOLD_ACTION_TIME_IN = false # 折叠 action/time 输入投影。
+# RPU_RHINOVLA_GATED_NO_SUB = false # 省略代数冗余的 gated subtraction。
+# RPU_RHINOVLA_FUSED_SILU_MUL = false # 融合 SiLU 与 multiply。
+# RPU_RHINOVLA_VISION_PREP_CACHE = false # 缓存 grid 相关 Vision 准备结果。
+# RPU_RHINOVLA_VISION_BATCH_MERGERS = false # 合并兼容的 merger GEMM。
+# RPU_RHINOVLA_VISION_BATCH_VIEWS = false # 同尺寸相机视图合批。
+# RPU_RHINOVLA_VISION_RPU_MERGER_NORM = false # merger norm 在 RPU。
+# RPU_RHINOVLA_VISION_CPU_MERGER_NORM_FP16 = false # CPU merger norm 使用 FP16。
+# RPU_RHINOVLA_VISION_RPU_MERGER_OUTPUT_RPU = false # merger 输出保留在 RPU。
+# RPU_RHINOVLA_VISION_SKIP_RAW_SNAPSHOTS = false # merger 消费后不保留 raw CPU snapshot。
+
+[runner.torch_profile]
+enabled = false # 默认 false；启用整次命令的 Torch profiler。
+output = "profiles/rhinovla_torch.json" # 默认 profiles/torch_trace.json；Chrome trace 输出路径。
+record_shapes = false # 默认 false；记录算子输入 shape。
+profile_memory = false # 默认 false；记录内存事件。
+with_stack = false # 默认 false；记录 Python stack，开销更高。
+
+[model]
+checkpoint = "models/rhinovla"
+runtime_factory = "your_package.runtime:create_rhino_vla_runtime"
+
+# Add only model-repository-defined runtime factory fields here.
+[runtime]
+
+[request]
+request_json = "requests/rhinovla.json"

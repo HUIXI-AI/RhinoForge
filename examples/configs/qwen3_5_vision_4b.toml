@@ -1,0 +1,44 @@
+# 单一完整模板 / Single complete template：注释行展示默认值，取消注释才覆盖运行时。
+# Qwen3.5 Vision 4B 受控单图评估模板；官方真实图数值门未通过。
+[runner]
+target = "qwen3_5_vision"
+
+[runner.env]
+# 通用参数 / Common。注释行给出默认值；取消注释才覆盖 facade 默认行为。
+RPU_LOG_LEVEL = 3 # 默认 3；允许 0..5；进程日志级别。
+# RPU_WARMUP = 0 # 默认 0；非负整数；模型构建后的预热 forward 次数。
+# RPU_MODEL_CACHE = "~/.cache/rhinoforge/models" # 默认模型别名缓存根目录。
+# HF_HOME / HF_HUB_CACHE / HUGGINGFACE_HUB_CACHE：默认继承 Hugging Face；自定义缓存位置时设置。
+LKN_MAX_BATCH_ENTRIES = 4194304 # 系统默认 65536；本模板的大 Graph 容量。
+LKN_KD_BUF_MB = 256 # 系统默认 8；范围 1..256 MiB；本模板取上限。
+LKN_INSTR_BUF_MB = 1024 # 系统默认 64；范围 1..1024 MiB；本模板取上限。
+# RPU_KERNEL_LIB_PATH 由部署环境设置；runner 拒绝从 TOML 选择算子资产。
+# RPU_KVINSERT_V16 = true # 默认 true；允许 0/1；合法布局使用 16 行 KV insert，否则自动回退。
+# QWEN3_5_TEXT_CHUNK = 0 # 默认 0=自动；允许 0 或 >=64；prefill chunk 上限；优先用 rpu_execution。
+# QWEN3_5_TEXT_PADDING_BUDGET = 64 # 默认 64；允许 0..64；可选 padding 上限。
+# RPU_QWEN3_5_FREE_HF_WEIGHTS = true # 默认 true；安装 RPU 权重后释放原始 HF 权重。
+# QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED = 1 # 默认 0；只接受精确 1；受控评估前必须显式取消注释。
+# QWEN3_5_VISION_CHUNK = 0 # 默认 0=自动；允许 <=0 或 >=16；Vision chunk 上限。
+# RPU_VISION_STEP0 = true # 默认 true；Vision 输入首段在 RPU 执行；false 使用 CPU 回退。
+# RPU_VISION_MERGER = true # 默认 true；Vision merger 在 RPU 执行；false 使用 CPU 回退。
+
+[runner.torch_profile]
+enabled = false # 默认 false；启用整次命令的 Torch profiler。
+output = "profiles/qwen3_5_vision_4b_torch.json" # 默认 profiles/torch_trace.json；Chrome trace 输出路径。
+record_shapes = false # 默认 false；记录算子输入 shape。
+profile_memory = false # 默认 false；记录内存事件。
+with_stack = false # 默认 false；记录 Python stack，开销更高。
+
+[rpu_execution.prefill]
+chunk_size = "auto" # 默认 auto；也可用满足模型约束的 16 倍数。
+padding_budget = 64 # 默认 64；非负整数；与 padding_rows 二选一。
+# padding_rows = "auto" # 默认 auto；也可指定非负整数；启用时删除 padding_budget。
+
+[model]
+alias = "qwen3_5-4b"
+local_files_only = true
+
+[request]
+image = "assets/example.ppm"
+prompt = "Describe this image in one sentence."
+max_new_tokens = 32

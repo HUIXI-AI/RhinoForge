@@ -1,15 +1,18 @@
-"""Offline W8A16 / fake-W4 quantization for Pi0.5 Gemma projection weights.
+"""Offline W8A16 / fake-W4 quantization for Pi0.5 weights.
 
 The VLM Gemma decoder and action expert decoder projections are quantized.
-SigLIP, AdaRMS dense, action projection, and processor sidecar tensors remain
-fp16/original. Fake-W4 stores signed 4-bit values in int8 tensors and still
-uses the existing W8A16 runtime kernel; it is a numerical probe only. The
-output deliberately omits model_remapped.safetensors so the Pi05 loader
-regenerates a remap from the quantized source tensors.
+With ``--include-runtime-linears``, SigLIP encoder and AdaRMS dense weights are
+also quantized from saved calibration statistics. Action projections and
+processor sidecar tensors remain fp16/original. Fake-W4 stores signed 4-bit
+values in int8 tensors and still uses the existing W8A16 runtime kernel; it is
+a numerical probe only. The output deliberately omits
+model_remapped.safetensors so the Pi05 loader regenerates a remap from the
+quantized source tensors.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -20,13 +23,20 @@ import torch
 from safetensors.torch import load_file, save_file
 
 try:
-    from ._common import quantize_linear_per_channel
+    from ._common import (
+        quantize_linear_per_channel,
+        quantize_linear_per_channel_activation_aware,
+    )
 except ImportError:
-    from _common import quantize_linear_per_channel
+    from _common import (
+        quantize_linear_per_channel,
+        quantize_linear_per_channel_activation_aware,
+    )
 
 
 PI05_EXPERT_ANCHOR = ".paligemma_with_expert.gemma_expert.model.layers."
 PI05_VLM_ANCHOR = ".paligemma_with_expert.paligemma.model.language_model.layers."
+PI05_SIGLIP_ANCHOR = ".paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers."
 PI05_PROJ_SUFFIXES = (
     "self_attn.q_proj.weight",
     "self_attn.k_proj.weight",
@@ -36,23 +46,45 @@ PI05_PROJ_SUFFIXES = (
     "mlp.up_proj.weight",
     "mlp.down_proj.weight",
 )
+PI05_SIGLIP_PROJ_SUFFIXES = (
+    "self_attn.q_proj.weight",
+    "self_attn.k_proj.weight",
+    "self_attn.v_proj.weight",
+    "self_attn.out_proj.weight",
+    "mlp.fc1.weight",
+    "mlp.fc2.weight",
+)
+PI05_ADARMS_SUFFIXES = (
+    "input_layernorm.dense.weight",
+    "post_attention_layernorm.dense.weight",
+)
+PI05_ADARMS_FINAL = ".paligemma_with_expert.gemma_expert.model.norm.dense.weight"
 
 
 def _scale_name(weight_name: str) -> str:
     return weight_name[: -len(".weight")] + ".weight_scale"
 
 
-def _target_for_name(name: str) -> str | None:
+def _target_for_name(name: str, *, include_runtime_linears: bool = False) -> str | None:
     if name.endswith(PI05_PROJ_SUFFIXES):
         if PI05_EXPERT_ANCHOR in name:
             return "expert"
         if PI05_VLM_ANCHOR in name:
             return "vlm"
+    if include_runtime_linears:
+        if PI05_SIGLIP_ANCHOR in name and name.endswith(PI05_SIGLIP_PROJ_SUFFIXES):
+            return "siglip"
+        if (
+            PI05_EXPERT_ANCHOR in name and name.endswith(PI05_ADARMS_SUFFIXES)
+        ) or name.endswith(PI05_ADARMS_FINAL):
+            return "adarms"
     return None
 
 
-def _is_pi05_quant_proj(name: str) -> bool:
-    return _target_for_name(name) is not None
+def _is_pi05_quant_proj(name: str, *, include_runtime_linears: bool = False) -> bool:
+    return _target_for_name(
+        name, include_runtime_linears=include_runtime_linears
+    ) is not None
 
 
 def _bits_for_name(name: str, bits: int, int8_keep_suffixes: tuple[str, ...]) -> int:
@@ -105,9 +137,11 @@ def _convert_tensor(
     *,
     bits: int,
     int8_keep_suffixes: tuple[str, ...] = (),
+    input_second_moment: torch.Tensor | None = None,
+    include_runtime_linears: bool = False,
 ) -> tuple[dict[str, torch.Tensor], int, int, int]:
     bytes_in = tensor.numel() * tensor.element_size()
-    if _is_pi05_quant_proj(name):
+    if _is_pi05_quant_proj(name, include_runtime_linears=include_runtime_linears):
         eff_bits = _bits_for_name(name, bits, int8_keep_suffixes)
         if tensor.dtype == torch.int8:
             if eff_bits == 4:
@@ -121,7 +155,12 @@ def _convert_tensor(
                 f"cannot quantize non-floating tensor {name!r} "
                 f"with dtype {tensor.dtype}"
             )
-        w_int8, scale = quantize_linear_per_channel(tensor, bits=eff_bits)
+        if input_second_moment is None:
+            w_int8, scale = quantize_linear_per_channel(tensor, bits=eff_bits)
+        else:
+            w_int8, scale = quantize_linear_per_channel_activation_aware(
+                tensor, input_second_moment, bits=eff_bits
+            )
         bytes_out = (
             w_int8.numel() * w_int8.element_size()
             + scale.numel() * scale.element_size()
@@ -160,7 +199,9 @@ def _method_for_stats(*, bits: int, real_w4: bool = False) -> str:
 
 
 def _quant_config(*, bits: int, int8_keep_suffixes: tuple[str, ...] = (),
-                  real_w4: bool = False) -> dict:
+                  real_w4: bool = False,
+                  activation_stats_sha256: str | None = None,
+                  include_runtime_linears: bool = False) -> dict:
     int8_keep_suffixes = _normalize_keep_int8_suffixes(
         int8_keep_suffixes, real_w4=real_w4)
     if bits == 4:
@@ -190,17 +231,34 @@ def _quant_config(*, bits: int, int8_keep_suffixes: tuple[str, ...] = (),
     if real_w4:
         raise ValueError("real_w4=True requires bits=4")
     if bits == 8:
-        return {
+        config = {
             "method": "w8a16",
             "mode": "per_channel_symmetric",
             "qaxis": 0,
-            "target": "pi05_gemma_vlm_and_expert",
+            "target": (
+                "pi05_vlm_expert_siglip_adarms"
+                if include_runtime_linears
+                else "pi05_gemma_vlm_and_expert"
+            ),
             "quantized_projection_suffixes": list(PI05_PROJ_SUFFIXES),
             "storage": "int8",
             "value_bits": 8,
             "scale": "per_output_channel",
             "kernel": "w8a16",
         }
+        if include_runtime_linears:
+            config["runtime_quantized_groups"] = ["siglip", "adarms"]
+        if activation_stats_sha256 is not None:
+            config.update({
+                "mode": "activation_aware_per_channel_symmetric",
+                "activation_aware": {
+                    "algorithm": "diag_input_second_moment_weighted_clip_v1",
+                    "clip_ratios": [round(1.0 - 0.05 * i, 2) for i in range(11)],
+                    "zero_activation_fallback": "per_channel_absmax",
+                    "calibration_stats_sha256": activation_stats_sha256,
+                },
+            })
+        return config
     raise ValueError(f"expected bits to be 4 or 8, got {bits}")
 
 
@@ -211,6 +269,8 @@ def convert_checkpoint(
     bits: int = 8,
     int8_keep_suffixes: tuple[str, ...] = (),
     real_w4: bool = False,
+    activation_stats_path: str | Path | None = None,
+    include_runtime_linears: bool = False,
 ) -> dict:
     src = Path(src).expanduser().resolve()
     dst = Path(dst).expanduser().resolve()
@@ -224,10 +284,28 @@ def convert_checkpoint(
         raise ValueError("int8_keep_suffixes is only meaningful with bits=4 (fake-W4)")
     if real_w4 and bits != 4:
         raise ValueError("real_w4=True requires bits=4")
+    if activation_stats_path is not None and bits != 8:
+        raise ValueError("activation-aware quantization currently requires bits=8")
+    if include_runtime_linears and (bits != 8 or activation_stats_path is None):
+        raise ValueError(
+            "include_runtime_linears requires W8 plus activation_stats_path"
+        )
     int8_keep_suffixes = _normalize_keep_int8_suffixes(
         int8_keep_suffixes, real_w4=real_w4)
 
     is_sharded, shards, weight_map, index = _checkpoint_layout(src)
+    activation_stats = None
+    activation_stats_sha256 = None
+    if activation_stats_path is not None:
+        activation_stats_path = Path(activation_stats_path).expanduser().resolve()
+        if not activation_stats_path.is_file():
+            raise FileNotFoundError(
+                f"activation stats file not found: {activation_stats_path}"
+            )
+        activation_stats = load_file(activation_stats_path)
+        activation_stats_sha256 = hashlib.sha256(
+            activation_stats_path.read_bytes()
+        ).hexdigest()
     tmp = dst.with_name(f".{dst.name}.tmp-{os.getpid()}")
     if tmp.exists():
         raise FileExistsError(f"temporary output already exists: {tmp}")
@@ -240,6 +318,8 @@ def convert_checkpoint(
         "n_shards": len(shards),
         "expert_projection_weights": 0,
         "vlm_projection_weights": 0,
+        "siglip_projection_weights": 0,
+        "adarms_dense_weights": 0,
         "value_bits": bits,
         "method": _method_for_stats(bits=bits, real_w4=real_w4),
         "mixed_int8_suffixes": list(int8_keep_suffixes),
@@ -254,10 +334,19 @@ def convert_checkpoint(
             out: dict[str, torch.Tensor] = {}
 
             for name in sorted(tensors):
-                target = _target_for_name(name)
+                target = _target_for_name(
+                    name, include_runtime_linears=include_runtime_linears
+                )
+                input_second_moment = None
+                if target is not None and activation_stats is not None:
+                    input_second_moment = activation_stats.pop(name, None)
+                    if input_second_moment is None:
+                        raise ValueError(f"activation stats missing target tensor {name!r}")
                 converted, n_quant, n_copy, bytes_out = _convert_tensor(
                     name, tensors[name], bits=bits,
                     int8_keep_suffixes=int8_keep_suffixes,
+                    input_second_moment=input_second_moment,
+                    include_runtime_linears=include_runtime_linears,
                 )
                 out.update(converted)
                 stats["n_quantized"] += n_quant
@@ -268,6 +357,10 @@ def convert_checkpoint(
                     stats["expert_projection_weights"] += 1
                 elif target == "vlm":
                     stats["vlm_projection_weights"] += 1
+                elif target == "siglip":
+                    stats["siglip_projection_weights"] += 1
+                elif target == "adarms":
+                    stats["adarms_dense_weights"] += 1
                 if n_quant:
                     new_weight_map[_scale_name(name)] = shard
 
@@ -280,6 +373,20 @@ def convert_checkpoint(
                 "missing Pi05 projection weights: "
                 f"expert={stats['expert_projection_weights']} "
                 f"vlm={stats['vlm_projection_weights']}"
+            )
+        if include_runtime_linears and (
+            stats["siglip_projection_weights"] != 162
+            or stats["adarms_dense_weights"] != 37
+        ):
+            raise ValueError(
+                "missing Pi05 runtime W8A16 weights: "
+                f"siglip={stats['siglip_projection_weights']}/162 "
+                f"adarms={stats['adarms_dense_weights']}/37"
+            )
+        if activation_stats:
+            raise ValueError(
+                "activation stats contain unknown tensors: "
+                f"{sorted(activation_stats)[:5]}"
             )
 
         if is_sharded:
@@ -294,7 +401,9 @@ def convert_checkpoint(
         with (src / "config.json").open() as f:
             config = json.load(f)
         quant_config = _quant_config(bits=bits, int8_keep_suffixes=int8_keep_suffixes,
-                                     real_w4=real_w4)
+                                     real_w4=real_w4,
+                                     activation_stats_sha256=activation_stats_sha256,
+                                     include_runtime_linears=include_runtime_linears)
         with (tmp / "config.json").open("w") as f:
             json.dump(config, f, indent=2)
         with (tmp / "rpu_quant_config.json").open("w") as f:
@@ -313,6 +422,18 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--src", required=True, help="source Pi0.5 checkpoint directory")
     parser.add_argument("--dst", required=True, help="output quantized checkpoint directory")
+    parser.add_argument(
+        "--activation-stats",
+        help=(
+            "safetensors file mapping each quantized weight name to its calibrated "
+            "input second moment; enables activation-aware per-channel W8"
+        ),
+    )
+    parser.add_argument(
+        "--include-runtime-linears",
+        action="store_true",
+        help="also quantize calibrated SigLIP encoder and AdaRMS dense weights",
+    )
     parser.add_argument(
         "--fake-w4",
         action="store_true",
@@ -363,6 +484,8 @@ def main(argv: list[str] | None = None) -> int:
         stats = convert_checkpoint(
             args.src, args.dst, bits=bits, int8_keep_suffixes=int8_keep_suffixes,
             real_w4=args.real_w4,
+            activation_stats_path=args.activation_stats,
+            include_runtime_linears=args.include_runtime_linears,
         )
     except (FileExistsError, FileNotFoundError, TypeError, ValueError) as exc:
         print(f"[convert_pi05] error: {exc}", file=sys.stderr)
@@ -373,6 +496,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  shards     : {stats['n_shards']}")
     print(f"  vlm        : {stats['vlm_projection_weights']} projection weights")
     print(f"  expert     : {stats['expert_projection_weights']} projection weights")
+    if args.include_runtime_linears:
+        print(f"  siglip     : {stats['siglip_projection_weights']} projection weights")
+        print(f"  adarms     : {stats['adarms_dense_weights']} dense weights")
     print(f"  method     : {stats['method']} (value_bits={stats['value_bits']})")
     effective_keep = stats["mixed_int8_suffixes"]
     if effective_keep:

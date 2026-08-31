@@ -722,8 +722,22 @@ class Pi05Adapter:
                 transform_linear_weight as _tlw, NUM_CORES as _NC)
 
             def _q_dense(dense):
-                orig = dense.weight.detach().cpu().to(torch.float16).contiguous()
-                w8, sc = quantize_linear_per_channel(orig)
+                weight = dense.weight.detach().cpu().contiguous()
+                if weight.dtype == torch.int8:
+                    sc = getattr(dense, "weight_scale", None)
+                    if sc is None or sc.dtype != torch.float16:
+                        raise RuntimeError(
+                            "pre-quantized AdaRMS int8 weight requires fp16 weight_scale"
+                        )
+                    if sc.dim() != 1 or sc.numel() != weight.size(0):
+                        raise RuntimeError(
+                            "pre-quantized AdaRMS weight_scale shape mismatch"
+                        )
+                    w8 = weight
+                    sc = sc.detach().cpu().contiguous()
+                else:
+                    w8, sc = quantize_linear_per_channel(
+                        weight.to(torch.float16))
                 w_rp = _tlw(w8.contiguous(), partition=0,
                             num_cores=_NC).to('rpu').contiguous()
                 return w_rp, sc.to(torch.float16).to('rpu').contiguous()

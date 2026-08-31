@@ -26,6 +26,7 @@ _LOAD_LOCK = threading.Lock()
 _PI05_W8A16_TARGETS = {
     "expert": ".paligemma_with_expert.gemma_expert.model.layers.",
     "vlm": ".paligemma_with_expert.paligemma.model.language_model.layers.",
+    "siglip": ".paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers.",
 }
 _PI05_PROJ_SUFFIXES = (
     "self_attn.q_proj.weight",
@@ -36,10 +37,41 @@ _PI05_PROJ_SUFFIXES = (
     "mlp.up_proj.weight",
     "mlp.down_proj.weight",
 )
+_PI05_SIGLIP_PROJ_SUFFIXES = (
+    "self_attn.q_proj.weight",
+    "self_attn.k_proj.weight",
+    "self_attn.v_proj.weight",
+    "self_attn.out_proj.weight",
+    "mlp.fc1.weight",
+    "mlp.fc2.weight",
+)
+_PI05_ADARMS_SUFFIXES = (
+    "input_layernorm.dense.weight",
+    "post_attention_layernorm.dense.weight",
+)
+_PI05_ADARMS_FINAL = ".paligemma_with_expert.gemma_expert.model.norm.dense.weight"
 
 
 def _is_pi05_w8a16_proj_weight(name: str, anchor: str) -> bool:
     return anchor in name and name.endswith(_PI05_PROJ_SUFFIXES)
+
+
+def _pi05_w8a16_target_for_name(name: str) -> str | None:
+    if _is_pi05_w8a16_proj_weight(name, _PI05_W8A16_TARGETS["expert"]):
+        return "expert"
+    if _is_pi05_w8a16_proj_weight(name, _PI05_W8A16_TARGETS["vlm"]):
+        return "vlm"
+    if (
+        _PI05_W8A16_TARGETS["siglip"] in name
+        and name.endswith(_PI05_SIGLIP_PROJ_SUFFIXES)
+    ):
+        return "siglip"
+    if (
+        _PI05_W8A16_TARGETS["expert"] in name
+        and name.endswith(_PI05_ADARMS_SUFFIXES)
+    ) or name.endswith(_PI05_ADARMS_FINAL):
+        return "adarms"
+    return None
 
 
 def _load_pi05_rpu_quant_config(model_path: str) -> dict:
@@ -60,7 +92,28 @@ def _load_pi05_rpu_quant_config(model_path: str) -> dict:
         )
 
     method = cfg.get("method")
-    if method == "w4a16_fake_int8":
+    if method == "w8a16" and cfg.get("mode") == "activation_aware_per_channel_symmetric":
+        activation_aware = cfg.get("activation_aware")
+        if not isinstance(activation_aware, dict):
+            raise RPUBackendError(
+                "_load_and_fp16_cast: activation-aware W8A16 requires "
+                "activation_aware metadata"
+            )
+        if activation_aware.get("algorithm") != "diag_input_second_moment_weighted_clip_v1":
+            raise RPUBackendError(
+                "_load_and_fp16_cast: unsupported activation-aware W8A16 algorithm"
+            )
+        digest = activation_aware.get("calibration_stats_sha256")
+        if not isinstance(digest, str) or len(digest) != 64:
+            raise RPUBackendError(
+                "_load_and_fp16_cast: activation-aware W8A16 requires a SHA256 "
+                "calibration stats identity"
+            )
+        _LOG.info(
+            "Pi0.5 activation-aware W8A16 checkpoint detected: "
+            "per-output-channel scales, calibration_stats_sha256=%s", digest
+        )
+    elif method == "w4a16_fake_int8":
         if cfg.get("storage") != "int8" or int(cfg.get("value_bits", 0)) != 4:
             raise RPUBackendError(
                 "_load_and_fp16_cast: method=w4a16_fake_int8 requires "
@@ -87,13 +140,17 @@ def _pop_pi05_w8a16_tensors(policy, state_dict: dict[str, torch.Tensor]):
     modules = dict(policy.named_modules())
     consumed = {}
     scale_names = [name for name in state_dict if name.endswith(".weight_scale")]
-    for target, anchor in _PI05_W8A16_TARGETS.items():
-        expected = sorted(
-            f"{name}.weight" for name, module in modules.items()
-            if isinstance(module, nn.Linear) and _is_pi05_w8a16_proj_weight(
-                f"{name}.weight", anchor
-            )
-        )
+    expected_by_target: dict[str, list[str]] = {}
+    for name, module in modules.items():
+        if not isinstance(module, nn.Linear):
+            continue
+        weight_name = f"{name}.weight"
+        target = _pi05_w8a16_target_for_name(weight_name)
+        if target is not None:
+            expected_by_target.setdefault(target, []).append(weight_name)
+
+    for target, expected in expected_by_target.items():
+        expected.sort()
         if not expected:
             continue
 
@@ -103,10 +160,9 @@ def _pop_pi05_w8a16_tensors(policy, state_dict: dict[str, torch.Tensor]):
         ]
         target_scale_names = [
             name for name in scale_names
-            if anchor in name and any(
-                name.endswith(suffix.replace(".weight", ".weight_scale"))
-                for suffix in _PI05_PROJ_SUFFIXES
-            )
+            if _pi05_w8a16_target_for_name(
+                name[: -len(".weight_scale")] + ".weight"
+            ) == target
         ]
         if not int8_names:
             if target_scale_names:
@@ -167,6 +223,23 @@ def _pi05_consumed_keys(consumed) -> set[str]:
         keys.add(f"{module_name}.weight")
         keys.add(f"{module_name}.weight_scale")
     return keys
+
+
+def _remove_missing_pi05_lm_heads(policy, missing: list[str]) -> set[str]:
+    """Remove Transformers 5.5 logits heads unused by Pi0.5 hidden-state inference."""
+    head_names = (
+        "model.paligemma_with_expert.paligemma.lm_head",
+        "model.paligemma_with_expert.gemma_expert.lm_head",
+    )
+    removed = set()
+    for head_name in head_names:
+        weight_name = f"{head_name}.weight"
+        if weight_name not in missing:
+            continue
+        parent_name, attribute = head_name.rsplit(".", 1)
+        setattr(policy.get_submodule(parent_name), attribute, nn.Identity())
+        removed.add(weight_name)
+    return removed
 
 
 # =============================================================================
@@ -329,10 +402,13 @@ def _load_and_fp16_cast(model_path: str, dtype: "torch.dtype", **lerobot_kwargs:
     # Validate critical checkpoint keys after loading.
     missing = list(getattr(load_result, 'missing_keys', []))
     unexpected = list(getattr(load_result, 'unexpected_keys', []))
+    removed_head_keys = _remove_missing_pi05_lm_heads(policy, missing)
     expected_param_names = {n for n, _ in policy.named_parameters()}
     critical_missing = [
         k for k in missing
-        if k in expected_param_names and k not in consumed_keys
+        if k in expected_param_names
+        and k not in consumed_keys
+        and k not in removed_head_keys
     ]
     if critical_missing:
         raise RPUBackendError(

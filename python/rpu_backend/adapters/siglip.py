@@ -105,6 +105,7 @@ def _quantize_and_swizzle_siglip_weight(
     weight: torch.Tensor,
     *,
     partition: int,
+    scale: torch.Tensor | None = None,
     num_cores: int = NUM_CORES,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if weight.device.type != "cpu":
@@ -112,7 +113,21 @@ def _quantize_and_swizzle_siglip_weight(
             "RPU_PI05_SIGLIP_W8A16 requires SigLIP encoder conversion before "
             "moving weights to RPU"
         )
-    w_int8, scale = quantize_linear_per_channel(weight.contiguous())
+    if weight.dtype == torch.int8:
+        if scale is None:
+            raise RuntimeError(
+                "pre-quantized SigLIP int8 weight requires saved weight_scale"
+            )
+        if scale.dim() != 1 or scale.numel() != weight.size(0):
+            raise RuntimeError(
+                "pre-quantized SigLIP weight_scale does not match output rows"
+            )
+        w_int8 = weight
+        scale = scale.to(torch.float16)
+    else:
+        if scale is not None:
+            raise RuntimeError("SigLIP weight_scale requires an int8 weight")
+        w_int8, scale = quantize_linear_per_channel(weight.contiguous())
     w_swizzled = transform_linear_weight(
         w_int8.contiguous(), partition=partition, num_cores=num_cores)
     return w_swizzled.contiguous(), scale.contiguous()
@@ -124,16 +139,32 @@ def _install_siglip_linear_weight(
     *,
     partition: int,
     w8a16: bool,
+    scale: torch.Tensor | None = None,
 ) -> None:
     if w8a16:
         weight, scale = _quantize_and_swizzle_siglip_weight(
-            weight, partition=partition)
+            weight, partition=partition, scale=scale)
         module.weight = nn.Parameter(weight, requires_grad=False)
         _set_siglip_weight_scale(module, scale)
     else:
+        if weight.dtype == torch.int8:
+            raise RuntimeError(
+                "pre-quantized SigLIP checkpoint requires W8A16 execution"
+            )
         weight = transform_linear_weight(
             weight.contiguous(), partition=partition, num_cores=NUM_CORES)
         module.weight = nn.Parameter(weight.contiguous(), requires_grad=False)
+
+
+def _prequantized_siglip_scale(module: nn.Linear) -> torch.Tensor | None:
+    if module.weight.dtype != torch.int8:
+        return None
+    scale = getattr(module, "weight_scale", None)
+    if scale is None or scale.dtype != torch.float16:
+        raise RuntimeError("pre-quantized SigLIP weight requires fp16 weight_scale")
+    if scale.dim() != 1 or scale.numel() != module.weight.size(0):
+        raise RuntimeError("pre-quantized SigLIP weight_scale shape mismatch")
+    return scale.detach()
 
 
 def _iter_siglip_encoder_projections(encoder):
@@ -277,16 +308,24 @@ def _convert_siglip_weights_for_rpu(vision_tower, *, w8a16_default: bool = False
             # === Q/K/V weights: [orig_out, hidden] -> pad -> [padded_out, hidden] -> col swizzle ===
             for proj_name in ['q_proj', 'k_proj', 'v_proj']:
                 proj = getattr(attn, proj_name)
+                scale = _prequantized_siglip_scale(proj)
                 w = proj.weight.data  # [num_heads*orig_hd, hidden_size]
                 w = w.view(num_heads, orig_head_dim, hidden_size)
                 if padded_head_dim > orig_head_dim:
                     pad = torch.zeros(num_heads, padded_head_dim - orig_head_dim, hidden_size,
                                       dtype=w.dtype, device=w.device)
                     w = torch.cat([w, pad], dim=1)
+                    if scale is not None:
+                        scale = scale.view(num_heads, orig_head_dim)
+                        scale_pad = torch.ones(
+                            num_heads, padded_head_dim - orig_head_dim,
+                            dtype=scale.dtype, device=scale.device)
+                        scale = torch.cat([scale, scale_pad], dim=1).reshape(-1)
                 w = w.reshape(padded_qkv_out, hidden_size).contiguous()
                 _install_siglip_linear_weight(
                     proj, w, partition=1,
-                    w8a16=(f"self_attn.{proj_name}" in siglip_w8a16_names))
+                    w8a16=(f"self_attn.{proj_name}" in siglip_w8a16_names),
+                    scale=scale)
                 proj.out_features = padded_qkv_out
 
                 # Bias: [num_heads*orig_hd] -> pad -> [num_heads*padded_hd]
@@ -298,6 +337,7 @@ def _convert_siglip_weights_for_rpu(vision_tower, *, w8a16_default: bool = False
                 proj.bias = nn.Parameter(b.reshape(-1).contiguous(), requires_grad=False)
 
             # === O_proj (out_proj): [hidden, orig_in] -> pad -> [hidden, padded_in] -> row swizzle ===
+            scale = _prequantized_siglip_scale(attn.out_proj)
             w = attn.out_proj.weight.data  # [hidden_size, num_heads*orig_hd]
             w = w.view(hidden_size, num_heads, orig_head_dim)
             if padded_head_dim > orig_head_dim:
@@ -307,19 +347,28 @@ def _convert_siglip_weights_for_rpu(vision_tower, *, w8a16_default: bool = False
             w = w.reshape(hidden_size, padded_qkv_out).contiguous()
             _install_siglip_linear_weight(
                 attn.out_proj, w, partition=0,
-                w8a16=("self_attn.out_proj" in siglip_w8a16_names))
+                w8a16=("self_attn.out_proj" in siglip_w8a16_names),
+                scale=scale)
             attn.out_proj.in_features = padded_qkv_out
             # O_proj bias: [hidden_size] -- no padding needed
 
             # === fc1: [orig_inter, hidden] -> pad -> [padded_inter, hidden] -> col swizzle ===
+            scale = _prequantized_siglip_scale(mlp.fc1)
             w = mlp.fc1.weight.data
             if padded_intermediate > orig_intermediate:
                 pad = torch.zeros(padded_intermediate - orig_intermediate, hidden_size,
                                   dtype=w.dtype, device=w.device)
                 w = torch.cat([w, pad], dim=0)
+                if scale is not None:
+                    scale = torch.cat([
+                        scale,
+                        torch.ones(
+                            padded_intermediate - orig_intermediate,
+                            dtype=scale.dtype, device=scale.device),
+                    ])
             _install_siglip_linear_weight(
                 mlp.fc1, w.contiguous(), partition=1,
-                w8a16=("mlp.fc1" in siglip_w8a16_names))
+                w8a16=("mlp.fc1" in siglip_w8a16_names), scale=scale)
             mlp.fc1.out_features = padded_intermediate
 
             # fc1 bias: [orig_inter] -> pad -> [padded_inter]
@@ -331,6 +380,7 @@ def _convert_siglip_weights_for_rpu(vision_tower, *, w8a16_default: bool = False
             mlp.fc1.bias = nn.Parameter(b.contiguous(), requires_grad=False)
 
             # === fc2: [hidden, orig_inter] -> pad -> [hidden, padded_inter] -> row swizzle ===
+            scale = _prequantized_siglip_scale(mlp.fc2)
             w = mlp.fc2.weight.data
             if padded_intermediate > orig_intermediate:
                 pad = torch.zeros(hidden_size, padded_intermediate - orig_intermediate,
@@ -338,7 +388,7 @@ def _convert_siglip_weights_for_rpu(vision_tower, *, w8a16_default: bool = False
                 w = torch.cat([w, pad], dim=1)
             _install_siglip_linear_weight(
                 mlp.fc2, w.contiguous(), partition=0,
-                w8a16=("mlp.fc2" in siglip_w8a16_names))
+                w8a16=("mlp.fc2" in siglip_w8a16_names), scale=scale)
             mlp.fc2.in_features = padded_intermediate
             # fc2 bias: [hidden_size] -- no padding needed
 

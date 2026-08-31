@@ -762,3 +762,33 @@ def test_pi05_rejects_custom_model_code_before_optional_import() -> None:
         Pi05Policy.from_pretrained(
             "unused/checkpoint", trust_remote_code=True
         )
+
+
+def test_pi05_removes_missing_transformers_55_lm_heads() -> None:
+    import torch
+    from rpu_backend.adapters.pi05.loader import _remove_missing_pi05_lm_heads
+
+    policy = torch.nn.Module()
+    policy.model = torch.nn.Module()
+    root = policy.model.paligemma_with_expert = torch.nn.Module()
+    root.paligemma = torch.nn.Module()
+    root.paligemma.lm_head = torch.nn.Linear(3, 4, bias=False, device="meta")
+    root.paligemma.model = torch.nn.Module()
+    root.paligemma.model.language_model = torch.nn.Module()
+    root.paligemma.model.language_model.embed_tokens = torch.nn.Embedding(4, 3)
+    root.gemma_expert = torch.nn.Module()
+    root.gemma_expert.lm_head = torch.nn.Linear(3, 4, bias=False, device="meta")
+    root.gemma_expert.model = torch.nn.Module()
+    root.gemma_expert.model.embed_tokens = torch.nn.Embedding(4, 3)
+
+    removed = _remove_missing_pi05_lm_heads(
+        policy,
+        [
+            "model.paligemma_with_expert.paligemma.lm_head.weight",
+            "model.paligemma_with_expert.gemma_expert.lm_head.weight",
+        ],
+    )
+
+    assert len(removed) == 2
+    assert isinstance(root.paligemma.lm_head, torch.nn.Identity)
+    assert isinstance(root.gemma_expert.lm_head, torch.nn.Identity)

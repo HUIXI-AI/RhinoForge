@@ -32,7 +32,19 @@ def _install_pi_gemma_rmsnorm_class_patch() -> None:
         device = x.device
         x_cpu = x.to('cpu') if x.device.type != 'cpu' else x
         cond_cpu = cond.to('cpu') if (cond is not None and cond.device.type != 'cpu') else cond
-        normed, gate = _orig_forward(self, x_cpu, cond=cond_cpu)
+        if self.dense is not None and self.dense.weight.dtype == torch.int8:
+            scale = self.dense.weight_scale
+            weight = self.dense.weight.float().mul(scale.float().unsqueeze(1))
+            modulation = torch.nn.functional.linear(
+                cond_cpu.float(), weight, self.dense.bias.float())
+            if x_cpu.dim() == 3:
+                modulation = modulation.unsqueeze(1)
+            scale, shift, gate = modulation.chunk(3, dim=-1)
+            normed = self._norm(x_cpu)
+            normed = normed * (1 + scale) + shift
+            normed, gate = normed.to(x_cpu.dtype), gate.to(x_cpu.dtype)
+        else:
+            normed, gate = _orig_forward(self, x_cpu, cond=cond_cpu)
         if device.type != 'cpu':
             normed = normed.to(device)
             if gate is not None:

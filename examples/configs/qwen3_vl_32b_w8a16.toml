@@ -1,6 +1,7 @@
 # 单一完整模板 / Single complete template：注释行展示默认值，取消注释才覆盖运行时。
-# Graph-blocked controlled evaluation only; successful asset preflight is not
-# a numerical or retained-Graph certification.
+# Source-only controlled single-image smoke. The gate name is retained for
+# compatibility; a successful smoke is not numerical, task, performance, or
+# release-runtime certification.
 [runner]
 target = "qwen3_vl"
 
@@ -10,12 +11,12 @@ RPU_LOG_LEVEL = 3 # 默认 3；允许 0..5；进程日志级别。
 # RPU_WARMUP = 0 # 默认 0；非负整数；模型构建后的预热 forward 次数。
 # RPU_MODEL_CACHE = "~/.cache/rhinoforge/models" # 默认模型别名缓存根目录。
 # HF_HOME / HF_HUB_CACHE / HUGGINGFACE_HUB_CACHE：默认继承 Hugging Face；自定义缓存位置时设置。
-LKN_MAX_BATCH_ENTRIES = 4194304 # 系统默认 65536；本模板的大 Graph 容量。
-LKN_KD_BUF_MB = 256 # 系统默认 8；范围 1..256 MiB；本模板取上限。
-LKN_INSTR_BUF_MB = 1024 # 系统默认 64；范围 1..1024 MiB；本模板取上限。
+LKN_MAX_BATCH_ENTRIES = 65536 # 本受控 profile 要求加载时和运行时都保持该值。
+LKN_KD_BUF_MB = 8 # 本受控 profile 要求加载时和运行时都保持该值。
+LKN_INSTR_BUF_MB = 64 # 本受控 profile 要求加载时和运行时都保持该值。
 # RPU_KERNEL_LIB_PATH 由部署环境设置；runner 拒绝从 TOML 选择算子资产。
 # RPU_KVINSERT_V16 = true # 默认 true；允许 0/1；合法布局使用 16 行 KV insert，否则自动回退。
-QWEN3_VL_32B_ALLOW_GRAPH_BLOCKED = true # 默认 false；仅允许本 32B W8A16 受控评估。
+QWEN3_VL_32B_ALLOW_GRAPH_BLOCKED = true # 兼容旧名称；仅允许本 32B W8A16 受控评估。
 # RPU_QWEN3VL_VISION_BATCH = false # 默认 false；true 合并连续且同尺寸的多图 Vision 调用。
 # RPU_QWEN3VL_VISION_BATCH_CAP = 3 # 默认 3；正整数；仅合批开启时生效。
 # RPU_QWEN3VL_VISION_FUSED_MERGER = false # 默认 false；true 将 patch/deepstack merger 纳入 Graph。
@@ -47,4 +48,4 @@ local_files_only = true
 [request]
 image = "assets/example.ppm"
 prompt = "Describe this image in one sentence."
-max_new_tokens = 32
+max_new_tokens = 4

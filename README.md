@@ -90,6 +90,11 @@ playbook。规范流程见[模型移植](docs/model_porting.zh.md)。
 RhinoForge v1.0.0 从源码安装，需要已配置好的 RPU 板卡环境和 Python 3.12。
 授权接收方的安装路径如下：
 
+> **Draft 分支兼容性：** 本分支尚未绑定可发布 runtime-set，并要求 Rhino
+> Launch 提供 `rhino_lkn::ReserveBatchBuffers`。现有 r4 bundle 不具备该能力，
+> 不能与本分支配套使用；以下 r4 流程仅适用于当前 `main`/`v1.0.0`，不构成
+> 本 Draft 的支持声明。
+
 1. 从分发方提供的版本化 bundle URL 下载
    `RhinoForge-runtime-v1.0.0-r4.tar.gz` 及其 `.sha256`，先校验外层归档，再解包。
 2. 检查 `RELEASE.txt` 中 `download_enabled=true`、

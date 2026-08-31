@@ -50,8 +50,9 @@ Verifier 检查 method、INT8/scale tensor 配对和代表性 dequantized weight
 默认 Pi0.5 转换把 VLM decoder 和 action-expert decoder projection 转为 W8A16。Vision
 encoder、AdaRMS dense、action projection 和 processor sidecar 保持 FP16 或不变。
 
-Pi0.5 W8A16 和 W4A16 输出在 v1.0.0 中均为 Source-only：发布版本未为它们
-绑定公开不可变派生 checkpoint 身份或 hash。
+Pi0.5 W8A16 和 mixed W4A16-G32-KV8 输出在 v1.0.0 中均为 Source-only：
+发布版本未为它们绑定公开不可变派生 checkpoint 身份或 hash；精确同量化 oracle
+与 checkpoint 自有任务证据也仍待完成。
 
 ```bash
 python -m rpu_backend.quant.convert_pi05 \
@@ -68,17 +69,25 @@ python -m rpu_backend.quant.convert_pi05 \
   --dst /path/to/pi05-fake-W4 \
   --fake-w4
 
-# Runtime packed W4 评估格式。
+# Runtime mixed W4A16-G32-KV8 评估格式（不是纯 W4）。
 python -m rpu_backend.quant.convert_pi05 \
   --src /path/to/pi05-source \
-  --dst /path/to/pi05-W4A16 \
+  --dst /path/to/pi05-mixed-W4A16-G32-KV8 \
   --fake-w4 --real-w4
 ```
 
-`--keep-int8` 接受逗号分隔 projection name，用于受控 W4 mixed-precision 实验。Real
-W4 自动让 key/value projection 保持 INT8。两种 W4 都是 Source-only 评估路径，
-提升前需有独立不可变资产身份和验证。Converter 会删除旧 remapped checkpoint，
-让 loader 从新量化 tensor 重建。
+该 runtime profile 是 mixed W4A16-G32-KV8，并非纯 W4。仅量化声明的 Gemma
+VLM/action-expert Linear projection 权重：q/o/gate/up/down 沿 K 使用 symmetric
+W4 group-size-32，K/V projection 权重保持 W8；activation 与 KV cache 均保持
+FP16。Checkpoint 中逻辑 FP16 scale shape 为 `[K/32, N]`，加载时再转成 packed
+pgrp ABI 的 controller-striped 布局。SigLIP、AdaRMS dense、action projection
+和 processor sidecar 保持 FP16 或不变。
+
+`--keep-int8` 接受逗号分隔 projection name，用于受控 W4 mixed-precision 实验。
+`--real-w4` 是该 mixed profile 的遗留 CLI 名称，会自动让 K/V projection 权重
+保持 W8。两种 W4 都是 Source-only 评估路径；提升前需有独立不可变资产身份、
+精确同量化 oracle 与 checkpoint 自有任务证据。Converter 会删除旧 remapped
+checkpoint，让 loader 从新量化 tensor 重建。
 
 ## Wall-OSS
 

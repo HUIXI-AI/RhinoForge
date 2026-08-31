@@ -387,21 +387,6 @@ def patch_gemma_model_for_rpu_all_layers_once(model) -> int:
         if use_cache and isinstance(past_key_values, RPUCache):
             past_key_values._prefix_len = past_key_values.position
 
-        # Optional KV cache probe after prefill.
-        import os as _os
-        _probe_dir = _os.environ.get("RPU_PI05_PROBE_DIR")
-        if use_cache and _probe_dir and isinstance(past_key_values, RPUCache):
-            try:
-                import torch as _torch
-                _os.makedirs(_probe_dir, exist_ok=True)
-                for _L in (0, 8, 17):
-                    _k = past_key_values.k_caches[_L].cpu().float()
-                    _v = past_key_values.v_caches[_L].cpu().float()
-                    _torch.save(_k, _os.path.join(_probe_dir, f"kv_post_prefill_L{_L}_k.pt"))
-                    _torch.save(_v, _os.path.join(_probe_dir, f"kv_post_prefill_L{_L}_v.pt"))
-            except Exception as _exc:
-                _LOG.warning("KV probe dump failed: %s", _exc)
-
         return BaseModelOutputWithPast(
             last_hidden_state=output,
             past_key_values=past_key_values if use_cache is not False else None,

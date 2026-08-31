@@ -2,6 +2,8 @@
 // Keeping the module body in an include fragment preserves the process-runtime
 // initialization and teardown ordering of the composition translation unit.
 
+#include "rhino_launch_queue.h"
+
 PYBIND11_MODULE(rpu_backend, m) {
   m.doc() = "RPU backend extension";
 
@@ -10,6 +12,11 @@ PYBIND11_MODULE(rpu_backend, m) {
 
   m.def("rpu_runtime_is_available", &rpu_runtime_is_available,
         "Return whether the initialized backend can access required device nodes");
+  m.def("reserve_batch_buffers", [] {
+    TORCH_CHECK(
+        rhino_lkn::ReserveBatchBuffers(),
+        "RPU runtime could not reserve instruction-addressable Graph buffers");
+  });
 
   m.def("rpu_add", &rpu_add, "rpu_add");
   m.def("rpu_copy_", &rpu_copy_, "rpu_copy_");
@@ -54,13 +61,6 @@ PYBIND11_MODULE(rpu_backend, m) {
   // Shutdown - release all cached resources (SPM pool, caching allocator)
   // Must be called before program exit while the device runtime is still alive.
   m.def("shutdown", &rpu_shutdown, "Release all cached resources (call before exit)");
-
-  // Debug export - store intermediate tensors for verification
-  m.def("set_debug_export", &set_debug_export, "Enable/disable debug tensor export");
-  m.def("get_debug_export", &get_debug_export, "Get debug tensor export state");
-  m.def("get_debug_tensor", &get_debug_tensor, "Get debug tensor by name", py::arg("name"));
-  m.def("clear_debug_tensors", &clear_debug_tensors, "Clear all debug tensors");
-  m.def("list_debug_tensors", &list_debug_tensors, "List all debug tensor names");
 
   // SPM debug - control SPM/chunk size debug output
   m.def("set_spm_debug", &set_spm_debug, "Enable/disable SPM/chunk debug output");

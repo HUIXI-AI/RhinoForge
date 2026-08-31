@@ -927,7 +927,7 @@ def build_hy_vla(
     # profiler 未启用时跳过空闲的 `record_function`；启用 profiler 时完整保留区间。
     # ⚠️ 只在 `torch.autograd._profiler_enabled()` 为 False 时跳过
     # ⇒ **开着 profiler 时行为逐字不变**，trace 里的区间一个不少。
-    # 共享文件（`_bootstrap.py`）⇒ 全局默认 OFF，只在这里 setdefault。
+    # 共享 GraphCache 也使用该安全默认；这里 setdefault 保持策略显式。
     _setdefault_env("RPU_SKIP_IDLE_RECORD_FUNCTION", "1", _env_snapshot)
     # 使用融合 all-reduce，减少 reduce-scatter 与 all-gather 之间的单独提交。
     # ⚠️ 融合版使用 fp32 累加，而两阶段路径是分段求和，因此不保证逐位等价。

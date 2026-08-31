@@ -41,6 +41,20 @@ std::vector<v3::FmbExecutionSpan> semantic_spans() {
 }  // namespace
 
 int main() {
+    const auto wall_dual448_single_image =
+        v3::compose_fmb_three_stage_chunk_plan(
+            {{0, 0, 1024, 1024}},
+            {{0, 0, 768, 768}, {1, 768, 256, 1024}},
+            {{0, 0, 768, 768}, {1, 768, 256, 1024}},
+            {{0, 1024}}, v3::ChunkMode::KV_FIRST);
+    EXPECT(
+        wall_dual448_single_image.compute.plan.chunk_size == 768 &&
+            wall_dual448_single_image.compute.plan.num_chunks == 2 &&
+            wall_dual448_single_image.compute.chunks.back().len == 256 &&
+            v3::fmb_chunk_topology(wall_dual448_single_image) ==
+                v3::FmbChunkTopology::SIMC,
+        "Wall dual-448 executes each semantic image as exact 768+256 SIMC");
+
     const auto wall_exact = v3::compose_fmb_three_stage_chunk_plan(
         {{0, 0, 1728, 1728}}, {{0, 0, 1728, 1728}},
         {{0, 0, 576, 576}, {1, 576, 576, 1152},

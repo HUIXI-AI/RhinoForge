@@ -38,6 +38,11 @@ void process_guarded_spm_alloc_reset_all();
 // PASSTHROUGH direct-kernel queues live in graph_runtime_execute.cpp and must
 // release their DDR command buffers before RpuDdrShutdown().
 void graph_clear_passthrough_kernel_queues();
+// Adapter-owned GraphCache objects can still be held by Python when the
+// process-level shutdown hook runs.  Invalidate their registered native
+// graphs while DDR is alive so their command buffers and retained outputs are
+// released before allocator/DDR teardown.
+void invalidate_registered_rpu_kernel_graphs();
 #include "rpu_spm_allocator.h"
 #include "rpu_caching_allocator.h"
 #include "graph/graph_pybind.h"  // Graph / GraphCache / GraphSignature bindings
@@ -53,12 +58,6 @@ void graph_clear_passthrough_kernel_queues();
 using namespace at;
 
 namespace {
-
-struct LknBatchConfig {
-    int64_t max_entries;
-    int64_t kd_buf_mb;
-    int64_t instr_buf_mb;
-};
 
 int64_t parse_lkn_env(const char* name, int64_t default_value,
                       int64_t max_value) {
@@ -96,6 +95,10 @@ std::vector<int64_t> rpu_get_lkn_batch_config() {
 }
 
 }  // namespace
+
+const LknBatchConfig& rpu_lkn_batch_config_at_load() {
+    return kLknBatchConfigAtLoad;
+}
 
 // =============================================================================
 // Global Debug and Profile Switches - 默认关闭
@@ -162,11 +165,17 @@ pybind11::dict rpu_stat_to_dict(const rpu::Stat& stat) {
 pybind11::dict rpu_get_memory_stats_py() {
   const rpu::DeviceStats stats = rpu::get_memory_stats();
   pybind11::dict d;
+  d["caching_allocator_enabled"] = g_rpu_caching_allocator_enabled;
   d["allocation"] = rpu_stat_to_dict(stats.allocation);
   d["reserved_bytes"] = rpu_stat_to_dict(stats.reserved_bytes);
   d["allocated_bytes"] = rpu_stat_to_dict(stats.allocated_bytes);
   d["active_bytes"] = rpu_stat_to_dict(stats.active_bytes);
   d["segment"] = rpu_stat_to_dict(stats.segment);
+  // Count only HostDDR segments owned by the shared caching allocator. Launch,
+  // SPM and direct-allocation mappings are outside this statistic.
+  d["caching_allocator_mapping"] = rpu_stat_to_dict(stats.segment);
+  d["cached_idle_mapping"] =
+      rpu::get_caching_allocator().getCachedSegmentCount();
   d["inactive_split_bytes"] = rpu_stat_to_dict(stats.inactive_split_bytes);
   d["num_device_alloc"] = stats.num_device_alloc;
   d["num_device_free"] = stats.num_device_free;
@@ -372,6 +381,12 @@ void rpu_shutdown() {
     // Mark first so a repeated/manual+atexit call is idempotent even if one of
     // the best-effort cleanup operations below reports an exception.
     g_rpu_backend_lifecycle = RpuBackendLifecycleState::kShutdown;
+
+    // Python may still own adapter GraphCache wrappers (and therefore native
+    // graph objects) at this point.  Release their graph-owned resources
+    // before marking the allocator shut down; otherwise the later Python GC
+    // cannot safely return those DDR-backed command/output buffers.
+    invalidate_registered_rpu_kernel_graphs();
 
     // Stop cached allocations immediately. This must not depend on the current
     // feature toggle: callers may disable the allocator after creating cached

@@ -18,7 +18,7 @@ RPU_WALL_OSS_FUSED_DENOISE = true # 全局默认 false，builder 默认 true；�
 # RPU_WALL_OSS_DENOISE_UNROLL = true # 默认 true；全部 denoise step 录制为一个 Graph。
 # RPU_WALL_OSS_ATTN_TP8 = true # builder 默认 true；该 profile 的 8-core attention。
 # RPU_WALL_OSS_KVINSERT_PAD16 = true # 默认 true；prefix/KV 行对齐。
-# RPU_WALL_OSS_BATCH_VISION = true # 默认 true；合并兼容的同尺寸多图。
+RPU_WALL_OSS_BATCH_VISION = false # Source-only facade 固定 false；逐图精确预检。
 # RPU_WALL_OSS_BATCH_MAX_SEQ = 768 # 默认 768；正整数；普通 Vision 合批序列上限。
 # RPU_WALL_OSS_DEVICE_PATCH_EMBED = true # 默认 true；RPU patch embedding。
 # RPU_WALL_OSS_FAST_PROCESSOR = true # 默认 true；自校验的快速 processor。
@@ -50,7 +50,7 @@ padding_budget = 64 # 默认 64；非负整数；与 padding_rows 二选一。
 # padding_rows = "auto" # 默认 auto；也可指定非负整数；启用时删除 padding_budget。
 
 [rpu_execution.vision]
-chunk_size = "auto" # 默认 auto；也可用满足模型约束的 16 倍数。
+chunk_size = 768 # 官方双 448 profile：每图 1024 patch，按 768+256 逐图执行。
 
 [rpu_execution.action]
 chunk_size = "auto" # 默认 auto；也可用满足模型约束的 16 倍数。
@@ -60,13 +60,14 @@ alias = "wall-oss-0.5-w4a16-pgrp"
 precision = "w4a16"
 fp16_alias = "wall-oss-0.5"
 dataset_key = "berkeley_autolab_ur5"
-camera_names = ["face_view"]
+camera_names = ["face_view", "right_wrist_view"]
+state_bins = 512
 action_horizon = 32
 num_steps = 10
 max_seq_len = 2048
 
 [request]
-images = ["assets/front_camera.jpg"]
+images = ["assets/example.ppm", "assets/example.ppm"]
 instruction = "Pick up the object on the table."
 proprioception = [
   0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,

@@ -45,10 +45,34 @@ chunk_size = "auto" # 默认 auto；也可用满足模型约束的 16 倍数。
 chunk_size = "auto" # 默认 auto；也可用满足模型约束的 16 倍数。
 
 [model]
-alias = "gr00t-n1d7-3b"
-qwen3vl_alias = "qwen3-vl-2b"
-embodiment_id = 20
+profile = "gr00t-n1.7-3b-droid-zero-shot"
+alias = "gr00t-n1d7-3b-droid-zero-shot"
+checkpoint_repository = "nvidia/GR00T-N1.7-3B"
+checkpoint_revision = "2fc962b973bccdd5d8ce4f67cc63b264d6886495"
+processor_config_sha256 = "85c1b4690ae090559e79a45193e598b65d6146eedf14750884da65e6d31032be"
+statistics_sha256 = "c97b1b07a82a8a8858771d56d278732d97dd8eae506032c146c77eb53828afc9"
+cosmos_repository = "nvidia/Cosmos-Reason2-2B"
+cosmos_revision = "9ce19a195e423419c349abfc86fd07178b230561"
+cosmos_manifest_sha256 = "0aeff3308620feaa907990623b9db429a43cc671673d9f8ee34e4415144055a2"
+embodiment_id = 24
 source_only_acknowledged = true
+# cosmos_checkpoint = "/path/to/exact/cosmos-processor-assets"
+# Execution requires the local eight-file directory matching the manifest.
+
+[model.input_envelope]
+embodiment_tag = "OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT"
+camera_names = ["exterior_image_1_left", "wrist_image_left"]
+video_delta_indices = [-15, 0]
+images_per_request = 4
+image_grid_thw = [1, 16, 16]
+image_target_size = [256, 256]
+batch_size = 1
+state_dim = 17
+action_dim = 17
+action_horizon = 40
+processor_input_oracle_sequence_length = 277
+kvpad16_min_rows = 288
+rhinoforge_cache_capacity = 320
 
 [request]
 input_pt = "requests/gr00t_preprocessed.pt"

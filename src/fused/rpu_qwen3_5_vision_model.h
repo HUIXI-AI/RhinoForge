@@ -140,33 +140,6 @@ public:
         return merged_buf_.narrow(1, 0, current_output_patches_ / 4);
     }
 
-    // ── Per-layer debug snapshots (only populated under get_debug_export()) ──────────
-    //   dbg_hidden = [num_layers, N, hidden]                 — Phase-2 per-layer output
-    //                                                          (residual1 after Phase 6, core 0).
-    //   dbg_q      = [num_layers, NUM_CORES, N, local_q_dim] — Phase-1 rope'd Q (per core).
-    // Filled by in-graph DMAs (NOT SPM+cpu_ptr) so they also carry real values under
-    // capture/replay; read from Python via the get_dbg_* torch ops AFTER the forward.
-    // Enable with torch.rpu.set_debug_export(True) before the forward.
-    // SELF-CHECK IS AN INSTRUMENT CHECK, NOT A DIAGNOSIS. dbg_hidden[num_layers-1] and the
-    //     forward's return are byte-identical DMAs — both core-0 SPM → DDR, channel 0, zero
-    //     barriers — emitted adjacently on the same stream off the same SPM. They
-    //     CANNOT legitimately disagree, so a mismatch only
-    //     ever means the probe is broken. It cannot show that the return path is wrong.
-    at::Tensor dbg_hidden() {
-        TORCH_CHECK(dbg_hidden_.defined(),
-                    "qwen3_5_vision: dbg_hidden is unset — run a forward with "
-                    "torch.rpu.set_debug_export(True) set before it.");
-        return dbg_hidden_;
-    }
-    at::Tensor dbg_q() {
-        TORCH_CHECK(dbg_q_.defined(),
-                    "qwen3_5_vision: dbg_q is unset. It is OFF BY DEFAULT even under "
-                    "set_debug_export(True) — set QWEN3_5_VISION_DBG_Q=1 too. It is opt-in "
-                    "because it is an 8-core scatter and so injects a 7+7 barrier fence per "
-                    "layer (dbg_hidden is num_cores=1 → zero barriers; see dbg_q_enabled()).");
-        return dbg_q_;
-    }
-
     // forward — drive the 24-block encoder. Input is fp16 RPU
     // [1, num_patches, patch_dim] with STEP0, or canonical G0.5 compact
     // [1,18,3,256,256]; without STEP0 it is [1,num_patches,hidden]. STEP0 adds
@@ -299,10 +272,6 @@ private:
     at::Tensor merger_dst_ref_; // keeps a per-forward fusion target alive until sync completion
     std::array<uint64_t, 3> merger_dst_bases_{};
     bool merger_wrote_fusion_target_ = false;
-
-    // Per-layer debug snapshots (get_debug_export() only). See dbg_hidden()/dbg_q().
-    at::Tensor dbg_hidden_;  // [num_layers, N, hidden]
-    at::Tensor dbg_q_;       // [num_layers, NUM_CORES, N, local_q_dim]
 
     // Model config
     double eps_ = 1e-6;

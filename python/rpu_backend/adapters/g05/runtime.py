@@ -1974,7 +1974,7 @@ def _g05_policy_runtime_ready(policy) -> bool:
 
 @_transactional_g05_policy_install
 def patch_g05_policy_for_rpu(policy, *, max_seq_len: int = 2048):
-    """Patch a canonical G0.5 policy for continuous action inference.
+    """Patch the public G0.5 base policy for FM, discrete AR, and CoT.
 
     Load the official policy on CPU and call ``eval()`` before this function.
     The VLM text stack and action-expert decoder core move to RPU. Vision still
@@ -1998,28 +1998,62 @@ def patch_g05_policy_for_rpu(policy, *, max_seq_len: int = 2048):
         raise NotImplementedError(
             "G0.5 RPU policy supports inference only; call policy.eval()"
         )
-    continuous = bool(getattr(policy, "continuous_action", False))
-    discrete = bool(getattr(policy, "discrete_action", False))
+    continuous = getattr(policy, "continuous_action", None)
+    discrete = getattr(policy, "discrete_action", None)
     model = getattr(policy, "model", None)
     if model is None:
         raise TypeError("expected G05PolicyQwen35 with policy.model")
     if bool(getattr(model, "use_training_rtc", False)):
         raise NotImplementedError(
             "G0.5 RTC policies must use the upstream runtime; RhinoForge "
-            "patches only the public non-RTC continuous policy"
+            "patches only the public non-RTC policy"
         )
-    if not continuous or discrete:
+    if (
+        continuous is not True
+        or discrete is not True
+        or getattr(policy, "predict_cot", None) is not True
+        or getattr(policy, "return_continuous_action", None) is not True
+    ):
         raise NotImplementedError(
-            "G0.5 RPU supports only continuous_action=true with "
-            "discrete_action=false; discrete AR/CoT is not certified"
+            "G0.5 RPU admits only the pinned public base profile with "
+            "continuous_action=true, discrete_action=true, predict_cot=true, "
+            "and return_continuous_action=true"
         )
-    if bool(getattr(policy, "predict_cot", False)):
+    if max_seq_len != 2048:
+        raise ValueError("the pinned public G0.5 profile requires max_seq_len=2048")
+
+    ar_helper = getattr(model, "ar_helper", None)
+    action_token_ranges = getattr(ar_helper, "_token_index_ranges", None)
+    if (
+        ar_helper is None
+        or getattr(ar_helper, "block_wise_autoregressive", None) is not False
+        or getattr(ar_helper, "do_sample", None) is not False
+        or getattr(ar_helper, "max_new_tokens", None) != 300
+        or not isinstance(getattr(ar_helper, "eov_token_id", None), int)
+        or not isinstance(action_token_ranges, (list, tuple))
+        or not any(
+            isinstance(item, dict) and item.get("pos_id") == 3
+            for item in action_token_ranges
+        )
+    ):
         raise NotImplementedError(
-            "G0.5 RPU requires predict_cot=false; AR/CoT is not certified"
+            "G0.5 RPU requires the pinned greedy non-BAR AR/CoT profile with "
+            "max_new_tokens=300, EOV, and configured discrete-action tokens"
         )
-    if max_seq_len <= 0 or (continuous and max_seq_len < 32):
-        raise ValueError(
-            "max_seq_len must be positive and cover the 32-token action horizon"
+    if not all(
+        callable(value)
+        for value in (
+            getattr(policy, "forward_inference", None),
+            getattr(policy, "generate_text", None),
+            getattr(policy, "generate_action", None),
+            getattr(model, "inference_ar", None),
+            getattr(getattr(policy, "processor", None), "decode_text", None),
+            getattr(getattr(policy, "processor", None), "decode_ar", None),
+        )
+    ):
+        raise TypeError(
+            "the pinned public G0.5 implementation must provide its official "
+            "forward_inference, AR/CoT orchestration, and decoders"
         )
     parameters = getattr(policy, "parameters", None)
     if callable(parameters) and any(

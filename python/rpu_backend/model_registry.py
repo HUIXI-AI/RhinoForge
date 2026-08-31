@@ -31,6 +31,7 @@ MODELS: Dict[str, str] = {
     # Source-only local conversion outputs; aliases are path mappings, not
     # immutable derived-asset identities or support claims.
     "pi05-libero-finetuned-w8a16-vlm-expert": "pi05_libero_finetuned-w8a16-vlm-expert",
+    # Legacy alias name: this is mixed W4A16-G32-KV8, not a pure-W4 profile.
     "pi05-libero-finetuned-w4real-kvint8": "pi05_libero_finetuned-w4real-kvint8",
     # Wall-OSS-0.5 VLA (Qwen2.5-VL-3B)
     "wall-oss-0.5": "wall-oss-0.5",
@@ -39,22 +40,24 @@ MODELS: Dict[str, str] = {
     # Group-wise int4 profile: expert-0 down remains int8; the other seven
     # projections use int4-pgrp with group_size=32.
     "wall-oss-0.5-w4a16-pgrp": "wall-oss-0.5-w4a16-pgrp",
-    # GR00T-N1.7-3B VLA (Qwen3-VL-2B backbone + flow-matching DiT action head).
-    # RPU runtime = adapters/gr00t (build_gr00t_vla); needs the public Qwen3-VL-2B
-    # config/tokenizer alongside ("qwen3-vl-2b") for the backbone scaffold.
-    "gr00t-n1d7-3b": "GR00T-N1.7-3B",
+    # Distinct Source-only DROID checkpoint identities. Registry resolution is
+    # not admission: the GR00T builder remains fail-closed until the exact
+    # gated Cosmos processor/config manifest is release-bound.
+    "gr00t-n1d7-3b-droid-zero-shot": "GR00T-N1.7-3B",
+    "gr00t-n1d7-droid-finetuned": "GR00T-N1.7-DROID",
     # LingBot-VLA V2 (Qwen3-VL-4B + 32-expert top-4 AdaRMS sparse-MoE
     # action expert). Registry resolution is not a support claim.
     "lingbot-vla-v2-6b": "hf/robbyant/lingbot-vla-v2-6b",
-    # Public InternRobotics/InternVLA-N1-w-NavDP source-only cache alias. Path
-    # resolution is not a support claim; execution remains fail-closed.
+    # Public InternRobotics/InternVLA-N1-w-NavDP component-scope cache alias.
+    # Path resolution remains separate from the exact component contract; the
+    # complete policy is not admitted by this alias.
     "internvla-n1-navdp": "InternVLA-N1-w-NavDP",
     # Hy-Embodied-0.5-VLA (HunYuanVL dual-tower: HYViT2-400M AnyRes ViT + MoT VLM
     # + flow-matching action expert). RPU runtime = adapters/hy_vla (build_hy_vla).
     # obs supplies pre-tokenized lang_tokens + the prefill/denoise masks, so no
     # tokenizer is needed at inference; the ckpt is a single model.safetensors.
     "hy-embodied-0.5-vla-umi": "Hy-Embodied-0.5-VLA-UMI",
-    # DINOv3 ViT-B encoder.
+    # DINOv3 ViT-B component-scope feature encoder.
     "dinov3-vit-b": "dinov3-vitb16-pretrain-lvd1689m",
     # Qwen3-VL (vision + text)
     "qwen3-vl-2b": "Qwen3-VL-2B-Instruct",

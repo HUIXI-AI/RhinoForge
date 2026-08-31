@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import threading
 import weakref
+from functools import lru_cache
 from typing import Any
 
 import torch
@@ -203,6 +204,7 @@ def _pi05_graph_runtime_profile(self, num_steps: int) -> dict:
         ) is not None,
         "denoise_graph": bool(_denoise_graph_enabled()),
         "denoise_unroll": bool(_denoise_unroll_enabled()),
+        "prefix_pad16": bool(_prefix_pad16_enabled()),
         "kvinsert_pad16": bool(_kvinsert_pad16_enabled()),
         "execution": tuple(
             (stage, tuple(sorted(fields.items())))
@@ -339,34 +341,14 @@ def _reset_prefix_mask_cache():
         _PREFIX_MASK_CACHE_MISSES = 0
 
 
-# =============================================================================
-# Debug probe: dump named tensors when RPU_PI05_PROBE_DIR is set. It is a no-op
-# when unset and fails silently on errors
-# to avoid perturbing exec.
-# =============================================================================
-def _pi05_probe_save(name: str, tensor: Any) -> None:
-    probe_dir = os.environ.get("RPU_PI05_PROBE_DIR")
-    if not probe_dir or tensor is None:
-        return
-    try:
-        os.makedirs(probe_dir, exist_ok=True)
-        t = tensor
-        if hasattr(t, "device") and t.device.type == "rpu":
-            t = t.cpu()
-        if hasattr(t, "dtype") and t.dtype in (torch.float16, torch.bfloat16):
-            t = t.float()
-        torch.save(t, os.path.join(probe_dir, f"{name}.pt"))
-    except Exception as exc:  # probes must never break the forward
-        _LOG.warning("Pi05 probe dump %s failed: %s", name, exc)
-
-
-def _load_pi05_probe_tensor(
+@lru_cache(maxsize=3)
+def _load_pi05_probe_tensor_snapshot(
     path: str,
-    *,
     name: str,
     expected_shape: tuple[int, ...],
+    _file_identity: tuple[int, int, int, int, int],
 ) -> torch.Tensor:
-    """Load one local debug override without enabling arbitrary pickle."""
+    """Load and validate one unchanged, read-only local debug override."""
     value = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(value, torch.Tensor):
         raise TypeError(
@@ -383,6 +365,30 @@ def _load_pi05_probe_tensor(
     if value.is_floating_point() and not bool(torch.isfinite(value).all()):
         raise ValueError(f"{name} override must contain only finite values")
     return value
+
+
+def _load_pi05_probe_tensor(
+    path: str,
+    *,
+    name: str,
+    expected_shape: tuple[int, ...],
+) -> torch.Tensor:
+    """Reuse an unchanged local debug override without enabling pickle."""
+    resolved_path = os.path.realpath(path)
+    stat = os.stat(resolved_path)
+    identity = (
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+    )
+    return _load_pi05_probe_tensor_snapshot(
+        resolved_path,
+        name,
+        tuple(expected_shape),
+        identity,
+    )
 
 
 # =============================================================================
@@ -441,7 +447,6 @@ def _sample_noise(self, bsize, noise):
             name="RPU_PI05_LOAD_NOISE",
             expected_shape=actions_shape,
         ).to(dtype=torch.float32)
-    _pi05_probe_save("x_t_init", x_t)
     return x_t
 
 
@@ -521,6 +526,16 @@ def _plan_pi05_prefix_execution(self, logical_len: int) -> tuple[int, int]:
     trailing and masked, and the RoPE
     index/cache-row split makes it semantics-preserving.
     """
+    logical_len = int(logical_len)
+    prepared = _PI05_PREPARED_GRAPH_PROFILES.get(self)
+    cached = (
+        prepared.get("_prefix_execution_plan")
+        if prepared is not None
+        else None
+    )
+    if cached is not None and cached[0] == logical_len:
+        return cached[1]
+
     vlm = self.paligemma_with_expert.paligemma.model.language_model
     handle = vlm._rpu_vlm_decoder_handle
     requested_chunk = int(getattr(vlm, "_rpu_chunk_size", 0))
@@ -540,34 +555,37 @@ def _plan_pi05_prefix_execution(self, logical_len: int) -> tuple[int, int]:
             if _prefix_pad16_enabled()
             else logical_len
         )
-        return execution_len, resolve(execution_len)
-
-    padding_rows = prefill.get("padding_rows", "auto")
-    padding_budget = int(prefill.get("padding_budget", 15))
-    # Leave the configured action horizon addressable after the physical prefix.
-    physical_limit = (
-        int(getattr(vlm, "_rpu_max_seq_len", 2048))
-        - int(self.config.chunk_size)
-    )
-
-    def score(execution_len, chunk_size, num_chunks, padding, tail_deficit):
-        return (
-            num_chunks,
-            int(execution_len % 16 != 0),
-            padding,
-            tail_deficit,
+        plan = (execution_len, resolve(execution_len))
+    else:
+        padding_rows = prefill.get("padding_rows", "auto")
+        padding_budget = int(prefill.get("padding_budget", 15))
+        # Leave the action horizon addressable after the physical prefix.
+        physical_limit = (
+            int(getattr(vlm, "_rpu_max_seq_len", 2048))
+            - int(self.config.chunk_size)
         )
 
-    return plan_bounded_prefill_execution(
-        logical_len,
-        physical_limit,
-        padding_budget,
-        resolve,
-        alignment=1,
-        padding_rows=padding_rows,
-        exact_chunk_size=(requested_chunk or None),
-        candidate_score=score,
-    )
+        def score(execution_len, chunk_size, num_chunks, padding, tail_deficit):
+            return (
+                num_chunks,
+                int(execution_len % 16 != 0),
+                padding,
+                tail_deficit,
+            )
+
+        plan = plan_bounded_prefill_execution(
+            logical_len,
+            physical_limit,
+            padding_budget,
+            resolve,
+            alignment=1,
+            padding_rows=padding_rows,
+            exact_chunk_size=(requested_chunk or None),
+            candidate_score=score,
+        )
+    if prepared is not None:
+        prepared["_prefix_execution_plan"] = (logical_len, plan)
+    return plan
 
 
 def _prefill_prefix_embs(self, images, img_masks, tokens, masks, rpu_device):
@@ -632,16 +650,11 @@ def _prefill_prefix_embs(self, images, img_masks, tokens, masks, rpu_device):
         prefix_att_masks,
         execution_prefix_len - logical_prefix_len,
     )
-    _pi05_probe_save("prefix_embs", prefix_embs)
-    _pi05_probe_save("prefix_pad_masks", prefix_pad_masks)
-    _pi05_probe_save("prefix_att_masks", prefix_att_masks)
     # A cache hit returns the last (mask4d, pos_ids) verbatim;
     # cache miss with all-zero att uses pad-outer-product fast-path; otherwise
     # calls upstream make_att_2d_masks.
     prefix_att_2d_masks_4d, prefix_position_ids = _cached_build_prefix_mask_4d(
         prefix_pad_masks, prefix_att_masks, prepare_attention_masks_4d)
-    _pi05_probe_save("prefix_att_2d_masks_4d", prefix_att_2d_masks_4d)
-    _pi05_probe_save("prefix_position_ids", prefix_position_ids)
     self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
     vlm = self.paligemma_with_expert.paligemma.model.language_model
@@ -677,15 +690,6 @@ def _prefill_prefix_embs(self, images, img_masks, tokens, masks, rpu_device):
     }
     prefix_len = int(prefix_pad_masks.shape[1])
     past_key_values._prefix_len = prefix_len
-    # Probe KV cache state after prefill for comparison with a reference run.
-    if os.environ.get("RPU_PI05_PROBE_DIR"):
-        _pi05_probe_save("kv_post_prefill_L0_k", past_key_values.k_caches[0])
-        _pi05_probe_save("kv_post_prefill_L0_v", past_key_values.v_caches[0])
-        _pi05_probe_save("kv_post_prefill_L8_k", past_key_values.k_caches[8])
-        _pi05_probe_save("kv_post_prefill_L8_v", past_key_values.v_caches[8])
-        _pi05_probe_save("kv_post_prefill_L17_k", past_key_values.k_caches[17])
-        _pi05_probe_save("kv_post_prefill_L17_v", past_key_values.v_caches[17])
-
     return past_key_values, prefix_pad_masks, prefix_len
 
 
@@ -841,12 +845,6 @@ def _run_denoise_python_baseline(self, x_t, prefix_pad_masks, past_key_values,
                 [1] + [0] * (chunk_size - 1),
                 dtype=suffix_embs.dtype, device=suffix_embs.device,
             )[None, :].expand(bsize, chunk_size)
-        if step == 0:
-            _pi05_probe_save("suffix_embs_step0", suffix_embs)
-            _pi05_probe_save("adarms_cond_step0", adarms_cond)
-            _pi05_probe_save("suffix_pad_masks_step0", suffix_pad_masks)
-            _pi05_probe_save("suffix_att_masks_step0", suffix_att_masks)
-
         # Construct the mask once at step 0 (data_ptr stable across
         # 5 forwards → C++ AdaRMSModel mask cache hits on steps 1-4).
         if step == 0:
@@ -859,8 +857,6 @@ def _run_denoise_python_baseline(self, x_t, prefix_pad_masks, past_key_values,
             prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
             position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
             full_att_2d_masks_4d = prepare_attention_masks_4d(full_att_2d_masks)
-            _pi05_probe_save("att_mask_4d_step0", full_att_2d_masks_4d)
-            _pi05_probe_save("position_ids_step0", position_ids)
 
         # Expert forward via paligemma_with_expert — routes through
         # `rpu_adarms_model_forward`. That function:
@@ -877,8 +873,6 @@ def _run_denoise_python_baseline(self, x_t, prefix_pad_masks, past_key_values,
             adarms_cond=[None, adarms_cond],
         )
         suffix_out = outputs_embeds[1]
-        if step == 0:
-            _pi05_probe_save("suffix_out_step0_full", suffix_out)
 
         # Preserve the reference output projection semantics:
         #   - take last chunk_size tokens (take_len precomputed above)
@@ -886,18 +880,12 @@ def _run_denoise_python_baseline(self, x_t, prefix_pad_masks, past_key_values,
         #   - action_out_proj on CPU fp32 -> v_t is fp16 (post-hook cast)
         suffix_out = suffix_out[:, -take_len:]
         suffix_out = suffix_out.to(dtype=torch.float32)
-        if step == 0:
-            _pi05_probe_save("suffix_out_step0_sliced", suffix_out)
         v_t = self.action_out_proj(suffix_out)
-        if step == 0:
-            _pi05_probe_save("v_t_step0", v_t)
 
         # Python type promotion keeps the Euler accumulator in FP32:
         # `x_t + dt * v_t` to fp32 because x_t is fp32 and (dt*v_t) is fp32
         # (Python float * fp16 -> fp32).
         x_t = x_t + dt * v_t
-        if step == 0:
-            _pi05_probe_save("x_t_after_step0", x_t)
 
     return x_t
 

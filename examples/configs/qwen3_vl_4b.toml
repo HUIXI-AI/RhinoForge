@@ -1,5 +1,5 @@
 # 单一完整模板 / Single complete template：注释行展示默认值，取消注释才覆盖运行时。
-# Complete Qwen3-VL 4B Supported multi-image runner profile.
+# Qwen3-VL 4B Source-only multi-image evaluation profile; release gates remain pending.
 [runner]
 target = "qwen3_vl"
 

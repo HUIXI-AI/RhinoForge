@@ -45,7 +45,7 @@ def main() -> int:
         return 0
     if os.environ.get("QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED") != "1":
         raise SystemExit(
-            "Qwen3.5 Vision is Experimental/numeric-blocked and disabled by "
+            "Qwen3.5 Vision is Source-only/numeric-blocked and disabled by "
             "default. For controlled evaluation only, set exact "
             "QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED=1 before running this example."
         )

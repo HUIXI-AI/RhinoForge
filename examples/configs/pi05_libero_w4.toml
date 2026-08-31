@@ -1,5 +1,7 @@
 # 单一完整模板 / Single complete template：注释行展示默认值，取消注释才覆盖运行时。
-# Pi0.5 Libero W4A16 Source-only local-conversion profile；reduced-step/closed-loop 也仅为 Source-only。
+# Pi0.5 Libero mixed W4A16-G32-KV8（非纯 W4）：仅 Gemma Linear projection 权重；
+# q/o/gate/up/down W4 G32，K/V 权重 W8，activation/KV cache FP16。该本地转换
+# profile 为 Source-only，同量化 oracle 与任务证据 pending；reduced-step/closed-loop 同样如此。
 [runner]
 target = "pi05"
 
@@ -52,6 +54,7 @@ chunk_size = "auto" # 默认 auto；也可用满足模型约束的 16 倍数。
 chunk_size = "auto" # 默认 auto；也可用满足模型约束的 16 倍数。
 
 [model]
+# 遗留 alias 名称；实际精度契约为上面的 mixed W4A16-G32-KV8。
 alias = "pi05-libero-finetuned-w4real-kvint8"
 
 [request]

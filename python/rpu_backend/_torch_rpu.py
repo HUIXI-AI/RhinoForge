@@ -31,9 +31,8 @@ def configure_torch_rpu(
     rpu_module.manual_seed_all = manual_seed_all
 
     for name in (
-        "set_debug set_profile set_debug_export set_spm_debug "
+        "set_debug set_profile set_spm_debug "
         "get_debug get_profile get_debug_export get_spm_debug "
-        "get_debug_tensor clear_debug_tensors list_debug_tensors "
         "spm_alloc_dump reset_profile_accumulators"
     ).split():
         setattr(rpu_module, name, getattr(debug, name))

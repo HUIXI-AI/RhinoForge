@@ -56,7 +56,7 @@ _ATTN_TP = 2
 _MLP_CORES = 8
 _PREFILL_CHUNK_SIZE_CAP_SAFE = 256
 _PREFILL_CHUNK_SIZE_CAP_TP8_PAD16 = 384
-_PREFILL_CHUNK_POLICY_VERSION = 4
+_PREFILL_CHUNK_POLICY_VERSION = 5
 
 
 def _kvinsert_pad16_enabled() -> bool:
@@ -93,71 +93,13 @@ def _prefill_chunk_size_cap(attn_tp: int) -> int:
     """Return the build-time auto-planner ceiling for text prefill.
 
     The 384-token layout is supported by the SPM envelope only for TP8, and
-    padding keeps the equal-two long-prefix plan legal. Keep the established
-    256-token ceiling for TP2 or an explicitly unpadded prefix.
+    the shared planner may split longer prefixes into as many legal chunks as
+    needed. Keep the established 256-token ceiling for TP2 or an explicitly
+    unpadded prefix.
     """
     if attn_tp == _MLP_CORES and _kvinsert_pad16_enabled():
         return _PREFILL_CHUNK_SIZE_CAP_TP8_PAD16
     return _PREFILL_CHUNK_SIZE_CAP_SAFE
-
-
-def _equal_two_chunk_supported(
-    chunk_size: int, execution_len: int, geom: dict
-) -> bool:
-    """Whether Wall TP8 LTM can safely execute two equal FP16 chunks.
-
-    This delegates to ``sdpa_helpers.is_valid_chunk_size``, the same native
-    predicate used by the auto planner and ``compute_chunks_impl``. Feasibility
-    is a property of ``(chunk_size, execution_len)`` because accumulated calls
-    have different grid geometry. C288 stays excluded separately because its
-    ACC16 first chunk is outside the strict prefix contract represented here.
-    """
-    if chunk_size == 288:
-        return False
-    from rpu_backend._cpp_ext import sdpa_helpers as h
-    return bool(h.is_valid_chunk_size(
-        **geom, cs=chunk_size, seq_len=execution_len, position=0))
-
-
-def _prefill_execution_plan(
-    real_len: int,
-    chunk_size_cap: int,
-    *,
-    pad16: bool,
-    equal_two: bool,
-    geom: dict,
-) -> tuple[int, int]:
-    """Return ``(execution_len, planned_chunk_size)`` before embedding assembly.
-
-    A prefix that fits the supported single-chunk cap keeps the existing 16-token
-    KV-insert alignment. Longer Wall TP8 prefixes use the smallest 32-aligned
-    execution length, so the two chunks are both 16-aligned and exactly equal.
-
-    This helper owns the Wall-specific execution-length policy.  A live model
-    must still ask the native dry resolver for the actual chunk size because
-    the full decoder's SPM and kernel-validity gates can tighten it below this
-    policy ceiling.
-    """
-    if real_len <= 0:
-        raise ValueError(f"prefill length must be positive, got {real_len}")
-    if not pad16:
-        return real_len, min(real_len, chunk_size_cap)
-
-    padded16 = ((real_len + 15) // 16) * 16
-    if not equal_two or padded16 <= chunk_size_cap:
-        return padded16, min(padded16, chunk_size_cap)
-
-    execution_len = ((real_len + 31) // 32) * 32
-    while execution_len <= 2 * chunk_size_cap:
-        chunk_size = execution_len // 2
-        if _equal_two_chunk_supported(chunk_size, execution_len, geom):
-            return execution_len, chunk_size
-        execution_len += 32
-    raise ValueError(
-        "Wall-OSS equal-two prefill has no safe two-chunk execution profile: "
-        f"real_len={real_len}, chunk_size_cap={chunk_size_cap}, "
-        f"max_execution_len={2 * chunk_size_cap}"
-    )
 
 
 def _prefill_graph_signature(
@@ -448,8 +390,7 @@ _CHUNK_ENVELOPE_MAX_KV = 8192
 
 
 def _configure_causal_decoder_handle(
-    *, set_weights, weight_args, chunk_size_cap, equal_two_prefill,
-    chunk_size_override=0
+    *, set_weights, weight_args, chunk_size_cap, chunk_size_override=0
 ):
     """Create/configure a decoder handle, destroying it on any failed gate."""
     handle = torch.ops.rpu.causal_decoder_create()
@@ -462,11 +403,8 @@ def _configure_causal_decoder_handle(
         torch.ops.rpu.causal_decoder_set_chunk_envelope(
             handle, _CHUNK_ENVELOPE_MAX_KV, chunk_size_cap
         )
-        torch.ops.rpu.causal_decoder_set_equal_two_prefill(
-            handle, equal_two_prefill
-        )
-        # The cap/equal-two setters reset the override, so exact public control
-        # must be installed last.  Zero preserves the native auto planner.
+        # The cap setter resets the override, so exact public control must be
+        # installed last. Zero preserves the native auto planner.
         torch.ops.rpu.causal_decoder_set_chunk_size_override(
             handle, chunk_size_override
         )
@@ -487,8 +425,7 @@ class WallOssLLM:
 
     def __init__(self, *, handle, cache, graph_cache, embed_w, hidden_size,
                  num_layers, head_dim, rope_theta, mrope_section,
-                 prefill_chunk_size_cap, prefill_pad16, prefill_equal_two,
-                 attn_geometry, partial_mrope=None, execution_config=None):
+                 prefill_pad16, partial_mrope=None, execution_config=None):
         partial_mrope = (
             _partial_mrope_enabled()
             if partial_mrope is None else bool(partial_mrope)
@@ -504,14 +441,7 @@ class WallOssLLM:
         self._embed_w = embed_w          # [vocab, hidden] fp32 CPU
         self.hidden_size = hidden_size
         self.num_layers = num_layers
-        self._prefill_chunk_size_cap = prefill_chunk_size_cap
         self._prefill_pad16 = prefill_pad16
-        self._prefill_equal_two = prefill_equal_two
-        # Attention geometry AS THE C++ DECODER SEES IT (post KV replication),
-        # so the host prefill planner can ask the real chunk predicate rather
-        # than re-deriving the kernel's tiling rules. See
-        # :func:`_equal_two_chunk_supported`.
-        self._attn_geometry = dict(attn_geometry)
         self._rpu_execution = (
             {} if execution_config is None else execution_config
         )
@@ -570,44 +500,17 @@ class WallOssLLM:
                 f"reserve_rows={reserve_rows}"
             )
         stage = self._rpu_execution.get("prefill", {})
-        if (
+        default_policy = (
             stage.get("chunk_size", "auto") == "auto"
             and "padding_rows" not in stage
             and "padding_budget" not in stage
-        ):
-            # Preserve the Wall default execution length byte-for-byte
-            # when no public padding policy was requested.  The policy helper's
-            # chunk is only a ceiling/equal-two target: the full native planner
-            # can choose a smaller value once it applies the model's real SPM
-            # and kernel-validity gates (tensor parallelism 2 at 192 rows can
-            # resolve to a 96-row chunk, for example).
-            execution_len, _ = _prefill_execution_plan(
-                real_len,
-                self._prefill_chunk_size_cap,
-                pad16=self._prefill_pad16,
-                equal_two=self._prefill_equal_two,
-                geom=self._attn_geometry,
-            )
-            if execution_len > physical_limit:
-                raise ValueError(
-                    "Wall-OSS prefill execution plus reserved action rows "
-                    "exceeds the shared KV cache: "
-                    f"real_len={real_len}, execution_len={execution_len}, "
-                    f"reserve_rows={reserve_rows}, "
-                    f"max_seq_len={self.cache.max_seq_len}"
-                )
-            chunk_size = int(
-                torch.ops.rpu.causal_decoder_resolve_prefill_chunk_size(
-                    self._handle, execution_len, 0
-                )
-            )
-            return execution_len, chunk_size
+        )
 
         from rpu_backend.runtime.decoder import plan_bounded_prefill_execution
         return plan_bounded_prefill_execution(
             real_len,
             physical_limit,
-            int(stage.get("padding_budget", 64)),
+            0 if default_policy else int(stage.get("padding_budget", 64)),
             lambda execution_len: (
                 torch.ops.rpu.causal_decoder_resolve_prefill_chunk_size(
                     self._handle, execution_len, 0
@@ -924,11 +827,6 @@ def build_wall_oss_llm(
             f"requested={CHUNK_SIZE_OVERRIDE}, "
             f"ceiling={PREFILL_CHUNK_SIZE_CAP}"
         )
-    PREFILL_EQUAL_TWO = (
-        ATTN_TP == _MLP_CORES
-        and PREFILL_PAD16
-        and CHUNK_SIZE_OVERRIDE == 0
-    )
     REP = ATTN_TP // NKV            # KV-head replication factor (1 or 4)
     NKV_EFF = NKV * REP             # effective KV heads the C++ decoder sees (== ATTN_TP)
 
@@ -1175,7 +1073,6 @@ def build_wall_oss_llm(
         set_weights=set_weights,
         weight_args=weight_args,
         chunk_size_cap=PREFILL_CHUNK_SIZE_CAP,
-        equal_two_prefill=PREFILL_EQUAL_TWO,
         chunk_size_override=CHUNK_SIZE_OVERRIDE,
     )
     transferred = False
@@ -1184,15 +1081,7 @@ def build_wall_oss_llm(
             handle=handle, cache=cache, graph_cache=graph_cache,
             embed_w=embed_w, hidden_size=H, num_layers=num_layers,
             head_dim=HD, rope_theta=THETA, mrope_section=MROPE,
-            prefill_chunk_size_cap=PREFILL_CHUNK_SIZE_CAP,
             prefill_pad16=PREFILL_PAD16,
-            prefill_equal_two=PREFILL_EQUAL_TWO,
-            # NKV_EFF / ATTN_TP, not the checkpoint's NKV: the C++ decoder sees
-            # the REPLICATED KV heads, and the chunk predicate keys on what the
-            # kernel is launched with.
-            attn_geometry=dict(num_q_heads=NQ, num_kv_heads=NKV_EFF,
-                               num_cores=ATTN_TP, head_dim=HD,
-                               attn_mask_type=1),   # 1 = LTM (causal prefill)
             partial_mrope=partial_mrope,
             execution_config=execution_config,
         )

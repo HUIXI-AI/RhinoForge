@@ -434,25 +434,40 @@ void sdpa_dma_mask_to_spm(
     const PreparedMask &mask,
     uint32_t sdpa_mask_off,
     int64_t seq_q, int64_t seq_k,
-    int num_cores)
+    int num_cores,
+    int64_t query_row_offset)
 {
     if (mask.mask_type <= 1) return;  // MASK_NONE or MASK_LTM — no DMA needed
 
+    TORCH_CHECK(seq_q > 0 && seq_k > 0 && query_row_offset >= 0,
+                "SDPA mask row slice requires positive dimensions and a "
+                "non-negative query offset");
     int64_t seq_k_v16 = CeilDiv(seq_k, (int64_t)16);
-    int64_t mask_elements = seq_q * seq_k_v16 * 16;
+    const int64_t row_elements = seq_k_v16 * 16;
+    TORCH_CHECK(query_row_offset <=
+                    std::numeric_limits<int64_t>::max() / row_elements &&
+                    seq_q <= std::numeric_limits<int64_t>::max() / row_elements,
+                "SDPA mask row slice geometry overflows int64");
+    const int64_t source_offset = query_row_offset * row_elements;
+    const int64_t mask_elements = seq_q * row_elements;
+    TORCH_CHECK(mask.ddr_tensor.defined() && mask.ddr_tensor.is_contiguous() &&
+                    source_offset <= mask.ddr_tensor.numel() &&
+                    mask_elements <= mask.ddr_tensor.numel() - source_offset,
+                "SDPA mask row slice escapes the prepared stable mask");
 
     // mask.ddr_tensor is the stable Route B slot (see sdpa_prepare_mask);
     // DMA src is safe to bake. Graph mode uses broadcast DMA rather than the
     // direct rpu_launch_ddr2spm_multicore path.
     if (graph_dma::active()) {
         rpu_launch_ddr_broadcast_spm_dma(
-            mask.ddr_tensor, /*src_offset_elements=*/0, mask_elements,
+            mask.ddr_tensor, source_offset, mask_elements,
             SPM_ALLOC.addr(0, sdpa_mask_off), num_cores);
     } else {
         // Immediate-mode fallback for non-graph callers (currently none — the
         // helper is only reached from build_layer_subgraph). Kept for safety.
         rpu_launch_ddr_broadcast_spm_dma_immediate(
-            mask.ddr_tensor.data_ptr<c10::Half>(), mask_elements,
+            mask.ddr_tensor.data_ptr<c10::Half>() + source_offset,
+            mask_elements,
             SPM_ALLOC.addr(0, sdpa_mask_off), num_cores);
     }
 }

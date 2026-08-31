@@ -13,7 +13,7 @@ Wires ``Qwen3_5VisionModel`` into the C++ vision subsystem registered as
 Public surface:
   - ``install_qwen3_5_vision_for_rpu(model)`` — swizzle vision blocks, create the
     C++ handle on ``model.model.visual``, set weights + rope tables, replace the
-    vision-tower forward. The 2B/4B path is experimental/numeric-blocked and
+    vision-tower forward. The 2B/4B path is Source-only/numeric-blocked and
     requires explicit controlled-evaluation opt-in before installation.
     Idempotent; called lazily on the first image forward.
   - ``fuse_visual_embeds(model, hidden, input_ids, pixel_values, image_grid_thw, ...)``
@@ -54,6 +54,9 @@ from rpu_backend.api.cache import RPUCache
 
 QWEN3_5_VISION_ARCH = "qwen3_5_vision"
 _VISION_INSTALL_LOCK = threading.RLock()
+_QWEN3_5_VISION_MAX_HW = 128
+_QWEN3_5_VISION_MAX_SEQ_LEN = 4096
+_QWEN3_5_VISION_MAX_TEXT_SEQ_LEN = 384
 
 
 def build_vision_rope_tables(
@@ -525,8 +528,8 @@ def install_qwen3_5_vision_for_rpu(
     model,
     *,
     vision_config: Any | None = None,
-    max_hw: int = 128,        # 2D RoPE table rows; supports up to 2048 px per side and about 4:1 aspect ratio
-    max_seq_len: int = 4096,  # generic vision KV-cache cap; G0.5 uses isolated 768-row spatial minibatches
+    max_hw: int = _QWEN3_5_VISION_MAX_HW,  # supports up to 2048 px per side and about 4:1 aspect ratio
+    max_seq_len: int = _QWEN3_5_VISION_MAX_SEQ_LEN,  # G0.5 uses isolated 768-row spatial minibatches
 ) -> int:
     """Install the numeric-blocked 2B/4B controlled-evaluation path transactionally.
 
@@ -615,7 +618,7 @@ def _install_qwen3_5_vision_for_rpu_impl(
         )
     if os.environ.get("QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED") != "1":
         raise NotImplementedError(
-            "Qwen3.5 Vision is experimental/numeric-blocked: the 2B/4B "
+            "Qwen3.5 Vision is Source-only/numeric-blocked: the 2B/4B "
             "official real-image correctness gates fail and no production-safe "
             "input envelope is certified. Image inference is disabled by "
             "default; Qwen3.5 text remains supported. For controlled evaluation "
@@ -1127,11 +1130,14 @@ def _rpu_vision_forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tenso
                        else torch.cat(last_hidden_per_image, dim=0))
         if merger_on:
             # merge-then-cat: every n_i is a multiple of sm², so groups never
-            # straddle images. Keep the standalone pooler output on CPU fp32.
+            # straddle images. Preserve the native FP16 execution dtype when
+            # returning the standalone pooler output on CPU.
             merged = (merged_per_image[0] if len(merged_per_image) == 1
-                      else torch.cat(merged_per_image, dim=0)).detach().cpu().float()
+                      else torch.cat(merged_per_image, dim=0)).detach().to(
+                          device="cpu", dtype=torch.float16)
         else:
-            merged = self.merger(last_hidden.detach().cpu().float())
+            merged = self.merger(last_hidden.detach().cpu().float()).to(
+                dtype=torch.float16)
 
     torch.ops.rpu.spm_alloc_reset_temporary()
 
@@ -1167,31 +1173,79 @@ def fuse_visual_embeds(model, hidden, input_ids, pixel_values, image_grid_thw,
     fusion = model.model  # Qwen3_5Model
     vision_model = fusion.visual
 
-    # Lazy install: first image forward swizzles + installs the vision tower.
-    # Vision touches the
-    # RPU only when an image actually arrives.
-    # The installer is a cheap locked no-op after commit and also validates
-    # that an apparent existing handle still has a live finalizer.
-    install_qwen3_5_vision_for_rpu(model)
-
     if image_grid_thw is None:
         raise ValueError("Qwen3.5 vision fuse: image_grid_thw must accompany pixel_values.")
     if video_grid_thw is not None or kw.get("pixel_values_videos") is not None:
         raise NotImplementedError("Qwen3.5 vision fuse: video inputs not supported yet.")
-
-    image_token_id = int(model.config.image_token_id)
-
     if input_ids is None:
         raise ValueError("Qwen3.5 vision fuse: input_ids required to locate image tokens.")
+    if input_ids.dim() != 2 or input_ids.size(0) != 1:
+        raise ValueError(
+            "Qwen3.5 vision fuse: input_ids must have batch-one shape [1, N]")
+    if input_ids.size(1) > _QWEN3_5_VISION_MAX_TEXT_SEQ_LEN:
+        raise ValueError(
+            "Qwen3.5 vision fuse: input length "
+            f"{input_ids.size(1)} exceeds the admitted image-prefill maximum "
+            f"{_QWEN3_5_VISION_MAX_TEXT_SEQ_LEN}")
+    if mm_token_type_ids is None:
+        raise ValueError(
+            "Qwen3.5 vision fuse: mm_token_type_ids is required for M-RoPE "
+            "(returned by the processor alongside input_ids).")
+    if tuple(mm_token_type_ids.shape) != tuple(input_ids.shape):
+        raise ValueError(
+            "Qwen3.5 vision fuse: mm_token_type_ids must match input_ids shape")
+    if hidden.dim() != 3 or hidden.size(0) != 1 or hidden.size(1) != input_ids.size(1):
+        raise ValueError(
+            "Qwen3.5 vision fuse: hidden must have batch-one token shape [1, N, H]")
+    if attention_mask is not None and tuple(attention_mask.shape) != tuple(input_ids.shape):
+        raise ValueError(
+            "Qwen3.5 vision fuse: attention_mask must match input_ids shape")
+
+    grid_thw_cpu = image_grid_thw.detach().cpu()
+    grid, merge_size = _validate_vision_grid(
+        grid_thw_cpu,
+        vision_model.config.spatial_merge_size,
+        "Qwen3.5 vision fuse",
+    )
+    total_patches = sum(t * h * w for t, h, w in grid)
+    if total_patches > _QWEN3_5_VISION_MAX_SEQ_LEN:
+        raise ValueError(
+            "Qwen3.5 vision fuse: total patches "
+            f"{total_patches} exceed the admitted maximum "
+            f"{_QWEN3_5_VISION_MAX_SEQ_LEN}")
+    if any(max(h, w) > _QWEN3_5_VISION_MAX_HW for _, h, w in grid):
+        raise ValueError(
+            "Qwen3.5 vision fuse: image grid exceeds the admitted 2D RoPE "
+            f"maximum {_QWEN3_5_VISION_MAX_HW}")
+    cfg = vision_model.config
+    patch_features = (
+        int(cfg.in_channels)
+        * int(cfg.temporal_patch_size)
+        * int(cfg.patch_size) ** 2
+    )
+    if (
+        pixel_values is None
+        or pixel_values.dim() != 2
+        or tuple(pixel_values.shape) != (total_patches, patch_features)
+    ):
+        shape = None if pixel_values is None else tuple(pixel_values.shape)
+        raise ValueError(
+            "Qwen3.5 vision fuse: pixel_values must have shape "
+            f"({total_patches}, {patch_features}), got {shape}")
+
+    image_token_id = int(model.config.image_token_id)
     input_ids_cpu = input_ids.to("cpu")
     visual_mask = (input_ids_cpu == image_token_id)
     n_visual_tokens = int(visual_mask.sum())
-    split_sizes = (image_grid_thw.detach().cpu().prod(-1) //
-                   int(vision_model.config.spatial_merge_size) ** 2).tolist()
+    split_sizes = [t * h * w // merge_size**2 for t, h, w in grid]
     if sum(split_sizes) != n_visual_tokens:
         raise RuntimeError(
             f"Qwen3.5 vision fuse: image embeds rows {sum(split_sizes)} "
             f"!= image token count {n_visual_tokens}")
+
+    # Lazy install only after every request-side semantic check above. The first
+    # install irreversibly swizzles Vision weights.
+    install_qwen3_5_vision_for_rpu(model)
 
     run_starts = _visual_run_starts(input_ids_cpu, image_token_id, split_sizes)
     direct_fusion = getattr(vision_model, "_rpu_vision_has_merger", False) and run_starts is not None
@@ -1216,10 +1270,6 @@ def fuse_visual_embeds(model, hidden, input_ids, pixel_values, image_grid_thw,
     # ----- 3. 3D position_ids via compute_3d_position_ids (get_rope_index) ----
     # Image input is admitted only at cache position 0, so this takes the
     # get_rope_index path and stashes fusion.rope_deltas for decode.
-    if mm_token_type_ids is None:
-        raise ValueError(
-            "Qwen3.5 vision fuse: mm_token_type_ids is required for M-RoPE "
-            "(returned by the processor alongside input_ids).")
     position_ids = fusion.compute_3d_position_ids(
         input_ids=input_ids_cpu,
         inputs_embeds=hidden,

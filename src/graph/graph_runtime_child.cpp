@@ -319,7 +319,13 @@ void RpuKernelGraph::replay_prepared_child(
     local_spm_pool_.reset_cursor();
     global_spm_pool_.reset_cursor();
     state_ = State::REPLAYING;
-    execute_graph_for_replaying();
+    try {
+        execute_graph_for_replaying();
+    } catch (...) {
+        release_prepared_queues();
+        state_ = State::BUILT;
+        throw;
+    }
     // 3) 切回 BUILT,以便父 graph 后续 forward 可再次 replay 同一 child。
     state_ = State::BUILT;
 }
@@ -402,7 +408,13 @@ void RpuKernelGraph::replay_prepared_child_with_data_patches(
     local_spm_pool_.reset_cursor();
     global_spm_pool_.reset_cursor();
     state_ = State::REPLAYING;
-    execute_graph_for_replaying();
+    try {
+        execute_graph_for_replaying();
+    } catch (...) {
+        release_prepared_queues();
+        state_ = State::BUILT;
+        throw;
+    }
     state_ = State::BUILT;
 }
 

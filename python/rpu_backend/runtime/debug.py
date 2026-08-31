@@ -1,4 +1,4 @@
-"""Debug helpers — set/get_debug, set/get_profile, debug tensor export, SPM debug, profile accumulator reset.
+"""Debug helpers — logging, timing counters, and SPM diagnostics.
 
 This is the canonical home for debug control wrappers.
 
@@ -68,40 +68,9 @@ def reset_profile_accumulators() -> None:
         _cpp().reset_profile_accumulators()
 
 
-# -------------------------------
-# Debug tensor export
-# -------------------------------
-def set_debug_export(enabled: bool) -> None:
-    """Enable/disable debug tensor export for fused decoder layer verification."""
-    if _cpp_loaded():
-        _cpp().set_debug_export(enabled)
-
-
 def get_debug_export() -> bool:
-    """Get debug tensor export state."""
-    if _cpp_loaded() and hasattr(_cpp(), "get_debug_export"):
-        return _cpp().get_debug_export()
+    """Compatibility query for model code; activation export is hard-disabled."""
     return False
-
-
-def get_debug_tensor(name: str) -> torch.Tensor:
-    """Get a debug tensor by name."""
-    if _cpp_loaded() and hasattr(_cpp(), "get_debug_tensor"):
-        return _cpp().get_debug_tensor(name)
-    return torch.Tensor()
-
-
-def clear_debug_tensors() -> None:
-    """Clear all stored debug tensors."""
-    if _cpp_loaded() and hasattr(_cpp(), "clear_debug_tensors"):
-        _cpp().clear_debug_tensors()
-
-
-def list_debug_tensors() -> list:
-    """List all stored debug tensor names."""
-    if _cpp_loaded() and hasattr(_cpp(), "list_debug_tensors"):
-        return _cpp().list_debug_tensors()
-    return []
 
 
 # -------------------------------

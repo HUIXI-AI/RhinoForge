@@ -168,13 +168,11 @@ size_t RPUCachingAllocator::get_allocation_size(size_t size) {
     if (size <= kSmallSize) {
         // Small allocations: use small buffer size
         return kSmallBuffer;
-    } else if (size < kMinLargeAlloc) {
-        // Medium allocations: use large buffer size
-        return kLargeBuffer;
-    } else {
-        // Large allocations: round up to 2 MB
-        return kRoundLarge * ((size + kRoundLarge - 1) / kRoundLarge);
     }
+    // Weight-heavy models keep medium allocations live. Reserving a CUDA-style
+    // 20 MiB segment for every 1--10 MiB tensor exhausts HostDDR long before the
+    // logical payload does; a 2 MiB multiple preserves reuse without that bloat.
+    return kRoundLarge * ((size + kRoundLarge - 1) / kRoundLarge);
 }
 
 BlockPool& RPUCachingAllocator::get_pool(size_t size) {
@@ -685,6 +683,22 @@ size_t RPUCachingAllocator::getTotalCachedMemory() const {
     }
 
     return cached;
+}
+
+int64_t RPUCachingAllocator::getCachedSegmentCount() const {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+
+    int64_t count = 0;
+    for (size_t i = 0; i < kNumSizeClasses; ++i) {
+        count += static_cast<int64_t>(size_class_counts_[i]);
+    }
+    for (const auto* block : small_blocks_.blocks) {
+        count += !block->is_split();
+    }
+    for (const auto* block : large_blocks_.blocks) {
+        count += !block->is_split();
+    }
+    return count;
 }
 
 RPUCachingAllocator& RPUCachingAllocator::get() {

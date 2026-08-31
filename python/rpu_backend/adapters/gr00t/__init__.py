@@ -1,6 +1,6 @@
-"""GR00T-N1.7-3B VLA RPU adapter (standalone runtime — gr00t package not importable in RPU env).
+"""GR00T-N1.7 DROID VLA RPU adapter (standalone runtime).
 
-Full image→action execution on RPU.
+Base-zero-shot and finetuned DROID are separate exact Source-only profiles.
 """
 from rpu_backend.adapters.gr00t.runtime import Gr00tN1d7VLA, build_gr00t_vla
 

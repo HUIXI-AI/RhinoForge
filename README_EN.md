@@ -98,6 +98,13 @@ RhinoForge v1.0.0 is installed from source and requires a preconfigured RPU
 board environment and Python 3.12. The installation path for an authorized
 recipient is:
 
+> **Draft-branch compatibility:** this branch is not bound to a publishable
+> runtime-set and requires Rhino Launch to provide
+> `rhino_lkn::ReserveBatchBuffers`. The existing r4 bundle lacks that
+> capability and cannot be paired with this branch. The r4 procedure below
+> applies only to the current `main`/`v1.0.0`; it is not a support claim for
+> this Draft.
+
 1. Download `RhinoForge-runtime-v1.0.0-r4.tar.gz` and its `.sha256` from the
    versioned bundle URL supplied by the distributor. Verify the outer archive
    before extracting it.

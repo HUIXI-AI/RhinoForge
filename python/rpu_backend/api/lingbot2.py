@@ -38,6 +38,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import os
+from pathlib import Path
 import threading
 import time
 import weakref
@@ -113,7 +114,6 @@ _STRUCTURAL_ENV: dict[str, str] = {
     "RPU_LINGBOT2_GROUPED_EXPERTS": "0",
     "RPU_LINGBOT2_FP16_TOP4": "1",
     "RPU_LINGBOT2_DEBUG_DENSE_SOFT_ROUTER": "0",
-    "RPU_LINGBOT2_DEBUG_DUMP_ROUTER_H": "0",
     "RPU_LINGBOT2_EXPERT_REPLAY": "1",
     "RPU_LINGBOT2_HOST_PREFIX_OPT": "1",
     "RPU_LINGBOT2_VISION_DIRECT_PREFIX": "0",
@@ -165,14 +165,8 @@ _PROFILE_DEFAULT_ENV: dict[str, str] = {
 _PROFILE_DEFAULT_ENV.update({
     "RPU_LINGBOT2_PREFILL_W4A16": "0",
     "RPU_LINGBOT2_LEGACY_PREPROC": "0",
-    "RPU_L2_CAPTURE_L0": "0",
-    "RPU_L2_CAPTURE_INNORM": "0",
-    "RPU_L2_CAPTURE_GATE": "0",
-    "RPU_L2_CAP_RESID": "0",
-    "RPU_L2_STAGES": "0",
     "RPU_L2_ROUTED_ONLY": "0",
     "RPU_L2_DOWN_ACC16": "0",
-    "RPU_L2_DBG_PACKED": "0",
     "RPU_L2_RCHUNK": "0",
     "RPU_L2_SCHUNK": "0",
 })
@@ -243,6 +237,39 @@ def _runtime_policy_complete(policy) -> bool:
         and finalizer is not None
         and getattr(finalizer, "alive", False)
     )
+
+
+def _resolve_use_qwen3_chat_template(
+    checkpoint: str | os.PathLike[str],
+    training_config: str | os.PathLike[str] | None,
+) -> bool:
+    """Resolve the public prompt format before any weight materialization."""
+    config_path = None if training_config is None else Path(training_config)
+    if config_path is None:
+        candidates = sorted(Path(checkpoint).glob("lingbotvla_cli*.y*ml"))
+        config_path = candidates[0] if candidates else None
+    if config_path is None:
+        # LingbotVLAV2Config owns this exact public-profile default upstream.
+        return True
+
+    import yaml
+
+    with config_path.open("r", encoding="utf-8") as stream:
+        document = yaml.safe_load(stream) or {}
+    if not isinstance(document, Mapping):
+        raise ValueError("LingBot-VLA-V2 training config must be a mapping")
+    merged: dict[str, Any] = {}
+    for section_name in ("model", "train"):
+        section = document.get(section_name, {}) or {}
+        if not isinstance(section, Mapping):
+            raise ValueError(
+                f"LingBot-VLA-V2 training config [{section_name}] must be a mapping"
+            )
+        merged.update(section)
+    enabled = merged.get("use_qwen3_chat_template", True)
+    if not isinstance(enabled, bool):
+        raise ValueError("use_qwen3_chat_template must be true or false")
+    return enabled
 
 
 @dataclasses.dataclass(frozen=True)
@@ -333,10 +360,12 @@ class Lingbot2Policy:
     ) -> "Lingbot2Policy":
         """Create a policy bound to a LingBot-VLA-V2 checkpoint directory.
 
-        ``ckpt_dir`` must hold ``config.json``, the BF16/FP32 ``model-*.safetensors``
-        shards and the Qwen3-VL processor/tokenizer files. The SAME directory
-        serves every ``dtype``: w8a16/w4a16 quantize from these weights at load
-        time, so there is no separate quantized checkpoint to ship.
+        ``ckpt_dir`` must hold ``config.json`` and the BF16/FP32
+        ``model-*.safetensors`` shards. The public chat-template profile also
+        requires ``qwen3vl_base`` (or ``RPU_LINGBOT2_QWEN3VL_BASE``) to point to
+        the complete public Qwen3-VL processor/tokenizer assets. The SAME LingBot
+        directory serves every ``dtype``: w8a16/w4a16 quantize from these weights
+        at load time, so there is no separate quantized checkpoint to ship.
 
         ``dtype`` selects the precision profile:
           ``fp16``   — unquantized fp16
@@ -387,6 +416,9 @@ class Lingbot2Policy:
         inst._max_lang_tokens = int(max_lang_tokens)
         inst._robot_norm_path = None if robot_norm_path is None else os.fspath(robot_norm_path)
         inst._training_config_path = None if training_config_path is None else os.fspath(training_config_path)
+        inst._use_qwen3_chat_template = _resolve_use_qwen3_chat_template(
+            ckpt_dir, training_config_path
+        )
         inst._robot_config_path = None if robot_config_path is None else os.fspath(robot_config_path)
         inst._action_norm_spec = action_norm_spec
         inst._denorm = None
@@ -404,6 +436,14 @@ class Lingbot2Policy:
         inst._policy_finalizer = None
         inst._env_snapshot = None
         inst._processor = None
+        processor_source = (
+            inst._qwen3vl_base
+            or inst._runtime_env.get("RPU_LINGBOT2_QWEN3VL_BASE")
+        )
+        inst._processor_source = (
+            os.path.abspath(os.path.expanduser(processor_source))
+            if processor_source else inst._ckpt_dir
+        )
         inst._prepare_ms = {}
         inst._graph_profile = None
         inst._preproc_mode = "exact"        # real value set in .to() once env is applied
@@ -569,10 +609,28 @@ class Lingbot2Policy:
             qv = (
                 self._qwen3vl_base
                 or self._runtime_env.get("RPU_LINGBOT2_QWEN3VL_BASE")
+                or os.environ.get("RPU_LINGBOT2_QWEN3VL_BASE")
                 or None
             )
             if qv:
                 qv = os.path.abspath(os.path.expanduser(str(qv)))
+
+            # Public upstream owns the exact processor and chat template in the
+            # Qwen3-VL base asset, not in the LingBot weight checkpoint. Validate
+            # that dependency while the policy is still safe to retry/discard.
+            if self._use_qwen3_chat_template and not qv:
+                from rpu_backend.api.errors import RPUBackendError
+
+                raise RPUBackendError(
+                    "LingBot-VLA-V2 public chat-template preprocessing requires "
+                    "qwen3vl_base (or RPU_LINGBOT2_QWEN3VL_BASE) to name a "
+                    "complete local public Qwen3-VL processor asset."
+                )
+            processor_source = qv or self._ckpt_dir
+            if processor_source != self._processor_source:
+                self._processor = None
+            self._processor_source = processor_source
+            self._preflight_processor_contract()
 
             # Robot-action config is CPU-only preflight. Resolve it before any
             # swizzle or native handle is created so a bad/mismatched stats file
@@ -707,8 +765,39 @@ class Lingbot2Policy:
         if self._processor is None:
             from transformers import AutoProcessor
 
-            self._processor = AutoProcessor.from_pretrained(self._ckpt_dir)
+            self._processor = AutoProcessor.from_pretrained(self._processor_source)
         return self._processor
+
+    def _preflight_processor_contract(self) -> None:
+        """Validate public prompt ownership before runtime/weight mutation."""
+        if not self._use_qwen3_chat_template:
+            return
+        from rpu_backend.api.errors import RPUBackendError
+
+        try:
+            processor = self._get_processor()
+            tokenizer = processor.tokenizer
+            image_processor = processor.image_processor
+            prompt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": "probe"}],
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+        except Exception:
+            raise RPUBackendError(
+                "LingBot-VLA-V2 could not load the required public Qwen3-VL "
+                "processor and chat template; runtime construction was not started."
+            ) from None
+        if not callable(tokenizer) or not callable(image_processor):
+            raise RPUBackendError(
+                "LingBot-VLA-V2 requires callable public Qwen3-VL tokenizer and "
+                "image-processor assets; runtime construction was not started."
+            )
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise RPUBackendError(
+                "LingBot-VLA-V2 public Qwen3-VL chat template returned an invalid "
+                "prompt; runtime construction was not started."
+            )
 
     @staticmethod
     def _as_rgb_uint8_array(im: Any) -> Any:
@@ -749,9 +838,9 @@ class Lingbot2Policy:
         Resizes each camera frame to the square the checkpoint's evaluation contract
         assumes, then runs the Qwen3-VL image processor.
 
-        Exact mode preserves the fp32 torchvision resize pipeline and batches the
-        processor call. Fast mode uses PIL resize. Compatibility mode retains the
-        per-camera processor path.
+        Exact mode preserves the public fp32 torchvision resize and per-camera
+        processor calls. Fast mode uses PIL resize and a batched processor call.
+        Compatibility mode retains the earlier uint8 HWC round-trip.
 
         Resampling differs from the compatibility path (torchvision antialiased
         bilinear on fp32 vs PIL bilinear on uint8). Set
@@ -784,20 +873,22 @@ class Lingbot2Policy:
                 enc["image_grid_thw"].reshape(n, 3).long()
 
         if mode == "exact":
-            # Preserve the compatibility pipeline's fp32 antialiased resize while
-            # batching the processor call; pixel_values remain identical.
+            # Match public FeatureTransform exactly: resize the CHW uint8 source
+            # in fp32, then pass that float tensor directly to each camera's
+            # image-processor call. A uint8 HWC round-trip changes pixel values.
             from torchvision.transforms.v2 import Resize
 
-            resize = Resize((sz, sz))
-            arrs = []
+            resize = Resize((sz, sz), antialias=True)
+            pixel_values = []
+            grids = []
             for im in images:
                 t = torch.as_tensor(self._as_rgb_uint8_array(im)).permute(2, 0, 1).contiguous()
-                t = resize(t.to(torch.float32))
-                arrs.append(t.permute(1, 2, 0).clamp(0, 255).to(torch.uint8).numpy())
-            enc = ip(images=arrs, return_tensors="pt")
-            pixel_values = enc["pixel_values"]
-            return pixel_values.reshape(n, -1, pixel_values.shape[-1]).contiguous().float(), \
-                enc["image_grid_thw"].reshape(n, 3).long()
+                enc = ip(resize(t.to(torch.float32)))
+                pixel_values.append(enc["pixel_values"])
+                grids.append(torch.as_tensor(enc["image_grid_thw"]).reshape(-1, 3)[0])
+            packed = torch.cat(pixel_values, dim=0)
+            return packed.reshape(n, -1, packed.shape[-1]).contiguous().float(), \
+                torch.stack(grids, dim=0).long()
 
         # Compatibility preprocessing mode.
         from PIL import Image as _Image
@@ -819,10 +910,18 @@ class Lingbot2Policy:
     def _encode_instruction(self, instruction: str) -> tuple[torch.Tensor, torch.Tensor]:
         """Tokenize to the admission cap; ``attention_mask`` defines REAL rows."""
         proc = self._get_processor()
+        prompt = instruction
+        if self._use_qwen3_chat_template:
+            prompt = proc.tokenizer.apply_chat_template(
+                [{"role": "user", "content": instruction}],
+                tokenize=False,
+                add_generation_prompt=False,
+            )
         tok = proc.tokenizer(
-            instruction,
+            prompt,
             return_tensors="pt",
             padding="max_length",
+            padding_side="right",
             truncation=True,
             max_length=self._max_lang_tokens,
         )

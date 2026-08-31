@@ -1,4 +1,4 @@
-"""GR00T-N1.7-3B VLA — RPU runtime (image → 132-d action, flow-matching denoise).
+"""GR00T-N1.7 DROID VLA — RPU runtime (image → 132-d action, flow-matching denoise).
 
 Self-contained standalone runtime (NOT a `register_adapter` HF patch: the GR00T package is not
 importable in the RPU env). **"全程 RPU" — ALL per-action compute on-device** (the host-fp32 glue
@@ -15,7 +15,11 @@ Caller contracts:
   - the text/image MASK_2D subsets each get their OWN prepared slot in the C++ (prep_mask_into).
 """
 from __future__ import annotations
+from collections.abc import Mapping
+import hashlib
+import inspect
 import os, math, glob
+from pathlib import Path
 import weakref
 import torch
 import torch.nn.functional as F
@@ -53,6 +57,239 @@ _ACTION_QUERY_ROWS = _AH + 1
 _ACTION_CHUNK_SIZE = ((_ACTION_QUERY_ROWS + 15) // 16) * 16
 _PREFILL_PADDING_BUDGET = 64
 _VISION_EXACT_CHUNKS = frozenset((144, 256, 512, 768))
+_COSMOS_MANIFEST_SHA256 = "0aeff3308620feaa907990623b9db429a43cc671673d9f8ee34e4415144055a2"
+_COSMOS_FILES = {
+    "chat_template.json": "6f8a6a55027e3da5160105556cda5dd69f6423f1c32645f6730d32de7773d0c4",
+    "config.json": "bec4b3d446efa05807365c9e1cec03ac590836879d02f3a6da879971154bdd3b",
+    "merges.txt": "599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3",
+    "preprocessor_config.json": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
+    "tokenizer.json": "a5d85b6dcc535e6b93115a9ef287e6132fdbf30270da6218194ba742261173c7",
+    "tokenizer_config.json": "c2da771801886ad9ae98181793ffd3dfb7f1af30f6f7c6a4e15d7dbba52e2399",
+    "video_preprocessor_config.json": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13",
+    "vocab.json": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+}
+
+# Public DROID identities are deliberately separate.  A release profile is
+# not selectable by architecture name alone: the base zero-shot checkpoint
+# consumes two temporal samples per camera, while the finetuned checkpoint
+# consumes one. Both profiles stay fail-closed until their exact checkpoint,
+# Cosmos assets, caller-preprocessed inputs, and candidate cache bound match.
+_GR00T_PROFILE_IDENTITIES = {
+    "gr00t-n1.7-3b-droid-zero-shot": {
+        "checkpoint_repository": "nvidia/GR00T-N1.7-3B",
+        "checkpoint_revision": "2fc962b973bccdd5d8ce4f67cc63b264d6886495",
+        "checkpoint_files": {
+            "config.json": "54c0367060cd310d0b3343fe72a589860a8b6e8173810164a4ffd6253f52e689",
+            "embodiment_id.json": "abc4a749389837416a102d9455a8c089336f2e417afb18565703b9944974bc35",
+            "model-00001-of-00002.safetensors": "8a1a1d8a33c99103c7c80c136073c5bb8bfe9ca8f7a970c93c033ea89742906d",
+            "model-00002-of-00002.safetensors": "c3f61940deb2007ba1ad7743013b57f0f8462356151db9655175d7aca2d40661",
+            "model.safetensors.index.json": "407804ea5a62f4f8823f48811ae0edbb82fac101e9cf4d7273e6e2f692bb4d59",
+            "processor_config.json": "85c1b4690ae090559e79a45193e598b65d6146eedf14750884da65e6d31032be",
+            "statistics.json": "c97b1b07a82a8a8858771d56d278732d97dd8eae506032c146c77eb53828afc9",
+        },
+        "processor_config_sha256": "85c1b4690ae090559e79a45193e598b65d6146eedf14750884da65e6d31032be",
+        "statistics_sha256": "c97b1b07a82a8a8858771d56d278732d97dd8eae506032c146c77eb53828afc9",
+        "cosmos_repository": "nvidia/Cosmos-Reason2-2B",
+        "cosmos_revision": "9ce19a195e423419c349abfc86fd07178b230561",
+        "cosmos_manifest_sha256": _COSMOS_MANIFEST_SHA256,
+        "cosmos_files": _COSMOS_FILES,
+        "embodiment_id": 24,
+        "input_envelope": {
+            "embodiment_tag": "OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT",
+            "camera_names": ["exterior_image_1_left", "wrist_image_left"],
+            "video_delta_indices": [-15, 0],
+            "images_per_request": 4,
+            "image_grid_thw": [1, 16, 16],
+            "image_target_size": [256, 256],
+            "batch_size": 1,
+            "state_dim": 17,
+            "action_dim": 17,
+            "action_horizon": 40,
+            "processor_input_oracle_sequence_length": 277,
+            "kvpad16_min_rows": 288,
+            "rhinoforge_cache_capacity": 320,
+        },
+    },
+    "gr00t-n1.7-droid-finetuned": {
+        "checkpoint_repository": "nvidia/GR00T-N1.7-DROID",
+        "checkpoint_revision": "05e7cc97e40dbd33b0890c35cc0214fcb0547ab5",
+        "checkpoint_files": {
+            "config.json": "b20d22636bdaf49436de49c5e7e5fc65203f7a4b88384eef426000100be57d1e",
+            "embodiment_id.json": "c81282ca2f434fd6b92e16c7e0ac6ebcb9e9bd63f856deaae93780df6c86e4d7",
+            "model-00001-of-00002.safetensors": "68d885c9684bb7d4781389873e4b7d33202b5618e70a83f2e78187a5fb839202",
+            "model-00002-of-00002.safetensors": "aa4c6e553ea8454500354352368bcbb7e4f0fb32a9816b20d5b25c231f13a8fd",
+            "model.safetensors.index.json": "407804ea5a62f4f8823f48811ae0edbb82fac101e9cf4d7273e6e2f692bb4d59",
+            "processor_config.json": "4b5c3bab3f148ff47ba903714c3247403c754f806ff2354a73acdfa2102a66fb",
+            "statistics.json": "127832f7df25cda15da4ba6be81737f96b65673d0f892f9fc1bce1bc062fa858",
+        },
+        "processor_config_sha256": "4b5c3bab3f148ff47ba903714c3247403c754f806ff2354a73acdfa2102a66fb",
+        "statistics_sha256": "127832f7df25cda15da4ba6be81737f96b65673d0f892f9fc1bce1bc062fa858",
+        "cosmos_repository": "nvidia/Cosmos-Reason2-2B",
+        "cosmos_revision": "9ce19a195e423419c349abfc86fd07178b230561",
+        "cosmos_manifest_sha256": _COSMOS_MANIFEST_SHA256,
+        "cosmos_files": _COSMOS_FILES,
+        "embodiment_id": 24,
+        "input_envelope": {
+            "embodiment_tag": "OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT",
+            "camera_names": ["exterior_image_1_left", "wrist_image_left"],
+            "video_delta_indices": [0],
+            "images_per_request": 2,
+            "image_grid_thw": [1, 16, 16],
+            "image_target_size": [256, 256],
+            "batch_size": 1,
+            "state_dim": 17,
+            "action_dim": 17,
+            "action_horizon": 40,
+            "processor_input_oracle_sequence_length": 145,
+            "kvpad16_min_rows": 160,
+            "rhinoforge_cache_capacity": 256,
+        },
+    },
+}
+
+
+def _sha256_file(path: Path) -> str:
+    if not path.is_file():
+        raise ValueError(f"GR00T exact-profile asset is missing: {path.name}")
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _get_gr00t_rope_index(
+    get_rope_index,
+    *,
+    input_ids,
+    mm_token_type_ids,
+    image_grid_thw,
+    attention_mask,
+):
+    """Call the Qwen3-VL 4.57/5.x M-RoPE API without masking real errors."""
+    kwargs = {
+        "input_ids": input_ids.cpu(),
+        "image_grid_thw": image_grid_thw.cpu(),
+        "video_grid_thw": None,
+        "attention_mask": attention_mask.cpu(),
+    }
+    if "mm_token_type_ids" in inspect.signature(get_rope_index).parameters:
+        kwargs["mm_token_type_ids"] = mm_token_type_ids.cpu()
+    return get_rope_index(**kwargs)
+
+
+def _validate_gr00t_admission_inputs(profile, inputs, *, cache_capacity):
+    identity = _GR00T_PROFILE_IDENTITIES[profile]
+    envelope = identity["input_envelope"]
+    if not isinstance(inputs, Mapping):
+        raise TypeError("GR00T admission_inputs must be a tensor mapping")
+    required = ("input_ids", "attention_mask", "pixel_values", "image_grid_thw", "state")
+    missing = [name for name in required if not isinstance(inputs.get(name), torch.Tensor)]
+    if missing:
+        raise ValueError(f"GR00T admission_inputs are missing tensor fields: {missing}")
+    if any(inputs[name].device.type != "cpu" for name in required):
+        raise ValueError("GR00T admission_inputs must remain on CPU during profile admission")
+
+    input_ids = inputs["input_ids"]
+    attention_mask = inputs["attention_mask"]
+    if input_ids.ndim != 2 or tuple(input_ids.shape[:1]) != (envelope["batch_size"],):
+        raise ValueError("GR00T input_ids must be [1, sequence_length]")
+    if tuple(attention_mask.shape) != tuple(input_ids.shape):
+        raise ValueError("GR00T attention_mask must match input_ids")
+    sequence_length = int(input_ids.shape[-1])
+    if sequence_length <= 0:
+        raise ValueError("GR00T sequence_length must be positive")
+    if sequence_length > int(cache_capacity):
+        raise ValueError(
+            f"GR00T input sequence_length={sequence_length} exceeds the current "
+            f"exact-profile VL/action cache capacity {int(cache_capacity)}"
+        )
+
+    grid = inputs["image_grid_thw"]
+    expected_images = envelope["images_per_request"]
+    if tuple(grid.shape) != (expected_images, 3):
+        raise ValueError(
+            f"GR00T profile requires image_grid_thw [{expected_images}, 3]"
+        )
+    if grid.dtype not in (torch.int32, torch.int64):
+        raise TypeError("GR00T image_grid_thw must use an integer dtype")
+    expected_grid = torch.tensor(
+        [envelope["image_grid_thw"]] * expected_images,
+        dtype=grid.dtype,
+    )
+    if not torch.equal(grid, expected_grid):
+        raise ValueError("GR00T image_grid_thw is outside the exact DROID envelope")
+    expected_patches = expected_images * _VISION_PATCHES_PER_IMAGE
+    pixel_values = inputs["pixel_values"]
+    if pixel_values.ndim < 2 or int(pixel_values.shape[0]) != expected_patches:
+        raise ValueError(
+            f"GR00T profile requires {expected_patches} flattened image patches"
+        )
+    if tuple(inputs["state"].shape) != (1, 1, _AD):
+        raise ValueError("GR00T state must be the processor-padded [1, 1, 132] tensor")
+
+
+def _preflight_gr00t_build(
+    ckpt_path,
+    cosmos_local,
+    *,
+    profile,
+    checkpoint_repository,
+    checkpoint_revision,
+    processor_config_sha256,
+    statistics_sha256,
+    cosmos_repository,
+    cosmos_revision,
+    cosmos_manifest_sha256,
+    embodiment_id,
+    input_envelope,
+    admission_inputs,
+):
+    identity = _GR00T_PROFILE_IDENTITIES.get(profile)
+    if identity is None:
+        known = ", ".join(sorted(_GR00T_PROFILE_IDENTITIES))
+        raise ValueError(f"unknown GR00T exact profile {profile!r}; choose one of: {known}")
+    exact_fields = {
+        "checkpoint_repository": checkpoint_repository,
+        "checkpoint_revision": checkpoint_revision,
+        "processor_config_sha256": processor_config_sha256,
+        "statistics_sha256": statistics_sha256,
+        "cosmos_repository": cosmos_repository,
+        "cosmos_revision": cosmos_revision,
+        "cosmos_manifest_sha256": cosmos_manifest_sha256,
+        "embodiment_id": embodiment_id,
+    }
+    for name, actual in exact_fields.items():
+        if actual != identity[name]:
+            raise ValueError(
+                f"GR00T profile {profile!r} requires exact {name}={identity[name]!r}"
+            )
+    if not isinstance(input_envelope, Mapping) or dict(input_envelope) != identity["input_envelope"]:
+        raise ValueError(f"GR00T profile {profile!r} input_envelope does not match its public identity")
+
+    _validate_gr00t_admission_inputs(
+        profile,
+        admission_inputs,
+        cache_capacity=identity["input_envelope"]["rhinoforge_cache_capacity"],
+    )
+
+    if identity["statistics_sha256"] is None:
+        raise RuntimeError(
+            f"GR00T profile {profile!r} remains Source-only: statistics.json "
+            "has no release-bound SHA256"
+        )
+    checkpoint_dir = Path(ckpt_path)
+    for filename, expected in identity["checkpoint_files"].items():
+        if _sha256_file(checkpoint_dir / filename) != expected:
+            raise ValueError(f"GR00T exact-profile asset digest mismatch: {filename}")
+
+    cosmos_dir = Path(cosmos_local) if cosmos_local is not None else None
+    if cosmos_dir is None or not cosmos_dir.is_dir():
+        raise ValueError("GR00T exact-profile Cosmos asset directory is required")
+    for filename, expected in identity["cosmos_files"].items():
+        if _sha256_file(cosmos_dir / filename) != expected:
+            raise ValueError(f"GR00T exact-profile Cosmos asset digest mismatch: {filename}")
+    return identity
 
 
 def _normalize_gr00t_execution(rpu_execution):
@@ -382,7 +619,8 @@ class Gr00tN1d7VLA:
 
     def __init__(self, *, backbone, cfg, text_model, vision_model,
                  a_handle, a_keep, d_handle, d_keep, image_token_id,
-                 execution_config=None, embodiment_id=20):
+                 execution_config=None, embodiment_id=24, profile,
+                 cache_capacity):
         self._bb = backbone
         self._cfg = cfg
         self._text = text_model
@@ -393,16 +631,19 @@ class Gr00tN1d7VLA:
         self._d_keep = d_keep
         self._img_tok = image_token_id
         self._emb = embodiment_id
+        self._profile = profile
         self._rpu_execution = (
             execution_config if execution_config is not None else {}
         )
         self._a_gc = rpu_backend.graph.GraphCache()
         self._d_gc = rpu_backend.graph.GraphCache()
-        self._a_cache = RPUCache(num_layers=_VL_NL, batch_size=1, max_seq_len=256,
+        self._a_cache = RPUCache(num_layers=_VL_NL, batch_size=1,
+                                 max_seq_len=cache_capacity,
                                  num_kv_heads=_VLH, head_dim=_VLHD, attn_tp=_TP)
         # Denoise cross-attn KV stores one entry per backbone token and supports
         # multi-image prompts up to the declared capacity.
-        self._d_cache = RPUCache(num_layers=_NL, batch_size=1, max_seq_len=256,
+        self._d_cache = RPUCache(num_layers=_NL, batch_size=1,
+                                 max_seq_len=cache_capacity,
                                  num_kv_heads=_NQ, head_dim=_HD, attn_tp=_TP)
         # Reuse one backbone prefill cache and reset its logical position; its
         # storage address remains stable for graph replay.
@@ -576,9 +817,13 @@ class Gr00tN1d7VLA:
                 or not torch.equal(grid, self._rope_grid_key)
                 or not torch.equal(attn, self._rope_attn_key)):
             mmtt = (input_ids == img_tok).to(torch.int32)
-            self._rope_ids, _ = m.model.get_rope_index(input_ids.cpu(), mm_token_type_ids=mmtt.cpu(),
-                                                       image_grid_thw=grid.cpu(), video_grid_thw=None,
-                                                       attention_mask=attn.cpu())
+            self._rope_ids, _ = _get_gr00t_rope_index(
+                m.model.get_rope_index,
+                input_ids=input_ids,
+                mm_token_type_ids=mmtt,
+                image_grid_thw=grid,
+                attention_mask=attn,
+            )
             self._rope_key = input_ids.clone()
             self._rope_grid_key = grid.clone()
             self._rope_attn_key = attn.clone()
@@ -718,19 +963,11 @@ class Gr00tN1d7VLA:
             raise ValueError(
                 f"gr00t denoise is built for num_steps={_NSTEPS}; got {num_steps}. "
                 f"Rebuild via build_gr00t_vla(...) for a different schedule.")
-        self._validate_forward_execution(inputs)
-        # Capacity guard BEFORE the backbone: the backbone writes _bb_cache (512); _vl_encode /
-        # _denoise use _a_cache / _d_cache (256). A longer prompt / more images would OOB-write a
-        # KV cache in the C++ op (no capacity check there → wrong action / crash). Check the input
-        # seq (== backbone seq) up front against the SMALLEST cache, so we never even run the
-        # backbone with an over-capacity sequence.
-        _S_in = int(inputs["input_ids"].shape[-1])
         _cap = min(getattr(self._bb_cache, "max_seq_len", 512),
                    getattr(self._a_cache, "max_seq_len", 256),
                    getattr(self._d_cache, "max_seq_len", 256))
-        if _S_in > _cap:
-            raise ValueError(f"GR00T input seq {_S_in} exceeds the KV-cache capacity {_cap} "
-                             f"(backbone/VL/denoise); rebuild with larger caches or shorten the input.")
+        _validate_gr00t_admission_inputs(self._profile, inputs, cache_capacity=_cap)
+        self._validate_forward_execution(inputs)
         raw, S = self._backbone(inputs)
         vl_r = self._vl_encode(raw, S)
         action = self._denoise(vl_r, inputs, S, seed)
@@ -923,12 +1160,37 @@ def _build_denoise(gw, emb, num_steps=_NSTEPS):
 
 def build_gr00t_vla(
     ckpt_path,
-    qwen3vl_local,
+    cosmos_local=None,
     *,
-    embodiment_id=20,
+    profile=None,
+    checkpoint_repository=None,
+    checkpoint_revision=None,
+    processor_config_sha256=None,
+    statistics_sha256=None,
+    cosmos_repository=None,
+    cosmos_revision=None,
+    cosmos_manifest_sha256=None,
+    embodiment_id=24,
+    input_envelope=None,
+    admission_inputs=None,
     rpu_execution=None,
 ):
     """Build the fully-on-device RPU GR00T VLA with fused encoder and denoiser ops."""
+    identity = _preflight_gr00t_build(
+        ckpt_path,
+        cosmos_local,
+        profile=profile,
+        checkpoint_repository=checkpoint_repository,
+        checkpoint_revision=checkpoint_revision,
+        processor_config_sha256=processor_config_sha256,
+        statistics_sha256=statistics_sha256,
+        cosmos_repository=cosmos_repository,
+        cosmos_revision=cosmos_revision,
+        cosmos_manifest_sha256=cosmos_manifest_sha256,
+        embodiment_id=embodiment_id,
+        input_envelope=input_envelope,
+        admission_inputs=admission_inputs,
+    )
     execution_config = _normalize_gr00t_execution(rpu_execution)
     # All reductions use the generated ring path. GR00T Vision uses
     # SPM-resident 2D-RoPE tables.
@@ -947,7 +1209,7 @@ def build_gr00t_vla(
     os.environ.setdefault("RPU_FASTREPLAY_SKIP_SYNC", "1")
     os.environ.setdefault("RPU_DEEP_FAST_REPLAY", "1")
     from transformers import Qwen3VLConfig, Qwen3VLForConditionalGeneration
-    cfg = Qwen3VLConfig.from_pretrained(qwen3vl_local)
+    cfg = Qwen3VLConfig.from_pretrained(cosmos_local)
     cfg.text_config.num_hidden_layers = _SELECT_LAYER
     model = Qwen3VLForConditionalGeneration(cfg)
     model._rpu_execution = execution_config
@@ -1062,6 +1324,8 @@ def build_gr00t_vla(
             image_token_id=model.config.image_token_id,
             execution_config=execution_config,
             embodiment_id=embodiment_id,
+            profile=profile,
+            cache_capacity=identity["input_envelope"]["rhinoforge_cache_capacity"],
         )
         transferred = True
         try:

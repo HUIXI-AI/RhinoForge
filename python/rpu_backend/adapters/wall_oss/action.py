@@ -367,7 +367,8 @@ class WallOssAction:
         if self._fused:
             raise NotImplementedError(
                 "WallOssAction.predict() (LTM no-mask path) is unsupported for fused models; "
-                "use denoise_with_mask() (with WallOssVLA.predict for the full E2E flow).")
+                "use denoise_with_mask() (through WallOssPolicy for the full "
+                "E2E flow).")
         if not isinstance(input_ids, torch.Tensor):
             raise TypeError(
                 "input_ids must be a torch.Tensor, got "
@@ -739,8 +740,8 @@ class WallOssAction:
                           debug: bool = False) -> dict:
         """10-step Euler denoise over a prefix of arbitrary length.
 
-        Unlike :meth:`predict`, this does NOT prefill — the caller (WallOssVLA) has
-        already filled the shared cache prefix K/V at [0, prefix_len) via
+        Unlike :meth:`predict`, this does NOT prefill — the internal full-model
+        runtime has already filled the shared cache prefix K/V at [0, prefix_len) via
         ``WallOssLLM.forward_embeds``. Each step runs the expert-1 decoder over the
         action chunk with an explicit 2D mask (is_causal=False), so the prefix length
         need not be %16-aligned (the LTM path requires that).

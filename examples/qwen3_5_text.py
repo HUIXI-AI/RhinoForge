@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run text-only greedy decoding with a supported dense Qwen3.5 checkpoint."""
+"""Run text-only greedy decoding for a configured Qwen3.5 profile."""
 
 from __future__ import annotations
 

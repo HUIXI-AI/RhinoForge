@@ -191,7 +191,7 @@ before reduction. See
 | `RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN` | Off; exact `1`, `true`, `True`, or `on` enables | First native coexistence use / **NATIVE** | Retains a persistent SPM generation across profile-owned subsystem handoff. Wrong ownership can corrupt later execution. |
 | `RPU_GRAPH_DEFER_TO_COPY` | No independent default; legacy alias accepts `auto`/empty, `0`/`off`/`false`, or any other non-empty value for forced on | First host-op gate use / **NATIVE** | Consulted only when `RPU_GRAPH_HOST_OP_DEFER_GATE` is unset. Avoid setting both. |
 | `RPU_GRAPH_HOST_OP_DEFER_GATE` | `auto`; `auto`/empty, `0`/`off`/`false`, or any other non-empty value for forced on | First host-op gate use / **NATIVE** | Controls deferral of stable host inputs during capture. Forced-on with unstable storage risks stale data. |
-| `RPU_SKIP_IDLE_RECORD_FUNCTION` | Off; `1`/`on`/`true`/`True` enable | First Python graph scope / **MODEL** | Omits idle profiler scopes only while the profiler is off. It preserves scopes when profiling and otherwise reduces host overhead. |
+| `RPU_SKIP_IDLE_RECORD_FUNCTION` | On; `0`/`off`/`false` disable | First Python graph scope / **MODEL** | Omits idle profiler scopes only while the profiler is off. It preserves scopes when profiling and otherwise reduces host overhead. |
 
 ### KV, linear, normalization, and scheduling
 
@@ -413,33 +413,23 @@ sharing it.
 
 | Variable | Unset/default and accepted values | Read / change | Scope, effect, and risk |
 |---|---|---|---|
-| `QWEN3_5_VISION_DBG_Q` | Off; exact `1` or lowercase `true` | First native debug check / **NATIVE** | Enables the Qwen3.5 Vision query probe path. It adds captures/synchronization and may expose intermediates. |
 | `QWEN3_5_VISION_GRAPH_DISABLE` | `0`; any value other than exact `0` disables | Vision forward / **CALL**; rebuild/clear Graph | Bypasses Qwen3.5 Vision GraphCache for controlled comparison. Replay and latency conclusions no longer apply. |
 | `RPU_ALL_GATHER_FORCE_MULTI_CORE` | Off; **N1** | First native use / **NATIVE** | Forces the multi-core schedule for A/B comparison. It is not a generally supported performance selector. |
 | `RPU_CHUNK_FORCE_UNSAFE` | Off; **N1** | First applicable native planner/launcher use / **NATIVE** | Bypasses a planner safety check. It can exceed execution constraints and must never produce deployable output. |
 | `RPU_DYNAMO_MATERIALIZE_BREAKS` | **PB(false)** | Dynamo partitioning / **CALL**; recompile | Materializes partition breaks. It changes graph boundaries and adds transfers, so it is only a compiler diagnostic. |
 | `RPU_GRAPH_DDR_SPM_LOG` | Off; non-empty whose first character is not `0` | First data-node execution / **NATIVE** | Logs node indexes, byte counts, and a bounded source checksum. Output is model-data-derived and logging changes timing. |
 | `RPU_GRAPH_FORCE_ONESHOT_ON_REPLAY` | Off; non-empty whose first character is not `0` | First replay check / **NATIVE** | Executes a one-shot route instead of normal replay. It invalidates Graph lifecycle and performance conclusions. |
-| `RPU_GRAPH_HCB_CHECKSUM` | Off; non-empty whose first character is not `0` | First host-callback execution / **NATIVE** | Logs live/stable tensor metadata and bounded value summaries. Treat output as sensitive model data. |
 | `RPU_KVINSERT_V16_TRACE` | Off; any present value except exact `0` or `false`; an empty exported value enables | First native use / **NATIVE** | Logs KV route selection and shapes. It is diagnostic output, not proof of cache correctness. |
 | `RPU_L2_BUFONLY` | Off by absence; any presence, including `0`, enables | Grouped-expert Graph emission / **BUILD** | Declares grouped buffers but runs the per-expert route for bisection. Changes graph and performance. |
-| `RPU_L2_CAPTURE_GATE` | Off; **E1** | Expert weight installation / **MODEL** | Allocates and exports gate-related layer-0 intermediates. Increases memory/Graph work and exposes model data. |
-| `RPU_L2_CAPTURE_INNORM` | Off; **E1** | Expert weight installation / **MODEL** | Captures layer-0 post-normalization input. The tensor may contain user-derived activations. |
-| `RPU_L2_CAPTURE_L0` | Off; **E1** | Expert weight installation / **MODEL** | Captures layer-0 output for comparison. Adds persistent storage and a copy. |
-| `RPU_L2_CAP_RESID` | Off; **E1** | Expert weight installation / **MODEL** | Captures residual-stream tensors across layers. High memory cost; outputs may contain request-derived activations. |
-| `RPU_L2_DBG_PACKED` | Off; **E1** checked at each debug getter | Debug getter / **CALL** | Unlocks access to packed model weights for local inspection. Never expose returned tensors. |
 | `RPU_L2_DOWN_ACC16` | Off; **E1** | Expert weight installation / **MODEL** | Forces the diagnostic ACC16 grouped-down route. It changes numerical results and is not a supported precision profile. |
 | `RPU_L2_RCHUNK` | Runtime fallback `256`; positive decimal; supported grouped profiles require exact `1632` | Weight/profile validation (**MODEL**) and Graph emission (**BUILD**); fresh process | Overrides grouped scaling row chunks. Wrong values fail the sealed profile or change graph/timing. |
 | `RPU_L2_ROUTED_ONLY` | Off; **E1** | Expert weight installation / **MODEL** | Isolates routed-expert contribution for bisection. Output is not full-model output. |
 | `RPU_L2_SCHUNK` | `32512`; positive decimal, non-positive uses default | Graph emission / **BUILD** | Overrides grouped activation host chunking. It changes graph census and may reduce safety/performance. |
-| `RPU_L2_STAGES` | Off; **E1** | Expert weight installation / **MODEL** | Captures intermediate grouped stages. Adds memory/copies and exposes activations. |
 | `RPU_LINGBOT2_DEBUG_DENSE_SOFT_ROUTER` | Off; **E1** | Expert weight installation / **MODEL** | Replaces strict top-4 routing with dense soft routing. Accuracy is unvalidated and output is non-production. |
-| `RPU_LINGBOT2_DEBUG_DUMP_ROUTER_H` | Off; **E1** | Expert weight installation / **MODEL** | Captures per-layer router inputs. Dumps can contain request-derived activations and use substantial memory. |
 | `RPU_PI05_LOAD_NOISE` | Unset; path to an existing tensor `.pt`; missing path is ignored | Noise preparation / **CALL** | Replaces sampled noise after strict shape/finite checks using `weights_only=True`. Only trusted local files should be used. |
 | `RPU_PI05_LOAD_PIXEL_VALUES` | Unset; path to an existing tensor `.pt`; missing path is ignored | Image feature call / **CALL** | Replaces processed pixel values after strict checks. It changes model input and may load sensitive test data. |
 | `RPU_PI05_LOAD_PREFIX_EMBS` | Unset; path to an existing tensor `.pt`; missing path is ignored | Prefix preparation / **CALL** | Replaces prefix embeddings after strict checks. It bypasses normal upstream values and invalidates E2E claims. |
 | `RPU_PI05_LOG_CONVERSION` | Off by absence; any non-empty value, including `0`, enables | Gemma prefill / **CALL** | Logs conversion/handle/chunk diagnostics. Adds output and may expose model shape/configuration. |
-| `RPU_PI05_PROBE_DIR` | Unset; non-empty directory path | Pi0.5 conversion and forwards / **CALL** | Dumps named inputs, activations, and KV tensors as `.pt`. Artifacts can contain model weights and user data. |
 | `RPU_RHINOVLA_VISION_RPU_MERGERS_MEM_DEBUG` | **PB(false)** | Vision installation/materialization / **MODEL** | Prints allocator summaries around merger materialization. Adds synchronization and exposes memory structure. |
 | `RPU_SIGLIP_ISOLATE_PATCH_EMBED` | Off; non-empty except `0`/`false`/`False` | First segment planning / **NATIVE** | Isolates Pi0.5 patch-embedding segments to diagnose graph-finalization failures. Changes graph segmentation. |
 | `RPU_WALL_OSS_INSTRUMENT` | **PB(false)** | Wall-OSS forward stages / **CALL** | Prints host stage timings. Instrumentation overhead makes the same run unsuitable for clean latency reporting. |
@@ -475,8 +465,12 @@ one.
 - `torch.rpu.set_caching_allocator(bool)` toggles the process caching allocator
   (default off). `torch.rpu.empty_cache()` releases cached, unused blocks; it
   cannot release live tensors or Graph-owned storage.
-- `torch.rpu.memory_stats()` and `torch.rpu.get_memory_stats()` return allocator
-  counters. `reset_peak_memory_stats()` resets peak counters, while
+- `torch.rpu.memory_stats()` and `torch.rpu.get_memory_stats()` return
+  address-free allocator counters. When `caching_allocator_enabled` is true,
+  `caching_allocator_mapping` counts live HostDDR segments owned by that
+  allocator and `cached_idle_mapping` counts its fully idle cached segments.
+  They exclude Launch, SPM, and direct allocations and are not a process-wide
+  driver mapping count. `reset_peak_memory_stats()` resets peak counters, while
   `reset_accumulated_memory_stats()` resets accumulated allocation/free
   counters. Resetting counters does not free memory.
 - `torch.rpu.set_ddr_flush(bool)` controls internal RPU-to-RPU flush points

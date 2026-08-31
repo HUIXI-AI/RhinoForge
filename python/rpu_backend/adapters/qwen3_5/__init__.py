@@ -5,7 +5,7 @@ interleaves full-attention and Gated-DeltaNet (GDN) linear layers per
 ``text_config.layer_types``. The package follows the Hugging Face model hierarchy:
 
   ``Qwen3_5ForConditionalGeneration``   ← ``__init__.py``: top forward + lm_head + register
-          ├── ``Qwen3_5VisionModel``      ← ``vision.py`` (experimental 2B/4B path)
+          ├── ``Qwen3_5VisionModel``      ← ``vision.py`` (Source-only 2B/4B path)
           └── ``Qwen3_5Model`` (fusion)   ← ``__init__.py``: ``_rpu_qwen3_5_forward``
                     └── ``Qwen3_5TextModel``   ← ``text.py`` (text backbone)
 

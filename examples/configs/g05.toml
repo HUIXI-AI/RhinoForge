@@ -1,6 +1,6 @@
 # 单一完整模板 / Single complete template：注释行展示默认值，取消注释才覆盖运行时。
 # Public G0.5 integration boundary. Construct the policy with the pinned
-# OpenGalaxea implementation, then apply RhinoForge's continuous-action patch.
+# OpenGalaxea implementation, then apply RhinoForge's exact three-branch patch.
 [runner]
 target = "g05"
 
@@ -19,5 +19,13 @@ with_stack = false # 默认 false；记录 Python stack，开销更高。
 alias = "g05-base"
 source = "OpenGalaxea/G05"
 revision = "e312be81e90c56a55bcb26b57429bd39a335b449"
+subfolder = "g05-base"
+implementation = "OpenGalaxea/GalaxeaVLA"
+implementation_revision = "89f2322b4ad016e192437adc1a2c253b05bab246"
+config_sha256 = "c98af37352c0f600341d2ecbdb49fcdfa87812198654448991615065fa1a4461"
+license = "G0.5 Community License (non-commercial)"
 max_seq_len = 2048
+continuous_action = true
+discrete_action = true
+predict_cot = true
 source_only_acknowledged = true

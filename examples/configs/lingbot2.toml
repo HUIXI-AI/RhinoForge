@@ -56,7 +56,7 @@ with_stack = false # 默认 false；记录 Python stack，开销更高。
 
 [model]
 alias = "lingbot-vla-v2-6b"
-dtype = "w8a16"
+dtype = "fp16"
 n_cameras = 3
 image_size = 256
 max_lang_tokens = 72

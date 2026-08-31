@@ -49,7 +49,7 @@ constexpr int64_t QWEN25VL_VISION_DEBUG_PHASE_LAYER = 17;
 constexpr int64_t QWEN25VL_VISION_DEBUG_PHASE_COUNT = 3;
 
 // RPU_WALL_OSS_VISION_ROPE_SPM — default OFF in C++ (only this qwen25vl vision
-// encoder reads it; wall_oss opts in default-on via build_wall_oss_vla). When
+// encoder reads it; WallOssPolicy's internal builder opts in by default). When
 // on, the 2D-RoPE cos/sin tables are broadcast into SPM once at preload and the
 // SPM-table kernel variant is used, so the per-token cos/sin gather hits SPM
 // instead of DDR. Numerically identical to the DDR variant (same kernel math).
@@ -575,16 +575,14 @@ public:
             position_idx_keepalive_.data_ptr<int16_t>(),
             static_cast<size_t>(num_patches_in * 2 * sizeof(int16_t)));
 
-        // Generic SISC/MISC stays single-chunk. Layer grouping exposes one
-        // framework compute chunk per image.
+        // Generic execution uses the configured physical chunk as a fixed
+        // capacity. FMB clamps it only when the whole logical sequence is
+        // smaller; a 1024-row image with the public 768 capacity therefore
+        // resolves to 768 + 256. The legacy layer-group schedule still owns
+        // one exact chunk per image.
         const int64_t logical_chunk = is_generic()
             ? num_patches_in : num_patches_in / image_batch_count_;
         const int64_t required_chunk = ((logical_chunk + 15) / 16) * 16;
-        TORCH_CHECK(configured_chunk_size_ == 0
-                        || configured_chunk_size_ == required_chunk,
-                    "qwen25vl vision exact chunk_size must equal the native "
-                    "single-chunk capacity: configured=", configured_chunk_size_,
-                    " logical=", logical_chunk, " required=", required_chunk);
         set_chunk_size_override(is_generic()
             ? configured_chunk_size_ : required_chunk);
 
@@ -620,6 +618,9 @@ protected:
         cfg.num_layers = num_layers();
         cfg.preload_fn = static_cast<void(FusedModelBase::*)()>(
                              &Qwen25VLVisionModel::emit_preload_weights);
+        cfg.kv_first_fn =
+            static_cast<void(FusedModelBase::*)(int, const ChunkInfo&)>(
+                &Qwen25VLVisionModel::emit_kv_first_body);
         cfg.cross_layer_batch_size = num_layers();
         // Fused merger (single- and batched-image): run the merger inside the
         // same capture after the encoder loop, returning [seq/4, oh] from the C++
@@ -649,19 +650,26 @@ protected:
             cfg.chunk_outer_within_group = true;
             return cfg;
         }
-        TORCH_CHECK(schedule_ != VisionSchedule::MIMC,
-                    "qwen25vl generic DDR MIMC is not implemented");
-        // This vision encoder is hard-wired single-chunk: build_layer_subgraph uses GLOBAL
-        // RoPE pos_offset/KV-insert position but a CHUNK-LOCAL SDPA kv_seq_len, so a >1-chunk
-        // plan would silently degrade full/window attention to per-chunk self-attention. Fail
-        // loudly instead. (If a real input ever exceeds the single-chunk SPM budget, implement
-        // true multi-chunk: per-chunk.offset KV/positions + full-sequence kv_seq_len + mask.)
-        TORCH_CHECK(plan.num_chunks == 1,
-            "qwen25vl_vision requires a single chunk (got ", plan.num_chunks,
-            "); multi-chunk would silently break cross-patch attention");
         ModelDynamicConfig cfg;
-        cfg.chunk_mode     = ChunkMode::SEQUENTIAL;
-        cfg.inter_layer_io = InterLayerIO::SPM_RESIDENT;
+        if (plan.num_chunks == 1) {
+            cfg.chunk_mode = ChunkMode::SEQUENTIAL;
+            cfg.inter_layer_io = InterLayerIO::SPM_RESIDENT;
+            return cfg;
+        }
+        TORCH_CHECK(image_batch_count_ == 1 &&
+                        schedule_ == VisionSchedule::SISC,
+                    "qwen25vl multi-chunk supports one semantic image only; "
+                    "packed multi-image execution remains disabled");
+        TORCH_CHECK(current_num_patches_ == 1024 &&
+                        configured_chunk_size_ == 768 &&
+                        plan.chunk_size == 768 && plan.num_chunks == 2,
+                    "qwen25vl multi-chunk is admitted only for the exact "
+                    "1024-row image with a 768+256 plan");
+        TORCH_CHECK(!per_window_sdpa_enabled_,
+                    "qwen25vl per-window SDPA multi-chunk is not implemented; "
+                    "use the public dense-window-mask path");
+        cfg.chunk_mode = ChunkMode::KV_FIRST;
+        cfg.inter_layer_io = InterLayerIO::AUTO;
         return cfg;
     }
 
@@ -679,6 +687,12 @@ protected:
         int64_t res  = A(cs * h * DWIDTH);
         int64_t qkv  = A(cs * local_q_dim * DWIDTH);
         int64_t inter = A(cs * local_inter * DWIDTH);
+        const bool multi_chunk = is_generic() && current_num_patches_ > cs;
+
+        constexpr BufferScope ALL = BufferScope::LayerWide;
+        constexpr BufferScope KVIN = BufferScope::KvInsert;
+        constexpr BufferScope COMP = BufferScope::Compute;
+        constexpr BufferScope OUTSIDE = BufferScope::OutsideLayerLoop;
 
         SdpaConfig sdpa_cfg{SdpaKernelType::FLASH_ATTN_SPM,
                             hd, /*nq*/nq, /*nkv*/nq,
@@ -687,11 +701,13 @@ protected:
         // sequence. Batched vision calls SDPA per image; a long single image uses
         // 144-query strips below while retaining full-sequence K/V. This saves
         // ~320 KiB/core at seq=576 without changing attention or buffer lifetimes.
-        const bool packed_batch = is_generic()
+        const bool packed_batch = !multi_chunk && is_generic()
             && schedule_ == VisionSchedule::MISC;
         int64_t sdpa_seq = packed_batch
             ? (cs / image_batch_count_)
-            : (cs > 256 ? std::min(cs, QWEN25VL_VISION_SDPA_QUERY_CHUNK) : cs);
+            : (multi_chunk || cs > 256
+                   ? std::min(cs, QWEN25VL_VISION_SDPA_QUERY_CHUNK)
+                   : cs);
         SdpaTiling t = sdpa_compute_tiling(sdpa_cfg, sdpa_seq);
         int64_t nkv_per_core = CeilDiv(nq, (int64_t)NUM_CORES);
         int64_t sdpa_tmp = A(t.tile_n_v16 * t.tile_k * nkv_per_core * CeilDiv(sdpa_seq, t.tile_m) * 32);
@@ -705,30 +721,39 @@ protected:
         int64_t inter_bias_sz = dma_safe(local_inter);   // gate/up per-core 432
         int64_t full_bias_sz  = dma_safe(h);             // o/down full width 1280
 
-        // Dense block-diagonal mask [seq_q, seq_k_v16*16] fp16, broadcast to
-        // all cores. seq_k = seq_q = cs (single-chunk vision). Same formula as
-        // Gemma (rpu_gemma_model.cpp). Only declared when windowing.
-        // Batched: window SDPA is per-image (per_image_ctx queries), so the mask is
-        // [per_image_ctx, per_image_ctx], not [cs, cs] — much smaller in SPM.
-        int64_t mask_cs = packed_batch ? (cs / image_batch_count_) : cs;
-        int64_t mask_sz = A(mask_cs * CeilDiv(mask_cs, (int64_t)16) * 32);
+        // Single-chunk paths retain their existing full/per-image mask. The
+        // multi-chunk SIMC path uploads one query strip at a time from the
+        // stable full [N,N] DDR mask, so SPM needs only [strip,N].
+        const int64_t mask_q = multi_chunk
+            ? sdpa_seq : (packed_batch ? cs / image_batch_count_ : cs);
+        const int64_t mask_k = multi_chunk
+            ? current_num_patches_
+            : (packed_batch ? cs / image_batch_count_ : cs);
+        int64_t mask_sz = A(mask_q * CeilDiv(mask_k, (int64_t)16) * 32);
 
         int nl = static_cast<int>(num_layers());
 
         std::vector<BufferDecl> decls = {
-            {"residual1",  res,    1, 6, StorageClass::Temp, 0, nullptr},
-            {"input_norm", res,    1, 6, StorageClass::Temp, 0, nullptr},
-            {"oproj",      res,    4, 6, StorageClass::Temp, 0, nullptr},
+            {"residual1",  res,    1, 6, StorageClass::Temp, 0, nullptr, ALL},
+            {"input_norm", res,    1, 6, StorageClass::Temp, 0, nullptr, ALL},
+            {"oproj",      res,    4, 6, StorageClass::Temp, 0, nullptr,
+             multi_chunk ? COMP : ALL},
 
-            {"q",          qkv,    2, 3, StorageClass::Temp, 0, nullptr},
-            {"k",          qkv,    2, 3, StorageClass::Temp, 0, nullptr},
-            {"v",          qkv,    2, 3, StorageClass::Temp, 0, nullptr},
-            {"sdpa_out",   qkv,    3, 4, StorageClass::Temp, 0, nullptr},
-            {"sdpa_tmp",   sdpa_tmp, 3, 3, StorageClass::Temp, 0, nullptr},
+            {"q",          qkv,    2, 3, StorageClass::Temp, 0, nullptr,
+             multi_chunk ? COMP : ALL},
+            {"k",          qkv,    2, 3, StorageClass::Temp, 0, nullptr,
+             multi_chunk ? KVIN : ALL},
+            {"v",          qkv,    2, 3, StorageClass::Temp, 0, nullptr,
+             multi_chunk ? KVIN : ALL},
+            {"sdpa_out",   qkv,    3, 4, StorageClass::Temp, 0, nullptr,
+             multi_chunk ? COMP : ALL},
+            {"sdpa_tmp",   sdpa_tmp, 3, 3, StorageClass::Temp, 0, nullptr,
+             multi_chunk ? COMP : ALL},
 
             // SwiGLU: gate + up live across phases 5..6 (gate also holds the
             // silu*up product fed to down).
-            {"gate",       inter,  5, 6, StorageClass::Temp, 0, nullptr},
+            {"gate",       inter,  5, 6, StorageClass::Temp, 0, nullptr,
+             multi_chunk ? COMP : ALL},
             // `up` lives ONLY in phase 5 (written by up_proj, consumed by the SwiGLU
             // mul, dead before phase 6). `residual1`'s CONTENT is dead in phase 5 (read
             // by the phase-4 residual-add, then overwritten by the phase-6 block-output
@@ -736,7 +761,7 @@ protected:
             // safely reuses residual1's slot → drops the phase-5 peak by one `inter`
             // (3·res+2·inter → 3·res+1·inter), which lets 3×256=768 fit a single chunk
             // in the full VLA. Bit-exact (verified by the cos=1.0 gate).
-            {"up",         inter,  5, 5, StorageClass::Temp, 0, "residual1"},
+            {"up",         inter,  5, 5, StorageClass::Temp, 0, "residual1", ALL},
 
             {"norm1_w",    norm_w_sz,     0, 0, StorageClass::PersistentPerLayer, nl, nullptr},
             {"norm2_w",    norm_w_sz,     0, 0, StorageClass::PersistentPerLayer, nl, nullptr},
@@ -749,7 +774,9 @@ protected:
             {"down_bias",  full_bias_sz,  0, 0, StorageClass::PersistentPerLayer, nl, nullptr},
         };
         if (window_mask_present_) {
-            decls.push_back({"sdpa_mask", mask_sz, 3, 4, StorageClass::Temp, 0, nullptr});
+            decls.push_back({"sdpa_mask", mask_sz, 3, 4,
+                             StorageClass::Temp, 0, nullptr,
+                             multi_chunk ? COMP : ALL});
         }
         // SPM-resident 2D-RoPE cos/sin tables [max_hw, head_dim/4] fp16 (shared
         // across all layers; broadcast once in emit_preload_weights). Tiny
@@ -770,14 +797,16 @@ protected:
         //   RMSNorm(residual1[seq,h]) -> m0 GEMM col [mrows, merge_hidden] -> GELU
         //   -> m2 GEMM row partial [mrows, oh] -> all-reduce [mrows, oh] -> SPM->DDR.
         //
-        // All 4 activation buffers ALIAS dead encoder Temps, so the merger adds 0
-        // Fixed / 0 Temp peak AND the persistent set is g-INDEPENDENT (no merger
-        // buffer is Persistent). g-independence is required because forward()
+        // Single-chunk activations alias dead encoder Temps. Multi-chunk uses
+        // OutsideLayerLoop storage, which aliases the layer scopes as a group
+        // and reloads ordered final rows from DDR. In both cases the persistent
+        // set is g-INDEPENDENT (no merger activation is Persistent). This is
+        // required because forward()
         // routes g=1 -> _forward_one and g>1 -> _forward_group on ONE shared
         // handle, and the framework hard-aborts on any persistent-set change after
         // the first forward (persistent layout hash lock).
         //
-        // Lifetime (all reuses are sequentially safe — the graph executes encoder
+        // Single-chunk lifetime (all reuses are sequentially safe — the graph executes encoder
         // nodes then post_fn nodes in emission order):
         //   merger_normed (->oproj):     RMSNorm out (1->2), then m2 PARTIAL (4->5).
         //   merger_mid    (->gate):      m0 col / GELU (2->4).
@@ -806,10 +835,32 @@ protected:
             const int64_t normed_sz = A(cs * h * DWIDTH);                 // == oproj (res)
             const int64_t mid_sz    = A(mrows * local_mh * DWIDTH);
             const int64_t out_sz    = A(mrows * oh * DWIDTH);            // zero & out
-            decls.push_back({"merger_normed", normed_sz, 0, 0, StorageClass::Temp, 0, "oproj"});
-            decls.push_back({"merger_mid",    mid_sz,    0, 0, StorageClass::Temp, 0, "gate"});
-            decls.push_back({"merger_zero",   out_sz,    0, 0, StorageClass::Temp, 0, "input_norm"});
-            decls.push_back({"merger_out",    out_sz,    0, 0, StorageClass::Temp, 0, "residual1"});
+            if (multi_chunk) {
+                // DDR_PINGPONG leaves the complete last-layer result in the
+                // registry output. PostFn reloads one merge-aligned run into
+                // this disjoint scope; it does not depend on the last compute
+                // chunk still occupying residual1.
+                decls.push_back({"merger_input", normed_sz, 1, 1,
+                                 StorageClass::Temp, 0, nullptr, OUTSIDE});
+                decls.push_back({"merger_normed", normed_sz, 1, 5,
+                                 StorageClass::Temp, 0, nullptr, OUTSIDE});
+                decls.push_back({"merger_mid", mid_sz, 2, 4,
+                                 StorageClass::Temp, 0, nullptr, OUTSIDE});
+                decls.push_back({"merger_zero", out_sz, 5, 5,
+                                 StorageClass::Temp, 0, nullptr, OUTSIDE});
+                // Exact 768+256 uses two independent output slots. The mutable
+                // DDR copy of chunk 0 may still be in flight when chunk 1
+                // computes; reusing one SPM destination would create a WAR.
+                decls.push_back({"merger_out0", out_sz, 5, 6,
+                                 StorageClass::Temp, 0, nullptr, OUTSIDE});
+                decls.push_back({"merger_out1", out_sz, 5, 6,
+                                 StorageClass::Temp, 0, nullptr, OUTSIDE});
+            } else {
+                decls.push_back({"merger_normed", normed_sz, 0, 0, StorageClass::Temp, 0, "oproj"});
+                decls.push_back({"merger_mid",    mid_sz,    0, 0, StorageClass::Temp, 0, "gate"});
+                decls.push_back({"merger_zero",   out_sz,    0, 0, StorageClass::Temp, 0, "input_norm"});
+                decls.push_back({"merger_out",    out_sz,    0, 0, StorageClass::Temp, 0, "residual1"});
+            }
             decls.push_back({"merger_ln_q_w",  dma_safe(h),              0, 0, StorageClass::Persistent, 0, nullptr});
             decls.push_back({"merger_m0_bias", dma_safe(local_mh),       0, 0, StorageClass::Persistent, 0, nullptr});
             decls.push_back({"merger_m2_bias", dma_safe(oh),             0, 0, StorageClass::Persistent, 0, nullptr});
@@ -924,6 +975,67 @@ protected:
         }
     }
 
+    void emit_vision_rope(const char* buffer, const ChunkInfo& chunk) {
+        const int64_t nq = num_q_heads();
+        const int64_t hd = head_dim();
+        const int64_t local_heads = nq / NUM_CORES;
+        if (vision_rope_spm_enabled()) {
+            rpu_launch_rope_2d_spm_kernel(
+                addr(0, buffer), addr(0, buffer),
+                addr(0, "rope_cos"), addr(0, "rope_sin"),
+                position_idx_keepalive_.data_ptr<int16_t>(),
+                /*pos_offset=*/chunk.offset, chunk.len,
+                local_heads, hd, /*head_dim_pad=*/hd, NUM_CORES);
+            return;
+        }
+        rpu_launch_rope_2d_ddr_kernel(
+            addr(0, buffer), addr(0, buffer),
+            freq_cos_.data_ptr<c10::Half>(), freq_sin_.data_ptr<c10::Half>(),
+            position_idx_keepalive_.data_ptr<int16_t>(),
+            /*pos_offset=*/chunk.offset, chunk.len,
+            local_heads, hd, /*head_dim_pad=*/hd, NUM_CORES);
+    }
+
+    // KV_FIRST phase 1 for one logical image split across physical chunks.
+    // Fill every layer's global K/V cache before any query chunk executes.
+    // Q is intentionally recomputed in the compute phase from the same
+    // deterministic RMSNorm output, avoiding another long-lived DDR mapping.
+    void emit_kv_first_body(int layer_idx, const ChunkInfo& chunk) {
+        TORCH_INTERNAL_ASSERT(
+            ctx().stage_plan.chunk_mode == ChunkMode::KV_FIRST);
+        const auto& lw = layer_weights_[layer_idx];
+        const int64_t seq_len = chunk.len;
+        const int64_t h = hidden_size();
+        const int64_t nq = num_q_heads();
+        const int64_t hd = head_dim();
+
+        if (!ctx().input_in_spm) {
+            emit_layer_input_dma(layer_idx, chunk);
+        }
+        rpu_launch_rmsnorm_spm_kernel(
+            addr(0, "residual1"), addr(0, "input_norm"),
+            layer_addr(layer_idx, 0, "norm1_w"), seq_len, h, eps_);
+        rpu_launch_linear_spm_to_spm_acc16_kernel(
+            addr(0, "input_norm"), lw.k_w, addr(0, "k"),
+            seq_len, nq * hd, h, 1, NUM_CORES,
+            layer_addr(layer_idx, 0, "k_bias"), lw.k_ws);
+        rpu_launch_linear_spm_to_spm_acc16_kernel(
+            addr(0, "input_norm"), lw.v_w, addr(0, "v"),
+            seq_len, nq * hd, h, 1, NUM_CORES,
+            layer_addr(layer_idx, 0, "v_bias"), lw.v_ws);
+        emit_vision_rope("k", chunk);
+
+        auto& k_cache = (*ctx().k_caches)[layer_idx];
+        auto& v_cache = (*ctx().v_caches)[layer_idx];
+        const int64_t insert_position = ctx().position + chunk.offset;
+        rpu_launch_insert_kcache_spm_unified(
+            k_cache, insert_position, addr_offset("k").value,
+            seq_len, nq, hd, NUM_CORES);
+        rpu_launch_insert_vcache_spm_unified(
+            v_cache, insert_position, addr_offset("v").value,
+            seq_len, nq, hd, NUM_CORES);
+    }
+
     void build_layer_subgraph(int layer_idx, const ChunkInfo& chunk) override {
         const auto& lw = layer_weights_[layer_idx];
         int64_t seq_len = chunk.len;
@@ -956,58 +1068,44 @@ protected:
             layer_addr(layer_idx, 0, "norm1_w"), seq_len, h, eps_);
         emit_debug_phase(0, "input_norm");
 
-        // Phase 2: Q / K / V Linear with bias (col-partition).
+        const bool kv_first =
+            ctx().stage_plan.chunk_mode == ChunkMode::KV_FIRST;
+
+        // Phase 2: Q always belongs to the compute phase. The one-chunk path
+        // retains its original Q/K/V body; KV_FIRST already populated global
+        // K/V in emit_kv_first_body.
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "input_norm"), lw.q_w, addr(0, "q"),
             seq_len, nq * hd, h, 1, NUM_CORES, layer_addr(layer_idx, 0, "q_bias"), lw.q_ws);
-        rpu_launch_linear_spm_to_spm_acc16_kernel(
-            addr(0, "input_norm"), lw.k_w, addr(0, "k"),
-            seq_len, nq * hd, h, 1, NUM_CORES, layer_addr(layer_idx, 0, "k_bias"), lw.k_ws);
-        rpu_launch_linear_spm_to_spm_acc16_kernel(
-            addr(0, "input_norm"), lw.v_w, addr(0, "v"),
-            seq_len, nq * hd, h, 1, NUM_CORES, layer_addr(layer_idx, 0, "v_bias"), lw.v_ws);
-
-        // Phase 2.5: 2D RoPE on Q and K (in-place). Each core holds nq/8=2 heads.
-        const int64_t local_heads = nq / NUM_CORES;
-        const int64_t head_dim_pad = hd;  // head_dim=80, no padding.
-        if (vision_rope_spm_enabled()) {
-            // SPM-resident cos/sin tables (broadcast once in emit_preload_weights).
-            const uint32_t cos_a = addr(0, "rope_cos");
-            const uint32_t sin_a = addr(0, "rope_sin");
-            rpu_launch_rope_2d_spm_kernel(
-                addr(0, "q"), addr(0, "q"), cos_a, sin_a,
-                position_idx_keepalive_.data_ptr<int16_t>(),
-                /*pos_offset=*/chunk.offset, seq_len,
-                local_heads, hd, head_dim_pad, NUM_CORES);
-            rpu_launch_rope_2d_spm_kernel(
-                addr(0, "k"), addr(0, "k"), cos_a, sin_a,
-                position_idx_keepalive_.data_ptr<int16_t>(),
-                /*pos_offset=*/chunk.offset, seq_len,
-                local_heads, hd, head_dim_pad, NUM_CORES);
-        } else {
-            rpu_launch_rope_2d_ddr_kernel(
-                addr(0, "q"), addr(0, "q"),
-                freq_cos_.data_ptr<c10::Half>(), freq_sin_.data_ptr<c10::Half>(),
-                position_idx_keepalive_.data_ptr<int16_t>(),
-                /*pos_offset=*/chunk.offset, seq_len,
-                local_heads, hd, head_dim_pad, NUM_CORES);
-            rpu_launch_rope_2d_ddr_kernel(
-                addr(0, "k"), addr(0, "k"),
-                freq_cos_.data_ptr<c10::Half>(), freq_sin_.data_ptr<c10::Half>(),
-                position_idx_keepalive_.data_ptr<int16_t>(),
-                /*pos_offset=*/chunk.offset, seq_len,
-                local_heads, hd, head_dim_pad, NUM_CORES);
+        if (!kv_first) {
+            rpu_launch_linear_spm_to_spm_acc16_kernel(
+                addr(0, "input_norm"), lw.k_w, addr(0, "k"),
+                seq_len, nq * hd, h, 1, NUM_CORES,
+                layer_addr(layer_idx, 0, "k_bias"), lw.k_ws);
+            rpu_launch_linear_spm_to_spm_acc16_kernel(
+                addr(0, "input_norm"), lw.v_w, addr(0, "v"),
+                seq_len, nq * hd, h, 1, NUM_CORES,
+                layer_addr(layer_idx, 0, "v_bias"), lw.v_ws);
         }
 
-        // Phase 3: KV cache insert (position=0) + bidirectional SDPA (MASK_NONE).
+        // Phase 2.5: 2D RoPE on local Q, plus K on the one-chunk path.
+        emit_vision_rope("q", chunk);
+        if (!kv_first) {
+            emit_vision_rope("k", chunk);
+        }
+
+        // Phase 3: one-chunk inserts at position zero. KV_FIRST has already
+        // inserted all chunks at absolute offsets before reaching this body.
         auto& k_cache = (*ctx().k_caches)[layer_idx];
         auto& v_cache = (*ctx().v_caches)[layer_idx];
-        rpu_launch_insert_kcache_spm_unified(
-            k_cache, 0 /*position*/, addr_offset("k").value,
-            seq_len, nq, hd, NUM_CORES);
-        rpu_launch_insert_vcache_spm_unified(
-            v_cache, 0 /*position*/, addr_offset("v").value,
-            seq_len, nq, hd, NUM_CORES);
+        if (!kv_first) {
+            rpu_launch_insert_kcache_spm_unified(
+                k_cache, 0 /*position*/, addr_offset("k").value,
+                seq_len, nq, hd, NUM_CORES);
+            rpu_launch_insert_vcache_spm_unified(
+                v_cache, 0 /*position*/, addr_offset("v").value,
+                seq_len, nq, hd, NUM_CORES);
+        }
 
         double attn_scale = 1.0 / std::sqrt(static_cast<double>(orig_head_dim_));
 
@@ -1021,7 +1119,36 @@ protected:
         int mask_type = (is_full || per_window_sdpa_enabled_)
             ? 0 : prepared_window_mask_.mask_type;  // 0 / 4
 
-        if (is_generic() && schedule_ == VisionSchedule::MISC) {
+        if (kv_first) {
+            TORCH_INTERNAL_ASSERT(image_batch_count_ == 1);
+            TORCH_CHECK(ctx().position == 0,
+                        "qwen25vl Vision multi-chunk requires position zero");
+            const int64_t full_seq = current_num_patches_;
+            const int64_t qd = (nq / NUM_CORES) * hd;
+            const int64_t query_chunk =
+                std::min<int64_t>(QWEN25VL_VISION_SDPA_QUERY_CHUNK, seq_len);
+            for (int64_t q_rel = 0; q_rel < seq_len; q_rel += query_chunk) {
+                const int64_t query_len =
+                    std::min(query_chunk, seq_len - q_rel);
+                uint32_t mask_off = 0;
+                if (!is_full) {
+                    mask_off = addr_offset("sdpa_mask").value;
+                    sdpa_dma_mask_to_spm(
+                        prepared_window_mask_, mask_off,
+                        query_len, full_seq, NUM_CORES,
+                        /*query_row_offset=*/chunk.offset + q_rel);
+                }
+                const uint32_t q_off = addr_offset("q").value
+                    + static_cast<uint32_t>(q_rel * qd * DWIDTH);
+                const uint32_t out_off = addr_offset("sdpa_out").value
+                    + static_cast<uint32_t>(q_rel * qd * DWIDTH);
+                rpu_launch_sdpa_spm_unified_kernel_v2(
+                    k_cache, v_cache, mask_type, attn_scale,
+                    q_off, out_off, addr_offset("sdpa_tmp").value,
+                    mask_off, query_len, nq, nq, hd,
+                    full_seq, NUM_CORES, NUM_CORES);
+            }
+        } else if (is_generic() && schedule_ == VisionSchedule::MISC) {
             // Batched multi-image: g per-image SDPA calls, each at the proven ≤256
             // config (full → MASK_NONE, window → shared [pic,pic] MASK_2D). Keeping
             // every SDPA at per_image_ctx (a) dodges the documented ≥512 unified
@@ -1254,8 +1381,34 @@ protected:
             post_output_tensor().nbytes());
 
         if (is_generic()) {
-            emit_merger_chunk(
-                total_seq, /*dst_offset_elems=*/0, addr(0, "residual1"));
+            const auto& compute_chunks = ctx().stage_plan.compute.chunks;
+            if (compute_chunks.size() == 1) {
+                emit_merger_chunk(
+                    total_seq, /*dst_offset_elems=*/0,
+                    addr(0, "residual1"));
+                return;
+            }
+            TORCH_INTERNAL_ASSERT(image_batch_count_ == 1);
+            TORCH_INTERNAL_ASSERT(compute_chunks.size() == 2);
+            int64_t covered = 0;
+            for (const ChunkInfo& chunk : compute_chunks) {
+                TORCH_CHECK(chunk.offset == covered &&
+                                chunk.offset % 4 == 0 && chunk.len % 4 == 0,
+                            "qwen25vl multi-chunk merger requires ordered "
+                            "merge-unit-aligned chunks");
+                const uint32_t input_addr = addr(0, "merger_input");
+                rpu_launch_ddr_broadcast_spm_dma(
+                    output_tensor(), chunk.offset * h, chunk.len * h,
+                    input_addr, NUM_CORES);
+                const uint32_t output_addr =
+                    addr(0, chunk.idx == 0 ? "merger_out0" : "merger_out1");
+                emit_merger_chunk(
+                    chunk.len, (chunk.offset / 4) * oh,
+                    input_addr, output_addr);
+                covered += chunk.len;
+            }
+            TORCH_CHECK(covered == total_seq,
+                        "qwen25vl multi-chunk merger did not cover all rows");
             return;
         }
 

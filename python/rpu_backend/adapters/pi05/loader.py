@@ -6,8 +6,10 @@ Owns the `_load_and_fp16_cast` + `_cache_is_stale` + `_install_fp16_hooks` + the
 """
 from __future__ import annotations
 import glob
+import hashlib
 import json
 import os
+from pathlib import Path
 import threading
 import time
 from typing import Any
@@ -16,11 +18,248 @@ import torch
 import torch.nn as nn
 
 from rpu_backend.runtime.log import _LOG
-from rpu_backend.api.errors import RPUBackendError, RPUUnsupportedDtypeError
+from rpu_backend.api.errors import (
+    RPUBackendError,
+    RPUUnsupportedDtypeError,
+    UnsupportedModelError,
+)
 
 
 # Serialize the temporary PI05Policy.__init__ patch.
 _LOAD_LOCK = threading.Lock()
+
+
+PI05_BASE_PUBLIC_PROFILE = "pi0.5-base"
+PI05_LIBERO_PUBLIC_PROFILE = "pi0.5-libero-v044"
+_PI05_BASE_MANIFEST_SHA256 = (
+    "4133ecc2e9d9ec04afdff7f251857027b20c414952653dbd5022687e40b9ec23"
+)
+_PI05_BASE_FILES = {
+    "config.json": "367869712a2847c27e95c431ecb03f17bec4eee01a63995e2fb2d91940752b53",
+    "model.safetensors": "0eb11ca9587678c1d2ef8cf32807c29f8ce53a2bfdfc1aa4a4c96f16fca59b0f",
+    "policy_postprocessor.json": "142c8b622aeac5c14631e057279df058d3005f616d909cfe30a04524de0b0891",
+    "policy_preprocessor.json": "be2cd1acc33229d42be0640cb55b5d5a4bb3e8d8e27ddfcdcf3f99f1fe3beaef",
+}
+_PI05_BASE_REMAPPED_SHA256 = (
+    "b55bac5fc2a4e52dee8170fd14a9ab0c26dc5dfa4c2b2ae3fd7b2852dda74884"
+)
+_PI05_BASE_CAMERA_KEYS = (
+    "observation.images.base_0_rgb",
+    "observation.images.left_wrist_0_rgb",
+    "observation.images.right_wrist_0_rgb",
+)
+_PI05_BASE_MAX_ATTENTION_TOKENS = 60
+_PI05_BASE_VOCAB_SIZE = 257_152
+
+_PI05_LIBERO_MANIFEST_SHA256 = (
+    "bf035fe76a92cb4cfa3c14803e1b265f3f2ffecbeae9b214253b0a26deed0f39"
+)
+_PI05_LIBERO_FILES = {
+    ".gitattributes": "11ad7efa24975ee4b0c3c3a38ed18737f0658a5f75a0a96787b576a78a023361",
+    "README.md": "1be8947f4a576eef20d423ade5f651db2b0c78b4d3c154660b9a93feaaf2d13e",
+    "config.json": "2f6d4b96b032593e1de65b391ee7252a70227bff398ef1b94658fea17818142f",
+    "model.safetensors": "877b3ec1130548b69af7f8aeef3ec9d3fc7738040f0b9beb490857ec970997ae",
+    "model_remapped.safetensors": "63b51a0897def2f9a7d7dc7d8e6b0ee3708514aadb9d5785d7c987af69129598",
+    "policy_postprocessor.json": "37d719a6584600988e6c343306d2eaee0575109f235ad500313577f73e47e8a1",
+    "policy_postprocessor_step_0_unnormalizer_processor.safetensors": (
+        "a002c0df7f79c5b169c5a899ad151d4ea1bed246c7d82bd93ed1556558d517a9"
+    ),
+    "policy_preprocessor.json": "3d669ffc18d0364536735d8203076dcc69d3a6523aa5956ccaada3f9e1e6b748",
+    "policy_preprocessor_step_2_normalizer_processor.safetensors": (
+        "a002c0df7f79c5b169c5a899ad151d4ea1bed246c7d82bd93ed1556558d517a9"
+    ),
+    "train_config.json": "199518b79faeaef0877e9a1eb5f2df6884902476a7d4491c7f865142c3fe90fd",
+}
+_PI05_LIBERO_CAMERA_KEYS = (
+    "observation.images.image",
+    "observation.images.image2",
+)
+
+
+def _pi05_public_profile(profile: str) -> dict[str, Any]:
+    if profile == PI05_BASE_PUBLIC_PROFILE:
+        return {
+            "repository": "lerobot/pi05_base",
+            "revision": "b211f3d44c36b6acfcf7ae94a64e8e96f75a64ba",
+            "manifest_sha256": _PI05_BASE_MANIFEST_SHA256,
+            "files": _PI05_BASE_FILES,
+            "remapped_sha256": _PI05_BASE_REMAPPED_SHA256,
+            "camera_keys": _PI05_BASE_CAMERA_KEYS,
+            "state_dim": 32,
+        }
+    if profile == PI05_LIBERO_PUBLIC_PROFILE:
+        return {
+            "repository": "lerobot/pi05_libero_finetuned_v044",
+            "revision": "8e174154ef5f6c60a8da12ae99c303d8963138c1",
+            "manifest_sha256": _PI05_LIBERO_MANIFEST_SHA256,
+            "files": _PI05_LIBERO_FILES,
+            "remapped_sha256": _PI05_LIBERO_FILES["model_remapped.safetensors"],
+            "camera_keys": _PI05_LIBERO_CAMERA_KEYS,
+            "state_dim": 8,
+        }
+    raise UnsupportedModelError(
+        f"unknown Pi0.5 public profile {profile!r}; expected one of "
+        f"{[PI05_BASE_PUBLIC_PROFILE, PI05_LIBERO_PUBLIC_PROFILE]!r}."
+    )
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(16 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_pi05_public_request(
+    batch: dict,
+    *,
+    profile: str | None,
+    entry_point: str,
+    num_steps: int | None = None,
+) -> dict:
+    """Validate a controlled Pi0.5 request without device or model mutation."""
+    if profile is None:
+        return batch
+    identity = _pi05_public_profile(profile)
+    if not isinstance(batch, dict):
+        raise TypeError(
+            f"{entry_point}: admission_batch must be a dict, got "
+            f"{type(batch).__name__}"
+        )
+    camera_keys = identity["camera_keys"]
+    request_keys = frozenset({
+        *camera_keys,
+        "observation.state",
+        "observation.language.tokens",
+        "observation.language.attention_mask",
+    })
+    if set(batch) != request_keys:
+        missing = sorted(request_keys - set(batch))
+        extra = sorted(set(batch) - request_keys)
+        raise ValueError(
+            f"{entry_point}: {profile} request keys drift; "
+            f"missing={missing}, extra={extra}"
+        )
+
+    expected = {
+        **{name: ((1, 3, 256, 256), torch.float32)
+           for name in camera_keys},
+        "observation.state": ((1, identity["state_dim"]), torch.float32),
+        "observation.language.tokens": ((1, 200), torch.int64),
+        "observation.language.attention_mask": ((1, 200), torch.bool),
+    }
+    for name, (shape, dtype) in expected.items():
+        value = batch[name]
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"{entry_point}: {name} must be a torch.Tensor")
+        if value.device.type != "cpu":
+            raise ValueError(f"{entry_point}: {name} must remain on CPU for admission")
+        if tuple(value.shape) != shape or value.dtype != dtype:
+            raise ValueError(
+                f"{entry_point}: {name} must be {shape}/{dtype}, got "
+                f"{tuple(value.shape)}/{value.dtype}"
+            )
+        if value.is_floating_point() and not bool(torch.isfinite(value).all()):
+            raise ValueError(f"{entry_point}: {name} must contain only finite values")
+
+    for name in camera_keys:
+        image = batch[name]
+        if bool((image < 0).any()) or bool((image > 1).any()):
+            raise ValueError(f"{entry_point}: {name} must stay in the [0, 1] range")
+    state = batch["observation.state"]
+    if bool((state < -1).any()) or bool((state > 1).any()):
+        raise ValueError(
+            f"{entry_point}: normalized observation.state must stay in [-1, 1]"
+        )
+    tokens = batch["observation.language.tokens"]
+    if bool((tokens < 0).any()) or bool((tokens >= _PI05_BASE_VOCAB_SIZE).any()):
+        raise ValueError(
+            f"{entry_point}: language tokens must be in [0, "
+            f"{_PI05_BASE_VOCAB_SIZE})"
+        )
+
+    mask = batch["observation.language.attention_mask"]
+    valid_tokens = int(mask.sum().item())
+    if valid_tokens < 1 or valid_tokens > _PI05_BASE_MAX_ATTENTION_TOKENS:
+        raise ValueError(
+            f"{entry_point}: {profile} supports 1.."
+            f"{_PI05_BASE_MAX_ATTENTION_TOKENS} attention tokens, got "
+            f"{valid_tokens}; rejecting before model/Graph mutation."
+        )
+    expected_mask = torch.arange(mask.shape[1], device="cpu").unsqueeze(0) < valid_tokens
+    if not torch.equal(mask, expected_mask):
+        raise ValueError(
+            f"{entry_point}: attention_mask must be one contiguous prefix "
+            "followed by padding."
+        )
+    if num_steps is not None and num_steps != 10:
+        raise ValueError(
+            f"{entry_point}: {profile} requires num_steps=10, "
+            f"got {num_steps}."
+        )
+    return batch
+
+
+def _preflight_pi05_public_profile(
+    model_path: str | os.PathLike[str],
+    *,
+    profile: str | None,
+    admission_batch: dict | None,
+) -> dict[str, Any] | None:
+    """Bind exact public bytes, config, and request before weight loading."""
+    if profile is None:
+        if admission_batch is not None:
+            raise ValueError("Pi05Policy admission_batch requires an explicit profile")
+        return None
+    identity = _pi05_public_profile(profile)
+    if admission_batch is None:
+        raise ValueError(
+            f"Pi05Policy.from_pretrained: profile={profile!r} requires "
+            "admission_batch so the request envelope is checked before weights load."
+        )
+    _validate_pi05_public_request(
+        admission_batch,
+        profile=profile,
+        entry_point="Pi05Policy.from_pretrained",
+        num_steps=10,
+    )
+
+    root = Path(model_path)
+    for filename, expected_sha256 in identity["files"].items():
+        path = root / filename
+        if not path.is_file():
+            raise UnsupportedModelError(
+                f"Pi05Policy.from_pretrained: exact profile asset drift: {filename}"
+            )
+        if _sha256_file(path) != expected_sha256:
+            raise UnsupportedModelError(
+                f"Pi05Policy.from_pretrained: exact profile asset digest drift: {filename}"
+            )
+    source_names = sorted(
+        path.name for path in root.glob("model*.safetensors")
+        if path.name != "model_remapped.safetensors"
+    )
+    if source_names != ["model.safetensors"] or (root / "rpu_quant_config.json").exists():
+        raise UnsupportedModelError(
+            "Pi05Policy.from_pretrained: exact FP16 profile rejects additional "
+            "source safetensors or quantization metadata."
+        )
+    remapped = root / "model_remapped.safetensors"
+    if remapped.exists() and (
+        not remapped.is_file()
+        or _sha256_file(remapped) != identity["remapped_sha256"]
+    ):
+        raise UnsupportedModelError(
+            "Pi05Policy.from_pretrained: generated public remap digest drift."
+        )
+    return {
+        "profile": profile,
+        "repository": identity["repository"],
+        "revision": identity["revision"],
+        "manifest_sha256": identity["manifest_sha256"],
+        "maximum_attention_tokens": _PI05_BASE_MAX_ATTENTION_TOKENS,
+    }
 
 
 _PI05_W8A16_TARGETS = {
@@ -76,14 +315,52 @@ def _load_pi05_rpu_quant_config(model_path: str) -> dict:
                 "_load_and_fp16_cast: method=w4a16 requires storage=int8 "
                 "(int4 values stored in int8 on disk) and value_bits=4"
             )
+        group_size = int(cfg.get("group_size", 0))
+        group_wise = (
+            group_size != 0
+            or cfg.get("mode") == "group_wise_symmetric"
+            or cfg.get("scale") == "per_group_GxN"
+        )
+        if group_wise and not (
+            group_size in (32, 64, 128)
+            and cfg.get("mode") == "group_wise_symmetric"
+            and cfg.get("scale") == "per_group_GxN"
+        ):
+            raise RPUBackendError(
+                "_load_and_fp16_cast: group-wise method=w4a16 requires "
+                "group_size in {32,64,128}, mode=group_wise_symmetric, "
+                "and scale=per_group_GxN"
+            )
+        mixed_int8 = {
+            (suffix[: -len(".weight")] if suffix.endswith(".weight") else suffix)
+            .rsplit(".", 1)[-1]
+            for suffix in cfg.get("mixed_int8_suffixes", ())
+            if isinstance(suffix, str)
+        }
+        if group_wise and not {"k_proj", "v_proj"}.issubset(mixed_int8):
+            raise RPUBackendError(
+                "_load_and_fp16_cast: group-wise method=w4a16 requires "
+                "mixed_int8_suffixes to include k_proj and v_proj"
+            )
         _LOG.info(
-            "Pi0.5 real-W4 checkpoint detected: method=w4a16, storage=int8, "
-            "value_bits=4, kernel=wINT4a16 (runtime packs to uint8 [N,K/2])"
+            "Pi0.5 mixed W4A16-KV8 checkpoint detected: method=w4a16, "
+            "storage=int8, value_bits=4, kernel=wINT4a16_pgrp, group_size=%s; "
+            "activations and KV cache remain FP16",
+            group_size or "legacy-per-channel",
         )
     return cfg
 
 
-def _pop_pi05_w8a16_tensors(policy, state_dict: dict[str, torch.Tensor]):
+def _pop_pi05_w8a16_tensors(
+    policy, state_dict: dict[str, torch.Tensor], quant_config: dict | None = None
+):
+    quant_config = quant_config or {}
+    group_size = int(quant_config.get("group_size", 0))
+    mixed_int8 = {
+        (suffix[: -len(".weight")] if suffix.endswith(".weight") else suffix)
+        .rsplit(".", 1)[-1]
+        for suffix in quant_config.get("mixed_int8_suffixes", ())
+    }
     modules = dict(policy.named_modules())
     consumed = {}
     scale_names = [name for name in state_dict if name.endswith(".weight_scale")]
@@ -129,15 +406,35 @@ def _pop_pi05_w8a16_tensors(policy, state_dict: dict[str, torch.Tensor]):
                 )
             weight = state_dict.pop(weight_name)
             scale = state_dict.pop(scale_name)
-            if scale.dtype != torch.float16 or scale.dim() != 1:
-                raise RPUBackendError(
-                    f"_load_and_fp16_cast: {scale_name} must be 1D fp16, got "
-                    f"dtype={scale.dtype}, shape={tuple(scale.shape)}"
+            group_w4 = (
+                quant_config.get("method") == "w4a16"
+                and group_size > 0
+                and weight_name[: -len(".weight")].rsplit(".", 1)[-1]
+                not in mixed_int8
+            )
+            if group_w4:
+                if weight.size(1) % group_size:
+                    raise RPUBackendError(
+                        f"_load_and_fp16_cast: {weight_name}.shape[1]={weight.size(1)} "
+                        f"is not divisible by group_size={group_size}"
+                    )
+                expected_scale_shape = (weight.size(1) // group_size, weight.size(0))
+                scale_ok = (
+                    scale.dtype == torch.float16
+                    and tuple(scale.shape) == expected_scale_shape
                 )
-            if scale.numel() != weight.size(0):
+                scale_desc = f"2D fp16 [K/group_size,N]={expected_scale_shape}"
+            else:
+                scale_ok = (
+                    scale.dtype == torch.float16
+                    and scale.dim() == 1
+                    and scale.numel() == weight.size(0)
+                )
+                scale_desc = f"1D fp16 [N]=[{weight.size(0)}]"
+            if not scale_ok:
                 raise RPUBackendError(
-                    f"_load_and_fp16_cast: {scale_name}.numel()={scale.numel()} "
-                    f"!= {weight_name}.shape[0]={weight.size(0)}"
+                    f"_load_and_fp16_cast: {scale_name} must be {scale_desc}, got "
+                    f"dtype={scale.dtype}, shape={tuple(scale.shape)}"
                 )
             module_name = weight_name[: -len(".weight")]
             consumed[module_name] = (weight.contiguous(), scale.contiguous())
@@ -176,31 +473,36 @@ def _cache_is_stale(source_paths: list, cache_path: str) -> bool:
     """True if the cached `cache_path` is stale vs any of `source_paths`.
 
     The check:
-      - Uses `os.stat(path).st_mtime_ns` for nanosecond precision.
+      - Uses `os.stat(path).st_mtime_ns` and `st_ctime_ns` for nanosecond
+        precision.
       - Caller must EXCLUDE the cache file itself from source_paths (avoid
         self-matching).
 
     An obsolete size-based heuristic (doubled-size check) was removed because
     it only fired on extreme growth, missing normal-range size changes (e.g.
     a single added parameter in a shard, a weight-renaming that shrinks the
-    file, etc.), and conversely a "same mtime, changed content" case with a
-    smaller source would go undetected. Removed entirely. mtime_ns is
-    authoritative — any remap must bump mtime on the source. Self-exclusion
-    of the cache file itself prevents the cache from matching itself as a
-    source.
+    file, etc.). A source replacement that preserves or rolls back mtime still
+    changes ctime, so either timestamp being newer invalidates the cache.
+    Self-exclusion of the cache file itself prevents the cache from matching
+    itself as a source.
 
     """
     if not os.path.exists(cache_path):
         return True
     cache_stat = os.stat(cache_path)
     cache_mtime_ns = cache_stat.st_mtime_ns
+    cache_ctime_ns = cache_stat.st_ctime_ns
     for src in source_paths:
         if not os.path.exists(src):
             continue
-        # ``mtime_ns`` is the authoritative freshness signal.
+        source_stat = os.stat(src)
+        # ``ctime_ns`` catches content replacement with a preserved mtime.
         # Callers exclude `model_remapped.safetensors` itself from source_paths
         # (enforced at call-site in _load_and_fp16_cast).
-        if os.stat(src).st_mtime_ns > cache_mtime_ns:
+        if (
+            source_stat.st_mtime_ns > cache_mtime_ns
+            or source_stat.st_ctime_ns > cache_ctime_ns
+        ):
             return True
     return False
 
@@ -208,11 +510,17 @@ def _cache_is_stale(source_paths: list, cache_path: str) -> bool:
 # =============================================================================
 # Load, cast, and validate a Pi0.5 policy.
 # =============================================================================
-def _load_and_fp16_cast(model_path: str, dtype: "torch.dtype", **lerobot_kwargs: Any) -> Any:
+def _load_and_fp16_cast(
+    model_path: str,
+    dtype: "torch.dtype",
+    *,
+    expected_remap_sha256: str | None = None,
+    **lerobot_kwargs: Any,
+) -> Any:
     """Load a LeRobot PI05Policy and cast it to FP16.
 
     ``_LOAD_LOCK`` protects the constructor patch. Cache freshness uses
-    nanosecond timestamps, size, and self-exclusion. Integrity checks reject
+    nanosecond timestamps and self-exclusion. Integrity checks reject
     empty sources, meta tensors, and missing or unexpected critical keys.
     """
     if dtype is not torch.float16:
@@ -260,6 +568,13 @@ def _load_and_fp16_cast(model_path: str, dtype: "torch.dtype", **lerobot_kwargs:
         # Weight remapping is owned by the weights module.
         from rpu_backend.adapters.pi05.weights import _remap_and_save
         _remap_and_save(model_path, remapped_path)
+    if (
+        expected_remap_sha256 is not None
+        and _sha256_file(Path(remapped_path)) != expected_remap_sha256
+    ):
+        raise UnsupportedModelError(
+            "_load_and_fp16_cast: generated public remap digest drift."
+        )
 
     # The PI05Policy.__init__ monkey-patch is process-global, so guard it
     # with `_LOAD_LOCK`.
@@ -282,7 +597,7 @@ def _load_and_fp16_cast(model_path: str, dtype: "torch.dtype", **lerobot_kwargs:
 
     # Load weights via safetensors.
     state_dict = load_file(remapped_path)
-    w8a16_consumed = _pop_pi05_w8a16_tensors(policy, state_dict)
+    w8a16_consumed = _pop_pi05_w8a16_tensors(policy, state_dict, quant_config)
     _consumed_method = quant_config.get("method")
     if _consumed_method in ("w4a16_fake_int8", "w4a16") and not w8a16_consumed:
         raise RPUBackendError(
@@ -429,6 +744,8 @@ def load_and_construct_pi05_policy(
     dtype: torch.dtype = torch.float16,
     trust_remote_code: bool = False,
     rpu_execution=None,
+    profile: str | None = None,
+    admission_batch: dict | None = None,
     **lerobot_kwargs: Any,
 ) -> "Any":
     """Load and construct the policy used by ``Pi05Policy.from_pretrained``.
@@ -453,12 +770,30 @@ def load_and_construct_pi05_policy(
             "Pi05Policy.from_pretrained requires trust_remote_code=False; "
             "custom model code is not supported."
         )
+    admitted_profile = _preflight_pi05_public_profile(
+        pretrained_name_or_path,
+        profile=profile,
+        admission_batch=admission_batch,
+    )
     lerobot_kwargs["trust_remote_code"] = trust_remote_code
-    lerobot_policy = _load_and_fp16_cast(pretrained_name_or_path, dtype, **lerobot_kwargs)
+    lerobot_policy = _load_and_fp16_cast(
+        pretrained_name_or_path,
+        dtype,
+        expected_remap_sha256=(
+            _pi05_public_profile(admitted_profile["profile"])["remapped_sha256"]
+            if admitted_profile is not None else None
+        ),
+        **lerobot_kwargs,
+    )
     # Late import keeps the loader and policy modules circular-free.
     from rpu_backend.api.policy import Pi05Policy
     if rpu_execution is None:
-        return Pi05Policy.from_lerobot_policy(lerobot_policy)
-    return Pi05Policy.from_lerobot_policy(
-        lerobot_policy, rpu_execution=rpu_execution
-    )
+        policy = Pi05Policy.from_lerobot_policy(lerobot_policy)
+    else:
+        policy = Pi05Policy.from_lerobot_policy(
+            lerobot_policy, rpu_execution=rpu_execution
+        )
+    if admitted_profile is not None:
+        policy._rpu_public_profile = admitted_profile["profile"]
+        policy._rpu_public_profile_identity = dict(admitted_profile)
+    return policy

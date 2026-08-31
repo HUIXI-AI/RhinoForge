@@ -18,6 +18,7 @@
 #include <ATen/core/stack.h>
 #include <c10/core/Storage.h>
 
+#include <array>
 #include <memory>
 #include <optional>
 #include <string>
@@ -459,7 +460,6 @@ enum class GraphNodeKind : uint8_t {
     Kernel = 0, Memcpy = 1, Memset = 2,
     // Value 3 belonged to the deleted graph-aware Flush shim. Keep the hole so
     // checked-in register-census hashes remain comparable with their captured
-    // hardware traces; no node or execution path may use it.
     ChildGraph = 4, Branch = 5, HostCallback = 6,
     // RNG / data-dependent shape op 的节点级 oneshot:每轮 replay 在该节点真跑
     // host op,周围可 replay 的节点仍保留 graph 收益。
@@ -1013,19 +1013,9 @@ struct Segment {
     QueueLaunchState queue_state;           // 本 segment 的 queue 状态
     size_t replay_count = 0;                // 当前 BUILT 期内 replay 次数
     uint64_t signature_layer_hash = 0;       // segment-level layered lookup hash
-    // Queue_t 不再由每个 segment 持有。改用 QueueCache::instance()
-    // .get(core_num) 在 RECORDING/REPLAYING segment loop 内复用 (按 core 数
-    // 全局缓存,最多 8 个 Queue_t)。每段调用前 build_batch() 会 reset 之前
-    // 的 kd_buf。原因:per-segment unique_ptr 在 segments=112 时挂 112 个
-    // Queue_t,直接打爆 SDK BufferPool (pool_size=16)。
-    //
-    // Queue_t 由每个 cache entry 持有 (RpuKernelGraph::private_queue_),
-    // segment 仍不持 Queue_t,但本段 BUILD 时通过 prepare_segment_queue 填
-    // mutable_dmas 槽位（单 build-order vector，Kind 字段区分 src/dst）。
-    // REPLAY 时若 RpuKernelGraph::private_queue_built_segment_idx_ ==
-    // 本段 idx,可走 sync-only fast path (update_dma_kernel + sync_mutable_params
-    // + enqueu_batch),否则 fallback full rebuild。多段 graph 因为 kd_buf
-    // 只能容纳一个段,fallback 路径会循环触发。
+    // Queue_t 由 RpuKernelGraph 有界持有，segment 本身不拥有 Queue_t。
+    // RECORDING 只用一个 queue；热 multi-segment graph 在首次 REPLAY
+    // 内按进程级预算懒保留每段的 prepared kd_buf。
 
     // mutable DMA 槽位在 REPLAY 时按 dma_id 顺序 update_dma_kernel。
     // dma_id 由 add_dma_kernel_mutable 在本段 prepare 调用顺序累加 (0,1,2,...);
@@ -1037,11 +1027,16 @@ struct Segment {
         Kind     kind;
         const uint64_t* live_base;          // caller-owned uint64_t 指针 (跨 forward 稳定)
         int64_t  live_offset;               // *live_base + live_offset = 本轮 live address
-        RpuDmaEndpoint fixed_endpoint;       // MutableSrc → dst; MutableDst → src
         size_t   bytes;
         uint8_t  channel;
     };
     std::vector<PreparedMutableDmaSlot> mutable_dmas;
+    struct PreparedFixedDmaSlot {
+        size_t node_idx;
+        uint64_t src_addr;
+        uint64_t dst_addr;
+    };
+    std::vector<PreparedFixedDmaSlot> fixed_dmas;
 };
 
 // =============================================================================
@@ -1069,19 +1064,9 @@ struct GraphStats {
     size_t tier3_oneshot_count = 0;
 
     // launch_segment_for_replay 累计计数器。**不在 execute_graph_for_replaying
-    // / replay_stats_refresh 里 reset**,跨整个 graph 生命周期累积,反映 Queue_t
-    // 复用效率 (QueueCache::get 命中率)。
-    //
-    // Queue_t 按 core_num 全局缓存时的计数语义:
-    //   prepared_segment_hit_total : QueueCache.get(core_num) 命中已缓存 Queue_t
-    //                                的次数 (segments_launched_via_cached_queue)
-    //   prepared_segment_miss_total: QueueCache.get(core_num) 触发 new Queue_t
-    //                                的次数 (= 实际 BufferPool::AcquireBuffer 次数)
-    //                                进程生命周期内最多 8 (每个 core_num 一次)
-    //
-    // 稳定 replay 期预期: miss_total 维持在 [1..8] (取决于 graph 涉及多少
-    // 不同的 core_num),hit_total ≈ segment_count × replay_count。
-    // miss_total > 8 (单进程) 说明 QueueCache 被 clear 过(异常)。
+    // / replay_stats_refresh 里 reset**,跨整个 graph 生命周期累积：
+    //   prepared_segment_hit_total : segment 命中已保留的 prepared kd_buf；
+    //   prepared_segment_miss_total: segment 需要重新 prepare + build_batch。
     //
     // RECORDING 期的 launch 不计入;这两个计数只反映 REPLAYING 路径。
     size_t prepared_segment_hit_total = 0;
@@ -1136,7 +1121,7 @@ public:
     };
 
     RpuKernelGraph();
-    ~RpuKernelGraph();
+    ~RpuKernelGraph() noexcept;
     RpuKernelGraph(const RpuKernelGraph&) = delete;
     RpuKernelGraph& operator=(const RpuKernelGraph&) = delete;
 
@@ -1484,10 +1469,6 @@ public:
     // intentionally excluded just like GraphSignature::operator==.
     uint64_t built_signature_identity() const;
 
-    // Compatibility no-op: Queue_t instances are owned by the process-wide
-    // QueueCache rather than by individual segments.
-    void release_prepared_queues();
-
     // Replace a contiguous BUILT parent window with one ChildGraph node. Replay
     // still runs the original op-stream; when cursor reaches this node, the raw
     // child window is consumed against the child graph and the parent executor
@@ -1800,38 +1781,39 @@ private:
     // 对一个 segment 设置 Queue_t 状态并 prepare 其 kernel 列表。
     // 同时填 seg.mutable_dmas (每个 add_dma_kernel_mutable 累计 dma_id
     // + push 槽位),让后续 REPLAY 能走 sync-only 快路径。
-    void prepare_segment_queue(Segment& seg, ::rhino_lkn::Queue_t& wq);
+    uint32_t prepare_segment_queue(Segment& seg, ::rhino_lkn::Queue_t& wq);
 
-    // replay 路径发射单段:从本 entry 的 private_queue_ (经 ensure_private_queue
-    // 取);若 private_queue_built_segment_idx_ 与本段 idx 命中则走 sync-only
-    // (launch_segment_sync_only),否则 full rebuild (prepare_segment_queue +
-    // build_batch + enqueu_batch)。
+    // Drop every entry-owned prepared Queue_t and its segment fingerprint.
+    void release_prepared_queues() noexcept;
+
+    // replay 路径发射单段；若映射 slot 的 fingerprint 命中则走 sync-only，
+    // 否则 full rebuild。
     void launch_segment_for_replay(Segment& seg);
 
     // sync-only fast path:walk seg.mutable_dmas + update_dma_kernel +
-    // sync_mutable_params + enqueu_batch。前提:private_queue_'s kd_buf 仍持本段
-    // build_batch 结果 (由 launch_segment_for_replay 的 segment-idx fingerprint
-    // 判定后才调用本函数)。返回 SDK rc (0 = 成功;非 0 → caller TORCH_CHECK)。
-    uint32_t launch_segment_sync_only(Segment& seg);
+    // sync_mutable_params + enqueu_batch。前提:wq 的 kd_buf 仍持本段
+    // build_batch 结果。返回 SDK rc (0 = 成功;非 0 → caller TORCH_CHECK)。
+    uint32_t launch_segment_sync_only(Segment& seg,
+                                      ::rhino_lkn::Queue_t& wq);
 
-    // 取本 cache entry 私有的 Queue_t,按 num_cores 懒分配。
+    // 取本 cache entry 对应 segment slot 的 Queue_t,按 num_cores 懒分配。
     // 与 QueueCache::instance() 共享池**完全隔离**:immediate DMA 与
     // execute_graph_oneshot 走 QueueCache，PASSTHROUGH kernel 走另一条隔离
     // direct-launch queue；本 entry 的 cacheable execute 路径
     // (execute_graph_for_recording + launch_segment_for_replay) 走这个私有
     // Queue，从而避免任一旁路作废其 prepared batch。
     //
-    // 行为说明:
-    //   - 首次调用按 segment 最大 core 域构造；若后续 segment 的最大域不同，
-    //     销毁旧 queue + 重建。**同一 segment 内**混用 1/8-core kernel 不会触发
-    //     重建：每个 kernel 的 core_ids 已独立烤入 batch。跨段重建只损失
-    //     prepared-kd_buf 复用收益，不影响正确性。
+    // RECORDING 全部 segment 映射 slot 0。REPLAY 的 segment>0 在
+    // 进程级 extra-queue 预算内映射独立 slot；预算耗尽或超过本地
+    // slot 上限时回落 slot 0，只损失性能，不改变执行正确性。
     //   - 不在 PASSTHROUGH (raw kernel 走隔离 direct-launch queue) 与
     //     execute_graph_oneshot (non-replayable 一次性降级，走 QueueCache)
     //     中使用；两条路径都不会被 REPLAY。
     //   - 生命周期:unique_ptr,随 RpuKernelGraph 实例析构(RpuGraphCache::evict
-    //     / clear) 自动释放底层 Queue_t,无需显式 hook。
-    ::rhino_lkn::Queue_t* ensure_private_queue(size_t num_cores);
+    //     / clear) 自动释放底层 Queue_t 和进程级预算。
+    ::rhino_lkn::Queue_t* ensure_private_queue(size_t queue_slot_idx,
+                                                size_t num_cores);
+    size_t prepared_queue_slot_index(size_t segment_idx, bool retain);
 
     // non-replayable 降级路径：一次性按 segment 分组提交 kernel + 段间交错执行
     // data nodes，执行完丢弃 segments_。
@@ -2284,24 +2266,20 @@ private:
     // execute_graph_* + flush_boundary_ptrs 写入的统计快照
     GraphStats last_stats_;
 
-    // 本 cache entry 私有的 Queue_t (lazy-init via ensure_private_queue)。
-    // 详细语义见 ensure_private_queue 注释。RAII 析构自动归还 BufferPool;
-    // 不在 begin/end/invalidate 中显式 reset(REPLAY 期保留同一 Queue 才能
-    // 在 sync-only fast path 中享受 kd_buf reuse 的收益)。
-    std::unique_ptr<::rhino_lkn::Queue_t> private_queue_;
-    uint8_t private_queue_core_num_ = 0;
-
-    // Segment fingerprint：private_queue_ 的 kd_buf 当前对应 segments_
-    // 的哪个 idx (-1 = 空 / 未 build / 已失效)。launch_segment_for_replay
-    // 用此判断能否走 sync-only fast path (idx 匹配 + core_num 匹配 →
-    // update_dma_kernel + sync_mutable_params + enqueu_batch;否则 full
-    // rebuild prepare_segment_queue + 重设 idx)。Reset 时机:
-    //   - ensure_private_queue 重建 Queue_t 时 (core_num mismatch)
-    //   - invalidate / abort (segments_ 被清,所有 idx 失效)
-    //   - prepare_segment_queue 写新 seg 前 (前段 kd_buf 即将被覆写)
-    // 必须使用 segment fingerprint，而不能只检查 batch_built_；本字段是该
-    // fingerprint 的唯一来源。
-    ssize_t private_queue_built_segment_idx_ = -1;
+    // One fallback slot plus at most eight retained segment slots. The extra
+    // slots are also capped process-wide, so many cold/cache entries cannot
+    // multiply this incremental queue cost without bound.
+    static constexpr size_t kMaxPreparedQueueSlots = 9;
+    struct PreparedQueueSlot {
+        std::unique_ptr<::rhino_lkn::Queue_t> queue;
+        uint8_t core_num = 0;
+        ssize_t built_segment_idx = -1;
+        std::vector<Segment::PreparedFixedDmaSlot> fixed_dmas;
+        bool consumes_extra_budget = false;
+        bool promotion_denied = false;
+    };
+    std::array<PreparedQueueSlot, kMaxPreparedQueueSlots>
+        private_queue_slots_{};
 
     // Per-graph cumulative REPLAY count, incremented at
     // entry of execute_graph_for_replaying. INFO logs the first-replay-per-

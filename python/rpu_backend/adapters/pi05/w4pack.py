@@ -1,16 +1,22 @@
 """Pi05 packed-INT4 weight preparation.
 
-For a real-W4 checkpoint (method=w4a16), the int4 projections are stored on disk
-as int8 [N,K] (values in [-8,7]). At .to('rpu') time we nibble-pack them to uint8
-[N,K/2] and expand their per-channel scale into the controller-striped pgrp ABI.
-KV projections (in mixed_int8_suffixes) stay int8 (w8a16).
+For a mixed W4A16-G32-KV8 checkpoint (legacy method=w4a16), only the declared
+Gemma Linear projection weights are quantized. By default q/o/gate/up/down are
+stored on disk as int8 [N,K] containers (values in [-8,7]) with logical group
+scales [G,N]. At .to('rpu') time we nibble-pack them to uint8 [N,K/2] and stripe
+those scales for the pgrp ABI. K/V projection weights stay W8A16; activations
+and the KV cache stay FP16. Legacy per-channel scales remain loadable.
 """
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 
-from rpu_backend.quant.int4_pgrp_pack import pack_int4_per_channel_as_pgrp
+from rpu_backend.quant.int4_pgrp_pack import (
+    pack_int4_per_channel_as_pgrp,
+    swizzle_int4_pgrp_scale,
+    swizzle_pack_int4_pgrp,
+)
 from rpu_backend.runtime.weights import ROW_PARTITION_NAMES
 
 # All Pi05/Gemma projection child names.
@@ -93,10 +99,26 @@ def pack_int4_projections_inplace(decoder, int4_children: set[str], *, attn_num_
                     raise RuntimeError(
                         f"pack_int4: {parent_name}.{proj_name} has no weight_scale"
                     )
-                packed, packed_scale = pack_int4_per_channel_as_pgrp(
-                    w.detach().cpu(), scale.detach().cpu().to(torch.float16),
-                    partition, num_cores,
-                )
+                cpu_scale = scale.detach().cpu().to(torch.float16)
+                if cpu_scale.dim() == 2:
+                    groups, channels = cpu_scale.shape
+                    if channels != N or groups == 0 or K % groups:
+                        raise RuntimeError(
+                            f"pack_int4: {parent_name}.{proj_name} logical pgrp scale "
+                            f"must be [G,N] with G dividing K={K}, N={N}; got "
+                            f"{tuple(cpu_scale.shape)}"
+                        )
+                    group_size = K // groups
+                    packed = swizzle_pack_int4_pgrp(
+                        w.detach().cpu(), partition, num_cores
+                    )
+                    packed_scale = swizzle_int4_pgrp_scale(
+                        cpu_scale.contiguous(), group_size, partition, num_cores
+                    )
+                else:
+                    packed, packed_scale = pack_int4_per_channel_as_pgrp(
+                        w.detach().cpu(), cpu_scale, partition, num_cores,
+                    )
                 packed = packed.reshape(N, K // 2).contiguous().to(w.device)
                 module.weight = nn.Parameter(packed, requires_grad=False)
                 if "weight_scale" in module._buffers:

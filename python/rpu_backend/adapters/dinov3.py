@@ -70,7 +70,7 @@ _LOG = logging.getLogger(__name__)
 # Section 1 — Loader: HF config validation
 # =============================================================================
 #
-# Supported variants. Profile tuple is:
+# Adapter-admitted variants. Profile tuple is:
 #   (hidden_size, num_attention_heads, num_hidden_layers, patch_size,
 #    image_size, num_register_tokens)
 # ViT-7B/16 (4096/32/40 + head_dim 128) is outside the supported envelope.
@@ -100,6 +100,28 @@ def _profile(config: Any) -> tuple[int, int, int, int, int, int]:
     )
 
 
+def _dinov3_layers(model: nn.Module) -> nn.ModuleList:
+    """Return the encoder layers for supported DINOv3 HF layouts.
+
+    Transformers releases have exposed the direct ``DINOv3ViTModel`` layers
+    as either ``model.layer`` or ``model.model.layer`` (the latter is used by
+    wrapper classes).  Do not use an eager ``getattr(..., default)`` here:
+    evaluating the default would touch ``model.layer`` even when a wrapper is
+    present, and a self-referential compatibility alias must not recurse.
+    """
+    wrapped = getattr(model, "model", None)
+    if wrapped is not None and wrapped is not model:
+        layers = getattr(wrapped, "layer", None)
+        if layers is not None:
+            return layers
+    layers = getattr(model, "layer", None)
+    if layers is None:
+        raise RPUBackendError(
+            "DINOv3Adapter: expected encoder layers at `layer` or `model.layer`"
+        )
+    return layers
+
+
 def _check_profile(config: Any) -> None:
     """Raise UnsupportedModelError if the HF config isn't in
     `_SUPPORTED_PROFILES`. Reads only config — never touches weights.
@@ -124,8 +146,10 @@ def _check_profile(config: Any) -> None:
     if blocked_reason is not None:
         raise UnsupportedModelError(
             f"DINOv3Adapter: profile {profile} is unsupported/numerical-blocked: "
-            f"{blocked_reason}. Only DINOv3 ViT-B is currently supported; "
-            "a model-registry path does not imply runtime support."
+            f"{blocked_reason}. Only DINOv3 ViT-B is currently admitted by "
+            "this source-only adapter; no release support is transferred by "
+            "source admission alone. "
+            "A model-registry path does not imply runtime support."
         )
     if profile not in _SUPPORTED_PROFILES:
         raise UnsupportedModelError(
@@ -205,7 +229,7 @@ def _pad_attn_heads_to_multiple_of_cores(model: nn.Module) -> None:
     pad_rows = (target - num_heads) * head_dim
 
     with torch.no_grad():
-        for layer in model.model.layer:
+        for layer in _dinov3_layers(model):
             attn = layer.attention
             for name in ("q_proj", "k_proj", "v_proj"):
                 lin = getattr(attn, name)
@@ -291,7 +315,8 @@ def _install_dinov3_rpu_keepalives(model: nn.Module) -> None:
     cfg = model.config
     hidden = int(cfg.hidden_size)
     num_reg = int(cfg.num_register_tokens)
-    num_layers = len(model.model.layer)
+    layers = _dinov3_layers(model)
+    num_layers = len(layers)
 
     with torch.no_grad():
         cls = model.embeddings.cls_token.data.view(1, hidden)
@@ -308,7 +333,7 @@ def _install_dinov3_rpu_keepalives(model: nn.Module) -> None:
         gamma_mlp = torch.empty(
             (num_layers, hidden), dtype=torch.float16, device="rpu"
         )
-        for layer_idx, layer in enumerate(model.model.layer):
+        for layer_idx, layer in enumerate(layers):
             gamma_attn[layer_idx].copy_(
                 layer.layer_scale1.lambda1.data.to(torch.float16)
             )
@@ -517,7 +542,8 @@ def _install_dinov3_vision_for_rpu_impl(
     intermediate = int(cfg.intermediate_size)
     head_dim = hidden // int(cfg.num_attention_heads)
     num_heads_padded = _padded_num_heads(int(cfg.num_attention_heads))
-    num_layers = len(vision_model.model.layer)
+    layers = _dinov3_layers(vision_model)
+    num_layers = len(layers)
     num_register = int(cfg.num_register_tokens)
     num_special_tokens = 1 + num_register
     eps = float(cfg.layer_norm_eps)
@@ -534,7 +560,7 @@ def _install_dinov3_vision_for_rpu_impl(
     # Gather per-layer tensors. Weights are post-swizzle nn.Parameters; we
     # pass `.weight` directly so the C++ side holds the same storage without a
     # copy; the Python model object owns its lifetime.
-    layers = list(vision_model.model.layer)
+    layers = list(_dinov3_layers(vision_model))
     q_w  = [L.attention.q_proj.weight for L in layers]
     k_w  = [L.attention.k_proj.weight for L in layers]
     v_w  = [L.attention.v_proj.weight for L in layers]

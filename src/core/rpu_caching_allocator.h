@@ -51,12 +51,6 @@ constexpr size_t kSmallSize = 1048576;
 // Small allocations are packed into 2 MB buffers
 constexpr size_t kSmallBuffer = 2097152;
 
-// Large allocations between 1-10 MB may use 20 MB buffers
-constexpr size_t kLargeBuffer = 20971520;
-
-// Threshold for large buffer usage
-constexpr size_t kMinLargeAlloc = 10485760;
-
 // Round large allocations to 2 MB
 constexpr size_t kRoundLarge = 2097152;
 
@@ -290,6 +284,10 @@ public:
 
     // Get total cached memory (reserved but not in use)
     size_t getTotalCachedMemory() const;
+
+    // Count fully idle cached system mappings. Split segments with live
+    // allocations are intentionally excluded.
+    int64_t getCachedSegmentCount() const;
 
     // Get singleton instance
     static RPUCachingAllocator& get();

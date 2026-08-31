@@ -23,9 +23,30 @@ def load_config(path: Path) -> dict:
         raise ValueError("[model].source must be OpenGalaxea/G05")
     if model.get("revision") != "e312be81e90c56a55bcb26b57429bd39a335b449":
         raise ValueError("[model].revision must match the v1.0.0 public ledger")
+    if model.get("subfolder") != "g05-base":
+        raise ValueError("[model].subfolder must be g05-base")
+    if model.get("implementation") != "OpenGalaxea/GalaxeaVLA":
+        raise ValueError("[model].implementation must be OpenGalaxea/GalaxeaVLA")
+    if (
+        model.get("implementation_revision")
+        != "89f2322b4ad016e192437adc1a2c253b05bab246"
+    ):
+        raise ValueError("[model].implementation_revision must match the public ledger")
+    if (
+        model.get("config_sha256")
+        != "c98af37352c0f600341d2ecbdb49fcdfa87812198654448991615065fa1a4461"
+    ):
+        raise ValueError("[model].config_sha256 must match the resolved Hydra config")
+    if model.get("license") != "G0.5 Community License (non-commercial)":
+        raise ValueError("[model].license must retain the non-commercial terms")
     max_seq_len = model.get("max_seq_len", 2048)
-    if isinstance(max_seq_len, bool) or not isinstance(max_seq_len, int) or max_seq_len < 32:
-        raise ValueError("[model].max_seq_len must be an integer >= 32")
+    if max_seq_len != 2048:
+        raise ValueError("[model].max_seq_len must be exactly 2048")
+    if any(
+        model.get(name) is not True
+        for name in ("continuous_action", "discrete_action", "predict_cot")
+    ):
+        raise ValueError("[model] must keep continuous, discrete, and CoT enabled")
     env = config.get("runner", {}).get("env", {})
     if not isinstance(env, dict) or set(env) - {"RPU_LOG_LEVEL"}:
         raise ValueError("G0.5 [runner.env] supports only RPU_LOG_LEVEL")
@@ -52,7 +73,8 @@ def main() -> int:
         "at revision 89f2322b4ad016e192437adc1a2c253b05bab246, "
         "call rpu_backend.adapters.g05.patch_g05_policy_for_rpu(policy, "
         f"max_seq_len={model.get('max_seq_len', 2048)}), then invoke the "
-        "official continuous-action request path. This v1.0.0 integration is "
+        "official simultaneous continuous/discrete/CoT request path. This "
+        "non-commercial v1.0.0 integration is "
         "source-only until the public checkpoint profile passes the release gates."
     )
 

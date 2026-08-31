@@ -10,7 +10,7 @@ Two shape choices are driven by the Wall-OSS adapter's real interface:
   checkpoint dir, so the entry point is ``from_checkpoint(...)`` (not
   ``from_prepare_artifact``). ``.to('rpu')`` triggers that eager build — there is
   no separate device move to make afterward.
-- ``WallOssVLA.predict`` returns the *de-normalized* (physical-unit) action chunk
+- The internal runtime returns the *de-normalized* (physical-unit) action chunk
   (the per-dataset normalizer runs inside the adapter). So ``WallOssActionOutput``
   carries ``actions`` (physical), not ``actions_norm``. Downstream should not
   re-denormalize.
@@ -38,19 +38,25 @@ from rpu_backend.api._runtime_env import (
 )
 
 
-_SUPPORTED_CAMERA_NAMES = frozenset(
-    {
-        "face_view",
-        "left_wrist_view",
-        "right_wrist_view",
-        "move1_view",
-        "move2_view",
-        "wall_view",
-        "top_view",
-        "side_view",
-        "global_view",
-    }
-)
+_PUBLIC_CAMERA_ROSTER = ("face_view", "right_wrist_view")
+_MAX_PUBLIC_VISION_CHUNK = 768
+_PUBLIC_VISION_GRID = (1, 32, 32)
+_PUBLIC_VISION_IMAGE_COUNT = 2
+_PUBLIC_STATE_BINS = 512
+_PUBLIC_DATASET_KEY = "berkeley_autolab_ur5"
+_PUBLIC_ACTION_HZ = 32.0
+_PUBLIC_ACTION_HORIZON = 32
+_PUBLIC_NUM_STEPS = 10
+_PUBLIC_MAX_SEQ_LEN = 2048
+_PUBLIC_FIXED_RUNTIME_ENV = {
+    "RPU_LINEAR_ACC32": "0",
+    "RPU_RMSNORM_NEWTON": "0",
+    "RPU_WALL_OSS_ACTION_FP32_TAIL": "0",
+    "RPU_WALL_OSS_GENERIC_PROLOGUE": "0",
+    "RPU_WALL_OSS_MULTISUITE_PROLOGUE": "0",
+    "RPU_WALL_OSS_PROLOGUE_FILLER": "",
+    "RPU_WALL_OSS_SHORT_PROMPT": "0",
+}
 _RUNTIME_ENV_ALLOWLIST = frozenset({
     "RPU_DEEP_FAST_REPLAY",
     "RPU_FASTREPLAY_SKIP_SYNC",
@@ -82,7 +88,6 @@ _RUNTIME_ENV_ALLOWLIST = frozenset({
     "RPU_WALL_OSS_VISION_FUSED_MERGER",
     "RPU_WALL_OSS_VISION_LAYER_GROUP",
     "RPU_WALL_OSS_VISION_ROPE_SPM",
-    "WALL_OSS_PROFILE_PREFIX",
 })
 
 
@@ -137,13 +142,20 @@ def _camera_roster(camera_names: Sequence[str]) -> list[str]:
         raise ValueError(
             "WallOssPolicy camera_names must be a non-empty sequence of names"
         )
-    unknown = sorted(set(result) - _SUPPORTED_CAMERA_NAMES)
-    if unknown:
+    if tuple(result) != _PUBLIC_CAMERA_ROSTER:
         raise ValueError(
-            f"WallOssPolicy unsupported camera_names {unknown}; supported names: "
-            f"{sorted(_SUPPORTED_CAMERA_NAMES)}"
+            "WallOssPolicy exact public profile requires ordered camera_names="
+            f"{list(_PUBLIC_CAMERA_ROSTER)}, got {result}"
         )
     return result
+
+
+def _reject_profile_prefix() -> None:
+    if os.environ.get("WALL_OSS_PROFILE_PREFIX"):
+        raise ValueError(
+            "WallOssPolicy rejects WALL_OSS_PROFILE_PREFIX because it changes "
+            "model semantics and produces non-task outputs"
+        )
 
 
 def _active_slot_list(active_slots: Sequence[int] | None) -> list[int] | None:
@@ -266,7 +278,7 @@ class WallOssPolicy:
     def __init__(self) -> None:
         raise RuntimeError(
             "WallOssPolicy() is not a public constructor. Use "
-            "WallOssPolicy.from_checkpoint(...).to('rpu')."
+            "WallOssPolicy.from_checkpoint(...).preflight_images(...).to('rpu')."
         )
 
     @property
@@ -291,10 +303,10 @@ class WallOssPolicy:
         cls,
         ckpt_dir: str | os.PathLike[str],
         *,
-        dataset_key: str = "berkeley_autolab_ur5",
-        camera_names: Sequence[str] = ("face_view",),
+        dataset_key: str = _PUBLIC_DATASET_KEY,
+        camera_names: Sequence[str] = ("face_view", "right_wrist_view"),
         delta_action: bool = False,
-        state_bins: int = 256,
+        state_bins: int = _PUBLIC_STATE_BINS,
         action_hz: float = 32.0,
         action_horizon: int = 32,
         num_steps: int = 10,
@@ -313,8 +325,9 @@ class WallOssPolicy:
         Qwen2.5-VL processor files and the ``normalizer_action.pth`` /
         ``normalizer_propri.pth`` sidecars. ``dataset_key`` selects the per-robot
         normalizer and the FLOW-prompt Embodiment tag; it must have both
-        ``min.<key>`` and ``delta.<key>`` entries in both sidecars. See
-        ``rpu_backend.adapters.wall_oss.build_wall_oss_vla`` for the field meanings.
+        ``min.<key>`` and ``delta.<key>`` entries in both sidecars.
+        ``WallOssPolicy`` is the only public full-model entry; the component
+        adapters are not alternate full-model constructors.
 
         ``w8a16``, ``w4a16`` and ``nvfp4a16`` require an explicit
         ``fp16_ckpt_dir`` for processor, normalizer and CPU glue weights.
@@ -326,6 +339,8 @@ class WallOssPolicy:
         """
 
         from rpu_backend.api._execution import normalize_rpu_execution
+        if rpu_execution is None:
+            rpu_execution = {"vision": {"chunk_size": 768}}
         execution_config = normalize_rpu_execution(
             rpu_execution,
             entry_point="WallOssPolicy.from_checkpoint",
@@ -335,6 +350,15 @@ class WallOssPolicy:
                 "action": ("chunk_size",),
             },
         )
+        vision_chunk = execution_config.get("vision", {}).get(
+            "chunk_size", "auto"
+        )
+        if vision_chunk == "auto" or int(vision_chunk) != _MAX_PUBLIC_VISION_CHUNK:
+            raise ValueError(
+                "WallOssPolicy exact public profile requires explicit Vision "
+                "chunk_size=768 so unsupported image grids fail before "
+                "checkpoint weights are loaded"
+            )
         delta_action = _strict_bool("delta_action", delta_action)
         w8a16 = _strict_bool("w8a16", w8a16)
         w4a16 = _strict_bool("w4a16", w4a16)
@@ -360,14 +384,32 @@ class WallOssPolicy:
                 f"WallOssPolicy dataset_key must be a non-empty string, got "
                 f"{dataset_key!r}"
             )
+        if dataset_key != _PUBLIC_DATASET_KEY:
+            raise ValueError(
+                "WallOssPolicy exact public profile requires "
+                f"dataset_key={_PUBLIC_DATASET_KEY!r}"
+            )
         inst._dataset_key = dataset_key
         inst._camera_names = _camera_roster(camera_names)
         inst._delta_action = delta_action
         inst._state_bins = _integer_at_least("state_bins", state_bins, 2)
+        if inst._state_bins != _PUBLIC_STATE_BINS:
+            raise ValueError(
+                "WallOssPolicy exact public checkpoint requires state_bins=512"
+            )
         inst._action_hz = _positive_float("action_hz", action_hz)
+        if inst._delta_action or inst._action_hz != _PUBLIC_ACTION_HZ:
+            raise ValueError(
+                "WallOssPolicy exact public profile requires delta_action=False "
+                "and action_hz=32"
+            )
         inst._action_horizon = _integer_at_least(
             "action_horizon", action_horizon, 1
         )
+        if inst._action_horizon != _PUBLIC_ACTION_HORIZON:
+            raise ValueError(
+                "WallOssPolicy exact public profile requires action_horizon=32"
+            )
         action_chunk = execution_config.get("action", {}).get(
             "chunk_size", "auto"
         )
@@ -385,6 +427,14 @@ class WallOssPolicy:
             )
         inst._num_steps = _integer_at_least("num_steps", num_steps, 1)
         inst._max_seq_len = _integer_at_least("max_seq_len", max_seq_len, 1)
+        if (
+            inst._num_steps != _PUBLIC_NUM_STEPS
+            or inst._max_seq_len != _PUBLIC_MAX_SEQ_LEN
+        ):
+            raise ValueError(
+                "WallOssPolicy exact public profile requires num_steps=10 "
+                "and max_seq_len=2048"
+            )
         if inst._max_seq_len <= inst._action_horizon:
             raise ValueError(
                 "WallOssPolicy max_seq_len must be greater than "
@@ -406,6 +456,33 @@ class WallOssPolicy:
         inst._fp16_ckpt_dir = os.fspath(fp16_ckpt_dir) if fp16_ckpt_dir is not None else inst._ckpt_dir
         inst._active_slots = active_slot_list
         inst._runtime_env = _runtime_environment(runtime_env)
+        for key, required in _PUBLIC_FIXED_RUNTIME_ENV.items():
+            configured = inst._runtime_env.get(key, required)
+            if configured != required:
+                raise ValueError(
+                    f"WallOssPolicy exact public profile requires {key}={required!r}"
+                )
+            inst._runtime_env[key] = required
+        layer_group = inst._runtime_env.get(
+            "RPU_WALL_OSS_VISION_LAYER_GROUP",
+            os.environ.get("RPU_WALL_OSS_VISION_LAYER_GROUP", "0"),
+        )
+        if layer_group != "0":
+            raise ValueError(
+                "WallOssPolicy exact public profile requires "
+                "RPU_WALL_OSS_VISION_LAYER_GROUP=0"
+            )
+        inst._runtime_env["RPU_WALL_OSS_VISION_LAYER_GROUP"] = "0"
+        _reject_profile_prefix()
+        batch_vision = inst._runtime_env.get(
+            "RPU_WALL_OSS_BATCH_VISION", "0"
+        ).lower()
+        if batch_vision not in {"0", "false"}:
+            raise ValueError(
+                "WallOssPolicy source-only profile requires "
+                "RPU_WALL_OSS_BATCH_VISION=0"
+            )
+        inst._runtime_env["RPU_WALL_OSS_BATCH_VISION"] = "0"
         inst._rpu_execution = execution_config
         inst._rpu_ready = False
         inst._rpu_build_started = False
@@ -413,6 +490,7 @@ class WallOssPolicy:
         inst._vla = None
         inst._prepare_ms = {}
         inst._graph_profile = None
+        inst._preflight_image_grid = None
         return inst
 
     @classmethod
@@ -432,10 +510,10 @@ class WallOssPolicy:
         on ``model.safetensors``; the ``.pth`` sidecars are preprocessing stats
         (action/proprioception mean+delta), NOT model weights.
 
-        Weights are delivered out of band (not on a public Hub), so this resolves a
-        **local directory** — fetch the model dir first (``git lfs clone`` or
-        ``huggingface_hub.snapshot_download``) and pass its path. Remaining keyword
-        args are forwarded verbatim to :meth:`from_checkpoint`.
+        This facade resolves a **local directory** and performs no network
+        download. Fetch the pinned public model snapshot first (for example with
+        ``huggingface_hub.snapshot_download``), then pass its path. Remaining
+        keyword args are forwarded verbatim to :meth:`from_checkpoint`.
         """
         path = os.fspath(pretrained_model_name_or_path)
         if not os.path.isdir(path):
@@ -448,10 +526,73 @@ class WallOssPolicy:
             )
         return cls.from_checkpoint(path, **kwargs)
 
+    def preflight_images(self, images) -> "WallOssPolicy":
+        """Freeze the exact CPU-processor image grid before RPU weight loading."""
+        _reject_profile_prefix()
+        if self._rpu_build_started or self._rpu_ready:
+            raise RuntimeError(
+                "WallOssPolicy image preflight must run before .to('rpu')"
+            )
+        image_list = list(images) if isinstance(images, (list, tuple)) else [images]
+        if len(image_list) != len(self._camera_names) or any(
+            image is None for image in image_list
+        ):
+            raise ValueError(
+                f"WallOssPolicy image preflight expected "
+                f"{len(self._camera_names)} non-null images, got {len(image_list)}"
+            )
+
+        from transformers import AutoProcessor
+
+        processor = AutoProcessor.from_pretrained(
+            self._fp16_ckpt_dir, local_files_only=True
+        )
+        prepared = processor.image_processor(
+            images=image_list, return_tensors="pt"
+        )
+        grid = prepared.get("image_grid_thw")
+        if not isinstance(grid, torch.Tensor) or tuple(grid.shape) != (
+            len(image_list), 3
+        ):
+            raise ValueError(
+                "WallOssPolicy processor must return positive image_grid_thw "
+                f"with shape ({len(image_list)}, 3)"
+            )
+        if grid.dtype not in {
+            torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64
+        }:
+            raise TypeError(
+                "WallOssPolicy processor image_grid_thw must use an integer dtype"
+            )
+        if bool((grid <= 0).any()):
+            raise ValueError(
+                "WallOssPolicy processor must return positive image_grid_thw"
+            )
+        configured = int(
+            self._rpu_execution["vision"]["chunk_size"]
+        )
+        actual_grid = tuple(tuple(int(value) for value in row) for row in grid.tolist())
+        expected_grid = (_PUBLIC_VISION_GRID,) * _PUBLIC_VISION_IMAGE_COUNT
+        if actual_grid != expected_grid or configured != _MAX_PUBLIC_VISION_CHUNK:
+            raise ValueError(
+                "WallOssPolicy image grid is outside the exact public dual-448 "
+                f"Vision profile: grid={actual_grid}, configured={configured}, "
+                f"required_grid={expected_grid}, required_chunk=768"
+            )
+        admitted_grid = grid.detach().cpu().long().contiguous().clone()
+        with self._rpu_build_lock:
+            if self._rpu_build_started or self._rpu_ready:
+                raise RuntimeError(
+                    "WallOssPolicy image preflight must run before .to('rpu')"
+                )
+            self._preflight_image_grid = admitted_grid
+        return self
+
     def to(self, device: Any) -> "WallOssPolicy":
         from rpu_backend.api.errors import RPUBackendError
         from rpu_backend.api._loading import resolve_loader_device
 
+        _reject_profile_prefix()
         try:
             is_rpu = resolve_loader_device(
                 device, entry_point="WallOssPolicy.to"
@@ -466,6 +607,11 @@ class WallOssPolicy:
             )
         if _wall_oss_policy_runtime_complete(self):
             return self
+        if self._preflight_image_grid is None:
+            raise RPUBackendError(
+                "WallOssPolicy requires preflight_images(images) before .to('rpu') "
+                "so unsupported Vision grids fail before weight loading."
+            )
         if self._rpu_ready:
             raise RPUBackendError(
                 "WallOssPolicy is marked ready but its VLA runtime ownership is "
@@ -494,6 +640,11 @@ class WallOssPolicy:
                     "gc.collect(), and construct a fresh instance; retrying may "
                     "reuse partially initialized or swizzled state."
                 )
+            if self._preflight_image_grid is None:
+                raise RPUBackendError(
+                    "WallOssPolicy requires a completed preflight_images(images) "
+                    "before .to('rpu')."
+                )
 
             from rpu_backend.api.causal_lm import _claim_live_instance
             _claim_live_instance(self)
@@ -504,10 +655,10 @@ class WallOssPolicy:
                 for key, value in self._runtime_env.items():
                     os.environ[str(key)] = str(value)
 
-                from rpu_backend.adapters.wall_oss import build_wall_oss_vla
+                from rpu_backend.adapters.wall_oss.runtime import _build_wall_oss_vla
 
                 t0 = time.perf_counter()
-                pending_vla = build_wall_oss_vla(
+                pending_vla = _build_wall_oss_vla(
                     self._ckpt_dir,
                     dataset_key=self._dataset_key,
                     camera_names=self._camera_names,
@@ -519,6 +670,9 @@ class WallOssPolicy:
                     nvfp4_wint4_scope=self._nvfp4a16,
                     fp16_ckpt_dir=self._fp16_ckpt_dir,
                     rpu_execution=self._rpu_execution,
+                )
+                pending_vla._admitted_image_grid = (
+                    self._preflight_image_grid.clone()
                 )
                 self._rpu_execution = pending_vla._rpu_execution
                 if not _wall_oss_vla_runtime_complete(pending_vla):
@@ -684,6 +838,7 @@ class WallOssPolicy:
         different image geometry, horizon, denoise-step count or dof-mask execution
         mode fails before graph capture instead of triggering an online BUILD.
         """
+        _reject_profile_prefix()
         if not _wall_oss_policy_runtime_complete(self):
             from rpu_backend.api.errors import RPUBackendError
 
@@ -753,6 +908,7 @@ class WallOssPolicy:
         mask). Returns de-normalized actions with shape ``[H, action_dim]``.
         """
 
+        _reject_profile_prefix()
         if not _wall_oss_policy_runtime_complete(self):
             from rpu_backend.api.errors import RPUBackendError
 

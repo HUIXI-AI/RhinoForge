@@ -11,6 +11,7 @@ import torch
 
 from rpu_backend.adapters.qwen3_5 import text as qwen3_5_text
 from rpu_backend.adapters.qwen3_5 import vision as qwen3_5_vision
+from rpu_backend.adapters.wall_oss import llm as wall_llm
 from rpu_backend.adapters import qwen3
 from rpu_backend.api.errors import RPUBackendError, UnsupportedModelError
 
@@ -24,6 +25,40 @@ EAGER_BMM_TILES = {
     (128, 128, 64),
     (128, 128, 128),
 }
+
+
+def test_w8a16_prefix_tile_uses_the_measured_exact_entry(tmp_path: Path) -> None:
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("C++ compiler is unavailable")
+
+    source = tmp_path / "linear_tiling_check.cpp"
+    source.write_text(
+        '#include "rpu_linear_tiling.h"\n'
+        "int main() {\n"
+        "  const auto w8 = rpu_pl_tiling::select_tile_acc16(400, 2048, 2048, false);\n"
+        "  const auto nearby = rpu_pl_tiling::select_tile_acc16(399, 2048, 2048, false);\n"
+        "  const auto w16 = rpu_pl_tiling::select_tile_acc16(400, 2048, 2048, true);\n"
+        "  return w8.m_tile != 400 || w8.n_tile != 80 ||\n"
+        "         nearby.m_tile != 512 || nearby.n_tile != 48 ||\n"
+        "         w16.m_tile != 480 || w16.n_tile != 64;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    executable = tmp_path / "linear_tiling_check"
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-I",
+            str(ROOT / "src/ops"),
+            str(source),
+            "-o",
+            str(executable),
+        ],
+        check=True,
+    )
+    subprocess.run([str(executable)], check=True)
 
 
 def test_operator_kernel_manifest_is_strict_and_asset_stays_opaque(
@@ -121,6 +156,83 @@ def test_operator_kernel_manifest_is_strict_and_asset_stays_opaque(
     assert loader.index("kernel_manifest_names") < loader.index(
         "create_with_binary_file"
     )
+
+
+def test_wall_oss_exact_multichunk_uses_global_kv_and_ordered_merger() -> None:
+    vision = (
+        ROOT / "src" / "fused" / "rpu_qwen25vl_vision_model.cpp"
+    ).read_text(encoding="utf-8")
+    mask_dma = (ROOT / "src" / "ops" / "rpu_sdpa.cpp").read_text(
+        encoding="utf-8"
+    )
+    adapter = (
+        ROOT
+        / "python"
+        / "rpu_backend"
+        / "adapters"
+        / "wall_oss"
+        / "vision.py"
+    ).read_text(encoding="utf-8")
+
+    assert "&Qwen25VLVisionModel::emit_kv_first_body" in vision
+    assert "cfg.chunk_mode = ChunkMode::KV_FIRST" in vision
+    assert "current_num_patches_ == 1024" in vision
+    assert "configured_chunk_size_ == 768" in vision
+    assert "insert_position = ctx().position + chunk.offset" in vision
+    assert "query_row_offset=*/chunk.offset + q_rel" in vision
+    assert "full_seq, NUM_CORES, NUM_CORES" in vision
+    assert 'addr(0, chunk.idx == 0 ? "merger_out0" : "merger_out1")' in vision
+    assert "output_tensor(), chunk.offset * h, chunk.len * h" in vision
+    assert "chunk.offset % 4 == 0 && chunk.len % 4 == 0" in vision
+
+    assert "query_row_offset * row_elements" in mask_dma
+    assert "mask.ddr_tensor, source_offset, mask_elements" in mask_dma
+    assert "packed multi-image multi-chunk Vision is not" in adapter
+    assert "per-window SDPA multi-chunk is not implemented" in adapter
+    forward_one = adapter.split("def _forward_one", 1)[1].split(
+        "def _forward_group", 1
+    )[0]
+    immediate_reverse = forward_one.split("if self._fused_merger:", 1)[1].split(
+        "if self._device_merged:", 1
+    )[0]
+    assert immediate_reverse.index("spm_alloc_reset_temporary()") < (
+        immediate_reverse.index("gather_embedding(merged, ri)")
+    )
+
+
+@pytest.mark.parametrize(
+    "prefill_config",
+    [{}, {"chunk_size": "auto", "padding_budget": 64}],
+)
+def test_wall_oss_prefill_uses_shared_multichunk_planner(
+    monkeypatch, prefill_config
+) -> None:
+    assert "causal_decoder_set_equal_two_prefill" not in Path(
+        wall_llm.__file__
+    ).read_text(encoding="utf-8")
+    model = wall_llm.WallOssLLM.__new__(wall_llm.WallOssLLM)
+    model.cache = SimpleNamespace(max_seq_len=8192)
+    model._handle = 7
+    model._prefill_pad16 = True
+    model._rpu_execution = {"prefill": prefill_config}
+
+    def resolve(handle, execution_len, position):
+        assert (handle, position) == (7, 0)
+        if execution_len == 656:
+            return 320
+        if execution_len == 672:
+            return 224
+        raise RuntimeError("no legal chunk")
+
+    monkeypatch.setattr(
+        torch.ops.rpu,
+        "causal_decoder_resolve_prefill_chunk_size",
+        resolve,
+        raising=False,
+    )
+
+    assert model.prefill_execution_plan(643) == (656, 320)
+    assert (656 + 320 - 1) // 320 == 3
 
 
 def test_eager_bmm_allowlist_matches_preloaded_kernels() -> None:
@@ -236,6 +348,63 @@ def test_qwen3_5_vision_gate_precedes_handle_and_weight_mutation() -> None:
     )
 
 
+def test_qwen3_5_standalone_pooler_preserves_native_fp16_contract() -> None:
+    adapter = Path(qwen3_5_vision.__file__).read_text(encoding="utf-8")
+    standalone = adapter.split("def _rpu_vision_forward", 1)[1].split(
+        "def fuse_visual_embeds", 1
+    )[0]
+    native = (
+        ROOT / "src" / "fused" / "rpu_qwen3_5_vision_model.cpp"
+    ).read_text(encoding="utf-8")
+
+    assert 'device="cpu", dtype=torch.float16' in standalone
+    assert "self.merger(last_hidden.detach().cpu().float()).to(" in standalone
+    assert "dtype=torch.float16" in standalone
+    assert ").detach().cpu().float()" not in standalone
+    assert "merged_buf_ = at::empty(" in native
+    assert "input.options());" in native
+    assert "merged_buf_.data_ptr<c10::Half>()" in native
+
+
+@pytest.mark.parametrize(
+    ("grid", "input_len", "message"),
+    [
+        ([1, 130, 32], 1, "total patches"),
+        ([1, 2, 130], 1, "2D RoPE"),
+        ([1, 30, 40], 385, "image-prefill maximum"),
+    ],
+)
+def test_qwen3_5_vision_request_rejects_before_install(
+    grid, input_len, message, monkeypatch
+) -> None:
+    called = False
+
+    def install(_model):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(qwen3_5_vision, "install_qwen3_5_vision_for_rpu", install)
+    model = SimpleNamespace(
+        config=SimpleNamespace(image_token_id=248056),
+        model=SimpleNamespace(
+            visual=SimpleNamespace(config=SimpleNamespace(spatial_merge_size=2))
+        ),
+    )
+    patches = grid[0] * grid[1] * grid[2]
+
+    with pytest.raises(ValueError, match=message):
+        qwen3_5_vision.fuse_visual_embeds(
+            model,
+            torch.empty(1, 1, 1),
+            torch.zeros(1, input_len, dtype=torch.long),
+            torch.empty(patches, 1),
+            torch.tensor([grid]),
+            mm_token_type_ids=torch.zeros(1, input_len, dtype=torch.long),
+        )
+
+    assert not called
+
+
 def test_qwen3_14b_requires_exact_lm_head_quantization_metadata() -> None:
     profile = {
         "hidden_size": 5120,
@@ -269,6 +438,23 @@ def test_qwen3_14b_requires_exact_lm_head_quantization_metadata() -> None:
     model.lm_head = torch.nn.Linear(2, 2).half()
     with pytest.raises(RPUBackendError, match="checkpoint tensors do not match"):
         qwen3.Qwen3Adapter(model)
+
+
+def test_qwen3_32b_exact_public_profile_rejects_before_admission() -> None:
+    config = SimpleNamespace(
+        hidden_size=5120,
+        intermediate_size=25600,
+        num_hidden_layers=64,
+        num_attention_heads=64,
+        num_key_value_heads=8,
+        head_dim=128,
+    )
+    before = vars(config).copy()
+
+    with pytest.raises(UnsupportedModelError, match="no certified RPU execution"):
+        qwen3.Qwen3Adapter.preflight(config)
+
+    assert vars(config) == before
 
 
 def test_qwen3_14b_installs_existing_int8_lm_head_path() -> None:
@@ -308,6 +494,83 @@ def test_hyvla_native_handles_declare_exact_chunk_envelopes() -> None:
         assert "chunk_within_envelope(cs)" in validity
 
 
+def test_lingbot2_moe_declares_its_native_chunk_envelope() -> None:
+    source = (ROOT / "src/fused/rpu_lingbot_v2_moe_model.cpp").read_text(
+        encoding="utf-8"
+    )
+    setter = source.split("LingbotV2MoeExpertModel::set_moe_weights", 1)[1]
+    setter = setter.split("LingbotV2MoeExpertModel::declare_buffers", 1)[0]
+    assert "tp_rows_        = Align(chunk_size, (int64_t)16);" in setter
+    assert (
+        "set_chunk_envelope(/*max_kv_len=*/cos_.size(0), "
+        "/*chunk=*/tp_rows_);"
+    ) in setter
+
+
+def test_public_release_has_no_activation_export_path() -> None:
+    python_debug = (
+        ROOT / "python/rpu_backend/runtime/debug.py"
+    ).read_text(encoding="utf-8")
+    torch_namespace = (
+        ROOT / "python/rpu_backend/_torch_rpu.py"
+    ).read_text(encoding="utf-8")
+    pybind = (ROOT / "src/core/rpu_pybind.inc").read_text(encoding="utf-8")
+    runtime_state = (
+        ROOT / "src/core/rpu_runtime_state.cpp"
+    ).read_text(encoding="utf-8")
+    graph_execute = (
+        ROOT / "src/graph/graph_runtime_execute.cpp"
+    ).read_text(encoding="utf-8")
+    pi05 = "\n".join(
+        (ROOT / relative).read_text(encoding="utf-8")
+        for relative in (
+            "python/rpu_backend/adapters/pi05/runtime.py",
+            "python/rpu_backend/adapters/pi05/gemma.py",
+            "python/rpu_backend/adapters/pi05/__init__.py",
+        )
+    )
+    lingbot = "\n".join(
+        (ROOT / relative).read_text(encoding="utf-8")
+        for relative in (
+            "python/rpu_backend/api/lingbot2.py",
+            "src/core/rpu_dispatch_registrations.inc",
+            "src/core/rpu_kernel_decls.h",
+            "src/fused/rpu_lingbot_v2_moe_model.cpp",
+            "src/fused/rpu_lingbot_v2_moe_model.h",
+        )
+    )
+
+    for symbol in (
+        "set_debug_export",
+        "get_debug_tensor",
+        "list_debug_tensors",
+        "clear_debug_tensors",
+    ):
+        assert f"def {symbol}" not in python_debug
+        assert f'"{symbol}"' not in torch_namespace
+        assert f'm.def("{symbol}"' not in pybind
+    assert "void set_debug_export(" not in runtime_state
+    assert "bool get_debug_export() {\n    return false;\n}" in runtime_state
+    assert "qwen3_5_vision_get_dbg_" not in lingbot
+    assert "RPU_GRAPH_HCB_CHECKSUM" not in graph_execute
+    assert "[HCB-CK]" not in graph_execute
+    assert "RPU_PI05_PROBE_DIR" not in pi05
+    assert "torch.save(" not in pi05
+    for marker in (
+        "lingbot_v2_moe_debug_",
+        "RPU_LINGBOT2_DEBUG_DUMP_ROUTER_H",
+        "RPU_L2_CAPTURE_",
+        "RPU_L2_CAP_RESID",
+        "RPU_L2_DBG_PACKED",
+        "RPU_L2_STAGES",
+    ):
+        assert marker not in lingbot
+
+    ignored = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+    for pattern in ("*.pth", "*.ckpt", "*.safetensors", "*.npz", "*.onnx"):
+        assert pattern in ignored
+
+
 def test_hyvla_vlm_allows_the_planner_fixed_overhead_probe() -> None:
     source = (ROOT / "src/fused/rpu_hyvla_vlm_model.cpp").read_text(
         encoding="utf-8"
@@ -341,6 +604,42 @@ def test_fmb_joint_chunk_budget_and_modes_fail_closed() -> None:
     modes = modes.split("static void validate_kv_first_chunk_plan", 1)[0]
     assert "dynamic_config returned an invalid inter-layer I/O mode" in modes
     assert "chunk_outer_within_group requires SEQUENTIAL + SPM_RESIDENT" in modes
+
+
+def test_graph_segments_follow_runtime_capacity_and_preserve_dma_fences() -> None:
+    source = (ROOT / "src/graph/graph_runtime_execute.cpp").read_text(
+        encoding="utf-8"
+    )
+    backend = (ROOT / "src/core/rpu_backend.cpp").read_text(encoding="utf-8")
+    runtime_state = (ROOT / "src/core/rpu_runtime_state.h").read_text(
+        encoding="utf-8"
+    )
+    budget = source.split("static SegmentResourceBudget segment_resource_budget()", 1)[
+        1
+    ].split("static SegmentResourceUse segment_node_resources", 1)[0]
+    assert "rpu_lkn_batch_config_at_load()" in budget
+    assert "getenv" not in budget
+    assert "LKN_MAX_BATCH_ENTRIES" not in budget
+    assert (
+        "const LknBatchConfig& rpu_lkn_batch_config_at_load();"
+        in runtime_state
+    )
+    assert re.search(
+        r"const LknBatchConfig& rpu_lkn_batch_config_at_load\(\)\s*"
+        r"\{\s*return kLknBatchConfigAtLoad;\s*\}",
+        backend,
+    )
+    assert "SegmentResourceBudget{sdk_entries, sdk_kd, sdk_instr}" in budget
+    assert "sdk_entries / 2" not in budget
+    assert "8192" not in budget
+    assert "20000" not in budget
+    assert "pi05_denoise_10_step_owns_larger_entry_budget" not in source
+    assert "16 + 15 * sizeof(uint64_t)" in source
+    assert "fenced_group_resources" in source
+    assert "admit_batch_group(i);" in source
+    assert "one indivisible batch group exceeds" in source
+    assert "barrier.target_stream) != streams.end()" in source
+    assert "unterminated cross-stream DMA fence" not in source
 
 
 def test_physical_prepare_is_bound_to_the_exact_stage_plan() -> None:

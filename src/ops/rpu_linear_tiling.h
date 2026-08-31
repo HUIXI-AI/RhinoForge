@@ -496,6 +496,11 @@ inline int measured_neighbor_tile(const PLEntry* table, std::size_t count,
 }
 
 inline TilePick select_tile_acc16(int M, int local_n, int local_k, bool is_fp16) {
+  // Measured Pi0.5 prefix projection; keep it out of neighbor voting so no
+  // unmeasured W8 shape changes route.
+  if (!is_fp16 && M == 400 && local_n == 2048 && local_k == 2048) {
+    return {80, mtile_w8a16(80)};
+  }
   const PLEntry* table = is_fp16 ? PL_EXACT_W16 : PL_EXACT_W8A16;
   const std::size_t count = is_fp16 ? table_size(PL_EXACT_W16)
                                      : table_size(PL_EXACT_W8A16);

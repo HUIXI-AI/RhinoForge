@@ -207,6 +207,11 @@ def _check_prefix_envelope(n_valid: Any, prefix_len: int) -> int:
     return value
 
 
+def _require_finite_tensor(name: str, value: torch.Tensor) -> None:
+    if not bool(torch.isfinite(value).all().item()):
+        raise ValueError(f"{name} 只允许有限值（不能含 NaN/Inf）。")
+
+
 def _validate_runner_observation(
     obs: Mapping[str, Any], *, n_cameras: int, prefix_len: int
 ) -> dict[str, Any]:
@@ -233,6 +238,7 @@ def _validate_runner_observation(
         if not torch.is_tensor(image) or tuple(image.shape) != (1, 3, 224, 224):
             raise ValueError(
                 f"obs['images'][{index}] 必须是 tensor [1,3,224,224]。")
+        _require_finite_tensor(f"obs['images'][{index}]", image)
 
     def require_shape(name: str, expected: str, valid) -> None:
         value = values[name]
@@ -265,6 +271,7 @@ def _validate_runner_observation(
         lambda s: len(s) == 2 and s[0] == 51 and s[1] >= prefix_len + 51)
     require_shape("suffix_pos", "[51]", lambda s: s == (51,))
     require_shape("noise", "[1,50,32]", lambda s: s == (1, 50, 32))
+    _require_finite_tensor("obs['noise']", values["noise"])
 
     state_keys = [name for name in ("state", "state_emb") if values.get(name) is not None]
     if len(state_keys) != 1:
@@ -273,6 +280,7 @@ def _validate_runner_observation(
         require_shape("state", "[1,32]", lambda s: s == (1, 32))
     else:
         require_shape("state_emb", "[1,1,1024]", lambda s: s == (1, 1, 1024))
+    _require_finite_tensor(f"obs[{state_keys[0]!r}]", values[state_keys[0]])
     return values
 
 
@@ -368,7 +376,7 @@ class HyEmbodiedPolicy:
         Args:
             dtype: 见 `_PROFILE_ENV`。当前 immutable-v2 认证档是 `fp16`；
                 W8 各档仅用于 legacy-bf16 受控评估。
-            prefix_len: S，`{16,32,…,240}`。240 覆盖 `tokenizer_max_length=64`
+            prefix_len: S，`{192,208,224,240}`。240 覆盖 `tokenizer_max_length=64`
                 下的最坏 prompt，是默认值；调小只为省时间，且必须 ≥
                 `ceil16(本条 observation 的有效行数)`。
             norm_stats_path: `norm_stats.pkl`。**必须显式给，不会自动探测**；
@@ -385,8 +393,12 @@ class HyEmbodiedPolicy:
         dtype = (dtype or "fp16").strip().lower()
         if dtype not in _PROFILE_ENV:
             raise ValueError(f"dtype 必须是 {sorted(_PROFILE_ENV)} 之一，得到 {dtype!r}")
-        if prefix_len % 16 or not 16 <= prefix_len <= 240:
-            raise ValueError(f"prefix_len 必须是 16 的倍数且在 [16,240]，得到 {prefix_len}")
+        # 三张图固定占 2 + 3×58 = 176 行；指令端即使只有助手
+        # tag 也至少有一行，因此第一个可达的 16 对齐 S 是 192。
+        if prefix_len % 16 or not 192 <= prefix_len <= 240:
+            raise ValueError(
+                f"prefix_len 必须是 16 的倍数且在 [192,240]，得到 {prefix_len}"
+            )
         if not isinstance(trust_norm_stats_pickle, bool):
             raise TypeError("trust_norm_stats_pickle must be bool")
         if norm_stats_path is None:
@@ -777,6 +789,9 @@ class HyEmbodiedPolicy:
                     raise ValueError(
                         "传了 ee_pose 但没有 norm_stats —— 无法把位姿编码成模型的 "
                         "state。请在 from_checkpoint 里给 norm_stats_path。")
+                _require_finite_tensor(
+                    "ee_pose", torch.as_tensor(ee_pose, dtype=torch.float64)
+                )
                 norm_state = torch.as_tensor(
                     self._decoder.encode_state(ee_pose), dtype=torch.float32)
             elif state is not None:

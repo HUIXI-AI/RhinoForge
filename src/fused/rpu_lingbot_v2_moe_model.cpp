@@ -231,6 +231,10 @@ void LingbotV2MoeExpertModel::set_moe_weights(
     chunk_size_     = chunk_size;
     // The transpose kernel requires C (= the token dim) to be v16-aligned.
     tp_rows_        = Align(chunk_size, (int64_t)16);
+    // The RoPE table and the fixed MoE suffix already carry this handle's exact
+    // validated range.  Declare it here because LingBot2 owns a separate native
+    // handle registry and cannot use causal_decoder_set_chunk_envelope().
+    set_chunk_envelope(/*max_kv_len=*/cos_.size(0), /*chunk=*/tp_rows_);
     (void)h;
 
     // Pad rows [chunk_size, tp_rows) of the router score buffer are filled with
@@ -313,33 +317,6 @@ void LingbotV2MoeExpertModel::set_moe_weights(
         fp16_top4_ = explicit_on || (!explicit_off && !debug_dense_soft_router_);
     }
 
-    // ── DEBUG router-input (residual1) dump opt-in. SEPARATE env var; default OFF.
-    //    When OFF nothing is allocated and emit_router_select emits no extra DMA, so the
-    //    graph is byte-identical to a build without this feature.
-    {
-        const char* e = std::getenv("RPU_LINGBOT2_DEBUG_DUMP_ROUTER_H");
-        debug_dump_router_h_ = (e != nullptr && e[0] == '1' && e[1] == '\0');
-    }
-    if (debug_dump_router_h_) {
-        // Fresh dedicated tensor, one slot PER LAYER => no layer overwrites another and
-        // no existing DDR buffer is reused.
-        h_stage_ = at::zeros({nl, tp_rows_, hidden_size()},
-            at::TensorOptions().dtype(at::kHalf).device(at::kPrivateUse1));
-        std::printf("[lingbot2] DEBUG_DUMP_ROUTER_H=1 -> capturing router input residual1 [%ld, %ld, %ld]\n", (long)nl, (long)tp_rows_, (long)hidden_size());
-    }
-    // ── DEBUG all-layer residual-stream capture (layer_in + attn_resid). SEPARATE env var,
-    //    default OFF => nothing allocated, no DMA emitted, graph byte-identical.
-    {
-        const char* e = std::getenv("RPU_L2_CAP_RESID");
-        debug_cap_resid_ = (e != nullptr && e[0] == '1' && e[1] == '\0');
-    }
-    if (debug_cap_resid_) {
-        lin_stage_ = at::zeros({nl, tp_rows_, hidden_size()},
-            at::TensorOptions().dtype(at::kHalf).device(at::kPrivateUse1));
-        ar_stage_ = at::zeros({nl, tp_rows_, hidden_size()},
-            at::TensorOptions().dtype(at::kHalf).device(at::kPrivateUse1));
-        std::printf("[lingbot2] RPU_L2_CAP_RESID=1 -> capturing layer_in + attn_resid [%ld, %ld, %ld]\n", (long)nl, (long)tp_rows_, (long)hidden_size());
-    }
     // Loud banner, once per set_weights, for whichever router is active.
     if (fp16_top4_) {
         std::printf("LINGBOT2_FP16_TOP4_ROUTER\n");
@@ -354,37 +331,10 @@ void LingbotV2MoeExpertModel::set_moe_weights(
         std::fflush(stdout);
     }
     {
-        const char* e = std::getenv("RPU_L2_CAPTURE_L0");
-        debug_capture_l0_ = (e != nullptr && e[0] == '1' && e[1] == '\0');
         const char* ero = std::getenv("RPU_L2_ROUTED_ONLY");
         debug_routed_only_ = (ero != nullptr && ero[0] == '1' && ero[1] == '\0');
-        const char* est = std::getenv("RPU_L2_STAGES");
-        debug_stages_ = (est != nullptr && est[0] == '1' && est[1] == '\0');
         const char* ea = std::getenv("RPU_L2_DOWN_ACC16");
         debug_down_acc16_ = (ea != nullptr && ea[0] == '1' && ea[1] == '\0');
-        if (debug_stages_) {
-            int64_t gw = num_experts_ * (routed_inter_ / NUM_CORES);
-            scap_ = at::zeros({tp_rows_, gw}, at::TensorOptions().dtype(at::kHalf).device(at::kPrivateUse1));
-            ccap_ = at::zeros({tp_rows_, gw}, at::TensorOptions().dtype(at::kHalf).device(at::kPrivateUse1));
-        }
-        if (debug_capture_l0_)
-            l0_out_ = at::zeros({tp_rows_, hidden_size()},
-                at::TensorOptions().dtype(at::kHalf).device(at::kPrivateUse1));
-        // Opt-in capture of layer 0's post-AdaRMS activation. Same shape/dtype/device as
-        // l0_out_; allocated only when asked for, so the default build is unchanged.
-        const char* ein = std::getenv("RPU_L2_CAPTURE_INNORM");
-        debug_capture_innorm_ = (ein != nullptr && ein[0] == '1' && ein[1] == '\0');
-        if (debug_capture_innorm_)
-            innorm_ = at::zeros({tp_rows_, hidden_size()},
-                at::TensorOptions().dtype(at::kHalf).device(at::kPrivateUse1));
-        const char* eg = std::getenv("RPU_L2_CAPTURE_GATE");
-        debug_capture_gate_ = (eg != nullptr && eg[0] == '1' && eg[1] == '\0');
-        if (debug_capture_gate_) {
-            gcap_ = at::zeros({tp_rows_, num_experts_ * (routed_inter_ / NUM_CORES)},
-                at::TensorOptions().dtype(at::kHalf).device(at::kPrivateUse1));
-            acap_ = at::zeros({tp_rows_, hidden_size()},
-                at::TensorOptions().dtype(at::kHalf).device(at::kPrivateUse1));
-        }
     }
     invalidate_model_state();   // Must remain the last statement.
 }
@@ -474,19 +424,12 @@ std::vector<BufferDecl> LingbotV2MoeExpertModel::declare_buffers(const LayoutCon
         // DIAG: Persistent (never aliased) to test whether Temp aliasing corrupts the big buffers.
         d.push_back({"moe_ggate", gpc, 7, 8, SC::Temp, 0, nullptr, ALL});
         d.push_back({"moe_gup",   gpc, 7, 8, SC::Temp, 0, nullptr, ALL});
+        // Keep the released layout identity stable; these former diagnostic
+        // slots are no longer written or exported.
         d.push_back({"moe_gsilu", gpc, 7, 8, SC::Temp, 0, nullptr, ALL});
         d.push_back({"moe_gscale",gpc, 7, 8, SC::Temp, 0, nullptr, ALL});
         d.push_back({"moe_wtm",   te,  7, 8, SC::Temp, 0, nullptr, ALL});
         d.push_back({"moe_wtmb",  te,  7, 8, SC::Temp, 0, nullptr, ALL});  // relay DEST (src!=dst)
-    }
-
-    // DEBUG-ONLY: never-aliased slot for the layer-0 post-AdaRMS activation. Declared ONLY
-    // when RPU_L2_CAPTURE_INNORM=1, so with the flag off the SPM layout (and its hash) is
-    // byte-identical to the baseline. Persistent over the whole layer window [0,8] so no
-    // other buffer can be aliased onto it while the capture DMA is still draining — the
-    // failure mode that made the first attempt read residual2's data instead.
-    if (debug_capture_innorm_) {
-        d.push_back({"innorm_dbg", full, 0, 8, SC::Persistent, 0, nullptr, ALL});
     }
 
     // Per-layer router correction bias [E] — PersistentPerLayer preload,
@@ -705,15 +648,6 @@ void LingbotV2MoeExpertModel::emit_router_select(int layer_idx, int64_t seq_len)
     // ── 1. logits = residual1 @ gate_w^T  -> [Tp, E], core-0 only.
     //    N is the full output dimension; the kernel divides by num_cores.
     //    router_gate_ is col-swizzled for one core.
-    // ── 0. DEBUG-ONLY: capture the router's REAL input BEFORE any router math runs.
-    //    Reads residual1, writes a private per-layer slot. Emits nothing when the opt-in
-    //    env var is off, so the router math / weights / kernel order are unchanged.
-    if (debug_dump_router_h_) {
-        c10::Half* hstage = h_stage_.data_ptr<c10::Half>()
-                          + (int64_t)layer_idx * tp_rows_ * h;
-        rpu_launch_spm_copy_ddr_dma(addr(0, "residual1"), hstage, seq_len * h);
-    }
-
     // Accumulate the router GEMM in FP32, then store FP16 logits. This cannot
     // recover the exact FP32-selection contract, but it avoids an unnecessary
     // ACC16 deviation before the already-documented FP16 storage boundary.
@@ -938,8 +872,6 @@ void LingbotV2MoeExpertModel::emit_moe_mlp(int layer_idx, int64_t seq_len) {
     rpu_launch_all_reduce_sum_residual_kernel(
         addr(0, "moe_acc"), addr(0, "residual2"),
         addr(0, "residual1"), seq_len, h, NUM_CORES, NUM_CORES);
-    if (debug_capture_l0_ && layer_idx == 0)
-        rpu_launch_spm_copy_ddr_dma(addr(0, "residual1"), l0_out_.data_ptr<c10::Half>(), seq_len * h);
 }
 
 
@@ -1034,29 +966,19 @@ void LingbotV2MoeExpertModel::emit_moe_mlp_grouped(int layer_idx, int64_t seq_le
             const int64_t v = (e != nullptr) ? (int64_t)std::atol(e) : 0;
             return v > 0 ? v : (int64_t)(256 * 127);   // "" -> atol==0 -> off+=0 hangs
         }();
-        // debug_stages: write silu to a FRESH buffer (single-version -> reliable capture, user #8)
-        const char* silu_out = debug_stages_ ? "moe_gsilu" : "moe_ggate";
         for (int64_t off = 0; off < total; off += CHUNK) {
             const int64_t nn = (total - off < CHUNK) ? (total - off) : CHUNK;
             rpu_launch_silu_mul_spm_kernel(
                 addr(0, "moe_ggate") + off * DWIDTH, addr(0, "moe_gup") + off * DWIDTH,
-                addr(0, silu_out) + off * DWIDTH, nn, NUM_CORES);
-        }
-        if (debug_stages_ && layer_idx == 0) {
-            rpu_launch_spm_copy_ddr_dma(addr(0,"moe_wtm"), gcap_.data_ptr<c10::Half>(), Tp * E);  // CORE0 wtm
-            rpu_launch_spm_copy_ddr_dma(addr(1,"moe_wtm"), scap_.data_ptr<c10::Half>(), Tp * E);  // CORE1 wtm
+                addr(0, "moe_ggate") + off * DWIDTH, nn, NUM_CORES);
         }
     }
-    if (debug_capture_gate_ && layer_idx == 0)
-        rpu_launch_spm_copy_ddr_dma(addr(0, "moe_ggate"), gcap_.data_ptr<c10::Half>(), seq_len * (E * (I / NUM_CORES)));
     // act[t,e,i] *= w[t,e] * routed_scaling. Per-core view [seq,E,Ic] as [seq*E, Ic];
     //   a = moe_wtm (row t*E+e = w[t,e], IDENTICAL on all cores), contiguous.
     // act[t,e,i] *= w[t,e] * routed_scaling. The packed grouped binding requires one
     // Nx1_NxC launch over all seq_len*E rows: advancing a later host-side chunk would
     // not advance the packed B-operand inside the kernel. set_grouped_experts() therefore
     // rejects RCHUNK < chunk_size*E; the public quantized profiles set RCHUNK=1632.
-    const char* scale_in  = debug_stages_ ? "moe_gsilu"  : "moe_ggate";
-    const char* scale_out = debug_stages_ ? "moe_gscale" : "moe_ggate";
     {
         const int64_t nrows = seq_len * E;   // 1632
         // DIAG RPU_L2_RCHUNK: scale row-chunk size. The low default deliberately makes a
@@ -1071,13 +993,11 @@ void LingbotV2MoeExpertModel::emit_moe_mlp_grouped(int layer_idx, int64_t seq_le
             const int64_t rn = (nrows - r < RCHUNK) ? (nrows - r) : RCHUNK;
             rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel(
                 addr(0, "moe_wtmb") + r * DWIDTH,
-                addr(0, scale_in) + r * Ic * DWIDTH,
-                addr(0, scale_out) + r * Ic * DWIDTH,
+                addr(0, "moe_ggate") + r * Ic * DWIDTH,
+                addr(0, "moe_ggate") + r * Ic * DWIDTH,
                 /*n=*/rn, /*c=*/Ic, routed_scaling_, ValuOpType::MUL, /*is_bopa=*/false);
         }
     }
-    if (debug_stages_ && layer_idx == 0)
-        rpu_launch_spm_copy_ddr_dma(addr(0,"moe_gscale"), ccap_.data_ptr<c10::Half>(), seq_len * GpC);
     // down_all = act @ down_packed^T (row-partition K=E*I) -> per-core PARTIAL into moe_acc.
     //   The contraction over E*I sums all experts+slices; moe_acc is fully overwritten
     //   (seed), like e==0 in the per-expert loop.  ACC32 (fp32 accumulate) is REQUIRED here:
@@ -1085,21 +1005,18 @@ void LingbotV2MoeExpertModel::emit_moe_mlp_grouped(int layer_idx, int64_t seq_le
     //   shorter acc16 reductions; the grouped path therefore requires ACC32.
     if (debug_down_acc16_ || packed_w8a16_)
         rpu_launch_linear_spm_to_spm_acc16_kernel(
-            addr(0, scale_out), packed_down_[layer_idx], addr(0, "moe_acc"),
+            addr(0, "moe_ggate"), packed_down_[layer_idx], addr(0, "moe_acc"),
             seq_len, /*N=*/h, /*K=*/NI, /*partition=*/0, NUM_CORES,
             /*bias_spm_addr=*/0u, ds);
     else
         rpu_launch_linear_spm_to_spm_kernel(   // acc32 = fp32-accumulate (default)
-            addr(0, scale_out), packed_down_[layer_idx], addr(0, "moe_acc"),
+            addr(0, "moe_ggate"), packed_down_[layer_idx], addr(0, "moe_acc"),
             seq_len, /*N=*/h, /*K=*/NI, /*partition=*/0, NUM_CORES);
-    if (debug_capture_gate_ && layer_idx == 0)
-        rpu_launch_spm_copy_ddr_dma(addr(0, "moe_acc"), acap_.data_ptr<c10::Half>(), seq_len * h);
 
     // ── SHARED EXPERT (identical to emit_moe_mlp) folded into moe_acc, then ONE reduce ──
     const auto& lw = layer_weights_[layer_idx];
     if (debug_routed_only_) {
-        // DIAG: layer output = pure routed contribution (zero shared + zero residual2),
-        // so l0_out is CPU-verifiable against the full routed sum with no in-place capture.
+        // DIAG: return only the routed contribution (zero shared + residual).
         rpu_launch_memset_spm_multicore(addr(0, "residual2"), seq_len * h);
     } else {
     rpu_launch_linear_spm_to_spm_acc16_kernel(
@@ -1120,8 +1037,6 @@ void LingbotV2MoeExpertModel::emit_moe_mlp_grouped(int layer_idx, int64_t seq_le
     rpu_launch_all_reduce_sum_residual_kernel(
         addr(0, "moe_acc"), addr(0, "residual2"),
         addr(0, "residual1"), seq_len, h, NUM_CORES, NUM_CORES);
-    if (debug_capture_l0_ && layer_idx == 0)
-        rpu_launch_spm_copy_ddr_dma(addr(0, "residual1"), l0_out_.data_ptr<c10::Half>(), seq_len * h);
 }
 
 // Bind per-layer packed (core-slice-interleaved) expert weights and enable the grouped
@@ -1229,40 +1144,18 @@ void LingbotV2MoeExpertModel::build_layer_subgraph(int layer_idx, const ChunkInf
         emit_layer_input_dma(layer_idx, chunk);
     }
 
-    // ── DEBUG: capture the layer input (residual1) BEFORE any layer math, all layers. ──
-    if (debug_cap_resid_) {
-        c10::Half* p = lin_stage_.data_ptr<c10::Half>() + (int64_t)layer_idx * tp_rows_ * h;
-        rpu_launch_spm_copy_ddr_dma(addr(0, "residual1"), p, seq_len * h);
-    }
-
     // ── Phase 1: input RMSNorm (+ AdaRMS FiLM shift) ──
     emit_adarms_mut_refresh_input(layer_idx);
     rpu_launch_rmsnorm_spm_kernel(
         addr(0, "residual1"), addr(0, "input_norm"),
         layer_addr(layer_idx, 0, "norm_w"),   // adarms_: scale rides here
         seq_len, h, eps_);
-    // DEBUG-ONLY: recompute the FiLM shift into a never-aliased slot BEFORE the real one.
-    // Reads input_norm (written by the rmsnorm above), so the dependency on the normalisation
-    // is explicit; writes innorm_dbg, which nothing else touches. The real shift below is
-    // untouched and still reads the same input_norm, so the computation is unchanged.
-    // Emits nothing unless RPU_L2_CAPTURE_INNORM=1.
-    const bool cap_innorm = (debug_capture_innorm_ && layer_idx == 0 && adarms_);
-    if (cap_innorm) {
-        rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
-            layer_addr(layer_idx, 0, "input_shift"),
-            addr(0, "input_norm"), addr(0, "innorm_dbg"),
-            seq_len, h, c10::Half(1.0f), ValuOpType::ADD, /*is_bopa=*/false);
-    }
     if (adarms_) {
         rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
             layer_addr(layer_idx, 0, "input_shift"),
             addr(0, "input_norm"), addr(0, "input_norm"),
             seq_len, h, c10::Half(1.0f), ValuOpType::ADD, /*is_bopa=*/false);
     }
-    if (cap_innorm)
-        rpu_launch_spm_copy_ddr_dma(addr(0, "innorm_dbg"),
-                                    innorm_.data_ptr<c10::Half>(), seq_len * h);
-
     // ── Phase 2: QKV linear (Qwen2.5 QKV bias fused via the per-layer SPM slot) ──
     rpu_launch_linear_spm_to_spm_acc16_kernel(
         addr(0, "input_norm"), lw.q_w, addr(0, "q"),
@@ -1328,12 +1221,6 @@ void LingbotV2MoeExpertModel::build_layer_subgraph(int layer_idx, const ChunkInf
     rpu_launch_all_reduce_sum_residual_kernel(
         addr(0, "oproj"), addr(0, "residual1"),
         addr(0, "residual2"), seq_len, h, tp, NUM_CORES);
-
-    // ── DEBUG: capture the post-attention residual (residual2 = layer_in + attn_out). ──
-    if (debug_cap_resid_) {
-        c10::Half* p = ar_stage_.data_ptr<c10::Half>() + (int64_t)layer_idx * tp_rows_ * h;
-        rpu_launch_spm_copy_ddr_dma(addr(0, "residual2"), p, seq_len * h);
-    }
 
     // ── Phase 6: post-attention RMSNorm (+ AdaRMS FiLM shift) ──
     emit_adarms_mut_refresh_post(layer_idx);
@@ -1655,28 +1542,6 @@ void rpu_lingbot_v2_moe_set_base_scales(
         ->set_base_scales(q_ws, k_ws, v_ws, o_ws, gate_ws, up_ws, down_ws);
 }
 
-at::Tensor v3::LingbotV2MoeExpertModel::debug_packed(int64_t which, int64_t layer) const {
-    const std::vector<at::Tensor>* v =
-        which == 0 ? &packed_gate_ : which == 1 ? &packed_up_ :
-        which == 2 ? &packed_down_ : nullptr;
-    TORCH_CHECK(v != nullptr, "debug_packed: which must be 0=gate, 1=up, 2=down, got ", which);
-    TORCH_CHECK(!v->empty(), "debug_packed: no packed weights bound (grouped path never set up)");
-    TORCH_CHECK(layer >= 0 && layer < (int64_t)v->size(),
-                "debug_packed: layer ", layer, " out of range [0,", v->size(), ")");
-    return (*v)[layer];
-}
-
-at::Tensor rpu_lingbot_v2_moe_debug_packed(int64_t handle, int64_t which, int64_t layer)
-{
-    // Default-OFF gate: without the flag this op throws, so it is unreachable from
-    // the default path and cannot perturb it.
-    const char* f = std::getenv("RPU_L2_DBG_PACKED");
-    TORCH_CHECK(f != nullptr && f[0] == '1' && f[1] == '\0',
-                "rpu_lingbot_v2_moe_debug_packed is DEBUG-ONLY: set RPU_L2_DBG_PACKED=1");
-    return LingbotV2MoeRegistry::get(handle, "rpu_lingbot_v2_moe_debug_packed")
-        ->debug_packed(which, layer);
-}
-
 // REPLAY-safe per-Euler-step AdaRMS FiLM. The 10-step denoise loop is driven from
 // Python: step 0 BUILDs the graph, steps 1..9 REPLAY it, with only the FiLM
 // scale/shift contents refreshed per step.
@@ -1748,72 +1613,6 @@ void rpu_lingbot_v2_moe_denoise_unroll_forward(
 // and lands on CausalDecoderModel::forward's trailing cos_sin_offset param
 // (rpu_qwen3_model.h:666), which sets rope_position_base_ — already honoured by
 // build_layer_subgraph's rope_base computation.
-// DEBUG-ONLY: hand back the dense-soft router's device-computed [nl,E,Tp]
-// routing weights so the bring-up can measure shape / pad / row-sum on real
-// device data. Returns the live RPU-resident tensor; the caller copies to CPU.
-at::Tensor rpu_lingbot_v2_moe_debug_rw_stage(int64_t handle)
-{
-    return LingbotV2MoeRegistry::get(handle, "rpu_lingbot_v2_moe_debug_rw_stage")
-        ->debug_rw_stage();
-}
-
-at::Tensor rpu_lingbot_v2_moe_debug_wtm_stage(int64_t handle)
-{
-    return LingbotV2MoeRegistry::get(handle, "rpu_lingbot_v2_moe_debug_wtm_stage")
-        ->debug_wtm_stage();
-}
-
-at::Tensor rpu_lingbot_v2_moe_debug_l0_out(int64_t handle)
-{
-    return LingbotV2MoeRegistry::get(handle, "rpu_lingbot_v2_moe_debug_l0_out")->debug_l0_out();
-}
-
-at::Tensor rpu_lingbot_v2_moe_debug_innorm(int64_t handle)
-{
-    return LingbotV2MoeRegistry::get(handle, "rpu_lingbot_v2_moe_debug_innorm")->debug_innorm();
-}
-
-at::Tensor rpu_lingbot_v2_moe_debug_gcap(int64_t handle)
-{
-    return LingbotV2MoeRegistry::get(handle, "rpu_lingbot_v2_moe_debug_gcap")->debug_gcap();
-}
-
-at::Tensor rpu_lingbot_v2_moe_debug_acap(int64_t handle)
-{
-    return LingbotV2MoeRegistry::get(handle, "rpu_lingbot_v2_moe_debug_acap")->debug_acap();
-}
-
-at::Tensor rpu_lingbot_v2_moe_debug_scap(int64_t handle){return LingbotV2MoeRegistry::get(handle,"s")->debug_scap();}
-at::Tensor rpu_lingbot_v2_moe_debug_ccap(int64_t handle){return LingbotV2MoeRegistry::get(handle,"c")->debug_ccap();}
-
-at::Tensor rpu_lingbot_v2_moe_debug_router_h(int64_t handle)
-{
-    at::Tensor t = LingbotV2MoeRegistry::get(handle, "rpu_lingbot_v2_moe_debug_router_h")
-        ->debug_router_h();
-    TORCH_CHECK(t.defined(),
-        "lingbot2: router-h capture is off. Set RPU_LINGBOT2_DEBUG_DUMP_ROUTER_H=1 before "
-        "building the model to populate it.");
-    return t;
-}
-
-at::Tensor rpu_lingbot_v2_moe_debug_layer_in(int64_t handle)
-{
-    at::Tensor t = LingbotV2MoeRegistry::get(handle, "rpu_lingbot_v2_moe_debug_layer_in")
-        ->debug_layer_in();
-    TORCH_CHECK(t.defined(),
-        "lingbot2: layer_in capture is off. Set RPU_L2_CAP_RESID=1 before building the model.");
-    return t;
-}
-
-at::Tensor rpu_lingbot_v2_moe_debug_attn_resid(int64_t handle)
-{
-    at::Tensor t = LingbotV2MoeRegistry::get(handle, "rpu_lingbot_v2_moe_debug_attn_resid")
-        ->debug_attn_resid();
-    TORCH_CHECK(t.defined(),
-        "lingbot2: attn_resid capture is off. Set RPU_L2_CAP_RESID=1 before building the model.");
-    return t;
-}
-
 at::Tensor rpu_lingbot_v2_moe_forward(
     int64_t handle, const at::Tensor& hidden_states,
     std::vector<at::Tensor> k_caches, std::vector<at::Tensor> v_caches,

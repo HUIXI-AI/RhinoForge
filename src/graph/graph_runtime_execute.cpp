@@ -7,6 +7,7 @@
 #include "graph/graph_runtime_internal.h"
 #include "rpu_copy_safety.h"
 #include "rpu_profile.h"        // debug-level log_at(N) gate
+#include "rpu_runtime_state.h"
 
 #include <ATen/record_function.h>
 #include <algorithm>
@@ -986,18 +987,10 @@ static bool siglip_should_isolate_patch_embed_kernel(
            label.find("_1core_") != std::string::npos;
 }
 
-// Keep replay batches comfortably below both the SDK's declared limits and a
-// smaller hardware-safe envelope. Large batches can pass host-side checks while
-// exceeding the board-safe footprint, so mirror Queue_t::build_batch's exact
-// accounting here; node count alone is insufficient because instruction and kd
-// footprints vary by kernel.
-//
-// The SDK defaults are 65536 entries / 8 MiB kd / 64 MiB instructions.  These
-// budgets intentionally retain at least 2x headroom for firmware behavior not
-// covered by build_batch's host-side checks.  If a process lowers an LKN limit,
-// use half of that configured value as well.  A single indivisible node or
-// fenced multi-stream DMA burst may exceed the soft budget; the SDK's hard
-// build_batch guard remains the final authority for those cases.
+// Mirror Queue_t::build_batch's configured capacities so Graph has no separate
+// node/entry policy. Graph still plans segments before build_batch(): the SDK
+// reports an oversized batch but does not split it, and a fenced multi-stream
+// DMA burst must remain indivisible.
 struct SegmentResourceBudget {
     size_t entries;
     size_t kd_bytes;
@@ -1006,39 +999,21 @@ struct SegmentResourceBudget {
 
 struct SegmentResourceUse {
     size_t entries = 0;
-    size_t kd_bytes = 16;  // Queue_t::build_batch final + end-marker packets.
+    // Queue_t adds final + end-marker packets and one completion sync for each
+    // active nonzero stream. Reserve all 15 possible nonzero streams so exact
+    // stream tracking is unnecessary at the hard KD boundary.
+    size_t kd_bytes = 16 + 15 * sizeof(uint64_t);
     size_t instr_bytes = 0;
 };
 
-static size_t segment_env_limit(const char* name,
-                                size_t default_value,
-                                size_t max_value,
-                                bool megabytes) {
-    const char* text = std::getenv(name);
-    if (text == nullptr || *text == '\0') return default_value;
-    char* end = nullptr;
-    const unsigned long parsed = std::strtoul(text, &end, 10);
-    if (end == text || parsed == 0) return default_value;
-    if (!megabytes) {
-        return std::min(static_cast<size_t>(parsed), max_value);
-    }
-    const size_t max_mb = max_value >> 20;
-    return std::min(static_cast<size_t>(parsed), max_mb) << 20;
-}
-
 static SegmentResourceBudget segment_resource_budget() {
     constexpr size_t kMiB = 1u << 20;
-    const size_t sdk_entries = segment_env_limit(
-        "LKN_MAX_BATCH_ENTRIES", 65536, 1u << 22, false);
-    const size_t sdk_kd = segment_env_limit(
-        "LKN_KD_BUF_MB", 8 * kMiB, 256 * kMiB, true);
-    const size_t sdk_instr = segment_env_limit(
-        "LKN_INSTR_BUF_MB", 64 * kMiB, 1024 * kMiB, true);
-    return {
-        std::max<size_t>(1, std::min<size_t>(8192, sdk_entries / 2)),
-        std::max<size_t>(16, std::min<size_t>(4 * kMiB, sdk_kd / 2)),
-        std::max<size_t>(4096, std::min<size_t>(32 * kMiB, sdk_instr / 2)),
-    };
+    const LknBatchConfig& config = rpu_lkn_batch_config_at_load();
+    const size_t sdk_entries = static_cast<size_t>(config.max_entries);
+    const size_t sdk_kd = static_cast<size_t>(config.kd_buf_mb) * kMiB;
+    const size_t sdk_instr =
+        static_cast<size_t>(config.instr_buf_mb) * kMiB;
+    return SegmentResourceBudget{sdk_entries, sdk_kd, sdk_instr};
 }
 
 static SegmentResourceUse segment_node_resources(
@@ -1111,8 +1086,8 @@ void RpuKernelGraph::build_segments_from_nodes() {
     //   1. queue_state 变化 (BARRIER_NEXT / instr-pause 等差异)
     //   2. data 节点 (Memcpy / Memset / ChildGraph / Branch /
     //      HostCallback / Tier3Oneshot 切段;Dma / Barrier 不切)
-    //   3. SDK footprint 达到共享安全预算 — 在跨 stream DMA fence 完整闭合的
-    //      边界贪心切段，避免大图虽 build_batch rc=0 却在硬件静默错算。
+    //   3. SDK footprint 达到 runtime capacity — 在跨 stream DMA fence 完整
+    //      闭合的边界贪心切段。
     constexpr size_t kNoOpenSeg = std::numeric_limits<size_t>::max();
     const SegmentResourceBudget resource_budget =
         segment_resource_budget();
@@ -1132,18 +1107,31 @@ void RpuKernelGraph::build_segments_from_nodes() {
         pending_streams.clear();
     };
 
-    auto mark_pending_stream = [&](uint8_t stream) {
-        if (stream == 0) return;
-        if (std::find(pending_streams.begin(), pending_streams.end(), stream) ==
-            pending_streams.end()) {
-            pending_streams.push_back(stream);
+    auto update_pending_streams = [&](const GraphNode& node,
+                                      std::vector<uint8_t>& streams) {
+        auto add_stream = [&](uint8_t stream) {
+            if (stream != 0 &&
+                std::find(streams.begin(), streams.end(), stream) ==
+                    streams.end()) {
+                streams.push_back(stream);
+            }
+        };
+        auto remove_stream = [&](uint8_t stream) {
+            streams.erase(std::remove(streams.begin(), streams.end(), stream),
+                          streams.end());
+        };
+        if (node.kind == GraphNodeKind::Dma) {
+            add_stream(static_cast<uint8_t>(node.as_dma().channel * 2));
+        } else if (node.kind == GraphNodeKind::Barrier) {
+            const auto& barrier = node.as_barrier_node();
+            if (barrier.target_stream == 0) {
+                add_stream(barrier.self_stream);
+            } else if (std::find(streams.begin(), streams.end(),
+                                 barrier.target_stream) != streams.end()) {
+                remove_stream(barrier.target_stream);
+                add_stream(barrier.self_stream);
+            }
         }
-    };
-
-    auto mark_joined_stream = [&](uint8_t stream) {
-        pending_streams.erase(
-            std::remove(pending_streams.begin(), pending_streams.end(), stream),
-            pending_streams.end());
     };
 
     auto account_node = [&](const GraphNode& node,
@@ -1151,16 +1139,7 @@ void RpuKernelGraph::build_segments_from_nodes() {
         seg_resources.entries += use.entries;
         seg_resources.kd_bytes += use.kd_bytes;
         seg_resources.instr_bytes += use.instr_bytes;
-        if (node.kind == GraphNodeKind::Dma) {
-            mark_pending_stream(static_cast<uint8_t>(node.as_dma().channel * 2));
-        } else if (node.kind == GraphNodeKind::Barrier) {
-            const auto& barrier = node.as_barrier_node();
-            if (barrier.self_stream == 0) {
-                mark_joined_stream(barrier.target_stream);
-            } else if (barrier.target_stream == 0) {
-                mark_pending_stream(barrier.self_stream);
-            }
-        }
+        update_pending_streams(node, pending_streams);
     };
 
     auto close_segment = [&](size_t end_exclusive) {
@@ -1185,28 +1164,60 @@ void RpuKernelGraph::build_segments_from_nodes() {
         resource_reset();
     };
 
+    auto fenced_group_resources = [&](size_t begin) {
+        SegmentResourceUse group{0, 0, 0};
+        std::vector<uint8_t> group_pending_streams;
+        bool fence_opened = false;
+        for (size_t j = begin; j < nodes_.size(); ++j) {
+            const auto kind = nodes_[j].kind;
+            if (kind != GraphNodeKind::Kernel &&
+                kind != GraphNodeKind::Dma &&
+                kind != GraphNodeKind::Barrier) {
+                return group;
+            }
+            const SegmentResourceUse use =
+                segment_node_resources(nodes_[j], kernels_);
+            group.entries += use.entries;
+            group.kd_bytes += use.kd_bytes;
+            group.instr_bytes += use.instr_bytes;
+            update_pending_streams(nodes_[j], group_pending_streams);
+            fence_opened = fence_opened || !group_pending_streams.empty();
+            if (!fence_opened || group_pending_streams.empty()) return group;
+        }
+        return group;
+    };
+
+    auto admit_batch_group = [&](size_t begin) {
+        if (!pending_streams.empty()) return;
+        const SegmentResourceUse group = fenced_group_resources(begin);
+        TORCH_CHECK(
+            !segment_would_exceed(SegmentResourceUse{}, group,
+                                  resource_budget),
+            "build_segments_from_nodes: one indivisible batch group exceeds "
+            "runtime entries/KD/instruction capacity at node ", begin);
+        if (seg_start != kNoOpenSeg &&
+            segment_would_exceed(seg_resources, group, resource_budget)) {
+            close_segment(begin);
+        }
+    };
+
     for (size_t i = 0; i < nodes_.size(); ++i) {
         switch (nodes_[i].kind) {
         case GraphNodeKind::Kernel: {
             auto& kn = nodes_[i].as_kernel();
             const uint8_t kn_num = static_cast<uint8_t>(kn.core_ids.size());
+            const SegmentResourceUse node_resources =
+                segment_node_resources(nodes_[i], kernels_);
+            admit_batch_group(i);
             if (siglip_should_isolate_patch_embed_kernel(graph_label, kn)) {
                 close_segment(i);
                 seg_start = i;
                 seg_max_num_cores = kn_num;
                 seg_isolated_core_ids = kn.core_ids;
                 seg_queue_state = kn.queue_state;
-                account_node(nodes_[i], segment_node_resources(nodes_[i], kernels_));
+                account_node(nodes_[i], node_resources);
                 close_segment(i + 1);
                 break;
-            }
-
-            const SegmentResourceUse node_resources =
-                segment_node_resources(nodes_[i], kernels_);
-            if (seg_start != kNoOpenSeg && pending_streams.empty() &&
-                segment_would_exceed(seg_resources, node_resources,
-                                     resource_budget)) {
-                close_segment(i);
             }
 
             if (seg_start == kNoOpenSeg) {
@@ -1229,11 +1240,7 @@ void RpuKernelGraph::build_segments_from_nodes() {
         case GraphNodeKind::Barrier: {
             const SegmentResourceUse node_resources =
                 segment_node_resources(nodes_[i], kernels_);
-            if (seg_start != kNoOpenSeg && pending_streams.empty() &&
-                segment_would_exceed(seg_resources, node_resources,
-                                     resource_budget)) {
-                close_segment(i);
-            }
+            admit_batch_group(i);
             // 顶替原 BATCH_CTX.add_dma / add_barrier 顺序进 batch 的语义。
             // 不约束 segment.queue_state;若 segment 还没开始,用 8 核作为
             // Queue_t 构造尺寸 hint (matches v5 BATCH_CTX 典型 core_ids.size()==8)。
@@ -1261,28 +1268,93 @@ void RpuKernelGraph::build_segments_from_nodes() {
 // segment queue preparation / launch
 // =============================================================================
 
-void RpuKernelGraph::release_prepared_queues() {
-    // Queue_t 是 per-cache-entry (private_queue_)，依靠 RpuKernelGraph
-    // 析构(RpuGraphCache::evict / clear)自动释放;Python ABI hook 仍是 no-op
-    // (callers 不需要主动释放;若需要诊断可显式 reset)。
-}
+namespace {
 
-::rhino_lkn::Queue_t* RpuKernelGraph::ensure_private_queue(size_t num_cores) {
-    const uint8_t want = static_cast<uint8_t>(num_cores);
-    if (!private_queue_ || private_queue_core_num_ != want) {
-        // 不同 segment 最大 core 域时丢掉旧 queue 重建(RAII)。段内混核不走
-        // 本分支：queue 按最大域构造，每个 kernel 的 core_ids 在
-        // prepare_segment_queue 中独立传给 SDK。跨段重建只丢失 kd_buf reuse
-        // 收益，不影响正确性。
-        private_queue_ = std::make_unique<::rhino_lkn::Queue_t>(num_cores);
-        private_queue_core_num_ = want;
-        // 新 Queue 没有任何已 build 的 kd_buf，fingerprint 失效。
-        private_queue_built_segment_idx_ = -1;
+// Queue_t allocates its batch arena lazily at build_batch(). Keep the
+// incremental retained-batch cost bounded across every GraphCache in the
+// process; slot 0 is the pre-existing per-entry fallback and is not counted.
+constexpr size_t kExtraPreparedQueueBudget = 8;
+std::atomic<size_t> g_extra_prepared_queues{0};
+
+bool try_acquire_extra_prepared_queue() {
+    size_t used = g_extra_prepared_queues.load(std::memory_order_relaxed);
+    while (used < kExtraPreparedQueueBudget) {
+        if (g_extra_prepared_queues.compare_exchange_weak(
+                used, used + 1, std::memory_order_acq_rel,
+                std::memory_order_relaxed)) {
+            return true;
+        }
     }
-    return private_queue_.get();
+    return false;
 }
 
-void RpuKernelGraph::prepare_segment_queue(
+void release_extra_prepared_queue() noexcept {
+    size_t used = g_extra_prepared_queues.load(std::memory_order_relaxed);
+    while (used != 0 && !g_extra_prepared_queues.compare_exchange_weak(
+               used, used - 1, std::memory_order_acq_rel,
+               std::memory_order_relaxed)) {}
+}
+
+}  // namespace
+
+void RpuKernelGraph::release_prepared_queues() noexcept {
+    for (auto& slot : private_queue_slots_) {
+        slot.queue.reset();
+        slot.core_num = 0;
+        slot.built_segment_idx = -1;
+        slot.fixed_dmas.clear();
+        slot.promotion_denied = false;
+        if (slot.consumes_extra_budget) {
+            slot.consumes_extra_budget = false;
+            release_extra_prepared_queue();
+        }
+    }
+}
+
+size_t RpuKernelGraph::prepared_queue_slot_index(
+        size_t segment_idx,
+        bool retain) {
+    TORCH_CHECK(segment_idx < segments_.size(),
+                "prepared queue segment index out of range: ", segment_idx,
+                " >= ", segments_.size());
+    if (!retain || segment_idx == 0 ||
+        segment_idx >= private_queue_slots_.size()) {
+        return 0;
+    }
+    auto& slot = private_queue_slots_[segment_idx];
+    if (slot.promotion_denied) return 0;
+    if (!slot.consumes_extra_budget) {
+        if (!try_acquire_extra_prepared_queue()) {
+            slot.promotion_denied = true;
+            return 0;
+        }
+        slot.consumes_extra_budget = true;
+    }
+    return segment_idx;
+}
+
+::rhino_lkn::Queue_t* RpuKernelGraph::ensure_private_queue(
+        size_t queue_slot_idx,
+        size_t num_cores) {
+    TORCH_CHECK(queue_slot_idx < private_queue_slots_.size(),
+                "prepared queue slot index out of range: ", queue_slot_idx,
+                " >= ", private_queue_slots_.size());
+    auto& slot = private_queue_slots_[queue_slot_idx];
+    const uint8_t want = static_cast<uint8_t>(num_cores);
+    if (!slot.queue || slot.core_num != want) {
+        // 最大 core 域变化时丢掉旧 queue 重建(RAII)。段内混核不走
+        // 本分支：queue 按最大域构造，每个 kernel 的 core_ids 在
+        // prepare_segment_queue 中独立传给 SDK。重建只丢失 kd_buf reuse
+        // 收益，不影响正确性。
+        slot.queue = std::make_unique<::rhino_lkn::Queue_t>(num_cores);
+        slot.core_num = want;
+        slot.built_segment_idx = -1;
+        slot.fixed_dmas.clear();
+    }
+    return slot.queue.get();
+}
+
+uint32_t RpuKernelGraph::prepare_segment_queue(
         Segment& seg,
         ::rhino_lkn::Queue_t& wq) {
     // Queue preparation contract:
@@ -1294,6 +1366,7 @@ void RpuKernelGraph::prepare_segment_queue(
     // BUILD 结尾的 build_batch() 把 kd_buf 落定;后续若调 sync_mutable_params +
     // enqueu_batch 即等价于 BATCH_CTX 时代的 prepare-once-launch-many 快路径。
     seg.mutable_dmas.clear();
+    seg.fixed_dmas.clear();
     uint32_t next_mutable_dma_id = 0;
     wq.set_broadcast_mode(seg.queue_state.broadcast_mode);
     wq.set_flush_icache(seg.queue_state.flush_icache);
@@ -1334,7 +1407,6 @@ void RpuKernelGraph::prepare_segment_queue(
                     Segment::PreparedMutableDmaSlot::Kind::MutableSrc,
                     /*live_base*/  dma.live_base,
                     /*live_offset*/dma.live_offset,
-                    /*fixed_endpoint*/ dma.dst_endpoint,
                     /*bytes*/      dma.bytes,
                     /*channel*/    dma.channel,
                 });
@@ -1358,7 +1430,6 @@ void RpuKernelGraph::prepare_segment_queue(
                     Segment::PreparedMutableDmaSlot::Kind::MutableDst,
                     /*live_base*/  dma.live_base,
                     /*live_offset*/dma.live_offset,
-                    /*fixed_endpoint*/ dma.src_endpoint,
                     /*bytes*/      dma.bytes,
                     /*channel*/    dma.channel,
                 });
@@ -1372,6 +1443,8 @@ void RpuKernelGraph::prepare_segment_queue(
                 rpu_add_dma_checked(wq, dma.src_endpoint, dma.dst_endpoint,
                                     dma.bytes, dma.channel,
                                     "prepare_segment_queue/Fixed");
+                seg.fixed_dmas.push_back(Segment::PreparedFixedDmaSlot{
+                    i, dma.src_addr, dma.dst_addr});
             }
             break;
         }
@@ -1387,14 +1460,9 @@ void RpuKernelGraph::prepare_segment_queue(
                         i, " (only Kernel / Dma / Barrier allowed)");
         }
     }
-    // build_batch reports resource or empty-batch failures through its return
-    // code. Reject a partial batch here instead of allowing silent corruption.
-    const uint32_t build_rc = wq.build_batch();
-    TORCH_CHECK(build_rc == 0,
-                "prepare_segment_queue: build_batch SDK rc=", build_rc,
-                " (!=0 = no kernels / batch entries > kMaxBatchKernels [default "
-                "65536] / kd_buf|instr_buf overflow); segment nodes=",
-                (seg.end_idx - seg.start_idx));
+    // Let the caller decide whether an optional retained queue may fall back
+    // to slot 0; recording and one-shot callers still reject every failure.
+    return wq.build_batch();
 }
 
 void RpuKernelGraph::launch_segment_for_replay(Segment& seg) {
@@ -1405,17 +1473,41 @@ void RpuKernelGraph::launch_segment_for_replay(Segment& seg) {
     // 不重新分配,seg 始终是 segments_[idx]。
     const ssize_t seg_idx = static_cast<ssize_t>(&seg - segments_.data());
 
-    // Sync-only fast path:本 segment 的 kd_buf 仍在 private_queue_ 里
+    const auto fixed_dmas_match = [&](const auto& bindings) {
+        if (bindings.size() != seg.fixed_dmas.size()) return false;
+        for (const auto& binding : bindings) {
+            TORCH_CHECK(binding.node_idx < nodes_.size() &&
+                            nodes_[binding.node_idx].kind == GraphNodeKind::Dma,
+                        "launch_segment_for_replay: fixed DMA sidecar is stale "
+                        "at node ", binding.node_idx);
+            const auto& dma = nodes_[binding.node_idx].as_dma();
+            if (dma.src_addr != binding.src_addr ||
+                dma.dst_addr != binding.dst_addr) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const size_t segment_idx = static_cast<size_t>(seg_idx);
+    const bool already_retained = segment_idx != 0 &&
+        segment_idx < private_queue_slots_.size() &&
+        private_queue_slots_[segment_idx].consumes_extra_budget;
+    size_t slot_idx = prepared_queue_slot_index(
+        segment_idx, fixed_dmas_match(seg.fixed_dmas) || already_retained);
+    PreparedQueueSlot* slot = &private_queue_slots_[slot_idx];
+
+    // Sync-only fast path:本 segment 的 kd_buf 仍在对应 queue slot 里
     // (前一次 build_batch 之后没有其他 segment 覆写过) → 跳过 prepare_segment_queue
     // 的 add_kernel_mutable + add_dma_kernel_mutable + build_batch 整段重建,只
     // 走 update_dma_kernel (~50 ns/个) + sync_mutable_params + enqueu_batch。
-    // 单段 graph 在两次 forward 间一定命中此路径 (kd_buf 没人覆写);多段 graph
-    // 命中率 = 当前 idx 命中,典型 0% (rotating 覆写)。
-    if (private_queue_ &&
-        private_queue_built_segment_idx_ == seg_idx &&
-        private_queue_core_num_ == static_cast<uint8_t>(seg.core_ids.size())) {
+    // 多段 graph 的首次 replay 会在有界预算内逐段 prepare；后续
+    // replay 稳定命中。预算耗尽的段回落 slot 0 并保持旧行为。
+    if (fixed_dmas_match(slot->fixed_dmas) && slot->queue &&
+        slot->built_segment_idx == seg_idx &&
+        slot->core_num == static_cast<uint8_t>(seg.core_ids.size())) {
         RECORD_FUNCTION("rpu_graph::segment_launch_sync_only", {});
-        const uint32_t rc = launch_segment_sync_only(seg);
+        const uint32_t rc = launch_segment_sync_only(seg, *slot->queue);
+        if (rc != 0) slot->built_segment_idx = -1;
         TORCH_CHECK(rc == 0,
                     "launch_segment_sync_only: SDK rc=", rc,
                     " on segment idx=", seg_idx,
@@ -1425,22 +1517,67 @@ void RpuKernelGraph::launch_segment_for_replay(Segment& seg) {
         return;
     }
 
-    // Fallback: full rebuild on private_queue_。覆写前先把 idx
+    // Fallback: full rebuild on mapped queue slot。覆写前先把 idx
     // 失效,防止异常路径 (build_batch 抛错) 留下半 build 状态被下次误判命中。
-    ::rhino_lkn::Queue_t* wq = ensure_private_queue(seg.core_ids.size());
-    private_queue_built_segment_idx_ = -1;
-    prepare_segment_queue(seg, *wq);
+    ::rhino_lkn::Queue_t* wq = nullptr;
+    uint32_t build_rc = 0;
+    try {
+        wq = ensure_private_queue(slot_idx, seg.core_ids.size());
+        slot->built_segment_idx = -1;
+        build_rc = prepare_segment_queue(seg, *wq);
+        if (build_rc == 0) slot->fixed_dmas = seg.fixed_dmas;
+    } catch (...) {
+        if (slot_idx != 0) {
+            slot->queue.reset();
+            slot->core_num = 0;
+            slot->built_segment_idx = -1;
+            slot->fixed_dmas.clear();
+            slot->promotion_denied = true;
+            if (slot->consumes_extra_budget) {
+                slot->consumes_extra_budget = false;
+                release_extra_prepared_queue();
+            }
+        }
+        throw;
+    }
+    if (build_rc != 0 && slot_idx != 0) {
+        // A retained arena is an optimization only. If the SDK cannot allocate
+        // or build it, release the process token and keep this segment on the
+        // pre-existing slot-0 path for the rest of the graph lifetime.
+        slot->queue.reset();
+        slot->core_num = 0;
+        slot->built_segment_idx = -1;
+        slot->fixed_dmas.clear();
+        slot->promotion_denied = true;
+        if (slot->consumes_extra_budget) {
+            slot->consumes_extra_budget = false;
+            release_extra_prepared_queue();
+        }
+        slot_idx = 0;
+        slot = &private_queue_slots_[0];
+        wq = ensure_private_queue(slot_idx, seg.core_ids.size());
+        slot->built_segment_idx = -1;
+        build_rc = prepare_segment_queue(seg, *wq);
+        if (build_rc == 0) slot->fixed_dmas = seg.fixed_dmas;
+    }
+    TORCH_CHECK(build_rc == 0,
+                "prepare_segment_queue: build_batch SDK rc=", build_rc,
+                " (!=0 = no kernels / batch entries > kMaxBatchKernels [default "
+                "65536] / kd_buf|instr_buf overflow); segment idx=", seg_idx,
+                " nodes=", (seg.end_idx - seg.start_idx));
     const uint32_t rc_fallback = wq->enqueu_batch(/*wait_finish=*/true);
     TORCH_CHECK(rc_fallback == 0,
                 "launch_segment_for_replay(fallback): enqueu_batch SDK rc=",
                 rc_fallback, " on segment idx=", seg_idx);
     ++last_stats_.hw_batch_submit_total;
-    private_queue_built_segment_idx_ = seg_idx;
+    slot->built_segment_idx = seg_idx;
     ++last_stats_.prepared_segment_miss_total;
 }
 
-uint32_t RpuKernelGraph::launch_segment_sync_only(Segment& seg) {
-    // 前提:caller (launch_segment_for_replay) 已确认 private_queue_ 的 kd_buf
+uint32_t RpuKernelGraph::launch_segment_sync_only(
+        Segment& seg,
+        ::rhino_lkn::Queue_t& wq) {
+    // 前提:caller 已确认 wq 的 kd_buf
     // 是本段刚 build 的状态;mutable_dmas 与 SDK 内部 dma_id 计数一致。
     //
     // 顺序:先 update_dma_kernel 把每个 mutable DMA 的 live src/dst 重写到本轮
@@ -1450,14 +1587,10 @@ uint32_t RpuKernelGraph::launch_segment_sync_only(Segment& seg) {
     // size=0 是 SDK address-only 快速路径 (4 packet writes / DMA,~50 ns 量级);
     // 比走完整 add_dma_kernel_mutable + build_batch 链快 1-2 个数量级。
     //
-    // ⚠️ Fixed DMA 陷阱:本路径只 update mutable DMA 的 kd_buf src/dst,fixed
-    // DMA 的 kd_buf 在 BUILD 之后冻结。如果 subclass 用 `rpu_launch_ddr_broadcast_spm_dma`
-    // / `rpu_launch_spm_copy_ddr_dma`(fixed variant)且 src/dst 是 per-forward
-    // 漂移的 tensor(典型:caller-supplied input、`at::empty(...)` 每次新分配,
-    // 不走 framework `ShapeKey registry` / `output_tensor_` 通道),merge 路径
-    // 走 sync-only fast-path 时会读/写 BUILD 时的 stale DDR 地址 — 表现为
-    // baseline 多段切分 PASS,合 segment 后 MSE 飙升。改用 `*_mutable` variant
-    // 并维护稳定的 mutable base 地址即可。
+    // Fixed DMA cannot be patched after build. The caller exact-compares every
+    // fixed src/dst binding before entering this path; any drift takes the full
+    // prepare path and refreshes the sidecar. Mutable DMA resolves both current
+    // endpoints below, including legacy live_base/fixed-side replacement.
     for (const auto& slot : seg.mutable_dmas) {
         TORCH_CHECK(
             slot.node_idx < nodes_.size() &&
@@ -1471,19 +1604,26 @@ uint32_t RpuKernelGraph::launch_segment_sync_only(Segment& seg) {
                  dma.live_offset == slot.live_offset),
             "launch_segment_sync_only: mutable DMA slot drift at node ",
             slot.node_idx);
-        const uint64_t live = (*slot.live_base) +
-                              static_cast<uint64_t>(slot.live_offset);
+        TORCH_CHECK(dma.live_base != nullptr,
+                    "launch_segment_sync_only: mutable DMA missing live_base "
+                    "at node ", slot.node_idx);
+        const uint64_t live = (*dma.live_base) +
+                              static_cast<uint64_t>(dma.live_offset);
         const auto live_endpoint = rpu_resolve_device_dma_endpoint(
             live, slot.bytes, "launch_segment_sync_only/live");
         RpuDmaEndpoint src, dst;
         if (slot.kind == Segment::PreparedMutableDmaSlot::Kind::MutableSrc) {
             src = live_endpoint;
-            dst = slot.fixed_endpoint;
+            dst = rpu_resolve_device_dma_endpoint(
+                dma.dst_addr, slot.bytes,
+                "launch_segment_sync_only/MutableSrc/dst");
         } else {
-            src = slot.fixed_endpoint;
+            src = rpu_resolve_device_dma_endpoint(
+                dma.src_addr, slot.bytes,
+                "launch_segment_sync_only/MutableDst/src");
             dst = live_endpoint;
         }
-        const uint32_t rc = private_queue_->update_dma_kernel(
+        const uint32_t rc = wq.update_dma_kernel(
             slot.dma_id, *src.owner, src.offset, *dst.owner, dst.offset,
             /*size=*/0);
         if (rc != 0) {
@@ -1497,10 +1637,10 @@ uint32_t RpuKernelGraph::launch_segment_sync_only(Segment& seg) {
     // directly via update_dma_kernel (independent of sync_mutable_params). Gated
     // on RPU_FASTREPLAY_SKIP_SYNC.
     if (!(fast_replay_skip_sync_ && op_stream_fully_skipped_)) {
-        const uint32_t rc_sync = private_queue_->sync_mutable_params();
+        const uint32_t rc_sync = wq.sync_mutable_params();
         if (rc_sync != 0) return rc_sync;
     }
-    return private_queue_->enqueu_batch(/*wait_finish=*/true);
+    return wq.enqueu_batch(/*wait_finish=*/true);
 }
 
 static void mirror_per_segment_replay_count(
@@ -1639,54 +1779,6 @@ void RpuKernelGraph::execute_data_node(const GraphNode& node) {
                     "should not reach REPLAYING executor (scope must have been "
                     "marked non-replayable). op=",
                     hc.op_handle->operator_name().name);
-        // HostCallback checksum diagnostics are disabled by default and enabled
-        // with RPU_GRAPH_HCB_CHECKSUM=1. For _to_copy nodes they report the live
-        // input, fresh output and stable post-copy checksums to diagnose stale
-        // refresh or stale-tensor failures.
-        static const bool hcb_checksum = []() {
-            const char* e = std::getenv("RPU_GRAPH_HCB_CHECKSUM");
-            return e && *e && *e != '0';
-        }();
-        const std::string hcb_op_name = hc.op_handle->operator_name().name;
-        const bool hcb_log = hcb_checksum && hcb_op_name == "aten::_to_copy";
-        auto hcb_checksum_str = [](const at::Tensor& t) -> std::string {
-            if (!t.defined()) return "<undef>";
-            std::ostringstream o;
-            o << "shape=" << t.sizes() << " dtype=" << t.dtype();
-            try {
-                at::Tensor cpu = t.is_cpu() ? t : t.cpu();
-                auto stype = cpu.scalar_type();
-                if (stype == c10::kHalf || stype == c10::kFloat ||
-                    stype == c10::kDouble) {
-                    o << " sum=" << cpu.to(at::kDouble).sum().item<double>();
-                } else if (stype == c10::kLong) {
-                    o << " sum=" << cpu.sum().item<int64_t>();
-                } else if (stype == c10::kInt) {
-                    o << " sum=" << cpu.sum().item<int32_t>();
-                } else if (stype == c10::kBool) {
-                    o << " any=" << cpu.any().item<bool>();
-                }
-                if (cpu.numel() > 0 && cpu.numel() <= 4) {
-                    o << " val=" << cpu;
-                }
-            } catch (const std::exception& e) {
-                o << " sum=<err:" << e.what() << ">";
-            }
-            return o.str();
-        };
-        const char* hcb_state = state_ == State::RECORDING ? "REC"
-                              : state_ == State::REPLAYING ? "REP"
-                              : "OS"; /* oneshot */
-        if (hcb_log) {
-            std::cerr << "[HCB-CK] " << hcb_op_name << " state=" << hcb_state
-                      << " node=" << (&node - nodes_.data())
-                      << " stage=in:";
-            for (size_t k = 0; k < hc.live_tensor_args.size(); ++k) {
-                std::cerr << "\n  live[" << k << "]: "
-                          << hcb_checksum_str(hc.live_tensor_args[k]);
-            }
-            std::cerr << "\n";
-        }
         // (1) pre-flush: 让 host 看到 RPU 之前写入的 DDR
         flush_boundary_ptrs();
         // (2) 重建 stack: live_tensor_args 提供本轮 tensor,args_template
@@ -1743,24 +1835,12 @@ void RpuKernelGraph::execute_data_node(const GraphNode& node) {
                             "HostCallback executor: output_pool[", r,
                             "] not defined (RECORDING 期 adopt_returns 应已分配); op=",
                             hc.op_handle->operator_name().name);
-                if (hcb_log) {
-                    std::cerr << "[HCB-CK] " << hcb_op_name << " state="
-                              << hcb_state << " stage=fresh_out["
-                              << r << "]: " << hcb_checksum_str(fresh_out)
-                              << "\n";
-                }
                 // copy CPU/RPU fresh tensor → stable RPU buffer
                 stable.copy_(fresh_out);
                 // 替换 stack slot,下游(若有)直接读 stable
                 ret = stable;
                 // 登记 post-CPU boundary flush:host 写入对后续 RPU 可见
                 record_boundary_flush(stable.data_ptr());
-                if (hcb_log) {
-                    std::cerr << "[HCB-CK] " << hcb_op_name << " state="
-                              << hcb_state << " stage=stable_post_copy["
-                              << r << "]: " << hcb_checksum_str(stable)
-                              << "\n";
-                }
                 // sanity check:stable 地址应当与 RECORDING 期录的一致
                 if (r < hc.output_pool_dev_addrs.size()) {
                     uint64_t dev = rhino_lkn::RpuGetDevAddr(stable.data_ptr());
@@ -1775,10 +1855,6 @@ void RpuKernelGraph::execute_data_node(const GraphNode& node) {
         }
         // (5) post-flush: host 写入对后续 RPU kernel 可见
         flush_boundary_ptrs();
-        if (hcb_log) {
-            std::cerr << "[HCB-CK] " << hcb_op_name << " state=" << hcb_state
-                      << " stage=post_flush_done\n";
-        }
         // 注:不清 live_tensor_args —— REPLAYING 期 op stream 重 dispatch
         // 时 capture_host_callback_replay_args 会覆写;RECORDING-collapse
         // 路径(execute_graph_for_recording / oneshot)是一次性消费,清不清
@@ -2111,14 +2187,8 @@ void RpuKernelGraph::execute_graph_for_recording() {
         std::cerr << "[GRAPH-INSTR] BUILD " << gid << " build#" << build_seq
                   << " mix=[" << kernel_histogram_string(nodes_) << "]\n";
     }
-    // Queue_t 为 per-cache-entry 私有 (ensure_private_queue):多段时
-    // 同一 Queue 串行 build_batch 覆写 kd_buf (与之前 QueueCache 共享情形等
-    // 价的串行执行,但不被 immediate ops 旁路作废)。BufferPool 压力由
-    // RpuGraphCache.max_entries 上限 + RAII 析构控制。
-    // 每段 build_batch 后更新 private_queue_built_segment_idx_ 指向本段,
-    // 让首次 REPLAY 命中 sync-only fast path。多段 graph 因 kd_buf 只能容纳
-    // 最后一段,后续段在 REPLAY 时会触发 fallback rebuild;narrow scope 单段
-    // graph (qwen3 / llama) 始终命中。
+    // Cold BUILD 始终只保留一个 Queue_t。multi-segment graph 只在实际
+    // REPLAY 后才按进程级预算懒分配 extra queues。
     size_t next_node = 0;
     size_t seg_idx_for_instr = 0;
     size_t fresh_alloc_count = 0;
@@ -2126,10 +2196,13 @@ void RpuKernelGraph::execute_graph_for_recording() {
         for (size_t i = next_node; i < seg.start_idx; ++i) {
             execute_data_node(nodes_[i]);
         }
-        const bool was_present =
-            static_cast<bool>(private_queue_) &&
-            private_queue_core_num_ == static_cast<uint8_t>(seg.core_ids.size());
-        ::rhino_lkn::Queue_t* wq = ensure_private_queue(seg.core_ids.size());
+        const size_t slot_idx = prepared_queue_slot_index(
+            seg_idx_for_instr, /*retain=*/false);
+        auto& slot = private_queue_slots_[slot_idx];
+        const bool was_present = slot.queue &&
+            slot.core_num == static_cast<uint8_t>(seg.core_ids.size());
+        ::rhino_lkn::Queue_t* wq = ensure_private_queue(
+            slot_idx, seg.core_ids.size());
         const bool fresh = !was_present;
         if (fresh) ++fresh_alloc_count;
         // [GRAPH-INSTR] per-segment summary (FRESH = first allocation of this
@@ -2143,20 +2216,23 @@ void RpuKernelGraph::execute_graph_for_recording() {
         }
 
         // Invalidate fingerprint 前先 reset，避免 build_batch 抛错留下半状态。
-        private_queue_built_segment_idx_ = -1;
-        prepare_segment_queue(seg, *wq);
+        slot.built_segment_idx = -1;
+        const uint32_t build_rc = prepare_segment_queue(seg, *wq);
+        TORCH_CHECK(build_rc == 0,
+                    "prepare_segment_queue: build_batch SDK rc=", build_rc,
+                    " during RECORDING on segment idx=", seg_idx_for_instr,
+                    " nodes=", (seg.end_idx - seg.start_idx));
+        slot.fixed_dmas = seg.fixed_dmas;
         // 首次 launch 紧跟 build_batch,kd_buf 里的 regs 是刚 build 时的当前值,
         // 不需要 sync_mutable_params。enqueu_batch(wait_finish=true) SYNC 返回
-        // 后,本 entry 的 private_queue 处于 idle 态,可被下一 segment 复用
-        // (build_batch 会清掉之前的 kd_buf state)。
+        // 后,对应 queue slot 处于 idle 态。
         const uint32_t rc_build = wq->enqueu_batch(/*wait_finish=*/true);
         TORCH_CHECK(rc_build == 0,
                     "execute_graph_for_recording: enqueu_batch SDK rc=", rc_build,
                     " on segment idx=", seg_idx_for_instr);
         ++last_stats_.hw_batch_submit_total;
-        // 标记本段为 private_queue_ 当前 build 的内容，供下次 REPLAY
-        // 比对 (单段 graph 一定命中;多段 graph 只有 last seg 命中)。
-        private_queue_built_segment_idx_ = static_cast<ssize_t>(seg_idx_for_instr);
+        // 标记本 queue slot 当前 build 的 segment，供下次 REPLAY 比对。
+        slot.built_segment_idx = static_cast<ssize_t>(seg_idx_for_instr);
 
         ++seg_idx_for_instr;
         next_node = seg.end_idx;
@@ -2298,7 +2374,11 @@ void RpuKernelGraph::execute_graph_oneshot() {
         // add_kernel_mutable 没有副作用(kd_buf 一次性执行后丢弃)。
         // prepare_segment_queue 接收 Segment& 以填充 seg.mutable_dmas；
         // oneshot 路径填的 slot 在下面 segments_.clear() 时就丢了,无副作用。
-        prepare_segment_queue(seg, *wq);
+        const uint32_t build_rc = prepare_segment_queue(seg, *wq);
+        TORCH_CHECK(build_rc == 0,
+                    "prepare_segment_queue: build_batch SDK rc=", build_rc,
+                    " during one-shot on segment idx=", seg_idx_oneshot,
+                    " nodes=", (seg.end_idx - seg.start_idx));
         const uint32_t rc_oneshot = wq->enqueu_batch(/*wait_finish=*/true);
         TORCH_CHECK(rc_oneshot == 0,
                     "execute_graph_oneshot: enqueu_batch SDK rc=", rc_oneshot,

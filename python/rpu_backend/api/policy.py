@@ -45,6 +45,27 @@ def _validate_num_steps(num_steps: int | None, *, entry_point: str) -> int | Non
     return num_steps
 
 
+def _validate_profile_request(
+    policy: "Pi05Policy",
+    batch: dict,
+    *,
+    entry_point: str,
+    num_steps: int | None = None,
+) -> dict:
+    """Apply a bound public profile before any forward/Graph mutation."""
+    profile = getattr(policy, "_rpu_public_profile", None)
+    if profile is None:
+        return batch
+    from rpu_backend.adapters.pi05.loader import _validate_pi05_public_request
+
+    return _validate_pi05_public_request(
+        batch,
+        profile=profile,
+        entry_point=entry_point,
+        num_steps=num_steps,
+    )
+
+
 class Pi05Policy:
     """Thin public wrapper around a Pi0.5 policy and its RPU adapter."""
 
@@ -63,12 +84,16 @@ class Pi05Policy:
         trust_remote_code: bool = False,
         vlm_chunk_size: int | None = None,
         rpu_execution=None,
+        profile: str | None = None,
+        admission_batch: dict | None = None,
         **lerobot_kwargs: Any,
     ) -> "Pi05Policy":
         """Load a Pi0.5 checkpoint through the adapter loader.
 
         The loader is imported lazily from
-        ``rpu_backend.adapters.pi05.loader``.
+        ``rpu_backend.adapters.pi05.loader``. The public ``pi0.5-base`` and
+        ``pi0.5-libero-v044`` profiles require ``admission_batch`` and bind the
+        exact checkpoint plus request envelope before any weight load.
         """
         if not isinstance(trust_remote_code, bool):
             raise TypeError(
@@ -103,6 +128,8 @@ class Pi05Policy:
                 if execution_explicit
                 else {}
             ),
+            profile=profile,
+            admission_batch=admission_batch,
             **lerobot_kwargs,
         )
         # A real loader returns an already-bound Pi05Policy.  Keep this
@@ -116,6 +143,13 @@ class Pi05Policy:
         )
         policy._vlm_chunk_size = 0 if chunk_size == "auto" else chunk_size
         policy._adapter._vlm_chunk_size = policy._vlm_chunk_size
+        if profile is not None and getattr(
+            policy, "_rpu_public_profile", None
+        ) != profile:
+            raise RuntimeError(
+                "Pi05Policy.from_pretrained: loader did not preserve the "
+                "admitted public profile."
+            )
         return policy
 
     @classmethod
@@ -141,6 +175,8 @@ class Pi05Policy:
         inst = cls.__new__(cls)
         inst._lerobot_policy = lerobot_policy
         inst._adapter = Pi05Adapter(lerobot_policy)
+        inst._rpu_public_profile = None
+        inst._rpu_public_profile_identity = None
         owner = getattr(lerobot_policy, "model", lerobot_policy)
         execution_config = bind_rpu_execution(
             owner,
@@ -197,15 +233,21 @@ class Pi05Policy:
         num_steps: "int | None" = None,
     ) -> dict:
         """Prebuild one finite Pi0.5 signature, freeze it, and verify READY."""
+        batch = _validate_batch(batch, entry_point="Pi05Policy.prepare_graphs")
+        num_steps = _validate_num_steps(
+            num_steps, entry_point="Pi05Policy.prepare_graphs"
+        )
+        batch = _validate_profile_request(
+            self,
+            batch,
+            entry_point="Pi05Policy.prepare_graphs",
+            num_steps=num_steps,
+        )
         if not getattr(self, "_rpu_ready", False):
             from rpu_backend.api.errors import RPUBackendError
             raise RPUBackendError(
                 "prepare_graphs requires Pi05Policy.to('rpu') to complete first."
             )
-        batch = _validate_batch(batch, entry_point="Pi05Policy.prepare_graphs")
-        num_steps = _validate_num_steps(
-            num_steps, entry_point="Pi05Policy.prepare_graphs"
-        )
         from rpu_backend.runtime.hw_attrs import mark_first_forward_done
         mark_first_forward_done(self._lerobot_policy)
         return self._adapter.prepare_graphs(batch, num_steps=num_steps)
@@ -218,18 +260,24 @@ class Pi05Policy:
         num_steps: "int | None" = None,
     ) -> torch.Tensor:
         """Run one full Pi0.5 inference and return the complete action chunk."""
-        if not getattr(self, "_rpu_ready", False):
-            from rpu_backend.api.errors import RPUBackendError
-            raise RPUBackendError(
-                "predict_action_chunk requires Pi05Policy.to('rpu') to "
-                "complete first."
-            )
         batch = _validate_batch(
             batch, entry_point="Pi05Policy.predict_action_chunk"
         )
         num_steps = _validate_num_steps(
             num_steps, entry_point="Pi05Policy.predict_action_chunk"
         )
+        batch = _validate_profile_request(
+            self,
+            batch,
+            entry_point="Pi05Policy.predict_action_chunk",
+            num_steps=num_steps,
+        )
+        if not getattr(self, "_rpu_ready", False):
+            from rpu_backend.api.errors import RPUBackendError
+            raise RPUBackendError(
+                "predict_action_chunk requires Pi05Policy.to('rpu') to "
+                "complete first."
+            )
         from rpu_backend.runtime.hw_attrs import mark_first_forward_done
         mark_first_forward_done(self._lerobot_policy)
         if num_steps is None:
@@ -245,6 +293,12 @@ class Pi05Policy:
         CPU so no RPU tensors survive between calls.
         """
         batch = _validate_batch(batch, entry_point="Pi05Policy.select_action")
+        batch = _validate_profile_request(
+            self,
+            batch,
+            entry_point="Pi05Policy.select_action",
+            num_steps=None,
+        )
 
         # Record the first forward once before dispatch.
         from rpu_backend.runtime.hw_attrs import mark_first_forward_done

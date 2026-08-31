@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run greedy text generation with a supported Qwen3 or Llama checkpoint."""
+"""Run greedy text generation for a configured causal-LM profile."""
 
 from __future__ import annotations
 

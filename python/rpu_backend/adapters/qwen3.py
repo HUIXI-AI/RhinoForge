@@ -54,7 +54,9 @@ from rpu_backend.runtime.chunk_envelope import ChunkEnvelope, make_lookup
 _CHUNK_ENVELOPE = {
     ("qwen3", 28, 1024): ChunkEnvelope(1024, 512),   # 0.6b  fp16 + w8a16
     ("qwen3", 28, 2048): ChunkEnvelope(1024, 512),   # 1.7b  fp16
-    ("qwen3", 36, 2560): ChunkEnvelope(1024, 256),   # 4b    fp16
+    # 4B/cs=256 is memory-safe, but the certified prefill=999 numeric leg
+    # misses the published 0.99995 cosine floor. cs=128 passes that leg.
+    ("qwen3", 36, 2560): ChunkEnvelope(1024, 128),   # 4b    fp16
     # 8b — 128 is the largest currently selectable/certified chunk; cs=224 is
     # not legal under the current SDPA validity predicate.
     ("qwen3", 36, 4096): ChunkEnvelope(4096, 128),   # 8b    fp16 + w8a16

@@ -807,11 +807,25 @@ PreparedMask sdpa_prepare_mask(
     int64_t ordinal = 0);
 
 // RPU side: DMA prepared mask to SPM (batch compatible).
+// query_row_offset selects a contiguous row slice from the stable full mask;
+// chunked bidirectional attention uses it to keep global K/V visibility without
+// materialising the whole [query, key] mask in SPM at once.
 void sdpa_dma_mask_to_spm(
     const PreparedMask &mask,
     uint32_t sdpa_mask_off,
     int64_t seq_q, int64_t seq_k,
-    int num_cores);
+    int num_cores,
+    int64_t query_row_offset);
+
+inline void sdpa_dma_mask_to_spm(
+    const PreparedMask &mask,
+    uint32_t sdpa_mask_off,
+    int64_t seq_q, int64_t seq_k,
+    int num_cores) {
+    sdpa_dma_mask_to_spm(
+        mask, sdpa_mask_off, seq_q, seq_k, num_cores,
+        /*query_row_offset=*/0);
+}
 
 // Legacy combined API (calls prepare + dma internally).
 int sdpa_load_mask_to_spm(
@@ -1841,19 +1855,6 @@ void rpu_lingbot_v2_moe_denoise_unroll_forward(
     double dt, int64_t prefix_len, int64_t cos_sin_offset,
     int64_t num_steps);
 
-// DEBUG-ONLY router read-back: [nl, E, Tp] device-computed routing weights.
-at::Tensor rpu_lingbot_v2_moe_debug_rw_stage(int64_t handle);
-at::Tensor rpu_lingbot_v2_moe_debug_wtm_stage(int64_t handle);
-at::Tensor rpu_lingbot_v2_moe_debug_l0_out(int64_t handle);
-at::Tensor rpu_lingbot_v2_moe_debug_innorm(int64_t handle);
-at::Tensor rpu_lingbot_v2_moe_debug_gcap(int64_t handle);
-at::Tensor rpu_lingbot_v2_moe_debug_acap(int64_t handle);
-at::Tensor rpu_lingbot_v2_moe_debug_scap(int64_t handle);
-at::Tensor rpu_lingbot_v2_moe_debug_ccap(int64_t handle);
-// DEBUG-ONLY: hand back the DDR-resident packed expert weight actually bound to the
-// device path (which: 0=gate, 1=up, 2=down). Gated on RPU_L2_DBG_PACKED=1 -- throws
-// when the flag is absent, so no default-path caller can reach it.
-at::Tensor rpu_lingbot_v2_moe_debug_packed(int64_t handle, int64_t which, int64_t layer);
 // GROUPED-EXPERTS opt-in: bind per-layer core-slice-interleaved packed expert weights.
 void rpu_lingbot_v2_moe_set_packed_weights(
     int64_t handle, at::TensorList gate_packed, at::TensorList up_packed,
@@ -1866,10 +1867,6 @@ void rpu_lingbot_v2_moe_set_packed_scales(
 void rpu_lingbot_v2_moe_set_base_scales(
     int64_t handle, at::TensorList q_ws, at::TensorList k_ws, at::TensorList v_ws,
     at::TensorList o_ws, at::TensorList gate_ws, at::TensorList up_ws, at::TensorList down_ws);
-at::Tensor rpu_lingbot_v2_moe_debug_router_h(int64_t handle);
-at::Tensor rpu_lingbot_v2_moe_debug_layer_in(int64_t handle);
-at::Tensor rpu_lingbot_v2_moe_debug_attn_resid(int64_t handle);
-
 at::Tensor rpu_lingbot_v2_moe_forward(
     int64_t handle, const at::Tensor& hidden_states,
     std::vector<at::Tensor> k_caches, std::vector<at::Tensor> v_caches,
@@ -2499,12 +2496,6 @@ at::Tensor rpu_qwen3_5_vision_forward(
 int64_t rpu_qwen3_5_vision_get_resolved_chunk_size(int64_t handle);
 // Cold per-handle vision chunk cap.
 void rpu_qwen3_5_vision_set_chunk_size_cap(int64_t handle, int64_t cap);
-
-// Per-layer debug snapshots (empty until a get_debug_export() forward). dbg_hidden =
-// [num_layers, N, hidden] Phase-2 output; dbg_q = [num_layers, NUM_CORES, N, local_q_dim].
-at::Tensor rpu_qwen3_5_vision_get_dbg_hidden(int64_t handle);
-at::Tensor rpu_qwen3_5_vision_get_dbg_q(int64_t handle);
-
 
 // =============================================================================
 // Qwen2.5-VL Vision Encoder. RMSNorm + biased SwiGLU + window

@@ -102,11 +102,11 @@ def _positive_runtime_int(name: str, value: int) -> int:
     return int(value)
 
 
-def _discretize_proprioception(norm_active: np.ndarray, state_bins: int = 256) -> str:
+def _discretize_proprioception(norm_active: np.ndarray, state_bins: int = 512) -> str:
     """Reference state-string discretization (`get_text_flow`, state_str=True): map the
     already-normalized active proprioception dims ([-1,1]) into `state_bins` bins and
     space-join the integer bucket indices. `norm_active`: 1-D numpy array of active dims.
-    (base wall-oss-0.5 trained with 256; the LIBERO finetune uses state_bins=512.)"""
+    (the pinned public Wall-OSS-0.5 checkpoint declares state_bins=512.)"""
     disc = np.digitize(norm_active, bins=np.linspace(-1, 1, state_bins + 1)[:-1]) - 1
     return " ".join(map(str, disc.tolist()))
 
@@ -156,11 +156,11 @@ def _build_flow_prompt(instruction: str, camera_names, dataset_name: str,
             + os.environ.get("RPU_WALL_OSS_PROLOGUE_FILLER", "")  # DIAG: length-vs-content bisection
             + "\n<|im_end|>\n")
     else:
-        emb = dataset_name.split("_")[-1]
+        # The pinned public checkpoint declares
+        # `use_embodied_system_prompt_ratio: 0.0`.  wall-x therefore uses this
+        # plain system prologue for its normal inference path.
         prologue = (
-            f"<|im_start|>system\nYou are an embodied vision-language-action (VLA) model "
-            f"controlling the robot with language instructions.\n Embodiment: {emb}\n "
-            f"Camera Setup: {cam},\n Frequency: 32HZ\n Action Space: {action_space}\n<|im_end|>\n"
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
         )
     user_request = "<|im_start|>user\nObservation:"
     for c in camera_names:
@@ -198,12 +198,12 @@ def _close_wall_component(component) -> None:
             pass
 
 
-class WallOssVLA:
-    """Full Wall-OSS-0.5 VLA on RPU. Construct via :func:`build_wall_oss_vla`."""
+class _WallOssVLA:
+    """Internal full Wall-OSS-0.5 runtime owned by ``WallOssPolicy``."""
 
     def __init__(self, *, vision, action, processor, rope_helper, normalizer,
                  normalizer_propri, dataset_key, camera_names, delta_action,
-                 state_bins: int = 256, normalizer_clamp: bool = True):
+                 state_bins: int = 512, normalizer_clamp: bool = True):
         self.vision = vision               # WallOssVision (own cache)
         self.action = action               # WallOssAction (expert-1)
         self.llm = action.llm              # WallOssLLM (expert-0; shares cache with action)
@@ -236,7 +236,7 @@ class WallOssVLA:
         self.dataset_key = dataset_key
         self.camera_names = list(camera_names)   # FLOW prompt Camera Setup / Observation
         self.delta_action = delta_action         # FLOW prompt Action Space (Rel/Abs EEF)
-        self.state_bins = state_bins             # proprioception discretization bins (256 base / 512 libero ft)
+        self.state_bins = state_bins             # pinned public checkpoint: 512 bins
         self.action_dim = action.action_dim
         self._normalizer_clamp = bool(normalizer_clamp)
         # Memoized get_rope_index output, keyed on the execution length, vision grid,
@@ -501,6 +501,18 @@ class WallOssVLA:
             ("prefill", self.llm._graph_cache),
             ("denoise", self.action._graph_cache),
         )
+
+        def cache_lifecycle(cache):
+            entries = cache.snapshot()
+            return {
+                "entries": len(entries),
+                "replays": sum(int(entry.replay_count) for entry in entries),
+                "recaptures": sum(
+                    int(entry.recapture_count) for entry in entries
+                ),
+                "invariant": bool(cache.cache_invariant_ok()),
+            }
+
         for _, cache in caches:
             cache.begin_warmup()
             cache.clear()
@@ -605,6 +617,17 @@ class WallOssVLA:
             if actual != expected:
                 raise RuntimeError(
                     f"Wall-OSS graph prewarm produced {actual}, expected {expected}")
+            warming_lifecycle = {
+                name: cache_lifecycle(cache) for name, cache in caches
+            }
+            if any(
+                state["recaptures"] != 0 or not state["invariant"]
+                for state in warming_lifecycle.values()
+            ):
+                raise RuntimeError(
+                    "Wall-OSS WARMING graph lifecycle violated the fixed-cache "
+                    f"contract: {warming_lifecycle}"
+                )
             for _, cache in caches:
                 cache.freeze()
             # One final real observation under strict READY proves that all three
@@ -619,6 +642,22 @@ class WallOssVLA:
                 raise RuntimeError(
                     "Wall-OSS READY replay changed graph counts: "
                     f"before={actual}, after={ready_counts}")
+            ready_lifecycle = {
+                name: cache_lifecycle(cache) for name, cache in caches
+            }
+            if any(
+                ready_lifecycle[name]["replays"]
+                    <= warming_lifecycle[name]["replays"]
+                or ready_lifecycle[name]["recaptures"] != 0
+                or not ready_lifecycle[name]["invariant"]
+                or ready_lifecycle[name]["entries"] != actual[name]
+                for name, _cache in caches
+            ):
+                raise RuntimeError(
+                    "Wall-OSS READY did not produce stable replay-only Graph "
+                    f"lifecycle: before={warming_lifecycle}, "
+                    f"after={ready_lifecycle}"
+                )
             if not torch.equal(warm_out["x_norm"], ready_out["x_norm"]):
                 max_abs = float(
                     (warm_out["x_norm"].float()
@@ -646,6 +685,7 @@ class WallOssVLA:
             "denoise_mode": dict(profile["denoise_mode"]),
             "phase": "READY",
             "ready_replay_validated": True,
+            "graph_lifecycle": ready_lifecycle,
         }
 
     def _fast_image_preproc(self, images):
@@ -924,6 +964,14 @@ class WallOssVLA:
                                   self.delta_action, propri_str)
         _mk("1_propri+prompt")
         input_ids, pixel_values, grid = self._process_inputs(text, images)
+        admitted_grid = getattr(self, "_admitted_image_grid", None)
+        if admitted_grid is not None and not torch.equal(
+            grid.detach().cpu().long(), admitted_grid
+        ):
+            raise ValueError(
+                "Wall-OSS request image_grid_thw differs from the CPU-preflight "
+                "profile; no RPU Vision work was submitted"
+            )
         n_img = int((input_ids == IMAGE_PAD_ID).sum())
         _mk("2_process_inputs(imgproc+tok)")
 
@@ -1074,13 +1122,13 @@ class WallOssVLA:
         }
 
 
-def build_wall_oss_vla(
+def _build_wall_oss_vla(
     ckpt_dir: str | None = None,
     *,
     dataset_key: str = "berkeley_autolab_ur5",
     camera_names=("face_view",),
     delta_action: bool = False,
-    state_bins: int = 256,
+    state_bins: int = 512,
     max_seq_len: int = 2048,
     w8a16: bool = False,
     w4a16: bool = False,
@@ -1089,7 +1137,7 @@ def build_wall_oss_vla(
     nvfp4_wint4_scope: bool = False,
     fp16_ckpt_dir: str | None = None,
     rpu_execution=None,
-) -> WallOssVLA:
+) -> _WallOssVLA:
     """Build the full VLA: vision tower + expert-0 prefill + expert-1 denoiser (sharing
     one RPUCache) + Qwen2.5-VL processor + action/proprioception normalizers.
 
@@ -1101,8 +1149,8 @@ def build_wall_oss_vla(
         camera_names: ordered raw view keys (FLOW prompt Camera Setup / Observation); one
             <|image_pad|> emitted per camera. Default single front view.
         delta_action: FLOW prompt Action Space ("Rel EEF" if True else "Abs EEF").
-        state_bins: proprioception state-string discretization bins (base wall-oss-0.5 =
-            256; the LIBERO finetune trained with 512).
+        state_bins: proprioception state-string discretization bins. The pinned
+            public Wall-OSS-0.5 checkpoint declares 512.
         max_seq_len: RoPE table + shared KV cache capacity (prefix + horizon).
         w8a16: load expert-0/expert-1 decoder weights and vision transformer
             block weights from the W8A16 checkpoint. CPU patch_embed/merger and
@@ -1122,7 +1170,7 @@ def build_wall_oss_vla(
     from rpu_backend.api._execution import normalize_rpu_execution
     execution_config = normalize_rpu_execution(
         rpu_execution,
-        entry_point="build_wall_oss_vla",
+        entry_point="WallOssPolicy",
         supported={
             "prefill": ("chunk_size", "padding_rows", "padding_budget"),
             "vision": ("chunk_size",),
@@ -1257,7 +1305,7 @@ def build_wall_oss_vla(
                 ckpt_dir, window=True, w8a16=w8a16,
                 fp16_ckpt_dir=fp16_ckpt_dir,
                 execution_config=execution_config)
-        runtime = WallOssVLA(
+        runtime = _WallOssVLA(
             vision=vision, action=action, processor=processor,
             rope_helper=rope, normalizer=normalizer,
             normalizer_propri=normalizer_propri, dataset_key=dataset_key,

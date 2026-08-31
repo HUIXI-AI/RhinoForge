@@ -572,9 +572,6 @@ TORCH_LIBRARY(rpu, m) {
   // DIFFERENT caps; before this the first forward in the process pinned one
   // cap for every handle created afterwards.
   m.def("qwen3_5_vision_set_chunk_size_cap", TORCH_FN(rpu_qwen3_5_vision_set_chunk_size_cap));
-  // Per-layer debug snapshots (int -> Tensor, DEFAULT block). Read after a get_debug_export() forward.
-  m.def("qwen3_5_vision_get_dbg_hidden", TORCH_FN(rpu_qwen3_5_vision_get_dbg_hidden));
-  m.def("qwen3_5_vision_get_dbg_q", TORCH_FN(rpu_qwen3_5_vision_get_dbg_q));
   m.def("qwen3_5_vision_set_weights(int handle, "
         "Tensor[] q_w_list, Tensor[] k_w_list, "
         "Tensor[] v_w_list, Tensor[] o_w_list, "
@@ -708,20 +705,6 @@ TORCH_LIBRARY(rpu, m) {
   m.def("spm_alloc_reset_temporary", &graph_aware_spm_alloc_reset_temporary);
   m.def("spm_alloc_reset_all", &process_guarded_spm_alloc_reset_all);
   m.def("spm_alloc_dump", [](const std::string& label) { SPM_ALLOC.dump(label.c_str()); });
-
-  // Debug-only LingBot2 router and intermediate read-back helpers.
-  m.def("lingbot_v2_moe_debug_rw_stage", &rpu_lingbot_v2_moe_debug_rw_stage);
-  m.def("lingbot_v2_moe_debug_wtm_stage", &rpu_lingbot_v2_moe_debug_wtm_stage);
-  m.def("lingbot_v2_moe_debug_l0_out", &rpu_lingbot_v2_moe_debug_l0_out);
-  m.def("lingbot_v2_moe_debug_innorm", &rpu_lingbot_v2_moe_debug_innorm);
-  m.def("lingbot_v2_moe_debug_gcap", &rpu_lingbot_v2_moe_debug_gcap);
-  m.def("lingbot_v2_moe_debug_acap", &rpu_lingbot_v2_moe_debug_acap);
-  m.def("lingbot_v2_moe_debug_scap", &rpu_lingbot_v2_moe_debug_scap);
-  m.def("lingbot_v2_moe_debug_ccap", &rpu_lingbot_v2_moe_debug_ccap);
-  m.def("lingbot_v2_moe_debug_router_h", &rpu_lingbot_v2_moe_debug_router_h);
-  m.def("lingbot_v2_moe_debug_layer_in", &rpu_lingbot_v2_moe_debug_layer_in);
-  m.def("lingbot_v2_moe_debug_attn_resid", &rpu_lingbot_v2_moe_debug_attn_resid);
-  m.def("lingbot_v2_moe_debug_packed", &rpu_lingbot_v2_moe_debug_packed);
 
 }
 

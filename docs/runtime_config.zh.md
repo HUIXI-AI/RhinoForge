@@ -173,7 +173,7 @@ producer 在 reduction 前清理 inactive shard。见
 | `RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN` | 关闭；精确 `1`、`true`、`True` 或 `on` 会启用 | 首次原生 coexistence 使用 / **NATIVE** | 在配置负责的 subsystem handoff 之间保留 persistent SPM generation。归属错误可能破坏后续执行。 |
 | `RPU_GRAPH_DEFER_TO_COPY` | 没有独立默认值；legacy alias 接受 `auto`/空、`0`/`off`/`false`，其他任意非空值强制开启 | 首次 host-op gate 使用 / **NATIVE** | 仅当未设置 `RPU_GRAPH_HOST_OP_DEFER_GATE` 时查询。避免同时设置两者。 |
 | `RPU_GRAPH_HOST_OP_DEFER_GATE` | `auto`；`auto`/空、`0`/`off`/`false`，其他任意非空值强制开启 | 首次 host-op gate 使用 / **NATIVE** | 控制 capture 期间 stable host input 的 deferral。对不稳定 storage 强制开启会产生过期数据。 |
-| `RPU_SKIP_IDLE_RECORD_FUNCTION` | 关闭；`1`/`on`/`true`/`True` 会启用 | 首次 Python graph scope / **MODEL** | 只在 profiler 关闭时省略 idle profiler scope。profiling 时保留 scope，其他情况下减少 host 开销。 |
+| `RPU_SKIP_IDLE_RECORD_FUNCTION` | 开启；`0`/`off`/`false` 会禁用 | 首次 Python graph scope / **MODEL** | 只在 profiler 关闭时省略 idle profiler scope。profiling 时保留 scope，其他情况下减少 host 开销。 |
 
 ### KV、linear、normalization 与 scheduling
 
@@ -393,33 +393,23 @@ Pi0.5 loader 负责这些设置。Graph selector 必须在模型构造和首次 
 
 | 变量 | 未设置时的默认值与接受值 | 读取 / 更改 | 作用域、效果与风险 |
 |---|---|---|---|
-| `QWEN3_5_VISION_DBG_Q` | 关闭；精确 `1` 或小写 `true` | 首次原生 debug 检查 / **NATIVE** | 启用 Qwen3.5 Vision query probe 路径。会增加 capture/同步，并可能暴露 intermediate。 |
 | `QWEN3_5_VISION_GRAPH_DISABLE` | `0`；除精确 `0` 外的任意值都会禁用 | Vision forward / **CALL**；重建/清除 Graph | 绕过 Qwen3.5 Vision GraphCache，用于受控比较。replay 和 latency 结论不再适用。 |
 | `RPU_ALL_GATHER_FORCE_MULTI_CORE` | 关闭；**N1** | 首次原生使用 / **NATIVE** | 强制 multi-core schedule，用于 A/B 比较。它不是普遍支持的性能 selector。 |
 | `RPU_CHUNK_FORCE_UNSAFE` | 关闭；**N1** | 首次适用的原生 planner/launcher 使用 / **NATIVE** | 绕过 planner safety check。可能超过执行约束，绝不能产出可部署输出。 |
 | `RPU_DYNAMO_MATERIALIZE_BREAKS` | **PB(false)** | Dynamo partitioning / **CALL**；重新编译 | materialize partition break。它会改变 Graph boundary 并增加 transfer，仅用于 compiler 诊断。 |
 | `RPU_GRAPH_DDR_SPM_LOG` | 关闭；首字符不是 `0` 的非空值 | 首次 data-node 执行 / **NATIVE** | 记录 node index、byte count 和有界 source checksum。输出由模型数据派生，且日志会改变 timing。 |
 | `RPU_GRAPH_FORCE_ONESHOT_ON_REPLAY` | 关闭；首字符不是 `0` 的非空值 | 首次 replay 检查 / **NATIVE** | 执行 one-shot 路径而不是普通 replay。会使 Graph lifecycle 和性能结论失效。 |
-| `RPU_GRAPH_HCB_CHECKSUM` | 关闭；首字符不是 `0` 的非空值 | 首次 host-callback 执行 / **NATIVE** | 记录 live/stable tensor metadata 和有界 value summary。将输出视为敏感模型数据。 |
 | `RPU_KVINSERT_V16_TRACE` | 关闭；除精确 `0` 或 `false` 外，任何出现的值都会启用；export 的空值也会启用 | 首次原生使用 / **NATIVE** | 记录 KV route selection 和 shape。它是诊断输出，不是 cache 正确性证明。 |
 | `RPU_L2_BUFONLY` | 未出现时关闭；任意出现（包括 `0`）都会启用 | Grouped-expert Graph emission / **BUILD** | 声明 grouped buffer，但运行 per-expert 路径进行 bisection。会改变 Graph 和性能。 |
-| `RPU_L2_CAPTURE_GATE` | 关闭；**E1** | Expert 权重安装 / **MODEL** | 分配并导出 gate 相关 layer-0 intermediate。增加内存/Graph 工作，并暴露模型数据。 |
-| `RPU_L2_CAPTURE_INNORM` | 关闭；**E1** | Expert 权重安装 / **MODEL** | capture layer-0 post-normalization input。tensor 可能包含用户派生的 activation。 |
-| `RPU_L2_CAPTURE_L0` | 关闭；**E1** | Expert 权重安装 / **MODEL** | capture layer-0 output 用于比较。增加 persistent storage 和一次 copy。 |
-| `RPU_L2_CAP_RESID` | 关闭；**E1** | Expert 权重安装 / **MODEL** | 跨 layer capture residual-stream tensor。内存成本高；输出可能包含请求派生的 activation。 |
-| `RPU_L2_DBG_PACKED` | 关闭；每次 debug getter 都检查 **E1** | Debug getter / **CALL** | 解锁 packed 模型权重供本地检查。绝不能公开返回 tensor。 |
 | `RPU_L2_DOWN_ACC16` | 关闭；**E1** | Expert 权重安装 / **MODEL** | 强制 diagnostic ACC16 grouped-down 路径。它会改变数值结果，不是受支持 precision 配置。 |
 | `RPU_L2_RCHUNK` | Runtime fallback 为 `256`；正十进制数；受支持 grouped 配置要求精确 `1632` | Weight/config 校验（**MODEL**）和 Graph emission（**BUILD**）；新进程 | 覆盖 grouped scaling row chunk。错误值会使密封配置失败，或改变 Graph/timing。 |
 | `RPU_L2_ROUTED_ONLY` | 关闭；**E1** | Expert 权重安装 / **MODEL** | 隔离 routed-expert contribution 用于 bisection。输出不是完整模型输出。 |
 | `RPU_L2_SCHUNK` | `32512`；正十进制数；非正值使用默认值 | Graph emission / **BUILD** | 覆盖 grouped activation host chunk。它会改变 Graph census，并可能降低安全性/性能。 |
-| `RPU_L2_STAGES` | 关闭；**E1** | Expert 权重安装 / **MODEL** | capture intermediate grouped stage。增加内存/copy，并暴露 activation。 |
 | `RPU_LINGBOT2_DEBUG_DENSE_SOFT_ROUTER` | 关闭；**E1** | Expert 权重安装 / **MODEL** | 用 dense soft routing 替换严格 top-4 routing。精度未验证，输出不用于生产。 |
-| `RPU_LINGBOT2_DEBUG_DUMP_ROUTER_H` | 关闭；**E1** | Expert 权重安装 / **MODEL** | capture per-layer router input。dump 可能包含请求派生 activation，并占用大量内存。 |
 | `RPU_PI05_LOAD_NOISE` | 未设置；现有 tensor `.pt` 的路径；路径不存在时忽略 | Noise preparation / **CALL** | 在严格 shape/finite 检查后使用 `weights_only=True` 替换 sampled noise。只应使用受信任本地文件。 |
 | `RPU_PI05_LOAD_PIXEL_VALUES` | 未设置；现有 tensor `.pt` 的路径；路径不存在时忽略 | Image feature 调用 / **CALL** | 在严格检查后替换 processed pixel value。它会改变模型输入，并可能加载敏感测试数据。 |
 | `RPU_PI05_LOAD_PREFIX_EMBS` | 未设置；现有 tensor `.pt` 的路径；路径不存在时忽略 | Prefix preparation / **CALL** | 在严格检查后替换 prefix embedding。它会绕过普通 upstream 值，并使 E2E 声明失效。 |
 | `RPU_PI05_LOG_CONVERSION` | 未出现时关闭；任意非空值（包括 `0`）都会启用 | Gemma prefill / **CALL** | 记录 conversion/handle/chunk 诊断。增加输出，并可能暴露模型 shape/configuration。 |
-| `RPU_PI05_PROBE_DIR` | 未设置；非空目录路径 | Pi0.5 conversion 和 forward / **CALL** | 将具名 input、activation 和 KV tensor dump 为 `.pt`。artifact 可能包含模型权重和用户数据。 |
 | `RPU_RHINOVLA_VISION_RPU_MERGERS_MEM_DEBUG` | **PB(false)** | Vision 安装/materialization / **MODEL** | 在 merger materialization 前后打印 allocator summary。增加同步，并暴露内存结构。 |
 | `RPU_SIGLIP_ISOLATE_PATCH_EMBED` | 关闭；除 `0`/`false`/`False` 外的非空值 | 首次 segment 规划 / **NATIVE** | 隔离 Pi0.5 patch-embedding segment，诊断 Graph finalization failure。改变 Graph segmentation。 |
 | `RPU_WALL_OSS_INSTRUMENT` | **PB(false)** | Wall-OSS forward stage / **CALL** | 打印 host stage timing。instrumentation 开销会使同一次运行不适合报告干净 latency。 |
@@ -452,7 +442,11 @@ envelope；如果公共 policy API 有记录，它也会公开 resolved executio
 - `torch.rpu.set_caching_allocator(bool)` 切换进程 caching allocator（默认关闭）。
   `torch.rpu.empty_cache()` 释放已缓存、未使用的 block；无法释放 live tensor 或
   Graph-owned storage。
-- `torch.rpu.memory_stats()` 和 `torch.rpu.get_memory_stats()` 返回 allocator counter。
+- `torch.rpu.memory_stats()` 和 `torch.rpu.get_memory_stats()` 返回不含地址的
+  allocator counter。启用 `caching_allocator_enabled` 时，
+  `caching_allocator_mapping` 统计该 allocator 当前拥有的 HostDDR segment，
+  `cached_idle_mapping` 统计其中完全空闲的缓存 segment；它们不含 Launch、SPM、
+  direct allocation，也不是进程级 driver mapping 总数。
   `reset_peak_memory_stats()` 重置 peak counter，`reset_accumulated_memory_stats()` 重置
   累计 allocate/free counter。重置 counter 不会释放内存。
 - `torch.rpu.set_ddr_flush(bool)` 控制内部 RPU-to-RPU flush point（默认关闭）。模型

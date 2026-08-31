@@ -58,8 +58,10 @@ The default Pi0.5 conversion is W8A16 for the VLM decoder and action-expert
 decoder projections. Vision encoder, AdaRMS dense layers, action projection,
 and processor sidecars remain FP16 or unchanged.
 
-Pi0.5 W8A16 and W4A16 outputs are Source-only in v1.0.0: the release binds no
-public immutable derived checkpoint identity or hash for them.
+Pi0.5 W8A16 and mixed W4A16-G32-KV8 outputs are Source-only in v1.0.0: the
+release binds no public immutable derived checkpoint identity or hash for them.
+Their exact same-quantization oracle and checkpoint-owned task evidence also
+remain pending.
 
 ```bash
 python -m rpu_backend.quant.convert_pi05 \
@@ -76,17 +78,27 @@ python -m rpu_backend.quant.convert_pi05 \
   --dst /path/to/pi05-fake-W4 \
   --fake-w4
 
-# Runtime W4 evaluation format.
+# Runtime mixed W4A16-G32-KV8 evaluation format (not pure W4).
 python -m rpu_backend.quant.convert_pi05 \
   --src /path/to/pi05-source \
-  --dst /path/to/pi05-W4A16 \
+  --dst /path/to/pi05-mixed-W4A16-G32-KV8 \
   --fake-w4 --real-w4
 ```
 
+The runtime profile is mixed W4A16-G32-KV8, not pure W4. Only the declared
+Gemma VLM/action-expert Linear projection weights are quantized:
+q/o/gate/up/down use symmetric W4 group-size-32 weights along K, while K/V
+projection weights remain W8. Activations and the KV cache remain FP16. The
+checkpoint stores logical FP16 scales as `[K/32, N]`; loading stripes them into
+the packed pgrp ABI. SigLIP, AdaRMS dense, action projection, and processor
+sidecars remain FP16 or unchanged.
+
 `--keep-int8` accepts a comma-separated list of projection names for a
-controlled mixed-precision W4 experiment. Real W4 automatically keeps the key
-and value projections at INT8. Both W4 modes are Source-only evaluation paths
-and require their own immutable asset identity and validation before promotion.
+controlled mixed-precision W4 experiment. `--real-w4` is the legacy CLI name
+for the mixed profile and automatically keeps the K/V projection weights at W8.
+Both W4 modes are Source-only evaluation paths and require their own immutable
+asset identity, exact same-quantization oracle, and checkpoint-owned task
+evidence before promotion.
 
 The converter deliberately omits a stale remapped checkpoint so the Pi0.5
 loader can regenerate it from the new quantized tensors.

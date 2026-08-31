@@ -3,11 +3,10 @@
 // Single declaration owner for shared runtime globals.
 //
 // Symbols owned here:
-//   - g_debug_tensors              — debug-export registry consumed by Python
-//                                    rpu_backend.get_debug_tensor(name)
+//   - g_debug_tensors               — dormant internal debug storage
 //   - set/get_cross_layer_batch_size — cross-layer batch group size
-//   - set/get_debug_export + get_debug_tensor + clear_debug_tensors
-//     + list_debug_tensors          — debug-tensor cluster
+//   - get_debug_export              — hard-disabled compatibility query
+//   - rpu_lkn_batch_config_at_load  — immutable Launch capacity snapshot
 //
 // Defined in the sibling TU `src/core/rpu_runtime_extras.cpp`:
 //   - set/get_spm_debug                    (kept Python-bound; chat_cli caller)
@@ -16,6 +15,7 @@
 //
 // Initialization contract:
 //   g_debug_tensors is default-initialized to empty (`{}` at definition site).
+//   LKN capacity is snapshotted in rpu_backend.cpp during extension load.
 //
 // Convention: global namespace (matches rpu_helpers.h / rpu_kernel_decls.h);
 //             no `namespace rpu` wrapper.
@@ -27,6 +27,16 @@
 #include <unordered_map>
 #include <vector>
 #include <ATen/ATen.h>
+
+struct LknBatchConfig {
+    int64_t max_entries;
+    int64_t kd_buf_mb;
+    int64_t instr_buf_mb;
+};
+
+// Immutable process snapshot taken while rpu_backend and the Launch runtime
+// are loaded. Graph planning must use this instead of rereading the env.
+const LknBatchConfig& rpu_lkn_batch_config_at_load();
 
 // =============================================================================
 // Globals — defined in rpu_runtime_state.cpp with explicit zero/default-init
@@ -47,9 +57,8 @@
 // because compute_chunks_impl reads it directly.
 extern int64_t g_cross_layer_batch_size;
 
-// Debug-export tensor registry: populated when set_debug_export(true) by v3
-// model forward paths and Python-snapshot helpers; consumed via
-// rpu_backend.get_debug_tensor(name) / list_debug_tensors() / clear_debug_tensors().
+// Dormant internal storage retained until model-local debug branches are removed.
+// get_debug_export() is hard-disabled, so release execution never populates it.
 extern std::unordered_map<std::string, at::Tensor> g_debug_tensors;
 
 // =============================================================================
@@ -61,10 +70,4 @@ extern std::unordered_map<std::string, at::Tensor> g_debug_tensors;
 void    set_cross_layer_batch_size(int64_t size);
 int64_t get_cross_layer_batch_size();
 
-// Debug export cluster (Python: torch.rpu.set_debug_export / get_debug_export /
-// list_debug_tensors / get_debug_tensor / clear_debug_tensors)
-void                      set_debug_export(bool enabled);
-bool                      get_debug_export();
-at::Tensor                get_debug_tensor(const std::string& name);
-void                      clear_debug_tensors();
-std::vector<std::string>  list_debug_tensors();
+bool get_debug_export();

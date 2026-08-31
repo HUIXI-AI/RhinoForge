@@ -1,5 +1,5 @@
 # 单一完整模板 / Single complete template：注释行展示默认值，取消注释才覆盖运行时。
-# Qwen3-VL 8B Limited profile；精确 padded profile 的 4/4 numeric/task/Graph 已通过，包含 dual-full。
+# Qwen3-VL 8B Source-only padded-profile evaluation; no release-bound evidence is transferred.
 [runner]
 target = "qwen3_vl"
 

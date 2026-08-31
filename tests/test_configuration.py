@@ -9,6 +9,7 @@ import re
 import runpy
 import subprocess
 import sys
+import threading
 import tomllib
 
 import pytest
@@ -17,6 +18,12 @@ from rpu_backend.api._execution import normalize_rpu_execution
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _join(*parts: str) -> str:
+    return "".join(parts)
+
+
 EXPECTED_EXAMPLE_CONFIGS = {
     "dinov3_vit_b.toml",
     "g05.toml",
@@ -114,12 +121,12 @@ def test_example_toml_files_are_portable() -> None:
     configs = sorted(config_dir.glob("*.toml"))
     assert configs
     banned = (
-        "/" + "nfs",
-        "/" + "data/",
-        "10." + "10.",
-        "192." + "168.",
-        "hf" + "_",
-        "token" + "=",
+        _join("/", "n", "fs"),
+        _join("/", "da", "ta", "/"),
+        _join("10", ".", "10", "."),
+        _join("192", ".", "168", "."),
+        _join("h", "f", "_"),
+        _join("tok", "en", "="),
     )
     for path in configs:
         text = path.read_text(encoding="utf-8")
@@ -165,6 +172,15 @@ def test_qwen3_8b_profile_uses_auto_prefill_chunk() -> None:
         "chunk_size": "auto",
         "padding_budget": 64,
     }
+
+
+def test_lingbot_example_matches_bound_fp16_identity() -> None:
+    profile = tomllib.loads(
+        (ROOT / "examples" / "configs" / "lingbot2.toml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert profile["model"]["dtype"] == "fp16"
 
 
 def test_internvla_example_uses_only_the_public_navdp_checkpoint() -> None:
@@ -261,7 +277,7 @@ max_new_tokens = 1
         load_config(ambiguous)
 
 
-def test_wall_oss_w8a16_example_binds_fp16_source(tmp_path: Path) -> None:
+def test_wall_oss_examples_match_public_checkpoint_profile(tmp_path: Path) -> None:
     load_config = runpy.run_path(str(ROOT / "examples" / "wall_oss.py"))[
         "load_config"
     ]
@@ -270,6 +286,29 @@ def test_wall_oss_w8a16_example_binds_fp16_source(tmp_path: Path) -> None:
     )
     assert config["model"]["precision"] == "w8a16"
     assert config["model"]["fp16_alias"] == "wall-oss-0.5"
+    for name in ("wall_oss.toml", "wall_oss_w8a16.toml", "wall_oss_w4a16.toml"):
+        profile = load_config(ROOT / "examples" / "configs" / name)
+        assert profile["model"]["camera_names"] == [
+            "face_view",
+            "right_wrist_view",
+        ]
+        assert profile["model"]["state_bins"] == 512
+        assert len(profile["request"]["images"]) == 2
+        assert profile["request"]["images"] == [
+            "assets/example.ppm",
+            "assets/example.ppm",
+        ]
+        assert profile["rpu_execution"]["vision"]["chunk_size"] == 768
+
+    from rpu_backend.api import WallOssPolicy
+
+    with pytest.raises(ValueError, match="explicit Vision chunk_size"):
+        WallOssPolicy.from_checkpoint(
+            "unused/checkpoint",
+            rpu_execution={"vision": {"chunk_size": "auto"}},
+        )
+    with pytest.raises(ValueError, match="state_bins=512"):
+        WallOssPolicy.from_checkpoint("unused/checkpoint", state_bins=256)
 
     missing_source = tmp_path / "missing-source.toml"
     missing_source.write_text(
@@ -286,6 +325,191 @@ proprioception = [0.0]
     )
     with pytest.raises(ValueError, match="fp16_alias or fp16_checkpoint"):
         load_config(missing_source)
+
+
+def test_wall_oss_public_prompt_matches_pinned_upstream(monkeypatch) -> None:
+    from rpu_backend.adapters.wall_oss.runtime import _build_flow_prompt
+
+    for name in (
+        "RPU_WALL_OSS_GENERIC_PROLOGUE",
+        "RPU_WALL_OSS_MULTISUITE_PROLOGUE",
+        "RPU_WALL_OSS_PROLOGUE_FILLER",
+        "RPU_WALL_OSS_SHORT_PROMPT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    prompt = _build_flow_prompt(
+        "pick up the object",
+        ("face_view", "right_wrist_view"),
+        "berkeley_autolab_ur5",
+        False,
+        "1 2",
+    )
+    assert prompt == (
+        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+        "<|im_start|>user\nObservation:"
+        " front view: <|vision_start|><|image_pad|><|vision_end|>"
+        " right wrist view: <|vision_start|><|image_pad|><|vision_end|>"
+        "\nInstruction: pick up the object"
+        "\nPredict the next action in robot action.\nProprioception: 1 2\n"
+        "<|im_end|>\n<|im_start|>assistant\n"
+    )
+    assert "Embodiment:" not in prompt
+    assert "Camera Setup:" not in prompt
+    assert "Frequency:" not in prompt
+    assert "Action Space:" not in prompt
+
+
+def test_wall_oss_public_profile_rejects_non_evidence_modes(monkeypatch) -> None:
+    from rpu_backend.api import WallOssPolicy
+
+    monkeypatch.delenv("RPU_WALL_OSS_VISION_LAYER_GROUP", raising=False)
+    monkeypatch.delenv("WALL_OSS_PROFILE_PREFIX", raising=False)
+
+    with pytest.raises(ValueError, match="ordered camera_names"):
+        WallOssPolicy.from_checkpoint(
+            "unused/checkpoint",
+            camera_names=("right_wrist_view", "face_view"),
+        )
+    with pytest.raises(ValueError, match="VISION_LAYER_GROUP=0"):
+        WallOssPolicy.from_checkpoint(
+            "unused/checkpoint",
+            runtime_env={"RPU_WALL_OSS_VISION_LAYER_GROUP": "32"},
+        )
+    with pytest.raises(ValueError, match="dataset_key='berkeley_autolab_ur5'"):
+        WallOssPolicy.from_checkpoint("unused/checkpoint", dataset_key="droid")
+    with pytest.raises(ValueError, match="RPU_LINEAR_ACC32='0'"):
+        WallOssPolicy.from_checkpoint(
+            "unused/checkpoint", runtime_env={"RPU_LINEAR_ACC32": "1"}
+        )
+    with pytest.raises(ValueError, match="action_horizon=32"):
+        WallOssPolicy.from_checkpoint("unused/checkpoint", action_horizon=16)
+
+    monkeypatch.setenv("WALL_OSS_PROFILE_PREFIX", "320")
+    with pytest.raises(ValueError, match="rejects WALL_OSS_PROFILE_PREFIX"):
+        WallOssPolicy.from_checkpoint("unused/checkpoint")
+
+
+def test_wall_oss_official_dual_448_grid_is_admitted_before_rpu_claim(
+    monkeypatch,
+) -> None:
+    import torch
+    import transformers
+    import rpu_backend.api.causal_lm as causal_lm
+    from rpu_backend.api import RPUBackendError, WallOssPolicy
+
+    class FakeProcessor:
+        grid_dtype = torch.long
+        grid = ((1, 32, 32), (1, 32, 32))
+
+        @staticmethod
+        def image_processor(*, images, return_tensors):
+            assert len(images) == 2
+            assert return_tensors == "pt"
+            return {
+                "image_grid_thw": torch.tensor(
+                    FakeProcessor.grid,
+                    dtype=FakeProcessor.grid_dtype,
+                )
+            }
+
+    monkeypatch.setattr(
+        transformers.AutoProcessor,
+        "from_pretrained",
+        lambda *args, **kwargs: FakeProcessor(),
+    )
+    claims = []
+    monkeypatch.setattr(
+        causal_lm, "_claim_live_instance", lambda owner: claims.append(owner)
+    )
+    policy = WallOssPolicy.from_checkpoint(
+        "unused/checkpoint",
+        camera_names=("face_view", "right_wrist_view"),
+        rpu_execution={"vision": {"chunk_size": 768}},
+    )
+    FakeProcessor.grid_dtype = torch.float32
+    with pytest.raises(TypeError, match="integer dtype"):
+        policy.preflight_images([object(), object()])
+    FakeProcessor.grid_dtype = torch.long
+    FakeProcessor.grid = ((1, 32, 32), (1, 16, 64))
+    with pytest.raises(ValueError, match="exact public dual-448"):
+        policy.preflight_images([object(), object()])
+    FakeProcessor.grid = ((1, 32, 32), (1, 32, 32))
+    assert policy.preflight_images([object(), object()]) is policy
+    assert torch.equal(
+        policy._preflight_image_grid,
+        torch.tensor(FakeProcessor.grid, dtype=torch.long),
+    )
+    assert claims == []
+
+    unprepared = WallOssPolicy.from_checkpoint(
+        "unused/checkpoint",
+        camera_names=("face_view", "right_wrist_view"),
+        rpu_execution={"vision": {"chunk_size": 768}},
+    )
+    with pytest.raises(RPUBackendError, match="preflight_images"):
+        unprepared.to("rpu")
+    assert claims == []
+
+
+def test_wall_oss_preflight_and_build_share_one_lock(monkeypatch) -> None:
+    import torch
+    import transformers
+    import rpu_backend.api.causal_lm as causal_lm
+    from rpu_backend.api import RPUBackendError, WallOssPolicy
+
+    processor_done = threading.Event()
+
+    class FakeProcessor:
+        @staticmethod
+        def image_processor(*, images, return_tensors):
+            assert len(images) == 2
+            assert return_tensors == "pt"
+            processor_done.set()
+            return {
+                "image_grid_thw": torch.tensor(
+                    [[1, 32, 32], [1, 32, 32]], dtype=torch.long
+                )
+            }
+
+    monkeypatch.setattr(
+        transformers.AutoProcessor,
+        "from_pretrained",
+        lambda *args, **kwargs: FakeProcessor(),
+    )
+    claims = []
+    monkeypatch.setattr(
+        causal_lm, "_claim_live_instance", lambda owner: claims.append(owner)
+    )
+    policy = WallOssPolicy.from_checkpoint(
+        "unused/checkpoint",
+        camera_names=("face_view", "right_wrist_view"),
+        rpu_execution={"vision": {"chunk_size": 768}},
+    ).preflight_images([object(), object()])
+
+    processor_done.clear()
+    errors = []
+
+    def rerun_preflight() -> None:
+        try:
+            policy.preflight_images([object(), object()])
+        except BaseException as exc:
+            errors.append(exc)
+
+    policy._rpu_build_lock.acquire()
+    worker = threading.Thread(target=rerun_preflight)
+    try:
+        worker.start()
+        assert processor_done.wait(timeout=2)
+        assert worker.is_alive()
+        with pytest.raises(RPUBackendError, match="already building"):
+            policy.to("rpu")
+        assert claims == []
+    finally:
+        policy._rpu_build_lock.release()
+        worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert errors == []
 
 
 def test_model_example_check_config_does_not_import_native(tmp_path: Path) -> None:
@@ -618,6 +842,15 @@ def test_policy_runtime_env_rejects_unknown_keys_before_mutation(
             {
                 "RPU_WALL_OSS_FUSED_DENOISE": "1",
                 "RPU_FASTREPLAY_SKIP_SYNC": "False",
+                "RPU_LINEAR_ACC32": "0",
+                "RPU_RMSNORM_NEWTON": "0",
+                "RPU_WALL_OSS_ACTION_FP32_TAIL": "0",
+                "RPU_WALL_OSS_BATCH_VISION": "0",
+                "RPU_WALL_OSS_GENERIC_PROLOGUE": "0",
+                "RPU_WALL_OSS_MULTISUITE_PROLOGUE": "0",
+                "RPU_WALL_OSS_PROLOGUE_FILLER": "",
+                "RPU_WALL_OSS_SHORT_PROMPT": "0",
+                "RPU_WALL_OSS_VISION_LAYER_GROUP": "0",
             },
         ),
         (
@@ -731,6 +964,89 @@ def test_hy_norm_stats_and_tokenizer_are_fail_closed(monkeypatch) -> None:
         lambda *args, **kwargs: kwargs,
     )
     assert policy._tokenizer()["trust_remote_code"] is False
+
+
+def test_hy_rejects_unreachable_three_camera_prefix_before_build() -> None:
+    from rpu_backend.api import HyEmbodiedPolicy
+
+    with pytest.raises(ValueError, match=r"\[192,240\]"):
+        HyEmbodiedPolicy.from_checkpoint("unused/checkpoint", prefix_len=176)
+    assert HyEmbodiedPolicy.from_checkpoint(
+        "unused/checkpoint", prefix_len=192
+    ).prefix_len == 192
+
+
+@pytest.mark.parametrize("location", ["image", "noise", "state", "state_emb"])
+def test_hy_rejects_non_finite_observation_before_runner(
+    location: str,
+) -> None:
+    import torch
+
+    from rpu_backend.api import HyEmbodiedPolicy
+
+    prefill_mask = torch.zeros(240, 240, dtype=torch.bool)
+    prefill_mask[0, 0] = True
+    obs = {
+        "images": [torch.zeros(1, 3, 224, 224) for _ in range(3)],
+        "lang_tokens": torch.zeros(64, dtype=torch.long),
+        "prefill_mask": prefill_mask,
+        "prefill_pos": torch.zeros(240),
+        "modality_mask": torch.zeros(240, dtype=torch.bool),
+        "denoise_mask": torch.zeros(51, 291, dtype=torch.bool),
+        "suffix_pos": torch.zeros(51),
+        "noise": torch.zeros(1, 50, 32),
+        "state": torch.zeros(1, 32),
+        "n_valid": 1,
+    }
+    if location == "image":
+        obs["images"][1][0, 0, 0, 0] = torch.nan
+    elif location == "state_emb":
+        del obs["state"]
+        obs["state_emb"] = torch.zeros(1, 1, 1024)
+        obs["state_emb"][0, 0, 0] = torch.inf
+    else:
+        obs[location].reshape(-1)[0] = torch.inf
+
+    class Runner:
+        called = False
+
+        def get_action(self, **_kwargs):
+            self.called = True
+            raise AssertionError("runner must not see a non-finite observation")
+
+    policy = HyEmbodiedPolicy.from_checkpoint("unused/checkpoint")
+    policy._rpu_ready = True
+    policy._runner = Runner()
+    with pytest.raises(ValueError, match="NaN/Inf"):
+        policy.infer(obs=obs)
+    assert policy._runner.called is False
+
+
+def test_hy_rejects_non_finite_ee_pose_before_decoder_or_runner() -> None:
+    import torch
+
+    from rpu_backend.api import HyEmbodiedPolicy
+
+    class Decoder:
+        def encode_state(self, _ee_pose):
+            raise AssertionError("decoder must not see a non-finite ee_pose")
+
+    class Runner:
+        def get_action(self, **_kwargs):
+            raise AssertionError("runner must not see a non-finite ee_pose")
+
+    policy = HyEmbodiedPolicy.from_checkpoint("unused/checkpoint")
+    policy._rpu_ready = True
+    policy._decoder = Decoder()
+    policy._runner = Runner()
+    ee_pose = torch.zeros(16)
+    ee_pose[-1] = torch.nan
+    with pytest.raises(ValueError, match="NaN/Inf"):
+        policy.infer(
+            images=[torch.zeros(3, 2, 2) for _ in range(3)],
+            instruction="unused",
+            ee_pose=ee_pose,
+        )
 
 
 @pytest.mark.parametrize(

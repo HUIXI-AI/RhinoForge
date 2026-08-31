@@ -23,6 +23,25 @@ set(CMAKE_PREFIX_PATH ${TORCH_CMAKE_PREFIX} ${CMAKE_PREFIX_PATH})
 find_package(Torch REQUIRED)
 find_package(rhino_launch 1.0.0 EXACT CONFIG REQUIRED)
 
+# Rhino Launch 1.0.0 existed before the batch-reservation API.  Check the
+# capability itself so a same-version stale header or shared library fails at
+# configure time instead of producing a broken extension.
+include(CheckCXXSourceCompiles)
+include(CMakePushCheckState)
+cmake_push_check_state(RESET)
+set(CMAKE_REQUIRED_LIBRARIES rhino_launch::rhino_launch)
+unset(RHINOFORGE_HAS_LAUNCH_BATCH_RESERVATION CACHE)
+check_cxx_source_compiles(
+    "#include <rhino_launch_queue.h>
+     int main() { return rhino_lkn::ReserveBatchBuffers() ? 0 : 1; }"
+    RHINOFORGE_HAS_LAUNCH_BATCH_RESERVATION)
+cmake_pop_check_state()
+if(NOT RHINOFORGE_HAS_LAUNCH_BATCH_RESERVATION)
+    message(FATAL_ERROR
+        "RhinoForge requires a Rhino Launch package with "
+        "rhino_lkn::ReserveBatchBuffers; install the runtime-set package")
+endif()
+
 # Add torch lib directory so linker can find libtorch_python.so
 execute_process(
     COMMAND ${Python3_EXECUTABLE} -c "import torch; print(torch.utils.cmake_prefix_path + '/../../lib')"

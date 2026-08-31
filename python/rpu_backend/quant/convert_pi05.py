@@ -1,11 +1,13 @@
-"""Offline W8A16 / fake-W4 quantization for Pi0.5 Gemma projection weights.
+"""Offline W8A16 / mixed W4A16-G32-KV8 quantization for Pi0.5.
 
-The VLM Gemma decoder and action expert decoder projections are quantized.
-SigLIP, AdaRMS dense, action projection, and processor sidecar tensors remain
-fp16/original. Fake-W4 stores signed 4-bit values in int8 tensors and still
-uses the existing W8A16 runtime kernel; it is a numerical probe only. The
-output deliberately omits model_remapped.safetensors so the Pi05 loader
-regenerates a remap from the quantized source tensors.
+Only the declared VLM Gemma decoder and action-expert decoder Linear projection
+weights are quantized. In the runtime W4 profile, q/o/gate/up/down use symmetric
+W4 group-size-32 weights while K/V projection weights stay W8; activations and
+the KV cache stay FP16. SigLIP, AdaRMS dense, action projection, and processor
+sidecar tensors remain fp16/original. Fake-W4 keeps per-channel scales and the
+W8A16 runtime kernel as a numerical probe. The output deliberately omits
+model_remapped.safetensors so the Pi05 loader regenerates a remap from the
+quantized source tensors.
 """
 from __future__ import annotations
 
@@ -21,12 +23,14 @@ from safetensors.torch import load_file, save_file
 
 try:
     from ._common import quantize_linear_per_channel
+    from .int4_pgrp_pack import quantize_int4_group_wise
 except ImportError:
     from _common import quantize_linear_per_channel
+    from int4_pgrp_pack import quantize_int4_group_wise
 
 
-PI05_EXPERT_ANCHOR = ".paligemma_with_expert.gemma_expert.model.layers."
-PI05_VLM_ANCHOR = ".paligemma_with_expert.paligemma.model.language_model.layers."
+PI05_EXPERT_ANCHOR = "paligemma_with_expert.gemma_expert.model.layers."
+PI05_VLM_ANCHOR = "paligemma_with_expert.paligemma.model.language_model.layers."
 PI05_PROJ_SUFFIXES = (
     "self_attn.q_proj.weight",
     "self_attn.k_proj.weight",
@@ -36,6 +40,7 @@ PI05_PROJ_SUFFIXES = (
     "mlp.up_proj.weight",
     "mlp.down_proj.weight",
 )
+PI05_W4_GROUP_SIZE = 32
 
 
 def _scale_name(weight_name: str) -> str:
@@ -105,6 +110,7 @@ def _convert_tensor(
     *,
     bits: int,
     int8_keep_suffixes: tuple[str, ...] = (),
+    group_size: int = 0,
 ) -> tuple[dict[str, torch.Tensor], int, int, int]:
     bytes_in = tensor.numel() * tensor.element_size()
     if _is_pi05_quant_proj(name):
@@ -121,7 +127,10 @@ def _convert_tensor(
                 f"cannot quantize non-floating tensor {name!r} "
                 f"with dtype {tensor.dtype}"
             )
-        w_int8, scale = quantize_linear_per_channel(tensor, bits=eff_bits)
+        if eff_bits == 4 and group_size:
+            w_int8, scale, _ = quantize_int4_group_wise(tensor, group_size)
+        else:
+            w_int8, scale = quantize_linear_per_channel(tensor, bits=eff_bits)
         bytes_out = (
             w_int8.numel() * w_int8.element_size()
             + scale.numel() * scale.element_size()
@@ -165,28 +174,35 @@ def _quant_config(*, bits: int, int8_keep_suffixes: tuple[str, ...] = (),
         int8_keep_suffixes, real_w4=real_w4)
     if bits == 4:
         method = "w4a16" if real_w4 else "w4a16_fake_int8"
-        kernel = "wint4a16" if real_w4 else "w8a16"
+        kernel = "wint4a16_pgrp" if real_w4 else "w8a16"
         note = (
-            "Real W4: int4 values stored in int8 on disk; runtime packs to uint8 "
-            "[N,K/2] and dispatches to the wINT4 kernel. mixed_int8_suffixes stay INT8."
+            "Pi0.5 mixed W4A16-G32-KV8: only the declared Gemma VLM/action-expert "
+            "Linear projection weights are quantized. mixed_int8_suffixes use W8 "
+            "and always include K/V; the remaining declared projections use W4 G32. "
+            "Activations and KV cache stay FP16. INT4 values are stored in INT8 on "
+            "disk with scale [G=K/32,N], then packed to the controller-striped pgrp "
+            "ABI at runtime."
         ) if real_w4 else (
             "Fake W4 numerical probe: signed int4 values stored in int8; "
             "runtime intentionally uses existing W8A16 kernel. "
             "mixed_int8_suffixes (if any) are kept at full INT8."
         )
-        return {
+        config = {
             "method": method,
-            "mode": "per_channel_symmetric",
+            "mode": "group_wise_symmetric" if real_w4 else "per_channel_symmetric",
             "qaxis": 0,
             "target": "pi05_gemma_vlm_and_expert",
             "quantized_projection_suffixes": list(PI05_PROJ_SUFFIXES),
             "storage": "int8",
             "value_bits": 4,
             "mixed_int8_suffixes": list(int8_keep_suffixes),
-            "scale": "per_output_channel",
+            "scale": "per_group_GxN" if real_w4 else "per_output_channel",
             "kernel": kernel,
             "note": note,
         }
+        if real_w4:
+            config["group_size"] = PI05_W4_GROUP_SIZE
+        return config
     if real_w4:
         raise ValueError("real_w4=True requires bits=4")
     if bits == 8:
@@ -258,6 +274,7 @@ def convert_checkpoint(
                 converted, n_quant, n_copy, bytes_out = _convert_tensor(
                     name, tensors[name], bits=bits,
                     int8_keep_suffixes=int8_keep_suffixes,
+                    group_size=PI05_W4_GROUP_SIZE if real_w4 else 0,
                 )
                 out.update(converted)
                 stats["n_quantized"] += n_quant
@@ -333,10 +350,13 @@ def main(argv: list[str] | None = None) -> int:
         "--real-w4",
         action="store_true",
         help=(
-            "tag the checkpoint method=w4a16 (real packed INT4): runtime packs to "
-            "uint8 [N,K/2] and uses the wINT4 kernel. Requires --fake-w4 quantization "
-            "(same int4-in-int8 on-disk storage). k_proj/v_proj are automatically "
-            "kept at INT8. Without this, method stays w4a16_fake_int8 (W8A16 kernel)."
+            "emit the Pi0.5 mixed W4A16-G32-KV8 profile under the legacy "
+            "method=w4a16 runtime tag: by default q/o/gate/up/down Linear weights "
+            "use W4 G32, k_proj/v_proj weights stay W8, and activations/KV cache "
+            "stay FP16. Additional --keep-int8 tokens define controlled variants. "
+            "Runtime packs INT4 to the pgrp ABI and uses the wINT4 kernel. Requires "
+            "--fake-w4 for the int4-in-int8 on-disk representation. Without this, "
+            "method stays w4a16_fake_int8 (W8A16 kernel)."
         ),
     )
     args = parser.parse_args(argv)

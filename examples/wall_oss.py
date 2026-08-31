@@ -112,7 +112,7 @@ def main() -> int:
         active_slots=model_config.get("active_slots"),
         runtime_env=model_config.get("runtime_env"),
         rpu_execution=config.get("rpu_execution"),
-    ).to("rpu")
+    ).preflight_images(images).to("rpu")
     request = config["request"]
     infer_options = {
         name: request[name]

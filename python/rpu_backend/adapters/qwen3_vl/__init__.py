@@ -32,7 +32,11 @@ import torch.nn as nn
 
 import rpu_backend
 from rpu_backend.runtime.log import _LOG
-from rpu_backend.api.causal_lm import _claim_live_instance
+from rpu_backend.api.causal_lm import (
+    _claim_live_instance,
+    _poison_live_instance,
+    _release_live_instance,
+)
 from rpu_backend.runtime.device import extract_to_device_target, is_rpu_device_target
 from rpu_backend.api.errors import RPUBackendError, UnsupportedModelError
 from rpu_backend.api.cache import RPUCache
@@ -49,6 +53,7 @@ from rpu_backend.runtime.weights import (
 from . import patches  # noqa: F401 — idempotent class swaps at import time
 from .text import (
     QWEN3_VL_TEXT_ARCH,
+    _QWEN3_VL_32B_RESERVED_INSTALL_TOKEN,
     _deepstack_text_layer_indices,
     build_mrope_cos_sin_tables,
     get_or_create_zero_keepalive,
@@ -127,12 +132,18 @@ _QWEN3_VL_8B_VISION_PROFILE = (
 )
 _QWEN3_VL_8B_VISION_SEMANTICS = ("qwen3_vl", 3, 2304)
 
-# Qwen3-VL-32B W8A16 is integrated only as a controlled-evaluation path.  The
-# retained-Graph path produces exactly zero logits from the third decode step.
-# Keep it outside the supported profile registry
-# and require an exact opt-in before model loading or any irreversible mutation.
+# Qwen3-VL-32B W8A16 remains a controlled Source-only path while its numeric,
+# task, performance, and release-runtime gates are pending.  Keep it outside
+# the supported profile registry and require an exact opt-in before model
+# loading or any irreversible mutation.  The environment name is retained for
+# compatibility with the earlier graph-blocked diagnostic entry.
 _QWEN3_VL_32B_GRAPH_BLOCKED_ENV = "QWEN3_VL_32B_ALLOW_GRAPH_BLOCKED"
 _QWEN3_VL_32B_TEXT_PROFILE = (5120, 25600, 64, 8)
+_QWEN3_VL_32B_MAX_SEQ_LEN = 128
+_QWEN3_VL_32B_INPUT_SEQ_LEN = 81
+_QWEN3_VL_32B_PIXEL_SHAPE = (256, 1536)
+_QWEN3_VL_32B_IMAGE_GRID = (1, 16, 16)
+_QWEN3_VL_32B_REQUIRED_LKN_BATCH_CONFIG = (65_536, 8, 64) * 2
 _QWEN3_VL_TEXT_PROJECTIONS = (
     "self_attn.q_proj",
     "self_attn.k_proj",
@@ -170,6 +181,31 @@ def _is_qwen3_vl_32b_w8a16_config(config) -> bool:
     return is_qwen3_vl_32b_w8a16_config(config)
 
 
+def _preflight_qwen3_vl_32b_rpu_runtime(config, *, entry_point: str) -> None:
+    """Require the reserved-buffer feature and exact cold Launch config."""
+    if not _is_qwen3_vl_32b_w8a16_config(config):
+        return
+    try:
+        reserve_batch_buffers = rpu_backend._cpp_ext.reserve_batch_buffers
+        if not callable(reserve_batch_buffers):
+            raise TypeError("reserve_batch_buffers is not callable")
+        batch_config = tuple(
+            int(value)
+            for value in rpu_backend._cpp_ext.get_lkn_batch_config()
+        )
+    except Exception as exc:
+        raise RPUBackendError(
+            f"{entry_point}: the exact 32B W8A16 profile requires a runtime "
+            "with reserved Graph-buffer support."
+        ) from exc
+    if batch_config != _QWEN3_VL_32B_REQUIRED_LKN_BATCH_CONFIG:
+        raise RPUBackendError(
+            f"{entry_point}: the exact 32B W8A16 profile requires unchanged "
+            "load/current LKN_MAX_BATCH_ENTRIES=65536, LKN_KD_BUF_MB=8, and "
+            f"LKN_INSTR_BUF_MB=64; got {batch_config}."
+        )
+
+
 def _check_profile(config) -> None:
     """Validate the admitted Qwen3-VL profiles before weight mutation."""
     if getattr(config, "model_type", None) != "qwen3_vl":
@@ -193,17 +229,15 @@ def _check_profile(config) -> None:
         if os.environ.get(_QWEN3_VL_32B_GRAPH_BLOCKED_ENV) != "1":
             raise UnsupportedModelError(
                 "Qwen3VLAdapter: the exact Qwen3-VL-32B W8A16 profile is "
-                "graph-blocked: retained Graph replay produces all-zero logits "
-                "from the third decode step. It is not a "
-                "supported profile. Set exact "
+                "Source-only and fail-closed by default. Set the legacy-named "
                 f"{_QWEN3_VL_32B_GRAPH_BLOCKED_ENV}=1 only for controlled "
-                "evaluation; clearing the graph per token is not an accepted "
-                "runtime workaround."
+                "evaluation with a matching reserved-buffer runtime; this "
+                "opt-in does not confer support."
             )
     elif profile == _QWEN3_VL_32B_TEXT_PROFILE:
         raise UnsupportedModelError(
             "Qwen3VLAdapter: only the exact Qwen3-VL-32B W8A16 config may enter "
-            "the graph-blocked controlled-evaluation path; architecture, text "
+            "the controlled Source-only path; architecture, text "
             "geometry, logical vision geometry, and quant method must all match."
         )
     elif profile not in _SUPPORTED_TEXT_PROFILES:
@@ -648,6 +682,13 @@ class Qwen3VLAdapter:
                 "loading model weights."
             )
 
+    @classmethod
+    def preflight_rpu_runtime(cls, config) -> None:
+        _preflight_qwen3_vl_32b_rpu_runtime(
+            config,
+            entry_point="RPUModelForConditionalGeneration.from_pretrained",
+        )
+
     def __init__(self, model) -> None:
         _check_profile(model.config)
         self.model = model
@@ -791,6 +832,11 @@ class Qwen3VLAdapter:
                 is_graph_blocked_32b_w8a16 = (
                     _validate_qwen3_vl_32b_w8a16_model(self.model)
                 )
+            if is_graph_blocked_32b_w8a16:
+                _preflight_qwen3_vl_32b_rpu_runtime(
+                    self.model.config,
+                    entry_point="Qwen3VLAdapter.to_rpu()",
+                )
             cfg = self.model.config
             text_cfg = cfg.text_config
             vision_cfg = cfg.vision_config
@@ -805,7 +851,21 @@ class Qwen3VLAdapter:
                 (vision_model, "forward" in vars(vision_model), vars(vision_model).get("forward")),
             ]
 
+            # Reuse HostDDR mappings across weights and request temporaries.
+            # This must precede every RPU allocation, including reserved Launch
+            # buffers for the exact 32B profile.
+            torch.rpu.set_caching_allocator(True)
             _claim_live_instance(self.model)
+            if is_graph_blocked_32b_w8a16:
+                try:
+                    rpu_backend._cpp_ext.reserve_batch_buffers()
+                except BaseException:
+                    _release_live_instance(self.model)
+                    raise
+                _poison_live_instance(
+                    self.model,
+                    "Qwen3-VL-32B W8A16 reserved Graph-buffer ownership",
+                )
             self.model._rpu_swizzle_started = True
             mutation_started = True
 
@@ -875,7 +935,19 @@ class Qwen3VLAdapter:
                     _qwen3_vl_text_scale_lists(text_model)
                     if is_graph_blocked_32b_w8a16 else None
                 ),
+                _reserved_32b_token=(
+                    _QWEN3_VL_32B_RESERVED_INSTALL_TOKEN
+                    if is_graph_blocked_32b_w8a16 else None
+                ),
             )
+            if is_graph_blocked_32b_w8a16:
+                bounded_text_cache = rpu_backend.graph.GraphCache(max_entries=2)
+                text_model._rpu_text_graph_cache = bounded_text_cache
+                text_model._rpu_decoder_graph_cache = bounded_text_cache
+                vision_model._rpu_vision_graph_cache = (
+                    rpu_backend.graph.GraphCache(max_entries=1)
+                )
+                text_model._rpu_text_exact_32b_w8a16 = True
 
             # ---------- Step F: push lm_head weight to C++ -------------------
             handle = text_model._rpu_decoder_handle
@@ -1219,6 +1291,222 @@ def _rpu_qwen3vl_forward(
     text_cfg = self.config.text_config
     hidden_size = text_cfg.hidden_size
     spatial_merge_size = vision_cfg_or(self).spatial_merge_size
+
+    exact_32b_w8a16 = getattr(
+        text_model, "_rpu_text_exact_32b_w8a16", False
+    )
+    if exact_32b_w8a16:
+        if pixel_values_videos is not None or video_grid_thw is not None:
+            raise NotImplementedError(
+                "Qwen3VL-32B W8A16 RPU forward supports one still image; "
+                "video is outside the validated Graph envelope."
+            )
+        if pixel_values is not None:
+            if (
+                not isinstance(image_grid_thw, torch.Tensor)
+                or tuple(image_grid_thw.shape) != (1, 3)
+            ):
+                raise ValueError(
+                    "Qwen3VL-32B W8A16 RPU forward requires exactly one "
+                    "still-image grid row [1, height, width]."
+                )
+            if image_grid_thw.dtype not in integer_dtypes:
+                raise TypeError(
+                    "Qwen3VL-32B W8A16 RPU forward requires an integer "
+                    "image_grid_thw."
+                )
+            if image_grid_thw.device.type != "cpu":
+                raise ValueError(
+                    "Qwen3VL-32B W8A16 RPU forward requires CPU "
+                    "image_grid_thw."
+                )
+            grid = image_grid_thw.detach().to("cpu", dtype=torch.long).reshape(3)
+            if int(grid[0]) != 1 or not bool(torch.all(grid > 0).item()):
+                raise ValueError(
+                    "Qwen3VL-32B W8A16 RPU forward requires exactly one "
+                    "still-image grid [1, positive height, positive width]."
+                )
+        elif image_grid_thw is not None:
+            raise ValueError(
+                "Qwen3VL-32B W8A16 RPU forward received image_grid_thw "
+                "without pixel_values."
+            )
+
+        if input_ids is None and inputs_embeds is None:
+            raise ValueError(
+                "Qwen3VL RPU forward: must provide input_ids or inputs_embeds."
+            )
+        request_seq_len = int(
+            inputs_embeds.shape[1]
+            if inputs_embeds is not None else input_ids.shape[1]
+        )
+        if (input_ids is not None and inputs_embeds is not None
+                and input_ids.shape[1] != inputs_embeds.shape[1]):
+            raise ValueError(
+                "Qwen3VL-32B W8A16 RPU forward requires input_ids and "
+                "inputs_embeds to have the same sequence length."
+            )
+        if inputs_embeds is not None and inputs_embeds.shape[-1] != hidden_size:
+            raise ValueError(
+                "Qwen3VL RPU forward: inputs_embeds hidden dimension "
+                f"{inputs_embeds.shape[-1]} != model hidden_size {hidden_size}."
+            )
+        request_position = int(past_key_values.position)
+        request_horizon = min(
+            int(past_key_values.max_seq_len), _QWEN3_VL_32B_MAX_SEQ_LEN
+        )
+        if request_position + request_seq_len > request_horizon:
+            raise ValueError(
+                "Qwen3VL RPU forward: logical sequence exceeds KV-cache horizon: "
+                f"position={request_position}, seq_len={request_seq_len}, "
+                f"max_seq_len={request_horizon}"
+            )
+
+        if pixel_values is not None:
+            if request_position != 0:
+                raise NotImplementedError(
+                    "Qwen3VL-32B W8A16 RPU forward accepts image input only "
+                    "for the initial prefill at cache position 0."
+                )
+            if input_ids is None or inputs_embeds is not None:
+                raise NotImplementedError(
+                    "Qwen3VL-32B W8A16 RPU image prefill requires input_ids "
+                    "and does not accept inputs_embeds."
+                )
+            if request_seq_len != _QWEN3_VL_32B_INPUT_SEQ_LEN:
+                raise ValueError(
+                    "Qwen3VL-32B W8A16 RPU image prefill requires exactly "
+                    f"{_QWEN3_VL_32B_INPUT_SEQ_LEN} input tokens."
+                )
+            if attention_mask is None:
+                raise ValueError(
+                    "Qwen3VL-32B W8A16 RPU image prefill requires the "
+                    "processor attention_mask."
+                )
+            if position_ids is not None or cache_position is not None:
+                raise NotImplementedError(
+                    "Qwen3VL-32B W8A16 RPU image prefill computes positions "
+                    "from the processor inputs; explicit position_ids or "
+                    "cache_position is outside the validated profile."
+                )
+            if type(logits_to_keep) is not int or logits_to_keep != 1:
+                raise ValueError(
+                    "Qwen3VL-32B W8A16 RPU forward requires "
+                    "logits_to_keep=1."
+                )
+            if tuple(int(value) for value in grid.tolist()) != _QWEN3_VL_32B_IMAGE_GRID:
+                raise ValueError(
+                    "Qwen3VL-32B W8A16 RPU image prefill requires exact "
+                    f"image_grid_thw={list(_QWEN3_VL_32B_IMAGE_GRID)}."
+                )
+            merge_size = int(spatial_merge_size)
+            if (
+                merge_size <= 0
+                or int(grid[1]) % merge_size != 0
+                or int(grid[2]) % merge_size != 0
+            ):
+                raise ValueError(
+                    "Qwen3VL-32B W8A16 RPU forward requires each image-grid "
+                    "axis to be divisible by spatial_merge_size."
+                )
+            if not isinstance(pixel_values, torch.Tensor):
+                raise TypeError(
+                    "Qwen3VL-32B W8A16 RPU forward requires tensor pixel_values."
+                )
+            if (
+                pixel_values.device.type != "cpu"
+                or pixel_values.dtype != torch.float32
+                or tuple(pixel_values.shape) != _QWEN3_VL_32B_PIXEL_SHAPE
+            ):
+                raise ValueError(
+                    "Qwen3VL-32B W8A16 RPU image prefill requires CPU float32 "
+                    f"pixel_values with shape {_QWEN3_VL_32B_PIXEL_SHAPE}."
+                )
+            patch_rows = int(torch.prod(grid).item())
+            merge_area = merge_size ** 2
+            if patch_rows % merge_area != 0:
+                raise ValueError(
+                    "Qwen3VL-32B W8A16 RPU forward grid product must be "
+                    "divisible by spatial_merge_size squared."
+                )
+            expected_visual_rows = patch_rows // merge_area
+            input_ids_cpu = input_ids.detach().to("cpu", dtype=torch.long)
+            vocab_size = getattr(text_cfg, "vocab_size", None)
+            if (
+                not isinstance(vocab_size, int)
+                or vocab_size <= 0
+                or bool(((input_ids_cpu < 0) | (input_ids_cpu >= vocab_size)).any())
+            ):
+                raise ValueError(
+                    "Qwen3VL-32B W8A16 RPU image prefill requires every "
+                    "input token id to be inside the model vocabulary."
+                )
+            image_mask = input_ids_cpu == self.config.image_token_id
+            image_positions = torch.nonzero(
+                image_mask.reshape(-1), as_tuple=False
+            ).reshape(-1)
+            actual_visual_tokens = int(image_positions.numel())
+            if actual_visual_tokens != expected_visual_rows:
+                raise ValueError(
+                    "Qwen3VL-32B W8A16 RPU forward image token count "
+                    f"{actual_visual_tokens} != merged grid rows "
+                    f"{expected_visual_rows}."
+                )
+            expected_positions = torch.arange(
+                int(image_positions[0]),
+                int(image_positions[0]) + expected_visual_rows,
+                dtype=torch.long,
+            )
+            if not torch.equal(image_positions, expected_positions):
+                raise ValueError(
+                    "Qwen3VL-32B W8A16 RPU image prefill requires the image "
+                    "tokens to form one contiguous processor group."
+                )
+            if (
+                not isinstance(mm_token_type_ids, torch.Tensor)
+                or mm_token_type_ids.device.type != "cpu"
+                or mm_token_type_ids.dtype not in integer_dtypes
+                or tuple(mm_token_type_ids.shape) != tuple(input_ids.shape)
+            ):
+                raise ValueError(
+                    "Qwen3VL-32B W8A16 RPU image prefill requires CPU integer "
+                    "mm_token_type_ids matching input_ids shape."
+                )
+            expected_mm_types = image_mask.to(dtype=torch.long)
+            if not torch.equal(
+                mm_token_type_ids.detach().to(dtype=torch.long),
+                expected_mm_types,
+            ):
+                raise ValueError(
+                    "Qwen3VL-32B W8A16 RPU image prefill requires processor "
+                    "mm_token_type_ids to mark exactly the image tokens."
+                )
+        else:
+            if input_ids is None or inputs_embeds is not None:
+                raise NotImplementedError(
+                    "Qwen3VL-32B W8A16 RPU decode requires one input token "
+                    "and does not accept inputs_embeds."
+                )
+            if (
+                attention_mask is not None
+                or position_ids is not None
+                or cache_position is not None
+                or mm_token_type_ids is not None
+            ):
+                raise NotImplementedError(
+                    "Qwen3VL-32B W8A16 RPU decode accepts only input_ids and "
+                    "the existing RPU cache."
+                )
+            if request_seq_len != 1 or request_position not in range(81, 84):
+                raise ValueError(
+                    "Qwen3VL-32B W8A16 RPU decode requires one token at cache "
+                    "position 81, 82, or 83."
+                )
+            if type(logits_to_keep) is not int or logits_to_keep != 1:
+                raise ValueError(
+                    "Qwen3VL-32B W8A16 RPU forward requires "
+                    "logits_to_keep=1."
+                )
 
     # ----- Vision encoder pass (image OR video) ----------------------------
     # HF `get_video_features` is literally `get_image_features` — same vision

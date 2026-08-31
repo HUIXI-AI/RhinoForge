@@ -577,7 +577,7 @@ class WallOssVision:
         return torch.cat(merged, dim=0)
 
     def _native_chunk_size(self, grid_group: torch.Tensor) -> int:
-        """Return the one chunk size the native forward will actually use."""
+        """Return the resolved first native compute chunk for this group."""
         seq = int(grid_group.prod(-1).sum().item())
         if (
             grid_group.size(0) > 1
@@ -585,17 +585,20 @@ class WallOssVision:
             and seq == _LAYER_GROUP_TOTAL_SEQ
         ):
             seq = int(grid_group[0].prod().item())
-        return ((seq + 15) // 16) * 16
+            return ((seq + 15) // 16) * 16
+        aligned = ((seq + 15) // 16) * 16
+        requested = getattr(self, "_execution_chunk_size", "auto")
+        return aligned if requested == "auto" else min(aligned, int(requested))
 
     def _validate_execution_chunks(self, chunks) -> None:
         requested = getattr(self, "_execution_chunk_size", "auto")
         if requested == "auto":
             return
         native = tuple(int(chunk) for chunk in chunks)
-        if any(chunk != int(requested) for chunk in native):
+        if any(chunk <= 0 or chunk > int(requested) for chunk in native):
             raise ValueError(
-                "Wall-OSS vision chunk_size must equal every native Vision "
-                f"forward chunk for this request: requested={requested}, "
+                "Wall-OSS vision resolved chunk exceeds its fixed capacity: "
+                f"capacity={requested}, "
                 f"native={native}"
             )
 
@@ -761,13 +764,31 @@ class WallOssVision:
                      fused: bool = False) -> torch.Tensor:
         """Single-image ViT (grid_cpu [1, 3]) → merged [patches/4, 2048].
 
-        Supports full or window attention with at most 256 patches. When `fused`, return the
-        RAW window-order merged + stash `_pending_rev` (the runtime applies the reverse
-        inside assemble_inputs_embeds_rev)."""
+        The release profile supports the existing one-chunk path plus exact
+        1024-row dense-window Vision through 768+256. When `fused`, return the
+        RAW window-order merged + stash `_pending_rev` (the runtime applies the
+        reverse inside assemble_inputs_embeds_rev)."""
         seq = int(grid_cpu.prod(-1).sum().item())
+        native_chunk = self._native_chunk_size(grid_cpu)
         self._validate_execution_chunks(
-            (self._native_chunk_size(grid_cpu),)
+            (native_chunk,)
         )
+        if seq > native_chunk and (seq, native_chunk) != (1024, 768):
+            raise ValueError(
+                "Wall-OSS Vision multi-chunk is admitted only for the exact "
+                f"1024-row image with a 768+256 plan, got seq={seq}, "
+                f"chunk={native_chunk}"
+            )
+        if seq > native_chunk and self._per_window_sdpa:
+            raise ValueError(
+                "Wall-OSS per-window SDPA multi-chunk is not implemented; "
+                "use the dense-window-mask release path"
+            )
+        if seq > self.cache.max_seq_len:
+            raise ValueError(
+                f"vision attention seq {seq} exceeds cache capacity "
+                f"{self.cache.max_seq_len}"
+            )
         smu = self._sms * self._sms
 
         layout = self._window_layout(grid_cpu, seq)
@@ -786,15 +807,18 @@ class WallOssVision:
         v_caches = [self.cache.v_caches[i] for i in range(self.num_layers)]
 
         # Eager patch_embed/gather above uses the shared temporary arena after
-        # WallOssVLA entered the Vision subsystem. Reset again at the exact graph
-        # boundary so BUILD and every REPLAY allocate the fused Vision layout from
-        # the same t_end=0. embed_rpu/keepalive/KV live in DDR and survive this.
+        # The internal full-model runtime entered Vision. Reset again at the
+        # exact graph boundary so BUILD and every REPLAY allocate the fused Vision
+        # layout from the same t_end=0. embed_rpu/keepalive/KV live in DDR and
+        # survive this.
         torch.ops.rpu.spm_alloc_reset_temporary()
         dyn_dims = _vision_graph_dyn_dims(
             [
                 self.num_layers,
-                self._native_chunk_size(grid_cpu),
+                native_chunk,
                 int(self._window),
+                1,
+                int(seq > native_chunk),
                 int(torch.rpu.get_debug_export()),
             ],
             cu_window_seqlens if self._per_window_sdpa else None,
@@ -822,6 +846,10 @@ class WallOssVision:
                     # Defer the reverse to the runtime's fused assemble op.
                     self._pending_rev = (ri, [seq // smu])
                     return merged                                       # window order
+                # The Graph output is a fresh DDR tensor. Release its dead
+                # temporary arena before the immediate reverse gather, just as
+                # the grouped path does below.
+                torch.ops.rpu.spm_alloc_reset_temporary()
                 merged = torch.ops.rpu.gather_embedding(merged, ri)
             return merged
 
@@ -854,6 +882,13 @@ class WallOssVision:
             raise ValueError("batched group requires equal-size images")
         n_i = int(grid_group[0].prod().item())
         seq = g * n_i
+        native_chunk = self._native_chunk_size(grid_group)
+        self._validate_execution_chunks((native_chunk,))
+        if seq > native_chunk:
+            raise ValueError(
+                "Wall-OSS packed multi-image multi-chunk Vision is not "
+                "implemented; run images sequentially"
+            )
         smu = self._sms * self._sms
         layer_group = self._layer_group
         grouped_chunks = (
@@ -866,9 +901,6 @@ class WallOssVision:
                     f"patches, got {g}x{n_i}"
                 )
         cache_seq = n_i if grouped_chunks else seq
-        self._validate_execution_chunks(
-            (self._native_chunk_size(grid_group),)
-        )
         if cache_seq > self.cache.max_seq_len:
             raise ValueError(
                 f"vision attention seq {cache_seq} exceeds cache capacity "
@@ -907,7 +939,7 @@ class WallOssVision:
             shapes=[seq, self.hidden_size],
             # g distinguishes 1×768 (single big image) from g×256 (batched) — they
             # take different SDPA branches and must NOT share a cached graph.
-            dyn_dims=[self.num_layers, self._native_chunk_size(grid_group),
+            dyn_dims=[self.num_layers, native_chunk,
                       int(self._window), g,
                       layer_group if grouped_chunks else 0,
                       int(torch.rpu.get_debug_export())],

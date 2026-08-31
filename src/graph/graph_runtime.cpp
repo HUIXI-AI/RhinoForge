@@ -1223,7 +1223,9 @@ RpuKernelGraph::RpuKernelGraph()
     : lifetime_retirement_(next_graph_lifetime_id()),
       graph_lifetime_id_(lifetime_retirement_.lifetime_id) {}
 
-RpuKernelGraph::~RpuKernelGraph() = default;
+RpuKernelGraph::~RpuKernelGraph() noexcept {
+    release_prepared_queues();
+}
 
 namespace {
 
@@ -2985,7 +2987,8 @@ void RpuKernelGraph::end() {
         {
             if (force_oneshot_on_replay_enabled()) {
                 RECORD_FUNCTION("rpu_graph::execute_replay_force_oneshot", {});
-                segments_.clear();          // 丢弃 RECORDING 期 prepared_wq
+                release_prepared_queues();  // 诊断路径不保留 prepared batch
+                segments_.clear();
                 build_segments_from_nodes();
                 execute_graph_oneshot();
                 segments_.clear();
@@ -3149,10 +3152,8 @@ void RpuKernelGraph::invalidate_impl(bool from_abort) {
     // 对称,免得下一个 keep_alive 生产方继承一个静默的滞留窗口。
     tensor_refs_.clear();
     boundary_flush_ptrs_.clear();
-    // segments_ 被清,所有 seg idx 失效;private_queue_ 的 kd_buf 仍存
-    // 但内容不再对应任何 segment (即将被下一轮 prepare_segment_queue 覆写)。
-    // 重置 fingerprint 强制 fallback rebuild,防 stale data 被 sync-only 误读。
-    private_queue_built_segment_idx_ = -1;
+    // segments_ 被清后旧 kd_buf/fingerprint 都不再有效。
+    release_prepared_queues();
     // invalidate 是硬重置;两张 admission 表都清。persistent 资源由 owner
     // tree 管理；先遍历 owner tree mark_released 再 clear,跟 begin 收尾对齐。
     for (auto& r : host_callback_persistent_owners_) r.mark_released();

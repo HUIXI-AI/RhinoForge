@@ -105,21 +105,6 @@ static at::Tensor empty_256b_aligned_fp16_rpu(
     return aligned;
 }
 
-// QWEN3_5_VISION_DBG_Q=1 enables the Phase-1 RoPE-Q probe. OFF by default because
-// its 8-core scatter emits a 7+7 barrier fence per layer, i.e. ~336 extra barriers
-// across the tower. The dbg_hidden probe next to it passes num_cores=1, so those loops never run
-// and it emits ZERO barriers — it is a plain channel-0 (= stream 0 = the compute stream) DMA that
-// adds no cross-stream ordering at all.
-
-static bool dbg_q_enabled() {
-    static int cached = -1;
-    if (cached < 0) {
-        const char* e = std::getenv("QWEN3_5_VISION_DBG_Q");
-        cached = (e && (std::string(e) == "1" || std::string(e) == "true")) ? 1 : 0;
-    }
-    return cached != 0;
-}
-
 namespace v3 {
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -279,25 +264,6 @@ at::Tensor Qwen3_5VisionModel::forward(
             cache_shape, input.options(), "G0.5 temporal K cache");
         temporal_v_cache_ = empty_256b_aligned_fp16_rpu(
             cache_shape, input.options(), "G0.5 temporal V cache");
-    }
-
-    // Per-layer debug snapshots (get_debug_export() only), read after forward.
-    // Fixed DMAs bind their destinations at BUILD, so snapshots are allocated once
-    // per shape; shape changes force a rebuild.
-    if (get_debug_export()) {
-        const int64_t L = num_layers(), N = num_patches_in, H = hidden_size();
-        if (!dbg_hidden_.defined() || dbg_hidden_.size(0) != L ||
-            dbg_hidden_.size(1) != N || dbg_hidden_.size(2) != H) {
-            dbg_hidden_ = at::empty({L, N, H}, input.options());
-        }
-        if (temporal_num_frames == 1 && dbg_q_enabled()) {
-            const int64_t lq = (num_q_heads() / NUM_CORES) * head_dim();
-            if (!dbg_q_.defined() || dbg_q_.size(0) != L ||
-                dbg_q_.size(1) != (int64_t)NUM_CORES || dbg_q_.size(2) != N ||
-                dbg_q_.size(3) != lq) {
-                dbg_q_ = at::empty({L, (int64_t)NUM_CORES, N, lq}, input.options());
-            }
-        }
     }
 
     // STEP 0: the tower consumes hidden_buf_ (emit_step0's output), not the raw
@@ -940,13 +906,6 @@ void Qwen3_5VisionModel::emit_spatial_group(
         if (layer_idx == last_layer_idx) {
             emit_layer_output_dma(last_layer_idx, group, "residual1");
         }
-        if (get_debug_export()) {
-            c10::Half* dh = dbg_hidden_.data_ptr<c10::Half>() +
-                ((int64_t)layer_idx * current_num_patches_ + offset) * h;
-            rpu_launch_spm_scatter_ddr_dma(
-                addr(0, "residual1"), dh, seq_len * h,
-                seq_len * h * DWIDTH, 1);
-        }
     }
 }
 
@@ -1019,17 +978,6 @@ void Qwen3_5VisionModel::emit_kv_first_body(int layer_idx, const ChunkInfo& chun
         addr(0, "q"), q_ddr_base + q_elem_offset,
         q_local_elems, q_core_stride_bytes, NUM_CORES);
 
-    // DEBUG: snapshot rope'd Q per-layer per-core → dbg_q_[layer, core, chunk.offset:, :].
-    // Same live "q" SPM source as the q_ddr_buf_ store above. Core c writes to
-    // base + c*(N*local_q_dim); rows offset by chunk.offset (multi-chunk fills all rows).
-    if (get_debug_export() && dbg_q_enabled()) {
-        const int64_t N = current_num_patches_;
-        c10::Half* dq = dbg_q_.data_ptr<c10::Half>()
-                      + ((int64_t)layer_idx * NUM_CORES * N + chunk.offset) * local_q_dim;
-        rpu_launch_spm_scatter_ddr_dma(
-            addr(0, "q"), dq, q_local_elems,
-            /*core_stride_bytes=*/N * local_q_dim * DWIDTH, NUM_CORES);
-    }
 }
 
 // ── build_layer_subgraph: KV_FIRST Phase 2 — Phase 1 已做 LN/QKV/rope/存 Q 并插满
@@ -1114,24 +1062,6 @@ void Qwen3_5VisionModel::build_layer_subgraph(int layer_idx, const ChunkInfo& ch
         emit_layer_output_dma(layer_idx, chunk, "residual1");
     }
 
-    // DEBUG: snapshot this layer's output hidden (residual1 is replicated → read core 0) →
-    // dbg_hidden_[layer, chunk.offset:, :].
-    //
-    // Deliberately emitted AFTER the output DMA so debug mode does not perturb the production
-    // operation order. It still reads the same value because both copies are on stream 0 and
-    // nothing writes residual1 in between.
-    //
-    // num_cores=1 is also deliberate: it makes rpu_memcpy.cpp's `for (ch = 1; ch < num_cores)`
-    // fences no-ops, so this injects ZERO barriers (unlike dbg_q, which is 8-core — see
-    // dbg_q_enabled() at the top of this file).
-    if (get_debug_export()) {
-        const int64_t N = current_num_patches_;
-        c10::Half* dh = dbg_hidden_.data_ptr<c10::Half>()
-                      + ((int64_t)layer_idx * N + chunk.offset) * h;
-        rpu_launch_spm_scatter_ddr_dma(
-            addr(0, "residual1"), dh, seq_len * h,
-            /*core_stride_bytes=*/seq_len * h * DWIDTH, /*num_cores=*/1);
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1996,13 +1926,4 @@ int64_t rpu_qwen3_5_vision_get_resolved_chunk_size(int64_t handle) {
 void rpu_qwen3_5_vision_set_chunk_size_cap(int64_t handle, int64_t cap) {
     Qwen3_5VisionRegistry::get(handle, "rpu_qwen3_5_vision_set_chunk_size_cap")
         ->set_chunk_size_cap(cap);
-}
-
-// Per-layer debug snapshots (empty tensor until a get_debug_export() forward runs).
-// dbg_hidden = [num_layers, N, hidden]; dbg_q = [num_layers, NUM_CORES, N, local_q_dim].
-at::Tensor rpu_qwen3_5_vision_get_dbg_hidden(int64_t handle) {
-    return Qwen3_5VisionRegistry::get(handle, "rpu_qwen3_5_vision_get_dbg_hidden")->dbg_hidden();
-}
-at::Tensor rpu_qwen3_5_vision_get_dbg_q(int64_t handle) {
-    return Qwen3_5VisionRegistry::get(handle, "rpu_qwen3_5_vision_get_dbg_q")->dbg_q();
 }

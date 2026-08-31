@@ -123,25 +123,6 @@ private:
     void emit_router_select(int layer_idx, int64_t seq_len);
 
 public:
-    // DEBUG-ONLY read-back of the dense-soft router's device-computed routing
-    // weights: [nl, E, Tp], written by emit_router_select's core0->DDR relay.
-    // Allows diagnostics to inspect router shape, padding, and row sums.
-    // Not on any hot path.
-    at::Tensor debug_rw_stage() const { return rw_stage_; }
-    at::Tensor debug_wtm_stage() const { return wtm_stage_; }
-    at::Tensor debug_l0_out() const { return l0_out_; }
-    // DEBUG [Tp,h] capture of layer-0's input RMSNorm + AdaRMS output (`input_norm`),
-    // i.e. the activation both the QKV projections and the MoE branch consume. Opt-in
-    // via RPU_L2_CAPTURE_INNORM; nothing is allocated or emitted when it is off.
-    at::Tensor debug_innorm() const { return innorm_; }
-    at::Tensor debug_gcap() const { return gcap_; }
-    at::Tensor debug_acap() const { return acap_; }
-    at::Tensor debug_scap() const { return scap_; }
-    at::Tensor debug_ccap() const { return ccap_; }
-    // DEBUG-ONLY read-back of the DDR-resident packed expert weight bound to the
-    // device path (which: 0=gate, 1=up, 2=down). packed_* are DDR tensors, NOT SPM
-    // buffers, so this read-back carries none of the SPM capture-timing hazard.
-    at::Tensor debug_packed(int64_t which, int64_t layer) const;
     // Bind per-layer packed expert weights + enable the grouped path (opt-in).
     void set_packed_expert_weights(at::TensorList gate_packed, at::TensorList up_packed,
                                    at::TensorList down_packed);
@@ -157,20 +138,6 @@ public:
                          at::TensorList o_ws, at::TensorList gate_ws, at::TensorList up_ws,
                          at::TensorList down_ws);
 
-    // DEBUG-ONLY read-back of the router's REAL INPUT hidden state (residual1),
-    // [nl, Tp, h], one slot per layer. Populated ONLY when
-    // RPU_LINGBOT2_DEBUG_DUMP_ROUTER_H=1; otherwise this tensor is undefined and no
-    // DMA is emitted, so the default graph is unchanged. Exists so a CPU fp32 router
-    // reference can be computed on the SAME activations the fp16 router saw --
-    // residual1 sits AFTER attention, so it is not host-computable.
-    at::Tensor debug_router_h() const { return h_stage_; }
-    // DEBUG-ONLY all-layer residual-stream taps (opt-in via RPU_L2_CAP_RESID). layer_in =
-    // residual1 at phase-1 start (= layer input), attn_resid = residual2 after phase-5
-    // (= layer_input + attention_output). Together with debug_router_h they localise, per
-    // layer, whether the RPU-vs-CPU drift enters at attention or at the MoE MLP.
-    at::Tensor debug_layer_in() const { return lin_stage_; }
-    at::Tensor debug_attn_resid() const { return ar_stage_; }
-
 private:
 
     at::Tensor ones_pad_;     // [Tp*E] fp16 RPU — fills the router score pad rows with 1.0 so
@@ -179,10 +146,6 @@ private:
     at::Tensor expert_scatter_ids_; // [Tp,E] raw uint16 (expert*Tp+token) held in
                                     // FP16-sized DDR; persistent strict-top-k lookup
     at::Tensor rw_stage_;     // [nl, E, Tp] fp16 RPU — per-layer core0->all-cores relay
-    at::Tensor h_stage_;      // [nl, Tp, h] fp16 RPU — DEBUG router-input capture, opt-in,
-                              //          one slot PER LAYER (never overwritten downstream)
-    at::Tensor lin_stage_;    // [nl, Tp, h] fp16 RPU — DEBUG layer-input (residual1 @ phase1), opt-in
-    at::Tensor ar_stage_;     // [nl, Tp, h] fp16 RPU — DEBUG post-attention residual (residual2 @ phase5), opt-in
     std::vector<at::Tensor> router_gate_, router_bias_;   // [nl]
     std::vector<at::Tensor> expert_gate_, expert_up_, expert_down_;  // [nl*E]
     // GROUPED-EXPERTS: per-layer core-slice-interleaved packed weights.
@@ -194,17 +157,7 @@ private:
     std::vector<at::Tensor> packed_gate_s_, packed_up_s_, packed_down_s_;
     bool packed_w8a16_ = false;
     at::Tensor wtm_stage_;   // [nl, Tp, E] fp16 RPU — token-major routing-weight relay
-    at::Tensor l0_out_;      // DEBUG [Tp,h] capture of layer-0 MoE output (residual1)
-    at::Tensor innorm_;      // DEBUG [Tp,h] capture of layer-0 input_norm (post AdaRMS)
-    at::Tensor gcap_;        // DEBUG [Tp, E*Ic] core-0 gate-GEMM output, layer 0
-    at::Tensor acap_;        // DEBUG [Tp, h] core-0 routed moe_acc (post routed-down), layer 0
-    at::Tensor scap_, ccap_; // DEBUG core-0 silu-out, scale-out (fresh single-version buffers)
-    bool debug_stages_ = false;
     bool debug_down_acc16_ = false;
-    bool debug_capture_gate_ = false;
-    bool debug_capture_l0_ = false;
-    bool debug_capture_innorm_ = false;
-    bool debug_cap_resid_ = false;
     bool debug_routed_only_ = false;
     bool grouped_experts_ = false;
     int64_t num_experts_ = 0, top_k_ = 0, routed_inter_ = 0;
@@ -216,10 +169,6 @@ private:
     // Strict fp16 top-k router (RPU_LINGBOT2_FP16_TOP4=1). Selection is exactly k
     // with lower-index tie-breaking; correction bias is selection-only.
     bool fp16_top4_ = false;
-    // DEBUG router-input dump (RPU_LINGBOT2_DEBUG_DUMP_ROUTER_H=1). Independent of
-    // debug_dense_soft_router_. Default false => nothing allocated, no DMA emitted.
-    bool debug_dump_router_h_ = false;
-
     // Controlled fused-denoise state. Undefined/zero in the default host-loop
     // path, so it cannot perturb the existing graph or SPM manifest.
     bool denoise_unroll_ = false;

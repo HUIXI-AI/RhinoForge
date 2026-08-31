@@ -107,7 +107,7 @@ def _skip_idle_record_function():
     global _SKIP_IDLE_RF_ENV
     if _SKIP_IDLE_RF_ENV is None:
         import os
-        v = os.environ.get("RPU_SKIP_IDLE_RECORD_FUNCTION", "")
+        v = os.environ.get("RPU_SKIP_IDLE_RECORD_FUNCTION", "1")
         _SKIP_IDLE_RF_ENV = v in ("1", "on", "true", "True")
     if not _SKIP_IDLE_RF_ENV:
         return False
@@ -146,7 +146,7 @@ class _GraphCaptureScope:
             # 的 C++ 调用，而 profiler 未启用时它什么也不记。
             # ⚠️ **只在 profiler 确实没启用时跳过** ⇒ 开着 profiler 时行为逐字不变，
             #    trace 里该有的区间一个不少（判据见 `_skip_idle_record_function`）。
-            # ⚠️ 共享文件 ⇒ 由 `RPU_SKIP_IDLE_RECORD_FUNCTION` 控制，**全局默认 OFF**。
+            # 共享默认跳过 idle scope；显式设为 0 可回退。
             self._prof_ctx = None
             return self._graph
         try:

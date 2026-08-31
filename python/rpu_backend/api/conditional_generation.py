@@ -5,9 +5,10 @@ classes through `AutoModelForImageTextToText`. It shares
 the same single-handle gate (`_LIVE_REF` in causal_lm.py) so a CausalLM and a
 ConditionalGeneration model cannot be live on RPU simultaneously.
 
-Supported: `Qwen3VLForConditionalGeneration` (registered by
-`rpu_backend.adapters.qwen3_vl`). Other built-in conditional-generation
-architectures use their documented model-specific adapters.
+The Qwen3-VL adapter is a public Source-only integration in the v1.0.0
+release ledger; its exact profiles must pass the release gates before a
+support claim is made. Other built-in conditional-generation architectures use
+their documented model-specific adapters.
 """
 from __future__ import annotations
 
@@ -124,6 +125,8 @@ class RPUModelForConditionalGeneration:
             adapter_cls.preflight(config)
         if hasattr(adapter_cls, "preflight_execution"):
             adapter_cls.preflight_execution(config, execution_config)
+        if hasattr(adapter_cls, "preflight_rpu_runtime"):
+            adapter_cls.preflight_rpu_runtime(config)
 
         from rpu_backend.quant.load import (
             is_qwen3_vl_32b_w8a16_config,

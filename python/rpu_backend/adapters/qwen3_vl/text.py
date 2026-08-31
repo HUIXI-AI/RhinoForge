@@ -33,6 +33,7 @@ _CHUNK_ENVELOPE = {
     ("qwen3_vl_text", 28, 2048): ChunkEnvelope(336, 320),   # 2b
     ("qwen3_vl_text", 36, 2560): ChunkEnvelope(336, 256),   # 4b
     ("qwen3_vl_text", 36, 4096): ChunkEnvelope(320, 128),   # padded 8b
+    ("qwen3_vl_text", 64, 5120): ChunkEnvelope(128, 16),    # 32b W8A16
     # GR00T-N1.7-3B uses a truncated 16-layer Qwen3-VL-2B backbone. Auto is
     # validated to length 512; no exact chunk is published for this geometry.
     ("qwen3_vl_text", 16, 2048): ChunkEnvelope(512),
@@ -42,6 +43,8 @@ lookup_causal_decoder = make_lookup(
 
 QWEN3_VL_TEXT_ARCH = "qwen3_vl_text"
 _GR00T_TEXT_GEOMETRY = (QWEN3_VL_TEXT_ARCH, 16, 2048)
+_QWEN3_VL_32B_TEXT_GEOMETRY = (QWEN3_VL_TEXT_ARCH, 64, 5120)
+_QWEN3_VL_32B_RESERVED_INSTALL_TOKEN = object()
 
 
 def _deepstack_text_layer_indices(vision_config: Any) -> list[int]:
@@ -164,6 +167,7 @@ def install_qwen3_vl_text_for_rpu(
     enable_deepstack: bool = True,
     scale_lists=None,
     execution_config=None,
+    _reserved_32b_token=None,
 ) -> int:
     """Install RPU all-layers-once forward on a `Qwen3VLTextModel` instance.
 
@@ -175,6 +179,8 @@ def install_qwen3_vl_text_for_rpu(
     `causal_decoder_set_weights`. The supported Qwen3-VL ConditionalGeneration
     adapter composes this with the Vision tower; component/text-only callers can
     opt out of DeepStack via `enable_deepstack=False` or an empty layer list.
+    The 32B geometry is top-level-only because its Graph buffers must be
+    reserved before any weight migration.
 
     Args:
         text_model: Qwen3VLTextModel instance (already moved to RPU).
@@ -201,6 +207,23 @@ def install_qwen3_vl_text_for_rpu(
         raise ValueError(
             "install_qwen3_vl_text_for_rpu: text_config not provided and "
             "text_model has no .config attribute."
+        )
+    geometry = (
+        QWEN3_VL_TEXT_ARCH,
+        int(cfg.num_hidden_layers),
+        int(cfg.hidden_size),
+    )
+    if geometry == _QWEN3_VL_32B_TEXT_GEOMETRY:
+        if _reserved_32b_token is not _QWEN3_VL_32B_RESERVED_INSTALL_TOKEN:
+            raise ValueError(
+                "install_qwen3_vl_text_for_rpu: Qwen3-VL-32B may only be "
+                "installed by the gated top-level adapter after Graph-buffer "
+                "reservation."
+            )
+    elif _reserved_32b_token is not None:
+        raise ValueError(
+            "install_qwen3_vl_text_for_rpu: reserved 32B install token used "
+            "with a different text geometry."
         )
 
     rope_params = getattr(cfg, "rope_parameters", None)

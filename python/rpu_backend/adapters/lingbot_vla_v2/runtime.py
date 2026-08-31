@@ -915,6 +915,9 @@ class LingbotVlaV2Policy:
                 "remains claimed. Restart the process before loading another "
                 "policy."
             )
+        # Model and Graph references are gone, so fully idle slabs can now be
+        # unmapped without disturbing stable storage owned by another tensor.
+        torch.rpu.empty_cache()
         if getattr(self, "_live_slot_released", False):
             return
         from rpu_backend.api.causal_lm import _release_live_instance
@@ -2370,6 +2373,10 @@ def _build_lingbot_vla_v2_impl(
     vlm.eval()
 
     text_model, vision_model = vlm.language_model, vlm.visual
+    # Reuse freed blocks through the shared allocator. Live large tensors still
+    # own independent mappings, so this does not waive the profile's mapping
+    # ceiling or certify the full 6B checkpoint.
+    torch.rpu.set_caching_allocator(True)
     # Publish partial ownership before the first irreversible swizzle/RPU
     # allocation. The outer transaction can then retire any text/vision handle
     # installed before a later stage fails.

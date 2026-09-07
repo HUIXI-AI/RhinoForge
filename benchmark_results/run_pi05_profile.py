@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Calibrate and benchmark the frozen Zhiyuan Pi0.5 profile."""
+"""Calibrate and benchmark Pi0.5 checkpoints."""
 from __future__ import annotations
 
 import argparse
@@ -40,8 +40,8 @@ def make_batch(samples, index: int, device: str) -> dict[str, torch.Tensor]:
     return batch
 
 
-def fixed_noise(index: int, device: str) -> torch.Tensor:
-    generator = torch.Generator(device="cpu").manual_seed(NOISE_SEED + index)
+def fixed_noise(index: int, device: str, noise_seed: int) -> torch.Tensor:
+    generator = torch.Generator(device="cpu").manual_seed(noise_seed + index)
     return torch.randn((1, 50, 32), generator=generator, dtype=torch.float32).to(device)
 
 
@@ -56,14 +56,14 @@ def target_linears(policy) -> dict[str, nn.Linear]:
     }
 
 
-def load_policy(checkpoint: Path, device: str):
+def load_policy(checkpoint: Path, device: str, vlm_chunk_size: int):
     from rpu_backend.api import Pi05Policy
 
-    execution = {"vlm_chunk_size": 400}
+    execution = {"vlm_chunk_size": vlm_chunk_size}
     if "rpu_execution" in inspect.signature(Pi05Policy.from_pretrained).parameters:
         execution = {
             "rpu_execution": {
-                "prefill": {"chunk_size": 400, "padding_budget": 64},
+                "prefill": {"chunk_size": vlm_chunk_size, "padding_budget": 64},
                 "vision": {"chunk_size": "auto"},
                 "action": {"chunk_size": "auto"},
             }
@@ -79,10 +79,14 @@ def load_policy(checkpoint: Path, device: str):
 
 def calibrate(args) -> None:
     samples = np.load(args.samples)
-    policy = load_policy(args.checkpoint, args.device)
+    policy = load_policy(args.checkpoint, args.device, args.vlm_chunk_size)
     modules = target_linears(policy)
-    if len(modules) != 451:
-        raise RuntimeError(f"expected 451 quantized linears, found {len(modules)}")
+    if not modules:
+        raise RuntimeError("no Pi0.5 W8A16 target linears found")
+    if args.expected_linears is not None and len(modules) != args.expected_linears:
+        raise RuntimeError(
+            f"expected {args.expected_linears} quantized linears, found {len(modules)}"
+        )
 
     sums = {
         name: torch.zeros(module.in_features, dtype=torch.float32, device=args.device)
@@ -102,8 +106,8 @@ def calibrate(args) -> None:
         for index in range(len(samples["images"])):
             policy._lerobot_policy.predict_action_chunk(
                 make_batch(samples, index, args.device),
-                noise=fixed_noise(index, args.device),
-                num_steps=10,
+                noise=fixed_noise(index, args.device, args.noise_seed),
+                num_steps=args.num_steps,
             )
             print(f"[calibrate] {index + 1}/{len(samples['images'])}", flush=True)
     for hook in hooks:
@@ -113,7 +117,7 @@ def calibrate(args) -> None:
     save_file(stats, args.output, metadata={
         "algorithm": "diag_input_second_moment_v1",
         "samples": str(len(samples["images"])),
-        "noise_seed": str(NOISE_SEED),
+        "noise_seed": str(args.noise_seed),
     })
     print(json.dumps({
         "output": str(args.output),
@@ -187,7 +191,7 @@ def percentile(values: list[float], fraction: float) -> float:
 
 def run(args) -> None:
     samples = np.load(args.samples)
-    policy = load_policy(args.checkpoint, args.device)
+    policy = load_policy(args.checkpoint, args.device, args.vlm_chunk_size)
     quantized_linears = 0
     if args.precision == "w8a16" and args.device == "cuda":
         quantized_linears = configure_w8_cuda(policy, args.w8_execution)
@@ -201,7 +205,7 @@ def run(args) -> None:
         for index in range(3):
             policy._lerobot_policy.predict_action_chunk(
                 make_batch(samples, index, args.device),
-                noise=fixed_noise(index, args.device),
+                noise=fixed_noise(index, args.device, args.noise_seed),
                 num_steps=args.num_steps,
             )
         synchronize(args.device)
@@ -212,7 +216,7 @@ def run(args) -> None:
         batch_device = "cpu" if args.device == "rpu" else args.device
         noise_device = "cpu" if args.device == "rpu" else args.device
         batch = make_batch(samples, index, batch_device)
-        noise = fixed_noise(index, noise_device)
+        noise = fixed_noise(index, noise_device, args.noise_seed)
         synchronize(args.device)
         started = time.perf_counter()
         action = policy._lerobot_policy.predict_action_chunk(
@@ -238,7 +242,7 @@ def run(args) -> None:
         "w8_execution": args.w8_execution if args.precision == "w8a16" else None,
         "quantized_linears": quantized_linears,
         "samples": len(samples["images"]),
-        "noise_seed": NOISE_SEED,
+        "noise_seed": args.noise_seed,
         "denoise_steps": args.num_steps,
         "latency_ms": {
             "min": min(latencies),
@@ -268,6 +272,10 @@ def main() -> None:
     calibration.add_argument("--samples", type=Path, required=True)
     calibration.add_argument("--output", type=Path, required=True)
     calibration.add_argument("--device", choices=("cuda",), default="cuda")
+    calibration.add_argument("--num-steps", type=int, choices=(5, 10), default=10)
+    calibration.add_argument("--noise-seed", type=int, default=NOISE_SEED)
+    calibration.add_argument("--vlm-chunk-size", type=int, default=400)
+    calibration.add_argument("--expected-linears", type=int)
     calibration.set_defaults(func=calibrate)
 
     benchmark = subparsers.add_parser("run")
@@ -280,6 +288,8 @@ def main() -> None:
         "--w8-execution", choices=("native", "torchao", "dequant"), default="native"
     )
     benchmark.add_argument("--num-steps", type=int, choices=(5, 10), default=10)
+    benchmark.add_argument("--noise-seed", type=int, default=NOISE_SEED)
+    benchmark.add_argument("--vlm-chunk-size", type=int, default=400)
     benchmark.set_defaults(func=run)
     args = parser.parse_args()
     args.func(args)

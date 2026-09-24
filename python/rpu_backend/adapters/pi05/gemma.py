@@ -1,10 +1,15 @@
-"""Pi0.5 Gemma all-layers-once instance patch.
+"""Pi0.5 Gemma all-layers-once instance patch (canonical home).
 
-``Pi05Adapter`` installs this flat helper module lazily from ``to_rpu``.
+v5-03 B4: relocated from _internal/patches/pi05_all_layers_once.py L41-369
+per ADR §6.2. Pi05Adapter is the only in-tree caller (lazy import inside
+to_rpu()); test consumers live under tests/model/test_gemma_*.py.
+
+ADR §3.3 forbids reintroducing a ComponentBase abstraction; this file is
+intentionally a flat function module sharing the adapters/pi05/ namespace
+with adarms.py and siglip.py.
 """
 from __future__ import annotations
 import types
-import weakref
 
 import torch
 import torch.nn as nn
@@ -17,35 +22,37 @@ from rpu_backend.runtime.weights import (
     NUM_CORES, tp_row_swizzle_mc_weight, tp_col_swizzle_mc_weight,
 )
 from rpu_backend.api.cache import RPUCache
+from rpu_backend.runtime._native_retirement import _InstalledNativeResource
 
 
 def _gemma_graph_enabled() -> bool:
     return rpu_env_bool("RPU_PI05_GEMMA_GRAPH", default=True)
 
 
-# Native Gemma handle lifecycle helper.
+# patch-reason: (a) Gemma all-layers-once C++ handle lifecycle helper — §3a (a) run-different-op-on-RPU
 def _gemma_destroy_handle(h):
-    """Release C++ GemmaModel handle. Called by weakref.finalize on GC."""
-    try:
-        torch.ops.rpu.gemma_destroy(h)
-    except Exception:
-        # Swallow -- during interpreter shutdown the op may be gone
-        pass
+    """Raw destroy; the installed resource owns retirement failures."""
+    torch.ops.rpu.gemma_destroy(h)
 
 
 _GEMMA_RUNTIME_INSTALL_ATTRS = (
+    "_gemma_graph_enabled",
     "_rpu_cache",
     "_rpu_gemma_graph_cache",
+    "_rpu_prefill_kv_only",
     "_rpu_lazy_init_checked",
     "_rpu_required_attrs",
     "_rpu_vlm_decoder_handle",
     "_rpu_vlm_decoder_handle_finalizer",
+    "_rpu_vlm_decoder_retirement_state",
     "forward",
 )
 
 
-# Install the all-layers-once runtime on one Gemma model instance.
-def patch_gemma_model_for_rpu_all_layers_once(model) -> int:
+# patch-reason: (a) Gemma all-layers-once instance patch — §3a (a) run-different-op-on-RPU
+def patch_gemma_model_for_rpu_all_layers_once(
+    model, *, runtime_policy=None, prefill_pair_rows=400,
+) -> int:
     """
     Patch a specific Gemma/PiGemma model instance to use all-layers-once C++
     execution via GemmaModel (FusedModelBase).
@@ -58,10 +65,10 @@ def patch_gemma_model_for_rpu_all_layers_once(model) -> int:
       - No QK head norms (Gemma does not have q_norm / k_norm)
       - Gemma uses GELU activation (not SiLU)
       - Supports bidirectional attention via attention_mask (is_causal contract)
-      - RPUCache is selected automatically when past_key_values is None
+      - RPUCache is auto-created when past_key_values is None (D-14)
 
-    **Idempotent**: a failed replacement preserves the currently published
-    ``_rpu_vlm_decoder_handle`` and its forward/cache state.
+    Successful rollback preserves the published handle and forward/cache state.
+    Uncertain retirement retains both installs and poisons the process.
 
     Prerequisites:
       - model.to("rpu") must have been called (weights on RPU device)
@@ -82,14 +89,27 @@ def patch_gemma_model_for_rpu_all_layers_once(model) -> int:
             "with BaseModelOutputWithPast"
         ) from e
 
+    from rpu_backend.api._execution import _require_execution_process_safe
+
+    _require_execution_process_safe()
+    from .cores import model_topology, graph_cache_options, validate_native_topology
+    topology = model_topology(model)
+    old_resource = getattr(model, "_rpu_vlm_decoder_retirement_state", None)
+    if old_resource is not None:
+        old_resource.require_replaceable()
+    elif getattr(model, "_rpu_vlm_decoder_handle", None) is not None:
+        raise RuntimeError("Pi0.5 Gemma replacement requires its actual retirement resource")
     model_state = vars(model)
+    graph_enabled = (
+        bool(model_state["_gemma_graph_enabled"])
+        if "_gemma_graph_enabled" in model_state
+        else bool(_gemma_graph_enabled())
+    )
     install_snapshot = {
         name: model_state[name]
         for name in _GEMMA_RUNTIME_INSTALL_ATTRS
         if name in model_state
     }
-    had_old_handle = "_rpu_vlm_decoder_handle" in install_snapshot
-    old_handle = install_snapshot.get("_rpu_vlm_decoder_handle")
     old_finalizer = install_snapshot.get(
         "_rpu_vlm_decoder_handle_finalizer")
 
@@ -172,6 +192,15 @@ def patch_gemma_model_for_rpu_all_layers_once(model) -> int:
     # every forward; these are ~1 MB total and read-only.
     _cos_cpu = cos_cached.cpu()
     _sin_cpu = sin_cached.cpu()
+    # Cold, per-install opt-in. The forward closure and its bounded cache retire
+    # together; a replacement native handle cannot inherit another's upload.
+    _prefill_rope_cache = None
+    if rpu_env_bool("RPU_PI05_PREFILL_ROPE_CACHE", default=False):
+        from ._rope_cache import PrefillRopeUploadCache
+        with torch.inference_mode(False):
+            _cos_cpu = _cos_cpu.clone()
+            _sin_cpu = _sin_cpu.clone()
+        _prefill_rope_cache = PrefillRopeUploadCache(_cos_cpu, _sin_cpu)
 
     # ------------------------------------------------------------------ #
     # 5. Final norm weight
@@ -194,18 +223,21 @@ def patch_gemma_model_for_rpu_all_layers_once(model) -> int:
     # ------------------------------------------------------------------ #
     # 7. Replace forward with all-layers-once implementation
     #
-    # Capture signature constants in the closure. The signature drops position
-    # (Pi05 VLM prefill always has position=0; chunk_masks_ uses
-    # sdpa_prepare_mask's shape-keyed stable slot, NOT gemma2's baked
-    # chunk_masks_ vector). 1 prefill call per forward → cross-forward
-    # same-shape prompts all REPLAY.
+    # Capture signature constants in the closure. VLM prefill resets position
+    # to zero, and prepared masks use stable shape-keyed storage. Matching
+    # prompt shapes can therefore reuse the prefill graph.
     # ------------------------------------------------------------------ #
     _gemma_sig_hidden_size = int(hidden_size)
     _gemma_sig_num_layers = int(num_layers)
     _gemma_sig_num_q_heads = int(num_q_heads)
     _gemma_sig_w8a16 = bool(gemma_w8a16)
+    _prefill_kv_only = not bool(getattr(model, "_fmb_execution_component_config", {})
+                                .get("prefill", {}).get("linear_acc32", False)) and rpu_env_bool(
+        "RPU_PI05_PREFILL_KV_ONLY", default=False,
+        cpp_mirror="src/fused/rpu_gemma_model.cpp",
+    )
 
-    def rpu_gemma_model_forward(
+    def _run_gemma_prefill(
         self,
         input_ids=None,
         attention_mask=None,
@@ -218,8 +250,14 @@ def patch_gemma_model_for_rpu_all_layers_once(model) -> int:
         output_hidden_states=None,
         return_dict=None,
         adarms_cond=None,
+        _kv_only=False,
         **kwargs,
     ):
+        if bool(_kv_only) != _prefill_kv_only:
+            raise RuntimeError(
+                "Pi0.5 Gemma entry does not match the installed KV-only policy; "
+                "use the dedicated cache-only entry for a KV-only owner"
+            )
         # ---------------------------------------------------------- #
         # Precondition guards (same pattern as Qwen3)
         # ---------------------------------------------------------- #
@@ -238,8 +276,8 @@ def patch_gemma_model_for_rpu_all_layers_once(model) -> int:
             )
 
         # ---------------------------------------------------------- #
-        # Input embedding resolution uses the same mutual-exclusion guard as
-        # the shared causal-decoder path.
+        # Input embedding resolution (Bug 4 fix: require inputs_embeds,
+        # same mutual-exclusion guard as Qwen3 all-layers-once)
         # ---------------------------------------------------------- #
         if input_ids is not None and inputs_embeds is not None:
             raise AssertionError(
@@ -269,11 +307,11 @@ def patch_gemma_model_for_rpu_all_layers_once(model) -> int:
         seq_len = hidden_states.shape[1]
 
         # ---------------------------------------------------------- #
-        # RPUCache selection.
+        # D-14: RPUCache auto-creation (matching v2 pi05_converter.py:794-816)
         # ---------------------------------------------------------- #
         if past_key_values is None:
-            # `_rpu_cache` is eagerly initialized during installation so
-            # Dynamo does not record a changing attribute-existence guard.
+            # Installation creates the cache eagerly, keeping its ownership
+            # stable across tracing and replay.
             if use_cache:
                 self._rpu_cache.reset_to_position(0)
             past_key_values = self._rpu_cache
@@ -285,42 +323,58 @@ def patch_gemma_model_for_rpu_all_layers_once(model) -> int:
             )
 
         # ---------------------------------------------------------- #
-        # is_causal contract.
+        # D-13: is_causal contract (exact v2 rule, no ambiguity)
         # ---------------------------------------------------------- #
         is_causal = (attention_mask is None)
 
-        # Mask normalization.
+        # D-13: Mask normalization (matching model_converter.py:1188-1195)
         if attention_mask is not None:
             attention_mask = attention_mask.to(dtype=torch.float16).cpu().contiguous()
 
         # ---------------------------------------------------------- #
-        # RoPE positions must follow `position_ids` when masked rows can precede
-        # real tokens; row indexes alone would renumber later tokens.
+        # RoPE positions. The fused prefill used to derive RoPE from the ROW
+        # INDEX because this op never forwarded `position_ids` — correct only
+        # while no masked row precedes a real one. Violating that renumbered
+        # every token after an absent camera and held the pi05 camera legs red
+        # at mse 0.696 until 2026-08-06, which was worked around by DROPPING
+        # absent cameras from the prefix (adapters/pi05/patches.py). Gathering
+        # the table by `position_ids` removes the constraint instead.
         #
         # Sent on EVERY forward, including when the positions ARE the row index:
         # which table the kernel reads is decided at graph BUILD, so a handle
         # that only sometimes sets it would replay one forward's choice against
         # another's positions. Falling back to `arange + position` rather than
         # skipping the call keeps that choice constant for the handle's whole
-        # life. The default arange path preserves physical-row semantics.
+        # life, and reproduces the old row-index behaviour exactly. Cost is a
+        # [seq, head_dim/2] gather + H2D — ~78 KB at pi05's prefix lengths,
+        # against a whole VLM prefill.
         if position_ids is None:
             _pos = torch.arange(seq_len) + int(past_key_values.position)
         else:
             _pos = position_ids[0] if position_ids.dim() == 2 else position_ids
             _pos = _pos.to(device="cpu", dtype=torch.long)
+        if _prefill_rope_cache is None:
+            _cos_rows, _sin_rows = _cos_cpu[_pos].to("rpu"), _sin_cpu[_pos].to("rpu")
+        else:
+            _cos_rows, _sin_rows = _prefill_rope_cache.tables(_pos)
+        # Always refresh the native stable slots, including a cache hit. BUILD
+        # and REPLAY keep the same table source and dynamic position semantics.
         torch.ops.rpu.gemma_set_prefill_rope(
-            self._rpu_vlm_decoder_handle,
-            _cos_cpu[_pos].to("rpu"), _sin_cpu[_pos].to("rpu"))
+            self._rpu_vlm_decoder_handle, _cos_rows, _sin_rows)
 
         # ---------------------------------------------------------- #
         # Call fused all-layers-once C++ op
         # ---------------------------------------------------------- #
-        chunk_size = getattr(
-            self, '_rpu_planned_prefill_chunk_size',
-            getattr(self, '_rpu_chunk_size', 0),
-        )
-        # A single chunk is valid because the layer-input DMA uses the same
-        # `!ctx().input_in_spm` guard as the other fused models, so a
+        a6_plan = self._rpu_planned_prefill_plan
+        selected = a6_plan.selected
+        if selected is None or not selected.stage_tuple.physical_descriptor:
+            raise RuntimeError("Pi0.5 prefill A6 winner has no native descriptor")
+        chunk_size = int(selected.stage_tuple.compute_chunk)
+        planned_stage_descriptor = selected.stage_tuple.physical_descriptor
+        # A single chunk is fine again. The "split a would-be-single chunk in
+        # two" workaround that lived here was removed once the real defect was
+        # found: rpu_gemma_model.cpp emitted the layer-input DMA without the
+        # `!ctx().input_in_spm` guard every other fused model has, so a
         # one-chunk prefill (which resolves InterLayerIO::AUTO to SPM_RESIDENT,
         # where the DDR ping-pong buffers are deliberately absent) died with
         # "ddr_broadcast_spm_dma: null ddr_ptr" at layer 1.
@@ -331,21 +385,22 @@ def patch_gemma_model_for_rpu_all_layers_once(model) -> int:
                 "(_rpu_chunk_size attr present: %s)",
                 self._rpu_vlm_decoder_handle, hidden_states.shape[1], chunk_size,
                 hasattr(self, '_rpu_chunk_size'))
-        # Wrap the fused C++ op in GraphCache.capture(sig). Pi05 VLM
-        # prefill is invoked ONCE per inference with position=0 stable
-        # with the same prompt shape across inferences can REPLAY. `chunk_masks_`
-        # is rebuilt per-forward via dynamic_config lazy
-        # prepare; each PreparedMask uses sdpa_prepare_mask's shape-keyed
-        # stable slot → cross-forward same-shape ptr stability).
+        # Prefill starts at cache position zero on every inference. Masks are
+        # refreshed in stable shape-keyed slots before the cached graph runs.
         _sig = rpu_backend.graph.GraphSignature(
             op_id="pi05_gemma_prefill",
             shapes=[int(seq_len), _gemma_sig_num_layers, _gemma_sig_hidden_size],
-            dyn_dims=[_gemma_sig_num_q_heads, int(chunk_size)],
+            dyn_dims=[_gemma_sig_num_q_heads, int(chunk_size),
+                      *a6_plan.graph_key_words()],
             dtypes=[torch.float16],
         )
-        if _gemma_graph_enabled():
+        native_forward = (
+            torch.ops.rpu.gemma_prefill_kv_only
+            if _kv_only else torch.ops.rpu.gemma_forward
+        )
+        if graph_enabled:
             with self._rpu_gemma_graph_cache.capture(_sig):
-                output = torch.ops.rpu.gemma_forward(
+                output = native_forward(
                     self._rpu_vlm_decoder_handle,
                     hidden_states,
                     past_key_values.k_caches,
@@ -353,10 +408,11 @@ def patch_gemma_model_for_rpu_all_layers_once(model) -> int:
                     attention_mask,
                     past_key_values.position,
                     is_causal,
-                    chunk_size,
+                    0,
+                    planned_stage_descriptor,
                 )
         else:
-            output = torch.ops.rpu.gemma_forward(
+            output = native_forward(
                 self._rpu_vlm_decoder_handle,
                 hidden_states,
                 past_key_values.k_caches,
@@ -364,7 +420,8 @@ def patch_gemma_model_for_rpu_all_layers_once(model) -> int:
                 attention_mask,
                 past_key_values.position,
                 is_causal,
-                chunk_size,
+                0,
+                planned_stage_descriptor,
             )
 
         # Advance global position (the fused kernel does not touch RPUCache state)
@@ -376,38 +433,53 @@ def patch_gemma_model_for_rpu_all_layers_once(model) -> int:
         # lifecycle-aliasing config — causing action corruption even though VLM
         # output is bit-identical. Gemma's next call re-allocates via ensure_allocated
         # Path 2 (gen_changed), which safely re-runs preprocess_all_norms().
-        # This must stay outside the capture scope above: graph-aware
+        # R-4: MUST stay OUTSIDE the capture scope above — graph-aware
         # spm_alloc_reset_temporary marks the graph non-replayable.
         torch.ops.rpu.spm_alloc_reset_temporary()
 
         # Final norm is done in C++ (fused into last layer)
 
         # Record prefix length for shared cache (used by denoise_step to
-        # reset position between denoising iterations.
+        # reset position between denoising iterations — matches v2 behavior
+        # at pi05_converter.py:901)
         if use_cache and isinstance(past_key_values, RPUCache):
             past_key_values._prefix_len = past_key_values.position
 
-        # Optional KV cache probe after prefill.
-        import os as _os
-        _probe_dir = _os.environ.get("RPU_PI05_PROBE_DIR")
-        if use_cache and _probe_dir and isinstance(past_key_values, RPUCache):
-            try:
-                import torch as _torch
-                _os.makedirs(_probe_dir, exist_ok=True)
-                for _L in (0, 8, 17):
-                    _k = past_key_values.k_caches[_L].cpu().float()
-                    _v = past_key_values.v_caches[_L].cpu().float()
-                    _torch.save(_k, _os.path.join(_probe_dir, f"kv_post_prefill_L{_L}_k.pt"))
-                    _torch.save(_v, _os.path.join(_probe_dir, f"kv_post_prefill_L{_L}_v.pt"))
-            except Exception as _exc:
-                _LOG.warning("KV probe dump failed: %s", _exc)
-
+        if _kv_only:
+            return past_key_values
         return BaseModelOutputWithPast(
             last_hidden_state=output,
             past_key_values=past_key_values if use_cache is not False else None,
         )
 
-    # Eagerly initialize _rpu_cache, stamp the installed state, and freeze it.
+    def rpu_gemma_model_forward(
+        self, input_ids=None, attention_mask=None, position_ids=None,
+        past_key_values=None, inputs_embeds=None, use_cache=None,
+        cache_position=None, output_attentions=None, output_hidden_states=None,
+        return_dict=None, adarms_cond=None, **kwargs,
+    ):
+        # Preserve the ordinary hidden-state return contract. A KV-only owner
+        # rejects this entry before input/cache mutation in the shared body.
+        return _run_gemma_prefill(
+            self, input_ids=input_ids, attention_mask=attention_mask,
+            position_ids=position_ids, past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds, use_cache=use_cache,
+            cache_position=cache_position, output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states, return_dict=return_dict,
+            adarms_cond=adarms_cond, _kv_only=False, **kwargs,
+        )
+
+    def rpu_gemma_prefill_kv_only(
+        self, *, inputs_embeds, attention_mask, position_ids,
+    ):
+        """Build the full prefix cache without promising final hidden states."""
+        return _run_gemma_prefill(
+            self, inputs_embeds=inputs_embeds, attention_mask=attention_mask,
+            position_ids=position_ids, past_key_values=None, use_cache=True,
+            _kv_only=True,
+        )
+
+    # P7.1h L1+L2:eager init _rpu_cache + stamp marker + freeze.
     _effective_num_kv_heads = int(getattr(
         model, "_rpu_effective_num_kv_heads", config.num_key_value_heads
     ))
@@ -424,54 +496,73 @@ def patch_gemma_model_for_rpu_all_layers_once(model) -> int:
         head_dim=int(config.head_dim),
         attn_tp=_attn_tp_default,
     )
-    # Per-instance GraphCache for the Gemma VLM prefill wrapper. It uses the same
+    # S3: per-instance GraphCache for the Gemma VLM prefill wrap. Same
     # Dynamo guard-stability rationale as `_rpu_cache` above — eager init.
-    gemma_graph_cache = rpu_backend.graph.GraphCache()
+    gemma_graph_cache = (
+        rpu_backend.graph.GraphCache(**graph_cache_options(topology.num_cores))
+        if runtime_policy is None
+        else rpu_backend.graph.GraphCache(runtime_policy=runtime_policy)
+    )
     required_attrs = (
         '_rpu_cache',
         '_rpu_vlm_decoder_handle',
         '_rpu_gemma_graph_cache',
     )
 
-    handle = torch.ops.rpu.gemma_create()
-    handle_finalizer = None
+    resource = _InstalledNativeResource(
+        model, None, _gemma_destroy_handle, graphs=(gemma_graph_cache,),
+        keepalive=(set_weights_args, rpu_cache), label="Pi0.5 Gemma",
+        handle_name="_rpu_vlm_decoder_handle")
+    handle_finalizer = resource.finalizer
     committed = False
     try:
-        handle_finalizer = weakref.finalize(
-            model, _gemma_destroy_handle, h=handle)
+        resource.handle = handle = torch.ops.rpu.gemma_create(
+            bool(getattr(model, "_fmb_execution_component_config", {})
+                 .get("prefill", {}).get("linear_acc32", False)))
+        if topology.num_cores != 8:
+            torch.ops.rpu.gemma_set_execution_core_count(handle, topology.num_cores)
+        torch.ops.rpu.gemma_set_prefill_pair_rows(handle, prefill_pair_rows)
         torch.ops.rpu.gemma_set_weights(handle, *set_weights_args)
+        validate_native_topology("gemma", handle, topology, intermediate_size, gate_list[0].dtype)
+        # Physical KV capacity is independent of gathered logical RoPE rows.
+        torch.ops.rpu.gemma_set_chunk_envelope(handle, _max_seq, 0)
 
         model._rpu_cache = rpu_cache
+        model._gemma_graph_enabled = graph_enabled
         model._rpu_gemma_graph_cache = gemma_graph_cache
+        model._rpu_prefill_kv_only = (
+            types.MethodType(rpu_gemma_prefill_kv_only, model)
+            if _prefill_kv_only else None
+        )
         model._rpu_lazy_init_checked = True
         model._rpu_required_attrs = required_attrs
         model._rpu_vlm_decoder_handle = handle
+        model._rpu_vlm_decoder_retirement_state = resource
         model._rpu_vlm_decoder_handle_finalizer = handle_finalizer
         model.forward = types.MethodType(rpu_gemma_model_forward, model)
 
         from rpu_backend.graph.lazy_init_guard import _verify_lazy_init
         _verify_lazy_init(model)
 
-        if (
-            had_old_handle
-            and (
-                old_finalizer is None
-                or getattr(old_finalizer, "alive", False)
-            )
-        ):
-            torch.ops.rpu.gemma_destroy(old_handle)
+        if old_resource is not None:
+            old_resource.retire()
         committed = True
-    except BaseException:
+    except BaseException as error:
         if not committed:
+            cleanup_ok = resource.cleanup_failure(error, model, install_snapshot)
+            if resource.handle is None and handle_finalizer.alive:
+                handle_finalizer.detach()
             model_state = vars(model)
-            for name in _GEMMA_RUNTIME_INSTALL_ATTRS:
-                model_state.pop(name, None)
-            model_state.update(install_snapshot)
-
-            if handle_finalizer is None:
-                _gemma_destroy_handle(handle)
-            elif handle_finalizer.alive:
-                handle_finalizer()
+            if cleanup_ok:
+                for name in _GEMMA_RUNTIME_INSTALL_ATTRS:
+                    model_state.pop(name, None)
+                model_state.update(install_snapshot)
+            else:
+                model_state.update(
+                    _rpu_vlm_decoder_handle=resource.handle,
+                    _rpu_vlm_decoder_handle_finalizer=handle_finalizer,
+                    _rpu_vlm_decoder_retirement_state=resource,
+                    _rpu_gemma_graph_cache=gemma_graph_cache, _rpu_cache=rpu_cache)
         raise
 
     if old_finalizer is not None and getattr(old_finalizer, "alive", False):

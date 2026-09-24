@@ -1,12 +1,12 @@
 """Galaxea G0.5 Qwen3.5 VLM runtime on RPU.
 
 The canonical G0.5 components reuse the shipping Qwen3.5 fused runtime.
-Single-frame and canonical K=6 factorized-temporal vision use its experimental
-vision path. Action I/O projections and FP16 Euler run on RPU while time
+Single-frame vision uses its experimental vision path. Action I/O projections and FP16 Euler run on RPU while time
 conditioning remains on the host. BAR and training are intentionally unsupported.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 import copy
 import functools
 import importlib
@@ -18,6 +18,7 @@ import weakref
 
 import torch
 
+from rpu_backend.api._execution import execution_serialized
 from rpu_backend.api.causal_lm import _claim_live_instance
 from rpu_backend.adapters.g05.action import (
     _check_g05_action_profile,
@@ -41,6 +42,85 @@ _G05_VLM_PROFILE = (
 _INSTALL_LOCK = threading.Lock()
 _VISION_PATCH_LOCK = threading.Lock()
 _POLICY_INSTALL_LOCK = threading.Lock()
+_FAILED_POLICY_RETIREMENTS = []
+_GRAPH_COMPOSITE_CHILD = "COMPOSITE_CHILD"
+
+_G05_VISION_COMPONENT = "vision_encoder"
+_G05_TEXT_COMPONENT = "language_model"
+_G05_ACTION_COMPONENT = "action_expert"
+_G05_EXECUTION_COMPONENTS = {
+    _G05_VISION_COMPONENT: {
+        "vision": ("chunk_size", "padding_rows", "padding_budget"),
+    },
+    _G05_TEXT_COMPONENT: {
+        "prefill": ("chunk_size", "padding_rows", "padding_budget"),
+    },
+    _G05_ACTION_COMPONENT: {"action": ("chunk_size",)},
+}
+
+
+def _resolve_g05_execution(value, *, max_seq_len: int, entry_point: str):
+    """Resolve one root request into three stable composite-child views."""
+    from rpu_backend.api._execution import (
+        normalize_rpu_execution,
+        resolve_component_rpu_execution,
+    )
+
+    root = normalize_rpu_execution(
+        value,
+        entry_point=entry_point,
+        supported_components=_G05_EXECUTION_COMPONENTS,
+    )
+    profile_auto = {
+        _G05_VISION_COMPONENT: {"vision": {"chunk_size": "auto"}},
+        _G05_TEXT_COMPONENT: {
+            "prefill": {"chunk_size": "auto", "padding_budget": 64},
+        },
+        _G05_ACTION_COMPONENT: {"action": {"chunk_size": "auto"}},
+    }
+    components = {
+        component: resolve_component_rpu_execution(
+            root,
+            component,
+            entry_point=entry_point,
+            supported_components=_G05_EXECUTION_COMPONENTS,
+            profile_auto=profile_auto[component],
+        )
+        for component in _G05_EXECUTION_COMPONENTS
+    }
+    text_chunk = components[_G05_TEXT_COMPONENT]["prefill"]["chunk_size"]
+    if isinstance(text_chunk, int) and text_chunk % 64:
+        raise ValueError(
+            f"{entry_point}: language_model prefill.chunk_size must be a "
+            f"multiple of 64, got {text_chunk}"
+        )
+    action_chunk = components[_G05_ACTION_COMPONENT]["action"]["chunk_size"]
+    if isinstance(action_chunk, int) and action_chunk != 32:
+        raise ValueError(
+            f"{entry_point}: action_expert action.chunk_size must be 'auto' "
+            f"or exactly 32, got {action_chunk}"
+        )
+    if (
+        isinstance(max_seq_len, bool)
+        or not isinstance(max_seq_len, int)
+        or max_seq_len < 1
+    ):
+        raise ValueError(
+            f"{entry_point}: max_seq_len must be a positive integer, got "
+            f"{max_seq_len!r}"
+        )
+    text_prefill = components[_G05_TEXT_COMPONENT]["prefill"]
+    if int(text_prefill.get("padding_budget", 0)) > 64:
+        raise ValueError(f"{entry_point}: language padding_budget must be <= 64")
+    vision = components[_G05_VISION_COMPONENT]["vision"]
+    if vision.get("padding_rows", "auto") not in ("auto", 0) or int(
+        vision.get("padding_budget", 0)
+    ):
+        raise ValueError(
+            f"{entry_point}: vision padding is unsupported without a "
+            "bidirectional padding-mask route"
+        )
+    return root, components
 
 
 def _snapshot_instance_attrs(owner, names):
@@ -63,26 +143,9 @@ def _retire_new_qwen3_5_state(owner, state_before) -> None:
     state = getattr(owner, "_rpu_qwen3_5", None)
     if state is None or state is state_before:
         return
-    for name in (
-        "graph_cache",
-        "prefill_graph_cache",
-        "prefill_debug_graph_cache",
-        "action_graph_cache",
-    ):
-        cache = getattr(state, name, None)
-        if cache is not None:
-            try:
-                cache.clear()
-            except Exception:
-                pass
-    finalizer = getattr(state, "handle_finalizer", None)
-    if finalizer is not None and getattr(finalizer, "alive", False):
-        try:
-            finalizer()
-        except Exception:
-            pass
-    if vars(owner).get("_rpu_qwen3_5") is state:
-        vars(owner).pop("_rpu_qwen3_5", None)
+    from rpu_backend.adapters.qwen3_5.text import _retire_qwen3_5_text_state
+
+    _retire_qwen3_5_text_state(owner, state=state)
 
 
 def _retire_new_g05_vision_runtime(vision, runtime_before) -> None:
@@ -90,17 +153,17 @@ def _retire_new_g05_vision_runtime(vision, runtime_before) -> None:
     if vision is None:
         return
     handle_before, finalizer_before = runtime_before
-    handle = getattr(vision, "_rpu_vision_handle", None)
-    finalizer = getattr(vision, "_rpu_vision_handle_finalizer", None)
+    handle = getattr(vision, "_rpu_vision_installing_handle", None)
+    if handle is None:
+        handle = getattr(vision, "_rpu_vision_handle", None)
+    finalizer = getattr(vision, "_rpu_vision_installing_finalizer", None)
+    if finalizer is None:
+        finalizer = getattr(vision, "_rpu_vision_handle_finalizer", None)
     if handle == handle_before and finalizer is finalizer_before:
         return
-    vision_adapter = sys.modules.get("rpu_backend.adapters.qwen3_5.vision")
-    rollback = getattr(vision_adapter, "_rollback_qwen3_5_vision_install", None)
-    if callable(rollback):
-        try:
-            rollback(vision)
-        except Exception:
-            pass
+    from rpu_backend.adapters.qwen3_5.vision import _rollback_qwen3_5_vision_install
+
+    _rollback_qwen3_5_vision_install(vision)
 
 
 def _instance_method_is(owner, name: str, function) -> bool:
@@ -130,6 +193,19 @@ def _transactional_g05_policy_install(function):
         try:
             if getattr(policy, "_rpu_g05_policy_ready", False):
                 if _g05_policy_runtime_ready(policy):
+                    requested = kwargs.get("rpu_execution")
+                    if requested is not None:
+                        max_seq_len = kwargs.get("max_seq_len", 2048)
+                        normalized, _components = _resolve_g05_execution(
+                            requested,
+                            max_seq_len=max_seq_len,
+                            entry_point="patch_g05_policy_for_rpu",
+                        )
+                        if normalized != getattr(policy, "_rpu_execution", None):
+                            raise ValueError(
+                                "G0.5 policy execution config conflicts with "
+                                "the installed runtime"
+                            )
                     return policy
                 raise RuntimeError(
                     "G0.5 policy ready marker has incomplete runtime state; "
@@ -157,10 +233,17 @@ def _transactional_g05_policy_install(function):
                     (
                         "forward",
                         "_rpu_g05_vision_forward_impl",
-                        "_rpu_g05_temporal_pe",
+                        "_rpu_execution",
+                        "_rpu_execution_component_id",
+                        "_rpu_execution_generation",
+                        "_execution_generation",
+                        "_execution_session",
                     ),
                 )
-                + _snapshot_instance_attrs(model, ("_rpu_g05_vision_ready",))
+                + _snapshot_instance_attrs(
+                    model,
+                    ("_rpu_g05_vision_ready", "_rpu_execution", "_execution_session"),
+                )
                 + _snapshot_instance_attrs(
                     vlm,
                     (
@@ -169,6 +252,10 @@ def _transactional_g05_policy_install(function):
                         "_rpu_g05_max_seq_len",
                         "_rpu_g05_owner",
                         "_rpu_g05_original_decode",
+                        "_rpu_execution",
+                        "_rpu_execution_component_id",
+                        "_rpu_execution_generation",
+                        "_execution_session",
                     ),
                 )
                 + _snapshot_instance_attrs(
@@ -190,9 +277,14 @@ def _transactional_g05_policy_install(function):
                         "_rpu_g05_adaptive_mod_stack_cache",
                         "_rpu_g05_time_cond_cache",
                         "_rpu_g05_fixed_time_schedule",
+                        "_rpu_g05_rtc_time_schedules",
                         "_rpu_g05_original_encode_time",
                         "_rpu_g05_original_forward",
                         "_rpu_g05_action_ready",
+                        "_rpu_execution",
+                        "_rpu_execution_component_id",
+                        "_rpu_execution_generation",
+                        "_execution_session",
                     ),
                 )
                 + _snapshot_instance_attrs(
@@ -203,6 +295,8 @@ def _transactional_g05_policy_install(function):
                         "_forward_embed",
                         "_rpu_g05_original_inference_fm",
                         "inference_fm",
+                        "_rpu_execution",
+                        "_execution_session",
                     ),
                 )
                 + _snapshot_instance_attrs(
@@ -221,19 +315,55 @@ def _transactional_g05_policy_install(function):
                         "_rpu_g05_original_predict_action",
                         "predict_action",
                         "_rpu_g05_policy_ready",
+                        "_rpu_execution",
+                        "_rpu_execution_generation",
+                        "_rpu_g05_execution_components",
+                        "_rpu_g05_execution_component_generations",
+                        "_rpu_g05_execution_reconfigure_journal",
+                        "_execution_session",
+                        "reconfigure_rpu_execution",
+                        "close_rpu_execution",
                     ),
                 )
             )
             try:
                 return function(policy, *args, **kwargs)
-            except BaseException:
+            except BaseException as error:
                 if vars(policy).get("_rpu_g05_policy_install_started", False):
-                    _retire_new_qwen3_5_state(expert, expert_state_before)
-                    _retire_new_qwen3_5_state(vlm, vlm_state_before)
-                    _retire_new_g05_vision_runtime(
-                        vision, vision_runtime_before
-                    )
-                    _restore_instance_attrs(snapshots)
+                    session = vars(policy).get("_execution_session")
+                    def retire():
+                        from rpu_backend.adapters.qwen3_5.text import _clear_qwen35_graphs
+
+                        states = tuple(state for child, before in ((vlm, vlm_state_before), (expert, expert_state_before))
+                                       if (state := getattr(child, "_rpu_qwen3_5", None)) is not before)
+                        _clear_qwen35_graphs(states, vision)
+                        _retire_new_qwen3_5_state(expert, expert_state_before)
+                        _retire_new_qwen3_5_state(vlm, vlm_state_before)
+                        _retire_new_g05_vision_runtime(vision, vision_runtime_before)
+                    try:
+                        if session is not None:
+                            session.shutdown(retire)
+                        else:
+                            retire()
+                        for child, before in ((expert, expert_state_before), (vlm, vlm_state_before)):
+                            remaining = getattr(child, "_rpu_qwen3_5", None)
+                            if remaining is not None and remaining is not before:
+                                raise RuntimeError("G0.5 policy cleanup left a new text runtime installed")
+                        if (getattr(vision, "_rpu_vision_handle", None),
+                            getattr(vision, "_rpu_vision_handle_finalizer", None)) != vision_runtime_before or getattr(vision, "_rpu_vision_installing_handle", None) is not None:
+                            raise RuntimeError("G0.5 policy cleanup left a new Vision runtime installed")
+                    except BaseException as cleanup_error:
+                        error.add_note(f"G0.5 policy install cleanup failed: {cleanup_error!r}")
+                        if session is not None:
+                            session.poison()
+                        from rpu_backend.api.causal_lm import _poison_live_instance
+
+                        _poison_g05_retirement(policy, cleanup_error)
+                        vars(policy)["_rpu_g05_policy_ready"] = False
+                    else:
+                        if all(item[2].handle is None for item in vars(policy).get("_qwen35_retirement_children", ())):
+                            vars(policy).pop("_qwen35_retirement_children", None)
+                        _restore_instance_attrs(snapshots)
                 for name, value in perf_env_snapshot.items():
                     if value is None:
                         os.environ.pop(name, None)
@@ -267,31 +397,6 @@ def _g05_token_index(model):
             return token_index
     raise TypeError(
         "G0.5 RPU direct fusion could not resolve the model's TOKEN_INDEX enum"
-    )
-
-
-def _get_lkn_batch_config() -> tuple[tuple[int, ...], tuple[int, ...]] | None:
-    """Return the extension-load snapshot and current Rhino Launch env values."""
-    try:
-        from rpu_backend import _cpp_ext
-
-        values = tuple(int(value) for value in _cpp_ext.get_lkn_batch_config())
-    except (AttributeError, ImportError, TypeError, ValueError):
-        return None
-    if len(values) != 6:
-        return None
-    return values[:3], values[3:]
-
-
-def _g05_packed_vision_capacity_enabled() -> bool:
-    """Require a stable large-Graph envelope loaded before the SDK pool."""
-    config = _get_lkn_batch_config()
-    if config is None:
-        return False
-    loaded, current = config
-    return loaded == current and all(
-        actual >= required
-        for actual, required in zip(loaded, (262_144, 32, 256))
     )
 
 
@@ -336,7 +441,7 @@ def _check_g05_vlm_profile(config) -> None:
     )
     if profile != _G05_VLM_PROFILE:
         raise UnsupportedModelError(
-            "G0.5 RPU path supports only the canonical Qwen3.5-2B VLM "
+            "G0.5 RPU bring-up supports only the canonical Qwen3.5-2B VLM "
             f"profile; got {profile}."
         )
 
@@ -348,7 +453,7 @@ def _preflight_g05_vlm(model):
         raise TypeError("expected G05ModelQwen35 with model.vlm.layers and model.vlm.norm")
     if getattr(model, "training", True):
         raise NotImplementedError(
-            "G0.5 RPU path supports inference only; call model.eval()"
+            "G0.5 RPU bring-up supports inference only; call model.eval()"
         )
     _check_g05_vlm_profile(vlm.config)
     if getattr(getattr(model, "cfg", None), "position_ids_type", None) != "pi0fast":
@@ -398,15 +503,12 @@ def _rpu_g05_build_causal_mask_and_position_ids(
         or attention_mask.device.type != "cpu"
         or input_ids.shape != attention_mask.shape
     ):
-        # Preserve compatibility with builders that do not accept
-        # ``is_action_block`` unless the option is active.
-        kwargs = {"kv_len": kv_len, "dtype": dtype}
-        if is_action_block:
-            kwargs["is_action_block"] = True
         return original(
             input_ids,
             attention_mask,
-            **kwargs,
+            kv_len=kv_len,
+            dtype=dtype,
+            is_action_block=is_action_block,
         )
 
     helper = self.mask_helper
@@ -471,6 +573,7 @@ def _rpu_g05_vlm_decode(self, hidden: torch.Tensor) -> torch.Tensor:
         return self._rpu_g05_original_decode(hidden)
 
 
+@execution_serialized
 def _rpu_g05_vision_forward(
     self,
     hidden_states: torch.Tensor,
@@ -479,34 +582,22 @@ def _rpu_g05_vision_forward(
     bsz: int = 1,
 ):
     """Adapt the Qwen3.5 vision result to G0.5's tuple contract."""
-    num_frames = int(num_frames)
-    camera_batch_count = int(bsz)
-    if num_frames not in (1, 6) or camera_batch_count not in (1, 3):
+    if int(num_frames) != 1 or int(bsz) != 1:
         raise NotImplementedError(
-            "G0.5 RPU vision supports only canonical B_camera=1/3, K=1/6 input"
+            "G0.5 RPU vision supports only single-frame calls with bsz=1"
         )
-    packed_b3 = (
-        camera_batch_count == 3
-        and num_frames == 6
-        and _g05_packed_vision_capacity_enabled()
-    )
-    if packed_b3:
-        grid_cpu = grid_thw.detach().cpu()
-        if (
-            tuple(grid_cpu.shape) != (18, 3)
-            or hidden_states.shape[0] != 4608
-            or not torch.equal(grid_cpu, grid_cpu[0].expand_as(grid_cpu))
-            or int(grid_cpu[0].prod()) != 256
-        ):
-            raise ValueError(
-                "G0.5 packed vision requires B_camera=3,K=6,P=256 equal grids"
-            )
-    output = self._rpu_g05_vision_forward_impl(
-        hidden_states,
-        grid_thw,
-        _rpu_temporal_num_frames=num_frames,
-        _rpu_camera_batch_count=3 if packed_b3 else 1,
-    )
+    output = self._rpu_g05_vision_forward_impl(hidden_states, grid_thw)
+    plan = getattr(self, "_rpu_vision_last_a6_plan", None)
+    if isinstance(plan, Mapping):
+        receipt = dict(plan)
+        receipt.update({
+            "stage": "vision",
+            "component": _G05_VISION_COMPONENT,
+            "generation": int(getattr(self, "_rpu_execution_generation", 0)),
+            "authority": "NATIVE_A6_STAGE_DESCRIPTOR",
+            "dry_forward_agreement": True,
+        })
+        vars(self)["_rpu_last_execution_plan"] = receipt
     return output.last_hidden_state, output.pooler_output
 
 
@@ -556,12 +647,9 @@ def _preflight_g05_vision(model):
         getattr(cfg, "temporal_pe_pretrain_frames", None),
         bool(getattr(cfg, "batch_all_cameras", False)),
     )
-    if temporal_profile not in (
-        (0, "factorized", 24, None, False),
-        (4, "factorized", 24, None, False),
-    ):
+    if temporal_profile != (0, "factorized", 24, None, False):
         raise NotImplementedError(
-            f"G0.5 RPU vision requires canonical temporal profile; got {temporal_profile}"
+            f"G0.5 RPU vision requires a single-frame profile; got {temporal_profile}"
         )
     return vision, cfg, temporal_profile
 
@@ -593,16 +681,24 @@ def _g05_vision_runtime_ready(model) -> bool:
             return False
     except Exception:
         return False
-    if int(getattr(getattr(vision, "config", None), "temporal_freq", 0)) == 4:
-        if getattr(vision, "_rpu_g05_temporal_pe", None) is None:
-            return False
+    if int(getattr(getattr(vision, "config", None), "temporal_freq", 0)) != 0:
+        return False
     return _instance_method_is(vision, "forward", _rpu_g05_vision_forward)
 
 
-def patch_g05_vision_for_rpu(model):
+def patch_g05_vision_for_rpu(model, *, _execution_config=None):
     """Patch the canonical G0.5 single-frame vision tower for RPU."""
     if getattr(model, "_rpu_g05_vision_ready", False):
         if _g05_vision_runtime_ready(model):
+            vision = model.vision_tower
+            if (
+                _execution_config is not None
+                and getattr(vision, "_rpu_execution", None)
+                != _execution_config
+            ):
+                raise ValueError(
+                    "G0.5 Vision execution config conflicts with the installed runtime"
+                )
             return model
         raise RuntimeError(
             "G0.5 Vision ready marker has incomplete runtime state; reload "
@@ -633,7 +729,7 @@ def patch_g05_vision_for_rpu(model):
                 "G0.5 Vision installation was already attempted; reload the "
                 "checkpoint to avoid reusing partial wrapper state"
             )
-        vision, cfg, temporal_profile = _preflight_g05_vision(model)
+        vision, cfg, _ = _preflight_g05_vision(model)
         if os.environ.get("QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED") != "1":
             raise NotImplementedError(
                 "generic G0.5 RPU Vision is numeric-blocked; controlled "
@@ -673,7 +769,10 @@ def patch_g05_vision_for_rpu(model):
                 (
                     "forward",
                     "_rpu_g05_vision_forward_impl",
-                    "_rpu_g05_temporal_pe",
+                    "_rpu_execution",
+                    "_rpu_execution_component_id",
+                    "_rpu_execution_generation",
+                    "_execution_generation",
                 ),
             )
             + _snapshot_instance_attrs(model, ("_rpu_g05_vision_ready",))
@@ -683,47 +782,41 @@ def patch_g05_vision_for_rpu(model):
         _claim_live_instance(model)
         model._rpu_g05_vision_install_started = True
 
-        # The validated profile loads this tower directly in FP32, while the
-        # in-place multi-core swizzle contract is FP16 (DWIDTH=2).
+        # Cast before the in-place multi-core FP16 swizzle (DWIDTH=2).
         vision.half()
-        handle = install_vision(vision, vision_config=cfg)
+        install_kwargs = {"vision_config": cfg}
+        if _execution_config is not None:
+            install_kwargs["execution_config"] = _execution_config
+        handle = install_vision(vision, **install_kwargs)
         shared_installed = True
-        if temporal_profile[0] == 4:
-            temporal_module = importlib.import_module(type(vision).__module__)
-            sinusoidal_temporal_pe = getattr(
-                temporal_module, "_sinusoidal_temporal_pe", None
-            )
-            if not callable(sinusoidal_temporal_pe):
-                sinusoidal_temporal_pe = getattr(
-                    importlib.import_module("g05.models.g05.qwen35.vision"),
-                    "_sinusoidal_temporal_pe",
-                )
-            temporal_pe = sinusoidal_temporal_pe(
-                torch.arange(-5, 1, dtype=torch.float32),
-                int(cfg.hidden_size),
-            ).to(device="rpu", dtype=torch.float16).contiguous()
-            vision._rpu_g05_temporal_pe = temporal_pe
-            torch.ops.rpu.qwen3_5_vision_set_temporal(
-                handle, temporal_pe, 6, 256
-            )
         vision._rpu_g05_vision_forward_impl = vision.forward
         vision.forward = types.MethodType(_rpu_g05_vision_forward, vision)
+        if _execution_config is not None:
+            vision._rpu_execution = _execution_config
+        vision._rpu_execution_component_id = _G05_VISION_COMPONENT
+        vision._rpu_execution_generation = 0
+        vision._execution_generation = 0
         model._rpu_g05_vision_ready = True
         return model
-    except BaseException:
-        if shared_installed and callable(rollback_shared):
+    except BaseException as error:
+        if callable(rollback_shared) and (
+            shared_installed
+            or getattr(vision, "_rpu_vision_installing_handle", None) is not None
+            or getattr(vision, "_rpu_vision_handle", None) is not None
+        ):
             try:
                 rollback_shared(vision)
-            except Exception:
-                pass
+            except BaseException as cleanup_error:
+                error.add_note(f"G0.5 Vision cleanup failed: {cleanup_error!r}")
+                raise error
         _restore_instance_attrs(snapshots)
         raise
     finally:
         _VISION_PATCH_LOCK.release()
 
 
-def _pack_g05_vision(pixel_values, vision, *, compact: bool = False):
-    """Prepare canonical batch-1 K=1/K=6 cameras exactly like G0.5."""
+def _pack_g05_vision(pixel_values, vision):
+    """Prepare batch-one single-frame cameras in their declared order."""
     if not isinstance(pixel_values, dict) or not pixel_values:
         raise TypeError("G0.5 RPU vision expects a non-empty camera dict")
 
@@ -733,9 +826,9 @@ def _pack_g05_vision(pixel_values, vision, *, compact: bool = False):
     camera_info, grids, split_sizes = [], [], []
     num_frames = None
     for camera in pixel_values.values():
-        if camera.dim() != 5 or camera.shape[0] != 1 or camera.shape[1] not in (1, 6):
+        if camera.dim() != 5 or camera.shape[0] != 1 or camera.shape[1] != 1:
             raise NotImplementedError(
-                "G0.5 RPU direct vision fusion supports only [1,K,C,H,W], K=1 or 6"
+                "G0.5 RPU direct vision fusion supports only [1,1,C,H,W]"
             )
         _, camera_frames, channels, height, width = camera.shape
         if num_frames is None:
@@ -787,31 +880,6 @@ def _pack_g05_vision(pixel_values, vision, *, compact: bool = False):
             else torch.cat(image_views, dim=0)
         )
 
-    # The production compact path is deliberately exact-profile-only. Keep the
-    # official Resize -> FP32 / 255 -> Normalize result untouched; cast those
-    # normalized CHW frames to the same final FP16 bytes as the packed path, but
-    # defer temporal expansion and pure layout to STEP0 on RPU.
-    compact_canonical = (
-        compact
-        and len(camera_info) == 3
-        and num_frames == 6
-        and patch_size == 16
-        and temporal_patch_size == 2
-        and merge_size == 2
-        and same_grid
-        and all(tuple(info[0].shape) == (6, 3, 256, 256) for info in camera_info)
-    )
-    if compact_canonical:
-        compact_images = merged_images
-        if compact_images.dtype != torch.float16:
-            compact_images = compact_images.to(torch.float16)
-        return (
-            compact_images.contiguous(),
-            torch.cat(grids, dim=0),
-            split_sizes,
-            num_frames,
-        )
-
     if same_grid:
         pack_groups = [(merged_images, camera_info[0][1], camera_info[0][2])]
     else:
@@ -846,21 +914,6 @@ def _pack_g05_vision(pixel_values, vision, *, compact: bool = False):
     grid_thw = torch.cat(grids, dim=0)
     packed = patches[0] if len(patches) == 1 else torch.cat(patches, dim=0)
     return packed, grid_thw, split_sizes, num_frames
-
-
-def _g05_packed_camera_batch_count(
-    grid_thw: torch.Tensor, split_sizes: list[int], num_frames: int
-) -> int:
-    if (
-        not _g05_packed_vision_capacity_enabled()
-        or num_frames != 6
-        or split_sizes != [64, 64, 64]
-        or tuple(grid_thw.shape) != (18, 3)
-        or not torch.equal(grid_thw, grid_thw[0].expand_as(grid_thw))
-        or int(grid_thw[0].prod()) != 256
-    ):
-        return 1
-    return 3
 
 
 def _rpu_g05_forward_embed(
@@ -927,20 +980,10 @@ def _rpu_g05_forward_embed(
                 state.to(device="rpu", dtype=torch.float16).contiguous()
             )
 
-    patches, grid_thw, split_sizes, num_frames = _pack_g05_vision(
-        pixel_values,
-        self.vision_tower,
-        compact=(
-            getattr(self.vision_tower, "_rpu_vision_step0", False)
-            and _g05_packed_vision_capacity_enabled()
-        ),
+    patches, grid_thw, split_sizes, _ = _pack_g05_vision(
+        pixel_values, self.vision_tower,
     )
-    camera_batch_count = _g05_packed_camera_batch_count(
-        grid_thw, split_sizes, num_frames
-    )
-    self._cached_image_grid_thw = grid_thw[
-        num_frames - 1 :: num_frames
-    ].contiguous()
+    self._cached_image_grid_thw = grid_thw.contiguous()
     from rpu_backend.adapters.qwen3_5.vision import _visual_run_starts
 
     starts = _visual_run_starts(
@@ -955,8 +998,6 @@ def _rpu_g05_forward_embed(
         grid_thw,
         _rpu_fusion_target=hidden,
         _rpu_fusion_run_starts=starts,
-        _rpu_temporal_num_frames=num_frames,
-        _rpu_camera_batch_count=camera_batch_count,
     )
     return hidden
 
@@ -1001,6 +1042,18 @@ def _rpu_g05_build_prefix_action_kv(self, vlm_kv, split_index: int):
     )
 
 
+def _ensure_g05_text_cache(vlm):
+    """Allocate the single production KV cache, also used by cold planning."""
+    from rpu_backend.api.qwen3_5_cache import Qwen3_5Cache
+
+    cache = getattr(vlm, "_rpu_g05_cache", None)
+    if cache is None:
+        cache = Qwen3_5Cache.from_config(vlm.config, max_seq_len=vlm._rpu_g05_max_seq_len)
+        vlm._rpu_g05_cache = cache
+    return cache
+
+
+@execution_serialized
 def _rpu_g05_vlm_forward(
     self,
     inputs_embeds: torch.Tensor,
@@ -1021,7 +1074,7 @@ def _rpu_g05_vlm_forward(
     if owner is None:
         raise RuntimeError("G0.5 RPU model owner no longer exists")
     if owner.training:
-        raise NotImplementedError("G0.5 RPU path supports inference only")
+        raise NotImplementedError("G0.5 RPU bring-up supports inference only")
     if inputs_embeds.shape[0] != 1:
         raise NotImplementedError("G0.5 RPU VLM currently supports batch_size == 1")
     if past_key_values is not None or kv_cache is None:
@@ -1029,12 +1082,11 @@ def _rpu_g05_vlm_forward(
     if not return_kv_cache:
         raise NotImplementedError("G0.5 RPU VLM requires return_kv_cache=True")
     if time_cond is not None or split_idx is not None:
-        raise NotImplementedError("G0.5 RPU VLM supports inference prefill/decode only")
+        raise NotImplementedError("G0.5 RPU VLM bring-up supports inference prefill/decode only")
     if padding_mask is not None and not bool(padding_mask.bool().all().item()):
         raise NotImplementedError("G0.5 RPU VLM does not support padded tokens")
 
     from rpu_backend.api.cache import RPUCache
-    from rpu_backend.api.qwen3_5_cache import Qwen3_5Cache
     from rpu_backend.adapters.qwen3_5.text import (
         _normalize_prefill_position_ids,
         run_qwen3_5_text,
@@ -1047,11 +1099,7 @@ def _rpu_g05_vlm_forward(
             raise ValueError("G0.5 RPU cache must be installed before it contains tokens")
         cache = getattr(self, "_rpu_g05_cache", None)
         if cache is None:
-            cache = Qwen3_5Cache.from_config(
-                self.config,
-                max_seq_len=self._rpu_g05_max_seq_len,
-            )
-            self._rpu_g05_cache = cache
+            cache = _ensure_g05_text_cache(self)
         else:
             # Decode GraphCache replay bakes cache DDR addresses. Keep one cache
             # allocation per installed model. Prefill overwrites full-attention
@@ -1097,6 +1145,16 @@ def _rpu_g05_vlm_forward(
         cache,
         position_ids=position_ids,
     )
+    plan = getattr(self, "_rpu_last_execution_plan", None)
+    if isinstance(plan, Mapping):
+        receipt = dict(plan)
+        receipt.update({
+            "component": _G05_TEXT_COMPONENT,
+            "generation": int(getattr(self, "_rpu_execution_generation", 0)),
+            "authority": "NATIVE_A6_STAGE_DESCRIPTOR",
+            "dry_forward_agreement": True,
+        })
+        vars(self)["_rpu_last_execution_plan"] = receipt
 
     # pi0fast decode advances all three M-RoPE lanes from the largest prefill T.
     if start == 0 and inputs_embeds.shape[1] > 1 and position_ids is not None:
@@ -1136,8 +1194,9 @@ def _g05_vlm_runtime_ready(model) -> bool:
     state = getattr(vlm, "_rpu_qwen3_5", None)
     if state is None or getattr(state, "handle", None) is None:
         return False
-    finalizer = getattr(state, "handle_finalizer", None)
-    if finalizer is None or not getattr(finalizer, "alive", False):
+    from rpu_backend.adapters.qwen3_5.text import _qwen35_retirement_ready
+
+    if not _qwen35_retirement_ready(state):
         return False
     for name in ("graph_cache", "prefill_graph", "prefill_graph_cache"):
         if getattr(state, name, None) is None:
@@ -1206,6 +1265,7 @@ def patch_g05_vlm_for_rpu(
     model,
     *,
     max_seq_len: int = 2048,
+    _execution_config=None,
 ):
     """Patch ``G05ModelQwen35.vlm`` for FP16 RPU prefill and q1 decode.
 
@@ -1215,6 +1275,14 @@ def patch_g05_vlm_for_rpu(
     """
     if getattr(model, "_rpu_g05_vlm_ready", False):
         if _g05_vlm_runtime_ready(model):
+            if (
+                _execution_config is not None
+                and getattr(model.vlm, "_rpu_execution", None)
+                != _execution_config
+            ):
+                raise ValueError(
+                    "G0.5 VLM execution config conflicts with the installed runtime"
+                )
             return model
         raise RuntimeError(
             "G0.5 VLM ready marker has incomplete runtime state; reload the "
@@ -1264,6 +1332,9 @@ def patch_g05_vlm_for_rpu(
                         "_rpu_g05_max_seq_len",
                         "_rpu_g05_owner",
                         "_rpu_g05_original_decode",
+                        "_rpu_execution",
+                        "_rpu_execution_component_id",
+                        "_rpu_execution_generation",
                     ),
                 ),
                 (
@@ -1282,7 +1353,7 @@ def patch_g05_vlm_for_rpu(
         _claim_live_instance(model)
         model._rpu_g05_vlm_install_started = True
 
-        # Cast dtype first, then swizzle inside the shared installer.
+        # RC-1/P1: dtype first, swizzle inside the shared installer second.
         # Restrict the cast to the fused backbone so a direct caller cannot
         # enqueue eager casts on unrelated VLM modules already placed on RPU.
         vlm.layers.to(device="cpu", dtype=torch.float16)
@@ -1291,10 +1362,13 @@ def patch_g05_vlm_for_rpu(
             vlm,
             vlm.config,
             max_seq_len,
+            execution_config=_execution_config,
             _cpu_stage_weights=True,
         )
         torch.ops.rpu.qwen3_5_set_linear_acc32(handle, True)
         torch.ops.rpu.qwen3_5_set_fast_replay(handle, True)
+        torch.ops.rpu.qwen3_5_set_retained_prefill_graph(handle, True)
+        torch.ops.rpu.qwen3_5_enable_execution_reconfigure(handle)
         import rpu_backend as _rb
 
         vlm._rpu_qwen3_5.prefill_graph_cache = _rb.graph.GraphCache(max_entries=1)
@@ -1303,11 +1377,19 @@ def patch_g05_vlm_for_rpu(
         # diagnostic-only fixed-address SPM→DDR taps. Never replay it as the
         # production prefill graph (or vice versa).
         vlm._rpu_qwen3_5.prefill_debug_graph_cache = None
+        from rpu_backend.adapters.qwen3_5.text import _refresh_qwen35_text_retirement
+
+        _refresh_qwen35_text_retirement(vlm._rpu_qwen3_5)
         vlm._rpu_qwen3_5.prefill_debug_graph_sig = None
         vlm._rpu_qwen3_5.prefill_rope_cache = None
 
         vlm._rpu_g05_max_seq_len = int(max_seq_len)
         vlm._rpu_g05_owner = weakref.ref(model)
+        if _execution_config is not None:
+            vlm._rpu_execution = _execution_config
+        vlm._rpu_execution_component_id = _G05_TEXT_COMPONENT
+        vlm._rpu_execution_generation = 0
+        vlm._rpu_qwen3_5.execution_generation = 0
         vlm._rpu_g05_original_decode = vlm.decode
         vlm.forward = types.MethodType(_rpu_g05_vlm_forward, vlm)
         vlm.decode = types.MethodType(_rpu_g05_vlm_decode, vlm)
@@ -1327,28 +1409,15 @@ def patch_g05_vlm_for_rpu(
         model._rpu_g05_prefix_bridge_installed = prefix_bridge_installed
         model._rpu_g05_vlm_ready = True
         return model
-    except BaseException:
+    except BaseException as error:
         state = getattr(vlm, "_rpu_qwen3_5", None) if vlm is not None else None
         if state is not None and state is not state_before:
-            for name in (
-                "graph_cache",
-                "prefill_graph_cache",
-                "prefill_debug_graph_cache",
-            ):
-                cache = getattr(state, name, None)
-                if cache is not None:
-                    try:
-                        cache.clear()
-                    except Exception:
-                        pass
-            finalizer = getattr(state, "handle_finalizer", None)
-            if finalizer is not None and getattr(finalizer, "alive", False):
-                try:
-                    finalizer()
-                except Exception:
-                    pass
-            if vars(vlm).get("_rpu_qwen3_5") is state:
-                vars(vlm).pop("_rpu_qwen3_5", None)
+            from rpu_backend.adapters.qwen3_5.text import _retire_failed_qwen3_5_text_install
+
+            try:
+                _retire_failed_qwen3_5_text_install(vlm, state=state)
+            except BaseException as cleanup_error:
+                error.add_note(f"G0.5 VLM install cleanup failed: {cleanup_error!r}")
         for owner, name, had_value, value in reversed(snapshots):
             if had_value:
                 vars(owner)[name] = value
@@ -1489,13 +1558,13 @@ def patch_g05_data_processor_for_rpu(processor):
     if getattr(processor, "is_train", None) is not False:
         raise NotImplementedError("G0.5 RPU host preprocessing requires processor.eval()")
     if (
-        int(getattr(processor, "num_obs_steps", 0)) not in (1, 6)
+        int(getattr(processor, "num_obs_steps", 0)) != 1
         or int(getattr(processor, "num_output_cameras", 0))
         != 3 * int(processor.num_obs_steps)
         or int(getattr(processor, "action_horizon", 0)) != 32
     ):
         raise NotImplementedError(
-            "G0.5 RPU host preprocessing supports only three cameras, K=1/K=6, "
+            "G0.5 RPU host preprocessing supports only three single-frame cameras, "
             "and action_horizon=32"
         )
 
@@ -1891,15 +1960,436 @@ def patch_g05_inferencer_for_rpu(inferencer):
     return inferencer
 
 
+def _clear_g05_graph(cache) -> None:
+    if cache is None:
+        return
+    cache.begin_warmup()
+    cache.clear()
+    invariant = getattr(cache, "cache_invariant_ok", None)
+    if callable(invariant) and not invariant():
+        raise RuntimeError("G0.5 GraphCache invariant failed during reconfigure")
+
+
+def _publish_g05_execution_views(
+    policy, resolved, *, generation: int, component_generations
+) -> None:
+    """Publish one root generation and independent child generations."""
+    root, components = resolved
+    model = policy.model
+    policy._rpu_execution = root
+    model._rpu_execution = root
+    policy._rpu_execution_generation = int(generation)
+    policy._rpu_g05_execution_components = dict(components)
+    policy._rpu_g05_execution_component_generations = dict(
+        component_generations
+    )
+    children = {
+        _G05_VISION_COMPONENT: getattr(model, "vision_tower", None),
+        _G05_TEXT_COMPONENT: getattr(model, "vlm", None),
+        _G05_ACTION_COMPONENT: getattr(model, "action_expert", None),
+    }
+    for component, child in children.items():
+        if child is None:
+            continue
+        child_state = vars(child)
+        child_state["_rpu_execution"] = components[component]
+        child_state["_rpu_execution_component_id"] = component
+        child_state["_rpu_execution_generation"] = int(
+            component_generations[component]
+        )
+
+    text = children[_G05_TEXT_COMPONENT]
+    text_state = getattr(text, "_rpu_qwen3_5", None)
+    if text_state is not None:
+        text_state.execution_config = components[_G05_TEXT_COMPONENT]
+        text_state.execution_generation = int(
+            component_generations[_G05_TEXT_COMPONENT]
+        )
+    vision = children[_G05_VISION_COMPONENT]
+    if getattr(vision, "_rpu_vision_handle", None) is not None:
+        vision._execution_generation = int(
+            component_generations[_G05_VISION_COMPONENT]
+        )
+    action = children[_G05_ACTION_COMPONENT]
+    action_state = getattr(action, "_rpu_qwen3_5", None)
+    if action_state is not None:
+        action_state.execution_config = components[_G05_ACTION_COMPONENT]
+        action_state.execution_generation = int(
+            component_generations[_G05_ACTION_COMPONENT]
+        )
+
+
+def _validate_g05_execution_reconfigure(policy, execution_config) -> None:
+    """Validate every child and required native transaction API."""
+    _resolve_g05_execution(
+        execution_config,
+        max_seq_len=policy.model.vlm._rpu_g05_max_seq_len,
+        entry_point="G0.5 policy reconfigure",
+    )
+    required = (
+        "execution_reconfigure_begin",
+        "execution_reconfigure_commit",
+        "execution_reconfigure_abort",
+        "execution_reconfigure_abort_attempt",
+        "qwen3_5_stage_prefill_execution_controls",
+        "qwen3_5_stage_action_chunk_size",
+    )
+    if getattr(policy.model.vision_tower, "_rpu_vision_handle", None) is not None:
+        required += ("qwen3_5_vision_stage_prefill_execution_controls",)
+    missing = [name for name in required if not hasattr(torch.ops.rpu, name)]
+    if missing:
+        raise RuntimeError(
+            "G0.5 binary lacks execution-reconfigure op(s): "
+            + ", ".join(missing)
+        )
+
+
+def _apply_g05_execution_config(
+    policy,
+    execution_config,
+    generation: int,
+    *,
+    force_native: bool = False,
+    forced_component_generations=None,
+) -> None:
+    """Atomically stage native child controls, then rotate their graph owners."""
+    policy._rpu_g05_execution_reconfigure_journal = {"mutation_started": False}
+    from rpu_backend.api._execution import native_execution_reconfigure
+
+    model = policy.model
+    max_seq_len = model.vlm._rpu_g05_max_seq_len
+    resolved = _resolve_g05_execution(
+        execution_config,
+        max_seq_len=max_seq_len,
+        entry_point="G0.5 policy reconfigure",
+    )
+    _root, components = resolved
+    old_components = getattr(policy, "_rpu_g05_execution_components", {})
+    changed = {
+        component
+        for component in _G05_EXECUTION_COMPONENTS
+        if force_native or old_components.get(component) != components[component]
+    }
+    old_generations = dict(getattr(
+        policy,
+        "_rpu_g05_execution_component_generations",
+        {component: 0 for component in _G05_EXECUTION_COMPONENTS},
+    ))
+    if forced_component_generations is None:
+        next_generations = dict(old_generations)
+        for component in changed:
+            next_generations[component] = old_generations[component] + 1
+    else:
+        next_generations = dict(forced_component_generations)
+
+    text = model.vlm
+    text_state = text._rpu_qwen3_5
+    vision = model.vision_tower
+    vision_handle = getattr(vision, "_rpu_vision_handle", None)
+    action = model.action_expert
+    action_state = action._rpu_qwen3_5
+    from rpu_backend.adapters.qwen3_5.text import _resolve_text_install_options
+    from rpu_backend.adapters.qwen3_5.vision import _resolve_vision_install_options
+
+    text_options = _resolve_text_install_options(
+        max_seq_len,
+        execution_config=components[_G05_TEXT_COMPONENT],
+        cold_snapshot=text_state.control_snapshot,
+    )
+    vision_options = _resolve_vision_install_options(
+        execution_config=components[_G05_VISION_COMPONENT],
+        cold_snapshot=getattr(
+            vision, "_rpu_vision_control_snapshot", None
+        ),
+    )
+    text_requested = components[_G05_TEXT_COMPONENT]["prefill"]["chunk_size"]
+    text_exact = 0 if text_requested == "auto" else int(text_requested)
+    action_requested = components[_G05_ACTION_COMPONENT]["action"]["chunk_size"]
+    action_exact = 0 if action_requested == "auto" else int(action_requested)
+
+    policy._rpu_g05_execution_reconfigure_journal = {
+        "mutation_started": False,
+        "component_generations": old_generations,
+    }
+    if changed:
+        with native_execution_reconfigure(torch.ops.rpu) as token:
+            policy._rpu_g05_execution_reconfigure_journal[
+                "mutation_started"
+            ] = True
+            if _G05_TEXT_COMPONENT in changed:
+                max_kv_len, envelope_chunk = getattr(
+                    text_state,
+                    "prefill_capability_envelope",
+                    text_state.chunk_envelope,
+                )
+                torch.ops.rpu.qwen3_5_stage_prefill_execution_controls(
+                    text_state.handle,
+                    token,
+                    int(text_options[1]),
+                    text_exact,
+                    int(max_kv_len),
+                    int(envelope_chunk),
+                )
+            if _G05_VISION_COMPONENT in changed and vision_handle is not None:
+                torch.ops.rpu.qwen3_5_vision_stage_prefill_execution_controls(
+                    vision_handle,
+                    token,
+                    int(vision_options[0]),
+                    int(vision_options[1] or 0),
+                )
+            if _G05_ACTION_COMPONENT in changed:
+                torch.ops.rpu.qwen3_5_stage_action_chunk_size(
+                    action_state.handle, token, action_exact
+                )
+
+    if _G05_TEXT_COMPONENT in changed:
+        text_state.padding_budget = int(text_options[2])
+        text_state.padding_rows = components[_G05_TEXT_COMPONENT]["prefill"].get(
+            "padding_rows", "auto"
+        )
+        text_state.control_snapshot = text_options[3]
+        text_state.exact_chunk_size = text_exact or None
+        text_state.prefill_plan_key = None
+        text_state.prefill_plan = None
+        text_state.last_a6_plan = None
+        text_state.decode_stage_descriptor = None
+        _clear_g05_graph(text_state.graph_cache)
+        _clear_g05_graph(getattr(text_state, "prefill_graph_cache", None))
+        _clear_g05_graph(getattr(text_state, "prefill_debug_graph_cache", None))
+        text_state.prefill_graph.invalidate()
+    if _G05_VISION_COMPONENT in changed and vision_handle is not None:
+        (
+            vision._rpu_vision_chunk_size_cap,
+            vision._rpu_vision_exact_chunk_size,
+            vision._rpu_vision_padding_rows,
+            vision._rpu_vision_padding_budget,
+            vision._rpu_vision_control_snapshot,
+        ) = vision_options
+        _clear_g05_graph(vision._rpu_vision_graph_cache)
+        vision._rpu_vision_debug_graph.invalidate()
+        vision._rpu_vision_graph_key = None
+        vision._rpu_vision_graph_sig = None
+        vision._rpu_vision_last_a6_plan = None
+        vision._rpu_vision_a6_plans = {}
+    if _G05_ACTION_COMPONENT in changed:
+        _clear_g05_graph(action_state.graph_cache)
+        _clear_g05_graph(action_state.action_graph_cache)
+        _clear_g05_graph(action_state.action_trace_graph_cache)
+        action_state.last_a6_plan = None
+        vars(action).pop("_rpu_last_execution_plan", None)
+
+    policy._rpu_g05_execution_reconfigure_journal["mutation_started"] = True
+    _publish_g05_execution_views(
+        policy,
+        resolved,
+        generation=generation,
+        component_generations=next_generations,
+    )
+    # Retain undo state through the shared session's config publication.
+
+
+def _rollback_g05_execution_config(
+    policy, old_config, generation: int
+) -> None:
+    journal = getattr(policy, "_rpu_g05_execution_reconfigure_journal", None)
+    if journal is not None and not journal.get("mutation_started", False):
+        policy._rpu_g05_execution_reconfigure_journal = None
+        return
+    old_generations = (
+        None if journal is None else journal.get("component_generations")
+    )
+    _apply_g05_execution_config(
+        policy,
+        old_config,
+        generation,
+        force_native=True,
+        forced_component_generations=old_generations,
+    )
+    policy._rpu_g05_execution_reconfigure_journal = None
+
+
+def _retire_g05_policy_runtime(policy) -> None:
+    """Clear all child Graph owners before retiring their native handles."""
+    model = policy.model
+    vision = getattr(model, "vision_tower", None)
+    text = getattr(model, "vlm", None)
+    action = getattr(model, "action_expert", None)
+    from rpu_backend.adapters.qwen3_5.text import (
+        _retire_qwen3_5_text_state, _clear_qwen35_graphs, _validate_qwen35_retirement_children)
+    from rpu_backend.api._execution import ExecutionSession
+
+    session = policy._execution_session
+    if session._owner is not policy:
+        raise RuntimeError("G0.5 retirement requires its actual parent Session")
+    _validate_qwen35_retirement_children(policy, tuple(
+        (child, getattr(child, "_rpu_qwen3_5", None) or getattr(child, "_rpu_vision_retirement_state", None))
+        for child in (text, action, vision)))
+    for child in (text, action, vision):
+        state = getattr(child, "_rpu_qwen3_5", None) or getattr(child, "_rpu_vision_retirement_state", None)
+        if child is vision and any(getattr(vision, name, None) is not None for name in (
+                "_rpu_vision_handle", "_rpu_vision_installing_handle")) and state is None:
+            raise RuntimeError("G0.5 Vision retirement has no resource owner")
+        if state is None or getattr(state, "handle", None) is None:
+            continue
+        resource = getattr(state, "retirement", None)
+        if (resource is None or resource.failed is not None or resource.handle != state.handle
+                or (resource.owner() is not None and resource.owner() is not state)
+                or resource.parent is None
+                or (resource.parent() is not None and resource.parent() is not policy)
+                or getattr(state, "_execution_session", None) is not session
+                or getattr(state, "_retirement_close", None) is not _rpu_g05_close_execution):
+            raise RuntimeError("G0.5 retirement child belongs to a different parent")
+        try:
+            guarded = getattr(child, "_execution_session", None)
+            if not isinstance(guarded, ExecutionSession) or vars(guarded) is not vars(session):
+                raise RuntimeError("G0.5 retirement child belongs to a different Session")
+        except ReferenceError:
+            if resource.owner() is not None or resource.parent() is not None:
+                raise
+    _clear_qwen35_graphs(tuple(getattr(owner, "_rpu_qwen3_5", None)
+                             for owner in (text, action)), vision)
+
+    for owner in (action, text):
+        if owner is not None:
+            _retire_qwen3_5_text_state(owner, _graphs_retired=True)
+    if vision is not None:
+        from rpu_backend.adapters.qwen3_5.vision import _rollback_qwen3_5_vision_install
+
+        _rollback_qwen3_5_vision_install(vision, _graphs_retired=True)
+    from rpu_backend.api.causal_lm import _release_live_instance
+
+    _release_live_instance(model)
+    policy._rpu_g05_policy_ready = False
+
+
+def _poison_g05_retirement(policy, error):
+    from rpu_backend.api import causal_lm
+    from rpu_backend.api._execution import _mark_execution_process_unsafe
+
+    if not getattr(policy, "_rpu_g05_retirement_failed", None):
+        _FAILED_POLICY_RETIREMENTS.append(policy)
+        vars(policy)["_rpu_g05_retirement_failed"] = repr(error)
+    session = getattr(policy, "_execution_session", None)
+    if session is not None:
+        session.poison()
+    with causal_lm._LIVE_LOCK:
+        live = causal_lm._LIVE_REF() if causal_lm._LIVE_REF is not None else None
+        if live is None:
+            causal_lm._claim_live_instance(policy.model)
+            live = policy.model
+        causal_lm._poison_live_instance(live, f"G0.5 cleanup failed: {error!r}", unsafe=True)
+    _mark_execution_process_unsafe(f"G0.5 cleanup failed: {error!r}")
+    for child in (getattr(policy.model, "vlm", None), getattr(policy.model, "action_expert", None),
+                  getattr(policy.model, "vision_tower", None)):
+        state = getattr(child, "_rpu_qwen3_5", None) or getattr(child, "_rpu_vision_retirement_state", None)
+        resource = getattr(state, "retirement", None)
+        if resource is not None and resource.handle is not None:
+            resource.retain_failure(error, policy)
+    for _child, _state, resource, _session in vars(policy).get("_qwen35_retirement_children", ()):
+        if resource.handle is not None:
+            resource.retain_failure(error, policy)
+
+
+def _rpu_g05_reconfigure_execution(self, value):
+    return self._execution_session.reconfigure(value)
+
+
+def _rpu_g05_close_execution(self) -> None:
+    if getattr(self, "_rpu_g05_retirement_failed", None):
+        raise RuntimeError("G0.5 retirement already failed; restart the process")
+    started = False
+    def retire():
+        nonlocal started
+        started = True
+        from rpu_backend.api import causal_lm
+
+        with causal_lm._LIVE_LOCK:
+            live = causal_lm._LIVE_REF() if causal_lm._LIVE_REF is not None else None
+            if live is not None and live is not self.model:
+                raise RuntimeError("G0.5 retirement lost the live-owner slot")
+            _retire_g05_policy_runtime(self)
+    try:
+        self._execution_session.shutdown(retire)
+        if any(item[2].handle is not None for item in vars(self).get("_qwen35_retirement_children", ())):
+            started = True
+            raise RuntimeError("G0.5 closed Session still owns native resources")
+        for child in (getattr(self.model, "vlm", None), getattr(self.model, "action_expert", None),
+                      getattr(self.model, "vision_tower", None)):
+            if (getattr(getattr(child, "_rpu_qwen3_5", None), "handle", None) is not None
+                    or getattr(child, "_rpu_vision_handle", None) is not None
+                    or getattr(child, "_rpu_vision_installing_handle", None) is not None):
+                started = True
+                raise RuntimeError("G0.5 closed Session still owns native resources")
+        vars(self).pop("_qwen35_retirement_children", None)
+    except BaseException as error:
+        if started:
+            _poison_g05_retirement(self, error)
+        raise
+
+
+def _install_g05_execution_session(policy, resolved) -> None:
+    from rpu_backend.api._execution import bind_execution_session
+
+    generations = {component: 0 for component in _G05_EXECUTION_COMPONENTS}
+    _publish_g05_execution_views(
+        policy,
+        resolved,
+        generation=0,
+        component_generations=generations,
+    )
+    session = bind_execution_session(
+        policy,
+        resolved[0],
+        entry_point="G0.5 policy",
+        supported_components=_G05_EXECUTION_COMPONENTS,
+        validate=lambda config: _validate_g05_execution_reconfigure(
+            policy, config
+        ),
+        apply=lambda _old, new, generation, *, force_rebuild=False: _apply_g05_execution_config(
+            policy, new, generation, force_native=force_rebuild
+        ),
+        rollback=lambda old, _new, generation: _rollback_g05_execution_config(
+            policy, old, generation
+        ),
+        graph_mode=_GRAPH_COMPOSITE_CHILD,
+    )
+    session.register_config_view(policy.model)
+    vars(policy.model)["_execution_session"] = weakref.proxy(session)
+    for component, child in (
+        (_G05_VISION_COMPONENT, getattr(policy.model, "vision_tower", None)),
+        (_G05_TEXT_COMPONENT, getattr(policy.model, "vlm", None)),
+        (_G05_ACTION_COMPONENT, getattr(policy.model, "action_expert", None)),
+    ):
+        if child is not None:
+            session._bind_planner_owner(child, component)
+            vars(child)["_execution_session"] = weakref.proxy(session)
+            state = getattr(child, "_rpu_qwen3_5", None) or getattr(child, "_rpu_vision_retirement_state", None)
+            if state is not None:
+                from rpu_backend.adapters.qwen3_5.text import _bind_qwen35_retirement
+
+                _bind_qwen35_retirement(state, policy, _rpu_g05_close_execution, child)
+    policy.reconfigure_rpu_execution = types.MethodType(
+        _rpu_g05_reconfigure_execution, policy
+    )
+    policy.close_rpu_execution = types.MethodType(
+        _rpu_g05_close_execution, policy
+    )
+
+
+@execution_serialized
 def _rpu_g05_predict_action(self, batch):
     """Run the already-eval RPU policy without recursive mode walks."""
     if self.training or self.model.training:
         raise NotImplementedError("G0.5 RPU policy supports inference only")
+    samples = batch["samples"]
     generated = self.forward_inference(
-        samples=batch["samples"],
+        samples=samples,
         pixel_values=batch["pixel_values"],
         actions=batch.get("action"),
         action_dim_is_pad=batch.get("action_dim_is_pad"),
+        prev_action=batch.get("prev_action"),
+        inference_interval=batch.get("inference_interval"),
+        inference_delay=batch.get("inference_delay"),
     )
     batch.update(generated)
     return batch
@@ -1933,6 +2423,33 @@ def _g05_policy_runtime_ready(policy) -> bool:
         return False
     if not callable(getattr(policy, "forward_inference", None)):
         return False
+    session = vars(policy).get("_execution_session")
+    if session is None:
+        return False
+    try:
+        if session.graph_mode != _GRAPH_COMPOSITE_CHILD:
+            return False
+        if session.stats()["state"] != "QUIESCENT":
+            return False
+    except Exception:
+        return False
+    if not _instance_method_is(
+        policy, "reconfigure_rpu_execution", _rpu_g05_reconfigure_execution
+    ) or not _instance_method_is(
+        policy, "close_rpu_execution", _rpu_g05_close_execution
+    ):
+        return False
+    for component, child in (
+        (_G05_VISION_COMPONENT, getattr(model, "vision_tower", None)),
+        (_G05_TEXT_COMPONENT, getattr(model, "vlm", None)),
+        (_G05_ACTION_COMPONENT, expert),
+    ):
+        if child is None:
+            return False
+        if getattr(child, "_rpu_execution_component_id", None) != component:
+            return False
+        if getattr(child, "_execution_session", None) is None:
+            return False
 
     vision_required = (
         getattr(model, "_rpu_g05_vision_install_started", False) is True
@@ -1973,14 +2490,16 @@ def _g05_policy_runtime_ready(policy) -> bool:
 
 
 @_transactional_g05_policy_install
-def patch_g05_policy_for_rpu(policy, *, max_seq_len: int = 2048):
+def patch_g05_policy_for_rpu(
+    policy, *, max_seq_len: int = 2048, rpu_execution=None
+):
     """Patch a canonical G0.5 policy for continuous action inference.
 
     Load the official policy on CPU and call ``eval()`` before this function.
-    The VLM text stack and action-expert decoder core move to RPU. Vision still
+    The VLM text stack and action-expert decoder core move to RPU. Vision
     requires the controlled Qwen3.5 numeric-blocked opt-in. Tokenization and
-    time conditioning stay on the host; the action I/O
-    projections and FP16 Euler run inside the RPU action graph.
+    time conditioning stay on the host; the action I/O projections and FP16
+    Euler run inside the RPU action graph.
     """
     if getattr(policy, "_rpu_g05_policy_ready", False):
         if _g05_policy_runtime_ready(policy):
@@ -1994,6 +2513,11 @@ def patch_g05_policy_for_rpu(policy, *, max_seq_len: int = 2048):
             "G0.5 policy installation was already attempted; reload the "
             "checkpoint to avoid reusing partial wrapper state"
         )
+    resolved_execution = _resolve_g05_execution(
+        rpu_execution,
+        max_seq_len=max_seq_len,
+        entry_point="patch_g05_policy_for_rpu",
+    )
     if getattr(policy, "training", True):
         raise NotImplementedError(
             "G0.5 RPU policy supports inference only; call policy.eval()"
@@ -2003,19 +2527,14 @@ def patch_g05_policy_for_rpu(policy, *, max_seq_len: int = 2048):
     model = getattr(policy, "model", None)
     if model is None:
         raise TypeError("expected G05PolicyQwen35 with policy.model")
-    if bool(getattr(model, "use_training_rtc", False)):
-        raise NotImplementedError(
-            "G0.5 RTC policies must use the upstream runtime; RhinoForge "
-            "patches only the public non-RTC continuous policy"
-        )
     if not continuous or discrete:
         raise NotImplementedError(
-            "G0.5 RPU supports only continuous_action=true with "
+            "G0.5 RPU bring-up supports only continuous_action=true with "
             "discrete_action=false; discrete AR/CoT is not certified"
         )
     if bool(getattr(policy, "predict_cot", False)):
         raise NotImplementedError(
-            "G0.5 RPU requires predict_cot=false; AR/CoT is not certified"
+            "G0.5 RPU bring-up requires predict_cot=false; AR/CoT is not certified"
         )
     if max_seq_len <= 0 or (continuous and max_seq_len < 32):
         raise ValueError(
@@ -2101,8 +2620,15 @@ def patch_g05_policy_for_rpu(policy, *, max_seq_len: int = 2048):
     policy._rpu_g05_policy_install_started = True
     os.environ.setdefault("RPU_FASTREPLAY_SKIP_SYNC", "1")
     if vision_enabled:
-        patch_g05_vision_for_rpu(model)
-    patch_g05_vlm_for_rpu(model, max_seq_len=max_seq_len)
+        patch_g05_vision_for_rpu(
+            model,
+            _execution_config=resolved_execution[1][_G05_VISION_COMPONENT],
+        )
+    vlm_install_kwargs = {
+        "max_seq_len": max_seq_len,
+        "_execution_config": resolved_execution[1][_G05_TEXT_COMPONENT],
+    }
+    patch_g05_vlm_for_rpu(model, **vlm_install_kwargs)
     if getattr(model, "_rpu_g05_vision_ready", False):
         model._rpu_g05_embed_w_rpu = (
             model.vlm.input_proj.weight.detach().to(torch.float16).contiguous().to("rpu")
@@ -2116,6 +2642,7 @@ def patch_g05_policy_for_rpu(policy, *, max_seq_len: int = 2048):
     patch_g05_action_expert_for_rpu(
         model.action_expert,
         max_seq_len=max_seq_len,
+        _execution_config=resolved_execution[1][_G05_ACTION_COMPONENT],
     )
     model._rpu_g05_original_inference_fm = model.inference_fm
     model.inference_fm = types.MethodType(_rpu_g05_inference_fm, model)
@@ -2170,6 +2697,7 @@ def patch_g05_policy_for_rpu(policy, *, max_seq_len: int = 2048):
         )
     policy._rpu_g05_original_predict_action = predict_action
     policy.predict_action = types.MethodType(_rpu_g05_predict_action, policy)
+    _install_g05_execution_session(policy, resolved_execution)
     policy._rpu_g05_policy_ready = True
     return policy
 

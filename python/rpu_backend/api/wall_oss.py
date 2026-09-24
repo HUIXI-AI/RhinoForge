@@ -32,11 +32,6 @@ from typing import Any
 
 import torch
 
-from rpu_backend.api._runtime_env import (
-    LKN_CAPACITY_ENV,
-    normalize_runtime_env,
-)
-
 
 _SUPPORTED_CAMERA_NAMES = frozenset(
     {
@@ -51,39 +46,6 @@ _SUPPORTED_CAMERA_NAMES = frozenset(
         "global_view",
     }
 )
-_RUNTIME_ENV_ALLOWLIST = frozenset({
-    "RPU_DEEP_FAST_REPLAY",
-    "RPU_FASTREPLAY_SKIP_SYNC",
-    "RPU_LINEAR_ACC32",
-    "RPU_RMSNORM_NEWTON",
-    "RPU_WALL_OSS_ACTION_FP32_TAIL",
-    "RPU_WALL_OSS_ATTN_TP8",
-    "RPU_WALL_OSS_BATCH_MAX_SEQ",
-    "RPU_WALL_OSS_BATCH_VISION",
-    "RPU_WALL_OSS_DENOISE_UNROLL",
-    "RPU_WALL_OSS_DEVICE_PATCH_EMBED",
-    "RPU_WALL_OSS_EXPERT0_DOWN_INT4",
-    "RPU_WALL_OSS_FAST_IMGPROC",
-    "RPU_WALL_OSS_FAST_PROCESSOR",
-    "RPU_WALL_OSS_FAST_REPLAY",
-    "RPU_WALL_OSS_FUSED_ASSEMBLE",
-    "RPU_WALL_OSS_FUSED_DENOISE",
-    "RPU_WALL_OSS_GENERIC_PROLOGUE",
-    "RPU_WALL_OSS_HOST_CACHE",
-    "RPU_WALL_OSS_INSTRUMENT",
-    "RPU_WALL_OSS_KVINSERT_PAD16",
-    "RPU_WALL_OSS_MULTISUITE_PROLOGUE",
-    "RPU_WALL_OSS_ONDEVICE_EMBED",
-    "RPU_WALL_OSS_PARTIAL_MROPE",
-    "RPU_WALL_OSS_PE_NORM_FOLD",
-    "RPU_WALL_OSS_PROLOGUE_FILLER",
-    "RPU_WALL_OSS_SHORT_PROMPT",
-    "RPU_WALL_OSS_VISION_DEVICE_MERGED",
-    "RPU_WALL_OSS_VISION_FUSED_MERGER",
-    "RPU_WALL_OSS_VISION_LAYER_GROUP",
-    "RPU_WALL_OSS_VISION_ROPE_SPM",
-    "WALL_OSS_PROFILE_PREFIX",
-})
 
 
 def _strict_bool(name: str, value: bool) -> bool:
@@ -161,12 +123,38 @@ def _active_slot_list(active_slots: Sequence[int] | None) -> list[int] | None:
 
 
 def _runtime_environment(runtime_env: Mapping[str, str] | None) -> dict[str, str]:
-    return normalize_runtime_env(
-        runtime_env,
-        owner="WallOssPolicy",
-        allowed=_RUNTIME_ENV_ALLOWLIST,
-        preimport_only=LKN_CAPACITY_ENV,
-    )
+    if runtime_env is None:
+        return {}
+    if not isinstance(runtime_env, Mapping):
+        raise ValueError("WallOssPolicy runtime_env must be a mapping")
+    result: dict[str, str] = {}
+    for key, value in runtime_env.items():
+        if (
+            not isinstance(key, str)
+            or not key
+            or "=" in key
+            or "\0" in key
+        ):
+            raise ValueError(
+                f"WallOssPolicy runtime_env has invalid environment key {key!r}"
+            )
+        if key == "RPU_LINEAR_ACC32":
+            raise ValueError(
+                "RPU_LINEAR_ACC32 is retired for production models; Linear "
+                "accumulation is selected by each native handle"
+            )
+        if key in {"RPU_RMSNORM_NEWTON", "RPU_RMSNORM_VWARP"}:
+            raise ValueError(
+                f"{key} is not a Wall-OSS production selector; RMSNorm is "
+                "selected by the frozen native-handle capability"
+            )
+        rendered = str(value)
+        if "\0" in rendered:
+            raise ValueError(
+                f"WallOssPolicy runtime_env[{key!r}] contains a null byte"
+            )
+        result[key] = rendered
+    return result
 
 
 def _cpu_finite_tensor(value, *, name: str) -> torch.Tensor:
@@ -249,10 +237,7 @@ def _wall_oss_policy_runtime_complete(policy: Any) -> bool:
 def _close_wall_oss_vla(vla: Any) -> None:
     close = getattr(vla, "close", None)
     if callable(close):
-        try:
-            close()
-        except BaseException:
-            pass
+        close()
 
 
 class WallOssPolicy:
@@ -398,13 +383,15 @@ class WallOssPolicy:
         inst._nvfp4a16 = nvfp4a16
         inst._precision = (
             "w8a16" if w8a16 else (
-                "w4a16" if w4a16 else (
-                    "nvfp4a16" if nvfp4a16 else "fp16"
+                    "w4a16" if w4a16 else (
+                        "nvfp4a16" if nvfp4a16 else "fp16"
+                    )
                 )
-            )
         )
         inst._fp16_ckpt_dir = os.fspath(fp16_ckpt_dir) if fp16_ckpt_dir is not None else inst._ckpt_dir
-        inst._active_slots = active_slot_list
+        inst._active_slots = (
+            active_slot_list
+        )
         inst._runtime_env = _runtime_environment(runtime_env)
         inst._rpu_execution = execution_config
         inst._rpu_ready = False
@@ -495,6 +482,7 @@ class WallOssPolicy:
                     "reuse partially initialized or swizzled state."
                 )
 
+
             from rpu_backend.api.causal_lm import _claim_live_instance
             _claim_live_instance(self)
             self._rpu_build_started = True
@@ -520,6 +508,7 @@ class WallOssPolicy:
                     fp16_ckpt_dir=self._fp16_ckpt_dir,
                     rpu_execution=self._rpu_execution,
                 )
+                pending_vla._live_owner = self
                 self._rpu_execution = pending_vla._rpu_execution
                 if not _wall_oss_vla_runtime_complete(pending_vla):
                     raise RPUBackendError(
@@ -532,15 +521,24 @@ class WallOssPolicy:
                 self._vla = pending_vla
                 self._rpu_ready = True
                 return self
-            except BaseException:
+            except BaseException as error:
                 self._rpu_ready = False
-                _close_wall_oss_vla(pending_vla)
-                self._vla = None
+                from rpu_backend.adapters.wall_oss._retirement import _cleanup_build_failure
+                _cleanup_build_failure(error, pending_vla,
+                                       lambda: _close_wall_oss_vla(pending_vla))
+                self._vla = (pending_vla if getattr(pending_vla, "_retirement_failed", None)
+                             is not None else None)
                 self._prepare_ms = {}
                 self._graph_profile = None
                 raise
         finally:
             self._rpu_build_lock.release()
+
+    def close(self) -> None:
+        """Retire the actual composite before releasing public ownership."""
+        _close_wall_oss_vla(getattr(self, "_vla", None))
+        self._rpu_ready = False
+        self._vla = None
 
     @staticmethod
     def _make_default_noise(*, horizon: int, action_dim: int, noise_seed: int) -> torch.Tensor:
@@ -570,6 +568,7 @@ class WallOssPolicy:
         if tuple(t.shape) != expected:
             raise ValueError(f"{name} shape {tuple(t.shape)} != expected {expected}")
         return t.contiguous()
+
 
     def _observation_inputs(
         self,
@@ -802,9 +801,10 @@ class WallOssPolicy:
                     "online graph BUILD is disabled")
 
         t0 = time.perf_counter()
+        predict_kwargs = {"num_steps": steps}
         out = self._vla.predict(
             image_list, instruction, prop, state_mask_t, noise_t, dof_t,
-            num_steps=steps)
+            **predict_kwargs)
         latency_ms = (time.perf_counter() - t0) * 1000.0
 
         from rpu_backend.api.errors import RPUBackendError
@@ -848,6 +848,8 @@ class WallOssPolicy:
                 "action_chunk_size_resolved": (
                     (int(horizon) + 15) // 16
                 ) * 16,
+
+
                 "noise_seed": seed,
                 "prepare_ms": dict(self._prepare_ms),
                 "graphs_ready": self.graphs_ready,

@@ -1,8 +1,8 @@
-"""Qwen3-VL text decoder integration.
+"""Qwen3-VL text decoder → rpu_backend (R-Phase 1).
 
 Wires `Qwen3VLTextModel` into the existing `causal_decoder_set_weights` /
-`causal_decoder_forward` op family with M-RoPE enabled. Reuses the Qwen3
-adapter wiring (same QKV / RMSNorm / SwiGLU / qk-norm layout) and
+`causal_decoder_forward` op family with M-RoPE enabled. Reuses 90 % of the
+Qwen3 adapter wiring (same QKV / RMSNorm / SwiGLU / qk-norm layout) and
 adds three pieces:
 
 1. `mrope_section` is read from `text_config.rope_parameters["mrope_section"]`
@@ -13,8 +13,11 @@ adds three pieces:
 3. position_ids is built at forward time by HF's `get_rope_index` and
    normalized to `[seq_len, 3]` int32 RPU by `_run_causal_decoder_forward`.
 
-The same installer serves the public
-``RPUModelForConditionalGeneration`` entry point and DeepStack path.
+R-Phase 1 verification uses `install_qwen3_vl_text_for_rpu` directly from
+the verify_mrope_text_only.py golden test; the user-facing entry
+(`RPUModelForConditionalGeneration`) lands in R-Phase 4.
+
+DeepStack helpers + injection wiring arrive in R-Phase 2.
 """
 
 from __future__ import annotations
@@ -23,18 +26,28 @@ from typing import Any
 
 import torch
 
-import rpu_backend
-from rpu_backend.runtime.decoder import _install_causal_decoder_forward
+from rpu_backend.runtime.decoder import (
+    build_mrope_cos_sin_tables, install_mrope_text_decoder_for_rpu,
+)
 from rpu_backend.runtime.chunk_envelope import ChunkEnvelope, make_lookup
+from rpu_backend.runtime.topology import execution_core_count
 
-# Validated bounded-prefill envelopes. The limit applies to the 16-aligned
-# executed length after adapter padding, not the caller's logical token count.
+# Declared execution-length and chunk ceilings for each text geometry.
 _CHUNK_ENVELOPE = {
-    ("qwen3_vl_text", 28, 2048): ChunkEnvelope(336, 320),   # 2b
-    ("qwen3_vl_text", 36, 2560): ChunkEnvelope(336, 256),   # 4b
-    ("qwen3_vl_text", 36, 4096): ChunkEnvelope(320, 128),   # padded 8b
-    # GR00T-N1.7-3B uses a truncated 16-layer Qwen3-VL-2B backbone. Auto is
-    # validated to length 512; no exact chunk is published for this geometry.
+    # Bound the padded execution length, not the logical token count.
+    # P4097 requires E4112; optional padding can extend the search to E4176.
+    # Per-chunk ceilings do not bypass native SPM/SDPA feasibility checks.
+    ("qwen3_vl_text", 28, 2048): ChunkEnvelope(4176, 320),  # 2b
+    # 4B long-context admission retains C256 and every native SPM/SDPA check.
+    # 4176 bounds padded prefill execution; P4096D128 separately needs KV4224.
+    ("qwen3_vl_text", 36, 2560): ChunkEnvelope(4176, 256),  # 4b
+    # Exact padded 8B retains C128; the extended length window does not
+    # enlarge native SPM/SDPA candidates or the separately allocated KV cache.
+    ("qwen3_vl_text", 36, 4096): ChunkEnvelope(4176, 128),  # padded 8b
+    # GR00T-N1.7-3B backbone — a TRUNCATED 16-layer Qwen3-VL-2B (select_layer=16)
+    # installed through install_qwen3_vl_text_for_rpu, so it lands on this arch
+    # key with its own geometry. Auto is independently certified to length 512;
+    # no exact chunk is certified for this truncated geometry.
     ("qwen3_vl_text", 16, 2048): ChunkEnvelope(512),
 }
 lookup_causal_decoder = make_lookup(
@@ -42,12 +55,6 @@ lookup_causal_decoder = make_lookup(
 
 QWEN3_VL_TEXT_ARCH = "qwen3_vl_text"
 _GR00T_TEXT_GEOMETRY = (QWEN3_VL_TEXT_ARCH, 16, 2048)
-
-
-def _deepstack_text_layer_indices(vision_config: Any) -> list[int]:
-    """Map N ordered vision features to the first N text layers, as HF does."""
-    visual_layers = getattr(vision_config, "deepstack_visual_indexes", ()) or ()
-    return list(range(len(visual_layers)))
 
 
 def _chunk_envelope_for_execution(
@@ -79,235 +86,102 @@ def _chunk_envelope_for_execution(
     )
 
 
-def build_mrope_cos_sin_tables(
-    text_config: Any,
-    *,
-    max_seq_len: int | None = None,
-    device: str | torch.device = "rpu",
-    dtype: torch.dtype = torch.float16,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build kernel-format M-RoPE cos/sin tables.
+_RUNTIME_QUANTIZED_32B_ENVELOPE = ChunkEnvelope(4176, 64)
 
-    Shape: `[max_seq_len, head_dim / 2]` (the rotary half-dim — the kernel
-    consumes the standard 1D RoPE table; the per-axis (T/H/W) selection is
-    performed at runtime via strobe masks set by the launcher).
 
-    Args:
-        text_config: Qwen3VLTextConfig (or anything quack-compatible with
-            head_dim / num_attention_heads / hidden_size / rope_parameters).
-        max_seq_len: Defaults to `text_config.max_position_embeddings` and
-            sizes the table to match the runtime keepalive
-            (QWEN3_MROPE_MAX_KEEPALIVE_SEQ = 8192). Larger values are safe
-            but waste DDR.
-        device: target device (default "rpu").
-        dtype: target dtype (default torch.float16 — matches the kernel
-            register format).
-    """
-    head_dim = getattr(text_config, "head_dim", None)
-    if head_dim is None:
-        head_dim = text_config.hidden_size // text_config.num_attention_heads
-    if head_dim <= 0 or (head_dim % 2) != 0:
-        raise ValueError(
-            f"build_mrope_cos_sin_tables: head_dim must be positive and even, "
-            f"got {head_dim}"
-        )
-
-    # rope_parameters (transformers >=5.x) replaces rope_scaling. Try both for
-    # forward-compat with mid-flight transformers versions.
-    rope_params = getattr(text_config, "rope_parameters", None)
-    if rope_params is None:
-        rope_params = getattr(text_config, "rope_scaling", None) or {}
-    rope_type = rope_params.get("rope_type", "default")
-    if rope_type != "default":
-        # YaRN / dynamic / linear scaling cases need the corresponding HF
-        # rope_init_fn. Only the default branch is wired, so fail loudly
-        # rather than silently produce wrong cos/sin.
-        raise NotImplementedError(
-            f"build_mrope_cos_sin_tables: rope_type={rope_type!r} not yet "
-            "supported; only 'default' for Qwen3-VL 2B/4B-Instruct is wired."
-        )
-    rope_theta = rope_params.get("rope_theta", None)
-    if rope_theta is None:
-        rope_theta = getattr(text_config, "rope_theta", 10000.0)
-
-    if max_seq_len is None:
-        max_seq_len = int(getattr(text_config, "max_position_embeddings", 8192))
-
-    half = head_dim // 2
-    inv_freq = 1.0 / (
-        rope_theta
-        ** (torch.arange(0, head_dim, 2, dtype=torch.float64) / head_dim)
-    )  # [half]
-    positions = torch.arange(max_seq_len, dtype=torch.float64)  # [max_seq]
-    freqs = positions[:, None] * inv_freq[None, :]  # [max_seq, half]
-    cos = freqs.cos().to(dtype=dtype)
-    sin = freqs.sin().to(dtype=dtype)
-    cos = cos.to(device=device).contiguous()
-    sin = sin.to(device=device).contiguous()
-    expected_shape = (max_seq_len, half)
-    if tuple(cos.shape) != expected_shape or tuple(sin.shape) != expected_shape:
-        raise RuntimeError(
-            "build_mrope_cos_sin_tables produced invalid table shapes: "
-            f"cos={tuple(cos.shape)}, sin={tuple(sin.shape)}, "
-            f"expected={expected_shape}"
-        )
-    return cos, sin
+def _validate_runtime_quantized_32b_text(text_model, cfg, scale_lists):
+    """Bind the exact 32B envelope to the live quantized projection owners."""
+    fields = ("num_hidden_layers", "hidden_size", "intermediate_size",
+              "num_attention_heads", "num_key_value_heads", "head_dim")
+    for config in (cfg, getattr(text_model, "config", None)):
+        values = tuple(getattr(config, field, None) for field in fields)
+        if (getattr(config, "model_type", None) != QWEN3_VL_TEXT_ARCH
+                or any(type(value) is not int for value in values)
+                or values != (64, 5120, 25600, 64, 8, 128)):
+            raise ValueError("runtime quantized 32B text requires exact live geometry")
+    layers = getattr(text_model, "layers", ())
+    if (len(layers) != 64 or not isinstance(scale_lists, (tuple, list))
+            or len(scale_lists) != 7
+            or any(not isinstance(scales, (tuple, list)) or len(scales) != 64
+                   for scales in scale_lists)):
+        raise ValueError("runtime quantized 32B text requires seven complete scale lists")
+    shapes = (("self_attn.q_proj", 8192, 5120),
+              ("self_attn.k_proj", 1024, 5120),
+              ("self_attn.v_proj", 1024, 5120),
+              ("self_attn.o_proj", 5120, 8192),
+              ("mlp.gate_proj", 25600, 5120),
+              ("mlp.up_proj", 25600, 5120),
+              ("mlp.down_proj", 5120, 25600))
+    dtype = None
+    for (role, n, k), scales in zip(shapes, scale_lists, strict=True):
+        for layer, scale in zip(layers, scales, strict=True):
+            try:
+                projection = layer.get_submodule(role)
+            except (AttributeError, KeyError) as exc:
+                raise ValueError("runtime quantized 32B text requires all seven projections") from exc
+            weight = getattr(projection, "weight", None)
+            if not isinstance(weight, torch.Tensor) or weight.dtype not in (torch.int8, torch.uint8):
+                raise ValueError("runtime quantized 32B text requires uniform INT8 or packed W4 weights")
+            if dtype is None:
+                dtype = weight.dtype
+            packed = dtype == torch.uint8
+            if (weight.dtype != dtype or not weight.is_contiguous()
+                    or (projection.out_features, projection.in_features) != (n, k)
+                    or tuple(weight.shape) != (n, k // 2 if packed else k)
+                    or getattr(projection, "bias", None) is not None
+                    or not isinstance(scale, torch.Tensor)
+                    or scale is not projection._buffers.get("weight_scale")
+                    or scale.dtype != torch.float16 or not scale.is_contiguous()
+                    or scale.device != weight.device
+                    or tuple(scale.shape) != ((32, n * k // 1024) if packed else (n,))):
+                raise ValueError("runtime quantized 32B text requires matching projection weights and actual scale buffers")
 
 
 def install_qwen3_vl_text_for_rpu(
-    text_model,
-    *,
-    text_config: Any | None = None,
-    max_seq_len: int | None = None,
-    vision_config: Any | None = None,
-    deepstack_lang_layers: list[int] | None = None,
-    enable_deepstack: bool = True,
-    scale_lists=None,
-    execution_config=None,
+    text_model, *, text_config=None, max_seq_len=None, vision_config=None,
+    deepstack_lang_layers=None, enable_deepstack=True, scale_lists=None,
+    execution_config=None, topology=None, runtime_align_w8a16=False,
+    _runtime_quantized_32b=False,
+    _graph_cache_max_entries=None,
 ) -> int:
-    """Install RPU all-layers-once forward on a `Qwen3VLTextModel` instance.
-
-    Prerequisites (same as the Qwen3 path):
-      - `text_model.to('rpu')` has been called.
-      - `convert_linear_weights_inplace(text_model)` has been called.
-
-    Text path with M-RoPE and optional DeepStack injection wired through
-    `causal_decoder_set_weights`. The supported Qwen3-VL ConditionalGeneration
-    adapter composes this with the Vision tower; component/text-only callers can
-    opt out of DeepStack via `enable_deepstack=False` or an empty layer list.
-
-    Args:
-        text_model: Qwen3VLTextModel instance (already moved to RPU).
-        text_config: optional; defaults to `text_model.config`.
-        max_seq_len: cos/sin table length; defaults to
-            text_config.max_position_embeddings.
-        vision_config: optional; used only to infer the number of leading text
-            layers that receive DeepStack when `deepstack_lang_layers` is None.
-            Pass `model.config.vision_config` for end-to-end Qwen3-VL flows.
-        deepstack_lang_layers: explicit list of text-decoder layer indices that
-            receive DeepStack injection. Overrides vision_config detection.
-        enable_deepstack: false → bypass DeepStack injection regardless of
-            config (text-only fallback).
-        scale_lists: optional W8A16 per-output-channel fp16 scale tuple
-            (q,k,v,o,gate,up,down), one fp16 [out] tensor per layer per
-            projection. When provided, the decoder's 7 projection weights must
-            already be int8 (swizzled dwidth=1) and the install routes to
-            `causal_decoder_set_weights_w8a16`. None → fp16 (default).
-
-    Returns the C++ handle (also stashed at `text_model._rpu_decoder_handle`).
-    """
-    cfg = text_config if text_config is not None else getattr(text_model, "config", None)
-    if cfg is None:
-        raise ValueError(
-            "install_qwen3_vl_text_for_rpu: text_config not provided and "
-            "text_model has no .config attribute."
-        )
-
-    rope_params = getattr(cfg, "rope_parameters", None)
-    if rope_params is None:
-        rope_params = getattr(cfg, "rope_scaling", None) or {}
-    mrope_section = rope_params.get("mrope_section", None)
-    if mrope_section is None:
-        raise ValueError(
-            "install_qwen3_vl_text_for_rpu: text_config.rope_parameters['mrope_section'] "
-            "is required (expected [T_dim_half, H_dim_half, W_dim_half])."
-        )
-    mrope_section = [int(x) for x in mrope_section]
-
-    cos, sin = build_mrope_cos_sin_tables(
-        cfg, max_seq_len=max_seq_len, device="rpu", dtype=torch.float16,
+    """Bind this adapter's certified geometry to the shared M-RoPE installer."""
+    if type(_runtime_quantized_32b) is not bool:
+        raise ValueError("_runtime_quantized_32b must be a bool")
+    if _runtime_quantized_32b:
+        if (runtime_align_w8a16 or topology is not None
+                or execution_core_count(execution_config) != 8):
+            raise ValueError("runtime quantized 32B text requires TP8 without the legacy W8 flag")
+        cfg = text_config if text_config is not None else getattr(text_model, "config", None)
+        _validate_runtime_quantized_32b_text(text_model, cfg, scale_lists)
+    if runtime_align_w8a16:
+        cfg = text_config if text_config is not None else text_model.config
+        if (topology is not None or scale_lists is None or
+                (cfg.num_hidden_layers, cfg.hidden_size, cfg.intermediate_size,
+                 cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim)
+                != (36, 2560, 9728, 32, 8, 128)):
+            raise ValueError("runtime-alignment W8 text requires exact 4B TP8 geometry and scales")
+    return install_mrope_text_decoder_for_rpu(
+        text_model, arch=QWEN3_VL_TEXT_ARCH,
+        chunk_envelope_for=lambda arch, num_layers, hidden_size: (
+            # Explicit candidate only; native planning/SPM checks still apply.
+            # This is not an ordinary FP16 envelope or hardware certification.
+            _RUNTIME_QUANTIZED_32B_ENVELOPE if _runtime_quantized_32b
+            and (arch, num_layers, hidden_size) == (QWEN3_VL_TEXT_ARCH, 64, 5120) else
+            ChunkEnvelope(4176, 256) if runtime_align_w8a16 else
+            _chunk_envelope_for_execution(arch, num_layers, hidden_size, execution_config)
+        ),
+        text_config=text_config, max_seq_len=max_seq_len,
+        vision_config=vision_config, deepstack_lang_layers=deepstack_lang_layers,
+        enable_deepstack=enable_deepstack, scale_lists=scale_lists,
+        execution_config=execution_config, topology=topology,
+        _kv_cache_layer_bank_size=8 if _runtime_quantized_32b else 1,
+        **({"_graph_cache_max_entries": _graph_cache_max_entries}
+           if _graph_cache_max_entries is not None else {}),
     )
-
-    # Vision indexes select extraction blocks; HF injects those outputs into
-    # the first text layers in list order.  Caller > vision_config > [].
-    if not enable_deepstack:
-        ds_layers: list[int] = []
-    elif deepstack_lang_layers is not None:
-        ds_layers = [int(x) for x in deepstack_lang_layers]
-    elif vision_config is not None:
-        ds_layers = list(
-            range(len(getattr(vision_config, "deepstack_visual_indexes", [])))
-        )
-    else:
-        ds_layers = []
-
-    # Eager-initialize the text-decoder GraphCache so the
-    # Qwen3-VL adapter can batch all kernel dispatches inside one
-    # `with graph_cache.capture(sig):` block per forward. Without the
-    # wrap, the graph runtime dispatches each kernel in immediate mode.
-    text_graph_cache = rpu_backend.graph.GraphCache()
-    text_num_layers = int(cfg.num_hidden_layers)
-    text_hidden_size = int(cfg.hidden_size)
-    # FNV1a-style hash of the deepstack lang-layer list — used as a
-    # tiebreaker in the GraphSignature so two models with different
-    # deepstack layouts but the same sequence shape don't alias.
-    _ds_hash = 0
-    for idx in ds_layers:
-        _ds_hash = (_ds_hash * 1099511628211) ^ int(idx)
-        _ds_hash &= (1 << 63) - 1
-    runtime_attrs = {
-        "_rpu_text_graph_cache": text_graph_cache,
-        "_rpu_text_num_layers": text_num_layers,
-        "_rpu_text_hidden_size": text_hidden_size,
-        "_rpu_text_deepstack_hash": _ds_hash,
-    }
-    model_vars = vars(text_model)
-    snapshot = {
-        name: (name in model_vars, model_vars.get(name))
-        for name in runtime_attrs
-    }
-
-    # Publish only pre-built, non-native wrapper state before entering the
-    # common decoder transaction. If that transaction fails, its old handle
-    # remains published and this wrapper state is restored exactly.
-    try:
-        for name, value in runtime_attrs.items():
-            setattr(text_model, name, value)
-        handle = _install_causal_decoder_forward(
-            text_model,
-            arch=QWEN3_VL_TEXT_ARCH,
-            mrope_section=mrope_section,
-            cos_sin=(cos, sin),
-            deepstack_lang_layers=ds_layers,
-            scale_lists=scale_lists,
-            chunk_envelope_for=lambda arch, num_layers, hidden_size: (
-                _chunk_envelope_for_execution(
-                    arch,
-                    num_layers,
-                    hidden_size,
-                    execution_config,
-                )
-            ),
-            execution_config=execution_config,
-        )
-    except BaseException:
-        try:
-            text_graph_cache.clear()
-        except Exception:
-            pass
-        # Rollback must not re-enter model-defined attribute hooks: the
-        # publication failure may have come from those hooks in the first
-        # place, and they may keep rejecting subsequent writes/deletes.
-        model_vars = vars(text_model)
-        for name in runtime_attrs:
-            model_vars.pop(name, None)
-        for name, (had_attr, value) in snapshot.items():
-            if had_attr:
-                model_vars[name] = value
-        raise
-
-    old_graph_cache = snapshot["_rpu_text_graph_cache"][1]
-    if old_graph_cache is not None and old_graph_cache is not text_graph_cache:
-        try:
-            old_graph_cache.clear()
-        except Exception:
-            pass
-
-    return handle
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# DeepStack helpers
+# DeepStack helpers (R-Phase 2)
 # ─────────────────────────────────────────────────────────────────────────
 
 
@@ -324,7 +198,7 @@ def get_or_create_zero_keepalive(
     DeepStack fused-graph injection reads when there are no actual visual
     tokens to add (text-only prefill, decode, multi-chunk text prefill).
 
-    Sized to MAX_KEEPALIVE_SEQ rather than max_chunk because the
+    Sized to MAX_KEEPALIVE_SEQ rather than max_chunk per findings F27 — the
     mutable DMA's `src_offset_bytes = chunk.offset × hidden × 2` is baked at
     BUILD time, so chunk N > 0 reads beyond the per-forward seq_len region.
     """
@@ -340,6 +214,7 @@ def get_or_create_zero_keepalive(
         device="rpu",
     ).contiguous()
     text_model._rpu_deepstack_zero_keepalive = z
+    text_model._rpu_deepstack_zero_views = {}
     return z
 
 
@@ -362,52 +237,183 @@ def make_zero_visual_embeds(
             f"make_zero_visual_embeds: seq_len={seq_len} exceeds "
             f"keepalive capacity={z.shape[0]}; bump max_seq_len or split chunks."
         )
-    view = z.narrow(0, 0, seq_len)
+    zero_views = getattr(text_model, "_rpu_deepstack_zero_views", None)
+    if zero_views is None:
+        zero_views = {}
+        text_model._rpu_deepstack_zero_views = zero_views
+    view = zero_views.get(seq_len)
+    if view is None:
+        view = z.narrow(0, 0, seq_len)
+        zero_views[seq_len] = view
     return [view for _ in range(n_mergers)]
 
 
 def scatter_visual_embeds_to_dense(
-    visual_embeds: list[torch.Tensor],
+    visual_embeds: list[torch.Tensor | list[torch.Tensor]],
     visual_pos_mask: torch.Tensor,
     seq_len: int,
     hidden_size: int,
     *,
     device: str = "rpu",
+    cache_owner: Any | None = None,
+    row_indices_cpu: torch.Tensor | None = None,
+    cached_prefix_parts: int = 0,
+    execution_len: int | None = None,
 ) -> list[torch.Tensor]:
-    """Build dense `[seq_len, hidden]` fp16 tensors from sparse visual_embeds.
+    """Build dense FP16 DeepStack inputs with zero execution-padding rows.
 
-    HF Qwen3-VL `_deepstack_process` does `hidden[mask] += visual_embeds[i]`.
-    Equivalent: dense = zeros[seq_len, hidden]; dense[mask] = visual_embeds[i];
-    then `hidden += dense`. The fused-graph injection consumes the dense form.
-
-    Args:
-        visual_embeds: list of N `[num_visual_tokens, hidden]` tensors (one per
-            DeepStack merger). All on the same device, fp16.
-        visual_pos_mask: 1D bool/long tensor of shape `[seq_len]` marking
-            which positions hold visual tokens.
-        seq_len: full prompt length (text + visual tokens).
-        hidden_size: text-decoder hidden size.
-        device: target device (default 'rpu').
-
-    Returns N dense fp16 tensors of shape `[seq_len, hidden_size]`.
+    A cache owner enables stable internal DDR buffers. Per-image source parts
+    may mix CPU and RPU tensors; unchanged leading cached parts are retained
+    while only fresh suffix rows are overwritten. Scatter indices remain in
+    the logical `seq_len` even when the buffer has `execution_len` rows.
     """
-    mask = visual_pos_mask.to(device=device)
-    if mask.dtype != torch.bool:
-        mask = mask.to(torch.bool)
-    if mask.numel() != seq_len:
+    if execution_len is None:
+        execution_len = seq_len
+    if execution_len < seq_len:
+        raise ValueError(
+            f"execution_len={execution_len} is smaller than logical seq_len={seq_len}"
+        )
+    if visual_pos_mask.numel() != seq_len:
         raise ValueError(
             f"scatter_visual_embeds_to_dense: visual_pos_mask length "
-            f"{mask.numel()} != seq_len {seq_len}"
+            f"{visual_pos_mask.numel()} != seq_len {seq_len}"
         )
 
-    dense_list: list[torch.Tensor] = []
-    for i, embed in enumerate(visual_embeds):
-        if embed.shape[1] != hidden_size:
-            raise ValueError(
-                f"scatter_visual_embeds_to_dense[{i}]: hidden {embed.shape[1]} "
-                f"!= text hidden_size {hidden_size}"
+    mask_unchanged = False
+    if cache_owner is None:
+        mask = visual_pos_mask.to(device=device, dtype=torch.bool)
+        dense_list = [
+            torch.zeros(
+                (execution_len, hidden_size), dtype=torch.float16, device=device
             )
-        dense = torch.zeros((seq_len, hidden_size), dtype=torch.float16, device=device)
-        dense[mask] = embed.to(dtype=torch.float16, device=device)
-        dense_list.append(dense.contiguous())
+            for _ in visual_embeds
+        ]
+    else:
+        signature = (seq_len, execution_len, hidden_size, len(visual_embeds), str(device))
+        previous_signature = getattr(
+            cache_owner, "_rpu_deepstack_dense_signature", None
+        )
+        if previous_signature != signature:
+            dense_list = [
+                torch.zeros(
+                    (execution_len, hidden_size), dtype=torch.float16, device=device
+                ).contiguous()
+                for _ in visual_embeds
+            ]
+            cache_owner._rpu_deepstack_dense_buffers = dense_list
+            cache_owner._rpu_deepstack_dense_signature = signature
+        else:
+            dense_list = cache_owner._rpu_deepstack_dense_buffers
+
+        mask_cpu = visual_pos_mask.detach().to(
+            device="cpu", dtype=torch.bool
+        ).contiguous()
+        if row_indices_cpu is None:
+            row_indices_cpu = (
+                mask_cpu.nonzero().flatten().to(torch.int64).contiguous()
+            )
+        else:
+            row_indices_cpu = row_indices_cpu.detach().to(
+                device="cpu", dtype=torch.int64
+            ).contiguous()
+        if execution_len > seq_len and row_indices_cpu.numel() \
+                and int(row_indices_cpu.max()) >= seq_len:
+            raise ValueError("DeepStack scatter indices must stay within logical seq_len")
+        previous_mask = getattr(
+            cache_owner, "_rpu_deepstack_dense_mask_cpu", None
+        )
+        mask_unchanged = (
+            previous_signature == signature
+            and previous_mask is not None
+            and torch.equal(previous_mask, mask_cpu)
+        )
+        if previous_signature == signature and previous_mask is not None \
+                and not mask_unchanged:
+            for dense in dense_list:
+                dense.zero_()
+        if not mask_unchanged:
+            # A changed mask clears every destination. Invalidate all merger
+            # prefix stamps before any one native scatter can fail.
+            cache_owner._rpu_deepstack_cached_prefix_signatures = {}
+        cache_owner._rpu_deepstack_dense_mask_cpu = mask_cpu.clone()
+
+    expected_visual_rows = (
+        row_indices_cpu.numel()
+        if row_indices_cpu is not None else int(mask.sum().item())
+    )
+    for i, embed in enumerate(visual_embeds):
+        embed_parts = list(embed) if isinstance(embed, (list, tuple)) else None
+        tensors = embed_parts if embed_parts is not None else [embed]
+        for part in tensors:
+            if part.dim() != 2 or part.shape[1] != hidden_size:
+                raise ValueError(
+                    f"scatter_visual_embeds_to_dense[{i}]: shape "
+                    f"{tuple(part.shape)} must be "
+                    f"[num_visual_tokens, {hidden_size}]"
+                )
+        source_rows = sum(int(part.shape[0]) for part in tensors)
+        if source_rows != expected_visual_rows:
+            raise ValueError(
+                f"scatter_visual_embeds_to_dense[{i}]: source rows "
+                f"{source_rows} != visual rows {expected_visual_rows}"
+            )
+
+        dense = dense_list[i]
+        if cache_owner is None:
+            merged = torch.cat(tensors, dim=0) if embed_parts is not None else embed
+            dense[:seq_len][mask] = merged.to(dtype=torch.float16, device=device)
+            continue
+
+        prefix_signatures = getattr(
+            cache_owner, "_rpu_deepstack_cached_prefix_signatures", {}
+        )
+        previous_prefix = prefix_signatures.pop(i, None)
+        if embed_parts is None:
+            embed_cpu = embed.detach().to(
+                device="cpu", dtype=torch.float16
+            ).contiguous()
+            torch.ops.rpu.qwen3vl_scatter_row_parts_unflushed_(
+                dense, row_indices_cpu, [embed_cpu]
+            )
+            continue
+
+        normalized_parts = [
+            part.detach().to(dtype=torch.float16).contiguous()
+            for part in embed_parts
+        ]
+        scatter_parts = normalized_parts
+        scatter_indices = row_indices_cpu
+        pending_prefix = None
+        if cached_prefix_parts:
+            if not 0 <= cached_prefix_parts < len(normalized_parts):
+                raise ValueError(
+                    "cached_prefix_parts must be in "
+                    "[0, len(deepstack parts))"
+                )
+            prefix_rows = sum(
+                int(part.shape[0])
+                for part in normalized_parts[:cached_prefix_parts]
+            )
+            prefix_sources = normalized_parts[:cached_prefix_parts]
+            cacheable_prefix = all(not torch.is_inference(part) for part in prefix_sources)
+            prefix_signature = (
+                int(dense.data_ptr()),
+                tuple(
+                    (int(part.data_ptr()), tuple(part.shape), str(part.dtype),
+                     int(part._version) if cacheable_prefix else None)
+                    for part in prefix_sources
+                ),
+            )
+            if (mask_unchanged and cacheable_prefix and previous_prefix is not None
+                    and previous_prefix[0] == prefix_signature):
+                scatter_parts = normalized_parts[cached_prefix_parts:]
+                scatter_indices = row_indices_cpu[prefix_rows:].contiguous()
+            if cacheable_prefix:
+                pending_prefix = (prefix_signature, prefix_sources)
+        torch.ops.rpu.qwen3vl_scatter_row_parts_unflushed_(
+            dense, scatter_indices, scatter_parts
+        )
+        if pending_prefix is not None:
+            prefix_signatures[i] = pending_prefix
+            cache_owner._rpu_deepstack_cached_prefix_signatures = prefix_signatures
     return dense_list

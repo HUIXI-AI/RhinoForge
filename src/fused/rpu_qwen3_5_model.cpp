@@ -18,17 +18,24 @@
 //   SETUP            set_weights() (store swizzled weights)
 //   C-API (bottom)   rpu_qwen3_5_* free funcs — Python handle ↔ object bridges
 #include "rpu_qwen3_5_model.h"
+#include "rpu_qwen3_5_spm_z2.h"
+#include "qwen3_5_execution_topology.h"
 
 #include "model_handle_registry.h"
 #include "rpu_ops.h"
 #include "rpu_spm_buffers.h"
+#include "rpu_spm_residency.h"
+#include "rpu_spm_pipeline.h"
 #include "rpu_helpers.h"
 #include "rpu_profile.h"         // rpu_ddr_flush
 #include "rpu_runtime_state.h"   // diagnostic-only hidden-state export
 
+#include <c10/util/ScopeExit.h>
 #include <c10/util/Half.h>
 #include <algorithm>
 #include <cmath>     // std::sqrt (GDN qk_scale)
+#include <limits>
+#include <tuple>
 
 using namespace at;
 using namespace ::rhino_lkn;
@@ -37,6 +44,126 @@ using namespace ::rhino_lkn;
 #define DWIDTH 2
 
 namespace {
+
+constexpr uint32_t QWEN35_TEXT_KV_CAPABILITIES =
+    KV_INSERT_CAP_V2 | KV_INSERT_CAP_V16 |
+    KV_INSERT_CAP_NON8_TP_V16;
+constexpr int64_t QWEN35_TEXT_KV_REASON_DDR_REQUIRED = 1;
+
+enum Qwen35TextAttentionRouteFlags : int64_t {
+    QWEN35_TEXT_ATTN_PREFIX_HISTORY_DDR_REQUIRED = 1LL << 0,
+    QWEN35_TEXT_ATTN_MULTI_CHUNK_DDR_REQUIRED = 1LL << 1,
+    QWEN35_TEXT_ATTN_RAW_KERNEL_INCOMPATIBLE_DDR_REQUIRED = 1LL << 2,
+    QWEN35_TEXT_ATTN_ACTION_PREFIX_DDR_REQUIRED = 1LL << 3,
+    QWEN35_TEXT_ATTN_CAPABILITY_FALLBACK_DDR_REQUIRED = 1LL << 4,
+};
+
+constexpr int64_t QWEN35_TEXT_LINEAR_SITE = 4115846627077743284LL;
+constexpr int64_t QWEN35_TEXT_FULL_PREPARE_ALL_REDUCE_SITE =
+    4219478719568483423LL;
+constexpr int64_t QWEN35_TEXT_FULL_ALL_REDUCE_SITE =
+    2379894461900596701LL;
+constexpr int64_t QWEN35_TEXT_GDN_ALL_REDUCE_SITE =
+    5015834406872099990LL;
+constexpr int64_t QWEN35_TEXT_MLP_ALL_REDUCE_SITE =
+    700438019929736867LL;
+constexpr int64_t QWEN35_TEXT_CORE_TOPOLOGY_SITE = 3215916181030544856LL;
+constexpr int64_t QWEN35_TEXT_GDN_PREPARE_ALL_REDUCE_SITE = 6288021177778164369LL;
+constexpr int64_t QWEN35_TEXT_GDN_MASK_RESIDENCY_SITE = 120356759196541611LL;
+
+constexpr int64_t QWEN35_TEXT_PARTIAL_ROPE_1D_SITE =
+    2169018622841064289LL;
+constexpr int64_t QWEN35_TEXT_PARTIAL_MROPE_SITE =
+    6715828002838469508LL;
+constexpr int64_t QWEN35_TEXT_Q_NORM_ROPE_SITE =
+    3390471367801678782LL;
+constexpr int64_t QWEN35_TEXT_K_NORM_ROPE_SITE =
+    3432209414188589631LL;
+constexpr int64_t QWEN35_TEXT_Q_ROPE_SITE = 7236156864873926LL;
+constexpr int64_t QWEN35_TEXT_K_ROPE_SITE = 7698060160224136988LL;
+
+constexpr int64_t QWEN35_TEXT_ADAPTIVE_MOD_DMA_SITE =
+    4776555215188706607LL;
+constexpr int64_t QWEN35_TEXT_ACTION_INPUT_DMA_SITE =
+    5753123845172482927LL;
+constexpr int64_t QWEN35_TEXT_ACTION_RTC_PREFIX_DMA_SITE =
+    3125805963720679503LL;
+constexpr int64_t QWEN35_TEXT_ACTION_TRACE_PRE_DMA_SITE =
+    5950445703812717097LL;
+constexpr int64_t QWEN35_TEXT_ACTION_TRACE_EMBED_DMA_SITE =
+    530244801951758262LL;
+constexpr int64_t QWEN35_TEXT_ACTION_TRACE_HIDDEN_DMA_SITE =
+    7825855580192819414LL;
+constexpr int64_t QWEN35_TEXT_ACTION_KEEP_MASK_DMA_SITE =
+    6395936005365706696LL;
+constexpr int64_t QWEN35_TEXT_ACTION_TRACE_VELOCITY_DMA_SITE =
+    1593989881490609202LL;
+constexpr int64_t QWEN35_TEXT_ACTION_TRACE_POST_DMA_SITE =
+    4453412602072100184LL;
+constexpr int64_t QWEN35_TEXT_ACTION_OUTPUT_DMA_SITE =
+    3683811421906687568LL;
+constexpr int64_t QWEN35_TEXT_ACTION_INPUT_BIAS_PRELOAD_SITE =
+    1610850368048667879LL;
+constexpr int64_t QWEN35_TEXT_ACTION_OUTPUT_BIAS_PRELOAD_SITE =
+    3726963074905085368LL;
+constexpr int64_t QWEN35_TEXT_Q_NORM_PRELOAD_SITE =
+    1967194233859833524LL;
+constexpr int64_t QWEN35_TEXT_K_NORM_PRELOAD_SITE =
+    8085492494885672497LL;
+constexpr int64_t QWEN35_TEXT_ACTION_SCHEDULE_SITE =
+    4167953566644294997LL;
+constexpr int64_t QWEN35_TEXT_QK_NORM_SCHEDULE_SITE =
+    7233132720578852326LL;
+constexpr int64_t QWEN35_TEXT_MLP_SILU_SITE = 5544299293668623348LL;
+
+constexpr int64_t QWEN35_TEXT_GDN_STATE_LOAD_DMA_SITE =
+    3058759894390714248LL;
+constexpr int64_t QWEN35_TEXT_GDN_CONV_DECODE_LOAD_DMA_SITE =
+    4006260985833968847LL;
+constexpr int64_t QWEN35_TEXT_GDN_CONV_PREFILL_LOAD_DMA_SITE =
+    2783544813801395793LL;
+constexpr int64_t QWEN35_TEXT_GDN_CONV_PREFILL_STORE_DMA_SITE =
+    2740211351482404404LL;
+constexpr int64_t QWEN35_TEXT_GDN_STATE_PREFILL_LOAD_DMA_SITE =
+    5713030811346189917LL;
+constexpr int64_t QWEN35_TEXT_GDN_STATE_PREFILL_STORE_DMA_SITE =
+    416809216438236659LL;
+constexpr int64_t QWEN35_TEXT_GDN_STATE_DECODE_STORE_DMA_SITE =
+    222275318630817083LL;
+constexpr int64_t QWEN35_TEXT_GDN_CONV_DECODE_STORE_DMA_SITE =
+    1343355373711461289LL;
+
+constexpr int64_t QWEN35_ACTION_ROUTE_IO = 1LL << 0;
+constexpr int64_t QWEN35_ACTION_ROUTE_RTC = 1LL << 1;
+constexpr int64_t QWEN35_ACTION_ROUTE_TRACE = 1LL << 2;
+constexpr int64_t QWEN35_ACTION_ROUTE_MASK =
+    QWEN35_ACTION_ROUTE_IO | QWEN35_ACTION_ROUTE_RTC |
+    QWEN35_ACTION_ROUTE_TRACE;
+
+enum class Qwen35TextAllReduceRoute : int64_t {
+    PREPARE_RING_INPUT = 3,
+};
+
+enum class Qwen35TextRopeRoute : int64_t {
+    PARTIAL_ROPE_1D = 1,
+    PARTIAL_MROPE = 2,
+    ROPE_SPM = 3,
+};
+
+enum class Qwen35TextMutableDmaRoute : int64_t {
+    DDR_BROADCAST_TO_SPM = 1,
+    DDR_SCATTER_TO_SPM = 2,
+    SPM_COPY_TO_DDR = 3,
+    SPM_SCATTER_TO_DDR = 4,
+};
+
+constexpr int64_t qwen35_text_rope_route(Qwen35TextRopeRoute route) {
+    return static_cast<int64_t>(route);
+}
+
+constexpr int64_t qwen35_text_dma_route(Qwen35TextMutableDmaRoute route) {
+    return static_cast<int64_t>(route);
+}
 
 // PARTIAL_MROPE encodes DDR bases in 256-byte units (addr >> 8). The caching
 // allocator guarantees only 32-byte alignment, so retain an aligned view when
@@ -74,8 +201,51 @@ at::Tensor keep_256b_aligned_rpu_copy(const at::Tensor& src,
 
 namespace v3 {
 
+// QWEN35_TEXT_FIXED_KERNEL_BASIS: non-manifest launchers implement fixed GDN,
+// normalization/activation, cache bookkeeping, or BufferDecl transport. Any
+// selectable physical implementation must first become a typed manifest route.
+
 Qwen3_5Model::Qwen3_5Model() = default;
 Qwen3_5Model::~Qwen3_5Model() = default;
+
+void Qwen3_5Model::set_execution_cores(int64_t cores) {
+    TORCH_CHECK(cores == 4 || cores == 6 || cores == 8,
+                "Qwen3.5 execution cores must be 4, 6 or 8");
+    TORCH_CHECK(layer_weights_.empty() && !z2_bound_ && !action_mode_,
+                "Qwen3.5 execution cores must be bound before weights");
+    set_execution_core_count(static_cast<int>(cores));
+}
+
+std::vector<int64_t> Qwen3_5Model::execution_topology() const {
+    TORCH_CHECK(num_layers() > 0,
+                "Qwen3.5 topology requires installed model weights");
+    return {num_cores(), attn_tp(), mlp_tp(), lm_head_tp(), NUM_CORES};
+}
+
+DecoderExecutionTopology Qwen3_5Model::resolve_model_execution_topology(
+        int64_t nq, int64_t nkv, int64_t hd, int64_t h, int64_t intermediate) const {
+    if (num_cores() == 8)
+        return FusedModelBase::resolve_model_execution_topology(
+            nq, nkv, hd, h, intermediate);
+    return resolve_qwen35_reduced_execution_topology(
+        num_cores(), nq, nkv, hd, h, intermediate);
+}
+
+std::vector<int64_t> Qwen3_5Model::cold_topology_arguments() const {
+    return {1, num_cores(), attn_tp(), gdn_tp(), mlp_tp(), lm_head_tp(), NUM_CORES};
+}
+
+int64_t Qwen3_5Model::subclass_layout_hash() const {
+    if (num_cores() == 8) return 0;
+    int64_t hash = 0;
+    for (const auto value : cold_topology_arguments())
+        hash = detail::layout_mix(hash, value);
+    return hash;
+}
+
+int64_t Qwen3_5Model::text_ring_route(int64_t rows, int64_t cols) const {
+    return fmb_ring_all_reduce_route_selector(rows, cols, num_cores());
+}
 
 void Qwen3_5Model::set_chunk_size_cap(int64_t cap) {
     TORCH_CHECK(cap == 0 || cap >= 64,
@@ -92,13 +262,30 @@ void Qwen3_5Model::set_prefill_chunk_size(int64_t chunk_size) {
                     || (chunk_size >= 64 && chunk_size % 64 == 0),
                 "Qwen3.5 text chunk size must be 0 (auto) or a positive "
                 "multiple of 64, got ", chunk_size);
-    // Prefill is a bounded raw-Graph one-shot, not a retained GraphCache entry.
-    // It is therefore safe for the certification harness to switch this exact
-    // request between independent cache-reset legs on one loaded model.  The
-    // public execution configuration remains cold/per-instance; this internal
-    // setter invalidates the FMB layout before the next one-shot build.
+    TORCH_CHECK(get_last_resolved_chunk_size() == 0,
+                "Qwen3.5 text chunk size must be set before the first forward; "
+                "use the execution-reconfigure transaction for a live handle");
     set_chunk_size_override(chunk_size);
     invalidate_model_state();
+}
+
+void Qwen3_5Model::stage_prefill_execution_controls(
+        uint64_t token, int64_t cap, int64_t chunk_size,
+        int64_t max_kv_len, int64_t envelope_chunk) {
+    TORCH_CHECK(cap == 0 || cap >= 64,
+                "Qwen3.5 text chunk cap must be 0 or at least 64, got ", cap);
+    TORCH_CHECK(chunk_size == 0 ||
+                    (chunk_size >= 64 && chunk_size % 64 == 0),
+                "Qwen3.5 text chunk size must be 0 (auto) or a positive "
+                "multiple of 64, got ", chunk_size);
+    const int64_t old_cap = chunk_size_cap_;
+    stage_execution_controls(
+        token,
+        chunk_size,
+        ChunkEnvelope{max_kv_len, envelope_chunk},
+        [this, cap] { chunk_size_cap_ = cap; },
+        [this, old_cap] { chunk_size_cap_ = old_cap; },
+        "Qwen3_5Model::stage_prefill_execution_controls");
 }
 
 void Qwen3_5Model::set_linear_acc32(bool enabled) {
@@ -116,6 +303,7 @@ void Qwen3_5Model::set_fast_replay(bool enabled) {
 }
 
 void Qwen3_5Model::enable_action_mode() {
+    TORCH_CHECK(num_cores() == 8, "Qwen3.5 action mode requires eight cores");
     TORCH_CHECK(get_last_resolved_chunk_size() == 0,
                 "Qwen3.5 action mode must be enabled before the first forward");
     TORCH_CHECK(num_layers() > 0,
@@ -168,6 +356,21 @@ void Qwen3_5Model::set_action_io_weights(
     action_dim_pad_ = action_dim_pad;
     action_len_ = action_len;
     action_loop_active_ = false;
+    action_rtc_active_ = false;
+    action_rtc_prefix_len_ = 0;
+    action_rtc_prefix_ref_ = at::Tensor();
+    action_rtc_prefix_live_base_ = 0;
+    action_trace_active_ = false;
+    action_trace_pre_action_ref_ = at::Tensor();
+    action_trace_action_embed_ref_ = at::Tensor();
+    action_trace_final_hidden_ref_ = at::Tensor();
+    action_trace_velocity_ref_ = at::Tensor();
+    action_trace_post_action_ref_ = at::Tensor();
+    action_trace_pre_action_live_base_ = 0;
+    action_trace_action_embed_live_base_ = 0;
+    action_trace_final_hidden_live_base_ = 0;
+    action_trace_velocity_live_base_ = 0;
+    action_trace_post_action_live_base_ = 0;
     action_num_steps_ = 1;
     action_euler_scale_pinned_ = false;
     auto options = input_w.options();
@@ -180,10 +383,290 @@ void Qwen3_5Model::set_action_io_weights(
 
 int64_t Qwen3_5Model::resolve_prefill_chunk_size(int64_t execution_len) {
     TORCH_CHECK(execution_len >= 64 && execution_len % 64 == 0,
-                "Qwen3.5 prefill execution length must be a positive multiple of 64, got ",
+                "RPU_PLANNER_REJECT:CAPABILITY: Qwen3.5 prefill execution "
+                "length must be a positive multiple of 64, got ",
                 execution_len);
     return resolve_chunk_size_for_shape(
         execution_len, /*position=*/0, std::nullopt, /*is_causal=*/true);
+}
+
+std::vector<int64_t> Qwen3_5Model::resolve_prefill_stage_domain(
+    int64_t execution_len, int64_t logical_len,
+    int64_t planning_chunk_size_override) {
+    TORCH_CHECK(planning_chunk_size_override <= 0 ||
+                    planning_chunk_size_override % 64 == 0,
+                "RPU_PLANNER_REJECT:EXACT_MISMATCH: Qwen3.5 prefill "
+                "planning chunk must be a multiple of 64");
+    TORCH_CHECK(execution_len >= 64 && execution_len % 64 == 0,
+                "RPU_PLANNER_REJECT:CAPABILITY: Qwen3.5 prefill execution "
+                "length must be a positive "
+                "multiple of 64, got ", execution_len);
+    TORCH_CHECK(
+        logical_len > 1 && logical_len <= execution_len,
+        "RPU_PLANNER_REJECT:CAPABILITY: Qwen3.5 prefill logical length "
+        "must be in [2, execution length], got ", logical_len,
+        " for execution length ", execution_len);
+    return encode_fmb_prefill_stage_domain(
+        resolve_prefill_stage_domain_for_shape(
+            execution_len, /*position=*/0, std::nullopt,
+            /*is_causal=*/true, /*requested_chunk_size=*/0, logical_len,
+            planning_chunk_size_override));
+}
+
+std::vector<int64_t> Qwen3_5Model::resolve_decode_stage_descriptor() {
+    auto candidates = resolve_prefill_stage_domain_for_shape(
+        /*seq_len=*/1, /*position=*/0, std::nullopt,
+        /*is_causal=*/true);
+    TORCH_CHECK(
+        candidates.size() == 1,
+        "RPU_PLANNER_REJECT:CAPABILITY: Qwen3.5 fixed decode must resolve "
+        "exactly one native stage candidate, got ", candidates.size());
+    return encode_fmb_prefill_stage_candidate(candidates.front());
+}
+
+std::vector<int64_t> Qwen3_5Model::resolve_action_stage_domain(
+    int64_t requested_action_len, int64_t max_prefix_len,
+    int64_t requested_chunk_size, bool include_action_io,
+    int64_t action_route_flags, int64_t graph_lifecycle, int64_t num_steps) {
+    TORCH_CHECK(action_mode_ && action_len_ > 0,
+                "RPU_PLANNER_REJECT:CAPABILITY: Qwen3.5 action planner "
+                "requires an installed action-mode handle");
+    TORCH_CHECK(requested_action_len == action_len_,
+                "RPU_PLANNER_REJECT:CAPABILITY: Qwen3.5 action planner "
+                "requires the configured horizon ", action_len_, ", got ",
+                requested_action_len);
+    TORCH_CHECK(max_prefix_len >= 0,
+                "RPU_PLANNER_REJECT:CAPABILITY: Qwen3.5 action prefix "
+                "length must be non-negative, got ", max_prefix_len);
+    TORCH_CHECK(requested_chunk_size == 0 ||
+                    requested_chunk_size == action_len_,
+                "RPU_PLANNER_REJECT:EXACT_MISMATCH: Qwen3.5 action chunk "
+                "must be AUTO or exact ", action_len_, ", got ",
+                requested_chunk_size);
+    TORCH_CHECK(
+        action_route_flags >= 0 &&
+            (action_route_flags & ~QWEN35_ACTION_ROUTE_MASK) == 0 &&
+            include_action_io ==
+                ((action_route_flags & QWEN35_ACTION_ROUTE_IO) != 0) &&
+            ((action_route_flags & QWEN35_ACTION_ROUTE_RTC) == 0 ||
+             include_action_io) &&
+            ((action_route_flags & QWEN35_ACTION_ROUTE_TRACE) == 0 ||
+             (action_route_flags & QWEN35_ACTION_ROUTE_RTC) != 0),
+        "RPU_PLANNER_REJECT:CAPABILITY: Qwen3.5 action route flags do not "
+        "describe a canonical base/IO/RTC/trace variant");
+    const auto lifecycle = static_cast<FmbGraphLifecycle>(graph_lifecycle);
+    TORCH_CHECK(
+        lifecycle == FmbGraphLifecycle::BOUNDED_ONESHOT ||
+            lifecycle == FmbGraphLifecycle::COMPOSITE_CHILD,
+        "RPU_PLANNER_REJECT:CAPABILITY: Qwen3.5 action lifecycle must be "
+        "BOUNDED_ONESHOT or COMPOSITE_CHILD, got ", graph_lifecycle);
+    TORCH_CHECK(
+        (num_steps == 1 || num_steps == 10) &&
+            (include_action_io || num_steps == 1) &&
+            ((action_route_flags & QWEN35_ACTION_ROUTE_RTC) == 0 || num_steps == 10) &&
+            (lifecycle != FmbGraphLifecycle::BOUNDED_ONESHOT || num_steps == 1),
+        "RPU_PLANNER_REJECT:CAPABILITY: Qwen3.5 action schedule must be a "
+        "single hidden/IO step or a retained 10-step IO/RTC loop");
+    const bool saved_include_io = action_descriptor_include_io_;
+    const int64_t saved_route_flags = action_descriptor_route_flags_;
+    const FmbGraphLifecycle saved_lifecycle =
+        action_descriptor_graph_lifecycle_;
+    const bool saved_step = action_step_active_;
+    const bool saved_loop = action_loop_active_;
+    const bool saved_rtc = action_rtc_active_;
+    const bool saved_trace = action_trace_active_;
+    const int64_t saved_steps = action_num_steps_;
+    action_descriptor_include_io_ = include_action_io;
+    action_descriptor_route_flags_ = action_route_flags;
+    action_descriptor_graph_lifecycle_ = lifecycle;
+    // Query the requested first-forward schedule, never the previous call's
+    // hidden/step/unroll state. These fields also affect temporary SPM layout.
+    action_step_active_ = include_action_io;
+    action_loop_active_ = num_steps > 1;
+    action_num_steps_ = num_steps;
+    action_rtc_active_ = (action_route_flags & QWEN35_ACTION_ROUTE_RTC) != 0;
+    action_trace_active_ = (action_route_flags & QWEN35_ACTION_ROUTE_TRACE) != 0;
+    auto restore = c10::make_scope_exit(
+        [&] {
+            action_descriptor_include_io_ = saved_include_io;
+            action_descriptor_route_flags_ = saved_route_flags;
+            action_descriptor_graph_lifecycle_ = saved_lifecycle;
+            action_step_active_ = saved_step;
+            action_loop_active_ = saved_loop;
+            action_num_steps_ = saved_steps;
+            action_rtc_active_ = saved_rtc;
+            action_trace_active_ = saved_trace;
+        });
+    return encode_fmb_prefill_stage_domain(
+        resolve_prefill_stage_domain_for_shape(
+            action_len_, max_prefix_len, std::nullopt,
+            /*is_causal=*/false, requested_chunk_size,
+            /*logical_len=*/action_len_));
+}
+
+void Qwen3_5Model::set_action_chunk_size(int64_t chunk_size) {
+    TORCH_CHECK(action_mode_ && action_len_ > 0,
+                "Qwen3.5 action chunk control requires action mode and I/O "
+                "weights");
+    TORCH_CHECK(chunk_size == 0 || chunk_size == action_len_,
+                "Qwen3.5 action chunk size must be AUTO (0) or exact ",
+                action_len_, ", got ", chunk_size);
+    set_control_chunk_size_override(
+        chunk_size, "Qwen3_5Model::set_action_chunk_size");
+}
+
+void Qwen3_5Model::stage_action_chunk_size(
+        uint64_t token, int64_t chunk_size) {
+    TORCH_CHECK(action_mode_ && action_len_ > 0,
+                "Qwen3.5 action chunk control requires action mode and I/O "
+                "weights");
+    TORCH_CHECK(chunk_size == 0 || chunk_size == action_len_,
+                "Qwen3.5 action chunk size must be AUTO (0) or exact ",
+                action_len_, ", got ", chunk_size);
+    stage_control_chunk_size_override(
+        token, chunk_size, "Qwen3_5Model::stage_action_chunk_size");
+}
+
+void Qwen3_5Model::enable_execution_reconfigure() {
+    enable_execution_reconfigure_guard();
+}
+
+void Qwen3_5Model::set_retained_prefill_graph(bool enabled) {
+    TORCH_CHECK(
+        get_last_resolved_chunk_size() == 0,
+        "Qwen3.5 prefill Graph lifecycle must be fixed before the first "
+        "forward");
+    retained_prefill_graph_ = enabled;
+    invalidate_model_state();
+}
+
+SpmPipelineComponentLayout Qwen3_5Model::prepare_z2_layout(
+    int64_t execution_len,
+    int64_t real_len) {
+    TORCH_CHECK(num_cores() == 8, "Qwen3.5 Z2 canary requires eight cores");
+    constexpr int64_t kCanaryExecutionLen = 128;
+    constexpr int64_t kCanaryRealLen = 72;
+    constexpr int64_t kCanaryHidden = 2048;
+    TORCH_CHECK(!z2_bound_,
+                "Qwen3.5 text Z2: cannot prepare while a lease is active");
+    TORCH_CHECK(execution_len == kCanaryExecutionLen &&
+                    real_len == kCanaryRealLen,
+                "Qwen3.5 text Z2 canary accepts only execution/real=(128,72), got (",
+                execution_len, ",", real_len, ")");
+    TORCH_CHECK(hidden_size() == kCanaryHidden,
+                "Qwen3.5 text Z2 canary accepts only the 2B hidden size 2048, got ",
+                hidden_size());
+    TORCH_CHECK(valid_prefill_len_ == real_len,
+                "Qwen3.5 text Z2: valid prefill length must be set to ", real_len,
+                " before prepare; got ", valid_prefill_len_);
+    TORCH_CHECK(has_mrope_ && prefill_cos_.defined() && prefill_sin_.defined() &&
+                    prefill_cos_.dim() == 2 &&
+                    prefill_cos_.sizes() == prefill_sin_.sizes() &&
+                    prefill_cos_.size(0) == execution_len &&
+                    prefill_cos_.size(1) == rotary_dim_ / 2,
+                "Qwen3.5 text Z2: stable prefill M-RoPE tables must be [128,",
+                rotary_dim_ / 2, "] before prepare");
+
+    const int64_t resolved = resolve_prefill_chunk_size(execution_len);
+    LayoutContext layout;
+    layout.chunk_size = resolved;
+    layout.max_kv_seq_len = execution_len;
+    layout.num_layers = num_layers();
+    layout.use_attn_mask = false;
+    layout.is_causal = true;
+    auto prepared = prepare_spm_pipeline_component(
+        layout, compose_fmb_default_three_stage_chunk_plan(
+                    layout, execution_len, /*position=*/0,
+                    ChunkMode::SEQUENTIAL));
+
+    z2_prepared_execution_len_ = execution_len;
+    z2_prepared_real_len_ = real_len;
+    z2_prefill_cos_addr_ =
+        ::rhino_lkn::RpuGetDevAddr(prefill_cos_.data_ptr<c10::Half>());
+    z2_prefill_sin_addr_ =
+        ::rhino_lkn::RpuGetDevAddr(prefill_sin_.data_ptr<c10::Half>());
+    return prepared;
+}
+
+SpmDense2DSpec Qwen3_5Model::z2_storage_spec(int64_t execution_len) const {
+    TORCH_CHECK(execution_len == 128,
+                "Qwen3.5 text Z2 canary storage requires 128 rows, got ",
+                execution_len);
+    TORCH_CHECK(hidden_size() == 2048,
+                "Qwen3.5 text Z2 canary storage requires hidden size 2048, got ",
+                hidden_size());
+    SpmDense2DSpec spec;
+    spec.rows = execution_len;
+    spec.cols = hidden_size();
+    spec.validate();
+    return spec;
+}
+
+void Qwen3_5Model::validate_z2_prefill_contract() const {
+    TORCH_CHECK(num_cores() == 8, "Qwen3.5 Z2 canary requires eight cores");
+    TORCH_CHECK(z2_prepared_execution_len_ == 128 &&
+                    z2_prepared_real_len_ == 72,
+                "Qwen3.5 text Z2: fixed prefill layout was not prepared");
+    TORCH_CHECK(valid_prefill_len_ == z2_prepared_real_len_,
+                "Qwen3.5 text Z2: valid prefill length drifted after prepare");
+    TORCH_CHECK(prefill_cos_.defined() && prefill_sin_.defined() &&
+                    prefill_cos_.dim() == 2 &&
+                    prefill_cos_.sizes() == prefill_sin_.sizes() &&
+                    prefill_cos_.size(0) == z2_prepared_execution_len_ &&
+                    prefill_cos_.size(1) == rotary_dim_ / 2,
+                "Qwen3.5 text Z2: prefill M-RoPE shape drifted after prepare");
+    TORCH_CHECK(
+        ::rhino_lkn::RpuGetDevAddr(prefill_cos_.data_ptr<c10::Half>()) ==
+                z2_prefill_cos_addr_ &&
+            ::rhino_lkn::RpuGetDevAddr(prefill_sin_.data_ptr<c10::Half>()) ==
+                z2_prefill_sin_addr_,
+        "Qwen3.5 text Z2: prefill M-RoPE address drifted after prepare");
+}
+
+void Qwen3_5Model::adopt_z2_layout(
+    const SpmPipelineLease& lease,
+    const SpmTensorView& scratch) {
+    validate_z2_prefill_contract();
+    TORCH_CHECK(!z2_bound_,
+                "Qwen3.5 text Z2: binding is already active");
+    adopt_spm_pipeline_component(lease, scratch);
+}
+
+void Qwen3_5Model::bind_z2_port(
+    const SpmPipelineLease& lease,
+    const SpmPortView& port) {
+    validate_z2_prefill_contract();
+    TORCH_CHECK(!z2_bound_,
+                "Qwen3.5 text Z2: binding is already active");
+    const auto expected = z2_storage_spec(z2_prepared_execution_len_);
+    TORCH_CHECK(port.spec() == expected,
+                "Qwen3.5 text Z2: full storage port spec mismatch");
+    z2_input_port_addr_ = port.resolve_physical_addr(/*core=*/0, lease);
+    z2_epoch_ = lease.epoch();
+    z2_plan_hash_ = lease.plan_hash();
+    z2_bound_ = true;
+}
+
+void Qwen3_5Model::validate_z2_layout(
+    const SpmPipelineLease& lease) const {
+    validate_z2_prefill_contract();
+    TORCH_CHECK(z2_bound_, "Qwen3.5 text Z2: no active binding");
+    TORCH_CHECK(z2_epoch_ == lease.epoch() &&
+                    z2_plan_hash_ == lease.plan_hash(),
+                "Qwen3.5 text Z2: stale lease binding");
+    validate_spm_pipeline_component(lease);
+}
+
+void Qwen3_5Model::clear_z2_layout(uint64_t epoch, uint64_t plan_hash) {
+    if (z2_bound_) {
+        TORCH_CHECK(z2_epoch_ == epoch && z2_plan_hash_ == plan_hash,
+                    "Qwen3.5 text Z2: stale clear token");
+    }
+    release_spm_pipeline_component(epoch, plan_hash);
+    z2_input_port_addr_ = 0;
+    z2_epoch_ = 0;
+    z2_plan_hash_ = 0;
+    z2_bound_ = false;
 }
 
 at::Tensor Qwen3_5Model::forward_action(
@@ -191,7 +674,8 @@ at::Tensor Qwen3_5Model::forward_action(
     const at::Tensor& adaptive_mod,
     std::vector<at::Tensor>& k_caches,
     std::vector<at::Tensor>& v_caches,
-    at::IntArrayRef prefix_lens) {
+    at::IntArrayRef prefix_lens,
+    at::IntArrayRef planned_stage_descriptor) {
     TORCH_CHECK(action_mode_,
                 "Qwen3.5 action forward requires enable_action_mode()");
     TORCH_CHECK(hidden_states.dim() == 3 && hidden_states.size(0) == 1,
@@ -239,15 +723,28 @@ at::Tensor Qwen3_5Model::forward_action(
     adaptive_mod_live_base_ =
         ::rhino_lkn::RpuGetDevAddr(adaptive_mod.data_ptr<c10::Half>());
     rpu_ddr_flush_force(adaptive_mod.data_ptr<c10::Half>());
+    if (action_step_active_ || action_loop_active_ || action_num_steps_ != 1 ||
+            action_rtc_active_ || action_trace_active_) {
+        action_step_active_ = false;
+        action_loop_active_ = false;
+        action_num_steps_ = 1;
+        action_trace_active_ = false;
+        action_rtc_active_ = false;
+        action_rtc_prefix_len_ = 0;
+        action_rtc_prefix_ref_ = at::Tensor();
+        action_rtc_prefix_live_base_ = 0;
+        invalidate_model_state(/*planning_domain_changed=*/false);
+    }
     action_step_active_ = false;
     fast_replay_active_ = fast_replay_enabled_;
 
-    // Bidirectional action self-attention requires the entire suffix to be
-    // inserted before SDPA; force one chunk for this fixed-horizon forward.
-    set_chunk_size_override(seq_len);
+    TORCH_CHECK(!planned_stage_descriptor.empty(),
+                "Qwen3.5 action forward requires one complete planner "
+                "stage descriptor");
     return run_all_layers(
         hidden_states, k_caches, v_caches, std::nullopt,
-        max_prefix, /*is_causal=*/false);
+        max_prefix, /*is_causal=*/false,
+        /*planned_chunk_size=*/0, planned_stage_descriptor);
 }
 
 at::Tensor Qwen3_5Model::forward_action_step(
@@ -259,17 +756,104 @@ at::Tensor Qwen3_5Model::forward_action_step(
     std::vector<at::Tensor>& k_caches,
     std::vector<at::Tensor>& v_caches,
     at::IntArrayRef prefix_lens,
-    int64_t num_steps) {
+    int64_t num_steps,
+    at::IntArrayRef planned_stage_descriptor) {
+    return forward_action_step_impl(
+        action, action_keep_mask, action_out,
+        /*action_prefix=*/nullptr, /*action_prefix_len=*/0,
+        /*trace=*/nullptr,
+        delta_t, adaptive_mod, k_caches, v_caches, prefix_lens, num_steps,
+        planned_stage_descriptor);
+}
+
+at::Tensor Qwen3_5Model::forward_action_rtc_step(
+    const at::Tensor& action,
+    const at::Tensor& action_keep_mask,
+    at::Tensor& action_out,
+    const at::Tensor& action_prefix,
+    int64_t action_prefix_len,
+    double delta_t,
+    const at::Tensor& adaptive_mod,
+    std::vector<at::Tensor>& k_caches,
+    std::vector<at::Tensor>& v_caches,
+    at::IntArrayRef prefix_lens,
+    int64_t num_steps,
+    at::IntArrayRef planned_stage_descriptor) {
+    return forward_action_step_impl(
+        action, action_keep_mask, action_out,
+        &action_prefix, action_prefix_len,
+        /*trace=*/nullptr,
+        delta_t, adaptive_mod, k_caches, v_caches, prefix_lens, num_steps,
+        planned_stage_descriptor);
+}
+
+at::Tensor Qwen3_5Model::forward_action_rtc_trace(
+    const at::Tensor& action,
+    const at::Tensor& action_keep_mask,
+    at::Tensor& action_out,
+    const at::Tensor& action_prefix,
+    int64_t action_prefix_len,
+    double delta_t,
+    const at::Tensor& adaptive_mod,
+    std::vector<at::Tensor>& k_caches,
+    std::vector<at::Tensor>& v_caches,
+    at::IntArrayRef prefix_lens,
+    at::Tensor& trace_pre_action,
+    at::Tensor& trace_action_embed,
+    at::Tensor& trace_final_hidden,
+    at::Tensor& trace_velocity,
+    at::Tensor& trace_post_action,
+    at::IntArrayRef planned_stage_descriptor) {
+    ActionRtcTraceOutputs trace{
+        trace_pre_action,
+        trace_action_embed,
+        trace_final_hidden,
+        trace_velocity,
+        trace_post_action,
+    };
+    return forward_action_step_impl(
+        action, action_keep_mask, action_out,
+        &action_prefix, action_prefix_len, &trace,
+        delta_t, adaptive_mod, k_caches, v_caches, prefix_lens,
+        /*num_steps=*/10, planned_stage_descriptor);
+}
+
+at::Tensor Qwen3_5Model::forward_action_step_impl(
+    const at::Tensor& action,
+    const at::Tensor& action_keep_mask,
+    at::Tensor& action_out,
+    const at::Tensor* action_prefix,
+    int64_t action_prefix_len,
+    const ActionRtcTraceOutputs* trace,
+    double delta_t,
+    const at::Tensor& adaptive_mod,
+    std::vector<at::Tensor>& k_caches,
+    std::vector<at::Tensor>& v_caches,
+    at::IntArrayRef prefix_lens,
+    int64_t num_steps,
+    at::IntArrayRef planned_stage_descriptor) {
     TORCH_CHECK(action_mode_ && action_input_w_.defined(),
                 "Qwen3.5 action step requires action mode and I/O weights");
     TORCH_CHECK(num_steps == 1 || num_steps == 10,
                 "Qwen3.5 action supports one diagnostic step or the canonical "
                 "10-step Euler loop, got ", num_steps);
     const bool loop_active = num_steps > 1;
-    if (action_loop_active_ != loop_active || action_num_steps_ != num_steps) {
+    const bool rtc_active = action_prefix != nullptr;
+    const bool trace_active = trace != nullptr;
+    TORCH_CHECK(!rtc_active || loop_active,
+                "Qwen3.5 RTC action requires the canonical unrolled loop");
+    TORCH_CHECK(!trace_active || rtc_active,
+                "Qwen3.5 action trace is available only for the RTC loop");
+    if (!action_step_active_ || action_loop_active_ != loop_active || action_num_steps_ != num_steps
+            || action_rtc_active_ != rtc_active
+            || action_rtc_prefix_len_ != action_prefix_len
+            || action_trace_active_ != trace_active) {
         action_loop_active_ = loop_active;
         action_num_steps_ = num_steps;
-        invalidate_model_state();
+        action_rtc_active_ = rtc_active;
+        action_rtc_prefix_len_ = action_prefix_len;
+        action_trace_active_ = trace_active;
+        invalidate_model_state(/*planning_domain_changed=*/false);
     }
     TORCH_CHECK(action.dim() == 3 && action.size(0) == 1
                 && action.size(1) == action_len_
@@ -294,6 +878,74 @@ at::Tensor Qwen3_5Model::forward_action_step(
                 "contiguous FP16 on RPU");
     TORCH_CHECK(action_out.data_ptr() != action.data_ptr(),
                 "Qwen3.5 action step requires distinct input/output buffers");
+    if (rtc_active) {
+        TORCH_CHECK(action_prefix_len > 0 && action_prefix_len < action_len_,
+                    "Qwen3.5 RTC action prefix length must be in [1, ",
+                    action_len_ - 1, "], got ", action_prefix_len);
+        TORCH_CHECK(action_prefix->dim() == 3
+                    && action_prefix->size(0) == 1
+                    && action_prefix->size(1) == action_prefix_len
+                    && action_prefix->size(2) == action_dim_pad_
+                    && action_prefix->device().type() == at::kPrivateUse1
+                    && action_prefix->scalar_type() == at::kHalf
+                    && action_prefix->is_contiguous(),
+                    "Qwen3.5 RTC action prefix must be [1, ",
+                    action_prefix_len, ", ", action_dim_pad_,
+                    "] contiguous FP16 on RPU");
+        TORCH_CHECK(action_prefix->data_ptr() != action.data_ptr()
+                    && action_prefix->data_ptr() != action_out.data_ptr(),
+                    "Qwen3.5 RTC action prefix must use a distinct buffer");
+    } else {
+        TORCH_CHECK(action_prefix_len == 0,
+                    "Qwen3.5 non-RTC action cannot carry a prefix length");
+    }
+    if (trace_active) {
+        auto check_trace = [this, num_steps](
+                               const at::Tensor& tensor,
+                               const char* name,
+                               int64_t width) {
+            TORCH_CHECK(tensor.dim() == 4
+                        && tensor.size(0) == num_steps
+                        && tensor.size(1) == 1
+                        && tensor.size(2) == action_len_
+                        && tensor.size(3) == width
+                        && tensor.device().type() == at::kPrivateUse1
+                        && tensor.scalar_type() == at::kHalf
+                        && tensor.is_contiguous(),
+                        name, " must be [", num_steps, ", 1, ",
+                        action_len_, ", ", width,
+                        "] contiguous FP16 on RPU");
+        };
+        check_trace(trace->pre_action,
+                    "Qwen3.5 RTC pre-action trace", action_dim_pad_);
+        check_trace(trace->action_embed,
+                    "Qwen3.5 RTC action-embed trace", hidden_size());
+        check_trace(trace->final_hidden,
+                    "Qwen3.5 RTC final-hidden trace", hidden_size());
+        check_trace(trace->velocity,
+                    "Qwen3.5 RTC velocity trace", action_dim_pad_);
+        check_trace(trace->post_action,
+                    "Qwen3.5 RTC post-action trace", action_dim_pad_);
+        const std::array<const void*, 9> distinct_ptrs = {
+            action.data_ptr(),
+            action_keep_mask.data_ptr(),
+            action_out.data_ptr(),
+            action_prefix->data_ptr(),
+            trace->pre_action.data_ptr(),
+            trace->action_embed.data_ptr(),
+            trace->final_hidden.data_ptr(),
+            trace->velocity.data_ptr(),
+            trace->post_action.data_ptr(),
+        };
+        for (size_t i = 0; i < distinct_ptrs.size(); ++i) {
+            for (size_t j = i + 1; j < distinct_ptrs.size(); ++j) {
+                TORCH_CHECK(
+                    distinct_ptrs[i] != distinct_ptrs[j],
+                    "Qwen3.5 RTC trace destinations and action inputs must "
+                    "use distinct buffers");
+            }
+        }
+    }
     TORCH_CHECK(delta_t > 0.0,
                 "Qwen3.5 action Euler delta_t must be positive");
     const c10::Half euler_scale =
@@ -308,13 +960,18 @@ at::Tensor Qwen3_5Model::forward_action_step(
     const int64_t modulation_rows = 2 * num_layers() + 1;
     const int64_t modulation_width = 3 * hidden_size();
     const bool modulation_shape_ok = adaptive_mod.defined() &&
-        ((!loop_active && adaptive_mod.dim() == 2
+        ((!loop_active && !rtc_active && adaptive_mod.dim() == 2
           && adaptive_mod.size(0) == modulation_rows
           && adaptive_mod.size(1) == modulation_width)
-         || (loop_active && adaptive_mod.dim() == 3
+         || (loop_active && !rtc_active && adaptive_mod.dim() == 3
              && adaptive_mod.size(0) == num_steps
              && adaptive_mod.size(1) == modulation_rows
-             && adaptive_mod.size(2) == modulation_width));
+             && adaptive_mod.size(2) == modulation_width)
+         || (loop_active && rtc_active && adaptive_mod.dim() == 4
+             && adaptive_mod.size(0) == num_steps
+             && adaptive_mod.size(1) == modulation_rows
+             && adaptive_mod.size(2) == 2
+             && adaptive_mod.size(3) == modulation_width));
     TORCH_CHECK(modulation_shape_ok
                 && adaptive_mod.device().type() == at::kPrivateUse1
                 && adaptive_mod.scalar_type() == at::kHalf
@@ -322,7 +979,9 @@ at::Tensor Qwen3_5Model::forward_action_step(
                 "Qwen3.5 action modulation must be [", modulation_rows,
                 ", ", modulation_width, "] for one step, [", num_steps,
                 ", ", modulation_rows, ", ", modulation_width,
-                "] for an unrolled loop");
+                "] for an unrolled loop, or [", num_steps, ", ",
+                modulation_rows, ", 2, ", modulation_width,
+                "] for RTC");
     TORCH_CHECK(static_cast<int64_t>(prefix_lens.size()) == num_layers(),
                 "Qwen3.5 action step prefix_lens must have ", num_layers(),
                 " entries, got ", prefix_lens.size());
@@ -368,12 +1027,60 @@ at::Tensor Qwen3_5Model::forward_action_step(
     action_output_live_base_ =
         ::rhino_lkn::RpuGetDevAddr(action_out.data_ptr<c10::Half>());
     rpu_ddr_flush_force(action_out.data_ptr<c10::Half>());
+    if (rtc_active) {
+        action_rtc_prefix_ref_ = *action_prefix;
+        action_rtc_prefix_live_base_ = ::rhino_lkn::RpuGetDevAddr(
+            action_prefix->data_ptr<c10::Half>());
+        rpu_ddr_flush_force(action_prefix->data_ptr<c10::Half>());
+    } else {
+        action_rtc_prefix_ref_ = at::Tensor();
+        action_rtc_prefix_live_base_ = 0;
+    }
+    action_trace_active_ = trace_active;
+    if (trace_active) {
+        auto bind_trace = [](at::Tensor& ref, uint64_t& live_base,
+                             at::Tensor& tensor) {
+            ref = tensor;
+            live_base = ::rhino_lkn::RpuGetDevAddr(
+                tensor.data_ptr<c10::Half>());
+            rpu_ddr_flush_force(tensor.data_ptr<c10::Half>());
+        };
+        bind_trace(
+            action_trace_pre_action_ref_,
+            action_trace_pre_action_live_base_, trace->pre_action);
+        bind_trace(
+            action_trace_action_embed_ref_,
+            action_trace_action_embed_live_base_, trace->action_embed);
+        bind_trace(
+            action_trace_final_hidden_ref_,
+            action_trace_final_hidden_live_base_, trace->final_hidden);
+        bind_trace(
+            action_trace_velocity_ref_,
+            action_trace_velocity_live_base_, trace->velocity);
+        bind_trace(
+            action_trace_post_action_ref_,
+            action_trace_post_action_live_base_, trace->post_action);
+    } else {
+        action_trace_pre_action_ref_ = at::Tensor();
+        action_trace_action_embed_ref_ = at::Tensor();
+        action_trace_final_hidden_ref_ = at::Tensor();
+        action_trace_velocity_ref_ = at::Tensor();
+        action_trace_post_action_ref_ = at::Tensor();
+        action_trace_pre_action_live_base_ = 0;
+        action_trace_action_embed_live_base_ = 0;
+        action_trace_final_hidden_live_base_ = 0;
+        action_trace_velocity_live_base_ = 0;
+        action_trace_post_action_live_base_ = 0;
+    }
     action_step_active_ = true;
     fast_replay_active_ = fast_replay_enabled_;
-    set_chunk_size_override(action_len_);
+    TORCH_CHECK(!planned_stage_descriptor.empty(),
+                "Qwen3.5 action step requires one complete planner stage "
+                "descriptor");
     (void) run_all_layers(
         action_hidden_stage_, k_caches, v_caches, std::nullopt,
-        max_prefix, /*is_causal=*/false);
+        max_prefix, /*is_causal=*/false,
+        /*planned_chunk_size=*/0, planned_stage_descriptor);
     return action_velocity_stage_;
 }
 
@@ -385,9 +1092,44 @@ at::Tensor Qwen3_5Model::forward(
     std::vector<at::Tensor>& gdn_states,
     std::vector<at::Tensor>& conv_states,
     const std::optional<at::Tensor>& attention_mask,
-    int64_t position, bool is_causal) {
+    int64_t position, bool is_causal,
+    int64_t planned_chunk_size,
+    at::IntArrayRef planned_stage_descriptor) {
+    TORCH_CHECK(!z2_bound_,
+                "Qwen3.5 text ordinary forward is unavailable while its Z2 lease is active");
+    TORCH_CHECK(
+        planned_chunk_size == 0 && !planned_stage_descriptor.empty(),
+        "RPU_PLANNER_REJECT:CAPABILITY: Qwen3.5 ordinary text forward "
+        "requires one complete planner stage descriptor");
     return forward_impl(hidden_states, k_caches, v_caches, gdn_states,
-                        conv_states, attention_mask, position, is_causal);
+                        conv_states, attention_mask, position, is_causal,
+                        planned_chunk_size, planned_stage_descriptor);
+}
+
+at::Tensor Qwen3_5Model::forward_z2(
+    const at::Tensor& hidden_states,
+    std::vector<at::Tensor>& k_caches,
+    std::vector<at::Tensor>& v_caches,
+    std::vector<at::Tensor>& gdn_states,
+    std::vector<at::Tensor>& conv_states,
+    uint64_t epoch,
+    uint64_t plan_hash) {
+    validate_z2_prefill_contract();
+    TORCH_CHECK(z2_bound_ && z2_epoch_ == epoch &&
+                    z2_plan_hash_ == plan_hash,
+                "Qwen3.5 text Z2 forward received a stale epoch/plan hash");
+    TORCH_CHECK(hidden_states.defined() && hidden_states.dim() == 3 &&
+                    hidden_states.size(0) == 1 &&
+                    hidden_states.size(1) == z2_prepared_execution_len_ &&
+                    hidden_states.size(2) == hidden_size() &&
+                    hidden_states.device().type() == at::kPrivateUse1 &&
+                    hidden_states.scalar_type() == at::kHalf &&
+                    hidden_states.is_contiguous(),
+                "Qwen3.5 text Z2 hidden must be contiguous RPU FP16 [1,128,2048]");
+    return forward_impl(hidden_states, k_caches, v_caches, gdn_states,
+                        conv_states, std::nullopt, /*position=*/0,
+                        /*is_causal=*/true, /*planned_chunk_size=*/0,
+                        /*planned_stage_descriptor=*/{});
 }
 
 at::Tensor Qwen3_5Model::forward_impl(
@@ -397,7 +1139,21 @@ at::Tensor Qwen3_5Model::forward_impl(
     std::vector<at::Tensor>& gdn_states,
     std::vector<at::Tensor>& conv_states,
     const std::optional<at::Tensor>& attention_mask,
-    int64_t position, bool is_causal) {
+    int64_t position, bool is_causal,
+    int64_t planned_chunk_size,
+    at::IntArrayRef planned_stage_descriptor) {
+    if (num_cores() != 8) {
+        TORCH_CHECK(hidden_states.defined() && hidden_states.dim() == 3 &&
+                        hidden_states.size(0) == 1 &&
+                        hidden_states.size(2) == hidden_size() &&
+                        hidden_states.scalar_type() == at::kHalf &&
+                        hidden_states.device().type() == at::kPrivateUse1 &&
+                        hidden_states.is_contiguous() && is_causal,
+                    "Qwen3.5 reduced execution requires causal B1 FP16 hidden states");
+        TORCH_CHECK(gdn_states.size() == static_cast<size_t>(num_layers()) &&
+                        conv_states.size() == static_cast<size_t>(num_layers()),
+                    "Qwen3.5 reduced execution requires one cache slot per layer");
+    }
     const int64_t seq_len = hidden_states.size(1);
     TORCH_CHECK(seq_len == 1 || seq_len % 64 == 0,
                 "Qwen3.5 text expects decode length 1 or a prefill execution "
@@ -439,8 +1195,9 @@ at::Tensor Qwen3_5Model::forward_impl(
     }
 
     // Fast replay skips build_gdn(), so refresh every mutable cache base before
-    // entering run_all_layers. Decode still walks the layer loop, but shares the
-    // same safe prologue.
+    // entering run_all_layers. Only fast replay needs the unconditional CPU/RPU
+    // boundary flush; ordinary text prefill/decode retain the configurable
+    // intra-RPU flush used by build_gdn().
     for (int64_t layer_idx = 0; layer_idx < num_layers(); ++layer_idx) {
         if (layer_is_full_[layer_idx])
             continue;
@@ -449,16 +1206,35 @@ at::Tensor Qwen3_5Model::forward_impl(
         TORCH_CHECK(st && cv && st->defined() && cv->defined(),
                     "Qwen3.5 missing recurrent/conv state cache for layer ",
                     layer_idx);
+        if (num_cores() != 8) {
+            const auto valid_state = [](const at::Tensor& tensor) {
+                return tensor.scalar_type() == at::kHalf &&
+                       tensor.device().type() == at::kPrivateUse1 &&
+                       tensor.is_contiguous();
+            };
+            TORCH_CHECK(valid_state(*st) && valid_state(*cv) &&
+                            st->sizes() == at::IntArrayRef({gdn_nvh_, gdn_dk_, gdn_dv_}) &&
+                            cv->sizes() == at::IntArrayRef({gdn_tp(), gdn_kc_,
+                                                          gdn_conv_dim_ / gdn_tp()}),
+                        "Qwen3.5 recurrent/conv cache layout does not match the cold GDN core count");
+        }
         gdn_state_live_addr_[layer_idx] =
             ::rhino_lkn::RpuGetDevAddr(st->data_ptr<c10::Half>());
         conv_state_live_addr_[layer_idx] =
             ::rhino_lkn::RpuGetDevAddr(cv->data_ptr<c10::Half>());
-        rpu_ddr_flush_force(st->data_ptr<c10::Half>());
-        rpu_ddr_flush_force(cv->data_ptr<c10::Half>());
+        if (fast_replay_active_) {
+            rpu_ddr_flush_force(st->data_ptr<c10::Half>());
+            rpu_ddr_flush_force(cv->data_ptr<c10::Half>());
+        } else {
+            rpu_ddr_flush(st->data_ptr<c10::Half>());
+            rpu_ddr_flush(cv->data_ptr<c10::Half>());
+        }
     }
 
     at::Tensor out = run_all_layers(hidden_states, k_caches, v_caches,
-                                    attention_mask, position, is_causal);
+                                    attention_mask, position, is_causal,
+                                    planned_chunk_size,
+                                    planned_stage_descriptor);
 
     // PREFILL 的 resolved chunk_size 单独留一份。基类的 last_resolved_chunk_size_
     // (fused_model_base.cpp:546) 每次 compute_chunks 都覆写,而 decode 跑在 prefill 之后
@@ -491,13 +1267,64 @@ at::Tensor Qwen3_5Model::forward_impl(
     return out;
 }
 
+uint32_t Qwen3_5Model::layer_input_residual_addr(
+    int layer_idx,
+    const ChunkInfo& chunk) const {
+    if (!z2_bound_ || layer_idx != 0) {
+        return addr(0, "residual1");
+    }
+    TORCH_CHECK(z2_input_port_addr_ != 0,
+                "Qwen3.5 text Z2: layer-0 input port is unset");
+    TORCH_CHECK(chunk.offset >= 0 && chunk.len > 0 &&
+                    chunk.offset <= z2_prepared_execution_len_ &&
+                    chunk.len <= z2_prepared_execution_len_ - chunk.offset,
+                "Qwen3.5 text Z2: layer-0 chunk escapes the prepared input port");
+    const uint64_t byte_offset =
+        static_cast<uint64_t>(chunk.offset) *
+        static_cast<uint64_t>(hidden_size()) * sizeof(c10::Half);
+    TORCH_CHECK(byte_offset <= std::numeric_limits<uint32_t>::max() -
+                                   z2_input_port_addr_,
+                "Qwen3.5 text Z2: layer-0 port address overflows uint32");
+    return z2_input_port_addr_ + static_cast<uint32_t>(byte_offset);
+}
+
 void Qwen3_5Model::build_layer_subgraph(int layer_idx, const ChunkInfo& chunk) {
     const int64_t h = hidden_size();
-    const uint32_t input_residual = addr(0, "residual1");
+    const bool z2_layer0 = z2_bound_ && layer_idx == 0;
+    const uint32_t input_residual =
+        layer_input_residual_addr(layer_idx, chunk);
+
+    if (ctx().has_complete_physical_manifest() &&
+        layer_idx == 0 && chunk.idx == 0) {
+        if (num_cores() != 8) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::GRAPH_SCHEDULE, QWEN35_TEXT_CORE_TOPOLOGY_SITE,
+                /*selector=*/1, /*flags=*/0, cold_topology_arguments());
+        }
+        const int64_t action_body_iterations =
+            action_step_active_ && action_loop_active_ ? action_num_steps_ : 1;
+        ctx().consume_physical_route(
+            FmbRouteFamily::GRAPH_SCHEDULE,
+            QWEN35_TEXT_ACTION_SCHEDULE_SITE,
+            action_mode_ ? 2 : 1, /*resolved_flags=*/0,
+            {action_mode_ ? 1 : 0, action_input_w_.defined() ? 1 : 0,
+             action_loop_active_ ? 1 : 0, action_rtc_active_ ? 1 : 0,
+             action_step_active_ ? 1 : 0, action_body_iterations,
+             action_len_, action_dim_pad_}, chunk.idx);
+        const int64_t full_layer_count = std::count_if(
+            layer_is_full_.begin(), layer_is_full_.end(),
+            [](int value) { return value != 0; });
+        ctx().consume_physical_route(
+            FmbRouteFamily::GRAPH_SCHEDULE,
+            QWEN35_TEXT_QK_NORM_SCHEDULE_SITE,
+            has_qk_norm_ ? 2 : 1, /*resolved_flags=*/0,
+            {has_qk_norm_ ? 1 : 0, has_mrope_ ? 1 : 0,
+             head_dim(), attn_tp(), full_layer_count}, chunk.idx);
+    }
 
     // A layer = input DMA → input_layernorm → token mixer → post_norm + MLP + output.
     // ① input DMA: the first layer of the cross-layer group brings h_in into residual1.
-    if (!ctx().input_in_spm) {
+    if (!ctx().input_in_spm && !z2_layer0) {
         emit_layer_input_dma(layer_idx, chunk);   // h_in → residual1
     }
     // ② input_layernorm (HF: at the DecoderLayer, NOT inside the mixer). residual1 keeps
@@ -509,7 +1336,8 @@ void Qwen3_5Model::build_layer_subgraph(int layer_idx, const ChunkInfo& chunk) {
     } else {
         rpu_launch_rmsnorm_spm_kernel(
             input_residual, addr(0, "input_norm"),
-            layer_addr(layer_idx, 0, "norm_w"), chunk.len, h, eps_);
+            layer_addr(layer_idx, 0, "norm_w"), chunk.len, h, eps_,
+            RpuRmsNormSpmRoute::BASE, num_cores());
     }
     // ③ token mixer (reads "input_norm"; ends with an all_reduce that adds the h_in residual).
     if (layer_is_full_[layer_idx]) {
@@ -527,48 +1355,112 @@ void Qwen3_5Model::build_layer_subgraph(int layer_idx, const ChunkInfo& chunk) {
 }
 
 void Qwen3_5Model::launch_linear(
+    int64_t chunk_idx,
     uint32_t input, const at::Tensor& weight, uint32_t output,
     int64_t m, int64_t n, int64_t k, int partition, int num_cores,
-    uint32_t bias_spm_addr) {
+    uint32_t bias_spm_addr, const at::Tensor& scale) {
+    const FmbLinearRouteSelector selector =
+        linear_route_selector(weight, m);
+    const int64_t invocation = linear_invocation(chunk_idx, selector);
+    if (ctx().has_complete_physical_manifest()) {
+        ctx().consume_physical_route(
+            FmbRouteFamily::LINEAR, QWEN35_TEXT_LINEAR_SITE,
+            static_cast<int64_t>(selector), /*resolved_flags=*/0,
+            /*resolved_arguments=*/{}, invocation);
+    }
     rpu_launch_linear_spm_to_spm_acc16_kernel(
         input, weight, output, m, n, k, partition, num_cores,
-        bias_spm_addr, /*scale=*/{},
+        bias_spm_addr, scale,
         /*nvfp4_tensor_scale_spm_addr=*/0, /*nvfp4_layer_id=*/0,
-        /*force_acc32=*/linear_acc32_);
+        /*force_acc32=*/linear_acc32_,
+        /*prefer_gemv=*/selector == FmbLinearRouteSelector::GEMV);
+}
+
+void Qwen3_5Model::consume_manifest_route(
+    FmbRouteFamily family, int64_t site_id,
+    int64_t selector, int64_t invocation) {
+    if (!ctx().has_complete_physical_manifest()) return;
+    ctx().consume_physical_route(
+        family, site_id, selector, /*resolved_flags=*/0,
+        /*resolved_arguments=*/{}, invocation);
 }
 
 void Qwen3_5Model::load_adaptive_mod_row(int64_t row) {
     TORCH_CHECK(action_mode_ && adaptive_mod_ref_.defined(),
                 "Qwen3.5 action modulation is unavailable");
     const int64_t width = 3 * hidden_size();
+    const int64_t variants = action_rtc_active_ ? 2 : 1;
     const int64_t rows = 2 * num_layers() + 1;
     const int64_t step_row = action_loop_active_
-        ? ctx().body_iter * rows + row
-        : row;
+        ? (ctx().body_iter * rows + row) * variants
+        : row * variants;
+    consume_manifest_route(
+        FmbRouteFamily::MUTABLE_DMA,
+        QWEN35_TEXT_ADAPTIVE_MOD_DMA_SITE,
+        qwen35_text_dma_route(
+            Qwen35TextMutableDmaRoute::DDR_BROADCAST_TO_SPM));
     rpu_launch_ddr_broadcast_spm_dma_mutable(
         &adaptive_mod_live_base_,
         step_row * width * static_cast<int64_t>(sizeof(c10::Half)),
-        width, addr(0, "adaptive_mod"), NUM_CORES);
+        variants * width, addr(0, "adaptive_mod"), NUM_CORES);
 }
 
 void Qwen3_5Model::apply_adaptive_norm(
     uint32_t input, uint32_t output, const ChunkInfo& chunk) {
     const int64_t h = hidden_size();
-    const uint32_t modulation = addr(0, "adaptive_mod");
-    const uint32_t shift = modulation + static_cast<uint32_t>(h * DWIDTH);
-    rpu_launch_rmsnorm_spm_kernel(
-        input, output, modulation, chunk.len, h, eps_);
-    rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
-        shift, output, output, chunk.len, h,
-        c10::Half(1.0), ValuOpType::ADD, /*is_bopa=*/false);
+    const int64_t clean_rows = action_rtc_active_
+        ? std::clamp<int64_t>(
+              action_rtc_prefix_len_ - chunk.offset, 0, chunk.len)
+        : 0;
+    auto emit_segment = [&](int64_t row_offset, int64_t row_count,
+                            uint32_t modulation) {
+        if (row_count == 0) return;
+        const uint32_t data_offset = static_cast<uint32_t>(
+            row_offset * h * static_cast<int64_t>(DWIDTH));
+        const uint32_t shift = modulation + static_cast<uint32_t>(h * DWIDTH);
+        rpu_launch_rmsnorm_spm_kernel(
+            input + data_offset, output + data_offset,
+            modulation, row_count, h, eps_);
+        rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
+            shift, output + data_offset, output + data_offset,
+            row_count, h, c10::Half(1.0), ValuOpType::ADD,
+            /*is_bopa=*/false);
+    };
+    if (!action_rtc_active_) {
+        emit_segment(/*row_offset=*/0, chunk.len, addr(0, "adaptive_mod"));
+        return;
+    }
+    emit_segment(/*row_offset=*/0, clean_rows, addr(0, "adaptive_mod"));
+    emit_segment(
+        clean_rows, chunk.len - clean_rows,
+        addr(0, "adaptive_mod") + static_cast<uint32_t>(3 * h * DWIDTH));
 }
 
 void Qwen3_5Model::apply_adaptive_residual_gate(
     uint32_t output, uint32_t residual, const ChunkInfo& chunk) {
     const int64_t h = hidden_size();
-    const uint32_t gate = addr(0, "adaptive_mod")
-        + static_cast<uint32_t>(2 * h * DWIDTH);
-    apply_raw_residual_gate(output, residual, gate, chunk.len);
+    const int64_t clean_rows = action_rtc_active_
+        ? std::clamp<int64_t>(
+              action_rtc_prefix_len_ - chunk.offset, 0, chunk.len)
+        : 0;
+    auto emit_segment = [&](int64_t row_offset, int64_t row_count,
+                            uint32_t modulation) {
+        if (row_count == 0) return;
+        const uint32_t data_offset = static_cast<uint32_t>(
+            row_offset * h * static_cast<int64_t>(DWIDTH));
+        const uint32_t gate =
+            modulation + static_cast<uint32_t>(2 * h * DWIDTH);
+        apply_raw_residual_gate(
+            output + data_offset, residual + data_offset, gate, row_count);
+    };
+    if (!action_rtc_active_) {
+        emit_segment(/*row_offset=*/0, chunk.len, addr(0, "adaptive_mod"));
+        return;
+    }
+    emit_segment(/*row_offset=*/0, clean_rows, addr(0, "adaptive_mod"));
+    emit_segment(
+        clean_rows, chunk.len - clean_rows,
+        addr(0, "adaptive_mod") + static_cast<uint32_t>(3 * h * DWIDTH));
 }
 
 void Qwen3_5Model::apply_raw_residual_gate(
@@ -589,16 +1481,61 @@ void Qwen3_5Model::emit_action_input_projection() {
     TORCH_CHECK(action_step_active_,
                 "Qwen3.5 action input hook outside action-step forward");
     if (!action_loop_active_ || ctx().body_iter == 0) {
+        consume_manifest_route(
+            FmbRouteFamily::MUTABLE_DMA,
+            QWEN35_TEXT_ACTION_INPUT_DMA_SITE,
+            qwen35_text_dma_route(
+                Qwen35TextMutableDmaRoute::DDR_BROADCAST_TO_SPM));
         rpu_launch_ddr_broadcast_spm_dma_mutable(
             &action_input_live_base_, /*src_offset_bytes=*/0,
             action_len_ * action_dim_pad_, addr(0, "action_input"),
             /*num_cores=*/1);
     }
+    if (action_rtc_active_) {
+        // Replay-safe prefix inpainting: the caller supplies a fresh compact
+        // DDR tensor, and every Euler body restores its committed leading rows
+        // before the input projection. The previous body may have updated those
+        // rows in SPM, so loading only body 0 would change RTC semantics.
+        consume_manifest_route(
+            FmbRouteFamily::MUTABLE_DMA,
+            QWEN35_TEXT_ACTION_RTC_PREFIX_DMA_SITE,
+            qwen35_text_dma_route(
+                Qwen35TextMutableDmaRoute::DDR_BROADCAST_TO_SPM));
+        rpu_launch_ddr_broadcast_spm_dma_mutable(
+            &action_rtc_prefix_live_base_, /*src_offset_bytes=*/0,
+            action_rtc_prefix_len_ * action_dim_pad_,
+            addr(0, "action_input"), /*num_cores=*/1);
+    }
+    if (action_trace_active_) {
+        consume_manifest_route(
+            FmbRouteFamily::MUTABLE_DMA,
+            QWEN35_TEXT_ACTION_TRACE_PRE_DMA_SITE,
+            qwen35_text_dma_route(
+                Qwen35TextMutableDmaRoute::SPM_COPY_TO_DDR));
+        rpu_launch_spm_copy_ddr_dma_mutable(
+            addr(0, "action_input"),
+            &action_trace_pre_action_live_base_,
+            ctx().body_iter * action_len_ * action_dim_pad_ * DWIDTH,
+            action_len_ * action_dim_pad_);
+    }
     launch_linear(
+        /*chunk_idx=*/0,
         addr(0, "action_input"), action_input_w_,
         addr(0, "action_hidden"), action_len_, hidden_size(),
         action_dim_pad_, /*partition=*/1, /*num_cores=*/1,
         addr(0, "action_input_bias"));
+    if (action_trace_active_) {
+        consume_manifest_route(
+            FmbRouteFamily::MUTABLE_DMA,
+            QWEN35_TEXT_ACTION_TRACE_EMBED_DMA_SITE,
+            qwen35_text_dma_route(
+                Qwen35TextMutableDmaRoute::SPM_COPY_TO_DDR));
+        rpu_launch_spm_copy_ddr_dma_mutable(
+            addr(0, "action_hidden"),
+            &action_trace_action_embed_live_base_,
+            ctx().body_iter * action_len_ * hidden_size() * DWIDTH,
+            action_len_ * hidden_size());
+    }
     rpu_launch_spm_copy_ddr_dma(
         addr(0, "action_hidden"),
         action_hidden_stage_.data_ptr<c10::Half>(),
@@ -608,15 +1545,45 @@ void Qwen3_5Model::emit_action_input_projection() {
 void Qwen3_5Model::emit_action_output_projection() {
     TORCH_CHECK(action_step_active_,
                 "Qwen3.5 action output hook outside action-step forward");
+    if (action_trace_active_) {
+        consume_manifest_route(
+            FmbRouteFamily::MUTABLE_DMA,
+            QWEN35_TEXT_ACTION_TRACE_HIDDEN_DMA_SITE,
+            qwen35_text_dma_route(
+                Qwen35TextMutableDmaRoute::SPM_COPY_TO_DDR));
+        rpu_launch_spm_copy_ddr_dma_mutable(
+            addr(0, "residual1"),
+            &action_trace_final_hidden_live_base_,
+            ctx().body_iter * action_len_ * hidden_size() * DWIDTH,
+            action_len_ * hidden_size());
+    }
+    consume_manifest_route(
+        FmbRouteFamily::MUTABLE_DMA,
+        QWEN35_TEXT_ACTION_KEEP_MASK_DMA_SITE,
+        qwen35_text_dma_route(
+            Qwen35TextMutableDmaRoute::DDR_BROADCAST_TO_SPM));
     rpu_launch_ddr_broadcast_spm_dma_mutable(
         &action_keep_mask_live_base_, /*src_offset_bytes=*/0,
         action_dim_pad_, addr(0, "action_keep_mask"),
         /*num_cores=*/1);
     launch_linear(
+        /*chunk_idx=*/0,
         addr(0, "residual1"), action_output_w_,
         addr(0, "action_velocity"), action_len_, action_dim_pad_,
         hidden_size(), /*partition=*/1, /*num_cores=*/1,
         addr(0, "action_output_bias"));
+    if (action_trace_active_) {
+        consume_manifest_route(
+            FmbRouteFamily::MUTABLE_DMA,
+            QWEN35_TEXT_ACTION_TRACE_VELOCITY_DMA_SITE,
+            qwen35_text_dma_route(
+                Qwen35TextMutableDmaRoute::SPM_COPY_TO_DDR));
+        rpu_launch_spm_copy_ddr_dma_mutable(
+            addr(0, "action_velocity"),
+            &action_trace_velocity_live_base_,
+            ctx().body_iter * action_len_ * action_dim_pad_ * DWIDTH,
+            action_len_ * action_dim_pad_);
+    }
     const bool final_step =
         !action_loop_active_ || ctx().body_iter + 1 == action_num_steps_;
     if (final_step) {
@@ -633,7 +1600,24 @@ void Qwen3_5Model::emit_action_output_projection() {
         addr(0, "action_keep_mask"), addr(0, "action_input"),
         addr(0, "action_input"), action_len_, action_dim_pad_,
         c10::Half(1.0f), ValuOpType::MUL, /*is_bopa=*/false);
+    if (action_trace_active_) {
+        consume_manifest_route(
+            FmbRouteFamily::MUTABLE_DMA,
+            QWEN35_TEXT_ACTION_TRACE_POST_DMA_SITE,
+            qwen35_text_dma_route(
+                Qwen35TextMutableDmaRoute::SPM_COPY_TO_DDR));
+        rpu_launch_spm_copy_ddr_dma_mutable(
+            addr(0, "action_input"),
+            &action_trace_post_action_live_base_,
+            ctx().body_iter * action_len_ * action_dim_pad_ * DWIDTH,
+            action_len_ * action_dim_pad_);
+    }
     if (final_step) {
+        consume_manifest_route(
+            FmbRouteFamily::MUTABLE_DMA,
+            QWEN35_TEXT_ACTION_OUTPUT_DMA_SITE,
+            qwen35_text_dma_route(
+                Qwen35TextMutableDmaRoute::SPM_COPY_TO_DDR));
         rpu_launch_spm_copy_ddr_dma_mutable(
             addr(0, "action_input"), &action_output_live_base_,
             /*dst_offset_bytes=*/0, action_len_ * action_dim_pad_);
@@ -651,28 +1635,36 @@ void Qwen3_5Model::build_full_attention(int layer_idx, const ChunkInfo& chunk) {
     int64_t nq = num_q_heads();
     int64_t nkv = num_kv_heads();
     int64_t hd = head_dim();
-    // The adapter replicates logical GQA KV heads to an effective NUM_CORES
-    // width. One complete effective KV head lives on each active core;
-    // attention-phase kernels run on that resolved tensor-parallel width and
-    // virtual_num_cores=NUM_CORES keeps the KV-cache swizzle layout.
-    // MLP / all-reduce still span NUM_CORES.
+    // The adapter replicates logical GQA KV heads to the selected attention
+    // width. One complete effective KV head lives on each active core.
+    // DDR cache storage keeps the physical eight-controller layout, while
+    // mixer reductions broadcast to the selected owner core domain.
     int64_t tp = attn_tp();
+    // Preserve legacy eight-core auxiliary launches for non-text owners.
+    const int auxiliary_cores = num_cores() == 8 ? NUM_CORES : static_cast<int>(tp);
 
     // input DMA + input_layernorm are done by build_layer_subgraph; the normed input is
     // in "input_norm", h_in stays in residual1 (for the all_reduce residual).
     // Phase 2: QKV linear (col-partition over tp cores)
     launch_linear(
-        addr(0, "input_norm"), lw.q_w, addr(0, "q"), seq_len, nq * hd, h, 1, tp);
+        chunk.idx,
+        addr(0, "input_norm"), lw.q_w, addr(0, "q"), seq_len, nq * hd, h,
+        1, tp, 0, lw.q_ws);
     launch_linear(
-        addr(0, "input_norm"), lw.k_w, addr(0, "k"), seq_len, nkv * hd, h, 1, tp);
+        chunk.idx,
+        addr(0, "input_norm"), lw.k_w, addr(0, "k"), seq_len, nkv * hd, h,
+        1, tp, 0, lw.k_ws);
     launch_linear(
-        addr(0, "input_norm"), lw.v_w, addr(0, "v"), seq_len, nkv * hd, h, 1, tp);
+        chunk.idx,
+        addr(0, "input_norm"), lw.v_w, addr(0, "v"), seq_len, nkv * hd, h,
+        1, tp, 0, lw.v_ws);
     // Gated-attention gate projection. Compute here while "input_norm" still
     // holds the Phase-1 input RMSNorm output (Phase 3 k_norm overwrites it).
     // Applied as sigmoid(gate) ⊙ attn_out after SDPA (Qwen3.5 attn_output_gate).
     launch_linear(
+        chunk.idx,
         addr(0, "input_norm"), lw.attn_gate_w, addr(0, "attn_gate"),
-        seq_len, nq * hd, h, 1, tp);
+        seq_len, nq * hd, h, 1, tp, 0, lw.attn_gate_ws);
 
     // Phase 3: QK RMSNorm + RoPE. M-RoPE (interleaved) + partial rotary when
     // has_mrope_ (Qwen3.5); the 1D RoPE branch stays for non-mrope models.
@@ -693,20 +1685,27 @@ void Qwen3_5Model::build_full_attention(int layer_idx, const ChunkInfo& chunk) {
     // ctx().position+chunk.offset), so shifting it here does not disturb the KV slot.
     if (!use_prefill_rope) cos_sin_start += mrope_pos_delta_;
 
-    // Partial rotary, split by phase according to the operator-asset contract:
-    //   DECODE  (seq_len==1) → partial_rope_1d  (grid NUM_ELT_PER_WRP=512, grid_y=num_tokens)
-    //   PREFILL (seq_len >1) → partial_mrope    (grid 64,                 grid_y=ceil(/64))
-    // Both read [*, rotary_dim_/2] cos/sin tables and rotate only the first
-    // rotary_dim_ values (rotate-half within rotary_dim_). The shipping operator
-    // writes only that span, so input/output aliasing preserves the remaining values.
-    // Text-only tables coincide (T==H==W); multimodal prefill needs cos_for_mrope.
+
     auto emit_partial_rope = [&](uint32_t buf, int64_t heads) {
-        if (seq_len <= 1)
+        if (seq_len <= 1) {
+            consume_manifest_route(
+                FmbRouteFamily::ROPE,
+                QWEN35_TEXT_PARTIAL_ROPE_1D_SITE,
+                qwen35_text_rope_route(
+                    Qwen35TextRopeRoute::PARTIAL_ROPE_1D),
+                chunk.idx);
             rpu_launch_partial_rope_1d_spm_kernel(
                 buf, buf, cos_ptr, sin_ptr, cos_sin_start, seq_len, heads, hd, rotary_dim_, tp);
-        else
+        } else {
+            consume_manifest_route(
+                FmbRouteFamily::ROPE,
+                QWEN35_TEXT_PARTIAL_MROPE_SITE,
+                qwen35_text_rope_route(
+                    Qwen35TextRopeRoute::PARTIAL_MROPE),
+                chunk.idx);
             rpu_launch_partial_mrope_spm_kernel(
                 buf, buf, cos_ptr, sin_ptr, cos_sin_start, seq_len, heads, hd, rotary_dim_, tp);
+        }
     };
 
     if (has_qk_norm_) {
@@ -717,16 +1716,21 @@ void Qwen3_5Model::build_full_attention(int layer_idx, const ChunkInfo& chunk) {
             rpu_launch_rmsnorm_spm_kernel(
                 addr(0, "q"), addr(0, "q"),
                 layer_addr(layer_idx, 0, "q_norm_w"),
-                seq_len * local_q_heads, hd, eps_);
+                seq_len * local_q_heads, hd, eps_, RpuRmsNormSpmRoute::BASE, auxiliary_cores);
             emit_partial_rope(addr(0, "q"), local_q_heads);
         } else {
             rpu_launch_rmsnorm_spm_kernel(
                 addr(0, "q"), addr(0, "output"),
                 layer_addr(layer_idx, 0, "q_norm_w"),
-                seq_len * local_q_heads, hd, eps_);
+                seq_len * local_q_heads, hd, eps_, RpuRmsNormSpmRoute::BASE, auxiliary_cores);
+            consume_manifest_route(
+                FmbRouteFamily::ROPE,
+                QWEN35_TEXT_Q_NORM_ROPE_SITE,
+                qwen35_text_rope_route(Qwen35TextRopeRoute::ROPE_SPM),
+                chunk.idx);
             rpu_launch_rope_spm_kernel(
                 addr(0, "output"), addr(0, "q"), cos_ptr, sin_ptr,
-                seq_len, local_q_heads, hd, cos_sin_start);
+                seq_len, local_q_heads, hd, cos_sin_start, auxiliary_cores);
         }
         // K: norm + rope (same as Q), ONLY when each core owns >=1 whole head.
         // No GQA weight replication: attn runs on tp = min(NUM_CORES, nkv) cores,
@@ -737,50 +1741,167 @@ void Qwen3_5Model::build_full_attention(int layer_idx, const ChunkInfo& chunk) {
                 rpu_launch_rmsnorm_spm_kernel(
                     addr(0, "k"), addr(0, "k"),
                     layer_addr(layer_idx, 0, "k_norm_w"),
-                    seq_len * local_kv_heads, hd, eps_);
+                    seq_len * local_kv_heads, hd, eps_, RpuRmsNormSpmRoute::BASE, auxiliary_cores);
                 emit_partial_rope(addr(0, "k"), local_kv_heads);
             } else {
                 rpu_launch_rmsnorm_spm_kernel(
                     addr(0, "k"), addr(0, "input_norm"),
                     layer_addr(layer_idx, 0, "k_norm_w"),
-                    seq_len * local_kv_heads, hd, eps_);
+                    seq_len * local_kv_heads, hd, eps_, RpuRmsNormSpmRoute::BASE, auxiliary_cores);
+                consume_manifest_route(
+                    FmbRouteFamily::ROPE,
+                    QWEN35_TEXT_K_NORM_ROPE_SITE,
+                    qwen35_text_rope_route(Qwen35TextRopeRoute::ROPE_SPM),
+                    chunk.idx);
                 rpu_launch_rope_spm_kernel(
                     addr(0, "input_norm"), addr(0, "k"), cos_ptr, sin_ptr,
-                    seq_len, local_kv_heads, hd, cos_sin_start);
+                    seq_len, local_kv_heads, hd, cos_sin_start, auxiliary_cores);
             }
         }
     } else {
+        consume_manifest_route(
+            FmbRouteFamily::ROPE, QWEN35_TEXT_Q_ROPE_SITE,
+            qwen35_text_rope_route(Qwen35TextRopeRoute::ROPE_SPM),
+            chunk.idx);
         rpu_launch_rope_spm_kernel(
             addr(0, "q"), addr(0, "q"), cos_ptr, sin_ptr,
-            seq_len, local_q_heads, hd, cos_sin_start);
+            seq_len, local_q_heads, hd, cos_sin_start, auxiliary_cores);
+        consume_manifest_route(
+            FmbRouteFamily::ROPE, QWEN35_TEXT_K_ROPE_SITE,
+            qwen35_text_rope_route(Qwen35TextRopeRoute::ROPE_SPM),
+            chunk.idx);
         rpu_launch_rope_spm_kernel(
             addr(0, "k"), addr(0, "k"), cos_ptr, sin_ptr,
-            seq_len, 1, local_kv_dim, cos_sin_start);
+            seq_len, 1, local_kv_dim, cos_sin_start, auxiliary_cores);
     }
 
-    // Phase 4: KV-cache insert + SDPA + O_proj (typed offsets via addr_offset)
+    // Phase 4: KV-cache insert + SDPA + O_proj (P3: offsets via addr_offset)
     auto& k_cache = (*ctx().k_caches)[layer_idx];
     auto& v_cache = (*ctx().v_caches)[layer_idx];
     const int64_t kv_insert_pos =
         (action_mode_ ? action_prefix_lens_[layer_idx] : ctx().position)
         + chunk.offset;
-    rpu_launch_insert_kcache_spm_unified(
-        k_cache, kv_insert_pos, addr_offset("k").value,
-        seq_len, nkv, hd, tp);
-    rpu_launch_insert_vcache_spm_unified(
-        v_cache, kv_insert_pos, addr_offset("v").value,
-        seq_len, nkv, hd, tp);
+    const KvInsertSegmentPlan kv_plan = [&] {
+        if (!ctx().has_complete_physical_manifest()) {
+            TORCH_CHECK(
+                z2_bound_,
+                "Qwen3.5 production KV insert requires a COMPLETE physical "
+                "descriptor");
+            return rpu_resolve_kvinsert_segment_plan_auto(
+                kv_insert_pos, seq_len, seq_len, tp, nkv, hd,
+                QWEN35_TEXT_KV_CAPABILITIES);
+        }
+        const int64_t invocation = action_mode_
+            ? (action_prefix_lens_[layer_idx] > 0 ? 1 : 0)
+            : chunk.idx;
+        const auto& kv_route = ctx().find_physical_route(
+            FmbRouteFamily::KV_INSERT, kFullAttentionKvInsertSite,
+            invocation);
+        const KvInsertSegmentPlan template_plan =
+            restore_kvinsert_plan(
+                kFullAttentionKvInsertSite, kv_route.arguments, tp, nkv, hd);
+        const bool dynamic_position =
+            (kv_route.flags & KV_INSERT_ROUTE_FLAG_DYNAMIC_POSITION) != 0;
+        TORCH_CHECK(
+            !dynamic_position ||
+                (!action_mode_ && seq_len == 1 &&
+                 template_plan.segment(0).position == 0),
+            "Qwen3.5 dynamic KV position is only valid for a canonical "
+            "single-token text decode template");
+        KvInsertSegmentPlan resolved_plan = dynamic_position
+            ? rpu_rebase_kvinsert_segment_plan_position(
+                  template_plan, kv_insert_pos, tp, nkv, hd)
+            : template_plan;
+        TORCH_CHECK(
+            resolved_plan.logical_rows() == seq_len &&
+                resolved_plan.physical_rows() == seq_len &&
+                resolved_plan.segment(0).position == kv_insert_pos,
+            "Qwen3.5 KV descriptor geometry drift at layer ", layer_idx,
+            ", invocation ", invocation);
+        ctx().consume_physical_route(
+            FmbRouteFamily::KV_INSERT, kFullAttentionKvInsertSite,
+            static_cast<int64_t>(template_plan.route()), kv_route.flags,
+            kv_route.arguments, invocation);
+        return resolved_plan;
+    }();
+    rpu_launch_insert_kvcache_spm_unified_with_plan(
+        k_cache, v_cache,
+        addr_offset("k").value, addr_offset("v").value,
+        nkv, hd, tp,
+        /*k_cache_batch_offset_elems=*/0,
+        /*v_cache_batch_offset_elems=*/0,
+        // Action has no padded physical tail: the frozen plan's physical rows
+        // equal its logical horizon. Z2 also has no padded SPM tail.
+        /*spm_rows=*/0, kv_plan);
 
     int64_t kv_seq_len = action_mode_
         ? action_prefix_lens_[layer_idx] + ctx().seq_len
         : chunk.kv_seq_len;
     bool sdpa_causal = ctx().is_causal && (seq_len > 1);
-    // SDPA on tp cores; virtual_num_cores=NUM_CORES governs the KV-cache 7D swizzle.
-    rpu_launch_sdpa_spm_dispatch(
-        sdpa_kernel_, k_cache, v_cache, sdpa_causal ? 1 : 0, c10::nullopt,
-        addr_offset("q").value, addr_offset("output").value,
-        addr_offset("sdpa_tmp").value, 0,
-        seq_len, nq, nkv, hd, kv_seq_len, tp, NUM_CORES);
+    const bool raw_spm = ctx().attention_policy ==
+        AttentionExecutionPolicy::SPM_KV_BY_MHA;
+    const int64_t attention_site = raw_spm
+        ? kFullAttentionRawSpmSite : kFullAttentionSite;
+    const int64_t attention_invocation = action_mode_ ? 0 : chunk.idx;
+    const FmbRouteManifestEntry* attention_route = nullptr;
+    std::vector<int64_t> attention_arguments;
+    if (ctx().has_complete_physical_manifest()) {
+        attention_route = &ctx().find_physical_route(
+            FmbRouteFamily::ATTENTION, attention_site,
+            attention_invocation);
+        attention_arguments = action_mode_ || seq_len == 1
+            ? std::vector<int64_t>{seq_len}
+            : std::vector<int64_t>{
+                  /*batch=*/1, seq_len, kv_seq_len, nq, nkv, hd, tp,
+                  sdpa_causal ? 1 : 0};
+        TORCH_CHECK(
+            (raw_spm && attention_route->flags == 0) ||
+                (!raw_spm && attention_route->flags != 0),
+            "Qwen3.5 attention descriptor lacks its exact RAW_SPM or "
+            "DDR_REQUIRED reason");
+    }
+    if (raw_spm) {
+        if (attention_route != nullptr) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::ATTENTION,
+                kFullAttentionRawSpmSite,
+                static_cast<int64_t>(
+                    AttentionExecutionPolicy::SPM_KV_BY_MHA),
+                attention_route->flags, attention_arguments,
+                attention_invocation);
+        }
+        TORCH_CHECK(
+            !action_mode_ && sdpa_causal &&
+                sdpa_by_mha_spm_is_valid(
+                    /*batch=*/1, seq_len, kv_seq_len, nq, nkv, hd, tp,
+                    /*MASK_LTM=*/1),
+            "Qwen3.5 RAW_SPM attention escaped its exact P0 single-chunk "
+            "capability");
+        rpu_launch_v_transpose_spm(
+            addr(0, "v"), addr(0, "sdpa_tmp"),
+            /*batch=*/1, kv_seq_len, nkv, hd, tp);
+        rpu_launch_sdpa_by_mha_spm(
+            addr(0, "q"), addr(0, "k"), addr(0, "sdpa_tmp"),
+            addr(0, "output"), /*mask_spm=*/0, /*MASK_LTM=*/1,
+            1.0 / std::sqrt(static_cast<double>(hd)),
+            /*batch=*/1, seq_len, kv_seq_len, nq, nkv, hd, tp);
+    } else {
+        if (attention_route != nullptr) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::ATTENTION, kFullAttentionSite,
+                static_cast<int64_t>(AttentionExecutionPolicy::DDR_KV),
+                attention_route->flags, attention_arguments,
+                attention_invocation);
+        }
+        // DDR SDPA on tp cores; virtual_num_cores=NUM_CORES governs the
+        // KV-cache 7-D swizzle.
+        rpu_launch_sdpa_spm_dispatch(
+            sdpa_kernel_, k_cache, v_cache, sdpa_causal ? 1 : 0,
+            c10::nullopt,
+            addr_offset("q").value, addr_offset("output").value,
+            addr_offset("sdpa_tmp").value, 0,
+            seq_len, nq, nkv, hd, kv_seq_len, tp, NUM_CORES);
+    }
 
     // Gated-attention output gate (Qwen3.5 attn_output_gate=true):
     //   output = sigmoid(gate) ⊙ output, before o_proj.
@@ -789,20 +1910,32 @@ void Qwen3_5Model::build_full_attention(int layer_idx, const ChunkInfo& chunk) {
         rpu_launch_eltwise_unary_spm_kernel(
             addr(0, "attn_gate"), addr(0, "attn_gate"),
             gate_elems, ValuOpType::SIGMOID, /*is_gelu=*/false, tp);
-        rpu_launch_eltwise_mul_spm_kernel(
-            addr(0, "attn_gate"), addr(0, "output"), addr(0, "output"), gate_elems);
+        rpu_launch_eltwise_binary_spm_kernel(
+            addr(0, "attn_gate"), addr(0, "output"), addr(0, "output"), gate_elems, ValuOpType::MUL, c10::Half(1.0f), auxiliary_cores);
     }
-    // O-proj row-partition over tp cores; reduce back to NUM_CORES below.
+    // O-proj row-partition over tp cores; reduce to the owner below.
+    consume_manifest_route(
+        FmbRouteFamily::ALL_REDUCE,
+        QWEN35_TEXT_FULL_PREPARE_ALL_REDUCE_SITE,
+        static_cast<int64_t>(
+            Qwen35TextAllReduceRoute::PREPARE_RING_INPUT),
+        chunk.idx);
     rpu_prepare_ring_all_reduce_input(
-        addr(0, "oproj"), seq_len, h, tp);
+        addr(0, "oproj"), seq_len, h, tp, num_cores());
     launch_linear(
-        addr(0, "output"), lw.o_w, addr(0, "oproj"), seq_len, h, nq * hd, 0, tp);
+        chunk.idx,
+        addr(0, "output"), lw.o_w, addr(0, "oproj"), seq_len, h, nq * hd,
+        0, tp, 0, lw.o_ws);
 
-    // Phase 5: attention reduce + residual (tp inputs → NUM_CORES out)
+    // Phase 5: attention reduce + residual (tp inputs → owner outputs)
+    consume_manifest_route(
+        FmbRouteFamily::ALL_REDUCE,
+        QWEN35_TEXT_FULL_ALL_REDUCE_SITE,
+        text_ring_route(seq_len, h), chunk.idx);
     rpu_launch_all_reduce_sum_residual_kernel(
-        addr(0, "oproj"), addr(0, "residual1"),
+        addr(0, "oproj"), layer_input_residual_addr(layer_idx, chunk),
         addr(0, "residual2"), seq_len, h,
-        tp, NUM_CORES);
+        tp, num_cores());
     if (action_mode_) {
         apply_adaptive_residual_gate(
             addr(0, "residual2"), addr(0, "residual1"), chunk);
@@ -822,13 +1955,13 @@ void Qwen3_5Model::build_gdn(int layer_idx, const ChunkInfo& chunk, bool decode)
     const int64_t conv_dim = gdn_conv_dim_, Kc = gdn_kc_;
     const int64_t nkh = (conv_dim - H * Dv) / (2 * Dk), rep = H / nkh;
     const int64_t key_dim = nkh * Dk, value_dim = H * Dv, hidden = hidden_size();
-    const int     nc = NUM_CORES;
+    const int     nc = gdn_tp();
     const int64_t Hc = H / nc, Hc_kv = nkh / nc, lval = value_dim / nc, lkey = key_dim / nc;
     const int64_t lconv = conv_dim / nc;                          // per-core conv channels
     const int64_t n_bg = ((Hc + 15) / 16) * 16, N_bg = n_bg * nc; // padded b/a width (16/core)
     const int64_t L = decode ? 1 : chunk.len;   // seq_len: decode 1 token / prefill chunk
     TORCH_CHECK(H % nc == 0 && conv_dim % nc == 0 && value_dim % nc == 0 && nkh % nc == 0,
-                "build_gdn: H/conv_dim/value_dim/nkh must be divisible by 8");
+                "build_gdn: H/conv_dim/value_dim/nkh must divide the GDN core count");
     at::Tensor* st = gdn_state_for_layer(layer_idx);
     at::Tensor* cv = conv_state_for_layer(layer_idx);
     TORCH_CHECK(st && cv && st->defined() && cv->defined(),
@@ -850,41 +1983,93 @@ void Qwen3_5Model::build_gdn(int layer_idx, const ChunkInfo& chunk, bool decode)
 
     // ── DMA the M-independent weights/state into SPM. ──
     rpu_launch_ddr_broadcast_spm_dma(lw.gdn_norm_w.data_ptr<c10::Half>(),    Dv,      D("gdn_normw"), nc);
-    rpu_launch_ddr_broadcast_spm_dma(gdn_zero_.data_ptr<c10::Half>(),        Dk * Dv, D("gdn_zero"),  nc);
+    if (decode)
+        rpu_launch_ddr_broadcast_spm_dma(
+            gdn_zero_.data_ptr<c10::Half>(), Dk * Dv, D("gdn_zero"), nc);
     // gdn_Al: decode = RAW A_log (recurrent device-exps it); prefill = precomputed neg_exp_A.
+    const int64_t scalar_slots = qwen35_gdn_scalar_slots(H, nc);
     if (decode) {
-        rpu_launch_ddr_scatter_spm_dma(lw.gdn_A_log.data_ptr<c10::Half>(), 8, 16, D("gdn_Al"), nc);
+        rpu_launch_ddr_scatter_spm_dma(lw.gdn_A_log.data_ptr<c10::Half>(), scalar_slots, scalar_slots * DWIDTH, D("gdn_Al"), nc);
     } else {
         TORCH_CHECK(gdn_neg_exp_A_[layer_idx].defined(), "build_gdn: neg_exp_A missing for layer ", layer_idx);
-        rpu_launch_ddr_scatter_spm_dma(gdn_neg_exp_A_[layer_idx].data_ptr<c10::Half>(), 8, 16, D("gdn_Al"), nc);
+        rpu_launch_ddr_scatter_spm_dma(gdn_neg_exp_A_[layer_idx].data_ptr<c10::Half>(), scalar_slots, scalar_slots * DWIDTH, D("gdn_Al"), nc);
     }
-    rpu_launch_ddr_scatter_spm_dma(lw.gdn_dt_bias.data_ptr<c10::Half>(), 8, 16, D("gdn_dt"), nc);
-    if (initial_prefill_chunk) {
-        rpu_launch_fill_spm_kernel(
-            D("gdn_state"), Hc * Dk * Dv, c10::Half(0.0f), nc);
-        rpu_launch_fill_spm_kernel(
-            D("gdn_cs"), Kc * lconv, c10::Half(0.0f), nc);
-    } else {
+    rpu_launch_ddr_scatter_spm_dma(lw.gdn_dt_bias.data_ptr<c10::Half>(), scalar_slots, scalar_slots * DWIDTH, D("gdn_dt"), nc);
+    if (decode) {
+        consume_manifest_route(
+            FmbRouteFamily::MUTABLE_DMA,
+            QWEN35_TEXT_GDN_STATE_LOAD_DMA_SITE,
+            qwen35_text_dma_route(
+                Qwen35TextMutableDmaRoute::DDR_SCATTER_TO_SPM),
+            chunk.idx);
         rpu_launch_ddr_scatter_spm_dma_mutable(
             &gdn_state_live_addr_[layer_idx], 0, Hc * Dk * Dv,
             Hc * Dk * Dv * 2, D("gdn_state"), nc);
+        consume_manifest_route(
+            FmbRouteFamily::MUTABLE_DMA,
+            QWEN35_TEXT_GDN_CONV_DECODE_LOAD_DMA_SITE,
+            qwen35_text_dma_route(
+                Qwen35TextMutableDmaRoute::DDR_SCATTER_TO_SPM),
+            chunk.idx);
+        rpu_launch_ddr_scatter_spm_dma_mutable(
+            &conv_state_live_addr_[layer_idx], 0, Kc * lconv,
+            Kc * lconv * 2, D("gdn_cs"), nc);
+    } else if (initial_prefill_chunk) {
+        rpu_launch_fill_spm_kernel(
+            D("gdn_cs"), Kc * lconv, c10::Half(0.0f), nc);
+    } else {
+        // Prefill consumes the conv carry immediately in phase 2. The recurrent
+        // state is loaded only at phase 16, after earlier scratch is dead.
+        consume_manifest_route(
+            FmbRouteFamily::MUTABLE_DMA,
+            QWEN35_TEXT_GDN_CONV_PREFILL_LOAD_DMA_SITE,
+            qwen35_text_dma_route(
+                Qwen35TextMutableDmaRoute::DDR_SCATTER_TO_SPM),
+            chunk.idx);
         rpu_launch_ddr_scatter_spm_dma_mutable(
             &conv_state_live_addr_[layer_idx], 0, Kc * lconv,
             Kc * lconv * 2, D("gdn_cs"), nc);
     }
-    if (!decode) {  // prefill-only M-gen chunk masks (tril/strict, same on every core)
+    bool load_chunk_masks = !decode;
+    if (!decode && ctx().has_complete_physical_manifest() && !action_mode_ && !z2_bound_) {
+        const auto& route = ctx().find_physical_route(
+            FmbRouteFamily::GRAPH_SCHEDULE, QWEN35_TEXT_GDN_MASK_RESIDENCY_SITE);
+        TORCH_CHECK(route.selector == 1 || route.selector == 2,
+                    "GDN mask residency requires per-layer or forward-retained schedule");
+        const auto arguments = gdn_mask_schedule_arguments(ctx().stage_plan);
+        ctx().consume_physical_route(
+            FmbRouteFamily::GRAPH_SCHEDULE, QWEN35_TEXT_GDN_MASK_RESIDENCY_SITE,
+            route.selector, /*resolved_flags=*/0, arguments);
+        // This is an execution-position predicate, never a host 'already loaded'
+        // cache: every Graph execution records/replays its first pair of DMAs.
+        load_chunk_masks = route.selector == 1 ||
+            (layer_idx == arguments[3] && chunk.idx == 0);
+    }
+    if (load_chunk_masks) {  // fixed 64x64 masks; all GDN consumers only read them
         rpu_launch_ddr_broadcast_spm_dma(gdn_tril_.data_ptr<c10::Half>(),   64 * 64, D("gdn_c_tril"),   nc);
         rpu_launch_ddr_broadcast_spm_dma(gdn_strict_.data_ptr<c10::Half>(), 64 * 64, D("gdn_c_strict"), nc);
     }
 
     // ── in_proj: q/k/v/z col-parallel + N_bg-padded b/a. input_layernorm is at the layer
     //    level → "input_norm"; decode writes its own buffers, prefill the conv xpad region. ──
-    launch_linear(D("input_norm"), lw.gdn_q_w,    q_out, L, key_dim,   hidden, 1, nc);
-    launch_linear(D("input_norm"), lw.gdn_k_w,    k_out, L, key_dim,   hidden, 1, nc);
-    launch_linear(D("input_norm"), lw.gdn_v_w,    v_out, L, value_dim, hidden, 1, nc);
-    launch_linear(D("input_norm"), lw.gdn_in_z_w, z_out, L, value_dim, hidden, 1, nc);
-    launch_linear(D("input_norm"), lw.gdn_b_bg_w, b_out, L, N_bg, hidden, 1, nc);
-    launch_linear(D("input_norm"), lw.gdn_a_bg_w, a_out, L, N_bg, hidden, 1, nc);
+    launch_linear(chunk.idx,
+                  D("input_norm"), lw.gdn_q_w, q_out, L, key_dim, hidden,
+                  1, nc, 0, lw.gdn_q_ws);
+    launch_linear(chunk.idx,
+                  D("input_norm"), lw.gdn_k_w, k_out, L, key_dim, hidden,
+                  1, nc, 0, lw.gdn_k_ws);
+    launch_linear(chunk.idx,
+                  D("input_norm"), lw.gdn_v_w, v_out, L, value_dim, hidden,
+                  1, nc, 0, lw.gdn_v_ws);
+    launch_linear(chunk.idx,
+                  D("input_norm"), lw.gdn_in_z_w, z_out, L, value_dim, hidden,
+                  1, nc, 0, lw.gdn_in_z_ws);
+    launch_linear(chunk.idx,
+                  D("input_norm"), lw.gdn_b_bg_w, b_out, L, N_bg, hidden,
+                  1, nc, 0, lw.gdn_b_bg_ws);
+    launch_linear(chunk.idx,
+                  D("input_norm"), lw.gdn_a_bg_w, a_out, L, N_bg, hidden,
+                  1, nc, 0, lw.gdn_a_bg_ws);
 
     // ── Divergent token mixer: decode = recurrent single step / prefill = chunked delta-rule.
     //    Both converge on the shared phase-6 tail below. ──
@@ -919,10 +2104,11 @@ void Qwen3_5Model::build_gdn(int layer_idx, const ChunkInfo& chunk, bool decode)
             rk = D("gdn_k_rep");
         }
 
-        // 4) l2norm + gating + recurrent delta-rule (Hc heads/core, 8-core SPMD). gdn_Al = RAW
+        // 4) l2norm + gating + recurrent delta-rule (Hc heads/core). gdn_Al = RAW
         //    A_log (the recurrent device-exps it); consumes raw a/b/dt; state updated in place.
         rpu_emit_gdn_recurrent_multihead_seq(
-            rq, rk, a_v, D("gdn_state"), D("gdn_p"), D("gdn_delta"), D("gdn_zero"),
+            rq, rk, a_v, D("gdn_state"), D("gdn_p"), D("gdn_scratch"),
+            D("gdn_delta"), D("gdn_zero"),
             D("gdn_Al"), D("gdn_a"), D("gdn_b"), D("gdn_dt"),
             D("gdn_gexp"), D("gdn_beta"), D("gdn_gs"), D("gdn_out"),
             Hc, Dk, Dv, nc);
@@ -945,8 +2131,9 @@ void Qwen3_5Model::build_gdn(int layer_idx, const ChunkInfo& chunk, bool decode)
                 chunk.offset, ", valid_prefill_len=", valid_prefill_len_, ") — bad chunk plan/padding");
 
     // ── Phase 2: causal conv1d (prefill, per-path) + SiLU → gdn_c_query/key/value. ──
-    //   pad rows [0:hist] = prev-chunk conv state (fresh prefill = 0); conv writes IN PLACE into
-    //   gdn_c_*_pad[hist:], then SiLU reads it → gdn_c_query/key/value (the conv-activated q/k/v).
+    //   pad rows [0:hist] = prev-chunk conv state (fresh prefill = 0). The
+    //   no-inplace kernel leaves pad intact and writes activated inputs to
+    //   gdn_c_query/key/value through the following SiLU.
     if (Lv == 1) {
         // Lv==1 edge (last chunk holds a single real token; real_len ≡ 1 mod cs, > cs): the prefill
         // conv kernel is L>1 only, so use the DECODE single-token conv. gdn_cs already holds the conv
@@ -965,8 +2152,6 @@ void Qwen3_5Model::build_gdn(int layer_idx, const ChunkInfo& chunk, bool decode)
         rpu_launch_eltwise_unary_spm_kernel(cs_k + (uint32_t)((Kc - 1) * lkey * 2), D("gdn_c_key"),   lkey, ValuOpType::SILU, false, nc);
         rpu_launch_eltwise_unary_spm_kernel(cs_v + (uint32_t)((Kc - 1) * lval * 2), D("gdn_c_value"), lval, ValuOpType::SILU, false, nc);
     } else {
-        const int64_t N_seg = (Lv >= 32) ? 8 : 1, seg_len = Lv / N_seg;
-        const int64_t seg_rem = Lv % N_seg;   // remainder-in-seg0 (matches kernel _seg_lo / launcher reg[22])
         // pad[0:hist] = prev-chunk conv carry, copied from gdn_cs (loaded from the DDR cache at
         // setup; fresh chunk 0 = 0 since the cache inits to 0). gdn_cs is path-major, SAME offsets
         // as decode's cs_q/cs_k/cs_v (q@+0, k@+Kc·lkey, v@+Kc·2lkey). The conv below writes the NEW
@@ -975,53 +2160,36 @@ void Qwen3_5Model::build_gdn(int layer_idx, const ChunkInfo& chunk, bool decode)
         rpu_launch_eltwise_binary_spm_kernel(D("gdn_cs"),                               D("gdn_cs"),                               D("gdn_c_q_pad"), hist * lkey, ValuOpType::MAX, c10::Half(1.0f), nc);
         rpu_launch_eltwise_binary_spm_kernel(D("gdn_cs") + (uint32_t)(Kc * lkey * 2),     D("gdn_cs") + (uint32_t)(Kc * lkey * 2),     D("gdn_c_k_pad"), hist * lkey, ValuOpType::MAX, c10::Half(1.0f), nc);
         rpu_launch_eltwise_binary_spm_kernel(D("gdn_cs") + (uint32_t)(Kc * 2 * lkey * 2), D("gdn_cs") + (uint32_t)(Kc * 2 * lkey * 2), D("gdn_c_v_pad"), hist * lval, ValuOpType::MAX, c10::Half(1.0f), nc);
-        if (N_seg > 1) {  // halo[bz] = pad[_seg_lo(bz)]: the L%8 remainder goes ENTIRELY to seg0
-            // (base=L/8, rem=L%8; kernel/launcher reg[22]=seg_rem), so the 8 halo starts are
-            // {0, rem+base, rem+2base, …} — equidistant ONLY when rem==0. A single strided slice
-            // cuts equidistant starts, so rem==0 keeps the original one-slice form; rem!=0 needs
-            // TWO slices: seg0 = pad[0:hist] (conv history), seg1..N-1 = pad[rem+bz*base] (stride
-            // base from row rem+base → halo rows [hist:]). This matches the admitted
-            // ragged-L operator contract.
-            // PER-CORE: slice uses an explicit global per-core base+offset address,
-            // so issue one single-core launch per core at addr(c,·); otherwise cores
-            // 1..nc-1's halo stays UNWRITTEN (conv reads NaN).
-            auto emit_halo = [&](int c, const char* pad_n, const char* halo_n, int64_t l) {
-                if (seg_rem == 0) {
-                    rpu_launch_slice_spm_kernel(addr(c, pad_n), addr(c, halo_n), {N_seg, seg_len, l}, {N_seg, hist, l}, {0, 0, 0}, 1);
-                } else {
-                    rpu_launch_slice_spm_kernel(addr(c, pad_n), addr(c, halo_n), {1, seg_len, l}, {1, hist, l}, {0, 0, 0}, 1);
-                    rpu_launch_slice_spm_kernel(addr(c, pad_n) + (uint32_t)((seg_rem + seg_len) * l * 2),
-                                                addr(c, halo_n) + (uint32_t)(hist * l * 2),
-                                                {N_seg - 1, seg_len, l}, {N_seg - 1, hist, l}, {0, 0, 0}, 1);
-                }
-            };
-            for (int c = 0; c < nc; ++c) {
-                emit_halo(c, "gdn_c_q_pad", "gdn_c_q_halo", lkey);
-                emit_halo(c, "gdn_c_k_pad", "gdn_c_k_halo", lkey);
-                emit_halo(c, "gdn_c_v_pad", "gdn_c_v_halo", lval);
-            }
-        }
         // cso (new conv carry = last hist inputs; only the top segment stores it) is written
         // straight into gdn_cs at the same path-major offsets decode uses → the shared tail's
         // gdn_cs→cache scatter carries it to the next chunk / decode step.
-        rpu_launch_fla_conv1d_prefill_spm_kernel(D("gdn_c_q_pad"), D("gdn_cs"),                               D("gdn_c_q_halo"), lw.gdn_conv_q_w.data_ptr<c10::Half>(), 1, lkey, Kc, Lv, nc);
-        rpu_launch_fla_conv1d_prefill_spm_kernel(D("gdn_c_k_pad"), D("gdn_cs") + (uint32_t)(Kc * lkey * 2),     D("gdn_c_k_halo"), lw.gdn_conv_k_w.data_ptr<c10::Half>(), 1, lkey, Kc, Lv, nc);
-        rpu_launch_fla_conv1d_prefill_spm_kernel(D("gdn_c_v_pad"), D("gdn_cs") + (uint32_t)(Kc * 2 * lkey * 2), D("gdn_c_v_halo"), lw.gdn_conv_v_w.data_ptr<c10::Half>(), 1, lval, Kc, Lv, nc);
-        rpu_launch_eltwise_unary_spm_kernel(D("gdn_c_q_pad") + qx, D("gdn_c_query"), L * lkey, ValuOpType::SILU, false, nc);
-        rpu_launch_eltwise_unary_spm_kernel(D("gdn_c_k_pad") + qx, D("gdn_c_key"),   L * lkey, ValuOpType::SILU, false, nc);
-        rpu_launch_eltwise_unary_spm_kernel(D("gdn_c_v_pad") + vx, D("gdn_c_value"), L * lval, ValuOpType::SILU, false, nc);
+        rpu_launch_fla_conv1d_prefill_noinplace_spm_kernel(D("gdn_c_q_pad"), D("gdn_c_query"), D("gdn_cs"),                               lw.gdn_conv_q_w.data_ptr<c10::Half>(), 1, lkey, Kc, Lv, nc);
+        rpu_launch_fla_conv1d_prefill_noinplace_spm_kernel(D("gdn_c_k_pad"), D("gdn_c_key"),   D("gdn_cs") + (uint32_t)(Kc * lkey * 2),     lw.gdn_conv_k_w.data_ptr<c10::Half>(), 1, lkey, Kc, Lv, nc);
+        rpu_launch_fla_conv1d_prefill_noinplace_spm_kernel(D("gdn_c_v_pad"), D("gdn_c_value"), D("gdn_cs") + (uint32_t)(Kc * 2 * lkey * 2), lw.gdn_conv_v_w.data_ptr<c10::Half>(), 1, lval, Kc, Lv, nc);
+        rpu_launch_eltwise_unary_spm_kernel(D("gdn_c_query"), D("gdn_c_query"), L * lkey, ValuOpType::SILU, false, nc);
+        rpu_launch_eltwise_unary_spm_kernel(D("gdn_c_key"),   D("gdn_c_key"),   L * lkey, ValuOpType::SILU, false, nc);
+        rpu_launch_eltwise_unary_spm_kernel(D("gdn_c_value"), D("gdn_c_value"), L * lval, ValuOpType::SILU, false, nc);
     }
-    // ── Phases 3–5: prefill chunked delta-rule core. Falls through to the SHARED phase-6 tail
+    // The conv carry is complete after phase 2 and is not read again in prefill.
+    consume_manifest_route(
+        FmbRouteFamily::MUTABLE_DMA,
+        QWEN35_TEXT_GDN_CONV_PREFILL_STORE_DMA_SITE,
+        qwen35_text_dma_route(
+            Qwen35TextMutableDmaRoute::SPM_SCATTER_TO_DDR),
+        chunk.idx);
+    rpu_launch_spm_scatter_ddr_dma_mutable(
+        D("gdn_cs"), &conv_state_live_addr_[layer_idx], 0,
+        Kc * lconv, Kc * lconv * 2, nc);
+    // ── Phases 3–17: prefill chunked delta-rule core. Falls through to the shared tail
     //    below (gated-norm + out_proj + state/conv writeback + AllReduce residual), same as the
     //    decode branch — both leave the post-mixer stream in residual2 for build_layer_subgraph. ──
     const int64_t C = 64, N = L / C;            // GDN chunk size / sub-chunk count (L is 64-aligned)
     const int64_t vg_c = H / nc;                // beta/g heads/core (== Hc)
-    // PER-CORE slice: slice_single_axis/last_dim use an explicit global per-core
-    // base+offset address. A multi-core broadcast launch makes every
-    // core hit core-0's SPM (cores 1..nc-1 unwritten → garbage). Launch one single-core slice per
-    // core, re-based to that core's SPM. pc_addr rebases an addr(0,·) → addr(c,·) via the SPM
-    // bases, so it works with the resolved buffer vars (a_gexpc/a_gc), not just literal names.
-    // (N-major removed the phase-5 sub-chunk slice/insert; only the glast C-axis slice remains.)
+    const uint32_t q_rep_buf = D("gdn_c_q_rep");
+    const uint32_t k_rep_buf = D("gdn_c_k_rep");
+    const uint32_t q_h_buf = D("gdn_c_q_h");
+    const uint32_t decay_buf = D("gdn_c_decay");
+
     auto pc_addr = [&](uint32_t a0, int cc) -> uint32_t {
         return a0 - SPM_ALLOC.addr(0, 0) + SPM_ALLOC.addr(cc, 0);
     };
@@ -1035,20 +2203,20 @@ void Qwen3_5Model::build_gdn(int layer_idx, const ChunkInfo& chunk, bool decode)
     slice_pc(D("gdn_c_b"), D("gdn_c_beta"), {L, n_bg}, {L, vg_c}, {0, 0});
     slice_pc(D("gdn_c_a"), D("gdn_c_g"),    {L, n_bg}, {L, vg_c}, {0, 0});
     rpu_launch_eltwise_unary_spm_kernel(D("gdn_c_beta"), D("gdn_c_beta"), L * vg_c, ValuOpType::SIGMOID, false, nc);
-    rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(D("gdn_dt"), D("gdn_c_g"), D("gdn_c_g"), L, vg_c, c10::Half(1.0f), ValuOpType::ADD, false);  // +dt_bias
+    rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(D("gdn_dt"), D("gdn_c_g"), D("gdn_c_g"), L, vg_c, c10::Half(1.0f), ValuOpType::ADD, false, nc);  // +dt_bias
     rpu_launch_eltwise_unary_spm_kernel(
         D("gdn_c_g"), D("gdn_c_g"), L * vg_c, ValuOpType::SOFTPLUS,
         false, nc);
-    rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(D("gdn_Al"), D("gdn_c_g"), D("gdn_c_g"), L, vg_c, c10::Half(1.0f), ValuOpType::MUL, false);  // g *= neg_exp_A
+    rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(D("gdn_Al"), D("gdn_c_g"), D("gdn_c_g"), L, vg_c, c10::Half(1.0f), ValuOpType::MUL, false, nc);  // g *= neg_exp_A
     rpu_launch_l2norm_spm_kernel(D("gdn_c_query"), D("gdn_c_query"), L * Hc_kv, Dk, 1e-6, nc);
     rpu_launch_l2norm_spm_kernel(D("gdn_c_key"),   D("gdn_c_key"),   L * Hc_kv, Dk, 1e-6, nc);
     uint32_t rq = D("gdn_c_query"), rk = D("gdn_c_key");
     const uint32_t a_v = D("gdn_c_value");
     if (rep > 1) {
-        rpu_launch_tile_spm_kernel(D("gdn_c_query"), D("gdn_c_q_rep"), L * Hc_kv, 1, Dk, 1, rep, 1, nc);
-        rpu_launch_tile_spm_kernel(D("gdn_c_key"),   D("gdn_c_k_rep"), L * Hc_kv, 1, Dk, 1, rep, 1, nc);
-        rq = D("gdn_c_q_rep");
-        rk = D("gdn_c_k_rep");
+        rpu_launch_tile_spm_kernel(D("gdn_c_query"), q_rep_buf, L * Hc_kv, 1, Dk, 1, rep, 1, nc);
+        rpu_launch_tile_spm_kernel(D("gdn_c_key"),   k_rep_buf, L * Hc_kv, 1, Dk, 1, rep, 1, nc);
+        rq = q_rep_buf;
+        rk = k_rep_buf;
     }
 
     // Zero the pad rows [Lv:L] of the chunk-core inputs (route B: the last chunk's [valid:L] are pad
@@ -1064,7 +2232,7 @@ void Qwen3_5Model::build_gdn(int layer_idx, const ChunkInfo& chunk, bool decode)
         rpu_launch_fill_spm_kernel(D("gdn_c_g")    + (uint32_t)(Lv * vg_c * 2),    np * vg_c,    c10::Half(0.0f), nc);
     }
 
-    // ===== Phase 4: CHUNK CORE (M-gen) — N-major [N,Hc,C,*] =====
+    // ===== Phases 4-8: q/k/v/beta/g transpose — N-major [N,Hc,C,*] =====
     const int64_t HN = Hc * N, HL = Hc * L, CC = C * C;
     const float   qk_scale = 1.0f / std::sqrt((float)Dk);
     // N-major setup transpose: token-major [N,C,Hc,Dl] -> [N,Hc,C,Dl] (= permute(0,2,1,3)),
@@ -1079,32 +2247,53 @@ void Qwen3_5Model::build_gdn(int layer_idx, const ChunkInfo& chunk, bool decode)
                 out_base + (uint32_t)(ni * Hc * C  * Dl * 2),   // block ni: [Hc, C, Dl]
                 C, Hc, Dl, {1, 0, 2}, nc);
     };
-    permute_nmajor(rq,               D("gdn_c_q_h"),    Dk);
+    permute_nmajor(rq,               q_h_buf,             Dk);
     permute_nmajor(rk,               D("gdn_c_k_h"),    Dk);
     permute_nmajor(a_v,              D("gdn_c_v_h"),    Dv);
     permute_nmajor(D("gdn_c_beta"),  D("gdn_c_beta_h"), 1);
     permute_nmajor(D("gdn_c_g"),     D("gdn_c_g_h"),    1);
-    rpu_launch_eltwise_binary_scalar_spm_kernel(D("gdn_c_q_h"), c10::Half(qk_scale), D("gdn_c_q_h"), HL * Dk, ValuOpType::MUL);
-    rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel(D("gdn_c_beta_h"), D("gdn_c_k_h"), D("gdn_c_kbeta"), HL, Dk, c10::Half(1.0f), ValuOpType::MUL, false);
-    rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel(D("gdn_c_beta_h"), D("gdn_c_v_h"), D("gdn_c_vbeta"), HL, Dv, c10::Half(1.0f), ValuOpType::MUL, false);
+    // ===== Phases 9-12: q scale, beta*k, beta*v, cumsum =====
+    rpu_launch_eltwise_binary_scalar_spm_kernel(q_h_buf, c10::Half(qk_scale), q_h_buf, HL * Dk, ValuOpType::MUL, nc);
+    rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel(D("gdn_c_beta_h"), D("gdn_c_k_h"), D("gdn_c_kbeta"), HL, Dk, c10::Half(1.0f), ValuOpType::MUL, false, nc);
+    rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel(D("gdn_c_beta_h"), D("gdn_c_v_h"), D("gdn_c_v_h"), HL, Dv, c10::Half(1.0f), ValuOpType::MUL, false, nc);
     rpu_launch_cumsum_spm_kernel(D("gdn_c_g_h"), D("gdn_c_gcumsum"), D("gdn_c_ws"), HN, C, nc);
-    rpu_launch_fill_spm_kernel(D("gdn_c_decay"), HN * CC, c10::Half(0.0f), nc);
-    rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel(D("gdn_c_gcumsum"), D("gdn_c_decay"), D("gdn_c_decay"), HN * C, C, c10::Half(1.0f), ValuOpType::ADD, false);
-    rpu_launch_eltwise_binary_Bx1xC_BxNxC_spm_kernel(D("gdn_c_gcumsum"), D("gdn_c_decay"), D("gdn_c_decay"), HN, C, C, c10::Half(1.0f), ValuOpType::SUB, true);
-    rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(D("gdn_c_tril"), D("gdn_c_decay"), D("gdn_c_decay"), HN, CC, c10::Half(1.0f), ValuOpType::MUL, false);
-    rpu_launch_eltwise_unary_spm_kernel(D("gdn_c_decay"), D("gdn_c_decay"), HN * CC, ValuOpType::EXP, false, nc);
-    rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(D("gdn_c_tril"), D("gdn_c_decay"), D("gdn_c_decay"), HN, CC, c10::Half(1.0f), ValuOpType::MUL, false);
+
+    // ===== Phase 13: decay matrix =====
+    rpu_launch_fill_spm_kernel(decay_buf, HN * CC, c10::Half(0.0f), nc);
+    rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel(D("gdn_c_gcumsum"), decay_buf, decay_buf, HN * C, C, c10::Half(1.0f), ValuOpType::ADD, false, nc);
+    rpu_launch_eltwise_binary_Bx1xC_BxNxC_spm_kernel(D("gdn_c_gcumsum"), decay_buf, decay_buf, HN, C, C, c10::Half(1.0f), ValuOpType::SUB, true, nc);
+    rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(D("gdn_c_tril"), decay_buf, decay_buf, HN, CC, c10::Half(1.0f), ValuOpType::MUL, false, nc);
+    rpu_launch_eltwise_unary_spm_kernel(decay_buf, decay_buf, HN * CC, ValuOpType::EXP, false, nc);
+    rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(D("gdn_c_tril"), decay_buf, decay_buf, HN, CC, c10::Half(1.0f), ValuOpType::MUL, false, nc);
     rpu_launch_bmm_spm_kernel(D("gdn_c_kbeta"), D("gdn_c_k_h"), D("gdn_c_attn"), C, C, Dk, HN, nc, BmmMode::RowByRow);
-    rpu_launch_eltwise_binary_scalar_spm_kernel(D("gdn_c_attn"), c10::Half(-1.0f), D("gdn_c_attn"), HN * CC, ValuOpType::MUL);
-    rpu_launch_eltwise_binary_spm_kernel(D("gdn_c_attn"), D("gdn_c_decay"), D("gdn_c_attn"), HN * CC, ValuOpType::MUL, c10::Half(1.0f), nc);
-    rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(D("gdn_c_strict"), D("gdn_c_attn"), D("gdn_c_attn"), HN, CC, c10::Half(1.0f), ValuOpType::MUL, false);
+    rpu_launch_eltwise_binary_scalar_spm_kernel(D("gdn_c_attn"), c10::Half(-1.0f), D("gdn_c_attn"), HN * CC, ValuOpType::MUL, nc);
+    rpu_launch_eltwise_binary_spm_kernel(D("gdn_c_attn"), decay_buf, D("gdn_c_attn"), HN * CC, ValuOpType::MUL, c10::Half(1.0f), nc);
+    rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(D("gdn_c_strict"), D("gdn_c_attn"), D("gdn_c_attn"), HN, CC, c10::Half(1.0f), ValuOpType::MUL, false, nc);
     rpu_launch_unit_tril_inv_spm_kernel(D("gdn_c_attn"), D("gdn_c_attn"), HN, nc);
-    rpu_launch_bmm_spm_kernel(D("gdn_c_attn"), D("gdn_c_vbeta"), D("gdn_c_vnew"), C, Dv, C, HN, nc);
+    rpu_launch_bmm_spm_kernel(D("gdn_c_attn"), D("gdn_c_v_h"), D("gdn_c_vnew"), C, Dv, C, HN, nc);
+
+    // ===== Phase 15: recurrent-state coefficients =====
     rpu_launch_eltwise_unary_spm_kernel(D("gdn_c_gcumsum"), D("gdn_c_gexp"), HL, ValuOpType::EXP, false, nc);
-    rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel(D("gdn_c_gexp"), D("gdn_c_kbeta"), D("gdn_c_kbeta"), HL, Dk, c10::Half(1.0f), ValuOpType::MUL, false);
+    rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel(D("gdn_c_gexp"), D("gdn_c_kbeta"), D("gdn_c_kbeta"), HL, Dk, c10::Half(1.0f), ValuOpType::MUL, false, nc);
     rpu_launch_bmm_spm_kernel(D("gdn_c_attn"), D("gdn_c_kbeta"), D("gdn_c_kcd"), C, Dk, C, HN, nc);
 
-    // ===== Phase 5: per-chunk recurrent loop. gdn_state [Hc,Dk,Dv] carried across i. =====
+    // ===== Phase 16: per-chunk recurrent loop. gdn_state [Hc,Dk,Dv] carried across i. =====
+    // The state is consumed only by this loop, so load or initialize it after
+    // the earlier phase scratch is dead.
+    if (initial_prefill_chunk) {
+        rpu_launch_fill_spm_kernel(
+            D("gdn_state"), Hc * Dk * Dv, c10::Half(0.0f), nc);
+    } else {
+        consume_manifest_route(
+            FmbRouteFamily::MUTABLE_DMA,
+            QWEN35_TEXT_GDN_STATE_PREFILL_LOAD_DMA_SITE,
+            qwen35_text_dma_route(
+                Qwen35TextMutableDmaRoute::DDR_SCATTER_TO_SPM),
+            chunk.idx);
+        rpu_launch_ddr_scatter_spm_dma_mutable(
+            &gdn_state_live_addr_[layer_idx], 0, Hc * Dk * Dv,
+            Hc * Dk * Dv * 2, D("gdn_state"), nc);
+    }
     // N-major layout ([N,Hc,C,*]) makes each sub-chunk i a CONTIGUOUS [Hc,C,*] block, so the
     // per-chunk operands are pure base+offset views into the phase-4 buffers — no slice/insert.
     // a_qc/a_kc/a_vc/a_gexpc are mutated in place below, but each gdn_c_*[i] region is touched
@@ -1125,21 +2314,31 @@ void Qwen3_5Model::build_gdn(int layer_idx, const ChunkInfo& chunk, bool decode)
         rpu_launch_eltwise_binary_spm_kernel(D("gdn_c_attnc"), a_decc, D("gdn_c_attnc"), Hc * C * C, ValuOpType::MUL, c10::Half(1.0f), nc);
         rpu_launch_bmm_spm_kernel(a_kcdc, D("gdn_state"), a_outc, C, Dv, Dk, Hc, nc);
         rpu_launch_eltwise_binary_spm_kernel(a_vc, a_outc, a_vc, Hc * C * Dv, ValuOpType::SUB, c10::Half(1.0f), nc);
-        rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel(a_gexpc, a_qc, a_qc, Hc * C, Dk, c10::Half(1.0f), ValuOpType::MUL, false);
+        rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel(a_gexpc, a_qc, a_qc, Hc * C, Dk, c10::Half(1.0f), ValuOpType::MUL, false, nc);
         rpu_launch_bmm_spm_kernel(a_qc, D("gdn_state"), a_outc, C, Dv, Dk, Hc, nc);
-        rpu_launch_bmm_spm_kernel(D("gdn_c_attnc"), a_vc, D("gdn_c_recout"), C, Dv, C, Hc, nc);
-        rpu_launch_eltwise_binary_spm_kernel(a_outc, D("gdn_c_recout"), a_outc, Hc * C * Dv, ValuOpType::ADD, c10::Half(1.0f), nc);
+        rpu_launch_bmm_spm_kernel(D("gdn_c_attnc"), a_vc, D("gdn_c_loop_b"), C, Dv, C, Hc, nc);
+        rpu_launch_eltwise_binary_spm_kernel(a_outc, D("gdn_c_loop_b"), a_outc, Hc * C * Dv, ValuOpType::ADD, c10::Half(1.0f), nc);
         slice_pc(a_gexpc, D("gdn_c_glast"), sh_gl, sl_gl, bC);
-        rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel(D("gdn_c_glast"), D("gdn_state"), D("gdn_state"), Hc, Dk * Dv, c10::Half(1.0f), ValuOpType::MUL, false);
+        rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel(D("gdn_c_glast"), D("gdn_state"), D("gdn_state"), Hc, Dk * Dv, c10::Half(1.0f), ValuOpType::MUL, false, nc);
         slice_pc(a_gc, D("gdn_c_glast"), sh_gl, sl_gl, bC);
-        rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel(D("gdn_c_glast"), a_gc, a_gexpc, Hc, C, c10::Half(1.0f), ValuOpType::SUB, false);
+        rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel(D("gdn_c_glast"), a_gc, a_gexpc, Hc, C, c10::Half(1.0f), ValuOpType::SUB, false, nc);
         rpu_launch_eltwise_unary_spm_kernel(a_gexpc, a_gexpc, Hc * C, ValuOpType::EXP, false, nc);
-        rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel(a_gexpc, a_kc, a_kc, Hc * C, Dk, c10::Half(1.0f), ValuOpType::MUL, false);
-        rpu_launch_bmm_spm_kernel(a_kc, a_vc, D("gdn_c_recstate"), Dk, Dv, C, Hc, nc, BmmMode::ColByCol);
-        rpu_launch_eltwise_binary_spm_kernel(D("gdn_state"), D("gdn_c_recstate"), D("gdn_state"), Hc * Dk * Dv, ValuOpType::ADD, c10::Half(1.0f), nc);
+        rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel(a_gexpc, a_kc, a_kc, Hc * C, Dk, c10::Half(1.0f), ValuOpType::MUL, false, nc);
+        rpu_launch_bmm_spm_kernel(a_kc, a_vc, D("gdn_c_loop_b"), Dk, Dv, C, Hc, nc, BmmMode::ColByCol);
+        rpu_launch_eltwise_binary_spm_kernel(D("gdn_state"), D("gdn_c_loop_b"), D("gdn_state"), Hc * Dk * Dv, ValuOpType::ADD, c10::Half(1.0f), nc);
         // a_outc == gdn_c_coreout[i] (written in place above) — no insert needed.
     }
-    // final transpose: core_attn_out N-major [N,Hc,C,Dv] -> token-major [L,Hc,Dv] (= [N,C,Hc,Dv]),
+    consume_manifest_route(
+        FmbRouteFamily::MUTABLE_DMA,
+        QWEN35_TEXT_GDN_STATE_PREFILL_STORE_DMA_SITE,
+        qwen35_text_dma_route(
+            Qwen35TextMutableDmaRoute::SPM_SCATTER_TO_DDR),
+        chunk.idx);
+    rpu_launch_spm_scatter_ddr_dma_mutable(
+        D("gdn_state"), &gdn_state_live_addr_[layer_idx], 0,
+        Hc * Dk * Dv, Hc * Dk * Dv * 2, nc);
+    // ===== Phase 17: final transpose =====
+    // core_attn_out N-major [N,Hc,C,Dv] -> token-major [L,Hc,Dv] (= [N,C,Hc,Dv]),
     // N independent 3D {1,0,2} transposes ([Hc,C,Dv]->[C,Hc,Dv]), one per sub-chunk (no 4D permute).
     // Pad rows [Lv:L] carry zeroed output; the adapter slices them off the logits.
     for (int64_t ni = 0; ni < N; ++ni)
@@ -1149,34 +2348,63 @@ void Qwen3_5Model::build_gdn(int layer_idx, const ChunkInfo& chunk, bool decode)
             Hc, C, Dv, {1, 0, 2}, nc);
     }  // end prefill (chunked delta-rule)
 
-    // ── Phase 6 tail (SHARED decode + prefill): RMSNormGated (norm-then-gate) + out_proj
-    //    (row-parallel) + recurrent-state writeback + AllReduce residual → residual2.
-    //    The reference RMSNormGated contract is norm-THEN-gate
-    //    ([[qwen35-rmsnormgated-norm-then-gate]]): rms_norm the raw core_attn_out over Dv · norm_w,
-    //    THEN · silu(z). core_attn_out is token-major [L,Hc,Dv] per core → M = L*Hc, N = Dv;
-    //    decode's gdn_out [Hc,Dv] is already token-major (L=1). ──
+
     const uint32_t out_buf   = decode ? D("gdn_out")   : D("gdn_c_out_tok");
-    const uint32_t gated_buf = decode ? D("gdn_gated") : D("gdn_c_gated");
-    const uint32_t z_buf     = decode ? D("gdn_z")     : D("gdn_c_z");
+    const uint32_t gated_buf = decode ? D("gdn_gated") : out_buf;
+    const uint32_t z_buf     = z_out;
     const uint32_t m_buf     = decode ? D("gdn_m")     : D("gdn_c_m");
-    rpu_launch_rmsnorm_spm_kernel(out_buf, gated_buf, D("gdn_normw"), L * Hc, Dv, 1e-6);
-    // gate = silu(z) · normed as TWO SEPARATE ops (EltwiseUnary silu(z) in place
-    // followed by EltwiseBinary mul). The fused llama_silu_mul operator applies
-    // SILU to the other operand and therefore does not implement this contract.
-    rpu_launch_eltwise_unary_spm_kernel(z_buf, z_buf, L * lval, ValuOpType::SILU, false, nc);
-    rpu_launch_eltwise_binary_spm_kernel(z_buf, gated_buf, gated_buf, L * lval, ValuOpType::MUL, c10::Half(1.0f), nc);
+    if (decode) {
+        rpu_launch_qwen3_5_rms_norm_gated(
+            out_buf, z_buf, D("gdn_normw"), gated_buf, Hc, Dv, 1e-6, nc);
+    } else {
+        rpu_launch_rmsnorm_spm_kernel(
+            out_buf, gated_buf, D("gdn_normw"), L * Hc, Dv, 1e-6, RpuRmsNormSpmRoute::BASE, nc);
+        // Keep the proven prefill formula: gate = silu(z) * normed.
+        rpu_launch_eltwise_unary_spm_kernel(
+            z_buf, z_buf, L * lval, ValuOpType::SILU, false, nc);
+        rpu_launch_eltwise_binary_spm_kernel(
+            z_buf, gated_buf, gated_buf, L * lval, ValuOpType::MUL,
+            c10::Half(1.0f), nc);
+    }
     // out_proj (row-parallel): gated [L,value_dim] @ gdn_out_w → per-core partial m [L,hidden].
     // FULL K = value_dim (launcher splits local_k = value_dim/tp). See [[emitter-local-vs-graphop-full-dims]].
-    launch_linear(gated_buf, lw.gdn_out_w, m_buf, L, hidden, value_dim, 0, nc);
-    // state + conv-window writeback (SHARED decode + prefill): both leave the updated recurrent
-    // state in gdn_state and the new conv carry in gdn_cs (prefill's cso is written into gdn_cs at
-    // the path offsets), so one pair of scatters carries BOTH states across chunks and into decode.
-    rpu_launch_spm_scatter_ddr_dma_mutable(D("gdn_state"), &gdn_state_live_addr_[layer_idx], 0, Hc * Dk * Dv, Hc * Dk * Dv * 2, nc);
-    rpu_launch_spm_scatter_ddr_dma_mutable(D("gdn_cs"),    &conv_state_live_addr_[layer_idx], 0, Kc * lconv,    Kc * lconv * 2,    nc);
+    if (nc != num_cores()) {
+        consume_manifest_route(
+            FmbRouteFamily::ALL_REDUCE,
+            QWEN35_TEXT_GDN_PREPARE_ALL_REDUCE_SITE,
+            static_cast<int64_t>(Qwen35TextAllReduceRoute::PREPARE_RING_INPUT),
+            chunk.idx);
+        rpu_prepare_ring_all_reduce_input(m_buf, L, hidden, nc, num_cores());
+    }
+    launch_linear(chunk.idx,
+                  gated_buf, lw.gdn_out_w, m_buf, L, hidden, value_dim,
+                  0, nc, 0, lw.gdn_out_ws);
+    // Prefill persisted both states before their SPM slots were reused. Decode
+    // keeps them live to this shared tail.
+    if (decode) {
+        consume_manifest_route(
+            FmbRouteFamily::MUTABLE_DMA,
+            QWEN35_TEXT_GDN_STATE_DECODE_STORE_DMA_SITE,
+            qwen35_text_dma_route(
+                Qwen35TextMutableDmaRoute::SPM_SCATTER_TO_DDR),
+            chunk.idx);
+        rpu_launch_spm_scatter_ddr_dma_mutable(D("gdn_state"), &gdn_state_live_addr_[layer_idx], 0, Hc * Dk * Dv, Hc * Dk * Dv * 2, nc);
+        consume_manifest_route(
+            FmbRouteFamily::MUTABLE_DMA,
+            QWEN35_TEXT_GDN_CONV_DECODE_STORE_DMA_SITE,
+            qwen35_text_dma_route(
+                Qwen35TextMutableDmaRoute::SPM_SCATTER_TO_DDR),
+            chunk.idx);
+        rpu_launch_spm_scatter_ddr_dma_mutable(D("gdn_cs"),    &conv_state_live_addr_[layer_idx], 0, Kc * lconv,    Kc * lconv * 2,    nc);
+    }
     // AllReduce the out_proj partials + h_in residual → post-mixer stream (== HF `mixer_out`).
+    consume_manifest_route(
+        FmbRouteFamily::ALL_REDUCE,
+        QWEN35_TEXT_GDN_ALL_REDUCE_SITE,
+        text_ring_route(L, hidden), chunk.idx);
     rpu_launch_all_reduce_sum_residual_kernel(
-        m_buf, addr(0, "residual1"),
-        D("residual2"), L, hidden);
+        m_buf, layer_input_residual_addr(layer_idx, chunk),
+        D("residual2"), L, hidden, nc, num_cores());
     return;
 }
 
@@ -1210,17 +2438,54 @@ void Qwen3_5Model::emit_mlp_and_output(int layer_idx, const ChunkInfo& chunk) {
     } else {
         rpu_launch_rmsnorm_spm_kernel(
             addr(0, "input_norm"), addr(0, "residual1"),
-            layer_addr(layer_idx, 0, "post_norm_w"), seq_len, h, eps_);
+            layer_addr(layer_idx, 0, "post_norm_w"), seq_len, h, eps_, RpuRmsNormSpmRoute::BASE, num_cores());
     }
-    // MLP (SwiGLU) + reduce + residual → residual1.
-    emit_mlp_pipeline(lw.gate_w, lw.up_w, lw.down_w, seq_len,
-                      use_silu_ ? ActivationKind::SILU : ActivationKind::NONE,
-                      {}, {}, {},
-                      /*gate_nvfp4_ts_addr=*/0,
-                      /*up_nvfp4_ts_addr=*/0,
-                      /*down_nvfp4_ts_addr=*/0,
-                      /*nvfp4_layer_id=*/0,
-                      /*acc32=*/linear_acc32_);
+    // MLP (SwiGLU) + reduce + residual → residual1. Standard text can reuse
+    // residual1 for gate*up; action keeps that product in gate so residual1
+    // retains the established adaptive-normalization lifetime.
+    const int64_t mlp_elems =
+        seq_len * (intermediate_size() / mlp_tp());
+    const uint32_t product_buf =
+        action_mode_ ? addr(0, "gate") : addr(0, "residual1");
+    const uint32_t residual_buf =
+        action_mode_ ? addr(0, "residual2") : addr(0, "input_norm");
+    const at::Tensor gate_scale = action_mode_ ? at::Tensor{} : lw.gate_ws;
+    const at::Tensor up_scale = action_mode_ ? at::Tensor{} : lw.up_ws;
+    const at::Tensor down_scale = action_mode_ ? at::Tensor{} : lw.down_ws;
+    launch_linear(
+        chunk.idx,
+        addr(0, "residual1"), lw.gate_w, addr(0, "gate"),
+        seq_len, intermediate_size(), h, 1, mlp_tp(), 0, gate_scale);
+    if (use_silu_) {
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::ACTIVATION, QWEN35_TEXT_MLP_SILU_SITE,
+                /*resolved_selector=*/1, /*resolved_flags=*/0,
+                {use_silu_ ? 1 : 0, mlp_elems,
+                 static_cast<int64_t>(ValuOpType::SILU)}, chunk.idx);
+        }
+        rpu_launch_eltwise_unary_spm_kernel(
+            addr(0, "gate"), addr(0, "gate"), mlp_elems,
+            ValuOpType::SILU, false, mlp_tp());
+    }
+    launch_linear(
+        chunk.idx,
+        addr(0, "residual1"), lw.up_w, addr(0, "up"),
+        seq_len, intermediate_size(), h, 1, mlp_tp(), 0, up_scale);
+    rpu_launch_eltwise_binary_spm_kernel(
+        addr(0, "gate"), addr(0, "up"), product_buf,
+        mlp_elems, ValuOpType::MUL, c10::Half(1.0), mlp_tp());
+    launch_linear(
+        chunk.idx,
+        product_buf, lw.down_w, addr(0, "down"),
+        seq_len, h, intermediate_size(), 0, mlp_tp(), 0, down_scale);
+    consume_manifest_route(
+        FmbRouteFamily::ALL_REDUCE,
+        QWEN35_TEXT_MLP_ALL_REDUCE_SITE,
+        text_ring_route(seq_len, h), chunk.idx);
+    rpu_launch_all_reduce_sum_residual_kernel(
+        addr(0, "down"), residual_buf, addr(0, "residual1"),
+        seq_len, h, mlp_tp(), num_cores());
     if (action_mode_) {
         apply_adaptive_residual_gate(
             addr(0, "residual1"), addr(0, "residual2"), chunk);
@@ -1245,7 +2510,7 @@ void Qwen3_5Model::emit_mlp_and_output(int layer_idx, const ChunkInfo& chunk) {
         } else {
             rpu_launch_rmsnorm_spm_kernel(
                 addr(0, "residual1"), addr(0, "residual1"),
-                addr(0, "final_norm_w"), seq_len, h, eps_);
+                addr(0, "final_norm_w"), seq_len, h, eps_, RpuRmsNormSpmRoute::BASE, num_cores());
         }
     }
     // Export the post-layer residual stream at physical prefill length. For
@@ -1269,7 +2534,8 @@ void Qwen3_5Model::emit_mlp_and_output(int layer_idx, const ChunkInfo& chunk) {
 // ── declare_buffers: union of full-attention and GDN buffer sets; per-layer
 //    norm preloads are guarded so empty attention slots on GDN layers are not
 //    read. ───────────────────────────────────────────────────────────────────
-std::vector<BufferDecl> Qwen3_5Model::declare_buffers(const LayoutContext& ctx) {
+std::vector<BufferDecl> Qwen3_5Model::declare_legacy_buffers(
+    const LayoutContext& ctx) const {
     int64_t cs = ctx.chunk_size;
     int64_t h  = hidden_size();
     int64_t nq = num_q_heads();
@@ -1278,9 +2544,8 @@ std::vector<BufferDecl> Qwen3_5Model::declare_buffers(const LayoutContext& ctx) 
     int64_t is_ = intermediate_size();
     int64_t nl  = num_layers();
 
-    // num_kv_heads() is the adapter-expanded effective KV width, so tp resolves
-    // to NUM_CORES and each core owns one whole effective KV head. q/k/v/output/
-    // attn_gate are sized per active core; MLP also spans NUM_CORES.
+    // Attention buffers use the adapter-expanded effective KV width and the
+    // selected attention TP. MLP buffers use their independent selected TP.
     int64_t tp = attn_tp();
     int64_t local_q  = nq / tp;
     int64_t local_kv = nkv * hd / tp;
@@ -1288,29 +2553,61 @@ std::vector<BufferDecl> Qwen3_5Model::declare_buffers(const LayoutContext& ctx) 
 
     int64_t res = A(cs * h * DWIDTH);
     int64_t q   = A(cs * local_q * hd * DWIDTH);
-    int64_t kv  = A(cs * local_kv * DWIDTH);
-    int64_t mlp = A(cs * (is_ / NUM_CORES) * DWIDTH);
+    const int64_t raw_kv_rows = Align(cs, static_cast<int64_t>(16));
+    int64_t kv  = A((ctx.attention_policy ==
+                         AttentionExecutionPolicy::SPM_KV_BY_MHA
+                     ? raw_kv_rows : cs) * local_kv * DWIDTH);
+    int64_t mlp = A(cs * (is_ / mlp_tp()) * DWIDTH);
+    int64_t mlp_down = res;
+    int64_t oproj = res;
     int64_t nw  = A(h * DWIDTH);
     int64_t hnw = A(hd * DWIDTH);
     int64_t tmp = A(sdpa_compute_tmp_v16_size(make_sdpa_config(), cs) * 32);
+    if (ctx.attention_policy ==
+        AttentionExecutionPolicy::SPM_KV_BY_MHA) {
+        tmp = std::max(tmp, A(raw_kv_rows * local_kv * DWIDTH));
+    }
 
+    const char* narrow_input_alias = action_mode_ ? nullptr : "input_norm";
+    if (!action_mode_) {
+        TORCH_CHECK(q <= res,
+                    "Qwen3.5 attention output exceeds input_norm alias: output=",
+                    q, ", input_norm=", res);
+    }
+
+    // GDN occupies phases 1..20, full attention 22..27 and the shared MLP
+    // 30..31. The paths are mutually exclusive by layer, so disjoint local
+    // phase ranges let main's LayerWide planner reuse their scratch without
+    // abusing KV_FIRST-only BufferScope values.
     std::vector<BufferDecl> decls;
-    decls.push_back({"residual1",  res,  1, 8, StorageClass::Temp, 0, nullptr});
-    decls.push_back({"input_norm", res,  1, 8, StorageClass::Temp, 0, nullptr});
+    decls.push_back({"residual1",  res,  1, 31, StorageClass::Temp, 0, nullptr});
+    decls.push_back({"input_norm", res,  1, 31, StorageClass::Temp, 0, nullptr});
     decls.push_back({"residual2",  0,    0, 0, StorageClass::Temp, 0, "input_norm"});
-    decls.push_back({"q",          q,    2, 5, StorageClass::Temp, 0, nullptr});
-    decls.push_back({"k",          kv,   2, 4, StorageClass::Temp, 0, nullptr});
-    decls.push_back({"v",          kv,   2, 4, StorageClass::Temp, 0, nullptr});
-    decls.push_back({"output",     q,    3, 5, StorageClass::Temp, 0, nullptr});
-    decls.push_back({"attn_gate",  q,    2, 5, StorageClass::Temp, 0, nullptr});
-    decls.push_back({"oproj",      res,  5, 5, StorageClass::Temp, 0, nullptr});
-    decls.push_back({"sdpa_tmp",   tmp,  5, 5, StorageClass::Temp, 0, nullptr});
-    decls.push_back({"gate",       mlp,  7, 8, StorageClass::Temp, 0, nullptr});
-    decls.push_back({"up",         mlp,  7, 7, StorageClass::Temp, 0, nullptr});
-    decls.push_back({"down",       res,  7, 8, StorageClass::Temp, 0, nullptr});
+    decls.push_back({"q",          q,    22, 25, StorageClass::Temp, 0, nullptr});
+    const int attention_input_end = ctx.attention_policy ==
+            AttentionExecutionPolicy::SPM_KV_BY_MHA
+        ? 25 : 24;
+    decls.push_back({"k",          kv,   22, attention_input_end,
+                     StorageClass::Temp, 0, nullptr});
+    decls.push_back({"v",          kv,   22, attention_input_end,
+                     StorageClass::Temp, 0, nullptr});
+    decls.push_back({"output",     q,    25, 27, StorageClass::Temp, 0, narrow_input_alias});
+    decls.push_back({"attn_gate",  q,    22, 26, StorageClass::Temp, 0, nullptr});
+    decls.push_back({"oproj",      oproj, 27, 27, StorageClass::Temp, 0, nullptr});
+    decls.push_back({"sdpa_tmp",   tmp,  25, 25, StorageClass::Temp, 0, nullptr});
+    // Text mode consumes gate at phase 30 and writes the elementwise product
+    // into residual1. Action mode keeps the generic FMB path, whose phase-31
+    // down projection still reads the product from gate.
+    decls.push_back({"gate",       mlp,  30, action_mode_ ? 31 : 30,
+                     StorageClass::Temp, 0, nullptr});
+    decls.push_back({"up",         mlp,  30, 30, StorageClass::Temp, 0, nullptr});
+    decls.push_back({"down",       mlp_down, 31, 31, StorageClass::Temp, 0, nullptr});
     if (action_mode_) {
         decls.push_back({
-            "adaptive_mod", A(3 * h * DWIDTH), 1, 8,
+            // RTC carries clean/noisy AdaLN triples side-by-side. Reserve both
+            // halves for every action graph so toggling RTC never changes the
+            // SPM manifest; non-RTC loads and reads only the first half.
+            "adaptive_mod", A(6 * h * DWIDTH), 1, 31,
             StorageClass::Temp, 0, nullptr});
     }
     if (action_input_w_.defined()) {
@@ -1332,6 +2629,14 @@ std::vector<BufferDecl> Qwen3_5Model::declare_buffers(const LayoutContext& ctx) 
             d.size = A(h * DWIDTH);
             d.storage = StorageClass::Persistent;
             d.preload_callback = [this](FusedModelBase&, int, uint32_t core0_addr) {
+                if (this->ctx().has_complete_physical_manifest()) {
+                    this->ctx().consume_physical_route(
+                        FmbRouteFamily::MUTABLE_DMA,
+                        QWEN35_TEXT_ACTION_INPUT_BIAS_PRELOAD_SITE,
+                        qwen35_text_dma_route(
+                            Qwen35TextMutableDmaRoute::DDR_BROADCAST_TO_SPM),
+                        /*resolved_flags=*/0, {hidden_size(), 1});
+                }
                 rpu_launch_ddr_broadcast_spm_dma(
                     action_input_b_.data_ptr<c10::Half>(), hidden_size(),
                     core0_addr, /*num_cores=*/1);
@@ -1344,6 +2649,14 @@ std::vector<BufferDecl> Qwen3_5Model::declare_buffers(const LayoutContext& ctx) 
             d.size = A(action_dim_pad_ * DWIDTH);
             d.storage = StorageClass::Persistent;
             d.preload_callback = [this](FusedModelBase&, int, uint32_t core0_addr) {
+                if (this->ctx().has_complete_physical_manifest()) {
+                    this->ctx().consume_physical_route(
+                        FmbRouteFamily::MUTABLE_DMA,
+                        QWEN35_TEXT_ACTION_OUTPUT_BIAS_PRELOAD_SITE,
+                        qwen35_text_dma_route(
+                            Qwen35TextMutableDmaRoute::DDR_BROADCAST_TO_SPM),
+                        /*resolved_flags=*/0, {action_dim_pad_, 1});
+                }
                 rpu_launch_ddr_broadcast_spm_dma(
                     action_output_b_.data_ptr<c10::Half>(), action_dim_pad_,
                     core0_addr, /*num_cores=*/1);
@@ -1362,7 +2675,7 @@ std::vector<BufferDecl> Qwen3_5Model::declare_buffers(const LayoutContext& ctx) 
         d.preload_callback = [this](FusedModelBase&, int L, uint32_t core0_addr) {
             rpu_launch_ddr_broadcast_spm_dma(
                 layer_weights_[L].input_norm_w.data_ptr<c10::Half>(),
-                hidden_size(), core0_addr);
+                hidden_size(), core0_addr, num_cores());
         };
         decls.push_back(d);
     }
@@ -1374,7 +2687,7 @@ std::vector<BufferDecl> Qwen3_5Model::declare_buffers(const LayoutContext& ctx) 
             // both full and GDN layers do the standard post_norm + MLP half
             rpu_launch_ddr_broadcast_spm_dma(
                 layer_weights_[L].post_norm_w.data_ptr<c10::Half>(),
-                hidden_size(), core0_addr);
+                hidden_size(), core0_addr, num_cores());
         };
         decls.push_back(d);
     }
@@ -1385,9 +2698,18 @@ std::vector<BufferDecl> Qwen3_5Model::declare_buffers(const LayoutContext& ctx) 
             d.storage = StorageClass::PersistentPerLayer; d.per_layer = nl;
             d.preload_callback = [this](FusedModelBase&, int L, uint32_t core0_addr) {
                 if (!layer_is_full_[L]) return;
+                if (this->ctx().has_complete_physical_manifest()) {
+                    this->ctx().consume_physical_route(
+                        FmbRouteFamily::MUTABLE_DMA,
+                        QWEN35_TEXT_Q_NORM_PRELOAD_SITE,
+                        qwen35_text_dma_route(
+                            Qwen35TextMutableDmaRoute::DDR_BROADCAST_TO_SPM),
+                        /*resolved_flags=*/0,
+                        {L, layer_is_full_[L] ? 1 : 0, head_dim(), 1}, L);
+                }
                 rpu_launch_ddr_broadcast_spm_dma(
                     layer_weights_[L].q_norm_w.data_ptr<c10::Half>(),
-                    head_dim(), core0_addr);
+                    head_dim(), core0_addr, num_cores() == 8 ? NUM_CORES : attn_tp());
             };
             decls.push_back(d);
         }
@@ -1397,9 +2719,18 @@ std::vector<BufferDecl> Qwen3_5Model::declare_buffers(const LayoutContext& ctx) 
             d.storage = StorageClass::PersistentPerLayer; d.per_layer = nl;
             d.preload_callback = [this](FusedModelBase&, int L, uint32_t core0_addr) {
                 if (!layer_is_full_[L]) return;
+                if (this->ctx().has_complete_physical_manifest()) {
+                    this->ctx().consume_physical_route(
+                        FmbRouteFamily::MUTABLE_DMA,
+                        QWEN35_TEXT_K_NORM_PRELOAD_SITE,
+                        qwen35_text_dma_route(
+                            Qwen35TextMutableDmaRoute::DDR_BROADCAST_TO_SPM),
+                        /*resolved_flags=*/0,
+                        {L, layer_is_full_[L] ? 1 : 0, head_dim(), 1}, L);
+                }
                 rpu_launch_ddr_broadcast_spm_dma(
                     layer_weights_[L].k_norm_w.data_ptr<c10::Half>(),
-                    head_dim(), core0_addr);
+                    head_dim(), core0_addr, num_cores() == 8 ? NUM_CORES : attn_tp());
             };
             decls.push_back(d);
         }
@@ -1410,7 +2741,7 @@ std::vector<BufferDecl> Qwen3_5Model::declare_buffers(const LayoutContext& ctx) 
         d.storage = StorageClass::Persistent; d.per_layer = 0;
         d.preload_callback = [this](FusedModelBase&, int, uint32_t core0_addr) {
             rpu_launch_ddr_broadcast_spm_dma(
-                final_norm_w_.data_ptr<c10::Half>(), hidden_size(), core0_addr);
+                final_norm_w_.data_ptr<c10::Half>(), hidden_size(), core0_addr, num_cores());
         };
         decls.push_back(d);
     }
@@ -1421,93 +2752,206 @@ std::vector<BufferDecl> Qwen3_5Model::declare_buffers(const LayoutContext& ctx) 
     if (has_gdn_) {
         const int64_t H = gdn_nvh_, Dk = gdn_dk_, Dv = gdn_dv_;
         const int64_t conv_dim = gdn_conv_dim_, Kc = gdn_kc_, hidden = hidden_size();
-        const int     nc = NUM_CORES;
+        const int     nc = gdn_tp();
         const int64_t Hc = H / nc, lconv = conv_dim / nc, lval = (H * Dv) / nc;
         const int64_t nkh = (conv_dim - H * Dv) / (2 * Dk), lkey = (nkh * Dk) / nc;
         const int64_t n_bg = ((Hc + 15) / 16) * 16, hist = Kc - 1;
+        const int64_t scalar_slots = qwen35_gdn_scalar_slots(H, nc);
         const int64_t CS = std::max<int64_t>(64, ctx.chunk_size), N = CS / 64;
         auto A = [](int64_t bytes) -> int64_t { return Align(bytes, 256); };
         auto B = [&](const char* n, int64_t elems) -> BufferDecl {
             return {n, A(elems * DWIDTH), 1, 6, StorageClass::Temp, 0, nullptr};
         };
-        // BP: phase-tagged LayerWide Temp. This model is SEQUENTIAL, not KV_FIRST;
-        // the phase windows therefore share the layer-loop timeline with attention/MLP.
-        auto BP = [&](const char* n, int64_t elems, int p0, int p1) -> BufferDecl {
-            return {n, A(elems * DWIDTH), p0, p1, StorageClass::Temp, 0, nullptr};
+        auto BP = [&](const char* n, int64_t elems, int p0, int p1,
+                      const char* alias = nullptr) -> BufferDecl {
+            return {n, A(elems * DWIDTH), p0, p1,
+                    StorageClass::Temp, 0, alias};
         };
-        // Setup/state buffers are shared by both GDN modes.
-        decls.insert(decls.end(), {
-            B("gdn_normw", Dv), B("gdn_zero", Dk * Dv),
-            B("gdn_Al", 8), B("gdn_dt", 8),
-            B("gdn_state", Hc * Dk * Dv), B("gdn_cs", Kc * lconv),
-        });
-        // ── GDN DECODE (mixer) buffers — 8-core, Hc heads/core ──
+        // Small setup weights are shared by both GDN modes. In prefill the
+        // normalization weight is loaded during setup but consumed after the
+        // recurrent phase, so its declared lifetime must span phase 18. A_log
+        // and dt_bias are consumed while forming g at phase 3.
+        if (ctx.chunk_size < 64) {
+            decls.insert(decls.end(), {
+                B("gdn_normw", Dv),
+                B("gdn_Al", scalar_slots), B("gdn_dt", scalar_slots),
+            });
+        } else {
+            decls.insert(decls.end(), {
+                BP("gdn_normw", Dv, 1, 18),
+                BP("gdn_Al", scalar_slots, 1, 3), BP("gdn_dt", scalar_slots, 1, 3),
+            });
+        }
+        if (ctx.chunk_size < 64) {
+            decls.push_back(B("gdn_state", Hc * Dk * Dv));
+            decls.push_back(B("gdn_cs", Kc * lconv));
+            decls.push_back(B("gdn_zero", Dk * Dv));
+        }
+        // ── GDN DECODE (mixer) buffers — selected cores, Hc heads/core ──
         if (ctx.chunk_size < 64) {
             decls.insert(decls.end(), {
                 B("gdn_q", lkey), B("gdn_k", lkey), B("gdn_v", lval),       // per-path proj/conv input
                 B("gdn_qa", lkey), B("gdn_ka", lkey), B("gdn_va", lval),    // per-path post-conv (silu)
                 B("gdn_q_rep", Hc * Dk), B("gdn_k_rep", Hc * Dk),  // GQA-tiled q/k (Hc heads)
                 B("gdn_z", lval), B("gdn_a", n_bg), B("gdn_b", n_bg),
-                B("gdn_p", Hc * Dk * Dv), B("gdn_delta", Hc * Dv),
+                B("gdn_p", Hc * Dk * Dv), B("gdn_scratch", Hc * Dk * Dv),
+                B("gdn_delta", Hc * Dv),
                 B("gdn_gexp", Hc), B("gdn_beta", Hc), B("gdn_gs", Hc),
                 B("gdn_out", Hc * Dv), B("gdn_gated", lval), B("gdn_m", hidden),
             });
         }
-        // ── GDN PREFILL (chunk) buffers — phase-tagged for lifecycle aliasing. Phases:
-        //   1 proj | 2 conv+prep+tile | 3 transpose | 4 M-gen | 5 recurrent | 6 tail.
-        //   WITHOUT phases the L=256 set sums ~10MB and OOMs; WITH them peak ~3.7MB. The
+        if (ctx.chunk_size >= 64 && !action_mode_) {
+            const int64_t out_tok_bytes = A(CS * Hc * Dv * DWIDTH);
+            TORCH_CHECK(out_tok_bytes <= res,
+                        "Qwen3.5 GDN out_tok exceeds input_norm alias: out_tok=",
+                        out_tok_bytes, ", input_norm=", res);
+        }
+        // ── GDN PREFILL (chunk) buffers. Phase numbers follow the actual
+        // producer/consumer order so dead intermediates can share SPM. Declaration
+        // order among equal starts is intentional: the planner is stable first-fit.
+        // WITHOUT phases the L=256 set sums ~10MB and OOMs.
         //   build_gdn prefill branch MUST NOT read a buffer after its phase_end. ──
         if (ctx.chunk_size >= 64) decls.insert(decls.end(), {
-            // ---- phase 1: proj ----  (z spans to the tail; h_in stays in residual1;
-            // input_layernorm is at the layer level, reading shared "input_norm".)
-            BP("gdn_c_z",      CS * lval,   1, 6),
-            BP("gdn_c_b",      CS * n_bg,   1, 3), BP("gdn_c_a", CS * n_bg, 1, 3),
-            // ---- phase 2: per-path conv-prefill (pad = [hist+L, l*]) + silu ----
-            BP("gdn_c_q_pad", (hist + CS) * lkey, 1, 2), BP("gdn_c_k_pad", (hist + CS) * lkey, 1, 2),
+            BP("gdn_c_z",      CS * lval, 1, 19),
+            BP("gdn_c_a",      CS * n_bg, 1, 3),
             BP("gdn_c_v_pad", (hist + CS) * lval, 1, 2),
-            // conv carry (cso) is written straight into the LayerWide gdn_cs at path offsets — no
-            // separate gdn_c_*_cso buffers (shared with decode; tail scatters gdn_cs → cache).
-            BP("gdn_c_q_halo", 8 * hist * lkey, 2, 2), BP("gdn_c_k_halo", 8 * hist * lkey, 2, 2),
-            BP("gdn_c_v_halo", 8 * hist * lval, 2, 2),
-            BP("gdn_c_query", CS * lkey, 2, 4), BP("gdn_c_key", CS * lkey, 2, 4),
-            BP("gdn_c_value", CS * lval, 2, 4),
-            // ---- phase 3: prep (beta/g [L,vg_c=Hc]) + GQA tile ----
-            BP("gdn_c_beta",  CS * Hc,  3, 4), BP("gdn_c_g", CS * Hc, 3, 4),
-            BP("gdn_c_q_rep", CS * Hc * Dk, 3, 4), BP("gdn_c_k_rep", CS * Hc * Dk, 3, 4),
-            // ---- phase 3: token->N-major transpose [N,Hc,C,*] (== [Hc*CS,*] total) ----
-            BP("gdn_c_q_h",    Hc * CS * Dk, 3, 5), BP("gdn_c_k_h", Hc * CS * Dk, 3, 5),
-            BP("gdn_c_v_h",    Hc * CS * Dv, 3, 4),
-            BP("gdn_c_beta_h", Hc * CS, 3, 4), BP("gdn_c_g_h", Hc * CS, 3, 4),
-            // ---- phase 4: M-gen [N,Hc,C,*] ----
-            BP("gdn_c_kbeta",  Hc * CS * Dk, 4, 4), BP("gdn_c_vbeta", Hc * CS * Dv, 4, 4),
-            BP("gdn_c_gcumsum", Hc * CS,        4, 5),
-            BP("gdn_c_decay",   Hc * N * 64 * 64, 4, 5),
-            BP("gdn_c_attn",    Hc * N * 64 * 64, 4, 4),
-            BP("gdn_c_vnew",    Hc * CS * Dv,   4, 5),
-            BP("gdn_c_kcd",     Hc * CS * Dk,   4, 5),
-            BP("gdn_c_gexp",    Hc * CS,        4, 5),
-            // host-preloaded constant masks: tril (i>=j) + strict-lower (i>j). DMA'd in the
-            // phase-1 SETUP (build_gdn ~L385), but READ in phase 4 (decay/M tril-muls). Scope MUST
-            // span [1,4] — with a phase-4-only [4,4] scope the allocator lets phases 2-3 reuse this
-            // SPM region, clobbering the mask before phase 4 reads it (tril becomes ~±4 garbage →
-            // decay·tril = ±691 instead of the 0/1-masked diff). The M *= -1 and q *= qk_scale are
-            // separate binary_scalar ops.
-            BP("gdn_c_tril",   64 * 64, 1, 4), BP("gdn_c_strict", 64 * 64, 1, 4),
-            BP("gdn_c_ws",     Hc * CS, 4, 4),           // cumsum workspace
-            // ---- phase 5: recurrent per-chunk scratch [Hc,C,*] ----
-            // q/k/v/kcd/decay/g/gexp/out use offset views into phase-4 storage.
-            BP("gdn_c_attnc", Hc * 64 * 64, 5, 5),
-            BP("gdn_c_recout", Hc * 64 * Dv, 5, 5),
-            BP("gdn_c_recstate", Hc * Dk * Dv, 5, 5), BP("gdn_c_glast", Hc, 5, 5),
-            BP("gdn_c_coreout", Hc * CS * Dv, 5, 6),
-            // ---- phase 6: tail ----
-            BP("gdn_c_out_tok", CS * Hc * Dv, 6, 6),
-            BP("gdn_c_gated",   CS * lval,    6, 6),
-            BP("gdn_c_m",       CS * hidden,  6, 6),
+            BP("gdn_c_strict", 64 * 64, 1, 14),
+            BP("gdn_c_tril", 64 * 64, 1, 13),
+            BP("gdn_c_k_pad", (hist + CS) * lkey, 1, 2),
+            BP("gdn_c_b",      CS * n_bg, 1, 3),
+            BP("gdn_cs", Kc * lconv, 1, 2),
+            BP("gdn_c_q_pad", (hist + CS) * lkey, 1, 2),
+            BP("gdn_c_key", CS * lkey, 2, 5),
+            BP("gdn_c_query", CS * lkey, 2, 4),
+            BP("gdn_c_value", CS * lval, 2, 6),
+            BP("gdn_c_q_rep", CS * Hc * Dk, 3, 4),
+            BP("gdn_c_beta", CS * Hc, 3, 7),
+            BP("gdn_c_k_rep", CS * Hc * Dk, 3, 5),
+            BP("gdn_c_g", CS * Hc, 3, 8),
+            BP("gdn_c_q_h", Hc * CS * Dk, 4, 16),
+            BP("gdn_c_k_h", Hc * CS * Dk, 5, 16),
+            BP("gdn_c_v_h", Hc * CS * Dv, 6, 14),
+            BP("gdn_c_beta_h", Hc * CS, 7, 11),
+            BP("gdn_c_g_h", Hc * CS, 8, 12),
+            BP("gdn_c_kbeta", Hc * CS * Dk, 10, 15),
+            BP("gdn_c_gcumsum", Hc * CS, 12, 16),
+            BP("gdn_c_decay", Hc * N * 64 * 64, 13, 16),
+            BP("gdn_c_vnew", Hc * CS * Dv, 14, 16),
+            BP("gdn_c_attn", Hc * N * 64 * 64, 14, 15),
+            BP("gdn_c_kcd", Hc * CS * Dk, 15, 16),
+            BP("gdn_c_gexp", Hc * CS, 15, 16),
+            BP("gdn_c_ws", 64 * 17 * 16, 12, 12),
+            BP("gdn_c_coreout", Hc * CS * Dv, 16, 17),
+            BP("gdn_c_attnc", Hc * 64 * 64, 16, 16),
+            BP("gdn_state", Hc * Dk * Dv, 16, 16),
+            BP("gdn_c_glast", Hc, 16, 16),
+            BP("gdn_c_loop_b", Hc * Dk * Dv, 16, 16),
+            BP("gdn_c_out_tok", CS * Hc * Dv, 17, 20,
+               narrow_input_alias),
+            BP("gdn_c_m", CS * hidden, 20, 20),
         });
     }
     return decls;
 }
+
+std::vector<BufferDecl> Qwen3_5Model::declare_buffers(const LayoutContext& layout) {
+    auto declarations = declare_legacy_buffers(layout);
+    switch (layout.forward_operand_residency) {
+        case FmbForwardOperandResidency::UNSPECIFIED:
+        case FmbForwardOperandResidency::PER_LAYER:
+            return declarations;
+        case FmbForwardOperandResidency::FORWARD: {
+            TORCH_CHECK(!action_mode_ && !z2_bound_ && has_gdn_ &&
+                            layout.chunk_size >= 64,
+                        "Qwen3.5 text retained masks require GDN prefill");
+            const auto trial = detail::make_forward_spm_residency_candidate(
+                declarations, {"gdn_c_tril", "gdn_c_strict"});
+            TORCH_CHECK(trial.valid,
+                        "Qwen3.5 text mask declaration cannot retain operands");
+            return trial.declarations;
+        }
+    }
+    TORCH_CHECK(false, "Qwen3.5 text unknown forward operand residency");
+}
+
+FmbForwardOperandResidency Qwen3_5Model::gdn_mask_residency_for_candidate(
+    const LayoutContext& layout) const {
+    // A descriptor-bound layout is immutable: do not reselect from live free
+    // space during Graph reconstruction, allocation, or replay.
+    if (layout.forward_operand_residency !=
+            FmbForwardOperandResidency::UNSPECIFIED) {
+        TORCH_CHECK(layout.forward_operand_residency ==
+                        FmbForwardOperandResidency::PER_LAYER ||
+                    layout.forward_operand_residency ==
+                        FmbForwardOperandResidency::FORWARD,
+                    "Qwen3.5 text unknown bound mask residency");
+        return layout.forward_operand_residency;
+    }
+    if (action_mode_ || z2_bound_ || !has_gdn_ || layout.chunk_size < 64)
+        return FmbForwardOperandResidency::PER_LAYER;
+    const auto fits = [&](const LayoutContext& candidate_layout) {
+        const auto trial = detail::make_forward_spm_residency_candidate(
+            declare_legacy_buffers(candidate_layout),
+            {"gdn_c_tril", "gdn_c_strict"});
+        return trial.valid && declared_spm_layout_fits(trial.declarations);
+    };
+    if (!fits(layout)) return FmbForwardOperandResidency::PER_LAYER;
+    if (layout.planning_chunk_capacity > 0 &&
+            layout.planning_chunk_capacity != layout.chunk_size) {
+        auto capacity_layout = layout;
+        capacity_layout.chunk_size = layout.planning_chunk_capacity;
+        if (!fits(capacity_layout)) return FmbForwardOperandResidency::PER_LAYER;
+    }
+    return FmbForwardOperandResidency::FORWARD;
+}
+
+std::vector<int64_t> Qwen3_5Model::gdn_mask_schedule_arguments(
+    const FmbThreeStageChunkPlan& plan) const {
+    const auto first = std::find(layer_is_full_.begin(), layer_is_full_.end(), 0);
+    return {64, 64, 2,
+            static_cast<int64_t>(first - layer_is_full_.begin()),
+            static_cast<int64_t>(std::count(
+                layer_is_full_.begin(), layer_is_full_.end(), 0)),
+            plan.compute.plan.chunk_size,
+            static_cast<int64_t>(plan.compute.chunks.size()),
+            gdn_tp(), num_cores()};
+}
+
+
+FmbForwardOperandResidency Qwen3_5Model::physical_forward_operand_residency(
+    const FmbPhysicalExecutionManifest& manifest) const {
+    if (manifest.state != FmbPhysicalManifestState::COMPLETE ||
+            manifest.physical_length == 1 || !has_gdn_ || action_mode_ || z2_bound_)
+        return FmbForwardOperandResidency::UNSPECIFIED;
+    const auto route = std::find_if(
+        manifest.routes.begin(), manifest.routes.end(), [](const auto& row) {
+            return row.family == FmbRouteFamily::GRAPH_SCHEDULE &&
+                row.site_id == QWEN35_TEXT_GDN_MASK_RESIDENCY_SITE;
+        });
+    TORCH_CHECK(route != manifest.routes.end() && route->flags == 0 &&
+                    route->invocation == 0 &&
+                    (route->selector == 1 || route->selector == 2),
+                "Qwen3.5 text prefill requires its bound GDN mask schedule");
+    TORCH_CHECK(std::count_if(manifest.routes.begin(), manifest.routes.end(),
+                    [](const auto& row) {
+                        return row.family == FmbRouteFamily::GRAPH_SCHEDULE &&
+                            row.site_id == QWEN35_TEXT_GDN_MASK_RESIDENCY_SITE;
+                    }) == 1,
+                "Qwen3.5 text requires one GDN mask schedule");
+    const auto& args = route->arguments;
+    const auto first = std::find(layer_is_full_.begin(), layer_is_full_.end(), 0);
+    TORCH_CHECK(args.size() == 9 && args[0] == 64 && args[1] == 64 &&
+                    args[2] == 2 &&
+                    args[3] == first - layer_is_full_.begin() &&
+                    args[4] == std::count(layer_is_full_.begin(), layer_is_full_.end(), 0) &&
+                    args[5] >= 64 && args[5] % 64 == 0 &&
+                    args[6] == CeilDiv(manifest.physical_length, args[5]) &&
+                    args[7] == gdn_tp() && args[8] == num_cores(),
+                "Qwen3.5 text GDN mask geometry differs from its owner");
+    return route->selector == 2 ? FmbForwardOperandResidency::FORWARD
+                                : FmbForwardOperandResidency::PER_LAYER;
+}
+
 
 
 ModelStaticConfig Qwen3_5Model::static_config() {
@@ -1529,6 +2973,9 @@ ModelDynamicConfig Qwen3_5Model::dynamic_config(const ChunkPlan& /*plan*/) {
     ModelDynamicConfig cfg;
     cfg.chunk_mode     = ChunkMode::SEQUENTIAL;
     cfg.inter_layer_io = InterLayerIO::AUTO;
+    // COMPLETE per-site routes decide between the bounded P0 single-chunk
+    // raw-SPM handoff and explicit DDR_REQUIRED fallbacks.
+    cfg.attention_policy = AttentionExecutionPolicy::AUTO;
     return cfg;
 }
 
@@ -1551,20 +2998,23 @@ bool Qwen3_5Model::subclass_chunk_size_valid(int64_t cs, int64_t seq_len,
     if (seq_len <= 1 || !has_gdn_) return true;
     if (cs % 64 != 0) return false;
 
-    // Enforce the certified envelope per candidate. Unlike CausalDecoderModel this
+    // MR-A: certified envelope, per candidate. Unlike CausalDecoderModel this
     // class already closed the explicit-override route below (the cap check was
     // always in the VALIDITY hook, not the cap hook), so the envelope only has to
     // join it here. The deny-by-default half lives in subclass_chunk_size_cap.
     if (!chunk_within_envelope(cs)) return false;
 
-    // Optional cold per-handle cap. The planner still chooses a fitting valid
-    // value; this is not an exact chunk-size override.
-    return chunk_size_cap_ <= 0 || cs <= chunk_size_cap_;
+    // The cold cap bounds AUTO enumeration only. Exact controls still pass the
+    // kernel and certified-envelope predicates above, but do not inherit that
+    // search heuristic.
+    return true;
 }
 
-// The auto scan is bounded by the validity predicate above. This hook adds a
-// once-per-resolve declaration gate before SPM allocation on both planner entry
-// points, including the explicit-override route.
+// MR-A: Qwen3.5 had no cap hook at all — the auto scan was bounded only by the
+// validity predicate above. The override route reached compute_chunks_impl:499
+// without any once-per-resolve gate, so there was nowhere to fail an undeclared
+// handle loudly. This adds that gate; it runs before SPM allocation on both
+// planner entry points (fused_model_base.cpp:615 dry, :1024 forward).
 int64_t Qwen3_5Model::subclass_chunk_size_cap(int64_t seq_len,
                                               int64_t position) const {
     // G0.5 action mode is a fixed all-full-attention expert, not a Qwen3.5
@@ -1575,6 +3025,536 @@ int64_t Qwen3_5Model::subclass_chunk_size_cap(int64_t seq_len,
     if (chunk_size_cap_ <= 0) return envelope_chunk;
     if (envelope_chunk <= 0) return chunk_size_cap_;
     return std::min(chunk_size_cap_, envelope_chunk);
+}
+
+bool Qwen3_5Model::subclass_spm_kv_by_mha_eligible(
+    const FmbThreeStageChunkPlan& plan,
+    const LayoutContext& layout,
+    int64_t position) const {
+    if (z2_bound_ || action_mode_ ||
+        layout.attention_policy !=
+            AttentionExecutionPolicy::SPM_KV_BY_MHA ||
+        position != 0 || layout.batch_size != 1 || !layout.is_causal ||
+        layout.use_attn_mask || plan.chunk_mode != ChunkMode::SEQUENTIAL ||
+        plan.input.chunks.size() != 1 || plan.qkv.chunks.size() != 1 ||
+        plan.compute.chunks.size() != 1 || plan.spans.size() != 1) {
+        return false;
+    }
+
+    const ChunkInfo& input = plan.input.chunks.front();
+    const ChunkInfo& qkv = plan.qkv.chunks.front();
+    const ChunkInfo& compute = plan.compute.chunks.front();
+    const FmbExecutionSpan& span = plan.spans.front();
+    const int64_t seq = compute.len;
+    if (seq <= 1 || input.offset != 0 || qkv.offset != 0 ||
+        compute.offset != 0 ||
+        span.offset != 0 || input.len != seq || qkv.len != seq ||
+        span.len != seq || compute.kv_seq_len != seq ||
+        layout.chunk_size != seq || layout.max_kv_seq_len != seq) {
+        return false;
+    }
+    if (std::none_of(
+            layer_is_full_.begin(), layer_is_full_.end(),
+            [](int value) { return value != 0; })) {
+        return false;
+    }
+    return sdpa_by_mha_spm_is_valid(
+        /*batch=*/1, seq, seq, num_q_heads(), num_kv_heads(), head_dim(),
+        attn_tp(), /*MASK_LTM=*/1);
+}
+
+std::vector<FmbPhysicalExecutionManifest>
+Qwen3_5Model::physical_manifest_domain_for_candidate(
+    const FmbThreeStageChunkPlan& plan,
+    const LayoutContext& layout,
+    int64_t physical_len, int64_t logical_len,
+    int64_t position) const {
+    LayoutContext ddr_layout = layout;
+    ddr_layout.attention_policy = AttentionExecutionPolicy::DDR_KV;
+    std::vector<FmbPhysicalExecutionManifest> domain{
+        physical_manifest_for_candidate(
+            plan, ddr_layout, physical_len, logical_len, position)};
+
+    LayoutContext raw_layout = layout;
+    raw_layout.attention_policy =
+        AttentionExecutionPolicy::SPM_KV_BY_MHA;
+    if (subclass_spm_kv_by_mha_eligible(plan, raw_layout, position)) {
+        domain.push_back(physical_manifest_for_candidate(
+            plan, raw_layout, physical_len, logical_len, position));
+    }
+    return domain;
+}
+
+FmbLinearRouteSelector Qwen3_5Model::linear_route_selector(
+    const at::Tensor& weight, int64_t m) const {
+    const bool acc32 = linear_acc32_;
+    // The new legacy 27B profile has only AUTO_TILE provenance. Its COMPLETE
+    // descriptor must not inherit the smaller profiles' GEMV route without separate admission.
+    const bool legacy_27b_geometry =
+        num_layers() == 64 && hidden_size() == 5120 &&
+        intermediate_size() == 17408 && num_q_heads() == 24 &&
+        head_dim() == 256;
+    if (m == 1 && !acc32 && !legacy_27b_geometry &&
+        (weight.scalar_type() == at::kHalf ||
+         weight.scalar_type() == at::kChar)) {
+        return FmbLinearRouteSelector::GEMV;
+    }
+    return FmbLinearRouteSelector::AUTO_TILE;
+}
+
+FmbPhysicalExecutionManifest Qwen3_5Model::physical_manifest_for_candidate(
+    const FmbThreeStageChunkPlan& plan,
+    const LayoutContext& layout,
+    int64_t physical_len, int64_t logical_len, int64_t position) const {
+    // Z2 has its own physical coordinator. Action is a regular composite child
+    // and consumes the same descriptor path as text below.
+    if (z2_bound_) return {};
+
+    FmbPhysicalExecutionManifest manifest;
+    manifest.state = FmbPhysicalManifestState::COMPLETE;
+    manifest.logical_length = logical_len;
+    manifest.physical_length = physical_len;
+    manifest.execution_padding_rows = physical_len - logical_len;
+    manifest.kv_logical_length = physical_len == 1
+        ? cos_.size(0) : position + logical_len;
+    manifest.kv_insert_physical_rows = physical_len;
+    manifest.graph_lifecycle = action_mode_
+        ? action_descriptor_graph_lifecycle_
+        : physical_len == 1 || retained_prefill_graph_
+            ? FmbGraphLifecycle::RETAINED_CACHE
+            : FmbGraphLifecycle::BOUNDED_ONESHOT;
+    manifest.linear_accumulation =
+        linear_acc32_
+        ? FmbLinearAccumulationPolicy::ACC32
+        : FmbLinearAccumulationPolicy::ACC16;
+    if (num_cores() != 8) {
+        manifest.routes.push_back({
+            QWEN35_TEXT_CORE_TOPOLOGY_SITE, FmbRouteFamily::GRAPH_SCHEDULE,
+            /*selector=*/1, /*flags=*/0, cold_topology_arguments()});
+    }
+
+    const bool has_full_attention = std::any_of(
+        layer_is_full_.begin(), layer_is_full_.end(),
+        [](int value) { return value != 0; });
+    const bool has_gdn = std::any_of(
+        layer_is_full_.begin(), layer_is_full_.end(),
+        [](int value) { return value == 0; });
+    const bool raw_spm = has_full_attention &&
+        layout.attention_policy ==
+            AttentionExecutionPolicy::SPM_KV_BY_MHA &&
+        subclass_spm_kv_by_mha_eligible(plan, layout, position);
+    auto attention_arguments = [&](int64_t seq_q, int64_t seq_k,
+                                   int64_t mask_type) {
+        return std::vector<int64_t>{
+            /*batch=*/1, seq_q, seq_k, num_q_heads(), num_kv_heads(),
+            head_dim(), attn_tp(), mask_type};
+    };
+    auto ddr_attention_reason = [&] {
+        if (action_mode_)
+            return QWEN35_TEXT_ATTN_ACTION_PREFIX_DDR_REQUIRED;
+        if (position != 0)
+            return QWEN35_TEXT_ATTN_PREFIX_HISTORY_DDR_REQUIRED;
+        if (plan.qkv.chunks.size() != 1 ||
+            plan.compute.chunks.size() != 1)
+            return QWEN35_TEXT_ATTN_MULTI_CHUNK_DDR_REQUIRED;
+        LayoutContext raw_probe = layout;
+        raw_probe.attention_policy =
+            AttentionExecutionPolicy::SPM_KV_BY_MHA;
+        return subclass_spm_kv_by_mha_eligible(
+                   plan, raw_probe, position)
+            ? QWEN35_TEXT_ATTN_CAPABILITY_FALLBACK_DDR_REQUIRED
+            : QWEN35_TEXT_ATTN_RAW_KERNEL_INCOMPATIBLE_DDR_REQUIRED;
+    };
+    if (action_mode_ && has_full_attention) {
+        manifest.routes.push_back({
+            kFullAttentionSite, FmbRouteFamily::ATTENTION,
+            static_cast<int64_t>(AttentionExecutionPolicy::DDR_KV),
+            ddr_attention_reason(),
+            {physical_len}});
+    } else if (has_full_attention) {
+        for (const ChunkInfo& chunk : plan.compute.chunks) {
+            manifest.routes.push_back({
+                raw_spm ? kFullAttentionRawSpmSite : kFullAttentionSite,
+                FmbRouteFamily::ATTENTION,
+                static_cast<int64_t>(
+                    raw_spm ? AttentionExecutionPolicy::SPM_KV_BY_MHA
+                            : AttentionExecutionPolicy::DDR_KV),
+                raw_spm ? 0 : ddr_attention_reason(),
+                physical_len == 1
+                    ? std::vector<int64_t>{1}
+                    : attention_arguments(
+                          chunk.len, chunk.kv_seq_len, /*MASK_LTM=*/1),
+                /*invocation=*/chunk.idx});
+        }
+    }
+    if (!action_mode_ && has_gdn_ && physical_len > 1) {
+        const auto residency = gdn_mask_residency_for_candidate(layout);
+        manifest.routes.push_back({
+            QWEN35_TEXT_GDN_MASK_RESIDENCY_SITE, FmbRouteFamily::GRAPH_SCHEDULE,
+            residency == FmbForwardOperandResidency::FORWARD ? 2 : 1,
+            /*flags=*/0, gdn_mask_schedule_arguments(plan)});
+    }
+    auto append_route = [&](FmbRouteFamily family, int64_t site_id,
+                            int64_t selector, int64_t invocation = 0) {
+        manifest.routes.push_back({
+            site_id, family, selector, /*flags=*/0, {}, invocation});
+    };
+    auto append_linear = [&](FmbLinearRouteSelector selector,
+                             int64_t chunk_idx) {
+        manifest.routes.push_back({
+            QWEN35_TEXT_LINEAR_SITE, FmbRouteFamily::LINEAR,
+            static_cast<int64_t>(selector), /*flags=*/0, {},
+            linear_invocation(chunk_idx, selector)});
+    };
+    const int64_t action_body_iterations =
+        action_step_active_ && action_loop_active_ ? action_num_steps_ : 1;
+    manifest.routes.push_back({
+        QWEN35_TEXT_ACTION_SCHEDULE_SITE, FmbRouteFamily::GRAPH_SCHEDULE,
+        action_mode_ ? 2 : 1, /*flags=*/0,
+        {action_mode_ ? 1 : 0, action_input_w_.defined() ? 1 : 0,
+         action_loop_active_ ? 1 : 0, action_rtc_active_ ? 1 : 0,
+         action_step_active_ ? 1 : 0, action_body_iterations,
+         action_len_, action_dim_pad_}});
+    const int64_t full_layer_count = std::count_if(
+        layer_is_full_.begin(), layer_is_full_.end(),
+        [](int value) { return value != 0; });
+    manifest.routes.push_back({
+        QWEN35_TEXT_QK_NORM_SCHEDULE_SITE,
+        FmbRouteFamily::GRAPH_SCHEDULE,
+        has_qk_norm_ ? 2 : 1, /*flags=*/0,
+        {has_qk_norm_ ? 1 : 0, has_mrope_ ? 1 : 0,
+         head_dim(), attn_tp(), full_layer_count}});
+    if (action_input_w_.defined()) {
+        manifest.routes.push_back({
+            QWEN35_TEXT_ACTION_INPUT_BIAS_PRELOAD_SITE,
+            FmbRouteFamily::MUTABLE_DMA,
+            qwen35_text_dma_route(
+                Qwen35TextMutableDmaRoute::DDR_BROADCAST_TO_SPM),
+            /*flags=*/0, {hidden_size(), 1}});
+        manifest.routes.push_back({
+            QWEN35_TEXT_ACTION_OUTPUT_BIAS_PRELOAD_SITE,
+            FmbRouteFamily::MUTABLE_DMA,
+            qwen35_text_dma_route(
+                Qwen35TextMutableDmaRoute::DDR_BROADCAST_TO_SPM),
+            /*flags=*/0, {action_dim_pad_, 1}});
+    }
+    if (has_qk_norm_) {
+        for (int64_t layer = 0; layer < num_layers(); ++layer) {
+            if (!layer_is_full_[layer]) continue;
+            for (const int64_t site_id : {
+                     QWEN35_TEXT_Q_NORM_PRELOAD_SITE,
+                     QWEN35_TEXT_K_NORM_PRELOAD_SITE}) {
+                manifest.routes.push_back({
+                    site_id, FmbRouteFamily::MUTABLE_DMA,
+                    qwen35_text_dma_route(
+                        Qwen35TextMutableDmaRoute::DDR_BROADCAST_TO_SPM),
+                    /*flags=*/0, {layer, 1, head_dim(), 1}, layer});
+            }
+        }
+    }
+    for (const ChunkInfo& chunk : plan.compute.chunks) {
+        bool needs_auto_tile = false;
+        bool needs_gemv = false;
+        auto observe_linear = [&](const at::Tensor& weight,
+                                  int64_t rows = -1) {
+            const FmbLinearRouteSelector selector =
+                linear_route_selector(
+                    weight, rows >= 0 ? rows : chunk.len);
+            TORCH_INTERNAL_ASSERT(
+                selector == FmbLinearRouteSelector::AUTO_TILE ||
+                    selector == FmbLinearRouteSelector::GEMV,
+                "Qwen3.5 text resolved an unsupported LINEAR route");
+            needs_auto_tile |=
+                selector == FmbLinearRouteSelector::AUTO_TILE;
+            needs_gemv |= selector == FmbLinearRouteSelector::GEMV;
+        };
+        for (int64_t layer_idx = 0; layer_idx < num_layers(); ++layer_idx) {
+            const auto& lw = layer_weights_[layer_idx];
+            if (layer_is_full_[layer_idx]) {
+                observe_linear(lw.q_w);
+                observe_linear(lw.k_w);
+                observe_linear(lw.v_w);
+                observe_linear(lw.attn_gate_w);
+                observe_linear(lw.o_w);
+            } else {
+                observe_linear(lw.gdn_q_w);
+                observe_linear(lw.gdn_k_w);
+                observe_linear(lw.gdn_v_w);
+                observe_linear(lw.gdn_in_z_w);
+                observe_linear(lw.gdn_b_bg_w);
+                observe_linear(lw.gdn_a_bg_w);
+                observe_linear(lw.gdn_out_w);
+            }
+            observe_linear(lw.gate_w);
+            observe_linear(lw.up_w);
+            observe_linear(lw.down_w);
+        }
+        if (action_mode_ && action_descriptor_include_io_ && chunk.idx == 0) {
+            observe_linear(action_input_w_, physical_len);
+            observe_linear(action_output_w_, physical_len);
+        }
+        if (needs_auto_tile) {
+            append_linear(FmbLinearRouteSelector::AUTO_TILE, chunk.idx);
+        }
+        if (needs_gemv) {
+            append_linear(FmbLinearRouteSelector::GEMV, chunk.idx);
+        }
+        if (use_silu_) {
+            manifest.routes.push_back({
+                QWEN35_TEXT_MLP_SILU_SITE, FmbRouteFamily::ACTIVATION,
+                /*selector=*/1, /*flags=*/0,
+                {use_silu_ ? 1 : 0,
+                 chunk.len * (intermediate_size() / mlp_tp()),
+                 static_cast<int64_t>(ValuOpType::SILU)}, chunk.idx});
+        }
+    }
+
+    for (const ChunkInfo& chunk : plan.compute.chunks) {
+        if (has_full_attention) {
+            if (has_qk_norm_ && has_mrope_) {
+                append_route(
+                    FmbRouteFamily::ROPE,
+                    chunk.len <= 1
+                        ? QWEN35_TEXT_PARTIAL_ROPE_1D_SITE
+                        : QWEN35_TEXT_PARTIAL_MROPE_SITE,
+                    qwen35_text_rope_route(
+                        chunk.len <= 1
+                            ? Qwen35TextRopeRoute::PARTIAL_ROPE_1D
+                            : Qwen35TextRopeRoute::PARTIAL_MROPE),
+                    chunk.idx);
+            } else if (has_qk_norm_) {
+                append_route(
+                    FmbRouteFamily::ROPE,
+                    QWEN35_TEXT_Q_NORM_ROPE_SITE,
+                    qwen35_text_rope_route(
+                        Qwen35TextRopeRoute::ROPE_SPM),
+                    chunk.idx);
+                append_route(
+                    FmbRouteFamily::ROPE,
+                    QWEN35_TEXT_K_NORM_ROPE_SITE,
+                    qwen35_text_rope_route(
+                        Qwen35TextRopeRoute::ROPE_SPM),
+                    chunk.idx);
+            } else {
+                append_route(
+                    FmbRouteFamily::ROPE, QWEN35_TEXT_Q_ROPE_SITE,
+                    qwen35_text_rope_route(
+                        Qwen35TextRopeRoute::ROPE_SPM),
+                    chunk.idx);
+                append_route(
+                    FmbRouteFamily::ROPE, QWEN35_TEXT_K_ROPE_SITE,
+                    qwen35_text_rope_route(
+                        Qwen35TextRopeRoute::ROPE_SPM),
+                    chunk.idx);
+            }
+            append_route(
+                FmbRouteFamily::ALL_REDUCE,
+                QWEN35_TEXT_FULL_PREPARE_ALL_REDUCE_SITE,
+                static_cast<int64_t>(
+                    Qwen35TextAllReduceRoute::PREPARE_RING_INPUT),
+                chunk.idx);
+            append_route(
+                FmbRouteFamily::ALL_REDUCE,
+                QWEN35_TEXT_FULL_ALL_REDUCE_SITE,
+                text_ring_route(chunk.len, hidden_size()),
+                chunk.idx);
+        }
+        if (has_gdn) {
+            if (gdn_tp() != num_cores()) {
+                append_route(
+                    FmbRouteFamily::ALL_REDUCE,
+                    QWEN35_TEXT_GDN_PREPARE_ALL_REDUCE_SITE,
+                    static_cast<int64_t>(Qwen35TextAllReduceRoute::PREPARE_RING_INPUT),
+                    chunk.idx);
+            }
+            const bool decode = chunk.len <= 1;
+            const bool initial_prefill_chunk =
+                !decode && position == 0 && chunk.offset == 0;
+            if (decode) {
+                for (const int64_t site_id : {
+                         QWEN35_TEXT_GDN_STATE_LOAD_DMA_SITE,
+                         QWEN35_TEXT_GDN_CONV_DECODE_LOAD_DMA_SITE}) {
+                    append_route(
+                        FmbRouteFamily::MUTABLE_DMA, site_id,
+                        qwen35_text_dma_route(
+                            Qwen35TextMutableDmaRoute::DDR_SCATTER_TO_SPM),
+                        chunk.idx);
+                }
+                for (const int64_t site_id : {
+                         QWEN35_TEXT_GDN_STATE_DECODE_STORE_DMA_SITE,
+                         QWEN35_TEXT_GDN_CONV_DECODE_STORE_DMA_SITE}) {
+                    append_route(
+                        FmbRouteFamily::MUTABLE_DMA, site_id,
+                        qwen35_text_dma_route(
+                            Qwen35TextMutableDmaRoute::SPM_SCATTER_TO_DDR),
+                        chunk.idx);
+                }
+            } else {
+                if (!initial_prefill_chunk) {
+                    for (const int64_t site_id : {
+                             QWEN35_TEXT_GDN_CONV_PREFILL_LOAD_DMA_SITE,
+                             QWEN35_TEXT_GDN_STATE_PREFILL_LOAD_DMA_SITE}) {
+                        append_route(
+                            FmbRouteFamily::MUTABLE_DMA, site_id,
+                            qwen35_text_dma_route(
+                                Qwen35TextMutableDmaRoute::DDR_SCATTER_TO_SPM),
+                            chunk.idx);
+                    }
+                }
+                for (const int64_t site_id : {
+                         QWEN35_TEXT_GDN_CONV_PREFILL_STORE_DMA_SITE,
+                         QWEN35_TEXT_GDN_STATE_PREFILL_STORE_DMA_SITE}) {
+                    append_route(
+                        FmbRouteFamily::MUTABLE_DMA, site_id,
+                        qwen35_text_dma_route(
+                            Qwen35TextMutableDmaRoute::SPM_SCATTER_TO_DDR),
+                        chunk.idx);
+                }
+            }
+            append_route(
+                FmbRouteFamily::ALL_REDUCE,
+                QWEN35_TEXT_GDN_ALL_REDUCE_SITE,
+                text_ring_route(chunk.len, hidden_size()),
+                chunk.idx);
+        }
+        append_route(
+            FmbRouteFamily::ALL_REDUCE,
+            QWEN35_TEXT_MLP_ALL_REDUCE_SITE,
+            text_ring_route(chunk.len, hidden_size()),
+            chunk.idx);
+    }
+
+    if (action_mode_) {
+        append_route(
+            FmbRouteFamily::MUTABLE_DMA,
+            QWEN35_TEXT_ADAPTIVE_MOD_DMA_SITE,
+            qwen35_text_dma_route(
+                Qwen35TextMutableDmaRoute::DDR_BROADCAST_TO_SPM));
+        if ((action_descriptor_route_flags_ & QWEN35_ACTION_ROUTE_IO) != 0) {
+            append_route(
+                FmbRouteFamily::MUTABLE_DMA,
+                QWEN35_TEXT_ACTION_INPUT_DMA_SITE,
+                qwen35_text_dma_route(
+                    Qwen35TextMutableDmaRoute::DDR_BROADCAST_TO_SPM));
+            append_route(
+                FmbRouteFamily::MUTABLE_DMA,
+                QWEN35_TEXT_ACTION_KEEP_MASK_DMA_SITE,
+                qwen35_text_dma_route(
+                    Qwen35TextMutableDmaRoute::DDR_BROADCAST_TO_SPM));
+            append_route(
+                FmbRouteFamily::MUTABLE_DMA,
+                QWEN35_TEXT_ACTION_OUTPUT_DMA_SITE,
+                qwen35_text_dma_route(
+                    Qwen35TextMutableDmaRoute::SPM_COPY_TO_DDR));
+        }
+        if ((action_descriptor_route_flags_ & QWEN35_ACTION_ROUTE_RTC) != 0) {
+            append_route(
+                FmbRouteFamily::MUTABLE_DMA,
+                QWEN35_TEXT_ACTION_RTC_PREFIX_DMA_SITE,
+                qwen35_text_dma_route(
+                    Qwen35TextMutableDmaRoute::DDR_BROADCAST_TO_SPM));
+        }
+        if ((action_descriptor_route_flags_ & QWEN35_ACTION_ROUTE_TRACE) != 0) {
+            for (const int64_t site_id : {
+                     QWEN35_TEXT_ACTION_TRACE_PRE_DMA_SITE,
+                     QWEN35_TEXT_ACTION_TRACE_EMBED_DMA_SITE,
+                     QWEN35_TEXT_ACTION_TRACE_HIDDEN_DMA_SITE,
+                     QWEN35_TEXT_ACTION_TRACE_VELOCITY_DMA_SITE,
+                     QWEN35_TEXT_ACTION_TRACE_POST_DMA_SITE}) {
+                append_route(
+                    FmbRouteFamily::MUTABLE_DMA, site_id,
+                    qwen35_text_dma_route(
+                        Qwen35TextMutableDmaRoute::SPM_COPY_TO_DDR));
+            }
+        }
+    }
+    if (action_mode_ && has_full_attention) {
+        constexpr uint32_t kv_caps = KV_INSERT_CAP_V2 |
+            KV_INSERT_CAP_V16 | KV_INSERT_CAP_HYBRID2 |
+            KV_INSERT_CAP_HYBRID3;
+        auto append_kv_route = [&](int64_t invocation,
+                                   int64_t insert_position) {
+            const KvInsertSegmentPlan kv_plan =
+                resolve_kvinsert_plan_auto(
+                    kFullAttentionKvInsertSite, manifest.graph_lifecycle,
+                    insert_position, physical_len, physical_len, attn_tp(),
+                    num_kv_heads(), head_dim(), kv_caps);
+            const KvInsertRouteArguments arguments =
+                rpu_kvinsert_route_arguments(
+                    kv_plan, attn_tp(), num_kv_heads(), head_dim());
+            manifest.routes.push_back({
+                kFullAttentionKvInsertSite, FmbRouteFamily::KV_INSERT,
+                static_cast<int64_t>(kv_plan.route()), /*flags=*/0,
+                {arguments.begin(), arguments.end()}, invocation});
+        };
+        // One native call site has two action geometries. Invocation 0 is the
+        // local position-zero plan; invocation 1 is the shared-prefix plan.
+        append_kv_route(/*invocation=*/0, /*insert_position=*/0);
+        if (position > 0) {
+            append_kv_route(/*invocation=*/1, position);
+        }
+    } else if (has_full_attention) {
+        for (const ChunkInfo& chunk : plan.qkv.chunks) {
+            const bool dynamic_decode_position = physical_len == 1;
+            const int64_t insert_position = dynamic_decode_position
+                ? 0 : position + chunk.offset;
+            const KvInsertSegmentPlan kv_plan = dynamic_decode_position
+                ? rpu_resolve_kvinsert_segment_plan(
+                      insert_position, chunk.len, chunk.len, attn_tp(),
+                      num_kv_heads(), head_dim(), KV_INSERT_CAP_V2,
+                      KvInsertRoute::V2)
+                : resolve_kvinsert_plan_auto(
+                      kFullAttentionKvInsertSite, manifest.graph_lifecycle,
+                      insert_position, chunk.len, chunk.len, attn_tp(),
+                      num_kv_heads(), head_dim(),
+                      QWEN35_TEXT_KV_CAPABILITIES);
+            const KvInsertRouteArguments arguments =
+                rpu_kvinsert_route_arguments(
+                    kv_plan, attn_tp(), num_kv_heads(), head_dim());
+            manifest.routes.push_back({
+                kFullAttentionKvInsertSite, FmbRouteFamily::KV_INSERT,
+                static_cast<int64_t>(kv_plan.route()),
+                QWEN35_TEXT_KV_REASON_DDR_REQUIRED |
+                    (dynamic_decode_position
+                         ? KV_INSERT_ROUTE_FLAG_DYNAMIC_POSITION : 0),
+                {arguments.begin(), arguments.end()},
+                /*invocation=*/chunk.idx});
+        }
+    }
+    append_fmb_shared_runtime_routes(
+        manifest, plan, hidden_size(), FMB_SHARED_LAYER_INPUT_DMA,
+        /*compute_row_multiplier=*/1,
+        num_cores(), mlp_tp());
+    std::sort(
+        manifest.routes.begin(), manifest.routes.end(),
+        [](const FmbRouteManifestEntry& lhs,
+           const FmbRouteManifestEntry& rhs) {
+            return std::make_tuple(
+                       static_cast<int64_t>(lhs.family), lhs.site_id,
+                       lhs.invocation) <
+                std::make_tuple(
+                       static_cast<int64_t>(rhs.family), rhs.site_id,
+                       rhs.invocation);
+        });
+    return manifest;
+}
+
+FmbPhysicalManifestForwardCapability
+Qwen3_5Model::physical_manifest_forward_capability(
+    const FmbPhysicalExecutionManifest& manifest) const {
+    if (z2_bound_) return {};
+    if (action_mode_) {
+        TORCH_CHECK(
+            manifest.graph_lifecycle == FmbGraphLifecycle::BOUNDED_ONESHOT ||
+                manifest.graph_lifecycle == FmbGraphLifecycle::COMPOSITE_CHILD,
+            "Qwen3.5 action descriptor carries an unsupported Graph lifecycle");
+        return {true, manifest.graph_lifecycle};
+    }
+    const FmbGraphLifecycle expected = manifest.logical_length == 1 ||
+            retained_prefill_graph_
+        ? FmbGraphLifecycle::RETAINED_CACHE
+        : FmbGraphLifecycle::BOUNDED_ONESHOT;
+    return {true, expected};
 }
 
 // Per-forward prefill M-RoPE tables. Generic Qwen3.5 uses a fresh oneshot graph;
@@ -1626,10 +3606,44 @@ void Qwen3_5Model::set_weights(
     int64_t gdn_value_head_dim, int64_t gdn_conv_dim, int64_t gdn_conv_kernel,
     at::TensorList gdn_q_list, at::TensorList gdn_k_list, at::TensorList gdn_v_list,
     at::TensorList gdn_cq_list, at::TensorList gdn_ck_list, at::TensorList gdn_cv_list,
-    at::TensorList gdn_b_bg_list, at::TensorList gdn_a_bg_list) {
+    at::TensorList gdn_b_bg_list, at::TensorList gdn_a_bg_list,
+    at::TensorList q_scale_list, at::TensorList k_scale_list,
+    at::TensorList v_scale_list, at::TensorList o_scale_list,
+    at::TensorList attn_gate_scale_list,
+    at::TensorList gate_scale_list, at::TensorList up_scale_list,
+    at::TensorList down_scale_list,
+    at::TensorList gdn_in_z_scale_list, at::TensorList gdn_out_scale_list,
+    at::TensorList gdn_q_scale_list, at::TensorList gdn_k_scale_list,
+    at::TensorList gdn_v_scale_list, at::TensorList gdn_b_bg_scale_list,
+    at::TensorList gdn_a_bg_scale_list) {
 
     const int64_t N = static_cast<int64_t>(layer_is_full.size());
     TORCH_CHECK(N > 0, "qwen3_5 set_weights: layer_is_full must be non-empty");
+    const bool reduced = num_cores() != 8;
+    const bool reduced_legacy27 = reduced && qwen35_legacy27_geometry(
+        num_q_heads, num_kv_heads, head_dim, hidden_size, intermediate_size);
+    // Admission and set_model_params keep logical geometry. Only the prepared
+    // gate/up/down tensors carry cold MLP padding (0.8B MLP6: 3584 -> 3648).
+    const int64_t prepared_intermediate_size =
+        decoder_mlp_intermediate_size(intermediate_size, num_cores());
+    if (reduced) {
+        const int expected_layers = qwen35_reduced_profile_num_layers(
+            num_q_heads, num_kv_heads, head_dim, hidden_size, intermediate_size);
+        const int64_t expected_value_heads =
+            reduced_legacy27 ? 48 : (hidden_size == 1024 || hidden_size == 2048) ? 16 : 32;
+        TORCH_CHECK(expected_layers != 0 && N == expected_layers &&
+                        !action_mode_ && !z2_bound_ && use_silu && eps == 1e-6 &&
+                        mrope_section == at::IntArrayRef({11, 11, 10}) &&
+                        gdn_num_v_heads == expected_value_heads &&
+                        gdn_key_head_dim == 128 && gdn_value_head_dim == 128 &&
+                        gdn_conv_kernel == 4 &&
+                        gdn_conv_dim == (32 + expected_value_heads) * 128,
+                    "Qwen3.5 reduced execution requires an exact dense FP16, 2B W8 or legacy27 W8 text profile");
+        for (int64_t i = 0; i < N; ++i) {
+            TORCH_CHECK(layer_is_full[i] == ((i + 1) % 4 == 0 ? 1 : 0),
+                        "Qwen3.5 reduced execution requires the 3-GDN/1-full layer schedule");
+        }
+    }
     const auto check_list = [N](at::TensorList list, const char* name) {
         TORCH_CHECK(static_cast<int64_t>(list.size()) == N,
                     "qwen3_5 set_weights: ", name,
@@ -1660,6 +3674,21 @@ void Qwen3_5Model::set_weights(
     check_list(gdn_cv_list, "gdn_cv_list");
     check_list(gdn_b_bg_list, "gdn_b_bg_list");
     check_list(gdn_a_bg_list, "gdn_a_bg_list");
+    check_list(q_scale_list, "q_scale_list");
+    check_list(k_scale_list, "k_scale_list");
+    check_list(v_scale_list, "v_scale_list");
+    check_list(o_scale_list, "o_scale_list");
+    check_list(attn_gate_scale_list, "attn_gate_scale_list");
+    check_list(gate_scale_list, "gate_scale_list");
+    check_list(up_scale_list, "up_scale_list");
+    check_list(down_scale_list, "down_scale_list");
+    check_list(gdn_in_z_scale_list, "gdn_in_z_scale_list");
+    check_list(gdn_out_scale_list, "gdn_out_scale_list");
+    check_list(gdn_q_scale_list, "gdn_q_scale_list");
+    check_list(gdn_k_scale_list, "gdn_k_scale_list");
+    check_list(gdn_v_scale_list, "gdn_v_scale_list");
+    check_list(gdn_b_bg_scale_list, "gdn_b_bg_scale_list");
+    check_list(gdn_a_bg_scale_list, "gdn_a_bg_scale_list");
 
     const auto check_tensor = [](const at::Tensor& tensor, const char* name,
                                  int64_t layer, int64_t dim) {
@@ -1675,37 +3704,134 @@ void Qwen3_5Model::set_weights(
                     "qwen3_5 set_weights: ", name, "[", layer,
                     "] must be ", dim, "D, got ", tensor.dim(), "D");
     };
+    // Exact 2B W8 main/GDN profile; b/a scalar projections remain FP16.
+    // Inspect only after list cardinalities have been validated above.
+    const bool reduced_w8_2b = reduced && !reduced_legacy27 &&
+        hidden_size == 2048 && gate_list[0].defined() &&
+        gate_list[0].scalar_type() == at::kChar;
+    const auto check_linear = [reduced, reduced_legacy27, reduced_w8_2b](const at::Tensor& weight,
+                                 const at::Tensor& scale,
+                                 const char* name, int64_t layer) {
+        TORCH_CHECK(weight.defined() && weight.numel() > 0 && weight.dim() == 2,
+                    "qwen3_5 set_weights: ", name, "[", layer,
+                    "] weight must be a non-empty 2D tensor");
+        const std::string role(name);
+        const bool legacy_main = reduced_legacy27 && role.rfind("gdn_", 0) != 0;
+        const bool w8_2b_projection = reduced_w8_2b &&
+            role != "gdn_b_bg" && role != "gdn_a_bg";
+        TORCH_CHECK(!reduced || weight.scalar_type() ==
+                        (legacy_main || w8_2b_projection ? at::kChar : at::kHalf),
+                    "Qwen3.5 reduced projection dtype must match exact FP16, "
+                    "2B W8 with FP16 GDN b/a, or legacy W8-main FP16-GDN policy");
+        TORCH_CHECK(weight.device().type() == at::kPrivateUse1
+                    && weight.is_contiguous()
+                    && (weight.scalar_type() == at::kHalf
+                        || weight.scalar_type() == at::kChar
+                        || weight.scalar_type() == at::kByte),
+                    "qwen3_5 set_weights: ", name, "[", layer,
+                    "] weight must be contiguous FP16, int8, or packed uint8 on RPU");
+        if (weight.scalar_type() == at::kChar) {
+            TORCH_CHECK(scale.defined() && scale.dim() == 1
+                        && scale.numel() == weight.size(0)
+                        && scale.scalar_type() == at::kHalf
+                        && scale.device().type() == at::kPrivateUse1
+                        && scale.is_contiguous(),
+                        "qwen3_5 set_weights: W8A16 ", name, "[", layer,
+                        "] requires contiguous FP16 RPU scale [N=",
+                        weight.size(0), "]");
+        } else if (weight.scalar_type() == at::kByte) {
+            TORCH_CHECK(scale.defined() && scale.dim() == 2
+                        && (scale.size(0) == 32 || scale.size(0) == 64
+                            || scale.size(0) == 128)
+                        && scale.numel() > 0
+                        && scale.scalar_type() == at::kHalf
+                        && scale.device().type() == at::kPrivateUse1
+                        && scale.is_contiguous(),
+                        "qwen3_5 set_weights: packed W4A16 ", name, "[", layer,
+                        "] requires current-main controller-striped FP16 scale "
+                        "[group_size, physical_elements/group_size], got ",
+                        scale.defined() ? scale.sizes() : at::IntArrayRef{});
+        } else {
+            TORCH_CHECK(!scale.defined() || scale.numel() == 0,
+                        "qwen3_5 set_weights: FP16 ", name, "[", layer,
+                        "] must not carry a quant scale");
+        }
+    };
     for (int64_t i = 0; i < N; ++i) {
         TORCH_CHECK(layer_is_full[i] == 0 || layer_is_full[i] == 1,
                     "qwen3_5 set_weights: layer_is_full[", i,
                     "] must be 0 or 1, got ", layer_is_full[i]);
+        if (reduced) {
+            const auto shape = [i](const at::Tensor& tensor,
+                                    at::IntArrayRef expected, const char* name) {
+                TORCH_CHECK(tensor.defined() && tensor.sizes() == expected,
+                            "Qwen3.5 reduced ", name, " shape mismatch at layer ", i);
+            };
+            shape(input_norm_list[i], {hidden_size}, "input norm");
+            shape(post_norm_list[i], {hidden_size}, "post norm");
+            shape(gate_list[i], {prepared_intermediate_size, hidden_size}, "MLP gate");
+            shape(up_list[i], {prepared_intermediate_size, hidden_size}, "MLP up");
+            shape(down_list[i], {hidden_size, prepared_intermediate_size}, "MLP down");
+            if (layer_is_full[i]) {
+                shape(q_w_list[i], {num_q_heads * head_dim, hidden_size}, "Q");
+                shape(k_w_list[i], {num_kv_heads * head_dim, hidden_size}, "K");
+                shape(v_w_list[i], {num_kv_heads * head_dim, hidden_size}, "V");
+                shape(o_w_list[i], {hidden_size, num_q_heads * head_dim}, "O");
+                shape(attn_gate_list[i], {num_q_heads * head_dim, hidden_size}, "attention gate");
+                shape(q_norm_list[i], {head_dim}, "Q norm");
+                shape(k_norm_list[i], {head_dim}, "K norm");
+            } else {
+                const int64_t gc = gdn_tp();
+                const int64_t key = 16 * gdn_key_head_dim;
+                const int64_t value = gdn_num_v_heads * gdn_value_head_dim;
+                shape(gdn_q_list[i], {key, hidden_size}, "GDN Q");
+                shape(gdn_k_list[i], {key, hidden_size}, "GDN K");
+                shape(gdn_v_list[i], {value, hidden_size}, "GDN V");
+                shape(gdn_in_z_list[i], {value, hidden_size}, "GDN Z");
+                shape(gdn_out_list[i], {hidden_size, value}, "GDN output");
+                shape(gdn_b_bg_list[i], {16 * gc, hidden_size}, "GDN beta");
+                shape(gdn_a_bg_list[i], {16 * gc, hidden_size}, "GDN decay");
+                const int64_t scalar_slots = qwen35_gdn_scalar_slots(gdn_num_v_heads, gc);
+                shape(gdn_A_log_list[i], {scalar_slots * gc}, "GDN A_log");
+                shape(gdn_dt_bias_list[i], {scalar_slots * gc}, "GDN dt_bias");
+                shape(gdn_norm_list[i], {gdn_value_head_dim}, "GDN norm");
+                shape(gdn_cq_list[i], {gc, gdn_conv_kernel, key / gc}, "GDN conv Q");
+                shape(gdn_ck_list[i], {gc, gdn_conv_kernel, key / gc}, "GDN conv K");
+                shape(gdn_cv_list[i], {gc, gdn_conv_kernel, value / gc}, "GDN conv V");
+            }
+        }
         check_tensor(input_norm_list[i], "input_norm_list", i, 1);
         check_tensor(post_norm_list[i], "post_norm_list", i, 1);
-        check_tensor(gate_list[i], "gate_list", i, 2);
-        check_tensor(up_list[i], "up_list", i, 2);
-        check_tensor(down_list[i], "down_list", i, 2);
+        check_linear(gate_list[i], gate_scale_list[i], "gate", i);
+        check_linear(up_list[i], up_scale_list[i], "up", i);
+        check_linear(down_list[i], down_scale_list[i], "down", i);
         if (layer_is_full[i]) {
-            check_tensor(q_w_list[i], "q_w_list", i, 2);
-            check_tensor(k_w_list[i], "k_w_list", i, 2);
-            check_tensor(v_w_list[i], "v_w_list", i, 2);
-            check_tensor(o_w_list[i], "o_w_list", i, 2);
+            check_linear(q_w_list[i], q_scale_list[i], "q", i);
+            check_linear(k_w_list[i], k_scale_list[i], "k", i);
+            check_linear(v_w_list[i], v_scale_list[i], "v", i);
+            check_linear(o_w_list[i], o_scale_list[i], "o", i);
             check_tensor(q_norm_list[i], "q_norm_list", i, 1);
             check_tensor(k_norm_list[i], "k_norm_list", i, 1);
-            check_tensor(attn_gate_list[i], "attn_gate_list", i, 2);
+            check_linear(attn_gate_list[i], attn_gate_scale_list[i],
+                         "attn_gate", i);
         } else {
-            check_tensor(gdn_in_z_list[i], "gdn_in_z_list", i, 2);
-            check_tensor(gdn_out_list[i], "gdn_out_list", i, 2);
+            check_linear(gdn_in_z_list[i], gdn_in_z_scale_list[i],
+                         "gdn_in_z", i);
+            check_linear(gdn_out_list[i], gdn_out_scale_list[i],
+                         "gdn_out", i);
             check_tensor(gdn_A_log_list[i], "gdn_A_log_list", i, 1);
             check_tensor(gdn_dt_bias_list[i], "gdn_dt_bias_list", i, 1);
             check_tensor(gdn_norm_list[i], "gdn_norm_list", i, 1);
-            check_tensor(gdn_q_list[i], "gdn_q_list", i, 2);
-            check_tensor(gdn_k_list[i], "gdn_k_list", i, 2);
-            check_tensor(gdn_v_list[i], "gdn_v_list", i, 2);
+            check_linear(gdn_q_list[i], gdn_q_scale_list[i], "gdn_q", i);
+            check_linear(gdn_k_list[i], gdn_k_scale_list[i], "gdn_k", i);
+            check_linear(gdn_v_list[i], gdn_v_scale_list[i], "gdn_v", i);
             check_tensor(gdn_cq_list[i], "gdn_cq_list", i, 3);
             check_tensor(gdn_ck_list[i], "gdn_ck_list", i, 3);
             check_tensor(gdn_cv_list[i], "gdn_cv_list", i, 3);
-            check_tensor(gdn_b_bg_list[i], "gdn_b_bg_list", i, 2);
-            check_tensor(gdn_a_bg_list[i], "gdn_a_bg_list", i, 2);
+            check_linear(gdn_b_bg_list[i], gdn_b_bg_scale_list[i],
+                         "gdn_b_bg", i);
+            check_linear(gdn_a_bg_list[i], gdn_a_bg_scale_list[i],
+                         "gdn_a_bg", i);
         }
     }
     check_tensor(cos, "cos", -1, 2);
@@ -1713,6 +3839,8 @@ void Qwen3_5Model::set_weights(
     check_tensor(final_norm_w, "final_norm_w", -1, 1);
     TORCH_CHECK(cos.sizes() == sin.sizes(),
                 "qwen3_5 set_weights: cos/sin shapes must match");
+    TORCH_CHECK(!reduced || (cos.size(1) == 32 && final_norm_w.numel() == hidden_size),
+                "Qwen3.5 reduced RoPE/final norm geometry mismatch");
 
     has_qk_norm_ = q_norm_list.size() > 0;
     use_silu_    = use_silu;
@@ -1723,6 +3851,10 @@ void Qwen3_5Model::set_weights(
         layer_is_full_.begin(), layer_is_full_.end(),
         [](uint8_t is_full) { return !is_full; });
     action_mode_ = false;
+    action_rtc_active_ = false;
+    action_rtc_prefix_len_ = 0;
+    action_rtc_prefix_ref_ = at::Tensor();
+    action_rtc_prefix_live_base_ = 0;
     adaptive_mod_ref_ = at::Tensor();
     action_prefix_lens_.clear();
     layer_weights_.assign(N, LayerWeights{});
@@ -1732,6 +3864,12 @@ void Qwen3_5Model::set_weights(
         lw.input_norm_w = input_norm_list[i];
         lw.post_norm_w = post_norm_list[i];
         lw.gate_w = gate_list[i]; lw.up_w = up_list[i]; lw.down_w = down_list[i];
+        lw.gate_ws = rpu_retain_linear_quant_scale(
+            gate_list[i], gate_scale_list[i]);
+        lw.up_ws = rpu_retain_linear_quant_scale(
+            up_list[i], up_scale_list[i]);
+        lw.down_ws = rpu_retain_linear_quant_scale(
+            down_list[i], down_scale_list[i]);
         if (!layer_is_full_[i]) {
             // GDN mixer weights (attention slots stay empty).
             lw.gdn_in_z_w    = gdn_in_z_list[i];
@@ -1739,19 +3877,43 @@ void Qwen3_5Model::set_weights(
             lw.gdn_A_log     = gdn_A_log_list[i];
             lw.gdn_dt_bias   = gdn_dt_bias_list[i];
             lw.gdn_norm_w    = gdn_norm_list[i];
+            lw.gdn_in_z_ws = rpu_retain_linear_quant_scale(
+                gdn_in_z_list[i], gdn_in_z_scale_list[i]);
+            lw.gdn_out_ws = rpu_retain_linear_quant_scale(
+                gdn_out_list[i], gdn_out_scale_list[i]);
             // prefill (chunk) per-path weights (separate q/k/v proj + conv, N_bg b/a)
             if (gdn_q_list.size() > 0) {
                 lw.gdn_q_w = gdn_q_list[i]; lw.gdn_k_w = gdn_k_list[i]; lw.gdn_v_w = gdn_v_list[i];
                 lw.gdn_conv_q_w = gdn_cq_list[i]; lw.gdn_conv_k_w = gdn_ck_list[i]; lw.gdn_conv_v_w = gdn_cv_list[i];
                 lw.gdn_b_bg_w = gdn_b_bg_list[i]; lw.gdn_a_bg_w = gdn_a_bg_list[i];
+                lw.gdn_q_ws = rpu_retain_linear_quant_scale(
+                    gdn_q_list[i], gdn_q_scale_list[i]);
+                lw.gdn_k_ws = rpu_retain_linear_quant_scale(
+                    gdn_k_list[i], gdn_k_scale_list[i]);
+                lw.gdn_v_ws = rpu_retain_linear_quant_scale(
+                    gdn_v_list[i], gdn_v_scale_list[i]);
+                lw.gdn_b_bg_ws = rpu_retain_linear_quant_scale(
+                    gdn_b_bg_list[i], gdn_b_bg_scale_list[i]);
+                lw.gdn_a_bg_ws = rpu_retain_linear_quant_scale(
+                    gdn_a_bg_list[i], gdn_a_bg_scale_list[i]);
             }
             continue;
         }
         lw.q_w = q_w_list[i]; lw.k_w = k_w_list[i];
         lw.v_w = v_w_list[i]; lw.o_w = o_w_list[i];
+        lw.q_ws = rpu_retain_linear_quant_scale(
+            q_w_list[i], q_scale_list[i]);
+        lw.k_ws = rpu_retain_linear_quant_scale(
+            k_w_list[i], k_scale_list[i]);
+        lw.v_ws = rpu_retain_linear_quant_scale(
+            v_w_list[i], v_scale_list[i]);
+        lw.o_ws = rpu_retain_linear_quant_scale(
+            o_w_list[i], o_scale_list[i]);
         lw.q_norm_w    = has_qk_norm_ ? q_norm_list[i] : at::Tensor();
         lw.k_norm_w    = has_qk_norm_ ? k_norm_list[i] : at::Tensor();
         lw.attn_gate_w = attn_gate_list[i];
+        lw.attn_gate_ws = rpu_retain_linear_quant_scale(
+            attn_gate_list[i], attn_gate_scale_list[i]);
     }
     cos_ = keep_256b_aligned_rpu_copy(cos, "qwen3_5 set_weights: cos");
     sin_ = keep_256b_aligned_rpu_copy(sin, "qwen3_5 set_weights: sin");
@@ -1768,7 +3930,7 @@ void Qwen3_5Model::set_weights(
         auto opt = final_norm_w.options();   // fp16 on RPU
         gdn_zero_ = at::zeros({gdn_dk_ * gdn_dv_}, opt);
         // prefill-chunk constant masks (C=64 fixed). tril keeps the diagonal (decay
-        // self-score exp(0)=1); strict is the strict-lower (i>j). Both match the
+        // self-score exp(0)=1); strict is the strict-lower (i>j). Both match rhino's
         // host-prepared constant masks (the -1 is a separate binary_scalar, not folded
         // here). Built on CPU then moved to RPU (host-side fill; values exact).
         {
@@ -1808,7 +3970,7 @@ void Qwen3_5Model::set_weights(
         rotary_dim_ = 2 * sec_sum;
     }
 
-    invalidate_model_state();   // Must remain the last statement.
+    invalidate_model_state();   // D-503: MUST be the last statement.
 }
 
 }  // namespace v3
@@ -1818,8 +3980,120 @@ void Qwen3_5Model::set_weights(
 // =============================================================================
 using Qwen3_5Registry = ModelHandleRegistry<v3::Qwen3_5Model>;
 
+void rpu_qwen3_5_prepare_persistent_spm(int64_t handle, int64_t execution_len) {
+    Qwen3_5Registry::get(handle, "rpu_qwen3_5_prepare_persistent_spm")
+        ->prepare_persistent_spm(execution_len, 0, true);
+}
+
+std::vector<int64_t> rpu_qwen3_5_planner_cache_identity(int64_t handle) {
+    return Qwen3_5Registry::get(handle, "rpu_qwen3_5_planner_cache_identity")
+        ->planner_cache_identity();
+}
+
+void rpu_qwen3_5_bind_kvinsert_costs(
+        int64_t handle, at::IntArrayRef identity,
+        const std::string& catalog_sha256, at::IntArrayRef certificate_rows) {
+    Qwen3_5Registry::get(handle, "rpu_qwen3_5_bind_kvinsert_costs")
+        ->bind_kvinsert_costs(identity, catalog_sha256, certificate_rows);
+}
+
+std::tuple<std::vector<int64_t>, int64_t, int64_t>
+rpu_qwen3_5_kvinsert_exact_candidate(
+    int64_t handle, at::IntArrayRef descriptor, int64_t site_id,
+    int64_t invocation, int64_t route) {
+    return Qwen3_5Registry::get(handle, "rpu_qwen3_5_kvinsert_exact_candidate")
+        ->mint_kvinsert_exact_candidate(descriptor, site_id, invocation, route);
+}
+
+KvInsertCostDomainQuery rpu_qwen3_5_kvinsert_cost_domain(
+        int64_t handle, at::IntArrayRef descriptor) {
+    return Qwen3_5Registry::get(handle, "rpu_qwen3_5_kvinsert_cost_domain")
+        ->kvinsert_cost_domain("qwen3_5", descriptor);
+}
+
+std::string rpu_qwen3_5_kvinsert_cost_catalog_sha256(int64_t handle) {
+    return Qwen3_5Registry::get(
+        handle, "rpu_qwen3_5_kvinsert_cost_catalog_sha256")
+        ->kvinsert_cost_catalog_sha256();
+}
+
+namespace v3::qwen3_5_z2_internal {
+
+SpmPipelineComponentLayout prepare_text(
+    int64_t handle,
+    int64_t execution_len,
+    int64_t real_len) {
+    return Qwen3_5Registry::get(handle, "qwen3_5_z2_prepare_text")
+        ->prepare_z2_layout(execution_len, real_len);
+}
+
+SpmDense2DSpec text_storage_spec(int64_t handle, int64_t execution_len) {
+    return Qwen3_5Registry::get(handle, "qwen3_5_z2_text_storage_spec")
+        ->z2_storage_spec(execution_len);
+}
+
+void adopt_text(
+    int64_t handle,
+    const SpmPipelineLease& lease,
+    const SpmTensorView& scratch) {
+    Qwen3_5Registry::get(handle, "qwen3_5_z2_adopt_text")
+        ->adopt_z2_layout(lease, scratch);
+}
+
+void bind_text(
+    int64_t handle,
+    const SpmPipelineLease& lease,
+    const SpmPortView& storage) {
+    Qwen3_5Registry::get(handle, "qwen3_5_z2_bind_text")
+        ->bind_z2_port(lease, storage);
+}
+
+void validate_text(int64_t handle, const SpmPipelineLease& lease) {
+    Qwen3_5Registry::get(handle, "qwen3_5_z2_validate_text")
+        ->validate_z2_layout(lease);
+}
+
+void clear_text(int64_t handle, uint64_t epoch, uint64_t plan_hash) {
+    Qwen3_5Registry::get(handle, "qwen3_5_z2_clear_text")
+        ->clear_z2_layout(epoch, plan_hash);
+}
+
+at::Tensor forward_text_z2(
+    int64_t handle,
+    const at::Tensor& hidden,
+    at::TensorList k_caches,
+    at::TensorList v_caches,
+    at::TensorList gdn_states,
+    at::TensorList conv_states,
+    uint64_t epoch,
+    uint64_t plan_hash) {
+    validate_text_dispatch(handle, epoch, plan_hash);
+    auto* model = Qwen3_5Registry::get(handle, "qwen3_5_z2_forward_text");
+    std::vector<at::Tensor> kc(k_caches.begin(), k_caches.end());
+    std::vector<at::Tensor> vc(v_caches.begin(), v_caches.end());
+    std::vector<at::Tensor> gs(gdn_states.begin(), gdn_states.end());
+    std::vector<at::Tensor> cs(conv_states.begin(), conv_states.end());
+    return model->forward_z2(hidden, kc, vc, gs, cs, epoch, plan_hash);
+}
+
+}  // namespace v3::qwen3_5_z2_internal
+
 int64_t rpu_qwen3_5_create() { return Qwen3_5Registry::create(); }
+
+void rpu_qwen3_5_set_execution_cores(int64_t handle, int64_t num_cores) {
+    Qwen3_5Registry::get(handle, "rpu_qwen3_5_set_execution_cores")
+        ->set_execution_cores(num_cores);
+}
+
+std::vector<int64_t> rpu_qwen3_5_get_execution_topology(int64_t handle) {
+    return Qwen3_5Registry::get(handle, "rpu_qwen3_5_get_execution_topology")
+        ->execution_topology();
+}
 void    rpu_qwen3_5_destroy(int64_t handle) {
+    v3::qwen3_5_z2_internal::check_text_destroy_allowed(handle);
+    Qwen3_5Registry::get(handle, "rpu_qwen3_5_destroy")
+        ->check_execution_reconfigure_destroy_allowed(
+            "rpu_qwen3_5_destroy");
     Qwen3_5Registry::destroy(handle, "rpu_qwen3_5_destroy");
 }
 
@@ -1853,6 +4127,17 @@ void rpu_qwen3_5_set_chunk_envelope(int64_t handle, int64_t max_kv_len,
         ->set_chunk_envelope(max_kv_len, chunk);
 }
 
+void rpu_qwen3_5_stage_prefill_execution_controls(
+        int64_t handle, int64_t token, int64_t cap, int64_t chunk_size,
+        int64_t max_kv_len, int64_t envelope_chunk) {
+    TORCH_CHECK(token > 0, "Qwen3.5 hot-reconfigure token must be positive");
+    Qwen3_5Registry::get(
+        handle, "rpu_qwen3_5_stage_prefill_execution_controls")
+        ->stage_prefill_execution_controls(
+            static_cast<uint64_t>(token), cap, chunk_size,
+            max_kv_len, envelope_chunk);
+}
+
 void rpu_qwen3_5_set_linear_acc32(int64_t handle, bool enabled) {
     Qwen3_5Registry::get(handle, "rpu_qwen3_5_set_linear_acc32")
         ->set_linear_acc32(enabled);
@@ -1863,9 +4148,35 @@ void rpu_qwen3_5_set_fast_replay(int64_t handle, bool enabled) {
         ->set_fast_replay(enabled);
 }
 
+void rpu_qwen3_5_set_retained_prefill_graph(
+        int64_t handle, bool enabled) {
+    Qwen3_5Registry::get(
+        handle, "rpu_qwen3_5_set_retained_prefill_graph")
+        ->set_retained_prefill_graph(enabled);
+}
+
 void rpu_qwen3_5_enable_action_mode(int64_t handle) {
     Qwen3_5Registry::get(handle, "rpu_qwen3_5_enable_action_mode")
         ->enable_action_mode();
+}
+
+void rpu_qwen3_5_set_action_chunk_size(
+        int64_t handle, int64_t chunk_size) {
+    Qwen3_5Registry::get(handle, "rpu_qwen3_5_set_action_chunk_size")
+        ->set_action_chunk_size(chunk_size);
+}
+
+void rpu_qwen3_5_stage_action_chunk_size(
+        int64_t handle, int64_t token, int64_t chunk_size) {
+    TORCH_CHECK(token > 0, "Qwen3.5 action hot-reconfigure token must be positive");
+    Qwen3_5Registry::get(handle, "rpu_qwen3_5_stage_action_chunk_size")
+        ->stage_action_chunk_size(static_cast<uint64_t>(token), chunk_size);
+}
+
+void rpu_qwen3_5_enable_execution_reconfigure(int64_t handle) {
+    Qwen3_5Registry::get(
+        handle, "rpu_qwen3_5_enable_execution_reconfigure")
+        ->enable_execution_reconfigure();
 }
 
 void rpu_qwen3_5_set_action_io_weights(
@@ -1886,6 +4197,33 @@ int64_t rpu_qwen3_5_resolve_prefill_chunk_size(
         ->resolve_prefill_chunk_size(execution_len);
 }
 
+std::vector<int64_t> rpu_qwen3_5_resolve_prefill_stage_domain(
+    int64_t handle, int64_t execution_len, int64_t logical_len,
+    int64_t planning_chunk_size_override) {
+    return Qwen3_5Registry::get(
+        handle, "rpu_qwen3_5_resolve_prefill_stage_domain")
+        ->resolve_prefill_stage_domain(
+            execution_len, logical_len, planning_chunk_size_override);
+}
+
+std::vector<int64_t> rpu_qwen3_5_resolve_decode_stage_descriptor(
+        int64_t handle) {
+    return Qwen3_5Registry::get(
+        handle, "rpu_qwen3_5_resolve_decode_stage_descriptor")
+        ->resolve_decode_stage_descriptor();
+}
+
+std::vector<int64_t> rpu_qwen3_5_resolve_action_stage_domain(
+        int64_t handle, int64_t action_len, int64_t max_prefix_len,
+        int64_t requested_chunk_size, bool include_action_io,
+        int64_t action_route_flags, int64_t graph_lifecycle, int64_t num_steps) {
+    return Qwen3_5Registry::get(
+        handle, "rpu_qwen3_5_resolve_action_stage_domain")
+        ->resolve_action_stage_domain(
+            action_len, max_prefix_len, requested_chunk_size,
+            include_action_io, action_route_flags, graph_lifecycle, num_steps);
+}
+
 void rpu_qwen3_5_set_weights(
     int64_t handle,
     at::TensorList q, at::TensorList k, at::TensorList v, at::TensorList o,
@@ -1903,14 +4241,29 @@ void rpu_qwen3_5_set_weights(
     int64_t gdn_conv_kernel,
     at::TensorList gdn_q, at::TensorList gdn_k, at::TensorList gdn_v,
     at::TensorList gdn_cq, at::TensorList gdn_ck, at::TensorList gdn_cv,
-    at::TensorList gdn_b_bg, at::TensorList gdn_a_bg) {
+    at::TensorList gdn_b_bg, at::TensorList gdn_a_bg,
+    at::TensorList q_scale, at::TensorList k_scale,
+    at::TensorList v_scale, at::TensorList o_scale,
+    at::TensorList attn_gate_scale,
+    at::TensorList gate_scale, at::TensorList up_scale,
+    at::TensorList down_scale,
+    at::TensorList gdn_in_z_scale, at::TensorList gdn_out_scale,
+    at::TensorList gdn_q_scale, at::TensorList gdn_k_scale,
+    at::TensorList gdn_v_scale, at::TensorList gdn_b_bg_scale,
+    at::TensorList gdn_a_bg_scale) {
     auto* m = Qwen3_5Registry::get(handle, "rpu_qwen3_5_set_weights");
     m->set_weights(q, k, v, o, qn, kn, ag, in_norm, post_norm, gate, up, down,
                    cos, sin, final_norm, layer_is_full,
                    nqh, nkvh, hd, hs, is_, eps, use_silu, mrope_section,
                    gdn_in_z, gdn_out, gdn_A_log, gdn_dt_bias, gdn_norm,
                    gdn_nvh, gdn_dk, gdn_dv, gdn_conv_dim, gdn_conv_kernel,
-                   gdn_q, gdn_k, gdn_v, gdn_cq, gdn_ck, gdn_cv, gdn_b_bg, gdn_a_bg);
+                   gdn_q, gdn_k, gdn_v, gdn_cq, gdn_ck, gdn_cv,
+                   gdn_b_bg, gdn_a_bg,
+                   q_scale, k_scale, v_scale, o_scale, attn_gate_scale,
+                   gate_scale, up_scale, down_scale,
+                   gdn_in_z_scale, gdn_out_scale,
+                   gdn_q_scale, gdn_k_scale, gdn_v_scale,
+                   gdn_b_bg_scale, gdn_a_bg_scale);
 }
 
 void rpu_qwen3_5_set_prefill_rope(int64_t handle, const at::Tensor& cos, const at::Tensor& sin) {
@@ -1929,23 +4282,30 @@ at::Tensor rpu_qwen3_5_forward(
     int64_t handle, const at::Tensor& hidden,
     at::TensorList k_caches, at::TensorList v_caches, at::TensorList gdn_states,
     at::TensorList conv_states,
-    const std::optional<at::Tensor>& mask, int64_t position, bool is_causal) {
+    const std::optional<at::Tensor>& mask, int64_t position, bool is_causal,
+    int64_t planned_chunk_size,
+    at::IntArrayRef planned_stage_descriptor) {
     auto* m = Qwen3_5Registry::get(handle, "rpu_qwen3_5_forward");
     std::vector<at::Tensor> kc(k_caches.begin(), k_caches.end());
     std::vector<at::Tensor> vc(v_caches.begin(), v_caches.end());
     std::vector<at::Tensor> gs(gdn_states.begin(), gdn_states.end());
     std::vector<at::Tensor> cs(conv_states.begin(), conv_states.end());
-    return m->forward(hidden, kc, vc, gs, cs, mask, position, is_causal);
+    return m->forward(
+        hidden, kc, vc, gs, cs, mask, position, is_causal,
+        planned_chunk_size, planned_stage_descriptor);
 }
 
 at::Tensor rpu_qwen3_5_action_forward(
     int64_t handle, const at::Tensor& hidden, const at::Tensor& adaptive_mod,
     at::TensorList k_caches, at::TensorList v_caches,
-    at::IntArrayRef prefix_lens) {
+    at::IntArrayRef prefix_lens,
+    at::IntArrayRef planned_stage_descriptor) {
     auto* m = Qwen3_5Registry::get(handle, "rpu_qwen3_5_action_forward");
     std::vector<at::Tensor> kc(k_caches.begin(), k_caches.end());
     std::vector<at::Tensor> vc(v_caches.begin(), v_caches.end());
-    return m->forward_action(hidden, adaptive_mod, kc, vc, prefix_lens);
+    return m->forward_action(
+        hidden, adaptive_mod, kc, vc, prefix_lens,
+        planned_stage_descriptor);
 }
 
 at::Tensor rpu_qwen3_5_action_step_forward(
@@ -1953,12 +4313,58 @@ at::Tensor rpu_qwen3_5_action_step_forward(
     const at::Tensor& action_keep_mask, at::Tensor action_out,
     double delta_t, const at::Tensor& adaptive_mod,
     at::TensorList k_caches, at::TensorList v_caches,
-    at::IntArrayRef prefix_lens, int64_t num_steps) {
+    at::IntArrayRef prefix_lens, int64_t num_steps,
+    at::IntArrayRef planned_stage_descriptor) {
     auto* m = Qwen3_5Registry::get(
         handle, "rpu_qwen3_5_action_step_forward");
     std::vector<at::Tensor> kc(k_caches.begin(), k_caches.end());
     std::vector<at::Tensor> vc(v_caches.begin(), v_caches.end());
     return m->forward_action_step(
         action, action_keep_mask, action_out, delta_t,
-        adaptive_mod, kc, vc, prefix_lens, num_steps);
+        adaptive_mod, kc, vc, prefix_lens, num_steps,
+        planned_stage_descriptor);
+}
+
+at::Tensor rpu_qwen3_5_action_rtc_step_forward(
+    int64_t handle, const at::Tensor& action,
+    const at::Tensor& action_keep_mask, at::Tensor action_out,
+    const at::Tensor& action_prefix, int64_t action_prefix_len,
+    double delta_t, const at::Tensor& adaptive_mod,
+    at::TensorList k_caches, at::TensorList v_caches,
+    at::IntArrayRef prefix_lens, int64_t num_steps,
+    at::IntArrayRef planned_stage_descriptor) {
+    auto* m = Qwen3_5Registry::get(
+        handle, "rpu_qwen3_5_action_rtc_step_forward");
+    std::vector<at::Tensor> kc(k_caches.begin(), k_caches.end());
+    std::vector<at::Tensor> vc(v_caches.begin(), v_caches.end());
+    return m->forward_action_rtc_step(
+        action, action_keep_mask, action_out,
+        action_prefix, action_prefix_len, delta_t,
+        adaptive_mod, kc, vc, prefix_lens, num_steps,
+        planned_stage_descriptor);
+}
+
+at::Tensor rpu_qwen3_5_action_rtc_trace_forward(
+    int64_t handle, const at::Tensor& action,
+    const at::Tensor& action_keep_mask, at::Tensor action_out,
+    const at::Tensor& action_prefix, int64_t action_prefix_len,
+    double delta_t, const at::Tensor& adaptive_mod,
+    at::TensorList k_caches, at::TensorList v_caches,
+    at::IntArrayRef prefix_lens,
+    at::Tensor trace_pre_action,
+    at::Tensor trace_action_embed,
+    at::Tensor trace_final_hidden,
+    at::Tensor trace_velocity,
+    at::Tensor trace_post_action,
+    at::IntArrayRef planned_stage_descriptor) {
+    auto* m = Qwen3_5Registry::get(
+        handle, "rpu_qwen3_5_action_rtc_trace_forward");
+    std::vector<at::Tensor> kc(k_caches.begin(), k_caches.end());
+    std::vector<at::Tensor> vc(v_caches.begin(), v_caches.end());
+    return m->forward_action_rtc_trace(
+        action, action_keep_mask, action_out,
+        action_prefix, action_prefix_len, delta_t,
+        adaptive_mod, kc, vc, prefix_lens,
+        trace_pre_action, trace_action_embed, trace_final_hidden,
+        trace_velocity, trace_post_action, planned_stage_descriptor);
 }

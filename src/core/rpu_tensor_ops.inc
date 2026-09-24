@@ -32,12 +32,29 @@ using namespace at;
 bool graph_aware_rpu_to_cpu_zerocopy_sync();
 
 // ------------------------ RPUAllocator ------------------------
-// 支持切换 direct allocator 和 caching allocator
-extern bool g_rpu_caching_allocator_enabled;
+// The process policy is frozen atomically by the first non-empty allocation,
+// or earlier by an explicit cold declaration through set_caching_allocator.
+bool rpu_caching_allocator_for_allocation();
 
 bool rpu_device_nodes_accessible() {
   return ::access("/dev/rpu", R_OK | W_OK) == 0 &&
          ::access("/dev/mem", R_OK | W_OK) == 0;
+}
+
+static void* rpu_allocate_registered_ddr(size_t nbytes) {
+  void* ptr = rhino_lkn::RpuDdrAlloc(nbytes);
+  if (!ptr) {
+    throw std::bad_alloc();
+  }
+  try {
+    rpu_register_ddr_dma_allocation(ptr, nbytes);
+  } catch (...) {
+    // Registration is part of the direct-allocation transaction. A registry
+    // invariant failure must not strand the physical HostDDR allocation.
+    rhino_lkn::RpuDdrFree(ptr);
+    throw;
+  }
+  return ptr;
 }
 
 struct RPUAllocator final : public c10::Allocator {
@@ -52,18 +69,17 @@ struct RPUAllocator final : public c10::Allocator {
         "RPU device is unavailable to this process: require read/write access "
         "to /dev/rpu and /dev/mem");
 
-    if (g_rpu_caching_allocator_enabled) {
-      // 使用 caching allocator
-      return rpu::RPUCachingAllocatorAdapter::get().allocate(nbytes);
-    } else {
+    return rpu_tensor_ddr_lifecycle().run_allocation([&]() -> at::DataPtr {
+      if (rpu_caching_allocator_for_allocation()) {
+        // 使用 caching allocator
+        return rpu::RPUCachingAllocatorAdapter::get().allocate(nbytes);
+      }
+
       // 使用 direct allocator
-      void *ptr = rhino_lkn::RpuDdrAlloc(nbytes);
-      if (!ptr)
-        throw std::bad_alloc();
-      rpu_register_ddr_dma_allocation(ptr, nbytes);
+      void* ptr = rpu_allocate_registered_ddr(nbytes);
       return {ptr, ptr, &rpu_free_registered_ddr,
               at::Device(c10::DeviceType::PrivateUse1, 0)};
-    }
+    });
   }
   void copy_data(void *dest, const void *src,
                  std::size_t count) const override {
@@ -186,31 +202,17 @@ at::Tensor rpu_view(const at::Tensor &self, at::IntArrayRef new_sizes) {
   // compute new strides as contiguous for simplicity
   std::vector<int64_t> new_strides = compute_contiguous_strides(new_sizes);
 
-  auto storage = self.storage();
-  auto new_tensor_impl = c10::make_intrusive<at::TensorImpl>(
-      c10::Storage(std::move(storage)),
-      c10::DispatchKeySet{c10::DispatchKey::PrivateUse1}, self.dtype());
-
-  // preserve storage offset
-  new_tensor_impl->set_storage_offset(self.storage_offset());
-  new_tensor_impl->set_sizes_and_strides(new_sizes, new_strides);
-
-  return at::Tensor(std::move(new_tensor_impl));
+  // A view inherits the base tensor's inference state, independently of the
+  // caller's current InferenceMode. A fresh TensorImpl incorrectly follows
+  // the caller and cannot inherit a normal base's version counter.
+  return at::native::as_strided_tensorimpl(
+      self, new_sizes, new_strides, self.storage_offset());
 }
 
 at::Tensor rpu_as_strided(const at::Tensor &self, at::IntArrayRef size,
                           at::IntArrayRef stride,
                           c10::optional<int64_t> storage_offset) {
-  // as_strided 是视图操作，直接在 RPU 上创建新的视图
-  auto storage = self.storage();
-  auto new_tensor_impl = c10::make_intrusive<at::TensorImpl>(
-      c10::Storage(std::move(storage)),
-      c10::DispatchKeySet{c10::DispatchKey::PrivateUse1}, self.dtype());
-
-  new_tensor_impl->set_storage_offset(storage_offset.value_or(self.storage_offset()));
-  new_tensor_impl->set_sizes_and_strides(size, stride);
-
-  return at::Tensor(std::move(new_tensor_impl));
+  return at::native::as_strided_tensorimpl(self, size, stride, storage_offset);
 }
 
 // at::Tensor rpu_transpose(const at::Tensor &self, int64_t dim0, int64_t dim1)
@@ -233,14 +235,8 @@ at::Tensor rpu_transpose(const at::Tensor &self, int64_t dim0, int64_t dim1) {
   // // properly registers aliasing with autograd.
   // return self.alias_with_sizes_and_strides(sizes, strides);
 
-  auto storage = self.storage();
-  auto new_tensor_impl = c10::make_intrusive<at::TensorImpl>(
-      c10::Storage(std::move(storage)),
-      c10::DispatchKeySet{c10::DispatchKey::PrivateUse1}, self.dtype());
-  new_tensor_impl->set_storage_offset(self.storage_offset());
-  new_tensor_impl->set_sizes_and_strides(sizes, strides);
-
-  return at::Tensor(std::move(new_tensor_impl));
+  return at::native::as_strided_tensorimpl(
+      self, sizes, strides, self.storage_offset());
 }
 
 // ------------------------ expand (view operation) ------------------------
@@ -297,15 +293,8 @@ at::Tensor rpu_expand(const at::Tensor &self, at::IntArrayRef size, bool implici
     }
   }
 
-  // Create new tensor view with same storage but different sizes/strides
-  auto storage = self.storage();
-  auto new_tensor_impl = c10::make_intrusive<at::TensorImpl>(
-      c10::Storage(std::move(storage)),
-      c10::DispatchKeySet{c10::DispatchKey::PrivateUse1}, self.dtype());
-  new_tensor_impl->set_storage_offset(self.storage_offset());
-  new_tensor_impl->set_sizes_and_strides(new_sizes, new_strides);
-
-  return at::Tensor(std::move(new_tensor_impl));
+  return at::native::as_strided_tensorimpl(
+      self, new_sizes, new_strides, self.storage_offset());
 }
 
 // ------------------------ unsqueeze (view operation) ------------------------
@@ -348,15 +337,8 @@ at::Tensor rpu_unsqueeze(const at::Tensor &self, int64_t dim) {
     new_strides.push_back(old_strides[i]);
   }
 
-  // Create new tensor view with same storage but different sizes/strides
-  auto storage = self.storage();
-  auto new_tensor_impl = c10::make_intrusive<at::TensorImpl>(
-      c10::Storage(std::move(storage)),
-      c10::DispatchKeySet{c10::DispatchKey::PrivateUse1}, self.dtype());
-  new_tensor_impl->set_storage_offset(self.storage_offset());
-  new_tensor_impl->set_sizes_and_strides(new_sizes, new_strides);
-
-  return at::Tensor(std::move(new_tensor_impl));
+  return at::native::as_strided_tensorimpl(
+      self, new_sizes, new_strides, self.storage_offset());
 }
 
 // ------------------------ arange (creation op, fallback to CPU) ------------------------
@@ -418,7 +400,7 @@ static at::Tensor rpu_to_cpu_zerocopy_impl(const at::Tensor &rpu_tensor,
                                            bool graph_sync) {
   TORCH_CHECK(rpu_tensor.device().type() == c10::DeviceType::PrivateUse1,
               "rpu_to_cpu_zerocopy: input must be on RPU device");
-  // Defensive sync: callers that invoke this helper directly (for example,
+  // Q2 (task #63):defensive sync — 内部直接调本函数的 op (e.g.
   // rpu_linear CPU fallback / rpu_eltwise_binary CPU fallback) 期望立即拿到
   // 有效 DDR data。RECORDING + pending nodes 时 sync_point() 把已录前缀 oneshot
   // 落地。注意:PyTorch `tensor.to('cpu')` 的 Composite 分解走 CPU side memcpy
@@ -910,7 +892,7 @@ Tensor rpu_to_copy(const Tensor &self,
   // Zero-copy optimization: 仅 RPU -> CPU 且 dtype 相同
   // RPU 内存一定在共享 DDR 上，所以这是安全的
   //
-  // Graph RECORDING 期 zero-copy 不安全 — 此刻 RPU kernels 还在
+  // Q2 (task #63):graph RECORDING 期 zero-copy 不安全 — 此刻 RPU kernels 还在
   // nodes_ 没跑,直接返回 DDR view 让 CPU 读到 stale 数据。Pi0.5 denoise loop
   // 内 adapters/pi05/adarms.py:399 触发本路径 → action_out_proj CPU fp32 读
   // stale fp16 → Euler `x_t += dt*v_t` 累积放大成 0.6 量级偏差。
@@ -1277,17 +1259,10 @@ at::Tensor rpu_bmm(const at::Tensor &self, const at::Tensor &mat2) {
   return result;
 }
 
-// Unified layout SDPA: accepts [batch, seq_len, num_heads, head_dim] format (4D unified)
-// Different from standard PyTorch [batch, num_heads, seq_len, head_dim]
-// Only difference: dimensions 1 and 2 are swapped (seq_len and heads)
-//
-// CPU-only compatibility path. The former eager device implementation was not
-// numerically reliable for this general contract. Production fused decoders
-// use their validated SPM attention path instead.
-//
-// The CPU branch below already existed as the fallback for unsupported shapes;
-// it is now the whole function, and it honours attn_mask / dropout_p /
-// enable_gqa, which the unified-layout half of it previously dropped.
+// Unified-layout SDPA accepts [batch, seq_len, num_heads, head_dim].
+// Dimensions 1 and 2 are swapped relative to PyTorch's SDPA layout.
+// This eager entry point runs on CPU and preserves attn_mask, dropout_p and
+// enable_gqa. Fused decoders use the separate SPM SDPA launcher.
 namespace {
 
 // Shared CPU body. `unified` says how to READ the caller's tensors; it is the
@@ -1326,18 +1301,10 @@ Tensor sdpa_on_cpu(
 
 }  // namespace
 
-// aten::scaled_dot_product_attention — PyTorch layout [batch, heads, seq, dim],
-// which is what the ATen schema means, unconditionally.
-//
-// This used to be registered to the *unified* function below, which had to
-// recover the layout from the shapes: `is_pytorch_layout = (size(3) != 128)`.
-// That guess is wrong for exactly the most common case in this repo — a
-// PyTorch-layout caller with head_dim == 128 (Qwen3, Qwen2.5, ...) was read as
-// unified, silently transposed, and returned garbage at the SAME output shape:
-// measured cos 0.126 via plain F.scaled_dot_product_attention, while head_dim
-// 64 through the identical call path was cos 0.999997. Two entry points with
-// two different layout contracts cannot share one function without guessing, so
-// they no longer do. Gate: tests/ops/test_sdpa_entry_point_layouts.py.
+// aten::scaled_dot_product_attention always uses PyTorch's
+// [batch, heads, seq, dim] layout. Keep it separate from the unified-layout
+// entry point: dimensions cannot be inferred from head_dim without ambiguity.
+// See tests/ops/test_sdpa_entry_point_layouts.py.
 Tensor rpu_scaled_dot_product_attention(
     const Tensor &query, const Tensor &key, const Tensor &value,
     const optional<Tensor> &attn_mask, double dropout_p, bool is_causal,

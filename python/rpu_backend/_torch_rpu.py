@@ -31,10 +31,11 @@ def configure_torch_rpu(
     rpu_module.manual_seed_all = manual_seed_all
 
     for name in (
-        "set_debug set_profile set_debug_export set_spm_debug "
-        "get_debug get_profile get_debug_export get_spm_debug "
-        "get_debug_tensor clear_debug_tensors list_debug_tensors "
-        "spm_alloc_dump reset_profile_accumulators"
+        "set_debug set_profile set_spm_debug "
+        "get_debug get_profile get_spm_debug "
+        ""
+        "spm_alloc_dump reset_profile_accumulators "
+        "set_hw_perf_trace get_hw_perf_trace hw_perf_trace"
     ).split():
         setattr(rpu_module, name, getattr(debug, name))
 
@@ -47,7 +48,7 @@ def configure_torch_rpu(
         "empty_cache get_memory_stats memory_stats reset_peak_memory_stats "
         "reset_accumulated_memory_stats "
         "set_ddr_flush_force get_ddr_flush_force "
-        "get_spm_mode get_linear_acc32 "
+        "get_spm_mode "
         "set_cross_layer_batch_prefill "
         "set_cross_layer_batch_size "
         "is_available get_amp_supported_dtype is_autocast_available shutdown "
@@ -63,7 +64,8 @@ def configure_torch_rpu(
         for name in (
             "rms_norm apply_rotary_pos_emb "
             "insert_vcache insert_kcache "
-            "insert_vcache_arena insert_kcache_arena"
+            "insert_vcache_arena insert_kcache_arena insert_kvcache_arena "
+            "resolve_kvcache_arena_plan"
         ).split():
             if hasattr(cpp_ext, name):
                 setattr(rpu_module, name, getattr(cpp_ext, name))
@@ -98,11 +100,15 @@ def manual_seed_all(seed: int) -> None:
     ``torch.Generator(device='rpu')`` raises ("Please register
     PrivateUse1HooksInterface..."), so ``torch.randn(..., device='rpu')`` is
     served by the CPU fallback and draws from the CPU **global** RNG, which
-    ``torch.manual_seed`` seeds itself.
+    ``torch.manual_seed`` seeds itself. Measured on device (2026-08-10, SDK
+    05E): after ``torch.manual_seed(1234)``, ``randn(64, device='rpu')`` and
+    ``randn(64).to('rpu')`` hash identically, and repeat across processes.
 
     So the seed already takes effect, and this function has nothing left to do.
-    Registering it (with :func:`_is_in_bad_fork`) also prevents PyTorch from
-    emitting an inapplicable warning that the seed does not take effect.
+    Registering it (with :func:`_is_in_bad_fork`) also retires PyTorch's
+    ``Set seed for `rpu` device does not take effect`` UserWarning — which was
+    false, and is the traced origin of a "manual_seed does not seed rpu
+    tensors" folklore that survived months in this repo's methodology.
 
     It must stay a no-op rather than, say, re-seeding the CPU generator:
     ``_manual_seed_impl`` calls this BEFORE ``default_generator.manual_seed``,

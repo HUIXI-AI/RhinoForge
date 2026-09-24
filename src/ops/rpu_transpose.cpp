@@ -5,7 +5,7 @@
 //
 // Kernel: transpose_ncb_c16 (order "120", get_tailb_config)
 //
-// Register mapping for get_tailb_config:
+// Register mapping:
 //   params[0:1]  = spm_in_byte_base   (32-bit)
 //   params[2:3]  = spm_out_byte_base  (32-bit)
 //   params[4]    = data_type           (1=fp16)

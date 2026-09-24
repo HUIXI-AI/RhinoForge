@@ -1,5 +1,5 @@
 // rpu_ddr_buffer_registry.h — shape-keyed at::Tensor registry for DMA-baked
-// DDR buffers in FusedModelBase.
+// DDR buffers in FusedModelBase. See spec §3 and §9.
 //
 // Why this exists: DMA src/dst addresses are baked into kd_buf at
 // Queue_t::build_batch and have no sync_mutable_params equivalent. Any DMA
@@ -55,16 +55,14 @@ public:
     //
     // Layer-0 input no longer needs a registry-owned staging slot — it uses
     // a mutable DMA referencing the caller's per-forward `hidden_states`
-    // directly.
+    // directly through add_dma_kernel_mutable.
     const Entry& get(const ShapeKey& key, at::TensorOptions opts,
                      bool need_ab, bool need_out);
 
-    // Bound on distinct shapes per handle. NOT evictable: `out` is handed to
-    // the subclass as output_tensor_ and `a`/`b` are the DDR ping-pong bases
-    // baked into every inner layer's DMA at BUILD, so dropping an entry would
-    // leave a cached graph writing to a reissued VA (C-1).
-    // The limit leaves headroom for supported profile shape sets while failing
-    // early enough to prevent unbounded per-handle DDR growth.
+    // Bound on distinct shapes per handle. Entries cannot be evicted: output_tensor_
+    // and the DDR ping-pong bases are baked into DMA nodes at BUILD. Releasing an
+    // entry while a cached graph exists could let REPLAY access reissued storage.
+    // The bound limits growth from requests that continually introduce new shapes.
     static constexpr size_t kMaxShapes = 64;
 
 private:

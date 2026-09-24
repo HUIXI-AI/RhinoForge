@@ -19,15 +19,17 @@ Shape choices, driven by the LingBot-VLA-V2 adapter's real interface:
 - The denoise step count is fixed at 10 and is not a per-call argument. The
   ordinary generic profiles default to one ten-step graph with FP16 Euler state;
   exact ``runtime_env={"RPU_LINGBOT2_DENOISE_UNROLL": "0"}`` restores the
-  host-FP32 Euler loop for a controlled comparison.
+  legacy host-FP32 Euler loop for a controlled comparison.
 
 Router: the MoE router is strict fp16-storage top-4, and it is the DEFAULT — no flag
 needed. (``RPU_LINGBOT2_DEBUG_DENSE_SOFT_ROUTER=1`` still selects the dense-soft
-diagnostic path, which is ACCURACY_UNVALIDATED and must not be used in production.)
+bring-up bypass, which is ACCURACY_UNVALIDATED and must not be used for delivery.)
 
-The public upstream integration is source-only and is not a Supported/GA model
-profile. ``.to('rpu')`` therefore stays fail-closed unless the compatibility-
-named ``RPU_LINGBOT2_ALLOW_UNVALIDATED=1`` is set exactly.
+The exact-Z2 W8A16 three-image REAL215..225/P225 envelope has controlled
+temporary support under blocking CI, but is not formally or robot certified.
+FP16, W4 and other profiles remain evaluation-only. ``.to('rpu')`` stays
+fail-closed unless the compatibility-named
+``RPU_LINGBOT2_ALLOW_UNVALIDATED=1`` is set exactly.
 
 Adapter code is lazy-imported inside methods so ``rpu_backend.api`` stays cheap to
 import in downstream control/data tooling.
@@ -35,6 +37,7 @@ import in downstream control/data tooling.
 
 from __future__ import annotations
 
+from pathlib import Path
 import dataclasses
 import functools
 import os
@@ -45,8 +48,6 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 import torch
-
-from rpu_backend.api._runtime_env import normalize_runtime_env
 
 # Real robot DoF count. The model emits 55 action dims; 16..54 are unsupervised
 # padding and must not be fed to a robot or scored for accuracy.
@@ -76,8 +77,7 @@ _PROFILE_ENV: dict[str, dict[str, str]] = {
     # FP16 uses the same grouped-expert topology as W8/W4, while keeping FP16
     # packed weights.  This cuts the routed-expert launch fan-out without
     # changing the public precision contract.  The grouped down projection
-    # accumulates internally in FP32 and writes FP16. Keep the m304/n80 shape
-    # override for this profile; it still uses the current autotile family.
+    # accumulates internally in FP32 and writes FP16.
     # Retain the validated global replay selector as the fallback when a caller
     # explicitly disables denoise unroll.
     "fp16": {
@@ -108,7 +108,7 @@ _PROFILE_ENV: dict[str, dict[str, str]] = {
 
 # Structural defaults. The ordinary precision bundles live in _PROFILE_ENV
 # above; callers can still override every switch explicitly through
-# runtime_env.
+# runtime_env for a controlled A/B. Physical-Z2-only controls remain off here.
 _STRUCTURAL_ENV: dict[str, str] = {
     "RPU_LINGBOT2_GROUPED_EXPERTS": "0",
     "RPU_LINGBOT2_FP16_TOP4": "1",
@@ -118,6 +118,7 @@ _STRUCTURAL_ENV: dict[str, str] = {
     "RPU_LINGBOT2_HOST_PREFIX_OPT": "1",
     "RPU_LINGBOT2_VISION_DIRECT_PREFIX": "0",
     "RPU_LINGBOT2_VISION_DIRECT_PREFIX_NO_OUTPUT": "0",
+    "RPU_LINGBOT2_MULTIVIEW_SPM_Z2": "0",
     "RPU_LINGBOT2_DENOISE_UNROLL": "0",
     "RPU_LINGBOT2_ADARMS_DIRECT_SCHEDULE": "0",
     "RPU_LINGBOT2_VLM_REPLAY": "1",
@@ -148,12 +149,101 @@ _DENOISE_UNROLL_CAPACITY_DEFAULTS: dict[str, str] = {
     "LKN_INSTR_BUF_MB": "128",
 }
 
-# Dense FP16 emits a larger ten-step Graph than grouped W8/W4, so it uses a
-# larger queue and instruction-buffer envelope.
+# Dense FP16 emits a materially larger ten-step Graph than grouped W8/W4.  Its
+# historical 145,284-node upper observation does not fit the 131,072-entry
+# quantized tier, so use the already proven conservative envelope by default.
 _DENSE_FP16_DENOISE_UNROLL_CAPACITY_DEFAULTS: dict[str, str] = {
     "LKN_MAX_BATCH_ENTRIES": "262144",
     "LKN_KD_BUF_MB": "64",
     "LKN_INSTR_BUF_MB": "512",
+}
+
+# The dense-FP16 multiview-Z2 profile has the larger denoise Graph: 145,284
+# batch entries versus the earlier grouped/W8 graph's 59,404.  Use the larger
+# envelope for all three sealed profiles so profile admission is the only
+# variable in the first A/B; queue shrinking is a separate optimization.
+_MULTIVIEW_SPM_Z2_QUEUE_ENV: dict[str, str] = {
+    "LKN_MAX_BATCH_ENTRIES": "262144",
+    # The earlier 59,404-entry grouped/W8 graph already consumed 11.94 MiB KD
+    # and 112.32 MiB instructions.  The ungrouped graph is 145,284 entries;
+    # reserve the next conservative tiers so its first successful pre-scan does
+    # not merely move from the entry-cap failure to rc=3/4 buffer overflow.
+    "LKN_KD_BUF_MB": "64",
+    "LKN_INSTR_BUF_MB": "512",
+}
+
+# The physical-Z2 path admits exactly three typed layouts.  Its replay portion
+# enables the generic full-body replay and redundant-sync skip consumed by the
+# separate denoise Graph.  Physical Vision/Text members carry a non-zero
+# pipeline lease epoch, so they cannot enter the ordinary FMB skip path; their
+# outer owner remains on the audited occurrence walk.  The exact host ingress
+# packs three raw patch slabs without changing those native occurrences.  The
+# sealed dtype profile owns CPU-versus-device patch embedding and the bounded
+# denoise deep-replay result.  Component-local Vision/Prefill replay stays off.
+_MULTIVIEW_SPM_Z2_COMMON_ENV: dict[str, str] = {
+    "RPU_LINGBOT2_DENOISE_UNROLL": "1",
+    "RPU_LINGBOT2_ADARMS_DIRECT_SCHEDULE": "0",
+    "RPU_LINGBOT2_EXPERT_REPLAY": "1",
+    "RPU_LINGBOT2_FP16_TOP4": "1",
+    "RPU_QWEN3VL_VISION_FUSED_MERGER": "1",
+    "RPU_QWEN3VL_VISION_ROPE_SPM": "1",
+    "RPU_WALL_OSS_FAST_REPLAY": "1",
+    "RPU_FASTREPLAY_SKIP_SYNC": "1",
+    "RPU_LINGBOT2_VISION_DIRECT_PREFIX": "0",
+    "RPU_LINGBOT2_VISION_DIRECT_PREFIX_NO_OUTPUT": "0",
+    "RPU_LINGBOT2_VISION_FAST_REPLAY": "0",
+    "RPU_LINGBOT2_PREFILL_FAST_REPLAY": "0",
+    "RPU_LINGBOT2_VISION_PACKED_PREP": "1",
+    "RPU_QWEN3VL_VISION_HOST_FP32_PATCH": "0",
+    "RPU_QWEN3VL_VISION_BATCH": "0",
+    "RPU_KVINSERT_HYBRID_V16": "0",
+    "RPU_KVINSERT_HYBRID3_V16": "0",
+    "RPU_ADARMS_FUSED_BCAST": "0",
+}
+
+_MULTIVIEW_SPM_Z2_PROFILE_ENV: dict[str, dict[str, str]] = {
+    "dense_fp16": {
+        "RPU_DEEP_FAST_REPLAY": "0",
+        "RPU_QWEN3VL_VISION_PATCH_EMBED_DEVICE": "0",
+        "RPU_LINGBOT2_GROUPED_EXPERTS": "0",
+        "RPU_LINGBOT2_EXPERT_W8A16": "0",
+        "RPU_LINGBOT2_EXPERT_W4A16": "0",
+        "RPU_LINGBOT2_PREFILL_W8A16": "0",
+        "RPU_LINGBOT2_PREFILL_W4A16": "0",
+        "RPU_LINGBOT2_BASE_W8A16": "0",
+        "RPU_LINGBOT2_VISION_W8A16": "0",
+        "RPU_L2_RCHUNK": "0",
+    },
+    "grouped_w8a16": {
+        "RPU_DEEP_FAST_REPLAY": "1",
+        "RPU_QWEN3VL_VISION_PATCH_EMBED_DEVICE": "1",
+        "RPU_LINGBOT2_GROUPED_EXPERTS": "1",
+        "RPU_LINGBOT2_EXPERT_W8A16": "1",
+        "RPU_LINGBOT2_EXPERT_W4A16": "0",
+        "RPU_LINGBOT2_PREFILL_W8A16": "1",
+        "RPU_LINGBOT2_PREFILL_W4A16": "0",
+        "RPU_LINGBOT2_BASE_W8A16": "1",
+        "RPU_LINGBOT2_VISION_W8A16": "1",
+        "RPU_L2_RCHUNK": "1632",
+    },
+    "grouped_w4a16": {
+        "RPU_DEEP_FAST_REPLAY": "1",
+        "RPU_QWEN3VL_VISION_PATCH_EMBED_DEVICE": "1",
+        "RPU_LINGBOT2_GROUPED_EXPERTS": "1",
+        "RPU_LINGBOT2_EXPERT_W8A16": "0",
+        "RPU_LINGBOT2_EXPERT_W4A16": "1",
+        "RPU_LINGBOT2_PREFILL_W8A16": "1",
+        "RPU_LINGBOT2_PREFILL_W4A16": "0",
+        "RPU_LINGBOT2_BASE_W8A16": "1",
+        "RPU_LINGBOT2_VISION_W8A16": "1",
+        "RPU_L2_RCHUNK": "1632",
+    },
+}
+
+_MULTIVIEW_SPM_Z2_DTYPE_PROFILE: dict[str, str] = {
+    "fp16": "dense_fp16",
+    "w8a16": "grouped_w8a16",
+    "w4a16": "grouped_w4a16",
 }
 
 # Build a complete profile snapshot on every construction. Without explicit OFF
@@ -179,20 +269,7 @@ _PROFILE_DEFAULT_ENV.update({
 
 # These debug switches are enabled by mere presence in the native code. They
 # must be removed, not assigned "0", before applying a fresh profile snapshot.
-_PROFILE_CLEAR_ENV = frozenset({"RPU_L2_BUFONLY"})
-
-_RUNTIME_ENV_ALLOWLIST = frozenset({
-    *_PROFILE_DEFAULT_ENV,
-    *_STRUCTURAL_ENV,
-    *_DENOISE_UNROLL_CAPACITY_DEFAULTS,
-    *_DENSE_FP16_DENOISE_UNROLL_CAPACITY_DEFAULTS,
-    *_PROFILE_CLEAR_ENV,
-    "RPU_LINGBOT2_ALLOW_UNVALIDATED",
-    "RPU_LINGBOT2_ENCODER_1THREAD",
-    "RPU_LINGBOT2_PREPROC",
-    "RPU_LINGBOT2_QWEN3VL_BASE",
-    "RPU_QWEN3VL_VISION_BATCH_CAP",
-})
+_PROFILE_CLEAR_ENV = frozenset({"RPU_L2_BUFONLY", "RPU_L2_ADDR"})
 
 # LingBot2's native graph state and its profile switches are process-global.
 # Serialize every facade build/inference/close/finalizer transaction so a second
@@ -215,34 +292,99 @@ def _serialized_policy_call(method):
     """Serialize inference with construction/close over shared graph scratch."""
     @functools.wraps(method)
     def wrapped(self, *args, **kwargs):
-        with _RPU_POLICY_RUNTIME_LOCK:
-            with self._rpu_build_lock:
-                return method(self, *args, **kwargs)
+        from rpu_backend.api._execution import execution_guard
+
+        with execution_guard(self):
+            with _RPU_POLICY_RUNTIME_LOCK:
+                with self._rpu_build_lock:
+                    return method(self, *args, **kwargs)
+    return wrapped
+
+
+def _serialized_policy_build(method):
+    """Keep construction cold under the same Session/runtime/build lock order."""
+    @functools.wraps(method)
+    def wrapped(self, *args, **kwargs):
+        from rpu_backend.api._execution import _require_execution_process_safe
+
+        session = self._execution_session
+        with session._lock:
+            _require_execution_process_safe()
+            state = session.stats()["state"]
+            if state != "QUIESCENT":
+                raise RuntimeError(
+                    "Lingbot2Policy.to('rpu') requires a quiescent execution "
+                    f"session; state={state.lower()}"
+                )
+            if not self._rpu_ready:
+                session.require_cold()
+            with _RPU_POLICY_RUNTIME_LOCK:
+                with self._rpu_build_lock:
+                    return method(self, *args, **kwargs)
     return wrapped
 
 
 def _finalize_runtime_policy(policy, env_snapshot=None) -> bool:
-    """Best-effort facade finalizer; the runtime owns native-handle details."""
-    with _RPU_POLICY_RUNTIME_LOCK:
-        try:
-            policy.close()
-        except Exception:
-            return False
-        _restore_environment(env_snapshot)
-        return True
+    """GC delegates to the same graph-aware, live-owner-checked retirement."""
+    from contextlib import nullcontext
+
+    try:
+        session = getattr(policy, "_execution_session", None)
+        lock = session._lock if session is not None else nullcontext()
+    except ReferenceError:
+        lock = nullcontext()
+    with lock:
+        with _RPU_POLICY_RUNTIME_LOCK:
+            if not policy._gc_retire():
+                return False
+            _restore_environment(env_snapshot)
+            return True
 
 
 def _runtime_policy_complete(policy) -> bool:
-    finalizer = getattr(policy, "_handle_finalizer", None)
     return bool(
         policy is not None
         and not getattr(policy, "_closed", True)
         and getattr(policy, "_exp", None) is not None
         and getattr(policy, "_text", None) is not None
         and getattr(policy, "_visual", None) is not None
-        and finalizer is not None
-        and getattr(finalizer, "alive", False)
+        and getattr(policy, "_gc_retirement_enabled", False)
+        and getattr(policy, "_cleanup_ok", None) is None
+        and getattr(policy, "_rpu_swizzled", False)
     )
+
+
+def _resolve_use_qwen3_chat_template(
+    checkpoint: str | os.PathLike[str],
+    training_config: str | os.PathLike[str] | None,
+) -> bool:
+    """Resolve the public prompt format before any weight materialization."""
+    config_path = None if training_config is None else Path(training_config)
+    if config_path is None:
+        candidates = sorted(Path(checkpoint).glob("lingbotvla_cli*.y*ml"))
+        config_path = candidates[0] if candidates else None
+    if config_path is None:
+        # LingbotVLAV2Config owns this exact public-profile default upstream.
+        return True
+
+    import yaml
+
+    with config_path.open("r", encoding="utf-8") as stream:
+        document = yaml.safe_load(stream) or {}
+    if not isinstance(document, Mapping):
+        raise ValueError("LingBot-VLA-V2 training config must be a mapping")
+    merged: dict[str, Any] = {}
+    for section_name in ("model", "train"):
+        section = document.get(section_name, {}) or {}
+        if not isinstance(section, Mapping):
+            raise ValueError(
+                f"LingBot-VLA-V2 training config [{section_name}] must be a mapping"
+            )
+        merged.update(section)
+    enabled = merged.get("use_qwen3_chat_template", True)
+    if not isinstance(enabled, bool):
+        raise ValueError("use_qwen3_chat_template must be true or false")
+    return enabled
 
 
 @dataclasses.dataclass(frozen=True)
@@ -259,9 +401,9 @@ class Lingbot2ActionOutput:
     physical units.
 
     ``actions_normalized`` is the ``[H, 16]`` real-DoF slice in the model's normalized
-    space; ``actions_full`` is the untrimmed
+    space (what the old API returned as ``.actions``); ``actions_full`` is the untrimmed
     ``[H, 55]`` normalized grid the model emits (dims 16..54 are unsupervised padding).
-    Use these for comparisons against normalized-space reference output.
+    Use these for accuracy work against a normalized-space golden.
     """
 
     actions_normalized: torch.Tensor
@@ -329,6 +471,7 @@ class Lingbot2Policy:
         robot_config_path: str | os.PathLike[str] | None = None,
         action_norm_spec: Any | None = None,
         runtime_env: Mapping[str, str] | None = None,
+        rpu_execution: Mapping[str, Mapping[str, Any]] | None = None,
         qwen3vl_base: str | os.PathLike[str] | None = None,
     ) -> "Lingbot2Policy":
         """Create a policy bound to a LingBot-VLA-V2 checkpoint directory.
@@ -343,8 +486,10 @@ class Lingbot2Policy:
           ``w8a16``  — int8 weights / fp16 activations on expert+prefill+base+vision
           ``w4a16``  — group-wise int4 routed experts, the rest int8
 
-        These profiles expose the public upstream source integration only; none
-        is a Supported/GA or robot-certified release profile.
+        Only exact-Z2 ``w8a16`` at three-image REAL215..225/P225 has controlled
+        temporary support. ``fp16``, ``w4a16`` and other profiles remain
+        evaluation-only; none is formally or robot certified, and performance
+        conclusions do not inherit the W8 accuracy envelope.
 
         ``max_lang_tokens`` is a tokenizer truncation/admission cap (72 for the
         public checkpoint), not the semantic prompt length.  The tokenizer may
@@ -352,6 +497,11 @@ class Lingbot2Policy:
         by ``attention_mask`` and preserves the resulting variable REAL prefix.
         A prepared generic profile then adds its own masked 16-row execution-tail
         padding; those execution rows are never instruction tokens.
+
+        ``rpu_execution`` is the cold, immutable planner request for the
+        independent ``prefill``, ``vision`` and ``action`` children.  The
+        physical Z2 profile validates those requests against its native
+        composite descriptor before acquiring the shared SPM arena.
 
         Action de-normalization is required to obtain physical-unit actions, but is
         not sufficient for robot-control certification. The model emits a *normalized*
@@ -373,6 +523,34 @@ class Lingbot2Policy:
             raise ValueError(
                 f"dtype must be one of {sorted(_PROFILE_ENV)}, got {dtype!r}"
             )
+        from rpu_backend.api._execution import (
+            bind_execution_session,
+            normalize_rpu_execution,
+        )
+
+        from rpu_backend.adapters.lingbot_vla_v2.runtime import (
+            LINGBOT2_ACTION_COMPONENT,
+            LINGBOT2_EXECUTION_COMPONENTS,
+            LINGBOT2_TEXT_COMPONENT,
+            LINGBOT2_VISION_COMPONENT,
+            _validate_lingbot2_cold_execution_config,
+            resolve_lingbot2_execution_components,
+        )
+        execution_config = normalize_rpu_execution(
+            rpu_execution,
+            entry_point="Lingbot2Policy.from_checkpoint",
+            supported_components=LINGBOT2_EXECUTION_COMPONENTS,
+        )
+        resolved_execution = resolve_lingbot2_execution_components(
+            execution_config,
+            entry_point="Lingbot2Policy.from_checkpoint",
+        )
+        _validate_lingbot2_cold_execution_config(
+            execution_config,
+            multiview_spm_z2=(
+                (runtime_env or {}).get("RPU_LINGBOT2_MULTIVIEW_SPM_Z2") == "1"
+            ),
+        )
         inst = cls.__new__(cls)
         inst._ckpt_dir = os.fspath(ckpt_dir)
         inst._dtype = dtype
@@ -387,14 +565,26 @@ class Lingbot2Policy:
         inst._max_lang_tokens = int(max_lang_tokens)
         inst._robot_norm_path = None if robot_norm_path is None else os.fspath(robot_norm_path)
         inst._training_config_path = None if training_config_path is None else os.fspath(training_config_path)
+        inst._use_qwen3_chat_template = _resolve_use_qwen3_chat_template(
+            ckpt_dir, training_config_path
+        )
         inst._robot_config_path = None if robot_config_path is None else os.fspath(robot_config_path)
         inst._action_norm_spec = action_norm_spec
         inst._denorm = None
-        inst._runtime_env = normalize_runtime_env(
-            runtime_env,
-            owner="Lingbot2Policy",
-            allowed=_RUNTIME_ENV_ALLOWLIST,
-        )
+        inst._runtime_env = {str(k): str(v) for k, v in (runtime_env or {}).items()}
+        inst._rpu_execution = execution_config
+        inst._execution_components = {
+            LINGBOT2_VISION_COMPONENT: resolved_execution[1],
+            LINGBOT2_TEXT_COMPONENT: resolved_execution[2],
+            LINGBOT2_ACTION_COMPONENT: resolved_execution[3],
+        }
+        inst._vision_execution = resolved_execution[1]
+        inst._text_execution = resolved_execution[2]
+        inst._action_execution = resolved_execution[3]
+        inst._component_generations = {
+            component: 0 for component in LINGBOT2_EXECUTION_COMPONENTS
+        }
+        inst._execution_reconfigure_journal = None
         inst._qwen3vl_base = None if qwen3vl_base is None else os.fspath(qwen3vl_base)
         inst._rpu_ready = False
         inst._rpu_build_started = False
@@ -403,11 +593,40 @@ class Lingbot2Policy:
         inst._policy = None
         inst._policy_finalizer = None
         inst._env_snapshot = None
+        inst._processor_source = inst._ckpt_dir
         inst._processor = None
         inst._prepare_ms = {}
         inst._graph_profile = None
         inst._preproc_mode = "exact"        # real value set in .to() once env is applied
+        inst._execution_session = bind_execution_session(
+            inst,
+            execution_config,
+            entry_point="Lingbot2Policy",
+            supported_components=LINGBOT2_EXECUTION_COMPONENTS,
+            validate=inst._validate_execution_reconfigure,
+            apply=inst._apply_execution_reconfigure,
+            rollback=inst._rollback_execution_reconfigure,
+            cold_config_only=inst._cold_execution_configuration_only,
+            graph_mode=(
+                "NATIVE_COMPOSITE1"
+                if inst._runtime_env.get("RPU_LINGBOT2_MULTIVIEW_SPM_Z2") == "1"
+                else "COMPOSITE_CHILD"
+            ),
+        )
         return inst
+
+    def _cold_execution_configuration_only(self) -> bool:
+        state = vars(self)
+        return (
+            state.get("_rpu_build_started") is False
+            and state.get("_rpu_ready") is False
+            and state.get("_closed") is False
+            and state.get("_policy") is None
+            and state.get("_policy_finalizer") is None
+            and state.get("_graph_profile") is None
+            and state.get("_env_snapshot") is None
+            and not self._execution_session._config_views
+        )
 
     @property
     def dtype(self) -> str:
@@ -445,7 +664,157 @@ class Lingbot2Policy:
         profile["graph_counts"] = dict(profile["graph_counts"])
         return profile
 
-    @_serialized_policy_call
+    def _validate_execution_reconfigure(self, execution_config) -> None:
+        if self._closed:
+            raise RuntimeError("Lingbot2Policy is closed")
+        policy = self._policy
+        if _runtime_policy_complete(policy):
+            policy.validate_execution_reconfigure(execution_config)
+        else:
+            from rpu_backend.adapters.lingbot_vla_v2.runtime import (
+                _validate_lingbot2_cold_execution_config,
+            )
+            _validate_lingbot2_cold_execution_config(
+                execution_config,
+                multiview_spm_z2=(
+                    self._runtime_env.get(
+                        "RPU_LINGBOT2_MULTIVIEW_SPM_Z2"
+                    ) == "1"
+                ),
+            )
+
+    @staticmethod
+    def _resolve_execution(execution_config, *, entry_point):
+        from rpu_backend.adapters.lingbot_vla_v2.runtime import (
+            resolve_lingbot2_execution_components,
+        )
+        return resolve_lingbot2_execution_components(
+            execution_config, entry_point=entry_point
+        )
+
+    def _publish_execution_views(
+        self, resolved, *, component_generations
+    ) -> None:
+        from rpu_backend.adapters.lingbot_vla_v2.runtime import (
+            LINGBOT2_ACTION_COMPONENT,
+            LINGBOT2_TEXT_COMPONENT,
+            LINGBOT2_VISION_COMPONENT,
+        )
+        root, vision, text, action = resolved
+        self._rpu_execution = root
+        self._vision_execution = vision
+        self._text_execution = text
+        self._action_execution = action
+        self._component_generations = dict(component_generations)
+        self._execution_components = {
+            LINGBOT2_VISION_COMPONENT: vision,
+            LINGBOT2_TEXT_COMPONENT: text,
+            LINGBOT2_ACTION_COMPONENT: action,
+        }
+
+    def _apply_execution_reconfigure(
+        self, old_config, new_config, generation, *, force_rebuild=False
+    ) -> None:
+        with _RPU_POLICY_RUNTIME_LOCK:
+            with self._rpu_build_lock:
+                if self._closed:
+                    raise RuntimeError("Lingbot2Policy is closed")
+                old_resolved = self._resolve_execution(
+                    old_config,
+                    entry_point="Lingbot2Policy.reconfigure rollback",
+                )
+                new_resolved = self._resolve_execution(
+                    new_config,
+                    entry_point="Lingbot2Policy.reconfigure",
+                )
+                component_generations = dict(self._component_generations)
+                for component, old, new in zip(
+                    self._execution_components,
+                    old_resolved[1:],
+                    new_resolved[1:],
+                ):
+                    if old != new or force_rebuild:
+                        component_generations[component] += 1
+                self._execution_reconfigure_journal = {
+                    "resolved": old_resolved,
+                    "component_generations": dict(
+                        self._component_generations
+                    ),
+                    "mutation_started": False,
+                }
+                policy = self._policy
+                if _runtime_policy_complete(policy):
+                    try:
+                        policy.apply_execution_reconfigure(
+                            new_config, generation,
+                            **({"force_rebuild": True} if force_rebuild else {}),
+                        )
+                    except BaseException:
+                        runtime_journal = getattr(
+                            policy, "_execution_reconfigure_journal", None
+                        )
+                        self._execution_reconfigure_journal[
+                            "mutation_started"
+                        ] = bool(
+                            runtime_journal
+                            and runtime_journal.get(
+                                "mutation_started", False
+                            )
+                        )
+                        raise
+                    runtime_journal = getattr(policy, "_execution_reconfigure_journal", None)
+                    self._execution_reconfigure_journal["mutation_started"] = bool(
+                        runtime_journal and runtime_journal.get("mutation_started", False)
+                    )
+                    component_generations = dict(
+                        policy._component_generations
+                    )
+                    new_resolved = (
+                        policy._rpu_execution,
+                        policy._vision_execution,
+                        policy._text_execution,
+                        policy._action_execution,
+                    )
+                else:
+                    self._execution_reconfigure_journal[
+                        "mutation_started"
+                    ] = True
+                self._publish_execution_views(
+                    new_resolved,
+                    component_generations=component_generations,
+                )
+                self._graph_profile = None
+                # Keep the bounded undo journal until shared publication has
+                # completed; the next transaction replaces it.
+
+    def _rollback_execution_reconfigure(
+        self, old_config, _new_config, generation
+    ) -> None:
+        with _RPU_POLICY_RUNTIME_LOCK:
+            with self._rpu_build_lock:
+                journal = self._execution_reconfigure_journal
+                if journal is None:
+                    return
+                if _runtime_policy_complete(self._policy):
+                    # The runtime owns the native journal.  Its rollback is a
+                    # deliberate no-op when begin failed before mutation, but
+                    # still clears that journal for the next attempt.
+                    self._policy.rollback_execution_reconfigure(
+                        old_config, generation
+                    )
+                if not journal["mutation_started"]:
+                    self._execution_reconfigure_journal = None
+                    return
+                self._publish_execution_views(
+                    journal["resolved"],
+                    component_generations=journal[
+                        "component_generations"
+                    ],
+                )
+                self._graph_profile = None
+                self._execution_reconfigure_journal = None
+
+    @_serialized_policy_build
     def to(self, device: Any) -> "Lingbot2Policy":
         target = str(device)
         if not target.startswith("rpu"):
@@ -477,8 +846,10 @@ class Lingbot2Policy:
             from rpu_backend.api.errors import RPUBackendError
 
             raise RPUBackendError(
-                "LingBot-VLA-V2 is a source-only public-upstream integration "
-                "and is fail-closed by default. Set exactly "
+                "LingBot-VLA-V2 is fail-closed by default. Blocking CI grants "
+                "controlled temporary support only to exact-Z2 W8A16, three-image "
+                "REAL215..225/P225; FP16, W4 and other profiles remain "
+                "evaluation-only. Set exactly "
                 "RPU_LINGBOT2_ALLOW_UNVALIDATED=1 to enter a controlled path; "
                 "none is formally or robot certified."
             )
@@ -549,6 +920,67 @@ class Lingbot2Policy:
                     if key not in self._runtime_env and key not in os.environ:
                         env[key] = value
 
+            # The production multiview Z2 path owns one retained physical
+            # Vision->Text Graph and then hands the arena to fused denoise.
+            # Ambient process state must never opt a policy into this
+            # thread-affine lifecycle: only an exact per-policy "1" does so.
+            multiview_spm_z2 = (
+                self._runtime_env.get("RPU_LINGBOT2_MULTIVIEW_SPM_Z2") == "1"
+            )
+            env["RPU_LINGBOT2_MULTIVIEW_SPM_Z2"] = (
+                "1" if multiview_spm_z2 else "0"
+            )
+            if multiview_spm_z2:
+                z2_profile = _MULTIVIEW_SPM_Z2_DTYPE_PROFILE.get(self._dtype)
+                if z2_profile is None:
+                    raise ValueError(
+                        "RPU_LINGBOT2_MULTIVIEW_SPM_Z2=1 supports only the "
+                        "sealed Dense FP16, Grouped W8A16, or Grouped W4A16 "
+                        "profiles."
+                    )
+                if self._n_cameras != 3 or self._image_size != 256:
+                    raise ValueError(
+                        "RPU_LINGBOT2_MULTIVIEW_SPM_Z2=1 requires exactly "
+                        "3 cameras at image_size=256."
+                    )
+                if not denoise_unroll:
+                    raise ValueError(
+                        "RPU_LINGBOT2_MULTIVIEW_SPM_Z2=1 requires exact "
+                        "RPU_LINGBOT2_DENOISE_UNROLL=1."
+                    )
+
+                preproc = self._runtime_env.get(
+                    "RPU_LINGBOT2_PREPROC",
+                    os.environ.get("RPU_LINGBOT2_PREPROC", "exact"),
+                ).strip().lower()
+                legacy_preproc = self._runtime_env.get(
+                    "RPU_LINGBOT2_LEGACY_PREPROC", "0"
+                )
+                if preproc not in ("", "exact") or legacy_preproc != "0":
+                    raise ValueError(
+                        "RPU_LINGBOT2_MULTIVIEW_SPM_Z2=1 requires the exact "
+                        "LingBot2 image preprocessor."
+                    )
+
+                required_env = {
+                    **_MULTIVIEW_SPM_Z2_QUEUE_ENV,
+                    **_MULTIVIEW_SPM_Z2_COMMON_ENV,
+                    **_MULTIVIEW_SPM_Z2_PROFILE_ENV[z2_profile],
+                }
+                conflicts = {
+                    key: self._runtime_env[key]
+                    for key, required in required_env.items()
+                    if key in self._runtime_env
+                    and self._runtime_env[key] != required
+                }
+                if conflicts:
+                    raise ValueError(
+                        "RPU_LINGBOT2_MULTIVIEW_SPM_Z2=1 conflicts with "
+                        f"sealed-profile runtime_env values: {conflicts}."
+                    )
+                env.update(required_env)
+                env["RPU_LINGBOT2_PREPROC"] = "exact"
+
             touched = set(env) | set(_PROFILE_CLEAR_ENV)
             self._env_snapshot = {key: os.environ.get(key) for key in touched}
             for key in _PROFILE_CLEAR_ENV:
@@ -574,6 +1006,20 @@ class Lingbot2Policy:
             if qv:
                 qv = os.path.abspath(os.path.expanduser(str(qv)))
 
+            if self._use_qwen3_chat_template and not qv:
+                from rpu_backend.api.errors import RPUBackendError
+
+                raise RPUBackendError(
+                    "LingBot-VLA-V2 public chat-template preprocessing requires "
+                    "qwen3vl_base (or RPU_LINGBOT2_QWEN3VL_BASE) to name a "
+                    "complete local public Qwen3-VL processor asset."
+                )
+            processor_source = qv or self._ckpt_dir
+            if processor_source != self._processor_source:
+                self._processor = None
+            self._processor_source = processor_source
+            self._preflight_processor_contract()
+
             # Robot-action config is CPU-only preflight. Resolve it before any
             # swizzle or native handle is created so a bad/mismatched stats file
             # cannot leave a partially materialized process behind.
@@ -592,6 +1038,12 @@ class Lingbot2Policy:
                     self._ckpt_dir,
                     qwen3vl_base=qv,
                     training_config_path=self._training_config_path,
+                    rpu_execution=self._rpu_execution,
+                    _execution_session=self._execution_session,
+                    _execution_generation=(
+                        self._execution_session.generation
+                    ),
+                    _component_generations=self._component_generations,
                 )
                 if not _runtime_policy_complete(pending_policy):
                     from rpu_backend.api.errors import RPUBackendError
@@ -612,13 +1064,9 @@ class Lingbot2Policy:
             except BaseException as exc:
                 if pending_policy is not None:
                     try:
-                        pending_policy.close()
-                    except Exception:
-                        raise RuntimeError(
-                            "LingBot-VLA-V2 construction failed and native "
-                            "runtime cleanup also failed; restart the process "
-                            "before loading another policy."
-                        ) from exc
+                        pending_policy._close_without_session()
+                    except BaseException as cleanup_error:
+                        exc.add_note(f"LingBot2 facade construction cleanup also failed: {cleanup_error!r}")
                 raise
 
             # Publish only after runtime construction, de-normalizer setup and
@@ -633,33 +1081,58 @@ class Lingbot2Policy:
             if not self._rpu_ready:
                 _restore_environment(self._env_snapshot)
                 self._env_snapshot = None
+                from rpu_backend.api import _execution
+
+                if (self._rpu_build_started and self._policy is None
+                        and self._policy_finalizer is None
+                        and self._execution_session.stats()["state"] == "CLOSED"
+                        and _execution._UNSAFE_PROCESS_REASON is None):
+                    # The original builder finished strict retirement before
+                    # re-raising. shutdown is now a no-op, so publish only the
+                    # facade's terminal metadata, never a second raw close.
+                    self._closed = True
             raise
         finally:
             self._rpu_build_lock.release()
 
-    @_serialized_policy_call
     def close(self) -> None:
         """Release the owned runtime and make this facade permanently closed."""
-        with self._rpu_build_lock:
-            if self._closed:
-                return
-            finalizer = getattr(self, "_policy_finalizer", None)
-            policy = getattr(self, "_policy", None)
-            if finalizer is not None and getattr(finalizer, "alive", False):
-                if finalizer() is not True:
-                    raise RuntimeError(
-                        "LingBot-VLA-V2 cleanup failed; restart the process "
-                        "before loading another policy."
-                    )
-            elif policy is not None:
-                policy.close()
-            _restore_environment(self._env_snapshot)
-            self._env_snapshot = None
-            self._policy = None
-            self._policy_finalizer = None
-            self._graph_profile = None
-            self._rpu_ready = False
-            self._closed = True
+        def retire() -> None:
+            with _RPU_POLICY_RUNTIME_LOCK:
+                with self._rpu_build_lock:
+                    if self._closed:
+                        return
+                    finalizer = getattr(self, "_policy_finalizer", None)
+                    policy = getattr(self, "_policy", None)
+                    if policy is not None:
+                        policy._close_without_session()
+                    if finalizer is not None and finalizer.alive:
+                        finalizer.detach()
+                    _restore_environment(self._env_snapshot)
+                    self._env_snapshot = None
+                    self._policy = None
+                    self._policy_finalizer = None
+                    self._graph_profile = None
+                    self._rpu_ready = False
+                    self._closed = True
+
+        try:
+            self._execution_session.shutdown(retire)
+        except BaseException as error:
+            from rpu_backend.api import _execution
+
+            if _execution._UNSAFE_PROCESS_REASON is not None and self._policy is not None:
+                from rpu_backend.adapters.lingbot_vla_v2.runtime import _poison_lingbot2_retirement
+
+                _poison_lingbot2_retirement(self._policy, error)
+            raise
+        if not self._closed:
+            error = RuntimeError("LingBot2 facade closed Session still owns native resources")
+            if self._policy is not None:
+                from rpu_backend.adapters.lingbot_vla_v2.runtime import _poison_lingbot2_retirement
+
+                _poison_lingbot2_retirement(self._policy, error)
+            raise error
 
     def _build_denormalizer(self):
         """Construct the config-driven action de-normalizer, or None if not configured."""
@@ -707,19 +1180,33 @@ class Lingbot2Policy:
         if self._processor is None:
             from transformers import AutoProcessor
 
-            self._processor = AutoProcessor.from_pretrained(self._ckpt_dir)
+            self._processor = AutoProcessor.from_pretrained(
+                self._processor_source,
+                local_files_only=True,
+            )
         return self._processor
 
     @staticmethod
     def _as_rgb_uint8_array(im: Any) -> Any:
-        """Normalize one camera frame to an HWC uint8 RGB numpy array.
+        """Normalize one camera frame to an HWC uint8 RGB numpy array — the format the
+        torchvision Resize and Qwen3-VL image processor actually consume.
 
         Accepts three input types:
-          * a PIL image, converted with ``np.array(im.convert("RGB"))``;
-          * an HWC uint8 RGB numpy array;
+          * a PIL image  — back-compat for the offline file path (``executor.py`` does
+            ``Image.open(f).convert("RGB")``); the result is ``np.array(im.convert
+            ("RGB"))``, byte-for-byte what the old code produced, so exact-mode
+            pixel_values are UNCHANGED and no accuracy re-validation is needed;
+          * an HWC uint8 RGB numpy array — the real-robot streaming path (serve.py);
           * an HWC uint8 torch tensor.
 
-        Numpy/tensor inputs must already be RGB; no colourspace conversion is applied.
+        A numpy/tensor frame skips the numpy->PIL (client ``Image.fromarray``) and
+        PIL->numpy (``convert``/``np.array`` here) round-trip that a real-robot client
+        would otherwise pay on the control-loop critical path — the model never needed
+        PIL, only this array.
+
+        A numpy/tensor frame is TRUSTED to already be RGB: unlike PIL's ``.convert
+        ("RGB")`` there is no colourspace fix-up here, so feeding BGR silently yields
+        wrong actions. The client owns channel order (see serve.py / DEPLOYMENT.md).
         """
         import numpy as np
 
@@ -728,7 +1215,9 @@ class Lingbot2Policy:
         elif torch.is_tensor(im):
             arr = im.detach().cpu().numpy()
         else:  # PIL.Image, or anything exposing .convert()
-            # np.array provides the writable copy required by torch.as_tensor.
+            # np.array (a writable COPY), matching the original code exactly — np.asarray
+            # would hand torch.as_tensor a read-only PIL buffer and trip a spurious
+            # "NumPy array is not writable" UserWarning on the executor/file path.
             return np.array(im.convert("RGB"))
         if arr.ndim != 3 or arr.shape[2] != 3:
             raise ValueError(
@@ -741,6 +1230,37 @@ class Lingbot2Policy:
             )
         return np.ascontiguousarray(arr)
 
+    def _preflight_processor_contract(self) -> None:
+        """Validate public prompt ownership before runtime/weight mutation."""
+        if not self._use_qwen3_chat_template:
+            return
+        from rpu_backend.api.errors import RPUBackendError
+
+        try:
+            processor = self._get_processor()
+            tokenizer = processor.tokenizer
+            image_processor = processor.image_processor
+            prompt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": "probe"}],
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+        except Exception:
+            raise RPUBackendError(
+                "LingBot-VLA-V2 could not load the required public Qwen3-VL "
+                "processor and chat template; runtime construction was not started."
+            ) from None
+        if not callable(tokenizer) or not callable(image_processor):
+            raise RPUBackendError(
+                "LingBot-VLA-V2 requires callable public Qwen3-VL tokenizer and "
+                "image-processor assets; runtime construction was not started."
+            )
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise RPUBackendError(
+                "LingBot-VLA-V2 public Qwen3-VL chat template returned an invalid "
+                "prompt; runtime construction was not started."
+            )
+
     def _encode_images(self, images: Sequence[Any]) -> tuple[torch.Tensor, torch.Tensor]:
         """Camera frames -> (pixel_values [N, P, D], image_grid_thw [N, 3]).
 
@@ -749,9 +1269,9 @@ class Lingbot2Policy:
         Resizes each camera frame to the square the checkpoint's evaluation contract
         assumes, then runs the Qwen3-VL image processor.
 
-        Exact mode preserves the fp32 torchvision resize pipeline and batches the
-        processor call. Fast mode uses PIL resize. Compatibility mode retains the
-        per-camera processor path.
+        Exact mode preserves the public fp32 torchvision resize and per-camera
+        processor calls. Fast mode uses PIL resize and a batched processor call.
+        Compatibility mode retains the earlier uint8 HWC round-trip.
 
         Resampling differs from the compatibility path (torchvision antialiased
         bilinear on fp32 vs PIL bilinear on uint8). Set
@@ -784,20 +1304,22 @@ class Lingbot2Policy:
                 enc["image_grid_thw"].reshape(n, 3).long()
 
         if mode == "exact":
-            # Preserve the compatibility pipeline's fp32 antialiased resize while
-            # batching the processor call; pixel_values remain identical.
+            # Match public FeatureTransform exactly: resize the CHW uint8 source
+            # in fp32, then pass that float tensor directly to each camera's
+            # image-processor call. A uint8 HWC round-trip changes pixel values.
             from torchvision.transforms.v2 import Resize
 
-            resize = Resize((sz, sz))
-            arrs = []
+            resize = Resize((sz, sz), antialias=True)
+            pixel_values = []
+            grids = []
             for im in images:
                 t = torch.as_tensor(self._as_rgb_uint8_array(im)).permute(2, 0, 1).contiguous()
-                t = resize(t.to(torch.float32))
-                arrs.append(t.permute(1, 2, 0).clamp(0, 255).to(torch.uint8).numpy())
-            enc = ip(images=arrs, return_tensors="pt")
-            pixel_values = enc["pixel_values"]
-            return pixel_values.reshape(n, -1, pixel_values.shape[-1]).contiguous().float(), \
-                enc["image_grid_thw"].reshape(n, 3).long()
+                enc = ip(resize(t.to(torch.float32)))
+                pixel_values.append(enc["pixel_values"])
+                grids.append(torch.as_tensor(enc["image_grid_thw"]).reshape(-1, 3)[0])
+            packed = torch.cat(pixel_values, dim=0)
+            return packed.reshape(n, -1, packed.shape[-1]).contiguous().float(), \
+                torch.stack(grids, dim=0).long()
 
         # Compatibility preprocessing mode.
         from PIL import Image as _Image
@@ -819,10 +1341,18 @@ class Lingbot2Policy:
     def _encode_instruction(self, instruction: str) -> tuple[torch.Tensor, torch.Tensor]:
         """Tokenize to the admission cap; ``attention_mask`` defines REAL rows."""
         proc = self._get_processor()
+        prompt = instruction
+        if self._use_qwen3_chat_template:
+            prompt = proc.tokenizer.apply_chat_template(
+                [{"role": "user", "content": instruction}],
+                tokenize=False,
+                add_generation_prompt=False,
+            )
         tok = proc.tokenizer(
-            instruction,
+            prompt,
             return_tensors="pt",
             padding="max_length",
+            padding_side="right",
             truncation=True,
             max_length=self._max_lang_tokens,
         )
@@ -887,7 +1417,8 @@ class Lingbot2Policy:
         padding has already been filtered, while adapter execution-tail padding
         has not yet been appended.  When omitted, generic execution covers one
         through ``max_lang_tokens`` REAL instruction tokens for the representative
-        image geometry.
+        image geometry.  Fixed-P225 multiview Z2 truthfully caps that default at
+        its physical envelope instead of falling back to generic execution.
         """
         if not self._rpu_ready or not _runtime_policy_complete(self._policy):
             from rpu_backend.api.errors import RPUBackendError
@@ -916,10 +1447,12 @@ class Lingbot2Policy:
         if prefix_length_range is None:
             lo = metadata["fixed_real_rows"] + 1
             hi = metadata["fixed_real_rows"] + self._max_lang_tokens
+            if getattr(self._policy, "_multiview_spm_z2", False):
+                hi = min(hi, 225)
             if hi < lo:
                 raise ValueError(
-                    "representative image geometry does not fit the prepared "
-                    "prompt envelope")
+                    "representative image geometry does not fit the fixed P225 "
+                    "multiview Z2 prompt envelope")
             prefix_length_range = (lo, hi)
 
         t0 = time.perf_counter()
@@ -946,7 +1479,8 @@ class Lingbot2Policy:
 
         Either pass the raw inputs (``images`` + ``instruction`` + ``proprioception``)
         and let the policy preprocess them, or pass a fully-formed ``obs`` mapping to
-        reproduce a recorded preprocessed input byte-for-byte.
+        reproduce a recorded input byte-for-byte (that is what the accuracy protocol
+        against a GPU golden does — see DEPLOYMENT.md).
         """
         if not self._rpu_ready or not _runtime_policy_complete(self._policy):
             from rpu_backend.api.errors import RPUBackendError

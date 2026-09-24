@@ -4,6 +4,9 @@
 #include "rhino_launch_queue.h"
 #include "rpu_ops.h"
 #include "rpu_spm_allocator.h"
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -31,6 +34,7 @@ void rpu_launch_tile_kernel(const at::Tensor &input,
 
     constexpr size_t WARP_SIZE = 16;
     constexpr size_t VLM_ENTRIES = 384;
+    constexpr size_t THD_VECTOR_SIZE = 16;
 
     size_t dwidth = sizeof(c10::Half);
     int64_t rank = input.dim();
@@ -41,6 +45,21 @@ void rpu_launch_tile_kernel(const at::Tensor &input,
         base = input._base();
     } else {
         base = input;
+    }
+
+    // 计算base和output的bytesize
+    size_t base_nbytes = base.numel() * dwidth;
+    size_t output_nbytes = output.numel() * dwidth;
+
+    // 打印基本信息
+    if (log_at(4)) {
+        std::cout << "[rpu_launch_tile_kernel] base_nbytes = " << base_nbytes
+                  << ", output_nbytes = " << output_nbytes << std::endl;
+        // print_tensor_info(base, "rpu_launch_tile_kernel - base");
+        // print_tensor_info(output, "rpu_launch_tile_kernel - output");
+        std::cout << "[rpu_launch_tile_kernel] repeats: ";
+        for (auto r : repeats) std::cout << r << " ";
+        std::cout << ", rank = " << rank << std::endl;
     }
 
     // 确保输入是 half 类型
@@ -57,7 +76,65 @@ void rpu_launch_tile_kernel(const at::Tensor &input,
     uint64_t ddr_input_addr = RpuGetDevAddr(in_ptr) >> 8;
     uint64_t ddr_output_addr = RpuGetDevAddr(out_ptr) >> 8;
 
+    if (log_at(4)) {
+        std::cout << std::hex << std::showbase;
+        std::cout << "[tile] DDR in_ptr           = "
+                  << reinterpret_cast<uintptr_t>(in_ptr) << "\n";
+        std::cout << "[tile] DDR out_ptr          = "
+                  << reinterpret_cast<uintptr_t>(out_ptr) << "\n";
+        std::cout << "[tile] ddr_input addr       = "
+                  << (ddr_input_addr << 8) << "\n";
+        std::cout << "[tile] ddr_output addr      = "
+                  << (ddr_output_addr << 8) << "\n";
+        std::cout << std::dec << std::noshowbase;
+    }
+
+
+    // ==================== SPM 版本 (注释保留) ====================
+    // // std::cout << "rpu_launch_tile_kernel: in ptr " << in_ptr  << std::endl;
+    // RpuDdrFlush(in_ptr);
+    //
+    // auto t_now = std::chrono::high_resolution_clock::now();
+    // double this_preprocess_time = std::chrono::duration<double, std::milli>(t_now - t_prev).count();
+    // t_prev = t_now;
+    // std::cout << "rpu_launch_tile_kernel: flush input ddr time " << this_preprocess_time << " ms" << std::endl;
+    //
+    // // 申请spm空间
+    // // LocalSPM_t(size_t size, MemFlag flag, MemStride stride, uint64_t alignment,
+    // //          int core_id);
+    // LocalSPM_t spm_core0_input(base_nbytes, read_write, kStride32B, 2, 0);
+    // LocalSPM_t spm_core0_output(output_nbytes, read_write, kStride32B, 2, 0);
+    //
+    // t_now = std::chrono::high_resolution_clock::now();
+    // double this_alloc_time = std::chrono::duration<double, std::milli>(t_now - t_prev).count();
+    // t_prev = t_now;
+    // std::cout << "rpu_launch_tile_kernel: spm alloc time " << this_alloc_time << " ms" << std::endl;
+    //
+    // // std::cout << "move input form ddr to spm " << std::endl;
+    //
+    // // CopyToDevice(spm_core0_input, in_ptr, base_nbytes); // 会卡死
+    // // 打印inptr地址以及输入的spm地址
+    // std::cout << "rpu_launch_tile_kernel: in_ptr addr " << static_cast<void*>(in_ptr)
+    //           << ", spm_core0_input addr " << spm_core0_input.get_cpu_ptr() << std::endl;
+    // // base_nbytes向上对齐到32字节
+    // size_t aligned_base_nbytes = CeilDiv(base_nbytes, 32) * 32;
+    // std::memcpy(spm_core0_input.get_cpu_ptr(), in_ptr, aligned_base_nbytes);
+    // // std::memcpy(spm_core0_input.get_cpu_ptr(), in_ptr, base_nbytes);
+    //
+    // t_now = std::chrono::high_resolution_clock::now();
+    // double this_copyin_time = std::chrono::duration<double, std::milli>(t_now - t_prev).count();
+    // t_prev = t_now;
+    // std::cout << "rpu_launch_tile_kernel: move input to spm time " << this_copyin_time << " ms" << std::endl;
+    // // std::cout << "rpu_launch_tile_kernel: move input to spm finish " << std::endl;
+
     auto* wq = GET_QUEUE(1);  // 复用缓存的 queue
+
+    // Context for export case
+    // Context_t ctx;
+    // ctx.recode_queue(&wq);
+    // ctx.record_buffer(&ddr_input);
+    // ctx.record_buffer(&ddr_output);
+    // ctx.dump_init_buf();
 
     if (rank == 2) {
       // 2D case: tile_Nx1_NxC
@@ -74,6 +151,7 @@ void rpu_launch_tile_kernel(const at::Tensor &input,
       Kernel_t* kernel = KernelCache::instance().get_kernel(kernel_name);
       TORCH_CHECK(kernel != nullptr, "Failed to get ", kernel_name, " kernel from cache");
       kernel->reset_regs();
+      // std::cout << "rpu_launch_tile_kernel: Using kernel " << kernel_name << std::endl;
 
       // 计算 block 参数
       size_t chunk_N_per_loop = WARP_SIZE;
@@ -120,6 +198,8 @@ void rpu_launch_tile_kernel(const at::Tensor &input,
           kernel->set_regs(8, (uint16_t)Broadcast_C);
       }
 
+      // SPM 版本 (注释保留)
+      // kernel->set_regs(61, (uint16_t)0x1); // lsu mode, local memory and 32bytes vector
       kernel->set_regs(64, (uint16_t)blk_cnt); // gridDim.x
       kernel->set_regs(65, (uint16_t)0x1); // gridDim.y
       kernel->set_regs(66, (uint16_t)0x1); // gridDim.z
@@ -130,11 +210,39 @@ void rpu_launch_tile_kernel(const at::Tensor &input,
               kernel, (uint32_t)i + 4096, thread_params[i], "tile");
       }
 
+      // 打印 2D case 参数配置
+      if (log_at(4)) {
+          std::cout << "[rpu_launch_tile_kernel] 2D case kernel config:" << std::endl;
+          std::cout << "  kernel_name = " << kernel_name << std::endl;
+          std::cout << "  N = " << N << ", C = " << C << std::endl;
+          std::cout << "  Broadcast_N = " << Broadcast_N << ", Broadcast_C = " << Broadcast_C << std::endl;
+          std::cout << "  blk_cnt = " << blk_cnt << ", normal_blk_loopcnt = " << normal_blk_loopcnt << std::endl;
+          std::cout << "  last_blk_loopcnt = " << last_blk_loopcnt << ", rmd_threads = " << rmd_threads << std::endl;
+          std::cout << "  block_data_stride = " << block_data_stride << std::endl;
+          std::cout << "  ddr_input_addr = 0x" << std::hex << (ddr_input_addr << 8)
+                    << ", ddr_output_addr = 0x" << (ddr_output_addr << 8) << std::dec << std::endl;
+          std::cout << "  Registers:" << std::endl;
+          std::cout << "    reg[0] (normal_blk_loopcnt) = " << normal_blk_loopcnt << std::endl;
+          std::cout << "    reg[2-3] (ddr_input_addr>>8) = 0x" << std::hex << ddr_input_addr << std::dec << std::endl;
+          std::cout << "    reg[4-5] (ddr_output_addr>>8) = 0x" << std::hex << ddr_output_addr << std::dec << std::endl;
+          std::cout << "    reg[6-7] (block_data_stride) = " << block_data_stride << std::endl;
+          std::cout << "    reg[8] (C_loopcnt) = " << (use_v16 ? Broadcast_C / 16 : Broadcast_C) << std::endl;
+          std::cout << "    reg[64-66] (gridDim) = (" << blk_cnt << ", 1, 1)" << std::endl;
+          std::cout << "  thread_params (SCM): ";
+          for (int i = 0; i < 16; i++) std::cout << thread_params[i] << " ";
+          std::cout << std::endl;
+      }
+
       wq->enqueu_kernel(*kernel, {(uint16_t)blk_cnt, (uint16_t)1, (uint16_t)1}, {0});
 
       // Flush output, 确保 CPU 能读到 RPU 写入的最新数据
       rpu_ddr_flush(out_ptr);
 
+      // ==================== SPM 版本 (注释保留) ====================
+      // c10::Half *out = output.data_ptr<c10::Half>();
+      // spm_to_ddr(out, spm_core0_output.get_cpu_ptr(), output_nbytes);
+
+      // ctx.export_case();
       return;
     }
 
@@ -154,6 +262,10 @@ void rpu_launch_tile_kernel(const at::Tensor &input,
         Kernel_t* kernel = KernelCache::instance().get_kernel(kernel_name);
         TORCH_CHECK(kernel != nullptr, "Failed to get ", kernel_name, " kernel from cache");
         kernel->reset_regs();
+
+        // SPM 版本 (注释保留)
+        // uint32_t a_base = 0;
+        // uint32_t r_base = a_base + CeilDiv(base_nbytes, 32) * 32;
 
         int64_t blkcnt_x, blkcnt_y;
         int64_t Input_Stride_dim0, Input_Stride_dim1;
@@ -204,6 +316,12 @@ void rpu_launch_tile_kernel(const at::Tensor &input,
         kernel->set_regs(2, (uint16_t)(ddr_output_addr & 0xFFFF));
         kernel->set_regs(3, (uint16_t)(ddr_output_addr >> 16));
 
+        // SPM 版本 (注释保留)
+        // kernel->set_regs(0, (uint16_t)(a_base & 0xFFFF));
+        // kernel->set_regs(1, (uint16_t)(a_base >> 16));
+        // kernel->set_regs(2, (uint16_t)(r_base & 0xFFFF));
+        // kernel->set_regs(3, (uint16_t)(r_base >> 16));
+
         kernel->set_regs(4, (uint16_t)dim0);
         kernel->set_regs(5, (uint16_t)dim1);
         kernel->set_regs(6, (uint16_t)dim2);
@@ -233,11 +351,50 @@ void rpu_launch_tile_kernel(const at::Tensor &input,
         kernel->set_regs(65, (uint16_t)blkcnt_y); // gridDim.y
         kernel->set_regs(66, (uint16_t)0x1); // gridDim.z
 
+        // 打印 3D case 参数配置
+        if (log_at(4)) {
+            std::cout << "[rpu_launch_tile_kernel] 3D case kernel config:" << std::endl;
+            std::cout << "  kernel_name = " << kernel_name << " (is_largeC = " << is_largeC << ")" << std::endl;
+            std::cout << "  dim0 = " << dim0 << ", dim1 = " << dim1 << ", dim2 = " << dim2 << std::endl;
+            std::cout << "  repeat0 = " << repeat0 << ", repeat1 = " << repeat1 << ", repeat2 = " << repeat2 << std::endl;
+            std::cout << "  blkcnt_x = " << blkcnt_x << ", blkcnt_y = " << blkcnt_y << std::endl;
+            std::cout << "  ddr_input_addr = 0x" << std::hex << (ddr_input_addr << 8)
+                      << ", ddr_output_addr = 0x" << (ddr_output_addr << 8) << std::dec << std::endl;
+            std::cout << "  Registers:" << std::endl;
+            std::cout << "    reg[0-1] (ddr_input_addr>>8) = 0x" << std::hex << ddr_input_addr << std::dec << std::endl;
+            std::cout << "    reg[2-3] (ddr_output_addr>>8) = 0x" << std::hex << ddr_output_addr << std::dec << std::endl;
+            std::cout << "    reg[4] (dim0) = " << dim0 << std::endl;
+            std::cout << "    reg[5] (dim1) = " << dim1 << std::endl;
+            std::cout << "    reg[6] (dim2) = " << dim2 << std::endl;
+            std::cout << "    reg[7] (repeat0) = " << repeat0 << std::endl;
+            std::cout << "    reg[8] (repeat1) = " << repeat1 << std::endl;
+            std::cout << "    reg[9] (repeat2) = " << repeat2 << std::endl;
+            std::cout << "    reg[10-11] (Input_Stride_dim0) = " << Input_Stride_dim0 << std::endl;
+            std::cout << "    reg[12-13] (Input_Stride_dim1) = " << Input_Stride_dim1 << std::endl;
+            std::cout << "    reg[14-15] (Output_Stride_dim0) = " << Output_Stride_dim0 << std::endl;
+            std::cout << "    reg[16-17] (Output_Stride_dim1) = " << Output_Stride_dim1 << std::endl;
+            std::cout << "    reg[20-21] (Output_lpstep_dim0) = " << Output_lpstep_dim0 << std::endl;
+            std::cout << "    reg[22-23] (Output_lpstep_dim1) = " << Output_lpstep_dim1 << std::endl;
+            std::cout << "    reg[24-25] (Output_lpstep_dim2) = " << Output_lpstep_dim2 << std::endl;
+            std::cout << "    reg[64-66] (gridDim) = (" << blkcnt_x << ", " << blkcnt_y << ", 1)" << std::endl;
+            if (!is_largeC) {
+                std::cout << "  smallC extra params:" << std::endl;
+                std::cout << "    reg[26-27] (Input_loop_delta_dim0) = " << Input_loop_delta_dim0 << std::endl;
+                std::cout << "    reg[28-29] (Output_loop_delta_dim0) = " << Output_loop_delta_dim0 << std::endl;
+                std::cout << "    reg[30] (dim0_loop_tile) = " << dim0_loop_tile << std::endl;
+            }
+        }
+
         wq->enqueu_kernel(*kernel, {(uint16_t)blkcnt_x, (uint16_t)blkcnt_y, (uint16_t)1}, {0});
 
         // Flush output, 确保 CPU 能读到 RPU 写入的最新数据
         rpu_ddr_flush(out_ptr);
 
+        // ==================== SPM 版本 (注释保留) ====================
+        // c10::Half *out = output.data_ptr<c10::Half>();
+        // spm_to_ddr(out, spm_core0_output.get_cpu_ptr(), output_nbytes);
+
+        // ctx.export_case();
         return;
     } else {
         TORCH_CHECK(false, "rpu_launch_tile_kernel: only 2D and 3D tensors are supported");
@@ -246,14 +403,13 @@ void rpu_launch_tile_kernel(const at::Tensor &input,
 
 // ===================== Tile SPM Kernel Launch (multi-core) =====================
 // SPM-resident 3D tile: input [dim0,dim1,dim2] -> output [dim0*r0, dim1*r1, dim2*r2].
-// Reuses the same tile_general_smallC / largeC kernels as the eager DDR path.
-// The host ABI takes raw SPM byte addresses for the input and output bases.
+// Reuses tile_general_smallC / largeC with raw SPM byte addresses:
+// param0/1=input base, param2/3=output base.
 //
 // GDN use: GQA-expand q/k via the [N,1,Dk] repeat-middle trick — view q as
 // [num_k_heads, 1, Dk] and tile {1, rep, 1} -> [num_k_heads, rep, Dk], which
-// flattens to [h0,h0,h1,h1,...] = repeat_interleave on the head dim. With eight
-// SPMD cores, each core tiles its own heads at the
-// same SPM offsets (broadcast mode).
+// flattens to [h0,h0,h1,h1,...] = repeat_interleave on the head dim.
+// With num_cores=8, each core tiles its own heads at the same SPM offsets.
 void rpu_launch_tile_spm_kernel(uint32_t input_spm_addr, uint32_t output_spm_addr,
                                 int64_t dim0, int64_t dim1, int64_t dim2,
                                 int64_t repeat0, int64_t repeat1, int64_t repeat2,
@@ -265,8 +421,13 @@ void rpu_launch_tile_spm_kernel(uint32_t input_spm_addr, uint32_t output_spm_add
     const bool is_largeC = (dim2 >= 256);
     const std::string kernel_name =
         is_largeC ? "tile_general_largeC" : "tile_general_smallC";
-    // Use the graph-aware lookup so capture records this launch; eager execution
-    // falls back to the cache.
+    // Graph-aware kernel fetch — NOT KernelCache::get_kernel(name) (the RAW string
+    // path: sets neither pending_kernel_id_ nor pending_kernel_name_, so during graph
+    // RECORDING it hits the §12.4 raw-kernel fallback → oneshots the prefix, switches
+    // to PASSTHROUGH, marks the graph non-replayable + emits the "enqueu_kernel after
+    // build_batch" WARN). get_kernel_reset(name) sets pending_kernel_name_ so the
+    // launch records into the graph; in PASSTHROUGH (isolated test) it falls back to
+    // the cache. Mirrors GET_KERNEL(id) used by fla_conv1d/eltwise/etc.
     Kernel_t* kernel = RpuKernelGraph::active().get_kernel_reset(kernel_name);
     TORCH_CHECK(kernel != nullptr,
                 "rpu_launch_tile_spm_kernel: failed to get ", kernel_name, " kernel");
@@ -308,7 +469,7 @@ void rpu_launch_tile_spm_kernel(uint32_t input_spm_addr, uint32_t output_spm_add
         kernel->set_regs(30, (uint16_t)dim0_loop_tile);
     }
 
-    // SPM byte addresses (a_g1B): param0/1 = input base, param2/3 = output base.
+    // SPM byte addresses: param0/1 = input base, param2/3 = output base.
     kernel->set_regs(0, (uint16_t)(input_spm_addr & 0xFFFF));
     kernel->set_regs(1, (uint16_t)(input_spm_addr >> 16));
     kernel->set_regs(2, (uint16_t)(output_spm_addr & 0xFFFF));

@@ -16,6 +16,9 @@ destinations.
   forwards.
 - Use fixed DMA only for model-owned storage proven stable for every replay.
 - Allocate independent storage for outputs a caller may retain.
+- Prepare fresh outputs and their live address slots before entering any layer
+  callbacks that fast replay can skip. HYViT's projector follows this rule for
+  both direct DMA and DDR Linear writeback; its internal staging slots stay fixed.
 - Test the cold first BUILD as well as warm REPLAY; warmup can hide a
   first-allocation lifetime defect.
 

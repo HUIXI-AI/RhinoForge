@@ -12,7 +12,6 @@
 
 using namespace ::rhino_lkn;
 
-// Host launch constants.
 #define WARP_SIZE 16
 #define WARP_NUM 8
 #define VLM_ENTRY_NUM 384
@@ -85,7 +84,7 @@ void rpu_launch_reduce_mean_last_dim_kernel(const at::Tensor &input,
     uint64_t x_addr_v128 = RpuGetDevAddr(in_ptr) >> 8;
     uint64_t y_addr_v128 = RpuGetDevAddr(out_ptr) >> 8;
 
-    // Set registers according to the host launch ABI.
+    // Set launch parameters.
     kernel->set_regs(0, (uint16_t)(x_addr_v128 & 0xFFFF));
     kernel->set_regs(1, (uint16_t)(x_addr_v128 >> 16));
     kernel->set_regs(2, (uint16_t)(y_addr_v128 & 0xFFFF));
@@ -186,9 +185,9 @@ at::Tensor rpu_mean_dim(const at::Tensor &self, at::OptionalIntArrayRef dim,
 
 // =============================================================================
 // SPM sum over rows (axis 0): [rows, cols<256] fp16 → [cols], in ONE launch.
-// Kernel "reduce_sum_non_last_dim_out_seg". Host ABI is Sum over axis 0 with
-// WARP_SIZE=16 and VLM_ENTRIES_FP16=400.
+// Kernel: `reduce_sum_non_last_dim_out_seg`.
 // Addresses are absolute 32-bit SPM (regs 0/1 = in, 2/3 = out), like l2norm.
+// Replaces the 7-step tree-reduce halving with a single kernel.
 // =============================================================================
 void rpu_launch_reduce_sum_rows_spm_kernel(uint32_t in_spm_addr,
                                            uint32_t out_spm_addr,
@@ -209,7 +208,7 @@ void rpu_launch_reduce_sum_rows_spm_kernel(uint32_t in_spm_addr,
     const uint32_t out_outer_step = inner_num * dw;   // axis==0, outer size 1
     const uint32_t one_cth_bits   = float_to_bits(1.0f / (float)axis_size);
 
-    // Partition for the inner_num < 256 branch.
+    // Partition for inner_num < 256.
     constexpr uint32_t WS = 16, WNPL = 8, VLM = 400;
     auto cdiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
     const uint32_t inner_v16 = std::min<uint32_t>(16, cdiv(inner_num, 16));

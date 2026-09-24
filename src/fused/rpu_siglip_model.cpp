@@ -1,40 +1,65 @@
-// rpu_siglip_model.cpp — SigLIP ViT all-layers-once fused model.
+// rpu_siglip_model.cpp — SigLIP ViT all-layers-once model (v3 FusedModelBase port)
 //
-// SigLIPModel implements the flat `v3::FusedModelBase` contract.
-// `emit_preload_weights()` is registered through the preload-fn slot in
-// ModelStaticConfig.
+// Plan 01-03: ports SigLIPModel from the v2 two-class framework pair to the
+// v3 flat FusedModelBase single-class (from Plan 01-01). The port exercises
+// D-501 .preload_fn for the first time in production — SigLIP's v2
+// `build_preload_subgraph` virtual becomes a plain `emit_preload_weights()`
+// member registered via the preload-fn slot inside `static_config()`. The body
+// is verbatim from v2 (10 LN/bias × 27 layers + 2 post-LN DMAs).
 //
-// `projector_output_` is allocated with `allocate_tracked_output(...)` on each
-// forward because callers may retain multiple image outputs before concatenation.
+// Pitfall 4 structural mitigation (from the 12-round siglip-multi-group-replay
+// debug session): `projector_output_` is now allocated via
+// `allocate_tracked_output(...)` — fresh per forward. Pi0.5 embed_prefix
+// appends each image's projector output to a Python list before torch.cat;
+// a stable-DDR allocation would corrupt earlier slots when later forwards
+// overwrite the buffer. `test_siglip_multi_image_regression.py` (this plan)
+// guards the regression.
 //
-// Framework integration contracts:
-//   - Register the `emit_preload_weights()` pointer-to-member in ModelStaticConfig.
+// Key transformations vs v2:
+//   - Inherit from v3::FusedModelBase (lives in `namespace v3`).
+//   - Replace the v2 `build_preload_subgraph()` virtual with
+//     `emit_preload_weights()` plain member + register the pointer-to-member
+//     on the D-501 preload-fn slot of ModelStaticConfig.
 //     Framework opens the weights-graph scope externally; callback body
-//     emits only `rpu_launch_*` DMAs and does not manage the batch context.
-//   - SDPA + KV-insert call sites use typed SpmOffset values from
-//     `addr_offset(name).value`.
+//     emits only `rpu_launch_*` DMAs (EXT-5: framework owns batch context).
+//   - Drop unreachable v2 overrides `build_kv_insert_subgraph` and
+//     `build_compute_subgraph` — v3 has neither virtual (D-201).
+//   - Replace `buf(name)` at SDPA + KV-insert call sites with
+//     `addr_offset(name).value` (Pitfall 3 structural fix via typed SpmOffset).
 //   - Access model params via pimpl getters (`num_layers()`, `hidden_size()`,
-//     etc.).
-//   - Allocate and track `projector_output_` as a fresh per-forward tensor.
-//   - `set_weights` ends with `invalidate_model_state();` as its last non-empty
-//     statement.
+//     etc.) instead of v2 protected members (`num_layers_`, etc.).
+//   - Replace the v2 two-step alloc+track pattern with
+//     `projector_output_ = allocate_tracked_output({...})` — framework helper
+//     centralizes the fresh-per-forward discipline (Pitfall 4).
+//   - `set_weights` ENDS with `invalidate_model_state();` as last non-empty
+//     statement (D-503 per-function awk contract).
 //
-// KV_FIRST execution:
-//   - SigLIP uses ChunkMode::KV_FIRST + InterLayerIO::AUTO so the encoder
-//     can token-chunk and stay under the 8 MB SPM ceiling for large single-image
-//     inputs. The KV_FIRST path has no RoPE or attention mask.
+// SEQUENTIAL→KV_FIRST refactor (halo-vit-cache-kvfirst-refactor-design-2026-06-18):
+//   - D-508's "ALWAYS single chunk" is RETIRED. SigLIP is now a KV_FIRST model
+//     (dynamic_config: ChunkMode::KV_FIRST + InterLayerIO::AUTO) so the encoder
+//     can token-chunk and stay under the 8 MB SPM ceiling for HALO's 1564-patch
+//     single-image ViT (the old single-chunk encoder hung at ~960 tokens — see
+//     the seq-ceiling probe note). The KV_FIRST trio mirrors GemmaModel but is
+//     SIMPLIFIED: SigLIP has NO rope and NO attention mask (MASK_NONE).
 //   - emit_kv_first_body (Phase 1: LN1+QKV+KV-insert+Q→DDR) +
 //     build_layer_subgraph (Phase 2: DDR→Q + full-KV SDPA + O/MLP) +
-//     plan_kv_first_chunks + subclass_chunk_size_valid implement the flow.
+//     plan_kv_first_chunks + subclass_chunk_size_valid are the new methods.
 //
-// Execution scope:
-//   - cfg.cross_layer_batch_size = num_layers() (force single group).
+// Scope preserved from v2:
+//   - cfg.cross_layer_batch_size = num_layers() (force single group; the
+//     Section 3 Round 6 debug session proved multi-group REPLAY is
+//     non-deterministic for SigLIP regardless of runtime knob).
 //   - 10 PersistentPerLayer + 2 Persistent buffers; no `.preload_callback`
-//     on any BufferDecl (SigLIP uses one-shot `.preload_fn`).
+//     on any BufferDecl (SigLIP uses one-shot `.preload_fn` per PATTERNS.md,
+//     NOT Gemma-style per-buffer callbacks).
 //
-// Framework contract: FusedModelBase.
+// Framework contract: docs/architecture.md#fusedmodelbase-v3--framework-contract
 
 #include "fused_model_base.h"
+#include "pi05_kernel_policy.h"
+#include "rpu_pi05_vision_fc.h"
+#include "rpu_pi05_owner_norm.h"
+#include "rpu_kernel_cache.h"
 #include "model_handle_registry.h"
 #include "rpu_ops.h"
 #include "rpu_eltwise.h"
@@ -42,23 +67,69 @@
 #include "rpu_spm_allocator.h"
 #include <ATen/record_function.h>
 #include <c10/util/Half.h>
+#include <c10/util/ScopeExit.h>
 #include <array>
+#include <optional>
 #include <cstdint>
 #include <vector>
 #include <algorithm>
 #include <cmath>
 #include <map>
+#include <tuple>
 #include <utility>
 
 using namespace at;
 using namespace ::rhino_lkn;
 
-#define NUM_CORES 8
 #define DWIDTH 2
 
+constexpr int64_t SIGLIP_CORE_PROFILE_SITE = 2831089885636848922LL;
+
+// Stable native route identities. Norms, fixed activations, debug staging, and
+// preload launchers implement fixed SigLIP math/BufferDecl dataflow. The
+// selector-bearing launch sites below are consumed from the descriptor.
+constexpr int64_t SIGLIP_Q_LINEAR_SITE = 50221634946316412LL;
+constexpr int64_t SIGLIP_K_LINEAR_SITE = 2185350348864592434LL;
+constexpr int64_t SIGLIP_V_LINEAR_SITE = 4454356738631095076LL;
+constexpr int64_t SIGLIP_KV_INSERT_SITE = 4340742943631646068LL;
+constexpr int64_t SIGLIP_MINIBATCH_ATTN_SITE = 3592870858110241415LL;
+constexpr int64_t SIGLIP_UNIFIED_ATTN_SITE = 871279723585541140LL;
+constexpr int64_t SIGLIP_RAW_SPM_ATTN_SITE = 1638421364140696436LL;
+constexpr int64_t SIGLIP_O_LINEAR_SITE = 5652000568558546719LL;
+constexpr int64_t SIGLIP_ATTN_ALL_REDUCE_SITE = 558716769043213323LL;
+constexpr int64_t SIGLIP_FC1_LINEAR_SITE = 628733187506223803LL;
+constexpr int64_t SIGLIP_FC2_LINEAR_SITE = 2130098820486441137LL;
+constexpr int64_t SIGLIP_MLP_ALL_REDUCE_SITE = 2323671932454929043LL;
+constexpr int64_t SIGLIP_PROJECTOR_LINEAR_SITE = 2282358810048681094LL;
+constexpr int64_t SIGLIP_PATCH_INPUT_DMA_SITE = 1143336462482724752LL;
+constexpr int64_t SIGLIP_PATCH_POSITION_DMA_SITE = 1099468962711310446LL;
+constexpr int64_t SIGLIP_PATCH_LINEAR_SITE = 6500914803307480014LL;
+constexpr int64_t SIGLIP_PATCH_OUTPUT_DMA_SITE = 7261580027961404620LL;
+constexpr int64_t SIGLIP_Q_RESIDENT_SITE = 0x5349474c5153504dll;
+constexpr int64_t SIGLIP_FC1_WEIGHT_OUTER_SITE = 0x5349474643313736LL;
+constexpr int64_t SIGLIP_FC2_WEIGHT_OUTER_SITE = 0x5349474643323736LL;
+// Owner-local ALL_REDUCE selectors retain the existing two semantic sites.
+constexpr int64_t SIGLIP_OWNER_LN_ROUTE = 101;
+constexpr int64_t SIGLIP_OWNER_LN_COMPACT_ROUTE = 102;
+
+enum class SiglipPatchMutableDmaRoute : int64_t {
+    DDR_BROADCAST_TO_SPM_MUTABLE = 1,
+    SPM_COPY_TO_DDR_MUTABLE = 2,
+};
+
+constexpr uint32_t SIGLIP_KV_CAPABILITIES =
+    KV_INSERT_CAP_V2 | KV_INSERT_CAP_V16 |
+    KV_INSERT_CAP_HYBRID2 | KV_INSERT_CAP_HYBRID3;
+constexpr int64_t SIGLIP_KV_FLAG_DDR_MIRROR = 1;
+constexpr int64_t SIGLIP_KV_FLAG_RAW_SPM_ONLY = 2;
+constexpr int64_t SIGLIP_ATTN_CAPABILITY_FALLBACK_DDR_REQUIRED = 1LL << 0;
+
 // =============================================================================
-// Fused patch embedding is an internal helper used by SigLIPModel::forward's
-// 4D auto-detect path; it is not registered as a torch op.
+// v5-05 D-07: Fused patch embedding (lifted byte-equal from former
+// rpu_fused_patch_embedding.cpp; that file is deleted in C2). Internal helper;
+// not registered as a torch op (the fused_patch_embedding op surface is
+// removed in C2). The only remaining call site is rpu_siglip_model.cpp's
+// SigLIPModel::forward 4D auto-detect path (~L278).
 // =============================================================================
 namespace {
 
@@ -73,8 +144,8 @@ struct PatchEmbeddingLiveBases {
 // ([1, total_seq, cout]) at sequence row `seq_off`. `img_slot` selects a
 // stable per-image live-base slot for the mutable input DMA: the SigLIP-batch
 // path packs N images through ONE captured graph, so a single shared live-base
-// would make every image read the LAST image's pixels on REPLAY. The
-// output/pos_emb live-bases stay shared
+// would make every image read the LAST image's pixels on REPLAY (mutable-DMA
+// trap — CLAUDE.md "Fixed DMA trap"). The output/pos_emb live-bases stay shared
 // (same packed-tensor base / same registered pos_emb across all N images).
 //
 // `offsets` are the 6 SPM temp-buffer offsets, allocated ONCE by the caller and
@@ -94,7 +165,8 @@ static void fused_patch_embedding(
     int64_t strideh, int64_t stridew,
     at::Tensor& out, int64_t seq_off, int img_slot,
     const std::vector<uint32_t>& offsets,
-    PatchEmbeddingLiveBases& live_bases)
+    PatchEmbeddingLiveBases& live_bases,
+    const v3::InferenceContext* physical_ctx, bool linear_acc32_)
 {
     RECORD_FUNCTION("rpu::fused_patch_embedding", {});
 
@@ -122,7 +194,8 @@ static void fused_patch_embedding(
 
     // ===== Step ① DMA raw input DDR → SPM =====
     // Mutable DMA: input_nchw is caller-supplied per-forward, address drifts.
-    // Fixed variant would bake a BUILD-time address that the sync-only path cannot rewrite.
+    // Fixed variant would bake BUILD-time addr that sync-only fast-path can't
+    // rewrite.
     //
     // NOTE: input_nchw MUST already be DDR-coherent here. The driver
     // (run_packed_patch_embed_core's per-image loop) flushes each image before
@@ -139,6 +212,16 @@ static void fused_patch_embedding(
                 PatchEmbeddingLiveBases::kMaxPackedImages, ")");
     live_bases.input[img_slot] = ::rhino_lkn::RpuGetDevAddr(
         const_cast<c10::Half*>(input_nchw.data_ptr<c10::Half>()));
+    if (physical_ctx != nullptr) {
+        physical_ctx->consume_physical_route(
+            v3::FmbRouteFamily::MUTABLE_DMA,
+            SIGLIP_PATCH_INPUT_DMA_SITE,
+            static_cast<int64_t>(
+                SiglipPatchMutableDmaRoute::DDR_BROADCAST_TO_SPM_MUTABLE),
+            /*resolved_flags=*/0,
+            {num_patches, cin_orig, cin_padded, kh, kw,
+             strideh, stridew, 1}, img_slot);
+    }
     rpu_launch_ddr_broadcast_spm_dma_mutable(
         &live_bases.input[img_slot],
         /*src_offset_bytes=*/0,
@@ -164,21 +247,40 @@ static void fused_patch_embedding(
 
     // ===== Step ⑤ GEMM =====
     uint32_t im2col_addr = SPM_ALLOC.addr(0, im2col_off);
+    if (physical_ctx != nullptr) {
+        physical_ctx->consume_physical_route(
+            v3::FmbRouteFamily::LINEAR,
+            SIGLIP_PATCH_LINEAR_SITE,
+            static_cast<int64_t>(v3::FmbLinearRouteSelector::AUTO_TILE),
+            /*resolved_flags=*/0,
+            {num_patches, cout, K, 1, 1, 0}, img_slot);
+    }
     rpu_launch_linear_spm_to_spm_acc16_kernel(
         im2col_addr, weight, gemm_out_addr,
         num_patches, cout, K,
-        /*partition=*/1, /*num_cores=*/1, /*bias_spm_addr=*/0);
+        /*partition=*/1, /*num_cores=*/1, /*bias_spm_addr=*/0, at::Tensor(), 0, 0,
+            /*force_acc32=*/linear_acc32_);
 
     // ===== Step ⑥ pos_emb add =====
     // Mutable form for symmetry with step ① (pos_emb_fused.data_ptr is
     // actually stable — registered model weight — so fixed would also work).
-    // No flush is needed: pos_emb_fused is
+    // No flush is needed here; unlike the per-forward conditioning input in
+    // rpu_adarms_model.cpp, pos_emb_fused is immutable after installation and is
     // patch_emb_pos_emb_, a registered weight whose only host write is the
     // set_weights-time CPU->RPU copy, and rpu_copy_impl already force-flushes
     // that boundary (rpu_tensor_ops.inc). Nothing writes it per forward, so
     // there are no CPU-dirty lines left for this DMA to miss.
     live_bases.position = ::rhino_lkn::RpuGetDevAddr(
         const_cast<c10::Half*>(pos_emb_fused.data_ptr<c10::Half>()));
+    if (physical_ctx != nullptr) {
+        physical_ctx->consume_physical_route(
+            v3::FmbRouteFamily::MUTABLE_DMA,
+            SIGLIP_PATCH_POSITION_DMA_SITE,
+            static_cast<int64_t>(
+                SiglipPatchMutableDmaRoute::DDR_BROADCAST_TO_SPM_MUTABLE),
+            /*resolved_flags=*/0,
+            {num_patches, cout, 1}, img_slot);
+    }
     rpu_launch_ddr_broadcast_spm_dma_mutable(
         &live_bases.position,
         /*src_offset_bytes=*/0,
@@ -197,6 +299,15 @@ static void fused_patch_embedding(
     rpu_ddr_flush(out.data_ptr<c10::Half>());
     live_bases.output =
         ::rhino_lkn::RpuGetDevAddr(out.data_ptr());
+    if (physical_ctx != nullptr) {
+        physical_ctx->consume_physical_route(
+            v3::FmbRouteFamily::MUTABLE_DMA,
+            SIGLIP_PATCH_OUTPUT_DMA_SITE,
+            static_cast<int64_t>(
+                SiglipPatchMutableDmaRoute::SPM_COPY_TO_DDR_MUTABLE),
+            /*resolved_flags=*/0,
+            {seq_off * cout * DWIDTH, num_patches * cout}, img_slot);
+    }
     rpu_launch_spm_copy_ddr_dma_mutable(
         gemm_out_addr,
         &live_bases.output,
@@ -263,6 +374,8 @@ static void check_siglip_w8a16_scale_lists(
 
 namespace v3 {
 
+// SIGLIP_FIXED_KERNEL_BASIS: remaining launches are fixed math/transport kernels.
+
 // =============================================================================
 // SigLIPModel — v3::FusedModelBase subclass (SigLIP ViT Encoder)
 // =============================================================================
@@ -285,7 +398,53 @@ public:
         at::Tensor fc1_b, fc2_b;                       // MLP biases
     };
 
-    SigLIPModel() = default;
+    explicit SigLIPModel(std::optional<bool> linear_acc32 = std::nullopt)
+        : configured_linear_acc32_(linear_acc32), linear_acc32_(linear_acc32.value_or(false)) {}
+
+private:
+    const std::optional<bool> configured_linear_acc32_;
+    const bool linear_acc32_;
+    FmbLinearAccumulationPolicy linear_accumulation_policy() const {
+        return linear_acc32_ ? FmbLinearAccumulationPolicy::ACC32
+                             : FmbLinearAccumulationPolicy::ACC16;
+    }
+public:
+
+    void set_execution_cores(int64_t cores) {
+        TORCH_CHECK(cores == 4 || cores == 8,
+                    "SigLIP execution cores must be 4 or 8");
+        TORCH_CHECK(layer_weights_.empty(),
+                    "SigLIP execution cores must precede weight installation");
+        set_execution_core_count(static_cast<int>(cores));
+    }
+
+    std::vector<int64_t> execution_topology() const {
+        TORCH_CHECK(num_layers() > 0 && !layer_weights_.empty(),
+                    "SigLIP topology requires installed model weights");
+        return {1, num_cores(), attn_tp(), mlp_tp(), 1, 8,
+                logical_intermediate_size_, intermediate_size()};
+    }
+
+    std::vector<int64_t> core_profile_arguments() const {
+        auto args = execution_topology();
+        args.push_back(reduced_w8_projection_mask_);
+        return args;
+    }
+
+    DecoderExecutionTopology resolve_model_execution_topology(
+            int64_t nq, int64_t nkv, int64_t hd, int64_t h,
+            int64_t intermediate) const override {
+        if (num_cores() == 8)
+            return FusedModelBase::resolve_model_execution_topology(
+                nq, nkv, hd, h, intermediate);
+        TORCH_CHECK(num_cores() == 4 && nq == 16 && nkv == 16 &&
+                        hd == 80 && h == 1152 && intermediate == 4352,
+                    "no admitted reduced-core Pi0.5 SigLIP profile");
+        return {4, 4, 4};
+    }
+
+
+
 
     void set_configured_chunk_size(int64_t chunk_size) {
         TORCH_CHECK(chunk_size == 0
@@ -296,6 +455,62 @@ public:
                     "SigLIP chunk size must be set before the first forward");
         configured_chunk_size_ = chunk_size;
         invalidate_model_state();
+    }
+
+    int64_t resolve_vision_chunk_size(
+        int64_t seq_len, int64_t packed_image_count)
+    {
+        require_pi05_vision_owner_ln_profile(seq_len, packed_image_count);
+        configure_chunk_for_shape(seq_len, packed_image_count);
+        return resolve_chunk_size_for_shape(
+            seq_len, /*position=*/0, std::nullopt, /*is_causal=*/false);
+    }
+
+    std::vector<int64_t> resolve_stage_domain(
+        int64_t seq_len, int64_t packed_image_count,
+        bool external_patch_prologue)
+    {
+        TORCH_CHECK(num_layers() > 0,
+                    "RPU_PLANNER_REJECT:CAPABILITY: SigLIP weights are not "
+                    "initialized");
+        require_pi05_vision_owner_ln_profile(seq_len, packed_image_count);
+        configure_chunk_for_shape(seq_len, packed_image_count);
+        TORCH_CHECK(seq_len % packed_image_count == 0,
+                    "RPU_PLANNER_REJECT:CAPABILITY: SigLIP packed sequence "
+                    "must divide into image spans");
+        const int64_t per_image = seq_len / packed_image_count;
+        std::vector<ChunkInfo> patch_chunks;
+        std::vector<FmbExecutionSpan> image_spans;
+        patch_chunks.reserve(packed_image_count);
+        image_spans.reserve(packed_image_count);
+        for (int64_t image = 0; image < packed_image_count; ++image) {
+            const int64_t offset = image * per_image;
+            patch_chunks.push_back({
+                static_cast<int>(image), offset, per_image,
+                offset + per_image});
+            image_spans.push_back({offset, per_image, image});
+        }
+        const FmbStageBoundaryPolicies boundary_policies{
+            FmbSpanBoundaryPolicy::KEEP_LOCAL,
+            FmbSpanBoundaryPolicy::ALLOW_CROSS,
+            FmbSpanBoundaryPolicy::ALLOW_CROSS};
+        const bool saved_external_patch_prologue =
+            planning_external_patch_prologue_;
+        planning_external_patch_prologue_ = external_patch_prologue;
+        auto restore_external_patch_prologue = c10::make_scope_exit([&] {
+            planning_external_patch_prologue_ =
+                saved_external_patch_prologue;
+        });
+        // Packed minibatch SDPA requires one full-sequence QKV/compute chunk;
+        // publish only that domain; single-image retains its cold request.
+        return encode_fmb_prefill_stage_domain(
+            resolve_prefill_stage_domain_for_shape(
+                seq_len, /*position=*/0,
+                /*attention_mask=*/std::nullopt, /*is_causal=*/false,
+                patch_chunks, image_spans, boundary_policies,
+                /*requested_chunk_size=*/packed_image_count > 1
+                    ? seq_len : configured_chunk_size_,
+                /*logical_len=*/seq_len));
     }
 
     // ========================================================================
@@ -348,7 +563,7 @@ public:
         check_list(fc2_b_list, "fc2_b_list");
 
         // Global tensor checks — post_ln/proj are always fp16, DMA'd as Half
-        // (fp16 + PrivateUse1 + contiguous).
+        // (add fp16 + PrivateUse1 + contiguous).
         auto check_global_fp16_rpu = [&](const at::Tensor& t, const char* name) {
             TORCH_CHECK(t.defined(), "siglip_set_weights: ", name, " must be defined");
             TORCH_CHECK(t.scalar_type() == at::kHalf
@@ -366,7 +581,7 @@ public:
 
         // Per-layer defined/rank checks. require_fp16_rpu adds the fp16 +
         // PrivateUse1 + contiguous guard for the ALWAYS-fp16 tensors (norms,
-        // biases) that are later DMA'd via data_ptr<c10::Half>() —
+        // biases) that are later DMA'd via data_ptr<c10::Half>()
         // weight-validate fix. The main q/k/v/o/fc projection weights skip it
         // (they may be int8 W8A16 and are validated by check_projection above).
         auto check_defined_rank = [&](const at::TensorList& list,
@@ -413,6 +628,127 @@ public:
             q_w_list, k_w_list, v_w_list, o_w_list, fc1_w_list, fc2_w_list,
             q_ws_list, k_ws_list, v_ws_list, o_ws_list, fc1_ws_list, fc2_ws_list);
 
+        int64_t precision_mask = 0;
+        if (num_cores() != 8) {
+            TORCH_CHECK(num_cores() == 4 && N == 27 && num_heads == 16 &&
+                            head_dim == 80 && hidden_size == 1152 &&
+                            intermediate_size == 4352 && projection_dim == 2048,
+                        "no admitted reduced-core Pi0.5 SigLIP geometry");
+            TORCH_CHECK(proj_w.sizes() == at::IntArrayRef({2048, 1152}) &&
+                            proj_b.numel() == 2048 &&
+                            post_ln_w.numel() == 1152 && post_ln_b.numel() == 1152,
+                        "Pi0.5 SigLIP global projection/norm shape mismatch");
+            const std::array<std::array<int64_t, 2>, 6> expected{{
+                {1280, 1152}, {1280, 1152}, {1280, 1152},
+                {1152, 1280}, {4352, 1152}, {1152, 4352}}};
+            for (int64_t i = 0; i < N; ++i) {
+                size_t j = 0;
+                int64_t layer_mask = 0;
+                for (const auto* tensor : {&q_w_list[i], &k_w_list[i],
+                        &v_w_list[i], &o_w_list[i], &fc1_w_list[i],
+                        &fc2_w_list[i]}) {
+                    TORCH_CHECK((tensor->scalar_type() == at::kHalf ||
+                                 tensor->scalar_type() == at::kChar) &&
+                                tensor->size(0) == expected[j][0] &&
+                                tensor->size(1) == expected[j][1],
+                                "Pi0.5 SigLIP projection shape/precision mismatch");
+                    if (tensor->scalar_type() == at::kChar) layer_mask |= 1LL << j;
+                    ++j;
+                }
+                if (i == 0) precision_mask = layer_mask;
+                TORCH_CHECK(layer_mask == precision_mask,
+                            "Pi0.5 SigLIP precision scope must match across layers");
+                for (const auto* tensor : {&ln1_w_list[i], &ln1_b_list[i],
+                        &ln2_w_list[i], &ln2_b_list[i], &o_b_list[i],
+                        &fc2_b_list[i]})
+                    TORCH_CHECK(tensor->numel() == 1152,
+                                "Pi0.5 SigLIP norm/row-bias shape mismatch");
+                for (const auto* tensor : {&q_b_list[i], &k_b_list[i], &v_b_list[i]})
+                    TORCH_CHECK(tensor->numel() == 1280,
+                                "Pi0.5 SigLIP QKV bias shape mismatch");
+                TORCH_CHECK(fc1_b_list[i].numel() == 4352,
+                            "Pi0.5 SigLIP FC1 bias shape mismatch");
+            }
+        }
+        logical_intermediate_size_ =
+            hidden_size == 1152 && intermediate_size == 4352 ? 4304 : intermediate_size;
+        reduced_w8_projection_mask_ = precision_mask;
+        // These routes change only FP16 activation movement/collectives. Keep
+        // the original uniformly FP16 or uniformly W8 weights and scale owners.
+        if (pi05_vision_owner_ln_opt_in_) {
+            TORCH_CHECK(num_cores() == 8 && pi05_ring_xor3_opt_in_ && eps == 1e-6,
+                "Pi Vision owner-LN requires eight cores, XOR3 and epsilon 1e-6");
+            // Image count is not known at set_weights. Shape planning below
+            // requires the exact selected pair before any graph submission.
+            require_pi05_vision_owner_ln_payloads(0);
+            TORCH_CHECK(proj_w.sizes() == at::IntArrayRef({2048, 1152}) &&
+                            proj_b.numel() == 2048 && post_ln_w.numel() == 1152 &&
+                            post_ln_b.numel() == 1152,
+                        "Pi Vision owner-LN global projection/norm shape mismatch");
+            for (int64_t i = 0; i < N; ++i) {
+                TORCH_CHECK(ln1_w_list[i].numel() == 1152 && ln1_b_list[i].numel() == 1152 &&
+                                ln2_w_list[i].numel() == 1152 && ln2_b_list[i].numel() == 1152,
+                            "Pi Vision owner-LN requires exact FP16 affine norm owners");
+            }
+        }
+        if (pi05_vision_kv_spm_only_opt_in_ || pi05_vision_owner_ln_opt_in_) {
+            TORCH_CHECK(num_cores() == 8 && N == 27 && num_heads == 16 && head_dim == 80 &&
+                    hidden_size == 1152 && intermediate_size == 4352 &&
+                    projection_dim == 2048 && hidden_size / num_heads == 72,
+                "Pi Vision residency requires the exact FP16/W8 Pi SigLIP profile");
+            auto exact = [](const at::Tensor& tensor, at::ScalarType dtype,
+                            at::IntArrayRef shape) {
+                return tensor.defined() && tensor.device().type() == at::kPrivateUse1 &&
+                    tensor.scalar_type() == dtype && tensor.is_contiguous() && tensor.sizes() == shape;
+            };
+            const auto dtype = q_w_list.front().scalar_type();
+            TORCH_CHECK(dtype == at::kChar || dtype == at::kHalf,
+                        "Pi Vision residency requires genuine W8 or FP16 weights");
+            const bool w8 = dtype == at::kChar;
+            for (const auto* scales : {&q_ws_list, &k_ws_list, &v_ws_list,
+                                      &o_ws_list, &fc1_ws_list, &fc2_ws_list}) {
+                TORCH_CHECK(w8 ? scales->size() == 27 : scales->empty(),
+                            "Pi Vision residency requires W8 scales only with W8 weights");
+            }
+            for (int64_t i = 0; i < N; ++i) {
+                TORCH_CHECK(exact(q_w_list[i], dtype, {1280, 1152}) &&
+                        exact(k_w_list[i], dtype, {1280, 1152}) &&
+                        exact(v_w_list[i], dtype, {1280, 1152}) &&
+                        exact(o_w_list[i], dtype, {1152, 1280}) &&
+                        exact(fc1_w_list[i], dtype, {4352, 1152}) &&
+                        exact(fc2_w_list[i], dtype, {1152, 4352}),
+                    "Pi Vision residency requires uniform exact projection owners at layer ", i);
+                TORCH_CHECK(!w8 || (exact(q_ws_list[i], at::kHalf, {1280}) &&
+                        exact(k_ws_list[i], at::kHalf, {1280}) &&
+                        exact(v_ws_list[i], at::kHalf, {1280}) &&
+                        exact(o_ws_list[i], at::kHalf, {1152}) &&
+                        exact(fc1_ws_list[i], at::kHalf, {4352}) &&
+                        exact(fc2_ws_list[i], at::kHalf, {1152})),
+                    "Pi Vision residency scale mismatch at layer ", i);
+            }
+        }
+
+        // The opt-in is exact and checked before mutating the installed owner.
+        if (pi05_vision_fc_weight_outer_opt_in_) {
+            TORCH_CHECK(N==27 && num_heads==16 && head_dim==80 && hidden_size==1152 &&
+                intermediate_size==4352 && projection_dim==2048,
+                "Pi Vision FC weight-outer requires the exact W8 Pi SigLIP profile");
+            auto exact=[](const at::Tensor& t,at::ScalarType dtype,at::IntArrayRef shape) {
+                return t.defined() && t.device().type()==at::kPrivateUse1 &&
+                    t.scalar_type()==dtype && t.is_contiguous() && t.sizes()==shape;
+            };
+            TORCH_CHECK(fc1_ws_list.size()==27 && fc2_ws_list.size()==27,
+                "Pi Vision FC weight-outer requires all original scale owners");
+            for(int64_t i=0;i<N;++i) {
+                TORCH_CHECK(q_w_list[i].scalar_type()==at::kChar && k_w_list[i].scalar_type()==at::kChar &&
+                    v_w_list[i].scalar_type()==at::kChar && o_w_list[i].scalar_type()==at::kChar &&
+                    exact(fc1_w_list[i],at::kChar,{4352,1152}) && exact(fc2_w_list[i],at::kChar,{1152,4352}) &&
+                    exact(fc1_ws_list[i],at::kHalf,{4352}) && exact(fc2_ws_list[i],at::kHalf,{1152}) &&
+                    exact(fc1_b_list[i],at::kHalf,{4352}) && exact(fc2_b_list[i],at::kHalf,{1152}),
+                    "Pi Vision FC weight-outer weight/scale/original bias mismatch at layer ",i);
+            }
+        }
+
         // SigLIP uses MHA: num_kv_heads == num_q_heads
         set_model_params(num_heads, num_heads, head_dim,
                          hidden_size, intermediate_size);
@@ -420,14 +756,15 @@ public:
         eps_ = eps;
         projection_dim_ = projection_dim;
 
-        // orig_head_dim = hidden_size / num_heads (= 72 for SigLIP), not from
-        // the padded weight shape, which would give 80.
+        // orig_head_dim = hidden_size / num_heads (= 72 for SigLIP, NOT from
+        // padded weight shape which would give 80). v2 reference:
+        // rpu_siglip_fused_encoder_layer.cpp:584.
         orig_head_dim_ = hidden_size / num_heads;
 
-        // Per-core local Q head count for KV_FIRST q_ddr_buf_ staging
+        // Site9 (KV_FIRST): per-core local Q head count for q_ddr_buf_ staging
         // and the Phase1 Q→DDR / Phase2 DDR→Q scatter/gather (mirror Gemma's
-        // local_q_heads_ = num_q_heads / attn_tp()). SigLIP fixes tp = NUM_CORES.
-        local_q_heads_ = num_q_heads() / NUM_CORES;
+        // local_q_heads_ = num_q_heads / attn_tp()). SigLIP fixes tp = num_cores().
+        local_q_heads_ = num_q_heads() / num_cores();
 
         // Build layer weights
         layer_weights_.clear();
@@ -463,7 +800,7 @@ public:
         proj_w_ = proj_w;
         proj_b_ = proj_b;
 
-        invalidate_model_state();  // Must remain the last statement of set_weights.
+        invalidate_model_state();  // D-503: last non-empty statement of set_weights
     }
 
     // ========================================================================
@@ -476,6 +813,17 @@ public:
                     "siglip_set_patch_emb: weight must be defined 2D");
         TORCH_CHECK(pos_emb.defined(),
                     "siglip_set_patch_emb: pos_emb must be defined");
+        if (num_cores() != 8) {
+            TORCH_CHECK(kernel_size == 14 && stride == 14 &&
+                            weight.sizes() == at::IntArrayRef({1152, 3136}) &&
+                            pos_emb.sizes() == at::IntArrayRef({1, 256, 1152}),
+                        "Pi0.5 SigLIP4 requires the fixed 224x224 patch profile");
+            for (const auto* tensor : {&weight, &pos_emb})
+                TORCH_CHECK(tensor->scalar_type() == at::kHalf &&
+                                tensor->device().type() == at::kPrivateUse1 &&
+                                tensor->is_contiguous(),
+                            "Pi0.5 SigLIP patch/position weights must remain FP16 RPU");
+        }
 
         patch_emb_weight_ = weight;
         patch_emb_pos_emb_ = pos_emb;
@@ -500,7 +848,8 @@ public:
     at::Tensor forward(
         const at::Tensor& input,
         std::vector<at::Tensor>& k_caches,
-        std::vector<at::Tensor>& v_caches)
+        std::vector<at::Tensor>& v_caches,
+        at::IntArrayRef planned_stage_descriptor)
     {
         TORCH_CHECK(num_layers() > 0,
                     "SigLIPModel::forward called before set_weights");
@@ -520,16 +869,57 @@ public:
         at::Tensor hidden_states;
         int64_t packed_image_count = 1;
 
-        // Supported inputs: 4D [N,C,H,W] packs N images into one hidden tensor
-        // and drives per-image minibatch SDPA; 3D [1,S,hidden] is pre-embedded.
+        // D-507: Auto-detect input shape.
+        //  - 4D [N,C,H,W]: SigLIP-batch packs the N camera images into one
+        //    [1,N*256,hidden] hidden via run_packed_patch_embed (all inside this
+        //    one capture); image_batch_count_ = N drives the per-image minibatch
+        //    SDPA. N=1 is the legacy single-image path, byte-identical.
+        //  - 3D [1,S,hidden]: pre-embedded single hidden (image_batch_count_=1).
         if (input.dim() == 4 && has_patch_emb_) {
-            hidden_states = run_packed_patch_embed(input);  // sets image_batch_count_
+            TORCH_CHECK(
+                !planned_stage_descriptor.empty(),
+                "SigLIP patch-embedding forward requires its native A6 "
+                "stage descriptor");
+            const int64_t patch_rows =
+                input.size(0) *
+                ((input.size(2) - pe_kh_) / pe_strideh_ + 1) *
+                ((input.size(3) - pe_kw_) / pe_stridew_ + 1);
+            TORCH_CHECK(num_cores() == 8 ||
+                            (input.sizes() == at::IntArrayRef({1, 3, 224, 224}) &&
+                             input.scalar_type() == at::kHalf && patch_rows == 256),
+                        "Pi0.5 SigLIP4 requires serial single-image M256 execution");
+            // Validate the descriptor against this request's actual cameras,
+            // even if a different admitted shape was the last planned/replayed one.
+            image_batch_count_ = input.size(0);
+            const auto prepared_planned = prepare_stage_candidate(planned_stage_descriptor);
+            const auto& planned = prepared_planned->candidate();
+            validate_pi05_vision_kv_spm_only_policy(
+                planned, patch_rows, input.size(0));
+            validate_pi05_vision_owner_ln_policy(
+                planned, patch_rows, input.size(0));
+            require_pi05_vision_fc_profile(patch_rows,input.size(0));
+            validate_pi05_vision_fc_manifest(planned.physical_manifest);
+            if(pi05_vision_fc_weight_outer_opt_in_)
+                require_pi05_vision_fc_schedule(planned.stage_plan);
+            begin_external_physical_manifest_prologue(
+                planned.physical_manifest, patch_rows, /*position=*/0);
+            auto cancel_patch_prologue = c10::make_scope_exit(
+                [&] { cancel_external_physical_manifest_prologue(); });
+            hidden_states = run_packed_patch_embed(
+                input, /*consume_external_prologue=*/true);
             packed_image_count = image_batch_count_;
+            at::Tensor result = forward_packed(
+                hidden_states, packed_image_count, k_caches, v_caches,
+                planned_stage_descriptor);
+            cancel_patch_prologue.release();
+            return result;
         } else {
             hidden_states = input;
         }
 
-        return forward_packed(hidden_states, packed_image_count, k_caches, v_caches);
+        return forward_packed(
+            hidden_states, packed_image_count, k_caches, v_caches,
+            planned_stage_descriptor);
     }
 
     // ========================================================================
@@ -538,13 +928,14 @@ public:
     // [1, N*256, hidden] hidden via run_packed_patch_embed_list, then runs the
     // identical encoder + projector tail as forward(). image_batch_count_ = N
     // (set by the packer) drives the per-image minibatch SDPA in
-    // build_layer_subgraph — bit-exact with forward()'s 4D torch.cat path,
-    // without the cat/slice round trip.
+    // build_layer_subgraph — bit-exact vs forward()'s 4D torch.cat'd path
+    // (test_siglip_batch_3image.py), just without the cat/slice round-trip.
     // ========================================================================
     at::Tensor forward_multi(
         at::TensorList images,
         std::vector<at::Tensor>& k_caches,
-        std::vector<at::Tensor>& v_caches)
+        std::vector<at::Tensor>& v_caches,
+        at::IntArrayRef planned_stage_descriptor)
     {
         TORCH_CHECK(num_layers() > 0,
                     "SigLIPModel::forward_multi called before set_weights");
@@ -565,8 +956,42 @@ public:
 
         // Patch-embed + pack all N images into [1, N*256, hidden] (sets
         // image_batch_count_ = N for the per-image minibatch SDPA).
-        at::Tensor hidden_states = run_packed_patch_embed_list(images);
-        return forward_packed(hidden_states, image_batch_count_, k_caches, v_caches);
+        TORCH_CHECK(
+            !planned_stage_descriptor.empty(),
+            "SigLIP patch-embedding forward requires its native A6 stage "
+            "descriptor");
+        const at::Tensor& first_image = images.front();
+        const int64_t patch_rows =
+            static_cast<int64_t>(images.size()) *
+            ((first_image.size(2) - pe_kh_) / pe_strideh_ + 1) *
+            ((first_image.size(3) - pe_kw_) / pe_stridew_ + 1);
+        TORCH_CHECK(num_cores() == 8 ||
+                        (images.size() == 1 && patch_rows == 256 &&
+                         first_image.sizes() == at::IntArrayRef({1, 3, 224, 224}) &&
+                         first_image.scalar_type() == at::kHalf),
+                    "Pi0.5 SigLIP4 requires serial single-image M256 execution");
+        image_batch_count_ = static_cast<int64_t>(images.size());
+        const auto prepared_planned = prepare_stage_candidate(planned_stage_descriptor);
+        const auto& planned = prepared_planned->candidate();
+        validate_pi05_vision_kv_spm_only_policy(
+            planned, patch_rows, static_cast<int64_t>(images.size()));
+        validate_pi05_vision_owner_ln_policy(
+            planned, patch_rows, static_cast<int64_t>(images.size()));
+        require_pi05_vision_fc_profile(patch_rows,static_cast<int64_t>(images.size()));
+        validate_pi05_vision_fc_manifest(planned.physical_manifest);
+        if(pi05_vision_fc_weight_outer_opt_in_)
+            require_pi05_vision_fc_schedule(planned.stage_plan);
+        begin_external_physical_manifest_prologue(
+            planned.physical_manifest, patch_rows, /*position=*/0);
+        auto cancel_patch_prologue = c10::make_scope_exit(
+            [&] { cancel_external_physical_manifest_prologue(); });
+        at::Tensor hidden_states = run_packed_patch_embed_list(
+            images, /*consume_external_prologue=*/true);
+        at::Tensor result = forward_packed(
+            hidden_states, image_batch_count_, k_caches, v_caches,
+            planned_stage_descriptor);
+        cancel_patch_prologue.release();
+        return result;
     }
 
     at::Tensor patch_embed(const at::Tensor& input) {
@@ -579,7 +1004,8 @@ public:
                     input.dim(), "D");
         TORCH_CHECK(has_patch_emb_,
                     "SigLIPModel::patch_embed requires patch embedding params");
-        return run_packed_patch_embed(input);
+        return run_packed_patch_embed(
+            input, /*consume_external_prologue=*/false);
     }
 
     at::Tensor patch_embed_multi(at::TensorList images) {
@@ -595,15 +1021,20 @@ public:
             TORCH_CHECK(im.dim() == 4 && im.size(0) == 1,
                         "SigLIPModel::patch_embed_multi: each image must be [1,C,H,W]");
         }
-        return run_packed_patch_embed_list(images);
+        return run_packed_patch_embed_list(
+            images, /*consume_external_prologue=*/false);
     }
 
     at::Tensor forward_packed(
         const at::Tensor& hidden_states,
         int64_t packed_image_count,
         std::vector<at::Tensor>& k_caches,
-        std::vector<at::Tensor>& v_caches)
+        std::vector<at::Tensor>& v_caches,
+        at::IntArrayRef planned_stage_descriptor)
     {
+        TORCH_CHECK(!planned_stage_descriptor.empty(),
+                    "SigLIP production forward requires its native A6 stage "
+                    "descriptor");
         TORCH_CHECK(hidden_states.dim() == 3,
                     "SigLIPModel::forward_packed: hidden input must be 3D, got ",
                     hidden_states.dim(), "D");
@@ -617,42 +1048,40 @@ public:
 
         int64_t seq_len = hidden_states.size(1);
 
+        validate_pi05_vision_owner_ln_policy(
+            decode_fmb_prefill_stage_candidate(planned_stage_descriptor),
+            seq_len, packed_image_count);
+
+        if (pi05_vision_kv_spm_only_opt_in_) {
+            validate_pi05_vision_kv_spm_only_policy(
+                decode_fmb_prefill_stage_candidate(planned_stage_descriptor),
+                seq_len, packed_image_count);
+        }
+
         // Site5 (KV_FIRST): seq_len_ is this forward's full sequence length (the SDPA
-        // kv_seq_len). The stable per-shape Q staging slot is allocated below,
-        // after validation, so an invalid packed shape cannot leak a slot.
+        // kv_seq_len). The STABLE per-shape Q staging slot is allocated BELOW, AFTER
+        // the shape-validity checks (cold-panel re-review #edge: don't allocate before
+        // validation — an invalid packed shape would otherwise leak a slot).
         seq_len_ = seq_len;
 
         // Minibatch (N>1 packed images) mutual-exclusion with chunking: the
         // per-image minibatch SDPA launcher asserts a SINGLE chunk spanning the
         // whole packed sequence. For N>1, pin the compute chunk size to the full
         // sequence via the override; plan_kv_first_chunks then keeps QKV
-        // identical to that plan. N==1 leaves the override at 0 so the auto-scan
-        // can choose a fitting compute chunk.
+        // identical to that plan. This bypasses the auto-scan, exactly like the
+        // retired D-508 single-chunk path did. N==1 (HALO single-image) leaves
+        // the override at 0 so the auto-scan can pick a fitting comp_cs and
+        // token-chunk the 1564 path.
         //
-        // The override is floored to (override/16)*16. A packed seq not a multiple of 16 — or not
+        // the override is floored to (override/16)*16
+        // (fused_model_base.cpp:487). A packed seq not a multiple of 16 — or not
         // divisible by image_batch_count_ — would split a TAIL chunk, violating the
         // single-block minibatch assertion (TORCH_CHECK(chunk.len==seq_len_) in the
-        // KV_FIRST body below). Fail fast here with a clear shape error. SigLIP
-        // packs per-image npp(=256)
+        // KV_FIRST body below) deep on-board where it is hard to root-cause. Fail
+        // fast HERE with a clear shape error. SigLIP packs per-image npp(=256)
         // tokens so seq_len = N*256 is 16-aligned in practice; this guards the
         // invariant the forced-single-block override silently relies on.
-        TORCH_CHECK(
-            image_batch_count_ == 1 ||
-                (seq_len % 16 == 0 && seq_len % image_batch_count_ == 0),
-            "SigLIP packed forward: seq_len (", seq_len,
-            ") must be divisible by 16 and by image_batch_count (", image_batch_count_,
-            ") so the forced single-block KV_FIRST override does not split a tail chunk");
-        if (image_batch_count_ > 1) {
-            TORCH_CHECK(configured_chunk_size_ == 0
-                            || configured_chunk_size_ >= seq_len,
-                        "SigLIP packed multi-image attention requires one "
-                        "chunk spanning the full sequence (", seq_len,
-                        "); configured chunk_size must be auto or at least the "
-                        "packed sequence length, got ", configured_chunk_size_);
-            set_chunk_size_override(seq_len);
-        } else {
-            set_chunk_size_override(configured_chunk_size_);
-        }
+        configure_chunk_for_shape(seq_len, image_batch_count_);
 
         // Site5 (KV_FIRST): shape now validated → ensure a STABLE Q staging slot for
         // THIS forward (mirror GemmaModel). Keyed by {seq_len, q_width =
@@ -669,12 +1098,22 @@ public:
                         "shapes on one handle — likely a runaway shape loop (per-shape Q "
                         "staging is never freed for replay-address stability)");
             q_ddr_slots_.emplace(q_key, at::empty(
-                {(int64_t)NUM_CORES, seq_len, q_width},
+                {int64_t{8}, seq_len, q_width},
                 at::TensorOptions().dtype(at::kHalf).device(at::kPrivateUse1)));
         }
 
-        // Fail early if the smallest legal chunk cannot fit SPM. The framework's
-        // auto scan remains the authoritative budget gate for larger chunks.
+        // GUARD (design note §2 三件套 ①): host-side per-chunk SPM budget
+        // pre-check BEFORE dispatch. The probe note proved a naive single-chunk
+        // 1564-token forward exhausts the 8 MB SPM block and enters an infinite
+        // allocator retry that POISONS the whole RPU board (run-queue wedged
+        // until reboot). The framework's auto chunk-size scan
+        // (compute_chunks_impl) already rejects an over-budget seq with a clear
+        // TORCH_CHECK on the same planner path used by the per-forward override,
+        // so this is a defense-in-depth fail-fast: if even the SMALLEST
+        // legal chunk (cs=16) cannot fit, refuse loudly here rather than relying
+        // solely on the framework's [Fix #4] min-chunk check. The framework owns
+        // the authoritative budget gate; this guard only converts the worst case
+        // into an explicit, readable error at the model boundary.
         {
             LayoutContext probe_ctx;
             probe_ctx.chunk_size = 16;  // smallest legal chunk
@@ -691,26 +1130,21 @@ public:
                         "seq_len=", seq_len, ", hidden=", hidden_size(), ".");
         }
 
-        TORCH_CHECK(seq_len % image_batch_count_ == 0,
-                    "SigLIP packed sequence must divide into image spans");
-        const int64_t per_image = seq_len / image_batch_count_;
-        std::vector<ChunkInfo> patch_chunks;
-        std::vector<FmbExecutionSpan> image_spans;
-        patch_chunks.reserve(image_batch_count_);
-        image_spans.reserve(image_batch_count_);
-        for (int64_t image = 0; image < image_batch_count_; ++image) {
-            const int64_t offset = image * per_image;
-            patch_chunks.push_back({
-                static_cast<int>(image), offset, per_image,
-                offset + per_image});
-            image_spans.push_back({offset, per_image});
-        }
+        // Fast/deep REPLAY skips build_layer_subgraph entirely. Allocate the
+        // externally returned tensor here on EVERY forward and refresh the
+        // owner-local mutable DMA base before FMB can take that skip path.
+        // Otherwise a retained previous Vision return is overwritten by the
+        // next request even though its Tensor/DDR owner is still alive.
+        projector_output_ = allocate_tracked_output({1, seq_len_, projection_dim_});
+        projector_out_live_base_ =
+            ::rhino_lkn::RpuGetDevAddr(projector_output_.data_ptr());
+
         at::Tensor result = run_all_layers(
             hidden_states, k_caches, v_caches,
             /*mask=*/std::nullopt, /*position=*/0, /*is_causal=*/false,
-            patch_chunks, image_spans);
+            /*planned_chunk_size=*/0, planned_stage_descriptor);
 
-        // Last layer freshly allocated projector_output_ (Pitfall 4); flush for
+        // Last layer writes the fresh projector_output_ (Pitfall 4); flush for
         // CPU coherency before returning to Python (framework doesn't track it).
         if (projector_output_.defined()) {
             rpu_ddr_flush(projector_output_.data_ptr<c10::Half>());
@@ -720,8 +1154,14 @@ public:
     }
 
 protected:
+    KvCostLayoutScope capture_kvinsert_cost_layout_scope() override {
+        return capture_kvinsert_cost_layout_fields(
+            seq_len_, image_batch_count_,
+            planning_external_patch_prologue_);
+    }
+
     // ========================================================================
-    // static_config — preload + KV_FIRST callback registration
+    // static_config — D-501 preload + KV_FIRST callback registration
     //
     // Registers the pointer-to-member `&SigLIPModel::emit_preload_weights`
     // (cast to FusedModelBase pointer-to-member) on the preload-fn slot.
@@ -732,14 +1172,16 @@ protected:
         ModelStaticConfig cfg;
         cfg.num_layers       = num_layers();
 
-        // One-shot .preload_fn. The body emits only rpu_launch_* operations and never opens
+        // D-501 one-shot .preload_fn: replaces v2's `build_preload_subgraph`
+        // virtual. The body emits only rpu_launch_* operations and never opens
         // its own graph or batch lifecycle.
-        // SigLIP uses one-shot preload_fn while Gemma
+        // PRESERVED through the SEQUENTIAL→KV_FIRST refactor (Site3): SigLIP is
+        // the only KV_FIRST consumer that ALSO uses one-shot preload_fn (Gemma
         // uses per-buffer .preload_callback instead) — both coexist fine here.
         cfg.preload_fn = static_cast<void(FusedModelBase::*)()>(
                              &SigLIPModel::emit_preload_weights);
 
-        // Two pointer-to-member slots implement the KV_FIRST two-phase dispatch
+        // D-501 KV_FIRST: two pointer-to-member slots for the two-phase dispatch
         // (mirror GemmaModel::static_config). The static_cast is required because
         // the base struct types the slots as pointer-to-member-of-FusedModelBase
         // (std::invoke resolves to the concrete subclass at runtime).
@@ -751,13 +1193,15 @@ protected:
             static_cast<ChunkPlan(FusedModelBase::*)(const ChunkPlan&)>(
                 &SigLIPModel::plan_kv_first_chunks);
 
-        // SigLIP REQUIRES a single group. With cross_batch < num_layers,
+        // SigLIP REQUIRES single group (matches v2 design at
+        // rpu_siglip_fused_encoder_layer.cpp:634-645). With cross_batch < num_layers,
         // splitting this encoder changes its required cross-layer SPM/dataflow
-        // contract and can produce non-deterministic output.
+        // contract and produced non-deterministic output in the original A/B.
         //
         // The Qwen3 global runtime knob (g_cross_layer_batch_size, default 12) leaks into
-        // SigLIP if not explicitly set, so this model enforces the full-layer
-        // group invariant directly in C++.
+        // SigLIP if not explicitly set. Other models (Qwen3, Gemma) work because their
+        // tests explicitly set cross_batch >= num_layers (test_qwen3_decode.py sets 36).
+        // SigLIP enforces this invariant in C++ to be defensive.
         cfg.cross_layer_batch_size = num_layers();
         return cfg;
     }
@@ -765,17 +1209,318 @@ protected:
     // ========================================================================
     // dynamic_config — KV_FIRST + AUTO inter-layer I/O.
     //
-    // KV_FIRST keeps full [seq,h] K/V in DDR and feeds SPM one query chunk at a
-    // time. AUTO selects SPM_RESIDENT for one chunk and DDR_PINGPONG otherwise.
-    // The base ping-pong DMA uses a single core-0 path.
+    // SEQUENTIAL→KV_FIRST refactor (halo-vit-cache-kvfirst-refactor-design
+    // -2026-06-18): the former single-chunk SPM_RESIDENT encoder hit the 8 MB
+    // SPM ceiling at ~960 tokens (the MLP-intermediate working set), hanging
+    // HALO's 1564-patch single-image ViT path (probe note
+    // halo-vit-cache-seq-ceiling-probe-2026-06-18). KV_FIRST keeps the full
+    // [seq,h] K/V in DDR and feeds SPM one query-chunk at a time, so the
+    // per-chunk SPM footprint stays chunk-bounded; AUTO then picks SPM_RESIDENT
+    // for a lone chunk (seq≤ceiling, byte-identical to the old path) and
+    // DDR_PINGPONG when the sequence splits into multiple chunks.
+    //
+    // The old "DDR ping-pong 8-core broadcast-write race / corruption" worry
+    // (former Round-9 SPM_RESIDENT rationale) does NOT reproduce: the base
+    // ping-pong DMA is a single core-0 path (rpu_memcpy.cpp:1146), not the old
+    // multicore broadcast — cross-ref design note §0b for the static proof.
     // No build_chunk_masks: SigLIP attention is MASK_NONE (bidirectional, no
     // additive mask), unlike Gemma's per-chunk causal masks.
     // ========================================================================
     ModelDynamicConfig dynamic_config(const ChunkPlan& /*plan*/) override {
         ModelDynamicConfig cfg;
         cfg.chunk_mode     = ChunkMode::KV_FIRST;
-        cfg.inter_layer_io = InterLayerIO::AUTO;
+        cfg.inter_layer_io = pi05_vision_owner_ln_opt_in_
+            ? InterLayerIO::SPM_RESIDENT : InterLayerIO::AUTO;
+        // RAW_SPM is descriptor-owned: legacy/no-descriptor entry points keep
+        // the historical DDR route and cannot silently select a physical ABI.
+        cfg.attention_policy = ctx().has_complete_physical_manifest()
+            ? AttentionExecutionPolicy::AUTO
+            : AttentionExecutionPolicy::DDR_KV;
         return cfg;
+    }
+
+    void consume_manifest_route(
+        FmbRouteFamily family, int64_t site_id, int64_t selector,
+        int64_t invocation = 0) {
+        if (!ctx().has_complete_physical_manifest()) return;
+        ctx().consume_physical_route(
+            family, site_id, selector, /*resolved_flags=*/0,
+            /*resolved_arguments=*/{}, invocation);
+    }
+
+    FmbPhysicalExecutionManifest physical_manifest_for_candidate(
+        const FmbThreeStageChunkPlan& plan,
+        const LayoutContext& layout, int64_t physical_len,
+        int64_t logical_len, int64_t position) const override {
+        FmbPhysicalExecutionManifest manifest;
+        manifest.state = FmbPhysicalManifestState::COMPLETE;
+        manifest.logical_length = logical_len;
+        manifest.physical_length = physical_len;
+        manifest.execution_padding_rows = physical_len - logical_len;
+        manifest.kv_logical_length = position + logical_len;
+        manifest.kv_insert_physical_rows = physical_len;
+        manifest.graph_lifecycle = FmbGraphLifecycle::COMPOSITE_CHILD;
+        manifest.linear_accumulation = linear_accumulation_policy();
+        if(pi05_vision_fc_weight_outer_opt_in_) {
+            require_pi05_vision_fc_profile(physical_len,image_batch_count_);
+            TORCH_CHECK(logical_len==768 && position==0 && layout.batch_size==1 &&
+                !layout.is_causal && !layout.use_attn_mask && layout.chunk_size==768 &&
+                layout.effective_kv_cs()==768,"Pi Vision FC weight-outer rejects noncanonical layout");
+            require_pi05_vision_fc_schedule(plan);
+        }
+
+        LayoutContext spm_layout = layout;
+        spm_layout.attention_policy =
+            AttentionExecutionPolicy::SPM_KV_BY_MHA;
+        const bool raw_spm_eligible = subclass_spm_kv_by_mha_eligible(
+            plan, spm_layout, position);
+        const bool raw_spm = layout.attention_policy ==
+            AttentionExecutionPolicy::SPM_KV_BY_MHA;
+        require_pi05_vision_kv_spm_only_candidate(
+            plan, layout, physical_len, logical_len, position);
+        if (pi05_vision_owner_ln_opt_in_) {
+            require_pi05_vision_owner_ln_profile(physical_len, image_batch_count_);
+            require_pi05_vision_kv_spm_only_schedule(plan);
+            TORCH_CHECK(logical_len == physical_len && position == 0 &&
+                            layout.batch_size == 1 && !layout.is_causal &&
+                            !layout.use_attn_mask && layout.chunk_size == physical_len &&
+                            layout.effective_kv_cs() == physical_len && raw_spm && raw_spm_eligible,
+                        "Pi Vision owner-LN requires exact SPM-resident input2-or-3/QKV1/compute1 candidate");
+        }
+        TORCH_CHECK(
+            !raw_spm || raw_spm_eligible,
+            "RPU_PLANNER_REJECT:CAPABILITY: SigLIP raw-SPM attention was "
+            "selected without one full packed QKV/compute schedule");
+
+        auto append = [&](FmbRouteFamily family, int64_t site_id,
+                          int64_t selector,
+                          std::vector<int64_t> arguments = {},
+                          int64_t invocation = 0) {
+            manifest.routes.push_back({
+                site_id, family, selector, /*flags=*/0,
+                std::move(arguments), invocation});
+        };
+        auto append_linear = [&](int64_t site_id, int64_t invocation) {
+            append(FmbRouteFamily::LINEAR, site_id,
+                   static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+                   {}, invocation);
+        };
+        if (num_cores() != 8) {
+            append(FmbRouteFamily::GRAPH_SCHEDULE, SIGLIP_CORE_PROFILE_SITE,
+                   1, core_profile_arguments());
+        }
+        for (const ChunkInfo& chunk : plan.qkv.chunks) {
+            if (pi05_vision_q_resident_opt_in_) {
+                const bool carry_q = use_pi05_vision_q_resident(
+                    chunk.len, layout.attention_policy) &&
+                    plan.qkv.chunks.size() == 1 && plan.compute.chunks.size() == 1 &&
+                    plan.compute.chunks.front().len == chunk.len;
+                append(FmbRouteFamily::GRAPH_SCHEDULE, SIGLIP_Q_RESIDENT_SITE,
+                       carry_q ? 2 : 1, {}, chunk.idx);
+            }
+            append_linear(SIGLIP_Q_LINEAR_SITE, chunk.idx);
+            append_linear(SIGLIP_K_LINEAR_SITE, chunk.idx);
+            append_linear(SIGLIP_V_LINEAR_SITE, chunk.idx);
+            const KvInsertSegmentPlan kv_plan =
+                resolve_kvinsert_plan_auto(
+                    SIGLIP_KV_INSERT_SITE, manifest.graph_lifecycle,
+                    position + chunk.offset, chunk.len, chunk.len,
+                    num_cores(), num_q_heads(), head_dim(),
+                    SIGLIP_KV_CAPABILITIES);
+            const KvInsertRouteArguments arguments =
+                rpu_kvinsert_route_arguments(
+                    kv_plan, num_cores(), num_q_heads(), head_dim());
+            manifest.routes.push_back({
+                SIGLIP_KV_INSERT_SITE, FmbRouteFamily::KV_INSERT,
+                static_cast<int64_t>(kv_plan.route()),
+                pi05_vision_kv_spm_only_opt_in_
+                    ? SIGLIP_KV_FLAG_RAW_SPM_ONLY
+                    : SIGLIP_KV_FLAG_DDR_MIRROR,
+                {arguments.begin(), arguments.end()}, chunk.idx});
+            manifest.kv_insert_physical_rows = std::max(
+                manifest.kv_insert_physical_rows,
+                kv_plan.physical_rows());
+        }
+        for (const ChunkInfo& chunk : plan.compute.chunks) {
+            const int64_t per_image_ctx =
+                physical_len / image_batch_count_;
+            manifest.routes.push_back({
+                raw_spm
+                    ? SIGLIP_RAW_SPM_ATTN_SITE
+                    : (image_batch_count_ > 1
+                           ? SIGLIP_MINIBATCH_ATTN_SITE
+                           : SIGLIP_UNIFIED_ATTN_SITE),
+                FmbRouteFamily::ATTENTION,
+                static_cast<int64_t>(
+                    raw_spm ? AttentionExecutionPolicy::SPM_KV_BY_MHA
+                            : AttentionExecutionPolicy::DDR_KV),
+                raw_spm || raw_spm_eligible
+                    ? 0 : SIGLIP_ATTN_CAPABILITY_FALLBACK_DDR_REQUIRED,
+                {image_batch_count_, per_image_ctx, chunk.len, physical_len,
+                 num_q_heads(), head_dim()}, chunk.idx});
+            append_linear(SIGLIP_O_LINEAR_SITE, chunk.idx);
+            append(
+                FmbRouteFamily::ALL_REDUCE,
+                SIGLIP_ATTN_ALL_REDUCE_SITE,
+                pi05_vision_owner_ln_opt_in_ ? SIGLIP_OWNER_LN_ROUTE :
+                    fmb_ring_all_reduce_route_selector(
+                        chunk.len, hidden_size(), use_pi05_ring_xor3(chunk.len), num_cores()),
+                pi05_vision_owner_ln_opt_in_ ? pi05_vision_owner_ln_arguments(false, chunk.len) :
+                    std::vector<int64_t>{}, chunk.idx);
+            if(pi05_vision_fc_weight_outer_opt_in_) {
+                append(FmbRouteFamily::GRAPH_SCHEDULE,SIGLIP_FC1_WEIGHT_OUTER_SITE,
+                    2,pi05_vision_fc_arguments(false),chunk.idx);
+                append(FmbRouteFamily::GRAPH_SCHEDULE,SIGLIP_FC2_WEIGHT_OUTER_SITE,
+                    2,pi05_vision_fc_arguments(true),chunk.idx);
+            } else {
+                append_linear(SIGLIP_FC1_LINEAR_SITE, chunk.idx);
+                append_linear(SIGLIP_FC2_LINEAR_SITE, chunk.idx);
+            }
+            append(
+                FmbRouteFamily::ALL_REDUCE,
+                SIGLIP_MLP_ALL_REDUCE_SITE,
+                pi05_vision_owner_ln_opt_in_ ? SIGLIP_OWNER_LN_COMPACT_ROUTE :
+                    fmb_ring_all_reduce_route_selector(
+                        chunk.len, hidden_size(), use_pi05_ring_xor3(chunk.len), num_cores()),
+                pi05_vision_owner_ln_opt_in_ ? pi05_vision_owner_ln_arguments(true, chunk.len) :
+                    std::vector<int64_t>{}, chunk.idx);
+            append_linear(SIGLIP_PROJECTOR_LINEAR_SITE, chunk.idx);
+        }
+        if (planning_external_patch_prologue_) {
+            TORCH_CHECK(
+                has_patch_emb_ &&
+                    static_cast<int64_t>(plan.spans.size()) ==
+                        image_batch_count_,
+                "RPU_PLANNER_REJECT:CAPABILITY: SigLIP patch prologue "
+                "requires initialized patch weights and one span per image");
+            const int64_t K = pe_kh_ * pe_kw_ * pe_cin_padded_;
+            for (int64_t image = 0; image < image_batch_count_; ++image) {
+                const FmbExecutionSpan& span = plan.spans[image];
+                append(
+                    FmbRouteFamily::MUTABLE_DMA,
+                    SIGLIP_PATCH_INPUT_DMA_SITE,
+                    static_cast<int64_t>(SiglipPatchMutableDmaRoute::
+                        DDR_BROADCAST_TO_SPM_MUTABLE),
+                    {span.len, pe_cin_orig_, pe_cin_padded_, pe_kh_, pe_kw_,
+                     pe_strideh_, pe_stridew_, 1}, image);
+                append(
+                    FmbRouteFamily::LINEAR,
+                    SIGLIP_PATCH_LINEAR_SITE,
+                    static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+                    {span.len, pe_cout_, K, 1, 1, 0}, image);
+                append(
+                    FmbRouteFamily::MUTABLE_DMA,
+                    SIGLIP_PATCH_POSITION_DMA_SITE,
+                    static_cast<int64_t>(SiglipPatchMutableDmaRoute::
+                        DDR_BROADCAST_TO_SPM_MUTABLE),
+                    {span.len, pe_cout_, 1}, image);
+                append(
+                    FmbRouteFamily::MUTABLE_DMA,
+                    SIGLIP_PATCH_OUTPUT_DMA_SITE,
+                    static_cast<int64_t>(SiglipPatchMutableDmaRoute::
+                        SPM_COPY_TO_DDR_MUTABLE),
+                    {span.offset * pe_cout_ * DWIDTH,
+                     span.len * pe_cout_}, image);
+            }
+        }
+        append_fmb_shared_runtime_routes(
+            manifest, plan, hidden_size(), FMB_SHARED_LAYER_INPUT_DMA, 1, num_cores(), mlp_tp());
+        std::sort(
+            manifest.routes.begin(), manifest.routes.end(),
+            [](const FmbRouteManifestEntry& lhs,
+               const FmbRouteManifestEntry& rhs) {
+                return std::make_tuple(
+                           static_cast<int64_t>(lhs.family), lhs.site_id,
+                           lhs.invocation) <
+                    std::make_tuple(
+                           static_cast<int64_t>(rhs.family), rhs.site_id,
+                           rhs.invocation);
+            });
+        return manifest;
+    }
+
+    std::vector<FmbPhysicalExecutionManifest>
+    physical_manifest_domain_for_candidate(
+        const FmbThreeStageChunkPlan& plan,
+        const LayoutContext& layout,
+        int64_t physical_len, int64_t logical_len,
+        int64_t position) const override {
+        if (pi05_vision_kv_spm_only_opt_in_ || pi05_vision_owner_ln_opt_in_) {
+            LayoutContext spm_only_layout = layout;
+            spm_only_layout.attention_policy =
+                AttentionExecutionPolicy::SPM_KV_BY_MHA;
+            return {physical_manifest_for_candidate(
+                plan, spm_only_layout, physical_len, logical_len, position)};
+        }
+        LayoutContext ddr_layout = layout;
+        ddr_layout.attention_policy = AttentionExecutionPolicy::DDR_KV;
+        std::vector<FmbPhysicalExecutionManifest> domain{
+            physical_manifest_for_candidate(
+                plan, ddr_layout, physical_len, logical_len, position)};
+        LayoutContext spm_layout = layout;
+        spm_layout.attention_policy =
+            AttentionExecutionPolicy::SPM_KV_BY_MHA;
+        if (subclass_spm_kv_by_mha_eligible(
+                plan, spm_layout, position)) {
+            domain.push_back(physical_manifest_for_candidate(
+                plan, spm_layout, physical_len, logical_len, position));
+        }
+        return domain;
+    }
+
+    FmbPhysicalManifestForwardCapability
+    physical_manifest_forward_capability(
+        const FmbPhysicalExecutionManifest& manifest) const override {
+        validate_pi05_vision_fc_manifest(manifest);
+        validate_pi05_vision_kv_spm_only_manifest(manifest);
+        validate_pi05_vision_owner_ln_manifest(manifest);
+        return {true, FmbGraphLifecycle::COMPOSITE_CHILD};
+    }
+
+    bool subclass_spm_kv_by_mha_eligible(
+        const FmbThreeStageChunkPlan& plan,
+        const LayoutContext& layout,
+        int64_t position) const override {
+        if (position != 0 || layout.is_causal || layout.use_attn_mask ||
+            layout.batch_size != 1 ||
+            layout.attention_policy !=
+                AttentionExecutionPolicy::SPM_KV_BY_MHA ||
+            plan.chunk_mode != ChunkMode::KV_FIRST ||
+            plan.qkv.chunks.size() != 1 ||
+            plan.compute.chunks.size() != 1 || image_batch_count_ <= 0 ||
+            static_cast<int64_t>(plan.input.chunks.size()) !=
+                image_batch_count_ ||
+            static_cast<int64_t>(plan.spans.size()) != image_batch_count_) {
+            return false;
+        }
+        const ChunkInfo& chunk = plan.compute.chunks.front();
+        const int64_t seq = chunk.len;
+        // The candidate describes its complete packed sequence. Live seq_len_
+        // may still be zero or describe a prior shape during dry planning.
+        if (seq <= 0 || seq % image_batch_count_ != 0 ||
+            chunk.offset != 0 || chunk.kv_seq_len != seq ||
+            plan.qkv.chunks.front().offset != 0 ||
+            plan.qkv.chunks.front().len != seq) {
+            return false;
+        }
+        const int64_t per_image = seq / image_batch_count_;
+        for (int64_t image = 0; image < image_batch_count_; ++image) {
+            const int64_t offset = image * per_image;
+            if (plan.input.chunks[image].offset != offset ||
+                plan.input.chunks[image].len != per_image ||
+                plan.spans[image].offset != offset ||
+                plan.spans[image].len != per_image) {
+                return false;
+            }
+        }
+        return num_layers() == 27 && layer_weights_.size() == 27 &&
+            hidden_size() == 1152 && intermediate_size() == 4352 &&
+            num_q_heads() == 16 && num_kv_heads() == 16 &&
+            head_dim() == 80 && orig_head_dim_ == 72 &&
+            sdpa_by_mha_spm_is_valid(
+                image_batch_count_, per_image, per_image,
+                num_q_heads(), num_kv_heads(), head_dim(), num_cores(),
+                /*MASK_NONE=*/0);
     }
 
     // ========================================================================
@@ -787,7 +1532,7 @@ protected:
     // cycle 2+ 时 SIGLIP_WEIGHTS DMA graph + SIGLIP_COMPUTE compute graph 都直接
     // SKIP/REPLAY (省去 272 个权重 DMA + 382 个 compute kernel).
     //
-    // SigLIP uses one-shot preload-fn instead of per-buffer
+    // SigLIP uses one-shot preload-fn (D-501) instead of per-buffer
     // `.preload_callback` (which would be the Gemma pattern) — so NO
     // `.preload_callback` field is set on any decl here.
     // ========================================================================
@@ -807,16 +1552,25 @@ protected:
         int64_t hd = head_dim();
         int64_t is_ = intermediate_size();
 
-        int64_t local_q_dim = (nq / NUM_CORES) * hd;
-        int64_t local_inter = is_ / NUM_CORES;
+        int64_t local_q_dim = (nq / num_cores()) * hd;
+        int64_t local_inter = is_ / mlp_tp();
         auto A = [](int64_t bytes) -> int64_t { return Align(bytes, 256); };
+        const bool raw_spm = ctx.attention_policy ==
+            AttentionExecutionPolicy::SPM_KV_BY_MHA;
+        const bool carry_q = comp_cs == kv_cs &&
+            use_pi05_vision_q_resident(kv_cs, ctx.attention_policy);
 
         // LayerWide: read in both phases → sized at wide_cs.
         int64_t res  = A(wide_cs * h * DWIDTH);
         // KvInsert: Phase-1 QKV outputs (q renamed → q_kv; Phase 1 writes q_kv,
         // dumps it to q_ddr_buf_, never reads it again — Phase 2 reloads from
         // DDR into q_comp).
-        int64_t qkv  = A(kv_cs   * local_q_dim * DWIDTH);
+        const int64_t raw_kv_rows = raw_spm
+            ? image_batch_count_ * Align(
+                  CeilDiv(kv_cs, image_batch_count_), int64_t{16})
+            : kv_cs;
+        int64_t qkv  = A(kv_cs * local_q_dim * DWIDTH);
+        const int64_t raw_kv = A(raw_kv_rows * local_q_dim * DWIDTH);
         // Compute: Phase-2 working buffers → sized at comp_cs.
         int64_t q_comp = A(comp_cs * local_q_dim * DWIDTH);
         int64_t sdpa_out = A(comp_cs * local_q_dim * DWIDTH);
@@ -826,10 +1580,11 @@ protected:
         // Phase-2 query-chunk length, NOT the full sequence).
         SdpaConfig sdpa_cfg{SdpaKernelType::FLASH_ATTN_SPM,
                             hd, /*nq*/nq, /*nkv*/nq,
-                            /*cores*/NUM_CORES, /*mask*/0 /*MASK_NONE*/};
+                            /*cores*/num_cores(), /*mask*/0 /*MASK_NONE*/};
         SdpaTiling t = sdpa_compute_tiling(sdpa_cfg, comp_cs);
-        int64_t nkv_per_core = CeilDiv(nq, (int64_t)NUM_CORES);
+        int64_t nkv_per_core = CeilDiv(nq, (int64_t)num_cores());
         int64_t sdpa_tmp = A(t.tile_n_v16 * t.tile_k * nkv_per_core * CeilDiv(comp_cs, t.tile_m) * 32);
+        if (raw_spm) sdpa_tmp = std::max(sdpa_tmp, raw_kv);
 
         // DMA-safe sizing for persistent buffers
         auto dma_safe = [&](int64_t elems) -> int64_t {
@@ -858,17 +1613,27 @@ protected:
         // Structural — alive across both phases (always-conflict with KVIN/COMP).
         decls.push_back({"residual1",  res, 1, 8, StorageClass::Temp, 0, nullptr, ALL});
         decls.push_back({"input_norm", res, 1, 8, StorageClass::Temp, 0, nullptr, ALL});
-        // oproj: Phase-2 o_proj output / LN2 output / fc2 partial scratch,
-        // retained in the LayerWide band across both phases.
+        // oproj: Phase-2 o_proj out / LN2 out / fc2 partial scratch. Held in the
+        // LayerWide band per design (could be COMP-scoped at comp_cs as a future
+        // SPM optimization; kept LayerWide for the conservative first cut).
         decls.push_back({"oproj",      res, 4, 8, StorageClass::Temp, 0, nullptr, ALL});
 
         // KvInsert-only (Phase 1) — aliasable against Compute-only buffers.
-        decls.push_back({"q_kv",       qkv, 1, 3, StorageClass::Temp, 0, nullptr, KVIN});
-        decls.push_back({"k",          qkv, 1, 3, StorageClass::Temp, 0, nullptr, KVIN});
-        decls.push_back({"v",          qkv, 1, 3, StorageClass::Temp, 0, nullptr, KVIN});
+        decls.push_back({"q_kv", qkv, 1, carry_q ? 5 : 3,
+                         StorageClass::Temp, 0, nullptr, carry_q ? ALL : KVIN});
+        // Raw attention consumes K/V in Phase 2, so its full packed source is
+        // LayerWide.  DDR candidates retain the original KV_FIRST aliasing.
+        decls.push_back({"k", raw_spm ? raw_kv : qkv, 1,
+                         raw_spm ? 5 : 3, StorageClass::Temp, 0, nullptr,
+                         raw_spm ? ALL : KVIN});
+        decls.push_back({"v", raw_spm ? raw_kv : qkv, 1,
+                         raw_spm ? 5 : 3, StorageClass::Temp, 0, nullptr,
+                         raw_spm ? ALL : KVIN});
 
         // Compute-only (Phase 2) — lifecycle aliasing across attention→MLP.
-        decls.push_back({"q_comp",     q_comp,   4, 5, StorageClass::Temp, 0, nullptr, COMP});
+        decls.push_back({"q_comp", carry_q ? 0 : q_comp, 4, 5,
+                         StorageClass::Temp, 0, carry_q ? "q_kv" : nullptr,
+                         carry_q ? ALL : COMP});
         decls.push_back({"sdpa_out",   sdpa_out, 5, 6, StorageClass::Temp, 0, nullptr, COMP});
         decls.push_back({"sdpa_tmp",   sdpa_tmp, 5, 5, StorageClass::Temp, 0, nullptr, COMP});
         decls.push_back({"fc1",        fc1,      7, 8, StorageClass::Temp, 0, nullptr, COMP});
@@ -893,41 +1658,43 @@ protected:
     }
 
     // ========================================================================
-    // emit_preload_weights — 272 persistent weight DMAs
+    // emit_preload_weights — 272 persistent weight DMAs (D-501 callback body)
     //
-    // Registered through the preload-fn slot in static_config(); the framework
+    // Was v2 `build_preload_subgraph()` virtual; v3 registers this via the
+    // preload-fn slot in static_config(). Body is verbatim from v2 — framework
     // opens the weights-graph scope around this call.
     //
-    // The body emits only rpu_launch_* DMAs; no subclass-side
+    // EXT-5 contract: body emits only rpu_launch_* DMAs; no subclass-side
     // batch-context calls (framework owns them). CRITICAL: DMA length is num_elements
     // (NOT bytes). Per layer (27 layers, 10 DMA ops each) + 2 global = 272 total.
     // ========================================================================
     void emit_preload_weights() {
         int64_t h = hidden_size();
-        int64_t local_q_dim = (num_q_heads() / NUM_CORES) * head_dim();
-        int64_t local_inter = intermediate_size() / NUM_CORES;
+        int64_t local_q_dim = (num_q_heads() / num_cores()) * head_dim();
+        int64_t local_inter = intermediate_size() / mlp_tp();
 
         // Loop 1: 8-core DMAs for all layers (memset + norm + col-partition bias)
+        // Matches v2 ordering at rpu_siglip_fused_encoder_layer.cpp:316-333.
         for (int64_t L = 0; L < num_layers(); ++L) {
             auto& bn = layer_bias_norm_[L];
 
-            // Zero row-partition biases (these accumulate partial sums from 8 cores)
-            rpu_launch_memset_spm_multicore(layer_addr(L, 0, "o_bias"), h);
-            rpu_launch_memset_spm_multicore(layer_addr(L, 0, "fc2_bias"), h);
+            // Zero row-partition biases before summing the selected root cores.
+            rpu_launch_memset_spm_multicore(layer_addr(L, 0, "o_bias"), h, num_cores());
+            rpu_launch_memset_spm_multicore(layer_addr(L, 0, "fc2_bias"), h, num_cores());
 
             // Broadcast LayerNorm gamma/beta to all cores (num_elements, NOT bytes)
             rpu_launch_ddr_broadcast_spm_dma(
                 bn.ln1_w.data_ptr<c10::Half>(), h,
-                layer_addr(L, 0, "ln1_gamma"));
+                layer_addr(L, 0, "ln1_gamma"), num_cores());
             rpu_launch_ddr_broadcast_spm_dma(
                 bn.ln1_b.data_ptr<c10::Half>(), h,
-                layer_addr(L, 0, "ln1_beta"));
+                layer_addr(L, 0, "ln1_beta"), num_cores());
             rpu_launch_ddr_broadcast_spm_dma(
                 bn.ln2_w.data_ptr<c10::Half>(), h,
-                layer_addr(L, 0, "ln2_gamma"));
+                layer_addr(L, 0, "ln2_gamma"), num_cores());
             rpu_launch_ddr_broadcast_spm_dma(
                 bn.ln2_b.data_ptr<c10::Half>(), h,
-                layer_addr(L, 0, "ln2_beta"));
+                layer_addr(L, 0, "ln2_beta"), num_cores());
 
             // Col-partition scatter: each core gets its own slice of the bias.
             // DMA path via rpu_launch_ddr_scatter_spm_dma — weights are static
@@ -937,25 +1704,26 @@ protected:
                 /*elements_per_core=*/local_q_dim,
                 /*core_stride_bytes=*/local_q_dim * DWIDTH,
                 layer_addr(L, 0, "q_bias"),
-                /*num_cores=*/NUM_CORES);
+                /*num_cores=*/num_cores());
             rpu_launch_ddr_scatter_spm_dma(
                 bn.k_b.data_ptr<c10::Half>(),
                 local_q_dim, local_q_dim * DWIDTH,
                 layer_addr(L, 0, "k_bias"),
-                /*num_cores=*/NUM_CORES);
+                /*num_cores=*/num_cores());
             rpu_launch_ddr_scatter_spm_dma(
                 bn.v_b.data_ptr<c10::Half>(),
                 local_q_dim, local_q_dim * DWIDTH,
                 layer_addr(L, 0, "v_bias"),
-                /*num_cores=*/NUM_CORES);
+                /*num_cores=*/num_cores());
             rpu_launch_ddr_scatter_spm_dma(
                 bn.fc1_b.data_ptr<c10::Half>(),
                 local_inter, local_inter * DWIDTH,
                 layer_addr(L, 0, "fc1_bias"),
-                /*num_cores=*/NUM_CORES);
+                /*num_cores=*/num_cores());
         }
 
         // Loop 2: 1-core DMAs for all layers (row-partition biases).
+        // Matches v2 ordering at rpu_siglip_fused_encoder_layer.cpp:334-338.
         // Mixing 1-core and 8-core DMAs in the same loop (as before) may cause
         // kernel-ordering/synchronization issues in graph replay; v2's grouped
         // pattern avoids it.
@@ -972,25 +1740,29 @@ protected:
         // Global: post-LayerNorm weights (broadcast to all cores)
         rpu_launch_ddr_broadcast_spm_dma(
             post_ln_w_.data_ptr<c10::Half>(), h,
-            addr(0, "post_ln_gamma"));
+            addr(0, "post_ln_gamma"), num_cores());
         rpu_launch_ddr_broadcast_spm_dma(
             post_ln_b_.data_ptr<c10::Half>(), h,
-            addr(0, "post_ln_beta"));
+            addr(0, "post_ln_beta"), num_cores());
     }
 
     // ========================================================================
-    // emit_kv_first_body — kv_first_fn (KV_FIRST Phase 1 body).
+    // emit_kv_first_body — D-501 kv_first_fn (KV_FIRST Phase 1 body).
     //
-    // Phase 1 runs LayerNorm1 → QKV+bias → KV-insert and saves Q to DDR
+    // SEQUENTIAL→KV_FIRST refactor Site6: extracts the former build_layer_subgraph
+    // Phase-1/2/3-front (LayerNorm1 → QKV+bias → KV-insert) and ADDS a Q→DDR save
     // so Phase 2 (build_layer_subgraph) can reload Q per query-chunk. Mirrors
     // GemmaModel::emit_kv_first_body but SIMPLIFIED: SigLIP has NO rope (position
     // embedding is added in patch_embed, not per-layer) and NO attention mask.
     //
-    // KV-insert uses ctx().position + chunk.offset as the absolute KV row, so
-    // multi-chunk runs place each chunk in the full [seq,h] cache.
+    // CRITICAL (load-bearing) vs the old single-chunk body: KV-insert position
+    // is now `chunk.offset` (was a hardcoded 0). With position=0 and ctx().position
+    // also 0 (SigLIP forward passes position=0), chunk.offset is the absolute KV
+    // row for this chunk — so multi-chunk runs insert each chunk's K/V at the
+    // right rows of the full [seq,h] cache.
     //
-    // SDPA / KV-insert sites take SPM offsets via addr_offset(name).value,
-    // typed distinctly from the absolute addr() return.
+    // Pitfall 3 structural fix: SDPA / KV-insert sites take SPM OFFSETS via
+    // addr_offset(name).value (typed-distinct from the absolute addr() return).
     // ========================================================================
     void emit_kv_first_body(int layer_idx, const ChunkInfo& chunk) {
         const auto& lw = layer_weights_[layer_idx];
@@ -1013,39 +1785,76 @@ protected:
         rpu_launch_layernorm_spm_kernel(
             addr(0, "residual1"), addr(0, "input_norm"),
             layer_addr(layer_idx, 0, "ln1_gamma"), layer_addr(layer_idx, 0, "ln1_beta"),
-            seq_len, h, eps_, false, 0, NUM_CORES);
+            seq_len, h, eps_, false, 0, num_cores());
 
         // QKV Linear with bias (SPM-to-SPM ACC16, col-partition). q → q_kv.
+        consume_manifest_route(
+            FmbRouteFamily::LINEAR, SIGLIP_Q_LINEAR_SITE,
+            static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+            chunk.idx);
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "input_norm"), lw.q_w, addr(0, "q_kv"),
-            seq_len, nq * hd, h, 1, NUM_CORES,
-            layer_addr(layer_idx, 0, "q_bias"), lw.q_ws);
+            seq_len, nq * hd, h, 1, num_cores(),
+            layer_addr(layer_idx, 0, "q_bias"), lw.q_ws, 0, 0,
+            /*force_acc32=*/linear_acc32_);
+        consume_manifest_route(
+            FmbRouteFamily::LINEAR, SIGLIP_K_LINEAR_SITE,
+            static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+            chunk.idx);
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "input_norm"), lw.k_w, addr(0, "k"),
-            seq_len, nq * hd, h, 1, NUM_CORES,
-            layer_addr(layer_idx, 0, "k_bias"), lw.k_ws);
+            seq_len, nq * hd, h, 1, num_cores(),
+            layer_addr(layer_idx, 0, "k_bias"), lw.k_ws, 0, 0,
+            /*force_acc32=*/linear_acc32_);
+        consume_manifest_route(
+            FmbRouteFamily::LINEAR, SIGLIP_V_LINEAR_SITE,
+            static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+            chunk.idx);
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "input_norm"), lw.v_w, addr(0, "v"),
-            seq_len, nq * hd, h, 1, NUM_CORES,
-            layer_addr(layer_idx, 0, "v_bias"), lw.v_ws);
+            seq_len, nq * hd, h, 1, num_cores(),
+            layer_addr(layer_idx, 0, "v_bias"), lw.v_ws, 0, 0,
+            /*force_acc32=*/linear_acc32_);
 
         // No RoPE (SigLIP has none).
 
         // KV cache insert at absolute position chunk.offset.
         // Pitfall 3 structural fix: takes SPM offsets via addr_offset(name).value.
-        auto& k_cache = (*ctx().k_caches)[layer_idx];
-        auto& v_cache = (*ctx().v_caches)[layer_idx];
-        rpu_launch_insert_kcache_spm_unified(
-            k_cache, kv_pos, addr_offset("k").value,
-            seq_len, nq, hd, NUM_CORES);
-        rpu_launch_insert_vcache_spm_unified(
-            v_cache, kv_pos, addr_offset("v").value,
-            seq_len, nq, hd, NUM_CORES);
+        require_pi05_vision_kv_spm_only_runtime(chunk);
+        const auto& kv_route = ctx().find_physical_route(
+            FmbRouteFamily::KV_INSERT, SIGLIP_KV_INSERT_SITE, chunk.idx);
+        const KvInsertSegmentPlan kv_plan =
+            restore_kvinsert_plan(
+                SIGLIP_KV_INSERT_SITE, kv_route.arguments, num_cores(), nq, hd);
+        TORCH_CHECK(
+            kv_plan.logical_rows() == seq_len &&
+                kv_plan.physical_rows() == seq_len &&
+                kv_plan.segment(0).position == kv_pos,
+            "SigLIP KV descriptor geometry drift at invocation ", chunk.idx);
+        ctx().consume_physical_route(
+            FmbRouteFamily::KV_INSERT, SIGLIP_KV_INSERT_SITE,
+            static_cast<int64_t>(kv_plan.route()),
+            pi05_vision_kv_spm_only_opt_in_
+                ? SIGLIP_KV_FLAG_RAW_SPM_ONLY
+                : SIGLIP_KV_FLAG_DDR_MIRROR,
+            kv_route.arguments, chunk.idx);
+        if (!pi05_vision_kv_spm_only_opt_in_) {
+            auto& k_cache = (*ctx().k_caches)[layer_idx];
+            auto& v_cache = (*ctx().v_caches)[layer_idx];
+            rpu_launch_insert_kvcache_spm_unified_with_plan(
+                k_cache, v_cache,
+                addr_offset("k").value, addr_offset("v").value,
+                nq, hd, num_cores(),
+                /*k_cache_batch_offset_elems=*/0,
+                /*v_cache_batch_offset_elems=*/0,
+                /*spm_rows=*/0, kv_plan);
+        }
 
         // Save Q to the per-seq Q staging slot via spm_scatter_ddr_dma
         // (position-indexed by chunk.offset). The slot (keyed by seq_len_) is
         // created once in forward_packed and NEVER reallocated → stable data_ptr,
-        // safe for non-mutable DMA across REPLAY. Phase 2 reloads it into "q_comp".
+        // safe for non-mutable DMA across REPLAY (matching GemmaModel:
+        // stable storage). Phase 2 reloads it into "q_comp".
         TORCH_CHECK(q_ddr_slots_.count({seq_len_, local_q_heads_ * head_dim()}) == 1,
                     "SigLIPModel: Q staging slot not allocated in KV_FIRST mode");
         const at::Tensor& q_slot = q_ddr_slot();
@@ -1054,17 +1863,31 @@ protected:
         int64_t q_row_stride = local_q_heads_ * hd;
         int64_t q_elem_offset = chunk.offset * q_row_stride;
         int64_t q_core_stride_bytes = q_slot.size(1) * q_row_stride * DWIDTH;
-        rpu_launch_spm_scatter_ddr_dma(
-            addr(0, "q_kv"), q_ddr_base + q_elem_offset,
-            q_local_elems, q_core_stride_bytes,
-            /*num_cores=*/NUM_CORES);
+        const bool carry_q = use_pi05_vision_q_resident(
+            seq_len, ctx().attention_policy);
+        if (pi05_vision_q_resident_opt_in_) {
+            consume_manifest_route(FmbRouteFamily::GRAPH_SCHEDULE,
+                                   SIGLIP_Q_RESIDENT_SITE, carry_q ? 2 : 1,
+                                   chunk.idx);
+        }
+        if (carry_q) {
+            TORCH_CHECK(chunk.idx == 0 && chunk.offset == 0 && seq_len == seq_len_ &&
+                            addr(0, "q_kv") == addr(0, "q_comp"),
+                        "Pi0.5 Vision Q carry requires one shared live SPM slot");
+        } else {
+            rpu_launch_spm_scatter_ddr_dma(
+                addr(0, "q_kv"), q_ddr_base + q_elem_offset,
+                q_local_elems, q_core_stride_bytes,
+                /*num_cores=*/num_cores());
+        }
 
         // No residual output DMA — Phase 2 re-reads the original input (matching
         // Gemma); the SPM_RESIDENT single-chunk case keeps residual1 live.
     }
 
     // ========================================================================
-    // build_layer_subgraph — KV_FIRST Phase 2 body.
+    // build_layer_subgraph — KV_FIRST Phase 2 body (was the full SEQUENTIAL
+    // 6-phase pipeline; Site7 removed LN1/QKV/KV-insert → now in Phase 1).
     //
     // Phase 2: reload Q from q_ddr_buf_ → q_comp → SDPA (full-KV) → O_proj+resid
     //          → LayerNorm2+fc1+GELU → fc2+resid.
@@ -1073,20 +1896,26 @@ protected:
     // (the FULL bidirectional KV) — the two are decoupled by the launcher (see
     // rpu_launch_sdpa_spm_unified_kernel_v2 signature). mask=0 (MASK_NONE).
     //
-    // Last layer: fuses post-LN + projector Linear.
+    // Last layer: fuses post-LN + projector Linear (D-501).
     //
     // Pitfall 3 structural fix: SDPA call site uses `addr_offset(name).value`
     // (typed SPM offset). Non-SDPA sites use absolute `addr(0, name)` /
     // `layer_addr(L, 0, name)`.
     // ========================================================================
     void build_layer_subgraph(int layer_idx, const ChunkInfo& chunk) override {
+        require_pi05_vision_owner_ln_runtime(chunk, layer_idx);
+        if (num_cores() != 8 && layer_idx == 0 && chunk.idx == 0 &&
+            ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(FmbRouteFamily::GRAPH_SCHEDULE,
+                SIGLIP_CORE_PROFILE_SITE, 1, 0, core_profile_arguments());
+        }
         const auto& lw = layer_weights_[layer_idx];
         int64_t seq_len = chunk.len;        // this query-chunk length
         int64_t h = hidden_size();
         int64_t nq = num_q_heads();
         int64_t hd = head_dim();
         int64_t is_ = intermediate_size();
-        int64_t local_inter = is_ / NUM_CORES;
+        int64_t local_inter = is_ / mlp_tp();
 
         // Re-read original input into residual1 (Phase 2 reads the same source
         // as Phase 1). Guarded by input_in_spm (see emit_kv_first_body note):
@@ -1100,19 +1929,25 @@ protected:
         // chunk.offset) into "q_comp" (mirror GemmaModel build_layer_subgraph
         // DDR→SPM scatter; NO rope). The slot is keyed by seq_len_, so its
         // size(1) == seq_len_ gives the per-core pitch — and being never
-        // reallocated, its data_ptr stays valid across REPLAY.
+        // reallocated, its data_ptr stays valid across REPLAY .
         const at::Tensor& q_slot = q_ddr_slot();
         int64_t q_local_elems = seq_len * local_q_heads_ * hd;
         c10::Half* q_ddr_base = q_slot.data_ptr<c10::Half>();
         int64_t q_row_stride = local_q_heads_ * hd;
         int64_t q_elem_offset = chunk.offset * q_row_stride;
         int64_t q_core_stride = q_slot.size(1) * q_row_stride * DWIDTH;
-        rpu_launch_ddr_scatter_spm_dma(
-            q_ddr_base + q_elem_offset,
-            /*elements_per_core=*/q_local_elems,
-            /*core_stride_bytes=*/q_core_stride,
-            addr(0, "q_comp"),
-            /*num_cores=*/NUM_CORES);
+        if (use_pi05_vision_q_resident(seq_len, ctx().attention_policy)) {
+            TORCH_CHECK(chunk.idx == 0 && chunk.offset == 0 && seq_len == seq_len_ &&
+                            addr(0, "q_kv") == addr(0, "q_comp"),
+                        "Pi0.5 Vision Q carry lost its single-chunk SPM lifetime");
+        } else {
+            rpu_launch_ddr_scatter_spm_dma(
+                q_ddr_base + q_elem_offset,
+                /*elements_per_core=*/q_local_elems,
+                /*core_stride_bytes=*/q_core_stride,
+                addr(0, "q_comp"),
+                /*num_cores=*/num_cores());
+        }
 
         // SDPA over the FULL bidirectional KV cache (kv_seq_len = seq_len_),
         // query = this chunk (seq_q = chunk.len). Source Q from "q_comp".
@@ -1128,14 +1963,54 @@ protected:
                     ") SDPA requires a single chunk (chunk.len=", chunk.len,
                     " == seq_len_=", seq_len_, "); forward_packed must pin one "
                     "compute chunk for N>1.");
+        const int64_t per_image_ctx = seq_len_ / image_batch_count_;
 
-        if (image_batch_count_ > 1) {
+        if (ctx().attention_policy ==
+            AttentionExecutionPolicy::SPM_KV_BY_MHA) {
+            TORCH_CHECK(
+                chunk.offset == 0 && chunk.len == seq_len_ &&
+                    seq_len_ % image_batch_count_ == 0,
+                "SigLIP raw-SPM attention requires one full packed chunk");
+            ctx().consume_physical_route(
+                FmbRouteFamily::ATTENTION, SIGLIP_RAW_SPM_ATTN_SITE,
+                static_cast<int64_t>(
+                    AttentionExecutionPolicy::SPM_KV_BY_MHA),
+                /*resolved_flags=*/0,
+                {image_batch_count_, per_image_ctx, seq_len, seq_len_,
+                 nq, hd}, chunk.idx);
+            rpu_launch_v_transpose_spm(
+                addr(0, "v"), addr(0, "sdpa_tmp"),
+                image_batch_count_, per_image_ctx, nq, hd, num_cores());
+            rpu_launch_sdpa_by_mha_spm(
+                addr(0, "q_comp"), addr(0, "k"), addr(0, "sdpa_tmp"),
+                addr(0, "sdpa_out"), /*mask_spm=*/0,
+                /*MASK_NONE=*/0, attn_scale,
+                image_batch_count_, per_image_ctx, per_image_ctx,
+                nq, nq, hd, num_cores());
+        } else if (image_batch_count_ > 1) {
             // SigLIP-batch: N images packed into seq_len_. Per-image attention
             // isolation via the minibatch kernel — image i attends ONLY its own
             // per_image_ctx tokens. K/V were inserted contiguously at position 0
             // in Phase 1, so the kernel's image_idx*per_image_sKeyVx offset lines
-        // up. Single-chunk only (guarded above).
-            int64_t per_image_ctx = seq_len_ / image_batch_count_;
+            // up. Single-chunk only (guarded above).
+            if (ctx().has_complete_physical_manifest()) {
+                LayoutContext spm_layout;
+                spm_layout.attention_policy =
+                    AttentionExecutionPolicy::SPM_KV_BY_MHA;
+                spm_layout.batch_size = ctx().batch_size;
+                spm_layout.is_causal = ctx().is_causal;
+                spm_layout.use_attn_mask = ctx().attention_mask.has_value();
+                const bool raw_profile = subclass_spm_kv_by_mha_eligible(
+                    ctx().stage_plan, spm_layout, ctx().position);
+                ctx().consume_physical_route(
+                    FmbRouteFamily::ATTENTION, SIGLIP_MINIBATCH_ATTN_SITE,
+                    static_cast<int64_t>(AttentionExecutionPolicy::DDR_KV),
+                    raw_profile
+                        ? 0
+                        : SIGLIP_ATTN_CAPABILITY_FALLBACK_DDR_REQUIRED,
+                    {image_batch_count_, per_image_ctx, seq_len, seq_len_,
+                     nq, hd}, chunk.idx);
+            }
             rpu_launch_sdpa_spm_minibatch_kernel(
                 k_cache, v_cache,
                 0 /*MASK_NONE*/, attn_scale,
@@ -1144,8 +2019,26 @@ protected:
                 addr_offset("sdpa_tmp").value, 0,
                 seq_len_, nq, nq, hd,
                 per_image_ctx, image_batch_count_,
-                NUM_CORES, NUM_CORES);
+                num_cores(), /*physical_kv_cores=*/8);
         } else {
+            if (ctx().has_complete_physical_manifest()) {
+                LayoutContext spm_layout;
+                spm_layout.attention_policy =
+                    AttentionExecutionPolicy::SPM_KV_BY_MHA;
+                spm_layout.batch_size = ctx().batch_size;
+                spm_layout.is_causal = ctx().is_causal;
+                spm_layout.use_attn_mask = ctx().attention_mask.has_value();
+                const bool raw_profile = subclass_spm_kv_by_mha_eligible(
+                    ctx().stage_plan, spm_layout, ctx().position);
+                ctx().consume_physical_route(
+                    FmbRouteFamily::ATTENTION, SIGLIP_UNIFIED_ATTN_SITE,
+                    static_cast<int64_t>(AttentionExecutionPolicy::DDR_KV),
+                    raw_profile
+                        ? 0
+                        : SIGLIP_ATTN_CAPABILITY_FALLBACK_DDR_REQUIRED,
+                    {image_batch_count_, per_image_ctx, seq_len, seq_len_,
+                     nq, hd}, chunk.idx);
+            }
             rpu_launch_sdpa_spm_unified_kernel_v2(
                 k_cache, v_cache,
                 0 /*MASK_NONE*/, attn_scale,
@@ -1153,44 +2046,97 @@ protected:
                 addr_offset("sdpa_out").value,
                 addr_offset("sdpa_tmp").value, 0,
                 /*seq_q=*/seq_len, nq, nq, hd,
-                /*kv_seq_len=*/seq_len_, NUM_CORES, NUM_CORES);
+                /*kv_seq_len=*/seq_len_, num_cores(), /*physical_kv_cores=*/8);
         }
 
         // Phase 4: O_proj (row-partition, with bias) + AllReduce + Residual
+        consume_manifest_route(
+            FmbRouteFamily::LINEAR, SIGLIP_O_LINEAR_SITE,
+            static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+            chunk.idx);
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "sdpa_out"), lw.o_w, addr(0, "oproj"),
-            seq_len, h, nq * hd, 0, NUM_CORES,
-            layer_addr(layer_idx, 0, "o_bias"), lw.o_ws);
-        rpu_launch_all_reduce_sum_residual_kernel(
-            addr(0, "oproj"), addr(0, "residual1"), addr(0, "input_norm"),
-            seq_len, h, NUM_CORES, NUM_CORES);
+            seq_len, h, nq * hd, 0, num_cores(),
+            layer_addr(layer_idx, 0, "o_bias"), lw.o_ws, 0, 0,
+            /*force_acc32=*/linear_acc32_);
+        if (pi05_vision_owner_ln_opt_in_) {
+            consume_pi05_vision_owner_ln_route(false, chunk);
+            // Reduce first, retire compact FP16 raw, then original LN2 and
+            // gather. The full normalized output reuses the dead O partial.
+            rpu_launch_pi05_vision_owner_layernorm_spm_kernel(
+                addr(0, "oproj"), addr(0, "residual1"), addr(0, "input_norm"),
+                addr(0, "oproj"), layer_addr(layer_idx, 0, "ln2_gamma"),
+                layer_addr(layer_idx, 0, "ln2_beta"), eps_, seq_len);
+        } else {
+            consume_manifest_route(
+                FmbRouteFamily::ALL_REDUCE, SIGLIP_ATTN_ALL_REDUCE_SITE,
+                fmb_ring_all_reduce_route_selector(seq_len, h, use_pi05_ring_xor3(seq_len), num_cores()), chunk.idx);
+            rpu_launch_all_reduce_sum_residual_kernel(
+                addr(0, "oproj"), addr(0, "residual1"), addr(0, "input_norm"),
+                seq_len, h, num_cores(), num_cores(), use_pi05_ring_xor3(seq_len));
+            rpu_launch_layernorm_spm_kernel(
+                addr(0, "input_norm"), addr(0, "oproj"),
+                layer_addr(layer_idx, 0, "ln2_gamma"), layer_addr(layer_idx, 0, "ln2_beta"),
+                seq_len, h, eps_, false, 0, num_cores());
+        }
 
-        // Phase 5: LayerNorm2 + fc1+bias + GELU
-        rpu_launch_layernorm_spm_kernel(
-            addr(0, "input_norm"), addr(0, "oproj"),
-            layer_addr(layer_idx, 0, "ln2_gamma"), layer_addr(layer_idx, 0, "ln2_beta"),
-            seq_len, h, eps_, false, 0, NUM_CORES);
-        rpu_launch_linear_spm_to_spm_acc16_kernel(
-            addr(0, "oproj"), lw.fc1_w, addr(0, "fc1"),
-            seq_len, is_, h, 1, NUM_CORES,
-            layer_addr(layer_idx, 0, "fc1_bias"), lw.fc1_ws);
+        // Phase 5: fc1+bias + GELU consumes the same full normalized root.
+        if(pi05_vision_fc_weight_outer_opt_in_) {
+            consume_pi05_vision_fc_route(false,chunk);
+            rpu_launch_pi05_vision_fc_weight_outer_spm_kernel(
+                Pi05VisionFcProjection::Fc1Column,
+                addr(0,"oproj"),lw.fc1_w,addr(0,"fc1"),
+                layer_addr(layer_idx,0,"fc1_bias"),lw.fc1_ws);
+        } else {
+            consume_manifest_route(
+                FmbRouteFamily::LINEAR, SIGLIP_FC1_LINEAR_SITE,
+                static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+                chunk.idx);
+            rpu_launch_linear_spm_to_spm_acc16_kernel(
+                addr(0, "oproj"), lw.fc1_w, addr(0, "fc1"),
+                seq_len, is_, h, 1, num_cores(),
+                layer_addr(layer_idx, 0, "fc1_bias"), lw.fc1_ws, 0, 0,
+            /*force_acc32=*/linear_acc32_);
+        }
         rpu_launch_eltwise_unary_spm_kernel(
             addr(0, "fc1"), addr(0, "fc1"),
-            seq_len * local_inter, ValuOpType::ADD, GeluMode::TANH, NUM_CORES);
+            seq_len * local_inter, ValuOpType::ADD, GeluMode::TANH, num_cores());
 
         // Phase 6: fc2 (row-partition, with bias) + AllReduce + Residual
-        // The final output goes to "residual1" instead of "oproj" so the
+        // Round 9: final output goes to "residual1" instead of "oproj" so the
         // next layer (which reads from "residual1") gets it directly via SPM
         // without needing DDR ping-pong.
         // Phase 6 uses "oproj" as temporary storage for fc2 partial results,
         // then all_reduce(oproj + input_norm) lands back in "residual1".
-        rpu_launch_linear_spm_to_spm_acc16_kernel(
-            addr(0, "fc1"), lw.fc2_w, addr(0, "oproj"),
-            seq_len, h, is_, 0, NUM_CORES,
-            layer_addr(layer_idx, 0, "fc2_bias"), lw.fc2_ws);
-        rpu_launch_all_reduce_sum_residual_kernel(
-            addr(0, "oproj"), addr(0, "input_norm"), addr(0, "residual1"),
-            seq_len, h, NUM_CORES, NUM_CORES);
+        if(pi05_vision_fc_weight_outer_opt_in_) {
+            consume_pi05_vision_fc_route(true,chunk);
+            rpu_launch_pi05_vision_fc_weight_outer_spm_kernel(
+                Pi05VisionFcProjection::Fc2Row,
+                addr(0,"fc1"),lw.fc2_w,addr(0,"oproj"),
+                layer_addr(layer_idx,0,"fc2_bias"),lw.fc2_ws);
+        } else {
+            consume_manifest_route(
+                FmbRouteFamily::LINEAR, SIGLIP_FC2_LINEAR_SITE,
+                static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+                chunk.idx);
+            rpu_launch_linear_spm_to_spm_acc16_kernel(
+                addr(0, "fc1"), lw.fc2_w, addr(0, "oproj"),
+                seq_len, h, is_, 0, num_cores(),
+                layer_addr(layer_idx, 0, "fc2_bias"), lw.fc2_ws, 0, 0,
+            /*force_acc32=*/linear_acc32_);
+        }
+        if (pi05_vision_owner_ln_opt_in_) {
+            consume_pi05_vision_owner_ln_route(true, chunk);
+            rpu_launch_pi05_vision_compact_residual_spm_kernel(
+                addr(0, "oproj"), addr(0, "input_norm"), addr(0, "residual1"), seq_len);
+        } else {
+            consume_manifest_route(
+                FmbRouteFamily::ALL_REDUCE, SIGLIP_MLP_ALL_REDUCE_SITE,
+                fmb_ring_all_reduce_route_selector(seq_len, h, use_pi05_ring_xor3(seq_len), num_cores()), chunk.idx);
+            rpu_launch_all_reduce_sum_residual_kernel(
+                addr(0, "oproj"), addr(0, "input_norm"), addr(0, "residual1"),
+                seq_len, h, num_cores(), num_cores(), use_pi05_ring_xor3(seq_len));
+        }
 
         // ----------------------------------------------------------------
         // SPM→DDR output DMA or post-LN+projector (last layer)
@@ -1206,13 +2152,13 @@ protected:
                 emit_layer_output_dma(layer_idx, chunk, "residual1");
             }
         } else {
-            // Last layer: Post-LayerNorm + Projector.
+            // Last layer (D-501): Post-LayerNorm + Projector.
             // Phase-6 output is in "residual1"; post-LN reads residual1 → writes
             // input_norm (SPM).
             rpu_launch_layernorm_spm_kernel(
                 addr(0, "residual1"), addr(0, "input_norm"),
                 addr(0, "post_ln_gamma"), addr(0, "post_ln_beta"),
-                seq_len, h, eps_, false, 0, NUM_CORES);
+                seq_len, h, eps_, false, 0, num_cores());
 
             // SPM → DDR temp (num_elements, NOT bytes). Shape-keyed staging slot
             // sized at chunk.len rows — an internal member Python never sees, so
@@ -1229,19 +2175,16 @@ protected:
                 slot.data_ptr<c10::Half>(),
                 seq_len * h);
 
-            // The projector output spans the full sequence [1, seq_len_, proj].
-            // Allocate it once on the first query chunk and fresh per forward.
-            if (chunk.offset == 0) {
-                projector_output_ = allocate_tracked_output(
-                    {1, seq_len_, projection_dim_});
-            }
+            // forward_packed already allocated the full sequence output and
+            // refreshed its DMA base, including when this body is skipped on
+            // fast REPLAY. All query chunks write into that one fresh owner.
             TORCH_CHECK(projector_output_.defined(),
                         "SigLIPModel: projector_output_ undefined on a non-first "
                         "chunk (chunk.offset=", chunk.offset,
                         ") — first chunk must run with offset 0.");
 
             // Projector Linear (DDR col-partition) writes THIS chunk's rows.
-            // For multi-chunk, target a [1, chunk.len, proj] view at the chunk's
+            // For multi-chunk, target a [chunk.len, proj] view at the chunk's
             // row offset. A dim-1 slice of a contiguous [1,S,P] tensor is itself
             // contiguous (dim-0 size 1), so its data_ptr lands at offset*P and
             // the kernel writes the right rows. Single-chunk → the slice is the
@@ -1256,11 +2199,18 @@ protected:
                     ? projector_output_
                     : projector_output_.slice(1, chunk.offset,
                                               chunk.offset + chunk.len);
-            // Mutable write-back is required because projector_output_ has a fresh
-            // base each forward. Chunks share the base and use byte offsets.
-            static thread_local uint64_t projector_out_live_base = 0;
-            projector_out_live_base =
-                ::rhino_lkn::RpuGetDevAddr(projector_output_.data_ptr());
+            // The DDR launcher consumes matrices. This view removes only the
+            // singleton batch axis and preserves storage and the row offset.
+            proj_out_chunk = proj_out_chunk.view({seq_len, projection_dim_});
+            // MUTABLE write-back: projector_output_ is allocate_tracked_output
+            // (fresh every forward, P4) so its data_ptr DRIFTS. A fixed DMA
+            // freezes the BUILD-time dst in kd_buf and REPLAY's sync-only fast
+            // path (this graph is single-segment ⇒ it always hits) never
+            // rewrites it — the projector then writes the PREVIOUS forward's
+            // buffer and the returned tensor is uninitialized. Same shape and
+            // same fix as the patch_emb step ①/⑦ live-base sites above
+            // All chunks share one base; the per-chunk row
+            // offset rides in dst_offset_bytes exactly like step ⑦'s seq_off.
             // proj_b_ is a registered weight, but set_weights can REBIND it to a
             // different tensor on a live handle (set_weights only invalidates
             // model state, not the built graph). The bias DMA is the one path a
@@ -1269,24 +2219,28 @@ protected:
             static thread_local uint64_t projector_bias_live_base = 0;
             projector_bias_live_base =
                 ::rhino_lkn::RpuGetDevAddr(proj_b_.data_ptr());
+            consume_manifest_route(
+                FmbRouteFamily::LINEAR, SIGLIP_PROJECTOR_LINEAR_SITE,
+                static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+                chunk.idx);
             rpu_launch_linear_ddr_kernel(
                 slot, proj_w_, proj_out_chunk, proj_b_,
                 /*has_bias=*/true, /*partition=*/1,
-                &projector_out_live_base,
+                &projector_out_live_base_,
                 /*dst_offset_bytes=*/chunk.offset * projection_dim_
                                      * (int64_t)sizeof(c10::Half),
-                &projector_bias_live_base);
+                &projector_bias_live_base, num_cores(), {}, configured_linear_acc32_);
         }
     }
 
     // ========================================================================
-    // plan_kv_first_chunks — kv_first_chunk_plan_fn.
+    // plan_kv_first_chunks — D-501 kv_first_chunk_plan_fn (Site8).
     //
     // SigLIP keeps Phase 1 (KV-insert) and Phase 2 (compute) on the SAME chunk
     // size — return the compute_plan unchanged (mirror image_flow, which also
     // disables the kv_cs doubling). The auto chunk-size scan finds the largest
     // comp_cs that fits SPM; a single kv_cs simplifies SPM budgeting and avoids
-    // a two-phase estimator/allocator mismatch.
+    // the two-phase estimator/allocator mismatch image_flow R5 documents.
     //
     // Multi-image compute is already pinned to one full-sequence chunk in
     // forward_packed. Keep QKV identical to that canonical compute plan; FMB's
@@ -1297,13 +2251,13 @@ protected:
     }
 
     // ========================================================================
-    // subclass_chunk_size_valid — required kernel-validity hook for the auto
-    // chunk-size scan. The base default returns true (only the
+    // subclass_chunk_size_valid — kernel-validity hook for the auto chunk-size
+    // scan (Site10, REQUIRED override). The base default returns true (only the
     // SPM budget is checked), but the SigLIP SDPA imposes real tile/structural
-    // constraints the budget predicate does not capture.
+    // constraints the budget predicate does NOT capture. COPY-image_flow:287-290.
     //
     // head_dim() = 80 (padded), NOT orig_head_dim_ = 72: sdpa_is_valid_chunk_size
-    // hard-requires head_dim % 16 == 0; 72%16≠0 would reject
+    // hard-requires head_dim % 16 == 0 (rpu_helpers.h:358); 72%16≠0 would reject
     // EVERY cs, 80%16==0 passes. This matches declare_buffers' sdpa_compute_tiling
     // (which also uses head_dim()). mask=0 (MASK_NONE) skips the LTM-only
     // sQryAcc%16 constraints that don't apply to SigLIP's bidirectional attention.
@@ -1311,37 +2265,62 @@ protected:
     // ========================================================================
     bool subclass_chunk_size_valid(int64_t cs, int64_t seq_len,
                                    int64_t position) const override {
+        // Packed minibatch attention consumes one full physical window.
+        // A6 enumerates all capacities under the legacy override, so express
+        // this owner capability here as well as in forward's fixed override.
+        if (image_batch_count_ > 1 && cs != seq_len) return false;
+
         SdpaConfig cfg{SdpaKernelType::FLASH_ATTN_SPM,
                        head_dim(), num_q_heads(), num_q_heads(),
-                       NUM_CORES, /*mask=*/0 /*MASK_NONE*/};
+                       num_cores(), /*mask=*/0 /*MASK_NONE*/};
         if (!sdpa_is_valid_chunk_size(cfg, cs, seq_len, position)) return false;
 
-        // The single-image auto scan is capped at 512 because stacked KvInsert and
-        // Compute temporaries exceed the generic scope model. Packed multi-image
-        // runs force one chunk and rely on the exact stacked-temp budget gate below.
+        // Board-proven safe ceiling (2026-06-18). cs=256/512 RUN (clean, finite);
+        // cs=880 HANGS on the cs-independent 8 MB SPM-block request
+        // (`requested=8388608 available=0` infinite retry). Root cause: persistent
+        // weights (~569 KB) + the STACKED per-chunk temps (KvInsert + Compute do
+        // NOT alias, see below) push the FULL 8 MB SPM
+        // block over, even though the bump-pool temps alone fit. The current
+        // framework uses SPM_PLANNING_BUDGET, but its generic scope model still
+        // does not express this board-observed stacked allocation. Cap cs at the proven-working 512
+        // (1564 → ~4 chunks of ≤512, each with the cs=512 footprint that runs)
+        // until the kernel-internal SPM headroom beyond declared temps is
+        // characterized. The stacked-temp check below is the secondary defense.
+        //
+        // this 512 ceiling is the SINGLE-IMAGE auto-scan cap.
+        // Multi-image packed (image_batch_count_>1) pins ONE chunk == seq_len via
+        // set_chunk_size_override (forward_packed:624), which STILL routes through
+        // this validator (fused_model_base.cpp:490 TORCH_CHECK(valid_fn(...))) — so a
+        // legit 3-image 768-token packed forward (3*256) would be wrongly rejected by
+        // `cs>512`, regressing the pre-MR single-block path. Gate the heuristic cap to
+        // the single-image auto-scan; the multi-image forced-single-block path is
+        // bounded by the stacked-temp SPM budget gate below (the real safety check),
+        // which sizes the actual peak for this exact cs.
         if (image_batch_count_ <= 1 && cs > 512) return false;
 
-        // SPM budget gate. The
+        // SPM budget gate (residual-risk #3, board-confirmed 2026-06-18). The
         // framework's auto-scan budget check (estimate_temporary_total) models
         // KvInsert and Compute scopes as ALIASING (LayerWide + max(KvInsert,
         // Compute)). The real bump allocator (rpu_spm_allocator) does NOT free the
         // Phase-1 KvInsert temps (q_kv/k/v) before Phase-2 Compute allocates — the
-        // two scopes stack. Reject cs whose actual stacked peak
-        // (LayerWide + KvInsert + Compute) exceeds the usable
+        // two scopes STACK. Board proof: cs=944 estimated 7.78 MB (planner fits=1)
+        // but really allocated 8 458 240 B → SpmAllocator OOM. Reject cs whose
+        // ACTUAL stacked peak (LayerWide + KvInsert + Compute, the bump-allocator
+        // truth for the aliased layout) exceeds the usable
         // profile-specific 0.97 * SPM_USABLE ceiling, so the auto-scan picks a
         // cs that fits at real allocation.
         const int64_t h   = hidden_size();
         const int64_t nq  = num_q_heads();
         const int64_t hd  = head_dim();
         const int64_t is_ = intermediate_size();
-        const int64_t local_q_dim = (nq / NUM_CORES) * hd;
-        const int64_t local_inter = is_ / NUM_CORES;
+        const int64_t local_q_dim = (nq / num_cores()) * hd;
+        const int64_t local_inter = is_ / mlp_tp();
         auto Aln = [](int64_t b) -> int64_t { return Align(b, 256); };
         const int64_t res = Aln(cs * h * DWIDTH);            // residual1/input_norm/oproj
         const int64_t qkv = Aln(cs * local_q_dim * DWIDTH);  // q_kv/k/v/q_comp/sdpa_out
         const int64_t fc1 = Aln(cs * local_inter * DWIDTH);
         SdpaTiling t = sdpa_compute_tiling(cfg, cs);
-        const int64_t nkv_per_core = CeilDiv(nq, (int64_t)NUM_CORES);
+        const int64_t nkv_per_core = CeilDiv(nq, (int64_t)num_cores());
         const int64_t sdpa_tmp =
             Aln(t.tile_n_v16 * t.tile_k * nkv_per_core * CeilDiv(cs, t.tile_m) * 32);
         const int64_t layer_wide = 3 * res;                       // alive both phases
@@ -1369,7 +2348,9 @@ protected:
     // slices [N,C,H,W] into the vector) and the all-RPU list path (forward_multi
     // via run_packed_patch_embed_list, which receives N distinct image tensors).
     // ========================================================================
-    at::Tensor run_packed_patch_embed_core(const std::vector<at::Tensor>& images) {
+    at::Tensor run_packed_patch_embed_core(
+        const std::vector<at::Tensor>& images,
+        bool consume_external_prologue) {
         if (!SPM_ALLOC.is_initialized()) SPM_ALLOC.init();
         int64_t N = static_cast<int64_t>(images.size());
         TORCH_CHECK(N > 0, "run_packed_patch_embed: empty image list");
@@ -1399,12 +2380,32 @@ protected:
         });
 
         // allocate_tracked_output, not a bare at::empty: `hidden` is BOTH a
-        // per-forward Python-returned tensor and the live base of a
+        // per-forward Python-returned tensor (P4) and the live base of a
         // deferred DMA — fused_patch_embedding step (7) bakes
         // RpuGetDevAddr(out.data_ptr()) into patch_emb_output_live_base, which
-        // the graph dereferences at end(), long after this frame returns. The
-        // helper keeps the graph's own reference until after execution.
+        // the graph dereferences at end(), long after this frame returns
+        // (docs/pitfalls.md#c-1, write side). The helper keeps the graph's own
+        // reference until after execution.
         at::Tensor hidden = allocate_tracked_output({1, N * npp, cout});
+
+        auto& graph = RpuKernelGraph::active();
+        const auto graph_state = graph.state();
+        const bool recording_or_replaying =
+            graph_state == RpuKernelGraph::State::RECORDING ||
+            graph_state == RpuKernelGraph::State::REPLAYING;
+        const bool merge_patch_segment = pi05_vision_merge_segment_opt_in_ &&
+            (N == 2 || N == 3) && num_cores() == 8 && npp == 256 && cout == 1152 &&
+            num_layers() == 27 && intermediate_size() == 4352 &&
+            num_q_heads() == 16 && num_kv_heads() == 16 && head_dim() == 80 &&
+            orig_head_dim_ == 72 && pi05_vision_supported_owner();
+        if (recording_or_replaying && merge_patch_segment) {
+            // The reset below changes only the host allocator cursor. Keep a
+            // topology marker before the patch nodes so their prepared batch
+            // can be retained together with the encoder on warm REPLAY.
+            graph.record_branch(
+                0x5349474c49505f4dull,  // "SIGLIP_M"
+                GraphSignature{}, "siglip_patch_encoder_merged");
+        }
 
         for (int64_t i = 0; i < N; ++i) {
             // ② Flush each image at the batch driver, before its mutable input
@@ -1413,7 +2414,8 @@ protected:
             // un-flushed to device DDR → the DMA would read stale bytes →
             // non-deterministic output. Idempotent for already-coherent inputs
             // (e.g. the 4D single-image .to('rpu') path), so N=1 stays
-            // byte-identical.
+            // byte-identical. (CLAUDE.md "mutable DMA reading a torch.cat result
+            // MUST be fed a flushed tensor"; memory rpu-adapter-pitfalls #5.)
             rpu_ddr_flush_force(
                 const_cast<c10::Half*>(images[i].data_ptr<c10::Half>()));
             // C-1: step (1) bakes RpuGetDevAddr(images[i]) into
@@ -1428,17 +2430,19 @@ protected:
                 pe_kh_, pe_kw_, pe_cin_orig_, pe_cin_padded_, pe_cout_,
                 pe_strideh_, pe_stridew_,
                 hidden, /*seq_off=*/i * npp, /*img_slot=*/(int)i, offsets,
-                patch_embedding_live_bases_);
+                patch_embedding_live_bases_,
+                consume_external_prologue ? &ctx() : nullptr, linear_acc32_);
         }
-        auto& graph = RpuKernelGraph::active();
-        const auto graph_state = graph.state();
-        if (graph_state == RpuKernelGraph::State::RECORDING ||
-            graph_state == RpuKernelGraph::State::REPLAYING) {
+        if (recording_or_replaying && !merge_patch_segment) {
             graph.record_branch(
                 0x5349474c49505f52ull,  // "SIGLIP_R"
                 GraphSignature{},
                 "siglip_patch_embed_spm_reset");
         }
+        // Patch output is a channel-0 DMA. Encoder input broadcast joins every
+        // other DMA stream to channel 0 before reading that DDR output; the
+        // unchanged absolute SPM addresses preserve SDK read/write hazards
+        // across this host-only cursor reset when both parts share a segment.
         SPM_ALLOC.reset_temporary();  // free patch_emb temp before the encoder
         image_batch_count_ = N;
         return hidden;
@@ -1448,25 +2452,559 @@ protected:
     // contiguous [1,C,H,W] images, then pack via the shared core. A dim-0 slice
     // of a contiguous [N,C,H,W] is already contiguous, so .contiguous() is a
     // metadata no-op (no kernel/copy). N=1 stays byte-identical to before.
-    at::Tensor run_packed_patch_embed(const at::Tensor& input) {
+    at::Tensor run_packed_patch_embed(
+        const at::Tensor& input, bool consume_external_prologue) {
         int64_t N = input.size(0);
         std::vector<at::Tensor> images;
         images.reserve(N);
         for (int64_t i = 0; i < N; ++i) {
             images.push_back(input.slice(0, i, i + 1).contiguous());
         }
-        return run_packed_patch_embed_core(images);
+        return run_packed_patch_embed_core(
+            images, consume_external_prologue);
     }
 
     // All-RPU list path (forward_multi): the N camera images arrive as distinct
     // [1,C,H,W] tensors — no torch.cat upstream, no slice here.
-    at::Tensor run_packed_patch_embed_list(at::TensorList images) {
+    at::Tensor run_packed_patch_embed_list(
+        at::TensorList images, bool consume_external_prologue) {
         std::vector<at::Tensor> imgs(images.begin(), images.end());
-        return run_packed_patch_embed_core(imgs);
+        return run_packed_patch_embed_core(
+            imgs, consume_external_prologue);
     }
 
 private:
+    void require_pi05_vision_owner_ln_payloads(int64_t rows) const {
+        const auto& cache = KernelCache::instance();
+        const bool m768 = cache.has_loaded(KernelId::PI05_VISION_OWNER_REDUCE_LAYERNORM_M768N1152) &&
+            cache.has_loaded(KernelId::PI05_VISION_XOR3_COMPACT_RESIDUAL_RAW_FULL_M768N1152);
+        const bool m512 = cache.has_loaded(KernelId::PI05_VISION_OWNER_REDUCE_LAYERNORM_M512N1152) &&
+            cache.has_loaded(KernelId::PI05_VISION_XOR3_COMPACT_RESIDUAL_RAW_FULL_M512N1152);
+        TORCH_CHECK((rows == 0 && (m768 || m512)) || (rows == 768 && m768) ||
+                        (rows == 512 && m512),
+            "Pi Vision owner-LN ON requires the exact selected owner-LN and compact-residual payloads; no fallback");
+    }
+
+    std::vector<int64_t> pi05_vision_owner_ln_arguments(bool compact, int64_t rows) const {
+        TORCH_CHECK(rows == 512 || rows == 768, "Pi Vision owner-LN rejects unsupported rows");
+        // ABI v1: full M/N, cores, owner rows, reduce rounds/elements,
+        // FP16 raw/full bytes, epsilon, affine, partial==normalized alias, epoch.
+        return {1, compact ? 1 : 0, rows, 1152, 8, rows / 8, 2, 63488,
+                rows / 8 * 1152 * 2, rows * 1152 * 2, 1000000,
+                compact ? 0 : 1, compact ? 0 : 1, 0};
+    }
+
+    void require_pi05_vision_owner_ln_profile(int64_t rows, int64_t images) const {
+        if (!pi05_vision_owner_ln_opt_in_) return;
+        TORCH_CHECK(
+            (images == 2 || images == 3) && rows == images * 256 && num_cores() == 8 &&
+                num_layers() == 27 && layer_bias_norm_.size() == 27 &&
+                hidden_size() == 1152 && intermediate_size() == 4352 &&
+                num_q_heads() == 16 && num_kv_heads() == 16 && head_dim() == 80 &&
+                orig_head_dim_ == 72 && projection_dim_ == 2048 && eps_ == 1e-6 &&
+                pi05_ring_xor3_opt_in_ && pi05_vision_supported_owner(),
+            "Pi Vision owner-LN ON requires exact 2x256 or 3x256 eight-core FP16/W8 Pi profile and epsilon 1e-6; no fallback");
+        require_pi05_vision_owner_ln_payloads(rows);
+    }
+
+    void validate_pi05_vision_owner_ln_manifest(
+        const FmbPhysicalExecutionManifest& manifest) const {
+        int owner_routes = 0, compact_routes = 0, attention_routes = 0;
+        for (const auto& route : manifest.routes) {
+            const bool first = route.site_id == SIGLIP_ATTN_ALL_REDUCE_SITE;
+            const bool second = route.site_id == SIGLIP_MLP_ALL_REDUCE_SITE;
+            const bool owner_selector = route.family == FmbRouteFamily::ALL_REDUCE &&
+                (route.selector == SIGLIP_OWNER_LN_ROUTE ||
+                 route.selector == SIGLIP_OWNER_LN_COMPACT_ROUTE);
+            if (!pi05_vision_owner_ln_opt_in_) {
+                TORCH_CHECK(!owner_selector && (!(first || second) || route.arguments.empty()),
+                    "Pi Vision owner-LN OFF rejects ON descriptor");
+                continue;
+            }
+            TORCH_CHECK(!owner_selector || first || second,
+                "Pi Vision owner-LN descriptor has a foreign collective site");
+            if (first || second) {
+                first ? ++owner_routes : ++compact_routes;
+                TORCH_CHECK(route.family == FmbRouteFamily::ALL_REDUCE &&
+                    route.selector == (second ? SIGLIP_OWNER_LN_COMPACT_ROUTE : SIGLIP_OWNER_LN_ROUTE) &&
+                    route.flags == 0 && route.invocation == 0 &&
+                    route.arguments == pi05_vision_owner_ln_arguments(second, manifest.physical_length),
+                    "Pi Vision owner-LN route ABI mismatch");
+            }
+            if (route.family == FmbRouteFamily::ATTENTION) {
+                ++attention_routes;
+                const std::vector<int64_t> expected{image_batch_count_, 256,
+                    manifest.physical_length, manifest.physical_length, 16, 80};
+                TORCH_CHECK(route.site_id == SIGLIP_RAW_SPM_ATTN_SITE &&
+                    route.selector == static_cast<int64_t>(AttentionExecutionPolicy::SPM_KV_BY_MHA) &&
+                    route.flags == 0 && route.invocation == 0 && route.arguments == expected,
+                    "Pi Vision owner-LN requires the current raw-SPM attention route");
+            }
+        }
+        if (!pi05_vision_owner_ln_opt_in_) return;
+        require_pi05_vision_owner_ln_profile(manifest.physical_length, image_batch_count_);
+        TORCH_CHECK(manifest.state == FmbPhysicalManifestState::COMPLETE &&
+            manifest.logical_length == image_batch_count_ * 256 && manifest.physical_length == manifest.logical_length &&
+            manifest.execution_padding_rows == 0 && manifest.kv_logical_length == manifest.logical_length &&
+            manifest.kv_insert_physical_rows == manifest.logical_length &&
+            manifest.graph_lifecycle == FmbGraphLifecycle::COMPOSITE_CHILD &&
+            manifest.linear_accumulation == linear_accumulation_policy() &&
+            owner_routes == 1 && compact_routes == 1 && attention_routes == 1,
+            "Pi Vision owner-LN requires COMPLETE exact physical profile and both collective roles");
+    }
+
+    void validate_pi05_vision_owner_ln_policy(
+        const FmbPrefillStageCandidate& candidate, int64_t rows, int64_t images) const {
+        validate_pi05_vision_owner_ln_manifest(candidate.physical_manifest);
+        if (!pi05_vision_owner_ln_opt_in_) return;
+        require_pi05_vision_owner_ln_profile(rows, images);
+        TORCH_CHECK(candidate.physical_manifest.physical_length == rows &&
+                        images == image_batch_count_,
+                    "Pi Vision owner-LN request and descriptor shape differ");
+        // Same independent image spans and one full QKV/compute chunk.
+        require_pi05_vision_kv_spm_only_schedule(candidate.stage_plan);
+    }
+
+    void require_pi05_vision_owner_ln_runtime(const ChunkInfo& chunk, int layer) const {
+        if (!pi05_vision_owner_ln_opt_in_) return;
+        require_pi05_vision_owner_ln_profile(ctx().seq_len, image_batch_count_);
+        require_pi05_vision_kv_spm_only_schedule(ctx().stage_plan);
+        TORCH_CHECK(ctx().has_complete_physical_manifest() &&
+            ctx().attention_policy == AttentionExecutionPolicy::SPM_KV_BY_MHA &&
+            ctx().position == 0 && ctx().batch_size == 1 && !ctx().is_causal &&
+            !ctx().attention_mask.has_value() && chunk.idx == 0 && chunk.offset == 0 &&
+            chunk.len == image_batch_count_ * 256 && chunk.kv_seq_len == image_batch_count_ * 256 &&
+            (layer == 0 || ctx().input_in_spm) &&
+            (layer == num_layers() - 1 || ctx().output_to_spm),
+            "Pi Vision owner-LN runtime lost its exact SPM-resident lifetime");
+        auto& graph = RpuKernelGraph::active();
+        TORCH_CHECK((graph.state() == RpuKernelGraph::State::RECORDING ||
+                     graph.state() == RpuKernelGraph::State::REPLAYING) && graph.replayable(),
+                    "Pi Vision owner-LN requires replayable BUILD/REPLAY");
+    }
+
+    void consume_pi05_vision_owner_ln_route(bool compact, const ChunkInfo& chunk) {
+        TORCH_CHECK(pi05_vision_owner_ln_opt_in_ && ctx().has_complete_physical_manifest(),
+            "Pi Vision owner-LN requires its COMPLETE manifest");
+        ctx().consume_physical_route(FmbRouteFamily::ALL_REDUCE,
+            compact ? SIGLIP_MLP_ALL_REDUCE_SITE : SIGLIP_ATTN_ALL_REDUCE_SITE,
+            compact ? SIGLIP_OWNER_LN_COMPACT_ROUTE : SIGLIP_OWNER_LN_ROUTE,
+            0, pi05_vision_owner_ln_arguments(compact, chunk.len), chunk.idx);
+    }
+
+    void configure_chunk_for_shape(
+        int64_t seq_len, int64_t packed_image_count)
+    {
+        TORCH_CHECK(num_cores() == 8 ||
+                        (seq_len == 256 && packed_image_count == 1),
+                    "Pi0.5 SigLIP4 requires serial single-image M256 execution");
+        require_pi05_vision_owner_ln_profile(seq_len, packed_image_count);
+        require_pi05_vision_fc_profile(seq_len,packed_image_count);
+        require_pi05_vision_kv_spm_only_profile(
+            seq_len, packed_image_count);
+        TORCH_CHECK(seq_len > 0,
+                    "SigLIP sequence length must be positive");
+        TORCH_CHECK(packed_image_count > 0,
+                    "SigLIP packed image count must be positive");
+        TORCH_CHECK(
+            packed_image_count == 1 ||
+                (seq_len % 16 == 0 && seq_len % packed_image_count == 0),
+            "SigLIP packed forward: seq_len (", seq_len,
+            ") must be divisible by 16 and by image_batch_count (",
+            packed_image_count,
+            ") so the forced single-block KV_FIRST override does not split a tail chunk");
+        if (packed_image_count > 1) {
+            TORCH_CHECK(configured_chunk_size_ == 0
+                            || configured_chunk_size_ >= seq_len,
+                        "SigLIP packed multi-image attention requires one "
+                        "chunk spanning the full sequence (", seq_len,
+                        "); configured chunk_size must be auto or at least the "
+                        "packed sequence length, got ", configured_chunk_size_);
+            image_batch_count_ = packed_image_count;
+            set_chunk_size_override(seq_len);
+        } else {
+            image_batch_count_ = 1;
+            set_chunk_size_override(configured_chunk_size_);
+        }
+    }
+
+    bool pi05_vision_supported_owner() const {
+        if (layer_weights_.size() != 27 || !layer_weights_.front().q_w.defined()) return false;
+        const auto dtype = layer_weights_.front().q_w.scalar_type();
+        if (dtype != at::kHalf && dtype != at::kChar) return false;
+        for (const auto& weights : layer_weights_) {
+            for (const auto* tensor : {&weights.q_w, &weights.k_w, &weights.v_w,
+                                      &weights.o_w, &weights.fc1_w, &weights.fc2_w})
+                if (!tensor->defined() || tensor->scalar_type() != dtype) return false;
+            for (const auto* scale : {&weights.q_ws, &weights.k_ws, &weights.v_ws,
+                                     &weights.o_ws, &weights.fc1_ws, &weights.fc2_ws}) {
+                if (dtype == at::kChar ? (!scale->defined() || scale->scalar_type() != at::kHalf)
+                                     : scale->defined()) return false;
+            }
+        }
+        return true;
+    }
+
+    void require_pi05_vision_kv_spm_only_profile(
+        int64_t rows, int64_t images) const {
+        if (!pi05_vision_kv_spm_only_opt_in_) return;
+        TORCH_CHECK(
+            (images == 2 || images == 3) && rows == images * 256 && num_cores() == 8 && num_layers() == 27 &&
+                hidden_size() == 1152 && intermediate_size() == 4352 &&
+                num_q_heads() == 16 && num_kv_heads() == 16 &&
+                head_dim() == 80 && orig_head_dim_ == 72 &&
+                projection_dim_ == 2048 && pi05_vision_supported_owner(),
+            "Pi Vision KV raw-SPM-only ON requires exact 2x256 or 3x256 FP16/W8 Pi profile; no fallback");
+    }
+
+    void require_pi05_vision_kv_spm_only_schedule(
+        const FmbThreeStageChunkPlan& plan) const {
+        TORCH_CHECK(
+            plan.chunk_mode == ChunkMode::KV_FIRST &&
+                static_cast<int64_t>(plan.input.chunks.size()) == image_batch_count_ &&
+                static_cast<int64_t>(plan.spans.size()) == image_batch_count_ &&
+                (image_batch_count_ == 2 || image_batch_count_ == 3) &&
+                plan.qkv.chunks.size() == 1 &&
+                plan.compute.chunks.size() == 1 &&
+                plan.boundary_policies.input ==
+                    FmbSpanBoundaryPolicy::KEEP_LOCAL &&
+                plan.boundary_policies.qkv ==
+                    FmbSpanBoundaryPolicy::ALLOW_CROSS &&
+                plan.boundary_policies.compute ==
+                    FmbSpanBoundaryPolicy::ALLOW_CROSS,
+            "Pi Vision KV raw-SPM-only requires input2-or-3/QKV1/compute1 schedule");
+        for (int64_t image = 0; image < image_batch_count_; ++image) {
+            const auto& chunk = plan.input.chunks[image];
+            const auto& span = plan.spans[image];
+            TORCH_CHECK(
+                chunk.idx == image && chunk.offset == image * 256 &&
+                    chunk.len == 256 && chunk.kv_seq_len == (image + 1) * 256 &&
+                    span.offset == image * 256 && span.len == 256 &&
+                    span.group_id == image,
+                "Pi Vision KV raw-SPM-only requires independent 256-token image spans");
+        }
+        for (const auto* stage : {&plan.qkv, &plan.compute}) {
+            const auto& chunk = stage->chunks.front();
+            TORCH_CHECK(
+                chunk.idx == 0 && chunk.offset == 0 && chunk.len == image_batch_count_ * 256 &&
+                    chunk.kv_seq_len == image_batch_count_ * 256,
+                "Pi Vision KV raw-SPM-only rejects split/tail/offset QKV or compute");
+        }
+    }
+
+    void require_pi05_vision_kv_spm_only_candidate(
+        const FmbThreeStageChunkPlan& plan, const LayoutContext& layout,
+        int64_t physical_len, int64_t logical_len, int64_t position) const {
+        if (!pi05_vision_kv_spm_only_opt_in_) return;
+        require_pi05_vision_kv_spm_only_profile(
+            physical_len, image_batch_count_);
+        require_pi05_vision_kv_spm_only_schedule(plan);
+        TORCH_CHECK(
+            physical_len == image_batch_count_ * 256 && logical_len == physical_len && position == 0 &&
+                layout.batch_size == 1 && !layout.is_causal &&
+                !layout.use_attn_mask && layout.chunk_size == physical_len &&
+                layout.effective_kv_cs() == physical_len &&
+                layout.attention_policy ==
+                    AttentionExecutionPolicy::SPM_KV_BY_MHA &&
+                subclass_spm_kv_by_mha_eligible(plan, layout, position),
+            "Pi Vision KV raw-SPM-only requires the exact SPM_KV_BY_MHA physical candidate");
+    }
+
+    void validate_pi05_vision_kv_spm_only_manifest(
+        const FmbPhysicalExecutionManifest& manifest) const {
+        size_t kv_routes = 0;
+        size_t raw_attention_routes = 0;
+        for (const auto& route : manifest.routes) {
+            if (route.site_id == SIGLIP_KV_INSERT_SITE) {
+                ++kv_routes;
+                const int64_t expected_flags =
+                    pi05_vision_kv_spm_only_opt_in_
+                    ? SIGLIP_KV_FLAG_RAW_SPM_ONLY
+                    : SIGLIP_KV_FLAG_DDR_MIRROR;
+                TORCH_CHECK(
+                    route.family == FmbRouteFamily::KV_INSERT &&
+                        route.flags == expected_flags,
+                    pi05_vision_kv_spm_only_opt_in_
+                        ? "Pi Vision KV raw-SPM-only route identity mismatch"
+                        : "Pi Vision KV mirror route rejects raw-SPM-only descriptor");
+                if (pi05_vision_kv_spm_only_opt_in_) {
+                    TORCH_CHECK(
+                        route.invocation == 0 && route.arguments.size() ==
+                            kKvInsertRouteArgumentWords &&
+                            route.selector == route.arguments[1] &&
+                            route.arguments[0] == 2 &&
+                            route.arguments[2] == manifest.physical_length &&
+                            route.arguments[3] == manifest.physical_length &&
+                            route.arguments[4] == 1 &&
+                            route.arguments[6] == 0 &&
+                            route.arguments[7] == 0 &&
+                            route.arguments[8] == manifest.physical_length,
+                        "Pi Vision KV raw-SPM-only KV topology is not canonical");
+                }
+            } else if (route.site_id == SIGLIP_RAW_SPM_ATTN_SITE) {
+                ++raw_attention_routes;
+                if (pi05_vision_kv_spm_only_opt_in_) {
+                    const std::vector<int64_t> expected_arguments{
+                        image_batch_count_, 256, manifest.physical_length, manifest.physical_length, 16, 80};
+                    TORCH_CHECK(
+                        route.family == FmbRouteFamily::ATTENTION &&
+                            route.selector == static_cast<int64_t>(
+                                AttentionExecutionPolicy::SPM_KV_BY_MHA) &&
+                            route.flags == 0 && route.invocation == 0 &&
+                            route.arguments == expected_arguments,
+                        "Pi Vision KV raw-SPM-only attention route is not canonical");
+                }
+            } else if (pi05_vision_kv_spm_only_opt_in_ &&
+                       (route.site_id == SIGLIP_MINIBATCH_ATTN_SITE ||
+                        route.site_id == SIGLIP_UNIFIED_ATTN_SITE)) {
+                TORCH_CHECK(
+                    false,
+                    "Pi Vision KV raw-SPM-only rejects a DDR attention route");
+            }
+        }
+        if (!pi05_vision_kv_spm_only_opt_in_) return;
+        require_pi05_vision_kv_spm_only_profile(manifest.physical_length, image_batch_count_);
+        TORCH_CHECK(
+            manifest.state == FmbPhysicalManifestState::COMPLETE &&
+                manifest.logical_length == image_batch_count_ * 256 &&
+                manifest.physical_length == manifest.logical_length &&
+                manifest.execution_padding_rows == 0 &&
+                manifest.kv_logical_length == manifest.logical_length &&
+                manifest.kv_insert_physical_rows == manifest.logical_length &&
+                manifest.graph_lifecycle ==
+                    FmbGraphLifecycle::COMPOSITE_CHILD &&
+                manifest.linear_accumulation ==
+                    linear_accumulation_policy(),
+            "Pi Vision KV raw-SPM-only requires exact COMPLETE physical profile");
+        TORCH_CHECK(
+            kv_routes == 1 && raw_attention_routes == 1,
+            "Pi Vision KV raw-SPM-only routes are missing or duplicated");
+    }
+
+    void validate_pi05_vision_kv_spm_only_policy(
+        const FmbPrefillStageCandidate& candidate, int64_t rows,
+        int64_t images) const {
+        if (!pi05_vision_kv_spm_only_opt_in_) return;
+        require_pi05_vision_kv_spm_only_profile(rows, images);
+        TORCH_CHECK(candidate.physical_manifest.physical_length == rows &&
+                        images == image_batch_count_,
+                    "Pi Vision raw-SPM-only request and descriptor shape differ");
+        require_pi05_vision_kv_spm_only_schedule(candidate.stage_plan);
+        validate_pi05_vision_kv_spm_only_manifest(
+            candidate.physical_manifest);
+    }
+
+    void require_pi05_vision_kv_spm_only_runtime(
+        const ChunkInfo& chunk) const {
+        if (!pi05_vision_kv_spm_only_opt_in_) return;
+        require_pi05_vision_kv_spm_only_profile(
+            ctx().seq_len, image_batch_count_);
+        require_pi05_vision_kv_spm_only_schedule(ctx().stage_plan);
+        TORCH_CHECK(
+            ctx().has_complete_physical_manifest() &&
+                ctx().attention_policy ==
+                    AttentionExecutionPolicy::SPM_KV_BY_MHA &&
+                ctx().position == 0 && ctx().batch_size == 1 &&
+                !ctx().is_causal && !ctx().attention_mask.has_value() &&
+                chunk.idx == 0 && chunk.offset == 0 && chunk.len == image_batch_count_ * 256 &&
+                chunk.kv_seq_len == image_batch_count_ * 256,
+            "Pi Vision KV raw-SPM-only runtime geometry drift");
+        auto& graph = RpuKernelGraph::active();
+        TORCH_CHECK(
+            (graph.state() == RpuKernelGraph::State::RECORDING ||
+             graph.state() == RpuKernelGraph::State::REPLAYING) &&
+                graph.replayable(),
+            "Pi Vision KV raw-SPM-only requires replayable BUILD/REPLAY");
+    }
+
+    // One immutable opt-in per owner; no getenv or graph selection in REPLAY.
+    std::vector<int64_t> pi05_vision_fc_arguments(bool second) const {
+        return {1,768,second?1152:544,second?544:1152,8,second?0:1,
+            80,128,second?15:7,1,1,second?1:8,374};
+    }
+    void require_pi05_vision_fc_profile(int64_t rows,int64_t images) const {
+        if(!pi05_vision_fc_weight_outer_opt_in_)return;
+        TORCH_CHECK(rows==768 && images==3 && num_layers()==27 && layer_weights_.size()==27 &&
+            layer_bias_norm_.size()==27 && hidden_size()==1152 && intermediate_size()==4352 &&
+            num_q_heads()==16 && num_kv_heads()==16 && head_dim()==80 && orig_head_dim_==72 &&
+            projection_dim_==2048 && layer_weights_.front().q_w.scalar_type()==at::kChar,
+            "Pi Vision FC weight-outer ON requires exact 3x256 W8 Pi profile; no fallback");
+    }
+    void require_pi05_vision_fc_schedule(const FmbThreeStageChunkPlan& plan) const {
+        TORCH_CHECK(plan.chunk_mode==ChunkMode::KV_FIRST && plan.input.chunks.size()==3 &&
+            plan.spans.size()==3 && plan.qkv.chunks.size()==1 && plan.compute.chunks.size()==1 &&
+            plan.boundary_policies.input==FmbSpanBoundaryPolicy::KEEP_LOCAL &&
+            plan.boundary_policies.qkv==FmbSpanBoundaryPolicy::ALLOW_CROSS &&
+            plan.boundary_policies.compute==FmbSpanBoundaryPolicy::ALLOW_CROSS,
+            "Pi Vision FC weight-outer requires input3/QKV1/compute1 schedule");
+        for(int i=0;i<3;++i) {
+            const auto& c=plan.input.chunks[i];const auto& span=plan.spans[i];
+            TORCH_CHECK(c.idx==i && c.offset==i*256 && c.len==256 && c.kv_seq_len==(i+1)*256 &&
+                span.offset==i*256 && span.len==256 && span.group_id==i,
+                "Pi Vision FC weight-outer requires three independent 256-token image spans");
+        }
+        for(const auto* stage:{&plan.qkv,&plan.compute}) {
+            const auto& c=stage->chunks.front();
+            TORCH_CHECK(c.idx==0 && c.offset==0 && c.len==768 && c.kv_seq_len==768,
+                "Pi Vision FC weight-outer rejects split/tail/offset compute");
+        }
+    }
+    void validate_pi05_vision_fc_manifest(const FmbPhysicalExecutionManifest& manifest) const {
+        if(!pi05_vision_fc_weight_outer_opt_in_) {
+            for(const auto& r:manifest.routes)
+                TORCH_CHECK(r.site_id!=SIGLIP_FC1_WEIGHT_OUTER_SITE && r.site_id!=SIGLIP_FC2_WEIGHT_OUTER_SITE,
+                    "Pi Vision FC weight-outer OFF rejects ON descriptor");
+            return;
+        }
+        require_pi05_vision_fc_profile(768,3);
+        TORCH_CHECK(manifest.state==FmbPhysicalManifestState::COMPLETE &&
+            manifest.logical_length==768 && manifest.physical_length==768 &&
+            manifest.execution_padding_rows==0 && manifest.kv_logical_length==768 &&
+            manifest.kv_insert_physical_rows==768 && manifest.graph_lifecycle==FmbGraphLifecycle::COMPOSITE_CHILD &&
+            manifest.linear_accumulation==linear_accumulation_policy(),
+            "Pi Vision FC weight-outer ON requires exact COMPLETE physical profile");
+        for(bool second:{false,true}) {
+            const int64_t site=second?SIGLIP_FC2_WEIGHT_OUTER_SITE:SIGLIP_FC1_WEIGHT_OUTER_SITE;
+            int count=0;
+            for(const auto& r:manifest.routes) {
+                TORCH_CHECK(r.site_id!=SIGLIP_FC1_LINEAR_SITE && r.site_id!=SIGLIP_FC2_LINEAR_SITE,
+                    "Pi Vision FC weight-outer ON rejects original AUTO_TILE FC routes");
+                if(r.site_id==site) {
+                    ++count;
+                    TORCH_CHECK(r.family==FmbRouteFamily::GRAPH_SCHEDULE && r.selector==2 &&
+                        r.flags==0 && r.invocation==0 && r.arguments==pi05_vision_fc_arguments(second),
+                        "Pi Vision FC weight-outer route identity mismatch");
+                }
+            }
+            TORCH_CHECK(count==1,"Pi Vision FC weight-outer requires one explicit route per role");
+        }
+    }
+    void consume_pi05_vision_fc_route(bool second,const ChunkInfo& chunk) {
+        TORCH_CHECK(pi05_vision_fc_weight_outer_opt_in_ && ctx().has_complete_physical_manifest(),
+            "Pi Vision FC weight-outer requires its COMPLETE manifest");
+        require_pi05_vision_fc_profile(ctx().seq_len,image_batch_count_);
+        require_pi05_vision_fc_schedule(ctx().stage_plan);
+        TORCH_CHECK(ctx().position==0 && ctx().batch_size==1 && !ctx().is_causal &&
+            !ctx().attention_mask.has_value() && chunk.idx==0 && chunk.offset==0 &&
+            chunk.len==768 && chunk.kv_seq_len==768,"Pi Vision FC weight-outer runtime shape drift");
+        auto& graph=RpuKernelGraph::active();
+        TORCH_CHECK((graph.state()==RpuKernelGraph::State::RECORDING ||
+            graph.state()==RpuKernelGraph::State::REPLAYING) && graph.replayable(),
+            "Pi Vision FC weight-outer requires a replayable BUILD/REPLAY graph");
+        ctx().consume_physical_route(FmbRouteFamily::GRAPH_SCHEDULE,
+            second?SIGLIP_FC2_WEIGHT_OUTER_SITE:SIGLIP_FC1_WEIGHT_OUTER_SITE,
+            2,0,pi05_vision_fc_arguments(second),chunk.idx);
+    }
+    int64_t subclass_layout_hash() const override {
+        if (num_cores() != 8) {
+            int64_t hash = 0;
+            for (const auto value : core_profile_arguments()) hash = detail::layout_mix(hash, value);
+            return configured_linear_acc32_.has_value()
+                ? detail::layout_mix(hash, linear_acc32_ ? 32 : 16) : hash;
+        }
+        if(!pi05_vision_fc_weight_outer_opt_in_ &&
+           !pi05_vision_kv_spm_only_opt_in_ && !pi05_vision_owner_ln_opt_in_)return configured_linear_acc32_.has_value() ? (linear_acc32_ ? 32 : 16) : 0;
+        int64_t hash=0x5657464337363831LL;
+        for(int64_t value:{int64_t(1),num_layers(),hidden_size(),intermediate_size(),
+            num_q_heads(),num_kv_heads(),head_dim(),orig_head_dim_,projection_dim_,
+            int64_t(pi05_ring_xor3_opt_in_),int64_t(pi05_vision_merge_segment_opt_in_),
+            int64_t(pi05_vision_q_resident_opt_in_)})hash=detail::layout_mix(hash,value);
+        if(pi05_vision_fc_weight_outer_opt_in_)
+            for(bool second:{false,true})for(int64_t value:pi05_vision_fc_arguments(second))
+                hash=detail::layout_mix(hash,value);
+        if(pi05_vision_kv_spm_only_opt_in_) {
+            hash=detail::layout_mix(hash,0x4b5653504d4f4e4cLL);
+            hash=detail::layout_mix(hash,SIGLIP_KV_FLAG_RAW_SPM_ONLY);
+        }
+        if (pi05_vision_owner_ln_opt_in_) {
+            hash = detail::layout_mix(hash, 0x5649534f574e4c4eLL);
+            for (int64_t rows : {512, 768})
+                for (bool compact : {false, true})
+                    for (int64_t value : pi05_vision_owner_ln_arguments(compact, rows))
+                        hash = detail::layout_mix(hash, value);
+        }
+        return configured_linear_acc32_.has_value()
+                ? detail::layout_mix(hash, linear_acc32_ ? 32 : 16) : hash;
+    }
+
     // ----- Model state -----
+    std::vector<int64_t> kvinsert_cost_weight_identity() const override {
+        if (layer_weights_.empty()) return {};
+        // Bind cold ring policy independently of per-forward image/chunk rows.
+        std::vector<int64_t> identity{
+            1, 0x50493035434f5354LL, 2, pi05_ring_xor3_opt_in_ ? 1 : 0};
+        if (pi05_vision_merge_segment_opt_in_) {
+            identity[2] = 3;
+            identity.push_back(1);  // cold patch/encoder segment policy
+        }
+        if (pi05_vision_q_resident_opt_in_) {
+            identity = {1, 0x50493035434f5354LL, 4,
+                        pi05_ring_xor3_opt_in_ ? 1 : 0,
+                        pi05_vision_merge_segment_opt_in_ ? 1 : 0, 1};
+        }
+        if(pi05_vision_fc_weight_outer_opt_in_) {
+            identity={1,0x50493035434f5354LL,5,pi05_ring_xor3_opt_in_?1:0,
+                pi05_vision_merge_segment_opt_in_?1:0,pi05_vision_q_resident_opt_in_?1:0,1};
+            const auto first=pi05_vision_fc_arguments(false),second=pi05_vision_fc_arguments(true);
+            identity.insert(identity.end(),first.begin(),first.end());
+            identity.insert(identity.end(),second.begin(),second.end());
+        }
+        if(pi05_vision_kv_spm_only_opt_in_) {
+            identity={1,0x50493035434f5354LL,6,pi05_ring_xor3_opt_in_?1:0,
+                pi05_vision_merge_segment_opt_in_?1:0,
+                pi05_vision_q_resident_opt_in_?1:0,
+                pi05_vision_fc_weight_outer_opt_in_?1:0,
+                SIGLIP_KV_FLAG_RAW_SPM_ONLY};
+            if(pi05_vision_fc_weight_outer_opt_in_) {
+                const auto first=pi05_vision_fc_arguments(false),second=pi05_vision_fc_arguments(true);
+                identity.insert(identity.end(),first.begin(),first.end());
+                identity.insert(identity.end(),second.begin(),second.end());
+            }
+        }
+        if (pi05_vision_owner_ln_opt_in_) {
+            identity[2] = 7;
+            identity.insert(identity.end(), {0x5649534f574e4c4eLL, 1,
+                SIGLIP_OWNER_LN_ROUTE, SIGLIP_OWNER_LN_COMPACT_ROUTE});
+            for (int64_t rows : {512, 768}) {
+                for (bool compact : {false, true}) {
+                    const auto arguments = pi05_vision_owner_ln_arguments(compact, rows);
+                    identity.insert(identity.end(), arguments.begin(), arguments.end());
+                }
+            }
+        }
+        append_kvinsert_cost_scalar_identity(identity, eps_);
+        identity.insert(identity.end(), {
+            static_cast<int64_t>(has_patch_emb_)});
+        identity.push_back(static_cast<int64_t>(layer_weights_.size()));
+        for (const auto& weights : layer_weights_) {
+            for (const auto* tensor : {
+                    &weights.q_w, &weights.k_w, &weights.v_w, &weights.o_w,
+                    &weights.fc1_w, &weights.fc2_w, &weights.q_ws, &weights.k_ws,
+                    &weights.v_ws, &weights.o_ws, &weights.fc1_ws, &weights.fc2_ws}) {
+                append_kvinsert_cost_tensor_identity(identity, *tensor);
+            }
+        }
+        identity.push_back(static_cast<int64_t>(layer_bias_norm_.size()));
+        for (const auto& weights : layer_bias_norm_) {
+            for (const auto* tensor : {
+                    &weights.ln1_w, &weights.ln1_b, &weights.ln2_w, &weights.ln2_b,
+                    &weights.q_b, &weights.k_b, &weights.v_b, &weights.o_b,
+                    &weights.fc1_b, &weights.fc2_b}) {
+                append_kvinsert_cost_tensor_identity(identity, *tensor);
+            }
+        }
+        for (const auto* tensor : {
+                &post_ln_w_, &post_ln_b_, &proj_w_, &proj_b_,
+                &patch_emb_weight_, &patch_emb_pos_emb_}) {
+            append_kvinsert_cost_tensor_identity(identity, *tensor);
+        }
+        if (configured_linear_acc32_.has_value())
+            identity.insert(identity.end(), {0x4143433332LL, linear_acc32_ ? 1 : 0});
+        return identity;
+    }
+
+    int64_t logical_intermediate_size_ = 0;
+    int64_t reduced_w8_projection_mask_ = 0;
     std::vector<LayerWeights> layer_weights_;
     std::vector<LayerBiasNorm> layer_bias_norm_;
 
@@ -1474,21 +3012,79 @@ private:
     at::Tensor post_ln_w_, post_ln_b_;
     at::Tensor proj_w_, proj_b_;
 
-    // Model-owned DDR staging from post-LN to projector. Shape-keyed slots keep
-    // fixed DMA addresses stable across multi-shape replay and never escape.
+    // Intermediate DDR staging buffer (post-LN → DDR → projector). Shape-gated
+    // reuse is SAFE here because this tensor is a class member that never
+    // escapes to Python — no caller accumulates references to it. The
+    // per-forward spm_copy_ddr_dma writes to this stable DDR address, and the
+    // projector Linear (still inside the same main graph batch) reads from
+    // it immediately. Shape-keyed map: each (seq_len, hidden_size) gets its
+    // own slot so multi-shape REPLAY keeps every shape's DMA address valid.
     std::map<std::pair<int64_t, int64_t>, at::Tensor> temp_ddr_slots_;
 
-    // Final projector output is allocated and tracked fresh per forward.
+    // Final projector linear output — Pitfall 4: allocated fresh per forward
+    // via allocate_tracked_output({1, seq_len, projection_dim_}) in
+    // forward_packed before FMB's fast-REPLAY boundary. The v2 stable-DDR reuse
+    // pattern is structurally replaced by the framework's Pitfall 4 helper.
     at::Tensor projector_output_;
+    uint64_t projector_out_live_base_ = 0;
+
+    const bool pi05_vision_fc_weight_outer_opt_in_ =
+        !linear_acc32_ && pi05_kernel_opt_in("RPU_PI05_VISION_FC_WEIGHT_OUTER");
+    const bool pi05_ring_xor3_opt_in_ = !linear_acc32_ && pi05_kernel_opt_in("RPU_PI05_RING_XOR3");
+    const bool pi05_vision_merge_segment_opt_in_ =
+        !linear_acc32_ && pi05_kernel_opt_in("RPU_PI05_VISION_MERGE_SEGMENT");
+    const bool pi05_vision_q_resident_opt_in_ =
+        !linear_acc32_ && pi05_kernel_opt_in("RPU_PI05_VISION_Q_RESIDENT");
+    const bool pi05_vision_kv_spm_only_opt_in_ =
+        !linear_acc32_ && pi05_kernel_opt_in("RPU_PI05_VISION_KV_SPM_ONLY");
+    const bool pi05_vision_owner_ln_opt_in_ =
+        !linear_acc32_ && pi05_kernel_opt_in("RPU_PI05_VISION_OWNER_LN");
+    bool use_pi05_vision_q_resident(
+        int64_t rows, AttentionExecutionPolicy policy) const {
+        return pi05_vision_q_resident_opt_in_ &&
+            policy == AttentionExecutionPolicy::SPM_KV_BY_MHA &&
+            (image_batch_count_ == 2 || image_batch_count_ == 3) &&
+            rows == image_batch_count_ * 256 && num_cores() == 8 && num_layers() == 27 &&
+            hidden_size() == 1152 && intermediate_size() == 4352 &&
+            num_q_heads() == 16 && num_kv_heads() == 16 && head_dim() == 80 &&
+            orig_head_dim_ == 72 && pi05_vision_supported_owner();
+    }
+    bool use_pi05_ring_xor3(int64_t rows) const {
+        return pi05_ring_xor3_opt_in_ && (image_batch_count_ == 2 || image_batch_count_ == 3) &&
+            rows == image_batch_count_ * 256 && num_cores() == 8 &&
+            num_layers() == 27 && hidden_size() == 1152 && intermediate_size() == 4352 &&
+            num_q_heads() == 16 && num_kv_heads() == 16 && head_dim() == 80 &&
+            orig_head_dim_ == 72 && pi05_vision_supported_owner();
+    }
 
     // Model config
     double eps_ = 1e-6;
     int64_t projection_dim_ = 0;
     int64_t orig_head_dim_ = 0;  // SigLIP head_dim=72, padded to 80
 
-    // KV_FIRST Q staging between scatter-to-DDR and gather-to-SPM. Fixed scatter
-    // DMA binds addresses at capture, so each {seq_len, q_width} slot remains
-    // stable; q_width also separates configurations on a reused handle.
+    // Site5 (KV_FIRST state) — mirror GemmaModel. Stages Q across the two phases
+    // (Phase 1 scatters Q→DDR, Phase 2 gathers DDR→SPM "q_comp"). local_q_heads_ =
+    // num_q_heads()/NUM_CORES (set in set_weights). seq_len_ = this forward's
+    // full sequence length (the SDPA kv_seq_len, decoupled from per-chunk seq_q).
+    //
+    // keyed by seq_len so each shape keeps its OWN
+    // never-reallocated DDR address. The earlier single grow-only q_ddr_buf_ would,
+    // on a later larger-seq realloc, invalidate a smaller shape's already-captured
+    // graph: the Q save/load use FIXED scatter DMA (rpu_launch_spm_scatter_ddr_dma /
+    // ddr_scatter_spm_dma) whose kd_buf address is baked at capture and NOT refreshed
+    // by sync-only REPLAY → small→large→small alternation would read/write a freed
+    // address. Per-seq slots (mirror temp_ddr_slots_) are created once and never
+    // reallocated, so every shape's baked address stays valid. q_ddr_slot() returns
+    // this forward's slot.
+    //
+    // Key = {seq_len, q_width} with q_width = local_q_heads_ * head_dim() (cold-panel
+    // re-review): set_weights can change local_q_heads_/head_dim on a REUSED handle,
+    // and invalidate_model_state() is base-class — it does NOT clear these SigLIP
+    // slots (same blind spot the old single q_ddr_buf_ had: its realloc guard only
+    // checked size(0)=NUM_CORES + size(1)=seq_len, never the width). Without q_width
+    // in the key, a later forward at the SAME seq_len after a width change would reuse
+    // the old undersized slot while the fixed DMA stride uses the NEW width → OOB
+    // write. q_width in the key forces a fresh slot per (seq_len, width).
     std::map<std::pair<int64_t, int64_t>, at::Tensor> q_ddr_slots_;
     at::Tensor& q_ddr_slot() {
         return q_ddr_slots_.at({seq_len_, local_q_heads_ * head_dim()});
@@ -1501,6 +3097,7 @@ private:
     // in forward() from input.size(0); read in build_layer_subgraph.
     int64_t image_batch_count_ = 1;
     int64_t configured_chunk_size_ = 0;
+    bool planning_external_patch_prologue_ = false;
 
     // Patch embedding params
     at::Tensor patch_emb_weight_, patch_emb_pos_emb_;
@@ -1520,12 +3117,54 @@ private:
 
 using SigLIPRegistry = ModelHandleRegistry<v3::SigLIPModel>;
 
+std::vector<int64_t> rpu_siglip_planner_cache_identity(int64_t handle) {
+    return SigLIPRegistry::get(handle, "rpu_siglip_planner_cache_identity")
+        ->planner_cache_identity();
+}
+
+void rpu_siglip_bind_kvinsert_costs(
+        int64_t handle, at::IntArrayRef identity,
+        const std::string& catalog_sha256, at::IntArrayRef certificate_rows) {
+    SigLIPRegistry::get(handle, "rpu_siglip_bind_kvinsert_costs")
+        ->bind_kvinsert_costs(identity, catalog_sha256, certificate_rows);
+}
+
+std::tuple<std::vector<int64_t>, int64_t, int64_t>
+rpu_siglip_kvinsert_exact_candidate(
+    int64_t handle, at::IntArrayRef descriptor, int64_t site_id,
+    int64_t invocation, int64_t route) {
+    return SigLIPRegistry::get(handle, "rpu_siglip_kvinsert_exact_candidate")
+        ->mint_kvinsert_exact_candidate(descriptor, site_id, invocation, route);
+}
+
+KvInsertCostDomainQuery rpu_siglip_kvinsert_cost_domain(
+        int64_t handle, at::IntArrayRef descriptor) {
+    return SigLIPRegistry::get(handle, "rpu_siglip_kvinsert_cost_domain")
+        ->kvinsert_cost_domain("siglip", descriptor);
+}
+
+std::string rpu_siglip_kvinsert_cost_catalog_sha256(int64_t handle) {
+    return SigLIPRegistry::get(
+        handle, "rpu_siglip_kvinsert_cost_catalog_sha256")
+        ->kvinsert_cost_catalog_sha256();
+}
+
 // =============================================================================
 // Public C API for TORCH_LIBRARY_IMPL wrappers (file-scope, not namespaced)
 // =============================================================================
 
-int64_t rpu_siglip_create() {
-    return SigLIPRegistry::create();
+void rpu_siglip_set_execution_core_count(int64_t handle, int64_t cores) {
+    SigLIPRegistry::get(handle, "rpu_siglip_set_execution_core_count")
+        ->set_execution_cores(cores);
+}
+
+std::vector<int64_t> rpu_siglip_get_execution_topology(int64_t handle) {
+    return SigLIPRegistry::get(handle, "rpu_siglip_get_execution_topology")
+        ->execution_topology();
+}
+
+int64_t rpu_siglip_create(const std::optional<bool>& linear_acc32) {
+    return SigLIPRegistry::create(linear_acc32);
 }
 
 void rpu_siglip_destroy(int64_t handle) {
@@ -1610,9 +3249,42 @@ void rpu_siglip_set_chunk_size(int64_t handle, int64_t chunk_size) {
         ->set_configured_chunk_size(chunk_size);
 }
 
+void rpu_siglip_set_chunk_envelope(int64_t handle, int64_t max_kv_len, int64_t chunk) {
+    SigLIPRegistry::get(handle, "rpu_siglip_set_chunk_envelope")
+        ->set_chunk_envelope(max_kv_len, chunk);
+}
+
 int64_t rpu_siglip_get_resolved_chunk_size(int64_t handle) {
     return SigLIPRegistry::get(handle, "rpu_siglip_get_resolved_chunk_size")
         ->get_last_resolved_chunk_size();
+}
+
+int64_t rpu_siglip_resolve_chunk_size(
+    int64_t handle, int64_t seq_len, int64_t packed_image_count)
+{
+    return SigLIPRegistry::get(handle, "rpu_siglip_resolve_chunk_size")
+        ->resolve_vision_chunk_size(seq_len, packed_image_count);
+}
+
+void rpu_siglip_prepare_persistent_spm(
+    int64_t handle, int64_t seq_len, int64_t packed_image_count)
+{
+    TORCH_CHECK(seq_len > 0 && packed_image_count > 0 &&
+                    seq_len % packed_image_count == 0 &&
+                    (packed_image_count == 1 || seq_len % 16 == 0),
+                "siglip_prepare_persistent_spm: invalid packed image geometry");
+    SigLIPRegistry::get(handle, "rpu_siglip_prepare_persistent_spm")
+        ->prepare_persistent_spm(
+            seq_len, /*position=*/0, /*is_causal=*/false);
+}
+
+std::vector<int64_t> rpu_siglip_resolve_stage_domain(
+    int64_t handle, int64_t seq_len, int64_t packed_image_count,
+    bool external_patch_prologue)
+{
+    return SigLIPRegistry::get(handle, "rpu_siglip_resolve_stage_domain")
+        ->resolve_stage_domain(
+            seq_len, packed_image_count, external_patch_prologue);
 }
 
 at::Tensor rpu_siglip_patch_embed(
@@ -1633,12 +3305,13 @@ at::Tensor rpu_siglip_forward(
     int64_t handle,
     const at::Tensor& input,
     at::TensorList k_caches_list,
-    at::TensorList v_caches_list)
+    at::TensorList v_caches_list,
+    at::IntArrayRef planned_stage_descriptor)
 {
     std::vector<at::Tensor> k_caches(k_caches_list.begin(), k_caches_list.end());
     std::vector<at::Tensor> v_caches(v_caches_list.begin(), v_caches_list.end());
     return SigLIPRegistry::get(handle, "rpu_siglip")->forward(
-        input, k_caches, v_caches);
+        input, k_caches, v_caches, planned_stage_descriptor);
 }
 
 at::Tensor rpu_siglip_forward_packed(
@@ -1646,22 +3319,25 @@ at::Tensor rpu_siglip_forward_packed(
     const at::Tensor& hidden,
     int64_t image_batch_count,
     at::TensorList k_caches_list,
-    at::TensorList v_caches_list)
+    at::TensorList v_caches_list,
+    at::IntArrayRef planned_stage_descriptor)
 {
     std::vector<at::Tensor> k_caches(k_caches_list.begin(), k_caches_list.end());
     std::vector<at::Tensor> v_caches(v_caches_list.begin(), v_caches_list.end());
     return SigLIPRegistry::get(handle, "rpu_siglip")->forward_packed(
-        hidden, image_batch_count, k_caches, v_caches);
+        hidden, image_batch_count, k_caches, v_caches,
+        planned_stage_descriptor);
 }
 
 at::Tensor rpu_siglip_forward_multi(
     int64_t handle,
     at::TensorList images,
     at::TensorList k_caches_list,
-    at::TensorList v_caches_list)
+    at::TensorList v_caches_list,
+    at::IntArrayRef planned_stage_descriptor)
 {
     std::vector<at::Tensor> k_caches(k_caches_list.begin(), k_caches_list.end());
     std::vector<at::Tensor> v_caches(v_caches_list.begin(), v_caches_list.end());
     return SigLIPRegistry::get(handle, "rpu_siglip")->forward_multi(
-        images, k_caches, v_caches);
+        images, k_caches, v_caches, planned_stage_descriptor);
 }

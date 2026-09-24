@@ -51,12 +51,6 @@ constexpr size_t kSmallSize = 1048576;
 // Small allocations are packed into 2 MB buffers
 constexpr size_t kSmallBuffer = 2097152;
 
-// Large allocations between 1-10 MB may use 20 MB buffers
-constexpr size_t kLargeBuffer = 20971520;
-
-// Threshold for large buffer usage
-constexpr size_t kMinLargeAlloc = 10485760;
-
 // Round large allocations to 2 MB
 constexpr size_t kRoundLarge = 2097152;
 
@@ -130,6 +124,7 @@ struct Block {
     void* ptr{nullptr};         // Memory address
     size_t size{0};             // Block size in bytes
     size_t requested_size{0};   // Originally requested size
+    uint64_t allocation_id{0};  // Live logical-storage identity; zero when idle
     bool allocated{false};      // In-use flag
     BlockPool* pool{nullptr};   // Owning memory pool
     Block* prev{nullptr};       // Previous block if split from larger allocation
@@ -290,6 +285,10 @@ public:
 
     // Get total cached memory (reserved but not in use)
     size_t getTotalCachedMemory() const;
+
+    // Fully idle cached system mappings; exclude split segments containing
+    // live allocations.
+    int64_t getCachedSegmentCount() const;
 
     // Get singleton instance
     static RPUCachingAllocator& get();

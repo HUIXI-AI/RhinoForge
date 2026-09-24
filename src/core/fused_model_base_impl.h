@@ -1,10 +1,11 @@
-// fused_model_base_impl.h — private PImpl state container
+// fused_model_base_impl.h — PRIVATE PImpl state container (Plan 01-01 Task 2)
 //
 // Defines FusedModelBase::Impl. Included ONLY by fused_model_base.cpp.
-// Holds the internal FusedModelBase framework state.
+// Holds every internal framework-state field that used to live in v2's
+// FusedLayerBase + FusedModelBase private sections (deleted in Plan 01-07b).
 // Adding a field here does NOT change the public header.
 //
-// Two independent dirty flags (weights_dirty_ for preload_fn,
+// EXT-4 note: two independent dirty flags (weights_dirty_ for preload_fn,
 // preload_callbacks_dirty_ for Gemma path). Conflating them would cause
 // Gemma per-forward re-DMA of all norms.
 
@@ -15,6 +16,7 @@
 #include "rpu_kernel_decls.h"   // PreparedMask
 #include "rpu_spm_allocator.h"  // SpmAllocator::AllocRequest
 #include "rpu_spm_pipeline.h"
+#include "ops/rpu_kvinsert_segment_plan.h"
 #include <array>
 #include <optional>
 #include <string>
@@ -216,6 +218,27 @@ public:
         std::vector<BuildTraceCallbackRecord> callbacks;
         std::optional<BuildTraceProducerYieldRecord>
             pending_producer_yield;
+
+        // Recorded only around the actual COMPLETE manifest Branch emission.
+        // This metadata is not a persistent preload or a resolved callback.
+        uint64_t manifest_prefix_fingerprint = 0;
+        size_t manifest_prefix_begin = 0;
+        size_t manifest_prefix_end = 0;
+
+        bool composite_preload_prefix_valid() const {
+            size_t preload_begin = composite_outer_begin;
+            if (manifest_prefix_fingerprint != 0) {
+                if (manifest_prefix_begin != composite_outer_begin ||
+                    manifest_prefix_end <= manifest_prefix_begin ||
+                    manifest_prefix_end - manifest_prefix_begin != 1) {
+                    return false;
+                }
+                preload_begin = manifest_prefix_end;
+            }
+            return composite_preload_follower
+                ? preload_begin == graph_node_begin
+                : (cpu_dry || preload_begin < graph_node_begin);
+        }
     };
 
     struct CompositeOccurrenceRuntime {
@@ -237,6 +260,11 @@ public:
         uint64_t graph_signature_identity = 0;
         uint64_t graph_signature_segment_key = 0;
         bool preload_follower = false;
+        // Private, lexical same-owner preload receipt. Retained only between
+        // the three producer occurrences; never across outer Graph calls.
+        bool preload_routes_recorded = false;
+        uint64_t preload_manifest_fingerprint = 0;
+        std::vector<uint8_t> preload_route_receipt;
     };
 
     // One lexical physical-composite occurrence.  The retained lease owns all
@@ -369,19 +397,45 @@ public:
         std::unique_ptr<SpmFmbSealedCallbackYields> yields;
     };
 
-    // ===== Layer execution state =====
+    // ===== From v2 FusedLayerBase private state (v2 deleted in Plan 01-07b) =====
     bool     valid_                 = false;
     uint64_t alloc_gen_             = 0;
     uint64_t cached_persistent_gen_ = 0;  // for ensure_allocated Path 1 detection
-    uint64_t cached_preload_gen_    = 0;  // Tracks when preload_callbacks last fired.
+    uint64_t cached_preload_gen_    = 0;  // D-502 — tracks when preload_callbacks last fired
     int64_t  chunk_size_override_   = 0;
-    // Per-handle resolved chunk_size, populated by run_all_layers after
-    // compute_chunks_impl resolves a real dispatch.
+    bool     execution_reconfigure_guard_enabled_ = false;
+    KvInsertCostCatalog kvinsert_cost_catalog_;
+    struct KvCostObservation {
+        int64_t site_id = 0, graph_lifecycle = 0;
+        int64_t num_cores = 0, num_kv_heads = 0, head_dim = 0;
+        uint32_t capabilities = 0;
+        KvInsertRouteArguments arguments{};
+    };
+    struct KvCostCandidate {
+        std::vector<int64_t> descriptor;
+        std::vector<std::vector<int64_t>> rows;
+        std::string reason;
+        LayoutContext layout;
+        std::vector<int64_t> owner_prefix;
+        int64_t subclass_layout_identity = 0;
+        bool layout_bound = false;
+    };
+    // A scoped pointer to the current probe only; never a global observer.
+    std::vector<KvCostObservation>* kv_cost_observations_ = nullptr;
+    std::vector<KvCostCandidate> kv_cost_candidates_;
+    std::optional<InferenceContext> kv_cost_planning_context_;
+    KvCostLayoutScope kv_cost_layout_scope_;
+    std::vector<int64_t> kv_cost_precision_identity_;
+    size_t kv_cost_snapshot_words_ = 0;
+    uint64_t kv_cost_model_state_gen_ = 0;
+    std::string kv_cost_snapshot_reason_ = "NATIVE_STAGE_ORACLE_REQUIRED";
+    // TASK-1.5 (codex round-3 path-(b) BC2-01 closure): per-handle resolved chunk_size
+    // populated by run_all_layers after compute_chunks_impl resolves a real dispatch.
     // Default 0 = sentinel "no forward has run yet for this handle". Read via the
     // public FusedModelBase::get_last_resolved_chunk_size() accessor; surfaced to
     // Python through rpu_causal_decoder_get_resolved_chunk_size(handle) op.
     int64_t  last_resolved_chunk_size_ = 0;
-    // Certified chunk envelope. Default-constructed == UNDECLARED, and the
+    // MR-A: certified chunk envelope. Default-constructed == UNDECLARED, and the
     // participating subclasses (CausalDecoderModel, Qwen3_5Model) deny prefill on
     // an undeclared handle. Every other subclass ignores it and is unchanged.
     FusedModelBase::ChunkEnvelope chunk_envelope_{};
@@ -414,6 +468,7 @@ public:
     CompositePhysicalExecution composite_physical_execution_;
 
     int64_t  cached_params_hash_     = 0;
+    uint64_t checked_layer_body_replay_layout_hash_ = 0;
 
     // Model parameters (set by subclass via set_model_params)
     int64_t num_q_heads_         = 0;
@@ -422,22 +477,21 @@ public:
     int64_t hidden_size_         = 0;
     int64_t intermediate_size_   = 0;
     int     attn_tp_             = 8;
+    int     num_cores_           = 8;
+    int     mlp_tp_              = 8;
 
-    // ===== Model execution state =====
+    // ===== From v2 FusedModelBase private state (v2 deleted in Plan 01-07b) =====
     uint64_t model_state_gen_            = 0;
+    int64_t planner_cache_epoch_         = 0;
+    FmbPreparedStageCandidateCache prepared_stage_candidates_;
+    detail::FmbPreparedSpmCostCache prepared_spm_costs_;
     std::shared_ptr<uint64_t> outer_fast_model_generation_ =
         std::make_shared<uint64_t>(0);
     uint64_t persistent_layout_version_  = 0;  // 仅 Path 1 递增
 
-    // Dirty-flag separation — each gates a different dispatch path:
+    // EXT-4 dirty-flag separation — each gates a DIFFERENT dispatch path:
     bool weights_dirty_           = true;  // preload_fn emission; cleared after dispatch
     bool preload_callbacks_dirty_ = true;  // BufferDecl callback loop; cleared after dispatch
-
-    // Cold per-handle fast-replay policy. The environment is sampled when the
-    // native model handle is constructed, so one handle cannot process-cache
-    // the decision for a model loaded later.
-    bool global_fast_replay_enabled_ = false;
-    bool deep_fast_replay_enabled_   = false;
 
     DdrBufferRegistry registry_;
     at::Tensor       ddr_bufA_;
@@ -454,7 +508,7 @@ public:
     int64_t          batch_size_   = 0;
     // Cached last-declared buffers, so run_preload_callbacks_ can re-fire
     // without invoking declare_buffers() again (the fresh lambda captures
-    // from the most-recent declare_buffers invocation).
+    // from the most-recent declare_buffers invocation — EXT-7 rebinding path).
     std::vector<BufferDecl> last_decls_;
 
     // Transitional physical-pipeline adoption.  Offsets remain the ordinary

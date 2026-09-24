@@ -1,21 +1,50 @@
 """rpu_backend.runtime.decoder — generic decoder helpers.
 
-Private helpers consumed directly by architecture adapters. This module
-imports only from ``runtime.*`` and ``api.*``.
+Per ADR §6.4 + REQ V2D-06 + V2D-05: private helpers consumed by adapters/<arch>.py.
+This module is INTERNAL — adapters call these directly.
+
+v5-04 lift: byte-equal copy of `patch_rmsnorm_class` + `patch_rotary_embedding`
+from `_internal/patches/__init__.py`. Renamed to `_install_rmsnorm_class_swap`
++ `_install_rotary_class_swap` to make the side-effecting "install once"
+semantics explicit at the call site.
+
+v5-11 (Phase 11) NS-03 closure adds 3 more helpers absorbed from
+`_internal/patches/__init__.py` (deleted in this phase):
+  - `_install_causal_decoder_forward` (was `patch_causal_decoder_for_rpu` at :393)
+  - `_run_causal_decoder_forward` (was `_rpu_qwen3_run_forward` at :277; renamed
+    because the implementation is shared
+    cross-arch, not Qwen3-specific; "qwen3" in old name was historical misnomer)
+  - `chunk_policy_key` (MR-D; replaced `_get_chunk_size`, which read the
+    process-global chunk size that MR-D deleted)
+
+ADR §3.2 DAG: this module imports only from `runtime.*` and `api.*` (downward).
 adapters/* depends on this module (downward); runtime/decoder.py MUST NOT import
 from adapters/*.
 """
 from __future__ import annotations
 
+import json
 import os
+import sys
 import torch
-import weakref
-from typing import Type
+from typing import Any, Type
 
 from rpu_backend.runtime.log import _LOG
+from rpu_backend.runtime.control import rpu_env_bool
+from rpu_backend.runtime._native_retirement import _InstalledNativeResource
+from rpu_backend.runtime.topology import (
+    execution_core_count, resolve_decoder_topology, decoder_mlp_intermediate_size,
+    require_same_decoder_topology, validate_decoder_cache_topology,
+)
+from rpu_backend.runtime.execution_planner import (
+    GRAPH_RETAINED_CACHE,
+    PlannerRejectError,
+    native_chunk_reject,
+    plan_prefill,
+)
 
 
-# Install native RPU dispatch while preserving the original CPU behavior.
+# patch-reason: (a) RMSNorm kernel dispatch — §3a (a) run-different-op-on-RPU
 def _install_rmsnorm_class_swap(rmsnorm_class: Type) -> None:
     """
     Patch RMSNorm class to use RPU kernel when on RPU device.
@@ -29,7 +58,7 @@ def _install_rmsnorm_class_swap(rmsnorm_class: Type) -> None:
     """
     def rpu_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.device.type == "rpu":
-            # Use native PyTorch dispatch (torch.ops.rpu.rms_norm) instead of pybind11.
+            # Use native PyTorch operator dispatch for the RPU RMSNorm kernel.
             return torch.ops.rpu.rms_norm(
                 hidden_states,
                 [self.weight.shape[0]],
@@ -48,7 +77,7 @@ def _install_rmsnorm_class_swap(rmsnorm_class: Type) -> None:
     _LOG.info("Patched %s to use RPU kernel (native dispatch)", rmsnorm_class.__name__)
 
 
-# Install RPU-format RoPE output while preserving the original CPU behavior.
+# patch-reason: (a) RoPE class swap — §3a (a) run-different-op-on-RPU
 def _install_rotary_class_swap(rotary_emb_class) -> None:
     """
     Patch RotaryEmbedding class to output kernel format cos/sin on RPU, original on CPU.
@@ -70,7 +99,8 @@ def _install_rotary_class_swap(rotary_emb_class) -> None:
                 # `freqs` tensor would dispatch to. Phase precision still
                 # accumulates in fp32 (matching Gemma's reference path); only
                 # the final cos/sin are cast to fp16 when shipped to RPU.
-                # Only the final cos/sin tensors cross to the RPU.
+                # The tensors are tiny ([B, seq_len, head_dim], ~few KB) so the
+                # per-forward CPU cost is negligible vs the rotary apply kernel.
                 inv_freq_cpu = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).cpu()
                 position_ids_cpu = position_ids[:, None, :].float().cpu()
 
@@ -102,13 +132,19 @@ def _rotary_table_capacity(rotary, model) -> int:
     return max(values, default=4096)
 
 
-# Decoder helpers live here to avoid a runtime → adapters dependency.
+# ═════════════════════════════════════════════════════════════════════════
+# v5-11 NS-03 closure: 3 helpers absorbed from _internal/patches/__init__.py
+# The causal forward and chunk-size helpers belong to the runtime layer.
+# _run_causal_decoder_forward and the chunk-size helper are
+# co-located here (NOT in adapters/qwen3.py per original D-03a/b) to avoid a
+# runtime → adapters DAG violation.
+# ═════════════════════════════════════════════════════════════════════════
 
 
 def chunk_policy_key(handle: int) -> int:
     """This handle's chunk override, to be folded into its GRAPH SIGNATURE.
 
-    The chunk plan decides the SPM layout — ctx.chunk_size feeds
+    MR-D. The chunk plan decides the SPM layout — ctx.chunk_size feeds
     compute_params_hash_impl, so a policy change takes ensure_allocated's Path 1
     and re-derives every temp offset. A graph captured under one policy has that
     policy's offsets baked into its DMA descriptors, so two policies at one shape
@@ -117,7 +153,7 @@ def chunk_policy_key(handle: int) -> int:
 
     Why the override alone is enough, and why it is not the RESOLVED chunk:
       - under an explicit override, alloc_ctx.chunk_size IS the override
-        in the native allocation context, so this is exactly the discriminator;
+        (fused_model_base.cpp:742), so this is exactly the discriminator;
       - under auto (0), the resolved chunk is a function of the shape — already
         in the signature — and of the cap/envelope, which are frozen before the
         first forward (their setters check get_last_resolved_chunk_size() == 0).
@@ -128,6 +164,9 @@ def chunk_policy_key(handle: int) -> int:
     ⚠️ The "function of the shape" clause above is INCOMPLETE. See
     `prefill_position_key()` below for the half it omits.
 
+    (Replaced `_get_chunk_size()`, which read the process-global chunk size that
+    MR-D deleted. It was documented dead — no production callers — and its global
+    is gone, so it went with it.)
     """
     return int(torch.ops.rpu.causal_decoder_get_chunk_size_override(handle))
 
@@ -136,19 +175,26 @@ def prefill_position_key(seq_len: int, position: int) -> int:
     """The resume position of a MULTI-TOKEN forward, for its graph signature.
 
     `chunk_policy_key` claims the resolved chunk is, under auto, a function of
-    the shape. It is not: chunk validity depends on the KV CONTEXT LENGTH,
-    `position + execution_len`, not only `execution_len`. One shape at two
-    resume positions can therefore resolve to two chunk sizes and two SPM
-    layouts. The signature keys the input to that decision rather than relying
-    on a particular model profile to resolve both positions identically.
+    the shape. It is not: chunk validity depends on the KV CONTEXT LENGTH, which
+    is `position + execution_len`, not `execution_len`. `rpu_qwen3_model.h:120`
+    says so in as many words — "a plan resolved at position 0 can be REJECTED by
+    compute_chunks at position P". So one shape at two resume positions can
+    resolve to two chunk sizes, i.e. two SPM layouts, and the second forward
+    replays the first one's graph under a layout it was never recorded for.
 
-    Decode is deliberately exempt (`seq_len <= 1` -> 0) so successive steps
-    share one entry. Every position-derived kernel argument is mutable and
-    refreshed per replay, while the single-token SPM layout cannot change.
-    Keying decode on position would create one graph per generated token.
+    The signature must key on the input to that decision even when two
+    positions happen to resolve to the same layout for a particular model.
 
-    Prefill at position 0 also hashes to 0 and does not create a
-    position-specific cache entry.
+    DECODE IS DELIBERATELY EXEMPT (`seq_len <= 1` -> 0). P3 dropped position from
+    this signature so successive decode steps share one entry, and that reasoning
+    still holds there: every position-derived KERNEL ARG is mutable and refreshed
+    per REPLAY. What is not mutable is the SPM layout — and at seq_len=1 the
+    search range is [16, 16], so the layout cannot move. Keying decode on
+    position would put one graph per generated token in the cache, which is the
+    regression this exemption exists to prevent.
+
+    Prefill at position 0 — every single-turn caller — still hashes to 0, so no
+    existing signature changes and no cache entry is added.
     """
     return 0 if int(seq_len) <= 1 else int(position)
 
@@ -183,18 +229,186 @@ def _destroy_causal_decoder_handle(handle: int) -> None:
 
 
 _CAUSAL_DECODER_INSTALL_ATTRS = (
+    "_execution_session",
     "_rpu_deepstack_lang_layers",
     "_rpu_batch_decode_enabled",
     "_rpu_decoder_graph_cache",
     "_rpu_decoder_num_layers",
     "_rpu_decoder_hidden_size",
     "_rpu_decoder_deepstack_hash",
+    "_rpu_decoder_topology",
+    "_rpu_decode_stage_descriptor",
+    "_decoder_decode_plan",
     "_rpu_decoder_handle",
     "_rpu_decoder_handle_finalizer",
+    "_rpu_decoder_retirement_state",
     "_rpu_prefill_execution_alignment",
+    "_rpu_kv_cache_layer_bank_size",
     "_rpu_execution",
+    "_rpu_execution_generation",
     "_rpu_last_execution_plan",
 )
+
+def _bind_causal_decoder_execution_session(adapter, *, entry_point: str):
+    """Bind one retained-cache control session to a plain CausalLM owner."""
+    from rpu_backend.api._execution import (
+        _CAUSAL_DECODER_EXECUTION_SUPPORTED,
+        _cold_causal_decoder_execution,
+        bind_execution_session,
+        bind_rpu_execution,
+        native_execution_reconfigure,
+    )
+
+    model = adapter.model
+    inner = model.model
+    supported = getattr(adapter, "EXECUTION_SUPPORTED", _CAUSAL_DECODER_EXECUTION_SUPPORTED)
+    execution = bind_rpu_execution(
+        model,
+        getattr(model, "_rpu_execution", None),
+        entry_point=entry_point,
+        supported=supported,
+    )
+    existing_session = getattr(model, "_execution_session", None)
+    if existing_session is None:
+        execution = _cold_causal_decoder_execution(execution)
+    journal = {}
+
+    def native_chunk(config) -> int:
+        value = config.get("prefill", {}).get("chunk_size", "auto")
+        return 0 if value == "auto" else int(value)
+
+    def reset_graphs() -> None:
+        cache = getattr(inner, "_rpu_decoder_graph_cache", None)
+        if cache is None:
+            raise RuntimeError(
+                f"{entry_point}: live decoder has no retained GraphCache"
+            )
+        cache.begin_warmup()
+        cache.clear()
+        if not cache.cache_invariant_ok():
+            raise RuntimeError(
+                f"{entry_point}: GraphCache invariant failed during "
+                "execution reconfigure"
+            )
+        state = vars(inner)
+        state.pop("_rpu_last_a6_plan", None)
+        state.pop("_rpu_last_execution_plan", None)
+
+    def validate(config) -> None:
+        require_same_decoder_topology(model._execution_session.config, config)
+        if (bool(config.get("prefill", {}).get("linear_acc32", False)) !=
+                bool(model._execution_session.config.get("prefill", {}).get("linear_acc32", False))):
+            raise ValueError("linear_acc32 is cold-only; close and reload the model")
+        if not _causal_lm_runtime_complete(model):
+            raise RuntimeError(
+                f"{entry_point}: reconfigure requires to_rpu() to complete first"
+            )
+        adapter.preflight_execution(model.config, config)
+        required = (
+            "execution_reconfigure_begin",
+            "execution_reconfigure_commit",
+            "execution_reconfigure_abort",
+            "execution_reconfigure_abort_attempt",
+            "causal_decoder_stage_chunk_size_override",
+        )
+        missing = [name for name in required if not hasattr(torch.ops.rpu, name)]
+        if missing:
+            raise RuntimeError(
+                f"{entry_point}: binary lacks native execution-reconfigure "
+                "op(s): " + ", ".join(missing)
+            )
+
+    def apply(old, new, generation: int, *, force_rebuild=False) -> None:
+        journal.clear()
+        journal.update({
+            "mutation_started": False,
+            "graphs_touched": False,
+            "old_generation": int(
+                getattr(inner, "_rpu_execution_generation", generation - 1)
+            ),
+        })
+        old_chunk = native_chunk(old)
+        new_chunk = native_chunk(new)
+        if old_chunk != new_chunk:
+            with native_execution_reconfigure(torch.ops.rpu) as token:
+                journal["mutation_started"] = True
+                torch.ops.rpu.causal_decoder_stage_chunk_size_override(
+                    inner._rpu_decoder_handle, token, new_chunk
+                )
+
+        journal["graphs_touched"] = True
+        reset_graphs()
+        vars(inner)["_rpu_execution"] = new
+        vars(inner)["_rpu_execution_generation"] = int(generation)
+        vars(model)["_rpu_execution_generation"] = int(generation)
+
+    def rollback(old, _new, generation: int) -> None:
+        if journal.get("mutation_started", False):
+            with native_execution_reconfigure(torch.ops.rpu) as token:
+                torch.ops.rpu.causal_decoder_stage_chunk_size_override(
+                    inner._rpu_decoder_handle, token, native_chunk(old)
+                )
+        if journal.get("graphs_touched", False):
+            reset_graphs()
+        old_generation = int(journal.get("old_generation", generation))
+        vars(inner)["_rpu_execution"] = old
+        vars(inner)["_rpu_execution_generation"] = old_generation
+        vars(model)["_rpu_execution_generation"] = old_generation
+        journal.clear()
+
+    callbacks = {}
+    if existing_session is None:
+        callbacks = {
+            "validate": validate,
+            "apply": apply,
+            "rollback": rollback,
+        }
+    session = bind_execution_session(
+        model,
+        execution,
+        entry_point=entry_point,
+        supported=supported,
+        graph_mode="RETAINED_CACHE",
+        **callbacks,
+    )
+    # The public loader returns ``model``. Keep that owner, its adapter facade,
+    # and the physical inner decoder on the exact same immutable generation.
+    vars(model)["_rpu_execution"] = session.config
+    session.register_config_view(adapter)
+    session.register_config_view(inner)
+    vars(inner)["_execution_session"] = session
+    # Cold construction owns the generation on the session. Publishing private
+    # runtime metadata before the public-only preinstall scan makes a clean
+    # Qwen3/Llama model look like a partially installed or user-modified model.
+    # The installer binds again once its native decoder exists; publish both
+    # runtime mirrors then, without admitting arbitrary private cold attrs.
+    if getattr(inner, "_rpu_decoder_handle", None) is not None:
+        vars(model)["_rpu_execution_generation"] = int(session.generation)
+        vars(inner)["_rpu_execution_generation"] = int(session.generation)
+    adapter._execution_session = session
+    return session
+
+
+def _enable_causal_decoder_execution_reconfigure(inner) -> None:
+    enable = getattr(
+        torch.ops.rpu, "causal_decoder_enable_execution_reconfigure", None
+    )
+    if enable is None:
+        raise RuntimeError(
+            "RPU binary lacks causal-decoder hot-reconfigure support"
+        )
+    enable(inner._rpu_decoder_handle)
+
+
+def _new_decoder_graph_cache(topology=None, *, max_entries=None):
+    """Bind graph queue/snapshot resources to the decoder's cold core budget."""
+    from rpu_backend.graph import GraphCache, GraphRuntimePolicy
+
+    capacity = {"max_entries": max_entries} if max_entries is not None else {}
+    if topology is None:
+        return GraphCache(**capacity)
+    return GraphCache(runtime_policy=GraphRuntimePolicy.from_environment(
+        execution_core_count=topology.num_cores), **capacity)
 
 
 def _causal_lm_runtime_complete(causal_lm) -> bool:
@@ -221,10 +435,39 @@ def _causal_lm_runtime_complete(causal_lm) -> bool:
         and getattr(inner, "_rpu_decoder_num_layers", None) is not None
         and getattr(inner, "_rpu_decoder_hidden_size", None) is not None
         and getattr(inner, "_rpu_decoder_deepstack_hash", None) is not None
+        and bool(getattr(inner, "_rpu_decode_stage_descriptor", ()))
         and getattr(installed_forward, "__self__", None) is inner
         and getattr(forward_function, "__name__", None)
         == "rpu_decoder_model_forward"
     )
+
+
+def _close_causal_lm_model(model) -> None:
+    """Explicit inference teardown shared by public examples and v5."""
+    from rpu_backend.api.causal_lm import _release_live_instance
+
+    gemma4 = getattr(model, "_rpu_gemma4_retirement_state", None)
+    if gemma4 is not None or getattr(model, "_rpu_gemma4_handle", None) is not None:
+        if gemma4 is None:
+            raise RuntimeError("Gemma4 teardown requires its actual retirement state")
+        gemma4.retire_owned(model)
+        for attr in ("_rpu_gemma4_handle", "_rpu_gemma4_handle_finalizer",
+                     "_rpu_gemma4_retirement_state"):
+            vars(model).pop(attr, None)
+        _release_live_instance(model)
+    inner = getattr(model, "model", None)
+    if getattr(inner, "_rpu_decoder_handle", None) is not None:
+        # Del/GC is not retirement evidence and intentionally swallows errors.
+        def retire():
+            inner._rpu_decoder_retirement_state.retire()
+            for attr in ("_rpu_decoder_handle", "_rpu_decoder_handle_finalizer",
+                         "_rpu_decoder_graph_cache", "_rpu_decoder_retirement_state"):
+                vars(inner).pop(attr, None)
+
+        model._execution_session.shutdown(retire)
+        if hasattr(inner, "_rpu_decoder_handle"):
+            raise RuntimeError("CausalLM session closed without retiring its handle")
+        _release_live_instance(model)
 
 
 def _cleanup_causal_decoder_install(
@@ -233,28 +476,31 @@ def _cleanup_causal_decoder_install(
     had_instance_forward: bool,
     original_instance_forward,
 ) -> None:
-    """Best-effort cleanup for a failed irreversible outer adapter install."""
+    """Retire an outer failed install without hiding its original exception."""
     if inner is None:
         return
-    graph_cache = getattr(inner, "_rpu_decoder_graph_cache", None)
-    if graph_cache is not None:
+    resource = getattr(inner, "_rpu_decoder_retirement_state", None)
+    if resource is None and getattr(inner, "_rpu_decoder_handle", None) is not None:
+        raise RuntimeError("decoder cleanup requires its actual retirement state")
+    if resource is not None:
+        error = sys.exception()
+        session = getattr(inner, "_execution_session", None)
         try:
-            graph_cache.clear()
-        except Exception:
-            pass
+            if session is not None:
+                session.shutdown(resource.retire)
+            else:
+                resource.retire()
+            if resource.handle is not None:
+                raise RuntimeError("decoder session closed without retiring its handle")
+        except BaseException as cleanup_error:
+            resource.retain_failure(cleanup_error, inner)
+            if error is None:
+                raise
+            error.add_note(f"decoder cleanup failed: {cleanup_error!r}")
+            return
 
-    finalizer = getattr(inner, "_rpu_decoder_handle_finalizer", None)
-    handle = getattr(inner, "_rpu_decoder_handle", None)
-    if finalizer is not None and getattr(finalizer, "alive", False):
-        try:
-            finalizer()
-        except Exception:
-            pass
-    elif finalizer is None and handle is not None:
-        _destroy_causal_decoder_handle(handle)
-
-    # An outer publication failure can activate the model's custom
-    # hardware-attribute guard before cleanup runs. Restore plain install metadata
+    # An outer publication failure can activate the model's A9/custom
+    # attribute guard before cleanup runs. Restore plain install metadata
     # without re-entering those hooks.
     inner_state = vars(inner)
     if had_instance_forward:
@@ -265,192 +511,292 @@ def _cleanup_causal_decoder_install(
         inner_state.pop(attr, None)
 
 
-# Extra rows the plain-text prefill planner may add beyond the logical length
-# to buy a better chunk plan. Read PER FORWARD (not cached in a module constant)
-# so a test can compare the padded and unpadded plans in one process; 0 disables
-# padding entirely. Kept modest on purpose — every padded row is real compute.
-_PREFILL_PADDING_BUDGET_ENV = "RPU_CAUSAL_PREFILL_PADDING_BUDGET"
-_PREFILL_PADDING_BUDGET_DEFAULT = 64
+def _mint_planner_calibration_candidate(native, execution_len, logical_len,
+                                        position, graph_mode, row, route):
+    """Decode the real owner's admitted EXACT result while its oracle is live."""
+    from rpu_backend.runtime.execution_planner import StageTuple, _decode_native_stage_domain
+
+    descriptor, layout_hi, layout_lo = getattr(
+        torch.ops.rpu, native[0] + "_kvinsert_exact_candidate")(
+            native[1], list(row.physical_descriptor), *route)
+    if any(type(value) is not int or not 0 <= value <= 0xFFFFFFFF
+           for value in (layout_hi, layout_lo)) or not (layout_hi or layout_lo):
+        raise ValueError("native calibration requires an actual nonzero layout identity")
+    decoded, = _decode_native_stage_domain(
+        (1, 1, len(descriptor), *descriptor), execution_len=execution_len,
+        logical_len=logical_len, position=position, graph_mode=graph_mode)
+    original = row.physical_descriptor
+    stage_words = 15 + 4 * sum(original[11:14]) + 3 * original[14]
+    if tuple(descriptor[2:stage_words]) != original[2:stage_words]:
+        raise ValueError("native calibration changed the admitted chunk/span topology")
+    metadata = {**dict(row.physical_metadata), **dict(decoded.physical_metadata)}
+    if "layout_hash_hi" in metadata or "layout_hash_lo" in metadata:
+        if not {"layout_hash_hi", "layout_hash_lo"}.issubset(metadata):
+            raise ValueError("native calibration layout metadata is incomplete")
+        metadata.update(layout_hash_hi=layout_hi, layout_hash_lo=layout_lo)
+    return StageTuple.from_value(StageTuple(
+        *decoded.as_tuple(), tuple(metadata.items()), decoded.physical_descriptor))
 
 
 def plan_bounded_prefill_execution(
     real_len: int,
     physical_limit: int,
     padding_budget: int,
-    resolve_chunk_size,
-    position: int = 0,
     *,
+    resolve_stage_domain,
+    position: int = 0,
     alignment: int = 1,
     padding_rows: str | int = "auto",
     exact_chunk_size: int | None = None,
-    candidate_score=None,
+    max_stage_chunk_size: int | None = None,
+    candidate_logger=None,
+    request_id=None,
+    plan_result_sink=None,
+    graph_mode="RETAINED_CACHE",
+    queue_owner_id=0,
+    lease_owner_id=0,
+    physical_metadata=(),
+    cost_scope=None,
+    cost_certificates=(),
+    execution_owner=None,
+    execution_stage="prefill",
+    execution_component=None,
+    execution_native=None,
+    plan_signature=None,
+    graph_cache=None,
 ) -> tuple[int, int]:
-    """Choose a bounded prefill plan using the exact C++ chunk resolver.
+    """Select once per prepared semantic signature, then reuse the native plan.
 
-    Returns ``(execution_len, chunk_size)``. ``alignment`` is an adapter-owned
-    execution-length constraint: plain Qwen/Llama text uses 1, Qwen3-VL uses
-    16, and Qwen3.5 uses 64.  Chunk sizes remain 16-aligned in C++ regardless.
-    ``padding_budget`` is optional search room beyond the smallest aligned
-    execution length; an integer ``padding_rows`` selects one exact plan.
-    ``exact_chunk_size`` rejects the native resolver's otherwise-valid clamp
-    to ``ceil16(execution_len)``.  This is what lets a caller jointly request
-    an exact chunk and enough padding to make that exact chunk realizable.
-    Model-specific downstream costs may be expressed with ``candidate_score``;
-    it receives ``(execution_len, chunk_size, num_chunks, padding, tail_deficit)``.
-
-    Two levels of ordering, and they are not the same question:
-
-    * For ONE execution length the C++ query has already minimised
-      ``(num_chunks, n*cs - execution_len)`` — fewest launches, then the most
-      even split.
-    * ACROSS execution lengths this picks
-      ``(num_chunks, padding_rows, tail_deficit)``.  Padding is selected only
-      when it makes a lower-launch legal plan; equal-launch plans keep the raw
-      rows.  This prevents padding from hiding whether ordinary text really
-      supports an off-grid logical length.
-
-    A candidate whose final chunk would hold no real rows is rejected outright:
-    that is a whole launch of pure padding.
-
-    Shared by the text decoder and Qwen3-VL adapter so the two cannot drift;
-    padding itself stays out of the C++ planner.
+    Production callers explicitly declare resolver semantics in plan_signature.
+    Ownerless diagnostic queries keep their existing uncached behavior.
     """
-    real_len = int(real_len)
-    physical_limit = int(physical_limit)
-    padding_budget = int(padding_budget)
-    alignment = int(alignment)
-    position = int(position)   # reporting only; the caller binds it into
-                               # resolve_chunk_size, this is for the error text
-    if exact_chunk_size is not None:
-        if (
-            isinstance(exact_chunk_size, bool)
-            or not isinstance(exact_chunk_size, int)
-            or exact_chunk_size <= 0
-            or exact_chunk_size % 16
-        ):
-            raise ValueError(
-                "exact_chunk_size must be a positive multiple of 16, got "
-                f"{exact_chunk_size!r}"
-            )
-    if real_len <= 0:
-        raise ValueError(f"real_len must be positive, got {real_len}")
-    if padding_budget < 0:
-        raise ValueError(
-            f"padding_budget must be non-negative, got {padding_budget}"
-        )
-    if alignment < 1:
-        raise ValueError(f"alignment must be positive, got {alignment}")
-    if padding_rows != "auto":
-        if isinstance(padding_rows, bool) or not isinstance(padding_rows, int):
-            raise ValueError(
-                "padding_rows must be 'auto' or a non-negative integer, got "
-                f"{padding_rows!r}"
-            )
-        if padding_rows < 0:
-            raise ValueError(
-                f"padding_rows must be non-negative, got {padding_rows}"
+
+    if (graph_cache is not None and graph_cache.is_frozen()
+            and (plan_signature is None or execution_owner is None)):
+        raise RuntimeError("execution plan READY requires an explicit owner and semantic signature")
+
+    cost_observer = None
+    calibration = None
+    if execution_owner is not None:
+        if cost_scope is not None or cost_certificates:
+            raise ValueError("production planning cannot override its owner-local cost binding")
+        from rpu_backend.api._execution import planner_execution_context
+        cost_scope, cost_certificates, cost_observer, calibration = planner_execution_context(
+            execution_owner, execution_stage, execution_component, execution_native)
+        if calibration is not None and not calibration.domain_scoped:
+            if cost_scope is not None and cost_scope != calibration.scope:
+                raise ValueError("calibration cannot override the installed owner scope")
+            cost_scope = calibration.scope
+    elif execution_native is not None:
+        raise ValueError("native cost planning requires its actual execution owner")
+
+    if candidate_logger is None and "HALO_CHUNK_DIAG" in os.environ:
+        def candidate_logger(record):
+            _LOG.info(
+                "[A6_CHUNK_DIAG] %s",
+                json.dumps(record, sort_keys=True, default=list),
             )
 
-    base = ((real_len + alignment - 1) // alignment) * alignment
-    if padding_rows == "auto":
-        upper = min(physical_limit, base + padding_budget)
-        candidates = range(base, upper + 1, alignment)
+    physical_metadata = tuple(physical_metadata)
+    def prepare():
+        def typed_stage_domain(execution_len):
+            try:
+                return resolve_stage_domain(execution_len)
+            except PlannerRejectError:
+                raise
+            except RuntimeError as exc:
+                reject = native_chunk_reject(
+                    exc,
+                    stage="PREFILL",
+                    requested=(
+                        int(exact_chunk_size)
+                        if exact_chunk_size is not None
+                        else int(execution_len)
+                    ),
+                )
+                if reject is None:
+                    raise
+                raise reject from exc
+
+        return plan_prefill(
+            real_len,
+            physical_limit,
+            padding_budget,
+            position=position,
+            alignment=alignment,
+            padding_rows=padding_rows,
+            exact_chunk_size=exact_chunk_size,
+            max_stage_chunk_size=max_stage_chunk_size,
+            logger=candidate_logger,
+            request_id=request_id,
+            graph_mode=graph_mode,
+            queue_owner_id=queue_owner_id,
+            lease_owner_id=lease_owner_id,
+            physical_metadata=physical_metadata,
+            cost_scope=cost_scope,
+            cost_certificates=cost_certificates,
+            cost_domain_observer=(
+                (lambda length, rows: cost_observer("domain", (length, rows)))
+                if cost_observer is not None else None),
+            calibration_selection=calibration,
+            calibration_mint=(
+                (lambda length, row, route: _mint_planner_calibration_candidate(
+                    execution_native, length, int(real_len), int(position), graph_mode, row, route))
+                if calibration is not None and calibration.native_route is not None else None),
+            resolve_stage_domain=typed_stage_domain,
+        )
+
+    if plan_signature is None or execution_owner is None:
+        result = prepare()
     else:
-        execution_len = real_len + padding_rows
-        if execution_len % alignment:
-            raise ValueError(
-                f"real_len={real_len} + padding_rows={padding_rows} must be "
-                f"a multiple of execution alignment {alignment}"
-            )
-        upper = min(physical_limit, execution_len)
-        candidates = (execution_len,) if execution_len <= physical_limit else ()
-    best = None
-    # Why each candidate was dropped. Without this the caller is told only that
-    # nothing was plannable, and the planner's own reason — which distinguishes
-    # "SPM budget" from "kernel-validity" from "certified envelope", three
-    # different fixes — is swallowed by the `continue` below.
-    rejected: list[str] = []
-    for execution_len in candidates:
-        try:
-            chunk_size = int(resolve_chunk_size(execution_len))
-        except RuntimeError as e:
-            rejected.append(f"{execution_len}: {e}")
-            continue
-        if chunk_size <= 0:
-            raise RuntimeError(
-                "causal prefill planner returned non-positive "
-                f"chunk_size={chunk_size} for execution_len={execution_len}"
-            )
-        if chunk_size % 16:
-            raise RuntimeError(
-                "causal prefill planner returned non-16-aligned "
-                f"chunk_size={chunk_size} for execution_len={execution_len}"
-            )
-        if exact_chunk_size is not None and chunk_size != exact_chunk_size:
-            rejected.append(
-                f"{execution_len}: native resolver returned chunk_size="
-                f"{chunk_size}, not exact request {exact_chunk_size}"
-            )
-            continue
-        num_chunks = (execution_len + chunk_size - 1) // chunk_size
-        # Do not emit a final chunk containing only padded rows.
-        if (num_chunks - 1) * chunk_size >= real_len:
-            rejected.append(
-                f"{execution_len}: final chunk would contain only padding"
-            )
-            continue
-        padding = execution_len - real_len
-        tail_deficit = num_chunks * chunk_size - execution_len
-        score = (
-            candidate_score(
-                execution_len,
-                chunk_size,
-                num_chunks,
-                padding,
-                tail_deficit,
-            )
-            if candidate_score is not None
-            else (num_chunks, padding, tail_deficit)
-        )
-        candidate = (score, execution_len, chunk_size)
-        if best is None or score < best[0]:
-            best = candidate
-
-    if best is None:
-        hint = ""
-        if position % 16:
-            # The binding constraint is the start position, not the padded
-            # execution length, so searching longer lengths cannot help.
-            hint = (f" — position={position} is not 16-aligned, and a "
-                    f"MULTI-TOKEN forward must start on the 16 grid (a "
-                    f"1-token decode step need not). A continuation is only "
-                    f"plannable after a turn whose length was a multiple of "
-                    f"16; searching longer execution lengths will not fix it.")
-        why = ""
-        if rejected:
-            # One line per candidate length: they usually share a cause, and
-            # when they do not, the difference IS the diagnosis.
-            why = "\n  planner rejected each candidate:\n    " + "\n    ".join(
-                rejected)
-        elif not candidates:
-            why = (f"\n  no candidate was even tried: physical_limit="
-                   f"{physical_limit} is below the requested/aligned "
-                   f"execution length {base}.")
+        if execution_native is None:
+            raise ValueError("cached production planning requires its actual native owner")
+        if graph_cache is not None and (cost_observer is not None or calibration is not None):
+            if graph_cache.is_frozen():
+                raise RuntimeError("cost observation/calibration requires graph warmup, not READY execution")
+        if cost_observer is not None or calibration is not None:
+            # Collection must query the current native oracle, even when the
+            # same descriptor already has a prepared production Graph.
+            result = prepare()
         else:
-            why = ("\n  every candidate planned, but each would end in a chunk "
-                   "of pure padding.")
+            from rpu_backend.api._execution import prepared_execution_plan_cache
+
+            prefix, handle = execution_native
+            identity_op = getattr(torch.ops.rpu, f"{prefix}_planner_cache_identity", None)
+            if identity_op is None:
+                raise RuntimeError(f"{prefix}: native planner cache identity is unavailable; rebuild the backend")
+            native_identity = tuple(identity_op(handle))
+            if not native_identity:
+                raise RuntimeError("native planner cache identity must not be empty")
+            key = (
+                execution_native, native_identity, execution_component, execution_stage,
+                real_len, physical_limit, padding_budget, position, alignment,
+                padding_rows, exact_chunk_size, max_stage_chunk_size,
+                graph_mode, queue_owner_id, lease_owner_id, physical_metadata,
+                plan_signature,
+                # Installed owner costs are immutable. Native catalog changes
+                # advance native_identity; Session installation clears local
+                # preparation. Do not walk/hash the candidate-cost table here.
+                None if cost_scope is None else (
+                    cost_scope.profile_identity, cost_scope.dependency_identity,
+                    cost_scope.runtime_identity),
+            )
+            if graph_cache is not None:
+                result = graph_cache.prepare_plan(key, prepare)
+            else:
+                cache = prepared_execution_plan_cache(
+                    execution_owner, execution_stage, execution_component, prefix)
+                result = cache.prepare(key, prepare)
+    if cost_observer is not None:
+        cost_observer("result", (int(real_len), int(position), result))
+    if plan_result_sink is not None:
+        plan_result_sink(result)
+    assert result.selected is not None
+    return (
+        int(result.selected.execution_len),
+        int(result.selected.stage_tuple.compute_chunk),
+    )
+
+
+def plan_native_component_execution(
+    logical_len: int,
+    *,
+    component_id: str,
+    stage: str,
+    generation: int,
+    execution,
+    resolve_stage_domain,
+    graph_mode: str,
+    physical_metadata=(),
+    queue_owner_id: int = 0,
+    request_id: str | None = None,
+    cost_scope=None,
+    cost_certificates=(),
+    execution_owner=None,
+    execution_component=None,
+    execution_native=None,
+    plan_signature=None,
+    graph_cache=None,
+    position: int = 0,
+):
+    """Plan one exact-length component through its native finite domain."""
+    stage_config = execution.get(stage, {})
+    exact = stage_config.get("chunk_size")
+    box = {}
+    execution_len, chunk = plan_bounded_prefill_execution(
+        logical_len,
+        logical_len,
+        0,
+        resolve_stage_domain=resolve_stage_domain,
+        position=int(position),
+        alignment=1,
+        padding_rows=0,
+        exact_chunk_size=exact if isinstance(exact, int) else None,
+        graph_mode=graph_mode,
+        cost_scope=cost_scope,
+        cost_certificates=cost_certificates,
+        execution_owner=execution_owner,
+        execution_stage=stage,
+        execution_component=execution_component,
+        execution_native=execution_native,
+        plan_signature=plan_signature,
+        graph_cache=graph_cache,
+        request_id=request_id or f"{component_id}:{stage}",
+        physical_metadata=(
+            ("execution_generation", int(generation)),
+            *tuple(physical_metadata),
+        ),
+        queue_owner_id=int(queue_owner_id),
+        plan_result_sink=lambda result: box.__setitem__("result", result),
+    )
+    result = box["result"]
+    if (
+        execution_len != logical_len
+        or result.selected is None
+        or not result.selected.stage_tuple.physical_descriptor
+    ):
         raise RuntimeError(
-            "causal prefill has no safe execution plan for "
-            f"real_len={real_len}, physical_limit={physical_limit}, "
-            f"padding_budget={padding_budget}, padding_rows={padding_rows!r}, "
-            f"alignment={alignment}{hint}{why}"
+            f"{component_id} planner returned no native descriptor"
         )
-    return best[1], best[2]
+    return int(chunk), result
+
+
+def _cold_text_cost_request(owner, native, cache, request, position, *,
+                            component=None, stage="prefill"):
+    """Validate a typed cold inspection without changing installed inputs."""
+    from rpu_backend.api._execution import _planner_owner_binding, planner_cost_observer
+    from rpu_backend.runtime.execution_planner import PlannerRequest
+
+    session, component = _planner_owner_binding(owner, stage, component)
+    if session is None or planner_cost_observer(owner, stage, component, native) is None:
+        raise RuntimeError("text request inspection requires its cold cost collector")
+    session.require_cold()
+    if cache is not None and cache.position != 0:
+        raise ValueError("cold text request inspection requires an empty actual KV cache")
+    if type(position) is not int or position < 0:
+        raise ValueError("cold text planning position must be a non-negative integer")
+    if not isinstance(request, PlannerRequest):
+        raise TypeError("cold text planning requires a typed PlannerRequest")
+    fields = request.as_dict()
+    if request.padding_rows is not None:
+        if type(request.padding_budget) is not int or request.padding_budget != 0:
+            raise ValueError("exact padding cannot carry a search budget")
+        fields.pop("padding_budget")
+    normalized = PlannerRequest.from_mapping(fields)
+    if normalized != request or any(
+        type(value) is not type(normalized.as_dict()[name])
+        for name, value in request.as_dict().items()
+    ):
+        raise ValueError("cold text request must be canonically typed")
+    known = session._planner_native.get((component, stage, native[0]))
+    if known is not None and (known[0] is not owner or known[1] != native[1]):
+        raise ValueError("cold text planning changed its actual native owner")
+    return normalized, position
 
 
 def _text_prefill_execution_plan(
-    model, handle, past_key_values, seq_len: int
-) -> tuple[int, int]:
+    model, handle, past_key_values, seq_len: int, *, _cost_request=None, _cost_position=None
+) -> tuple[int, int, object]:
     """Execution length and chunk for a plain 1D-RoPE text prefill.
 
     Applies to any multi-token forward of a plain text decoder — the initial
@@ -467,18 +813,33 @@ def _text_prefill_execution_plan(
     ``physical_limit`` below is the room LEFT in the cache, not its capacity, so
     a continuation can never plan past the end.
     """
+    from rpu_backend.api._execution import (
+        _PREFILL_PADDING_BUDGET_ENV, _PREFILL_PADDING_BUDGET_DEFAULT,
+    )
+
+    inspecting = _cost_request is not None or _cost_position is not None
+    position = int(past_key_values.position)
     stage = getattr(model, "_rpu_execution", {}).get("prefill", {})
+    planning_override = ()
+    if inspecting:
+        if type(seq_len) is not int or seq_len <= 1:
+            raise ValueError("cold text prefill length must be an integer greater than one")
+        if type(handle) is not int or handle != getattr(model, "_rpu_decoder_handle", None):
+            raise ValueError("cold text planning requires its actual decoder handle")
+        request, position = _cold_text_cost_request(
+            model, ("causal_decoder", handle), past_key_values, _cost_request,
+            position if _cost_position is None else _cost_position)
+        stage = {"chunk_size": request.chunk_size or "auto",
+                 "padding_rows": "auto" if request.padding_rows is None else request.padding_rows,
+                 "padding_budget": request.padding_budget}
+        planning_override = (request.chunk_size or 0,)
     padding_rows = stage.get("padding_rows", "auto")
     if isinstance(padding_rows, int) and not isinstance(padding_rows, bool):
         budget = 0  # exact rows do not consult the optional-search budget
     else:
         try:
             budget = int(stage.get(
-                "padding_budget",
-                os.environ.get(
-                    _PREFILL_PADDING_BUDGET_ENV,
-                    _PREFILL_PADDING_BUDGET_DEFAULT,
-                ),
+                "padding_budget", _PREFILL_PADDING_BUDGET_DEFAULT
             ))
         except ValueError as exc:
             raise ValueError(
@@ -487,15 +848,20 @@ def _text_prefill_execution_plan(
             raise ValueError(
                 f"{_PREFILL_PADDING_BUDGET_ENV} must be non-negative"
             )
-    physical_limit = int(past_key_values.max_seq_len) - int(past_key_values.position)
+    physical_limit = int(past_key_values.max_seq_len) - position
+    plan_box = {}
     execution_len, chunk_size = plan_bounded_prefill_execution(
         seq_len, physical_limit, budget,
-        # The resolver takes the POSITION this forward will start at: chunk
-        # validity depends on the KV context length, so planning a
-        # continuation at 0 accepts a split compute_chunks then rejects.
-        lambda n: torch.ops.rpu.causal_decoder_resolve_prefill_chunk_size(
-            handle, n, int(past_key_values.position)),
-        position=int(past_key_values.position),
+        execution_owner=model,
+        execution_native=("causal_decoder", int(handle)),
+        plan_signature=None if inspecting else (),
+        graph_cache=getattr(model, "_rpu_decoder_graph_cache", None),
+        resolve_stage_domain=lambda n: (
+            torch.ops.rpu.causal_decoder_resolve_prefill_stage_domain(
+                handle, n, position, True, 0, 0, 1, seq_len, *planning_override
+            )
+        ),
+        position=position,
         alignment=1,
         padding_rows=padding_rows,
         exact_chunk_size=(
@@ -503,8 +869,52 @@ def _text_prefill_execution_plan(
             if isinstance(stage.get("chunk_size"), int)
             else None
         ),
+        queue_owner_id=int(handle),
+        plan_result_sink=lambda result: plan_box.__setitem__("result", result),
     )
-    return int(execution_len), int(chunk_size)
+    result = plan_box["result"]
+    if not inspecting:
+        vars(model)["_rpu_last_a6_plan"] = result.as_dict(
+            include_candidates=False
+        )
+    return int(execution_len), int(chunk_size), result
+
+
+def _text_decode_execution_plan(model, handle, *, position=0, graph_cache=None):
+    """Observe the native fixed decode ABI without adding a decode config axis.
+
+    Position zero preserves the shared mutable-position descriptor. A caller
+    with scalar position registers selects an explicit position-specific domain.
+    The shared preparation cache validates native identity and Graph READY;
+    only explicit cost observation/calibration queries need a fresh oracle.
+    """
+    native = ("causal_decoder", int(handle))
+    generation = int(getattr(model, "_rpu_execution_generation", 0))
+    position = int(position)
+    def domain(_length):
+        # Position zero preserves the generic mutable-position ABI. An owner
+        # using scalar position registers asks for a distinct COMPLETE domain.
+        descriptor = tuple(torch.ops.rpu.causal_decoder_resolve_decode_stage_descriptor(
+            handle, position) if position else
+            torch.ops.rpu.causal_decoder_resolve_decode_stage_descriptor(handle))
+        return [1, 1, len(descriptor), *descriptor]
+
+    _, result = plan_native_component_execution(
+        1, position=position, component_id="language_model", stage="decode", generation=generation,
+        execution={}, resolve_stage_domain=domain, graph_mode=GRAPH_RETAINED_CACHE,
+        queue_owner_id=int(handle), execution_owner=model, execution_native=native,
+        plan_signature=(() if position == 0 else (position,)),
+        graph_cache=(graph_cache if graph_cache is not None else
+                     getattr(model, "_rpu_decoder_graph_cache", None)),
+    )
+    descriptor = result.selected.stage_tuple.physical_descriptor
+    if position == 0:
+        vars(model)["_rpu_decode_stage_descriptor"] = tuple(descriptor)
+        # This diagnostic memo is not a second cache. Shared preparation above
+        # owns all current native/cost/generation invalidation.
+        key = (int(handle), generation, result.plan_digest, position)
+        vars(model)["_decoder_decode_plan"] = (key, result)
+    return result
 
 
 def _canonicalize_plain_text_controls(
@@ -619,7 +1029,7 @@ def _reject_unconsumed_text_padding(
 _BATCH_PREFILL_ALL_ONES_MASK = object()
 
 
-# Shared causal-decoder forward runner.
+# patch-reason: (b) Causal decoder forward runner — §3a (b)
 def _run_causal_decoder_forward(
     model,
     handle,
@@ -637,24 +1047,29 @@ def _run_causal_decoder_forward(
     rope_cos_il=None,
     rope_sin_il=None,
     prefill_plan=None,
+    decode_descriptor=None,
     batch_slot=0,
     _validated_all_ones_attention_mask=None,
     **kwargs,
 ):
     """Shared RPU forward runner for the all-layers-once causal-decoder kernel.
 
-    This body is cross-architecture and uses the generic
-    ``torch.ops.rpu.causal_decoder_forward`` operation family.
+    v5-11 Step-4 deviation rename: was `_rpu_qwen3_run_forward` at
+    `_internal/patches/__init__.py:277`. The body is genuinely cross-arch
+    (uses the generic `torch.ops.rpu.causal_decoder_forward` op family
+    renamed v5-06 D-06+D-07); the "qwen3" name was historical misnomer.
+    The shared runtime owns the architecture-independent forward path.
 
     Returns:
         (raw_tensor, past_key_values)
         raw_tensor is [batch, seq_len, hidden_size] hidden states.
-        The native operation returns hidden states; outer wrappers own any
-        shape-changing logits projection.
+        (Phase 2.5: C++ post_graph for shape-changing logits output is deferred;
+        the C++ side always returns hidden states.)
     """
     # Late import (avoids module-load circular with api.cache).
     from rpu_backend.api.cache import RPUCache
-    # The first-forward marker is idempotent.
+    # D-32 wire-point #3 (first-forward marker). Idempotent per D-22 — safe
+    # to call every forward.
     from rpu_backend.runtime.hw_attrs import mark_first_forward_done
     mark_first_forward_done(model)
 
@@ -662,7 +1077,7 @@ def _run_causal_decoder_forward(
     if (input_ids is None) == (inputs_embeds is None):
         raise AssertionError(
             "RPU all-layers-once: must provide exactly one of "
-            "input_ids or inputs_embeds"
+            "input_ids or inputs_embeds (HF contract modeling_qwen3.py:401)"
         )
 
     # past_key_values must be an RPUCache instance
@@ -674,6 +1089,8 @@ def _run_causal_decoder_forward(
             f"cache = rpu_backend.RPUCache(num_layers, batch_size, max_seq_len, "
             f"num_kv_heads, head_dim)"
         )
+    validate_decoder_cache_topology(getattr(model, "_rpu_decoder_topology", None),
+        past_key_values, batch_size=int((inputs_embeds if inputs_embeds is not None else input_ids).shape[0]))
 
     # Unsupported HF options — fail-fast instead of silent drop
     if output_attentions:
@@ -687,16 +1104,16 @@ def _run_causal_decoder_forward(
     if return_dict is False:
         raise AssertionError(
             "RPU all-layers-once: return_dict=False is not supported "
-            "because this path returns OutputWithPast"
+            "(Phase 1 only returns OutputWithPast)"
         )
     if use_cache is False:
         raise AssertionError(
             "RPU all-layers-once: use_cache=False is not supported "
-            "because this is a cache-backed inference path"
+            "in Phase 1 (caching path only; no-cache training scenario deferred)"
         )
     # cache_position is received but ignored (RPUCache.position owns position).
     _ = cache_position
-    # Forward position_ids to the native operation when Qwen3-VL M-RoPE is active.
+    # R-Phase 1 (Qwen3-VL): position_ids is forwarded to the C++ op when
     # M-RoPE is active. Non-mrope models (Qwen3 / Llama) pass position_ids=None
     # to the op — the C++ side silently ignores it.
     #
@@ -704,7 +1121,7 @@ def _run_causal_decoder_forward(
     # the C++ M-RoPE entry check expects [seq_len, 3] int32 RPU contig.
     # Normalize here so adapters don't each duplicate the reshape.
     if position_ids is not None and position_ids.dim() == 3:
-        # [3, batch, seq_len] → [seq_len, 3]; only batch==1 is supported.
+        # [3, batch, seq_len] → [seq_len, 3]; only batch==1 supported in R-Phase 1.
         if position_ids.size(0) != 3 or position_ids.size(1) != 1:
             raise AssertionError(
                 f"RPU all-layers-once: 3D position_ids must be [3, batch=1, seq_len], "
@@ -786,22 +1203,92 @@ def _run_causal_decoder_forward(
     # takes the REMAINING physical room (max_seq_len - position) as its limit.
     #
     execution_len = seq_len
+    logical_seq_len = seq_len
     planned_chunk_size = 0
-    if (seq_len > 1
-            and position_ids is None
-            and (attention_mask is None
-                 or _validated_all_ones_attention_mask
-                 is _BATCH_PREFILL_ALL_ONES_MASK)):
-        if prefill_plan is None:
-            prefill_plan = _text_prefill_execution_plan(
-                model, handle, past_key_values, seq_len)
-        execution_len, planned_chunk_size = map(int, prefill_plan)
+    planned_stage_descriptor = ()
+    # Native decode descriptors are resolved with RETAINED_CACHE at install;
+    # prefill carries the lifecycle of the A6 winner consumed below.
+    planned_graph_mode = GRAPH_RETAINED_CACHE
+    if prefill_plan is not None:
+        execution_len, planned_chunk_size, plan_result = prefill_plan
+        execution_len, planned_chunk_size = map(
+            int, (execution_len, planned_chunk_size)
+        )
+        assert plan_result.selected is not None
+        planned_stage_descriptor = (
+            plan_result.selected.stage_tuple.physical_descriptor
+        )
+        if not planned_stage_descriptor:
+            raise RuntimeError("A6 prefill winner has no native stage descriptor")
+        planned_graph_mode = plan_result.graph_mode
+    elif (seq_len > 1
+          and position_ids is None
+          and (attention_mask is None
+               or _validated_all_ones_attention_mask
+               is _BATCH_PREFILL_ALL_ONES_MASK)):
+        prefill_plan = _text_prefill_execution_plan(
+            model, handle, past_key_values, seq_len)
+        execution_len, planned_chunk_size, plan_result = prefill_plan
+        planned_stage_descriptor = (
+            plan_result.selected.stage_tuple.physical_descriptor
+        )
+        planned_graph_mode = plan_result.graph_mode
+
+    if decode_descriptor is not None:
+        if seq_len != 1 or prefill_plan is not None:
+            raise RuntimeError("an explicit decode descriptor requires a single-token decode")
+        planned_stage_descriptor = tuple(decode_descriptor)
+        if not planned_stage_descriptor:
+            raise RuntimeError("an explicit decode descriptor cannot be empty")
+
+    if seq_len == 1 and not planned_stage_descriptor:
+        planned_stage_descriptor = tuple(
+            getattr(model, "_rpu_decode_stage_descriptor", ())
+        )
+        if not planned_stage_descriptor:
+            raise RuntimeError(
+                "causal decoder decode has no installed physical descriptor"
+            )
+
+    if planned_chunk_size:
+        if seq_len <= 1:
+            raise RuntimeError(
+                "an A6 prefill plan cannot be applied to decode"
+            )
         if execution_len < seq_len:
             raise RuntimeError(
                 f"prefill execution_len={execution_len} is smaller than "
                 f"logical seq_len={seq_len}"
             )
+        # Plain text arrives at its logical length; M-RoPE composites pad
+        # embeddings, positions and visual rows before entering this runner.
+        # Both carry the same A6 winner, whose padding records the real token
+        # count. Tensor shape alone cannot determine cache/receipt semantics.
+        selected = plan_result.selected
+        logical_seq_len = int(selected.execution_len) - int(selected.padding_rows)
+        if (
+            int(selected.execution_len) != execution_len
+            or int(selected.stage_tuple.compute_chunk) != planned_chunk_size
+            or not 1 < logical_seq_len <= seq_len <= execution_len
+            or seq_len not in (logical_seq_len, execution_len)
+        ):
+            raise RuntimeError(
+                "causal prefill input/physical plan mismatch: "
+                f"input_len={seq_len}, logical_len={logical_seq_len}, "
+                f"execution_len={execution_len}, planned_chunk={planned_chunk_size}, "
+                f"selected_execution_len={selected.execution_len}, "
+                f"selected_chunk={selected.stage_tuple.compute_chunk}"
+            )
         if execution_len > seq_len:
+            if position_ids is not None or (
+                attention_mask is not None
+                and _validated_all_ones_attention_mask
+                is not _BATCH_PREFILL_ALL_ONES_MASK
+            ):
+                raise RuntimeError(
+                    "externally planned M-RoPE/masked prefill must pad all "
+                    "semantic inputs before the shared decoder call"
+                )
             hidden_states = torch.cat(
                 [hidden_states,
                  hidden_states.new_zeros(hidden_states.shape[0],
@@ -810,13 +1297,24 @@ def _run_causal_decoder_forward(
                 dim=1,
             ).contiguous()
 
-    # Forward dense visual embeddings when Qwen3-VL DeepStack is active.
+    # R-Phase 2 (Qwen3-VL): deepstack_dense_visual_embeds is forwarded to the
     # C++ op when DeepStack is active. None default → empty list (transparent
     # for Qwen3 / Llama 1D-RoPE callers). Qwen3-VL callers pass either
     # zero-keepalive views (text-only / decode) or scattered dense embeds
     # (image prefill).
     if deepstack_dense_visual_embeds is None:
         deepstack_dense_visual_embeds = []
+
+    # Packed KV tensors round storage to 16 rows. Enforce the public logical
+    # limit before native execution, including temporary prefill padding, so an
+    # overflowing decode cannot write an aligned tail before update_position().
+    if (past_key_values.position < 0 or
+            past_key_values.position + execution_len > past_key_values.max_seq_len):
+        raise ValueError(
+            "RPUCache position overflow before execution: "
+            f"position={past_key_values.position}, execution_len={execution_len}, "
+            f"max_seq_len={past_key_values.max_seq_len}"
+        )
 
     # Call the fused all-layers-once C++ op.
     # is_causal=True is HARDCODED here. See comment block above.
@@ -828,47 +1326,50 @@ def _run_causal_decoder_forward(
         attention_mask,
         past_key_values.position,
         True,  # is_causal — fused SDPA is causal-only
-        position_ids,                   # forwarded to M-RoPE; None otherwise
-        deepstack_dense_visual_embeds,  # DeepStack injection or []
+        position_ids,                   # R-Phase 1: forwarded to mrope path; None otherwise
+        deepstack_dense_visual_embeds,  # R-Phase 2: DeepStack injection (or [])
         rope_cos_il,                    # partial_mrope: host-baked interleaved cos (None → legacy
         rope_sin_il,                    #   in-kernel llama_mrope_interleave; both None = unchanged)
         -1,                             # cos_sin_offset: -1 = legacy ctx().position base
         batch_slot,                     # batch decode: KV-cache slot for this batch==1 call
         batch_decode_enabled,           # explicit per-model capability; Qwen3 only
+        0,                              # descriptor is the sole plan authority
+        planned_stage_descriptor,       # complete A6 physical winner
     )
 
     if planned_chunk_size:
-        resolved_chunk_size = int(
-            torch.ops.rpu.causal_decoder_get_resolved_chunk_size(handle)
-        )
-        if resolved_chunk_size != planned_chunk_size:
-            raise RuntimeError(
-                "causal prefill dry/forward chunk mismatch: "
-                f"planned={planned_chunk_size}, resolved={resolved_chunk_size}, "
-                f"logical_len={seq_len}, execution_len={execution_len}"
-            )
+        # The successful native call consumed this selected descriptor. FMB
+        # validates its compute/qkv capacities and schedules against the live
+        # request; querying its saved copy of that capacity adds no evidence.
+        resolved_chunk_size = int(plan_result.selected.stage_tuple.compute_chunk)
     else:
         resolved_chunk_size = int(
             torch.ops.rpu.causal_decoder_get_resolved_chunk_size(handle)
         )
 
     vars(model)["_rpu_last_execution_plan"] = {
-        "stage": "prefill" if seq_len > 1 else "decode",
-        "logical_len": int(seq_len),
+        "stage": "prefill" if logical_seq_len > 1 else "decode",
+        "component": getattr(
+            model, "_rpu_execution_component_id", "language_model"
+        ),
+        "generation": int(getattr(model, "_rpu_execution_generation", 0)),
+        "logical_len": int(logical_seq_len),
         "execution_len": int(execution_len),
         "chunk_size": resolved_chunk_size,
-        "padding_rows": int(execution_len - seq_len),
+        "padding_rows": int(execution_len - logical_seq_len),
         "position": int(past_key_values.position),
+        "physical_descriptor": tuple(planned_stage_descriptor),
+        "graph_mode": planned_graph_mode,
     }
 
     # Slice the padded tail off before anyone sees it, and advance the cache by
     # the LOGICAL length so decode continues from the real end (and overwrites
     # the first padded KV row).
-    if execution_len > seq_len:
-        raw = raw[:, :seq_len]
+    if execution_len > logical_seq_len:
+        raw = raw[:, :logical_seq_len]
 
     # Global position advance (the fused kernel does not touch RPUCache state)
-    past_key_values.update_position(seq_len)
+    past_key_values.update_position(logical_seq_len)
 
     return raw, past_key_values
 
@@ -1004,11 +1505,470 @@ def _run_batched_prefill(model, handle, capture_factory, *, past_key_values,
         raise
 
 
-# Generic CausalLM all-layers-once fusion seam shared by Qwen3 and Llama.
+# Phase 06.1 / D-6-17 (codex round-1 + round-2): generic CausalLM all-layers-once
+# fusion seam. Body shared between Qwen3 + Llama (and future Phi/Mistral).
 # Qwen3-specific q_norm/k_norm reads stay on the Qwen3 surface, behind the
 # `qk_norm_lists=` kwarg gate.
 #
-# All callers read ``_rpu_decoder_handle`` directly.
+# v5-04 HND-01: legacy per-arch handle alias removed (hard cutover per
+# ADR §10 #1). All callers now read `_rpu_decoder_handle` directly.
+# v5-11 Step-4 deviation: renamed from `patch_causal_decoder_for_rpu` to
+# `_install_causal_decoder_forward`; co-located with `_run_causal_decoder_forward`
+# (was `_rpu_qwen3_run_forward`) to satisfy ADR §3.2 DAG (runtime ↛ adapters).
+def build_mrope_cos_sin_tables(
+    text_config: Any,
+    *,
+    max_seq_len: int | None = None,
+    device: str | torch.device = "rpu",
+    dtype: torch.dtype = torch.float16,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build kernel-format M-RoPE cos/sin tables.
+
+    Shape: `[max_seq_len, head_dim / 2]` (the rotary half-dim — the kernel
+    consumes the standard 1D RoPE table; the per-axis (T/H/W) selection is
+    performed at runtime via strobe masks set by the launcher).
+
+    Args:
+        text_config: Qwen3VLTextConfig (or anything quack-compatible with
+            head_dim / num_attention_heads / hidden_size / rope_parameters).
+        max_seq_len: Defaults to `text_config.max_position_embeddings`.
+            R-Phase 1 sizes the table to match the runtime keepalive
+            (QWEN3_MROPE_MAX_KEEPALIVE_SEQ = 8192). Larger values are safe
+            but waste DDR.
+        device: target device (default "rpu").
+        dtype: target dtype (default torch.float16 — matches the kernel
+            register format).
+    """
+    head_dim = getattr(text_config, "head_dim", None)
+    if head_dim is None:
+        head_dim = text_config.hidden_size // text_config.num_attention_heads
+    if head_dim <= 0 or (head_dim % 2) != 0:
+        raise ValueError(
+            f"build_mrope_cos_sin_tables: head_dim must be positive and even, "
+            f"got {head_dim}"
+        )
+
+    # rope_parameters (transformers >=5.x) replaces rope_scaling. Try both for
+    # forward-compat with mid-flight transformers versions.
+    rope_params = getattr(text_config, "rope_parameters", None)
+    if rope_params is None:
+        rope_params = getattr(text_config, "rope_scaling", None) or {}
+    rope_type = rope_params.get("rope_type", "default")
+    if rope_type != "default":
+        # YaRN / dynamic / linear scaling cases need the corresponding HF
+        # rope_init_fn. R-Phase 1 only wires the default branch — bail loudly
+        # rather than silently produce wrong cos/sin.
+        raise NotImplementedError(
+            f"build_mrope_cos_sin_tables: rope_type={rope_type!r} not yet "
+            "supported; only 'default' for Qwen3-VL 2B/4B-Instruct is wired."
+        )
+    rope_theta = rope_params.get("rope_theta", None)
+    if rope_theta is None:
+        rope_theta = getattr(text_config, "rope_theta", 10000.0)
+
+    if max_seq_len is None:
+        max_seq_len = int(getattr(text_config, "max_position_embeddings", 8192))
+
+    half = head_dim // 2
+    inv_freq = 1.0 / (
+        rope_theta
+        ** (torch.arange(0, head_dim, 2, dtype=torch.float64) / head_dim)
+    )  # [half]
+    positions = torch.arange(max_seq_len, dtype=torch.float64)  # [max_seq]
+    freqs = positions[:, None] * inv_freq[None, :]  # [max_seq, half]
+    cos = freqs.cos().to(dtype=dtype)
+    sin = freqs.sin().to(dtype=dtype)
+    cos = cos.to(device=device).contiguous()
+    sin = sin.to(device=device).contiguous()
+    expected_shape = (max_seq_len, half)
+    if tuple(cos.shape) != expected_shape or tuple(sin.shape) != expected_shape:
+        raise RuntimeError(
+            "build_mrope_cos_sin_tables produced invalid table shapes: "
+            f"cos={tuple(cos.shape)}, sin={tuple(sin.shape)}, "
+            f"expected={expected_shape}"
+        )
+    return cos, sin
+
+
+def validate_qwen3_vl_text_semantics(text_model) -> None:
+    """Check live scalar/module semantics before admitting reduced VL text."""
+    from numbers import Integral
+    from rpu_backend.api._execution import qwen3_vl_text_core_profile
+    from transformers.activations import SiLUActivation
+
+    profile = qwen3_vl_text_core_profile(text_model.config, 4)
+    for index, layer in enumerate(text_model.layers):
+        activation = getattr(layer.mlp, "act_fn", None)
+        # Transformers5 uses its exact nn.functional.silu wrapper; earlier
+        # versions use nn.SiLU. Both have the same admitted activation math.
+        if not (type(activation) is SiLUActivation or (
+                type(activation) is torch.nn.SiLU and activation.inplace is False)):
+            raise ValueError(f"reduced-core Qwen3-VL layer {index} requires exact SiLU activation")
+        for owner, name in ((layer.self_attn, "q_norm"), (layer.self_attn, "k_norm"),
+                            (layer, "input_layernorm"), (layer, "post_attention_layernorm")):
+            if getattr(getattr(owner, name, None), "variance_epsilon", None) != 1e-6:
+                raise ValueError(f"reduced-core Qwen3-VL layer {index} {name} requires epsilon 1e-6")
+    if getattr(text_model.norm, "variance_epsilon", None) != 1e-6:
+        raise ValueError("reduced-core Qwen3-VL final norm requires epsilon 1e-6")
+
+    rotary = getattr(text_model, "rotary_emb", None)
+    section = getattr(rotary, "mrope_section", None)
+    if (getattr(rotary, "rope_type", None) != "default"
+            or getattr(rotary, "attention_scaling", None) != 1.0
+            or not isinstance(section, (list, tuple))
+            or tuple(section) != (24, 20, 20)
+            or any(isinstance(item, bool) or not isinstance(item, Integral) for item in section)
+            or qwen3_vl_text_core_profile(getattr(rotary, "config", None), 4) != profile):
+        raise ValueError("reduced-core Qwen3-VL requires exact live default interleaved M-RoPE semantics")
+
+
+def _validate_decoder_w8_scale_lists(model, scale_lists):
+    """Bind all seven INT8 projections to their actual per-channel buffers."""
+    if (scale_lists is None or len(scale_lists) != 7
+            or any(len(scales) != len(model.layers) for scales in scale_lists)):
+        raise ValueError("reduced-core W8A16 requires seven complete scale lists")
+    roles = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+             "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
+    for role, scales in zip(roles, scale_lists, strict=True):
+        for index, (layer, scale) in enumerate(zip(model.layers, scales, strict=True)):
+            projection = layer.get_submodule(role)
+            if (projection.weight.dtype != torch.int8
+                    or not isinstance(scale, torch.Tensor)
+                    or scale is not getattr(projection, "weight_scale", None)
+                    or scale.dtype != torch.float16
+                    or tuple(scale.shape) != (projection.out_features,)
+                    or not scale.is_contiguous()
+                    or scale.device != projection.weight.device):
+                raise ValueError(f"reduced-core W8A16 layer {index} {role} requires its actual INT8 weight / FP16 per-channel scale")
+
+
+def _validate_decoder_w4_scale_lists(model, scale_lists, topology):
+    """Check the exact dense/G32/TP8 packed install before native creation."""
+    from rpu_backend.quant.qwen3_profiles import qwen3_dense_quant_profile
+
+    profile = qwen3_dense_quant_profile(model.config)
+    if topology.num_cores != 8 or len(model.layers) != profile.num_layers:
+        raise ValueError("packed Qwen3 topology requires the exact dense/G32/TP8 recipe")
+    if (scale_lists is None or len(scale_lists) != 7
+            or any(len(scales) != len(model.layers) for scales in scale_lists)):
+        raise ValueError("packed Qwen3 requires seven complete G32 scale lists")
+    h, i = profile.hidden_size, profile.intermediate_size
+    q, kv = profile.num_q_heads * profile.head_dim, profile.num_kv_heads * profile.head_dim
+    roles = (("self_attn.q_proj", q, h, 1),
+             ("self_attn.k_proj", kv, h, 1),
+             ("self_attn.v_proj", kv, h, 1),
+             ("self_attn.o_proj", h, q, 0),
+             ("mlp.gate_proj", i, h, 1),
+             ("mlp.up_proj", i, h, 1),
+             ("mlp.down_proj", h, i, 0))
+    for (role, n, k, partition), scales in zip(roles, scale_lists, strict=True):
+        local_g, local_n = (k // 32, n // 8) if partition else (k // 32 // 8, n)
+        physical_scales = 8 * ((local_g + 3) // 4 * 4) * ((local_n + 63) // 64 * 64)
+        for index, (layer, scale) in enumerate(zip(model.layers, scales, strict=True)):
+            projection = layer.get_submodule(role)
+            weight = projection.weight
+            if ((projection.out_features, projection.in_features) != (n, k)
+                    or weight.dtype != torch.uint8 or tuple(weight.shape) != (n, k // 2)
+                    or not weight.is_contiguous()
+                    or not isinstance(scale, torch.Tensor)
+                    or scale is not getattr(projection, "weight_scale", None)
+                    or scale.dtype != torch.float16 or not scale.is_contiguous()
+                    or scale.device != weight.device
+                    or tuple(scale.shape) != (32, physical_scales // 32)):
+                raise ValueError(f"packed Qwen3 layer {index} {role} requires its actual UINT8/G32 payload")
+
+
+def _validate_mrope_decoder_topology(
+    model, *, config, arch, execution_config, topology, mrope_section,
+    deepstack_lang_layers, scale_lists,
+):
+    """Admit the bounded M-RoPE profile before allocating wrapper resources."""
+    if execution_core_count(execution_config) != (topology.num_cores if topology else 8):
+        raise ValueError("decoder install requires the resolved cold model topology")
+    if topology is None or topology.num_cores == 8:
+        return
+    from numbers import Integral
+    from rpu_backend.api._execution import qwen3_vl_text_core_profile
+
+    if arch != "qwen3_vl_text":
+        raise ValueError("reduced-core M-RoPE requires the exact Qwen3-VL text profile")
+    profile = qwen3_vl_text_core_profile(config, topology.num_cores)
+    bound_profile = qwen3_vl_text_core_profile(model.config, topology.num_cores)
+    w8a16 = scale_lists is not None
+    if (profile != bound_profile or len(model.layers) != profile.num_layers
+            or (w8a16 and profile.hidden_size != 2048)):
+        raise ValueError("reduced-core M-RoPE requires exact FP16 text or 2B per-channel W8A16 layers")
+    if w8a16:
+        _validate_decoder_w8_scale_lists(model, scale_lists)
+    if resolve_decoder_topology(num_cores=topology.num_cores, **profile.geometry()) != topology:
+        raise ValueError("decoder geometry differs from the bound cold topology")
+    validate_qwen3_vl_text_semantics(model)
+    for value, expected, label in (
+        (mrope_section, (24, 20, 20), "M-RoPE sections"),
+        (deepstack_lang_layers, (0, 1, 2), "DeepStack consumers"),
+    ):
+        if (value is None or tuple(value) != expected
+                or any(isinstance(item, bool) or not isinstance(item, Integral)
+                       for item in value)):
+            raise ValueError(f"reduced-core Qwen3-VL requires {label} {list(expected)}")
+    hidden = profile.hidden_size
+    intermediate = decoder_mlp_intermediate_size(profile.intermediate_size, topology.mlp_tp)
+    shapes = {
+        "q_proj": (profile.num_q_heads * profile.head_dim, hidden),
+        "k_proj": (profile.num_kv_heads * profile.head_dim, hidden),
+        "v_proj": (profile.num_kv_heads * profile.head_dim, hidden),
+        "o_proj": (hidden, profile.num_q_heads * profile.head_dim),
+        "gate_proj": (intermediate, hidden), "up_proj": (intermediate, hidden),
+        "down_proj": (hidden, intermediate),
+    }
+    projection_dtype = torch.int8 if w8a16 else torch.float16
+    for index, layer in enumerate(model.layers):
+        for owner, names in (
+            (layer.self_attn, ("q_proj", "k_proj", "v_proj", "o_proj")),
+            (layer.mlp, ("gate_proj", "up_proj", "down_proj")),
+        ):
+            for name in names:
+                projection = getattr(owner, name)
+                if (projection.weight.dtype != projection_dtype
+                        or tuple(projection.weight.shape) != shapes[name]
+                        or (projection.out_features, projection.in_features) != shapes[name]
+                        or getattr(projection, "bias", None) is not None):
+                    raise ValueError(f"reduced-core Qwen3-VL layer {index} {name} requires exact {projection_dtype} weights")
+        for norm, width in ((layer.self_attn.q_norm, profile.head_dim),
+                            (layer.self_attn.k_norm, profile.head_dim),
+                            (layer.input_layernorm, hidden),
+                            (layer.post_attention_layernorm, hidden)):
+            if norm.weight.dtype != torch.float16 or tuple(norm.weight.shape) != (width,):
+                raise ValueError(f"reduced-core Qwen3-VL layer {index} requires exact FP16 norms")
+    if model.norm.weight.dtype != torch.float16 or tuple(model.norm.weight.shape) != (hidden,):
+        raise ValueError("reduced-core Qwen3-VL requires an exact FP16 final norm")
+
+
+def install_mrope_text_decoder_for_rpu(
+    text_model,
+    *,
+    arch: str,
+    chunk_envelope_for,
+    text_config: Any | None = None,
+    max_seq_len: int | None = None,
+    vision_config: Any | None = None,
+    deepstack_lang_layers: list[int] | None = None,
+    enable_deepstack: bool = True,
+    scale_lists=None,
+    execution_config=None,
+    topology=None,
+    _kv_cache_layer_bank_size=1,
+    _graph_cache_max_entries=None,
+) -> int:
+    """Install RPU all-layers-once forward on a `Qwen3VLTextModel` instance.
+
+    Prerequisites (same as the Qwen3 path):
+      - `text_model.to('rpu')` has been called.
+      - `convert_linear_weights_inplace(text_model)` has been called.
+
+    Text path with M-RoPE and optional DeepStack injection wired through
+    `causal_decoder_set_weights`. The supported Qwen3-VL ConditionalGeneration
+    adapter composes this with the Vision tower; component/text-only callers can
+    opt out of DeepStack via `enable_deepstack=False` or an empty layer list.
+
+    Args:
+        text_model: Qwen3VLTextModel instance (already moved to RPU).
+        text_config: optional; defaults to `text_model.config`.
+        max_seq_len: cos/sin table length; defaults to
+            text_config.max_position_embeddings.
+        vision_config: optional; used only to infer the number of leading text
+            layers that receive DeepStack when `deepstack_lang_layers` is None.
+            Pass `model.config.vision_config` for end-to-end Qwen3-VL flows.
+        deepstack_lang_layers: explicit list of text-decoder layer indices that
+            receive DeepStack injection. Overrides vision_config detection.
+        enable_deepstack: false → bypass DeepStack injection regardless of
+            config (text-only smoke / R-Phase 1 fallback).
+        scale_lists: optional W8A16 per-output-channel fp16 scale tuple
+            (q,k,v,o,gate,up,down), one fp16 [out] tensor per layer per
+            projection. When provided, the decoder's 7 projection weights must
+            already be int8 (swizzled dwidth=1) and the install routes to
+            `causal_decoder_set_weights_w8a16`. None → fp16 (default).
+
+    Returns the C++ handle (also stashed at `text_model._rpu_decoder_handle`).
+    """
+    import rpu_backend
+
+    if type(_kv_cache_layer_bank_size) is not int or _kv_cache_layer_bank_size < 1:
+        raise ValueError("M-RoPE KV cache layer bank size must be a positive integer")
+    if _graph_cache_max_entries is not None and (
+        type(_graph_cache_max_entries) is not int or _graph_cache_max_entries < 1
+    ):
+        raise ValueError("_graph_cache_max_entries must be a positive integer or None")
+
+    old_resource = getattr(text_model, "_rpu_decoder_retirement_state", None)
+    if old_resource is not None:
+        old_resource.require_replaceable()
+    else:
+        from rpu_backend.api._execution import _require_execution_process_safe
+        _require_execution_process_safe()
+
+    cfg = text_config if text_config is not None else getattr(text_model, "config", None)
+    if cfg is None:
+        raise ValueError(
+            "install_qwen3_vl_text_for_rpu: text_config not provided and "
+            "text_model has no .config attribute."
+        )
+
+    rope_params = getattr(cfg, "rope_parameters", None)
+    if rope_params is None:
+        rope_params = getattr(cfg, "rope_scaling", None) or {}
+    mrope_section = rope_params.get("mrope_section", None)
+    if mrope_section is None:
+        raise ValueError(
+            "install_qwen3_vl_text_for_rpu: text_config.rope_parameters['mrope_section'] "
+            "is required (expected [T_dim_half, H_dim_half, W_dim_half])."
+        )
+    # Vision indexes select extraction blocks; HF injects those outputs into
+    # the first text layers in list order.  Caller > vision_config > [].
+    if not enable_deepstack:
+        ds_layers: list[int] = []
+    elif deepstack_lang_layers is not None:
+        ds_layers = list(deepstack_lang_layers)
+    elif vision_config is not None:
+        ds_layers = list(
+            range(len(getattr(vision_config, "deepstack_visual_indexes", [])))
+        )
+    else:
+        ds_layers = []
+
+    if (hasattr(text_model, "_rpu_decoder_handle")
+            and getattr(text_model, "_rpu_decoder_topology", None) != topology):
+        raise ValueError("decoder replacement cannot change the cold weight topology")
+    _validate_mrope_decoder_topology(
+        text_model, config=cfg, arch=arch, execution_config=execution_config,
+        topology=topology, mrope_section=mrope_section,
+        deepstack_lang_layers=ds_layers, scale_lists=scale_lists,
+    )
+    mrope_section = [int(x) for x in mrope_section]
+    ds_layers = [int(x) for x in ds_layers]
+    cos, sin = build_mrope_cos_sin_tables(
+        cfg, max_seq_len=max_seq_len, device="rpu", dtype=torch.float16,
+    )
+
+    # Capture the text decoder under its cold topology and cache capacity.
+    text_graph_cache = _new_decoder_graph_cache(
+        topology, max_entries=_graph_cache_max_entries)
+    text_num_layers = int(cfg.num_hidden_layers)
+    text_hidden_size = int(cfg.hidden_size)
+    # FNV1a-style hash of the deepstack lang-layer list — used as a
+    # tiebreaker in the GraphSignature so two models with different
+    # deepstack layouts but the same sequence shape don't alias.
+    _ds_hash = 0
+    for idx in ds_layers:
+        _ds_hash = (_ds_hash * 1099511628211) ^ int(idx)
+        _ds_hash &= (1 << 63) - 1
+    runtime_attrs = {
+        "_rpu_kv_cache_layer_bank_size": _kv_cache_layer_bank_size,
+        "_rpu_text_graph_cache": text_graph_cache,
+        "_rpu_text_num_layers": text_num_layers,
+        "_rpu_text_hidden_size": text_hidden_size,
+        "_rpu_text_deepstack_hash": _ds_hash,
+    }
+    model_vars = vars(text_model)
+    snapshot = {
+        name: (name in model_vars, model_vars.get(name))
+        for name in runtime_attrs
+    }
+
+    # Publish only pre-built, non-native wrapper state before entering the
+    # common decoder transaction. If that transaction fails, its old handle
+    # remains published and this wrapper state is restored exactly.
+    try:
+        for name, value in runtime_attrs.items():
+            setattr(text_model, name, value)
+        handle = _install_causal_decoder_forward(
+            text_model,
+            arch=arch,
+            mrope_section=mrope_section,
+            cos_sin=(cos, sin),
+            deepstack_lang_layers=ds_layers,
+            scale_lists=scale_lists,
+            chunk_envelope_for=chunk_envelope_for,
+            execution_config=execution_config,
+            topology=topology,
+            **({"_graph_cache_max_entries": _graph_cache_max_entries}
+               if _graph_cache_max_entries is not None else {}),
+        )
+    except BaseException:
+        # Rollback must not re-enter model-defined attribute hooks: the
+        # publication failure may have come from those hooks in the first
+        # place, and they may keep rejecting subsequent writes/deletes.
+        model_vars = vars(text_model)
+        for name in runtime_attrs:
+            model_vars.pop(name, None)
+        for name, (had_attr, value) in snapshot.items():
+            if had_attr:
+                model_vars[name] = value
+        raise
+
+    return handle
+
+
+def pad_mrope_prefill_inputs(
+    inputs_embeds: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    position_ids: torch.Tensor,
+    execution_len: int,
+):
+    """Right-pad token-indexed inputs to the selected execution length.
+
+    Padded rows cannot affect the logical prefix under the causal
+    lower-triangular mask (LTM).
+    """
+    logical_len = inputs_embeds.size(1)
+    pad = execution_len - logical_len
+    if pad < 0:
+        raise ValueError(
+            f"execution_len={execution_len} is smaller than logical_len={logical_len}"
+        )
+    if pad == 0:
+        return inputs_embeds, attention_mask, position_ids
+
+    inputs_embeds = torch.cat(
+        [inputs_embeds,
+         inputs_embeds.new_zeros(inputs_embeds.size(0), pad, inputs_embeds.size(2))],
+        dim=1,
+    )
+    if attention_mask is not None and attention_mask.dim() == 2:
+        if attention_mask.size(-1) != logical_len:
+            raise ValueError(
+                "M-RoPE decoder forward: 2D attention_mask length "
+                f"{attention_mask.size(-1)} != input length {logical_len}"
+            )
+        attention_mask = torch.cat(
+            [attention_mask,
+             attention_mask.new_zeros(attention_mask.size(0), pad)],
+            dim=-1,
+        )
+    if position_ids.dim() == 3 and position_ids.size(-1) == logical_len:
+        position_ids = torch.cat(
+            [position_ids,
+             position_ids[..., -1:].expand(*position_ids.shape[:-1], pad)],
+            dim=-1,
+        ).contiguous()
+    elif (
+        position_ids.dim() == 2
+        and position_ids.size(0) == logical_len
+        and position_ids.size(1) == 3
+    ):
+        position_ids = torch.cat(
+            [position_ids, position_ids[-1:].expand(pad, 3)],
+            dim=0,
+        ).contiguous()
+    else:
+        raise ValueError(
+            "M-RoPE decoder forward: position_ids must be [3, batch, seq] "
+            f"or [seq, 3] with seq={logical_len}, got "
+            f"{tuple(position_ids.shape)}"
+        )
+    return inputs_embeds, attention_mask, position_ids
+
+
 def _install_causal_decoder_forward(
     model,
     *,
@@ -1020,17 +1980,20 @@ def _install_causal_decoder_forward(
     scale_lists=None,
     chunk_envelope_for,
     execution_config=None,
+    topology=None,
+    _graph_cache_max_entries=None,
 ) -> int:
-    """Generic CausalLM all-layers-once installer shared by Qwen3 and Llama.
+    """Generic CausalLM all-layers-once installer (D-06: single shared body for Qwen3 + Llama).
 
-    The C++ kernel side accepts empty per-layer q_norm/k_norm tensor lists and routes on
+    Phase 06.1 / D-6-17 round-2 (codex HIGH-1+HIGH-2): the C++ kernel side
+    accepts empty per-layer q_norm/k_norm tensor lists post-T1.5 and routes on
     an explicit `has_qk_norm_` boolean. Qwen3 callers pass the gathered q/k norm
     lists; Llama callers pass `qk_norm_lists=None` (which materializes as empty
     lists at the C++ boundary).
 
-    **Transactional + idempotent**: a replacement handle is fully configured
-    before the old published handle is retired. Any prepare/create/set-weights
-    failure destroys only the new handle and leaves the old model state intact.
+    **Transactional + idempotent**: fully configure the replacement before
+    retiring the old install. Successful rollback preserves the old state;
+    uncertain graph/native retirement retains both installs and fails closed.
 
     Prerequisites:
       - model.to("rpu") must have been called (weights on RPU device)
@@ -1042,14 +2005,14 @@ def _install_causal_decoder_forward(
             the outer ForCausalLM wrapper).
         arch: "qwen3" — Qwen3-specific q_norm/k_norm gathered from
               model.layers[i].self_attn.q_norm/k_norm.
-              "llama" — empty q_norm/k_norm tensor lists passed to the native
-              operation (has_qk_norm_=false branch with in-place RoPE).
+              "llama" — empty q_norm/k_norm tensor lists passed to the C++ kernel
+              (has_qk_norm_=false branch; in-place RoPE per Phase 06.1 D-6-17 round-2).
               "qwen3_vl_text" — Qwen3-VL text decoder; same QK-norm layout as Qwen3,
               additionally requires `mrope_section` and kernel-format `cos_sin`.
         qk_norm_lists: Internal escape hatch — if provided (Qwen3 wrapper passes the
             tuple it already gathered), short-circuits arch-specific gather. New callers
             should pass `arch=` only.
-        mrope_section: Required for arch='qwen3_vl_text';
+        mrope_section: R-Phase 1 (Qwen3-VL). Required for arch='qwen3_vl_text';
             rejected for non-mrope archs. Forwarded as the trailing append-only
             kwarg of `causal_decoder_set_weights`.
         cos_sin: Override for the kernel-format cos/sin tables `[max_seq, head_dim/2]`.
@@ -1059,7 +2022,11 @@ def _install_causal_decoder_forward(
     Returns:
         int: The handle for this model. Also stored as `model._rpu_decoder_handle`.
     """
-    # ``qwen3_vl_text`` is the M-RoPE-enabled variant.
+    if _graph_cache_max_entries is not None and (
+        type(_graph_cache_max_entries) is not int or _graph_cache_max_entries < 1
+    ):
+        raise ValueError("_graph_cache_max_entries must be a positive integer or None")
+    # R-Phase 1 (Qwen3-VL GAP-A1): 'qwen3_vl_text' is the M-RoPE-enabled variant.
     if arch not in ("qwen3", "llama", "qwen3_vl_text"):
         raise ValueError(
             f"_install_causal_decoder_forward: arch must be 'qwen3', 'llama', "
@@ -1079,7 +2046,39 @@ def _install_causal_decoder_forward(
                 f"mrope_section must be empty for non-mrope archs"
             )
 
-    # Validate `arch` against model.config.model_type to catch caller-side
+    if execution_config is None and arch != "qwen3_vl_text":
+        execution_config = getattr(model, "_rpu_execution", None)
+    execution_config = dict(execution_config or {})
+    if execution_core_count(execution_config) != (topology.num_cores if topology else 8):
+        raise ValueError("decoder install requires the resolved cold model topology")
+    if topology is not None and arch not in ("qwen3", "qwen3_vl_text"):
+        raise ValueError("reduced-core decoder topology is admitted only by Qwen3 and Qwen3-VL")
+    if topology is not None and topology.num_cores != 8:
+        if arch == "qwen3_vl_text":
+            _validate_mrope_decoder_topology(
+                model, config=model.config, arch=arch, execution_config=execution_config,
+                topology=topology, mrope_section=mrope_section,
+                deepstack_lang_layers=deepstack_lang_layers, scale_lists=scale_lists,
+            )
+        else:
+            from rpu_backend.api._execution import qwen3_core_profile, is_qwen3_17b_w8a16_core_config
+            profile = qwen3_core_profile(model.config, topology.num_cores)
+            w8a16 = is_qwen3_17b_w8a16_core_config(model.config)
+            if len(model.layers) != profile.num_layers or (scale_lists is not None) != w8a16:
+                raise ValueError(f"reduced-core decoder install requires all {profile.num_layers} admitted FP16 or W8A16 layers")
+            if w8a16:
+                _validate_decoder_w8_scale_lists(model, scale_lists)
+            if resolve_decoder_topology(num_cores=topology.num_cores,
+                                        **profile.geometry()) != topology:
+                raise ValueError("decoder geometry differs from the bound cold topology")
+    if arch != "qwen3_vl_text" and getattr(model, "_execution_session", None) is None:
+        from rpu_backend.api._execution import _cold_causal_decoder_execution
+
+        # Direct low-level installs have no outer Session; keep their cold
+        # translation too. Bound owners already carry the authoritative view.
+        execution_config = _cold_causal_decoder_execution(execution_config)
+
+    # W-05: validate `arch` against model.config.model_type to catch caller-side
     # architecture/config mismatches. Qwen3-VL text decoder shares the qwen3
     # weight layout (same QKV / RMSNorm / SwiGLU pattern); allow it through.
     _ARCH_MAP = {"qwen3": "qwen3", "llama": "llama", "qwen3_vl_text": "qwen3_vl_text"}
@@ -1123,7 +2122,15 @@ def _install_causal_decoder_forward(
     # failed replacement into a half-installed model.
     _missing = object()
     old_handle = getattr(model, "_rpu_decoder_handle", _missing)
+    if old_handle is not _missing and getattr(model, "_rpu_decoder_topology", None) != topology:
+        raise ValueError("decoder replacement cannot change the cold weight topology")
     old_finalizer = getattr(model, "_rpu_decoder_handle_finalizer", None)
+    old_resource = getattr(model, "_rpu_decoder_retirement_state", None)
+    if old_resource is not None:
+        old_resource.require_replaceable()
+    else:
+        from rpu_backend.api._execution import _require_execution_process_safe
+        _require_execution_process_safe()
     old_install_state = {
         attr: getattr(model, attr, _missing)
         for attr in _CAUSAL_DECODER_INSTALL_ATTRS
@@ -1152,7 +2159,7 @@ def _install_causal_decoder_forward(
     if qk_norm_lists is not None:
         q_norm_list, k_norm_list = qk_norm_lists
     else:
-        q_norm_list, k_norm_list = [], []  # empty lists select the no-QK-norm path
+        q_norm_list, k_norm_list = [], []  # empty per-layer norm — kernel accepts post-T1.5
     input_norm_list   = [model.layers[i].input_layernorm.weight         for i in range(num_layers)]
     post_norm_list    = [model.layers[i].post_attention_layernorm.weight for i in range(num_layers)]
     gate_list         = [_layer_weight(i, ["mlp", "gate_proj"])         for i in range(num_layers)]
@@ -1166,6 +2173,43 @@ def _install_causal_decoder_forward(
     hidden_size = attn0.o_proj.out_features
     intermediate_size = model.layers[0].mlp.gate_proj.out_features
     eps = model.layers[0].input_layernorm.variance_epsilon
+    if topology is not None:
+        if arch == "qwen3" and any(getattr(weight, "dtype", None) == torch.uint8
+                for group in (q_w_list, k_w_list, v_w_list, o_w_list, gate_list, up_list, down_list)
+                for weight in group):
+            _validate_decoder_w4_scale_lists(model, scale_lists, topology)
+        # Model config remains logical after one-time CPU weight padding.
+        # Native admission takes logical geometry, while weight/SPM execution
+        # uses the physical width selected by the same cold template.
+        intermediate_size = model.config.intermediate_size
+        physical_intermediate = decoder_mlp_intermediate_size(intermediate_size, topology.mlp_tp)
+        actual = resolve_decoder_topology(
+            num_cores=topology.num_cores, hidden_size=hidden_size,
+            intermediate_size=intermediate_size, num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads, head_dim=head_dim,
+            vocab_size=model.config.vocab_size)
+        if actual != topology:
+            raise ValueError("decoder layer geometry does not match the bound topology")
+        for index, layer in enumerate(model.layers):
+            if physical_intermediate != intermediate_size:
+                for name, shape in (("gate_proj", (physical_intermediate, hidden_size)),
+                                    ("up_proj", (physical_intermediate, hidden_size)),
+                                    ("down_proj", (hidden_size, physical_intermediate))):
+                    projection = getattr(layer.mlp, name)
+                    if ((projection.out_features, projection.in_features) != shape
+                            or tuple(projection.weight.shape) != shape
+                            or projection.weight.dtype != torch.float16):
+                        raise ValueError(f"decoder layer {index} {name} physical MLP shape differs from cold padding")
+            for container, names, cores in (
+                (layer.self_attn, ("q_proj", "k_proj", "v_proj", "o_proj"), topology.attn_tp),
+                (layer.mlp, ("gate_proj", "up_proj", "down_proj"), topology.mlp_tp),
+            ):
+                for name in names:
+                    projection = getattr(container, name)
+                    partition = 0 if name in {"o_proj", "down_proj"} else 1
+                    if (getattr(projection, "_rpu_linear_num_cores", None) != cores or
+                            getattr(projection, "_rpu_linear_partition", None) != partition):
+                        raise ValueError(f"decoder layer {index} {name} weight layout differs from the cold topology")
 
     # cos/sin override: callers (e.g. Qwen3-VL text) can pre-compute the
     # kernel-format [max_seq, head_dim/2] tables themselves and bypass the
@@ -1188,8 +2232,12 @@ def _install_causal_decoder_forward(
         sin_cached = getattr(rotary, "sin_cached", None)
         if cos_cached is None or sin_cached is None:
             device = next(model.parameters()).device
-            # Resolve every supported rotary capacity spelling and keep the
-            # largest authoritative value.
+            # Newer HF Qwen3 rotary modules expose max_seq_len_cached/config,
+            # not max_position_embeddings directly. Falling back to 4096 here
+            # built a truncated table for a 40960-position model: P4096 prefill
+            # was correct, then decode position 4096 read past the table and
+            # produced a confidently wrong token. Read every supported spelling
+            # and keep the largest authoritative capacity.
             max_pos = _rotary_table_capacity(rotary, model)
             dummy = torch.zeros(1, 1, hidden_size, dtype=torch.float16, device=device)
             dummy_pos = torch.arange(max_pos, device=device).unsqueeze(0)
@@ -1205,11 +2253,12 @@ def _install_causal_decoder_forward(
 
     use_silu = True  # Qwen3 / Llama / Phi / Mistral all use SwiGLU (SiLU(gate) * up)
 
-    # Pass mrope_section as the trailing append-only argument. Empty means
-    # standard one-dimensional RoPE.
+    # R-Phase 1 (Qwen3-VL): pass mrope_section as the trailing append-only
+    # kwarg. Empty list for non-mrope archs preserves legacy behavior.
     mrope_section_arg = list(mrope_section) if mrope_section else []
-    # The same append-only contract applies to DeepStack language layers.
-    # Empty means no DeepStack injection.
+    # R-Phase 2 (Qwen3-VL): same append-only contract for
+    # deepstack_lang_layers. Empty default = no DeepStack injection
+    # (transparent for Qwen3 / Llama and for Qwen3-VL text-only smoke tests).
     deepstack_lang_layers_arg = (
         [int(x) for x in deepstack_lang_layers] if deepstack_lang_layers else []
     )
@@ -1241,9 +2290,9 @@ def _install_causal_decoder_forward(
             q_ws, k_ws, v_ws, o_ws, gate_ws, up_ws, down_ws,
         ])
 
-    # Create a per-instance GraphCache so the patched forward can wrap
-    # `_run_causal_decoder_forward` in `with graph_cache.capture(sig):`.
-    # Without the wrap, every operator uses passthrough submission.
+    # Own a GraphCache for the patched Qwen3 / Llama / Qwen3-VL text-only
+    # forward. Capture groups the decoder dispatches into a reusable batch
+    # instead of submitting each kernel through the immediate path.
     #
     # The Qwen3-VL e2e flow (adapters/qwen3_vl/__init__.py) bypasses this
     # patched forward and uses its own `_rpu_text_graph_cache` external
@@ -1252,12 +2301,17 @@ def _install_causal_decoder_forward(
     # this closure).
     from contextlib import nullcontext as _nullcontext
     import rpu_backend as _rb
-    decoder_graph_cache = _rb.graph.GraphCache()
-    decoder_batch_decode_enabled = arch == "qwen3"
+    decoder_graph_cache = _new_decoder_graph_cache(
+        topology, max_entries=_graph_cache_max_entries)
+    decoder_batch_decode_enabled = (
+        arch == "qwen3" and (topology is None or topology.num_cores == 8)
+        and not any(weight.dtype == torch.uint8 for weight in q_w_list)
+        and not (num_layers == 64 and hidden_size == 5120))
     decoder_num_layers = int(num_layers)
     decoder_hidden_size = int(hidden_size)
-    # FNV1a-style tiebreaker prevents plain Qwen3 and Qwen3-VL DeepStack
-    # signatures from aliasing on one model instance.
+    # FNV1a-style hash tiebreaker so plain qwen3 (empty list → 0) and
+    # qwen3-vl text-only smoke (non-empty layer list) cannot alias on a
+    # shared model instance. Mirrors adapters/qwen3_vl/text.py:194-198.
     _ds_hash = 0
     for _idx in deepstack_lang_layers_arg:
         _ds_hash = (_ds_hash * 1099511628211) ^ int(_idx)
@@ -1285,8 +2339,10 @@ def _install_causal_decoder_forward(
         # (past_key_values not RPUCache, or input_ids/inputs_embeds XOR
         # violation). `past_key_values.position` would otherwise blow up here.
         prefill_plan = None
+        decode_plan = None
         batched_prefill = _is_batched_prefill(input_ids, inputs_embeds)
         if isinstance(past_key_values, _RPUCache_for_sig):
+            validate_decoder_cache_topology(topology, past_key_values)
             if inputs_embeds is not None:
                 _batch, _seq_len = (int(inputs_embeds.shape[0]),
                                     int(inputs_embeds.shape[1]))
@@ -1294,6 +2350,7 @@ def _install_causal_decoder_forward(
                 _batch, _seq_len = int(input_ids.shape[0]), int(input_ids.shape[1])
             else:
                 _batch, _seq_len = 1, 0  # runner will raise on XOR violation
+            validate_decoder_cache_topology(topology, past_key_values, batch_size=_batch)
             if arch != "qwen3_vl_text" and not batched_prefill:
                 attention_mask, position_ids, cache_position = (
                     _canonicalize_plain_text_controls(
@@ -1334,10 +2391,12 @@ def _install_causal_decoder_forward(
                     past_key_values,
                     _seq_len,
                 )
-                _execution_len, _planned_chunk_size = prefill_plan
-            # Position is omitted from the decode signature so successive steps
-            # hit the same cached entry (first step BUILD, rest REPLAY through
-            # the sync-only fast path). This is safe because every position-derived
+                _execution_len, _planned_chunk_size = prefill_plan[:2]
+            elif _seq_len == 1:
+                decode_plan = _text_decode_execution_plan(self, self._rpu_decoder_handle)
+            # P3 — position dropped from sig so successive decode steps hit
+            # the same cached entry (first step BUILD, rest REPLAY via P2's
+            # sync-only fast path). Safe because every position-derived
             # kernel arg flows through set_regs + add_kernel_mutable and is
             # refreshed by sync_mutable_params on each REPLAY.
             # Batch, logical length and physical execution plan all key the
@@ -1346,6 +2405,11 @@ def _install_causal_decoder_forward(
                 execution_len, planned_chunk_size = (
                     (int(plan[0]), int(plan[1]))
                     if plan is not None else (int(seq_len), 0)
+                )
+                plan_key = (
+                    plan[2].graph_key_words()
+                    if plan is not None
+                    else (decode_plan.graph_key_words() if int(seq_len) == 1 else ())
                 )
                 return self._rpu_decoder_graph_cache.capture(_GraphSignature(
                     op_id="rpu_causal_decoder",
@@ -1358,11 +2422,14 @@ def _install_causal_decoder_forward(
                     dyn_dims=[
                         self._rpu_decoder_num_layers,
                         self._rpu_decoder_deepstack_hash,
+                        *(topology.identity() if topology is not None else ()),
+                        int(getattr(self, "_rpu_execution_generation", 0)),
                         chunk_policy_key(self._rpu_decoder_handle),
                         planned_chunk_size,
                         prefill_position_key(
                             execution_len, past_key_values.position
                         ),
+                        *plan_key,
                     ],
                     dtypes=[torch.float16],
                 ))
@@ -1428,38 +2495,68 @@ def _install_causal_decoder_forward(
             attentions=None,
         )
 
+    from rpu_backend.api._execution import execution_serialized
+    rpu_decoder_model_forward = execution_serialized(
+        rpu_decoder_model_forward
+    )
+
     # 2. Configure and tentatively publish the replacement while retaining a
     # complete snapshot of the old Python state. The old native handle remains
     # live until every Python assignment succeeds. Publication or old-handle
-    # retirement failure restores the snapshot and immediately finalizes the
-    # pending handle.
-    handle = torch.ops.rpu.causal_decoder_create()
-    handle_finalizer = None
-    committed = False
+    # retirement failure restores the snapshot. An unsafe retirement retains
+    # the pending handle too: no more native work is allowed in that process.
+    handle = torch.ops.rpu.causal_decoder_create(
+        rpu_env_bool("RPU_QWEN3_SPM_KV_BY_MHA", default=True),
+        rpu_env_bool("RPU_ADARMS_FUSED_BCAST"),
+        **({"num_cores": topology.num_cores, "vocab_size": model.config.vocab_size}
+           if topology is not None else {}),
+    )
+    resource = _InstalledNativeResource(
+        model, handle, torch.ops.rpu.causal_decoder_destroy,
+        graphs=(getattr(model, "_rpu_text_graph_cache", None), decoder_graph_cache),
+        keepalive=set_weights_args, label="decoder",
+        handle_name="_rpu_decoder_handle")
+    handle_finalizer = resource.finalizer
     try:
-        handle_finalizer = weakref.finalize(
-            model, _destroy_causal_decoder_handle, handle
-        )
         set_weights_op(handle, *set_weights_args)
-        # Declare the certified chunk envelope before the first forward.
+        if topology is not None:
+            native_topology = tuple(torch.ops.rpu.causal_decoder_topology(handle))
+            if native_topology != topology.identity()[1:]:
+                raise RuntimeError(
+                    "native decoder topology differs from the bound weight/cache layout: "
+                    f"actual={native_topology}, expected={topology.identity()[1:]}")
+        # MR-A: declare the certified chunk envelope BEFORE the first forward.
         # Deny-by-default — the C++ planner refuses to prefill an undeclared
         # handle, because the auto search can otherwise pick a chunk above the
-        # model's verified SPM ceiling. The caller owns the architecture-specific
-        # table so this runtime module stays architecture-independent.
+        # model's true SPM ceiling and WEDGE the board.
+        #
+        # The TABLE is not here: DAG-03 forbids arch tokens in runtime/, and it is
+        # real arch coupling (scripts/check_import_graph_v5.py:61 rejected an
+        # earlier draft that put it in runtime/chunk_envelope.py). The caller hands
+        # us the lookup; we own only the geometry, which we already derived above.
         _envelope = chunk_envelope_for(
             arch, decoder_num_layers, decoder_hidden_size)
         torch.ops.rpu.causal_decoder_set_chunk_envelope(
             handle, int(_envelope[0]), int(_envelope[1]))
 
-        execution_config = (
-            {} if execution_config is None else execution_config
-        )
         _prefill_cfg = execution_config.get("prefill", {})
+        if arch == "qwen3":
+            torch.ops.rpu.causal_decoder_set_linear_acc32(
+                handle, bool(_prefill_cfg.get("linear_acc32", False)))
         _requested_chunk = _prefill_cfg.get("chunk_size", "auto")
         torch.ops.rpu.causal_decoder_set_chunk_size_override(
             handle,
             0 if _requested_chunk == "auto" else int(_requested_chunk),
         )
+        decode_stage_descriptor = tuple(
+            torch.ops.rpu.causal_decoder_resolve_decode_stage_descriptor(
+                handle
+            )
+        )
+        if not decode_stage_descriptor:
+            raise RuntimeError(
+                "causal decoder decode planner returned an empty descriptor"
+            )
 
         model._rpu_deepstack_lang_layers = deepstack_lang_layers_arg
         model._rpu_batch_decode_enabled = decoder_batch_decode_enabled
@@ -1467,7 +2564,11 @@ def _install_causal_decoder_forward(
         model._rpu_decoder_num_layers = decoder_num_layers
         model._rpu_decoder_hidden_size = decoder_hidden_size
         model._rpu_decoder_deepstack_hash = _ds_hash
+        if topology is not None and not hasattr(model, "_rpu_decoder_topology"):
+            model._rpu_decoder_topology = topology
+        model._rpu_decode_stage_descriptor = decode_stage_descriptor
         model._rpu_decoder_handle = handle
+        model._rpu_decoder_retirement_state = resource
         model._rpu_decoder_handle_finalizer = handle_finalizer
         model._rpu_prefill_execution_alignment = (
             16 if arch == "qwen3_vl_text" else 1
@@ -1477,35 +2578,26 @@ def _install_causal_decoder_forward(
         import types
         model.forward = types.MethodType(rpu_decoder_model_forward, model)
 
-        if (
-            old_handle is not _missing
-            and (
-                old_finalizer is None
-                or getattr(old_finalizer, "alive", False)
-            )
-        ):
-            torch.ops.rpu.causal_decoder_destroy(old_handle)
-        committed = True
-    finally:
-        if not committed:
-            # Rollback uses the instance dictionary deliberately: a failing
-            # custom hardware-attribute __setattr__ is one of the publication failures
-            # this path must recover from.
-            state = vars(model)
-            for attr, old_value in old_install_state.items():
-                if old_value is _missing:
-                    state.pop(attr, None)
-                else:
-                    state[attr] = old_value
-            if had_instance_forward:
-                state["forward"] = old_instance_forward
+        if old_resource is not None:
+            old_resource.retire()
+            if old_resource.parent is not None:
+                resource.take_ownership(old_resource.parent())
+        elif old_handle is not _missing and old_handle is not None:
+            raise RuntimeError("decoder replacement requires its actual retirement state")
+    except BaseException as error:
+        resource.cleanup_failure(error, model, old_install_state, old_instance_forward)
+        # Rollback must not re-enter the attribute hook that just failed.
+        state = vars(model)
+        for attr, old_value in old_install_state.items():
+            if old_value is _missing:
+                state.pop(attr, None)
             else:
-                state.pop("forward", None)
-
-            if handle_finalizer is None:
-                _destroy_causal_decoder_handle(handle)
-            elif handle_finalizer.alive:
-                handle_finalizer()
+                state[attr] = old_value
+        if had_instance_forward:
+            state["forward"] = old_instance_forward
+        else:
+            state.pop("forward", None)
+        raise
 
     # The old callback must not outlive its retired handle. The current native
     # registry uses monotonic IDs, but detaching still preserves one callback

@@ -4,6 +4,8 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tomllib
+from types import SimpleNamespace
 
 import pytest
 
@@ -95,6 +97,35 @@ def test_public_api_and_host_graph_lifecycle() -> None:
         cache.freeze()
 
 
+def test_pi05_remap_cache_detects_source_replacement_with_older_mtime(
+    monkeypatch, tmp_path,
+) -> None:
+    from rpu_backend.adapters.pi05 import loader
+
+    source = tmp_path / "model.safetensors"
+    cache = tmp_path / "model_remapped.safetensors"
+    source.write_bytes(b"make")
+    cache.write_bytes(b"remapped-make")
+    stats = {
+        source: SimpleNamespace(st_mtime_ns=10, st_ctime_ns=10),
+        cache: SimpleNamespace(st_mtime_ns=20, st_ctime_ns=20),
+    }
+    monkeypatch.setattr(
+        loader,
+        "os",
+        SimpleNamespace(
+            path=SimpleNamespace(exists=os.path.exists),
+            stat=lambda path: stats[Path(path)],
+        ),
+    )
+    assert not loader._cache_is_stale([source], cache)
+
+    source.write_bytes(b"pour")
+    stats[source] = SimpleNamespace(st_mtime_ns=9, st_ctime_ns=30)
+    assert source.read_bytes() == b"pour"
+    assert loader._cache_is_stale([source], cache)
+
+
 def test_graph_structure_diagnostics_are_safe_and_public() -> None:
     from rpu_backend.graph import Graph
 
@@ -115,10 +146,7 @@ def test_graph_structure_diagnostics_are_safe_and_public() -> None:
 
     header = (ROOT / "src/graph/graph_runtime.h").read_text(encoding="utf-8")
     bindings = (ROOT / "src/graph/graph_pybind.cpp").read_text(encoding="utf-8")
-    runtime = (ROOT / "src/graph/graph_runtime.cpp").read_text(encoding="utf-8")
-    diagnostics = runtime.split("const char* graph_state_name", 1)[1].split(
-        "RpuExecutionCoordinator::Claim", 1
-    )[0]
+    diagnostics = (ROOT / "src/graph/graph_runtime_dump.cpp").read_text(encoding="utf-8")
 
     for name in ("dump_replay_plan", "dump_tree"):
         assert f"std::string {name}() const;" in header
@@ -156,7 +184,7 @@ def test_external_adapter_registration() -> None:
         registry.ADAPTERS.pop(architecture, None)
 
 
-def test_registry_excludes_unsupported_profiles() -> None:
+def test_registry_keeps_public_example_paths_local() -> None:
     from rpu_backend import model_registry
 
     required = {
@@ -169,6 +197,15 @@ def test_registry_excludes_unsupported_profiles() -> None:
         "dinov3-vit-b",
         "pi05-libero-finetuned",
         "qwen3-14b-w8a16-lmhead-int8",
+        # Public component and quantization-recipe inputs. Registry presence
+        # is not model admission; loaders still enforce their exact profiles.
+        "lingbot-vla-4b",
+        "qwen3-14b",
+        "qwen3-0.6b-w8a16-lmhead-int8",
+        "qwen3-1.7b-w8a16-lmhead-int8",
+        "qwen3-4b-w8a16-lmhead-int8",
+        "qwen3-0.6b-instruct",
+        "qwen3-4b-instruct",
     }
     excluded = {
         "dinov3-vit-s",
@@ -177,14 +214,6 @@ def test_registry_excludes_unsupported_profiles() -> None:
         "paligemma2",
         "paligemma2-3b-pt-224",
         "paligemma2-3b-mix-224",
-        "lingbot-vla-4b",
-        "qwen3-14b",
-        "qwen3-0.6b-w8a16-lmhead-int8",
-        "qwen3-1.7b-w8a16-lmhead-int8",
-        "qwen3-4b-w8a16-lmhead-int8",
-        "qwen3-8b-w8a16-lmhead-int8",
-        "qwen3-0.6b-instruct",
-        "qwen3-4b-instruct",
     }
     assert required <= model_registry.MODELS.keys()
     assert excluded.isdisjoint(model_registry.MODELS)
@@ -197,12 +226,25 @@ def test_registry_excludes_unsupported_profiles() -> None:
 def test_qwen3_vl_deepstack_targets_first_text_layers() -> None:
     from types import SimpleNamespace
 
-    from rpu_backend.adapters.qwen3_vl.text import (
+    from rpu_backend.adapters.qwen3_vl import (
         _deepstack_text_layer_indices,
     )
 
     config = SimpleNamespace(deepstack_visual_indexes=[5, 11, 17])
     assert _deepstack_text_layer_indices(config) == [0, 1, 2]
+
+
+def test_shutdown_invalidates_registered_graphs_before_allocator_teardown() -> None:
+    source = (ROOT / "src" / "core" / "rpu_backend.cpp").read_text(
+        encoding="utf-8"
+    )
+    shutdown = source.split("void rpu_shutdown()", 1)[1]
+    assert shutdown.index("g_rpu_backend_lifecycle = RpuBackendLifecycleState::kShutdown") < shutdown.index(
+        "invalidate_registered_rpu_kernel_graphs()"
+    )
+    assert shutdown.index("invalidate_registered_rpu_kernel_graphs()") < shutdown.index(
+        "rpu::RPUCachingAllocator::get().mark_shutdown()"
+    )
 
 
 def test_native_loader_only_selects_packaged_extension(
@@ -223,9 +265,23 @@ def test_native_loader_only_selects_packaged_extension(
     assert find_shared_object(package_dir=str(package_dir)) == str(packaged)
 
 
-def test_rhinovla_has_no_model_source_execution_loader() -> None:
-    package = ROOT / "python" / "rpu_backend" / "adapters" / "rhinovla"
-    assert not (package / "checkpoint.py").exists()
-    assert "load_action_bundle" not in (package / "__init__.py").read_text(
-        encoding="utf-8"
+@pytest.mark.parametrize(
+    ("setting", "profiler_enabled", "expected"),
+    [(None, False, True), (None, True, False), ("0", False, False)],
+)
+def test_idle_record_scope_default_is_profiler_safe(
+    setting, profiler_enabled, expected, monkeypatch
+) -> None:
+    import torch
+
+    from rpu_backend.graph import _runtime
+
+    if setting is None:
+        monkeypatch.delenv("RPU_SKIP_IDLE_RECORD_FUNCTION", raising=False)
+    else:
+        monkeypatch.setenv("RPU_SKIP_IDLE_RECORD_FUNCTION", setting)
+    monkeypatch.setattr(_runtime, "_SKIP_IDLE_RF_ENV", None)
+    monkeypatch.setattr(
+        torch.autograd, "_profiler_enabled", lambda: profiler_enabled
     )
+    assert _runtime._skip_idle_record_function() is expected

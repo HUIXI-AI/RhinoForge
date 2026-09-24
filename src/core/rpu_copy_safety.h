@@ -1,11 +1,12 @@
-// rpu_copy_safety.h — copy-capture safety checks and counter.
+// rpu_copy_safety.h — Wave 3 方式 A 安全判定 + copy counter
+// 被 rpu_memcpy_ops.cpp 引用，判定 rpu_memcpy / rpu_memset 是否可安全走 capture_data。
 #pragma once
 
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 
-// Safety criteria:
+// 判定标准（todo.md §Wave3，简化版，不引入 RegisteredPtrSet）：
 //   bytes == 0              → safe（no-op）
 //   bytes > 128 MB          → unsafe（异常大块，单 frame 不应出现）
 //   dst/src 区间重叠        → unsafe（memcpy UB，capture_data 无法保持语义）
@@ -51,7 +52,7 @@ inline bool is_unsafe_memset(void* dst, size_t bytes) {
     return rpu_copy_safety_detail::near_stack(dst, a);
 }
 
-// CopyCounter — profiling counters for capture and execution paths.
+// CopyCounter — 累积计数，供 profile / Wave 4 E2E 验证用
 // 前四类是 capture-time 分类;后面是 execute-time DMA 计数,用来区分
 // "node 被分类为 DMA-able" 和 "DMA 路径真的在 replay/oneshot 时跑过"。
 struct CopyCounter {
@@ -59,7 +60,7 @@ struct CopyCounter {
     std::atomic<uint64_t> eager_fallback{0};    // RECORDING unsafe: sync_point + eager
     std::atomic<uint64_t> blocked{0};           // REPLAYING unsafe: TORCH_CHECK(false)
     std::atomic<uint64_t> passthrough{0};       // PASSTHROUGH eager
-    std::atomic<uint64_t> dma_ddr_to_ddr{0};    // execute-time CopyMemoryChannel count
+    std::atomic<uint64_t> dma_ddr_to_ddr{0};    // T2' execute-time: CopyMemoryChannel fired
     std::atomic<uint64_t> dma_ddr_to_spm{0};    // reserved until sliced SPM↔DDR DMA exists
     std::atomic<uint64_t> dma_spm_to_ddr{0};    // reserved until sliced SPM↔DDR DMA exists
 

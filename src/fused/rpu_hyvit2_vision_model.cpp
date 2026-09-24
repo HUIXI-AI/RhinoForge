@@ -1,5 +1,5 @@
 // rpu_hyvit2_vision_model.cpp — HYViT2-400M AnyRes ViT，all-layers-once
-// (v3 FusedModelBase)。与 `rpu_siglip_model.cpp` 共享主体结构。
+// (v3 FusedModelBase)。**自 `rpu_siglip_model.cpp` 派生**。
 //
 // 为什么派生而不是复用：HYViT2 与 SigLIP-so400m 的几何完全相同
 // (hidden 1152 / 27 层 / 16 heads / head_dim 72 / intermediate 4304)，block 结构也同式
@@ -13,19 +13,22 @@
 // HYViT2 在动作路径上没有 post-norm（`_HYViT2VisionTransformer.forward_head` 因
 // `cal_attn_pool=False` 是死代码，encoder 输出直接进 tower 外的 merger）。
 // 不能用"传 identity 权重"绕过：LayerNorm(w=1,b=0) 仍执行 (x-mean)/std，
-// 且逐行非线性、无法用任何权重取值抵消。
+// 这是逐行非线性变换，无法用 identity 权重抵消。
 // 故 `set_weights` 相比 SigLIP 少了 `post_ln_w/post_ln_b` 两个参数（24 个而非 26）。
 // projector 槽接 merger 的 `proj1 [2048,1152]`（逐 token 纯 Linear，与 SigLIP projector 同语义）；
-// merger 余下的 DwPooler→GELU→proj2 由 host 承担。
+// merger 余下的 DwPooler→GELU→proj2 由独立 merger 路径承担。
 //
 // 其他与 SigLIP 的共性约束（padding / scale / 打包）：
 //   - Python 侧把 fused qkv [3456,1152] 按 [3, heads, head_dim] 拆成 q/k/v；
 //     head_dim 72→80、intermediate 4304→4352 补零（与 adapters/siglip.py 同式）。
 //   - ⚠️ attention scale 用 ORIG head_dim=72，不是 padded 的 80（见下方 orig_head_dim_）。
-//   - 推理路径上每次 forward 只处理 1 张图（seq=196，image_batch_count_=1）；
-//     多图打包不走这条路。
+//   - 单图路径的 seq=196、image_batch_count_=1；多图打包使用独立布局。
 //
-// 下方注释说明与 SigLIP 共用的 preload_fn、KV_FIRST 和缓冲区生命周期契约。
+// 下面保留的注释来自 SigLIP 原文件，用于说明框架契约的来龙去脉（D-501 preload_fn、
+// KV_FIRST 重构、Pitfall 2/3/4 的结构性缓解等），对本文件同样适用。
+//
+// ============================ 以下为 SigLIP 原始设计注释 ============================
+//
 #include "fused_model_base.h"
 #include "model_handle_registry.h"
 #include "rpu_ops.h"
@@ -34,6 +37,7 @@
 #include "rpu_spm_allocator.h"
 #include <ATen/record_function.h>
 #include <c10/util/Half.h>
+#include <c10/util/ScopeExit.h>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -44,151 +48,86 @@
 #include <map>
 #include <utility>
 
-// ─────────────────────────────────────────────────────────────────────────────
-// RPU_HY_VLA_FAST_REPLAY —— **逐座 opt-in** 的 fast-replay，默认 OFF。
+// RPU_HY_VLA_FAST_REPLAY is a per-component opt-in. Skipping the host op walk
+// requires stable kernel-register addresses and no body-local host side effects.
+// Request changes must reach stable position/mask buffers or mutable DMA bases.
+// RPU_HY_VLA_FAST_REPLAY_PRELOAD additionally skips clean-weight preload emission;
+// the built graph still executes the preload DMAs into persistent SPM.
 //
-// 打开后 REPLAY 期不再重走该座的 op stream，避免逐帧重新 emit 节点的 host 开销。
+// RPU_HY_VLA_MASK_ONCE preserves a request's mask across layers. Its storage must
+// move from Compute to LayerWide as well as extending its phase lifetime:
+// KvInsert and Compute scopes may alias even when their phase ranges overlap.
 //
-// ⚠️ 契约：**body 不得有 kernel 会读的
-// per-call host 副作用**。合法出口只有：position_ids 的稳定 keepalive、
-// dynamic_config 拷进稳定 DDR 槽的显式 2D mask、`hidden_in_src_base_` 与
-// op 序言里 `*_mutable(&member)` 的可变基址。
+// RPU_HY_VLA_Q_INPLACE applies to the single-chunk KV_FIRST schedule. Phase 1
+// produces Q immediately before Phase 2 consumes it, so q_comp can alias q_kv
+// instead of round-tripping through DDR. q_kv must be LayerWide and live through
+// phase 6; otherwise SDPA scratch may overwrite it. The temporary estimate
+// changes from max(2*qkv+tmp, fc1) to max(qkv+tmp, fc1).
 //
-// 该开关按子系统独立控制，避免多个变化同时启用后无法定位问题。
-// 取值：逗号分隔的座名（vit / vlm / expert），或 1/on/true 表示三座全开。
-// ─────────────────────────────────────────────────────────────────────────────
-static bool hyvla_fast_replay_on(const char* who) {
-    static const std::string v = [] {
-        const char* e = std::getenv("RPU_HY_VLA_FAST_REPLAY");
-        return std::string(e ? e : "");
-    }();
-    if (v.empty() || v == "0" || v == "off" || v == "false") return false;
-    if (v == "1" || v == "on" || v == "true") return true;
-    return v.find(who) != std::string::npos;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// RPU_HY_VLA_FAST_REPLAY_PRELOAD —— 同样**逐座 opt-in**，默认 OFF。
-// 打开后在 REPLAY（且权重 clean）跳过 preload 回调与 `preload_fn` 的
-// host 重走 —— 已建好的 preload DMA 节点仍由 segment launch 重放到同一块
-// persistent SPM，逐位不变。
-// 依赖 `fast_replay_skip_layer_loop` 一起开（框架内部与它 AND）。
-// ─────────────────────────────────────────────────────────────────────────────
-static bool hyvla_fast_replay_preload_on(const char* who) {
-    static const std::string v = [] {
-        const char* e = std::getenv("RPU_HY_VLA_FAST_REPLAY_PRELOAD");
-        return std::string(e ? e : "");
-    }();
-    if (v.empty() || v == "0" || v == "off" || v == "false") return false;
-    if (v == "1" || v == "on" || v == "true") return true;
-    return v.find(who) != std::string::npos;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// RPU_HY_VLA_MASK_ONCE —— 同样**逐座 opt-in**，默认 OFF。
-// 打包 3 图后本座的块对角 2D mask 是 [588,592] = 696 KB/核，且逐层恒定。
-// 其机制与其他子系统的同名开关一致。
-//
-// ⚠️ 本座与 VLM/expert 有一处**关键差别**：这里的 `sdpa_mask` 原本声明在
-// `Compute` 域，而分配器规定 `KvInsert` 与 `Compute` **恒不冲突**
-// —— 只把相位撑满、留在 Compute 域，
-// 下一层 Phase 1 的 `q_kv/k/v` 照样会压在同一段地址上、静默读到坏 mask。
-// 所以打开时必须**同时**把它挪到 `LayerWide`。代价是不再能与 `fc1`（相 7..8）
-// 混叠，本座 SPM 峰值 +696 KB。
-// ─────────────────────────────────────────────────────────────────────────────
-static bool hyvla_mask_once_on(const char* who) {
-    static const std::string v = [] {
-        const char* e = std::getenv("RPU_HY_VLA_MASK_ONCE");
-        return std::string(e ? e : "");
-    }();
-    if (v.empty() || v == "0" || v == "off" || v == "false") return false;
-    if (v == "1" || v == "on" || v == "true") return true;
-    return v.find(who) != std::string::npos;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// RPU_HY_VLA_Q_INPLACE —— 单 chunk 专用，默认 OFF。
-// 打开后 Q 保持在 LayerWide SPM 直到 SDPA 消费，q_comp alias 到 q_kv，
-// 省略相间的 Q staging DMA。q_kv 必须使用 LayerWide scope，避免与 Compute
-// 临时区混叠。
-// ─────────────────────────────────────────────────────────────────────────────
-// RPU_HY_VLA_KVPAD16 —— 逐座 opt-in，默认 OFF。把 k/v 槽行容量向上补齐
-// 到 v16 边界；逻辑 KV 长度不变。
-static bool hyvla_kvpad16_on(const char* who) {
-    static const std::string v = [] {
-        const char* e = std::getenv("RPU_HY_VLA_KVPAD16");
-        return std::string(e ? e : "");
-    }();
-    if (v.empty() || v == "0" || v == "off" || v == "false") return false;
-    if (v == "1" || v == "on" || v == "true") return true;
-    return v.find(who) != std::string::npos;
-}
-
-static bool hyvla_q_inplace_on() {
-    static const bool on = [] {
-        const char* e = std::getenv("RPU_HY_VLA_Q_INPLACE");
-        const std::string v(e ? e : "");
-        return !(v.empty() || v == "0" || v == "off" || v == "false");
-    }();
-    return on;
-}
-
-// RPU_HY_VLA_FUSED_MERGER —— 全局默认 OFF。打开后 ViT 尾部在 proj1 之前把行序换成
-// member-major（两次 permute3d），tower 外 merger 的组轴改走
-// `rpu.hyvla_merger_pool` / `_combine` 两个 op。**Python 与 C++ 必须同开同关**：
-// 它改的是行布局，不是数值。
-static bool hyvla_fused_merger_on() {
-    static const bool on = [] {
-        const char* e = std::getenv("RPU_HY_VLA_FUSED_MERGER");
-        return e && *e && std::string(e) != "0" &&
-               std::string(e) != "false" && std::string(e) != "False";
-    }();
-    return on;
-}
-
+// RPU_HY_VLA_KVPAD16 rounds K/V storage to a v16 capacity. Attention continues to
+// use the logical KV length, so extra padded rows remain inaccessible.
+// RPU_HY_VLA_FUSED_MERGER uses member-major ordering from two permute3d calls.
+// Python resolves the cold choice and binds it through set_weights.
 using namespace at;
 using namespace ::rhino_lkn;
 
 #define NUM_CORES 8
 #define DWIDTH 2
 
+constexpr int64_t HYVIT2_PATCH_INPUT_DMA_SITE = 6327224917790673981LL;
+constexpr int64_t HYVIT2_PATCH_LINEAR_SITE = 5594838142388648123LL;
+constexpr int64_t HYVIT2_PATCH_ALL_GATHER_SITE = 2358476529501646058LL;
+constexpr int64_t HYVIT2_PATCH_POSITION_DMA_SITE = 2702679098023419389LL;
+constexpr int64_t HYVIT2_PATCH_OUTPUT_DMA_SITE = 1374295323147233269LL;
+
+enum class HyViT2PatchMutableDmaRoute : int64_t {
+    DDR_BROADCAST_TO_SPM_MUTABLE = 1,
+    SPM_COPY_TO_DDR_MUTABLE = 2,
+};
+
 // =============================================================================
-// Fused patch embedding is an internal helper used by
-// HYViT2VisionModel::forward's 4D auto-detect path; it is not registered as a
-// torch op.
+// v5-05 D-07: Fused patch embedding (lifted byte-equal from former
+// rpu_fused_patch_embedding.cpp; that file is deleted in C2). Internal helper;
+// not registered as a torch op (the fused_patch_embedding op surface is
+// removed in C2). The only remaining call site is rpu_hyvit2_model.cpp's
+// HYViT2VisionModel::forward 4D auto-detect path (~L278).
 // =============================================================================
 namespace {
 
-// RPU_HY_VLA_PATCH_EMBED_MC — 默认 ON（设 0 使用单核）。Python 与 C++
-// 必须一致，因为权重 swizzle 的 num_cores 跟随此开关。
-// ─────────────────────────────────────────────────────────────────────────────
-// RPU_HY_VLA_PROJ1_IN_MERGER —— C++ 侧默认 ON。打开时 ViT 输出
-// member-major [S, hidden]，由 merger 图执行 proj1。Python 必须使用同一设置。
-static bool hyvla_proj1_in_merger() {
-    static const bool on = [] {
-        const char* e = std::getenv("RPU_HY_VLA_PROJ1_IN_MERGER");
-        if (!e || !*e) return true;
-        const std::string v(e);
-        return !(v == "0" || v == "off" || v == "false" || v == "False");
-    }();
-    return on;
-}
+constexpr int64_t kMaxPackedImages = 8;
 
-static int hyvla_patch_embed_cores() {
-    static const int nc = [] {
-        const char* e = std::getenv("RPU_HY_VLA_PATCH_EMBED_MC");
-        const bool off = e && *e && (std::string(e) == "0" ||
-                                     std::string(e) == "false" ||
-                                     std::string(e) == "False");
-        return off ? 1 : NUM_CORES;
-    }();
-    return nc;
-}
+// PATCH_EMBED_MC selects the multicore patch-embedding path. It broadcasts raw
+// input, performs local pad/transpose and permute3d, runs column-partitioned GEMM,
+// and all-gathers the full output. Python's weight swizzle and native core count
+// must use the same cold setting.
+//
+// PROJ1_IN_MERGER leaves member-major [S, hidden] in the ViT tracked output and
+// moves proj1 into hyvla_merger_fused. Python binds this choice to both handles
+// so there is one authority for the boundary layout.
+struct HYViT2ColdConfig {
+    bool fast_replay = false;
+    bool fast_replay_preload = false;
+    bool mask_once = false;
+    bool kvpad16 = false;
+    bool q_inplace = false;
+};
 
-// Writes one image's [num_patches, cout] embedding into `out` at `seq_off`.
-// `img_slot` selects a stable per-image mutable-DMA base in the shared Graph;
-// output and position-embedding bases remain shared. The caller allocates one
-// reusable set of SPM offsets, preserving bounded usage and Graph dependencies.
+// Writes this image's [num_patches, cout] patch embedding into `out`
+// ([1, total_seq, cout]) at sequence row `seq_off`. `img_slot` selects a
+// stable per-image live-base slot for the mutable input DMA: the SigLIP-batch
+// path packs N images through ONE captured graph, so a single shared live-base
+// would make every image read the LAST image's pixels on REPLAY (mutable-DMA
+// trap — CLAUDE.md "Fixed DMA trap"). The output/pos_emb live-bases stay shared
+// (same packed-tensor base / same registered pos_emb across all N images).
+//
+// `offsets` are the 6 SPM temp-buffer offsets, allocated ONCE by the caller and
+// reused for every image (all images share H/W/cout so one allocation fits all).
+// Reusing the SAME offsets — instead of reset_temporary + realloc per image —
+// (a) bounds SPM to one image's footprint (3x would OOM) and (b) keeps the
+// graph's SPM read/write dependency tracking intact, so image i+1's GEMM
+// (writing gemm_out) is serialized after image i's output DMA (reading
+// gemm_out). reset_temporary between images clears that tracking → async DMA
+// vs GEMM race → non-deterministic REPLAY.
 static void fused_patch_embedding(
     const at::Tensor& input_nchw,    // [1, cin_orig, H, W] fp16 RPU DDR
     const at::Tensor& weight,        // [cout, K] fp16 RPU DDR, col-swizzled (1 core)
@@ -197,7 +136,8 @@ static void fused_patch_embedding(
     int64_t cin_orig, int64_t cin_padded, int64_t cout,
     int64_t strideh, int64_t stridew,
     at::Tensor& out, int64_t seq_off, int img_slot,
-    const std::vector<uint32_t>& offsets)
+    const std::vector<uint32_t>& offsets, int nc,
+    const v3::InferenceContext* physical_ctx)
 {
     RECORD_FUNCTION("rpu::fused_patch_embedding", {});
 
@@ -224,14 +164,14 @@ static void fused_patch_embedding(
     uint32_t gemm_out_addr = SPM_ALLOC.addr(0, gemm_out_off);
     uint32_t pos_emb_addr  = SPM_ALLOC.addr(0, pos_emb_off);
 
-    const int nc = hyvla_patch_embed_cores();
     TORCH_CHECK(cout % nc == 0,
                 "fused_patch_embedding: cout(", cout, ") must be divisible by "
                 "num_cores(", nc, ") for the col-partition GEMM");
 
     // ===== Step ① DMA raw input DDR → SPM =====
     // Mutable DMA: input_nchw is caller-supplied per-forward, address drifts.
-    // Fixed variant would bake a BUILD-time address that the sync-only path cannot rewrite.
+    // Fixed variant would bake BUILD-time addr that sync-only fast-path can't
+    // rewrite.
     //
     // NOTE: input_nchw MUST already be DDR-coherent here. The driver
     // (run_packed_patch_embed_core's per-image loop) flushes each image before
@@ -240,19 +180,31 @@ static void fused_patch_embedding(
     // torch.cat / CPU-fallback input is left un-flushed → stale DDR).
     // Per-image live-base slot (see fn doc): each packed image bakes a distinct
     // &slot so REPLAY rewrites the correct per-image source addr.
-    static constexpr int kMaxPackedImages = 8;
     TORCH_CHECK(img_slot >= 0 && img_slot < kMaxPackedImages,
                 "fused_patch_embedding: img_slot ", img_slot,
                 " out of range [0,", kMaxPackedImages, ")");
     static thread_local uint64_t patch_emb_input_live_base[kMaxPackedImages] = {0};
     patch_emb_input_live_base[img_slot] = ::rhino_lkn::RpuGetDevAddr(
         const_cast<c10::Half*>(input_nchw.data_ptr<c10::Half>()));
+    if (physical_ctx != nullptr) {
+        physical_ctx->consume_physical_route(
+            v3::FmbRouteFamily::MUTABLE_DMA,
+            HYVIT2_PATCH_INPUT_DMA_SITE,
+            static_cast<int64_t>(HyViT2PatchMutableDmaRoute::
+                DDR_BROADCAST_TO_SPM_MUTABLE),
+            /*resolved_flags=*/0,
+            {num_patches, cin_orig, cin_padded, kh, kw,
+             strideh, stridew, nc}, img_slot);
+    }
     rpu_launch_ddr_broadcast_spm_dma_mutable(
         &patch_emb_input_live_base[img_slot],
         /*src_offset_bytes=*/0,
         cin_orig * HW, raw_addr, /*num_cores=*/nc);
 
-    // ===== Step ② Pad channels on each participating core =====
+    // ===== Step ② Pad channels =====
+    // nc>1: every core pads its own broadcast copy (SPMD). Steps ②③④ are
+    // redundant across cores — they cost the same wall-clock as one core and
+    // leave the GEMM operand resident on all `nc` cores.
     rpu_launch_pad_channel_spm(
         raw_off, padded_off, /*N=*/1, /*C=*/cin_orig * HW,
         /*pad_front=*/0, /*pad_tail=*/(cin_padded - cin_orig) * HW, nc);
@@ -262,7 +214,15 @@ static void fused_patch_embedding(
         padded_off, nhwc_off, (int)cin_padded, (int)H, (int)W, nc);
 
     // ===== Step ④ im2col =====
-    // For multi-core non-overlapping patches, use the equivalent permute3d form.
+    // Multi-core: the im2col kernel is NOT a clean SPMD kernel — it splits its
+    // grid by core id, so replicating it leaves every core with a DIFFERENT
+    // partial. Since stride == kernel here the patches don't
+    // overlap and im2col is a PURE PERMUTE, so we do it with permute3d, which
+    // is a plain broadcast SPMD kernel (same family as the transpose above):
+    //   nhwc[(ph*kh+i)*W + pw*kw+j][c]  →  col[ph*gw+pw][(i*kw+j)*cin+c]
+    // Fixing ph leaves (i, pw, j*cin+c) → (pw, i, j*cin+c) = perm{1,0,2}, and
+    // both sides have the same ph-stride (kh*gw*kw*cin), so it is gh calls at
+    // the same offset on both ends.
     if (nc > 1) {
         TORCH_CHECK(strideh == kh && stridew == kw,
                     "fused_patch_embedding: the multi-core permute form of "
@@ -289,6 +249,14 @@ static void fused_patch_embedding(
 
     // ===== Step ⑤ GEMM (col-partition over nc cores) =====
     uint32_t im2col_addr = SPM_ALLOC.addr(0, im2col_off);
+    if (physical_ctx != nullptr) {
+        physical_ctx->consume_physical_route(
+            v3::FmbRouteFamily::LINEAR,
+            HYVIT2_PATCH_LINEAR_SITE,
+            static_cast<int64_t>(v3::FmbLinearRouteSelector::AUTO_TILE),
+            /*resolved_flags=*/0,
+            {num_patches, cout, K, 1, nc, 0}, img_slot);
+    }
     rpu_launch_linear_spm_to_spm_acc16_kernel(
         im2col_addr, weight, gemm_out_addr,
         num_patches, cout, K,
@@ -300,9 +268,20 @@ static void fused_patch_embedding(
     uint32_t result_addr = gemm_out_addr;
     if (nc > 1) {
         result_addr = SPM_ALLOC.addr(0, gathered_off);
+        const RpuAllGatherSchedule schedule =
+            rpu_resolve_all_gather_schedule(cout / nc, DWIDTH);
+        if (physical_ctx != nullptr) {
+            physical_ctx->consume_physical_route(
+                v3::FmbRouteFamily::COLLECTIVE,
+                HYVIT2_PATCH_ALL_GATHER_SITE,
+                static_cast<int64_t>(schedule),
+                /*resolved_flags=*/0,
+                {num_patches, cout / nc, DWIDTH, nc}, img_slot);
+        }
         rpu_launch_all_gather_spm_kernel(
             gemm_out_addr, result_addr,
-            /*n=*/num_patches, /*chunk_elems=*/cout / nc, DWIDTH, nc);
+            /*n=*/num_patches, /*chunk_elems=*/cout / nc, DWIDTH, nc,
+            schedule);
     }
 
     // ===== Step ⑥ pos_emb add =====
@@ -312,6 +291,15 @@ static void fused_patch_embedding(
     static thread_local uint64_t patch_emb_pos_live_base = 0;
     patch_emb_pos_live_base = ::rhino_lkn::RpuGetDevAddr(
         const_cast<c10::Half*>(pos_emb_fused.data_ptr<c10::Half>()));
+    if (physical_ctx != nullptr) {
+        physical_ctx->consume_physical_route(
+            v3::FmbRouteFamily::MUTABLE_DMA,
+            HYVIT2_PATCH_POSITION_DMA_SITE,
+            static_cast<int64_t>(HyViT2PatchMutableDmaRoute::
+                DDR_BROADCAST_TO_SPM_MUTABLE),
+            /*resolved_flags=*/0,
+            {num_patches, cout, 1}, img_slot);
+    }
     rpu_launch_ddr_broadcast_spm_dma_mutable(
         &patch_emb_pos_live_base,
         /*src_offset_bytes=*/0,
@@ -331,6 +319,15 @@ static void fused_patch_embedding(
     static thread_local uint64_t patch_emb_output_live_base = 0;
     patch_emb_output_live_base =
         ::rhino_lkn::RpuGetDevAddr(out.data_ptr());
+    if (physical_ctx != nullptr) {
+        physical_ctx->consume_physical_route(
+            v3::FmbRouteFamily::MUTABLE_DMA,
+            HYVIT2_PATCH_OUTPUT_DMA_SITE,
+            static_cast<int64_t>(HyViT2PatchMutableDmaRoute::
+                SPM_COPY_TO_DDR_MUTABLE),
+            /*resolved_flags=*/0,
+            {seq_off * cout * DWIDTH, num_patches * cout}, img_slot);
+    }
     rpu_launch_spm_copy_ddr_dma_mutable(
         result_addr,
         &patch_emb_output_live_base,
@@ -397,6 +394,64 @@ static void check_hyvit2_w8a16_scale_lists(
 
 namespace v3 {
 
+// HYVIT2_FIXED_KERNEL_BASIS: remaining non-manifest launchers are fixed patch,
+// norm/activation, merger, or BufferDecl transport steps. They expose no
+// candidate selector; a selectable implementation must enter the manifest.
+
+// Stable planner-owner registry IDs.  Keep these tied one-to-one to the two
+// source attention calls below: packed block-diagonal and single-image.
+constexpr int64_t HYVIT2_PACKED_ATTN_SITE = 5767182756843666109LL;
+constexpr int64_t HYVIT2_SINGLE_ATTN_SITE = 9203248630619952644LL;
+constexpr int64_t HYVIT2_PACKED_RAW_SPM_ATTN_SITE = 2830105912667431460LL;
+constexpr int64_t HYVIT2_SINGLE_RAW_SPM_ATTN_SITE = 2565594785490903973LL;
+constexpr int64_t HYVIT2_KV_SITE = 3316688202874054057LL;
+constexpr int64_t HYVIT2_GRAPH_SCHEDULE_SITE = 3923102957416140944LL;
+constexpr int64_t HYVIT2_MASK_SCHEDULE_SITE = 2185747737952178549LL;
+constexpr int64_t HYVIT2_KV_PADDING_SITE = 8743411889070049254LL;
+constexpr int64_t HYVIT2_MERGER_PERMUTE1_SITE = 1256999960682954151LL;
+constexpr int64_t HYVIT2_MERGER_PERMUTE2_SITE = 1906212928857069507LL;
+
+constexpr int64_t HYVIT2_KV_Q_LINEAR_SITE = 3821976038473806707LL;
+constexpr int64_t HYVIT2_KV_K_LINEAR_SITE = 8147072609028639932LL;
+constexpr int64_t HYVIT2_KV_V_LINEAR_SITE = 8613419147536865054LL;
+constexpr int64_t HYVIT2_Q_SAVE_DMA_SITE = 4520706683310192342LL;
+constexpr int64_t HYVIT2_Q_LOAD_DMA_SITE = 2558943548608657790LL;
+constexpr int64_t HYVIT2_O_LINEAR_SITE = 5411123264736285894LL;
+constexpr int64_t HYVIT2_ATTN_ALL_REDUCE_SITE = 7296386757428037628LL;
+constexpr int64_t HYVIT2_FC1_LINEAR_SITE = 816252863600784417LL;
+constexpr int64_t HYVIT2_FC2_LINEAR_SITE = 2679807282578599669LL;
+constexpr int64_t HYVIT2_MLP_ALL_REDUCE_SITE = 7190094110879491471LL;
+constexpr int64_t HYVIT2_TAIL_SLOT_DMA_SITE = 3131457000840871027LL;
+constexpr int64_t HYVIT2_TAIL_OUTPUT_DMA_SITE = 6474014664636894258LL;
+constexpr int64_t HYVIT2_PROJECTOR_LINEAR_SITE = 7630442159474739795LL;
+constexpr uint32_t HYVIT2_KV_CAPABILITIES =
+    KV_INSERT_CAP_V2 | KV_INSERT_CAP_V16 | KV_INSERT_CAP_PAD16 |
+    KV_INSERT_CAP_HYBRID2;
+constexpr int64_t HYVIT2_KV_FLAG_DDR_MIRROR = 1;
+constexpr int64_t HYVIT2_ATTN_CAPABILITY_FALLBACK_DDR_REQUIRED = 1LL << 0;
+
+enum class HyViT2GraphScheduleRoute : int64_t {
+    REEMIT_LAYER_LOOP = 1,
+    FAST_REPLAY_SKIP_LAYER_LOOP = 2,
+    MASK_EACH_LAYER = 3,
+    MASK_FIRST_LAYER_ONLY = 4,
+    PATCH_MAJOR_LAYOUT = 5,
+    MERGER_MEMBER_MAJOR_LAYOUT = 6,
+};
+
+enum class HyViT2KvPaddingRoute : int64_t {
+    LOGICAL_ROWS = 1,
+    PAD16_ROWS = 2,
+};
+
+enum class HyViT2DmaRoute : int64_t {
+    DDR_SCATTER_TO_SPM_FIXED = 1,
+    SPM_SCATTER_TO_DDR_FIXED = 2,
+    SPM_TO_DDR_FIXED = 3,
+    KEEP_Q_IN_SPM = 4,
+    SPM_TO_DDR_MUTABLE = 5,
+};
+
 // =============================================================================
 // HYViT2VisionModel — v3::FusedModelBase subclass (SigLIP ViT Encoder)
 // =============================================================================
@@ -421,6 +476,19 @@ public:
 
     HYViT2VisionModel() = default;
 
+    void set_runtime_config(
+        bool fast_replay, bool fast_replay_preload, bool mask_once,
+        bool kvpad16, bool q_inplace) {
+        TORCH_CHECK(
+            !cold_config_bound_ && !production_config_bound_,
+            "hyvit2_set_runtime_config must run exactly once before "
+            "set_weights");
+        cold_config_ = {
+            fast_replay, fast_replay_preload, mask_once, kvpad16, q_inplace};
+        cold_config_bound_ = true;
+        invalidate_model_state();
+    }
+
     // ========================================================================
     // set_weights — stores all per-layer and global weights
     // ========================================================================
@@ -437,15 +505,32 @@ public:
         int64_t num_heads, int64_t head_dim,
         int64_t hidden_size, int64_t intermediate_size,
         int64_t projection_dim, double eps,
+        bool fused_merger, bool proj1_in_merger,
+        int64_t patch_embed_cores,
         at::TensorList q_ws_list, at::TensorList k_ws_list,
         at::TensorList v_ws_list, at::TensorList o_ws_list,
         at::TensorList fc1_ws_list, at::TensorList fc2_ws_list)
     {
+        TORCH_CHECK(
+            cold_config_bound_,
+            "hyvit2_set_weights requires an explicit immutable runtime "
+            "config snapshot");
         int64_t N = static_cast<int64_t>(q_w_list.size());
         TORCH_CHECK(N > 0, "hyvit2_set_weights: empty weight lists");
         TORCH_CHECK(num_heads > 0 && head_dim > 0 && hidden_size > 0
                     && intermediate_size > 0 && projection_dim > 0,
                     "hyvit2_set_weights: dim params must be positive");
+        TORCH_CHECK(patch_embed_cores == 1 || patch_embed_cores == NUM_CORES,
+                    "hyvit2_set_weights: patch_embed_cores must be 1 or ",
+                    NUM_CORES, ", got ", patch_embed_cores);
+        if (production_config_bound_) {
+            TORCH_CHECK(
+                merger_member_major_ == fused_merger &&
+                    proj1_in_merger_ == proj1_in_merger &&
+                    patch_embed_cores_ == patch_embed_cores,
+                "hyvit2_set_weights: production configuration is immutable "
+                "for a native handle");
+        }
 
         // All 16 per-layer lists must have the same length
         auto check_list = [&](const at::TensorList& l, const char* n) {
@@ -470,7 +555,7 @@ public:
         check_list(fc2_b_list, "fc2_b_list");
 
         // Global tensor checks — proj is always fp16, DMA'd as Half
-        // (fp16 + PrivateUse1 + contiguous).
+        // (add fp16 + PrivateUse1 + contiguous).
         auto check_global_fp16_rpu = [&](const at::Tensor& t, const char* name) {
             TORCH_CHECK(t.defined(), "hyvit2_set_weights: ", name, " must be defined");
             TORCH_CHECK(t.scalar_type() == at::kHalf
@@ -484,9 +569,11 @@ public:
         check_global_fp16_rpu(proj_w,    "proj_w");
         check_global_fp16_rpu(proj_b,    "proj_b");
 
-        // Per-layer rank checks. require_fp16_rpu adds the fp16, PrivateUse1 and
-        // contiguous preconditions for tensors accessed as c10::Half. Projection
-        // weights may be int8 W8A16 and are checked separately above.
+        // Per-layer defined/rank checks. require_fp16_rpu adds the fp16 +
+        // PrivateUse1 + contiguous guard for the ALWAYS-fp16 tensors (norms,
+        // biases) that are later DMA'd via data_ptr<c10::Half>()
+        // weight-validate fix. The main q/k/v/o/fc projection weights skip it
+        // (they may be int8 W8A16 and are validated by check_projection above).
         auto check_defined_rank = [&](const at::TensorList& list,
                                       const char* name, int64_t expected_rank,
                                       bool require_fp16_rpu = false) {
@@ -538,11 +625,12 @@ public:
         eps_ = eps;
         projection_dim_ = projection_dim;
 
-        // orig_head_dim = hidden_size / num_heads (= 72 for SigLIP), not from
-        // the padded weight shape, which would give 80.
+        // orig_head_dim = hidden_size / num_heads (= 72 for SigLIP, NOT from
+        // padded weight shape which would give 80). v2 reference:
+        // rpu_hyvit2_fused_encoder_layer.cpp:584.
         orig_head_dim_ = hidden_size / num_heads;
 
-        // Per-core local Q head count for KV_FIRST q_ddr_buf_ staging
+        // Site9 (KV_FIRST): per-core local Q head count for q_ddr_buf_ staging
         // and the Phase1 Q→DDR / Phase2 DDR→Q scatter/gather (mirror Gemma's
         // local_q_heads_ = num_q_heads / attn_tp()). SigLIP fixes tp = NUM_CORES.
         local_q_heads_ = num_q_heads() / NUM_CORES;
@@ -579,7 +667,12 @@ public:
         proj_w_ = proj_w;
         proj_b_ = proj_b;
 
-        invalidate_model_state();  // Must remain the last statement of set_weights.
+        merger_member_major_ = fused_merger;
+        proj1_in_merger_ = proj1_in_merger;
+        patch_embed_cores_ = static_cast<int>(patch_embed_cores);
+        production_config_bound_ = true;
+
+        invalidate_model_state();  // D-503: last non-empty statement of set_weights
     }
 
     // ========================================================================
@@ -588,10 +681,28 @@ public:
     void set_patch_emb_params(const at::Tensor& weight, const at::Tensor& pos_emb,
                               int64_t kernel_size, int64_t stride)
     {
-        TORCH_CHECK(weight.defined() && weight.dim() == 2,
-                    "hyvit2_set_patch_emb: weight must be defined 2D");
-        TORCH_CHECK(pos_emb.defined(),
-                    "hyvit2_set_patch_emb: pos_emb must be defined");
+        TORCH_CHECK(kernel_size > 0 && stride > 0,
+                    "hyvit2_set_patch_emb: kernel_size and stride must be positive");
+        TORCH_CHECK(weight.defined() && weight.dim() == 2 &&
+                        weight.size(0) > 0 && weight.size(1) > 0 &&
+                        weight.scalar_type() == at::kHalf &&
+                        weight.device().type() == at::kPrivateUse1 &&
+                        weight.is_contiguous(),
+                    "hyvit2_set_patch_emb: weight must be nonempty contiguous FP16 RPU [cout,K]");
+        TORCH_CHECK(kernel_size <= weight.size(1) / kernel_size,
+                    "hyvit2_set_patch_emb: kernel area exceeds weight K");
+        const int64_t kernel_area = kernel_size * kernel_size;
+        TORCH_CHECK(weight.size(1) % kernel_area == 0 &&
+                        weight.size(1) / kernel_area >= 3 &&
+                        (weight.size(1) / kernel_area) % 16 == 0,
+                    "hyvit2_set_patch_emb: weight K must contain RGB patches "
+                    "with padded channels divisible by 16 for NCHW-to-NHWC");
+        TORCH_CHECK(pos_emb.defined() && pos_emb.numel() > 0 &&
+                        pos_emb.scalar_type() == at::kHalf &&
+                        pos_emb.device().type() == at::kPrivateUse1 &&
+                        pos_emb.is_contiguous() &&
+                        pos_emb.numel() % weight.size(0) == 0,
+                    "hyvit2_set_patch_emb: pos_emb must contain contiguous FP16 RPU rows of cout elements");
 
         patch_emb_weight_ = weight;
         patch_emb_pos_emb_ = pos_emb;
@@ -616,7 +727,8 @@ public:
     at::Tensor forward(
         const at::Tensor& input,
         std::vector<at::Tensor>& k_caches,
-        std::vector<at::Tensor>& v_caches)
+        std::vector<at::Tensor>& v_caches,
+        at::IntArrayRef planned_stage_descriptor = {})
     {
         TORCH_CHECK(num_layers() > 0,
                     "HYViT2VisionModel::forward called before set_weights");
@@ -636,17 +748,39 @@ public:
         at::Tensor hidden_states;
         int64_t packed_image_count = 1;
 
-        // Input formats:
-        //  - 4D [N,C,H,W]: pack N images into one hidden tensor in this capture.
-        //  - 3D [1,S,hidden]: use a pre-embedded single hidden tensor.
+        // D-507: Auto-detect input shape.
+        //  - 4D [N,C,H,W]: SigLIP-batch packs the N camera images into one
+        //    [1,N*256,hidden] hidden via run_packed_patch_embed (all inside this
+        //    one capture); image_batch_count_ = N drives the per-image minibatch
+        //    SDPA. N=1 is the legacy single-image path, byte-identical.
+        //  - 3D [1,S,hidden]: pre-embedded single hidden (image_batch_count_=1).
         if (input.dim() == 4 && has_patch_emb_) {
-            hidden_states = run_packed_patch_embed(input);  // sets image_batch_count_
+            const int64_t patch_rows = validate_patch_inputs(
+                {input}, /*allow_batched_tensor=*/true);
+            TORCH_CHECK(
+                !planned_stage_descriptor.empty(),
+                "HYViT2 patch-embedding forward requires its native A6 "
+                "stage descriptor");
+            const auto prepared_planned = prepare_stage_candidate(planned_stage_descriptor);
+            const auto& planned = prepared_planned->candidate();
+            begin_external_physical_manifest_prologue(
+                planned.physical_manifest, patch_rows, /*position=*/0);
+            auto cancel_patch_prologue = c10::make_scope_exit(
+                [&] { cancel_external_physical_manifest_prologue(); });
+            hidden_states = run_packed_patch_embed(
+                input, /*consume_external_prologue=*/true);
             packed_image_count = image_batch_count_;
+            at::Tensor result = forward_packed(
+                hidden_states, packed_image_count, k_caches, v_caches,
+                planned_stage_descriptor);
+            cancel_patch_prologue.release();
+            return result;
         } else {
             hidden_states = input;
         }
 
-        return forward_packed(hidden_states, packed_image_count, k_caches, v_caches);
+        return forward_packed(hidden_states, packed_image_count, k_caches,
+                              v_caches, planned_stage_descriptor);
     }
 
     // ========================================================================
@@ -655,71 +789,60 @@ public:
     // [1, N*256, hidden] hidden via run_packed_patch_embed_list, then runs the
     // identical encoder + projector tail as forward(). image_batch_count_ = N
     // (set by the packer) drives the per-image minibatch SDPA in
-    // build_layer_subgraph — bit-exact with forward()'s 4D torch.cat path,
-    // without the cat/slice round trip.
+    // build_layer_subgraph — bit-exact vs forward()'s 4D torch.cat'd path
+    // (test_siglip_batch_3image.py), just without the cat/slice round-trip.
     // ========================================================================
     at::Tensor forward_multi(
         at::TensorList images,
         std::vector<at::Tensor>& k_caches,
-        std::vector<at::Tensor>& v_caches)
+        std::vector<at::Tensor>& v_caches,
+        at::IntArrayRef planned_stage_descriptor = {})
     {
         TORCH_CHECK(num_layers() > 0,
                     "HYViT2VisionModel::forward_multi called before set_weights");
-        TORCH_CHECK(has_patch_emb_,
-                    "HYViT2VisionModel::forward_multi requires patch embedding params — "
-                    "call hyvit2_model_set_patch_emb before forward_multi");
-        TORCH_CHECK(images.size() > 0,
-                    "HYViT2VisionModel::forward_multi: empty image list");
-        for (const auto& im : images) {
-            TORCH_CHECK(im.device().type() == at::kPrivateUse1,
-                        "HYViT2VisionModel::forward_multi: each image must be on RPU device");
-            TORCH_CHECK(im.is_contiguous(),
-                        "HYViT2VisionModel::forward_multi: each image must be contiguous");
-            TORCH_CHECK(im.dim() == 4,
-                        "HYViT2VisionModel::forward_multi: each image must be 4D [1,C,H,W], "
-                        "got ", im.dim(), "D");
-        }
+        const int64_t patch_rows = validate_patch_inputs(
+            images, /*allow_batched_tensor=*/false);
 
-        // Patch-embed + pack all N images into [1, N*256, hidden] (sets
-        // image_batch_count_ = N for the per-image minibatch SDPA).
-        at::Tensor hidden_states = run_packed_patch_embed_list(images);
-        return forward_packed(hidden_states, image_batch_count_, k_caches, v_caches);
+        // Patch-embed + encoder are one physical candidate.  The prologue
+        // consumes its routes before run_all_layers transfers the same
+        // manifest and verifies every body receipt.
+        TORCH_CHECK(
+            !planned_stage_descriptor.empty(),
+            "HYViT2 patch-embedding forward requires its native A6 stage "
+            "descriptor");
+        const auto prepared_planned = prepare_stage_candidate(planned_stage_descriptor);
+        const auto& planned = prepared_planned->candidate();
+        begin_external_physical_manifest_prologue(
+            planned.physical_manifest, patch_rows, /*position=*/0);
+        auto cancel_patch_prologue = c10::make_scope_exit(
+            [&] { cancel_external_physical_manifest_prologue(); });
+        at::Tensor hidden_states = run_packed_patch_embed_list(
+            images, /*consume_external_prologue=*/true);
+        at::Tensor result = forward_packed(
+            hidden_states, image_batch_count_, k_caches, v_caches,
+            planned_stage_descriptor);
+        cancel_patch_prologue.release();
+        return result;
     }
 
     at::Tensor patch_embed(const at::Tensor& input) {
-        TORCH_CHECK(input.device().type() == at::kPrivateUse1,
-                    "HYViT2VisionModel::patch_embed: input must be on RPU device");
-        TORCH_CHECK(input.is_contiguous(),
-                    "HYViT2VisionModel::patch_embed: input must be contiguous");
-        TORCH_CHECK(input.dim() == 4,
-                    "HYViT2VisionModel::patch_embed expects 4D [B,C,H,W] input, got ",
-                    input.dim(), "D");
-        TORCH_CHECK(has_patch_emb_,
-                    "HYViT2VisionModel::patch_embed requires patch embedding params");
-        return run_packed_patch_embed(input);
+        validate_patch_inputs({input}, /*allow_batched_tensor=*/true);
+        return run_packed_patch_embed(
+            input, /*consume_external_prologue=*/false);
     }
 
     at::Tensor patch_embed_multi(at::TensorList images) {
-        TORCH_CHECK(has_patch_emb_,
-                    "HYViT2VisionModel::patch_embed_multi requires patch embedding params");
-        TORCH_CHECK(images.size() > 0,
-                    "HYViT2VisionModel::patch_embed_multi: empty image list");
-        for (const auto& im : images) {
-            TORCH_CHECK(im.device().type() == at::kPrivateUse1,
-                        "HYViT2VisionModel::patch_embed_multi: each image must be on RPU");
-            TORCH_CHECK(im.is_contiguous(),
-                        "HYViT2VisionModel::patch_embed_multi: each image must be contiguous");
-            TORCH_CHECK(im.dim() == 4 && im.size(0) == 1,
-                        "HYViT2VisionModel::patch_embed_multi: each image must be [1,C,H,W]");
-        }
-        return run_packed_patch_embed_list(images);
+        validate_patch_inputs(images, /*allow_batched_tensor=*/false);
+        return run_packed_patch_embed_list(
+            images, /*consume_external_prologue=*/false);
     }
 
     at::Tensor forward_packed(
         const at::Tensor& hidden_states,
         int64_t packed_image_count,
         std::vector<at::Tensor>& k_caches,
-        std::vector<at::Tensor>& v_caches)
+        std::vector<at::Tensor>& v_caches,
+        at::IntArrayRef planned_stage_descriptor = {})
     {
         TORCH_CHECK(hidden_states.dim() == 3,
                     "HYViT2VisionModel::forward_packed: hidden input must be 3D, got ",
@@ -735,8 +858,9 @@ public:
         int64_t seq_len = hidden_states.size(1);
 
         // Site5 (KV_FIRST): seq_len_ is this forward's full sequence length (the SDPA
-        // kv_seq_len). The stable per-shape Q staging slot is allocated below,
-        // after validation, so an invalid packed shape cannot leak a slot.
+        // kv_seq_len). The STABLE per-shape Q staging slot is allocated BELOW, AFTER
+        // the shape-validity checks (cold-panel re-review #edge: don't allocate before
+        // validation — an invalid packed shape would otherwise leak a slot).
         seq_len_ = seq_len;
 
         // Minibatch (N>1 packed images) mutual-exclusion with chunking: the
@@ -745,19 +869,25 @@ public:
         // KV-insert plan to one chunk, but the framework's COMPUTE chunk plan is
         // computed independently by compute_chunks_impl — so for N>1 we also pin
         // the compute chunk size to the full sequence via the override (which
-        // bypasses the auto-scan). N==1 leaves the override at 0 so the
-        // auto-scan can pick a fitting comp_cs and token-chunk the input.
+        // bypasses the auto-scan, exactly like the retired D-508 single-chunk
+        // path did). N==1 (HALO single-image) leaves the override at 0 so the
+        // auto-scan can pick a fitting comp_cs and token-chunk the 1564 path.
         //
-        // The override is floored to (override/16)*16. A packed seq not a multiple of 16 — or not
+        // the override is floored to (override/16)*16
+        // (fused_model_base.cpp:487). A packed seq not a multiple of 16 — or not
         // divisible by image_batch_count_ — would split a TAIL chunk, violating the
         // single-block minibatch assertion (TORCH_CHECK(chunk.len==seq_len_) in the
-        // KV_FIRST body below). Fail
+        // KV_FIRST body below) deep on-board where it is hard to root-cause. Fail
         // fast HERE with a clear shape error. SigLIP packs per-image npp(=256)
         // tokens so seq_len = N*256 is 16-aligned in practice; this guards the
         // invariant the forced-single-block override silently relies on.
-        // 传 **ceil16(seq_len)** 时，框架把 override clamp 到
+        // 2026-08-05: 原先还要求 seq_len % 16 == 0, 理由是 override 会被
+        // (v/16)*16 下取整 (fused_model_base.cpp:500) ⇒ 传 seq_len 会得到一个
+        // **小于** seq_len 的 cs, 从而切出 tail chunk 并违反下面的单块断言。
+        // 传 **ceil16(seq_len)** 就没有这个问题: 框架把它 clamp 到
         // hi=ceil16(seq_len) (:501), 再按 len=min(cs, seq_len-off) 建块 ⇒
-        // 恰好一块、len==seq_len，因此 seq_len 无需被 16 整除。
+        // 恰好一块、len==seq_len。于是 16 整除这条约束可以去掉 ——
+        // Hy-VLA 的 3 相机 × 196 token = 588 (588%16=12) 因此得以走 packed 路径。
         // 仍然要求能被 image_batch_count_ 整除: minibatch SDPA 的
         // per_image_ctx = seq_len / N 必须是整数。
         TORCH_CHECK(
@@ -765,10 +895,30 @@ public:
             "HYViT2 packed forward: seq_len (", seq_len,
             ") must be divisible by image_batch_count (", image_batch_count_,
             ") — minibatch SDPA 的 per_image_ctx 必须整除");
-        set_chunk_size_override(
-            image_batch_count_ > 1 ? ((seq_len + 15) / 16) * 16 : 0);
+        // A production descriptor carries the selected geometry.  Keep the
+        // old direct entry usable before the execution guard is enabled, but
+        // do not mutate a guarded handle during forward.
+        const int64_t saved_chunk_override = get_chunk_size_override();
+        const bool legacy_geometry = planned_stage_descriptor.empty();
+        if (!legacy_geometry) {
+            const auto prepared_planned = prepare_stage_candidate(planned_stage_descriptor);
+            const auto& planned = prepared_planned->candidate();
+            TORCH_CHECK(
+                planned.physical_manifest.state ==
+                        FmbPhysicalManifestState::COMPLETE &&
+                    planned.stage_plan.qkv.chunks.size() == 1,
+                "RPU_PLANNER_REJECT:CAPABILITY: HYViT2 production descriptor "
+                "requires one frozen KV_FIRST segment plan");
+        }
+        if (legacy_geometry) {
+            set_chunk_size_override(
+                image_batch_count_ > 1 ? ((seq_len + 15) / 16) * 16 : 0);
+        }
+        auto restore_chunk_override = c10::make_scope_exit([&] {
+            if (legacy_geometry) set_chunk_size_override(saved_chunk_override);
+        });
 
-        // KV_FIRST: shape now validated → ensure a STABLE Q staging slot for
+        // Site5 (KV_FIRST): shape now validated → ensure a STABLE Q staging slot for
         // THIS forward (mirror GemmaModel). Keyed by {seq_len, q_width =
         // local_q_heads_*head_dim()} → created once, NEVER reallocated, so a smaller
         // shape's already-captured graph keeps a valid fixed-DMA address after a
@@ -787,8 +937,18 @@ public:
                 at::TensorOptions().dtype(at::kHalf).device(at::kPrivateUse1)));
         }
 
-        // Fail fast when even the minimum legal chunk exceeds the SPM budget.
-        // The framework's auto planner remains the authoritative per-candidate gate.
+        // GUARD (design note §2 三件套 ①): host-side per-chunk SPM budget
+        // pre-check BEFORE dispatch. The probe note proved a naive single-chunk
+        // 1564-token forward exhausts the 8 MB SPM block and enters an infinite
+        // allocator retry that POISONS the whole RPU board (run-queue wedged
+        // until reboot). The framework's auto chunk-size scan
+        // (compute_chunks_impl) already rejects an over-budget seq with a clear
+        // TORCH_CHECK on the AUTO path we now take (set_chunk_size_override is
+        // gone), so this is a defense-in-depth fail-fast: if even the SMALLEST
+        // legal chunk (cs=16) cannot fit, refuse loudly here rather than relying
+        // solely on the framework's [Fix #4] min-chunk check. The framework owns
+        // the authoritative budget gate; this guard only converts the worst case
+        // into an explicit, readable error at the model boundary.
         {
             LayoutContext probe_ctx;
             probe_ctx.chunk_size = 16;  // smallest legal chunk
@@ -815,15 +975,46 @@ public:
             input_chunks.push_back(
                 {static_cast<int>(image), offset, rows_per_image,
                  offset + rows_per_image});
-            spans.push_back({image * rows_per_image, rows_per_image});
+            spans.push_back(
+                {image * rows_per_image, rows_per_image, image});
         }
-        at::Tensor result = run_all_layers(
-            hidden_states, k_caches, v_caches,
-            /*mask=*/std::nullopt, /*position=*/0, /*is_causal=*/false,
-            input_chunks, spans);
+        const FmbStageBoundaryPolicies boundary_policies{
+            FmbSpanBoundaryPolicy::KEEP_LOCAL,
+            FmbSpanBoundaryPolicy::ALLOW_CROSS,
+            FmbSpanBoundaryPolicy::ALLOW_CROSS};
+        // Fast replay can skip every layer callback. Prepare caller-visible
+        // storage here on every invocation, then rebind the retained DMA nodes
+        // through member addresses that remain valid for this handle's lifetime.
+        const bool p1m = proj1_in_merger_ && merger_member_major_;
+        const int64_t projector_out_dim = p1m ? hidden_size() : projection_dim_;
+        at::Tensor result;
+        try {
+            projector_output_ = allocate_tracked_output(
+                {1, seq_len_, projector_out_dim});
+            projector_out_live_base_ =
+                ::rhino_lkn::RpuGetDevAddr(projector_output_.data_ptr());
+            projector_bias_live_base_ = p1m ? 0 :
+                ::rhino_lkn::RpuGetDevAddr(proj_b_.data_ptr());
+            if (planned_stage_descriptor.empty()) {
+                result = run_all_layers(
+                    hidden_states, k_caches, v_caches,
+                    /*mask=*/std::nullopt, /*position=*/0, /*is_causal=*/false,
+                    input_chunks, spans, boundary_policies);
+            } else {
+                result = run_all_layers(
+                    hidden_states, k_caches, v_caches,
+                    /*mask=*/std::nullopt, /*position=*/0, /*is_causal=*/false,
+                    /*planned_chunk_size=*/0, planned_stage_descriptor);
+            }
+        } catch (...) {
+            projector_output_ = at::Tensor{};
+            projector_out_live_base_ = 0;
+            projector_bias_live_base_ = 0;
+            throw;
+        }
 
-        // Last layer freshly allocated projector_output_ (Pitfall 4); flush for
-        // CPU coherency before returning to Python (framework doesn't track it).
+        // Deferred execution owns the fresh output until Graph completion.
+        // Flush for CPU coherency before returning it to Python.
         if (projector_output_.defined()) {
             rpu_ddr_flush(projector_output_.data_ptr<c10::Half>());
             return projector_output_;
@@ -831,28 +1022,84 @@ public:
         return result;
     }
 
+    std::vector<int64_t> resolve_stage_domain(
+        int64_t seq_len, int64_t image_batch_count,
+        bool external_patch_prologue) {
+        TORCH_CHECK(seq_len > 0 && image_batch_count > 0 &&
+                        seq_len % image_batch_count == 0,
+                    "hyvit2_resolve_stage_domain: seq_len must be positive "
+                    "and divisible by image_batch_count");
+        const int64_t saved_seq_len = seq_len_;
+        const int64_t saved_image_batch_count = image_batch_count_;
+        const int64_t saved_chunk_override = get_chunk_size_override();
+        auto restore = c10::make_scope_exit([&] {
+            seq_len_ = saved_seq_len;
+            image_batch_count_ = saved_image_batch_count;
+            set_chunk_size_override(saved_chunk_override);
+        });
+        seq_len_ = seq_len;
+        image_batch_count_ = image_batch_count;
+        set_chunk_size_override(0);
+        const bool saved_external_patch_prologue =
+            planning_external_patch_prologue_;
+        planning_external_patch_prologue_ = external_patch_prologue;
+        auto restore_external_patch_prologue = c10::make_scope_exit([&] {
+            planning_external_patch_prologue_ =
+                saved_external_patch_prologue;
+        });
+
+        const int64_t rows_per_image = seq_len / image_batch_count;
+        std::vector<ChunkInfo> input_chunks;
+        std::vector<FmbExecutionSpan> spans;
+        input_chunks.reserve(image_batch_count);
+        spans.reserve(image_batch_count);
+        for (int64_t image = 0; image < image_batch_count; ++image) {
+            const int64_t offset = image * rows_per_image;
+            input_chunks.push_back(
+                {static_cast<int>(image), offset, rows_per_image,
+                 offset + rows_per_image});
+            spans.push_back({offset, rows_per_image, image});
+        }
+        const FmbStageBoundaryPolicies boundary_policies{
+            FmbSpanBoundaryPolicy::KEEP_LOCAL,
+            FmbSpanBoundaryPolicy::ALLOW_CROSS,
+            FmbSpanBoundaryPolicy::ALLOW_CROSS};
+        return encode_fmb_prefill_stage_domain(
+            resolve_prefill_stage_domain_for_shape(
+                seq_len, /*position=*/0, /*attention_mask=*/std::nullopt,
+                /*is_causal=*/false, input_chunks, spans, boundary_policies));
+    }
+
 protected:
+    KvCostLayoutScope capture_kvinsert_cost_layout_scope() override {
+        return capture_kvinsert_cost_layout_fields(
+            seq_len_, image_batch_count_,
+            planning_external_patch_prologue_);
+    }
+
     // ========================================================================
-    // static_config — SIGLIP_WEIGHTS preload and SIGLIP_COMPUTE layer graphs.
+    // static_config — D-501: uses SIGLIP_WEIGHTS for preload, SIGLIP_COMPUTE for layers
     //
     // Registers the pointer-to-member `&HYViT2VisionModel::emit_preload_weights`
     // (cast to FusedModelBase pointer-to-member) on the preload-fn slot.
     // Framework dispatches via std::invoke inside a framework-managed
-    // GRAPH_CACHE.begin(SIGLIP_WEIGHTS) / end pair.
+    // GRAPH_CACHE.begin(SIGLIP_WEIGHTS) / end pair (EXT-5 locked).
     // ========================================================================
     ModelStaticConfig static_config() override {
         ModelStaticConfig cfg;
         cfg.num_layers       = num_layers();
 
-        // One-shot .preload_fn. Framework wraps the callback body in ONE
+        // D-501 one-shot .preload_fn: replaces v2's `build_preload_subgraph`
+        // virtual. Framework wraps the callback body in ONE
         // GRAPH_CACHE.begin(SIGLIP_WEIGHTS)/end pair. The body emits only
-        // rpu_launch_* DMAs with no subclass-side batch-context calls.
-        // SigLIP uses one-shot preload_fn while Gemma uses per-buffer
-        // .preload_callback instead; both coexist here.
+        // rpu_launch_* DMAs — no subclass-side batch-context calls (EXT-5).
+        // PRESERVED through the SEQUENTIAL→KV_FIRST refactor (Site3): SigLIP is
+        // the only KV_FIRST consumer that ALSO uses one-shot preload_fn (Gemma
+        // uses per-buffer .preload_callback instead) — both coexist fine here.
         cfg.preload_fn = static_cast<void(FusedModelBase::*)()>(
                              &HYViT2VisionModel::emit_preload_weights);
 
-        // Two pointer-to-member slots implement the KV_FIRST two-phase dispatch
+        // D-501 KV_FIRST: two pointer-to-member slots for the two-phase dispatch
         // (mirror GemmaModel::static_config). The static_cast is required because
         // the base struct types the slots as pointer-to-member-of-FusedModelBase
         // (std::invoke resolves to the concrete subclass at runtime).
@@ -864,23 +1111,41 @@ protected:
             static_cast<ChunkPlan(FusedModelBase::*)(const ChunkPlan&)>(
                 &HYViT2VisionModel::plan_kv_first_chunks);
 
-        // SigLIP requires a single group. With cross_batch < num_layers,
-        // cached kernels may bind different layer-specific weights, KV caches,
-        // and per-layer SPM offsets across groups, producing non-deterministic
-        // output. Pinning the full layer count keeps that dataflow invariant.
+        // SigLIP REQUIRES single group (matches v2 design at
+        // rpu_hyvit2_fused_encoder_layer.cpp:634-645). With cross_batch < num_layers,
+        // groups that share (group_size, contains_last_layer) cache_key force REPLAY
+        // of cached kernels with different layer-specific pointers (weights, KV caches,
+        // per-layer SPM offsets). The cursor mechanism updates registers via setup_regs,
+        // but produces non-deterministic output between forwards (verified Section 3
+        // failure: rel_diff=0.49 between same-input forwards with cross_batch=12 default).
+        //
+        // The Qwen3 global runtime knob (g_cross_layer_batch_size, default 12) leaks into
+        // SigLIP if not explicitly set. Other models (Qwen3, Gemma) work because their
+        // tests explicitly set cross_batch >= num_layers (test_qwen3_decode.py sets 36).
+        // SigLIP enforces this invariant in C++ to be defensive.
         cfg.cross_layer_batch_size = num_layers();
-        cfg.fast_replay_skip_layer_loop = hyvla_fast_replay_on("vit");
-        cfg.fast_replay_skip_preload = hyvla_fast_replay_preload_on("vit");
+        cfg.fast_replay_skip_layer_loop = cold_config_.fast_replay;
+        cfg.fast_replay_skip_preload = cold_config_.fast_replay_preload;
         return cfg;
     }
 
     // ========================================================================
     // dynamic_config — KV_FIRST + AUTO inter-layer I/O.
     //
-    // KV_FIRST keeps full-sequence K/V in DDR and feeds SPM one query chunk at a
-    // time. AUTO selects SPM_RESIDENT for one chunk and DDR_PINGPONG otherwise.
+    // SEQUENTIAL→KV_FIRST refactor (halo-vit-cache-kvfirst-refactor-design
+    // -2026-06-18): the former single-chunk SPM_RESIDENT encoder hit the 8 MB
+    // SPM ceiling at ~960 tokens (the MLP-intermediate working set), hanging
+    // HALO's 1564-patch single-image ViT path (probe note
+    // halo-vit-cache-seq-ceiling-probe-2026-06-18). KV_FIRST keeps the full
+    // [seq,h] K/V in DDR and feeds SPM one query-chunk at a time, so the
+    // per-chunk SPM footprint stays chunk-bounded; AUTO then picks SPM_RESIDENT
+    // for a lone chunk (seq≤ceiling, byte-identical to the old path) and
+    // DDR_PINGPONG when the sequence splits into multiple chunks.
     //
-    // The base ping-pong DMA uses a single core-0 path, not multicore broadcast.
+    // The old "DDR ping-pong 8-core broadcast-write race / corruption" worry
+    // (former Round-9 SPM_RESIDENT rationale) does NOT reproduce: the base
+    // ping-pong DMA is a single core-0 path (rpu_memcpy.cpp:1146), not the old
+    // multicore broadcast — cross-ref design note §0b for the static proof.
     // No build_chunk_masks: SigLIP attention is MASK_NONE (bidirectional, no
     // additive mask), unlike Gemma's per-chunk causal masks.
     // ========================================================================
@@ -888,7 +1153,371 @@ protected:
         ModelDynamicConfig cfg;
         cfg.chunk_mode     = ChunkMode::KV_FIRST;
         cfg.inter_layer_io = InterLayerIO::AUTO;
+        // RAW_SPM is descriptor-owned: legacy/no-descriptor entry points keep
+        // the historical DDR route and cannot silently select a physical ABI.
+        cfg.attention_policy = ctx().has_complete_physical_manifest()
+            ? AttentionExecutionPolicy::AUTO
+            : AttentionExecutionPolicy::DDR_KV;
         return cfg;
+    }
+
+    FmbPhysicalExecutionManifest physical_manifest_for_candidate(
+        const FmbThreeStageChunkPlan& plan,
+        const LayoutContext& layout,
+        int64_t physical_len, int64_t logical_len,
+        int64_t position) const override {
+        FmbPhysicalExecutionManifest manifest;
+        manifest.state = FmbPhysicalManifestState::COMPLETE;
+        manifest.logical_length = logical_len;
+        manifest.physical_length = physical_len;
+        manifest.execution_padding_rows = physical_len - logical_len;
+        manifest.kv_logical_length = position + logical_len;
+        manifest.kv_insert_physical_rows = physical_len;
+        manifest.graph_lifecycle = FmbGraphLifecycle::COMPOSITE_CHILD;
+        manifest.linear_accumulation = FmbLinearAccumulationPolicy::ACC16;
+
+        LayoutContext spm_layout = layout;
+        spm_layout.attention_policy =
+            AttentionExecutionPolicy::SPM_KV_BY_MHA;
+        const bool raw_spm_eligible = subclass_spm_kv_by_mha_eligible(
+            plan, spm_layout, position);
+        const bool raw_spm = layout.attention_policy ==
+            AttentionExecutionPolicy::SPM_KV_BY_MHA;
+        TORCH_CHECK(
+            !raw_spm || raw_spm_eligible,
+            "RPU_PLANNER_REJECT:CAPABILITY: HYViT2 raw-SPM attention was "
+            "selected without one full 196-row/image schedule");
+
+        const int64_t h = hidden_size();
+        const int64_t nq = num_q_heads();
+        const int64_t hd = head_dim();
+        const int64_t tp = NUM_CORES;
+        const int64_t local_q_dim = (nq / tp) * hd;
+        const int64_t inter = intermediate_size();
+        const int64_t local_inter = inter / tp;
+        const int64_t compute_cs = layout.chunk_size;
+        const int64_t kv_cs = layout.effective_kv_cs();
+        const bool q_inplace = cold_config_.q_inplace &&
+            compute_cs == kv_cs && compute_cs >= physical_len &&
+            physical_len > 0;
+        const int64_t kv_storage_rows = cold_config_.kvpad16
+            ? Align(kv_cs, int64_t{16}) : 0;
+        const bool p1m = proj1_in_merger_ && merger_member_major_;
+
+        const auto append = [&](FmbRouteFamily family, int64_t site_id,
+                                int64_t selector,
+                                std::vector<int64_t> arguments = {},
+                                int64_t flags = 0,
+                                int64_t invocation = 0) {
+            manifest.routes.push_back({site_id, family, selector, flags,
+                                       std::move(arguments), invocation});
+        };
+        const auto append_linear = [&](int64_t site_id,
+                                       std::vector<int64_t> arguments,
+                                       int64_t invocation) {
+            append(FmbRouteFamily::LINEAR, site_id,
+                   static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+                   std::move(arguments), /*flags=*/0, invocation);
+        };
+
+        append(
+            FmbRouteFamily::GRAPH_SCHEDULE, HYVIT2_GRAPH_SCHEDULE_SITE,
+            static_cast<int64_t>(
+                cold_config_.fast_replay
+                    ? HyViT2GraphScheduleRoute::FAST_REPLAY_SKIP_LAYER_LOOP
+                    : HyViT2GraphScheduleRoute::REEMIT_LAYER_LOOP),
+            {cold_config_.fast_replay ? 1 : 0,
+             cold_config_.fast_replay_preload ? 1 : 0,
+             num_layers()});
+
+        for (const ChunkInfo& kv_chunk : plan.qkv.chunks) {
+            const int64_t invocation = kv_chunk.idx;
+            // SPM capacity can exceed this chunk (especially the final tail).
+            // The KV route describes only the rows actually written to DDR.
+            const int64_t kv_physical_rows = cold_config_.kvpad16 &&
+                    (position + kv_chunk.offset) % 16 == 0
+                ? Align(kv_chunk.len, int64_t{16}) : kv_chunk.len;
+            const KvInsertSegmentPlan kv_plan =
+                resolve_kvinsert_plan_auto(
+                    HYVIT2_KV_SITE, manifest.graph_lifecycle,
+                    position + kv_chunk.offset, kv_chunk.len,
+                    kv_physical_rows, tp, nq, hd,
+                    HYVIT2_KV_CAPABILITIES);
+            const KvInsertRouteArguments kv_arguments =
+                rpu_kvinsert_route_arguments(kv_plan, tp, nq, hd);
+            manifest.kv_insert_physical_rows = std::max(
+                manifest.kv_insert_physical_rows,
+                kv_chunk.offset + kv_plan.physical_rows());
+
+            append_linear(
+                HYVIT2_KV_Q_LINEAR_SITE,
+                {kv_chunk.len, nq * hd, h, 1, tp}, invocation);
+            append_linear(
+                HYVIT2_KV_K_LINEAR_SITE,
+                {kv_chunk.len, nq * hd, h, 1, tp}, invocation);
+            append_linear(
+                HYVIT2_KV_V_LINEAR_SITE,
+                {kv_chunk.len, nq * hd, h, 1, tp}, invocation);
+            append(
+                FmbRouteFamily::KV_INSERT, HYVIT2_KV_PADDING_SITE,
+                static_cast<int64_t>(
+                    kv_physical_rows > kv_chunk.len
+                        ? HyViT2KvPaddingRoute::PAD16_ROWS
+                        : HyViT2KvPaddingRoute::LOGICAL_ROWS),
+                {cold_config_.kvpad16 ? 1 : 0, kv_chunk.len,
+                 kv_storage_rows, kv_physical_rows, tp, nq, hd},
+                /*flags=*/0, invocation);
+            append(
+                FmbRouteFamily::KV_INSERT, HYVIT2_KV_SITE,
+                static_cast<int64_t>(kv_plan.route()),
+                std::vector<int64_t>(kv_arguments.begin(), kv_arguments.end()),
+                HYVIT2_KV_FLAG_DDR_MIRROR, invocation);
+            append(
+                FmbRouteFamily::MUTABLE_DMA, HYVIT2_Q_SAVE_DMA_SITE,
+                static_cast<int64_t>(
+                    q_inplace ? HyViT2DmaRoute::KEEP_Q_IN_SPM
+                              : HyViT2DmaRoute::SPM_SCATTER_TO_DDR_FIXED),
+                {cold_config_.q_inplace ? 1 : 0, q_inplace ? 1 : 0,
+                 kv_chunk.offset, kv_chunk.len,
+                 kv_chunk.len * local_q_dim,
+                 physical_len * local_q_dim * DWIDTH, tp},
+                /*flags=*/0, invocation);
+        }
+
+        for (const ChunkInfo& chunk : plan.compute.chunks) {
+            const int64_t invocation = chunk.idx;
+            append(
+                FmbRouteFamily::MUTABLE_DMA, HYVIT2_Q_LOAD_DMA_SITE,
+                static_cast<int64_t>(
+                    q_inplace ? HyViT2DmaRoute::KEEP_Q_IN_SPM
+                              : HyViT2DmaRoute::DDR_SCATTER_TO_SPM_FIXED),
+                {cold_config_.q_inplace ? 1 : 0, q_inplace ? 1 : 0,
+                 chunk.offset, chunk.len, chunk.len * local_q_dim,
+                 physical_len * local_q_dim * DWIDTH, tp},
+                /*flags=*/0, invocation);
+
+            const int64_t attention_site = raw_spm
+                ? (image_batch_count_ > 1
+                       ? HYVIT2_PACKED_RAW_SPM_ATTN_SITE
+                       : HYVIT2_SINGLE_RAW_SPM_ATTN_SITE)
+                : (image_batch_count_ > 1
+                       ? HYVIT2_PACKED_ATTN_SITE
+                       : HYVIT2_SINGLE_ATTN_SITE);
+            append(
+                FmbRouteFamily::ATTENTION, attention_site,
+                static_cast<int64_t>(
+                    raw_spm ? AttentionExecutionPolicy::SPM_KV_BY_MHA
+                            : AttentionExecutionPolicy::DDR_KV),
+                {image_batch_count_, chunk.len, physical_len, nq, hd,
+                 orig_head_dim_, tp},
+                raw_spm || raw_spm_eligible
+                    ? 0 : HYVIT2_ATTN_CAPABILITY_FALLBACK_DDR_REQUIRED,
+                invocation);
+            if (image_batch_count_ > 1) {
+                append(
+                    FmbRouteFamily::GRAPH_SCHEDULE,
+                    HYVIT2_MASK_SCHEDULE_SITE,
+                    static_cast<int64_t>(
+                        cold_config_.mask_once
+                            ? HyViT2GraphScheduleRoute::MASK_FIRST_LAYER_ONLY
+                            : HyViT2GraphScheduleRoute::MASK_EACH_LAYER),
+                    {cold_config_.mask_once ? 1 : 0, image_batch_count_,
+                     chunk.len, physical_len, num_layers(), tp},
+                    /*flags=*/0, invocation);
+            }
+            append_linear(
+                HYVIT2_O_LINEAR_SITE,
+                {chunk.len, h, nq * hd, 0, tp}, invocation);
+            append(
+                FmbRouteFamily::ALL_REDUCE,
+                HYVIT2_ATTN_ALL_REDUCE_SITE,
+                fmb_ring_all_reduce_route_selector(chunk.len, h),
+                {chunk.len, h, tp, NUM_CORES},
+                /*flags=*/0, invocation);
+            append_linear(
+                HYVIT2_FC1_LINEAR_SITE,
+                {chunk.len, inter, h, 1, tp}, invocation);
+            append_linear(
+                HYVIT2_FC2_LINEAR_SITE,
+                {chunk.len, h, inter, 0, tp}, invocation);
+            append(
+                FmbRouteFamily::ALL_REDUCE,
+                HYVIT2_MLP_ALL_REDUCE_SITE,
+                fmb_ring_all_reduce_route_selector(chunk.len, h),
+                {chunk.len, h, tp, NUM_CORES},
+                /*flags=*/0, invocation);
+
+            const auto append_merger_permute = [&](int64_t site_id) {
+                append(
+                    FmbRouteFamily::GRAPH_SCHEDULE, site_id,
+                    static_cast<int64_t>(
+                        merger_member_major_
+                            ? HyViT2GraphScheduleRoute::MERGER_MEMBER_MAJOR_LAYOUT
+                            : HyViT2GraphScheduleRoute::PATCH_MAJOR_LAYOUT),
+                    {merger_member_major_ ? 1 : 0,
+                     proj1_in_merger_ ? 1 : 0, p1m ? 1 : 0,
+                     image_batch_count_, chunk.offset, chunk.len,
+                     physical_len, h},
+                    /*flags=*/0, invocation);
+            };
+            append_merger_permute(HYVIT2_MERGER_PERMUTE1_SITE);
+            append_merger_permute(HYVIT2_MERGER_PERMUTE2_SITE);
+            if (p1m) {
+                append(
+                    FmbRouteFamily::MUTABLE_DMA,
+                    HYVIT2_TAIL_OUTPUT_DMA_SITE,
+                    static_cast<int64_t>(HyViT2DmaRoute::SPM_TO_DDR_MUTABLE),
+                    {merger_member_major_ ? 1 : 0,
+                     proj1_in_merger_ ? 1 : 0, p1m ? 1 : 0,
+                     chunk.offset, chunk.len, h, h},
+                    /*flags=*/0, invocation);
+            } else {
+                append(
+                    FmbRouteFamily::MUTABLE_DMA,
+                    HYVIT2_TAIL_SLOT_DMA_SITE,
+                    static_cast<int64_t>(HyViT2DmaRoute::SPM_TO_DDR_FIXED),
+                    {merger_member_major_ ? 1 : 0,
+                     proj1_in_merger_ ? 1 : 0, p1m ? 1 : 0,
+                     chunk.offset, chunk.len, h},
+                    /*flags=*/0, invocation);
+                append_linear(
+                    HYVIT2_PROJECTOR_LINEAR_SITE,
+                    {proj1_in_merger_ ? 1 : 0,
+                     merger_member_major_ ? 1 : 0, p1m ? 1 : 0,
+                     chunk.len, projection_dim_, h, 1, 1},
+                    invocation);
+            }
+        }
+
+        if (planning_external_patch_prologue_) {
+            TORCH_CHECK(
+                has_patch_emb_ &&
+                    static_cast<int64_t>(plan.spans.size()) ==
+                        image_batch_count_,
+                "RPU_PLANNER_REJECT:CAPABILITY: HYViT2 patch prologue "
+                "requires initialized patch weights and one span per image");
+            const int64_t K = pe_kh_ * pe_kw_ * pe_cin_padded_;
+            for (int64_t image = 0; image < image_batch_count_; ++image) {
+                const FmbExecutionSpan& span = plan.spans[image];
+                append(
+                    FmbRouteFamily::MUTABLE_DMA,
+                    HYVIT2_PATCH_INPUT_DMA_SITE,
+                    static_cast<int64_t>(HyViT2PatchMutableDmaRoute::
+                        DDR_BROADCAST_TO_SPM_MUTABLE),
+                    {span.len, pe_cin_orig_, pe_cin_padded_, pe_kh_, pe_kw_,
+                     pe_strideh_, pe_stridew_, patch_embed_cores_},
+                    /*flags=*/0, /*invocation=*/image);
+                append(
+                    FmbRouteFamily::LINEAR,
+                    HYVIT2_PATCH_LINEAR_SITE,
+                    static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+                    {span.len, pe_cout_, K, 1, patch_embed_cores_, 0},
+                    /*flags=*/0, /*invocation=*/image);
+                if (patch_embed_cores_ > 1) {
+                    const RpuAllGatherSchedule schedule =
+                        rpu_resolve_all_gather_schedule(
+                            pe_cout_ / patch_embed_cores_, DWIDTH);
+                    append(
+                        FmbRouteFamily::COLLECTIVE,
+                        HYVIT2_PATCH_ALL_GATHER_SITE,
+                        static_cast<int64_t>(schedule),
+                        {span.len, pe_cout_ / patch_embed_cores_, DWIDTH,
+                         patch_embed_cores_},
+                        /*flags=*/0, /*invocation=*/image);
+                }
+                append(
+                    FmbRouteFamily::MUTABLE_DMA,
+                    HYVIT2_PATCH_POSITION_DMA_SITE,
+                    static_cast<int64_t>(HyViT2PatchMutableDmaRoute::
+                        DDR_BROADCAST_TO_SPM_MUTABLE),
+                    {span.len, pe_cout_, 1},
+                    /*flags=*/0, /*invocation=*/image);
+                append(
+                    FmbRouteFamily::MUTABLE_DMA,
+                    HYVIT2_PATCH_OUTPUT_DMA_SITE,
+                    static_cast<int64_t>(HyViT2PatchMutableDmaRoute::
+                        SPM_COPY_TO_DDR_MUTABLE),
+                    {span.offset * pe_cout_ * DWIDTH,
+                     span.len * pe_cout_},
+                    /*flags=*/0, /*invocation=*/image);
+            }
+        }
+        append_fmb_shared_runtime_routes(
+            manifest, plan, hidden_size(), FMB_SHARED_LAYER_INPUT_DMA);
+        return manifest;
+    }
+
+    std::vector<FmbPhysicalExecutionManifest>
+    physical_manifest_domain_for_candidate(
+        const FmbThreeStageChunkPlan& plan,
+        const LayoutContext& layout,
+        int64_t physical_len, int64_t logical_len,
+        int64_t position) const override {
+        LayoutContext ddr_layout = layout;
+        ddr_layout.attention_policy = AttentionExecutionPolicy::DDR_KV;
+        std::vector<FmbPhysicalExecutionManifest> domain{
+            physical_manifest_for_candidate(
+                plan, ddr_layout, physical_len, logical_len, position)};
+        LayoutContext spm_layout = layout;
+        spm_layout.attention_policy =
+            AttentionExecutionPolicy::SPM_KV_BY_MHA;
+        if (subclass_spm_kv_by_mha_eligible(
+                plan, spm_layout, position)) {
+            domain.push_back(physical_manifest_for_candidate(
+                plan, spm_layout, physical_len, logical_len, position));
+        }
+        return domain;
+    }
+
+    FmbPhysicalManifestForwardCapability
+    physical_manifest_forward_capability(
+        const FmbPhysicalExecutionManifest& /*manifest*/) const override {
+        return {true, FmbGraphLifecycle::COMPOSITE_CHILD};
+    }
+
+    bool subclass_spm_kv_by_mha_eligible(
+        const FmbThreeStageChunkPlan& plan,
+        const LayoutContext& layout,
+        int64_t position) const override {
+        if (position != 0 || layout.is_causal || layout.use_attn_mask ||
+            layout.batch_size != 1 ||
+            layout.attention_policy !=
+                AttentionExecutionPolicy::SPM_KV_BY_MHA ||
+            plan.chunk_mode != ChunkMode::KV_FIRST ||
+            plan.qkv.chunks.size() != 1 ||
+            plan.compute.chunks.size() != 1 || image_batch_count_ <= 0 ||
+            image_batch_count_ > 8 ||
+            static_cast<int64_t>(plan.input.chunks.size()) !=
+                image_batch_count_ ||
+            static_cast<int64_t>(plan.spans.size()) != image_batch_count_) {
+            return false;
+        }
+        const ChunkInfo& chunk = plan.compute.chunks.front();
+        const int64_t seq = chunk.len;
+        if (seq <= 0 || seq != seq_len_ ||
+            seq != image_batch_count_ * 196 || chunk.offset != 0 ||
+            chunk.kv_seq_len != seq ||
+            plan.qkv.chunks.front().offset != 0 ||
+            plan.qkv.chunks.front().len != seq) {
+            return false;
+        }
+        for (int64_t image = 0; image < image_batch_count_; ++image) {
+            const int64_t offset = image * 196;
+            if (plan.input.chunks[image].offset != offset ||
+                plan.input.chunks[image].len != 196 ||
+                plan.spans[image].offset != offset ||
+                plan.spans[image].len != 196) {
+                return false;
+            }
+        }
+        const int mask_type = image_batch_count_ > 1 ? 4 : 0;
+        return num_layers() == 27 && layer_weights_.size() == 27 &&
+            hidden_size() == 1152 && intermediate_size() == 4352 &&
+            num_q_heads() == 16 && num_kv_heads() == 16 &&
+            head_dim() == 80 && orig_head_dim_ == 72 &&
+            sdpa_by_mha_spm_is_valid(
+                /*batch=*/1, seq, seq, num_q_heads(), num_kv_heads(),
+                head_dim(), NUM_CORES, mask_type);
     }
 
     // ========================================================================
@@ -900,12 +1529,12 @@ protected:
     // cycle 2+ 时 SIGLIP_WEIGHTS DMA graph + SIGLIP_COMPUTE compute graph 都直接
     // SKIP/REPLAY (省去 272 个权重 DMA + 382 个 compute kernel).
     //
-    // SigLIP uses one-shot preload-fn instead of per-buffer
+    // SigLIP uses one-shot preload-fn (D-501) instead of per-buffer
     // `.preload_callback` (which would be the Gemma pattern) — so NO
     // `.preload_callback` field is set on any decl here.
     // ========================================================================
     std::vector<BufferDecl> declare_buffers(const LayoutContext& ctx) override {
-        // Three KV_FIRST chunk sizes drive three buffer scopes
+        // Site4 (KV_FIRST 3-scope): three chunk sizes drive three buffer scopes
         // (mirror Gemma / image_flow). comp_cs feeds Phase 2 (SDPA + MLP);
         // kv_cs feeds Phase 1 (QKV + KV-insert); wide_cs = max sizes the
         // LayerWide band read in BOTH phases. SigLIP runs single-chunk-size
@@ -923,6 +1552,8 @@ protected:
         int64_t local_q_dim = (nq / NUM_CORES) * hd;
         int64_t local_inter = is_ / NUM_CORES;
         auto A = [](int64_t bytes) -> int64_t { return Align(bytes, 256); };
+        const bool raw_spm = ctx.attention_policy ==
+            AttentionExecutionPolicy::SPM_KV_BY_MHA;
 
         // LayerWide: read in both phases → sized at wide_cs.
         int64_t res  = A(wide_cs * h * DWIDTH);
@@ -930,12 +1561,16 @@ protected:
         // dumps it to q_ddr_buf_, never reads it again — Phase 2 reloads from
         // DDR into q_comp).
         int64_t qkv  = A(kv_cs   * local_q_dim * DWIDTH);
+        const int64_t raw_kv_rows = raw_spm
+            ? Align(kv_cs, int64_t{16}) : kv_cs;
+        const int64_t raw_kv = A(raw_kv_rows * local_q_dim * DWIDTH);
         // Compute: Phase-2 working buffers → sized at comp_cs.
         int64_t q_comp = A(comp_cs * local_q_dim * DWIDTH);
         int64_t sdpa_out = A(comp_cs * local_q_dim * DWIDTH);
         int64_t fc1  = A(comp_cs * local_inter * DWIDTH);
 
-        // Size SDPA temporaries for the Phase-2 query-chunk length.
+        // SDPA tmp sizing (same formula as before, now sized at comp_cs — the
+        // Phase-2 query-chunk length, NOT the full sequence).
         SdpaConfig sdpa_cfg{SdpaKernelType::FLASH_ATTN_SPM,
                             hd, /*nq*/nq, /*nkv*/nq,
                             /*cores*/NUM_CORES,
@@ -943,6 +1578,7 @@ protected:
         SdpaTiling t = sdpa_compute_tiling(sdpa_cfg, comp_cs);
         int64_t nkv_per_core = CeilDiv(nq, (int64_t)NUM_CORES);
         int64_t sdpa_tmp = A(t.tile_n_v16 * t.tile_k * nkv_per_core * CeilDiv(comp_cs, t.tile_m) * 32);
+        if (raw_spm) sdpa_tmp = std::max(sdpa_tmp, raw_kv);
 
         // DMA-safe sizing for persistent buffers
         auto dma_safe = [&](int64_t elems) -> int64_t {
@@ -971,13 +1607,14 @@ protected:
         // Structural — alive across both phases (always-conflict with KVIN/COMP).
         decls.push_back({"residual1",  res, 1, 8, StorageClass::Temp, 0, nullptr, ALL});
         decls.push_back({"input_norm", res, 1, 8, StorageClass::Temp, 0, nullptr, ALL});
-        // oproj: Phase-2 o_proj output / LN2 output / fc2 partial scratch,
-        // retained in the LayerWide band across both phases.
+        // oproj: Phase-2 o_proj out / LN2 out / fc2 partial scratch. Held in the
+        // LayerWide band per design (could be COMP-scoped at comp_cs as a future
+        // SPM optimization; kept LayerWide for the conservative first cut).
         decls.push_back({"oproj",      res, 4, 8, StorageClass::Temp, 0, nullptr, ALL});
 
         // Q_INPLACE（见文件头）：只在**单 chunk**（两相同一个 chunk 且覆盖整段
         // 序列）下成立 —— 否则 Phase 1/Phase 2 之间隔着别的 chunk，q 必须过 DDR。
-        q_inplace_ = hyvla_q_inplace_on()
+        q_inplace_ = cold_config_.q_inplace
                      && comp_cs == kv_cs && comp_cs >= seq_len_ && seq_len_ > 0;
 
         // KvInsert-only (Phase 1) — aliasable against Compute-only buffers.
@@ -985,11 +1622,18 @@ protected:
         decls.push_back({"q_kv",       qkv, 1, q_inplace_ ? 6 : 3, StorageClass::Temp, 0,
                          nullptr, q_inplace_ ? ALL : KVIN});
         // KVPAD16（见文件头）：k/v 槽补到 16 的倍数行，KV-insert 一次 v16 打完。
-        kv_pad_rows_ = hyvla_kvpad16_on("vit") ? Align(kv_cs, (int64_t)16) : 0;
-        const int64_t kv_sz = kv_pad_rows_ > 0
-            ? std::max(qkv, A(kv_pad_rows_ * local_q_dim * DWIDTH)) : qkv;
-        decls.push_back({"k",          kv_sz, 1, 3, StorageClass::Temp, 0, nullptr, KVIN});
-        decls.push_back({"v",          kv_sz, 1, 3, StorageClass::Temp, 0, nullptr, KVIN});
+        kv_pad_rows_ = cold_config_.kvpad16 ? Align(kv_cs, (int64_t)16) : 0;
+        const int64_t kv_sz = raw_spm
+            ? raw_kv
+            : (kv_pad_rows_ > 0
+                   ? std::max(qkv, A(kv_pad_rows_ * local_q_dim * DWIDTH))
+                   : qkv);
+        decls.push_back({"k", kv_sz, 1, raw_spm ? 5 : 3,
+                         StorageClass::Temp, 0, nullptr,
+                         raw_spm ? ALL : KVIN});
+        decls.push_back({"v", kv_sz, 1, raw_spm ? 5 : 3,
+                         StorageClass::Temp, 0, nullptr,
+                         raw_spm ? ALL : KVIN});
 
         // Compute-only (Phase 2) — lifecycle aliasing across attention→MLP.
         // Q_INPLACE 下 q_comp 就是 q_kv 本身（alias_of，不占新字节）。
@@ -1000,11 +1644,11 @@ protected:
         decls.push_back({"sdpa_out",   sdpa_out, 5, 6, StorageClass::Temp, 0, nullptr, COMP});
         decls.push_back({"sdpa_tmp",   sdpa_tmp, 5, 5, StorageClass::Temp, 0, nullptr, COMP});
         // packed 路径的显式 2D mask 槽（相位窗口贴着 SDPA 的消费窗，不与
-        // sdpa_tmp 混叠）。尺寸公式与基类一致。
+        // sdpa_tmp 混叠）。尺寸公式同基类 rpu_qwen3_model.h:1177。
         // MASK_ONCE 打开时改成 LayerWide + 撑满相位（见文件头），这样它才既不被
         // Phase-2 的 fc1 压、也不被下一层 Phase-1 的 q_kv/k/v 压。
         if (image_batch_count_ > 1) {
-            const bool once = hyvla_mask_once_on("vit");
+            const bool once = cold_config_.mask_once;
             decls.push_back({"sdpa_mask",
                              A(comp_cs * CeilDiv(seq_len_, (int64_t)16) * 32),
                              once ? 1 : 4, once ? 8 : 5, StorageClass::Temp, 0, nullptr,
@@ -1030,12 +1674,13 @@ protected:
     }
 
     // ========================================================================
-    // emit_preload_weights — 272 persistent weight DMAs
+    // emit_preload_weights — 272 persistent weight DMAs (D-501 callback body)
     //
-    // Registered through the preload-fn slot in static_config(); the framework
+    // Was v2 `build_preload_subgraph()` virtual; v3 registers this via the
+    // preload-fn slot in static_config(). Body is verbatim from v2 — framework
     // opens the weights-graph scope around this call.
     //
-    // The body emits only rpu_launch_* DMAs; no subclass-side
+    // EXT-5 contract: body emits only rpu_launch_* DMAs; no subclass-side
     // batch-context calls (framework owns them). CRITICAL: DMA length is num_elements
     // (NOT bytes). Per layer (27 layers, 10 DMA ops each) + 2 global = 272 total.
     // ========================================================================
@@ -1045,6 +1690,7 @@ protected:
         int64_t local_inter = intermediate_size() / NUM_CORES;
 
         // Loop 1: 8-core DMAs for all layers (memset + norm + col-partition bias)
+        // Matches v2 ordering at rpu_hyvit2_fused_encoder_layer.cpp:316-333.
         for (int64_t L = 0; L < num_layers(); ++L) {
             auto& bn = layer_bias_norm_[L];
 
@@ -1092,8 +1738,11 @@ protected:
                 /*num_cores=*/NUM_CORES);
         }
 
-        // Loop 2: group 1-core DMAs for row-partition biases separately from
-        // multicore preload operations.
+        // Loop 2: 1-core DMAs for all layers (row-partition biases).
+        // Matches v2 ordering at rpu_hyvit2_fused_encoder_layer.cpp:334-338.
+        // Mixing 1-core and 8-core DMAs in the same loop (as before) may cause
+        // kernel-ordering/synchronization issues in graph replay; v2's grouped
+        // pattern avoids it.
         for (int64_t L = 0; L < num_layers(); ++L) {
             auto& bn = layer_bias_norm_[L];
             rpu_launch_ddr_broadcast_spm_dma(
@@ -1108,17 +1757,27 @@ protected:
     }
 
     // ========================================================================
-    // emit_kv_first_body — kv_first_fn (KV_FIRST Phase 1 body).
+    // emit_kv_first_body — D-501 kv_first_fn (KV_FIRST Phase 1 body).
     //
-    // Phase 1 runs LayerNorm1 → QKV+bias → KV-insert and saves Q to DDR
+    // SEQUENTIAL→KV_FIRST refactor Site6: extracts the former build_layer_subgraph
+    // Phase-1/2/3-front (LayerNorm1 → QKV+bias → KV-insert) and ADDS a Q→DDR save
     // so Phase 2 (build_layer_subgraph) can reload Q per query-chunk. Mirrors
     // GemmaModel::emit_kv_first_body but SIMPLIFIED: SigLIP has NO rope (position
     // embedding is added in patch_embed, not per-layer) and NO attention mask.
     //
-    // KV-insert uses ctx().position + chunk.offset as its absolute KV row.
-    // SDPA and KV-insert receive typed SPM offsets via addr_offset(name).value.
+    // CRITICAL (load-bearing) vs the old single-chunk body: KV-insert position
+    // is now `chunk.offset` (was a hardcoded 0). With position=0 and ctx().position
+    // also 0 (SigLIP forward passes position=0), chunk.offset is the absolute KV
+    // row for this chunk — so multi-chunk runs insert each chunk's K/V at the
+    // right rows of the full [seq,h] cache.
+    //
+    // Pitfall 3 structural fix: SDPA / KV-insert sites take SPM OFFSETS via
+    // addr_offset(name).value (typed-distinct from the absolute addr() return).
     // ========================================================================
     void emit_kv_first_body(int layer_idx, const ChunkInfo& chunk) {
+        TORCH_CHECK(
+            ctx().has_complete_physical_manifest(),
+            "HYViT2VisionModel requires a COMPLETE physical descriptor");
         const auto& lw = layer_weights_[layer_idx];
         int64_t seq_len = chunk.len;
         int64_t kv_pos  = ctx().position + chunk.offset;  // absolute KV row
@@ -1142,14 +1801,46 @@ protected:
             seq_len, h, eps_, false, 0, NUM_CORES);
 
         // QKV Linear with bias (SPM-to-SPM ACC16, col-partition). q → q_kv.
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::GRAPH_SCHEDULE,
+                HYVIT2_GRAPH_SCHEDULE_SITE,
+                static_cast<int64_t>(
+                    cold_config_.fast_replay
+                        ? HyViT2GraphScheduleRoute::FAST_REPLAY_SKIP_LAYER_LOOP
+                        : HyViT2GraphScheduleRoute::REEMIT_LAYER_LOOP),
+                /*resolved_flags=*/0,
+                {cold_config_.fast_replay ? 1 : 0,
+                 cold_config_.fast_replay_preload ? 1 : 0,
+                 num_layers()});
+            ctx().consume_physical_route(
+                FmbRouteFamily::LINEAR, HYVIT2_KV_Q_LINEAR_SITE,
+                static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+                /*resolved_flags=*/0,
+                {seq_len, nq * hd, h, 1, NUM_CORES}, chunk.idx);
+        }
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "input_norm"), lw.q_w, addr(0, "q_kv"),
             seq_len, nq * hd, h, 1, NUM_CORES,
             layer_addr(layer_idx, 0, "q_bias"), lw.q_ws);
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::LINEAR, HYVIT2_KV_K_LINEAR_SITE,
+                static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+                /*resolved_flags=*/0,
+                {seq_len, nq * hd, h, 1, NUM_CORES}, chunk.idx);
+        }
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "input_norm"), lw.k_w, addr(0, "k"),
             seq_len, nq * hd, h, 1, NUM_CORES,
             layer_addr(layer_idx, 0, "k_bias"), lw.k_ws);
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::LINEAR, HYVIT2_KV_V_LINEAR_SITE,
+                static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+                /*resolved_flags=*/0,
+                {seq_len, nq * hd, h, 1, NUM_CORES}, chunk.idx);
+        }
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "input_norm"), lw.v_w, addr(0, "v"),
             seq_len, nq * hd, h, 1, NUM_CORES,
@@ -1161,22 +1852,62 @@ protected:
         // Pitfall 3 structural fix: takes SPM offsets via addr_offset(name).value.
         auto& k_cache = (*ctx().k_caches)[layer_idx];
         auto& v_cache = (*ctx().v_caches)[layer_idx];
-        rpu_launch_insert_kcache_spm_unified(
-            k_cache, kv_pos, addr_offset("k").value,
-            seq_len, nq, hd, NUM_CORES, /*cache_batch_offset_elems=*/0,
-            /*allow_non8_v16=*/false, /*allow_hybrid_v16=*/false,
-            /*spm_rows=*/kv_pad_rows_);
-        rpu_launch_insert_vcache_spm_unified(
-            v_cache, kv_pos, addr_offset("v").value,
-            seq_len, nq, hd, NUM_CORES, /*cache_batch_offset_elems=*/0,
-            /*allow_non8_v16=*/false, /*allow_hybrid_v16=*/false,
-            /*spm_rows=*/kv_pad_rows_);
+        const int64_t kv_physical_rows = cold_config_.kvpad16 && kv_pos % 16 == 0
+            ? Align(seq_len, int64_t{16}) : seq_len;
+        ctx().consume_physical_route(
+            FmbRouteFamily::KV_INSERT, HYVIT2_KV_PADDING_SITE,
+            static_cast<int64_t>(
+                kv_physical_rows > seq_len
+                    ? HyViT2KvPaddingRoute::PAD16_ROWS
+                    : HyViT2KvPaddingRoute::LOGICAL_ROWS),
+            /*resolved_flags=*/0,
+            {cold_config_.kvpad16 ? 1 : 0, seq_len,
+             kv_pad_rows_, kv_physical_rows, NUM_CORES, nq, hd},
+            chunk.idx);
+        const FmbRouteManifestEntry& route = ctx().find_physical_route(
+            FmbRouteFamily::KV_INSERT, HYVIT2_KV_SITE, chunk.idx);
+        const KvInsertSegmentPlan kv_plan =
+            restore_kvinsert_plan(
+                HYVIT2_KV_SITE, route.arguments, NUM_CORES, nq, hd);
+        TORCH_CHECK(
+            kv_plan.logical_rows() == seq_len &&
+                kv_plan.physical_rows() == kv_physical_rows &&
+                kv_plan.segment(0).position == kv_pos,
+            "HYViT2VisionModel KV descriptor geometry drift at invocation ",
+            chunk.idx);
+        ctx().consume_physical_route(
+            FmbRouteFamily::KV_INSERT, HYVIT2_KV_SITE,
+            static_cast<int64_t>(kv_plan.route()),
+            HYVIT2_KV_FLAG_DDR_MIRROR,
+            route.arguments, chunk.idx);
+        rpu_launch_insert_kvcache_spm_unified_with_plan(
+            k_cache, v_cache,
+            addr_offset("k").value, addr_offset("v").value,
+            nq, hd, NUM_CORES,
+            /*k_cache_batch_offset_elems=*/0,
+            /*v_cache_batch_offset_elems=*/0,
+            kv_pad_rows_, kv_plan);
 
         // Save Q to the per-seq Q staging slot via spm_scatter_ddr_dma
         // (position-indexed by chunk.offset). The slot (keyed by seq_len_) is
         // created once in forward_packed and NEVER reallocated → stable data_ptr,
-        // safe for non-mutable DMA across REPLAY. Phase 2 reloads it into "q_comp".
+        // safe for non-mutable DMA across REPLAY (matching GemmaModel:
+        // stable storage). Phase 2 reloads it into "q_comp".
         // Q_INPLACE: 单 chunk 下 Phase 2 紧跟其后、直接读 q_kv ⇒ 整趟往返不发。
+        const int64_t q_local_elems = seq_len * local_q_heads_ * hd;
+        const int64_t q_core_stride_bytes =
+            seq_len_ * local_q_heads_ * hd * DWIDTH;
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::MUTABLE_DMA, HYVIT2_Q_SAVE_DMA_SITE,
+                static_cast<int64_t>(
+                    q_inplace_ ? HyViT2DmaRoute::KEEP_Q_IN_SPM
+                               : HyViT2DmaRoute::SPM_SCATTER_TO_DDR_FIXED),
+                /*resolved_flags=*/0,
+                {cold_config_.q_inplace ? 1 : 0, q_inplace_ ? 1 : 0,
+                 chunk.offset, seq_len, q_local_elems,
+                 q_core_stride_bytes, NUM_CORES}, chunk.idx);
+        }
         if (q_inplace_) {
             TORCH_CHECK(chunk.len == seq_len_ && chunk.offset == 0,
                         "HYViT2VisionModel: Q_INPLACE 只在单 chunk 下成立 "
@@ -1187,11 +1918,12 @@ protected:
         TORCH_CHECK(q_ddr_slots_.count({seq_len_, local_q_heads_ * head_dim()}) == 1,
                     "HYViT2VisionModel: Q staging slot not allocated in KV_FIRST mode");
         const at::Tensor& q_slot = q_ddr_slot();
-        int64_t q_local_elems = seq_len * local_q_heads_ * hd;
         c10::Half* q_ddr_base = q_slot.data_ptr<c10::Half>();
         int64_t q_row_stride = local_q_heads_ * hd;
         int64_t q_elem_offset = chunk.offset * q_row_stride;
-        int64_t q_core_stride_bytes = q_slot.size(1) * q_row_stride * DWIDTH;
+        TORCH_CHECK(
+            q_core_stride_bytes == q_slot.size(1) * q_row_stride * DWIDTH,
+            "HYViT2VisionModel Q staging descriptor/core stride drift");
         rpu_launch_spm_scatter_ddr_dma(
             addr(0, "q_kv"), q_ddr_base + q_elem_offset,
             q_local_elems, q_core_stride_bytes,
@@ -1202,7 +1934,8 @@ protected:
     }
 
     // ========================================================================
-    // build_layer_subgraph — KV_FIRST Phase 2 body.
+    // build_layer_subgraph — KV_FIRST Phase 2 body (was the full SEQUENTIAL
+    // 6-phase pipeline; Site7 removed LN1/QKV/KV-insert → now in Phase 1).
     //
     // Phase 2: reload Q from q_ddr_buf_ → q_comp → SDPA (full-KV) → O_proj+resid
     //          → LayerNorm2+fc1+GELU → fc2+resid.
@@ -1211,7 +1944,7 @@ protected:
     // (the FULL bidirectional KV) — the two are decoupled by the launcher (see
     // rpu_launch_sdpa_spm_unified_kernel_v2 signature). mask=0 (MASK_NONE).
     //
-    // Last layer: fuses post-LN + projector Linear.
+    // Last layer: fuses post-LN + projector Linear (D-501).
     //
     // Pitfall 3 structural fix: SDPA call site uses `addr_offset(name).value`
     // (typed SPM offset). Non-SDPA sites use absolute `addr(0, name)` /
@@ -1238,15 +1971,31 @@ protected:
         // chunk.offset) into "q_comp" (mirror GemmaModel build_layer_subgraph
         // DDR→SPM scatter; NO rope). The slot is keyed by seq_len_, so its
         // size(1) == seq_len_ gives the per-core pitch — and being never
-        // reallocated, its data_ptr stays valid across REPLAY.
+        // reallocated, its data_ptr stays valid across REPLAY .
         // Q_INPLACE: q 还留在 q_kv 里，而 "q_comp" 已 alias 到它 ⇒ 不必读回。
+        const int64_t q_local_elems = seq_len * local_q_heads_ * hd;
+        const int64_t q_core_stride_bytes =
+            seq_len_ * local_q_heads_ * hd * DWIDTH;
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::MUTABLE_DMA, HYVIT2_Q_LOAD_DMA_SITE,
+                static_cast<int64_t>(
+                    q_inplace_ ? HyViT2DmaRoute::KEEP_Q_IN_SPM
+                               : HyViT2DmaRoute::DDR_SCATTER_TO_SPM_FIXED),
+                /*resolved_flags=*/0,
+                {cold_config_.q_inplace ? 1 : 0, q_inplace_ ? 1 : 0,
+                 chunk.offset, seq_len, q_local_elems,
+                 q_core_stride_bytes, NUM_CORES}, chunk.idx);
+        }
         if (!q_inplace_) {
             const at::Tensor& q_slot = q_ddr_slot();
-            int64_t q_local_elems = seq_len * local_q_heads_ * hd;
             c10::Half* q_ddr_base = q_slot.data_ptr<c10::Half>();
             int64_t q_row_stride = local_q_heads_ * hd;
             int64_t q_elem_offset = chunk.offset * q_row_stride;
             int64_t q_core_stride = q_slot.size(1) * q_row_stride * DWIDTH;
+            TORCH_CHECK(
+                q_core_stride == q_core_stride_bytes,
+                "HYViT2VisionModel Q reload descriptor/core stride drift");
             rpu_launch_ddr_scatter_spm_dma(
                 q_ddr_base + q_elem_offset,
                 /*elements_per_core=*/q_local_elems,
@@ -1286,34 +2035,153 @@ protected:
             const PreparedMask& pm =
                 packed_block_mask(seq_len_, image_batch_count_);
             const uint32_t mask_off = addr_offset("sdpa_mask").value;
+            if (ctx().has_complete_physical_manifest()) {
+                ctx().consume_physical_route(
+                    FmbRouteFamily::GRAPH_SCHEDULE,
+                    HYVIT2_MASK_SCHEDULE_SITE,
+                    static_cast<int64_t>(
+                        cold_config_.mask_once
+                            ? HyViT2GraphScheduleRoute::MASK_FIRST_LAYER_ONLY
+                            : HyViT2GraphScheduleRoute::MASK_EACH_LAYER),
+                    /*resolved_flags=*/0,
+                    {cold_config_.mask_once ? 1 : 0, image_batch_count_,
+                     seq_len, seq_len_, num_layers(), NUM_CORES},
+                    chunk.idx);
+            }
             // 块对角 mask 逐层恒定（且此路径已断言单 chunk）⇒ 槽撑满相位后
             // 只需在层 0 灌一次（见文件头 MASK_ONCE）。
-            if (!hyvla_mask_once_on("vit") || layer_idx == 0)
+            if (!cold_config_.mask_once || layer_idx == 0)
                 sdpa_dma_mask_to_spm(pm, mask_off, seq_len_, seq_len_, NUM_CORES);
-            rpu_launch_sdpa_spm_unified_kernel_v2(
-                k_cache, v_cache,
-                pm.mask_type, attn_scale,
-                addr_offset("q_comp").value,
-                addr_offset("sdpa_out").value,
-                addr_offset("sdpa_tmp").value, mask_off,
-                /*seq_q=*/seq_len, nq, nq, hd,
-                /*kv_seq_len=*/seq_len_, NUM_CORES, NUM_CORES);
+            if (ctx().attention_policy ==
+                AttentionExecutionPolicy::SPM_KV_BY_MHA) {
+                TORCH_CHECK(
+                    chunk.offset == 0 && chunk.len == seq_len_ &&
+                        pm.mask_type == 4,
+                    "HYViT2 raw-SPM packed attention requires one full "
+                    "packed chunk and MASK_2D");
+                rpu_launch_v_transpose_spm(
+                    addr(0, "v"), addr(0, "sdpa_tmp"),
+                    /*batch=*/1, seq_len_, nq, hd, NUM_CORES);
+                ctx().consume_physical_route(
+                    FmbRouteFamily::ATTENTION,
+                    HYVIT2_PACKED_RAW_SPM_ATTN_SITE,
+                    static_cast<int64_t>(
+                        AttentionExecutionPolicy::SPM_KV_BY_MHA),
+                    /*resolved_flags=*/0,
+                    {image_batch_count_, seq_len, seq_len_, nq, hd,
+                     orig_head_dim_, NUM_CORES}, chunk.idx);
+                rpu_launch_sdpa_by_mha_spm(
+                    addr(0, "q_comp"), addr(0, "k"),
+                    addr(0, "sdpa_tmp"), addr(0, "sdpa_out"),
+                    addr(0, "sdpa_mask"), pm.mask_type, attn_scale,
+                    /*batch=*/1, seq_len, seq_len_, nq, nq, hd,
+                    NUM_CORES);
+            } else {
+                if (ctx().has_complete_physical_manifest()) {
+                    LayoutContext spm_layout;
+                    spm_layout.attention_policy =
+                        AttentionExecutionPolicy::SPM_KV_BY_MHA;
+                    spm_layout.batch_size = ctx().batch_size;
+                    spm_layout.is_causal = ctx().is_causal;
+                    spm_layout.use_attn_mask =
+                        ctx().attention_mask.has_value();
+                    const bool raw_profile =
+                        subclass_spm_kv_by_mha_eligible(
+                            ctx().stage_plan, spm_layout, ctx().position);
+                    ctx().consume_physical_route(
+                        FmbRouteFamily::ATTENTION, HYVIT2_PACKED_ATTN_SITE,
+                        static_cast<int64_t>(
+                            AttentionExecutionPolicy::DDR_KV),
+                        raw_profile
+                            ? 0
+                            : HYVIT2_ATTN_CAPABILITY_FALLBACK_DDR_REQUIRED,
+                        {image_batch_count_, seq_len, seq_len_, nq, hd,
+                         orig_head_dim_, NUM_CORES}, chunk.idx);
+                }
+                rpu_launch_sdpa_spm_unified_kernel_v2(
+                    k_cache, v_cache,
+                    pm.mask_type, attn_scale,
+                    addr_offset("q_comp").value,
+                    addr_offset("sdpa_out").value,
+                    addr_offset("sdpa_tmp").value, mask_off,
+                    /*seq_q=*/seq_len, nq, nq, hd,
+                    /*kv_seq_len=*/seq_len_, NUM_CORES, NUM_CORES);
+            }
         } else {
-            rpu_launch_sdpa_spm_unified_kernel_v2(
-                k_cache, v_cache,
-                0 /*MASK_NONE*/, attn_scale,
-                addr_offset("q_comp").value,
-                addr_offset("sdpa_out").value,
-                addr_offset("sdpa_tmp").value, 0,
-                /*seq_q=*/seq_len, nq, nq, hd,
-                /*kv_seq_len=*/seq_len_, NUM_CORES, NUM_CORES);
+            if (ctx().attention_policy ==
+                AttentionExecutionPolicy::SPM_KV_BY_MHA) {
+                TORCH_CHECK(chunk.offset == 0 && chunk.len == seq_len_,
+                            "HYViT2 raw-SPM attention requires one full chunk");
+                rpu_launch_v_transpose_spm(
+                    addr(0, "v"), addr(0, "sdpa_tmp"),
+                    /*batch=*/1, seq_len_, nq, hd, NUM_CORES);
+                ctx().consume_physical_route(
+                    FmbRouteFamily::ATTENTION,
+                    HYVIT2_SINGLE_RAW_SPM_ATTN_SITE,
+                    static_cast<int64_t>(
+                        AttentionExecutionPolicy::SPM_KV_BY_MHA),
+                    /*resolved_flags=*/0,
+                    {image_batch_count_, seq_len, seq_len_, nq, hd,
+                     orig_head_dim_, NUM_CORES}, chunk.idx);
+                rpu_launch_sdpa_by_mha_spm(
+                    addr(0, "q_comp"), addr(0, "k"),
+                    addr(0, "sdpa_tmp"), addr(0, "sdpa_out"),
+                    /*mask_spm=*/0, /*MASK_NONE=*/0, attn_scale,
+                    /*batch=*/1, seq_len, seq_len_, nq, nq, hd,
+                    NUM_CORES);
+            } else {
+                if (ctx().has_complete_physical_manifest()) {
+                    LayoutContext spm_layout;
+                    spm_layout.attention_policy =
+                        AttentionExecutionPolicy::SPM_KV_BY_MHA;
+                    spm_layout.batch_size = ctx().batch_size;
+                    spm_layout.is_causal = ctx().is_causal;
+                    spm_layout.use_attn_mask =
+                        ctx().attention_mask.has_value();
+                    const bool raw_profile =
+                        subclass_spm_kv_by_mha_eligible(
+                            ctx().stage_plan, spm_layout, ctx().position);
+                    ctx().consume_physical_route(
+                        FmbRouteFamily::ATTENTION, HYVIT2_SINGLE_ATTN_SITE,
+                        static_cast<int64_t>(
+                            AttentionExecutionPolicy::DDR_KV),
+                        raw_profile
+                            ? 0
+                            : HYVIT2_ATTN_CAPABILITY_FALLBACK_DDR_REQUIRED,
+                        {image_batch_count_, seq_len, seq_len_, nq, hd,
+                         orig_head_dim_, NUM_CORES}, chunk.idx);
+                }
+                rpu_launch_sdpa_spm_unified_kernel_v2(
+                    k_cache, v_cache,
+                    0 /*MASK_NONE*/, attn_scale,
+                    addr_offset("q_comp").value,
+                    addr_offset("sdpa_out").value,
+                    addr_offset("sdpa_tmp").value, 0,
+                    /*seq_q=*/seq_len, nq, nq, hd,
+                    /*kv_seq_len=*/seq_len_, NUM_CORES, NUM_CORES);
+            }
         }
 
         // Phase 4: O_proj (row-partition, with bias) + AllReduce + Residual
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::LINEAR, HYVIT2_O_LINEAR_SITE,
+                static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+                /*resolved_flags=*/0,
+                {seq_len, h, nq * hd, 0, NUM_CORES}, chunk.idx);
+        }
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "sdpa_out"), lw.o_w, addr(0, "oproj"),
             seq_len, h, nq * hd, 0, NUM_CORES,
             layer_addr(layer_idx, 0, "o_bias"), lw.o_ws);
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::ALL_REDUCE,
+                HYVIT2_ATTN_ALL_REDUCE_SITE,
+                fmb_ring_all_reduce_route_selector(seq_len, h),
+                /*resolved_flags=*/0,
+                {seq_len, h, NUM_CORES, NUM_CORES}, chunk.idx);
+        }
         rpu_launch_all_reduce_sum_residual_kernel(
             addr(0, "oproj"), addr(0, "residual1"), addr(0, "input_norm"),
             seq_len, h, NUM_CORES, NUM_CORES);
@@ -1323,6 +2191,13 @@ protected:
             addr(0, "input_norm"), addr(0, "oproj"),
             layer_addr(layer_idx, 0, "ln2_gamma"), layer_addr(layer_idx, 0, "ln2_beta"),
             seq_len, h, eps_, false, 0, NUM_CORES);
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::LINEAR, HYVIT2_FC1_LINEAR_SITE,
+                static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+                /*resolved_flags=*/0,
+                {seq_len, is_, h, 1, NUM_CORES}, chunk.idx);
+        }
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "oproj"), lw.fc1_w, addr(0, "fc1"),
             seq_len, is_, h, 1, NUM_CORES,
@@ -1332,15 +2207,30 @@ protected:
             seq_len * local_inter, ValuOpType::ADD, /*is_gelu=*/true, NUM_CORES);
 
         // Phase 6: fc2 (row-partition, with bias) + AllReduce + Residual
-        // The final output goes to "residual1" instead of "oproj" so the
+        // Round 9: final output goes to "residual1" instead of "oproj" so the
         // next layer (which reads from "residual1") gets it directly via SPM
         // without needing DDR ping-pong.
         // Phase 6 uses "oproj" as temporary storage for fc2 partial results,
         // then all_reduce(oproj + input_norm) lands back in "residual1".
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::LINEAR, HYVIT2_FC2_LINEAR_SITE,
+                static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+                /*resolved_flags=*/0,
+                {seq_len, h, is_, 0, NUM_CORES}, chunk.idx);
+        }
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "fc1"), lw.fc2_w, addr(0, "oproj"),
             seq_len, h, is_, 0, NUM_CORES,
             layer_addr(layer_idx, 0, "fc2_bias"), lw.fc2_ws);
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::ALL_REDUCE,
+                HYVIT2_MLP_ALL_REDUCE_SITE,
+                fmb_ring_all_reduce_route_selector(seq_len, h),
+                /*resolved_flags=*/0,
+                {seq_len, h, NUM_CORES, NUM_CORES}, chunk.idx);
+        }
         rpu_launch_all_reduce_sum_residual_kernel(
             addr(0, "oproj"), addr(0, "input_norm"), addr(0, "residual1"),
             seq_len, h, NUM_CORES, NUM_CORES);
@@ -1359,8 +2249,15 @@ protected:
                 emit_layer_output_dma(layer_idx, chunk, "residual1");
             }
         } else {
-            // The action path has no post-LayerNorm: the encoder output feeds the
-            // tower-external merger directly. Stage residual1 to DDR as-is.
+            // Last layer (D-501): Projector ONLY.
+            // DIVERGENCE FROM SigLIP: HYViT2 has NO post-LayerNorm on the action
+            // path — `_HYViT2VisionTransformer.forward_head` is dead code because
+            // `cal_attn_pool=False`, and the encoder output feeds the tower-external
+            // `merger` directly. Passing an identity LayerNorm is NOT an option:
+            // LayerNorm(w=1,b=0) still applies (x-mean)/std
+            // and is per-row nonlinear, so no weight choice
+            // can cancel it. Phase-6 output stays in "residual1" and is staged to
+            // DDR as-is.
 
             // SPM → DDR temp (num_elements, NOT bytes). Shape-keyed staging slot
             // sized at chunk.len rows — an internal member Python never sees, so
@@ -1372,10 +2269,27 @@ protected:
                 slot = at::empty({seq_len, h},
                     at::TensorOptions().dtype(at::kHalf).device(at::kPrivateUse1));
             }
-            // Fused merger mode reorders patch rows to member-major before proj1.
-            // Two equivalent permutations reuse existing temporary slots, adding
-            // no SPM allocation; the resulting group order matches the merger.
+            // merger 的 member-major 重排（项 A，`RPU_HY_VLA_FUSED_MERGER`）。
+            // tower 外 merger 把每张图的 14×14 patch 按 2×2 分成 7×7 组，组轴上做
+            // pooled / softmax / 加权求和。**只有 member-major `[4, G, D]`（G = B·49）
+            // 才能让这三件事退化成扁平算子**（同一成员的全部组在内存里连成一片），
+            // 否则要么用跨步 kernel（没有），要么 588 次逐行 DMA。
+            //
+            // 源行下标 row = (((cam*7+r7)*2 + a)*7 + c7)*2 + b，
+            // 轴序 X=(cam,r7)[B·gr] · a[2] · c7[gr] · b[2] · D ⇒ **两次 perm{1,0,2}**：
+            //   #1  (X·a·c7, n=b=2, c=D)      -> (b, X, a, c7, D)
+            //   #2  (b·X,    n=a=2, c=c7·D)   -> (a, b, X, c7, D) = (m, g, D) ✅
+            // 两次都是 transpose_nbc（`rpu_permute.cpp:700` 的 "102" 分支），
+            // c 都是 16 的倍数且 < 65536（reg 是 u16）。
+            //
+            // 放在 proj1 **之前**：这里是 h=1152 而不是 proj 后的 2048，少搬一半；
+            // 且 residual1 本来就在 SPM，不需要任何 DMA。乒乓复用同层已死的
+            // input_norm / oproj（两者与 residual1 相位重叠 ⇒ 框架保证不混叠）
+            // ⇒ **不新增任何 SPM**。
+            // 末端不需要反向置换：加权求和后的 147 组顺序就是 (cam,r7,c7)，
+            // 正好是 VLM 期望的顺序。
             uint32_t tail_src = addr(0, "residual1");
+            const bool p1m = proj1_in_merger_ && merger_member_major_;
             if (merger_member_major_) {
                 TORCH_CHECK(chunk.len == seq_len_,
                             "HYViT2VisionModel: member-major merger requires a single "
@@ -1391,34 +2305,85 @@ protected:
                 const int64_t gr = side / 2;
                 TORCH_CHECK(gr * h < 65536,
                             "HYViT2VisionModel: permute3d c-reg is u16, gr*h=", gr * h);
+                if (ctx().has_complete_physical_manifest()) {
+                    ctx().consume_physical_route(
+                        FmbRouteFamily::GRAPH_SCHEDULE,
+                        HYVIT2_MERGER_PERMUTE1_SITE,
+                        static_cast<int64_t>(
+                            HyViT2GraphScheduleRoute::MERGER_MEMBER_MAJOR_LAYOUT),
+                        /*resolved_flags=*/0,
+                        {merger_member_major_ ? 1 : 0,
+                         proj1_in_merger_ ? 1 : 0, p1m ? 1 : 0,
+                         image_batch_count_, chunk.offset, seq_len,
+                         seq_len_, h}, chunk.idx);
+                }
                 rpu_launch_permute3d_spm_kernel(
                     tail_src, addr(0, "input_norm"),
                     /*b=*/B * gr * 2 * gr, /*n=*/2, /*c=*/h, {1, 0, 2}, /*num_cores=*/1);
+                if (ctx().has_complete_physical_manifest()) {
+                    ctx().consume_physical_route(
+                        FmbRouteFamily::GRAPH_SCHEDULE,
+                        HYVIT2_MERGER_PERMUTE2_SITE,
+                        static_cast<int64_t>(
+                            HyViT2GraphScheduleRoute::MERGER_MEMBER_MAJOR_LAYOUT),
+                        /*resolved_flags=*/0,
+                        {merger_member_major_ ? 1 : 0,
+                         proj1_in_merger_ ? 1 : 0, p1m ? 1 : 0,
+                         image_batch_count_, chunk.offset, seq_len,
+                         seq_len_, h}, chunk.idx);
+                }
                 rpu_launch_permute3d_spm_kernel(
                     addr(0, "input_norm"), addr(0, "oproj"),
                     /*b=*/2 * B * gr, /*n=*/2, /*c=*/gr * h, {1, 0, 2}, /*num_cores=*/1);
                 tail_src = addr(0, "oproj");
+            } else if (ctx().has_complete_physical_manifest()) {
+                const std::vector<int64_t> arguments{
+                    merger_member_major_ ? 1 : 0,
+                    proj1_in_merger_ ? 1 : 0, p1m ? 1 : 0,
+                    image_batch_count_, chunk.offset, seq_len,
+                    seq_len_, h};
+                ctx().consume_physical_route(
+                    FmbRouteFamily::GRAPH_SCHEDULE,
+                    HYVIT2_MERGER_PERMUTE1_SITE,
+                    static_cast<int64_t>(
+                        HyViT2GraphScheduleRoute::PATCH_MAJOR_LAYOUT),
+                    /*resolved_flags=*/0, arguments, chunk.idx);
+                ctx().consume_physical_route(
+                    FmbRouteFamily::GRAPH_SCHEDULE,
+                    HYVIT2_MERGER_PERMUTE2_SITE,
+                    static_cast<int64_t>(
+                        HyViT2GraphScheduleRoute::PATCH_MAJOR_LAYOUT),
+                    /*resolved_flags=*/0, arguments, chunk.idx);
             }
-            if (!(hyvla_proj1_in_merger() && merger_member_major_))
+            if (!p1m) {
+                if (ctx().has_complete_physical_manifest()) {
+                    ctx().consume_physical_route(
+                        FmbRouteFamily::MUTABLE_DMA,
+                        HYVIT2_TAIL_SLOT_DMA_SITE,
+                        static_cast<int64_t>(
+                            HyViT2DmaRoute::SPM_TO_DDR_FIXED),
+                        /*resolved_flags=*/0,
+                        {merger_member_major_ ? 1 : 0,
+                         proj1_in_merger_ ? 1 : 0, p1m ? 1 : 0,
+                         chunk.offset, seq_len, h}, chunk.idx);
+                }
                 rpu_launch_spm_copy_ddr_dma(
                     tail_src,
                     slot.data_ptr<c10::Half>(),
                     seq_len * h);
-
-            // The projector output spans the full sequence and is allocated once
-            // on the first query chunk. A fresh tracked output prevents references
-            // retained by callers from aliasing a later forward.
-            // proj1 进 merger 图之后，本塔的输出维就是 hidden（1152），不是 2048。
-            const bool p1m = hyvla_proj1_in_merger() && merger_member_major_;
-            const int64_t out_dim = p1m ? h : projection_dim_;
-            if (chunk.offset == 0) {
-                projector_output_ = allocate_tracked_output(
-                    {1, seq_len_, out_dim});
             }
-            TORCH_CHECK(projector_output_.defined(),
-                        "HYViT2VisionModel: projector_output_ undefined on a non-first "
-                        "chunk (chunk.offset=", chunk.offset,
-                        ") — first chunk must run with offset 0.");
+
+            // forward_packed prepared the full output before entering this
+            // fast-skippable layer body. Every chunk writes its own row range.
+            // proj1 进 merger 图之后，本塔的输出维就是 hidden（1152），不是 2048。
+            const int64_t out_dim = p1m ? h : projection_dim_;
+            TORCH_CHECK(
+                projector_output_.defined() && projector_output_.dim() == 3 &&
+                    projector_output_.size(0) == 1 &&
+                    projector_output_.size(1) == seq_len_ &&
+                    projector_output_.size(2) == out_dim,
+                "HYViT2VisionModel: projector output was not prepared for "
+                "the admitted forward shape");
 
             // Projector Linear (DDR col-partition) writes THIS chunk's rows.
             // For multi-chunk, target a [1, chunk.len, proj] view at the chunk's
@@ -1437,33 +2402,62 @@ protected:
                     : projector_output_.slice(1, chunk.offset,
                                               chunk.offset + chunk.len);
             if (p1m) {
-                // Write [chunk.len, h] directly to the tracked output for the
-                // merger-owned proj1. The fixed SPM-to-DDR destination is captured
-                // with the Graph.
-                rpu_launch_spm_copy_ddr_dma(
-                    tail_src, proj_out_chunk.data_ptr<c10::Half>(),
+                // The merger consumes this fresh output directly. Update its
+                // destination on replay instead of retaining the BUILD address.
+                if (ctx().has_complete_physical_manifest()) {
+                    ctx().consume_physical_route(
+                        FmbRouteFamily::MUTABLE_DMA,
+                        HYVIT2_TAIL_OUTPUT_DMA_SITE,
+                        static_cast<int64_t>(
+                            HyViT2DmaRoute::SPM_TO_DDR_MUTABLE),
+                        /*resolved_flags=*/0,
+                        {merger_member_major_ ? 1 : 0,
+                         proj1_in_merger_ ? 1 : 0, p1m ? 1 : 0,
+                         chunk.offset, seq_len, h, h}, chunk.idx);
+                }
+                rpu_launch_spm_copy_ddr_dma_mutable(
+                    tail_src, &projector_out_live_base_,
+                    /*dst_offset_bytes=*/chunk.offset * out_dim * DWIDTH,
                     chunk.len * h);
             } else {
+                if (ctx().has_complete_physical_manifest()) {
+                    ctx().consume_physical_route(
+                        FmbRouteFamily::LINEAR,
+                        HYVIT2_PROJECTOR_LINEAR_SITE,
+                        static_cast<int64_t>(
+                            FmbLinearRouteSelector::AUTO_TILE),
+                        /*resolved_flags=*/0,
+                        {proj1_in_merger_ ? 1 : 0,
+                         merger_member_major_ ? 1 : 0, p1m ? 1 : 0,
+                         seq_len, projection_dim_, h, 1, 1}, chunk.idx);
+                }
+                // The shared DDR launcher accepts matrix metadata; retain the
+                // output storage alias and its mutable per-chunk DMA address.
+                auto proj_out_matrix = proj_out_chunk.view({seq_len, out_dim});
                 rpu_launch_linear_ddr_kernel(
-                    slot, proj_w_, proj_out_chunk, proj_b_,
-                    /*has_bias=*/true, /*partition=*/1);
+                    slot, proj_w_, proj_out_matrix, proj_b_,
+                    /*has_bias=*/true, /*partition=*/1,
+                    &projector_out_live_base_,
+                    /*dst_offset_bytes=*/chunk.offset * out_dim * DWIDTH,
+                    &projector_bias_live_base_);
             }
         }
     }
 
     // ========================================================================
-    // plan_kv_first_chunks — kv_first_chunk_plan_fn.
+    // plan_kv_first_chunks — D-501 kv_first_chunk_plan_fn (Site8).
     //
     // SigLIP keeps Phase 1 (KV-insert) and Phase 2 (compute) on the SAME chunk
     // size — return the compute_plan unchanged (mirror image_flow, which also
     // disables the kv_cs doubling). The auto chunk-size scan finds the largest
     // comp_cs that fits SPM; a single kv_cs simplifies SPM budgeting and avoids
-    // a two-phase estimator/allocator mismatch.
+    // the two-phase estimator/allocator mismatch image_flow R5 documents.
     //
-    // The per-image
+    // EXCEPTION (minibatch mutual-exclusion, design note §0/Site8): the per-image
     // minibatch SDPA launcher asserts a single chunk (seq_q == full packed seq).
     // For N>1 packed images we therefore FORCE a single chunk spanning the whole
-    // sequence. N==1 keeps the ordinary single-image path.
+    // sequence. HALO's current single-image action path is N==1, so this branch
+    // is the multi-camera safety net, not the hot path.
     // ========================================================================
     ChunkPlan plan_kv_first_chunks(const ChunkPlan& compute_plan) {
         if (image_batch_count_ > 1) {
@@ -1473,13 +2467,13 @@ protected:
     }
 
     // ========================================================================
-    // subclass_chunk_size_valid — required kernel-validity hook for the auto
-    // chunk-size scan. The base default returns true (only the
+    // subclass_chunk_size_valid — kernel-validity hook for the auto chunk-size
+    // scan (Site10, REQUIRED override). The base default returns true (only the
     // SPM budget is checked), but the SigLIP SDPA imposes real tile/structural
-    // constraints the budget predicate does not capture.
+    // constraints the budget predicate does NOT capture. COPY-image_flow:287-290.
     //
     // head_dim() = 80 (padded), NOT orig_head_dim_ = 72: sdpa_is_valid_chunk_size
-    // hard-requires head_dim % 16 == 0; 72%16≠0 would reject
+    // hard-requires head_dim % 16 == 0 (rpu_helpers.h:358); 72%16≠0 would reject
     // EVERY cs, 80%16==0 passes. This matches declare_buffers' sdpa_compute_tiling
     // (which also uses head_dim()). mask=0 (MASK_NONE) skips the LTM-only
     // sQryAcc%16 constraints that don't apply to SigLIP's bidirectional attention.
@@ -1493,19 +2487,43 @@ protected:
                        head_dim(), num_q_heads(), num_q_heads(),
                        NUM_CORES, image_batch_count_ > 1 ? 4 : 0};
         if (!sdpa_is_valid_chunk_size(cfg, cs, seq_len, position)) return false;
+        // Packed images use one block-diagonal attention matrix and therefore
+        // require a single compute chunk.  Publish that constraint in the
+        // native domain instead of hiding it in a per-forward override.
+        if (image_batch_count_ > 1 && cs < seq_len) return false;
 
-        // The 512 ceiling applies to the single-image auto scan. Packed multi-image
-        // single-chunk plans are instead constrained by the exact stacked SPM budget
-        // check below.
+        // Board-proven safe ceiling (2026-06-18). cs=256/512 RUN (clean, finite);
+        // cs=880 HANGS on the cs-independent 8 MB SPM-block request
+        // (`requested=8388608 available=0` infinite retry). Root cause: persistent
+        // weights (~569 KB) + the STACKED per-chunk temps (KvInsert + Compute do
+        // NOT alias, see below) push the FULL 8 MB SPM
+        // block over, even though the bump-pool temps alone fit. The framework's
+        // budget basis (SPM_USABLE = full 8 MB) does not subtract the persistent
+        // reserve, so the auto-scan over-picks. Cap cs at the proven-working 512
+        // (1564 → ~4 chunks of ≤512, each with the cs=512 footprint that runs)
+        // until the kernel-internal SPM headroom beyond declared temps is
+        // characterized. The stacked-temp check below is the secondary defense.
+        //
+        // this 512 ceiling is the SINGLE-IMAGE auto-scan cap.
+        // Multi-image packed (image_batch_count_>1) pins ONE chunk == seq_len via
+        // set_chunk_size_override (forward_packed:624), which STILL routes through
+        // this validator (fused_model_base.cpp:490 TORCH_CHECK(valid_fn(...))) — so a
+        // legit 3-image 768-token packed forward (3*256) would be wrongly rejected by
+        // `cs>512`, regressing the pre-MR single-block path. Gate the heuristic cap to
+        // the single-image auto-scan; the multi-image forced-single-block path is
+        // bounded by the stacked-temp SPM budget gate below (the real safety check),
+        // which sizes the actual peak for this exact cs.
         if (image_batch_count_ <= 1 && cs > 512) return false;
 
-        // SPM budget gate. The
+        // SPM budget gate (residual-risk #3, board-confirmed 2026-06-18). The
         // framework's auto-scan budget check (estimate_temporary_total) models
         // KvInsert and Compute scopes as ALIASING (LayerWide + max(KvInsert,
         // Compute)). The real bump allocator (rpu_spm_allocator) does NOT free the
         // Phase-1 KvInsert temps (q_kv/k/v) before Phase-2 Compute allocates — the
-        // two scopes stack. Reject cs whose actual stacked peak
-        // (LayerWide + KvInsert + Compute) exceeds the usable
+        // two scopes STACK. Board proof: cs=944 estimated 7.78 MB (planner fits=1)
+        // but really allocated 8 458 240 B → SpmAllocator OOM. Reject cs whose
+        // ACTUAL stacked peak (LayerWide + KvInsert + Compute, the bump-allocator
+        // truth for the aliased layout) exceeds the usable
         // budget, so the auto-scan picks a cs that fits at real allocation.
         const int64_t h   = hidden_size();
         const int64_t nq  = num_q_heads();
@@ -1532,6 +2550,65 @@ protected:
         return true;
     }
 
+    // Validate the whole request before any external prologue, SPM allocation,
+    // flush or DMA. Tensor input packs its B images; list input packs one image
+    // per element. All elements share the SPM geometry allocated for image 0.
+    int64_t validate_patch_inputs(
+        at::TensorList images, bool allow_batched_tensor) const {
+        TORCH_CHECK(has_patch_emb_,
+                    "HYViT2 patch embedding requires patch embedding params");
+        TORCH_CHECK(!images.empty() && images.size() <= kMaxPackedImages &&
+                        (!allow_batched_tensor || images.size() == 1),
+                    "HYViT2 patch embedding requires 1..", kMaxPackedImages,
+                    " images (one tensor for batched input)");
+        int64_t image_count = 0;
+        for (const auto& im : images) {
+            TORCH_CHECK(im.defined() && im.dim() == 4 &&
+                            im.scalar_type() == at::kHalf &&
+                            im.device().type() == at::kPrivateUse1 &&
+                            im.is_contiguous(),
+                        "HYViT2 patch embedding requires contiguous FP16 RPU [B,3,H,W]");
+            TORCH_CHECK(im.size(0) > 0 && im.size(0) <= kMaxPackedImages &&
+                            (allow_batched_tensor || im.size(0) == 1) &&
+                            im.size(1) == pe_cin_orig_,
+                        "HYViT2 patch embedding requires RGB and list elements with batch=1");
+            TORCH_CHECK(im.size(2) >= pe_kh_ && im.size(3) >= pe_kw_ &&
+                            im.size(2) == images.front().size(2) &&
+                            im.size(3) == images.front().size(3),
+                        "HYViT2 patch embedding images must share H/W and fit a full patch");
+            image_count += im.size(0);
+        }
+        TORCH_CHECK(image_count <= kMaxPackedImages,
+                    "HYViT2 patch embedding exceeds mutable input slots");
+        const int64_t h = images.front().size(2);
+        const int64_t w = images.front().size(3);
+        if (patch_embed_cores_ > 1) {
+            // This permute uses packed source rows of (w / kw) * kw pixels.
+            // A width remainder changes their stride. A height remainder is
+            // a valid unused bottom strip, just as in the single-core im2col.
+            TORCH_CHECK(pe_strideh_ == pe_kh_ && pe_stridew_ == pe_kw_ &&
+                            w % pe_kw_ == 0,
+                        "HYViT2 multi-core patch embedding requires stride == kernel "
+                        "and width divisible by kernel width");
+        }
+        TORCH_CHECK(pe_cout_ % patch_embed_cores_ == 0,
+                    "HYViT2 patch embedding cout must be divisible by patch cores");
+        // Mirror the raw-input DMA limit before touching the allocator.
+        constexpr int64_t max_raw_pixels = (8LL << 20) / (3 * DWIDTH);
+        TORCH_CHECK(h <= max_raw_pixels / w &&
+                        (h * w * 3 * DWIDTH) % 16 == 0,
+                    "HYViT2 patch input DMA must be 16-byte aligned and at most 8 MiB");
+        const int64_t rows = ((h - pe_kh_) / pe_strideh_ + 1) *
+                             ((w - pe_kw_) / pe_stridew_ + 1);
+        TORCH_CHECK(rows <= patch_emb_pos_emb_.numel() / pe_cout_,
+                    "HYViT2 patch position table is shorter than the image patch grid");
+        TORCH_CHECK(pe_cout_ <= (8LL << 20) / DWIDTH &&
+                        rows <= (8LL << 20) / (pe_cout_ * DWIDTH) &&
+                        (rows * pe_cout_ * DWIDTH) % 16 == 0,
+                    "HYViT2 patch output DMA must be 16-byte aligned and at most 8 MiB");
+        return image_count * rows;
+    }
+
     // ========================================================================
     // run_packed_patch_embed_core — pack N per-image [1,C,H,W] tensors through
     // fused_patch_embedding into one [1, N*num_patches, hidden] tensor, each at
@@ -1546,7 +2623,9 @@ protected:
     // slices [N,C,H,W] into the vector) and the all-RPU list path (forward_multi
     // via run_packed_patch_embed_list, which receives N distinct image tensors).
     // ========================================================================
-    at::Tensor run_packed_patch_embed_core(const std::vector<at::Tensor>& images) {
+    at::Tensor run_packed_patch_embed_core(
+        const std::vector<at::Tensor>& images,
+        bool consume_external_prologue) {
         if (!SPM_ALLOC.is_initialized()) SPM_ALLOC.init();
         int64_t N = static_cast<int64_t>(images.size());
         TORCH_CHECK(N > 0, "run_packed_patch_embed: empty image list");
@@ -1571,7 +2650,7 @@ protected:
         // exactly the im2col kernel reading one and writing the other.
         // The peak is unchanged by the multi-core path (nhwc+im2col at step 4
         // dominates the gathered/pos_emb pair at step 8).
-        const int nc = hyvla_patch_embed_cores();
+        const int nc = patch_embed_cores_;
         using AR = SpmAllocator::AllocRequest;
         std::vector<uint32_t> offsets = SPM_ALLOC.alloc_temporary_aliased({
             AR{pe_cin_orig_ * HW * 2,   1, 2},  // raw
@@ -1597,14 +2676,16 @@ protected:
             // un-flushed to device DDR → the DMA would read stale bytes →
             // non-deterministic output. Idempotent for already-coherent inputs
             // (e.g. the 4D single-image .to('rpu') path), so N=1 stays
-            // byte-identical.
+            // byte-identical. (CLAUDE.md "mutable DMA reading a torch.cat result
+            // MUST be fed a flushed tensor"; memory rpu-adapter-pitfalls #5.)
             rpu_ddr_flush_force(
                 const_cast<c10::Half*>(images[i].data_ptr<c10::Half>()));
             fused_patch_embedding(
                 images[i], patch_emb_weight_, patch_emb_pos_emb_,
                 pe_kh_, pe_kw_, pe_cin_orig_, pe_cin_padded_, pe_cout_,
                 pe_strideh_, pe_stridew_,
-                hidden, /*seq_off=*/i * npp, /*img_slot=*/(int)i, offsets);
+                hidden, /*seq_off=*/i * npp, /*img_slot=*/(int)i, offsets, nc,
+                consume_external_prologue ? &ctx() : nullptr);
         }
         auto& graph = RpuKernelGraph::active();
         const auto graph_state = graph.state();
@@ -1620,29 +2701,40 @@ protected:
         return hidden;
     }
 
-    // 4D [N,C,H,W] path: slice into contiguous [1,C,H,W] images and pack through
-    // the shared core. A dim-0 slice is already contiguous.
-    at::Tensor run_packed_patch_embed(const at::Tensor& input) {
+    // 4D [N,C,H,W] single-tensor path (forward auto-detect): slice into N
+    // contiguous [1,C,H,W] images, then pack via the shared core. A dim-0 slice
+    // of a contiguous [N,C,H,W] is already contiguous, so .contiguous() is a
+    // metadata no-op (no kernel/copy). N=1 stays byte-identical to before.
+    at::Tensor run_packed_patch_embed(
+        const at::Tensor& input, bool consume_external_prologue) {
         int64_t N = input.size(0);
         std::vector<at::Tensor> images;
         images.reserve(N);
         for (int64_t i = 0; i < N; ++i) {
             images.push_back(input.slice(0, i, i + 1).contiguous());
         }
-        return run_packed_patch_embed_core(images);
+        return run_packed_patch_embed_core(
+            images, consume_external_prologue);
     }
 
     // All-RPU list path (forward_multi): the N camera images arrive as distinct
     // [1,C,H,W] tensors — no torch.cat upstream, no slice here.
-    at::Tensor run_packed_patch_embed_list(at::TensorList images) {
+    at::Tensor run_packed_patch_embed_list(
+        at::TensorList images, bool consume_external_prologue) {
         std::vector<at::Tensor> imgs(images.begin(), images.end());
-        return run_packed_patch_embed_core(imgs);
+        return run_packed_patch_embed_core(
+            imgs, consume_external_prologue);
     }
 
 private:
-    // Packed attention uses a 2D block-diagonal mask cached by (seq_len, N).
-    // Each image attends only to its own columns. Caching preserves the fixed DMA
-    // source address across Graph replay, including when mask preparation pads it.
+    // ── packed 路径的 2D 块对角 mask（按 (seq_len, N) 缓存）───────────────────
+    // minibatch SDPA 走不通：它要 `per_image_ctx % tile_m == 0`，而
+    // `tile_m = tile_m_v16 * 16` 恒为 16 的倍数，Hy-VLA 的 per_image_ctx=196
+    // (=2²×7²) 没有 16 的倍数因子。改用普通 unified SDPA + 显式 2D mask：
+    // image i 的 query 只对自己那 per_image_ctx 列开口，其余为 MASK_NEG。
+    // ⚠️ **必须缓存**：seq_len 非 16 对齐时 `sdpa_prepare_mask` 会 pad 出**新张量**，
+    //    每帧重建会让地址漂移，而它的 DMA 源在 BUILD 期就烘进图了（跨帧 REPLAY
+    //    会读到已释放的块）。按 (seq_len,N) 缓存 ⇒ 地址跨帧稳定。
     static constexpr float kPackedMaskNeg = -50000.0f;   // 与 Python 侧 MASK_NEG 一致
     std::map<std::pair<int64_t, int64_t>, PreparedMask> packed_masks_;
 
@@ -1659,8 +2751,11 @@ private:
             m.slice(2, i * per, (i + 1) * per)
              .slice(3, i * per, (i + 1) * per).fill_(0.0f);
         }
-        m = m.to(at::TensorOptions().dtype(at::kHalf).device(at::kPrivateUse1))
-             .contiguous();
+        // sdpa_prepare_mask is the single CPU-normalization/DDR-publication
+        // boundary.  Uploading here and immediately reading the same immutable
+        // mask back on the host would force an unrelated, already-recorded
+        // patch-embed prefix through Graph sync_point on the first capture.
+        m = m.contiguous();
         packed_masks_.emplace(
             key, sdpa_prepare_mask(c10::optional<at::Tensor>(m), /*is_causal=*/false,
                                    seq_len, seq_len, sdpa_stable_mask_cache(),
@@ -1669,13 +2764,56 @@ private:
     }
 
     // ----- Model state -----
+    HYViT2ColdConfig cold_config_;
+    bool cold_config_bound_ = false;
+    std::vector<int64_t> kvinsert_cost_weight_identity() const override {
+        if (layer_weights_.empty()) return {};
+        std::vector<int64_t> identity{1};
+        append_kvinsert_cost_scalar_identity(identity, eps_);
+        identity.insert(identity.end(), {
+            static_cast<int64_t>(merger_member_major_),
+            static_cast<int64_t>(proj1_in_merger_),
+            static_cast<int64_t>(cold_config_.fast_replay),
+            static_cast<int64_t>(cold_config_.fast_replay_preload),
+            static_cast<int64_t>(cold_config_.mask_once),
+            static_cast<int64_t>(cold_config_.kvpad16),
+            static_cast<int64_t>(cold_config_.q_inplace),
+            static_cast<int64_t>(has_patch_emb_)});
+        identity.push_back(static_cast<int64_t>(layer_weights_.size()));
+        for (const auto& weights : layer_weights_) {
+            for (const auto* tensor : {
+                    &weights.q_w, &weights.k_w, &weights.v_w, &weights.o_w,
+                    &weights.fc1_w, &weights.fc2_w, &weights.q_ws, &weights.k_ws,
+                    &weights.v_ws, &weights.o_ws, &weights.fc1_ws, &weights.fc2_ws}) {
+                append_kvinsert_cost_tensor_identity(identity, *tensor);
+            }
+        }
+        identity.push_back(static_cast<int64_t>(layer_bias_norm_.size()));
+        for (const auto& weights : layer_bias_norm_) {
+            for (const auto* tensor : {
+                    &weights.ln1_w, &weights.ln1_b, &weights.ln2_w, &weights.ln2_b,
+                    &weights.q_b, &weights.k_b, &weights.v_b, &weights.o_b,
+                    &weights.fc1_b, &weights.fc2_b}) {
+                append_kvinsert_cost_tensor_identity(identity, *tensor);
+            }
+        }
+        for (const auto* tensor : {
+                &proj_w_, &proj_b_, &patch_emb_weight_, &patch_emb_pos_emb_}) {
+            append_kvinsert_cost_tensor_identity(identity, *tensor);
+        }
+        return identity;
+    }
+
     std::vector<LayerWeights> layer_weights_;
     std::vector<LayerBiasNorm> layer_bias_norm_;
 
     // Global weights
     at::Tensor proj_w_, proj_b_;
     // 项 A：proj1 之前把行序换成 member-major，供 tower 外 merger 的组轴算子用。
-    const bool merger_member_major_ = hyvla_fused_merger_on();
+    bool merger_member_major_ = false;
+    bool proj1_in_merger_ = true;
+    int patch_embed_cores_ = NUM_CORES;
+    bool production_config_bound_ = false;
 
     // Intermediate DDR staging buffer (post-LN → DDR → projector). Shape-gated
     // reuse is SAFE here because this tensor is a class member that never
@@ -1686,9 +2824,12 @@ private:
     // own slot so multi-shape REPLAY keeps every shape's DMA address valid.
     std::map<std::pair<int64_t, int64_t>, at::Tensor> temp_ddr_slots_;
 
-    // Final projector output is allocated fresh per forward so caller-held
-    // references do not alias later outputs.
+    // Fresh on every forward, including when fast replay skips the layer body.
+    // Retained DMA nodes refer to these member slots and resolve their current
+    // values while holding the destination's submission lease.
     at::Tensor projector_output_;
+    uint64_t projector_out_live_base_ = 0;
+    uint64_t projector_bias_live_base_ = 0;
 
     // Model config
     double eps_ = 1e-6;
@@ -1700,9 +2841,24 @@ private:
     // num_q_heads()/NUM_CORES (set in set_weights). seq_len_ = this forward's
     // full sequence length (the SDPA kv_seq_len, decoupled from per-chunk seq_q).
     //
-    // Each {seq_len, q_width} shape keeps a never-reallocated DDR slot because the
-    // Q scatter/gather DMA address is fixed at Graph capture. Including q_width
-    // also preserves validity when a reused handle loads different weight geometry.
+    // keyed by seq_len so each shape keeps its OWN
+    // never-reallocated DDR address. The earlier single grow-only q_ddr_buf_ would,
+    // on a later larger-seq realloc, invalidate a smaller shape's already-captured
+    // graph: the Q save/load use FIXED scatter DMA (rpu_launch_spm_scatter_ddr_dma /
+    // ddr_scatter_spm_dma) whose kd_buf address is baked at capture and NOT refreshed
+    // by sync-only REPLAY → small→large→small alternation would read/write a freed
+    // address. Per-seq slots (mirror temp_ddr_slots_) are created once and never
+    // reallocated, so every shape's baked address stays valid. q_ddr_slot() returns
+    // this forward's slot.
+    //
+    // Key = {seq_len, q_width} with q_width = local_q_heads_ * head_dim() (cold-panel
+    // re-review): set_weights can change local_q_heads_/head_dim on a REUSED handle,
+    // and invalidate_model_state() is base-class — it does NOT clear these SigLIP
+    // slots (same blind spot the old single q_ddr_buf_ had: its realloc guard only
+    // checked size(0)=NUM_CORES + size(1)=seq_len, never the width). Without q_width
+    // in the key, a later forward at the SAME seq_len after a width change would reuse
+    // the old undersized slot while the fixed DMA stride uses the NEW width → OOB
+    // write. q_width in the key forces a fresh slot per (seq_len, width).
     std::map<std::pair<int64_t, int64_t>, at::Tensor> q_ddr_slots_;
     at::Tensor& q_ddr_slot() {
         return q_ddr_slots_.at({seq_len_, local_q_heads_ * head_dim()});
@@ -1718,9 +2874,11 @@ private:
     // KVPAD16（见文件头）：k/v 槽被保证的 SPM 行容量；0 = 关闭。
     int64_t kv_pad_rows_ = 0;
 
-    // Number of images packed along sequence this forward. One selects the
-    // single-image path; more than one selects block-masked packed attention.
+    // SigLIP-batch: number of images packed along seq this forward (1 = legacy
+    // single-image path → unified_v2 SDPA; >1 → per-image minibatch SDPA). Set
+    // in forward() from input.size(0); read in build_layer_subgraph.
     int64_t image_batch_count_ = 1;
+    bool planning_external_patch_prologue_ = false;
 
     // Patch embedding params
     at::Tensor patch_emb_weight_, patch_emb_pos_emb_;
@@ -1739,6 +2897,38 @@ private:
 
 using HYViT2Registry = ModelHandleRegistry<v3::HYViT2VisionModel>;
 
+std::vector<int64_t> rpu_hyvit2_planner_cache_identity(int64_t handle) {
+    return HYViT2Registry::get(handle, "rpu_hyvit2_planner_cache_identity")
+        ->planner_cache_identity();
+}
+
+void rpu_hyvit2_bind_kvinsert_costs(
+        int64_t handle, at::IntArrayRef identity,
+        const std::string& catalog_sha256, at::IntArrayRef certificate_rows) {
+    HYViT2Registry::get(handle, "rpu_hyvit2_bind_kvinsert_costs")
+        ->bind_kvinsert_costs(identity, catalog_sha256, certificate_rows);
+}
+
+std::tuple<std::vector<int64_t>, int64_t, int64_t>
+rpu_hyvit2_kvinsert_exact_candidate(
+    int64_t handle, at::IntArrayRef descriptor, int64_t site_id,
+    int64_t invocation, int64_t route) {
+    return HYViT2Registry::get(handle, "rpu_hyvit2_kvinsert_exact_candidate")
+        ->mint_kvinsert_exact_candidate(descriptor, site_id, invocation, route);
+}
+
+KvInsertCostDomainQuery rpu_hyvit2_kvinsert_cost_domain(
+        int64_t handle, at::IntArrayRef descriptor) {
+    return HYViT2Registry::get(handle, "rpu_hyvit2_kvinsert_cost_domain")
+        ->kvinsert_cost_domain("hyvit2", descriptor);
+}
+
+std::string rpu_hyvit2_kvinsert_cost_catalog_sha256(int64_t handle) {
+    return HYViT2Registry::get(
+        handle, "rpu_hyvit2_kvinsert_cost_catalog_sha256")
+        ->kvinsert_cost_catalog_sha256();
+}
+
 // =============================================================================
 // Public C API for TORCH_LIBRARY_IMPL wrappers (file-scope, not namespaced)
 // =============================================================================
@@ -1747,7 +2937,19 @@ int64_t rpu_hyvit2_create() {
     return HYViT2Registry::create();
 }
 
+void rpu_hyvit2_set_runtime_config(
+    int64_t handle,
+    bool fast_replay, bool fast_replay_preload, bool mask_once,
+    bool kvpad16, bool q_inplace) {
+    HYViT2Registry::get(handle, "rpu_hyvit2_set_runtime_config")
+        ->set_runtime_config(
+            fast_replay, fast_replay_preload, mask_once, kvpad16,
+            q_inplace);
+}
+
 void rpu_hyvit2_destroy(int64_t handle) {
+    HYViT2Registry::get(handle, "rpu_hyvit2_destroy")
+        ->check_execution_reconfigure_destroy_allowed("rpu_hyvit2_destroy");
     HYViT2Registry::destroy(handle, "rpu_hyvit2_destroy");
 }
 
@@ -1764,7 +2966,9 @@ void rpu_hyvit2_set_weights(
     const at::Tensor& proj_w, const at::Tensor& proj_b,
     int64_t num_heads, int64_t head_dim,
     int64_t hidden_size, int64_t intermediate_size,
-    int64_t projection_dim, double eps)
+    int64_t projection_dim, double eps,
+    bool fused_merger, bool proj1_in_merger,
+    int64_t patch_embed_cores)
 {
     std::vector<at::Tensor> empty_scales;
     HYViT2Registry::get(handle, "rpu_hyvit2")->set_weights(
@@ -1775,7 +2979,8 @@ void rpu_hyvit2_set_weights(
         fc1_b_list, fc2_b_list,
         proj_w, proj_b,
         num_heads, head_dim, hidden_size, intermediate_size,
-        projection_dim, eps,
+        projection_dim, eps, fused_merger, proj1_in_merger,
+        patch_embed_cores,
         empty_scales, empty_scales, empty_scales, empty_scales,
         empty_scales, empty_scales);
 }
@@ -1794,6 +2999,8 @@ void rpu_hyvit2_set_weights_w8a16(
     int64_t num_heads, int64_t head_dim,
     int64_t hidden_size, int64_t intermediate_size,
     int64_t projection_dim, double eps,
+    bool fused_merger, bool proj1_in_merger,
+    int64_t patch_embed_cores,
     at::TensorList q_ws_list, at::TensorList k_ws_list,
     at::TensorList v_ws_list, at::TensorList o_ws_list,
     at::TensorList fc1_ws_list, at::TensorList fc2_ws_list)
@@ -1806,7 +3013,8 @@ void rpu_hyvit2_set_weights_w8a16(
         fc1_b_list, fc2_b_list,
         proj_w, proj_b,
         num_heads, head_dim, hidden_size, intermediate_size,
-        projection_dim, eps,
+        projection_dim, eps, fused_merger, proj1_in_merger,
+        patch_embed_cores,
         q_ws_list, k_ws_list, v_ws_list, o_ws_list,
         fc1_ws_list, fc2_ws_list);
 }
@@ -1840,12 +3048,13 @@ at::Tensor rpu_hyvit2_forward(
     int64_t handle,
     const at::Tensor& input,
     at::TensorList k_caches_list,
-    at::TensorList v_caches_list)
+    at::TensorList v_caches_list,
+    at::IntArrayRef planned_stage_descriptor)
 {
     std::vector<at::Tensor> k_caches(k_caches_list.begin(), k_caches_list.end());
     std::vector<at::Tensor> v_caches(v_caches_list.begin(), v_caches_list.end());
     return HYViT2Registry::get(handle, "rpu_hyvit2")->forward(
-        input, k_caches, v_caches);
+        input, k_caches, v_caches, planned_stage_descriptor);
 }
 
 at::Tensor rpu_hyvit2_forward_packed(
@@ -1853,22 +3062,66 @@ at::Tensor rpu_hyvit2_forward_packed(
     const at::Tensor& hidden,
     int64_t image_batch_count,
     at::TensorList k_caches_list,
-    at::TensorList v_caches_list)
+    at::TensorList v_caches_list,
+    at::IntArrayRef planned_stage_descriptor)
 {
     std::vector<at::Tensor> k_caches(k_caches_list.begin(), k_caches_list.end());
     std::vector<at::Tensor> v_caches(v_caches_list.begin(), v_caches_list.end());
     return HYViT2Registry::get(handle, "rpu_hyvit2")->forward_packed(
-        hidden, image_batch_count, k_caches, v_caches);
+        hidden, image_batch_count, k_caches, v_caches,
+        planned_stage_descriptor);
 }
 
 at::Tensor rpu_hyvit2_forward_multi(
     int64_t handle,
     at::TensorList images,
     at::TensorList k_caches_list,
-    at::TensorList v_caches_list)
+    at::TensorList v_caches_list,
+    at::IntArrayRef planned_stage_descriptor)
 {
     std::vector<at::Tensor> k_caches(k_caches_list.begin(), k_caches_list.end());
     std::vector<at::Tensor> v_caches(v_caches_list.begin(), v_caches_list.end());
     return HYViT2Registry::get(handle, "rpu_hyvit2")->forward_multi(
-        images, k_caches, v_caches);
+        images, k_caches, v_caches, planned_stage_descriptor);
+}
+
+std::vector<int64_t> rpu_hyvit2_resolve_stage_domain(
+    int64_t handle, int64_t seq_len, int64_t image_batch_count,
+    bool external_patch_prologue) {
+    return HYViT2Registry::get(handle, "rpu_hyvit2_resolve_stage_domain")
+        ->resolve_stage_domain(
+            seq_len, image_batch_count, external_patch_prologue);
+}
+
+int64_t rpu_hyvit2_get_resolved_chunk_size(int64_t handle) {
+    return HYViT2Registry::get(
+               handle, "rpu_hyvit2_get_resolved_chunk_size")
+        ->get_last_resolved_chunk_size();
+}
+
+void rpu_hyvit2_set_chunk_envelope(int64_t handle, int64_t max_kv_len, int64_t chunk) {
+    HYViT2Registry::get(handle, "rpu_hyvit2_set_chunk_envelope")
+        ->set_chunk_envelope(max_kv_len, chunk);
+}
+
+void rpu_hyvit2_set_chunk_size_override(
+    int64_t handle, int64_t chunk_size) {
+    HYViT2Registry::get(handle, "rpu_hyvit2_set_chunk_size_override")
+        ->set_control_chunk_size_override(
+            chunk_size, "rpu_hyvit2_set_chunk_size_override");
+}
+
+void rpu_hyvit2_enable_execution_reconfigure(int64_t handle) {
+    HYViT2Registry::get(handle, "rpu_hyvit2_enable_execution_reconfigure")
+        ->enable_execution_reconfigure_guard();
+}
+
+void rpu_hyvit2_stage_chunk_size_override(
+    int64_t handle, int64_t token, int64_t chunk_size) {
+    TORCH_CHECK(token > 0,
+                "HYViT2 hot-reconfigure token must be positive");
+    HYViT2Registry::get(handle, "rpu_hyvit2_stage_chunk_size_override")
+        ->stage_control_chunk_size_override(
+            static_cast<uint64_t>(token), chunk_size,
+            "rpu_hyvit2_stage_chunk_size_override");
 }

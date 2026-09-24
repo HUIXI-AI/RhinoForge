@@ -27,6 +27,16 @@ component-specific conversion to the same projection. Prevent it at the shared
 `skip_names` boundary instead of patching each call site.
 [Weight helpers](../../python/rpu_backend/runtime/weights.py)
 
+The exact dense FP16 Qwen3-8B cold install validates the complete original CPU
+weight tree before claiming the model. It converts and moves the vocabulary head
+and embedding first, then each decoder Linear, releasing CPU temporaries between
+transfers. This limits duplicate CPU/RPU storage and reserves the two largest
+contiguous allocations before smaller weights can fragment HostDDR. It retains
+the existing tied-embedding handling, layout tags and failed-install poison;
+norms and buffers move in the final model transfer. This is a loading-memory
+change, with the existing eight-core execution and W8 installation paths.
+[Qwen3 adapter](../../python/rpu_backend/adapters/qwen3.py)
+
 ## Sources
 
 - [API reference: weight-layout API](../../docs/api_reference.md#weight-layout-api-for-adapter-authors)

@@ -1,11 +1,13 @@
-"""Offline W8A16 / fake-W4 quantization for Pi0.5 Gemma projection weights.
+"""Offline W8A16 / mixed W4A16-G32-KV8 quantization for Pi0.5.
 
-The VLM Gemma decoder and action expert decoder projections are quantized.
-SigLIP, AdaRMS dense, action projection, and processor sidecar tensors remain
-fp16/original. Fake-W4 stores signed 4-bit values in int8 tensors and still
-uses the existing W8A16 runtime kernel; it is a numerical probe only. The
-output deliberately omits model_remapped.safetensors so the Pi05 loader
-regenerates a remap from the quantized source tensors.
+Only the declared VLM Gemma decoder and action-expert decoder Linear projection
+weights are quantized. In the runtime W4 profile, q/o/gate/up/down use symmetric
+W4 group-size-32 weights while K/V projection weights stay W8; activations and
+the KV cache stay FP16. SigLIP, AdaRMS dense, action projection, and processor
+sidecar tensors remain fp16/original. Fake-W4 keeps per-channel scales and the
+W8A16 runtime kernel as a numerical probe. The output deliberately omits
+model_remapped.safetensors so the Pi05 loader regenerates a remap from the
+quantized source tensors.
 """
 from __future__ import annotations
 
@@ -21,12 +23,16 @@ from safetensors.torch import load_file, save_file
 
 try:
     from ._common import quantize_linear_per_channel
+    from .int4_pgrp_pack import quantize_int4_group_wise
+    from .nvfp4_pack import quantize_nvfp4
 except ImportError:
     from _common import quantize_linear_per_channel
+    from int4_pgrp_pack import quantize_int4_group_wise
+    from nvfp4_pack import quantize_nvfp4
 
 
-PI05_EXPERT_ANCHOR = ".paligemma_with_expert.gemma_expert.model.layers."
-PI05_VLM_ANCHOR = ".paligemma_with_expert.paligemma.model.language_model.layers."
+PI05_EXPERT_ANCHOR = "paligemma_with_expert.gemma_expert.model.layers."
+PI05_VLM_ANCHOR = "paligemma_with_expert.paligemma.model.language_model.layers."
 PI05_PROJ_SUFFIXES = (
     "self_attn.q_proj.weight",
     "self_attn.k_proj.weight",
@@ -36,6 +42,7 @@ PI05_PROJ_SUFFIXES = (
     "mlp.up_proj.weight",
     "mlp.down_proj.weight",
 )
+PI05_W4_GROUP_SIZE = 32
 
 
 def _scale_name(weight_name: str) -> str:
@@ -105,6 +112,8 @@ def _convert_tensor(
     *,
     bits: int,
     int8_keep_suffixes: tuple[str, ...] = (),
+    w4_format: str = "legacy_int4",
+    group_size: int = 0,
 ) -> tuple[dict[str, torch.Tensor], int, int, int]:
     bytes_in = tensor.numel() * tensor.element_size()
     if _is_pi05_quant_proj(name):
@@ -121,7 +130,15 @@ def _convert_tensor(
                 f"cannot quantize non-floating tensor {name!r} "
                 f"with dtype {tensor.dtype}"
             )
-        w_int8, scale = quantize_linear_per_channel(tensor, bits=eff_bits)
+        if eff_bits == 4 and w4_format == "nvfp4":
+            codes, scale, tensor_scale = quantize_nvfp4(tensor)
+            out = {name: codes, _scale_name(name): scale,
+                   name.removesuffix(".weight") + ".tensor_scale": tensor_scale}
+            return out, 1, 0, sum(t.numel() * t.element_size() for t in out.values())
+        if eff_bits == 4 and (group_size or w4_format == "int4_g128"):
+            w_int8, scale, _ = quantize_int4_group_wise(tensor, group_size or 128)
+        else:
+            w_int8, scale = quantize_linear_per_channel(tensor, bits=eff_bits)
         bytes_out = (
             w_int8.numel() * w_int8.element_size()
             + scale.numel() * scale.element_size()
@@ -165,28 +182,35 @@ def _quant_config(*, bits: int, int8_keep_suffixes: tuple[str, ...] = (),
         int8_keep_suffixes, real_w4=real_w4)
     if bits == 4:
         method = "w4a16" if real_w4 else "w4a16_fake_int8"
-        kernel = "wint4a16" if real_w4 else "w8a16"
+        kernel = "wint4a16_pgrp" if real_w4 else "w8a16"
         note = (
-            "Real W4: int4 values stored in int8 on disk; runtime packs to uint8 "
-            "[N,K/2] and dispatches to the wINT4 kernel. mixed_int8_suffixes stay INT8."
+            "Pi0.5 mixed W4A16-G32-KV8: only the declared Gemma VLM/action-expert "
+            "Linear projection weights are quantized. mixed_int8_suffixes use W8 "
+            "and always include K/V; the remaining declared projections use W4 G32. "
+            "Activations and KV cache stay FP16. INT4 values are stored in INT8 on "
+            "disk with scale [G=K/32,N], then packed to the controller-striped pgrp "
+            "ABI at runtime."
         ) if real_w4 else (
             "Fake W4 numerical probe: signed int4 values stored in int8; "
             "runtime intentionally uses existing W8A16 kernel. "
             "mixed_int8_suffixes (if any) are kept at full INT8."
         )
-        return {
+        config = {
             "method": method,
-            "mode": "per_channel_symmetric",
+            "mode": "group_wise_symmetric" if real_w4 else "per_channel_symmetric",
             "qaxis": 0,
             "target": "pi05_gemma_vlm_and_expert",
             "quantized_projection_suffixes": list(PI05_PROJ_SUFFIXES),
             "storage": "int8",
             "value_bits": 4,
             "mixed_int8_suffixes": list(int8_keep_suffixes),
-            "scale": "per_output_channel",
+            "scale": "per_group_GxN" if real_w4 else "per_output_channel",
             "kernel": kernel,
             "note": note,
         }
+        if real_w4:
+            config["group_size"] = PI05_W4_GROUP_SIZE
+        return config
     if real_w4:
         raise ValueError("real_w4=True requires bits=4")
     if bits == 8:
@@ -211,7 +235,13 @@ def convert_checkpoint(
     bits: int = 8,
     int8_keep_suffixes: tuple[str, ...] = (),
     real_w4: bool = False,
+    action_w4: bool = False,
+    action_w4_format: str = "nvfp4",
 ) -> dict:
+    if action_w4_format not in ("nvfp4", "int4_g128", "legacy_int4"):
+        raise ValueError("action_w4_format must be nvfp4, int4_g128, or legacy_int4")
+    if action_w4:
+        bits, real_w4 = 4, True
     src = Path(src).expanduser().resolve()
     dst = Path(dst).expanduser().resolve()
     if not src.is_dir():
@@ -256,8 +286,10 @@ def convert_checkpoint(
             for name in sorted(tensors):
                 target = _target_for_name(name)
                 converted, n_quant, n_copy, bytes_out = _convert_tensor(
-                    name, tensors[name], bits=bits,
+                    name, tensors[name], bits=(8 if action_w4 and target == "vlm" else bits),
                     int8_keep_suffixes=int8_keep_suffixes,
+                    w4_format=action_w4_format if action_w4 else "legacy_int4",
+                    group_size=PI05_W4_GROUP_SIZE if real_w4 and not action_w4 else 0,
                 )
                 out.update(converted)
                 stats["n_quantized"] += n_quant
@@ -269,7 +301,7 @@ def convert_checkpoint(
                 elif target == "vlm":
                     stats["vlm_projection_weights"] += 1
                 if n_quant:
-                    new_weight_map[_scale_name(name)] = shard
+                    new_weight_map.update({key: shard for key in converted})
 
             save_file(out, tmp / shard, metadata={"format": "pt"})
             del tensors
@@ -295,6 +327,24 @@ def convert_checkpoint(
             config = json.load(f)
         quant_config = _quant_config(bits=bits, int8_keep_suffixes=int8_keep_suffixes,
                                      real_w4=real_w4)
+        if action_w4:
+            quant_config.pop("group_size", None)
+            quant_config.update(int4_components=["expert"], int4_group_size=128,
+                                target="pi05_action_w4_vlm_w8")
+            if action_w4_format == "legacy_int4":
+                quant_config.update(mode="per_channel_symmetric", scale="per_output_channel", kernel="wint4a16")
+            if action_w4_format == "int4_g128":
+                quant_config.update(mode="group_symmetric", qaxis=1,
+                                    scale="per_k128_output_channel",
+                                    note="True independent K128 scales, logical [K/128,N]; runtime pgrp packing.")
+            elif action_w4_format == "nvfp4":
+                quant_config.update(method="nvfp4a16", mode="nvfp4_e2m1", qaxis=1,
+                                    storage="uint8_codes", scale="fp8_e4m3_block16",
+                                    kernel="wnvfp4a16", nvfp4_abi="striped_v2",
+                                    nvfp4_block_size=16,
+                                    note="Action Q/O/Gate/Up/Down E2M1 + FP8 block16 + FP32 tensor scale; K/V and VLM W8; accumulation selected by cold linear_acc32 config.")
+                quant_config.pop("int4_group_size")
+            stats["method"] = quant_config["method"]
         with (tmp / "config.json").open("w") as f:
             json.dump(config, f, indent=2)
         with (tmp / "rpu_quant_config.json").open("w") as f:
@@ -333,14 +383,21 @@ def main(argv: list[str] | None = None) -> int:
         "--real-w4",
         action="store_true",
         help=(
-            "tag the checkpoint method=w4a16 (real packed INT4): runtime packs to "
-            "uint8 [N,K/2] and uses the wINT4 kernel. Requires --fake-w4 quantization "
-            "(same int4-in-int8 on-disk storage). k_proj/v_proj are automatically "
-            "kept at INT8. Without this, method stays w4a16_fake_int8 (W8A16 kernel)."
+            "emit the Pi0.5 mixed W4A16-G32-KV8 profile under the legacy "
+            "method=w4a16 runtime tag: by default q/o/gate/up/down Linear weights "
+            "use W4 G32, k_proj/v_proj weights stay W8, and activations/KV cache "
+            "stay FP16. Additional --keep-int8 tokens define controlled variants. "
+            "Runtime packs INT4 to the pgrp ABI and uses the wINT4 kernel. Requires "
+            "--fake-w4 for the int4-in-int8 on-disk representation. Without this, "
+            "method stays w4a16_fake_int8 (W8A16 kernel)."
         ),
     )
+    parser.add_argument("--action-w4", action="store_true",
+                        help="Action Q/O/Gate/Up/Down W4 (default NVFP4); K/V and VLM W8")
+    parser.add_argument("--action-w4-format", choices=("nvfp4", "int4_g128", "legacy_int4"),
+                        default="nvfp4", help="NVFP4 (default), true K128 INT4, or legacy per-channel INT4")
     args = parser.parse_args(argv)
-    bits = 4 if args.fake_w4 else 8
+    bits = 4 if args.fake_w4 or args.action_w4 else 8
 
     if args.real_w4 and bits != 4:
         print("[convert_pi05] error: --real-w4 requires --fake-w4 (int4 quantization)",
@@ -362,7 +419,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         stats = convert_checkpoint(
             args.src, args.dst, bits=bits, int8_keep_suffixes=int8_keep_suffixes,
-            real_w4=args.real_w4,
+            real_w4=args.real_w4, action_w4=args.action_w4,
+            action_w4_format=args.action_w4_format,
         )
     except (FileExistsError, FileNotFoundError, TypeError, ValueError) as exc:
         print(f"[convert_pi05] error: {exc}", file=sys.stderr)

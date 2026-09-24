@@ -14,9 +14,11 @@ MODELS: Dict[str, str] = {
     "qwen3-1.7b": "Qwen3-1.7B",
     "qwen3-4b": "Qwen3-4B",
     "qwen3-8b": "Qwen3-8B",
+    # Local conversion alias; runtime admission checks determine support.
+    "qwen3-8b-w8a16-lmhead-int8": "qwen3_lmhead_int8_ckpts/qwen3-8b-w8a16-lmhead-int8",
     # Source-only local W8A16 conversion output. This alias does not establish
-    # a public immutable derived-checkpoint identity; the FP16-looking alias is
-    # intentionally absent.
+    # a public immutable derived-checkpoint identity. The source alias below
+    # supports explicit on-install recipes, not ordinary FP16 admission.
     "qwen3-14b-w8a16-lmhead-int8": "qwen3_lmhead_int8_ckpts/qwen3-14b-w8a16-lmhead-int8",
     # Qwen3.5 hybrid-attention text profiles.
     "qwen3_5-0.8b": "qwen3_5-0.8b",
@@ -31,6 +33,7 @@ MODELS: Dict[str, str] = {
     # Source-only local conversion outputs; aliases are path mappings, not
     # immutable derived-asset identities or support claims.
     "pi05-libero-finetuned-w8a16-vlm-expert": "pi05_libero_finetuned-w8a16-vlm-expert",
+    # Legacy alias name: this is mixed W4A16-G32-KV8, not a pure-W4 profile.
     "pi05-libero-finetuned-w4real-kvint8": "pi05_libero_finetuned-w4real-kvint8",
     # Wall-OSS-0.5 VLA (Qwen2.5-VL-3B)
     "wall-oss-0.5": "wall-oss-0.5",
@@ -39,22 +42,24 @@ MODELS: Dict[str, str] = {
     # Group-wise int4 profile: expert-0 down remains int8; the other seven
     # projections use int4-pgrp with group_size=32.
     "wall-oss-0.5-w4a16-pgrp": "wall-oss-0.5-w4a16-pgrp",
-    # GR00T-N1.7-3B VLA (Qwen3-VL-2B backbone + flow-matching DiT action head).
-    # RPU runtime = adapters/gr00t (build_gr00t_vla); needs the public Qwen3-VL-2B
-    # config/tokenizer alongside ("qwen3-vl-2b") for the backbone scaffold.
-    "gr00t-n1d7-3b": "GR00T-N1.7-3B",
+    # Distinct Source-only DROID checkpoint identities. Registry resolution is
+    # not admission: the GR00T builder remains fail-closed until the exact
+    # gated Cosmos processor/config manifest is release-bound.
+    "gr00t-n1d7-3b-droid-zero-shot": "GR00T-N1.7-3B",
+    "gr00t-n1d7-droid-finetuned": "GR00T-N1.7-DROID",
     # LingBot-VLA V2 (Qwen3-VL-4B + 32-expert top-4 AdaRMS sparse-MoE
     # action expert). Registry resolution is not a support claim.
     "lingbot-vla-v2-6b": "hf/robbyant/lingbot-vla-v2-6b",
-    # Public InternRobotics/InternVLA-N1-w-NavDP source-only cache alias. Path
-    # resolution is not a support claim; execution remains fail-closed.
+    # Public InternRobotics/InternVLA-N1-w-NavDP component-scope cache alias.
+    # Path resolution remains separate from the exact component contract; the
+    # complete policy is not admitted by this alias.
     "internvla-n1-navdp": "InternVLA-N1-w-NavDP",
     # Hy-Embodied-0.5-VLA (HunYuanVL dual-tower: HYViT2-400M AnyRes ViT + MoT VLM
     # + flow-matching action expert). RPU runtime = adapters/hy_vla (build_hy_vla).
     # obs supplies pre-tokenized lang_tokens + the prefill/denoise masks, so no
     # tokenizer is needed at inference; the ckpt is a single model.safetensors.
     "hy-embodied-0.5-vla-umi": "Hy-Embodied-0.5-VLA-UMI",
-    # DINOv3 ViT-B encoder.
+    # DINOv3 ViT-B component-scope feature encoder.
     "dinov3-vit-b": "dinov3-vitb16-pretrain-lvd1689m",
     # Qwen3-VL (vision + text)
     "qwen3-vl-2b": "Qwen3-VL-2B-Instruct",
@@ -62,6 +67,41 @@ MODELS: Dict[str, str] = {
     "qwen3-vl-8b": "Qwen3-VL-8B-Instruct",
     # Llama-3.2-1B local checkpoint alias.
     "llama-3.2-1b": "Llama-3.2-1B",
+    # Additional public example aliases. These resolve caller-managed local
+    # assets only; the loader still validates checkpoint format and geometry.
+    "halo_action_expert": "HALO/action_expert.safetensors",
+    "lingbot-vla-4b": "lingbot-vla-4b",
+    "qwen3-0.6b-instruct": "qwen3-0.6b-instruct",
+    "qwen3-0.6b-w8a16-lmhead-int8": "qwen3_lmhead_int8_ckpts/qwen3-0.6b-w8a16-lmhead-int8",
+    "qwen3-1.7b-w8a16-lmhead-int8": "qwen3_lmhead_int8_ckpts/qwen3-1.7b-w8a16-lmhead-int8",
+    "qwen3-14b": "Qwen3-14B",
+    "qwen3-32b": "Qwen3-32B",
+    "qwen3-32b-w8a16-lmhead-int8": "Qwen3-32B-w8a16",
+    "qwen3-4b-instruct": "qwen3-4b-instruct",
+    "qwen3-4b-w8a16-lmhead-int8": "qwen3_lmhead_int8_ckpts/qwen3-4b-w8a16-lmhead-int8",
+    "qwen3-vl-2b-runtime-w4a16": "Qwen3-VL-2B-Instruct-runtime-w4-awq",
+    "qwen3-vl-2b-runtime-w8a16": "Qwen3-VL-2B-Instruct-runtime-w8",
+    "qwen3-vl-2b-text-awq-w4a16": "Qwen3-VL-2B-Instruct-AWQ",
+    "qwen3-vl-2b-text-w8a16": "Qwen3-VL-2B-Instruct-w8a16-text",
+    "qwen3-vl-32b-runtime-w4a16": "Qwen3-VL-32B-Instruct-runtime-w4",
+    "qwen3-vl-32b-runtime-w8a16": "Qwen3-VL-32B-Instruct-runtime-w8",
+    "qwen3-vl-32b-w8a16": "Qwen3-VL-32B-Instruct-w8a16-legacy",
+    "qwen3-vl-4b-runtime-w4a16": "Qwen3-VL-4B-Instruct-runtime-w4-awq",
+    "qwen3-vl-4b-runtime-w8a16": "Qwen3-VL-4B-Instruct-runtime-w8",
+    "qwen3-vl-4b-text-awq-w4a16": "Qwen3-VL-4B-Instruct-AWQ",
+    "qwen3-vl-8b-runtime-w4a16": "Qwen3-VL-8B-Instruct-runtime-w4-awq",
+    "qwen3-vl-8b-runtime-w8a16": "Qwen3-VL-8B-Instruct-runtime-w8",
+    "qwen3_5-0.8b-w4a16": "qwen3_5_quant_ckpts/qwen3_5-0.8b-w4a16",
+    "qwen3_5-0.8b-w8a16": "qwen3_5_quant_ckpts/qwen3_5-0.8b-w8a16",
+    "qwen3_5-2b-w4a16": "qwen3_5_quant_ckpts/qwen3_5-2b-w4a16",
+    "qwen3_5-2b-w8a16": "qwen3_5_quant_ckpts/qwen3_5-2b-w8a16",
+    "qwen3_5-35b-a3b-mixed": "Qwen3.5-35B-A3B-rpu-fp8-mixed",
+    "qwen3_5-4b-w4a16": "qwen3_5_quant_ckpts/qwen3_5-4b-w4a16",
+    "qwen3_5-4b-w8a16": "qwen3_5_quant_ckpts/qwen3_5-4b-w8a16",
+    "qwen3_5-9b-w4a16": "qwen3_5_quant_ckpts/qwen3_5-9b-w4a16",
+    "qwen3_5-9b-w8a16": "qwen3_5_quant_ckpts/qwen3_5-9b-w8a16",
+    "qwen3_8-27b-w8a16": "Qwen3.8-27B-w8a16",
+    "rhinovla-controlled": "rhinovla-controlled",
     # Gemma 4 E4B source-only adapter. Registry resolution is not a support
     # claim; the first release does not provide a compatible runnable profile.
     "gemma4-e4b": "gemma-4-e4b-it",

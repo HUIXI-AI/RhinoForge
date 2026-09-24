@@ -8,8 +8,6 @@
         "<MODEL_ROOT>/Hy-Embodied-0.5-VLA-UMI",
         dtype="fp16",                    # 当前 immutable-v2 认证档
         norm_stats_path="<...>/norm_stats.pkl",   # **必须显式给**，否则没有物理动作
-        trust_norm_stats_pickle=True,
-        norm_stats_sha256="<64-digit SHA-256>",
     ).to("rpu")
 
     out = policy.infer(
@@ -17,14 +15,14 @@
         instruction="pick up the bottle",
         ee_pose=current_dual_arm_ee_pose_16_wxyz,
     )
-    out.actions              # (49, 16) 双臂位姿（配置的坐标约定，未认证真机）
-    out.actions_normalized   # [50, 20] 模型原始归一化输出
+    out.actions              # (49, 16) 双臂位姿（vendor 默认坐标约定，未认证真机）
+    out.actions_normalized   # [50, 20] 模型原始输出（归一化），做精度对拍用
 
 形状选择的依据（都来自这个 ckpt 的 `config.json` 与既有 RPU 实现）：
 
 * 没有离线 prepare 产物、也没有预量化 ckpt：三档精度都从**同一份 fp32/bf16
   权重**在装载时量化，所以入口是 `from_checkpoint(...)`，`.to('rpu')` 触发构建
-  （包括权重 layout 转换与 RPU DDR 安装）。
+  （约 12 s，权重 swizzle 上 RPU DDR）。
 * 模型每步吐 **32** 个 action 维，**只有前 20 维是真的**；[20:32] 从未对任何
   target 训练过。`actions_normalized` 是裁好的 `[50, 20]`；`actions_full` 保留
   未裁的网格，只应该用于调试。
@@ -34,17 +32,14 @@
 ⚠️ **单实例单进程**：RPU 一次只服务一个 handle 集合。Hy-VLA 的原生
 env 开关会在首次物化时固化，所以 `.to("rpu")` 一旦开始装载权重，该 Python
 进程就不能再装第二个 RPU 模型/policy。`close()` 会回收 handle、图和本 policy
-改过的全局设置，但不会使进程可复用；换模型必须重启进程。并发服务时，
-使用"模型常驻 + 请求串行"的结构。
+改过的全局设置，但不会使进程可复用；换模型必须重启进程。要并发服务多个客户端，
+用 `serve.py` 那种"模型常驻 + 请求串行"的结构。
 """
 from __future__ import annotations
 
 import dataclasses
-import hashlib
 import operator
 import os
-import pickle
-import re
 import threading
 import time
 import weakref
@@ -53,21 +48,18 @@ from typing import Any
 
 import torch
 
-from rpu_backend.api._runtime_env import (
-    LKN_CAPACITY_ENV,
-    normalize_runtime_env,
-)
-
 # 模型吐 32 维，只有前 20 维是真的（双臂各 [平移3 + 6D旋转6 + 夹爪1]）。
 VALID_ACTION_DIMS = 20
 
 # 模型**归一化网格**的步数（ckpt `config.json` 的 `n_action_steps`）。解码时第 0 行
-# 是"当前位姿"这一行，由 `hy_action_decode.drop_first` 丢弃，所以物理轨迹
+# 是"当前位姿"这一行、由 vendor 丢弃（`hy_action_decode.drop_first`），所以物理轨迹
 # 只有 `MODEL_ACTION_STEPS - 1` 步。两者别混用：`actions_normalized` 是 50 行，
 # `actions` 是 49 行。
 MODEL_ACTION_STEPS = 50
 
-# 公共 dtype profile → `RPU_HY_VLA_W8A16` 的逐塔选择。
+# `[model].dtype` → `RPU_HY_VLA_W8A16`。**与 `specs/hy_vla/executor.py` 的 DTYPES
+# 表同源**，改一处必须改另一处（两边都是交付面）。W8 各档只保留为
+# legacy-bf16 受控评估；当前 immutable-v2 认证仅覆盖 `fp16`。
 _PROFILE_ENV: dict[str, str] = {
     "fp16":              "0",                  # 三座全 fp16（W16A16）
     "w8a16":             "all",
@@ -77,76 +69,6 @@ _PROFILE_ENV: dict[str, str] = {
     "w8a16-vit":         "vit",
     "w8a16-no-vlm":      "vit,expert",         # 已被 expert-vlmv 严格支配，勿新用
 }
-
-_RUNTIME_ENV_ALLOWLIST = frozenset({
-    "RPU_FASTREPLAY_SKIP_SYNC",
-    "RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN",
-    "RPU_HY_VLA_ACTION_MLP_MC",
-    "RPU_HY_VLA_ATTN_TP8",
-    "RPU_HY_VLA_CACHING_ALLOC",
-    "RPU_HY_VLA_DENOISE_UNROLL",
-    "RPU_HY_VLA_FAST_REPLAY",
-    "RPU_HY_VLA_FAST_REPLAY_PRELOAD",
-    "RPU_HY_VLA_FUSED_MERGER",
-    "RPU_HY_VLA_KVPAD16",
-    "RPU_HY_VLA_MASK_ONCE",
-    "RPU_HY_VLA_MERGER_IN_GRAPH",
-    "RPU_HY_VLA_MOT_NORM_NOMERGE",
-    "RPU_HY_VLA_PARTIAL_ROPE",
-    "RPU_HY_VLA_PATCH_EMBED_IN_GRAPH",
-    "RPU_HY_VLA_PATCH_EMBED_MC",
-    "RPU_HY_VLA_PERSIST_HANDLES",
-    "RPU_HY_VLA_PREFIX_TEMPLATE",
-    "RPU_HY_VLA_PROJ1_IN_MERGER",
-    "RPU_HY_VLA_Q_INPLACE",
-    "RPU_HY_VLA_RMSNORM_PAD16",
-    "RPU_HY_VLA_SILU_MUL",
-    "RPU_HY_VLA_VIT_PACKED",
-    "RPU_HY_VLA_W4A16",
-    "RPU_HY_VLA_W8A16",
-    "RPU_KVINSERT_HYBRID_V16",
-    "RPU_KVINSERT_V16_ANY_TP",
-    "RPU_RMSNORM_VWARP",
-    "RPU_SKIP_IDLE_RECORD_FUNCTION",
-})
-
-
-def _load_trusted_norm_stats_pickle(
-    path: str | os.PathLike[str],
-    *,
-    trust_norm_stats_pickle: bool,
-    norm_stats_sha256: str | None,
-) -> Mapping[str, Any]:
-    """Verify the exact pickle bytes before deserializing those same bytes."""
-    if not isinstance(trust_norm_stats_pickle, bool):
-        raise TypeError("trust_norm_stats_pickle must be bool")
-    if not trust_norm_stats_pickle:
-        raise PermissionError(
-            "norm_stats.pkl uses executable pickle deserialization; pass "
-            "trust_norm_stats_pickle=True only for a reviewed asset."
-        )
-    if (
-        not isinstance(norm_stats_sha256, str)
-        or re.fullmatch(r"[0-9a-fA-F]{64}", norm_stats_sha256) is None
-    ):
-        raise ValueError("norm_stats_sha256 must be an exact 64-digit SHA-256 hex digest")
-
-    import pathlib
-
-    payload = pathlib.Path(path).read_bytes()
-    actual = hashlib.sha256(payload).hexdigest()
-    expected = norm_stats_sha256.lower()
-    if actual != expected:
-        raise ValueError(
-            f"norm_stats.pkl SHA-256 mismatch: expected {expected}, got {actual}"
-        )
-    value = pickle.loads(payload)
-    if not isinstance(value, Mapping):
-        raise TypeError(
-            "norm_stats.pkl must deserialize to a mapping, got "
-            f"{type(value).__name__}"
-        )
-    return value
 
 
 def _remember_environment(
@@ -285,11 +207,12 @@ class HyEmbodiedActionOutput:
     """一次 action-chunk 推理的结果。
 
     `actions` 是**已解码成物理量纲**的双臂 EE 位姿 `(H-1, 16)`（wxyz），
-    口径是**配置的坐标约定下的解码轨迹（未认证真机）**。只有在构造
+    口径是 **vendor 默认坐标约定下的解码轨迹（未认证真机）**。只有在构造
     policy 时给了 `norm_stats_path`、且本次调用传了 `ee_pose` 时才有值；否则读它
-    会抛异常：模型吐的是**归一化的相对增量**，不能直接作为物理动作下发。
+    会抛异常 —— 模型吐的是**归一化的相对增量**，直接当动作下发会让机器人走到错
+    误位姿（同类交付上已经发生过：肩关节偏 1.84 rad ≈ 106°）。
 
-    `actions_normalized` 是 `[50, 20]` 的归一化有效维，
+    `actions_normalized` 是 `[50, 20]` 的归一化有效维（对 golden 比精度用这个），
     `actions_full` 是未裁的 `[50, 32]`。
     """
 
@@ -351,12 +274,11 @@ class HyEmbodiedPolicy:
         prefix_len: int = 240,
         n_cameras: int = 3,
         norm_stats_path: str | os.PathLike[str] | None = None,
-        trust_norm_stats_pickle: bool = False,
-        norm_stats_sha256: str | None = None,
         umi_coord_frame: bool = True,
         umi_gripper_space: bool = False,
         runtime_env: Mapping[str, str] | None = None,
         threads: int = 12,
+        rpu_execution: Mapping[str, Any] | None = None,
     ) -> "HyEmbodiedPolicy":
         """绑定一个 Hy-VLA ckpt 目录。
 
@@ -369,44 +291,27 @@ class HyEmbodiedPolicy:
             dtype: 见 `_PROFILE_ENV`。当前 immutable-v2 认证档是 `fp16`；
                 W8 各档仅用于 legacy-bf16 受控评估。
             prefix_len: S，`{16,32,…,240}`。240 覆盖 `tokenizer_max_length=64`
-                下的最坏 prompt，是默认值；调小只为省时间，且必须 ≥
+                下的最坏 prompt，是交付默认；调小只为省时间，且必须 ≥
                 `ceil16(本条 observation 的有效行数)`。
             norm_stats_path: `norm_stats.pkl`。**必须显式给，不会自动探测**；
                 不给就拿不到物理动作（`out.actions` 会抛，只能读
                 `.actions_normalized`）。通常就是 `<ckpt_dir>/norm_stats.pkl`。
-            trust_norm_stats_pickle / norm_stats_sha256: `norm_stats.pkl` 是可执行的
-                pickle 格式；必须显式信任并提供该文件的精确 SHA-256 才会读取。
-            umi_coord_frame / umi_gripper_space: 坐标帧与夹爪空间约定。
-                ⚠️ **必须与机器人团队确认**，它们决定
+            umi_coord_frame / umi_gripper_space: 坐标帧与夹爪空间约定，取 vendor
+                RoboDojo 封装的默认值。⚠️ **必须与机器人团队确认**，它们决定
                 下发动作落在哪个世界帧。
             threads: `torch.set_num_threads`。⚠️ 生产口径是 12；板上默认 24，
                 不设就会量错延迟。
         """
+        from rpu_backend.adapters.hy_vla.runtime import resolve_hy_vla_execution
+
+        execution_root, _execution_children = resolve_hy_vla_execution(
+            rpu_execution, entry_point="HyEmbodiedPolicy.from_checkpoint"
+        )
         dtype = (dtype or "fp16").strip().lower()
         if dtype not in _PROFILE_ENV:
             raise ValueError(f"dtype 必须是 {sorted(_PROFILE_ENV)} 之一，得到 {dtype!r}")
         if prefix_len % 16 or not 16 <= prefix_len <= 240:
             raise ValueError(f"prefix_len 必须是 16 的倍数且在 [16,240]，得到 {prefix_len}")
-        if not isinstance(trust_norm_stats_pickle, bool):
-            raise TypeError("trust_norm_stats_pickle must be bool")
-        if norm_stats_path is None:
-            if trust_norm_stats_pickle or norm_stats_sha256 is not None:
-                raise ValueError(
-                    "trust_norm_stats_pickle/norm_stats_sha256 require norm_stats_path"
-                )
-        else:
-            if not trust_norm_stats_pickle:
-                raise PermissionError(
-                    "norm_stats_path requires trust_norm_stats_pickle=True and an exact "
-                    "norm_stats_sha256"
-                )
-            if (
-                not isinstance(norm_stats_sha256, str)
-                or re.fullmatch(r"[0-9a-fA-F]{64}", norm_stats_sha256) is None
-            ):
-                raise ValueError(
-                    "norm_stats_sha256 must be an exact 64-digit SHA-256 hex digest"
-                )
 
         import pathlib
 
@@ -421,7 +326,7 @@ class HyEmbodiedPolicy:
         #    ckpt `config.json` 的 `image_features` 是这三个键、ViT packed 路径的
         #    KV cache 按相机数定长。传别的值不会在这里报错，只会在更深处
         #    产出错位的 prefix 布局或对不上的 KV 长度 —— 那时已经很难查了。
-        #    支持其他相机数需要对应的 checkpoint 与数值验证，不是只改参数。
+        #    真要支持别的相机数，得先有对应的 ckpt 与 golden，不是改个参数。
         from rpu_backend.adapters.hy_vla.preprocess import CAMERA_ORDER
 
         if int(n_cameras) != len(CAMERA_ORDER):
@@ -429,20 +334,16 @@ class HyEmbodiedPolicy:
                 f"Hy-Embodied-0.5-VLA-UMI 是 {len(CAMERA_ORDER)} 相机 profile"
                 f"（{', '.join(CAMERA_ORDER)}），不支持 n_cameras={n_cameras}。")
         inst._n_cameras = int(n_cameras)
-        # ⚠️ **不自动探测 `norm_stats.pkl`**：物理动作解码必须由调用方**显式**打开，
-        # 避免目录内容静默改变是否产出物理动作。
+        # ⚠️ **不自动探测 `norm_stats.pkl`**：物理动作解码必须由调用方**显式**打开。
+        #    早先这里会在 ckpt 目录下自动找到就启用，那等于让"目录里碰巧有个文件"
+        #    决定了有没有东西流向机器人 —— 一次 `git clone` 或换个 ckpt 目录就能
+        #    静默改变行为，而这条链的坐标系与夹爪量纲**从未被任何一方确认过**。
         #    不给这个参数时 `out.actions` 继续抛异常（读 `.actions_normalized`）。
         inst._norm_stats_path = norm_stats_path
-        inst._trust_norm_stats_pickle = trust_norm_stats_pickle
-        inst._norm_stats_sha256 = norm_stats_sha256
         inst._umi_coord_frame = bool(umi_coord_frame)
         inst._umi_gripper_space = bool(umi_gripper_space)
-        inst._runtime_env = normalize_runtime_env(
-            runtime_env,
-            owner="HyEmbodiedPolicy",
-            allowed=_RUNTIME_ENV_ALLOWLIST,
-            preimport_only=LKN_CAPACITY_ENV,
-        )
+        inst._runtime_env = {str(k): str(v) for k, v in (runtime_env or {}).items()}
+        inst._rpu_execution = execution_root
         inst._threads = int(threads)
         inst._runner = None
         inst._runner_finalizer = None
@@ -457,7 +358,7 @@ class HyEmbodiedPolicy:
         inst._prepare_ms: dict[str, float] = {}
         return inst
 
-    # ── 自描述（供服务健康检查使用） ─────────────────────────────────
+    # ── 自描述（serve.py 的 ping 靠这几个） ─────────────────────────────────
     @property
     def dtype(self) -> str:
         return self._dtype
@@ -480,8 +381,9 @@ class HyEmbodiedPolicy:
     def action_horizon(self) -> int:
         """一次推理产出的**物理**动作步数 —— `out.actions` 的行数。
 
-        比 `model_horizon` 少 1：解码时第 0 行是"当前位姿"并被丢弃。
-        ⚠️ 这两个数不能混用：按 50 索引 `actions` 会越界，归一化网格仍有 50 行。
+        比 `model_horizon` 少 1：解码时第 0 行是"当前位姿"那一行，由 vendor 丢弃。
+        ⚠️ 这两个数别混用 —— 按 50 去索引 `actions` 会越界，按 49 去对 golden 的
+        归一化网格会错位一行。
         """
         return MODEL_ACTION_STEPS - 1
 
@@ -502,6 +404,23 @@ class HyEmbodiedPolicy:
         **机器人业务契约**，本仓库没有、也无法用数值验证确认它。
         """
         return self._decoder is not None
+
+    @property
+    def rpu_execution(self):
+        """Canonical read-only execution configuration."""
+        return self._rpu_execution
+
+    @property
+    def last_rpu_execution_plan(self) -> dict[str, dict[str, Any]]:
+        """Detached per-child native planning receipts from the last call."""
+        runner = self._runner
+        return {} if runner is None else runner.last_rpu_execution_plan
+
+    def reconfigure(self, rpu_execution):
+        """Atomically hot-reconfigure admitted child execution geometry."""
+        from rpu_backend.api._execution import reconfigure_rpu_execution
+
+        return reconfigure_rpu_execution(self, rpu_execution)
 
     # ── 上设备 ──────────────────────────────────────────────────────────────
     def to(self, device: Any) -> "HyEmbodiedPolicy":
@@ -564,19 +483,29 @@ class HyEmbodiedPolicy:
             if self._norm_stats_path is not None:
                 from rpu_backend.api.hy_action_decode import HyVlaActionDecoder
 
-                norm_stats = _load_trusted_norm_stats_pickle(
+                decoder = HyVlaActionDecoder.from_norm_stats(
                     self._norm_stats_path,
-                    trust_norm_stats_pickle=self._trust_norm_stats_pickle,
-                    norm_stats_sha256=self._norm_stats_sha256,
-                )
-                decoder = HyVlaActionDecoder.from_norm_stats_mapping(
-                    norm_stats,
-                    source=str(self._norm_stats_path),
                     umi_coord_frame=self._umi_coord_frame,
                     umi_gripper_space=self._umi_gripper_space)
 
+            from rpu_backend.adapters.hy_vla.weights import (
+                HyVlaConfig,
+                preflight_hy_vla_checkpoint,
+            )
+            from rpu_backend.adapters.hy_vla.runtime import (
+                build_hy_vla,
+                prepare_hy_vla_cold_plan,
+            )
+
+            cold_overrides = {
+                "RPU_HY_VLA_W8A16": _PROFILE_ENV[self._dtype],
+                "RPU_HY_VLA_W4A16": "0",
+            }
+            cold_overrides.update(self._runtime_env)
+            cold_plan = prepare_hy_vla_cold_plan(cold_overrides)
+            model_cfg = HyVlaConfig()
+            preflight_hy_vla_checkpoint(self._ckpt, model_cfg)
             import rpu_backend  # noqa: F401  （注册 PrivateUse1 后端）
-            from rpu_backend.adapters.hy_vla import build_hy_vla
             from rpu_backend.api.causal_lm import (
                 _claim_live_instance,
                 _release_live_instance,
@@ -608,8 +537,11 @@ class HyEmbodiedPolicy:
                 pending_runner = build_hy_vla(
                     self._ckpt,
                     prefix_len=self._prefix_len,
+                    cfg=model_cfg,
+                    rpu_execution=self._rpu_execution,
                     _env_snapshot=env_snapshot,
                     _owner=self,
+                    _cold_plan=cold_plan,
                 )
                 prepare_ms = {
                     "build_ms": (time.perf_counter() - t0) * 1000.0
@@ -623,6 +555,12 @@ class HyEmbodiedPolicy:
                 )
 
                 self._runner = pending_runner
+                execution_session = getattr(
+                    pending_runner, "_execution_session", None
+                )
+                if execution_session is not None:
+                    execution_session.register_config_view(self)
+                    self._execution_session = execution_session
                 self._runner_finalizer = pending_finalizer
                 self._env_snapshot = env_snapshot
                 self._previous_threads = previous_threads
@@ -704,7 +642,7 @@ class HyEmbodiedPolicy:
             from transformers import AutoTokenizer
 
             self._tok = AutoTokenizer.from_pretrained(str(self._ckpt_dir),
-                                                      trust_remote_code=False)
+                                                      trust_remote_code=True)
         return self._tok
 
     # ── 推理 ────────────────────────────────────────────────────────────────
@@ -724,7 +662,9 @@ class HyEmbodiedPolicy:
         两种入口二选一：
         * **原始观测** —— `images` + `instruction`（+ `ee_pose`）：由 policy 自己
           做预处理（缩放补边、分词、mask、position_ids、noise）。
-        * **`obs=`** —— 一份已经组好的入参字典，用于复现预处理后的输入。
+        * **`obs=`** —— 一份已经组好的入参字典，逐位复现录下来的输入。对 golden
+          比精度走这条（预处理层本身已对 golden 逐位验证，但比精度时应当排除
+          预处理这一环）。
 
         Args:
             images: 每相机一帧，顺序见 `camera_names`。收 CHW/HWC、torch/numpy/PIL、
@@ -800,7 +740,8 @@ class HyEmbodiedPolicy:
         if not bool(torch.isfinite(full).all()):
             from rpu_backend.api.errors import RPUBackendError
 
-            raise RPUBackendError("Hy-VLA 输出了非有限值（NaN/Inf）—— 拒绝返回。")
+            raise RPUBackendError("Hy-VLA 输出了非有限值（NaN/Inf）—— 拒绝返回。"
+                                  "见交付包 DEPLOYMENT.md §7。")
 
         norm20 = full[:, :VALID_ACTION_DIMS].contiguous()
         physical = None
@@ -862,7 +803,7 @@ class HyEmbodiedPolicy:
     def predict_action_chunk(self, **kwargs: Any):
         """便捷封装：只要解码后的物理量纲动作 `(H-1, 16)`。
 
-        ⚠️ 口径是**配置的坐标约定下的解码轨迹（未认证真机）** ——
+        ⚠️ 口径是 **vendor 默认坐标约定下的解码轨迹（未认证真机）** ——
         上机前必须由机器人团队确认坐标系与夹爪量纲，首次上机需值守急停。
         """
         return self.infer(**kwargs).actions

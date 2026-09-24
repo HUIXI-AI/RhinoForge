@@ -67,9 +67,9 @@ Choose one mechanism according to the question:
 See [runtime profiling controls](../../docs/runtime_config.md#profiling-mechanisms)
 and the [TOML profiling guide](../../docs/model_testing.md#torch-profile).
 
-Do not use profiler-on latency as the release number. Torch traces may contain
-tensor shapes and source paths. Review locally, publish only the necessary
-summary, and never add generated trace directories to the repository.
+Profiler-on latency does not represent normal inference. Torch traces may contain
+tensor shapes and source paths. Review locally and keep traces and measurement
+summaries outside the repository and release artifacts.
 
 ## Stop conditions
 

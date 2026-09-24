@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.metadata
+import importlib.util
 import os
 from pathlib import Path
 
@@ -14,27 +15,11 @@ def main() -> int:
     parser.add_argument(
         "--check-config",
         action="store_true",
-        help="check Python imports without accessing the RPU",
+        help="check package metadata and module locations without accessing the RPU",
     )
     args = parser.parse_args()
 
-    import torch
-    import rpu_backend
-    from rpu_backend.api import API_VERSION
-
-    if args.check_config:
-        print(
-            f"configuration OK: rhinoforge={rpu_backend.__version__}, "
-            f"api={API_VERSION}"
-        )
-        return 0
-
     installed_version = importlib.metadata.version("rhinoforge")
-    if installed_version != rpu_backend.__version__:
-        raise SystemExit(
-            "RhinoForge package metadata and import version differ: "
-            f"{installed_version} != {rpu_backend.__version__}"
-        )
     owners = importlib.metadata.packages_distributions().get("rpu_backend") or []
     if "rhinoforge" not in owners:
         raise SystemExit(
@@ -48,6 +33,31 @@ def main() -> int:
         raise SystemExit(
             "the legacy rpu_backend distribution is installed; use a fresh "
             "environment or uninstall it before installing RhinoForge"
+        )
+
+    if args.check_config:
+        # Only discover top-level modules: importing either package can load
+        # the native backend and initialize the board runtime.
+        for name in ("torch", "rpu_backend"):
+            spec = importlib.util.find_spec(name)
+            if spec is None:
+                raise SystemExit(f"Python module is not discoverable: {name}")
+        torch_version = importlib.metadata.version("torch")
+        print(
+            f"configuration OK: rhinoforge={installed_version}, "
+            f"torch={torch_version}"
+        )
+        print(f"rpu_backend location: {spec.origin}")
+        return 0
+
+    import torch
+    import rpu_backend
+    from rpu_backend.api import API_VERSION
+
+    if installed_version != rpu_backend.__version__:
+        raise SystemExit(
+            "RhinoForge package metadata and import version differ: "
+            f"{installed_version} != {rpu_backend.__version__}"
         )
 
     ref_path = os.environ.get("RPU_KERNEL_LIB_PATH")

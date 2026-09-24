@@ -1,6 +1,7 @@
 """W4A16 (packed int4 weight / fp16 activation) for Qwen3.
 
-This converter defaults to group-wise pgrp int4: `rpu_linear.cpp` routes a **packed uint8
+Qwen3 shipped with a W8A16 offline converter but no 4-bit path. This converter
+defaults to group-wise pgrp int4: `rpu_linear.cpp` routes a **packed uint8
 [N, K/2]** weight plus a controller-striped FP16 scale payload to the tiled
 wINT4a16 pgrp family. Weights are handed over through
 `causal_decoder_set_weights_w8a16` — the same entry point as int8, because the
@@ -15,12 +16,11 @@ so these projections MUST be excluded from
 
 Scope / limits
 --------------
-* Only the 7 decoder projections are int4. `lm_head` and the embedding stay
-  fp16: lm_head is col-partition swizzled by the generic converter.
+* The default recipe quantizes seven decoder projections. The explicit
+  quantize_lm_head option also packs the head; embedding and norms stay FP16.
 * Both quantization modes support M=1 through the generated pgrp tiled family.
-* Qwen3-0.6B needs no intermediate-size padding: every projection already
-  satisfies the int4 swizzle rules (col: N%(16*cores)==0 and K%64==0;
-  row: N%16==0 and K%(64*cores)==0). Larger Qwen3 sizes are not checked here.
+* Public admission validates the six exact dense Qwen3 source profiles. Every
+  projection must satisfy col N%128/K%64 or row N%16/K%512, without padding.
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ from rpu_backend.model_registry import model_path
 from rpu_backend.quant._common import quantize_linear_per_channel
 from rpu_backend.quant.int4_pgrp_pack import (
     pack_int4_per_channel_as_pgrp,
+    quantize_pack_int4_pgrp_col_bounded,
     quantize_int4_group_wise,
     swizzle_int4_pgrp_scale,
     swizzle_pack_int4_pgrp,
@@ -108,18 +109,19 @@ def pack_linear_int4_(linear: nn.Linear, partition: int, name: str = "",
         packed.to(torch.uint8).contiguous(), requires_grad=False)
     # register_buffer, NOT a plain attribute: `model.to('rpu')` only migrates
     # parameters and buffers. A plain attribute leaves the scale on the host,
-    # and the C++ side then takes a device address of a CPU pointer, producing
-    # invalid outputs without a device error. quant/load.py does
+    # and the C++ side then takes a device address of a CPU pointer — no error,
+    # just garbage. (Symptom: the model emits a constant token, so MMLU lands
+    # exactly on the dataset's base rate for that letter.) quant/load.py does
     # the same thing for the W8A16 checkpoint scales.
     if hasattr(linear, "weight_scale"):
         del linear.weight_scale
     linear.register_buffer("weight_scale",
                            scale.to(torch.float16).contiguous(),
                            persistent=False)
-    linear._rpu_int4_logical_shape = (n, k)
 
 
-def convert_qwen3_to_w4a16_(model, group_size: int | None = None) -> None:
+def convert_qwen3_to_w4a16_(model, group_size: int | None = None,
+                           *, quantize_lm_head: bool = False) -> None:
     """Quantize every decoder projection of a loaded fp16 Qwen3 to packed int4."""
     for i, layer in enumerate(model.model.layers):
         for dotted, partition in _PROJECTIONS:
@@ -129,14 +131,26 @@ def convert_qwen3_to_w4a16_(model, group_size: int | None = None) -> None:
                     f"layer{i}.{dotted}: expected fp16 weight, got {mod.weight.dtype}")
             pack_linear_int4_(mod, partition, name=f"layer{i}.{dotted}",
                               group_size=group_size)
+    if quantize_lm_head:
+        if group_size != DEFAULT_GROUP_SIZE:
+            raise ValueError("W4 lm_head requires group_size=32")
+        head = model.lm_head
+        if head.weight.dtype != torch.float16:
+            raise TypeError("W4 lm_head requires original FP16 weights")
+        packed, scale = quantize_pack_int4_pgrp_col_bounded(head.weight, group_size)
+        # Replace only the head Parameter. The 0.6/1.7/4B source ties it to
+        # embed_tokens; the embedding must retain the original FP16 storage.
+        head.weight = nn.Parameter(packed, requires_grad=False)
+        head.register_buffer("weight_scale", scale, persistent=False)
 
 
 def load_w4a16_model(path: str | None = None,
                      group_size: int | None = DEFAULT_GROUP_SIZE):
     """Load Qwen3-0.6B and return it with int4 projections, ready for `.to('rpu')`.
 
-    Group-wise quantization is the default. Per-channel int4 remains available
-    with ``group_size=None`` for diagnostic comparison.
+    Uses group-wise quantization by default. ``group_size=None`` selects the
+    alternative per-channel format for evaluation; it changes scale granularity
+    and must not be treated as the same numerical profile.
 
     The caller still does `.to('rpu')` and
     `_install_causal_decoder_forward(..., scale_lists=...)`.

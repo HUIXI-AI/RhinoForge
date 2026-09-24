@@ -1,13 +1,22 @@
-"""LingBot-VLA V2 prefix composition (``embed_prefix``), implemented on CPU.
+"""LingBot-VLA V2 — prefix composition (`embed_prefix`) mirrored EXACTLY, pure CPU.
 
-This module implements the model's prefix layout, special-token embedding,
-position-id construction, query-segment spans, and suffix-to-future-video
-blocking contract.
+Line-for-line mirror of the official
+  models/lingbot-vla-v2/lingbotvla/models/vla/lingbot_vla/modeling_lingbot_vla_v2.py
+    LingbotVlaV2 .embed_prefix                    (:499-740)
+    .embed_special_token                          (:260-263)
+    ._build_full_position_ids                     (:741-747)
+  models/lingbot-vla-v2/lingbotvla/models/vla/lingbot_vla/utils.py
+    prefix_query_segments / prefix_query_token_spans / fv_col_span / block_suffix_to_fv_
+  models/lingbot-vla-v2/lingbotvla/models/vla/lingbot_vla/modeling_lingbot_vla.py
+    ._future_depth_token_count / ._future_video_own_token_count / ._future_video_query_span
+    ._block_suffix_to_future_video_               (:1005-1018)
+    align-flag parsing                            (:775-870)
 
-⚠️ IMPORT CONTRACT: pure torch, NO module-level `import rpu_backend`, no relative imports,
-   so this file remains importable on an RPU-less host. Same rule as ``convert.py``.
+⚠️ IMPORT CONTRACT: pure torch, NO module-level `import rpu_backend`, no relative imports —
+   so the CPU test suite can exec this file standalone on an RPU-less host. Same rule as
+   convert.py; `test_prefix_module_is_cpu_safe` stands guard.
 
-Prefix token layout produced for the public training configuration:
+Prefix token layout produced for the AUTHORITATIVE YAML (kuavo_v2_depth):
 
     [<vision_start> <image>*num_patch <vision_end>] * n_images
     ++ lang_tokens
@@ -18,7 +27,7 @@ The `<eos>` ids are FAKE — they exist only so `get_rope_index` treats the alig
 (type 0 → sequential positions). Their EMBEDDINGS are overwritten with the align tokens, never
 the eos embedding. Likewise `<image>` ids are placeholders whose embeddings are overwritten by
 the ViT patch embeddings; `<vision_start>` / `<vision_end>` keep their real token embeddings
-(special tokens use the language-token embedding table).
+(embed_special_token is literally embed_language_tokens, :260-263).
 """
 from __future__ import annotations
 
@@ -28,8 +37,8 @@ from numbers import Integral
 import torch
 import torch.nn.functional as F
 
-# HF Qwen3-VL `get_rope_index` modality encoding: text=0, image=1, video=2.
-# vision_start/vision_end are text (type 0); only the
+# HF Qwen3-VL `get_rope_index` modality encoding (modeling_qwen3_vl.py: "text == 0",
+# "image == 1, video == 2"). vision_start/vision_end are TEXT (type 0) — only the
 # `<image>` placeholder run is type 1, which also makes it the deepstack visual mask.
 MM_TYPE_TEXT = 0
 MM_TYPE_IMAGE = 1
@@ -55,10 +64,10 @@ class SpecialTokenIds:
 
 @dataclass(frozen=True)
 class AlignConfig:
-    """Resolved ``align_params`` flags.
+    """The align_params flags, resolved exactly as modeling_lingbot_vla.py:775-870 does.
 
-    Defaults match the supported public training profile. Each field
-    is annotated with the configuration key it mirrors.
+    Defaults preserve the public checkpoint's alignment and action visibility.
+    Comments identify the corresponding training configuration fields.
     """
     use_depth_align: bool = True                      # align_params present + mode == "query"
     align_type: str = "query"                         # align_params.mode
@@ -72,13 +81,13 @@ class AlignConfig:
     use_future_video_cls: bool = False                # align_params.video.use_cls_loss
     future_video_share_future_depth_query: bool = True   # align_params.video.share_future_depth_query
     use_shared_future_task_proj: bool = True          # align_params.video.use_shared_future_task_proj
-    block_future_depth_to_action: bool = True         # align_params.depth.block_future_depth_to_action
-    block_suffix_to_future_video: bool = True         # align_params.video.block_suffix_to_future_video
-    qwen3vl_use_vision_boundaries: bool = True        # config.qwen3vl_use_vision_boundaries
-    vlm_causal: bool = True                           # config.vlm_causal
+    block_future_depth_to_action: bool = False         # align_params.depth.block_future_depth_to_action
+    block_suffix_to_future_video: bool = False         # align_params.video.block_suffix_to_future_video
+    qwen3vl_use_vision_boundaries: bool = True        # config.qwen3vl_use_vision_boundaries (default True, :541)
+    vlm_causal: bool = True                           # vlm_causal (YAML:261)
 
     def __post_init__(self):
-        # Validate dependent alignment options.
+        # Mirror the official's validation (modeling_lingbot_vla.py:781-783, 845-878).
         if self.use_depth_align and self.align_type != "query":
             raise ValueError(f"Only query depth alignment is supported, got {self.align_type!r}.")
         if self.num_task_tokens <= 0 or self.num_backbone_tokens % self.num_task_tokens != 0:
@@ -105,7 +114,7 @@ class AlignConfig:
 # Segment order / spans (utils.py mirrors)
 # =============================================================================
 def prefix_query_segments(cfg: AlignConfig) -> tuple[str, ...]:
-    """Return the prefix segment order after the image block.
+    """Prefix segment order AFTER the image block (utils.py prefix_query_segments).
 
     Current task queries precede future task queries; future_depth stays LAST so the
     suffix-to-future-depth tail blocking can keep using the tail span.
@@ -133,7 +142,7 @@ def segment_token_counts(cfg: AlignConfig) -> dict[str, int]:
 
 
 def prefix_query_token_spans(prefix_len: int, cfg: AlignConfig) -> dict[str, tuple[int, int]]:
-    """Return ``[start, end)`` spans of the non-language query segments."""
+    """[start, end) spans of the non-language query segments (utils.py prefix_query_token_spans)."""
     counts = segment_token_counts(cfg)
     ordered = prefix_query_segments(cfg)
     query_segments = [n for n in ordered if n != "language"]
@@ -151,13 +160,13 @@ def num_query_tokens(cfg: AlignConfig) -> int:
 
 
 def fv_col_span(prefix_len: int, num_task_tokens: int, use_cls: bool, use_patch: bool):
-    """Return the tail query block used for future-depth blocking."""
+    """utils.py fv_col_span — the TAIL query block, used for future-depth blocking in V2."""
     fv_len = (1 if use_cls else 0) + (num_task_tokens if use_patch else 0)
     return prefix_len - fv_len, prefix_len
 
 
 def future_video_query_span(prefix_len: int, cfg: AlignConfig) -> tuple[int, int]:
-    """Return the future-video query span.
+    """modeling_lingbot_vla.py _future_video_query_span (via _future_video_own_token_count).
 
     With share_future_depth_query=True the future-video segment owns NO tokens ⇒ start == end
     ⇒ _block_suffix_to_future_video_ is a NO-OP for the authoritative YAML.
@@ -173,10 +182,10 @@ def future_video_query_span(prefix_len: int, cfg: AlignConfig) -> tuple[int, int
 
 
 # =============================================================================
-# Align query tokens
+# Align query tokens (embed_prefix :583-643)
 # =============================================================================
 def get_align_tokens(tokens: torch.Tensor, num_task_tokens: int) -> torch.Tensor:
-    """Reduce ``[num_backbone_tokens, D]`` to ``[num_task_tokens, D]``.
+    """`_get_align_tokens` (:585-588): [num_backbone_tokens, D] -> [num_task_tokens, D].
 
     ORDER IS LOAD-BEARING: `view(num_task_tokens, N // num_task_tokens, D).mean(dim=1)`, i.e.
     task token i = mean of backbone rows [i*stride, (i+1)*stride). NOT view(N//ntt, ntt, D).
@@ -188,7 +197,7 @@ def get_align_tokens(tokens: torch.Tensor, num_task_tokens: int) -> torch.Tensor
 
 
 def compute_align_tokens(align_W: dict, cfg: AlignConfig) -> dict[str, torch.Tensor]:
-    """Build ``current_task`` and ``future_task`` query embeddings in CPU FP32.
+    """The `current_task` / `future_task` query embeddings (:600-643). CPU fp32.
 
     current_task = shared_task_proj(cat[ align(depth_align_embs), align(current_video_align_embs) ])
     future_task  = shared_task_proj(cat[ align(future_depth_align_embs), align(future_video_align_embs) ])
@@ -220,7 +229,7 @@ def compute_align_tokens(align_W: dict, cfg: AlignConfig) -> dict[str, torch.Ten
                 align_W["model.future_shared_task_proj.bias"])
         out["future_depth"] = future_task
 
-    # Reject an invalid shared-query configuration rather than dropping it.
+    # ':643-649' — the official raises here rather than silently dropping the shared query.
     if (not cfg.use_future_depth and cfg.use_future_video
             and cfg.future_video_share_future_depth_query):
         raise ValueError("share_future_depth_query=True requires depth.use_future_depth=True.")
@@ -234,7 +243,7 @@ def compute_align_tokens(align_W: dict, cfg: AlignConfig) -> dict[str, torch.Ten
 
 
 # =============================================================================
-# Prefix ID layout
+# Prefix id layout (embed_prefix :541-712)
 # =============================================================================
 @dataclass(frozen=True)
 class PrefixLayout:
@@ -277,6 +286,7 @@ class PrefixExecutionPlan:
     real_len: int
     execution_len: int
     chunk_size: int
+    a6_plan: object | None = None
 
     @property
     def key(self) -> tuple[int, int]:
@@ -296,8 +306,9 @@ def plan_prefix_execution(
 
     This mirrors Wall-OSS' adapter-level planning split: the REAL processor
     length remains semantic, while the execution length is a finite Graph shape.
-    The execution length is selected from the public profile and rejects,
-    rather than truncates, a semantic prefix that does not fit.
+    Generic LingBot2 may align the tail; production Z2 passes
+    ``fixed_execution_len=225`` and therefore rejects, rather than truncates, a
+    REAL prefix that does not fit that sealed physical profile.
 
     ``chunk_size`` is the already-selected per-instance decoder policy.  This
     helper does not second-guess the generic C++ exact planner when it is zero.
@@ -414,7 +425,7 @@ def pad_prefix_layout_for_execution(
 
 def build_prefix_layout(n_images: int, num_patch: int, lang_ids: torch.Tensor,
                         cfg: AlignConfig, ids: SpecialTokenIds) -> PrefixLayout:
-    """Build the prefix ``input_ids`` and masks used by ``embed_prefix``.
+    """Build the prefix input_ids / masks EXACTLY as embed_prefix does (:541-712).
 
     `n_images` is the count of VALID images (img_masks already applied), `num_patch` the
     post-merger token count per image, `lang_ids` the [1, L] masked language tokens.
@@ -423,7 +434,7 @@ def build_prefix_layout(n_images: int, num_patch: int, lang_ids: torch.Tensor,
         raise ValueError(f"build_prefix_layout: lang_ids must be [1, L], got {tuple(lang_ids.shape)}")
     L = lang_ids.shape[1]
 
-    # ---- image block: <vision_start> <image>*num_patch <vision_end> ----
+    # ---- image block: <vision_start> <image>*num_patch <vision_end> (:541-563) ----
     if cfg.qwen3vl_use_vision_boundaries:
         image_token_len = num_patch + 2
         one = torch.full((image_token_len,), ids.image, dtype=torch.long)
@@ -445,7 +456,7 @@ def build_prefix_layout(n_images: int, num_patch: int, lang_ids: torch.Tensor,
     cursor = n_images * image_token_len
     spans["image"] = (0, cursor)
 
-    # ---- segments after the image block in model order ----
+    # ---- segments after the image block, in the official order (:652-694) ----
     n_task = cfg.num_task_tokens
     for seg in prefix_query_segments(cfg):
         if seg == "language":
@@ -455,7 +466,7 @@ def build_prefix_layout(n_images: int, num_patch: int, lang_ids: torch.Tensor,
             cursor += L
         else:
             count = 1 if seg == "future_video_cls" else n_task
-            # Fake IDs use text_config.eos_token_id and serve only as placeholders.
+            # fake ids = text_config.eos_token_id (:557-562 / :679-684) — placeholders only.
             parts_ids.append(torch.full((1, count), ids.eos, dtype=torch.long))
             parts_vis.append(torch.zeros(1, count, dtype=torch.bool))
             spans[seg] = (cursor, cursor + count)
@@ -474,7 +485,7 @@ def build_prefix_layout(n_images: int, num_patch: int, lang_ids: torch.Tensor,
     # filters first, which is equivalent for batch_size 1.)
     pad_masks = torch.ones(1, S, dtype=torch.bool)
 
-    # Cross-check against the independent span calculator.
+    # Cross-check against the independent span calculator (utils.py prefix_query_token_spans).
     ref_spans = prefix_query_token_spans(S, cfg)
     for name, span in ref_spans.items():
         if spans[name] != span:
@@ -487,7 +498,7 @@ def build_prefix_layout(n_images: int, num_patch: int, lang_ids: torch.Tensor,
 
 
 def suffix_position_start(prefix_position_ids: torch.Tensor, pad_masks: torch.Tensor) -> int:
-    """``p0`` — the suffix's RoPE position base.
+    """`p0` — the suffix's RoPE position base (_build_full_position_ids :741-747).
 
         valid_prefix_pos = prefix_position_ids.masked_fill(~prefix_pad_masks.unsqueeze(0), 0)
         prefix_offsets   = valid_prefix_pos.amax(dim=(0, 2)) + 1
@@ -502,7 +513,7 @@ def suffix_position_start(prefix_position_ids: torch.Tensor, pad_masks: torch.Te
 
 
 def apply_suffix_prefix_blocking_(prefix_2d: torch.Tensor, prefix_len: int, cfg: AlignConfig):
-    """Mask the configured suffix→prefix edges.
+    """Mask the suffix→prefix edges the official blocks (predict_velocity :1033-1042).
 
     `prefix_2d` is bool [suffix_len, prefix_len], True == visible. Modified IN PLACE.
 

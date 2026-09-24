@@ -1,56 +1,264 @@
-"""RhinoVLA fused forward.
+"""RhinoVLA fused forward (P1).
 
 Patches a RhinoVLA action expert (depth-18 / 72-D) to run the fused C++ expert
-via the dedicated RhinoVLA ops `torch.ops.rpu.rhino_vla_{create,set_weights,
-forward,destroy}`. RhinoVLA-specific IO, mask conditioning, instance-LoRA
-merge, and denoising live in the adapter; LoRA is merged into base weights
-before `set_weights`, so the C++ op never sees it.
+via the DEDICATED RhinoVLA ops `torch.ops.rpu.rhino_vla_{create,set_weights,
+forward,destroy}` (src/fused/rpu_rhino_vla_model.cpp — an independent fork of the
+qwenpi05 expert so RhinoVLA can be optimized in isolation). The expert math is
+identical to qwenpi05's; RhinoVLA specifics (72-D IO, mask_condition,
+instance-LoRA merge, 0→1 denoise) live in the adapter / test harness, and LoRA
+is merged into base weights before set_weights so the C++ op never sees it.
 
-Prerequisites (caller order):
+Prerequisites (required caller order):
     expert = convert.convert_expert_for_rpu(expert)   # half() -> swizzle -> rpu
     patch_rhino_vla_for_rpu(expert, prefix_len=P, suffix_len=S, cpu_rotary_emb=...)
 
-Action IO and the final AdaRMSNorm stay on CPU fp32; suffix construction and
-decode run in PyTorch.
+action_io + the final AdaRMSNorm stay on CPU fp32 (suffix construction + decode
+run in PyTorch), so the qwenpi05 dtype monkey-patches are not needed here.
 """
 
 import copy
+import dataclasses
+import sys
 import types
-import weakref
-from collections.abc import Mapping
 from numbers import Integral
 
 import torch
 
 from rpu_backend.runtime import rpu_env_bool
+from rpu_backend.runtime.decoder import plan_bounded_prefill_execution
+from rpu_backend.runtime.execution_planner import GRAPH_COMPOSITE_CHILD
 
 
-def publish_rpu_execution_resolved(runtime, resolved):
-    """Publish one full, post-dispatch execution plan with a fresh generation."""
-    if not isinstance(resolved, Mapping):
-        raise TypeError("RhinoVLA resolved execution plan must be a mapping")
-    generation = getattr(runtime, "_rpu_execution_resolved_generation", 0)
-    if (
-        isinstance(generation, bool)
-        or not isinstance(generation, int)
-        or generation < 0
-    ):
-        raise TypeError(
-            "RhinoVLA _rpu_execution_resolved_generation must be a "
-            "non-negative integer"
+def _rhino_action_math(expert):
+    """Use the helpers belonging to the loaded expert, not a different checkout."""
+    names = ("make_suffix_attn_mask", "bool_mask_to_attention_bias", "get_cache_layer")
+    for cls in type(expert).__mro__:
+        module = sys.modules.get(cls.__module__)
+        helpers = tuple(getattr(module, name, None) for name in names)
+        if all(callable(helper) for helper in helpers):
+            return helpers
+    raise RuntimeError("RhinoVLA expert source does not expose its attention/cache helpers")
+
+
+def _cached_rhino_attention_bias(owner, prefix_mask, suffix_mask,
+                                 make_suffix_attn_mask, bool_mask_to_attention_bias):
+    """One content-owned CPU mask shared by step and unroll callers.
+
+    Tensor identity is not a semantic key: request masks may be mutated in
+    place or be inference tensors without versions. Snapshot their actual
+    binary values, retaining physical lengths and padded suffix rows.
+    """
+    prefix = prefix_mask.detach().to(device="cpu").contiguous()
+    suffix = suffix_mask.detach().to(device="cpu").contiguous()
+    key = (str(prefix.dtype), tuple(prefix.shape), tuple(prefix.reshape(-1).tolist()),
+           str(suffix.dtype), tuple(suffix.shape), tuple(suffix.reshape(-1).tolist()),
+           make_suffix_attn_mask, bool_mask_to_attention_bias)
+    cached = getattr(owner, "_rhino_attention_bias_cache", None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    bias = bool_mask_to_attention_bias(make_suffix_attn_mask(prefix, suffix), torch.float16)
+    pad_k = (-bias.shape[-1]) % 16
+    if pad_k:
+        bias = torch.nn.functional.pad(bias, (0, pad_k), value=torch.finfo(bias.dtype).min)
+    result = versioned_cpu_mask(bias)
+    owner._rhino_attention_bias_cache = (key, result)
+    return result
+
+
+def _aligned_rhino_action_prefix(prefix_mask, *, prefix_len, suffix_len, capacity):
+    """Pad only the expert's KV prefix; text position and logical RoPE stay live."""
+    if prefix_mask.ndim != 2 or prefix_mask.shape[1] != prefix_len:
+        raise ValueError("RhinoVLA aligned KV prefix mask must match physical text rows")
+    _validate_rhino_prefix_mask(
+        runtime_prefix_len=prefix_len, batch_size=prefix_mask.shape[0],
+        prefix_mask=prefix_mask,
+    )
+    position = ((prefix_len + 15) // 16) * 16
+    if suffix_len != 31 or position + 32 > capacity:
+        raise ValueError("RhinoVLA aligned KV requires M31 and capacity for its 32-row write")
+    if position == prefix_len:
+        return position, prefix_mask
+    return position, torch.nn.functional.pad(prefix_mask, (0, position - prefix_len), value=0)
+
+
+@dataclasses.dataclass(frozen=True)
+class _RhinoVLANativeColdConfig:
+    """One immutable Python-owned selector snapshot for a native handle."""
+
+    denoise_static_context_cache: bool = False
+    fused_adarms: bool = False
+    skip_adarms_gemv: bool = False
+    precompute_adarms: bool = False
+    precompute_time_proj: bool = False
+    fold_action_time_in: bool = False
+    gated_no_sub: bool = False
+    fused_silu_mul: bool = False
+    expert_fusions: bool = False
+    adarms_resident: bool = False
+    packed_qkv: bool = False
+    aligned_kv: bool = False
+
+    @classmethod
+    def from_env(cls) -> "_RhinoVLANativeColdConfig":
+        config = cls(
+            denoise_static_context_cache=rpu_env_bool(
+                "RPU_RHINOVLA_DENOISE_STATIC_CONTEXT_CACHE"
+            ),
+            fused_adarms=rpu_env_bool("RPU_RHINOVLA_FUSED_ADARMS_GEMV"),
+            skip_adarms_gemv=rpu_env_bool(
+                "RPU_RHINOVLA_SKIP_ADARMS_GEMV"
+            ),
+            precompute_adarms=rpu_env_bool(
+                "RPU_RHINOVLA_PRECOMPUTE_ADARMS"
+            ),
+            precompute_time_proj=rpu_env_bool(
+                "RPU_RHINOVLA_PRECOMPUTE_TIME_PROJ"
+            ),
+            fold_action_time_in=rpu_env_bool(
+                "RPU_RHINOVLA_FOLD_ACTION_TIME_IN"
+            ),
+            gated_no_sub=rpu_env_bool("RPU_RHINOVLA_GATED_NO_SUB"),
+            fused_silu_mul=rpu_env_bool("RPU_RHINOVLA_FUSED_SILU_MUL"),
+            expert_fusions=rpu_env_bool("RPU_RHINOVLA_EXPERT_FUSIONS"),
+            adarms_resident=rpu_env_bool("RPU_RHINOVLA_ADARMS_RESIDENT"),
+            packed_qkv=rpu_env_bool("RPU_RHINOVLA_PACKED_QKV"),
+            aligned_kv=rpu_env_bool("RPU_RHINOVLA_ALIGNED_KV"),
         )
-    runtime._rpu_execution_resolved = copy.deepcopy(resolved)
-    runtime._rpu_execution_resolved_generation = generation + 1
-    return generation + 1
+        if config.expert_fusions or config.adarms_resident:
+            if not config.precompute_adarms or config.skip_adarms_gemv:
+                raise ValueError("RhinoVLA expert transfer requires PRECOMPUTE_ADARMS and rejects SKIP_ADARMS_GEMV")
+            if config.expert_fusions and not config.gated_no_sub:
+                raise ValueError("RhinoVLA EXPERT_FUSIONS requires GATED_NO_SUB")
+        return config
 
 
-def _rhino_destroy_handle(h):
-    """Release the reused C++ expert handle. Called by weakref.finalize on GC."""
-    try:
-        torch.ops.rpu.rhino_vla_destroy(h)
-    except Exception:
-        # Swallow -- during interpreter shutdown the op may be gone
-        pass
+def plan_rhino_action_execution(
+    expert,
+    *,
+    logical_len,
+    execution_len,
+    prefix_len,
+    kv_len,
+    use_attention_mask,
+    is_causal,
+    prefix_plan_key_words=(),
+):
+    """Resolve the exact native action descriptor before Graph admission."""
+    component = str(getattr(
+        expert, "_fmb_execution_component_id", "action_expert"
+    ))
+    generation = int(getattr(expert, "_fmb_execution_generation", 0))
+    action_config = getattr(expert, "_rpu_execution", {}).get("action", {})
+    requested_chunk = action_config.get("chunk_size", "auto")
+    exact_chunk = requested_chunk if isinstance(requested_chunk, int) else None
+    prefix_plan_key_words = tuple(int(word) for word in prefix_plan_key_words)
+    handle = int(expert._rpu_handle)
+    plan_box = {}
+    resolved_execution, resolved_chunk = plan_bounded_prefill_execution(
+        int(logical_len),
+        int(execution_len),
+        int(execution_len) - int(logical_len),
+        execution_owner=expert,
+        execution_stage="action",
+        execution_native=("rhino_vla", handle),
+        plan_signature=(int(kv_len), bool(use_attention_mask), bool(is_causal)),
+        graph_cache=getattr(expert, "_rpu_graph_cache", None),
+        position=int(prefix_len),
+        alignment=1,
+        padding_rows=int(execution_len) - int(logical_len),
+        exact_chunk_size=exact_chunk,
+        resolve_stage_domain=lambda length: (
+            torch.ops.rpu.rhino_vla_resolve_action_stage_domain(
+                handle,
+                int(length),
+                int(logical_len),
+                int(prefix_len),
+                int(kv_len),
+                bool(use_attention_mask),
+                bool(is_causal),
+                0 if exact_chunk is None else int(exact_chunk),
+            )
+        ),
+        request_id=f"rhinovla:{component}:action",
+        plan_result_sink=lambda result: plan_box.__setitem__("result", result),
+        graph_mode=GRAPH_COMPOSITE_CHILD,
+        queue_owner_id=handle,
+        physical_metadata=(
+            (f"component:{component}", 1),
+            ("execution_generation", generation),
+            ("prefix_len", int(prefix_len)),
+            ("kv_len", int(kv_len)),
+            ("direct_prefix_plan", int(bool(prefix_plan_key_words))),
+            *(tuple(
+                (f"prefix_plan_digest_{index}", word)
+                for index, word in enumerate(prefix_plan_key_words)
+            )),
+        ),
+    )
+    result = plan_box["result"]
+    selected = result.selected
+    if (
+        selected is None
+        or resolved_execution != int(execution_len)
+        or resolved_chunk != selected.stage_tuple.compute_chunk
+        or not selected.stage_tuple.physical_descriptor
+    ):
+        raise RuntimeError(
+            "RhinoVLA action dry planner returned no consumable native "
+            "stage descriptor"
+        )
+    return result
+
+
+def publish_rhino_action_execution_receipt(
+    expert,
+    plan,
+    *,
+    logical_len,
+    prefix_plan=None,
+    prefix_route_argument_digest="",
+):
+    """Publish one standard receipt after native dry/forward agreement."""
+    selected = plan.selected
+    if selected is None:
+        raise RuntimeError("RhinoVLA action planner selected no plan")
+    resolved_chunk = int(
+        torch.ops.rpu.rhino_vla_get_resolved_chunk_size(expert._rpu_handle)
+    )
+    if resolved_chunk != selected.stage_tuple.compute_chunk:
+        raise RuntimeError(
+            "RhinoVLA action dry/forward chunk plan drift: dry="
+            f"{selected.stage_tuple.compute_chunk}, forward={resolved_chunk}"
+        )
+    receipt = plan.as_dict(include_candidates=False)
+    receipt.update({
+        "stage": "action",
+        "component": getattr(
+            expert, "_fmb_execution_component_id", "action_expert"
+        ),
+        "generation": int(getattr(
+            expert, "_fmb_execution_generation", 0
+        )),
+        "logical_len": int(logical_len),
+        "execution_len": int(selected.execution_len),
+        "chunk_size": resolved_chunk,
+        "padding_rows": int(selected.padding_rows),
+        "position": dict(
+            selected.stage_tuple.physical_metadata
+        )["prefix_len"],
+        "authority": "NATIVE_A6_STAGE_DESCRIPTOR",
+        "attention_policy": "DDR_REQUIRED",
+        "dry_forward_agreement": True,
+    })
+    if prefix_plan is not None:
+        receipt["prefix_kv"] = {
+            **prefix_plan.as_dict(include_candidates=False),
+            "stage": "prefix_kv",
+            "authority": "TYPED_KV_INSERT_ROUTE",
+            "route_argument_digest": str(prefix_route_argument_digest),
+        }
+    vars(expert)["_rpu_last_execution_plan"] = receipt
+    return receipt
 
 
 _RHINO_RUNTIME_INSTALL_ATTRS = (
@@ -61,8 +269,15 @@ _RHINO_RUNTIME_INSTALL_ATTRS = (
     "_rpu_suffix_len",
     "_rpu_kv_cache",
     "_rpu_prefix_source_snapshot",
+    "_rpu_execution",
+    "_fmb_execution_component_id",
+    "_fmb_execution_generation",
+    "_rpu_native_cold_config",
+    "_rpu_full_w8a16",
+    "_rpu_last_execution_plan",
     "_rpu_handle",
     "_rpu_handle_finalizer",
+    "_rpu_retirement_state",
     "forward",
 )
 
@@ -81,12 +296,19 @@ def _rhino_tensor_version(tensor):
 
 
 def _snapshot_rhino_prefix_source(
-    prefix_key_values, prefix_layer_offset, prefix_pairs
+    prefix_key_values,
+    prefix_layer_offset,
+    prefix_pairs,
+    *,
+    route_argument_digest="",
+    execution_generation=0,
 ):
     """Keep strong refs plus versions for the exact K/V layers copied to RPU."""
     return (
         prefix_key_values,
         int(prefix_layer_offset),
+        str(route_argument_digest),
+        int(execution_generation),
         tuple(
             (
                 prefix_k,
@@ -103,11 +325,13 @@ def _rhino_prefix_source_matches(snapshot, candidate) -> bool:
     """Compare snapshots without invoking tensor value equality."""
     if snapshot is None or candidate is None:
         return snapshot is candidate
-    old_owner, old_offset, old_pairs = snapshot
-    new_owner, new_offset, new_pairs = candidate
+    old_owner, old_offset, old_route, old_generation, old_pairs = snapshot
+    new_owner, new_offset, new_route, new_generation, new_pairs = candidate
     if (
         old_owner is not new_owner
         or old_offset != new_offset
+        or old_route != new_route
+        or old_generation != new_generation
         or len(old_pairs) != len(new_pairs)
     ):
         return False
@@ -139,8 +363,9 @@ def _validate_rhino_prefix_rope_contract(
     position_ids,
     prefix_mask,
     suffix_mask,
+    prefix_rope_deltas=None,
 ):
-    """Return the logical suffix RoPE start for a right-padded prefix."""
+    """Return the suffix RoPE start, independent of physical prefix KV rows."""
     runtime_prefix_len = int(runtime_prefix_len)
     rope_max_seq_len = int(rope_max_seq_len)
     suffix_len = int(suffix_len)
@@ -151,10 +376,11 @@ def _validate_rhino_prefix_rope_contract(
             "batch_size must be positive"
         )
 
-    logical_prefix_len = _validate_rhino_prefix_mask(
+    logical_prefix_len = _rhino_suffix_rope_start(
         runtime_prefix_len=runtime_prefix_len,
         batch_size=batch_size,
         prefix_mask=prefix_mask,
+        prefix_rope_deltas=prefix_rope_deltas,
     )
 
     if suffix_mask is not None:
@@ -213,6 +439,35 @@ def _validate_rhino_prefix_rope_contract(
     return logical_prefix_len
 
 
+def _rhino_suffix_rope_start(
+    *, runtime_prefix_len, batch_size, prefix_mask, prefix_rope_deltas=None,
+):
+    """Apply the model's continuation delta, not a planner search setting."""
+    logical_rows = _validate_rhino_prefix_mask(
+        runtime_prefix_len=runtime_prefix_len,
+        batch_size=batch_size,
+        prefix_mask=prefix_mask,
+    )
+    delta = prefix_rope_deltas
+    if delta is None:
+        delta = 0
+    if isinstance(delta, torch.Tensor):
+        if delta.dtype not in (torch.int8, torch.int16, torch.int32, torch.int64):
+            raise TypeError("RhinoVLA prefix_rope_deltas must be an integer tensor")
+        if tuple(delta.shape) not in ((batch_size,), (batch_size, 1)):
+            raise ValueError("RhinoVLA prefix_rope_deltas must have shape [B] or [B,1]")
+        values = delta.detach().cpu().reshape(-1)
+        if not torch.equal(values, values[:1].expand_as(values)):
+            raise ValueError("RhinoVLA prefix RoPE deltas must agree across batch rows")
+        delta = int(values[0])
+    if isinstance(delta, bool) or not isinstance(delta, Integral):
+        raise TypeError("RhinoVLA prefix_rope_deltas must be an integer or integer tensor")
+    position = logical_rows + int(delta)
+    if position < 0:
+        raise ValueError("RhinoVLA logical prefix + RoPE delta must be non-negative")
+    return position
+
+
 def _validate_rhino_prefix_mask(
     *, runtime_prefix_len, batch_size, prefix_mask
 ):
@@ -258,7 +513,7 @@ def _validate_rhino_prefix_mask(
 
 
 def patch_rhino_vla_for_rpu(expert, *, prefix_len, suffix_len, max_seq_len=2048,
-                            cpu_rotary_emb=None):
+                            cpu_rotary_emb=None, full_w8a16=False):
     """Patch a RhinoVLA action expert transactionally onto its fused C++ op.
 
     Weight/M-RoPE/KV/GraphCache state is prepared before native handle creation.
@@ -277,7 +532,8 @@ def patch_rhino_vla_for_rpu(expert, *, prefix_len, suffix_len, max_seq_len=2048,
         int handle (also stored as expert._rpu_handle).
     """
     from rpu_backend.adapters.rhinovla.convert import (
-        _gather_expert_weights, _precompute_mrope_cos_sin, _create_kv_cache,
+        _gather_expert_weights, _gather_expert_scales,
+        _precompute_mrope_cos_sin, _create_kv_cache,
     )
 
     for name, value, minimum in (
@@ -305,6 +561,8 @@ def patch_rhino_vla_for_rpu(expert, *, prefix_len, suffix_len, max_seq_len=2048,
     if len(expert.layers) == 0:
         raise RuntimeError("patch_rhino_vla_for_rpu: expert has no layers")
 
+    native_cold = _RhinoVLANativeColdConfig.from_env()
+
     expert_state = vars(expert)
     install_snapshot = {
         name: expert_state[name]
@@ -314,13 +572,27 @@ def patch_rhino_vla_for_rpu(expert, *, prefix_len, suffix_len, max_seq_len=2048,
     had_old_handle = "_rpu_handle" in install_snapshot
     old_handle = install_snapshot.get("_rpu_handle")
     old_finalizer = install_snapshot.get("_rpu_handle_finalizer")
+    old_resource = install_snapshot.get("_rpu_retirement_state")
+    if old_resource is not None:
+        old_resource.require_replaceable()
+    else:
+        from rpu_backend.api._execution import _require_execution_process_safe
+        _require_execution_process_safe()
 
     import rpu_backend as _rb
     graph_cache = _rb.graph.GraphCache()
     _GraphSignature = _rb.graph.GraphSignature
 
     # -- gather per-layer weight lists --
-    weights = _gather_expert_weights(expert)
+    scale_lists = _gather_expert_scales(expert)
+    if full_w8a16 and (not scale_lists or not native_cold.precompute_adarms
+                       or native_cold.skip_adarms_gemv):
+        raise ValueError("RhinoVLA full W8 requires expert W8 and PRECOMPUTE_ADARMS without SKIP_ADARMS_GEMV")
+    if scale_lists and native_cold.packed_qkv:
+        raise ValueError("RhinoVLA EXPERT_W8A16 is incompatible with PACKED_QKV")
+    weights = (_gather_expert_weights(expert, full_w8a16=True)
+               if full_w8a16 else _gather_expert_weights(expert))
+    cond_owners = getattr(expert, "_rpu_full_w8_cond_owners", None) if full_w8a16 else None
 
     # -- Stable full M-RoPE table. RoPE uses a logical per-forward start while
     #    KV insert keeps using the physical prefix row (Pi0.5's proven split).
@@ -340,7 +612,7 @@ def patch_rhino_vla_for_rpu(expert, *, prefix_len, suffix_len, max_seq_len=2048,
     print(f"[Rhino] M-RoPE precomputed: cos/sin [{max_seq_len}, {cos_cached.shape[-1]}], "
           f"KV cache max_seq={max_seq_len}")
 
-    # -- prepare dedicated rhino_vla_set_weights args --
+    # -- prepare set_weights args (reused qwenpi05 op) --
     config = expert.config
     set_weights_args = (
         *weights,  # q,k,v,o,gate,up,down, adarms dense/pair dense, q_norm,k_norm
@@ -352,7 +624,7 @@ def patch_rhino_vla_for_rpu(expert, *, prefix_len, suffix_len, max_seq_len=2048,
         config.rms_norm_eps,
     )
 
-    # -- final AdaRMSNorm runs in Python on CPU fp32 --
+    # -- final AdaRMSNorm runs in Python on CPU fp32 (D-402) --
     if getattr(expert, 'norm', None) is not None:
         expert.norm = expert.norm.to('cpu').to(dtype=torch.float32)
 
@@ -369,13 +641,14 @@ def patch_rhino_vla_for_rpu(expert, *, prefix_len, suffix_len, max_seq_len=2048,
         position_ids=None,
         adarms_cond=None,
         prefix_layer_offset=0,
+        prefix_rope_deltas=None,
     ):
-        """Fused velocity forward through the dedicated RhinoVLA op."""
-        from rhinovla.model.modules.action_expert import (
-            make_suffix_attn_mask, bool_mask_to_attention_bias,
-            get_cache_layer,
-        )
+        """Fused velocity forward: routes through the reused C++ qwenpi05_forward op."""
+        make_suffix_attn_mask, bool_mask_to_attention_bias, get_cache_layer = _rhino_action_math(self)
         from rpu_backend.adapters.rhinovla.convert import _prefill_kv_cache
+        from rpu_backend.adapters.rhinovla.convert import (
+            _plan_rhino_prefix_kv_execution,
+        )
 
         orig_device = suffix_embeds.device
         if suffix_embeds.shape[0] != 1:
@@ -388,6 +661,9 @@ def patch_rhino_vla_for_rpu(expert, *, prefix_len, suffix_len, max_seq_len=2048,
         # logical RoPE start before any cache fill or graph dispatch.
         cache = self._rpu_kv_cache
         prefix_source_snapshot = None
+        prefix_plan = None
+        prefix_route_arguments = ()
+        prefix_route_argument_digest = ""
         if prefix_key_values is not None:
             prefix_lengths = []
             prefix_pairs = []
@@ -415,10 +691,26 @@ def patch_rhino_vla_for_rpu(expert, *, prefix_len, suffix_len, max_seq_len=2048,
                     "RhinoVLA fused: prefix KV lengths differ across layers: "
                     f"{prefix_lengths}"
                 )
+            generation = int(getattr(self, "_fmb_execution_generation", 0))
+            component = str(getattr(
+                self, "_fmb_execution_component_id", "action_expert"
+            ))
+            (
+                prefix_plan,
+                prefix_route_arguments,
+                prefix_route_argument_digest,
+            ) = _plan_rhino_prefix_kv_execution(
+                prefix_pairs,
+                component=component,
+                generation=generation,
+                queue_owner_id=int(self._rpu_handle),
+            )
             prefix_source_snapshot = _snapshot_rhino_prefix_source(
                 prefix_key_values,
                 prefix_layer_offset,
                 prefix_pairs,
+                route_argument_digest=prefix_route_argument_digest,
+                execution_generation=generation,
             )
             if cache.position != 0:
                 if int(cache.position) != runtime_prefix_len:
@@ -460,6 +752,7 @@ def patch_rhino_vla_for_rpu(expert, *, prefix_len, suffix_len, max_seq_len=2048,
             position_ids=position_ids,
             prefix_mask=prefix_mask,
             suffix_mask=suffix_mask,
+            prefix_rope_deltas=prefix_rope_deltas,
         )
         if (
             runtime_prefix_len + target_suffix_len > cache.max_seq_len
@@ -510,13 +803,15 @@ def patch_rhino_vla_for_rpu(expert, *, prefix_len, suffix_len, max_seq_len=2048,
 
         # -- prefix KV pre-fill (first step / after reset) --
         if prefix_key_values is not None and cache.position == 0:
-            _prefill_kv_cache(cache, prefix_key_values, prefix_layer_offset, len(self.layers))
+            _prefill_kv_cache(
+                cache, prefix_pairs, prefix_route_arguments
+            )
             self._rpu_prefix_source_snapshot = prefix_source_snapshot
         elif prefix_key_values is None:
             # A shared-cache caller owns the prefix bytes. Do not later accept
             # an old direct-prefix identity against storage it may have replaced.
             self._rpu_prefix_source_snapshot = None
-        # The shared-cache path preloads the expert RPUCache directly from
+        # Phase2 shared-cache path preloads the expert RPUCache directly from
         # the text RPUCache and passes prefix_key_values=None. In that mode the
         # cache position itself is the prefix contract.
         has_prefix = prefix_key_values is not None or prefix_mask is not None
@@ -541,29 +836,29 @@ def patch_rhino_vla_for_rpu(expert, *, prefix_len, suffix_len, max_seq_len=2048,
             attention_mask = None
             is_causal = True
 
-        # -- fused C++ forward, wrapped in GraphCache.capture (graph_dma active) --
-        # Small-shape fusion flags change the emitted kernel
-        # sequence, so they MUST be part of the graph-cache key or a stale
-        # captured path gets replayed when a flag flips.
-        # ⚠️ SHARED SWITCHES — the same four variables are read by C++
-        # with the byte-exact `e && s != "0" && s != "false"` rule. These values also go into the
-        # GraphSignature, so a Python/C++ disagreement replays a graph built for
-        # the other kernel sequence. `cpp_mirror` refuses everything but 1/0.
-        _no_sub = 1 if rpu_env_bool(
-            "RPU_RHINOVLA_GATED_NO_SUB",
-            cpp_mirror="src/fused/rpu_rhino_vla_model.cpp") else 0
-        _silu_mul = 1 if rpu_env_bool(
-            "RPU_RHINOVLA_FUSED_SILU_MUL",
-            cpp_mirror="src/fused/rpu_rhino_vla_model.cpp") else 0
-        # AdaRMS GEMV mode also selects a different kernel sequence in the C++
-        # rhino_vla_forward (fused / skip / precomputed) — key the graph on it too so
-        # a same-process flag flip can't replay a stale AdaRMS path.
-        _fused_adarms = 1 if rpu_env_bool(
-            "RPU_RHINOVLA_FUSED_ADARMS_GEMV",
-            cpp_mirror="src/fused/rpu_rhino_vla_model.cpp") else 0
-        _skip_adarms = 1 if rpu_env_bool(
-            "RPU_RHINOVLA_SKIP_ADARMS_GEMV",
-            cpp_mirror="src/fused/rpu_rhino_vla_model.cpp") else 0
+        action_plan = plan_rhino_action_execution(
+            self,
+            logical_len=actual_suffix_len,
+            execution_len=target_suffix_len,
+            prefix_len=prefix_len_actual,
+            kv_len=(
+                int(attention_mask.shape[-1])
+                if attention_mask is not None
+                else prefix_len_actual + target_suffix_len
+            ),
+            use_attention_mask=attention_mask is not None,
+            is_causal=is_causal,
+            prefix_plan_key_words=(
+                prefix_plan.graph_key_words()
+                if prefix_plan is not None else ()
+            ),
+        )
+        selected_action_plan = action_plan.selected
+        if selected_action_plan is None:
+            raise RuntimeError("RhinoVLA action planner selected no plan")
+
+        # The native handle owns the frozen selector snapshot bound at install;
+        # the resulting COMPLETE descriptor digest is the graph-key authority.
         sig = _GraphSignature(
             op_id="rhino_vla_forward",
             shapes=[int(hidden_states.shape[1]), int(hidden_states.shape[2])],
@@ -574,12 +869,14 @@ def patch_rhino_vla_for_rpu(expert, *, prefix_len, suffix_len, max_seq_len=2048,
                 int(self.config.head_dim),
                 int(prefix_len_actual),
                 int(logical_prefix_len),
+                _validate_rhino_prefix_mask(
+                    runtime_prefix_len=runtime_prefix_len,
+                    batch_size=int(suffix_embeds.shape[0]),
+                    prefix_mask=prefix_mask,
+                ),
                 int(is_causal),
                 1 if attention_mask is not None else 0,
-                _no_sub,
-                _silu_mul,
-                _fused_adarms,
-                _skip_adarms,
+                *action_plan.graph_key_words(),
             ],
             dtypes=[torch.float16],
         )
@@ -596,6 +893,9 @@ def patch_rhino_vla_for_rpu(expert, *, prefix_len, suffix_len, max_seq_len=2048,
                     attention_mask,
                     prefix_len_actual,
                     is_causal,
+                    list(
+                        selected_action_plan.stage_tuple.physical_descriptor
+                    ),
                 )
         finally:
             torch.ops.rpu.spm_alloc_reset_temporary()
@@ -604,7 +904,7 @@ def patch_rhino_vla_for_rpu(expert, *, prefix_len, suffix_len, max_seq_len=2048,
         if actual_suffix_len < target_suffix_len:
             output = output[:, :actual_suffix_len, :]
 
-        # -- final norm in Python on CPU fp32 --
+        # -- final norm in Python on CPU fp32 (D-402) --
         if getattr(self, "norm", None) is not None:
             norm_w = getattr(self.norm.norm, 'weight', None)
             norm_device = norm_w.device if norm_w is not None else torch.device('cpu')
@@ -615,15 +915,47 @@ def patch_rhino_vla_for_rpu(expert, *, prefix_len, suffix_len, max_seq_len=2048,
         if orig_device.type != output.device.type:
             output = output.to(orig_device)
 
+        publish_rhino_action_execution_receipt(
+            self,
+            action_plan,
+            logical_len=actual_suffix_len,
+            prefix_plan=prefix_plan,
+            prefix_route_argument_digest=prefix_route_argument_digest,
+        )
+
         return output
 
     handle = torch.ops.rpu.rhino_vla_create()
-    handle_finalizer = None
-    committed = False
+    from rpu_backend.runtime._native_retirement import _InstalledNativeResource
+    resource = _InstalledNativeResource(
+        expert, handle, torch.ops.rpu.rhino_vla_destroy,
+        graphs=(graph_cache,), keepalive=(set_weights_args, scale_lists, cond_owners, cos_cached, sin_cached, kv_cache),
+        label="RhinoVLA action", handle_name="_rpu_handle")
+    handle_finalizer = resource.finalizer
     try:
-        handle_finalizer = weakref.finalize(
-            expert, _rhino_destroy_handle, h=handle)
-        torch.ops.rpu.rhino_vla_set_weights(handle, *set_weights_args)
+        torch.ops.rpu.rhino_vla_set_runtime_config(
+            handle,
+            native_cold.denoise_static_context_cache,
+            native_cold.fused_adarms,
+            native_cold.skip_adarms_gemv,
+            native_cold.precompute_adarms,
+            native_cold.precompute_time_proj,
+            native_cold.fold_action_time_in,
+            native_cold.gated_no_sub,
+            native_cold.fused_silu_mul,
+            native_cold.expert_fusions,
+            native_cold.adarms_resident,
+            native_cold.packed_qkv,
+            native_cold.aligned_kv,
+        )
+        if full_w8a16:
+            torch.ops.rpu.rhino_vla_set_weights_full_w8a16(
+                handle, *set_weights_args, *scale_lists, *cond_owners["scales"])
+        elif scale_lists:
+            torch.ops.rpu.rhino_vla_set_weights_w8a16(handle, *set_weights_args, *scale_lists)
+        else:
+            torch.ops.rpu.rhino_vla_set_weights(handle, *set_weights_args)
+        torch.ops.rpu.rhino_vla_set_chunk_envelope(handle, int(kv_cache.max_seq_len), 0)
         torch.ops.rpu.rhino_vla_set_rope_position(handle, int(prefix_len))
 
         expert._rpu_graph_cache = graph_cache
@@ -633,31 +965,29 @@ def patch_rhino_vla_for_rpu(expert, *, prefix_len, suffix_len, max_seq_len=2048,
         expert._rpu_suffix_len = int(suffix_len)
         expert._rpu_kv_cache = kv_cache
         expert._rpu_prefix_source_snapshot = None
+        expert._rpu_execution = {"action": {"chunk_size": "auto"}}
+        expert._fmb_execution_component_id = "action_expert"
+        expert._fmb_execution_generation = 0
+        expert._rpu_native_cold_config = native_cold
+        expert._rpu_full_w8a16 = bool(full_w8a16)
         expert._rpu_handle = handle
         expert._rpu_handle_finalizer = handle_finalizer
+        expert._rpu_retirement_state = resource
         expert.forward = types.MethodType(
             rpu_rhino_vla_fused_forward, expert)
 
-        if (
-            had_old_handle
-            and (
-                old_finalizer is None
-                or getattr(old_finalizer, "alive", False)
-            )
-        ):
-            torch.ops.rpu.rhino_vla_destroy(old_handle)
-        committed = True
-    except BaseException:
-        if not committed:
-            expert_state = vars(expert)
-            for name in _RHINO_RUNTIME_INSTALL_ATTRS:
-                expert_state.pop(name, None)
-            expert_state.update(install_snapshot)
-
-            if handle_finalizer is None:
-                _rhino_destroy_handle(handle)
-            elif handle_finalizer.alive:
-                handle_finalizer()
+        if old_resource is not None:
+            old_resource.retire()
+            if old_resource.parent is not None:
+                resource.take_ownership(old_resource.parent())
+        elif had_old_handle and old_handle is not None:
+            raise RuntimeError("RhinoVLA action replacement requires its actual retirement state")
+    except BaseException as error:
+        resource.cleanup_failure(error, expert, install_snapshot)
+        expert_state = vars(expert)
+        for name in _RHINO_RUNTIME_INSTALL_ATTRS:
+            expert_state.pop(name, None)
+        expert_state.update(install_snapshot)
         raise
 
     if old_finalizer is not None and getattr(old_finalizer, "alive", False):

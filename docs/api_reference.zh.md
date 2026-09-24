@@ -6,7 +6,7 @@
 `PrivateUse1` 设备注册为 `rpu`，并创建 `torch.rpu` namespace。
 
 支持按配置判定。Class、adapter、registry alias 或 native schema 可导入并不代表模型
-受到支持；选择入口前查[模型支持](model_support.zh.md)。
+受到支持；选择入口前查[示例](model_support.zh.md)。
 
 ## 顶层 package
 
@@ -118,7 +118,7 @@ model = RPUModelForConditionalGeneration.from_pretrained(
 
 它与 CausalLM loader 一样 CPU-first、profile fail-fast。`vision` 接受 `chunk_size`，
 `prefill` 接受前述字段。Class 存在不自动扩展视频或
-[模型支持](model_support.zh.md)之外的配置。Qwen3.5 text/vision 与 Gemma4 使用各自
+[示例](model_support.zh.md)之外的配置。Qwen3.5 text/vision 与 Gemma4 使用各自
 adapter。
 
 ## Policy API
@@ -133,9 +133,26 @@ adapter。
 | `Lingbot2Policy` | `from_checkpoint(...)`；`to("rpu")`；`prepare_graphs(...)`；`infer(...)`；`predict_action_chunk(...)`；`close()` |
 | `HyEmbodiedPolicy` | `from_checkpoint(...)`；`to("rpu")`；`infer(...)`；`predict_action_chunk(...)`；`close()` |
 
+公开 LIBERO 优化配置通过 `Pi05Policy.from_pretrained(..., optimized_profile=...)`
+指定：`precision` 为 `fp16`、`w8a16`、`w8_action_nvfp4` 或
+`w8_prefill_a8_action_nvfp4`；`num_cameras` 为 2 或 3；`text_tokens` 为
+32、64、96 或 128。精度必须匹配 checkpoint 元数据，所需算子必须存在。
+`prepare_graphs(...)` 对此配置默认预计算 AdaRMS；示例见
+[`examples/configs/pi05/`](../examples/configs/pi05/)。
+
+对于发布绑定的 Pi0.5 组件 profile，传入 `profile="pi0.5-base"` 或
+`profile="pi0.5-libero-v044"`，并同时传入首个预处理后的 `admission_batch`。
+Loader 会在加载权重前校验精确公开 payload 和请求范围，后续 Graph 与推理请求继续按
+同一 profile 校验。
+
 `WallOssActionOutput`、`Lingbot2ActionOutput`、`HyEmbodiedActionOutput` 是对应
 结构化结果。带物理单位的 action 字段只表示已应用配置 normalization，不认证机器人
 安全或坐标系。
+
+`WallOssPolicy.from_checkpoint(...)` 绑定 checkpoint、相机顺序、归一化与精度，
+`.to("rpu")` 安装 runtime。调用 `infer(...)` 时，图像顺序必须与 `camera_names`
+一致；policy 按已装载模型检查实际请求的图像几何和状态。可用 `prepare_graphs(...)`
+为代表输入绑定明确的有限前缀范围，仅在请求满足该 policy 的准入条件时复用。
 
 `RhinoVLAPolicy` 把 checkpoint 组合与 preprocessing 委托给显式 model-repository
 runtime factory。Runtime 必须声明 execution capability 和实际消费的 `rpu_execution`；
@@ -148,9 +165,13 @@ facade 拒绝静默 mismatch。
 `HyEmbodiedPolicy.from_checkpoint` 默认不读取 `norm_stats.pkl`。解码物理 action 需要
 `norm_stats_path`、显式 `trust_norm_stats_pickle=True` 和准确文件的
 `norm_stats_sha256`；同一字节先验证 hash，再 deserialize。
+固定三相机 facade 的 `prefix_len` 仅接受 `{192, 208, 224, 240}`。请求中的图像、
+noise、state embedding/state 和末端执行器 pose 必须为有限值；非法值会在 policy
+执行前被拒绝。
 
-多个 policy 配置仍是 Experimental、Component-only 或 Source-only。只使用 release
-指定的 constructor、input schema 和 precision，不能从 method 存在推断相邻配置。
+除精确 Supported/Limited profile 外，v1.0.0 的所有公开模型或 policy profile 均为
+Source-only。只使用 release 指定的 constructor、input schema 和 precision，不能从
+method 存在推断相邻配置。
 
 ## Error hierarchy
 
@@ -198,6 +219,11 @@ with cache.capture(sig):
 聚合 counter。它们解释生命周期，不是数值或支持证据。`Graph.dump_replay_plan()` 返回
 pointer-free node/segment 摘要，`Graph.dump_tree()` 按 segment 分组；均不包含 launch
 argument word、设备程序或原始 address。
+
+`Graph.runtime_policy` 和 `GraphCache.runtime_policy` 是构造时配置的只读视图，
+抽取的子图继承父图配置。capture 失败后，scope 会释放借用的 graph 引用，
+因此保留异常 traceback 不会额外阻止 `evict()` 或 `clear()`；调用方显式
+持有的 graph 引用仍会阻止回收。
 
 `Graph` 是低层 capture object；`get_default_graph_cache()` 返回 thread-local cache。
 新 adapter 通常使用显式 per-model `GraphCache`，便于 ownership 与 teardown。
@@ -268,12 +294,17 @@ Swizzle 原地改变 parameter storage，必须只运行一次。Fused subsystem
 
 - `set_debug` / `get_debug` / `set_profile` / `get_profile` /
   `reset_profile_accumulators`；
-- `set_debug_export` / `get_debug_export` / `list_debug_tensors` /
-  `get_debug_tensor` / `clear_debug_tensors`；
 - `set_spm_debug` / `get_spm_debug` / `spm_alloc_dump`。
 
-Debug tensor 可能含模型输入或 activation。把这些视为敏感应用产物，不要附到公开
-issue；API 不暴露 raw Graph register/resource/plan payload。
+这些诊断只暴露日志和聚合计数，不暴露模型输入、中间 activation、raw address
+或 Graph register/resource payload。
+
+`set_caching_allocator(bool)` 是进程级冷态 tensor storage 选择。第一次显式调用，
+或尚未选择时第一次分配非空 RPU tensor，都会把策略冻结到进程结束。同值重复调用
+是幂等的；请求相反值会报错，必须使用新进程。应在任何 RPU tensor 物化前调用。
+`empty_cache()` 只释放未使用的 cached block，不能释放 live tensor 或 Graph-owned
+storage。`memory_stats()` 通过 `caching_allocator_enabled` 返回所选模式，并通过
+`caching_allocator_policy_frozen` 返回策略是否已经冻结。
 
 CPU/RPU boundary flush 默认打开，正常推理不要关闭。Chunk size 属于 per-handle
 `rpu_execution`，不是进程全局 `torch.rpu` setter。内部 `torch.ops.rpu.*` 是 adapter

@@ -12,21 +12,8 @@
 
 using namespace ::rhino_lkn;
 
-// Thread-local lookup cache avoids repeated KernelCache queries.
+// Thread-local 小型缓存，避免每次都查询主 KernelCache
 static thread_local std::unordered_map<std::string, Kernel_t*> bmm_kernel_cache;
-
-static constexpr uint64_t kPreloadedEagerBmmTiles[][3] = {
-    {64, 64, 64},   {64, 64, 128},
-    {64, 128, 64},  {64, 128, 128},
-    {128, 128, 64}, {128, 128, 128},
-};
-
-static bool is_preloaded_eager_bmm_tile(uint64_t m, uint64_t n, uint64_t k) {
-  for (const auto &tile : kPreloadedEagerBmmTiles) {
-    if (tile[0] == m && tile[1] == n && tile[2] == k) return true;
-  }
-  return false;
-}
 
 void rpu_launch_bmm_kernel(const at::Tensor &input_a, const at::Tensor &input_b,
                            at::Tensor &output) {
@@ -92,12 +79,6 @@ void rpu_launch_bmm_kernel(const at::Tensor &input_a, const at::Tensor &input_b,
   } else {
     tile_n_per_warp = 128;
   }
-
-  TORCH_CHECK(
-      is_preloaded_eager_bmm_tile(tile_m_per_warp, tile_n_per_warp,
-                                  tile_k_per_warp),
-      "rpu_bmm: unsupported kernel tile (", tile_m_per_warp, ", ",
-      tile_n_per_warp, ", ", tile_k_per_warp, ")");
 
   uint64_t tile_m = tile_m_per_warp, tile_n = tile_n_per_warp, tile_k = tile_k_per_warp;
 
@@ -194,7 +175,8 @@ void rpu_launch_bmm_kernel(const at::Tensor &input_a, const at::Tensor &input_b,
   uint16_t hasCType = 4;
   kernel->set_regs(10, hasCType);
 
-  /* The current BMM API does not expose a C scalar term. */
+  /* CScalar */
+  /* TODO: leave for future */
   uint16_t CScalar = 0;
   kernel->set_regs(11, CScalar);
 
@@ -268,25 +250,34 @@ void rpu_launch_bmm_kernel(const at::Tensor &input_a, const at::Tensor &input_b,
   uint16_t grid_dim_z = batch;
   kernel->set_regs(66, grid_dim_z);
 
+  // wq->set_flush_icache(false);
   wq->enqueu_kernel(*kernel, {grid_dim_x, grid_dim_y, grid_dim_z}, {0});
+  // wq->print_pkt();
+
+  // // kernel.print_kernel_info();
   spm_to_ddr(out, spm_core0_output.get_cpu_ptr(), spm_y_v16_size * dwidth_v16);
+
+  // // dump cfg/reg.in
+  // // dump spm_output_*.in / ddr_output_*.in
+  // ctx.export_case();
 }
 
 // ============ BMM SPM Kernel Launch (multi-core, fused-graph) ============
 // SPM-resident batched matmul: out[batch,M,N] = A[batch,M,K] @ B[batch,K,N], fp16.
-// Uses the same gemm_fp16_spm_16b kernel, tiling and register contract as the
-// eager rpu_launch_bmm_kernel above. It differs in:
+// SAME gemm_fp16_spm_16b kernel + register math as the eager rpu_launch_bmm_kernel
+// above (verbatim copy of the tile/v16/reg logic). Differs ONLY in:
 //   - operands are ALREADY in SPM: caller passes byte addresses, no DDR<->SPM DMA;
 //   - graph-aware kernel fetch (RpuKernelGraph::active().get_kernel_reset) so the
-//     launch records into the fused graph instead of the eager kernel
+//     launch records into the fused graph instead of hitting the §12.4 raw-kernel
 //     PASSTHROUGH fallback (the eager path's KernelCache::get_kernel is fine in
 //     eager but would make the recorded graph non-replayable);
 //   - multi-core broadcast: each of num_cores cores runs the batched gemm on its
 //     OWN per-core SPM at the same offsets (for the GDN chunk, batch = heads/core).
-// No-C path (hasCType=4) stores raw A@B (alpha/beta/C ignored, as in the
-// eager path). Assumes M,N,K % 16 == 0 so the v16 SPM
+// No-C path (hasCType=4) -> stores raw A@B (alpha/beta/C ignored, exactly like the
+// eager; see [[bmm-no-c-skips-alpha-beta]]). Assumes M,N,K % 16 == 0 so the v16 SPM
 // layout equals the plain contiguous fp16 layout (true for GDN chunk: C=64, Dk=Dv=128).
-// batch applies to both operands (symmetric per-head).
+// batch applies to BOTH operands (symmetric per-head); add separate flags later if a
+// chunk bmm needs an operand shared across batch.
 void rpu_launch_bmm_spm_kernel(uint32_t a_spm_addr, uint32_t b_spm_addr,
                                uint32_t out_spm_addr, int64_t M, int64_t N,
                                int64_t K, int64_t batch, int num_cores,
@@ -294,7 +285,7 @@ void rpu_launch_bmm_spm_kernel(uint32_t a_spm_addr, uint32_t b_spm_addr,
   uint64_t Mv16 = 0, Nv16 = 0, Kv16 = 0;
   uint64_t Mv16Tail = 0, Nv16Tail = 0, Kv16Tail = 0, Kv16Pad = 0;
 
-  /* Match the eager-path tile selection. */
+  /* set kernel tiles (verbatim from the eager path) */
   uint64_t tile_k_per_warp = 0, tile_m_per_warp = 0, tile_n_per_warp = 0;
   if (K <= 64) {
     tile_k_per_warp = 64;
@@ -431,4 +422,62 @@ void rpu_launch_bmm_spm_kernel(uint32_t a_spm_addr, uint32_t b_spm_addr,
   std::vector<uint8_t> cores;
   for (int i = 0; i < num_cores; ++i) cores.push_back((uint8_t)i);
   wq->enqueu_kernel(*kernel, {grid_dim_x, grid_dim_y, grid_dim_z}, cores);
+}
+
+// Isolated test: stage A/B into SPM, single-core bmm (orientation = `mode`), return
+// out[batch,M,N]. Golden (Python side) = the matching torch.bmm with transposes.
+// Same gemm kernel as the fused path -> validates kernel + reg + SPM addressing.
+// M,N,K must be multiples of 16. `mode`: 0 RowByCol (A[M,K]@B[K,N]), 1 RowByRow
+// (A[M,K]@B[N,K]ᵀ), 2 ColByRow (A[K,M]ᵀ@B[N,K]ᵀ), 3 ColByCol (A[K,M]ᵀ@B[K,N]).
+at::Tensor rpu_bmm_spm_test(const at::Tensor& input_a, const at::Tensor& input_b,
+                            int64_t mode) {
+  TORCH_CHECK(input_a.dim() == 3 && input_b.dim() == 3,
+              "bmm_spm_test: expects 3D operands");
+  TORCH_CHECK(input_a.scalar_type() == at::kHalf && input_b.scalar_type() == at::kHalf,
+              "bmm_spm_test: fp16 only");
+  TORCH_CHECK(input_a.device().type() == at::kPrivateUse1,
+              "bmm_spm_test: input must be on RPU");
+  TORCH_CHECK(mode >= 0 && mode <= 3, "bmm_spm_test: mode must be 0..3");
+  const int64_t batch = input_a.size(0);
+  TORCH_CHECK(input_b.size(0) == batch, "bmm_spm_test: batch mismatch");
+  // Derive logical M/N/K from the operand layouts per mode.
+  // A is [M,K] for modes 0/1 (row) and [K,M] for 2/3 (col); B is [K,N] for 0/3 (col)
+  // and [N,K] for 1/2 (row).
+  const bool a_col = (mode == 2 || mode == 3);
+  const bool b_row = (mode == 1 || mode == 2);
+  const int64_t M = a_col ? input_a.size(2) : input_a.size(1);
+  const int64_t K = a_col ? input_a.size(1) : input_a.size(2);
+  const int64_t N = b_row ? input_b.size(1) : input_b.size(2);
+  const int64_t b_k = b_row ? input_b.size(2) : input_b.size(1);
+  TORCH_CHECK(b_k == K, "bmm_spm_test: contraction K mismatch (A K=", K, " B K=", b_k, ")");
+  TORCH_CHECK(M % 16 == 0 && N % 16 == 0 && K % 16 == 0,
+              "bmm_spm_test: M,N,K must be multiples of 16 (v16 SPM layout)");
+  if (!SPM_ALLOC.is_initialized()) SPM_ALLOC.init();
+
+  auto a_c = input_a.contiguous();
+  auto b_c = input_b.contiguous();
+  const int64_t a_bytes = a_c.numel() * 2;
+  const int64_t b_bytes = b_c.numel() * 2;
+  const int64_t out_numel = batch * M * N;
+  const int64_t out_bytes = out_numel * 2;
+  using AR = SpmAllocator::AllocRequest;
+  auto offsets = SPM_ALLOC.alloc_temporary_aliased({
+      AR{a_bytes, 1, 2},    // A   (read by the kernel)
+      AR{b_bytes, 1, 2},    // B   (read by the kernel)
+      AR{out_bytes, 1, 3},  // out (written; alive across the kernel + DMA-out)
+  });
+  const uint32_t a_addr = SPM_ALLOC.addr(0, offsets[0]);
+  const uint32_t b_addr = SPM_ALLOC.addr(0, offsets[1]);
+  const uint32_t out_addr = SPM_ALLOC.addr(0, offsets[2]);
+
+  rpu_launch_ddr_broadcast_spm_dma_immediate(
+      const_cast<c10::Half*>(a_c.data_ptr<c10::Half>()), a_c.numel(), a_addr, 1);
+  rpu_launch_ddr_broadcast_spm_dma_immediate(
+      const_cast<c10::Half*>(b_c.data_ptr<c10::Half>()), b_c.numel(), b_addr, 1);
+  rpu_launch_bmm_spm_kernel(a_addr, b_addr, out_addr, M, N, K, batch, 1, (BmmMode)mode);
+
+  auto output = at::empty({batch, M, N}, a_c.options());
+  rpu_launch_spm_copy_ddr_dma_immediate(out_addr, output.data_ptr<c10::Half>(), out_numel);
+  SPM_ALLOC.reset_temporary();
+  return output;
 }

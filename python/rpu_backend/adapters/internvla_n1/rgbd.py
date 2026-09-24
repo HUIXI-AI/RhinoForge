@@ -8,19 +8,16 @@ timm / cv2 / xformers (MemEffAttention falls back to standard attention when xfo
 
 The DINOv2 source (`dinov2.py` + `dinov2_layers/`, pure torch, bundled by InternNav) must be
 importable — pass its parent dir via `dinov2_src` (added to sys.path). Weights load from the
-public checkpoint under ``model.navdp.rgbd_encoder.*``. This is the on-board CPU path; the RPU
-port uses the same public tensors.
+extracted `navdp_head.safetensors` under `rgbd_encoder.*`. This is the on-board CPU path; the RPU
+port (dinov3 reuse + fp16 hybrid) is a separate, deferred effort.
 """
 from __future__ import annotations
 import importlib
 import sys
-from collections.abc import Mapping
 from pathlib import Path
 
 import torch
 import torch.nn as nn
-
-from ._checkpoint import NAVDP_PREFIX, open_public_checkpoint
 
 
 def _module_source(module) -> Path | None:
@@ -151,30 +148,15 @@ class RGBDEncoder(nn.Module):
         return self.project_layer(self.former_net(q, former_token))
 
 
-def build_rgbd_encoder(
-    checkpoint_dir: str | Path,
-    dinov2_src: str,
-    device: str = "cpu",
-    *,
-    asset_manifest: Mapping[str | Path, str] | None = None,
-) -> RGBDEncoder:
-    """Strictly load public ``model.navdp.rgbd_encoder.*`` tensors in fp32."""
+def build_rgbd_encoder(safetensors_path: str | Path, dinov2_src: str,
+                       device: str = "cpu") -> RGBDEncoder:
+    """Strictly load ``rgbd_encoder.*`` onto the board CPU in fp32."""
     if device != "cpu":
         raise ValueError("use build_rgbd_encoder_rpu for the controlled RPU path")
-    prefix = NAVDP_PREFIX + "rgbd_encoder."
-    store, names, assets = open_public_checkpoint(
-        checkpoint_dir,
-        asset_manifest,
-        prefixes=(prefix,),
-        controlled_rpu=False,
-    )
-    sd = {
-        name[len(NAVDP_PREFIX):]: store.get_tensor(name)
-        for name in names
-    }
+    from safetensors.torch import load_file
+    sd = load_file(str(safetensors_path))
     enc = RGBDEncoder(dinov2_src, input_dtype=torch.float32).eval()
     local = {k[len("rgbd_encoder."):]: v.float() for k, v in sd.items()
              if k.startswith("rgbd_encoder.")}
     enc.load_state_dict(local, strict=True)
-    enc._rpu_checkpoint_assets = assets
     return enc.float().cpu()

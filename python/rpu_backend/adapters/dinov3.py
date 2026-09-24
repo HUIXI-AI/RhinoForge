@@ -1,11 +1,12 @@
-"""DINOv3 ViT → rpu_backend adapter.
+"""DINOv3 ViT → rpu_backend adapter (v5 single-file flat layout).
 
 Public surface:
-  - `DINOv3Adapter` — direct per-instance adapter. Run config preflight before
-    loading weights, then call `DINOv3Adapter(model).to_rpu()`.
-  - `build_dinov3_rope_tables` / `build_position_idx` — RoPE-2D helpers.
+  - `DINOv3Adapter` — per-instance adapter dispatched from
+    `RPUModelForConditionalGeneration` / `AutoModel.to('rpu')`.
+  - `build_dinov3_rope_tables` / `build_position_idx` — RoPE-2D helpers
+    (validated by `tools/dinov3/verify_rope2d_math.py`).
 
-Install and forward path:
+Scope (P4 install + forward):
   - Install path: config preflight → patch_embed Conv2d→Linear CPU fp16
     fold + ViT-B 12→16 head zero-pad + linear swizzle → move to RPU →
     install RPU keepalives (CLS+reg / γ_attn / γ_mlp stacks) → install
@@ -25,6 +26,11 @@ Install and forward path:
       5. Final LayerNorm (`model.norm`, aten op on RPU) + CLS slice as
          `pooler_output`.
 
+References:
+  - HF source: transformers/models/dinov3_vit/modeling_dinov3_vit.py
+  - Qwen3-VL vision template: rpu_backend/adapters/qwen3_vl/vision.py
+  - Adapter skeleton conventions: rpu_backend/adapters/_template/adapter.py
+  - RoPE-2D math validation: tools/dinov3/verify_rope2d_math.py
 """
 from __future__ import annotations
 
@@ -32,7 +38,7 @@ import logging
 import math
 import threading
 import types
-import weakref
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -42,8 +48,15 @@ import torch.nn.functional as F
 import rpu_backend
 from rpu_backend.api.cache import RPUCache
 from rpu_backend.api.causal_lm import _claim_live_instance
+from rpu_backend.api._execution import (
+    bind_execution_session, execution_serialized, native_execution_reconfigure,
+    _mark_execution_process_unsafe, _require_execution_process_safe,
+)
+from rpu_backend.runtime._native_retirement import _InstalledNativeResource
 from rpu_backend.runtime.device import extract_to_device_target, is_rpu_device_target
 from rpu_backend.api.errors import RPUBackendError, UnsupportedModelError
+from rpu_backend.runtime.decoder import plan_bounded_prefill_execution
+from rpu_backend.runtime.execution_planner import GRAPH_RETAINED_CACHE
 from rpu_backend.runtime.registry import register_adapter
 from rpu_backend.runtime.weights import convert_linear_weights_inplace
 
@@ -73,9 +86,10 @@ _LOG = logging.getLogger(__name__)
 # Supported variants. Profile tuple is:
 #   (hidden_size, num_attention_heads, num_hidden_layers, patch_size,
 #    image_size, num_register_tokens)
-# ViT-7B/16 (4096/32/40 + head_dim 128) is outside the supported envelope.
+# ViT-7B/16 (4096/32/40 + head_dim 128) is OUT-OF-ENVELOPE per
+# CLAUDE.md hardware constraints.
 _SUPPORTED_PROFILES: frozenset[tuple[int, int, int, int, int, int]] = frozenset({
-    # ViT-B/16 (86 M) — head_dim 64
+    # ViT-B/16  (86 M)  — head_dim 64 — recommended first port (P0)
     ( 768, 12, 12, 16, 224, 4),
 })
 
@@ -87,6 +101,28 @@ _NUMERIC_BLOCKED_PROFILES: dict[
     # ViT-L/16: LayerScale × block output exceeds the fp16 finite range.
     (1024, 16, 24, 16, 224, 4): "LayerScale output overflows FP16",
 }
+
+
+def _dinov3_layers(model: nn.Module) -> nn.ModuleList:
+    """Return the encoder layers for supported DINOv3 HF layouts.
+
+    Transformers releases have exposed the direct ``DINOv3ViTModel`` layers
+    as either ``model.layer`` or ``model.model.layer`` (the latter is used by
+    wrapper classes).  Do not use an eager ``getattr(..., default)`` here:
+    evaluating the default would touch ``model.layer`` even when a wrapper is
+    present, and a self-referential compatibility alias must not recurse.
+    """
+    wrapped = getattr(model, "model", None)
+    if wrapped is not None and wrapped is not model:
+        layers = getattr(wrapped, "layer", None)
+        if layers is not None:
+            return layers
+    layers = getattr(model, "layer", None)
+    if layers is None:
+        raise RPUBackendError(
+            "DINOv3Adapter: expected encoder layers at `layer` or `model.layer`"
+        )
+    return layers
 
 
 def _profile(config: Any) -> tuple[int, int, int, int, int, int]:
@@ -112,7 +148,7 @@ def _check_profile(config: Any) -> None:
     if config.use_gated_mlp:
         raise UnsupportedModelError(
             "DINOv3Adapter: SwiGLU variant (use_gated_mlp=True, i.e. ViT-S+/"
-            "H+/7B) is not supported. The supported profile uses a GELU MLP."
+            "H+/7B) is deferred. First port supports GELU MLP only (B/L)."
         )
     if config.num_register_tokens != 4:
         raise UnsupportedModelError(
@@ -132,7 +168,7 @@ def _check_profile(config: Any) -> None:
             f"DINOv3Adapter: profile {profile} not supported. "
             f"Supported: {sorted(_SUPPORTED_PROFILES)} "
             "(ViT-B at 224×224 with 4 register tokens; ViT-S/L are "
-            "numerical-blocked and ViT-7B is outside the supported envelope)."
+            "numerical-blocked and ViT-7B is out-of-envelope per CLAUDE.md)."
         )
 
 
@@ -142,16 +178,19 @@ def _check_profile(config: Any) -> None:
 #                       post-move keepalive installer (Section 2b).
 # =============================================================================
 #
-# Double-swizzle guard: convert_linear_weights_inplace must
+# Pitfall 1 (double-swizzle) reminder: convert_linear_weights_inplace must
 # run EXACTLY once per model. The adapter `_rpu_swizzled` marker enforces
 # this; the global swizzle lock prevents concurrent calls.
 #
 # DINOv3 attention has bias=None on k_proj (HF config.key_bias=False).
 # `convert_linear_weights_inplace` only operates on `child.weight`, never
-# touches bias.
+# touches bias — verified P1.5 (2026-05-21).
 #
-# Patch embed (Conv2d k=16 s=16) is folded to a row-major CPU-fp16 Linear.
-# RPU `aten::linear` requires a pre-swizzled weight.
+# Patch embed (Conv2d k=16 s=16) is folded to a Linear `[hidden, 3·16·16]`
+# kept on CPU fp16. Mirrors qwen3_vl/vision.py:407 — RPU `aten::linear`
+# expects a pre-swizzled weight, but the folded patch weight is plain
+# row-major; running it on CPU avoids the swizzle dance for one one-off
+# Linear (~ms-scale per forward).
 
 SKIP_LINEAR_NAMES: set[str] = set()
 
@@ -205,7 +244,7 @@ def _pad_attn_heads_to_multiple_of_cores(model: nn.Module) -> None:
     pad_rows = (target - num_heads) * head_dim
 
     with torch.no_grad():
-        for layer in model.model.layer:
+        for layer in _dinov3_layers(model):
             attn = layer.attention
             for name in ("q_proj", "k_proj", "v_proj"):
                 lin = getattr(attn, name)
@@ -274,24 +313,29 @@ def _convert_dinov3_weights_for_rpu(model: nn.Module) -> None:
 # register_tokens, layer_scale*.lambda1) are already RPU fp16 and we can
 # copy into freshly-allocated RPU keepalives without device-bouncing.
 #
-# Keep LayerScale γ as a runtime multiply: folding it into projection weights
-# can push fp16 values into the subnormal range.
+# Why keep γ as runtime mul (not fold into o_proj / down_proj):
+#     P1.3 dumped real γ from facebook/dinov3-vitb16-pretrain-lvd1689m and
+#     found abs_min(γ) = 3.69e-06 ≪ fp16 smallest-normal 6.10e-05. Folding
+#     W ← W·γ pushes products into the fp16 subnormal range and corrupts
+#     a tail of weight entries. Retaining gamma as a separate multiplication
+#     preserves these small values. The 24 element-wise muls per forward (12
+#     layers × 2 branches) cost is negligible.
 
 
 def _install_dinov3_rpu_keepalives(model: nn.Module) -> None:
-    """Install RPU fp16 keepalive buffers required by the fused forward.
+    """Install RPU fp16 keepalive buffers required by the P4 forward.
 
       - `_rpu_dinov3_cls_reg`   shape `[1+num_register, hidden]`
       - `_rpu_dinov3_gamma_attn` shape `[num_layers, hidden]`
       - `_rpu_dinov3_gamma_mlp`  shape `[num_layers, hidden]`
 
-    All contiguous fp16 on `'rpu'`. Stacked per branch so the fused forward
+    All contiguous fp16 on `'rpu'`. Stacked per branch so the P4/P5 forward
     can index by layer id without per-layer attribute walks.
     """
     cfg = model.config
     hidden = int(cfg.hidden_size)
     num_reg = int(cfg.num_register_tokens)
-    num_layers = len(model.model.layer)
+    num_layers = len(_dinov3_layers(model))
 
     with torch.no_grad():
         cls = model.embeddings.cls_token.data.view(1, hidden)
@@ -308,7 +352,7 @@ def _install_dinov3_rpu_keepalives(model: nn.Module) -> None:
         gamma_mlp = torch.empty(
             (num_layers, hidden), dtype=torch.float16, device="rpu"
         )
-        for layer_idx, layer in enumerate(model.model.layer):
+        for layer_idx, layer in enumerate(_dinov3_layers(model)):
             gamma_attn[layer_idx].copy_(
                 layer.layer_scale1.lambda1.data.to(torch.float16)
             )
@@ -346,6 +390,55 @@ def _configured_vision_chunk(model: nn.Module) -> int:
     return 0 if requested == "auto" else int(requested)
 
 
+def _plan_dinov3_vision_execution(
+    handle: int,
+    num_tokens: int,
+    exact_chunk_size: int | None,
+    *, execution_owner=None,
+    graph_cache=None, plan_signature=(),
+):
+    """Resolve the unpadded native Vision descriptor before Graph BUILD."""
+    plan_box = {}
+    execution_len, chunk_size = plan_bounded_prefill_execution(
+        int(num_tokens),
+        int(num_tokens),
+        0,
+        resolve_stage_domain=lambda length: (
+            torch.ops.rpu.dinov3_vision_resolve_stage_domain(
+                handle, int(length)
+            )
+        ),
+        position=0,
+        alignment=1,
+        padding_rows=0,
+        exact_chunk_size=exact_chunk_size,
+        request_id="dinov3:vision_encoder:vision",
+        execution_owner=execution_owner,
+        execution_stage="vision",
+        execution_native=("dinov3_vision", int(handle)) if execution_owner is not None else None,
+        queue_owner_id=int(handle),
+        plan_result_sink=lambda result: plan_box.__setitem__("result", result),
+        graph_mode=GRAPH_RETAINED_CACHE,
+        plan_signature=plan_signature,
+        graph_cache=graph_cache,
+    )
+    if execution_len != int(num_tokens):
+        raise RPUBackendError(
+            "DINOv3 Vision planner changed the unpadded execution length: "
+            f"tokens={num_tokens}, execution={execution_len}"
+        )
+    result = plan_box["result"]
+    if (
+        result.selected is None
+        or chunk_size != result.selected.stage_tuple.compute_chunk
+        or not result.selected.stage_tuple.physical_descriptor
+    ):
+        raise RPUBackendError(
+            "DINOv3 Vision planner returned no consumable native descriptor"
+        )
+    return result
+
+
 def _apply_runtime_attrs(model: nn.Module) -> None:
     """Cold-set the per-instance hw attribute defaults."""
     model._rpu_chunk_size = _configured_vision_chunk(model)
@@ -373,16 +466,10 @@ def _apply_runtime_attrs(model: nn.Module) -> None:
 # + RPU CLS+reg prepend + handle.forward + final-LN + CLS-slice dispatch.
 
 
-def _destroy_dinov3_vision_handle(handle: int) -> None:
-    try:
-        torch.ops.rpu.dinov3_vision_destroy(handle)
-    except Exception:
-        pass
-
-
 _DINOV3_HANDLE_INSTALL_ATTRS = frozenset({
     "_rpu_dinov3_handle",
     "_rpu_dinov3_handle_finalizer",
+    "_rpu_dinov3_retirement_state",
     "_rpu_dinov3_freq_cos",
     "_rpu_dinov3_freq_sin",
     "_rpu_dinov3_position_idx_keepalive",
@@ -405,23 +492,27 @@ def _clear_dinov3_handle_install(vision_model: nn.Module) -> None:
         model_state.pop(name, None)
 
 
-def _cleanup_dinov3_partial_runtime(vision_model: nn.Module) -> None:
-    """Best-effort cleanup after the irreversible outer install has failed."""
-    graph_cache = getattr(vision_model, "_rpu_dinov3_graph_cache", None)
-    if graph_cache is not None and hasattr(graph_cache, "clear"):
-        try:
-            graph_cache.clear()
-        except Exception:
-            pass
-
-    finalizer = getattr(
-        vision_model, "_rpu_dinov3_handle_finalizer", None)
-    handle = getattr(vision_model, "_rpu_dinov3_handle", None)
-    if finalizer is not None and getattr(finalizer, "alive", False):
-        finalizer()
-    elif finalizer is None and handle is not None:
-        _destroy_dinov3_vision_handle(handle)
-    _clear_dinov3_handle_install(vision_model)
+def _close_dinov3_model(vision_model: nn.Module) -> None:
+    """Release graph addresses before native state; propagate uncertain cleanup."""
+    session = getattr(vision_model, "_execution_session", None)
+    with session._lock if session is not None else nullcontext():
+        resource = getattr(vision_model, "_rpu_dinov3_retirement_state", None)
+        if resource is not None:
+            graph = getattr(vision_model, "_rpu_dinov3_graph_cache", None)
+            if resource.handle is not None and not any(graph is owned for owned in resource.graphs):
+                error = RuntimeError("DINOv3 retirement GraphCache identity changed")
+                resource.retain_failure(error, vision_model, graph)
+                raise error
+            resource.retire_owned(vision_model)
+        elif getattr(vision_model, "_rpu_dinov3_handle", None) is not None:
+            reason = "DINOv3 retirement requires its actual resource state"
+            if session is not None:
+                session.poison()
+            _mark_execution_process_unsafe(reason)
+            raise RuntimeError(reason)
+        elif session is not None and session._owner is vision_model:
+            session.shutdown()
+        _clear_dinov3_handle_install(vision_model)
 
 
 def install_dinov3_vision_for_rpu(
@@ -431,41 +522,38 @@ def install_dinov3_vision_for_rpu(
     max_seq_len: int | None = None,
 ) -> int:
     """Install or replace the DINOv3 native vision runtime transactionally."""
-    snapshot = {
-        name: getattr(vision_model, name)
-        for name in _DINOV3_HANDLE_INSTALL_ATTRS
-        if hasattr(vision_model, name)
-    }
-    install_state = {
-        "old_handle": snapshot.get("_rpu_dinov3_handle"),
-        "had_old_handle": "_rpu_dinov3_handle" in snapshot,
-        "old_finalizer": snapshot.get("_rpu_dinov3_handle_finalizer"),
-    }
-    try:
-        return _install_dinov3_vision_for_rpu_impl(
-            vision_model,
-            max_hw=max_hw,
-            max_seq_len=max_seq_len,
-            _install_state=install_state,
-        )
-    except BaseException:
-        if not install_state.get("committed", False):
-            pending_finalizer = install_state.get("pending_finalizer")
-            pending_handle = install_state.get("pending_handle")
-            if pending_finalizer is not None:
-                if pending_finalizer.alive:
-                    pending_finalizer()
-            elif pending_handle is not None:
-                _destroy_dinov3_vision_handle(pending_handle)
-
-            # Bypass a custom __setattr__ that may itself have caused the
-            # interrupted tentative publication.
-            state = vars(vision_model)
-            for name in _DINOV3_HANDLE_INSTALL_ATTRS:
-                state.pop(name, None)
-            for name, value in snapshot.items():
-                state[name] = value
-        raise
+    session = getattr(vision_model, "_execution_session", None)
+    with session._lock if session is not None else nullcontext():
+        _require_execution_process_safe()
+        if session is not None:
+            session.require_cold()
+        snapshot = {
+            name: getattr(vision_model, name)
+            for name in _DINOV3_HANDLE_INSTALL_ATTRS
+            if hasattr(vision_model, name)
+        }
+        old_resource = snapshot.get("_rpu_dinov3_retirement_state")
+        if old_resource is not None:
+            old_resource.require_replaceable()
+        elif snapshot.get("_rpu_dinov3_handle") is not None:
+            raise RuntimeError("DINOv3 replacement requires its actual retirement state")
+        install_state = {"old_resource": old_resource}
+        try:
+            return _install_dinov3_vision_for_rpu_impl(
+                vision_model,
+                max_hw=max_hw,
+                max_seq_len=max_seq_len,
+                _install_state=install_state,
+            )
+        except BaseException as error:
+            if not install_state.get("committed", False):
+                pending = install_state.get("pending_resource")
+                if pending is not None:
+                    pending.cleanup_failure(error, vision_model, snapshot)
+                # Bypass a custom __setattr__ that interrupted publication.
+                _clear_dinov3_handle_install(vision_model)
+                vars(vision_model).update(snapshot)
+            raise
 
 
 def _make_dummy_dinov3_kv_caches(
@@ -517,7 +605,7 @@ def _install_dinov3_vision_for_rpu_impl(
     intermediate = int(cfg.intermediate_size)
     head_dim = hidden // int(cfg.num_attention_heads)
     num_heads_padded = _padded_num_heads(int(cfg.num_attention_heads))
-    num_layers = len(vision_model.model.layer)
+    num_layers = len(_dinov3_layers(vision_model))
     num_register = int(cfg.num_register_tokens)
     num_special_tokens = 1 + num_register
     eps = float(cfg.layer_norm_eps)
@@ -532,9 +620,9 @@ def _install_dinov3_vision_for_rpu_impl(
         max_seq_len = ((num_special_tokens + grid_side * grid_side + 255) // 256) * 256
 
     # Gather per-layer tensors. Weights are post-swizzle nn.Parameters; we
-    # pass `.weight` directly so the C++ side holds the same storage without a
-    # copy; the Python model object owns its lifetime.
-    layers = list(vision_model.model.layer)
+    # pass `.weight` directly so the C++ side holds the same storage (no copy,
+    # P4 lifetime managed by the Python model object).
+    layers = list(_dinov3_layers(vision_model))
     q_w  = [L.attention.q_proj.weight for L in layers]
     k_w  = [L.attention.k_proj.weight for L in layers]
     v_w  = [L.attention.v_proj.weight for L in layers]
@@ -553,7 +641,7 @@ def _install_dinov3_vision_for_rpu_impl(
     up_b = [L.mlp.up_proj.bias      for L in layers]
     dn_b = [L.mlp.down_proj.bias    for L in layers]
 
-    # γ keepalives are stacked `[num_layers, hidden]`. Unbind into
+    # γ keepalives are stacked `[num_layers, hidden]` from P3. Unbind into
     # per-layer 1D rows so the C++ schema (TensorList[hidden]) is happy.
     ga_stack = vision_model._rpu_dinov3_gamma_attn
     gm_stack = vision_model._rpu_dinov3_gamma_mlp
@@ -576,25 +664,37 @@ def _install_dinov3_vision_for_rpu_impl(
         num_layers, max_seq_len, num_heads_padded, head_dim,
     )
 
-    # Retain one fused encoder graph per admitted signature for stable replay.
+    # GraphCache for the fused encoder forward. PASSTHROUGH queue hygiene is
+    # already safe: kernels direct-launch on a queue isolated from immediate
+    # DMA's QueueCache batches. Capture is still required for performance and
+    # lifecycle: the fused encoder op enters RECORDING, its DMAs/kernels form
+    # one retained graph, and later calls with the same signature REPLAY
+    # (sync-only fast path) instead of synchronously dispatching every kernel
+    # and rebuilding every immediate DMA batch — same pattern as
+    # qwen3_vl_vision / siglip_compute / pi05_gemma / pi05_adarms.
     graph_cache = rpu_backend.graph.GraphCache()
 
     # Configure the pending native entry only after all Python-side state is
     # ready. The public wrapper owns immediate cleanup until commit.
     handle = torch.ops.rpu.dinov3_vision_create()
-    _install_state["pending_handle"] = handle
-    handle_finalizer = weakref.finalize(
-        vision_model, _destroy_dinov3_vision_handle, handle)
-    _install_state["pending_finalizer"] = handle_finalizer
+    resource = _InstalledNativeResource(
+        vision_model, handle, torch.ops.rpu.dinov3_vision_destroy,
+        graphs=(graph_cache,), keepalive=(weight_args, freq_cos, freq_sin, kv_cache),
+        label="DINOv3", handle_name="_rpu_dinov3_handle")
+    handle_finalizer = resource.finalizer
+    _install_state["pending_resource"] = resource
     torch.ops.rpu.dinov3_vision_set_weights(handle, *weight_args)
+    torch.ops.rpu.dinov3_vision_set_chunk_envelope(handle, int(kv_cache.max_seq_len), 0)
     torch.ops.rpu.dinov3_vision_set_rope(handle, freq_cos, freq_sin)
     configured_chunk = _configured_vision_chunk(vision_model)
     if configured_chunk:
         torch.ops.rpu.dinov3_vision_set_chunk_size(handle, configured_chunk)
     keepalive = torch.ops.rpu.dinov3_vision_position_idx_keepalive(handle)
+    resource.keepalive = (resource.keepalive, keepalive)
 
     _clear_dinov3_handle_install(vision_model)
     vision_model._rpu_dinov3_handle = handle
+    vision_model._rpu_dinov3_retirement_state = resource
     vision_model._rpu_dinov3_handle_finalizer = handle_finalizer
     vision_model._rpu_dinov3_freq_cos = freq_cos
     vision_model._rpu_dinov3_freq_sin = freq_sin
@@ -610,18 +710,12 @@ def _install_dinov3_vision_for_rpu_impl(
     vision_model._rpu_dinov3_hidden_size = hidden
     vision_model._rpu_dinov3_graph_cache = graph_cache
 
-    if (
-        _install_state["had_old_handle"]
-        and (
-            _install_state["old_finalizer"] is None
-            or getattr(_install_state["old_finalizer"], "alive", False)
-        )
-    ):
-        torch.ops.rpu.dinov3_vision_destroy(_install_state["old_handle"])
+    old_resource = _install_state["old_resource"]
+    if old_resource is not None:
+        old_resource.retire()
+        if old_resource.parent is not None:
+            resource.take_ownership(old_resource.parent())
     _install_state["committed"] = True
-    old_finalizer = _install_state["old_finalizer"]
-    if old_finalizer is not None and getattr(old_finalizer, "alive", False):
-        old_finalizer.detach()
 
     return handle
 
@@ -649,6 +743,7 @@ def _validate_dinov3_input_bounds(
 
 
 
+@execution_serialized
 def _rpu_dinov3_forward(self, pixel_values: torch.Tensor, **_kwargs: Any):
     """RPU-dispatching forward for DINOv3ViTModel.
 
@@ -669,7 +764,9 @@ def _rpu_dinov3_forward(self, pixel_values: torch.Tensor, **_kwargs: Any):
     """
     from transformers.modeling_outputs import BaseModelOutputWithPooling
 
-    handle = self._rpu_dinov3_handle
+    handle = getattr(self, "_rpu_dinov3_handle", None)
+    if handle is None:
+        raise RPUBackendError("DINOv3 runtime is closed; reload the model")
     num_special_tokens = self._rpu_dinov3_num_special_tokens
     patch_size = self._rpu_dinov3_patch_size
 
@@ -680,7 +777,7 @@ def _rpu_dinov3_forward(self, pixel_values: torch.Tensor, **_kwargs: Any):
         )
     if pixel_values.size(0) != 1:
         raise RPUBackendError(
-            "DINOv3 forward: only batch=1 is supported "
+            "DINOv3 forward: only batch=1 is supported in P4 "
             f"(got batch={pixel_values.size(0)})"
         )
     H, W = pixel_values.shape[-2], pixel_values.shape[-1]
@@ -708,8 +805,20 @@ def _rpu_dinov3_forward(self, pixel_values: torch.Tensor, **_kwargs: Any):
             f"single-chunk capacity {required_chunk} "
             f"for {num_tokens} logical tokens, got {configured_chunk}"
         )
-    planned_chunk = int(
-        torch.ops.rpu.dinov3_vision_resolve_chunk_size(handle, num_tokens)
+    vision_plan = _plan_dinov3_vision_execution(
+        handle,
+        num_tokens,
+        configured_chunk if configured_chunk else None,
+        execution_owner=self,
+        graph_cache=self._rpu_dinov3_graph_cache,
+        plan_signature=(int(num_patches_h), int(num_patches_w)),
+    )
+    selected = vision_plan.selected
+    if selected is None:
+        raise RPUBackendError("DINOv3 Vision dry planner selected no plan")
+    planned_chunk = int(selected.stage_tuple.compute_chunk)
+    planned_stage_descriptor = list(
+        selected.stage_tuple.physical_descriptor
     )
     if planned_chunk != required_chunk:
         raise RPUBackendError(
@@ -758,12 +867,13 @@ def _rpu_dinov3_forward(self, pixel_values: torch.Tensor, **_kwargs: Any):
     sig = rpu_backend.graph.GraphSignature(
         op_id="dinov3_vision",
         shapes=[num_tokens, self._rpu_dinov3_hidden_size],
-        dyn_dims=[num_layers],
+        dyn_dims=[num_layers, *vision_plan.graph_key_words()],
         dtypes=[torch.float16],
     )
     with graph_cache.capture(sig):
         raw = torch.ops.rpu.dinov3_vision_forward(
             handle, sequence, k_caches, v_caches, num_tokens,
+            planned_stage_descriptor,
         )
     resolved_chunk = int(
         torch.ops.rpu.dinov3_vision_get_resolved_chunk_size(handle))
@@ -773,24 +883,37 @@ def _rpu_dinov3_forward(self, pixel_values: torch.Tensor, **_kwargs: Any):
             f"dry={planned_chunk}, forward={resolved_chunk}, "
             f"logical_tokens={num_tokens}"
         )
-    vars(self)["_rpu_last_execution_plan"] = {
-        "vision": {
-            "stage": "vision",
-            "logical_len": num_tokens,
-            "execution_len": num_tokens,
-            "chunk_size": resolved_chunk,
-            "padding_rows": 0,
-            "position": 0,
-        }
-    }
+    execution_receipt = {"vision": {
+        "stage": "vision",
+        "component": getattr(
+            self, "_rpu_execution_component_id", "vision_encoder"
+        ),
+        "logical_len": num_tokens,
+        "execution_len": num_tokens,
+        "chunk_size": resolved_chunk,
+        "padding_rows": 0,
+        "position": 0,
+        "graph_mode": vision_plan.graph_mode,
+        "physical_descriptor": tuple(planned_stage_descriptor),
+        "authority": "NATIVE_A6_STAGE_DESCRIPTOR",
+        "selection_scope": vision_plan.selection_scope,
+        "physical_plan_digest": vision_plan.physical_plan_digest,
+        "plan_digest": vision_plan.plan_digest,
+        "dry_forward_agreement": True,
+    }}
 
-    # Reset SPM temporary slots so subsequent RPU ops receive fresh workspace.
+    # Step 7: reset SPM temporary slots, matching qwen3_vl/vision.py:604 —
+    # any subsequent RPU op needs fresh temp workspace.
     torch.ops.rpu.spm_alloc_reset_temporary()
 
     # Step 8: final LayerNorm + CLS slice on CPU.
-    # Running an eager LN on RPU immediately after the fused encoder competes
-    # with the graph's DDR allocator reserve. The final LN is small, so it runs
-    # on CPU after materializing the fused output there.
+    # Running an eager LN on the RPU device immediately after the fused
+    # encoder collides with the DDR caching allocator (the prior BATCH_CTX
+    # has filled the high-mem reserve — "allocate: insufficient free memory,
+    # requested=308736 available=0"). qwen3_vl avoids this by running its
+    # merger / deepstack on CPU; DINOv3 has no merger, just a final LN that
+    # is tiny (1×201×768) so we follow the same pattern. Moving the final
+    # LN into the C++ fused graph is a P5/P6 optimization.
     raw_cpu = raw.detach().cpu()
     last_hidden_cpu = F.layer_norm(
         raw_cpu, normalized_shape=(self.config.hidden_size,),
@@ -800,20 +923,24 @@ def _rpu_dinov3_forward(self, pixel_values: torch.Tensor, **_kwargs: Any):
     )
     pooler_output_cpu = last_hidden_cpu[:, 0, :].contiguous()
 
-    # Move back to RPU to match HF's device contract. Callers may accumulate
-    # these tensors across forwards, so each result needs independent storage;
-    # `.to(device)` produces a fresh RPU tensor rather than a graph-buffer view.
+    # Move back to RPU to match HF's device contract (callers expect RPU
+    # tensors when the model lives on RPU). Pitfall P4: callers may
+    # accumulate these tensors across multiple forwards — `at::empty`-style
+    # per-forward allocation is required; `.to(device)` on a CPU tensor
+    # produces a fresh RPU tensor (not a slice of a graph buffer).
     last_hidden = last_hidden_cpu.to(device="rpu")
     pooler_output = pooler_output_cpu.to(device="rpu")
 
-    return BaseModelOutputWithPooling(
+    result = BaseModelOutputWithPooling(
         last_hidden_state=last_hidden,
         pooler_output=pooler_output,
     )
+    vars(self)["_rpu_last_execution_plan"] = execution_receipt
+    return result
 
 
 # =============================================================================
-# RoPE-2D helpers
+# RoPE-2D helpers (validated by tools/dinov3/verify_rope2d_math.py)
 # =============================================================================
 
 
@@ -845,7 +972,7 @@ def build_dinov3_rope_tables(
         max_hw: largest patch-grid side, e.g. 14 for 224×224, patch=16.
         theta: rope base; DINOv3 config default = 100.
         device: where to place the tables. Use "rpu" for live forward.
-        dtype: fp16 for the kernel; fp32 when checking the math on CPU.
+        dtype: fp16 for the kernel; fp32 for unit-test verification.
 
     Returns:
         (cos_table, sin_table), each shape `[max_hw, head_dim/4]`.
@@ -918,6 +1045,12 @@ def _dinov3_runtime_complete(model: nn.Module) -> bool:
         return False
     if getattr(model, "_rpu_dinov3_handle", None) is None:
         return False
+    resource = getattr(model, "_rpu_dinov3_retirement_state", None)
+    if (resource is None or resource.owner() is not model or resource.failed is not None
+            or resource.handle != model._rpu_dinov3_handle
+            or resource.finalizer is not finalizer
+            or model._rpu_dinov3_graph_cache not in resource.graphs):
+        return False
     installed_forward = vars(model).get("forward")
     return bool(
         getattr(installed_forward, "__self__", None) is model
@@ -937,14 +1070,16 @@ _SWIZZLE_LOCK = threading.Lock()
 class DINOv3Adapter:
     """Per-instance adapter for DINOv3ViTModel.
 
-    Lifecycle (two-step with an RPU shortcut):
+    Lifecycle (D-01 two-step + RPU shortcut):
       1. `__init__(model)` — preflight, install `.to('rpu')` interceptor.
       2. `to_rpu()` — irreversible swizzle + move to RPU + apply hw attrs.
          Returns the same model object.
 
-    Forward dispatch uses `torch.ops.rpu.dinov3_vision_forward`. Calling
-    `model(pixel_values)` after `to_rpu()` runs the fused-graph pipeline and
-    returns `BaseModelOutputWithPooling(last_hidden_state, pooler_output)`.
+    Forward dispatch is wired in P4 to `torch.ops.rpu.dinov3_vision_forward`.
+    Calling `model(pixel_values)` after `to_rpu()` runs the fused-graph
+    pipeline and returns `BaseModelOutputWithPooling(last_hidden_state,
+    pooler_output)`. Numeric correctness (cos ≥ 0.999 vs CPU fp32) is verified
+    in P4.5 with real DINOv3-B weights.
     """
 
     @classmethod
@@ -992,6 +1127,23 @@ class DINOv3Adapter:
         self.preflight_execution(model.config, self._rpu_execution)
         self.model = model
         self._rpu_is_ready: bool = _dinov3_runtime_complete(model)
+        self._execution_reconfigure_journal = None
+        callbacks = {}
+        if getattr(model, "_execution_session", None) is None:
+            callbacks = {
+                "validate": self.validate_execution_reconfigure,
+                "apply": self.apply_execution_reconfigure,
+                "rollback": self.rollback_execution_reconfigure,
+                "cold_config_only": self._cold_execution_configuration_only,
+            }
+        self._execution_session = bind_execution_session(
+            model, self._rpu_execution, entry_point="DINOv3Adapter",
+            supported=supported_execution, graph_mode=GRAPH_RETAINED_CACHE,
+            **callbacks,
+        )
+        vars(model)["_rpu_execution"] = self._execution_session.config
+        self._execution_session.register_config_view(self)
+        self._execution_session._bind_planner_owner(model)
 
         # Idempotent `.to('rpu')` interceptor.
         if getattr(model.to, "__rpu_wrapped__", False):
@@ -1034,10 +1186,98 @@ class DINOv3Adapter:
         rpu_aware_to.__rpu_wrapped__ = True
         model.to = rpu_aware_to
 
+    def _cold_execution_configuration_only(self) -> bool:
+        model, session = self.model, self._execution_session
+        state = vars(model)
+        if (type(state) is not dict or session._owner is not model
+                or state.get("_rpu_swizzle_started", False)
+                or state.get("_rpu_swizzled", False)
+                or any(name in state for name in _DINOV3_HANDLE_INSTALL_ATTRS)
+                or any(name in state for name in (
+                    "_rpu_dinov3_patch_embed_w", "_rpu_dinov3_patch_embed_b",
+                    "_rpu_dinov3_cls_reg", "_rpu_dinov3_gamma_attn", "_rpu_dinov3_gamma_mlp"))):
+            return False
+        # Rewrapping a still-cold model can create several adapter mirrors.
+        # These are configuration views, not additional physical owners.
+        return self in session._config_views and all(
+            type(view) is DINOv3Adapter and type(vars(view)) is dict
+            and view.model is model and view._execution_session is session
+            and view._rpu_is_ready is False
+            for view in session._config_views
+        )
+
+    def validate_execution_reconfigure(self, config) -> None:
+        self.preflight_execution(self.model.config, config)
+        if getattr(self.model, "_rpu_dinov3_handle", None) is not None:
+            required = (
+                "dinov3_vision_get_chunk_size_override",
+                "dinov3_vision_stage_chunk_size",
+                "execution_reconfigure_begin", "execution_reconfigure_commit",
+                "execution_reconfigure_abort", "execution_reconfigure_abort_attempt",
+            )
+            missing = [name for name in required if not hasattr(torch.ops.rpu, name)]
+            if missing:
+                raise RuntimeError("DINOv3 binary lacks execution-reconfigure op(s): "
+                                   + ", ".join(missing))
+
+    def _reset_execution_graphs(self) -> None:
+        cache = getattr(self.model, "_rpu_dinov3_graph_cache", None)
+        if cache is not None:
+            cache.begin_warmup()
+            cache.clear()
+            if not cache.cache_invariant_ok():
+                raise RuntimeError("DINOv3 GraphCache invariant failed during reconfigure")
+        # A native transaction invalidates the prior descriptor generation.
+        vars(self.model).pop("_rpu_last_execution_plan", None)
+
+    def apply_execution_reconfigure(self, _old, config, _generation, *, force_rebuild=False) -> None:
+        state = vars(self.model)
+        journal = self._execution_reconfigure_journal = {
+            "mutation_started": False,
+            "had_chunk": "_rpu_chunk_size" in state,
+            "chunk": state.get("_rpu_chunk_size"),
+            "handle": getattr(self.model, "_rpu_dinov3_handle", None),
+        }
+        requested = config.get("vision", {}).get("chunk_size", "auto")
+        chunk = 0 if requested == "auto" else int(requested)
+        if journal["handle"] is not None:
+            journal["native_chunk"] = int(
+                torch.ops.rpu.dinov3_vision_get_chunk_size_override(journal["handle"]))
+            with native_execution_reconfigure(torch.ops.rpu, journal=journal) as token:
+                torch.ops.rpu.dinov3_vision_stage_chunk_size(
+                    journal["handle"], token, chunk)
+        journal["mutation_started"] = True
+        self._reset_execution_graphs()
+        state["_rpu_chunk_size"] = chunk
+        # Retain the actual native/Python snapshot until shared publication ends.
+
+    def rollback_execution_reconfigure(self, _old, _new, _generation) -> None:
+        journal = self._execution_reconfigure_journal
+        if journal is None or not journal["mutation_started"]:
+            return
+        if journal["handle"] is not None:
+            with native_execution_reconfigure(torch.ops.rpu) as token:
+                torch.ops.rpu.dinov3_vision_stage_chunk_size(
+                    journal["handle"], token, journal["native_chunk"])
+        self._reset_execution_graphs()
+        if journal["had_chunk"]:
+            vars(self.model)["_rpu_chunk_size"] = journal["chunk"]
+        else:
+            vars(self.model).pop("_rpu_chunk_size", None)
+        self._execution_reconfigure_journal = None
+
     def to_rpu(self) -> nn.Module:
+        """Serialize cold construction with the existing forward/close Session."""
+        with self._execution_session._lock:
+            _require_execution_process_safe()
+            if self._execution_session.stats()["state"] != "QUIESCENT":
+                raise RPUBackendError("DINOv3 installation requires a quiescent Session")
+            return self._to_rpu_locked()
+
+    def _to_rpu_locked(self) -> nn.Module:
         """Run the install sequence. Idempotent for the same model.
 
-        Install sequence:
+        P4 scope:
           A. Pre-move: fold patch_embed Conv2d to CPU fp16 Linear, zero-pad
              attention heads up to a multiple of NUM_CORES (no-op for ViT-L),
              swizzle every leaf Linear.
@@ -1066,6 +1306,7 @@ class DINOv3Adapter:
                 "model in undefined state. Reload from_pretrained()."
             )
 
+        self._execution_session.require_cold()
         if not _SWIZZLE_LOCK.acquire(blocking=False):
             raise RPUBackendError(
                 "DINOv3Adapter.to_rpu(): another swizzle in progress."
@@ -1114,9 +1355,12 @@ class DINOv3Adapter:
             self._rpu_is_ready = True
             self.model._rpu_swizzled = True
             return self.model
-        except BaseException:
+        except BaseException as error:
             if install_started:
-                _cleanup_dinov3_partial_runtime(self.model)
+                try:
+                    _close_dinov3_model(self.model)
+                except BaseException as cleanup_error:
+                    error.add_note(f"DINOv3 outer cleanup failed: {cleanup_error!r}")
             model_state = vars(self.model)
             if had_instance_forward:
                 model_state["forward"] = old_instance_forward

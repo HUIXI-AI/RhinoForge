@@ -1,12 +1,11 @@
 // rpu_linear_tiling.h — host-side auto-tile selection and register ABI for
 // tiled parallel_linear kernels.
 //
-// AUTO-GENERATED TABLES: the six PL_EXACT_* arrays match the generated tables
-// shipped by operator asset v1.0.0. Update all six together when that asset
-// changes. The fallback rules and m-tile maps below mirror the same source.
+// Keep the six PL_EXACT_* variant tables in sync with the operator ABI.
+// PL_EXACT_W8A16 also contains explicitly labelled shared overrides.
 //
 // The current op library exposes seven baked n-tile variants for each family:
-// FP16/W8A16/W4A16-pgrp, each with acc16 and acc32 accumulation. The host picks a
+// FP16/W8A16/W4A16-pgrp with acc16 and acc32, and NVFP4 with acc32 only. The host picks a
 // variant from the per-core (M, local_n, local_k) shape and launches the matching
 // grid.
 #pragma once
@@ -27,12 +26,15 @@ namespace rpu_pl_tiling {
 struct PLEntry { int M, n, k, tile; };
 struct TilePick { int n_tile; int m_tile; };
 
-// These precision families currently expose one fixed operator-asset tile. Keep
-// their fixed capability explicit instead of presenting them as auto-tile:
-// rhino-ops must publish additional named variants before the host can select
-// any other tile without changing the kernel ABI.
-inline constexpr TilePick kNvfp4Acc16FixedTile{128, 208};
-inline constexpr TilePick kNvfp4Acc32FixedTile{128, 128};
+// Shared Full-local-K W8A16 row schedule for an exact admitted geometry.
+// This does not extend the generated auto-tile tables.
+// Payload availability, precision, layouts and buffer lifetimes are separate
+// owner/launcher contracts. Other shapes keep the existing auto-tile route.
+inline constexpr bool supports_w8a16_row_weight_reuse(
+    int64_t M, int64_t N, int64_t K, int partition, int num_cores) noexcept {
+  return M == 512 && N == 1024 && K == 2048 && partition == 0 &&
+         num_cores == 8;
+}
 
 template <std::size_t N>
 constexpr std::size_t table_size(const PLEntry (&)[N]) { return N; }
@@ -61,7 +63,7 @@ inline int exact_lookup(const PLEntry* table, std::size_t count,
   return pl_key(e.M, e.n, e.k) == wanted ? e.tile : 0;
 }
 
-// EXACT_TILE_TABLE (285 entries).
+// EXACT_TILE_TABLE (285 entries), generated from the shared public operator table.
 static constexpr PLEntry PL_EXACT_W8A16[] = {
     {1,32,2048,48}, {1,32,4096,112}, {1,64,2048,32}, {1,64,2560,32}, {1,64,3584,32}, {1,128,1024,32},
     {1,128,2048,32}, {1,128,2304,48}, {1,128,2560,48}, {1,128,4096,32}, {1,128,5120,32}, {1,256,1024,32},
@@ -414,6 +416,60 @@ inline int mtile_int4_acc32(int n) {
 
 inline constexpr int kFallbackNeighbors = 5;
 inline constexpr double kFallbackDistanceEpsilon = 0.01;
+// NVFP4 ACC32 uses its own register ABI and tile family; this migration does
+// not change the other precision families.
+static constexpr PLEntry PL_EXACT_NVFP4_ACC32[] = {
+    {1,32,2048,112}, {1,32,4096,80}, {1,64,2048,32}, {1,64,2560,32}, {1,64,3584,32}, {1,128,1024,32},
+    {1,128,2048,32}, {1,128,2304,32}, {1,128,2560,32}, {1,128,4096,32}, {1,128,5120,32}, {1,256,1024,64},
+    {1,256,2048,64}, {1,256,2304,64}, {1,256,2560,64}, {1,320,2048,128}, {1,384,1024,128}, {1,384,2048,128},
+    {1,384,2560,128}, {1,448,3584,128}, {1,512,1024,64}, {1,512,2048,64}, {1,512,2304,64}, {1,512,2560,64},
+    {1,512,4096,64}, {1,576,3584,64}, {1,576,4096,64}, {1,640,2048,64}, {1,640,5120,64}, {1,768,2048,128},
+    {1,768,2560,128}, {1,768,4096,128}, {1,896,5120,128}, {1,1024,256,96}, {1,1024,384,96}, {1,1024,2048,64},
+    {1,1024,5120,64}, {1,1152,2304,128}, {1,1152,2560,128}, {1,1216,2560,128}, {1,1280,2560,128}, {1,1280,5120,128},
+    {1,1376,2048,128}, {1,1536,4096,64}, {1,2048,256,64}, {1,2048,512,64}, {1,2048,768,64}, {1,2048,1024,64},
+    {1,2048,2048,64}, {1,2048,4096,64}, {1,2176,5120,128}, {1,2304,256,64}, {1,2304,1152,128}, {1,2368,3584,128},
+    {1,2560,256,64}, {1,2560,512,128}, {1,2560,1152,64}, {1,2560,1216,64}, {1,2560,1280,64}, {1,3200,5120,128},
+    {1,3584,448,64}, {1,3584,2368,128}, {1,4096,512,64}, {1,4096,1536,64}, {1,4096,2048,128}, {1,5120,640,64},
+    {1,5120,1024,128}, {1,5120,2176,128}, {1,5120,3200,128}, {1,16032,2048,128}, {1,18992,1024,128}, {1,18992,2048,128},
+    {1,18992,2560,128}, {1,18992,4096,128}, {1,18992,5120,128}, {1,19008,2048,128}, {1,19008,3584,128}, {1,31040,2560,128},
+    {1,32000,2304,128}, {1,32144,2048,128}, {31,32,1024,128}, {31,128,1024,32}, {31,256,1024,64}, {31,320,1024,112},
+    {31,384,1024,128}, {31,512,1024,64}, {31,1024,256,64}, {31,1024,384,64}, {31,1024,512,96}, {32,32,1024,80},
+    {32,128,1024,32}, {32,256,1024,64}, {32,320,1024,112}, {32,384,1024,128}, {32,512,1024,64}, {32,1024,256,128},
+    {32,1024,384,64}, {32,1024,512,64}, {50,32,1024,80}, {50,128,1024,32}, {50,256,1024,64}, {50,320,1024,96},
+    {50,384,1024,128}, {50,512,1024,48}, {50,1024,256,64}, {50,1024,384,64}, {50,1024,512,64}, {72,512,4096,64},
+    {72,576,4608,128}, {72,640,5120,64}, {72,2048,512,64}, {72,2048,640,64}, {72,4096,576,64}, {180,512,4096,80},
+    {180,576,4608,96}, {180,640,5120,96}, {180,2048,512,96}, {180,2048,640,96}, {180,4096,576,96}, {192,512,4096,80},
+    {192,576,4608,96}, {192,640,5120,96}, {192,2048,512,112}, {192,2048,640,96}, {192,4096,576,96}, {256,32,2048,128},
+    {256,32,4096,128}, {256,64,2048,32}, {256,64,2560,32}, {256,64,3584,32}, {256,128,1024,48}, {256,128,2048,48},
+    {256,128,2304,48}, {256,128,2560,48}, {256,128,4096,48}, {256,128,5120,48}, {256,256,1024,64}, {256,256,2048,64},
+    {256,256,2304,64}, {256,256,2560,64}, {256,320,2048,80}, {256,384,1024,80}, {256,384,2048,64}, {256,384,2560,64},
+    {256,448,3584,80}, {256,512,1024,80}, {256,512,2048,80}, {256,512,2304,80}, {256,512,2560,80}, {256,512,4096,80},
+    {256,576,3584,80}, {256,576,4096,80}, {256,640,2048,80}, {256,640,5120,80}, {256,768,2048,80}, {256,768,2560,80},
+    {256,768,4096,80}, {256,896,5120,80}, {256,1024,256,80}, {256,1024,384,80}, {256,1024,2048,80}, {256,1024,5120,80},
+    {256,1152,2304,80}, {256,1152,2560,80}, {256,1216,2560,80}, {256,1280,2560,80}, {256,1280,5120,80}, {256,1376,2048,80},
+    {256,1536,4096,80}, {256,2048,256,80}, {256,2048,512,80}, {256,2048,768,80}, {256,2048,1024,80}, {256,2048,2048,80},
+    {256,2048,4096,80}, {256,2176,5120,80}, {256,2304,256,80}, {256,2304,1152,80}, {256,2368,3584,80}, {256,2560,256,80},
+    {256,2560,512,80}, {256,2560,1152,64}, {256,2560,1216,64}, {256,2560,1280,80}, {256,3200,5120,80}, {256,3584,448,80},
+    {256,3584,2368,80}, {256,4096,512,80}, {256,4096,1536,80}, {256,4096,2048,80}, {256,5120,640,80}, {256,5120,1024,80},
+    {256,5120,2176,64}, {256,5120,3200,64}, {288,128,1024,48}, {288,128,1536,48}, {288,128,4096,48}, {288,144,1152,48},
+    {288,144,1536,64}, {288,160,1280,64}, {288,256,1024,64}, {288,384,1024,64}, {288,432,1152,64}, {288,432,1280,64},
+    {288,480,1280,64}, {288,512,1024,64}, {288,512,4096,64}, {288,544,1152,64}, {288,576,4608,64}, {288,640,5120,64},
+    {288,1024,128,64}, {288,1024,256,64}, {288,1024,512,64}, {288,1152,192,64}, {288,1152,576,64}, {288,1280,192,64},
+    {288,1280,448,64}, {288,1536,4096,64}, {288,2048,512,64}, {288,2048,640,64}, {288,4096,512,64}, {288,4096,576,64},
+    {288,5120,2176,64}, {512,128,1024,64}, {512,128,4096,64}, {512,256,1024,64}, {512,512,4096,80}, {512,1024,256,80},
+    {512,1536,4096,80}, {512,4096,512,80}, {512,5120,2176,80}, {720,128,1024,64}, {720,128,1536,64}, {720,144,1152,48},
+    {720,144,1536,80}, {720,160,1280,80}, {720,384,1024,80}, {720,432,1152,48}, {720,432,1280,96}, {720,480,1280,96},
+    {720,512,1024,96}, {720,544,1152,48}, {720,1024,128,96}, {720,1024,512,96}, {720,1152,192,96}, {720,1152,576,48},
+    {720,1280,192,96}, {720,1280,448,48}, {768,128,1024,64}, {768,128,1536,64}, {768,128,4096,64}, {768,144,1152,48},
+    {768,144,1536,80}, {768,160,1280,80}, {768,256,1024,96}, {768,384,1024,80}, {768,432,1152,48}, {768,432,1280,80},
+    {768,480,1280,80}, {768,512,1024,80}, {768,512,4096,80}, {768,544,1152,48}, {768,1024,128,80}, {768,1024,256,80},
+    {768,1024,512,80}, {768,1152,192,80}, {768,1152,576,48}, {768,1280,192,80}, {768,1280,448,80}, {768,4096,512,80},
+    {1152,128,1024,64}, {1152,128,1536,64}, {1152,144,1152,80}, {1152,144,1536,80}, {1152,160,1280,80}, {1152,384,1024,96},
+    {1152,432,1152,64}, {1152,432,1280,96}, {1152,480,1280,96}, {1152,512,1024,96}, {1152,544,1152,64}, {1152,1024,128,96},
+    {1152,1024,512,96}, {1152,1152,192,96}, {1152,1152,576,48}, {1152,1280,192,96}, {1152,1280,448,64},
+};
+static_assert(table_size(PL_EXACT_NVFP4_ACC32) == 287, "EXACT_TILE_TABLE_NVFP4_ACC32 count drifted");
+
 inline constexpr std::array<int, 7> kTileGrid{32, 48, 64, 80, 96, 112, 128};
 
 inline int ceil_div_positive(int value, int divisor) {
@@ -495,52 +551,164 @@ inline int measured_neighbor_tile(const PLEntry* table, std::size_t count,
   return candidates[best];
 }
 
-inline TilePick select_tile_acc16(int M, int local_n, int local_k, bool is_fp16) {
-  const PLEntry* table = is_fp16 ? PL_EXACT_W16 : PL_EXACT_W8A16;
-  const std::size_t count = is_fp16 ? table_size(PL_EXACT_W16)
-                                     : table_size(PL_EXACT_W8A16);
-  int n = exact_lookup(table, count, M, local_n, local_k);
-  if (n == 0) {
-    n = measured_neighbor_tile(table, count, M, local_n, local_k,
-                               is_fp16 ? mtile_w16 : mtile_w8a16);
+inline int mtile_nvfp4_acc32(int n) {
+  switch (n) {
+    case 128: return 176;
+    case 112: return 208;
+    case 96: return 240;
+    case 80: return 272;
+    case 64: return 320;
+    case 48: return 384;
+    case 32: return 480;
+    default: throw std::invalid_argument("unsupported NVFP4 n_tile");
   }
-  return {n, is_fp16 ? mtile_w16(n) : mtile_w8a16(n)};
+}
+
+namespace detail {
+
+enum class TileFamily : uint8_t {
+  Fp16Acc16, W8Acc16, Fp16Acc32, W8Acc32, W4Acc16, W4Acc32, Nvfp4Acc32,
+};
+
+// Tables and fallback math are immutable in this binary. Bound the memo to
+// 128 entries per calling thread; collisions replace a value and only cause
+// recomputation. No tensor, model, device address, or cross-version state is
+// retained. Compare every integer field: pl_key's packed representation is
+// for the generated exact tables, not an identity for arbitrary input shapes.
+class TileSelectionCache {
+ public:
+  static constexpr std::size_t capacity = 128;
+
+  bool lookup(TileFamily family, int m, int n, int k, TilePick& pick) const noexcept {
+    const auto& entry = entries_[slot(family, m, n, k)];
+    if (!entry.valid || entry.family != family ||
+        entry.m != m || entry.n != n || entry.k != k) return false;
+    pick = entry.pick;
+    return true;
+  }
+
+  void store(TileFamily family, int m, int n, int k, TilePick pick) noexcept {
+    entries_[slot(family, m, n, k)] = {family, m, n, k, pick, true};
+  }
+
+ private:
+  struct Entry {
+    TileFamily family{};
+    int m = 0, n = 0, k = 0;
+    TilePick pick{};
+    bool valid = false;
+  };
+  std::array<Entry, capacity> entries_{};
+
+  static std::size_t slot(TileFamily family, int m, int n, int k) noexcept {
+    uint64_t hash = static_cast<uint32_t>(m);
+    for (const uint64_t value : {uint64_t{static_cast<uint32_t>(n)},
+                                 uint64_t{static_cast<uint32_t>(k)},
+                                 uint64_t{static_cast<uint8_t>(family)}}) {
+      hash = hash * UINT64_C(0x9e3779b97f4a7c15) + value;
+    }
+    hash ^= hash >> 33;
+    hash *= UINT64_C(0xff51afd7ed558ccd);
+    hash ^= hash >> 33;
+    return static_cast<std::size_t>(hash) & (capacity - 1);
+  }
+};
+
+inline TileSelectionCache& tile_selection_cache() {
+  static thread_local TileSelectionCache cache;
+  return cache;
+}
+
+template <typename Select>
+inline TilePick cached_tile(TileFamily family, int m, int n, int k, Select select) {
+  auto& cache = tile_selection_cache();
+  TilePick pick;
+  if (cache.lookup(family, m, n, k, pick)) return pick;
+  pick = select();  // Failed selection must never publish a cache entry.
+  cache.store(family, m, n, k, pick);
+  return pick;
+}
+
+}  // namespace detail
+
+inline TilePick select_tile_nvfp4_acc32(int M, int local_n, int local_k) {
+  return detail::cached_tile(detail::TileFamily::Nvfp4Acc32, M, local_n, local_k, [&] {
+    int n = exact_lookup(PL_EXACT_NVFP4_ACC32, table_size(PL_EXACT_NVFP4_ACC32),
+                         M, local_n, local_k);
+    if (n == 0) {
+      n = measured_neighbor_tile(PL_EXACT_NVFP4_ACC32,
+                                 table_size(PL_EXACT_NVFP4_ACC32),
+                                 M, local_n, local_k, mtile_nvfp4_acc32);
+    }
+    return TilePick{n, mtile_nvfp4_acc32(n)};
+  });
+}
+
+// The initial ACC16 family preserves all seven ACC32 tile geometries. Reuse
+// its deterministic selection as a bootstrap heuristic, without claiming the
+// ACC32 measurement table is an ACC16 performance measurement.
+inline TilePick select_tile_nvfp4_acc16(int M, int local_n, int local_k) {
+  return select_tile_nvfp4_acc32(M, local_n, local_k);
+}
+
+inline TilePick select_tile_acc16(int M, int local_n, int local_k, bool is_fp16) {
+  return detail::cached_tile(is_fp16 ? detail::TileFamily::Fp16Acc16
+                                    : detail::TileFamily::W8Acc16,
+                             M, local_n, local_k, [&] {
+    const PLEntry* table = is_fp16 ? PL_EXACT_W16 : PL_EXACT_W8A16;
+    const std::size_t count = is_fp16 ? table_size(PL_EXACT_W16)
+                                       : table_size(PL_EXACT_W8A16);
+    int n = exact_lookup(table, count, M, local_n, local_k);
+    if (n == 0) {
+      n = measured_neighbor_tile(table, count, M, local_n, local_k,
+                                 is_fp16 ? mtile_w16 : mtile_w8a16);
+    }
+    return TilePick{n, is_fp16 ? mtile_w16(n) : mtile_w8a16(n)};
+  });
 }
 
 inline TilePick select_tile_acc32(int M, int local_n, int local_k, bool is_fp16) {
-  const PLEntry* table = is_fp16 ? PL_EXACT_FP16_ACC32
-                                 : PL_EXACT_W8A16_ACC32;
-  const std::size_t count = is_fp16 ? table_size(PL_EXACT_FP16_ACC32)
-                                     : table_size(PL_EXACT_W8A16_ACC32);
-  int n = exact_lookup(table, count, M, local_n, local_k);
-  if (n == 0) {
-    n = measured_neighbor_tile(
-        table, count, M, local_n, local_k,
-        is_fp16 ? mtile_fp16_acc32 : mtile_w8a16_acc32);
-  }
-  return {n, is_fp16 ? mtile_fp16_acc32(n) : mtile_w8a16_acc32(n)};
+  return detail::cached_tile(is_fp16 ? detail::TileFamily::Fp16Acc32
+                                    : detail::TileFamily::W8Acc32,
+                             M, local_n, local_k, [&] {
+    const PLEntry* table = is_fp16 ? PL_EXACT_FP16_ACC32
+                                   : PL_EXACT_W8A16_ACC32;
+    const std::size_t count = is_fp16 ? table_size(PL_EXACT_FP16_ACC32)
+                                       : table_size(PL_EXACT_W8A16_ACC32);
+    int n = exact_lookup(table, count, M, local_n, local_k);
+    if (n == 0) {
+      n = measured_neighbor_tile(
+          table, count, M, local_n, local_k,
+          is_fp16 ? mtile_fp16_acc32 : mtile_w8a16_acc32);
+    }
+    return TilePick{n, is_fp16 ? mtile_fp16_acc32(n) : mtile_w8a16_acc32(n)};
+  });
 }
 
 inline TilePick select_tile_int4(int M, int local_n, int local_k) {
-  int n = exact_lookup(PL_EXACT_INT4, table_size(PL_EXACT_INT4),
-                       M, local_n, local_k);
-  if (n == 0) {
-    n = measured_neighbor_tile(PL_EXACT_INT4, table_size(PL_EXACT_INT4),
-                               M, local_n, local_k, mtile_int4);
-  }
-  return {n, mtile_int4(n)};
+  return detail::cached_tile(detail::TileFamily::W4Acc16, M, local_n, local_k, [&] {
+    int n = exact_lookup(PL_EXACT_INT4, table_size(PL_EXACT_INT4),
+                         M, local_n, local_k);
+    if (n == 0) {
+      n = measured_neighbor_tile(PL_EXACT_INT4, table_size(PL_EXACT_INT4),
+                                 M, local_n, local_k, mtile_int4);
+    }
+    return TilePick{n, mtile_int4(n)};
+  });
 }
 
 inline TilePick select_tile_int4_acc32(int M, int local_n, int local_k) {
-  int n = exact_lookup(PL_EXACT_INT4_ACC32,
-                       table_size(PL_EXACT_INT4_ACC32),
-                       M, local_n, local_k);
-  if (n == 0) {
-    n = measured_neighbor_tile(
-        PL_EXACT_INT4_ACC32, table_size(PL_EXACT_INT4_ACC32),
-        M, local_n, local_k, mtile_int4_acc32);
-  }
-  return {n, mtile_int4_acc32(n)};
+  return detail::cached_tile(detail::TileFamily::W4Acc32, M, local_n, local_k, [&] {
+    int n = exact_lookup(PL_EXACT_INT4_ACC32,
+                         table_size(PL_EXACT_INT4_ACC32),
+                         M, local_n, local_k);
+    if (n == 0) {
+      n = measured_neighbor_tile(
+          PL_EXACT_INT4_ACC32, table_size(PL_EXACT_INT4_ACC32),
+          M, local_n, local_k, mtile_int4_acc32);
+    }
+    return TilePick{n, mtile_int4_acc32(n)};
+  });
 }
 
 inline std::string autotile_kernel_name(bool is_fp16, int m_tile, int n_tile) {
@@ -562,6 +730,16 @@ inline std::string autotile_kernel_name_int4_acc32(int m_tile, int n_tile) {
          "n" + std::to_string(n_tile) + "k128";
 }
 
+inline std::string autotile_kernel_name_nvfp4_acc16(int m_tile, int n_tile) {
+  return "parallel_linear_wnvfp4a16_acc16_m" + std::to_string(m_tile) +
+         "n" + std::to_string(n_tile) + "k128";
+}
+
+inline std::string autotile_kernel_name_nvfp4_acc32(int m_tile, int n_tile) {
+  return "parallel_linear_wnvfp4a16_acc32_m" + std::to_string(m_tile) +
+         "n" + std::to_string(n_tile) + "k128";
+}
+
 // Order: existing 21 acc16 IDs first, then the 21 acc32 IDs. Within every
 // family n_tile is 128,112,96,80,64,48,32. KernelCache enum order must match.
 inline std::vector<std::string> autotile_kernel_names() {
@@ -577,7 +755,7 @@ inline std::vector<std::string> autotile_kernel_names() {
   return names;
 }
 
-// Operator-asset v1.0.0 ParallelLinear wrapper ABI. Weight and
+// Parallel linear ABI (registers 0..23). Weight and
 // scale are raw device addresses here; zero is valid when a graph DDR writer
 // fills the corresponding register pair after this helper returns.
 struct ParallelLinearRegisterArgs {
@@ -630,6 +808,27 @@ struct ParallelLinearInt4GroupRegisterArgs {
   uint16_t local_groups;
   uint32_t scale_group_block_byte_step;
 };
+
+// NVFP4 uses common 0..21, except localK/64 at reg 13,
+// then 32-bit K32-pair scale stride, absolute FP32 tensor-scale SPM address,
+// partition and layer. It is not the retired fixed NVFP4 0..23 ABI.
+struct ParallelLinearNvfp4RegisterArgs {
+  ParallelLinearRegisterArgs linear;
+  uint32_t scale_kpair_byte_step;
+  uint32_t tensor_scale_spm_addr;
+  uint16_t layer_id;
+};
+
+template <typename Kernel>
+inline void set_parallel_linear_nvfp4_regs(
+    Kernel& kernel, const ParallelLinearNvfp4RegisterArgs& a) {
+  set_parallel_linear_regs(kernel, a.linear);
+  kernel.set_regs(13, static_cast<uint16_t>(a.linear.local_k / 64));
+  set_u32_reg_pair(kernel, 22, a.scale_kpair_byte_step);
+  set_u32_reg_pair(kernel, 24, a.tensor_scale_spm_addr);
+  kernel.set_regs(26, a.linear.partition);
+  kernel.set_regs(27, a.layer_id);
+}
 
 template <typename Kernel>
 inline void set_parallel_linear_int4_group_regs(

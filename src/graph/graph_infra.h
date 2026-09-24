@@ -17,6 +17,7 @@
 #include <ATen/core/dispatch/Dispatcher.h>
 #include <ATen/core/function_schema.h>
 #include <ATen/core/stack.h>
+#include <c10/util/Exception.h>
 
 #include <array>
 #include <cassert>
@@ -34,6 +35,39 @@
 
 class RpuKernelGraph;
 
+enum class GraphHostOpDeferMode : uint8_t {
+    Auto = 0,
+    ForceOff = 1,
+    ForceOn = 2,
+};
+
+// Immutable policy copied into each Graph when its owning Python Graph or
+// GraphCache is created.  Runtime execution must never consult process
+// environment selectors after this snapshot is bound.
+struct GraphRuntimePolicy {
+    // Safe by default: the executor skips the mutable-kernel scan only when
+    // its per-replay witness proves that no Graph-owned Kernel_t was touched.
+    // The policy remains an opt-out/debug control; it is not a model route.
+    bool fast_replay_skip_sync = true;
+    bool force_oneshot_on_replay = false;
+    GraphHostOpDeferMode host_op_defer_mode = GraphHostOpDeferMode::Auto;
+    bool siglip_isolate_patch_embed = false;
+    bool lingbot2_multiview_spm_z2 = false;
+    bool fmb_fast_replay = false;
+    bool fmb_deep_fast_replay = false;
+    size_t lkn_max_batch_entries = 65'536;
+    size_t lkn_kd_buf_mb = 8;
+    size_t lkn_instr_buf_mb = 64;
+    // Set only by the exact legacy 27B text owner before graph construction.
+    bool qwen35_legacy_27b_sdk_budget = false;
+    // Driver resource prefix [0, execution_core_count), shared by compute and
+    // DMA engines. Physical DDR/controller memory striping remains eight-way.
+    int execution_core_count = 8;
+    // Opt-in cold pool of uniform SDK-sized instruction arenas. Zero leaves
+    // ordinary allocation unchanged; the legacy 27B owner retains three slots.
+    size_t graph_arena_count = 0;
+};
+
 // =============================================================================
 // GraphSignature — multi-graph cache lookup key
 // =============================================================================
@@ -43,7 +77,7 @@ struct GraphSignature {
     // FNV1a-hash strings to int64_t before crossing the pybind boundary.
     int64_t op_id = 0;
 
-    // Human-readable diagnostic label mirrored from Python
+    // P6 (debug-level extension): human-readable label mirrored from Python
     // (`rpu_backend.GraphSignature(op_id="pi05_siglip_compute")`). NOT part of
     // operator==/Hash/empty() — only used for log lines + diagnostic strings.
     // Empty is allowed and means "no label" (older callers / no-backend mode).
@@ -555,10 +589,64 @@ struct RpuGraphCacheEntry {
     size_t recapture_count = 0;
 };
 
+// Direct Graph-node counts, never HWPerf-derived or inclusive of child work.
+struct GraphSegmentCensus {
+    size_t segment_id = 0;
+    size_t start_idx = 0;
+    size_t end_idx = 0;
+    size_t core_count = 0;
+    size_t kernel_count = 0;
+    size_t dma_count = 0;
+    size_t barrier_count = 0;
+
+    size_t manifest_metadata_count() const {
+        TORCH_CHECK(end_idx >= start_idx,
+                    "Graph segment census has a reversed node range");
+        size_t remaining = end_idx - start_idx;
+        // Subtract separately: summing the three counters could overflow.
+        // The segment builder admits only these device nodes and privately
+        // authenticated FMB manifest metadata inside the original Graph range.
+        for (const size_t count : {kernel_count, dma_count, barrier_count}) {
+            TORCH_CHECK(count <= remaining,
+                        "Graph segment census device counts exceed its node range");
+            remaining -= count;
+        }
+        return remaining;
+    }
+};
+
+struct GraphSegmentExecution {
+    uint64_t graph_lifetime_id = 0;
+    uint64_t build_generation = 0;
+    uint64_t execution_ordinal = 0;
+    uint64_t parent_graph_lifetime_id = 0;
+    uint64_t parent_execution_ordinal = 0;
+    // Actual active parent chain, nearest parent first; diagnostic bound 64.
+    std::vector<std::pair<uint64_t, uint64_t>> execution_ancestors;
+    std::string graph_name;
+    std::string execution_kind;  // Actual executor: build / replay / oneshot.
+    bool native_composite = false;
+    size_t graph_kernel_count = 0;
+    size_t graph_dma_count = 0;
+    size_t graph_barrier_count = 0;
+    size_t graph_child_count = 0;
+    size_t graph_segment_count = 0;
+    GraphSegmentCensus segment;
+    uint64_t hwperf_sequence = 0;
+    std::string hwperf_path;
+    std::string companion_path;
+    // Negative = no attempt: -1 disabled, -2 budget exhausted, -3 unprepared,
+    // -4 path truncated, -5 invalid/overlong parent chain. Nonnegative values
+    // are actual dump/write return codes.
+    int64_t hwperf_rc = -1;
+    int64_t companion_rc = -1;
+};
+
 class RpuGraphCache {
 public:
-    RpuGraphCache() = default;
-    explicit RpuGraphCache(size_t max_entries) : max_entries_(max_entries) {}
+    RpuGraphCache();
+    explicit RpuGraphCache(size_t max_entries);
+    RpuGraphCache(size_t max_entries, GraphRuntimePolicy runtime_policy);
 
     RpuKernelGraph& get_or_create(const GraphSignature& sig);
     RpuKernelGraph* lookup(const GraphSignature& sig);
@@ -573,6 +661,9 @@ public:
     void touch_entry(const GraphSignature& sig, bool replay);
 
     struct Snapshot {
+        uint64_t graph_lifetime_id = 0;
+        uint64_t build_generation = 0;
+        uint64_t execution_ordinal = 0;
         GraphSignature signature;
         size_t kernel_count;
         size_t segment_count;
@@ -581,6 +672,13 @@ public:
         size_t recapture_count;
         std::string non_replayable_reason;
         size_t data_node_count = 0;
+        size_t dma_count = 0;
+        size_t barrier_count = 0;
+        size_t child_graph_count = 0;
+        std::vector<uint64_t> child_graph_lifetime_ids;
+        uint64_t hwperf_evidence_failure_total = 0;
+        std::vector<GraphSegmentCensus> segment_census;
+        std::vector<GraphSegmentExecution> last_segment_executions;
         size_t boundary_flush_count = 0;
         size_t prepared_segment_hit_total = 0;
         size_t prepared_segment_miss_total = 0;
@@ -632,6 +730,7 @@ private:
     std::unordered_map<int64_t, std::map<uint64_t, std::vector<GraphSignature>>>
         by_gm_branch_;
     size_t max_entries_ = std::numeric_limits<size_t>::max();
+    const GraphRuntimePolicy runtime_policy_{};
 };
 
 RpuGraphCache& default_graph_cache();

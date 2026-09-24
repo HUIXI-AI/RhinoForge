@@ -187,12 +187,12 @@ public:
     // persistent allocations use this to detect whether their persistent SPM
     // data was actually wiped (vs only temporary being reset). This avoids the
     // pessimistic "any reset == full rebuild" fallback in FusedLayerBase, which
-    // would force SigLIP to BUILD weights and main graphs every forward instead
-    // of REPLAY.
+    // forced SigLIP to BUILD weights+main graphs every forward instead of REPLAY
+    // (cause of the siglip-multi-group-replay-non-determinism bug).
     uint64_t persistent_generation() const { return persistent_generation_; }
 
     // =========================================================================
-    // Instance lifecycle.
+    // Instance lifecycle (Task 4.5.1)
     //
     // Counts live FusedModelBase instances. super_persistent is process-wide
     // monotonic during a "session" (count > 0), but when all model instances
@@ -243,7 +243,7 @@ private:
     size_t sp_floor_ = SPM_USABLE;  // super-persistent 底部（从 SPM_USABLE 向下, 单调）
     uint64_t generation_ = 0;      // reset 计数（temporary OR all），用于客户端失效检测
     uint64_t persistent_generation_ = 0;  // reset_all 计数，用于精确判断 persistent 是否被清空
-    int active_instance_count_ = 0;  // Live FusedModelBase count.
+    int active_instance_count_ = 0;  // Task 4.5.1: live FusedModelBase count
     bool deferred_floor_release_ = false;
 
     // FusedModelBase destruction is noexcept.  If the last instance disappears

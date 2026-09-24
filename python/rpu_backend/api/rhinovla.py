@@ -2,175 +2,33 @@
 
 The backend owns the RPU components, but the separate RhinoVLA model repository
 owns checkpoint composition, preprocessing, and the live-input contract. This
-wrapper gives runtime integrators one stable API without pretending the backend
+wrapper gives delivery executors one stable API without pretending the backend
 can infer those model-repository choices.
 """
 from __future__ import annotations
 
+import copy
 import importlib
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Mapping
 from os import PathLike, fspath
 from typing import Any
 
 
 RuntimeFactory = str | Callable[..., Any]
 _MISSING = object()
-_EXECUTION_STAGES = ("prefill", "vision", "action")
-_EXECUTION_FIELDS = ("chunk_size", "padding_rows", "padding_budget")
-_RESOLVED_FIELDS = ("logical_len", "execution_len", "chunk_size", "padding_rows")
-_RESOLVED_OPTIONAL_FIELDS = ("execution_alignment",)
 
 
-def _execution_capabilities(owner: Any, *, entry_point: str):
-    """Return the external runtime's declared stage/field support."""
-    raw = getattr(owner, "_rpu_execution_capabilities", _MISSING)
-    if raw is _MISSING:
-        raise ValueError(
-            f"{entry_point}: non-empty rpu_execution requires "
-            "_rpu_execution_capabilities on the runtime factory and returned "
-            "runtime"
-        )
-    if not isinstance(raw, Mapping):
-        raise TypeError(
-            f"{entry_point}: _rpu_execution_capabilities must be a mapping"
-        )
-    unknown_stages = set(raw) - set(_EXECUTION_STAGES)
-    if unknown_stages:
-        raise ValueError(
-            f"{entry_point}: capability has unknown stage(s) "
-            f"{sorted(map(str, unknown_stages))}"
-        )
-    supported: dict[str, tuple[str, ...]] = {}
-    for stage, fields in raw.items():
-        if (
-            isinstance(fields, (str, bytes))
-            or not isinstance(fields, Collection)
-        ):
-            raise TypeError(
-                f"{entry_point}: capability for {stage!r} must be a "
-                "collection of field names"
-            )
-        unknown_fields = set(fields) - set(_EXECUTION_FIELDS)
-        if unknown_fields:
-            raise ValueError(
-                f"{entry_point}: capability for {stage!r} has unknown "
-                f"field(s) {sorted(map(str, unknown_fields))}"
-            )
-        supported[stage] = tuple(
-            field for field in _EXECUTION_FIELDS if field in fields
-        )
-    return supported
-
-
-def _resolved_execution_generation(runtime: Any, *, entry_point: str) -> int:
-    raw = getattr(runtime, "_rpu_execution_resolved_generation", _MISSING)
-    if raw is _MISSING:
-        return -1
-    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
-        raise TypeError(
-            f"{entry_point}: _rpu_execution_resolved_generation must be a "
-            "non-negative integer"
-        )
-    return raw
-
-
-def _validate_resolved_execution(
-    runtime: Any,
-    requested,
-    *,
-    previous_generation: int,
-    entry_point: str,
-):
-    """Validate post-dispatch telemetry against the cold request."""
-    generation = _resolved_execution_generation(
-        runtime, entry_point=entry_point
+def _normalize_execution(value, *, entry_point):
+    from rpu_backend.adapters.rhinovla.runtime import (
+        RHINOVLA_EXECUTION_COMPONENTS,
     )
-    if generation <= previous_generation:
-        raise RuntimeError(
-            f"{entry_point}: runtime did not publish a fresh resolved execution "
-            "plan; _rpu_execution_resolved_generation must strictly increase "
-            "during this dispatch"
-        )
-    raw = getattr(runtime, "_rpu_execution_resolved", _MISSING)
-    if raw is _MISSING:
-        raise RuntimeError(
-            f"{entry_point}: runtime did not publish "
-            "_rpu_execution_resolved after execution"
-        )
-    if not isinstance(raw, Mapping):
-        raise TypeError(
-            f"{entry_point}: _rpu_execution_resolved must be a mapping"
-        )
-    resolved: dict[str, dict[str, int]] = {}
-    for stage, config in requested.items():
-        plan = raw.get(stage)
-        if not isinstance(plan, Mapping):
-            raise RuntimeError(
-                f"{entry_point}: resolved plan is missing stage {stage!r}"
-            )
-        missing = set(_RESOLVED_FIELDS) - set(plan)
-        unknown = set(plan) - set(_RESOLVED_FIELDS) - set(
-            _RESOLVED_OPTIONAL_FIELDS
-        )
-        if missing or unknown:
-            raise RuntimeError(
-                f"{entry_point}: resolved {stage!r} plan has "
-                f"missing={sorted(missing)} unknown={sorted(map(str, unknown))}"
-            )
-        values = {field: plan[field] for field in _RESOLVED_FIELDS}
-        for field in _RESOLVED_OPTIONAL_FIELDS:
-            if field in plan:
-                values[field] = plan[field]
-        if any(isinstance(value, bool) or not isinstance(value, int)
-               for value in values.values()):
-            raise TypeError(
-                f"{entry_point}: resolved {stage!r} plan values must be integers"
-            )
-        logical = values["logical_len"]
-        execution = values["execution_len"]
-        chunk = values["chunk_size"]
-        padding = values["padding_rows"]
-        execution_alignment = values.get("execution_alignment", 1)
-        if (
-            logical < 0
-            or execution < logical
-            or padding < 0
-            or execution != logical + padding
-            or execution_alignment <= 0
-            or execution % execution_alignment != 0
-            or chunk <= 0
-            or chunk % 16 != 0
-        ):
-            raise RuntimeError(
-                f"{entry_point}: invalid resolved {stage!r} plan {values}"
-            )
-        requested_chunk = config.get("chunk_size")
-        requested_padding = config.get("padding_rows")
-        padding_budget = config.get("padding_budget")
-        mandatory_padding = (-logical) % execution_alignment
-        optional_padding = padding - mandatory_padding
-        if isinstance(requested_chunk, int) and chunk != requested_chunk:
-            raise RuntimeError(
-                f"{entry_point}: resolved {stage!r} chunk_size={chunk} does "
-                f"not match exact request {requested_chunk}"
-            )
-        if isinstance(requested_padding, int) and padding != requested_padding:
-            raise RuntimeError(
-                f"{entry_point}: resolved {stage!r} padding_rows={padding} "
-                f"does not match exact request {requested_padding}"
-            )
-        if (
-            isinstance(padding_budget, int)
-            and optional_padding > padding_budget
-        ):
-            raise RuntimeError(
-                f"{entry_point}: resolved {stage!r} optional padding="
-                f"{optional_padding} (total={padding}, mandatory="
-                f"{mandatory_padding}, alignment={execution_alignment}) "
-                f"exceeds budget {padding_budget}"
-            )
-        resolved[stage] = values
-    return resolved
+    from rpu_backend.api._execution import normalize_rpu_execution
+
+    return normalize_rpu_execution(
+        value,
+        entry_point=entry_point,
+        supported_components=RHINOVLA_EXECUTION_COMPONENTS,
+    )
 
 
 def _resolve_runtime_factory(target: RuntimeFactory) -> Callable[..., Any]:
@@ -193,6 +51,13 @@ def _resolve_runtime_factory(target: RuntimeFactory) -> Callable[..., Any]:
     return factory
 
 
+def _bound_execution_request(runtime, value):
+    """Fill only cold defaults captured by this runtime, never re-read env."""
+    normalized = _normalize_execution(value, entry_point="RhinoVLAPolicy.from_runtime")
+    snapshot = getattr(runtime, "_pipeline_cold_config", None)
+    return normalized if snapshot is None else snapshot.bind_defaults(normalized)
+
+
 class RhinoVLAPolicy:
     """Stable policy facade around a model-repository-owned RhinoVLA runtime."""
 
@@ -213,22 +78,8 @@ class RhinoVLAPolicy:
         if isinstance(runtime, cls):
             if rpu_execution is None:
                 return runtime
-            from rpu_backend.api._execution import normalize_rpu_execution
-            requested = normalize_rpu_execution(
-                rpu_execution,
-                entry_point="RhinoVLAPolicy.from_runtime",
-            )
-            if requested:
-                supported = _execution_capabilities(
-                    runtime._runtime,
-                    entry_point="RhinoVLAPolicy.from_runtime",
-                )
-                requested = normalize_rpu_execution(
-                    requested,
-                    entry_point="RhinoVLAPolicy.from_runtime",
-                    supported=supported,
-                )
-            existing = normalize_rpu_execution(
+            requested = _bound_execution_request(runtime._runtime, rpu_execution)
+            existing = _normalize_execution(
                 getattr(runtime, "_rpu_execution", None),
                 entry_point="RhinoVLAPolicy.from_runtime",
             )
@@ -237,7 +88,6 @@ class RhinoVLAPolicy:
                     "RhinoVLAPolicy.from_runtime: rpu_execution conflicts with "
                     "the existing policy configuration"
                 )
-            runtime._rpu_execution_handshake_required = bool(requested)
             return runtime
         if not callable(getattr(runtime, "predict", None)):
             raise TypeError(
@@ -245,32 +95,22 @@ class RhinoVLAPolicy:
             )
         policy = cls.__new__(cls)
         policy._runtime = runtime
-        from rpu_backend.api._execution import normalize_rpu_execution
+        controller = getattr(runtime, "_rhinovla_execution_controller", None)
         existing_raw = getattr(runtime, "_rpu_execution", _MISSING)
-        requested = normalize_rpu_execution(
+        requested = _bound_execution_request(
+            runtime,
             rpu_execution if rpu_execution is not None else (
                 existing_raw if existing_raw is not _MISSING else None
             ),
-            entry_point="RhinoVLAPolicy.from_runtime",
         )
-        if requested:
-            supported = _execution_capabilities(
-                runtime,
-                entry_point="RhinoVLAPolicy.from_runtime",
-            )
-            requested = normalize_rpu_execution(
-                requested,
-                entry_point="RhinoVLAPolicy.from_runtime",
-                supported=supported,
-            )
-        if rpu_execution is not None and existing_raw is _MISSING and requested:
+        if controller is None:
             raise ValueError(
-                "RhinoVLAPolicy.from_runtime: non-empty rpu_execution was not "
-                "consumed by the runtime; the runtime must expose its effective "
-                "configuration as _rpu_execution"
+                "RhinoVLAPolicy.from_runtime: the runtime must call "
+                "bind_rhinovla_execution_runtime() with its explicit text, "
+                "vision, and action children"
             )
         if existing_raw is not _MISSING:
-            existing = normalize_rpu_execution(
+            existing = _normalize_execution(
                 existing_raw,
                 entry_point="RhinoVLAPolicy.from_runtime",
             )
@@ -281,11 +121,41 @@ class RhinoVLAPolicy:
                 )
             requested = existing
         policy._rpu_execution = requested
-        policy._rpu_execution_handshake_required = (
-            rpu_execution is not None and bool(requested)
-        )
+        policy._rhinovla_execution_controller = controller
+        if controller is not None:
+            if controller.runtime is not runtime:
+                raise ValueError(
+                    "RhinoVLAPolicy.from_runtime: execution controller owns a "
+                    "different runtime"
+                )
+            policy._execution_session = controller.session
+            controller.session.register_config_view(policy)
         policy._last_rpu_execution_plan = {}
         return policy
+
+    @classmethod
+    def _from_factory_runtime(cls, runtime, *, rpu_execution):
+        try:
+            return cls.from_runtime(runtime, rpu_execution=rpu_execution)
+        except BaseException as error:
+            from rpu_backend.adapters.rhinovla.runtime import (
+                _RhinoVLAExecutionController,
+                close_rhinovla_runtime,
+            )
+
+            controller = getattr(runtime, "_rhinovla_execution_controller", None)
+            owns_children = bool(vars(runtime).get("_rhinovla_retirement_children"))
+            if ((isinstance(controller, _RhinoVLAExecutionController)
+                 and getattr(controller, "runtime", None) is runtime)
+                    or owns_children):
+                try:
+                    if isinstance(controller, _RhinoVLAExecutionController):
+                        controller.close()
+                    else:
+                        close_rhinovla_runtime(runtime)
+                except BaseException as cleanup_error:
+                    error.add_note(f"RhinoVLA factory cleanup failed: {cleanup_error!r}")
+            raise
 
     @classmethod
     def from_factory(
@@ -295,32 +165,23 @@ class RhinoVLAPolicy:
         *,
         rpu_execution=None,
     ) -> "RhinoVLAPolicy":
-        """Build from the runtime contract ``factory(config) -> runtime``."""
+        """Build through a factory that binds all three physical children.
+
+        The factory always receives canonical ``rpu_execution`` (including
+        the empty mapping for AUTO) and must call
+        ``bind_rhinovla_execution_runtime`` before returning.
+        """
         if not isinstance(config, Mapping):
             raise TypeError(
                 f"RhinoVLA factory config must be a mapping, got {type(config).__name__}"
             )
-        from rpu_backend.api._execution import normalize_rpu_execution
-        execution_config = normalize_rpu_execution(
+        execution_config = _normalize_execution(
             rpu_execution,
             entry_point="RhinoVLAPolicy.from_factory",
         )
         factory = _resolve_runtime_factory(runtime_factory)
-        if execution_config:
-            execution_config = normalize_rpu_execution(
-                execution_config,
-                entry_point="RhinoVLAPolicy.from_factory",
-                supported=_execution_capabilities(
-                    factory,
-                    entry_point="RhinoVLAPolicy.from_factory",
-                ),
-            )
-        runtime = (
-            factory(config, rpu_execution=execution_config)
-            if rpu_execution is not None
-            else factory(config)
-        )
-        return cls.from_runtime(
+        runtime = factory(config, rpu_execution=execution_config)
+        return cls._from_factory_runtime(
             runtime,
             rpu_execution=execution_config if rpu_execution is not None else None,
         )
@@ -340,7 +201,9 @@ class RhinoVLAPolicy:
         The factory receives ``pretrained_name_or_path`` as its first argument.
         When supplied, ``config`` is forwarded as a keyword argument. Loading,
         irreversible RPU conversion, and input-envelope validation remain the
-        factory's responsibility.
+        factory's responsibility. It always receives canonical
+        ``rpu_execution`` and must bind the explicit text, vision, and action
+        children before returning.
         """
         if isinstance(pretrained_name_or_path, str):
             path_value = pretrained_name_or_path
@@ -358,21 +221,11 @@ class RhinoVLAPolicy:
             )
         if not path_value:
             raise ValueError("RhinoVLA pretrained_name_or_path must not be empty")
-        from rpu_backend.api._execution import normalize_rpu_execution
-        execution_config = normalize_rpu_execution(
+        execution_config = _normalize_execution(
             rpu_execution,
             entry_point="RhinoVLAPolicy.from_pretrained",
         )
         factory = _resolve_runtime_factory(runtime_factory)
-        if execution_config:
-            execution_config = normalize_rpu_execution(
-                execution_config,
-                entry_point="RhinoVLAPolicy.from_pretrained",
-                supported=_execution_capabilities(
-                    factory,
-                    entry_point="RhinoVLAPolicy.from_pretrained",
-                ),
-            )
         if config is not None:
             if not isinstance(config, Mapping):
                 raise TypeError(
@@ -382,10 +235,9 @@ class RhinoVLAPolicy:
             if "config" in factory_kwargs:
                 raise TypeError("RhinoVLA factory received duplicate config")
             factory_kwargs["config"] = config
-        if rpu_execution is not None:
-            factory_kwargs["rpu_execution"] = execution_config
+        factory_kwargs["rpu_execution"] = execution_config
         runtime = factory(pretrained_name_or_path, **factory_kwargs)
-        return cls.from_runtime(
+        return cls._from_factory_runtime(
             runtime,
             rpu_execution=execution_config if rpu_execution is not None else None,
         )
@@ -395,13 +247,65 @@ class RhinoVLAPolicy:
         """Return the wrapped runtime for model-specific diagnostics."""
         return self._runtime
 
+    def close(self) -> None:
+        """Delegate native retirement to the actual repository-owned parent.
+
+        An external runtime's optional hook retains its historical contract;
+        a facade-only Session close is not evidence of physical device release.
+        """
+        from rpu_backend.adapters.rhinovla.runtime import (
+            _RhinoVLAExecutionController, _retirement_failure,
+        )
+
+        controller = self._rhinovla_execution_controller
+        if isinstance(controller, _RhinoVLAExecutionController):
+            if (getattr(controller, "runtime", None) is not self._runtime
+                    or getattr(controller, "session", None) is not self._execution_session):
+                error = RuntimeError("RhinoVLA facade retirement authority changed")
+                _retirement_failure(self._runtime, error)
+                raise error
+            controller.close()
+            return
+        retire = getattr(self._runtime, "close", None)
+        session = self._execution_session
+        with session._lock:
+            runtime_state = vars(self._runtime)
+            failed = runtime_state.get("_rhinovla_facade_retirement_failed")
+            if failed is not None:
+                raise RuntimeError(
+                    "RhinoVLA external retirement already failed; restart the process"
+                ) from failed
+            if runtime_state.get("_rhinovla_facade_retired"):
+                session.shutdown()
+                return
+            if session._active:
+                raise RuntimeError("cannot close RhinoVLA during a forward")
+            from rpu_backend.api._execution import _require_execution_process_safe
+            _require_execution_process_safe()
+            try:
+                if callable(retire):
+                    retire()
+                runtime_state["_rhinovla_facade_retired"] = True
+                # The external hook may own this same Session. A second,
+                # idempotent shutdown is safe; nesting the hook inside shutdown
+                # would skip its physical retirement.
+                session.shutdown()
+            except BaseException as error:
+                runtime_state.setdefault(
+                    "_rhinovla_facade_retirement_failed", error
+                )
+                _retirement_failure(self._runtime, error)
+                raise
+
     @property
-    def last_rpu_execution_plan(self) -> dict[str, dict[str, int]]:
+    def last_rpu_execution_plan(self) -> dict[str, dict[str, Any]]:
         """Return a detached copy of the last validated per-stage plan."""
-        return {
-            stage: dict(fields)
-            for stage, fields in self._last_rpu_execution_plan.items()
-        }
+        return copy.deepcopy(self._last_rpu_execution_plan)
+
+    def _collect_execution_receipts(self) -> None:
+        controller = self._rhinovla_execution_controller
+        if controller is not None:
+            self._last_rpu_execution_plan = controller.collect_receipts()
 
     def prepare_graphs(self, **request: Any) -> Any:
         """Prepare the runtime's finite graph profile for a representative request."""
@@ -410,37 +314,35 @@ class RhinoVLAPolicy:
             raise TypeError(
                 "RhinoVLA runtime does not provide prepare_graphs(**request)"
             )
-        if self._rpu_execution_handshake_required:
-            previous_generation = _resolved_execution_generation(
-                self._runtime,
-                entry_point="RhinoVLAPolicy.prepare_graphs",
-            )
-        result = prepare(**request)
-        if self._rpu_execution_handshake_required:
-            self._last_rpu_execution_plan = _validate_resolved_execution(
-                self._runtime,
-                self._rpu_execution,
-                previous_generation=previous_generation,
-                entry_point="RhinoVLAPolicy.prepare_graphs",
-            )
+        from rpu_backend.api._execution import execution_guard
+
+        with execution_guard(self._runtime):
+            if self._rhinovla_execution_controller is not None:
+                self._rhinovla_execution_controller.clear_receipts()
+            result = prepare(**request)
+            self._collect_execution_receipts()
         return result
 
     def predict(self, **request: Any) -> Any:
         """Run one complete RhinoVLA request and return its action chunk."""
-        if self._rpu_execution_handshake_required:
-            previous_generation = _resolved_execution_generation(
-                self._runtime,
-                entry_point="RhinoVLAPolicy.predict",
-            )
-        result = self._runtime.predict(**request)
-        if self._rpu_execution_handshake_required:
-            self._last_rpu_execution_plan = _validate_resolved_execution(
-                self._runtime,
-                self._rpu_execution,
-                previous_generation=previous_generation,
-                entry_point="RhinoVLAPolicy.predict",
-            )
+        from rpu_backend.api._execution import execution_guard
+
+        with execution_guard(self._runtime):
+            if self._rhinovla_execution_controller is not None:
+                self._rhinovla_execution_controller.clear_receipts()
+            result = self._runtime.predict(**request)
+            self._collect_execution_receipts()
         return result
+
+    def reconfigure(self, rpu_execution) -> Mapping[str, Any]:
+        """Atomically update one or more RhinoVLA physical children."""
+        if self._rhinovla_execution_controller is None:
+            raise RuntimeError(
+                "RhinoVLAPolicy.reconfigure requires a bound RhinoVLA runtime"
+            )
+        from rpu_backend.api._execution import reconfigure_rpu_execution
+
+        return reconfigure_rpu_execution(self._runtime, rpu_execution)
 
     def predict_action_chunk(self, **request: Any) -> Any:
         """VLA-policy spelling of :meth:`predict`."""

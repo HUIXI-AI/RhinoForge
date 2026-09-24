@@ -1,4 +1,8 @@
-"""Adapter registration and lazy discovery.
+"""rpu_backend.runtime.registry — canonical adapter registry + discovery.
+
+Per ADR §6.4 + DELETION-LEDGER §D3 (v5.0 final form). Consolidates
+`core/registry/{_state,discover,__init__}.py` + `_internal/registry.py`
+into a single flat module. Module-level symbols only (no nested package).
 
 Public API (stable): register_adapter, get_adapter, list_adapters.
 Discovery bootstrap: discover_all (called once from rpu_backend/__init__.py).
@@ -6,7 +10,7 @@ Built-in adapters are registered as lazy module targets; importing the backend
 does not import model adapters or install their class-level patches.
 
 Internal: ADAPTERS dict + _register_plugin_adapter_with_snapshot factory
-(consumed by entry-point discovery).
+(consumed by discover_entry_points + select test hooks).
 """
 from __future__ import annotations
 
@@ -57,7 +61,10 @@ def register_adapter(arch_string: str, adapter_cls) -> None:
 
 
 def get_adapter(arch_string: str):
-    """Return the adapter class or raise ``UnsupportedModelError``."""
+    """Return the adapter class for `arch_string`, else raise UnsupportedModelError.
+
+    REG-07: message cites sorted(list_adapters()) + docs/api_reference.md#Migration.
+    """
     from rpu_backend.runtime import UnsupportedModelError
     with _REGISTRY_LOCK:
         adapter = ADAPTERS.get(arch_string)
@@ -70,8 +77,7 @@ def get_adapter(arch_string: str):
             raise UnsupportedModelError(
                 f"No RPU adapter registered for HF architecture {arch_string!r}. "
                 f"Registered archs: {sorted(list_adapters())}. "
-                "See docs/api_reference.md#adapter-registry-and-plugins and "
-                "docs/model_porting.md#6-register-the-adapter."
+                f"See docs/api_reference.md#Migration for supported models and porting guide."
             )
         if not isinstance(adapter, _LazyAdapter):
             return adapter
@@ -94,7 +100,7 @@ def get_adapter(arch_string: str):
 
 
 def list_adapters() -> list[str]:
-    """Return registered HF architecture names in insertion order."""
+    """Return registered HF architecture names in insertion order (D-4-12)."""
     with _REGISTRY_LOCK:
         return list(ADAPTERS.keys())
 
@@ -102,14 +108,15 @@ def list_adapters() -> list[str]:
 def _register_plugin_adapter_with_snapshot(builtin_snapshot):
     """Factory: returns a register callable that refuses any arch in `builtin_snapshot`.
 
-    Discovery snapshots built-in names before loading entry points, then gives
-    each plugin a namespace whose ``register_adapter`` uses this closure.
+    D-4-04: discover.py's discover_entry_points() takes ADAPTERS.keys() snapshot
+    BEFORE iterating entry_points, then feeds each plugin's register callable a
+    SimpleNamespace whose register_adapter is this snapshot-closure.
     """
     def register_plugin_adapter(arch: str, cls) -> None:
         if arch in builtin_snapshot:
             raise RuntimeError(
                 f"{arch} is a built-in; plugins cannot override. "
-                "See docs/api_reference.md#adapter-registry-and-plugins."
+                f"See docs/api_reference.md#Migration for supported override paths."
             )
         register_adapter(arch, cls)
     return register_plugin_adapter
@@ -150,11 +157,14 @@ def discover_in_tree(
 
 
 def discover_entry_points() -> None:
-    """Explicitly load ``rpu_backend.plugins`` and reject shadow attempts.
+    """Explicitly load rpu_backend.plugins; reject shadow attempts (REG-03).
 
-    Registration collisions propagate as ``RuntimeError``. Other plugin
-    failures become ``ImportWarning`` so one optional plugin cannot break the
-    backend import.
+    WR-01 resilience: REG-03 RuntimeError (shadow + plugin-vs-plugin collision,
+    per D-4-04 "at init, stays raised") propagates. Any OTHER exception from a
+    broken third-party plugin (ImportError, ValueError, bad signature, etc.) is
+    downgraded to an ImportWarning so a single bad plugin does NOT crash the
+    whole library import — this matches REG-06's "library stays functional
+    when an optional dep is missing" resilience goal.
     """
     global _PLUGINS_DISCOVERED
     with _REGISTRY_LOCK:
@@ -167,7 +177,8 @@ def discover_entry_points() -> None:
                 register_callable = ep.load()
                 register_callable(api)
             except RuntimeError:
-                # Propagate rejected overrides and duplicate registrations.
+                # REG-03 shadow raise (and plugin-vs-plugin duplicate-class raise)
+                # — propagate so a rejected mutation is never hidden.
                 raise
             except Exception as _e:
                 # All other plugin-authoring errors: warn + continue so one

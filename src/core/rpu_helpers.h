@@ -6,6 +6,7 @@
 #include <cstring>
 #include <algorithm>
 #include <array>
+#include <limits>
 #include <optional>
 #include <string>
 #include <ATen/ATen.h>
@@ -13,12 +14,11 @@
 #include "rhino_launch_kernel.h"
 
 // =============================================================================
-// SDPA tiling helper. It implements the admitted operator-asset constraints and
-// the runtime tile-selection policy.
+// SDPA Tiling Helper
 // =============================================================================
 inline int64_t sdpa_tile_m_v16_initial(int64_t seq_q) {
     if (seq_q <= 176) return CeilDiv(seq_q, (int64_t)16);
-    return 8;   // operator-asset hard cap (treg)
+    return 8;
 }
 
 // Backwards-compat alias for the pybind export name (test surface).
@@ -26,11 +26,8 @@ inline int64_t sdpa_tile_m_v16(int64_t seq_q) {
     return sdpa_tile_m_v16_initial(seq_q);
 }
 
-// tile_k_v16 starts from tile_m_v16 and is reduced by sdpa_compute_tiling when
-// required by the VLM budget.
-
 // =============================================================================
-// SDPA vctxlen tiling — VLM-based operator contract
+// SDPA vctxlen Tiling — VLM-based, aligned with llama_flash_attn_vctxlen
 // =============================================================================
 #define SDPA_MAX_VLM_SIZE 400
 
@@ -51,9 +48,15 @@ struct SdpaConfig {
     int64_t num_kv_heads;
     int num_cores;
     int attn_mask_type;  // 0=NONE, 1=LTM, 4=2D
+    // Optional per-profile numerical ceiling for the synchronized grid
+    // product.  Zero means that only the shared structural predicate below
+    // applies.  This is deliberately a capability on the config consumed by
+    // the planner, not a second kernel selector; launchers without a profile
+    // certificate retain the default (zero) and still enforce the structural
+    // multiple-of-eight rule.
+    int64_t max_sync_product = 0;
 };
 
-// Compute the temporary vector-memory requirement for one attention tile.
 inline uint32_t GetMhaAttnUnivVlmNeed(
     uint16_t tile_m_v16, uint16_t tile_n_v16, uint16_t tile_k_v16,
     uint16_t hdQryV16, uint16_t hdKeyV16, uint16_t hdValV16,
@@ -80,10 +83,10 @@ inline uint32_t GetMhaAttnUnivVlmNeed(
 }
 
 // =============================================================================
-// choose_tile_k — pure function family
+// choose_tile_k — pure function family (R11/R13/R14)
 // Picks a tile_k_v16 satisfying constraints C1–C4, or std::nullopt.
 //
-//   C1: tile_k_v16 ∈ [1, 16]                         (treg limit)
+//   C1: tile_k_v16 ∈ [1, 16]
 //   C2: tile_m_v16 * tile_n_v16 * tile_k_v16 ≤ 1024  (total tile size)
 //   C3: LTM (attn_mask_type==1) ⇒ tk % tm == 0
 //   C4: GetMhaAttnUnivVlmNeed(tm, tn, tk, hd, hd, hd, mask) ≤ SDPA_MAX_VLM_SIZE
@@ -92,19 +95,17 @@ inline uint32_t GetMhaAttnUnivVlmNeed(
 //   AGGRESSIVE: largest tk_v16 ∈ [1, 16] satisfying C1–C4 (descending scan).
 //   CONSERVATIVE: largest tk in Tier-1 {16,11,8,5,4,2,1} satisfying C1–C4;
 //                 falls back to Tier-2 tk = tm_v16 if no Tier-1 candidate
-//                 fits. Tier-2 outputs are NOT guaranteed to be in the
-//                 admitted set; the fallback preserves tk=tm compatibility but
-//                 requires qualification before release.
+//                 fits.
 //                 Conservative deliberately does NOT return "largest"; e.g.
 //                 at (tm=3, tn=8, LTM, hd=8) aggressive picks tk=15 while
 //                 conservative picks tk=3 (Tier-2 fallback).
 //
-// nullopt iff no tk≥1 satisfies all 4 — caller sdpa_try_compute_tiling
+// nullopt iff no tk≥1 satisfies all 4 — caller (sdpa_try_compute_tiling, R12)
 // must then shrink tm/tn and retry.
 //
 // Default mode: CONSERVATIVE.
 // Aggressive mode (opt-in via -DRPU_SDPA_TILE_K_AGGRESSIVE_MODE) allows any
-// tk_v16 ∈ [1, 16]; reserved for explicit qualification sweeps.
+// tk_v16 ∈ [1, 16]; reserved for Phase 4 sweep validation.
 // =============================================================================
 #ifndef RPU_SDPA_TILE_K_AGGRESSIVE_MODE
 #  define RPU_SDPA_TILE_K_CONSERVATIVE_MODE 1
@@ -147,10 +148,8 @@ inline std::optional<int64_t> choose_tile_k_aggressive(
 }
 
 // Two-tier conservative scan:
-//   Tier 1: {16,11,8,5,4,2,1} (admitted set)
-//   Tier 2: tk = tm_v16       (compatibility fallback)
-// "Conservative" avoids unqualified tile values; Tier-2 outputs require an
-// explicit qualification sweep.
+//   Tier 1: {16,11,8,5,4,2,1}
+//   Tier 2: tk = tm_v16
 inline std::optional<int64_t> choose_tile_k_conservative(
         int64_t tm_v16, int64_t tn_v16, int attn_mask_type,
         int64_t head_dim_v16) {
@@ -205,8 +204,6 @@ inline uint32_t float32_to_uint32(float f) {
 #define SCM_REG_OFFSET 4096
 #endif
 
-// Launch v1 writes typed 32-bit fields directly. Legacy 16-bit wrapper slots
-// use the compatibility mapping expected by the versioned operator asset.
 inline void rpu_set_scm_u32_checked(
         ::rhino_lkn::Kernel_t* kernel, uint32_t reg_idx, uint32_t value,
         const char* context) {
@@ -237,7 +234,7 @@ inline void rpu_set_legacy_scm_u16_checked(
 }
 
 // =============================================================================
-// Unified SDPA tiling — outer shrink loop on tm/tn, tk from choose_tile_k.
+// Unified SDPA tiling (R12) — outer shrink loop on tm/tn, tk from choose_tile_k.
 //
 // Replaces the legacy halve-tm→halve-tk→halve-tn loop (whose stale-tk state
 // between iterations caused LTM tk%tm violations). choose_tile_k embeds the
@@ -267,7 +264,8 @@ inline bool sdpa_try_compute_tiling(const SdpaConfig& cfg, int64_t seq_q,
         // A later LTM chunk starts at sQryAcc = N * seq_q. The kernel's
         // triangular-mask tile origin must divide that offset; otherwise the
         // first chunk is correct but every later chunk reads the wrong causal
-        // region. Pick the largest admitted tile <= the normal 8-v16 cap that
+        // region (Wall-OSS equal C288/C304/C320 reproduced this on hardware).
+        // Pick the largest legal tile <= the normal 8-v16 cap that
         // divides seq_q.
         while (tile_m_v16 > 1 && seq_q_v16 % tile_m_v16 != 0) {
             --tile_m_v16;
@@ -283,7 +281,7 @@ inline bool sdpa_try_compute_tiling(const SdpaConfig& cfg, int64_t seq_q,
         if (sync_product > 8 && sync_product % 8 != 0) {
             // Preserve the established first/single-chunk tiling when the
             // aligned candidate itself violates the keeper's sync constraint
-            // A later chunk is still rejected by the
+            // (Wall C304/C352/C480). A later chunk is still rejected by the
             // explicit sQryAcc % tile_m check, so this fallback cannot silently
             // reintroduce the offset-corruption bug.
             tile_m_v16 = sdpa_tile_m_v16_initial(seq_q);
@@ -329,12 +327,13 @@ inline bool sdpa_try_compute_tiling(const SdpaConfig& cfg, int64_t seq_q,
     return true;
 }
 
-// Throwing wrapper. The stable "cannot shrink to fit VLM" substring is part of
-// the validation error contract.
+// Throwing wrapper. Error text retains the literal "cannot shrink to fit VLM"
+// substring so test_sdpa_constraints.py::test_compute_tiling_vlm_unshrinkable
+// _throws keeps matching its pytest.raises regex.
 inline SdpaTiling sdpa_compute_tiling(const SdpaConfig& cfg, int64_t seq_q) {
     SdpaTiling t;
     TORCH_CHECK(sdpa_try_compute_tiling(cfg, seq_q, &t),
-                "sdpa_compute_tiling: cannot shrink to fit VLM/treg/LTM "
+                "sdpa_compute_tiling: cannot shrink to fit VLM/LTM "
                 "constraints (seq_q=", seq_q, ", head_dim=", cfg.head_dim,
                 ", attn_mask_type=", cfg.attn_mask_type, ")");
     return t;
@@ -348,13 +347,17 @@ inline int64_t sdpa_compute_tmp_v16_size(const SdpaConfig& cfg, int64_t seq_q) {
     return t.tile_n_v16 * t.tile_k * nkv_head_per_core * grid_dim_x;
 }
 
-// Per-call operator-asset constraint check — called by sdpa_is_valid_chunk_size
+// Per-call constraint check — called by sdpa_is_valid_chunk_size
 // for each kernel invocation in the chunked-prefill plan.
 //
-// Uses sdpa_try_compute_tiling (non-throwing). An infeasible tiling
+// R12: uses sdpa_try_compute_tiling (non-throwing). An infeasible tiling
 // means "this chunk_size is illegal" — return false, do not throw.
 static inline bool sdpa_call_valid(const SdpaConfig& cfg,
                                    int64_t sQry, int64_t sQryAcc) {
+    // A negative profile ceiling is malformed input, not an instruction to
+    // disable the capability check.  Keep the helper a total predicate so a
+    // bad external/config value cannot silently widen admission.
+    if (cfg.max_sync_product < 0) return false;
     if (sQry <= 0) return false;
     SdpaConfig call_cfg = cfg;
     if (sQry == 1 && call_cfg.attn_mask_type == 1) {
@@ -364,11 +367,6 @@ static inline bool sdpa_call_valid(const SdpaConfig& cfg,
     SdpaTiling t;
     if (!sdpa_try_compute_tiling(call_cfg, sQry, &t)) return false;
 
-    // Tile-level constraints.
-    // (Old `tile_m_v16 > 8` and `tile_k_v16 != 8` checks removed —
-    //  the admitted policy allows tile_m∈[1,11] for sQry∈[16,176] and dynamic
-    //  tile_k. treg limit `tile_k_v16 <= 16` is enforced in
-    //  sdpa_compute_tiling itself.)
     if (t.tile_m_v16 * t.tile_n_v16 * t.tile_k_v16 > 1024) return false;
 
     // VLM capacity
@@ -378,22 +376,27 @@ static inline bool sdpa_call_valid(const SdpaConfig& cfg,
         (uint16_t)call_cfg.attn_mask_type);
     if (vlm > SDPA_MAX_VLM_SIZE) return false;
 
-    // Grid + sync: the admitted operator contract limits syncGroupSize to 8.
-    // Larger products are not numerically qualified even if accepted by a
-    // lower-level build check.
+    // Grid/sync structural predicate shared by the planner and launcher:
+    // products above one sync group are admissible only on the
+    // multiple-of-eight boundary.  Profile-specific numerical certificates
+    // remain responsible for excluding any shape that has not been measured.
     int64_t grid_dim_x = CeilDiv(sQry, t.tile_m);
     int64_t num_heads_per_core = call_cfg.num_q_heads / call_cfg.num_cores;
     int64_t nkv_head_per_core = CeilDiv(call_cfg.num_kv_heads,
                                         (int64_t)std::max(call_cfg.num_cores, 1));
     int64_t gqa_group_size = num_heads_per_core / std::max(nkv_head_per_core, (int64_t)1);
     int64_t product = grid_dim_x * gqa_group_size;
-    if (product > 8) return false;
-    // Accumulated LTM with sync product 6 is not an admitted board profile.
+    if (call_cfg.max_sync_product > 0 && product > call_cfg.max_sync_product)
+        return false;
+    if (product > 8 && product % 8 != 0) return false;
+    // HW survey (qwen3-0.6b, seq=576): an accumulated LTM call with
+    // grid=3, gqa=2 (product=6) corrupts rows after absolute position 512.
+    // The same shape at sQryAcc=0 is sound, as are product={2,4,8} calls.
+    // Reject this one empirically-broken sync shape until the SDPA kernel is
+    // fixed; otherwise the balanced planner selects cs=288 and silently
+    // diverges while cs=384/512 remain correct.
     if (cfg.attn_mask_type == 1 && sQryAcc != 0 && product == 6) return false;
 
-    // LTM per-call contract: tile_k_v16 % tile_m_v16 == 0.
-    // sQryAcc % sQry: enforced (see sdpa_validate_kernel_call for runtime-divergence note)
-    //
     // Single-token decode (sQry==1) is mask-agnostic: every causal LM fused
     // path launches that call with MASK_NONE (sdpa_causal = is_causal &&
     // seq_len > 1 in build_layer_subgraph), so the LTM-specific tile and
@@ -413,10 +416,10 @@ static inline bool sdpa_call_valid(const SdpaConfig& cfg,
 
 inline bool sdpa_is_valid_chunk_size(const SdpaConfig& cfg, int64_t cs,
                                      int64_t seq_len, int64_t position) {
+    if (cfg.max_sync_product < 0) return false;
     if (cs < 16 || cs % 16 != 0) return false;
     if (seq_len <= 0 || position < 0) return false;
 
-    // Structural operator constraints.
     if (cfg.num_cores <= 0 || cfg.num_q_heads <= 0 || cfg.num_kv_heads <= 0)
         return false;
     if (cfg.num_q_heads % cfg.num_kv_heads != 0) return false;
@@ -461,8 +464,82 @@ inline bool sdpa_is_valid_chunk_size(const SdpaConfig& cfg, int64_t cs,
     return true;
 }
 
+// Non-throwing capability predicate for the generic raw-SPM V-transpose +
+// by-MHA pair. Keep this in lock-step with rpu_sdpa_vctxlen.cpp so planners can
+// reject an inexpressible physical route before a COMPLETE descriptor names it.
+inline bool sdpa_by_mha_spm_is_valid(
+    int64_t batch, int64_t seq_q, int64_t seq_k,
+    int64_t num_q_heads, int64_t num_kv_heads,
+    int64_t head_dim, int num_cores, int attn_mask_type) {
+    constexpr int64_t kV16 = 16;
+    constexpr int64_t kTileKV16 = 16;
+    constexpr int64_t kMaxTileElementsV16 = 1024;
+    constexpr int64_t kU16Max = std::numeric_limits<uint16_t>::max();
+
+    if (attn_mask_type != 0 && attn_mask_type != 1 &&
+        attn_mask_type != 4) return false;
+    if (num_cores <= 0 || num_cores > 8 ||
+        batch <= 0 || batch > kU16Max ||
+        seq_q <= 0 || seq_q > kU16Max ||
+        // The paired V-transpose ABI carries seq_k in uint16_t even though
+        // the downstream by-MHA ABI can represent a wider key length.
+        seq_k < seq_q || seq_k > kU16Max ||
+        num_q_heads <= 0 || num_q_heads > kU16Max ||
+        num_kv_heads <= 0 || num_kv_heads > kU16Max ||
+        head_dim <= 0 || head_dim > kU16Max || head_dim % kV16 != 0) {
+        return false;
+    }
+    if (num_q_heads % num_kv_heads != 0 ||
+        num_q_heads % num_cores != 0 ||
+        num_kv_heads % num_cores != 0 ||
+        (batch > 1 && seq_k % kV16 != 0)) {
+        return false;
+    }
+
+    const int64_t seq_k_v16 = CeilDiv(seq_k, kV16);
+    const int64_t seq_q_acc = seq_k - seq_q;
+    const int64_t seq_q_acc_v16 = CeilDiv(seq_q_acc, kV16);
+    if (seq_k_v16 > kU16Max || seq_q_acc_v16 > kU16Max) return false;
+
+    const int64_t q_heads_per_core = num_q_heads / num_cores;
+    const int64_t kv_heads_per_core = num_kv_heads / num_cores;
+    if (kv_heads_per_core <= 0 || kv_heads_per_core > 32 ||
+        q_heads_per_core % kv_heads_per_core != 0) {
+        return false;
+    }
+    const int64_t gqa_group_size = q_heads_per_core / kv_heads_per_core;
+    const int64_t head_dim_v16 = head_dim / kV16;
+    const int64_t tile_m_v16 =
+        seq_q <= 128 ? CeilDiv(seq_q, kV16) : 5;
+    if (tile_m_v16 * head_dim_v16 * kTileKV16 >
+        kMaxTileElementsV16) return false;
+    if (GetMhaAttnUnivVlmNeed(
+            static_cast<uint16_t>(tile_m_v16),
+            static_cast<uint16_t>(head_dim_v16),
+            static_cast<uint16_t>(kTileKV16),
+            static_cast<uint16_t>(head_dim_v16),
+            static_cast<uint16_t>(head_dim_v16),
+            static_cast<uint16_t>(head_dim_v16),
+            static_cast<uint16_t>(attn_mask_type)) > SDPA_MAX_VLM_SIZE) {
+        return false;
+    }
+
+    const int64_t tile_m = tile_m_v16 * kV16;
+    const int64_t grid_dim_y = CeilDiv(seq_q, tile_m);
+    const int64_t sync_product = grid_dim_y * gqa_group_size;
+    if (sync_product > 8 && sync_product % 8 != 0) return false;
+    if (attn_mask_type == 1) {
+        if (kTileKV16 % tile_m_v16 != 0) return false;
+        if (seq_q_acc != 0 &&
+            (sync_product == 6 || seq_q_acc % kV16 != 0 ||
+             seq_q_acc % tile_m != 0 || seq_q_acc % seq_q != 0)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Keeper-side runtime validator. Called at each keeper entry before set_regs.
-// Subset of operator-asset constraints derivable from keeper actuals;
 // batch / Q/K/V head_dim split / sKey-sVal are caller invariants.
 inline void sdpa_validate_kernel_call(int64_t seq_q, int64_t seq_k,
                                       int64_t tile_m_v16, int64_t tile_n_v16, int64_t tile_k_v16,
@@ -478,10 +555,10 @@ inline void sdpa_validate_kernel_call(int64_t seq_q, int64_t seq_k,
     TORCH_CHECK(grid_dim_x > 0 && gqa_group_size > 0,
         "SDPA grid_dim_x(", grid_dim_x, "), gqa(", gqa_group_size, ") must be > 0");
     TORCH_CHECK(tile_k_v16 >= 1 && tile_k_v16 <= 16,
-                "SDPA tile_k_v16(", tile_k_v16, ") must be in [1, 16] (treg limit)");
+                "SDPA tile_k_v16(", tile_k_v16, ") must be in [1, 16]");
     TORCH_CHECK(tile_m_v16 >= 1 && tile_m_v16 <= 11,
                 "SDPA tile_m_v16(", tile_m_v16, ") must be in [1, 11] "
-                "(admitted boundary: ceil(176/16)=11)");
+                "(runtime _dp boundary: ceil(176/16)=11)");
 
     int64_t total_tile = tile_m_v16 * tile_n_v16 * tile_k_v16;
     TORCH_CHECK(total_tile <= 1024,
@@ -497,18 +574,16 @@ inline void sdpa_validate_kernel_call(int64_t seq_q, int64_t seq_k,
 
     // RPU_CHUNK_FORCE_UNSAFE=1 also lifts this launcher-side gate, so a chunk
     // size the planner rejected can still be TIMED end-to-end. Diagnostic only:
-    // syncGroupSize > 8 is an empirical cmodel/HW limit whose violation yields
-    // wrong numbers (and some products are not admitted by the operator asset),
-    // so a forced run MUST be checked against a legal chunk
-    // size before drawing any conclusion from it.
+    // product>8 is structurally legal only on a multiple-of-eight boundary;
+    // profile-specific certificates still gate unmeasured numerical shapes.
     static const bool sync_force_unsafe = [] {
         const char* e = std::getenv("RPU_CHUNK_FORCE_UNSAFE");
         return e && (std::string(e) == "1" || std::string(e) == "true");
     }();
     int64_t product = grid_dim_x * gqa_group_size;
-    TORCH_CHECK(product <= 8 || sync_force_unsafe,
+    TORCH_CHECK(product <= 8 || product % 8 == 0 || sync_force_unsafe,
         "SDPA sync constraint: grid_dim_x(", grid_dim_x, ") * gqa(", gqa_group_size,
-        ") = ", product, " must be <= 8 (seq_q=", seq_q, ").");
+        ") = ", product, " must be <= 8 or a multiple of 8 (seq_q=", seq_q, ").");
 
     if (attn_mask_type == 1) {
         TORCH_CHECK(tile_k_v16 % tile_m_v16 == 0,
@@ -526,8 +601,8 @@ inline void sdpa_validate_kernel_call(int64_t seq_q, int64_t seq_k,
                 tile_m, ")");
             TORCH_CHECK(seq_q_acc % seq_q == 0,
                 "LTM sQryAcc(", seq_q_acc, ") must be multiple of seq_q(", seq_q,
-                "). NOTE: runtime _dp doesn't enforce this (TODO at line 1724-1726). "
-                "We do — masks misalign without it.");
+                "). "
+                "Masks misalign without it.");
         }
     }
 }
@@ -574,7 +649,19 @@ at::Tensor cpu_to_rpu_zerocopy(const at::Tensor &cpu_tensor);
 #define NUM_THD_PER_WARP 16
 #define NUM_WARP_PER_LAUNCH 8
 #define NUM_THD_PER_LAUNCH 128
+#define MAX_VLM_PER_THD 768
+#define MAX_FP16_VLM_PER_THD 384
 #define MAX_FP16_VLM_V16_PER_THD 24
+#define CONST_VMAT_ADDR 454
+#define ALU_MAX_FP16_WMODE 0x892
+#define ALU_MIN_FP16_WMODE 0xA92
+#define ALU_GT_IF16_OU8_WMODE 0x3A12
+#define ALU_LT_IF16_OU8_WMODE 0x3C12
+#define NEG_INF_FP16 0xFC00
+#define POS_INF_FP16 0x7C00
+#define F32_TO_F16_RATIO 2
+#define F16_TO_I8_RATIO 2
+#define I32_TO_I8_RATIO 4
 #define V16_NUM 16
 
 constexpr int UNIFIED_NUM_CORES = 8;

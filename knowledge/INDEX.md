@@ -10,8 +10,7 @@ and source remain authoritative; see [the schema](SCHEMA.md) and
   Graph/batch execution, and DMA ownership.
 - [API reference](../docs/api_reference.md): supported Python and `torch.rpu`
   surfaces.
-- [Model support](../docs/model_support.md): exact public profile status and
-  limits.
+- [Examples](../docs/model_support.md): example entry points, configuration layout, and runtime admission boundaries.
 - [Model porting](../docs/model_porting.md): capability classification,
   implementation path, and verification gates.
 - [Capability review](../docs/model_porting_capability_review.md): six-phase
@@ -19,14 +18,13 @@ and source remain authoritative; see [the schema](SCHEMA.md) and
 - [Decoder step-by-step](../docs/new_model_step_by_step.md): minimal
   Adapter-only CausalLM checklist.
 - [Porting pitfalls](../docs/pitfalls.md): focused correctness triage.
-- [Getting started](../docs/getting_started.md): installation and first
-  inference.
-- [Restricted runtime assets](../docs/runtime_assets.md): versioned runtime set,
-  checksum, installation, and revocation.
+- [Getting started](../docs/getting_started.md): installation, metadata checks
+  without device access, and first inference.
+- [Restricted runtime assets](../docs/runtime_assets.md): matching external
+  runtime packages, provider integrity checks, and installation.
 - [Model execution and profiling](../docs/model_testing.md): direct examples,
   TOML runner, and profiling.
-- [Model validation policy](../docs/validation_policy.md): independent hard
-  semantic, implementation-parity, task-quality, and lifecycle gates.
+- [Model validation policy](../docs/validation_policy.md): proportionate host and hardware checks, numerical records and stop conditions.
 - [Runtime configuration](../docs/runtime_config.md): supported controls,
   defaults, lifecycle, and risk.
 - [Performance measurement](../docs/performance.md): correctness-first,
@@ -38,31 +36,33 @@ and source remain authoritative; see [the schema](SCHEMA.md) and
 ## Concepts
 
 - [SPM allocation](concepts/spm-allocation.md): buffer lifetimes, planning, and
-  capacity admission.
-- [GraphCache capture](concepts/graphcache-capture.md): BUILD/REPLAY lifecycle
-  and signature correctness.
+  capacity admission and standalone layout rebuilding.
+- [GraphCache capture](concepts/graphcache-capture.md): BUILD/REPLAY lifecycle,
+  signature correctness, policy inheritance, and failure cleanup.
 - [DDR/SPM DMA wrappers](concepts/ddr-dma-wrappers.md): fixed, mutable, and
   immediate address ownership.
-- [KV cache](concepts/kv-cache.md): sizing, position, and model state.
+- [KV cache](concepts/kv-cache.md): sizing, position, transactional prefix
+  replacement, and model state.
 - [Weight swizzle](concepts/weight-swizzle.md): exactly-once layout conversion.
 - [Multi-core broadcast](concepts/multicore-broadcast.md): safe immediate and
   batched launch behavior.
 - [Multimodal rotary positions](concepts/mrope.md): three-axis position input,
-  section, padding, and Graph contracts.
+  section, padded position slots, Graph contracts, and inference-tensor keepalive refresh.
 - [Attention layout boundaries](concepts/sdpa-layout.md): unified and PyTorch
   layout conversion without exposing cache storage internals.
 - [Host launch runtime boundary](concepts/launch-runtime.md): restricted library
-  dependency, public wrapper contract, queue ownership, and hardware profiling.
+  dependency, public wrapper contract, queue ownership, and buffer lifetime.
 - [Runtime profiles](concepts/runtime-profiles.md): profile identity,
-  configuration precedence, lifecycle, and safe change classification.
+  configuration precedence, cold owner binding, host settings, lifecycle, and safe change classification.
 - [Chunk planning and admitted envelopes](concepts/chunk-plan-and-envelope.md):
   logical versus physical lengths, planning feasibility, padding ownership,
-  and profile admission.
+  decode override semantics, and profile admission.
 - [Three-stage chunk execution](concepts/three-stage-chunk-plan.md): shared
   input/QKV/compute schedules, semantic spans, exact plan identity, and
   attention-storage fallback.
 - [Multi-component ownership and handoff](concepts/component-handoff.md):
-  Graph, SPM, DMA, output, and teardown boundaries between model components.
+  Graph, SPM, DMA, output, HYViT input admission, and teardown boundaries between
+  model components.
 - [Automatic residual reduction](concepts/allreduce-routing.md): one generated
   eight-core ring route, partial-producer preparation, and Graph ownership.
 - [Generated Linear auto-tiling](concepts/linear-autotiling.md): shared FP16,

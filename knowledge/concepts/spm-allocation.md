@@ -29,6 +29,12 @@ SPM, about 7.9 MiB per core. Capacity is a hard constraint, not a tuning hint.
   with `invalidate_model_state()`.
   [Model porting](../../docs/model_porting.md#4-add-a-fused-subsystem-only-when-required)
 
+When another fused owner changes the SPM generation, a standalone COMPLETE
+plan rebuilds temporary storage at its planned zero base while retaining
+persistent weights. Leased pipeline layouts and legacy append-style callers
+keep their existing allocation authority.
+[Allocation state machine](../../src/core/fused_model_base.cpp)
+
 Before admitting a chunk, verify that the exact `LayoutContext` is represented,
 the manifest fits, aliases do not overlap, and every replay-persistent value is
 declared. [Public C++ contract](../../src/core/fused_model_base.h)

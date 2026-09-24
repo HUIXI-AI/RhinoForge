@@ -232,9 +232,10 @@ void SpmAllocator::reset_all() {
 }
 
 // =============================================================================
-// Instance lifecycle — release the super_persistent floor when no
-// FusedModelBase instance is alive so sequential model loads do not accumulate
-// stale allocations.
+// Instance lifecycle (Task 4.5.1) — release super_persistent floor when no
+// FusedModelBase instance is alive, so cross-load tests in one process don't
+// accumulate stale allocations (root cause of acceptance-test SPM OOM after
+// ~3 sequential Pi0.5 loads).
 // =============================================================================
 
 void SpmAllocator::register_instance() {

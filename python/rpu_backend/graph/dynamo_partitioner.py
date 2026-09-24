@@ -25,11 +25,16 @@ Materialization detection
   - `aten._to_copy.default`     — 当且仅当 device 改变 (跨 device 必 break)
   - `aten.copy_.default`        — 总是切 (in-place,跨 RECORDING 边界语义复杂)
 
-``torch.compile`` on RPU is unsupported
-because adapters already own graph capture and nested capture is unsupported.
+未来可以扩展 conditional break (e.g. RPU→RPU 同 dtype `_to_copy` 不切)。
 
-The lazy-init guard remains available from graph/lazy_init_guard.py because
-every patch_*_for_rpu() uses it on the ordinary eager path.
+
+This frontend is frozen and is not exported from the top-level package.
+Adapter execution already owns Graph capture, so wrapping an adapter in
+another captured region would attempt unsupported nested capture.
+
+The lazy-init guard is NOT part of this frozen surface: it moved to
+graph/lazy_init_guard.py because every patch_*_for_rpu() uses it on the
+ordinary eager path.
 """
 from __future__ import annotations
 from typing import Callable, List, Tuple
@@ -184,9 +189,9 @@ def materialization_breaks_enabled() -> bool:
     """Env gate. **Default OFF** — experimental opt-in only.
 
     Set RPU_DYNAMO_MATERIALIZE_BREAKS=1 to enable partitioner. Default off
-    because the partitioner is currently experimental: a single Dynamo call
-    can match direct capture, but a second call across Dynamo traces may be
-    numerically incorrect and miss replay. Enabling it by default could affect
-    user workloads,
+    because the partitioner is currently experimental:single Dynamo call
+    数值已验证 byte-exact (`test_siglip_dynamo_compile.py` Call 1 matches
+    cache.capture baseline),但跨 Dynamo trace 的第二次 call 数值损坏 + replay
+    不命中,作为 P7.1g known-fail 待跟。**默认开启可能伤真实用户 path**,
     必须用户显式 opt-in 才生效。"""
     return rpu_env_bool("RPU_DYNAMO_MATERIALIZE_BREAKS")

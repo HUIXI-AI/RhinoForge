@@ -1,4 +1,13 @@
-"""Pi0.5 weight preparation for root Linear modules and the multimodal projector."""
+"""Pi0.5 weight-prep helpers: leaf-Linear swizzle + projector pre-swizzle (PI05-01 reshape Plan 03-01).
+
+Per D-3-04 refinement, weight-prep for SigLIP encoder + AdaRMS dense stays in
+sibling converters (siglip_converter.py / adarms_converter.py) through Phase 3;
+Phase 5 absorbs them. This file owns ONLY the 4 PI05Pytorch root-Linear swizzle
+(CR-R5 BLOCKER 1) and the projector pre-swizzle (Pitfall-1 belt for the
+multi_modal_projector).
+
+v5-02 / B3: relocated from transformers/pi05/weights.py to adapters/pi05/weights.py.
+"""
 from __future__ import annotations
 import torch
 import torch.nn as nn
@@ -6,16 +15,32 @@ import torch.nn as nn
 from rpu_backend.runtime.log import _LOG
 
 
-# A leaf `nn.Linear` has no named children, so it must call
-# `transform_linear_weight` directly rather than relying on a recursive walker.
+# =============================================================================
+# CR-R5 BLOCKER 1 (F4 real fix) — direct leaf-Linear swizzle helper.
+#
+# The legacy recursive-walk helper in the model_converter shim (rpu_backend's
+# v4.0 surface) walks `module.named_children()`. A leaf `nn.Linear` has NO
+# children — iteration is empty, function returns WITHOUT touching `.weight.data`.
+# Iteration 3/4 called that recursive-walk helper on each of the 4 root Linears
+# directly,
+# which was therefore a no-op: the 4 root Linears stayed row-major, and the
+# `rpu_linear` kernel read them with the wrong layout -> MSE catastrophic.
+#
+# The correct operation: call `transform_linear_weight` directly on the leaf's
+# `.weight.data`. This helper does exactly that, using the same
+# partition-selection logic the recursive-walk helper would have applied had
+# the Linear been a child of a larger module.
+# =============================================================================
 def _swizzle_leaf_linear(linear: nn.Linear, *, force_col_partition: bool = False) -> int:
     """Swizzle a leaf `nn.Linear`'s weight data IN-PLACE via transform_linear_weight.
 
     Returns the partition chosen (0 = row, 1 = col, -1 = skipped/fallback).
 
-    Uses the normal partition selection for a non-attention,
-    non-{'dense','o_proj','down_proj'} Linear.
+    Uses the same partition-selection as the legacy recursive-walk helper
+    would have applied to a non-attention, non-{'dense','o_proj','down_proj'}
+    Linear — which is exactly what the 4 PI05Pytorch root Linears are.
     """
+    # Phase 12 D-H1: was the model_converter shim multi-import; canonical home is core.weights.
     from rpu_backend.runtime.weights import (
         transform_linear_weight, get_linear_partition, NUM_CORES,
     )
@@ -49,22 +74,27 @@ def _swizzle_leaf_linear(linear: nn.Linear, *, force_col_partition: bool = False
     return partition
 
 
-def swizzle_projector_inplace(projector) -> None:
-    """Pre-swizzle the Pi0.5 SigLIP projector exactly once.
+def swizzle_projector_inplace(projector, *, num_cores=8) -> None:
+    """Pi05-local SigLIP projector pre-swizzle (P1 double-swizzle belt).
 
     Sets `_rpu_weights_converted` sentinel BEFORE move-to-RPU so
-    `_convert_siglip_projector_for_rpu` observes the idempotence marker.
+    `_convert_siglip_projector_for_rpu` (siglip_converter.py:165) sees idempotent.
+    Mirrors `_adapter.py:949-956` Step C verbatim.
+
+    NOTE: `_rpu_weights_converted` is in INTERNAL_HW_ATTRS_TRANSITIONAL (verified
+    in core/runtime/hw_attrs.py:101) — AM-3 guard satisfied; no whitelist
+    extension needed.
     """
-    if hasattr(projector, 'linear') and isinstance(projector.linear, nn.Linear):
-        _swizzle_leaf_linear(projector.linear)
-        projector._rpu_weights_converted = True
-        projector.linear._rpu_weights_converted = True
-    elif isinstance(projector, nn.Linear):
-        _swizzle_leaf_linear(projector)
-        projector._rpu_weights_converted = True
+    from rpu_backend.adapters.siglip import _convert_siglip_projector_for_rpu
+    _convert_siglip_projector_for_rpu(projector, num_cores=num_cores)
 
 
-# Pi0.5-specific safetensors-key remapping from LeRobot keys to the HF layout.
+# =============================================================================
+# D-B3 — Pi0.5 safetensors-key remapping (moved from pi05_converter.py:59 in
+# Phase 5 Plan 05-01). Pi05-specific: renames lerobot's `model.…` keys to
+# the HF Pi0.5 layout that the v4 loader expects. Not a generic
+# `core/weights/` candidate (key rules are Pi05-specific).
+# =============================================================================
 def _remap_and_save(model_path: str, save_path: str):
     """First-time: load original safetensors, remap keys, save as new safetensors."""
     import os
@@ -100,16 +130,19 @@ def _remap_and_save(model_path: str, save_path: str):
     _LOG.info("Done.")
 
 
-# Pi0.5 fused num_steps weight helpers.
+# ----------------------------------------------------------------------
+# Pi0.5 num_steps fuse — weights helpers.
+# Weight preparation shared by the per-step and fused denoise paths.
+# ----------------------------------------------------------------------
 
-def _prepare_final_norm_weights(expert) -> None:
+def _prepare_final_norm_weights(expert, *, num_cores=8) -> None:
     """Swizzle the model's final PiGemmaRMSNorm dense for AdaRMS-style GEMV.
 
     The per-layer AdaRMS converter (adarms.py:_prepare_adarms_dense_weights)
     already registers ``norm._rpu_dense_w_rp`` / ``_rpu_dense_b_rp`` on each
     layer's input/post_attention layernorm. The final norm (``expert.norm``)
     is not touched by that helper — it stays on CPU and runs in Python fp32
-    by default. For the fused denoise step we need it on RPU
+    by default (adarms.py:445). For the fused denoise step we need it on RPU
     in the same row-partition swizzled form.
 
     Idempotent: skips work if buffers are already registered.
@@ -131,7 +164,7 @@ def _prepare_final_norm_weights(expert) -> None:
     orig_w = (norm.dense.weight.detach().cpu()
               .to(dtype=torch.float16).contiguous())
     transformed_w = (transform_linear_weight(orig_w, partition=0,
-                                              num_cores=NUM_CORES)
+                                              num_cores=num_cores)
                      .to('rpu').contiguous())
     orig_b = (norm.dense.bias.detach().cpu()
               .to(dtype=torch.float16).to('rpu').contiguous())
@@ -144,13 +177,13 @@ def _swizzle_action_proj_weights(action_in_proj, action_out_proj) -> None:
 
     K=32 for action_in_proj satisfies num_ele_32B=16 alignment (K%16==0). The
     8-core default converter (root-Linear walker) is bypassed — calling it
-    and this helper would double-swizzle. The transformed
+    AND this helper would double-swizzle (P1 pitfall). The transformed
     weight + bias are moved to RPU fp16. Caller MUST NOT also pass these
     modules through ``_convert_linear_weights_inplace``.
 
     Stored as ``_rpu_w_num_cores_1`` and ``_rpu_bias`` attributes (the bias
-    name avoids colliding with the ``bias`` parameter; the CPU path may still
-    need its CPU copy).
+    name avoids colliding with the legacy ``bias`` parameter — the legacy
+    CPU path may still need its CPU copy for the safety-net baseline run).
 
     Idempotent: skips if attrs already set.
     """
@@ -177,8 +210,14 @@ def _precompute_adarms_cond_all(policy, num_steps: int) -> "torch.Tensor":
     """Precompute the [num_steps, H_ada] adarms_cond tensor on RPU fp16.
 
     The conditioning is deterministic from the time schedule (independent of
-    x_t). ``tvs`` preserves the scalar ``1.0 + s*dt`` sequence, and sin_emb is
-    cast to fp32 before time_mlp_in.
+    x_t), so we materialize all num_steps cond vectors up front. Mirrors the
+    PERF E5 sin_lut precompute in runtime.py::_run_denoise.
+
+    B1·A (2026-05-27): batched over num_steps to collapse 2N CPU linear
+    dispatches into 2 GEMMs. Spec §4 + Rev 4 corrections C1/C2. tvs uses
+    list-comprehension to bit-match `1.0 + s*dt` scalar sequence; sin_emb
+    cast back to fp32 before time_mlp_in to avoid fp64 leak from upstream
+    create_sinusoidal_pos_embedding intermediates.
     """
     import torch
     import torch.nn.functional as F
@@ -196,14 +235,14 @@ def _precompute_adarms_cond_all(policy, num_steps: int) -> "torch.Tensor":
     device = next(policy.time_mlp_in.parameters()).device
     sin_dim = policy.action_in_proj.out_features
 
-    # list-comprehension 精确复刻原标量序列 `1.0 + s * dt`,
+    # Rev 4 C2: list-comprehension精确复刻原标量序列 `1.0 + s * dt`,
     # 避免 arange*dt+1.0 在某些 num_steps 下的浮点序差异.
     tvs = torch.tensor([1.0 + s * dt for s in range(num_steps)],
                        dtype=torch.float32, device=device)               # [num_steps]
     sin_emb = create_sinusoidal_pos_embedding(
         tvs, sin_dim, cfg.min_period, cfg.max_period, device=device)     # [num_steps, sin_dim]
-    # 保留 .type(tvs.dtype) cast；upstream 在 CPU 上用 float64
-    # intermediates，不 cast 会把 fp64
+    # Rev 4 C1: 保留原 .type(tvs.dtype) cast. upstream 在 CPU 上用 float64
+    # intermediates (modeling_pi05.py:88 get_safe_dtype), 不 cast 会把 fp64
     # 喂进 fp32 time_mlp_in.
     sin_emb = sin_emb.type(tvs.dtype)                                    # fp32
 
@@ -215,3 +254,39 @@ def _precompute_adarms_cond_all(policy, num_steps: int) -> "torch.Tensor":
     if cache is not None:
         cache[cache_key] = cond_all_rpu
     return cond_all_rpu
+
+
+@torch.no_grad()
+def _precompute_adarms_table(expert, cond_all, *, dense_w8a16: bool):
+    """CPU-compute fixed-schedule modulation, using the installed dense dtype.
+
+    Layout is [steps, attention/MLP per layer then final norm, scale/shift/gate].
+    Like RhinoVLA's table, CPU fp32 accumulation can differ from the RPU ACC16
+    GEMV/ring. This is a numerical optimization candidate, not bitwise parity.
+    The native cold setter takes its own RPU copy and seals the step count.
+    """
+    from rpu_backend.quant._common import (
+        quantize_linear_per_channel, dequantize_linear_per_channel,
+    )
+
+    cond = cond_all.detach().to(device="cpu", dtype=torch.float16).float()
+    if cond.ndim != 2 or not cond.numel() or not torch.isfinite(cond).all():
+        raise ValueError("Pi0.5 AdaRMS conditioning must be finite nonempty [steps,H]")
+    width = cond.shape[1]
+    norms = [norm for layer in expert.layers for norm in (
+        layer.input_layernorm, layer.post_attention_layernorm)] + [expert.norm]
+    rows = []
+    for norm in norms:
+        weight = norm.dense.weight.detach().to(device="cpu", dtype=torch.float16)
+        bias = norm.dense.bias.detach().to(device="cpu", dtype=torch.float16)
+        if weight.shape != (3 * width, width) or bias.shape != (3 * width,):
+            raise ValueError("Pi0.5 AdaRMS dense must have weight [3H,H], bias [3H]")
+        if dense_w8a16:
+            weight = dequantize_linear_per_channel(*quantize_linear_per_channel(weight))
+        row = torch.nn.functional.linear(cond, weight.float(), bias.float()).half()
+        row[:, :width] += 1.0
+        rows.append(row)
+    table = torch.stack(rows, dim=1).contiguous()
+    if not torch.isfinite(table).all():
+        raise ValueError("Pi0.5 AdaRMS table contains nonfinite values")
+    return table

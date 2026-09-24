@@ -23,8 +23,6 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
-import hashlib
-import secrets
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -123,12 +121,13 @@ def build_plan_for_call(
     impl = getattr(signature, "_impl", signature)
     op_id = getattr(impl, "op_id", 0)
     shapes = tuple(getattr(impl, "shapes", ()))
+    dyn_dims = tuple(getattr(impl, "dyn_dims", ()))
     dtypes = tuple(getattr(impl, "dtypes", ()))
     flags = getattr(impl, "flags", 0)
     sig_branch_key = getattr(impl, "branch_key", branch_key)
     sig_segment_key = getattr(impl, "segment_key", segment_key)
 
-    key = hash((op_id, shapes, dtypes, flags,
+    key = hash((op_id, shapes, dyn_dims, dtypes, flags,
                 sig_branch_key, sig_segment_key)) & 0x7FFFFFFFFFFFFFFF
 
     return GraphPlan(
@@ -159,14 +158,6 @@ _TAG_DICT = -4
 _TAG_END = -5
 
 _HASH_MASK = 0x7FFFFFFFFFFFFFFF
-_OBJECT_ID_KEY = secrets.token_bytes(16)
-
-
-def _opaque_object_id(value: Any) -> int:
-    digest = hashlib.blake2b(
-        str(id(value)).encode("ascii"), key=_OBJECT_ID_KEY, digest_size=8
-    ).digest()
-    return int.from_bytes(digest, "little") & _HASH_MASK
 
 
 def _fnv1a_64_u(s: str) -> int:
@@ -315,8 +306,9 @@ class SignaturePlanner:
         across rebuilds because the C++ impl pointer participates.
         """
         impl = sig._impl
-        return (impl.op_id, tuple(impl.shapes), tuple(impl.dtypes),
-                impl.flags, impl.branch_key, impl.segment_key)
+        return (impl.op_id, tuple(impl.shapes), tuple(impl.dyn_dims),
+                tuple(impl.dtypes), impl.flags, impl.branch_key,
+                impl.segment_key)
 
     # ----- workload kind inference -----
 

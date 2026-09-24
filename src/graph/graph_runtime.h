@@ -13,17 +13,20 @@
 #include "rpu_ops.h"  // KernelId, KernelCache, QueueCache, g_rpu_ddr_flush_enabled 等
 #include "graph/execution_coordinator.h"
 #include "graph/graph_infra.h"
+#include "rpu_dma_endpoint.h"
 
 #include <ATen/core/dispatch/OperatorEntry.h>
 #include <ATen/core/stack.h>
 #include <c10/core/Storage.h>
 
+#include <array>
 #include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <variant>
+#include <vector>
 
 // 前置声明:ChildGraphNodeData 内部要 shared_ptr<RpuKernelGraph>
 class RpuKernelGraph;
@@ -224,7 +227,10 @@ private:
 // constructor are registered. Child graphs are owned by their parent and are
 // released by parent.invalidate(); registering them separately would make a
 // process reset depend on parent/child destruction order.
-std::shared_ptr<RpuKernelGraph> make_registered_rpu_kernel_graph();
+void validate_graph_runtime_policy(const GraphRuntimePolicy& runtime_policy);
+bool prepare_graph_runtime_arenas(const GraphRuntimePolicy& runtime_policy);
+std::shared_ptr<RpuKernelGraph> make_registered_rpu_kernel_graph(
+    GraphRuntimePolicy runtime_policy = {});
 void invalidate_registered_rpu_kernel_graphs();
 
 // Public allocator bindings route through these process-coordinated helpers.
@@ -276,6 +282,17 @@ enum class GraphDdrRegisterRole : uint8_t {
     // include the role byte.
     Int8ModelWeight = 5,
     PerChannelScale = 6,
+    // Raw uint8 storage whose bytes are interpreted by the kernel as FP8.
+    // Append-only: schema-5 policy digests include the numeric role value.
+    Fp8ModelWeight = 7,
+    // Two signed INT4 nibbles in each uint8 container. Never admit this dtype
+    // through the signed INT8 role: its packing/shape is a distinct launcher ABI.
+    PackedInt4ModelWeight = 8,
+    PackedFp4ModelWeight = 9,
+    Fp8BlockScale = 10,
+    // Full-K INT8 accumulation kernels consume exact FP32 scale owners.
+    // Distinct from the FP16 role; append-only for existing policy digests.
+    Fp32PerChannelScale = 11,
 };
 
 enum class GraphDdrRegisterAccess : uint8_t {
@@ -528,6 +545,9 @@ public:
     size_t node_count = 0;
     GraphNodeKindMask kind_mask = 0;
     uint64_t topology_hash = 0;
+    // Actual BUILD order, without addresses. Kernel/Dma advance HWPerf's
+    // per-segment batch_index; Barrier occupies a node but does not advance it.
+    std::vector<GraphNodeKind> node_kinds;
 
     bool contains(GraphNodeKind kind) const {
         return (kind_mask & graph_node_kind_bit(kind)) != 0;
@@ -587,7 +607,7 @@ private:
 
 // Copy backend for a MemcpyNodeData — determined at capture time.
 //   HOST_MEMCPY : fallback ::memcpy (32B 未对齐 / dev_addr 查不到 / 栈上)
-//   DDR_TO_DDR  : 两端 RpuGetDevAddr 命中 → CopyMemoryChannel
+//   DDR_TO_DDR  : 两端 managed DDR endpoint → owner-budget one-shot Queue
 //   DDR_TO_SPM  : reserved;当前 CopyToDevice* 只能整块 SPM↔DDR,不支持 slice
 //   SPM_TO_DDR  : reserved;同上
 //   SPM_TO_SPM  : reserved
@@ -799,12 +819,21 @@ struct ChildGraphNodeData {
 // Branch marker node
 // =============================================================================
 //
-// BranchNode 是显式控制流标记,作为 segment 边界参与 dump 和校验;执行时 no-op。
+// Ordinary Branch nodes delimit segments. The private FMB manifest marker is
+// host-only metadata: it remains in topology/replay but adds no SDK entry.
 // cache 正确性由 GraphSignature.branch_key 承载。
 struct BranchNodeData {
     uint64_t branch_key = 0;
     GraphSignature branch_signature;  // debug only; empty = caller omitted it
     std::string label;                 // optional human-readable debug label
+
+    static constexpr const char* physical_manifest_label() {
+        return "FMB complete physical manifest";
+    }
+    bool is_physical_manifest_metadata() const {
+        return branch_key != 0 && label == physical_manifest_label() &&
+            branch_signature == GraphSignature{};
+    }
 };
 
 // =============================================================================
@@ -1000,7 +1029,8 @@ template <> struct NodeKindOf<BarrierNodeData> {
 };
 
 // =============================================================================
-// Segment（类似子图） — 一组连续、queue_state 兼容的 Kernel/Dma/Barrier nodes。
+// Segment — queue-compatible Kernel/Dma/Barrier nodes, optionally interleaved
+// with authenticated zero-entry FMB manifest metadata.
 // Kernel 可混用不同 core_ids；segment.core_ids 仅记录最大的 queue 执行域，
 // prepare_segment_queue 仍把每个 KernelNodeData.core_ids 单独传给 SDK。
 // =============================================================================
@@ -1008,26 +1038,17 @@ template <> struct NodeKindOf<BarrierNodeData> {
 struct Segment {
     size_t segment_id = 0;                  // segments_ 中的顺序 id,用于 dump / replay 诊断
     size_t start_idx = 0;                   // nodes_ 中的起始下标（含）
-    size_t end_idx = 0;                     // 结束下标（exclusive）；区间仅含 Kernel/Dma/Barrier
+    size_t end_idx = 0;                     // exclusive Graph-node index, including metadata
     std::vector<uint8_t> core_ids;          // Queue_t 构造用的最大 core 执行域
     QueueLaunchState queue_state;           // 本 segment 的 queue 状态
     size_t replay_count = 0;                // 当前 BUILT 期内 replay 次数
     uint64_t signature_layer_hash = 0;       // segment-level layered lookup hash
-    // Queue_t 不再由每个 segment 持有。改用 QueueCache::instance()
-    // .get(core_num) 在 RECORDING/REPLAYING segment loop 内复用 (按 core 数
-    // 全局缓存,最多 8 个 Queue_t)。每段调用前 build_batch() 会 reset 之前
-    // 的 kd_buf。原因:per-segment unique_ptr 在 segments=112 时挂 112 个
-    // Queue_t,直接打爆 SDK BufferPool (pool_size=16)。
-    //
-    // Queue_t 由每个 cache entry 持有 (RpuKernelGraph::private_queue_),
-    // segment 仍不持 Queue_t,但本段 BUILD 时通过 prepare_segment_queue 填
-    // mutable_dmas 槽位（单 build-order vector，Kind 字段区分 src/dst）。
-    // REPLAY 时若 RpuKernelGraph::private_queue_built_segment_idx_ ==
-    // 本段 idx,可走 sync-only fast path (update_dma_kernel + sync_mutable_params
-    // + enqueu_batch),否则 fallback full rebuild。多段 graph 因为 kd_buf
-    // 只能容纳一个段,fallback 路径会循环触发。
+    GraphSegmentCensus census;
+    // BUILD uses one fallback queue. REPLAY can retain independent segment
+    // batches only within the local/process budget; each slot owns its SDK
+    // queue, fixed-DMA bindings, register tokens and instrumentation state.
 
-    // mutable DMA 槽位在 REPLAY 时按 dma_id 顺序 update_dma_kernel。
+    // P2 — 一个 mutable DMA 槽位记录,REPLAY 时按 dma_id 顺序 update_dma_kernel。
     // dma_id 由 add_dma_kernel_mutable 在本段 prepare 调用顺序累加 (0,1,2,...);
     // Fixed DMA / Barrier / Kernel **不增** dma_id (SDK 内部计数与此一致)。
     struct PreparedMutableDmaSlot {
@@ -1037,11 +1058,49 @@ struct Segment {
         Kind     kind;
         const uint64_t* live_base;          // caller-owned uint64_t 指针 (跨 forward 稳定)
         int64_t  live_offset;               // *live_base + live_offset = 本轮 live address
-        RpuDmaEndpoint fixed_endpoint;       // MutableSrc → dst; MutableDst → src
+        // Device address and logical-allocation identity of the fixed side at
+        // the last successful prepare/update.  Replay re-resolves the endpoint
+        // every time; retaining only this witness avoids dereferencing an owner
+        // pointer after the backing Storage has been released.
+        uint64_t fixed_addr;                 // MutableSrc → dst; MutableDst → src
+        uint64_t fixed_allocation_id;
         size_t   bytes;
         uint8_t  channel;
     };
     std::vector<PreparedMutableDmaSlot> mutable_dmas;
+    struct PreparedFixedDmaSlot {
+        size_t node_idx;
+        uint64_t src_addr;
+        uint64_t dst_addr;
+        // Nonzero only for a live logical DDR allocation.  A fixed Graph DMA
+        // may keep the same numeric device address after allocator reuse; these
+        // identities distinguish that ABA case from the original storage.
+        uint64_t src_allocation_id = 0;
+        uint64_t dst_allocation_id = 0;
+        // A retained Queue_t also bakes the transfer topology into kd_buf.
+        // Address identity alone cannot detect a changed byte span or stream.
+        size_t bytes = 0;
+        uint8_t channel = 0;
+    };
+    struct PreparedFixedDmaTable {
+        std::vector<PreparedFixedDmaSlot> bindings;
+        std::vector<RpuDmaAllocationWitness> witnesses;
+    };
+    // A fresh immutable table is published only after a successful prepare.
+    // The queue slot shares that exact table after successful submission, so
+    // object identity proves which cold bindings its batch contains. These
+    // values never prove current allocation lifetime: every replay still
+    // checks actual nodes and reacquires allocator authority and a lease.
+    std::shared_ptr<const PreparedFixedDmaTable> fixed_dma_table;
+};
+
+struct ReplayPlan {
+    const std::vector<GraphNode>* steps = nullptr;
+    const std::vector<Segment>* segments = nullptr;
+
+    size_t steps_size() const { return steps ? steps->size() : 0; }
+    size_t segments_size() const { return segments ? segments->size() : 0; }
+    const Segment& segment_at(size_t i) const { return (*segments)[i]; }
 };
 
 // =============================================================================
@@ -1050,9 +1109,27 @@ struct Segment {
 // execute_graph_for_recording / execute_graph_for_replaying / execute_graph_oneshot
 // 完成后写入;Python 通过 Graph.debug_stats() 读取。
 
+// Process-wide monotonic diagnostic witness; does not initialize the SDK.
+uint64_t rpu_get_hwperf_evidence_failure_total();
+
 struct GraphStats {
+    uint64_t graph_lifetime_id = 0;
+    uint64_t build_generation = 0;
+    uint64_t execution_ordinal = 0;
     size_t kernel_count = 0;            // 所有 Kernel kind 节点数
-    size_t data_node_count = 0;         // Memcpy + Memset 节点数
+    size_t data_node_count = 0;         // All non-Kernel nodes; NOT a DMA count.
+    size_t dma_count = 0;               // Only GraphNodeKind::Dma, direct nodes.
+    size_t barrier_count = 0;
+    size_t child_graph_count = 0;       // Direct occurrences, not unique graphs.
+    // BUILD node order, retaining repeated references to the same actual child.
+    std::vector<uint64_t> child_graph_lifetime_ids;
+    // Lifetime-monotonic, includes actual child execution failures. A cost
+    // sampling window requires zero delta (including exhausted dump budgets).
+    uint64_t hwperf_evidence_failure_total = 0;
+    std::vector<GraphSegmentCensus> segment_census;
+    // Last invocation only, in actual segment/child execution order. Complete
+    // sampling history lives in the existing bounded HWPerf output directory.
+    std::vector<GraphSegmentExecution> last_segment_executions;
     size_t segment_count = 0;           // build_segments_from_nodes 后 segments_ 长度 (= launch 次数)
     std::vector<size_t> per_segment_replay_count;  // mirror segments_[i].replay_count(live)
     size_t boundary_flush_count = 0;    // 上次 flush_boundary_ptrs 去重后刷的 unique ptr 数
@@ -1072,7 +1149,7 @@ struct GraphStats {
     // / replay_stats_refresh 里 reset**,跨整个 graph 生命周期累积,反映 Queue_t
     // 复用效率 (QueueCache::get 命中率)。
     //
-    // Queue_t 按 core_num 全局缓存时的计数语义:
+    // P8.0 修复后语义 (Queue_t 改为按 core_num 全局缓存):
     //   prepared_segment_hit_total : QueueCache.get(core_num) 命中已缓存 Queue_t
     //                                的次数 (segments_launched_via_cached_queue)
     //   prepared_segment_miss_total: QueueCache.get(core_num) 触发 new Queue_t
@@ -1135,7 +1212,7 @@ public:
         REPLAYING
     };
 
-    RpuKernelGraph();
+    explicit RpuKernelGraph(GraphRuntimePolicy runtime_policy = {});
     ~RpuKernelGraph();
     RpuKernelGraph(const RpuKernelGraph&) = delete;
     RpuKernelGraph& operator=(const RpuKernelGraph&) = delete;
@@ -1144,6 +1221,10 @@ public:
 
     static RpuKernelGraph& active();
     static bool has_active();
+
+    const GraphRuntimePolicy& runtime_policy() const {
+        return runtime_policy_;
+    }
 
     // Direct/immediate DMA is Graph-invisible by construction.  Admit it only
     // outside every Graph scope, or for the compatibility suffix of exactly
@@ -1196,7 +1277,7 @@ public:
     // 默认关闭,由调用方显式选择。
     void skip_op_stream_for_fast_replay();
 
-    // Fast replay variant for graphs that carry a post_fn re-emitting
+    // Fast replay variant for graphs that carry a post_fn (D-501) re-emitting
     // its own kernels after the layer body. Instead of pushing cursor_ to the
     // very end (skip_op_stream_for_fast_replay), this advances cursor_ only to
     // the recorded post_fn-start position, so the layer-body re-walk is skipped
@@ -1329,7 +1410,7 @@ public:
     //   RECORDING   : get_program(name) + Kernel_t 独立 clone + push 进 kernels_
     //                 set pending_kernel_name_ + pending_kernel_idx_,后续 enqueue 消费
     //   REPLAYING   : cursor 前向扫下一个 Kernel node,校验 kernel_name 一致
-    // Dynamic callers use this entry point so Graph ownership remains explicit.
+    // 调用者:Op 侧把原先的 KernelCache::instance().get_kernel(name) 换成这个入口。
     ::rhino_lkn::Kernel_t* get_kernel_reset(const std::string& name);
 
     // Typed DDR-register census.  The outer subsystem opens exactly one scope
@@ -1437,7 +1518,7 @@ public:
 
     // ==================== Tensor / SPM 生命周期 ====================
 
-    // 纯生命周期锚点：把 t 的所有权挂到 graph 上，直到
+    // 纯生命周期锚点(docs/pitfalls.md#c-1):把 t 的所有权挂到 graph 上,直到
     // 图真正执行完 —— tensor_refs_ 由 end() 在执行之后才 clear。RECORDING /
     // REPLAYING 之外是 no-op(PASSTHROUGH 下 op 返回前就同步跑完了,没有延迟窗口),
     // 这与 graph_dma::active() 的判据一致。不做 flush:相干性归调用点的
@@ -1477,16 +1558,22 @@ public:
     uint64_t build_topology_hash() const;
     // Cold full-graph node-kind summary for post-BUILD admission checks. This
     // does not expose nodes_, arm topology tracing, or mutate the BUILD seal.
-    // Child graphs are supported even when they carry no signature.
+    // Extracted child graphs are supported even when they carry no signature.
     GraphNodeKindMask build_node_kind_mask() const;
     // Stable identity of the equality-bearing GraphSignature fields. This is
     // available after BUILD (and while that graph is REPLAYING); op_id_str is
     // intentionally excluded just like GraphSignature::operator==.
     uint64_t built_signature_identity() const;
 
-    // Compatibility no-op: Queue_t instances are owned by the process-wide
-    // QueueCache rather than by individual segments.
-    void release_prepared_queues();
+    // Drop all entry-owned prepared batches and return optional-slot tokens.
+    // The recorded graph remains valid and prepares again on its next replay.
+    void release_prepared_queues() noexcept;
+
+    // Copy a contiguous BUILT node window into a standalone child graph. The
+    // extracted child rebases node/kernel indices to child-local order and supports
+    // the same explicit DataPatch replay path as hand-built children.
+    std::shared_ptr<RpuKernelGraph> extract_child_window(
+        size_t start_idx, size_t end_idx) const;
 
     // Replace a contiguous BUILT parent window with one ChildGraph node. Replay
     // still runs the original op-stream; when cursor reaches this node, the raw
@@ -1500,10 +1587,19 @@ public:
         GraphSignature child_signature = {});
 
     // 上一次 execute_graph_* 的统计快照
-    const GraphStats& debug_stats() const { return last_stats_; }
+    GraphStats debug_stats() const {
+        GraphStats result = last_stats_;
+        // Read the actual owner even before any segment, after invalidation,
+        // and for pure-child/empty graphs that never emit a HWPerf file.
+        result.graph_lifetime_id = graph_lifetime_id_;
+        result.build_generation = build_generation_;
+        result.execution_ordinal = execution_ordinal_;
+        return result;
+    }
+    ReplayPlan replay_plan() const { return ReplayPlan{&nodes_, &segments_}; }
 
-    // Pointer-free structural diagnostics. These expose graph organization,
-    // not launch argument words, device instructions, or runtime addresses.
+    // Read-only pointer-free Graph structure. Register words, tensor bytes
+    // and raw allocation addresses are outside the public diagnostic surface.
     std::string dump_replay_plan() const;
     std::string dump_tree() const;
 
@@ -1562,21 +1658,15 @@ public:
     // 路径(stable input chain 下游 → 进 host_callback Tier1/2;否则 inline)。
     // 跨 dtype / 跨 device 路径若需要 stable input deferred 直接调本 API。
     //
-    // env 控制(默认 unset 走 Auto):
-    //   unset / ""    → Auto:仅 stable input 命中时 defer(推荐)
-    //   "auto"        → 同 Auto
-    //   "0"/"off"     → ForceOff:全 inline(诊断 deferred 是否引入回归)
-    //   "false"       → 同 ForceOff
-    //   其他非空      → ForceOn:全 defer(诊断用,可能引入回归)
-    //
-    // env 名:首选 RPU_GRAPH_HOST_OP_DEFER_GATE;兼容 RPU_GRAPH_DEFER_TO_COPY。
+    // GraphRuntimePolicy 在 Graph 构造前把兼容环境入口严格翻译为 Auto /
+    // ForceOff / ForceOn；本执行路径只读 immutable typed policy。
     bool should_defer_host_op_input(const at::Tensor& src) const;
 
     // ==================== ZeroCopy storage holder owner tree =====
     //
     // run_cpu_fallback_zerocopy 创建 zero-copy CPU view 时,view 的 storage
-    // 必须额外持有到 redispatch + return 处理结束。owner tree 跟踪
-    // 同一 lifeline 的资源状态。生命周期通过 ZeroCopyHolderGuard
+    // 必须额外持有到 redispatch + return 处理结束。这里把 lifeline 镜像进
+    // owner tree 让 dump_resources 能见。生命周期通过 ZeroCopyHolderGuard
     // 管理:guard ctor 记录当前 size,dtor 截断回原 size,
     // 避免嵌套 fallback 累积 / 跨调用泄漏。
     void register_zero_copy_holder(const at::Tensor& view);
@@ -1597,8 +1687,8 @@ public:
     // lifecycle:begin (PASSTHROUGH→RECORDING) / abort / invalidate 全清(跨
     // capture 不复用 buffer,因为新一轮 capture 可能 op shape / dtype 不同)。
     // BUILT→REPLAYING 不清(地址稳定语义)。
-    // dev_addr 由 caller 预算后传入，作为唯一地址来源，保持 owner
-    // tree 与节点 last_output_dev_addrs 一致。
+    // dev_addr 由 caller 预先解析后传入，保证 owner tree 与节点的
+    // last_output_dev_addrs 使用同一份地址。
     size_t register_tier3_transient_buffer(int owner_node_id,
                                             const at::Tensor& buffer,
                                             uint64_t dev_addr);
@@ -1614,12 +1704,16 @@ private:
     friend class GraphKernelRegisterCensusGuard;
     friend class GraphKernelRegisterOuterFastTicket;
     struct OuterFastTensorSnapshot;
+    // FMB calls this only after validating a COMPLETE physical manifest.
+    // Ordinary Branch/data-node APIs remain forbidden under register census.
+    void record_physical_manifest_branch(uint64_t manifest_fingerprint);
+    void observe_physical_manifest_branch_for_census();
     // begin() / begin(sig) 的公共骨架。sig.has_value() 时携带 admission key;
     // nullopt 表示无签名,直接 RECORDING(不写 pending_signature_)。
     void begin_impl(const std::optional<GraphSignature>& sig);
     // Explicitly opt this RECORDING scope into retained-arena publication.
     // Only the composite coordinator may request it, after validating the
-    // live lease. Ordinary physical Graph users retain the standard
+    // live lease.  Ordinary physical Graph users retain their historical
     // acquire/build/replay/release lifecycle and never create a provisional
     // registry entry.
     void request_retained_physical_arena_build();
@@ -1780,7 +1874,7 @@ private:
     void observe_kernel_register_node(GraphNodeKind kind,
                                       const std::string* kernel_name);
     void verify_kernel_register_end_preflight() const;
-    static bool force_oneshot_on_replay_enabled();
+    bool force_oneshot_on_replay_enabled() const;
 
     // 线性扫 nodes_，把连续且 queue_state 兼容的 Kernel/Dma/Barrier 合并为
     // segment；Kernel 的 core_ids 可不同，segment 取最大执行域。其它 data
@@ -1792,46 +1886,27 @@ private:
     // 复用，不由 segment 持有。
     void execute_graph_for_recording();
 
-    // REPLAYING 收尾：按 segment 走 QueueCache::get + build_batch +
-    // enqueu_batch。段间 data nodes 重复执行 (capture_data 已在 REPLAYING
-    // 期覆写过各 data node 的 dst/src)。
+    // Replay entry-owned prepared batches where their fingerprints match;
+    // otherwise rebuild. Interleaved data nodes consume current bindings.
     void execute_graph_for_replaying();
 
-    // 对一个 segment 设置 Queue_t 状态并 prepare 其 kernel 列表。
-    // 同时填 seg.mutable_dmas (每个 add_dma_kernel_mutable 累计 dma_id
-    // + push 槽位),让后续 REPLAY 能走 sync-only 快路径。
-    void prepare_segment_queue(Segment& seg, ::rhino_lkn::Queue_t& wq);
-
-    // replay 路径发射单段:从本 entry 的 private_queue_ (经 ensure_private_queue
-    // 取);若 private_queue_built_segment_idx_ 与本段 idx 命中则走 sync-only
-    // (launch_segment_sync_only),否则 full rebuild (prepare_segment_queue +
-    // build_batch + enqueu_batch)。
-    void launch_segment_for_replay(Segment& seg);
-
-    // sync-only fast path:walk seg.mutable_dmas + update_dma_kernel +
-    // sync_mutable_params + enqueu_batch。前提:private_queue_'s kd_buf 仍持本段
-    // build_batch 结果 (由 launch_segment_for_replay 的 segment-idx fingerprint
-    // 判定后才调用本函数)。返回 SDK rc (0 = 成功;非 0 → caller TORCH_CHECK)。
-    uint32_t launch_segment_sync_only(Segment& seg);
-
-    // 取本 cache entry 私有的 Queue_t,按 num_cores 懒分配。
-    // 与 QueueCache::instance() 共享池**完全隔离**:immediate DMA 与
-    // execute_graph_oneshot 走 QueueCache，PASSTHROUGH kernel 走另一条隔离
-    // direct-launch queue；本 entry 的 cacheable execute 路径
-    // (execute_graph_for_recording + launch_segment_for_replay) 走这个私有
-    // Queue，从而避免任一旁路作废其 prepared batch。
-    //
-    // 行为说明:
-    //   - 首次调用按 segment 最大 core 域构造；若后续 segment 的最大域不同，
-    //     销毁旧 queue + 重建。**同一 segment 内**混用 1/8-core kernel 不会触发
-    //     重建：每个 kernel 的 core_ids 已独立烤入 batch。跨段重建只损失
-    //     prepared-kd_buf 复用收益，不影响正确性。
-    //   - 不在 PASSTHROUGH (raw kernel 走隔离 direct-launch queue) 与
-    //     execute_graph_oneshot (non-replayable 一次性降级，走 QueueCache)
-    //     中使用；两条路径都不会被 REPLAY。
-    //   - 生命周期:unique_ptr,随 RpuKernelGraph 实例析构(RpuGraphCache::evict
-    //     / clear) 自动释放底层 Queue_t,无需显式 hook。
-    ::rhino_lkn::Queue_t* ensure_private_queue(size_t num_cores);
+    // Prepare a segment and snapshot both mutable and fixed DMA bindings.
+    // Optional retained slots may fall back when the SDK rejects build_batch.
+    uint32_t prepare_segment_queue(
+        Segment& seg, ::rhino_lkn::Queue_t& wq, bool hw_perf_enabled,
+        RpuDmaSubmissionLease& submission_lease,
+        bool retain_replay_state = true);
+    struct PreparedQueueSlot;
+    ::rhino_lkn::Queue_t* launch_segment_for_replay(
+        Segment& seg, bool hw_perf_enabled);
+    bool capture_segment_kernel_register_tokens(
+        const Segment& seg,
+        std::vector<std::pair<size_t, uint64_t>>& tokens) const;
+    uint32_t launch_segment_sync_only(
+        Segment& seg, PreparedQueueSlot& slot);
+    ::rhino_lkn::Queue_t* ensure_private_queue(size_t queue_slot_idx,
+                                              size_t num_cores);
+    size_t prepared_queue_slot_index(size_t segment_idx, bool retain);
 
     // non-replayable 降级路径：一次性按 segment 分组提交 kernel + 段间交错执行
     // data nodes，执行完丢弃 segments_。
@@ -1855,6 +1930,7 @@ private:
     // 执行单个 data node（Memcpy / Memset）；末尾统一 __sync_synchronize()。
     // 三条 execute_graph_* 路径共享此 helper。
     void execute_data_node(const GraphNode& node);
+    void execute_ddr_copy(const MemcpyNodeData& copy);
 
     // active 栈化:nested begin 允许;同一 graph 重入仍被拒。
     // active() 返回栈顶(空时返回 fallback_graph_,保持单图老语义)。
@@ -1894,9 +1970,10 @@ private:
     uint64_t recording_physical_execution_token_ = 0;
     uint64_t built_physical_execution_token_ = 0;
     bool retained_physical_build_requested_ = false;
-    // Prepared-child APIs can externally embed baked register values. Once
-    // that relation has existed, this Graph lifetime is never eligible to
-    // become a retained physical root.
+    // Prepared-child APIs can detach or externally embed baked register
+    // values.  Once either relation has existed, this Graph lifetime is never
+    // eligible to become a retained physical root.
+    mutable bool ever_extracted_child_window_ = false;
     bool ever_embedded_as_child_ = false;
 
     // mark_non_replayable() 留下的原因字符串。GraphStats 暴露给 Python 侧调试。
@@ -1998,25 +2075,30 @@ private:
     // window digest arms the one-time end() commit instead.
     mutable bool topology_hash_requested_ = false;
 
-    // post_fn-start cursor for skip_layer_body_for_fast_replay (post_fn
+    // post_fn-start cursor for skip_layer_body_for_fast_replay (D-501 post_fn
     // graphs). Recorded during RECORDING via mark_post_fn_cursor(); reset on
     // every fresh capture / invalidate so a stale value can't leak across
     // rebuilds.
     size_t post_fn_cursor_ = 0;
     bool has_post_fn_cursor_ = false;
 
-    // Set by skip_op_stream_for_fast_replay (the FULL op-stream skip, no post_fn
-    // re-emit) → this replay emitted NO kernel set_regs, so the kd_buf params are
-    // unchanged from BUILD/last-sync and sync_mutable_params() is redundant work
-    // because it scans every recorded kernel.
-    // Consumed + reset per replay in execute_graph_for_replaying. NOT set by
-    // skip_layer_body_for_fast_replay (post_fn re-emits → set_regs possible).
+    // Flow witness used by the FMB/composite transaction.  A full skip may
+    // happen after a replayed prefix, so this flag does not prove that kernel
+    // parameters are unchanged and must never decide queue synchronization.
     bool op_stream_fully_skipped_ = false;
 
-    // Cold per-BUILD policy. Captured on entry to RECORDING and retained for
-    // every REPLAY of that graph, so a later model's environment cannot alter
-    // whether this graph synchronizes its prepared kernel parameters.
-    bool fast_replay_skip_sync_ = false;
+    // Conservative per-replay mutation witness for Graph-owned Kernel_t
+    // configuration.  Every kernel lookup/re-emission and every direct
+    // RegisterPatch marks the actual owning Graph before mutation.  It remains
+    // set until all segments submit successfully; only then may the next replay
+    // start clean.  The prepared Queue slot also retains the Launch ABI's
+    // per-Kernel register-state tokens, which catch successful register writes
+    // missed by this coarse flow witness.
+    bool kernel_params_dirty_this_replay_ = false;
+
+    // Immutable per-Graph policy. Python freezes all legacy environment inputs
+    // before construction; BUILD and every REPLAY consume this same snapshot.
+    const GraphRuntimePolicy runtime_policy_;
 
     struct ReplayChildSkipState {
         bool active = false;
@@ -2283,27 +2365,77 @@ private:
 
     // execute_graph_* + flush_boundary_ptrs 写入的统计快照
     GraphStats last_stats_;
+    uint64_t execution_ordinal_ = 0;  // Monotonic for this Graph lifetime.
+    uint64_t hwperf_evidence_failure_total_ = 0;
+    RpuKernelGraph* execution_parent_ = nullptr;  // Scoped actual ChildGraph call.
+    void begin_execution_stats();
+    void record_segment_execution(
+        const Segment& segment, ::rhino_lkn::Queue_t& queue,
+        const char* execution_kind, const std::string& graph_name,
+        bool hwperf_enabled, bool hwperf_prepared,
+        const std::string& output_dir);
 
-    // 本 cache entry 私有的 Queue_t (lazy-init via ensure_private_queue)。
-    // 详细语义见 ensure_private_queue 注释。RAII 析构自动归还 BufferPool;
-    // 不在 begin/end/invalidate 中显式 reset(REPLAY 期保留同一 Queue 才能
-    // 在 sync-only fast path 中享受 kd_buf reuse 的收益)。
-    std::unique_ptr<::rhino_lkn::Queue_t> private_queue_;
-    uint8_t private_queue_core_num_ = 0;
+    // One fallback slot plus at most eight retained segment slots. The extra
+    // slots are also capped process-wide, so many cold/cache entries cannot
+    // multiply this incremental queue cost without bound.
+    static constexpr size_t kMaxPreparedQueueSlots = 9;
+    struct PreparedQueueSlot {
+        std::unique_ptr<::rhino_lkn::Queue_t> queue;
+        uint8_t core_num = 0;
+        ssize_t built_segment_idx = -1;
+        bool hw_perf_enabled_at_build = false;
+        std::shared_ptr<const Segment::PreparedFixedDmaTable> fixed_dma_table;
+        // Committed tokens describe the mutable Kernel_t argument image copied
+        // into this Queue_t's current kd_buf. Pending storage is reused to make
+        // the pre-submit comparison transactional without allocating each hit.
+        std::vector<std::pair<size_t, uint64_t>> kernel_register_tokens;
+        std::vector<std::pair<size_t, uint64_t>> pending_kernel_register_tokens;
+        bool kernel_register_tokens_valid = false;
+        // Successful typed DMA updates for this exact private queue/build.
+        // These are identity values, not retained owners or submission leases;
+        // replay must resolve and validate every endpoint again before comparing
+        // them. In particular SPM has allocation_id == 0, so its root owner
+        // identity must participate even when offsets happen to be equal.
+        struct MutableDmaPacketBinding {
+            size_t node_idx;
+            uint32_t dma_id;
+            Segment::PreparedMutableDmaSlot::Kind kind;
+            size_t bytes;
+            uint8_t channel;
+            RpuDmaEndpoint src;
+            RpuDmaEndpoint dst;
 
-    // Segment fingerprint：private_queue_ 的 kd_buf 当前对应 segments_
-    // 的哪个 idx (-1 = 空 / 未 build / 已失效)。launch_segment_for_replay
-    // 用此判断能否走 sync-only fast path (idx 匹配 + core_num 匹配 →
-    // update_dma_kernel + sync_mutable_params + enqueu_batch;否则 full
-    // rebuild prepare_segment_queue + 重设 idx)。Reset 时机:
-    //   - ensure_private_queue 重建 Queue_t 时 (core_num mismatch)
-    //   - invalidate / abort (segments_ 被清,所有 idx 失效)
-    //   - prepare_segment_queue 写新 seg 前 (前段 kd_buf 即将被覆写)
-    // 必须使用 segment fingerprint，而不能只检查 batch_built_；本字段是该
-    // fingerprint 的唯一来源。
-    ssize_t private_queue_built_segment_idx_ = -1;
+            bool operator==(const MutableDmaPacketBinding& other) const noexcept {
+                return node_idx == other.node_idx && dma_id == other.dma_id &&
+                    kind == other.kind && bytes == other.bytes &&
+                    channel == other.channel &&
+                    src.owner == other.src.owner &&
+                    src.allocation_id == other.src.allocation_id &&
+                    src.offset == other.src.offset &&
+                    dst.owner == other.dst.owner &&
+                    dst.allocation_id == other.dst.allocation_id &&
+                    dst.offset == other.dst.offset;
+            }
+        };
+        std::vector<MutableDmaPacketBinding> mutable_dma_packets;
+        std::vector<MutableDmaPacketBinding> pending_mutable_dma_packets;
+        void invalidate_mutable_dma_packets() noexcept {
+            mutable_dma_packets.clear();
+            pending_mutable_dma_packets.clear();
+        }
+        bool consumes_extra_budget = false;
+        bool promotion_denied = false;
+    };
+    std::array<PreparedQueueSlot, kMaxPreparedQueueSlots>
+        private_queue_slots_{};
 
-    // Per-graph cumulative REPLAY count, incremented at
+    // Synchronous DDR data nodes use a separate one-shot queue. A data copy
+    // may run between segments whose completed batch remains in slot 0;
+    // borrowing a retained queue would invalidate that batch. Successful
+    // copies discard their arena, and failures destroy this queue.
+    std::unique_ptr<::rhino_lkn::Queue_t> data_dma_queue_;
+
+    // P6 (debug-level): per-graph cumulative REPLAY count, incremented at
     // entry of execute_graph_for_replaying. INFO logs the first-replay-per-
     // graph transition; DEBUG logs every call. Not part of any control flow.
     size_t total_replay_count_ = 0;
@@ -2330,8 +2462,8 @@ private:
     // zero-copy CPU view storage holder owner tree。run_cpu_fallback_
     // zerocopy 通过 ZeroCopyHolderGuard 管理 RAII 生命周期;guard 退栈时截回
     // 原 size,所以 RECORDING/REPLAYING/PASSTHROUGH 任何时刻进入 fallback 之前,
-    // 这个 vector 都是上次 fallback 退出后的 size(典型 0),
-    // 不影响 admission 路径。
+    // 这个 vector 都是上次 fallback 退出后的 size(典型 0)。dump_resources
+    // 只在 fallback 内调可见,不影响 admission 路径。
     std::vector<GraphOwnedResource> host_callback_zero_copy_holders_;
 
     // Tier3OneshotNode transient buffer owner tree。
@@ -2528,7 +2660,7 @@ set_dma_semantics_for_topology_golden(
     TORCH_CHECK(graph.state_ == RpuKernelGraph::State::RECORDING &&
                     node_idx < graph.nodes_.size() &&
                     graph.nodes_[node_idx].kind == GraphNodeKind::Dma,
-                "topology reference requires one recorded DMA node");
+                "topology golden requires one recorded DMA node");
     auto& dma = graph.nodes_[node_idx].as_dma();
     dma.semantic_endpoint_id = endpoint_id;
     dma.semantic_canonical_member_emission = canonical_member;
@@ -2715,7 +2847,9 @@ public:
     }
 
     // core_num 有效范围 1..8，使用 core_num-1 作为索引
-    RpuQueue* get(uint8_t core_num) {
+    RpuQueue* get(size_t core_num) {
+        TORCH_CHECK(core_num >= 1 && core_num <= queues_.size(),
+                    "RpuQueueCache core count must be in [1, 8], got ", core_num);
         return queues_[core_num - 1].get();
     }
 

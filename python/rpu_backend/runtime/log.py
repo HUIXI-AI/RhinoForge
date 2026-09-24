@@ -1,4 +1,4 @@
-"""Unified debug verbosity bridge.
+"""Unified debug verbosity bridge (P1b, 2026-05-21-debug-level session).
 
 State syncing:
     - C++ side:   g_rpu_debug_level (std::atomic<int> 0..5) in libc-ext.
@@ -70,9 +70,11 @@ _LEVEL_TO_LOGGING = {
 
 _LOG = logging.getLogger("rpu_backend")
 
-# Handler policy: StreamHandler provides default visibility; propagate=False
-# prevents duplicate output after a downstream `logging.basicConfig()`.
-# Logging-capture integrations may set `_LOG.propagate = True` explicitly.
+# Handler policy: StreamHandler + propagate=False.
+# Trade-off (rev3 §1.2): out-of-box visibility for `import rpu_backend; do_work()`
+# matches the legacy `print()` behavior; propagate=False prevents double-prints
+# from a downstream `logging.basicConfig()`. pytest caplog users must
+# `_LOG.propagate = True` themselves — documented limitation.
 if not _LOG.handlers:
     _handler = logging.StreamHandler()  # stderr
     _handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))

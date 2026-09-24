@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run greedy text generation with a supported Qwen3 or Llama checkpoint."""
+"""Run greedy text generation for a configured causal-LM profile."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from pathlib import Path
 import tomllib
 
 
-DEFAULT_CONFIG = Path(__file__).with_name("configs") / "qwen3_0_6b.toml"
+DEFAULT_CONFIG = Path(__file__).with_name("configs") / "qwen3/text/0_6b/fp16.toml"
 
 
 def load_config(path: Path) -> dict:
@@ -18,6 +18,8 @@ def load_config(path: Path) -> dict:
     generation = config["generation"]
     if not model.get("alias") and not model.get("checkpoint"):
         raise ValueError("[model] needs alias or checkpoint")
+    if model.get("quantization") not in (None, "w4a16", "w4a16_lm_head"):
+        raise ValueError("[model].quantization must be w4a16 or w4a16_lm_head")
     if not isinstance(generation.get("prompt"), str):
         raise ValueError("[generation].prompt must be a string")
     if not isinstance(generation.get("max_new_tokens"), int) or generation["max_new_tokens"] < 1:
@@ -26,6 +28,15 @@ def load_config(path: Path) -> dict:
 
 
 def main() -> int:
+    import sys
+    example_dir = str(Path(__file__).resolve().parent)
+    if example_dir not in sys.path:
+        sys.path.insert(0, example_dir)
+    from _common import maybe_run_catalog
+    result = maybe_run_catalog(None, DEFAULT_CONFIG)
+    if result is not None:
+        return result
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--check-config", action="store_true")
@@ -56,26 +67,32 @@ def main() -> int:
         dtype=torch.float16,
         device="rpu",
         rpu_execution=config.get("rpu_execution"),
+        quantization=model_config.get("quantization"),
         local_files_only=local_only,
         trust_remote_code=False,
     )
-    inputs = tokenizer(config["generation"]["prompt"], return_tensors="pt")
-    max_new_tokens = config["generation"]["max_new_tokens"]
-    cache = RPUCache.from_model(
-        model,
-        input_ids=inputs.input_ids,
-        max_new_tokens=max_new_tokens,
-    )
-    rpu_inputs = {name: value.to("rpu") for name, value in inputs.items()}
-    outputs = model.generate(
-        **rpu_inputs,
-        past_key_values=cache,
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-        use_cache=True,
-    )
-    completion = outputs[0, inputs.input_ids.shape[1] :].cpu()
-    print(tokenizer.decode(completion, skip_special_tokens=True))
+    try:
+        inputs = tokenizer(config["generation"]["prompt"], return_tensors="pt")
+        max_new_tokens = config["generation"]["max_new_tokens"]
+        cache = RPUCache.from_model(
+            model,
+            input_ids=inputs.input_ids,
+            max_new_tokens=max_new_tokens,
+        )
+        rpu_inputs = {name: value.to("rpu") for name, value in inputs.items()}
+        outputs = model.generate(
+            **rpu_inputs,
+            past_key_values=cache,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            use_cache=True,
+            logits_to_keep=1,
+        )
+        completion = outputs[0, inputs.input_ids.shape[1] :].cpu()
+        print(tokenizer.decode(completion, skip_special_tokens=True))
+    finally:
+        from rpu_backend.runtime.decoder import _close_causal_lm_model
+        _close_causal_lm_model(model)
     return 0
 
 

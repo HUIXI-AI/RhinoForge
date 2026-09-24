@@ -9,7 +9,7 @@ from pathlib import Path
 import tomllib
 
 
-DEFAULT_CONFIG = Path(__file__).with_name("configs") / "qwen3_vl_2b.toml"
+DEFAULT_CONFIG = Path(__file__).with_name("configs") / "qwen3_vl/vl/2b/fp16.toml"
 
 
 def load_config(path: Path) -> dict:
@@ -46,7 +46,26 @@ def load_config(path: Path) -> dict:
     return config
 
 
+def close_model(model) -> None:
+    """Retire the actual composite owner, with Graphs before native handles."""
+    from rpu_backend.adapters.qwen3_vl import _is_retirement_owner
+
+    owner = getattr(model, "_qwen3_vl_retirement_owner", None)
+    if not _is_retirement_owner(owner, model):
+        raise RuntimeError("Qwen3-VL teardown lost its actual composite retirement owner")
+    owner.close()
+
+
 def main() -> int:
+    import sys
+    example_dir = str(Path(__file__).resolve().parent)
+    if example_dir not in sys.path:
+        sys.path.insert(0, example_dir)
+    from _common import maybe_run_catalog
+    result = maybe_run_catalog('qwen3_vl', DEFAULT_CONFIG)
+    if result is not None:
+        return result
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--check-config", action="store_true")
@@ -66,7 +85,9 @@ def main() -> int:
     import torch
     from PIL import Image
     from transformers import AutoProcessor
-    from rpu_backend.api import RPUCache, RPUModelForConditionalGeneration
+    from rpu_backend.api import (
+        RPUCache, RPUModelForConditionalGeneration, greedy_token_ids,
+    )
     from rpu_backend.model_registry import model_path
 
     checkpoint = model_config.get("checkpoint") or str(
@@ -108,54 +129,57 @@ def main() -> int:
         local_files_only=local_only,
         trust_remote_code=False,
     )
-    cache = RPUCache.from_model(
-        model.model.language_model,
-        input_ids=input_ids,
-        max_new_tokens=max_new_tokens,
-    )
-    prefill = {
-        name: inputs[name]
-        for name in (
-            "attention_mask",
-            "pixel_values",
-            "image_grid_thw",
-            "mm_token_type_ids",
+    try:
+        cache = RPUCache.from_model(
+            model.model.language_model,
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
         )
-        if name in inputs
-    }
+        prefill = {
+            name: inputs[name]
+            for name in (
+                "attention_mask",
+                "pixel_values",
+                "image_grid_thw",
+                "mm_token_type_ids",
+            )
+            if name in inputs
+        }
 
-    generated = []
-    with torch.no_grad():
-        output = model(
-            input_ids=input_ids.to("rpu"),
-            past_key_values=cache,
-            logits_to_keep=1,
-            use_cache=True,
-            return_dict=True,
-            **prefill,
-        )
-        for step in range(max_new_tokens):
-            next_id = output.logits[:, -1].argmax(dim=-1, keepdim=True).long()
-            generated.append(next_id.cpu())
-            if (
-                processor.tokenizer.eos_token_id is not None
-                and next_id.item() == processor.tokenizer.eos_token_id
-            ):
-                break
-            if step + 1 == max_new_tokens:
-                break
+        generated = []
+        with torch.no_grad():
             output = model(
-                input_ids=next_id.to("rpu"),
+                input_ids=input_ids.to("rpu"),
                 past_key_values=cache,
                 logits_to_keep=1,
                 use_cache=True,
                 return_dict=True,
+                **prefill,
             )
-    print(
-        processor.tokenizer.decode(
-            torch.cat(generated, dim=1)[0], skip_special_tokens=True
+            for step in range(max_new_tokens):
+                next_id = greedy_token_ids(output.logits)
+                generated.append(next_id.cpu())
+                if (
+                    processor.tokenizer.eos_token_id is not None
+                    and next_id.item() == processor.tokenizer.eos_token_id
+                ):
+                    break
+                if step + 1 == max_new_tokens:
+                    break
+                output = model(
+                    input_ids=next_id.to("rpu"),
+                    past_key_values=cache,
+                    logits_to_keep=1,
+                    use_cache=True,
+                    return_dict=True,
+                )
+        print(
+            processor.tokenizer.decode(
+                torch.cat(generated, dim=1)[0], skip_special_tokens=True
+            )
         )
-    )
+    finally:
+        close_model(model)
     return 0
 
 

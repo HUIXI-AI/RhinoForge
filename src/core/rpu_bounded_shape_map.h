@@ -19,8 +19,8 @@
 //            that same address without asking the map again. Evicting such an
 //            entry frees the DDR block, its device VA becomes immediately
 //            re-issuable, and the next REPLAY of the still-cached graph writes
-//            over whoever owns it now. A device address does not retain the
-//            allocation lifetime, so a map
+//            over whoever owns it now — exactly the C-1 use-after-free shape
+//            ("a device address is not a reference", docs/pitfalls.md). A map
 //            like that must NEVER evict. It fails loudly at the bound instead,
 //            which is a bug report, not a crash: the bound is set above the
 //            distinct-shape count a real run touches, so hitting it means the
@@ -105,7 +105,7 @@ private:
                     " distinct shapes on one handle. This map cannot evict — its "
                     "entries' device addresses are baked into built graph DMA "
                     "descriptors, so freeing one would leave a cached graph "
-                    "writing to a reissued VA. A real run "
+                    "writing to a reissued VA (docs/pitfalls.md C-1). A real run "
                     "touches far fewer shapes than this; if you legitimately need "
                     "more, give the entries an explicit lifetime tied to the "
                     "graph cache rather than raising the bound.");

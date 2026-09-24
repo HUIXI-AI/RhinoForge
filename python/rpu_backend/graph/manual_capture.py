@@ -1,7 +1,7 @@
-"""Manual capture frontend.
+"""Manual capture frontend (M0 skeleton).
 
-This module provides a thin Python wrapper around
-`torch.rpu.GraphCache.capture(sig)` that hides
+Per `docs/manual_frontend.md` M0, this module provides a thin Python
+wrapper around `torch.rpu.GraphCache.capture(sig)` that hides
 SignaturePlanner construction, exposes a CUDA-Graph-style
 `g.replay(*args)` entry, and refuses to silently recapture on
 signature drift.
@@ -16,9 +16,11 @@ Boundary against the Dynamo frontend (`dynamo_backend.py`):
   - Reuses `SignaturePlanner` for sig construction so the two
     frontends share signature semantics.
 
-Fast replay via `dynamic_inputs` is not implemented because it requires
-backend RECORDING-time patch identification. Non-empty `dynamic_inputs`
-raises `NotImplementedError`.
+M1 (fast replay via `dynamic_inputs`) is intentionally not in this
+file yet — it requires backend RECORDING-time patch identification
+that has to be designed to be reusable by Dynamo fast replay
+(`docs/manual_frontend.md` "Fast replay 集成").  M0 raises
+`NotImplementedError` if `dynamic_inputs` is supplied.
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from .admission import SignaturePlanner, _opaque_object_id
+from .admission import SignaturePlanner
 
 
 class GraphCapture:
@@ -65,9 +67,10 @@ class GraphCapture:
     ):
         if dynamic_inputs:
             raise NotImplementedError(
-                "GraphCapture: dynamic_inputs requires fast replay. "
+                "GraphCapture: dynamic_inputs is the M1 fast-replay path. "
                 "It requires backend RECORDING-time patch identification "
-                "and is not implemented."
+                "and is not implemented in this M0 build. See "
+                "docs/manual_frontend.md M1 for the planned API."
             )
         if example_kwargs is None:
             example_kwargs = {}
@@ -85,12 +88,12 @@ class GraphCapture:
         self._example_args = tuple(example_args)
         self._example_kwargs = dict(example_kwargs)
 
-        # The default is an opaque process-local identity, so two GraphCapture
+        # op_id derivation: defaults to id(callable_) so two GraphCapture
         # instances over the same module share a cache entry when shapes
         # also match (resource sharing). User can override with a hashable
         # marker to force separation.
         if op_id is None:
-            op_id_int = _opaque_object_id(callable_)
+            op_id_int = id(callable_)
         elif isinstance(op_id, int):
             op_id_int = int(op_id)
         else:
@@ -150,7 +153,8 @@ class GraphCapture:
                 f"GraphCapture.replay: signature mismatch (first diverge at "
                 f"layer {miss_layer!r}). Manual frontend does not "
                 f"auto-recapture. Call .invalidate() and construct a new "
-                f"GraphCapture. Automatic shape-driven retrace is unsupported."
+                f"GraphCapture. (The Dynamo frontend used to be offered here "
+                f"for shape-driven retrace; it is FROZEN since 2026-08-08.)"
             )
 
         with self._cache.capture(self._sig):
@@ -183,7 +187,7 @@ class GraphCapture:
     def cached_output(self) -> Any:
         """Output produced by the capture-time call. The first replay
         does NOT reuse this — backend re-allocates output each call
-        unless fast replay is wired."""
+        unless fast replay (M1) is wired."""
         return self._cached_output
 
     def replayable(self) -> bool:
@@ -309,14 +313,14 @@ def capture(
           rpu.capture(model, args=(input_ids,),
                       kwargs={"past_key_values": cache})
 
-    `dynamic_inputs` is reserved for fast replay and raises
+    `dynamic_inputs` is reserved for M1 fast-replay; M0 raises
     `NotImplementedError` if non-empty.
 
     `cache` defaults to a fresh `torch.rpu.GraphCache()` so two
     `GraphCapture` instances are independent unless the caller
     passes a shared one explicitly. Mixing manual and Dynamo
-    frontends on the same cache is supported but not recommended because
-    they use distinct admission and lifetime policies.
+    frontends on the same cache is supported but not recommended;
+    see `docs/manual_frontend.md` "与 Dynamo 前端共存".
     """
     if args is not None or kwargs is not None:
         if example_inputs is not None:

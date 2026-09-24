@@ -1,20 +1,24 @@
-// fused_model_base.cpp — flat single-class implementation
+// fused_model_base.cpp — Flat single-class implementation (Plan 01-01 Task 2)
 //
-// FusedModelBase uses a PImpl to hide internal state.
-// Framework features:
-//   - ModelStaticConfig.preload_fn / kv_first_fn / post_fn are dispatched
+// Collapses v2's FusedLayerBase + FusedModelBase runtime into one flat class
+// with PImpl hiding internal state. Behavior is bit-for-bit equivalent to v2
+// (every numbered Fix from v2 FusedLayerBase is preserved with its comment).
+//
+// New features landed here:
+//   - D-501: ModelStaticConfig.preload_fn / kv_first_fn / post_fn dispatched
 //     via std::invoke inside run_all_layers.
-//   - BufferDecl.preload_callback fires on persistent-generation advance or
-//     preload_callbacks_dirty_.
-//   - Two independent dirty flags — weights_dirty_ (preload_fn
+//   - D-502: BufferDecl.preload_callback auto-fired on persistent-generation
+//     advance OR on preload_callbacks_dirty_ (EXT-4).
+//   - EXT-4: two independent dirty flags — weights_dirty_ (preload_fn
 //     emission) and preload_callbacks_dirty_ (per-buffer callback loop) — each
 //     cleared at its own dispatch point.
-//   - Preload callbacks use the graph-aware RpuQueue
+//   - EXT-5: preload callbacks directly use the graph-aware RpuQueue
 //     proxy 进 RpuKernelGraph::active() (有 scope → 进 RECORDING/REPLAYING,
 //     无 scope → 立即发射)。
 
 #include "fused_model_base.h"
 #include "fused_model_base_impl.h"
+#include "execution_topology.h"
 
 #include "rpu_caching_allocator.h"
 #include "rpu_spm_allocator.h"   // SPM_ALLOC, SpmAllocator::AllocRequest
@@ -26,13 +30,16 @@
 #include "graph/graph_runtime.h" // RpuKernelGraph (keep_alive, has_active)
 
 #include <ATen/ATen.h>
+#include <ATen/record_function.h>
 #include <c10/util/ScopeExit.h>
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <functional>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <set>
@@ -41,13 +48,28 @@
 
 namespace v3 {
 
+// FMB_SHARED_FIXED_KERNEL_BASIS: launchers not represented by a physical-route
+// entry are invariant framework transport, bookkeeping, or elementwise steps
+// fixed by BufferDecl/dataflow. Any future selectable implementation must first
+// become a typed manifest route.
+
 namespace {
 
-bool env_enabled(const char* name, bool reject_false_prefix) {
-    const char* value = std::getenv(name);
-    if (value == nullptr || *value == '\0' || value[0] == '0') return false;
-    return !reject_false_prefix ||
-        (value[0] != 'f' && value[0] != 'F');
+void consume_shared_runtime_route(
+    InferenceContext& ctx,
+    FmbRouteFamily family,
+    int64_t site_id,
+    int64_t selector,
+    int64_t invocation = 0,
+    at::IntArrayRef arguments = {},
+    int num_cores = 8,
+    int mlp_num_cores = 8) {
+    if (!ctx.has_complete_physical_manifest()) return;
+    const std::array<int64_t, 3> topology{2, num_cores, mlp_num_cores};
+    if (num_cores != 8 && arguments.empty()) arguments = topology;
+    (void)ctx.consume_physical_route(
+        family, site_id, selector, /*resolved_flags=*/0,
+        arguments, invocation);
 }
 
 constexpr uint64_t kFmbFnvOffset = 0xcbf29ce484222325ULL;
@@ -2790,12 +2812,7 @@ void SpmCompositeTraceCoordinator::finish_occurrence(
                   candidate.composite_producer_local_ordinal < 3 &&
                   candidate.composite_preload_follower ==
                       (candidate.composite_producer_local_ordinal != 0) &&
-                  (candidate.composite_preload_follower
-                       ? candidate.composite_outer_begin ==
-                             candidate.graph_node_begin
-                       : (candidate.cpu_dry ||
-                          candidate.composite_outer_begin <
-                              candidate.graph_node_begin)))) &&
+                  candidate.composite_preload_prefix_valid())) &&
                 candidate.composite_producer ==
                     pimpl_->active_is_producer &&
                 (!candidate.composite_producer ||
@@ -3124,6 +3141,15 @@ void SpmCompositeTraceCoordinator::cancel() noexcept {
     pimpl_->replay_consumer_owner = nullptr;
     pimpl_->replay_consumer_occurrence_count = 0;
     pimpl_->replay_outer_fast_owner_order_exact = false;
+    // A failure between producer occurrences has no active occurrence to
+    // cancel, but must still discard the leader's lexical preload receipt.
+    if (pimpl_->producer_owner != nullptr &&
+        !pimpl_->producer_owner_generation.expired() &&
+        pimpl_->producer_owner->pimpl_->composite_occurrence_runtime_
+                .composite_identity == pimpl_->composite_identity) {
+        pimpl_->producer_owner
+            ->cancel_spm_pipeline_composite_occurrence_runtime();
+    }
     pimpl_->completed.clear();
     pimpl_->replay.reset();
 }
@@ -3152,11 +3178,7 @@ void validate_dense_spm_peer_callback_complete(
 // =============================================================================
 
 FusedModelBase::FusedModelBase() : pimpl_(std::make_unique<Impl>()) {
-    pimpl_->global_fast_replay_enabled_ =
-        env_enabled("RPU_WALL_OSS_FAST_REPLAY", /*reject_false_prefix=*/true);
-    pimpl_->deep_fast_replay_enabled_ =
-        env_enabled("RPU_DEEP_FAST_REPLAY", /*reject_false_prefix=*/false);
-    // Register with SpmAllocator so super_persistent is released
+    // Task 4.5.1: register with SpmAllocator so super_persistent is released
     // when the last live instance is destroyed (prevents cross-load SPM leak).
     SPM_ALLOC.register_instance();
 }
@@ -3172,7 +3194,7 @@ FusedModelBase::~FusedModelBase() {
     }
     // GraphCache ownership lives in the Python adapter; destroying this C++
     // model handle has no graph-cache eviction responsibility.
-    // Unregister; when the count drops to 0, SpmAllocator releases the
+    // Task 4.5.1: unregister; when count drops to 0, SpmAllocator releases the
     // super_persistent floor (sp_floor_ → SPM_USABLE).
     SPM_ALLOC.unregister_instance();
 }
@@ -3183,6 +3205,31 @@ FusedModelBase::~FusedModelBase() {
 
 InferenceContext&       FusedModelBase::ctx()       { return pimpl_->ctx_; }
 const InferenceContext& FusedModelBase::ctx() const { return pimpl_->ctx_; }
+void FusedModelBase::begin_external_physical_manifest_prologue(
+    const FmbPhysicalExecutionManifest& manifest,
+    int64_t physical_length,
+    int64_t position) {
+    validate_fmb_physical_manifest(manifest, physical_length, position);
+    validate_fmb_physical_manifest_forward_capability(
+        manifest, physical_manifest_forward_capability(manifest));
+    const bool replaying =
+        RpuKernelGraph::has_active() &&
+        RpuKernelGraph::active().state() == RpuKernelGraph::State::REPLAYING;
+    pimpl_->ctx_.begin_external_physical_manifest_prologue(
+        manifest, replaying);
+    auto cancel_failed_begin = c10::make_scope_exit(
+        [&] { pimpl_->ctx_.cancel_external_physical_manifest_prologue(); });
+    if (RpuKernelGraph::has_active()) {
+        RpuKernelGraph::active().record_physical_manifest_branch(
+            pimpl_->ctx_.physical_manifest_fingerprint());
+    }
+    cancel_failed_begin.release();
+}
+
+void FusedModelBase::cancel_external_physical_manifest_prologue() {
+    pimpl_->ctx_.cancel_external_physical_manifest_prologue();
+}
+
 SdpaStableMaskCache& FusedModelBase::sdpa_stable_mask_cache() {
     return pimpl_->sdpa_stable_mask_cache_;
 }
@@ -3296,11 +3343,15 @@ void FusedModelBase::set_chunk_size_override(int64_t cs) {
                 "set_chunk_size_override: chunk size must be 0 (auto) or a "
                 "positive multiple of 16, got ", cs);
     pimpl_->chunk_size_override_ = cs;
+    // A hot exact request does not alter the owner's feasible geometry or
+    // precision. Native oracles also temporarily set/restore this value; do
+    // not erase their just-published, exact-descriptor diagnostic snapshot.
 }
 int64_t FusedModelBase::get_chunk_size_override() const  { return pimpl_->chunk_size_override_; }
+// TASK-1.5 (codex round-3 path-(b) BC2-01 closure)
 int64_t FusedModelBase::get_last_resolved_chunk_size() const { return pimpl_->last_resolved_chunk_size_; }
 
-// Certified chunk envelope.
+// ── MR-A: certified chunk envelope ──────────────────────────────────────────
 void FusedModelBase::set_chunk_envelope(int64_t max_kv_len, int64_t chunk) {
     TORCH_CHECK(max_kv_len > 0,
                 "set_chunk_envelope: max_kv_len must be > 0 (an envelope with "
@@ -3315,11 +3366,271 @@ void FusedModelBase::set_chunk_envelope(int64_t max_kv_len, int64_t chunk) {
     // not be hot-switched.
     TORCH_CHECK(get_last_resolved_chunk_size() == 0,
                 "set_chunk_envelope must be called before the first forward");
+    if (pimpl_->chunk_envelope_.max_kv_len != max_kv_len ||
+            pimpl_->chunk_envelope_.chunk != chunk) {
+        invalidate_planner_cache();
+    }
     pimpl_->chunk_envelope_ = ChunkEnvelope{max_kv_len, chunk};
+    pimpl_->kv_cost_candidates_.clear();
+    pimpl_->kv_cost_planning_context_.reset();
+    pimpl_->kv_cost_layout_scope_ = {};
+    pimpl_->kv_cost_snapshot_reason_ = "NATIVE_STAGE_ORACLE_REQUIRED";
 }
 
 const FusedModelBase::ChunkEnvelope& FusedModelBase::chunk_envelope() const {
     return pimpl_->chunk_envelope_;
+}
+
+void FusedModelBase::bind_kvinsert_costs(
+        at::IntArrayRef identity, const std::string& catalog_sha256,
+        at::IntArrayRef certificate_rows) {
+    TORCH_CHECK(get_last_resolved_chunk_size() == 0 &&
+                    !pimpl_->kvinsert_cost_catalog_.bound(),
+                "KV-insert costs must be bound once before the first forward");
+    // Construction validates every row before publishing any owner state.
+    auto catalog = KvInsertCostCatalog::from_arguments(
+        identity, catalog_sha256, certificate_rows);
+    invalidate_planner_cache();
+    pimpl_->kvinsert_cost_catalog_ = std::move(catalog);
+    pimpl_->kv_cost_candidates_.clear();
+    pimpl_->kv_cost_planning_context_.reset();
+    pimpl_->kv_cost_layout_scope_ = {};
+    pimpl_->kv_cost_snapshot_reason_ = "NATIVE_STAGE_ORACLE_REQUIRED";
+}
+
+const std::string& FusedModelBase::kvinsert_cost_catalog_sha256() const {
+    return pimpl_->kvinsert_cost_catalog_.artifact_sha256();
+}
+
+void FusedModelBase::append_kvinsert_cost_scalar_identity(
+        std::vector<int64_t>& identity, double value) {
+    int64_t bits = 0;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    identity.push_back(bits);
+}
+
+void FusedModelBase::append_kvinsert_cost_tensor_identity(
+        std::vector<int64_t>& identity, const at::Tensor& tensor) {
+    identity.push_back(tensor.defined() ? 1 : 0);
+    if (!tensor.defined()) return;
+    identity.push_back(static_cast<int64_t>(tensor.scalar_type()));
+    identity.push_back(static_cast<int64_t>(tensor.element_size()));
+    identity.push_back(tensor.dim());
+    identity.insert(identity.end(), tensor.sizes().begin(), tensor.sizes().end());
+    identity.insert(identity.end(), tensor.strides().begin(), tensor.strides().end());
+}
+
+std::vector<int64_t> FusedModelBase::planner_cache_identity() const {
+    return {1, pimpl_->planner_cache_epoch_};
+}
+
+std::shared_ptr<const FmbPreparedStageCandidate>
+FusedModelBase::prepare_stage_candidate(at::IntArrayRef descriptor) const {
+    return pimpl_->prepared_stage_candidates_.prepare(descriptor);
+}
+
+void FusedModelBase::invalidate_planner_cache() {
+    TORCH_CHECK(pimpl_->planner_cache_epoch_ < std::numeric_limits<int64_t>::max(),
+                "FusedModelBase: planner cache epoch exhausted");
+    ++pimpl_->planner_cache_epoch_;
+    pimpl_->prepared_stage_candidates_.clear();
+    pimpl_->prepared_spm_costs_.clear();
+}
+
+uint64_t FusedModelBase::installed_model_state_generation() const {
+    return pimpl_->model_state_gen_;
+}
+
+std::vector<int64_t> FusedModelBase::installed_profile_identity() const {
+    const auto precision = kvinsert_cost_weight_identity();
+    // Process handles/generation and hot chunk choices are not profile facts.
+    const auto& envelope = chunk_envelope();
+    std::vector<int64_t> profile{
+        1, num_layers(), hidden_size(), intermediate_size(), num_q_heads(),
+        num_kv_heads(), head_dim(), attn_tp(), envelope.max_kv_len, envelope.chunk,
+        static_cast<int64_t>(precision.size())};
+    profile.insert(profile.end(), precision.begin(), precision.end());
+    return profile;
+}
+
+KvInsertCostDomainQuery FusedModelBase::kvinsert_cost_domain(
+        const char* owner_kind, at::IntArrayRef descriptor) const {
+    TORCH_CHECK(!RpuKernelGraph::has_active(),
+                "KV cost domain query must run outside Graph capture");
+    RpuExecutionCleanupGuard exclusive_planning("kvinsert_cost_domain");
+    TORCH_CHECK(pimpl_->kv_cost_snapshot_reason_ == "READY" &&
+                    pimpl_->kv_cost_model_state_gen_ == pimpl_->model_state_gen_,
+                "KV cost domain requires the latest successful native stage oracle: ",
+                pimpl_->kv_cost_snapshot_reason_);
+    const auto found = std::find_if(
+        pimpl_->kv_cost_candidates_.begin(), pimpl_->kv_cost_candidates_.end(),
+        [&](const Impl::KvCostCandidate& candidate) {
+            return candidate.descriptor.size() == descriptor.size() &&
+                std::equal(candidate.descriptor.begin(), candidate.descriptor.end(),
+                           descriptor.begin());
+        });
+    TORCH_CHECK(found != pimpl_->kv_cost_candidates_.end(),
+                "KV cost domain descriptor was not admitted by this owner's latest oracle");
+    auto profile = installed_profile_identity();
+    TORCH_CHECK(std::equal(profile.begin() + 11, profile.end(),
+                          pimpl_->kv_cost_precision_identity_.begin(),
+                          pimpl_->kv_cost_precision_identity_.end()),
+                "KV cost domain native weights/cold policy changed since the stage oracle");
+    // Source/profile identity deliberately excludes handles and model generation.
+    // Effective envelope and owner-declared cold policy remain part of this
+    // identity. Hot chunk/exact route choices belong only to the descriptor.
+    const std::string reason = found->reason != "READY" ? found->reason :
+        profile[10] == 0 ? "NATIVE_WEIGHT_PRECISION_UNAVAILABLE" : "READY";
+    return {owner_kind, reason, std::move(profile), found->rows};
+}
+
+KvInsertSegmentPlan FusedModelBase::resolve_kvinsert_plan_auto(
+        int64_t site_id, FmbGraphLifecycle graph_lifecycle,
+        int64_t position, int64_t logical_rows,
+        int64_t physical_rows, int num_cores, int64_t num_kv_heads,
+        int64_t head_dim, uint32_t capabilities) const {
+    static_assert(static_cast<int64_t>(FmbGraphLifecycle::RETAINED_CACHE) == 1 &&
+                  static_cast<int64_t>(FmbGraphLifecycle::BOUNDED_ONESHOT) == 2 &&
+                  static_cast<int64_t>(FmbGraphLifecycle::NATIVE_COMPOSITE1) == 3 &&
+                  static_cast<int64_t>(FmbGraphLifecycle::COMPOSITE_CHILD) == 4,
+                  "KV cost catalog v2 lifecycle wire must match FMB");
+    const auto& catalog = pimpl_->kvinsert_cost_catalog_;
+    auto plan = rpu_resolve_kvinsert_segment_plan_auto(
+        position, logical_rows, physical_rows, num_cores, num_kv_heads,
+        head_dim, capabilities,
+        catalog.scope(site_id, static_cast<int64_t>(graph_lifecycle)),
+        catalog.certificates());
+    if (pimpl_->kv_cost_observations_ != nullptr) {
+        auto& observations = *pimpl_->kv_cost_observations_;
+        if (observations.size() < 4096) {
+            observations.push_back({
+                site_id, static_cast<int64_t>(graph_lifecycle), num_cores,
+                num_kv_heads, head_dim, capabilities,
+                rpu_kvinsert_route_arguments(plan, num_cores, num_kv_heads, head_dim)});
+        } else {
+            pimpl_->kv_cost_snapshot_reason_ = "NATIVE_KV_DOMAIN_SNAPSHOT_LIMIT";
+        }
+    }
+    return plan;
+}
+
+KvInsertSegmentPlan FusedModelBase::restore_kvinsert_plan(
+        int64_t site_id, at::IntArrayRef arguments, int num_cores,
+        int64_t num_kv_heads, int64_t head_dim) const {
+    const auto& catalog = pimpl_->kvinsert_cost_catalog_;
+    TORCH_CHECK(ctx().has_complete_physical_manifest(),
+                "KV-insert cost restore requires the actual COMPLETE manifest");
+    const auto graph_lifecycle = ctx().physical_manifest().graph_lifecycle;
+    return rpu_kvinsert_segment_plan_from_route_arguments(
+        arguments, num_cores, num_kv_heads, head_dim,
+        catalog.scope(site_id, static_cast<int64_t>(graph_lifecycle)),
+        catalog.certificates());
+}
+
+KvInsertSegmentPlan FusedModelBase::restore_kvinsert_plan_from_manifest(
+        const FmbPhysicalExecutionManifest& manifest,
+        int64_t site_id, int64_t invocation, int num_cores,
+        int64_t num_kv_heads, int64_t head_dim) const {
+    TORCH_CHECK(
+        manifest.state == FmbPhysicalManifestState::COMPLETE,
+        "KV-insert detached restore requires an actual COMPLETE manifest");
+    const FmbPhysicalManifestConsumer consumer(manifest);
+    const FmbRouteManifestEntry& route = consumer.find_route(
+        FmbRouteFamily::KV_INSERT, site_id, invocation);
+    const auto& catalog = pimpl_->kvinsert_cost_catalog_;
+    return rpu_kvinsert_segment_plan_from_route_arguments(
+        route.arguments, num_cores, num_kv_heads, head_dim,
+        catalog.scope(
+            site_id, static_cast<int64_t>(manifest.graph_lifecycle)),
+        catalog.certificates());
+}
+
+void FusedModelBase::enable_execution_reconfigure_guard() {
+    TORCH_CHECK(get_last_resolved_chunk_size() == 0,
+                "execution hot-reconfigure guard must be enabled before "
+                "the first forward");
+    pimpl_->execution_reconfigure_guard_enabled_ = true;
+}
+
+void FusedModelBase::set_control_chunk_size_override(
+        int64_t cs, const char* operation) {
+    TORCH_CHECK(operation != nullptr && *operation != '\0',
+                "chunk control write requires an operation name");
+    TORCH_CHECK(!pimpl_->execution_reconfigure_guard_enabled_ ||
+                    get_last_resolved_chunk_size() == 0,
+                operation,
+                ": a dispatched handle requires an execution-reconfigure "
+                "token; direct control writes are forbidden");
+    const bool changed = get_chunk_size_override() != cs;
+    set_chunk_size_override(cs);
+    if (changed) invalidate_planner_cache();
+}
+
+void FusedModelBase::stage_control_chunk_size_override(
+        uint64_t token, int64_t cs, const char* operation) {
+    TORCH_CHECK(cs == 0 || (cs >= 16 && cs % 16 == 0),
+                operation, ": chunk size must be 0 (auto) or a positive "
+                "multiple of 16, got ", cs);
+    stage_execution_controls(
+        token, cs, std::nullopt, {}, {}, operation);
+}
+
+void FusedModelBase::check_execution_reconfigure_destroy_allowed(
+        const char* operation) const {
+    RpuExecutionCoordinator::check_reconfigure_participant_destroy_allowed(
+        this, operation);
+}
+
+void FusedModelBase::stage_execution_controls(
+        uint64_t token,
+        std::optional<int64_t> chunk_size_override,
+        std::optional<ChunkEnvelope> chunk_envelope,
+        std::function<void()> apply_extra,
+        std::function<void()> rollback_extra,
+        const char* operation) {
+    TORCH_CHECK(operation != nullptr && *operation != '\0',
+                "execution control stage requires an operation name");
+    if (chunk_size_override.has_value()) {
+        const int64_t value = *chunk_size_override;
+        TORCH_CHECK(value == 0 || (value >= 16 && value % 16 == 0),
+                    operation, ": chunk size must be 0 (auto) or a positive "
+                    "multiple of 16, got ", value);
+    }
+    if (chunk_envelope.has_value()) {
+        TORCH_CHECK(chunk_envelope->max_kv_len > 0,
+                    operation, ": chunk envelope max_kv_len must be > 0");
+        TORCH_CHECK(chunk_envelope->chunk == 0 ||
+                        (chunk_envelope->chunk >= 16 &&
+                         chunk_envelope->chunk % 16 == 0),
+                    operation, ": chunk envelope must be 0 (auto) or a "
+                    "positive multiple of 16");
+    }
+    RpuExecutionCoordinator::validate_reconfigure(token, operation);
+
+    const int64_t old_chunk_size = pimpl_->chunk_size_override_;
+    const ChunkEnvelope old_envelope = pimpl_->chunk_envelope_;
+    const int64_t new_chunk_size = chunk_size_override.value_or(old_chunk_size);
+    const ChunkEnvelope new_envelope =
+        chunk_envelope.value_or(old_envelope);
+    RpuExecutionCoordinator::stage_reconfigure(
+        token,
+        this,
+        [this, new_chunk_size, new_envelope,
+         apply_extra = std::move(apply_extra)]() mutable {
+            pimpl_->chunk_size_override_ = new_chunk_size;
+            pimpl_->chunk_envelope_ = new_envelope;
+            if (apply_extra) apply_extra();
+            invalidate_model_state();
+        },
+        [this, old_chunk_size, old_envelope,
+         rollback_extra = std::move(rollback_extra)]() mutable {
+            pimpl_->chunk_size_override_ = old_chunk_size;
+            pimpl_->chunk_envelope_ = old_envelope;
+            if (rollback_extra) rollback_extra();
+            invalidate_model_state();
+        },
+        operation);
 }
 
 int64_t FusedModelBase::enforce_chunk_envelope(int64_t seq_len, int64_t position,
@@ -3333,35 +3644,71 @@ int64_t FusedModelBase::enforce_chunk_envelope(int64_t seq_len, int64_t position
     if (seq_len <= 1) return e.chunk;
 
     TORCH_CHECK(e.declared(),
-        "REFUSING PREFILL: no certified chunk envelope declared for this ",
+        "RPU_PLANNER_REJECT:CAPABILITY: REFUSING PREFILL: no certified "
+        "chunk envelope declared for this ",
         model_name, " handle (seq_len=", seq_len, ", position=", position, "). "
         "This is deny-by-default: the auto chunk search can pick a chunk above "
         "the model's true SPM ceiling, which busts the 8191 KB SPM, hangs the "
         "oversized HW DMA and WEDGES the board (251 does not auto-recover). "
-        "Declare a validated envelope on this handle before the first forward.");
+        "Declare the measured envelope on this handle before the first forward "
+        "-- see docs/roadmap/chunk_certified_envelope.md for the allowlist and "
+        "for what evidence a new row needs.");
 
     const int64_t kv_len = position + seq_len;
     TORCH_CHECK(kv_len <= e.max_kv_len,
-        "REFUSING PREFILL: ", model_name, " kv_len=", kv_len, " (position=",
+        "RPU_PLANNER_REJECT:CAPABILITY: REFUSING PREFILL: ", model_name,
+        " kv_len=", kv_len, " (position=",
         position, " + seq_len=", seq_len, ") exceeds this handle's CERTIFIED "
         "envelope max_kv_len=", e.max_kv_len, " (chunk=", e.chunk,
         ", 0 means auto). "
-        "This combination has not been validated on hardware. Validate it on a "
-        "resettable board and update the model profile; do not widen the "
-        "envelope merely to make this pass.");
+        "The combination is not in docs/roadmap/chunk_certified_envelope.md, "
+        "so it has never been measured on hardware. Measure it on a RESETTABLE "
+        "board and add the row -- do not widen the envelope to make this pass.");
 
     return e.chunk;
+}
+
+DecoderExecutionTopology FusedModelBase::resolve_model_execution_topology(
+        int64_t num_q_heads, int64_t num_kv_heads, int64_t head_dim,
+        int64_t hidden_size, int64_t intermediate_size) const {
+    if (pimpl_->num_cores_ != 8) {
+        return resolve_decoder_execution_topology(
+            pimpl_->num_cores_, num_q_heads, num_kv_heads,
+            head_dim, hidden_size, intermediate_size);
+    }
+    // Preserve existing owners' eight-core layout contracts.
+    return {8, std::min(8, static_cast<int>(num_kv_heads)), 8};
 }
 
 void FusedModelBase::set_model_params(int64_t num_q_heads, int64_t num_kv_heads,
                                       int64_t head_dim, int64_t hidden_size,
                                       int64_t intermediate_size) {
+    const auto topology = resolve_model_execution_topology(
+        num_q_heads, num_kv_heads, head_dim, hidden_size, intermediate_size);
+    TORCH_CHECK(topology.num_cores == pimpl_->num_cores_ &&
+                    topology.attention_tp > 0 && topology.attention_tp <= topology.num_cores &&
+                    topology.mlp_tp > 0 && topology.mlp_tp <= topology.num_cores,
+                "model execution topology must fit its cold owner core budget");
+    pimpl_->attn_tp_ = topology.attention_tp;
+    pimpl_->mlp_tp_ = topology.mlp_tp;
     pimpl_->num_q_heads_        = num_q_heads;
     pimpl_->num_kv_heads_       = num_kv_heads;
     pimpl_->head_dim_           = head_dim;
     pimpl_->hidden_size_        = hidden_size;
-    pimpl_->intermediate_size_  = intermediate_size;
-    pimpl_->attn_tp_            = std::min(8, (int)num_kv_heads);
+    // All SPM declarations, GEMMs and plan/layout hashes consume the physical
+    // width. The exact logical profile was checked before selecting its TP.
+    pimpl_->intermediate_size_  = decoder_mlp_intermediate_size(
+        intermediate_size, pimpl_->mlp_tp_);
+
+}
+
+void FusedModelBase::set_execution_core_count(int num_cores) {
+    TORCH_CHECK(num_cores >= 1 && num_cores <= 8,
+                "execution core count must be in [1,8]");
+    TORCH_CHECK(pimpl_->hidden_size_ == 0 && !pimpl_->valid_ &&
+                    get_last_resolved_chunk_size() == 0,
+                "execution topology must be bound before weights or planning");
+    pimpl_->num_cores_ = num_cores;
 }
 
 void FusedModelBase::set_num_layers(int64_t n) { pimpl_->num_layers_ = n; }
@@ -3372,16 +3719,18 @@ int64_t FusedModelBase::head_dim()          const { return pimpl_->head_dim_; }
 int64_t FusedModelBase::hidden_size()       const { return pimpl_->hidden_size_; }
 int64_t FusedModelBase::intermediate_size() const { return pimpl_->intermediate_size_; }
 int     FusedModelBase::attn_tp()           const { return pimpl_->attn_tp_; }
+int     FusedModelBase::num_cores()         const { return pimpl_->num_cores_; }
+int     FusedModelBase::mlp_tp()            const { return pimpl_->mlp_tp_; }
 int64_t FusedModelBase::num_layers()        const { return pimpl_->num_layers_; }
 
-// Fresh at::empty per forward plus a lifetime anchor makes the "tracked" in
-// the name true.
+// Pitfall 4 structural mitigation — fresh at::empty per forward, PLUS the C-1
+// lifetime anchor that makes the "tracked" in the name true.
 //
-// A caller that accumulates
+// The freshness half answers P4 (docs/pitfalls.md#p4): a caller that accumulates
 // per-forward outputs (Pi0.5 embed_prefix's per-image list, GR00T's per-step
 // action) must get distinct DDR each time, or torch.cat replays the last slot.
 //
-// Subclasses may bake
+// The tracking half answers C-1 (docs/pitfalls.md#c-1): subclasses bake
 // RpuGetDevAddr(out.data_ptr()) into a DEFERRED DMA destination — see
 // rpu_gr00t_dit_model.cpp x_out_dst_base_ in both step_forward and
 // unroll_forward — and the graph does not execute until RpuKernelGraph::end(),
@@ -3405,11 +3754,14 @@ at::Tensor FusedModelBase::allocate_tracked_output(at::IntArrayRef shape) {
 }
 
 // =============================================================================
-// Model state invalidation — subclass calls from set_weights.
-// Sets both weights_dirty_ and preload_callbacks_dirty_.
+// Model state invalidation (D-503) — subclass calls from set_weights
+// EXT-4: sets BOTH weights_dirty_ AND preload_callbacks_dirty_
 // =============================================================================
 
-void FusedModelBase::invalidate_model_state() {
+void FusedModelBase::invalidate_model_state(bool planning_domain_changed) {
+    if (planning_domain_changed) invalidate_planner_cache();
+    pimpl_->prepared_stage_candidates_.clear();
+    pimpl_->prepared_spm_costs_.clear();
     // The generation binds outer-fast and manifest ownership to the current
     // weights. It is deliberately excluded from compute_params_hash_impl: a
     // weight refresh does not change buffer sizes and must not force re-layout.
@@ -3425,9 +3777,13 @@ void FusedModelBase::invalidate_model_state() {
     TORCH_INTERNAL_ASSERT(
         pimpl_->model_state_gen_ ==
         *pimpl_->outer_fast_model_generation_);
-    pimpl_->weights_dirty_           = true;  // preload_fn path
-    pimpl_->preload_callbacks_dirty_ = true;  // Per-buffer callback path.
+    pimpl_->weights_dirty_           = true;  // EXT-4: preload_fn path
+    pimpl_->preload_callbacks_dirty_ = true;  // EXT-4: Gemma path (independent)
     pimpl_->attention_policy_by_plan_.clear();
+    pimpl_->kv_cost_candidates_.clear();
+    pimpl_->kv_cost_planning_context_.reset();
+    pimpl_->kv_cost_layout_scope_ = {};
+    pimpl_->kv_cost_snapshot_reason_ = "NATIVE_STAGE_ORACLE_REQUIRED";
     retire_pipeline_manifest(*pimpl_);
 }
 
@@ -3441,15 +3797,15 @@ static int64_t compute_params_hash_impl(
     int64_t hidden_size, int64_t intermediate_size,
     int64_t subclass_layout_hash)
 {
-    // chunk_size in the hash ensures re-allocation when the chunk changes.
-    // max_kv_seq_len affects SPM sizing only when use_attn_mask is true.
+    // [Fix #2]: chunk_size in hash ensures re-alloc when chunk changes.
+    // [Fix #5]: max_kv_seq_len only affects SPM sizing when use_attn_mask is true.
     int64_t h = num_q_heads * 1000003 ^ num_kv_heads * 999983 ^
                 head_dim * 999979 ^ hidden_size * 999961 ^
                 intermediate_size * 999931 ^
                 ctx.chunk_size * 999929 ^ ctx.num_layers * 999917 ^
                 (ctx.use_attn_mask ? ctx.max_kv_seq_len * 999907 : 0) ^
                 (ctx.use_attn_mask ? 999883 : 0);
-    // The bidirectional-no-mask (KV_FIRST) layout differs
+    // the bidirectional-no-mask (KV_FIRST) layout differs
     // from the causal layout at the SAME (chunk_size, use_attn_mask=false) —
     // CausalDecoderModel::declare_buffers splits q_kv, sizes k/v at kv_cs, and
     // flips buffer scopes / sdpa_tmp mask on this bit. Fold the derived bit in so
@@ -3459,8 +3815,8 @@ static int64_t compute_params_hash_impl(
     const bool kv_first_layout = !ctx.is_causal && !ctx.use_attn_mask;
     h ^= (kv_first_layout ? 999149 : 0);
     // kv_insert_chunk_size feeds declare_buffers'
-    // effective_kv_cs() → res/q_kv/k/v sizing for KV-first subclasses. It was
-    // absent from the hash, masked only by the old
+    // effective_kv_cs() → res/q_kv/k/v sizing (CausalDecoderModel KV_FIRST and
+    // HaloImageFlowModel). It was absent from the hash, masked only by the old
     // hardcoded planner constant; once plan_kv_first_chunks probes the real
     // footprint the chosen value varies, so it MUST key the allocation. Default 0
     // (single-chunk / causal) leaves the term 0 → zero perturbation.
@@ -3479,9 +3835,23 @@ static int64_t compute_params_hash_impl(
         h = detail::layout_mix(
             h, static_cast<int64_t>(ctx.stage_plan_fingerprint));
     }
+    if (ctx.physical_manifest_fingerprint != 0) {
+        h = detail::layout_mix(
+            h, static_cast<int64_t>(ctx.physical_manifest_fingerprint));
+    }
     if (ctx.attention_policy != AttentionExecutionPolicy::DDR_KV) {
         h = detail::layout_mix(
             h, static_cast<int64_t>(ctx.attention_policy));
+    }
+    if (ctx.rope_table_residency !=
+        FmbRopeTableResidency::UNSPECIFIED) {
+        h = detail::layout_mix(
+            h, static_cast<int64_t>(ctx.rope_table_residency));
+    }
+    if (ctx.forward_operand_residency !=
+        FmbForwardOperandResidency::UNSPECIFIED) {
+        h = detail::layout_mix(
+            h, static_cast<int64_t>(ctx.forward_operand_residency));
     }
     return h;
 }
@@ -4043,6 +4413,54 @@ int64_t detail::estimate_temporary_total(const std::vector<BufferDecl>& decls) {
         SpmAllocator::plan_temporary_aliased(requests).peak_bytes);
 }
 
+bool detail::FmbPreparedSpmCostCache::Input::matches(const BufferDecl& d) const {
+    return size == d.size && phase_start == d.phase_start && phase_end == d.phase_end &&
+        storage == d.storage && per_layer == d.per_layer && scope == d.scope &&
+        alias == (d.alias_of != nullptr);
+}
+
+detail::FmbPreparedSpmCost detail::FmbPreparedSpmCostCache::prepare(
+    const std::vector<BufferDecl>& declarations) {
+    for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+        if (it->inputs.size() == declarations.size() &&
+            std::equal(it->inputs.begin(), it->inputs.end(), declarations.begin(),
+                [](const Input& input, const BufferDecl& declaration) {
+                    return input.matches(declaration);
+                })) {
+            const auto cost = it->cost;
+            entries_.splice(entries_.begin(), entries_, it);
+            return cost;
+        }
+    }
+    const auto fixed = estimate_fixed_overhead(declarations);
+    Entry entry;
+    entry.cost = {fixed.persistent, fixed.temp_per_layer,
+                  detail::estimate_temporary_total(declarations)};
+    entry.inputs.reserve(declarations.size());
+    for (const auto& d : declarations) {
+        entry.inputs.push_back({d.size, d.phase_start, d.phase_end, d.storage,
+                                d.per_layer, d.scope, d.alias_of != nullptr});
+    }
+    entries_.push_front(std::move(entry));
+    if (entries_.size() > kCapacity) entries_.pop_back();
+    return entries_.front().cost;
+}
+
+int64_t detail::FmbPreparedSpmCost::available(
+    int64_t after_reset_free, bool persistent_allocated, int64_t planning_budget) const {
+    constexpr int64_t kOutOfBandReserve = 64 * 1024;
+    return std::min(std::max<int64_t>(planning_budget - persistent - temp_per_layer, 0),
+                    std::max<int64_t>(after_reset_free - kOutOfBandReserve - temp_per_layer -
+                                         (persistent_allocated ? 0 : persistent), 0));
+}
+
+bool detail::FmbPreparedSpmCost::fits(
+    int64_t after_reset_free, bool persistent_allocated, int64_t planning_budget) const {
+    const int64_t fixed = persistent + temp_per_layer;
+    return fixed >= 0 && temporary >= 0 && fixed <= planning_budget &&
+        temporary <= available(after_reset_free, persistent_allocated, planning_budget);
+}
+
 static int64_t available_temporary_spm_after_reset(
     const std::vector<BufferDecl>& decls,
     bool persistent_already_allocated) {
@@ -4082,6 +4500,32 @@ static bool final_chunk_layout_fits(
         temporary <= available;
 }
 
+bool FusedModelBase::declared_spm_layout_fits(
+    const std::vector<BufferDecl>& declarations) const {
+    TORCH_CHECK(!RpuKernelGraph::has_active(),
+                "SPM residency selection requires a cold planning context");
+    return final_chunk_layout_fits(declarations, pimpl_->persistent_allocated_);
+}
+
+LayoutContext FusedModelBase::bind_physical_layout_context(
+    LayoutContext layout, const FmbPhysicalExecutionManifest& manifest) const {
+    if (manifest.state != FmbPhysicalManifestState::COMPLETE) return layout;
+    layout.physical_manifest_fingerprint =
+        fmb_physical_manifest_fingerprint(manifest);
+    layout.rope_table_residency = fmb_rope_table_residency(manifest);
+    const auto attention =
+        FmbPhysicalManifestConsumer(manifest).attention_layout_policy();
+    if (attention.has_value()) layout.attention_policy = *attention;
+    layout.forward_operand_residency =
+        physical_forward_operand_residency(manifest);
+    TORCH_CHECK(
+        layout.forward_operand_residency == FmbForwardOperandResidency::UNSPECIFIED ||
+        layout.forward_operand_residency == FmbForwardOperandResidency::PER_LAYER ||
+        layout.forward_operand_residency == FmbForwardOperandResidency::FORWARD,
+        "Invalid descriptor-bound forward operand residency");
+    return layout;
+}
+
 static void validate_final_chunk_layout_fits(
     const std::vector<BufferDecl>& decls,
     bool persistent_already_allocated,
@@ -4096,7 +4540,8 @@ static void validate_final_chunk_layout_fits(
         fixed.total() <= budget && temporary <= available;
     TORCH_CHECK(
         fits,
-        contract, ": final joint compute/KV_FIRST layout exceeds SPM "
+        "RPU_PLANNER_REJECT:CAPABILITY: ", contract,
+        ": final joint compute/KV_FIRST layout exceeds SPM "
         "planning budget: fixed=", fixed.total(), " temporary=", temporary,
         " budget=", budget, " available=", available);
 }
@@ -4109,11 +4554,13 @@ static void validate_fmb_chunk_mode(
         case ChunkMode::SEQUENTIAL:
             return;
         case ChunkMode::KV_FIRST:
-            TORCH_CHECK(static_cfg.kv_first_fn != nullptr, contract,
+            TORCH_CHECK(static_cfg.kv_first_fn != nullptr,
+                        "RPU_PLANNER_REJECT:CAPABILITY: ", contract,
                         ": KV_FIRST requires kv_first_fn");
             return;
         default:
-            TORCH_CHECK(false, contract, ": unsupported ChunkMode");
+            TORCH_CHECK(false, "RPU_PLANNER_REJECT:CAPABILITY: ",
+                        contract, ": unsupported ChunkMode");
     }
 }
 
@@ -4130,22 +4577,25 @@ static InterLayerIO resolve_and_validate_fmb_inter_layer_io(
     TORCH_CHECK(
         io == InterLayerIO::SPM_RESIDENT ||
             io == InterLayerIO::DDR_PINGPONG,
-        contract, ": dynamic_config returned an invalid inter-layer I/O mode");
+        "RPU_PLANNER_REJECT:CAPABILITY: ", contract,
+        ": dynamic_config returned an invalid inter-layer I/O mode");
     TORCH_CHECK(
         !dynamic_cfg.chunk_outer_within_group ||
             (dynamic_cfg.chunk_mode == ChunkMode::SEQUENTIAL &&
              io == InterLayerIO::SPM_RESIDENT),
-        contract,
+        "RPU_PLANNER_REJECT:CAPABILITY: ", contract,
         ": chunk_outer_within_group requires SEQUENTIAL + SPM_RESIDENT");
     return io;
 }
 
 static void validate_kv_first_chunk_plan(
     const ChunkPlan& plan, int64_t execution_len, const char* contract) {
-    TORCH_CHECK(plan.chunk_size > 0, contract,
+    TORCH_CHECK(plan.chunk_size > 0,
+                "RPU_PLANNER_REJECT:CAPABILITY: ", contract,
                 ": KV_FIRST chunk_size must be positive");
     const int64_t expected = 1 + (execution_len - 1) / plan.chunk_size;
-    TORCH_CHECK(plan.num_chunks == expected, contract,
+    TORCH_CHECK(plan.num_chunks == expected,
+                "RPU_PLANNER_REJECT:CAPABILITY: ", contract,
                 ": KV_FIRST num_chunks does not match chunk_size: chunk_size=",
                 plan.chunk_size, " num_chunks=", plan.num_chunks,
                 " expected=", expected);
@@ -4198,28 +4648,110 @@ static void resolve_aliases_impl(
     }
 }
 
+// Shared with cold Persistent-only preparation. Keep the original first-Path-1
+// allocation order (including reverse-layer slots); no Temp or preload here.
+static void allocate_persistent_impl(
+    FusedModelBase::Impl& s,
+    const std::vector<BufferDecl>& decls,
+    int64_t new_persistent_hash)
+{
+    SPM_ALLOC.reset_all();
+    s.persistent_offsets_.clear();
+    s.persistent_per_layer_offsets_.clear();
+    s.persistent_usage_ = 0;
+    if (!SPM_ALLOC.is_initialized()) SPM_ALLOC.init();
+
+    for (auto& d : decls) {
+        if (d.alias_of) continue;
+        if (d.storage == StorageClass::PersistentPerLayer && d.per_layer > 0) {
+            if ((int)s.persistent_per_layer_offsets_.size() < d.per_layer)
+                s.persistent_per_layer_offsets_.resize(d.per_layer);
+            // B1: reverse_layer_alloc walks layers DESCENDING so the downward
+            // bump allocator lays layer 0 lowest — matching DDR [num_layers, h]
+            // order, which lets one DMA fill all layers (BufferDecl comment).
+            if (d.reverse_layer_alloc) {
+                for (int L = d.per_layer - 1; L >= 0; L--) {
+                    s.persistent_per_layer_offsets_[L][d.name] =
+                        SPM_ALLOC.alloc_super_persistent(d.size);
+                }
+            } else {
+                for (int L = 0; L < d.per_layer; L++) {
+                    s.persistent_per_layer_offsets_[L][d.name] =
+                        SPM_ALLOC.alloc_super_persistent(d.size);
+                }
+            }
+            s.persistent_usage_ += d.size * d.per_layer;
+        } else if (d.storage == StorageClass::Persistent) {
+            s.persistent_offsets_[d.name] =
+                SPM_ALLOC.alloc_super_persistent(d.size);
+            s.persistent_usage_ += d.size;
+        }
+    }
+    s.persistent_allocated_ = true;
+    s.persistent_layout_hash_ = new_persistent_hash;
+}
+
+void FusedModelBase::prepare_persistent_spm(
+    int64_t execution_len, int64_t position,
+    bool is_causal, int64_t mask_kv_len)
+{
+    TORCH_CHECK(!RpuKernelGraph::has_active(),
+                "prepare_persistent_spm must run outside Graph capture");
+    RpuExecutionCleanupGuard exclusive_planning("prepare_persistent_spm");
+    TORCH_CHECK(pimpl_->last_resolved_chunk_size_ == 0 && !pimpl_->valid_ &&
+                    !pimpl_->allocation_declaration_valid_ &&
+                    pimpl_->ctx_.hidden_states == nullptr,
+                "prepare_persistent_spm requires a cold, unexecuted owner");
+    detail::validate_fmb_planning_shape(
+        execution_len, position, "prepare_persistent_spm");
+    TORCH_CHECK(pimpl_->num_layers_ > 0 && pimpl_->hidden_size_ > 0 &&
+                    pimpl_->num_q_heads_ > 0 && pimpl_->num_kv_heads_ > 0 &&
+                    pimpl_->head_dim_ > 0 && pimpl_->intermediate_size_ > 0,
+                "prepare_persistent_spm requires installed model weights");
+    TORCH_CHECK(mask_kv_len >= 0 && !(is_causal && mask_kv_len > 0),
+                "prepare_persistent_spm: invalid explicit-mask geometry");
+    (void)subclass_chunk_size_cap(execution_len, position);
+    TORCH_CHECK(mask_kv_len == 0 ||
+                    (chunk_envelope().declared() &&
+                     mask_kv_len <= chunk_envelope().max_kv_len),
+                "prepare_persistent_spm: mask width exceeds the envelope");
+
+    LayoutContext layout;
+    // C16 is only a declaration seed for chunk-independent Persistent slots.
+    // It is not an EXACT request, a candidate, or an executed layout.
+    layout.chunk_size = 16;
+    layout.num_layers = pimpl_->num_layers_;
+    layout.max_kv_seq_len = mask_kv_len > 0
+        ? mask_kv_len : position + execution_len;
+    layout.use_attn_mask = mask_kv_len > 0;
+    layout.is_causal = is_causal;
+    const auto decls = declare_buffers(layout);
+    const int64_t persistent_hash = compute_persistent_hash_impl(decls);
+    TORCH_CHECK(!pimpl_->persistent_allocated_ ||
+                    persistent_hash == pimpl_->persistent_layout_hash_,
+                "FusedModelBase: Persistent buffer shape change detected after "
+                "initial allocation; recreate the model instance");
+    if (pimpl_->persistent_allocated_) return;
+
+    allocate_persistent_impl(*pimpl_, decls, persistent_hash);
+    ++pimpl_->persistent_layout_version_;
+    pimpl_->weights_dirty_ = true;
+    pimpl_->preload_callbacks_dirty_ = true;
+    // Keep allocation/forward/preload receipts untouched. The first real
+    // forward still runs Path 1 for Temp and records both preload paths.
+}
+
 // =============================================================================
-// ensure_allocated — three-path state machine
+// ensure_allocated — three-path state machine (bit-for-bit from v2)
 //
 // Path 1: params_changed → full realloc of temp + persistent (first call only)
 // Path 2: gen_changed → temp-only rebuild, persistent survives
 // Path 3: nothing to do, full reuse
 //
-// preload_callbacks_dirty_ is set when persistent_generation advances, not
-// just by invalidate_model_state.
+// Preserves every numbered Fix (#1..#5) from v2 FusedLayerBase (deleted in Plan 01-07b).
+// EXT-4: preload_callbacks_dirty_ is set when persistent_generation advances
+// (structural change), not just by invalidate_model_state.
 // =============================================================================
-
-// 多实例共存时不发假的"persistent 被抹掉"警报（RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN，
-// 默认 OFF —— 不改任何既有模型的行为）。理由见下面 Step 2 的注释。
-static bool coexist_keep_persistent_gen() {
-    static const bool v = [] {
-        const char* e = std::getenv("RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN");
-        if (!e) return false;
-        const std::string t(e);
-        return t == "1" || t == "true" || t == "True" || t == "on";
-    }();
-    return v;
-}
 
 static void ensure_allocated_impl(
     FusedModelBase::Impl& s,
@@ -4227,7 +4759,8 @@ static void ensure_allocated_impl(
     const LayoutContext& ctx,
     std::function<int64_t(const LayoutContext&)> estimate_temp_fn,
     int64_t subclass_layout_hash,
-    bool enforce_allocation_identity)
+    bool enforce_allocation_identity,
+    bool standalone_complete_layout)
 {
     int64_t new_hash = compute_params_hash_impl(
         ctx, s.num_q_heads_, s.num_kv_heads_, s.head_dim_,
@@ -4260,7 +4793,7 @@ static void ensure_allocated_impl(
         }
     }
 
-    // persistent_generation-aware Path 1 promotion
+    // [Fix #3] persistent_generation-aware Path 1 promotion
     bool persistent_invalidated =
         (s.cached_persistent_gen_ != SPM_ALLOC.persistent_generation());
     if (!params_changed && gen_changed && s.persistent_usage_ > 0 &&
@@ -4294,59 +4827,16 @@ static void ensure_allocated_impl(
 
         // Step 1: first-Path-1 Persistent allocation
         if (persistent_needs_alloc) {
-            SPM_ALLOC.reset_all();
-            s.persistent_offsets_.clear();
-            s.persistent_per_layer_offsets_.clear();
-            s.persistent_usage_ = 0;
-            if (!SPM_ALLOC.is_initialized()) SPM_ALLOC.init();
-
-            for (auto& d : decls) {
-                if (d.alias_of) continue;
-                if (d.storage == StorageClass::PersistentPerLayer && d.per_layer > 0) {
-                    if ((int)s.persistent_per_layer_offsets_.size() < d.per_layer)
-                        s.persistent_per_layer_offsets_.resize(d.per_layer);
-                    // B1: reverse_layer_alloc walks layers DESCENDING so the downward
-                    // bump allocator lays layer 0 lowest — matching DDR [num_layers, h]
-                    // order, which lets one DMA fill all layers (BufferDecl comment).
-                    if (d.reverse_layer_alloc) {
-                        for (int L = d.per_layer - 1; L >= 0; L--) {
-                            s.persistent_per_layer_offsets_[L][d.name] =
-                                SPM_ALLOC.alloc_super_persistent(d.size);
-                        }
-                    } else {
-                        for (int L = 0; L < d.per_layer; L++) {
-                            s.persistent_per_layer_offsets_[L][d.name] =
-                                SPM_ALLOC.alloc_super_persistent(d.size);
-                        }
-                    }
-                    s.persistent_usage_ += d.size * d.per_layer;
-                } else if (d.storage == StorageClass::Persistent) {
-                    s.persistent_offsets_[d.name] =
-                        SPM_ALLOC.alloc_super_persistent(d.size);
-                    s.persistent_usage_ += d.size;
-                }
-            }
-            s.persistent_allocated_ = true;
-            s.persistent_layout_hash_ = new_persistent_hash;
+            allocate_persistent_impl(s, decls, new_persistent_hash);
         }
 
-        // Step 2: clear temp (persistent survives above sp_floor_)。
-        //
-        // ⚠️ `reset_all()` 还会推进 `persistent_generation_`，而上面的检查把它读作
-        // "我的 persistent 被抹了" —— **多个实例共存时这是一个自持循环**：任一实例的
-        // Path 1 会把其余实例在各自的下一次 forward 提升到 Path 1，后者的 Path 1 又再次
-        // 推进代际，永不收敛。多个 handle 共存时会导致各实例在每帧重复
-        // realloc、re-preload 和 re-BUILD。
-        //
-        // 而普通 persistent 区（`[p_start_, sp_floor_)`）在本仓库**无人使用** ——
-        // `SpmAllocator::alloc_persistent()` 零调用点，每个 `StorageClass::Persistent`
-        // 声明都走上面的 `alloc_super_persistent`。该区为空时 `reset_all()` 与
-        // `reset_temporary()` 释放的字节**完全相同**，区别只剩那一个代际计数。
-        //
-        // 单实例模型下两支行为**完全一致**（`persistent_invalidated` 是在本函数入口
-        // 算的，单实例时自己上一轮的 bump 已在函数末尾被吸收 ⇒ 恒为 false）。
-        // 默认仍走 reset_all；只有显式 opt-in 才取无假警报的那支。
-        if (coexist_keep_persistent_gen() && SPM_ALLOC.persistent_used() == 0)
+        // Step 2: clear temporary allocations without invalidating live persistent data.
+        // When the ordinary persistent region [p_start_, sp_floor_) is empty,
+        // reset_temporary() releases the same bytes as reset_all() without advancing
+        // persistent_generation_. Advancing that generation unnecessarily makes
+        // coexisting handles repeatedly invalidate and rebuild each other's state.
+        // StorageClass::Persistent declarations use the super-persistent region.
+        if (SPM_ALLOC.persistent_used() == 0)
             SPM_ALLOC.reset_temporary();
         else
             SPM_ALLOC.reset_all();
@@ -4381,10 +4871,10 @@ static void ensure_allocated_impl(
 
         if (persistent_needs_alloc) {
             s.persistent_layout_version_++;
-            s.weights_dirty_ = true;  // preload_fn path
+            s.weights_dirty_ = true;  // EXT-4 preload_fn path
         }
 
-        // Persistent advance triggers preload_callbacks_dirty_ too —
+        // EXT-4: persistent advance triggers preload_callbacks_dirty_ too —
         // a buffer's SPM address may have moved, so the callback must re-fire.
         if (persistent_invalidated) s.preload_callbacks_dirty_ = true;
 
@@ -4394,6 +4884,15 @@ static void ensure_allocated_impl(
     } else if (gen_changed) {
         // Path 2: only rebuild temporary (persistent survives)
         if (!SPM_ALLOC.is_initialized()) SPM_ALLOC.init();
+        // A standalone COMPLETE plan owns a zero-based temporary layout. A
+        // sibling FMB may have reset and then populated this arena since our
+        // last call; generation drift does not imply that its waterline is 0.
+        // Rebuild at the planned base, preserving super-persistent weights.
+        // Leased/composite placements and legacy append-style callers do not
+        // grant this authority. Path 1 already resets; Path 3 changes nothing.
+        if (standalone_complete_layout) {
+            SPM_ALLOC.reset_temporary();
+        }
 
         s.temp_per_layer_usage_ = 0;
         for (auto& d : decls) {
@@ -4424,14 +4923,112 @@ static void ensure_allocated_impl(
 // =============================================================================
 // compute_chunks — linear scan (auto-path); honors subclass kernel-validity hook
 //
-// The combined SPM-budget and subclass kernel-validity predicate is not
-// monotone in cs, so binary search is invalid. Scan every candidate satisfying
-// both predicates. Among those candidates, prefer
+// History: v2/v3-original used a binary search assuming the predicate was
+// monotone in cs (only SPM budget was checked, which IS monotone). When the
+// subclass kernel-validity predicate (e.g. Qwen3 sdpa_is_valid_chunk_size)
+// was added it became NON-monotone — cs=384 valid, cs=480/512 invalid,
+// cs=256 valid again — causing auto-pick to silently land on invalid sizes
+// (test_qwen3_prefill.py at seq=468/512). Replaced with a linear scan over
+// every candidate satisfying BOTH predicates. Among those candidates, prefer
 // the fewest chunks and then the smallest tail deficit.
 //
 // Cost: bounded by seq_len/16 declare_buffers() probes (max 512 at seq=8192),
 // each cheap relative to the actual forward.
 // =============================================================================
+
+struct ChunkSizeProbe {
+    int64_t chunk_size = 0;
+    int64_t temporary_bytes = 0;
+    int64_t available_bytes = 0;
+    bool valid = false;
+    bool fits = false;
+};
+
+static std::vector<ChunkSizeProbe> enumerate_chunk_size_domain_impl(
+    FusedModelBase::Impl& s,
+    const std::function<std::vector<BufferDecl>(const LayoutContext&)>& decl_fn,
+    const std::function<bool(int64_t)>& valid_fn,
+    int64_t chunk_size_cap,
+    int64_t seq_len,
+    const LayoutContext& base_ctx,
+    bool apply_auto_cap) {
+    int64_t hi = ((seq_len + 15) / 16) * 16;
+    if (apply_auto_cap && chunk_size_cap > 0) {
+        const int64_t aligned_cap = (chunk_size_cap / 16) * 16;
+        TORCH_CHECK(aligned_cap >= 16,
+                    "RPU_PLANNER_REJECT:CAPABILITY: chunk_size_cap must be "
+                    "0 or >= 16, got ",
+                    chunk_size_cap);
+        hi = std::min(hi, aligned_cap);
+    }
+
+    std::vector<ChunkSizeProbe> result;
+    result.reserve(static_cast<size_t>(hi / 16));
+    for (int64_t chunk_size = 16; chunk_size <= hi; chunk_size += 16) {
+        // Some owners require a complete fixed suffix (HALO M18/C32,
+        // LingBot2 M51/C64). Their declarations cannot represent smaller
+        // candidates. Reject those through the owner's validity hook before
+        // constructing a layout, so an invalid C16 cannot abort a legal C32.
+        const bool valid = !valid_fn || valid_fn(chunk_size);
+        if (!valid) {
+            result.push_back({chunk_size, 0, 0, false, false});
+            continue;
+        }
+        LayoutContext context = base_ctx;
+        context.chunk_size = chunk_size;
+        const std::vector<BufferDecl> declarations = decl_fn(context);
+        const int64_t temporary =
+            detail::estimate_temporary_total(declarations);
+        const int64_t available = available_temporary_spm_after_reset(
+            declarations, s.persistent_allocated_);
+        result.push_back({chunk_size, temporary, available, valid,
+                          temporary <= available &&
+                              final_chunk_layout_fits(
+                                  declarations, s.persistent_allocated_)});
+    }
+    return result;
+}
+
+static std::vector<ChunkInfo> make_fmb_chunks(
+    int64_t seq_len, int64_t position, int64_t chunk_size) {
+    std::vector<ChunkInfo> chunks;
+    for (int64_t off = 0; off < seq_len; off += chunk_size) {
+        const int64_t len = std::min(chunk_size, seq_len - off);
+        chunks.push_back({static_cast<int>(chunks.size()), off, len,
+                          position + off + len});
+    }
+    return chunks;
+}
+
+static void validate_fmb_input_stage(
+    const std::vector<ChunkInfo>& input_chunks,
+    const std::vector<FmbExecutionSpan>& spans,
+    FmbSpanBoundaryPolicy boundary_policy,
+    int64_t seq_len,
+    int64_t position,
+    const char* contract) {
+    detail::validate_fmb_execution_spans(spans, seq_len, contract);
+    TORCH_CHECK(detail::validate_resolved_chunk_coverage(
+                    input_chunks, contract, "input") == seq_len,
+                contract, ": input chunks must cover the physical length");
+    TORCH_CHECK(input_chunks.front().kv_seq_len - input_chunks.front().len ==
+                    position,
+                contract, ": input chunks require the dispatch position base");
+    TORCH_CHECK(detail::fmb_chunks_respect_boundary_policy(
+                    input_chunks, spans, boundary_policy),
+                contract, ": input chunks violate the semantic span boundary "
+                "policy");
+}
+
+static int64_t legacy_chunk_override_for_exact_request(
+    int64_t legacy_override, int64_t seq_len) {
+    // A sticky prefill override has always resolved to one v16 capacity for
+    // single-token calls, including noncausal owners. Compare EXACT against
+    // that request-local legacy meaning without changing either authority.
+    // Multi-token prefill remains strict: its exact request is never clamped.
+    return seq_len == 1 && legacy_override > 0
+        ? std::min(legacy_override, int64_t{16}) : legacy_override;
+}
 
 static std::vector<ChunkInfo> compute_chunks_impl(
     FusedModelBase::Impl& s,
@@ -4439,33 +5036,68 @@ static std::vector<ChunkInfo> compute_chunks_impl(
     std::function<bool(int64_t)> valid_fn,
     int64_t chunk_size_cap,
     int64_t seq_len, int64_t position, const LayoutContext& base_ctx,
-    int64_t* resolved_chunk_size)
+    int64_t* resolved_chunk_size, int64_t planned_chunk_size = 0,
+    std::function<bool(int64_t)> hard_valid_fn = {})
 {
-    // Fixed declarations and the allocator capacity available after the next
-    // temporary reset constrain both auto and explicit chunk selection.  Keep
-    // this one budget so an override cannot pass the dry plan and OOM when the
-    // real layout is materialised beside another subsystem's persistent SPM.
-    LayoutContext probe_ctx = base_ctx;
-    probe_ctx.chunk_size = 16;
-    const int64_t available =
-        available_temporary_spm_after_reset(
-            decl_fn(probe_ctx), s.persistent_allocated_);
-
-    auto temporary_total_for = [&](int64_t cs) {
-        LayoutContext ctx = base_ctx;
-        ctx.chunk_size = cs;
-        return detail::estimate_temporary_total(decl_fn(ctx));
-    };
+    TORCH_CHECK(planned_chunk_size == 0 ||
+                    (planned_chunk_size >= 16 && planned_chunk_size % 16 == 0),
+                "RPU_PLANNER_REJECT:EXACT_MISMATCH: planner authority: "
+                "planned chunk size must be 0 or a positive multiple of 16, "
+                "got ", planned_chunk_size);
+    const int64_t requested_chunk_size =
+        planned_chunk_size > 0 ? planned_chunk_size : s.chunk_size_override_;
+    if (planned_chunk_size > 0) {
+        detail::validate_fmb_exact_chunk_size(
+            planned_chunk_size, seq_len, "FusedModelBase");
+    }
+    const auto probes = enumerate_chunk_size_domain_impl(
+        s, decl_fn, valid_fn, chunk_size_cap, seq_len, base_ctx,
+        /*apply_auto_cap=*/requested_chunk_size == 0);
+    const auto first_valid = std::find_if(probes.begin(), probes.end(),
+        [](const ChunkSizeProbe& probe) { return probe.valid; });
+    const int64_t available = first_valid == probes.end()
+        ? 0 : first_valid->available_bytes;
+    const int64_t after_reset_free = (int64_t)SPM_ALLOC.free_space()
+                                   + (int64_t)SPM_ALLOC.temporary_used();
+    if (std::getenv("HALO_CHUNK_DIAG") != nullptr) {
+        fprintf(stderr,
+                "[CHUNK_DIAG] cap seq_len=%ld free=%ld temp=%ld "
+                "after_reset=%ld budget=%ld\n",
+                (long)seq_len, (long)SPM_ALLOC.free_space(),
+                (long)SPM_ALLOC.temporary_used(), (long)after_reset_free,
+                (long)available);
+    }
 
     int64_t chunk_size = 0;
-    if (s.chunk_size_override_ > 0) {
-        // Clamp the override to the v16-rounded seq_len: a single override is
-        // sticky across prefill + decode, but cs > seq_len has no meaning and
-        // would fail the subclass validator (e.g. decode at seq_len=1 with a
-        // prefill override of 512 → valid_fn(512) rejects against sQry=1).
-        // The auto path below already implicitly bounds cs by hi=ceil16(seq_len).
-        int64_t hi = ((seq_len + 15) / 16) * 16;
-        chunk_size = std::min(s.chunk_size_override_, hi);
+    if (requested_chunk_size > 0) {
+        const int64_t hi = ((seq_len + 15) / 16) * 16;
+        if (planned_chunk_size > 0) {
+            // Canonical EXACT is never a clamp.  The sticky handle override
+            // below is the only legacy COMPAT_CLAMP path.
+            chunk_size = planned_chunk_size;
+        } else {
+            // Legacy handle policy is shared by prefill and decode, so a
+            // prefill-sized value must retain its historical decode clamp.
+            chunk_size = std::min(s.chunk_size_override_, hi);
+        }
+        if (planned_chunk_size > 0 && s.chunk_size_override_ > 0) {
+            const int64_t effective_legacy_override =
+                legacy_chunk_override_for_exact_request(s.chunk_size_override_, seq_len);
+            TORCH_CHECK(
+                chunk_size == effective_legacy_override,
+                "RPU_PLANNER_REJECT:EXACT_MISMATCH: planner authority "
+                "mismatch: A6 selected chunk_size=",
+                planned_chunk_size, " but the handle exact policy resolves ",
+                effective_legacy_override, " (stored override=", s.chunk_size_override_, ")");
+        }
+        const auto selected = std::find_if(
+            probes.begin(), probes.end(), [chunk_size](const ChunkSizeProbe& p) {
+                return p.chunk_size == chunk_size;
+            });
+        TORCH_CHECK(selected != probes.end(),
+                    "RPU_PLANNER_REJECT:CAPABILITY: chunk_size=", chunk_size,
+                    " is outside the bounded native domain");
+        auto selected_probe = *selected;
         // Diagnostic-only escape hatch. It bypasses only the subclass/kernel
         // validity gate; the hard SPM-fit check remains non-negotiable.
         static const bool force_unsafe = [] {
@@ -4473,9 +5105,11 @@ static std::vector<ChunkInfo> compute_chunks_impl(
             return value != nullptr &&
                 (std::string(value) == "1" || std::string(value) == "true");
         }();
-        if (!valid_fn(chunk_size)) {
+        if (!selected->valid) {
             TORCH_CHECK(force_unsafe,
-                "chunk_size_override(", s.chunk_size_override_, ", clamped to ",
+                "RPU_PLANNER_REJECT:CAPABILITY: ",
+                planned_chunk_size > 0 ? "planned_exact(" : "legacy_compat_clamp(",
+                requested_chunk_size, ", resolved to ",
                 chunk_size, ") fails validity check (position=", position,
                 ", seq_len=", seq_len, ")");
             if (log_at(2)) {
@@ -4486,83 +5120,89 @@ static std::vector<ChunkInfo> compute_chunks_impl(
                     << ", seq_len=" << seq_len
                     << ") -- output may be numerically wrong\n";
             }
+            // Preserve the explicit diagnostic-only path: ordinary enumeration
+            // never declares invalid candidates. The requested unsafe layout
+            // must still be representable by the owner and fit real SPM.
+            LayoutContext unsafe_context = base_ctx;
+            unsafe_context.chunk_size = chunk_size;
+            const auto unsafe_declarations = decl_fn(unsafe_context);
+            selected_probe.temporary_bytes = detail::estimate_temporary_total(
+                unsafe_declarations);
+            selected_probe.available_bytes = available_temporary_spm_after_reset(
+                unsafe_declarations, s.persistent_allocated_);
+            selected_probe.fits = final_chunk_layout_fits(
+                unsafe_declarations, s.persistent_allocated_);
         }
-        const int64_t total = temporary_total_for(chunk_size);
-        TORCH_CHECK(total <= available,
-            "chunk_size_override(", s.chunk_size_override_, ", clamped to ",
+        TORCH_CHECK(selected_probe.fits,
+            "RPU_PLANNER_REJECT:CAPABILITY: ",
+            planned_chunk_size > 0 ? "planned_exact(" : "legacy_compat_clamp(",
+            requested_chunk_size, ", resolved to ",
             chunk_size, ") exceeds SPM budget (position=", position,
-            ", seq_len=", seq_len, ", required=", total,
-            " bytes, available=", available, " bytes)");
+            ", seq_len=", seq_len, ", required=",
+            selected_probe.temporary_bytes, " bytes, available=",
+            selected_probe.available_bytes, " bytes)");
+        TORCH_CHECK(!hard_valid_fn || hard_valid_fn(chunk_size),
+                    "RPU_PLANNER_REJECT:CAPABILITY: chunk_size=", chunk_size,
+                    " violates a semantic span boundary policy");
     } else {
-        int64_t hi = ((seq_len + 15) / 16) * 16;
-        if (chunk_size_cap > 0) {
-            const int64_t aligned_cap = (chunk_size_cap / 16) * 16;
-            TORCH_CHECK(aligned_cap >= 16,
-                        "chunk_size_cap must be 0 or >= 16, got ",
-                        chunk_size_cap);
-            hi = std::min(hi, aligned_cap);
+        // Enumerate the complete bounded domain. Selection is retained only
+        // for legacy direct callers; production prefill passes the A6 winner
+        // back as planned_chunk_size.
+        const bool chunk_diag = (std::getenv("HALO_CHUNK_DIAG") != nullptr);
+        for (const ChunkSizeProbe& probe : probes) {
+            const bool hard_valid = probe.fits && probe.valid &&
+                (!hard_valid_fn || hard_valid_fn(probe.chunk_size));
+            const bool preferred = hard_valid &&
+                detail::prefer_balanced_chunk(
+                    seq_len, probe.chunk_size, chunk_size);
+            if (chunk_diag) {
+                fprintf(stderr,
+                    "[CHUNK_DIAG] cs=%ld total=%ld avail=%ld fits=%d "
+                    "valid=%d boundary=%d%s\n",
+                    (long)probe.chunk_size, (long)probe.temporary_bytes,
+                    (long)probe.available_bytes, (int)probe.fits,
+                    (int)probe.valid, (int)hard_valid,
+                    preferred ? "  <-- BEST" : "");
+            }
+            if (preferred) chunk_size = probe.chunk_size;
         }
-
-        // Top-down linear scan over [16, hi] (step 16). First minimize the
-        // number of chunks, then minimize n*cs-seq_len: the latter is both the
-        // tail deficit and the padding needed to make all chunks equal.
-        chunk_size = 0;
-        for (int64_t cs = hi; cs >= 16; cs -= 16) {
-            if (chunk_size > 0 &&
-                (seq_len + cs - 1) / cs > (seq_len + chunk_size - 1) / chunk_size)
-                break;
-            const int64_t total = temporary_total_for(cs);
-            const bool fits = (total <= available);
-            const bool valid = (!valid_fn || valid_fn(cs));
-            const bool preferred = fits && valid &&
-                detail::prefer_balanced_chunk(seq_len, cs, chunk_size);
-            if (preferred) chunk_size = cs;
-        }
+        const int64_t hi = probes.empty() ? 0 : probes.back().chunk_size;
         TORCH_CHECK(chunk_size > 0,
-                    "compute_chunks: no chunk_size in [16, ", hi,
-                    "] (step 16) satisfies BOTH SPM budget AND subclass "
-                    "kernel-validity. seq_len=", seq_len,
+                    "RPU_PLANNER_REJECT:NO_FEASIBLE: compute_chunks: no "
+                    "chunk_size in [16, ", hi,
+                    "] (step 16) satisfies SPM, kernel-validity, and semantic "
+                    "boundary policy. seq_len=", seq_len,
                     ", chunk_size_cap=", chunk_size_cap,
                     ", available=", available, " bytes. "
                     "Use the model's supported per-instance or per-handle chunk "
                     "control if an explicit size is required.");
     }
 
-    // Ensure the minimum chunk fits.
-    {
-        LayoutContext min_ctx = base_ctx;
-        min_ctx.chunk_size = chunk_size;
-        auto min_decls = decl_fn(min_ctx);
-        const int64_t fixed = estimate_fixed_overhead(min_decls).total();
-        int64_t temp_peak = detail::estimate_temporary_total(min_decls);
-        TORCH_CHECK(fixed + temp_peak <=
-                        (int64_t)SpmAllocator::SPM_PLANNING_BUDGET,
-                    "Cannot fit even chunk_size=", chunk_size, " in SPM. "
-                    "Fixed=", fixed, ", Temp peak=", temp_peak,
-                    ", Available=",
-                    (int64_t)SpmAllocator::SPM_PLANNING_BUDGET);
-    }
-
     *resolved_chunk_size = chunk_size;
 
-    std::vector<ChunkInfo> chunks;
-    for (int64_t off = 0; off < seq_len; off += chunk_size) {
-        int64_t len = std::min(chunk_size, seq_len - off);
-        chunks.push_back({(int)(off / chunk_size), off, len, position + off + len});
-    }
-    return chunks;
+    return make_fmb_chunks(seq_len, position, chunk_size);
 }
 
 int64_t FusedModelBase::resolve_chunk_size_for_shape(
     int64_t seq_len, int64_t position,
     const std::optional<at::Tensor>& attention_mask, bool is_causal) {
-    TORCH_CHECK(seq_len > 0 && position >= 0,
-                "resolve_chunk_size_for_shape: invalid seq_len/position");
+    const char* api = "resolve_chunk_size_for_shape";
+    std::optional<RpuExecutionCleanupGuard> exclusive_planning;
+    if (RpuKernelGraph::has_active()) {
+        RpuExecutionCoordinator::check_current_thread_execution_allowed(api);
+    } else {
+        exclusive_planning.emplace(api);
+    }
+    detail::validate_fmb_planning_shape(seq_len, position, api);
     const auto static_cfg = static_config();
-    TORCH_CHECK(static_cfg.num_layers > 0,
-                "resolve_chunk_size_for_shape: model weights are not initialized");
-    TORCH_CHECK(static_cfg.num_layers == pimpl_->num_layers_,
-                "resolve_chunk_size_for_shape: num_layers mismatch");
+    TORCH_CHECK(
+        static_cfg.num_layers > 0,
+        "RPU_PLANNER_REJECT:CAPABILITY: resolve_chunk_size_for_shape: "
+        "model weights are not initialized");
+    TORCH_CHECK(
+        static_cfg.num_layers == pimpl_->num_layers_,
+        "RPU_PLANNER_REJECT:CAPABILITY: resolve_chunk_size_for_shape: "
+        "num_layers mismatch");
 
     const InferenceContext saved_ctx = pimpl_->ctx_;
     auto restore_ctx = c10::make_scope_exit([&] { pimpl_->ctx_ = saved_ctx; });
@@ -4575,6 +5215,7 @@ int64_t FusedModelBase::resolve_chunk_size_for_shape(
     pimpl_->ctx_.is_causal = is_causal;
     pimpl_->ctx_.input_in_spm = false;
     pimpl_->ctx_.output_to_spm = false;
+    pimpl_->ctx_.physical_route_invocation = 0;
     pimpl_->ctx_.attention_policy = AttentionExecutionPolicy::DDR_KV;
 
     LayoutContext layout_ctx;
@@ -4595,9 +5236,603 @@ int64_t FusedModelBase::resolve_chunk_size_for_shape(
     auto chunks = compute_chunks_impl(
         *pimpl_, decl_fn, valid_fn, chunk_size_cap,
         seq_len, position, layout_ctx, &resolved);
-    TORCH_CHECK(!chunks.empty(),
-                "resolve_chunk_size_for_shape: planner returned no chunks");
+    TORCH_CHECK(
+        !chunks.empty(),
+        "RPU_PLANNER_REJECT:NO_FEASIBLE: resolve_chunk_size_for_shape: "
+        "planner returned no chunks");
     return resolved;
+}
+
+std::vector<FmbPrefillStageCandidate>
+FusedModelBase::resolve_prefill_stage_domain_for_shape(
+    int64_t seq_len, int64_t position,
+    const std::optional<at::Tensor>& attention_mask, bool is_causal,
+    int64_t requested_chunk_size, int64_t logical_len,
+    int64_t planning_chunk_size_override) {
+    return resolve_prefill_stage_domain_for_shape_impl(
+        seq_len, position, attention_mask, is_causal,
+        nullptr, nullptr, nullptr, requested_chunk_size, logical_len,
+        planning_chunk_size_override);
+}
+
+static FusedModelBase::Impl::KvCostCandidate make_kvinsert_cost_candidate(
+        const FmbPrefillStageCandidate& candidate,
+        const std::vector<FusedModelBase::Impl::KvCostObservation>& observations) {
+    FusedModelBase::Impl::KvCostCandidate result;
+    result.descriptor = encode_fmb_prefill_stage_candidate(candidate);
+    result.reason = "INCOMPLETE_PHYSICAL_MANIFEST";
+    const auto& manifest = candidate.physical_manifest;
+    if (manifest.state != FmbPhysicalManifestState::COMPLETE) return result;
+    result.reason = "NO_COMPETING_KV_DOMAIN";
+    auto reject = [&](const char* reason) {
+        result.reason = reason;
+        result.rows.clear();
+    };
+    auto observation_for = [&](const auto& route) {
+        const FusedModelBase::Impl::KvCostObservation* found = nullptr;
+        for (const auto& observation : observations) {
+            if (observation.site_id != route.site_id ||
+                observation.graph_lifecycle != static_cast<int64_t>(manifest.graph_lifecycle) ||
+                !std::equal(route.arguments.begin(), route.arguments.end(), observation.arguments.begin())) continue;
+            if (found != nullptr &&
+                std::tie(found->num_cores, found->num_kv_heads, found->head_dim, found->capabilities) !=
+                std::tie(observation.num_cores, observation.num_kv_heads, observation.head_dim, observation.capabilities)) {
+                reject("NATIVE_KV_DOMAIN_AMBIGUOUS");
+                return static_cast<const FusedModelBase::Impl::KvCostObservation*>(nullptr);
+            }
+            found = &observation;
+        }
+        if (found == nullptr) reject("NATIVE_KV_DOMAIN_PRODUCER_UNAVAILABLE");
+        return found;
+    };
+    for (const auto& route : manifest.routes) {
+        if (route.family != FmbRouteFamily::KV_INSERT) continue;
+        const auto& args = route.arguments;
+        // The only registered family-5 allocation auxiliaries (HYViT2 and
+        // HyVLA expert) are not executable KV plans. Bind their source ABI to
+        // the actual same-invocation KV22 and its observed native partition.
+        const int64_t paired_site = route.site_id == 8743411889070049254LL
+            ? 3316688202874054057LL : route.site_id == 3353793944280539666LL
+            ? 2502630319608950519LL : 0;
+        if (paired_site != 0) {
+            const int64_t paired_flags = route.site_id == 8743411889070049254LL ? 1 : 2;
+            if (manifest.graph_lifecycle != FmbGraphLifecycle::COMPOSITE_CHILD ||
+                route.flags != 0 || args.size() != 7 ||
+                (args[0] != 0 && args[0] != 1) || route.selector != args[0] + 1 ||
+                candidate.qkv_chunk_size <= 0 ||
+                candidate.qkv_chunk_size > std::numeric_limits<int64_t>::max() - 15 ||
+                args[1] <= 0 || args[1] > candidate.qkv_chunk_size ||
+                args[2] != (args[0] ? (candidate.qkv_chunk_size + 15) / 16 * 16 : 0) ||
+                args[3] != (args[0] ? args[2] : args[1])) {
+                reject("NATIVE_KV_DOMAIN_PRODUCER_UNAVAILABLE");
+                return result;
+            }
+            const auto* counterpart = &route;
+            size_t count = 0;
+            for (const auto& other : manifest.routes) {
+                if (other.family == FmbRouteFamily::KV_INSERT &&
+                    other.site_id == paired_site && other.invocation == route.invocation) {
+                    counterpart = &other;
+                    ++count;
+                }
+            }
+            if (count != 1 || counterpart->flags != paired_flags ||
+                counterpart->arguments.size() != kKvInsertRouteArgumentWords ||
+                counterpart->arguments[0] != 2 ||
+                counterpart->selector != counterpart->arguments[1] ||
+                counterpart->arguments[2] != args[1] || counterpart->arguments[3] != args[3]) {
+                reject("NATIVE_KV_DOMAIN_PRODUCER_UNAVAILABLE");
+                return result;
+            }
+            const auto* found = observation_for(*counterpart);
+            if (found == nullptr) return result;
+            if (std::tie(found->num_cores, found->num_kv_heads, found->head_dim) !=
+                std::tie(args[4], args[5], args[6])) {
+                reject("NATIVE_KV_DOMAIN_PRODUCER_UNAVAILABLE");
+                return result;
+            }
+            continue;
+        }
+        if (args.size() != kKvInsertRouteArgumentWords || args[0] != 2) {
+            reject("NATIVE_KV_DOMAIN_PRODUCER_UNAVAILABLE");
+            return result;
+        }
+        if ((route.flags & KV_INSERT_ROUTE_FLAG_DYNAMIC_POSITION) != 0) continue;
+        const int64_t mask = args[18];
+        if (mask == 0 || (mask & (mask - 1)) == 0) continue;
+        const auto* found = observation_for(route);
+        if (found == nullptr) return result;
+        // Fixed diagnostic row: site, lifecycle, invocation, position,
+        // logical/physical rows, cores, KV heads, head dim, caps, mask, state.
+        result.rows.push_back({route.site_id, found->graph_lifecycle, route.invocation,
+            args[6], args[2], args[3], found->num_cores, found->num_kv_heads,
+            found->head_dim, found->capabilities, mask, args[17]});
+    }
+    if (!result.rows.empty()) result.reason = "READY";
+    return result;
+}
+
+std::vector<FmbPrefillStageCandidate>
+FusedModelBase::resolve_prefill_stage_domain_for_shape(
+    int64_t seq_len, int64_t position,
+    const std::optional<at::Tensor>& attention_mask, bool is_causal,
+    const std::vector<ChunkInfo>& input_chunks,
+    const std::vector<FmbExecutionSpan>& spans,
+    FmbStageBoundaryPolicies boundary_policies,
+    int64_t requested_chunk_size, int64_t logical_len,
+    int64_t planning_chunk_size_override) {
+    return resolve_prefill_stage_domain_for_shape_impl(
+        seq_len, position, attention_mask, is_causal,
+        &input_chunks, &spans, &boundary_policies, requested_chunk_size,
+        logical_len, planning_chunk_size_override);
+}
+
+void FusedModelBase::begin_kvinsert_cost_domain_oracle() {
+    TORCH_CHECK(!RpuKernelGraph::has_active() &&
+                    pimpl_->kv_cost_observations_ == nullptr,
+                "KV cost oracle must run outside capture/nested observation");
+    pimpl_->kv_cost_candidates_.clear();
+    pimpl_->kv_cost_planning_context_.reset();
+    pimpl_->kv_cost_layout_scope_ = {};
+    pimpl_->kv_cost_snapshot_words_ = 0;
+    pimpl_->kv_cost_snapshot_reason_ = "NATIVE_STAGE_ORACLE_FAILED";
+}
+
+void FusedModelBase::remember_kvinsert_cost_planning_context(
+        const InferenceContext& context) {
+    pimpl_->kv_cost_planning_context_ = context;
+    // A layout-only snapshot must not retain borrowed per-forward addresses
+    // (the cache vectors/input reference may have lived on the caller stack).
+    pimpl_->kv_cost_planning_context_->hidden_states = nullptr;
+    pimpl_->kv_cost_planning_context_->k_caches = nullptr;
+    pimpl_->kv_cost_planning_context_->v_caches = nullptr;
+    pimpl_->kv_cost_planning_context_->cancel_external_physical_manifest_prologue();
+    pimpl_->kv_cost_layout_scope_ = capture_kvinsert_cost_layout_scope();
+    if (!pimpl_->kv_cost_layout_scope_) {
+        pimpl_->kv_cost_planning_context_.reset();
+        pimpl_->kv_cost_snapshot_reason_ = "NATIVE_KV_DOMAIN_SNAPSHOT_LIMIT";
+    }
+}
+
+std::vector<FmbPrefillStageCandidate>
+FusedModelBase::observe_kvinsert_cost_candidates(
+        const std::function<std::vector<FmbPrefillStageCandidate>()>& producer,
+        const LayoutContext* actual_layout) {
+    TORCH_CHECK(pimpl_->kv_cost_observations_ == nullptr,
+                "nested KV cost domain observation is not supported");
+    std::vector<Impl::KvCostObservation> observations;
+    pimpl_->kv_cost_observations_ = &observations;
+    auto reset_observer = c10::make_scope_exit([&] {
+        pimpl_->kv_cost_observations_ = nullptr;
+    });
+    try {
+        auto candidates = producer();
+        for (const auto& candidate : candidates) {
+            if (pimpl_->kv_cost_snapshot_reason_ == "NATIVE_KV_DOMAIN_SNAPSHOT_LIMIT") break;
+            auto metadata = make_kvinsert_cost_candidate(candidate, observations);
+            if (actual_layout != nullptr) {
+                metadata.layout = *actual_layout;
+                metadata.subclass_layout_identity = subclass_layout_hash();
+                metadata.layout_bound = true;
+            }
+            size_t words = metadata.descriptor.size();
+            for (const auto& row : metadata.rows) words += row.size();
+            if (pimpl_->kv_cost_candidates_.size() == 4096 ||
+                words > 1048576 - pimpl_->kv_cost_snapshot_words_) {
+                pimpl_->kv_cost_candidates_.clear();
+                pimpl_->kv_cost_planning_context_.reset();
+                pimpl_->kv_cost_layout_scope_ = {};
+                pimpl_->kv_cost_snapshot_reason_ = "NATIVE_KV_DOMAIN_SNAPSHOT_LIMIT";
+                break;
+            }
+            pimpl_->kv_cost_snapshot_words_ += words;
+            pimpl_->kv_cost_candidates_.push_back(std::move(metadata));
+        }
+        return candidates;
+    } catch (...) {
+        pimpl_->kv_cost_candidates_.clear();
+        pimpl_->kv_cost_planning_context_.reset();
+        pimpl_->kv_cost_layout_scope_ = {};
+        pimpl_->kv_cost_snapshot_reason_ = "NATIVE_STAGE_ORACLE_FAILED";
+        throw;
+    }
+}
+
+void FusedModelBase::finish_kvinsert_cost_domain_oracle(
+        const std::vector<FmbPrefillStageCandidate>& returned_candidates) {
+    TORCH_CHECK(pimpl_->kv_cost_observations_ == nullptr,
+                "cannot publish an active KV cost observation");
+    if (pimpl_->kv_cost_snapshot_reason_ == "NATIVE_KV_DOMAIN_SNAPSHOT_LIMIT") return;
+    std::vector<std::vector<int64_t>> returned;
+    returned.reserve(returned_candidates.size());
+    for (const auto& candidate : returned_candidates) {
+        returned.push_back(encode_fmb_prefill_stage_candidate(candidate));
+    }
+    auto& metadata = pimpl_->kv_cost_candidates_;
+    metadata.erase(std::remove_if(metadata.begin(), metadata.end(),
+        [&](const auto& row) {
+            return std::find(returned.begin(), returned.end(), row.descriptor) == returned.end();
+        }), metadata.end());
+    std::sort(metadata.begin(), metadata.end(),
+              [](const auto& a, const auto& b) { return a.descriptor < b.descriptor; });
+    for (size_t i = 1; i < metadata.size(); ++i) {
+        if (metadata[i - 1].descriptor == metadata[i].descriptor) {
+            TORCH_CHECK(metadata[i - 1].rows == metadata[i].rows &&
+                            metadata[i - 1].reason == metadata[i].reason,
+                        "native KV oracle produced conflicting metadata for one descriptor");
+        }
+    }
+    metadata.erase(std::unique(metadata.begin(), metadata.end(),
+        [](const auto& a, const auto& b) { return a.descriptor == b.descriptor; }), metadata.end());
+    pimpl_->kv_cost_precision_identity_ = kvinsert_cost_weight_identity();
+    pimpl_->kv_cost_model_state_gen_ = pimpl_->model_state_gen_;
+    pimpl_->kv_cost_snapshot_reason_ = "READY";
+}
+
+void FusedModelBase::bind_kvinsert_cost_owner_prefix(
+        at::IntArrayRef descriptor, at::IntArrayRef native_prefix) {
+    if (pimpl_->kv_cost_snapshot_reason_ == "NATIVE_KV_DOMAIN_SNAPSHOT_LIMIT") return;
+    (void)kvinsert_cost_domain("native_owner_prefix", descriptor);
+    auto& candidates = pimpl_->kv_cost_candidates_;
+    auto found = std::find_if(candidates.begin(), candidates.end(), [&](const auto& value) {
+        return value.descriptor.size() == descriptor.size() &&
+            std::equal(value.descriptor.begin(), value.descriptor.end(), descriptor.begin());
+    });
+    if (native_prefix.size() > 1048576 - pimpl_->kv_cost_snapshot_words_ +
+                    found->owner_prefix.size()) {
+        begin_kvinsert_cost_domain_oracle();
+        pimpl_->kv_cost_snapshot_reason_ = "NATIVE_KV_DOMAIN_SNAPSHOT_LIMIT";
+        return;
+    }
+    std::vector<int64_t> owned(native_prefix.begin(), native_prefix.end());
+    pimpl_->kv_cost_snapshot_words_ -= found->owner_prefix.size();
+    found->owner_prefix = std::move(owned);
+    pimpl_->kv_cost_snapshot_words_ += found->owner_prefix.size();
+}
+
+std::vector<int64_t> FusedModelBase::kvinsert_cost_owner_prefix(
+        at::IntArrayRef descriptor) const {
+    (void)kvinsert_cost_domain("native_owner_prefix", descriptor);
+    for (const auto& candidate : pimpl_->kv_cost_candidates_) {
+        if (candidate.descriptor.size() == descriptor.size() &&
+            std::equal(candidate.descriptor.begin(), candidate.descriptor.end(), descriptor.begin())) {
+            TORCH_CHECK(!candidate.owner_prefix.empty(), "native owner prefix was not produced");
+            return candidate.owner_prefix;
+        }
+    }
+    TORCH_CHECK(false, "native owner prefix descriptor was not admitted");
+}
+
+std::tuple<std::vector<int64_t>, int64_t, int64_t>
+FusedModelBase::mint_kvinsert_exact_candidate(
+        at::IntArrayRef descriptor, int64_t site_id,
+        int64_t invocation, int64_t route_id) {
+    TORCH_CHECK(!RpuKernelGraph::has_active(),
+                "KV exact candidate must be minted outside Graph capture");
+    RpuExecutionCleanupGuard exclusive_planning("mint_kvinsert_exact_candidate");
+    TORCH_CHECK(site_id > 0 && invocation >= 0 && route_id >= 1 && route_id <= 5,
+                "KV exact candidate has invalid site/invocation/route");
+    // This lookup checks the actual latest oracle, model generation and native
+    // precision before the input descriptor can be decoded as an admitted key.
+    const auto query = kvinsert_cost_domain("native_exact_diagnostic", descriptor);
+    TORCH_CHECK(std::get<1>(query) == "READY",
+                "KV exact candidate requires verified native precision and a competing domain");
+    const auto& rows = std::get<3>(query);
+    const auto row = std::find_if(rows.begin(), rows.end(), [&](const auto& value) {
+        return value[0] == site_id && value[2] == invocation;
+    });
+    TORCH_CHECK(row != rows.end() && ((*row)[10] & (int64_t{1} << route_id)) != 0,
+                "KV exact route is outside the actual competing site domain");
+    const auto found = std::find_if(
+        pimpl_->kv_cost_candidates_.begin(), pimpl_->kv_cost_candidates_.end(),
+        [&](const auto& value) {
+            return value.descriptor.size() == descriptor.size() &&
+                std::equal(value.descriptor.begin(), value.descriptor.end(), descriptor.begin());
+        });
+    TORCH_CHECK(found != pimpl_->kv_cost_candidates_.end() && found->layout_bound &&
+                    pimpl_->kv_cost_planning_context_.has_value() && pimpl_->kv_cost_layout_scope_,
+                "KV exact candidate has no actual native planning layout");
+    auto metadata = *found;
+    const auto saved_context = pimpl_->ctx_;
+    auto restore_context = c10::make_scope_exit([&] { pimpl_->ctx_ = saved_context; });
+    pimpl_->ctx_ = *pimpl_->kv_cost_planning_context_;
+    // Snapshot belongs to this actual latest oracle, not caller geometry.
+    auto layout_scope = pimpl_->kv_cost_layout_scope_;
+    std::tuple<std::vector<int64_t>, int64_t, int64_t> result;
+    layout_scope([&] {
+        TORCH_CHECK(subclass_layout_hash() == metadata.subclass_layout_identity,
+                    "KV exact candidate requires its actual native geometry to be restored");
+        auto candidate = decode_fmb_prefill_stage_candidate(metadata.descriptor);
+        auto& manifest = candidate.physical_manifest;
+        auto route = std::find_if(manifest.routes.begin(), manifest.routes.end(), [&](const auto& value) {
+            return value.family == FmbRouteFamily::KV_INSERT && value.site_id == site_id &&
+                value.invocation == invocation;
+        });
+        TORCH_CHECK(route != manifest.routes.end() &&
+                        (route->flags & KV_INSERT_ROUTE_FLAG_DYNAMIC_POSITION) == 0 &&
+                        static_cast<int64_t>(manifest.graph_lifecycle) == (*row)[1],
+                    "KV exact candidate does not bind the actual physical invocation");
+        const auto plan = rpu_resolve_kvinsert_segment_plan(
+            (*row)[3], (*row)[4], (*row)[5], static_cast<int>((*row)[6]),
+            (*row)[7], (*row)[8], static_cast<uint32_t>((*row)[9]),
+            static_cast<KvInsertRoute>(route_id));
+        const auto arguments = rpu_kvinsert_route_arguments(
+            plan, static_cast<int>((*row)[6]), (*row)[7], (*row)[8]);
+        route->selector = static_cast<int64_t>(plan.route());
+        route->arguments.assign(arguments.begin(), arguments.end());
+        rebind_kvinsert_exact_candidate(
+            candidate, metadata.layout, site_id, invocation, plan);
+        validate_fmb_physical_manifest(manifest, manifest.physical_length, pimpl_->ctx_.position);
+        validate_fmb_physical_manifest_forward_capability(
+            manifest, physical_manifest_forward_capability(manifest));
+        pimpl_->ctx_.cancel_external_physical_manifest_prologue();
+        pimpl_->ctx_.bind_physical_manifest(manifest);
+        metadata.layout = bind_physical_layout_context(metadata.layout, manifest);
+        // EXACT changes the full allocation identity, even when K/V buffer sizes
+        // stay the same. Re-run the real declarations/budget/layout hash, not a
+        // fingerprint-only rewrite or a caller-supplied geometry calculation.
+        const auto layout = resolve_spm_pipeline_component_layout_for_cpu_contract(
+            metadata.layout, candidate.stage_plan);
+        TORCH_CHECK(layout.layout_hash != 0, "KV exact candidate has an empty layout identity");
+        metadata.descriptor = encode_fmb_prefill_stage_candidate(candidate);
+        metadata.rows.erase(std::remove_if(metadata.rows.begin(), metadata.rows.end(),
+            [&](const auto& value) { return value[0] == site_id && value[2] == invocation; }),
+            metadata.rows.end());
+        metadata.reason = metadata.rows.empty() ? "NO_COMPETING_KV_DOMAIN" : "READY";
+        const auto existing = std::find_if(
+            pimpl_->kv_cost_candidates_.begin(), pimpl_->kv_cost_candidates_.end(),
+            [&](const auto& value) { return value.descriptor == metadata.descriptor; });
+        if (existing == pimpl_->kv_cost_candidates_.end()) {
+            size_t words = metadata.descriptor.size() + metadata.owner_prefix.size();
+            for (const auto& value : metadata.rows) words += value.size();
+            TORCH_CHECK(pimpl_->kv_cost_candidates_.size() < 4096 &&
+                            words <= 1048576 - pimpl_->kv_cost_snapshot_words_,
+                        "KV exact candidate exceeds the bounded latest oracle snapshot");
+            pimpl_->kv_cost_snapshot_words_ += words;
+            pimpl_->kv_cost_candidates_.push_back(metadata);
+        }
+        result = {metadata.descriptor,
+                static_cast<int64_t>(layout.layout_hash >> 32),
+                static_cast<int64_t>(layout.layout_hash & 0xffffffffULL)};
+    });
+    return result;
+}
+
+std::vector<FmbPrefillStageCandidate>
+FusedModelBase::resolve_prefill_stage_domain_for_shape_impl(
+    int64_t seq_len, int64_t position,
+    const std::optional<at::Tensor>& attention_mask, bool is_causal,
+    const std::vector<ChunkInfo>* input_chunks,
+    const std::vector<FmbExecutionSpan>* spans,
+    const FmbStageBoundaryPolicies* boundary_policies,
+    int64_t requested_chunk_size, int64_t logical_len,
+    int64_t planning_chunk_size_override) {
+    const char* api = "resolve_prefill_stage_domain_for_shape";
+    TORCH_CHECK(!RpuKernelGraph::has_active(),
+                "RPU_PLANNER_REJECT:CAPABILITY: ", api,
+                " must run outside Graph capture");
+    RpuExecutionCleanupGuard exclusive_planning(api);
+    begin_kvinsert_cost_domain_oracle();
+    bool completed_oracle = false;
+    auto discard_failed_oracle = c10::make_scope_exit([&] {
+        if (!completed_oracle) begin_kvinsert_cost_domain_oracle();
+    });
+    TORCH_CHECK((input_chunks == nullptr) == (spans == nullptr) &&
+                    (spans == nullptr) == (boundary_policies == nullptr),
+                "RPU_PLANNER_REJECT:CAPABILITY: ", api,
+                ": specialized input chunks, spans, and boundary "
+                "policies must be provided together");
+    detail::validate_fmb_planning_shape(seq_len, position, api);
+    // A cold collector can inspect the request a later leg will install.
+    // Unlike requested_chunk_size, this does not filter the raw stage domain:
+    // it only selects the original AUTO-cap semantics. Never mutate controls,
+    // the installed cold cap/profile, or the model's allocation generation.
+    TORCH_CHECK(
+        planning_chunk_size_override == -1 ||
+            planning_chunk_size_override == 0 ||
+            (planning_chunk_size_override >= 16 &&
+             planning_chunk_size_override % 16 == 0),
+        "RPU_PLANNER_REJECT:EXACT_MISMATCH: ", api,
+        ": planning override must be -1 (installed), 0 (auto), or positive v16");
+    TORCH_CHECK(
+        planning_chunk_size_override <= 0 || chunk_envelope().chunk > 0,
+        "RPU_PLANNER_REJECT:CAPABILITY: ", api,
+        ": exact planning requires a declared positive chunk certificate");
+    const int64_t effective_chunk_override = planning_chunk_size_override < 0
+        ? pimpl_->chunk_size_override_ : planning_chunk_size_override;
+    logical_len = logical_len == 0 ? seq_len : logical_len;
+    TORCH_CHECK(
+        logical_len > 0 && logical_len <= seq_len,
+        "RPU_PLANNER_REJECT:CAPABILITY: ", api,
+        ": logical length must be in [1, execution length], got ",
+        logical_len, " for execution length ", seq_len);
+    TORCH_CHECK(requested_chunk_size == 0 ||
+                    (requested_chunk_size >= 16 &&
+                     requested_chunk_size % 16 == 0),
+                "RPU_PLANNER_REJECT:EXACT_MISMATCH: ", api,
+                ": requested chunk size must be 0 (auto) or a "
+                "positive multiple of 16, got ", requested_chunk_size);
+    if (requested_chunk_size > 0) {
+        detail::validate_fmb_exact_chunk_size(
+            requested_chunk_size, seq_len, api);
+    }
+    const ModelStaticConfig static_cfg = static_config();
+    TORCH_CHECK(static_cfg.num_layers > 0,
+                "RPU_PLANNER_REJECT:CAPABILITY: ", api,
+                ": model weights are not initialized");
+    TORCH_CHECK(static_cfg.num_layers == pimpl_->num_layers_,
+                "RPU_PLANNER_REJECT:CAPABILITY: ", api,
+                ": num_layers mismatch");
+
+    const InferenceContext saved_ctx = pimpl_->ctx_;
+    auto restore_ctx = c10::make_scope_exit([&] { pimpl_->ctx_ = saved_ctx; });
+    const bool use_explicit_mask = !is_causal && attention_mask.has_value();
+    pimpl_->ctx_.attention_mask = use_explicit_mask
+        ? attention_mask : std::nullopt;
+    pimpl_->ctx_.position = position;
+    pimpl_->ctx_.seq_len = seq_len;
+    pimpl_->ctx_.batch_size = 1;
+    pimpl_->ctx_.is_causal = is_causal;
+    pimpl_->ctx_.input_in_spm = false;
+    pimpl_->ctx_.output_to_spm = false;
+    pimpl_->ctx_.attention_policy = AttentionExecutionPolicy::DDR_KV;
+
+    if (input_chunks != nullptr) {
+        validate_fmb_input_stage(
+            *input_chunks, *spans, boundary_policies->input,
+            seq_len, position,
+            "RPU_PLANNER_REJECT:CAPABILITY: "
+            "resolve_prefill_stage_domain_for_shape");
+    }
+    remember_kvinsert_cost_planning_context(pimpl_->ctx_);
+
+    LayoutContext base_layout;
+    base_layout.max_kv_seq_len = use_explicit_mask
+        ? attention_mask->size(-1) : position + seq_len;
+    base_layout.num_layers = static_cfg.num_layers;
+    base_layout.use_attn_mask = use_explicit_mask;
+    base_layout.is_causal = is_causal;
+    auto decl_fn = [this](const LayoutContext& context) {
+        return this->declare_buffers(context);
+    };
+    auto valid_fn = [this, seq_len, position](int64_t candidate) {
+        return this->subclass_chunk_size_valid(
+            candidate, seq_len, position);
+    };
+    const int64_t chunk_size_cap =
+        subclass_chunk_size_cap(seq_len, position);
+    const std::vector<ChunkSizeProbe> probes =
+        enumerate_chunk_size_domain_impl(
+            *pimpl_, decl_fn, valid_fn, chunk_size_cap, seq_len, base_layout,
+            /*apply_auto_cap=*/requested_chunk_size == 0 &&
+                effective_chunk_override == 0);
+
+    std::vector<FmbPrefillStageCandidate> result;
+    result.reserve(probes.size());
+    for (const ChunkSizeProbe& probe : probes) {
+        if (!probe.valid || !probe.fits) continue;
+
+        const int64_t compute_chunk_size = probe.chunk_size;
+        const int64_t compute_num_chunks =
+            1 + (seq_len - 1) / compute_chunk_size;
+        const ChunkPlan compute_plan{
+            std::min(compute_chunk_size, seq_len), compute_num_chunks};
+        const ModelDynamicConfig dynamic_cfg =
+            planning_dynamic_config(compute_plan);
+        validate_fmb_chunk_mode(static_cfg, dynamic_cfg, api);
+        (void)resolve_and_validate_fmb_inter_layer_io(
+            dynamic_cfg, static_cast<size_t>(compute_num_chunks), api);
+
+        ChunkPlan qkv_plan = compute_plan;
+        if (dynamic_cfg.chunk_mode == ChunkMode::KV_FIRST &&
+            static_cfg.kv_first_chunk_plan_fn != nullptr) {
+            qkv_plan = std::invoke(
+                static_cfg.kv_first_chunk_plan_fn, *this, compute_plan);
+        }
+        if (dynamic_cfg.chunk_mode == ChunkMode::KV_FIRST) {
+            validate_kv_first_chunk_plan(qkv_plan, seq_len, api);
+        }
+        // Preserve the configurable v16 capacity across a one-tail plan.  The
+        // ChunkPlan handed to dynamic_config stores the first physical length,
+        // so an unchanged KV_FIRST plan at E225/C240 says 225 even though both
+        // native stage capacities are 240.
+        const bool qkv_reuses_compute_capacity =
+            qkv_plan.chunk_size == compute_plan.chunk_size &&
+            qkv_plan.num_chunks == compute_plan.num_chunks;
+        const int64_t qkv_chunk_size =
+            dynamic_cfg.chunk_mode == ChunkMode::SEQUENTIAL ||
+                qkv_reuses_compute_capacity
+            ? compute_chunk_size : qkv_plan.chunk_size;
+        if (requested_chunk_size > 0 &&
+            (compute_chunk_size != requested_chunk_size ||
+             qkv_chunk_size != requested_chunk_size)) {
+            continue;
+        }
+
+        const std::vector<ChunkInfo> compute_chunks =
+            make_fmb_chunks(seq_len, position, compute_chunk_size);
+        const std::vector<ChunkInfo> qkv_chunks =
+            make_fmb_chunks(seq_len, position, qkv_chunk_size);
+        if (boundary_policies != nullptr &&
+            (!detail::fmb_chunks_respect_boundary_policy(
+                 qkv_chunks, *spans, boundary_policies->qkv) ||
+             !detail::fmb_chunks_respect_boundary_policy(
+                 compute_chunks, *spans, boundary_policies->compute))) {
+            continue;
+        }
+
+        LayoutContext candidate_layout = base_layout;
+        // Match run_all_layers exactly: for a one-tail plan the allocation
+        // layout uses the physical first-row length, while the A6 tuple keeps
+        // the configurable v16 capacity returned to the caller.
+        candidate_layout.chunk_size = compute_plan.chunk_size;
+        candidate_layout.planning_chunk_capacity = compute_chunk_size;
+        if (dynamic_cfg.chunk_mode == ChunkMode::KV_FIRST &&
+            qkv_plan.chunk_size != compute_plan.chunk_size) {
+            candidate_layout.kv_insert_chunk_size = qkv_plan.chunk_size;
+        }
+        FmbThreeStageChunkPlan stage_plan = input_chunks == nullptr
+            ? compose_fmb_default_three_stage_chunk_plan(
+                  candidate_layout, seq_len, position,
+                  dynamic_cfg.chunk_mode)
+            : compose_fmb_three_stage_chunk_plan(
+                  *input_chunks, qkv_chunks, compute_chunks, *spans,
+                  dynamic_cfg.chunk_mode, *boundary_policies);
+        candidate_layout.stage_plan_fingerprint =
+            fmb_three_stage_chunk_plan_fingerprint(stage_plan);
+        auto admitted = observe_kvinsert_cost_candidates([&] {
+            std::vector<FmbPrefillStageCandidate> admitted;
+            std::vector<FmbPhysicalExecutionManifest> physical_domain =
+                physical_manifest_domain_for_candidate(
+                    stage_plan, candidate_layout, seq_len, logical_len, position);
+            for (FmbPhysicalExecutionManifest& physical_manifest :
+                 physical_domain) {
+                validate_fmb_physical_manifest(
+                    physical_manifest, seq_len, position);
+                const LayoutContext physical_layout = bind_physical_layout_context(
+                    candidate_layout, physical_manifest);
+                if (!final_chunk_layout_fits(
+                        decl_fn(physical_layout),
+                        pimpl_->persistent_allocated_)) {
+                    continue;
+                }
+                // Input is a caller-owned physical schedule.  The canonical scalar
+                // EXACT request constrains only the two native configurable
+                // capacities (QKV and compute); each feasible physical manifest
+                // remains a separate same-chunk candidate.
+                admitted.push_back({stage_plan.input.plan.chunk_size,
+                                  qkv_chunk_size, compute_chunk_size,
+                                  stage_plan, std::move(physical_manifest)});
+            }
+            return admitted;
+        }, &candidate_layout);
+        result.insert(result.end(), std::make_move_iterator(admitted.begin()),
+                      std::make_move_iterator(admitted.end()));
+    }
+
+    std::sort(result.begin(), result.end(),
+              detail::fmb_prefill_stage_candidate_less);
+    result.erase(
+        std::unique(
+            result.begin(), result.end(),
+            detail::fmb_prefill_stage_candidate_same_identity),
+        result.end());
+    if (requested_chunk_size > 0) {
+        TORCH_CHECK(
+            !result.empty(),
+            "RPU_PLANNER_REJECT:EXACT_MISMATCH: exact chunk=",
+            requested_chunk_size,
+            " is not simultaneously feasible for qkv and compute at "
+            "seq_len=", seq_len, ", position=", position);
+    } else {
+        TORCH_CHECK(
+            !result.empty(),
+            "RPU_PLANNER_REJECT:NO_FEASIBLE: no feasible three-stage tuple "
+            "for seq_len=", seq_len, ", position=", position);
+    }
+    finish_kvinsert_cost_domain_oracle(result);
+    completed_oracle = true;
+    return result;
 }
 
 SpmPipelineCausalPrefillShape
@@ -4607,15 +5842,21 @@ FusedModelBase::resolve_spm_pipeline_causal_prefill_shape_for_cpu_contract(
         "resolve_spm_pipeline_causal_prefill_shape_for_cpu_contract";
     TORCH_CHECK(
         !RpuKernelGraph::has_active(),
-        api, " must run outside Graph capture");
+        "RPU_PLANNER_REJECT:CAPABILITY: ", api,
+        " must run outside Graph capture");
+    RpuExecutionCleanupGuard exclusive_planning(api);
+    detail::validate_fmb_planning_shape(
+        execution_len, /*position=*/0, api);
     TORCH_CHECK(
         execution_len > 1,
-        api, " requires a multi-token execution length");
+        "RPU_PLANNER_REJECT:CAPABILITY: ", api,
+        " requires a multi-token execution length");
     const ModelStaticConfig static_cfg = static_config();
     TORCH_CHECK(
         static_cfg.num_layers > 0 &&
             static_cfg.num_layers == pimpl_->num_layers_,
-        api, " requires initialized, matching model layers");
+        "RPU_PLANNER_REJECT:CAPABILITY: ", api,
+        " requires initialized, matching model layers");
 
     const InferenceContext saved_ctx = pimpl_->ctx_;
     auto restore_ctx = c10::make_scope_exit([&] { pimpl_->ctx_ = saved_ctx; });
@@ -4648,7 +5889,8 @@ FusedModelBase::resolve_spm_pipeline_causal_prefill_shape_for_cpu_contract(
         &resolved_chunk_size);
     TORCH_CHECK(
         !chunks.empty(),
-        api, ": planner returned no chunks");
+        "RPU_PLANNER_REJECT:NO_FEASIBLE: ", api,
+        ": planner returned no chunks");
 
     ChunkPlan plan{
         chunks.front().len, static_cast<int64_t>(chunks.size())};
@@ -4670,7 +5912,8 @@ FusedModelBase::resolve_spm_pipeline_causal_prefill_shape_for_cpu_contract(
         kv_insert_plan.chunk_size != plan.chunk_size) {
         TORCH_CHECK(
             kv_insert_plan.chunk_size > 0,
-            api, ": invalid KV_FIRST chunk size");
+            "RPU_PLANNER_REJECT:CAPABILITY: ", api,
+            ": invalid KV_FIRST chunk size");
         kv_insert_chunks.clear();
         for (int64_t offset = 0; offset < execution_len;
              offset += kv_insert_plan.chunk_size) {
@@ -4767,7 +6010,8 @@ SpmPipelineComponentLayout FusedModelBase::prepare_spm_pipeline_component_impl(
     };
     ensure_allocated_impl(*pimpl_, decls, layout_ctx, estimate_fn,
                           subclass_layout_hash(),
-                          /*enforce_allocation_identity=*/true);
+                          /*enforce_allocation_identity=*/true,
+                          /*standalone_complete_layout=*/false);
     pimpl_->last_decls_ = decls;
     const std::vector<OwnedPipelineDecl> prepared_declarations =
         own_pipeline_decls(decls, /*require_seal_eligibility=*/true);
@@ -4871,6 +6115,160 @@ SpmPipelineComponentLayout FusedModelBase::prepare_spm_pipeline_component_impl(
     return {temporary_bytes, layout_hash};
 }
 
+namespace {
+
+struct CpuTemporaryLayoutPlan {
+    std::unordered_map<std::string, uint32_t> offsets;
+    std::vector<std::unordered_map<std::string, uint32_t>> per_layer_offsets;
+    size_t required_extent = 0;
+};
+
+CpuTemporaryLayoutPlan plan_cpu_temporary_layout(
+    const std::vector<BufferDecl>& decls) {
+    CpuTemporaryLayoutPlan result;
+    size_t cursor = 0;
+    for (const BufferDecl& decl : decls) {
+        if (decl.storage != StorageClass::TempPerLayer) continue;
+        if (static_cast<int>(result.per_layer_offsets.size()) < decl.per_layer) {
+            result.per_layer_offsets.resize(decl.per_layer);
+        }
+        const size_t bytes = align_spm_bytes(static_cast<size_t>(decl.size));
+        for (int layer = 0; layer < decl.per_layer; ++layer) {
+            TORCH_CHECK(cursor <= std::numeric_limits<uint32_t>::max(),
+                        "FusedModelBase CPU layout planner: temporary offset "
+                        "exceeds uint32");
+            result.per_layer_offsets[layer][decl.name] =
+                static_cast<uint32_t>(cursor);
+            TORCH_CHECK(cursor <= std::numeric_limits<size_t>::max() - bytes,
+                        "FusedModelBase CPU layout planner: temporary size "
+                        "overflow");
+            cursor += bytes;
+        }
+    }
+
+    std::vector<SpmAllocator::AllocRequest> requests;
+    std::vector<std::string> names;
+    for (const BufferDecl& decl : decls) {
+        if (decl.storage == StorageClass::Temp && decl.alias_of == nullptr) {
+            requests.push_back({decl.size, decl.phase_start, decl.phase_end,
+                                static_cast<int>(decl.scope)});
+            names.emplace_back(decl.name);
+        }
+    }
+    const SpmAllocator::AliasedPlan plan =
+        SpmAllocator::plan_temporary_aliased(requests);
+    TORCH_CHECK(plan.offsets.size() == names.size(),
+                "FusedModelBase CPU layout planner: first-fit result size "
+                "mismatch");
+    for (size_t index = 0; index < names.size(); ++index) {
+        const uint64_t offset = cursor + plan.offsets[index];
+        TORCH_CHECK(offset <= std::numeric_limits<uint32_t>::max(),
+                    "FusedModelBase CPU layout planner: aliased Temp offset "
+                    "exceeds uint32");
+        result.offsets[names[index]] = static_cast<uint32_t>(offset);
+    }
+    for (const BufferDecl& decl : decls) {
+        if (decl.alias_of == nullptr) continue;
+        const auto root = result.offsets.find(decl.alias_of);
+        TORCH_CHECK(root != result.offsets.end(),
+                    "FusedModelBase CPU layout planner: alias root '",
+                    decl.alias_of, "' is missing");
+        result.offsets[decl.name] = root->second;
+    }
+    TORCH_CHECK(cursor <= std::numeric_limits<size_t>::max() - plan.peak_bytes,
+                "FusedModelBase CPU layout planner: required extent overflow");
+    result.required_extent = cursor + plan.peak_bytes;
+    TORCH_CHECK(result.required_extent > 0,
+                "FusedModelBase CPU layout planner: component has no "
+                "temporary arena");
+    return result;
+}
+
+SpmPipelineComponentLayout current_temporary_layout_identity(
+    const std::vector<BufferDecl>& decls,
+    int64_t params_hash,
+    const std::unordered_map<std::string, uint32_t>& offsets,
+    const std::vector<std::unordered_map<std::string, uint32_t>>&
+        per_layer_offsets) {
+    size_t extent = 0;
+    for (const BufferDecl& decl : decls) {
+        if (decl.alias_of != nullptr) continue;
+        const size_t bytes = align_spm_bytes(static_cast<size_t>(decl.size));
+        if (decl.storage == StorageClass::Temp) {
+            const auto it = offsets.find(decl.name);
+            TORCH_CHECK(it != offsets.end(),
+                        "FusedModelBase Graph layout: missing Temp '",
+                        decl.name, "'");
+            extent = std::max(extent, static_cast<size_t>(it->second) + bytes);
+        } else if (decl.storage == StorageClass::TempPerLayer) {
+            TORCH_CHECK(decl.per_layer >= 0 &&
+                            static_cast<size_t>(decl.per_layer) <=
+                                per_layer_offsets.size(),
+                        "FusedModelBase Graph layout: missing TempPerLayer '",
+                        decl.name, "'");
+            for (int layer = 0; layer < decl.per_layer; ++layer) {
+                const auto it = per_layer_offsets[layer].find(decl.name);
+                TORCH_CHECK(it != per_layer_offsets[layer].end(),
+                            "FusedModelBase Graph layout: missing layer ", layer,
+                            " TempPerLayer '", decl.name, "'");
+                extent = std::max(
+                    extent, static_cast<size_t>(it->second) + bytes);
+            }
+        }
+    }
+    TORCH_CHECK(extent > 0,
+                "FusedModelBase Graph layout: empty temporary layout");
+    return {extent, pipeline_layout_hash_impl(
+        decls, params_hash, extent, offsets, per_layer_offsets)};
+}
+
+}  // namespace
+
+bool FusedModelBase::spm_pipeline_component_layout_fits_for_cpu_contract(
+    const LayoutContext& layout_ctx,
+    const FmbThreeStageChunkPlan& stage_plan) {
+    TORCH_CHECK(
+        !RpuKernelGraph::has_active(),
+        "spm_pipeline_component_layout_fits_for_cpu_contract must run "
+        "outside Graph capture");
+    const LayoutContext exact = bind_spm_pipeline_stage_plan(
+        layout_ctx, stage_plan,
+        "spm_pipeline_component_layout_fits_for_cpu_contract");
+    return final_chunk_layout_fits(
+        declare_buffers(exact), pimpl_->persistent_allocated_);
+}
+
+SpmPipelineComponentLayout
+FusedModelBase::resolve_spm_pipeline_component_layout_for_cpu_contract(
+    const LayoutContext& layout_ctx,
+    const FmbThreeStageChunkPlan& stage_plan) {
+    const char* api =
+        "resolve_spm_pipeline_component_layout_for_cpu_contract";
+    TORCH_CHECK(!RpuKernelGraph::has_active(),
+                api, " must run outside Graph capture");
+    RpuExecutionCleanupGuard exclusive_planning(api);
+    const LayoutContext exact = bind_spm_pipeline_stage_plan(
+        layout_ctx, stage_plan, api);
+    const std::vector<BufferDecl> decls = declare_buffers(exact);
+    (void)own_pipeline_decls(decls);
+    const CpuTemporaryLayoutPlan planned =
+        plan_cpu_temporary_layout(decls);
+    const FixedSpmOverhead fixed = estimate_fixed_overhead(decls);
+    TORCH_CHECK(
+        fixed.persistent >= 0 &&
+            static_cast<uint64_t>(fixed.persistent) +
+                    planned.required_extent <=
+                SpmAllocator::SPM_PLANNING_BUDGET,
+        "FusedModelBase CPU layout planner: layout exceeds SPM budget");
+    const int64_t params_hash = compute_params_hash_impl(
+        exact, pimpl_->num_q_heads_, pimpl_->num_kv_heads_,
+        pimpl_->head_dim_, pimpl_->hidden_size_,
+        pimpl_->intermediate_size_, subclass_layout_hash());
+    return {planned.required_extent, pipeline_layout_hash_impl(
+        decls, params_hash, planned.required_extent, planned.offsets,
+        planned.per_layer_offsets)};
+}
+
 SpmPipelineComponentLayout
 FusedModelBase::prepare_spm_pipeline_component_for_cpu_contract(
     const LayoutContext& layout_ctx,
@@ -4908,8 +6306,8 @@ FusedModelBase::prepare_spm_pipeline_component_for_cpu_contract_impl(
     // the final copy only after the pure plan is complete.
     (void)own_pipeline_decls(decls);
 
-    std::unordered_map<std::string, uint32_t> offsets;
-    std::vector<std::unordered_map<std::string, uint32_t>> per_layer_offsets;
+    const CpuTemporaryLayoutPlan temporary =
+        plan_cpu_temporary_layout(decls);
     std::unordered_map<std::string, uint32_t> persistent_offsets;
     std::vector<std::unordered_map<std::string, uint32_t>>
         persistent_per_layer_offsets;
@@ -4948,69 +6346,9 @@ FusedModelBase::prepare_spm_pipeline_component_for_cpu_contract_impl(
         }
     }
 
-    size_t temporary_cursor = 0;
-    for (const BufferDecl& decl : decls) {
-        if (decl.storage != StorageClass::TempPerLayer) continue;
-        if (static_cast<int>(per_layer_offsets.size()) < decl.per_layer) {
-            per_layer_offsets.resize(decl.per_layer);
-        }
-        const size_t bytes = align_spm_bytes(static_cast<size_t>(decl.size));
-        for (int layer = 0; layer < decl.per_layer; ++layer) {
-            TORCH_CHECK(temporary_cursor <=
-                            std::numeric_limits<uint32_t>::max(),
-                        "FusedModelBase CPU manifest planner: temporary "
-                        "offset exceeds uint32");
-            per_layer_offsets[layer][decl.name] =
-                static_cast<uint32_t>(temporary_cursor);
-            TORCH_CHECK(temporary_cursor <=
-                            std::numeric_limits<size_t>::max() - bytes,
-                        "FusedModelBase CPU manifest planner: temporary size "
-                        "overflow");
-            temporary_cursor += bytes;
-        }
-    }
-
-    std::vector<SpmAllocator::AllocRequest> requests;
-    std::vector<std::string> request_names;
-    for (const BufferDecl& decl : decls) {
-        if (decl.storage == StorageClass::Temp && decl.alias_of == nullptr) {
-            requests.push_back({decl.size, decl.phase_start, decl.phase_end,
-                                static_cast<int>(decl.scope)});
-            request_names.emplace_back(decl.name);
-        }
-    }
-    const SpmAllocator::AliasedPlan temp_plan =
-        SpmAllocator::plan_temporary_aliased(requests);
-    TORCH_CHECK(temp_plan.offsets.size() == request_names.size(),
-                "FusedModelBase CPU manifest planner: first-fit result size "
-                "mismatch");
-    for (size_t index = 0; index < request_names.size(); ++index) {
-        const uint64_t offset = temporary_cursor + temp_plan.offsets[index];
-        TORCH_CHECK(offset <= std::numeric_limits<uint32_t>::max(),
-                    "FusedModelBase CPU manifest planner: aliased Temp offset "
-                    "exceeds uint32");
-        offsets[request_names[index]] = static_cast<uint32_t>(offset);
-    }
-    for (const BufferDecl& decl : decls) {
-        if (decl.alias_of == nullptr) continue;
-        const auto root = offsets.find(decl.alias_of);
-        TORCH_CHECK(root != offsets.end(),
-                    "FusedModelBase CPU manifest planner: alias root '",
-                    decl.alias_of, "' is missing");
-        offsets[decl.name] = root->second;
-    }
-
-    TORCH_CHECK(temporary_cursor <=
-                    std::numeric_limits<size_t>::max() - temp_plan.peak_bytes,
-                "FusedModelBase CPU manifest planner: required extent "
-                "overflow");
-    const size_t required_extent = temporary_cursor + temp_plan.peak_bytes;
-    TORCH_CHECK(required_extent > 0,
-                "FusedModelBase CPU manifest planner: component has no "
-                "temporary arena");
-    TORCH_CHECK(required_extent <= persistent_floor,
+    TORCH_CHECK(temporary.required_extent <= persistent_floor,
                 "FusedModelBase CPU manifest planner: temporary extent ",
-                required_extent, " overlaps persistent floor ",
+                temporary.required_extent, " overlaps persistent floor ",
                 persistent_floor);
 
     const int64_t params_hash = compute_params_hash_impl(
@@ -5018,10 +6356,11 @@ FusedModelBase::prepare_spm_pipeline_component_for_cpu_contract_impl(
         pimpl_->head_dim_, pimpl_->hidden_size_,
         pimpl_->intermediate_size_, subclass_layout_hash());
     const uint64_t layout_hash = pipeline_layout_hash_impl(
-        decls, params_hash, required_extent, offsets, per_layer_offsets);
+        decls, params_hash, temporary.required_extent, temporary.offsets,
+        temporary.per_layer_offsets);
     CachedLayoutSnapshot snapshot = build_cached_layout_snapshot(
-        decls, layout_ctx, params_hash, required_extent, layout_hash, offsets,
-        per_layer_offsets, persistent_offsets,
+        decls, layout_ctx, params_hash, temporary.required_extent, layout_hash,
+        temporary.offsets, temporary.per_layer_offsets, persistent_offsets,
         persistent_per_layer_offsets, /*cpu_dry=*/true,
         /*allocator_generation=*/0, /*persistent_generation=*/0,
         has_persistent ? 1 : 0, persistent_floor,
@@ -5050,11 +6389,11 @@ FusedModelBase::prepare_spm_pipeline_component_for_cpu_contract_impl(
     pimpl_->allocation_declaration_hash_ = declaration_hash;
     pimpl_->allocation_declarations_ = std::move(allocation_declarations);
     pimpl_->pipeline_layout_hash_ = layout_hash;
-    pimpl_->pipeline_temporary_bytes_ = required_extent;
+    pimpl_->pipeline_temporary_bytes_ = temporary.required_extent;
     pimpl_->pipeline_temporary_names_.swap(temporary_names);
     pimpl_->pipeline_temporary_per_layer_names_.swap(
         temporary_per_layer_names);
-    return {required_extent, layout_hash};
+    return {temporary.required_extent, layout_hash};
 }
 
 void FusedModelBase::cancel_spm_pipeline_component_for_cpu_contract() {
@@ -6653,7 +7992,7 @@ void FusedModelBase::adopt_spm_pipeline_component(
     // A sibling component's prepare may have advanced persistent_generation via
     // reset_all(), but it cannot erase those slots.  Acknowledge that transition
     // only while no ordinary persistent range exists; callbacks remain dirty and
-    // are captured normally by the first Graph BUILD.
+    // are captured normally by the first Z2 BUILD.
     TORCH_CHECK(SPM_ALLOC.persistent_used() == 0,
                 "adopt_spm_pipeline_component cannot acknowledge ordinary "
                 "persistent SPM after reset_all");
@@ -6977,12 +8316,13 @@ void FusedModelBase::bind_spm_outer_fast_composite_input(
 }
 
 // =============================================================================
-// run_preload_callbacks_ — persistent callback dispatch
+// run_preload_callbacks_ — D-502 + EXT-4 + EXT-5 definitive shape
 // =============================================================================
 
 void FusedModelBase::run_preload_callbacks_(
     const std::vector<BufferDecl>& decls, FusedModelBase& self)
 {
+    RECORD_FUNCTION("rpu_fmb::preload_callbacks", {});
     // graph-scope override: inside RECORDING/REPLAYING the callbacks MUST run
     // every forward — RECORDING captures preload DMA nodes into the graph;
     // REPLAYING advances the cursor through those same nodes via the
@@ -6991,9 +8331,11 @@ void FusedModelBase::run_preload_callbacks_(
     // node and trips "DMA variant drift" (Fixed vs MutableSrc) at cursor N.
     const bool inside_graph = graph_dma::active();
 
-    // Outside graph scope (PASSTHROUGH/BUILT), return early only when
-    // persistent-gen UNCHANGED AND dirty flag clear.
+    // A COMPLETE immediate invocation must execute its declared preload routes
+    // itself: it cannot inherit a prior Graph's consumption receipt.
+    // Legacy PASSTHROUGH may reuse clean Persistent data as before.
     if (!inside_graph
+        && !pimpl_->ctx_.has_complete_physical_manifest()
         && pimpl_->cached_preload_gen_ == SPM_ALLOC.persistent_generation()
         && !pimpl_->preload_callbacks_dirty_) {
         return;
@@ -7001,7 +8343,7 @@ void FusedModelBase::run_preload_callbacks_(
 
     // graph-naive: callback body 直接 enqueu_kernel(走 RpuQueue proxy)。
     // 无 graph scope 时 wq->enqueu_kernel fallback PASSTHROUGH 立即发射;
-    // Python 端用 with cache.capture(WEIGHTS_SIG) 包整个
+    // P5.5 后 Python 端用 with cache.capture(WEIGHTS_SIG) 包整个
     // run_preload_callbacks_ 调用,callback 自动进 graph RECORDING/REPLAYING。
     auto invoke_preload_callback = [this, &self](
         const BufferDecl& d, int layer, uint32_t core0_addr) {
@@ -7061,6 +8403,24 @@ void FusedModelBase::run_preload_callbacks_(
         d.preload_callback(self, layer, core0_addr);
     };
 
+    // Capture only the delta emitted by these real persistent callbacks.
+    // Routes consumed by dynamic_config, the layer body or post_fn cannot
+    // become a same-owner preload receipt.
+    auto& preload_runtime = pimpl_->composite_occurrence_runtime_;
+    const bool record_composite_preload_routes =
+        preload_runtime.armed && !preload_runtime.preload_follower &&
+        pimpl_->ctx_.has_complete_physical_manifest();
+    std::vector<uint8_t> routes_before_preload;
+    uint64_t preload_manifest_fingerprint = 0;
+    if (record_composite_preload_routes) {
+        TORCH_CHECK(preload_runtime.preload_decision_consumed &&
+                        !preload_runtime.preload_routes_recorded,
+                    "composite preload receipt requires the fresh leader role");
+        routes_before_preload =
+            pimpl_->ctx_.consumed_physical_route_receipt();
+        preload_manifest_fingerprint =
+            pimpl_->ctx_.physical_manifest_fingerprint();
+    }
     for (const auto& d : decls) {
         if (!d.preload_callback) continue;
         if (d.storage == StorageClass::Persistent) {
@@ -7080,24 +8440,40 @@ void FusedModelBase::run_preload_callbacks_(
         }
     }
 
-    // Clear both bookkeeping fields only after successful dispatch.
+    if (record_composite_preload_routes) {
+        auto receipt = pimpl_->ctx_.consumed_physical_route_receipt();
+        TORCH_CHECK(
+            pimpl_->ctx_.physical_manifest_fingerprint() ==
+                preload_manifest_fingerprint &&
+                receipt.size() == routes_before_preload.size(),
+            "composite preload callback changed its physical manifest");
+        for (size_t index = 0; index < receipt.size(); ++index) {
+            receipt[index] = receipt[index] && !routes_before_preload[index];
+        }
+        preload_runtime.preload_manifest_fingerprint =
+            preload_manifest_fingerprint;
+        preload_runtime.preload_route_receipt = std::move(receipt);
+        preload_runtime.preload_routes_recorded = true;
+    }
+
+    // EXT-4: clear BOTH bookkeeping fields ONLY on successful dispatch.
     pimpl_->cached_preload_gen_       = SPM_ALLOC.persistent_generation();
     pimpl_->preload_callbacks_dirty_  = false;
 }
 
 // =============================================================================
-// drive_preload_for_test — diagnostic preload helper
+// drive_preload_for_test — test-only harness (Plan 01-01 smoke test)
 //
 // Runs ensure_allocated + run_preload_callbacks_ once against a minimal
 // LayoutContext. Does NOT require hidden_states / kv caches / position.
-// Used by the diagnostic model to exercise the preload-callback path.
+// Used only by SmokeModelV3 to exercise the D-502 path.
 // =============================================================================
 
 void FusedModelBase::drive_preload_for_test() {
     LayoutContext alloc_ctx;
     // Respect chunk_size_override_ so trigger_relayout_for_test(NEW_SIZE) can
     // change the LayoutContext hash → ensure_allocated Path 1 → declare_buffers
-    // re-invoked → fresh lambda closure registered.
+    // re-invoked → fresh lambda closure registered (EXT-7 rebinding).
     alloc_ctx.chunk_size       = (pimpl_->chunk_size_override_ > 0)
                                    ? pimpl_->chunk_size_override_
                                    : 16;
@@ -7119,9 +8495,10 @@ void FusedModelBase::drive_preload_for_test() {
     auto decls = decl_fn(alloc_ctx);
     ensure_allocated_impl(*pimpl_, decls, alloc_ctx, estimate_fn,
                           subclass_layout_hash(),
-                          /*enforce_allocation_identity=*/false);
+                          /*enforce_allocation_identity=*/false,
+                          /*standalone_complete_layout=*/false);
     // Cache last_decls_ so preload callbacks see the most-recent lambda closures
-    // so callbacks remain bound to the current declarations.
+    // (EXT-7 re-bind path).
     pimpl_->last_decls_ = std::move(decls);
 
     run_preload_callbacks_(pimpl_->last_decls_, *this);
@@ -7170,12 +8547,18 @@ void FusedModelBase::emit_layer_input_dma(int layer_idx, const ChunkInfo& chunk,
             chunk_row_offset_(chunk) * pimpl_->hidden_size_
             * static_cast<int64_t>(sizeof(c10::Half));
         TORCH_INTERNAL_ASSERT(pimpl_->ctx_.hidden_states != nullptr);
+        consume_shared_runtime_route(
+            pimpl_->ctx_, FmbRouteFamily::MUTABLE_DMA,
+            FMB_SHARED_LAYER_INPUT_DMA_SITE,
+            static_cast<int64_t>(
+                FmbSharedMutableDmaRouteSelector::DDR_BROADCAST_TO_SPM),
+            0, {}, num_cores(), mlp_tp());
         rpu_launch_ddr_broadcast_spm_dma_mutable(
             current_hidden_in_src_base(), *pimpl_->ctx_.hidden_states,
             chunk_offset_bytes,
             chunk_rows_(chunk) * pimpl_->hidden_size_,
             dst,
-            /*num_cores=*/8);
+            /*num_cores=*/num_cores());
         return;
     }
     // Inner layers read from the ping-pong chain buffers populated by the
@@ -7186,7 +8569,7 @@ void FusedModelBase::emit_layer_input_dma(int layer_idx, const ChunkInfo& chunk,
         input_tensor, chunk_row_offset_(chunk) * pimpl_->hidden_size_,
         chunk_rows_(chunk) * pimpl_->hidden_size_,
         dst,
-        /*num_cores=*/8);
+        /*num_cores=*/num_cores());
 }
 
 void FusedModelBase::emit_layer_input_row_run_dma(
@@ -7244,12 +8627,18 @@ void FusedModelBase::emit_layer_input_row_run_dma(
                 "layer-input row-run source resolved a zero RPU address");
     live_src_base = current_hidden_in_src_base();
 
+    consume_shared_runtime_route(
+        pimpl_->ctx_, FmbRouteFamily::MUTABLE_DMA,
+        FMB_SHARED_LAYER_INPUT_ROW_RUN_DMA_SITE,
+        static_cast<int64_t>(
+            FmbSharedMutableDmaRouteSelector::DDR_BROADCAST_TO_SPM),
+        0, {}, num_cores(), mlp_tp());
     rpu_launch_ddr_broadcast_spm_dma_mutable(
         live_src_base, *pimpl_->ctx_.hidden_states,
         /*src_offset_bytes=*/global_row_begin * row_bytes,
         /*num_elements=*/row_count * pimpl_->hidden_size_,
         dst_base + dst_byte_offset,
-        /*num_cores=*/8);
+        /*num_cores=*/num_cores());
 }
 
 void FusedModelBase::
@@ -7400,7 +8789,7 @@ void FusedModelBase::emit_layer_output_dma(int layer_idx, const ChunkInfo& chunk
     const bool is_last_layer = (layer_idx == pimpl_->num_layers_ - 1);
     // Both branches are registry-stable: output_tensor_ is per-shape stable
     // (kept alive by pimpl_->registry_); the ping-pong bufs are equivalently
-    // owned. Both are safe to DMA-bake.
+    // owned. Both safe to DMA-bake. See spec §9.
     const at::Tensor& out_tensor = is_last_layer
         ? pimpl_->output_tensor_
         : ((layer_idx % 2 == 0) ? pimpl_->ddr_bufB_
@@ -8446,6 +9835,8 @@ void validate_dense_spm_peer_callback_complete(
 void FusedModelBase::emit_spm_pipeline_member_ingress_dma(
         const SpmFmbRuntimeDenseDdrMemberRef& member,
         const char* dst_buf) {
+    TORCH_CHECK(num_cores() == 8,
+                "canonical SPM pipeline ingress requires an eight-core profile");
     const auto& state = validate_spm_pipeline_runtime_member_ref(member);
     auto& frame = pimpl_->pipeline_runtime_member_frame_;
     TORCH_CHECK(frame.next_member == state.member_ordinal &&
@@ -8555,6 +9946,12 @@ void FusedModelBase::emit_spm_pipeline_member_ingress_dma(
         if (!burst_complete) graph.cancel_canonical_dma_burst_for_fmb();
     });
     if (live_src_base != nullptr) {
+        consume_shared_runtime_route(
+            pimpl_->ctx_, FmbRouteFamily::MUTABLE_DMA,
+            FMB_SHARED_PIPELINE_INGRESS_DMA_SITE,
+            static_cast<int64_t>(FmbSharedMutableDmaRouteSelector::
+                CANONICAL_DDR_BROADCAST_TO_SPM_MUTABLE_SRC),
+            0, {}, num_cores(), mlp_tp());
         rpu_launch_canonical_ddr_broadcast_spm_dma_mutable_src(
             *state.ingress_endpoint, live_src_base,
             static_cast<int64_t>(state.ingress_byte_begin),
@@ -8736,19 +10133,72 @@ void FusedModelBase::emit_mlp_pipeline(const at::Tensor& gate_w,
                                        uint32_t up_nvfp4_ts_addr,
                                        uint32_t down_nvfp4_ts_addr,
                                        uint16_t nvfp4_layer_id,
-                                       bool acc32)
+                                       bool down_out_bf16,
+                                       bool residual_is_bf16,
+                                       bool acc32,
+                                       bool fuse_silu_mul,
+                                       bool skip_down,
+                                       bool bind_silu_mul_route,
+                                       uint32_t residual_spm_addr,
+                                       bool pi05_xor3,
+                                       bool pi05_nvfp4_v2,
+                                       bool prefer_gemv,
+                                       RpuUnaryPrecision unary_precision,
+                                       bool high_precision_silu_mul)
 {
-    constexpr int kNumCores = 8;
+    RECORD_FUNCTION("rpu_fmb::emit_mlp", {});
+    TORCH_CHECK(unary_precision == RpuUnaryPrecision::BASE ||
+                    (unary_precision == RpuUnaryPrecision::HIGH &&
+                     act == ActivationKind::SILU && !fuse_silu_mul &&
+                     !prefer_gemv),
+                "high-precision MLP requires explicit HIGH SiLU without legacy fusion or GEMV");
+    TORCH_CHECK(!high_precision_silu_mul ||
+                    (unary_precision == RpuUnaryPrecision::HIGH &&
+                     act == ActivationKind::SILU && !fuse_silu_mul &&
+                     !bind_silu_mul_route && !prefer_gemv &&
+                     !down_out_bf16 && !residual_is_bf16 && !skip_down &&
+                     !pi05_xor3 && !pi05_nvfp4_v2),
+                "HIGH SiLU/Mul fusion requires the ordinary HIGH SiLU MLP path");
+    const int kNumCores = mlp_tp();
+    TORCH_CHECK(num_cores() == 8 || !(down_out_bf16 || residual_is_bf16 ||
+                    fuse_silu_mul || skip_down),
+                "non-eight-core MLP requires the generic FP16 pipeline");
     int64_t elems = seq_len * (pimpl_->intermediate_size_ / kNumCores);
+
+    TORCH_CHECK(!down_out_bf16 && !residual_is_bf16,
+                "MLP requires FP16 partials and residuals");
+    TORCH_CHECK(!(prefer_gemv && pi05_nvfp4_v2),
+                "MLP cannot select GEMV and NVFP4 simultaneously");
+    TORCH_CHECK(!prefer_gemv || (seq_len == 1 && kNumCores == 8 &&
+                    !acc32 && !down_out_bf16 && !residual_is_bf16 &&
+                    !fuse_silu_mul && !skip_down &&
+                    (gate_w.scalar_type() == at::kChar || gate_w.scalar_type() == at::kHalf) &&
+                    up_w.scalar_type() == gate_w.scalar_type() &&
+                    down_w.scalar_type() == gate_w.scalar_type()),
+                "shared MLP GEMV requires TP8 uniform FP16/W8A16 ACC16 decode");
 
     auto emit_linear = [&](uint32_t input, const at::Tensor& weight,
                            uint32_t output, int64_t n, int64_t k,
                            int partition, const at::Tensor& scale,
                            uint32_t nvfp4_tensor_scale_spm_addr) {
+        consume_shared_runtime_route(
+            pimpl_->ctx_, FmbRouteFamily::LINEAR,
+            FMB_SHARED_MLP_AUTO_TILE_SITE,
+            static_cast<int64_t>(pi05_nvfp4_v2 ? (acc32
+                ? FmbLinearRouteSelector::PI05_NVFP4_V2_ACC32
+                : FmbLinearRouteSelector::PI05_NVFP4_V2_ACC16)
+                                           : (prefer_gemv ? FmbLinearRouteSelector::GEMV
+                                                          : FmbLinearRouteSelector::AUTO_TILE)),
+            0, {}, num_cores(), mlp_tp());
+        if (pi05_nvfp4_v2) {
+            rpu_launch_pi05_nvfp4_v2_kernel(input, weight, output, seq_len, n, k,
+                partition, kNumCores, scale, nvfp4_tensor_scale_spm_addr, nvfp4_layer_id, acc32);
+            return;
+        }
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             input, weight, output, seq_len, n, k, partition,
-            /*num_cores=*/8, /*bias_spm_addr=*/0, scale,
-            nvfp4_tensor_scale_spm_addr, nvfp4_layer_id, acc32);
+            /*num_cores=*/kNumCores, /*bias_spm_addr=*/0, scale,
+            nvfp4_tensor_scale_spm_addr, nvfp4_layer_id, acc32, prefer_gemv);
     };
 
     emit_linear(
@@ -8758,14 +10208,16 @@ void FusedModelBase::emit_mlp_pipeline(const at::Tensor& gate_w,
 
     switch (act) {
         case ActivationKind::SILU:
-            rpu_launch_eltwise_unary_spm_kernel(
-                addr(0, "gate"), addr(0, "gate"),
-                elems, ValuOpType::SILU);
+            if (!fuse_silu_mul && !high_precision_silu_mul) {
+                rpu_launch_eltwise_unary_spm_kernel(
+                    addr(0, "gate"), addr(0, "gate"),
+                    elems, ValuOpType::SILU, GeluMode::NONE, kNumCores, unary_precision);
+            }
             break;
         case ActivationKind::GELU:
             rpu_launch_eltwise_unary_spm_kernel(
                 addr(0, "gate"), addr(0, "gate"),
-                elems, ValuOpType::ADD, GeluMode::TANH);
+                elems, ValuOpType::ADD, GeluMode::TANH, kNumCores);
             break;
         case ActivationKind::NONE: break;
     }
@@ -8775,18 +10227,57 @@ void FusedModelBase::emit_mlp_pipeline(const at::Tensor& gate_w,
         pimpl_->intermediate_size_, pimpl_->hidden_size_, /*partition=*/1,
         up_ws, up_nvfp4_ts_addr);
 
-    rpu_launch_eltwise_binary_spm_kernel(
-        addr(0, "gate"), addr(0, "up"), addr(0, "gate"),
-        elems, ValuOpType::MUL, c10::Half(1.0));
+    if (high_precision_silu_mul) {
+        rpu_launch_rhinovla_silu_high_mul_spm_kernel(
+            addr(0, "gate"), addr(0, "up"), addr(0, "gate"),
+            elems, kNumCores);
+    } else if (fuse_silu_mul) {
+        TORCH_CHECK(act == ActivationKind::SILU,
+                    "fused SiLU*Mul requires SiLU activation");
+        if (bind_silu_mul_route) {
+            consume_shared_runtime_route(
+                pimpl_->ctx_, FmbRouteFamily::ACTIVATION,
+                FMB_SHARED_MLP_SILU_MUL_SITE, /*selector=*/1,
+                pimpl_->ctx_.physical_route_invocation,
+                {seq_len, pimpl_->intermediate_size_ / kNumCores, kNumCores});
+        }
+        rpu_launch_silu_mul_spm_kernel(
+            addr(0, "gate"), addr(0, "up"), addr(0, "gate"),
+            elems, kNumCores);
+    } else {
+        rpu_launch_eltwise_binary_spm_kernel(
+            addr(0, "gate"), addr(0, "up"), addr(0, "gate"),
+            elems, ValuOpType::MUL, c10::Half(1.0), kNumCores);
+    }
 
+    if (skip_down) return;
+
+    if (kNumCores != num_cores()) {
+        consume_shared_runtime_route(
+            pimpl_->ctx_, FmbRouteFamily::ALL_REDUCE,
+            FMB_SHARED_MLP_PREPARE_INPUT_SITE,
+            static_cast<int64_t>(FmbSharedAllReduceRouteSelector::PREPARE_RING_INPUT),
+            0, {kNumCores, num_cores(), 1});
+        rpu_prepare_ring_all_reduce_input(
+            addr(0, "down"), seq_len, pimpl_->hidden_size_,
+            kNumCores, num_cores());
+    }
+    const uint32_t residual = residual_spm_addr != 0
+        ? residual_spm_addr : addr(0, "residual2");
     emit_linear(
         addr(0, "gate"), down_w, addr(0, "down"),
         pimpl_->hidden_size_, pimpl_->intermediate_size_, /*partition=*/0,
         down_ws, down_nvfp4_ts_addr);
+    consume_shared_runtime_route(
+        pimpl_->ctx_, FmbRouteFamily::ALL_REDUCE,
+        FMB_SHARED_MLP_RING_REDUCE_SITE,
+        fmb_ring_all_reduce_route_selector(
+            seq_len, pimpl_->hidden_size_, pi05_xor3, num_cores()),
+        pimpl_->ctx_.physical_route_invocation, {}, num_cores(), mlp_tp());
     rpu_launch_all_reduce_sum_residual_kernel(
-        addr(0, "down"), addr(0, "residual2"), addr(0, "residual1"),
-        seq_len, pimpl_->hidden_size_, /*input_num_cores=*/8,
-        /*output_num_cores=*/8);
+        addr(0, "down"), residual, addr(0, "residual1"),
+        seq_len, pimpl_->hidden_size_, /*input_num_cores=*/kNumCores,
+        /*output_num_cores=*/num_cores(), pi05_xor3);
 }
 
 namespace {
@@ -8800,6 +10291,8 @@ struct FmbExecutionTraversalSpec {
     bool has_kv_first = false;
     const std::vector<ChunkInfo>* chunks = nullptr;
     const std::vector<ChunkInfo>* kv_insert_chunks = nullptr;
+    int64_t kv_first_pair_carry_rows = 0;
+    bool kv_first_pair_carry_across_layers = false;
 };
 
 struct FmbExecutionStepView {
@@ -8832,6 +10325,13 @@ void for_each_fmb_execution_step(const FmbExecutionTraversalSpec& spec,
                                  Visitor&& visitor) {
     TORCH_INTERNAL_ASSERT(spec.chunks != nullptr &&
                           spec.kv_insert_chunks != nullptr);
+    const bool carry_pair = spec.has_kv_first &&
+        spec.chunk_mode == ChunkMode::KV_FIRST &&
+        spec.inter_layer_io == InterLayerIO::DDR_PINGPONG &&
+        !spec.chunk_outer_within_group &&
+        detail::fmb_kv_first_pair_carry_eligible(
+            *spec.chunks, *spec.kv_insert_chunks,
+            spec.kv_first_pair_carry_rows);
     uint32_t traversal_ordinal = 0;
     uint32_t group_id = 0;
     for (int64_t gs = 0; gs < spec.num_layers;
@@ -8859,6 +10359,30 @@ void for_each_fmb_execution_step(const FmbExecutionTraversalSpec& spec,
             }
 
             for (int64_t layer = gs; layer <= ge; ++layer) {
+                if (carry_pair) {
+                    // Every callback explicitly installs its I/O state. The
+                    // DDR output stays materialized: COMP1 still needs the
+                    // original residual after KVIN0/COMP0 reused its SPM slot.
+                    const auto emit = [&](SpmFmbOccurrenceKind kind,
+                                          const ChunkInfo& chunk,
+                                          SpmFmbScopeMask scopes,
+                                          bool input_in_spm) {
+                        visitor(FmbExecutionStepView{
+                            kind, body_id, group_id, static_cast<int>(layer),
+                            traversal_ordinal++, &chunk, scopes,
+                            true, input_in_spm, false});
+                    };
+                    emit(SpmFmbOccurrenceKind::KvInsertBody,
+                         (*spec.kv_insert_chunks)[1], kLayerKvInsertScopes,
+                         spec.kv_first_pair_carry_across_layers && layer != gs);
+                    emit(SpmFmbOccurrenceKind::KvInsertBody,
+                         (*spec.kv_insert_chunks)[0], kLayerKvInsertScopes, false);
+                    emit(SpmFmbOccurrenceKind::LayerBody,
+                         (*spec.chunks)[0], kLayerComputeScopes, true);
+                    emit(SpmFmbOccurrenceKind::LayerBody,
+                         (*spec.chunks)[1], kLayerComputeScopes, false);
+                    continue;
+                }
                 const bool input_in_spm =
                     spec.inter_layer_io == InterLayerIO::SPM_RESIDENT &&
                     layer != gs;
@@ -9225,6 +10749,15 @@ SpmFmbResolvedExecutionProfile
 FusedModelBase::resolve_spm_pipeline_execution_profile_impl(
     const SpmFmbResolvedProfileRequest& request,
     bool require_cpu_dry) {
+    const char* api = require_cpu_dry
+        ? "resolve_spm_pipeline_execution_profile_for_cpu_contract"
+        : "resolve_spm_pipeline_execution_profile_for_build_trace";
+    std::optional<RpuExecutionCleanupGuard> exclusive_planning;
+    if (RpuKernelGraph::has_active()) {
+        RpuExecutionCoordinator::check_current_thread_execution_allowed(api);
+    } else {
+        exclusive_planning.emplace(api);
+    }
     const CachedLayoutSnapshot& snapshot =
         pimpl_->pipeline_manifest_snapshot_;
     TORCH_CHECK(snapshot.valid,
@@ -9573,6 +11106,8 @@ FusedModelBase::resolve_spm_pipeline_execution_profile_impl(
         static_cfg.kv_first_fn != nullptr,
         &request.chunks,
         kv_chunks,
+        static_cfg.kv_first_pair_carry_rows,
+        static_cfg.kv_first_pair_carry_across_layers,
     };
 
     std::map<std::pair<std::string, int>, const OwnedPipelineDecl*>
@@ -10123,7 +11658,31 @@ void FusedModelBase::arm_spm_pipeline_composite_occurrence_runtime(
     runtime.graph_signature_segment_key =
         stamp.signature_segment_key;
     runtime.preload_follower = preload_follower;
-    pimpl_->composite_occurrence_runtime_ = runtime;
+    auto& previous = pimpl_->composite_occurrence_runtime_;
+    if (preload_follower && previous.preload_routes_recorded) {
+        TORCH_CHECK(
+            previous.composite_identity == composite_identity &&
+                previous.producer_local_ordinal + 1 == producer_local_ordinal &&
+                previous.capability == capability &&
+                previous.policy_fingerprint == policy_fingerprint &&
+                previous.expected_layout_hash == expected_layout_hash &&
+                previous.expected_allocation_hash == expected_allocation_hash &&
+                previous.expected_persistent_generation ==
+                    expected_persistent_generation &&
+                previous.composite_occurrence_profile_hash ==
+                    composite_occurrence_profile_hash &&
+                previous.graph_identity == &graph &&
+                previous.graph_state == runtime.graph_state &&
+                previous.graph_build_generation == stamp.build_generation &&
+                previous.graph_signature_identity == stamp.signature_identity &&
+                previous.graph_signature_segment_key == stamp.signature_segment_key,
+            "composite preload receipt lost its leader Graph/owner authority");
+        runtime.preload_routes_recorded = true;
+        runtime.preload_manifest_fingerprint =
+            previous.preload_manifest_fingerprint;
+        runtime.preload_route_receipt = std::move(previous.preload_route_receipt);
+    }
+    pimpl_->composite_occurrence_runtime_ = std::move(runtime);
 }
 
 void FusedModelBase::finish_spm_pipeline_composite_occurrence_runtime(
@@ -10155,7 +11714,13 @@ void FusedModelBase::finish_spm_pipeline_composite_occurrence_runtime(
                 producer_local_ordinal] != 0,
         "composite producer occurrence did not consume its stable input "
         "slot and preload role exactly once");
-    pimpl_->composite_occurrence_runtime_ = {};
+    if (runtime.preload_routes_recorded && producer_local_ordinal < 2) {
+        // Carry only this completed occurrence's preload authority into the
+        // next same-owner producer. arm() revalidates every identity above.
+        pimpl_->composite_occurrence_runtime_.armed = false;
+    } else {
+        pimpl_->composite_occurrence_runtime_ = {};
+    }
 }
 
 void FusedModelBase::cancel_spm_pipeline_composite_occurrence_runtime()
@@ -10372,6 +11937,15 @@ bool FusedModelBase::consume_spm_pipeline_composite_preload_follower() {
               !pimpl_->preload_callbacks_dirty_)),
         "composite preload follower requires the leader's current clean "
         "persistent allocation");
+    if (runtime.preload_follower &&
+        (runtime.preload_routes_recorded ||
+         pimpl_->ctx_.has_complete_physical_manifest())) {
+        TORCH_CHECK(runtime.preload_routes_recorded,
+                    "composite preload follower has no leader route receipt");
+        pimpl_->ctx_.inherit_physical_route_subset(
+            runtime.preload_manifest_fingerprint,
+            runtime.preload_route_receipt);
+    }
     runtime.preload_decision_consumed = true;
     return runtime.preload_follower;
 }
@@ -10999,12 +12573,7 @@ SpmFmbSealedBuildTrace FusedModelBase::seal_spm_pipeline_build_trace(
                           previous_end <= graph.graph_size());
     if (stable_three_slot_occurrence) {
         TORCH_CHECK(
-            candidate.composite_preload_follower
-                ? candidate.composite_outer_begin ==
-                      candidate.graph_node_begin
-                : (candidate.cpu_dry ||
-                   candidate.composite_outer_begin <
-                       candidate.graph_node_begin),
+            candidate.composite_preload_prefix_valid(),
             "composite preload role did not produce the required "
             "leader/follower Graph prefix");
     }
@@ -13453,8 +15022,11 @@ void FusedModelBase::drive_spm_pipeline_spm_peer_replay_for_cpu_contract(
 }
 
 // =============================================================================
-// run_all_layers — 14-step driver. Graph admission is owned by the Python
-// GraphCache; C++ run_all_layers emits the operation stream.
+// run_all_layers — 14-step driver with D-501 + D-502 + EXT-4 extensions
+//
+// C2 (todo.md): make_cache_key_impl / make_weights_cache_key_impl 不再生成
+// GraphCacheKey/WeightsCacheKey —— admission 整体迁到 Python 端 GraphCache,
+// C++ run_all_layers 退化为纯 op stream emitter。
 // =============================================================================
 
 at::Tensor FusedModelBase::run_all_layers(
@@ -13463,10 +15035,47 @@ at::Tensor FusedModelBase::run_all_layers(
     std::vector<at::Tensor>& v_caches,
     const std::optional<at::Tensor>& attention_mask,
     int64_t position,
-    bool is_causal) {
+    bool is_causal,
+    int64_t planned_chunk_size,
+    at::IntArrayRef planned_stage_descriptor,
+    uint64_t expected_layout_hash) {
+    TORCH_CHECK(
+        planned_chunk_size == 0 || planned_stage_descriptor.empty(),
+        "RPU_PLANNER_REJECT:EXACT_MISMATCH: production forward received "
+        "both a scalar exact chunk and a stage-plan descriptor");
+    std::shared_ptr<const FmbPreparedStageCandidate> prepared_candidate;
+    std::optional<FmbPrefillStageCandidate> rebased_candidate;
+    const FmbPrefillStageCandidate* planned_stage_candidate = nullptr;
+    if (!planned_stage_descriptor.empty()) {
+        prepared_candidate = prepare_stage_candidate(planned_stage_descriptor);
+        planned_stage_candidate = &prepared_candidate->candidate();
+        TORCH_INTERNAL_ASSERT(
+            planned_stage_candidate->physical_manifest.state ==
+                    FmbPhysicalManifestState::UNSPECIFIED ||
+                planned_stage_candidate->physical_manifest.state ==
+                    FmbPhysicalManifestState::COMPLETE);
+        if (planned_stage_candidate->physical_manifest.state ==
+                FmbPhysicalManifestState::COMPLETE &&
+            planned_stage_candidate->physical_manifest.graph_lifecycle ==
+                FmbGraphLifecycle::RETAINED_CACHE &&
+            planned_stage_candidate->physical_manifest.logical_length == 1) {
+            // Canonical single-token descriptors intentionally omit position.
+            // Rebase a private working copy, never cached immutable authority.
+            rebased_candidate = *planned_stage_candidate;
+            rebase_fmb_retained_decode_candidate(*rebased_candidate, position);
+            planned_stage_candidate = &*rebased_candidate;
+            prepared_candidate.reset();
+        }
+        validate_fmb_physical_manifest_forward_capability(
+            planned_stage_candidate->physical_manifest,
+            physical_manifest_forward_capability(
+                planned_stage_candidate->physical_manifest));
+    }
     return run_all_layers_impl(
         hidden_states, k_caches, v_caches, attention_mask, position,
-        is_causal, nullptr, nullptr);
+        is_causal, nullptr, nullptr, nullptr, expected_layout_hash,
+        planned_chunk_size,
+        planned_stage_candidate, std::move(prepared_candidate));
 }
 
 at::Tensor FusedModelBase::run_all_layers(
@@ -13477,10 +15086,40 @@ at::Tensor FusedModelBase::run_all_layers(
     int64_t position,
     bool is_causal,
     const std::vector<ChunkInfo>& input_chunks,
-    const std::vector<FmbExecutionSpan>& spans) {
+    const std::vector<FmbExecutionSpan>& spans,
+    uint64_t expected_layout_hash) {
+    TORCH_CHECK(spans.size() == 1,
+                "FusedModelBase: multi-span callers must declare boundary "
+                "policies explicitly");
+    const FmbStageBoundaryPolicies boundary_policies{};
     return run_all_layers_impl(
         hidden_states, k_caches, v_caches, attention_mask, position,
-        is_causal, &input_chunks, &spans);
+        is_causal, &input_chunks, &spans, &boundary_policies,
+        expected_layout_hash, /*planned_chunk_size=*/0,
+        /*planned_stage_candidate=*/nullptr);
+}
+
+at::Tensor FusedModelBase::run_all_layers(
+    const at::Tensor& hidden_states,
+    std::vector<at::Tensor>& k_caches,
+    std::vector<at::Tensor>& v_caches,
+    const std::optional<at::Tensor>& attention_mask,
+    int64_t position,
+    bool is_causal,
+    const std::vector<ChunkInfo>& input_chunks,
+    const std::vector<FmbExecutionSpan>& spans,
+    FmbStageBoundaryPolicies boundary_policies,
+    uint64_t expected_layout_hash) {
+    return run_all_layers_impl(
+        hidden_states, k_caches, v_caches, attention_mask, position,
+        is_causal, &input_chunks, &spans, &boundary_policies,
+        expected_layout_hash,
+        /*planned_chunk_size=*/0,
+        /*planned_stage_candidate=*/nullptr);
+}
+
+uint64_t FusedModelBase::checked_layer_body_replay_layout_hash() const {
+    return pimpl_->valid_ ? pimpl_->checked_layer_body_replay_layout_hash_ : 0;
 }
 
 at::Tensor FusedModelBase::run_all_layers_impl(
@@ -13491,13 +15130,29 @@ at::Tensor FusedModelBase::run_all_layers_impl(
     int64_t position,
     bool is_causal,
     const std::vector<ChunkInfo>* input_chunks,
-    const std::vector<FmbExecutionSpan>* spans)
+    const std::vector<FmbExecutionSpan>* spans,
+    const FmbStageBoundaryPolicies* boundary_policies,
+    uint64_t expected_layout_hash,
+    int64_t planned_chunk_size,
+    const FmbPrefillStageCandidate* planned_stage_candidate,
+    std::shared_ptr<const FmbPreparedStageCandidate> prepared_candidate)
 {
+    TORCH_INTERNAL_ASSERT(
+        !prepared_candidate || planned_stage_candidate == &prepared_candidate->candidate());
+    RECORD_FUNCTION("rpu_fmb::run_all_layers", {});
+    pimpl_->checked_layer_body_replay_layout_hash_ = 0;
+    auto clear_checked_layout = c10::make_scope_exit([&] {
+        pimpl_->checked_layer_body_replay_layout_hash_ = 0;
+    });
+    TORCH_CHECK((input_chunks == nullptr) == (spans == nullptr) &&
+                    (spans == nullptr) == (boundary_policies == nullptr),
+                "FusedModelBase specialized stage plan requires input chunks, "
+                "semantic spans, and boundary policies together");
     TORCH_CHECK(
-        (input_chunks == nullptr) == (spans == nullptr),
-        "FusedModelBase specialized stage plan requires input chunks and "
-        "semantic spans "
-        "together");
+        planned_stage_candidate == nullptr ||
+            (input_chunks == nullptr && planned_chunk_size == 0),
+        "RPU_PLANNER_REJECT:EXACT_MISMATCH: a production stage descriptor "
+        "is the sole stage-plan authority");
     const bool post_fn_yield_replay_run =
         pimpl_->pipeline_post_fn_yield_replay_authority_.armed;
     const bool callback_yield_replay_run =
@@ -13657,11 +15312,6 @@ at::Tensor FusedModelBase::run_all_layers_impl(
                 "FusedModelBase::run_all_layers: hidden_states must be contiguous");
     TORCH_CHECK(hidden_states.scalar_type() == at::kHalf,
                 "FusedModelBase::run_all_layers: hidden_states must be FP16");
-    // Device belongs in the contract next to dim/dtype/contiguity: step 10 takes
-    // RpuGetDevAddr(hidden_states.data_ptr()) for the layer-input mutable DMA.
-    // A CPU tensor here would therefore provide an invalid device address. The DMA-side
-    // guard catches that, but only far from the cause and phrased as a DMA
-    // failure; naming it at the boundary points at the actual mistake.
     TORCH_CHECK(hidden_states.device().type() == at::kPrivateUse1,
                 "FusedModelBase::run_all_layers: hidden_states must be on the "
                 "RPU device, got ", hidden_states.device());
@@ -13670,6 +15320,8 @@ at::Tensor FusedModelBase::run_all_layers_impl(
     int64_t seq_len = hidden_states.size(1);
     TORCH_CHECK(pimpl_->batch_size_ > 0 && seq_len > 0,
                 "FusedModelBase::run_all_layers: empty batch/seq");
+    detail::validate_fmb_planning_shape(
+        seq_len, position, "FusedModelBase::run_all_layers");
     // Batch decode: B independent sequences are packed into the GEMM M dim so a
     // decode step reads each weight ONCE for all B rows. Only seq_len == 1
     // qualifies: at seq_len > 1 the rows of one sequence carry consecutive RoPE
@@ -13731,22 +15383,66 @@ at::Tensor FusedModelBase::run_all_layers_impl(
     pimpl_->ctx_.input_in_spm = false;
     pimpl_->ctx_.output_to_spm = false;
 
+    const FmbPhysicalExecutionManifest unspecified_physical_manifest{};
+    const FmbPhysicalExecutionManifest& physical_manifest =
+        planned_stage_candidate == nullptr
+        ? unspecified_physical_manifest
+        : planned_stage_candidate->physical_manifest;
+    const bool transferred_external_physical_manifest =
+        pimpl_->ctx_.bind_physical_manifest(physical_manifest, prepared_candidate);
+    // Every immutable prepared schedule, including legacy descriptors without
+    // COMPLETE routes, must match this live invocation before reuse.
+    if (prepared_candidate) prepared_candidate->validate_request(seq_len, position);
+    bool matching_physical_manifest_replay_branch = false;
+    bool defer_physical_manifest_branch = false;
+    if (pimpl_->ctx_.has_complete_physical_manifest()) {
+        // Decode validates the descriptor against its own stage schedule. Do it
+        // again against this live invocation so shape/position drift cannot
+        // preserve stale route authority.
+        if (!prepared_candidate)
+            validate_fmb_physical_manifest(physical_manifest, seq_len, position);
+        // Python Graph signatures already carry the complete physical-plan
+        // digest. This native receipt independently binds it to the op stream,
+        // so a stale or mis-keyed REPLAY cannot silently use old routes.
+        // Immediate control forwards retain full descriptor/route authority,
+        // but have no Graph branch and cannot inherit any REPLAY receipt.
+        if (RpuKernelGraph::has_active() && transferred_external_physical_manifest) {
+            matching_physical_manifest_replay_branch =
+                pimpl_->ctx_.external_physical_manifest_prologue_replay();
+        } else if (RpuKernelGraph::has_active()) {
+            // dynamic_config() may normalize an external RPU mask through a
+            // host view before any device work exists.  A Branch is still a
+            // Graph node, so recording the receipt here would make the generic
+            // RPU-to-CPU guard flush that metadata-only prefix and permanently
+            // downgrade the capture.  Emit the receipt immediately after
+            // dynamic_config(), before any route consumer or device launcher.
+            defer_physical_manifest_branch = true;
+        }
+        // On REPLAY, returning from record_branch means the next built node
+        // had this exact fingerprint. Keep the proof local to this invocation;
+        // fast-skip may inherit BUILD receipts only under that proof.
+    }
+
     // Deep fast-replay (RPU_DEEP_FAST_REPLAY): on a warm REPLAY that will FULLY skip the
     // op-stream (no post_fn — prefill/denoise/action graphs), the per-forward setup is
     // redundant. The SPM layout (declare_buffers + ensure_allocated, step 7) and the
-    // weight-DMA nodes (preload callbacks + preload_fn, step 11) are
+    // weight-DMA nodes (the D-502 preload callbacks + the D-501 preload_fn, step 11) are
     // baked into the kd_buf and replayed as-is, so re-running them just rebuilds identical
     // state nobody reads (like the body re-walk the existing fast-replay already skips).
     // Skip them. Vision uses skip_layer_body (its post_fn re-emits and READS the SPM
     // layout) → NOT full-skip → keeps the setup. The kept per-forward bits still run:
     // ctx_, compute_chunks/dynamic_config (cheap; mask #23), the registry output_tensor_,
     // hidden_in_src_base_ + flush. Default OFF in C++; wall_oss setdefaults it on.
+    const GraphRuntimePolicy* graph_runtime_policy =
+        RpuKernelGraph::has_active()
+        ? &RpuKernelGraph::active().runtime_policy() : nullptr;
     const bool deep_full_skip =
-        pimpl_->deep_fast_replay_enabled_ &&
-        pimpl_->global_fast_replay_enabled_
+        expected_layout_hash == 0 &&
+        graph_runtime_policy != nullptr &&
+        graph_runtime_policy->fmb_deep_fast_replay &&
+        graph_runtime_policy->fmb_fast_replay
         && !static_cfg.batch_decode_active
         && pimpl_->pipeline_lease_epoch_ == 0
-        && RpuKernelGraph::has_active()
         && RpuKernelGraph::active().state() == RpuKernelGraph::State::REPLAYING
         && !(static_cfg.post_fn != nullptr && RpuKernelGraph::active().has_post_fn_cursor());
 
@@ -13756,7 +15452,7 @@ at::Tensor FusedModelBase::run_all_layers_impl(
     layout_ctx.max_kv_seq_len = max_kv_seq_len;
     layout_ctx.num_layers = static_cfg.num_layers;
     layout_ctx.use_attn_mask = use_explicit_mask;
-    // Thread the attention mode into the hashed LayoutContext
+    // thread the attention mode into the hashed LayoutContext
     // so declare_buffers derives kv_first_layout from it (pure function) and the
     // allocation re-keys when a handle switches causal↔bidirectional-no-mask.
     // Propagates to compute_chunks probe_ctx/min_ctx and alloc_ctx by value-copy.
@@ -13764,6 +15460,20 @@ at::Tensor FusedModelBase::run_all_layers_impl(
     // Batch decode: chunk planning stays PER SEQUENCE (seq_len == 1 → one chunk
     // of len 1); declare_buffers multiplies the row-parallel slots by this.
     layout_ctx.batch_size = pimpl_->batch_size_;
+    if (prepared_candidate && pimpl_->ctx_.has_complete_physical_manifest()) {
+        layout_ctx.physical_manifest_fingerprint = prepared_candidate->manifest_fingerprint();
+        layout_ctx.rope_table_residency = prepared_candidate->rope_residency();
+        const auto attention = prepared_candidate->attention_policy();
+        if (attention) layout_ctx.attention_policy = *attention;
+        layout_ctx.forward_operand_residency = physical_forward_operand_residency(physical_manifest);
+        TORCH_CHECK(
+            layout_ctx.forward_operand_residency == FmbForwardOperandResidency::UNSPECIFIED ||
+                layout_ctx.forward_operand_residency == FmbForwardOperandResidency::PER_LAYER ||
+                layout_ctx.forward_operand_residency == FmbForwardOperandResidency::FORWARD,
+            "Invalid descriptor-bound forward operand residency");
+    } else {
+        layout_ctx = bind_physical_layout_context(layout_ctx, physical_manifest);
+    }
 
     auto decl_fn = [this](const LayoutContext& c) { return this->declare_buffers(c); };
     auto estimate_fn = [&](const LayoutContext& c) {
@@ -13774,11 +15484,161 @@ at::Tensor FusedModelBase::run_all_layers_impl(
     };
     const int64_t chunk_size_cap = subclass_chunk_size_cap(seq_len, position);
 
+    const auto live_after_reset_free = [] {
+        return static_cast<int64_t>(SPM_ALLOC.free_space()) +
+            static_cast<int64_t>(SPM_ALLOC.temporary_used());
+    };
+    const auto prepared_layout_fits = [&](const std::vector<BufferDecl>& declarations) {
+        return pimpl_->prepared_spm_costs_.prepare(declarations).fits(
+            live_after_reset_free(), pimpl_->persistent_allocated_,
+            static_cast<int64_t>(SpmAllocator::SPM_PLANNING_BUDGET));
+    };
+
+    std::function<bool(int64_t)> boundary_valid_fn;
+    if (boundary_policies != nullptr) {
+        validate_fmb_input_stage(
+            *input_chunks, *spans, boundary_policies->input,
+            seq_len, position, "FusedModelBase");
+        boundary_valid_fn = [this, &static_cfg, seq_len, position, spans,
+                             boundary_policies](int64_t chunk_size) {
+            const std::vector<ChunkInfo> compute_chunks =
+                make_fmb_chunks(seq_len, position, chunk_size);
+            if (!detail::fmb_chunks_respect_boundary_policy(
+                    compute_chunks, *spans, boundary_policies->compute)) {
+                return false;
+            }
+            if (boundary_policies->qkv ==
+                FmbSpanBoundaryPolicy::ALLOW_CROSS) {
+                return true;
+            }
+
+            const ChunkPlan compute_plan{
+                compute_chunks.front().len,
+                static_cast<int64_t>(compute_chunks.size())};
+            const ModelDynamicConfig dynamic_cfg =
+                planning_dynamic_config(compute_plan);
+            validate_fmb_chunk_mode(
+                static_cfg, dynamic_cfg, "FusedModelBase boundary planner");
+            (void)resolve_and_validate_fmb_inter_layer_io(
+                dynamic_cfg, compute_chunks.size(),
+                "FusedModelBase boundary planner");
+            ChunkPlan qkv_plan = compute_plan;
+            if (dynamic_cfg.chunk_mode == ChunkMode::KV_FIRST &&
+                static_cfg.kv_first_chunk_plan_fn != nullptr) {
+                qkv_plan = std::invoke(
+                    static_cfg.kv_first_chunk_plan_fn, *this, compute_plan);
+            }
+            if (dynamic_cfg.chunk_mode == ChunkMode::KV_FIRST) {
+                validate_kv_first_chunk_plan(
+                    qkv_plan, seq_len, "FusedModelBase boundary planner");
+            }
+            return detail::fmb_chunks_respect_boundary_policy(
+                make_fmb_chunks(seq_len, position, qkv_plan.chunk_size),
+                *spans, boundary_policies->qkv);
+        };
+    }
+
+    auto require_same_schedule = [](
+        const std::vector<ChunkInfo>& actual,
+        const std::vector<ChunkInfo>& expected,
+        const char* role) {
+        TORCH_CHECK(
+            actual.size() == expected.size(),
+            "RPU_PLANNER_REJECT:EXACT_MISMATCH: planned ", role,
+            " chunk count does not match the current request");
+        for (size_t index = 0; index < actual.size(); ++index) {
+            const ChunkInfo& lhs = actual[index];
+            const ChunkInfo& rhs = expected[index];
+            TORCH_CHECK(
+                lhs.idx == rhs.idx && lhs.offset == rhs.offset &&
+                    lhs.len == rhs.len && lhs.kv_seq_len == rhs.kv_seq_len,
+                "RPU_PLANNER_REJECT:EXACT_MISMATCH: planned ", role,
+                " chunk[", index,
+                "] does not match the current execution shape/position");
+        }
+    };
+
     int64_t resolved_chunk_size = 0;
-    auto chunks = compute_chunks_impl(
-        *pimpl_, decl_fn, valid_fn, chunk_size_cap,
-        seq_len, position, layout_ctx,
-        &resolved_chunk_size);
+    std::vector<ChunkInfo> chunks;
+    if (planned_stage_candidate != nullptr) {
+        const FmbPrefillStageCandidate& candidate =
+            *planned_stage_candidate;
+        detail::validate_fmb_exact_chunk_size(
+            candidate.compute_chunk_size, seq_len,
+            "FusedModelBase stage descriptor compute");
+        detail::validate_fmb_exact_chunk_size(
+            candidate.qkv_chunk_size, seq_len,
+            "FusedModelBase stage descriptor qkv");
+        // Prepared schedules already prove complete coverage, contiguous
+        // indices/offsets, uniform non-tail chunks, capacity and span boundaries.
+        // The live length/position check above binds those facts to this call.
+        // Dynamic owner capacity/mode, capability and resource admission remain
+        // below; rebased decode keeps the uncached checks.
+        if (!prepared_candidate) {
+            validate_fmb_input_stage(
+                candidate.stage_plan.input.chunks,
+                candidate.stage_plan.spans,
+                candidate.stage_plan.boundary_policies.input,
+                seq_len, position,
+                "RPU_PLANNER_REJECT:EXACT_MISMATCH: FusedModelBase stage "
+                "descriptor");
+            require_same_schedule(
+                candidate.stage_plan.compute.chunks,
+                make_fmb_chunks(
+                    seq_len, position, candidate.compute_chunk_size),
+                "compute");
+            require_same_schedule(
+                candidate.stage_plan.qkv.chunks,
+                make_fmb_chunks(seq_len, position, candidate.qkv_chunk_size),
+                "qkv");
+        }
+        // A sticky prefill override has request-local decode capacity 16;
+        // compare the effective value without changing the immutable plan.
+        const int64_t effective_legacy_override =
+            legacy_chunk_override_for_exact_request(pimpl_->chunk_size_override_, seq_len);
+        TORCH_CHECK(
+            effective_legacy_override == 0 ||
+                effective_legacy_override ==
+                    candidate.compute_chunk_size,
+            "RPU_PLANNER_REJECT:EXACT_MISMATCH: stage descriptor compute "
+            "capacity=", candidate.compute_chunk_size,
+            " conflicts with legacy handle override=",
+            pimpl_->chunk_size_override_, " (request resolves ",
+            effective_legacy_override, ")");
+
+        // Validate only the exact immutable winner.  Unlike the legacy auto
+        // path, this does not scan the domain and cannot select a replacement.
+        LayoutContext exact_probe_ctx = layout_ctx;
+        exact_probe_ctx.chunk_size = candidate.compute_chunk_size;
+        const std::vector<BufferDecl> exact_decls =
+            decl_fn(exact_probe_ctx);
+        const auto exact_cost = pimpl_->prepared_spm_costs_.prepare(exact_decls);
+        const int64_t exact_temporary = exact_cost.temporary;
+        const int64_t exact_free = live_after_reset_free();
+        const int64_t exact_budget = static_cast<int64_t>(SpmAllocator::SPM_PLANNING_BUDGET);
+        const int64_t exact_available = exact_cost.available(
+            exact_free, pimpl_->persistent_allocated_, exact_budget);
+        TORCH_CHECK(
+            valid_fn(candidate.compute_chunk_size),
+            "RPU_PLANNER_REJECT:CAPABILITY: stage descriptor compute "
+            "capacity=", candidate.compute_chunk_size,
+            " fails the model/kernel validity contract");
+        TORCH_CHECK(
+            exact_temporary <= exact_available &&
+                exact_cost.fits(exact_free, pimpl_->persistent_allocated_, exact_budget),
+            "RPU_PLANNER_REJECT:CAPABILITY: stage descriptor compute "
+            "capacity=", candidate.compute_chunk_size,
+            " exceeds the SPM budget: required=", exact_temporary,
+            " bytes, available=", exact_available, " bytes");
+        resolved_chunk_size = candidate.compute_chunk_size;
+        chunks = candidate.stage_plan.compute.chunks;
+    } else {
+        chunks = compute_chunks_impl(
+            *pimpl_, decl_fn, valid_fn, chunk_size_cap,
+            seq_len, position, layout_ctx,
+            &resolved_chunk_size, planned_chunk_size,
+            std::move(boundary_valid_fn));
+    }
     TORCH_CHECK(!chunks.empty(), "FusedModelBase: compute_chunks returned empty list");
     // Planning-only adapter queries must not alter this public observation.
     pimpl_->last_resolved_chunk_size_ = resolved_chunk_size;
@@ -13789,26 +15649,108 @@ at::Tensor FusedModelBase::run_all_layers_impl(
 
     // 6. dynamic config
     auto dyn_cfg = dynamic_config(plan);
+    if (defer_physical_manifest_branch) {
+        auto& physical_graph = RpuKernelGraph::active();
+        const bool replaying =
+            physical_graph.state() == RpuKernelGraph::State::REPLAYING;
+        const GraphOpStreamStamp manifest_begin =
+            physical_graph.op_stream_stamp();
+        physical_graph.record_physical_manifest_branch(
+            pimpl_->ctx_.physical_manifest_fingerprint());
+        if (C10_UNLIKELY(build_trace_run)) {
+            auto& candidate = pimpl_->pipeline_build_trace_;
+            const GraphOpStreamStamp manifest_end =
+                physical_graph.op_stream_stamp();
+            const auto matches_armed_graph = [&](const GraphOpStreamStamp& stamp) {
+                return stamp.graph == candidate.graph_identity &&
+                    stamp.state == RpuKernelGraph::State::RECORDING &&
+                    stamp.build_generation == candidate.graph_build_generation &&
+                    stamp.signature_identity == candidate.graph_signature_identity &&
+                    stamp.signature_segment_key == candidate.graph_signature_segment_key;
+            };
+            TORCH_CHECK(
+                candidate.manifest_prefix_fingerprint == 0 &&
+                    pimpl_->ctx_.physical_manifest_fingerprint() != 0 &&
+                    matches_armed_graph(manifest_begin) &&
+                    matches_armed_graph(manifest_end) &&
+                    manifest_end.position > manifest_begin.position &&
+                    manifest_end.position - manifest_begin.position == 1,
+                "BUILD manifest metadata must record exactly one node "
+                "in the armed Graph");
+            candidate.manifest_prefix_fingerprint =
+                pimpl_->ctx_.physical_manifest_fingerprint();
+            candidate.manifest_prefix_begin = manifest_begin.position;
+            candidate.manifest_prefix_end = manifest_end.position;
+        }
+        matching_physical_manifest_replay_branch = replaying;
+    }
     validate_fmb_chunk_mode(static_cfg, dyn_cfg, "FusedModelBase");
+    std::optional<AttentionExecutionPolicy>
+        manifest_attention_layout_policy;
+    if (pimpl_->ctx_.has_complete_physical_manifest()) {
+        manifest_attention_layout_policy =
+            pimpl_->ctx_.physical_attention_layout_policy();
+        TORCH_CHECK(
+            manifest_attention_layout_policy.has_value() ||
+                dyn_cfg.attention_policy ==
+                    AttentionExecutionPolicy::DDR_KV,
+            "RPU_PLANNER_REJECT:CAPABILITY: COMPLETE physical manifest "
+            "must carry per-site ATTENTION routes unless the native owner "
+            "declares fixed DDR_KV");
+        if (manifest_attention_layout_policy.has_value() &&
+            dyn_cfg.attention_policy != AttentionExecutionPolicy::AUTO) {
+            TORCH_CHECK(
+                dyn_cfg.attention_policy ==
+                    *manifest_attention_layout_policy,
+                "RPU_PLANNER_REJECT:EXACT_MISMATCH: COMPLETE per-site "
+                "ATTENTION routes conflict with the native owner's fixed "
+                "attention policy");
+        }
+    }
 
-    // 6.5 KV_FIRST dual-chunk plan (kv_first_chunk_plan_fn)
+    // 6.5 KV_FIRST dual-chunk plan (D-501 kv_first_chunk_plan_fn)
     ChunkPlan kv_insert_plan = plan;
-    std::vector<ChunkInfo> kv_insert_chunks = chunks;
     if (dyn_cfg.chunk_mode == ChunkMode::KV_FIRST) {
         if (static_cfg.kv_first_chunk_plan_fn != nullptr) {
             kv_insert_plan = std::invoke(static_cfg.kv_first_chunk_plan_fn, *this, plan);
         }
         validate_kv_first_chunk_plan(
             kv_insert_plan, seq_len, "FusedModelBase");
-        if (kv_insert_plan.chunk_size != plan.chunk_size) {
-            int64_t cs = kv_insert_plan.chunk_size;
-            kv_insert_chunks.clear();
-            for (int64_t off = 0; off < seq_len; off += cs) {
-                int64_t len = std::min(cs, seq_len - off);
-                kv_insert_chunks.push_back(
-                    {static_cast<int>(off / cs), off, len, position + off + len});
-            }
-        }
+    }
+    const bool qkv_reuses_compute_capacity =
+        kv_insert_plan.chunk_size == plan.chunk_size &&
+        kv_insert_plan.num_chunks == plan.num_chunks;
+    const int64_t resolved_qkv_chunk_size =
+        dyn_cfg.chunk_mode == ChunkMode::SEQUENTIAL ||
+            qkv_reuses_compute_capacity
+        ? resolved_chunk_size : kv_insert_plan.chunk_size;
+    std::vector<ChunkInfo> kv_insert_chunks = make_fmb_chunks(
+        seq_len, position, resolved_qkv_chunk_size);
+
+    if (planned_chunk_size > 0) {
+        TORCH_CHECK(
+            resolved_qkv_chunk_size == planned_chunk_size,
+            "RPU_PLANNER_REJECT:EXACT_MISMATCH: scalar exact chunk=",
+            planned_chunk_size, " resolves compute capacity=",
+            resolved_chunk_size, " but qkv capacity=",
+            resolved_qkv_chunk_size);
+    }
+    if (planned_stage_candidate != nullptr) {
+        const FmbPrefillStageCandidate& candidate =
+            *planned_stage_candidate;
+        TORCH_CHECK(
+            candidate.compute_chunk_size == resolved_chunk_size &&
+                candidate.qkv_chunk_size == resolved_qkv_chunk_size,
+            "RPU_PLANNER_REJECT:EXACT_MISMATCH: stage descriptor capacities "
+            "do not match the model's current qkv/compute plan");
+        TORCH_CHECK(
+            candidate.stage_plan.chunk_mode == dyn_cfg.chunk_mode,
+            "RPU_PLANNER_REJECT:EXACT_MISMATCH: stage descriptor chunk mode "
+            "does not match the model's current dynamic configuration");
+        require_same_schedule(
+            candidate.stage_plan.qkv.chunks, kv_insert_chunks, "qkv");
+        require_same_schedule(
+            candidate.stage_plan.compute.chunks, chunks, "compute");
     }
 
     // Every FMB model consumes one resolved three-stage plan. The legacy
@@ -13816,18 +15758,29 @@ at::Tensor FusedModelBase::run_all_layers_impl(
     // one full-sequence semantic span; Vision/action/language specializations
     // may publish finer outer/pre-layer input partitions and independent
     // packed spans.
-    const std::vector<ChunkInfo> default_input_chunks{
-        {0, 0, seq_len, position + seq_len}};
-    const std::vector<FmbExecutionSpan> default_spans{{0, seq_len}};
-    pimpl_->ctx_.stage_plan = compose_fmb_three_stage_chunk_plan(
-        input_chunks != nullptr ? *input_chunks : default_input_chunks,
-        kv_insert_chunks, chunks,
-        spans != nullptr ? *spans : default_spans,
-        dyn_cfg.chunk_mode);
+    if (planned_stage_candidate != nullptr) {
+        // Consume the exact decoded object.  Validation above may derive
+        // schedules for comparison, but it never replaces planner-owned
+        // chunks/spans/policies with a locally selected winner.
+        pimpl_->ctx_.stage_plan = planned_stage_candidate->stage_plan;
+    } else {
+        const std::vector<ChunkInfo> default_input_chunks{
+            {0, 0, seq_len, position + seq_len}};
+        const std::vector<FmbExecutionSpan> default_spans{{0, seq_len}};
+        pimpl_->ctx_.stage_plan = input_chunks == nullptr
+            ? compose_fmb_three_stage_chunk_plan(
+                  default_input_chunks, kv_insert_chunks, chunks,
+                  default_spans, dyn_cfg.chunk_mode)
+            : compose_fmb_three_stage_chunk_plan(
+                  *input_chunks, kv_insert_chunks, chunks, *spans,
+                  dyn_cfg.chunk_mode, *boundary_policies);
+    }
     pimpl_->ctx_.chunk_topology =
-        fmb_chunk_topology(pimpl_->ctx_.stage_plan);
+        prepared_candidate ? prepared_candidate->topology()
+                           : fmb_chunk_topology(pimpl_->ctx_.stage_plan);
     layout_ctx.stage_plan_fingerprint =
-        fmb_three_stage_chunk_plan_fingerprint(pimpl_->ctx_.stage_plan);
+        prepared_candidate ? prepared_candidate->stage_fingerprint()
+                           : fmb_three_stage_chunk_plan_fingerprint(pimpl_->ctx_.stage_plan);
     // The validated public plan is the single source consumed by the allocator
     // and traversal below, including model-specialized KV_FIRST schedules such
     // as packed QKV followed by span-local compute.
@@ -13848,8 +15801,31 @@ at::Tensor FusedModelBase::run_all_layers_impl(
 
     AttentionExecutionPolicy resolved_attention_policy =
         AttentionExecutionPolicy::DDR_KV;
-    if (dyn_cfg.attention_policy !=
-        AttentionExecutionPolicy::DDR_KV) {
+    if (manifest_attention_layout_policy.has_value()) {
+        // COMPLETE routes are direct authority, not input to the legacy
+        // resolver. The aggregate only selects the union layout; each
+        // launcher must still consume its own exact per-site route.
+        resolved_attention_policy = *manifest_attention_layout_policy;
+        if (resolved_attention_policy ==
+            AttentionExecutionPolicy::SPM_KV_BY_MHA) {
+            auto spm_candidate = alloc_ctx;
+            spm_candidate.attention_policy =
+                AttentionExecutionPolicy::SPM_KV_BY_MHA;
+            TORCH_CHECK(
+                subclass_spm_kv_by_mha_eligible(
+                    pimpl_->ctx_.stage_plan, spm_candidate, position),
+                "RPU_PLANNER_REJECT:CAPABILITY: COMPLETE ATTENTION route "
+                "selects SPM_KV_BY_MHA outside the native owner/kernel "
+                "capability");
+            TORCH_CHECK(
+                prepared_layout_fits(decl_fn(spm_candidate)),
+                "RPU_PLANNER_REJECT:CAPABILITY: COMPLETE ATTENTION route "
+                "selects SPM_KV_BY_MHA but its exact joint SPM layout does "
+                "not fit");
+        }
+    } else if (
+        !pimpl_->ctx_.has_complete_physical_manifest() &&
+        dyn_cfg.attention_policy != AttentionExecutionPolicy::DDR_KV) {
         auto spm_candidate = alloc_ctx;
         spm_candidate.attention_policy =
             AttentionExecutionPolicy::SPM_KV_BY_MHA;
@@ -13864,8 +15840,7 @@ at::Tensor FusedModelBase::run_all_layers_impl(
                     dyn_cfg.attention_policy, /*eligible=*/false,
                     /*fits=*/false);
         } else {
-            const bool spm_layout_fits = final_chunk_layout_fits(
-                decl_fn(spm_candidate), pimpl_->persistent_allocated_);
+            const bool spm_layout_fits = prepared_layout_fits(decl_fn(spm_candidate));
 
             // AUTO is sticky only for participating, bounded profiles: once a
             // Graph is built, unrelated global SPM occupancy must not silently
@@ -13921,26 +15896,97 @@ at::Tensor FusedModelBase::run_all_layers_impl(
 
     // 7. SPM allocation (dual-chunk aware) — skipped on deep full-skip replay (baked).
     if (!deep_full_skip) {
+        RECORD_FUNCTION("rpu_fmb::declare_and_allocate", {});
         auto decls = decl_fn(alloc_ctx);
+        TORCH_CHECK(prepared_layout_fits(decls),
+                    "RPU_PLANNER_REJECT:CAPABILITY: FusedModelBase: final joint "
+                    "compute/KV_FIRST layout exceeds SPM planning budget");
+        // COMPLETE standalone dispatch owns the same zero-based temporary
+        // layout whether or not its caller supplies a separate layout hash.
         validate_final_chunk_layout_fits(
             decls, pimpl_->persistent_allocated_, "FusedModelBase");
+        // In particular, Vision skips its captured body but re-emits post_fn;
+        // appending after a sibling owner's waterline would split those two
+        // halves across different absolute SPM addresses.
+        const bool standalone_complete_layout =
+            pimpl_->ctx_.has_complete_physical_manifest() &&
+            pimpl_->pipeline_lease_epoch_ == 0;
+        uint64_t required_layout_hash = expected_layout_hash;
+        if (standalone_complete_layout && required_layout_hash == 0) {
+            const CpuTemporaryLayoutPlan planned =
+                plan_cpu_temporary_layout(decls);
+            const int64_t params_hash = compute_params_hash_impl(
+                alloc_ctx, pimpl_->num_q_heads_, pimpl_->num_kv_heads_,
+                pimpl_->head_dim_, pimpl_->hidden_size_,
+                pimpl_->intermediate_size_, subclass_layout_hash());
+            required_layout_hash = pipeline_layout_hash_impl(
+                decls, params_hash, planned.required_extent,
+                planned.offsets, planned.per_layer_offsets);
+        }
         ensure_allocated_impl(*pimpl_, decls, alloc_ctx, estimate_fn,
                               subclass_layout_hash(),
-                              /*enforce_allocation_identity=*/false);
+                              /*enforce_allocation_identity=*/false,
+                              standalone_complete_layout);
+        if (required_layout_hash != 0) {
+            const SpmPipelineComponentLayout actual =
+                current_temporary_layout_identity(
+                    decls, pimpl_->cached_params_hash_, pimpl_->offsets_,
+                    pimpl_->per_layer_offsets_);
+            TORCH_CHECK(
+                actual.layout_hash == required_layout_hash,
+                "FusedModelBase: allocated layout differs from the planner "
+                "identity before Graph op emission: expected=",
+                required_layout_hash, " actual=", actual.layout_hash,
+                " extent=", actual.temporary_bytes);
+            pimpl_->checked_layer_body_replay_layout_hash_ = actual.layout_hash;
+        }
         // Cache the freshly-invoked declare_buffers result so
         // run_preload_callbacks_ captures the same BufferDecl instances
-        // (their preload_callback std::functions).
+        // (their preload_callback std::functions) — EXT-7 re-bind path.
         pimpl_->last_decls_ = std::move(decls);
     }
 
-    // Fire preload callbacks on persistent advance / dirty flag
+    // Validate the owner after real layout restoration, before re-walking its
+    // persistent preloads. The admitted hook skips the full captured stream;
+    // the following DDR registry, live input base/flush and keepalive setup emit
+    // no Graph nodes. D-501 preload/pre/post hooks remain outside this contract.
+    bool checked_body_replay = false;
+    if (static_cfg.checked_layer_body_replay_fn != nullptr &&
+        !static_cfg.batch_decode_active && !callback_yield_replay_run &&
+        !post_fn_yield_replay_run && !build_trace_run &&
+        pimpl_->pipeline_lease_epoch_ == 0 &&
+        static_cfg.preload_fn == nullptr && static_cfg.post_fn == nullptr &&
+        static_cfg.pre_layers_fn == nullptr &&
+        static_cfg.post_layers_fn == nullptr && static_cfg.body_iterations == 1 &&
+        RpuKernelGraph::has_active()) {
+        const bool replaying = RpuKernelGraph::active().state() ==
+            RpuKernelGraph::State::REPLAYING;
+        // No register patch or cursor advance may precede this route proof.
+        if (replaying) {
+            TORCH_CHECK(pimpl_->ctx_.has_complete_physical_manifest() &&
+                            matching_physical_manifest_replay_branch,
+                        "checked layer replay requires a matching COMPLETE Graph branch");
+        }
+        checked_body_replay = std::invoke(
+            static_cfg.checked_layer_body_replay_fn, *this);
+        TORCH_CHECK(!checked_body_replay || replaying,
+                    "checked layer replay cannot skip Graph BUILD");
+        if (checked_body_replay) {
+            pimpl_->ctx_.inherit_physical_routes_from_matching_graph_replay();
+            // The captured persistent DMA still runs in this Graph submission.
+            pimpl_->cached_preload_gen_ = SPM_ALLOC.persistent_generation();
+            pimpl_->preload_callbacks_dirty_ = false;
+        }
+    }
+
+    // D-502: fire preload callbacks on persistent advance / dirty flag
     // (skipped on deep full-skip — the persistent SPM is baked + replayed).
     // RhinoVLA per-model preload skip (fast_replay_skip_preload): on a fast-replay
     // REPLAY the cursor is set absolutely by skip_op_stream/skip_layer_body (both land
-    // >= the preload region), so re-walking the ~144 callbacks is pure host
+    // >= the preload region), so re-walking the ~144 D-502 callbacks is pure host
     // overhead; the built preload DMA nodes replay via the segment launch to the SAME
-    // persistent SPM. Gated on fast_replay_skip_layer_loop + REPLAYING; other
-    // models leave the flag false.
+    // persistent SPM. This requires fast_replay_skip_layer_loop and REPLAYING;
+    // other models leave the flag false.
     const bool skip_preload_callbacks_replay =
         static_cfg.fast_replay_skip_preload &&
         static_cfg.fast_replay_skip_layer_loop &&
@@ -13955,7 +16001,7 @@ at::Tensor FusedModelBase::run_all_layers_impl(
         RpuKernelGraph::active().state() == RpuKernelGraph::State::RECORDING &&
         pimpl_->cached_preload_gen_ == SPM_ALLOC.persistent_generation() &&
         !pimpl_->preload_callbacks_dirty_;
-    if (!deep_full_skip && !skip_preload_callbacks_replay &&
+    if (!checked_body_replay && !deep_full_skip && !skip_preload_callbacks_replay &&
         !composite_preload_follower &&
         !skip_clean_preload_callbacks_recording)
         run_preload_callbacks_(pimpl_->last_decls_, *this);
@@ -13968,7 +16014,7 @@ at::Tensor FusedModelBase::run_all_layers_impl(
 
     // 10. DDR buffers — looked up from the shape-keyed registry on
     //     pimpl_->registry_ so DMA-baked pointers remain stable across
-    //     multi-key GraphCache replay.
+    //     multi-key GraphCache replay. See spec §3 and §9.
     auto opts = hidden_states.options();
     pimpl_->post_output_tensor_ = at::Tensor{};
 
@@ -14013,38 +16059,22 @@ at::Tensor FusedModelBase::run_all_layers_impl(
         ::rhino_lkn::RpuGetDevAddr(hidden_states.data_ptr());
     rpu_ddr_flush_force_sized(
         hidden_states.data_ptr<c10::Half>(), hidden_states.nbytes());
-    // Keep the source tensor alive until graph execution completes.
-    // The two lines above capture only hidden_states' DEVICE ADDRESS: layer 0's
-    // chunk DMA reads `*hidden_in_src_base_ + offset`, and no graph node holds a
-    // reference to the tensor. But recording is not execution — the graph runs in
-    // RpuKernelGraph::end(), i.e. when the enclosing `with cache.capture(sig):`
-    // exits, by which time the Python adapter that built `hidden_states` has
-    // returned and dropped its only reference. The DDR block is then free and its
-    // device VA can be re-issued before the deferred DMA reads it.
-    // ⚠️ The relevant vector is RpuKernelGraph::tensor_refs_ (graph_runtime.h) —
-    // NOT this file's pimpl_->tensor_refs_, which is cleared before end() runs.
-    // RpuKernelGraph::tensor_refs_ is cleared in
-    // end() only AFTER execution, so keep_alive() is exactly the right lifetime.
-    // Costs one refcount per forward and nothing else (keep_alive does not flush).
+    // Keep hidden_states alive until deferred graph execution completes. Layer 0's
+    // DMA stores its device address, not a tensor reference; Python may release the
+    // input before RpuKernelGraph::end() executes the recorded work.
+    // RpuKernelGraph::tensor_refs_ owns this reference through execution. The
+    // similarly named pimpl_->tensor_refs_ is cleared earlier and cannot provide
+    // that lifetime. keep_alive() retains storage without flushing it.
     if (RpuKernelGraph::has_active()) {
         RpuKernelGraph::active().keep_alive(hidden_states);
     }
 
-    // 11. weights preload (preload_fn)
-    //
-    // graph-naive: GraphCache 已经移交 Python 端,这里不再做 weights_key_changed
-    // / set_weights_key admission。preload_fn 直接调,callback body 走
-    // wq->enqueu_kernel（无 graph scope 时立即发射，Python 用
-    // with cache.capture(WEIGHTS_SIG) 包整段 run_all_layers 让其进
-    // graph RECORDING/REPLAYING)。
-    //
-    // weights_dirty_ 仍然在这里清：Python 侧 admission 不知道 weights
-    // 是否真的换过(set_weights C++ 端置 dirty),所以即使 Python 命中 BUILT,
-    // 也要让本次 forward 走一遍 preload_fn 才能把 DMA 节点录进图。
-    // RhinoVLA per-model preload_fn skip (fast_replay_skip_preload): on a clean-weights
-    // REPLAY the preload op-walk is pure host overhead — the built DMA/memset nodes
-    // replay via the segment launch and the cursor is overwritten by the skip below.
-    // Validated profiles preserve output identity. Other models leave the flag false.
+    // 11. Weights preload (D-501 preload_fn).
+    // Python owns GraphCache admission; callbacks emit into the caller's capture.
+    // Native weights_dirty_ still requires preload emission after set_weights.
+    // A clean-weight replay may skip the preload op walk only when the per-model
+    // fast_replay_skip_preload contract is enabled: the built segment retains and
+    // executes the preload DMA/memset nodes, and the replay cursor is advanced.
     const bool skip_preload_replay =
         static_cfg.fast_replay_skip_preload &&
         pimpl_->pipeline_lease_epoch_ == 0 &&
@@ -14087,38 +16117,21 @@ at::Tensor FusedModelBase::run_all_layers_impl(
         }
     }
 
-    // Repeat the body (11.5 pre → 12 layers → 12.5 post) body_iterations
-    // times in one graph. Default 1 keeps non-Wall models byte-identical.
-    // Setup (1–11) and post_fn/flush (13–14) stay once, outside the loop.
-    // ── Fast replay (RPU_WALL_OSS_FAST_REPLAY; default OFF, wall_oss opts in) ─────
-    // On a warm REPLAY the body would otherwise re-emit the same op stream recorded at
-    // BUILD. All per-call deltas have already been applied outside the body loop:
-    //   • position_ids → copied into the stable keepalive in CausalDecoderModel::forward
-    //     (the prologue, before run_all_layers);
-    //   • the explicit 2D mask → copied to its stable DDR slot by dynamic_config (step 6);
-    //   • the caller's fresh input hidden_states → hidden_in_src_base_ refreshed above
-    //     (layer-0 reads it via `*_mutable(&hidden_in_src_base_)` → re-derefed every replay).
-    //   • op-specific mutable inputs (e.g. wall_oss denoise x0/b_all/te_all/x_traj/v_traj)
-    //     are `*_mutable(&member,…)` bases set in the op prologue → also re-derefed.
-    // Every kernel-register dev_addr is stable across replays (weights baked, KV cache
-    // persistent, SPM absolute), and the body emits NO per-call host side-effect a kernel
-    // reads. So pushing cursor_ to nodes_.size() (skip_op_stream_for_fast_replay) and
-    // letting end() drive execute_graph_for_replaying is BIT-IDENTICAL to re-walking —
-    // the segment fast-path re-derefs the mutable bases + reads the freshly-updated stable
-    // buffers. Default OFF (other models' bodies are not contract-audited); wall_oss
-    // setdefaults it on for its denoise/prefill/vision graphs. No post_output_shape op
-    // opts in, so the post-loop returns the stable output_tensor_.
-    // (fused_fast_replay is the per-handle latch taken near the top — reused by
-    // deep_full_skip.) RhinoVLA opts in per-model (static_cfg.fast_replay_skip_
-    // layer_loop) rather than via the RPU_WALL_OSS_FAST_REPLAY env that wall_oss,
-    // pi05, gr00t and lingbot use. Honor either — the skip path below re-derefs
-    // the graph's mutable bases so it is byte-identical to re-walking (verified
-    // by the e2e idempotent_cos + action_cos gates). Models that set neither are
-    // unaffected.
-    // The per-handle global_fast_replay_enabled_ value is also reused by
-    // deep_full_skip above.
-    const bool fast_skip =
-        (pimpl_->global_fast_replay_enabled_ ||
+    // Repeat pre_layers, layer groups and post_layers body_iterations times in one
+    // graph. Setup, post_fn and final flush remain outside that loop.
+    //
+    // Fast replay may skip the host op walk only for an opted-in immutable Graph
+    // policy. All request-dependent state must already be updated outside the body:
+    // position IDs and explicit masks in stable buffers, hidden_in_src_base_, and
+    // op-specific mutable DMA bases. Kernel-register addresses must remain stable,
+    // and the body must have no per-call host side effects consumed by kernels.
+    // The segment replay refreshes mutable addresses and reads those updated buffers.
+    // RhinoVLA binds fast_replay_skip_layer_loop per model; other participating
+    // models use the cold Graph policy. The same policy governs deep_full_skip.
+    // No post_output_shape path opts in; the post-loop returns output_tensor_.
+    const bool fast_skip = !checked_body_replay &&
+        ((graph_runtime_policy != nullptr &&
+          graph_runtime_policy->fmb_fast_replay) ||
          static_cfg.fast_replay_skip_layer_loop)
         && !static_cfg.batch_decode_active
         && !callback_yield_replay_run
@@ -14129,7 +16142,7 @@ at::Tensor FusedModelBase::run_all_layers_impl(
         auto& g = RpuKernelGraph::active();
         if (static_cfg.post_fn != nullptr && g.has_post_fn_cursor()
             && !static_cfg.fast_replay_bake_post_fn) {
-            // For a post_fn graph, skip only the layer body and leave post_fn's
+            // D-501 post_fn graph: skip only the layer body, leave post_fn's
             // nodes ahead for the normal replay path to re-emit (its mutable-DMA
             // op patches the fresh per-forward output addr).
             g.skip_layer_body_for_fast_replay();
@@ -14140,8 +16153,15 @@ at::Tensor FusedModelBase::run_all_layers_impl(
             // Byte-identical to the original fast-replay path.
             g.skip_op_stream_for_fast_replay();
         }
+        if (pimpl_->ctx_.has_complete_physical_manifest()) {
+            TORCH_CHECK(
+                matching_physical_manifest_replay_branch,
+                "RPU_PLANNER_REJECT:CAPABILITY: physical route receipt "
+                "inheritance requires an exact matching Graph replay branch");
+            pimpl_->ctx_.inherit_physical_routes_from_matching_graph_replay();
+        }
     }
-    int64_t body_iters = fast_skip
+    int64_t body_iters = (checked_body_replay || fast_skip)
         ? 0
         : (static_cfg.body_iterations > 0 ? static_cfg.body_iterations : 1);
     const FmbExecutionTraversalSpec execution_spec{
@@ -14153,12 +16173,15 @@ at::Tensor FusedModelBase::run_all_layers_impl(
         static_cfg.kv_first_fn != nullptr,
         &chunks,
         &kv_insert_chunks,
+        static_cfg.kv_first_pair_carry_rows,
+        static_cfg.kv_first_pair_carry_across_layers,
     };
     for (int64_t body_it = 0; body_it < body_iters; body_it++) {
+    RECORD_FUNCTION("rpu_fmb::layer_body", {});
     pimpl_->ctx_.body_iter = body_it;
     pimpl_->ctx_.position  = position;
 
-    // 11.5 pre_layers_fn — once per body iteration, before the
+    // 11.5 pre_layers_fn (EXT-Pi05) — once per body iteration, BEFORE the
     // layer loop. It emits into the caller-owned graph scope when one is
     // active. Subclass bodies must not open a raw or nested graph scope.
     if (static_cfg.pre_layers_fn != nullptr) {
@@ -14171,7 +16194,7 @@ at::Tensor FusedModelBase::run_all_layers_impl(
     // chunk + build_layer_subgraph;
     // op 内部 wq->enqueu_kernel 走 RpuQueue proxy(无 graph scope 立即发射,
     // 有 scope 则进 RECORDING/REPLAYING)。Python 端 with cache.capture(sig)
-    // 由适配器提供。
+    // 由 P5.5 提供。
     for_each_fmb_execution_step(
         execution_spec, static_cast<uint32_t>(body_it),
         [&](const FmbExecutionStepView& step) {
@@ -14180,6 +16203,7 @@ at::Tensor FusedModelBase::run_all_layers_impl(
                 pimpl_->ctx_.output_to_spm = step.output_to_spm;
             }
             TORCH_INTERNAL_ASSERT(step.chunk != nullptr);
+            pimpl_->ctx_.physical_route_invocation = step.chunk->idx;
             auto invoke_callback = [&] {
                 if (step.kind == SpmFmbOccurrenceKind::KvInsertBody) {
                     std::invoke(static_cfg.kv_first_fn, *this, step.layer,
@@ -14221,12 +16245,12 @@ at::Tensor FusedModelBase::run_all_layers_impl(
             }
         });
 
-    // 12.5 post_layers_fn — once per body iteration, after the
+    // 12.5 post_layers_fn (EXT-Pi05) — once per body iteration, AFTER the
     // layer loop, in the same caller-owned capture as the rest of the body.
     if (static_cfg.post_layers_fn != nullptr) {
         std::invoke(static_cfg.post_layers_fn, *this);
     }
-    }  // End body_iterations loop.
+    }  // EXT-unroll: end body_iterations loop
 
     if (C10_UNLIKELY(build_trace_run)) {
         auto& candidate = pimpl_->pipeline_build_trace_;
@@ -14249,7 +16273,7 @@ at::Tensor FusedModelBase::run_all_layers_impl(
         candidate.traversal_complete = !expects_post_fn;
     }
 
-    // 13. post (post_fn)
+    // 13. post (D-501 post_fn)
     //
     // graph-naive: 同 step 12,直接 invoke post_fn。Python with capture 包整段
     // run_all_layers 时 post 也跟着进 graph;无 scope 时立即发射。
@@ -14266,11 +16290,9 @@ at::Tensor FusedModelBase::run_all_layers_impl(
             RpuKernelGraph::active().mark_post_fn_cursor();
         }
 
-        // RhinoVLA fast_replay_bake_post_fn (vision fused merger): the post_fn nodes are
-        // baked in the BUILT graph and replay via the segment launch (skip_op_stream set
-        // the cursor to nodes_.size()); skip the host re-emission. Bit-identical — re-emit
-        // on REPLAY only re-validates the same built nodes. Other models leave the flag
-        // false → post_fn re-emits as before.
+        // With fast_replay_bake_post_fn enabled, post_fn nodes are already in the
+        // built graph and the segment launch replays them after the cursor skip.
+        // Other models re-emit post_fn normally.
         const bool skip_post_fn_replay =
             static_cfg.fast_replay_bake_post_fn &&
             static_cfg.fast_replay_skip_layer_loop &&
@@ -14285,6 +16307,7 @@ at::Tensor FusedModelBase::run_all_layers_impl(
             }
 
             auto invoke_post_fn = [&] {
+                RECORD_FUNCTION("rpu_fmb::post_fn", {});
                 std::invoke(static_cfg.post_fn, *this);
             };
             if (C10_UNLIKELY(build_trace_run)) {
@@ -14328,13 +16351,19 @@ at::Tensor FusedModelBase::run_all_layers_impl(
             "schema-v8 BUILD trace STOP: resolved post_fn was not emitted");
     }
 
+    // A COMPLETE descriptor is authority only if every listed semantic site
+    // acknowledged the exact selector it dispatched. This also makes fast-skip
+    // replay fail closed until an adopting owner supplies route receipts on the
+    // skipped path.
+    pimpl_->ctx_.require_all_physical_routes_consumed();
+
     // 14. flush output + cleanup
     if (!pimpl_->post_output_tensor_.defined()) {
         rpu_ddr_flush(pimpl_->output_tensor_.data_ptr<c10::Half>());
     }
     // ⚠️ Pre-existing orphan, NOT the graph's keepalive: nothing in the repo ever
     // pushes into pimpl_->tensor_refs_ (grep — only this clear and its declaration
-    // in fused_model_base_impl.h). It is also cleared here, i.e. before the
+    // in fused_model_base_impl.h:49). It is also cleared here, i.e. before the
     // graph executes, so it could never serve the C-1 lifetime anyway. The one
     // that matters is RpuKernelGraph::tensor_refs_ — see the guard at step 10.
     pimpl_->tensor_refs_.clear();
@@ -14365,7 +16394,7 @@ at::Tensor FusedModelBase::run_all_layers_impl(
         callback_yield_replay_run_complete = true;
     }
 
-    // Output lifetime contract by graph state:
+    // P4 protection vs Path B contract (graph capture):
     //
     // PASSTHROUGH: clone output_tensor_ so Python caller can accumulate
     //   returns into a list without aliasing (Pi0.5 multi-image,
@@ -14381,11 +16410,11 @@ at::Tensor FusedModelBase::run_all_layers_impl(
     //   Symptom: lm_head sees zero/garbage logits → next_id=0 and
     //   prompt-fragment tokens.
     //
-    //   Returning output_tensor_ raw means graph-capture callers are
+    //   Returning output_tensor_ raw means Path B callers are
     //   responsible for not aliasing across forwards. That's the
     //   contract — if they wrap forward in `with cache.capture(sig)`,
-    //   they must honor graph-stable buffer semantics and avoid aliasing
-    //   retained outputs across forwards.
+    //   they understand graph-stable buffer semantics. P4 risk shifts
+    //   to caller.
     if (pimpl_->post_output_tensor_.defined()) {
         return pimpl_->post_output_tensor_;
     }

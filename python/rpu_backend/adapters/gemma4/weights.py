@@ -1,9 +1,9 @@
-"""Gemma4 mixed-width weight binding.
+"""Gemma4 mixed-width weight binding (T1d).
 
 Builds the per-layer weight lists + dual RoPE tables + per-layer int arrays for
 ``torch.ops.rpu.gemma4_set_weights`` from a (swizzled) HF Gemma4 text model.
 
-Mixed geometry:
+Mixed geometry (PLAN.md §D T1d):
   * per-layer q/o projections have layer-dependent width (sliding nq*256 / global
     nq*512); ``convert_linear_weights_inplace`` swizzles each nn.Linear by its own
     (in,out) so a single ``attn_num_cores = min(8, num_kv_heads)`` (=2 for E4B)
@@ -72,8 +72,8 @@ def make_rope_tables(text_config, max_pos: int, device: str = "rpu", dtype=None)
     RPU SPM RoPE kernel. Returns (cos_sliding, sin_sliding, cos_global, sin_global)
     each ``[max_pos, head_dim/2]``. Needs the isolated transformers with Gemma4.
 
-    The RPU ``llama_rope`` kernel uses NeoX d/2-split pairing, identical to HF
-    Gemma4, and reads cos/sin
+    T2 (verified against golden + ``src/ops/rpu_rope.cpp``): the RPU ``llama_rope``
+    kernel uses NeoX d/2-split pairing — identical to HF Gemma4 — and reads cos/sin
     in the half-width KERNEL format ``[max_pos, head_dim/2]`` (the unique half; the
     fused C++ feeds the stored pointer straight to the kernel with NO slicing). HF
     emits the duplicated full-width form ``cat([h, h], dim=-1)``, so slicing to the
@@ -102,7 +102,7 @@ def make_rope_tables(text_config, max_pos: int, device: str = "rpu", dtype=None)
 
 
 def extract_ple_weights(layers, geom) -> dict:
-    """Per-layer PLE weights for gemma4_set_weights, ready (swizzled, rpu).
+    """Per-layer PLE weights (T6) for gemma4_set_weights, ready (swizzled, rpu).
 
     Mirrors the fused MLP col->row pattern: per_layer_input_gate is COL-swizzled
     (partition=1, num_cores=8) so its output is partitioned per core, and
@@ -136,7 +136,7 @@ def set_gemma4_weights(
 
     ``lists`` = output of ``extract_decoder_weight_lists`` (already swizzled).
     ``rope_tables`` = (cos_sliding, sin_sliding, cos_global, sin_global).
-    ``ple`` = output of ``extract_ple_weights``; None disables PLE.
+    ``ple`` = output of ``extract_ple_weights`` (T6); None disables PLE (T5 path).
     """
     import torch
     a = cpp_layer_arrays(geom)

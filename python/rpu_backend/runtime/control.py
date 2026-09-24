@@ -1,8 +1,17 @@
-"""Runtime controls for allocation, synchronization, batching, and shutdown.
+"""Runtime control helpers — caching allocator, DDR flush, SPM mode, chunk size, cross-layer batch, shutdown, SPM resets.
 
-Chunk size affects SPM layout and graph signatures, so public entry points bind
-cold ``rpu_execution`` settings to each handle. Low-level chunk setters remain
-per-handle runtime plumbing.
+Per ADR §6.4 (v5-04 final form): canonical home for SPM / system / cross-layer
+batch / caching-allocator wrappers. Lifted byte-equal from the v4.1
+``rpu_backend._internal.runtime`` module (deleted in this PR).
+
+Per ADR §11 / §10 #15: deprecated ``set_chunk_size`` / ``set_spm_mode`` global
+setters were tombstoned in v4.1 (use the model-specific public replacement);
+the global ``set_fuse_lm_head*`` family was removed in v5-01b. MR-D finished the
+chunk half: ``set_chunk_size`` / ``get_chunk_size`` and the ``_rpu_chunk_size``
+module global are GONE, along with the C++ ``g_chunk_size_override`` they wrote.
+Chunk size keys the SPM layout and graph signature, so public entry points bind
+cold ``rpu_execution`` to each handle; the low-level per-handle setter is
+internal runtime plumbing.
 
 Imports C-ext symbols from ``rpu_backend._cpp_ext`` (synthetic module populated
 by ``__init__.py`` from the .so loader). Each leaf reads ``_cpp_loaded`` to gate
@@ -65,7 +74,11 @@ def is_available() -> bool:
 # Caching allocator
 # -------------------------------
 def set_caching_allocator(enabled: bool) -> None:
-    """Enable/disable caching allocator (default: disabled)."""
+    """Select the process allocator before the first non-empty RPU tensor.
+
+    The first call or allocation freezes the choice. Repeating the same value
+    is safe; selecting the other mode requires a fresh Python process.
+    """
     if _cpp_loaded():
         _cpp().set_caching_allocator(enabled)
 
@@ -150,36 +163,26 @@ def get_ddr_flush_force() -> bool:
 # SPM mode
 # -------------------------------
 def get_spm_mode() -> bool:
-    """Return False because eager operators have fixed SPM/fallback behavior.
-
-    The function remains bound through ``torch.rpu`` for compatibility.
+    """Always False: the legacy per-op SPM selector (``g_rpu_use_spm_kernel``)
+    was deleted. Kept because ``torch.rpu.get_spm_mode`` is still bound — the
+    eager Linear now always stages through SPM and the eager RMSNorm always
+    falls back to CPU, so there is nothing left to select.
     """
     return False
 
 
 # -------------------------------
-# Chunk size is per handle rather than process-wide.
+# Chunk size — MR-D: there is no process-wide chunk size any more.
 #
 # `set_chunk_size(N)` decided a PER-HANDLE quantity: it keyed every live handle's
 # SPM allocation and, because the graph signature did not encode it, a change
 # after capture replayed a recorded graph under a layout it was not recorded for.
 # Name a handle instead:
 #     torch.ops.rpu.causal_decoder_set_chunk_size_override(handle, cs)
+#     torch.ops.rpu.halo_image_flow_set_chunk_size_override(handle, cs)
 # and for a bound on the AUTO search rather than a pin,
 #     torch.ops.rpu.causal_decoder_set_chunk_size_cap(handle, cs)   # cold only
 # -------------------------------
-
-
-def get_linear_acc32() -> bool:
-    """Return the process-cached fused FP16 Linear ACC32 selector."""
-    if not _cpp_loaded():
-        return False
-    cpp = _cpp()
-    if cpp is None or not hasattr(cpp, "get_linear_acc32"):
-        raise RuntimeError(
-            "native backend lacks get_linear_acc32; rebuild rpu_backend"
-        )
-    return bool(cpp.get_linear_acc32())
 
 
 # -------------------------------
@@ -212,8 +215,11 @@ def get_cross_layer_batch_size() -> int:
 
 
 # -------------------------------
-# Fused lm_head configuration is owned by the per-handle
-# ``causal_decoder_set_lm_head(handle, lm_head_w)`` interface.
+# Fuse lm_head (qwen3-specific runtime) — v5-01b D-15/D-16/D-17 DELETED.
+# Per ADR §6.4 + §10 #15: the global `set_fuse_lm_head` family is removed in
+# v5-01b; the per-instance `causal_decoder_set_lm_head(handle, lm_head_w)` API
+# lands in v5-06. The C-ext-side `g_fuse_lm_head*` cluster is retained until
+# the v5-06 per-instance API replaces it.
 # -------------------------------
 
 
@@ -226,7 +232,8 @@ def spm_alloc_reset_temporary() -> None:
 
 
 def reset_temporary_spm() -> None:
-    """Reset SPM temporary allocations (frees all temporary buffers)."""
+    """Reset SPM temporary allocations (frees all temporary buffers).
+    Plan 01-01 alias for the existing torch.ops.rpu.spm_alloc_reset_temporary op."""
     torch.ops.rpu.spm_alloc_reset_temporary()
 
 
@@ -270,17 +277,22 @@ def rpu_env_bool(
 ) -> bool:
     """Parse one boolean `RPU_*` switch. The ONLY boolean env reader in Python.
 
-    The opening rules in ``docs/runtime_config.md`` document these semantics:
+    Semantics = convention **D** of docs/runtime_config.md §"How values are
+    parsed", promoted from a single adapter to the whole package:
 
       unset            -> ``default``
       1 / true / on    -> True    (case-insensitive, surrounding space stripped)
       0 / false / off  -> False   (case-insensitive; "" counts as False)
       anything else    -> ``ValueError``
 
-    One strict parser keeps Python-side environment semantics consistent and
-    rejects typos instead of silently selecting the wrong execution path.
+    Why one parser and why it raises: the same variable used to be parsed a
+    different way in every file (``== "1"`` here, ``not in ("0","false","")``
+    there), so ``VAR=true`` meant ON in one module and OFF in the next, and a
+    typo meant ON everywhere with no diagnostic. A boolean switch that silently
+    resolves to the opposite of what the operator wrote is the worst failure
+    mode this package has; refusing to guess is cheaper than any of them.
 
-    ``cpp_mirror`` — pass ``"src/<file>.cpp"`` when the same variable is
+    ``cpp_mirror`` — pass ``"src/<file>.cpp:<line>"`` when the SAME variable is
     also read by ``std::getenv`` in the native half. There is no single rule
     over there (one site is ``e && s != "0" && s != "false"``, another is
     ``e[0] in {1,t,T}``), and where the two halves disagree the feature runs on
@@ -311,6 +323,11 @@ def rpu_env_bool(
 
 
 # -------------------------------
-# Fused lm_head configuration is per handle; no process-global setter is
-# exposed here.
+# Qwen3-specific fused lm_head — v5-01b D-18 + setup_fuse_lm_head DELETED.
+# Per ADR §6.4: `set_fused_lm_head_enabled` was a thin dispatcher; deleted in
+# v5-01b alongside the wrappers above. `setup_fuse_lm_head` was its sole
+# in-tree caller (set_fuse_lm_head_weights → C-ext); deleted in the same
+# atomic plan per Karpathy meta-rule 4 (the family is dead; the helper is dead).
+# Per-instance API (`causal_decoder_set_lm_head(handle, lm_head_w)`) lands
+# in v5-06.
 # -------------------------------

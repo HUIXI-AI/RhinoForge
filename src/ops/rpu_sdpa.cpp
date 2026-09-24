@@ -1,11 +1,20 @@
-// Native FP16 SDPA for RPU unified layout
-// [batch, seq_len, num_heads, head_dim].
+// rpu_sdpa.cpp — native SPM SDPA launchers.
+//
+// rpu_launch_sdpa_spm_unified_kernel_v2 is the fused-model FP16 path;
+// sdpa_dma_mask_to_spm and related helpers prepare its operands.
+// The eager unified-layout entry point computes on CPU.
+//
+// RPU unified layout is [batch, seq_len, num_heads, head_dim]. K/V caches use
+// the swizzled format produced by rpu_launch_llama_insert_kcache/_vcache.
+// Other SDPA variants live in sibling rpu_sdpa_*.cpp files.
+
 #include <limits>
 #include "rhino_launch_buffer.h"
 
 #include "rhino_launch_program.h"
 #include "rhino_launch_queue.h"
 #include "rpu_ops.h"
+#include "rpu_qwen3vl_vision_sdpa.h"
 #include "rpu_spm_allocator.h"
 #include <c10/util/Half.h>
 #include <cmath>
@@ -34,6 +43,93 @@ enum AttnMaskType {
   MASK_2D = 4,    // [seq_q, seq_k]
   MASK_1D = 5,    // [seq_k]
 };
+
+at::Tensor rpu_temporal_sdpa_composite_test(
+    const at::Tensor& q_shard,
+    const at::Tensor& k_shard,
+    const at::Tensor& v_shard)
+{
+  constexpr int64_t cores = 8;
+  constexpr int64_t frames = 6;
+  constexpr int64_t head_dim = 64;
+  auto check = [=](const at::Tensor& x, const char* name) {
+    TORCH_CHECK(x.device().type() == at::kPrivateUse1 &&
+                x.scalar_type() == at::kHalf && x.is_contiguous(),
+                name, " must be contiguous fp16 RPU");
+    TORCH_CHECK(x.dim() == 4 && x.size(0) == cores &&
+                x.size(1) == frames && x.size(3) == head_dim,
+                name, " must be [8,6,P*2,64], got ", x.sizes());
+  };
+  check(q_shard, "q_shard");
+  check(k_shard, "k_shard");
+  check(v_shard, "v_shard");
+  TORCH_CHECK(q_shard.sizes() == k_shard.sizes() &&
+              q_shard.sizes() == v_shard.sizes(),
+              "temporal composite Q/K/V shapes must match");
+  TORCH_CHECK(q_shard.size(2) > 0 && q_shard.size(2) % 2 == 0,
+              "temporal composite local heads must be positive and even");
+
+  const int64_t patch_group = q_shard.size(2) / 2;
+  const int64_t heads = patch_group * 16;
+  const int64_t elems_per_core = q_shard.numel() / cores;
+  const int64_t shard_bytes = elems_per_core * sizeof(c10::Half);
+  const int64_t core_stride_bytes = q_shard.stride(0) * sizeof(c10::Half);
+
+  if (!SPM_ALLOC.is_initialized()) SPM_ALLOC.init();
+  SdpaConfig cfg{SdpaKernelType::FLASH_ATTN_SPM,
+                 head_dim, heads, heads, static_cast<int>(cores), MASK_LTM};
+  const int64_t tmp_bytes = Align(
+      sdpa_compute_tmp_v16_size(cfg, frames) * 32, 256);
+  using AR = SpmAllocator::AllocRequest;
+  auto offsets = SPM_ALLOC.alloc_temporary_aliased({
+      AR{shard_bytes, 1, 2},
+      AR{shard_bytes, 1, 2},
+      AR{shard_bytes, 1, 2},
+      AR{shard_bytes, 2, 3},
+      AR{tmp_bytes,   2, 2},
+  });
+  const uint32_t q_off = offsets[0];
+  const uint32_t k_off = offsets[1];
+  const uint32_t v_off = offsets[2];
+  const uint32_t out_off = offsets[3];
+  const uint32_t tmp_off = offsets[4];
+
+  rpu_launch_ddr_scatter_spm_dma_immediate(
+      const_cast<c10::Half*>(q_shard.data_ptr<c10::Half>()),
+      elems_per_core, core_stride_bytes, SPM_ALLOC.addr(0, q_off), cores);
+  rpu_launch_ddr_scatter_spm_dma_immediate(
+      const_cast<c10::Half*>(k_shard.data_ptr<c10::Half>()),
+      elems_per_core, core_stride_bytes, SPM_ALLOC.addr(0, k_off), cores);
+  rpu_launch_ddr_scatter_spm_dma_immediate(
+      const_cast<c10::Half*>(v_shard.data_ptr<c10::Half>()),
+      elems_per_core, core_stride_bytes, SPM_ALLOC.addr(0, v_off), cores);
+
+  auto key_cache = at::empty(
+      {1, 1, patch_group * 2, 4, 8, 16, 16}, q_shard.options());
+  auto value_cache = at::empty_like(key_cache);
+  const KvInsertSegmentPlan kv_plan =
+      rpu_resolve_kvinsert_segment_plan_auto(
+          /*position=*/0, frames, frames, cores, heads, head_dim,
+          KV_INSERT_CAP_V2 | KV_INSERT_CAP_V16);
+  rpu_launch_insert_kvcache_spm_unified_with_plan(
+      key_cache, value_cache, k_off, v_off, heads, head_dim, cores,
+      /*k_cache_batch_offset_elems=*/0,
+      /*v_cache_batch_offset_elems=*/0,
+      /*spm_rows=*/frames, kv_plan);
+  rpu_launch_sdpa_spm_unified_kernel_v2(
+      key_cache, value_cache,
+      MASK_LTM, 1.0 / 8.0,
+      q_off, out_off, tmp_off, 0,
+      frames, heads, heads, head_dim, frames,
+      cores, cores);
+
+  auto output = at::empty_like(q_shard);
+  rpu_launch_spm_scatter_ddr_dma_immediate(
+      SPM_ALLOC.addr(0, out_off), output.data_ptr<c10::Half>(),
+      elems_per_core, core_stride_bytes, cores);
+  SPM_ALLOC.reset_temporary();
+  return output;
+}
 
 // float32_to_uint32 now in rpu_helpers.h (included via rpu_ops.h)
 
@@ -64,14 +160,14 @@ static at::Tensor sdpa_cache_batch_operand(
 // ============================================================================
 // SPM Unified Layout SDPA Kernel
 // ============================================================================
-// SDPA SPM unified launch geometry:
+// SDPA SPM Unified Kernel V2
 // tile_m_v16: sQry<=128 ? CeilDiv(sQry,16) : 8
 // tile_k_v16: from sdpa_compute_tiling (= tile_m_v16 initially, may VLM-shrink)
 // grid_dim_x: CeilDiv(sQry, tile_m)  (seq tiles)
 // grid_dim_y: num_heads_per_core      (heads)
 // ============================================================================
 
-void rpu_launch_sdpa_spm_unified_kernel_v2(
+static void launch_sdpa_spm_unified_impl(
     const at::Tensor &key,
     const at::Tensor &value,
     int attn_mask_type,
@@ -82,8 +178,25 @@ void rpu_launch_sdpa_spm_unified_kernel_v2(
     int num_cores,
     int virtual_num_cores,
     int64_t cache_batch_offset_elems,
-    bool use_16b)
+    bool use_16b,
+    bool qwen3vl_tm160,
+    const SdpaTiling* admitted_tiling)
 {
+  // Validate before divisions, cache operand staging, or narrowed queue/grid ABI.
+  TORCH_CHECK(num_cores >= 1 && num_cores <= MAX_CORES &&
+                  virtual_num_cores >= -1 && virtual_num_cores <= MAX_CORES,
+              "SDPA SPM requires 1..8 real cores and -1/0 or 1..8 virtual cores");
+  TORCH_CHECK(seq_q > 0 && seq_q <= UINT16_MAX &&
+                  kv_seq_len > 0 && kv_seq_len <= int64_t{UINT16_MAX} * 16 &&
+                  num_heads > 0 && num_heads <= UINT16_MAX &&
+                  num_kv_heads > 0 && num_kv_heads <= UINT16_MAX &&
+                  head_dim > 0 && head_dim <= UINT16_MAX && head_dim % 16 == 0,
+              "SDPA SPM geometry exceeds its positive register domain");
+  TORCH_CHECK(num_heads % num_cores == 0 &&
+                  ((num_kv_heads % num_cores == 0) ||
+                   (num_cores % num_kv_heads == 0)) &&
+                  num_heads % num_kv_heads == 0,
+              "SDPA SPM requires integral attention head partitions and GQA");
   const KernelId sdpa_kernel_id = use_16b
       ? KernelId::SDPA_FLASH_ATTN_SPM_16B
       : KernelId::SDPA_FLASH_ATTN_SPM;
@@ -91,9 +204,15 @@ void rpu_launch_sdpa_spm_unified_kernel_v2(
   int64_t core_num = num_cores;  // real cores for dispatch and SPM addressing
 
   // Virtual tp for parameter computation (cache layout, head distribution, registers).
-  // Keep virtual_attn_tp=8 so cache strides match the tp=8 cache allocation,
-  // even when fewer cores actually run the kernel.
+  // Use virtual TP=8 with an eight-way cache layout, even when fewer cores run.
   int64_t vtp = (virtual_num_cores > 0) ? virtual_num_cores : core_num;
+
+  TORCH_CHECK(!qwen3vl_tm160 ||
+                  (!use_16b && seq_q == 576 && kv_seq_len == 576 &&
+                   head_dim == 64 && num_heads == 16 && num_kv_heads == 16 &&
+                   core_num == 8 && vtp == 8 && attn_mask_type == 0 &&
+                   cache_batch_offset_elems == 0),
+              "Qwen3-VL tm160 requires the exact noncausal 2B/P576 Vision profile");
 
   // Compute "virtual" total head counts as runtime does:
   //   numHead = q_heads_per_core * virtual_tp
@@ -103,11 +222,8 @@ void rpu_launch_sdpa_spm_unified_kernel_v2(
   int64_t kv_heads_per_core = CeilDiv(num_kv_heads, core_num);
   int64_t virtual_num_heads = q_heads_per_core * vtp;
   int64_t virtual_num_kv_heads = kv_heads_per_core * vtp;
-
-  // Validate constraints (on real values)
-  TORCH_CHECK(num_heads % core_num == 0, "num_heads must be divisible by core_num (", core_num, ")");
-  TORCH_CHECK((num_kv_heads % core_num == 0) || (core_num % num_kv_heads == 0),
-              "num_kv_heads must divide core_num or be divisible by core_num");
+  TORCH_CHECK(virtual_num_heads <= UINT16_MAX && virtual_num_kv_heads <= UINT16_MAX,
+              "SDPA SPM virtual head counts exceed uint16 registers");
 
   size_t dwidth = sizeof(c10::Half);
   int64_t dwidth_v16 = dwidth * V16_NUM;
@@ -181,6 +297,21 @@ void rpu_launch_sdpa_spm_unified_kernel_v2(
                  head_dim, virtual_num_heads, virtual_num_kv_heads,
                  static_cast<int>(vtp), attn_mask_type};
   SdpaTiling t = sdpa_compute_tiling(cfg, seq_q);
+  if (qwen3vl_tm160) {
+    const auto tile_k = choose_tile_k_conservative(10, t.tile_n_v16, 0, 4);
+    TORCH_CHECK(tile_k.has_value() &&
+                    *tile_k * 4 <= t.tile_k_v16 * CeilDiv(seq_q, t.tile_m),
+                "Qwen3-VL tm160 exceeds the declared SDPA workspace");
+    t.tile_m_v16 = 10;
+    t.tile_k_v16 = *tile_k;
+    t.tile_m = 160;
+    t.tile_k = *tile_k * 16;
+  }
+  if (admitted_tiling) {
+    TORCH_CHECK(!qwen3vl_tm160,
+                "ordinary SDPA tiling cannot share the delivery selector");
+    t = *admitted_tiling;
+  }
   int64_t tile_m_v16 = t.tile_m_v16;
   int64_t tile_n_v16 = t.tile_n_v16;
   int64_t tile_k_v16 = t.tile_k_v16;
@@ -188,6 +319,10 @@ void rpu_launch_sdpa_spm_unified_kernel_v2(
   int64_t tile_m = tile_m_v16 * 16;
   int64_t tile_n = tile_n_v16 * 16;
   int64_t tile_k = tile_k_v16 * 16;
+  TORCH_CHECK(tile_m > 0 && tile_m <= UINT16_MAX &&
+                  tile_n > 0 && tile_n <= UINT16_MAX &&
+                  tile_k > 0 && tile_k <= UINT16_MAX,
+              "SDPA SPM tile dimensions exceed uint16 registers");
 
   // Mask type (passed directly, mask data already in SPM if needed)
   AttnMaskType mask_type = static_cast<AttnMaskType>(attn_mask_type);
@@ -197,7 +332,7 @@ void rpu_launch_sdpa_spm_unified_kernel_v2(
   float scale_factor = scale.value_or(1.0 / std::sqrt(static_cast<double>(head_dim)));
   uint32_t scale_u32 = float32_to_uint32(scale_factor);
 
-  // Grid dimensions: x=sequence tiles, y=heads, z=batch.
+  // Grid dimensions: x=seq_tiles, y=heads, z=batch.
   uint16_t grid_dim_x = CeilDiv(seq_q, tile_m);
   uint16_t grid_dim_y = num_heads_per_core;
   uint16_t grid_dim_z = 1;  // batch=1 always
@@ -218,6 +353,8 @@ void rpu_launch_sdpa_spm_unified_kernel_v2(
   int64_t page_size_v128 = page_size >> 8;
   int64_t chapter_size_v128 = chapter_size >> 8;
   int64_t section_size_v128 = section_size >> 8;
+  TORCH_CHECK(section_size_v128 <= UINT16_MAX,
+              "SDPA SPM cache section stride exceeds uint16 registers");
 
   // Use pre-allocated tmp addresses from spm_cache (managed by SimpleSpmBuffers)
   std::vector<uint32_t> tmp_addr_v16_vec(core_num);
@@ -320,6 +457,35 @@ void rpu_launch_sdpa_spm_unified_kernel_v2(
   wq->set_flush_icache(false);
 
   wq->enqueu_kernel(*kernel, {grid_dim_x, grid_dim_y, grid_dim_z}, core_list);
+}
+
+void rpu_launch_sdpa_spm_unified_kernel_v2(
+    const at::Tensor& key, const at::Tensor& value,
+    int attn_mask_type, std::optional<double> scale,
+    uint32_t q_off, uint32_t output_off, uint32_t sdpa_tmp_off, uint32_t sdpa_mask_off,
+    int64_t seq_q, int64_t num_heads, int64_t num_kv_heads, int64_t head_dim,
+    int64_t kv_seq_len, int num_cores, int virtual_num_cores,
+    int64_t cache_batch_offset_elems, bool use_16b, bool qwen3vl_tm160) {
+  launch_sdpa_spm_unified_impl(
+      key, value, attn_mask_type, scale,
+      q_off, output_off, sdpa_tmp_off, sdpa_mask_off,
+      seq_q, num_heads, num_kv_heads, head_dim, kv_seq_len,
+      num_cores, virtual_num_cores, cache_batch_offset_elems,
+      use_16b, qwen3vl_tm160, nullptr);
+}
+
+void rpu_launch_sdpa_qwen3vl_n1200_tm160(
+    const at::Tensor& key, const at::Tensor& value,
+    uint32_t q_off, uint32_t output_off, uint32_t sdpa_tmp_off,
+    int64_t seq_q, int64_t declared_tmp_bytes) {
+  const auto t = rpu_qwen3vl_n1200_tm160_tiling(seq_q, 1200, declared_tmp_bytes);
+  TORCH_CHECK(t.has_value(), "ordinary Qwen3-VL N1200 Tm160 geometry/workspace mismatch");
+  launch_sdpa_spm_unified_impl(
+      key, value, /*MASK_NONE=*/0, /*1/sqrt(64)=*/0.125,
+      q_off, output_off, sdpa_tmp_off, /*mask_off=*/0,
+      seq_q, /*Q=*/16, /*KV=*/16, /*D=*/64, /*Sk=*/1200,
+      /*cores=*/8, /*vtp=*/8, /*cache_offset=*/0,
+      /*use_16b=*/false, /*delivery_tm160=*/false, &*t);
 }
 
 // =============================================================================
@@ -442,8 +608,9 @@ void sdpa_dma_mask_to_spm(
     int64_t mask_elements = seq_q * seq_k_v16 * 16;
 
     // mask.ddr_tensor is the stable Route B slot (see sdpa_prepare_mask);
-    // DMA src is safe to bake. Graph mode uses broadcast DMA rather than the
-    // direct rpu_launch_ddr2spm_multicore path.
+    // DMA src is safe to bake. Graph-mode broadcast DMA replaces the legacy
+    // rpu_launch_ddr2spm_multicore here — eliminates the last graph-mode
+    // legacy launcher in src/ops/.
     if (graph_dma::active()) {
         rpu_launch_ddr_broadcast_spm_dma(
             mask.ddr_tensor, /*src_offset_elements=*/0, mask_elements,

@@ -35,6 +35,16 @@ just the next function call.
 6. Before returning to an earlier component, repeat its public admission and
    ownership path; do not assume its previous temporary state remains live.
 
+## HYViT patch inputs
+
+The native patch boundary accepts either one `[B,3,H,W]` tensor with `B=1..8`,
+or a list of up to eight `[1,3,H,W]` tensors with identical H/W. Inputs are
+contiguous FP16 RPU tensors. The whole request is checked before a physical
+prologue, SPM allocation, or DMA. The multi-core permute requires stride equal
+to kernel size and width divisible by kernel width; the position table must
+cover the resulting patch grid. Unsupported geometry fails before dispatch.
+[Native HYViT boundary](../../src/fused/rpu_hyvit2_vision_model.cpp)
+
 ## Failure signals
 
 - The first forward is correct but a repeated or multi-image forward changes:

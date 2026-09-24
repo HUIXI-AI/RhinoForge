@@ -57,14 +57,18 @@ void rpu_launch_layernorm_kernel(const at::Tensor &input, at::Tensor &output,
   size_t n_per_wrp = NUM_THD_PER_WARP * n_per_thd;
 
   float one_lcth = 1.0 / lc;
-  // High-range fp16 layer_norm ABI: reg12 = fp16(eps*LC) and
-  // reg20 = fp16(sqrt(LC)).
+  // High-range fp16 layer_norm ABI (matches rpu_launch_layernorm_spm_kernel): the
+  // kernel computes rstd = sqrt(LC)*rsqrt(M2 + LC*eps), so reg12 = fp16(eps*LC) and
+  // reg20 = fp16(sqrt(LC)). Leaving reg20=0 against the new kernel makes rstd=0 ->
+  // the output collapses to all-zeros (the eager aten::layer_norm bug this fixes).
   c10::Half eps_lc_half  = static_cast<c10::Half>((float)eps * (float)lc);
   c10::Half sqrt_lc_half = static_cast<c10::Half>(std::sqrt((float)lc));
 
   // 从缓存获取 Kernel (O(1) 数组索引)
   // Both LAYER_NORM (C>512) and LAYER_NORM_SIMPLE (C<=512) take the same high-range
   // reg ABI (reg12=fp16(eps*LC), reg20=fp16(sqrt(LC)), reg21=has_affine) set below.
+  // NOTE: the supported models all use hidden dim > 512, so the LAYER_NORM_SIMPLE
+  // path is currently UNEXERCISED by the E2E matrix — verify it if a C<=512 model lands.
   Kernel_t* kernel = (lc > 512)
       ? GET_KERNEL(KernelId::LAYER_NORM)
       : GET_KERNEL(KernelId::LAYER_NORM_SIMPLE);
@@ -108,7 +112,7 @@ void rpu_launch_layernorm_kernel(const at::Tensor &input, at::Tensor &output,
   kernel->set_regs(9, (uint16_t)(lc));
   kernel->set_regs(10, (uint16_t)(one_lcth_u32 & 0xFFFF));
   kernel->set_regs(11, (uint16_t)(one_lcth_u32 >> 16));
-  kernel->set_regs(12, eps_lc_half.x); // high-range ABI: fp16(eps*LC)
+  kernel->set_regs(12, eps_lc_half.x); // high-range ABI: fp16(eps*LC), was fp16(eps)
   kernel->set_regs(13, (uint16_t)(0)); // has_skip
   kernel->set_regs(14, (uint16_t)(0)); // skip_base
   kernel->set_regs(15, (uint16_t)(0));
@@ -164,7 +168,7 @@ void rpu_launch_layernorm_spm_kernel(
   size_t dwidth = sizeof(c10::Half);
   size_t input_n_byte_step = C * dwidth;
 
-  // Populate the operator launch geometry.
+  // Select launch geometry.
   size_t n_per_thd;
   if (C <= 512) {
     n_per_thd = 4;
@@ -178,8 +182,11 @@ void rpu_launch_layernorm_spm_kernel(
   // Precompute constants
   float one_lcth = 1.0f / C;
   uint32_t one_lcth_u32 = float_to_u32_le(one_lcth);
-  // High-range fp16 layer_norm ABI: reg12 = fp16(eps*C) and
-  // reg20 = fp16(sqrt(C)).
+  // High-range fp16 layer_norm ABI: the kernel
+  // computes rstd = sqrt(LC)*rsqrt(M2 + LC*eps) from raw M2=sum((x-mu)^2) kept in
+  // B32 (avoids fp16 var overflow for |x|>256). reg12 = fp16(eps*LC),
+  // reg20 = fp16(sqrt(LC)). Older kernels used reg12=fp16(eps) + no reg20; leaving
+  // reg20=0 against the new kernel makes rstd=0 -> output collapses to zero.
   c10::Half eps_lc_half  = static_cast<c10::Half>((float)eps * (float)C);
   c10::Half sqrt_lc_half = static_cast<c10::Half>(std::sqrt((float)C));
 
@@ -201,7 +208,7 @@ void rpu_launch_layernorm_spm_kernel(
     kernel->set_regs(9,  (uint16_t)(C));
     kernel->set_regs(10, (uint16_t)(one_lcth_u32 & 0xFFFF));
     kernel->set_regs(11, (uint16_t)(one_lcth_u32 >> 16));
-    kernel->set_regs(12, eps_lc_half.x);   // ABI: fp16(eps*LC)
+    kernel->set_regs(12, eps_lc_half.x);   // ABI: fp16(eps*LC), was fp16(eps)
     kernel->set_regs(13, (uint16_t)(has_skip ? 1 : 0));
     kernel->set_regs(14, (uint16_t)(skip_spm_addr & 0xFFFF));
     kernel->set_regs(15, (uint16_t)(skip_spm_addr >> 16));
@@ -229,10 +236,8 @@ void rpu_launch_layernorm_spm_kernel(
 // ============================================================================
 // Direct Address SPM LayerNorm bf16 Kernel — mixed precision
 // ============================================================================
-// Same public register layout as the fp16 LayerNorm launcher. All SPM inputs
-// and outputs remain fp16 at the wrapper boundary; the combined operator asset
-// owns the mixed-precision implementation. `epsilon` is encoded as fp16 and
-// `1/lc` as fp32.
+// Same public register layout as the fp16 LayerNorm launcher. Inputs and outputs
+// remain fp16; epsilon is fp16-encoded and 1/lc is fp32.
 // ============================================================================
 
 void rpu_launch_layernorm_bf16_spm_kernel(
@@ -250,7 +255,6 @@ void rpu_launch_layernorm_bf16_spm_kernel(
   size_t dwidth = sizeof(c10::BFloat16);
   size_t input_n_byte_step = C * dwidth;
 
-  // Populate the operator launch geometry using the fp16-compatible policy.
   size_t n_per_thd;
   if (C <= 512) {
     n_per_thd = 4;
@@ -264,6 +268,7 @@ void rpu_launch_layernorm_bf16_spm_kernel(
   // Precompute constants.
   float one_lcth = 1.0f / C;
   uint32_t one_lcth_u32 = float_to_u32_le(one_lcth);
+  // Epsilon remains fp16-encoded for this mixed-precision variant.
   c10::Half eps_half = static_cast<c10::Half>(eps);
 
   uint16_t grid_x = (uint16_t)CeilDiv((size_t)M, n_per_wrp);

@@ -25,9 +25,16 @@ compile_commands.json
 *.log
 *.tmp
 *.npy
+*.npz
 *.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
 *.ref
 core.*
 model_cache/
 profiles/
 rpu_hwperf_*.json
+
+perf_results/

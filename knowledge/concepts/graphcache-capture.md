@@ -23,6 +23,13 @@ on later calls with the same signature. [Graph API](../../docs/api_reference.md#
   shared default when writing a new adapter.
   [Graph API](../../docs/api_reference.md#graph-api)
 
+`Graph` and `GraphCache` retain a read-only construction policy; extracted
+children inherit it. Capture failure preserves the primary exception, attaches
+cleanup failures as notes, and releases the scope’s borrowed graph reference.
+The caller can evict or clear while keeping the traceback, provided it has not
+retained another graph reference.
+[Capture implementation](../../python/rpu_backend/graph/_runtime.py)
+
 A bounded one-shot graph is an explicit model-contract exception for a
 variable-shape path. It must execute one non-trivial graph, return to
 passthrough state, and leave retained-cache size unchanged.

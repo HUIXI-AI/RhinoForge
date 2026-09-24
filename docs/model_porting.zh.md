@@ -7,7 +7,7 @@
 input envelope、execution setting、Rhino Launch 和算子资产版本。复用源码或匹配同一
 Hugging Face architecture name 不是支持声明。
 
-改代码前先对照[模型支持](model_support.zh.md)，写下要接受的精确配置。不支持配置必须在
+改代码前先对照[示例](model_support.zh.md)，写下要接受的精确配置。不支持配置必须在
 完整 weight load 或任何原地转换前失败。
 
 AI 辅助工作使用仓库内的 [`rhinoforge-port` skill](../.agents/skills/rhinoforge-port/SKILL.md)。
@@ -138,26 +138,6 @@ Bounded one-shot 是变 shape 路径的显式例外：必须录制并执行 non-
 所有影响 output 的语义输入应进入 signature，或在稳定契约点由 mutable transfer 更新。
 同 signature 不同 value 用例必须与 uncaptured path 一致。
 
-## 8. 验证门禁
+## 8. 有针对性的验证
 
-先跑无板卡检查：unknown architecture 和 unsupported profile 在 weight load/transform 前
-拒绝；registry/plugin discovery 确定；execution config 拒绝非法或超范围值；cache sizing
-和 output shape 符合参考；源码 build 和 package import 干净完成。
-
-随后在 RPU 板卡跑精确 release 配置：
-
-- 按[验证策略](validation_policy.zh.md)运行硬语义、同 dtype 一致性、CPU FP32 anchor
-  与任务质量门禁；
-- 验证 `RPU_WARMUP=0/1/3` 默认输出 bit-identical；若精确配置有已提交的有界
-  repeatability 合同，则按该合同验证；
-- 证明适用 Graph 生命周期；
-- 多输入，vision 时多图，捕获 reused output storage；
-- 最大 sequence、batch、image 和 cache 范围；
-- 用精确 checkpoint、TOML、Launch 和算子资产，在新进程运行公开 E2E example。
-
-缺必需 operation、memory plan、profile asset 或硬语义门禁时标为 Blocked。代表性任务
-证据不完整可以保持 Experimental/Source-only，但不能晋级 Supported/Limited。小输入
-通过不能扩大模型表。
-
-把 checkpoint revision/hash、配置 hash、软件版本、算子资产 hash、输入范围、精度和
-结果写入 release evidence，之后才可修改[模型支持](model_support.zh.md)。
+按[模型验证](validation_policy.zh.md)选择与新路径相关的检查。受影响 host 检查运行一次，每条变化的路径使用一个代表板测；确认计算路径后记录数值差异。完整矩阵或发布认证仅在明确要求时执行。

@@ -7,7 +7,8 @@ from pathlib import Path
 
 from rpu_backend.adapters.wall_oss.vision import build_wall_oss_vision
 
-from ._checkpoint import open_public_checkpoint
+from ._policy import require_controlled_evaluation, verify_asset_manifest
+from .execution import VISION_COMPONENT, component_execution
 
 
 _VISION_PROFILE = {
@@ -27,16 +28,18 @@ def build_internvla_vision(
     ckpt_dir: str | Path,
     *,
     asset_manifest: Mapping[str | Path, str] | None = None,
+    rpu_execution=None,
 ):
     """Build the exact FP16 384px/784-patch controlled Vision profile."""
+    execution = component_execution(
+        rpu_execution,
+        VISION_COMPONENT,
+        entry_point="build_internvla_vision",
+    )
+    require_controlled_evaluation(asset_manifest)
     root = Path(ckpt_dir).expanduser().resolve()
     config_path = root / "config.json"
-    open_public_checkpoint(
-        root,
-        asset_manifest,
-        prefixes=("visual.",),
-        controlled_rpu=True,
-    )
+    verify_asset_manifest((config_path,), asset_manifest)
     with config_path.open(encoding="utf-8") as stream:
         config = json.load(stream)
     vision_config = config.get("vision_config", {})
@@ -51,12 +54,32 @@ def build_internvla_vision(
             f"profile: {'; '.join(errors)}"
         )
 
-    return build_wall_oss_vision(
+    index_path = root / "model.safetensors.index.json"
+    descriptor = index_path if index_path.is_file() else root / "model.safetensors"
+    verify_asset_manifest((descriptor,), asset_manifest)
+    if descriptor == index_path:
+        with index_path.open(encoding="utf-8") as stream:
+            weight_map = json.load(stream).get("weight_map", {})
+        shards = tuple(
+            (root / name).resolve() for name in sorted(set(weight_map.values()))
+        )
+        if not shards or any(root not in path.parents for path in shards):
+            raise ValueError(
+                "InternVLA-N1 Vision checkpoint index is empty or escapes ckpt_dir"
+            )
+        verify_asset_manifest(shards, asset_manifest)
+
+    result = build_wall_oss_vision(
         str(root),
         window=True,
         max_hw=32,
         max_seq_len=1024,
         w8a16=False,
         fp16_ckpt_dir=str(root),
+        execution_config=execution,
         per_window_sdpa=True,
     )
+    vars(result)["_rpu_execution"] = execution
+    vars(result)["_fmb_execution_component_id"] = VISION_COMPONENT
+    vars(result)["_fmb_execution_generation"] = 0
+    return result

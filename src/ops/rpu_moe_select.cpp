@@ -10,7 +10,7 @@
 //
 // correction_bias therefore changes membership only; it never leaks into the
 // routed weights.  No FP32 value is materialised in SPM.  The three dynamic
-// kernels used here must be present in the active combined operator asset:
+// kernels used here already ship in rhinoOpLib_current.ref:
 // topk_by_select_fp16, unary_cast_uint16_int32, and
 // scatter_elements_v2_spm_smallC.
 
@@ -27,7 +27,8 @@ using namespace ::rhino_lkn;
 namespace {
 
 Kernel_t* graph_kernel_by_name(const char* name) {
-    // Prime the dynamic lookup before asking the graph for its cached handle.
+    // get_kernel() performs the dynamic .ref lookup.  The graph's named-kernel
+    // path only clones an already-cached program, so prime the cache first.
     TORCH_CHECK(KernelCache::instance().get_kernel(name) != nullptr,
                 "backend_moe_select: kernel '", name,
                 "' is absent from the active rhino oplib");
@@ -57,8 +58,7 @@ void launch_topk_by_select_fp16(
     kernel->set_regs(6,  static_cast<uint16_t>(out_value_u16_addr & 0xFFFF));
     kernel->set_regs(7,  static_cast<uint16_t>(out_value_u16_addr >> 16));
     kernel->set_regs(8,  static_cast<uint16_t>(k));
-    // Host register contract: cv16_num deliberately includes the tail vector
-    // even when c is v16-aligned.
+    // cv16_num includes the tail vector even when c is v16-aligned.
     kernel->set_regs(10, static_cast<uint16_t>(c / 16 + 1));
     kernel->set_regs(11, static_cast<uint16_t>(c % 16));
     kernel->set_regs(12, static_cast<uint16_t>(c));

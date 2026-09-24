@@ -1,0 +1,27 @@
+# Public configuration; provide your own checkpoint and input assets.
+
+[example]
+profile_id = "qwen3_8-27b.w8a16.text-controlled"
+registry_alias = "qwen3_8-27b-w8a16"
+target = "qwen3_5"
+dtype = "w8a16"
+architecture = "Qwen3_5ForConditionalGeneration"
+
+[example.opt_in]
+QWEN3_5_QUANT_ALLOW_UNCERTIFIED = "1"
+
+[input]
+prompt = "Explain what a compiler does."
+decode_steps = 4
+
+[run]
+warmup = 1
+runs = 3
+hwperf = false
+profile = false
+seed = 0
+
+[rpu_execution]
+
+[rpu_execution.prefill]
+chunk_size = "auto"

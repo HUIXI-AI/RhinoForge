@@ -1,17 +1,29 @@
-"""SigLIP all-layers-once instance patch.
+"""SigLIP all-layers-once instance patch (canonical home).
 
-Pi05Adapter uses this direct-handle path, and other ViT adapters can reuse
-the same flat helper module. Weight preparation supports both Pi0.5's
-``projector.linear`` wrapper and plain ``nn.Linear`` callers.
+v5-03 B4: relocated from _internal/patches/pi05_all_layers_once.py L773-1013
+per ADR §6.2. Pi05Adapter uses this direct-handle path as production
+(v5-05 cutover SHIPPED; v2 shim deleted).
 
-The direct-handle path bypasses ``embeddings.forward`` and routes 4-D pixel
-inputs through ``siglip_forward`` after configuring patch-embedding weights
-with ``siglip_model_set_patch_emb``.
+v5-cleanup: lifted from `adapters/pi05/siglip.py` to `adapters/siglip.py` as
+a peer module so non-Pi0.5 ViT-using ports can reuse it directly; the
+projector-wrapper polymorphism on L73 / L180 already supports both Pi0.5's
+`projector.linear` wrapper and plain `nn.Linear` callers. ADR §3.3 forbids
+reintroducing a ComponentBase abstraction; this file remains a flat
+function module.
+
+v5-05 D-02 + D-03: weight-prep helpers (`_convert_siglip_weights_for_rpu`,
+`_convert_siglip_projector_for_rpu`, `patch_siglip_embeddings_for_rpu`) were
+lifted byte-equal from `_internal/patches/siglip_pi05.py` (now deleted) so this
+module is fully self-contained. The `patch_siglip_embeddings_for_rpu` helper's
+forward-replacement (the old `rpu_embeddings_forward` → `fused_patch_embedding`
+op call) was removed during the lift; the direct-handle path bypasses
+`embeddings.forward` entirely (it routes pixel_values through
+`siglip_forward(handle, 4D, ...)` via the C++ `siglip_model_set_patch_emb`).
 """
 from __future__ import annotations
+from dataclasses import replace
 import os
 import types
-import weakref
 
 import torch
 import torch.nn as nn
@@ -19,27 +31,129 @@ import torch.nn as nn
 import rpu_backend  # GraphCache / GraphSignature
 from rpu_backend.quant._common import quantize_linear_per_channel
 from rpu_backend.runtime import rpu_env_bool
+from rpu_backend.runtime.decoder import plan_bounded_prefill_execution
 from rpu_backend.runtime.log import _LOG
 from rpu_backend.runtime.weights import (
     transform_linear_weight, convert_linear_weights_inplace,
     NUM_CORES,
 )
 from rpu_backend.api.cache import RPUCache
+from rpu_backend.runtime.execution_planner import GRAPH_COMPOSITE_CHILD
 
 
 def _siglip_graph_enabled() -> bool:
     return rpu_env_bool("RPU_PI05_SIGLIP_GRAPH", default=True)
 
 
-# siglip_forward records structurally different graphs for 4D pixel input
-# (patch embedding plus encoder) and 3D pre-embedded input (encoder only).
-# Their canonical shape terms overlap, so branch_key is part of the cache key.
+def _siglip_component_execution_plan(
+    vision_model, handle: int, total_seq: int, image_batch_count: int,
+    *, external_patch_prologue: bool, _cost_request=None,
+    graph_cache=None,
+):
+    """Resolve and publish one native A6 plan for either SigLIP input path."""
+    component_id = getattr(
+        vision_model, "_fmb_execution_component_id", "vision_encoder"
+    )
+    component_config = getattr(
+        vision_model, "_fmb_execution_component_config", {}
+    )
+    stage_config = component_config.get("vision", component_config)
+    requested_chunk = stage_config.get("chunk_size", "auto")
+    if _cost_request is not None:
+        from rpu_backend.runtime.decoder import _cold_text_cost_request
+
+        if type(handle) is not int or handle != vision_model._rpu_vision_handle:
+            raise ValueError("cold SigLIP planning requires its actual handle")
+        request, _ = _cold_text_cost_request(
+            vision_model, ("siglip", handle), None, _cost_request, 0,
+            stage="vision")
+        if request.padding_rows != 0 or request.padding_budget != 0:
+            raise ValueError("cold SigLIP planning cannot add execution padding")
+        requested_chunk = request.chunk_size or "auto"
+    generation = int(getattr(vision_model, "_fmb_execution_generation", 0))
+    plan_box = {}
+    execution_len, chunk_size = plan_bounded_prefill_execution(
+        int(total_seq), int(total_seq), 0,
+        resolve_stage_domain=lambda length: (
+            torch.ops.rpu.siglip_resolve_stage_domain(
+                handle, int(length), int(image_batch_count),
+                bool(external_patch_prologue),
+            )
+        ),
+        position=0,
+        alignment=1,
+        padding_rows=0,
+        exact_chunk_size=(
+            None if requested_chunk == "auto" else int(requested_chunk)
+        ),
+        request_id=f"{component_id}:vision",
+        execution_owner=vision_model,
+        execution_stage="vision",
+        execution_native=("siglip", int(handle)),
+        plan_result_sink=lambda result: plan_box.__setitem__("result", result),
+        graph_mode=GRAPH_COMPOSITE_CHILD,
+        physical_metadata=(
+            (f"component:{component_id}", 1),
+            ("execution_generation", generation),
+            ("image_batch_count", int(image_batch_count)),
+            ("position", 0),
+            ("stage:vision", 1),
+        ),
+        queue_owner_id=int(handle),
+        plan_signature=(int(image_batch_count), bool(external_patch_prologue)),
+        graph_cache=graph_cache,
+    )
+    plan = plan_box["result"]
+    if (
+        execution_len != int(total_seq)
+        or plan.selected is None
+        or chunk_size != plan.selected.stage_tuple.compute_chunk
+        or not plan.selected.stage_tuple.physical_descriptor
+    ):
+        raise RuntimeError(
+            "SigLIP planner returned no consumable native stage descriptor"
+        )
+    if _cost_request is None:
+        vars(vision_model)["_fmb_last_execution_plan"] = plan
+    return plan
+
+
+# GraphSignature branch discriminator for the "pi05_siglip_compute" capture.
+#
+# The C++ `siglip_forward` auto-detects input rank (D-507) and records TWO
+# STRUCTURALLY DIFFERENT graphs on one handle:
+#   - 4D [N,C,H,W] pixel input → patch-embedding prologue first (node 0 is the
+#     im2col input DMA), then the encoder.
+#   - 3D [1,S,hidden] pre-embedded input → straight into the encoder (node 0 is
+#     a kernel).
+# Every other signature term is identical for the canonical pair
+# ([1,3,224,224] vs [1,256,1152]): shapes[0] = _n_packed*256 = 256 either way,
+# because `_n_packed` is `input.shape[0]` and equals 1 for both. Without this
+# discriminator the two recordings collide on ONE cache entry and whichever
+# runs second REPLAYs the other's node list — the graph runtime then aborts at
+# cursor 0 ("kind mismatch ... expected Dma got 0" / "kernel_id mismatch in
+# replay at node 1"). `branch_key` is the framework's designated control-flow
+# discriminator (graph_infra.h GraphSignature; it participates in operator==
+# and the hash, and drives MISS_BRANCH_KEY attribution).
 _SIGLIP_BRANCH_PATCH_EMBED = 1   # 4D pixels → patch-embed prologue + encoder
 _SIGLIP_BRANCH_PRE_EMBEDDED = 2  # 3D hidden → encoder only
 
 
-# The 3D branch is fixed to SIGLIP_SEQ_LEN because its signature uses the packed
-# image count. Other sequence lengths require a handle keyed by the actual rows.
+# MR-B / T2 — the 3D pre-embedded branch is pinned to exactly SIGLIP_SEQ_LEN rows.
+#
+# The trap this closes: the GraphSignature for this path keys its row count as
+# `_n_packed * _seq_len`, and for a 3D [1, S, hidden] input `_n_packed` is the
+# BATCH dim (1), not S. So the signature reads 256 for EVERY 3D input whatever S
+# is — two different row counts would share one cache entry and the second would
+# replay the first's node list, silently, with correct shapes and wrong numbers.
+#
+# Why a guard rather than a generalised key: no caller needs non-256 HERE. HALO
+# does run the encoder at n_vit=1564, but through the NATIVE path with
+# `shapes=[n_vit, ...]` — its real row count — under its own op_id and its own
+# GraphCache (adapters/halo/vit_cache.py:342). HALO is already correct, so
+# generalising this key would have zero consumers; what is actually left is a
+# trap for the next caller. Generalise only when a real non-256 caller appears on
+# THIS path (followups_plan_20260811.md §1 B4).
 SIGLIP_SEQ_LEN = 256
 
 
@@ -55,8 +169,9 @@ def check_pre_embedded_rows(shape, seq_len=SIGLIP_SEQ_LEN):
         f"{shape[1]} (shape {tuple(shape)}). This path keys its GraphCache entry "
         f"on _n_packed * {seq_len}, which ignores the actual row count, so a "
         f"different S would silently REPLAY the {seq_len}-row graph. If you need "
-        f"another length, use a native handle whose GraphSignature keys the "
-        f"actual row count under a distinct op_id and GraphCache.")
+        f"another length, follow HALO: drive the native handle with "
+        f"shapes=[rows, ...] under your own op_id and GraphCache "
+        f"(adapters/halo/vit_cache.py:342).")
 
 
 def _siglip_w8a16_enabled(default_enabled: bool = False) -> bool:
@@ -124,15 +239,16 @@ def _install_siglip_linear_weight(
     *,
     partition: int,
     w8a16: bool,
+    num_cores: int = NUM_CORES,
 ) -> None:
     if w8a16:
         weight, scale = _quantize_and_swizzle_siglip_weight(
-            weight, partition=partition)
+            weight, partition=partition, num_cores=num_cores)
         module.weight = nn.Parameter(weight, requires_grad=False)
         _set_siglip_weight_scale(module, scale)
     else:
         weight = transform_linear_weight(
-            weight.contiguous(), partition=partition, num_cores=NUM_CORES)
+            weight.contiguous(), partition=partition, num_cores=num_cores)
         module.weight = nn.Parameter(weight.contiguous(), requires_grad=False)
 
 
@@ -203,23 +319,26 @@ def _siglip_scale_to_rpu(module: nn.Linear) -> torch.Tensor:
     return scale.to(dtype=torch.float16, device="rpu").contiguous()
 
 
+# patch-reason: (a) SigLIP all-layers-once C++ handle lifecycle helper — §3a (a)
 def _siglip_destroy_handle(h):
-    """Release C++ SigLIPModel handle. Called by weakref.finalize on GC."""
-    try:
-        torch.ops.rpu.siglip_destroy(h)
-    except Exception:
-        # Swallow -- during interpreter shutdown the op may be gone
-        pass
+    """Raw destroy; the installed resource owns retirement failures."""
+    torch.ops.rpu.siglip_destroy(h)
 
 
 # =============================================================================
-# SigLIP weight-preparation helpers.
+# v5-05 D-02: SigLIP weight-prep helpers (lifted byte-equal from
+# `_internal/patches/siglip_pi05.py`; that file is now deleted).
 # =============================================================================
-# Idempotence guards short-circuit a second conversion when callers prepare
-# weights before entering `patch_siglip_model_for_rpu_all_layers_once`.
+# These were the substantive weight-prep bodies from siglip_converter.py
+# through v4.0 (relocated to siglip_pi05.py in Phase 12 D-B1 and again to here
+# in v5-05 D-02 to keep the direct-handle path self-contained). Idempotence
+# guards on `_rpu_siglip_weights_converted` and `_rpu_weights_converted`
+# preserved verbatim; they short-circuit double-call from a pre-move CPU
+# swizzle (Pi05Adapter._init_:154) followed by the inner call inside
+# `patch_siglip_model_for_rpu_all_layers_once` (line 108 below).
 
 
-def _convert_siglip_weights_for_rpu(vision_tower, *, w8a16_default: bool = False):
+def _convert_siglip_weights_for_rpu(vision_tower, *, w8a16_default: bool = False, num_cores: int = 8):
     """Convert SigLIP encoder weights: pad head_dim/intermediate, swizzle for RPU.
 
     Modifications:
@@ -236,11 +355,15 @@ def _convert_siglip_weights_for_rpu(vision_tower, *, w8a16_default: bool = False
     """
     # Normalize wrapper vs inner
     vit = vision_tower.vision_model if hasattr(vision_tower, 'vision_model') else vision_tower
+    if type(num_cores) is not int or num_cores not in (4, 8):
+        raise ValueError("SigLIP execution core count must be 4 or 8")
     siglip_w8a16_names = _siglip_w8a16_projection_names(default_enabled=w8a16_default)
     siglip_w8a16 = bool(siglip_w8a16_names)
 
     # Idempotence guard on the NORMALIZED vit object
     if getattr(vit, '_rpu_siglip_weights_converted', False):
+        if getattr(vit, '_rpu_vision_num_cores', 8) != num_cores:
+            raise ValueError('SigLIP core count is cold-only; reload before changing its weight layout')
         if siglip_w8a16 and not getattr(vit, '_siglip_w8a16', False):
             _LOG.warning(
                 "SigLIP W8A16 requested after encoder was already converted as fp16; "
@@ -248,6 +371,9 @@ def _convert_siglip_weights_for_rpu(vision_tower, *, w8a16_default: bool = False
         return
 
     encoder = vit.encoder
+    if num_cores == 4 and (len(encoder.layers) != 27 or
+            (vit.config.hidden_size, vit.config.intermediate_size, vit.config.num_attention_heads) != (1152, 4304, 16)):
+        raise ValueError("SigLIP4 requires the exact Pi0.5 SigLIP27 geometry")
 
     layer0 = encoder.layers[0]
     hidden_size = layer0.self_attn.embed_dim
@@ -286,7 +412,7 @@ def _convert_siglip_weights_for_rpu(vision_tower, *, w8a16_default: bool = False
                 w = w.reshape(padded_qkv_out, hidden_size).contiguous()
                 _install_siglip_linear_weight(
                     proj, w, partition=1,
-                    w8a16=(f"self_attn.{proj_name}" in siglip_w8a16_names))
+                    w8a16=(f"self_attn.{proj_name}" in siglip_w8a16_names), num_cores=num_cores)
                 proj.out_features = padded_qkv_out
 
                 # Bias: [num_heads*orig_hd] -> pad -> [num_heads*padded_hd]
@@ -307,7 +433,7 @@ def _convert_siglip_weights_for_rpu(vision_tower, *, w8a16_default: bool = False
             w = w.reshape(hidden_size, padded_qkv_out).contiguous()
             _install_siglip_linear_weight(
                 attn.out_proj, w, partition=0,
-                w8a16=("self_attn.out_proj" in siglip_w8a16_names))
+                w8a16=("self_attn.out_proj" in siglip_w8a16_names), num_cores=num_cores)
             attn.out_proj.in_features = padded_qkv_out
             # O_proj bias: [hidden_size] -- no padding needed
 
@@ -319,7 +445,7 @@ def _convert_siglip_weights_for_rpu(vision_tower, *, w8a16_default: bool = False
                 w = torch.cat([w, pad], dim=0)
             _install_siglip_linear_weight(
                 mlp.fc1, w.contiguous(), partition=1,
-                w8a16=("mlp.fc1" in siglip_w8a16_names))
+                w8a16=("mlp.fc1" in siglip_w8a16_names), num_cores=num_cores)
             mlp.fc1.out_features = padded_intermediate
 
             # fc1 bias: [orig_inter] -> pad -> [padded_inter]
@@ -338,7 +464,7 @@ def _convert_siglip_weights_for_rpu(vision_tower, *, w8a16_default: bool = False
                 w = torch.cat([w, pad], dim=1)
             _install_siglip_linear_weight(
                 mlp.fc2, w.contiguous(), partition=0,
-                w8a16=("mlp.fc2" in siglip_w8a16_names))
+                w8a16=("mlp.fc2" in siglip_w8a16_names), num_cores=num_cores)
             mlp.fc2.in_features = padded_intermediate
             # fc2 bias: [hidden_size] -- no padding needed
 
@@ -349,35 +475,31 @@ def _convert_siglip_weights_for_rpu(vision_tower, *, w8a16_default: bool = False
         layer._rpu_head_dim = padded_head_dim
         layer._rpu_intermediate_size = padded_intermediate
 
+    vit._rpu_vision_num_cores = num_cores
     vit._rpu_siglip_weights_converted = True
     vit._siglip_w8a16 = siglip_w8a16
     suffix = " (W8A16)" if siglip_w8a16 else ""
     _LOG.info("Converted %d SigLIP encoder layers%s", num_layers, suffix)
 
 
-def _convert_siglip_projector_for_rpu(projector):
-    """Idempotent projector weight conversion for RPU col-partition.
-    Handles both Pi0.5 wrapper (has .linear) and plain nn.Linear.
-    Guards on BOTH wrapper and leaf to prevent double-swizzle from mixed calls."""
-    # Normalize to leaf for guard check -- if either has the marker, skip
-    _leaf = projector.linear if hasattr(projector, 'linear') else projector
-    if getattr(projector, '_rpu_weights_converted', False) or \
-       getattr(_leaf, '_rpu_weights_converted', False):
+def _convert_siglip_projector_for_rpu(projector, *, num_cores: int = 8):
+    """Convert the actual leaf once, with the native projector's column layout."""
+    if type(num_cores) is not int or num_cores not in (4, 8):
+        raise ValueError("SigLIP projector core count must be 4 or 8")
+    leaf = projector.linear if hasattr(projector, 'linear') else projector
+    if getattr(projector, '_rpu_weights_converted', False) or getattr(leaf, '_rpu_weights_converted', False):
+        if getattr(leaf, '_rpu_linear_num_cores', 8) != num_cores:
+            raise ValueError("SigLIP projector core count is cold-only; reload the model")
         return
-    if hasattr(projector, 'linear'):
-        # Pi0.5 wrapper -- recurse into children to find the nn.Linear
-        convert_linear_weights_inplace(projector)
-    else:
-        # Plain nn.Linear -- transform directly (convert_linear_weights_inplace
-        # on a leaf module is a no-op since it only recurses named_children).
-        # Hardcode partition=1 (col-partition) -- matches C++ projector kernel.
-        projector.weight.data = transform_linear_weight(
-            projector.weight.data, partition=1, num_cores=8)
-    # Mark BOTH wrapper and leaf to handle mixed caller patterns
+    leaf.weight.data = transform_linear_weight(leaf.weight.data, partition=1, num_cores=num_cores)
+    leaf._rpu_linear_num_cores = num_cores
+    leaf._rpu_linear_partition = 1
     projector._rpu_weights_converted = True
-    _leaf._rpu_weights_converted = True
+    leaf._rpu_weights_converted = True
 
 
+# patch-reason: (a) Pi0.5 SigLIP embedding GEMM packing for RPU patch-emb kernel — §3a (a) hardware-constraint attribute injection
+# v5-05 D-03: forward replacement removed; direct handle path calls siglip_forward(handle, 4D, ...) directly.
 def patch_siglip_embeddings_for_rpu(embeddings_module, num_cores=8):
     """Patch SiglipVisionEmbeddings for RPU fused patch embedding.
 
@@ -387,8 +509,10 @@ def patch_siglip_embeddings_for_rpu(embeddings_module, num_cores=8):
 
     The direct-handle path consumes the resulting `_rpu_gemm_weight` and
     `_rpu_pos_emb_fused` buffers via `siglip_model_set_patch_emb` (called by
-    `patch_siglip_model_for_rpu_all_layers_once`); the direct-handle C++
-    pipeline routes 4-D pixel values through `siglip_forward`.
+    `patch_siglip_model_for_rpu_all_layers_once` Step 7); the legacy forward
+    replacement that called `torch.ops.rpu.fused_patch_embedding` directly was
+    removed in v5-05 D-03 because the direct-handle C++ pipeline routes 4D
+    pixel_values through `siglip_forward(handle, 4D, ...)`.
     """
     conv = embeddings_module.patch_embedding
     cin_orig = conv.in_channels  # 3
@@ -441,6 +565,7 @@ def patch_siglip_embeddings_for_rpu(embeddings_module, num_cores=8):
               cin_orig, cin_padded, cout, K)
 
 
+# patch-reason: (a) SigLIP all-layers-once instance patch — §3a (a) run-different-op-on-RPU
 _SIGLIP_RUNTIME_INSTALL_ATTRS = (
     "_test_siglip_weight_args_tuple",
     "_siglip_w8a16",
@@ -450,24 +575,29 @@ _SIGLIP_RUNTIME_INSTALL_ATTRS = (
     "_rpu_required_attrs",
     "_rpu_vision_handle",
     "_rpu_vision_handle_finalizer",
+    "_rpu_vision_retirement_state",
+    "_siglip_graph_enabled",
     "forward",
 )
 
 
 def patch_siglip_model_for_rpu_all_layers_once(vision_model, projector,
                                                num_images: int = 1,
-                                               w8a16_default: bool = False) -> int:
+                                               w8a16_default: bool = False,
+                                               num_cores: int = 8,
+                                               *, runtime_policy=None, linear_acc32=None) -> int:
     """
     Patch a Pi0.5 SigLIP vision model instance to use all-layers-once
     C++ execution via SigLIPModel (FusedModelBase).
 
-    With num_images > 1, the patched forward expects
+    SigLIP-batch (2026-05-31): with num_images > 1, the patched forward expects
     pixel_values to be [num_images, 3, H, W] — N camera images packed into ONE
     seq=N*256 fused encoder forward (per-image attention isolation via the
     minibatch SDPA). The KV cache is sized for up to num_images (N*256 rows);
     the per-forward GraphSignature is keyed on the ACTUAL packed N so single-
-    and multi-image graphs never collide. num_images = 1 is the default
-    single-image path used by standalone SigLIP and other ViT ports.
+    and multi-image graphs never collide. num_images = 1 (default) is the legacy
+    single-image path, byte-identical to before, used by standalone SigLIP +
+    non-Pi0.5 ViT ports.
 
     Steps:
       1. Keep the currently published handle alive while preparing replacement state
@@ -490,14 +620,37 @@ def patch_siglip_model_for_rpu_all_layers_once(vision_model, projector,
     # configured. This matters for direct re-patching (for example lifecycle
     # tests and adapter recovery): a failed set_weights must not leave a model
     # pointing at a half-initialized handle.
+    if linear_acc32 is not None and type(linear_acc32) is not bool:
+        raise TypeError("SigLIP linear_acc32 must be bool or None")
+
+    from rpu_backend.api._execution import _require_execution_process_safe
+    from rpu_backend.runtime._native_retirement import _InstalledNativeResource
+
+    _require_execution_process_safe()
+    if type(num_cores) is not int or num_cores not in (4, 8) or (num_cores == 4 and num_images != 1):
+        raise ValueError("SigLIP4 requires the fixed serial one-image profile")
+    if runtime_policy is not None:
+        if runtime_policy.execution_core_count < num_cores:
+            raise ValueError("SigLIP Graph policy cannot run fewer cores than its weights")
+        if runtime_policy.execution_core_count != num_cores:
+            # Pi0.5 MLP6 has a six-core root but its serial SigLIP child uses
+            # four. Keep the root's replay choices while narrowing this queue.
+            runtime_policy = replace(
+                runtime_policy, execution_core_count=num_cores,
+                provenance=runtime_policy.provenance +
+                (f"owner:siglip:execution_core_count={num_cores}",),
+            )
+    old_resource = getattr(vision_model, "_rpu_vision_retirement_state", None)
+    if old_resource is not None:
+        old_resource.require_replaceable()
+    elif getattr(vision_model, "_rpu_vision_handle", None) is not None:
+        raise RuntimeError("SigLIP replacement requires its actual retirement resource")
     model_state = vars(vision_model)
     install_snapshot = {
         name: model_state[name]
         for name in _SIGLIP_RUNTIME_INSTALL_ATTRS
         if name in model_state
     }
-    had_old_handle = "_rpu_vision_handle" in install_snapshot
-    old_handle = install_snapshot.get("_rpu_vision_handle")
     old_finalizer = install_snapshot.get(
         "_rpu_vision_handle_finalizer")
 
@@ -511,7 +664,7 @@ def patch_siglip_model_for_rpu_all_layers_once(vision_model, projector,
     head_dim = config.hidden_size // num_heads  # 72 original (will be 80 after pad)
     hidden_size = config.hidden_size  # 1152
     intermediate_size = config.intermediate_size  # 4304 original (4352 after pad)
-    # Pi0.5 projector may be a wrapper with a .linear attribute.
+    # Pi0.5 projector is a wrapper with .linear attribute (pi05_converter.py:1039-1041)
     # Support both nn.Linear (has .weight directly) and wrapper (has .linear.weight)
     if hasattr(projector, 'linear'):
         _proj_linear = projector.linear  # Pi0.5 wrapper: projector_module.linear
@@ -523,11 +676,12 @@ def patch_siglip_model_for_rpu_all_layers_once(vision_model, projector,
     # ------------------------------------------------------------------ #
     # Step 2: weight conversion (sole owner) -- idempotence guards inside
     # ------------------------------------------------------------------ #
+    # v5-05 D-02: helpers are now module-private (defined above).
     # Encoder conversion
-    _convert_siglip_weights_for_rpu(vision_model, w8a16_default=w8a16_default)
+    _convert_siglip_weights_for_rpu(vision_model, w8a16_default=w8a16_default, num_cores=num_cores)
 
     # Projector conversion
-    _convert_siglip_projector_for_rpu(projector)
+    _convert_siglip_projector_for_rpu(projector, num_cores=num_cores)
     siglip_w8a16 = _detect_and_validate_siglip_encoder_w8a16(encoder)
 
     # ------------------------------------------------------------------ #
@@ -604,7 +758,7 @@ def patch_siglip_model_for_rpu_all_layers_once(vision_model, projector,
     )
 
     # ------------------------------------------------------------------ #
-    # Step 5: mandatory patch-embedding setup
+    # Step 5: patch embedding setup (D-507, MANDATORY)
     # ------------------------------------------------------------------ #
     embeddings = vision_model.embeddings
     patch_projection = embeddings.patch_embedding  # nn.Conv2d
@@ -614,7 +768,8 @@ def patch_siglip_model_for_rpu_all_layers_once(vision_model, projector,
         gemm_weight = embeddings._rpu_gemm_weight
         pos_emb = embeddings._rpu_pos_emb_fused
     else:
-        # Prepare it ourselves using the same helper.
+        # Prepare it ourselves (same logic as patch_siglip_embeddings_for_rpu).
+        # v5-05 D-03: helper is now module-private (defined above).
         patch_siglip_embeddings_for_rpu(embeddings)
         gemm_weight = embeddings._rpu_gemm_weight
         pos_emb = embeddings._rpu_pos_emb_fused
@@ -633,16 +788,17 @@ def patch_siglip_model_for_rpu_all_layers_once(vision_model, projector,
     _num_layers = num_layers
     _num_heads = num_heads
     _padded_head_dim = padded_head_dim
-    _attn_tp = min(8, num_heads)
+    _attn_tp = min(num_cores, num_heads)
     _siglip_sig_w8a16 = int(siglip_w8a16)
+    _split_siglip_graph = _siglip_graph_enabled()
 
     def rpu_siglip_forward(self, pixel_values=None, **kwargs):
         h = self._rpu_vision_handle
 
-        # RPUCache is eagerly initialized below; forward only resets it to
-        # position zero. Lazy initialization would break the Dynamo cache:
+        # D-502: RPUCache 已经在 patch 函数末尾 eager init (见 line ~492 下方),
+        # forward 内只 reset_to_position(0)。**lazy init 会破坏 Dynamo cache**:
         # `hasattr(self, '_rpu_cache')` 第一次 trace 时 False,被烘成 guard;
-        # later calls see True, fail the guard, and recompile.
+        # 后续 call 时变 True → guard fail → recompile (P7.1g 已知问题)。
         cache = self._rpu_cache
         cache.reset_to_position(0)  # SigLIP re-inserts all tokens every forward
 
@@ -676,11 +832,26 @@ def patch_siglip_model_for_rpu_all_layers_once(vision_model, projector,
                 f"is sized for at most {_num_images}")
         _this_total_seq = _n_packed * _seq_len
 
-        # See check_pre_embedded_rows near the branch constants for
+        # Composite owners may publish a component-scoped fixed-ABI contract.
+        # Standalone SigLIP instances have no such attribute and retain their
+        # existing signature unchanged.
+        _component_plan = _siglip_component_execution_plan(
+            self, h, _this_total_seq, _n_packed,
+            external_patch_prologue=input_tensor.dim() == 4,
+            graph_cache=self._rpu_siglip_graph_cache,
+        )
+        _component_plan_words = (
+            () if _component_plan is None else _component_plan.graph_key_words()
+        )
+        _planned_stage_descriptor = list(
+            _component_plan.selected.stage_tuple.physical_descriptor
+        )
+
+        # MR-B / T2 — see check_pre_embedded_rows near the branch constants for
         # why this is a hard refusal and not a generalised cache key.
         check_pre_embedded_rows(input_tensor.shape, _seq_len)
 
-        # Call C++ forward (4-D patch embedding or 3-D pre-embedded input).
+        # Call C++ forward (handles 4D->patch_emb and 3D->direct via D-507)
         k_caches = [cache.k_caches[i] for i in range(_num_layers)]
         v_caches = [cache.v_caches[i] for i in range(_num_layers)]
 
@@ -698,33 +869,49 @@ def patch_siglip_model_for_rpu_all_layers_once(vision_model, projector,
         # always), and the encoder uses MASK_NONE → no
         # mask DMA risk. SigLIP-batch: the N images now ride ONE forward
         # (1 BUILD, then cross-forward all REPLAY) instead of 3 calls.
-        # Mixed core counts are handled by graph-runtime auto-segmentation.
+        # R-2 (1-core patch_emb + 8-core encoder mix) is handled by the
+        # graph runtime auto-segmenting by num_cores.
         # branch_key: the 4D and 3D inputs record different node lists on the
-        # same handle, and every other term above is
+        # SAME handle (D-507 auto-detection) and every other term above is
         # identical for [1,3,224,224] vs [1,256,1152]. See the constants near
         # the top of this module.
         _sig = rpu_backend.graph.GraphSignature(
             op_id="pi05_siglip_compute",
             shapes=[_this_total_seq, _num_layers, _padded_head_dim],
-            dyn_dims=[_num_heads, _attn_tp, _n_packed, _siglip_sig_w8a16],
+            dyn_dims=[
+                _num_heads, _attn_tp, _n_packed, _siglip_sig_w8a16,
+                *_component_plan_words,
+            ],
             dtypes=[torch.float16],
             branch_key=(_SIGLIP_BRANCH_PATCH_EMBED if input_tensor.dim() == 4
                         else _SIGLIP_BRANCH_PRE_EMBEDDED),
         )
-        split_siglip_graph = _siglip_graph_enabled()
-        if split_siglip_graph:
-            # Capture combined patch embedding and encoder execution once. The
-            # graph runtime segments the path by its core selections.
+        if _split_siglip_graph:
+            # Route B restore (2026-06-04): wrap the COMBINED siglip_forward
+            # (patch-embed + encoder, handles 4D internally) in ONE capture like
+            # the fused encoder does, so patch-embed rides graph mode
+            # instead of the immediate/PASSTHROUGH shared queue (which trips the
+            # enqueu-after-build_batch WARN). main split the 4D path citing a
+            # RECORDING-NaN; verified the merged C++ no longer NaNs (siglip +
+            # pi05 multi both 0 WARN, finite/MSE OK). num_cores mix (1-core
+            # patch-emb + 8-core encoder) is auto-segmented by the graph runtime.
             with self._rpu_siglip_graph_cache.capture(_sig):
                 output = torch.ops.rpu.siglip_forward(
-                    h, encoder_input, k_caches, v_caches)
+                    h, encoder_input, k_caches, v_caches,
+                    _planned_stage_descriptor)
+            # FMB fast replay skips the layer body that allocates the native
+            # projector output. Copy only after capture executes its kernels:
+            # callers may retain several camera outputs before concatenating.
+            output = output.clone()
         else:
             output = torch.ops.rpu.siglip_forward(
-                h, encoder_input, k_caches, v_caches)
+                h, encoder_input, k_caches, v_caches,
+                _planned_stage_descriptor)
 
         # Release temporary SPM (subsystem boundary).
-        # This must stay outside capture: graph-aware temporary-SPM reset
-        # marks the graph non-replayable.
+        # R-4: MUST stay OUTSIDE the capture scope — graph-aware
+        # spm_alloc_reset_temporary marks the graph non-replayable
+        # (src/graph/graph_spm_reset_guard.cpp + docs/graph_rules.md §12.4).
         torch.ops.rpu.spm_alloc_reset_temporary()
 
         # Return in HuggingFace format
@@ -734,9 +921,10 @@ def patch_siglip_model_for_rpu_all_layers_once(vision_model, projector,
             pooler_output=None,
         )
 
-    # Eager-initialize `_rpu_cache` during patching rather than in forward.
-    # Dynamo would otherwise record an attribute-existence guard that changes
-    # after the first call and forces recompilation.
+    # P7.1g D-502: 在 patch 阶段 eager init _rpu_cache,**不能 lazy init 在
+    # forward 内**。理由:Dynamo trace 第一次 forward 时把 `hasattr(self,
+    # '_rpu_cache')` 当 guard 烘进 cache,Call 2 时 attr 已存在 guard fail
+    # → 强制 recompile (frontend cache 命中失败,replay 永不命中)。
     rpu_cache = RPUCache(
         num_layers=_num_layers,
         batch_size=1,
@@ -745,17 +933,24 @@ def patch_siglip_model_for_rpu_all_layers_once(vision_model, projector,
         head_dim=_padded_head_dim,
         attn_tp=_attn_tp,
     )
-    # Per-instance GraphCache for the SigLIP forward wrap. Same Dynamo
+    # S2: per-instance GraphCache for the SigLIP forward wrap. Same Dynamo
     # guard-stability rationale as `_rpu_cache` above — eager init.
-    siglip_graph_cache = rpu_backend.graph.GraphCache()
+    siglip_graph_cache = (
+        rpu_backend.graph.GraphCache(runtime_policy=runtime_policy)
+        if runtime_policy is not None
+        else (rpu_backend.graph.GraphCache(runtime_policy=
+              rpu_backend.graph.GraphRuntimePolicy.from_environment(
+                  execution_core_count=num_cores))
+              if num_cores != 8 else rpu_backend.graph.GraphCache())
+    )
 
-    # Stamp the marker, declare required attributes, and auto-freeze.
+    # P7.1h L2 防线 — stamp marker + declare required attrs + auto freeze.
     # `_rpu_required_attrs` enumerates persistent `_rpu_*` attrs that forward()
     # reads — if any is missing at preflight time,DynamoUnsafeLazyStateError
-    # raises. Forward reads the following persistent attributes:
-    #   - _rpu_cache
-    #   - _rpu_vision_handle
-    #   - _rpu_siglip_graph_cache
+    # raises. forward 内 grep `self._rpu_*` 即枚举:
+    #   - _rpu_cache (this RPUCache instance,line above)
+    #   - _rpu_vision_handle (line 305,via rpu_siglip_forward at line 436)
+    #   - _rpu_siglip_graph_cache (S2 wrap site, line ~470)
     required_attrs = (
         '_rpu_cache',
         '_rpu_vision_handle',
@@ -765,17 +960,22 @@ def patch_siglip_model_for_rpu_all_layers_once(vision_model, projector,
     # ------------------------------------------------------------------ #
     # Step 7: configure a pending native handle, tentatively publish all
     # Python-visible state, validate it, then retire the old install as the
-    # commit gate. Until that gate succeeds, any BaseException restores the
-    # exact prior instance state and immediately destroys the pending handle.
+    # commit gate. Successful cleanup restores the exact prior instance state;
+    # uncertain retirement retains both installs and poisons the process.
     # The finalizer is retained on the model so later re-patches can detach
     # the retired handle's callback.
     # ------------------------------------------------------------------ #
-    handle = torch.ops.rpu.siglip_create()
-    handle_finalizer = None
+    resource = _InstalledNativeResource(
+        vision_model, None, _siglip_destroy_handle, graphs=(siglip_graph_cache,),
+        keepalive=(weight_args_tuple, q_ws_list, k_ws_list, v_ws_list, o_ws_list,
+                   fc1_ws_list, fc2_ws_list, gemm_weight, pos_emb, rpu_cache),
+        label="SigLIP", handle_name="_rpu_vision_handle")
+    handle_finalizer = resource.finalizer
     committed = False
     try:
-        handle_finalizer = weakref.finalize(
-            vision_model, _siglip_destroy_handle, h=handle)
+        resource.handle = handle = torch.ops.rpu.siglip_create(linear_acc32)
+        if num_cores != 8:
+            torch.ops.rpu.siglip_set_execution_core_count(handle, num_cores)
         if siglip_w8a16:
             torch.ops.rpu.siglip_set_weights_w8a16(
                 handle,
@@ -785,18 +985,28 @@ def patch_siglip_model_for_rpu_all_layers_once(vision_model, projector,
             )
         else:
             torch.ops.rpu.siglip_set_weights(handle, *weight_args_tuple)
+        if num_cores != 8:
+            actual = tuple(torch.ops.rpu.siglip_get_execution_topology(handle))
+            expected = (1, 4, 4, 4, 1, 8, 4304, 4352)
+            if actual != expected:
+                raise RuntimeError(f"SigLIP native topology mismatch: {actual} != {expected}")
+        # Bind the installed profile to this cache, before any native planning.
+        torch.ops.rpu.siglip_set_chunk_envelope(handle, int(_total_seq), 0)
         torch.ops.rpu.siglip_model_set_patch_emb(
             handle, gemm_weight, pos_emb, kernel_size, stride)
 
-        # Diagnostic state for same-handle invalidation checks. The name avoids
-        # the `_rpu_` prefix reserved for validated runtime attributes.
+        # v5-05 R1 HIGH-2: test-only state for Section 4 same-handle
+        # invalidation test. Renamed from `_rpu_siglip_weight_args_tuple` to
+        # drop the `_rpu_` prefix (A9 audits only `_rpu_*` attrs).
         vision_model._test_siglip_weight_args_tuple = weight_args_tuple
         vision_model._siglip_w8a16 = _siglip_sig_w8a16
+        vision_model._siglip_graph_enabled = _split_siglip_graph
         vision_model._rpu_cache = rpu_cache
         vision_model._rpu_siglip_graph_cache = siglip_graph_cache
         vision_model._rpu_lazy_init_checked = True
         vision_model._rpu_required_attrs = required_attrs
         vision_model._rpu_vision_handle = handle
+        vision_model._rpu_vision_retirement_state = resource
         vision_model._rpu_vision_handle_finalizer = handle_finalizer
         vision_model.forward = types.MethodType(
             rpu_siglip_forward, vision_model)
@@ -804,28 +1014,27 @@ def patch_siglip_model_for_rpu_all_layers_once(vision_model, projector,
         from rpu_backend.graph.lazy_init_guard import _verify_lazy_init
         _verify_lazy_init(vision_model)
 
-        if (
-            had_old_handle
-            and (
-                old_finalizer is None
-                or getattr(old_finalizer, "alive", False)
-            )
-        ):
-            torch.ops.rpu.siglip_destroy(old_handle)
+        if old_resource is not None:
+            old_resource.retire()
         committed = True
-    except BaseException:
+    except BaseException as error:
         if not committed:
+            cleanup_ok = resource.cleanup_failure(error, vision_model, install_snapshot)
+            if resource.handle is None and handle_finalizer.alive:
+                handle_finalizer.detach()
             # Bypass a custom __setattr__ that may itself have interrupted
             # tentative publication.
             model_state = vars(vision_model)
-            for name in _SIGLIP_RUNTIME_INSTALL_ATTRS:
-                model_state.pop(name, None)
-            model_state.update(install_snapshot)
-
-            if handle_finalizer is None:
-                _siglip_destroy_handle(handle)
-            elif handle_finalizer.alive:
-                handle_finalizer()
+            if cleanup_ok:
+                for name in _SIGLIP_RUNTIME_INSTALL_ATTRS:
+                    model_state.pop(name, None)
+                model_state.update(install_snapshot)
+            else:
+                model_state.update(
+                    _rpu_vision_handle=resource.handle,
+                    _rpu_vision_handle_finalizer=handle_finalizer,
+                    _rpu_vision_retirement_state=resource,
+                    _rpu_siglip_graph_cache=siglip_graph_cache, _rpu_cache=rpu_cache)
         raise
 
     if old_finalizer is not None and getattr(old_finalizer, "alive", False):
@@ -878,6 +1087,7 @@ def _prepare_siglip_images(images_list):
     ]
 
 
+# patch-reason: (a) SigLIP-batch all-RPU forward — bypass torch.cat + embed_image
 def _siglip_forward_images(vision_model, images_list):
     """Run the RPU SigLIP encoder over a LIST of N camera images in ONE fused
     forward, returning the packed projector output [1, N*256, projection_dim].
@@ -888,7 +1098,8 @@ def _siglip_forward_images(vision_model, images_list):
     `embed_prefix` no longer needs `torch.cat(images)` (a CPU fallback that
     leaves its result un-flushed to DDR → the downstream mutable patch-emb DMA
     reads stale bytes), nor the C++ a per-image slice of a re-cat'd tensor.
-    The output contract matches the per-image `embed_image` path.
+    Bit-exact vs the `embed_image(torch.cat(images))` path it replaces
+    (test_siglip_batch_3image.py + the E2E A/B in the resume doc).
 
     `vision_model` is the patched SigLIP inner vit (carries `_rpu_vision_handle`,
     `_rpu_cache`, `_rpu_siglip_graph_cache`). `images_list` is the per-camera
@@ -912,13 +1123,27 @@ def _siglip_forward_images(vision_model, images_list):
 
     # GraphSignature fields recovered from the eager-init cache (SigLIP is MHA:
     # num_kv_heads == num_q_heads == num_heads). op_id stays "pi05_siglip_compute"
-    # — same trace block as the single-image path. For N=1 the recordings are
-    # identical; ``branch_key`` distinguishes branches when their recordings differ.
+    # — same trace block as the single-image path. (The old note here claimed
+    # "_n_packed in dyn_dims differs anyway"; it does NOT for N=1. Sharing an
+    # entry with the N=1 4D path is fine because the recordings are identical —
+    # see the branch_key comment below — but it is not what _n_packed buys.)
     _num_layers = cache.num_layers
     _num_heads = cache.num_kv_heads
     _padded_head_dim = cache.head_dim
-    _attn_tp = min(8, _num_heads)
+    _attn_tp = cache.attn_tp
     _siglip_sig_w8a16 = int(getattr(vision_model, "_siglip_w8a16", 0))
+
+    component_plan = _siglip_component_execution_plan(
+        vision_model, h, _this_total_seq, _n_packed,
+        external_patch_prologue=True,
+        graph_cache=vision_model._rpu_siglip_graph_cache,
+    )
+    component_plan_words = (
+        () if component_plan is None else component_plan.graph_key_words()
+    )
+    planned_stage_descriptor = list(
+        component_plan.selected.stage_tuple.physical_descriptor
+    )
 
     # The Pi0.5 batch-preprocessing fast path returns dim-0 views of one CPU
     # slab. Upload that slab once, then pass contiguous views to the existing
@@ -936,18 +1161,26 @@ def _siglip_forward_images(vision_model, images_list):
     _sig = rpu_backend.graph.GraphSignature(
         op_id="pi05_siglip_compute",
         shapes=[_this_total_seq, _num_layers, _padded_head_dim],
-        dyn_dims=[_num_heads, _attn_tp, _n_packed, _siglip_sig_w8a16],
+        dyn_dims=[
+            _num_heads, _attn_tp, _n_packed, _siglip_sig_w8a16,
+            *component_plan_words,
+        ],
         dtypes=[torch.float16],
         branch_key=_SIGLIP_BRANCH_PATCH_EMBED,
     )
-    split_siglip_graph = _siglip_graph_enabled()
-    if split_siglip_graph:
-        # Capture combined patch embedding and encoder execution once. The
-        # graph runtime segments the path by its core selections.
+    if bool(getattr(vision_model, "_siglip_graph_enabled", True)):
+        # Route B restore (2026-06-04 experiment): wrap the COMBINED
+        # siglip_forward_multi (patch-embed + encoder) in ONE capture, like the
+        # fused encoder does, so the patch-embed DMA rides graph
+        # mode instead of the immediate/PASSTHROUGH shared queue (which trips
+        # the enqueu-after-build_batch WARN). main split it to dodge a claimed
+        # 4D-in-graph NaN — testing whether the merged C++ still NaNs.
         with vision_model._rpu_siglip_graph_cache.capture(_sig):
-            out = torch.ops.rpu.siglip_forward_multi(h, imgs, k_caches, v_caches)
+            out = torch.ops.rpu.siglip_forward_multi(
+                h, imgs, k_caches, v_caches, planned_stage_descriptor)
     else:
-        out = torch.ops.rpu.siglip_forward_multi(h, imgs, k_caches, v_caches)
+        out = torch.ops.rpu.siglip_forward_multi(
+            h, imgs, k_caches, v_caches, planned_stage_descriptor)
 
     # Subsystem boundary — MUST stay OUTSIDE the capture scope (graph-aware
     # spm_alloc_reset_temporary marks the graph non-replayable). Mirrors

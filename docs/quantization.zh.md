@@ -3,7 +3,7 @@
 简体中文 | [English](quantization.md)
 
 RhinoForge 为部分模型家族提供离线 checkpoint converter。量化支持按配置判定：转换后
-checkpoint 不继承其 FP16 来源或其他尺寸的状态。使用前检查[模型支持](model_support.zh.md)
+checkpoint 不继承其 FP16 来源或其他尺寸的状态。使用前检查[示例](model_support.zh.md)
 和 release 的[模型资产](model_assets.zh.md)。
 
 所有 converter 读取 source checkpoint 并创建新 destination；已有 destination 会拒绝，
@@ -45,13 +45,40 @@ Verifier 检查 method、INT8/scale tensor 配对和代表性 dequantized weight
 21 个样本、minimum weight cosine `0.999`；这些是 converter 检查，不是模型 acceptance。
 用 `--max-samples`、`--min-cosine` 设置 release procedure 值，再运行端到端验证。
 
+## Qwen3 显式安装 W4/G32
+
+公共 CausalLM loader 的 `quantization="w4a16"` 对精确 dense 0.6B、1.7B、4B、
+8B、14B、32B 的七类 decoder 投影做一次安装期 W4/G32 转换；
+`quantization="w4a16_lm_head"` 还转换 head。输入必须是原始浮点 checkpoint，
+不是 AWQ/GPTQ 或离线 W8 产物。embedding、norm 和 activation 保持 FP16。
+此入口固定 TP8、batch=1；`prefill.linear_acc32=false/true` 分别选择 ACC16/ACC32。
+普通 FP16 入口的准入不会因此扩大，模板和转换也不等同于质量认证。
+参见 [Qwen3 配置](../examples/configs/qwen3/README.md)。
+
+## Qwen3-VL
+
+2B/4B/8B 的离线转换入口为 `python -m rpu_backend.quant.convert_qwen3_vl`。
+`--bits 8` 从公开 FP16 权重生成 W8A16。使用 `awq_w4.toml` 时，
+`--bits 4` 的输入应为 symmetric G32 compressed-tensors AWQ：保留 Text AWQ，
+LM head 转为 RTN W4，Vision 为 W8。转换器也接受精确匹配的公开 2B/4B/8B FP16
+配置配合 `--bits 4`，但生成的是 Text/LM head RTN W4，不是 AWQ；两种 recipe 的
+元数据不同。输入格式不匹配时会提前拒绝。
+
+```sh
+python -m rpu_backend.quant.convert_qwen3_vl --bits 8 --src SOURCE_DIR --dst W8_DIR
+python -m rpu_backend.quant.convert_qwen3_vl --bits 4 --src AWQ_DIR --dst W4_DIR
+```
+
+加载转换目录时不需要额外的精度环境变量。原始 AWQ 与转换输出目录是不同资产。
+
 ## Pi0.5
 
 默认 Pi0.5 转换把 VLM decoder 和 action-expert decoder projection 转为 W8A16。Vision
 encoder、AdaRMS dense、action projection 和 processor sidecar 保持 FP16 或不变。
 
-Pi0.5 W8A16 和 W4A16 输出在 v1.0.0 中均为 Source-only：发布版本未为它们
-绑定公开不可变派生 checkpoint 身份或 hash。
+Pi0.5 W8A16 和 mixed W4A16-G32-KV8 输出在 v1.0.0 中均为 Source-only：
+发布版本未为它们绑定公开不可变派生 checkpoint 身份或 hash；精确同量化 oracle
+与 checkpoint 自有任务证据也仍待完成。
 
 ```bash
 python -m rpu_backend.quant.convert_pi05 \
@@ -68,17 +95,37 @@ python -m rpu_backend.quant.convert_pi05 \
   --dst /path/to/pi05-fake-W4 \
   --fake-w4
 
-# Runtime packed W4 评估格式。
+# Runtime mixed W4A16-G32-KV8 评估格式（不是纯 W4）。
 python -m rpu_backend.quant.convert_pi05 \
   --src /path/to/pi05-source \
-  --dst /path/to/pi05-W4A16 \
+  --dst /path/to/pi05-mixed-W4A16-G32-KV8 \
   --fake-w4 --real-w4
 ```
 
-`--keep-int8` 接受逗号分隔 projection name，用于受控 W4 mixed-precision 实验。Real
-W4 自动让 key/value projection 保持 INT8。两种 W4 都是 Source-only 评估路径，
-提升前需有独立不可变资产身份和验证。Converter 会删除旧 remapped checkpoint，
-让 loader 从新量化 tensor 重建。
+该 runtime profile 是 mixed W4A16-G32-KV8，并非纯 W4。仅量化声明的 Gemma
+VLM/action-expert Linear projection 权重：q/o/gate/up/down 沿 K 使用 symmetric
+W4 group-size-32，K/V projection 权重保持 W8；activation 与 KV cache 均保持
+FP16。Checkpoint 中逻辑 FP16 scale shape 为 `[K/32, N]`，加载时再转成 packed
+pgrp ABI 的 controller-striped 布局。SigLIP、AdaRMS dense、action projection
+和 processor sidecar 保持 FP16 或不变。
+
+`--keep-int8` 接受逗号分隔 projection name，用于受控 W4 mixed-precision 实验。
+`--real-w4` 是该 mixed profile 的遗留 CLI 名称，会自动让 K/V projection 权重
+保持 W8。两种 W4 都是 Source-only 评估路径；提升前需有独立不可变资产身份、
+精确同量化 oracle 与 checkpoint 自有任务证据。Converter 会删除旧 remapped
+checkpoint，让 loader 从新量化 tensor 重建。
+
+### Action NVFP4 优化格式
+
+```sh
+python -m rpu_backend.quant.convert_pi05 --src SOURCE_DIR --dst NVFP4_DIR --action-w4 --action-w4-format nvfp4
+```
+
+`--action-w4` 默认使用 NVFP4 `striped_v2` ABI、block16；Action Q/O/Gate/Up/Down
+使用 NVFP4，K/V 和 VLM 保持 W8。元数据写入 `rpu_quant_config.json`。
+这是 `optimized_profile.precision=w8_action_nvfp4` 的输入格式；两相机或三相机的
+`w8_prefill_a8_action_nvfp4` 在安装时另选 Prefill GateUp A8。
+它与上述 `--real-w4` INT4 G32/KV8 格式不可互换。
 
 ## Wall-OSS
 
@@ -153,4 +200,5 @@ metadata 或重命名 scale tensor。
 7. 验证 warmup 和 Graph lifecycle；
 8. 在新进程运行公开 E2E TOML example。
 
-量化结果在[模型支持](model_support.zh.md)单独成行。Weight cosine 通过不等于 E2E 支持。
+量化结果应与浮点来源分别记录，并注明精确 checkpoint 和执行配置。
+[示例](model_support.zh.md)存在或 weight cosine 通过均不等于 E2E 支持。

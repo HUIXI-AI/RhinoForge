@@ -8,7 +8,7 @@ from pathlib import Path
 import tomllib
 
 
-DEFAULT_CONFIG = Path(__file__).with_name("configs") / "siglip.toml"
+DEFAULT_CONFIG = Path(__file__).with_name("configs") / "siglip/pi05_component/fp16.toml"
 
 
 def load_config(path: Path) -> dict:

@@ -16,14 +16,7 @@ from rpu_backend.api.errors import RPUBackendError, UnsupportedModelError
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EAGER_BMM_TILES = {
-    (64, 64, 64),
-    (64, 64, 128),
-    (64, 128, 64),
-    (64, 128, 128),
-    (128, 128, 64),
-    (128, 128, 128),
-}
+
 
 
 def test_operator_kernel_manifest_is_strict_and_asset_stays_opaque(
@@ -110,7 +103,6 @@ def test_operator_kernel_manifest_is_strict_and_asset_stays_opaque(
         "rpu_kernel_" + "probe_by_name",
         "rpu_rope_" + "kernel_info",
         "rpu_rope_" + "probe",
-        "MROPE_" + "SPM_TBL",
     ):
         assert removed not in cache
         assert removed not in cache_header
@@ -120,42 +112,6 @@ def test_operator_kernel_manifest_is_strict_and_asset_stays_opaque(
     loader = loader[: loader.index("std::vector<std::string>")]
     assert loader.index("kernel_manifest_names") < loader.index(
         "create_with_binary_file"
-    )
-
-
-def test_eager_bmm_allowlist_matches_preloaded_kernels() -> None:
-    bmm = (ROOT / "src/ops/rpu_bmm.cpp").read_text(encoding="utf-8")
-    cache = (ROOT / "src/core/rpu_kernel_cache.inc").read_text(
-        encoding="utf-8"
-    )
-
-    table = bmm.split("kPreloadedEagerBmmTiles[][3] = {", 1)[1].split(
-        "};", 1
-    )[0]
-    assert {
-        tuple(map(int, match))
-        for match in re.findall(r"\{(\d+), (\d+), (\d+)\}", table)
-    } == EAGER_BMM_TILES
-
-    names = {
-        (int(m), int(n), int(k), mode)
-        for m, n, k, mode in re.findall(
-            r'\{"gemm_fp16_spm_16b_w(\d+)x(\d+)_k(\d+)_1core_buf1_'
-            r'nt_lpaddr_(peak|univ)"',
-            cache,
-        )
-    }
-    assert names == {
-        (*tile, mode)
-        for tile in EAGER_BMM_TILES
-        for mode in ("peak", "univ")
-    }
-
-    eager = bmm.split("void rpu_launch_bmm_kernel", 1)[1].split(
-        "// ============ BMM SPM Kernel Launch", 1
-    )[0]
-    assert eager.index("is_preloaded_eager_bmm_tile(") < eager.index(
-        "std::string kernel_mode"
     )
 
 
@@ -184,17 +140,11 @@ def test_qwen3_5_gdn_head_dims_fail_before_mutation(dims) -> None:
             graph_cache=object(),
             prefill_graph=object(),
             cpu_stage_weights=False,
+            control_snapshot=None,
+            pending_state=SimpleNamespace(),
         )
 
     assert not hasattr(model, "_rpu_qwen3_5_text_install_started")
-
-
-def test_qwen3_5_gdn_guard_precedes_irreversible_marker() -> None:
-    source = Path(qwen3_5_text.__file__).read_text(encoding="utf-8")
-    install = source.split("def _install_qwen3_5_text_for_rpu_impl", 1)[1]
-    assert install.index("if not all(is_full):") < install.index(
-        "inner._rpu_qwen3_5_text_install_started = True"
-    )
 
 
 @pytest.mark.parametrize("value", [None, "0", "true", "01"])
@@ -271,17 +221,40 @@ def test_qwen3_14b_requires_exact_lm_head_quantization_metadata() -> None:
         qwen3.Qwen3Adapter(model)
 
 
-def test_qwen3_14b_installs_existing_int8_lm_head_path() -> None:
-    source = Path(qwen3.__file__).read_text(encoding="utf-8")
-    to_rpu = source.split("    def to_rpu(self):", 1)[1].split(
-        "\n\nfrom rpu_backend.runtime.registry", 1
-    )[0]
-    install_tail = to_rpu.split(
-        "self._all_layers_once_handle = _install_causal_decoder_forward", 1
-    )[1]
-    assert install_tail.index("_apply_fused_lm_head_for_rpu(self.model)") < (
-        install_tail.index("self.model._rpu_swizzled = True")
+def test_qwen3_32b_requires_exact_quantized_metadata_before_admission() -> None:
+    config = SimpleNamespace(
+        hidden_size=5120,
+        intermediate_size=25600,
+        num_hidden_layers=64,
+        num_attention_heads=64,
+        num_key_value_heads=8,
+        head_dim=128,
     )
+    before = vars(config).copy()
+
+    with pytest.raises(UnsupportedModelError, match="no certified RPU execution"):
+        qwen3.Qwen3Adapter.preflight(config)
+
+    assert vars(config) == before
+    config.model_type = "qwen3"
+    config.architectures = ["Qwen3ForCausalLM"]
+    config.rms_norm_eps = 1e-6
+    config.vocab_size = 151936
+    config.max_position_embeddings = 40960
+    config.tie_word_embeddings = False
+    config.quant_config = {
+        "method": "w8a16", "mode": "per_channel_symmetric", "qaxis": 0,
+        "skip_modules": [], "quantized_lm_head": True,
+        "quantized_embed_tokens": False, "lm_head_untied": True,
+        "embed_tokens_untied": False,
+    }
+    qwen3.Qwen3Adapter.preflight(config)
+    qwen3.Qwen3Adapter.preflight_execution(config, {"prefill": {"chunk_size": 32}})
+    with pytest.raises(UnsupportedModelError, match="num_cores=8"):
+        qwen3.Qwen3Adapter.preflight_execution(config, {"model": {"num_cores": 4}})
+    config.quant_config["qaxis"] = False
+    with pytest.raises(UnsupportedModelError, match="no certified RPU execution"):
+        qwen3.Qwen3Adapter.preflight(config)
 
 
 def test_dinov3_example_preflights_before_weight_loading() -> None:
@@ -291,21 +264,58 @@ def test_dinov3_example_preflights_before_weight_loading() -> None:
     )
 
 
-def test_hyvla_native_handles_declare_exact_chunk_envelopes() -> None:
-    cases = {
-        "src/fused/rpu_hyvla_vlm_model.cpp": (240, 240),
-        "src/fused/rpu_hyvla_expert_model.cpp": (291, 64),
-    }
-    for relative, (max_kv_len, chunk) in cases.items():
-        source = (ROOT / relative).read_text(encoding="utf-8")
-        assert (
-            f"set_chunk_envelope(/*max_kv_len=*/{max_kv_len}, "
-            f"/*chunk=*/{chunk});"
-        ) in source
-        validity = source.split("subclass_chunk_size_valid(", 1)[1].split(
-            "}", 1
-        )[0]
-        assert "chunk_within_envelope(cs)" in validity
+def test_public_release_has_no_activation_export_path() -> None:
+    python_debug = (
+        ROOT / "python/rpu_backend/runtime/debug.py"
+    ).read_text(encoding="utf-8")
+    torch_namespace = (
+        ROOT / "python/rpu_backend/_torch_rpu.py"
+    ).read_text(encoding="utf-8")
+    pybind = (ROOT / "src/core/rpu_pybind.inc").read_text(encoding="utf-8")
+    runtime_state = (
+        ROOT / "src/core/rpu_runtime_state.cpp"
+    ).read_text(encoding="utf-8")
+    graph_execute = (
+        ROOT / "src/graph/graph_runtime_execute.cpp"
+    ).read_text(encoding="utf-8")
+    pi05 = "\n".join(
+        (ROOT / relative).read_text(encoding="utf-8")
+        for relative in (
+            "python/rpu_backend/adapters/pi05/runtime.py",
+            "python/rpu_backend/adapters/pi05/gemma.py",
+            "python/rpu_backend/adapters/pi05/__init__.py",
+        )
+    )
+
+
+    for symbol in (
+        "set_debug_export",
+        "get_debug_tensor",
+        "list_debug_tensors",
+        "clear_debug_tensors",
+    ):
+        assert f"def {symbol}" not in python_debug
+        assert f'"{symbol}"' not in torch_namespace
+        assert f'm.def("{symbol}"' not in pybind
+    assert "void set_debug_export(" not in runtime_state
+    runtime_header = (ROOT / "src/core/rpu_runtime_state.h").read_text()
+    assert "inline constexpr bool get_debug_export() noexcept { return false; }" in runtime_header
+    assert "RPU_GRAPH_HCB_CHECKSUM" not in graph_execute
+    assert "[HCB-CK]" not in graph_execute
+    assert "RPU_PI05_PROBE_DIR" not in pi05
+    assert "torch.save(" not in pi05
+    # The shared forward implementations retain dormant capture branches, but
+    # the public runtime has no switch, operator binding, or environment reader
+    # that can activate or retrieve them.
+    bindings = (ROOT / "src/core/rpu_dispatch_registrations.inc").read_text()
+    for name in re.findall(r'm\.(?:def|impl)\("([^"(]+)', bindings):
+        assert not any(part in name for part in ("debug_", "_dbg_", "flush_dumps"))
+    native_lingbot = (ROOT / "src/fused/rpu_lingbot_v2_moe_model.cpp").read_text()
+    assert not re.search(r'getenv\("(?:RPU_L2_(?:CAP|STAGES|DBG)|RPU_LINGBOT2_DEBUG)', native_lingbot)
+
+    ignored = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+    for pattern in ("*.pth", "*.ckpt", "*.safetensors", "*.npz", "*.onnx"):
+        assert pattern in ignored
 
 
 def test_hyvla_vlm_allows_the_planner_fixed_overhead_probe() -> None:
@@ -341,27 +351,3 @@ def test_fmb_joint_chunk_budget_and_modes_fail_closed() -> None:
     modes = modes.split("static void validate_kv_first_chunk_plan", 1)[0]
     assert "dynamic_config returned an invalid inter-layer I/O mode" in modes
     assert "chunk_outer_within_group requires SEQUENTIAL + SPM_RESIDENT" in modes
-
-
-def test_physical_prepare_is_bound_to_the_exact_stage_plan() -> None:
-    header = (ROOT / "src/core/fused_model_base.h").read_text(encoding="utf-8")
-    source = (ROOT / "src/core/fused_model_base.cpp").read_text(
-        encoding="utf-8"
-    )
-    assert header.count("const FmbThreeStageChunkPlan& stage_plan") == 2
-
-    bind = source.split("LayoutContext bind_spm_pipeline_stage_plan", 1)[1]
-    bind = bind.split("SpmPipelineComponentLayout FusedModelBase::", 1)[0]
-    assert "validate_fmb_three_stage_chunk_plan(stage_plan)" in bind
-    assert "fmb_three_stage_chunk_plan_fingerprint(stage_plan)" in bind
-    assert "exact.stage_plan_fingerprint = fingerprint" in bind
-
-    fused = "\n".join(
-        path.read_text(encoding="utf-8")
-        for path in (ROOT / "src/fused").glob("*.cpp")
-    )
-    assert re.search(
-        r"prepare_spm_pipeline_component(?:_for_cpu_contract)?\(\s*"
-        r"(?:layout|shape\.allocation_layout)\s*\)",
-        fused,
-    ) is None

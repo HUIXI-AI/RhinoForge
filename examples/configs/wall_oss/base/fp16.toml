@@ -1,0 +1,26 @@
+# Public configuration; provide your own checkpoint and input assets.
+
+[example]
+profile_id = "wall-oss-0.5.fp16.vla"
+registry_alias = "wall-oss-0.5"
+target = "wall_oss"
+dtype = "fp16"
+
+[example.opt_in]
+
+[input]
+images = ["assets/example.ppm", "assets/example.ppm", "assets/example.ppm"]
+instruction = "Move the object to the target."
+proprioception = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+state_mask = [1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+camera_names = ["face_view", "left_wrist_view", "right_wrist_view"]
+noise_seed = 0
+
+[run]
+warmup = 1
+runs = 3
+hwperf = false
+profile = false
+seed = 0
+
+[rpu_execution]

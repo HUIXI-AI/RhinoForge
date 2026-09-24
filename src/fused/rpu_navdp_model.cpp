@@ -14,10 +14,11 @@
 // Design/reuse: mirrors src/fused/rpu_gr00t_dit_model.cpp (build_self_attn_block /
 //   build_cross_attn_block / finish_attn_and_ffn), swapping AdaLN -> plain affine LayerNorm
 //   (learnable gamma/beta per norm) and adding a per-layer THREE-subblock structure.
-// Validation boundary: this public source-only profile is not a support claim. Native handle creation
+// Validation boundary: full-hidden metrics are record-only; the exact profile is admitted by
+// its final-action, action-MAE, performance, and Graph lifecycle gates.  Native handle creation
 // requires the controlled numeric-blocked evaluation selector before creating a handle.
 //
-// set_weights ends with invalidate_model_state().
+// set_weights ENDS with invalidate_model_state() (D-503).
 
 #include "fused_model_base.h"
 #include "model_handle_registry.h"
@@ -25,10 +26,10 @@
 #include "rpu_helpers.h"
 #include <ATen/ATen.h>
 #include <c10/util/Half.h>
+#include <c10/util/ScopeExit.h>
 #include <algorithm>
 #include <cstdint>
 #include <cmath>
-#include <cstdlib>
 #include <vector>
 
 using namespace at;
@@ -39,16 +40,41 @@ using namespace ::rhino_lkn;
 
 namespace v3 {
 
+// NAVDP_FIXED_KERNEL_BASIS: non-manifest launchers implement fixed NavDP
+// normalization/activation, trajectory glue, or BufferDecl transport. They have
+// no runtime candidate; alternatives must first become typed manifest routes.
+
 namespace {
 
-bool navdp_spm_kv_by_mha_enabled() {
-    const char* value = std::getenv("RPU_NAVDP_SPM_KV_BY_MHA");
-    if (value == nullptr) return true;
-    TORCH_CHECK(
-        (value[0] == '0' || value[0] == '1') && value[1] == '\0',
-        "RPU_NAVDP_SPM_KV_BY_MHA accepts only 0 or 1, got ", value);
-    return value[0] == '1';
-}
+constexpr int64_t kNavdpSelfKvSite = 5578031918666539451LL;
+constexpr int64_t kNavdpCrossKvSite = 5028686091549759246LL;
+constexpr int64_t kNavdpSelfAttentionDdrSite = 5266334158747974487LL;
+constexpr int64_t kNavdpSelfAttentionSpmSite = 7913923308750549684LL;
+constexpr int64_t kNavdpCrossAttentionDdrSite = 4550112057379938325LL;
+constexpr int64_t kNavdpCrossAttentionMemoryPrefixDdrRequired = 1LL << 8;
+constexpr int64_t kNavdpLoopPreloadDmaSite = 5843232389164851264LL;
+constexpr int64_t kNavdpLoopInitialStateDmaSite = 2768844808659448183LL;
+constexpr int64_t kNavdpLoopInputLinearSite = 8311979808409279276LL;
+constexpr int64_t kNavdpLoopMemoryDmaSite = 2471321219266394663LL;
+constexpr int64_t kNavdpLoopOutputLinearSite = 5717796996455384990LL;
+constexpr int64_t kNavdpLoopNoiseDmaSite = 1326351836944110747LL;
+constexpr int64_t kNavdpLoopOutputDmaSite = 2600646422303964861LL;
+constexpr int64_t kNavdpMemoryDmaSite = 2072388790201406506LL;
+constexpr int64_t kNavdpSelfAllReduceSite = 2412992928182911522LL;
+constexpr int64_t kNavdpFormerCrossAllReduceSite = 985603305552088294LL;
+constexpr int64_t kNavdpCrossAllReduceSite = 81349817211229034LL;
+constexpr int64_t kNavdpFormerFfAllReduceSite = 2628574193033020498LL;
+constexpr int64_t kNavdpFfAllReduceSite = 8341276851067680877LL;
+constexpr int64_t kNavdpProjectionLinearSite = 7289281567548044119LL;
+constexpr int64_t kNavdpExecutionScheduleSite = 8388526521297846072LL;
+constexpr int64_t kNavdpFormerScheduleSite = 1364822026573774829LL;
+constexpr uint32_t kNavdpKvCapabilities =
+    KV_INSERT_CAP_V2 | KV_INSERT_CAP_V16;
+
+enum class NavdpDmaRoute : int64_t {
+    DDR_TO_SPM = 1,
+    SPM_TO_DDR = 2,
+};
 
 }  // namespace
 
@@ -238,7 +264,7 @@ public:
         set_model_params(num_heads, num_heads, head_dim, hidden_size, ff_inter);
         set_num_layers(N);
         weights_set_ = true;
-        invalidate_model_state();
+        invalidate_model_state();  // D-503
     }
 
     // memory[memory_len, hidden] held per-forward (cross-attn K/V source, broadcast to SPM once).
@@ -247,7 +273,8 @@ public:
         const at::Tensor& memory,            // [memory_len, hidden]
         std::vector<at::Tensor>& k_caches,
         std::vector<at::Tensor>& v_caches,
-        const std::optional<at::Tensor>& causal_mask)
+        const std::optional<at::Tensor>& causal_mask,
+        at::IntArrayRef planned_stage_descriptor = {})
     {
         TORCH_CHECK(weights_set_, "navdp forward: weights are not installed");
         TORCH_CHECK(execution_mode_ != ExecutionMode::Denoise,
@@ -275,13 +302,95 @@ public:
         const std::vector<ChunkInfo> input_chunks{
             {0, 0, predict_size_, predict_size_}};
         const std::vector<FmbExecutionSpan> spans{{0, predict_size_}};
-        auto out = run_all_layers(
-            tgt, k_caches, v_caches, std::nullopt,
-            /*position=*/0, /*is_causal=*/true, input_chunks, spans);
+        auto out = planned_stage_descriptor.empty()
+            ? run_all_layers(
+                  tgt, k_caches, v_caches, std::nullopt,
+                  /*position=*/0, /*is_causal=*/!former_mode_,
+                  input_chunks, spans)
+            : run_all_layers(
+                  tgt, k_caches, v_caches, std::nullopt,
+                  /*position=*/0, /*is_causal=*/!former_mode_,
+                  /*planned_chunk_size=*/0, planned_stage_descriptor);
         return out;
     }
 
+    void validate_execution_admission(
+        int64_t packed_rows, int64_t denoise_steps) const {
+
+        TORCH_CHECK(weights_set_,
+                    "navdp_resolve_stage_domain: weights are not installed");
+        TORCH_CHECK(
+            packed_rows > 0 && packed_rows % predict_size_ == 0,
+            "navdp_resolve_stage_domain: packed_rows must be a positive "
+            "multiple of predict_size=", predict_size_, ", got ", packed_rows);
+        const int64_t requested_batch = packed_rows / predict_size_;
+        const bool denoise_loop = denoise_steps != 0;
+        TORCH_CHECK(
+            denoise_loop ? denoise_steps == kDenoiseSteps : requested_batch == 1,
+            "navdp_resolve_stage_domain: ordinary forward requires one "
+            "trajectory and denoise requires exactly ", kDenoiseSteps,
+            " steps");
+        TORCH_CHECK(
+            former_mode_ ? !denoise_loop : requested_batch <= 4,
+            "navdp_resolve_stage_domain: unsupported trajectory batch ",
+            requested_batch, former_mode_ ? " for Former" : " for NavDP");
+        TORCH_CHECK(
+            !(denoise_loop && execution_mode_ == ExecutionMode::Forward) &&
+                !(!denoise_loop && execution_mode_ == ExecutionMode::Denoise),
+            "navdp_resolve_stage_domain: requested lifecycle conflicts with "
+            "the handle's latched execution mode");
+        if (execution_mode_ == ExecutionMode::Denoise) {
+            TORCH_CHECK(
+                batch_ == requested_batch,
+                "navdp_resolve_stage_domain: denoise batch differs from the "
+                "latched handle batch");
+        }
+    }
+
+    std::vector<int64_t> resolve_stage_domain(
+        int64_t packed_rows, int64_t denoise_steps) {
+        validate_execution_admission(packed_rows, denoise_steps);
+        const int64_t requested_batch = packed_rows / predict_size_;
+        const bool denoise_loop = denoise_steps != 0;
+        const int64_t saved_batch = batch_;
+        const bool saved_loop_mode = loop_mode_;
+        const int64_t saved_num_steps = num_steps_;
+        const int64_t saved_override = get_chunk_size_override();
+        auto restore = c10::make_scope_exit([&] {
+            batch_ = saved_batch;
+            loop_mode_ = saved_loop_mode;
+            num_steps_ = saved_num_steps;
+            set_chunk_size_override(saved_override);
+        });
+        batch_ = requested_batch;
+        loop_mode_ = denoise_loop;
+        num_steps_ = denoise_loop ? denoise_steps : 1;
+        set_chunk_size_override(0);
+
+        const std::vector<ChunkInfo> input_chunks{
+            {0, 0, packed_rows, packed_rows}};
+        std::vector<FmbExecutionSpan> spans;
+        spans.reserve(requested_batch);
+        for (int64_t stream = 0; stream < requested_batch; ++stream) {
+            spans.push_back(
+                {stream * predict_size_, predict_size_, stream});
+        }
+        const FmbStageBoundaryPolicies boundary_policies{};
+        return encode_fmb_prefill_stage_domain(
+            resolve_prefill_stage_domain_for_shape(
+                packed_rows, /*position=*/0,
+                /*attention_mask=*/std::nullopt,
+                /*is_causal=*/!former_mode_, input_chunks, spans,
+                boundary_policies));
+    }
+
 protected:
+    KvCostLayoutScope capture_kvinsert_cost_layout_scope() override {
+        return capture_kvinsert_cost_layout_fields(
+            batch_, loop_mode_,
+            num_steps_);
+    }
+
     ModelStaticConfig static_config() override {
         ModelStaticConfig cfg;
         cfg.num_layers = num_layers();
@@ -323,6 +432,193 @@ protected:
             ? AttentionExecutionPolicy::AUTO
             : AttentionExecutionPolicy::DDR_KV;
         return cfg;
+    }
+
+    FmbPhysicalExecutionManifest physical_manifest_for_candidate(
+        const FmbThreeStageChunkPlan& plan,
+        const LayoutContext& layout,
+        int64_t physical_len, int64_t logical_len,
+        int64_t position) const override {
+        TORCH_CHECK(
+            position == 0 && plan.compute.chunks.size() == 1,
+            "NavDP COMPLETE descriptor requires one position-zero chunk");
+        FmbPhysicalExecutionManifest manifest;
+        manifest.state = FmbPhysicalManifestState::COMPLETE;
+        manifest.logical_length = logical_len;
+        manifest.physical_length = physical_len;
+        manifest.execution_padding_rows = physical_len - logical_len;
+        manifest.kv_logical_length = std::max(logical_len, memory_len_);
+        manifest.kv_insert_physical_rows =
+            std::max(physical_len, memory_len_);
+        manifest.graph_lifecycle = FmbGraphLifecycle::COMPOSITE_CHILD;
+        manifest.linear_accumulation = FmbLinearAccumulationPolicy::ACC16;
+
+        const int64_t invocation = plan.compute.chunks.front().idx;
+        const auto append = [&manifest, invocation](
+                                FmbRouteFamily family, int64_t site_id,
+                                int64_t selector, int64_t flags = 0,
+                                std::vector<int64_t> arguments = {},
+                                std::optional<int64_t> route_invocation =
+                                    std::nullopt) {
+            manifest.routes.push_back(
+                {site_id, family, selector, flags, std::move(arguments),
+                 route_invocation.value_or(invocation)});
+        };
+        const auto append_linear = [&append](int64_t site_id) {
+            append(FmbRouteFamily::LINEAR, site_id,
+                   static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE));
+        };
+        const auto append_dma = [&append](
+                                    int64_t site_id, NavdpDmaRoute route,
+                                    std::vector<int64_t> arguments = {},
+                                    std::optional<int64_t> route_invocation =
+                                        std::nullopt) {
+            append(FmbRouteFamily::MUTABLE_DMA, site_id,
+                   static_cast<int64_t>(route), /*flags=*/0,
+                   std::move(arguments), route_invocation);
+        };
+        const int64_t body_iterations = loop_mode_ ? num_steps_ : 1;
+        append(
+            FmbRouteFamily::GRAPH_SCHEDULE, kNavdpExecutionScheduleSite,
+            loop_mode_ ? 2 : 1, /*flags=*/0,
+            {loop_mode_ ? 1 : 0, num_steps_, batch_, body_iterations});
+        append(
+            FmbRouteFamily::GRAPH_SCHEDULE, kNavdpFormerScheduleSite,
+            former_mode_ ? 2 : 1, /*flags=*/0,
+            {former_mode_ ? 1 : 0,
+             former_mode_ ? 0 : 1,  // non-causal / causal
+             former_mode_ ? 1 : 0,  // post-LN / pre-LN
+             former_mode_ ? 1 : 0});  // ReLU / GELU
+
+        // Site 1 is trajectory-local self attention.  Its exact NavDP profile
+        // can consume raw SPM K/V; Former and disabled-policy handles remain
+        // DDR.  Site 2 is prefix/memory cross attention and is DDR_REQUIRED:
+        // the existing ABI takes RPUCache tensors and has no raw-residency port.
+        const AttentionExecutionPolicy self_policy =
+            !former_mode_ && spm_kv_by_mha_enabled_ &&
+                layout.attention_policy ==
+                    AttentionExecutionPolicy::SPM_KV_BY_MHA
+            ? AttentionExecutionPolicy::SPM_KV_BY_MHA
+            : AttentionExecutionPolicy::DDR_KV;
+        append(
+            FmbRouteFamily::ATTENTION,
+            self_policy == AttentionExecutionPolicy::SPM_KV_BY_MHA
+                ? kNavdpSelfAttentionSpmSite
+                : kNavdpSelfAttentionDdrSite,
+            static_cast<int64_t>(self_policy),
+            /*flags=*/former_mode_ ? 0 : 1,
+            {batch_, predict_size_, physical_len});
+        append(
+            FmbRouteFamily::ATTENTION, kNavdpCrossAttentionDdrSite,
+            static_cast<int64_t>(AttentionExecutionPolicy::DDR_KV),
+            kNavdpCrossAttentionMemoryPrefixDdrRequired,
+            {batch_, predict_size_, memory_len_});
+        // Self keeps a DDR mirror even when attention consumes raw SPM K/V;
+        // cross has no raw-residency route in the current launcher ABI.
+        const KvInsertSegmentPlan self_kv_plan =
+            resolve_kvinsert_plan_auto(
+                kNavdpSelfKvSite, manifest.graph_lifecycle,
+                /*position=*/0, predict_size_, predict_size_, NUM_CORES,
+                num_kv_heads(), head_dim(), kNavdpKvCapabilities);
+        const KvInsertRouteArguments self_kv_arguments =
+            rpu_kvinsert_route_arguments(
+                self_kv_plan, NUM_CORES, num_kv_heads(), head_dim());
+        append(
+            FmbRouteFamily::KV_INSERT, kNavdpSelfKvSite,
+            static_cast<int64_t>(self_kv_plan.route()), /*flags=*/0,
+            std::vector<int64_t>(self_kv_arguments.begin(),
+                                 self_kv_arguments.end()));
+        const KvInsertSegmentPlan cross_kv_plan =
+            resolve_kvinsert_plan_auto(
+                kNavdpCrossKvSite, manifest.graph_lifecycle,
+                /*position=*/0, memory_len_, memory_len_, NUM_CORES,
+                num_kv_heads(), head_dim(), kNavdpKvCapabilities);
+        const KvInsertRouteArguments cross_kv_arguments =
+            rpu_kvinsert_route_arguments(
+                cross_kv_plan, NUM_CORES, num_kv_heads(), head_dim());
+        append(
+            FmbRouteFamily::KV_INSERT, kNavdpCrossKvSite,
+            static_cast<int64_t>(cross_kv_plan.route()), /*flags=*/0,
+            std::vector<int64_t>(cross_kv_arguments.begin(),
+                                 cross_kv_arguments.end()));
+
+        append_linear(kNavdpProjectionLinearSite);
+        append(
+            FmbRouteFamily::ALL_REDUCE, kNavdpSelfAllReduceSite,
+            fmb_ring_all_reduce_route_selector(physical_len, hidden_size()));
+        append(
+            FmbRouteFamily::ALL_REDUCE,
+            former_mode_ ? kNavdpFormerCrossAllReduceSite
+                         : kNavdpCrossAllReduceSite,
+            fmb_ring_all_reduce_route_selector(physical_len, hidden_size()));
+        append(
+            FmbRouteFamily::ALL_REDUCE,
+            former_mode_ ? kNavdpFormerFfAllReduceSite
+                         : kNavdpFfAllReduceSite,
+            fmb_ring_all_reduce_route_selector(physical_len, hidden_size()));
+
+        if (loop_mode_) {
+            const int64_t action_dim_padded =
+                ((action_dim_ + 15) / 16) * 16;
+            const int64_t preload_sizes[] = {
+                hidden_size(), action_dim_padded, hidden_size(),
+                hidden_size(), predict_size_ * hidden_size()};
+            for (int64_t i = 0; i < 5; ++i) {
+                append_dma(
+                    kNavdpLoopPreloadDmaSite, NavdpDmaRoute::DDR_TO_SPM,
+                    {num_steps_, preload_sizes[i]}, i);
+            }
+            append_dma(
+                kNavdpLoopInitialStateDmaSite, NavdpDmaRoute::DDR_TO_SPM,
+                {batch_, predict_size_, action_dim_padded});
+            append_linear(kNavdpLoopInputLinearSite);
+            append_dma(
+                kNavdpLoopMemoryDmaSite, NavdpDmaRoute::DDR_TO_SPM,
+                {num_steps_, memory_len_, hidden_size()});
+            append_linear(kNavdpLoopOutputLinearSite);
+            append_dma(
+                kNavdpLoopNoiseDmaSite, NavdpDmaRoute::DDR_TO_SPM,
+                {num_steps_, batch_, predict_size_, action_dim_padded});
+            append_dma(
+                kNavdpLoopOutputDmaSite, NavdpDmaRoute::SPM_TO_DDR,
+                {batch_, predict_size_, action_dim_padded});
+        } else {
+            append_dma(
+                kNavdpMemoryDmaSite, NavdpDmaRoute::DDR_TO_SPM,
+                {memory_len_, hidden_size()});
+        }
+        append_fmb_shared_runtime_routes(
+            manifest, plan, hidden_size(), FMB_SHARED_LAYER_INPUT_DMA);
+        return manifest;
+    }
+
+    std::vector<FmbPhysicalExecutionManifest>
+    physical_manifest_domain_for_candidate(
+        const FmbThreeStageChunkPlan& plan,
+        const LayoutContext& layout,
+        int64_t physical_len, int64_t logical_len,
+        int64_t position) const override {
+        LayoutContext ddr_layout = layout;
+        ddr_layout.attention_policy = AttentionExecutionPolicy::DDR_KV;
+        std::vector<FmbPhysicalExecutionManifest> domain{
+            physical_manifest_for_candidate(
+                plan, ddr_layout, physical_len, logical_len, position)};
+
+        LayoutContext raw_layout = layout;
+        raw_layout.attention_policy =
+            AttentionExecutionPolicy::SPM_KV_BY_MHA;
+        if (subclass_spm_kv_by_mha_eligible(
+                plan, raw_layout, position)) {
+            domain.push_back(physical_manifest_for_candidate(
+                plan, raw_layout, physical_len, logical_len, position));
+        }
+        return domain;
+    }
+
+    FmbPhysicalManifestForwardCapability
+    physical_manifest_forward_capability(
+        const FmbPhysicalExecutionManifest& /*manifest*/) const override {
+        return {true, FmbGraphLifecycle::COMPOSITE_CHILD};
     }
 
     int64_t subclass_layout_hash() const override {
@@ -373,7 +669,11 @@ protected:
             num_q_heads() == kNumHeads && num_kv_heads() == kNumHeads &&
             head_dim() == kHeadDim && intermediate_size() == kNavdpFf &&
             memory_len_ == kNavdpMemory && predict_size_ == kPredictSize &&
-            action_dim_ == kActionDim;
+            action_dim_ == kActionDim &&
+            sdpa_by_mha_spm_is_valid(
+                batch_, predict_size_, predict_size_,
+                num_q_heads(), num_kv_heads(), head_dim(), NUM_CORES,
+                /*MASK_LTM=*/1);
     }
 
     std::vector<BufferDecl> declare_buffers(const LayoutContext& ctx) override {
@@ -480,19 +780,28 @@ protected:
             v.push_back(BufferDecl{"x0_spm",   A(PS*AD*DWIDTH), 0,0, StorageClass::Temp,0,nullptr, ALL}); // DDPM x0
             v.push_back(BufferDecl{"sigz_spm", A(PS*AD*DWIDTH), 0,0, StorageClass::Temp,0,nullptr, ALL}); // per-iter sig*z
             // Preloaded glue constants (broadcast once at BUILD; preload_callback is a NAMED field).
-            auto add_pre = [&](const char* nm, int64_t nelem, at::Tensor NavdpModel::* f) {
+            auto add_pre = [&](const char* nm, int64_t nelem,
+                               at::Tensor NavdpModel::* f,
+                               int64_t route_invocation) {
                 BufferDecl d; d.name = nm; d.size = A(nelem*DWIDTH);
                 d.storage = StorageClass::Persistent; d.scope = ALL;
-                d.preload_callback = [this, f, nelem](FusedModelBase&, int, uint32_t a0) {
+                d.preload_callback = [this, f, nelem, route_invocation](
+                                         FusedModelBase&, int, uint32_t a0) {
+                    this->ctx().consume_physical_route(
+                        FmbRouteFamily::MUTABLE_DMA,
+                        kNavdpLoopPreloadDmaSite,
+                        static_cast<int64_t>(NavdpDmaRoute::DDR_TO_SPM),
+                        /*resolved_flags=*/0, {num_steps_, nelem},
+                        route_invocation);
                     rpu_launch_ddr_broadcast_spm_dma((this->*f).data_ptr<c10::Half>(), nelem, a0, NUM_CORES);
                 };
                 v.push_back(d);
             };
-            add_pre("ie_b_spm",   h,    &NavdpModel::ie_b_);
-            add_pre("ah_b_spm",   AD,   &NavdpModel::ah_b_);
-            add_pre("flnw_spm",   h,    &NavdpModel::fln_w_);
-            add_pre("flnb_spm",   h,    &NavdpModel::fln_b_);
-            add_pre("outpos_spm", predict_size_*h, &NavdpModel::out_pos_);  // [predict_size,h]; added per-traj block
+            add_pre("ie_b_spm", h, &NavdpModel::ie_b_, 0);
+            add_pre("ah_b_spm", AD, &NavdpModel::ah_b_, 1);
+            add_pre("flnw_spm", h, &NavdpModel::fln_w_, 2);
+            add_pre("flnb_spm", h, &NavdpModel::fln_b_, 3);
+            add_pre("outpos_spm", predict_size_*h, &NavdpModel::out_pos_, 4);  // [predict_size,h]; added per-traj block
         }
         return v;
     }
@@ -505,9 +814,18 @@ protected:
         // [A1] body_iter 0: load init noise x0 → na_spm (mutable). iters 1+: na_spm holds the
         // post-hook's result (persists in its LayerWide slot).
         if (i == 0) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::MUTABLE_DMA,
+                kNavdpLoopInitialStateDmaSite,
+                static_cast<int64_t>(NavdpDmaRoute::DDR_TO_SPM),
+                /*resolved_flags=*/0, {batch_, predict_size_, AD});
             rpu_launch_ddr_broadcast_spm_dma_mutable(&x0_src_base_, 0, PS*AD, addr(0,"na_spm"), NUM_CORES);
         }
         // [A2] input_embed: na_spm[PS,AD] → ae_spm[PS,H] (single-core, K=AD) + bias; add out_pos.
+        ctx().consume_physical_route(
+            FmbRouteFamily::LINEAR, kNavdpLoopInputLinearSite,
+            static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+            /*resolved_flags=*/0);
         rpu_launch_linear_spm_to_spm_acc16_kernel(addr(0,"na_spm"), ie_w_, addr(0,"ae_spm"),
             PS, h, AD, /*partition=*/1, /*num_cores=*/1, addr(0,"ie_b_spm"), at::Tensor());
         for (int64_t b = 0; b < batch_; ++b) {   // out_pos [PSc,h] added to each trajectory's ae block
@@ -516,6 +834,10 @@ protected:
                 PSc*h, ValuOpType::ADD, c10::Half(1.0), NUM_CORES);
         }
         // [A3] memory row i → "memory" SPM (mutable, per-iter offset).
+        ctx().consume_physical_route(
+            FmbRouteFamily::MUTABLE_DMA, kNavdpLoopMemoryDmaSite,
+            static_cast<int64_t>(NavdpDmaRoute::DDR_TO_SPM),
+            /*resolved_flags=*/0, {num_steps_, memory_len_, h});
         rpu_launch_ddr_broadcast_spm_dma_mutable(&mem_all_src_base_, i*S*h*DWIDTH, S*h, addr(0,"memory"), NUM_CORES);
         mem_loaded_this_forward_ = true;   // suppress the body's own memory broadcast
         // [A4] ae_spm → na_stage_ DDR (layer-0 reads it via FMB hidden_in_src_base_).
@@ -529,9 +851,13 @@ protected:
         const float* c = coeff_.data_ptr<float>() + i*4;
         const float A_=c[0], B_=c[1], C_=c[2], D_=c[3];
         // build_layer_subgraph left the final layer output in "residual".
-        // Final-LN → ln_spm.
+        // [Z1] final-LN → ln_spm.
         layernorm(addr(0,"residual"), addr(0,"ln_spm"), addr(0,"flnw_spm"), addr(0,"flnb_spm"), PS, h);
-        // action_head: ln_spm[PS,H] → eps_spm[PS,AD] (single-core, K=H) + bias.
+        // [Z2] action_head: ln_spm[PS,H] → eps_spm[PS,AD] (single-core, K=H) + bias.
+        ctx().consume_physical_route(
+            FmbRouteFamily::LINEAR, kNavdpLoopOutputLinearSite,
+            static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+            /*resolved_flags=*/0);
         rpu_launch_linear_spm_to_spm_acc16_kernel(addr(0,"ln_spm"), ah_w_, addr(0,"eps_spm"),
             PS, AD, h, /*partition=*/1, /*num_cores=*/1, addr(0,"ah_b_spm"), at::Tensor());
         // [Z3] DDPM affine: x0 = clip(A*na + B*eps, -1,1);  na = C*x0 + D*na;  na += sig*z (i<N-1).
@@ -550,12 +876,21 @@ protected:
         rpu_launch_eltwise_binary_scalar_spm_kernel(addr(0,"na_spm"), c10::Half(C_), addr(0,"na_spm"),
             PS*AD, ValuOpType::MUL);
         if (i < num_steps_ - 1) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::MUTABLE_DMA, kNavdpLoopNoiseDmaSite,
+                static_cast<int64_t>(NavdpDmaRoute::DDR_TO_SPM),
+                /*resolved_flags=*/0,
+                {num_steps_, batch_, predict_size_, AD});
             rpu_launch_ddr_broadcast_spm_dma_mutable(&sigz_src_base_, i*PS*AD*DWIDTH, PS*AD, addr(0,"sigz_spm"), NUM_CORES);
             rpu_launch_eltwise_binary_spm_kernel(addr(0,"na_spm"), addr(0,"sigz_spm"), addr(0,"na_spm"),
                 PS*AD, ValuOpType::ADD, c10::Half(1.0), NUM_CORES);
         }
         // [Z4] last iter: na_spm → out DDR.
         if (i == num_steps_ - 1) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::MUTABLE_DMA, kNavdpLoopOutputDmaSite,
+                static_cast<int64_t>(NavdpDmaRoute::SPM_TO_DDR),
+                /*resolved_flags=*/0, {batch_, predict_size_, AD});
             rpu_launch_spm_copy_ddr_dma_mutable(addr(0,"na_spm"), &out_dst_base_, 0, PS*AD);
         }
     }
@@ -579,12 +914,36 @@ protected:
                              ? seq / predict_size_ : 1;
         const int64_t PSb  = seq / B;
         const uint32_t qrow = static_cast<uint32_t>(PSb * local_qhd * DWIDTH);  // per-traj SPM row offset
+        const int64_t body_iterations = loop_mode_ ? num_steps_ : 1;
+
+        if (layer_idx == 0) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::GRAPH_SCHEDULE,
+                kNavdpExecutionScheduleSite, loop_mode_ ? 2 : 1,
+                /*resolved_flags=*/0,
+                {loop_mode_ ? 1 : 0, num_steps_, batch_, body_iterations},
+                chunk.idx);
+            ctx().consume_physical_route(
+                FmbRouteFamily::GRAPH_SCHEDULE,
+                kNavdpFormerScheduleSite, former_mode_ ? 2 : 1,
+                /*resolved_flags=*/0,
+                {former_mode_ ? 1 : 0,
+                 former_mode_ ? 0 : 1,
+                 former_mode_ ? 1 : 0,
+                 former_mode_ ? 1 : 0},
+                chunk.idx);
+        }
 
         // Broadcast memory to SPM once per forward (cross-attn K/V input). MUTABLE variant: src is
         // rewritten per graph-replay from mem_src_base_ (a DEVICE addr, set in forward) → restores
         // graph-replay perf. (The earlier "fixed + fresh cache per forward" workaround is retired now
         // that mem_src_base_ is the correct device address, not the raw data_ptr.)
         if (layer_idx == 0 && chunk.idx == 0 && !mem_loaded_this_forward_) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::MUTABLE_DMA, kNavdpMemoryDmaSite,
+                static_cast<int64_t>(NavdpDmaRoute::DDR_TO_SPM),
+                /*resolved_flags=*/0, {memory_len_, hidden_size()},
+                chunk.idx);
             rpu_launch_ddr_broadcast_spm_dma_mutable(
                 &mem_src_base_, /*src_offset_bytes=*/0, S * h, addr(0, "memory"), NUM_CORES);
             mem_loaded_this_forward_ = true;
@@ -606,14 +965,26 @@ protected:
         proj(sa_in, lw.sq_w, addr(0, "q"), seq, nq * hd, h, 1, layer_addr(layer_idx, 0, "sq_bias"));
         proj(sa_in, lw.sk_w, addr(0, "k"), seq, nq * hd, h, 1, layer_addr(layer_idx, 0, "sk_bias"));
         proj(sa_in, lw.sv_w, addr(0, "v"), seq, nq * hd, h, 1, layer_addr(layer_idx, 0, "sv_bias"));
+        const KvInsertSegmentPlan self_kv_plan = resolve_kv_insert_plan(
+            kNavdpSelfKvSite, /*position=*/0, PSb);
         for (int64_t b = 0; b < B; ++b) {   // always mirror K/V to DDR for fallback/debug parity
             auto kcb = kc.narrow(0, b, 1);
             auto vcb = vc.narrow(0, b, 1);
             const uint32_t o = static_cast<uint32_t>(b) * qrow;
-            rpu_launch_insert_kcache_spm_unified(kcb, 0, addr_offset("k").value + o, PSb, nq, hd, NUM_CORES);
-            rpu_launch_insert_vcache_spm_unified(vcb, 0, addr_offset("v").value + o, PSb, nq, hd, NUM_CORES);
+            rpu_launch_insert_kvcache_spm_unified_with_plan(
+                kcb, vcb, addr_offset("k").value + o,
+                addr_offset("v").value + o, nq, hd, NUM_CORES,
+                /*k_cache_batch_offset_elems=*/0,
+                /*v_cache_batch_offset_elems=*/0, /*spm_rows=*/0,
+                self_kv_plan);
             if (ctx().attention_policy ==
                 AttentionExecutionPolicy::DDR_KV) {
+                ctx().consume_physical_route(
+                    FmbRouteFamily::ATTENTION,
+                    kNavdpSelfAttentionDdrSite,
+                    static_cast<int64_t>(AttentionExecutionPolicy::DDR_KV),
+                    /*resolved_flags=*/self_mask,
+                    {batch_, predict_size_, seq}, chunk.idx);
                 rpu_launch_sdpa_spm_unified_kernel_v2(
                     kcb, vcb, self_mask, scale,
                     addr_offset("q").value + o, addr_offset("sdpa_out").value + o, addr_offset("sdpa_tmp").value, 0,
@@ -626,6 +997,13 @@ protected:
                 !former_mode_ && self_mask == 1 && PSb == kPredictSize &&
                     B == batch_,
                 "NavDP raw-SPM self-attention escaped its exact profile");
+            ctx().consume_physical_route(
+                FmbRouteFamily::ATTENTION,
+                kNavdpSelfAttentionSpmSite,
+                static_cast<int64_t>(
+                    AttentionExecutionPolicy::SPM_KV_BY_MHA),
+                /*resolved_flags=*/self_mask,
+                {batch_, predict_size_, seq}, chunk.idx);
             rpu_launch_v_transpose_spm(
                 addr(0, "v"), addr(0, "sdpa_tmp"), B, PSb, nq, hd,
                 NUM_CORES);
@@ -635,6 +1013,10 @@ protected:
                 B, PSb, PSb, nq, nq, hd, NUM_CORES);
         }
         proj(addr(0, "sdpa_out"), lw.so_w, addr(0, "oproj"), seq, h, nq * hd, 0, layer_addr(layer_idx, 0, "so_bias"));
+        ctx().consume_physical_route(
+            FmbRouteFamily::ALL_REDUCE, kNavdpSelfAllReduceSite,
+            fmb_ring_all_reduce_route_selector(seq, h),
+            /*resolved_flags=*/0, {}, chunk.idx);
         rpu_launch_all_reduce_sum_residual_kernel(
             addr(0, "oproj"), addr(0, "residual"), addr(0, "acc"), seq, h, NUM_CORES, NUM_CORES);  // acc = reduce+x
         if (former_mode_)    // POST-LN: x = norm1(x + self_attn) → into "residual"
@@ -654,10 +1036,22 @@ protected:
              layer_addr(layer_idx, 0, "cv_bias"));
         auto& kc_x = cross_kc_[layer_idx];
         auto& vc_x = cross_vc_[layer_idx];
-        rpu_launch_insert_kcache_spm_unified(kc_x, 0, addr_offset("k").value, S, nq, hd, NUM_CORES);
-        rpu_launch_insert_vcache_spm_unified(vc_x, 0, addr_offset("v").value, S, nq, hd, NUM_CORES);
+        const KvInsertSegmentPlan cross_kv_plan = resolve_kv_insert_plan(
+            kNavdpCrossKvSite, /*position=*/0, S);
+        rpu_launch_insert_kvcache_spm_unified_with_plan(
+            kc_x, vc_x, addr_offset("k").value,
+            addr_offset("v").value, nq, hd, NUM_CORES,
+            /*k_cache_batch_offset_elems=*/0,
+            /*v_cache_batch_offset_elems=*/0, /*spm_rows=*/0,
+            cross_kv_plan);
         for (int64_t b = 0; b < B; ++b) {   // shared memory K/V (projected once), per-trajectory queries
             const uint32_t o = static_cast<uint32_t>(b) * qrow;
+            ctx().consume_physical_route(
+                FmbRouteFamily::ATTENTION,
+                kNavdpCrossAttentionDdrSite,
+                static_cast<int64_t>(AttentionExecutionPolicy::DDR_KV),
+                kNavdpCrossAttentionMemoryPrefixDdrRequired,
+                {batch_, predict_size_, memory_len_}, chunk.idx);
             rpu_launch_sdpa_spm_unified_kernel_v2(
                 kc_x, vc_x, /*mask_type=*/0 /*none — attend all memory*/, scale,
                 addr_offset("q").value + o, addr_offset("sdpa_out").value + o, addr_offset("sdpa_tmp").value, 0,
@@ -665,11 +1059,20 @@ protected:
         }
         proj(addr(0, "sdpa_out"), lw.co_w, addr(0, "oproj"), seq, h, nq * hd, 0, layer_addr(layer_idx, 0, "co_bias"));
         if (former_mode_) {   // POST-LN: x = norm2(x + cross_attn) → "residual"
+            ctx().consume_physical_route(
+                FmbRouteFamily::ALL_REDUCE,
+                kNavdpFormerCrossAllReduceSite,
+                fmb_ring_all_reduce_route_selector(seq, h),
+                /*resolved_flags=*/0, {}, chunk.idx);
             rpu_launch_all_reduce_sum_residual_kernel(
                 addr(0, "oproj"), x2, addr(0, "acc"), seq, h, NUM_CORES, NUM_CORES);
             layernorm(addr(0, "acc"), addr(0, "residual"),
                       layer_addr(layer_idx, 0, "n2w"), layer_addr(layer_idx, 0, "n2b"), seq, h);
         } else {
+            ctx().consume_physical_route(
+                FmbRouteFamily::ALL_REDUCE, kNavdpCrossAllReduceSite,
+                fmb_ring_all_reduce_route_selector(seq, h),
+                /*resolved_flags=*/0, {}, chunk.idx);
             rpu_launch_all_reduce_sum_residual_kernel(
                 addr(0, "oproj"), addr(0, "acc"), addr(0, "residual"), seq, h, NUM_CORES, NUM_CORES);
         }
@@ -688,11 +1091,20 @@ protected:
                 ValuOpType::ADD, GeluMode::ERF, NUM_CORES);
         proj(addr(0, "ff_mid"), lw.ff2_w, addr(0, "oproj"), seq, h, FF, 0, layer_addr(layer_idx, 0, "ff2_bias"));
         if (former_mode_) {   // POST-LN: x = norm3(x + ff) → "residual"
+            ctx().consume_physical_route(
+                FmbRouteFamily::ALL_REDUCE,
+                kNavdpFormerFfAllReduceSite,
+                fmb_ring_all_reduce_route_selector(seq, h),
+                /*resolved_flags=*/0, {}, chunk.idx);
             rpu_launch_all_reduce_sum_residual_kernel(
                 addr(0, "oproj"), addr(0, "residual"), addr(0, "acc"), seq, h, NUM_CORES, NUM_CORES);
             layernorm(addr(0, "acc"), addr(0, "residual"),
                       layer_addr(layer_idx, 0, "n3w"), layer_addr(layer_idx, 0, "n3b"), seq, h);
         } else {
+            ctx().consume_physical_route(
+                FmbRouteFamily::ALL_REDUCE, kNavdpFfAllReduceSite,
+                fmb_ring_all_reduce_route_selector(seq, h),
+                /*resolved_flags=*/0, {}, chunk.idx);
             rpu_launch_all_reduce_sum_residual_kernel(
                 addr(0, "oproj"), addr(0, "residual"), addr(0, "acc"),
                 seq, h, NUM_CORES, NUM_CORES);
@@ -705,6 +1117,38 @@ protected:
     }
 
 private:
+    KvInsertSegmentPlan resolve_kv_insert_plan(
+        int64_t site_id, int64_t position, int64_t logical_rows) {
+        const int64_t invocation = ctx().physical_route_invocation;
+        const FmbRouteManifestEntry& route = ctx().find_physical_route(
+            FmbRouteFamily::KV_INSERT, site_id, invocation);
+        const KvInsertSegmentPlan plan = restore_kvinsert_plan(
+            site_id, route.arguments, NUM_CORES, num_kv_heads(), head_dim());
+        const KvInsertSegmentPlan shape_plan = rpu_resolve_kvinsert_segment_plan(
+            position, logical_rows, logical_rows, NUM_CORES,
+            num_kv_heads(), head_dim(), kNavdpKvCapabilities,
+            plan.route());
+        const KvInsertRouteArguments canonical =
+            rpu_kvinsert_route_arguments(
+                shape_plan, NUM_CORES, num_kv_heads(), head_dim());
+        TORCH_CHECK(
+            plan.logical_rows() == logical_rows &&
+                plan.physical_rows() == logical_rows &&
+                plan.segment_count() > 0 &&
+                plan.segment(0).position == position &&
+                route.arguments.size() == canonical.size() &&
+                std::equal(canonical.begin(),
+                           canonical.begin() + kKvInsertRouteTopologyWords,
+                           route.arguments.begin()),
+            "NavDP KV-insert descriptor does not match site ", site_id,
+            " launch geometry");
+        ctx().consume_physical_route(
+            FmbRouteFamily::KV_INSERT, site_id,
+            static_cast<int64_t>(plan.route()), route.flags,
+            route.arguments, invocation);
+        return plan;
+    }
+
     // affine LayerNorm: (x-mean)/std * gamma + beta.
     void layernorm(uint32_t src, uint32_t dst, uint32_t gamma, uint32_t beta, int64_t seq, int64_t h) {
         rpu_launch_layernorm_spm_kernel(src, dst, gamma, beta, seq, h, eps_, false, 0, NUM_CORES);
@@ -712,8 +1156,42 @@ private:
     // linear (partition 1=col, 0=row) + bias.
     void proj(uint32_t in, const at::Tensor& w, uint32_t out, int64_t M, int64_t Nout, int64_t K,
               int64_t partition, uint32_t bias_addr) {
+        ctx().consume_physical_route(
+            FmbRouteFamily::LINEAR, kNavdpProjectionLinearSite,
+            static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+            /*resolved_flags=*/0, {}, ctx().physical_route_invocation);
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             in, w, out, M, Nout, K, partition, NUM_CORES, bias_addr, at::Tensor());
+    }
+
+    std::vector<int64_t> kvinsert_cost_weight_identity() const override {
+        if (layer_weights_.empty()) return {};
+        std::vector<int64_t> identity{1};
+        append_kvinsert_cost_scalar_identity(identity, eps_);
+        identity.insert(identity.end(), {
+            static_cast<int64_t>(former_mode_),
+            static_cast<int64_t>(spm_kv_by_mha_enabled_),
+            static_cast<int64_t>(weights_set_),
+            static_cast<int64_t>(glue_ready_)});
+        identity.push_back(static_cast<int64_t>(layer_weights_.size()));
+        for (const auto& weights : layer_weights_) {
+            for (const auto* tensor : {
+                    &weights.sq_w, &weights.sk_w, &weights.sv_w, &weights.so_w,
+                    &weights.sq_b, &weights.sk_b, &weights.sv_b, &weights.so_b,
+                    &weights.cq_w, &weights.ck_w, &weights.cv_w, &weights.co_w,
+                    &weights.cq_b, &weights.ck_b, &weights.cv_b, &weights.co_b,
+                    &weights.ff1_w, &weights.ff1_b, &weights.ff2_w, &weights.ff2_b,
+                    &weights.n1_w, &weights.n1_b, &weights.n2_w, &weights.n2_b,
+                    &weights.n3_w, &weights.n3_b}) {
+                append_kvinsert_cost_tensor_identity(identity, *tensor);
+            }
+        }
+        for (const auto* tensor : {
+                &ie_w_, &ie_b_, &ah_w_, &ah_b_,
+                &fln_w_, &fln_b_}) {
+            append_kvinsert_cost_tensor_identity(identity, *tensor);
+        }
+        return identity;
     }
 
     std::vector<LayerWeights> layer_weights_;
@@ -724,7 +1202,7 @@ private:
     int64_t action_dim_   = 3;
     uint64_t mem_src_base_ = 0;
     bool mem_loaded_this_forward_ = false;
-    // DDPM in-graph unroll. loop_mode_ off preserves the single-step path.
+    // DDPM in-graph unroll (P2/P3). loop_mode_ off → single-step byte-identical.
     bool    loop_mode_ = false;
     int64_t num_steps_ = 1;
     int64_t batch_ = 1;                         // # trajectories batched into one unroll (folded into seq)
@@ -733,11 +1211,17 @@ private:
     // POST-LN + ReLU + non-causal self-attn, memory_len=1024). Weights are structurally identical to
     // a NavDP layer. Guarded in build_layer_subgraph; navdp path (false) is the unchanged `else`.
     bool    former_mode_ = false;
-    bool    spm_kv_by_mha_enabled_ = navdp_spm_kv_by_mha_enabled();
+    bool    spm_kv_by_mha_enabled_ = true;
     bool    weights_set_ = false;
     bool    glue_ready_ = false;
     ExecutionMode execution_mode_ = ExecutionMode::Unset;
 public:
+    void configure_cold_routes(bool spm_kv_by_mha) {
+        TORCH_CHECK(!weights_set_ && execution_mode_ == ExecutionMode::Unset,
+                    "navdp cold routes must be configured before weights or dispatch");
+        spm_kv_by_mha_enabled_ = spm_kv_by_mha;
+    }
+
     void set_former_mode(bool f) {
         if (former_mode_ == f) return;
         TORCH_CHECK(!weights_set_ && execution_mode_ == ExecutionMode::Unset,
@@ -783,7 +1267,8 @@ public:
     // final action into out[predict_size,action_dim].
     at::Tensor denoise_loop_forward(at::Tensor x0, at::Tensor mem_all, at::Tensor sigz,
                                     at::Tensor coeff, std::vector<at::Tensor>& k_caches,
-                                    std::vector<at::Tensor>& v_caches, at::Tensor out) {
+                                    std::vector<at::Tensor>& v_caches, at::Tensor out,
+                                    at::IntArrayRef planned_stage_descriptor = {}) {
         TORCH_CHECK(weights_set_, "navdp denoise: weights are not installed");
         TORCH_CHECK(!former_mode_, "navdp denoise: Former profile is unsupported");
         TORCH_CHECK(glue_ready_, "navdp denoise: denoise glue is not installed");
@@ -812,7 +1297,9 @@ public:
             num_steps_ = kDenoiseSteps;
             batch_ = B;
             execution_mode_ = ExecutionMode::Denoise;
-            invalidate_model_state();
+            // The public request passed the same read-only mode/batch admission
+            // before planning; actual forward keeps its latch and safety checks.
+            invalidate_model_state(/*planning_domain_changed=*/false);
         } else {
             TORCH_CHECK(loop_mode_ && num_steps_ == kDenoiseSteps && batch_ == B,
                         "navdp denoise: num_steps and batch are fixed after first dispatch; "
@@ -851,11 +1338,20 @@ public:
         std::vector<FmbExecutionSpan> spans;
         spans.reserve(batch_);
         for (int64_t b = 0; b < batch_; ++b) {
-            spans.push_back({b * predict_size_, predict_size_});
+            spans.push_back({b * predict_size_, predict_size_, b});
         }
-        (void) run_all_layers(
-            na_stage_, k_caches, v_caches, std::nullopt,
-            /*position=*/0, /*is_causal=*/true, input_chunks, spans);
+        const FmbStageBoundaryPolicies boundary_policies{};
+        if (planned_stage_descriptor.empty()) {
+            (void)run_all_layers(
+                na_stage_, k_caches, v_caches, std::nullopt,
+                /*position=*/0, /*is_causal=*/true, input_chunks, spans,
+                boundary_policies);
+        } else {
+            (void)run_all_layers(
+                na_stage_, k_caches, v_caches, std::nullopt,
+                /*position=*/0, /*is_causal=*/true,
+                /*planned_chunk_size=*/0, planned_stage_descriptor);
+        }
         return out;
     }
 
@@ -868,23 +1364,57 @@ private:
 // ---- instance registry + C launchers ----
 using NavdpRegistry = ModelHandleRegistry<v3::NavdpModel>;
 
-int64_t rpu_navdp_create() {
-    const auto exact_one = [](const char* name) {
-        const char* value = std::getenv(name);
-        return value != nullptr && value[0] == '1' && value[1] == '\0';
-    };
-    const auto unset_or_zero = [](const char* name) {
-        const char* value = std::getenv(name);
-        return value == nullptr || (value[0] == '0' && value[1] == '\0');
-    };
-    constexpr const char* kOptIn = "RPU_INTERNVLA_N1_ALLOW_NUMERIC_BLOCKED";
-    TORCH_CHECK(exact_one(kOptIn) || unset_or_zero(kOptIn),
-                kOptIn, " accepts only literal 0 or 1");
+void rpu_navdp_validate_execution_admission(
+        int64_t handle, int64_t packed_rows, int64_t denoise_steps) {
+    NavdpRegistry::get(handle, "rpu_navdp_validate_execution_admission")
+        ->validate_execution_admission(packed_rows, denoise_steps);
+}
+
+std::vector<int64_t> rpu_navdp_planner_cache_identity(int64_t handle) {
+    return NavdpRegistry::get(handle, "rpu_navdp_planner_cache_identity")
+        ->planner_cache_identity();
+}
+
+void rpu_navdp_set_chunk_envelope(int64_t handle, int64_t max_kv_len, int64_t chunk) {
+    NavdpRegistry::get(handle, "rpu_navdp_set_chunk_envelope")
+        ->set_chunk_envelope(max_kv_len, chunk);
+}
+
+void rpu_navdp_bind_kvinsert_costs(
+        int64_t handle, at::IntArrayRef identity,
+        const std::string& catalog_sha256, at::IntArrayRef certificate_rows) {
+    NavdpRegistry::get(handle, "rpu_navdp_bind_kvinsert_costs")
+        ->bind_kvinsert_costs(identity, catalog_sha256, certificate_rows);
+}
+
+std::tuple<std::vector<int64_t>, int64_t, int64_t>
+rpu_navdp_kvinsert_exact_candidate(
+    int64_t handle, at::IntArrayRef descriptor, int64_t site_id,
+    int64_t invocation, int64_t route) {
+    return NavdpRegistry::get(handle, "rpu_navdp_kvinsert_exact_candidate")
+        ->mint_kvinsert_exact_candidate(descriptor, site_id, invocation, route);
+}
+
+KvInsertCostDomainQuery rpu_navdp_kvinsert_cost_domain(
+        int64_t handle, at::IntArrayRef descriptor) {
+    return NavdpRegistry::get(handle, "rpu_navdp_kvinsert_cost_domain")
+        ->kvinsert_cost_domain("navdp", descriptor);
+}
+
+std::string rpu_navdp_kvinsert_cost_catalog_sha256(int64_t handle) {
+    return NavdpRegistry::get(
+        handle, "rpu_navdp_kvinsert_cost_catalog_sha256")
+        ->kvinsert_cost_catalog_sha256();
+}
+
+int64_t rpu_navdp_create(bool allow_numeric_blocked, bool spm_kv_by_mha) {
     TORCH_CHECK(
-        exact_one("RPU_INTERNVLA_N1_ALLOW_NUMERIC_BLOCKED"),
-        "InternVLA-N1 RPU requires exact "
-        "RPU_INTERNVLA_N1_ALLOW_NUMERIC_BLOCKED=1");
-    return NavdpRegistry::create();
+        allow_numeric_blocked,
+        "InternVLA-N1 RPU requires explicit controlled numeric-blocked admission");
+    const int64_t handle = NavdpRegistry::create();
+    NavdpRegistry::get(handle, "rpu_navdp_create")
+        ->configure_cold_routes(spm_kv_by_mha);
+    return handle;
 }
 void    rpu_navdp_destroy(int64_t handle) { NavdpRegistry::destroy(handle, "rpu_navdp_destroy"); }
 void    rpu_navdp_set_former_mode(int64_t handle, bool former) {
@@ -914,11 +1444,27 @@ void rpu_navdp_set_weights(
 at::Tensor rpu_navdp_forward(
     int64_t handle, const at::Tensor& tgt, const at::Tensor& memory,
     at::TensorList k_caches_list, at::TensorList v_caches_list,
-    const std::optional<at::Tensor>& causal_mask)
+    const std::optional<at::Tensor>& causal_mask,
+    at::IntArrayRef planned_stage_descriptor)
 {
     std::vector<at::Tensor> k_caches(k_caches_list.begin(), k_caches_list.end());
     std::vector<at::Tensor> v_caches(v_caches_list.begin(), v_caches_list.end());
-    return NavdpRegistry::get(handle, "rpu_navdp")->forward(tgt, memory, k_caches, v_caches, causal_mask);
+    return NavdpRegistry::get(handle, "rpu_navdp")->forward(
+        tgt, memory, k_caches, v_caches, causal_mask,
+        planned_stage_descriptor);
+}
+
+std::vector<int64_t> rpu_navdp_resolve_stage_domain(
+    int64_t handle, int64_t packed_rows, int64_t denoise_steps) {
+    return NavdpRegistry::get(
+               handle, "rpu_navdp_resolve_stage_domain")
+        ->resolve_stage_domain(packed_rows, denoise_steps);
+}
+
+int64_t rpu_navdp_get_resolved_chunk_size(int64_t handle) {
+    return NavdpRegistry::get(
+               handle, "rpu_navdp_get_resolved_chunk_size")
+        ->get_last_resolved_chunk_size();
 }
 
 void rpu_navdp_set_denoise_glue(
@@ -930,10 +1476,13 @@ void rpu_navdp_set_denoise_glue(
 
 at::Tensor rpu_navdp_denoise_loop_forward(
     int64_t handle, const at::Tensor& x0, const at::Tensor& mem_all, const at::Tensor& sigz,
-    const at::Tensor& coeff, at::TensorList k_caches_list, at::TensorList v_caches_list, const at::Tensor& out)
+    const at::Tensor& coeff, at::TensorList k_caches_list,
+    at::TensorList v_caches_list, const at::Tensor& out,
+    at::IntArrayRef planned_stage_descriptor)
 {
     std::vector<at::Tensor> k_caches(k_caches_list.begin(), k_caches_list.end());
     std::vector<at::Tensor> v_caches(v_caches_list.begin(), v_caches_list.end());
     return NavdpRegistry::get(handle, "rpu_navdp")->denoise_loop_forward(
-        x0, mem_all, sigz, coeff, k_caches, v_caches, const_cast<at::Tensor&>(out));
+        x0, mem_all, sigz, coeff, k_caches, v_caches,
+        const_cast<at::Tensor&>(out), planned_stage_descriptor);
 }

@@ -28,7 +28,7 @@ each token and head.
   [Model porting](../../docs/model_porting.md#7-graph-and-cache-invariants)
 - A leading batch dimension does not imply that every model path supports
   general batching. Use only the envelope named for the exact release profile.
-  [Model support](../../docs/model_support.md#general-runtime-limits)
+  [Examples](../../docs/model_support.md#general-runtime-limits)
 
 If attention output is numerically wrong while projection norms look
 reasonable, verify the layout at every public boundary before changing model

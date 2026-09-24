@@ -60,8 +60,16 @@ bool ddr_register_role_accepts_dtype(
             dtype == at::kInt;
     case GraphDdrRegisterRole::Int8ModelWeight:
         return dtype == at::kChar;
+    case GraphDdrRegisterRole::PackedFp4ModelWeight:
+    case GraphDdrRegisterRole::Fp8BlockScale:
+    case GraphDdrRegisterRole::PackedInt4ModelWeight:
+        return dtype == at::kByte;
     case GraphDdrRegisterRole::PerChannelScale:
         return dtype == at::kHalf;
+    case GraphDdrRegisterRole::Fp32PerChannelScale:
+        return dtype == at::kFloat;
+    case GraphDdrRegisterRole::Fp8ModelWeight:
+        return dtype == at::kByte;
     }
     return false;
 }
@@ -73,7 +81,8 @@ void validate_ddr_register_role_dtype(
         "typed DDR-register role/dtype mismatch: role=",
         static_cast<unsigned>(role), ", dtype=", dtype,
         "; ModelWeight/KeyCache/ValueCache/PerChannelScale require FP16, "
-        "Int8ModelWeight requires signed int8, while SemanticInput "
+        "Fp32PerChannelScale requires FP32, Int8ModelWeight requires signed int8, Fp8ModelWeight requires "
+        "raw uint8, PackedInt4ModelWeight/PackedFp4ModelWeight/Fp8BlockScale require uint8, while SemanticInput "
         "additionally admits int16/int32");
 }
 
@@ -236,7 +245,7 @@ uint64_t tensor_topology_id(const at::Tensor& tensor,
     return hash;
 }
 
-GraphDdrRegisterOccurrence snapshot_operand(
+void validate_ddr_register_operand(
         const GraphDdrRegisterOperandSpec& spec) {
     TORCH_CHECK(spec.tensor.defined(),
                 "typed DDR-register operand is undefined");
@@ -255,6 +264,43 @@ GraphDdrRegisterOccurrence snapshot_operand(
                 "typed DDR-register address ABI must use an even low register "
                 "and its adjacent high register; got ", spec.abi.reg_lo,
                 "/", spec.abi.reg_hi);
+}
+
+void validate_ddr_register_device_address(uint64_t dev_addr) {
+    TORCH_CHECK(dev_addr != 0,
+                "typed DDR-register operand has no RPU device address");
+    TORCH_CHECK((dev_addr & UINT64_C(0xff)) == 0,
+                "typed DDR-register device address must be 256-byte aligned; "
+                "got 0x", std::hex, dev_addr, std::dec);
+    TORCH_CHECK((dev_addr >> 8) <=
+                    std::numeric_limits<uint32_t>::max(),
+                "typed DDR-register device address cannot be represented by "
+                "DevAddrShift8LoHi; got 0x", std::hex, dev_addr,
+                std::dec);
+}
+
+uint64_t resolve_ddr_register_address(
+        const GraphDdrRegisterOperandSpec& spec) {
+    validate_ddr_register_operand(spec);
+    // An ordinary launcher only needs the live address. Its input tensor
+    // already owns this storage for the call; no provenance snapshot escapes.
+    const c10::Storage& storage = spec.tensor.storage();
+    TORCH_CHECK(static_cast<bool>(storage),
+                "typed DDR-register operand has no StorageImpl");
+    const void* data_ptr = spec.tensor.const_data_ptr();
+    TORCH_CHECK(spec.tensor.unsafeGetTensorImpl() != nullptr &&
+                    storage.unsafeGetStorageImpl() != nullptr &&
+                    data_ptr != nullptr && storage.data() != nullptr,
+                "typed DDR-register operand has incomplete storage provenance");
+    const uint64_t dev_addr = rhino_lkn::RpuGetDevAddr(
+        const_cast<void*>(data_ptr));
+    validate_ddr_register_device_address(dev_addr);
+    return dev_addr;
+}
+
+GraphDdrRegisterOccurrence snapshot_operand(
+        const GraphDdrRegisterOperandSpec& spec) {
+    validate_ddr_register_operand(spec);
 
     GraphDdrRegisterOccurrence occurrence;
     occurrence.abi = spec.abi;
@@ -287,14 +333,7 @@ GraphDdrRegisterOccurrence snapshot_operand(
                 "typed DDR-register operand has incomplete storage provenance");
     occurrence.dev_addr = rhino_lkn::RpuGetDevAddr(
         const_cast<void*>(occurrence.data_ptr));
-    TORCH_CHECK(occurrence.dev_addr != 0,
-                "typed DDR-register operand has no RPU device address");
-    TORCH_CHECK((occurrence.dev_addr & UINT64_C(0xff)) == 0,
-                "typed DDR-register device address must be 256-byte aligned");
-    TORCH_CHECK((occurrence.dev_addr >> 8) <=
-                    std::numeric_limits<uint32_t>::max(),
-                "typed DDR-register device address cannot be represented by "
-                "DevAddrShift8LoHi");
+    validate_ddr_register_device_address(occurrence.dev_addr);
     return occurrence;
 }
 
@@ -460,7 +499,9 @@ void validate_policy(const GraphKernelRegisterPolicy& policy) {
     TORCH_CHECK(policy.fingerprint != 0 && !policy.name.empty(),
                 "typed DDR-register policy needs a stable identity");
     TORCH_CHECK(policy.expected_kernel_count > 0 &&
-                    policy.expected_node_count ==
+                    // The explicit remainder is reserved exclusively for
+                    // authenticated COMPLETE-manifest metadata Branches.
+                    policy.expected_node_count >=
                         policy.expected_kernel_count +
                             policy.expected_dma_count +
                             policy.expected_barrier_count &&
@@ -524,8 +565,14 @@ void validate_policy(const GraphKernelRegisterPolicy& policy) {
                                      GraphDdrRegisterRole::SemanticInput ||
                                  abi.role ==
                                      GraphDdrRegisterRole::Int8ModelWeight ||
+                                 abi.role == GraphDdrRegisterRole::PackedInt4ModelWeight ||
+                                 abi.role == GraphDdrRegisterRole::PackedFp4ModelWeight ||
+                                 abi.role == GraphDdrRegisterRole::Fp8BlockScale ||
                                  abi.role ==
-                                     GraphDdrRegisterRole::PerChannelScale) &&
+                                     GraphDdrRegisterRole::Fp8ModelWeight ||
+                                 abi.role ==
+                                     GraphDdrRegisterRole::PerChannelScale ||
+                                 abi.role == GraphDdrRegisterRole::Fp32PerChannelScale) &&
                                 (abi.access ==
                                      GraphDdrRegisterAccess::Read ||
                                  abi.access ==
@@ -534,8 +581,14 @@ void validate_policy(const GraphKernelRegisterPolicy& policy) {
                                       GraphDdrRegisterRole::SemanticInput &&
                                   abi.role !=
                                       GraphDdrRegisterRole::Int8ModelWeight &&
+                                  abi.role != GraphDdrRegisterRole::PackedInt4ModelWeight &&
+                                  abi.role != GraphDdrRegisterRole::PackedFp4ModelWeight &&
+                                  abi.role != GraphDdrRegisterRole::Fp8BlockScale &&
                                   abi.role !=
-                                      GraphDdrRegisterRole::PerChannelScale) ||
+                                      GraphDdrRegisterRole::PerChannelScale &&
+                                  abi.role != GraphDdrRegisterRole::Fp32PerChannelScale &&
+                                  abi.role !=
+                                      GraphDdrRegisterRole::Fp8ModelWeight) ||
                                  abi.access ==
                                      GraphDdrRegisterAccess::Read) &&
                                 abi.encoding ==
@@ -550,7 +603,12 @@ void validate_policy(const GraphKernelRegisterPolicy& policy) {
                 switch (abi.role) {
                 case GraphDdrRegisterRole::ModelWeight:
                 case GraphDdrRegisterRole::Int8ModelWeight:
+                case GraphDdrRegisterRole::PackedFp4ModelWeight:
+                case GraphDdrRegisterRole::Fp8BlockScale:
+                case GraphDdrRegisterRole::PackedInt4ModelWeight:
                 case GraphDdrRegisterRole::PerChannelScale:
+                case GraphDdrRegisterRole::Fp32PerChannelScale:
+                case GraphDdrRegisterRole::Fp8ModelWeight:
                     rule_weight_total += rule.expected_count;
                     break;
                 case GraphDdrRegisterRole::KeyCache:
@@ -606,7 +664,7 @@ void validate_policy(const GraphKernelRegisterPolicy& policy) {
                         phase_names.insert(phase.name).second,
                     "typed DDR-register policy phase names must be nonempty "
                     "and unique");
-        TORCH_CHECK(stats.node_count == stats.kernel_count + stats.dma_count +
+        TORCH_CHECK(stats.node_count >= stats.kernel_count + stats.dma_count +
                                              stats.barrier_count &&
                         stats.typed_kernel_count +
                                 stats.no_ddr_kernel_count ==
@@ -1046,11 +1104,11 @@ GraphKernelRegisterWriter RpuKernelGraph::stage_kernel_ddr_registers(
         std::vector<GraphKernelRegisterWriter::RegisterPair> pairs;
         pairs.reserve(operands.size());
         for (const auto& operand : operands) {
-            const auto occurrence = snapshot_operand(operand);
+            const uint64_t dev_addr = resolve_ddr_register_address(operand);
             pairs.push_back(GraphKernelRegisterWriter::RegisterPair{
-                occurrence.abi.reg_lo,
-                occurrence.abi.reg_hi,
-                static_cast<uint32_t>(occurrence.dev_addr >> 8)});
+                operand.abi.reg_lo,
+                operand.abi.reg_hi,
+                static_cast<uint32_t>(dev_addr >> 8)});
         }
         return GraphKernelRegisterWriter(nullptr, 0, std::move(pairs));
     }
@@ -1361,6 +1419,11 @@ void RpuKernelGraph::write_pending_kernel_ddr_registers(
                     pending.lookup_kernel == &kernel &&
                     pending.writer_ticket == ticket,
                 "typed DDR-register writer ticket/order is stale");
+    if (state_ == State::REPLAYING) {
+        // Defensive coverage for typed writers even if a future lookup path no
+        // longer goes through the ordinary get_kernel() replay branch.
+        kernel_params_dirty_this_replay_ = true;
+    }
     write_register_pairs(kernel, pending.expected_pairs,
                          "typed DDR-register graph writer");
     TORCH_CHECK(
@@ -1421,7 +1484,12 @@ void RpuKernelGraph::consume_pending_kernel_register_census(
             switch (operand.abi.role) {
             case GraphDdrRegisterRole::ModelWeight:
             case GraphDdrRegisterRole::Int8ModelWeight:
+            case GraphDdrRegisterRole::PackedFp4ModelWeight:
+            case GraphDdrRegisterRole::Fp8BlockScale:
+            case GraphDdrRegisterRole::PackedInt4ModelWeight:
             case GraphDdrRegisterRole::PerChannelScale:
+            case GraphDdrRegisterRole::Fp32PerChannelScale:
+            case GraphDdrRegisterRole::Fp8ModelWeight:
                 ++kernel_register_census_stats_.weight_operand_count;
                 break;
             case GraphDdrRegisterRole::KeyCache:
@@ -1442,7 +1510,7 @@ void RpuKernelGraph::consume_pending_kernel_register_census(
     const std::string& name = !rule.kernel_name.empty()
         ? rule.kernel_name
         : std::string(KERNEL_ID_NAMES[
-              static_cast<uint8_t>(*rule.kernel_id)]);
+              static_cast<size_t>(*rule.kernel_id)]);
     observe_kernel_register_node(GraphNodeKind::Kernel, &name);
     pending_kernel_register_census_.reset();
 }
@@ -1475,6 +1543,40 @@ void RpuKernelGraph::observe_kernel_register_node(
         TORCH_CHECK(false, "typed DDR-register census rejects Graph node kind ",
                     static_cast<int>(kind));
     }
+}
+
+void RpuKernelGraph::observe_physical_manifest_branch_for_census() {
+    TORCH_CHECK(kernel_register_census_active_ &&
+                    !kernel_register_census_complete_ &&
+                    !kernel_register_census_poisoned_ &&
+                    !pending_kernel_register_census_.has_value() &&
+                    kernel_register_census_next_phase_ <
+                        kernel_register_census_policy_.phases.size(),
+                "physical manifest Branch has no active census phase");
+    const auto metadata_count = [](const GraphKernelRegisterCensusStats& stats) {
+        const size_t execution_nodes =
+            stats.kernel_count + stats.dma_count + stats.barrier_count;
+        TORCH_CHECK(stats.node_count >= execution_nodes,
+                    "physical manifest metadata count underflow");
+        return stats.node_count - execution_nodes;
+    };
+    const auto& policy = kernel_register_census_policy_;
+    const size_t expected_metadata = policy.expected_node_count -
+        policy.expected_kernel_count - policy.expected_dma_count -
+        policy.expected_barrier_count;
+    const auto& phase = policy.phases[kernel_register_census_next_phase_].stats;
+    const auto delta = stats_delta(kernel_register_census_stats_,
+                                   kernel_register_census_phase_begin_stats_);
+    TORCH_CHECK(metadata_count(kernel_register_census_stats_) < expected_metadata &&
+                    metadata_count(delta) < metadata_count(phase),
+                "physical manifest Branch exceeds the exact census metadata quota");
+    ++kernel_register_census_stats_.node_count;
+    kernel_register_census_stats_.ordered_node_kind_hash = fnv_byte(
+        kernel_register_census_stats_.ordered_node_kind_hash,
+        static_cast<uint8_t>(GraphNodeKind::Branch));
+    kernel_register_census_phase_begin_stats_.ordered_node_kind_hash = fnv_byte(
+        kernel_register_census_phase_begin_stats_.ordered_node_kind_hash,
+        static_cast<uint8_t>(GraphNodeKind::Branch));
 }
 
 void RpuKernelGraph::checkpoint_kernel_register_census(
@@ -1825,7 +1927,10 @@ void RpuKernelGraph::complete_kernel_register_outer_fast_ordinary() {
                 burst.owner_ordinal, " side=",
                 static_cast<int>(burst.side), " range=[", burst.byte_begin,
                 ",", burst.byte_begin + burst.byte_count,
-                ") occurrences=", burst.expected_occurrence_count);
+                ") occurrences=", burst.expected_occurrence_count,
+                " current=0x", std::hex,
+                burst.live_base == nullptr ? UINT64_C(0) : *burst.live_base,
+                " expected=0x", burst.owner.dev_addr, std::dec);
             prepared.slot_writes.emplace_back(
                 burst.live_base, burst.owner.dev_addr);
             if (slot.side == GraphOuterFastDmaSide::Destination) {

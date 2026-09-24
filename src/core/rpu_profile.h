@@ -6,6 +6,7 @@
 #include <iomanip>
 #include <cstdint>
 #include <chrono>
+#include <string>
 
 // Forward declaration for DDR flush
 namespace rhino_lkn {
@@ -23,10 +24,10 @@ namespace rhino_lkn {
 // =============================================================================
 // Global Debug and Profile Switches
 // =============================================================================
-// Unified 6-level debug verbosity.
+// Unified 6-level debug verbosity (P1a, 2026-05-21).
 // 0 SILENT / 1 ERROR / 2 WARN / 3 INFO (default) / 4 DEBUG / 5 TRACE
 // Init from RPU_LOG_LEVEL env at .so load (parse_log_level_env_or_default).
-// log_at(N) is the relaxed-load fast gate.
+// log_at(N) is the relaxed-load fast gate (replaced the legacy single-bool debug switch).
 extern std::atomic<int> g_rpu_debug_level;
 inline bool log_at(int level) {
     return g_rpu_debug_level.load(std::memory_order_relaxed) >= level;
@@ -201,6 +202,44 @@ bool rpu_get_ddr_flush_force();
 
 // Reset all profile accumulators (call before profiling runs)
 void rpu_reset_profile_accumulators();
+
+// =============================================================================
+// HW perf trace — RPU cycle-precision kernel/DMA timestamp dump (Chrome JSON).
+//
+// Snapshot pattern: setter takes mutex and stamps all fields + bumps dump
+// budget; hot-path callers read via rpu_hw_perf_snapshot() (one mutex op per
+// graph forward, not per kernel).
+//
+// Toggle semantics: the adapter's graph signature/admission policy must keep
+// trace-enabled and trace-disabled captures distinct. The setter does not
+// eagerly clear adapter-owned GraphCache instances.
+//
+// File naming:
+// rpu_hwperf_pid<P>_tid<TID>_seq<S>_<OP_ID>_<build|replay>_seg<N>.json
+// in `output_dir`. Multiple threads / processes never collide.
+// =============================================================================
+struct HwPerfConfig {
+    bool enabled = false;
+    std::string output_dir = ".rpu-hw-perf";
+    int64_t max_dumps = 32;
+};
+
+HwPerfConfig rpu_hw_perf_snapshot();
+bool rpu_hw_perf_runtime_compatible() noexcept;
+bool rpu_hw_perf_enabled_fast() noexcept;
+void rpu_set_hw_perf_trace(bool enabled,
+                           const std::string& output_dir,
+                           int64_t max_dumps);
+bool rpu_get_hw_perf_trace();
+
+// Process-global atomic dump budget. Try to claim one dump slot — returns
+// true iff a budget slot was available (and consumed). Decremented monotonically
+// per setter call.
+bool rpu_hw_perf_try_consume_dump();
+
+// Process-global atomic dump sequence — unique per JSON file. Monotonic across
+// threads, never resets within a process.
+uint64_t rpu_hw_perf_next_dump_seq();
 
 // Conditional DDR flush macro - only executes if g_rpu_ddr_flush_enabled is true.
 // Use this for intra-RPU kernel-to-kernel sync points that are redundant when the

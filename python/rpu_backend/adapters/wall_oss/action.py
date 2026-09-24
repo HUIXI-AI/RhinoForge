@@ -1,13 +1,15 @@
-"""Wall-OSS-0.5 action expert (expert-1) flow-matching denoise for RPU.
+"""Wall-OSS-0.5 action expert (expert-1) flow-matching denoise → RPU (P2).
 
-The action expert is a plain 1024-dim Qwen2.5
-decoder (`use_adarms=FALSE`). The Wall-OSS checkpoint uses causal action
-attention. It reuses the same decoder core as expert-0, wrapped by the fused
-Wall-OSS action op for the preprocessor and Euler update. Expert-1 remains hidden 1024
+Rev 5 architecture (verified): the action expert is a PLAIN 1024-dim Qwen2.5
+decoder (`use_adarms=FALSE`). The stock Wall-OSS checkpoint uses causal action
+attention. P2 reuses the SAME
+decoder core as P1 (expert-0), wrapped by the fused Wall-OSS action op for the
+preprocessor and Euler update. Expert-1 remains hidden 1024
 (q_proj 1024→2048, o_proj 2048→1024) on the existing attn_tp=2 + optional-QKV-bias path.
 
-Flow:
-  1. expert-0 prefill (`WallOssLLM`) over the text prefix → fills the shared RPUCache
+Flow (mirrors `modeling_qwen2_5_vl_act.py::predict` diffusion mode + the pi05 shared-prefix
+denoise loop):
+  1. expert-0 prefill (P1 `WallOssLLM`) over the text prefix → fills the shared RPUCache
      with prefix K/V (positions [0, P)).
   2. Euler denoise over the checkpoint-specific time schedule: each step embeds the noisy action
      (`action_preprocessor.step`: w1/w2/w3 + sinusoidal time), runs the expert-1 decoder over
@@ -16,8 +18,7 @@ Flow:
      `action_proj_back(last_hidden[:, :1024])` = velocity, and integrates `x += dt·v`.
      `reset_to_position(P)` keeps the prefix intact across steps.
 
-The expert-1 decoder shares expert-0's RPUCache (same nkv=2, head_dim=128,
-attn_tp=2 layout):
+The expert-1 decoder shares P1's RPUCache (same nkv=2, head_dim=128, attn_tp=2 layout):
 prefix K/V are expert-0's, action K/V are expert-1's, concatenated in the same cache — the
 pi05 prefix-KV pattern. The C++ flushes the per-step CPU-computed action embedding and uses
 a mutable layer-0 input DMA, so a fresh `.to('rpu')` tensor each step is replay-safe.
@@ -27,13 +28,17 @@ from __future__ import annotations
 import json
 import math
 import os
-import weakref
 
 import torch
 import torch.nn.functional as F
 
 import rpu_backend
 from rpu_backend.runtime import rpu_env_bool
+from rpu_backend.runtime.decoder import plan_bounded_prefill_execution
+from rpu_backend.runtime.execution_planner import (
+    GRAPH_COMPOSITE_CHILD,
+    GRAPH_MODES,
+)
 from rpu_backend.runtime.weights import (
     tp_col_swizzle_mc_weight,
     tp_row_swizzle_mc_weight,
@@ -46,6 +51,9 @@ from rpu_backend.adapters.wall_oss.llm import (
     _partial_mrope_enabled, build_wall_oss_llm,
 )
 from rpu_backend.runtime.rope_partial import build_chunked_mrope_cos_sin
+
+
+_FMB_GRAPH_COMPOSITE_CHILD = GRAPH_MODES.index(GRAPH_COMPOSITE_CHILD) + 1
 
 
 def _sinusoidal_pos_emb(t: torch.Tensor, dim: int) -> torch.Tensor:
@@ -108,35 +116,30 @@ def _ensure_action_cache_capacity(cache, prefix_len: int, horizon: int) -> None:
 
 
 def _destroy_action_handle(h, fused):
-    """Release the expert-1 decoder handle (wall_oss_action_step when fused, else
-    causal_decoder). Called by weakref.finalize on GC."""
-    try:
-        if fused:
-            torch.ops.rpu.wall_oss_action_step_destroy(h)
-        else:
-            torch.ops.rpu.causal_decoder_destroy(h)
-    except Exception:
-        pass
+    """Raw destroy; graph retirement belongs to the actual component owner."""
+    if fused:
+        torch.ops.rpu.wall_oss_action_step_destroy(h)
+    else:
+        torch.ops.rpu.causal_decoder_destroy(h)
 
 
 def _configure_action_handle(
     *, fused, set_weights, weight_args, chunk_size_override=0
 ):
     """Create/configure an action handle, destroying it on failure."""
+    from rpu_backend.api._execution import _require_execution_process_safe
+    _require_execution_process_safe()
     create = (
         torch.ops.rpu.wall_oss_action_step_create
         if fused else torch.ops.rpu.causal_decoder_create
     )
     handle = create()
-    configured = False
     try:
         set_weights(handle, *weight_args)
         if not fused:
-            # Certified chunk envelope. Only the unfused path is a CausalDecoderModel;
-            # wall_oss_action_step is a different C++ class that does not
-            # participate in the envelope regime. Values are the text expert's
-            # (llm.py): same geometry family, same 2D-rect-mask layout, and the
-            # same geometry and mask contract.
+            # The unfused CausalDecoderModel shares the text expert's geometry
+            # and rectangular-mask envelope. The fused action handle owns a
+            # separate component contract.
             from rpu_backend.adapters.wall_oss.llm import (
                 _CHUNK_ENVELOPE_MAX_KV,
                 _PREFILL_CHUNK_SIZE_CAP_SAFE,
@@ -147,15 +150,16 @@ def _configure_action_handle(
                 torch.ops.rpu.causal_decoder_set_chunk_size_override(
                     handle, chunk_size_override
                 )
-        configured = True
         return handle
-    finally:
-        if not configured:
-            _destroy_action_handle(handle, fused)
+    except BaseException as error:
+        from rpu_backend.adapters.wall_oss._retirement import _cleanup_build_failure
+        _cleanup_build_failure(error, (handle, weight_args),
+                               lambda: _destroy_action_handle(handle, fused))
+        raise
 
 
 class WallOssAction:
-    """Expert-1 action denoiser on RPU.
+    """Expert-1 action denoiser on RPU (P2).
 
     Construct via :func:`build_wall_oss_action`. Call :meth:`predict` with CPU `input_ids`
     `[1, P]` (text prefix), a fixed `noise` `[1, H, action_dim]` and `dof_mask` `[1, H, action_dim]`;
@@ -171,6 +175,7 @@ class WallOssAction:
                  w2_rpu=None, w3_rpu=None, owns_llm=False,
                  execution_chunk_size="auto",
                  causal_action_attention_mask=True, flow_time_scale=1.0):
+        self._gc_retirement_enabled = False
         partial_mrope = (
             _partial_mrope_enabled()
             if partial_mrope is None else bool(partial_mrope)
@@ -192,8 +197,14 @@ class WallOssAction:
         self._causal_action_attention_mask = bool(
             causal_action_attention_mask)
         self._flow_time_scale = float(flow_time_scale)
+        self._action_fp32_tail = rpu_env_bool(
+            "RPU_WALL_OSS_ACTION_FP32_TAIL"
+        )
+        self._denoise_unroll = rpu_env_bool(
+            "RPU_WALL_OSS_DENOISE_UNROLL", default=True
+        )
         # Memoized x-independent denoise bias inputs (frame-invariant for a fixed
-        # dof_mask). RPU_WALL_OSS_HOST_CACHE=0 disables this cache.
+        # dof_mask). RPU_WALL_OSS_HOST_CACHE=0 disables (bit-exact A/B / escape hatch).
         self._bias_cache = None
         self._host_cache = rpu_env_bool("RPU_WALL_OSS_HOST_CACHE", default=True)
         # Memoized denoise-seam glue (prefill-graph → denoise-graph), both f(real_len)
@@ -221,7 +232,7 @@ class WallOssAction:
         # action_preprocessor weights. w1 (in=2*action_dim=52) and proj_back (out=26)
         # stay CPU fp32 — their dims aren't 16-aligned, so rpu_linear's partition search
         # rejects them (CPU fallback). w2 (2048->1024) / w3 (1024->1024) run on RPU fp16
-        # (col-swizzled, 8-core), and the result stays on RPU for the decoder.
+        # (column-swizzled, eight-core), leaving their output on RPU for the decoder.
         self._w1, self._w2, self._w3, self._proj_back = w1, w2, w3, proj_back
         if not fused:  # 8-core swizzled w2/w3 only feed the CPU-host _action_embed path
             self._w2_rpu = (
@@ -233,45 +244,43 @@ class WallOssAction:
                 if w3_rpu is None else w3_rpu
             )  # [1024,1024]
         self._closed = False
-        self._handle_finalizer = weakref.finalize(
-            self, _destroy_action_handle, handle, fused
-        )
+        if self._owns_llm:
+            self.llm._retirement_owner = self
+        self._gc_retirement_enabled = True
+
+    def _retire_native(self):
+        from rpu_backend.adapters.wall_oss._retirement import _retire_native
+        _retire_native(self, lambda handle: _destroy_action_handle(handle, self._fused))
 
     def close(self) -> None:
         """Release action resources and an internally owned LLM, once."""
-        if self._closed:
-            return
-        self._closed = True
-        graph_cache = getattr(self, "_graph_cache", None)
-        if graph_cache is not None:
-            try:
-                graph_cache.clear()
-            except Exception:
-                pass
-        finalizer = getattr(self, "_handle_finalizer", None)
-        if finalizer is not None and getattr(finalizer, "alive", False):
-            finalizer()
-        if getattr(self, "_owns_llm", False):
-            close_llm = getattr(self.llm, "close", None)
-            if close_llm is not None:
-                close_llm()
+        from rpu_backend.adapters.wall_oss._retirement import _close
+        components = (self, self.llm) if getattr(self, "_owns_llm", False) else (self,)
+        _close(self, components)
+
+    def __del__(self):
+        from rpu_backend.adapters.wall_oss._retirement import _gc_close
+        _gc_close(self)
 
     def begin_graph_warmup(self):
         """Allow the action GraphCache to BUILD declared execution profiles."""
         return self._graph_cache.begin_warmup()
+
 
     def freeze_graph_cache(self):
         """Enter lookup-only READY mode after all action profiles are BUILT."""
         return self._graph_cache.freeze()
 
     def _denoise_graph_signature(self, op_id: str, H: int, P: int,
-                                 num_steps: int, *mode_dims: int):
+                                 num_steps: int, *mode_dims: int,
+                                 resolved_chunk_size: int | None = None,
+                                 plan_key_words: tuple[int, ...] = ()):
         """Denoise graph identity: execution geometry only, never real prefix length.
 
         One key therefore serves every REAL prefix in an execution band. What makes that
         safe is NOT this key but the per-real-prefix mask pointer (see
         `_action_mask_cached`) driving the C++ (ptr, seq_q, seq_k) re-prepare. Gated on
-        device by the mutable-mask replay contract.
+        device by tests/model/wall_oss/test_wall_oss_denoise_real_prefix_replay.py.
         """
         return rpu_backend.graph.GraphSignature(
             op_id=op_id,
@@ -279,9 +288,12 @@ class WallOssAction:
             dyn_dims=[
                 self.num_layers,
                 P,
-                _native_action_chunk_size(H),
+                (_native_action_chunk_size(H) if resolved_chunk_size is None
+                 else int(resolved_chunk_size)),
                 num_steps,
                 *mode_dims,
+                getattr(self, "_precision_mode", 0),
+                *plan_key_words,
             ],
             dtypes=[torch.float16],
         )
@@ -295,6 +307,95 @@ class WallOssAction:
                 f"horizon): requested={requested}, horizon={horizon}, "
                 f"required={native_chunk}"
             )
+
+    def _plan_action_chunk(
+        self, horizon: int, prefix_len: int, *, is_causal: bool,
+        mask_kv_len: int = 0,
+        loop_mode: bool = False,
+        num_steps: int = 1,
+        b_step_is_bias: bool = False,
+        have_te: bool = False,
+    ):
+        requested = getattr(self, "_execution_chunk_size", "auto")
+        plan_box = {}
+        _, chunk_size = plan_bounded_prefill_execution(
+            int(horizon),
+            int(horizon),
+            0,
+            execution_owner=self,
+            execution_stage="action",
+            execution_native=("wall_oss_action_step" if self._fused else "causal_decoder", int(self._handle)),
+            position=int(prefix_len),
+            alignment=1,
+            padding_rows=0,
+            exact_chunk_size=(
+                int(requested) if requested != "auto" else None
+            ),
+            resolve_stage_domain=lambda length: (
+                torch.ops.rpu.wall_oss_action_resolve_stage_domain(
+                    self._handle, int(length), int(prefix_len),
+                    int(mask_kv_len),
+                    int(requested) if requested != "auto" else 0,
+                    bool(loop_mode), int(num_steps), bool(b_step_is_bias),
+                    bool(have_te),
+                ) if self._fused else
+                torch.ops.rpu.causal_decoder_resolve_prefill_stage_domain(
+                    self._handle, int(length), int(prefix_len),
+                    bool(is_causal), int(mask_kv_len),
+                    0, _FMB_GRAPH_COMPOSITE_CHILD, int(horizon),
+                )
+            ),
+            request_id="wall_oss:action_expert:action",
+            plan_result_sink=lambda result: plan_box.__setitem__("result", result),
+            graph_mode=GRAPH_COMPOSITE_CHILD,
+            queue_owner_id=int(self._handle),
+            physical_metadata=(
+                ("component:action_expert", 1),
+                ("execution_generation", int(getattr(
+                    self, "_fmb_execution_generation", 0))),
+                ("prefix_history_ddr_required", 1),
+                ("prefix_len", int(prefix_len)),
+            ),
+            plan_signature=(bool(self._fused), bool(is_causal), int(mask_kv_len), bool(loop_mode), int(num_steps), bool(b_step_is_bias), bool(have_te)),
+            graph_cache=self._graph_cache,
+        )
+        return int(chunk_size), plan_box["result"]
+
+    def _record_action_plan(
+        self, plan, *, horizon: int, prefix_len: int, chunk_size: int,
+    ) -> None:
+        selected = plan.selected
+        if (
+            selected is None
+            or int(selected.execution_len) != int(horizon)
+            or int(selected.stage_tuple.compute_chunk) != int(chunk_size)
+        ):
+            raise RuntimeError("Wall-OSS action dry/forward plan disagreement")
+        receipt = {
+            "component": getattr(
+                self, "_fmb_execution_component_id", "action_expert"),
+            "stage": "action",
+            "generation": int(getattr(
+                self, "_fmb_execution_generation", 0)),
+            "logical_len": int(horizon),
+            "execution_len": int(selected.execution_len),
+            "chunk_size": int(chunk_size),
+            "padding_rows": int(selected.padding_rows),
+            "position": int(prefix_len),
+            "graph_mode": plan.graph_mode,
+            "authority": "NATIVE_A6_STAGE_DESCRIPTOR",
+            "attention_policy": "DDR_REQUIRED",
+            "attention_reason": "PREFIX_HISTORY_DDR_REQUIRED_SHARED_RPUCACHE_ABI",
+            "selection_scope": plan.selection_scope,
+            "physical_plan_digest": plan.physical_plan_digest,
+            "plan_digest": plan.plan_digest,
+            "descriptor_words": len(
+                selected.stage_tuple.physical_descriptor),
+            "physical_descriptor": tuple(
+                selected.stage_tuple.physical_descriptor),
+            "dry_forward_agreement": True,
+        }
+        self._rpu_last_execution_plan = receipt
 
     def _bake_partial_mrope_tables(self, position_ids: torch.Tensor):
         """Host-bake Qwen2.5-VL chunked cos/sin [H, hd/2] → RPU fp16."""
@@ -360,6 +461,8 @@ class WallOssAction:
     @torch.no_grad()
     def predict(self, input_ids: torch.Tensor, noise: torch.Tensor,
                 dof_mask: torch.Tensor, num_steps: int = 10) -> dict:
+        from rpu_backend.adapters.wall_oss._retirement import _require_open
+        _require_open(self)
         # predict() is the non-fused LTM (no-mask) path: it embeds on the host via _w2_rpu/_w3_rpu
         # (only built when not fused) and dispatches causal_decoder_forward on self._handle. In
         # fused mode self._handle is a wall_oss_action_step handle and _w2_rpu/_w3_rpu are unset,
@@ -397,11 +500,20 @@ class WallOssAction:
         # (text-only context → no vision grid). Built once (stable keepalive across steps).
         pos = torch.arange(P, P + H, dtype=torch.int32)
         position_ids = pos[:, None].expand(H, 3).contiguous().to("rpu")
+        planned_chunk_size, a6_plan = self._plan_action_chunk(
+            H, P, is_causal=True
+        )
+        planned_stage_descriptor = (
+            a6_plan.selected.stage_tuple.physical_descriptor
+        )
+        if not planned_stage_descriptor:
+            raise RuntimeError("Wall-OSS action A6 winner has no native descriptor")
 
         sig = rpu_backend.graph.GraphSignature(
             op_id="wall_oss_action",
             shapes=[H, self.hidden_size],
-            dyn_dims=[self.num_layers, P, _native_action_chunk_size(H)],
+            dyn_dims=[self.num_layers, P, planned_chunk_size,
+                      *a6_plan.graph_key_words()],
             dtypes=[torch.float16],
         )
 
@@ -421,11 +533,27 @@ class WallOssAction:
                     True,            # is_causal
                     position_ids,    # mRoPE [H, 3]
                     [],              # deepstack dense embeds (none)
+                    None, None,      # partial M-RoPE tables
+                    -1, 0, False,
+                    0, planned_stage_descriptor,
                 )
             v = raw.float().cpu().reshape(1, H, self.hidden_size) @ self._proj_back.T  # [1,H,26]
             x = x + dt * v
             vs.append(v.clone()); xs.append(x.clone())
 
+        resolved = int(
+            torch.ops.rpu.causal_decoder_get_resolved_chunk_size(
+                self._handle)
+        )
+        if resolved != planned_chunk_size:
+            raise RuntimeError(
+                "Wall-OSS action dry/forward chunk disagreement: "
+                f"planned={planned_chunk_size}, forward={resolved}"
+            )
+        self._record_action_plan(
+            a6_plan, horizon=H, prefix_len=P,
+            chunk_size=planned_chunk_size,
+        )
         return {
             "action": x, "xs": torch.cat(xs, 0), "vs": torch.cat(vs, 0),
             "prefix_len": P, "dt": dt, "times": times,
@@ -436,15 +564,17 @@ class WallOssAction:
                            causal: bool = True) -> torch.Tensor:
         """[H, P+H] fp16 additive mask: action row i attends cols [0, real_P) (REAL prefix)
         + the configured action block, -inf elsewhere. CPU tensor — the op's sdpa_prepare_mask
-        copies it to a stable RPU DDR slot without a manual flush.
+        copies it to a stable RPU DDR slot (no manual flush, like the P3b window mask).
         Constant across denoise steps (P, H fixed) → baked once at graph BUILD.
 
         `real_P` < P only under the v16 KV-insert pad-to-16 path: the cache prefix occupies
         P (16-aligned) slots but the last (P-real_P) are masked padding (action must NOT
         attend to them)."""
         real_P = P if real_P is None else int(real_P)
-        # Vectorized build: every action row attends the real prefix [0, real_P).
-        # The action block [P, P+H) is causal or bidirectional.
+        # Vectorized build (was a Python H-row loop = 1 full + 2·H fill_ ops; the loop's
+        # ~2·H+1 aten::fill_ showed up as a host bubble in the torch profile). Bit-identical:
+        # every action row attends the real prefix [0, real_P). The action block
+        # [P, P+H) uses the checkpoint action-attention convention.
         m = torch.full((H, P + H), float("-inf"), dtype=torch.float16)
         m[:, :real_P] = 0.0                                            # real prefix, all rows
         if causal:
@@ -454,8 +584,7 @@ class WallOssAction:
         m[:, P : P + H].masked_fill_(allowed, 0.0)
         return m
 
-    def _action_mask_cached(self, P: int, H: int,
-                            real_P: int | None = None) -> torch.Tensor:
+    def _action_mask_cached(self, P: int, H: int, real_P: int | None = None) -> torch.Tensor:
         """Memoized `_build_action_mask`, keyed on (P, H, real_P) — all f(real_len) for a
         fixed horizon → recurring prefix lengths reuse one mask. The mask is read-only
         downstream (the op copies it to a stable DDR slot), so sharing across frames is
@@ -466,7 +595,8 @@ class WallOssAction:
         key = (P, H, P if real_P is None else int(real_P), causal)
         if self._host_cache and key in self._action_mask_cache:
             return self._action_mask_cache[key]
-        m = self._build_action_mask(P, H, real_P, causal=causal)
+        m = self._build_action_mask(
+            P, H, real_P, causal=causal)
         if self._host_cache:
             self._action_mask_cache[key] = m
         else:
@@ -479,15 +609,16 @@ class WallOssAction:
         scale = float(getattr(self, "_flow_time_scale", 1.0))
         return times if scale == 1.0 else times * scale
 
+
     def _precompute_b_step(self, dof_mask: torch.Tensor, times: torch.Tensor,
                            num_steps: int) -> torch.Tensor:
-        """X-independent per-step bias of the folded preprocessor:
+        """x-independent per-step bias of the folded preprocessor (Task 2):
         B_step[s] = (dof @ w1[:,AD:].T) @ w2[:,:AH].T + (te_s @ w2[:,AH:].T).
         Returns fp16 RPU [num_steps, AH] when dof is row-constant (→ C++ GEMM-bias path)
         else [num_steps, H, AH] (→ C++ same-shape add path)."""
         # base depends only on dof (const across steps). When dof is row-constant (the C++
-        # GEMM-bias path), all H rows of base are identical, so compute one row
-        # (M=1) instead of M=H.
+        # GEMM-bias path), all H rows of base are identical -> compute ONE row (M=1) instead
+        # of M=H, then share that row across the action horizon.
         row_constant = _dof_mask_is_row_constant(dof_mask)
         dof_b = dof_mask[:, :1] if row_constant else dof_mask    # [1,1,AD] or [1,H,AD]
         ae_dof = dof_b @ self._w1_dof.T                 # [1,*,AH]
@@ -504,10 +635,12 @@ class WallOssAction:
 
     def _precompute_bstep_base_te(self, dof_mask: torch.Tensor, times: torch.Tensor,
                                   num_steps: int):
-        """Return row-constant ``ae_dof`` and per-step time embeddings on RPU.
-
-        The op computes both projections in SPM and combines them into ``B_step``.
-        """
+        """Row-constant split of the x-independent B_step for the on-device path:
+        ae_dof [AH] = dof_row @ w1_dof.T   — tiny host GEMM (K=2·AD), x/step-independent;
+        te_all [num_steps, AH] = sinusoidal(times[:num_steps]).
+        The op computes base = ae_dof·w2_a.T and ct = te·w2_t.T in SPM and adds them, so BOTH
+        host preprocessor GEMMs (the [1,AH]@[AH,AH] base + the 10× te@w2_t) are dropped.
+        Both returned fp16 on RPU."""
         ae_dof = (dof_mask[:, :1] @ self._w1_dof.T)[0, 0]  # [AH]  (one row; row-constant)
         te_all = torch.cat([
             _sinusoidal_pos_emb(torch.tensor([times[i].item()]), self.action_hidden)
@@ -520,8 +653,8 @@ class WallOssAction:
         """Memoized x-independent denoise bias inputs `(row_constant, b_all, te_all)`.
         These depend only on `(dof_mask, num_steps)` — the dof_mask is the embodiment's
         active-dim mask and `times = linspace(0, 1, num_steps+1)` is fixed, so they are
-        constant across a rollout. Caching avoids rebuilding te_all and the
-        ae_dof/base GEMM, and holds stable RPU tensors (reused across frames →
+        constant across a rollout. Caching reuses te_all and the ae_dof/base result
+        and holds stable RPU tensors (reused across frames →
         also stabilizes the denoise op's input DDR addresses for replay). `b_all` is the
         row-constant ae_dof when row_constant else the full [steps,H,AH] B_step; `te_all`
         is the [steps,AH] table when row_constant else None — matching the two call sites.
@@ -539,12 +672,13 @@ class WallOssAction:
             self._bias_cache = (num_steps, dof_mask.clone(), row_constant, b_all, te_all)
         return row_constant, b_all, te_all
 
+
     @torch.no_grad()
     def _denoise_with_mask_loop(self, prefix_len: int, noise: torch.Tensor,
                                 dof_mask: torch.Tensor, position_ids: torch.Tensor,
                                 num_steps: int = 10, real_prefix_len: int | None = None,
                                 debug: bool = False) -> dict:
-        """In-graph unroll: one graph capture runs all `num_steps` Euler iterations
+        """Phase-2 in-graph unroll: ONE graph capture runs all `num_steps` Euler iterations
         (1 BUILD + 1 REPLAY). x persists in SPM across iterations; bias read at baked
         per-step offsets; final x = x_traj[-1]. Same return dict as `_denoise_with_mask_fused`."""
         H = _action_horizon(noise, self.action_dim)
@@ -562,13 +696,15 @@ class WallOssAction:
             raise RuntimeError(
                 f"RPU position_ids must be [H, 3], got {tuple(pos.shape)}"
             )
-        cos_il, sin_il = self._partial_mrope_tables(position_ids)
-        attn_mask = self._action_mask_cached(P, H, real_prefix_len)
+        cos_il, sin_il = self._partial_mrope_tables(
+            position_ids)
+        attn_mask = self._action_mask_cached(
+            P, H, real_prefix_len)
         times = self._flow_times(num_steps)
         dt = (times[1] - times[0]).item()
         # Bias inputs mirror the step op: row-constant -> ae_dof[hidden] + te_all[steps,hidden]
         # (on-device base+ct); else the full host-precomputed [steps,H,hidden] B_step.
-        # Memoized on (dof_mask, num_steps), which is constant across a rollout.
+        # Memoized on (dof_mask, num_steps), which are stable within a rollout.
         row_constant, b_all, te_all = self._denoise_bias_inputs(
             dof_mask, times, num_steps)
         kp = self._k_comb_pad
@@ -577,8 +713,19 @@ class WallOssAction:
                 f"in-graph Euler needs k_comb_pad({kp})=="
                 f"action_dim_pad({self._action_dim_pad})"
             )
+        x0_cpu = noise
+        planned_chunk_size, a6_plan = self._plan_action_chunk(
+            H, P, is_causal=False, mask_kv_len=P + H,
+            loop_mode=True, num_steps=num_steps,
+            b_step_is_bias=row_constant, have_te=te_all is not None,
+        )
+        planned_stage_descriptor = (
+            a6_plan.selected.stage_tuple.physical_descriptor
+        )
+        if not planned_stage_descriptor:
+            raise RuntimeError("Wall-OSS action A6 winner has no native descriptor")
         # x0 lives on the RPU as [1,H,kp] fp16; the op keeps x in SPM across all steps.
-        x0 = F.pad(noise, (0, kp - self.action_dim)).to(
+        x0 = F.pad(x0_cpu, (0, kp - self.action_dim)).to(
             dtype=torch.float16, device="rpu").contiguous()                  # [1,H,kp]
         x_traj = torch.empty((num_steps, H, kp), dtype=torch.float16, device="rpu")
         v_traj = torch.empty((num_steps, H, self._action_dim_pad),
@@ -589,20 +736,35 @@ class WallOssAction:
         sig = self._denoise_graph_signature(
             "wall_oss_action_denoise_loop", H, P, num_steps,
             int(row_constant),
+            resolved_chunk_size=planned_chunk_size,
+            plan_key_words=a6_plan.graph_key_words(),
         )
         with self._graph_cache.capture(sig):
             torch.ops.rpu.wall_oss_action_denoise_loop_forward(
                 self._handle, x0, cache.k_caches, cache.v_caches,
                 b_all, te_all, attn_mask, pos, x_traj, v_traj, dt, P,
-                num_steps, cos_il, sin_il)
+                num_steps, cos_il, sin_il,
+                planned_stage_descriptor)
+        resolved = int(
+            torch.ops.rpu.wall_oss_action_get_resolved_chunk_size(
+                self._handle)
+        )
+        if resolved != planned_chunk_size:
+            raise RuntimeError(
+                "Wall-OSS action dry/forward chunk disagreement: "
+                f"planned={planned_chunk_size}, forward={resolved}"
+            )
+        self._record_action_plan(
+            a6_plan, horizon=H, prefix_len=P,
+            chunk_size=planned_chunk_size,
+        )
         # Read trajectory ONLY after the capture exits (mutable SPM->DDR DMAs; op syncs).
         # Production (debug=False) reads back ONLY the final step (the action). The full
-        # [num_steps,H,*] xs/vs trajectories are diagnostics, so production skips
-        # their full readback, clone, and concatenation.
+        # [num_steps,H,*] xs/vs trajectories are read back only for diagnostics.
         x = x_traj[-1:][:, :, :self.action_dim].float().cpu()               # [1,H,action_dim]
         if debug:
             xs = torch.cat([
-                noise.clone(),
+                x0_cpu.clone(),
                 x_traj[:, :, :self.action_dim].float().cpu(),
             ], 0)
             vs = v_traj[:, :, :self.action_dim].float().cpu()
@@ -620,12 +782,11 @@ class WallOssAction:
                                  debug: bool = False) -> dict:
         """Fused denoise: on-device preprocessor + decoder + proj_back per step (1 BUILD +
         N-1 REPLAY). x never leaves the device between the preprocessor and proj_back."""
-        fp32_tail = rpu_env_bool("RPU_WALL_OSS_ACTION_FP32_TAIL")
-        # The in-graph unroll (1 BUILD + 1 REPLAY) is the default fused-denoise path;
+        fp32_tail = self._action_fp32_tail
+        # Phase-2: the in-graph unroll (1 BUILD + 1 REPLAY) is the DEFAULT fused-denoise path;
         # set RPU_WALL_OSS_DENOISE_UNROLL=0 to fall back to the per-step loop (1 BUILD + 9 REPLAY).
         # The FP32-tail diagnostic must run stepwise because x_t is accumulated on the host.
-        if (not fp32_tail and
-                rpu_env_bool("RPU_WALL_OSS_DENOISE_UNROLL", default=True)):
+        if not fp32_tail and self._denoise_unroll:
             return self._denoise_with_mask_loop(
                 prefix_len, noise, dof_mask, position_ids, num_steps=num_steps,
                 real_prefix_len=real_prefix_len, debug=debug)
@@ -647,15 +808,29 @@ class WallOssAction:
         attn_mask = self._action_mask_cached(P, H, real_prefix_len)  # CPU fp16 [H, P+H], memoized
         times = self._flow_times(num_steps)
         dt = (times[1] - times[0]).item()
-        # Row-constant masks pass ae_dof and per-step time embeddings separately;
-        # the op forms B_step in SPM. Other masks use a precomputed full B_step.
+        # On-device ct: for row-constant dof, pass the constant `base` as the bias and the
+        # per-step time emb `te` separately — the op computes ct = te·w2_t in SPM (drops the
+        # host te@w2_t GEMM). Non-row-constant falls back to the host-precomputed full B_step.
+        # Memoized on (dof_mask, num_steps) — constant across a rollout.
         row_constant, _bias, te_all = self._denoise_bias_inputs(dof_mask, times, num_steps)
+        planned_chunk_size, a6_plan = self._plan_action_chunk(
+            H, P, is_causal=False, mask_kv_len=P + H,
+            loop_mode=False, num_steps=1,
+            b_step_is_bias=row_constant, have_te=row_constant,
+        )
+        planned_stage_descriptor = (
+            a6_plan.selected.stage_tuple.physical_descriptor
+        )
+        if not planned_stage_descriptor:
+            raise RuntimeError("Wall-OSS action A6 winner has no native descriptor")
         ae_rpu = _bias if row_constant else None
         b_all = None if row_constant else _bias
         # row_constant selects the baked b_step/te_step mode. real_prefix_len
         # changes only the dynamically refreshed mask contents.
         sig = self._denoise_graph_signature(
             "wall_oss_action_step", H, P, num_steps, int(row_constant),
+            resolved_chunk_size=planned_chunk_size,
+            plan_key_words=a6_plan.graph_key_words(),
         )
         kp = self._k_comb_pad
         if kp != self._action_dim_pad:
@@ -663,8 +838,9 @@ class WallOssAction:
                 f"in-graph Euler needs k_comb_pad({kp})=="
                 f"action_dim_pad({self._action_dim_pad})"
             )
-        # x stays on RPU as [1,H,kp] fp16; the post-hook performs the Euler
-        # update in SPM using x_a/x_b as ping-pong buffers.
+        # x lives on the RPU as [1,H,kp] fp16 across all steps; the op's post-hook does the
+        # Euler add x += dt·v in SPM (no host round-trip, no PASSTHROUGH eltwise launch). The
+        # op reads x_a and writes x_b = x_a + dt·v; we swap so x_a always holds the latest x.
         # Cols [action_dim:kp] stay 0 (noise zero-padded; v_t cols [action_dim:] are 0).
         x_fp32 = (
             noise.detach().to(dtype=torch.float32, device="cpu").clone()
@@ -687,7 +863,8 @@ class WallOssAction:
             with self._graph_cache.capture(sig):
                 raw = torch.ops.rpu.wall_oss_action_step_forward(
                     self._handle, x_a, cache.k_caches, cache.v_caches, b_step, te_step,
-                    attn_mask, pos, v_t_buf, x_b, dt, P, cos_il, sin_il)  # x_b = x_a + dt·v
+                    attn_mask, pos, v_t_buf, x_b, dt, P, cos_il, sin_il,
+                    planned_stage_descriptor)  # x_b = x_a + dt·v
             if fp32_tail:
                 # Match the GPU action seam: final hidden + original proj_back weight +
                 # Euler state are FP32. The fused FP16 proj_back/Euler still execute in
@@ -712,6 +889,19 @@ class WallOssAction:
                 if debug:
                     vs_rpu.append(v_t_buf[:, :, :self.action_dim].clone())
                     xs_rpu.append(x_a[:, :, :self.action_dim].clone())
+        resolved = int(
+            torch.ops.rpu.wall_oss_action_get_resolved_chunk_size(
+                self._handle)
+        )
+        if resolved != planned_chunk_size:
+            raise RuntimeError(
+                "Wall-OSS action dry/forward chunk disagreement: "
+                f"planned={planned_chunk_size}, forward={resolved}"
+            )
+        self._record_action_plan(
+            a6_plan, horizon=H, prefix_len=P,
+            chunk_size=planned_chunk_size,
+        )
         if fp32_tail:
             x = x_fp32
             if debug:
@@ -737,13 +927,13 @@ class WallOssAction:
                           dof_mask: torch.Tensor, position_ids: torch.Tensor,
                           num_steps: int = 10, real_prefix_len: int | None = None,
                           debug: bool = False) -> dict:
-        """10-step Euler denoise over a prefix of arbitrary length.
+        """10-step Euler denoise over a prefix of ARBITRARY length (P4 E2E).
 
         Unlike :meth:`predict`, this does NOT prefill — the caller (WallOssVLA) has
         already filled the shared cache prefix K/V at [0, prefix_len) via
         ``WallOssLLM.forward_embeds``. Each step runs the expert-1 decoder over the
         action chunk with an explicit 2D mask (is_causal=False), so the prefix length
-        need not be %16-aligned (the LTM path requires that).
+        need not be %16-aligned (the LTM path P2 uses requires that).
 
         Args:
             prefix_len: P, the shared prefix (vision+text) length already in the cache.
@@ -752,6 +942,8 @@ class WallOssAction:
             position_ids: [H, 3] int32 mRoPE positions for the action chunk (continuing
                 after the prefix).
         """
+        from rpu_backend.adapters.wall_oss._retirement import _require_open
+        _require_open(self)
         H = _action_horizon(noise, self.action_dim)
         self.validate_execution_horizon(H)
         P = int(prefix_len)
@@ -774,9 +966,19 @@ class WallOssAction:
                 f"RPU position_ids must be [H, 3], got {tuple(pos.shape)}"
             )
         attn_mask = self._action_mask_cached(P, H, real_prefix_len)  # CPU fp16 [H, P+H], memoized
+        planned_chunk_size, a6_plan = self._plan_action_chunk(
+            H, P, is_causal=False, mask_kv_len=P + H
+        )
+        planned_stage_descriptor = (
+            a6_plan.selected.stage_tuple.physical_descriptor
+        )
+        if not planned_stage_descriptor:
+            raise RuntimeError("Wall-OSS action A6 winner has no native descriptor")
 
         sig = self._denoise_graph_signature(
             "wall_oss_action_masked", H, P, num_steps,  # distinct from predict's LTM path
+            resolved_chunk_size=planned_chunk_size,
+            plan_key_words=a6_plan.graph_key_words(),
         )
         times = self._flow_times(num_steps)
         dt = (times[1] - times[0]).item()
@@ -794,11 +996,27 @@ class WallOssAction:
                     False,           # is_causal=False → MASK_2D path
                     pos,             # mRoPE [H, 3]
                     [],
+                    None, None,
+                    -1, 0, False,
+                    0, planned_stage_descriptor,
                 )
             v = raw.float().cpu().reshape(1, H, self.hidden_size) @ self._proj_back.T  # [1,H,26]
             x = x + dt * v
             vs.append(v.clone()); xs.append(x.clone())
 
+        resolved = int(
+            torch.ops.rpu.causal_decoder_get_resolved_chunk_size(
+                self._handle)
+        )
+        if resolved != planned_chunk_size:
+            raise RuntimeError(
+                "Wall-OSS action dry/forward chunk disagreement: "
+                f"planned={planned_chunk_size}, forward={resolved}"
+            )
+        self._record_action_plan(
+            a6_plan, horizon=H, prefix_len=P,
+            chunk_size=planned_chunk_size,
+        )
         return {
             "x_norm": x, "xs": torch.cat(xs, 0), "vs": torch.cat(vs, 0),
             "prefix_len": P, "dt": dt, "times": times,
@@ -811,11 +1029,11 @@ def _load_expert1_decoder(st, cfg, num_layers, max_seq_len, *, w8a16: bool = Fal
                           action_chunk_size: int = 0):
     """Load expert-1 (action) decoder weights and install the RPU decoder handle.
 
-    Same split/swizzle@attn_tp=2 + QKV-bias path as `build_wall_oss_llm`, but at the
+    Same split/swizzle@attn_tp=2 + QKV-bias path as P1's `build_wall_oss_llm`, but at the
     action-expert dims (hidden 1024, intermediate 2048). q_proj 1024→2048, o_proj 2048→1024.
 
-    If ``fused_action`` is given (dict with single-core-swizzled w_comb/w3/proj_back +
-    action_dim/k_comb_pad/chunk_size), routes to the fused WallOssActionStepModel op
+    If ``fused_action`` is given (dict with TP8-col-swizzled w3 plus single-core
+    w_comb/proj_back and action_dim/k_comb_pad/chunk_size), routes to the fused WallOssActionStepModel op
     (decoder + on-device preprocessor + proj_back) instead of the plain causal_decoder.
     """
     NQ = cfg["num_attention_heads"]
@@ -1034,7 +1252,7 @@ def _load_expert1_decoder(st, cfg, num_layers, max_seq_len, *, w8a16: bool = Fal
 
 
 def _build_fused_action_weights(g, AH, AD, chunk_size):
-    """Fold the action preprocessor by linearity into single-core-swizzled
+    """Fold the action preprocessor by linearity (Task 2) into single-core-swizzled
     on-device weights + the CPU fp32 pieces the per-step B_step precompute needs.
 
     Returns (fused_action dict for the C-API, fused_extra dict for WallOssAction).
@@ -1051,7 +1269,7 @@ def _build_fused_action_weights(g, AH, AD, chunk_size):
     proj_back_p = F.pad(proj_back, (0, 0, 0, action_dim_pad - AD))  # [action_dim_pad, AH]
     fused_action = {
         "w_comb":    _to_rpu_half(tp_col_swizzle_mc_weight(w_comb_p.half(), 1)),
-        "w3":        _to_rpu_half(tp_col_swizzle_mc_weight(w3.half(), 1)),
+        "w3":        _to_rpu_half(tp_col_swizzle_mc_weight(w3.half(), _MLP_CORES)),
         "proj_back": _to_rpu_half(tp_col_swizzle_mc_weight(proj_back_p.half(), 1)),
         # w2_t = w2[:,AH:] (time proj) and w2_a = w2[:,:AH] (action proj); single-core
         # col-swizzled. Enable the on-device base = ae_dof·w2_a and ct = te·w2_t (the whole
@@ -1080,9 +1298,11 @@ def build_wall_oss_action(
     fp16_ckpt_dir: str | None = None,
     fused: bool = False,
     execution_config=None,
+
+
     flow_time_scale: float = 1.0,
 ) -> WallOssAction:
-    """Build the expert-0 prefill and expert-1 action denoiser sharing one RPUCache.
+    """Build the expert-0 prefill (P1) + expert-1 action denoiser sharing one RPUCache.
 
     Args:
         ckpt_dir: Wall-OSS-0.5 checkpoint directory. ``None`` (default) resolves at
@@ -1098,6 +1318,8 @@ def build_wall_oss_action(
             (on-device preprocessor + proj_back; folded by linearity). Gated upstream by
             RPU_WALL_OSS_FUSED_DENOISE.
     """
+    from rpu_backend.api._execution import _require_execution_process_safe
+    _require_execution_process_safe()
     precision_modes = {
         "w8a16": w8a16,
         "w4a16": w4a16,
@@ -1145,6 +1367,7 @@ def build_wall_oss_action(
         llm = build_wall_oss_llm(ckpt_dir, expert=0, max_seq_len=max_seq_len,
                                  w8a16=w8a16, w4a16=w4a16,
                                  nvfp4a16=nvfp4a16,
+                                 fp16_ckpt_dir=fp16_ckpt_dir,
                                  execution_config=execution_config)
     try:
         num_layers = cfg["num_hidden_layers"]
@@ -1185,6 +1408,7 @@ def build_wall_oss_action(
             )
 
         handle = None
+        model = None
         transferred = False
         try:
             handle, H, _INTER = _load_expert1_decoder(
@@ -1193,7 +1417,11 @@ def build_wall_oss_action(
                 fused_action=fused_action,
                 action_chunk_size=action_chunk_size,
             )
-            model = WallOssAction(
+            model = WallOssAction.__new__(WallOssAction)
+            model._handle, model._graph_cache, model._closed = handle, graph_cache, False
+            model._fused, model._owns_llm, model.llm = fused, owns_llm, llm
+            model._gc_retirement_enabled = False
+            WallOssAction.__init__(model,
                 llm=llm, handle=handle, graph_cache=graph_cache,
                 hidden_size=H, num_layers=num_layers,
                 action_dim=AD,                                             # 26
@@ -1213,17 +1441,25 @@ def build_wall_oss_action(
                 causal_action_attention_mask=causal_action_attention_mask,
                 flow_time_scale=flow_time_scale,
             )
+            model._precision_mode = (
+                1 if w8a16 else 2 if w4a16 else 3 if nvfp4a16 else 0
+            )
             transferred = True
             return model
-        finally:
+        except BaseException as error:
             if handle is not None and not transferred:
-                _destroy_action_handle(handle, fused)
-    except BaseException:
+                from rpu_backend.adapters.wall_oss._retirement import _cleanup_build_failure
+                keepalive = (graph_cache, llm, fused_action, w1, w2, w3, proj_back, w2_rpu, w3_rpu)
+                if model is not None:
+                    model._gc_retirement_enabled = False
+                    model._retirement_keepalive = keepalive
+                    _cleanup_build_failure(error, model, model.close)
+                else:
+                    _cleanup_build_failure(error, (handle, keepalive),
+                                           lambda: _destroy_action_handle(handle, fused))
+            raise
+    except BaseException as error:
         if owns_llm:
-            close_llm = getattr(llm, "close", None)
-            if close_llm is not None:
-                try:
-                    close_llm()
-                except Exception:
-                    pass
+            from rpu_backend.adapters.wall_oss._retirement import _cleanup_build_failure
+            _cleanup_build_failure(error, llm, llm.close)
         raise

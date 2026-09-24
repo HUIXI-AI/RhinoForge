@@ -1,5 +1,10 @@
-// RPU Conv2d wrappers for NHWC FP16 tensors in DDR and SPM.
-// Kernel launch ABI:
+// rpu_conv2d.cpp
+// RPU Conv2d kernel wrapper (DDR + SPM versions)
+//
+// Uses conv_fp16_{f1|f3|fn}_spm_16b_w128x128_k{tile_k}_1core_buf1_lpaddr_univ
+// kernels from rhinoOpLib. Data layout: NHWC in SPM.
+//
+// Register map:
 //   [0:1]  spm_in_v16      [2:3]  spm_flt_v16     [4:5]  spm_out_v16
 //   [6]    inhw             [7]    outhw            [8]    flthw
 //   [9]    inh              [10]   inw              [11]   batch
@@ -243,6 +248,55 @@ static void setup_conv2d_regs(
     kernel->set_regs(64, grid_dim_x);
     kernel->set_regs(65, grid_dim_y);
     kernel->set_regs(66, grid_dim_z);
+}
+
+// =============================================================================
+// SPM version — data already in SPM, caller provides SPM addresses (v16 units)
+// =============================================================================
+
+void rpu_launch_conv2d_spm_kernel(
+    uint32_t spm_in_v16,
+    uint32_t spm_flt_v16,
+    uint32_t spm_out_v16,
+    uint32_t spm_bias_v16,
+    int batch, int cin, int inh, int inw,
+    int cout, int kh, int kw,
+    int padh, int padH, int padw, int padW,
+    int strideh, int stridew,
+    int dilationh, int dilationw,
+    int groups, bool has_bias)
+{
+    int outh, outw;
+    compute_conv_output_dims(inh, inw, kh, kw, padh, padH, padw, padW,
+                             strideh, stridew, dilationh, dilationw,
+                             outh, outw);
+
+    int cin_per_grp  = cin / groups;
+    int cout_per_grp = cout / groups;
+    int outhw = outh * outw;
+    int tile_k = select_tile_k(cin_per_grp);
+
+    KernelId kid = select_conv_kernel_id(kh, kw, tile_k);
+
+    uint16_t grid_dim_x = CeilDiv(cout_per_grp, DEFAULT_TILE_N);
+    uint16_t grid_dim_y = CeilDiv(outhw, DEFAULT_TILE_M);
+    uint16_t grid_dim_z = batch * groups;
+
+      // Immediate execution on core 0
+      Kernel_t* kernel = GET_KERNEL(kid);
+      TORCH_CHECK(kernel, "rpu_conv2d_spm: kernel not found for KernelId=",
+                  static_cast<int>(kid));
+
+      setup_conv2d_regs(kernel,
+          spm_in_v16, spm_flt_v16, spm_out_v16, spm_bias_v16,
+          batch, cin, inh, inw, cout, kh, kw,
+          padh, padH, padw, padW,
+          strideh, stridew, dilationh, dilationw,
+          groups, has_bias, outh, outw, tile_k,
+          grid_dim_x, grid_dim_y, grid_dim_z);
+
+      auto* wq = GET_QUEUE(1);
+      wq->enqueu_kernel(*kernel, {grid_dim_x, grid_dim_y, grid_dim_z}, {0});
 }
 
 // =============================================================================

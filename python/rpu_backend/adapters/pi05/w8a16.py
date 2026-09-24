@@ -61,12 +61,25 @@ def detect_and_validate_gemma_decoder_w8a16(
     for layer_idx, parent_name, proj_name, module in projections:
         scale = getattr(module, "weight_scale", None)
         fq_name = f"{label}.layers[{layer_idx}].{parent_name}.{proj_name}"
-        if scale is None or scale.dtype != torch.float16:
+        nvfp4 = getattr(module, "_pi05_nvfp4_abi", None) == "striped_v2"
+        group_size = getattr(module, "_pi05_int4_group_size", None)
+        grouped = group_size in (32, 64, 128)
+        if scale is None or scale.dtype != (torch.uint8 if nvfp4 else torch.float16):
             raise RPUBackendError(
                 f"Pi05 quant validation failed: quantized {fq_name}.weight "
                 f"({module.weight.dtype}) requires fp16 weight_scale"
             )
-        if module.weight.dtype == torch.int8:
+        if nvfp4:
+            scale_shape_ok = (module.weight.dtype == torch.uint8 and scale.dim() == 2
+                              and tuple(scale.shape) == (module.in_features // 16, module.out_features))
+            ts = getattr(module, "tensor_scale", None)
+            if ts is None or ts.dtype != torch.float32 or ts.numel() != 1:
+                raise RPUBackendError(f"{fq_name}: missing FP32 NVFP4 tensor_scale")
+            expected = "FP8 [K/16,N] with FP32 tensor_scale"
+        elif module.weight.dtype == torch.int8 and grouped:
+            scale_shape_ok = tuple(scale.shape) == (module.in_features // group_size, module.out_features)
+            expected = "logical K128 group scales [K/128,N]"
+        elif module.weight.dtype == torch.int8:
             scale_shape_ok = (
                 scale.dim() == 1 and scale.numel() == module.weight.size(0)
             )
@@ -273,3 +286,27 @@ def pi05_expert_scale_lists(expert, *, require_rpu: bool = False):
     return gemma_decoder_scale_lists(
         expert, require_rpu=require_rpu, label="expert"
     )
+
+
+def pi05_nvfp4_tensor_scale_tables(decoder):
+    """Cold, immutable projection tables shared by AdaRMS and fused denoise."""
+    projections = list(_iter_decoder_projections(decoder, label="expert"))
+    if not any(getattr(m, "_pi05_nvfp4_abi", None) for _, _, _, m in projections):
+        return []
+    if hasattr(decoder, "_pi05_nvfp4_tensor_scale_tables"):
+        return decoder._pi05_nvfp4_tensor_scale_tables
+    paths = (("self_attn", "q_proj"), ("self_attn", "o_proj"),
+             ("mlp", "gate_proj"), ("mlp", "up_proj"), ("mlp", "down_proj"))
+    if len(decoder.layers) != 18:
+        raise RPUBackendError("Pi05 NVFP4 v2 requires 18 Action layers")
+    tables = []
+    for parent, name in paths:
+        modules = [getattr(getattr(layer, parent), name) for layer in decoder.layers]
+        if any(getattr(m, "_pi05_nvfp4_abi", None) != "striped_v2"
+               or not getattr(m, "_pi05_nvfp4_packed", False) for m in modules):
+            raise RPUBackendError("Pi05 NVFP4 tensor tables require all five packed projection families")
+        table = torch.ones(24, dtype=torch.float32)
+        table[:18] = torch.stack([m.tensor_scale.detach().cpu().reshape(()) for m in modules])
+        tables.append(table.to(modules[0].weight.device))
+    decoder._pi05_nvfp4_tensor_scale_tables = tables
+    return tables

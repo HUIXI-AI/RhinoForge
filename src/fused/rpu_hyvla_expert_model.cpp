@@ -1,10 +1,8 @@
-// rpu_hyvla_expert_model.cpp — Hy-Embodied-0.5-VLA 的 action expert denoise 解码器。
-// 设计与易错点见 rpu_hyvla_expert_model.h 的文件头。
-//
-// 层体是 rpu_hyvla_vlm_model.cpp 的**单塔版**: 同样的 rope→QK-norm 换序, 但去掉了
-// 全部孪生分支 (双 GEMM / 行掩码 merge / act 侧 Temp 槽 / 掩码 Persistent 槽) ——
-// expert 的 modality_mask 恒 True，reference path 只走 `_v` 分支。
-// 因此本文件不 override declare_buffers: 用到的槽基类全都声明过。
+// rpu_hyvla_expert_model.cpp — Hy-Embodied-0.5-VLA action-expert decoder.
+// The expert uses the _v branch because its suffix modality mask is true.
+// Unlike the VLM it needs no twin GEMMs or row-mask merge. It applies RoPE
+// before shared QK normalization. The base declares layer buffers; this class
+// adds unroll hooks and plans mask lifetimes across bodies.
 #include "rpu_hyvla_expert_model.h"
 #include "model_handle_registry.h"
 #include "rpu_kernel_decls.h"
@@ -12,6 +10,7 @@
 #include "rpu_eltwise.h"
 #include "rpu_helpers.h"
 #include "rpu_runtime_state.h"
+#include "rpu_spm_residency.h"
 
 #include <ATen/record_function.h>
 #include <c10/util/Half.h>
@@ -20,164 +19,30 @@
 #include <cstring>
 #include <vector>
 
-// ─────────────────────────────────────────────────────────────────────────────
-// RPU_HY_VLA_FAST_REPLAY —— **逐座 opt-in** 的 fast-replay，默认 OFF。
+// RPU_HY_VLA_FAST_REPLAY skips the per-component host op walk only when all
+// request changes are represented by stable buffers or mutable DMA bases.
+// RPU_HY_VLA_FAST_REPLAY_PRELOAD also requires the layer-loop skip and clean
+// weights; captured preload nodes still execute on replay.
 //
-// 打开后 REPLAY 期不再重走该座的 op stream，减少重复 emit 的 host 开销。
+// RPU_HY_VLA_ACTION_MLP_MC partitions A6 along K and reduces the partial outputs.
+// Do not add bias inside row-partitioned GEMM: add it once after all-reduce.
+// The consumed enc_h_spm input can then be cleared and reused as the zero
+// residual; all-reduce requires distinct input, residual and output addresses.
+// Python supplies the same core count to swizzling and native set_weights.
+// Partitioning changes accumulation order and may change rounding.
 //
-// ⚠️ 契约：**body 不得有 kernel 会读的
-// per-call host 副作用**。合法出口只有：position_ids 的稳定 keepalive、
-// dynamic_config 拷进稳定 DDR 槽的显式 2D mask、`hidden_in_src_base_` 与
-// op 序言里 `*_mutable(&member)` 的可变基址。
+// RPU_HY_VLA_MASK_ONCE extends a constant request mask's lifetime. The allocator
+// tries whole-forward residency after all hooks are declared, including phase 0.
+// Use it only when the temporary peak does not grow; otherwise preserve one
+// load per body. Every invocation still refreshes the current request's mask.
 //
-// 逐座开关用于隔离各子图的 replay 契约与故障范围。
-// 取值：逗号分隔的座名（vit / vlm / expert），或 1/on/true 表示三座全开。
-// ─────────────────────────────────────────────────────────────────────────────
-static bool hyvla_fast_replay_on(const char* who) {
-    static const std::string v = [] {
-        const char* e = std::getenv("RPU_HY_VLA_FAST_REPLAY");
-        return std::string(e ? e : "");
-    }();
-    if (v.empty() || v == "0" || v == "off" || v == "false") return false;
-    if (v == "1" || v == "on" || v == "true") return true;
-    return v.find(who) != std::string::npos;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// RPU_HY_VLA_FAST_REPLAY_PRELOAD —— 同样**逐座 opt-in**，默认 OFF。
-// 打开后在 REPLAY（且权重 clean）跳过 preload 回调与 `preload_fn` 的
-// host 重走 —— 已建好的 preload DMA 节点仍由 segment launch 重放到同一块
-// persistent SPM，逐位不变。
-// 依赖 `fast_replay_skip_layer_loop` 一起开（框架内部与它 AND）。
-// ─────────────────────────────────────────────────────────────────────────────
-static bool hyvla_fast_replay_preload_on(const char* who) {
-    static const std::string v = [] {
-        const char* e = std::getenv("RPU_HY_VLA_FAST_REPLAY_PRELOAD");
-        return std::string(e ? e : "");
-    }();
-    if (v.empty() || v == "0" || v == "off" || v == "false") return false;
-    if (v == "1" || v == "on" || v == "true") return true;
-    return v.find(who) != std::string::npos;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// RPU_HY_VLA_ACTION_MLP_MC —— unroll 的 `action_time_mlp_out`（步 A6）走几个核。
-// 默认 **8**；取 0/off/false 回到单核（逐字节复现改动前的行为）。
+// RPU_HY_VLA_SILU_MUL replaces separate SiLU and multiply launches with one fused
+// operation. The up GEMM must precede it; up and gate have independent inputs.
+// The fused operation may have a different intermediate rounding boundary.
 //
-// 为什么值得单独开一个开关：A6 是 `[hidden, hidden]` 的 fp16 GEMM，本模型
-// hidden=1024 ⇒ 权重 **2 MB**，而相邻的较小投影也被写成了 `num_cores=1`。
-// A6 的权重远大于相邻投影，适合多核分摊；较小投影保持原调度以避免
-// 不必要的 all-reduce 开销。因此只调整 A6。
-//
-// 做法：K 方向切 8 核（`partition=0`）+ 自动调度的 fused ring all-reduce。
-//   ⚠️ bias **不能**进 GEMM —— partition=0 时每核都会加一遍，all-reduce 后变 8 倍。
-//      改成 all-reduce 之后用 `1xC_NxC` 按列广播加一次。
-//   ⚠️ 零残差复用 `enc_h_spm`：它是 A6 的输入，A6 发完就死，就地清零当残差用，
-//      省掉一个 104 KB/核 的槽（`all_reduce_sum_residual` 要求三个地址互不相同）。
-//   ⚠️ **Python 侧的 swizzle 必须使用同一核数**，否则权重布局与 launcher
-//      不一致会静默算错。
-//      （同一模式见 `RPU_HY_VLA_PATCH_EMBED_MC` / `_patch_embed_cores()`。）
-//
-// ⚠️ **不是逐位等价**：K 被切成 8 段分别累加再跨核求和 = 求和重排。
-//    验收看 cos 分布，不能只看 wall。
-// ─────────────────────────────────────────────────────────────────────────────
-static int hyvla_action_mlp_cores() {
-    static const int nc = [] () -> int {
-        const char* e = std::getenv("RPU_HY_VLA_ACTION_MLP_MC");
-        if (!e || !*e) return v3::NUM_CORES;   // 本 helper 在 v3 外 ⇒ 要限定
-        const std::string v(e);
-        // 只有 0/off/false 关闭；`=1` 表示启用，与其余开关约定一致。
-        if (v == "0" || v == "off" || v == "false") return 1;
-        return v3::NUM_CORES;
-    }();
-    return nc;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// RPU_HY_VLA_MASK_ONCE —— 同样**逐座 opt-in**，默认 OFF。
-//
-// 显式 2D mask 在整个 forward 里逐层恒定（形状 `(seq_q, kv_seq_len)` 由
-// dynamic_config 固定，单 chunk），但 `sdpa_mask` 槽默认是**相位混叠**的 Temp
-// （基类 `rpu_qwen3_model.h:1215` 的 `[3,5]`），别的 Temp 会压在同一段 SPM 上
-// ⇒ 每层 SDPA 之前都得把它从 DDR 重新广播进 SPM 一次。基类那里的注释
-// （`rpu_qwen3_model.h:2025`）把这条记成了前提，其实它是**槽的相位窗口**带来的，
-// 不是 mask 本身要变。
-//
-// 逐层重复广播同一 mask 会产生与层数成比例的冗余 DMA。
-//
-// 打开后做两件事：① 把 `sdpa_mask` 的相位窗口撑满整个层体 ⇒ 分配器不再让别的
-// Temp 混叠它；② 只在 `layer_idx == 0` 发一次 DMA。
-// **逐位等价** —— SDPA 读到的 SPM 字节完全相同，只是写入次数从 n_layers 变成 1。
-//
-// ⚠️ 为什么是"每个 body 一次"而不是"整图一次"：expert 的 `pre_layers_fn` 临时量
-// （`enc_h_spm`/`emb_core0_spm`/… 相 `[0,0]`）与 mask 的相位窗口不重叠，分配器
-// **允许**它们共用地址，而 pre-hook 在每个 body 开头就会写它们。每 body 重发一次
-// 既不依赖任何跨 body 的存活假设，又已经拿到 320 → 10 次（96.9%）的减量。
-// ─────────────────────────────────────────────────────────────────────────────
-static bool hyvla_mask_once_on(const char* who) {
-    static const std::string v = [] {
-        const char* e = std::getenv("RPU_HY_VLA_MASK_ONCE");
-        return std::string(e ? e : "");
-    }();
-    if (v.empty() || v == "0" || v == "off" || v == "false") return false;
-    if (v == "1" || v == "on" || v == "true") return true;
-    return v.find(who) != std::string::npos;
-}
-
-// `sdpa_mask` 的相位窗口撑满层体 `[1,8]` 并落到 LayerWide —— LayerWide 与
-// KvInsert/Compute **恒冲突**、与同域 LayerWide 按相位重叠判冲突
-// （`rpu_spm_allocator.cpp::has_conflict`），撑满即等于"独占一块，谁也压不到"。
-// ─────────────────────────────────────────────────────────────────────────────
-// RPU_HY_VLA_SILU_MUL —— 逐座 opt-in，默认 OFF。
-//
-// SwiGLU 的 `unary(SILU)` + `binary(MUL)` 两枪合成 op-lib 里**已有**的
-// `llama_silu_mul` 一枪（`KernelId::LLAMA_SILU_MUL`，默认 ref 里就有，launcher
-// `rpu_launch_silu_mul_spm_kernel` 也早就写好了 —— 此前只有 RhinoVLA 在用，
-// 见 `rpu_rhino_vla_model.cpp::rhino_vla_fused_silu_mul_enabled`）。
-// **不是新算子**，是把一个已存在但没接线到本模型的核接上。
-//
-// 融合后减少一次 launch，同时把两枪路径的 3 读 2 写降为 2 读 1 写。
-//
-// ⚠️ 顺序变化：合并后必须先发 up 的 GEMM 再做 silu_mul（原路径是 gate GEMM →
-// silu → up GEMM → mul）。两者无数据依赖，交换合法。
-//
-// ⚠️ **不保证逐位等价**：融合核内部先 silu 后乘，中间量是否落 fp16 由核决定，
-// 与两枪路径可能差一次舍入 ⇒ 验收必须跑 cos 分布 A/B，不能只看逐位。
-// ─────────────────────────────────────────────────────────────────────────────
-static bool hyvla_silu_mul_on(const char* who) {
-    static const std::string v = [] {
-        const char* e = std::getenv("RPU_HY_VLA_SILU_MUL");
-        return std::string(e ? e : "");
-    }();
-    if (v.empty() || v == "0" || v == "off" || v == "false") return false;
-    if (v == "1" || v == "on" || v == "true") return true;
-    return v.find(who) != std::string::npos;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// RPU_HY_VLA_KVPAD16 —— 逐座 opt-in，默认 OFF。
-//
-// `RPU_KVINSERT_HYBRID_V16` 在 `seq % 16 != 0` 时需要分别处理 v16 主体与
-// 尾部行。补齐 SPM 行容量可以用一次 v16 launch 覆盖两部分。
-//
-// 打开后把 k/v 的 SPM 槽行数补齐到 16 的倍数（expert 51→64、ViT 588→592，
-// 每核各多 3.3 KB / 1.3 KB），并把这个**行容量**告诉 launcher，让它一次 v16 打完。
-// 多写进 cache 的 `[position+seq, position+pad)` 那几行是 SPM 里的既有字节，
-// **不会被读** —— SDPA 收到的 `kv_seq_len` 恒等于 `position + seq`
-// （expert 291、ViT 588）。而且那一段本来就装着上一帧的陈旧数据、一直靠
-// `kv_seq_len` 挡着 ⇒ **逐位等价**，不是"新引入了脏数据"。
-// ─────────────────────────────────────────────────────────────────────────────
-static bool hyvla_kvpad16_on(const char* who) {
-    static const std::string v = [] {
-        const char* e = std::getenv("RPU_HY_VLA_KVPAD16");
-        return std::string(e ? e : "");
-    }();
-    if (v.empty() || v == "0" || v == "off" || v == "false") return false;
-    if (v == "1" || v == "on" || v == "true") return true;
-    return v.find(who) != std::string::npos;
-}
-
-// 把 k/v 槽撑到 `rows` 行（只增不减）。返回实际保证的行容量。
+// RPU_HY_VLA_KVPAD16 rounds K/V SPM capacity to a multiple of 16 for one v16
+// insertion. The additional cache rows are excluded by the logical kv_seq_len.
+// Grow K/V capacity to at least rows; return the guaranteed row capacity.
 static int64_t hyvla_grow_kv_slots(std::vector<v3::BufferDecl>& decls,
                                    int64_t rows, int64_t local_kv_elems) {
     const int64_t need = Align(rows * local_kv_elems * 2, 256);
@@ -187,43 +52,15 @@ static int64_t hyvla_grow_kv_slots(std::vector<v3::BufferDecl>& decls,
     return rows;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// RPU_HY_VLA_RMSNORM_PAD16 —— 逐座 opt-in，默认 OFF。
+// RPU_HY_VLA_RMSNORM_PAD16 grows residual1/input_norm/q/output to aligned row
+// capacities so a vector route can use one launch. Aliases such as residual2
+// follow their backing allocation. Downstream consumers use only logical rows;
+// RMSNorm is row-local, so padded values cannot affect live rows.
 //
-// `llama_rms_norm_v16` 要求 **M % 16 == 0**，而本座的 M 是 51
-// （input/post/k_norm）与 102（q_norm）。将行数补齐到 16 的倍数可以保持
-// 单次 launch，避免主体与尾部拆成两枪。
-//
-// 打开后把 rmsnorm 读写到的四个槽撑到补齐后的行数（`residual1` / `input_norm`
-// —— `residual2` 是 `input_norm` 的别名，跟着涨 —— 以及 `q` / `output`），
-// 每核多约 **57 KB**（余量 1757.5 KB）。
-// 多算出来的 [51,64) / [102,112) 行读的是 SPM 里的既有字节、写的是槽尾，
-// **下游一律按 M=51 / seq_q=51 消费 ⇒ 永不被读**；RMSNorm 逐行独立，
-// 陈旧数据即使是 Inf/NaN 也只污染它自己那一行。⇒ **逐位等价**。
-// ─────────────────────────────────────────────────────────────────────────────
-// `RPU_HY_VLA_PARTIAL_ROPE` selects the validated partial-MRoPE host path.
-// Values: "expert", "vlm_vision", "1", or empty (default off).
-static bool hyvla_partial_rope_on(const char* who) {
-    static const std::string v = [] {
-        const char* e = std::getenv("RPU_HY_VLA_PARTIAL_ROPE");
-        return std::string(e ? e : "");
-    }();
-    if (v.empty() || v == "0" || v == "off" || v == "false") return false;
-    if (v == "1" || v == "on" || v == "true") return true;
-    return v.find(who) != std::string::npos;
-}
-
-static bool hyvla_rmsnorm_pad16_on(const char* who) {
-    static const std::string v = [] {
-        const char* e = std::getenv("RPU_HY_VLA_RMSNORM_PAD16");
-        return std::string(e ? e : "");
-    }();
-    if (v.empty() || v == "0" || v == "off" || v == "false") return false;
-    if (v == "1" || v == "on" || v == "true") return true;
-    return v.find(who) != std::string::npos;
-}
-
-// 把指定的槽撑到至少 `need` 字节（只增不减），返回是否全部命中。
+// RPU_HY_VLA_PARTIAL_ROPE selects partial_mrope with rotary_dim == head_dim.
+// Its grid is (ceil(rotary_dim/2/64), ceil(seq/64)); cos/sin remain the existing
+// [max_seq, head_dim/2] tables and pos_offset is a table-row offset.
+// Grow the requested buffers without shrinking them; report whether all exist.
 static bool hyvla_grow_slot(std::vector<v3::BufferDecl>& decls,
                             const char* name, int64_t need) {
     for (auto& b : decls)
@@ -246,8 +83,121 @@ static void hyvla_widen_sdpa_mask_slot(std::vector<v3::BufferDecl>& decls) {
 
 namespace v3 {
 
-HyVlaExpertModel::HyVlaExpertModel()  = default;
+// HYVLA_EXPERT_FIXED_KERNEL_BASIS: launchers outside the selector-controlled
+// sites below are invariant model-dataflow glue.  Every cold/per-handle route
+// that changes the graph, kernel, DMA, collective, RoPE, or layout is bound to
+// an explicit physical-manifest entry before its launcher is emitted.
+
+constexpr int64_t HYVLA_EXPERT_ATTN_SITE = 8372732983358876378LL;
+constexpr int64_t HYVLA_EXPERT_KV_SITE = 2502630319608950519LL;
+constexpr int64_t HYVLA_EXPERT_KV_PADDING_SITE = 3353793944280539666LL;
+constexpr int64_t HYVLA_EXPERT_GRAPH_SCHEDULE_SITE = 5602663956511155425LL;
+constexpr int64_t HYVLA_EXPERT_MASK_SCHEDULE_SITE = 1728596774874433151LL;
+
+constexpr int64_t HYVLA_EXPERT_PRE_X0_DMA_SITE = 8468013054253886391LL;
+constexpr int64_t HYVLA_EXPERT_PRE_X_FEEDBACK_DMA_SITE = 8068344894213309215LL;
+constexpr int64_t HYVLA_EXPERT_PRE_TIME_BROADCAST_DMA_SITE = 6202700778193353884LL;
+constexpr int64_t HYVLA_EXPERT_PRE_TIME_SCATTER_DMA_SITE = 5681167721722131756LL;
+constexpr int64_t HYVLA_EXPERT_PRE_MO_BIAS_DMA_SITE = 3234409676337683315LL;
+constexpr int64_t HYVLA_EXPERT_PRE_WC_LINEAR_SITE = 94006821360779226LL;
+constexpr int64_t HYVLA_EXPERT_PRE_ENCODER_ACTIVATION_SITE = 4663734415968545282LL;
+constexpr int64_t HYVLA_EXPERT_PRE_MO_SINGLE_LINEAR_SITE = 8695816214428940237LL;
+constexpr int64_t HYVLA_EXPERT_PRE_MO_MULTI_LINEAR_SITE = 2981602481703720578LL;
+constexpr int64_t HYVLA_EXPERT_PRE_MO_ZERO_SITE = 4262731488614715412LL;
+constexpr int64_t HYVLA_EXPERT_PRE_MO_ALL_REDUCE_SITE = 414612096590535714LL;
+constexpr int64_t HYVLA_EXPERT_PRE_MO_BIAS_ADD_SITE = 2288102790066046320LL;
+constexpr int64_t HYVLA_EXPERT_POST_OP_LINEAR_SITE = 2567201997024428744LL;
+constexpr int64_t HYVLA_EXPERT_POST_TRAJECTORY_DMA_SITE = 601652272865429711LL;
+
+constexpr int64_t HYVLA_EXPERT_INPUT_NORM_SITE = 2943148670015766034LL;
+constexpr int64_t HYVLA_EXPERT_QKV_LINEAR_SITE = 1236943476379916654LL;
+constexpr int64_t HYVLA_EXPERT_Q_PARTIAL_ROPE_SITE = 4314852815466214180LL;
+constexpr int64_t HYVLA_EXPERT_Q_ROPE_SITE = 2913243967564739575LL;
+constexpr int64_t HYVLA_EXPERT_Q_NORM_SITE = 2998501871001866367LL;
+constexpr int64_t HYVLA_EXPERT_K_PARTIAL_ROPE_SITE = 6204149761964354754LL;
+constexpr int64_t HYVLA_EXPERT_K_ROPE_SITE = 2703116739699322018LL;
+constexpr int64_t HYVLA_EXPERT_K_NORM_SITE = 739473353641483894LL;
+constexpr int64_t HYVLA_EXPERT_PREPARE_ATTN_ALL_REDUCE_SITE = 7991151858475231951LL;
+constexpr int64_t HYVLA_EXPERT_O_LINEAR_SITE = 36160785207660705LL;
+constexpr int64_t HYVLA_EXPERT_ATTN_ALL_REDUCE_SITE = 5454728429937755845LL;
+constexpr int64_t HYVLA_EXPERT_POST_NORM_SITE = 48200961442401552LL;
+constexpr int64_t HYVLA_EXPERT_GATE_LINEAR_SITE = 2105943201978379215LL;
+constexpr int64_t HYVLA_EXPERT_MLP_SILU_SITE = 1848219361374021523LL;
+constexpr int64_t HYVLA_EXPERT_UP_LINEAR_SITE = 4699339857693172978LL;
+constexpr int64_t HYVLA_EXPERT_MLP_SILU_MUL_SITE = 82400951984648727LL;
+constexpr int64_t HYVLA_EXPERT_MLP_MUL_SITE = 6313036385062334532LL;
+constexpr int64_t HYVLA_EXPERT_DOWN_LINEAR_SITE = 2699481217144264799LL;
+constexpr int64_t HYVLA_EXPERT_MLP_ALL_REDUCE_SITE = 2337931566137374851LL;
+constexpr int64_t HYVLA_EXPERT_FINAL_NORM_SITE = 6930260388322325380LL;
+
+constexpr uint32_t HYVLA_EXPERT_KV_CAPABILITIES =
+    KV_INSERT_CAP_V2 | KV_INSERT_CAP_V16 | KV_INSERT_CAP_PAD16 |
+    KV_INSERT_CAP_HYBRID2 | KV_INSERT_CAP_NON8_TP_V16;
+constexpr int64_t HYVLA_EXPERT_KV_REASON_PREFIX_HISTORY_DDR_REQUIRED = 2;
+
+enum class HyVlaExpertGraphScheduleRoute : int64_t {
+    REEMIT_LAYER_LOOP = 1,
+    FAST_REPLAY_SKIP_LAYER_LOOP = 2,
+    MASK_EACH_LAYER = 3,
+    MASK_FIRST_LAYER_ONLY = 4,
+    ZERO_A6_RESIDUAL = 5,
+    ADD_A6_BIAS_AFTER_REDUCE = 6,
+    MASK_FIRST_BODY_FIRST_LAYER = 7,
+};
+
+enum class HyVlaExpertNormalizationRoute : int64_t {
+    RMSNORM_SCALAR_ROWS = 1,
+    RMSNORM_V16_ROWS = 2,
+};
+
+enum class HyVlaExpertActivationRoute : int64_t {
+    SILU_UNARY = 1,
+    MUL = 2,
+    SILU_MUL_FUSED = 3,
+};
+
+enum class HyVlaExpertRopeRoute : int64_t {
+    ROPE_1D = 1,
+    PARTIAL_MROPE = 2,
+};
+
+enum class HyVlaExpertKvPaddingRoute : int64_t {
+    LOGICAL_ROWS = 1,
+    PAD16_ROWS = 2,
+};
+
+enum class HyVlaExpertDmaRoute : int64_t {
+    DDR_BROADCAST_TO_SPM_MUTABLE = 1,
+    DDR_BROADCAST_TO_SPM_FIXED = 2,
+    DDR_SCATTER_TO_SPM_FIXED = 3,
+    SPM_TO_DDR_MUTABLE = 4,
+};
+
+enum class HyVlaExpertAllReduceRoute : int64_t {
+    PREPARE_RING_INPUT = 3,
+};
+
+HyVlaExpertModel::HyVlaExpertModel() = default;
 HyVlaExpertModel::~HyVlaExpertModel() = default;
+
+void HyVlaExpertModel::set_runtime_config(
+    bool fast_replay, bool fast_replay_preload, bool mask_once,
+    bool silu_mul, bool kvpad16, bool partial_rope,
+    bool rmsnorm_pad16) {
+    TORCH_CHECK(
+        !cold_config_bound_ && !production_config_bound_,
+        "hyvla_expert_set_runtime_config must run exactly once before "
+        "set_weights");
+    cold_fast_replay_ = fast_replay;
+    cold_fast_replay_preload_ = fast_replay_preload;
+    cold_mask_once_ = mask_once;
+    cold_silu_mul_ = silu_mul;
+    cold_kvpad16_ = kvpad16;
+    cold_partial_rope_ = partial_rope;
+    cold_rmsnorm_pad16_ = rmsnorm_pad16;
+    cold_config_bound_ = true;
+    invalidate_model_state();
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // set_weights_expert — 基类委托 + 子类影子
@@ -261,15 +211,27 @@ void HyVlaExpertModel::set_weights_expert(
     const at::Tensor& cos, const at::Tensor& sin, const at::Tensor& final_norm_w,
     int64_t num_q_heads, int64_t num_kv_heads, int64_t head_dim,
     int64_t hidden_size, int64_t intermediate_size, double eps,
-    int64_t chunk_size,
+    int64_t chunk_size, int64_t action_mlp_cores,
     at::TensorList q_ws_list, at::TensorList k_ws_list,
     at::TensorList v_ws_list, at::TensorList o_ws_list,
     at::TensorList gate_ws_list, at::TensorList up_ws_list,
     at::TensorList down_ws_list)
 {
+    TORCH_CHECK(
+        cold_config_bound_,
+        "hyvla_expert set_weights requires an explicit immutable runtime "
+        "config snapshot");
     TORCH_CHECK(chunk_size == 51,
                 "hyvla_expert set_weights: the certified Hy-VLA suffix has "
                 "exactly 51 rows, got ", chunk_size);
+    TORCH_CHECK(action_mlp_cores == 1 || action_mlp_cores == NUM_CORES,
+                "hyvla_expert set_weights: action_mlp_cores must be 1 or ",
+                NUM_CORES, ", got ", action_mlp_cores);
+    if (production_config_bound_) {
+        TORCH_CHECK(action_mlp_cores_ == action_mlp_cores,
+                    "hyvla_expert set_weights: action MLP core count is "
+                    "immutable for a native handle");
+    }
     // Fail the cold-only check before the base setter retains any weights.
     set_chunk_envelope(/*max_kv_len=*/291, /*chunk=*/64);
     // 校验/状态提交全部委托基类 (含 q/k norm 全套检查 + quant scale 的
@@ -290,7 +252,7 @@ void HyVlaExpertModel::set_weights_expert(
                 "hyvla_expert set_weights: q/k_norm lists must be non-empty "
                 "(Hy-VLA is Qwen3-style). ⚠️ 且必须是 **VLM 层** 的 "
                 "query/key_layernorm —— 两塔共享 VLM 那一份, expert 自己的同名 "
-                "张量在该路径中不使用。");
+                "张量是死权重 (P0 hook calls=0)。");
 
     // 影子副本 — build_layer_subgraph 要逐层权重, 而基类 layer_weights_ 是 private。
     // W4 scale 必须单独 retain 基类相同的 4096B-aligned view。
@@ -313,8 +275,10 @@ void HyVlaExpertModel::set_weights_expert(
     sin_ref_ = sin;
     eps_expert_ = eps;
     expert_chunk_size_ = chunk_size;
+    action_mlp_cores_ = static_cast<int>(action_mlp_cores);
+    production_config_bound_ = true;
 
-    invalidate_model_state();   // Must remain the last statement.
+    invalidate_model_state();   // D-503: set_weights 的末条非空语句
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -362,24 +326,25 @@ void HyVlaExpertModel::set_action_weights(
 // ─────────────────────────────────────────────────────────────────────────────
 // declare_buffers / static_config — 只在 unroll 下追加
 // ─────────────────────────────────────────────────────────────────────────────
-std::vector<BufferDecl> HyVlaExpertModel::declare_buffers(const LayoutContext& ctx) {
-    auto d = CausalDecoderModel::declare_buffers(ctx);
-    if (hyvla_mask_once_on("expert")) hyvla_widen_sdpa_mask_slot(d);
+std::vector<BufferDecl> HyVlaExpertModel::baseline_buffer_declarations(
+    const LayoutContext& ctx) const {
+    // The base only constructs preload callbacks here; none executes during
+    // this pure layout probe. Keep the non-const bridge at this one boundary.
+    auto d = const_cast<HyVlaExpertModel*>(this)
+        ->causal_baseline_buffer_declarations(ctx);
+    if (cold_mask_once_) hyvla_widen_sdpa_mask_slot(d);
     // KVPAD16（见文件头）：把 k/v 槽撑到 16 的倍数行，KV-insert 一次 v16 打完。
-    kv_pad_rows_ = 0;
-    if (hyvla_kvpad16_on("expert")) {
+    if (cold_kvpad16_) {
         const int64_t local_kv = num_kv_heads() * head_dim() / attn_tp();
-        kv_pad_rows_ = hyvla_grow_kv_slots(
+        hyvla_grow_kv_slots(
             d, Align(ctx.chunk_size, (int64_t)16), local_kv);
     }
     // RMSNORM_PAD16（见文件头）：把 rmsnorm 读写的四个槽撑到 16 的倍数行。
-    rmsnorm_pad_rows_ = 0;
-    rmsnorm_pad_qrows_ = 0;
-    if (hyvla_rmsnorm_pad16_on("expert")) {
+    if (cold_rmsnorm_pad16_) {
         const int64_t hh = hidden_size(), hd_ = head_dim();
         const int64_t lq = num_q_heads() / attn_tp();
-        rmsnorm_pad_rows_  = Align(ctx.chunk_size, (int64_t)16);
-        rmsnorm_pad_qrows_ = Align(ctx.chunk_size * lq, (int64_t)16);
+        const int64_t rmsnorm_pad_rows_ = Align(ctx.chunk_size, (int64_t)16);
+        const int64_t rmsnorm_pad_qrows_ = Align(ctx.chunk_size * lq, (int64_t)16);
         const bool ok =
             hyvla_grow_slot(d, "residual1",  rmsnorm_pad_rows_  * hh  * 2) &&
             hyvla_grow_slot(d, "input_norm", rmsnorm_pad_rows_  * hh  * 2) &&
@@ -388,7 +353,7 @@ std::vector<BufferDecl> HyVlaExpertModel::declare_buffers(const LayoutContext& c
         // 四个槽名一个都不能漏 —— 漏了就是**写越界**，不是慢一点。
         TORCH_CHECK(ok, "hyvla RMSNORM_PAD16: 基类槽名对不上（residual1/input_norm/q/output）");
     }
-    if (!unroll_mode_) return d;      // 单步路径: SPM 布局逐字节不变
+    if (!unroll_mode_) return d;
     const int64_t cs = ctx.chunk_size, h = hidden_size(), np = action_dim_pad_;
     constexpr int DW = 2;
     auto A = [](int64_t bytes) -> int64_t { return Align(bytes, 256); };
@@ -402,7 +367,7 @@ std::vector<BufferDecl> HyVlaExpertModel::declare_buffers(const LayoutContext& c
     d.push_back({"emb_core0_spm", A(cs * h * DW),  0, 0, SC::Temp, 0, nullptr, ALL});
     // A6 走多核时的部分和槽（见文件头 ACTION_MLP_MC）。相位窗口同为 [0,0] ⇒ 与
     // 层体的 Temp（相 1..8）不重叠，分配器可以复用同一段地址，净 SPM 代价 ~0。
-    if (hyvla_action_mlp_cores() > 1)
+    if (action_mlp_cores_ > 1)
         d.push_back({"mo_part_spm", A(cs * h * DW), 0, 0, SC::Temp, 0, nullptr, ALL});
     d.push_back({"time_spm",      A(h * DW),       0, 0, SC::Temp, 0, nullptr, ALL});
     d.push_back({"mo_b_spm",      A(h * DW),       0, 0, SC::Temp, 0, nullptr, ALL});
@@ -412,10 +377,34 @@ std::vector<BufferDecl> HyVlaExpertModel::declare_buffers(const LayoutContext& c
     return d;
 }
 
+std::vector<BufferDecl> HyVlaExpertModel::planned_buffer_declarations(
+    const LayoutContext& layout, bool* retained) const {
+    auto declarations = baseline_buffer_declarations(layout);
+    const bool keep = cold_mask_once_ && layout.use_attn_mask &&
+        detail::plan_forward_spm_residency(declarations, {"sdpa_mask"}).retained;
+    if (retained) *retained = keep;
+    return declarations;
+}
+
+std::vector<BufferDecl> HyVlaExpertModel::declare_buffers(
+    const LayoutContext& layout) {
+    return planned_buffer_declarations(layout);
+}
+
+int64_t HyVlaExpertModel::mask_schedule_for_layout(
+    const LayoutContext& layout) const {
+    bool retained = false;
+    planned_buffer_declarations(layout, &retained);
+    return static_cast<int64_t>(retained
+        ? HyVlaExpertGraphScheduleRoute::MASK_FIRST_BODY_FIRST_LAYER
+        : cold_mask_once_ ? HyVlaExpertGraphScheduleRoute::MASK_FIRST_LAYER_ONLY
+                          : HyVlaExpertGraphScheduleRoute::MASK_EACH_LAYER);
+}
+
 ModelStaticConfig HyVlaExpertModel::static_config() {
     ModelStaticConfig cfg = CausalDecoderModel::static_config();
-    cfg.fast_replay_skip_layer_loop = hyvla_fast_replay_on("expert");
-    cfg.fast_replay_skip_preload = hyvla_fast_replay_preload_on("expert");
+    cfg.fast_replay_skip_layer_loop = cold_fast_replay_;
+    cfg.fast_replay_skip_preload = cold_fast_replay_preload_;
     if (!unroll_mode_) return cfg;
     cfg.pre_layers_fn  = reinterpret_cast<void (FusedModelBase::*)()>(
         &HyVlaExpertModel::emit_pre_layers_body);
@@ -435,20 +424,36 @@ void HyVlaExpertModel::emit_pre_layers_body() {
     // [A1] x0 DDR → x_t_spm (MUTABLE), **只在第 0 步**。第 1..N-1 步直接读上一步
     //      post-hook 留在 x_t_spm 里的 Euler 结果 (槽的生命期是 [0,9], 跨相存活)。
     if (bit == 0) {
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::MUTABLE_DMA,
+                HYVLA_EXPERT_PRE_X0_DMA_SITE,
+                static_cast<int64_t>(
+                    HyVlaExpertDmaRoute::DDR_BROADCAST_TO_SPM_MUTABLE),
+                /*resolved_flags=*/0,
+                {unroll_mode_ ? 1 : 0, cs * np, NUM_CORES});
+        }
         rpu_launch_ddr_broadcast_spm_dma_mutable(
             &x_t_src_base_, /*src_offset_bytes=*/0, /*num_elements=*/cs * np,
             addr(0, "x_t_spm"), /*num_cores=*/NUM_CORES);
-    } else if (hyvla_action_mlp_cores() > 1) {
-        // 多核档：A4 是列并行 ⇒ **每个核都要完整的 x_t**。但图内 Euler [Z3] 只在
-        // 核 0 更新 x_t_spm（v_t 只有核 0 有），第 1 步起核 1..7 就会保留陈旧值。
-        // 修法用本图**已经存在**的模式：[Z4] 每步都把 x_t 写进 x_traj[bit]，
-        // 这里从 x_traj[bit-1] 广播回全部核。
-        // 与 A7→emb_stage_→层 0 那条 DDR 往返同型，不引入新的存活假设。
+    } else if (action_mlp_cores_ > 1) {
+        // A4 is column-parallel, so every core needs the complete x_t. Euler updates
+        // only core 0; subsequent steps reload x_traj[bit-1] and broadcast it to all
+        // cores, using the existing trajectory buffer lifetime.
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::MUTABLE_DMA,
+                HYVLA_EXPERT_PRE_X_FEEDBACK_DMA_SITE,
+                static_cast<int64_t>(
+                    HyVlaExpertDmaRoute::DDR_BROADCAST_TO_SPM_MUTABLE),
+                /*resolved_flags=*/0,
+                {action_mlp_cores_, num_steps_, cs * np, NUM_CORES});
+        }
         rpu_launch_ddr_broadcast_spm_dma_mutable(
             &x_traj_dst_base_, /*src_offset_bytes=*/(bit - 1) * cs * np * DWIDTH,
             /*num_elements=*/cs * np, addr(0, "x_t_spm"), /*num_cores=*/NUM_CORES);
     }
-    const int amc = hyvla_action_mlp_cores();
+    const int amc = action_mlp_cores_;
     // [A2] time_all[bit] → time_spm, 作为 encoder 第一个 GEMM (A4) 的 bias。
     //      FIXED src: time_all_ 是稳定的注册权重, bit 偏移在 BUILD 期烘死
     //      (每个 body 单独 emit 一次, body_iter 是编译期常量)。
@@ -456,10 +461,28 @@ void HyVlaExpertModel::emit_pre_layers_body() {
     //         bias 必须**按核切片**（scatter），不能广播 —— 广播会让每个核都加
     //         bias[0:h/amc]，是静默算错。
     if (amc == 1) {
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::MUTABLE_DMA,
+                HYVLA_EXPERT_PRE_TIME_BROADCAST_DMA_SITE,
+                static_cast<int64_t>(
+                    HyVlaExpertDmaRoute::DDR_BROADCAST_TO_SPM_FIXED),
+                /*resolved_flags=*/0,
+                {action_mlp_cores_, h, h / action_mlp_cores_, DWIDTH});
+        }
         rpu_launch_ddr_broadcast_spm_dma(
             time_all_.data_ptr<c10::Half>() + bit * h, h, addr(0, "time_spm"),
             /*num_cores=*/1);
     } else {
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::MUTABLE_DMA,
+                HYVLA_EXPERT_PRE_TIME_SCATTER_DMA_SITE,
+                static_cast<int64_t>(
+                    HyVlaExpertDmaRoute::DDR_SCATTER_TO_SPM_FIXED),
+                /*resolved_flags=*/0,
+                {action_mlp_cores_, h, h / action_mlp_cores_, DWIDTH});
+        }
         rpu_launch_ddr_scatter_spm_dma(
             time_all_.data_ptr<c10::Half>() + bit * h,
             /*elements_per_core=*/h / amc,
@@ -469,6 +492,14 @@ void HyVlaExpertModel::emit_pre_layers_body() {
     // [A3] mo_bias → mo_b_spm (内容恒定, FIXED src)。
     //      单核档只有核 0 用得到；多核档 all-reduce 后每核都要按列加一次 bias
     //      （`1xC_NxC` 没有 num_cores 参数，8 核齐发），所以要广播满 8 核。
+    if (ctx().has_complete_physical_manifest()) {
+        ctx().consume_physical_route(
+            FmbRouteFamily::MUTABLE_DMA,
+            HYVLA_EXPERT_PRE_MO_BIAS_DMA_SITE,
+            static_cast<int64_t>(
+                HyVlaExpertDmaRoute::DDR_BROADCAST_TO_SPM_FIXED),
+            /*resolved_flags=*/0, {action_mlp_cores_, h});
+    }
     rpu_launch_ddr_broadcast_spm_dma(
         mo_bias_.data_ptr<c10::Half>(), h, addr(0, "mo_b_spm"), /*num_cores=*/amc);
 
@@ -476,37 +507,94 @@ void HyVlaExpertModel::emit_pre_layers_body() {
     //      ⚠️ 多核档必须**列并行**：A6 是行(K)并行，它要求核 c 手里正好是输入的
     //      第 c 段 K —— 而列并行 A4 的输出天然就是那一段。两者相接**零通信**，
     //      就是层体里 gate/up(列) → down(行) 的同一套 TP 模式。
-    //      如果 A4 留在单核，`enc_h_spm` 只有核 0 有效，其余核会读到无效值。
+    //      若 A4 只在单核执行，其他核的 enc_h_spm 无有效输入。
+    if (ctx().has_complete_physical_manifest()) {
+        ctx().consume_physical_route(
+            FmbRouteFamily::LINEAR, HYVLA_EXPERT_PRE_WC_LINEAR_SITE,
+            static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+            /*resolved_flags=*/0,
+            {cs, h, np, 1, action_mlp_cores_, 1});
+    }
     rpu_launch_linear_spm_to_spm_acc16_kernel(
         addr(0, "x_t_spm"), wc_, addr(0, "enc_h_spm"),
         /*M=*/cs, /*N=*/h, /*K=*/np, /*partition=*/1, /*num_cores=*/amc,
         /*bias_spm_addr=*/addr(0, "time_spm"));
     // [A5] SiLU 原地。逐元素 ⇒ 每核只处理自己那 h/amc 列。
+    if (ctx().has_complete_physical_manifest()) {
+        ctx().consume_physical_route(
+            FmbRouteFamily::ACTIVATION,
+            HYVLA_EXPERT_PRE_ENCODER_ACTIVATION_SITE,
+            static_cast<int64_t>(HyVlaExpertActivationRoute::SILU_UNARY),
+            /*resolved_flags=*/0,
+            {action_mlp_cores_, cs * (h / action_mlp_cores_)});
+    }
     rpu_launch_eltwise_unary_spm_kernel(
         addr(0, "enc_h_spm"), addr(0, "enc_h_spm"), cs * (h / amc), ValuOpType::SILU,
         /*is_gelu=*/false, /*num_cores=*/amc);
-    // [A6] emb = silu(enc_h) · moᵀ + mo_bias → emb_core0_spm。
-    //      多核档把 K 切 8 份并执行 all-reduce，见文件头 ACTION_MLP_MC。
+    // [A6] emb = silu(enc_h) * mo^T + mo_bias -> emb_core0_spm.
+    // The multicore path partitions K and all-reduces before adding bias.
     if (amc == 1) {
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::LINEAR,
+                HYVLA_EXPERT_PRE_MO_SINGLE_LINEAR_SITE,
+                static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+                /*resolved_flags=*/0,
+                {cs, h, h, 1, action_mlp_cores_, 1});
+        }
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "enc_h_spm"), mo_, addr(0, "emb_core0_spm"),
             /*M=*/cs, /*N=*/h, /*K=*/h, /*partition=*/1, /*num_cores=*/1,
             /*bias_spm_addr=*/addr(0, "mo_b_spm"));
     } else {
         // A6-1 K 方向切核 ⇒ 每核一份 [cs,h] 部分和。**bias 必须留到 all-reduce 之后**。
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::LINEAR,
+                HYVLA_EXPERT_PRE_MO_MULTI_LINEAR_SITE,
+                static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+                /*resolved_flags=*/0,
+                {cs, h, h, 0, action_mlp_cores_, 0});
+        }
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "enc_h_spm"), mo_, addr(0, "mo_part_spm"),
             /*M=*/cs, /*N=*/h, /*K=*/h, /*partition=*/0, /*num_cores=*/amc,
             /*bias_spm_addr=*/0u);
         // A6-2 enc_h_spm 到这里已死 ⇒ 就地清零，当 all-reduce 的零残差
         //      （该 kernel 要求 input/residual/output 三地址互不相同）。
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::GRAPH_SCHEDULE,
+                HYVLA_EXPERT_PRE_MO_ZERO_SITE,
+                static_cast<int64_t>(
+                    HyVlaExpertGraphScheduleRoute::ZERO_A6_RESIDUAL),
+                /*resolved_flags=*/0,
+                {action_mlp_cores_, cs * h});
+        }
         rpu_launch_fill_spm_kernel(
             addr(0, "enc_h_spm"), cs * h, c10::Half(0.0f), /*num_cores=*/amc);
         // A6-3 fused ring all-reduce；调度器按 per-core chunk 自动选 pace/nopace。
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::ALL_REDUCE,
+                HYVLA_EXPERT_PRE_MO_ALL_REDUCE_SITE,
+                fmb_ring_all_reduce_route_selector(cs, h),
+                /*resolved_flags=*/0,
+                {cs, h, action_mlp_cores_, action_mlp_cores_});
+        }
         rpu_launch_all_reduce_sum_residual_kernel(
             addr(0, "mo_part_spm"), addr(0, "enc_h_spm"), addr(0, "emb_core0_spm"),
             /*M=*/cs, /*N=*/h, /*input_num_cores=*/amc, /*output_num_cores=*/amc);
         // A6-4 bias 按列广播加一次（8 核齐发，各核结果一致；A7 只读核 0）。
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::GRAPH_SCHEDULE,
+                HYVLA_EXPERT_PRE_MO_BIAS_ADD_SITE,
+                static_cast<int64_t>(
+                    HyVlaExpertGraphScheduleRoute::ADD_A6_BIAS_AFTER_REDUCE),
+                /*resolved_flags=*/0,
+                {action_mlp_cores_, cs, h});
+        }
         rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
             addr(0, "mo_b_spm"), addr(0, "emb_core0_spm"), addr(0, "emb_core0_spm"),
             /*n=*/cs, /*c=*/h, c10::Half(1.0f), ValuOpType::ADD, /*is_bopa=*/false);
@@ -522,11 +610,17 @@ void HyVlaExpertModel::emit_pre_layers_body() {
 void HyVlaExpertModel::emit_post_layers_body() {
     const int64_t h = hidden_size(), cs = expert_chunk_size_, np = action_dim_pad_;
     const int64_t bit = ctx().body_iter;
-    // op_bias → op_b_spm (核 0, 内容恒定, FIXED src)。
+    // [Z1] op_bias → op_b_spm (核 0, 内容恒定, FIXED src)。
     rpu_launch_ddr_broadcast_spm_dma(
         op_bias_.data_ptr<c10::Half>(), np, addr(0, "op_b_spm"), /*num_cores=*/1);
-    // v_t = residual1 · opᵀ + op_bias (单核)。residual1 已被末层的 final
+    // [Z2] v_t = residual1 · opᵀ + op_bias (单核)。residual1 已被末层的 final
     //      RMSNorm 原地归一化过 —— **不要再归一化一次**。
+    if (ctx().has_complete_physical_manifest()) {
+        ctx().consume_physical_route(
+            FmbRouteFamily::LINEAR, HYVLA_EXPERT_POST_OP_LINEAR_SITE,
+            static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+            /*resolved_flags=*/0, {cs, np, h, 1, 1, 1});
+    }
     rpu_launch_linear_spm_to_spm_acc16_kernel(
         addr(0, "residual1"), op_, addr(0, "v_t_core0_spm"),
         /*M=*/cs, /*N=*/np, /*K=*/h, /*partition=*/1, /*num_cores=*/1,
@@ -537,24 +631,316 @@ void HyVlaExpertModel::emit_post_layers_body() {
         addr(0, "x_t_spm"), addr(0, "v_t_core0_spm"), addr(0, "x_t_spm"),
         cs * np, ValuOpType::ADD, dt_, /*num_cores=*/1);
     // [Z4] x_t_spm → x_traj[bit] DDR (MUTABLE)。终值 = x_traj[-1]。
+    if (ctx().has_complete_physical_manifest()) {
+        ctx().consume_physical_route(
+            FmbRouteFamily::MUTABLE_DMA,
+            HYVLA_EXPERT_POST_TRAJECTORY_DMA_SITE,
+            static_cast<int64_t>(
+                HyVlaExpertDmaRoute::SPM_TO_DDR_MUTABLE),
+            /*resolved_flags=*/0, {num_steps_, cs * np});
+    }
     rpu_launch_spm_copy_ddr_dma_mutable(
         addr(0, "x_t_spm"), &x_traj_dst_base_,
         /*dst_offset_bytes=*/bit * cs * np * 2, cs * np);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// dynamic_config — 基类断言单 chunk + 备一份子类可见的 PreparedMask
+// dynamic_config — 基类断言单 chunk，并统一准备显式 mask；本类直接复用
+// CausalDecoderModel 的稳定 PreparedMask。
 // ─────────────────────────────────────────────────────────────────────────────
 ModelDynamicConfig HyVlaExpertModel::dynamic_config(const ChunkPlan& plan) {
     ModelDynamicConfig cfg = CausalDecoderModel::dynamic_config(plan);
+    // Prefix history is shared with the VLM tower through DDR KV.  Keep this
+    // owner on that certified path; raw-SPM KV attention is not admissible.
+    cfg.attention_policy = AttentionExecutionPolicy::DDR_KV;
     TORCH_CHECK(ctx().attention_mask.has_value(),
                 "hyvla_expert dynamic_config: explicit attention mask required "
                 "(denoise 是非因果 prefix attention, prefix 块还要屏蔽 padding 行)");
-    prepared_mask_ = sdpa_prepare_mask(
-        ctx().attention_mask, /*is_causal=*/false,
-        ctx().seq_len, ctx().position + ctx().seq_len,
-        sdpa_stable_mask_cache());
     return cfg;
+}
+
+ModelDynamicConfig HyVlaExpertModel::planning_dynamic_config(
+    const ChunkPlan& /*plan*/) {
+    ModelDynamicConfig cfg;
+    cfg.chunk_mode = ChunkMode::SEQUENTIAL;
+    cfg.inter_layer_io = InterLayerIO::AUTO;
+    cfg.attention_policy = AttentionExecutionPolicy::DDR_KV;
+    return cfg;
+}
+
+FmbPhysicalExecutionManifest HyVlaExpertModel::physical_manifest_for_candidate(
+    const FmbThreeStageChunkPlan& plan,
+    const LayoutContext& layout,
+    int64_t physical_len, int64_t logical_len,
+    int64_t position) const {
+    FmbPhysicalExecutionManifest manifest;
+    manifest.state = FmbPhysicalManifestState::COMPLETE;
+    manifest.logical_length = logical_len;
+    manifest.physical_length = physical_len;
+    manifest.execution_padding_rows = physical_len - logical_len;
+    manifest.kv_logical_length = position + logical_len;
+    TORCH_CHECK(
+        plan.qkv.chunks.size() == 1 && plan.compute.chunks.size() == 1,
+        "HyVlaExpertModel COMPLETE descriptor requires one action chunk");
+    const ChunkInfo& kv_chunk = plan.qkv.chunks.front();
+    const ChunkInfo& chunk = plan.compute.chunks.front();
+    TORCH_CHECK(
+        kv_chunk.idx == chunk.idx && kv_chunk.offset == chunk.offset &&
+            kv_chunk.len == chunk.len,
+        "HyVlaExpertModel COMPLETE descriptor requires identical QKV and "
+        "compute action chunks");
+    const int64_t invocation = chunk.idx;
+    const int64_t h = hidden_size();
+    const int64_t nq = num_q_heads();
+    const int64_t nkv = num_kv_heads();
+    const int64_t hd = head_dim();
+    const int64_t tp = attn_tp();
+    const int64_t local_q = nq / tp;
+    const int64_t local_kv_heads = nkv / tp;
+    const int64_t padded_rows = Align(layout.chunk_size, int64_t{16});
+    const int64_t norm_rows = cold_rmsnorm_pad16_
+        ? padded_rows : chunk.len;
+    const int64_t q_norm_rows = cold_rmsnorm_pad16_
+        ? Align(layout.chunk_size * local_q, int64_t{16})
+        : chunk.len * local_q;
+    const int64_t k_norm_rows = (cold_rmsnorm_pad16_
+        ? padded_rows : chunk.len) * local_kv_heads;
+    const int64_t kv_physical_rows = cold_kvpad16_
+        ? Align(layout.chunk_size, int64_t{16}) : kv_chunk.len;
+    manifest.graph_lifecycle = FmbGraphLifecycle::COMPOSITE_CHILD;
+    const KvInsertSegmentPlan kv_plan =
+        resolve_kvinsert_plan_auto(
+            HYVLA_EXPERT_KV_SITE, manifest.graph_lifecycle,
+            position + kv_chunk.offset, kv_chunk.len, kv_physical_rows,
+            attn_tp(), num_kv_heads(), head_dim(),
+            HYVLA_EXPERT_KV_CAPABILITIES);
+    const KvInsertRouteArguments kv_arguments =
+        rpu_kvinsert_route_arguments(
+            kv_plan, attn_tp(), num_kv_heads(), head_dim());
+    manifest.kv_insert_physical_rows = kv_plan.physical_rows();
+    manifest.linear_accumulation = FmbLinearAccumulationPolicy::ACC16;
+
+    const auto append = [&](FmbRouteFamily family, int64_t site_id,
+                            int64_t selector,
+                            std::vector<int64_t> arguments = {},
+                            int64_t flags = 0) {
+        manifest.routes.push_back({site_id, family, selector, flags,
+                                   std::move(arguments), invocation});
+    };
+    const auto append_linear = [&](int64_t site_id,
+                                   std::vector<int64_t> arguments = {}) {
+        append(FmbRouteFamily::LINEAR, site_id,
+               static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+               std::move(arguments));
+    };
+    const auto append_norm = [&](int64_t site_id, int64_t rows,
+                                 int64_t cols) {
+        append(
+            FmbRouteFamily::NORMALIZATION, site_id,
+            static_cast<int64_t>(
+                cold_rmsnorm_pad16_
+                    ? HyVlaExpertNormalizationRoute::RMSNORM_V16_ROWS
+                    : HyVlaExpertNormalizationRoute::RMSNORM_SCALAR_ROWS),
+            {cold_rmsnorm_pad16_ ? 1 : 0, rows, cols});
+    };
+
+    append(
+        FmbRouteFamily::GRAPH_SCHEDULE,
+        HYVLA_EXPERT_GRAPH_SCHEDULE_SITE,
+        static_cast<int64_t>(
+            cold_fast_replay_
+                ? HyVlaExpertGraphScheduleRoute::FAST_REPLAY_SKIP_LAYER_LOOP
+                : HyVlaExpertGraphScheduleRoute::REEMIT_LAYER_LOOP),
+        {cold_fast_replay_ ? 1 : 0,
+         cold_fast_replay_preload_ ? 1 : 0,
+         unroll_mode_ ? 1 : 0,
+         unroll_mode_ ? num_steps_ : 1});
+    append(
+        FmbRouteFamily::GRAPH_SCHEDULE,
+        HYVLA_EXPERT_MASK_SCHEDULE_SITE,
+        mask_schedule_for_layout(layout),
+        {cold_mask_once_ ? 1 : 0, chunk.len, kv_chunk.kv_seq_len,
+         tp, num_layers()});
+    append(
+        FmbRouteFamily::KV_INSERT, HYVLA_EXPERT_KV_PADDING_SITE,
+        static_cast<int64_t>(
+            cold_kvpad16_ ? HyVlaExpertKvPaddingRoute::PAD16_ROWS
+                          : HyVlaExpertKvPaddingRoute::LOGICAL_ROWS),
+        {cold_kvpad16_ ? 1 : 0, kv_chunk.len,
+         cold_kvpad16_ ? kv_physical_rows : 0,
+         kv_physical_rows, tp, nkv, hd});
+
+    append_norm(HYVLA_EXPERT_INPUT_NORM_SITE, norm_rows, h);
+    append_linear(HYVLA_EXPERT_QKV_LINEAR_SITE);
+    append(
+        FmbRouteFamily::ROPE,
+        cold_partial_rope_ ? HYVLA_EXPERT_Q_PARTIAL_ROPE_SITE
+                           : HYVLA_EXPERT_Q_ROPE_SITE,
+        static_cast<int64_t>(
+            cold_partial_rope_ ? HyVlaExpertRopeRoute::PARTIAL_MROPE
+                               : HyVlaExpertRopeRoute::ROPE_1D),
+        {cold_partial_rope_ ? 1 : 0, position + chunk.offset,
+         chunk.len, local_q, hd, tp});
+    append_norm(HYVLA_EXPERT_Q_NORM_SITE, q_norm_rows, hd);
+    append(
+        FmbRouteFamily::ROPE,
+        cold_partial_rope_ ? HYVLA_EXPERT_K_PARTIAL_ROPE_SITE
+                           : HYVLA_EXPERT_K_ROPE_SITE,
+        static_cast<int64_t>(
+            cold_partial_rope_ ? HyVlaExpertRopeRoute::PARTIAL_MROPE
+                               : HyVlaExpertRopeRoute::ROPE_1D),
+        {cold_partial_rope_ ? 1 : 0, position + chunk.offset,
+         chunk.len, local_kv_heads, hd, tp});
+    append_norm(HYVLA_EXPERT_K_NORM_SITE, k_norm_rows, hd);
+    // The shared VLM prefix remains DDR_REQUIRED across every denoise step.
+    // Freeze the exact pure-resolver segment plan; no legacy selector is read
+    // while emitting the graph.
+    append(
+        FmbRouteFamily::KV_INSERT, HYVLA_EXPERT_KV_SITE,
+        static_cast<int64_t>(kv_plan.route()),
+        std::vector<int64_t>(kv_arguments.begin(), kv_arguments.end()),
+        HYVLA_EXPERT_KV_REASON_PREFIX_HISTORY_DDR_REQUIRED);
+    append(
+        FmbRouteFamily::ATTENTION, HYVLA_EXPERT_ATTN_SITE,
+        static_cast<int64_t>(AttentionExecutionPolicy::DDR_KV));
+    append(
+        FmbRouteFamily::ALL_REDUCE,
+        HYVLA_EXPERT_PREPARE_ATTN_ALL_REDUCE_SITE,
+        static_cast<int64_t>(
+            HyVlaExpertAllReduceRoute::PREPARE_RING_INPUT),
+        {chunk.len, h, tp});
+    append_linear(
+        HYVLA_EXPERT_O_LINEAR_SITE,
+        {chunk.len, h, nq * hd, 0, tp});
+    append(
+        FmbRouteFamily::ALL_REDUCE,
+        HYVLA_EXPERT_ATTN_ALL_REDUCE_SITE,
+        fmb_ring_all_reduce_route_selector(chunk.len, h),
+        {chunk.len, h, tp, NUM_CORES});
+    append_norm(HYVLA_EXPERT_POST_NORM_SITE, norm_rows, h);
+    append_linear(
+        HYVLA_EXPERT_GATE_LINEAR_SITE,
+        {chunk.len, intermediate_size(), h, 1, NUM_CORES});
+    append_linear(
+        HYVLA_EXPERT_UP_LINEAR_SITE,
+        {chunk.len, intermediate_size(), h, 1, NUM_CORES});
+    const int64_t elems_mlp = chunk.len * (intermediate_size() / NUM_CORES);
+    if (cold_silu_mul_) {
+        append(
+            FmbRouteFamily::ACTIVATION,
+            HYVLA_EXPERT_MLP_SILU_MUL_SITE,
+            static_cast<int64_t>(
+                HyVlaExpertActivationRoute::SILU_MUL_FUSED),
+            {cold_silu_mul_ ? 1 : 0, elems_mlp, NUM_CORES});
+    } else {
+        append(
+            FmbRouteFamily::ACTIVATION, HYVLA_EXPERT_MLP_SILU_SITE,
+            static_cast<int64_t>(
+                HyVlaExpertActivationRoute::SILU_UNARY),
+            {cold_silu_mul_ ? 1 : 0, elems_mlp, NUM_CORES});
+        append(
+            FmbRouteFamily::ACTIVATION, HYVLA_EXPERT_MLP_MUL_SITE,
+            static_cast<int64_t>(HyVlaExpertActivationRoute::MUL),
+            {cold_silu_mul_ ? 1 : 0, elems_mlp, NUM_CORES});
+    }
+    append_linear(
+        HYVLA_EXPERT_DOWN_LINEAR_SITE,
+        {chunk.len, h, intermediate_size(), 0, NUM_CORES});
+    append(
+        FmbRouteFamily::ALL_REDUCE,
+        HYVLA_EXPERT_MLP_ALL_REDUCE_SITE,
+        fmb_ring_all_reduce_route_selector(chunk.len, h),
+        {chunk.len, h, NUM_CORES, NUM_CORES});
+    append_norm(HYVLA_EXPERT_FINAL_NORM_SITE, norm_rows, h);
+
+    if (unroll_mode_) {
+        TORCH_CHECK(
+            action_dim_pad_ > 0 && num_steps_ > 0 &&
+                (action_mlp_cores_ == 1 || action_mlp_cores_ == NUM_CORES),
+            "HyVlaExpertModel COMPLETE unroll descriptor requires bound "
+            "action weights and a supported core count");
+        const int64_t amc = action_mlp_cores_;
+        const int64_t cs = expert_chunk_size_;
+        const int64_t np = action_dim_pad_;
+        append(
+            FmbRouteFamily::MUTABLE_DMA, HYVLA_EXPERT_PRE_X0_DMA_SITE,
+            static_cast<int64_t>(
+                HyVlaExpertDmaRoute::DDR_BROADCAST_TO_SPM_MUTABLE),
+            {unroll_mode_ ? 1 : 0, cs * np, NUM_CORES});
+        if (amc > 1 && num_steps_ > 1) {
+            append(
+                FmbRouteFamily::MUTABLE_DMA,
+                HYVLA_EXPERT_PRE_X_FEEDBACK_DMA_SITE,
+                static_cast<int64_t>(
+                    HyVlaExpertDmaRoute::DDR_BROADCAST_TO_SPM_MUTABLE),
+                {amc, num_steps_, cs * np, NUM_CORES});
+        }
+        append(
+            FmbRouteFamily::MUTABLE_DMA,
+            amc == 1 ? HYVLA_EXPERT_PRE_TIME_BROADCAST_DMA_SITE
+                     : HYVLA_EXPERT_PRE_TIME_SCATTER_DMA_SITE,
+            static_cast<int64_t>(
+                amc == 1
+                    ? HyVlaExpertDmaRoute::DDR_BROADCAST_TO_SPM_FIXED
+                    : HyVlaExpertDmaRoute::DDR_SCATTER_TO_SPM_FIXED),
+            {amc, h, h / amc, DWIDTH});
+        append(
+            FmbRouteFamily::MUTABLE_DMA,
+            HYVLA_EXPERT_PRE_MO_BIAS_DMA_SITE,
+            static_cast<int64_t>(
+                HyVlaExpertDmaRoute::DDR_BROADCAST_TO_SPM_FIXED),
+            {amc, h});
+        append_linear(
+            HYVLA_EXPERT_PRE_WC_LINEAR_SITE,
+            {cs, h, np, 1, amc, 1});
+        append(
+            FmbRouteFamily::ACTIVATION,
+            HYVLA_EXPERT_PRE_ENCODER_ACTIVATION_SITE,
+            static_cast<int64_t>(HyVlaExpertActivationRoute::SILU_UNARY),
+            {amc, cs * (h / amc)});
+        append_linear(
+            amc == 1 ? HYVLA_EXPERT_PRE_MO_SINGLE_LINEAR_SITE
+                     : HYVLA_EXPERT_PRE_MO_MULTI_LINEAR_SITE,
+            {cs, h, h, amc == 1 ? 1 : 0, amc, amc == 1 ? 1 : 0});
+        if (amc > 1) {
+            append(
+                FmbRouteFamily::GRAPH_SCHEDULE,
+                HYVLA_EXPERT_PRE_MO_ZERO_SITE,
+                static_cast<int64_t>(
+                    HyVlaExpertGraphScheduleRoute::ZERO_A6_RESIDUAL),
+                {amc, cs * h});
+            append(
+                FmbRouteFamily::ALL_REDUCE,
+                HYVLA_EXPERT_PRE_MO_ALL_REDUCE_SITE,
+                fmb_ring_all_reduce_route_selector(cs, h),
+                {cs, h, amc, amc});
+            append(
+                FmbRouteFamily::GRAPH_SCHEDULE,
+                HYVLA_EXPERT_PRE_MO_BIAS_ADD_SITE,
+                static_cast<int64_t>(
+                    HyVlaExpertGraphScheduleRoute::ADD_A6_BIAS_AFTER_REDUCE),
+                {amc, cs, h});
+        }
+        append_linear(
+            HYVLA_EXPERT_POST_OP_LINEAR_SITE,
+            {cs, np, h, 1, 1, 1});
+        append(
+            FmbRouteFamily::MUTABLE_DMA,
+            HYVLA_EXPERT_POST_TRAJECTORY_DMA_SITE,
+            static_cast<int64_t>(
+                HyVlaExpertDmaRoute::SPM_TO_DDR_MUTABLE),
+            {num_steps_, cs * np});
+    }
+    append_causal_decoder_preload_manifest_routes(manifest);
+    append_fmb_shared_runtime_routes(
+        manifest, plan, hidden_size(), FMB_SHARED_LAYER_INPUT_DMA);
+    return manifest;
+}
+
+FmbPhysicalManifestForwardCapability
+HyVlaExpertModel::physical_manifest_forward_capability(
+    const FmbPhysicalExecutionManifest& /*manifest*/) const {
+    return {true, FmbGraphLifecycle::COMPOSITE_CHILD};
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -565,10 +951,30 @@ bool HyVlaExpertModel::subclass_chunk_size_valid(
     return cs >= seq_len && chunk_within_envelope(cs);
 }
 
+std::vector<int64_t> HyVlaExpertModel::resolve_stage_domain(
+    int64_t seq_len, int64_t prefix_len, int64_t mask_kv_len) {
+    TORCH_CHECK(seq_len == expert_chunk_size_,
+                "hyvla_expert_resolve_stage_domain: seq_len must match the "
+                "fixed action suffix geometry");
+    TORCH_CHECK(prefix_len >= 0 && mask_kv_len == prefix_len + seq_len,
+                "hyvla_expert_resolve_stage_domain: mask width must equal "
+                "prefix_len + seq_len");
+    const at::Tensor mask = at::empty(
+        {1, mask_kv_len},
+        at::TensorOptions().dtype(at::kHalf).device(at::kCPU));
+    return encode_fmb_prefill_stage_domain(
+        resolve_prefill_stage_domain_for_shape(
+            seq_len, prefix_len, std::optional<at::Tensor>(mask),
+            /*is_causal=*/false));
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // build_layer_subgraph — 单塔层体 (基类 8 相, 步 3 换序)
 // ─────────────────────────────────────────────────────────────────────────────
 void HyVlaExpertModel::build_layer_subgraph(int layer_idx, const ChunkInfo& chunk) {
+    TORCH_CHECK(
+        ctx().has_complete_physical_manifest(),
+        "HyVlaExpertModel requires a COMPLETE physical descriptor");
     TORCH_CHECK(!layers_.empty(),
                 "hyvla_expert build_layer_subgraph: set_weights_expert must "
                 "have been called");
@@ -586,6 +992,30 @@ void HyVlaExpertModel::build_layer_subgraph(int layer_idx, const ChunkInfo& chun
     const int tp = attn_tp();
     const int64_t local_q  = nq / tp;
     const int64_t elems_mlp = seq_len * (intermediate_size() / NUM_CORES);
+    const int64_t allocation_rows = ctx().stage_plan.compute.chunks.front().len;
+    const int64_t kv_pad_rows_ = cold_kvpad16_
+        ? Align(allocation_rows, int64_t{16}) : 0;
+    const int64_t rmsnorm_pad_rows_ = cold_rmsnorm_pad16_
+        ? Align(allocation_rows, int64_t{16}) : 0;
+    const int64_t rmsnorm_pad_qrows_ = cold_rmsnorm_pad16_
+        ? Align(allocation_rows * local_q, int64_t{16}) : 0;
+
+
+    if (ctx().has_complete_physical_manifest()) {
+        ctx().consume_physical_route(
+            FmbRouteFamily::GRAPH_SCHEDULE,
+            HYVLA_EXPERT_GRAPH_SCHEDULE_SITE,
+            static_cast<int64_t>(
+                cold_fast_replay_
+                    ? HyVlaExpertGraphScheduleRoute::FAST_REPLAY_SKIP_LAYER_LOOP
+                    : HyVlaExpertGraphScheduleRoute::REEMIT_LAYER_LOOP),
+            /*resolved_flags=*/0,
+            {cold_fast_replay_ ? 1 : 0,
+             cold_fast_replay_preload_ ? 1 : 0,
+             unroll_mode_ ? 1 : 0,
+             unroll_mode_ ? num_steps_ : 1},
+            chunk.idx);
+    }
 
     if (!ctx().input_in_spm) {
         emit_layer_input_dma(layer_idx, chunk);
@@ -595,6 +1025,17 @@ void HyVlaExpertModel::build_layer_subgraph(int layer_idx, const ChunkInfo& chun
     // RMSNORM_PAD16：补齐到 16 的倍数行才能走 `llama_rms_norm_v16`（见文件头）。
     // 多算的 [seq_len, pad) 行下游按 M=seq_len 消费 ⇒ 永不被读。
     const int64_t nrows  = rmsnorm_pad_rows_  ? rmsnorm_pad_rows_  : seq_len;
+    if (ctx().has_complete_physical_manifest()) {
+        ctx().consume_physical_route(
+            FmbRouteFamily::NORMALIZATION,
+            HYVLA_EXPERT_INPUT_NORM_SITE,
+            static_cast<int64_t>(
+                cold_rmsnorm_pad16_
+                    ? HyVlaExpertNormalizationRoute::RMSNORM_V16_ROWS
+                    : HyVlaExpertNormalizationRoute::RMSNORM_SCALAR_ROWS),
+            /*resolved_flags=*/0,
+            {cold_rmsnorm_pad16_ ? 1 : 0, nrows, h}, chunk.idx);
+    }
     rpu_launch_rmsnorm_spm_kernel(
         addr(0, "residual1"), addr(0, "input_norm"),
         layer_addr(layer_idx, 0, "norm_w"), nrows, h, eps_expert_);
@@ -602,6 +1043,12 @@ void HyVlaExpertModel::build_layer_subgraph(int layer_idx, const ChunkInfo& chun
     // ── 步 2: QKV (无 bias — Hy-VLA attention_bias=false) ──
     auto qkv = [&](const at::Tensor& w, const at::Tensor& ws,
                    const char* out, int64_t n) {
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::LINEAR, HYVLA_EXPERT_QKV_LINEAR_SITE,
+                static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+                /*resolved_flags=*/0, {}, chunk.idx);
+        }
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "input_norm"), w, addr(0, out),
             seq_len, n, h, /*partition=*/1, /*num_cores=*/tp,
@@ -612,8 +1059,8 @@ void HyVlaExpertModel::build_layer_subgraph(int layer_idx, const ChunkInfo& chun
     qkv(lw.v_w, lw.v_ws, "v", nkv * hd);
 
     // ── 步 3: **先 RoPE, 再 q/k head-norm**(与基类及其余 7 个 emitter 相反) ──
-    // Reference contract 在 apply_rotary_pos_emb 之后执行
-    // query_layernorm/key_layernorm，且两塔共用 VLM 层的权重。
+    // 依据 vendor modeling_dual_tower.py: apply_rotary_pos_emb 之后才调
+    // query_layernorm/key_layernorm, 且两塔共用 VLM 层的那一份 (绑定方负责喂对)。
     // 与 VLM 塔 (rpu_hyvla_vlm_model.cpp 步 3) 完全同构, 只是这里没有孪生分支。
     // 换序可行的前提: 两个 kernel 都是 src/dst 分离、无隐藏状态的独立 SPM launch,
     // 且 QK-norm 的 framing (M=seq*heads, C=head_dim) 不受 RoPE 影响 —— RoPE 不改
@@ -621,73 +1068,223 @@ void HyVlaExpertModel::build_layer_subgraph(int layer_idx, const ChunkInfo& chun
     c10::Half* cos_ptr = cos_ref_.data_ptr<c10::Half>();
     c10::Half* sin_ptr = sin_ref_.data_ptr<c10::Half>();
 
-    // PARTIAL_ROPE（见文件头）：与 llama_rope 逐位相等，但 grid 从 (seq,1,1) 塌成
-    // (⌈hd/2/64⌉, ⌈seq/64⌉) ⇒ 每 token 边际成本 175.8 → 22.8 ns。表和偏移原样复用。
-    const bool prope = hyvla_partial_rope_on("expert");
+    // PARTIAL_ROPE uses the same tables and offsets with grid
+    // (ceil(hd/2/64), ceil(seq/64)).
+    const bool prope = cold_partial_rope_;
     const int64_t local_kv_heads = nkv / tp;
 
     if (prope) {
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::ROPE,
+                HYVLA_EXPERT_Q_PARTIAL_ROPE_SITE,
+                static_cast<int64_t>(HyVlaExpertRopeRoute::PARTIAL_MROPE),
+                /*resolved_flags=*/0,
+                {cold_partial_rope_ ? 1 : 0, cos_sin_start,
+                 seq_len, local_q, hd, tp}, chunk.idx);
+        }
         rpu_launch_partial_mrope_spm_kernel(
             addr(0, "q"), addr(0, "output"), cos_ptr, sin_ptr,
             cos_sin_start, seq_len, local_q, hd, /*rotary_dim=*/hd, tp);
     } else {
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::ROPE, HYVLA_EXPERT_Q_ROPE_SITE,
+                static_cast<int64_t>(HyVlaExpertRopeRoute::ROPE_1D),
+                /*resolved_flags=*/0,
+                {cold_partial_rope_ ? 1 : 0, cos_sin_start,
+                 seq_len, local_q, hd, tp}, chunk.idx);
+        }
         rpu_launch_rope_spm_kernel(addr(0, "q"), addr(0, "output"),
-                                   cos_ptr, sin_ptr, seq_len, local_q, hd, cos_sin_start);
+                                   cos_ptr, sin_ptr, seq_len, local_q, hd,
+                                   cos_sin_start, tp);
+    }
+    const int64_t q_norm_rows = rmsnorm_pad_qrows_
+        ? rmsnorm_pad_qrows_ : seq_len * local_q;
+    if (ctx().has_complete_physical_manifest()) {
+        ctx().consume_physical_route(
+            FmbRouteFamily::NORMALIZATION, HYVLA_EXPERT_Q_NORM_SITE,
+            static_cast<int64_t>(
+                cold_rmsnorm_pad16_
+                    ? HyVlaExpertNormalizationRoute::RMSNORM_V16_ROWS
+                    : HyVlaExpertNormalizationRoute::RMSNORM_SCALAR_ROWS),
+            /*resolved_flags=*/0,
+            {cold_rmsnorm_pad16_ ? 1 : 0, q_norm_rows, hd}, chunk.idx);
     }
     rpu_launch_rmsnorm_spm_kernel(
         addr(0, "output"), addr(0, "q"),
         layer_addr(layer_idx, 0, "q_norm_w"),
-        rmsnorm_pad_qrows_ ? rmsnorm_pad_qrows_ : seq_len * local_q, hd, eps_expert_);
+        q_norm_rows, hd, eps_expert_);
 
     if (prope) {
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::ROPE,
+                HYVLA_EXPERT_K_PARTIAL_ROPE_SITE,
+                static_cast<int64_t>(HyVlaExpertRopeRoute::PARTIAL_MROPE),
+                /*resolved_flags=*/0,
+                {cold_partial_rope_ ? 1 : 0, cos_sin_start,
+                 seq_len, local_kv_heads, hd, tp}, chunk.idx);
+        }
         rpu_launch_partial_mrope_spm_kernel(
             addr(0, "k"), addr(0, "input_norm"), cos_ptr, sin_ptr,
             cos_sin_start, seq_len, local_kv_heads, hd, /*rotary_dim=*/hd, tp);
     } else {
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::ROPE, HYVLA_EXPERT_K_ROPE_SITE,
+                static_cast<int64_t>(HyVlaExpertRopeRoute::ROPE_1D),
+                /*resolved_flags=*/0,
+                {cold_partial_rope_ ? 1 : 0, cos_sin_start,
+                 seq_len, local_kv_heads, hd, tp}, chunk.idx);
+        }
         rpu_launch_rope_spm_kernel(addr(0, "k"), addr(0, "input_norm"),
-                                   cos_ptr, sin_ptr, seq_len, local_kv_heads, hd, cos_sin_start);
+                                   cos_ptr, sin_ptr, seq_len, local_kv_heads,
+                                   hd, cos_sin_start, tp);
     }
     // k 槽已被 KVPAD16 撑到 Align(cs,16) 行 × local_kv 元素 ⇒ 这里补齐不需要额外撑槽。
+    const int64_t k_norm_rows =
+        (rmsnorm_pad_rows_ ? rmsnorm_pad_rows_ : seq_len) * local_kv_heads;
+    if (ctx().has_complete_physical_manifest()) {
+        ctx().consume_physical_route(
+            FmbRouteFamily::NORMALIZATION, HYVLA_EXPERT_K_NORM_SITE,
+            static_cast<int64_t>(
+                cold_rmsnorm_pad16_
+                    ? HyVlaExpertNormalizationRoute::RMSNORM_V16_ROWS
+                    : HyVlaExpertNormalizationRoute::RMSNORM_SCALAR_ROWS),
+            /*resolved_flags=*/0,
+            {cold_rmsnorm_pad16_ ? 1 : 0, k_norm_rows, hd}, chunk.idx);
+    }
     rpu_launch_rmsnorm_spm_kernel(
         addr(0, "input_norm"), addr(0, "k"),
         layer_addr(layer_idx, 0, "k_norm_w"),
-        (rmsnorm_pad_rows_ ? rmsnorm_pad_rows_ : seq_len) * local_kv_heads, hd, eps_expert_);
+        k_norm_rows, hd, eps_expert_);
 
     // ── 步 4: KV insert (追加在 prefix 之后) + SDPA + o_proj + 残差归约 ──
     // 调用方每步前 reset_to_position(prefix_len), 所以这 51 行每步覆写同一段,
-    // 语义上冻结 prefix，并在每步使用后丢弃 suffix KV。
+    // 等价于 vendor 的 copy.deepcopy 冻结 prefix、suffix KV 用完即弃。
     auto& k_cache = (*ctx().k_caches)[layer_idx];
     auto& v_cache = (*ctx().v_caches)[layer_idx];
-    rpu_launch_insert_kcache_spm_unified(
-        k_cache, ctx().position + chunk.offset, addr_offset("k").value,
-        seq_len, nkv, hd, tp, /*cache_batch_offset_elems=*/0,
-        /*allow_non8_v16=*/false, /*allow_hybrid_v16=*/false,
-        /*spm_rows=*/kv_pad_rows_);
-    rpu_launch_insert_vcache_spm_unified(
-        v_cache, ctx().position + chunk.offset, addr_offset("v").value,
-        seq_len, nkv, hd, tp, /*cache_batch_offset_elems=*/0,
-        /*allow_non8_v16=*/false, /*allow_hybrid_v16=*/false,
-        /*spm_rows=*/kv_pad_rows_);
+    const int64_t expected_kv_physical_rows = cold_kvpad16_
+        ? kv_pad_rows_ : seq_len;
+    ctx().consume_physical_route(
+        FmbRouteFamily::KV_INSERT,
+        HYVLA_EXPERT_KV_PADDING_SITE,
+        static_cast<int64_t>(
+            cold_kvpad16_ ? HyVlaExpertKvPaddingRoute::PAD16_ROWS
+                          : HyVlaExpertKvPaddingRoute::LOGICAL_ROWS),
+        /*resolved_flags=*/0,
+        {cold_kvpad16_ ? 1 : 0, seq_len, kv_pad_rows_,
+         expected_kv_physical_rows, tp, nkv, hd}, chunk.idx);
+    const FmbRouteManifestEntry& route = ctx().find_physical_route(
+        FmbRouteFamily::KV_INSERT, HYVLA_EXPERT_KV_SITE, chunk.idx);
+    const KvInsertSegmentPlan kv_plan =
+        restore_kvinsert_plan(
+            HYVLA_EXPERT_KV_SITE, route.arguments, tp, nkv, hd);
+    TORCH_CHECK(
+        kv_plan.logical_rows() == seq_len &&
+            kv_plan.physical_rows() == expected_kv_physical_rows &&
+            kv_plan.segment(0).position == cos_sin_start,
+        "HyVlaExpertModel KV descriptor geometry drift at invocation ",
+        chunk.idx);
+    ctx().consume_physical_route(
+        FmbRouteFamily::KV_INSERT, HYVLA_EXPERT_KV_SITE,
+        static_cast<int64_t>(kv_plan.route()),
+        HYVLA_EXPERT_KV_REASON_PREFIX_HISTORY_DDR_REQUIRED,
+        route.arguments, chunk.idx);
+    rpu_launch_insert_kvcache_spm_unified_with_plan(
+        k_cache, v_cache,
+        addr_offset("k").value, addr_offset("v").value,
+        nkv, hd, tp,
+        /*k_cache_batch_offset_elems=*/0,
+        /*v_cache_batch_offset_elems=*/0,
+        kv_pad_rows_, kv_plan);
     const uint32_t mask_off = addr_offset("sdpa_mask").value;
-    // mask 逐层恒定；槽撑满相位后每个 body 只需在层 0 灌一次（见文件头 MASK_ONCE）。
-    if (!hyvla_mask_once_on("expert") || layer_idx == 0)
-        sdpa_dma_mask_to_spm(prepared_mask_, mask_off, seq_len, chunk.kv_seq_len, tp);
+    const auto& mask_route = ctx().find_physical_route(
+        FmbRouteFamily::GRAPH_SCHEDULE, HYVLA_EXPERT_MASK_SCHEDULE_SITE,
+        chunk.idx);
+    if (ctx().body_iter == 0 && layer_idx == 0) {
+        // Revalidate the minted schedule against exactly the complete layout
+        // used for allocation, once before any mask reuse (not per layer).
+        LayoutContext layout;
+        layout.chunk_size = allocation_rows;
+        layout.max_kv_seq_len = ctx().attention_mask->size(-1);
+        layout.num_layers = num_layers();
+        layout.use_attn_mask = true;
+        layout.is_causal = ctx().is_causal;
+        layout.batch_size = ctx().batch_size;
+        layout.attention_policy = ctx().attention_policy;
+        ctx().consume_physical_route(
+            FmbRouteFamily::GRAPH_SCHEDULE, HYVLA_EXPERT_MASK_SCHEDULE_SITE,
+            mask_schedule_for_layout(layout), /*resolved_flags=*/0,
+            {cold_mask_once_ ? 1 : 0, seq_len, chunk.kv_seq_len,
+             tp, num_layers()}, chunk.idx);
+    }
+    const auto mask_schedule =
+        static_cast<HyVlaExpertGraphScheduleRoute>(mask_route.selector);
+    const bool upload_mask =
+        mask_schedule == HyVlaExpertGraphScheduleRoute::MASK_EACH_LAYER ||
+        (layer_idx == 0 &&
+         (mask_schedule == HyVlaExpertGraphScheduleRoute::MASK_FIRST_LAYER_ONLY ||
+          ctx().body_iter == 0));
+    if (upload_mask) {
+        sdpa_dma_mask_to_spm(prepared_attn_mask_, mask_off, seq_len, chunk.kv_seq_len, tp);
+    }
+    if (ctx().has_complete_physical_manifest()) {
+        ctx().consume_physical_attention_route(
+            HYVLA_EXPERT_ATTN_SITE, AttentionExecutionPolicy::DDR_KV,
+            chunk.idx);
+    }
     rpu_launch_sdpa_spm_dispatch(
         SdpaKernelType::FLASH_ATTN_SPM,
-        k_cache, v_cache, prepared_mask_.mask_type, c10::nullopt,
+        k_cache, v_cache, prepared_attn_mask_.mask_type, c10::nullopt,
         addr_offset("q").value, addr_offset("output").value,
         addr_offset("sdpa_tmp").value, mask_off,
         seq_len, nq, nkv, hd, chunk.kv_seq_len, tp, NUM_CORES);
+    if (ctx().has_complete_physical_manifest()) {
+        ctx().consume_physical_route(
+            FmbRouteFamily::ALL_REDUCE,
+            HYVLA_EXPERT_PREPARE_ATTN_ALL_REDUCE_SITE,
+            static_cast<int64_t>(
+                HyVlaExpertAllReduceRoute::PREPARE_RING_INPUT),
+            /*resolved_flags=*/0, {seq_len, h, tp}, chunk.idx);
+    }
     rpu_prepare_ring_all_reduce_input(addr(0, "oproj"), seq_len, h, tp);
+    if (ctx().has_complete_physical_manifest()) {
+        ctx().consume_physical_route(
+            FmbRouteFamily::LINEAR, HYVLA_EXPERT_O_LINEAR_SITE,
+            static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+            /*resolved_flags=*/0,
+            {seq_len, h, nq * hd, 0, tp}, chunk.idx);
+    }
     rpu_launch_linear_spm_to_spm_acc16_kernel(
         addr(0, "output"), lw.o_w, addr(0, "oproj"),
         seq_len, h, nq * hd, /*partition=*/0, /*num_cores=*/tp,
         /*bias_spm_addr=*/0u, /*scale=*/lw.o_ws);
+    if (ctx().has_complete_physical_manifest()) {
+        ctx().consume_physical_route(
+            FmbRouteFamily::ALL_REDUCE,
+            HYVLA_EXPERT_ATTN_ALL_REDUCE_SITE,
+            fmb_ring_all_reduce_route_selector(seq_len, h),
+            /*resolved_flags=*/0,
+            {seq_len, h, tp, NUM_CORES}, chunk.idx);
+    }
     rpu_launch_all_reduce_sum_residual_kernel(
         addr(0, "oproj"), addr(0, "residual1"), addr(0, "residual2"),
         seq_len, h, tp, NUM_CORES);
 
     // ── 步 5: post-attention RMSNorm ──
+    if (ctx().has_complete_physical_manifest()) {
+        ctx().consume_physical_route(
+            FmbRouteFamily::NORMALIZATION,
+            HYVLA_EXPERT_POST_NORM_SITE,
+            static_cast<int64_t>(
+                cold_rmsnorm_pad16_
+                    ? HyVlaExpertNormalizationRoute::RMSNORM_V16_ROWS
+                    : HyVlaExpertNormalizationRoute::RMSNORM_SCALAR_ROWS),
+            /*resolved_flags=*/0,
+            {cold_rmsnorm_pad16_ ? 1 : 0, nrows, h}, chunk.idx);
+    }
     rpu_launch_rmsnorm_spm_kernel(
         addr(0, "residual2"), addr(0, "residual1"),
         layer_addr(layer_idx, 0, "post_norm_w"), nrows, h, eps_expert_);
@@ -695,36 +1292,104 @@ void HyVlaExpertModel::build_layer_subgraph(int layer_idx, const ChunkInfo& chun
     // ── 步 6: SwiGLU MLP + 残差归约 ──
     // 手写而非用基类 emit_mlp_pipeline: 保持与 VLM 塔同构的可读性, 且这里的
     // 槽名/核数组合与基类默认一致, 没有额外分支。
+    if (ctx().has_complete_physical_manifest()) {
+        ctx().consume_physical_route(
+            FmbRouteFamily::LINEAR, HYVLA_EXPERT_GATE_LINEAR_SITE,
+            static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+            /*resolved_flags=*/0,
+            {seq_len, intermediate_size(), h, 1, NUM_CORES}, chunk.idx);
+    }
     rpu_launch_linear_spm_to_spm_acc16_kernel(
         addr(0, "residual1"), lw.gate_w, addr(0, "gate"),
         seq_len, intermediate_size(), h, /*partition=*/1, NUM_CORES,
         /*bias_spm_addr=*/0u, /*scale=*/lw.gate_ws);
-    if (!hyvla_silu_mul_on("expert"))
+    if (!cold_silu_mul_) {
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::ACTIVATION,
+                HYVLA_EXPERT_MLP_SILU_SITE,
+                static_cast<int64_t>(
+                    HyVlaExpertActivationRoute::SILU_UNARY),
+                /*resolved_flags=*/0,
+                {cold_silu_mul_ ? 1 : 0, elems_mlp, NUM_CORES}, chunk.idx);
+        }
         rpu_launch_eltwise_unary_spm_kernel(
             addr(0, "gate"), addr(0, "gate"), elems_mlp, ValuOpType::SILU,
             /*is_gelu=*/false, NUM_CORES);
+    }
+    if (ctx().has_complete_physical_manifest()) {
+        ctx().consume_physical_route(
+            FmbRouteFamily::LINEAR, HYVLA_EXPERT_UP_LINEAR_SITE,
+            static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+            /*resolved_flags=*/0,
+            {seq_len, intermediate_size(), h, 1, NUM_CORES}, chunk.idx);
+    }
     rpu_launch_linear_spm_to_spm_acc16_kernel(
         addr(0, "residual1"), lw.up_w, addr(0, "up"),
         seq_len, intermediate_size(), h, /*partition=*/1, NUM_CORES,
         /*bias_spm_addr=*/0u, /*scale=*/lw.up_ws);
-    if (hyvla_silu_mul_on("expert"))
+    if (cold_silu_mul_) {
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::ACTIVATION,
+                HYVLA_EXPERT_MLP_SILU_MUL_SITE,
+                static_cast<int64_t>(
+                    HyVlaExpertActivationRoute::SILU_MUL_FUSED),
+                /*resolved_flags=*/0,
+                {cold_silu_mul_ ? 1 : 0, elems_mlp, NUM_CORES}, chunk.idx);
+        }
         rpu_launch_silu_mul_spm_kernel(
             addr(0, "gate"), addr(0, "up"), addr(0, "gate"),
             elems_mlp, NUM_CORES);
-    else
+    } else {
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::ACTIVATION,
+                HYVLA_EXPERT_MLP_MUL_SITE,
+                static_cast<int64_t>(HyVlaExpertActivationRoute::MUL),
+                /*resolved_flags=*/0,
+                {cold_silu_mul_ ? 1 : 0, elems_mlp, NUM_CORES}, chunk.idx);
+        }
         rpu_launch_eltwise_binary_spm_kernel(
             addr(0, "gate"), addr(0, "up"), addr(0, "gate"),
             elems_mlp, ValuOpType::MUL, c10::Half(1.0f), NUM_CORES);
+    }
+    if (ctx().has_complete_physical_manifest()) {
+        ctx().consume_physical_route(
+            FmbRouteFamily::LINEAR, HYVLA_EXPERT_DOWN_LINEAR_SITE,
+            static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+            /*resolved_flags=*/0,
+            {seq_len, h, intermediate_size(), 0, NUM_CORES}, chunk.idx);
+    }
     rpu_launch_linear_spm_to_spm_acc16_kernel(
         addr(0, "gate"), lw.down_w, addr(0, "down"),
         seq_len, h, intermediate_size(), /*partition=*/0, NUM_CORES,
         /*bias_spm_addr=*/0u, /*scale=*/lw.down_ws);
+    if (ctx().has_complete_physical_manifest()) {
+        ctx().consume_physical_route(
+            FmbRouteFamily::ALL_REDUCE,
+            HYVLA_EXPERT_MLP_ALL_REDUCE_SITE,
+            fmb_ring_all_reduce_route_selector(seq_len, h),
+            /*resolved_flags=*/0,
+            {seq_len, h, NUM_CORES, NUM_CORES}, chunk.idx);
+    }
     rpu_launch_all_reduce_sum_residual_kernel(
         addr(0, "down"), addr(0, "residual2"), addr(0, "residual1"),
         seq_len, h, NUM_CORES, NUM_CORES);
 
     // ── 步 7 (末层): final RMSNorm (原地, 单份 γ) ──
     if (is_last_layer) {
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::NORMALIZATION,
+                HYVLA_EXPERT_FINAL_NORM_SITE,
+                static_cast<int64_t>(
+                    cold_rmsnorm_pad16_
+                        ? HyVlaExpertNormalizationRoute::RMSNORM_V16_ROWS
+                        : HyVlaExpertNormalizationRoute::RMSNORM_SCALAR_ROWS),
+                /*resolved_flags=*/0,
+                {cold_rmsnorm_pad16_ ? 1 : 0, nrows, h}, chunk.idx);
+        }
         rpu_launch_rmsnorm_spm_kernel(
             addr(0, "residual1"), addr(0, "residual1"),
             addr(0, "final_norm_w"), nrows, h, eps_expert_);
@@ -742,7 +1407,8 @@ at::Tensor HyVlaExpertModel::step_forward(
     const at::Tensor& x_emb, std::vector<at::Tensor>& k_caches,
     std::vector<at::Tensor>& v_caches,
     const at::Tensor& cos, const at::Tensor& sin,
-    const at::Tensor& attn_mask_4d, int64_t prefix_len)
+    const at::Tensor& attn_mask_4d, int64_t prefix_len,
+    at::IntArrayRef planned_stage_descriptor)
 {
     TORCH_CHECK(!layers_.empty() && expert_chunk_size_ > 0,
                 "hyvla_expert step_forward before set_weights_expert");
@@ -785,22 +1451,17 @@ at::Tensor HyVlaExpertModel::step_forward(
                     cs, ") exceeds k_cache capacity ", kc.size(1) * kc.size(5));
     }
 
-    // suffix 必须单块。override 取 ceil16(cs) —— override 路径的 (v/16)*16 会把
-    // 非 16 对齐值向下取整。RAII 恢复 (异常路径也恢复)。
-    const int64_t single_cs = ((cs + 15) / 16) * 16;
-    const int64_t saved_chunk_size = get_chunk_size_override();
-    set_chunk_size_override(single_cs);
-    auto chunk_guard = c10::make_scope_exit([this, saved_chunk_size] {
-        set_chunk_size_override(saved_chunk_size);
-    });
-
     rpu_ddr_flush_force(x_emb.data_ptr<c10::Half>());
 
     return CausalDecoderModel::forward(
         x_emb, k_caches, v_caches,
         std::optional<at::Tensor>(attn_mask_4d),
         /*position=*/prefix_len, /*is_causal=*/false,
-        /*position_ids=*/std::nullopt, /*deepstack=*/std::nullopt);
+        /*position_ids=*/std::nullopt, /*deepstack=*/std::nullopt,
+        /*rope_cos_il=*/std::nullopt, /*rope_sin_il=*/std::nullopt,
+        /*cos_sin_offset=*/-1, /*batch_slot=*/0,
+        /*allow_batch_decode=*/false, /*planned_chunk_size=*/0,
+        planned_stage_descriptor);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -810,14 +1471,15 @@ void HyVlaExpertModel::unroll_forward(
     const at::Tensor& x0_rpu, std::vector<at::Tensor>& k_caches,
     std::vector<at::Tensor>& v_caches, const at::Tensor& state_emb,
     const at::Tensor& cos, const at::Tensor& sin, const at::Tensor& attn_mask_4d,
-    at::Tensor& x_traj, double dt, int64_t prefix_len, int64_t num_steps)
+    at::Tensor& x_traj, double dt, int64_t prefix_len, int64_t num_steps,
+    at::IntArrayRef planned_stage_descriptor)
 {
     TORCH_CHECK(unroll_mode_, "hyvla_expert unroll_forward 之前必须 set_action_weights");
     TORCH_CHECK(num_steps == num_steps_, "num_steps(", num_steps,
                 ") 必须等于 set_action_weights 的 num_steps(", num_steps_, ")");
     const int64_t cs = expert_chunk_size_, np = action_dim_pad_, h = hidden_size();
 
-    // 节点数护栏：为 batch 上限保留充足余量。
+    // Bound the unrolled graph size before recording the repeated body.
     TORCH_CHECK(num_steps * 1500 < 32000,
                 "denoise unroll (", num_steps, " 个 body) 会逼近 32768 的 batch 上限");
 
@@ -873,21 +1535,17 @@ void HyVlaExpertModel::unroll_forward(
     x_traj_dst_base_ = ::rhino_lkn::RpuGetDevAddr(x_traj.data_ptr());
     rpu_ddr_flush_force(x0_rpu.data_ptr<c10::Half>());
 
-    // 与 step_forward 同一条 chunk 约束: suffix 必须单块。
-    const int64_t single_cs = ((cs + 15) / 16) * 16;
-    const int64_t saved_chunk_size = get_chunk_size_override();
-    set_chunk_size_override(single_cs);
-    auto chunk_guard = c10::make_scope_exit([this, saved_chunk_size] {
-        set_chunk_size_override(saved_chunk_size);
-    });
-
     // 一次 forward —— run_all_layers 内部循环 body_iterations(=num_steps_) 次,
     // pre/post hook 每次以递增的 ctx().body_iter 重新 emit。
     (void) CausalDecoderModel::forward(
         emb_stage_, k_caches, v_caches,
         std::optional<at::Tensor>(attn_mask_4d),
         /*position=*/prefix_len, /*is_causal=*/false,
-        /*position_ids=*/std::nullopt, /*deepstack=*/std::nullopt);
+        /*position_ids=*/std::nullopt, /*deepstack=*/std::nullopt,
+        /*rope_cos_il=*/std::nullopt, /*rope_sin_il=*/std::nullopt,
+        /*cos_sin_offset=*/-1, /*batch_slot=*/0,
+        /*allow_batch_decode=*/false, /*planned_chunk_size=*/0,
+        planned_stage_descriptor);
 }
 
 }  // namespace v3
@@ -897,11 +1555,57 @@ void HyVlaExpertModel::unroll_forward(
 // =============================================================================
 using HyVlaExpertRegistry = ModelHandleRegistry<v3::HyVlaExpertModel>;
 
+std::vector<int64_t> rpu_hyvla_expert_planner_cache_identity(int64_t handle) {
+    return HyVlaExpertRegistry::get(handle, "rpu_hyvla_expert_planner_cache_identity")
+        ->planner_cache_identity();
+}
+
+void rpu_hyvla_expert_bind_kvinsert_costs(
+        int64_t handle, at::IntArrayRef identity,
+        const std::string& catalog_sha256, at::IntArrayRef certificate_rows) {
+    HyVlaExpertRegistry::get(handle, "rpu_hyvla_expert_bind_kvinsert_costs")
+        ->bind_kvinsert_costs(identity, catalog_sha256, certificate_rows);
+}
+
+std::tuple<std::vector<int64_t>, int64_t, int64_t>
+rpu_hyvla_expert_kvinsert_exact_candidate(
+    int64_t handle, at::IntArrayRef descriptor, int64_t site_id,
+    int64_t invocation, int64_t route) {
+    return HyVlaExpertRegistry::get(handle, "rpu_hyvla_expert_kvinsert_exact_candidate")
+        ->mint_kvinsert_exact_candidate(descriptor, site_id, invocation, route);
+}
+
+KvInsertCostDomainQuery rpu_hyvla_expert_kvinsert_cost_domain(
+        int64_t handle, at::IntArrayRef descriptor) {
+    return HyVlaExpertRegistry::get(handle, "rpu_hyvla_expert_kvinsert_cost_domain")
+        ->kvinsert_cost_domain("hyvla_expert", descriptor);
+}
+
+std::string rpu_hyvla_expert_kvinsert_cost_catalog_sha256(int64_t handle) {
+    return HyVlaExpertRegistry::get(
+        handle, "rpu_hyvla_expert_kvinsert_cost_catalog_sha256")
+        ->kvinsert_cost_catalog_sha256();
+}
+
 int64_t rpu_hyvla_expert_create() {
     return HyVlaExpertRegistry::create();
 }
 
+void rpu_hyvla_expert_set_runtime_config(
+    int64_t handle,
+    bool fast_replay, bool fast_replay_preload, bool mask_once,
+    bool silu_mul, bool kvpad16, bool partial_rope,
+    bool rmsnorm_pad16) {
+    HyVlaExpertRegistry::get(handle, "rpu_hyvla_expert_set_runtime_config")
+        ->set_runtime_config(
+            fast_replay, fast_replay_preload, mask_once, silu_mul,
+            kvpad16, partial_rope, rmsnorm_pad16);
+}
+
 void rpu_hyvla_expert_destroy(int64_t handle) {
+    HyVlaExpertRegistry::get(handle, "rpu_hyvla_expert_destroy")
+        ->check_execution_reconfigure_destroy_allowed(
+            "rpu_hyvla_expert_destroy");
     HyVlaExpertRegistry::destroy(handle, "rpu_hyvla_expert_destroy");
 }
 
@@ -914,14 +1618,14 @@ void rpu_hyvla_expert_set_weights(
     const at::Tensor& cos, const at::Tensor& sin, const at::Tensor& final_norm_w,
     int64_t num_q_heads, int64_t num_kv_heads, int64_t head_dim,
     int64_t hidden_size, int64_t intermediate_size, double eps,
-    int64_t chunk_size)
+    int64_t chunk_size, int64_t action_mlp_cores)
 {
     HyVlaExpertRegistry::get(handle, "rpu_hyvla_expert_set_weights")
         ->set_weights_expert(
             q_w, k_w, v_w, o_w, q_norm, k_norm, input_norm, post_norm,
             gate_w, up_w, down_w, cos, sin, final_norm_w,
             num_q_heads, num_kv_heads, head_dim, hidden_size, intermediate_size,
-            eps, chunk_size);
+            eps, chunk_size, action_mlp_cores);
 }
 
 void rpu_hyvla_expert_set_weights_w8a16(
@@ -933,7 +1637,7 @@ void rpu_hyvla_expert_set_weights_w8a16(
     const at::Tensor& cos, const at::Tensor& sin, const at::Tensor& final_norm_w,
     int64_t num_q_heads, int64_t num_kv_heads, int64_t head_dim,
     int64_t hidden_size, int64_t intermediate_size, double eps,
-    int64_t chunk_size,
+    int64_t chunk_size, int64_t action_mlp_cores,
     at::TensorList q_ws, at::TensorList k_ws, at::TensorList v_ws,
     at::TensorList o_ws, at::TensorList gate_ws, at::TensorList up_ws,
     at::TensorList down_ws)
@@ -943,7 +1647,7 @@ void rpu_hyvla_expert_set_weights_w8a16(
             q_w, k_w, v_w, o_w, q_norm, k_norm, input_norm, post_norm,
             gate_w, up_w, down_w, cos, sin, final_norm_w,
             num_q_heads, num_kv_heads, head_dim, hidden_size, intermediate_size,
-            eps, chunk_size,
+            eps, chunk_size, action_mlp_cores,
             q_ws, k_ws, v_ws, o_ws, gate_ws, up_ws, down_ws);
 }
 
@@ -951,10 +1655,12 @@ at::Tensor rpu_hyvla_expert_step_forward(
     int64_t handle, const at::Tensor& x_emb,
     std::vector<at::Tensor> k_caches, std::vector<at::Tensor> v_caches,
     const at::Tensor& cos, const at::Tensor& sin,
-    const at::Tensor& attn_mask_4d, int64_t prefix_len)
+    const at::Tensor& attn_mask_4d, int64_t prefix_len,
+    at::IntArrayRef planned_stage_descriptor)
 {
     return HyVlaExpertRegistry::get(handle, "rpu_hyvla_expert_step_forward")
-        ->step_forward(x_emb, k_caches, v_caches, cos, sin, attn_mask_4d, prefix_len);
+        ->step_forward(x_emb, k_caches, v_caches, cos, sin, attn_mask_4d,
+                       prefix_len, planned_stage_descriptor);
 }
 
 void rpu_hyvla_expert_set_action_weights(
@@ -973,9 +1679,50 @@ void rpu_hyvla_expert_unroll_forward(
     std::vector<at::Tensor> k_caches, std::vector<at::Tensor> v_caches,
     const at::Tensor& state_emb, const at::Tensor& cos, const at::Tensor& sin,
     const at::Tensor& attn_mask_4d, at::Tensor x_traj,
-    double dt, int64_t prefix_len, int64_t num_steps)
+    double dt, int64_t prefix_len, int64_t num_steps,
+    at::IntArrayRef planned_stage_descriptor)
 {
     HyVlaExpertRegistry::get(handle, "rpu_hyvla_expert_unroll_forward")
         ->unroll_forward(x0_rpu, k_caches, v_caches, state_emb, cos, sin,
-                         attn_mask_4d, x_traj, dt, prefix_len, num_steps);
+                         attn_mask_4d, x_traj, dt, prefix_len, num_steps,
+                         planned_stage_descriptor);
+}
+
+std::vector<int64_t> rpu_hyvla_expert_resolve_stage_domain(
+    int64_t handle, int64_t seq_len, int64_t prefix_len,
+    int64_t mask_kv_len) {
+    return HyVlaExpertRegistry::get(
+               handle, "rpu_hyvla_expert_resolve_stage_domain")
+        ->resolve_stage_domain(seq_len, prefix_len, mask_kv_len);
+}
+
+int64_t rpu_hyvla_expert_get_resolved_chunk_size(int64_t handle) {
+    return HyVlaExpertRegistry::get(
+               handle, "rpu_hyvla_expert_get_resolved_chunk_size")
+        ->get_last_resolved_chunk_size();
+}
+
+void rpu_hyvla_expert_set_chunk_size_override(
+    int64_t handle, int64_t chunk_size) {
+    HyVlaExpertRegistry::get(
+        handle, "rpu_hyvla_expert_set_chunk_size_override")
+        ->set_control_chunk_size_override(
+            chunk_size, "rpu_hyvla_expert_set_chunk_size_override");
+}
+
+void rpu_hyvla_expert_enable_execution_reconfigure(int64_t handle) {
+    HyVlaExpertRegistry::get(
+        handle, "rpu_hyvla_expert_enable_execution_reconfigure")
+        ->enable_execution_reconfigure_guard();
+}
+
+void rpu_hyvla_expert_stage_chunk_size_override(
+    int64_t handle, int64_t token, int64_t chunk_size) {
+    TORCH_CHECK(token > 0,
+                "Hy-VLA action expert hot-reconfigure token must be positive");
+    HyVlaExpertRegistry::get(
+        handle, "rpu_hyvla_expert_stage_chunk_size_override")
+        ->stage_control_chunk_size_override(
+            static_cast<uint64_t>(token), chunk_size,
+            "rpu_hyvla_expert_stage_chunk_size_override");
 }

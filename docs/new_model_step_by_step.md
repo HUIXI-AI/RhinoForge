@@ -156,7 +156,7 @@ The example must pass configuration validation without importing the native
 backend:
 
 ```bash
-python examples/causal_lm.py --config examples/configs/<profile>.toml --check-config
+python examples/causal_lm.py --config examples/configs/<model>/<checkpoint>/<precision>.toml --check-config
 ```
 
 Update [Model assets](model_assets.md) with the source, revision, destination,
@@ -176,26 +176,6 @@ python -m pytest \
 **Done means:** configuration-only checks, package import, registry behavior,
 and the existing public contracts pass without a board.
 
-## 8. Run the profile gates and promote it
+## 8. Verify the affected path
 
-Build from a clean process using the release-matched dependencies and asset,
-then run the exact TOML on an RPU board. The required evidence is:
-
-- the hard semantic, same-dtype implementation-parity, CPU FP32 anchor, and
-  representative task gates frozen under
-  [Model validation policy](validation_policy.md);
-- bit-identical output for `RPU_WARMUP=0`, `1`, and `3` by default, or the
-  exact profile's checked-in bounded repeatability contract;
-- one BUILD followed by stable REPLAY;
-- same-shape/different-value coverage;
-- maximum batch, sequence, and cache envelope; and
-- the public example completing from the pinned checkpoint in a fresh process.
-
-Record source, dependency, checkpoint, configuration, asset, input, and output
-hashes together. A missing operation, unsafe resource plan, or hard semantic
-failure blocks the profile. Incomplete parity or task evidence remains
-Experimental or Source-only; it cannot be promoted by narrowing the envelope
-unless that exact narrower profile passes every applicable gate.
-
-**Done means:** only after every gate passes may the exact profile be added to
-the runnable table in [Model support](model_support.md).
+Run the smallest meaningful checks from [model validation](validation_policy.md), then document the admitted checkpoint, precision and input envelope. Do not start a full matrix or release certification run without an explicit request.

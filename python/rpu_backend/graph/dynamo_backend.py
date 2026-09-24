@@ -1,7 +1,7 @@
 """
 RPU TorchDynamo backend — torch.compile 入口包装。
 
-用法 (兼容性入口;RPU 上不支持生产使用 ``torch.compile``):
+用法 (FROZEN,见下;2026-08-08 起不再从 rpu_backend 顶层导出,只能直接 import 本模块):
     from rpu_backend.graph.dynamo_backend import RpuDynamoBackend, dynamo_backend
     compiled = torch.compile(model, backend=dynamo_backend)
 
@@ -12,7 +12,7 @@ RPU TorchDynamo backend — torch.compile 入口包装。
 
 工作机制 (per Dynamo-traced FX gm):
     第一次调用:
-      planner.make_plan(opaque_gm_id, args) → registry.admit_for_call(plan)
+      planner.make_plan(id(gm), args) → registry.admit_for_call(plan)
       → cache.get_or_create(sig) (registry 内部) → graph.begin(sig)
       → state=RECORDING → gm(*args) (op stream 真跑, push 节点 + capture_data)
       → graph.end() → BUILT → registry.touch_after_call(plan)
@@ -23,11 +23,11 @@ RPU TorchDynamo backend — torch.compile 入口包装。
       → graph.end() → 复用 prepared_wq launch_prepared_batch
 
 dynamic shape 漂移由 Dynamo guard 在 frontend 处理:guard 失败 → 重 trace
-新 gm → 新 opaque id → 新 sig → 新 cache entry。
+新 gm → 新 id → 新 sig → 新 cache entry。
 
 LRU eviction (max_entries):
-    decode loop 里 transformers 内部把 kv_cache.position 当 Python int 读,
-    Dynamo 把它纳入 guard,position 每涨
+    decode loop 里 transformers 内部把 kv_cache.position 当 Python int 读
+    (transformers/qwen3:379 的 arange),Dynamo 把它纳入 guard,position 每涨
     1 → guard 失败 → retrace 出新 gm → 新 sig → 每步新 entry。每个 BUILT
     graph 持有一份 graph-managed SPM(record-time defer 到 graph 销毁才
     释放)。多 entry 累积下 SPM 池被耗尽,后续 graph acquire 失败 → 错地址
@@ -43,25 +43,25 @@ LRU eviction (max_entries):
     如果同一段会反复在某些 sig 之间切换(比如 prefill_sig + decode_sig 两个
     长期共存),把 max_entries 调到 2-4 让两端都能 replay。
 
-    不要把 max_entries 设成无界;Python-int guard
-    根治需要 RPUCache.get_seq_length 返回 0-d tensor 供 Dynamo 作为
-    SymInt 处理；当前实现仍需保持 max_entries 有界。
+    不要把 max_entries 关成无穷(default 之前的形态);Python-int guard
+    根治在 B 路径(patch RPUCache.get_seq_length 让它返回 0-d tensor 让
+    Dynamo 当 SymInt 处理),目前 backlog,见 docs/d3_backlog.md。
 
 
-``torch.compile`` on RPU is unsupported because adapters already own graph
-capture and nested capture is unsupported.
+This frontend is frozen and is not exported from the top-level package.
+Adapter execution already owns Graph capture, so wrapping an adapter in
+another captured region would attempt unsupported nested capture.
 
-The backend is intentionally not exported while nested capture remains
-unsupported.
-
-The lazy-init guard remains available from graph/lazy_init_guard.py because
-every patch_*_for_rpu() uses it on the ordinary eager path.
+The lazy-init guard is NOT part of this frozen surface: it moved to
+graph/lazy_init_guard.py because every patch_*_for_rpu() uses it on the
+ordinary eager path.
 """
 
 from typing import Callable, List, Optional
 import torch
 
-from .admission import EntryRegistry, SignaturePlanner, _opaque_object_id
+from .admission import SignaturePlanner
+from .admission import EntryRegistry
 
 import hashlib
 import logging
@@ -83,7 +83,7 @@ class RpuDynamoBackend:
         max_entries: LRU 软上限。默认 1 适合每步新 sig 的 decode loop
                      (KV cache position guard 触发的多 gm 场景);若有几个
                      sig 长期共存(prefill+decode 两个 gm),调到 2-4
-        debug: True 时每编译一个 gm 打印一行(node 数)
+        debug: True 时每编译一个 gm 打印一行(node 数 + id)
         branch_key_fn: 可选 pure function `(gm, args) -> branch value`。
                        返回 None/bool/int/float/str/tuple/list,backend 稳定
                        hash 到 GraphSignature.branch_key。默认 None 保持旧行为。
@@ -108,7 +108,7 @@ class RpuDynamoBackend:
             max_entries=self._max_entries,
             planner=self._planner,
         )
-        # Recompile sentinel.
+        # P7.1h L3 防线 — recompile sentinel.
         # key = (graph_text_hash, input_shapes, input_dtypes);value = list of gm_id.
         # 同 key 看到 ≥2 个 gm_id → log warning catch-all (lazy attr / training
         # check / Python control flow on tensor 等任何 Dynamo guard hazard).
@@ -126,28 +126,30 @@ class RpuDynamoBackend:
     def evict_count(self) -> int:
         """累计 evict 次数(LRU 冲队头)。诊断 SPM 复用率用。
 
-        Sums across the prefill, decode, and generic pools owned by
-        ``EntryRegistry`` and returns one aggregate integer.
+        Sums across the prefill / decode / generic pools owned by
+        `EntryRegistry`; matches the integer external callers
+        (`tests/dynamo/test_d3_dynamic.py:81` etc) used to read off the
+        legacy single-LRU counter.
         """
         return self._registry.evict_total()
 
     def __call__(self, gm: torch.fx.GraphModule,
                  example_inputs: List[torch.Tensor]) -> Callable:
-        gm_id = _opaque_object_id(gm)
+        gm_id = id(gm)
 
-        # Preflight on gm-reachable modules.
+        # P7.1h L2 防线 — preflight on gm-reachable modules
         from .lazy_init_guard import _verify_lazy_init_best_effort
         _verify_lazy_init_best_effort(gm, example_inputs)
 
-        # Check for recompilation of an equivalent graph.
+        # P7.1h L3 防线 — recompile sentinel
         self._sentinel_check(gm, example_inputs)
 
         if self._debug:
             n = len(list(gm.graph.nodes))
-            print(f"[rpu_dynamo_backend] compile nodes={n} "
+            print(f"[rpu_dynamo_backend] compile gm id={gm_id:x} nodes={n} "
                   f"max_entries={self._max_entries}", flush=True)
 
-        # Materialization break partitioner:
+        # P7.1f — Materialization break partitioner:
         # Dynamo 把 aten.clone / aten._to_copy (cross-device) / aten.copy_
         # trace 进 FX gm,RECORDING 期 deferred 执行让这些 host-read 节点
         # 读到 empty buffer → silent wrong output。Partition gm 把这些节点
@@ -204,8 +206,9 @@ class RpuDynamoBackend:
             sub_mod = partitioned_gm.get_submodule(sub_name)
             # sub_id = (gm_id << 16) | hash(sub_name) — **跟 gm_id 关联**,每次
             # Dynamo 新 trace gm_id 不同 → sub_id 不同 → admit_for_call 总走
-            # 新 entry,跨 call replay 永不命中。跨 trace replay 要求 sub_id
-            # 稳定,而当前 sub_id 取决于 Dynamo trace 和 sub_mod 标识。
+            # 新 entry,跨 call replay 永不命中。P7.1g known-fail (B):跨 call
+            # replay。修法需要让 sub_id 跨 trace 稳定 (取决于 Dynamo trace
+            # caching 行为 + sub_mod 标识),设计待研究。
             sub_id = (gm_id << 16) | (hash(sub_name) & 0xFFFF)
             self._install_rpu_wrap(
                 partitioned_gm, sub_name, sub_mod, sub_id,
@@ -249,7 +252,7 @@ class RpuDynamoBackend:
         sub_mod.forward = wrapped_forward
 
     # ---------------------------------------------------------------- #
-    # Recompile sentinel
+    # P7.1h L3 — recompile sentinel
     # ---------------------------------------------------------------- #
     def _sentinel_key(self, gm, example_inputs):
         """Stable key: (graph_text_hash, shapes, dtypes).
@@ -260,8 +263,7 @@ class RpuDynamoBackend:
         """
         try:
             graph_src = gm.graph.python_code('self').src
-            graph_hash = hashlib.md5(
-                graph_src.encode(), usedforsecurity=False).hexdigest()[:16]
+            graph_hash = hashlib.md5(graph_src.encode()).hexdigest()[:16]
         except Exception:
             graph_hash = "unknown"
         shapes = tuple(
@@ -276,17 +278,17 @@ class RpuDynamoBackend:
         """Track gm_id history per (graph_hash, shape, dtype). Warn on ≥2."""
         key = self._sentinel_key(gm, example_inputs)
         hist = self._gm_id_history.setdefault(key, [])
-        hist.append(_opaque_object_id(gm))
+        hist.append(id(gm))
         if len(hist) > 1:
             _log.warning(
                 "[RpuDynamoBackend] recompile detected for "
                 "shape=%s dtype=%s\n"
-                "  recompile count: %d\n"
+                "  gm_id history: %s\n"
                 "  Likely Dynamo guard hazard. "
                 "Run with TORCH_LOGS=recompiles to diagnose.\n"
                 "  Common causes: lazy attr init, self.training check, "
                 "Python control flow on tensor value.",
-                key[1], key[2], len(hist),
+                key[1], key[2], hist,
             )
 
 
@@ -298,13 +300,13 @@ dynamo_backend = RpuDynamoBackend()
 # =============================================================================
 # rpu_backend.compile() — 用户面 API,封掉 cache_position 实现细节
 # =============================================================================
-# Decode 每步进入 forward 时会调 past_key_values.get_seq_length() 拿
-# Python int,Dynamo 把这个 int 烘进
+# 见 428_plan.md §11.5.3:decode 每步进入 forward 时 transformers Qwen3:379
+# 调 past_key_values.get_seq_length() 拿 Python int,Dynamo 把这个 int 烘进
 # frame guard。compile wrapper 在 traced region 外把它转成 cache_position
 # tensor 显式传入,upstream forward 看到 cache_position 非 None 跳过自己
 # arange,Dynamo 看到的就只是 tensor 输入,不再 specialize 出 step-varying
-# Python int guard。配合 op schema 的 SymInt position 和 dynamic=True,
-# decode 全程共享同一 sig,LRU 不动,replay 持续命中。
+# Python int guard。配合 op schema SymInt position(Step 1)+ dynamic=True
+# (Step 2),decode 全程共享同一 sig,LRU 不动,replay 持续命中。
 
 class _RpuCompiledModule:
     """torch.compile 包装器:在 compiled region 外补齐 cache_position。
@@ -314,11 +316,11 @@ class _RpuCompiledModule:
         Dynamo 把它烘进 frame-local guard,每步 retrace 出新 gm。这里在 compile
         外把它转成 cache_position tensor —— 从 caller 视角 Python int 始终留
         在 compiled region 外,Dynamo trace 看到的是 tensor 而非常量 int。
-        Qwen3 forward 看 cache_position 非 None 时跳过内部 arange,从而不再调
-        get_seq_length() 拿 int。
+        Qwen3 forward 看 cache_position 非 None 时跳过 modeling_qwen3.py:379
+        自己 arange,从而不再调 get_seq_length() 拿 int。
 
     Note:
-        本 wrapper 不暴露给用户写 cache_position。用户继续
+        本 wrapper 不暴露给用户写 cache_position(§11.2 产品目标)。用户继续
         按 model.model(input_ids=, past_key_values=, use_cache=True)调,wrapper
         透明补齐。
     """
@@ -360,7 +362,7 @@ class _RpuCompiledModule:
                 device=input_ids.device, dtype=torch.long,
             )
 
-        # The compile path is a decode graph path. Full prefill capture is still
+        # D3 compile path is a decode graph path. Full prefill capture is still
         # handled by the dedicated graph-prefill path; recording the whole
         # model prefill through TorchDynamo currently captures unsupported data
         # movement and can corrupt the first token. Keep prefill eager and let
@@ -382,7 +384,7 @@ class _RpuCompiledModule:
             (>0 说明某步 prepared_wq 被丢失)
           - non_replayable_reasons 列出每个 entry 的 reason(空字符串过滤掉)
 
-        entries 字段给出每个 cache entry 的 graph 计数明细
+        1.2 P0 起 entries 字段给出每个 cache entry 的 graph 计数明细
         (kernel/segment/data_node/boundary_flush/prepared hit-miss/HostCallback
         tier 分桶/Tier3Oneshot),用来在 benchmark 里直接判断"这次跑是稳定
         replay 还是反复 recapture"。
@@ -481,16 +483,16 @@ def compile(model, **compile_kwargs):
                lm_head 的整个 ForCausalLM —— argmax/sampling 是 host op,留
                lm_head 外面跑省一次 graph break。
         **compile_kwargs: 透传给 torch.compile。三个特殊 key:
-            - backend=RpuDynamoBackend(...) 自定义 backend 实例（需要控制
-              max_entries 或共享 cache 时传）。不传则内部新建默认实例。
+            - backend=RpuDynamoBackend(...) 自定义 backend 实例(测试需要控
+              max_entries / 共享 cache 时传)。不传则内部新建默认实例。
             - dynamic=True / fullgraph=False  默认值,如显式传则尊重用户值。
             其它 (mode= / options= 等) 透传给 torch.compile。
 
     Returns:
         _RpuCompiledModule 实例。callable + 透传 model 属性 + .stats()。
     """
-    # 用户传 backend= 走自定义路径（跨多次 compile 共享 cache 或调整
-    # max_entries）；否则内部新建默认 backend。
+    # 用户传 backend= 走自定义路径(典型场景:跨多 compile 共享 cache,或
+    # 测试调 max_entries);否则内部新建默认 backend。
     backend = compile_kwargs.pop("backend", None)
     if backend is None:
         backend = RpuDynamoBackend(max_entries=4)

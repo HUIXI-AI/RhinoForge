@@ -17,9 +17,10 @@
 
 namespace {
 
-// 检查给定 graph 当前是否在线程 active stack 上（全栈包含检查）。嵌套
-// cache.capture 中只检查栈顶会漏掉仍活跃的 outer graph，导致误删 entry；
-// 因此必须检查完整 active stack。
+// 检查给定 graph 当前是否在线程 active stack 上(全栈包含检查)。
+// 历史:A0/A1 阶段只比对栈顶,nested cache.capture(outer) → cache.capture(inner)
+// 路径下 inner=top 时 outer 不在栈顶 → cache.evict(outer) 误删 outer entry →
+// outer 退栈 use-after-free(SIGSEGV)。改成 is_on_active_stack 全栈包含。
 bool is_active_now(RpuKernelGraph& g) {
     return RpuKernelGraph::is_on_active_stack(g);
 }
@@ -189,6 +190,22 @@ bool signature_tree_less(const SignatureTreeDumpEntry& a,
 
 }  // namespace
 
+RpuGraphCache::RpuGraphCache() {
+    validate_graph_runtime_policy(runtime_policy_);
+}
+
+RpuGraphCache::RpuGraphCache(size_t max_entries)
+    : max_entries_(max_entries) {
+    validate_graph_runtime_policy(runtime_policy_);
+}
+
+RpuGraphCache::RpuGraphCache(
+        size_t max_entries, GraphRuntimePolicy runtime_policy)
+    : max_entries_(max_entries),
+      runtime_policy_(std::move(runtime_policy)) {
+    validate_graph_runtime_policy(runtime_policy_);
+}
+
 RpuKernelGraph& RpuGraphCache::get_or_create(const GraphSignature& sig) {
     auto it = entries_.find(sig);
     if (it != entries_.end()) {
@@ -197,10 +214,10 @@ RpuKernelGraph& RpuGraphCache::get_or_create(const GraphSignature& sig) {
     TORCH_CHECK(entries_.size() < max_entries_,
                 "RpuGraphCache: capacity reached (",
                 entries_.size(), "/", max_entries_,
-                "); manual evict() required");
+                "); manual evict() required (A3 will add LRU)");
 
     RpuGraphCacheEntry entry;
-    entry.graph = make_registered_rpu_kernel_graph();
+    entry.graph = make_registered_rpu_kernel_graph(runtime_policy_);
     entry.signature = sig;
     auto [ins_it, inserted] = entries_.emplace(sig, std::move(entry));
     if (inserted) {
@@ -281,8 +298,18 @@ std::vector<RpuGraphCache::Snapshot> RpuGraphCache::snapshot() const {
         s.recapture_count = entry.recapture_count;
         if (entry.graph) {
             const auto& gs = entry.graph->debug_stats();
+            s.graph_lifetime_id = gs.graph_lifetime_id;
+            s.build_generation = gs.build_generation;
+            s.execution_ordinal = gs.execution_ordinal;
             s.non_replayable_reason          = gs.non_replayable_reason;
             s.data_node_count                = gs.data_node_count;
+            s.dma_count = gs.dma_count;
+            s.barrier_count = gs.barrier_count;
+            s.child_graph_count = gs.child_graph_count;
+            s.child_graph_lifetime_ids = gs.child_graph_lifetime_ids;
+            s.hwperf_evidence_failure_total = gs.hwperf_evidence_failure_total;
+            s.segment_census = gs.segment_census;
+            s.last_segment_executions = gs.last_segment_executions;
             s.boundary_flush_count           = gs.boundary_flush_count;
             s.prepared_segment_hit_total     = gs.prepared_segment_hit_total;
             s.prepared_segment_miss_total    = gs.prepared_segment_miss_total;

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the supported DINOv3 ViT-B image encoder."""
+"""Run the Supported (component scope) DINOv3 ViT-B feature profile."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from pathlib import Path
 import tomllib
 
 
-DEFAULT_CONFIG = Path(__file__).with_name("configs") / "dinov3_vit_b.toml"
+DEFAULT_CONFIG = Path(__file__).with_name("configs") / "dinov3/vit_b/fp16.toml"
 
 
 def load_config(path: Path) -> dict:
@@ -23,6 +23,15 @@ def load_config(path: Path) -> dict:
 
 
 def main() -> int:
+    import sys
+    example_dir = str(Path(__file__).resolve().parent)
+    if example_dir not in sys.path:
+        sys.path.insert(0, example_dir)
+    from _common import maybe_run_catalog
+    result = maybe_run_catalog('dinov3', DEFAULT_CONFIG)
+    if result is not None:
+        return result
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--check-config", action="store_true")

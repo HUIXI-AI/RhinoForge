@@ -1,0 +1,18 @@
+{
+  "files": [
+    {"path": ".gitattributes", "sha256": "11ad7efa24975ee4b0c3c3a38ed18737f0658a5f75a0a96787b576a78a023361", "size": 1519},
+    {"path": "LICENSE", "sha256": "a9dc88c8451037432b730a338fc049278196d6274df38e4b7073cad6e9d892aa", "size": 11632},
+    {"path": "README.md", "sha256": "20ccaa9897cf14cbb6f0f1aa089bc53ca1e05961dc83a65ca87d922354f47c2a", "size": 7048},
+    {"path": "chat_template.jinja", "sha256": "0a3568d31461f095ffd81fe0444fb0347cfb97385fc371678a3fa7043303085c", "size": 5826},
+    {"path": "config.json", "sha256": "b8c72119b463848a951acc6eedfa85551410c5e59af9a4a8023ffa1c720e42a5", "size": 3510},
+    {"path": "model.safetensors", "sha256": "bc1f3f0de1bd1ca5ce6830c5933fbb09c358d12ea71d212c8e7cb66f22c4b246", "size": 9053587008},
+    {"path": "norm_stats.pkl", "sha256": "5a675d8f73eba20bfbcd0c53b6d4d93f1b89285adac0dbb9caa5519125949dc1", "size": 8477},
+    {"path": "preprocessor_config.json", "sha256": "1929c3a757543d069398007ad9033620f626f33ae552dd6e379a31cf00418e01", "size": 790},
+    {"path": "special_tokens_map.json", "sha256": "bb9f59990034dae326581b9c62471523975417869f78a244b7ae2ce8cbb085eb", "size": 488},
+    {"path": "tokenizer.json", "sha256": "f8a4db9062449d985badacd53e829adbd5e0e4d85d705c74bc8342da7d4c5a1f", "size": 9530129},
+    {"path": "tokenizer_config.json", "sha256": "6ed16f53434794123b6b81f0e8a3061a1e485ce02bb2654d80646600c05e5a61", "size": 168277}
+  ],
+  "repository": "tencent/Hy-Embodied-0.5-VLA-UMI",
+  "revision": "3f53d1f8d2bc587c523cfdc9f1041ceee42c2524",
+  "schema": "rhinoforge-public-payload-manifest-v2"
+}

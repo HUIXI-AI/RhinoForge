@@ -1,8 +1,16 @@
-"""Per-instance Llama-3.2-1B adapter for the shared causal decoder.
+"""Llama-3.2-1B per-instance adapter (D-6-17 / Phase 06.1 generic CausalLM fusion).
 
-Lock contention raises ``RPUBackendError``. Supported profiles use the tuple
-``(hidden, intermediate, layers, attention_heads, kv_heads)``;
-Llama-3.2-1B is ``(2048, 8192, 16, 32, 8)``.
+R2-HIGH-3 (round-2): the lock-contention failure branch RAISES RPUBackendError
+(mirrors transformers/qwen3/adapter.py:273-279 + transformers/pi05/policy.py:183-185
++ the now-deleted models/llama_3p2_1b/loader.py:138-142 precedent the round-1 plan
+incorrectly proposed to weaken to `return self.model`).
+
+R2-MEDIUM-3 (round-2): 5-tuple profile (hidden, intermediate, num_hidden_layers,
+num_attention_heads, num_key_value_heads); Llama-3.2-1B = (2048, 8192, 16, 32, 8).
+
+v5-02 / B2: merged from transformers/llama/adapter.py + models/llama_3p2_1b/runtime.py.
+`apply_rpu_runtime` is now a private module helper; the to_rpu() lazy import
+collapses to a direct same-module call (G5 / G7-acc-b).
 """
 from __future__ import annotations
 import os
@@ -12,9 +20,11 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-# Install LlamaRMSNorm and LlamaRotaryEmbedding
+# v5-11 NS-03b (D-03e): inline class-patch block absorbed from the deleted
+# `_internal/patches/llama.py` (~49 LOC). Fires LlamaRMSNorm + LlamaRotaryEmbedding
 # class patches at module-load time. Idempotency sentinels guard against
-# repeated module-level execution.
+# repeated module-level execution (matches the absorbed module's behavior +
+# adapters/qwen3.py mirror pattern + R1 M-2 idempotency invariant).
 from transformers.models.llama.modeling_llama import (
     LlamaRMSNorm,
     LlamaRotaryEmbedding,
@@ -42,14 +52,18 @@ def _idempotent_patch_llama_rotary(rotary_emb_class) -> None:
 _idempotent_patch_llama_rmsnorm(LlamaRMSNorm)
 _idempotent_patch_llama_rotary(LlamaRotaryEmbedding)
 
-# `_install_causal_decoder_forward` lives in `runtime/decoder.py`. The thin
-# `patch_llama_model_for_rpu_all_layers_once` wrapper is folded into
+# Shared decoder ownership:
+# `_install_causal_decoder_forward` (was `patch_causal_decoder_for_rpu` in
+# `_internal/patches/__init__.py:393`) lives in `runtime/decoder.py`. The thin
+# `patch_llama_model_for_rpu_all_layers_once` wrapper (D-03d) is folded into
 # the call site here:
 #     _install_causal_decoder_forward(model, arch="llama")
 from rpu_backend.runtime.weights import swizzle_model_inplace
 from rpu_backend.runtime.decoder import (
+    _bind_causal_decoder_execution_session,
     _causal_lm_runtime_complete,
     _cleanup_causal_decoder_install,
+    _enable_causal_decoder_execution_reconfigure,
     _install_causal_decoder_forward,
 )
 
@@ -58,7 +72,7 @@ from rpu_backend.api.causal_lm import _claim_live_instance
 from rpu_backend.runtime.device import extract_to_device_target, is_rpu_device_target
 from rpu_backend.runtime.chunk_envelope import ChunkEnvelope, make_lookup
 
-# Certified chunk envelope.
+# Explicit chunk bounds for the supported Llama-3.2-1B configuration.
 _CHUNK_ENVELOPE = {
     ("llama", 16, 2048): ChunkEnvelope(64, 64),      # Llama-3.2-1B
 }
@@ -67,6 +81,7 @@ lookup_causal_decoder = make_lookup(
 
 
 # Module-level lock serializes swizzle across all Llama models in the process.
+# Mirrors the Qwen3Adapter precedent (adapters/qwen3.py:48).
 _SWIZZLE_LOCK = threading.Lock()
 
 
@@ -81,7 +96,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 def apply_rpu_runtime(model: nn.Module) -> None:
-    """Cold-set hardware-attribute defaults on `model`.
+    """Cold-set A9 hardware-attribute defaults on `model`.
 
     Called by `LlamaAdapter.to_rpu()` AFTER `.to('rpu')` and AFTER
     `install_hw_attr_validator` so writes flow through the validator.
@@ -95,10 +110,11 @@ def apply_rpu_runtime(model: nn.Module) -> None:
         model._rpu_debug_export = False
 
 
-# Five-field profile guard.
+# R2-MEDIUM-3 (round-2): 5-tuple profile guard.
 # (hidden_size, intermediate_size, num_hidden_layers, num_attention_heads, num_key_value_heads)
 # Llama-3.2-1B HF config: (2048, 8192, 16, 32, 8).
-# Both num_hidden_layers and num_attention_heads are guarded.
+# Both num_hidden_layers AND num_attention_heads are guarded — the round-1 plan
+# dropped one of them and would have admitted unsupported Q-head shapes.
 _SUPPORTED_PROFILES: frozenset[tuple[int, int, int, int, int]] = frozenset({
     (2048, 8192, 16, 32, 8),  # Llama-3.2-1B
 })
@@ -123,17 +139,20 @@ def _check_profile(config) -> None:
             f"Llama with profile (hidden_size={profile[0]}, "
             f"intermediate_size={profile[1]}, num_hidden_layers={profile[2]}, "
             f"num_attention_heads={profile[3]}, num_key_value_heads={profile[4]}) "
-            f"is not supported. Supported profiles: "
-            f"{sorted(_SUPPORTED_PROFILES)}. See "
-            "docs/api_reference.md#causal-language-models."
+            f"is not supported in v4.0. "
+            f"Supported profiles: {sorted(_SUPPORTED_PROFILES)}. "
+            "See docs/api_reference.md#Migration. "
+            "Track progress: v4.0.x backlog."
         )
 
 
 class LlamaAdapter:
     """Per-instance adapter for HF `LlamaForCausalLM`.
 
-    It uses the shared all-layers-once runtime without importing model-specific
-    code into the runtime layer.
+    Phase 06.1 / D-6-17: this adapter lives under `rpu_backend.adapters.llama`
+    (v5-02 relocation; previously `rpu_backend.transformers.llama`) so the
+    all-layers-once C++ patch can be invoked via `_internal.patches` without
+    violating the import-graph contract.
     """
 
     @classmethod
@@ -165,10 +184,13 @@ class LlamaAdapter:
         self.model = model
         self._all_layers_once_handle: int | None = None
         # Mirror Qwen3Adapter pattern: readiness lives on the model so a second
-        # adapter on the same instance does not swizzle a second time.
+        # adapter on the same instance does NOT re-swizzle (Pitfall 1).
         self._rpu_is_ready: bool = _causal_lm_runtime_complete(model)
+        self._execution_session = _bind_causal_decoder_execution_session(
+            self, entry_point="LlamaAdapter"
+        )
 
-        # Idempotent re-wrap guard.
+        # Idempotent re-wrap guard (Qwen3 WR-04 pattern).
         if getattr(model.to, "__rpu_wrapped__", False):
             return
 
@@ -194,7 +216,7 @@ class LlamaAdapter:
                     )
                 return self.to_rpu()
             # Reject non-rpu .to() after swizzle — convert_linear_weights_inplace
-            # is irreversible.
+            # is irreversible (Qwen3 iter2 HIGH-3 pattern).
             if (
                 self._rpu_is_ready
                 or getattr(self.model, "_rpu_swizzled", False)
@@ -214,8 +236,9 @@ class LlamaAdapter:
         """Swizzle weights, claim single-handle gate, move to RPU,
         install all-layers-once patch + validator.
 
-        Lock contention raises ``RPUBackendError`` instead of returning a
-        partially installed model.
+        R2-HIGH-3 (round-2): the lock-contention branch RAISES RPUBackendError
+        (does NOT silently return self.model — that was the round-1 skeleton bug).
+        Mirrors adapters/qwen3.py + adapters/pi05/__init__.py.
         """
         if _causal_lm_runtime_complete(self.model):
             self._rpu_is_ready = True
@@ -228,7 +251,8 @@ class LlamaAdapter:
                 "accepting a partial install."
             )
 
-        # Preserve the _rpu_swizzle_started failure-state guard. A prior swizzle that crashed
+        # R2-HIGH-3 (round-2): preserve the _rpu_swizzle_started failure-state guard
+        # (mirrors the now-deleted loader.py:127-136). A prior swizzle that crashed
         # mid-way leaves `_rpu_swizzle_started=True` and `_rpu_swizzled=False`;
         # a naive retry would re-swizzle already-mutated weights (double-swizzle).
         if getattr(self.model, "_rpu_swizzle_started", False):
@@ -238,7 +262,9 @@ class LlamaAdapter:
                 "`RPUModelForCausalLM.from_pretrained(...)` before retrying."
             )
 
-        # Raise on lock contention; never return a partial installation.
+        # R2-HIGH-3 (round-2): RAISE on lock contention (do NOT silently return).
+        # Mirrors adapters/qwen3.py + adapters/pi05/__init__.py
+        # + the now-deleted models/llama_3p2_1b/loader.py:138-142.
         if not _SWIZZLE_LOCK.acquire(blocking=False):
             raise RPUBackendError(
                 "LlamaAdapter.to_rpu(): another swizzle is in progress in this "
@@ -270,6 +296,10 @@ class LlamaAdapter:
                         self.model, "_rpu_execution", None
                     ),
                 )
+                _enable_causal_decoder_execution_reconfigure(inner)
+                self._execution_session = _bind_causal_decoder_execution_session(
+                    self, entry_point="LlamaAdapter"
+                )
 
                 validate_postinstall(self.model)
                 install_hw_attr_validator(self.model)
@@ -295,16 +325,24 @@ register_adapter("LlamaForCausalLM", LlamaAdapter)
 
 
 # ---------------------------------------------------------------------------
-# Adapter-facing entry for Llama discovery and library callers. It delegates
-# to the shared causal-decoder implementation.
+# v5-06 D-02: adapter-facing entry for Llama HF-discovery + library callers.
+# Mirrors `_apply_fused_lm_head_for_rpu` on the Qwen3 side. Body is a single
+# delegation to the shared `patch_causal_decoder_for_rpu` per D-06 (single
+# common body; no parallel implementations).
 # ---------------------------------------------------------------------------
+# v5-11 NS-03b (Step-4): _install_causal_decoder_forward already imported at top
+# of file from rpu_backend.runtime.decoder. The local _patch_causal_decoder_for_rpu
+# alias dropped — direct call to the runtime helper.
 
 
 def patch_llama_for_causal_lm(model) -> int:
     """Adapter-facing entry — patches a LlamaModel for RPU all-layers-once execution.
 
-    This public adapter API delegates to
-    ``runtime.decoder._install_causal_decoder_forward(model, arch='llama')``.
+    D-02 + D-06: this is the public adapter API. Body is a 1-line delegation to
+    `runtime.decoder._install_causal_decoder_forward(model, arch='llama')` — the
+    shared body collapsed in v5-06 from the prior `patch_llama_model_for_rpu_all_layers_once`
+    sibling and now owned by runtime/decoder.py to share the implementation
+    across supported causal-decoder architectures.
 
     Prerequisites (mirror Qwen3 path):
       - model.to("rpu") must have been called (typically via `LlamaAdapter.to_rpu()`)

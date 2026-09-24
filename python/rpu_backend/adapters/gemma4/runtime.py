@@ -1,19 +1,19 @@
-"""Gemma4 E4B runtime glue: reusable builder shared by validation callers
+"""Gemma4 E4B runtime glue (T7+): reusable builder shared by the gate scripts
 and ``Gemma4Adapter.to_rpu``.
 
 Three pure helpers driven by a ``raw(full_name) -> cpu float tensor`` getter, so
-the same code serves both offline checkpoint reads (``f.get_tensor``) and the
+the SAME code serves both the offline safe_open gates (``f.get_tensor``) and the
 adapter path (``model.state_dict()``):
 
   * ``swizzle_decoder_and_ple`` — per-layer swizzled q/k/v/o/norms/mlp + PLE
     weight lists (KV-shared layers reuse the SOURCE layer's k/v/k_norm as dense
     placeholders, matching the C++ ``is_kv_shared`` skip).
-  * ``compute_side_input`` — the PLE side-input, core-major laid out for the
+  * ``compute_side_input`` — the T6a PLE side-input, core-major laid out for the
     C++ scatter (per forward; depends on input_ids).
   * ``softcap_lm_logits`` — tied lm_head (embed_tokens.weight) + final softcap.
 
-Swizzle partitions (``transform_linear_weight`` is layout-only, so the C++
-shape checks hold): q/k/v=col1·nc2, o=row0·nc2,
+Proven swizzle partitions (T5/T6b/T7 gates; ``transform_linear_weight`` is
+layout-only so the C++ shape checks hold): q/k/v=col1·nc2, o=row0·nc2,
 gate/up=col1·nc8, down=row0·nc8, ple_gate=col1·nc8, ple_proj=row0·nc8.
 """
 from __future__ import annotations
@@ -84,9 +84,7 @@ def compute_side_input(
     projection_norm_weight: torch.Tensor, num_layers: int, hidden_size: int,
     ple_dim: int, eps: float,
 ) -> torch.Tensor:
-    """Build the PLE side-input as a core-major FP16 RPU tensor.
-
-    The output shape is ``[num_layers, NUM_CORES, S, ple_dim / NUM_CORES]``.
+    """T6a PLE side-input -> core-major fp16 rpu tensor [num_layers, NUM_CORES, S, ple_dim/NUM_CORES].
 
     side = (proj_norm(per_layer_model_projection(embeds) * H^-0.5)
             + embed_tokens_per_layer(ids) * sqrt(ple_dim)) * 2^-0.5

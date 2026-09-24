@@ -2,7 +2,7 @@
 parallel_linear_wint4a16_pgrp_m{m}n{n}k128 kernel ABI.
 
 Group-wise symmetric int4 along K (group_size, default 32), per output channel.
-The weight transform follows the operator ABI:
+Weight packing steps:
   per-core 16N x 64K swizzle (tp_col/row_swizzle_mc_weight)
   -> *deinterleaved* int4 packing inside each 64-value K-group (_int4_pack_perm)
   -> two's-complement nibble pack.
@@ -44,7 +44,7 @@ def quantize_int4_group_wise(
 
     Symmetric per (output-channel, K-group) block, qmax=7 / qmin=-8 (matching the
     per-channel scheme). Self-consistent: dequant(int4, scale) is exactly what the
-    kernel computes (scale[g,n] * int4[n,k]), so the CPU reference uses the same.
+    kernel computes (scale[g,n] * int4[n,k]), so the CPU golden uses the same.
     """
     if weight.dim() != 2:
         raise ValueError(f"expected 2-D Linear weight, got {tuple(weight.shape)}")
@@ -68,7 +68,7 @@ def quantize_int4_group_wise(
 
 
 def dequantize_int4_group_wise(int4_vals: torch.Tensor, scale_gn: torch.Tensor) -> torch.Tensor:
-    """Inverse of quantize_int4_group_wise -> fp16 [N, K] for CPU comparison."""
+    """Inverse of quantize_int4_group_wise -> fp16 [N, K] (for the CPU golden)."""
     G, N = scale_gn.shape
     K = int4_vals.shape[1]
     gs = K // G
@@ -130,7 +130,7 @@ def swizzle_int4_pgrp_scale(
 
 
 def _int4_pack_perm() -> np.ndarray:
-    """Deinterleave permutation required by each 64-value K group:
+    """Deinterleave perm within each 64-value K-group:
     [0,16, 1,17, ..., 15,31, 32,48, ..., 47,63]."""
     perm = np.empty(64, dtype=np.int64)
     for blk in range(2):
@@ -203,3 +203,46 @@ def pack_int4_per_channel_as_pgrp(
             logical_scale, group_size, partition, num_cores
         ),
     )
+
+
+def quantize_pack_int4_pgrp_col_bounded(
+    weight: torch.Tensor, group_size: int = 32,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack a col-partitioned lm_head for the current pgrp W4 kernel ABI."""
+    if weight.dim() != 2:
+        raise ValueError(
+            f"W4 lm_head weight must be 2-D, got {tuple(weight.shape)}"
+        )
+    vocab, hidden = (int(dim) for dim in weight.shape)
+    if group_size != 32:
+        raise ValueError(
+            "W4 col packing is validated only for group_size=32, "
+            f"got {group_size}"
+        )
+    if vocab % (16 * 8) != 0 or hidden % 64 != 0:
+        raise ValueError(
+            "W4 col packing requires vocab%128==0 and hidden%64==0, "
+            f"got {(vocab, hidden)}"
+        )
+    # Bound the quantizer's fp32 and packer's int64 temporaries. A block
+    # contains the same local output rows from every core, so its packed
+    # bytes occupy one contiguous interval of the original physical layout.
+    local_rows = vocab // 8
+    packed = torch.empty(vocab * hidden // 2, dtype=torch.uint8)
+    logical_scale = torch.empty(hidden // group_size, vocab, dtype=torch.float16)
+    core_weight = weight.detach().reshape(8, local_rows, hidden)
+    for start in range(0, local_rows, 256):
+        stop = min(start + 256, local_rows)
+        block = core_weight[:, start:stop].reshape(-1, hidden).to(torch.float16)
+        values, block_scale, _ = quantize_int4_group_wise(block, group_size)
+        packed[start * hidden * 4:stop * hidden * 4] = swizzle_pack_int4_pgrp(
+            values, partition=1, num_cores=8,
+        )
+        logical_scale.reshape(hidden // group_size, 8, local_rows)[:, :, start:stop] = (
+            block_scale.reshape(hidden // group_size, 8, stop - start)
+        )
+    packed = packed.reshape(vocab, hidden // 2)
+    scale = swizzle_int4_pgrp_scale(
+        logical_scale, group_size, partition=1, num_cores=8,
+    )
+    return packed.contiguous(), scale.contiguous()

@@ -1,4 +1,4 @@
-"""Gemma4 per-layer mixed-geometry table + graph-signature encoding.
+"""Gemma4 per-layer mixed-geometry table + graph-signature encoding (T1b).
 
 Pure-Python by design: NO torch / transformers / rpu_backend imports at module
 load, so this file is safe to import standalone (unit tests) AND from the
@@ -9,11 +9,12 @@ the single source of truth for Gemma4's mixed geometry, consumed by both:
     (``layer_type_ids`` / ``head_dim_per_layer`` / ``num_kv_heads_per_layer`` /
     ``kv_source_layer`` / ``is_kv_shared``), and
   * the Python graph-signature key (``geometry_dyn_dims``) so a geometry change
-    forces a fresh BUILD instead of a wrong REPLAY hit; the base graph
-    signature intentionally omits position.
+    forces a fresh BUILD instead of a wrong REPLAY hit (T1b requirement —
+    the base graph signature intentionally drops position, ``decoder.py:608``).
 
-KV-share semantics: the source is the last non-shared layer of each type;
-shared layers with ``idx >= L - num_kv_shared_layers`` drop k/v/k_norm.
+KV sharing uses the last non-shared layer of each type as its source, with
+separate head dimensions. Shared layers at indices >= L - num_kv_shared_layers
+omit k/v/k_norm.
 """
 from __future__ import annotations
 
@@ -76,7 +77,7 @@ def layer_geometry(text_config: Any) -> list[LayerGeom]:
     k_eq_v = bool(_cfg(text_config, "attention_k_eq_v", False))
     sliding_window = _cfg(text_config, "sliding_window")
 
-    # Source layer per type = last non-shared layer of that type.
+    # Source layer per type = LAST non-shared layer of that type (audit §4).
     last_nonshared: dict[str, int] = {}
     for i in range(first_shared):
         last_nonshared[layer_types[i]] = i
@@ -135,7 +136,7 @@ def max_num_kv_heads(geo: list[LayerGeom]) -> int:
     return max(g.num_kv_heads for g in geo)
 
 
-# --- graph-signature geometry encoding --------------------------------------
+# --- graph-signature geometry encoding (T1b) --------------------------------
 _FNV64_OFFSET = 0xCBF29CE484222325
 _FNV64_PRIME = 0x100000001B3
 _U64 = (1 << 64) - 1

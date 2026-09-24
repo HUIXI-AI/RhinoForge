@@ -1,8 +1,20 @@
-"""RPU KV cache and model-aware cache sizing.
+"""v5.0 owning module for RPUCache + RPUCache.from_model classmethod.
 
-``RPUCache.from_model`` accepts either prompt-plus-generation sizing or an
-explicit maximum length. ``device='cpu'`` permits board-free sizing checks;
-normal inference uses the default ``device='rpu'``.
+Per ADR §2.5 + REQ SKEL-02 + REQ CUT-06 + DELETION-LEDGER §N0a: this
+file is the canonical home for the 7-D swizzled KV cache used by RPU
+fused attention. Predecessor: ``core/weights/cache.py`` (which is
+now a thin re-export per NS-09a / D-02b).
+
+``from_model`` ports the v4.x ``build_cache`` XOR signature
+(transformers/_causal_lm.py:233-301) onto a classmethod, preserving
+the iter2 BLOCKER-1 ``_REQUIRED`` sentinel that distinguishes
+"max_new_tokens not given" from ``max_new_tokens=None``. The
+``device='cpu'`` escape hatch (codex pass-4 HIGH-3) lets cheap
+CI / scaffold smoke tests verify factory sizing without RPU
+allocation; production callers use the default ``device='rpu'``.
+
+NUM_CORES is imported from ``rpu_backend.core.weights.swizzle``
+(W5 single-source-of-truth carried over from v4.x; do NOT redefine here).
 """
 
 import os
@@ -20,7 +32,8 @@ except ImportError:
 from rpu_backend.runtime.weights import NUM_CORES
 
 
-# Distinguish an omitted ``max_new_tokens`` from explicit ``None``.
+# iter2 BLOCKER-1 (carried from build_cache): sentinel that distinguishes
+# "max_new_tokens not provided" from explicit `max_new_tokens=None`.
 _REQUIRED = object()
 _PREFILL_PADDING_BUDGET_ENV = "RPU_CAUSAL_PREFILL_PADDING_BUDGET"
 _PREFILL_PADDING_BUDGET_DEFAULT = 64
@@ -99,6 +112,8 @@ class RPUCache(HFCache):
         device: str = "rpu",
         dtype: torch.dtype = torch.float16,
         attn_tp: int = NUM_CORES,
+        *,
+        _layer_bank_size: int = 1,
     ):
         num_layers = _positive_int("num_layers", num_layers)
         batch_size = _positive_int("batch_size", batch_size)
@@ -106,6 +121,7 @@ class RPUCache(HFCache):
         num_kv_heads = _positive_int("num_kv_heads", num_kv_heads)
         head_dim = _positive_int("head_dim", head_dim)
         attn_tp = _positive_int("attn_tp", attn_tp)
+        _layer_bank_size = _positive_int("_layer_bank_size", _layer_bank_size)
         # batch_size > 1 only allocates independent KV slots. The Qwen3 adapter
         # owns the explicit capability gate that allows those slots to be used
         # by batched prefill/decode; other architectures remain batch==1.
@@ -149,13 +165,14 @@ class RPUCache(HFCache):
         self.head_dim = head_dim
         self.device = device
         self.dtype = dtype
+        self.attn_tp = attn_tp
+        self.physical_kv_cores = NUM_CORES
 
         # Chunk sizes for swizzle format
         self.sKeyChunk = 16
         self.sValChunk = 16
         self.headDimChunk = 16
-        # nKVHeadChunk × nKVHeadVx must equal NUM_CORES × nhkv / attn_tp
-        # to match the cache-insert operator's DDR stride contract.
+
         effective_kv_slots = NUM_CORES * num_kv_heads // attn_tp
         self.nKVHeadChunk = min(NUM_CORES, effective_kv_slots)
 
@@ -172,19 +189,30 @@ class RPUCache(HFCache):
         self.k_caches = []
         self.v_caches = []
 
-        for _ in range(num_layers):
+        k_shape = (batch_size, self.sKeyVx, self.nKVHeadVx, self.headDimVx,
+                   self.nKVHeadChunk, self.sKeyChunk, self.headDimChunk)
+        v_shape = (batch_size, self.sValVx, self.nKVHeadVx, self.headDimVx,
+                   self.nKVHeadChunk, self.headDimChunk, self.sValChunk)
+        # Exact runtime-quantized 32B owns many persistent DDR mappings. Group
+        # its layers without changing the 7D ABI or aliasing any cache rows.
+        # The default remains one allocation per layer. Cap grouping at
+        # 512 MiB; an individually larger layer still uses its own allocation.
+        layer_bytes = (batch_size * self.sKeyVx * self.nKVHeadVx * self.headDimVx
+                       * self.nKVHeadChunk * self.sKeyChunk * self.headDimChunk * 2)
+        bank_size = min(_layer_bank_size, max(1, (512 * 1024 * 1024) // layer_bytes))
+        for start in range(0, num_layers, bank_size):
+            count = min(bank_size, num_layers - start)
             k_cache = torch.zeros(
-                (batch_size, self.sKeyVx, self.nKVHeadVx, self.headDimVx,
-                 self.nKVHeadChunk, self.sKeyChunk, self.headDimChunk),
+                k_shape if count == 1 else (count, *k_shape),
                 dtype=dtype, device=resolved_device
             )
             v_cache = torch.zeros(
-                (batch_size, self.sValVx, self.nKVHeadVx, self.headDimVx,
-                 self.nKVHeadChunk, self.headDimChunk, self.sValChunk),
+                v_shape if count == 1 else (count, *v_shape),
                 dtype=dtype, device=resolved_device
             )
-            self.k_caches.append(k_cache)
-            self.v_caches.append(v_cache)
+            # Views retain each owning bank for the complete cache lifetime.
+            self.k_caches.extend([k_cache] if count == 1 else k_cache.unbind(0))
+            self.v_caches.extend([v_cache] if count == 1 else v_cache.unbind(0))
 
         # Track current position (sequence length written so far)
         self.position = 0
@@ -318,11 +346,11 @@ class RPUCache(HFCache):
         max_new_tokens=_REQUIRED,
         max_seq_len: int | None = None,
         batch_size: int = 1,
-        device: str = "rpu",  # "cpu" supports board-free sizing checks
+        device: str = "rpu",  # codex pass-4 HIGH-3: cheap CI escape hatch
     ) -> "RPUCache":
-        """Build a cache sized from a model and one of two input forms.
+        """v5.0 canonical factory (replaces v4.x ``build_cache``).
 
-        Two valid call forms (strict XOR):
+        Two valid call forms (strict XOR per ADR §2.5):
 
         1. ``RPUCache.from_model(model, input_ids=ids, max_new_tokens=N)``
            sized to cover both ``ids.shape[1] + N`` logical rows and the
@@ -334,12 +362,12 @@ class RPUCache(HFCache):
 
         Raises ``ValueError`` on:
         - both / neither slot specified (XOR violation),
-        - ``input_ids=`` without ``max_new_tokens=``,
+        - ``input_ids=`` without ``max_new_tokens=`` (iter2 MEDIUM-9 / BLOCKER-1),
         - ``max_new_tokens < 0``,
         - computed ``max_seq_len <= 0``.
 
-        ``device='cpu'`` is for board-free factory sizing verification.
-        Production callers
+        ``device='cpu'`` is for cheap CI / scaffold smoke (factory
+        sizing verification without RPU allocation). Production callers
         omit it (default ``'rpu'``).
 
         ``batch_size > 1`` is available only when
@@ -356,12 +384,23 @@ class RPUCache(HFCache):
                 f"max_seq_len={max_seq_len!r}."
             )
         config = model.config
+        from rpu_backend.runtime.topology import decoder_topology_for_model
+        topology = decoder_topology_for_model(model)
         batch_size = _positive_int("batch_size", batch_size)
         if batch_size > 1 and getattr(config, "model_type", None) != "qwen3":
             raise NotImplementedError(
                 "RPUCache.from_model batch_size > 1 is supported only for "
                 "model.config.model_type == 'qwen3'"
             )
+        if batch_size > 1:
+            decoder = getattr(model, "model", model)
+            if getattr(decoder, "_rpu_batch_decode_enabled", None) is False:
+                raise ValueError("this installed decoder profile requires batch_size=1")
+            from rpu_backend.runtime.topology import execution_core_count
+            cores = (topology.num_cores if topology is not None else
+                     execution_core_count(getattr(model, "_rpu_execution", None)))
+            if cores != NUM_CORES:
+                raise ValueError("reduced-core decoder pilot requires batch_size=1")
         head_dim = getattr(
             config, "head_dim",
             config.hidden_size // config.num_attention_heads,
@@ -413,6 +452,22 @@ class RPUCache(HFCache):
                 f"RPUCache.from_model: computed max_seq_len="
                 f"{max_seq_len} must be > 0."
             )
+        if topology is None:
+            from rpu_backend.runtime.topology import execution_core_count, resolve_decoder_topology
+            from rpu_backend.api._execution import (
+                validate_qwen3_core_profile, qwen3_vl_text_core_profile,
+            )
+            cores = execution_core_count(getattr(model, "_rpu_execution", None))
+            if cores != NUM_CORES:
+                if getattr(config, "model_type", None) == "qwen3_vl_text":
+                    qwen3_vl_text_core_profile(config, cores)
+                else:
+                    validate_qwen3_core_profile(config, cores)
+                topology = resolve_decoder_topology(
+                    num_cores=cores, hidden_size=config.hidden_size,
+                    intermediate_size=config.intermediate_size,
+                    num_q_heads=config.num_attention_heads, num_kv_heads=config.num_key_value_heads,
+                    head_dim=head_dim, vocab_size=config.vocab_size)
         return cls(
             num_layers=config.num_hidden_layers,
             batch_size=batch_size,
@@ -421,6 +476,8 @@ class RPUCache(HFCache):
             head_dim=head_dim,
             device=device,
             dtype=torch.float16,
+            attn_tp=topology.attn_tp if topology is not None else NUM_CORES,
+            _layer_bank_size=getattr(model, "_rpu_kv_cache_layer_bank_size", 1),
         )
 
     def to_dynamic_cache(self, device="cpu"):

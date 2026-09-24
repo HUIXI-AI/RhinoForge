@@ -1,6 +1,8 @@
-"""Debug helpers — set/get_debug, set/get_profile, debug tensor export, SPM debug, profile accumulator reset.
+"""Debug helpers — set/get_debug, set/get_profile, SPM debug, profile accumulator reset.
 
-This is the canonical home for debug control wrappers.
+Per ADR §6.4 (v5-04 final form): canonical home for debug control wrappers.
+Lifted byte-equal from the v4.1 ``rpu_backend._internal.debug`` module
+(deleted in this PR).
 
 Imports C-ext symbols from ``rpu_backend._cpp_ext`` (synthetic module populated
 by ``__init__.py`` from the .so loader). Each leaf reads ``_cpp_loaded`` to gate
@@ -8,14 +10,18 @@ the call.
 """
 from __future__ import annotations
 
+import contextlib
+
 import torch
 
 
 def _cpp_loaded() -> bool:
     """Return True iff the .so backend was loaded at import time.
 
-    Late import of the synthetic ``_cpp_ext`` module avoids a package-import
-    cycle while ``rpu_backend.__init__`` is still populating native symbols.
+    Late import of the synthetic _cpp_ext module avoids a module-load circular
+    (rpu_backend.__init__ creates _cpp_ext, then runs Python files that may
+    `from rpu_backend._internal import debug as _debug` — at THAT point _cpp_ext
+    exists but _internal/debug.py was never re-imported).
     """
     import sys as _sys
     return "rpu_backend._cpp_ext" in _sys.modules and bool(getattr(_sys.modules.get("rpu_backend"), "_cpp_loaded", False))
@@ -69,39 +75,77 @@ def reset_profile_accumulators() -> None:
 
 
 # -------------------------------
-# Debug tensor export
+# HW perf trace (Chrome JSON)
 # -------------------------------
-def set_debug_export(enabled: bool) -> None:
-    """Enable/disable debug tensor export for fused decoder layer verification."""
-    if _cpp_loaded():
-        _cpp().set_debug_export(enabled)
+def set_hw_perf_trace(
+    enabled: bool,
+    output_dir: str = ".rpu-hw-perf",
+    max_dumps: int = 32,
+) -> None:
+    """Enable RPU HW cycle-precision kernel/DMA Chrome trace dump.
+
+    Generates one JSON per BUILD and per REPLAY of every cached fused-decoder
+    subgraph, up to ``max_dumps`` files per process. File names:
+    ``<output_dir>/rpu_hwperf_pid<P>_tid<TID>_seq<S>_<GRAPH>_<build|replay>.json``.
+    Drag a JSON into https://ui.perfetto.dev to visualize.
+
+    Toggle semantics: lazy per-slot invalidate — calling this with ``enabled``
+    flipped versus the previous setting does NOT eagerly reset GraphCache.
+    Each cached graph slot remembers its BUILD-time perf state and is rebuilt
+    the next time it's selected if the global flag has flipped. ``output_dir``
+    and ``max_dumps`` changes take effect on the next dump (no rebuild needed);
+    each call also resets the dump budget.
+    """
+    if _cpp_loaded() and hasattr(_cpp(), "set_hw_perf_trace"):
+        _cpp().set_hw_perf_trace(enabled, output_dir, max_dumps)
 
 
-def get_debug_export() -> bool:
-    """Get debug tensor export state."""
-    if _cpp_loaded() and hasattr(_cpp(), "get_debug_export"):
-        return _cpp().get_debug_export()
+def get_hw_perf_trace() -> bool:
+    """Get HW perf trace enabled state."""
+    if _cpp_loaded() and hasattr(_cpp(), "get_hw_perf_trace"):
+        return _cpp().get_hw_perf_trace()
     return False
 
 
-def get_debug_tensor(name: str) -> torch.Tensor:
-    """Get a debug tensor by name."""
-    if _cpp_loaded() and hasattr(_cpp(), "get_debug_tensor"):
-        return _cpp().get_debug_tensor(name)
-    return torch.Tensor()
+@contextlib.contextmanager
+def hw_perf_trace(output_dir: str = ".rpu-hw-perf", max_dumps: int = 32):
+    """Enable HW perf trace for the body of a ``with`` block.
+
+    Always disables on exit, even on exception. Does NOT snapshot/restore
+    any prior ``set_hw_perf_trace`` config — after the with-block the trace
+    is OFF, with ``output_dir`` and ``max_dumps`` preserved on the C++ side
+    (so a later ``set_hw_perf_trace(True)`` without args is harmless).
+
+    Usage::
+
+        with torch.rpu.hw_perf_trace("/tmp/run42", max_dumps=16):
+            outputs = model.generate(...)
+        # perf is OFF here; JSON files in /tmp/run42/
+
+    See :func:`set_hw_perf_trace` for arg semantics.
+    """
+    set_hw_perf_trace(True, output_dir, max_dumps)
+    try:
+        yield
+    finally:
+        # Disable but keep output_dir + max_dumps so any post-block call to
+        # set_hw_perf_trace(True) without explicit args picks up sensible
+        # defaults. Side-effect: max_dumps gets re-stamped, which also
+        # refreshes the budget counter — harmless when enabled is False.
+        set_hw_perf_trace(False, output_dir, max_dumps)
 
 
-def clear_debug_tensors() -> None:
-    """Clear all stored debug tensors."""
-    if _cpp_loaded() and hasattr(_cpp(), "clear_debug_tensors"):
-        _cpp().clear_debug_tensors()
+# -------------------------------
+# Debug tensor export
+# -------------------------------
 
 
-def list_debug_tensors() -> list:
-    """List all stored debug tensor names."""
-    if _cpp_loaded() and hasattr(_cpp(), "list_debug_tensors"):
-        return _cpp().list_debug_tensors()
-    return []
+
+
+
+
+
+
 
 
 # -------------------------------

@@ -14,14 +14,16 @@ import tomllib
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CONFIG = Path(__file__).with_name("configs") / "qwen3_0_6b.toml"
+DEFAULT_CONFIG = Path(__file__).with_name("configs") / "qwen3/text/0_6b/fp16.toml"
 TARGETS = {
-    "causal_lm": "causal_lm.py",
+    "qwen3": "qwen3.py",
+    "llama": "llama.py",
+    "hy_vla": "hy_vla.py",
+    "halo": "halo.py",
     "dinov3": "dinov3.py",
     "g05": "g05.py",
     "gemma4": "gemma4.py",
     "gr00t": "gr00t.py",
-    "hy_embodied": "hy_embodied.py",
     "internvla_navdp": "internvla_navdp.py",
     "lingbot2": "lingbot2.py",
     "pi05": "pi05.py",
@@ -32,8 +34,15 @@ TARGETS = {
     "siglip": "siglip.py",
     "wall_oss": "wall_oss.py",
 }
+# Caller-owned configurations may still use these earlier target names; the
+# catalog and --list-targets advertise one entry per current model family.
+_COMPATIBILITY_TARGETS = {"causal_lm": "causal_lm.py", "hy_embodied": "hy_embodied.py"}
+_CATALOG_ONLY_TARGETS = {"qwen3", "llama", "hy_vla", "halo"}
 _EXECUTION_SUPPORT = {
-    "causal_lm": {"prefill": ("chunk_size", "padding_rows", "padding_budget")},
+    "causal_lm": {
+        "model": ("num_cores",),
+        "prefill": ("chunk_size", "padding_rows", "padding_budget", "linear_acc32"),
+    },
     "dinov3": {"vision": ("chunk_size",)},
     "g05": {},
     "gemma4": {"prefill": ("chunk_size",)},
@@ -46,19 +55,24 @@ _EXECUTION_SUPPORT = {
     "internvla_navdp": {},
     "lingbot2": {},
     "pi05": {
-        "prefill": ("chunk_size", "padding_rows", "padding_budget"),
-        "vision": ("chunk_size",),
-        "action": ("chunk_size",),
+        "model": ("num_cores",),
+        "prefill": ("chunk_size", "padding_rows", "padding_budget", "linear_acc32"),
+        "vision": ("chunk_size", "linear_acc32"),
+        "action": ("chunk_size", "linear_acc32"),
     },
     "qwen3_5_text": {
-        "prefill": ("chunk_size", "padding_rows", "padding_budget")
+        "model": ("num_cores",),
+        "prefill": ("chunk_size", "padding_rows", "padding_budget", "linear_acc32")
     },
     "qwen3_5_vision": {
-        "prefill": ("chunk_size", "padding_rows", "padding_budget")
+        "model": ("num_cores",),
+        "prefill": ("chunk_size", "padding_rows", "padding_budget", "linear_acc32"),
+        "vision": ("chunk_size", "padding_rows", "padding_budget", "linear_acc32"),
     },
     "qwen3_vl": {
-        "prefill": ("chunk_size", "padding_rows", "padding_budget"),
-        "vision": ("chunk_size",),
+        "model": ("num_cores",),
+        "prefill": ("chunk_size", "padding_rows", "padding_budget", "linear_acc32", "fast_replay"),
+        "vision": ("chunk_size", "linear_acc32"),
     },
     "rhinovla": None,
     "siglip": {"vision": ("chunk_size",)},
@@ -109,18 +123,32 @@ def _runtime_environment_inventory() -> tuple[set[str], set[str]]:
     )
 
 
+def _catalog_module():
+    example_dir = str(Path(__file__).resolve().parent)
+    if example_dir not in sys.path:
+        sys.path.insert(0, example_dir)
+    import _common
+    return _common
+
+
 def load_config(path: Path) -> dict:
     with path.open("rb") as stream:
         config = tomllib.load(stream)
+    if "example" in config or "pi05" in config:
+        return _catalog_module().load_config(path)
+    if set(config) & {"input", "run"}:
+        raise ValueError("[input]/[run] require the [example] or [pi05] configuration format")
     runner = config.get("runner")
     if not isinstance(runner, dict):
         raise ValueError("configuration needs a [runner] table")
     _unknown_keys(runner, _RUNNER_KEYS, "[runner]")
     target = runner.get("target")
-    if target not in TARGETS:
+    if target not in TARGETS and target not in _COMPATIBILITY_TARGETS:
         raise ValueError(
             f"[runner].target must be one of: {', '.join(sorted(TARGETS))}"
         )
+    if target in _CATALOG_ONLY_TARGETS:
+        raise ValueError(f"{target} requires an [example]/[input]/[run] configuration")
     execution = config.get("rpu_execution")
     if execution is not None:
         normalize = runpy.run_path(
@@ -131,6 +159,15 @@ def load_config(path: Path) -> dict:
             entry_point="examples/run_model.py",
             supported=_EXECUTION_SUPPORT[target],
         )
+
+    if target == "pi05" and config.get("model", {}).get("optimized_profile") is not None:
+        # These cold profile helpers use only the standard library. Match the
+        # policy admission before importing torch or touching model weights.
+        profiles = runpy.run_path(
+            str(ROOT / "python" / "rpu_backend" / "adapters" / "pi05" / "optimized.py")
+        )
+        profile = profiles["normalize_profile"](config["model"]["optimized_profile"])
+        profiles["execution_for_profile"](profile, execution)
 
     env = runner.get("env", {})
     if not isinstance(env, dict):
@@ -174,7 +211,7 @@ def _apply_environment(env: dict) -> None:
 
 
 def _run_target(target: str, config_path: Path, *, check_config: bool) -> None:
-    script = Path(__file__).with_name(TARGETS[target])
+    script = Path(__file__).with_name((TARGETS | _COMPATIBILITY_TARGETS)[target])
     argv = [str(script), "--config", str(config_path)]
     if check_config:
         argv.append("--check-config")
@@ -227,6 +264,7 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--check-config", action="store_true")
     parser.add_argument("--list-targets", action="store_true")
+    parser.add_argument("--profile", action="store_true", help="Collect a Torch trace")
     args = parser.parse_args()
     if args.list_targets:
         print("\n".join(sorted(TARGETS)))
@@ -234,7 +272,11 @@ def main() -> int:
 
     config_path = args.config.expanduser().resolve()
     config = load_config(config_path)
+    if "example" in config or "pi05" in config:
+        return _catalog_module().run_example(None, config_path)
     runner = config["runner"]
+    if args.profile:
+        runner.setdefault("torch_profile", {})["enabled"] = True
     if args.check_config:
         _run_target(runner["target"], config_path, check_config=True)
         print(f"runner configuration OK: {config_path}")

@@ -1,8 +1,15 @@
-"""Lazy, idempotent class-level patches used by ``Pi05Adapter.to_rpu``.
+"""Pi0.5 class-level patches: idempotent installers + wiring helper (PI05-03 reshape Plan 03-01).
 
-Class-level sentinels (``cls._rpu_X_patched``) prevent repeated installation.
+Per D-3-07 / AM-7, patches are LAZY (applied from Pi05Adapter.to_rpu Step A) —
+NOT import-time as in the legacy transformers/pi05/__init__.py:23-46. The
+patches use class-level sentinels (`cls._rpu_X_patched = True`) which bypass
+the A9 validator's instance __setattr__ (hw_attrs.py:190-193) — no whitelist
+extension required.
+
+v5-02 / B3: relocated from transformers/pi05/patches.py to adapters/pi05/patches.py.
 """
 from __future__ import annotations
+import math
 import torch
 from rpu_backend.runtime import rpu_env_bool
 
@@ -13,7 +20,7 @@ _SPM_PLANNING_BUDGET_BYTES = _SPM_USABLE_BYTES * 99 // 100
 
 
 # =============================================================================
-# Class-level patch helpers (idempotent and sentinel-guarded).
+# Class-level patch helpers (idempotent; sentinel-guarded per HIGH-5).
 # =============================================================================
 
 def _install_pi_gemma_rmsnorm_class_patch() -> None:
@@ -46,6 +53,7 @@ def _install_pi_gemma_rmsnorm_class_patch() -> None:
 def _install_gemma_rotary_class_patch() -> None:
     """CLASS-level idempotent patch of GemmaRotaryEmbedding to output kernel-format cos/sin.
 
+    ITERATION 5 (2026-04-21) — missing-patch root cause fix.
     The fused Gemma/AdaRMS kernels consume cos/sin in kernel format
     `[seq_len, head_dim//2]`; the unpatched transformers Gemma rotary returns
     `[batch, seq_len, head_dim]` with `cat(freqs, freqs)` duplicated halves.
@@ -53,12 +61,15 @@ def _install_gemma_rotary_class_patch() -> None:
     the wrong format when it calls `rotary(dummy, dummy_pos)` on RPU and passes
     wrong cos/sin to `gemma_set_weights`, producing incorrect RoPE angles.
 
-    The patch must be installed before the fused model consumes the RoPE tables.
+    Legacy parity: `pi05_converter._patch_gemma_rotary_embedding`
+    (pi05_converter.py:420-432). The legacy `load_pi05_model(fused=True)` installs
+    this patch before `convert_pi05_to_rpu_fused`; our adapter was missing it.
     """
     try:
         from transformers.models.gemma.modeling_gemma import GemmaRotaryEmbedding
     except ImportError:
         return
+    # v5-04 V2D-06: relocated to runtime/decoder.py + renamed to _install_*_swap.
     from rpu_backend.runtime.decoder import _install_rotary_class_swap
     if getattr(GemmaRotaryEmbedding, "_rpu_kernel_fmt_patched", False):
         return
@@ -113,9 +124,8 @@ def _batched_preprocess_images(
     if not channels_first and not channels_last:
         return None
 
-    # These CPU-only operations become scheduling-bound with excessive
-    # intra-op parallelism. Scope the limit to this block and always restore
-    # the caller's setting.
+    # Bound CPU preprocessing parallelism and restore the caller's thread
+    # setting after this block.
     ambient_threads = torch.get_num_threads()
     scoped_threads = (
         min(ambient_threads, 8)
@@ -142,9 +152,36 @@ def _batched_preprocess_images(
             from lerobot.policies.pi05.modeling_pi05 import (
                 resize_with_pad_torch,
             )
-            images = resize_with_pad_torch(
-                images, *policy.config.image_resolution
+            target_height, target_width = policy.config.image_resolution
+            ratio = max(
+                images.shape[2] / target_width,
+                images.shape[1] / target_height,
             )
+            resized_shape = (
+                int(images.shape[1] / ratio),
+                int(images.shape[2] / ratio),
+            )
+            if (
+                channels_first
+                and images.device.type == "cpu"
+                and images.dtype == torch.float32
+                and resized_shape == (target_height, target_width)
+            ):
+                # Match LeRobot's interpolation and clipping exactly. Its
+                # fresh resize result can be clipped in place; a zero-width
+                # pad would only copy the same pixels into another tensor.
+                images = torch.nn.functional.interpolate(
+                    images.permute(0, 3, 1, 2),
+                    size=resized_shape,
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                images.clamp_(0.0, 1.0)
+                images = images.permute(0, 2, 3, 1)
+            else:
+                images = resize_with_pad_torch(
+                    images, target_height, target_width
+                )
 
         images.mul_(2.0).sub_(1.0)
         if channels_first:
@@ -158,7 +195,8 @@ def _batched_preprocess_images(
             images.narrow(0, camera_idx, 1)
             for camera_idx in range(len(image_keys))
         ]
-        # Preserve the shared slab identity for the packed SigLIP upload.
+        # `_siglip_forward_images` recognizes these views and uploads their
+        # shared slab once instead of one CPU→RPU copy per camera.
         for camera_idx, image in enumerate(per_camera):
             image._pi05_batch_slab = images
             image._pi05_batch_index = camera_idx
@@ -203,7 +241,13 @@ def _preprocess_outputs_equal(candidate, reference) -> bool:
 
 
 def _install_preprocess_images_class_patch(policy) -> None:
-    """Batch eligible camera preprocessing and keep RPU images fp16.
+    """Batch camera preprocessing and keep images fp16 on RPU.
+
+    ITERATION 5 (2026-04-21) — missing-patch fix.
+    Legacy `_patch_preprocess_images` (pi05_converter.py:264-282) casts images to
+    fp16 when the model lives on RPU so downstream SigLIP + `embed_image` stay
+    in the fp16-throughout contract. The adapter was missing this patch; images
+    flowed as fp32, triggering dtype-hook round-trips through SigLIP.
 
     The inference fast path combines equal-shape, fully-present cameras into one
     slab. Its first eligible call is compared strictly against LeRobot's
@@ -304,7 +348,12 @@ def _install_eval_fastpath_class_patch(policy) -> None:
     cls._rpu_eval_fastpath_patched = True
 
 
-# Pi0.5 is fully prefix-LM, so the patched path emits zero attention masks.
+# ---------------------------------------------------------------------------
+# B3·A·1 (2026-05-27): patched embed_prefix that skips the slow Python
+# list-extend + torch.tensor(list, dtype=bool) conversion. pi05 is fully
+# prefix-LM (att_masks all 0), so we directly emit torch.zeros.
+# Spec §5.1 + Rev 4 corrections.
+# ---------------------------------------------------------------------------
 
 # Captured at module-import time. If/when other patches start modifying
 # embed_prefix, lift this capture into _install_embed_prefix_class_patch body.
@@ -347,6 +396,7 @@ def _assemble_packed_prefix_ondevice(self, packed_emb, tokens):
         or tokens.shape[0] != 1
     ):
         lang_emb = self.paligemma_with_expert.embed_language_tokens(tokens)
+        lang_emb = lang_emb * math.sqrt(lang_emb.shape[-1])
         return None, lang_emb
 
     image_rows = int(packed_emb.shape[1])
@@ -366,6 +416,7 @@ def _assemble_packed_prefix_ondevice(self, packed_emb, tokens):
         ids_rpu = cache["ids_rpu"]
     else:
         lang_emb = self.paligemma_with_expert.embed_language_tokens(tokens)
+        lang_emb = lang_emb * math.sqrt(lang_emb.shape[-1])
         if (
             lang_emb.device.type != "cpu"
             or lang_emb.dtype != torch.float16
@@ -408,12 +459,16 @@ def _assemble_packed_prefix_ondevice(self, packed_emb, tokens):
 
 
 def _patched_embed_prefix(self, images, img_masks, tokens, masks):
-    """Inference ``embed_prefix`` for Pi0.5.
+    """Inference-fast `embed_prefix` for Pi0.5 — Spec §5.1.
 
-    Pi0.5 is fully prefix-LM, so the final attention mask is equivalent to
-    ``torch.zeros(B, total, dtype=bool)``.
+    Skips upstream's `att_masks += [0]*num_img_embs` × N_cam + lang list
+    extend (968 ops total for 3-cam + 200-text setup) and the final
+    `torch.tensor(list[bool])` conversion. Since pi05 is fully prefix-LM,
+    final att_masks is bit-equivalent to torch.zeros(B, total, dtype=bool).
 
-    Training delegates to the reference path to preserve checkpointing semantics.
+    Training fallback: if `self.training`, delegate to upstream to preserve
+    gradient checkpointing semantics (Spec C8). Uses runtime `if` branch,
+    NOT `assert` (-O strips assert).
     """
     if self.training:
         return _orig_embed_prefix(self, images, img_masks, tokens, masks)
@@ -423,26 +478,35 @@ def _patched_embed_prefix(self, images, img_masks, tokens, masks):
     total_prefix_len = 0
     packed_emb = None
 
-    # Pack configured camera images into one encoder forward. Minibatch SDPA
-    # preserves per-image isolation, and output rows remain grouped by image.
+    # SigLIP-batch (2026-05-31): when the RPU SigLIP forward was patched for N
+    # packed images (`_rpu_siglip_batch_n` set by Pi05Adapter), pass the N camera
+    # images as a LIST to the C++ multi op and run a SINGLE seq=N*256 fused
+    # encoder forward (collapses 27-layer weight DDR + LN/Linear/MLP/KV launches
+    # 3→1). Per-image attention isolation is enforced by the minibatch SDPA in
+    # C++. The packed output [1, N*256, 2048] keeps image i's tokens at rows
+    # [i*256,(i+1)*256), aligned with the per-image pad_masks built below.
     _batch_n = getattr(self, '_rpu_siglip_batch_n', 1)
     if _batch_n > 1 and len(images) == _batch_n:
-        # The multi op owns patch embedding and returns [1, N*256, 2048].
+        # All-RPU packed forward: bypass embed_image + torch.cat (a CPU fallback
+        # that leaves its result un-flushed to DDR → stale patch-emb DMA read).
+        # Pass the N images straight to the C++ multi op, which patch-embeds +
+        # packs them itself. Returns the same [1, N*256, 2048] embed_image would.
         from rpu_backend.adapters.siglip import _siglip_forward_images
         _vt = self.paligemma_with_expert.paligemma.model.vision_tower
         _vision_model = _vt.vision_model if hasattr(_vt, 'vision_model') else _vt
         packed_emb = _siglip_forward_images(_vision_model, list(images))  # [1, N*256, 2048]
         bsize = packed_emb.shape[0]
         per_img_embs = packed_emb.shape[1] // _batch_n
-        # ABSENT CAMERAS ARE DROPPED, NOT MASKED. Upstream keeps a
+        # ABSENT CAMERAS ARE DROPPED, NOT MASKED (2026-08-06). Upstream keeps a
         # missing camera as an all-(-1) image with a ZERO img_mask, so the
         # prefix gets a 256-row hole and lerobot's positions become
         # `cumsum(pad_masks) - 1`, renumbering everything after the hole. The
         # fused Gemma prefill takes `position_ids` in its signature and NEVER
         # PASSES IT to the op (adapters/pi05/gemma.py: only attention_mask and
         # is_causal reach torch.ops.rpu.gemma_forward), so RoPE there is always
-        # 0..L-1. With every camera present cumsum-1 is arange; with one absent,
-        # later text tokens would otherwise use the wrong positions.
+        # 0..L-1. With every camera present cumsum-1 IS arange and the
+        # difference cannot show; with one absent the text tokens sit 256
+        # positions off, changing the action computation.
         #
         # Dropping the rows is exact, not a workaround: those tokens are masked
         # out of every query (att_2d = pad ⊗ pad), their own outputs are
@@ -497,6 +561,7 @@ def _patched_embed_prefix(self, images, img_masks, tokens, masks):
 
     if lang_emb is None:
         lang_emb = self.paligemma_with_expert.embed_language_tokens(tokens)
+        lang_emb = lang_emb * math.sqrt(lang_emb.shape[-1])
 
     if assembled_embs is not None:
         if getattr(self, "_pi05_prefix_assembly_ok", None) is None:
@@ -565,7 +630,7 @@ def _install_embed_prefix_class_patch() -> None:
 
 
 def install_class_patches(policy) -> None:
-    """Apply all Pi0.5 class-level patches.
+    """Step A from _adapter.py:858-861 — apply all class-level patches.
 
     Called by Pi05Adapter.to_rpu() Step A. Idempotent across calls (each patch
     has its own sentinel guard).
@@ -574,4 +639,4 @@ def install_class_patches(policy) -> None:
     _install_gemma_rotary_class_patch()
     _install_preprocess_images_class_patch(policy)
     _install_eval_fastpath_class_patch(policy)
-    _install_embed_prefix_class_patch()
+    _install_embed_prefix_class_patch()  # B3·A·1 (2026-05-27)

@@ -19,15 +19,12 @@
 
 constexpr int SPM_BANK_SIZE = 32;
 
-// -----------------------------------------------------------------------------
-// RPU_CHECK_SPM — the eager ops build LocalSPM_t on the stack and then memcpy
-// through get_cpu_ptr(). Buffer_t's ctor leaves cpu_ptr_ = nullptr and the
-// derived ctor fills it ONLY ON SUCCESS, so exhaustion otherwise leaves a null
-// pointer for the following memcpy. This check converts that condition into an
-// error naming the buffer and byte count.
-//
-// It does NOT make the eager ops coexist with a live SPM_ALLOC. That needs
-// routing them through SPM_ALLOC; this only makes the incompatibility explicit.
+// RPU_CHECK_SPM checks eager LocalSPM_t allocations before get_cpu_ptr() is used.
+// Buffer_t starts with a null CPU pointer, which its derived constructor fills
+// only after a successful allocation. An exhausted pool must produce a regular
+// error naming the buffer and byte count rather than a null-pointer access.
+// This check does not make eager LocalSPM allocations coexist with a live
+// SPM_ALLOC reservation; those paths need allocator-aware routing.
 #define RPU_CHECK_SPM(buf, bytes)                                              \
     TORCH_CHECK((buf).get_cpu_ptr() != nullptr,                                \
                 "SPM allocation failed for '" #buf "' (", (bytes),             \

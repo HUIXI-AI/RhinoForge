@@ -1,22 +1,33 @@
 // rpu_adarms_model.cpp — Pi0.5 Action Expert AdaRMS all-layers-once model
 //                         (v3 FusedModelBase port)
 //
-// AdaRMSModel implements the flat v3 FusedModelBase contract with a flat-phase
-// lifecycle, no registered callbacks, no persistent weights, and no post-graph.
+// Plan 01-04: ports AdaRMSModel from v2's two-class framework pair to the
+// v3 flat FusedModelBase single-class (from Plan 01-01). AdaRMS is the
+// "negative control" subclass — flat-phase lifecycle, no D-501 callbacks,
+// no persistent weights, no post-graph. Any ceremony required here would
+// indicate framework scope creep; the port validates the v3 API for the
+// cleanest shape (mirroring Qwen3 01-02 minimalism, without Qwen3's fused
+// lm_head optional post-step).
 //
-// Key framework integration points:
+// Key transformations vs v2 (mechanical; compute logic untouched):
+//   - Inherit from v3::FusedModelBase (lives in `namespace v3`).
 //   - Replace `buf(name)` at SDPA + KV-insert call sites with
-//     `addr_offset(name).value`, using the typed SpmOffset contract.
+//     `addr_offset(name).value` (Pitfall 3 structural fix via typed SpmOffset).
 //   - Access model params via pimpl getters (num_layers() / hidden_size() /
 //     num_q_heads() / num_kv_heads() / head_dim() / intermediate_size() /
-//     attn_tp()).
-//   - Class-member `cond_ref_` keeps the tensor alive for the synchronous
+//     attn_tp()) instead of v2 protected members.
+//   - Drop the legacy subclass-side tensor-tracking call — class-member
+//     `cond_ref_` assignment alone keeps the tensor alive for the synchronous
 //     forward() (run_all_layers consumes the DDR pointer inside the batched
 //     dispatch).
 //   - set_weights ENDS with `invalidate_model_state();` as last non-empty
-//     statement.
+//     statement (D-503 per-function awk contract).
+//   - Delete v2-only virtual overrides (chunk-size clip, KV-insert / compute /
+//     preload / post subgraph stubs, post-alloc hook, layout-change hook,
+//     persistent-invalidated hook, temporary-total estimator) — all absent
+//     from the v3 subclass contract per D-203.
 //
-// Execution scope:
+// Scope preserved from v2:
 //   - Per-forward cond DMA (layer 0 / chunk 0 gate): `cond_loaded_this_forward_`
 //     subclass flag toggled on the first build_layer_subgraph invocation.
 //   - Per-layer GEMV (cond * dense_w + bias -> [scale|shift|gate]) at
@@ -28,29 +39,68 @@
 //   - No final_norm fusion (Pi0.5 flow-matching head runs on Python).
 //   - cfg.cross_layer_batch_size = num_layers() (force single group).
 //
-// Design contract: FusedModelBase.
+// Design contract: docs/architecture.md#fusedmodelbase-v3--framework-contract
 
+#include "pi05_nvfp4.h"
 #include "fused_model_base.h"
+#include "pi05_execution_topology.h"
 #include "model_handle_registry.h"
 #include "rpu_ops.h"
 #include "rpu_eltwise.h"
 #include "rpu_helpers.h"
-#include "rpu_runtime_state.h"  // shared runtime state
+#include "rpu_runtime_state.h"  // v5-07: shared runtime globals (g_chunk_size_override, get_cross_layer_batch_size)
 #include <ATen/record_function.h>
 #include <c10/util/Half.h>
-#include <cstdint>
-#include <vector>
 #include <algorithm>
+#include <cstdint>
+#include <limits>
+#include <utility>
+#include <vector>
 
 using namespace at;
 using namespace ::rhino_lkn;
 
-#define NUM_CORES 8
 #define DWIDTH 2
 
 namespace v3 {
 
 namespace {
+
+// ADARMS_FIXED_KERNEL_BASIS: every non-manifest launcher below is a model-math
+// normalization/activation or fixed BufferDecl transport with no alternative
+// implementation. A selectable implementation must become a typed route first.
+
+constexpr int64_t ADARMS_CORE_PROFILE_SITE = 1727285745909984687LL;
+constexpr int64_t ADARMS_COND_PREPARE_SITE = 4545122598025177250LL;
+constexpr int64_t ADARMS_COND_DMA_SITE = 1365898338277373764LL;
+constexpr int64_t ADARMS_Q_LINEAR_SITE = 3720663967042490210LL;
+constexpr int64_t ADARMS_K_LINEAR_SITE = 737407077005117954LL;
+constexpr int64_t ADARMS_V_LINEAR_SITE = 2757305400171169493LL;
+constexpr int64_t ADARMS_Q_ROPE_SITE = 5408876450787035953LL;
+constexpr int64_t ADARMS_K_ROPE_SITE = 7158713397924778966LL;
+constexpr int64_t ADARMS_KV_INSERT_SITE = 1489108772795312297LL;
+constexpr int64_t ADARMS_ATTENTION_SITE = 892830053731625482LL;
+constexpr int64_t ADARMS_PREPARE_ALL_REDUCE_SITE = 2713753424009463107LL;
+constexpr int64_t ADARMS_O_LINEAR_SITE = 8920591606190302727LL;
+constexpr int64_t ADARMS_ATTENTION_ALL_REDUCE_SITE = 1378336082325261091LL;
+constexpr int64_t ADARMS_GEMV_LINEAR_SITE = 73920063418775617LL;
+constexpr int64_t ADARMS_GEMV_ALL_REDUCE_SITE = 3363421386255464359LL;
+
+enum class AdarmsAllReduceRoute : int64_t {
+    PREPARE_RING_INPUT = 3,
+};
+
+enum class AdarmsRopeRoute : int64_t {
+    ROPE_1D = 1,
+};
+
+enum class AdarmsMutableDmaRoute : int64_t {
+    DDR_SCATTER_TO_SPM = 1,
+};
+
+int64_t adarms_ring_route(int64_t rows, int64_t cols, int cores) {
+    return fmb_ring_all_reduce_route_selector(rows, cols, cores);
+}
 
 void check_adarms_scale_lists(
     int64_t n_layers,
@@ -59,7 +109,7 @@ void check_adarms_scale_lists(
     at::TensorList down_w,
     at::TensorList q_ws, at::TensorList k_ws, at::TensorList v_ws,
     at::TensorList o_ws, at::TensorList gate_ws, at::TensorList up_ws,
-    at::TensorList down_ws)
+    at::TensorList down_ws, bool nvfp4)
 {
     const bool has_scale = !q_ws.empty();
     auto check_scale_list = [&](const at::TensorList& list, const char* name) {
@@ -100,15 +150,19 @@ void check_adarms_scale_lists(
             TORCH_CHECK(w.scalar_type() == at::kChar || w.scalar_type() == at::kByte,
                         "adarms_set_weights: quantized mode requires int8(W8A16) or "
                         "uint8(packed-INT4) ", name, "[", i, "], got ", w.scalar_type());
-            TORCH_CHECK(scale.defined() && scale.scalar_type() == at::kHalf
+            TORCH_CHECK(scale.defined() && (scale.scalar_type() == at::kHalf || (nvfp4 && scale.scalar_type() == at::kByte))
                         && scale.device().type() == at::kPrivateUse1
                         && scale.is_contiguous(),
                         "adarms_set_weights: ", name, "_scale[", i,
                         "] must be a contiguous fp16 RPU tensor");
             if (w.scalar_type() == at::kChar) {
-                TORCH_CHECK(scale.dim() == 1 && scale.numel() == w.size(0),
+                TORCH_CHECK(scale.scalar_type() == at::kHalf && scale.dim() == 1 && scale.numel() == w.size(0),
                             "adarms_set_weights: W8A16 ", name, "_scale[", i,
                             "] must be per-channel [N=", w.size(0), "]");
+            } else if (nvfp4) {
+                TORCH_CHECK(scale.scalar_type() == at::kByte && scale.dim() == 2 &&
+                                scale.size(0) == w.size(1) / 8 && scale.size(1) == w.size(0),
+                            "Pi05 NVFP4 v2 requires FP8 striped [K/16,N] scales");
             } else {
                 TORCH_CHECK(scale.dim() == 2 &&
                                 (scale.size(0) == 32 || scale.size(0) == 64 ||
@@ -124,6 +178,13 @@ void check_adarms_scale_lists(
     };
 
     for (int64_t i = 0; i < n_layers; ++i) {
+        if (nvfp4) {
+            TORCH_CHECK(has_scale && q_w[i].scalar_type() == at::kByte &&
+                o_w[i].scalar_type() == at::kByte && gate_w[i].scalar_type() == at::kByte &&
+                up_w[i].scalar_type() == at::kByte && down_w[i].scalar_type() == at::kByte &&
+                k_w[i].scalar_type() == at::kChar && v_w[i].scalar_type() == at::kChar,
+                "Pi05 NVFP4 v2 scope must be Q/O/Gate/Up/Down FP4, K/V W8");
+        }
         check_weight_dtype(q_w[i],    has_scale ? q_ws[i]    : at::Tensor(), "q_w", i);
         check_weight_dtype(k_w[i],    has_scale ? k_ws[i]    : at::Tensor(), "k_w", i);
         check_weight_dtype(v_w[i],    has_scale ? v_ws[i]    : at::Tensor(), "v_w", i);
@@ -159,10 +220,83 @@ public:
         at::Tensor mlp_dense_b;     // [3*hidden] fp16
     };
 
-    AdaRMSModel() = default;
+    explicit AdaRMSModel(bool linear_acc32 = false) : linear_acc32_(linear_acc32) {}
+
+private:
+    const bool linear_acc32_;
+public:
+
+    void set_execution_cores(int64_t cores) {
+        TORCH_CHECK(cores == 4 || cores == 6 || cores == 8,
+                    "AdaRMS execution cores must be 4, 6 or 8");
+        TORCH_CHECK(layer_weights_.empty(),
+                    "AdaRMS execution cores must precede weight installation");
+        set_execution_core_count(static_cast<int>(cores));
+    }
+
+    int condition_tp() const { return num_cores() == 8 ? 8 : 4; }
+
+    std::vector<int64_t> execution_topology() const {
+        TORCH_CHECK(num_layers() > 0 && !layer_weights_.empty(),
+                    "AdaRMS topology requires installed model weights");
+        return {1, num_cores(), attn_tp(), mlp_tp(), condition_tp(), 8,
+                 logical_intermediate_size_, intermediate_size()};
+    }
+
+    std::vector<int64_t> core_profile_arguments() const {
+        auto args = execution_topology();
+        args.push_back(reduced_w8a16_ ? 1 : 0);
+        return args;
+    }
+
+    DecoderExecutionTopology resolve_model_execution_topology(
+            int64_t nq, int64_t nkv, int64_t hd, int64_t h,
+            int64_t intermediate) const override {
+        if (num_cores() == 8)
+            return FusedModelBase::resolve_model_execution_topology(
+                nq, nkv, hd, h, intermediate);
+        return resolve_pi05_reduced_physical_topology(
+            num_cores(), nq, nkv, hd, h, intermediate, true);
+    }
+
+    int64_t subclass_layout_hash() const override {
+        if (num_cores() == 8) return linear_acc32_ ? 32 : 0;
+        int64_t hash = 0;
+        for (const auto value : core_profile_arguments())
+            hash = detail::layout_mix(hash, value);
+        return linear_acc32_ ? detail::layout_mix(hash, 32) : hash;
+    }
+
+
+    std::vector<int64_t> resolve_action_stage_domain(
+        int64_t execution_len, int64_t logical_len, int64_t position,
+        int64_t kv_len, bool use_attention_mask, bool is_causal,
+        int64_t requested_chunk_size)
+    {
+        detail::validate_fmb_planning_shape(
+            execution_len, position, "AdaRMS action planner");
+        TORCH_CHECK(
+            logical_len > 0 && logical_len <= execution_len,
+            "RPU_PLANNER_REJECT:CAPABILITY: AdaRMS action logical length "
+            "must be in [1, execution_len]");
+        TORCH_CHECK(
+            kv_len >= position + execution_len,
+            "RPU_PLANNER_REJECT:CAPABILITY: AdaRMS action KV length does "
+            "not cover prefix plus execution rows");
+        std::optional<at::Tensor> mask_shape = std::nullopt;
+        if (use_attention_mask) {
+            mask_shape = at::empty(
+                {1, 1, execution_len, kv_len},
+                at::TensorOptions().dtype(at::kHalf).device(at::kCPU));
+        }
+        return encode_fmb_prefill_stage_domain(
+            resolve_prefill_stage_domain_for_shape(
+                execution_len, position, mask_shape, is_causal,
+                requested_chunk_size, logical_len));
+    }
 
     // ========================================================================
-    // set_weights (called by the Python converter)
+    // set_weights -- D-405 / D-407 (Python converter calls this)
     //
     // Layer-specific AdaRMS dense weights (attn & mlp) are per-layer.
     // cos/sin are globals computed on RPU device with kernel format [max_pos, head_dim/2].
@@ -181,7 +315,7 @@ public:
         at::TensorList q_w_scale_list, at::TensorList k_w_scale_list,
         at::TensorList v_w_scale_list, at::TensorList o_w_scale_list,
         at::TensorList gate_scale_list, at::TensorList up_scale_list,
-        at::TensorList down_scale_list)
+        at::TensorList down_scale_list, at::TensorList nvfp4_tensor_scales)
     {
         int64_t N = static_cast<int64_t>(q_w_list.size());
         TORCH_CHECK(N > 0, "adarms_set_weights: empty weight lists");
@@ -213,7 +347,9 @@ public:
             q_w_list, k_w_list, v_w_list, o_w_list,
             gate_list, up_list, down_list,
             q_w_scale_list, k_w_scale_list, v_w_scale_list, o_w_scale_list,
-            gate_scale_list, up_scale_list, down_scale_list);
+            gate_scale_list, up_scale_list, down_scale_list, !nvfp4_tensor_scales.empty());
+        Pi05Nvfp4Tables nvfp4_tables;
+        nvfp4_tables.install(nvfp4_tensor_scales, N, num_cores());
         const bool has_scale = !q_w_scale_list.empty();
 
         // Global tensor checks
@@ -251,8 +387,48 @@ public:
         check_all_defined_rank(mlp_dense_b_list,  "mlp_dense_b_list",  1);
 
         // Commit model params (pimpl: hidden/q/kv/head_dim/intermediate + attn_tp_)
+        int64_t physical_intermediate = intermediate_size;
+        if (num_cores() != 8) {
+            const auto dtype = q_w_list[0].scalar_type();
+            TORCH_CHECK(dtype == at::kHalf || dtype == at::kChar,
+                        "reduced Pi0.5 supports FP16 or W8A16 projections");
+            physical_intermediate = validate_pi05_reduced_geometry(
+                num_cores(), num_q_heads, num_kv_heads, head_dim,
+                hidden_size, intermediate_size, N, true,
+                dtype == at::kChar);
+            for (int64_t i = 0; i < N; ++i) {
+                std::array<std::array<int64_t, 2>, 7> shapes;
+                size_t j = 0;
+                for (const auto* tensor : {&q_w_list[i], &k_w_list[i],
+                        &v_w_list[i], &o_w_list[i], &gate_list[i],
+                        &up_list[i], &down_list[i]}) {
+                    TORCH_CHECK(tensor->scalar_type() == dtype && tensor->dim() == 2,
+                                "Pi0.5 reduced projection precision/rank mismatch");
+                    shapes[j++] = {tensor->size(0), tensor->size(1)};
+                }
+                validate_pi05_reduced_projection_shapes(
+                    shapes, hidden_size, physical_intermediate);
+                // Baseline orchestration keeps modulation FP16. The fused
+                // denoise owner independently accepts its cold W8 dense path.
+                for (const auto* tensor : {&attn_dense_w_list[i], &mlp_dense_w_list[i]})
+                    TORCH_CHECK(tensor->scalar_type() == at::kHalf &&
+                                    tensor->device().type() == at::kPrivateUse1 &&
+                                    tensor->is_contiguous() &&
+                                    tensor->size(0) == 3 * hidden_size &&
+                                    tensor->size(1) == hidden_size,
+                                "Pi0.5 AdaRMS modulation must be FP16 [3H,H]");
+                for (const auto* tensor : {&attn_dense_b_list[i], &mlp_dense_b_list[i]})
+                    TORCH_CHECK(tensor->scalar_type() == at::kHalf &&
+                                    tensor->device().type() == at::kPrivateUse1 &&
+                                    tensor->is_contiguous() &&
+                                    tensor->numel() == 3 * hidden_size,
+                                "Pi0.5 AdaRMS modulation bias must be FP16 [3H]");
+            }
+        }
+        logical_intermediate_size_ = intermediate_size;
+        reduced_w8a16_ = q_w_list[0].scalar_type() == at::kChar;
         set_model_params(num_q_heads, num_kv_heads, head_dim,
-                         hidden_size, intermediate_size);
+                         hidden_size, physical_intermediate);
         set_num_layers(N);
         eps_ = eps;
 
@@ -264,6 +440,7 @@ public:
         local_kv_dim_  = num_kv_heads * head_dim / attn_tp();
 
         // Copy weights into layer state
+        nvfp4_ = std::move(nvfp4_tables);
         layer_weights_.clear();
         layer_weights_.reserve(N);
         for (int64_t i = 0; i < N; i++) {
@@ -284,7 +461,15 @@ public:
         cos_ = cos;
         sin_ = sin;
 
-        invalidate_model_state();  // Must remain the last statement of set_weights.
+        invalidate_model_state();  // D-503: last non-empty statement of set_weights
+    }
+
+
+    std::vector<int64_t> planner_cache_identity() const {
+        auto identity = FusedModelBase::planner_cache_identity();
+        identity.push_back(rope_position_);
+        for (const auto& table : nvfp4_.values) append_kvinsert_cost_tensor_identity(identity, table);
+        return identity;
     }
 
     void set_rope_position(int64_t position) {
@@ -292,10 +477,10 @@ public:
     }
 
     // ========================================================================
-    // forward -- cond is an explicit per-call argument on the RPU device.
+    // forward -- D-405: cond is explicit per-call argument on RPU device
     //
     // Each forward = one Pi0.5 denoising step with a new cond.
-    // The cache key excludes cond values; the REPLAY cursor patches the
+    // Cache key (D-404) excludes cond values; REPLAY cursor-patches the
     // cond DDR pointer on each subsequent denoise step.
     // ========================================================================
     at::Tensor forward(
@@ -305,7 +490,8 @@ public:
         std::vector<at::Tensor>& v_caches,
         const std::optional<at::Tensor>& attention_mask,
         int64_t position,
-        bool is_causal)
+        bool is_causal,
+        at::IntArrayRef planned_stage_descriptor = {})
     {
         TORCH_CHECK(num_layers() > 0,
                     "AdaRMSModel::forward called before set_weights");
@@ -331,8 +517,10 @@ public:
                     "AdaRMSModel::forward: cond must be contiguous "
                     "(DMA source pointer assumes row-major layout)");
 
-        // AdaRMS always auto-computes chunk_size (not affected by global override)
-        set_chunk_size_override(0);
+        TORCH_CHECK(
+            !RpuKernelGraph::has_active() || !planned_stage_descriptor.empty(),
+            "AdaRMS production Graph forward requires one complete planner "
+            "stage descriptor");
 
         // Reset per-forward cond state: a new denoise step is a new cond.
         // cond DMA/GEMV will re-emit into the graph on the first chunk of layer 0.
@@ -347,24 +535,30 @@ public:
         // this live storage. Per-forward flush mirrors fused_model_base's
         // hidden_in_src_base_ pattern (caller may have CPU-dirty lines).
         cond_src_base_ = ::rhino_lkn::RpuGetDevAddr(cond.data_ptr());
-        // The SDK enqueue path flushes its own uncached
-        // descriptor buffers, while a caller tensor is a CACHED HostDDR_t that
-        // only an explicit RpuDdrFlush ever cleans (see the same analysis in
-        // graph_cpu_fallback_stub.cpp). `cond` is caller-supplied, exactly as
-        // the comment above says. Keep the explicit flush aligned with the
-        // equivalent per-forward conditioning paths.
+        // Conditioning is a per-forward caller-owned tensor, so the CPU may
+        // have written cached data since the last submission. SDK command
+        // publication does not publish those tensor writes. Flush the live
+        // input before the mutable DMA reads it, as in CPU fallback write-back.
+        //
+        //
+        //
+        //
+        //
         rpu_ddr_flush_force(cond.data_ptr<c10::Half>());
 
-        // Prepare the SDPA mask outside per-layer Phase 6. The mask is invariant
-        // across all expert layers within one forward, so each layer only needs
-        // the prepared DDR-to-SPM DMA. The single-chunk-per-forward
+        // PERF L1 (2026-05-07): hoist SDPA mask prepare out of the per-layer
+        // Phase 6. The mask is invariant across all expert layers within one
+        // forward; preparing once + DMA-only per layer drops constant_pad_nd
+        // calls 18× (Pi0.5 5-step e2e: 90 → 5). The single-chunk-per-forward
         // assumption (suffix_len <= chunk_size auto-pick) matches the existing
         // sdpa_prepare_mask shape contract: it asserts mask_2d.size(0)==seq_q,
         // which already requires seq_q == ctx().seq_len == chunk.len.
         //
-        // Cache the prepared mask across forwards when the caller passes the
-        // same attention_mask tensor, allowing a matching data_ptr to skip
-        // preparation.
+        // PERF L2 (2026-05-07): also cache the prepared mask across forwards
+        // when the caller passes the SAME attention_mask tensor. Pi0.5 denoise
+        // builds the mask once outside the 5-step loop (runtime.py L2 hoist),
+        // so steps 2-5 see the same data_ptr → cache hit → skip the prepare
+        // (saves 4 constant_pad_nd + 4 DDR copies per inference; 5 → 1).
         // We hold a strong ref to the input tensor so its storage cannot be
         // reallocated to a different tensor while the cache is valid.
         const int64_t prep_seq_q = hidden_states.size(1);
@@ -390,24 +584,31 @@ public:
         }
 
         return run_all_layers(hidden_states, k_caches, v_caches,
-                              attention_mask, position, is_causal);
+                              attention_mask, position, is_causal,
+                              /*planned_chunk_size=*/0,
+                              planned_stage_descriptor);
     }
 
 protected:
     // ========================================================================
     // static_config -- graph-naive flat-phase subclass; no legacy graph slot.
     //
-    // All four pointer-to-member
+    // AdaRMS is the "no D-501 callbacks" shape — all four pointer-to-member
     // slots (preload_fn / kv_first_fn / kv_first_chunk_plan_fn / post_fn)
     // stay nullptr by default. Flat-phase baseline; no persistent weights.
     // ========================================================================
     ModelStaticConfig static_config() override {
         ModelStaticConfig cfg;
         cfg.num_layers       = num_layers();
-        // Force single group — matches other fused-model paths.
-        // Every subclass pins a single group and ignores the global runtime knob.
+        // Force single group — matches Gemma/SigLIP/QwenPi05/Qwen3 discipline.
+        // Round-2 codex-review cleanup of the CR-merge twin: the previous
+        // get_cross_layer_batch_size() read + rt>0?rt:num_layers() was always
+        // overwritten by the next line with num_layers(), making the runtime
+        // knob read dead. See rpu_siglip_model.cpp:358 for the authoritative
+        // note on why every v3 subclass pins a single group and ignores the
+        // global runtime knob.
         cfg.cross_layer_batch_size = num_layers();
-        // Callbacks are all null for AdaRMS (no preload, KV_FIRST, or post step).
+        // D-501 callbacks: all nullptr for AdaRMS (no preload / no KV_FIRST / no post).
         return cfg;
     }
 
@@ -419,6 +620,155 @@ protected:
         cfg.chunk_mode     = ChunkMode::SEQUENTIAL;   // AdaRMS never uses KV_FIRST
         cfg.inter_layer_io = InterLayerIO::AUTO;
         return cfg;
+    }
+
+    bool subclass_chunk_size_valid(
+        int64_t chunk_size, int64_t seq_len,
+        int64_t /*position*/) const override {
+        // The action suffix attends bidirectionally whenever prefix history is
+        // present. Splitting it would hide later suffix rows from an earlier
+        // chunk, so the only valid domain is one physical chunk.
+        return chunk_size >= seq_len;
+    }
+
+    FmbPhysicalExecutionManifest physical_manifest_for_candidate(
+        const FmbThreeStageChunkPlan& plan,
+        const LayoutContext& /*layout*/,
+        int64_t physical_len, int64_t logical_len,
+        int64_t position) const override {
+        TORCH_CHECK(
+            plan.compute.chunks.size() == 1,
+            "AdaRMS COMPLETE descriptor requires one action suffix chunk");
+
+        FmbPhysicalExecutionManifest manifest;
+        manifest.state = FmbPhysicalManifestState::COMPLETE;
+        manifest.logical_length = logical_len;
+        manifest.physical_length = physical_len;
+        manifest.execution_padding_rows = physical_len - logical_len;
+        manifest.kv_logical_length = position + logical_len;
+        manifest.kv_insert_physical_rows = physical_len;
+        manifest.graph_lifecycle = FmbGraphLifecycle::COMPOSITE_CHILD;
+        manifest.linear_accumulation = linear_acc32_ ? FmbLinearAccumulationPolicy::ACC32
+                                                   : FmbLinearAccumulationPolicy::ACC16;
+
+        auto append = [&](FmbRouteFamily family, int64_t site_id,
+                          int64_t selector,
+                          std::vector<int64_t> arguments = {},
+                          int64_t invocation = 0) {
+            manifest.routes.push_back({
+                site_id, family, selector, /*flags=*/0,
+                std::move(arguments), invocation});
+        };
+        append(
+            FmbRouteFamily::MUTABLE_DMA, ADARMS_COND_DMA_SITE,
+            static_cast<int64_t>(
+                AdarmsMutableDmaRoute::DDR_SCATTER_TO_SPM));
+        append(
+            FmbRouteFamily::LINEAR, ADARMS_GEMV_LINEAR_SITE,
+            static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE));
+        append(
+            FmbRouteFamily::ALL_REDUCE, ADARMS_GEMV_ALL_REDUCE_SITE,
+            adarms_ring_route(/*rows=*/1, /*cols=*/3 * hidden_size(), num_cores()));
+
+        constexpr uint32_t kv_capabilities =
+            KV_INSERT_CAP_V2 | KV_INSERT_CAP_V16;
+        const int64_t rope_base = rope_position_ >= 0
+            ? rope_position_ : position;
+        for (const ChunkInfo& chunk : plan.compute.chunks) {
+            const int64_t invocation = chunk.idx;
+            for (const int64_t site_id : {
+                     ADARMS_Q_LINEAR_SITE,
+                     ADARMS_K_LINEAR_SITE,
+                     ADARMS_V_LINEAR_SITE}) {
+                append(
+                    FmbRouteFamily::LINEAR, site_id,
+                    static_cast<int64_t>(
+                        FmbLinearRouteSelector::AUTO_TILE),
+                    {}, invocation);
+            }
+            append(
+                FmbRouteFamily::ROPE, ADARMS_Q_ROPE_SITE,
+                static_cast<int64_t>(AdarmsRopeRoute::ROPE_1D),
+                {rope_base + chunk.offset}, invocation);
+            append(
+                FmbRouteFamily::ROPE, ADARMS_K_ROPE_SITE,
+                static_cast<int64_t>(AdarmsRopeRoute::ROPE_1D),
+                {rope_base + chunk.offset}, invocation);
+
+            const KvInsertSegmentPlan kv_plan =
+                resolve_kvinsert_plan_auto(
+                    ADARMS_KV_INSERT_SITE, manifest.graph_lifecycle,
+                    position + chunk.offset, chunk.len, chunk.len,
+                    attn_tp(), num_kv_heads(), head_dim(), kv_capabilities);
+            const KvInsertRouteArguments kv_arguments =
+                rpu_kvinsert_route_arguments(
+                    kv_plan, attn_tp(), num_kv_heads(), head_dim());
+            append(
+                FmbRouteFamily::KV_INSERT, ADARMS_KV_INSERT_SITE,
+                static_cast<int64_t>(kv_plan.route()),
+                {kv_arguments.begin(), kv_arguments.end()}, invocation);
+            append(
+                FmbRouteFamily::ATTENTION, ADARMS_ATTENTION_SITE,
+                static_cast<int64_t>(AttentionExecutionPolicy::DDR_KV),
+                {}, invocation);
+            append(
+                FmbRouteFamily::ALL_REDUCE,
+                ADARMS_PREPARE_ALL_REDUCE_SITE,
+                static_cast<int64_t>(
+                    AdarmsAllReduceRoute::PREPARE_RING_INPUT),
+                {}, invocation);
+            append(
+                FmbRouteFamily::LINEAR, ADARMS_O_LINEAR_SITE,
+                static_cast<int64_t>(nvfp4_.enabled() ? (linear_acc32_ ? FmbLinearRouteSelector::PI05_NVFP4_V2_ACC32
+                                                   : FmbLinearRouteSelector::PI05_NVFP4_V2_ACC16) : FmbLinearRouteSelector::AUTO_TILE),
+                {}, invocation);
+            append(
+                FmbRouteFamily::ALL_REDUCE,
+                ADARMS_ATTENTION_ALL_REDUCE_SITE,
+                adarms_ring_route(chunk.len, hidden_size(), num_cores()),
+                {}, invocation);
+        }
+        if (num_cores() != 8) {
+            manifest.routes.push_back({ADARMS_CORE_PROFILE_SITE,
+                FmbRouteFamily::GRAPH_SCHEDULE, 1, 0,
+                core_profile_arguments(), 0});
+        }
+        if (condition_tp() != num_cores()) {
+            manifest.routes.push_back({ADARMS_COND_PREPARE_SITE,
+                FmbRouteFamily::ALL_REDUCE, 3, 0,
+                {condition_tp(), num_cores(), 1}, 0});
+        }
+        append_fmb_shared_runtime_routes(
+            manifest, plan, hidden_size(),
+            FMB_SHARED_LAYER_INPUT_DMA |
+                FMB_SHARED_MLP_AUTO_TILE |
+                FMB_SHARED_MLP_RING_REDUCE, 1, num_cores(), mlp_tp());
+        std::sort(
+            manifest.routes.begin(), manifest.routes.end(),
+            [](const FmbRouteManifestEntry& lhs,
+               const FmbRouteManifestEntry& rhs) {
+                const auto lhs_family = static_cast<int64_t>(lhs.family);
+                const auto rhs_family = static_cast<int64_t>(rhs.family);
+                if (lhs_family != rhs_family) return lhs_family < rhs_family;
+                if (lhs.site_id != rhs.site_id) return lhs.site_id < rhs.site_id;
+                return lhs.invocation < rhs.invocation;
+            });
+    if (nvfp4_.enabled()) {
+        for (auto& route : manifest.routes) {
+            if (route.family == FmbRouteFamily::LINEAR &&
+                (route.site_id == ADARMS_Q_LINEAR_SITE || route.site_id == ADARMS_O_LINEAR_SITE ||
+                 route.site_id == FMB_SHARED_MLP_AUTO_TILE_SITE))
+                route.selector = static_cast<int64_t>((linear_acc32_ ? FmbLinearRouteSelector::PI05_NVFP4_V2_ACC32
+                                                   : FmbLinearRouteSelector::PI05_NVFP4_V2_ACC16));
+        }
+    }
+        return manifest;
+    }
+
+    FmbPhysicalManifestForwardCapability
+    physical_manifest_forward_capability(
+        const FmbPhysicalExecutionManifest& /*manifest*/) const override {
+        return {true, FmbGraphLifecycle::COMPOSITE_CHILD};
     }
 
     // ========================================================================
@@ -434,7 +784,7 @@ protected:
     // v3 framework handles lifecycle aliasing via phase ranges, but AdaRMS
     // uses 0,0 to match v2's forward parity).
     //
-    // No per-buffer preload hook is used; all buffers are StorageClass::Temp.
+    // No D-502 per-buffer preload hook on any decl — all buffers are StorageClass::Temp.
     // ========================================================================
     std::vector<BufferDecl> declare_buffers(const LayoutContext& ctx) override {
         int64_t cs = ctx.chunk_size;
@@ -453,7 +803,7 @@ protected:
         int64_t kv    = A(cs * local_kv * DWIDTH);
         int64_t out   = A(cs * local_q * hd * DWIDTH);
         int64_t oproj = A(cs * h * DWIDTH);
-        int64_t mlp   = A(cs * (is_ / NUM_CORES) * DWIDTH);
+        int64_t mlp   = A(cs * (is_ / mlp_tp()) * DWIDTH);
 
         // SDPA tmp and mask sizing
         SdpaConfig sdpa_cfg = make_sdpa_config(ctx.use_attn_mask ? 4 : 1);
@@ -468,7 +818,7 @@ protected:
 
         constexpr BufferScope ALL = BufferScope::LayerWide;
 
-        return {
+        std::vector<BufferDecl> decls{
             // Structural (mirrors Gemma, but flat phases 0,0)
             {"residual1",    res,     0, 0, StorageClass::Temp, 0, nullptr, ALL},
             {"input_norm",   res,     0, 0, StorageClass::Temp, 0, nullptr, ALL},
@@ -491,12 +841,14 @@ protected:
             {"bias_temp",    gemv_out_sz, 0, 0, StorageClass::Temp, 0, nullptr, ALL},
             {"gemv_partial", gemv_out_sz, 0, 0, StorageClass::Temp, 0, nullptr, ALL},
         };
+        nvfp4_.declare(decls, num_cores());
+        return decls;
     }
 
     // ========================================================================
-    // build_layer_subgraph (SEQUENTIAL)
+    // build_layer_subgraph (SEQUENTIAL) -- THE core of Phase 4
     //
-    // Execution flow per layer:
+    // Execution flow per layer (ported from v2 adarms_gemma_process_single_chunk):
     //
     //   Phase 0 (layer 0, chunk 0 ONLY): DMA cond DDR -> "cond" SPM (scatter)
     //   Phase A (every layer, chunk 0):  GEMV attn_dense_w * cond + attn_dense_b -> "attn_gemv"
@@ -524,6 +876,11 @@ protected:
     // (typed SpmOffset, compile-time distinct from absolute addr() uint32_t).
     // ========================================================================
     void build_layer_subgraph(int layer_idx, const ChunkInfo& chunk) override {
+        if (num_cores() != 8 && layer_idx == 0 && chunk.idx == 0 &&
+            ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(FmbRouteFamily::GRAPH_SCHEDULE,
+                ADARMS_CORE_PROFILE_SITE, 1, 0, core_profile_arguments());
+        }
         const auto& lw = layer_weights_[layer_idx];
         int64_t seq_len = chunk.len;
         int64_t cos_sin_start = ctx().position + chunk.offset;
@@ -548,7 +905,14 @@ protected:
         // On REPLAY the DDR pointer is cursor-patched to the new cond tensor.
         // --------------------------------------------------------------------
         if (is_first_layer_first_chunk) {
-            int64_t local_k           = h / NUM_CORES;
+            if (ctx().has_complete_physical_manifest()) {
+                ctx().consume_physical_route(
+                    FmbRouteFamily::MUTABLE_DMA, ADARMS_COND_DMA_SITE,
+                    static_cast<int64_t>(
+                        AdarmsMutableDmaRoute::DDR_SCATTER_TO_SPM),
+                    /*resolved_flags=*/0);
+            }
+            int64_t local_k           = h / condition_tp();
             int64_t core_stride_bytes = local_k * DWIDTH;
             rpu_launch_ddr_scatter_spm_dma_mutable(
                 &cond_src_base_,
@@ -556,7 +920,7 @@ protected:
                 /*elements_per_core=*/local_k,
                 /*core_stride_bytes=*/core_stride_bytes,
                 addr(0, "cond"),
-                /*num_cores=*/NUM_CORES);
+                /*num_cores=*/condition_tp());
             cond_loaded_this_forward_ = true;
         }
 
@@ -604,27 +968,55 @@ protected:
         rpu_launch_rmsnorm_spm_kernel(
             addr(0, "residual1"), addr(0, "input_norm"),
             attn_scale,
-            seq_len, h, eps_);
+            seq_len, h, eps_, RpuRmsNormSpmRoute::BASE, num_cores());
         rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
             attn_shift, addr(0, "input_norm"), addr(0, "input_norm"),
             seq_len, h,
-            c10::Half(1.0), ValuOpType::ADD, /*is_bopa=*/false);
+            c10::Half(1.0), ValuOpType::ADD, /*is_bopa=*/false, num_cores());
 
         // --------------------------------------------------------------------
         // Phase 3: QKV Linear (attn_tp cores, col partition)
         // --------------------------------------------------------------------
-        rpu_launch_linear_spm_to_spm_acc16_kernel(
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::LINEAR, ADARMS_Q_LINEAR_SITE,
+                static_cast<int64_t>(nvfp4_.enabled() ? (linear_acc32_ ? FmbLinearRouteSelector::PI05_NVFP4_V2_ACC32
+                                                   : FmbLinearRouteSelector::PI05_NVFP4_V2_ACC16) : FmbLinearRouteSelector::AUTO_TILE),
+                /*resolved_flags=*/0, {}, chunk.idx);
+        }
+        if (nvfp4_.enabled()) {
+            rpu_launch_pi05_nvfp4_v2_kernel(addr(0, "input_norm"), lw.q_w, addr(0, "q"),
+                seq_len, nq * hd, h, 1, tp, lw.q_ws,
+                addr(0, Pi05Nvfp4Tables::names[0]), layer_idx, linear_acc32_);
+        } else {
+            rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "input_norm"), lw.q_w, addr(0, "q"),
             seq_len, nq * hd, h,
-            /*partition=*/1, tp, /*bias_spm_addr=*/0, lw.q_ws);
+            /*partition=*/1, tp, /*bias_spm_addr=*/0, lw.q_ws, 0, 0,
+            /*force_acc32=*/linear_acc32_);
+        }
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::LINEAR, ADARMS_K_LINEAR_SITE,
+                static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+                /*resolved_flags=*/0, {}, chunk.idx);
+        }
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "input_norm"), lw.k_w, addr(0, "k"),
             seq_len, nkv * hd, h,
-            /*partition=*/1, tp, /*bias_spm_addr=*/0, lw.k_ws);
+            /*partition=*/1, tp, /*bias_spm_addr=*/0, lw.k_ws, 0, 0,
+            /*force_acc32=*/linear_acc32_);
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::LINEAR, ADARMS_V_LINEAR_SITE,
+                static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+                /*resolved_flags=*/0, {}, chunk.idx);
+        }
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "input_norm"), lw.v_w, addr(0, "v"),
             seq_len, nkv * hd, h,
-            /*partition=*/1, tp, /*bias_spm_addr=*/0, lw.v_ws);
+            /*partition=*/1, tp, /*bias_spm_addr=*/0, lw.v_ws, 0, 0,
+            /*force_acc32=*/linear_acc32_);
 
         // --------------------------------------------------------------------
         // Phase 4: RoPE (in-place, no QK RMSNorm for AdaRMS Gemma)
@@ -636,10 +1028,22 @@ protected:
         // (see rope_position_). Equal only when the prefix has no pad rows.
         const int64_t rope_start = (rope_position_ >= 0)
             ? rope_position_ + chunk.offset : cos_sin_start;
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::ROPE, ADARMS_Q_ROPE_SITE,
+                static_cast<int64_t>(AdarmsRopeRoute::ROPE_1D),
+                /*resolved_flags=*/0, {rope_start}, chunk.idx);
+        }
         rpu_launch_rope_spm_kernel(
             addr(0, "q"), addr(0, "q"),
             cos_ptr, sin_ptr,
             seq_len, local_q_heads_, hd, rope_start, tp);
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::ROPE, ADARMS_K_ROPE_SITE,
+                static_cast<int64_t>(AdarmsRopeRoute::ROPE_1D),
+                /*resolved_flags=*/0, {rope_start}, chunk.idx);
+        }
         rpu_launch_rope_spm_kernel(
             addr(0, "k"), addr(0, "k"),
             cos_ptr, sin_ptr,
@@ -654,12 +1058,36 @@ protected:
         // --------------------------------------------------------------------
         auto& k_cache = (*ctx().k_caches)[layer_idx];
         auto& v_cache = (*ctx().v_caches)[layer_idx];
-        rpu_launch_insert_kcache_spm_unified(
-            k_cache, cos_sin_start, addr_offset("k").value,
-            seq_len, nkv, hd, tp);
-        rpu_launch_insert_vcache_spm_unified(
-            v_cache, cos_sin_start, addr_offset("v").value,
-            seq_len, nkv, hd, tp);
+        KvInsertSegmentPlan kv_plan = [&] {
+            if (!ctx().has_complete_physical_manifest()) {
+                return rpu_resolve_kvinsert_segment_plan_auto(
+                    cos_sin_start, seq_len, seq_len, tp, nkv, hd,
+                    KV_INSERT_CAP_V2 | KV_INSERT_CAP_V16);
+            }
+            const auto& route = ctx().find_physical_route(
+                FmbRouteFamily::KV_INSERT, ADARMS_KV_INSERT_SITE,
+                chunk.idx);
+            KvInsertSegmentPlan frozen =
+                restore_kvinsert_plan(
+                    ADARMS_KV_INSERT_SITE, route.arguments, tp, nkv, hd);
+            TORCH_CHECK(
+                frozen.logical_rows() == seq_len &&
+                    frozen.physical_rows() == seq_len &&
+                    frozen.segment(0).position == cos_sin_start,
+                "AdaRMS KV descriptor geometry drift");
+            ctx().consume_physical_route(
+                FmbRouteFamily::KV_INSERT, ADARMS_KV_INSERT_SITE,
+                static_cast<int64_t>(frozen.route()),
+                /*resolved_flags=*/0, route.arguments, chunk.idx);
+            return frozen;
+        }();
+        rpu_launch_insert_kvcache_spm_unified_with_plan(
+            k_cache, v_cache,
+            addr_offset("k").value, addr_offset("v").value,
+            nkv, hd, tp,
+            /*k_cache_batch_offset_elems=*/0,
+            /*v_cache_batch_offset_elems=*/0,
+            /*spm_rows=*/0, kv_plan);
 
         // --------------------------------------------------------------------
         // Phase 6: SDPA (causal or 2D mask).
@@ -668,13 +1096,18 @@ protected:
         // sdpa_mask) take SPM offsets via addr_offset(...).value.
         // --------------------------------------------------------------------
         int64_t kv_seq_len = ctx().position + ctx().seq_len;
-        // The mask is prepared once at forward() entry.
+        // PERF L1 (2026-05-07): mask was prepare()'d once at forward() entry.
         // Per-layer Phase 6 only DMAs the prepared DDR tensor → SPM.
         // mask_type was determined at prepare time (MASK_NONE/MASK_LTM/MASK_2D).
         sdpa_dma_mask_to_spm(prepared_mask_,
                              addr_offset("sdpa_mask").value,
                              seq_len, kv_seq_len, tp);
         int mask_type = prepared_mask_.mask_type;
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_attention_route(
+                ADARMS_ATTENTION_SITE,
+                AttentionExecutionPolicy::DDR_KV, chunk.idx);
+        }
         rpu_launch_sdpa_spm_unified_kernel_v2(
             k_cache, v_cache, mask_type, c10::nullopt,
             addr_offset("q").value,
@@ -682,25 +1115,54 @@ protected:
             addr_offset("sdpa_tmp").value,
             addr_offset("sdpa_mask").value,
             seq_len, nq, nkv, hd,
-            kv_seq_len, tp, NUM_CORES);
+            kv_seq_len, tp, /*physical_kv_cores=*/8);
 
         // --------------------------------------------------------------------
         // Phase 7: O_proj (row partition, attn_tp cores)
         // --------------------------------------------------------------------
-        rpu_prepare_ring_all_reduce_input(addr(0, "oproj"), seq_len, h, tp);
-        rpu_launch_linear_spm_to_spm_acc16_kernel(
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::ALL_REDUCE,
+                ADARMS_PREPARE_ALL_REDUCE_SITE,
+                static_cast<int64_t>(
+                    AdarmsAllReduceRoute::PREPARE_RING_INPUT),
+                /*resolved_flags=*/0, {}, chunk.idx);
+        }
+        rpu_prepare_ring_all_reduce_input(addr(0, "oproj"), seq_len, h, tp, num_cores());
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::LINEAR, ADARMS_O_LINEAR_SITE,
+                static_cast<int64_t>(nvfp4_.enabled() ? (linear_acc32_ ? FmbLinearRouteSelector::PI05_NVFP4_V2_ACC32
+                                                   : FmbLinearRouteSelector::PI05_NVFP4_V2_ACC16) : FmbLinearRouteSelector::AUTO_TILE),
+                /*resolved_flags=*/0, {}, chunk.idx);
+        }
+        if (nvfp4_.enabled()) {
+            rpu_launch_pi05_nvfp4_v2_kernel(addr(0, "output"), lw.o_w, addr(0, "oproj"),
+                seq_len, h, nq * hd, 0, tp, lw.o_ws,
+                addr(0, Pi05Nvfp4Tables::names[1]), layer_idx, linear_acc32_);
+        } else {
+            rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "output"), lw.o_w, addr(0, "oproj"),
             seq_len, h, nq * hd,
-            /*partition=*/0, tp, /*bias_spm_addr=*/0, lw.o_ws);
+            /*partition=*/0, tp, /*bias_spm_addr=*/0, lw.o_ws, 0, 0,
+            /*force_acc32=*/linear_acc32_);
+        }
 
         // --------------------------------------------------------------------
         // Phase 8: all_reduce_sum_residual (attn)
         // residual2 = reduce_sum(oproj, attn_tp cores) + residual1
         // Output goes to all NUM_CORES.
         // --------------------------------------------------------------------
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::ALL_REDUCE,
+                ADARMS_ATTENTION_ALL_REDUCE_SITE,
+                adarms_ring_route(seq_len, h, num_cores()),
+                /*resolved_flags=*/0, {}, chunk.idx);
+        }
         rpu_launch_all_reduce_sum_residual_kernel(
             addr(0, "oproj"), addr(0, "residual1"), addr(0, "residual2"),
-            seq_len, h, tp, NUM_CORES);
+            seq_len, h, tp, num_cores());
 
         // --------------------------------------------------------------------
         // Phase 9: GATED attn residual
@@ -709,14 +1171,14 @@ protected:
         // --------------------------------------------------------------------
         rpu_launch_eltwise_binary_spm_kernel(          // residual2 -= residual1
             addr(0, "residual2"), addr(0, "residual1"), addr(0, "residual2"),
-            num_elems_full, ValuOpType::SUB, c10::Half(1.0), NUM_CORES);
+            num_elems_full, ValuOpType::SUB, c10::Half(1.0), num_cores());
         rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(  // residual2 *= attn_gate (1xC broadcast)
             attn_gate, addr(0, "residual2"), addr(0, "residual2"),
             seq_len, h,
-            c10::Half(1.0), ValuOpType::MUL, /*is_bopa=*/false);
+            c10::Half(1.0), ValuOpType::MUL, /*is_bopa=*/false, num_cores());
         rpu_launch_eltwise_binary_spm_kernel(          // residual2 += residual1
             addr(0, "residual2"), addr(0, "residual1"), addr(0, "residual2"),
-            num_elems_full, ValuOpType::ADD, c10::Half(1.0), NUM_CORES);
+            num_elems_full, ValuOpType::ADD, c10::Half(1.0), num_cores());
 
         // --------------------------------------------------------------------
         // Phase 10: Post-attention AdaRMSNorm (MLP side): residual2 -> residual1
@@ -725,18 +1187,24 @@ protected:
         rpu_launch_rmsnorm_spm_kernel(
             addr(0, "residual2"), addr(0, "residual1"),
             mlp_scale,
-            seq_len, h, eps_);
+            seq_len, h, eps_, RpuRmsNormSpmRoute::BASE, num_cores());
         rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
             mlp_shift, addr(0, "residual1"), addr(0, "residual1"),
             seq_len, h,
-            c10::Half(1.0), ValuOpType::ADD, /*is_bopa=*/false);
+            c10::Half(1.0), ValuOpType::ADD, /*is_bopa=*/false, num_cores());
 
         // --------------------------------------------------------------------
         // Phase 11: MLP pipeline
         // --------------------------------------------------------------------
         emit_mlp_pipeline(lw.gate_proj_w, lw.up_proj_w, lw.down_proj_w,
                           seq_len, ActivationKind::GELU,
-                          lw.gate_ws, lw.up_ws, lw.down_ws);
+                          lw.gate_ws, lw.up_ws, lw.down_ws,
+                          nvfp4_.enabled() ? addr(0, "nvfp4_gate_ts") : 0,
+                          nvfp4_.enabled() ? addr(0, "nvfp4_up_ts") : 0,
+                          nvfp4_.enabled() ? addr(0, "nvfp4_down_ts") : 0, layer_idx,
+                          false, false, /*acc32=*/linear_acc32_, false, false,
+                          /*bind_silu_mul_route=*/false,
+                          /*residual_spm_addr=*/0, /*pi05_xor3=*/false, nvfp4_.enabled());
 
         // --------------------------------------------------------------------
         // Phase 13: GATED MLP residual
@@ -746,14 +1214,14 @@ protected:
         // --------------------------------------------------------------------
         rpu_launch_eltwise_binary_spm_kernel(          // residual1 -= residual2
             addr(0, "residual1"), addr(0, "residual2"), addr(0, "residual1"),
-            num_elems_full, ValuOpType::SUB, c10::Half(1.0), NUM_CORES);
+            num_elems_full, ValuOpType::SUB, c10::Half(1.0), num_cores());
         rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(  // residual1 *= mlp_gate (1xC broadcast)
             mlp_gate, addr(0, "residual1"), addr(0, "residual1"),
             seq_len, h,
-            c10::Half(1.0), ValuOpType::MUL, /*is_bopa=*/false);
+            c10::Half(1.0), ValuOpType::MUL, /*is_bopa=*/false, num_cores());
         rpu_launch_eltwise_binary_spm_kernel(          // residual1 += residual2
             addr(0, "residual1"), addr(0, "residual2"), addr(0, "residual1"),
-            num_elems_full, ValuOpType::ADD, c10::Half(1.0), NUM_CORES);
+            num_elems_full, ValuOpType::ADD, c10::Half(1.0), num_cores());
 
         // --------------------------------------------------------------------
         // Phase 14: Output DMA (unless output stays in SPM for next layer)
@@ -771,6 +1239,7 @@ private:
 
     // ========================================================================
     // GEMV helper: row-partition 8-core + fused all_reduce+bias.
+    // Synced from QwenPI05Model after the row-partition rework on 2026-04-15.
     //
     // Weight is the natural [3H, H] tensor row-partition swizzled so each core
     // holds K/NUM_CORES=H/NUM_CORES columns of all 3H output rows. Layout of
@@ -798,28 +1267,74 @@ private:
         // Step 1: DMA bias -> bias_temp (replicated across all 8 cores, acts
         // as the residual input to the fused all_reduce+bias kernel).
         rpu_launch_ddr_broadcast_spm_dma(
-            dense_b.data_ptr<c10::Half>(), out_features, bias_temp_spm_addr);
+            dense_b.data_ptr<c10::Half>(), out_features, bias_temp_spm_addr, num_cores());
+        if (condition_tp() != num_cores()) {
+            if (ctx().has_complete_physical_manifest()) {
+                ctx().consume_physical_route(FmbRouteFamily::ALL_REDUCE,
+                    ADARMS_COND_PREPARE_SITE, 3, 0,
+                    {condition_tp(), num_cores(), 1});
+            }
+            rpu_prepare_ring_all_reduce_input(partial_spm_addr, 1,
+                out_features, condition_tp(), num_cores());
+        }
         // Step 2: Row-partition GEMV. partial_spm_addr holds the per-core
         // partial [3H] along the local_k = H/NUM_CORES split.
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::LINEAR, ADARMS_GEMV_LINEAR_SITE,
+                static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+                /*resolved_flags=*/0);
+        }
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             cond_spm_addr, dense_w, partial_spm_addr,
             /*M=*/1, /*N=*/out_features, /*K=*/h,
-            /*partition=*/0, /*num_cores=*/NUM_CORES,
-            /*bias_spm_addr=*/0);
+            /*partition=*/0, /*num_cores=*/condition_tp(),
+            /*bias_spm_addr=*/0, /*scale=*/at::Tensor(), 0, 0,
+            /*force_acc32=*/linear_acc32_);
         // Step 3: Fused all_reduce + bias. reduce(partial) + bias -> gemv_out
         // broadcast to all output cores. Input and output MUST be distinct
         // SPM regions.
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::ALL_REDUCE,
+                ADARMS_GEMV_ALL_REDUCE_SITE,
+                adarms_ring_route(/*rows=*/1, out_features, num_cores()),
+                /*resolved_flags=*/0);
+        }
         rpu_launch_all_reduce_sum_residual_kernel(
             partial_spm_addr, bias_temp_spm_addr, gemv_out_spm_addr,
             /*M=*/1, /*N=*/out_features,
-            /*input_num_cores=*/NUM_CORES, /*output_num_cores=*/NUM_CORES);
+            /*input_num_cores=*/condition_tp(), /*output_num_cores=*/num_cores());
         // Step 4: (1+scale) -- add +1.0 only to the first hidden_size elements
         rpu_launch_eltwise_binary_scalar_spm_kernel(
             gemv_out_spm_addr, c10::Half(1.0),
-            gemv_out_spm_addr, h, ValuOpType::ADD);
+            gemv_out_spm_addr, h, ValuOpType::ADD, num_cores());
     }
 
+    int64_t logical_intermediate_size_ = 0;
+    bool reduced_w8a16_ = false;
+
     // ----- Model state -----
+    std::vector<int64_t> kvinsert_cost_weight_identity() const override {
+        if (layer_weights_.empty()) return {};
+        std::vector<int64_t> identity{1};
+        append_kvinsert_cost_scalar_identity(identity, eps_);
+        identity.push_back(static_cast<int64_t>(layer_weights_.size()));
+        for (const auto& weights : layer_weights_) {
+            for (const auto* tensor : {
+                    &weights.q_w, &weights.k_w, &weights.v_w, &weights.o_w,
+                    &weights.gate_proj_w, &weights.up_proj_w, &weights.down_proj_w, &weights.q_ws,
+                    &weights.k_ws, &weights.v_ws, &weights.o_ws, &weights.gate_ws,
+                    &weights.up_ws, &weights.down_ws, &weights.attn_dense_w, &weights.attn_dense_b,
+                    &weights.mlp_dense_w, &weights.mlp_dense_b}) {
+                append_kvinsert_cost_tensor_identity(identity, *tensor);
+            }
+        }
+        if (linear_acc32_) identity.insert(identity.end(), {0x4143433332LL, 1});
+        return identity;
+    }
+
+    Pi05Nvfp4Tables nvfp4_;
     std::vector<LayerWeights> layer_weights_;
     at::Tensor cos_, sin_;
     // Logical RoPE start for the action suffix, or -1 to use the physical row.
@@ -849,15 +1364,18 @@ private:
     uint64_t   cond_src_base_ = 0;
     bool cond_loaded_this_forward_ = false;
 
-    // Per-forward prepared SDPA mask shared across layers.
+    // Per-forward prepared SDPA mask (PERF L1: cross-layer hoist, 2026-05-07).
     // sdpa_prepare_mask() does dim-reduce + fp16-cast + constant_pad_nd +
     // DDR copy; results invariant across all 18 expert layers within one
-    // forward().
+    // forward(). Hoisting drops 18 redundant constant_pad_nd + DDR-copy calls
+    // per denoise step (90 → 5 across a 5-step Pi0.5 inference).
     // sdpa_dma_mask_to_spm() in the per-layer Phase 6 reads from this member;
     // member assignment also keeps DDR alive across the synchronous forward().
     PreparedMask prepared_mask_;
 
-    // Cross-forward cache key for prepared_mask_.
+    // PERF L2 (2026-05-07): cross-forward cache key for prepared_mask_.
+    // Pi0.5 denoise hoists mask construction outside the 5-step loop
+    // (runtime.py), so steps 2-5 pass the SAME at::Tensor (same data_ptr).
     // forward() compares (input_data_ptr, seq_q, seq_k, is_causal) against
     // this cache; on hit, skips sdpa_prepare_mask entirely (5 → 1 per
     // inference). prepared_mask_input_ref_ is a strong ref to the caller's
@@ -881,16 +1399,63 @@ private:
 
 using AdaRMSRegistry = ModelHandleRegistry<v3::AdaRMSModel>;
 
+std::vector<int64_t> rpu_adarms_planner_cache_identity(int64_t handle) {
+    return AdaRMSRegistry::get(handle, "rpu_adarms_planner_cache_identity")
+        ->planner_cache_identity();
+}
+
+void rpu_adarms_bind_kvinsert_costs(
+        int64_t handle, at::IntArrayRef identity,
+        const std::string& catalog_sha256, at::IntArrayRef certificate_rows) {
+    AdaRMSRegistry::get(handle, "rpu_adarms_bind_kvinsert_costs")
+        ->bind_kvinsert_costs(identity, catalog_sha256, certificate_rows);
+}
+
+std::tuple<std::vector<int64_t>, int64_t, int64_t>
+rpu_adarms_kvinsert_exact_candidate(
+    int64_t handle, at::IntArrayRef descriptor, int64_t site_id,
+    int64_t invocation, int64_t route) {
+    return AdaRMSRegistry::get(handle, "rpu_adarms_kvinsert_exact_candidate")
+        ->mint_kvinsert_exact_candidate(descriptor, site_id, invocation, route);
+}
+
+KvInsertCostDomainQuery rpu_adarms_kvinsert_cost_domain(
+        int64_t handle, at::IntArrayRef descriptor) {
+    return AdaRMSRegistry::get(handle, "rpu_adarms_kvinsert_cost_domain")
+        ->kvinsert_cost_domain("adarms", descriptor);
+}
+
+std::string rpu_adarms_kvinsert_cost_catalog_sha256(int64_t handle) {
+    return AdaRMSRegistry::get(
+        handle, "rpu_adarms_kvinsert_cost_catalog_sha256")
+        ->kvinsert_cost_catalog_sha256();
+}
+
 // =============================================================================
 // Public C API for TORCH_LIBRARY_IMPL wrappers (file-scope, not namespaced)
 // =============================================================================
 
-int64_t rpu_adarms_create() {
-    return AdaRMSRegistry::create();
+void rpu_adarms_set_execution_core_count(int64_t handle, int64_t cores) {
+    AdaRMSRegistry::get(handle, "rpu_adarms_set_execution_core_count")
+        ->set_execution_cores(cores);
+}
+
+std::vector<int64_t> rpu_adarms_get_execution_topology(int64_t handle) {
+    return AdaRMSRegistry::get(handle, "rpu_adarms_get_execution_topology")
+        ->execution_topology();
+}
+
+int64_t rpu_adarms_create(bool linear_acc32) {
+    return AdaRMSRegistry::create(linear_acc32);
 }
 
 void rpu_adarms_destroy(int64_t handle) {
     AdaRMSRegistry::destroy(handle, "rpu_adarms_destroy");
+}
+
+void rpu_adarms_set_chunk_envelope(int64_t handle, int64_t max_kv_len, int64_t chunk) {
+    AdaRMSRegistry::get(handle, "rpu_adarms_set_chunk_envelope")
+        ->set_chunk_envelope(max_kv_len, chunk);
 }
 
 void rpu_adarms_set_weights(
@@ -907,7 +1472,7 @@ void rpu_adarms_set_weights(
     at::TensorList q_w_scale_list, at::TensorList k_w_scale_list,
     at::TensorList v_w_scale_list, at::TensorList o_w_scale_list,
     at::TensorList gate_scale_list, at::TensorList up_scale_list,
-    at::TensorList down_scale_list)
+    at::TensorList down_scale_list, const std::optional<std::vector<at::Tensor>>& nvfp4_tensor_scales)
 {
     AdaRMSRegistry::get(handle, "rpu_adarms")->set_weights(
         q_w_list, k_w_list, v_w_list, o_w_list,
@@ -918,7 +1483,7 @@ void rpu_adarms_set_weights(
         num_q_heads, num_kv_heads, head_dim,
         hidden_size, intermediate_size, eps,
         q_w_scale_list, k_w_scale_list, v_w_scale_list, o_w_scale_list,
-        gate_scale_list, up_scale_list, down_scale_list);
+        gate_scale_list, up_scale_list, down_scale_list, nvfp4_tensor_scales.value_or(std::vector<at::Tensor>{}));
 }
 
 void rpu_adarms_set_rope_position(int64_t handle, int64_t position) {
@@ -934,7 +1499,8 @@ at::Tensor rpu_adarms_forward(
     at::TensorList v_caches_list,
     const std::optional<at::Tensor>& attention_mask,
     int64_t position,
-    bool is_causal)
+    bool is_causal,
+    at::IntArrayRef planned_stage_descriptor)
 {
     // TensorList -> std::vector<at::Tensor> (shallow copy; tensors are refcounted)
     std::vector<at::Tensor> k_caches(k_caches_list.begin(), k_caches_list.end());
@@ -942,5 +1508,23 @@ at::Tensor rpu_adarms_forward(
 
     return AdaRMSRegistry::get(handle, "rpu_adarms")->forward(
         hidden_states, cond, k_caches, v_caches,
-        attention_mask, position, is_causal);
+        attention_mask, position, is_causal,
+        planned_stage_descriptor);
+}
+
+std::vector<int64_t> rpu_adarms_resolve_action_stage_domain(
+    int64_t handle, int64_t execution_len, int64_t logical_len,
+    int64_t position, int64_t kv_len, bool use_attention_mask,
+    bool is_causal, int64_t requested_chunk_size) {
+    return AdaRMSRegistry::get(
+               handle, "rpu_adarms_resolve_action_stage_domain")
+        ->resolve_action_stage_domain(
+            execution_len, logical_len, position, kv_len,
+            use_attention_mask, is_causal, requested_chunk_size);
+}
+
+int64_t rpu_adarms_get_resolved_chunk_size(int64_t handle) {
+    return AdaRMSRegistry::get(
+               handle, "rpu_adarms_get_resolved_chunk_size")
+        ->get_last_resolved_chunk_size();
 }

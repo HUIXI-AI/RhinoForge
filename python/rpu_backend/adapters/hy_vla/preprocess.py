@@ -1,9 +1,16 @@
 """Hy-Embodied-0.5-VLA 的 host 预处理 —— 原始观测 → `HyVlaRunner.get_action` 的入参。
 
-本模块实现参考模型的图像、语言、状态、mask、position_ids 与张量整形约定；
-embedding 查表仍由 `HyVlaRunner.assemble_prefix` 完成。
+移植自 vendor `hy_vla/modeling_hy_vla.py` 的
+`prepare_images` / `prepare_language` / `prepare_state` / `make_att_2d_masks` /
+`embed_prefix` / `embed_suffix` / `_apply_visual_segment_mask` /
+`sample_actions` / `denoise_step`。
 
-⚠️ 下列常量来自受支持 checkpoint 的 `config.json`，必须保持一致：
+本模块只搬 **mask、position_ids 与张量整形**；embedding 查表仍由
+`HyVlaRunner.assemble_prefix` 做。vendor 的 `embed_prefix` 把"排 token 布局"和
+"查 embedding"写在同一个函数里，这里只要前者 —— 布局（谁在第几行、哪几行是
+vision）恰恰就是 mask 的定义域。
+
+⚠️ 常量全部来自交付 ckpt 的 `config.json`，**不要手改**：
 
     visual_segment_isolation = False    # patch-only 分支
     max_state_dim            = 32
@@ -33,13 +40,13 @@ CAMERA_ORDER = (
     "observation.images.hand_right",
 )
 
-# 模型 prefix 的固定前缀：<hy_begin_of_sentence><hy_User>
+# vendor `embed_prefix` 的固定前缀：<hy_begin_of_sentence><hy_User>
 _N_LEAD = 2
 
 
 def resize_with_pad(img: torch.Tensor, width: int, height: int,
                     pad_value: float = 0.0, mode: str = "bilinear") -> torch.Tensor:
-    """等比缩放到框内 + 居中补边，遵循模型预处理约定。
+    """等比缩放到框内 + 居中补边。逐字移植 vendor 的同名函数。
 
     ⚠️ `int()` 截断（不是 round）与"补在中心、余数补在下/右"这两点都照抄 ——
     480×640 → ratio=max(640/224,480/224)=2.857 ⇒ 168×224，上下各补 28 行。
@@ -65,11 +72,11 @@ def resize_with_pad(img: torch.Tensor, width: int, height: int,
 def _as_float01_nchw(frame, index: int) -> torch.Tensor:
     """一帧任意常见形态的相机图 → `[1,3,H,W]` fp32、像素在 **[0,1]**。
 
-    支持以下通用输入形态：
+    收下这些（都是真机客户端实际会送的形态）：
 
     | 入参 | 处理 |
     |---|---|
-    | `[1,3,H,W]` / `[3,H,W]` fp32 ∈ [0,1] | 原样（**逐位不变**）|
+    | `[1,3,H,W]` / `[3,H,W]` fp32 ∈ [0,1] | 原样（**逐位不变**，老路径就是它）|
     | `[H,W,3]` / `[1,H,W,3]` | `permute` 成 CHW |
     | `uint8` / 其他整型（0..255） | `/255` |
     | `numpy.ndarray` | `torch.from_numpy` |
@@ -79,13 +86,13 @@ def _as_float01_nchw(frame, index: int) -> torch.Tensor:
     ⚠️ 这层是**门禁不是转换器**：唯一会被"猜"的是 CHW/HWC 布局，其余都是无歧义的。
     浮点帧越界（例如 0..255 的 float）**不自动 /255** —— 分不清是"忘了归一"还是
     "已经是 [-1,1] 的模型输入"，猜错就是静默算错。整型的 0..255 才是无歧义的，
-    才自动除。这个门禁会防止 CHW uint8 以 `[-1.0, 503.2]` 的错误值域
-    进入模型。
+    才自动除。这条是本函数存在的理由：改之前 CHW uint8 会**一路算到底**，
+    产出值域 `[-1.0, 503.2]` 的"图"，不报错、只是全错。
 
     ⚠️ 布局二义只可能出现在 3×3 像素这种病态尺寸上，规则是 **CHW 优先**
     （`shape[1] == 3` 先判）。
     ⚠️ **通道序必须是 RGB**，这里不做任何色彩空间修正 —— 送 BGR 不报错、只是
-    静默算错；通道顺序由调用方保证。
+    静默算错（与 `serve.py` / lingbot2 的 numpy 输入约定一致，通道序归调用方）。
     """
     import numpy as np
 
@@ -132,11 +139,11 @@ def _as_float01_nchw(frame, index: int) -> torch.Tensor:
 def prepare_images(frames: Sequence, size: int = 224) -> list[torch.Tensor]:
     """每相机一帧 → `[1,3,224,224]` ∈ [-1,1]。入参形态见 :func:`_as_float01_nchw`。
 
-    处理顺序为 `resize_with_pad(..., pad_value=0)` 后执行 `img*2-1`
+    两步都照 vendor：`resize_with_pad(..., pad_value=0)` 然后 `img*2-1`
     （SigLIP 系的输入约定）。补边区因此落在 **-1**，不是 0。
 
-    ⚠️ `[1,3,H,W]` fp32 ∈ [0,1] 输入保持逐位不变：归一化门禁对它是恒等的
-    （`.float()` 对 fp32 是 no-op）。
+    对 `[1,3,H,W]`、范围为 [0,1] 的 fp32 输入，范围检查不改变数值，
+    `.float()` 也不进行 dtype 转换。
     """
     out = []
     for i, frame in enumerate(frames):
@@ -148,21 +155,12 @@ def prepare_images(frames: Sequence, size: int = 224) -> list[torch.Tensor]:
 
 def prepare_language(instruction: str, tokenizer, max_length: int = 64
                      ) -> tuple[torch.Tensor, torch.Tensor]:
-    """指令字符串 → (`lang_tokens [1,L]` int64, `lang_masks [1,L]` bool)。
+    """指令字符串 → lang_tokens [1,L] int64 与 lang_masks [1,L] bool。
 
-    清洗与分词参数遵循模型约定：先 `strip()`、把 `_` 和
-    换行都换成空格，再确保以 `<｜hy_Assistant｜>` 结尾，然后
-    `padding="max_length"` / `padding_side="right"` / `truncation=True` /
-    **`add_special_tokens=False`**（模型自己在 `embed_prefix` 里加 BOS，
-    tokenizer 再加一次就多一行、整个 mask 错位）。
-
-    ⚠️ **后缀先摘再清洗**。`<｜hy_Assistant｜>` 里有个
-    **ASCII 下划线**（`hy_Assistant`），
-    而清洗步骤会把 `_` 换成空格。若调用方传入**已经带后缀**的字符串，后缀会被
-    打碎成 4 个普通 token，再在末尾补一个真后缀，凭空多出 4 行、整个 prefix 布局
-    右移。这里先识别并摘掉后缀，只清洗指令本身，再统一补回；裸指令与已带后缀
-    的输入因此共享相同的 token 布局。
-    """
+    清洗指令中的下划线和换行，补齐 <｜hy_Assistant｜> 后缀，再按右侧
+    定长 padding 分词。add_special_tokens=False：prefix 会自行添加 BOS。
+    先移除已有后缀，再清洗指令本身，最后补回后缀；否则后缀中的 ASCII
+    下划线会被替换成空格，导致重复后缀和额外 token。"""
     tag = "<｜hy_Assistant｜>"
     task = instruction.strip()
     if task.endswith(tag):
@@ -183,10 +181,10 @@ def prepare_language(instruction: str, tokenizer, max_length: int = 64
 
 def prepare_state(state: torch.Tensor | Sequence[float] | None,
                   max_state_dim: int = 32) -> torch.Tensor:
-    """本体感受 → `[1, max_state_dim]` fp32，右侧补零。
+    """本体感受 → [1, max_state_dim] FP32，右侧补零。
 
-    `None` 生成全零状态；非零状态会经过完整的 `state_proj` 权重和 bias。
-    """
+    None 表示全零 state。全零输入经过 state_proj 后只保留 bias；
+    非零输入仍由完整权重矩阵参与投影。"""
     out = torch.zeros(1, max_state_dim, dtype=torch.float32)
     if state is None:
         return out
@@ -198,7 +196,7 @@ def prepare_state(state: torch.Tensor | Sequence[float] | None,
 
 
 def make_att_2d_masks(pad_masks: torch.Tensor, att_masks: torch.Tensor) -> torch.Tensor:
-    """用 `att_masks` 的 cumsum 定义分块因果关系。
+    """vendor 同名函数（源自 big_vision）：`att_masks` 的 cumsum 定义分块因果。
 
     `cumsum[j] <= cumsum[i]` ⇒ i 能看见 j。prefix 侧 `att_masks` 全 1 ⇒ 退化成
     纯因果；suffix 侧 `[1,1,0,…,0]` ⇒ 50 个 action token 同属一块、彼此全可见。
@@ -214,7 +212,7 @@ def make_att_2d_masks(pad_masks: torch.Tensor, att_masks: torch.Tensor) -> torch
 def prefix_masks(n_images: int, grid: int, lang_masks: torch.Tensor):
     """prefix 的三条 1-D mask + 图像 token 的行区间。
 
-    模型 prefix 布局：
+    布局（vendor `embed_prefix`）：
 
         <bos><hy_User>
         每图： <vision_start> + grid 行 ×(grid 个 patch + 1 个 split) + <vision_end>
@@ -242,7 +240,7 @@ def prefix_masks(n_images: int, grid: int, lang_masks: torch.Tensor):
         modality.append(False)
         pad_parts.append(torch.ones(1, 1, dtype=torch.bool))
 
-        start = len(att)               # 在 append(vision_start) 之后取起点
+        start = len(att)               # ⚠️ vendor 在 append(vision_start) **之后**取
         idx_ranges.extend((start + r * row_len, start + r * row_len + grid)
                           for r in range(grid))
         full_ranges.append((start, start + per_img))
@@ -270,20 +268,23 @@ def apply_visual_segment_mask(att_2d: torch.Tensor,
                               image_idx_ranges: Sequence[tuple[int, int]],
                               image_full_ranges: Sequence[tuple[int, int]],
                               isolation: bool = False) -> None:
-    """**原地**改写 2-D mask 的视觉段。
+    """**原地**改写 2-D mask 的视觉段（vendor `_apply_visual_segment_mask`）。
 
-    只实现受支持 checkpoint 使用的 `isolation=False`（patch-only）：
+    只实现 `isolation=False`（patch-only）—— 交付 ckpt 的
+    `config.json: visual_segment_isolation=False`。两步：
       ① 把**所有**图的 patch token 之间的可见性清零（连因果通路一起断）；
       ② 再把**同一张图内**的 patch token 之间打开成双向。
     ⇒ 跨图的 patch 互不可见，图内 patch 全可见；split / vision_start / vision_end
     仍走因果通路。
 
-    `isolation=True`（全段隔离）会改变数值，当前不受支持；遇到时显式报错。
+    `isolation=True`（RoboTwin post-train ckpt 用的全段隔离）**故意不实现**：
+    它会改变数值，而本仓没有对应的 golden 可验。遇到就显式报错，别静默算错。
     """
     if isolation:
         raise NotImplementedError(
-            "visual_segment_isolation=True（全段隔离）当前不受支持；"
-            "受支持的模型配置要求 visual_segment_isolation=False。")
+            "visual_segment_isolation=True（全段隔离）未移植：它与本交付 ckpt 的 "
+            "config.json(False) 不同，且本仓没有该模式的 golden。参见 vendor "
+            "modeling_hy_vla.py::_apply_visual_segment_mask 的 True 分支。")
 
     all_idx: list[int] = []
     for s, e in image_idx_ranges:
@@ -304,8 +305,8 @@ def suffix_masks(n_action: int = 50, n_state_tokens: int = 1):
     """suffix（1 个 state token + 50 个 action token）的三条 1-D mask。
 
     `att_masks = [1] + [0]*(T_state-1)` 再接 `[1] + [0]*(n_action-1)` ——
-    state 自成一块、action chunk 自成一块，块内双向、块间因果。
-    `modality_mask` 全 True：两段都走 `_v` 塔。
+    state 自成一块、action chunk 自成一块，块内双向、块间因果（vendor
+    `embed_suffix`）。`modality_mask` 全 True：两段都走 `_v` 塔。
     """
     total = n_state_tokens + n_action
     att = [1] + [0] * (n_state_tokens - 1) + [1] + [0] * (n_action - 1)
@@ -318,9 +319,9 @@ def sample_noise(n_action: int = 50, action_dim: int = 32,
                  seed: int | None = None) -> torch.Tensor:
     """flow-matching 的初始 `x_t`，`[1, n_action, action_dim]` fp32。
 
-    `seed=None` ⇒ 用全局 RNG；给 seed 则用独立
+    `seed=None` ⇒ 用全局 RNG（对齐 vendor 的 `torch.normal`）；给 seed 则用独立
     `Generator`，**不动全局 RNG 状态**，同 seed 逐位可复现。noise 是输入的一部分，
-    与参考输出比较时必须使用同源 noise。
+    对 golden 比精度时必须与参考实现同源。
     """
     shape = (1, n_action, action_dim)
     if seed is None:

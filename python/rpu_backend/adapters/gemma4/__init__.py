@@ -6,12 +6,11 @@ pure-Python ``.geometry`` helpers are import-safe; all heavy work
 (weight swizzle / cache / fused forward + ``graph_cache.capture``) is deferred
 into ``to_rpu`` and ``Gemma4ForRPU.forward`` (call-time imports).
 
-The adapter supports a mixed-geometry fused decoder, dual head_dim 256/512,
-KV sharing, 4-norm + QK/V-norm, dual RoPE, PLE side-input + layer_scalar,
-and tied lm_head + softcap=30. Full-model
-The sliding-window path for contexts longer than 512 tokens uses an offset KV
-read with a 2D mask; graph signatures bucket the total KV length by
-``ceil(total_kv/16)``.
+The fused decoder handles mixed geometry, dual head dimensions 256/512,
+KV sharing, four normalization stages, QK/V normalization, dual RoPE,
+PLE side inputs, layer scaling, a tied language head and softcap=30.
+Sliding-window attention uses an offset KV read, with graph signatures
+bucketed by ceil(total_kv/16) beyond the 512-token window.
 """
 from __future__ import annotations
 
@@ -60,9 +59,12 @@ _BUILD_LOCK = threading.Lock()
 _INSTALL_ATTRS = (
     "_rpu_gemma4_handle",
     "_rpu_gemma4_handle_finalizer",
+    "_rpu_gemma4_retirement_state",
     "_rpu_gemma4_geom",
     "_rpu_gemma4_graph_cache",
     "_rpu_gemma4_ready",
+    "_execution_session",
+    "_rpu_last_execution_plan",
 )
 
 
@@ -214,6 +216,11 @@ class Gemma4Adapter:
     def to_rpu(self):
         model = self.model
         if getattr(model, "_rpu_gemma4_ready", False):
+            resource = getattr(model, "_rpu_gemma4_retirement_state", None)
+            if (resource is None or resource.handle is None or resource.failed is not None
+                    or model._execution_session.stats()["state"] in {"CLOSED", "POISONED"}):
+                raise RPUBackendError("Gemma4Adapter.to_rpu(): native owner is retired or poisoned")
+            self._execution_session = model._execution_session
             return model
         if getattr(model, "_rpu_gemma4_install_poisoned", False):
             raise RPUBackendError(
@@ -252,9 +259,11 @@ class Gemma4Adapter:
                 )
             _claim_live_instance(model)
             claimed = True
-            return _build_rpu_model(
+            result = _build_rpu_model(
                 model, max_seq=max_seq, _install_state=install_state
             )
+            self._execution_session = model._execution_session
+            return result
         except BaseException:
             if claimed:
                 if install_state.get("cleanup_ok", False):
@@ -265,29 +274,74 @@ class Gemma4Adapter:
         finally:
             _BUILD_LOCK.release()
 
+    def reconfigure_rpu_execution(self, value):
+        if not getattr(self.model, "_rpu_gemma4_ready", False):
+            raise RuntimeError(
+                "Gemma4Adapter: call to_rpu() before reconfiguring execution"
+            )
+        return self.model._execution_session.reconfigure(value)
 
-def _destroy_gemma4_handle(handle):
-    """Release the C++ Gemma4Model handle. Called by weakref.finalize on GC.
 
-    Lazy ``import torch`` keeps this module import-safe at adapter discovery time
-    (module docstring); the finalizer only runs long after ``.to('rpu')``.
-    """
-    try:
-        import torch
-        torch.ops.rpu.gemma4_destroy(handle)
-        return True
-    except Exception:
-        return False
+def _execution_plan(model, handle, seq_len, position, horizon, graph_cache=None):
+    """Shared cold/forward planner for the actual installed Gemma4 owner."""
+    import torch
+    from rpu_backend.runtime.decoder import plan_bounded_prefill_execution
+
+    stage = getattr(model, "_rpu_execution", {}).get("prefill", {})
+    raw_chunk = stage.get("chunk_size", "auto")
+    exact_chunk = int(raw_chunk) if seq_len > 1 and raw_chunk != "auto" else None
+    if position < 0 or seq_len < 1 or position + seq_len > horizon:
+        raise ValueError("Gemma4 planner position+seq exceeds the RoPE/KV horizon")
+    canonical_position = 0 if seq_len == 1 else position
+    planning_limit = int(horizon) - int(position)
+    planning_max_kv = int(position + seq_len)
+    if seq_len == 1:
+        # Native decode feasibility depends only on the aligned sliding mask,
+        # not on its token position. Keep the real horizon check above; this
+        # matches the retained Graph's windowed/16-row bucket semantics.
+        text_config = getattr(model.config, "text_config", model.config)
+        sliding_window = int(getattr(text_config, "sliding_window", 512))
+        planning_limit = 1
+        planning_max_kv = (
+            min(((position + 1 + 15) // 16) * 16, int(horizon))
+            if sliding_window > 0 and position + 1 > sliding_window else 1
+        )
+    plan_box = {}
+    execution_len, _ = plan_bounded_prefill_execution(
+        int(seq_len), planning_limit, 0,
+        position=int(canonical_position), padding_rows=0,
+        exact_chunk_size=exact_chunk,
+        execution_owner=model,
+        execution_stage="prefill" if seq_len > 1 else "decode",
+        execution_native=("gemma4", int(handle)),
+        resolve_stage_domain=lambda length: torch.ops.rpu.gemma4_resolve_stage_domain(
+            handle, int(length), int(canonical_position),
+            int(planning_max_kv if seq_len == 1 else position + length),
+            0 if exact_chunk is None else int(exact_chunk)),
+        request_id="gemma4:text:prefill_decode",
+        graph_mode="RETAINED_CACHE", queue_owner_id=int(handle),
+        plan_result_sink=lambda result: plan_box.__setitem__("result", result),
+        physical_metadata=(("execution_generation", int(model._execution_session.generation)),),
+        plan_signature=(int(planning_max_kv),),
+        graph_cache=graph_cache,
+    )
+    if int(execution_len) != int(seq_len):
+        raise RuntimeError("Gemma4 planner introduced unsupported execution padding")
+    return plan_box["result"]
 
 
 def _build_rpu_model(model, *, max_seq=None, _install_state=None):
     """Swizzle the decoder onto the RPU + patch ``forward`` (call-time heavy imports)."""
     import types
-    import weakref
 
     import torch
     import rpu_backend
     from transformers.modeling_outputs import CausalLMOutputWithPast
+    from rpu_backend.api._execution import (
+        bind_execution_session,
+        execution_serialized,
+    )
+    from rpu_backend.runtime._native_retirement import _InstalledNativeResource
 
     from .cache import Gemma4KVCache
     from .weights import make_rope_tables, set_gemma4_weights
@@ -308,12 +362,6 @@ def _build_rpu_model(model, *, max_seq=None, _install_state=None):
         getattr(model, "_rpu_max_seq", DEFAULT_MAX_SEQ)
         if max_seq is None else max_seq,
         maximum=int(tc.max_position_embeddings),
-    )
-    requested_chunk = getattr(model, "_rpu_execution", {}).get(
-        "prefill", {}
-    ).get("chunk_size", "auto")
-    configured_prefill_chunk = (
-        0 if requested_chunk == "auto" else int(requested_chunk)
     )
     install_state = _install_state if _install_state is not None else {}
     install_state.update(native_created=False, cleanup_ok=True)
@@ -347,6 +395,7 @@ def _build_rpu_model(model, *, max_seq=None, _install_state=None):
             )
         return Gemma4KVCache(geom, max_seq_len=requested, device="rpu")
 
+    @execution_serialized
     def forward(self, input_ids=None, attention_mask=None, position_ids=None,
                 past_key_values=None, inputs_embeds=None, use_cache=None,
                 output_attentions=None, output_hidden_states=None,
@@ -450,7 +499,7 @@ def _build_rpu_model(model, *, max_seq=None, _install_state=None):
             model_projection_weight=plmp_w, projection_norm_weight=pln_w,
             num_layers=L, hidden_size=H, ple_dim=PD, eps=eps)
 
-        # When total context exceeds the sliding window, the fused decoder
+        # T4: when the total context exceeds the sliding window, the fused decoder
         # routes sliding(hd256) layers through a windowed MASK_2D over an offset KV
         # read. The KV-read offset + mask DMA size are constant per 16-token bucket
         # (C++ derives them from ceil(total_kv/16)), so bucket the graph signature to
@@ -459,15 +508,29 @@ def _build_rpu_model(model, *, max_seq=None, _install_state=None):
         total_kv = position + S
         windowed = 1 if total_kv > sliding_window else 0
         seq_k_bucket = (total_kv + 15) // 16 if windowed else 0
-        prefill_chunk = configured_prefill_chunk if S > 1 else 0
+        planned = _execution_plan(self, handle, S, position, horizon, graph_cache=gc)
+        selected = planned.selected
+        if selected is None or not selected.stage_tuple.physical_descriptor:
+            raise RuntimeError("Gemma4 planner returned no physical descriptor")
+        prefill_chunk = int(selected.stage_tuple.compute_chunk)
         sig = GraphSignature(op_id="gemma4_forward", shapes=[S, H],
                              dyn_dims=dyn + [windowed, seq_k_bucket,
-                                             prefill_chunk],
+                                             prefill_chunk,
+                                             *planned.graph_key_words()],
                              dtypes=[torch.float16])
         with gc.capture(sig):
             out = torch.ops.rpu.gemma4_forward(
                 handle, hidden, cache.k_caches, cache.v_caches,
-                None, position, True, prefill_chunk, side)
+                None, position, True, 0, side,
+                selected.stage_tuple.physical_descriptor)
+        receipt = planned.as_dict(include_candidates=False)
+        receipt.update({
+            "stage": "prefill" if S > 1 else "decode",
+            "component": getattr(
+                self, "_rpu_execution_component_id", "language_model"
+            ),
+        })
+        vars(self)["_rpu_last_execution_plan"] = receipt
         final_hidden = out.cpu().float().reshape(B, S, H)
         if logits_to_keep:
             final_hidden = final_hidden[:, -int(logits_to_keep):, :]
@@ -485,38 +548,57 @@ def _build_rpu_model(model, *, max_seq=None, _install_state=None):
         name: (name in model_vars, model_vars.get(name))
         for name in tracked_attrs
     }
-    handle = None
-    fin = None
+    # Register GC authority before native create: a registration failure has
+    # no native handle to leak. Keep tensors/GraphCache, never model/Session or
+    # owner-bound callables, alive through both rollback and final retirement.
+    resource = _InstalledNativeResource(
+        model, None, torch.ops.rpu.gemma4_destroy,
+        graphs=(gc,), keepalive=(lists, ple, rope_tables, final_norm_w,
+                                embed_w, eptl_w, plmp_w, pln_w),
+        label="Gemma4", handle_name="_rpu_gemma4_handle")
     try:
-        handle = int(torch.ops.rpu.gemma4_create())
+        resource.handle = handle = int(torch.ops.rpu.gemma4_create())
         install_state["native_created"] = True
-        fin = weakref.finalize(model, _destroy_gemma4_handle, handle)
         set_gemma4_weights(
             handle, geom, lists, rope_tables, final_norm_w,
             num_q_heads=NQ, num_kv_heads_max=max_num_kv_heads(geom),
             head_dim_max=max_head_dim(geom), hidden_size=H, intermediate_size=IS,
             eps=eps, qk_scale=1.0, ple=ple, ple_dim=PD,
             sliding_window=sliding_window)
+        torch.ops.rpu.gemma4_set_chunk_envelope(handle, max_seq, 0)
+
+        def invalidate_execution_graphs(_old, _new, _generation, *, force_rebuild=False):
+            # clear() deliberately preserves READY. Both apply and rollback
+            # retire the old layouts and permit an explicit new BUILD cycle.
+            gc.begin_warmup()
+            gc.clear()
+            vars(model).pop("_rpu_last_execution_plan", None)
+
+        session = bind_execution_session(
+            model,
+            getattr(model, "_rpu_execution", None),
+            entry_point="Gemma4Adapter",
+            supported={"prefill": ("chunk_size",)},
+            apply=invalidate_execution_graphs,
+            rollback=invalidate_execution_graphs,
+            graph_mode="RETAINED_CACHE",
+        )
 
         model._rpu_gemma4_handle = handle
-        model._rpu_gemma4_handle_finalizer = fin
+        model._rpu_gemma4_retirement_state = resource
+        model._rpu_gemma4_handle_finalizer = resource.finalizer
         model._rpu_gemma4_geom = geom
         model._rpu_gemma4_graph_cache = gc
+        model._execution_session = session
         model.build_rpu_cache = make_cache
         model.forward = types.MethodType(forward, model)
         model._rpu_gemma4_ready = True
         install_state["committed"] = True
         return model
-    except BaseException:
-        cleanup_ok = True
-        try:
-            gc.clear()
-        except Exception:
-            cleanup_ok = False
-        if fin is not None and fin.alive:
-            cleanup_ok = bool(fin()) and cleanup_ok
-        elif handle is not None:
-            cleanup_ok = _destroy_gemma4_handle(handle) and cleanup_ok
+    except BaseException as error:
+        cleanup_ok = resource.cleanup_failure(error, model, snapshot)
+        if resource.handle is None and resource.finalizer.alive:
+            resource.finalizer.detach()  # create failed before owning a handle
 
         # A publication hook may be the source of the failure and can keep
         # rejecting cleanup writes. Restore the exact instance dictionary

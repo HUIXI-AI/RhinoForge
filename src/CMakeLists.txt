@@ -17,6 +17,7 @@ set(RPU_CORE_SOURCES
 )
 
 set(RPU_FUSED_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_qwen3_5_moe_model.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_qwen3_model.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_qwen3_5_model.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_gemma_model.cpp"
@@ -32,12 +33,24 @@ set(RPU_FUSED_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_siglip_model.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_hyvit2_vision_model.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_qwen3vl_vision_model.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_qwen3vl_decode_replay.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_qwen3_5_vision_model.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_qwen25vl_vision_model.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_dinov3_vision_model.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_gr00t_dit_model.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_gr00t_vl_encoder_model.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_navdp_model.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_gemma2_model.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_gr00t_spm_z2.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_halo_action_expert_model.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_halo_image_flow_model.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_internvla_nextdit_model.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_lingbot_denoise_model.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_qwen3_5_spm_z2.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_qwen3vl_multiview_spm_z2.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_qwen3vl_pooler_spm_z1.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_qwenpi05_model.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_wall_oss_spm_z1.cpp"
 )
 
 set(RPU_GRAPH_SOURCES
@@ -47,6 +60,7 @@ set(RPU_GRAPH_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/graph/graph_runtime_capture.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/graph/graph_runtime_child.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/graph/graph_runtime_execute.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/graph/graph_runtime_dump.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/graph/graph_cpu_fallback_stub.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/graph/graph_pybind.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/graph/custom_cpu_fallback_dispatch.cpp"
@@ -54,6 +68,12 @@ set(RPU_GRAPH_SOURCES
 )
 
 set(RPU_OPS_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_gather.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_grouped_parallel_linear.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_moe_gather_mul.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_moe_index_shuffle.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_moe_topk_prob_norm.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_scatternd_add.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_argmax.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_bmm.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_cast.cpp"
@@ -81,6 +101,12 @@ set(RPU_OPS_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_gdn_recurrent.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_pad.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_reduce.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_pi05_down_pair.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_pi05_owner_norm.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_pi05_prefill_pair.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_pi05_producer_chain.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_pi05_q_rope.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_pi05_vision_fc.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_rmsnorm.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_rope.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_rope_2d.cpp"
@@ -91,6 +117,10 @@ set(RPU_OPS_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_sdpa_minibatch.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_softmax.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_transpose.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_fast_pos_embed.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_kvinsert_segment_plan.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_linear_gemv.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_qwen3_5_gdn_fused.cpp"
 )
 
 add_library(rpu_backend SHARED

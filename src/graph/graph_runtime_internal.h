@@ -7,6 +7,17 @@
 
 #include "graph/graph_runtime.h"
 
+inline void validate_graph_dma_channel(
+        int channel, size_t execution_core_count, const char* caller) {
+    TORCH_CHECK(execution_core_count >= 1 && execution_core_count <= 8,
+                caller, ": DMA execution core budget must be in [1, 8]");
+    TORCH_CHECK(channel >= 0 && channel < 8 &&
+                    static_cast<size_t>(channel) < execution_core_count,
+                caller, ": DMA channel ", channel,
+                " exceeds execution core budget ", execution_core_count,
+                "; the DMA engine must be inside the allocated core prefix");
+}
+
 inline void apply_register_patch_to_kernel(RpuKernelGraph& graph,
                                            const RegisterPatch& p,
                                            ::rhino_lkn::Kernel_t* k) {

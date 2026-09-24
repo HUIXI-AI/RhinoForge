@@ -1,4 +1,4 @@
-"""Gemma4 mixed-width KV cache.
+"""Gemma4 mixed-width KV cache (T1c).
 
 ``Gemma4KVCache`` subclasses ``RPUCache`` to inherit the HuggingFace ``Cache``
 interface (get_seq_length / update / reset / get_mask_sizes / position tracking)
@@ -33,7 +33,7 @@ from .geometry import layer_geometry, max_head_dim, max_num_kv_heads
 class Gemma4KVCache(RPUCache):
     """Per-layer mixed-width KV cache with a forced cross-layer source-map."""
 
-    # Sliding-window visibility is enforced in the fused C++ mask, not via
+    # Sliding-window visibility is enforced in the fused C++ mask (T4), not via
     # the HF cache type; keep False like RPUCache so HF masking stays bypassed.
     is_sliding_window = False
 
@@ -69,7 +69,7 @@ class Gemma4KVCache(RPUCache):
         self.num_kv_heads = max_num_kv_heads(geom)
 
         plan = cache_plan(geom, max_seq_len, attn_tp, batch_size, NUM_CORES)
-        # The mixed-width cache always carries an explicit source map.
+        # Forced source-map (T1c contract): always produced.
         self.kv_source_layer_for_layer: list[int] = plan["source_map"]
         self._owner_layers: list[int] = plan["owners"]
 

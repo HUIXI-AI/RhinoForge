@@ -1,12 +1,17 @@
 """Lazy-init guard — verify an RPU-patched module finished its install.
 
-Every `patch_*_for_rpu()` calls this guard on the ordinary eager path. It
-catches forward-time lazy initialization (`if not hasattr(self, "_rpu_xxx")`)
-at patch time instead of letting state appear later. Dynamo can bake that
-attribute test into a guard and repeatedly recompile, but the install contract
-applies with or without Dynamo: finish module initialization before returning.
+NOT a torch.compile / Dynamo component, despite the names this module
+shipped under until 2026-08-08 (`dynamo_freeze`, `freeze_for_dynamo`,
+`_rpu_dynamo_safe`). Every `patch_*_for_rpu()` calls it, on the ordinary
+eager path, and its job is to catch forward-time lazy init
+(`if not hasattr(self, "_rpu_xxx")`) at PATCH time instead of letting the
+attribute appear later. Dynamo is one victim of that hazard — it bakes
+`not hasattr == True` into a guard and never replays — but the rule
+("finish your install before you return") stands with or without it.
 
-Guard surface:
+Original P7.1h notes follow.
+
+L2 防线 (事前 hard raise):
 - `DynamoUnsafeLazyStateError` — adapter 漏 eager init 时的 sentinel exception
 - `_verify_lazy_init(model)` — preflight 实现,walk model.modules() 验所有
   `_rpu_lazy_init_checked=True` 子模块的 `_rpu_required_attrs` 全存在
@@ -14,7 +19,8 @@ Guard surface:
 - `_verify_lazy_init_best_effort(gm, example_inputs)` — RpuDynamoBackend 入口
   hook,扫 gm._modules best-effort
 
-上述列表定义了该 guard 的完整约束。
+详细机制见 `docs/graph_rules.md` 中的状态冻结规则。
+
 """
 from __future__ import annotations
 
@@ -33,10 +39,14 @@ class DynamoUnsafeLazyStateError(RuntimeError):
     """
 
 
-# Adapters stamp one of these marker attributes to opt into the preflight.
-# Both spellings are accepted for compatibility with out-of-tree adapters.
-# The compatibility name is also allowed by `INTERNAL_HW_ATTRS_TRANSITIONAL`
-# so the hardware-attribute validator permits adapters to set it.
+# The marker attribute an adapter stamps to opt into this preflight. Renamed
+# from `_rpu_dynamo_safe` on 2026-08-08; BOTH spellings are honoured because the
+# rename shipped without back-compat and its failure mode is silent — an
+# out-of-tree adapter still stamping the old name is simply skipped by the loop
+# below, so `_verify_lazy_init` returns CLEANLY and the lazy-init hazard the
+# marker exists to catch ships undetected. (The old name is also back in
+# `INTERNAL_HW_ATTRS_TRANSITIONAL`; without it the A9 validator rejects the
+# write outright with `RPUConfigError: Unknown hardware attribute`.)
 _LAZY_INIT_MARKERS = ("_rpu_lazy_init_checked", "_rpu_dynamo_safe")
 
 
@@ -83,7 +93,7 @@ def verify_lazy_init(model: nn.Module) -> None:
 
 # ── Backwards-compatible aliases ─────────────────────────────────────────────
 # `freeze_for_dynamo` and `DynamoUnsafeLazyStateError` are exported from the
-# packaged runtime, so the old spellings keep working. They are misnomers (this has
+# shipped wheel, so the old spellings keep working. They are misnomers (this has
 # never been Dynamo-specific); prefer the names above in new code.
 freeze_for_dynamo = verify_lazy_init
 UninitializedLazyStateError = DynamoUnsafeLazyStateError
@@ -100,9 +110,8 @@ def _verify_lazy_init_best_effort(gm, example_inputs) -> None:
 
     Args:
         gm: torch.fx.GraphModule (or anything with ._modules dict)
-        example_inputs: currently ignored because modules linked through tensor
-                        metadata are not cheaply reachable without private
-                        PyTorch introspection
+        example_inputs: ignored Phase 1 (modules linked via tensor metadata not
+                        cheaply reachable without PyTorch-internal introspection)
     """
     modules_dict = getattr(gm, '_modules', None)
     if not modules_dict:

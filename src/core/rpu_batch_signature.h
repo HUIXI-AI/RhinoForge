@@ -1,7 +1,7 @@
 // rpu_batch_signature.h — FNV-1a 64-bit hash helpers for build-signature.
 //
 // Hashes complete immutable kd_buf state per BatchItem so REPLAY can detect
-// any divergence from the BUILD-time emission sequence.
+// any divergence from the BUILD-time emission sequence. See spec §7.
 //
 // Per-item coverage:
 //   COMPUTE          kind=1, KernelId, every grid_dims entry, args_count after setup

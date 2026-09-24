@@ -155,6 +155,11 @@ Batch 把 kernel、DMA 和同步 node 组合成 launch segment。一核和八核
 于一个 batch，每个 node 保留自己的 core-count 契约。Immediate 多核 launch 必须打开
 broadcast mode，使所有参与 core 收到 host 参数；batch/Graph 路径统一处理。
 
+原生 queue 核数在索引和窄化前校验为 1–8；kernel core ID 必须在 0–7 内连续递增。
+Segment 的 queue 资源前缀同时覆盖最高 kernel core ID 和 DMA channel，也包括较少
+核心的 kernel 后追加的 DMA。例如 core 0–3 的 kernel 后接 channel 5 的 DMA，queue
+必须覆盖 core 0–5。这项资源管理修复不增加模型级核数配置。
+
 标准 residual reduction 使用共享生成式八核 ring，wrapper 根据已验证 geometry 自动
 选择 schedule；partial producer 先清 inactive shard。Linear 的 FP16/W8/W4-pgrp 路径
 同样由共享 generated planner 自动选 tile，不再接受模型级 route/tile selector。见
@@ -191,4 +196,4 @@ staging，不是 zero-copy。延迟执行还必须持有 source/destination tens
 | `src/fused/` | 模型专用 fused subsystem |
 
 支持行为由精确模型配置和 release asset set 定义，不由源码文件存在定义。见
-[模型支持](model_support.zh.md)和[模型移植](model_porting.zh.md)。
+[示例](model_support.zh.md)和[模型移植](model_porting.zh.md)。

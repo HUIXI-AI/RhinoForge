@@ -34,6 +34,11 @@ BUILTIN_ADAPTERS = (
         "Qwen3_5Adapter",
     ),
     (
+        "Qwen3_5MoeForConditionalGeneration",
+        "rpu_backend.adapters.qwen3_5_moe",
+        "Qwen3_5MoeAdapter",
+    ),
+    (
         "Qwen3VLForConditionalGeneration",
         "rpu_backend.adapters.qwen3_vl",
         "Qwen3VLAdapter",

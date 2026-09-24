@@ -1,5 +1,5 @@
 """
-rpu::* 自定义 op 的 Python dispatch fake shim。
+A2' — rpu::* 自定义 op 的 Python dispatch fake shim。
 
 背景:
   PT 2.10 的 dispatcher 在 FakeTensor 输入下走 op 时:
@@ -38,7 +38,7 @@ def _has_fake(x):
 
 
 def _require_fake(*args):
-    """Python dispatch shim 只在 FakeTensor 路径上被调。一旦真
+    """A2' 不变量:Python dispatch shim 只在 FakeTensor 路径上被调。一旦真
     tensor 进来就抛错,避免 silent 错误绕过真实 RPU 实现。"""
     if not any(_has_fake(a) for a in args):
         raise RuntimeError(
@@ -50,6 +50,30 @@ def _require_fake(*args):
 _SIGLIP_PATCH_SIZE = 14
 _SIGLIP_PATCH_HIDDEN_SIZE = 1152
 _SIGLIP_PROJECTOR_DIM = 2048
+
+
+@torch.library.impl("rpu::linear_w4a16", "Python")
+def _meta_linear_w4a16(input, weight, scale, bias=None):
+    _require_fake(input, weight, scale, bias)
+    if input.ndim < 1 or weight.ndim != 2:
+        raise RuntimeError("linear_w4a16 requires input rank >= 1 and weight rank 2")
+    if input.dtype != torch.float16 or weight.dtype != torch.uint8:
+        raise RuntimeError("linear_w4a16 requires FP16 input and packed UINT8 weight")
+    k, n = input.shape[-1], weight.shape[0]
+    if (k <= 0 or k % 64 or n <= 0 or n % 128 or input.numel() == 0
+            or weight.shape[1] != k // 2):
+        raise RuntimeError("linear_w4a16 requires positive logical K%64=0, N%128=0 and packed [N,K/2]")
+    scale_elements = ((k // 32 + 3) // 4) * ((n // 8 + 63) // 64) * 8 * 4 * 64
+    if (scale.dtype != torch.float16 or scale.ndim != 2 or scale.shape[0] != 32
+            or scale.numel() != scale_elements or not scale.is_contiguous()
+            or not weight.is_contiguous()
+            or weight.device != input.device or scale.device != input.device):
+        raise RuntimeError("linear_w4a16 requires contiguous pgrp weight and FP16 G32 striped scale on the input device")
+    if bias is not None and (bias.ndim != 1 or bias.shape[0] != n
+            or bias.dtype != torch.float16 or bias.device != input.device
+            or not bias.is_contiguous()):
+        raise RuntimeError("linear_w4a16 bias must be contiguous FP16 [N] on the input device")
+    return torch.empty((*input.shape[:-1], n), dtype=input.dtype, device=input.device)
 
 
 def _siglip_num_patches(image):
@@ -96,25 +120,55 @@ def _meta_sdpa_unified(query, key, value, attn_mask=None, dropout_p=0.0,
     return torch.empty_like(query)
 
 
-# Fused all-layers-once entry points。每个 op 包整层 forward,返回 Tensor
+# (v5 删 fused_qkv_attention / fused_decoder_layer:被全层 *_forward 替代,
+#  见 src/core/rpu_backend.cpp:2460 / :2579 注释。)
+
+
+# v5 fused all-layers-once entry points。每个 op 包整层 forward,返回 Tensor
 # 与 hidden_states 同 shape/dtype。k_caches/v_caches 在 C++ 内 in-place
 # mutate,schema 未声明 (a!)/(b!) alias,但 op 作为 opaque 单元,Dynamo 不
 # DCE 也不重排。
 #
 # 配套 C++ 改动:TORCH_LIBRARY_IMPL(rpu, AutogradPrivateUse1) 全部 op 改
 # makeFallthrough()。否则 Autograd 优先级高于 Python,直接撞真 kernel
-# to preserve the opaque fused operation.
+# (与自动批处理路径使用相同的输出形状契约)。
 @torch.library.impl("rpu::causal_decoder_forward", "Python")
 def _meta_causal_decoder_forward(handle, hidden_states, k_caches, v_caches,
                                   attention_mask, position, is_causal,
                                   position_ids=None,
                                   deepstack_dense_visual_embeds=None,
-                                  # Meta 须接收完整 schema，体内不消费这些参数。
+                                  # Schema includes GR00T rope_cos_il/sin_il and HALO cos_sin_offset.
+                                  # Accept all arguments so fake tracing matches the operator signature.
                                   rope_cos_il=None, rope_sin_il=None,
                                   cos_sin_offset=-1, batch_slot=0,
-                                  allow_batch_decode=False):
+                                  allow_batch_decode=False,
+                                  planned_chunk_size=0,
+                                  planned_stage_descriptor=()):
     _require_fake(hidden_states)
     return torch.empty_like(hidden_states)
+
+
+@torch.library.impl("rpu::halo_action_expert_step_forward", "Python")
+def _meta_halo_action_expert_step_forward(handle, x_emb, k_caches, v_caches,
+                                          cos, sin, attn_mask_4d, prefix_len,
+                                          planned_stage_descriptor=()):
+    # HALO action expert (mode=act) 单步: 返回末隐藏, 与 x_emb 同 shape/dtype
+    # [1,cs,hidden]。HaloActionExpertModel 继承 CausalDecoderModel, 返回基类
+    # output_tensor_ (= x_emb shape)。与上面 causal_decoder_forward 同模式。
+    _require_fake(x_emb)
+    return torch.empty_like(x_emb)
+
+
+@torch.library.impl("rpu::halo_image_flow_step_forward", "Python")
+def _meta_halo_image_flow_step_forward(handle, x_emb, k_caches, v_caches,
+                                       cos, sin, prefix_len,
+                                       planned_stage_descriptor=()):
+    # HALO image_flow (双流 MoT 去噪单步): 返回末隐藏 hidden [1,N,H], 与 x_emb
+    # 同 shape/dtype (HaloImageFlowModel 返回基类 output_tensor_)。无 meta 时
+    # FakeTensor/torch.compile 命中本 op 会落真 PrivateUse1 实现读 fake data_ptr
+    # → 复现本文件开头描述的失败模式 。与 action_expert 同模式。
+    _require_fake(x_emb)
+    return torch.empty_like(x_emb)
 
 
 @torch.library.impl("rpu::lm_head_logits_top1", "Python")
@@ -137,9 +191,66 @@ def _meta_argmax_lastdim_host(logits):
     )
 
 
+@torch.library.impl("rpu::zero_contiguous_tensor_blocks_sized", "Python")
+def _meta_zero_contiguous_tensor_blocks_sized(tensors, block_index):
+    _require_fake(tensors)
+    return None
+
+
+@torch.library.impl("rpu::lm_head_logits_top2_rescore_cpu", "Python")
+def _meta_lm_head_logits_top2_rescore_cpu(
+    logits, hidden, raw_weight, candidate_count=2,
+):
+    _require_fake(logits)
+    _require_fake(hidden)
+    _require_fake(raw_weight)
+    return torch.empty(
+        tuple(logits.shape[:-1]),
+        dtype=torch.long,
+        device="cpu",
+    )
+
+
+@torch.library.impl(
+    "rpu::qwen3vl_scatter_row_parts_unflushed_", "Python"
+)
+def _meta_qwen3vl_scatter_row_parts_unflushed_(
+    destination, row_indices, sources,
+):
+    _require_fake(destination)
+    return None
+
+
+@torch.library.impl(
+    "rpu::qwen3vl_gather_embedding_from_rpu_unflushed_", "Python"
+)
+def _meta_qwen3vl_gather_embedding_from_rpu_unflushed_(
+    destination, vocabulary, token_ids, skip_token_id=-1,
+):
+    _require_fake(destination)
+    return None
+
+
 @torch.library.impl("rpu::gemma_forward", "Python")
 def _meta_gemma_forward(handle, hidden_states, k_caches, v_caches,
-                        attention_mask, position, is_causal, chunk_size=0):
+                        attention_mask, position, is_causal, chunk_size=0,
+                        planned_stage_descriptor=()):
+    _require_fake(hidden_states)
+    return torch.empty_like(hidden_states)
+
+
+@torch.library.impl("rpu::gemma2_forward", "Python")
+def _meta_gemma2_forward(handle, hidden_states, k_caches, v_caches,
+                         attention_mask, position, is_causal, chunk_size=0,
+                         planned_stage_descriptor=()):
+    _require_fake(hidden_states)
+    return torch.empty_like(hidden_states)
+
+
+@torch.library.impl("rpu::gemma4_forward", "Python")
+def _meta_gemma4_forward(handle, hidden_states, k_caches, v_caches,
+                         attention_mask, position, is_causal, chunk_size=0,
+                         side_input=None, planned_stage_descriptor=()):
     _require_fake(hidden_states)
     return torch.empty_like(hidden_states)
 
@@ -151,8 +262,28 @@ def _meta_adarms_forward(handle, hidden_states, cond, k_caches, v_caches,
     return torch.empty_like(hidden_states)
 
 
+@torch.library.impl("rpu::internvla_nextdit_forward", "Python")
+def _meta_internvla_nextdit_forward(
+        handle, x, modulation, final_scale, raw_actions, use_action_encoder,
+        populate_cross_cache, denoise_unroll, prepare_modulation_on_rpu,
+        euler_steps,
+        cross_context,
+        self_k_caches, self_v_caches, cross_k_caches, cross_v_caches,
+        layer_outputs, collect_layer_outputs):
+    _require_fake(x)
+    if use_action_encoder:
+        return torch.empty(
+            (raw_actions.shape[0], raw_actions.shape[1], 16),
+            dtype=x.dtype,
+            device=x.device,
+        )
+    return torch.empty_like(x)
+
+
 @torch.library.impl("rpu::siglip_forward", "Python")
-def _meta_siglip_forward(handle, input, k_caches, v_caches):
+def _meta_siglip_forward(
+    handle, input, k_caches, v_caches, planned_stage_descriptor=()
+):
     _require_fake(input)
     if input.dim() == 4:
         shape = (1, input.shape[0] * _siglip_num_patches(input),
@@ -187,7 +318,8 @@ def _meta_siglip_patch_embed_multi(handle, images):
 
 @torch.library.impl("rpu::siglip_forward_packed", "Python")
 def _meta_siglip_forward_packed(handle, hidden, image_batch_count,
-                                k_caches, v_caches):
+                                k_caches, v_caches,
+                                planned_stage_descriptor=()):
     _require_fake(hidden)
     return torch.empty(
         _siglip_projector_shape_from_hidden(hidden),
@@ -197,7 +329,9 @@ def _meta_siglip_forward_packed(handle, hidden, image_batch_count,
 
 
 @torch.library.impl("rpu::siglip_forward_multi", "Python")
-def _meta_siglip_forward_multi(handle, images, k_caches, v_caches):
+def _meta_siglip_forward_multi(
+    handle, images, k_caches, v_caches, planned_stage_descriptor=()
+):
     _require_fake(images)
     if not images:
         raise RuntimeError("SigLIP fake dispatch got empty image list")
@@ -219,10 +353,11 @@ def _meta_conv2d_mc_nhwc(input, weight, *args, **kwargs):
     return torch.empty_like(input)
 
 
-# Hy-Embodied owns nested GraphCache captures, so torch.compile is unsupported
-# for that execution model. Partial shape shims are unsafe because the
-# PROJ1_IN_MERGER path returns 1152-wide Vision rows and the merger/unroll ops
-# cannot be represented by a partial fake graph.
+# Hy-Embodied owns nested GraphCache captures and torch.compile is frozen for
+# that execution model. Partial shape shims are unsafe: the production
+# PROJ1_IN_MERGER path returns 1152-wide Vision rows, while the old fake path
+# claimed 2048, and the default merger/unroll ops had no shim at all. Give every
+# Hy tensor op the same explicit boundary instead of tracing a fictitious graph.
 _HYVLA_COMPILE_UNSUPPORTED = (
     "HyEmbodiedPolicy/Hy-VLA torch.compile is unsupported: adapter owns "
     "nested GraphCache captures"

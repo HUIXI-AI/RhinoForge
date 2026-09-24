@@ -36,7 +36,7 @@ static void rpu_launch_rope_kernel_prefill_raw(
   kernel->reset_regs();
 
   auto* wq = GET_QUEUE(1);
-  wq->set_broadcast_mode(true);  // required for the multi-block launch
+  wq->set_broadcast_mode(true);
 
   // Flush DDR inputs
   rpu_ddr_flush(x_ptr);
@@ -51,7 +51,7 @@ static void rpu_launch_rope_kernel_prefill_raw(
   uint64_t sin_addr = RpuGetDevAddr(sin_ptr) >> 8;
 
   // Set kernel parameters
-  // param0/1: starting position (kernel adds blkid.x internally)
+  // param0/1: starting position
   kernel->set_regs(0, (uint16_t)(start_pos & 0xFFFF));
   kernel->set_regs(1, (uint16_t)(start_pos >> 16));
 
@@ -220,7 +220,9 @@ std::tuple<at::Tensor, at::Tensor> rpu_apply_rotary_pos_emb(
   c10::Half *q_out_ptr = q_out.data_ptr<c10::Half>();
   c10::Half *k_out_ptr = k_out.data_ptr<c10::Half>();
 
-  // Derive start_pos from position_ids for cos/sin row selection.
+  // Extract start_pos from position_ids[0, 0] (kernel uses start_pos + blkid.x
+  // for cos/sin row selection). Previous behavior hardcoded 0 — broke single-
+  // position tests with non-zero pos.
   int64_t start_pos = 0;
   if (position_ids.defined() && position_ids.numel() > 0) {
     auto pids_cpu = position_ids.to(at::kCPU).contiguous().to(at::kLong);
@@ -376,6 +378,15 @@ void rpu_launch_rope_spm_kernel(
     int64_t start_pos,
     int num_cores)                   // number of cores (attn_tp)
 {
+  TORCH_CHECK(num_cores >= 1 && num_cores <= ROPE_NUM_CORES,
+              "RoPE SPM num_cores must be in [1,8]");
+  TORCH_CHECK(seq_len > 0 && seq_len <= UINT16_MAX &&
+                  local_heads > 0 && local_heads <= UINT16_MAX &&
+                  head_dim > 0 && head_dim <= UINT16_MAX && head_dim % 16 == 0,
+              "RoPE SPM requires positive uint16 rows/heads and 16-aligned head_dim");
+  TORCH_CHECK(start_pos >= 0 && start_pos <= UINT32_MAX &&
+                  seq_len - 1 <= UINT32_MAX - start_pos,
+              "RoPE SPM position range exceeds uint32");
   // Flush DDR cos/sin
   rpu_ddr_flush(cos_ptr);
   rpu_ddr_flush(sin_ptr);
@@ -427,6 +438,28 @@ void rpu_launch_rope_spm_kernel(
   for (int i = 0; i < num_cores; ++i) core_list.push_back(i);
   wq->enqueu_kernel(*kernel, {(uint16_t)seq_len, (uint16_t)1, (uint16_t)1},
                     core_list);
+}
+
+void rpu_launch_rhinovla_rope_spm_kernel(
+    uint32_t input, uint32_t output, const at::Tensor& cos, const at::Tensor& sin,
+    int64_t rows, int64_t local_heads, int64_t head_dim, int64_t position,
+    bool partial, int num_cores) {
+  TORCH_CHECK(num_cores >= 1 && num_cores <= 8,
+              "RhinoVLA RoPE requires 1..8 cores");
+  if (partial) {
+    TORCH_CHECK(rows == 31 && head_dim == 128 &&
+                    (local_heads == 1 || local_heads == 2),
+                "RhinoVLA partial RoPE requires exact v3 Q/K geometry");
+    // Rotate the entire head, retaining the original table and logical offset.
+    // The owned launcher checks the table range and binds both DDR operands.
+    // Its token mask leaves the aligned K/Q padding row untouched.
+    rpu_launch_partial_mrope_spm_kernel(input, output, cos, sin,
+        position, rows, local_heads, head_dim, head_dim, num_cores);
+  } else {
+    rpu_launch_rope_spm_kernel(input, output,
+        cos.data_ptr<c10::Half>(), sin.data_ptr<c10::Half>(),
+        rows, local_heads, head_dim, position, num_cores);
+  }
 }
 
 // In-place convenience wrapper

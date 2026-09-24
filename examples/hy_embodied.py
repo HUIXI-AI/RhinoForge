@@ -8,7 +8,7 @@ from pathlib import Path
 import tomllib
 
 
-DEFAULT_CONFIG = Path(__file__).with_name("configs") / "hy_embodied.toml"
+DEFAULT_CONFIG = Path(__file__).with_name("configs") / "hy_embodied/umi/fp16.toml"
 
 
 def load_config(path: Path) -> dict:
@@ -28,6 +28,15 @@ def load_config(path: Path) -> dict:
 
 
 def main() -> int:
+    import sys
+    example_dir = str(Path(__file__).resolve().parent)
+    if example_dir not in sys.path:
+        sys.path.insert(0, example_dir)
+    from _common import maybe_run_catalog
+    result = maybe_run_catalog('hy_vla', DEFAULT_CONFIG)
+    if result is not None:
+        return result
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--check-config", action="store_true")

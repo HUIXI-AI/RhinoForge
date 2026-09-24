@@ -6,66 +6,48 @@ RhinoForge does not redistribute model checkpoints. Obtain each checkpoint from
 the model owner or through an authorized asset channel, accept its separate
 terms, and verify its public repository and revision before use.
 
-This page separates profile correctness from asset provenance. The v1.0.0
-ledger fixes every public upstream identity used by this source release;
-derived local artifacts remain outside that ledger and do not change the
-status in [Model support](model_support.md).
+Keep provenance records for both original and locally converted checkpoints.
+Runtime admission depends on the checkpoint format, precision and input scope
+described by the corresponding configuration and API. Source identity alone
+does not establish support; see [Examples](model_support.md).
 
-## Required record for a runnable profile
+## Model provenance and precision
 
-Every runnable profile must publish all of these fields together:
+Record the public checkpoint source, revision, license and actual precision.
+Keep conversion commands, converter versions and quantization metadata for
+derived checkpoints so the loader can distinguish AWQ, INT4, NVFP4 and W8.
+Model weights and request data are supplied separately from source and wheels.
 
-- model family and exact profile;
-- source identifier and immutable revision, when the model owner provides one;
-- model license and access conditions;
-- source or quantized checkpoint format;
-- conversion command and converter version, when conversion is required;
-- the matching example TOML;
-- the compatible public RhinoForge release tag; and
-- the required Rhino Launch and combined operator-asset release versions.
-
-Do not combine model or runtime-asset versions from different supported
-profiles.
-
-The machine-readable v1.0.0 upstream ledger is
-[`release/public-models-v1.0.0.json`](../release/public-models-v1.0.0.json). It
-pins only official public repositories and immutable revisions. It deliberately
-does not name customer assets or claim that a derived quantized directory is
-identical to its public source checkpoint.
-
-## Release identity boundary
-
-The JSON ledger above is the v1.0.0 identity contract for every public
-upstream integration in this repository. Each record includes the public
-repository, immutable revision, access condition, declared license status, and
-checkpoint format; an implementation repository and revision are included when
-the adapter depends on model-owned code.
-
-The ledger does not turn a Source-only or Limited profile into Supported, does
-not grant access to gated assets, and does not identify locally derived W8/W4
-outputs. A derived checkpoint remains outside the public identity ledger unless
-a public release lists it explicitly.
-
-Compatibility is defined by the public RhinoForge tag and the required Rhino
-Launch and operator-asset release versions. It does not depend on an internal
-source commit or tree, a receipt, or runtime linker/source mappings.
+Examples are archived by model under [`examples/configs/`](../examples/configs/).
+See the [example index](../examples/README.md) for entry points and configuration
+guides. Current API admission checks define the runnable envelope.
 
 ## Public upstream sources
 
-The JSON ledger above is authoritative for repository, revision, access,
-license declaration, and checkpoint format. Its Wall entry binds the public
-`wall-oss-0.5` checkpoint to the Apache-2.0 `wall-x` implementation, but the
-checkpoint repository declares no weight license. Its G0.5 entry binds the
-public Galaxea implementation and gated `g05-base` assets; those assets remain
-non-commercial under the G0.5 Community License.
+Use [Getting started](getting_started.md) for the pinned Qwen3-0.6B download.
+The [Qwen3](../examples/configs/qwen3/README.md),
+[Qwen3-VL](../examples/configs/qwen3_vl/README.md) and
+[Pi0.5](../examples/configs/pi05/README.md) configuration guides describe the
+checkpoint formats, conversion options and input constraints for their examples.
 
-SigLIP used by Pi0.5 is part of the pinned Pi0.5 bundle rather than a separate
-RhinoForge checkpoint identity. W8/W4 outputs are derived assets and are not
-covered by a runnable release claim unless a public release lists them.
+The public Wall-OSS base checkpoint is
+[`x-square-robot/wall-oss-0.5`](https://huggingface.co/x-square-robot/wall-oss-0.5).
+Use its processor, normalizer and action definitions as described in the
+[Wall-OSS example](../examples/README.md#公开-wall-oss-与-rhinovla). For G0.5, the
+[configuration](../examples/configs/g05/base/fp16.toml) records the source,
+revision, subfolder and implementation. Consult the model owner's access and
+license terms and [third-party notices](../THIRD_PARTY_NOTICES.md); RhinoForge's
+source license does not grant rights to these weights.
+
+Keep the complete checkpoint, including its configuration, tokenizer and
+processor files. Pi0.5's SigLIP weights belong to the policy checkpoint.
+Locally converted weights must match the selected configuration's format and
+do not inherit the original checkpoint's task-quality conclusions.
 
 ## Download pattern
 
-For a release row that names a Hugging Face source and immutable revision:
+For a Hugging Face checkpoint, select the repository and immutable revision
+that match the intended configuration:
 
 ```bash
 export RPU_MODEL_CACHE="${RPU_MODEL_CACHE:-$HOME/.cache/rhinoforge/models}"
@@ -74,9 +56,11 @@ hf download SOURCE_ID \
   --local-dir "$RPU_MODEL_CACHE/LOCAL_MODEL_DIRECTORY"
 ```
 
-Use the source identifier, revision, subfolder (when present), and access terms
-from the same release row. Access to a gated model must be granted by the model
-owner.
+Use any source, revision and subfolder pinned by the selected configuration or
+guide. When an example specifies only a local alias, obtain the checkpoint from
+its owner and record the actual repository and revision. Aliases map local cache
+paths; they do not download weights or pin upstream revisions. Access to a gated
+model must be granted by the model owner.
 
 The exact Hy-Embodied profile downloads directly into its registry path:
 
@@ -99,7 +83,7 @@ python -m rpu_backend.quant.convert_qwen3 \
 # Pi0.5 W8A16
 python -m rpu_backend.quant.convert_pi05 --src SOURCE_DIR --dst OUTPUT_DIR
 
-# Pi0.5 packed W4 evaluation profile
+# Pi0.5 mixed W4A16-G32-KV8 evaluation profile (not pure W4)
 python -m rpu_backend.quant.convert_pi05 \
   --src SOURCE_DIR --dst OUTPUT_DIR --fake-w4 --real-w4
 
@@ -118,17 +102,17 @@ model and converter versions for reproducibility.
 
 ## Runtime assets are separate
 
-Model assets do not replace the two restricted runtime prerequisites:
+Model assets do not replace the external runtime prerequisites:
 
-- The Rhino Launch binary development-package release required by the public
-  RhinoForge tag.
-- The combined operator-asset release selected through `RPU_KERNEL_LIB_PATH`,
-  plus its adjacent kernel manifest.
+- A matching sanitized Release Rhino Launch package with headers and libraries.
+- The matching combined operator asset selected through `RPU_KERNEL_LIB_PATH`,
+  plus its adjacent `.kernels` manifest.
+- The matching board SDK/runtime configured according to the platform's
+  installation instructions.
 
-Neither prerequisite is stored in this repository, a source archive, or a
-Python package. Compatibility is determined by the public RhinoForge tag and
-the two runtime-asset release versions documented for that tag; no internal
-commit, linker mapping, or source-build identity is required. Obtain both
-through the authorized distribution channel and verify their supplied
-checksums. Follow [Restricted runtime assets](runtime_assets.md) for download,
-installation, and revocation handling.
+These components are not stored in this repository, a source archive, or a
+Python package. Obtain assets compatible with the source revision from the
+runtime provider and verify its supplied checksums. Package versions alone do
+not establish compatibility; keep build-time and run-time Launch paths
+consistent. Follow [External runtime assets](runtime_assets.md) for required
+capabilities, path configuration and operator-manifest checks.

@@ -59,9 +59,19 @@ def find_shared_object(
     package_dir: str | None = None,
 ) -> str | None:
     """Return the packaged backend shared object, if installed."""
+    explicit_directory = package_dir is not None
     package_dir = package_dir or os.path.dirname(__file__)
     packaged = os.path.join(package_dir, "rpu_backend.so")
-    return packaged if os.path.isfile(packaged) else None
+    if os.path.isfile(packaged):
+        return packaged
+    if not explicit_directory:
+        # A scikit-build editable install keeps Python sources in the worktree
+        # and registers the installed extension as a submodule of this package.
+        spec = importlib.util.find_spec(f"{__package__}.rpu_backend")
+        if spec is not None and spec.origin is not None:
+            if os.path.basename(spec.origin) == "rpu_backend.so" and os.path.isfile(spec.origin):
+                return spec.origin
+    return None
 
 
 def _load_extension(path: str, package_name: str) -> types.ModuleType:

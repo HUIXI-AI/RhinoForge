@@ -1,21 +1,21 @@
-"""Gemma4 mixed-width KV-cache plan and required source map.
+"""Gemma4 mixed-width KV-cache plan + forced source-map (T1c).
 
-Pure Python (stdlib only) so it is standalone-loadable for offline checks
+Pure-Python (stdlib only) so it is standalone-loadable for offline unit tests
 (no torch / transformers / rpu_backend import). Computes, per decoder layer:
   * the 7-D swizzled K/V slot shapes for that layer's (num_kv_heads, head_dim), and
   * the forced source-map: which layer's slot each layer's SDPA reads.
 
-Why a source map is mandatory: Gemma4 KV sharing (idx >= first
+Why a source-map is mandatory (codex round-2): Gemma4 KV-share (idx >= first
 shared) means a layer must READ ANOTHER layer's K/V slot. A "max-width per-layer"
-option alone does not express that, so the plan must always produce the source map. The
+option alone does not express that; T1 must ALWAYS produce the source-map. The
 C++ ``Gemma4Model::build_layer_subgraph`` reads ``k_caches[geom.kv_source_layer]``
 and skips k/v insert for shared layers, so ``Gemma4KVCache`` (cache.py) only has
 to allocate a slot per non-shared layer and ALIAS shared layers to their source.
 
-⚠️ The 7-D layout must stay in sync with
+⚠️ 7-D swizzle layout MUST stay in sync with the kernel layout in
 ``rpu_backend/api/cache.py`` ``RPUCache.__init__`` (the insert_kcache/vcache +
-attention operators assume it). It is mirrored rather than imported to keep
-this module package-independent. Hardware constant NUM_CORES = 8.
+SDPA kernels require it). Mirrored here (not imported) to keep this module
+rpu_backend-free / offline-testable. Hardware constant NUM_CORES = 8.
 """
 from __future__ import annotations
 

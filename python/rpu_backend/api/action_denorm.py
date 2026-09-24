@@ -1,18 +1,27 @@
 """Config-driven action de-normalization for LingBot-VLA-V2 on the RPU.
 
 WHY THIS EXISTS
-    The LingBot-VLA-V2 model emits actions in a *normalized* space. Deployment
-    must map them back to physical units before handing them to the robot. This
-    module implements the required split, unnormalization, and optional delta
-    ``action += state`` transformation.
+    The LingBot-VLA-V2 model emits actions in a *normalized* space. The official
+    server (`lingbot_vla_v2_policy.py::select_action` / `_infer_batch`) ALWAYS maps
+    them back to physical units via `FeatureTransform.unapply()` before handing them
+    to the robot. The RPU delivery historically skipped this step and returned the
+    normalized grid verbatim -- so a robot fed `.actions` directly moved to the wrong
+    joint angles (worst observed: 1.84 rad ~= 106 deg on a shoulder joint).
 
-REQUIREMENTS
+    This module restores the missing step. It is a faithful, standalone re-implementation
+    of the operative parts of `lingbotvla.data.vla_data.transform.Normalizer.unnormalize`
+    and `FeatureTransform.unapply` (the `reverse_pad_and_concat` split + `unnormalize`
+    + optional delta `action += state`).
+
+NON-NEGOTIABLES (per the P0 brief)
     * NOTHING about a specific robot's stats is hardcoded. The norm JSON path, the joint
       order/dims and each joint's norm_type are all supplied by config.
-    * Uses the checkpoint configuration's normalization formulas.
+    * Numerically bit-identical to the official `unnormalize` (verified against the
+      shipped reference action, see tests).
 
-The formulas preserve the reference ``+1e-6`` epsilons and clamp bounds so
-results compose with other LingBot-VLA-V2 runtimes.
+The stat formulas below are copied verbatim (same +1e-6 epsilons, same clamp bounds)
+from `transform.py::Normalizer.{normalize,unnormalize}` so results compose with the
+GPU/official pipeline.
 """
 from __future__ import annotations
 
@@ -24,8 +33,7 @@ from typing import Mapping, Sequence
 import numpy as np
 import torch
 
-# Adapted from Robbyant/lingbot-vla-v2 Normalizer revision 951475ae (Apache-2.0);
-# see THIRD_PARTY_NOTICES.md.
+# Norm types whose unnormalize we have replicated verbatim from the official Normalizer.
 _SUPPORTED_NORM_TYPES = frozenset({
     "meanstd", "std", "minmax", "minmax_woclip",
     "bounds_98", "bounds_98_woclip", "bounds_99", "bounds_99_woclip",

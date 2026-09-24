@@ -1,38 +1,82 @@
-"""Qwen3 adapter for the shared all-layers-once causal decoder.
+"""Qwen3 adapter: wraps the existing convert + all-layers-once patch sequence
+behind a uniform interface. D-13 (v4.0): imported unchanged helpers from the
+model_converter shim. v4.1 Phase 12 D-A1 / D-H2: migrated to canonical homes
+(core.weights for weight primitives + _internal.patches for
+patch_qwen3_model_for_rpu_all_layers_once). Zero edits to behavior.
 
-It provides CPU-first loading with a ``.to('rpu')`` shortcut, per-instance
-installation, deny-by-default profile validation, and single-handle ownership.
+v5-02 / B1: relocated from transformers/qwen3/adapter.py. The cross-surface
+idempotent monkey-patcher in the legacy transformers/qwen3/__init__.py was
+DROPPED per G4-C — the legacy harness `tests/model/test_qwen3_prefill.py` is
+script-style (not pytest-collected) and already broken on v5-01b, so the
+70-LOC idempotency belt is moot. The two raw class-patch calls
+(`patch_rmsnorm_class(Qwen3RMSNorm)` + `patch_rotary_embedding(Qwen3RotaryEmbedding)`)
+remain — see below.
+
+This adapter implements decisions D-01 (two-step + .to('rpu') shortcut),
+D-02 (thin wrapper, NOT subclass), D-03 (per-instance patches at .to),
+D-04 (build_rpu_cache contract — caller passes input_ids; no runtime model attr),
+D-12 (deny-by-default model-profile envelope), D-13 (additive only),
+D-17 (single-handle).
 """
 from __future__ import annotations
+import gc
 import threading
 
 import torch
 
 from rpu_backend.runtime.log import _LOG
 
-# Weight transformation and decoder installation use their owning modules.
-from rpu_backend.runtime.weights import convert_linear_weights_inplace
+# Phase 12 D-H2: was the model_converter shim multi-import; split per canonical home.
+from rpu_backend.runtime.weights import (
+    _collect_embedding_data_ptrs,
+    convert_linear_weights_inplace,
+    _validate_bounded_linear_move,
+)
 from rpu_backend.quant.convert_qwen3 import QUANT_PROJ_SUFFIXES
-# `_install_causal_decoder_forward` lives in `runtime/decoder.py`. The thin
-# `patch_qwen3_model_for_rpu_all_layers_once`
-# wrapper is folded into the call site here:
+# Shared decoder ownership:
+# `_install_causal_decoder_forward` lives in `runtime/decoder.py` (was
+# `patch_causal_decoder_for_rpu` in `_internal/patches/__init__.py:393`,
+# deleted in Commit 2 of this phase). The thin `patch_qwen3_model_for_rpu_all_layers_once`
+# wrapper (D-03d) is folded into the call site here:
 #     _install_causal_decoder_forward(model, arch="qwen3")
 from rpu_backend.runtime.decoder import (
+    _bind_causal_decoder_execution_session,
     _causal_lm_runtime_complete,
     _canonicalize_plain_text_controls,
     _cleanup_causal_decoder_install,
+    _enable_causal_decoder_execution_reconfigure,
     _install_causal_decoder_forward,
     _reject_unconsumed_text_padding,
+    _text_decode_execution_plan,
     _text_prefill_execution_plan,
     chunk_policy_key,
     prefill_position_key,
 )
 
+from rpu_backend.runtime.causal_append import continuation_segments, run_continuation_segments
+
 from rpu_backend.api.errors import UnsupportedModelError, RPUBackendError
-from rpu_backend.api.causal_lm import _claim_live_instance
+from rpu_backend.api._execution import (
+    execution_serialized, _QWEN3_EXECUTION_SUPPORTED, validate_qwen3_core_profile,
+    qwen3_core_profile,
+    is_qwen3_17b_w8a16_core_config,
+)
+from rpu_backend.runtime.topology import (
+    execution_core_count, resolve_decoder_topology, validate_decoder_cache_topology,
+    decoder_topology_for_model, DECODER_GEOMETRY_PROFILES, decoder_mlp_intermediate_size,
+)
+from rpu_backend.quant.qwen3_profiles import (
+    qwen3_dense_quant_profile, is_qwen3_32b_w8a16_config,
+)
+from rpu_backend.api.causal_lm import _claim_live_instance, _release_live_instance
 from rpu_backend.runtime.device import extract_to_device_target, is_rpu_device_target
 
-# Class swaps are guarded below so repeated imports remain idempotent.
+# v5-02 / B1: lifted from the deleted transformers/qwen3/__init__.py — the two
+# raw class-patch invocations (was wrapped in a 70-LOC idempotent helper per
+# G4-C; helper dropped because the legacy harness is no longer pytest-collected).
+# v5-04 V2D-06: V2D-06 helpers relocated to runtime/decoder.py; renamed to
+# _install_*_class_swap to make the side-effecting "install once" semantics
+# explicit at the call site.
 from rpu_backend.runtime.decoder import (
     _install_rmsnorm_class_swap,
     _install_rotary_class_swap,
@@ -40,23 +84,20 @@ from rpu_backend.runtime.decoder import (
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm, Qwen3RotaryEmbedding
 from rpu_backend.runtime.chunk_envelope import ChunkEnvelope, make_lookup
 
-# Certified chunk envelope.
 # (arch, num_hidden_layers, hidden_size) -> (max_kv_len, safe chunk ceiling).
-# A positive ceiling bounds both auto and exact public requests. It is a memory
-# safety bound, not proof that every 16-aligned value below it is legal for a
-# particular attention geometry/input shape; the native exact planner remains
-# the final authority. The framework rejects exact requests on a zero/auto-only
-# row. Deny-by-default:
-# a size with no row here
-# cannot prefill, because the C++ planner refuses an undeclared handle.
-# 14B remains W8A16-only; its conservative row is
-# intentionally short and pinned while the larger-length sweep stays pending.
+# The length bounds position + physical execution length for multi-token
+# prefill; single-token decode retains its separate cache/RoPE bounds. These
+# geometry-based limits are shared by FP16 and W8A16. Keep chunk ceilings fixed
+# as context grows: the native planner still checks padding, tails and SPM.
+# A geometry without a row cannot prefill.
 _CHUNK_ENVELOPE = {
-    ("qwen3", 28, 1024): ChunkEnvelope(1024, 512),   # 0.6b  fp16 + w8a16
-    ("qwen3", 28, 2048): ChunkEnvelope(1024, 512),   # 1.7b  fp16
-    ("qwen3", 36, 2560): ChunkEnvelope(1024, 256),   # 4b    fp16
-    # 8b — 128 is the largest currently selectable/certified chunk; cs=224 is
-    # not legal under the current SDPA validity predicate.
+    ("qwen3", 28, 1024): ChunkEnvelope(4096, 512),   # 0.6b
+    ("qwen3", 28, 2048): ChunkEnvelope(4096, 512),   # 1.7b
+    ("qwen3", 36, 2560): ChunkEnvelope(4096, 256),   # 4b
+    # 8b — 128 is the largest currently selectable/certified chunk. Historical
+    # cs=224 measurements predate the current SDPA validity predicate; 224 is
+    # no longer a legal exact request and therefore must not be advertised as
+    # the public ceiling. The large certificate covers 64/128 through P4096.
     ("qwen3", 36, 4096): ChunkEnvelope(4096, 128),   # 8b    fp16 + w8a16
     ("qwen3", 40, 5120): ChunkEnvelope(192, 32),     # 14b   w8a16 only
 }
@@ -65,7 +106,7 @@ _CHUNK_ENVELOPE = {
 # certificate input. The shared runtime still validates the concrete logical
 # length, padding and cache position before executing: admissibility can change
 # with the tail/position. Keeping this small table prevents a multi-GB load for
-# values such as 8B/cs=224 or cs=48 which are 16-aligned and below the nominal
+# values such as 8B/cs=224 or cs=48 which are 16-aligned and below a historical
 # memory cap but cannot be launched by the current SDPA geometry.
 _EXACT_CHUNKS = {
     ("qwen3", 36, 4096): frozenset((16, 32, 64, 128)),
@@ -73,8 +114,18 @@ _EXACT_CHUNKS = {
 }
 lookup_causal_decoder = make_lookup(
     _CHUNK_ENVELOPE, "rpu_backend/adapters/qwen3.py::_CHUNK_ENVELOPE")
+# Quant-only candidate bounds; source admission stays exact and native planning
+# remains authoritative for each request. This adds no FP16 geometry profile.
+_QUANT_CHUNK_ENVELOPE = {
+    **_CHUNK_ENVELOPE,
+    ("qwen3", 64, 5120): ChunkEnvelope(4096, 64),
+}
+lookup_quantized_causal_decoder = make_lookup(
+    _QUANT_CHUNK_ENVELOPE, "rpu_backend/adapters/qwen3.py::_QUANT_CHUNK_ENVELOPE")
 
-# Wrap direct calls in idempotent guards. Sentinel attrs `_rpu_patched_*` make
+# v5-11 NS-03b (Step-4): wrap the direct calls in idempotent guards (matches
+# the absorbed _internal/patches/llama.py:34-45 pattern; codex sidebar #2 + R1 M-2
+# class-patch idempotency invariant). Sentinel attrs `_rpu_patched_*` make
 # repeated module-level execution (e.g., importlib.reload, multi-adapter import
 # orderings) a no-op after the first patch.
 def _idempotent_patch_qwen3_rmsnorm(rmsnorm_class) -> None:
@@ -95,7 +146,7 @@ _idempotent_patch_qwen3_rmsnorm(Qwen3RMSNorm)
 _idempotent_patch_qwen3_rotary(Qwen3RotaryEmbedding)
 
 
-# The module-level lock serializes swizzle across all
+# Round-5 hardening: module-level lock serializes swizzle across ALL
 # Qwen3 models in the process. Two racing threads calling .to('rpu')
 # on the same (or different) Qwen3 instances can no longer both enter
 # the irreversible convert_linear_weights_inplace path — the second
@@ -103,26 +154,23 @@ _idempotent_patch_qwen3_rotary(Qwen3RotaryEmbedding)
 # _rpu_swizzled flag when the first finishes, or (for same-model
 # re-entry within one thread) hits the fast-path check above the lock.
 #
-# The single-handle policy restricts the process to one live RPU model
+# Note: D-17 single-handle restricts the process to one LIVE RPU model
 # at a time, so cross-model serialization adds near-zero contention in
 # practice (users never run two concurrent .to('rpu') intentionally).
 _SWIZZLE_LOCK = threading.Lock()
 
 
-# Qwen3 supported envelope.
+# D-12 + MEDIUM-10 (codex iter1): Qwen3 supported envelope.
 # Multi-dimensional check: hidden_size alone is too weak (a future Qwen3 release
 # could ship hidden=4096 with much larger intermediate_size or num_hidden_layers
 # and silently pass the guard). Use a profile registry keyed on
 # (hidden_size, intermediate_size, num_hidden_layers, num_key_value_heads).
 # Values come from each model's config.json (model_cache/qwen3-*/config.json).
 #
-_SUPPORTED_PROFILES: frozenset[tuple[int, int, int, int]] = frozenset({
-    # (hidden_size, intermediate_size, num_hidden_layers, num_key_value_heads)
-    (1024,  3072, 28,  8),  # Qwen3-0.6B
-    (2048,  6144, 28,  8),  # Qwen3-1.7B
-    (2560,  9728, 36,  8),  # Qwen3-4B
-    (4096, 12288, 36,  8),  # Qwen3-8B
-})
+_SUPPORTED_PROFILES: frozenset[tuple[int, int, int, int]] = frozenset(
+    (profile.hidden_size, profile.intermediate_size, profile.num_layers,
+     profile.num_kv_heads) for profile in DECODER_GEOMETRY_PROFILES
+)
 
 _W8A16_ONLY_PROFILES: frozenset[tuple[int, int, int, int]] = frozenset({
     # 14B is only admitted for local W8A16 checkpoints. Plain fp16 14B must
@@ -155,10 +203,96 @@ def _config_is_w8a16(config) -> bool:
     return isinstance(qc, dict) and qc.get("method") == "w8a16"
 
 
+def _execution_topology(config, execution_config):
+    try:
+        cores = execution_core_count(execution_config)
+        if is_qwen3_32b_w8a16_config(config):
+            if cores != 8:
+                raise ValueError("Qwen3-32B W8A16 requires model.num_cores=8")
+        elif not validate_qwen3_core_profile(config, cores):
+            return None
+        return resolve_decoder_topology(
+            num_cores=cores, hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            num_q_heads=config.num_attention_heads, num_kv_heads=config.num_key_value_heads,
+            head_dim=config.head_dim, vocab_size=config.vocab_size)
+    except ValueError as exc:
+        raise UnsupportedModelError(str(exc)) from exc
+
+
+def _validate_reduced_model_structure(model, topology):
+    if topology is None:
+        return
+    from rpu_backend.runtime.weights import validate_decoder_weight_structure
+    try:
+        profile = qwen3_core_profile(model.config, topology.num_cores)
+        # Exact 8B FP16 also needs whole-tree admission at budget8 before its
+        # bounded CPU-to-RPU migration. Other default8 paths stay unchanged.
+        if (topology.num_cores == 8 and model.config.hidden_size == 4096
+                and profile is None):
+            raise ValueError("bounded 8B weight migration requires its exact plain FP16 profile")
+        if topology.num_cores == 8 and (profile is None or profile.hidden_size != 4096):
+            return
+        if resolve_decoder_topology(num_cores=topology.num_cores,
+                                    **profile.geometry()) != topology:
+            raise ValueError("decoder geometry changed its bound cold topology")
+        geometry = profile.weight_geometry()
+        if getattr(model, "_rpu_swizzled", False):
+            geometry["intermediate_size"] = decoder_mlp_intermediate_size(
+                profile.intermediate_size, topology.mlp_tp)
+        w8 = is_qwen3_17b_w8a16_core_config(model.config)
+        if w8:
+            validate_decoder_weight_structure(model, **geometry,
+                projection_dtype=torch.int8, lm_head_dtype=torch.int8)
+            expected_device = "rpu" if getattr(model, "_rpu_swizzled", False) else "cpu"
+            for name, module in model.named_modules():
+                if isinstance(module, torch.nn.Linear):
+                    scale = getattr(module, "weight_scale", None)
+                    if (not isinstance(scale, torch.Tensor) or scale.dtype != torch.float16
+                            or scale.device.type != expected_device or not scale.is_contiguous()
+                            or tuple(scale.shape) != (module.out_features,)):
+                        raise ValueError(f"decoder W8A16 requires its FP16 per-channel scale: {name}")
+                elif getattr(module, "weight_scale", None) is not None:
+                    raise ValueError(f"decoder W8A16 does not quantize this module: {name}")
+                if any(getattr(module, attr, None) is not None for attr in (
+                        "weight_scale_inv", "qweight")):
+                    raise ValueError(f"decoder W8A16 rejects alternate quantized storage: {name}")
+                if not getattr(model, "_rpu_swizzled", False) and hasattr(module, "_rpu_linear_partition"):
+                    raise ValueError(f"decoder W8A16 requires original unswizzled weights: {name}")
+            for name, tensor in (*model.named_parameters(), *model.named_buffers()):
+                if tensor.device.type != expected_device or not tensor.is_contiguous():
+                    raise ValueError(f"decoder W8A16 requires contiguous {expected_device} tensors: {name}")
+        else:
+            validate_decoder_weight_structure(model, **geometry)
+    except ValueError as exc:
+        raise UnsupportedModelError(str(exc)) from exc
+
+
+def _validate_w4a16_source(model, execution_config, quantization):
+    """Admit the original FP16 tree before the bounded on-install G32 recipe."""
+    from rpu_backend.runtime.weights import validate_decoder_weight_structure
+
+    profile = Qwen3Adapter.preflight_quantization(
+        model.config, execution_config, quantization)
+    try:
+        validate_decoder_weight_structure(model, **profile.weight_geometry())
+        for name, tensor in model.named_parameters():
+            if (tensor.dtype != torch.float16 or tensor.device.type != "cpu"
+                    or not tensor.is_contiguous()):
+                raise ValueError(f"W4A16 requires original contiguous CPU FP16 weights: {name}")
+        for name, module in model.named_modules():
+            if (hasattr(module, "_rpu_linear_partition") or any(
+                    getattr(module, attr, None) is not None for attr in (
+                        "weight_scale", "weight_scale_inv", "qweight"))):
+                raise ValueError(f"W4A16 requires original unquantized, unswizzled weights: {name}")
+    except ValueError as exc:
+        raise UnsupportedModelError(str(exc)) from exc
+
+
 def _check_profile(config) -> None:
     """Raise `UnsupportedModelError` if the config's 4-tuple profile is not in
     the supported fp16 or W8A16-only envelope. Used by both
-    `Qwen3Adapter.preflight(config)` (the fail-fast preflight before HF
+    `Qwen3Adapter.preflight(config)` (the iter7 fail-fast preflight before HF
     load) AND `Qwen3Adapter.__init__(model)` (belt-and-suspenders — catches
     direct instantiation paths that bypass `RPUModelForCausalLM.from_pretrained`).
     """
@@ -176,7 +310,9 @@ def _check_profile(config) -> None:
                 "Qwen3-14B requires the release W8A16 profile with an "
                 "untied INT8 lm_head and FP16 embeddings."
             )
-    supported = profile in _SUPPORTED_PROFILES or profile in _W8A16_ONLY_PROFILES
+    supported = profile in _SUPPORTED_PROFILES or (
+        _config_is_w8a16(config) and profile in _W8A16_ONLY_PROFILES
+    ) or is_qwen3_32b_w8a16_config(config)
     if not supported:
         raise UnsupportedModelError(
             f"Qwen3 with profile (hidden_size={profile[0]}, "
@@ -187,12 +323,30 @@ def _check_profile(config) -> None:
             "certification; it is not a claim that a future bounded or quantized "
             "profile cannot be supported. "
             f"Supported fp16 profiles: {sorted(_SUPPORTED_PROFILES)}. "
-            f"W8A16-only profiles: {sorted(_W8A16_ONLY_PROFILES)}."
+            f"W8A16-only profiles: {sorted(_W8A16_ONLY_PROFILES)}. "
+            "The exact 32B symmetric W8A16 decoder/head checkpoint is also admitted. "
+            "See docs/api_reference.md §Qwen3 size matrix for deferral rationale. "
+            "Track progress: v3.x backlog."
         )
 
 
 def _detect_and_validate_w8a16(model) -> bool:
     """Return True for local W8A16 Qwen3 models and fail on partial loads."""
+    # An INT8 output head needs the fused route even if decoder projections
+    # remain FP16. Validate it before any irreversible adapter work.
+    lm_head = getattr(model, "lm_head", None)
+    if isinstance(lm_head, torch.nn.Linear) and lm_head.weight.dtype == torch.int8:
+        scale = getattr(lm_head, "weight_scale", None)
+        if scale is None or scale.dtype != torch.float16:
+            raise RPUBackendError(
+                "W8A16 Qwen3 validation failed: int8 lm_head.weight requires "
+                "fp16 lm_head.weight_scale"
+            )
+        if scale.numel() != lm_head.weight.size(0):
+            raise RPUBackendError(
+                f"W8A16 Qwen3 validation failed: lm_head.weight_scale "
+                f"numel={scale.numel()} != vocab_size={lm_head.weight.size(0)}"
+            )
     layers = getattr(getattr(model, "model", None), "layers", [])
     expected = len(layers) * len(_W8A16_PROJ_NAMES)
     projections = [
@@ -217,19 +371,6 @@ def _detect_and_validate_w8a16(model) -> bool:
             f"W8A16 Qwen3 validation failed: int8={int8_count}/{len(projections)}, "
             f"fp16 weight_scale={scale_count}/{len(projections)}"
         )
-    lm_head = getattr(model, "lm_head", None)
-    if isinstance(lm_head, torch.nn.Linear) and lm_head.weight.dtype == torch.int8:
-        scale = getattr(lm_head, "weight_scale", None)
-        if scale is None or scale.dtype != torch.float16:
-            raise RPUBackendError(
-                "W8A16 Qwen3 validation failed: int8 lm_head.weight requires "
-                "fp16 lm_head.weight_scale"
-            )
-        if scale.numel() != lm_head.weight.size(0):
-            raise RPUBackendError(
-                f"W8A16 Qwen3 validation failed: lm_head.weight_scale "
-                f"numel={scale.numel()} != vocab_size={lm_head.weight.size(0)}"
-            )
     embed_tokens = getattr(getattr(model, "model", None), "embed_tokens", None)
     if (
         isinstance(embed_tokens, torch.nn.Embedding)
@@ -250,12 +391,68 @@ def _detect_and_validate_w8a16(model) -> bool:
     return True
 
 
+def _stage_large_qwen3_weights_for_rpu(model) -> None:
+    """Convert/transfer one decoder layer at a time before the remaining tree."""
+    inner = model.model
+    embedding_ptrs = _collect_embedding_data_ptrs(model)
+    for index, layer in enumerate(inner.layers):
+        convert_linear_weights_inplace(
+            layer, prefix=f"model.layers.{index}",
+            _embedding_ptrs=embedding_ptrs, skip_names=set(),
+        )
+        layer.to("rpu")
+        gc.collect()
+
+    _convert_qwen3_remaining_weights(model, embedding_ptrs)
+
+
+def _convert_qwen3_remaining_weights(model, embedding_ptrs=None):
+    inner = model.model
+    if embedding_ptrs is None:
+        embedding_ptrs = _collect_embedding_data_ptrs(model)
+    # Walk the rest through the same converter, including tied lm_head and
+    # any other Linear children, without revisiting already-staged layers.
+    # These temporary parent modules share the original children; the actual
+    # model registration and parameter ownership remain intact throughout.
+    remaining = torch.nn.Module()
+    for name, child in model.named_children():
+        if child is inner:
+            remaining_inner = torch.nn.Module()
+            for inner_name, inner_child in inner.named_children():
+                if inner_child is not inner.layers:
+                    remaining_inner.add_module(inner_name, inner_child)
+            remaining.add_module(name, remaining_inner)
+        else:
+            remaining.add_module(name, child)
+    convert_linear_weights_inplace(
+        remaining, _embedding_ptrs=embedding_ptrs, skip_names=set(),
+    )
+
+
 class Qwen3Adapter:
     """Per-instance adapter for HF `Qwen3ForCausalLM`."""
 
+    EXECUTION_SUPPORTED = _QWEN3_EXECUTION_SUPPORTED
+
+    @classmethod
+    def preflight_quantization(cls, config, execution_config, quantization):
+        """Admit an exact dense FP16 source for the two TP8/G32 recipes."""
+        try:
+            if quantization not in ("w4a16", "w4a16_lm_head"):
+                raise ValueError("unknown on-install W4 recipe")
+            profile = qwen3_dense_quant_profile(config)
+            if execution_core_count(execution_config) != 8:
+                raise ValueError("W4 requires model.num_cores=8")
+        except ValueError as exc:
+            raise UnsupportedModelError(
+                "on-install W4 requires exact dense Qwen3 FP16 source weights, "
+                "G32 and model.num_cores=8; embedding and norms remain FP16: " + str(exc)
+            ) from exc
+        return profile
+
     @classmethod
     def preflight(cls, config) -> None:
-        """Config-only fail-fast preflight.
+        """iter7 HIGH (codex): config-only D-12 fail-fast preflight.
 
         Called by `RPUModelForCausalLM.from_pretrained` BEFORE the full HF
         model load so unsupported dtype/profile combinations raise within
@@ -265,18 +462,20 @@ class Qwen3Adapter:
 
     @classmethod
     def preflight_execution(cls, config, execution_config) -> None:
+        _execution_topology(config, execution_config)
         requested = execution_config.get("prefill", {}).get("chunk_size", "auto")
         if not isinstance(requested, int):
             return
         key = ("qwen3", int(config.num_hidden_layers), int(config.hidden_size))
-        env = lookup_causal_decoder(*key)
+        env = lookup_quantized_causal_decoder(*key)
         if env.chunk > 0 and requested > env.chunk:
             raise UnsupportedModelError(
                 f"Qwen3 prefill chunk_size={requested} exceeds this profile's "
                 f"certified ceiling {env.chunk}; max certified KV length is "
                 f"{env.max_kv_len}. Refusing before loading model weights."
             )
-        admissible = _EXACT_CHUNKS.get(key)
+        admissible = (frozenset((16, 32, 64)) if key == ("qwen3", 64, 5120)
+                      else _EXACT_CHUNKS.get(key))
         if admissible is not None and requested not in admissible:
             choices = ", ".join(str(value) for value in sorted(admissible))
             raise UnsupportedModelError(
@@ -287,15 +486,51 @@ class Qwen3Adapter:
                 "again by the exact planner. Refusing before loading model weights."
             )
 
-    def __init__(self, model):
-        # Validate the envelope before any
+    def __init__(self, model, *, quantization=None):
+        # D-12 + MEDIUM-10 belt-and-suspenders: validate envelope BEFORE any
         # mutation (so an unsupported profile raises before swizzle), even on direct adapter
         # instantiation paths that bypass RPUModelForCausalLM.from_pretrained.
-        _check_profile(model.config)
+        if quantization is None:
+            _check_profile(model.config)
+        if (getattr(model.to, "__rpu_wrapped__", False)
+                and getattr(model.to, "__rpu_quantization__", None) != quantization):
+            raise UnsupportedModelError("Qwen3 on-install quantization is cold-only; reload the model to change it")
+        self._quantization = quantization
+        ready = _causal_lm_runtime_complete(model)
+        quant_profile = None
+        self._staged_w4 = False
+        if quantization is not None:
+            quant_profile = self.preflight_quantization(
+                model.config, getattr(model, "_rpu_execution", None), quantization)
+            self._staged_w4 = quant_profile.num_layers == 64
+            if not ready:
+                if self._staged_w4:
+                    from rpu_backend.quant.load_qwen3_quantized import validate_staged_qwen3_w4a16
+                    validate_staged_qwen3_w4a16(model, quantization=quantization)
+                else:
+                    _validate_w4a16_source(model, getattr(model, "_rpu_execution", None), quantization)
+        elif any(parameter.dtype == torch.uint8 for parameter in model.parameters()):
+            raise UnsupportedModelError(
+                "Packed UINT8 Qwen3 weights require the explicit on-install W4 "
+                "recipe from original FP16 weights"
+            )
         self.model = model
         self._all_layers_once_handle: int | None = None
         self._is_w8a16 = _detect_and_validate_w8a16(model)
-        if _config_profile(model.config) in _W8A16_ONLY_PROFILES:
+        self._large_quant = self._staged_w4 or is_qwen3_32b_w8a16_config(model.config)
+        self._topology = (resolve_decoder_topology(num_cores=8, **quant_profile.geometry())
+            if quant_profile is not None else _execution_topology(
+                config=model.config, execution_config=getattr(model, "_rpu_execution", None)))
+        self._bound_profile = _config_profile(model.config)
+        if self._topology is not None:
+            if (quantization is None and not self._large_quant
+                    and not is_qwen3_17b_w8a16_core_config(model.config)
+                    and (self._is_w8a16 or any(parameter.dtype != torch.float16
+                    for parameter in model.parameters()))):
+                raise UnsupportedModelError("fixed-core Qwen3 requires plain FP16 model weights")
+        if quantization is None and not self._large_quant:
+            _validate_reduced_model_structure(model, self._topology)
+        if quantization is None and _config_profile(model.config) in _W8A16_ONLY_PROFILES:
             lm_head = getattr(model, "lm_head", None)
             embed_tokens = getattr(getattr(model, "model", None), "embed_tokens", None)
             if (
@@ -310,26 +545,29 @@ class Qwen3Adapter:
                     "W8A16 profile: decoder projections and lm_head must be "
                     "INT8, and embeddings must remain FP16."
                 )
-        # Readiness must live on the model, not the
+        # Round-2 P1 hardening: readiness MUST live on the model, not the
         # adapter. Otherwise a second `Qwen3Adapter(model)` construction on
         # an already-swizzled model creates a fresh adapter with
         # `_rpu_is_ready=False`; `to_rpu()` then calls
         # `convert_linear_weights_inplace` on already-swizzled weights →
-        # double-swizzle. Adopt the existing per-model flag
+        # double-swizzle (Pitfall 1). Adopt the existing per-model flag
         # if present; otherwise start False.
         self._rpu_is_ready: bool = _causal_lm_runtime_complete(model)
+        self._execution_session = _bind_causal_decoder_execution_session(
+            self, entry_point="Qwen3Adapter"
+        )
 
-        # Install a `.to('rpu')` interceptor on the
+        # Per D-01 two-step canonical: install a `.to('rpu')` interceptor on the
         # model instance so user code `model.to('rpu')` triggers `to_rpu()`.
         # This monkey-patches the bound method on this single instance only — does
         # NOT mutate the HF class, does NOT affect other model instances.
         #
-        # Detect an already-wrapped `model.to` (from a
+        # WR-04 (codex iter9): detect an already-wrapped `model.to` (from a
         # prior `Qwen3Adapter(model)` on the same instance) via a sentinel
         # attribute on the wrapper function. Without this guard, repeated
         # construction stacks interceptors: the second __init__ captures the
         # first's `rpu_aware_to` as `original_to`, so `model.to('cpu')` would
-        # chain through two interceptors. The single-handle gate only
+        # chain through two interceptors. The single-handle gate (D-17) only
         # catches two DIFFERENT live models on RPU — not double-wrap on the
         # same instance. Short-circuit the `model.to` rewiring; the rest of
         # __init__ runs normally (cheap rebind of self.model / self._rpu_is_ready
@@ -368,16 +606,16 @@ class Qwen3Adapter:
                         "library forces fp16 at load time. Use .to('rpu') alone."
                     )
                 return self.to_rpu()
-            # Once the adapter has swizzled
+            # iter2 HIGH-3 + iter3 MEDIUM (codex): once the adapter has swizzled
             # weights for RPU, `convert_linear_weights_inplace` is IRREVERSIBLE —
             # moving the model back to CPU and then to RPU again would NOT
             # re-swizzle (no-op via _rpu_is_ready) and the CPU forward path
             # would crash on swizzled weights. Reject any non-rpu target after
             # to_rpu() so the failure surfaces at the .to() call site.
-            # Raise the typed `RPUBackendError` so callers can
+            # iter3: raise the typed `RPUBackendError` (D-18 base) so callers can
             # catch with `except RPUBackendError` rather than the broader
             # `RuntimeError`.
-            # This closure captures the creating adapter's
+            # Round-3 hardening: this closure captures adapter1's
             # `self._rpu_is_ready`. If a SECOND Qwen3Adapter was
             # constructed on the same model and its `to_rpu()` swizzled
             # the weights, adapter1's flag stays False (closure is stale)
@@ -398,36 +636,36 @@ class Qwen3Adapter:
                 )
             return original_to(*args, **kwargs)
 
-        # Tag the wrapper so a subsequent `Qwen3Adapter(model)`
+        # WR-04 sentinel: tag the wrapper so a subsequent `Qwen3Adapter(model)`
         # on the same instance detects the existing wrap via
         # `getattr(model.to, "__rpu_wrapped__", False)` and short-circuits.
         rpu_aware_to.__rpu_wrapped__ = True
+        rpu_aware_to.__rpu_quantization__ = quantization
 
         # Bind onto the instance (NOT the class) — survives only as long as `model` lives.
         # `nn.Module.__setattr__` falls through to `super().__setattr__` for plain
-        # functions, so this assignment is safe.
+        # functions (verified — module.py:2072), so this assignment is safe.
         model.to = rpu_aware_to
 
     def to_rpu(self):
         """Step A → B → C: convert weights, all-layers-once patch, claim live-handle, return RPU-ready model.
 
-        Idempotent for the same model instance. If
+        HIGH-3 (codex iter1): IDEMPOTENT for the same model instance. If
         `to_rpu()` was already called on this adapter, returns `self.model`
         without re-running weight swizzle (which would corrupt already-swizzled
         weights) or re-claiming the live-handle gate (which would raise against
         ourself).
 
-        Double-swizzle guard: SKIP_LINEAR_NAMES.
-        Qwen3 has no specialized adaptive-normalization projection Linears. We
-        pass `skip_names=set()` explicitly so future readers see the deliberate
-        choice.
+        Pitfall 1 (P1 — CLAUDE.md §"Critical: Known Pitfalls"): SKIP_LINEAR_NAMES.
+        Plain/W8 Qwen3 has no specialized `.dense` layers, so it uses an empty
+        skip set. The on-install W4 recipe packs its seven decoder projections
+        once and excludes them from the subsequent generic FP16 head swizzle.
 
-        The default `skip_names=None` in `convert_linear_weights_inplace`
-        merges `{'dense'}` into the skip set as a double-swizzle guard. For Qwen3 with no `.dense`
+        The default `skip_names=None` in `convert_linear_weights_inplace` (model_converter.py:195)
+        merges `{'dense'}` into the skip set as a P1 safety belt. For Qwen3 with no `.dense`
         leaves, this would be harmless either way, but explicit `set()` documents intent and
-        keeps adapter-level intent explicit alongside Pi0.5
-        (`skip_names={'dense'}`) and RhinoVLA (`skip_names={'cond'}`, plus the
-        built-in `dense` skip).
+        keeps adapter-level discipline visible alongside Phase 3 Pi05 (`skip_names={'dense'}`)
+        and Phase 4 QwenPI05 (`skip_names={'cond', 'dense'}`).
         """
         if _causal_lm_runtime_complete(self.model):
             self._rpu_is_ready = True
@@ -440,7 +678,7 @@ class Qwen3Adapter:
                 "accepting a partial install."
             )
 
-        # Fail loud if a prior swizzle attempt started mutation
+        # Round-5 HIGH #2: fail loud if a prior swizzle attempt started mutation
         # but crashed mid-way. `convert_linear_weights_inplace` mutates
         # Linear.weight.data in place. If `.to('rpu')` or
         # `patch_qwen3_model_for_rpu_all_layers_once` raised AFTER that,
@@ -460,8 +698,9 @@ class Qwen3Adapter:
                 "call .to('rpu') on the broken instance."
             )
 
-        # The module-level lock serializes the entire swizzle critical section
-        # across all Qwen3 models. A check-then-set flag alone has a race window
+        # Round-5 HIGH #1: module-level lock serializes the entire swizzle
+        # critical section across all Qwen3 models in the process. Round-4's
+        # check-then-set on `_rpu_swizzle_in_progress` had a race window
         # between the read and write — two threads could both pass the
         # check before either write landed, then both reach the irreversible
         # convert_linear_weights_inplace. Holding _SWIZZLE_LOCK for the
@@ -486,34 +725,128 @@ class Qwen3Adapter:
                 validate_preinstall,
             )
             validate_preinstall(self.model)
+            if getattr(self.model, "_rpu_execution", None) != self._execution_session.config:
+                raise RPUBackendError("Qwen3 execution configuration changed outside its bound session")
 
-            # Claim the single-handle gate before mutation so a second concurrent
+            if self._topology is not None and _config_profile(self.model.config) != self._bound_profile:
+                raise UnsupportedModelError("decoder geometry changed its bound cold topology")
+            if self._quantization is not None:
+                if self._staged_w4:
+                    from rpu_backend.quant.load_qwen3_quantized import validate_staged_qwen3_w4a16
+                    validate_staged_qwen3_w4a16(self.model, quantization=self._quantization)
+                else:
+                    _validate_w4a16_source(self.model, self._execution_session.config, self._quantization)
+            elif not self._large_quant:
+                _validate_reduced_model_structure(self.model, self._topology)
+            if self._topology is not None:
+                from rpu_backend.runtime.weights import validate_decoder_mlp_padding
+                logical = self.model.config.intermediate_size
+                validate_decoder_mlp_padding(self.model, logical_size=logical,
+                    physical_size=decoder_mlp_intermediate_size(logical, self._topology.mlp_tp))
+            bounded_move = (self._topology is not None and not self._is_w8a16
+                            and self._quantization is None
+                            and self.model.config.hidden_size == 4096)
+            if bounded_move:
+                _validate_bounded_linear_move(
+                    self.model, False, self._topology.attn_tp,
+                    self._topology.mlp_tp, self._topology.lm_head_tp,
+                    {"dense"})
+
+            # D-17: claim single-handle gate BEFORE mutation so a second concurrent
             # .to('rpu') on a DIFFERENT model raises before we touch any weights.
-            # _claim_live_instance is idempotent for the same model; only a
-            # different live model triggers RPUSingleHandleError.
+            # _claim_live_instance is idempotent for the same model id (HIGH-3 fix
+            # in 02-01); only a different live model triggers RPUSingleHandleError.
             _claim_live_instance(self.model)
+            try:
+                # Reuse HostDDR mappings for request temporaries before the
+                # first RPU allocation freezes the process allocator policy.
+                # A rejected second model must not change the live owner's policy.
+                torch.rpu.set_caching_allocator(True)
+                if self._large_quant:
+                    from rpu_backend.graph import GraphRuntimePolicy
+                    arena_policy = GraphRuntimePolicy.from_environment(graph_arena_count=9)
+                    if not arena_policy.prepare_arenas():
+                        raise RPUBackendError("Qwen3-32B quantization requires cold SDK graph arenas")
+                    self._graph_arena_policy = arena_policy
+            except BaseException:
+                _release_live_instance(self.model)
+                raise
 
             # Stamp started BEFORE any mutation. If anything below raises,
             # this flag stays set and the HIGH-#2 check at function-entry
             # above raises on retry telling the caller to reload.
             self.model._rpu_swizzle_started = True
+            if self._topology is not None:
+                self.model._rpu_decoder_topology = self._topology
             inner = self.model.model
+            if self._large_quant:
+                self.model._rpu_kv_cache_layer_bank_size = 8
+                inner._rpu_kv_cache_layer_bank_size = 8
             inner_state = vars(inner)
             had_instance_forward = "forward" in inner_state
             original_instance_forward = inner_state.get("forward")
+            outer_state = vars(self.model)
+            had_outer_forward = "forward" in outer_state
+            original_outer_forward = outer_state.get("forward")
             try:
                 # Step A: weight conversion and device migration are
                 # irreversible on this instance.
                 _stash_int8_lm_head_cpu_reference(self.model)
                 _patch_int8_embedding_forward(self.model)
-                convert_linear_weights_inplace(
-                    self.model, skip_names=set()
-                )
+                if self._staged_w4:
+                    from rpu_backend.quant.load_qwen3_quantized import materialize_staged_qwen3_w4a16_for_rpu
+                    materialize_staged_qwen3_w4a16_for_rpu(self.model, quantization=self._quantization)
+                elif self._quantization is not None:
+                    from rpu_backend.quant.convert_qwen3_w4a16 import (
+                        DEFAULT_GROUP_SIZE, SKIP_LINEAR_NAMES, _PROJECTIONS,
+                        convert_qwen3_to_w4a16_,
+                    )
+                    quantize_head = self._quantization == "w4a16_lm_head"
+                    convert_qwen3_to_w4a16_(self.model, group_size=DEFAULT_GROUP_SIZE,
+                                          quantize_lm_head=quantize_head)
+                    skip = set(SKIP_LINEAR_NAMES) | ({"lm_head"} if quantize_head else set())
+                    convert_linear_weights_inplace(self.model, skip_names=skip)
+                    if quantize_head:
+                        self.model.lm_head._rpu_linear_partition = 1
+                        self.model.lm_head._rpu_linear_num_cores = 8
+                    # The generic skip marker describes only that converter.
+                    # These projections already carry the packer's TP8 layout.
+                    for layer in inner.layers:
+                        for role, partition in _PROJECTIONS:
+                            projection = layer.get_submodule(role)
+                            projection._rpu_linear_partition = partition
+                            projection._rpu_linear_num_cores = 8
+                elif self._large_quant:
+                    from rpu_backend.quant.load_qwen3_quantized import move_qwen3_w8a16_decoder_for_rpu
+                    move_qwen3_w8a16_decoder_for_rpu(self.model)
+                    _convert_qwen3_remaining_weights(self.model)
+                elif self._topology is not None:
+                    from rpu_backend.runtime.weights import pad_decoder_mlp_weights
+                    logical = self.model.config.intermediate_size
+                    pad_decoder_mlp_weights(self.model, logical_size=logical,
+                        physical_size=decoder_mlp_intermediate_size(logical, self._topology.mlp_tp))
+                    convert_linear_weights_inplace(
+                        self.model, skip_names=set(),
+                        **({"move_to_device": "rpu"} if bounded_move else {}),
+                        attn_num_cores=self._topology.attn_tp,
+                        mlp_num_cores=self._topology.mlp_tp,
+                        lm_head_num_cores=self._topology.lm_head_tp,
+                        execution_core_count=self._topology.num_cores,
+                    )
+                elif int(self.model.config.hidden_size) >= 4096:
+                    # A full converted 8B/14B CPU decoder plus its RPU copy
+                    # can exceed the staging room of a 29-GiB host. Release
+                    # each converted CPU layer before converting the next.
+                    _stage_large_qwen3_weights_for_rpu(self.model)
+                else:
+                    convert_linear_weights_inplace(
+                        self.model, skip_names=set()
+                    )
                 original_to = type(self.model).to
                 original_to(self.model, "rpu")
 
                 scale_lists = None
-                if self._is_w8a16:
+                if self._is_w8a16 or self._quantization is not None:
                     num_layers = len(inner.layers)
                     scale_lists = (
                         [inner.layers[i].self_attn.q_proj.weight_scale for i in range(num_layers)],
@@ -526,15 +859,28 @@ class Qwen3Adapter:
                     )
                 self._all_layers_once_handle = _install_causal_decoder_forward(
                     inner, arch="qwen3", scale_lists=scale_lists,
-                    chunk_envelope_for=lookup_causal_decoder,
+                    chunk_envelope_for=(lookup_quantized_causal_decoder
+                        if self._quantization is not None or self._large_quant
+                        else lookup_causal_decoder),
+                    **({"_graph_cache_max_entries": 8} if self._large_quant else {}),
                     execution_config=getattr(
                         self.model, "_rpu_execution", None
                     ),
+                    **({"topology": self._topology}
+                       if self._topology is not None else {}),
                 )
-                if _config_profile(self.model.config) in _W8A16_ONLY_PROFILES:
+                lm_head = getattr(self.model, "lm_head", None)
+                if isinstance(lm_head, torch.nn.Linear) and lm_head.weight.dtype in (torch.int8, torch.uint8):
                     _apply_fused_lm_head_for_rpu(self.model)
+                else:
+                    _bind_fp16_lm_head_accumulation(self.model)
+                    _apply_plain_lm_head_causal_append_for_rpu(self.model)
+                _enable_causal_decoder_execution_reconfigure(inner)
+                self._execution_session = _bind_causal_decoder_execution_session(
+                    self, entry_point="Qwen3Adapter"
+                )
 
-                # Readiness is published only after the full installation. A
+                # Readiness is published only after the full A9 install. A
                 # failure before this point remains poisoned by
                 # `_rpu_swizzle_started` and cannot be retried.
                 validate_postinstall(self.model)
@@ -549,6 +895,16 @@ class Qwen3Adapter:
                     had_instance_forward=had_instance_forward,
                     original_instance_forward=original_instance_forward,
                 )
+                # A failed retirement keeps the installed forward and its
+                # weights under the poisoned session. Restore the original
+                # outer entry only after native ownership is gone.
+                if getattr(inner, "_rpu_decoder_handle", None) is None:
+                    if had_outer_forward:
+                        outer_state["forward"] = original_outer_forward
+                    else:
+                        outer_state.pop("forward", None)
+                    outer_state.pop("_rpu_lm_head_w_keepalive", None)
+                    outer_state.pop("_rpu_lm_head_scale_keepalive", None)
                 raise
 
             return self.model
@@ -556,7 +912,7 @@ class Qwen3Adapter:
             # Release the lock regardless of outcome. `_rpu_swizzle_started`
             # is NOT cleared here — on success it stays True alongside
             # _rpu_swizzled; on failure it stays True WITHOUT
-            # _rpu_swizzled, tripping the partial-state check on retry.
+            # _rpu_swizzled, tripping the HIGH-#2 check on retry.
             _SWIZZLE_LOCK.release()
 
 
@@ -565,8 +921,11 @@ register_adapter("Qwen3ForCausalLM", Qwen3Adapter)
 
 
 # =====================================================================
-# CausalLM-specific helpers for the fused-lm-head path use
-# `_rpu_decoder_handle` as the shared handle attribute.
+# Phase 04 / Q1 lift (ADR §6.4 + Ledger Q1): CausalLM-specific helpers
+# for the fused-lm-head path; lifted byte-equal from
+# _internal/patches/__init__.py (deleted in v5-11). HND-01 rename: the
+# legacy per-arch handle attribute is replaced by `_rpu_decoder_handle`
+# in the lifted body.
 # =====================================================================
 from rpu_backend.runtime.weights import transform_linear_weight
 from rpu_backend.runtime.decoder import (
@@ -603,29 +962,15 @@ def _stash_int8_lm_head_cpu_reference(causal_lm) -> None:
 
 
 def _int8_lm_head_prefill_logits(causal_lm, hidden: torch.Tensor) -> torch.Tensor:
-    """Reference first-token lm_head for int8 lm_head prefill.
-
-    The optimized path is decode-only and runs inside C++ while seq_len==1.
-    For prefill, we support the generate path (`logits_to_keep=1`) by using
-    the unswizzled CPU int8 reference stashed before RPU weight swizzling.
-    """
-    w_int8 = getattr(causal_lm, "_rpu_lm_head_int8_cpu_ref", None)
-    scale = getattr(causal_lm, "_rpu_lm_head_scale_cpu_ref", None)
-    if w_int8 is None or scale is None:
-        raise RPUBackendError(
-            "int8 lm_head prefill logits require an unswizzled CPU reference; "
-            "reload the model and call .to('rpu') once before generation"
-        )
-    hidden_cpu = hidden.to("cpu", dtype=torch.float16).contiguous()
-    weight = getattr(causal_lm, "_rpu_lm_head_fp16_cpu_ref", None)
-    if weight is None:
-        weight = (
-            w_int8.to(torch.float32)
-            * scale.to(torch.float32).unsqueeze(1)
-        ).to(torch.float16).contiguous()
-        causal_lm._rpu_lm_head_fp16_cpu_ref = weight
-    logits_cpu = torch.nn.functional.linear(hidden_cpu, weight)
-    return logits_cpu.to(hidden.device)
+    """Quantized DDR head using the same cold accumulation policy as decode."""
+    topology = decoder_topology_for_model(causal_lm)
+    cores = topology.lm_head_tp if topology is not None else 8
+    acc32 = bool(causal_lm._rpu_execution.get("prefill", {}).get("linear_acc32", False))
+    output = torch.ops.rpu.linear_with_accumulation(
+        hidden.reshape(-1, hidden.shape[-1]).contiguous(),
+        causal_lm._rpu_lm_head_w_keepalive, None, 1, cores, acc32,
+        causal_lm._rpu_lm_head_scale_keepalive)
+    return output.reshape(*hidden.shape[:-1], output.shape[-1])
 
 
 def _stash_int8_embedding_cpu_reference(causal_lm) -> None:
@@ -689,7 +1034,7 @@ def _w8a16_scale_lists_for_qwen3_inner(inner):
     if not layers:
         return None
     first_q = layers[0].self_attn.q_proj
-    if getattr(first_q.weight, "dtype", None) != torch.int8:
+    if getattr(first_q.weight, "dtype", None) not in (torch.int8, torch.uint8):
         return None
     num_layers = len(layers)
     return (
@@ -716,9 +1061,55 @@ def _push_lm_head_weight(causal_lm, handle: int) -> None:
     (b) Weight still on CPU → explicitly swizzled here via
         transform_linear_weight(..., partition=1) before moving to RPU.
 
-    CPU weights are transformed here before being uploaded.
+    This mirrors legacy setup_fuse_lm_head() (model_converter.py:1421-1430).
     """
+    topology = decoder_topology_for_model(causal_lm)
+    lm_head_tp = topology.lm_head_tp if topology is not None else 8
     lm_w = causal_lm.lm_head.weight.detach()
+    if topology is not None and topology.num_cores != 8:
+        try:
+            profile = qwen3_core_profile(causal_lm.config, topology.num_cores)
+            if resolve_decoder_topology(num_cores=topology.num_cores,
+                                        **profile.geometry()) != topology:
+                raise ValueError("fused lm_head geometry changed its bound cold topology")
+        except ValueError as exc:
+            raise RPUBackendError(str(exc)) from exc
+        shape = (profile.vocab_size, profile.hidden_size)
+        dtype = torch.int8 if is_qwen3_17b_w8a16_core_config(causal_lm.config) else torch.float16
+        if lm_w.dtype != dtype or tuple(lm_w.shape) != shape:
+            label = "INT8" if dtype == torch.int8 else "plain FP16"
+            raise RPUBackendError(f"reduced-core fused lm_head requires {label} {shape} weights")
+    if topology is not None and lm_w.device.type == "rpu":
+        if (getattr(causal_lm.lm_head, "_rpu_linear_num_cores", None) != lm_head_tp
+                or getattr(causal_lm.lm_head, "_rpu_linear_partition", None) != 1):
+            raise RPUBackendError("fused lm_head weight layout differs from the cold model topology")
+    if lm_w.dtype == torch.uint8:
+        if getattr(causal_lm.to, "__rpu_quantization__", None) != "w4a16_lm_head":
+            raise RPUBackendError("packed W4 lm_head requires its cold w4a16_lm_head recipe")
+        profile = Qwen3Adapter.preflight_quantization(
+            causal_lm.config, causal_lm._rpu_execution, "w4a16_lm_head")
+        scale = getattr(causal_lm.lm_head, "weight_scale", None)
+        scale_elems = ((profile.hidden_size // 32 + 3) // 4
+                       * ((profile.vocab_size // 8 + 63) // 64) * 8 * 4 * 64)
+        if (tuple(lm_w.shape) != (profile.vocab_size, profile.hidden_size // 2)
+                or not lm_w.is_contiguous()
+                or getattr(causal_lm.lm_head, "_rpu_linear_partition", None) != 1
+                or getattr(causal_lm.lm_head, "_rpu_linear_num_cores", None) != 8
+                or not isinstance(scale, torch.Tensor) or scale.dtype != torch.float16
+                or tuple(scale.shape) != (32, scale_elems // 32)
+                or not scale.is_contiguous()):
+            raise RPUBackendError("packed W4 lm_head requires its TP8/G32 weight and scale layout")
+        # Both payloads are already packed. A dtype cast or generic swizzle
+        # would reinterpret bytes and corrupt the independent FP16 embedding.
+        lm_w = lm_w.to("rpu")
+        lm_scale = scale.detach().to("rpu")
+        causal_lm._rpu_lm_head_w_keepalive = lm_w
+        causal_lm._rpu_lm_head_scale_keepalive = lm_scale
+        resource = getattr(causal_lm.model, "_rpu_decoder_retirement_state", None)
+        if resource is not None:
+            resource.keepalive = (resource.keepalive, lm_w, lm_scale)
+        torch.ops.rpu.causal_decoder_set_lm_head(handle, lm_w, lm_scale)
+        return
     if lm_w.dtype == torch.int8:
         if lm_w.device.type == "rpu" and not hasattr(
             causal_lm, "_rpu_lm_head_int8_cpu_ref"
@@ -734,10 +1125,14 @@ def _push_lm_head_weight(causal_lm, handle: int) -> None:
             lm_w = lm_w.contiguous()
             lm_scale = lm_scale.to(torch.float16).contiguous()
         else:
-            lm_w = transform_linear_weight(lm_w.contiguous(), partition=1).to("rpu")
+            lm_w = transform_linear_weight(lm_w.contiguous(), partition=1,
+                **({"num_cores": lm_head_tp} if topology is not None else {})).to("rpu")
             lm_scale = lm_scale.to(torch.float16).contiguous().to("rpu")
         causal_lm._rpu_lm_head_w_keepalive = lm_w
         causal_lm._rpu_lm_head_scale_keepalive = lm_scale
+        resource = getattr(causal_lm.model, "_rpu_decoder_retirement_state", None)
+        if resource is not None:
+            resource.keepalive = (resource.keepalive, lm_w, lm_scale)
         torch.ops.rpu.causal_decoder_set_lm_head(handle, lm_w, lm_scale)
         return
 
@@ -748,10 +1143,156 @@ def _push_lm_head_weight(causal_lm, handle: int) -> None:
     else:
         # Still on CPU — need explicit col-partition swizzle before moving.
         lm_w = transform_linear_weight(
-            lm_w.to(torch.float16).contiguous(), partition=1
+            lm_w.to(torch.float16).contiguous(), partition=1,
+            **({"num_cores": lm_head_tp} if topology is not None else {}),
         ).to("rpu")
     causal_lm._rpu_lm_head_w_keepalive = lm_w
+    resource = getattr(causal_lm.model, "_rpu_decoder_retirement_state", None)
+    if resource is not None:
+        resource.keepalive = (resource.keepalive, lm_w)
     torch.ops.rpu.causal_decoder_set_lm_head(handle, lm_w)
+
+
+def _bind_fp16_lm_head_accumulation(causal_lm) -> None:
+    """Keep the eager HF head while binding the model's cold Linear policy."""
+    from types import MethodType
+    from rpu_backend.runtime.weights import _check_linear_shapes
+
+    head = causal_lm.lm_head
+    partition = getattr(head, "_rpu_linear_partition", None)
+    num_cores = getattr(head, "_rpu_linear_num_cores", None)
+    if partition not in (0, 1) or num_cores not in (4, 6, 8):
+        raise RPUBackendError("Qwen3 lm_head requires its recorded swizzle layout")
+    acc32 = bool(causal_lm._rpu_execution.get("prefill", {}).get("linear_acc32", False))
+    original_forward = head.forward
+
+    def forward(self, x):
+        if x.device.type != "rpu":
+            return original_forward(x)
+        if (getattr(self, "_rpu_linear_partition", None),
+                getattr(self, "_rpu_linear_num_cores", None)) != (partition, num_cores):
+            raise RuntimeError("Qwen3 lm_head swizzle layout changed after installation")
+        _check_linear_shapes(x, self.weight, self.bias)
+        y = torch.ops.rpu.linear_with_accumulation(
+            x.reshape(-1, x.shape[-1]).contiguous(), self.weight, self.bias,
+            partition, num_cores, acc32)
+        return y.reshape(*x.shape[:-1], y.shape[-1])
+
+    head.forward = MethodType(forward, head)
+
+
+def _apply_plain_lm_head_causal_append_for_rpu(causal_lm) -> None:
+    """Add segmented continuation to the ordinary FP16 HF outer forward.
+
+    The shared decoder owns native execution and returns hidden states; the
+    original HF ``Qwen3ForCausalLM.forward`` must remain responsible for the
+    FP16 lm_head and output object.  Only the unpadded, auto-chunk continuation
+    route is intercepted.  Every other request delegates byte-for-byte through
+    the pre-install outer method.
+    """
+    from types import MethodType, SimpleNamespace
+    from rpu_backend.api.cache import RPUCache
+
+    original_forward = causal_lm.forward
+
+    def segmented_forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        labels=None,
+        use_cache=None,
+        cache_position=None,
+        logits_to_keep=0,
+        **kwargs,
+    ):
+        source = inputs_embeds if inputs_embeds is not None else input_ids
+        if (
+            isinstance(past_key_values, RPUCache)
+            and isinstance(source, torch.Tensor)
+            and source.ndim >= 2
+            and int(source.shape[0]) == 1
+            and int(source.shape[1]) > 1
+        ):
+            seq_len = int(source.shape[1])
+            spans = continuation_segments(
+                past_key_values.position,
+                seq_len,
+                getattr(self.model, "_rpu_execution", {}).get("prefill", {}),
+                capacity=past_key_values.max_seq_len,
+            )
+            if spans is not None:
+                if (input_ids is None) == (inputs_embeds is None):
+                    raise AssertionError(
+                        "RPU continuation requires exactly one of input_ids or inputs_embeds"
+                    )
+                if labels is not None:
+                    raise NotImplementedError(
+                        "RPU segmented continuation does not support labels/loss"
+                    )
+                if use_cache is False or kwargs.get("return_dict") is False:
+                    raise NotImplementedError(
+                        "RPU continuation requires use_cache=True and return_dict=True"
+                    )
+                attention_mask, position_ids, cache_position = (
+                    _canonicalize_plain_text_controls(
+                        seq_len,
+                        past_key_values,
+                        attention_mask,
+                        position_ids,
+                        cache_position,
+                        batch_size=1,
+                    )
+                )
+                handle = self.model._rpu_decoder_handle
+                for offset, count in spans:
+                    if count > 1:
+                        prospective = SimpleNamespace(
+                            position=int(past_key_values.position) + offset,
+                            max_seq_len=past_key_values.max_seq_len,
+                        )
+                        _text_prefill_execution_plan(
+                            self.model, handle, prospective, count
+                        )
+                _text_decode_execution_plan(self.model, handle)
+                arguments = dict(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    inputs_embeds=inputs_embeds,
+                    labels=labels,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    logits_to_keep=logits_to_keep,
+                    **kwargs,
+                )
+                return run_continuation_segments(
+                    lambda **call: original_forward(**call),
+                    past_key_values,
+                    self.model,
+                    spans,
+                    arguments,
+                )
+
+        return original_forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            labels=labels,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            logits_to_keep=logits_to_keep,
+            **kwargs,
+        )
+
+    segmented_forward = execution_serialized(segmented_forward)
+    segmented_forward.__rpu_segmented_append__ = True
+    causal_lm.forward = MethodType(segmented_forward, causal_lm)
 
 # patch-reason: (e) CausalLM lm-head fuse — §3a (e) module-method-set
 def _apply_fused_lm_head_for_rpu(causal_lm) -> int:
@@ -797,17 +1338,25 @@ def _apply_fused_lm_head_for_rpu(causal_lm) -> int:
     #    reuse that handle so W8A16 scale_lists are preserved. Otherwise install
     #    it here, deriving W8A16 scale_lists from the already-loaded modules.
     if not hasattr(causal_lm.model, "_rpu_decoder_handle"):
+        topology = decoder_topology_for_model(causal_lm)
         _install_causal_decoder_forward(
             causal_lm.model,
             arch="qwen3",
             scale_lists=_w8a16_scale_lists_for_qwen3_inner(causal_lm.model),
             chunk_envelope_for=lookup_causal_decoder,
+            **({"topology": topology,
+                "execution_config": getattr(causal_lm, "_rpu_execution", None)}
+               if topology is not None else {}),
         )
     handle = causal_lm.model._rpu_decoder_handle  # single authoritative handle
+    topology = getattr(causal_lm.model, "_rpu_decoder_topology", None)
 
     # 2. Push lm_head weight to the C++ side (state tracking for future
     #    C++ post_graph; currently used only as API symmetry).
     _push_lm_head_weight(causal_lm, handle)
+    # The shared installer observed the topology before lm_head was enabled.
+    # fused_forward calls the runner directly and needs the final descriptor.
+    _text_decode_execution_plan(causal_lm.model, handle)
 
     from contextlib import nullcontext as _nullcontext
     import rpu_backend as _rb
@@ -817,6 +1366,7 @@ def _apply_fused_lm_head_for_rpu(causal_lm) -> int:
     # 3. Install fused_forward on the Qwen3ForCausalLM.
     #    Signature explicitly lists labels / logits_to_keep / output_*
     #    / return_dict so HF generate() can inspect.signature it correctly.
+    @execution_serialized
     def fused_forward(
         self,
         input_ids=None,
@@ -863,8 +1413,10 @@ def _apply_fused_lm_head_for_rpu(causal_lm) -> int:
         h = self.model._rpu_decoder_handle
 
         prefill_plan = None
+        decode_plan_result = None
         batched_prefill = _is_batched_prefill(input_ids, inputs_embeds)
         if isinstance(past_key_values, _RPUCache_for_sig):
+            validate_decoder_cache_topology(topology, past_key_values)
             if inputs_embeds is not None:
                 _batch, _seq_len = (int(inputs_embeds.shape[0]),
                                     int(inputs_embeds.shape[1]))
@@ -872,6 +1424,7 @@ def _apply_fused_lm_head_for_rpu(causal_lm) -> int:
                 _batch, _seq_len = int(input_ids.shape[0]), int(input_ids.shape[1])
             else:
                 _batch, _seq_len = 1, 0
+            validate_decoder_cache_topology(topology, past_key_values, batch_size=_batch)
             if not batched_prefill:
                 attention_mask, position_ids, cache_position = (
                     _canonicalize_plain_text_controls(
@@ -893,6 +1446,38 @@ def _apply_fused_lm_head_for_rpu(causal_lm) -> int:
                 if (attention_mask is not None
                         and attention_mask.device.type != "rpu"):
                     attention_mask = attention_mask.to("rpu")
+            if _batch == 1 and _seq_len > 1:
+                spans = continuation_segments(
+                    past_key_values.position, _seq_len,
+                    getattr(self.model, "_rpu_execution", {}).get("prefill", {}),
+                    capacity=past_key_values.max_seq_len,
+                )
+                if spans is not None:
+                    if (input_ids is None) == (inputs_embeds is None):
+                        raise AssertionError("must provide exactly one of input_ids or inputs_embeds")
+                    if use_cache is False or return_dict is False:
+                        raise NotImplementedError("RPU continuation requires use_cache=True and return_dict=True")
+                    if self.lm_head.weight.dtype == torch.int8 and logits_to_keep != 1:
+                        raise NotImplementedError("int8 continuation requires logits_to_keep=1")
+                    from types import SimpleNamespace
+                    for offset, count in spans:
+                        if count > 1:
+                            prospective = SimpleNamespace(
+                                position=int(past_key_values.position) + offset,
+                                max_seq_len=past_key_values.max_seq_len)
+                            _text_prefill_execution_plan(self.model, h, prospective, count)
+                    _text_decode_execution_plan(self.model, h)
+                    return run_continuation_segments(
+                        lambda **call: fused_forward(self, **call),
+                        past_key_values, self.model, spans,
+                        dict(input_ids=input_ids, inputs_embeds=inputs_embeds,
+                             past_key_values=past_key_values, attention_mask=attention_mask,
+                             position_ids=position_ids, cache_position=cache_position,
+                             logits_to_keep=logits_to_keep, use_cache=use_cache,
+                             output_attentions=output_attentions,
+                             output_hidden_states=output_hidden_states,
+                             return_dict=return_dict, **kwargs),
+                    )
             _execution_len = _seq_len
             _planned_chunk_size = 0
             if (_seq_len > 1
@@ -904,12 +1489,20 @@ def _apply_fused_lm_head_for_rpu(causal_lm) -> int:
                     past_key_values,
                     _seq_len,
                 )
-                _execution_len, _planned_chunk_size = prefill_plan
+                _execution_len, _planned_chunk_size = prefill_plan[:2]
+            elif _seq_len == 1:
+                decode_plan_result = _text_decode_execution_plan(self.model, h)
 
             def _capture(batch, seq_len, plan=None):
                 execution_len, planned_chunk_size = (
                     (int(plan[0]), int(plan[1]))
                     if plan is not None else (int(seq_len), 0)
+                )
+                plan_key = (
+                    plan[2].graph_key_words()
+                    if plan is not None
+                    else (decode_plan_result.graph_key_words()
+                          if int(seq_len) == 1 else ())
                 )
                 return self.model._rpu_decoder_graph_cache.capture(
                     _GraphSignature(
@@ -923,6 +1516,10 @@ def _apply_fused_lm_head_for_rpu(causal_lm) -> int:
                         dyn_dims=[
                             self.model._rpu_decoder_num_layers,
                             self.model._rpu_decoder_deepstack_hash,
+                            *(topology.identity() if topology is not None else ()),
+                            int(getattr(
+                                self.model, "_rpu_execution_generation", 0
+                            )),
                             int(self.config.vocab_size),
                             chunk_policy_key(
                                 self.model._rpu_decoder_handle
@@ -932,6 +1529,7 @@ def _apply_fused_lm_head_for_rpu(causal_lm) -> int:
                                 execution_len,
                                 past_key_values.position,
                             ),
+                            *plan_key,
                         ],
                         dtypes=[torch.float16],
                     )
@@ -986,7 +1584,7 @@ def _apply_fused_lm_head_for_rpu(causal_lm) -> int:
                     **_runner_kwargs,
                 )
 
-        # Decode-only fused lm_head:
+        # Phase 2.5 decode-only fused lm_head:
         #   decode (seq_len=1) + fuse_lm_head enabled → C++ fuses lm_head GEMM
         #   in main graph last layer, returns [1, 1, vocab_size] logits directly.
         #   prefill (seq_len>1) → C++ returns [1, seq, hidden_size] hidden states,
@@ -1009,6 +1607,9 @@ def _apply_fused_lm_head_for_rpu(causal_lm) -> int:
                         "linear path, which is intentionally out of scope."
                     )
                 logits = _int8_lm_head_prefill_logits(self, raw[:, -1:, :])
+            elif self.lm_head.weight.dtype == torch.uint8:
+                selected = raw if logits_to_keep == 0 else raw[:, -logits_to_keep:, :]
+                logits = _int8_lm_head_prefill_logits(self, selected)
             elif logits_to_keep == 0:
                 # Full-sequence logits (HF default semantics for logits_to_keep=0)
                 logits = self.lm_head(raw)
@@ -1029,6 +1630,7 @@ def _apply_fused_lm_head_for_rpu(causal_lm) -> int:
         )
 
     import types
+    fused_forward = execution_serialized(fused_forward)
     causal_lm.forward = types.MethodType(fused_forward, causal_lm)
 
     _LOG.info("Patched Qwen3ForCausalLM (instance) with fused lm_head, "
@@ -1038,6 +1640,7 @@ def _apply_fused_lm_head_for_rpu(causal_lm) -> int:
     return handle
 
 
+@execution_serialized
 def _run_fused_lm_head_decode_top1(
     causal_lm,
     *,
@@ -1089,7 +1692,9 @@ def _run_fused_lm_head_decode_top1(
         )
 
     h = causal_lm.model._rpu_decoder_handle
+    topology = getattr(causal_lm.model, "_rpu_decoder_topology", None)
     if isinstance(past_key_values, _RPUCache_for_sig):
+        validate_decoder_cache_topology(topology, past_key_values)
         attention_mask, position_ids, cache_position = (
             _canonicalize_plain_text_controls(
                 seq_len,
@@ -1100,16 +1705,22 @@ def _run_fused_lm_head_decode_top1(
                 batch_size=batch,
             )
         )
+        decode_plan_result = _text_decode_execution_plan(causal_lm.model, h)
         sig = _rb.graph.GraphSignature(
             op_id="rpu_causal_decoder_lm_head_top1",
             shapes=[batch, seq_len, causal_lm.model._rpu_decoder_hidden_size],
             dyn_dims=[
                 causal_lm.model._rpu_decoder_num_layers,
                 causal_lm.model._rpu_decoder_deepstack_hash,
+                *(topology.identity() if topology is not None else ()),
+                int(getattr(
+                    causal_lm.model, "_rpu_execution_generation", 0
+                )),
                 int(causal_lm.config.vocab_size),
-                # Same decoder forward, same SPM-layout hazard.
+                # MR-D: same decoder forward, same SPM-layout hazard.
                 chunk_policy_key(causal_lm.model._rpu_decoder_handle),
                 prefill_position_key(seq_len, past_key_values.position),
+                *decode_plan_result.graph_key_words(),
             ],
             dtypes=[torch.float16],
         )

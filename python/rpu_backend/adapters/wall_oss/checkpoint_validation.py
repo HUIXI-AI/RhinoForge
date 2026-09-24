@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from rpu_backend.quant.convert_wall_oss import WALL_OSS_QUANT_SUFFIXES
+
+
 _QUANTIZATION_CONFIG_KEYS = frozenset(
     {
         "quant_config",

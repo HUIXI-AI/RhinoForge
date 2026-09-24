@@ -30,9 +30,10 @@ def require_numeric_blocked_opt_in() -> None:
                 f"{S2_SDPA_BF16_ENV} accepts only literal '0' or '1'."
             )
         raise UnsupportedModelError(
-            f"{S2_SDPA_BF16_ENV}=1 is unavailable with the installed "
+            f"{S2_SDPA_BF16_ENV}=1 is unavailable with the current latest "
             "RPU op-library: its BF16 flash-attention kernel was removed. "
-            "Leave the variable unset for controlled FP16-SDPA evaluation."
+            "Do not side-load a retired operator library; leave the variable "
+            "unset for the controlled FP16-SDPA evaluation."
         )
 
 

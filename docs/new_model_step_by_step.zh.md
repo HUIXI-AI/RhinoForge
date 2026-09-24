@@ -125,7 +125,7 @@ TOML schema 已覆盖目标时复用 `examples/causal_lm.py`。只为精确配�
 Example 必须在不导入 native backend 时通过配置校验：
 
 ```bash
-python examples/causal_lm.py --config examples/configs/<profile>.toml --check-config
+python examples/causal_lm.py --config examples/configs/<model>/<checkpoint>/<precision>.toml --check-config
 ```
 
 在[模型资产](model_assets.zh.md)更新来源、revision、destination 和 hash；只有入口表
@@ -160,5 +160,5 @@ python -m pytest \
 resource plan 或硬语义失败会阻塞配置。一致性或任务证据不完整时保持 Experimental 或
 Source-only；不能仅靠缩小范围晋级，除非这个更窄配置通过全部适用门禁。
 
-**Done：** 只有所有门禁通过后，才可把精确配置加入
-[模型支持](model_support.zh.md)可运行表。
+**Done：** 只有所有适用门禁通过后，才能为精确配置声明相应运行范围；
+[示例](model_support.zh.md)模板本身不构成认证。

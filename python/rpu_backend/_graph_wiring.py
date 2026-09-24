@@ -8,8 +8,9 @@ from typing import Any
 def configure_graph_runtime(_cpp_ext: Any) -> None:
     """Install optional FakeTensor integration for a loaded backend.
 
-    The unsupported Dynamo frontend is not wired onto the package shim; its
-    module remains directly importable for compatibility.
+    Returned a dict of `compile` / `dynamo_backend` exports until 2026-08-08.
+    The Dynamo frontend is FROZEN (graph/dynamo_backend.py docstring), so it is
+    no longer wired onto the package shim; the module stays importable directly.
     Importing `fake_dispatch` is the whole remaining job — it registers the
     FakeTensor rules as an import side effect.
     """

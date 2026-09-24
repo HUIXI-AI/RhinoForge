@@ -1,0 +1,34 @@
+# Text-backbone quantization with FP16 Vision; controlled image evaluation.
+
+[example]
+profile_id = "qwen3_5-2b.w8a16.vision-controlled"
+registry_alias = "qwen3_5-2b-w8a16"
+target = "qwen3_5_vision"
+dtype = "w8a16"
+architecture = "Qwen3_5ForConditionalGeneration"
+
+[example.opt_in]
+QWEN3_5_QUANT_ALLOW_UNCERTIFIED = "1"
+QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED = "1"
+
+[input]
+images = ["assets/example.ppm"]
+prompt = "Describe the image."
+decode_steps = 32
+stop_on_eos = false
+
+[run]
+warmup = 1
+runs = 3
+hwperf = false
+profile = false
+seed = 0
+
+[rpu_execution.model]
+num_cores = 8
+
+[rpu_execution.prefill]
+chunk_size = "auto"
+
+[rpu_execution.vision]
+chunk_size = "auto"

@@ -6,15 +6,16 @@
 // on-device, so the noisy action `x` never leaves the RPU between steps. The Python
 // adapter keeps the 10-step Euler loop (1 BUILD + 9 REPLAY) and the cheap x += dt·v.
 //
-// Pre-hook: x_t -> (W_comb GEMM + B_step + SiLU + w3 GEMM) -> emb_stage (DDR), which
-//           layer 0's emit_layer_input_dma then reads. The preprocessor is folded
-//           by linearity.
+// Pre-hook: x_t -> (W_comb GEMM + B_step + SiLU + w3 GEMM) -> residual1 (SPM), which
+//           layer 0 consumes directly. (preprocessor folded by linearity;
+//           see the buffer and execution contracts below.)
 // Post-hook: proj_back on the final-normed residual1 -> v_t_buf (DDR).
 //
-// Gated by RPU_WALL_OSS_FUSED_DENOISE on the Python side.
+// Gated by RPU_WALL_OSS_FUSED_DENOISE (Python side). See the plan for the codex review
+// resolutions folded into the design (base forward() reuse, buffer phases, chunk pin).
 #pragma once
 
-#include "rpu_qwen3_model.h"     // v3::CausalDecoderModel
+#include "rpu_qwen3_model.h"     // v3::CausalDecoderModel (extracted in Task 3)
 #include "rpu_kernel_decls.h"
 #include <ATen/ATen.h>
 #include <c10/util/Optional.h>
@@ -29,11 +30,18 @@ public:
     WallOssActionStepModel();
     ~WallOssActionStepModel() override;
 
-    // Bind the action preprocessor/proj_back weights (single-core col-swizzled, fp16)
+    std::vector<int64_t> resolve_action_stage_domain(
+        int64_t horizon, int64_t prefix_len, int64_t mask_kv_len,
+        int64_t requested_chunk_size, bool loop_mode, int64_t num_steps,
+        bool b_step_is_bias, bool have_te);
+    void stage_execution_chunk_size(uint64_t token, int64_t chunk_size);
+
+    // Bind the action preprocessor/proj_back weights (fp16; w3 is TP8 col-swizzled,
+    // the remaining projections are single-core col-swizzled)
     // plus the padded dims. Must be called AFTER CausalDecoderModel::set_weights.
     void set_action_weights(
         const at::Tensor& w_comb,      // [hidden, k_comb_pad]   single-core col-swizzled fp16
-        const at::Tensor& w3,          // [hidden, hidden]       single-core col-swizzled fp16
+        const at::Tensor& w3,          // [hidden, hidden]       TP8 col-swizzled fp16
         const at::Tensor& proj_back,   // [action_dim_pad, hidden] single-core col-swizzled fp16
         const at::Tensor& w2_t,        // [hidden, hidden] single-core col-swizzled fp16 — the
                                        // preprocessor time-projection (w2[:,AH:]); enables the
@@ -62,7 +70,8 @@ public:
         double dt,                         // Euler step (constant across steps; baked at BUILD)
         int64_t prefix_len,
         const std::optional<at::Tensor>& rope_cos_il = std::nullopt,  // partial_mrope interleaved cos
-        const std::optional<at::Tensor>& rope_sin_il = std::nullopt); // partial_mrope interleaved sin
+        const std::optional<at::Tensor>& rope_sin_il = std::nullopt,  // partial_mrope interleaved sin
+        at::IntArrayRef planned_stage_descriptor = {});
 
     // N-step in-graph unroll: ONE graph emits num_steps × [pre → layers → post].
     // x persists in x_t_spm across iterations; bias read at baked per-iteration
@@ -82,12 +91,28 @@ public:
         at::Tensor& v_traj,                // [num_steps,H,action_dim_pad] fp16 RPU (per-step v_t)
         double dt, int64_t prefix_len, int64_t num_steps,
         const std::optional<at::Tensor>& rope_cos_il = std::nullopt,  // partial_mrope interleaved cos
-        const std::optional<at::Tensor>& rope_sin_il = std::nullopt); // partial_mrope interleaved sin
+        const std::optional<at::Tensor>& rope_sin_il = std::nullopt,  // partial_mrope interleaved sin
+        at::IntArrayRef planned_stage_descriptor = {});
 
 protected:
+    KvCostLayoutScope capture_kvinsert_cost_layout_scope() override {
+        return capture_kvinsert_cost_layout_fields(
+            planning_rope_mode_, planning_graph_lifecycle_,
+            planning_mode_, planned_action_route_profile_valid_,
+            planned_loop_mode_, planned_num_steps_,
+            planned_b_step_is_bias_, planned_have_te_);
+    }
+
     std::vector<BufferDecl> declare_buffers(const LayoutContext& ctx) override;
     ModelStaticConfig       static_config() override;
     ModelDynamicConfig      dynamic_config(const ChunkPlan& plan) override;
+    FmbPhysicalExecutionManifest physical_manifest_for_candidate(
+        const FmbThreeStageChunkPlan& plan, const LayoutContext& layout,
+        int64_t physical_len, int64_t logical_len,
+        int64_t position) const override;
+    FmbPhysicalManifestForwardCapability
+    physical_manifest_forward_capability(
+        const FmbPhysicalExecutionManifest& manifest) const override;
     // build_layer_subgraph / forward: INHERITED from CausalDecoderModel.
 
     // The two action widths size the appended Temp "x_t_spm" / "v_t_core0_spm",
@@ -102,6 +127,23 @@ protected:
 private:
     void emit_pre_layers_body();
     void emit_post_layers_body();
+    void consume_action_route(
+        FmbRouteFamily family, int64_t site_id, int64_t selector,
+        std::vector<int64_t> arguments = {});
+    void validate_planned_action_route_profile(
+        at::IntArrayRef descriptor, bool loop_mode, int64_t num_steps,
+        bool b_step_is_bias, bool have_te);
+
+    std::vector<int64_t> kvinsert_cost_weight_identity() const override {
+        auto identity = causal_kvinsert_cost_weight_identity();
+        if (identity.empty()) return {};
+        for (const auto* tensor : {
+                &w_comb_, &w3_, &proj_back_, &w2_t_,
+                &w2_a_}) {
+            append_kvinsert_cost_tensor_identity(identity, *tensor);
+        }
+        return identity;
+    }
 
     at::Tensor w_comb_, w3_, proj_back_, w2_t_, w2_a_;
     int64_t action_dim_ = 0, action_dim_pad_ = 0, k_comb_pad_ = 0, chunk_size_ = 0;
@@ -114,15 +156,24 @@ private:
     int  b_step_mode_ = -1;           // -1 unset / 0 add / 1 bias; asserted stable across steps
     int  have_te_ = -1;               // -1 unset / 0 no te / 1 on-device ct; baked at BUILD, stable
     at::Tensor emb_stage_;            // stable staging DDR (allocated in set_action_weights)
-    // Keepalive across the synchronous forward — one per mutable base above, so
-    // the deferred graph can never dereference a freed VA.
+    // keepalive across the synchronous forward — one per mutable base above, so
+    // the deferred graph can never dereference a freed VA (pitfalls.md C-1).
     at::Tensor x_t_ref_, b_step_ref_, te_ref_, v_t_ref_, x_out_ref_;
-    // In-graph denoise loop. loop_mode_ gates the trajectory DMAs and the
+    // EXT-unroll (denoise loop). loop_mode_ gates the trajectory DMAs + the
     // body_iter==0 x0-load skip; false (single-step) keeps emit_*_body bit-identical.
     bool     loop_mode_   = false;
     int64_t  num_steps_   = 1;        // body_iterations when loop_mode_
     uint64_t x_traj_dst_base_ = 0, v_traj_dst_base_ = 0;          // mutable trajectory dst bases
     at::Tensor b_all_ref_, te_all_ref_, x_traj_ref_, v_traj_ref_; // keepalive across the forward
+
+    // The planner resolves before forward binds request tensors.  Keep that
+    // branch profile separate from the live graph state above: mutating
+    // loop_mode_/num_steps_ here would hide the forward's rebuild transition.
+    bool planned_action_route_profile_valid_ = false;
+    bool planned_loop_mode_ = false;
+    int64_t planned_num_steps_ = 1;
+    bool planned_b_step_is_bias_ = false;
+    bool planned_have_te_ = false;
 };
 
 }  // namespace v3

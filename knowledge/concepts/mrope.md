@@ -3,9 +3,9 @@
 Multimodal rotary position encoding assigns each token three logical
 coordinates, conventionally temporal, height, and width, instead of one scalar
 position. RhinoForge uses this contract in Qwen3-VL and in model-specific
-profiles that reuse its multimodal text path. Profile support still comes from
-[Model support](../../docs/model_support.md), not from the presence of this
-helper.
+profiles that reuse its multimodal text path. Each profile retains its runtime
+admission checks; the presence of this helper does not widen them. See
+[Examples](../../docs/model_support.md) for entry points and execution scope.
 
 ## Public boundary
 
@@ -28,6 +28,16 @@ helper.
   on every result-changing position property or update the live position data
   through its reviewed mutable-data contract.
   [GraphCache capture](graphcache-capture.md)
+- A stable source address does not prove unchanged position or partial cos/sin
+  contents. Sources without a tensor version counter, including inference
+  tensors, refresh the native keepalive before every forward. Version-tracked
+  sources may reuse unchanged contents.
+  [Native decoder](../../src/fused/rpu_qwen3_model.h)
+
+Automatic text-position slots contain logical P rows and are reused only when
+P equals the execution length E. Padded prefill keeps its E-row position tensor
+in the general stable slots, including valid repeated-last-position padding.
+[Qwen3-VL adapter](../../python/rpu_backend/adapters/qwen3_vl/__init__.py)
 
 When all three coordinates for a token are equal, each rotary section uses the
 same logical position. This is useful for checking text-only suffixes, but it

@@ -10,6 +10,7 @@
 #include <string.h> // for memcpy
 #include <string>   // for string
 #include <vector>   // for vector
+#include <utility>
 
 using namespace ::rhino_lkn;
 using namespace at;
@@ -64,7 +65,6 @@ static at::Tensor binary_op_impl(
   // dtype-ORDER-dependent and silently wrong: with fp16 `a` and fp32 `b` this
   // fell through to step 3, which does `b.to(a.scalar_type())` — downcasting
   // the fp32 operand and returning fp16, where PyTorch promotion says fp32.
-  // This makes mixed fp16/fp32 results independent of operand order.
   // at::result_type keeps the fast path for Half op Half and for
   // step 2's 0-dim/scalar operands, which do not promote. In-place keeps a's
   // dtype by definition (`a *= b` stays fp16), so it still gates on `a`.
@@ -78,7 +78,7 @@ static at::Tensor binary_op_impl(
   // bool mask on the left. `a` must itself be fp16 for the device path, which
   // was the original gate; the promoted type is the extra condition the
   // ordering fix added, not a replacement for it.
-  // The promoted dtype and the left operand dtype are both load-bearing gates.
+  // Gate: tests/ops/test_eltwise_dtype_promotion.py.
   const auto gate_dtype = inplace ? a.scalar_type() : at::result_type(a, b);
   if (gate_dtype != at::kHalf || a.scalar_type() != at::kHalf) {
     auto a_cpu = rpu_to_cpu_zerocopy(a);
@@ -359,9 +359,8 @@ static at::Tensor binary_op_impl(
         small_2d = b_contig.view({1, C});
         large_2d = a_contig.view({N_a, C});
         use_1xC_kernel = true;
-        // `scale_b` binds alpha to the kernel's SECOND
-        // operand, so swapping is only valid when alpha is 1. a + 2.5*b is not
-        // b + 2.5*a.
+        // scale_b applies alpha to the second operand. Swapping operands is valid
+        // only when alpha == 1: a + alpha*b generally differs from b + alpha*a.
         is_bopa = !(is_commutative && alpha_is_one);  // a op b = large op small
         break;
 
@@ -377,9 +376,8 @@ static at::Tensor binary_op_impl(
         small_2d = b_contig.view({N_b, 1});
         large_2d = a_contig.view({N_a, C});
         use_1xC_kernel = false;
-        // `scale_b` binds alpha to the kernel's SECOND
-        // operand, so swapping is only valid when alpha is 1. a + 2.5*b is not
-        // b + 2.5*a.
+        // scale_b applies alpha to the second operand. Swapping operands is valid
+        // only when alpha == 1: a + alpha*b generally differs from b + alpha*a.
         is_bopa = !(is_commutative && alpha_is_one);  // a op b = large op small
         break;
 
@@ -531,11 +529,8 @@ at::Tensor& binary_op_inplace_wrapper(
     const at::Tensor &other,
     const c10::Scalar &alpha,
     ValuOpType op_type) {
-  // `is_commutative` must follow the operation; otherwise `is_bopa =
-  // !is_commutative` was always false and the two "small operand second"
-  // patterns handed the kernel its operands backwards — `a.sub_(b)` computed
-  // b-a on the launchable fast path.
-  // Out-of-place was already correct; only in-place was wrong.
+  // Preserve operand order for noncommutative in-place operations. The small-
+  // operand broadcast patterns need is_bopa when their inputs are swapped.
   const bool is_commutative =
       (op_type == ValuOpType::ADD || op_type == ValuOpType::MUL);
   binary_op_impl(self, other, alpha, op_type, is_commutative, &self);
@@ -866,25 +861,18 @@ void rpu_launch_eltwise_binary_scalar_kernel(const at::Tensor &input_a,
   rpu_ddr_flush(out);
 }
 
-// Operator-asset constants
 #define VLM_ENTRIES 384
 #define WARP_VECTOR_SIZE 256
 #define THD_VECTOR_SIZE 16
 #define WARP_SIZE 16
 
-// ===================== DDR batch broadcast geometry =====================
+// DDR batch-broadcast geometry uses reg10/11 in 256-byte units, multiplied by
+// C for the NxC operands. Supply rows_per_block * sizeof(FP16) / 256 exactly:
+// multiple blocks require rows_per_block to be a multiple of 128. Truncating
+// this stride would repeat or misplace rows after the first block.
 //
-// Both DDR batch-broadcast wrappers split N across blocks. Their public ABI
-// encodes the row stride in 256-byte units, so rows_per_block must be a multiple
-// of 128 for FP16 whenever more than one block is used. Otherwise the encoded
-// stride truncates and later blocks address the wrong rows. The launchable
-// predicate below enforces this exactness before selecting the fast path.
-//
-// The kernels also step C in whole v16 vectors (c_loopcnt = C/16 or C/256), so
-// a C that is not v16-aligned drops its tail columns. C > 1024 remains supported
-// and is therefore not part of the guard.
-//
-// The SPM variants use a byte stride and do not have this restriction.
+// C must be v16-aligned because the payload advances whole vectors. The SPM
+// variants use an ordinary byte stride and do not share the DDR >>8 constraint.
 struct EltwiseDdrBatchGeom {
   bool C256;
   size_t c_loopcnt;
@@ -899,23 +887,10 @@ struct EltwiseDdrBatchGeom {
   uint16_t thread_params[WARP_SIZE];    // v16 kernels only (SCM regs 4096+)
 };
 
-// Both geometries divide by a VLM budget that SHRINKS as C grows, because VLM
-// is a fixed 384 entries and the kernel reserves a share of them per v16 column
-// vector. The budget reaches zero at a finite C — 3072 for 1xC_NxC, 6144 for
-// Nx1_NxC — and CeilDiv uses signed int64 arithmetic,
-// so dividing anyway went one of two ways, and BOTH ended in the same place:
-//   C exactly at the zero point : blk_cnt came back 0.
-//   C beyond it                 : divisor NEGATIVE => blk_cnt negative, which
-//                                 casts to a huge size_t.
-// Either way rows_per_block truncated to 0, stride_bytes was 0, and
-// `0 % 256 == 0` made finish_geom report the stride EXACT: the predicate whose
-// only job is to say "demote this" CERTIFIED a geometry that addresses nothing,
-// and the caller got back its untouched `at::empty` output.
-// So mark the geometry degenerate instead of dividing. `degenerate` is what the
-// _launchable predicates below reject; a rejected pattern is demoted to the
-// sameshape kernel, which is correct for any shape. The arithmetic itself is
-// pre-existing; the predicates are the contract that says "false means demote",
-// so this is where it is enforced.
+// The available VLM row budget decreases with C and can become nonpositive.
+// Check that budget before CeilDiv: zero or negative divisors cannot produce a
+// valid block count or stride. Mark such geometry degenerate and fall back to
+// the same-shape kernel rather than submitting an empty or overflowed grid.
 static void finish_geom(EltwiseDdrBatchGeom &g) {
   if (g.rows_per_block <= 0) {  // nothing to address per block
     g.degenerate = true;
@@ -1548,6 +1523,59 @@ at::Tensor rpu_pow_scalar_tensor(const c10::Scalar &self, const at::Tensor &expo
 
 #define NUM_CORES_BINARY 8
 
+void rpu_launch_pi05_gated_residual_spm_kernel(
+    uint32_t input_spm, uint32_t residual_spm, uint32_t gate_spm,
+    uint32_t output_spm, int64_t rows, int cores) {
+  TORCH_CHECK(rows >= 1 && rows <= 64 && (cores == 1 || cores == 8),
+              "Pi0.5 gated residual requires H1024, M1..64, cores1/8");
+  TORCH_CHECK(SPM_ALLOC.is_initialized(), "Pi0.5 gated residual requires live SPM");
+  constexpr uint64_t row_bytes = 2048;
+  const uint64_t bytes = rows * row_bytes, base = SPM_ALLOC.addr(0, 0);
+  auto checked = [base](uint32_t address, uint64_t size) {
+    return address % 256 == 0 && address >= base &&
+        uint64_t(address) - base + size <= SpmAllocator::SPM_USABLE;
+  };
+  TORCH_CHECK(checked(input_spm, bytes) && checked(residual_spm, bytes) &&
+                  checked(output_spm, bytes) && checked(gate_spm, row_bytes),
+              "Pi0.5 gated residual requires complete aligned absolute SPM operands");
+  auto disjoint = [](uint32_t a, uint64_t as, uint32_t b, uint64_t bs) {
+    return uint64_t(a) + as <= b || uint64_t(b) + bs <= a;
+  };
+  TORCH_CHECK((output_spm == input_spm || disjoint(output_spm, bytes, input_spm, bytes)) &&
+                  (output_spm == residual_spm || disjoint(output_spm, bytes, residual_spm, bytes)) &&
+                  disjoint(output_spm, bytes, gate_spm, row_bytes),
+              "Pi0.5 gated residual rejects partial output alias or gate overwrite");
+  // Balance <=16-row tiles: M50 uses 13/13/13/11 rows and four warps.
+  const int64_t blocks = CeilDiv(rows, int64_t(16));
+  const int64_t normal_rows = CeilDiv(rows, blocks);
+  const int64_t last_rows = rows - normal_rows * (blocks - 1);
+  auto* kernel = GET_KERNEL(KernelId::PI05_GATED_RESIDUAL_H1024);
+  TORCH_CHECK(kernel, "Pi0.5 gated-residual expansion kernel is unavailable");
+  kernel->reset_regs();
+  kernel->set_regs(0, uint16_t(normal_rows));
+  kernel->set_regs(2, uint16_t(last_rows));
+  for (auto entry : {std::pair<uint32_t, uint32_t>{4, gate_spm},
+                     {6, input_spm}, {8, output_spm}, {14, residual_spm}}) {
+    kernel->set_regs(entry.first, uint16_t(entry.second & 0xffff));
+    kernel->set_regs(entry.first + 1, uint16_t(entry.second >> 16));
+  }
+  kernel->set_regs(10, uint16_t(normal_rows * 2));
+  kernel->set_regs(11, uint16_t(0));
+  kernel->set_regs(12, uint16_t(4));  // 1024 / 256 elements per VLM entry
+  kernel->set_regs(13, uint16_t(64)); // matrix VLM, disjoint from residual[0,64)
+  for (int reg : {56, 57, 58}) kernel->set_regs(reg, uint16_t(0x3c00));
+  kernel->set_regs(59, uint16_t(0));
+  kernel->set_regs(60, uint16_t(0));
+  kernel->set_regs(61, uint16_t(1));
+  kernel->set_regs(62, uint16_t(0x0492)); // FP16 MUL, alpha=1, no custom op
+  kernel->set_regs(63, uint16_t(0));
+  auto* queue = GET_QUEUE(cores);
+  queue->set_broadcast_mode(true);
+  std::vector<uint8_t> core_ids;
+  for (int core = 0; core < cores; ++core) core_ids.push_back(core);
+  queue->enqueu_kernel(*kernel, {uint16_t(blocks), 1, 1}, core_ids);
+}
+
 // ==================== Sameshape SPM Kernel ====================
 // Generic sameshape SPM binary kernel
 // Supports: ADD, SUB, MUL, DIV, POW
@@ -1627,8 +1655,14 @@ void rpu_launch_eltwise_binary_scalar_spm_kernel(
     c10::Half scalar_val,              // Scalar value
     uint32_t output_spm_addr,          // SPM output address (core 0 base)
     int64_t num_elements,              // Total elements per core
-    ValuOpType op_type)
+    ValuOpType op_type,
+    int num_cores)
 {
+  TORCH_CHECK(num_cores >= 1 && num_cores <= NUM_CORES_BINARY,
+              "SPM binary: num_cores must be in [1,8], got ", num_cores);
+  std::vector<uint8_t> core_list;
+  for (int i = 0; i < num_cores; ++i)
+    core_list.push_back(static_cast<uint8_t>(i));
   size_t dwidth = sizeof(c10::Half);
   size_t n = num_elements;
   size_t normal_blk_n = 100 * 256;
@@ -1671,10 +1705,10 @@ void rpu_launch_eltwise_binary_scalar_spm_kernel(
   kernel->reset_regs();
   setup_regs(kernel);
 
-  auto* wq = GET_QUEUE(NUM_CORES_BINARY);
+  auto* wq = GET_QUEUE(num_cores);
   wq->set_broadcast_mode(true);
   wq->enqueu_kernel(*kernel, {(uint16_t)blk_cnt, (uint16_t)1, (uint16_t)1},
-                    {0, 1, 2, 3, 4, 5, 6, 7});
+                    core_list);
 }
 
 // ==================== Nx1_NxC SPM Kernel ====================
@@ -1699,11 +1733,7 @@ void rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel(
   std::vector<uint8_t> core_list;
   for (int i = 0; i < num_cores; ++i) core_list.push_back((uint8_t)i);
   // ---- V2 tile-based path (C not v16-aligned, or C>1024, or N>8192) ----
-  // Mirror the runtime dispatch (ConvertEltwiseBinary, Nx1_NxC branch): the v16/v256 "batch"
-  // path below packs C into VLM (max_possible_loopcnt = VLM_ENTRIES/(c/16+1)); for large C
-  // (e.g. GDN recurrent `state *= exp(g_last)` with c=Dk·Dv=16384) that goes to 0 → div-by-zero
-  // → garbage regs → corrupt output. The runtime routes such shapes to ConvertEltwiseBinary_
-  // Nx1_NxC_V2 (binary_Nx1_NxC_tileN/tileC), which tiles both N and C. reg0-1=n, reg2-3=c (u32);
+  // The V2 variants tile both N and C. reg0-1=n, reg2-3=c (u32);
   // reg10=last_blk_n, reg11=last_blk_c (u16); grid {blk_cnt_x=⌈c/256⌉, blk_cnt_y=⌈n/256⌉, 1}.
   if (c % 16 != 0 || c > 1024 || n > 8192) {
     const bool tile_c = (c >= 256);
@@ -1737,7 +1767,7 @@ void rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel(
     kernel->set_regs(7, (uint16_t)(b_spm_addr >> 16));
     kernel->set_regs(8, (uint16_t)(output_spm_addr & 0xFFFF));
     kernel->set_regs(9, (uint16_t)(output_spm_addr >> 16));
-    // eltwise common (regs 56-63) — imm3/imm4 = 1.0 per runtime COMMON_ELTWISE_BINARY_INIT.
+    // This tile variant requires fp16 1.0 in reg59/60.
     c10::Half scale_a = 1.0, scale_b = alpha_f, scale_r = 1.0, imm3 = 1.0, imm4 = 1.0;
     kernel->set_regs(56, scale_a.x);
     kernel->set_regs(57, scale_b.x);
@@ -1866,14 +1896,8 @@ void rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel(
 // When is_bopa=true:  computes B op A (large op small), used for non-commutative ops
 // Supports in-place: output_spm_addr can be same as b_spm_addr
 //
-// Dispatch contract: the v16/v256 "batch"
-// kernels below iterate C in whole v16 vectors (c_loopcnt = c/16 or c/256), so
-// they REQUIRE c%16==0 and SILENTLY NO-OP when c<16 (c_loopcnt truncates to 0,
-// leaving in-place output == input). For c not v16-aligned, or c>1024, or
-// n>8192, the runtime instead routes to the tile-based V2 kernel
-// (binary_1xC_NxC_tileN/tileC = ConvertEltwiseBinary_1xC_NxC_V2), which passes C
-// as a RAW element count and tiles only over N. GDN prep's dt_bias +/ neg_exp_A
-// EWa is [1,vg_c] op [L,vg_c] with vg_c=4 -> hits this V2 path.
+// The batch variants require c%16==0, c<=1024 and n<=8192.
+// Other shapes use the V2 tile-based kernel, whose C parameter is an element count.
 void rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
     uint32_t a_spm_addr,               // SPM input A address [1, C]
     uint32_t b_spm_addr,               // SPM input B address [N, C]
@@ -1882,13 +1906,19 @@ void rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
     int64_t c,                         // C dimension
     c10::Half alpha_f,
     ValuOpType op_type,
-    bool is_bopa)
+    bool is_bopa,
+    int num_cores)
 {
+  TORCH_CHECK(num_cores >= 1 && num_cores <= NUM_CORES_BINARY,
+              "SPM binary: num_cores must be in [1,8], got ", num_cores);
+  std::vector<uint8_t> core_list;
+  for (int i = 0; i < num_cores; ++i)
+    core_list.push_back(static_cast<uint8_t>(i));
   // ---- V2 tile-based path (C not v16-aligned, or C>1024, or N>8192) ----
-  // 1:1 port of ConvertEltwiseBinary_1xC_NxC_V2. Reg layout follows the runtime:
+  // Register layout:
   // reg0-1 = n (u32), reg2-3 = c (u32), reg10-11 = blk_stride (u32),
   // reg12 = normal_blk_n, reg13 = last_blk_n (tileN only), reg4-9 = a/b/out addrs,
-  // reg56-63 = eltwise_common_init. tile_c = c>=256 -> tileC (tile over C), else
+  // reg56-63 = operation parameters. tile_c = c>=256 -> tileC (tile over C), else
   // tileN (tile over N). a is always the [1,C] operand, b the [N,C] (is_bopa only
   // selects the op-order kernel variant, matching the v16/v256 branch below).
   if (c % 16 != 0 || c > 1024 || n > 8192) {
@@ -1926,11 +1956,7 @@ void rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
     kernel->set_regs(7, (uint16_t)(b_spm_addr >> 16));
     kernel->set_regs(8, (uint16_t)(output_spm_addr & 0xFFFF));
     kernel->set_regs(9, (uint16_t)(output_spm_addr >> 16));
-    // eltwise common (regs 56-63) — ported EXACTLY from the runtime COMMON_ELTWISE_BINARY_INIT
-    // (wrapper_util.h), NOT the other backend launchers' hand-rolled version. KEY DIFFERENCE:
-    // reg59/60 are imm3/imm4 = 1.0 in the runtime macro, whereas the Bx1xC/Nx1/v16 launchers
-    // set them to clip_max/clip_min = 0.0. The tile kernels read imm3/imm4 in their VALU config;
-    // feeding 0.0 makes the MUL produce garbage (decay tril-mul: ±691 instead of the masked diff).
+    // This tile variant requires fp16 1.0 in reg59/60.
     c10::Half scale_a = 1.0, scale_b = alpha_f, scale_r = 1.0, imm3 = 1.0, imm4 = 1.0;
     kernel->set_regs(56, scale_a.x);
     kernel->set_regs(57, scale_b.x);
@@ -1949,10 +1975,10 @@ void rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
     kernel->set_regs(65, (uint16_t)1);
     kernel->set_regs(66, (uint16_t)1);
 
-    auto* wq = GET_QUEUE(NUM_CORES_BINARY);
+    auto* wq = GET_QUEUE(num_cores);
     wq->set_broadcast_mode(true);
     wq->enqueu_kernel(*kernel, {(uint16_t)blk_cnt, (uint16_t)1, (uint16_t)1},
-                      {0, 1, 2, 3, 4, 5, 6, 7});
+                      core_list);
     return;
   }
 
@@ -2053,10 +2079,10 @@ void rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
   kernel->reset_regs();
   setup_regs(kernel);
 
-  auto* wq = GET_QUEUE(NUM_CORES_BINARY);
+  auto* wq = GET_QUEUE(num_cores);
   wq->set_broadcast_mode(true);
   wq->enqueu_kernel(*kernel, {(uint16_t)blk_cnt, (uint16_t)1, (uint16_t)1},
-                    {0, 1, 2, 3, 4, 5, 6, 7});
+                    core_list);
 }
 
 // ==================== Bx1xC_BxNxC middle-broadcast SPM Kernel ====================
@@ -2068,15 +2094,20 @@ void rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
 // chunk decay-mask step: decay_mask[H,N,C,C] - g_cumsum[H,N,1,C]
 // → fold the leading H,N into the batch ⇒ [HN, C, C] op [HN, 1, C].
 // Kernel "binary_Bx1xC_BxNxC_tileN/tileC(_bopa)" (default ref, lazy-loaded).
-// Register layout follows the admitted Bx1xC/BxNxC operator-asset ABI.
 void rpu_launch_eltwise_binary_Bx1xC_BxNxC_spm_kernel(
     uint32_t a_spm_addr,       // [B, 1, C]
     uint32_t b_spm_addr,       // [B, N, C]
     uint32_t output_spm_addr,  // [B, N, C]
     int64_t bsz, int64_t n, int64_t c,
-    c10::Half alpha_f, ValuOpType op_type, bool is_bopa)
+    c10::Half alpha_f, ValuOpType op_type, bool is_bopa,
+    int num_cores)
 {
-  // tile_method: tileN valid when c<=1024, tileC valid when n<=1024.
+  TORCH_CHECK(num_cores >= 1 && num_cores <= NUM_CORES_BINARY,
+              "SPM binary: num_cores must be in [1,8], got ", num_cores);
+  std::vector<uint8_t> core_list;
+  for (int i = 0; i < num_cores; ++i)
+    core_list.push_back(static_cast<uint8_t>(i));
+  // tile_method: tileN requires c<=1024; tileC requires n<=1024.
   const bool use_tileN = (c <= 1024);
   TORCH_CHECK(use_tileN || n <= 1024,
               "Bx1xC: need c<=1024 (tileN) or n<=1024 (tileC); got n=", n, " c=", c);
@@ -2112,9 +2143,7 @@ void rpu_launch_eltwise_binary_Bx1xC_BxNxC_spm_kernel(
   kernel->set_regs(8, (uint16_t)(output_spm_addr & 0xFFFF));
   kernel->set_regs(9, (uint16_t)(output_spm_addr >> 16));
 
-  // eltwise common (mirror the runtime COMMON_ELTWISE_BINARY_INIT macro).
-  // The tile kernels consume regs 59/60 as imm3/imm4, whose neutral runtime
-  // values are 1.0; treating them as zero-valued clip bounds corrupts MUL.
+  // This tile variant requires fp16 1.0 in reg59/60.
   c10::Half scale_a = 1.0, scale_b = alpha_f, scale_r = 1.0;
   c10::Half imm3 = 1.0, imm4 = 1.0;
   kernel->set_regs(56, scale_a.x);
@@ -2131,10 +2160,10 @@ void rpu_launch_eltwise_binary_Bx1xC_BxNxC_spm_kernel(
   kernel->set_regs(65, (uint16_t)blk_cnt_n);  // gridDim.y
   kernel->set_regs(66, (uint16_t)blk_cnt_c);  // gridDim.z
 
-  auto* wq = GET_QUEUE(NUM_CORES_BINARY);
+  auto* wq = GET_QUEUE(num_cores);
   wq->set_broadcast_mode(true);
   wq->enqueu_kernel(*kernel, {(uint16_t)bsz, (uint16_t)blk_cnt_n, (uint16_t)blk_cnt_c},
-                    {0, 1, 2, 3, 4, 5, 6, 7});
+                    core_list);
 }
 
 // Isolated test: a=[B,1,C], b=[B,N,C]. Broadcast both to all 8 cores' SPM, run

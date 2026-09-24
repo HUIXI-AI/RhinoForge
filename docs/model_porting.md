@@ -8,7 +8,7 @@ an exact model profile: architecture, checkpoint revision, precision, input
 envelope, execution settings, Rhino Launch version, and operator-asset version.
 Code reuse or a matching Hugging Face architecture name is not a support claim.
 
-Before changing code, compare the target with [Model support](model_support.md)
+Before changing code, compare the target with [Examples](model_support.md)
 and write down the exact profile to admit. Unsupported profiles must fail
 before the full weight load or any in-place weight transformation.
 
@@ -184,39 +184,6 @@ Every semantic input that can affect output belongs in the signature or must be
 updated through a mutable transfer at a stable contract point. Same-signature,
 different-value cases must match the uncaptured path.
 
-## 8. Verification gates
+## 8. Focused verification
 
-Run board-free checks first:
-
-- unknown architecture and unsupported-profile rejection occurs before weight
-  loading or transformation;
-- registry and plugin discovery are deterministic;
-- execution configuration rejects malformed or out-of-envelope values;
-- cache sizing and output shapes match the reference contract; and
-- the source build and package import complete cleanly.
-
-Then run the exact release profile on an RPU board:
-
-- run the hard semantic, same-dtype implementation-parity, CPU FP32 anchor,
-  and task-quality gates defined by the exact profile in
-  [Model validation policy](validation_policy.md);
-- verify `RPU_WARMUP=0`, `1`, and `3` are bit-identical by default, or satisfy
-  the exact profile's checked-in bounded repeatability contract;
-- prove the applicable graph lifecycle invariant;
-- run multiple inputs, and multiple images for a vision model, to catch reused
-  output storage;
-- exercise the maximum admitted sequence, batch, image, and cache envelope;
-  and
-- run the public end-to-end example from a clean process with the exact
-  checkpoint, TOML, launch library, and operator asset.
-
-Stop and classify the port as Blocked when a required operation, memory plan,
-profile asset, or hard semantic gate is missing. Incomplete representative
-task evidence can remain Experimental or Source-only, but cannot be promoted to
-Supported or Limited. Do not broaden the accepted input or model table based on
-a smaller passing case.
-
-Record the exact checkpoint revision and hashes, configuration hash, software
-versions, operator-asset hash, input envelope, precision, and results in the
-release evidence. Only then add or change a row in
-[Model support](model_support.md).
+Use [model validation](validation_policy.md) to select checks for the new execution path. Run affected host checks once and one representative board smoke per changed path. Record numerical differences after checking the computational path. Broader profile matrices or release certification require an explicit request.

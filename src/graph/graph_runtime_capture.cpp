@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <iomanip>
+#include <iostream>
 #include <sstream>
 #include <type_traits>
 #include <utility>
@@ -45,6 +46,14 @@ bool RpuKernelGraph::capture_replay_child_skip_data(ND data) {
                 " got=", static_cast<int>(node.kind));
     auto& rec = std::get<ND>(node.data);
     if constexpr (std::is_same_v<ND, MemcpyNodeData>) {
+        if (data.kind == CopyKind::DDR_TO_DDR) {
+            validate_graph_dma_channel(
+                data.dma_channel == -1 ? 0 : data.dma_channel,
+                child.runtime_policy_.execution_core_count,
+                "capture_replay_child_skip_data/DDR_TO_DDR");
+            TORCH_CHECK(rec.dma_channel == data.dma_channel,
+                        "capture_replay_child_skip_data: DDR DMA channel drift");
+        }
         TORCH_CHECK(rec.bytes == data.bytes,
                     "capture_replay_child_skip_data: Memcpy bytes mismatch at "
                     "child cursor ", replay_child_skip_.child_cursor,
@@ -60,6 +69,13 @@ bool RpuKernelGraph::capture_replay_child_skip_data(ND data) {
                     "child cursor ", replay_child_skip_.child_cursor,
                     " expected=", rec.bytes, " got=", data.bytes);
     } else if constexpr (std::is_same_v<ND, BranchNodeData>) {
+        if (rec.label == BranchNodeData::physical_manifest_label() ||
+            data.label == BranchNodeData::physical_manifest_label()) {
+            TORCH_CHECK(rec.is_physical_manifest_metadata() &&
+                            data.is_physical_manifest_metadata(),
+                        "capture_replay_child_skip_data: physical manifest "
+                        "Branch identity mismatch");
+        }
         TORCH_CHECK(rec.branch_key == data.branch_key,
                     "capture_replay_child_skip_data: branch-key mismatch at "
                     "child cursor ", replay_child_skip_.child_cursor,
@@ -74,6 +90,18 @@ bool RpuKernelGraph::capture_replay_child_skip_data(ND data) {
 
 template <typename ND>
 void RpuKernelGraph::capture_data(ND data) {
+    if constexpr (std::is_same_v<ND, BranchNodeData>) {
+        TORCH_CHECK(data.label != BranchNodeData::physical_manifest_label(),
+                    "capture_data: reserved physical manifest label is forbidden");
+    }
+    if constexpr (std::is_same_v<ND, MemcpyNodeData>) {
+        if (data.kind == CopyKind::DDR_TO_DDR) {
+            validate_graph_dma_channel(
+                data.dma_channel == -1 ? 0 : data.dma_channel,
+                runtime_policy_.execution_core_count,
+                "capture_data/DDR_TO_DDR");
+        }
+    }
     TORCH_CHECK(!kernel_register_census_active_ &&
                     !has_kernel_register_census_nodes_ &&
                     !pending_kernel_register_census_.has_value(),
@@ -90,7 +118,7 @@ void RpuKernelGraph::capture_data(ND data) {
     switch (state_) {
     case State::RECORDING: {
         const int node_id = static_cast<int>(nodes_.size());
-        // Memcpy 节点的 dep 推断:src 是 input(扫上游 writer),dst 是
+        // m2-3 — Memcpy 节点的 dep 推断:src 是 input(扫上游 writer),dst 是
         // output(注册给后续节点 lookup)。在 push 之前读 data 字段(push 后
         // data 已 move)。
         uint64_t mem_src_dev = 0;
@@ -123,10 +151,14 @@ void RpuKernelGraph::capture_data(ND data) {
                     cursor_);
         auto& rec = std::get<ND>(nodes_[cursor_].data);
         if constexpr (std::is_same_v<ND, MemcpyNodeData>) {
+            if (data.kind == CopyKind::DDR_TO_DDR) {
+                TORCH_CHECK(rec.dma_channel == data.dma_channel,
+                            "RpuKernelGraph: DDR DMA channel drift at cursor ", cursor_);
+            }
             TORCH_CHECK(rec.bytes == data.bytes,
                         "RpuKernelGraph: data-node bytes mismatch at cursor ",
                         cursor_, " expected=", rec.bytes, " got=", data.bytes);
-            // CopyKind 也是 replay signature 的一部分。
+            // T2' §4:schema 扩展后,CopyKind 也是 replay signature 的一部分。
             // 若 RECORDING 把某 node 分类为 DDR_TO_DDR 而 REPLAYING 下同一
             // 调用点因 dst/src 分配漂移查不到 dev_addr,kind 就会降回
             // HOST_MEMCPY。这意味着 graph 结构已变,应当 recapture 而不是
@@ -141,6 +173,8 @@ void RpuKernelGraph::capture_data(ND data) {
                         "RpuKernelGraph: data-node bytes mismatch at cursor ",
                         cursor_, " expected=", rec.bytes, " got=", data.bytes);
         } else if constexpr (std::is_same_v<ND, BranchNodeData>) {
+            TORCH_CHECK(rec.label != BranchNodeData::physical_manifest_label(),
+                        "capture_data: physical manifest Branch requires its private replay API");
             TORCH_CHECK(rec.branch_key == data.branch_key,
                         "RpuKernelGraph: branch-key mismatch at cursor ",
                         cursor_, " expected=", format_hex(rec.branch_key),
@@ -159,12 +193,14 @@ void RpuKernelGraph::capture_data(ND data) {
     }
 }
 
-// 显式实例化。ChildGraphNodeData 承载 ChildGraph 节点，BranchNodeData 承载
-// branch marker，HostCallbackNodeData 承载 HostCallback 节点。
+// 显式实例化。ChildGraphNodeData 是 A3 ChildGraph 节点的承载;BranchNodeData
+// 是 G6 branch marker;HostCallbackNodeData 是 A5+A6 HostCallback 节点的承载。
 template void RpuKernelGraph::capture_data<MemcpyNodeData>(MemcpyNodeData);
 template void RpuKernelGraph::capture_data<MemsetNodeData>(MemsetNodeData);
 template void RpuKernelGraph::capture_data<ChildGraphNodeData>(ChildGraphNodeData);
 template void RpuKernelGraph::capture_data<BranchNodeData>(BranchNodeData);
+// The private manifest recorder in graph_runtime_child.cpp shares this path.
+template bool RpuKernelGraph::capture_replay_child_skip_data<BranchNodeData>(BranchNodeData);
 template void RpuKernelGraph::capture_data<HostCallbackNodeData>(HostCallbackNodeData);
 template void RpuKernelGraph::capture_data<Tier3OneshotNodeData>(Tier3OneshotNodeData);
 
@@ -735,6 +771,9 @@ void RpuKernelGraph::record_dma_mutable_dst(
 }
 
 void RpuKernelGraph::record_dma_node(DmaNodeData data) {
+    validate_graph_dma_channel(data.channel,
+                               runtime_policy_.execution_core_count,
+                               "record_dma_node");
     check_kernel_register_node_emission("Graph-visible DMA emission");
     consume_kernel_register_dma_burst(data);
     switch (state_) {
@@ -886,7 +925,7 @@ void RpuKernelGraph::record_barrier(uint8_t self_stream, uint8_t target_stream) 
 }
 
 // =============================================================================
-// HostCallbackCapture — RECORDING-period RAII helper
+// HostCallbackCapture — A5+A6 RECORDING-period RAII helper
 // =============================================================================
 //
 // v1 行为:
@@ -910,15 +949,15 @@ void RpuKernelGraph::record_barrier(uint8_t self_stream, uint8_t target_stream) 
 //     - 仅把 stack returns 的 tensor 加进 output_pool 防本轮 forward
 //       内被 GC(scope 已 mark_non_replayable,跨轮不复用)
 //
-// dtor 当前为空；executor 的收尾由生命周期钩子负责。
+// dtor 当前为空(预留位置;未来 A5+A6.5 接入 executor 时再决定是否需要 dtor 收尾)
 //
 // 数据流时序的 v1 简化:CPU op 在 ctor → run_cpu_fallback_zerocopy 期间 eager
 // 跑;此时 prefix RPU kernel 尚未 launch(在 end() 才 launch),所以本轮 ctor
-// 跑 CPU op 看到的是 prefix kernel 写出之前的 DDR 旧值。executor 在 end
+// 跑 CPU op 看到的是 prefix kernel 写出之前的 DDR 旧值。executor (#14) 在 end
 // 阶段会 re-execute CPU op(那时 prefix segment 已 SYNC launch 完成),覆盖正确
 // 输出。下游 RPU kernel 节点 capture 时记下的 dev_addr 仍然正确,因为 dev_addr
-// 跨 ctor / executor 一致(同一个 .out= input arg 或 stable buffer)。因此在
-// capture scope 内直接用 .item() 读取该值仍可能看到旧值。
+// 跨 ctor / executor 一致(同一个 .out= input arg 或 stable buffer)。
+// 详见 plan §2.7.4 + §2.7.11("scope 内 .item() 读到 stale value" 的 v1 限制)。
 
 namespace {
 
@@ -994,7 +1033,7 @@ HostCallbackCapture::HostCallbackCapture(RpuKernelGraph& g,
 
     data.output_arg_indices = std::move(output_idx_set);
 
-    // Tier1 .out variant: the functional default wrapper
+    // S2 / G1.5 — Tier1 .out variant 的特殊性:functional default wrapper
     // (`topk(self, k)` -> alloc values_fresh / indices_fresh -> 调
     //  `topk.values(...,values_fresh, indices_fresh)`)在 dispatcher fallback
     // 之后 return values_fresh / indices_fresh,**不读 stack 替换后的 stable**。
@@ -1016,14 +1055,15 @@ HostCallbackCapture::HostCallbackCapture(RpuKernelGraph& g,
     }
 
     // output_pool / output_pool_dev_addrs / output_pool_bytes 在 adopt_returns
-    // (Tier 1+2)或 adopt_dynamic_return(Tier 3)阶段填写。Dynamo fx graph 是
-    // functional 形式,PT runtime 每次 alloc 全新 .out= 输入,因此统一使用
-    // graph-owned stable buffer:CPU op 跑完后由 adopt_returns 把
+    // (Tier 1+2)或 adopt_dynamic_return(Tier 3)阶段填写。原 v1 Tier 1 在 ctor
+    // 直接从入参 .out= 槽抓 dev_addr 的路径已废弃 —— Dynamo fx graph 总是
+    // functional 形式,PT runtime 每次 alloc 全新 .out= 输入,trust 不成立。
+    // 改成统一 graph-owned stable buffer:CPU op 跑完后由 adopt_returns 把
     // 数据 copy 到 stable buffer,stack slot 替换为 stable buffer。
 
     // push 进 nodes_;capture_data 走 RECORDING 分支。
     node_idx_ = g.nodes_.size();
-    // push 之前先收集 input dev_addrs(用 data.live_tensor_args,
+    // m2-3 — push 之前先收集 input dev_addrs(用 data.live_tensor_args,
     // 跟 data 里 push 的 tensor 一一对应)。
     std::vector<uint64_t> input_devs;
     input_devs.reserve(data.live_tensor_args.size());
@@ -1038,7 +1078,7 @@ HostCallbackCapture::HostCallbackCapture(RpuKernelGraph& g,
                 g.nodes_[node_idx_].kind == GraphNodeKind::HostCallback,
                 "HostCallbackCapture: capture_data did not push HostCallback "
                 "node as expected");
-    // push 之后调 resolve_recording_input_deps:
+    // m2-3 — push 之后调 resolve_recording_input_deps:
     //   - HostCallbackNodeData 自己不存 input_dep 字段(语义不需要 — replay 期
     //     stack 重建跟 dep 无关),只触发反向回填上游 Tier3Oneshot 的 output_dep。
     //   - 返回的 deps 列表丢弃。
@@ -1099,14 +1139,14 @@ void HostCallbackCapture::adopt_returns(torch::jit::Stack& stack) {
         if (stable.defined()) {
             g_->record_boundary_flush(stable.data_ptr());
         }
-        // 把这块 stable buffer 登记到 admission persistent 表,
+        // S2 / G1.5 — 把这块 stable buffer 登记到 admission persistent 表,
         // 让下游的 `_to_copy(self=stable)`(典型 Tier2 functional return
         // `f(...).to(fp16)`)命中后走 deferred 拿当步真值;Qwen3 rotary 内
         // `inv_freq.half() / position_ids.half()` 跟此 chain 无关,不命中,
-        // 保持 inline,避免误推进 host_callback Tier2 链。
+        // 保持 inline,从而避免 R2 把它们误推进 host_callback Tier2 链。
         // 跨 replay 不变,所以入 persistent 表(begin/abort/invalidate 才清)。
         g_->register_host_callback_persistent_stable(stable);
-        // 注册 stable output dev_addr 到 RECORDING dev_addr writer 表。
+        // m2-3 — 注册 stable output dev_addr 到 RECORDING dev_addr writer 表。
         // 下游消费者(下游 HostCallback 节点 / 下游 Memcpy / Tier3Oneshot ctor 期)
         // 扫 input dev_addr 时 lookup 到本节点 → 给本节点 push consumer 到
         // output_dep(本节点不是 Tier3Oneshot,output_dep 只在 Tier3 节点有意义,
@@ -1114,6 +1154,17 @@ void HostCallbackCapture::adopt_returns(torch::jit::Stack& stack) {
         // ctor 路径反向追到)。
         g_->track_recording_writer_dev_addr(dev,
                                             static_cast<int>(node_idx_));
+        if (const char* e = std::getenv("RPU_GRAPH_TO_COPY_LOG");
+            e && *e && *e != '0') {
+            const at::Tensor& iv_t = iv.toTensor();
+            std::cerr << "[ADOPT-RET] r=" << r
+                      << " stable.data_ptr=0x" << std::hex
+                      << reinterpret_cast<uintptr_t>(stable.data_ptr())
+                      << " stable.dev=0x" << dev
+                      << " iv.data_ptr=0x"
+                      << reinterpret_cast<uintptr_t>(iv_t.data_ptr())
+                      << std::dec << "\n";
+        }
     }
 }
 
@@ -1183,7 +1234,7 @@ void RpuKernelGraph::capture_host_callback_replay_args(
         }
     }
 
-    // During REPLAYING, register the current step's .out input
+    // S2 / G1.5 — REPLAYING op stream 期同步 register 当前 step .out input
     // args 的 storage 到 admission **live** 表。begin(BUILT→REPLAYING)已经
     // 把 live 表清空(每步 fresh 地址);这里把本步 PT functional default
     // wrapper alloc 的 fresh `.out` args 重新登记,让下游 `i.to(fp16)` 能命中
@@ -1228,7 +1279,7 @@ void RpuKernelGraph::capture_host_callback_replay_args(
 }
 
 // =============================================================================
-// Tier3OneshotNode REPLAYING op stream 入口
+// G3 m2-5 — Tier3OneshotNode REPLAYING op stream 入口
 // =============================================================================
 //
 // 镜像 capture_host_callback_replay_args 模式但路由到 Tier3OneshotNode。op stream
@@ -1349,11 +1400,12 @@ void HostCallbackCapture::adopt_dynamic_return(torch::jit::Stack& stack) {
 }
 
 // =============================================================================
-// Tier3OneshotCapture — RECORDING 期 RAII guard
+// Tier3OneshotCapture — G3 m2 RECORDING 期 RAII guard
 // =============================================================================
 //
 // 跟 HostCallbackCapture 同构,但录的是 Tier3OneshotNodeData(GraphNodeKind::
-// Tier3Oneshot)。Tier3 op 走这条路径以保留节点级 oneshot 收益。
+// Tier3Oneshot)。Tier3 op 从 m2-2 起走这条路径,m2-5 取消 mark_non_replayable
+// 后能拿到节点级 oneshot 收益。
 
 Tier3OneshotCapture::Tier3OneshotCapture(RpuKernelGraph& g,
                                           const c10::OperatorHandle& op,
@@ -1393,13 +1445,13 @@ Tier3OneshotCapture::Tier3OneshotCapture(RpuKernelGraph& g,
                 g.record_boundary_flush(t.data_ptr());
             }
         } else {
-            // 非 Tensor IValue 直接存值;REPLAYING capture_replay_args
+            // 非 Tensor IValue 直接存值;m2-5 REPLAYING capture_replay_args
             // 校验同槽不漂移。
             data.args_template.push_back(iv);
         }
     }
 
-    // push 节点之前先收集 input dev_addrs(用 data.live_tensor_args
+    // m2-3 — push 节点之前先收集 input dev_addrs(用 data.live_tensor_args
     // 跟 data 里 push 的 tensor 一一对应)。push 节点之后调
     // resolve_recording_input_deps 填 input_dep_node_ids,同时给上游
     // Tier3Oneshot 节点反向回填 output_dep_node_ids。
@@ -1411,7 +1463,7 @@ Tier3OneshotCapture::Tier3OneshotCapture(RpuKernelGraph& g,
             input_devs.push_back(rhino_lkn::RpuGetDevAddr(t.data_ptr()));
         }
     }
-    // output_dep_node_ids / transient_resource_ids 由下面的依赖与资源跟踪填充。
+    // output_dep_node_ids / transient_resource_ids:m2-4/m2-5 推断;m2-3 留空。
 
     node_idx_ = g.nodes_.size();
     g.capture_data<Tier3OneshotNodeData>(std::move(data));
@@ -1419,7 +1471,7 @@ Tier3OneshotCapture::Tier3OneshotCapture(RpuKernelGraph& g,
                 g.nodes_[node_idx_].kind == GraphNodeKind::Tier3Oneshot,
                 "Tier3OneshotCapture: capture_data did not push Tier3Oneshot "
                 "node as expected");
-    // push 后再 resolve,避免拿自己 node_id(虽然 dev addr 还没 register
+    // m2-3 — push 后再 resolve,避免拿自己 node_id(虽然 dev addr 还没 register
     // 进去,但 push 之后是干净路径)。
     auto deps = g.resolve_recording_input_deps(static_cast<int>(node_idx_),
                                                 input_devs);
@@ -1452,14 +1504,14 @@ void Tier3OneshotCapture::adopt_returns(torch::jit::Stack& stack) {
         c10::IValue& iv = stack[stack_size_before_returns_ + r];
         if (iv.isTensor()) {
             at::Tensor fresh = iv.toTensor();
-            // alloc graph-managed transient buffer:同 shape/dtype,
+            // m2-4 — alloc graph-managed transient buffer:同 shape/dtype,
             // RPU device,跨 replay dev_addr 稳定。fresh return 内容 copy 进去,
             // stack slot 替换为 transient buffer 让下游消费者读稳定 dev_addr。
             // 跟 HostCallback Tier1/2 stable buffer 同模式,只差语义上不承诺
-            // 内容稳定(每步 RNG 由 REPLAYING 真跑后重 copy 进去)。
+            // 内容稳定(每步 RNG 由 m2-5 REPLAYING 真跑后重 copy 进去)。
             //
             // 不能让 buffer 落 CPU 后再 .to(rpu) — 那样每步新 dev_addr,
-            // REPLAYING 期下游 RPU kernel 拿到上轮录的 dev_addr 就崩。
+            // m2-5 REPLAYING 期下游 RPU kernel 拿到上轮录的 dev_addr 就崩。
             at::Tensor transient = at::empty(
                 fresh.sizes(),
                 fresh.options().device(c10::DeviceType::PrivateUse1));
@@ -1476,7 +1528,9 @@ void Tier3OneshotCapture::adopt_returns(torch::jit::Stack& stack) {
             node.last_output_dev_addrs.push_back(dev);
             // 替换 stack slot:下游 op 直接读 transient buffer。
             iv = transient;
-            // output_keepalives 保留 fresh return 引用。
+            // 兼容:output_keepalives 保留 fresh return 引用(m2-2 字段)。
+            // m2-4 之后 transient buffer 已被 owner tree 持引用,output_keepalives
+            // 实际 redundant;留作以后清理。
             node.output_keepalives.push_back(fresh);
             // post-write boundary flush:transient buffer host 写入对后续 RPU
             // 可见(executor 跑下游 RPU kernel 前会 flush)。
@@ -1488,10 +1542,10 @@ void Tier3OneshotCapture::adopt_returns(torch::jit::Stack& stack) {
             node.transient_resource_ids.push_back(-1);
         }
     }
-    // 注册 transient buffer dev_addr 到 RECORDING writer 表。
+    // m2-3 — 注册 transient buffer dev_addr 到 RECORDING writer 表(m2-4 起
     // 跨 replay 稳定 dev_addr,下游消费者 lookup 到本节点 → 给本节点 push
     // output_dep。Kernel 消费者通过 stack slot 读 transient buffer dev_addr,
-    // graph-层 dep 推断只覆盖 HostCallback/Memcpy 类消费者。
+    // m2-3 的 graph-层 dep 推断仍只覆盖 HostCallback/Memcpy 类消费者)。
     for (uint64_t dev : node.last_output_dev_addrs) {
         g_->track_recording_writer_dev_addr(dev, static_cast<int>(node_idx_));
     }

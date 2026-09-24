@@ -1,0 +1,39 @@
+# Public configuration; provide your own checkpoint and input assets.
+
+[example]
+profile_id = "qwen3_5-2b.fp16.vision-controlled"
+registry_alias = "qwen3_5-2b"
+target = "qwen3_5_vision"
+dtype = "fp16"
+architecture = "Qwen3_5ForConditionalGeneration"
+
+[example.opt_in]
+QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED = "1"
+
+[input]
+images = ["assets/example.ppm"]
+image_size = 448
+prompt = "Describe the image in detail. A compiler translates source code into executable instructions. Explain the stages of compilation and give examples. "
+prefill_filler_prompt = "A compiler translates source code into executable instructions. Explain the stages of compilation and give examples. "
+prefill_tokens = 512
+decode_steps = 192
+stop_on_eos = false
+
+[run]
+warmup = 1
+runs = 3
+torch_num_threads = 12
+inference_mode = true
+timing_mode = "legacy_dense_vl"
+summary_statistic = "median"
+hwperf = false
+profile = false
+seed = 0
+
+[rpu_execution]
+
+[rpu_execution.model]
+num_cores = 8
+
+[rpu_execution.prefill]
+chunk_size = "auto"

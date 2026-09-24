@@ -1,21 +1,21 @@
-"""Wall-OSS-0.5 Qwen2.5-VL ViT vision tower for RPU.
+"""Wall-OSS-0.5 Qwen2.5-VL ViT vision tower → RPU (P3).
 
 The VLM backbone's vision tower is a stock Qwen2.5-VL ViT (32 blocks, hidden
 1280, head_dim 80, RMSNorm, biased SwiGLU, 2D RoPE, window attention). This
-adapter drives the native C++ model `qwen25vl_vision_*` (raw-tensor style, like
+adapter drives the forked C++ model `qwen25vl_vision_*` (raw-tensor style, like
 `wall_oss/llm.py` — no HF module).
 
 Weight layout (real ckpt): `visual.blocks.{L}.attn.qkv.{weight[3840,1280],bias}`
 (fused, split q/k/v at 1280 each); `attn.proj.{weight[1280,1280],bias}`;
 `mlp.gate_up_proj.{weight[6840,1280],bias}` (FUSED → split gate/up and
-zero-pad each half to 3456 since 3420 is not swizzle-representable).
-`mlp.down_proj` similarly accepts K=3420 or the
+zero-pad each half to 3456 since 3420 is not swizzle-representable). Already
+padded tensors with 6912 rows are also accepted. `mlp.down_proj` accepts K=3420 or the
 pre-padded K=3456; `norm1/norm2.weight[1280]` (RMSNorm, no bias);
 `patch_embed.proj.weight[1280,3,2,14,14]` (Conv3d, foldable to Linear, no bias);
 `merger.{ln_q.weight, mlp.0[5120,5120]+b, mlp.2[2048,5120]+b}`.
 
-The full-attention path uses MASK_NONE with no window reorder. The window path
-adds the window mask and CPU reorder/reverse.
+P3a: full-attention only (MASK_NONE), no window reorder. P3b adds the window
+mask + CPU reorder/reverse.
 
 The default adapter runs patch_embed on RPU and folds the merger into the C++
 graph; diagnostic fallbacks retain the CPU implementations. With
@@ -27,7 +27,6 @@ from __future__ import annotations
 import json
 import os
 import time
-import weakref
 from typing import Sequence
 
 import torch
@@ -36,6 +35,8 @@ import torch.nn.functional as F
 import rpu_backend
 from rpu_backend.runtime import rpu_env_bool
 from rpu_backend.api.cache import RPUCache
+from rpu_backend.runtime.decoder import plan_bounded_prefill_execution
+from rpu_backend.runtime.execution_planner import GRAPH_COMPOSITE_CHILD
 from rpu_backend.runtime.weights import (
     tp_col_swizzle_mc_weight,
     tp_row_swizzle_mc_weight,
@@ -54,37 +55,8 @@ _MAX_BATCH_SEQ = 768        # batched-vision ceiling = 3×256 (one forward for t
                             # case). Fits the full-VLA SPM after the vision temp-peak work
                             # (per-image sdpa_tmp + up→residual1 alias). Override via
                             # RPU_WALL_OSS_BATCH_MAX_SEQ.
-_LAYER_GROUP_TOTAL_SEQ = 3 * 576  # Exact three-camera layer-group sequence length.
 _INTER_PAD = 3456           # fp16: 3420 -> next multiple of 128
 _INTER_PAD_W8A16 = 3584     # int8 row-swizzle needs K divisible by 32B*8 = 256
-_PROCESS_EXPERIMENTAL_SCHEDULE: int | None = None
-
-
-def _experimental_schedule_from_env() -> int:
-    raw_layer_group = os.environ.get(
-        "RPU_WALL_OSS_VISION_LAYER_GROUP", "0"
-    ).strip() or "0"
-    if raw_layer_group not in ("0", "32"):
-        raise ValueError(
-            "RPU_WALL_OSS_VISION_LAYER_GROUP accepts only 0 (off) or 32 "
-            f"(exact 3x576 single-capture experiment), got {raw_layer_group!r}"
-        )
-    return int(raw_layer_group)
-
-
-def _claim_experimental_schedule() -> int:
-    """Validate and pin the process-wide Vision schedule."""
-    schedule = _experimental_schedule_from_env()
-    global _PROCESS_EXPERIMENTAL_SCHEDULE
-    if _PROCESS_EXPERIMENTAL_SCHEDULE is None:
-        _PROCESS_EXPERIMENTAL_SCHEDULE = schedule
-    if _PROCESS_EXPERIMENTAL_SCHEDULE != schedule:
-        raise RuntimeError(
-            "Wall-OSS Vision experimental scheduling is process-startup-only; "
-            "use a fresh process after changing "
-            "RPU_WALL_OSS_VISION_LAYER_GROUP"
-        )
-    return schedule
 
 
 def _to_rpu_half(t: torch.Tensor) -> torch.Tensor:
@@ -222,9 +194,8 @@ def _compute_vision_position_idx_cpu(
 
 
 def _get_window_index(grid_thw, window_size, spatial_merge_size, patch_size):
-    """Build the Qwen2.5-VL window permutation on CPU.
-
-    Returns (window_index, cu_window_seqlens,
+    """CPU port of HF `Qwen2_5_VisionTransformer.get_window_index`
+    (modeling_qwen2_5_vl.py:404-444). Returns (window_index, cu_window_seqlens,
     reverse_index) — all on CPU. window_index / reverse_index are merge-unit
     length (seq // spatial_merge_unit); cu_window_seqlens is patch-unit."""
     vit_win = window_size // spatial_merge_size // patch_size       # 4 merge-units
@@ -292,7 +263,7 @@ def _pack_multi_image(grid_group: torch.Tensor, window_size: int, sms: int,
                       patch_size: int):
     """Multi-image window reorder + shared mask (all images SAME size).
 
-    Returns ``(window_index_multi, reverse_indices, mask)``:
+    Returns ``(window_index_multi, reverse_indices, mask, cu_window_seqlens)``:
     - ``window_index_multi`` — merge-unit reorder, each image's indices offset by
       ``i * (n_i // smu)`` so the concatenated per-image blocks stay disjoint.
     - ``reverse_indices`` — list of per-image merge-unit argsorts (applied to each
@@ -313,27 +284,32 @@ def _pack_multi_image(grid_group: torch.Tensor, window_size: int, sms: int,
     n_i = int(grid_group[0].prod().item())
     _, cu0, _ = _get_window_index(grid_group[0:1], window_size, sms, patch_size)
     mask = _block_diag_mask(cu0, n_i)
-    return window_index_multi, reverses, mask
+    return window_index_multi, reverses, mask, cu0
 
 
 def _destroy_qwen25vl_vision_handle(h):
-    """Release the C++ Qwen25VLVisionModel handle. Called by weakref.finalize on GC."""
-    try:
-        torch.ops.rpu.qwen25vl_vision_destroy(h)
-    except Exception:
-        pass
+    """Raw destroy; graph retirement belongs to the actual component owner."""
+    torch.ops.rpu.qwen25vl_vision_destroy(h)
 
 
 def _configure_qwen25vl_vision_handle(
-    *, set_weights, weight_args, freq_cos, freq_sin, merger_args,
+    *, set_weights, weight_args, freq_cos, freq_sin, merger_args, max_seq_len,
+    execution_routes=(False, False),
     chunk_size=0,
-    per_window_sdpa=False,
+    per_window_sdpa=False, _owned_vision=None,
 ):
-    """Create/configure a Vision handle, destroying it on any failed gate."""
+    """Configure a pending handle; owned diagnostics retire via their parent."""
+    from rpu_backend.api._execution import _require_execution_process_safe
+    _require_execution_process_safe()
     handle = torch.ops.rpu.qwen25vl_vision_create()
-    configured = False
+    if _owned_vision is not None:
+        _owned_vision._handle = handle
     try:
+        torch.ops.rpu.qwen25vl_vision_set_execution_routes(
+            handle, *execution_routes
+        )
         set_weights(handle, *weight_args)
+        torch.ops.rpu.qwen25vl_vision_set_chunk_envelope(handle, int(max_seq_len), 0)
         torch.ops.rpu.qwen25vl_vision_set_chunk_size(handle, chunk_size)
         if per_window_sdpa:
             torch.ops.rpu.qwen25vl_vision_set_per_window_sdpa(handle, True)
@@ -342,11 +318,13 @@ def _configure_qwen25vl_vision_handle(
         torch.ops.rpu.qwen25vl_vision_set_merger_weights(
             handle, *merger_args
         )
-        configured = True
         return handle, keepalive
-    finally:
-        if not configured:
-            _destroy_qwen25vl_vision_handle(handle)
+    except BaseException as error:
+        if _owned_vision is None:
+            from rpu_backend.adapters.wall_oss._retirement import _cleanup_build_failure
+            _cleanup_build_failure(error, (handle, weight_args, freq_cos, freq_sin, merger_args),
+                                   lambda: _destroy_qwen25vl_vision_handle(handle))
+        raise
 
 
 class WallOssVision:
@@ -359,12 +337,10 @@ class WallOssVision:
 
     def __init__(self, *, handle, cache, graph_cache, keepalive, patch_w, merger,
                  hidden_size, num_layers, spatial_merge_size, window,
-                 window_size, patch_size, experimental_schedule=None,
-                 execution_chunk_size="auto", per_window_sdpa=False):
-        schedule = (
-            _claim_experimental_schedule()
-            if experimental_schedule is None else experimental_schedule
-        )
+                 window_size, patch_size,
+                 execution_chunk_size="auto", per_window_sdpa=False,
+                 fused_merger=False):
+        self._gc_retirement_enabled = False
         self._handle = handle
         self.cache = cache
         self._graph_cache = graph_cache
@@ -374,38 +350,39 @@ class WallOssVision:
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self._sms = spatial_merge_size
-        self._window = window                 # window attention on/off
+        self._window = window                 # P3b: window attention on/off
         self._window_size = window_size
         self._patch_size = patch_size
         self._execution_chunk_size = execution_chunk_size
         self._per_window_sdpa = per_window_sdpa
+        self._batch_vision = rpu_env_bool(
+            "RPU_WALL_OSS_BATCH_VISION", default=True
+        )
+        try:
+            self._batch_max_seq = int(os.environ.get(
+                "RPU_WALL_OSS_BATCH_MAX_SEQ", str(_MAX_BATCH_SEQ)
+            ))
+        except ValueError as exc:
+            raise ValueError(
+                "RPU_WALL_OSS_BATCH_MAX_SEQ must be a positive integer"
+            ) from exc
+        if self._batch_max_seq <= 0:
+            raise ValueError(
+                "RPU_WALL_OSS_BATCH_MAX_SEQ must be a positive integer"
+            )
         # Keep the merged vision tokens on the RPU device (merger RMSNorm on-device +
         # window reverse-reorder via the gather op) so the VLA's on-device embed
-        # assembly needs no merged readback/upload. Default off: this eager
+        # assembly needs no merged readback/upload. DEFAULT OFF: this legacy eager
         # path is superseded by the default fused-merger post_fn. Eager RMSNorm is
-        # implemented through a host fallback, so this switch is diagnostic rather
-        # than a performance alternative.
+        # correctness-safe as of 2026-08-01 but uses a host fallback, so this switch
+        # is diagnostic rather than a performance alternative.
         self._device_merged = rpu_env_bool("RPU_WALL_OSS_VISION_DEVICE_MERGED")
-        # RPU_WALL_OSS_VISION_FUSED_MERGER (default OFF): fold the merger
-        # (RMSNorm -> m0 GEMM -> GELU -> m2 GEMM -> all-reduce) into the C++
-        # qwen25vl_vision_forward graph via a post_fn. The route merges one
-        # packed sequence. The forward op returns the merged [seq/4, out_hidden]
-        # window-order tensor directly; Python only applies the reverse-gather.
-        #
-        # ⚠️ SHARED SWITCH — MUST agree with the C++
-        # `vision_fused_merger_enabled()` parser, which reads the same
-        # variable as `e && s != "0" && s != "false"` (byte-exact). If C++ reads
-        # ON and this reads OFF, the merger runs TWICE — folded into the graph
-        # and again here — and the vision embedding is silently wrong, with no
-        # exception. The two rules agree only on `1` and `0`; `VAR=` (what
-        # `export VAR=$UNSET` yields), `VAR=False` and `VAR=off` are ON in C++
-        # and OFF here, so `cpp_mirror` refuses every spelling but `1`/`0` —
-        # the only two on which the Python and C++ parsers agree.
-        self._fused_merger = rpu_env_bool(
-            "RPU_WALL_OSS_VISION_FUSED_MERGER",
-            cpp_mirror="src/fused/rpu_qwen25vl_vision_model.cpp")
-        # On-device patch_embed: run the folded Conv3d→Linear as an eager RPU linear. _patch_w_rpu
-        # (padded+col-swizzled weight) is set by build_wall_oss_vision; None disables.
+        # The builder resolves these once and passes the same cold values to
+        # this Python owner and the native handle.
+        self._fused_merger = bool(fused_merger)
+        # On-device patch_embed runs the folded Conv3d as an eager RPU Linear.
+        # build_wall_oss_vision sets the padded, column-swizzled _patch_w_rpu;
+        # None disables this path.
         # RPU_WALL_OSS_DEVICE_PATCH_EMBED=0 forces the CPU GEMM.
         self._device_patch_embed = rpu_env_bool(
             "RPU_WALL_OSS_DEVICE_PATCH_EMBED", default=True)
@@ -421,7 +398,7 @@ class WallOssVision:
         self._patch_w_fold_rpu = None    # [hidden, _pe_k] col-swizzled, normalize+bias baked
         self._patch_w_fold_cpu = None    # [hidden, _pe_k] CPU fp32 (device-patch-embed off)
         # Memoized per-grid CPU window/position layout (frame-invariant for a fixed
-        # camera). RPU_WALL_OSS_HOST_CACHE=0 disables this cache.
+        # camera). RPU_WALL_OSS_HOST_CACHE=0 disables (bit-exact A/B / escape hatch).
         self._layout_cache = {}          # single-image (_forward_one / _window_layout)
         self._group_layout_cache = {}    # batched multi-image (_forward_group / _group_layout)
         self._pe_buf_cache = {}          # persistent [seq, _pe_k] fp16 patch_embed input buffers
@@ -430,34 +407,53 @@ class WallOssVision:
         # allocating the next one. This prevents allocator address reuse from fooling
         # the C++ source-pointer memo into skipping an upload for changed contents.
         self._last_window_mask_ref = None
-        # Fused embed assembly returns raw window-order rows and stores the reverse
-        # index for assemble_inputs_embeds_rev. Mixed-size subgroups use the fallback.
+        # Fused embed-assembly: fold the window-REVERSE into the runtime's assemble op
+        # (so the two gather_embedding — vision reverse + token gather — collapse and the
+        # merged DDR round-trip is gone). When on, forward() returns the RAW window-order
+        # merged for a single-subgroup forward and stashes `_pending_rev = (rev_idx_rpu,
+        # [merged_tokens_per_image])`; the runtime reads it and calls
+        # assemble_inputs_embeds_rev. Multi-subgroup (mixed-size) forwards fall back (no
+        # fuse). Only meaningful with the fused merger. RPU_WALL_OSS_FUSED_ASSEMBLE=1.
         self._fused_assemble = rpu_env_bool("RPU_WALL_OSS_FUSED_ASSEMBLE")
         self._pending_rev = None         # (rev_idx_rpu int32, [mu_per_image]) or None
         self._host_cache = rpu_env_bool("RPU_WALL_OSS_HOST_CACHE", default=True)
-        # Controlled exact-shape scheduling. Treat this as an
-        # instance/startup setting: the C++ side snapshots the same env value.
-        self._layer_group = schedule
         self._closed = False
-        # Register ownership only after every fallible constructor step. The
-        # builder owns and destroys the raw handle until this assignment.
-        self._handle_finalizer = weakref.finalize(
-            self, _destroy_qwen25vl_vision_handle, handle
-        )
+        # Diagnostic children already belong to their parent's graph-aware close.
+        self._gc_retirement_enabled = getattr(self, "_retirement_session", None) is None
 
-    def close(self) -> None:
+    def _retire_native(self):
+        from rpu_backend.adapters.wall_oss._retirement import _retire_native
+        _retire_native(self, _destroy_qwen25vl_vision_handle)
+
+    def close(self, *, _graphs_retired=False) -> None:
         """Release graph/native resources. Safe to call more than once."""
         if self._closed:
             return
-        graph_cache = getattr(self, "_graph_cache", None)
-        if graph_cache is not None:
-            graph_cache.clear()
-        finalizer = getattr(self, "_handle_finalizer", None)
-        if finalizer is not None and getattr(finalizer, "alive", False):
-            # Explicit close keeps native destroy failures visible and retryable.
-            torch.ops.rpu.qwen25vl_vision_destroy(self._handle)
-            finalizer.detach()
-        self._closed = True
+        session = getattr(self, "_retirement_session", None)
+        if session is not None:
+            from rpu_backend.api._execution import ExecutionSession
+
+            parent = getattr(session, "_owner", None)
+            if (not _graphs_retired or not isinstance(session, ExecutionSession)
+                    or getattr(parent, "_execution_session", None) is not session
+                    or not session._shutting_down
+                    or session._active or getattr(parent, "_diagnostic_vision", None) is not self):
+                raise RuntimeError("owned Wall-OSS Vision must close through its parent Session shutdown")
+            if getattr(self, "_handle_finalizer", None) is not None:
+                raise RuntimeError("owned Wall-OSS Vision cannot have an independent raw finalizer")
+            if self._handle is not None:
+                torch.ops.rpu.qwen25vl_vision_destroy(self._handle)
+                self._handle = None
+            self._closed = True
+            return
+        if _graphs_retired:
+            raise RuntimeError("precleared Wall-OSS Vision requires its actual retirement parent")
+        from rpu_backend.adapters.wall_oss._retirement import _close
+        _close(self, (self,))
+
+    def __del__(self):
+        from rpu_backend.adapters.wall_oss._retirement import _gc_close
+        _gc_close(self)
 
     @torch.no_grad()
     def forward(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
@@ -470,6 +466,8 @@ class WallOssVision:
         back to ``_forward_one``. The generic route keeps attention image-local
         with per-image SDPA.
         """
+        from rpu_backend.adapters.wall_oss._retirement import _require_open
+        _require_open(self)
         if not isinstance(grid_thw, torch.Tensor):
             raise TypeError(
                 "WallOssVision.forward grid_thw must be a torch.Tensor, got "
@@ -499,34 +497,16 @@ class WallOssVision:
         self._pending_rev = None
         counts = [int(grid_cpu[i].prod().item()) for i in range(grid_cpu.size(0))]
         N = grid_cpu.size(0)
-        batch_on = rpu_env_bool("RPU_WALL_OSS_BATCH_VISION", default=True)
-        layer_group = self._layer_group
+        batch_on = self._batch_vision
         per_window_sdpa = getattr(self, "_per_window_sdpa", False)
-        if _experimental_schedule_from_env() != layer_group:
-            raise RuntimeError(
-                "Wall-OSS Vision experimental schedule is startup-only; "
-                "rebuild the vision instance in a fresh process after changing it"
-            )
         if per_window_sdpa and (
             not self._window
             or N != 1
-            or layer_group != 0
         ):
             raise ValueError(
                 "per-window Vision SDPA is restricted to the controlled "
                 "single-image FP16 normal schedule"
             )
-        if layer_group == 32:
-            if not batch_on:
-                raise ValueError(
-                    "RPU_WALL_OSS_VISION_LAYER_GROUP=32 requires "
-                    "RPU_WALL_OSS_BATCH_VISION=1"
-                )
-            if N != 3 or counts != [576, 576, 576]:
-                raise ValueError(
-                    "experimental vision layer grouping is validated only for "
-                    f"3x576 patches, got {counts}"
-                )
         if N == 1:
             self._validate_execution_chunks(
                 (self._native_chunk_size(grid_cpu),)
@@ -538,9 +518,7 @@ class WallOssVision:
         for n in counts:
             offs.append(offs[-1] + n)
         i = 0
-        max_seq = int(os.environ.get("RPU_WALL_OSS_BATCH_MAX_SEQ", str(_MAX_BATCH_SEQ)))
-        if layer_group == 32:
-            max_seq = max(max_seq, _LAYER_GROUP_TOTAL_SEQ)
+        max_seq = self._batch_max_seq
         subgroups = []   # (sub_pixel_values, grid_slice, is_group)
         while i < N:
             n_i = counts[i]
@@ -549,9 +527,8 @@ class WallOssVision:
             # max_seq (E2E-SPM ceiling; RPU_WALL_OSS_BATCH_MAX_SEQ to override);
             # else run the image solo.
             packed_ok = n_i >= 256 and n_i % 128 == 0
-            exact_3img_ok = layer_group == 32 and n_i == 576
             cap = (min(3, max_seq // n_i)
-                   if (batch_on and (packed_ok or exact_3img_ok)) else 1)
+                   if (batch_on and packed_ok) else 1)
             j = i + 1
             while j < N and torch.equal(grid_cpu[j], grid_cpu[i]) and (j - i) < cap:  # full grid, not just patch count (same count / different H·W must split)
                 j += 1
@@ -563,8 +540,7 @@ class WallOssVision:
         # Fused embed-assembly needs a single window-order output (the runtime reverses
         # via assemble_inputs_embeds_rev). Only when the whole forward is ONE subgroup
         # (1 cam, or N same-size cams ≤ cap) — the cat'd mixed-size case keeps the reverse.
-        if (self._fused_assemble and len(subgroups) == 1
-                and layer_group == 0):
+        if self._fused_assemble and len(subgroups) == 1:
             sub, gslice, is_group = subgroups[0]
             return (self._forward_group(sub, gslice, fused=True) if is_group
                     else self._forward_one(sub, gslice, fused=True))
@@ -579,16 +555,95 @@ class WallOssVision:
     def _native_chunk_size(self, grid_group: torch.Tensor) -> int:
         """Return the one chunk size the native forward will actually use."""
         seq = int(grid_group.prod(-1).sum().item())
-        if (
-            grid_group.size(0) > 1
-            and self._layer_group == 32
-            and seq == _LAYER_GROUP_TOTAL_SEQ
-        ):
-            seq = int(grid_group[0].prod().item())
         return ((seq + 15) // 16) * 16
 
+    def _plan_native_execution(
+        self, seq: int, image_batch_count: int,
+        window_mask: torch.Tensor | None,
+        cu_window_seqlens: torch.Tensor | None,
+    ):
+        requested = getattr(self, "_rpu_execution", {}).get("vision", {}).get(
+            "chunk_size", getattr(self, "_execution_chunk_size", "auto"))
+        plan_box = {}
+        _, chunk_size = plan_bounded_prefill_execution(
+            int(seq), int(seq), 0,
+            execution_owner=self,
+            execution_stage="vision",
+            execution_native=("qwen25vl_vision", int(self._handle)),
+            position=0,
+            alignment=1,
+            padding_rows=0,
+            exact_chunk_size=(
+                int(requested) if requested != "auto" else None
+            ),
+            resolve_stage_domain=lambda length: (
+                torch.ops.rpu.qwen25vl_vision_resolve_stage_domain(
+                    self._handle, int(length), int(image_batch_count),
+                    window_mask is not None, cu_window_seqlens,
+                    int(requested) if requested != "auto" else 0,
+                )
+            ),
+            request_id="qwen25vl:vision_encoder:vision",
+            plan_result_sink=lambda result: plan_box.__setitem__(
+                "result", result),
+            graph_mode=GRAPH_COMPOSITE_CHILD,
+            queue_owner_id=int(self._handle),
+            physical_metadata=(
+                ("component:vision_encoder", 1),
+                ("execution_generation", int(getattr(
+                    self, "_fmb_execution_generation", 0))),
+                ("semantic_span_count", int(image_batch_count)),
+                ("semantic_span_rows", int(seq) // int(image_batch_count)),
+                ("window_mask_present", int(window_mask is not None)),
+            ),
+            plan_signature=(int(image_batch_count), window_mask is not None, None if cu_window_seqlens is None else tuple(int(row) for row in cu_window_seqlens)),
+            graph_cache=self._graph_cache,
+        )
+        plan = plan_box["result"]
+        descriptor = plan.selected.stage_tuple.physical_descriptor
+        if not descriptor:
+            raise RuntimeError(
+                "Qwen2.5-VL Vision A6 winner has no native descriptor")
+        return int(chunk_size), plan, descriptor
+
+    def _record_native_execution(
+        self, plan, *, seq: int, image_batch_count: int, chunk_size: int,
+    ) -> None:
+        selected = plan.selected
+        if (
+            selected is None
+            or int(selected.execution_len) != int(seq)
+            or int(selected.stage_tuple.compute_chunk) != int(chunk_size)
+        ):
+            raise RuntimeError("Qwen2.5-VL Vision dry/forward plan disagreement")
+        self._rpu_last_execution_plan = {
+            "component": getattr(
+                self, "_fmb_execution_component_id", "vision_encoder"),
+            "stage": "vision",
+            "generation": int(getattr(
+                self, "_fmb_execution_generation", 0)),
+            "logical_len": int(seq),
+            "execution_len": int(selected.execution_len),
+            "chunk_size": int(chunk_size),
+            "padding_rows": int(selected.padding_rows),
+            "image_batch_count": int(image_batch_count),
+            "graph_mode": plan.graph_mode,
+            "semantic_span_owner": "INPUT",
+            "semantic_span_count": int(image_batch_count),
+            "authority": "NATIVE_A6_STAGE_DESCRIPTOR",
+            "selection_scope": plan.selection_scope,
+            "physical_plan_digest": plan.physical_plan_digest,
+            "plan_digest": plan.plan_digest,
+            "descriptor_words": len(
+                selected.stage_tuple.physical_descriptor),
+            "physical_descriptor": tuple(
+                selected.stage_tuple.physical_descriptor),
+            "dry_forward_agreement": True,
+        }
+
     def _validate_execution_chunks(self, chunks) -> None:
-        requested = getattr(self, "_execution_chunk_size", "auto")
+        requested = getattr(self, "_rpu_execution", {}).get("vision", {}).get(
+            "chunk_size", getattr(self, "_execution_chunk_size", "auto"))
         if requested == "auto":
             return
         native = tuple(int(chunk) for chunk in chunks)
@@ -599,10 +654,11 @@ class WallOssVision:
                 f"native={native}"
             )
 
+
     def _window_layout(self, grid_cpu: torch.Tensor, seq: int):
         """Memoized CPU window/position layout `(pos_idx, window_index, reverse_index,
         window_mask)`. Pure function of the grid + (instance-fixed) merge/window config,
-        so a fixed-camera rollout reuses one entry.
+        so recurring camera grids reuse one entry.
         All four are CPU tensors (the pos_idx→keepalive device copy stays per-forward) and
         are only read downstream, so sharing them across frames is safe."""
         key = (int(seq),) + tuple(grid_cpu.flatten().tolist())
@@ -618,7 +674,7 @@ class WallOssVision:
             )
         window_index = reverse_index = window_mask = cu_window_seqlens = None
         if self._window:
-            # Reorder by merge-unit window_index on CPU.
+            # P3b: reorder by merge-unit window_index ON CPU.
             window_index, cu_window_seqlens, reverse_index = _get_window_index(
                 grid_cpu, self._window_size, self._sms, self._patch_size)
             pos_idx = pos_idx.reshape(seq // smu, smu, 2)[window_index].reshape(seq, 2)
@@ -637,9 +693,10 @@ class WallOssVision:
 
     def _group_layout(self, grid_group: torch.Tensor, seq: int, smu: int):
         """Memoized batched (multi-image) window/position layout `(pos_idx,
-        window_index_multi, reverses, window_mask)` — the group analog of _window_layout.
+        window_index_multi, reverses, window_mask, cu_window_seqlens)` — the
+        group analog of _window_layout.
         Pure function of grid_group + (instance-fixed) window/merge/patch config, so a
-        fixed-camera rollout reuses one entry. All CPU
+        fixed-camera rollout reuses the packed positions and block-diagonal mask. All CPU
         tensors, read-only downstream → safe to share. RPU_WALL_OSS_HOST_CACHE=0 disables."""
         key = tuple(grid_group.flatten().tolist())
         if self._host_cache:
@@ -647,14 +704,16 @@ class WallOssVision:
             if hit is not None:
                 return hit
         pos_idx = _pack_multi_pos(grid_group, self._sms)                # [seq, 2] int16
-        window_mask = reverses = window_index_multi = None
+        window_mask = reverses = window_index_multi = cu_window_seqlens = None
         if self._window:
             # Per-image window reorder (offset window_index keeps each image's block
             # disjoint) + ONE shared [n_i, n_i] mask reused for every per-image SDPA.
-            window_index_multi, reverses, window_mask = _pack_multi_image(
+            (window_index_multi, reverses, window_mask,
+             cu_window_seqlens) = _pack_multi_image(
                 grid_group, self._window_size, self._sms, self._patch_size)
             pos_idx = pos_idx.reshape(seq // smu, smu, 2)[window_index_multi].reshape(seq, 2)
-        out = (pos_idx, window_index_multi, reverses, window_mask)
+        out = (pos_idx, window_index_multi, reverses, window_mask,
+               cu_window_seqlens)
         if self._host_cache:
             self._group_layout_cache[key] = out
         else:
@@ -671,7 +730,8 @@ class WallOssVision:
           W_fold[:, j] = W[:, j] * rescale/std[ch(j)]   (j in [0, K))
           W_fold[:, K] = -Σ_j W[:, j] * mean[ch(j)]/std[ch(j)]   (homogeneous bias column)
         normalize(u8)[j] = u8[j]*rescale/std[ch] - mean[ch]/std[ch], so the per-row dot
-        product reproduces the normalized GEMM exactly."""
+        product reproduces the normalized GEMM exactly (validated fp32-identity in the
+        bench; fp16 cos 1.0002)."""
         if self._patch_w is None or self._pe_k is None:
             return False
         W = self._patch_w.float()                                  # [hidden, K]
@@ -699,8 +759,8 @@ class WallOssVision:
         """Per-row spatial→window gather indices [seq] int32 on RPU. window_index
         [seq/smu] permutes merge-units (out unit j = in unit window_index[j]); expand
         to per-row: perm[j*smu+r] = window_index[j]*smu + r. Frame-invariant math but
-        recomputed+uploaded per frame (a small [seq] index array matching the existing
-        reverse_index upload pattern)."""
+        recomputed+uploaded per frame (tiny [seq] index array — matches the existing
+        reverse_index upload pattern; the cost this replaces is the [seq, K] pixel gather)."""
         wi = window_index.to(torch.int64)                          # [seq/smu]
         perm = (wi.unsqueeze(1) * smu + torch.arange(smu)).reshape(-1)  # [seq]
         return perm.to(torch.int32).to("rpu").contiguous()
@@ -711,8 +771,7 @@ class WallOssVision:
         uint8 → the normalize-folded weight (+ homogeneous bias column); fp32
         (HF-processor fallback) → the plain weight. patch_embed is per-row, so the
         window reorder commutes: GEMM in raster order, then gather the OUTPUT rows into
-        window order on device (llama_gather_embedding), replacing the CPU
-        fancy-index gather on the [seq, K] pixels. The fp32 fallback keeps the CPU
+        window order on-device with llama_gather_embedding. The fp32 fallback keeps the CPU
         pre-GEMM reorder (no device gather on that path)."""
         pv = pixel_values                                          # raster order
         folded = pv.dtype == torch.uint8
@@ -722,7 +781,8 @@ class WallOssVision:
             # Persistent pre-initialized input buffer: the pad/bias columns are
             # frame-invariant (zeros, + the homogeneous bias col=1.0 when folded), so
             # allocate once per seq and refill only the data region each frame with a
-            # single cast-copy. Gated on RPU_WALL_OSS_HOST_CACHE.
+            # single cast-copy, avoiding repeated cast and padding allocations.
+            # Gated on RPU_WALL_OSS_HOST_CACHE.
             if self._host_cache:
                 # Key on (seq, folded): the folded path needs the homogeneous bias col
                 # buf[:, K]=1.0, the fp32-fallback path does not — a seq-only key would
@@ -759,9 +819,8 @@ class WallOssVision:
 
     def _forward_one(self, pixel_values: torch.Tensor, grid_cpu: torch.Tensor,
                      fused: bool = False) -> torch.Tensor:
-        """Single-image ViT (grid_cpu [1, 3]) → merged [patches/4, 2048].
-
-        Supports full or window attention with at most 256 patches. When `fused`, return the
+        """Single-image ViT (grid_cpu [1, 3]) → merged [patches/4, 2048]. The validated
+        P3a/P3b path (full or window attention, ≤256 patches). When `fused`, return the
         RAW window-order merged + stash `_pending_rev` (the runtime applies the reverse
         inside assemble_inputs_embeds_rev)."""
         seq = int(grid_cpu.prod(-1).sum().item())
@@ -790,15 +849,23 @@ class WallOssVision:
         # boundary so BUILD and every REPLAY allocate the fused Vision layout from
         # the same t_end=0. embed_rpu/keepalive/KV live in DDR and survive this.
         torch.ops.rpu.spm_alloc_reset_temporary()
+        native_boundaries = (
+            cu_window_seqlens if self._per_window_sdpa else None
+        )
+        planned_chunk_size, a6_plan, planned_stage_descriptor = (
+            self._plan_native_execution(
+                seq, 1, window_mask, native_boundaries)
+        )
         dyn_dims = _vision_graph_dyn_dims(
             [
                 self.num_layers,
                 self._native_chunk_size(grid_cpu),
                 int(self._window),
-                int(torch.rpu.get_debug_export()),
+                0,  # Raw debug export is disabled in the public runtime.
             ],
-            cu_window_seqlens if self._per_window_sdpa else None,
+            native_boundaries,
         )
+        dyn_dims.extend(a6_plan.graph_key_words())
         sig = rpu_backend.graph.GraphSignature(
             op_id="wall_oss_vision",
             shapes=[seq, self.hidden_size],
@@ -808,8 +875,21 @@ class WallOssVision:
         with self._graph_cache.capture(sig):
             out = torch.ops.rpu.qwen25vl_vision_forward(
                 self._handle, embed_rpu, k_caches, v_caches, seq, window_mask,
-                1, cu_window_seqlens if self._per_window_sdpa else None,
+                1, native_boundaries, planned_stage_descriptor,
             )
+        resolved = int(
+            torch.ops.rpu.qwen25vl_vision_get_resolved_chunk_size(
+                self._handle)
+        )
+        if resolved != planned_chunk_size:
+            raise RuntimeError(
+                "Qwen2.5-VL Vision dry/forward chunk disagreement: "
+                f"planned={planned_chunk_size}, forward={resolved}"
+            )
+        self._record_native_execution(
+            a6_plan, seq=seq, image_batch_count=1,
+            chunk_size=planned_chunk_size,
+        )
 
         if self._fused_merger:
             # C++ post_fn already ran the merger; `out` is [seq/4, out_hidden]
@@ -845,8 +925,8 @@ class WallOssVision:
 
         Mirrors :meth:`_forward_one` but runs all g images' patches as one
         ``[1, g·n_i, hidden]`` sequence, passing ``image_batch_count=g`` so the C++
-        routes the generic schedule to image-local SDPA while preserving
-        block-diagonal image isolation."""
+        routes the schedule to image-local SDPA, preserving block-diagonal
+        image isolation."""
         g = grid_group.size(0)
         if not bool(
             (grid_group.prod(-1) == grid_group[0].prod()).all()
@@ -855,17 +935,7 @@ class WallOssVision:
         n_i = int(grid_group[0].prod().item())
         seq = g * n_i
         smu = self._sms * self._sms
-        layer_group = self._layer_group
-        grouped_chunks = (
-            layer_group == 32
-            and seq == _LAYER_GROUP_TOTAL_SEQ)
-        if grouped_chunks:
-            if g != 3 or n_i != 576:
-                raise ValueError(
-                    "experimental 3-image vision schedule requires 3x576 "
-                    f"patches, got {g}x{n_i}"
-                )
-        cache_seq = n_i if grouped_chunks else seq
+        cache_seq = seq
         self._validate_execution_chunks(
             (self._native_chunk_size(grid_group),)
         )
@@ -880,16 +950,18 @@ class WallOssVision:
         def _vm(n):
             if _vi:
                 x = time.perf_counter(); _vp[n] = (x - _vt[0]) * 1000; _vt[0] = x
-        # Memoized batched window/position layout, frame-invariant for a fixed camera set.
-        pos_idx, window_index_multi, reverses, window_mask = self._group_layout(grid_group, seq, smu)
+        # Reuse the window/position layout for a recurring camera grid.
+        (pos_idx, window_index_multi, reverses, window_mask,
+         cu_window_seqlens) = self._group_layout(grid_group, seq, smu)
         if pos_idx.size(0) != seq:
             raise RuntimeError(
                 f"batched vision position rows {pos_idx.size(0)} != sequence {seq}"
             )
         _vm("a_group_layout")
 
-        # Pack the group's patches into one [seq, K] slab. Per-row projection
-        # commutes with window reorder; weight selection follows the input dtype.
+        # Batched patch_embed: pack all g images' patches into one [seq, K] slab and run
+        # ONE GEMM (per-row, so the window reorder commutes; bit-exact vs the per-image
+        # loop). uint8 input → normalize-folded weight; fp32 (HF fallback) → plain weight.
         embed_rpu = self._patch_embed(pixel_values, window_index_multi, seq, smu)
         _vm("b_patch_embed")
         self._keepalive.narrow(0, 0, seq).copy_(pos_idx.to(self._keepalive.device))
@@ -902,26 +974,50 @@ class WallOssVision:
         # _patch_embed may run eager RPU Linear + gather, both before capture.
         # Re-establish the fused graph's deterministic temporary-SPM entry state.
         torch.ops.rpu.spm_alloc_reset_temporary()
+        native_window_boundaries = None
+        planned_chunk_size, a6_plan, planned_stage_descriptor = (
+            self._plan_native_execution(
+                seq, int(g), window_mask, native_window_boundaries)
+        )
+        graph_dyn_dims = _vision_graph_dyn_dims(
+            [self.num_layers, self._native_chunk_size(grid_group),
+             int(self._window), g,
+             0],  # Raw debug export is disabled in the public runtime.
+            native_window_boundaries,
+        )
+        graph_dyn_dims.extend(a6_plan.graph_key_words())
         sig = rpu_backend.graph.GraphSignature(
             op_id="wall_oss_vision",
             shapes=[seq, self.hidden_size],
             # g distinguishes 1×768 (single big image) from g×256 (batched) — they
             # take different SDPA branches and must NOT share a cached graph.
-            dyn_dims=[self.num_layers, self._native_chunk_size(grid_group),
-                      int(self._window), g,
-                      layer_group if grouped_chunks else 0,
-                      int(torch.rpu.get_debug_export())],
+            dyn_dims=graph_dyn_dims,
             dtypes=[torch.float16],
         )
         with self._graph_cache.capture(sig):
             out = torch.ops.rpu.qwen25vl_vision_forward(
                 self._handle, embed_rpu, k_caches, v_caches, seq, window_mask, g,
+                native_window_boundaries, planned_stage_descriptor,
             )
+        resolved = int(
+            torch.ops.rpu.qwen25vl_vision_get_resolved_chunk_size(
+                self._handle)
+        )
+        if resolved != planned_chunk_size:
+            raise RuntimeError(
+                "Qwen2.5-VL Vision dry/forward chunk disagreement: "
+                f"planned={planned_chunk_size}, forward={resolved}"
+            )
+        self._record_native_execution(
+            a6_plan, seq=seq, image_batch_count=int(g),
+            chunk_size=planned_chunk_size,
+        )
         _vm("d_vision_graph(wrap+hw)")
 
         if self._fused_merger:
-            # C++ post_fn ran one packed merger. It returns [seq/4, out_hidden]
-            # window-order with g contiguous per-image
+            # C++ post_fn ran either one packed merger or the exact
+            # weight-outer schedule's image-local merger passes. Both return
+            # [seq/4, out_hidden] window-order with g contiguous per-image
             # blocks of `mu` rows — NOT [1, seq, hidden]. Apply the per-image
             # reverse via a COMPOSED global index (reverses[i] is
             # image-local 0..mu-1; +i*mu lifts it to the packed [seq/4] block) +
@@ -937,7 +1033,8 @@ class WallOssVision:
                     # window-reverse gather + the per-run scatter into one op).
                     self._pending_rev = (gri, [mu] * g)
                     return merged                                       # window order
-                # Keep the reverse on device. The gather needs ~seq/4·out_hidden of
+                # Keep the reverse ON-DEVICE (vs the old CPU round-trip: download 786 KB +
+                # CPU gather + re-upload). The on-device gather needs ~seq/4·out_hidden of
                 # SPM staging, which OOMs while the vision graph still holds the arena —
                 # so free it FIRST. We are OUTSIDE the capture, and the cached graph keeps
                 # its baked [0,peak] offsets for the next replay, so this plain reset is
@@ -970,17 +1067,30 @@ def build_wall_oss_vision(
     fp16_ckpt_dir: str | None = None,
     execution_config=None,
     per_window_sdpa: bool = False,
+
+    _owned_vision: WallOssVision | None = None,
 ) -> WallOssVision:
     """Load `visual.*` weights and install the RPU Qwen2.5-VL ViT vision tower.
 
-    window=False: every layer is full attention (MASK_NONE), no reorder.
-    window=True: block-diagonal window attention with fullatt_block_indexes
+    window=False (P3a): every layer is full attention (MASK_NONE), no reorder.
+    window=True  (P3b): block-diagonal window attention with fullatt_block_indexes
     as full-attn layers + CPU get_window_index reorder/reverse.
 
     ``ckpt_dir``/``fp16_ckpt_dir`` default to ``None`` → resolved at call time
     under the current ``$RPU_MODEL_CACHE`` (W8A16 vs fp16 registry path).
     """
-    from rpu_backend.api._execution import normalize_rpu_execution
+    from rpu_backend.api._execution import ExecutionSession, normalize_rpu_execution
+    from rpu_backend.api._execution import _require_execution_process_safe
+    _require_execution_process_safe()
+    if _owned_vision is not None:
+        session = getattr(_owned_vision, "_retirement_session", None)
+        parent = getattr(session, "_owner", None)
+        if (not isinstance(_owned_vision, WallOssVision) or not isinstance(session, ExecutionSession)
+                or getattr(parent, "_execution_session", None) is not session
+                or getattr(parent, "_diagnostic_vision", None) is not _owned_vision
+                or _owned_vision._handle is not None or _owned_vision._closed):
+            raise RuntimeError("owned Vision build requires its cold parent and pending native owner")
+        session.require_cold()
     vision_execution = normalize_rpu_execution(
         {
             "vision": ({} if execution_config is None else
@@ -998,15 +1108,12 @@ def build_wall_oss_vision(
             )
     if per_window_sdpa and not window:
         raise ValueError("per_window_sdpa=True requires window=True")
-    experimental_schedule = _claim_experimental_schedule()
-    if per_window_sdpa and experimental_schedule != 0:
-        raise ValueError(
-            "per-window Vision SDPA is incompatible with layer grouping"
-        )
+    fused_merger = rpu_env_bool(
+        "RPU_WALL_OSS_VISION_FUSED_MERGER",
+    )
+    rope_spm = rpu_env_bool("RPU_WALL_OSS_VISION_ROPE_SPM")
     ckpt_dir = _resolve_ckpt(ckpt_dir, w8a16)
     fp16_ckpt_dir = _resolve_ckpt(fp16_ckpt_dir, False)
-    if w8a16:
-        validate_w8_nvfp4_checkpoint_pair(ckpt_dir, fp16_ckpt_dir)
     cfg = json.load(open(f"{ckpt_dir}/config.json"))
     vc = cfg["vision_config"]
     HID = vc["hidden_size"]            # 1280
@@ -1064,7 +1171,7 @@ def build_wall_oss_vision(
             qs, ks, vs = (qkv_scale[:DIM].contiguous(),
                           qkv_scale[DIM:2 * DIM].contiguous(),
                           qkv_scale[2 * DIM:3 * DIM].contiguous())
-            os = gr(f"{p}.attn.proj.weight_scale")
+            o_scale = gr(f"{p}.attn.proj.weight_scale")
 
         gu_w = gr(f"{p}.mlp.gate_up_proj.weight")
         gu_b = gf(f"{p}.mlp.gate_up_proj.bias")
@@ -1079,7 +1186,12 @@ def build_wall_oss_vision(
         gb = _pad_1d(gb.contiguous(), INTER_PAD)
         ub = _pad_1d(ub.contiguous(), INTER_PAD)
         down_key = f"{p}.mlp.down_proj.weight"
-        dw = _pad_cols(gr(down_key), INTER_PAD)
+        dw = _pad_cols(
+            (
+                gr(down_key)
+            ),
+            INTER_PAD,
+        )
         db = gf(f"{p}.mlp.down_proj.bias")  # [HID]
         if w8a16:
             gu_scale = gr(f"{p}.mlp.gate_up_proj.weight_scale")
@@ -1104,11 +1216,13 @@ def build_wall_oss_vision(
             o_w.append(_to_rpu_int8(tp_row_swizzle_mc_weight(ow, _VISION_CORES, dwidth=1)))
             gate_w.append(_to_rpu_int8(tp_col_swizzle_mc_weight(gw, _VISION_CORES, dwidth=1)))
             up_w.append(_to_rpu_int8(tp_col_swizzle_mc_weight(uw, _VISION_CORES, dwidth=1)))
-            down_w.append(_to_rpu_int8(
-                tp_row_swizzle_mc_weight(dw, _VISION_CORES, dwidth=1)
-            ))
+            down_w.append(
+                _to_rpu_int8(
+                    tp_row_swizzle_mc_weight(dw, _VISION_CORES, dwidth=1)
+                )
+            )
             q_s.append(_to_rpu_half(qs)); k_s.append(_to_rpu_half(ks)); v_s.append(_to_rpu_half(vs))
-            o_s.append(_to_rpu_half(os))
+            o_s.append(_to_rpu_half(o_scale))
             gate_s.append(_to_rpu_half(gate_scale))
             up_s.append(_to_rpu_half(up_scale))
             down_s.append(_to_rpu_half(down_scale))
@@ -1150,16 +1264,20 @@ def build_wall_oss_vision(
         num_layers=num_layers, batch_size=1, max_seq_len=max_seq_len,
         num_kv_heads=NHEADS, head_dim=HD, attn_tp=min(8, NHEADS),
     )
+    if _owned_vision is not None:
+        _owned_vision.cache = cache
+        _owned_vision._keepalive = (weight_args, freq_cos, freq_sin)
     graph_cache = rpu_backend.graph.GraphCache()
+    if _owned_vision is not None:
+        _owned_vision._graph_cache = graph_cache
 
     # patch_embed: fold Conv3d [HID,3,2,14,14] → Linear [HID, 1176], CPU fp32, no bias.
     patch_w = g_cpu("visual.patch_embed.proj.weight").reshape(HID, -1).contiguous()
 
     # merger: RMSNorm (CPU fp32) → reshape(-1, 4*HID) → Linear → GELU → Linear.
-    # The two large Linears run on RPU fp16. Weights are col-partition swizzled
-    # (8-core) to match rpu_linear's rpu_get_linear_partition choice (both shapes
-    # satisfy can_row && can_col → returns col). RMSNorm stays CPU fp32 so
-    # variance is accumulated in fp32.
+    # The Linears run on RPU FP16 with eight-core column-partition weights,
+    # matching rpu_get_linear_partition for these shapes. The CPU RMSNorm
+    # fallback retains FP32 variance calculation before the RPU projection.
     merge_hidden = HID * SMS * SMS    # 5120
     ln_q_w = g_cpu("visual.merger.ln_q.weight")
     ln_q_w_rpu = _to_rpu_half(ln_q_w)               # device weight for the on-device rms_norm
@@ -1181,6 +1299,8 @@ def build_wall_oss_vision(
     merger_args = (
         ln_q_w_rpu, m0_w_rpu, m0_b_rpu, m2_w_rpu_row, m2_b_rpu, OUT_HID
     )
+    if _owned_vision is not None:
+        _owned_vision._keepalive += (merger_args,)
 
     def merger(x: torch.Tensor, device_out: bool = False) -> torch.Tensor:
         # x [seq, HID] RPU fp16 → [seq/4, OUT_HID]. device_out=True keeps the result on
@@ -1197,41 +1317,64 @@ def build_wall_oss_vision(
         xr = F.linear(xr, m2_w_rpu, m2_b_rpu)        # → [N, 2048]
         return xr if device_out else xr.float().cpu()   # device fp16 OR CPU fp32 (legacy)
 
-    # Prepare the col-swizzled patch_embed weight with a 16-aligned K dimension.
+    # On-device patch_embed weight: pad K (1176) to a multiple of 16, col-swizzle, upload
+    # once. F.linear on rpu then replaces the per-frame CPU fp32 GEMM.
     _pe_k = ((patch_w.size(1) + 15) // 16) * 16
     patch_w_rpu = _to_rpu_half(tp_col_swizzle_mc_weight(
         F.pad(patch_w.to(torch.float16), (0, _pe_k - patch_w.size(1))), _VISION_CORES))
 
-    # The raw handle remains builder-owned until WallOssVision installs its
-    # tracked finalizer. Any native configuration or object-construction error
-    # therefore has one deterministic cleanup path instead of waiting for GC.
+    # Standalone handles stay builder-owned until their tracked finalizer exists;
+    # diagnostic children publish the handle immediately to the parent instead.
     handle, keepalive = _configure_qwen25vl_vision_handle(
         set_weights=set_weights,
+        max_seq_len=cache.max_seq_len,
         weight_args=weight_args,
         freq_cos=freq_cos,
         freq_sin=freq_sin,
         merger_args=merger_args,
+        execution_routes=(
+            rope_spm,
+            fused_merger,
+        ),
         chunk_size=(
             0 if execution_chunk_size == "auto"
             else int(execution_chunk_size)
         ),
         per_window_sdpa=per_window_sdpa,
+        _owned_vision=_owned_vision,
     )
-    transferred = False
+    vis = None
     try:
-        vis = WallOssVision(
+        arguments = dict(
             handle=handle, cache=cache, graph_cache=graph_cache,
-            keepalive=keepalive, patch_w=patch_w, merger=merger,
+            keepalive=(keepalive if _owned_vision is None else
+                       (keepalive, _owned_vision._keepalive)), patch_w=patch_w, merger=merger,
             hidden_size=HID, num_layers=num_layers, spatial_merge_size=SMS,
             window=window, window_size=WIN_SIZE, patch_size=PATCH,
-            experimental_schedule=experimental_schedule,
+
             execution_chunk_size=execution_chunk_size,
             per_window_sdpa=per_window_sdpa,
+            fused_merger=fused_merger,
         )
-        transferred = True
+        if _owned_vision is None:
+            vis = WallOssVision.__new__(WallOssVision)
+            vis._handle, vis._graph_cache, vis._closed = handle, graph_cache, False
+            vis._gc_retirement_enabled = False
+        else:
+            vis = _owned_vision
+        WallOssVision.__init__(vis, **arguments)
         vis._patch_w_rpu = patch_w_rpu
         vis._pe_k = _pe_k
         return vis
-    finally:
-        if not transferred:
-            _destroy_qwen25vl_vision_handle(handle)
+    except BaseException as error:
+        if _owned_vision is None:
+            from rpu_backend.adapters.wall_oss._retirement import _cleanup_build_failure
+            pending = (weight_args, cache, graph_cache, freq_cos, freq_sin, merger_args, keepalive)
+            if vis is not None:
+                vis._gc_retirement_enabled = False
+                vis._retirement_keepalive = pending
+                _cleanup_build_failure(error, vis, vis.close)
+            else:
+                _cleanup_build_failure(error, (handle, pending),
+                                       lambda: _destroy_qwen25vl_vision_handle(handle))
+        raise

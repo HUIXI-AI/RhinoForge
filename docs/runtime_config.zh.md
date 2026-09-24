@@ -56,52 +56,77 @@ IMPORT、NATIVE、MODEL 或 BUILD 设置时应使用新进程；不要认为在�
 
 ## TOML 参数目录
 
-完整 runner 将四个配置层分开：
+[配置索引](../examples/configs/README.md) 列出全部当前模板路径。每个模型只使用一套目录：
+Qwen3 在 `qwen3/text`，Qwen3-VL 分为 `text/vision/vl`，Qwen3.5 分为 `text/vl/legacy`
+（legacy 是独立 checkpoint 格式）。LingBot 只保留 `v2`，RhinoVLA 按 `v1/v3`，
+Wall-OSS 使用 `base`，Pi0.5 按 `2cam/3cam` 且只提供八核配置。根目录不放散落的模型 TOML。
 
-| 表 | 公共字段 | 归属 |
+### 模型与策略配置
+
+| 表 | 字段 | 作用 |
 |---|---|---|
-| `[runner]` | `target` | 选择 `examples/run_model.py --list-targets` 报告的一个 target。 |
-| `[runner.env]` | 本页记录的任意非诊断变量，但不包括 `RPU_KERNEL_LIB_PATH` 和类似凭据的名称 | 在导入 PyTorch 或 RhinoForge 前应用。省略的值继续从 shell 继承。只有在提供完整、已验证配置时才应更改模型配置 selector。 |
-| `[runner.torch_profile]` | `enabled`, `output`, `record_shapes`, `profile_memory`, `with_stack` | 配置覆盖整条命令的 Torch trace。 |
-| `[rpu_execution.<stage>]` | `chunk_size`；`prefill` 还接受 `padding_rows` 和 `padding_budget` | 冷态、按 handle 生效的规划。下面的 target 矩阵是 allowlist；不支持的 stage 或字段会在配置校验时失败。 |
-| `[model]`, `[generation]`, `[request]` | 下文列出的 target 特定字段 | 由所选直接 example 消费。路径和输入仍由部署方负责。 |
-| `[runtime]` | 仅限 RhinoVLA factory 定义的字段 | 非空 mapping 会原样传给受信任的外部 runtime factory。RhinoForge 无法安全地发明或校验模型仓库特定的名称。 |
+| `[example]` | `profile_id`、`target`、`registry_alias`、`dtype`、可选 `architecture` | 选择精确配置身份，实际 checkpoint 元数据仍由加载器检查。 |
+| `[example.opt_in]` | profile 规定的环境值 | 导入 backend 前设置，拒绝继承环境中的冲突值；必须匹配所选 profile。 |
+| `[input]` | `checkpoint` 及模型对应的 prompt/images/tensor、生成或策略选项 | 显式 checkpoint 优先于 alias。请求与输入文件由调用方提供，见各模型 README。 |
+| `[run]` | `warmup`、`runs`、`seed`、`torch_num_threads`、`inference_mode`、`output_dir` | 控制重复推理和主机设置；权重加载与 Graph 准备在计时样本之前。 |
+| `[run]` | `profile`，以及入口支持的 `timing_mode`、`summary_statistic`、`warmup_decode_steps` | Torch profiler 单独执行一次诊断调用；生成计时字段按模型检查。 |
+| `[rpu_execution.model]` | `num_cores` | 冷态计算预算，由模型/profile 准入；Pi 示例固定八核。 |
+| `[rpu_execution.<stage>]` | `chunk_size`、支持的布尔控制和 prefill padding 字段 | 冷态按 handle 规划；构造器检查实际 stage、字段和形状。 |
+| `[rpu_execution.components.<component>.<stage>]` | 支持的逐组件设置 | 复合模型覆盖项；组件 ID 与字段在安装前检查。 |
 
-`padding_rows` 可以是 `"auto"` 或精确的非负整数。精确整数和 `padding_budget` 是二选一，
-不能同时生效。所有 chunk size 都必须是 `"auto"` 或 16 的正整数倍。loader 或 policy
-还可以将每个值进一步收窄到模型允许的配置范围。
+`example.profile_id` 对应 [profiles.json](../examples/configs/profiles.json)，只包含当前模板
+实际引用的身份和约束，用于绑定精度、组件和 opt-in，不代表模型质量或性能认证。
+Qwen 的 `input.decode_steps` 是 prefill 首 token 之后的 decode 调用数；
+`input.prefill_tokens` 是显式构造的输入长度，不能当作旧文件的 `max_new_tokens` 使用。
 
-`--check-config` 会校验 `[runner.env]` 名称和 TOML 标量类型，但不会重复实现每个变量的
-解析器。下表中的值 grammar 和精确配置兼容性仍由构造或 preflight 阶段最终决定。
+Pi0.5 使用 `[pi05].precision`，其 `[input]` 包含 `checkpoint`、`batch`、`cameras`、
+`text_tokens` 和 `num_steps`。runner 绑定对应公开优化 profile 并检查 paired prefill
+几何，见 [Pi 配置](../examples/configs/pi05/README.md)。
 
-### 公共和模型特定参数映射
+RhinoVLA 的 `input.runtime_factory`、`factory_config`、`request` 分别指定调用方信任的实现、
+JSON factory 配置和 tensor-only 请求。模型字段由所选版本的 factory 定义；RhinoForge
+绑定 checkpoint、step 数和冷态执行设置，见 [RhinoVLA 配置](../examples/configs/rhinovla/README.md)。
 
-每个模型配置只保留一个模板。同一个文件既可交给 direct example，也包含公共 runner、
-profiler 字段和所有适用的 `rpu_execution` stage。
+### 独立集成模板与调用方自有文件
 
-| Target / 模型家族 | 模板 | 接受的规划 stage | 模型和请求字段 | 模型负责的 runtime 分组 |
-|---|---|---|---|---|
-| `causal_lm` · Qwen3 | [`qwen3_0_6b.toml`](../examples/configs/qwen3_0_6b.toml) | `prefill` | `model.alias` 或 `model.checkpoint`，`model.local_files_only`；`generation.prompt`，`generation.max_new_tokens` | 通用/cache 设置；精确量化配置可以增加其已记录的 selector |
-| `causal_lm` · Llama | [`llama_3_2_1b.toml`](../examples/configs/llama_3_2_1b.toml) | `prefill` | 与 CausalLM 相同的字段 | 通用/cache 设置 |
-| `qwen3_5_text` | [`qwen3_5_0_8b.toml`](../examples/configs/qwen3_5_0_8b.toml) | `prefill` | 与 CausalLM 相同的字段 | [模型特定公共设置](#model-specific-public-settings)；新集成优先使用 `rpu_execution` |
-| `qwen3_5_vision` | [`qwen3_5_vision_2b.toml`](../examples/configs/qwen3_5_vision_2b.toml) | `prefill` | Qwen3.5 模型字段、图像、prompt 和生成长度 | [Qwen3.5 Vision selector](#qwen35-vision-selectors)；状态按精确配置判定 |
-| `qwen3_vl` | [`qwen3_vl_2b.toml`](../examples/configs/qwen3_vl_2b.toml) | `prefill`, `vision` | `model.alias` 或 `model.checkpoint`，`model.local_files_only`；`request.image` 和 `request.images` 必须二选一，另含 prompt 和生成长度 | [Qwen3-VL 共享 Vision 配置](#qwen3-vl-shared-vision-profile) |
-| `dinov3` | [`dinov3_vit_b.toml`](../examples/configs/dinov3_vit_b.toml) | `vision` | `model.alias` 或 `model.checkpoint`，`model.local_files_only`；`request.image` | 通用/cache 设置 |
-| `siglip` | [`siglip.toml`](../examples/configs/siglip.toml) | `vision` | Pi0.5 bundle alias/checkpoint 和一张或多张图像路径 | [Pi0.5 配置](#pi05-profile)；仅 Component-only 输出 |
-| `pi05` | [`pi05_libero.toml`](../examples/configs/pi05_libero.toml) | `prefill`, `vision`, `action` | `model.alias` 或 `model.checkpoint`；`request.batch_file`，`request.num_steps`，`request.prepare_graphs` | [Pi0.5 配置](#pi05-profile)和模型特定公共设置 |
-| `wall_oss` | [`wall_oss.toml`](../examples/configs/wall_oss.toml) | `prefill`, `vision`, `action` | checkpoint/alias、精度与 FP16 来源、dataset/camera、state/action 字段；images、instruction、proprioception 和 noise | [Wall-OSS 配置](#wall-oss-profile) |
-| `hy_embodied` | [`hy_embodied.toml`](../examples/configs/hy_embodied.toml) | 无；非空 `rpu_execution` 会被拒绝 | checkpoint/alias，`dtype`，`prefix_len`；三张 images、instruction、state、noise seed | [Hy-Embodied 配置](#hy-embodied-profile) |
-| `gemma4` | [`gemma4.toml`](../examples/configs/gemma4.toml) | `prefill`（仅 `chunk_size`） | checkpoint/alias、local-only、最大序列长度和 Source-only 确认；prompt 和生成长度 | 通用/cache 设置；Source-only |
-| `gr00t` | [`gr00t.toml`](../examples/configs/gr00t.toml) | `prefill`, `vision`, `action` | GR00T 与 Qwen3-VL checkpoint/alias、embodiment ID 和 Source-only 确认；调用方预处理 tensor 文件、seed 和 step 数 | [GR00T 配置](#gr00t-profile)；Source-only |
-| `lingbot2` | [`lingbot2.toml`](../examples/configs/lingbot2.toml) | 无 | checkpoint/alias、精确 dtype/camera/image/token 配置和受控确认；三张 images、instruction、proprioception 和 seed | [LingBot-VLA-V2 配置](#lingbot-vla-v2-profile) |
-| `g05` | [`g05.toml`](../examples/configs/g05.toml) | 无 | checkpoint/alias、最大序列长度和受控确认 | 仅集成检查；由官方模型仓库构造 policy |
-| `internvla_navdp` | [`internvla_navdp.toml`](../examples/configs/internvla_navdp.toml) | 无 | 根 alias/checkpoint、NavDP checkpoint、SHA256 manifest 和受控确认；调用方 embeddings、sample 数和 seed | [InternVLA-N1 与 NavDP 配置](#internvla-n1-and-navdp-profiles)；仅 component |
-| `rhinovla` | [`rhinovla.toml`](../examples/configs/rhinovla.toml) | 仅限受信任 runtime factory 声明的 stage 和字段 | `model.checkpoint`，`model.runtime_factory`；`request.request_json`；factory 定义的 `[runtime]` | [RhinoVLA 配置](#rhinovla-profile)和外部 factory 契约 |
+G0.5、GR00T、NavDP、SigLIP 使用各自的 `[runner/model/request]` 集成模板。调用方已有的
+同格式文件仍可运行，仓库不为同一模型额外保存一份兼容模板。
 
-下面穷举记录模型负责的 runtime 分组，因为它们确实是源码读取项；但其中大多数是密封的
-配置 selector，而不是可以独立调优的用户旋钮。因此，模板展示稳定的公共配置面，
-不会为每个 selector 猜测一个值后全部启用。把所有 selector 默认值复制到 TOML 中
-可能覆盖 facade 负责的配置，并悄然产生未验证组合。
+| 表 | 字段 | 作用 |
+|---|---|---|
+| `[runner]` | `target` | 选择独立集成入口。 |
+| `[runner.env]` | 本页记录的非诊断变量，不包含运行时资产路径或凭据 | 在导入 Torch/backend 前设置，省略项继续继承环境。 |
+| `[runner.torch_profile]` | `enabled`、`output`、`record_shapes`、`profile_memory`、`with_stack` | 整条命令的 Torch trace。 |
+| `[model]`、`[request]`、`[generation]` | 所选直接 example 接受的字段 | 模型位置和调用方输入。 |
+| `[runtime]` | 调用方旧 RhinoVLA 文件中由可信 factory 定义的字段 | 经公开 factory 合同传递。 |
+
+不要把 `[input]/[run]` 混进 `[runner/model/request]` 文件，检查时会拒绝。
+`--check-config` 不导入 Torch 或访问板卡，只检查结构和冷态约束，不检查本地权重或认证请求。
+
+`padding_rows` 为 `"auto"` 或非负整数；精确值不能与 `padding_budget` 同时启用。
+chunk size 为 `"auto"` 或正 16 倍数，并受各 loader 的实际 profile 进一步限制。
+完整冷态规划见[非环境变量 runtime 控制](#非环境变量-runtime-控制)。
+
+## Host 执行设置
+
+这些参数属于应用进程及其安装的 CPU runtime，不属于 RPU planner。Pi 优化示例通过
+统一 `run_model.py` 在导入 Torch 前设置下列值；库内推理不会修改它们。更改后使用新
+进程；直接 example 脚本不会代替统一 runner 应用 `[runner.env]`。
+
+| Variable | Pi 建议值 | 读取 / 更改 | 作用与影响 |
+|---|---:|---|---|
+| `OMP_NUM_THREADS` | `8` | CPU runtime 初始化 / **IMPORT** | 限制 OpenMP host 工作线程，实际效果取决于 Torch 构建；显式 Torch 线程设置优先。 |
+| `MKL_NUM_THREADS` | `8` | CPU runtime 初始化 / **IMPORT** | 安装的 CPU runtime 使用 MKL 时限制其线程数。 |
+| `MIMALLOC_PURGE_DELAY` | `1000` | mimalloc 初始化 / **IMPORT** | 对齐上游 Pi host 设置；在含 mimalloc 的构建中延迟释放空闲页，可能增加保留内存。 |
+| `MIMALLOC_ARENA_PURGE_MULT` | `0` | mimalloc 初始化 / **IMPORT** | 对齐上游 Pi host 设置；调整 arena purge 策略，具体行为取决于 runtime 版本。 |
+
+Qwen3、Qwen3-VL、Qwen3.5 和 Pi0.5 接受冷态 `model.num_cores` 与分组件
+`linear_acc32`。核数是整数 `4/6/8`，实际准入仍由 checkpoint、量化与输入 profile
+收窄；Pi 优化 profile 和量化 Qwen 配置保持八核约束。`linear_acc32` 只接受布尔值，
+`false`（默认）选择 ACC16，`true` 选择 ACC32。Qwen3、Qwen3.5 文本入口在 `prefill`
+设置，图文入口还可在 `vision` 设置，Pi 分别在 `prefill/vision/action` 设置。
+Qwen3-VL 另接受 `prefill.fast_replay`（默认 `true`），不接受 `vision.fast_replay`
+或独立 `decode` 表。配置在安装权重前绑定；改变后应关闭模型、重新加载。
 
 ## 通用和 cache 设置
 
@@ -128,6 +153,7 @@ profiler 字段和所有适用的 `rpu_execution` stage。
 | 变量 | 未设置时的默认值与接受值 | 读取 / 更改 | 作用域、效果与风险 |
 |---|---|---|---|
 | `RPU_QWEN3_SPM_KV_BY_MHA` | `1`；仅接受精确 `0` 或 `1` | Qwen3 fused handle 构造 / **MODEL** | 允许已认证的短 prefill 配置在精确 plan 可容纳时将临时 K/V 保留在 SPM。`0` 固定使用 DDR cache attention；不符合条件的 shape 会自动使用 DDR。 |
+| `QWEN3_5_QUANT_ALLOW_UNCERTIFIED` | `0`；只有精确字符串 `1` 启用 | Qwen3.5 量化 preflight / **MODEL** | 允许未认证的 W8/W4 受控评估；不会跳过 checkpoint 格式、投影范围或数值检查。 |
 | `QWEN3_5_TEXT_CHUNK` | `0` auto；十进制 `0` 或至少为 `64` 的整数 | Qwen3.5 text 安装 / **MODEL** | 冷态、按 handle 生效的 prefill 上限。无效值或更小的正值会失败；新集成使用 `rpu_execution`。 |
 | `QWEN3_5_TEXT_PADDING_BUDGET` | `64`；十进制整数 `0..64` | Qwen3.5 text 安装 / **MODEL** | 冷态可选 padding budget。它会改变 prefill plan 和 Graph signature。 |
 | `RPU_QWEN3_5_FREE_HF_WEIGHTS` | **PB(true)** | Qwen3.5 权重安装 / **MODEL** | 已存在转换副本后，`1` 释放原始 HF 权重；`0` 保留并增加 host 内存。 |
@@ -147,7 +173,7 @@ chunk 和 padding 选择应优先使用公共 loader 或 policy 的 `rpu_executi
 | 变量 | 未设置时的默认值与接受值 | 读取 / 更改 | 作用域、效果与风险 |
 |---|---|---|---|
 | `QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED` | `0`；**E1** | Qwen3.5/G0.5 Vision preflight / **MODEL** | 启用 numeric-blocked Qwen3.5 Vision 2B/4B 和通用 G0.5 Vision 的受控评估。它不认证图像输出。 |
-| `QWEN3_VL_32B_ALLOW_GRAPH_BLOCKED` | `0`；**E1** | Preflight / **MODEL** | 仅用于精确 Qwen3-VL 32B W8A16 graph-blocked 评估。 |
+| `QWEN3_VL_32B_ALLOW_GRAPH_BLOCKED` | `0`；**E1** | Preflight / **MODEL** | 为兼容保留旧名称，仅用于精确 Source-only Qwen3-VL 32B W8A16 候选。它要求匹配的预留 buffer runtime 和未修改的精确 LKN 默认值；不认证数值、任务、性能或发布 runtime 门。 |
 | `RPU_LINGBOT2_ALLOW_UNVALIDATED` | `0`；**E1** | Preflight / **MODEL** | LingBot-VLA-V2 受控配置；输出没有机器人认证。 |
 | `RPU_INTERNVLA_N1_ALLOW_NUMERIC_BLOCKED` | `0`；**E1** | Preflight / **MODEL** | InternVLA-N1 legacy 受控评估。 |
 | `RPU_S2_SDPA_BF16` | 只接受未设置/空/`0`；字面值 `1` 和其他所有值都会被拒绝 | Preflight / **MODEL** | InternVLA policy 对不可用 asset 的 tripwire；保持关闭。 |
@@ -169,11 +195,11 @@ producer 在 reduction 前清理 inactive shard。见
 | 变量 | 未设置时的默认值与接受值 | 读取 / 更改 | 作用域、效果与风险 |
 |---|---|---|---|
 | `RPU_DEEP_FAST_REPLAY` | 关闭；首字符不是 `0` 的任意非空值会启用 | Fused handle 构造 / **MODEL** | full-body replay 时跳过已审计的 setup 工作。配置必须证明每个被跳过的 input/layout 仍有效。 |
-| `RPU_FASTREPLAY_SKIP_SYNC` | 关闭；不以 `0` 开头的非空值会启用 | Graph BUILD / **BUILD** | 仅在完全跳过的 replay 中省略冗余 mutable-parameter scan。错误使用可能 replay 过期参数。 |
+| `RPU_FASTREPLAY_SKIP_SYNC` | 开启；空值、`0`/`false`/`off` 禁用 | Graph BUILD / **BUILD** | 仅当本轮 replay 未触碰 Graph 所有的 kernel 参数，且每个 Launch register-state token 仍与 prepared batch 一致时，通用 Graph executor 才省略 mutable-kernel scan。mutable DMA endpoint 每轮独立解析和更新，提交前会发布全部 command 写入；通用脏标记、token 变化或 token 查询失败都会保守执行完整 scan。该变量只用于诊断退出，不是模型 route。 |
 | `RPU_FUSED_COEXIST_KEEP_PERSISTENT_GEN` | 关闭；精确 `1`、`true`、`True` 或 `on` 会启用 | 首次原生 coexistence 使用 / **NATIVE** | 在配置负责的 subsystem handoff 之间保留 persistent SPM generation。归属错误可能破坏后续执行。 |
 | `RPU_GRAPH_DEFER_TO_COPY` | 没有独立默认值；legacy alias 接受 `auto`/空、`0`/`off`/`false`，其他任意非空值强制开启 | 首次 host-op gate 使用 / **NATIVE** | 仅当未设置 `RPU_GRAPH_HOST_OP_DEFER_GATE` 时查询。避免同时设置两者。 |
 | `RPU_GRAPH_HOST_OP_DEFER_GATE` | `auto`；`auto`/空、`0`/`off`/`false`，其他任意非空值强制开启 | 首次 host-op gate 使用 / **NATIVE** | 控制 capture 期间 stable host input 的 deferral。对不稳定 storage 强制开启会产生过期数据。 |
-| `RPU_SKIP_IDLE_RECORD_FUNCTION` | 关闭；`1`/`on`/`true`/`True` 会启用 | 首次 Python graph scope / **MODEL** | 只在 profiler 关闭时省略 idle profiler scope。profiling 时保留 scope，其他情况下减少 host 开销。 |
+| `RPU_SKIP_IDLE_RECORD_FUNCTION` | 开启；`0`/`off`/`false` 会禁用 | 首次 Python graph scope / **MODEL** | 只在 profiler 关闭时省略 idle profiler scope。profiling 时保留 scope，其他情况下减少 host 开销。 |
 
 ### KV、linear、normalization 与 scheduling
 
@@ -186,13 +212,13 @@ producer 在 reduction 前清理 inactive shard。见
 | `RPU_KVINSERT_V16_ANY_TP` | 关闭；除 `0`/`false`/`False` 外的非空值 | 首次原生使用 / **NATIVE** | 允许其他 whole-head parallel factor 使用 aligned 路径。不支持的 geometry 可能无法通过 admission。 |
 | `RPU_LINEAR_ACC32` | 关闭；严格接受 `0`/`1`、`false`/`true` 或 `off`/`on` 及列出的大小写变体；无效值失败 | 首次原生使用 / **NATIVE** | 为 tiled linear 家族选择 FP32 accumulation。它会改变 tile、内存使用、性能和数值。 |
 | `RPU_RMSNORM_NEWTON` | 关闭；严格接受 `0`/`1`、`false`/`true` 或 `off`/`on` 及列出的大小写变体；无效值失败 | 首次原生使用 / **NATIVE** | 选择 refined normalization。它会改变数值，也可能改变可用 schedule。 |
-| `RPU_RMSNORM_VWARP` | `0`；`0`、`16`、`32` 或 `auto`；未知文本回退到 `0` | 首次原生使用 / **NATIVE** | 选择允许的 vector row schedule。不支持的 divisibility 会回退；timing 会变化。 |
+| `RPU_RMSNORM_VWARP` | 兼容输入；Hy-VLA 严格接受空/`0`/`off`/`false`、`16`、`32` 或 `auto`，Wall-OSS 拒绝该变量 | owner cold-plan admission / **NATIVE** | 归属 adapter 将其翻译成冻结的 per-handle capability。Hy-VLA 无效文本在进程 claim 前失败；原生 handle 不会重新读取。 |
 
 <a id="qwen35-vision-selectors"></a>
 ### Qwen3.5 Vision selector
 
 这些 selector 只在 numeric-blocked 受控评估门允许 Qwen3.5 Vision 后生效，
-不会扩大其 Experimental 状态。
+不会扩大其 Source-only 状态。
 
 | 变量 | 未设置时的默认值与接受值 | 读取 / 更改 | 作用域、效果与风险 |
 |---|---|---|---|
@@ -203,7 +229,14 @@ producer 在 reduction 前清理 inactive shard。见
 <a id="gr00t-profile"></a>
 ## GR00T 配置
 
-公共 GR00T builder 会在构造前提供其 facade 默认值。
+builder 将 base-zero-shot DROID 与 finetuned DROID 作为两个不同的精确 profile。
+前者是两相机、时间索引 `[-15,0]`（四图），后者是两相机、时间索引 `[0]`
+（双图）；两者都要求 embodiment 24。profile、checkpoint revision、
+processor/statistics 身份和 CPU 输入范围都在模型构造前检查。gated Cosmos 的精确
+八文件 manifest 也会在构造前校验，通用 Qwen3-VL-2B alias 不能替代。冻结的
+processor input-oracle 为 S277/S145，KVPAD16 floor 为 288/160，profile-local
+候选 cache 为 320/256。共享 512 行分配与 upstream 1024 行 action-position table
+都不是输入支持上限；仍须通过 single-chunk SPM 与生命周期验证。
 
 | 变量 | 未设置时的默认值与接受值 | 读取 / 更改 | 作用域、效果与风险 |
 |---|---|---|---|
@@ -214,35 +247,42 @@ producer 在 reduction 前清理 inactive shard。见
 <a id="hy-embodied-profile"></a>
 ## Hy-Embodied 配置
 
-`HyEmbodiedPolicy` 会在构造前应用完整的 scoped 配置。下面的原始默认值描述直接使用
-adapter 的行为；行中列出的 facade 默认值是普通公共 policy 值。切换 policy 配置时应
-使用新进程。
+直接 builder 或 `HyEmbodiedPolicy` 获取进程归属前，会先把 builder 默认值、facade
+dtype 和 `runtime_env` override 合并成一个不可变 cold plan。下面标为严格解析的 RMS、
+component、persist、bool 和量化 selector 若格式错误，会在 allocator policy 选择、
+terminal poison 和 safetensors tensor 读取前失败。权重 layout、原生 handle、cache
+geometry 和 Graph signature 只从该 plan 获取决定，不会再从环境变量重新读取这些
+selector。下面的严格 token 都会去除首尾空白并忽略大小写，component list 以逗号
+分隔；显式空 component selector 会禁用全部 component，仅含逗号和空 token 的 list
+会失败。切换 policy 配置必须使用新进程。固定三相机 facade 的 `prefix_len` 仅接受
+`{192, 208, 224, 240}`。
 
 | 变量 | 未设置时的默认值与接受值 | 读取 / 更改 | 作用域、效果与风险 |
 |---|---|---|---|
-| `RPU_HY_VLA_ACTION_MLP_MC` | 原始未设置表示 8 cores；`0`/`off`/`false`/`False` 表示 1，其他所有值表示 8；facade 为 `1` | Weight/build setup / **MODEL** | 选择 multi-core action-MLP 执行。它会改变 reduction order，且必须继续满足配置数值门禁。 |
-| `RPU_HY_VLA_ATTN_TP8` | 原始默认关闭；`1`/`true`/`True`/`on`；facade 为 `1` | 权重安装 / **MODEL** | 为 eight-core attention 复制 KV head。必须重建 cache geometry 和权重。 |
-| `RPU_HY_VLA_CACHING_ALLOC` | 开启；`0`/`false`/`False`/`off` 会禁用 | Hy-VLA 构造 / **MODEL** | 为该 policy 启用进程 caching allocator。它会改变内存保留；测量 free memory 前调用 `empty_cache()`。 |
-| `RPU_HY_VLA_DENOISE_UNROLL` | 原始默认关闭；`1`/`true`/`True`/`on`；facade 为 `1` | Action 构造 / **MODEL** | 将 denoise loop 记录为一个配置负责的 Graph。它会改变 Euler-state precision 和数值结果。 |
-| `RPU_HY_VLA_FAST_REPLAY` | 原始默认关闭；`0`/`off`/`false`、`1`/`on`/`true`，或命名 `vit`、`vlm` 和/或 `expert` 的值；facade 为 `1` | 首次原生 subsystem 使用 / **NATIVE** | replay 时跳过已审计的 layer-body emission。错误使用可能使 dynamic input 过期。 |
-| `RPU_HY_VLA_FAST_REPLAY_PRELOAD` | 原始默认关闭；`0`/`off`/`false`、`1`/`on`/`true`，或命名 `vit`、`vlm` 和/或 `expert` 的值；facade 为 `1` | 首次原生 subsystem 使用 / **NATIVE** | replay 时也跳过已审计的 preload 工作。需要稳定的 persistent state。 |
-| `RPU_HY_VLA_FUSED_MERGER` | 原始默认关闭；Python 接受 `1`/`true`/`True`/`on`；原生镜像要求字面值 `0`/`1`；facade 为 `1` | Vision 构造 / **MODEL** | 将 vision merger 折叠进 Graph。只使用 `0`/`1` 可避免解析器不一致。 |
-| `RPU_HY_VLA_KVPAD16` | 原始默认关闭；`0`/`off`/`false`、`1`/`on`/`true`，或命名 `vit`、`vlm` 和/或 `expert` 的值；facade 为 `1` | 首次原生 subsystem 使用 / **NATIVE** | 对 expert KV row 进行 padding/mask。它会改变 cache layout 和 signature。 |
-| `RPU_HY_VLA_MASK_ONCE` | 原始默认关闭；`0`/`off`/`false`、`1`/`on`/`true`，或命名 `vit`、`vlm` 和/或 `expert` 的值；facade 为 `1` | 首次原生 subsystem 使用 / **NATIVE** | 复用 invariant mask upload。mask 内容或 storage 可能变化时不安全。 |
-| `RPU_HY_VLA_MERGER_IN_GRAPH` | 原始默认关闭；`1`/`true`/`True`/`on`；facade 为 `1` | Vision 构造 / **MODEL** | 将启用的 fused merger 放进 capture。要求 `RPU_HY_VLA_FUSED_MERGER=1`。 |
-| `RPU_HY_VLA_MOT_NORM_NOMERGE` | `both`；`0`/`off`/`false`、`1`/`on`/`true`/`both`，或包含 `qkv` 和/或 `mlp` 的值 | 首次原生 VLM 使用 / **NATIVE** | 选择配置特定的 norm/merge scheduling。它会改变 temporary-memory 和 Graph 结构。 |
-| `RPU_HY_VLA_PARTIAL_ROPE` | 原始默认关闭；`0`/`off`/`false`、`1`/`on`/`true`，或 CSV scope `vit`、`vlm`、`expert`；facade 为 `expert,vlm` | 首次原生 subsystem 使用 / **NATIVE** | 为指定 subsystem 使用预计算的 partial position table。scope 不匹配会改变 position semantics。 |
-| `RPU_HY_VLA_PATCH_EMBED_IN_GRAPH` | 开启；`0`/`false`/`False`/`off` 会禁用；facade 为 `1` | Vision 构造 / **MODEL** | capture device patch embedding。禁用会选择不同的 host/device boundary。 |
-| `RPU_HY_VLA_PATCH_EMBED_MC` | 原始未设置表示 8 cores；`0`/`false`/`False` 表示 1；facade 为 `1` | 权重和 Vision 构造 / **MODEL** | 选择 multi-core patch embedding。Python/native state 必须一致；需重建权重和 Graph。 |
-| `RPU_HY_VLA_PERSIST_HANDLES` | 原始默认关闭；`0`/`off`/`false`/空，`1`/`on`/`true` 表示全部，或 CSV subset `vit`、`vlm`、`expert`；facade 为 `1` | Policy 构造 / **MODEL** | 跨调用保持指定 handle 存活。会增加保留内存，并实施单 policy 归属。 |
-| `RPU_HY_VLA_PREFIX_TEMPLATE` | 开启；`0`/`false`/`False`/`off` 会禁用 | Prompt 构造 / **MODEL** | 启用配置 prompt template。改变它会改变 token input，而不只是性能。 |
-| `RPU_HY_VLA_PROJ1_IN_MERGER` | 开启；`0`/`off`/`false`/`False` 会禁用；原生镜像使用同一变量 | Vision 构造 / **MODEL** | 在 merger 路径中包含 first projection。使用字面值 `0`/`1`；状态不一致会破坏 output shape/ownership。 |
-| `RPU_HY_VLA_Q_INPLACE` | 原始默认关闭；除 `0`/`off`/`false` 外的非空值；facade 为 `1` | 首次原生 Vision 使用 / **NATIVE** | 原地复用 query buffer。仅当配置证明旧值已死亡时才安全。 |
-| `RPU_HY_VLA_RMSNORM_PAD16` | 原始默认关闭；`0`/`off`/`false`、`1`/`on`/`true`，或命名 `vit`、`vlm` 和/或 `expert` 的值 | 首次原生 subsystem 使用 / **NATIVE** | 对指定 normalization row 做 padding。它会改变 layout 和 Graph census。 |
-| `RPU_HY_VLA_SILU_MUL` | 原始默认关闭；`0`/`off`/`false`、`1`/`on`/`true`，或 CSV scope `vit`、`vlm`、`expert`；facade 为 `expert` | 首次原生 subsystem 使用 / **NATIVE** | 融合指定的 activation/multiply schedule。每个 scope 都需要数值验证。 |
-| `RPU_HY_VLA_VIT_PACKED` | 原始默认关闭；`1`/`true`/`True`/`on`；facade 为 `1` | Vision 构造 / **MODEL** | 打包 vision-tower 执行配置。它会改变 shape/layout 契约，并要求重建权重/Graph。 |
-| `RPU_HY_VLA_W4A16` | 关闭；`0`/`off`/`false`/`False`/空，`1`/`on`/`true`/`True`/`all`，或 CSV subset `vit`、`vlm`、`expert`、`vlm_text`、`vlm_vision` | 权重安装 / **MODEL** | 按 scope 选择 W4A16；重叠时 W4 优先于 W8，不支持的 scope 会失败。数值配置会改变。 |
-| `RPU_HY_VLA_W8A16` | 原始默认关闭；facade 映射 `fp16`→`0`、`w8a16`→`all`、`w8a16-expert`→`expert`、`w8a16-expert-vlmv`→`expert,vlm_vision`、`w8a16-vlm`→`vlm`、`w8a16-vit`→`vit`、`w8a16-no-vlm`→`vit,expert`；也接受 W4 行的精确 enum/CSV grammar | 权重安装 / **MODEL** | 按 scope 选择 W8A16。它必须匹配 checkpoint/source 权重和指定 precision 配置。 |
+| `RPU_HY_VLA_ACTION_MLP_MC` | 未设置表示 8 cores；`0`/`off`/`false` 表示 1，其他值表示 8 | 进程 claim 前的 cold-plan admission / **MODEL** | 选择 multi-core action-MLP 执行。它会改变 reduction order，且必须继续满足配置数值门禁。 |
+| `RPU_HY_VLA_ATTN_TP8` | 原始默认关闭；只有 `1`/`true`/`on` 会启用；builder 默认 `1` | 进程 claim 前的 cold-plan admission / **MODEL** | 为 eight-core attention 复制 KV head。cache geometry 和权重使用冻结值。 |
+| `RPU_HY_VLA_CACHING_ALLOC` | 开启；严格接受 `0`/`off`/`false` 或 `1`/`on`/`true`；显式空值表示开启；其他值失败 | 进程 claim 前的 cold-plan admission / **PROCESS** | 在物化前选择通用的冷态 tensor allocation policy；进程中的第一次 policy 声明不可更改。它会改变内存保留；测量 free memory 前调用 `empty_cache()`。 |
+| `RPU_HY_VLA_DENOISE_UNROLL` | builder 默认 `1`；严格接受 `0`/`off`/`false` 或 `1`/`on`/`true`；显式空值表示关闭；其他值失败 | 进程 claim 前的 cold-plan admission / **MODEL** | 将 denoise loop 记录为一个配置负责的 Graph。它会改变 Euler-state precision 和数值结果。 |
+| `RPU_HY_VLA_FAST_REPLAY` | builder 默认 `1`；严格接受开关别名或 `vit`、`vlm`、`expert` 的精确 CSV subset；`all` 表示全部；未知 component 失败 | 进程 claim 前的 cold-plan admission / **NATIVE** | replay 时跳过已审计的 layer-body emission。错误使用可能使 dynamic input 过期。 |
+| `RPU_HY_VLA_FAST_REPLAY_PRELOAD` | builder 默认 `1`；使用与 `RPU_HY_VLA_FAST_REPLAY` 相同的严格 component grammar | 进程 claim 前的 cold-plan admission / **NATIVE** | replay 时也跳过已审计的 preload 工作。需要稳定的 persistent state。 |
+| `RPU_HY_VLA_FUSED_MERGER` | builder 默认 `1`；严格接受 `0`/`off`/`false` 或 `1`/`on`/`true`；显式空值表示关闭；其他值失败 | 进程 claim 前的 cold-plan admission / **MODEL** | 将 vision merger 折叠进 Graph；runner 复用冻结后的 Python 决定。 |
+| `RPU_HY_VLA_KVPAD16` | builder 默认 `1`；严格接受开关别名或 `vit`、`vlm`、`expert` 的精确 CSV subset；未知 component 失败 | 进程 claim 前的 cold-plan admission / **NATIVE** | 对 expert KV row 进行 padding/mask。它会改变 cache layout 和 signature。 |
+| `RPU_HY_VLA_MASK_ONCE` | builder 默认 `1`；严格接受开关别名或 `vit`、`vlm`、`expert` 的精确 CSV subset；未知 component 失败 | 进程 claim 前的 cold-plan admission / **NATIVE** | 复用 invariant mask upload。mask 内容或 storage 可能变化时不安全。 |
+| `RPU_HY_VLA_MERGER_IN_GRAPH` | builder 默认 `1`；严格接受 `0`/`off`/`false` 或 `1`/`on`/`true`；显式空值表示关闭；其他值失败 | 进程 claim 前的 cold-plan admission / **MODEL** | 将启用的 fused merger 放进 capture。要求 `RPU_HY_VLA_FUSED_MERGER=1`。 |
+| `RPU_HY_VLA_MOT_NORM_NOMERGE` | 默认 `both`；严格接受关闭别名、`1`/`on`/`true`/`both`，或 `qkv`、`mlp` 的精确 CSV subset；显式空值表示 `both`；其他文本失败 | 进程 claim 前的 cold-plan admission / **NATIVE** | 选择配置特定的 norm/merge scheduling。它会改变 temporary-memory 和 Graph 结构。 |
+| `RPU_HY_VLA_PARTIAL_ROPE` | builder 默认 `expert,vlm`；严格接受开关别名或 `vit`、`vlm`、`expert` 的精确 CSV subset；未知 component 失败 | 进程 claim 前的 cold-plan admission / **NATIVE** | 为指定 subsystem 使用预计算的 partial position table。scope 不匹配会改变 position semantics。 |
+| `RPU_HY_VLA_PATCH_EMBED_IN_GRAPH` | builder 默认 `1`；严格接受 `0`/`off`/`false` 或 `1`/`on`/`true`；显式空值表示开启；其他值失败 | 进程 claim 前的 cold-plan admission / **MODEL** | capture device patch embedding。禁用会选择不同的 host/device boundary。 |
+| `RPU_HY_VLA_PATCH_EMBED_MC` | 未设置表示 8 cores；`0`/`false` 表示 1，其他值表示 8；builder 默认 `1` | 进程 claim 前的 cold-plan admission / **MODEL** | 选择 multi-core patch embedding。权重 layout 与原生执行使用冻结 core 数。 |
+| `RPU_HY_VLA_PERSIST_HANDLES` | builder 默认 `1`；严格关闭别名或显式空值禁用全部，开启别名/`all` 启用全部，`vit`、`vlm`、`expert` 的精确 CSV subset 选择 owner；未知或仅含空 token 的 CSV 失败 | 进程 claim 前的 cold-plan admission / **MODEL** | 跨调用保持指定 handle 存活。会增加保留内存，并实施单 policy 归属。 |
+| `RPU_HY_VLA_PREFIX_TEMPLATE` | 开启；严格接受 `0`/`off`/`false` 或 `1`/`on`/`true`；显式空值表示开启；其他值失败 | 进程 claim 前的 cold-plan admission / **MODEL** | 启用配置 prompt template。改变它会改变 token input，而不只是性能。 |
+| `RPU_HY_VLA_PROJ1_IN_MERGER` | 开启；严格接受 `0`/`off`/`false` 或 `1`/`on`/`true`；显式空值表示开启；其他值失败 | 进程 claim 前的 cold-plan admission / **MODEL** | 在 merger 路径中包含 first projection；runner 对 layout 和 ownership 复用冻结决定。 |
+| `RPU_HY_VLA_Q_INPLACE` | builder 默认 `1`；严格接受 `0`/`off`/`false` 或 `1`/`on`/`true`；显式空值表示关闭；其他值失败 | 进程 claim 前的 cold-plan admission / **NATIVE** | 原地复用 query buffer。仅当配置证明旧值已死亡时才安全。 |
+| `RPU_HY_VLA_RMSNORM_PAD16` | 原始默认关闭；严格接受开关别名或 `vit`、`vlm`、`expert` 的精确 CSV subset；未知 component 失败 | 进程 claim 前的 cold-plan admission / **NATIVE** | 对指定 normalization row 做 padding。它会改变 layout 和 Graph census。 |
+| `RPU_HY_VLA_SILU_MUL` | builder 默认 `expert`；严格接受开关别名或 `vit`、`vlm`、`expert` 的精确 CSV subset；未知 component 失败 | 进程 claim 前的 cold-plan admission / **NATIVE** | 融合指定的 activation/multiply schedule。每个 scope 都需要数值验证。 |
+| `RPU_HY_VLA_VIT_PACKED` | builder 默认 `1`；严格接受 `0`/`off`/`false` 或 `1`/`on`/`true`；显式空值表示关闭；其他值失败 | 进程 claim 前的 cold-plan admission / **MODEL** | 打包 vision-tower 执行配置。它会改变 shape/layout 契约，并要求重建权重/Graph。 |
+| `RPU_HY_VLA_W4A16` | 关闭；严格接受开关别名或 `vit`、`vlm`、`expert`、`vlm_text`、`vlm_vision` 的精确 CSV subset；未知或仅空 CSV token 失败 | 进程 claim 前的 cold-plan admission / **MODEL** | 按 scope 选择 W4A16；重叠时 W4 优先于 W8。不支持的 ViT W4 会在归属和 tensor 读取前失败。数值配置会改变。 |
+| `RPU_HY_VLA_W8A16` | 原始默认关闭；facade 映射 `fp16`→`0`、`w8a16`→`all`、`w8a16-expert`→`expert`、`w8a16-expert-vlmv`→`expert,vlm_vision`、`w8a16-vlm`→`vlm`、`w8a16-vit`→`vit`、`w8a16-no-vlm`→`vit,expert`；其他值使用 W4 行的严格 grammar | 进程 claim 前的 cold-plan admission / **MODEL** | 按 scope 选择 W8A16。它必须匹配指定 precision profile；格式错误会在归属和 tensor 读取前失败。 |
+| `RPU_RMSNORM_VWARP` | Hy-VLA builder 默认 `auto`；严格接受空/`0`/`off`/`false`、`16`、`32` 或 `auto`；其他文本失败 | 进程 claim 前的 cold-plan admission / **NATIVE** | 冻结允许的 VLM RMSNorm capability；原生 handle 不再读取环境变量。 |
 
 <a id="internvla-n1-and-navdp-profiles"></a>
 ## InternVLA-N1 与 NavDP 配置
@@ -318,12 +358,17 @@ Pi0.5 loader 负责这些设置。Graph selector 必须在模型构造和首次 
 这些变量由 Qwen3-VL Vision 以及嵌入该 tower 的 VLA facade 消费。facade 可以在模型
 构造前设置精确默认值。
 
+精确普通 dense FP16 Qwen3-VL-2B、4B 和 8B 配置默认在 RPU 执行 patch 和
+merger GEMM，merger LayerNorm 保持 CPU FP32。安装前设置
+`RPU_QWEN3VL_VISION_HOST_FP32_PATCH=1` 可保留 CPU FP32 patch projection 和
+CPU FP32 merger。该选择在安装时固定；之后修改环境变量需要重新创建模型。
+
 | 变量 | 未设置时的默认值与接受值 | 读取 / 更改 | 作用域、效果与风险 |
 |---|---|---|---|
 | `RPU_QWEN3VL_VISION_BATCH` | **PB(false)** | Vision forward / **CALL**；重建 Graph | 打包兼容 image/view。它会改变 Graph signature 和内存；facade 约束仍会限制 shape。 |
 | `RPU_QWEN3VL_VISION_BATCH_CAP` | `3`；十进制整数，至少收窄为 `1` | Vision forward / **CALL**；重建 Graph | 每个 packed group 的最大兼容 image 数。更大值可能超过配置内存 envelope。 |
 | `RPU_QWEN3VL_VISION_FUSED_MERGER` | 原始默认关闭；**B01(false)** | Vision 构造 / **MODEL** | 将 merger 折叠进 Vision Graph。只有字面值 `0`/`1` 能保持 Python 与原生 reader 一致。 |
-| `RPU_QWEN3VL_VISION_HOST_FP32_PATCH` | `0`；**E1** | Vision forward / **CALL**；重建 Graph/model | 使用 host FP32 patch projection，而不是默认 FP16/device 配置。它会改变数值和 transfer cost。 |
+| `RPU_QWEN3VL_VISION_HOST_FP32_PATCH` | **PB(false)** | Vision 安装 / **MODEL**；在 `to_rpu()` 前设置，修改需新建模型 | 固定 CPU FP32 patch 配置；精确普通 dense FP16 VL2/VL4/VL8 同时保留 CPU FP32 merger。它会改变数值和 transfer cost。 |
 | `RPU_QWEN3VL_VISION_PATCH_EMBED_DEVICE` | `0`；**E1** | Vision 构造 / **MODEL** | 将 patch embedding 移到 RPU。它会改变已安装权重、数值和 Graph 拓扑。 |
 | `RPU_QWEN3VL_VISION_ROPE_SPM` | 关闭；原生值以 `1`、`t` 或 `T` 开头时启用 | 首次原生 Vision 使用 / **NATIVE** | 将 Vision position table 保存在 SPM。它会改变 persistent memory 使用，并要求重建 Vision handle。 |
 
@@ -356,14 +401,22 @@ Pi0.5 loader 负责这些设置。Graph selector 必须在模型构造和首次 
 ## Wall-OSS 配置
 
 `WallOssPolicy` 会在模型构造前提供经过验证的 facade 默认值。prompt selector 会改变
-实际模型输入，绝不能当作仅影响性能的开关。
+实际模型输入，绝不能当作仅影响性能的开关。所有 selector 均未设置时，固定公开
+checkpoint 按 `use_embodied_system_prompt_ratio=0.0` 使用公开 `wall-x` 中精确的
+`You are a helpful assistant.` system prompt。
+
+Source-only facade 固定 Vision `chunk_size=768`、关闭 packed Vision，并在 checkpoint
+权重加载前调用 `preflight_images(images)`。CPU processor 冻结的 grid 必须精确为两张
+`[1,32,32]` 图片；每张图独立使用共享的 `768+256` KV-first plan。`auto`、任何其他
+grid 和之后变化的 grid 分别会在进程级 claim 前或任何 Vision 工作前拒绝。这是准入
+契约，不是板上验证证据。
 
 | 变量 | 未设置时的默认值与接受值 | 读取 / 更改 | 作用域、效果与风险 |
 |---|---|---|---|
 | `RPU_WALL_OSS_ACTION_FP32_TAIL` | **PB(false)** | 每次 denoise 调用 / **CALL**；重建 prepared Graph 配置 | Euler tail 使用 host FP32。它会改变 action 数值，并与 fused/unrolled 执行冲突。 |
 | `RPU_WALL_OSS_ATTN_TP8` | 原始为 **PB(false)**；facade 为 `1` | 权重安装 / **MODEL** | 为 eight-core attention 复制 KV head。重建权重、cache 和 Graph。 |
 | `RPU_WALL_OSS_BATCH_MAX_SEQ` | `768`；十进制整数 | Vision grouping / **CALL**；重建 Graph | 限制 packed vision sequence length。过大可能超出内存；所选公开配置可能进一步约束。 |
-| `RPU_WALL_OSS_BATCH_VISION` | **PB(true)** | Vision forward / **CALL**；重建 Graph | 在上限内打包 equal-grid image。它会改变 signature 和内存。 |
+| `RPU_WALL_OSS_BATCH_VISION` | 原始 **PB(true)**；Source-only facade 为 `0` | Vision forward / **CALL**；重建 Graph | 直接 builder 可在上限内打包 equal-grid image。公开 facade 固定逐图预检，并拒绝启用该 selector。 |
 | `RPU_WALL_OSS_DENOISE_UNROLL` | **PB(true)** | Action 构造和调用 / **MODEL** | 使用 fused denoise loop。`0` 选择 host loop，并改变拓扑和 timing。 |
 | `RPU_WALL_OSS_DEVICE_PATCH_EMBED` | **PB(true)** | Vision 构造 / **MODEL** | 在 RPU 上运行 folded patch embedding。`0` 使用 CPU projection，并改变 boundary/性能。 |
 | `RPU_WALL_OSS_EXPERT0_DOWN_INT4` | **PB(true)** | 量化 LLM 权重安装 / **MODEL** | 使用允许的 compact expert-0 down projection。部分 W4 配置强制关闭；不匹配会校验失败。 |
@@ -381,7 +434,6 @@ Pi0.5 loader 负责这些设置。Graph selector 必须在模型构造和首次 
 | `RPU_WALL_OSS_PE_NORM_FOLD` | **PB(true)** | Policy 构造 / **MODEL** | fast preprocessing 开启时，将 image normalization 折叠进 patch 权重。改变时需重建已安装权重。 |
 | `RPU_WALL_OSS_SHORT_PROMPT` | **PB(false)** | Prompt 构造 / **CALL** | 选择 short prompt schema；与其他 prologue mode 互斥。改变 token。 |
 | `RPU_WALL_OSS_VISION_FUSED_MERGER` | 原始为 **B01(false)**；facade 为 `1` | Vision 构造 / **MODEL** | 将 merger 折叠进 Vision Graph。只有字面值 `0`/`1` 能保持 Python/原生状态一致。 |
-| `RPU_WALL_OSS_VISION_LAYER_GROUP` | `0`；精确 `0` 或 `32` | Vision 构造（**MODEL**）和首次原生 schedule claim（**NATIVE**）；新进程 | 受限精确 three-image scheduling 实验；与 per-window SDPA 不兼容。 |
 | `RPU_WALL_OSS_VISION_ROPE_SPM` | 原始默认关闭；**N1**；facade 为 `1` | 首次原生 Vision 使用 / **NATIVE** | 将 position table 保存在 SPM。会改变 persistent-memory 使用，并要求重建 Vision handle。 |
 
 ## 仅诊断项清单
@@ -393,33 +445,23 @@ Pi0.5 loader 负责这些设置。Graph selector 必须在模型构造和首次 
 
 | 变量 | 未设置时的默认值与接受值 | 读取 / 更改 | 作用域、效果与风险 |
 |---|---|---|---|
-| `QWEN3_5_VISION_DBG_Q` | 关闭；精确 `1` 或小写 `true` | 首次原生 debug 检查 / **NATIVE** | 启用 Qwen3.5 Vision query probe 路径。会增加 capture/同步，并可能暴露 intermediate。 |
 | `QWEN3_5_VISION_GRAPH_DISABLE` | `0`；除精确 `0` 外的任意值都会禁用 | Vision forward / **CALL**；重建/清除 Graph | 绕过 Qwen3.5 Vision GraphCache，用于受控比较。replay 和 latency 结论不再适用。 |
 | `RPU_ALL_GATHER_FORCE_MULTI_CORE` | 关闭；**N1** | 首次原生使用 / **NATIVE** | 强制 multi-core schedule，用于 A/B 比较。它不是普遍支持的性能 selector。 |
 | `RPU_CHUNK_FORCE_UNSAFE` | 关闭；**N1** | 首次适用的原生 planner/launcher 使用 / **NATIVE** | 绕过 planner safety check。可能超过执行约束，绝不能产出可部署输出。 |
 | `RPU_DYNAMO_MATERIALIZE_BREAKS` | **PB(false)** | Dynamo partitioning / **CALL**；重新编译 | materialize partition break。它会改变 Graph boundary 并增加 transfer，仅用于 compiler 诊断。 |
 | `RPU_GRAPH_DDR_SPM_LOG` | 关闭；首字符不是 `0` 的非空值 | 首次 data-node 执行 / **NATIVE** | 记录 node index、byte count 和有界 source checksum。输出由模型数据派生，且日志会改变 timing。 |
 | `RPU_GRAPH_FORCE_ONESHOT_ON_REPLAY` | 关闭；首字符不是 `0` 的非空值 | 首次 replay 检查 / **NATIVE** | 执行 one-shot 路径而不是普通 replay。会使 Graph lifecycle 和性能结论失效。 |
-| `RPU_GRAPH_HCB_CHECKSUM` | 关闭；首字符不是 `0` 的非空值 | 首次 host-callback 执行 / **NATIVE** | 记录 live/stable tensor metadata 和有界 value summary。将输出视为敏感模型数据。 |
 | `RPU_KVINSERT_V16_TRACE` | 关闭；除精确 `0` 或 `false` 外，任何出现的值都会启用；export 的空值也会启用 | 首次原生使用 / **NATIVE** | 记录 KV route selection 和 shape。它是诊断输出，不是 cache 正确性证明。 |
 | `RPU_L2_BUFONLY` | 未出现时关闭；任意出现（包括 `0`）都会启用 | Grouped-expert Graph emission / **BUILD** | 声明 grouped buffer，但运行 per-expert 路径进行 bisection。会改变 Graph 和性能。 |
-| `RPU_L2_CAPTURE_GATE` | 关闭；**E1** | Expert 权重安装 / **MODEL** | 分配并导出 gate 相关 layer-0 intermediate。增加内存/Graph 工作，并暴露模型数据。 |
-| `RPU_L2_CAPTURE_INNORM` | 关闭；**E1** | Expert 权重安装 / **MODEL** | capture layer-0 post-normalization input。tensor 可能包含用户派生的 activation。 |
-| `RPU_L2_CAPTURE_L0` | 关闭；**E1** | Expert 权重安装 / **MODEL** | capture layer-0 output 用于比较。增加 persistent storage 和一次 copy。 |
-| `RPU_L2_CAP_RESID` | 关闭；**E1** | Expert 权重安装 / **MODEL** | 跨 layer capture residual-stream tensor。内存成本高；输出可能包含请求派生的 activation。 |
-| `RPU_L2_DBG_PACKED` | 关闭；每次 debug getter 都检查 **E1** | Debug getter / **CALL** | 解锁 packed 模型权重供本地检查。绝不能公开返回 tensor。 |
 | `RPU_L2_DOWN_ACC16` | 关闭；**E1** | Expert 权重安装 / **MODEL** | 强制 diagnostic ACC16 grouped-down 路径。它会改变数值结果，不是受支持 precision 配置。 |
 | `RPU_L2_RCHUNK` | Runtime fallback 为 `256`；正十进制数；受支持 grouped 配置要求精确 `1632` | Weight/config 校验（**MODEL**）和 Graph emission（**BUILD**）；新进程 | 覆盖 grouped scaling row chunk。错误值会使密封配置失败，或改变 Graph/timing。 |
 | `RPU_L2_ROUTED_ONLY` | 关闭；**E1** | Expert 权重安装 / **MODEL** | 隔离 routed-expert contribution 用于 bisection。输出不是完整模型输出。 |
 | `RPU_L2_SCHUNK` | `32512`；正十进制数；非正值使用默认值 | Graph emission / **BUILD** | 覆盖 grouped activation host chunk。它会改变 Graph census，并可能降低安全性/性能。 |
-| `RPU_L2_STAGES` | 关闭；**E1** | Expert 权重安装 / **MODEL** | capture intermediate grouped stage。增加内存/copy，并暴露 activation。 |
 | `RPU_LINGBOT2_DEBUG_DENSE_SOFT_ROUTER` | 关闭；**E1** | Expert 权重安装 / **MODEL** | 用 dense soft routing 替换严格 top-4 routing。精度未验证，输出不用于生产。 |
-| `RPU_LINGBOT2_DEBUG_DUMP_ROUTER_H` | 关闭；**E1** | Expert 权重安装 / **MODEL** | capture per-layer router input。dump 可能包含请求派生 activation，并占用大量内存。 |
 | `RPU_PI05_LOAD_NOISE` | 未设置；现有 tensor `.pt` 的路径；路径不存在时忽略 | Noise preparation / **CALL** | 在严格 shape/finite 检查后使用 `weights_only=True` 替换 sampled noise。只应使用受信任本地文件。 |
 | `RPU_PI05_LOAD_PIXEL_VALUES` | 未设置；现有 tensor `.pt` 的路径；路径不存在时忽略 | Image feature 调用 / **CALL** | 在严格检查后替换 processed pixel value。它会改变模型输入，并可能加载敏感测试数据。 |
 | `RPU_PI05_LOAD_PREFIX_EMBS` | 未设置；现有 tensor `.pt` 的路径；路径不存在时忽略 | Prefix preparation / **CALL** | 在严格检查后替换 prefix embedding。它会绕过普通 upstream 值，并使 E2E 声明失效。 |
 | `RPU_PI05_LOG_CONVERSION` | 未出现时关闭；任意非空值（包括 `0`）都会启用 | Gemma prefill / **CALL** | 记录 conversion/handle/chunk 诊断。增加输出，并可能暴露模型 shape/configuration。 |
-| `RPU_PI05_PROBE_DIR` | 未设置；非空目录路径 | Pi0.5 conversion 和 forward / **CALL** | 将具名 input、activation 和 KV tensor dump 为 `.pt`。artifact 可能包含模型权重和用户数据。 |
 | `RPU_RHINOVLA_VISION_RPU_MERGERS_MEM_DEBUG` | **PB(false)** | Vision 安装/materialization / **MODEL** | 在 merger materialization 前后打印 allocator summary。增加同步，并暴露内存结构。 |
 | `RPU_SIGLIP_ISOLATE_PATCH_EMBED` | 关闭；除 `0`/`false`/`False` 外的非空值 | 首次 segment 规划 / **NATIVE** | 隔离 Pi0.5 patch-embedding segment，诊断 Graph finalization failure。改变 Graph segmentation。 |
 | `RPU_WALL_OSS_INSTRUMENT` | **PB(false)** | Wall-OSS forward stage / **CALL** | 打印 host stage timing。instrumentation 开销会使同一次运行不适合报告干净 latency。 |
@@ -433,12 +475,15 @@ Pi0.5 loader 负责这些设置。Graph selector 必须在模型构造和首次 
 
 ### 冷态、按 handle 生效的 `rpu_execution`
 
-公共 loader 和 policy 接受不可变的 `rpu_execution` mapping。三个可能的 stage 是
-`prefill`、`vision` 和 `action`；每个入口都会公布其支持的 subset，并在加载权重前拒绝
+公共 loader 和 policy 接受不可变的 `rpu_execution` mapping。stage 表为
+`prefill`、`vision` 和 `action`；支持该能力的入口另有 `model` 控制表；每个入口都会公布其支持的 subset，并在加载权重前拒绝
 其他所有 stage 或字段。
 
 | 字段 | 接受值 | 含义与生命周期 |
 |---|---|---|
+| `model.num_cores` | 整数 `4/6/8` | 仅限入口声明并由模型 profile 准入的冷态计算预算。 |
+| `<stage>.linear_acc32` | 布尔值 | 上述组件的 ACC16（`false`，默认）或 ACC32（`true`）；不改变量化权重格式。 |
+| `prefill.fast_replay` | 布尔值 | 仅 Qwen3-VL，默认 `true`。 |
 | `chunk_size` | `"auto"` 或 16 的正整数倍 | 指定 stage 的 planner cap/choice。绑定到模型或 policy；改变时应构造新实例。 |
 | `padding_rows` | `"auto"` 或非负整数 | 指定 stage 的精确/自动 execution padding。精确整数与 `padding_budget` 互斥。 |
 | `padding_budget` | 非负整数 | stage planner 考虑的最大可选 padding。不能与精确整数 `padding_rows` 同时使用。 |
@@ -449,10 +494,17 @@ envelope；如果公共 policy API 有记录，它也会公开 resolved executio
 
 ### 内存与 coherency 控制
 
-- `torch.rpu.set_caching_allocator(bool)` 切换进程 caching allocator（默认关闭）。
-  `torch.rpu.empty_cache()` 释放已缓存、未使用的 block；无法释放 live tensor 或
-  Graph-owned storage。
-- `torch.rpu.memory_stats()` 和 `torch.rpu.get_memory_stats()` 返回 allocator counter。
+- `torch.rpu.set_caching_allocator(bool)` 选择进程 tensor allocator（默认 direct/关闭）。
+  第一次显式选择或非空 RPU tensor allocation 会冻结该选择；同值重复调用是幂等的，
+  冲突值会报错。切换模式必须使用新进程。`torch.rpu.empty_cache()` 释放已缓存、未使用的
+  block；无法释放 live tensor 或 Graph-owned storage。需要保留大量 tensor 的 adapter
+  会在首次 RPU allocation 前选择同一个通用 caching policy。
+- `torch.rpu.memory_stats()` 和 `torch.rpu.get_memory_stats()` 返回不含地址的
+  allocator counter。`caching_allocator_policy_frozen` 表示选择是否已经不可更改。
+  当 `caching_allocator_enabled` 为 true 时，
+  `caching_allocator_mapping` 只统计该 allocator 持有的 HostDDR segment，
+  `cached_idle_mapping` 统计其中完全空闲的 segment；它们不包含 Launch、SPM 或
+  direct allocation，因此不是进程级 driver mapping 总数。
   `reset_peak_memory_stats()` 重置 peak counter，`reset_accumulated_memory_stats()` 重置
   累计 allocate/free counter。重置 counter 不会释放内存。
 - `torch.rpu.set_ddr_flush(bool)` 控制内部 RPU-to-RPU flush point（默认关闭）。模型

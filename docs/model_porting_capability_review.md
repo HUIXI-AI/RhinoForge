@@ -6,7 +6,7 @@ Run this review before writing a model adapter. Its purpose is to decide
 whether an exact model profile fits RhinoForge's current public interfaces and
 to expose blockers before checkpoint loading or irreversible weight changes.
 
-Read [Model support](model_support.md), [Architecture](architecture.md), and
+Read [Examples](model_support.md), [Architecture](architecture.md), and
 [Model porting](model_porting.md) first. Review one exact profile at a time; a
 family name or matching Hugging Face architecture is not a profile.
 
@@ -27,9 +27,9 @@ An unknown value is a review gap, not permission to inherit a nearby profile.
 
 ## Phase 1: freeze the profile
 
-Compare the target with every row and exclusion in
-[Model support](model_support.md). Define the smallest input envelope that is
-useful and testable. Include every option that changes model math, tensor
+Compare the target with the configuration and runtime admission boundaries
+linked from [Examples](model_support.md). Define the smallest input envelope
+that is useful and testable. Include every option that changes model math, tensor
 shape, Graph topology, cache layout, or precision.
 
 Fail the review early when any of these is true:
@@ -157,5 +157,5 @@ already supported exact profile. Use the broader workflow in [Model
 porting](model_porting.md) for runtime extensions, fused subsystems, vision
 models, and multi-component policies.
 
-Do not add a support-matrix row until all profile gates have run against one
-immutable source, dependency, checkpoint, configuration, and asset set.
+Do not declare a profile qualified until all applicable gates have run against
+one immutable source, dependency, checkpoint, configuration, and asset set.

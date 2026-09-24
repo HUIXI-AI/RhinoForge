@@ -8,7 +8,7 @@ The distribution is named `rhinoforge`; its Python package remains
 
 Support is profile-specific. An importable class, adapter, registry alias, or
 native schema does not by itself make a model supported. Check
-[Model support](model_support.md) before selecting an entry point.
+[Examples](model_support.md) before selecting an entry point.
 
 ## Top-level package
 
@@ -59,6 +59,7 @@ RPUModelForCausalLM.from_pretrained(
     dtype=torch.float16,
     device=None,
     rpu_execution=None,
+    quantization=None,  # CausalLM: explicit dense Qwen3 W4/G32 installation recipe
     **hf_kwargs,
 )
 ```
@@ -77,8 +78,14 @@ quantized checkpoint carries its own checked metadata.
 - `padding_budget`: a non-negative integer, mutually exclusive with an exact
   `padding_rows` value.
 
-The adapter may narrow these values to the exact profile envelope. Execution
-settings are cold: create a new model to change them after RPU installation.
+For Qwen3, `prefill.linear_acc32` selects ACC16 (`false`, default) or ACC32
+(`true`). The cold root `model.num_cores` budget is `4`, `6` or `8`; plain FP16
+batch-one profiles admit reduced budgets, while quantized profiles retain eight
+cores. Other CausalLM adapters declare their own accepted fields. The adapter
+may narrow these values to the exact profile envelope. Create a new model to
+change them after RPU installation. Qwen3-VL, Qwen3.5 and Pi0.5 expose their
+component precision and topology controls through the same mapping; see the
+[target-specific configuration catalog](runtime_config.md#toml-parameter-catalog).
 
 The generic CausalLM and image-text loaders, and `Pi05Policy.from_pretrained`,
 support only built-in model code. `trust_remote_code` must be exactly `False`;
@@ -137,7 +144,7 @@ model = RPUModelForConditionalGeneration.from_pretrained(
 It has the same CPU-first loading and fail-fast profile behavior as the
 CausalLM loader. The `vision` stage accepts `chunk_size`; the `prefill` stage
 accepts the fields described above. Video and profiles outside
-[Model support](model_support.md) are not implied by this class.
+[Examples](model_support.md) are not implied by this class.
 
 Qwen3.5 text/vision and Gemma4 use their documented model-specific adapters;
 their source presence does not widen the public support envelope.
@@ -154,10 +161,31 @@ The following classes are exported from `rpu_backend.api`:
 | `Lingbot2Policy` | `from_checkpoint(...)`; `to("rpu")`; `prepare_graphs(...)`; `infer(...)`; `predict_action_chunk(...)`; `close()` |
 | `HyEmbodiedPolicy` | `from_checkpoint(...)`; `to("rpu")`; `infer(...)`; `predict_action_chunk(...)`; `close()` |
 
+Public LIBERO optimized profiles use
+`Pi05Policy.from_pretrained(..., optimized_profile=...)` with `precision`
+(`fp16`, `w8a16`, `w8_action_nvfp4`, or `w8_prefill_a8_action_nvfp4`),
+`num_cameras` (2 or 3), and `text_tokens` (32, 64, 96, or 128).
+Precision must match checkpoint metadata and the required operator capabilities.
+`prepare_graphs(...)` precomputes AdaRMS by default for these profiles. See
+[`examples/configs/pi05/`](../examples/configs/pi05/).
+
+For the release-bound Pi0.5 component profiles, pass `profile="pi0.5-base"`
+or `profile="pi0.5-libero-v044"` together with the first preprocessed
+`admission_batch`. The loader verifies the exact public payload and request
+envelope before loading weights; subsequent Graph and inference requests are
+checked against the same profile.
+
 `WallOssActionOutput`, `Lingbot2ActionOutput`, and
 `HyEmbodiedActionOutput` are the corresponding structured return types. A
 physical-unit action field only means that the configured normalization was
 applied; it is not a robot-safety or coordinate-frame certification.
+
+`WallOssPolicy.from_checkpoint(...)` binds the checkpoint, camera roster,
+normalization and precision; `.to("rpu")` installs the runtime. Supply images
+in the same order as `camera_names` when calling `infer(...)`. The policy
+validates actual request geometry and state against the installed model.
+`prepare_graphs(...)` optionally binds an explicit finite prefix range for
+representative inputs; reuse a range only for inputs admitted by that policy.
 
 `RhinoVLAPolicy` deliberately delegates checkpoint composition and preprocessing
 to an explicit model-repository runtime factory. The runtime must expose the
@@ -173,10 +201,15 @@ request. Passing an already imported callable has the same trust requirement.
 Physical-action decoding requires `norm_stats_path`, the explicit
 `trust_norm_stats_pickle=True` opt-in, and `norm_stats_sha256` for the exact
 file bytes. The hash is checked before those same bytes are deserialized.
+The fixed three-camera facade accepts `prefix_len` only in
+`{192, 208, 224, 240}`. Request images, noise, state embeddings/state, and end
+effector pose must be finite; invalid values are rejected before policy
+execution.
 
-Several policy profiles are Experimental, Component-only, or Source-only. Use
-the exact constructor, input schema, and precision in the release profile; do
-not infer neighboring configurations from method availability.
+Every public model or policy profile outside the exact Supported/Limited
+profiles is Source-only in v1.0.0. Use the exact constructor, input schema, and
+precision in the release profile; do not infer neighboring configurations from
+method availability.
 
 ## Error hierarchy
 
@@ -220,6 +253,12 @@ with cache.capture(sig):
 `cache_invariant_ok`. A frozen cache is lookup-only and rejects an online
 BUILD. Most applications should let the model adapter own its graph cache;
 manual graph construction is primarily a porting interface.
+
+`Graph.runtime_policy` and `GraphCache.runtime_policy` are read-only views of
+the policy bound at construction. Extracted child graphs inherit that policy.
+After a failed capture, the scope releases its borrowed graph reference so
+`evict()` or `clear()` can run while the exception traceback is retained.
+References explicitly retained by callers still prevent graph retirement.
 
 User-level diagnostics remain public. On a `GraphCache` instance,
 `debug_bucket_counts()`, `debug_branch_counts()`, `dump_signature_tree()`, and
@@ -307,6 +346,12 @@ Swizzling changes parameter storage in place and must run exactly once. A
 specialized linear owned by a fused subsystem belongs in `skip_names` and must
 be transformed by that subsystem's one authoritative conversion path.
 
+The existing dense FP16 Qwen3-8B loader validates all original weights before
+installation, reserves its large vocabulary head and embedding first, then
+converts and transfers one Linear at a time. It releases CPU weight storage
+between transfers to reduce simultaneous CPU/RPU allocation. The public loading
+API is unchanged. A failed partial installation still requires a fresh model.
+
 ## `torch.rpu` device controls
 
 The commonly useful device-level functions include:
@@ -323,14 +368,20 @@ Developer diagnostics are also available through `torch.rpu`:
 
 - `set_debug`, `get_debug`, `set_profile`, `get_profile`, and
   `reset_profile_accumulators`;
-- `set_debug_export`, `get_debug_export`, `list_debug_tensors`,
-  `get_debug_tensor`, and `clear_debug_tensors`;
 - `set_spm_debug`, `get_spm_debug`, and `spm_alloc_dump`.
 
-Debug tensor exports may contain model inputs or intermediate activations.
-Store diagnostics as sensitive application artifacts and do not attach them to
-public issue reports. These APIs do not expose raw Graph register, resource, or
-plan payloads.
+These diagnostics expose logs and aggregate counters, not model inputs,
+intermediate activations, raw addresses, or Graph register/resource payloads.
+
+`set_caching_allocator(bool)` is a cold, process-wide tensor-storage choice.
+The first explicit call, or the first non-empty RPU tensor allocation when no
+choice was made, freezes the policy for the process. Repeating the same choice
+is idempotent; requesting the opposite choice raises an error and requires a
+fresh process. Call it only before RPU tensor materialization. `empty_cache()`
+releases unused cached blocks and cannot release live tensor or Graph-owned
+storage. `memory_stats()` reports the selected mode in
+`caching_allocator_enabled` and whether it is frozen in
+`caching_allocator_policy_frozen`.
 
 CPU/RPU boundary flushing is enabled by default and should not be disabled in
 normal inference. Chunk size is a per-handle `rpu_execution` setting, not a

@@ -42,8 +42,21 @@ license or redistribution basis, and cite it from a maintained page.
 
 ## Resolve conflicts
 
+For runnable examples, consult the [configuration index](../examples/configs/README.md)
+and validate the selected file with `examples/run_model.py --check-config`.
+Keep one canonical template per model/version/component/precision/workload;
+remove superseded copies and update script defaults, documentation and tests
+when reorganizing paths. Model TOML files belong in their family directories.
+The example catalog binds configuration identity and input settings; it does
+not expand the model's runtime admission or certify performance or quality.
+When adding quantized examples, trace the checkpoint loader and installed
+projection storage, not just the `dtype` label. Document the component scope
+and retain its admission controls. For caller factories, bind precision inputs,
+reject conflicting factory settings and verify the installed model before
+inference. See [quantization](../docs/quantization.md).
+
 Use public API documentation for user-visible behavior and source for actual
-implementation. Treat model-support status as profile-specific and defer to
-[model support](../docs/model_support.md) and
-[model validation policy](../docs/validation_policy.md). Update stale knowledge
-in the same change; do not preserve conflicting summaries.
+implementation. Treat model-support status as profile-specific. Use the entry
+points and runtime boundaries linked from [Examples](../docs/model_support.md)
+and follow [model validation policy](../docs/validation_policy.md). Update stale
+knowledge in the same change; do not preserve conflicting summaries.

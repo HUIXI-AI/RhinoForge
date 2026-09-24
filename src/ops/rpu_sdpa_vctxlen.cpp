@@ -2,7 +2,6 @@
 // SPM-based SDPA kernel wrapper using the vctxlen (variable context length) kernel.
 //
 // Kernel binary: llm_fp16_32b_prefill_flash_attn_univ_vctxlen
-// Register layout and tiling follow the FLASH_ATTN_SPM launch contract.
 // All param registers are set (including sKeyV16, sQryAcc, sKeyVx, sValVx).
 
 #include "rpu_ops.h"
@@ -22,6 +21,7 @@ using namespace ::rhino_lkn;
 #define SCM_PARAMS_PER_CORE 8  // 4 addresses × 2 uint16 each
 
 namespace {
+
 
 struct SpmRegion {
     uint32_t offset;
@@ -48,7 +48,8 @@ SpmRegion checked_spm_region(
                 "raw-SPM attention launcher requires initialized SPM");
     const uint32_t base = SPM_ALLOC.addr(0, 0);
     TORCH_CHECK(addr >= base && (addr & 31u) == 0,
-                operand, " must be a 32-byte-aligned core-0 SPM address");
+                operand, " must be a 32-byte-aligned core-0 SPM address, got ",
+                addr);
     const uint64_t offset = static_cast<uint64_t>(addr) - base;
     TORCH_CHECK(offset + bytes <= SpmAllocator::SPM_USABLE,
                 operand, " exceeds one core's SPM range");
@@ -131,7 +132,7 @@ void rpu_launch_sdpa_spm_vctxlen_kernel(
     int64_t seq_q_v16 = CeilDiv(seq_q, (int64_t)16);
     int64_t head_dim_v16 = CeilDiv(head_dim, (int64_t)16);
 
-    // sKey-dependent values required by the vctxlen launch contract.
+    // sKey-dependent values.
     int64_t seq_k = kv_seq_len;
     int64_t seq_k_v16 = CeilDiv(seq_k, (int64_t)16);
     int64_t seq_q_acc = seq_k - seq_q;
@@ -141,7 +142,7 @@ void rpu_launch_sdpa_spm_vctxlen_kernel(
     int64_t seq_v_chunk = seq_k_chunk;
     int64_t seq_v_vx = seq_k_vx;
 
-    // Launch tiling (same as FLASH_ATTN_SPM).
+    // Tiling shared with FLASH_ATTN_SPM.
     SdpaConfig tiling_cfg{SdpaKernelType::FLASH_ATTN_SPM,
                           head_dim, virtual_num_heads, virtual_num_kv_heads,
                           static_cast<int>(vtp), attn_mask_type};
@@ -199,7 +200,7 @@ void rpu_launch_sdpa_spm_vctxlen_kernel(
         kernel->set_regs(2, (uint16_t)seq_q);
         kernel->set_regs(3, (uint16_t)seq_q_v16);
 
-        // reg[4,5]: sKeyV16, sQryAccV16 (required for vctxlen too)
+        // reg[4,5]: sKeyV16, sQryAccV16
         kernel->set_regs(4, (uint16_t)seq_k_v16);
         kernel->set_regs(5, (uint16_t)seq_q_acc_v16);
 
@@ -217,7 +218,7 @@ void rpu_launch_sdpa_spm_vctxlen_kernel(
         kernel->set_regs(14, (uint16_t)head_dim_v16);
         kernel->set_regs(15, (uint16_t)head_dim_v16);
 
-        // reg[16,17]: sQryAcc (required for vctxlen too)
+        // reg[16,17]: sQryAcc
         kernel->set_regs(16, (uint16_t)(seq_q_acc & 0xFFFF));
         kernel->set_regs(17, (uint16_t)(seq_q_acc >> 16));
 

@@ -12,7 +12,7 @@ _BUILTIN_ROUTES = {
     "DINOv3ViTModel": "use DINOv3Adapter with the direct vision-model path",
     "Gemma4ForConditionalGeneration": "use Gemma4Adapter(model).to_rpu()",
     "Qwen3_5ForConditionalGeneration": (
-        "use Qwen3_5Adapter(model).to_rpu() with Qwen3_5Cache"
+        "use RPUModelForConditionalGeneration.from_pretrained(...)"
     ),
     "Qwen3VLForConditionalGeneration": (
         "use RPUModelForConditionalGeneration.from_pretrained(...)"
@@ -65,7 +65,7 @@ def resolve_config_architecture(
         raise UnsupportedModelError(
             f"HF config at {source!r} must define `architectures` as a non-empty "
             f"list of non-empty strings; got {architectures!r}. Cannot dispatch "
-            f"through {entry_point}. See docs/model_support.md."
+            f"through {entry_point}. See docs/api_reference.md#supported-models."
         )
 
     arch = architectures[0]
@@ -74,7 +74,7 @@ def resolve_config_architecture(
         route = _BUILTIN_ROUTES.get(arch, "use its model-specific adapter")
         raise UnsupportedModelError(
             f"{entry_point} does not support built-in HF architecture {arch!r}; "
-            f"{route}. See docs/model_support.md."
+            f"{route}. See docs/api_reference.md#supported-models."
         )
     return arch
 

@@ -36,16 +36,18 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 
 template <typename T>
 class ModelHandleRegistry {
 public:
     // 创建新实例, 返回其 handle。
-    static int64_t create() {
+    template <typename... Args>
+    static int64_t create(Args&&... args) {
         auto& r = instance();
         std::lock_guard<std::mutex> lock(r.mutex_);
         int64_t handle = r.next_handle_++;
-        r.instances_[handle] = std::make_unique<T>();
+        r.instances_[handle] = std::make_unique<T>(std::forward<Args>(args)...);
         return handle;
     }
 

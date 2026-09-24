@@ -5,7 +5,7 @@
 写 adapter 前先完成本评审。目标是判断一个精确模型配置是否适合 RhinoForge 当前公开
 接口，并在 checkpoint 加载或不可逆权重转换前暴露 blocker。
 
-先读[模型支持](model_support.zh.md)、[架构](architecture.zh.md)和
+先读[示例](model_support.zh.md)、[架构](architecture.zh.md)和
 [模型移植](model_porting.zh.md)。每次只评审一个精确配置；家族名称或相同 Hugging Face
 architecture 不是配置。
 
@@ -25,9 +25,9 @@ architecture 不是配置。
 
 ## 阶段 1：固定配置
 
-逐行比较[模型支持](model_support.zh.md)中的状态和排除项。定义有用且可测试的最小输入
-范围，并包含所有会改变模型数学、tensor shape、Graph topology、cache layout 或精度
-的选项。
+对照[示例](model_support.zh.md)链接的配置与运行时准入边界。定义有用且可测试的
+最小输入范围，并包含所有会改变模型数学、tensor shape、Graph topology、cache layout
+或精度的选项。
 
 出现下列任一情况时提前失败：精确配置明确不支持；所需精度不可用；目标需要训练或
 微调；所需模型代码无法在 `trust_remote_code=False` 下运行；或无法固定 checkpoint、
@@ -130,5 +130,5 @@ Outcome 旁列出假设和 blocker。只有批准的 decoder-only `Adapter-only`
 runtime extension、fused subsystem、vision 和多组件 policy 使用完整
 [模型移植](model_porting.zh.md)流程。
 
-所有门禁未在同一不可变源码、依赖、checkpoint、配置和资产集合上完成前，不得添加
-support matrix 行。
+所有适用门禁未在同一不可变源码、依赖、checkpoint、配置和资产集合上完成前，
+不得声明该配置已通过验证。

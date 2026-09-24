@@ -1,12 +1,9 @@
-// rpu_hyvla_vlm_model.cpp — Hy-Embodied-0.5-VLA 的 VLM prefill fused 解码器。
-//
-// 继承 v3::CausalDecoderModel, 每层做"双算 + 行掩码合并": text 行结果与 *_v 孪生
-// 权重结果按常量行掩码逐元素混合 (out = x_t*text + x_v*vis)。掩码常量化的前提是
-// 一次 prefill 内 prefix 的 modality 布局固定; 掩码在 set_moe_weights 时按宽度展开
-// 为 DDR 常量并经 Persistent SPM 槽 preload。
-//
-// 步 3 先执行 RoPE 再执行 QK-norm，norm 两塔共享；无 QKV
-// bias，final norm 仅一份，eps=1e-5。
+// rpu_hyvla_vlm_model.cpp — Hy-Embodied-0.5-VLA VLM prefill decoder.
+// Each layer computes text and vision branches and merges them using constant
+// per-row modality masks. set_moe_weights expands the masks into persistent
+// preload storage for the fixed prefill layout.
+// RoPE precedes QK normalization, whose weights are shared with the expert.
+// The model has no QKV bias and uses one final norm.
 #include "rpu_hyvla_vlm_model.h"
 #include "model_handle_registry.h"
 #include "rpu_kernel_decls.h"
@@ -21,115 +18,27 @@
 #include <cstring>
 #include <vector>
 
-// ─────────────────────────────────────────────────────────────────────────────
-// RPU_HY_VLA_FAST_REPLAY —— **逐座 opt-in** 的 fast-replay，默认 OFF。
-// 说明与契约见 `rpu_hyvit2_vision_model.cpp` 里同名函数的注释（三座各保留一份，
-// 避免为单个开关增加共享接口）。
-// ─────────────────────────────────────────────────────────────────────────────
-static bool hyvla_fast_replay_on(const char* who) {
-    static const std::string v = [] {
-        const char* e = std::getenv("RPU_HY_VLA_FAST_REPLAY");
-        return std::string(e ? e : "");
-    }();
-    if (v.empty() || v == "0" || v == "off" || v == "false") return false;
-    if (v == "1" || v == "on" || v == "true") return true;
-    return v.find(who) != std::string::npos;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// RPU_HY_VLA_FAST_REPLAY_PRELOAD —— 同样**逐座 opt-in**，默认 OFF。
-// 打开后在 REPLAY（且权重 clean）跳过 persistent preload 回调与 `preload_fn` 的
-// host 重走 —— 已建好的 preload DMA 节点仍由 segment launch 重放到同一块
-// persistent SPM，逐位不变。框架契约见 `fused_model_base.cpp` 的
-// `fast_replay_skip_preload` 注释。
-// 依赖 `fast_replay_skip_layer_loop` 一起开（框架内部与它 AND）。
-// ─────────────────────────────────────────────────────────────────────────────
-static bool hyvla_fast_replay_preload_on(const char* who) {
-    static const std::string v = [] {
-        const char* e = std::getenv("RPU_HY_VLA_FAST_REPLAY_PRELOAD");
-        return std::string(e ? e : "");
-    }();
-    if (v.empty() || v == "0" || v == "off" || v == "false") return false;
-    if (v == "1" || v == "on" || v == "true") return true;
-    return v.find(who) != std::string::npos;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// RPU_HY_VLA_MASK_ONCE —— 同样**逐座 opt-in**，默认 OFF。
-// 显式 2D mask 逐层恒定，但 `sdpa_mask` 槽默认相位混叠 ⇒ 每层都要重灌一次。
-// 完整机理与"为什么按 body 而不是按整图"见
-// `rpu_hyvla_expert_model.cpp` 里同名函数的注释（三座各一份，避免为一个开关
-// 往共享头文件里塞东西）。**逐位等价**。
-// ─────────────────────────────────────────────────────────────────────────────
-static bool hyvla_mask_once_on(const char* who) {
-    static const std::string v = [] {
-        const char* e = std::getenv("RPU_HY_VLA_MASK_ONCE");
-        return std::string(e ? e : "");
-    }();
-    if (v.empty() || v == "0" || v == "off" || v == "false") return false;
-    if (v == "1" || v == "on" || v == "true") return true;
-    return v.find(who) != std::string::npos;
-}
-
-// `RPU_HY_VLA_PARTIAL_ROPE` uses `who="vlm"` here. The selector semantics
-// and numerical-equivalence conditions are documented beside the matching
-// expert helper. Keep a local static copy to avoid shared-header state.
-static bool hyvla_partial_rope_on(const char* who) {
-    static const std::string v = [] {
-        const char* e = std::getenv("RPU_HY_VLA_PARTIAL_ROPE");
-        return std::string(e ? e : "");
-    }();
-    if (v.empty() || v == "0" || v == "off" || v == "false") return false;
-    if (v == "1" || v == "on" || v == "true") return true;
-    return v.find(who) != std::string::npos;
-}
-
-// RPU_HY_VLA_MOT_NORM_NOMERGE skips two row merges: the input-norm merge
-// before QKV and the post-norm merge before the MLP. Text rows consume the
-// text norm and action rows consume the action norm; the later 0/1 row mask
-// discards the other branch. This is bitwise equivalent while both branch
-// values remain finite, which RMSNorm guarantees for zero-padding rows.
+// FAST_REPLAY and FAST_REPLAY_PRELOAD use the same stable-buffer and mutable-DMA
+// contracts as the HYViT2 and expert components. Clean preload nodes remain
+// part of the captured segment even when their host emission is skipped.
+// MASK_ONCE extends the mask lifetime using the expert component's allocator
+// rules. Python resolves these choices once and binds them to the handle.
+// PARTIAL_ROPE preserves the existing tables and table-row offset.
 //
-// Skipping a merge extends the matching action-norm SPM lifetime by one phase,
-// so QKV and MLP can be selected independently:
-//     off / 0        keep both merges
-//     qkv            skip only the input-norm merge
-//     mlp            skip only the post-norm merge
-//     on / 1 / both  skip both merges (default)
-// The SPM allocator rejects a selection that exceeds the active profile.
+// MOT_NORM_NOMERGE omits merging the input and post-attention norm outputs before
+// the two independent GEMMs. Each branch reads its own norm output; the later
+// Q/K/V or down merge still selects the required branch per row. This requires
+// binary masks and finite discarded branch values, since 0 * NaN remains NaN.
+// norm_a1 must live through phase 2 and norm_a2 through phase 7. The qkv/mlp
+// selectors control these lifetime extensions independently; both enables both.
+// The allocator must account for the longer lifetimes before admitting a layout.
 enum : unsigned { MOT_NOMERGE_QKV = 1u, MOT_NOMERGE_MLP = 2u };
 
-static unsigned hyvla_mot_norm_nomerge_mask() {
-    static const unsigned m = [] () -> unsigned {
-        const char* e = std::getenv("RPU_HY_VLA_MOT_NORM_NOMERGE");
-        if (!e || !*e) return MOT_NOMERGE_QKV | MOT_NOMERGE_MLP;   // 默认两处都省
-        const std::string v(e);
-        if (v == "0" || v == "off" || v == "false") return 0u;
-        if (v == "1" || v == "on" || v == "true" || v == "both")
-            return MOT_NOMERGE_QKV | MOT_NOMERGE_MLP;
-        unsigned r = 0;
-        if (v.find("qkv") != std::string::npos) r |= MOT_NOMERGE_QKV;
-        if (v.find("mlp") != std::string::npos) r |= MOT_NOMERGE_MLP;
-        return r;
-    }();
-    return m;
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
-// RPU_HY_VLA_SILU_MUL —— 逐座 opt-in，默认 OFF。机理与等价条件见
+// RPU_HY_VLA_SILU_MUL —— 逐座 opt-in，默认 OFF。机理与验收口径见
 // `rpu_hyvla_expert_model.cpp` 里同名函数的注释（三座各一份）。
 // 本座是 MoT 双分支 ⇒ 每层两次 SwiGLU，合并后每层省 2 次 launch。
 // ─────────────────────────────────────────────────────────────────────────────
-static bool hyvla_silu_mul_on(const char* who) {
-    static const std::string v = [] {
-        const char* e = std::getenv("RPU_HY_VLA_SILU_MUL");
-        return std::string(e ? e : "");
-    }();
-    if (v.empty() || v == "0" || v == "off" || v == "false") return false;
-    if (v == "1" || v == "on" || v == "true") return true;
-    return v.find(who) != std::string::npos;
-}
-
 static void hyvla_widen_sdpa_mask_slot(std::vector<v3::BufferDecl>& decls) {
     for (auto& b : decls) {
         if (b.name && std::strcmp(b.name, "sdpa_mask") == 0) {
@@ -142,15 +51,125 @@ static void hyvla_widen_sdpa_mask_slot(std::vector<v3::BufferDecl>& decls) {
 
 namespace v3 {
 
+// HYVLA_VLM_FIXED_KERNEL_BASIS: launchers outside the selector-controlled
+// sites below are invariant model-dataflow glue.  Every cold route that
+// changes graph scheduling, normalization topology, activation, RoPE, or DMA
+// cadence is bound to an explicit physical-manifest entry before dispatch.
+
+constexpr int64_t HYVLA_VLM_ATTN_SITE = 4354974985578103569LL;
+constexpr int64_t HYVLA_VLM_KV_SITE = 2260457013508596554LL;
+constexpr int64_t HYVLA_VLM_GRAPH_SCHEDULE_SITE = 1891892172693751815LL;
+constexpr int64_t HYVLA_VLM_MASK_SCHEDULE_SITE = 8543552822435768982LL;
+constexpr int64_t HYVLA_VLM_INPUT_NORM_TOPOLOGY_SITE = 7126209149859475005LL;
+constexpr int64_t HYVLA_VLM_POST_NORM_TOPOLOGY_SITE = 7589253846984036685LL;
+constexpr int64_t kHyVlaVlmRmsNormFullRowsSite = 561884935551131924LL;
+constexpr int64_t kHyVlaVlmRmsNormQHeadRowsSite = 8544308333460224633LL;
+constexpr int64_t kHyVlaVlmRmsNormKHeadRowsSite = 1883301826947881937LL;
+constexpr int64_t HYVLA_VLM_QKV_LINEAR_SITE = 1055061191250944583LL;
+constexpr int64_t HYVLA_VLM_Q_PARTIAL_ROPE_SITE = 7310872600321580915LL;
+constexpr int64_t HYVLA_VLM_Q_ROPE_SITE = 5787941996819323604LL;
+constexpr int64_t HYVLA_VLM_K_PARTIAL_ROPE_SITE = 8480165489785921729LL;
+constexpr int64_t HYVLA_VLM_K_ROPE_SITE = 7482633060228256420LL;
+constexpr int64_t HYVLA_VLM_PREPARE_ATTN_ALL_REDUCE_SITE = 7244482564358429924LL;
+constexpr int64_t HYVLA_VLM_O_TEXT_LINEAR_SITE = 1140698111824322874LL;
+constexpr int64_t HYVLA_VLM_O_ACT_LINEAR_SITE = 3216096526013279443LL;
+constexpr int64_t HYVLA_VLM_ATTN_ALL_REDUCE_SITE = 2887898270408281163LL;
+constexpr int64_t HYVLA_VLM_MLP_GATE_LINEAR_SITE = 565715283461372786LL;
+constexpr int64_t HYVLA_VLM_MLP_SILU_SITE = 3082555866678770980LL;
+constexpr int64_t HYVLA_VLM_MLP_UP_LINEAR_SITE = 6842600829612506442LL;
+constexpr int64_t HYVLA_VLM_MLP_SILU_MUL_SITE = 3430121266977245422LL;
+constexpr int64_t HYVLA_VLM_MLP_MUL_SITE = 4141421508680707465LL;
+constexpr int64_t HYVLA_VLM_MLP_DOWN_LINEAR_SITE = 1914100820284426885LL;
+constexpr int64_t HYVLA_VLM_MLP_ALL_REDUCE_SITE = 740273045227131643LL;
+constexpr int64_t HYVLA_VLM_QKV_BIAS_PRELOAD_DMA_SITE =
+    7757347464819546080LL;
+constexpr uint32_t HYVLA_VLM_KV_CAPABILITIES =
+    KV_INSERT_CAP_V2 | KV_INSERT_CAP_V16 |
+    KV_INSERT_CAP_NON8_TP_V16;
+constexpr int64_t HYVLA_VLM_KV_REASON_PREFIX_HISTORY_DDR_REQUIRED = 2;
+
+enum class HyVlaVlmGraphScheduleRoute : int64_t {
+    REEMIT_LAYER_LOOP = 1,
+    FAST_REPLAY_SKIP_LAYER_LOOP = 2,
+    MASK_EACH_LAYER = 3,
+    MASK_FIRST_LAYER_ONLY = 4,
+};
+
+enum class HyVlaVlmNormalizationRoute : int64_t {
+    MOT_MERGED = 1,
+    MOT_BRANCH_LOCAL = 2,
+};
+
+enum class HyVlaVlmActivationRoute : int64_t {
+    SILU_UNARY = 1,
+    MUL = 2,
+    SILU_MUL_FUSED = 3,
+};
+
+enum class HyVlaVlmRopeRoute : int64_t {
+    ROPE_1D = 1,
+    PARTIAL_MROPE = 2,
+};
+
+enum class HyVlaVlmAllReduceRoute : int64_t {
+    PREPARE_RING_INPUT = 3,
+};
+
+enum class HyVlaVlmDmaRoute : int64_t {
+    DDR_SCATTER_TO_SPM_FIXED = 1,
+};
+
 ModelStaticConfig HyVlaVlmModel::static_config() {
     ModelStaticConfig cfg = CausalDecoderModel::static_config();
-    cfg.fast_replay_skip_layer_loop = hyvla_fast_replay_on("vlm");
-    cfg.fast_replay_skip_preload = hyvla_fast_replay_preload_on("vlm");
+    cfg.fast_replay_skip_layer_loop = cold_fast_replay_;
+    cfg.fast_replay_skip_preload = cold_fast_replay_preload_;
     return cfg;
 }
 
-HyVlaVlmModel::HyVlaVlmModel()  = default;
+HyVlaVlmModel::HyVlaVlmModel() = default;
 HyVlaVlmModel::~HyVlaVlmModel() = default;
+
+void HyVlaVlmModel::set_runtime_config(
+    bool fast_replay, bool fast_replay_preload, bool mask_once,
+    bool partial_rope, int64_t mot_norm_nomerge, bool silu_mul,
+    int64_t rmsnorm_capability) {
+    TORCH_CHECK(
+        !cold_config_bound_ && text_layers_.empty(),
+        "hyvla_vlm_set_runtime_config must run exactly once before "
+        "set_weights");
+    TORCH_CHECK(
+        mot_norm_nomerge >= 0 &&
+            mot_norm_nomerge <=
+                static_cast<int64_t>(MOT_NOMERGE_QKV | MOT_NOMERGE_MLP),
+        "hyvla_vlm_set_runtime_config: mot_norm_nomerge must be a "
+        "two-bit mask in [0,3], got ", mot_norm_nomerge);
+    TORCH_CHECK(
+        rmsnorm_capability >= 0 &&
+            rmsnorm_capability <= static_cast<int64_t>(RPU_RMSNORM_CAP_ALL) &&
+            rpu_rmsnorm_capability_valid(
+                static_cast<uint32_t>(rmsnorm_capability)),
+        "hyvla_vlm_set_runtime_config: rmsnorm_capability must include BASE "
+        "and contain only BASE/V16/V32; got ", rmsnorm_capability);
+
+    // Snapshot every fallible runtime dependency before committing this
+    // one-shot configuration.  In particular, KernelCache::has_loaded() may
+    // reject a call outside the runtime-ready lifecycle; such a rejection must
+    // leave the handle eligible for a clean retry with no partially installed
+    // cold fields.
+    const RpuRmsNormSpmContract rmsnorm_spm_contract =
+        rpu_snapshot_rmsnorm_spm_contract(
+            static_cast<uint32_t>(rmsnorm_capability));
+    invalidate_model_state();
+
+    cold_fast_replay_ = fast_replay;
+    cold_fast_replay_preload_ = fast_replay_preload;
+    cold_mask_once_ = mask_once;
+    cold_partial_rope_ = partial_rope;
+    cold_mot_norm_nomerge_ = static_cast<unsigned>(mot_norm_nomerge);
+    cold_silu_mul_ = silu_mul;
+    cold_rmsnorm_spm_contract_ = rmsnorm_spm_contract;
+    cold_config_bound_ = true;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // set_weights_hyvla — text 主权重 (基类委托 + 子类影子)
@@ -171,6 +190,10 @@ void HyVlaVlmModel::set_weights_hyvla(
     at::TensorList gate_ws_list, at::TensorList up_ws_list,
     at::TensorList down_ws_list)
 {
+    TORCH_CHECK(
+        cold_config_bound_,
+        "hyvla set_weights requires an explicit immutable runtime config "
+        "snapshot");
     // Hy-VLA 的 MLP 固定 SwiGLU; 手写 MLP 相 (步 6) 写死 SILU, 不接受
     // use_silu=false 的静默错配。
     TORCH_CHECK(use_silu,
@@ -218,22 +241,246 @@ void HyVlaVlmModel::set_weights_hyvla(
     eps_hyvla_ = eps;
     final_norm_text_ = final_norm_w;   // set_moe_weights 的同一性断言要用
 
-    invalidate_model_state();   // 影子提交后再失效一次，保持末语句语义。
+    invalidate_model_state();   // D-503: 影子提交后再失效一次, 保证末语句语义
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// dynamic_config — 基类断言单 chunk + 准备其 private mask; 再备一份子类可见的
-// PreparedMask 供步 4 的 sdpa_dma_mask_to_spm/SDPA 使用 (每 forward 一次)。
+// dynamic_config — 基类断言单 chunk，并统一准备显式 mask。HyVLA 直接复用
+// CausalDecoderModel 的稳定 PreparedMask，避免同一输入在一个 forward 内重复
+// RPU→CPU→RPU 归一化。
 // ─────────────────────────────────────────────────────────────────────────────
 ModelDynamicConfig HyVlaVlmModel::dynamic_config(const ChunkPlan& plan) {
     ModelDynamicConfig cfg = CausalDecoderModel::dynamic_config(plan);
+    // The action expert consumes this prefix history from the shared DDR KV
+    // cache.  This owner does not advertise the unrelated raw-SPM/MHA path.
+    cfg.attention_policy = AttentionExecutionPolicy::DDR_KV;
     TORCH_CHECK(ctx().attention_mask.has_value(),
                 "hyvla dynamic_config: explicit attention mask required");
-    prepared_mask_hyvla_ = sdpa_prepare_mask(
-        ctx().attention_mask, /*is_causal=*/false,
-        ctx().seq_len, ctx().position + ctx().seq_len,
-        sdpa_stable_mask_cache());
     return cfg;
+}
+
+ModelDynamicConfig HyVlaVlmModel::planning_dynamic_config(
+    const ChunkPlan& /*plan*/) {
+    ModelDynamicConfig cfg;
+    cfg.chunk_mode = ChunkMode::SEQUENTIAL;
+    cfg.inter_layer_io = InterLayerIO::AUTO;
+    cfg.attention_policy = AttentionExecutionPolicy::DDR_KV;
+    return cfg;
+}
+
+FmbPhysicalExecutionManifest HyVlaVlmModel::physical_manifest_for_candidate(
+    const FmbThreeStageChunkPlan& plan,
+    const LayoutContext& /*layout*/,
+    int64_t physical_len, int64_t logical_len,
+    int64_t position) const {
+    FmbPhysicalExecutionManifest manifest;
+    manifest.state = FmbPhysicalManifestState::COMPLETE;
+    manifest.logical_length = logical_len;
+    manifest.physical_length = physical_len;
+    manifest.execution_padding_rows = physical_len - logical_len;
+    manifest.kv_logical_length = position + logical_len;
+    TORCH_CHECK(
+        plan.qkv.chunks.size() == 1 && plan.compute.chunks.size() == 1,
+        "HyVlaVlmModel COMPLETE descriptor requires one prefix chunk");
+    const ChunkInfo& kv_chunk = plan.qkv.chunks.front();
+    const ChunkInfo& chunk = plan.compute.chunks.front();
+    TORCH_CHECK(
+        kv_chunk.idx == chunk.idx && kv_chunk.offset == chunk.offset &&
+            kv_chunk.len == chunk.len,
+        "HyVlaVlmModel COMPLETE descriptor requires identical QKV and "
+        "compute prefix chunks");
+    const int64_t invocation = chunk.idx;
+    const int64_t h = hidden_size();
+    const int64_t nq = num_q_heads();
+    const int64_t nkv = num_kv_heads();
+    const int64_t hd = head_dim();
+    const int64_t tp = attn_tp();
+    const int64_t local_q = nq / tp;
+    const int64_t local_kv_heads = nkv / tp;
+    manifest.graph_lifecycle = FmbGraphLifecycle::COMPOSITE_CHILD;
+    const KvInsertSegmentPlan kv_plan =
+        resolve_kvinsert_plan_auto(
+            HYVLA_VLM_KV_SITE, manifest.graph_lifecycle,
+            position + kv_chunk.offset, kv_chunk.len, kv_chunk.len,
+            attn_tp(), num_kv_heads(), head_dim(),
+            HYVLA_VLM_KV_CAPABILITIES);
+    const KvInsertRouteArguments kv_arguments =
+        rpu_kvinsert_route_arguments(
+            kv_plan, attn_tp(), num_kv_heads(), head_dim());
+    manifest.kv_insert_physical_rows = kv_plan.physical_rows();
+    manifest.linear_accumulation = FmbLinearAccumulationPolicy::ACC16;
+
+    const auto append = [&](FmbRouteFamily family, int64_t site_id,
+                            int64_t selector,
+                            std::vector<int64_t> arguments = {},
+                            int64_t flags = 0) {
+        manifest.routes.push_back({site_id, family, selector, flags,
+                                   std::move(arguments), invocation});
+    };
+    const auto append_linear = [&](int64_t site_id,
+                                   std::vector<int64_t> arguments = {}) {
+        append(FmbRouteFamily::LINEAR, site_id,
+               static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+               std::move(arguments));
+    };
+
+    append(
+        FmbRouteFamily::GRAPH_SCHEDULE,
+        HYVLA_VLM_GRAPH_SCHEDULE_SITE,
+        static_cast<int64_t>(
+            cold_fast_replay_
+                ? HyVlaVlmGraphScheduleRoute::FAST_REPLAY_SKIP_LAYER_LOOP
+                : HyVlaVlmGraphScheduleRoute::REEMIT_LAYER_LOOP),
+        {cold_fast_replay_ ? 1 : 0,
+         cold_fast_replay_preload_ ? 1 : 0});
+    append(
+        FmbRouteFamily::GRAPH_SCHEDULE,
+        HYVLA_VLM_MASK_SCHEDULE_SITE,
+        static_cast<int64_t>(
+            cold_mask_once_
+                ? HyVlaVlmGraphScheduleRoute::MASK_FIRST_LAYER_ONLY
+                : HyVlaVlmGraphScheduleRoute::MASK_EACH_LAYER),
+        {cold_mask_once_ ? 1 : 0, chunk.len, kv_chunk.kv_seq_len,
+         tp, num_layers()});
+    append(
+        FmbRouteFamily::NORMALIZATION,
+        HYVLA_VLM_INPUT_NORM_TOPOLOGY_SITE,
+        static_cast<int64_t>(
+            (cold_mot_norm_nomerge_ & MOT_NOMERGE_QKV)
+                ? HyVlaVlmNormalizationRoute::MOT_BRANCH_LOCAL
+                : HyVlaVlmNormalizationRoute::MOT_MERGED),
+        {static_cast<int64_t>(cold_mot_norm_nomerge_),
+         (cold_mot_norm_nomerge_ & MOT_NOMERGE_QKV) ? 1 : 0,
+         chunk.len, h});
+    append(
+        FmbRouteFamily::NORMALIZATION,
+        HYVLA_VLM_POST_NORM_TOPOLOGY_SITE,
+        static_cast<int64_t>(
+            (cold_mot_norm_nomerge_ & MOT_NOMERGE_MLP)
+                ? HyVlaVlmNormalizationRoute::MOT_BRANCH_LOCAL
+                : HyVlaVlmNormalizationRoute::MOT_MERGED),
+        {static_cast<int64_t>(cold_mot_norm_nomerge_),
+         (cold_mot_norm_nomerge_ & MOT_NOMERGE_MLP) ? 1 : 0,
+         chunk.len, h});
+    const auto append_rmsnorm = [&](int64_t site_id, int64_t rows,
+                                    int64_t cols) {
+        append(
+            FmbRouteFamily::NORMALIZATION, site_id,
+            static_cast<int64_t>(cold_rmsnorm_spm_contract_.resolve(rows, cols)),
+            cold_rmsnorm_spm_contract_.manifest_arguments(rows, cols));
+    };
+    append_rmsnorm(kHyVlaVlmRmsNormFullRowsSite, chunk.len, h);
+    append_rmsnorm(
+        kHyVlaVlmRmsNormQHeadRowsSite, chunk.len * local_q, hd);
+    append_rmsnorm(
+        kHyVlaVlmRmsNormKHeadRowsSite,
+        chunk.len * local_kv_heads, hd);
+    if (has_qkv_bias_) {
+        const int64_t q_bias_elems = nq * hd;
+        const int64_t kv_bias_elems = nkv * hd;
+        const auto append_bias_dma = [&](int64_t total_elems,
+                                         int64_t bias_invocation) {
+            const int64_t per_core = total_elems / tp;
+            manifest.routes.push_back({
+                HYVLA_VLM_QKV_BIAS_PRELOAD_DMA_SITE,
+                FmbRouteFamily::MUTABLE_DMA,
+                static_cast<int64_t>(
+                    HyVlaVlmDmaRoute::DDR_SCATTER_TO_SPM_FIXED),
+                /*flags=*/0,
+                {has_qkv_bias_ ? 1 : 0, total_elems, per_core,
+                 per_core * DWIDTH, tp},
+                bias_invocation});
+        };
+        append_bias_dma(q_bias_elems, /*bias_invocation=*/0);
+        append_bias_dma(kv_bias_elems, /*bias_invocation=*/1);
+        append_bias_dma(kv_bias_elems, /*bias_invocation=*/2);
+    }
+    append_linear(HYVLA_VLM_QKV_LINEAR_SITE);
+    append(
+        FmbRouteFamily::ROPE,
+        cold_partial_rope_ ? HYVLA_VLM_Q_PARTIAL_ROPE_SITE
+                           : HYVLA_VLM_Q_ROPE_SITE,
+        static_cast<int64_t>(
+            cold_partial_rope_ ? HyVlaVlmRopeRoute::PARTIAL_MROPE
+                               : HyVlaVlmRopeRoute::ROPE_1D),
+        {cold_partial_rope_ ? 1 : 0, position + chunk.offset,
+         chunk.len, local_q, hd, tp});
+    append(
+        FmbRouteFamily::ROPE,
+        cold_partial_rope_ ? HYVLA_VLM_K_PARTIAL_ROPE_SITE
+                           : HYVLA_VLM_K_ROPE_SITE,
+        static_cast<int64_t>(
+            cold_partial_rope_ ? HyVlaVlmRopeRoute::PARTIAL_MROPE
+                               : HyVlaVlmRopeRoute::ROPE_1D),
+        {cold_partial_rope_ ? 1 : 0, position + chunk.offset,
+         chunk.len, local_kv_heads, hd, tp});
+    // Prefix history has no raw-SPM ownership port in this model.  Freeze the
+    // exact pure-resolver segment plan into the descriptor; forward restores
+    // this typed value and never consults the legacy environment selectors.
+    append(
+        FmbRouteFamily::KV_INSERT, HYVLA_VLM_KV_SITE,
+        static_cast<int64_t>(kv_plan.route()),
+        std::vector<int64_t>(kv_arguments.begin(), kv_arguments.end()),
+        HYVLA_VLM_KV_REASON_PREFIX_HISTORY_DDR_REQUIRED);
+    append(
+        FmbRouteFamily::ATTENTION, HYVLA_VLM_ATTN_SITE,
+        static_cast<int64_t>(AttentionExecutionPolicy::DDR_KV));
+    append(
+        FmbRouteFamily::ALL_REDUCE,
+        HYVLA_VLM_PREPARE_ATTN_ALL_REDUCE_SITE,
+        static_cast<int64_t>(HyVlaVlmAllReduceRoute::PREPARE_RING_INPUT),
+        {chunk.len, h, tp});
+    append_linear(
+        HYVLA_VLM_O_TEXT_LINEAR_SITE,
+        {chunk.len, h, nq * hd, 0, tp});
+    append_linear(
+        HYVLA_VLM_O_ACT_LINEAR_SITE,
+        {chunk.len, h, nq * hd, 0, tp});
+    append(
+        FmbRouteFamily::ALL_REDUCE,
+        HYVLA_VLM_ATTN_ALL_REDUCE_SITE,
+        fmb_ring_all_reduce_route_selector(chunk.len, h),
+        {chunk.len, h, tp, NUM_CORES});
+    append_linear(
+        HYVLA_VLM_MLP_GATE_LINEAR_SITE,
+        {chunk.len, intermediate_size(), h, 1, NUM_CORES});
+    append_linear(
+        HYVLA_VLM_MLP_UP_LINEAR_SITE,
+        {chunk.len, intermediate_size(), h, 1, NUM_CORES});
+    const int64_t elems_mlp = chunk.len * (intermediate_size() / NUM_CORES);
+    if (cold_silu_mul_) {
+        append(
+            FmbRouteFamily::ACTIVATION, HYVLA_VLM_MLP_SILU_MUL_SITE,
+            static_cast<int64_t>(HyVlaVlmActivationRoute::SILU_MUL_FUSED),
+            {cold_silu_mul_ ? 1 : 0, elems_mlp, NUM_CORES});
+    } else {
+        append(
+            FmbRouteFamily::ACTIVATION, HYVLA_VLM_MLP_SILU_SITE,
+            static_cast<int64_t>(HyVlaVlmActivationRoute::SILU_UNARY),
+            {cold_silu_mul_ ? 1 : 0, elems_mlp, NUM_CORES});
+        append(
+            FmbRouteFamily::ACTIVATION, HYVLA_VLM_MLP_MUL_SITE,
+            static_cast<int64_t>(HyVlaVlmActivationRoute::MUL),
+            {cold_silu_mul_ ? 1 : 0, elems_mlp, NUM_CORES});
+    }
+    append_linear(
+        HYVLA_VLM_MLP_DOWN_LINEAR_SITE,
+        {chunk.len, h, intermediate_size(), 0, NUM_CORES});
+    append(
+        FmbRouteFamily::ALL_REDUCE,
+        HYVLA_VLM_MLP_ALL_REDUCE_SITE,
+        fmb_ring_all_reduce_route_selector(chunk.len, h),
+        {chunk.len, h, NUM_CORES, NUM_CORES});
+    append_causal_decoder_preload_manifest_routes(manifest);
+    append_fmb_shared_runtime_routes(
+        manifest, plan, hidden_size(), FMB_SHARED_LAYER_INPUT_DMA);
+    return manifest;
+}
+
+FmbPhysicalManifestForwardCapability
+HyVlaVlmModel::physical_manifest_forward_capability(
+    const FmbPhysicalExecutionManifest& /*manifest*/) const {
+    return {true, FmbGraphLifecycle::COMPOSITE_CHILD};
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -241,15 +488,32 @@ ModelDynamicConfig HyVlaVlmModel::dynamic_config(const ChunkPlan& plan) {
 //
 // 整个 prefix 必须一次进 MASK_2D 非因果 SDPA。Hy-VLA seq=192 > 176 ⇒
 // tile_m_v16 封顶 8 → tile_m=128 → grid_dim_x=2；16/4 GQA 在 attn_tp=4 下
-// gqa_group_size=4 ⇒ product=8，**正好压在** keeper 的 product<=8 上限。
-// 这里 override 是因为行掩码与 KV merge 按整块设计：
+// gqa_group_size=4 ⇒ product=8，**正好压在** keeper 的 product<=8 上限
+// (rpu_helpers.h:322)。这里 override 是因为行掩码与 KV merge 按整块设计：
 // 单块 (cs>=seq_len ⇒ num_chunks==1) 合法，多块非法。
 // ⚠️ 更长的 prefix 会把 grid 顶过上限 —— 届时要改成分块 + 掩码按 chunk.offset
-// 取行切片，不是放宽这里。
+// 取行切片，而不是放宽单块约束。
 // ─────────────────────────────────────────────────────────────────────────────
 bool HyVlaVlmModel::subclass_chunk_size_valid(
     int64_t cs, int64_t seq_len, int64_t /*position*/) const {
     return cs >= seq_len && chunk_within_envelope(cs);
+}
+
+std::vector<int64_t> HyVlaVlmModel::resolve_stage_domain(
+    int64_t seq_len, int64_t prefix_len, int64_t mask_kv_len) {
+    TORCH_CHECK(seq_len == moe_chunk_size_,
+                "hyvla_vlm_resolve_stage_domain: seq_len must match the "
+                "fixed MoT row-mask geometry");
+    TORCH_CHECK(prefix_len >= 0 && mask_kv_len == prefix_len + seq_len,
+                "hyvla_vlm_resolve_stage_domain: mask width must equal "
+                "prefix_len + seq_len");
+    const at::Tensor mask = at::empty(
+        {1, mask_kv_len},
+        at::TensorOptions().dtype(at::kHalf).device(at::kCPU));
+    return encode_fmb_prefill_stage_domain(
+        resolve_prefill_stage_domain_for_shape(
+            seq_len, prefix_len, std::optional<at::Tensor>(mask),
+            /*is_causal=*/false));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -327,7 +591,8 @@ void HyVlaVlmModel::set_moe_weights(
     // 秩 + dtype/device/contiguous 检查。这些 act-twin 权重
     // 经 moe_layers_ keepalive 后在 preload 回调以 data_ptr<c10::Half>() DMA 读 → 必须
     // fp16 + PrivateUse1 + contiguous,否则错 device/dtype 张量在入口通过却在 DMA 静默腐蚀。
-    // Shape details remain launcher-validated against GEMM N/K.
+    // 原仅 check_rank(defined+dim)是 CLASS-B 并行路径漂移:孪生 setter 漏抄 image_flow
+    // set_gen_weights 的 check_fp16_rpu 校验。形状细节仍由 GEMM 启动器按 N/K 校验。
     auto check_fp16_rpu = [&](const at::TensorList& list, const char* name,
                              int64_t rank) {
         for (int64_t i = 0; i < N; ++i) {
@@ -450,9 +715,14 @@ void HyVlaVlmModel::set_moe_weights(
                 "hyvla set_moe_weights: text_row_mask values must be exactly 0/1");
 
     // ── 掩码常量化: [cs, 1] fp16 行向量 (act = 1 - text) ──
-    // Masks are stored as [cs,1] row vectors and broadcast during merge. Exact
-    // 0/1 multiplication preserves the selected branch bit-for-bit.
-    // 常量在 host (CPU) 生成后整体复制到 RPU DDR，不在 device 上填充。
+    // 掩码逐行恒定, 只有 cs 个不同的值。历史版本按 3 个 merge 宽度各展开成
+    // [cs, W] —— S=240 时 2×(240+60+960) KB = **2520 KB** 的 Persistent, 存的却是
+    // 240 bit 的信息, 且 Persistent 走 alloc_super_persistent (单调不回收) ⇒ 它是
+    // 三子系统跨帧共存的头号阻塞。改成行向量后两个槽合计 1 KB。
+    // merge 侧用 `rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel` 做行广播乘,
+    // **位精确**: 掩码恒 0/1, fp16 下 x*1.0 / x*0.0 / x+0.0 都是精确的。
+    // ⚠️ 不要为了省掉一个掩码而改写成 `b + m*(a-b)` —— 那个不是位精确的。
+    // 展开在 host (CPU) 完成后整体复制到 RPU DDR — 不在 device 上做常量填充 (Pitfall B-1)。
     const at::Tensor text_cpu = mask_cpu.to(at::kHalf);
     const auto rpu_opts =
         at::TensorOptions().dtype(at::kHalf).device(at::kPrivateUse1);
@@ -484,12 +754,7 @@ void HyVlaVlmModel::set_moe_weights(
     text_row_mask_    = text_row_mask;
     moe_chunk_size_   = chunk_size;
 
-    // The public Hy-VLA profile admits at most 240 prefix rows and requires
-    // the whole prefix to execute as one chunk. Keep that certified boundary
-    // on this handle so the inherited planner remains deny-by-default.
-    set_chunk_envelope(/*max_kv_len=*/240, /*chunk=*/240);
-
-    invalidate_model_state();   // set_moe_weights 末非空语句。
+    invalidate_model_state();   // D-503: set_moe_weights 末非空语句
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -497,7 +762,7 @@ void HyVlaVlmModel::set_moe_weights(
 // ─────────────────────────────────────────────────────────────────────────────
 std::vector<BufferDecl> HyVlaVlmModel::declare_buffers(const LayoutContext& lctx) {
     auto d = CausalDecoderModel::declare_buffers(lctx);
-    if (hyvla_mask_once_on("vlm")) hyvla_widen_sdpa_mask_slot(d);
+    if (cold_mask_once_) hyvla_widen_sdpa_mask_slot(d);
     TORCH_CHECK(moe_chunk_size_ > 0,
                 "hyvla declare_buffers: set_moe_weights must precede forward");
     // 框架解析出的 chunk_size 是单块 SPM 规划宽度 (ceil16(seq)), 实际行数
@@ -526,7 +791,7 @@ std::vector<BufferDecl> HyVlaVlmModel::declare_buffers(const LayoutContext& lctx
     const int64_t nw  = A(h * DWIDTH);
     const int64_t hnw = A(hd * DWIDTH);
 
-    // act 分支 Temp 槽 — phase 区间镜像基类对应槽,
+    // act 分支 Temp 槽 — phase 区间镜像基类对应槽 (rpu_qwen3_model.h:785-807),
     // 使 SPM 别名窗口一致: q_a 2..5, k_a/v_a 2..4, oproj_a 5..5, gate_a 7..8,
     // up_a 7..7, down_a 7..8。norm_a 是 act 侧 norm 暂存 (input/headnorm/post/
     // final 各相复用), 生命周期与 input_norm 同 (1..8)。
@@ -534,14 +799,22 @@ std::vector<BufferDecl> HyVlaVlmModel::declare_buffers(const LayoutContext& lctx
     d.push_back({"k_a",     kv,  2, 4, StorageClass::Temp, 0, nullptr});
     d.push_back({"v_a",     kv,  2, 4, StorageClass::Temp, 0, nullptr});
     d.push_back({"oproj_a", res, 5, 5, StorageClass::Temp, 0, nullptr});
-    // The serial branches reuse the base gate/up slots; only down_a needs an
-    // independent lifetime for the row merge.
+    // (HALO 在此还有 gate_a / up_a 两个 mlp 槽 —— **不需要**: 两条 MLP 是串行
+    //  发射的, text 分支跑完时它的 gate/up 中间量已经死透 (结果落在 down),
+    //  而 gate/up 又不参与行掩码 merge —— 只有最终的 down 参与。所以孪生分支
+    //  直接复写基类的 "gate"/"up" 槽即可, 唯一必须独立的是 down_a。HALO 的
+    //  cs=18 下这两个槽只值 ~55 KB 没人注意, Hy-VLA 的 S=240 下是 0.72 MB,
+    //  且峰值恰好落在 phase 7-8 的 MLP 相。)
     d.push_back({"down_a",  res, 7, 8, StorageClass::Temp, 0, nullptr});
-    // norm_a1/norm_a2 cover the two independent twin-norm lifetimes.
-    // `MOT_NORM_NOMERGE` 打开对应半边时，act 侧 norm 暂存要活到下游 GEMM
+    // norm_a1/norm_a2 — 孪生 norm 的暂存。HALO 用**单个** norm_a 且 phase 1..8,
+    // 因为它的 final norm 也要双算; Hy-VLA 的 final norm 只有一份 (步 7 已改单算),
+    // 于是孪生 norm 只剩两个瞬时点: 步 1 (input norm) 与步 5 (post norm)。拆成两个
+    // 一格区间后, 二者都能与 q/k/v/output/oproj/gate/up/down 复用地址 —— 一个横跨
+    // 1..8 的 res 槽 (S=240 时 0.94 MB) 是 SPM 峰值里最贵且最没必要的一项。
+    // R43：`MOT_NORM_NOMERGE` 打开对应半边时，act 侧 norm 暂存要活到下游 GEMM
     // 那一相（QKV 是 phase 2、MLP 是 phase 7）⇒ 相应把窗口拉长一格。
-    // 关闭开关时恢复原有窗口布局。
-    const unsigned nomerge_mask = hyvla_mot_norm_nomerge_mask();
+    // 开关关掉时窗口与改动前**逐字节相同**，保证 A/B 两臂比的是同一个布局问题。
+    const unsigned nomerge_mask = cold_mot_norm_nomerge_;
     const int a1_hi = (nomerge_mask & MOT_NOMERGE_QKV) ? 2 : 1;
     const int a2_hi = (nomerge_mask & MOT_NOMERGE_MLP) ? 7 : 6;
     d.push_back({"norm_a1", res, 1, a1_hi, StorageClass::Temp, 0, nullptr});
@@ -591,12 +864,13 @@ std::vector<BufferDecl> HyVlaVlmModel::declare_buffers(const LayoutContext& lctx
 
     if (has_qkv_bias_) {
         // bias 按 col-partition scatter: core c 收到其输出通道切片 (numel/tp),
-        // 与基类 q/k_bias 槽的布局一致。
+        // 与基类 q/k_bias 槽的布局一致 (rpu_qwen3_model.h:917-941)。
         auto dma_safe = [&A](int64_t elems) -> int64_t {
             return A(((elems + 255) / 256) * 256 * DWIDTH);
         };
         auto add_bias = [&](const char* name, int64_t sz,
-                            at::Tensor MoeLayerWeights::* member) {
+                            at::Tensor MoeLayerWeights::* member,
+                            int64_t bias_invocation) {
             BufferDecl b;
             b.name      = name;
             b.size      = sz;
@@ -604,22 +878,38 @@ std::vector<BufferDecl> HyVlaVlmModel::declare_buffers(const LayoutContext& lctx
             b.per_layer = nl;
             b.scope     = BufferScope::LayerWide;
             b.preload_callback =
-                [this, member](FusedModelBase&, int L, uint32_t core0_addr) {
+                [this, member, bias_invocation](
+                    FusedModelBase&, int L, uint32_t core0_addr) {
                     const int tp_ = attn_tp();
                     const at::Tensor& bw = moe_layers_[L].*member;
                     const int64_t per_core = bw.numel() / tp_;
+                    if (ctx().has_complete_physical_manifest()) {
+                        ctx().consume_physical_route(
+                            FmbRouteFamily::MUTABLE_DMA,
+                            HYVLA_VLM_QKV_BIAS_PRELOAD_DMA_SITE,
+                            static_cast<int64_t>(
+                                HyVlaVlmDmaRoute::DDR_SCATTER_TO_SPM_FIXED),
+                            /*resolved_flags=*/0,
+                            {has_qkv_bias_ ? 1 : 0, bw.numel(), per_core,
+                             per_core * DWIDTH, tp_},
+                            bias_invocation);
+                    }
                     rpu_launch_ddr_scatter_spm_dma(
                         bw.data_ptr<c10::Half>(),
                         per_core, per_core * DWIDTH, core0_addr, tp_);
                 };
             d.push_back(b);
         };
-        add_bias("q_bias_act", dma_safe(local_q * hd), &MoeLayerWeights::q_bias);
-        add_bias("k_bias_act", dma_safe(local_kv),     &MoeLayerWeights::k_bias);
-        add_bias("v_bias_act", dma_safe(local_kv),     &MoeLayerWeights::v_bias);
+        add_bias("q_bias_act", dma_safe(local_q * hd),
+                 &MoeLayerWeights::q_bias, /*bias_invocation=*/0);
+        add_bias("k_bias_act", dma_safe(local_kv),
+                 &MoeLayerWeights::k_bias, /*bias_invocation=*/1);
+        add_bias("v_bias_act", dma_safe(local_kv),
+                 &MoeLayerWeights::v_bias, /*bias_invocation=*/2);
     }
 
-    // Final norm 只有一份，步 7 直接使用基类的 "final_norm_w"。
+    // (HALO 在此还声明了一个 "final_norm_moe_w" Persistent 槽 —— Hy-VLA 的 final
+    //  norm 只有一份, 步 7 直接用基类的 "final_norm_w", 该槽已随双算一并删除。)
     return d;
 }
 
@@ -650,10 +940,13 @@ void HyVlaVlmModel::emit_row_merge(
 //
 // 行独立性论证: RMSNorm/GEMM/bias/SiLU 全部逐行运算, 故"双算全 cs 行后按行掩码
 // 合并"与逐行选分支严格等价; SDPA 是唯一跨行算子, 但 q/k/v 在其之前已按行合并,
-// 与行选择的参考语义一致。RoPE 行位置只依赖 position+offset，与分支无关 → 合并后
+// 与 HALO 参考语义一致。RoPE 行位置只依赖 position+offset, 与分支无关 → 合并后
 // 单次 in-place。
 // ─────────────────────────────────────────────────────────────────────────────
 void HyVlaVlmModel::build_layer_subgraph(int layer_idx, const ChunkInfo& chunk) {
+    TORCH_CHECK(
+        ctx().has_complete_physical_manifest(),
+        "HyVlaVlmModel requires a COMPLETE physical descriptor");
     TORCH_CHECK(!text_layers_.empty() && !moe_layers_.empty(),
                 "hyvla build_layer_subgraph: set_weights_hyvla + set_moe_weights "
                 "must both have been called");
@@ -683,6 +976,45 @@ void HyVlaVlmModel::build_layer_subgraph(int layer_idx, const ChunkInfo& chunk) 
     const int64_t cols_h  = h;                  // input_norm / oproj / down
     const int64_t cols_q  = local_q * hd;       // q 槽（col-partition over tp）
     const int64_t cols_kv = local_kv;           // k/v 槽
+    const auto consume_rmsnorm = [&](int64_t site_id, int64_t rows,
+                                     int64_t cols) {
+        const RpuRmsNormSpmRoute route =
+            cold_rmsnorm_spm_contract_.resolve(rows, cols);
+        TORCH_CHECK(
+            !cold_rmsnorm_spm_contract_.has_vector_payload() ||
+                ctx().has_complete_physical_manifest(),
+            "HyVlaVlmModel non-BASE RMSNorm route requires a COMPLETE "
+            "physical descriptor");
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::NORMALIZATION, site_id,
+                static_cast<int64_t>(route), /*resolved_flags=*/0,
+                cold_rmsnorm_spm_contract_.manifest_arguments(rows, cols),
+                chunk.idx);
+        }
+        return route;
+    };
+    const RpuRmsNormSpmRoute full_rmsnorm_route = consume_rmsnorm(
+        kHyVlaVlmRmsNormFullRowsSite, seq_len, h);
+    const RpuRmsNormSpmRoute q_head_rmsnorm_route = consume_rmsnorm(
+        kHyVlaVlmRmsNormQHeadRowsSite, seq_len * local_q, hd);
+    const RpuRmsNormSpmRoute k_head_rmsnorm_route = consume_rmsnorm(
+        kHyVlaVlmRmsNormKHeadRowsSite,
+        seq_len * (nkv / tp), hd);
+
+    if (ctx().has_complete_physical_manifest()) {
+        ctx().consume_physical_route(
+            FmbRouteFamily::GRAPH_SCHEDULE,
+            HYVLA_VLM_GRAPH_SCHEDULE_SITE,
+            static_cast<int64_t>(
+                cold_fast_replay_
+                    ? HyVlaVlmGraphScheduleRoute::FAST_REPLAY_SKIP_LAYER_LOOP
+                    : HyVlaVlmGraphScheduleRoute::REEMIT_LAYER_LOOP),
+            /*resolved_flags=*/0,
+            {cold_fast_replay_ ? 1 : 0,
+             cold_fast_replay_preload_ ? 1 : 0},
+            chunk.idx);
+    }
 
     if (!ctx().input_in_spm) {
         emit_layer_input_dma(layer_idx, chunk);
@@ -690,25 +1022,46 @@ void HyVlaVlmModel::build_layer_subgraph(int layer_idx, const ChunkInfo& chunk) 
 
     // ── 步 1: input RMSNorm 双算 (→ merge 入 "input_norm"，除非 NOMERGE) ──
     // text γ 经基类 "norm_w" 槽, act γ 经 "norm_w_act"。
-    // merge 路径下 input_norm 持逐行选支的 normed hidden, 供两套 QKV 共读。
-    // 两套 QKV 分别发射时可各读各的 norm 输出，省掉这次 merge。
+    // 老路：merge 后 input_norm 持逐行选支的 normed hidden, 供两套 QKV 共读。
+    // R43：两套 QKV 本来就是分别发射的 ⇒ **各读各的 norm 输出**，省掉这次 merge。
     // 逐位等价的逐行论证见 `hyvla_mot_norm_nomerge_mask` 的注释。
-    const unsigned nomerge = hyvla_mot_norm_nomerge_mask();
+    const unsigned nomerge = cold_mot_norm_nomerge_;
+    if (ctx().has_complete_physical_manifest()) {
+        ctx().consume_physical_route(
+            FmbRouteFamily::NORMALIZATION,
+            HYVLA_VLM_INPUT_NORM_TOPOLOGY_SITE,
+            static_cast<int64_t>(
+                (cold_mot_norm_nomerge_ & MOT_NOMERGE_QKV)
+                    ? HyVlaVlmNormalizationRoute::MOT_BRANCH_LOCAL
+                    : HyVlaVlmNormalizationRoute::MOT_MERGED),
+            /*resolved_flags=*/0,
+            {static_cast<int64_t>(cold_mot_norm_nomerge_),
+             (cold_mot_norm_nomerge_ & MOT_NOMERGE_QKV) ? 1 : 0,
+             seq_len, h}, chunk.idx);
+    }
     rpu_launch_rmsnorm_spm_kernel(
         addr(0, "residual1"), addr(0, "input_norm"),
-        layer_addr(layer_idx, 0, "norm_w"), seq_len, h, eps_hyvla_);
+        layer_addr(layer_idx, 0, "norm_w"), seq_len, h, eps_hyvla_,
+        full_rmsnorm_route);
     rpu_launch_rmsnorm_spm_kernel(
         addr(0, "residual1"), addr(0, "norm_a1"),
-        layer_addr(layer_idx, 0, "norm_w_act"), seq_len, h, eps_hyvla_);
+        layer_addr(layer_idx, 0, "norm_w_act"), seq_len, h, eps_hyvla_,
+        full_rmsnorm_route);
     if (!(nomerge & MOT_NOMERGE_QKV))
         emit_row_merge(addr(0, "input_norm"), addr(0, "norm_a1"), addr(0, "input_norm"),
                        m_txt, m_act, seq_len, cols_h, NUM_CORES);
 
     // ── 步 2: QKV 双发射 (text→q/k/v, act→q_a/k_a/v_a) + merge ──
     // bias 各用自家 PersistentPerLayer 槽。NOMERGE 时 text 读 "input_norm"、
-    // act 读 "norm_a1"；否则两边都读 merge 后的 "input_norm"。
+    // act 读 "norm_a1"；否则两边都读 merge 后的 "input_norm"（老路）。
     auto qkv = [&](uint32_t in_addr, const at::Tensor& w, const at::Tensor& ws,
                    const char* out, const char* bias_slot, int64_t n) {
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::LINEAR, HYVLA_VLM_QKV_LINEAR_SITE,
+                static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+                /*resolved_flags=*/0, {}, chunk.idx);
+        }
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             in_addr, w, addr(0, out),
             seq_len, n, h, /*partition=*/1, /*num_cores=*/tp,
@@ -727,93 +1080,211 @@ void HyVlaVlmModel::build_layer_subgraph(int layer_idx, const ChunkInfo& chunk) 
     emit_row_merge(addr(0, "k"), addr(0, "k_a"), addr(0, "k"), m_txt, m_act, seq_len, cols_kv, tp);
     emit_row_merge(addr(0, "v"), addr(0, "v_a"), addr(0, "v"), m_txt, m_act, seq_len, cols_kv, tp);
 
-    // ── 步 3: **先 RoPE，再 q/k head-norm**，norm 为两塔共享 ──
+    // ── 步 3: **先 RoPE，再 q/k head-norm**（与 HALO 相反），norm 为两塔共享 ──
     // Hy-VLA 的 HyDualTower.forward:456-469 先对拼接后的 q/k 施 RoPE，再按塔切分做
     // head-dim RMSNorm；且该 norm 只有一份（query_layernorm / key_layernorm 非 _v）。
-    // 其他 decoder emitter 使用 norm→rope，本路径使用 rope→norm。
+    // 现有 7 个 RPU emitter（gemma4 / halo_* / qwen3_5 / qwenpi05 / rhino_vla / qwen3）
+    // 全是 norm→rope，本文件是**唯一** rope→norm 的。
     // 可行性依据：两个 kernel 都是 src/dst 分离、无隐藏状态的独立 SPM launch
     //   rpu_launch_rope_spm_kernel(x_addr, y_addr, cos, sin, seq, heads, hd, start)
     //   rpu_launch_rmsnorm_spm_kernel(in_addr, out_addr, w_addr, M, C, eps)
     // 且 QK-norm 的 framing 是 (M=seq*heads, C=head_dim)，RoPE 不改变 [seq,heads,hd]
     // 布局 ⇒ 同一 framing 在 RoPE 前后都成立，换序即调用顺序调换。
-    // 使用模型提供的 bf16 inv_freq。
     // 因 norm 共享，此处**不做双算/merge**（mw.q_norm_w / mw.k_norm_w 不参与计算）。
     c10::Half* cos_ptr = cos_hyvla_.data_ptr<c10::Half>();
     c10::Half* sin_ptr = sin_hyvla_.data_ptr<c10::Half>();
 
-    // PARTIAL_ROPE uses the model-owned tables and the same supported RoPE
-    // semantics as the default path.
-    const bool prope = hyvla_partial_rope_on("vlm");
+    // PARTIAL_ROPE（开关与依据见 rpu_hyvla_expert_model.cpp 文件头）：
+    // 与 llama_rope 逐位相等，grid 从 (seq,1,1) 塌成
+    // (⌈hd/2/64⌉, ⌈seq/64⌉)。本座 seq 更长（prefill 整段），塌缩比例比 expert 更大。
+    const bool prope = cold_partial_rope_;
     const int64_t local_kv_heads = nkv / tp;
 
     if (prope) {
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::ROPE,
+                HYVLA_VLM_Q_PARTIAL_ROPE_SITE,
+                static_cast<int64_t>(HyVlaVlmRopeRoute::PARTIAL_MROPE),
+                /*resolved_flags=*/0,
+                {cold_partial_rope_ ? 1 : 0, cos_sin_start,
+                 seq_len, local_q, hd, tp}, chunk.idx);
+        }
         rpu_launch_partial_mrope_spm_kernel(
             addr(0, "q"), addr(0, "output"), cos_ptr, sin_ptr,
             cos_sin_start, seq_len, local_q, hd, /*rotary_dim=*/hd, tp);
     } else {
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::ROPE, HYVLA_VLM_Q_ROPE_SITE,
+                static_cast<int64_t>(HyVlaVlmRopeRoute::ROPE_1D),
+                /*resolved_flags=*/0,
+                {cold_partial_rope_ ? 1 : 0, cos_sin_start,
+                 seq_len, local_q, hd, tp}, chunk.idx);
+        }
         rpu_launch_rope_spm_kernel(addr(0, "q"), addr(0, "output"),
-                                   cos_ptr, sin_ptr, seq_len, local_q, hd, cos_sin_start);
+                                   cos_ptr, sin_ptr, seq_len, local_q, hd,
+                                   cos_sin_start, tp);
     }
     rpu_launch_rmsnorm_spm_kernel(
         addr(0, "output"), addr(0, "q"),
-        layer_addr(layer_idx, 0, "q_norm_w"), seq_len * local_q, hd, eps_hyvla_);
+        layer_addr(layer_idx, 0, "q_norm_w"), seq_len * local_q, hd,
+        eps_hyvla_, q_head_rmsnorm_route);
 
     if (prope) {
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::ROPE,
+                HYVLA_VLM_K_PARTIAL_ROPE_SITE,
+                static_cast<int64_t>(HyVlaVlmRopeRoute::PARTIAL_MROPE),
+                /*resolved_flags=*/0,
+                {cold_partial_rope_ ? 1 : 0, cos_sin_start,
+                 seq_len, local_kv_heads, hd, tp}, chunk.idx);
+        }
         rpu_launch_partial_mrope_spm_kernel(
             addr(0, "k"), addr(0, "input_norm"), cos_ptr, sin_ptr,
             cos_sin_start, seq_len, local_kv_heads, hd, /*rotary_dim=*/hd, tp);
     } else {
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::ROPE, HYVLA_VLM_K_ROPE_SITE,
+                static_cast<int64_t>(HyVlaVlmRopeRoute::ROPE_1D),
+                /*resolved_flags=*/0,
+                {cold_partial_rope_ ? 1 : 0, cos_sin_start,
+                 seq_len, local_kv_heads, hd, tp}, chunk.idx);
+        }
         rpu_launch_rope_spm_kernel(addr(0, "k"), addr(0, "input_norm"),
-                                   cos_ptr, sin_ptr, seq_len, local_kv_heads, hd, cos_sin_start);
+                                   cos_ptr, sin_ptr, seq_len, local_kv_heads,
+                                   hd, cos_sin_start, tp);
     }
     rpu_launch_rmsnorm_spm_kernel(
         addr(0, "input_norm"), addr(0, "k"),
-        layer_addr(layer_idx, 0, "k_norm_w"), seq_len * local_kv_heads, hd, eps_hyvla_);
+        layer_addr(layer_idx, 0, "k_norm_w"), seq_len * local_kv_heads, hd,
+        eps_hyvla_, k_head_rmsnorm_route);
 
     // ── 步 4: KV insert + SDPA 单次; O 双算 + merge → 残差归约 ──
     // K/V 已按行合并, insert/SDPA 与基类完全一致。O_proj 行分到 tp 核, 结果
     // 各持全宽 h 部分和; 两分支各自行分一致 → 部分和也逐行可掩码合并。
     auto& k_cache = (*ctx().k_caches)[layer_idx];
     auto& v_cache = (*ctx().v_caches)[layer_idx];
-    rpu_launch_insert_kcache_spm_unified(
-        k_cache, ctx().position + chunk.offset, addr_offset("k").value,
-        seq_len, nkv, hd, tp);
-    rpu_launch_insert_vcache_spm_unified(
-        v_cache, ctx().position + chunk.offset, addr_offset("v").value,
-        seq_len, nkv, hd, tp);
+    const FmbRouteManifestEntry& route = ctx().find_physical_route(
+        FmbRouteFamily::KV_INSERT, HYVLA_VLM_KV_SITE, chunk.idx);
+    const KvInsertSegmentPlan kv_plan =
+        restore_kvinsert_plan(
+            HYVLA_VLM_KV_SITE, route.arguments, tp, nkv, hd);
+    TORCH_CHECK(
+        kv_plan.logical_rows() == seq_len &&
+            kv_plan.physical_rows() == seq_len &&
+            kv_plan.segment(0).position == cos_sin_start,
+        "HyVlaVlmModel KV descriptor geometry drift at invocation ",
+        chunk.idx);
+    ctx().consume_physical_route(
+        FmbRouteFamily::KV_INSERT, HYVLA_VLM_KV_SITE,
+        static_cast<int64_t>(kv_plan.route()),
+        HYVLA_VLM_KV_REASON_PREFIX_HISTORY_DDR_REQUIRED,
+        route.arguments, chunk.idx);
+    rpu_launch_insert_kvcache_spm_unified_with_plan(
+        k_cache, v_cache,
+        addr_offset("k").value, addr_offset("v").value,
+        nkv, hd, tp,
+        /*k_cache_batch_offset_elems=*/0,
+        /*v_cache_batch_offset_elems=*/0,
+        /*spm_rows=*/0, kv_plan);
     const uint32_t mask_off = addr_offset("sdpa_mask").value;
     // mask 逐层恒定；槽撑满相位后只需在层 0 灌一次（见 MASK_ONCE）。
-    if (!hyvla_mask_once_on("vlm") || layer_idx == 0)
-        sdpa_dma_mask_to_spm(prepared_mask_hyvla_, mask_off, seq_len, chunk.kv_seq_len, tp);
+    if (!cold_mask_once_ || layer_idx == 0) {
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::GRAPH_SCHEDULE,
+                HYVLA_VLM_MASK_SCHEDULE_SITE,
+                static_cast<int64_t>(
+                    cold_mask_once_
+                        ? HyVlaVlmGraphScheduleRoute::MASK_FIRST_LAYER_ONLY
+                        : HyVlaVlmGraphScheduleRoute::MASK_EACH_LAYER),
+                /*resolved_flags=*/0,
+                {cold_mask_once_ ? 1 : 0, seq_len, chunk.kv_seq_len,
+                 tp, num_layers()}, chunk.idx);
+        }
+        sdpa_dma_mask_to_spm(prepared_attn_mask_, mask_off, seq_len, chunk.kv_seq_len, tp);
+    }
+    if (ctx().has_complete_physical_manifest()) {
+        ctx().consume_physical_attention_route(
+            HYVLA_VLM_ATTN_SITE, AttentionExecutionPolicy::DDR_KV,
+            chunk.idx);
+    }
     rpu_launch_sdpa_spm_dispatch(
         SdpaKernelType::FLASH_ATTN_SPM,
-        k_cache, v_cache, prepared_mask_hyvla_.mask_type, c10::nullopt,
+        k_cache, v_cache, prepared_attn_mask_.mask_type, c10::nullopt,
         addr_offset("q").value, addr_offset("output").value,
         addr_offset("sdpa_tmp").value, mask_off,
         seq_len, nq, nkv, hd, chunk.kv_seq_len, tp, NUM_CORES);
+    if (ctx().has_complete_physical_manifest()) {
+        ctx().consume_physical_route(
+            FmbRouteFamily::ALL_REDUCE,
+            HYVLA_VLM_PREPARE_ATTN_ALL_REDUCE_SITE,
+            static_cast<int64_t>(HyVlaVlmAllReduceRoute::PREPARE_RING_INPUT),
+            /*resolved_flags=*/0, {seq_len, h, tp}, chunk.idx);
+    }
     rpu_prepare_ring_all_reduce_input(addr(0, "oproj"), seq_len, h, tp);
+    if (ctx().has_complete_physical_manifest()) {
+        ctx().consume_physical_route(
+            FmbRouteFamily::LINEAR, HYVLA_VLM_O_TEXT_LINEAR_SITE,
+            static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+            /*resolved_flags=*/0,
+            {seq_len, h, nq * hd, 0, tp}, chunk.idx);
+    }
     rpu_launch_linear_spm_to_spm_acc16_kernel(
         addr(0, "output"), lw.o_w, addr(0, "oproj"),
         seq_len, h, nq * hd, /*partition=*/0, /*num_cores=*/tp,
         /*bias_spm_addr=*/0, /*scale=*/lw.o_ws);
+    if (ctx().has_complete_physical_manifest()) {
+        ctx().consume_physical_route(
+            FmbRouteFamily::LINEAR, HYVLA_VLM_O_ACT_LINEAR_SITE,
+            static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+            /*resolved_flags=*/0,
+            {seq_len, h, nq * hd, 0, tp}, chunk.idx);
+    }
     rpu_launch_linear_spm_to_spm_acc16_kernel(
         addr(0, "output"), mw.o_w, addr(0, "oproj_a"),
         seq_len, h, nq * hd, /*partition=*/0, /*num_cores=*/tp,
         /*bias_spm_addr=*/0, /*scale=*/mw.o_ws);
     emit_row_merge(addr(0, "oproj"), addr(0, "oproj_a"), addr(0, "oproj"),
                    m_txt, m_act, seq_len, cols_h, tp);
+    if (ctx().has_complete_physical_manifest()) {
+        ctx().consume_physical_route(
+            FmbRouteFamily::ALL_REDUCE,
+            HYVLA_VLM_ATTN_ALL_REDUCE_SITE,
+            fmb_ring_all_reduce_route_selector(seq_len, h),
+            /*resolved_flags=*/0,
+            {seq_len, h, tp, NUM_CORES}, chunk.idx);
+    }
     rpu_launch_all_reduce_sum_residual_kernel(
         addr(0, "oproj"), addr(0, "residual1"), addr(0, "residual2"),
         seq_len, h, tp, NUM_CORES);
 
     // ── 步 5: post-attention RMSNorm 双算 (+ merge → residual1，除非 NOMERGE) ──
     // 与步 1 同理：两个 mlp_half 本来就是分别发射的 ⇒ 各读各的 norm 输出。
+    if (ctx().has_complete_physical_manifest()) {
+        ctx().consume_physical_route(
+            FmbRouteFamily::NORMALIZATION,
+            HYVLA_VLM_POST_NORM_TOPOLOGY_SITE,
+            static_cast<int64_t>(
+                (cold_mot_norm_nomerge_ & MOT_NOMERGE_MLP)
+                    ? HyVlaVlmNormalizationRoute::MOT_BRANCH_LOCAL
+                    : HyVlaVlmNormalizationRoute::MOT_MERGED),
+            /*resolved_flags=*/0,
+            {static_cast<int64_t>(cold_mot_norm_nomerge_),
+             (cold_mot_norm_nomerge_ & MOT_NOMERGE_MLP) ? 1 : 0,
+             seq_len, h}, chunk.idx);
+    }
     rpu_launch_rmsnorm_spm_kernel(
         addr(0, "residual2"), addr(0, "residual1"),
-        layer_addr(layer_idx, 0, "post_norm_w"), seq_len, h, eps_hyvla_);
+        layer_addr(layer_idx, 0, "post_norm_w"), seq_len, h, eps_hyvla_,
+        full_rmsnorm_route);
     rpu_launch_rmsnorm_spm_kernel(
         addr(0, "residual2"), addr(0, "norm_a2"),
-        layer_addr(layer_idx, 0, "post_norm_w_act"), seq_len, h, eps_hyvla_);
+        layer_addr(layer_idx, 0, "post_norm_w_act"), seq_len, h, eps_hyvla_,
+        full_rmsnorm_route);
     if (!(nomerge & MOT_NOMERGE_MLP))
         emit_row_merge(addr(0, "residual1"), addr(0, "norm_a2"), addr(0, "residual1"),
                        m_txt, m_act, seq_len, cols_h, NUM_CORES);
@@ -826,25 +1297,77 @@ void HyVlaVlmModel::build_layer_subgraph(int layer_idx, const ChunkInfo& chunk) 
                         const at::Tensor& down_w, const at::Tensor& gate_ws,
                         const at::Tensor& up_ws, const at::Tensor& down_ws,
                         const char* g, const char* u, const char* dn) {
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::LINEAR, HYVLA_VLM_MLP_GATE_LINEAR_SITE,
+                static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+                /*resolved_flags=*/0,
+                {seq_len, intermediate_size(), h, 1, NUM_CORES}, chunk.idx);
+        }
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             in_addr, gate_w, addr(0, g),
             seq_len, intermediate_size(), h, /*partition=*/1, NUM_CORES,
             /*bias_spm_addr=*/0u, /*scale=*/gate_ws);
-        if (!hyvla_silu_mul_on("vlm"))
+        if (!cold_silu_mul_) {
+            if (ctx().has_complete_physical_manifest()) {
+                ctx().consume_physical_route(
+                    FmbRouteFamily::ACTIVATION,
+                    HYVLA_VLM_MLP_SILU_SITE,
+                    static_cast<int64_t>(
+                        HyVlaVlmActivationRoute::SILU_UNARY),
+                    /*resolved_flags=*/0,
+                    {cold_silu_mul_ ? 1 : 0, elems_mlp, NUM_CORES},
+                    chunk.idx);
+            }
             rpu_launch_eltwise_unary_spm_kernel(
                 addr(0, g), addr(0, g), elems_mlp, ValuOpType::SILU,
                 /*is_gelu=*/false, NUM_CORES);
+        }
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::LINEAR, HYVLA_VLM_MLP_UP_LINEAR_SITE,
+                static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+                /*resolved_flags=*/0,
+                {seq_len, intermediate_size(), h, 1, NUM_CORES}, chunk.idx);
+        }
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             in_addr, up_w, addr(0, u),
             seq_len, intermediate_size(), h, /*partition=*/1, NUM_CORES,
             /*bias_spm_addr=*/0u, /*scale=*/up_ws);
-        if (hyvla_silu_mul_on("vlm"))
+        if (cold_silu_mul_) {
+            if (ctx().has_complete_physical_manifest()) {
+                ctx().consume_physical_route(
+                    FmbRouteFamily::ACTIVATION,
+                    HYVLA_VLM_MLP_SILU_MUL_SITE,
+                    static_cast<int64_t>(
+                        HyVlaVlmActivationRoute::SILU_MUL_FUSED),
+                    /*resolved_flags=*/0,
+                    {cold_silu_mul_ ? 1 : 0, elems_mlp, NUM_CORES},
+                    chunk.idx);
+            }
             rpu_launch_silu_mul_spm_kernel(
                 addr(0, g), addr(0, u), addr(0, g), elems_mlp, NUM_CORES);
-        else
+        } else {
+            if (ctx().has_complete_physical_manifest()) {
+                ctx().consume_physical_route(
+                    FmbRouteFamily::ACTIVATION,
+                    HYVLA_VLM_MLP_MUL_SITE,
+                    static_cast<int64_t>(HyVlaVlmActivationRoute::MUL),
+                    /*resolved_flags=*/0,
+                    {cold_silu_mul_ ? 1 : 0, elems_mlp, NUM_CORES},
+                    chunk.idx);
+            }
             rpu_launch_eltwise_binary_spm_kernel(
                 addr(0, g), addr(0, u), addr(0, g),
                 elems_mlp, ValuOpType::MUL, c10::Half(1.0f), NUM_CORES);
+        }
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::LINEAR, HYVLA_VLM_MLP_DOWN_LINEAR_SITE,
+                static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+                /*resolved_flags=*/0,
+                {seq_len, h, intermediate_size(), 0, NUM_CORES}, chunk.idx);
+        }
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, g), down_w, addr(0, dn),
             seq_len, h, intermediate_size(), /*partition=*/0, NUM_CORES,
@@ -862,6 +1385,14 @@ void HyVlaVlmModel::build_layer_subgraph(int layer_idx, const ChunkInfo& chunk) 
              mw.gate_ws, mw.up_ws, mw.down_ws, "gate", "up", "down_a");
     emit_row_merge(addr(0, "down"), addr(0, "down_a"), addr(0, "down"),
                    m_txt, m_act, seq_len, cols_h, NUM_CORES);
+    if (ctx().has_complete_physical_manifest()) {
+        ctx().consume_physical_route(
+            FmbRouteFamily::ALL_REDUCE,
+            HYVLA_VLM_MLP_ALL_REDUCE_SITE,
+            fmb_ring_all_reduce_route_selector(seq_len, h),
+            /*resolved_flags=*/0,
+            {seq_len, h, NUM_CORES, NUM_CORES}, chunk.idx);
+    }
     rpu_launch_all_reduce_sum_residual_kernel(
         addr(0, "down"), addr(0, "residual2"), addr(0, "residual1"),
         seq_len, h, NUM_CORES, NUM_CORES);
@@ -869,14 +1400,15 @@ void HyVlaVlmModel::build_layer_subgraph(int layer_idx, const ChunkInfo& chunk) 
     // ── 步 7 (末层): final RMSNorm —— **单次, 不双算** ──
     // Hy-VLA 的 ckpt 里 final norm 只有一份 (641 = 32×20 + 1, 无 norm_v.weight),
     // set_moe_weights 已断言 final_norm_moe_w 与 text 侧是同一张量。对同一个 γ
-    // 双算再按行掩码 merge 恒等于单算，因此这里的双算是纯冗余，每次末层
-    // 会多执行 1 次全宽 rmsnorm + 3 次全宽 eltwise，还把 norm_a 的生命周期钉到
+    // 双算再按行掩码 merge 恒等于单算 —— HALO 那份双算在这里是纯冗余, 每次末层
+    // 白烧 1 次全宽 rmsnorm + 3 次全宽 eltwise, 还把 norm_a 的生命周期钉到
     // phase 8 (见 declare_buffers 的 norm_a1/norm_a2 说明)。rmsnorm 支持原地
-    // 基类使用相同的原地形式, 故直接写回 residual1。
+    // (基类 rpu_qwen3_model.h:2146 同式), 故直接写回 residual1。
     if (is_last_layer) {
         rpu_launch_rmsnorm_spm_kernel(
             addr(0, "residual1"), addr(0, "residual1"),
-            addr(0, "final_norm_w"), seq_len, h, eps_hyvla_);
+            addr(0, "final_norm_w"), seq_len, h, eps_hyvla_,
+            full_rmsnorm_route);
     }
 
     if (!ctx().output_to_spm) {
@@ -891,7 +1423,8 @@ at::Tensor HyVlaVlmModel::step_forward(
     const at::Tensor& x_emb, std::vector<at::Tensor>& k_caches,
     std::vector<at::Tensor>& v_caches,
     const at::Tensor& cos, const at::Tensor& sin,
-    const at::Tensor& attn_mask_4d, int64_t prefix_len)
+    const at::Tensor& attn_mask_4d, int64_t prefix_len,
+    at::IntArrayRef planned_stage_descriptor)
 {
     TORCH_CHECK(!text_layers_.empty() && moe_chunk_size_ > 0,
                 "hyvla step_forward before set_weights_hyvla / set_moe_weights");
@@ -907,9 +1440,10 @@ at::Tensor HyVlaVlmModel::step_forward(
                 "hyvla step_forward: explicit attention mask required");
     TORCH_CHECK(prefix_len >= 0, "hyvla step_forward: prefix_len must be >= 0");
 
-    // Per-forward cos/sin references keep the RoPE inputs alive through graph
-    // capture. Each CFG branch supplies the table for its own rope position;
-    // validate the raw table contract before launch.
+    // per-forward cos/sin (镜像 qwenpi05 cos_ref_/sin_ref_): 覆盖 RoPE 影子成员,
+    // 赋值即保活过 graph capture; build_layer_subgraph (:525-548) 读 cos_hyvla_/sin_hyvla_
+    // 的 raw c10::Half*。CFG 三分支共用一个句柄, 每分支传自己 rope_position 的表。
+    // 校验范式对齐 qwenpi05_forward (kernel 按 raw c10::Half* 消费)。
     TORCH_CHECK(cos.defined() && sin.defined(),
                 "hyvla step_forward: cos/sin must be defined");
     TORCH_CHECK(cos.device().type() == at::kPrivateUse1
@@ -931,7 +1465,8 @@ at::Tensor HyVlaVlmModel::step_forward(
     cos_hyvla_ = cos;
     sin_hyvla_ = sin;
 
-    // KV headroom: 7-D K 布局的 max_seq = size(1)*size(5)。
+    // KV headroom: 7-D K 布局的 max_seq = size(1)*size(5)
+    // (pi05 rpu_pi05_denoise_step_model.cpp:256-266 先例)。
     if (!k_caches.empty()) {
         const at::Tensor& kc = k_caches[0];
         TORCH_CHECK(prefix_len + cs <= kc.size(1) * kc.size(5),
@@ -939,30 +1474,23 @@ at::Tensor HyVlaVlmModel::step_forward(
                     ") exceeds k_cache capacity ", kc.size(1) * kc.size(5));
     }
 
-    // prefill 必须单块 (MASK_2D 行掩码/KV merge 按整块设计)。把本实例 chunk
-    // override 设为 ceil16(seq): base forward 走 override 路径, compute_chunks
-    // 切出单块 len=seq (subclass_chunk_size_valid 放行)。取 ceil16 而非 seq 本身 —
-    // override 路径的 (override/16)*16 会把非 16 对齐值向下取整。RAII 恢复
-    // (异常路径也恢复; Wall-OSS guard 先例, 但值是 single_cs 而非 0)。
-    const int64_t single_cs = ((moe_chunk_size_ + 15) / 16) * 16;
-    const int64_t saved_chunk_size = get_chunk_size_override();
-    set_chunk_size_override(single_cs);
-    auto chunk_guard = c10::make_scope_exit([this, saved_chunk_size] {
-        set_chunk_size_override(saved_chunk_size);
-    });
-
     // host 侧合成的 x_emb 可能带脏 cache 行; BUILD 前显式 flush。
     rpu_ddr_flush_force(x_emb.data_ptr<c10::Half>());
 
     // 基类 forward 持有掩码准备 + run_all_layers; 行位置恒定 → 1D RoPE,
     // position_ids/deepstack 均空。返回基类 output_tensor_ (graph 写目标): 在
-    // capture 作用域内它尚未执行, 必须由 Python 在作用域**退出后**读。
-    // 切勿在此 copy 到外部张量 —— 会读到尚未执行的全 0。
+    // capture 作用域内它尚未执行, 必须由 Python 在作用域**退出后**读 (已证模式
+    // wall_oss/pi05)。切勿在此 copy 到外部张量 —— 会读到尚未执行的全 0
+    // (fused_model_base.cpp:1066-1086 契约)。
     return CausalDecoderModel::forward(
         x_emb, k_caches, v_caches,
         std::optional<at::Tensor>(attn_mask_4d),
         /*position=*/prefix_len, /*is_causal=*/false,
-        /*position_ids=*/std::nullopt, /*deepstack=*/std::nullopt);
+        /*position_ids=*/std::nullopt, /*deepstack=*/std::nullopt,
+        /*rope_cos_il=*/std::nullopt, /*rope_sin_il=*/std::nullopt,
+        /*cos_sin_offset=*/-1, /*batch_slot=*/0,
+        /*allow_batch_decode=*/false, /*planned_chunk_size=*/0,
+        planned_stage_descriptor);
 }
 
 }  // namespace v3
@@ -972,6 +1500,38 @@ at::Tensor HyVlaVlmModel::step_forward(
 // =============================================================================
 using HyVlaVlmRegistry = ModelHandleRegistry<v3::HyVlaVlmModel>;
 
+std::vector<int64_t> rpu_hyvla_vlm_planner_cache_identity(int64_t handle) {
+    return HyVlaVlmRegistry::get(handle, "rpu_hyvla_vlm_planner_cache_identity")
+        ->planner_cache_identity();
+}
+
+void rpu_hyvla_vlm_bind_kvinsert_costs(
+        int64_t handle, at::IntArrayRef identity,
+        const std::string& catalog_sha256, at::IntArrayRef certificate_rows) {
+    HyVlaVlmRegistry::get(handle, "rpu_hyvla_vlm_bind_kvinsert_costs")
+        ->bind_kvinsert_costs(identity, catalog_sha256, certificate_rows);
+}
+
+std::tuple<std::vector<int64_t>, int64_t, int64_t>
+rpu_hyvla_vlm_kvinsert_exact_candidate(
+    int64_t handle, at::IntArrayRef descriptor, int64_t site_id,
+    int64_t invocation, int64_t route) {
+    return HyVlaVlmRegistry::get(handle, "rpu_hyvla_vlm_kvinsert_exact_candidate")
+        ->mint_kvinsert_exact_candidate(descriptor, site_id, invocation, route);
+}
+
+KvInsertCostDomainQuery rpu_hyvla_vlm_kvinsert_cost_domain(
+        int64_t handle, at::IntArrayRef descriptor) {
+    return HyVlaVlmRegistry::get(handle, "rpu_hyvla_vlm_kvinsert_cost_domain")
+        ->kvinsert_cost_domain("hyvla_vlm", descriptor);
+}
+
+std::string rpu_hyvla_vlm_kvinsert_cost_catalog_sha256(int64_t handle) {
+    return HyVlaVlmRegistry::get(
+        handle, "rpu_hyvla_vlm_kvinsert_cost_catalog_sha256")
+        ->kvinsert_cost_catalog_sha256();
+}
+
 // =============================================================================
 // Public C API for TORCH_LIBRARY wrappers (file-scope; decls in rpu_kernel_decls.h)
 // =============================================================================
@@ -979,7 +1539,21 @@ int64_t rpu_hyvla_vlm_create() {
     return HyVlaVlmRegistry::create();
 }
 
+void rpu_hyvla_vlm_set_runtime_config(
+    int64_t handle,
+    bool fast_replay, bool fast_replay_preload, bool mask_once,
+    bool partial_rope, int64_t mot_norm_nomerge, bool silu_mul,
+    int64_t rmsnorm_capability) {
+    HyVlaVlmRegistry::get(handle, "rpu_hyvla_vlm_set_runtime_config")
+        ->set_runtime_config(
+            fast_replay, fast_replay_preload, mask_once, partial_rope,
+            mot_norm_nomerge, silu_mul, rmsnorm_capability);
+}
+
 void rpu_hyvla_vlm_destroy(int64_t handle) {
+    HyVlaVlmRegistry::get(handle, "rpu_hyvla_vlm_destroy")
+        ->check_execution_reconfigure_destroy_allowed(
+            "rpu_hyvla_vlm_destroy");
     HyVlaVlmRegistry::destroy(handle, "rpu_hyvla_vlm_destroy");
 }
 
@@ -1068,8 +1642,48 @@ at::Tensor rpu_hyvla_vlm_step_forward(
     int64_t handle, const at::Tensor& x_emb,
     std::vector<at::Tensor> k_caches, std::vector<at::Tensor> v_caches,
     const at::Tensor& cos, const at::Tensor& sin,
-    const at::Tensor& attn_mask_4d, int64_t prefix_len)
+    const at::Tensor& attn_mask_4d, int64_t prefix_len,
+    at::IntArrayRef planned_stage_descriptor)
 {
     return HyVlaVlmRegistry::get(handle, "rpu_hyvla_vlm_step_forward")
-        ->step_forward(x_emb, k_caches, v_caches, cos, sin, attn_mask_4d, prefix_len);
+        ->step_forward(x_emb, k_caches, v_caches, cos, sin, attn_mask_4d,
+                       prefix_len, planned_stage_descriptor);
+}
+
+std::vector<int64_t> rpu_hyvla_vlm_resolve_stage_domain(
+    int64_t handle, int64_t seq_len, int64_t prefix_len,
+    int64_t mask_kv_len) {
+    return HyVlaVlmRegistry::get(
+               handle, "rpu_hyvla_vlm_resolve_stage_domain")
+        ->resolve_stage_domain(seq_len, prefix_len, mask_kv_len);
+}
+
+int64_t rpu_hyvla_vlm_get_resolved_chunk_size(int64_t handle) {
+    return HyVlaVlmRegistry::get(
+               handle, "rpu_hyvla_vlm_get_resolved_chunk_size")
+        ->get_last_resolved_chunk_size();
+}
+
+void rpu_hyvla_vlm_set_chunk_size_override(
+    int64_t handle, int64_t chunk_size) {
+    HyVlaVlmRegistry::get(
+        handle, "rpu_hyvla_vlm_set_chunk_size_override")
+        ->set_control_chunk_size_override(
+            chunk_size, "rpu_hyvla_vlm_set_chunk_size_override");
+}
+
+void rpu_hyvla_vlm_enable_execution_reconfigure(int64_t handle) {
+    HyVlaVlmRegistry::get(
+        handle, "rpu_hyvla_vlm_enable_execution_reconfigure")
+        ->enable_execution_reconfigure_guard();
+}
+
+void rpu_hyvla_vlm_stage_chunk_size_override(
+    int64_t handle, int64_t token, int64_t chunk_size) {
+    TORCH_CHECK(token > 0, "Hy-VLA VLM hot-reconfigure token must be positive");
+    HyVlaVlmRegistry::get(
+        handle, "rpu_hyvla_vlm_stage_chunk_size_override")
+        ->stage_control_chunk_size_override(
+            static_cast<uint64_t>(token), chunk_size,
+            "rpu_hyvla_vlm_stage_chunk_size_override");
 }

@@ -5,16 +5,19 @@
 // and boundary flush bookkeeping. Kernel execution and replay dispatch are in
 // graph_runtime_execute.cpp.
 #include "graph/graph_runtime.h"
+#include "core/rpu_tensor_ops.h"
+#include "core/rpu_runtime_state.h"
 
 #include <ATen/record_function.h>
 #include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <cstdlib>
+#include <exception>
 #include <iomanip>
+#include <iostream>
 #include <limits>
 #include <mutex>
-#include <sstream>
 #include <string_view>
 #include <type_traits>
 #include <unordered_set>
@@ -24,11 +27,17 @@
 // 静态成员初始化
 // =============================================================================
 
-// Active graph stack: nested begin is allowed, but re-entering the same graph is not.
+// A1 — active 栈化:nested begin 允许,同一 graph 重入仍被拒。
 thread_local std::vector<RpuKernelGraph*> RpuKernelGraph::active_stack_;
 thread_local RpuKernelGraph RpuKernelGraph::fallback_graph_;
 
 namespace {
+
+struct ReconfigureParticipant {
+    const void* identity = nullptr;
+    RpuExecutionCoordinator::ReconfigureCallback apply;
+    RpuExecutionCoordinator::ReconfigureCallback rollback;
+};
 
 struct ProcessExecutionState {
     std::mutex mutex;
@@ -41,6 +50,12 @@ struct ProcessExecutionState {
     std::vector<uint64_t> graph_tokens;
     uint64_t physical_token = 0;
     std::vector<uint64_t> cleanup_tokens;
+    bool reconfigure_active = false;
+    bool reconfigure_quiescing = false;
+    bool reconfigure_committing = false;
+    uint64_t reconfigure_token = 0;
+    uint64_t reconfigure_attempt_token = 0;
+    std::vector<ReconfigureParticipant> reconfigure_participants;
 };
 
 enum class RetainedGraphLifetimeState : uint8_t {
@@ -431,9 +446,19 @@ uint64_t next_execution_token_locked(ProcessExecutionState& state) {
 
 void clear_execution_owner_if_idle_locked(ProcessExecutionState& state) {
     if (state.graph_depth == 0 && !state.physical_active &&
-        state.cleanup_depth == 0) {
+        state.cleanup_depth == 0 && !state.reconfigure_active) {
         state.owner_tid = std::thread::id{};
     }
+}
+
+void clear_reconfigure_locked(ProcessExecutionState& state) {
+    state.reconfigure_participants.clear();
+    state.reconfigure_active = false;
+    state.reconfigure_quiescing = false;
+    state.reconfigure_committing = false;
+    state.reconfigure_token = 0;
+    state.reconfigure_attempt_token = 0;
+    clear_execution_owner_if_idle_locked(state);
 }
 
 class GraphClaimRollback final {
@@ -1219,206 +1244,95 @@ RpuKernelGraph::LifetimeRetirementSentinel::~LifetimeRetirementSentinel() {
     mark_retained_physical_graph_evicted_noexcept(lifetime_id);
 }
 
-RpuKernelGraph::RpuKernelGraph()
+void validate_graph_runtime_policy(
+        const GraphRuntimePolicy& runtime_policy) {
+    TORCH_CHECK(
+        runtime_policy.execution_core_count >= 1 &&
+            runtime_policy.execution_core_count <= 8,
+        "GraphRuntimePolicy execution core count must be in [1, 8]");
+    TORCH_CHECK(
+        runtime_policy.graph_arena_count <= 4096,
+        "GraphRuntimePolicy graph arena count must be in [0, 4096]");
+    TORCH_CHECK(
+        !runtime_policy.qwen35_legacy_27b_sdk_budget ||
+            runtime_policy.graph_arena_count == 0,
+        "GraphRuntimePolicy legacy 27B arena plan cannot be combined with "
+        "an explicit graph arena count");
+    const auto defer_mode = static_cast<uint8_t>(
+        runtime_policy.host_op_defer_mode);
+    TORCH_CHECK(
+        defer_mode <= static_cast<uint8_t>(GraphHostOpDeferMode::ForceOn),
+        "GraphRuntimePolicy host-op defer mode is invalid: ", defer_mode);
+    TORCH_CHECK(
+        runtime_policy.lkn_max_batch_entries > 0 &&
+            runtime_policy.lkn_max_batch_entries <= (size_t{1} << 22),
+        "GraphRuntimePolicy LKN max batch entries must be in [1, 4194304]");
+    TORCH_CHECK(
+        runtime_policy.lkn_kd_buf_mb > 0 &&
+            runtime_policy.lkn_kd_buf_mb <= 256,
+        "GraphRuntimePolicy LKN KD buffer must be in [1, 256] MiB");
+    TORCH_CHECK(
+        runtime_policy.lkn_instr_buf_mb > 0 &&
+            runtime_policy.lkn_instr_buf_mb <= 1024,
+        "GraphRuntimePolicy LKN instruction buffer must be in [1, 1024] MiB");
+}
+
+bool prepare_graph_runtime_arenas(const GraphRuntimePolicy& runtime_policy) {
+    validate_graph_runtime_policy(runtime_policy);
+    TORCH_CHECK(runtime_policy.qwen35_legacy_27b_sdk_budget ||
+                    runtime_policy.graph_arena_count > 0,
+                "arena preparation requires an explicit graph arena count "
+                "or the legacy 27B owner");
+    const auto loaded = rpu_lkn_batch_config_at_load();
+    TORCH_CHECK(
+        runtime_policy.lkn_max_batch_entries ==
+            static_cast<size_t>(loaded.max_entries) &&
+        runtime_policy.lkn_kd_buf_mb == static_cast<size_t>(loaded.kd_buf_mb) &&
+        runtime_policy.lkn_instr_buf_mb == static_cast<size_t>(loaded.instr_buf_mb),
+        "graph arena policy must match the SDK load snapshot");
+    const auto current = rpu_lkn_batch_config_at_preflight();
+    TORCH_CHECK(
+        current.max_entries == loaded.max_entries &&
+        current.kd_buf_mb == loaded.kd_buf_mb &&
+        current.instr_buf_mb == loaded.instr_buf_mb,
+        "graph arena LKN environment changed after extension load; restart "
+        "with stable LKN_MAX_BATCH_ENTRIES/LKN_KD_BUF_MB/LKN_INSTR_BUF_MB "
+        "before preparing arenas or loading weights");
+    if (!rpu_device_nodes_accessible()) return false;
+
+    // Own an exclusive process claim through the transactional SDK allocation.
+    // Owners reserve their complete finite pool before weights and Queues.
+    // This changes placement and simultaneous queue capacity, not SDK limits
+    // or per-segment budgets. The legacy owner keeps its original three slots.
+    RpuExecutionCleanupGuard cleanup("graph arena preparation");
+    const auto count = runtime_policy.qwen35_legacy_27b_sdk_budget
+        ? uint32_t{3} : static_cast<uint32_t>(runtime_policy.graph_arena_count);
+    const ::rhino_lkn::GraphArenaRequirement requirement{
+        static_cast<uint64_t>(runtime_policy.lkn_kd_buf_mb) << 20,
+        static_cast<uint64_t>(runtime_policy.lkn_instr_buf_mb) << 20,
+        count, 0};
+    const auto result = ::rhino_lkn::ConfigureGraphArenaPool(&requirement, 1);
+    TORCH_CHECK(
+        result == ::rhino_lkn::GRAPH_ARENA_POOL_SUCCESS,
+        "graph arena preparation failed (SDK status ",
+        static_cast<uint32_t>(result),
+        "): reserve the complete plan before weights and the first "
+        "instruction-bearing Queue; an incompatible or late plan is frozen");
+    return true;
+}
+
+RpuKernelGraph::RpuKernelGraph(GraphRuntimePolicy runtime_policy)
     : lifetime_retirement_(next_graph_lifetime_id()),
-      graph_lifetime_id_(lifetime_retirement_.lifetime_id) {}
-
-RpuKernelGraph::~RpuKernelGraph() = default;
-
-namespace {
-
-const char* graph_state_name(RpuKernelGraph::State state) {
-    switch (state) {
-    case RpuKernelGraph::State::PASSTHROUGH: return "PASSTHROUGH";
-    case RpuKernelGraph::State::RECORDING: return "RECORDING";
-    case RpuKernelGraph::State::BUILT: return "BUILT";
-    case RpuKernelGraph::State::REPLAYING: return "REPLAYING";
-    }
-    return "UNKNOWN";
+      graph_lifetime_id_(lifetime_retirement_.lifetime_id),
+      runtime_policy_(std::move(runtime_policy)) {
+    validate_graph_runtime_policy(runtime_policy_);
 }
 
-const char* graph_node_kind_name(GraphNodeKind kind) {
-    switch (kind) {
-    case GraphNodeKind::Kernel: return "Kernel";
-    case GraphNodeKind::Memcpy: return "Memcpy";
-    case GraphNodeKind::Memset: return "Memset";
-    case GraphNodeKind::ChildGraph: return "ChildGraph";
-    case GraphNodeKind::Branch: return "Branch";
-    case GraphNodeKind::HostCallback: return "HostCallback";
-    case GraphNodeKind::Tier3Oneshot: return "Tier3Oneshot";
-    case GraphNodeKind::Dma: return "Dma";
-    case GraphNodeKind::Barrier: return "Barrier";
-    }
-    return "Unknown";
-}
-
-const char* copy_kind_name(CopyKind kind) {
-    switch (kind) {
-    case CopyKind::HOST_MEMCPY: return "host";
-    case CopyKind::DDR_TO_DDR: return "ddr_to_ddr";
-    case CopyKind::DDR_TO_SPM: return "ddr_to_spm";
-    case CopyKind::SPM_TO_DDR: return "spm_to_ddr";
-    case CopyKind::SPM_TO_SPM: return "spm_to_spm";
-    }
-    return "unknown";
-}
-
-const char* dma_variant_name(DmaNodeData::Variant variant) {
-    switch (variant) {
-    case DmaNodeData::Variant::Fixed: return "fixed";
-    case DmaNodeData::Variant::MutableSrc: return "mutable_src";
-    case DmaNodeData::Variant::MutableDst: return "mutable_dst";
-    }
-    return "unknown";
-}
-
-template <typename T>
-void append_values(std::ostringstream& out, const std::vector<T>& values) {
-    out << "[";
-    for (size_t i = 0; i < values.size(); ++i) {
-        if (i != 0) out << ",";
-        out << static_cast<uint64_t>(values[i]);
-    }
-    out << "]";
-}
-
-std::string graph_kernel_name(const KernelNodeData& kernel) {
-    if (kernel.kernel_id.has_value()) {
-        const size_t id = static_cast<size_t>(*kernel.kernel_id);
-        if (id < static_cast<size_t>(KernelId::_COUNT)) {
-            return KERNEL_ID_NAMES[id];
-        }
-        return "kernel_id#" + std::to_string(id);
-    }
-    return kernel.kernel_name.empty() ? "<unnamed>" : kernel.kernel_name;
-}
-
-std::string safe_node_summary(
-        size_t node_id, const GraphNode& node, int64_t segment_id) {
-    std::ostringstream out;
-    out << "node[" << node_id << "] kind=" << graph_node_kind_name(node.kind)
-        << " segment=" << segment_id;
-    switch (node.kind) {
-    case GraphNodeKind::Kernel: {
-        const auto& kernel = node.as_kernel();
-        out << " kernel=" << graph_kernel_name(kernel) << " cores=";
-        append_values(out, kernel.core_ids);
-        out << " grid=";
-        append_values(out, kernel.grid_dims);
-        break;
-    }
-    case GraphNodeKind::Memcpy: {
-        const auto& copy = node.as_memcpy();
-        out << " copy=" << copy_kind_name(copy.kind)
-            << " bytes=" << copy.bytes;
-        break;
-    }
-    case GraphNodeKind::Memset: {
-        const auto& fill = std::get<MemsetNodeData>(node.data);
-        out << " bytes=" << fill.bytes
-            << " value=" << static_cast<uint32_t>(fill.value);
-        break;
-    }
-    case GraphNodeKind::Branch:
-        out << " branch_key=0x" << std::hex << node.as_branch().branch_key;
-        break;
-    case GraphNodeKind::HostCallback: {
-        const auto& callback = node.as_host_callback();
-        out << " tier=" << static_cast<uint32_t>(callback.tier)
-            << " outputs=" << callback.output_pool.size();
-        break;
-    }
-    case GraphNodeKind::Tier3Oneshot: {
-        const auto& oneshot = node.as_tier3_oneshot();
-        out << " input_deps=" << oneshot.input_dep_node_ids.size()
-            << " output_deps=" << oneshot.output_dep_node_ids.size();
-        break;
-    }
-    case GraphNodeKind::Dma: {
-        const auto& dma = node.as_dma();
-        out << " variant=" << dma_variant_name(dma.variant)
-            << " bytes=" << dma.bytes
-            << " channel=" << static_cast<uint32_t>(dma.channel);
-        break;
-    }
-    case GraphNodeKind::Barrier: {
-        const auto& barrier = node.as_barrier_node();
-        out << " self_stream=" << static_cast<uint32_t>(barrier.self_stream)
-            << " target_stream="
-            << static_cast<uint32_t>(barrier.target_stream);
-        break;
-    }
-    case GraphNodeKind::ChildGraph:
-        break;
-    }
-    return out.str();
-}
-
-std::vector<int64_t> graph_segment_ids(
-        size_t node_count, const std::vector<Segment>& segments) {
-    std::vector<int64_t> result(node_count, -1);
-    for (const auto& segment : segments) {
-        for (size_t i = segment.start_idx; i < segment.end_idx; ++i) {
-            result[i] = static_cast<int64_t>(segment.segment_id);
-        }
-    }
-    return result;
-}
-
-void append_segment_summary(std::ostringstream& out, const Segment& segment) {
-    out << "segment[" << segment.segment_id << "] nodes=["
-        << segment.start_idx << "," << segment.end_idx << ") cores=";
-    append_values(out, segment.core_ids);
-    out << " broadcast=" << (segment.queue_state.broadcast_mode ? 1 : 0)
-        << " flush_icache=" << (segment.queue_state.flush_icache ? 1 : 0)
-        << " replay_count=" << segment.replay_count;
-}
-
-}  // namespace
-
-std::string RpuKernelGraph::dump_replay_plan() const {
-    std::ostringstream out;
-    out << "GraphReplayPlan state=" << graph_state_name(state_)
-        << " replayable=" << (replayable_ ? "true" : "false")
-        << " graph_size=" << nodes_.size()
-        << " segments=" << segments_.size()
-        << " boundary_flush_count=" << boundary_flush_ptrs_.size() << "\n";
-    for (const auto& segment : segments_) {
-        out << "  ";
-        append_segment_summary(out, segment);
-        out << "\n";
-    }
-    const auto segment_ids = graph_segment_ids(nodes_.size(), segments_);
-    for (size_t i = 0; i < nodes_.size(); ++i) {
-        out << "  " << safe_node_summary(i, nodes_[i], segment_ids[i]) << "\n";
-    }
-    return out.str();
-}
-
-std::string RpuKernelGraph::dump_tree() const {
-    std::ostringstream out;
-    out << "GraphTree state=" << graph_state_name(state_)
-        << " replayable=" << (replayable_ ? "true" : "false")
-        << " graph_size=" << nodes_.size()
-        << " segments=" << segments_.size()
-        << " boundary_flush_count=" << boundary_flush_ptrs_.size() << "\n";
-    const auto segment_ids = graph_segment_ids(nodes_.size(), segments_);
-    for (const auto& segment : segments_) {
-        out << "  ";
-        append_segment_summary(out, segment);
-        out << "\n";
-        for (size_t i = segment.start_idx; i < segment.end_idx; ++i) {
-            out << "    " << safe_node_summary(i, nodes_[i], segment_ids[i])
-                << "\n";
-        }
-    }
-    for (size_t i = 0; i < nodes_.size(); ++i) {
-        if (segment_ids[i] < 0) {
-            out << "  inter_segment "
-                << safe_node_summary(i, nodes_[i], -1) << "\n";
-        }
-    }
-    return out.str();
+RpuKernelGraph::~RpuKernelGraph() {
+    // Return process-wide retained-slot tokens even when a cache entry is
+    // destroyed directly without a prior invalidate(). Queue destruction
+    // precedes the kernels referenced by its mutable parameter bindings.
+    release_prepared_queues();
 }
 
 RpuExecutionCoordinator::Claim RpuExecutionCoordinator::enter_graph(
@@ -1428,9 +1342,10 @@ RpuExecutionCoordinator::Claim RpuExecutionCoordinator::enter_graph(
     auto& state = process_execution_state();
     const std::thread::id current = std::this_thread::get_id();
     std::lock_guard<std::mutex> lock(state.mutex);
-    TORCH_CHECK(state.cleanup_depth == 0 && !state.shutting_down,
+    TORCH_CHECK(state.cleanup_depth == 0 && !state.shutting_down &&
+                    !state.reconfigure_active,
                 operation, ": Graph execution is forbidden during process "
-                "runtime cleanup");
+                "runtime cleanup or hot reconfigure");
     if (state.owner_tid == std::thread::id{}) {
         state.owner_tid = current;
     } else {
@@ -1509,7 +1424,8 @@ RpuExecutionCoordinator::Claim RpuExecutionCoordinator::enter_physical(
     const std::thread::id current = std::this_thread::get_id();
     std::lock_guard<std::mutex> lock(state.mutex);
     TORCH_CHECK(state.graph_depth == 0 && !state.physical_active &&
-                    state.cleanup_depth == 0 && !state.shutting_down,
+                    state.cleanup_depth == 0 && !state.shutting_down &&
+                    !state.reconfigure_active,
                 operation,
                 ": physical arena acquisition requires a process-quiescent "
                 "Graph/physical/cleanup state");
@@ -1638,14 +1554,24 @@ RpuExecutionCoordinator::Claim RpuExecutionCoordinator::enter_cleanup(
     auto& state = process_execution_state();
     const std::thread::id current = std::this_thread::get_id();
     std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.reconfigure_active) {
+        TORCH_CHECK(state.reconfigure_quiescing &&
+                        state.owner_tid == current && !shutting_down &&
+                        state.graph_depth == 0,
+                    operation,
+                    ": cleanup during hot reconfigure is reserved for the "
+                    "owning quiesce callback");
+        return Claim{};
+    }
     if (state.graph_depth != 0 && state.owner_tid == current &&
         owned_graph_diagnostic != nullptr) {
         TORCH_CHECK(false, owned_graph_diagnostic);
     }
-    TORCH_CHECK(state.graph_depth == 0 && !state.physical_active,
+    TORCH_CHECK(state.graph_depth == 0 && !state.physical_active &&
+                    !state.reconfigure_active,
                 operation,
                 ": runtime cleanup requires no process-active Graph or "
-                "physical arena");
+                "physical arena/hot reconfigure");
     if (state.cleanup_depth == 0) {
         TORCH_CHECK(!state.shutting_down,
                     operation, ": runtime is permanently shut down");
@@ -1703,6 +1629,271 @@ void RpuExecutionCoordinator::exit_cleanup_noexcept(
     clear_execution_owner_if_idle_locked(state);
 }
 
+uint64_t RpuExecutionCoordinator::begin_reconfigure(
+        const char* operation) {
+    return begin_reconfigure(/*attempt_token=*/0, operation);
+}
+
+uint64_t RpuExecutionCoordinator::begin_reconfigure(
+        uint64_t attempt_token, const char* operation) {
+    TORCH_CHECK(operation != nullptr && *operation != '\0',
+                "hot reconfigure requires an operation name");
+    auto& state = process_execution_state();
+    const std::thread::id current = std::this_thread::get_id();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    TORCH_CHECK(state.graph_depth == 0 && !state.physical_active &&
+                    state.cleanup_depth == 0 && !state.shutting_down &&
+                    !state.reconfigure_active,
+                operation,
+                ": hot reconfigure requires a process-quiescent "
+                "Graph/physical/cleanup state");
+    TORCH_CHECK(state.owner_tid == std::thread::id{},
+                operation, ": process execution owner is not idle");
+    require_no_active_retained_physical_arena_guards(operation);
+    state.owner_tid = current;
+    state.reconfigure_active = true;
+    state.reconfigure_quiescing = false;
+    state.reconfigure_token = next_execution_token_locked(state);
+    state.reconfigure_attempt_token = attempt_token;
+    return state.reconfigure_token;
+}
+
+uint64_t RpuExecutionCoordinator::begin_reconfigure_with_quiesce(
+        ReconfigureCallback quiesce, const char* operation) {
+    return begin_reconfigure_with_quiesce(
+        std::move(quiesce), /*attempt_token=*/0, operation);
+}
+
+uint64_t RpuExecutionCoordinator::begin_reconfigure_with_quiesce(
+        ReconfigureCallback quiesce,
+        uint64_t attempt_token,
+        const char* operation) {
+    TORCH_CHECK(operation != nullptr && *operation != '\0' && quiesce,
+                "hot reconfigure quiesce requires a callback and operation");
+    auto& state = process_execution_state();
+    const std::thread::id current = std::this_thread::get_id();
+    uint64_t token = 0;
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        TORCH_CHECK(state.graph_depth == 0 && state.cleanup_depth == 0 &&
+                        !state.shutting_down && !state.reconfigure_active,
+                    operation,
+                    ": hot reconfigure quiesce requires no active Graph or "
+                    "cleanup");
+        TORCH_CHECK(
+            state.owner_tid == std::thread::id{} ||
+                (state.physical_active && state.owner_tid == current),
+            operation,
+            ": hot reconfigure quiesce is owned by another thread");
+        state.owner_tid = current;
+        state.reconfigure_active = true;
+        state.reconfigure_quiescing = true;
+        token = next_execution_token_locked(state);
+        state.reconfigure_token = token;
+        state.reconfigure_attempt_token = attempt_token;
+    }
+
+    try {
+        quiesce();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        TORCH_CHECK(state.reconfigure_active &&
+                        state.reconfigure_quiescing &&
+                        state.reconfigure_token == token &&
+                        state.owner_tid == current &&
+                        state.graph_depth == 0 && !state.physical_active &&
+                        state.cleanup_depth == 0 && !state.shutting_down,
+                    operation,
+                    ": quiesce callback did not release its physical/Graph "
+                    "lifecycle");
+        require_no_active_retained_physical_arena_guards(operation);
+        state.reconfigure_quiescing = false;
+    } catch (...) {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (state.reconfigure_active && state.reconfigure_token == token &&
+            state.owner_tid == current) {
+            clear_reconfigure_locked(state);
+        }
+        throw;
+    }
+    return token;
+}
+
+void RpuExecutionCoordinator::validate_reconfigure(
+        uint64_t token, const char* operation) {
+    TORCH_CHECK(operation != nullptr && *operation != '\0',
+                "hot reconfigure validation requires an operation name");
+    auto& state = process_execution_state();
+    const std::thread::id current = std::this_thread::get_id();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    TORCH_CHECK(token != 0 && state.reconfigure_active &&
+                    !state.reconfigure_quiescing &&
+                    state.reconfigure_token == token &&
+                    state.owner_tid == current &&
+                    state.graph_depth == 0 && !state.physical_active &&
+                    state.cleanup_depth == 0 && !state.shutting_down,
+                operation,
+                ": hot reconfigure token is stale, foreign, or not quiescent");
+}
+
+void RpuExecutionCoordinator::stage_reconfigure(
+        uint64_t token,
+        const void* participant,
+        ReconfigureCallback apply,
+        ReconfigureCallback rollback,
+        const char* operation) {
+    TORCH_CHECK(operation != nullptr && *operation != '\0',
+                "hot reconfigure stage requires an operation name");
+    TORCH_CHECK(participant != nullptr && apply && rollback,
+                operation, ": hot reconfigure participant is incomplete");
+    auto& state = process_execution_state();
+    const std::thread::id current = std::this_thread::get_id();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    TORCH_CHECK(token != 0 && state.reconfigure_active &&
+                    !state.reconfigure_quiescing &&
+                    !state.reconfigure_committing &&
+                    state.reconfigure_token == token &&
+                    state.owner_tid == current &&
+                    state.graph_depth == 0 && !state.physical_active &&
+                    state.cleanup_depth == 0 && !state.shutting_down,
+                operation,
+                ": hot reconfigure token is stale, foreign, or not quiescent");
+    const auto duplicate = std::find_if(
+        state.reconfigure_participants.begin(),
+        state.reconfigure_participants.end(),
+        [participant](const ReconfigureParticipant& item) {
+            return item.identity == participant;
+        });
+    TORCH_CHECK(duplicate == state.reconfigure_participants.end(),
+                operation,
+                ": hot reconfigure participant was staged more than once");
+    state.reconfigure_participants.push_back(
+        {participant, std::move(apply), std::move(rollback)});
+}
+
+void RpuExecutionCoordinator::check_reconfigure_participant_destroy_allowed(
+        const void* participant, const char* operation) {
+    TORCH_CHECK(operation != nullptr && *operation != '\0' &&
+                    participant != nullptr,
+                "hot reconfigure destroy admission is incomplete");
+    auto& state = process_execution_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    const auto staged = std::find_if(
+        state.reconfigure_participants.begin(),
+        state.reconfigure_participants.end(),
+        [participant](const ReconfigureParticipant& item) {
+            return item.identity == participant;
+        });
+    TORCH_CHECK(!state.reconfigure_active ||
+                    staged == state.reconfigure_participants.end(),
+                operation,
+                ": cannot destroy a staged execution-reconfigure participant; "
+                "commit or abort the transaction first");
+}
+
+void RpuExecutionCoordinator::commit_reconfigure(
+        uint64_t token, const char* operation) {
+    TORCH_CHECK(operation != nullptr && *operation != '\0',
+                "hot reconfigure commit requires an operation name");
+    auto& state = process_execution_state();
+    const std::thread::id current = std::this_thread::get_id();
+    std::vector<ReconfigureParticipant> participants;
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        TORCH_CHECK(token != 0 && state.reconfigure_active &&
+                        !state.reconfigure_quiescing &&
+                        !state.reconfigure_committing &&
+                        state.reconfigure_token == token &&
+                        state.owner_tid == current &&
+                        state.graph_depth == 0 && !state.physical_active &&
+                        state.cleanup_depth == 0 && !state.shutting_down,
+                    operation,
+                    ": hot reconfigure token is stale, foreign, or not quiescent");
+        participants = state.reconfigure_participants;
+        state.reconfigure_committing = true;
+    }
+
+    size_t attempted = 0;
+    try {
+        for (auto& participant : participants) {
+            ++attempted;
+            participant.apply();
+        }
+    } catch (...) {
+        const std::exception_ptr apply_error = std::current_exception();
+        std::exception_ptr rollback_error;
+        while (attempted != 0) {
+            try {
+                participants[--attempted].rollback();
+            } catch (...) {
+                if (!rollback_error) rollback_error = std::current_exception();
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            TORCH_INTERNAL_ASSERT(state.reconfigure_active &&
+                                  state.reconfigure_token == token &&
+                                  state.owner_tid == current);
+            clear_reconfigure_locked(state);
+        }
+        if (rollback_error) {
+            try {
+                std::rethrow_exception(rollback_error);
+            } catch (const std::exception& error) {
+                TORCH_CHECK(false, operation,
+                            ": hot reconfigure commit and rollback failed: ",
+                            error.what());
+            } catch (...) {
+                TORCH_CHECK(false, operation,
+                            ": hot reconfigure commit and rollback failed");
+            }
+        }
+        std::rethrow_exception(apply_error);
+    }
+
+    std::lock_guard<std::mutex> lock(state.mutex);
+    TORCH_INTERNAL_ASSERT(state.reconfigure_active &&
+                          state.reconfigure_token == token &&
+                          state.owner_tid == current);
+    clear_reconfigure_locked(state);
+}
+
+void RpuExecutionCoordinator::abort_reconfigure(
+        uint64_t token, const char* operation) {
+    TORCH_CHECK(operation != nullptr && *operation != '\0',
+                "hot reconfigure abort requires an operation name");
+    auto& state = process_execution_state();
+    const std::thread::id current = std::this_thread::get_id();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    TORCH_CHECK(token != 0 && state.reconfigure_active &&
+                    !state.reconfigure_quiescing &&
+                    !state.reconfigure_committing &&
+                    state.reconfigure_token == token &&
+                    state.owner_tid == current,
+                operation, ": hot reconfigure token is stale or foreign");
+    clear_reconfigure_locked(state);
+}
+
+bool RpuExecutionCoordinator::abort_reconfigure_attempt(
+        uint64_t attempt_token, const char* operation) {
+    TORCH_CHECK(operation != nullptr && *operation != '\0',
+                "hot reconfigure attempt abort requires an operation name");
+    TORCH_CHECK(attempt_token != 0,
+                operation, ": hot reconfigure attempt token is zero");
+    auto& state = process_execution_state();
+    const std::thread::id current = std::this_thread::get_id();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (!state.reconfigure_active) return false;
+    TORCH_CHECK(
+        !state.reconfigure_quiescing && !state.reconfigure_committing &&
+            state.reconfigure_participants.empty() &&
+            state.reconfigure_attempt_token == attempt_token &&
+            state.owner_tid == current,
+        operation,
+        ": hot reconfigure attempt is stale, foreign, or already staged");
+    clear_reconfigure_locked(state);
+    return true;
+}
+
 RpuExecutionCoordinator::Claim
 RpuExecutionCoordinator::enter_allocator_mutation(
         const char* operation, bool& graph_claim_active) {
@@ -1711,9 +1902,10 @@ RpuExecutionCoordinator::enter_allocator_mutation(
     auto& state = process_execution_state();
     const std::thread::id current = std::this_thread::get_id();
     std::lock_guard<std::mutex> lock(state.mutex);
-    TORCH_CHECK(state.cleanup_depth == 0 && !state.shutting_down,
+    TORCH_CHECK(state.cleanup_depth == 0 && !state.shutting_down &&
+                    !state.reconfigure_active,
                 operation, ": allocator mutation is forbidden during "
-                "runtime cleanup");
+                "runtime cleanup or hot reconfigure");
     TORCH_CHECK(!state.physical_active,
                 operation, ": allocator mutation requires no process-active "
                 "physical arena");
@@ -1748,6 +1940,18 @@ RpuExecutionCoordinator::enter_graph_invalidation(
                 operation,
                 ": Graph invalidation is forbidden while a Graph scope is "
                 "active; use abort for scope cleanup");
+
+    if (state.reconfigure_active) {
+        TORCH_CHECK(expected_physical_token == 0 &&
+                        state.cleanup_depth == 0 &&
+                        !state.shutting_down &&
+                        state.owner_tid == current,
+                    operation,
+                    ": Graph invalidation during hot reconfigure requires "
+                    "the exact owning thread and a non-physical graph");
+        physical_claim_active = true;
+        return Claim{};
+    }
 
     if (state.physical_active) {
         TORCH_CHECK(expected_physical_token != 0 &&
@@ -1786,8 +1990,13 @@ void RpuExecutionCoordinator::check_current_thread_execution_allowed(
     auto& state = process_execution_state();
     const std::thread::id current = std::this_thread::get_id();
     std::lock_guard<std::mutex> lock(state.mutex);
-    TORCH_CHECK(state.cleanup_depth == 0 && !state.shutting_down,
-                operation, ": execution is forbidden during runtime cleanup");
+    const bool quiesce_owner = state.reconfigure_active &&
+        state.reconfigure_quiescing && state.owner_tid == current;
+    TORCH_CHECK(state.cleanup_depth == 0 && !state.shutting_down &&
+                    (!state.reconfigure_active || quiesce_owner),
+                operation,
+                ": execution is forbidden during runtime cleanup or hot "
+                "reconfigure");
     TORCH_CHECK((state.graph_depth == 0 && !state.physical_active) ||
                     state.owner_tid == current,
                 operation, ": RPU execution is owned by another thread");
@@ -1798,7 +2007,10 @@ bool RpuExecutionCoordinator::current_thread_execution_allowed_noexcept()
     auto& state = process_execution_state();
     const std::thread::id current = std::this_thread::get_id();
     std::lock_guard<std::mutex> lock(state.mutex);
+    const bool quiesce_owner = state.reconfigure_active &&
+        state.reconfigure_quiescing && state.owner_tid == current;
     return state.cleanup_depth == 0 && !state.shutting_down &&
+        (!state.reconfigure_active || quiesce_owner) &&
         ((state.graph_depth == 0 && !state.physical_active) ||
          state.owner_tid == current);
 }
@@ -1842,8 +2054,42 @@ RpuExecutionGraphInvalidationGuard::~RpuExecutionGraphInvalidationGuard() {
     }
 }
 
-std::shared_ptr<RpuKernelGraph> make_registered_rpu_kernel_graph() {
-    auto graph = std::make_shared<RpuKernelGraph>();
+int64_t rpu_execution_reconfigure_begin(int64_t attempt_token) {
+    TORCH_CHECK(attempt_token > 0,
+                "RPU hot reconfigure attempt token must be positive");
+    const uint64_t token = RpuExecutionCoordinator::begin_reconfigure(
+        static_cast<uint64_t>(attempt_token),
+        "rpu::execution_reconfigure_begin");
+    TORCH_CHECK(token <= static_cast<uint64_t>(
+                    std::numeric_limits<int64_t>::max()),
+                "RPU hot reconfigure token exceeds the dispatcher int range");
+    return static_cast<int64_t>(token);
+}
+
+void rpu_execution_reconfigure_commit(int64_t token) {
+    TORCH_CHECK(token > 0, "RPU hot reconfigure token must be positive");
+    RpuExecutionCoordinator::commit_reconfigure(
+        static_cast<uint64_t>(token), "rpu::execution_reconfigure_commit");
+}
+
+void rpu_execution_reconfigure_abort(int64_t token) {
+    TORCH_CHECK(token > 0, "RPU hot reconfigure token must be positive");
+    RpuExecutionCoordinator::abort_reconfigure(
+        static_cast<uint64_t>(token), "rpu::execution_reconfigure_abort");
+}
+
+bool rpu_execution_reconfigure_abort_attempt(int64_t attempt_token) {
+    TORCH_CHECK(attempt_token > 0,
+                "RPU hot reconfigure attempt token must be positive");
+    return RpuExecutionCoordinator::abort_reconfigure_attempt(
+        static_cast<uint64_t>(attempt_token),
+        "rpu::execution_reconfigure_abort_attempt");
+}
+
+std::shared_ptr<RpuKernelGraph> make_registered_rpu_kernel_graph(
+        GraphRuntimePolicy runtime_policy) {
+    validate_graph_runtime_policy(runtime_policy);
+    auto graph = std::make_shared<RpuKernelGraph>(std::move(runtime_policy));
     auto& registry = registered_graph_registry();
     std::lock_guard<std::mutex> lock(registry.mutex);
     registry.graphs.emplace_back(graph);
@@ -1972,9 +2218,9 @@ RpuKernelGraph::arm_retained_physical_arena(
         "RpuKernelGraph::arm_retained_physical_arena requires a Graph built "
         "by this exact physical claim");
     TORCH_CHECK(
-        !ever_embedded_as_child_,
+        !ever_extracted_child_window_ && !ever_embedded_as_child_,
         "RpuKernelGraph::arm_retained_physical_arena rejects a Graph "
-        "lifetime that was embedded as a prepared child");
+        "lifetime that detached or was embedded as a prepared child");
     for (const GraphNode& node : nodes_) {
         TORCH_CHECK(
             node.kind != GraphNodeKind::ChildGraph,
@@ -2276,10 +2522,12 @@ GraphOpStreamWindowDigest RpuKernelGraph::digest_op_stream_window(
     digest.node_count = end.position - begin.position;
     digest.kind_mask = node_kind_mask_for_window(begin.position, end.position);
     digest.topology_hash = topology_hash_for_window(begin.position, end.position);
+    digest.node_kinds.reserve(digest.node_count);
     digest.semantic_spm_producer_yield_id_digest =
         semantic_spm_producer_yield_id_digest_for_window(
             begin.position, end.position);
     for (size_t index = begin.position; index < end.position; ++index) {
+        digest.node_kinds.push_back(nodes_[index].kind);
         if (nodes_[index].kind == GraphNodeKind::Kernel) {
             const auto& marker =
                 nodes_[index].as_kernel().semantic_spm_producer_yield;
@@ -2570,7 +2818,7 @@ void RpuKernelGraph::verify_composite_fmb_end_preflight() const {
 // begin / begin(sig) / begin_impl
 // =============================================================================
 //
-// Signature-driven admission:
+// A2 — signature-driven admission:
 //   begin(sig)   : 命中 BUILT+sig → REPLAYING;否则进 RECORDING + pending_signature_=sig
 //   begin()      : 兼容形态,无 sig,任何状态都进 RECORDING(不命中 admission;BUILT
 //                  会被 invalidate 重录)。
@@ -2635,7 +2883,7 @@ void RpuKernelGraph::begin_impl(const std::optional<GraphSignature>& sig) {
     check_foreign_graph_execution_allowed(
         "RpuKernelGraph: nested Graph begin",
         /*allow_managed_semantic_yield_scope_entry=*/true);
-    // Allow nested begin for different graph instances; reject re-entry.
+    // A1 — 允许 nested begin(不同 graph 实例),只拦截同一 graph 重入。
     TORCH_CHECK(std::find(active_stack_.begin(), active_stack_.end(), this)
                     == active_stack_.end(),
                 "RpuKernelGraph: begin() called on a graph already on the active stack");
@@ -2701,37 +2949,42 @@ void RpuKernelGraph::begin_impl(const std::optional<GraphSignature>& sig) {
         segments_.clear();
         tensor_refs_.clear();
         boundary_flush_ptrs_.clear();
-        // A fresh capture clears both admission tables. Persistent resources
-        // use the owner tree and follow the same mark-released/clear sequence
-        // as invalidate and abort.
+        // S2 — fresh capture(PASSTHROUGH→RECORDING):两张 admission 表都清。
+        // G4.B-2 起 persistent 一支用 owner tree(GraphOwnedResource 向量),
+        // G4.B-7 走 mark_released → clear 两步,跟 invalidate / abort 一致。
         for (auto& r : host_callback_persistent_owners_) r.mark_released();
         host_callback_persistent_owners_.clear();
         host_callback_live_tier1_out_ranges_.clear();
-        // ZeroCopyHolderGuard should remove zero-copy holders before
-        // RECORDING. Clear any exception-path residue defensively.
+        // G4.B-4 — RECORDING 入口:zero-copy holders 应该已被上一轮的
+        // ZeroCopyHolderGuard 截掉。若意外有遗留(嵌套异常 / 异常路径漏栈)
+        // 这里 defensive clear,不打 TORCH_CHECK 以免 false alarm。
         if (!host_callback_zero_copy_holders_.empty()) {
             for (auto& r : host_callback_zero_copy_holders_) r.mark_released();
             host_callback_zero_copy_holders_.clear();
         }
-        // Re-entering RECORDING must clear the previous pool slots and reverse
-        // lookup so an old CPU pointer cannot select a stale LocalSPM_t.
+        // T1a — 重新进入 RECORDING 必须清掉上一轮的 pool slot/反查表,否则
+        // 旧 cpu_ptr 仍会命中 ptr_to_slot_,导致 ddr_to_spm 错把 DMA 接到陈旧
+        // 的 LocalSPM_t 上(unique_ptr 持有的旧 slot 在本轮还没被释放,但其
+        // SPM 内容已属上一轮)。
         local_spm_pool_.clear();
         global_spm_pool_.clear();
-        // RECORDING dependency inference binds dev_addr-to-writer mappings to
-        // the current capture; clear them to prevent stale dependency edges.
+        // m2-3 — RECORDING dep 推断:dev_addr → writer 映射跟当前 capture 绑定,
+        // 跨 capture 必须清(否则上轮 caching allocator 复用的 dev_addr 会误命中
+        // 上轮 writer node id,产生悬空的 dep 边)。
         recording_dev_addr_writer_.clear();
-        // Tier3 transient buffers are not reused across captures because op
-        // shape or dtype may change. Mark them released before clearing.
+        // m2-4 — Tier3 transient buffer:跨 capture 不复用(新一轮 op shape /
+        // dtype 可能不同)。先 mark_released 给 dump_resources hook 留窗口,再清。
         for (auto& r : tier3_oneshot_transient_owners_) r.mark_released();
         tier3_oneshot_transient_owners_.clear();
         tier3_oneshot_transient_tensors_.clear();
         last_stats_ = {};
+        last_stats_.hwperf_evidence_failure_total = hwperf_evidence_failure_total_;
         pending_kernel_id_.reset();
         pending_kernel_name_.reset();
         replayable_ = true;
-        non_replayable_reason_.clear();
+        non_replayable_reason_.clear();    // A6 — 上一轮 Tier 3 留下的原因清掉
         cursor_ = 0;
-        // post_fn fast-replay: fresh capture re-records the post_fn-start
+        // D-501 post_fn fast-replay: fresh capture re-records the post_fn-start
         // cursor via mark_post_fn_cursor; clear the stale flag here too.
         has_post_fn_cursor_ = false;
         pending_signature_ = sig;          // nullopt 时本轮 end() 不落 BUILT
@@ -2741,21 +2994,24 @@ void RpuKernelGraph::begin_impl(const std::optional<GraphSignature>& sig) {
     case State::BUILT:
         if (hit_built) {
             cursor_ = 0;
+            kernel_params_dirty_this_replay_ = false;
             // 不复用 capture 期旧 ptr;REPLAYING 期由 record_boundary_flush
             // 的调用点重新登记本轮当前的 ptr 值。
             boundary_flush_ptrs_.clear();
-            // REPLAYING consumes the same LocalSPM_t in RECORDING order. Reset
-            // only the cursor; slots and reverse lookup remain stable.
+            // T1a — REPLAYING 期严格按 RECORDING 顺序消费同一只 LocalSPM_t,
+            // 只 reset cursor;slots_ / ptr_to_slot_ 都保留(SPM 物理 slot 在
+            // RECORDING 期就锁住了,本轮地址不变)。
             local_spm_pool_.reset_cursor();
             global_spm_pool_.reset_cursor();
-            // A new REPLAY keeps persistent stable storage but clears live
-            // Tier1 .out arguments, which are registered again for this step.
+            // S2 — 进入新一步 REPLAY:persistent stable 跨 step 不变保留;live
+            // Tier1 .out fresh args 每步新 alloc,先清,等 op stream 期
+            // capture_host_callback_replay_args 重新登记本步地址。
             host_callback_live_tier1_out_ranges_.clear();
             state_ = State::REPLAYING;
         } else {
             // sig miss(或本次无 sig)→ 丢弃旧 BUILT,重新 RECORDING。
             // RpuGraphCache 命中 entry.graph 时这条分支不应触发(否则等于同一 entry
-            // 的 sig 不一致,并记录 recapture_count)。
+            // 的 sig 不一致,A2 起记 recapture_count)。
             invalidate_impl(/*from_abort=*/false);
             replayable_ = true;
             pending_signature_ = sig;
@@ -2794,13 +3050,11 @@ void RpuKernelGraph::begin_impl(const std::optional<GraphSignature>& sig) {
         canonical_dma_build_trace_node_begin_ = 0;
         canonical_dma_build_trace_node_end_ = 0;
         op_stream_fully_skipped_ = false;
+        kernel_params_dirty_this_replay_ = false;
         build_generation_ = next_build_attempt_nonce();
         build_topology_hash_ = 0;
         topology_hash_requested_ = false;
         retained_physical_build_requested_ = false;
-        const char* value = std::getenv("RPU_FASTREPLAY_SKIP_SYNC");
-        fast_replay_skip_sync_ =
-            value != nullptr && *value != '\0' && value[0] != '0';
     }
 
     // Push may allocate, so do it while the local process claim still has a
@@ -2818,12 +3072,8 @@ void RpuKernelGraph::begin_impl(const std::optional<GraphSignature>& sig) {
 // end
 // =============================================================================
 
-bool RpuKernelGraph::force_oneshot_on_replay_enabled() {
-    static const bool enabled = []() {
-        const char* value = std::getenv("RPU_GRAPH_FORCE_ONESHOT_ON_REPLAY");
-        return value != nullptr && *value != '\0' && *value != '0';
-    }();
-    return enabled;
+bool RpuKernelGraph::force_oneshot_on_replay_enabled() const {
+    return runtime_policy_.force_oneshot_on_replay;
 }
 
 void RpuKernelGraph::end() {
@@ -2960,7 +3210,7 @@ void RpuKernelGraph::end() {
         TORCH_CHECK(cursor_ == nodes_.size(),
                     "RpuKernelGraph: replay incomplete: cursor=", cursor_,
                     " expected=", nodes_.size());
-        // Trace ranges:把 REPLAYING 期 end() 收尾拆成 pre-flush /
+        // 1.1 P0 trace ranges:把 REPLAYING 期 end() 收尾拆成 pre-flush /
         // execute / post-flush / stats 四段,Chrome tracing / Perfetto 里直接
         // 搜 `rpu_graph::*`。无语义改变。
         RECORD_FUNCTION("rpu_graph::end_REPLAYING", {});
@@ -2975,13 +3225,9 @@ void RpuKernelGraph::end() {
         }
         flush_kernel_register_outer_fast_force_visibility();
         verify_kernel_register_outer_fast_launch_preflight();
-        // 诊断开关 RPU_GRAPH_FORCE_ONESHOT_ON_REPLAY=1 强制走 oneshot 路径
-        // (每步 build_segments + prepare_kernel_mutable + launch), 不复用
-        // prepared_wq，用于隔离 prepared-queue 的 mutable-kernel 同步行为。
-        //
-        // This diagnostic changes behavior and must remain disabled for
-        // production profiles: REPLAYING falls back to one-shot execution and
-        // loses prepared-queue reuse. Always unset it after diagnosis.
+        // Diagnostic force_oneshot_on_replay rebuilds segments and mutable
+        // kernel preparation instead of reusing prepared_wq. It deliberately
+        // changes the replay execution path and is not a production policy.
         {
             if (force_oneshot_on_replay_enabled()) {
                 RECORD_FUNCTION("rpu_graph::execute_replay_force_oneshot", {});
@@ -3023,8 +3269,8 @@ void RpuKernelGraph::end() {
                     static_cast<int>(state_));
     }
 
-    // keep_alive() 的引用在这里（执行之后）才释放，以覆盖 graph 的完整执行
-    // 生命周期。该锚点不做 flush；相干性由 op 侧的
+    // keep_alive() 的引用在这里(执行之后)才丢 —— 这正是 C-1 要求的生命周期,
+    // 见 docs/pitfalls.md#c-1。纯生命周期锚点,不做 flush:相干性由 op 侧的
     // rpu_ddr_flush_force(执行前)和 boundary flush 机制负责。
     tensor_refs_.clear();
     pending_kernel_id_.reset();
@@ -3094,7 +3340,7 @@ void RpuKernelGraph::abort() {
     TORCH_CHECK(it != active_stack_.end(),
                 "RpuKernelGraph: abort() owner thread has no matching active "
                 "stack entry");
-    // 严格要求只能 abort 栈顶。非-top abort 是嵌套调用错乱,直接抛出
+    // A1 — 严格要求只能 abort 栈顶。非-top abort 是嵌套调用错乱,直接抛出
     // 而不是悄悄 erase 中间元素。
     TORCH_CHECK(it + 1 == active_stack_.end(),
                 "RpuKernelGraph: abort() called on non-top graph; nested "
@@ -3141,6 +3387,8 @@ void RpuKernelGraph::invalidate_impl(bool from_abort) {
                     !canonical_dma_burst_permit_.active,
                 "RpuKernelGraph: invalidate is forbidden inside an active "
                 "canonical FMB DMA callback/burst");
+    data_dma_queue_.reset();
+    release_prepared_queues();
     kernels_.clear();
     nodes_.clear();
     segments_.clear();
@@ -3149,30 +3397,29 @@ void RpuKernelGraph::invalidate_impl(bool from_abort) {
     // 对称,免得下一个 keep_alive 生产方继承一个静默的滞留窗口。
     tensor_refs_.clear();
     boundary_flush_ptrs_.clear();
-    // segments_ 被清,所有 seg idx 失效;private_queue_ 的 kd_buf 仍存
-    // 但内容不再对应任何 segment (即将被下一轮 prepare_segment_queue 覆写)。
-    // 重置 fingerprint 强制 fallback rebuild,防 stale data 被 sync-only 误读。
-    private_queue_built_segment_idx_ = -1;
-    // invalidate 是硬重置;两张 admission 表都清。persistent 资源由 owner
-    // tree 管理；先遍历 owner tree mark_released 再 clear,跟 begin 收尾对齐。
+    // S2 — invalidate 是硬重置;两张 admission 表都清。
+    // G4.B-2 persistent 一支已迁 owner tree。
+    // G4.B-7 — 遍历 owner tree mark_released 后再 clear,跟 begin 收尾对齐;
+    // 给将来 dump_resources 在退栈瞬间留 hook 点。
     for (auto& r : host_callback_persistent_owners_) r.mark_released();
     host_callback_persistent_owners_.clear();
     for (auto& r : host_callback_zero_copy_holders_) r.mark_released();
     host_callback_zero_copy_holders_.clear();
     host_callback_live_tier1_out_ranges_.clear();
-    // 同 begin(): 一并释放 pool 持有的 LocalSPM_t,清反查表。
+    // T1a — 同 begin(): 一并释放 pool 持有的 LocalSPM_t,清反查表。
     // abort() 也走这条路径,所以两条入口共用一份生命周期清理。
     local_spm_pool_.clear();
     global_spm_pool_.clear();
-    // invalidate 也是硬重置,清 RECORDING dep 推断映射。
+    // m2-3 — invalidate 也是硬重置,清 RECORDING dep 推断映射。
     recording_dev_addr_writer_.clear();
-    // invalidate 硬清 Tier3 transient buffer owner tree(同 begin)。
+    // m2-4 — invalidate 硬清 Tier3 transient buffer owner tree(同 begin)。
     for (auto& r : tier3_oneshot_transient_owners_) r.mark_released();
     tier3_oneshot_transient_owners_.clear();
     tier3_oneshot_transient_tensors_.clear();
     last_stats_ = {};
+    last_stats_.hwperf_evidence_failure_total = hwperf_evidence_failure_total_;
     replayable_ = false;
-    non_replayable_reason_.clear();   // 下次 begin 会重新设置
+    non_replayable_reason_.clear();   // A6 — 一并清掉(下次 begin 会重新设)
     built_signature_ = {};
     has_built_signature_ = false;
     pending_signature_.reset();
@@ -3199,10 +3446,11 @@ void RpuKernelGraph::invalidate_impl(bool from_abort) {
     canonical_dma_build_trace_node_begin_ = 0;
     canonical_dma_build_trace_node_end_ = 0;
     op_stream_fully_skipped_ = false;
+    kernel_params_dirty_this_replay_ = false;
     cursor_ = 0;
     build_topology_hash_ = 0;
     topology_hash_requested_ = false;
-    // post_fn fast-replay: clear so a stale post_fn-start cursor can't
+    // D-501 post_fn fast-replay: clear so a stale post_fn-start cursor can't
     // leak across rebuilds (next RECORDING re-records it via mark_post_fn_cursor).
     has_post_fn_cursor_ = false;
     replay_child_skip_ = ReplayChildSkipState{};
@@ -3218,7 +3466,7 @@ void RpuKernelGraph::invalidate_impl(bool from_abort) {
 }
 
 // =============================================================================
-// mark_non_replayable(reason) — Tier 3 / unsafe-copy 等场景标 scope 不可缓存
+// mark_non_replayable(reason) — A6 Tier 3 / unsafe-copy 等场景标 scope 不可缓存
 // =============================================================================
 //
 // 不调 sync_point()(保留 nodes_ 顺序),不动 cursor_,只翻 replayable_=false +
@@ -3257,7 +3505,7 @@ void RpuKernelGraph::mark_non_replayable(std::string reason) {
 // 不影响 replay cursor，仅把 ptr 累积到 boundary_flush_ptrs_，由生命周期钩子
 // （batch 前后、sync_point 前后）统一下发。
 // 当前不做去重 —— 128 个调用点 × 单层 ~50 flush，重复 flush 单个 dc civac
-// 成本可忽略；若 profiling 显示这里成为热点再在登记侧去重。
+// 成本可忽略；Phase 4 profile 若证明是热点再加 dedup。
 
 void RpuKernelGraph::record_boundary_flush(void* ptr) {
     if (ptr == nullptr) return;
@@ -3269,12 +3517,13 @@ void RpuKernelGraph::record_boundary_flush(void* ptr) {
 // flush_boundary_ptrs — 按顺序下发所有登记的 boundary ptr（in-place 去重）
 // =============================================================================
 // 遵循 g_rpu_ddr_flush_enabled：关闭时直接返回，不动集合，便于对照测试。
-// 不 clear 集合 —— clear 由调用方的生命周期钩子在合适时机做，
+// 不 clear 集合 —— clear 由调用方（Phase 2 生命周期钩子）在合适时机做，
 // 通常是「kernel batch 后」+「sync_point 后」+「end/abort/invalidate 收尾」。
 //
-// 去重：同一 ptr 可能被多个 Op 重复登记（例如 QKV 共享的 mask ptr）。
-// in-place sort + unique 让后续 flush 只处理唯一地址；第二次
-// （post-batch）flush 复用已去重的集合。
+// §12.7 dedup：Qwen3 单 layer ~50 rpu_ddr_flush 调用中，同一 ptr 常被多个 Op
+// 重复登记（例如 QKV 共享的 mask ptr）。in-place sort + unique 把 128 ptr 收敛
+// 到 ~20 unique，批量 dc civac 次数下降 ~6×。第一次 flush 调用后集合已去重，
+// 第二次（post-batch）flush 命中已去重的小集。
 
 void RpuKernelGraph::flush_boundary_ptrs() {
     if (!g_rpu_ddr_flush_enabled) {
@@ -3298,7 +3547,7 @@ void RpuKernelGraph::flush_boundary_ptrs() {
     }
     last_stats_.boundary_flush_count = boundary_flush_ptrs_.size();
 }
-// _to_copy admission: HostCallback stable-storage tracking
+// S2 / G1.5 — _to_copy admission:HostCallback stable storage tracking
 // =============================================================================
 //
 // rpu_to_copy 决定要不要把 RPU→RPU dtype cast 推进 host_callback Tier2 deferred
@@ -3335,6 +3584,13 @@ StableRangeView extract_range(const at::Tensor& t) {
     return r;
 }
 
+bool to_copy_log_enabled() {
+    static const bool v = []() {
+        const char* e = std::getenv("RPU_GRAPH_TO_COPY_LOG");
+        return e && *e && *e != '0';
+    }();
+    return v;
+}
 }  // namespace
 
 // 内部 helper:同 (host_base, nbytes) 已存在则跳过。
@@ -3362,7 +3618,7 @@ bool range_hit(const StableRangeView& v,
     return false;
 }
 
-// Owner-tree deduplication and lookup.
+// G4.B-2 — owner tree 版本的 dedup / lookup。
 // dedup 仍按 (host_base, nbytes) 二元组(沿用 push_unique_range 语义);命中
 // 走 GraphOwnedResource::contains_host_addr / contains_dev_addr 点命中,跟
 // 原 range_hit 1-byte 起始落在 owner 范围内的判定等价。
@@ -3397,6 +3653,13 @@ void RpuKernelGraph::register_host_callback_persistent_stable(
     StableRangeView v = extract_range(stable);
     if (v.host_base == 0 || v.nbytes == 0) return;
     push_unique_owner(host_callback_persistent_owners_, v);
+    if (to_copy_log_enabled()) {
+        std::cerr << "[STABLE-REG persist] host=0x" << std::hex << v.host_base
+                  << " dev=0x" << v.dev_base << std::dec
+                  << " nbytes=" << v.nbytes
+                  << " dtype=" << stable.scalar_type()
+                  << " sizes=" << stable.sizes() << "\n";
+    }
 }
 
 void RpuKernelGraph::register_host_callback_live_tier1_out(
@@ -3404,6 +3667,13 @@ void RpuKernelGraph::register_host_callback_live_tier1_out(
     StableRangeView v = extract_range(fresh_out_arg);
     if (v.host_base == 0 || v.nbytes == 0) return;
     push_unique_range(host_callback_live_tier1_out_ranges_, v);
+    if (to_copy_log_enabled()) {
+        std::cerr << "[STABLE-REG live] host=0x" << std::hex << v.host_base
+                  << " dev=0x" << v.dev_base << std::dec
+                  << " nbytes=" << v.nbytes
+                  << " dtype=" << fresh_out_arg.scalar_type()
+                  << " sizes=" << fresh_out_arg.sizes() << "\n";
+    }
 }
 
 bool RpuKernelGraph::is_host_callback_stable_input(const at::Tensor& src) const {
@@ -3420,28 +3690,15 @@ bool RpuKernelGraph::is_host_callback_stable_input(const at::Tensor& src) const 
 }
 
 bool RpuKernelGraph::should_defer_host_op_input(const at::Tensor& src) const {
-    enum class Mode { Auto, ForceOff, ForceOn };
-    static const Mode mode = []() {
-        // 优先读升级名 RPU_GRAPH_HOST_OP_DEFER_GATE;fall back 到 legacy alias
-        // RPU_GRAPH_DEFER_TO_COPY 是早期 _to_copy 单点 gate 的 env 名，
-        // 与新名同义，保留以兼容已有脚本。
-        const char* e = std::getenv("RPU_GRAPH_HOST_OP_DEFER_GATE");
-        if (e == nullptr || *e == '\0')
-            e = std::getenv("RPU_GRAPH_DEFER_TO_COPY");
-        if (e == nullptr || *e == '\0') return Mode::Auto;
-        std::string v(e);
-        if (v == "auto") return Mode::Auto;
-        if (v == "0" || v == "off" || v == "false") return Mode::ForceOff;
-        return Mode::ForceOn;
-    }();
-    if (mode == Mode::ForceOff) return false;
+    const GraphHostOpDeferMode mode = runtime_policy_.host_op_defer_mode;
+    if (mode == GraphHostOpDeferMode::ForceOff) return false;
     if (state_ != State::RECORDING && state_ != State::REPLAYING) return false;
-    if (mode == Mode::ForceOn) return true;
+    if (mode == GraphHostOpDeferMode::ForceOn) return true;
     return is_host_callback_stable_input(src);
 }
 
 // =============================================================================
-// ZeroCopy storage-holder registration
+// G4.B-4 — ZeroCopy storage holder 镜像注册
 // =============================================================================
 
 void RpuKernelGraph::register_zero_copy_holder(const at::Tensor& view) {
@@ -3468,7 +3725,8 @@ size_t RpuKernelGraph::zero_copy_holder_count() const {
 
 void RpuKernelGraph::truncate_zero_copy_holders(size_t to_size) {
     if (to_size <= host_callback_zero_copy_holders_.size()) {
-        // resize 前先 mark_released,保持 owner tree 的状态迁移语义。
+        // mark_released 只是 cosmetic(下一行 resize 立即丢)。但保留语义,
+        // 给将来 dump_resources 在退栈瞬间能看到 Released 留个 hook 点。
         for (size_t i = to_size; i < host_callback_zero_copy_holders_.size(); ++i) {
             host_callback_zero_copy_holders_[i].mark_released();
         }
@@ -3477,7 +3735,7 @@ void RpuKernelGraph::truncate_zero_copy_holders(size_t to_size) {
 }
 
 // =============================================================================
-// Tier3 transient buffer owner tree 注册 / 反查
+// G3 m2-4 — Tier3 transient buffer owner tree 注册 / 反查
 // =============================================================================
 
 size_t RpuKernelGraph::register_tier3_transient_buffer(
@@ -3525,7 +3783,7 @@ void RpuKernelGraph::keep_alive(const at::Tensor& t) {
 }
 
 // =============================================================================
-// RECORDING 期 dev_addr → writer node 推断 helper
+// G3 m2-3 — RECORDING 期 dev_addr → writer node 推断 helper
 // =============================================================================
 
 void RpuKernelGraph::track_recording_writer_dev_addr(uint64_t dev_addr,

@@ -41,6 +41,12 @@ when the physical plan uses more rows.
 7. Record the requested and resolved plan with the exact release profile. Do
    not promote an adjacent length or model size from one passing example.
 
+A sticky prefill chunk override resolves to a capacity of 16 for a single-token
+decode. Both scalar EXACT and COMPLETE descriptor admission compare that
+request-local capacity without rewriting the stored prefill override; multi-token
+requests retain strict equality.
+[Fused planning implementation](../../src/core/fused_model_base.cpp)
+
 ## Stop conditions
 
 Stop before execution when no candidate fits the resource envelope, an exact
@@ -54,6 +60,6 @@ profile.
 - [Runtime configuration: TOML and `rpu_execution`](../../docs/runtime_config.md#toml-parameter-catalog)
 - [Architecture: planning and invalidation](../../docs/architecture.md#planning-and-invalidation-lifecycle)
 - [Architecture: SPM design](../../docs/architecture.md#spm-design)
-- [Model support](../../docs/model_support.md)
+- [Examples](../../docs/model_support.md)
 - [Public execution-configuration validator](../../python/rpu_backend/api/_execution.py)
 - [Fused model planning contract](../../src/core/fused_model_base.h)

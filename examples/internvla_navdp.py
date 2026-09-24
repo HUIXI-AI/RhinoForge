@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the source-only public InternVLA-N1 NavDP component."""
+"""Run the Supported (component scope) public NavDP profile."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from pathlib import Path
 import tomllib
 
 
-DEFAULT_CONFIG = Path(__file__).with_name("configs") / "internvla_navdp.toml"
+DEFAULT_CONFIG = Path(__file__).with_name("configs") / "internvla/navdp/fp16.toml"
 ENV_KEYS = {
     "RPU_LOG_LEVEL",
     "RPU_INTERNVLA_N1_ALLOW_NUMERIC_BLOCKED",
@@ -107,7 +107,7 @@ def main() -> int:
         location = model_config.get("checkpoint") or model_config["alias"]
         print(
             f"configuration OK: {args.config} "
-            f"({location}; source-only public NavDP component)"
+            f"({location}; support_scope=component)"
         )
         return 0
 
@@ -144,7 +144,7 @@ def main() -> int:
             sample_num=config["request"].get("sample_num", 4),
             seed=config["request"].get("seed", 0),
         )
-        print(f"normalized_action_shape={tuple(action.shape)} component_only=true")
+        print(f"normalized_action_shape={tuple(action.shape)} support_scope=component")
     finally:
         runtime.destroy()
     return 0

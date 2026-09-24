@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run text-only greedy decoding with a supported dense Qwen3.5 checkpoint."""
+"""Run text-only greedy decoding for a configured Qwen3.5 profile."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from pathlib import Path
 import tomllib
 
 
-DEFAULT_CONFIG = Path(__file__).with_name("configs") / "qwen3_5_0_8b.toml"
+DEFAULT_CONFIG = Path(__file__).with_name("configs") / "qwen3_5/text/0_8b/fp16.toml"
 
 
 def load_config(path: Path) -> dict:
@@ -26,6 +26,15 @@ def load_config(path: Path) -> dict:
 
 
 def main() -> int:
+    import sys
+    example_dir = str(Path(__file__).resolve().parent)
+    if example_dir not in sys.path:
+        sys.path.insert(0, example_dir)
+    from _common import maybe_run_catalog
+    result = maybe_run_catalog('qwen3_5', DEFAULT_CONFIG)
+    if result is not None:
+        return result
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--check-config", action="store_true")
@@ -40,9 +49,9 @@ def main() -> int:
 
 
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
     from rpu_backend.adapters.qwen3_5 import Qwen3_5Adapter
-    from rpu_backend.api import Qwen3_5Cache
+    from rpu_backend.api import Qwen3_5Cache, RPUModelForConditionalGeneration
     from rpu_backend.model_registry import model_path
 
     checkpoint = model_config.get("checkpoint") or str(
@@ -58,11 +67,11 @@ def main() -> int:
     ).input_ids
     max_new_tokens = config["generation"]["max_new_tokens"]
     max_seq_len = input_ids.shape[1] + max_new_tokens
-    model = AutoModelForCausalLM.from_pretrained(
+    model = RPUModelForConditionalGeneration.from_pretrained(
         checkpoint,
         dtype=torch.float16,
-        device_map="cpu",
-        low_cpu_mem_usage=True,
+        device=None,
+        rpu_execution=config.get("rpu_execution"),
         local_files_only=local_only,
         trust_remote_code=False,
     ).eval()

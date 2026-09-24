@@ -22,11 +22,10 @@ from numbers import Integral
 import torch
 
 from rpu_backend.api.cache import RPUCache
+from rpu_backend.api._execution import QWEN3_5_OPTIONAL_PADDING_CAP, QWEN3_5_TOTAL_PADDING_CAP
 
 
 _VALID_LAYER_TYPES = frozenset({"linear_attention", "full_attention"})
-QWEN3_5_OPTIONAL_PADDING_CAP = 64
-QWEN3_5_TOTAL_PADDING_CAP = 63 + QWEN3_5_OPTIONAL_PADDING_CAP
 
 
 def _positive_int(name: str, value) -> int:
@@ -37,13 +36,27 @@ def _positive_int(name: str, value) -> int:
     return int(value)
 
 
+def qwen3_5_kv_replication(config, num_cores: int = 8) -> int:
+    """One cold profile geometry for both cache allocation and native weights."""
+    from rpu_backend.adapters.qwen3_5.quant_scope import validate_legacy_text_profile
+
+    tc = getattr(config, "text_config", config)
+    nkv = _positive_int("num_key_value_heads", tc.num_key_value_heads)
+    if validate_legacy_text_profile(config):
+        # The controlled 27B route duplicates each original KV head for all
+        # its queries. GQA=1 avoids the accumulated SDPA product=6 erratum at
+        # C128. The native planner still checks its actual SPM/SDPA domain.
+        return int(tc.num_attention_heads) // nkv
+    return num_cores // nkv if nkv < num_cores and num_cores % nkv == 0 else 1
+
+
 class Qwen3_5Cache(RPUCache):
     """RPUCache (KV for full layers) + per-GDN-layer recurrent_state + conv_state."""
 
     def __init__(self, num_layers, batch_size, max_seq_len,
                  num_kv_heads, head_dim, layer_types,
                  num_v_heads, key_head_dim, value_head_dim, conv_dim, conv_kernel_dim,
-                 attn_tp=8, device="rpu", dtype=torch.float16):
+                 attn_tp=8, device="rpu", dtype=torch.float16, *, num_cores=8):
         num_layers = _positive_int("num_layers", num_layers)
         logical_max_seq_len = _positive_int("max_seq_len", max_seq_len)
         num_v_heads = _positive_int("num_v_heads", num_v_heads)
@@ -68,10 +81,16 @@ class Qwen3_5Cache(RPUCache):
                 f"Qwen3_5Cache unsupported layer_types {invalid_types}; "
                 f"expected only {sorted(_VALID_LAYER_TYPES)}"
             )
-        num_cores = 8
-        if conv_dim % num_cores != 0:
+        from rpu_backend.adapters.qwen3_5.cores import core_topology, topology_tuple
+        topology = core_topology({"model": {"num_cores": num_cores}})
+        gdn_cores = topology.attn_tp
+        if topology.num_cores != 8 and (attn_tp != topology.attn_tp or batch_size != 1):
+            raise ValueError("reduced Qwen3_5Cache requires B1 and its fixed attention core count")
+        self.execution_topology = topology_tuple(topology)
+        self.gdn_num_cores = gdn_cores
+        if conv_dim % gdn_cores != 0:
             raise ValueError(
-                f"Qwen3_5Cache conv_dim must be divisible by 8, got {conv_dim}"
+                f"Qwen3_5Cache conv_dim must be divisible by {gdn_cores}, got {conv_dim}"
             )
         # Route-B first adds up to 63 mandatory rows for the 64-row GDN grid,
         # then may spend the public optional budget. Keep the public horizon
@@ -103,7 +122,7 @@ class Qwen3_5Cache(RPUCache):
         # the reordered [2q|2k|2v] block (see adapter weight prep). conv_dim must
         # be divisible by num_cores.
         self.conv_states = [
-            torch.zeros(num_cores, conv_kernel_dim, conv_dim // num_cores,
+            torch.zeros(gdn_cores, conv_kernel_dim, conv_dim // gdn_cores,
                         device=device, dtype=dtype)
             if _is_gdn(t) else empty
             for t in layer_types]
@@ -112,10 +131,11 @@ class Qwen3_5Cache(RPUCache):
 
         # DDR optimization: only full-attention layers use the 7-D KV cache; GDN
         # (`linear_attention`) layers carry recurrent+conv state and NEVER touch KV.
-        # The fused forward dereferences k_caches[layer_idx] only for a full
-        # attention layer, so an empty tensor at a GDN index is never indexed.
-        # Conversely, gdn_states/conv_states are empty at full-attention layers.
-        # The base RPUCache
+        # The fused C++ forward derefs (*ctx().k_caches)[layer_idx] ONLY inside
+        # build_full_attention, gated by layer_is_full_[layer_idx]
+        # (rpu_qwen3_5_model.cpp:197 → :354-355), so an empty tensor at a GDN index
+        # is never indexed. This mirrors the already-validated pattern where
+        # gdn_states/conv_states are `empty` at full-attn layers. base RPUCache
         # allocated all 32 layers above; drop the ~75% (4B: 24/32) that are GDN.
         # Cost: super().__init__ momentarily peaks at the full allocation before
         # these are freed (fine on a large-DDR board; switch to lazy alloc only if
@@ -156,15 +176,16 @@ class Qwen3_5Cache(RPUCache):
 
     @classmethod
     def from_config(cls, text_config, max_seq_len, device="rpu",
-                    dtype=torch.float16):
-        NUM_CORES = 8
+                    dtype=torch.float16, *, num_cores=8):
+        from rpu_backend.adapters.qwen3_5.cores import validate_core_profile
+        topology = validate_core_profile(text_config, {"model": {"num_cores": num_cores}})
+        NUM_CORES = topology.attn_tp
         max_seq_len = _positive_int("max_seq_len", max_seq_len)
         nkv = _positive_int(
             "num_key_value_heads", text_config.num_key_value_heads
         )
-        # Full-attention KV heads are replicated to ``nkv_eff == NUM_CORES``
-        # (one complete KV head per core). GDN states are unaffected.
-        kv_rep = NUM_CORES // nkv if (nkv < NUM_CORES and NUM_CORES % nkv == 0) else 1
+        # Share the exact installed geometry with the text weight path.
+        kv_rep = qwen3_5_kv_replication(text_config, NUM_CORES)
         nkv_eff = nkv * kv_rep
         attn_tp = NUM_CORES             # full-attn now runs on all 8 cores (replicated KV)
         nvh = _positive_int(
@@ -181,7 +202,7 @@ class Qwen3_5Cache(RPUCache):
         )
         # No GQA weight replication: q/k stay at nkh heads (the nkh→nvh expansion is
         # a runtime tile in build_gdn_mixer). conv_dim uses TRUE nkh — matches
-        # the text adapter's ``gdn_conv_dim`` and the native mixer (8192 for 4B).
+        # gdn_conv_dim in qwen3_5.py and gdn_conv_dim_ in the C++ mixer (8192 for 4B).
         conv_dim = 2 * (nkh * kdim) + nvh * vdim
         return cls(
             num_layers=_positive_int(
@@ -200,5 +221,29 @@ class Qwen3_5Cache(RPUCache):
             conv_kernel_dim=_positive_int(
                 "linear_conv_kernel_dim", text_config.linear_conv_kernel_dim
             ),
-            device=device, dtype=dtype,
+            device=device, dtype=dtype, num_cores=topology.num_cores,
         )
+
+    @classmethod
+    def from_model(cls, model, max_seq_len, device="rpu", dtype=torch.float16):
+        """Allocate KV/GDN state for this installed model's cold core layout."""
+        from rpu_backend.adapters.qwen3_5.cores import core_topology, topology_tuple
+
+        fusion = getattr(model, "model", model)
+        inner = getattr(fusion, "language_model", fusion)
+        state = getattr(inner, "_rpu_qwen3_5", None)
+        installed = getattr(state, "execution_topology", None)
+        execution = getattr(model, "_rpu_execution", None)
+        if execution is None:
+            # Direct text installation retains the cold configuration on its
+            # runtime state; only the public wrapper publishes _rpu_execution.
+            execution = getattr(state, "execution_config", None)
+        expected = (core_topology(execution)
+                    if execution is not None or installed is None else installed)
+        if installed is not None and topology_tuple(installed) != topology_tuple(expected):
+            raise ValueError("Qwen3.5 model config no longer matches its installed core layout")
+        if expected.num_cores != 8 and installed is None:
+            raise ValueError("reduced Qwen3.5 cache requires a completely installed model")
+        config = getattr(model.config, "text_config", model.config)
+        return cls.from_config(config, max_seq_len=max_seq_len, device=device, dtype=dtype,
+                               num_cores=expected.num_cores)

@@ -1,28 +1,27 @@
 """rpu_backend.runtime — internal framework layer (debug, weights, registry, decoder, hw_attrs, control).
 
 This subpackage MUST NOT import from rpu_backend.adapters or rpu_backend.api
-(the dependency direction is adapters/API → runtime).
+(CI: scripts/check_import_graph_v5.py).
 
-**Error classes owned here**:
-``RPUBackendError`` (base) + ``RPUConfigError`` + ``UnsupportedModelError`` are
-the canonical home for the 2 error classes that ``runtime/`` itself raises
-(via ``hw_attrs.validate_pre/postinstall`` and ``registry.get_adapter``).
+Error classes owned here:
+``RPUBackendError`` (base), ``RPUConfigError``, ``UnsupportedModelError``, and
+``PlannerRejectError`` are the canonical runtime-owned error classes raised by
+the hardware validator, adapter registry, and execution planner.
 ``rpu_backend.api.errors`` re-exports them so the user-facing surface remains
-``from rpu_backend.api.errors import RPUConfigError``.
-The other 5 error classes (``RPUUnsupportedDtypeError``, ``RPUSingleHandleError``,
+``from rpu_backend.api.errors import RPUConfigError`` (ADR §10 #1 unchanged).
+The other 4 error classes (``RPUUnsupportedDtypeError``, ``RPUSingleHandleError``,
 ``SPMExhaustionError``, ``WeightShapeMismatchError``) stay owned in ``api/errors.py``
 because ``runtime/`` does not raise them.
 """
 
 
-class RPUBackendError(Exception):
-    """Base for all rpu_backend errors raised inside library surfaces."""
+from rpu_backend.runtime._errors import RPUBackendError
 
 
 class RPUConfigError(RPUBackendError):
-    """Invalid `_rpu_*` per-instance hardware-attribute configuration.
+    """Invalid `_rpu_*` per-instance hardware-attribute configuration (A9).
 
-    Raised by the validator in ``rpu_backend.runtime.hw_attrs`` when:
+    Raised by the A9 validator in ``rpu_backend.runtime.hw_attrs`` when:
       - A pre-existing ``_rpu_*`` not in ``PUBLIC_HW_ATTRS`` /
         ``INTERNAL_HW_ATTRS_TRANSITIONAL`` is detected during pre-stamp scan
         (``validate_preinstall``).
@@ -38,7 +37,7 @@ class RPUConfigError(RPUBackendError):
 
 
 class UnsupportedModelError(RPUBackendError):
-    """HF architecture not in the adapter registry or outside its size envelope.
+    """HF architecture not in adapter registry, or size above Phase 2 envelope.
 
     Raised by ``rpu_backend.runtime.registry.get_adapter``. Re-exported from
     ``rpu_backend.api.errors``.
@@ -49,6 +48,7 @@ from rpu_backend.runtime import (  # noqa: F401, E402
     control,
     debug,
     decoder,
+    execution_planner,
     hw_attrs,
     registry,
     weights,
@@ -59,11 +59,13 @@ from rpu_backend.runtime import (  # noqa: F401, E402
 # already-imported subpackage, so it also works in the host-only unit tests that
 # load one adapter source file with `rpu_backend.runtime` stubbed in sys.modules.
 from rpu_backend.runtime.control import rpu_env_bool  # noqa: F401, E402
+from rpu_backend.runtime.execution_planner import PlannerRejectError  # noqa: F401, E402
 
 __all__ = [
     "control",
     "debug",
     "decoder",
+    "execution_planner",
     "hw_attrs",
     "registry",
     "weights",
@@ -71,4 +73,5 @@ __all__ = [
     "RPUBackendError",
     "RPUConfigError",
     "UnsupportedModelError",
+    "PlannerRejectError",
 ]

@@ -7,7 +7,7 @@
 //   Reshape as [1, cin*H*W] → pad tail by (cin_padded - cin)*H*W → [1, cin_padded*H*W]
 //   (appending zero-filled channels is equivalent to tail-padding the flattened view)
 //
-// Register mapping for the normal variant:
+// Register mapping:
 //   params[0]    = normal_blk_n          (N per grid block)
 //   params[1]    = last_blk_n            (last block's N count)
 //   params[2:3]  = C                     (input last dim, 32-bit split)
@@ -44,12 +44,14 @@ static void setup_pad_regs(
 {
     int dwidth = 2;  // fp16
 
-    // Partition N rows across the configured launch grid.
+    // Grid blocking: N rows across grid_x blocks
     int normal_blk_n, last_blk_n;
     if (N <= 16) {
         normal_blk_n = 1;
+        // grid_x = N (passed from caller)
     } else {
         normal_blk_n = (int)(N / 16);
+        // grid_x = 16 (passed from caller)
     }
     last_blk_n = (int)(N - (int64_t)normal_blk_n * (grid_x - 1));
 
@@ -105,7 +107,7 @@ void rpu_launch_pad_channel_spm(
       // register params to all cores; without it only core 0 gets them.
       // The num_cores==1 branch is left byte-identical to the pre-multicore
       // code (no set_broadcast_mode call) — on a 1-core launch that flag still
-      // carries meaning for some kernels (see rpu_rope.cpp), so single-core
+      // carries meaning for some kernels (see rpu_rope.cpp:39), so single-core
       // callers must keep inheriting whatever the queue already had.
       auto* wq = GET_QUEUE(num_cores);
       if (num_cores > 1) {

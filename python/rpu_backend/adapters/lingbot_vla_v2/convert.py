@@ -3,13 +3,14 @@
 Reads the OFFICIAL stacked-expert safetensors layout directly and produces the fp16 RPU
 weight set consumed by the `lingbot_v2_moe_*` op family.
 
-⚠️  IMPORT CONTRACT: this module MUST stay importable on a host with NO RPU.
+⚠️  IMPORT CONTRACT (deliverable 5): this module MUST stay importable on a host with NO RPU.
     There is NO module-level `import rpu_backend` (importing the package loads the built .so,
     whose module init touches /dev/rpu). Every rpu_backend symbol is imported INSIDE the
     function that needs it, and only the RPU-building functions do so. The CPU-only surface
     (`ckpt_reader`, `load_moe_layer_weights`, `expert_slice`, `load_host_weights`, `SWIZZLE_PLAN`)
-    is pure torch + safetensors and can be loaded with no RPU present. Keep it that way: do NOT
-    add a module-level rpu_backend import or relative (`from .x import`) imports.
+    is pure torch + safetensors, so `tests/model/test_lingbot_vla_v2_moe_cpu.py` can exec this
+    file standalone (spec_from_file_location) with no RPU present. Keep it that way: do NOT add
+    a module-level rpu_backend import and do NOT add relative (`from .x import`) imports.
 
 Stacked expert layout (bare nn.Parameter — NO `.weight` suffix; Qwen2FusedExperts):
     mlp.experts.gate_proj [E=32, 512, 768]   -> expert e's Linear(768->512).weight = stacked[e]
@@ -20,8 +21,9 @@ Stacked expert layout (bare nn.Parameter — NO `.weight` suffix; Qwen2FusedExpe
     mlp.shared_expert.{gate,up}_proj.weight [704, 768]
     mlp.shared_expert.down_proj.weight      [768, 704]
 
-Convert to fp16 before swizzling, never after. Every builder below follows
-half -> (pad) -> swizzle -> .to('rpu'). Build constant tensors on CPU before moving them to RPU.
+Pitfall P1 (docs/pitfalls.md:304-330) — `.half()` BEFORE swizzle, never after. Swizzle-before-half
+gives e2e cos -0.19. Every builder below is written half -> (pad) -> swizzle -> .to('rpu').
+Pitfall B-1 — never `torch.ones/zeros(device='rpu')`; build on CPU then `.to('rpu')`.
 """
 from __future__ import annotations
 
@@ -32,11 +34,11 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 
-# ---- checkpoint key prefixes ----
+# ---- checkpoint key prefixes (verified against the v2-6b safetensors index: 1708 tensors) ----
 VLM_P = "model.qwenvl_with_expert.qwenvl.model."
 EXP_P = "model.qwenvl_with_expert.qwen_expert.model."
 
-# ---- action-expert geometry for the supported public profile ----
+# ---- action-expert geometry (AUTHORITATIVE: lingbotvla_cli.kuavo_v2_depth.local.yaml) ----
 EXP_LAYERS = 36
 EXP_HID = 768
 NQ, NKV, HD = 32, 8, 128        # SAME head geometry as the VLM => shared prefix-KV cache works
@@ -49,10 +51,10 @@ ROUTED_INTER = 512
 SHARED_INTER = 704
 # 704 is not a multiple of 128, which 8-core col-swizzle requires (N % (16*8) == 0). Zero-pad to
 # 768 is NUMERICALLY EXACT for SwiGLU: the padded gate/up rows produce silu(0)*0 = 0, and the
-# padded down_proj columns multiply those zeros.
+# padded down_proj columns multiply those zeros. cf. V1 runtime.py:51 EXP_INTER_PAD (2752->2816).
 SHARED_INTER_PAD = 768
 ROUTED_SCALING = 4.0
-NORM_TOPK_PROB = True           # fixed by the model's MoE contract
+NORM_TOPK_PROB = True           # hardcoded by _install_moe_blocks (modeling_lingbot_vla_v2.py:180-186)
 ROUTER_ACTIVATION = "sigmoid"
 
 # ---- action / flow-matching ----
@@ -64,15 +66,24 @@ NUM_STEPS = 10
 # ---- core / partition plan ----
 ATTN_TP = 8                     # C++ attn_tp() == min(NUM_CORES, num_kv_heads) == min(8, 8) == 8
 MLP_CORES = 8
-ROUTER_CORES = 1                # the router GEMM is emitted on core 0 only
+ROUTER_CORES = 1                # the router GEMM is emitted core-0 only (rpu_lingbot_v2_moe_model.cpp:275-280)
 
 
 # =============================================================================
-# Per-checkpoint geometry.
+# Per-checkpoint geometry (stop hard-coding kuavo_v2 — P0 follow-up).
 #
-# The constants above are the default geometry. `resolve_geometry(...)` reads a
-# checkpoint's YAML when provided and validates every shape- and math-affecting
-# field against the checkpoint and native runtime. ``geom=None`` uses the defaults.
+# The constants above are the AUTHORITATIVE kuavo_v2_depth defaults. A DIFFERENT
+# lingbot-vla-v2 checkpoint ships its OWN lingbotvla_cli.yaml with its own MoE /
+# action geometry. `resolve_geometry(...)` reads those from the YAML (falling back
+# to these defaults when none is given) and cross-checks them against the
+# checkpoint's real tensor shapes + the as-built .so's fixed assumptions.
+#
+# WHY THIS MATTERS: shape-only params (experts/inter/dims) already fail a shape
+# check on a mismatched checkpoint, but VALUE-only params (top_k / routed_scaling /
+# router_activation / chunk_size) were SILENTLY wrong. resolve_geometry makes every
+# one of them fail LOUD instead. build_expert_moe / load_moe_layer_weights /
+# load_host_weights accept the resolved dict via `geom=`; with geom=None they use
+# these defaults, so every existing caller and the CPU golden test are unchanged.
 # =============================================================================
 _GEOM_KEYS = (
     "EXP_LAYERS", "EXP_HID", "NQ", "NKV", "HD", "RMS_EPS",
@@ -84,12 +95,12 @@ _GEOM_KEYS = (
 
 
 def _default_geom() -> dict:
-    """Return the built-in public checkpoint geometry."""
+    """The hard-coded kuavo_v2 defaults as a dict (single source of truth = the module consts)."""
     return {k: globals()[k] for k in _GEOM_KEYS}
 
 
 # =============================================================================
-# Explicit per-tensor classification.
+# Explicit per-tensor classification (P1 / RC-3).
 #
 # EVERY Linear-like tensor in the action expert is classified here as either
 # swizzled-and-fused (-> RPU, with an exact swizzle + core count) or KEPT OUT
@@ -126,11 +137,21 @@ SWIZZLE_PLAN: dict[str, dict] = {
     "post_attention_layernorm.beta.weight":  dict(shape=(EXP_HID, EXP_HID), swizzle="HOST", cores=0, dest="host:norm_W"),
     "post_attention_layernorm.beta.bias":    dict(shape=(EXP_HID,),         swizzle="HOST", cores=0, dest="host:norm_W"),
     # ---------------- MoE router (per layer) ----------------
-    # The native contract requires router_gate_w and router_bias as fp16 RPU
-    # tensors. The gate matrix is single-core COL-swizzled because the router
-    # linear uses partition=1 and num_cores=1. The router accumulates in fp32,
-    # while its operands remain fp16; reduced operand precision can still affect
-    # top-k selection.
+    # ⚠️ DEVIATION FROM THE PORT BRIEF, forced by the as-built C++ contract.
+    # The brief said "router gate.weight must stay FP32 and must NOT be swizzled". The as-built
+    # kernel disagrees on BOTH counts and would throw / silently misread if we obeyed the brief:
+    #   * rpu_lingbot_v2_moe_model.cpp:110-119 TORCH_CHECKs router_gate_w AND router_bias are
+    #     `fp16 RPU` (at::kHalf + kPrivateUse1). An fp32 tensor raises at set_weights.
+    #   * rpu_lingbot_v2_moe_model.cpp:275-280 feeds router_gate_[L] straight into
+    #     rpu_launch_linear_spm_to_spm_kernel(..., partition=1, num_cores=1), i.e. it expects a
+    #     SINGLE-CORE COL-SWIZZLED operand. An un-swizzled matrix is read in the wrong order
+    #     (silent corruption — exactly the RC-3 failure the brief warns about).
+    #   * rpu_lingbot_v2_moe_model.h:73 documents the intent: "single-core col-swizzled fp16 RPU".
+    # The kernel does use the acc32 (not acc16) linear for the router — "highest-precision router
+    # available" per its [D1] comment — but the OPERANDS are fp16. The CPU reference deliberately
+    # runs this GEMM in TRUE fp32 (lb2_moe_reference.py:146, autocast disabled) because bf16/fp16
+    # router logits can flip the top-k selection. That fp16-router top-k-flip risk is REAL and is
+    # reported as an open item; it is NOT something the Python side can fix unilaterally.
     "mlp.gate.weight":              dict(shape=(NUM_EXPERTS, EXP_HID), swizzle="col", cores=ROUTER_CORES, dest="router_gate_w"),
     "mlp.e_score_correction_bias":  dict(shape=(NUM_EXPERTS,),         swizzle=None,  cores=0, dest="router_bias"),
     # ---------------- MoE routed experts (per layer, stacked [E, out, in]) ----------------
@@ -148,10 +169,10 @@ SWIZZLE_PLAN: dict[str, dict] = {
     "mlp.shared_expert.down_proj.weight": dict(shape=(EXP_HID, SHARED_INTER), swizzle="row", cores=MLP_CORES,
                                                dest="shared_down_w", pad=(EXP_HID, SHARED_INTER_PAD)),
     # ---------------- expert final norm (model-level, not per layer) ----------------
-    # final_norm_adanorm=false selects plain RMSNorm; the checkpoint has no norm.gamma/beta.
+    # final_norm_adanorm: false (YAML:45) => plain RMSNorm; the checkpoint has no norm.gamma/beta.
     "norm.weight": dict(shape=(EXP_HID,), swizzle=None, cores=0, dest="final_norm_w", model_level=True),
     # ---------------- host-only heads (KEPT OUT of the RPU entirely) ----------------
-    # The default Euler loop is the host loop, so the suffix
+    # The mandated default Euler loop is the HOST loop (V1's proven default), so the suffix
     # encoders + the action head run as CPU fp32 F.linear and are never swizzled/uploaded.
     "model.state_proj":         dict(shape=(EXP_HID, STATE_DIM),      swizzle="HOST", cores=0, dest="host:head_W"),
     "model.action_in_proj":     dict(shape=(EXP_HID, ACTION_DIM),     swizzle="HOST", cores=0, dest="host:head_W"),
@@ -234,7 +255,8 @@ def expert_slice(stacked: torch.Tensor, e: int) -> torch.Tensor:
     """THE stacked-expert contract: expert e's Linear.weight is `stacked[e]`.
 
     `stacked` is [E, out, in] (gate/up: [32,512,768]; down: [32,768,512]). This is the single
-    place that defines the mapping used by the RPU builder and CPU-only consumers.
+    place that defines the mapping; the RPU builder and the CPU golden test both go through it,
+    so the test genuinely validates what the converter uploads.
     """
     if stacked.dim() != 3:
         raise ValueError(f"expert_slice: expected a stacked 3-D [E,out,in] tensor, got {tuple(stacked.shape)}")
@@ -247,8 +269,8 @@ def load_moe_layer_weights(ckpt_path_or_gw, layer: int, geom=None) -> dict[str, 
     """Read ONE layer's MoE weights (CPU fp32), shape-verified against the authoritative YAML.
 
     Accepts either a checkpoint dir path or an existing `gw` getter. Pure CPU — this is the
-    function remains usable without an RPU. `geom` (from resolve_geometry) overrides the module
-    defaults per checkpoint; ``geom=None`` uses the built-in public defaults.
+    function the golden test exercises. `geom` (from resolve_geometry) overrides the module
+    defaults per-checkpoint; geom=None ⇒ the kuavo_v2 defaults (unchanged behaviour).
     """
     _g = geom if geom is not None else _default_geom()
     NUM_EXPERTS = _g["NUM_EXPERTS"]; EXP_HID = _g["EXP_HID"]
@@ -330,7 +352,7 @@ def load_host_weights(gw, geom=None) -> tuple[dict, dict]:
 
     head_W  — suffix encoders + action head (host Euler loop; never uploaded).
     norm_W  — per-layer AdaRMS `.weight` + gamma/beta [768,768] linears (host fold).
-    `geom` sets the layer count per checkpoint; ``None`` uses public defaults.
+    `geom` (resolve_geometry) sets the layer count per-checkpoint; None ⇒ kuavo_v2 default.
     """
     EXP_LAYERS = (geom if geom is not None else _default_geom())["EXP_LAYERS"]
     head_W = {k: gw(k) for k in HEAD_KEYS}
@@ -355,16 +377,16 @@ def load_align_weights(gw) -> dict:
 def resolve_geometry(gw=None, *, training_config_path=None, ckpt_dir=None) -> dict:
     """Resolve the action-expert geometry for THIS checkpoint (pure CPU: yaml + safetensors).
 
-    Order:  built-in public checkpoint defaults
+    Order:  hard-coded kuavo_v2 defaults
             -> overridden by `training_config_path` (the checkpoint's lingbotvla_cli.yaml),
                or a `lingbotvla_cli*.yaml` auto-found in `ckpt_dir`
             -> validated against the checkpoint's real tensor shapes (`gw`) and the as-built
                .so's fixed assumptions.
     Fails LOUD on any mismatch instead of building a silently-wrong graph. With no YAML it
-    returns the built-in public defaults unchanged.
+    returns the defaults unchanged, so the kuavo_v2 build stays bit-identical.
     """
     geom = _default_geom()
-    src = "built-in public defaults"
+    src = "hard-coded kuavo_v2 defaults"
     yaml_path = training_config_path
     if yaml_path is None and ckpt_dir is not None:
         cands = sorted(glob.glob(os.path.join(ckpt_dir, "lingbotvla_cli*.y*ml")))
@@ -470,8 +492,8 @@ def verify_head_partition() -> tuple[int, int]:
     (roundup16). This asserts `get_linear_partition(768, 64, fp16) != -1`. Returns (pad, partition).
 
     NOTE: importing `rpu_backend.runtime.weights` pulls the rpu_backend package (and its .so), so
-    this is NOT callable on an RPU-less host. The default
-    runtime keeps the action head on the host in fp32, so 55->64
+    this is NOT callable on an RPU-less host and is NOT called by the CPU golden test. The DEFAULT
+    runtime keeps the action head on the HOST in fp32 (V1's proven default Euler loop), so 55->64
     is currently an unexercised contract kept here for a future on-device head.
     """
     from rpu_backend.runtime.weights import get_linear_partition
@@ -489,7 +511,7 @@ def verify_head_partition() -> tuple[int, int]:
 # RPU-touching surface (rpu_backend imported lazily, inside the functions)
 # =============================================================================
 def _h(t: torch.Tensor) -> torch.Tensor:
-    """fp32/any -> fp16 RPU contiguous; callers swizzle only after ``.half()``."""
+    """fp32/any -> fp16 RPU contiguous. P1: callers must have swizzled AFTER .half() already."""
     return t.detach().to(torch.float16).to("rpu").contiguous()
 
 
@@ -529,11 +551,12 @@ def _q(t: torch.Tensor) -> torch.Tensor:
 def _build_rope_tables(head_dim: int, theta: float, max_seq: int):
     """1-D RoPE cos/sin tables, fp16 RPU, shape [max_seq, head_dim/2]... (kernel format [max_seq, half*?]).
 
-    ``theta`` is the VLM's rope_theta (5e6 for Qwen3-VL-4B), not a separately
-    owned action-expert value: the VLM rotary embedding rotates the expert q/k.
-    Plain 1-D is exact for the suffix because all three M-RoPE axes receive the
-    same suffix positions, reducing interleaved M-RoPE sections [24,20,20] to
-    ordinary 1-D RoPE.
+    ⚠️ theta is the VLM's rope_theta (5e6 for Qwen3-VL-4B), NOT V1's 10000. The action expert does
+    NOT own its RoPE: modeling_lingbot_vla_v2.py:275-277 `apply_mrope` rotates the expert's q/k with
+    `self.qwenvl.model.language_model.rotary_emb`. Inheriting V1's ROPE_BASE=10000 here would be
+    silently wrong. Plain 1-D is nonetheless EXACT for the suffix: _build_full_position_ids
+    (:741-747) gives the suffix identical position values on all three M-RoPE axes, and all-equal
+    axes reduce interleaved M-RoPE (section [24,20,20]) to plain 1-D RoPE.
     """
     inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.float64) / head_dim))
     pos = torch.arange(max_seq, dtype=torch.float64)
@@ -545,22 +568,23 @@ def _build_rope_tables(head_dim: int, theta: float, max_seq: int):
 
 
 def build_expert_moe(
-    gw, *, max_seq: int, rope_theta: float, geom=None, on_handle_created=None
+    gw, *, max_seq: int, rope_theta: float, runtime_config,
+    geom=None, on_handle_created=None
 ):
     """Build the LingBot2 sparse-MoE action expert -> (handle, keep).
 
-    The order is load-bearing: .half() -> (F.pad) -> swizzle -> .to('rpu').
+    P1 ORDER IS LOAD-BEARING everywhere below: .half() -> (F.pad) -> swizzle -> .to('rpu').
 
     `keep` is the mandatory keepalive tuple: the C++ side holds raw pointers into these tensors
     (e.g. router_bias_[L].data_ptr<c10::Half>()), so dropping the Python refs frees DDR under a
     live handle. Store it on the policy and never let it go.
 
     `geom` (resolve_geometry) supplies the per-checkpoint geometry that is threaded into the C++
-    set_weights call below; ``geom=None`` uses the built-in public defaults.
+    set_weights call below; geom=None ⇒ the kuavo_v2 module defaults, so the build is unchanged.
 
     `on_handle_created`, when provided by the transactional runtime builder, is called
     immediately after native create and before any fallible setter. This publishes partial
-    ownership so an outer construction rollback can destroy the handle.
+    ownership as ``(handle, keep)`` so a failed rollback retains its tensors too.
     """
     from rpu_backend.runtime.weights import tp_col_swizzle_mc_weight, tp_row_swizzle_mc_weight
 
@@ -580,8 +604,8 @@ def build_expert_moe(
     router_bias_cpu = load_router_correction_biases(gw, geom=_g)
 
     # RPU_LINGBOT2_BASE_W8A16=1 — int8 the action expert's attention q/k/v/o and the SHARED
-    # expert gate/up/down. The router remains fp16 to preserve selection precision.
-    # Default OFF => fp16, unchanged.
+    # expert gate/up/down. The ROUTER is deliberately excluded (its N=32 GEMM is ~0.4% of the
+    # step and its precision is already the open blocker). Default OFF => fp16, unchanged.
     BASE_W8A16 = os.environ.get("RPU_LINGBOT2_BASE_W8A16") == "1"
     if BASE_W8A16:
         from rpu_backend.quant._common import quantize_linear_per_channel
@@ -659,10 +683,35 @@ def build_expert_moe(
 
     cos, sin = _build_rope_tables(HD, rope_theta, max_seq)
     final_norm_w = _h(gw(EXP_P + "norm.weight"))       # plain RMS (final_norm_adanorm: false)
+    grouped_experts_requested = (
+        os.environ.get("RPU_LINGBOT2_GROUPED_EXPERTS") == "1")
 
-    handle = torch.ops.rpu.lingbot_v2_moe_create()
+    from rpu_backend.runtime.control import rpu_env_bool
+
+    # Publish every native pointer's keepalive with the handle, before any
+    # fallible bind. The first twenty entries retain their public layout.
+    keep = (q_w, k_w, v_w, o_w, q_b, k_b, v_b, in_norm, post_norm,
+            sh_gate, sh_up, sh_down, router_gate, router_bias,
+            exp_gate, exp_up, exp_down, cos, sin, final_norm_w)
+    if BASE_W8A16:
+        keep += (q_ws, k_ws, v_ws, o_ws, shg_ws, shu_ws, shd_ws)
+    gate_packed, up_packed, down_packed = [], [], []
+    gate_scale, up_scale, down_scale = [], [], []
+    if grouped_experts_requested:
+        keep += (gate_packed, up_packed, down_packed, gate_scale, up_scale, down_scale)
+    handle = torch.ops.rpu.lingbot_v2_moe_create(
+        rpu_env_bool("RPU_ADARMS_FUSED_BCAST"),
+        runtime_config.bufonly,
+        runtime_config.addr,
+        runtime_config.schunk,
+        runtime_config.rchunk_requested,
+        runtime_config.dense_soft_router,
+        runtime_config.fp16_top4,
+        runtime_config.routed_only,
+        runtime_config.down_acc16,
+    )
     if on_handle_created is not None:
-        on_handle_created(handle)
+        on_handle_created(handle, keep)
     torch.ops.rpu.lingbot_v2_moe_set_weights(
         handle,
         q_w, k_w, v_w, o_w,
@@ -676,24 +725,19 @@ def build_expert_moe(
         exp_gate, exp_up, exp_down,
         NUM_EXPERTS, TOP_K, ROUTED_INTER,
         ROUTED_SCALING, N_ACTION + 1,          # chunk_size = 51 suffix rows (state + 50 actions)
+        grouped_experts_requested,
     )
-    keep = (q_w, k_w, v_w, o_w, q_b, k_b, v_b, in_norm, post_norm,
-            sh_gate, sh_up, sh_down, router_gate, router_bias,
-            exp_gate, exp_up, exp_down, cos, sin, final_norm_w)
     if BASE_W8A16:
         torch.ops.rpu.lingbot_v2_moe_set_base_scales(handle, q_ws, k_ws, v_ws, o_ws,
                                                      shg_ws, shu_ws, shd_ws)
-        keep = keep + (q_ws, k_ws, v_ws, o_ws, shg_ws, shu_ws, shd_ws)
     # ── GROUPED-EXPERTS opt-in: build core-slice-interleaved packed expert weights
     #    and bind them. Packed row/col order = c*(E*Ic) + e*Ic + s  (core c holds
     #    slice-c of EVERY expert), so the per-core packed GEMM computes all experts'
     #    slice-c at once and the routing weight w[seq,E] is identical on every core.
-    if os.environ.get("RPU_LINGBOT2_GROUPED_EXPERTS") == "1":
+    if grouped_experts_requested:
         from rpu_backend.runtime.weights import tp_col_swizzle_mc_weight, tp_row_swizzle_mc_weight
         NC = MLP_CORES
         Ic = ROUTED_INTER // NC
-        gate_packed, up_packed, down_packed = [], [], []
-        gate_scale, up_scale, down_scale = [], [], []
         # RPU_LINGBOT2_EXPERT_W8A16=1 — int8 the ROUTED expert gate/up/down only.
         # RPU_LINGBOT2_EXPERT_W4A16=1 — int4 (nibble-packed) the same three GEMMs. W4 wins over W8;
         #   if both are set W4 takes precedence. Both reuse the acc16 launcher's native int8/int4
@@ -745,7 +789,7 @@ def build_expert_moe(
                 # Expert-only W8A16. Reuses the shipped per-output-channel quantiser
                 # (rpu_backend.quant._common) and the acc16 GEMM's native int8-weight +
                 # fp16-scale path — no new quantisation machinery. int8 swizzles at
-                # dwidth=1.
+                # dwidth=1 (gr00t/runtime.py:85 does the same for its backbone).
                 # Only the ROUTED expert GEMMs are touched: router, attention, AdaRMS,
                 # shared expert, residual and the action head all stay fp16.
                 gq, gs = quantize_linear_per_channel(g_pk)
@@ -762,8 +806,6 @@ def build_expert_moe(
                 up_packed.append(_h(tp_col_swizzle_mc_weight(u_pk, NC)))
                 down_packed.append(_h(tp_row_swizzle_mc_weight(d_pk, NC)))
         torch.ops.rpu.lingbot_v2_moe_set_packed_weights(handle, gate_packed, up_packed, down_packed)
-        keep = keep + (gate_packed, up_packed, down_packed)
         if W8A16 or W4A16:
             torch.ops.rpu.lingbot_v2_moe_set_packed_scales(handle, gate_scale, up_scale, down_scale)
-            keep = keep + (gate_scale, up_scale, down_scale)
     return handle, keep

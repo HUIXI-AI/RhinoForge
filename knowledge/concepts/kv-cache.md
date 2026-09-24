@@ -30,6 +30,14 @@ Create the cache after model configuration is final, size it for the complete
 prefill-plus-decode envelope, and let the adapter advance or rewind its logical
 position. [CausalLM API](../../docs/api_reference.md#causal-language-models)
 
+## Prefix replacement
+
+HALO action-prefix replacement validates every layer and prepares the complete
+new K/V bank before publishing it. A failed validation or upload preserves the
+previous bank, position, and prefix epoch. A successful replacement advances
+the epoch used by the action Graph signature.
+[HALO runner](../../python/rpu_backend/adapters/halo/runtime.py)
+
 ## Sources
 
 - [API reference: `RPUCache`](../../docs/api_reference.md#rpucache)

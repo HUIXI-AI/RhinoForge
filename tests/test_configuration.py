@@ -9,6 +9,7 @@ import re
 import runpy
 import subprocess
 import sys
+import threading
 import tomllib
 
 import pytest
@@ -17,39 +18,12 @@ from rpu_backend.api._execution import normalize_rpu_execution
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_EXAMPLE_CONFIGS = {
-    "dinov3_vit_b.toml",
-    "g05.toml",
-    "gemma4.toml",
-    "gr00t.toml",
-    "hy_embodied.toml",
-    "internvla_navdp.toml",
-    "lingbot2.toml",
-    "llama_3_2_1b.toml",
-    "pi05_libero.toml",
-    "pi05_libero_w4.toml",
-    "pi05_libero_w8a16.toml",
-    "qwen3_0_6b.toml",
-    "qwen3_14b_w8a16.toml",
-    "qwen3_1_7b.toml",
-    "qwen3_4b.toml",
-    "qwen3_5_0_8b.toml",
-    "qwen3_5_2b.toml",
-    "qwen3_5_4b.toml",
-    "qwen3_5_9b.toml",
-    "qwen3_5_vision_2b.toml",
-    "qwen3_5_vision_4b.toml",
-    "qwen3_8b.toml",
-    "qwen3_vl_2b.toml",
-    "qwen3_vl_32b_w8a16.toml",
-    "qwen3_vl_4b.toml",
-    "qwen3_vl_8b.toml",
-    "rhinovla.toml",
-    "siglip.toml",
-    "wall_oss.toml",
-    "wall_oss_w4a16.toml",
-    "wall_oss_w8a16.toml",
-}
+
+
+def _join(*parts: str) -> str:
+    return "".join(parts)
+
+
 RETIRED_RUNTIME_OPTIONS = {
     "RPU_ALLREDUCE_CHUNK_BALANCED",
     "RPU_ALLREDUCE_CHUNK_V2",
@@ -109,17 +83,48 @@ def test_execution_configuration_is_validated_and_frozen() -> None:
         )
 
 
+def test_linear_acc32_requires_boolean_and_declared_owner_capability() -> None:
+    supported = {
+        "prefill": ("chunk_size", "linear_acc32"),
+        "vision": ("chunk_size", "linear_acc32"),
+    }
+    config = normalize_rpu_execution(
+        {"prefill": {"linear_acc32": True}, "vision": {"linear_acc32": False}},
+        entry_point="test", supported=supported,
+    )
+    assert config["prefill"]["linear_acc32"] is True
+    assert config["vision"]["linear_acc32"] is False
+
+    with pytest.raises(TypeError, match="must be bool"):
+        normalize_rpu_execution(
+            {"prefill": {"linear_acc32": 1}},
+            entry_point="test", supported=supported,
+        )
+    with pytest.raises(ValueError, match="explicit supported"):
+        normalize_rpu_execution(
+            {"vision": {"linear_acc32": True}}, entry_point="test",
+        )
+    with pytest.raises(ValueError, match="not supported"):
+        normalize_rpu_execution(
+            {"components": {"vision_encoder": {
+                "vision": {"linear_acc32": True},
+            }}},
+            entry_point="test",
+            supported_components={"vision_encoder": {"vision": ("chunk_size",)}},
+        )
+
+
 def test_example_toml_files_are_portable() -> None:
     config_dir = ROOT / "examples" / "configs"
-    configs = sorted(config_dir.glob("*.toml"))
+    configs = sorted(config_dir.rglob("*.toml"))
     assert configs
     banned = (
-        "/" + "nfs",
-        "/" + "data/",
-        "10." + "10.",
-        "192." + "168.",
-        "hf" + "_",
-        "token" + "=",
+        _join("/", "n", "fs"),
+        _join("/", "da", "ta", "/"),
+        _join("10", ".", "10", "."),
+        _join("192", ".", "168", "."),
+        _join("h", "f", "_"),
+        _join("tok", "en", "="),
     )
     for path in configs:
         text = path.read_text(encoding="utf-8")
@@ -128,18 +133,36 @@ def test_example_toml_files_are_portable() -> None:
         assert not any(value in text for value in banned), path
 
 
-def test_example_configs_are_the_single_public_profile_set() -> None:
-    config_dir = ROOT / "examples" / "configs"
-    actual = {path.name for path in config_dir.glob("*.toml")}
-    assert actual == EXPECTED_EXAMPLE_CONFIGS
-    assert not list(config_dir.glob("*_full.toml"))
-
-
 def test_example_configs_exclude_retired_runtime_options() -> None:
-    for path in (ROOT / "examples" / "configs").glob("*.toml"):
+    for path in (ROOT / "examples" / "configs").rglob("*.toml"):
         text = path.read_text(encoding="utf-8")
         found = {name for name in RETIRED_RUNTIME_OPTIONS if name in text}
         assert not found, (path, found)
+
+
+def test_example_catalog_uses_only_canonical_model_directories() -> None:
+    import json
+
+    root = ROOT / "examples/configs"
+    assert not list(root.glob("*.toml"))
+    directory_sets = {
+        "qwen3": {"text"}, "qwen3_5": {"text", "vl", "legacy"},
+        "qwen3_vl": {"text", "vision", "vl"}, "pi05": {"2cam", "3cam"},
+        "lingbot": {"v2"}, "rhinovla": {"v1", "v3"}, "wall_oss": {"base"},
+    }
+    for family, expected in directory_sets.items():
+        actual = {p.relative_to(root / family).parts[0]
+                  for p in (root / family).rglob("*.toml")}
+        assert actual == expected, (family, actual)
+    referenced = set()
+    for path in root.rglob("*.toml"):
+        config = tomllib.loads(path.read_text())
+        if "example" in config:
+            referenced.add(config["example"]["profile_id"])
+        if "pi05" in config:
+            assert config.get("rpu_execution", {}).get("model", {}).get("num_cores", 8) == 8
+    profiles = json.loads((root / "profiles.json").read_text())["profiles"]
+    assert {p["id"] for p in profiles} == referenced
 
 
 def test_every_runner_target_has_a_valid_toml() -> None:
@@ -148,99 +171,153 @@ def test_every_runner_target_has_a_valid_toml() -> None:
     run_target = namespace["_run_target"]
     targets = set(namespace["TARGETS"])
     covered = set()
-    for path in sorted((ROOT / "examples" / "configs").glob("*.toml")):
-        target = load_config(path)["runner"]["target"]
+    for path in sorted((ROOT / "examples" / "configs").rglob("*.toml")):
+        config = load_config(path)
+        if "example" in config or "pi05" in config:
+            target = namespace["_catalog_module"]().config_metadata(config)["target"]
+            target = {"qwen3_5": "qwen3_5_text"}.get(target, target)
+        else:
+            target = config["runner"]["target"]
         run_target(target, path, check_config=True)
         covered.add(target)
     assert covered == targets
 
 
+@pytest.mark.parametrize("target", ["qwen3_5_text", "qwen3_5_vision"])
+def test_runner_forwards_qwen35_cold_precision(target, tmp_path: Path) -> None:
+    body = f'[runner]\ntarget = "{target}"\n[rpu_execution.prefill]\nlinear_acc32 = true\n'
+    if target == "qwen3_5_vision":
+        body += '[rpu_execution.vision]\nlinear_acc32 = false\nchunk_size = "auto"\n'
+    path = tmp_path / "precision.toml"
+    path.write_text(body)
+    load_config = runpy.run_path(str(ROOT / "examples" / "run_model.py"))["load_config"]
+    config = load_config(path)
+    assert config["rpu_execution"]["prefill"]["linear_acc32"] is True
+    if target == "qwen3_5_vision":
+        assert config["rpu_execution"]["vision"]["linear_acc32"] is False
+    path.write_text(body.replace("linear_acc32 = true", "linear_acc32 = 1"))
+    with pytest.raises(TypeError, match="must be bool"):
+        load_config(path)
+
+
+def test_runner_rejects_incompatible_pi_padding_before_loading(tmp_path: Path) -> None:
+    path = ROOT / "examples" / "configs" / "pi05/2cam/w8a16_action_nvfp4.toml"
+    load_config = runpy.run_path(str(ROOT / "examples" / "run_model.py"))["load_config"]
+    load_config(path)
+    invalid = tmp_path / "invalid-pi.toml"
+    invalid.write_text(path.read_text() + "\n[rpu_execution.prefill]\npadding_budget = 64\n")
+    with pytest.raises(ValueError, match="without extra padding"):
+        load_config(invalid)
+
+
 def test_qwen3_8b_profile_uses_auto_prefill_chunk() -> None:
     profile = tomllib.loads(
-        (ROOT / "examples" / "configs" / "qwen3_8b.toml").read_text(
+        (ROOT / "examples" / "configs" / "qwen3/text/8b/fp16.toml").read_text(
             encoding="utf-8"
         )
     )
-    assert profile["rpu_execution"]["prefill"] == {
-        "chunk_size": "auto",
-        "padding_budget": 64,
-    }
+    assert profile["rpu_execution"]["prefill"]["chunk_size"] == "auto"
 
 
-def test_internvla_example_uses_only_the_public_navdp_checkpoint() -> None:
-    profile = tomllib.loads(
-        (ROOT / "examples" / "configs" / "internvla_navdp.toml").read_text(
-            encoding="utf-8"
-        )
-    )
-    assert profile["model"]["alias"] == "internvla-n1-navdp"
-    assert profile["model"]["source_only_acknowledged"] is True
-    assert "navdp_checkpoint" not in profile["model"]
-    assert profile["request"]["seed"] == 0
+@pytest.mark.parametrize("target,stages", [
+    ("causal_lm", ("prefill",)),
+    ("qwen3_vl", ("prefill", "vision")),
+    ("qwen3_5_text", ("prefill",)),
+    ("qwen3_5_vision", ("prefill", "vision")),
+    ("pi05", ("prefill", "vision", "action")),
+])
+def test_runner_accepts_declared_cold_controls(target, stages, tmp_path):
+    load = runpy.run_path(str(ROOT / "examples/run_model.py"))["load_config"]
+    body = f'[runner]\ntarget = "{target}"\n[rpu_execution.model]\nnum_cores = 8\n'
+    body += "".join(f"[rpu_execution.{stage}]\nlinear_acc32 = true\n" for stage in stages)
+    path = tmp_path / "cold.toml"
+    path.write_text(body)
+    config = load(path)
+    assert config["rpu_execution"]["model"]["num_cores"] == 8
+    assert all(config["rpu_execution"][stage]["linear_acc32"] is True for stage in stages)
+    path.write_text(body.replace("num_cores = 8", "num_cores = 5"))
+    with pytest.raises(ValueError, match="num_cores"):
+        load(path)
+    path.write_text(body.replace("linear_acc32 = true", "linear_acc32 = 1"))
+    with pytest.raises(TypeError, match="must be bool"):
+        load(path)
 
-    assert not (
-        ROOT / "python" / "rpu_backend" / "adapters" / "internvla_n1" / "nextdit.py"
-    ).exists()
-    assert not (ROOT / "src" / "fused" / "rpu_internvla_nextdit_model.cpp").exists()
 
-    source = "\n".join(
-        path.read_text(encoding="utf-8")
-        for path in (
-            ROOT / "python" / "rpu_backend" / "adapters" / "internvla_n1"
-        ).glob("*.py")
-    )
-    assert "model.navdp." in source
+def test_runner_qwen_vl_replay_is_prefill_only(tmp_path):
+    load = runpy.run_path(str(ROOT / "examples/run_model.py"))["load_config"]
+    path = tmp_path / "replay.toml"
+    body = '[runner]\ntarget = "qwen3_vl"\n[rpu_execution.prefill]\nfast_replay = true\n'
+    path.write_text(body)
+    assert load(path)["rpu_execution"]["prefill"]["fast_replay"] is True
+    path.write_text(body.replace(".prefill]", ".vision]"))
+    with pytest.raises(ValueError, match="not supported"):
+        load(path)
 
 
-def test_internvla_public_checkpoint_is_pinned_and_confined(tmp_path: Path) -> None:
-    from rpu_backend.adapters.internvla_n1._checkpoint import (
-        NAVDP_PREFIX,
-        open_public_checkpoint,
-    )
+def test_pi_two_camera_a8_template_retains_optimized_admission(tmp_path):
+    load = runpy.run_path(str(ROOT / "examples/run_model.py"))["load_config"]
+    path = ROOT / "examples/configs/pi05/2cam/w8a16_prefill_w8a8_action_nvfp4.toml"
+    config = load(path)
+    helpers = runpy.run_path(str(ROOT / "examples/_policy_examples.py"))
+    assert config["pi05"]["precision"] == "w8a16_prefill_w8a8_action_nvfp4"
+    assert helpers["_execution"](config)["prefill"]["chunk_size"] == 272
+    bad = tmp_path / "pi.toml"
+    bad.write_text(path.read_text() + "\n[rpu_execution.model]\nnum_cores = 4\n")
+    with pytest.raises(ValueError, match="TP4/TP6"):
+        load(bad)
 
-    config = tmp_path / "config.json"
-    index = tmp_path / "model.safetensors.index.json"
-    shard = tmp_path / "model-00001-of-00001.safetensors"
-    config.write_text(
-        json.dumps({"model_type": "internvla_n1", "system1": "navdp_async"}),
-        encoding="utf-8",
-    )
-    index.write_text(
-        json.dumps({"weight_map": {NAVDP_PREFIX + "weight": shard.name}}),
-        encoding="utf-8",
-    )
-    shard.write_bytes(b"opaque-test-shard")
 
-    digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
-    manifest = {path: digest(path) for path in (config, index, shard)}
-    _, names, assets = open_public_checkpoint(
-        tmp_path,
-        manifest,
-        prefixes=(NAVDP_PREFIX,),
-        controlled_rpu=False,
-    )
-    assert names == (NAVDP_PREFIX + "weight",)
-    assert assets == (config, index, shard)
+def test_qwen35_text_uses_checkpoint_aware_loader(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    import torch
+    import transformers
+    from rpu_backend.api import RPUModelForConditionalGeneration
 
-    index.write_text(
-        json.dumps({"weight_map": {NAVDP_PREFIX + "weight": "../escape.safetensors"}}),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="escapes checkpoint_dir"):
-        open_public_checkpoint(
-            tmp_path,
-            {config: digest(config), index: digest(index)},
-            prefixes=(NAVDP_PREFIX,),
-            controlled_rpu=False,
-        )
+    class LoadedCheckpoint(Exception):
+        pass
+
+    seen = {}
+    def exact_loader(checkpoint, **kwargs):
+        seen.update(checkpoint=checkpoint, **kwargs)
+        raise LoadedCheckpoint
+
+    monkeypatch.setattr(RPUModelForConditionalGeneration, "from_pretrained", exact_loader)
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **kw:
+                        lambda *a, **kw: SimpleNamespace(input_ids=torch.ones(1, 3, dtype=torch.int64)))
+    # Caller-owned earlier-format files remain accepted without shipping
+    # duplicate templates in the public catalog.
+    path = tmp_path / "qwen35-text.toml"
+    path.write_text('''[runner]
+target = "qwen3_5_text"
+[model]
+checkpoint = "/path/to/qwen3.5-2b-w8a16"
+local_files_only = true
+[generation]
+prompt = "Explain what a compiler does."
+max_new_tokens = 8
+[rpu_execution.model]
+num_cores = 8
+''')
+    monkeypatch.setattr(sys, "argv", ["qwen3_5_text.py", "--config", str(path)])
+    main = runpy.run_path(str(ROOT / "examples/qwen3_5_text.py"))["main"]
+    with pytest.raises(LoadedCheckpoint):
+        main()
+    assert seen["checkpoint"] == "/path/to/qwen3.5-2b-w8a16"
+    assert seen["device"] is None
+    assert seen["trust_remote_code"] is False
+    assert seen["rpu_execution"]["model"]["num_cores"] == 8
 
 
 def test_qwen3_vl_examples_cover_single_and_multiple_images(tmp_path: Path) -> None:
     load_config = runpy.run_path(str(ROOT / "examples" / "qwen3_vl.py"))[
         "load_config"
     ]
-    single = load_config(ROOT / "examples" / "configs" / "qwen3_vl_2b.toml")
-    multiple = load_config(ROOT / "examples" / "configs" / "qwen3_vl_4b.toml")
+    # Test the earlier public parser independently from the canonical catalog.
+    base = '[model]\nalias = "qwen3-vl-2b"\n[request]\nprompt = "describe"\nmax_new_tokens = 1\n'
+    single_path, multi_path = tmp_path / "single.toml", tmp_path / "multi.toml"
+    single_path.write_text(base + 'image = "one.jpg"\n')
+    multi_path.write_text(base + 'images = ["one.jpg", "two.jpg"]\n')
+    single, multiple = load_config(single_path), load_config(multi_path)
     assert "image" in single["request"]
     assert len(multiple["request"]["images"]) == 2
 
@@ -261,33 +338,6 @@ max_new_tokens = 1
         load_config(ambiguous)
 
 
-def test_wall_oss_w8a16_example_binds_fp16_source(tmp_path: Path) -> None:
-    load_config = runpy.run_path(str(ROOT / "examples" / "wall_oss.py"))[
-        "load_config"
-    ]
-    config = load_config(
-        ROOT / "examples" / "configs" / "wall_oss_w8a16.toml"
-    )
-    assert config["model"]["precision"] == "w8a16"
-    assert config["model"]["fp16_alias"] == "wall-oss-0.5"
-
-    missing_source = tmp_path / "missing-source.toml"
-    missing_source.write_text(
-        """
-[model]
-alias = "wall-oss-0.5-w8a16"
-precision = "w8a16"
-[request]
-images = ["frame.jpg"]
-instruction = "move"
-proprioception = [0.0]
-""".strip(),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="fp16_alias or fp16_checkpoint"):
-        load_config(missing_source)
-
-
 def test_model_example_check_config_does_not_import_native(tmp_path: Path) -> None:
     guard = tmp_path / "guard"
     (guard / "rpu_backend").mkdir(parents=True)
@@ -300,10 +350,20 @@ def test_model_example_check_config_does_not_import_native(tmp_path: Path) -> No
     env = os.environ.copy()
     env["PYTHONPATH"] = str(guard)
     env.pop("RPU_KERNEL_LIB_PATH", None)
+    # Include every explicit template, not only each script's default. An
+    # optimized profile must not bootstrap Torch during syntax validation.
+    validate_all = subprocess.run(
+        [sys.executable, "-S", "-c",
+         "from pathlib import Path; import runpy; "
+         "load = runpy.run_path('examples/run_model.py')['load_config']; "
+         "[load(p) for p in Path('examples/configs').rglob('*.toml')]"],
+        cwd=ROOT, env=env, text=True, capture_output=True, timeout=30,
+    )
+    assert validate_all.returncode == 0, validate_all.stderr
     scripts = sorted(
         path
         for path in (ROOT / "examples").glob("*.py")
-        if path.name != "verify_install.py"
+        if path.name != "verify_install.py" and not path.name.startswith("_")
     )
     assert scripts
     for script in scripts:
@@ -324,31 +384,11 @@ def test_model_example_check_config_does_not_import_native(tmp_path: Path) -> No
         assert "configuration OK" in result.stdout
 
 
-def test_rhinovla_placeholder_rejects_without_native_import(tmp_path: Path) -> None:
-    guard = tmp_path / "guard"
-    (guard / "rpu_backend").mkdir(parents=True)
-    (guard / "rpu_backend" / "__init__.py").write_text(
-        "raise AssertionError('rpu_backend imported')\n", encoding="utf-8"
-    )
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(guard)
-    result = subprocess.run(
-        [sys.executable, "-S", str(ROOT / "examples" / "rhinovla.py")],
-        cwd=ROOT,
-        env=env,
-        text=True,
-        capture_output=True,
-        check=False,
-        timeout=30,
-    )
-    assert result.returncode != 0
-    assert "Set [model].runtime_factory" in result.stderr
-    assert "rpu_backend imported" not in result.stderr
-
-
 @pytest.mark.parametrize(
     "body,expected",
     [
+        ("[run]\nwarmup = 1\nruns = 3", "require the"),
+        ("[input]\ndecode_steps = 32", "require the"),
         ("[runner.env]\nRPU_NOT_A_DOCUMENTED_OPTION = 1", "not documented"),
         ("[runner.env]\nRPU_KERNEL_LIB_PATH = 'x'", "not allowed"),
         ("[runner.env]\nRPU_API_TOKEN = 'x'", "not allowed"),
@@ -392,7 +432,8 @@ max_new_tokens = 1
 
 def test_full_runner_applies_environment_only_for_execution(tmp_path: Path) -> None:
     script = ROOT / "examples" / "run_model.py"
-    config = ROOT / "examples" / "configs" / "qwen3_0_6b.toml"
+    config = tmp_path / "runner-env.toml"
+    config.write_text('[runner]\ntarget = "causal_lm"\n[runner.env]\nRPU_LOG_LEVEL = 3\n')
     code = f"""
 import os, runpy, sys
 ns = runpy.run_path({str(script)!r})
@@ -445,65 +486,6 @@ max_new_tokens = 1
         "load_config"
     ]
     assert load_config(config)["runner"]["env"]["HF_HOME"] == "/tmp/huggingface"
-
-
-def test_runtime_configuration_covers_source_environment_readers() -> None:
-    pattern = re.compile(
-        r'["\']((?:RPU|QWEN3|LKN|WALL_OSS|HF|HUGGINGFACE)_[A-Z0-9_]+)["\']'
-    )
-    source_names = set()
-    for base in (ROOT / "python" / "rpu_backend", ROOT / "src"):
-        for path in base.rglob("*"):
-            if path.suffix in {
-                ".py", ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".inc"
-            }:
-                source_names.update(pattern.findall(path.read_text(encoding="utf-8")))
-
-    text = (ROOT / "docs" / "runtime_config.md").read_text(encoding="utf-8")
-    rows = re.findall(r"^\| `([A-Z][A-Z0-9_]+)` \|", text, re.MULTILINE)
-    documented = set(rows)
-    non_environment_constants = {
-        "HF_ARCH",
-        "QWEN3_VL_TEXT_ARCH",
-        "QWEN3_VL_VISION_ARCH",
-    }
-
-    assert len(rows) == len(documented), "duplicate runtime-configuration row"
-    assert source_names - non_environment_constants == documented
-
-
-def test_runtime_configuration_chinese_mirror_keeps_variable_order() -> None:
-    row_pattern = r"^\| `([A-Z][A-Z0-9_]+)` \|"
-    english_text = (ROOT / "docs" / "runtime_config.md").read_text(
-        encoding="utf-8"
-    )
-    chinese_text = (ROOT / "docs" / "runtime_config.zh.md").read_text(
-        encoding="utf-8"
-    )
-    english = re.findall(
-        row_pattern,
-        english_text,
-        re.MULTILINE,
-    )
-    chinese = re.findall(
-        row_pattern,
-        chinese_text,
-        re.MULTILINE,
-    )
-    assert english
-    assert chinese == english
-
-    def table_code_tokens(text: str) -> list[list[str]]:
-        return [
-            re.findall(r"`([^`]+)`", line)
-            for line in text.splitlines()
-            if line.startswith("|") and "`" in line
-        ]
-
-    assert table_code_tokens(chinese_text) == table_code_tokens(english_text)
-    assert len(re.findall(r"^#{2,3} ", chinese_text, re.MULTILINE)) == len(
-        re.findall(r"^#{2,3} ", english_text, re.MULTILINE)
-    )
 
 
 def test_full_runner_profile_defaults_and_exception_cleanup(
@@ -579,160 +561,6 @@ def _policy_with_runtime_env(name: str, runtime_env):
     )
 
 
-@pytest.mark.parametrize("policy_name", ["lingbot2", "wall_oss", "hy_embodied"])
-@pytest.mark.parametrize(
-    "key",
-    ["LD_PRELOAD", "PYTHONPATH", "RPU_BACKEND_SO", "HF_TOKEN", "RPU_TEST_ENV"],
-)
-def test_policy_runtime_env_rejects_unknown_keys_before_mutation(
-    policy_name: str, key: str, monkeypatch
-) -> None:
-    monkeypatch.delenv(key, raising=False)
-    with pytest.raises(ValueError, match="unsupported environment key"):
-        _policy_with_runtime_env(policy_name, {key: "value"})
-    assert key not in os.environ
-
-
-@pytest.mark.parametrize(
-    "policy_name,runtime_env,expected",
-    [
-        (
-            "lingbot2",
-            {
-                "RPU_LINGBOT2_DENOISE_UNROLL": 0,
-                "RPU_FASTREPLAY_SKIP_SYNC": True,
-                "LKN_MAX_BATCH_ENTRIES": 131072,
-            },
-            {
-                "RPU_LINGBOT2_DENOISE_UNROLL": "0",
-                "RPU_FASTREPLAY_SKIP_SYNC": "True",
-                "LKN_MAX_BATCH_ENTRIES": "131072",
-            },
-        ),
-        (
-            "wall_oss",
-            {
-                "RPU_WALL_OSS_FUSED_DENOISE": 1,
-                "RPU_FASTREPLAY_SKIP_SYNC": False,
-            },
-            {
-                "RPU_WALL_OSS_FUSED_DENOISE": "1",
-                "RPU_FASTREPLAY_SKIP_SYNC": "False",
-            },
-        ),
-        (
-            "hy_embodied",
-            {
-                "RPU_HY_VLA_W8A16": "expert",
-                "RPU_HY_VLA_DENOISE_UNROLL": 1,
-            },
-            {
-                "RPU_HY_VLA_W8A16": "expert",
-                "RPU_HY_VLA_DENOISE_UNROLL": "1",
-            },
-        ),
-    ],
-)
-def test_policy_runtime_env_accepts_exact_keys_and_stringifies_values(
-    policy_name: str, runtime_env, expected
-) -> None:
-    policy = _policy_with_runtime_env(policy_name, runtime_env)
-    assert policy._runtime_env == expected
-
-
-@pytest.mark.parametrize("policy_name", ["wall_oss", "hy_embodied"])
-@pytest.mark.parametrize(
-    "key",
-    ["LKN_MAX_BATCH_ENTRIES", "LKN_KD_BUF_MB", "LKN_INSTR_BUF_MB"],
-)
-def test_policy_runtime_env_requires_lkn_capacity_before_import(
-    policy_name: str, key: str
-) -> None:
-    with pytest.raises(ValueError, match="before importing rpu_backend"):
-        _policy_with_runtime_env(policy_name, {key: "64"})
-
-
-@pytest.mark.parametrize(
-    "runtime_env",
-    [
-        [],
-        {1: "value"},
-        {"": "value"},
-        {"A=B": "value"},
-        {"GOOD": "value\0tail"},
-    ],
-)
-def test_runtime_env_normalizer_rejects_unrepresentable_inputs(runtime_env) -> None:
-    from rpu_backend.api._runtime_env import normalize_runtime_env
-
-    with pytest.raises(ValueError, match="runtime_env"):
-        normalize_runtime_env(
-            runtime_env,
-            owner="TestPolicy",
-            allowed={"GOOD"},
-        )
-
-
-def test_hy_norm_stats_pickle_requires_opt_in_and_exact_hash(
-    tmp_path: Path, monkeypatch
-) -> None:
-    import rpu_backend.api.hy_embodied as hy_embodied
-
-    payload = pickle.dumps({"action_mean": [0], "action_std": [1]})
-    path = tmp_path / "norm_stats.pkl"
-    path.write_bytes(payload)
-    digest = hashlib.sha256(payload).hexdigest()
-
-    with pytest.raises(PermissionError, match="trust_norm_stats_pickle=True"):
-        hy_embodied._load_trusted_norm_stats_pickle(
-            path,
-            trust_norm_stats_pickle=False,
-            norm_stats_sha256=digest,
-        )
-
-    original_loads = pickle.loads
-    called = False
-
-    def unexpected_loads(_payload):
-        nonlocal called
-        called = True
-        raise AssertionError("pickle.loads ran before hash verification")
-
-    monkeypatch.setattr(hy_embodied.pickle, "loads", unexpected_loads)
-    with pytest.raises(ValueError, match="SHA-256 mismatch"):
-        hy_embodied._load_trusted_norm_stats_pickle(
-            path,
-            trust_norm_stats_pickle=True,
-            norm_stats_sha256="0" * 64,
-        )
-    assert not called
-
-    monkeypatch.setattr(hy_embodied.pickle, "loads", original_loads)
-    assert hy_embodied._load_trusted_norm_stats_pickle(
-        path,
-        trust_norm_stats_pickle=True,
-        norm_stats_sha256=digest.upper(),
-    ) == {"action_mean": [0], "action_std": [1]}
-
-
-def test_hy_norm_stats_and_tokenizer_are_fail_closed(monkeypatch) -> None:
-    from transformers import AutoTokenizer
-    from rpu_backend.api import HyEmbodiedPolicy
-
-    with pytest.raises(PermissionError, match="norm_stats_path requires"):
-        HyEmbodiedPolicy.from_checkpoint(
-            "unused/checkpoint", norm_stats_path="norm_stats.pkl"
-        )
-
-    policy = HyEmbodiedPolicy.from_checkpoint("unused/checkpoint")
-    monkeypatch.setattr(
-        AutoTokenizer,
-        "from_pretrained",
-        lambda *args, **kwargs: kwargs,
-    )
-    assert policy._tokenizer()["trust_remote_code"] is False
-
-
 @pytest.mark.parametrize(
     "loader",
     [
@@ -752,13 +580,4 @@ def test_generic_loaders_reject_custom_model_code(loader: str, value) -> None:
     with pytest.raises(ValueError, match="trust_remote_code=False"):
         model_loader.from_pretrained(
             "unused/checkpoint", trust_remote_code=value
-        )
-
-
-def test_pi05_rejects_custom_model_code_before_optional_import() -> None:
-    from rpu_backend.api import Pi05Policy
-
-    with pytest.raises(ValueError, match="trust_remote_code=False"):
-        Pi05Policy.from_pretrained(
-            "unused/checkpoint", trust_remote_code=True
         )

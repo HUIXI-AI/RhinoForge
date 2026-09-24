@@ -10,8 +10,9 @@ RhinoForge is an inference-only PyTorch `PrivateUse1` backend exposed as
 2. Read [architecture](docs/architecture.md) for runtime ownership and execution
    contracts.
 3. Read [API reference](docs/api_reference.md) before changing a public surface.
-4. Use [model validation](docs/validation_policy.md) for independent hard,
-   same-dtype parity, FP32-anchor, task-quality, and lifecycle gates.
+4. Use the relevant checks in [model validation](docs/validation_policy.md).
+   Full profile certification applies only to a requested acceptance/porting run;
+   ordinary fixes follow the validation scope below.
 5. For model work, start with the
    [capability review](docs/model_porting_capability_review.md), then follow
    [model porting](docs/model_porting.md), the decoder
@@ -26,6 +27,24 @@ Use [getting started](docs/getting_started.md) and
 [restricted runtime assets](docs/runtime_assets.md) for installation,
 [model testing](docs/model_testing.md) for runnable entry points and profiling,
 and [runtime configuration](docs/runtime_config.md) for supported controls.
+
+## Validation scope and budget
+
+- Use the smallest meaningful validation set for the requested change. Run
+  affected host tests once; do not expand to the full suite when targeted checks
+  already cover the changed path.
+- For an RPU-specific fix, default to one representative hardware smoke test per
+  affected execution path. Use 3–10 replay iterations, or 2 warmups plus 5–10
+  measured iterations for performance, unless the user requests another protocol.
+- Stop when the requested behavior and its direct regression checks pass. Reuse
+  valid evidence for the same build/profile instead of recertifying it.
+- Full model/precision/length matrices, more than 30 iterations, repeated clean-room
+  benchmarks, cryptographic evidence closures, sealed generations, custom result
+  publication harnesses, and layered validation gates require an explicit user
+  request.
+- Keep diagnostic follow-ups bounded to the failed hypothesis. Once the execution
+  path is confirmed, record ordinary accumulated numerical differences instead of
+  escalating them into additional gates.
 
 ## Required engineering contracts
 
@@ -63,5 +82,6 @@ and [runtime configuration](docs/runtime_config.md) for supported controls.
 - Run board-free checks before board validation. A port is not complete until
   the exact profile passes the numerical, warmup, Graph-lifecycle, input-
   envelope, and end-to-end gates in [model porting](docs/model_porting.md).
+  An ordinary existing-model fix does not start a full port or certification run.
 - Update public documentation and [the knowledge workflow](knowledge/WORKFLOWS.md)
   when a public contract changes.

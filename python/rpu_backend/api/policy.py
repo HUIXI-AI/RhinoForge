@@ -1,22 +1,33 @@
-"""Public Pi0.5 policy facade.
+"""Pi0.5 public entry class (Pi05Policy) — owning module per ADR §10 #16.
 
-Adapter and LeRobot imports remain method-local so importing the public API
-does not load optional model dependencies.
+Phase 01.2-01a-2-policy-split (REQ SKEL-03 + REQ SKEL-01b). This file is the
+canonical home for ``Pi05Policy``. Module-top-level imports are limited to
+``torch / typing / threading / os`` per ADR §6.2 — every adapters / lerobot
+reference goes through method-body lazy imports to keep ``api/`` free of
+reverse-direction DAG edges and to avoid importing lerobot at package load time.
+
+v5-02 D-12: lazy-import paths swung from ``rpu_backend.transformers.pi05.*``
+to ``rpu_backend.adapters.pi05.*``. The transition shim at
+``rpu_backend.transformers.pi05.policy`` is gone (transformers/pi05/ deleted
+entirely with v5-02); the v5-01a-2 splits remain — Pi05Policy here, Pi05Adapter
+in adapters/pi05/__init__.py.
 
 Class lifecycle:
-  - ``Pi05Policy.from_pretrained(...)`` — checkpoint constructor; lazy-imports
+  - ``Pi05Policy.from_pretrained(...)`` — canonical constructor; lazy-imports
     ``rpu_backend.adapters.pi05.loader.load_and_construct_pi05_policy``.
   - ``Pi05Policy.from_lerobot_policy(...)`` — convenience wrapper that lazy-imports
-    ``rpu_backend.adapters.pi05.Pi05Adapter``.
+    ``rpu_backend.adapters.pi05.Pi05Adapter`` (the internal orchestrator owns
+    the swizzle / patch lock per G1-A).
   - ``Pi05Policy.to('rpu')`` — irreversible CPU→RPU mutation routed through
     ``self._adapter.to_rpu()``.
-  - ``Pi05Policy.select_action(batch)`` — public inference API that keeps the
-    action queue on CPU.
-  - ``Pi05Policy._forward_rpu(batch, ...)`` — internal direct-forward path.
+  - ``Pi05Policy.select_action(batch)`` — public inference API; CR-R5 BLOCKER 7
+    queue-pin loop CPU-pins ``_action_queue`` entries.
+  - ``Pi05Policy._forward_rpu(batch, ...)`` — internal MSE-harness path; AM-7
+    requires ``_rpu_ready`` before claiming the RPU path.
 """
 from __future__ import annotations
 import os
-import threading  # noqa: F401
+import threading  # noqa: F401  (intentional; matches policy.py:14 for byte-equal lift discipline. ADR §6.2 allows it.)
 from typing import Any
 
 import torch
@@ -46,7 +57,7 @@ def _validate_num_steps(num_steps: int | None, *, entry_point: str) -> int | Non
 
 
 class Pi05Policy:
-    """Thin public wrapper around a Pi0.5 policy and its RPU adapter."""
+    """Public Pi0.5 entry (D-02 thin wrapper)."""
 
     def __init__(self) -> None:
         raise RuntimeError(
@@ -63,58 +74,71 @@ class Pi05Policy:
         trust_remote_code: bool = False,
         vlm_chunk_size: int | None = None,
         rpu_execution=None,
+        optimized_profile=None,
         **lerobot_kwargs: Any,
     ) -> "Pi05Policy":
-        """Load a Pi0.5 checkpoint through the adapter loader.
+        """D-01 canonical (delegates to loader.py per D-3-03).
 
-        The loader is imported lazily from
-        ``rpu_backend.adapters.pi05.loader``.
+        Lazy import per ADR §6.2: ``loader`` lives in
+        ``rpu_backend.adapters.pi05.loader`` (v5-02 D-12 relocated from
+        ``transformers/pi05/``).
         """
         if not isinstance(trust_remote_code, bool):
             raise TypeError(
                 "Pi05Policy.from_pretrained: trust_remote_code must be bool, "
                 f"got {trust_remote_code!r}"
             )
-        if trust_remote_code is not False:
-            raise ValueError(
-                "Pi05Policy.from_pretrained requires trust_remote_code=False; "
-                "custom model code is not supported."
-            )
+        from rpu_backend.adapters.pi05.optimized import (
+            normalize_profile, execution_for_profile, profile_environment_scope,
+            bind_profile, validate_checkpoint, require_profile_assets,
+            _PRECISION_MAP,
+        )
+        profile = normalize_profile(optimized_profile)
+        if profile is not None:
+            from rpu_backend.adapters.pi05.loader import _load_pi05_rpu_quant_config
+            validate_checkpoint(_load_pi05_rpu_quant_config(pretrained_name_or_path),
+                                _PRECISION_MAP[profile["precision"]])
+            require_profile_assets(profile, rpu_execution)
+        rpu_execution = execution_for_profile(profile, rpu_execution)
         from rpu_backend.api._execution import normalize_rpu_execution
+        from rpu_backend.api._execution import PI05_EXECUTION_COMPONENTS, PI05_EXECUTION_SUPPORTED
         execution_explicit = rpu_execution is not None or vlm_chunk_size is not None
         execution_config = normalize_rpu_execution(
             rpu_execution,
             entry_point="Pi05Policy.from_pretrained",
             vlm_chunk_size=vlm_chunk_size,
-            supported={
-                "prefill": ("chunk_size", "padding_rows", "padding_budget"),
-                "vision": ("chunk_size",),
-                "action": ("chunk_size",),
-            },
+            supported=PI05_EXECUTION_SUPPORTED,
+            supported_components=PI05_EXECUTION_COMPONENTS,
         )
-        # Keep this optional model dependency out of package import.
+        # ADR §6.2 / codex G2-A literal: lazy import, NOT module top-level.
         from rpu_backend.adapters.pi05.loader import load_and_construct_pi05_policy
-        policy = load_and_construct_pi05_policy(
-            pretrained_name_or_path,
-            dtype=dtype,
-            trust_remote_code=trust_remote_code,
-            **(
-                {"rpu_execution": execution_config}
-                if execution_explicit
-                else {}
-            ),
-            **lerobot_kwargs,
-        )
+        with profile_environment_scope(profile, rpu_execution):
+            policy = load_and_construct_pi05_policy(
+                pretrained_name_or_path,
+                dtype=dtype,
+                trust_remote_code=trust_remote_code,
+                **(
+                    {"rpu_execution": execution_config}
+                    if execution_explicit
+                    else {}
+                ),
+                **lerobot_kwargs,
+            )
+        bind_profile(policy, profile)
         # A real loader returns an already-bound Pi05Policy.  Keep this
         # assignment for small loader doubles and assert one canonical object
         # for both public and adapter views.
         if not hasattr(policy, "_rpu_execution"):
             policy._rpu_execution = execution_config
         policy._adapter._rpu_execution = policy._rpu_execution
-        chunk_size = policy._rpu_execution.get("prefill", {}).get(
-            "chunk_size", "auto"
+        text_config = getattr(policy._adapter, "_vlm_execution", {})
+        chunk_size = text_config.get("prefill", {}).get(
+            "chunk_size",
+            policy._rpu_execution.get("prefill", {}).get("chunk_size", "auto"),
         )
-        policy._vlm_chunk_size = 0 if chunk_size == "auto" else chunk_size
+        policy._vlm_chunk_size = (
+            0 if chunk_size == "auto" else int(chunk_size)
+        )
         policy._adapter._vlm_chunk_size = policy._vlm_chunk_size
         return policy
 
@@ -124,41 +148,50 @@ class Pi05Policy:
         lerobot_policy: Any,
         *,
         rpu_execution=None,
+        optimized_profile=None,
     ) -> "Pi05Policy":
-        """Wrap an existing LeRobot policy.
+        """D-01 convenience.
 
-        ``Pi05Adapter`` is imported lazily from
-        ``rpu_backend.adapters.pi05``.
+        Lazy import per ADR §6.2 / codex G1-A: ``Pi05Adapter`` (the internal
+        swizzle orchestrator) lives in ``rpu_backend.adapters.pi05`` (v5-02 B3
+        relocated from ``transformers/pi05/adapter.py``; the class body now
+        sits in the package's ``__init__.py``).
         """
-        # Keep this optional model dependency out of package import.
+        # ADR §6.2 / codex G1-A literal: lazy import; lock + class both in adapters/pi05/__init__.py.
         from rpu_backend.adapters.pi05 import Pi05Adapter
+        from rpu_backend.api._execution import PI05_EXECUTION_COMPONENTS, PI05_EXECUTION_SUPPORTED
         from rpu_backend.api._execution import bind_rpu_execution
-        supported = {
-            "prefill": ("chunk_size", "padding_rows", "padding_budget"),
-            "vision": ("chunk_size",),
-            "action": ("chunk_size",),
-        }
+        from rpu_backend.adapters.pi05.optimized import (
+            normalize_profile, execution_for_profile, profile_environment_scope, bind_profile,
+        )
+        profile = normalize_profile(optimized_profile)
+        rpu_execution = execution_for_profile(profile, rpu_execution)
         inst = cls.__new__(cls)
         inst._lerobot_policy = lerobot_policy
-        inst._adapter = Pi05Adapter(lerobot_policy)
         owner = getattr(lerobot_policy, "model", lerobot_policy)
         execution_config = bind_rpu_execution(
             owner,
             rpu_execution,
             entry_point="Pi05Policy.from_lerobot_policy",
-            supported=supported,
+            supported=PI05_EXECUTION_SUPPORTED,
+            supported_components=PI05_EXECUTION_COMPONENTS,
         )
+        with profile_environment_scope(profile, rpu_execution):
+            inst._adapter = Pi05Adapter(lerobot_policy)
         inst._rpu_ready = inst._adapter._rpu_is_ready
         inst._rpu_execution = execution_config
-        inst._adapter._rpu_execution = execution_config
-        configured_chunk = execution_config.get("prefill", {}).get("chunk_size")
-        if configured_chunk is not None:
-            inst._vlm_chunk_size = (
-                0 if configured_chunk == "auto" else configured_chunk
-            )
-            inst._adapter._vlm_chunk_size = inst._vlm_chunk_size
-        else:
-            inst._vlm_chunk_size = inst._adapter._vlm_chunk_size
+        text_config = getattr(inst._adapter, "_vlm_execution", {})
+        chunk_size = text_config.get("prefill", {}).get(
+            "chunk_size",
+            execution_config.get("prefill", {}).get("chunk_size", "auto"),
+        )
+        inst._vlm_chunk_size = 0 if chunk_size == "auto" else int(chunk_size)
+        inst._adapter._vlm_chunk_size = inst._vlm_chunk_size
+        session = getattr(inst._adapter, "_execution_session", None)
+        if session is not None:
+            inst._execution_session = session
+            session.register_config_view(inst)
+        bind_profile(inst, profile)
         return inst
 
     def to(self, device: Any) -> "Pi05Policy":
@@ -168,7 +201,11 @@ class Pi05Policy:
 
         if is_rpu_device_target(device, entry_point="Pi05Policy.to"):
             try:
-                self._adapter.to_rpu()
+                from rpu_backend.adapters.pi05.optimized import profile_environment_scope, require_profile_assets
+                profile = getattr(self, "_optimized_profile", None)
+                require_profile_assets(profile, self._rpu_execution)
+                with profile_environment_scope(profile, self._rpu_execution):
+                    self._adapter.to_rpu()
             except BaseException:
                 self._rpu_ready = False
                 raise
@@ -189,12 +226,18 @@ class Pi05Policy:
         self._lerobot_policy.to(device)
         return self
 
+    def close(self) -> None:
+        """Retire Pi0.5 resources through its shared execution session."""
+        self._adapter.close()
+        self._rpu_ready = False
+
     @torch.no_grad()
     def prepare_graphs(
         self,
         batch: dict,
         *,
         num_steps: "int | None" = None,
+        precompute_adarms: bool | None = None,
     ) -> dict:
         """Prebuild one finite Pi0.5 signature, freeze it, and verify READY."""
         if not getattr(self, "_rpu_ready", False):
@@ -206,9 +249,18 @@ class Pi05Policy:
         num_steps = _validate_num_steps(
             num_steps, entry_point="Pi05Policy.prepare_graphs"
         )
+        from rpu_backend.adapters.pi05.optimized import validate_profile_batch, profile_environment_scope
+        profile = getattr(self, "_optimized_profile", None)
+        validate_profile_batch(self, batch, num_steps)
+        if precompute_adarms is None:
+            precompute_adarms = profile is not None
+        if type(precompute_adarms) is not bool:
+            raise TypeError("precompute_adarms must be bool")
         from rpu_backend.runtime.hw_attrs import mark_first_forward_done
         mark_first_forward_done(self._lerobot_policy)
-        return self._adapter.prepare_graphs(batch, num_steps=num_steps)
+        with profile_environment_scope(profile, self._rpu_execution):
+            return self._adapter.prepare_graphs(
+                batch, num_steps=num_steps, precompute_adarms=precompute_adarms)
 
     @torch.no_grad()
     def predict_action_chunk(
@@ -232,27 +284,33 @@ class Pi05Policy:
         )
         from rpu_backend.runtime.hw_attrs import mark_first_forward_done
         mark_first_forward_done(self._lerobot_policy)
+        from rpu_backend.adapters.pi05.optimized import validate_profile_batch
+        validate_profile_batch(self, batch, num_steps)
+        # Installation already froze the profile on the Python/native owners.
+        # Inference must not republish cold flags into the process environment.
         if num_steps is None:
             return self._lerobot_policy.predict_action_chunk(batch)
-        return self._lerobot_policy.predict_action_chunk(
-            batch, num_steps=num_steps)
+        return self._lerobot_policy.predict_action_chunk(batch, num_steps=num_steps)
 
     @torch.no_grad()
     def select_action(self, batch: dict) -> torch.Tensor:
-        """Run inference and return a CPU tensor.
+        """Public inference API (D-04). Returns CPU tensor (D-CR3-SELECT1).
 
-        After LeRobot populates ``_action_queue``, move each queued tensor to
-        CPU so no RPU tensors survive between calls.
+        CR-R5 BLOCKER 7: after lerobot.select_action populates `_action_queue`
+        from predict_action_chunk (RPU-resident on RPU path), walk the queue
+        and `.cpu()` each entry IN-PLACE so zero RPU tensors survive.
         """
         batch = _validate_batch(batch, entry_point="Pi05Policy.select_action")
 
-        # Record the first forward once before dispatch.
+        # D-32 A9 wire-point #3 (idempotent first-forward marker).
         from rpu_backend.runtime.hw_attrs import mark_first_forward_done
         mark_first_forward_done(self._lerobot_policy)
 
+        from rpu_backend.adapters.pi05.optimized import validate_profile_batch
+        validate_profile_batch(self, batch)
         result = self._lerobot_policy.select_action(batch)
 
-        # Keep queued actions on CPU.
+        # CR-R5 BLOCKER 7: CPU-pin the queue.
         queue = getattr(self._lerobot_policy, '_action_queue', None)
         if queue is None:
             queue = getattr(getattr(self._lerobot_policy, 'model', None),
@@ -291,15 +349,16 @@ class Pi05Policy:
     @torch.no_grad()
     def _forward_rpu(self, batch: dict, *, return_chunk: bool = True,
                      num_steps: "int | None" = None) -> torch.Tensor:
-        """Internal direct-forward path.
+        """D-701 internal surface — MSE harness path.
 
         return_chunk=True -> predict_action_chunk (RPU tensor).
-        return_chunk=False -> self.select_action (CPU-pinned).
-        Requires ``_rpu_ready`` set by ``Pi05Policy.to('rpu')``.
+        return_chunk=False -> self.select_action (CPU-pinned, AM-2).
+        AM-7: requires `_rpu_ready` (set by Pi05Policy.to('rpu')).
         """
-        # ``_rpu_ready`` is a plain Python attribute on Pi05Policy.
+        # AM-7: _rpu_ready is a plain Python attr on Pi05Policy (NOT nn.Module),
+        # so A9 validator does not intercept; no whitelist extension required.
         if not getattr(self, '_rpu_ready', False):
-            from rpu_backend.api.errors import RPUBackendError
+            from rpu_backend.api.errors import RPUBackendError   # ADR §6.2 lazy
             raise RPUBackendError(
                 "_forward_rpu requires Pi05Policy.to('rpu') to have completed first.")
 
@@ -311,5 +370,5 @@ class Pi05Policy:
 
         if return_chunk:
             return self.predict_action_chunk(batch, num_steps=num_steps)
-        # Route through the wrapper that keeps queued and returned actions on CPU.
+        # AM-2 fix: route through self.select_action(batch) CPU-pin wrapper.
         return self.select_action(batch)

@@ -25,6 +25,10 @@ from rpu_backend.quant.convert_qwen3 import (
     LM_HEAD_WEIGHT_NAME,
     QUANT_PROJ_SUFFIXES,
 )
+from rpu_backend.quant.convert_qwen3_vl import (
+    QUANT_CONFIG as _QWEN3_VL_4B_W8A16_QUANT_CONFIG,
+    matches_4b_geometry,
+)
 
 
 _QWEN3_VL_32B_W8A16_QUANT_CONFIG = {
@@ -36,6 +40,11 @@ _QWEN3_VL_32B_W8A16_QUANT_CONFIG = {
     "quantized_embed_tokens": False,
     "lm_head_untied": False,
     "embed_tokens_untied": False,
+}
+
+_QWEN3_VL_2B_W8A16_QUANT_CONFIG = {
+    **_QWEN3_VL_32B_W8A16_QUANT_CONFIG,
+    "skip_modules": ["model.visual", "lm_head"],
 }
 
 _W8A16_IMAGETEXT_STAGE_ATTR = "_rpu_w8a16_imagetext_load_plan"
@@ -55,6 +64,21 @@ def is_w8a16_config(config) -> bool:
     """Return True when an HF config declares the local W8A16 quant format."""
     qc = getattr(config, "quant_config", None)
     return isinstance(qc, dict) and qc.get("method") == "w8a16"
+
+
+def is_qwen3_vl_4b_w8a16_config(config) -> bool:
+    """Exact controlled 4B profile: offline W8 text/head, install-time W8 Vision."""
+    text = getattr(config, "text_config", None)
+    vision = getattr(config, "vision_config", None)
+    return (
+        matches_4b_geometry(config)
+        and getattr(config, "tie_word_embeddings", None) is False
+        and getattr(text, "tie_word_embeddings", None) is False
+        and getattr(config, "quant_config", None) == _QWEN3_VL_4B_W8A16_QUANT_CONFIG
+        and getattr(config, "quantization_config", None) is None
+        and all(getattr(owner, key, None) is None for owner in (text, vision)
+                for key in ("quant_config", "quantization_config"))
+    )
 
 
 def is_qwen3_vl_32b_w8a16_config(config) -> bool:
@@ -101,6 +125,49 @@ def is_qwen3_vl_32b_w8a16_config(config) -> bool:
         )
     except (AttributeError, TypeError, ValueError):
         return False
+
+
+def is_qwen3_vl_2b_w8a16_config(config) -> bool:
+    """Exact 2B text-only per-channel INT8; Vision/embed/head remain FP16.
+
+    This is the ``w8a16-text-v1`` checkpoint format, not the separate hybrid
+    delivery profile or a generic admission of quantized Qwen3-VL models.
+    """
+    from rpu_backend.api._execution import qwen3_vl_text_core_profile
+
+    try:
+        text, vision = config.text_config, config.vision_config
+        profile = qwen3_vl_text_core_profile(text, 4)
+        return (
+            tuple(config.architectures) == ("Qwen3VLForConditionalGeneration",)
+            and config.model_type == "qwen3_vl"
+            and config.tie_word_embeddings is True
+            and text.tie_word_embeddings is True
+            and config.quant_config == _QWEN3_VL_2B_W8A16_QUANT_CONFIG
+            and getattr(config, "quantization_config", None) is None
+            and all(getattr(vision, key, None) is None
+                    for key in ("quant_config", "quantization_config"))
+            and (profile.hidden_size, profile.intermediate_size,
+                 profile.num_layers, profile.num_q_heads) == (2048, 6144, 28, 16)
+            and (vision.model_type, vision.hidden_size, vision.intermediate_size,
+                 vision.depth, vision.num_heads, vision.patch_size,
+                 vision.temporal_patch_size, vision.spatial_merge_size,
+                 tuple(vision.deepstack_visual_indexes), vision.out_hidden_size,
+                 vision.hidden_act, vision.in_channels, vision.num_position_embeddings)
+                == ("qwen3_vl", 1024, 4096, 24, 16, 16, 2, 2,
+                    (5, 11, 17), 2048, "gelu_pytorch_tanh", 3, 2304)
+            and tuple(getattr(config, key) for key in (
+                "image_token_id", "video_token_id", "vision_start_token_id",
+                "vision_end_token_id")) == (151655, 151656, 151652, 151653)
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def is_qwen3_vl_w8a16_config(config) -> bool:
+    return (is_qwen3_vl_2b_w8a16_config(config)
+            or is_qwen3_vl_4b_w8a16_config(config)
+            or is_qwen3_vl_32b_w8a16_config(config))
 
 
 def _safetensor_shards(ckpt_dir: Path) -> list[Path]:
@@ -406,11 +473,7 @@ def _build_w8a16_imagetext_plan(
 ) -> _W8A16ImageTextLoadPlan:
     modules = dict(model.named_modules())
     parameter_names = {name for name, _parameter in model.named_parameters()}
-    expected_quant_weights = {
-        f"{name}.weight" for name, module in modules.items()
-        if isinstance(module, nn.Linear)
-        and f"{name}.weight".endswith(QUANT_PROJ_SUFFIXES)
-    }
+    expected_quant_weights = _expected_imagetext_quant_weights(model)
     expected_scales = {
         name[: -len(".weight")] + ".weight_scale"
         for name in expected_quant_weights
@@ -519,11 +582,11 @@ def _prepare_w8a16_imagetext(
     **resolve_kwargs,
 ) -> tuple[nn.Module, _W8A16ImageTextLoadPlan]:
     if dtype is not torch.float16:
-        raise TypeError(f"Qwen3-VL-32B W8A16 loader requires torch.float16, got {dtype}")
-    if not is_qwen3_vl_32b_w8a16_config(config):
+        raise TypeError(f"Qwen3-VL W8A16 loader requires torch.float16, got {dtype}")
+    if not is_qwen3_vl_w8a16_config(config):
         raise ValueError(
             "W8A16 image-text loading is restricted to the exact "
-            "Qwen3-VL-32B-Instruct controlled profile"
+            "Qwen3-VL-2B-Instruct text-only, 4B runtime-alignment or 32B controlled profile"
         )
 
     ckpt_dir_path = _resolve_checkpoint_dir(ckpt_dir, **resolve_kwargs)
@@ -541,11 +604,14 @@ def _prepare_w8a16_imagetext(
 
 
 def _expected_imagetext_quant_weights(model: nn.Module) -> set[str]:
-    return {
+    expected = {
         f"{name}.weight" for name, module in model.named_modules()
         if isinstance(module, nn.Linear)
         and f"{name}.weight".endswith(QUANT_PROJ_SUFFIXES)
     }
+    if is_qwen3_vl_4b_w8a16_config(getattr(model, "config", None)):
+        expected.add("lm_head.weight")
+    return expected
 
 
 def _install_imagetext_tensor(
@@ -569,6 +635,9 @@ def _install_imagetext_tensor(
                 f"W8A16 scale {name!r} has shape {tuple(tensor.shape)}, "
                 f"expected {(module.out_features,)}"
             )
+        if is_qwen3_vl_4b_w8a16_config(getattr(model, "config", None)) and (
+                not bool(torch.isfinite(tensor).all()) or not bool((tensor > 0).all())):
+            raise ValueError(f"W8A16 runtime-alignment scale {name!r} must be finite and positive")
         module.register_buffer("weight_scale", tensor.clone().contiguous())
         return
 
@@ -645,18 +714,18 @@ def _validate_staged_w8a16_imagetext(model: nn.Module) -> _W8A16ImageTextLoadPla
     plan = vars(model).get(_W8A16_IMAGETEXT_STAGE_ATTR)
     if not isinstance(plan, _W8A16ImageTextLoadPlan) or plan.model_id != id(model):
         raise RuntimeError(
-            "Qwen3-VL-32B W8A16 staged load plan is missing or belongs to another model"
+            "Qwen3-VL W8A16 staged load plan is missing or belongs to another model"
         )
     parameter_names = tuple(sorted(name for name, _param in model.named_parameters()))
     if parameter_names != plan.parameter_names:
         raise RuntimeError(
-            "Qwen3-VL-32B W8A16 staged model hierarchy changed after "
+            "Qwen3-VL W8A16 staged model hierarchy changed after "
             "metadata validation"
         )
     non_meta = [name for name, param in model.named_parameters() if not param.is_meta]
     if non_meta:
         raise RuntimeError(
-            "Qwen3-VL-32B W8A16 staged model was materialized before RPU ownership: "
+            "Qwen3-VL W8A16 staged model was materialized before RPU ownership: "
             f"{non_meta[:8]}"
         )
     non_host_buffers = [
@@ -665,16 +734,16 @@ def _validate_staged_w8a16_imagetext(model: nn.Module) -> _W8A16ImageTextLoadPla
     ]
     if non_host_buffers:
         raise RuntimeError(
-            "Qwen3-VL-32B W8A16 staged model owns non-host buffers before RPU ownership: "
+            "Qwen3-VL W8A16 staged model owns non-host buffers before RPU ownership: "
             f"{non_host_buffers[:8]}"
         )
     if len(model.model.language_model.layers) != len(plan.layer_tensor_names):
-        raise RuntimeError("Qwen3-VL-32B W8A16 staged decoder layer count changed")
+        raise RuntimeError("Qwen3-VL W8A16 staged decoder layer count changed")
     checkpoint_names = {name for name, _shard in plan.tensor_shards}
     expected_quant_weights = _expected_imagetext_quant_weights(model)
     if not expected_quant_weights.issubset(checkpoint_names):
         raise RuntimeError(
-            "Qwen3-VL-32B W8A16 staged quantized module inventory changed"
+            "Qwen3-VL W8A16 staged quantized module inventory changed"
         )
     return plan
 
@@ -686,11 +755,13 @@ def stage_w8a16_imagetext_for_rpu(
     dtype: torch.dtype = torch.float16,
     **resolve_kwargs,
 ) -> nn.Module:
-    """Validate checkpoint metadata and return an unmaterialized exact 32B model.
+    """Validate metadata and return an unmaterialized controlled 4B/32B model.
 
     Tensor loading is deliberately deferred until the Qwen3-VL adapter owns the
     process-wide RPU slot and has published its irreversible-install poison.
     """
+    if not (is_qwen3_vl_32b_w8a16_config(config) or is_qwen3_vl_4b_w8a16_config(config)):
+        raise ValueError("W8A16 metadata-only staging requires exact Qwen3-VL-4B/32B; use the CPU loader for 2B")
     model, plan = _prepare_w8a16_imagetext(
         config, ckpt_dir, dtype=dtype, **resolve_kwargs
     )
@@ -699,11 +770,134 @@ def stage_w8a16_imagetext_for_rpu(
     return model
 
 
-def _swizzle_and_move_w8a16_decoder_layer(layer: nn.Module) -> None:
+def _allocate_decoder_projection_views(
+    model: nn.Module, layer_tensor_names: tuple[tuple[str, ...], ...],
+    *, dtype: torch.dtype,
+) -> dict[str, torch.Tensor]:
+    """One model-owned storage, with byte-aligned independent projection views.
+
+    Exact 2B FP16/text-W8 and controlled 4B W8 callers use this layout; 4B
+    FP16 requests one layer at a time to keep each allocation below 4 GiB. Q/K/V
+    bytes are adjacent in that order so decode can form a read-only packed
+    view without copying weights or allocating another DDR mapping. Parameters retain
+    the storage after this temporary view dictionary dies; no global arena or
+    allocator policy is involved. Build offsets from validated tensor geometry
+    before any projection is swizzled.
+    """
+    if dtype not in (torch.uint8, torch.int8, torch.float16):
+        raise ValueError("Decoder projection storage requires packed INT4, INT8 or FP16")
+    element_size = 2 if dtype == torch.float16 else 1
+    layout = []
+    size = 0
+    for names in layer_tensor_names:
+        projections = [name for name in names if name.endswith(QUANT_PROJ_SUFFIXES)]
+        qkv_order = (".self_attn.q_proj.weight", ".self_attn.k_proj.weight",
+                     ".self_attn.v_proj.weight")
+        # Stable sorting keeps every other projection's existing relative order.
+        projections.sort(key=lambda name: next(
+            (index for index, suffix in enumerate(qkv_order) if name.endswith(suffix)), 3))
+        for name in projections:
+            weight = model.get_parameter(name)
+            offset = (size + 255) // 256 * 256
+            layout.append((name, tuple(weight.shape), offset // element_size, weight.numel()))
+            size = offset + weight.numel() * element_size
+    if not layout:
+        raise ValueError("Decoder projection storage requires nonempty weights")
+    storage = torch.empty(size // element_size, dtype=dtype, device="rpu")
+    return {name: storage.narrow(0, offset, count).view(shape)
+            for name, shape, offset, count in layout}
+
+
+def _allocate_w8a16_decoder_projection_views(
+    model: nn.Module, layer_tensor_names: tuple[tuple[str, ...], ...],
+) -> dict[str, torch.Tensor]:
+    return _allocate_decoder_projection_views(model, layer_tensor_names, dtype=torch.int8)
+
+
+def _swizzle_and_move_decoder_layer(
+    layer: nn.Module, *, dtype: torch.dtype,
+    projection_views: dict[str, torch.Tensor] | None = None,
+) -> None:
     from rpu_backend.runtime.weights import convert_linear_weights_inplace
 
     convert_linear_weights_inplace(layer, skip_names=set())
+    if projection_views is not None:
+        for name, target in projection_views.items():
+            module = layer.get_submodule(name)
+            source = module.weight.detach()
+            if (source.dtype != dtype or source.device.type != "cpu"
+                    or source.shape != target.shape or not source.is_contiguous()
+                    or target.dtype != dtype or not target.is_contiguous()):
+                raise ValueError(f"Invalid swizzled projection storage: {name}")
+            # copy_ publishes only this view's bytes through the existing sized
+            # CPU->RPU flush. Do not create a per-projection RPU allocation.
+            target.copy_(source)
+            module.weight = nn.Parameter(target, requires_grad=False)
+    # Packed weights already reside on RPU; only FP16 norms/scales still move.
     layer.to("rpu")
+
+
+def _swizzle_and_move_w8a16_decoder_layer(
+    layer: nn.Module, *, projection_views: dict[str, torch.Tensor] | None = None,
+) -> None:
+    _swizzle_and_move_decoder_layer(layer, dtype=torch.int8, projection_views=projection_views)
+
+
+def _move_materialized_w8a16_decoder_for_rpu(model: nn.Module) -> None:
+    """Give the public CPU-load then .to('rpu') path the same 4B storage."""
+    if not is_qwen3_vl_4b_w8a16_config(getattr(model, "config", None)):
+        raise ValueError("Shared W8 decoder storage requires the exact controlled 4B profile")
+    _move_materialized_decoder_for_rpu(model, dtype=torch.int8)
+
+
+def _move_materialized_decoder_for_rpu(
+    model: nn.Module, *, dtype: torch.dtype, per_layer: bool = False,
+    decoder: nn.Module | None = None, decoder_prefix: str = "model.language_model",
+) -> None:
+    """Pack decoder weights after the adapter admits the exact eight-core profile."""
+    from rpu_backend.runtime.weights import _release_cpu_weight_pages
+
+    if dtype not in (torch.int8, torch.float16):
+        raise ValueError("Decoder migration requires INT8 or FP16")
+    if vars(model).get("_rpu_swizzle_started") is not True:
+        raise RuntimeError("Decoder migration requires adapter ownership/poison first")
+    decoder = model.get_submodule(decoder_prefix) if decoder is None else decoder
+    if model.get_submodule(decoder_prefix) is not decoder:
+        raise ValueError("Decoder bank prefix must identify the supplied model-owned decoder")
+    layers = decoder.layers
+    layer_tensor_names = tuple(
+        tuple(f"{decoder_prefix}.layers.{index}.{name}"
+              for name, _ in sorted(layer.named_parameters()))
+        for index, layer in enumerate(layers)
+    )
+    # Check the entire inventory before allocating or mutating the first layer.
+    # The adapter already validates exact shapes and the matching scale tensors.
+    for names in layer_tensor_names:
+        for name in names:
+            if not name.endswith(QUANT_PROJ_SUFFIXES):
+                continue
+            module = model.get_submodule(name[:-len(".weight")])
+            weight = module.weight
+            if (weight.device.type != "cpu" or weight.dtype != dtype
+                    or not weight.is_contiguous()
+                    or getattr(module, "_rpu_linear_partition", None) is not None):
+                label = "INT8" if dtype == torch.int8 else "FP16"
+                raise ValueError(f"Decoder migration requires unswizzled CPU {label}: {name}")
+            # Validation must not pin the final CPU Parameter during migration.
+            del weight
+    views = (None if per_layer else
+             _allocate_decoder_projection_views(model, layer_tensor_names, dtype=dtype))
+    for layer, names in zip(layers, layer_tensor_names, strict=True):
+        if per_layer:
+            views = _allocate_decoder_projection_views(model, (names,), dtype=dtype)
+        relative_views = {
+            name.rsplit(".layers.", 1)[1].split(".", 1)[1][:-len(".weight")]: views[name]
+            for name in names if name in views
+        }
+        _swizzle_and_move_decoder_layer(layer, dtype=dtype, projection_views=relative_views)
+        # HostDDR shares physical RAM with CPU weights. GC alone can leave
+        # freed CPU arenas resident while the next device bank is allocated.
+        _release_cpu_weight_pages()
 
 
 def _materialize_staged_w8a16_imagetext_for_rpu(model: nn.Module) -> None:
@@ -711,9 +905,13 @@ def _materialize_staged_w8a16_imagetext_for_rpu(model: nn.Module) -> None:
     plan = _validate_staged_w8a16_imagetext(model)
     if vars(model).get("_rpu_swizzle_started") is not True:
         raise RuntimeError(
-            "Qwen3-VL-32B W8A16 streaming requires adapter ownership/poison first"
+            "Qwen3-VL W8A16 streaming requires adapter ownership/poison first"
         )
 
+    projection_views = (
+        _allocate_w8a16_decoder_projection_views(model, plan.layer_tensor_names)
+        if is_qwen3_vl_4b_w8a16_config(getattr(model, "config", None)) else None
+    )
     _load_imagetext_plan_names(
         model, plan, plan.nondecoder_tensor_names, dtype=torch.float16
     )
@@ -725,7 +923,14 @@ def _materialize_staged_w8a16_imagetext_for_rpu(model: nn.Module) -> None:
             raise KeyError(
                 f"W8A16 decoder layer remains incomplete before swizzle: {layer_meta[:8]}"
             )
-        _swizzle_and_move_w8a16_decoder_layer(layer)
+        if projection_views is None:
+            _swizzle_and_move_w8a16_decoder_layer(layer)
+        else:
+            relative_views = {
+                name.rsplit(".layers.", 1)[1].split(".", 1)[1][:-len(".weight")]: projection_views[name]
+                for name in names if name in projection_views
+            }
+            _swizzle_and_move_w8a16_decoder_layer(layer, projection_views=relative_views)
         gc.collect()
 
     _materialize_imagetext_meta_buffers(model)
@@ -741,12 +946,17 @@ def load_w8a16_imagetext(
     dtype: torch.dtype = torch.float16,
     **resolve_kwargs,
 ) -> nn.Module:
-    """Strictly load the controlled Qwen3-VL-32B W8A16 checkpoint on CPU."""
+    """Strictly load a controlled Qwen3-VL W8A16 checkpoint on CPU."""
     model, plan = _prepare_w8a16_imagetext(
         config, ckpt_dir, dtype=dtype, **resolve_kwargs
     )
     all_names = tuple(name for name, _shard in plan.tensor_shards)
     _load_imagetext_plan_names(model, plan, all_names, dtype=dtype)
+    if is_qwen3_vl_2b_w8a16_config(config):
+        # Safetensors omits the tied head. Installing a new embedding Parameter
+        # leaves the original alias on meta, so restore this exact HF tie before
+        # validation. The adapter unties it once before col-swizzling the head.
+        model.lm_head.weight = model.model.language_model.embed_tokens.weight
     gc.collect()
 
     _materialize_imagetext_meta_buffers(model)
@@ -761,3 +971,12 @@ def load_w8a16_imagetext(
         )
     model.eval()
     return model
+
+
+# Exact compressed-tensors Text-W4 loader; independent of the W8 staging path.
+from rpu_backend.quant.load_qwen3_vl_awq import (  # noqa: E402,F401
+    is_qwen3_vl_awq_config,
+    load_qwen3_vl_awq_imagetext,
+    _validate_qwen3_vl_awq_model,
+    _move_materialized_awq_decoder_for_rpu,
+)

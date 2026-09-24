@@ -136,7 +136,8 @@ def build_interleaved_mrope_cos_sin(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return Qwen3-VL interleaved cos/sin, fp16, on CPU.
 
-    This layout must match the public M-RoPE operator contract:
+    This layout must match
+    ``src/ops/rpu_mrope.cpp::rpu_compute_mrope_strobe_masks``:
 
     * T is the baseline on every lane.
     * H overrides lanes ``1 + 3i``.

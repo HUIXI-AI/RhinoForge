@@ -8,13 +8,13 @@
 | 主题 | 中文 | English |
 |---|---|---|
 | 从源码安装并跑通首个模型 | [入门指南](getting_started.zh.md) | [Getting started](getting_started.md) |
-| 模型状态、入口和边界 | [模型支持](model_support.zh.md) | [Model support](model_support.md) |
+| 示例与运行范围 | [示例](model_support.zh.md) | [Examples](model_support.md) |
 | Rhino Launch 和合并算子资产 | [受限运行时资产](runtime_assets.zh.md) | [Restricted runtime assets](runtime_assets.md) |
 | Checkpoint 来源、hash 和转换 | [模型资产](model_assets.zh.md) | [Model assets](model_assets.md) |
 | TOML、环境变量和运行时参数 | [运行时配置](runtime_config.zh.md) | [Runtime configuration](runtime_config.md) |
 | 模型入口、配置检查和 profiling | [模型运行与性能分析](model_testing.zh.md) | [Model execution and profiling](model_testing.md) |
 | 可复现性能测量 | [性能测量](performance.zh.md) | [Performance measurement](performance.md) |
-| 支持状态与数值门禁 | [模型验证策略](validation_policy.zh.md) | [Model validation policy](validation_policy.md) |
+| 适量验证与数值记录 | [模型验证策略](validation_policy.zh.md) | [Model validation policy](validation_policy.md) |
 
 ## 开发、扩展与调试
 

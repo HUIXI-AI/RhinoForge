@@ -35,6 +35,15 @@ Therefore:
 - never infer that changing `os.environ` reconfigured an existing model or
   Graph.
 
+The Pi optimized facade scopes its cold environment only during construction,
+installation and graph preparation. Normal inference uses the already-bound
+Python/native owners and still validates each current request; it does not
+rewrite process environment variables or cache input validity by tensor identity.
+See [policy entry points](../../python/rpu_backend/api/policy.py) and
+[profile admission](../../python/rpu_backend/adapters/pi05/optimized.py).
+Host thread and allocator settings remain application-owned and are applied by
+the common example runner before Torch is imported.
+
 ## Safe profile changes
 
 Classify a setting before changing it:
@@ -69,7 +78,7 @@ selectors to reproduce an older run.
 ## Sources
 
 - [Runtime configuration](../../docs/runtime_config.md)
-- [Model support](../../docs/model_support.md)
+- [Examples](../../docs/model_support.md)
 - [Model execution and profiling](../../docs/model_testing.md)
 - [Performance measurement](../../docs/performance.md)
 - [Restricted runtime assets](../../docs/runtime_assets.md)

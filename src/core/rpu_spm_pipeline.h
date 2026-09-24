@@ -279,7 +279,7 @@ struct SpmPermutationRowRunsEvents {
 // One replicated dense source is gathered by an exact row permutation directly
 // into ordered row runs of a larger replicated dense consumer storage.  The
 // sealed mapping is lowered explicitly by the coordinator into maximal
-// contiguous SPM source runs.  This route describes fixed permutation semantics; it never
+// contiguous SPM source runs.  This route describes Z1 semantics only; it never
 // implies an index buffer or a DDR fallback.
 class SpmPermutationRowRunsRoute {
 public:
@@ -562,7 +562,7 @@ struct SpmFmbResolvedExecutionStep {
 
 // Opaque schema-v7 BUILD-topology profile.  There is no public constructor or
 // step getter: callers can compare its sealed count/hash but cannot forge,
-// delete, reorder, or rewrite the traversal required by FusedModelBase.
+// delete, reorder, or rewrite the traversal proven by FusedModelBase.
 class SpmFmbResolvedExecutionProfile {
 public:
     uint64_t profile_hash() const { return profile_hash_; }
@@ -1874,8 +1874,8 @@ private:
 using SpmFmbDenseProducerYieldTarget = SpmFmbPostFnYieldTarget;
 using SpmFmbDenseProducerYieldScope = SpmFmbPostFnYieldScope;
 
-// The consumer operation is part of route identity. Overwrite copies the
-// payload; RunAdd consumes both payload and destination and
+// The consumer operation is part of route identity.  Overwrite is the
+// historical schema-v5 copy; RunAdd consumes both payload and destination and
 // lowers later to the existing SPM eltwise-ADD launcher.
 enum class SpmConsumerTransform : uint8_t {
     Overwrite = 1,

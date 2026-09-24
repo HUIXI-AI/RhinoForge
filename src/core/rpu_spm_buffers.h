@@ -164,6 +164,18 @@ public:
         SPM_ALLOC.reset_temporary();
     }
 
+    // Debug
+    void dump_buffers(const char* tag) const {
+        printf("[%s:%s] core0: res=0x%08x norm=0x%08x gate=0x%08x up=0x%08x down=0x%08x "
+               "q=0x%08x k=0x%08x v=0x%08x out=0x%08x oproj=0x%08x tmp=0x%08x nw=0x%08x\n",
+               sub_, tag,
+               SPM_ALLOC.addr(0, residual1_off), SPM_ALLOC.addr(0, input_norm_off),
+               SPM_ALLOC.addr(0, gate_off), SPM_ALLOC.addr(0, up_off), SPM_ALLOC.addr(0, down_off),
+               SPM_ALLOC.addr(0, q_off), SPM_ALLOC.addr(0, k_off), SPM_ALLOC.addr(0, v_off),
+               SPM_ALLOC.addr(0, output_off), SPM_ALLOC.addr(0, oproj_off),
+               SPM_ALLOC.addr(0, sdpa_tmp_off), SPM_ALLOC.addr(0, input_norm_weight_off));
+    }
+
 protected:
     const char* sub_;
 };

@@ -17,6 +17,9 @@ restricted library and combined operator asset remain outside the source tree.
 - Treat the Launch package, operator asset, and RhinoForge release as one
   versioned runtime set. A successful link does not prove runtime compatibility.
   [Runtime set](../../docs/runtime_assets.md#delivery-layout)
+- Require the runtime set to bind
+  `launch_capabilities=batch-buffer-reservation-v1`; the package version and
+  SONAME do not identify that lifecycle contract.
 - Require the release-provided `<operator-asset>.kernels` sidecar before loading
   any program. It lists the asset size and names only; RhinoForge never parses
   the opaque asset.

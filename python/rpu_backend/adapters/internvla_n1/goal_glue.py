@@ -6,19 +6,15 @@ Bridges System-2 (vlm_tokens) to System-1 (NavDP memory). Two small modules:
     4 vlm tokens to a single goal token, with learned token/query positional encodings.
 
 Reconstructed as plain nn.Modules (no InternNav import); weights load strictly from the
-public checkpoint's ``model.navdp.vlm_embed_mlp.*`` and
-``model.navdp.goal_compressor.*`` tensors. The unvalidated stock-aten RPU path is
-deliberately rejected.
+extracted `navdp_head.safetensors` (`vlm_embed_mlp.*`, `goal_compressor.*`). The unvalidated
+stock-aten RPU path is deliberately rejected.
 """
 from __future__ import annotations
-from collections.abc import Mapping
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from ._checkpoint import NAVDP_PREFIX, open_public_checkpoint
 
 
 class LearnablePositionalEncoding(nn.Module):
@@ -75,29 +71,12 @@ class GoalGlue(nn.Module):
         return self.goal_compressor(self.vlm_embed_mlp(vlm_tokens))
 
 
-def build_goal_glue(
-    checkpoint_dir: str | Path,
-    device: str = "cpu",
-    *,
-    asset_manifest: Mapping[str | Path, str] | None = None,
-) -> GoalGlue:
-    """Load CPU-fp32 goal glue from the public sharded checkpoint."""
+def build_goal_glue(safetensors_path: str | Path, device: str = "cpu") -> GoalGlue:
+    """Load the CPU-fp32 goal glue from ``navdp_head.safetensors``."""
     if device != "cpu":
         raise ValueError("InternVLA-N1 goal glue supports only device='cpu' with fp32")
-    prefixes = (
-        NAVDP_PREFIX + "vlm_embed_mlp.",
-        NAVDP_PREFIX + "goal_compressor.",
-    )
-    store, names, _ = open_public_checkpoint(
-        checkpoint_dir,
-        asset_manifest,
-        prefixes=prefixes,
-        controlled_rpu=False,
-    )
-    sd = {
-        name[len(NAVDP_PREFIX):]: store.get_tensor(name)
-        for name in names
-    }
+    from safetensors.torch import load_file
+    sd = load_file(str(safetensors_path))
     g = GoalGlue().eval()
     g.vlm_embed_mlp.load_state_dict({
         k[len("vlm_embed_mlp."):]: v.float()

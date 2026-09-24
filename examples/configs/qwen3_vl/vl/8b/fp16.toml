@@ -1,0 +1,31 @@
+# Public configuration; provide your own checkpoint and input assets.
+
+[example]
+profile_id = "qwen3-vl-8b.fp16.multimodal"
+registry_alias = "qwen3-vl-8b"
+target = "qwen3_vl"
+dtype = "fp16"
+architecture = "Qwen3VLForConditionalGeneration"
+
+[example.opt_in]
+
+[input]
+component = "multimodal"
+prompt = "Describe the image."
+decode_steps = 4
+images = ["assets/example.ppm"]
+
+[run]
+warmup = 1
+runs = 3
+hwperf = false
+profile = false
+seed = 0
+
+[rpu_execution]
+
+[rpu_execution.prefill]
+chunk_size = "auto"
+
+[rpu_execution.vision]
+chunk_size = "auto"

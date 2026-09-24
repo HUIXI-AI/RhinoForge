@@ -1,0 +1,48 @@
+# V3 FP16 caller-factory template with public cold optimization controls.
+# The installed model integration must implement and validate this V3 profile.
+[example]
+profile_id = "rhinovla.v3.fp16.trusted-factory"
+registry_alias = "rhinovla-controlled"
+target = "rhinovla"
+dtype = "fp16"
+
+[input]
+checkpoint = "/path/to/rhinovla-v3/checkpoint"
+runtime_factory = "your_package.rhinovla_v3:create_runtime"
+request = "/path/to/rhinovla-v3/request.pt"
+factory_config = "/path/to/rhinovla-v3/factory.json"
+trust_model_code = true
+num_steps = 10
+
+[run]
+warmup = 1
+runs = 3
+hwperf = false
+profile = false
+seed = 0
+
+[rpu_execution.components.vision_encoder.vision]
+chunk_size = "auto"
+rpu_patch_embed = true
+rpu_mergers = true
+fused_merger = true
+fast_replay = true
+preload_replay_skip = true
+bake_merger = true
+
+[rpu_execution.components.language_model.prefill]
+chunk_size = "auto"
+prefix_prep_cache = true
+prefix_prep_rpu = true
+prefix_no_clone = true
+partial_mrope = true
+merger_scatter = true
+fast_replay = true
+preload_replay_skip = true
+
+[rpu_execution.components.action_expert.action]
+chunk_size = "auto"
+denoise_unroll = true
+shared_cache = true
+prefix_alias = true
+fast_replay = true

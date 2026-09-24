@@ -5,7 +5,7 @@
 RhinoForge provides offline checkpoint converters for selected model families.
 Quantization support is profile-specific: a converted checkpoint does not
 inherit the support status of its FP16 source or of another model size. Check
-[Model support](model_support.md) and the release's
+[Examples](model_support.md) and the release's
 [Model assets](model_assets.md) before using a converted checkpoint.
 
 All converters read a source checkpoint and create a new destination directory.
@@ -52,14 +52,46 @@ and its default minimum weight cosine is `0.999`; these are converter checks,
 not model-level acceptance criteria. Use `--max-samples` and `--min-cosine` to
 apply the release procedure's values, then run end-to-end validation.
 
+## Qwen3 explicit W4/G32 installation
+
+The public CausalLM loader accepts `quantization="w4a16"` for the exact dense
+0.6B, 1.7B, 4B, 8B, 14B and 32B source geometries. It quantizes the seven
+decoder projections once during installation; `quantization="w4a16_lm_head"`
+also quantizes the head. The source must contain original floating weights,
+not AWQ/GPTQ or offline W8 tensors. Embeddings, norms and activations stay FP16.
+These recipes require TP8 and batch one; cold `prefill.linear_acc32=false/true`
+selects ACC16/ACC32. They do not extend ordinary FP16 admission or certify
+model quality. See the [Qwen3 templates](../examples/configs/qwen3/README.md).
+
+## Qwen3-VL
+
+Use `python -m rpu_backend.quant.convert_qwen3_vl` for offline 2B/4B/8B conversion.
+`--bits 8` converts public FP16 weights to W8A16. For the `awq_w4.toml`
+examples, use `--bits 4` with symmetric G32 compressed-tensors AWQ input:
+Text AWQ is preserved, the LM head uses RTN W4, and Vision uses W8.
+The converter also accepts the exact unquantized public 2B/4B/8B FP16 profile
+with `--bits 4`; that produces RTN W4 text/head weights, not AWQ weights.
+The two recipes have distinct metadata. Incompatible input formats are rejected
+before conversion.
+
+```sh
+python -m rpu_backend.quant.convert_qwen3_vl --bits 8 --src SOURCE_DIR --dst W8_DIR
+python -m rpu_backend.quant.convert_qwen3_vl --bits 4 --src AWQ_DIR --dst W4_DIR
+```
+
+Load the converted directory without a precision environment override. The
+original AWQ directory and converted runtime directory are distinct artifacts.
+
 ## Pi0.5
 
 The default Pi0.5 conversion is W8A16 for the VLM decoder and action-expert
 decoder projections. Vision encoder, AdaRMS dense layers, action projection,
 and processor sidecars remain FP16 or unchanged.
 
-Pi0.5 W8A16 and W4A16 outputs are Source-only in v1.0.0: the release binds no
-public immutable derived checkpoint identity or hash for them.
+Pi0.5 W8A16 and mixed W4A16-G32-KV8 outputs are Source-only in v1.0.0: the
+release binds no public immutable derived checkpoint identity or hash for them.
+Their exact same-quantization oracle and checkpoint-owned task evidence also
+remain pending.
 
 ```bash
 python -m rpu_backend.quant.convert_pi05 \
@@ -76,20 +108,44 @@ python -m rpu_backend.quant.convert_pi05 \
   --dst /path/to/pi05-fake-W4 \
   --fake-w4
 
-# Runtime W4 evaluation format.
+# Runtime mixed W4A16-G32-KV8 evaluation format (not pure W4).
 python -m rpu_backend.quant.convert_pi05 \
   --src /path/to/pi05-source \
-  --dst /path/to/pi05-W4A16 \
+  --dst /path/to/pi05-mixed-W4A16-G32-KV8 \
   --fake-w4 --real-w4
 ```
 
+The runtime profile is mixed W4A16-G32-KV8, not pure W4. Only the declared
+Gemma VLM/action-expert Linear projection weights are quantized:
+q/o/gate/up/down use symmetric W4 group-size-32 weights along K, while K/V
+projection weights remain W8. Activations and the KV cache remain FP16. The
+checkpoint stores logical FP16 scales as `[K/32, N]`; loading stripes them into
+the packed pgrp ABI. SigLIP, AdaRMS dense, action projection, and processor
+sidecars remain FP16 or unchanged.
+
 `--keep-int8` accepts a comma-separated list of projection names for a
-controlled mixed-precision W4 experiment. Real W4 automatically keeps the key
-and value projections at INT8. Both W4 modes are Source-only evaluation paths
-and require their own immutable asset identity and validation before promotion.
+controlled mixed-precision W4 experiment. `--real-w4` is the legacy CLI name
+for the mixed profile and automatically keeps the K/V projection weights at W8.
+Both W4 modes are Source-only evaluation paths and require their own immutable
+asset identity, exact same-quantization oracle, and checkpoint-owned task
+evidence before promotion.
 
 The converter deliberately omits a stale remapped checkpoint so the Pi0.5
 loader can regenerate it from the new quantized tensors.
+
+### Optimized Action NVFP4 format
+
+```sh
+python -m rpu_backend.quant.convert_pi05 --src SOURCE_DIR --dst NVFP4_DIR --action-w4 --action-w4-format nvfp4
+```
+
+`--action-w4` defaults to NVFP4 with `striped_v2` ABI and block16. Action
+Q/O/Gate/Up/Down use NVFP4; K/V and VLM remain W8. The converter writes
+`rpu_quant_config.json`. Use this format with
+`optimized_profile.precision=w8_action_nvfp4`; the two- or three-camera
+`w8_prefill_a8_action_nvfp4` variant additionally selects Prefill GateUp A8 at
+installation. It is not interchangeable with the legacy `--real-w4` INT4
+G32/KV8 format described above.
 
 ## Wall-OSS
 
@@ -129,6 +185,34 @@ per-output-channel scale across `K / 32` groups, then produce the
 controller-striped layout. Do not add a model-specific packing or tile
 override. FP16, W8A16, and W4A16 Linear paths all use the shared generated auto-tiler described in
 [Generated Linear auto-tiling](../knowledge/concepts/linear-autotiling.md).
+
+## Qwen3.5 Dense image-text examples
+
+The [Dense VL configurations](../examples/configs/qwen3_5/README.md) select
+checkpoint-declared text projection quantization with an FP16 vision tower.
+Use `rpu_backend.quant.convert_qwen3_5` to produce the complete conditional
+generation checkpoint and `RPUModelForConditionalGeneration` to load it;
+ordinary Hugging Face loading can lose integer storage and scale metadata.
+Embedding, LM head, norms and GDN convolution remain floating point.
+The example checks the declared precision before processor or weight loading.
+
+Quantized image evaluation requires both
+`QWEN3_5_QUANT_ALLOW_UNCERTIFIED=1` and
+`QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED=1`. These are separate admission controls;
+neither declares numerical or task-quality certification. See the configuration
+index for the exact sizes, quantization methods and core counts. MoE mixed-E4M3
+and legacy text bundles keep their separate formats.
+
+## RhinoVLA v3 expert examples
+
+The [v3 W8 configurations](../examples/configs/rhinovla/v3/README.md) pass
+`expert_w8a16` and `full_w8a16` to a caller-owned, trusted runtime factory.
+`w8a16.toml` quantizes the action expert's Q/K/V/O and gate/up/down projections.
+`full_expert_w8a16.toml` also selects its AdaRMS condition projections.
+Both use INT8 weights with FP16 scales and activations; neither template selects
+vision, prefix-language or action-IO quantization. The runner verifies actual
+installed expert storage rather than accepting a precision label from the
+factory. Checkpoint composition and preprocessing remain owned by that factory.
 
 ## Source-only helpers
 
@@ -174,6 +258,6 @@ Before publishing or selecting a quantized profile:
 7. verify warmup and graph lifecycle behavior; and
 8. run the public end-to-end TOML example in a clean process.
 
-Record quantized results as a separate row in
-[Model support](model_support.md). A passing weight-cosine check alone is not an
-end-to-end support result.
+Record quantized results separately from the floating-point source, with the
+exact checkpoint and execution configuration. An [example](model_support.md)
+or a passing weight-cosine check alone is not an end-to-end support result.

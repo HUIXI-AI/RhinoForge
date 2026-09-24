@@ -192,6 +192,13 @@ own core-count contract. Immediate multi-core launches must enable broadcast
 mode so every participating core receives the host parameters. Batch and graph
 paths do this centrally.
 
+Native queue counts are checked in the range 1–8 before indexing or narrowing.
+Kernel core IDs must form a contiguous ascending range within 0–7. A segment's
+queue covers the highest kernel core ID and DMA channel, including a DMA that
+follows a kernel using fewer cores. For example, kernel cores 0–3 followed by
+DMA channel 5 require a queue covering cores 0–5. This resource bookkeeping
+does not add model-level core-count configuration.
+
 Standard residual reduction uses the shared generated eight-core ring. The
 wrapper selects its schedule from validated geometry, and a partial producer
 clears inactive shards before the ring consumes them. FP16, W8A16, and packed
@@ -234,5 +241,5 @@ or destination address until execution completes. See
 | `src/fused/` | Model-specific fused subsystems |
 
 Supported behavior is defined by an exact model profile and release asset set,
-not by source-file presence. See [Model support](model_support.md) and
+not by source-file presence. See [Examples](model_support.md) and
 [Model porting](model_porting.md).

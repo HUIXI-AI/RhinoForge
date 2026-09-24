@@ -1,0 +1,24 @@
+# Generic FP16 evaluation profile; supply caller-owned images and checkpoint.
+[example]
+profile_id = "lingbot-vla-v2-6b.fp16.source-only"
+registry_alias = "lingbot-vla-v2-6b"
+target = "lingbot2"
+dtype = "fp16"
+
+[example.opt_in]
+RPU_LINGBOT2_ALLOW_UNVALIDATED = "1"
+
+[input]
+images = ["assets/example.ppm", "assets/example.ppm", "assets/example.ppm"]
+instruction = "Pick up the object on the table."
+proprioception = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+seed = 0
+
+[run]
+warmup = 1
+runs = 3
+hwperf = false
+profile = false
+seed = 0
+
+[rpu_execution]

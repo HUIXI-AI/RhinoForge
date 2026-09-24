@@ -1,9 +1,10 @@
-"""Class-level patches for Qwen3-VL.
+"""Class-level patches for Qwen3-VL (R-Phase 4).
 
 Idempotent class swaps for `Qwen3VLTextRMSNorm` and `Qwen3VLTextRotaryEmbedding`
 so the CPU-side reference path inside HF code still works after `.to('rpu')`.
 
-These patches run once per process at adapter import time.
+Mirrors the qwen3.py:55-70 pattern. These patches run once per process at
+adapter import time.
 """
 
 from __future__ import annotations

@@ -1,23 +1,44 @@
-// fused_model_base.h — flat single-class framework contract
+// fused_model_base.h — Flat single-class framework contract (Plan 01-01)
 //
-// Exposes four mandatory virtuals, a narrow facade, and run_all_layers.
+// Collapses v2's FusedLayerBase + FusedModelBase into ONE public header.
+// Exposes: 4 mandatory virtuals (D-201/202), narrow facade (D-203), run_all_layers.
 // Internal state hides behind PImpl (Impl defined in fused_model_base_impl.h).
+// v2 headers untouched during shim-coexist (D-301) until Plan 01-07b.
+//
+// DEVIATION NOTE (Rule 3, blocking issue found during Task 2 build):
+//   v2's src/core/fused_model_base.{h,cpp} already defines a top-level
+//   `class FusedModelBase`. Defining a second top-level class with the same
+//   name in this TU causes a linker collision (multiple definition). To
+//   satisfy D-301 (shim-coexist, both compile alongside), v3 lives inside
+//   `namespace v3 { ... }`. Plan 01-07b's atomic cleanup removes the v2
+//   files AND lifts v3's class out of the namespace into the canonical
+//   top-level, then renames fused_model_base.{h,cpp} →
+//   fused_model_base.{h,cpp}. No subclass code changes during the rename.
 
 #pragma once
 
 #include <ATen/ATen.h>
+#include <c10/util/ScopeExit.h>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
+#include <list>
 #include <memory>
 #include <optional>
+#include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
+#include "ops/rpu_kvinsert_segment_plan.h"
+#include "execution_topology.h"
+#include "rpu_math_precision.h"
 
 class RpuKernelGraph;
 class GraphDmaSemanticEndpoint;
 class GraphKernelRegisterCensusGuard;
 class SdpaStableMaskCache;
+class KvInsertSegmentPlan;
 
 namespace v3 {
 
@@ -45,7 +66,7 @@ struct SpmFmbResolvedExecutionStep;
 struct SpmFmbOccurrenceSchedule;
 struct SpmFmbConsumerOccurrenceSelector;
 
-// Public enum numeric values are stable; new values are append-only.
+// Public enums keep their v2 numeric values; new values are append-only.
 enum class ChunkMode       : int { SEQUENTIAL = 0, KV_FIRST = 1 };
 enum class InterLayerIO    : int { AUTO = 0, SPM_RESIDENT = 1, DDR_PINGPONG = 2 };
 // AUTO is the public default. SPM_KV_BY_MHA means raw transient K/V remain in
@@ -56,6 +77,14 @@ enum class AttentionExecutionPolicy : int {
     AUTO = 0,
     DDR_KV = 1,
     SPM_KV_BY_MHA = 2,
+};
+// Resolved table residency carried by a COMPLETE physical manifest.  It is a
+// layout input, not a public tuning field: UNSPECIFIED preserves every owner
+// that has no route-dependent RoPE allocation.
+enum class FmbRopeTableResidency : int {
+    UNSPECIFIED = 0,
+    DDR = 1,
+    SPM = 2,
 };
 enum class ActivationKind  : int {
     NONE = 0,
@@ -78,7 +107,7 @@ enum class BufferScope : uint8_t {
     OutsideLayerLoop = 3,
 };
 
-// Buffer, layout, and chunk structs.
+// Buffer / layout / chunk structs (verbatim from v2, plus D-502 field)
 struct BufferDecl {
     const char*  name         = nullptr;
     int64_t      size         = 0;
@@ -89,23 +118,25 @@ struct BufferDecl {
     const char*  alias_of     = nullptr;
     BufferScope  scope        = BufferScope::LayerWide;
 
-    // For Persistent / PersistentPerLayer buffers, the framework auto-wires:
+    // D-502: for Persistent / PersistentPerLayer buffers, framework auto-wires:
     //   (1) captures SPM_ALLOC.persistent_generation() at allocation
-    //   (2) re-fires on generation advance or preload_callbacks_dirty_
+    //   (2) re-fires on generation advance OR on preload_callbacks_dirty_ (EXT-4)
     //   (3) passes layer_idx (-1 for non-per-layer) + core-0 absolute SPM addr
     //
-    // Graph-capture contract:
+    // EXT-5 graph-capture contract (LOCKED):
     //   The caller's GraphCache/raw-Graph scope owns capture. Every rpu_launch_*
     //   emitted by the complete preload-callback loop enters that active graph
     //   through RpuQueue/graph_dma. Callbacks MUST NOT open a nested graph or raw
     //   batch scope themselves.
+    //   Audit (must return 0 in every ported model):
+    //     grep -c 'BATCH_CTX\.begin\|BATCH_CTX\.end' src/fused/<model>.cpp
     std::function<void(FusedModelBase& /*self*/,
                        int             /*layer_idx*/,
                        uint32_t        /*core0_addr*/)> preload_callback;
 
-    // For fused AdaRMS broadcast, allocate this PersistentPerLayer decl's layers
+    // B1 (AdaRMS fused broadcast): allocate this PersistentPerLayer decl's layers
     // in DESCENDING layer order (L = per_layer-1 .. 0). alloc_super_persistent is a
-    // DOWNWARD bump allocator (see rpu_spm_allocator.cpp), so the default ascending
+    // DOWNWARD bump allocator (rpu_spm_allocator.cpp:172), so the default ascending
     // loop puts layer 0 at the HIGHEST address — the reverse of every [num_layers, h]
     // DDR-side buffer. Allocating descending makes layer L sit at
     // `layer_addr(0) + L*align_up(size)`, i.e. SAME direction as DDR, so all
@@ -134,10 +165,52 @@ inline int64_t layout_mix(int64_t acc, int64_t value) {
 
 // Pure SPM-budget estimator used by chunk planning and CPU-only contract tests.
 int64_t estimate_temporary_total(const std::vector<BufferDecl>& decls);
+
+struct FmbPreparedSpmCost {
+    int64_t persistent = 0;
+    int64_t temp_per_layer = 0;
+    int64_t temporary = 0;
+    int64_t available(int64_t after_reset_free, bool persistent_allocated,
+                      int64_t planning_budget) const;
+    bool fits(int64_t after_reset_free, bool persistent_allocated,
+              int64_t planning_budget) const;
+};
+
+// Cache pure allocator planning, not an admission result or live resource
+// state. Match the full current declaration input, including alias presence
+// and lifetime, rather than assuming every model's layout hash is complete.
+class FmbPreparedSpmCostCache {
+public:
+    static constexpr size_t kCapacity = 32;
+    FmbPreparedSpmCost prepare(const std::vector<BufferDecl>& declarations);
+    void clear() { entries_.clear(); }
+    size_t size() const { return entries_.size(); }
+private:
+    struct Input {
+        int64_t size;
+        int phase_start, phase_end;
+        StorageClass storage;
+        int per_layer;
+        BufferScope scope;
+        bool alias;
+        bool matches(const BufferDecl& declaration) const;
+    };
+    struct Entry {
+        std::vector<Input> inputs;
+        FmbPreparedSpmCost cost;
+    };
+    std::list<Entry> entries_;
+};
 // Prefer fewer chunks, then the most even fixed-size chunk + tail split.
 bool prefer_balanced_chunk(int64_t seq_len, int64_t candidate,
                            int64_t current);
 }  // namespace detail
+
+enum class FmbForwardOperandResidency : uint8_t {
+    UNSPECIFIED = 0,
+    PER_LAYER = 1,
+    FORWARD = 2,
+};
 
 struct LayoutContext {
     int64_t chunk_size = 0;
@@ -145,7 +218,7 @@ struct LayoutContext {
     int64_t max_kv_seq_len = 0;
     int64_t num_layers = 0;
     bool    use_attn_mask = false;
-    // The attention layout mode (causal vs bidirectional-
+    // the attention layout mode (causal vs bidirectional-
     // no-mask) drives subclass declare_buffers layout (KV_FIRST q_kv split, k/v
     // sizing, buffer scopes, sdpa_tmp mask — see CausalDecoderModel). It MUST be
     // part of the allocation identity (compute_params_hash_impl) so a handle that
@@ -170,9 +243,23 @@ struct LayoutContext {
     // kv_seq_len/position is intentionally excluded: decode must not allocate
     // a fresh layout at every token.
     uint64_t stage_plan_fingerprint = 0;
+    // Non-zero only for a COMPLETE physical descriptor. Route selectors can
+    // alter BufferDecl shape without changing the logical stage plan, so this
+    // identity independently prevents incompatible allocation reuse.
+    uint64_t physical_manifest_fingerprint = 0;
     // Resolved value only (never AUTO) once final allocation begins.
     AttentionExecutionPolicy attention_policy =
         AttentionExecutionPolicy::DDR_KV;
+    FmbRopeTableResidency rope_table_residency =
+        FmbRopeTableResidency::UNSPECIFIED;
+    // Selected by an adopting owner's COMPLETE physical schedule. Never infer
+    // this from live free space in declare_buffers() or during Graph replay.
+    FmbForwardOperandResidency forward_operand_residency =
+        FmbForwardOperandResidency::UNSPECIFIED;
+    // Cold oracle hint only: the configurable capacity can exceed the actual
+    // first chunk (e.g. M18/C32). A growing candidate must also fit that exact
+    // capacity probe. This is not an allocation input or part of its hash.
+    int64_t planning_chunk_capacity = 0;
 
     int64_t effective_kv_cs() const {
         return kv_insert_chunk_size > 0 ? kv_insert_chunk_size : chunk_size;
@@ -196,12 +283,25 @@ struct ResolvedFmbStageChunks {
     std::vector<ChunkInfo> chunks;
 };
 
+enum class FmbSpanBoundaryPolicy : uint8_t {
+    ALLOW_CROSS,
+    KEEP_LOCAL,
+    GROUP_LOCAL,
+};
+
+struct FmbStageBoundaryPolicies {
+    FmbSpanBoundaryPolicy input = FmbSpanBoundaryPolicy::ALLOW_CROSS;
+    FmbSpanBoundaryPolicy qkv = FmbSpanBoundaryPolicy::ALLOW_CROSS;
+    FmbSpanBoundaryPolicy compute = FmbSpanBoundaryPolicy::ALLOW_CROSS;
+};
+
 // One independent semantic span on the physical sequence axis. Vision uses
 // image boundaries; language/action default to one full-sequence span and may
 // specialize when several independent streams are packed along sequence.
 struct FmbExecutionSpan {
     int64_t offset = 0;
     int64_t len = 0;
+    int64_t group_id = -1;
 };
 
 struct FmbThreeStageChunkPlan {
@@ -209,6 +309,7 @@ struct FmbThreeStageChunkPlan {
     ResolvedFmbStageChunks qkv;
     ResolvedFmbStageChunks compute;
     std::vector<FmbExecutionSpan> spans;
+    FmbStageBoundaryPolicies boundary_policies;
     ChunkMode chunk_mode = ChunkMode::SEQUENTIAL;
 };
 
@@ -227,6 +328,13 @@ FmbThreeStageChunkPlan compose_fmb_three_stage_chunk_plan(
     std::vector<ChunkInfo> compute_chunks,
     std::vector<FmbExecutionSpan> spans,
     ChunkMode chunk_mode);
+FmbThreeStageChunkPlan compose_fmb_three_stage_chunk_plan(
+    std::vector<ChunkInfo> input_chunks,
+    std::vector<ChunkInfo> qkv_chunks,
+    std::vector<ChunkInfo> compute_chunks,
+    std::vector<FmbExecutionSpan> spans,
+    ChunkMode chunk_mode,
+    FmbStageBoundaryPolicies boundary_policies);
 // Common six-argument run_all_layers plan: one full-sequence input stage and
 // one semantic span, with QKV/compute schedules derived from the exact
 // allocation chunk sizes. Physical-pipeline prepare uses this to seal the same
@@ -248,10 +356,44 @@ int64_t validate_resolved_chunk_coverage(
     const std::vector<ChunkInfo>& chunks,
     const char* contract,
     const char* role);
+void validate_fmb_execution_spans(
+    const std::vector<FmbExecutionSpan>& spans,
+    int64_t execution_len,
+    const char* contract);
+bool fmb_chunks_respect_boundary_policy(
+    const std::vector<ChunkInfo>& chunks,
+    const std::vector<FmbExecutionSpan>& spans,
+    FmbSpanBoundaryPolicy policy);
+void validate_fmb_planning_shape(
+    int64_t execution_len,
+    int64_t position,
+    const char* contract);
+void validate_fmb_exact_chunk_size(
+    int64_t requested_chunk_size,
+    int64_t execution_len,
+    const char* contract);
 AttentionExecutionPolicy resolve_attention_execution_policy(
     AttentionExecutionPolicy requested,
     bool model_kernel_eligible,
     bool exact_spm_layout_fits);
+
+// Logical coverage remains canonical. An owner may separately opt into the
+// physical KVIN1, KVIN0, COMP0, COMP1 schedule for one equal, zero-position
+// pair. Both the profile builder and runtime traversal use this same gate.
+inline bool fmb_kv_first_pair_carry_eligible(
+    const std::vector<ChunkInfo>& compute,
+    const std::vector<ChunkInfo>& kv_insert, int64_t rows) {
+    if (rows <= 0 || rows > std::numeric_limits<int64_t>::max() / 2 ||
+        compute.size() != 2 || kv_insert.size() != 2) return false;
+    for (int i = 0; i != 2; ++i) {
+        for (const auto* chunks : {&compute, &kv_insert}) {
+            const auto& c = (*chunks)[i];
+            if (c.idx != i || c.offset != i * rows || c.len != rows ||
+                c.kv_seq_len != (i + 1) * rows) return false;
+        }
+    }
+    return true;
+}
 }  // namespace detail
 
 // Board-free causal-prefill planning result.  `resolved_chunk_size` is the
@@ -268,6 +410,332 @@ struct SpmPipelineCausalPrefillShape {
     InterLayerIO inter_layer_io = InterLayerIO::AUTO;
     bool chunk_outer_within_group = false;
 };
+
+// Version-2 physical descriptor wire.  The codec is deliberately capable of
+// carrying every native selector without assigning model-specific meaning to
+// selector/argument values: each owner must publish and validate those values
+// before a COMPLETE manifest is admitted by forward.  UNSPECIFIED is the
+// migration-safe state emitted by owners that have not supplied that contract;
+// it must never be interpreted as a default route.
+enum class FmbPhysicalManifestState : int {
+    UNSPECIFIED = 0,
+    COMPLETE = 1,
+};
+
+enum class FmbGraphLifecycle : int {
+    UNSPECIFIED = 0,
+    RETAINED_CACHE = 1,
+    BOUNDED_ONESHOT = 2,
+    NATIVE_COMPOSITE1 = 3,
+    COMPOSITE_CHILD = 4,
+};
+
+enum class FmbLinearAccumulationPolicy : int {
+    UNSPECIFIED = 0,
+    ACC16 = 1,
+    ACC32 = 2,
+    MIXED_BY_SITE = 3,
+};
+
+enum class FmbRouteFamily : int {
+    ATTENTION = 1,
+    LINEAR = 2,
+    ALL_REDUCE = 3,
+    ROPE = 4,
+    KV_INSERT = 5,
+    MUTABLE_DMA = 6,
+    NORMALIZATION = 7,
+    ACTIVATION = 8,
+    GRAPH_SCHEDULE = 9,
+    COLLECTIVE = 10,
+};
+
+// Shared high-bit route flags.  Owner-local low bits remain available for
+// kernel-specific reasons; these two bits make table residency recoverable
+// from the immutable descriptor before declare_buffers() runs.
+inline constexpr int64_t FMB_ROUTE_FLAG_ROPE_TABLE_DDR = 1LL << 56;
+inline constexpr int64_t FMB_ROUTE_FLAG_ROPE_TABLE_SPM = 1LL << 57;
+
+// Shared LINEAR selector IDs.  A COMPLETE owner manifest must name the
+// physical launcher route; AUTO_TILE is an already-resolved route here, not
+// an instruction to choose again during forward.
+enum class FmbLinearRouteSelector : int {
+    AUTO_TILE = 1,
+    GEMV = 2,
+    ACC32_OUT_BF16 = 4,
+    ROW_WEIGHT_REUSE = 5,
+    PI05_NVFP4_V2_ACC32 = 6,
+    PI05_NVFP4_V2_ACC16 = 7,
+};
+
+// Shared FusedModelBase emitters are native physical sites in their own
+// right.  Owners add the subset they actually use to their COMPLETE manifest
+// with append_fmb_shared_runtime_routes(); the emitter then consumes the same
+// entry immediately before dispatch.  Keeping this list here avoids copying
+// shared source-site IDs into every model.
+inline constexpr int64_t FMB_SHARED_LAYER_INPUT_DMA_SITE =
+    8256462186627229745LL;
+inline constexpr int64_t FMB_SHARED_LAYER_INPUT_ROW_RUN_DMA_SITE =
+    7164742071837285576LL;
+inline constexpr int64_t FMB_SHARED_PIPELINE_INGRESS_DMA_SITE =
+    1763009975491617456LL;
+inline constexpr int64_t FMB_SHARED_MLP_AUTO_TILE_SITE =
+    6066351929848019041LL;
+inline constexpr int64_t FMB_SHARED_MLP_ACC32_OUT_BF16_SITE =
+    5407567195452051675LL;
+inline constexpr int64_t FMB_SHARED_MLP_BF16_FP16_REDUCE_SITE =
+    8878474719496009170LL;
+inline constexpr int64_t FMB_SHARED_MLP_FP16_BF16_REDUCE_SITE =
+    1641660405853831496LL;
+inline constexpr int64_t FMB_SHARED_MLP_RING_REDUCE_SITE =
+    1201194854597513173LL;
+inline constexpr int64_t FMB_SHARED_MLP_PREPARE_INPUT_SITE =
+    47322565134527036LL;
+inline constexpr int64_t FMB_SHARED_MLP_SILU_MUL_SITE =
+    379290273870460553LL;
+
+enum FmbSharedRuntimeRouteMask : uint32_t {
+    FMB_SHARED_LAYER_INPUT_DMA = 1U << 0,
+    FMB_SHARED_LAYER_INPUT_ROW_RUN_DMA = 1U << 1,
+    FMB_SHARED_PIPELINE_INGRESS_DMA = 1U << 2,
+    FMB_SHARED_MLP_AUTO_TILE = 1U << 3,
+    FMB_SHARED_MLP_ACC32_OUT_BF16 = 1U << 4,
+    FMB_SHARED_MLP_BF16_FP16_REDUCE = 1U << 5,
+    FMB_SHARED_MLP_FP16_BF16_REDUCE = 1U << 6,
+    FMB_SHARED_MLP_RING_REDUCE = 1U << 7,
+    FMB_SHARED_MLP_PREPARE_INPUT = 1U << 8,
+    FMB_SHARED_MLP_GEMV = 1U << 9,
+};
+
+enum class FmbSharedMutableDmaRouteSelector : int64_t {
+    DDR_BROADCAST_TO_SPM = 1,
+    CANONICAL_DDR_BROADCAST_TO_SPM_MUTABLE_SRC = 2,
+};
+
+enum class FmbSharedAllReduceRouteSelector : int64_t {
+    RING_NOPACE = 1,
+    RING_PACED = 2,
+    PREPARE_RING_INPUT = 3,
+    FP16_PARTIAL_BF16_RESIDUAL = 4,
+    BF16_PARTIAL_FP16_RESIDUAL = 5,
+    RING_PI05_XOR3 = 6,
+};
+
+struct FmbRouteManifestEntry {
+    // Positive, owner-stable native call-site ID.  Repeated physical
+    // invocations of that site use the zero-based invocation discriminator;
+    // (family, site_id, invocation) is unique and encoded in that order.
+    int64_t site_id = 0;
+    FmbRouteFamily family = FmbRouteFamily::ATTENTION;
+    // Append-only selector ID and non-negative physical arguments (for
+    // example, a hybrid KV-insert segment partition). ATTENTION is the shared
+    // exception to owner-defined selector semantics: selector is exactly a
+    // resolved AttentionExecutionPolicy (DDR_KV or SPM_KV_BY_MHA).
+    // Site-specific attention-kernel variants may use flags/arguments, but
+    // forward must consume those exact values through consume_physical_route.
+    int64_t selector = 0;
+    int64_t flags = 0;
+    std::vector<int64_t> arguments;
+    int64_t invocation = 0;
+};
+
+struct FmbPhysicalExecutionManifest {
+    FmbPhysicalManifestState state =
+        FmbPhysicalManifestState::UNSPECIFIED;
+    // Execution geometry is independent from KV-cache horizon and from the
+    // physical row count emitted by the selected KV-insert route.
+    int64_t logical_length = 0;
+    int64_t physical_length = 0;
+    int64_t execution_padding_rows = 0;
+    int64_t kv_logical_length = 0;
+    int64_t kv_insert_physical_rows = 0;
+    FmbGraphLifecycle graph_lifecycle = FmbGraphLifecycle::UNSPECIFIED;
+    FmbLinearAccumulationPolicy linear_accumulation =
+        FmbLinearAccumulationPolicy::UNSPECIFIED;
+    std::vector<FmbRouteManifestEntry> routes;
+};
+
+int64_t fmb_ring_all_reduce_route_selector(int64_t rows, int64_t cols,
+                                          int num_cores = 8);
+int64_t fmb_ring_all_reduce_route_selector(int64_t rows, int64_t cols, bool pi05_xor3, int num_cores = 8);
+void append_fmb_shared_runtime_routes(
+    FmbPhysicalExecutionManifest& manifest,
+    const FmbThreeStageChunkPlan& plan,
+    int64_t hidden_size,
+    uint32_t route_mask,
+    int64_t compute_row_multiplier = 1,
+    int num_cores = 8,
+    int mlp_num_cores = 8);
+void append_fmb_shared_runtime_routes(
+    FmbPhysicalExecutionManifest& manifest, const FmbThreeStageChunkPlan& plan,
+    int64_t hidden_size, uint32_t route_mask, int64_t compute_row_multiplier,
+    bool pi05_xor3, int num_cores = 8, int mlp_num_cores = 8);
+
+// Explicit native opt-in for COMPLETE descriptors. The zero/default value is
+// deliberately incapable of accepting authority; an adopting owner must also
+// declare the Graph lifecycle of the current call.
+struct FmbPhysicalManifestForwardCapability {
+    bool complete_descriptor = false;
+    FmbGraphLifecycle graph_lifecycle = FmbGraphLifecycle::UNSPECIFIED;
+};
+
+uint64_t fmb_physical_manifest_fingerprint(
+    const FmbPhysicalExecutionManifest& manifest);
+void validate_fmb_physical_manifest(
+    const FmbPhysicalExecutionManifest& manifest,
+    int64_t stage_physical_length,
+    int64_t position_base);
+void validate_fmb_physical_manifest_forward_capability(
+    const FmbPhysicalExecutionManifest& manifest,
+    const FmbPhysicalManifestForwardCapability& capability);
+AttentionExecutionPolicy fmb_attention_execution_policy(
+    const FmbRouteManifestEntry& route);
+FmbRopeTableResidency fmb_rope_table_residency(
+    const FmbPhysicalExecutionManifest& manifest);
+
+// One per-forward route receipt. Lookup is read-only; consume_route records a
+// site only after the caller states the selector/flags/arguments it actually
+// dispatched. Repeated loop invocations of one semantic site are valid, while
+// missing/wrong-family/mismatched policy and omitted sites fail closed.
+class FmbPreparedStageCandidate;
+
+class FmbPhysicalManifestConsumer {
+public:
+    FmbPhysicalManifestConsumer() = default;
+    explicit FmbPhysicalManifestConsumer(
+        const FmbPhysicalExecutionManifest& manifest) {
+        reset(manifest);
+    }
+
+    void reset(const FmbPhysicalExecutionManifest& manifest);
+    void reset_prepared(
+        std::shared_ptr<const FmbPreparedStageCandidate> prepared);
+    void retain_consumed_if_matching(
+        const FmbPhysicalExecutionManifest& manifest) const;
+    bool complete() const;
+    const FmbPhysicalExecutionManifest& manifest() const;
+    uint64_t fingerprint() const;
+    const FmbRouteManifestEntry& find_route(
+        FmbRouteFamily family, int64_t site_id,
+        int64_t invocation = 0) const;
+    const FmbRouteManifestEntry& consume_route(
+        FmbRouteFamily family,
+        int64_t site_id,
+        int64_t resolved_selector,
+        int64_t resolved_flags,
+        at::IntArrayRef resolved_arguments = {},
+        int64_t invocation = 0) const;
+    AttentionExecutionPolicy attention_policy_for_site(
+        int64_t site_id, int64_t invocation = 0) const;
+    std::optional<AttentionExecutionPolicy> attention_layout_policy() const;
+    const FmbRouteManifestEntry& consume_attention_route(
+        int64_t site_id,
+        AttentionExecutionPolicy dispatched_policy,
+        int64_t invocation = 0) const;
+    // Valid only after the active REPLAY consumed the Graph branch node whose
+    // key is this exact manifest fingerprint. A replayable Graph could only
+    // have been built after the original forward consumed every route.
+    void inherit_matching_graph_replay_receipt(
+        uint64_t replayed_manifest_fingerprint) const;
+    // Only the composite preload authority may carry this subset between
+    // occurrences. Reading/merging receipts never changes the route schema.
+    std::vector<uint8_t> consumed_route_receipt() const;
+    void inherit_consumed_route_subset(
+        uint64_t manifest_fingerprint,
+        const std::vector<uint8_t>& receipt) const;
+    void require_all_consumed() const;
+
+private:
+    FmbPhysicalExecutionManifest manifest_;
+    std::shared_ptr<const FmbPreparedStageCandidate> prepared_;
+    uint64_t fingerprint_ = 0;
+    mutable std::vector<uint8_t> consumed_;
+};
+
+// One native-feasible point in the bounded A6 stage domain. Chunk values are
+// capacities (so a one-chunk tail may be shorter); the complete physical
+// schedules remain owned by FmbThreeStageChunkPlan.
+struct FmbPrefillStageCandidate {
+    int64_t input_chunk_size = 0;
+    int64_t qkv_chunk_size = 0;
+    int64_t compute_chunk_size = 0;
+    FmbThreeStageChunkPlan stage_plan;
+    FmbPhysicalExecutionManifest physical_manifest;
+};
+
+namespace detail {
+bool fmb_prefill_stage_candidate_less(
+    const FmbPrefillStageCandidate& lhs,
+    const FmbPrefillStageCandidate& rhs);
+bool fmb_prefill_stage_candidate_same_identity(
+    const FmbPrefillStageCandidate& lhs,
+    const FmbPrefillStageCandidate& rhs);
+}  // namespace detail
+
+// Versioned int-only descriptor used at the Python/C++ planning boundary.
+// Capacities stay separate from the resolved schedules because a legal
+// one-tail plan can have execution_len=225, compute capacity=240, and a single
+// physical compute chunk of length 225.  The descriptor carries every chunk,
+// span, boundary policy, mode, and the native stage-plan fingerprint. V2/V3
+// append a separately fingerprinted physical manifest (V3 adds invocation);
+// V1 remains decode-only compatibility and yields an UNSPECIFIED manifest.
+std::vector<int64_t> encode_fmb_prefill_stage_candidate(
+    const FmbPrefillStageCandidate& candidate);
+FmbPrefillStageCandidate decode_fmb_prefill_stage_candidate(
+    at::IntArrayRef descriptor);
+
+// Only the descriptor decoder can publish these immutable objects. A cache
+// hit compares every wire word; fingerprints are Graph receipts, not cache
+// identity. The cache belongs to one native owner and retains at most 32
+// descriptors (each already bounded by the wire decoder).
+class FmbPreparedStageCandidate {
+public:
+    const FmbPrefillStageCandidate& candidate() const { return candidate_; }
+    uint64_t manifest_fingerprint() const { return manifest_fingerprint_; }
+    uint64_t stage_fingerprint() const { return stage_fingerprint_; }
+    FmbChunkTopology topology() const { return topology_; }
+    FmbRopeTableResidency rope_residency() const { return rope_residency_; }
+    std::optional<AttentionExecutionPolicy> attention_policy() const {
+        return attention_policy_;
+    }
+    void validate_request(int64_t physical_length, int64_t position) const;
+
+private:
+    friend class FmbPreparedStageCandidateCache;
+    explicit FmbPreparedStageCandidate(FmbPrefillStageCandidate candidate);
+    FmbPrefillStageCandidate candidate_;
+    uint64_t manifest_fingerprint_ = 0;
+    uint64_t stage_fingerprint_ = 0;
+    FmbChunkTopology topology_ = FmbChunkTopology::SISC;
+    FmbRopeTableResidency rope_residency_ = FmbRopeTableResidency::UNSPECIFIED;
+    std::optional<AttentionExecutionPolicy> attention_policy_;
+    int64_t physical_length_ = 0;
+    int64_t position_ = 0;
+};
+
+class FmbPreparedStageCandidateCache {
+public:
+    static constexpr size_t kCapacity = 32;
+    std::shared_ptr<const FmbPreparedStageCandidate> prepare(
+        at::IntArrayRef descriptor);
+    void clear() { entries_.clear(); }
+    size_t size() const { return entries_.size(); }
+
+private:
+    struct Entry {
+        std::vector<int64_t> descriptor;
+        std::shared_ptr<const FmbPreparedStageCandidate> prepared;
+    };
+    std::list<Entry> entries_;
+};
+// A retained single-token Graph intentionally excludes the absolute decode
+// position from its identity.  Rebase only the decoded working copy's
+// absolute KV schedule; the immutable wire descriptor and both fingerprints
+// remain unchanged.
+void rebase_fmb_retained_decode_candidate(
+    FmbPrefillStageCandidate& candidate, int64_t position);
+std::vector<int64_t> encode_fmb_prefill_stage_domain(
+    const std::vector<FmbPrefillStageCandidate>& candidates);
 
 // Schema-v7 is fail-closed: existing production models do not acquire a
 // resolved-profile claim merely by inheriting FusedModelBase.  A model must be
@@ -432,7 +900,7 @@ struct SpmFmbResolvedProfileRequest {
     std::vector<ChunkInfo> kv_insert_chunks;
 };
 
-// Typed SPM offset for SDPA / KV-insert only.
+// Pitfall 3 structural fix (D-203): typed SPM offset for SDPA / KV-insert only.
 // explicit operator uint32_t() forces conversion at each call site; mixing
 // offset vs absolute address becomes a compile-time error, not a runtime bug.
 struct SpmOffset {
@@ -440,9 +908,9 @@ struct SpmOffset {
     explicit operator uint32_t() const { return value; }
 };
 
-// Description of one component's already-planned, zero-based
+// Canary-stage description of one component's already-planned, zero-based
 // temporary layout.  It deliberately carries no offsets: the physical pipeline
-// adopts the exact cached FusedModelBase layout only after validating every
+// may only adopt the exact cached FusedModelBase layout after validating every
 // buffer against its checked scratch view.
 struct SpmPipelineComponentLayout {
     size_t temporary_bytes = 0;
@@ -452,9 +920,10 @@ struct SpmPipelineComponentLayout {
 struct SpmPipelineCausalPrefillDryLayout {
     SpmPipelineCausalPrefillShape shape;
     SpmPipelineComponentLayout component;
+    std::vector<int64_t> stage_descriptor;
 };
 
-// ModelStaticConfig carries optional pointer-to-member callbacks.
+// D-501: ModelStaticConfig carries optional pointer-to-member callbacks.
 // Framework discovers features by inspecting which fields are non-null —
 // no extra virtuals on the subclass header.
 //
@@ -464,13 +933,13 @@ struct ModelStaticConfig {
     int64_t                 num_layers           = 0;
     int64_t                 cross_layer_batch_size = 0;
 
-    // Optional callbacks — null means disabled.
+    // D-501 opt-ins — null = disabled.
     // Dispatched via std::invoke(cfg.xxx_fn, *this) inside run_all_layers.
     void      (FusedModelBase::*preload_fn)()                              = nullptr;  // SigLIP
     void      (FusedModelBase::*kv_first_fn)(int, const ChunkInfo&)        = nullptr;  // Gemma Phase 1
     ChunkPlan (FusedModelBase::*kv_first_chunk_plan_fn)(const ChunkPlan&)  = nullptr;  // Gemma dual-chunk
     void      (FusedModelBase::*post_fn)()                                 = nullptr;  // Qwen3 fused lm_head
-    // pre_layers_fn / post_layers_fn are called by run_all_layers
+    // EXT-Pi05: pre_layers_fn / post_layers_fn — called by run_all_layers
     // BEFORE the first layer / AFTER the last layer, inside the same
     // caller-owned capture when active. Used by Pi05DenoiseStepModel to emit action_in_proj
     // (pre) and final PiGemmaRMSNorm + action_out_proj (post). Subclass
@@ -478,8 +947,12 @@ struct ModelStaticConfig {
     // open a raw batch or nested GraphCache scope.
     void (FusedModelBase::*pre_layers_fn)()                                = nullptr;
     void (FusedModelBase::*post_layers_fn)()                               = nullptr;
+    // After allocation, before persistent preloads: false keeps their ordinary
+    // emission and the body; true proves and advances this same Graph to its end.
+    // Only admitted without D-501 preload/pre/post hooks; captured DMA still runs.
+    bool (FusedModelBase::*checked_layer_body_replay_fn)()                 = nullptr;
     std::vector<int64_t> post_output_shape;
-    // Repeat the pre_layers_fn → layer-loop → post_layers_fn body
+    // EXT-unroll: repeat the pre_layers_fn → layer-loop → post_layers_fn body
     // this many times in ONE graph (default 1 = unchanged for all other models).
     // Only WallOssActionStepModel sets > 1 (in-graph denoise unroll).
     int64_t body_iterations = 1;
@@ -518,6 +991,13 @@ struct ModelStaticConfig {
     // keep the host op stream live on REPLAY, so the driver uses this bit to
     // disable both fast-replay skip variants.
     bool batch_decode_active = false;
+
+    // Owner-certified, default-off two-chunk KV_FIRST carry. Logical chunk
+    // vectors stay in canonical order; physical order is KVIN1, KVIN0,
+    // COMP0, COMP1. The owner must keep Q and residual alive across these
+    // callbacks and bind this policy to its physical manifest/cost identity.
+    int64_t kv_first_pair_carry_rows = 0;
+    bool kv_first_pair_carry_across_layers = false;
 };
 
 struct ModelDynamicConfig {
@@ -551,7 +1031,11 @@ struct InferenceContext {
     bool    is_causal      = true;
     bool    input_in_spm   = false;  // set by run_all_layers layer-group loop
     bool    output_to_spm  = false;
-    int64_t body_iter      = 0;  // Current body iteration; 0 unless body_iterations > 1.
+    int64_t body_iter      = 0;  // current body iteration (EXT-unroll); 0 unless body_iterations>1
+    // Zero-based physical chunk invocation of the callback currently being
+    // emitted. Shared sites whose resolved route can differ on the tail use
+    // this V3 discriminator; repeated layers/body iterations reuse it.
+    int64_t physical_route_invocation = 0;
     // Resolved for every run_all_layers call, including legacy six-argument
     // callers. Subclasses may inspect it to select a certified specialization;
     // the framework remains the sole owner of traversal and allocation.
@@ -559,12 +1043,113 @@ struct InferenceContext {
     FmbChunkTopology chunk_topology = FmbChunkTopology::SISC;
     AttentionExecutionPolicy attention_policy =
         AttentionExecutionPolicy::DDR_KV;
+
+    bool has_complete_physical_manifest() const {
+        return physical_manifest_consumer_.complete();
+    }
+    const FmbPhysicalExecutionManifest& physical_manifest() const {
+        return physical_manifest_consumer_.manifest();
+    }
+    uint64_t physical_manifest_fingerprint() const {
+        return physical_manifest_consumer_.fingerprint();
+    }
+    const FmbRouteManifestEntry& find_physical_route(
+        FmbRouteFamily family, int64_t site_id,
+        int64_t invocation = 0) const {
+        return physical_manifest_consumer_.find_route(
+            family, site_id, invocation);
+    }
+    const FmbRouteManifestEntry& consume_physical_route(
+        FmbRouteFamily family,
+        int64_t site_id,
+        int64_t resolved_selector,
+        int64_t resolved_flags,
+        at::IntArrayRef resolved_arguments = {},
+        int64_t invocation = 0) const {
+        return physical_manifest_consumer_.consume_route(
+            family, site_id, resolved_selector, resolved_flags,
+            resolved_arguments, invocation);
+    }
+    AttentionExecutionPolicy physical_attention_policy_for_site(
+        int64_t site_id, int64_t invocation = 0) const {
+        return physical_manifest_consumer_.attention_policy_for_site(
+            site_id, invocation);
+    }
+    const FmbRouteManifestEntry& consume_physical_attention_route(
+        int64_t site_id,
+        AttentionExecutionPolicy dispatched_policy,
+        int64_t invocation = 0) const {
+        return physical_manifest_consumer_.consume_attention_route(
+            site_id, dispatched_policy, invocation);
+    }
+
+private:
+    friend class FusedModelBase;
+    std::vector<uint8_t> consumed_physical_route_receipt() const {
+        return physical_manifest_consumer_.consumed_route_receipt();
+    }
+    void inherit_physical_route_subset(
+        uint64_t manifest_fingerprint,
+        const std::vector<uint8_t>& receipt) const {
+        physical_manifest_consumer_.inherit_consumed_route_subset(
+            manifest_fingerprint, receipt);
+    }
+    void begin_external_physical_manifest_prologue(
+        const FmbPhysicalExecutionManifest& manifest,
+        bool matching_replay_branch) {
+        TORCH_CHECK(
+            !external_physical_manifest_prologue_pending_,
+            "RPU_PLANNER_REJECT:CAPABILITY: an external physical-manifest "
+            "prologue is already pending transfer");
+        physical_manifest_consumer_.reset(manifest);
+        TORCH_CHECK(
+            physical_manifest_consumer_.complete(),
+            "RPU_PLANNER_REJECT:CAPABILITY: an external prologue requires a "
+            "COMPLETE physical manifest");
+        external_physical_manifest_prologue_pending_ = true;
+        external_physical_manifest_prologue_replay_ = matching_replay_branch;
+    }
+    bool bind_physical_manifest(
+        const FmbPhysicalExecutionManifest& manifest,
+        std::shared_ptr<const FmbPreparedStageCandidate> prepared = {}) {
+        if (external_physical_manifest_prologue_pending_) {
+            physical_manifest_consumer_.retain_consumed_if_matching(manifest);
+            external_physical_manifest_prologue_pending_ = false;
+            return true;
+        }
+        if (prepared) physical_manifest_consumer_.reset_prepared(std::move(prepared));
+        else physical_manifest_consumer_.reset(manifest);
+        external_physical_manifest_prologue_replay_ = false;
+        return false;
+    }
+    bool external_physical_manifest_prologue_replay() const {
+        return external_physical_manifest_prologue_replay_;
+    }
+    void cancel_external_physical_manifest_prologue() {
+        external_physical_manifest_prologue_pending_ = false;
+        external_physical_manifest_prologue_replay_ = false;
+        physical_manifest_consumer_.reset({});
+    }
+    void require_all_physical_routes_consumed() const {
+        physical_manifest_consumer_.require_all_consumed();
+    }
+    std::optional<AttentionExecutionPolicy>
+    physical_attention_layout_policy() const {
+        return physical_manifest_consumer_.attention_layout_policy();
+    }
+    void inherit_physical_routes_from_matching_graph_replay() const {
+        physical_manifest_consumer_.inherit_matching_graph_replay_receipt(
+            physical_manifest_consumer_.fingerprint());
+    }
+    FmbPhysicalManifestConsumer physical_manifest_consumer_;
+    bool external_physical_manifest_prologue_pending_ = false;
+    bool external_physical_manifest_prologue_replay_ = false;
 };
 
-// FusedModelBase — flat framework. Subclass contract:
+// FusedModelBase — flat framework (v3). Subclass contract:
 //   4 mandatory virtuals (declare_buffers, static_config, dynamic_config, build_layer_subgraph)
-//   Optional features via ModelStaticConfig callback fields
-//   Call invalidate_model_state() after set_weights(...)
+//   Optional D-501 features via ModelStaticConfig callback fields
+//   Call invalidate_model_state() after set_weights(...) (D-503)
 class FusedModelBase {
 public:
     // PImpl forward decl — the Impl BODY is defined only in the private header
@@ -588,7 +1173,10 @@ public:
         std::vector<at::Tensor>& v_caches,
         const std::optional<at::Tensor>& attention_mask,
         int64_t position,
-        bool is_causal);
+        bool is_causal,
+        int64_t planned_chunk_size = 0,
+        at::IntArrayRef planned_stage_descriptor = {},
+        uint64_t expected_layout_hash = 0);
 
     // Specialized entry point: FMB resolves and consumes qkv/compute chunks
     // while the model supplies its independently executed input-stage
@@ -603,24 +1191,39 @@ public:
         int64_t position,
         bool is_causal,
         const std::vector<ChunkInfo>& input_chunks,
-        const std::vector<FmbExecutionSpan>& spans);
+        const std::vector<FmbExecutionSpan>& spans,
+        uint64_t expected_layout_hash = 0);
+    at::Tensor run_all_layers(
+        const at::Tensor& hidden_states,
+        std::vector<at::Tensor>& k_caches,
+        std::vector<at::Tensor>& v_caches,
+        const std::optional<at::Tensor>& attention_mask,
+        int64_t position,
+        bool is_causal,
+        const std::vector<ChunkInfo>& input_chunks,
+        const std::vector<FmbExecutionSpan>& spans,
+        FmbStageBoundaryPolicies boundary_policies,
+        uint64_t expected_layout_hash = 0);
 
     void    set_chunk_size_override(int64_t cs);
     int64_t get_chunk_size_override() const;
-    // Per-handle resolved chunk_size
+    // TASK-1.5 (codex round-3 path-(b) BC2-01 closure): per-handle resolved chunk_size
     // from the most-recent forward; 0 if no forward has run yet on this instance.
     int64_t get_last_resolved_chunk_size() const;
 
-    // Certified chunk envelope. Profiles can bound automatic planning more
-    // tightly than the generic SPM budget; undeclared combinations are denied.
+    // Cold composite barrier: reserve only the installed owner's fixed
+    // Persistent declarations before any peer's domain is searched. No Temp,
+    // preload/DMA, Graph, plan selection, or forward receipt is produced.
+    void prepare_persistent_spm(int64_t execution_len, int64_t position,
+                                bool is_causal, int64_t mask_kv_len = 0);
+
+    // Admitted chunk envelope: native SPM arithmetic and profile admission are
+    // separate guards. A candidate must satisfy both before hardware submission.
     //
-    // Two fields are used because two different quantities scale:
-    //   chunk       every path's ceiling; the thing that busts SPM.
-    //   max_kv_len  load-bearing ONLY on the explicit-mask path, where
-    //               declare_buffers adds sdpa_mask = comp_cs * ceil16(kv) * 32
-    //               (see rpu_qwen3_model.h). With no mask the layout is FLAT in
-    //               length, so there it only bounds the certified range over
-    //               which `auto` has actually been certified.
+    // chunk bounds the physical chunk on every path. max_kv_len additionally
+    // bounds the explicit-mask allocation, whose size scales as
+    // comp_cs * ceil16(kv) * 32. Without an explicit mask, it bounds the admitted
+    // AUTO request range rather than a mask allocation.
     struct ChunkEnvelope {
         int64_t max_kv_len = 0;   // 0 = UNDECLARED => deny
         int64_t chunk      = 0;   // 0 = "auto is certified within max_kv_len"
@@ -632,7 +1235,129 @@ public:
     void set_chunk_envelope(int64_t max_kv_len, int64_t chunk);
     const ChunkEnvelope& chunk_envelope() const;
 
+    // The trusted Python binder supplies a verified external catalog once,
+    // before dispatch. Hot chunk changes retain this immutable owner value.
+    void bind_kvinsert_costs(at::IntArrayRef identity,
+                            const std::string& catalog_sha256,
+                            at::IntArrayRef certificate_rows);
+    const std::string& kvinsert_cost_catalog_sha256() const;
+    // Exact lookup in this owner's latest successful native stage-domain query.
+    // The supplied descriptor is only a key, never a source of geometry/caps.
+    KvInsertCostDomainQuery kvinsert_cost_domain(
+        const char* owner_kind, at::IntArrayRef actual_stage_descriptor) const;
+    // Diagnostic only: mint an existing EXACT route after native feasibility
+    // and SPM revalidation. No measured-cost authority is created.
+    std::tuple<std::vector<int64_t>, int64_t, int64_t>
+    mint_kvinsert_exact_candidate(
+        at::IntArrayRef actual_stage_descriptor, int64_t site_id,
+        int64_t invocation, int64_t route);
+    // Read-only installed geometry/precision/cold policy, shared by leaf cost
+    // queries and the existing native-composite execution identity.
+    std::vector<int64_t> installed_profile_identity() const;
+    uint64_t installed_model_state_generation() const;
+    // Cache identity for native candidate preparation, combined with the caller's
+    // native owner prefix and non-reused handle. It excludes runtime addresses,
+    // temporary oracle state, and other owners' resource generations.
+    std::vector<int64_t> planner_cache_identity() const;
+
+    // Public control-plane writes may remain legacy-hot unless an adapter
+    // opts its handle into the common transaction. Internal per-forward
+    // routing continues to use set_chunk_size_override() directly.
+    void enable_execution_reconfigure_guard();
+    void set_control_chunk_size_override(int64_t cs, const char* operation);
+    void stage_control_chunk_size_override(uint64_t token, int64_t cs,
+                                           const char* operation);
+    void check_execution_reconfigure_destroy_allowed(
+        const char* operation) const;
+
+    // Shared by the generic planner, runtime and custom component planners.
+    // Bind the immutable physical selections before declaring/hashing buffers.
+    LayoutContext bind_physical_layout_context(
+        LayoutContext layout,
+        const FmbPhysicalExecutionManifest& manifest) const;
+
+    // Shared with native prologues which inspect a descriptor before entering
+    // run_all_layers. Returned storage survives cache eviction and re-keying.
+    std::shared_ptr<const FmbPreparedStageCandidate> prepare_stage_candidate(
+        at::IntArrayRef descriptor) const;
 protected:
+    // Valid only during this dispatch, after actual temporary layout matched
+    // the COMPLETE plan. Persistent addresses require separate owner checks.
+    uint64_t checked_layer_body_replay_layout_hash() const;
+
+    // Cold admission uses the same complete fixed/temporary/held-SPM budget
+    // as actual allocation. Runtime must validate its selected descriptor,
+    // never use this query to select a replacement schedule.
+    bool declared_spm_layout_fits(const std::vector<BufferDecl>& declarations) const;
+    virtual FmbForwardOperandResidency physical_forward_operand_residency(
+        const FmbPhysicalExecutionManifest& /*manifest*/) const {
+        return FmbForwardOperandResidency::UNSPECIFIED;
+    }
+
+    // One typed, owner-local snapshot of the latest oracle's temporary layout
+    // fields. Arguments MUST be members of this owner, never stack locals.
+    // The closure cannot outlive the owner and restores even a failed mint.
+    using KvCostLayoutScope = std::function<void(const std::function<void()>&)>;
+    template <typename... Fields>
+    static KvCostLayoutScope capture_kvinsert_cost_layout_fields(Fields&... fields) {
+        return [members = std::tie(fields...), values = std::make_tuple(fields...)](
+                   const std::function<void()>& operation) mutable {
+            auto saved = std::apply(
+                [](auto&... value) { return std::make_tuple(value...); }, members);
+            auto restore = c10::make_scope_exit([&] { members = std::move(saved); });
+            members = values;
+            operation();
+        };
+    }
+    virtual KvCostLayoutScope capture_kvinsert_cost_layout_scope() {
+        return [](const std::function<void()>& operation) { operation(); };
+    }
+    // Empty means unverified precision: geometry may be inspected, but no cost
+    // artifact may activate. Overrides must inspect installed native weights.
+    virtual std::vector<int64_t> kvinsert_cost_weight_identity() const {
+        return {};
+    }
+    static void append_kvinsert_cost_tensor_identity(
+        std::vector<int64_t>& identity, const at::Tensor& tensor);
+    static void append_kvinsert_cost_scalar_identity(
+        std::vector<int64_t>& identity, double value);
+    // Reused by the generic oracle and native geometry-specific producers.
+    // The callback must return only its actual post-SPM-admission candidates.
+    void begin_kvinsert_cost_domain_oracle();
+    void remember_kvinsert_cost_planning_context(const InferenceContext& context);
+    std::vector<FmbPrefillStageCandidate> observe_kvinsert_cost_candidates(
+        const std::function<std::vector<FmbPrefillStageCandidate>()>& producer,
+        const LayoutContext* actual_layout = nullptr);
+    void finish_kvinsert_cost_domain_oracle(
+        const std::vector<FmbPrefillStageCandidate>& returned_candidates);
+    void bind_kvinsert_cost_owner_prefix(
+        at::IntArrayRef descriptor, at::IntArrayRef native_prefix);
+    std::vector<int64_t> kvinsert_cost_owner_prefix(at::IntArrayRef descriptor) const;
+    KvInsertSegmentPlan resolve_kvinsert_plan_auto(
+        int64_t site_id, FmbGraphLifecycle graph_lifecycle,
+        int64_t position, int64_t logical_rows,
+        int64_t physical_rows, int num_cores, int64_t num_kv_heads,
+        int64_t head_dim, uint32_t capabilities) const;
+    KvInsertSegmentPlan restore_kvinsert_plan(
+        int64_t site_id, at::IntArrayRef arguments, int num_cores,
+        int64_t num_kv_heads, int64_t head_dim) const;
+    // Planning/cold-policy validators inspect detached candidates before the
+    // selected manifest is installed in ctx(). Bind decode authority to the
+    // COMPLETE candidate's exact KV_INSERT site/invocation and lifecycle;
+    // runtime emitters continue to use restore_kvinsert_plan() above.
+    KvInsertSegmentPlan restore_kvinsert_plan_from_manifest(
+        const FmbPhysicalExecutionManifest& manifest,
+        int64_t site_id, int64_t invocation, int num_cores,
+        int64_t num_kv_heads, int64_t head_dim) const;
+
+    void stage_execution_controls(
+        uint64_t token,
+        std::optional<int64_t> chunk_size_override,
+        std::optional<ChunkEnvelope> chunk_envelope,
+        std::function<void()> apply_extra,
+        std::function<void()> rollback_extra,
+        const char* operation);
+
     // Hard half of the envelope, for the ONCE-per-resolve hook
     // (subclass_chunk_size_cap). Throws with an actionable message; returns the
     // chunk ceiling to feed the auto search. Participating subclasses call this
@@ -646,16 +1371,26 @@ protected:
     // call it in its validity hook, not only in its cap hook.
     bool chunk_within_envelope(int64_t cs) const {
         const ChunkEnvelope& e = chunk_envelope();
-        // An `auto` row does not authorize an arbitrary explicit override.
-        // Zero-ceiling rows therefore remain closed on the override path.
+        // An `auto` row certifies only the planner result for the measured
+        // length.  It is not evidence for an arbitrary explicit override.
+        // Profiles that expose public exact chunk control therefore declare a
+        // positive, measured-safe ceiling; keep future zero-ceiling rows
+        // closed on the override path instead of silently widening them.
         if (e.chunk <= 0) return get_chunk_size_override() <= 0;
         return cs <= e.chunk;
     }
 
-    // Mandatory subclass virtuals.
+    // Mandatory subclass virtuals (D-201 + D-202)
     virtual std::vector<BufferDecl> declare_buffers(const LayoutContext& ctx) = 0;
     virtual ModelStaticConfig       static_config() = 0;
     virtual ModelDynamicConfig      dynamic_config(const ChunkPlan& plan) = 0;
+    // Read-only sibling used by the finite-domain oracle. Subclasses whose
+    // forward dynamic_config materializes masks or other runtime state must
+    // override this with the same configuration minus those side effects.
+    virtual ModelDynamicConfig planning_dynamic_config(
+        const ChunkPlan& plan) {
+        return dynamic_config(plan);
+    }
     virtual void                    build_layer_subgraph(int layer_idx,
                                                          const ChunkInfo& chunk) = 0;
 
@@ -671,6 +1406,40 @@ protected:
         return false;
     }
 
+    // COMPLETE physical descriptors are inert unless a concrete native owner
+    // opts in and names the current Graph lifecycle. This does not adopt any
+    // route by itself: each exact launcher site must consume its own entry.
+    virtual FmbPhysicalManifestForwardCapability
+    physical_manifest_forward_capability(
+        const FmbPhysicalExecutionManifest& /*manifest*/) const {
+        return {};
+    }
+
+    // Optional owner authority added to each native A6 candidate.  The
+    // default preserves UNSPECIFIED for every owner that has not adopted the
+    // descriptor/receipt contract.
+    virtual FmbPhysicalExecutionManifest physical_manifest_for_candidate(
+        const FmbThreeStageChunkPlan& /*plan*/,
+        const LayoutContext& /*layout*/,
+        int64_t /*physical_len*/, int64_t /*logical_len*/,
+        int64_t /*position*/) const {
+        return {};
+    }
+
+    // A physical choice can change the exact SPM footprint without changing
+    // any of the three chunk capacities.  The common resolver therefore asks
+    // for the complete same-chunk domain and runs declare_buffers() for each
+    // manifest.  Existing owners keep their single-candidate behaviour.
+    virtual std::vector<FmbPhysicalExecutionManifest>
+    physical_manifest_domain_for_candidate(
+        const FmbThreeStageChunkPlan& plan,
+        const LayoutContext& layout,
+        int64_t physical_len, int64_t logical_len,
+        int64_t position) const {
+        return {physical_manifest_for_candidate(
+            plan, layout, physical_len, logical_len, position)};
+    }
+
     // Optional kernel-validity hook for auto chunk_size search (compute_chunks_impl).
     // Default: every 16-multiple is valid. Override when subclass kernels (e.g.
     // SDPA tile-shape / VLM register / mask-tiling constraints in
@@ -683,7 +1452,7 @@ protected:
     // (compute_chunks_impl:536); the explicit-override path calls it exactly
     // once, on the sequence-clamped override (:499). It was documented here as
     // "auto-pick only ... the override path bypasses this hook by design" until
-    // This hook is the only
+    // MR-A — that was stale, and the correction matters: this hook is the only
     // consumer choke point BOTH routes pass through, which is why the certified
     // envelope's per-candidate check has to live here and not just in the cap.
     virtual bool subclass_chunk_size_valid(int64_t /*cs*/,
@@ -707,7 +1476,8 @@ protected:
     // compute_params_hash_impl keys the allocation on a FIXED set of fields —
     // the five set_model_params values plus LayoutContext's chunk_size,
     // kv_insert_chunk_size, num_layers, use_attn_mask, is_causal, batch_size,
-    // stage_plan_fingerprint, attention_policy and
+    // stage_plan_fingerprint, physical_manifest_fingerprint,
+    // attention_policy, descriptor-derived RoPE table residency, and
     // (only when use_attn_mask) max_kv_seq_len. ensure_allocated reuses the existing layout
     // whenever that hash is unchanged. So a subclass whose declare_buffers sizes
     // any BufferDecl from state OUTSIDE that set — image grid, patch count,
@@ -780,11 +1550,37 @@ protected:
         return 0;
     }
 
+    // Append after the existing virtual sequence: earlier slot order stays
+    // unchanged. All base/derived native objects must still be rebuilt together;
+    // an old compiled derived vtable cannot service this new slot.
+    // The shared mint has already installed the actual KV selector/22-word plan.
+    // Owners may now rebind dependent routes before validation/layout/encoding.
+    // Existing owners intentionally keep the default no-op behavior.
+    virtual void rebind_kvinsert_exact_candidate(
+        FmbPrefillStageCandidate& /*candidate*/, const LayoutContext& /*layout*/,
+        int64_t /*site_id*/, int64_t /*invocation*/,
+        const KvInsertSegmentPlan& /*plan*/) const {}
+
     // Planning-only query for adapters that must shape input before dispatch.
     // Uses the same exact SPM and model validator path as run_all_layers().
     int64_t resolve_chunk_size_for_shape(
         int64_t seq_len, int64_t position,
         const std::optional<at::Tensor>& attention_mask, bool is_causal);
+    std::vector<FmbPrefillStageCandidate>
+    resolve_prefill_stage_domain_for_shape(
+        int64_t seq_len, int64_t position,
+        const std::optional<at::Tensor>& attention_mask, bool is_causal,
+        int64_t requested_chunk_size = 0, int64_t logical_len = 0,
+        int64_t planning_chunk_size_override = -1);
+    std::vector<FmbPrefillStageCandidate>
+    resolve_prefill_stage_domain_for_shape(
+        int64_t seq_len, int64_t position,
+        const std::optional<at::Tensor>& attention_mask, bool is_causal,
+        const std::vector<ChunkInfo>& input_chunks,
+        const std::vector<FmbExecutionSpan>& spans,
+        FmbStageBoundaryPolicies boundary_policies,
+        int64_t requested_chunk_size = 0, int64_t logical_len = 0,
+        int64_t planning_chunk_size_override = -1);
     SpmPipelineCausalPrefillShape
     resolve_spm_pipeline_causal_prefill_shape_for_cpu_contract(
         int64_t execution_len);
@@ -800,6 +1596,18 @@ protected:
     // snapshot with the pure first-fit planner but never admits physical use.
     SpmPipelineComponentLayout
     prepare_spm_pipeline_component_for_cpu_contract(
+        const LayoutContext& layout_ctx,
+        const FmbThreeStageChunkPlan& stage_plan);
+    // Pure layout identity for Graph admission. It reuses the CPU first-fit
+    // planner but publishes no allocator, manifest, or handle state.
+    SpmPipelineComponentLayout
+    resolve_spm_pipeline_component_layout_for_cpu_contract(
+        const LayoutContext& layout_ctx,
+        const FmbThreeStageChunkPlan& stage_plan);
+    // Non-mutating exact feasibility predicate for custom native stage
+    // resolvers.  The caller supplies descriptor-derived layout fields; this
+    // uses the same BufferDecl budget and current persistent occupancy as A6.
+    bool spm_pipeline_component_layout_fits_for_cpu_contract(
         const LayoutContext& layout_ctx,
         const FmbThreeStageChunkPlan& stage_plan);
     // Symmetric retirement for a live-handle board-free dry probe.  It drops
@@ -876,7 +1684,7 @@ protected:
         const SpmFmbSealedCallbackYields& yields);
     // Board-free composite contract driver.  Production occurrences re-enter
     // run_all_layers normally; this helper replays the already-installed
-    // opaque callback authority without exposing its token to external callers.
+    // opaque callback authority without exposing its token to tests/callers.
     void drive_spm_pipeline_composite_callback_yield_replay_for_cpu_contract();
     void cancel_spm_pipeline_callback_yield_replay() noexcept;
     // Schema-v8 CPU-dry foundation.  begin() must run inside the exact Graph
@@ -973,9 +1781,13 @@ protected:
         const at::Tensor& hidden_states,
         size_t producer_ordinal);
 
-    // Narrow facade.
+    // Narrow facade (D-203)
     InferenceContext&       ctx();
     const InferenceContext& ctx() const;
+    void begin_external_physical_manifest_prologue(
+        const FmbPhysicalExecutionManifest& manifest,
+        int64_t physical_length, int64_t position);
+    void cancel_external_physical_manifest_prologue();
     SdpaStableMaskCache& sdpa_stable_mask_cache();
 
     uint32_t  addr(int core, const char* name) const;
@@ -1064,15 +1876,29 @@ protected:
                            uint32_t up_nvfp4_ts_addr = 0,
                            uint32_t down_nvfp4_ts_addr = 0,
                            uint16_t nvfp4_layer_id = 0,
-                           bool acc32 = false);
+                           bool down_out_bf16 = false,
+                           bool residual_is_bf16 = false,
+                           bool acc32 = false,
+                           bool fuse_silu_mul = false,
+                           bool skip_down = false,
+                           bool bind_silu_mul_route = false,
+                           uint32_t residual_spm_addr = 0,
+                           bool pi05_xor3 = false,
+                           bool pi05_nvfp4_v2 = false,
+                           bool prefer_gemv = false,
+                           RpuUnaryPrecision unary_precision = RpuUnaryPrecision::BASE,
+                           bool high_precision_silu_mul = false);
 
-    // Stays protected. External callers must go through a concrete
+    // D-503 — stays PROTECTED. External callers must go through a concrete
     // subclass's public wrapper (e.g., SmokeModelV3::public_invalidate_for_test).
     // Promoting to public would leak a test-only API onto every production subclass.
     //
-    // Sets both weights_dirty_ and preload_callbacks_dirty_; each is cleared
+    // EXT-4: sets BOTH weights_dirty_ AND preload_callbacks_dirty_; each cleared
     // at its OWN dispatch point (see run_preload_callbacks_ and run_all_layers).
-    void invalidate_model_state();
+    // Keep Graph/preload invalidation even for a verified numerical-only refresh.
+    // Only unchanged tensor layouts and execution routes may preserve plan reuse.
+    void invalidate_model_state(bool planning_domain_changed = true);
+    void invalidate_planner_cache();
 
     // Post-graph output (Phase 2.5 — e.g. Qwen3 fused lm_head)
     at::Tensor&       post_output_tensor();
@@ -1083,15 +1909,22 @@ protected:
     const at::Tensor& output_tensor() const;
 
     // Model-param setter (subclass calls from set_weights / ctor)
+    // Reduced owners explicitly resolve their own admitted physical geometry.
+    // The default preserves the dense causal-decoder admission boundary.
+    virtual DecoderExecutionTopology resolve_model_execution_topology(
+        int64_t num_q_heads, int64_t num_kv_heads, int64_t head_dim,
+        int64_t hidden_size, int64_t intermediate_size) const;
     void set_model_params(int64_t num_q_heads, int64_t num_kv_heads,
                           int64_t head_dim, int64_t hidden_size,
                           int64_t intermediate_size);
     void set_num_layers(int64_t n);
+    // Cold model configuration: must precede weight/layout installation.
+    void set_execution_core_count(int num_cores);
 
     // Pitfall 4 mitigation — fresh at::empty per forward for caller-accumulated lists
     at::Tensor allocate_tracked_output(at::IntArrayRef shape);
 
-    // Diagnostic helper used by the conformance model. Runs the
+    // Test-only helper used by SmokeModelV3 (Plan 01-01 smoke test). Runs the
     // preload path (ensure_allocated + run_preload_callbacks_) without
     // requiring the full run_all_layers input contract (hidden_states /
     // kv caches / position / mask). Not called by production subclasses.
@@ -1114,6 +1947,8 @@ protected:
     int64_t hidden_size()       const;
     int64_t intermediate_size() const;
     int     attn_tp()           const;
+    int     num_cores()         const;
+    int     mlp_tp()            const;
     int64_t num_layers()        const;
 
     // PImpl — internal framework state hides here (Impl forward-declared in public).
@@ -1121,6 +1956,15 @@ protected:
 
 private:
     // Framework-private dispatch helpers
+    std::vector<FmbPrefillStageCandidate>
+    resolve_prefill_stage_domain_for_shape_impl(
+        int64_t seq_len, int64_t position,
+        const std::optional<at::Tensor>& attention_mask, bool is_causal,
+        const std::vector<ChunkInfo>* input_chunks,
+        const std::vector<FmbExecutionSpan>* spans,
+        const FmbStageBoundaryPolicies* boundary_policies,
+        int64_t requested_chunk_size, int64_t logical_len,
+        int64_t planning_chunk_size_override);
     SpmPipelineComponentLayout prepare_spm_pipeline_component_impl(
         const LayoutContext& layout_ctx);
     SpmPipelineComponentLayout
@@ -1134,7 +1978,12 @@ private:
         int64_t position,
         bool is_causal,
         const std::vector<ChunkInfo>* input_chunks,
-        const std::vector<FmbExecutionSpan>* spans);
+        const std::vector<FmbExecutionSpan>* spans,
+        const FmbStageBoundaryPolicies* boundary_policies,
+        uint64_t expected_layout_hash,
+        int64_t planned_chunk_size,
+        const FmbPrefillStageCandidate* planned_stage_candidate,
+        std::shared_ptr<const FmbPreparedStageCandidate> prepared_candidate = {});
     void run_preload_callbacks_(const std::vector<BufferDecl>& decls,
                                 FusedModelBase& self);
     SpmFmbResolvedExecutionProfile

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <thread>
 
 class RpuExecutionCoordinator final {
@@ -13,6 +14,7 @@ public:
         Graph = 1,
         Physical = 2,
         Cleanup = 3,
+        Reconfigure = 4,
     };
 
     class Claim {
@@ -74,6 +76,33 @@ public:
         const char* owned_graph_diagnostic = nullptr);
     static void exit_cleanup(Claim& claim, const char* operation);
     static void exit_cleanup_noexcept(Claim& claim) noexcept;
+
+    // One process-wide, same-thread transaction for live execution controls.
+    // Setters register staged participants; commit applies every participant
+    // before releasing the claim, while abort discards an uncommitted stage.
+    using ReconfigureCallback = std::function<void()>;
+    static uint64_t begin_reconfigure(const char* operation);
+    static uint64_t begin_reconfigure(
+        uint64_t attempt_token, const char* operation);
+    static uint64_t begin_reconfigure_with_quiesce(
+        ReconfigureCallback quiesce, const char* operation);
+    static uint64_t begin_reconfigure_with_quiesce(
+        ReconfigureCallback quiesce,
+        uint64_t attempt_token,
+        const char* operation);
+    static void stage_reconfigure(
+        uint64_t token,
+        const void* participant,
+        ReconfigureCallback apply,
+        ReconfigureCallback rollback,
+        const char* operation);
+    static void check_reconfigure_participant_destroy_allowed(
+        const void* participant, const char* operation);
+    static void commit_reconfigure(uint64_t token, const char* operation);
+    static void abort_reconfigure(uint64_t token, const char* operation);
+    static bool abort_reconfigure_attempt(
+        uint64_t attempt_token, const char* operation);
+    static void validate_reconfigure(uint64_t token, const char* operation);
 
     // Allocator mutations may retain the current thread's already-open Graph
     // claim (reset_temporary during RECORDING), or take an exclusive cleanup

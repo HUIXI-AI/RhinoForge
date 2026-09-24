@@ -1,10 +1,15 @@
-"""Pi0.5 AdaRMS all-layers-once instance patch.
+"""Pi0.5 AdaRMS all-layers-once instance patch (canonical home).
 
-``Pi05Adapter`` installs this flat helper module lazily from ``to_rpu``.
+v5-03 B4: relocated from _internal/patches/pi05_all_layers_once.py L372-770
+per ADR §6.2. Pi05Adapter is the only in-tree caller (lazy import inside
+to_rpu()); no test consumers reference this module directly.
+
+ADR §3.3 forbids reintroducing a ComponentBase abstraction; this file is
+intentionally a flat function module sharing the adapters/pi05/ namespace
+with gemma.py and siglip.py.
 """
 from __future__ import annotations
 import types
-import weakref
 
 import torch
 import torch.nn as nn
@@ -17,6 +22,11 @@ from rpu_backend.runtime.weights import (
     NUM_CORES, tp_row_swizzle_mc_weight, tp_col_swizzle_mc_weight,
 )
 from rpu_backend.api.cache import RPUCache
+from rpu_backend.runtime.decoder import plan_bounded_prefill_execution
+from rpu_backend.runtime.execution_planner import GRAPH_COMPOSITE_CHILD
+
+
+_ADARMS_ACTION_COMPONENT = "action_expert"
 
 
 def _adarms_graph_enabled() -> bool:
@@ -24,26 +34,130 @@ def _adarms_graph_enabled() -> bool:
 
 
 def _adarms_w8a16_graph_enabled() -> bool:
-    # W8A16 AdaRMS graph capture avoids the "enqueu_kernel called after
-    # build_batch" warnings emitted by PASSTHROUGH: the preceding
-    # gemma_prefill graph build leaves batch_built_=true on the shared
-    # Queue_t, so an uncaptured AdaRMS layer cannot be enqueued on that queue.
-    # Default ON; set RPU_PI05_ADARMS_W8A16_GRAPH=0 to force PASSTHROUGH for
-    # debugging.
+
     return rpu_env_bool("RPU_PI05_ADARMS_W8A16_GRAPH", default=True)
 
 
-# AdaRMS all-layers-once C++ handle lifecycle helper.
+def _plan_adarms_action_execution(
+    model,
+    *,
+    logical_len: int,
+    execution_len: int,
+    position: int,
+    kv_len: int,
+    use_attention_mask: bool,
+    is_causal: bool,
+    _cost_request=None,
+    graph_cache=None,
+):
+    """Resolve the native one-chunk action descriptor before Graph admission."""
+    config = getattr(
+        model, "_fmb_execution_component_config",
+        {"action": {"chunk_size": "auto"}},
+    )
+    requested = config.get("action", {}).get("chunk_size", "auto")
+    if _cost_request is not None:
+        from rpu_backend.runtime.decoder import _cold_text_cost_request
+
+        request, _ = _cold_text_cost_request(
+            model, ("adarms", int(model._rpu_action_handle)), model._rpu_cache,
+            _cost_request, position, component=_ADARMS_ACTION_COMPONENT, stage="action")
+        if request.padding_rows != 0 or request.padding_budget != 0:
+            raise ValueError("Pi0.5 AdaRMS action cannot pad or split its suffix")
+        requested = request.chunk_size or "auto"
+    exact_chunk = requested if isinstance(requested, int) else None
+    result_box = {}
+    resolved_execution, resolved_chunk = plan_bounded_prefill_execution(
+        logical_len,
+        execution_len,
+        0,
+        execution_owner=model,
+        execution_component="action_expert",
+        execution_stage="action",
+        execution_native=("adarms", int(model._rpu_action_handle)),
+        position=position,
+        alignment=1,
+        padding_rows=0,
+        exact_chunk_size=exact_chunk,
+        resolve_stage_domain=lambda length: (
+            torch.ops.rpu.adarms_resolve_action_stage_domain(
+                int(model._rpu_action_handle),
+                int(length),
+                logical_len,
+                position,
+                kv_len,
+                use_attention_mask,
+                is_causal,
+                0 if exact_chunk is None else exact_chunk,
+            )
+        ),
+        request_id="pi05:action_expert:action",
+        graph_mode=GRAPH_COMPOSITE_CHILD,
+        queue_owner_id=int(model._rpu_action_handle),
+        physical_metadata=(
+            ("component:action_expert", 1),
+            ("execution_generation", int(getattr(
+                model, "_fmb_execution_generation", 0
+            ))),
+            ("prefix_len", position),
+            ("kv_len", kv_len),
+        ),
+        plan_result_sink=lambda result: result_box.__setitem__("result", result),
+        plan_signature=(int(kv_len), bool(use_attention_mask), bool(is_causal)),
+        graph_cache=graph_cache,
+    )
+    result = result_box["result"]
+    selected = result.selected
+    if (
+        selected is None
+        or resolved_execution != execution_len
+        or resolved_chunk != selected.stage_tuple.compute_chunk
+        or not selected.stage_tuple.physical_descriptor
+    ):
+        raise RuntimeError(
+            "Pi0.5 AdaRMS planner returned no consumable native descriptor"
+        )
+    return result
+
+
+def _publish_adarms_action_plan(model, plan, *, logical_len: int) -> None:
+    selected = plan.selected
+    if selected is None:  # pragma: no cover - planner rejects first
+        raise RuntimeError("Pi0.5 AdaRMS planner selected no action plan")
+    resolved = int(torch.ops.rpu.adarms_get_resolved_chunk_size(
+        model._rpu_action_handle
+    ))
+    if resolved != selected.stage_tuple.compute_chunk:
+        raise RuntimeError(
+            "Pi0.5 AdaRMS dry/forward chunk plan drift: "
+            f"dry={selected.stage_tuple.compute_chunk}, forward={resolved}"
+        )
+    vars(model)["_fmb_last_execution_plan"] = plan
+    vars(model)["_rpu_last_action_execution_plan"] = {
+        **plan.as_dict(include_candidates=False),
+        "component": _ADARMS_ACTION_COMPONENT,
+        "stage": "action",
+        "logical_len": logical_len,
+        "execution_len": selected.execution_len,
+        "chunk_size": resolved,
+        "padding_rows": selected.padding_rows,
+        "authority": "NATIVE_A6_STAGE_DESCRIPTOR",
+        "attention_policy": "DDR_REQUIRED",
+        "attention_reason": "PREFIX_HISTORY_DDR_REQUIRED_NO_RAW_RESIDENCY_ABI",
+        "dry_forward_agreement": True,
+    }
+
+
+# patch-reason: (a) AdaRMS all-layers-once C++ handle lifecycle helper — §3a (a)
 def _adarms_destroy_handle(h):
-    """Release C++ AdaRMSModel handle. Called by weakref.finalize on GC."""
-    try:
-        torch.ops.rpu.adarms_destroy(h)
-    except Exception:
-        # During interpreter shutdown the op may already be gone.
-        pass
+    """Raw destroy; the installed resource owns retirement failures."""
+    torch.ops.rpu.adarms_destroy(h)
 
 
 _ADARMS_RUNTIME_INSTALL_ATTRS = (
+    "_adarms_graph_enabled",
+    "_adarms_w8a16_graph_enabled",
+    "_adarms_graph_capture_enabled",
     "_gemma_rope_cos",
     "_gemma_rope_sin",
     "_rpu_cache",
@@ -52,6 +166,7 @@ _ADARMS_RUNTIME_INSTALL_ATTRS = (
     "_rpu_required_attrs",
     "_rpu_action_handle",
     "_rpu_action_handle_finalizer",
+    "_rpu_action_retirement_state",
     "forward",
 )
 
@@ -73,11 +188,14 @@ def _prepare_adarms_dense_weights(model):
       attn_dense_w_list, attn_dense_b_list, mlp_dense_w_list, mlp_dense_b_list
 
     The helper is self-contained: if `norm._rpu_dense_w_rp` is already
-    registered, it is
+    registered (pi05_converter v2 pre-registration under the new name), it is
     reused; otherwise the weight is recomputed from the live `norm.dense`
-    Linear. `_rpu_dense_w_rp` distinguishes row-partitioned data from any
-    incompatible `_rpu_dense_w` buffer.
+    Linear. The cache buffer is version-bumped from `_rpu_dense_w` to
+    `_rpu_dense_w_rp` so stale col-partition-replicated tensors from older
+    converter versions are ignored.
     """
+    from .cores import model_topology
+    condition_cores = model_topology(model).attn_tp
     attn_w, attn_b, mlp_w, mlp_b = [], [], [], []
 
     for layer_idx, layer in enumerate(model.layers):
@@ -105,7 +223,7 @@ def _prepare_adarms_dense_weights(model):
             # calls .to("rpu") before the patch; some test paths may not).
             orig_w = norm.dense.weight.detach().cpu().to(dtype=torch.float16).contiguous()  # CPU [3H, H]
             transformed_w = transform_linear_weight(
-                orig_w, partition=0, num_cores=NUM_CORES
+                orig_w, partition=0, num_cores=condition_cores
             ).to('rpu').contiguous()
             if norm.dense.bias is None:
                 raise RuntimeError(
@@ -128,8 +246,10 @@ def _prepare_adarms_dense_weights(model):
     return attn_w, attn_b, mlp_w, mlp_b
 
 
-# AdaRMS all-layers-once instance patch.
-def patch_adarms_model_for_rpu_all_layers_once(model) -> int:
+# patch-reason: (a) AdaRMS all-layers-once instance patch — §3a (a) run-different-op-on-RPU
+def patch_adarms_model_for_rpu_all_layers_once(
+    model, *, runtime_policy=None,
+) -> int:
     """
     Patch a Pi0.5 Action Expert (Gemma + AdaRMS) instance to use all-layers-once
     C++ execution via AdaRMSModel (FusedModelBase).
@@ -144,11 +264,11 @@ def patch_adarms_model_for_rpu_all_layers_once(model) -> int:
          - validates preconditions (use_cache, batch, adarms_cond, devices)
          - resolves inputs_embeds / input_ids
          - normalizes adarms_cond to [hidden_size] fp16 RPU contiguous
-         - selects RPUCache when none is supplied
-         - computes the is_causal contract
+         - auto-creates RPUCache on first call (D-14)
+         - computes is_causal per D-13 contract
          - calls torch.ops.rpu.adarms_forward(handle, ...)
          - calls torch.ops.rpu.spm_alloc_reset_temporary() at exit
-         - returns BaseModelOutputWithPast without applying final_norm in C++
+         - returns BaseModelOutputWithPast (no final_norm applied -- D-402)
 
     Prerequisites:
       - convert_linear_weights_inplace(model) must have been called
@@ -173,14 +293,28 @@ def patch_adarms_model_for_rpu_all_layers_once(model) -> int:
             "with BaseModelOutputWithPast"
         ) from e
 
+    from rpu_backend.api._execution import _require_execution_process_safe
+    from rpu_backend.runtime._native_retirement import _InstalledNativeResource
+
+    _require_execution_process_safe()
+    from .cores import model_topology, graph_cache_options, validate_native_topology
+    topology = model_topology(model)
+    old_resource = getattr(model, "_rpu_action_retirement_state", None)
+    if old_resource is not None:
+        old_resource.require_replaceable()
+    elif getattr(model, "_rpu_action_handle", None) is not None:
+        raise RuntimeError("Pi0.5 AdaRMS replacement requires its actual retirement resource")
     model_state = vars(model)
+    graph_enabled = (
+        bool(model_state["_adarms_graph_enabled"])
+        if "_adarms_graph_enabled" in model_state
+        else bool(_adarms_graph_enabled())
+    )
     install_snapshot = {
         name: model_state[name]
         for name in _ADARMS_RUNTIME_INSTALL_ATTRS
         if name in model_state
     }
-    had_old_handle = "_rpu_action_handle" in install_snapshot
-    old_handle = install_snapshot.get("_rpu_action_handle")
     old_finalizer = install_snapshot.get(
         "_rpu_action_handle_finalizer")
 
@@ -246,11 +380,23 @@ def patch_adarms_model_for_rpu_all_layers_once(model) -> int:
     sin_cached = sin_cached.to(dtype=torch.float16, device="rpu").contiguous()
 
     # ------------------------------------------------------------------ #
-    # Step 3: prepare set_weights arguments (no final_norm)
+    # Step 3: prepare set_weights arguments (NO final_norm -- D-402)
     # ------------------------------------------------------------------ #
-    from rpu_backend.adapters.pi05.w8a16 import pi05_expert_scale_lists
+    from rpu_backend.adapters.pi05.w8a16 import pi05_expert_scale_lists, pi05_nvfp4_tensor_scale_tables
     scale_lists = pi05_expert_scale_lists(model, require_rpu=True)
     adarms_w8a16 = bool(scale_lists[0])
+    w8a16_graph_enabled = (
+        bool(model_state["_adarms_w8a16_graph_enabled"])
+        if "_adarms_w8a16_graph_enabled" in model_state
+        else (
+            bool(_adarms_w8a16_graph_enabled())
+            if adarms_w8a16
+            else True
+        )
+    )
+    graph_capture_enabled = bool(
+        graph_enabled and (not adarms_w8a16 or w8a16_graph_enabled)
+    )
     set_weights_args = (
         q_w_list, k_w_list, v_w_list, o_w_list,
         gate_w_list, up_w_list, down_w_list,
@@ -259,17 +405,15 @@ def patch_adarms_model_for_rpu_all_layers_once(model) -> int:
         cos_cached, sin_cached,
         num_q_heads, num_kv_heads, head_dim,
         hidden_size, intermediate_size, eps,
-        *scale_lists,
+        *scale_lists, pi05_nvfp4_tensor_scale_tables(model),
     )
 
     # ------------------------------------------------------------------ #
     # Step 6: replace forward
     #
-    # Capture config in the closure for the GraphCache signature. The signature
-    # omits position because all position-derived kernel regs go
-    # through set_regs + add_kernel_mutable, and the only baked DMA
-    # (sdpa_dma_mask_to_spm) uses a shape-keyed stable slot. Mutable parameters
-    # are synchronized before a same-signature replay at a new position.
+    # Capture model constants in the closure for GraphCache signatures.
+    # Mutable kernel registers are refreshed on replay; mask DMA uses stable
+    # prepared storage. The signature below also binds prefix and RoPE positions.
     # ------------------------------------------------------------------ #
     _adarms_sig_hidden_size = int(hidden_size)
     _adarms_sig_num_layers = int(num_layers)
@@ -291,7 +435,7 @@ def patch_adarms_model_for_rpu_all_layers_once(model) -> int:
         adarms_cond=None,
         **kwargs,
     ):
-        # -- Preconditions before the native op --
+        # -- Preconditions (Python-side guards before the C++ op, T-04-06) --
         if output_attentions:
             raise AssertionError(
                 "AdaRMS (RPU all-layers-once): output_attentions is not supported"
@@ -300,10 +444,13 @@ def patch_adarms_model_for_rpu_all_layers_once(model) -> int:
             raise AssertionError(
                 "AdaRMS (RPU all-layers-once): output_hidden_states is not supported"
             )
-        # use_cache=False is valid for Pi0.5 denoise_step. Cache reset and
-        # `_prefix_len` publication are conditional, while the fused op still
-        # uses RPUCache for SDPA reads and writes. The type guard below is the
-        # correctness check.
+        # D-14 relaxed: use_cache=False is legitimate for Pi0.5 denoise_step
+        # (see pi05_converter._patched_denoise_step -> paligemma_with_expert.forward
+        # -> gemma_expert.model.forward with use_cache=False). Matches v2 pattern in
+        # pi05_converter.py:802/900 which gates cache-reset and _prefix_len setter
+        # on use_cache, but still uses the cache for SDPA KV reads/writes in the
+        # C++ op regardless. The guard below on past_key_values/RPUCache is the
+        # actual correctness check.
         if adarms_cond is None:
             raise AssertionError(
                 "AdaRMS (RPU all-layers-once): adarms_cond is required"
@@ -328,13 +475,18 @@ def patch_adarms_model_for_rpu_all_layers_once(model) -> int:
                 dtype=torch.float16, device='rpu')
 
         hidden_states = inputs_embeds
-        # Capture the caller's original device so it can be restored before the
-        # final norm.
+        # Capture the caller's original device so we can restore it before the
+        # final norm (matches v2 rpu_gemma_model_forward at pi05_converter.py:792
+        # / 894 which does `orig_device = inputs_embeds.device` then
+        # `hidden_states.to(orig_device)` before `self.norm(...)`).
         # Pi0.5 denoise_step delivers suffix_embs on CPU; downstream code
-        # needs the suffix hidden on CPU so action_out_proj's CPU weights
-        # dispatch correctly and v_t lands beside x_t for `x_t + dt * v_t`.
+        # (modeling_pi05.py:901-902) needs the suffix hidden on CPU so that
+        # action_out_proj's CPU weights dispatch correctly and v_t lands on
+        # the same device as x_t (CPU) for the `x_t + dt * v_t` update at :858.
         orig_device = hidden_states.device
-        # Auto-route CPU inputs to the RPU in fp16.
+        # Auto-route CPU inputs to RPU (matches v2 pattern in pi05_converter.py:826
+        # where rpu_gemma_model_forward does `inputs_embeds.to(dtype=fp16, device=model_device)`
+        # unconditionally).
         if hidden_states.device.type != 'rpu':
             hidden_states = hidden_states.to(dtype=torch.float16, device='rpu')
         if hidden_states.dtype != torch.float16:
@@ -348,7 +500,7 @@ def patch_adarms_model_for_rpu_all_layers_once(model) -> int:
             )
         seq_len = hidden_states.shape[1]
 
-        # -- cond normalization ([hidden_size] contiguous FP16 on RPU) --
+        # -- cond normalization ([hidden_size] fp16 RPU contiguous) (T-04-05) --
         cond_rpu = adarms_cond.to(dtype=torch.float16, device='rpu')
         if cond_rpu.dim() == 2 and cond_rpu.shape[0] == 1:
             cond_rpu = cond_rpu.squeeze(0)
@@ -359,9 +511,9 @@ def patch_adarms_model_for_rpu_all_layers_once(model) -> int:
             )
         cond_rpu = cond_rpu.contiguous()
 
-        # -- RPUCache auto-creation --
+        # -- D-14: RPUCache auto-creation --
         if past_key_values is None:
-            # `_rpu_cache` is eagerly initialized during patch installation.
+            # Installation creates the cache eagerly for stable ownership.
             if use_cache:
                 self._rpu_cache.reset_to_position(0)
             past_key_values = self._rpu_cache
@@ -372,12 +524,12 @@ def patch_adarms_model_for_rpu_all_layers_once(model) -> int:
                 f"{type(past_key_values).__name__}"
             )
 
-        # -- is_causal contract + mask normalization --
+        # -- D-13: is_causal contract + mask normalization --
         is_causal = (attention_mask is None)
         if attention_mask is not None:
-            # Cache the converted mask keyed on input Python identity. The
-            # Pi0.5 denoise loop builds the mask once outside the loop, so
-            # subsequent steps pass the
+            # PERF L2 (2026-05-07): cache the converted mask keyed on input
+            # Python identity. The Pi0.5 denoise loop builds the mask ONCE
+            # outside the loop (runtime.py L2 hoist), so steps 2-5 pass the
             # SAME Python object → cache hit → reuse the converted tensor →
             # downstream C++ AdaRMSModel cache also hits (same data_ptr).
             # Avoid `_rpu_*` prefix — Validated_PiGemmaModel rejects unlisted
@@ -393,19 +545,21 @@ def patch_adarms_model_for_rpu_all_layers_once(model) -> int:
                 object.__setattr__(self, "__adarms_mask_out", converted)
                 attention_mask = converted
 
-        # Wrap the fused C++ op in GraphCache.capture(sig).
+        # -- S1: wrap the fused C++ op in GraphCache.capture(sig) --
         # sig keys on `position` (== prefix_len here), which is what the SDPA
         # kv length and the [1,1,suffix,prefix+suffix] 2D mask both derive
         # from. It is NOT a per-step split: the denoise loop calls
         # reset_to_position(prefix_len) before every step (runtime.py), so all
-        # steps of one profile share a position and therefore one cache entry.
-        # Pi0.5 denoise passes a 2D mask, so the prefix position must remain in
-        # the signature.
+        # steps of one profile share a position and therefore one cache entry
+        # -- the original reason for dropping it still holds.
+        #
+        # Denoise passes an explicit attention mask, so a graph prepared for
+        # one prefix length cannot be reused with another prefix geometry.
         # RoPE start for the suffix. The expert's `position` is the PHYSICAL
         # cache row (the denoise loop resets the shared cache to
         # prefix_pad_masks.shape[1]); its RoPE position is the LOGICAL one the
         # reference uses, sum(prefix_pad_masks). They differ by the prefix's pad
-            # rows. -1 keeps physical-row behavior for callers that pass no
+        # rows. -1 keeps the old physical-row behaviour for callers that pass no
         # position_ids. Baked at graph BUILD, hence also in the signature below.
         _rope_pos = -1
         if position_ids is not None:
@@ -414,16 +568,39 @@ def patch_adarms_model_for_rpu_all_layers_once(model) -> int:
         torch.ops.rpu.adarms_set_rope_position(
             self._rpu_action_handle, _rope_pos)
 
+        _position = int(past_key_values.position)
+        _kv_len = (
+            int(attention_mask.shape[-1])
+            if attention_mask is not None
+            else _position + int(seq_len)
+        )
+        _component_plan = _plan_adarms_action_execution(
+            self,
+            logical_len=int(seq_len),
+            execution_len=int(seq_len),
+            position=_position,
+            kv_len=_kv_len,
+            use_attention_mask=attention_mask is not None,
+            is_causal=is_causal,
+            graph_cache=self._rpu_adarms_graph_cache,
+        )
+        _selected_component_plan = _component_plan.selected
+        if _selected_component_plan is None:
+            raise RuntimeError("Pi0.5 AdaRMS planner selected no action plan")
+
         _sig = rpu_backend.graph.GraphSignature(
             op_id="pi05_adarms",
             shapes=[int(seq_len), _adarms_sig_hidden_size],
-            dyn_dims=[_adarms_sig_num_layers, _adarms_sig_num_q_heads,
-                      int(past_key_values.position), _rope_pos],
+            dyn_dims=[
+                _adarms_sig_num_layers, _adarms_sig_num_q_heads,
+                int(past_key_values.position), _rope_pos,
+                *_component_plan.graph_key_words(),
+            ],
             dtypes=[torch.float16],
         )
         # -- Call the fused C++ op (schema: handle, hidden, cond, k_caches,
         #    v_caches, attention_mask, position, is_causal) --
-        if _adarms_graph_enabled() and (not _adarms_sig_w8a16 or _adarms_w8a16_graph_enabled()):
+        if graph_capture_enabled:
             with self._rpu_adarms_graph_cache.capture(_sig):
                 output = torch.ops.rpu.adarms_forward(
                     self._rpu_action_handle,
@@ -434,8 +611,14 @@ def patch_adarms_model_for_rpu_all_layers_once(model) -> int:
                     attention_mask,
                     past_key_values.position,
                     is_causal,
+                    list(
+                        _selected_component_plan.stage_tuple.physical_descriptor
+                    ),
                 )
         else:
+            # DIAGNOSTIC_ONLY: without an active Graph, FMB cannot bind a
+            # COMPLETE descriptor. The same native AUTO resolver still runs,
+            # and the dry/forward agreement check below fails on any drift.
             output = torch.ops.rpu.adarms_forward(
                 self._rpu_action_handle,
                 hidden_states,
@@ -445,29 +628,41 @@ def patch_adarms_model_for_rpu_all_layers_once(model) -> int:
                 attention_mask,
                 past_key_values.position,
                 is_causal,
+                [],
             )
+
+        _publish_adarms_action_plan(
+            self, _component_plan, logical_len=int(seq_len)
+        )
 
         past_key_values.update_position(seq_len)
 
         # Subsystem boundary: release temporary SPM for the next subsystem.
-        # In Pi0.5 this is the next denoise step re-entering Gemma VLM -> AdaRMS.
-        # This must stay outside the capture scope: graph-aware temporary-SPM
-        # reset marks a graph non-replayable.
+        # Keep the reset outside capture: resetting temporary SPM inside a
+        # graph would mark that graph non-replayable.
         torch.ops.rpu.spm_alloc_reset_temporary()
 
         if use_cache and isinstance(past_key_values, RPUCache):
             past_key_values._prefix_len = past_key_values.position
 
-        # Restore the caller's original device before the final norm. Pi0.5
-        # denoise_step supplies suffix_embs on CPU and expects the suffix
-        # output on CPU so that `x_t = x_t + dt * v_t` stays on CPU, matching the noise tensor
+        # Restore caller's original device before the final norm — mirrors v2
+        # rpu_gemma_model_forward at pi05_converter.py:894 `hidden_states.to(orig_device)`.
+        # Pi0.5 denoise_step delivers suffix_embs on CPU and expects the suffix
+        # output on CPU so that modeling_pi05.py:901-902 / :858
+        # (`x_t = x_t + dt * v_t`) stays on CPU (matches x_t's CPU noise tensor
         # and action_out_proj's CPU weights).
         if orig_device.type != 'rpu':
             output = output.to(orig_device)
 
-        # Final PiGemmaRMSNorm stays in this Python wrapper rather than the
-        # decoder-layer graph, so `last_hidden_state` is post-norm for the
-        # suffix-only consumer.
+        # Final PiGemmaRMSNorm — matches v2 pi05_converter.py:894-895 which
+        # runs `hidden_states, _ = self.norm(hidden_states, adarms_cond)`
+        # inside the patched `rpu_gemma_model_forward`. D-402 (no C++ fusion)
+        # only prohibits baking final_norm into the decoder-layer graph; the
+        # Python-level final norm still needs to be applied inside this
+        # `model.forward` wrapper so `last_hidden_state` is post-norm, matching
+        # both v2 behavior AND the lerobot PaliGemmaWithExpertModel.forward
+        # suffix-only branch (modeling_pi05.py:475-483) that consumes
+        # `suffix_output.last_hidden_state` directly.
         if getattr(self, "norm", None) is not None:
             output, _ = self.norm(output, adarms_cond)
 
@@ -476,7 +671,7 @@ def patch_adarms_model_for_rpu_all_layers_once(model) -> int:
             past_key_values=past_key_values if use_cache is not False else None,
         )
 
-    # Eagerly initialize the cache, stamp the installed state, and freeze it.
+    # P7.1h L1+L2:eager init _rpu_cache + stamp marker + freeze.
     _effective_num_kv_heads = int(getattr(
         model, "_rpu_effective_num_kv_heads", config.num_key_value_heads
     ))
@@ -493,60 +688,77 @@ def patch_adarms_model_for_rpu_all_layers_once(model) -> int:
         head_dim=int(config.head_dim),
         attn_tp=_attn_tp_default,
     )
-    # Per-instance GraphCache for the AdaRMS forward wrap. Eager initialization
+    # S1: per-instance GraphCache for the AdaRMS forward wrap. Eager-init
     # mirrors `_rpu_cache` to keep Dynamo guard-set stable across calls
-    # because lazy initialization would invalidate the frontend cache on first use.
-    adarms_graph_cache = rpu_backend.graph.GraphCache()
+    # (lazy init would invalidate the frontend cache on first hit;
+    # see siglip.py line ~477-481 for the same pattern + reasoning).
+    adarms_graph_cache = (
+        rpu_backend.graph.GraphCache(**graph_cache_options(topology.num_cores))
+        if runtime_policy is None
+        else rpu_backend.graph.GraphCache(runtime_policy=runtime_policy)
+    )
     required_attrs = (
         '_rpu_cache',
         '_rpu_action_handle',
         '_rpu_adarms_graph_cache',
     )
 
-    handle = torch.ops.rpu.adarms_create()
-    handle_finalizer = None
+    resource = _InstalledNativeResource(
+        model, None, _adarms_destroy_handle, graphs=(adarms_graph_cache,),
+        keepalive=(set_weights_args, rpu_cache), label="Pi0.5 AdaRMS",
+        handle_name="_rpu_action_handle")
+    handle_finalizer = resource.finalizer
     committed = False
     try:
-        handle_finalizer = weakref.finalize(
-            model, _adarms_destroy_handle, h=handle)
+        resource.handle = handle = torch.ops.rpu.adarms_create(
+            bool(getattr(model, "_fmb_execution_component_config", {})
+                 .get("action", {}).get("linear_acc32", False)))
+        if topology.num_cores != 8:
+            torch.ops.rpu.adarms_set_execution_core_count(handle, topology.num_cores)
         torch.ops.rpu.adarms_set_weights(handle, *set_weights_args)
+        validate_native_topology("adarms", handle, topology, intermediate_size, gate_w_list[0].dtype)
+        # Shared physical KV offsets need not equal logical/suffix RoPE rows.
+        torch.ops.rpu.adarms_set_chunk_envelope(handle, _max_seq, 0)
 
-        # Stash cos/sin on the model so
+        # Task 4.3: stash cos/sin on model so
         # _install_fused_denoise_handle can reuse the already-allocated RPU
         # tensors without a second allocation.
         model._gemma_rope_cos = cos_cached
         model._gemma_rope_sin = sin_cached
+        model._adarms_graph_enabled = graph_enabled
+        model._adarms_w8a16_graph_enabled = w8a16_graph_enabled
+        model._adarms_graph_capture_enabled = graph_capture_enabled
         model._rpu_cache = rpu_cache
         model._rpu_adarms_graph_cache = adarms_graph_cache
         model._rpu_lazy_init_checked = True
         model._rpu_required_attrs = required_attrs
         model._rpu_action_handle = handle
+        model._rpu_action_retirement_state = resource
         model._rpu_action_handle_finalizer = handle_finalizer
         model.forward = types.MethodType(rpu_adarms_model_forward, model)
 
         from rpu_backend.graph.lazy_init_guard import _verify_lazy_init
         _verify_lazy_init(model)
 
-        if (
-            had_old_handle
-            and (
-                old_finalizer is None
-                or getattr(old_finalizer, "alive", False)
-            )
-        ):
-            torch.ops.rpu.adarms_destroy(old_handle)
+        if old_resource is not None:
+            old_resource.retire()
         committed = True
-    except BaseException:
+    except BaseException as error:
         if not committed:
+            cleanup_ok = resource.cleanup_failure(error, model, install_snapshot)
+            if resource.handle is None and handle_finalizer.alive:
+                handle_finalizer.detach()
             model_state = vars(model)
-            for name in _ADARMS_RUNTIME_INSTALL_ATTRS:
-                model_state.pop(name, None)
-            model_state.update(install_snapshot)
-
-            if handle_finalizer is None:
-                _adarms_destroy_handle(handle)
-            elif handle_finalizer.alive:
-                handle_finalizer()
+            if cleanup_ok:
+                for name in _ADARMS_RUNTIME_INSTALL_ATTRS:
+                    model_state.pop(name, None)
+                model_state.update(install_snapshot)
+            else:
+                model_state.update(
+                    _rpu_action_handle=resource.handle,
+                    _rpu_action_handle_finalizer=handle_finalizer,
+                    _rpu_action_retirement_state=resource,
+                    _rpu_adarms_graph_cache=adarms_graph_cache, _rpu_cache=rpu_cache)
         raise
 
     if old_finalizer is not None and getattr(old_finalizer, "alive", False):
@@ -556,7 +768,7 @@ def patch_adarms_model_for_rpu_all_layers_once(model) -> int:
     if adarms_w8a16:
         graph_note = (
             ", W8A16 graph enabled"
-            if _adarms_w8a16_graph_enabled()
+            if w8a16_graph_enabled
             else ", W8A16 graph disabled by RPU_PI05_ADARMS_W8A16_GRAPH=0")
     _LOG.info("Patched AdaRMSModel (instance) with all-layers-once fused forward, "
               "handle=%d, num_layers=%d%s", handle, num_layers,

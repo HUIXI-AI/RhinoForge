@@ -23,7 +23,6 @@ controlled evaluator rather than a generic supported-model path.
 from __future__ import annotations
 
 import json
-import weakref
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Sequence
@@ -35,11 +34,15 @@ from rpu_backend.runtime.rope_partial import build_interleaved_mrope_cos_sin
 from rpu_backend.runtime.control import rpu_env_bool
 from rpu_backend.api.cache import RPUCache
 from rpu_backend.runtime.weights import tp_col_swizzle_mc_weight, tp_row_swizzle_mc_weight
+from rpu_backend.runtime.decoder import plan_bounded_prefill_execution
+from rpu_backend.runtime._native_retirement import _InstalledNativeResource
+from rpu_backend.api._execution import execution_serialized
 from rpu_backend.adapters.wall_oss.llm import (
-    _SafeTensorStore, _build_rope_tables, _to_rpu_half,
-    _partial_mrope_enabled, _destroy_causal_decoder_handle,
+    _SafeTensorStore, _build_rope_tables, _to_rpu_half, _to_rpu_int8,
+    _partial_mrope_enabled,
 )
-from ._checkpoint import open_public_checkpoint
+from ._policy import require_controlled_evaluation, verify_asset_manifest
+from .execution import BACKBONE_COMPONENT, component_execution
 
 
 _PROFILE = {
@@ -54,11 +57,13 @@ _PROFILE = {
 }
 _MROPE_SECTION = [16, 24, 24]
 _MAX_SEQ_LEN = 4096
+_CERTIFIED_MAX_KV_LEN = 1936
+_CERTIFIED_CHUNK_SIZE = 176
 
 
 def _expected_checkpoint_profile() -> dict[str, tuple[tuple[int, ...], str]]:
     hidden, kv, inter = 3584, 512, 18944
-    expected = {"model.norm.weight": ((hidden,), "BF16")}
+    expected = {"model.norm.weight": ((hidden,), "F16")}
     projections = {
         "self_attn.q_proj": (hidden, hidden),
         "self_attn.k_proj": (kv, hidden),
@@ -71,13 +76,14 @@ def _expected_checkpoint_profile() -> dict[str, tuple[tuple[int, ...], str]]:
     for layer in range(28):
         prefix = f"model.layers.{layer}."
         for name, shape in projections.items():
-            expected[prefix + name + ".weight"] = (shape, "BF16")
+            expected[prefix + name + ".weight"] = (shape, "I8")
+            expected[prefix + name + ".weight_scale"] = ((shape[0],), "F16")
         expected.update({
-            prefix + "self_attn.q_proj.bias": ((hidden,), "BF16"),
-            prefix + "self_attn.k_proj.bias": ((kv,), "BF16"),
-            prefix + "self_attn.v_proj.bias": ((kv,), "BF16"),
-            prefix + "input_layernorm.weight": ((hidden,), "BF16"),
-            prefix + "post_attention_layernorm.weight": ((hidden,), "BF16"),
+            prefix + "self_attn.q_proj.bias": ((hidden,), "F16"),
+            prefix + "self_attn.k_proj.bias": ((kv,), "F16"),
+            prefix + "self_attn.v_proj.bias": ((kv,), "F16"),
+            prefix + "input_layernorm.weight": ((hidden,), "F16"),
+            prefix + "post_attention_layernorm.weight": ((hidden,), "F16"),
         })
     return expected
 
@@ -103,7 +109,7 @@ def _validate_checkpoint_profile(store: _SafeTensorStore) -> None:
     if errors:
         raise ValueError(
             "InternVLA-N1 System-2 checkpoint does not match the fixed 28-layer "
-            f"public BF16 profile: {'; '.join(errors)}"
+            f"W8A16 profile: {'; '.join(errors)}"
         )
 
 
@@ -118,11 +124,17 @@ class Qwen25VLBackbone:
     """
 
     def __init__(self, *, handle, cache, graph_cache, hidden_size, num_layers,
-                 head_dim, rope_theta, mrope_section, partial_mrope, host_cache):
+                 head_dim, rope_theta, mrope_section, partial_mrope, host_cache,
+                 execution_config=None, _resource=None):
+        if _resource is not None and (
+                _resource.owner() is not self or _resource.handle != handle or _resource.failed is not None):
+            raise RuntimeError("InternVLA System-2 requires its actual pending native resource")
         self._handle = handle
-        self._handle_finalizer = weakref.finalize(
-            self, _destroy_causal_decoder_handle, handle
-        )
+        self._native_resource = _resource or _InstalledNativeResource(
+            self, handle, torch.ops.rpu.causal_decoder_destroy,
+            graphs=(graph_cache,), keepalive=(cache,),
+            label="InternVLA System-2", handle_name="_handle")
+        self._handle_finalizer = self._native_resource.finalizer
         self._head_dim = head_dim
         self._rope_theta = rope_theta
         self._mrope_section = mrope_section
@@ -134,22 +146,23 @@ class Qwen25VLBackbone:
         self._prefill_rope_cache = {}
         self._prefill_position_cache = {}
         self._prefill_input_cache = {}
+        self._native_resource.keepalive = (
+            self._native_resource.keepalive, cache, self._prefill_rope_cache,
+            self._prefill_position_cache, self._prefill_input_cache)
         self._host_cache = host_cache
+        self._rpu_execution = component_execution(
+            execution_config,
+            BACKBONE_COMPONENT,
+            entry_point="build_qwen25vl_backbone",
+        )
+        self._fmb_execution_component_id = BACKBONE_COMPONENT
+        self._fmb_execution_generation = 0
 
     def destroy(self) -> None:
-        """Release graph/native resources. Safe to call more than once."""
+        """Retire once; an uncertain graph/native failure is process-terminal."""
         if getattr(self, "_handle", None) is None:
             return
-        graph_cache = getattr(self, "_graph_cache", None)
-        if graph_cache is not None:
-            graph_cache.clear()
-        finalizer = getattr(self, "_handle_finalizer", None)
-        if finalizer is not None and getattr(finalizer, "alive", False):
-            torch.ops.rpu.causal_decoder_destroy(self._handle)
-            finalizer.detach()
-        elif finalizer is None:
-            torch.ops.rpu.causal_decoder_destroy(self._handle)
-        self._handle = None
+        self._native_resource.retire_owned(self)
 
     def _prefill_inputs_embeds(self, inputs_embeds: torch.Tensor, seq: int):
         if inputs_embeds.device.type != "cpu" or not self._host_cache:
@@ -186,23 +199,86 @@ class Qwen25VLBackbone:
             self._prefill_rope_cache[seq] = (position_ids.clone(), cos_il, sin_il)
         return cos_il, sin_il
 
+    def _prefill_execution_plan(self, logical_seq: int):
+        """Cold inspection and forward use the same native prefill domain."""
+        if self._handle is None:
+            raise RuntimeError("InternVLA System-2 is destroyed; build a new instance")
+        stage = getattr(
+            self, "_rpu_execution", {"prefill": {"chunk_size": "auto"}}
+        ).get("prefill", {})
+        generation = int(getattr(self, "_fmb_execution_generation", 0))
+        exact_chunk = stage.get("chunk_size", "auto")
+        requested_chunk = (
+            int(exact_chunk)
+            if isinstance(exact_chunk, int)
+            else 0
+        )
+        padding_rows = stage.get("padding_rows")
+        if padding_rows is None:
+            padding_rows = 0
+        padding_budget = int(stage.get(
+            "padding_budget", 0 if isinstance(padding_rows, int) else 64
+        ))
+        plan_box = {}
+        execution_seq, planned_chunk = plan_bounded_prefill_execution(
+            logical_seq,
+            min(int(self.cache.max_seq_len), _CERTIFIED_MAX_KV_LEN),
+            padding_budget,
+            execution_owner=self,
+            execution_component="system2_backbone",
+            execution_stage="prefill",
+            execution_native=("causal_decoder", int(self._handle)),
+            alignment=1,
+            padding_rows=padding_rows,
+            exact_chunk_size=(requested_chunk or None),
+            resolve_stage_domain=lambda length: (
+                torch.ops.rpu.causal_decoder_resolve_prefill_stage_domain(
+                    self._handle, int(length), 0, True, 0, 1, 4, logical_seq
+                )
+            ),
+            graph_mode="COMPOSITE_CHILD",
+            physical_metadata=((
+                "execution_generation",
+                generation,
+            ),),
+            queue_owner_id=int(self._handle),
+            plan_result_sink=lambda result: plan_box.__setitem__("result", result),
+            plan_signature=(True, 0, 1, 4),
+            graph_cache=self._graph_cache,
+        )
+        a6_plan = plan_box["result"]
+        planned_stage_descriptor = (
+            a6_plan.selected.stage_tuple.physical_descriptor
+        )
+        if not planned_stage_descriptor:
+            raise RuntimeError("InternVLA prefill A6 winner has no native descriptor")
+        return execution_seq, planned_chunk, a6_plan
+
+    @execution_serialized
     @torch.no_grad()
     def forward_embeds(self, inputs_embeds: torch.Tensor,
                        position_ids: torch.Tensor) -> torch.Tensor:
         """Prefill from pre-assembled inputs_embeds [1, seq, H] + 3D M-RoPE position_ids
         [seq, 3] → final-normed last_hidden [1, seq, H]."""
+        if self._handle is None:
+            raise RuntimeError("InternVLA System-2 is destroyed; build a new instance")
         assert inputs_embeds.dim() == 3 and inputs_embeds.size(0) == 1, (
             f"forward_embeds: inputs_embeds must be [1, seq, H], got {tuple(inputs_embeds.shape)}")
         logical_seq = int(inputs_embeds.size(1))
         assert position_ids.shape == (logical_seq, 3), (
             "position_ids must be [seq, 3], got "
             f"{tuple(position_ids.shape)}")
-        execution_seq = logical_seq
-        torch.ops.rpu.causal_decoder_set_chunk_size_override(
-            self._handle, 0)
-        planned_chunk = int(
-            torch.ops.rpu.causal_decoder_resolve_prefill_chunk_size(
-                self._handle, execution_seq, 0))
+        execution_seq, planned_chunk, a6_plan = self._prefill_execution_plan(logical_seq)
+        planned_stage_descriptor = a6_plan.selected.stage_tuple.physical_descriptor
+        generation = int(getattr(self, "_fmb_execution_generation", 0))
+        component = getattr(self, "_fmb_execution_component_id", BACKBONE_COMPONENT)
+
+        if execution_seq != logical_seq:
+            pad_rows = execution_seq - logical_seq
+            inputs_embeds = torch.nn.functional.pad(
+                inputs_embeds, (0, 0, 0, pad_rows))
+            position_ids = torch.cat(
+                [position_ids, position_ids.new_zeros((pad_rows, 3))], dim=0)
 
         ie = self._prefill_inputs_embeds(inputs_embeds, execution_seq)
         pos = self._prefill_position_ids(position_ids, execution_seq)
@@ -214,12 +290,18 @@ class Qwen25VLBackbone:
         sig = rpu_backend.graph.GraphSignature(
             op_id="internvla_s2_backbone",
             shapes=[logical_seq, execution_seq, self.hidden_size],
-            dyn_dims=[self.num_layers, planned_chunk],
+            dyn_dims=[
+                self.num_layers,
+                planned_chunk,
+                generation,
+                *a6_plan.graph_key_words(),
+            ],
             dtypes=[torch.float16])
         with self._graph_cache.capture(sig):
             raw = torch.ops.rpu.causal_decoder_forward(
                 self._handle, ie, self.cache.k_caches, self.cache.v_caches,
-                None, self.cache.position, True, pos, [], cos_il, sin_il)
+                None, self.cache.position, True, pos, [], cos_il, sin_il,
+                -1, 0, False, 0, planned_stage_descriptor)
         resolved_chunk = int(
             torch.ops.rpu.causal_decoder_get_resolved_chunk_size(self._handle))
         if resolved_chunk != planned_chunk:
@@ -227,12 +309,18 @@ class Qwen25VLBackbone:
                 "InternVLA System-2 prefill dry/forward chunk mismatch: "
                 f"planned={planned_chunk}, resolved={resolved_chunk}, "
                 f"logical_len={logical_seq}, execution_len={execution_seq}")
-        vars(self)["_rpu_last_execution_plan"] = {
+        receipt = a6_plan.as_dict(include_candidates=False)
+        receipt.update({
+            "component": component,
+            "stage": "prefill",
+            "generation": generation,
             "logical_len": logical_seq,
             "execution_len": execution_seq,
             "chunk_size": resolved_chunk,
             "padding_rows": execution_seq - logical_seq,
-        }
+            "descriptor_authority": bool(planned_stage_descriptor),
+        })
+        vars(self)["_rpu_last_execution_plan"] = receipt
         self.cache.update_position(logical_seq)
         return raw[:, :logical_seq]
 
@@ -243,7 +331,9 @@ def build_qwen25vl_backbone(
     layer_indices: Sequence[int] | None = None,
     max_seq_len: int = _MAX_SEQ_LEN,
     attn_tp: int = 4,
+    w8a16: bool = True,
     asset_manifest: Mapping[str | Path, str] | None = None,
+    rpu_execution=None,
 ) -> Qwen25VLBackbone:
     """Load the stock Qwen2.5-VL-7B text decoder and install it on RPU.
 
@@ -251,17 +341,24 @@ def build_qwen25vl_backbone(
         ckpt_dir: dir with config.json + model.safetensors(.index.json) (stock keys).
         layer_indices: must be ``None``; partial profiles fail closed.
         attn_tp: attention tensor-parallel factor (= attention cores). 4 for NKV=4.
+        w8a16: load int8 weight + fp16 per-out-channel scale (fits the board's disk;
+            needs a pre-quantized checkpoint with `.weight_scale` tensors).
     """
+    from rpu_backend.api._execution import _require_execution_process_safe
+    _require_execution_process_safe()
+    execution = component_execution(
+        rpu_execution,
+        BACKBONE_COMPONENT,
+        entry_point="build_qwen25vl_backbone",
+    )
+    require_controlled_evaluation(asset_manifest)
     partial_mrope = _partial_mrope_enabled()
     host_cache = rpu_env_bool("RPU_INTERNVLA_HOST_CACHE", default=True)
     root = Path(ckpt_dir).expanduser().resolve()
     config_path = root / "config.json"
-    st, _, _ = open_public_checkpoint(
-        root,
-        asset_manifest,
-        prefixes=("model.layers.", "model.norm.weight"),
-        controlled_rpu=True,
-    )
+    index_path = root / "model.safetensors.index.json"
+    single_path = root / "model.safetensors"
+    verify_asset_manifest((config_path,), asset_manifest)
     with config_path.open(encoding="utf-8") as stream:
         cfg = json.load(stream)
     actual_head_dim = cfg.get("head_dim")
@@ -288,9 +385,11 @@ def build_qwen25vl_backbone(
         )
     if attn_tp != 4:
         errors.append(f"attn_tp={attn_tp!r} (expected 4)")
+    if w8a16 is not True:
+        errors.append("w8a16 must be True")
     if errors:
         raise ValueError(
-            "InternVLA-N1 System-2 does not match the public 7B BF16 "
+            "InternVLA-N1 System-2 does not match the controlled 7B W8A16 "
             f"profile: {'; '.join(errors)}"
         )
     H = cfg["hidden_size"]
@@ -307,20 +406,31 @@ def build_qwen25vl_backbone(
     layer_indices = list(range(cfg["num_hidden_layers"]))
     num_layers = len(layer_indices)
 
+    checkpoint_descriptor = index_path if index_path.is_file() else single_path
+    verify_asset_manifest((checkpoint_descriptor,), asset_manifest)
+    st = _SafeTensorStore(str(root), mmap=False)  # stream w/o mmap residency (10 GB peak budget)
+    shard_paths = tuple((root / shard).resolve() for shard in sorted(set(st.weight_map.values())))
+    if any(root not in path.parents for path in shard_paths):
+        raise ValueError("InternVLA-N1 checkpoint index contains a shard outside ckpt_dir")
+    verify_asset_manifest((config_path, *shard_paths), asset_manifest)
     _validate_checkpoint_profile(st)
     def gf(key): return st.get_tensor(key)
 
     q_w, k_w, v_w, o_w = [], [], [], []
     q_b, k_b, v_b = [], [], []
     gate, up, down = [], [], []
+    q_s, k_s, v_s, o_s, gate_s, up_s, down_s = [], [], [], [], [], [], []
     in_norm, post_norm = [], []
 
     def col(w):
-        return _to_rpu_half(tp_col_swizzle_mc_weight(w.half(), attn_tp))
+        return (_to_rpu_int8(tp_col_swizzle_mc_weight(w, attn_tp, dwidth=1)) if w8a16
+                else _to_rpu_half(tp_col_swizzle_mc_weight(w.half(), attn_tp)))
     def row(w, tp):
-        return _to_rpu_half(tp_row_swizzle_mc_weight(w.half(), tp))
+        return (_to_rpu_int8(tp_row_swizzle_mc_weight(w, tp, dwidth=1)) if w8a16
+                else _to_rpu_half(tp_row_swizzle_mc_weight(w.half(), tp)))
     def col8(w):
-        return _to_rpu_half(tp_col_swizzle_mc_weight(w.half(), 8))
+        return (_to_rpu_int8(tp_col_swizzle_mc_weight(w, 8, dwidth=1)) if w8a16
+                else _to_rpu_half(tp_col_swizzle_mc_weight(w.half(), 8)))
 
     for L in layer_indices:
         p = f"model.layers.{L}"
@@ -336,31 +446,49 @@ def build_qwen25vl_backbone(
         down.append(row(gf(f"{p}.mlp.down_proj.weight"), 8))
         in_norm.append(_to_rpu_half(gf(f"{p}.input_layernorm.weight")))
         post_norm.append(_to_rpu_half(gf(f"{p}.post_attention_layernorm.weight")))
+        if w8a16:
+            q_s.append(_to_rpu_half(gf(f"{p}.self_attn.q_proj.weight_scale")))
+            k_s.append(_to_rpu_half(gf(f"{p}.self_attn.k_proj.weight_scale")))
+            v_s.append(_to_rpu_half(gf(f"{p}.self_attn.v_proj.weight_scale")))
+            o_s.append(_to_rpu_half(gf(f"{p}.self_attn.o_proj.weight_scale")))
+            gate_s.append(_to_rpu_half(gf(f"{p}.mlp.gate_proj.weight_scale")))
+            up_s.append(_to_rpu_half(gf(f"{p}.mlp.up_proj.weight_scale")))
+            down_s.append(_to_rpu_half(gf(f"{p}.mlp.down_proj.weight_scale")))
+
     final_norm_w = _to_rpu_half(gf("model.norm.weight"))
     cos, sin = _build_rope_tables(HD, THETA, max_seq_len)
 
+    set_weights = (torch.ops.rpu.causal_decoder_set_weights_w8a16 if w8a16
+                   else torch.ops.rpu.causal_decoder_set_weights)
     args = [q_w, k_w, v_w, o_w, [], [], in_norm, post_norm,
             gate, up, down, cos, sin, final_norm_w,
             NQ, NKV, HD, H, INTER, EPS, True, MROPE, []]
-    args.extend([q_b, k_b, v_b])
+    if w8a16:
+        args.extend([q_s, k_s, v_s, o_s, gate_s, up_s, down_s, q_b, k_b, v_b])
+    else:
+        args.extend([q_b, k_b, v_b])
+    cache = RPUCache(
+        num_layers=num_layers, batch_size=1, max_seq_len=max_seq_len,
+        num_kv_heads=NKV, head_dim=HD, attn_tp=attn_tp)
+    graph_cache = rpu_backend.graph.GraphCache()
+    pending = Qwen25VLBackbone.__new__(Qwen25VLBackbone)
     handle = torch.ops.rpu.causal_decoder_create()
-    configured = False
+    resource = _InstalledNativeResource(
+        pending, handle, torch.ops.rpu.causal_decoder_destroy,
+        graphs=(graph_cache,), keepalive=(args, cache),
+        label="InternVLA System-2", handle_name="_handle")
     try:
-        torch.ops.rpu.causal_decoder_set_weights(handle, *args)
+        set_weights(handle, *args)
         torch.ops.rpu.causal_decoder_set_chunk_envelope(
-            handle, max_seq_len, 0)
+            handle, _CERTIFIED_MAX_KV_LEN, _CERTIFIED_CHUNK_SIZE)
         torch.ops.rpu.causal_decoder_set_chunk_size_override(handle, 0)
-        cache = RPUCache(
-            num_layers=num_layers, batch_size=1, max_seq_len=max_seq_len,
-            num_kv_heads=NKV, head_dim=HD, attn_tp=attn_tp)
-        result = Qwen25VLBackbone(
+        Qwen25VLBackbone.__init__(pending,
             handle=handle, cache=cache,
-            graph_cache=rpu_backend.graph.GraphCache(), hidden_size=H,
+            graph_cache=graph_cache, hidden_size=H,
             num_layers=num_layers, head_dim=HD, rope_theta=THETA,
             mrope_section=MROPE, partial_mrope=partial_mrope,
-            host_cache=host_cache)
-        configured = True
-        return result
-    finally:
-        if not configured:
-            _destroy_causal_decoder_handle(handle)
+            host_cache=host_cache, execution_config=execution, _resource=resource)
+        return pending
+    except BaseException as error:
+        resource.cleanup_failure(error, pending)
+        raise

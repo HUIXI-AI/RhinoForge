@@ -1,0 +1,2219 @@
+{
+  "schema_version": 1,
+  "description": "Public configuration constraints. Checkpoint and runtime admission remain authoritative; this is not a certification catalog.",
+  "profiles": [
+    {
+      "id": "dinov3-vit-b.fp16.vision",
+      "family": "dinov3",
+      "asset_alias": "dinov3-vit-b",
+      "precision": "fp16",
+      "component": "vision",
+      "variant": "default",
+      "example": {
+        "runner_target": "dinov3"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "gemma4-e4b.fp16.text",
+      "family": "gemma4",
+      "asset_alias": "gemma4-e4b",
+      "precision": "fp16",
+      "component": "text",
+      "variant": "default",
+      "example": {
+        "runner_target": "gemma4"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "halo_action_expert.fp16.action-step",
+      "family": "halo",
+      "asset_alias": "halo_action_expert",
+      "precision": "fp16",
+      "component": "action",
+      "variant": "default",
+      "example": {
+        "runner_target": "halo"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "hy-embodied-0.5-vla-umi.fp16.vla",
+      "family": "hy-vla",
+      "asset_alias": "hy-embodied-0.5-vla-umi",
+      "precision": "fp16",
+      "component": "vla",
+      "variant": "default",
+      "example": {
+        "runner_target": "hy_vla"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "lingbot-vla-v2-6b.fp16.source-only",
+      "family": "lingbot2",
+      "asset_alias": "lingbot-vla-v2-6b",
+      "precision": "fp16",
+      "component": "vla",
+      "variant": "source-only",
+      "example": {
+        "runner_target": "lingbot2"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": [
+        {
+          "kind": "env",
+          "name": "RPU_LINGBOT2_ALLOW_UNVALIDATED",
+          "value": "1"
+        }
+      ]
+    },
+    {
+      "id": "lingbot-vla-v2-6b.w8a16.exact-z2",
+      "family": "lingbot-v2",
+      "asset_alias": "lingbot-vla-v2-6b",
+      "precision": "w8a16",
+      "component": "vla",
+      "variant": "default",
+      "example": {
+        "runner_target": "lingbot2"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": [
+        {
+          "kind": "env",
+          "name": "RPU_LINGBOT2_ALLOW_UNVALIDATED",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_LINGBOT2_MULTIVIEW_SPM_Z2",
+          "value": "1"
+        }
+      ]
+    },
+    {
+      "id": "llama-3.2-1b.fp16.text",
+      "family": "llama",
+      "asset_alias": "llama-3.2-1b",
+      "precision": "fp16",
+      "component": "text",
+      "variant": "default",
+      "example": {
+        "runner_target": "llama"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-0.6b-instruct.fp16.text",
+      "family": "qwen3",
+      "asset_alias": "qwen3-0.6b-instruct",
+      "precision": "fp16",
+      "component": "text",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-0.6b-w8a16-lmhead-int8.w8a16.text",
+      "family": "qwen3",
+      "asset_alias": "qwen3-0.6b-w8a16-lmhead-int8",
+      "precision": "w8a16",
+      "component": "text",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-0.6b.fp16.text",
+      "family": "qwen3",
+      "asset_alias": "qwen3-0.6b",
+      "precision": "fp16",
+      "component": "text",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-0.6b.w4a16-g32-lm-head.text",
+      "family": "qwen3",
+      "asset_alias": "qwen3-0.6b",
+      "precision": "w4a16",
+      "component": "text",
+      "variant": "w4a16-g32-lm-head",
+      "example": {
+        "runner_target": "qwen3"
+      },
+      "input_envelope": {
+        "limits": {
+          "on_install_quantization": "w4a16_lm_head",
+          "num_cores": 8,
+          "hidden_size": 1024,
+          "intermediate_size": 3072,
+          "num_hidden_layers": 28,
+          "num_attention_heads": 16,
+          "num_key_value_heads": 8,
+          "head_dim": 128,
+          "vocab_size": 151936
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-0.6b.w4a16-g32.text",
+      "family": "qwen3",
+      "asset_alias": "qwen3-0.6b",
+      "precision": "w4a16",
+      "component": "text",
+      "variant": "w4a16-g32",
+      "example": {
+        "runner_target": "qwen3"
+      },
+      "input_envelope": {
+        "limits": {
+          "on_install_quantization": "w4a16",
+          "num_cores": 8,
+          "hidden_size": 1024,
+          "intermediate_size": 3072,
+          "num_hidden_layers": 28,
+          "num_attention_heads": 16,
+          "num_key_value_heads": 8,
+          "head_dim": 128,
+          "vocab_size": 151936
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-1.7b-w8a16-lmhead-int8.w8a16.text",
+      "family": "qwen3",
+      "asset_alias": "qwen3-1.7b-w8a16-lmhead-int8",
+      "precision": "w8a16",
+      "component": "text",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-1.7b.fp16.text",
+      "family": "qwen3",
+      "asset_alias": "qwen3-1.7b",
+      "precision": "fp16",
+      "component": "text",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-1.7b.w4a16-g32-lm-head.text",
+      "family": "qwen3",
+      "asset_alias": "qwen3-1.7b",
+      "precision": "w4a16",
+      "component": "text",
+      "variant": "w4a16-g32-lm-head",
+      "example": {
+        "runner_target": "qwen3"
+      },
+      "input_envelope": {
+        "limits": {
+          "on_install_quantization": "w4a16_lm_head",
+          "num_cores": 8,
+          "hidden_size": 2048,
+          "intermediate_size": 6144,
+          "num_hidden_layers": 28,
+          "num_attention_heads": 16,
+          "num_key_value_heads": 8,
+          "head_dim": 128,
+          "vocab_size": 151936
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-1.7b.w4a16-g32.text",
+      "family": "qwen3",
+      "asset_alias": "qwen3-1.7b",
+      "precision": "w4a16",
+      "component": "text",
+      "variant": "w4a16-g32",
+      "example": {
+        "runner_target": "qwen3"
+      },
+      "input_envelope": {
+        "limits": {
+          "on_install_quantization": "w4a16",
+          "num_cores": 8,
+          "hidden_size": 2048,
+          "intermediate_size": 6144,
+          "num_hidden_layers": 28,
+          "num_attention_heads": 16,
+          "num_key_value_heads": 8,
+          "head_dim": 128,
+          "vocab_size": 151936
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-14b-w8a16-lmhead-int8.w8a16.text",
+      "family": "qwen3",
+      "asset_alias": "qwen3-14b-w8a16-lmhead-int8",
+      "precision": "w8a16",
+      "component": "text",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-14b.w4a16-g32-lm-head.text",
+      "family": "qwen3",
+      "asset_alias": "qwen3-14b",
+      "precision": "w4a16",
+      "component": "text",
+      "variant": "w4a16-g32-lm-head",
+      "example": {
+        "runner_target": "qwen3"
+      },
+      "input_envelope": {
+        "limits": {
+          "on_install_quantization": "w4a16_lm_head",
+          "num_cores": 8,
+          "hidden_size": 5120,
+          "intermediate_size": 17408,
+          "num_hidden_layers": 40,
+          "num_attention_heads": 40,
+          "num_key_value_heads": 8,
+          "head_dim": 128,
+          "vocab_size": 151936
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-14b.w4a16-g32.text",
+      "family": "qwen3",
+      "asset_alias": "qwen3-14b",
+      "precision": "w4a16",
+      "component": "text",
+      "variant": "w4a16-g32",
+      "example": {
+        "runner_target": "qwen3"
+      },
+      "input_envelope": {
+        "limits": {
+          "on_install_quantization": "w4a16",
+          "num_cores": 8,
+          "hidden_size": 5120,
+          "intermediate_size": 17408,
+          "num_hidden_layers": 40,
+          "num_attention_heads": 40,
+          "num_key_value_heads": 8,
+          "head_dim": 128,
+          "vocab_size": 151936
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-32b-w8a16-lmhead-int8.w8a16.text",
+      "family": "qwen3",
+      "asset_alias": "qwen3-32b-w8a16-lmhead-int8",
+      "precision": "w8a16",
+      "component": "text",
+      "variant": "w8a16-lm-head",
+      "example": {
+        "runner_target": "qwen3"
+      },
+      "input_envelope": {
+        "limits": {
+          "checkpoint_format": "qwen3_32b_w8a16",
+          "num_cores": 8,
+          "hidden_size": 5120,
+          "intermediate_size": 25600,
+          "num_hidden_layers": 64,
+          "num_attention_heads": 64,
+          "num_key_value_heads": 8,
+          "head_dim": 128,
+          "vocab_size": 151936
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-32b.w4a16-g32-lm-head.text",
+      "family": "qwen3",
+      "asset_alias": "qwen3-32b",
+      "precision": "w4a16",
+      "component": "text",
+      "variant": "w4a16-g32-lm-head",
+      "example": {
+        "runner_target": "qwen3"
+      },
+      "input_envelope": {
+        "limits": {
+          "on_install_quantization": "w4a16_lm_head",
+          "num_cores": 8,
+          "hidden_size": 5120,
+          "intermediate_size": 25600,
+          "num_hidden_layers": 64,
+          "num_attention_heads": 64,
+          "num_key_value_heads": 8,
+          "head_dim": 128,
+          "vocab_size": 151936
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-32b.w4a16-g32.text",
+      "family": "qwen3",
+      "asset_alias": "qwen3-32b",
+      "precision": "w4a16",
+      "component": "text",
+      "variant": "w4a16-g32",
+      "example": {
+        "runner_target": "qwen3"
+      },
+      "input_envelope": {
+        "limits": {
+          "on_install_quantization": "w4a16",
+          "num_cores": 8,
+          "hidden_size": 5120,
+          "intermediate_size": 25600,
+          "num_hidden_layers": 64,
+          "num_attention_heads": 64,
+          "num_key_value_heads": 8,
+          "head_dim": 128,
+          "vocab_size": 151936
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-4b-instruct.fp16.text",
+      "family": "qwen3",
+      "asset_alias": "qwen3-4b-instruct",
+      "precision": "fp16",
+      "component": "text",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-4b-w8a16-lmhead-int8.w8a16.text",
+      "family": "qwen3",
+      "asset_alias": "qwen3-4b-w8a16-lmhead-int8",
+      "precision": "w8a16",
+      "component": "text",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-4b.fp16.text",
+      "family": "qwen3",
+      "asset_alias": "qwen3-4b",
+      "precision": "fp16",
+      "component": "text",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-4b.w4a16-g32-lm-head.text",
+      "family": "qwen3",
+      "asset_alias": "qwen3-4b",
+      "precision": "w4a16",
+      "component": "text",
+      "variant": "w4a16-g32-lm-head",
+      "example": {
+        "runner_target": "qwen3"
+      },
+      "input_envelope": {
+        "limits": {
+          "on_install_quantization": "w4a16_lm_head",
+          "num_cores": 8,
+          "hidden_size": 2560,
+          "intermediate_size": 9728,
+          "num_hidden_layers": 36,
+          "num_attention_heads": 32,
+          "num_key_value_heads": 8,
+          "head_dim": 128,
+          "vocab_size": 151936
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-4b.w4a16-g32.text",
+      "family": "qwen3",
+      "asset_alias": "qwen3-4b",
+      "precision": "w4a16",
+      "component": "text",
+      "variant": "w4a16-g32",
+      "example": {
+        "runner_target": "qwen3"
+      },
+      "input_envelope": {
+        "limits": {
+          "on_install_quantization": "w4a16",
+          "num_cores": 8,
+          "hidden_size": 2560,
+          "intermediate_size": 9728,
+          "num_hidden_layers": 36,
+          "num_attention_heads": 32,
+          "num_key_value_heads": 8,
+          "head_dim": 128,
+          "vocab_size": 151936
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-8b-w8a16-lmhead-int8.w8a16.text",
+      "family": "qwen3",
+      "asset_alias": "qwen3-8b-w8a16-lmhead-int8",
+      "precision": "w8a16",
+      "component": "text",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-8b.fp16.text",
+      "family": "qwen3",
+      "asset_alias": "qwen3-8b",
+      "precision": "fp16",
+      "component": "text",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-8b.w4a16-g32-lm-head.text",
+      "family": "qwen3",
+      "asset_alias": "qwen3-8b",
+      "precision": "w4a16",
+      "component": "text",
+      "variant": "w4a16-g32-lm-head",
+      "example": {
+        "runner_target": "qwen3"
+      },
+      "input_envelope": {
+        "limits": {
+          "on_install_quantization": "w4a16_lm_head",
+          "num_cores": 8,
+          "hidden_size": 4096,
+          "intermediate_size": 12288,
+          "num_hidden_layers": 36,
+          "num_attention_heads": 32,
+          "num_key_value_heads": 8,
+          "head_dim": 128,
+          "vocab_size": 151936
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-8b.w4a16-g32.text",
+      "family": "qwen3",
+      "asset_alias": "qwen3-8b",
+      "precision": "w4a16",
+      "component": "text",
+      "variant": "w4a16-g32",
+      "example": {
+        "runner_target": "qwen3"
+      },
+      "input_envelope": {
+        "limits": {
+          "on_install_quantization": "w4a16",
+          "num_cores": 8,
+          "hidden_size": 4096,
+          "intermediate_size": 12288,
+          "num_hidden_layers": 36,
+          "num_attention_heads": 32,
+          "num_key_value_heads": 8,
+          "head_dim": 128,
+          "vocab_size": 151936
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-vl-2b-runtime-w4a16.w4a16.multimodal",
+      "family": "qwen3-vl",
+      "asset_alias": "qwen3-vl-2b-runtime-w4a16",
+      "precision": "w4a16",
+      "component": "multimodal",
+      "variant": "runtime-align-v1",
+      "example": {
+        "runner_target": "qwen3_vl"
+      },
+      "input_envelope": {
+        "limits": {
+          "checkpoint_quant_profile": "qwen3_vl_2b_w4a16_awq_runtime_align_v1",
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-vl-2b-runtime-w4a16.w4a16.text",
+      "family": "qwen3-vl",
+      "asset_alias": "qwen3-vl-2b-runtime-w4a16",
+      "precision": "w4a16",
+      "component": "text",
+      "variant": "runtime-align-v1",
+      "example": {
+        "runner_target": "qwen3_vl"
+      },
+      "input_envelope": {
+        "limits": {
+          "checkpoint_quant_profile": "qwen3_vl_2b_w4a16_awq_runtime_align_v1",
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-vl-2b-runtime-w8a16.w8a16.multimodal",
+      "family": "qwen3-vl",
+      "asset_alias": "qwen3-vl-2b-runtime-w8a16",
+      "precision": "w8a16",
+      "component": "multimodal",
+      "variant": "runtime-align-v1",
+      "example": {
+        "runner_target": "qwen3_vl"
+      },
+      "input_envelope": {
+        "limits": {
+          "checkpoint_quant_profile": "qwen3_vl_2b_w8a16_runtime_align_v1",
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-vl-2b-runtime-w8a16.w8a16.text",
+      "family": "qwen3-vl",
+      "asset_alias": "qwen3-vl-2b-runtime-w8a16",
+      "precision": "w8a16",
+      "component": "text",
+      "variant": "runtime-align-v1",
+      "example": {
+        "runner_target": "qwen3_vl"
+      },
+      "input_envelope": {
+        "limits": {
+          "checkpoint_quant_profile": "qwen3_vl_2b_w8a16_runtime_align_v1",
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-vl-2b-text-awq-w4a16.w4a16.multimodal",
+      "family": "qwen3-vl",
+      "asset_alias": "qwen3-vl-2b-text-awq-w4a16",
+      "precision": "w4a16",
+      "component": "multimodal",
+      "variant": "text-awq-g32-fp16-head-vision",
+      "example": {
+        "runner_target": "qwen3_vl"
+      },
+      "input_envelope": {
+        "limits": {
+          "checkpoint_format": "qwen3_vl_text_awq",
+          "text_hidden_size": 2048,
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-vl-2b-text-awq-w4a16.w4a16.text",
+      "family": "qwen3-vl",
+      "asset_alias": "qwen3-vl-2b-text-awq-w4a16",
+      "precision": "w4a16",
+      "component": "text",
+      "variant": "text-awq-g32-fp16-head-vision",
+      "example": {
+        "runner_target": "qwen3_vl"
+      },
+      "input_envelope": {
+        "limits": {
+          "checkpoint_format": "qwen3_vl_text_awq",
+          "text_hidden_size": 2048,
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-vl-2b-text-w8a16.w8a16.multimodal",
+      "family": "qwen3-vl",
+      "asset_alias": "qwen3-vl-2b-text-w8a16",
+      "precision": "w8a16",
+      "component": "multimodal",
+      "variant": "text-w8-fp16-head-vision",
+      "example": {
+        "runner_target": "qwen3_vl"
+      },
+      "input_envelope": {
+        "limits": {
+          "checkpoint_format": "qwen3_vl_text_w8",
+          "text_hidden_size": 2048,
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-vl-2b-text-w8a16.w8a16.text",
+      "family": "qwen3-vl",
+      "asset_alias": "qwen3-vl-2b-text-w8a16",
+      "precision": "w8a16",
+      "component": "text",
+      "variant": "text-w8-fp16-head-vision",
+      "example": {
+        "runner_target": "qwen3_vl"
+      },
+      "input_envelope": {
+        "limits": {
+          "checkpoint_format": "qwen3_vl_text_w8",
+          "text_hidden_size": 2048,
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-vl-2b.fp16.multimodal",
+      "family": "qwen3-vl",
+      "asset_alias": "qwen3-vl-2b",
+      "precision": "fp16",
+      "component": "multimodal",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3_vl"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-vl-2b.fp16.text",
+      "family": "qwen3-vl",
+      "asset_alias": "qwen3-vl-2b",
+      "precision": "fp16",
+      "component": "text",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3_vl"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-vl-2b.fp16.vision",
+      "family": "qwen3-vl",
+      "asset_alias": "qwen3-vl-2b",
+      "precision": "fp16",
+      "component": "vision",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3_vl"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-vl-32b-runtime-w4a16.w4a16.multimodal",
+      "family": "qwen3-vl",
+      "asset_alias": "qwen3-vl-32b-runtime-w4a16",
+      "precision": "w4a16",
+      "component": "multimodal",
+      "variant": "runtime-align-v1",
+      "example": {
+        "runner_target": "qwen3_vl"
+      },
+      "input_envelope": {
+        "limits": {
+          "checkpoint_quant_profile": "qwen3_vl_32b_w4a16_runtime_align_v1",
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-vl-32b-runtime-w4a16.w4a16.text",
+      "family": "qwen3-vl",
+      "asset_alias": "qwen3-vl-32b-runtime-w4a16",
+      "precision": "w4a16",
+      "component": "text",
+      "variant": "runtime-align-v1",
+      "example": {
+        "runner_target": "qwen3_vl"
+      },
+      "input_envelope": {
+        "limits": {
+          "checkpoint_quant_profile": "qwen3_vl_32b_w4a16_runtime_align_v1",
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-vl-32b-runtime-w8a16.w8a16.multimodal",
+      "family": "qwen3-vl",
+      "asset_alias": "qwen3-vl-32b-runtime-w8a16",
+      "precision": "w8a16",
+      "component": "multimodal",
+      "variant": "runtime-align-v1",
+      "example": {
+        "runner_target": "qwen3_vl"
+      },
+      "input_envelope": {
+        "limits": {
+          "checkpoint_quant_profile": "qwen3_vl_32b_w8a16_runtime_align_v1",
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-vl-32b-runtime-w8a16.w8a16.text",
+      "family": "qwen3-vl",
+      "asset_alias": "qwen3-vl-32b-runtime-w8a16",
+      "precision": "w8a16",
+      "component": "text",
+      "variant": "runtime-align-v1",
+      "example": {
+        "runner_target": "qwen3_vl"
+      },
+      "input_envelope": {
+        "limits": {
+          "checkpoint_quant_profile": "qwen3_vl_32b_w8a16_runtime_align_v1",
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-vl-32b.w8a16.multimodal-controlled",
+      "family": "qwen3-vl",
+      "asset_alias": "qwen3-vl-32b-w8a16",
+      "precision": "w8a16",
+      "component": "multimodal",
+      "variant": "controlled",
+      "example": {
+        "runner_target": "qwen3_vl"
+      },
+      "input_envelope": {
+        "limits": {
+          "text_hidden_size": 5120
+        }
+      },
+      "controlled_gates": [
+        {
+          "kind": "env",
+          "name": "QWEN3_VL_32B_ALLOW_GRAPH_BLOCKED",
+          "value": "1"
+        }
+      ]
+    },
+    {
+      "id": "qwen3-vl-4b-runtime-w4a16.w4a16.multimodal",
+      "family": "qwen3-vl",
+      "asset_alias": "qwen3-vl-4b-runtime-w4a16",
+      "precision": "w4a16",
+      "component": "multimodal",
+      "variant": "runtime-align-v1",
+      "example": {
+        "runner_target": "qwen3_vl"
+      },
+      "input_envelope": {
+        "limits": {
+          "checkpoint_quant_profile": "qwen3_vl_4b_w4a16_awq_runtime_align_v1",
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-vl-4b-runtime-w4a16.w4a16.text",
+      "family": "qwen3-vl",
+      "asset_alias": "qwen3-vl-4b-runtime-w4a16",
+      "precision": "w4a16",
+      "component": "text",
+      "variant": "runtime-align-v1",
+      "example": {
+        "runner_target": "qwen3_vl"
+      },
+      "input_envelope": {
+        "limits": {
+          "checkpoint_quant_profile": "qwen3_vl_4b_w4a16_awq_runtime_align_v1",
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-vl-4b-runtime-w8a16.w8a16.multimodal",
+      "family": "qwen3-vl",
+      "asset_alias": "qwen3-vl-4b-runtime-w8a16",
+      "precision": "w8a16",
+      "component": "multimodal",
+      "variant": "runtime-align-v1",
+      "example": {
+        "runner_target": "qwen3_vl"
+      },
+      "input_envelope": {
+        "limits": {
+          "checkpoint_quant_profile": "qwen3_vl_4b_w8a16_runtime_align_v1",
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-vl-4b-runtime-w8a16.w8a16.text",
+      "family": "qwen3-vl",
+      "asset_alias": "qwen3-vl-4b-runtime-w8a16",
+      "precision": "w8a16",
+      "component": "text",
+      "variant": "runtime-align-v1",
+      "example": {
+        "runner_target": "qwen3_vl"
+      },
+      "input_envelope": {
+        "limits": {
+          "checkpoint_quant_profile": "qwen3_vl_4b_w8a16_runtime_align_v1",
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-vl-4b-text-awq-w4a16.w4a16.multimodal",
+      "family": "qwen3-vl",
+      "asset_alias": "qwen3-vl-4b-text-awq-w4a16",
+      "precision": "w4a16",
+      "component": "multimodal",
+      "variant": "text-awq-g32-fp16-head-vision",
+      "example": {
+        "runner_target": "qwen3_vl"
+      },
+      "input_envelope": {
+        "limits": {
+          "checkpoint_format": "qwen3_vl_text_awq",
+          "text_hidden_size": 2560,
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-vl-4b-text-awq-w4a16.w4a16.text",
+      "family": "qwen3-vl",
+      "asset_alias": "qwen3-vl-4b-text-awq-w4a16",
+      "precision": "w4a16",
+      "component": "text",
+      "variant": "text-awq-g32-fp16-head-vision",
+      "example": {
+        "runner_target": "qwen3_vl"
+      },
+      "input_envelope": {
+        "limits": {
+          "checkpoint_format": "qwen3_vl_text_awq",
+          "text_hidden_size": 2560,
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-vl-4b.fp16.multimodal",
+      "family": "qwen3-vl",
+      "asset_alias": "qwen3-vl-4b",
+      "precision": "fp16",
+      "component": "multimodal",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3_vl"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-vl-4b.fp16.text",
+      "family": "qwen3-vl",
+      "asset_alias": "qwen3-vl-4b",
+      "precision": "fp16",
+      "component": "text",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3_vl"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-vl-4b.fp16.vision",
+      "family": "qwen3-vl",
+      "asset_alias": "qwen3-vl-4b",
+      "precision": "fp16",
+      "component": "vision",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3_vl"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-vl-8b-runtime-w4a16.w4a16.multimodal",
+      "family": "qwen3-vl",
+      "asset_alias": "qwen3-vl-8b-runtime-w4a16",
+      "precision": "w4a16",
+      "component": "multimodal",
+      "variant": "runtime-align-v1",
+      "example": {
+        "runner_target": "qwen3_vl"
+      },
+      "input_envelope": {
+        "limits": {
+          "checkpoint_quant_profile": "qwen3_vl_8b_w4a16_awq_runtime_align_v1",
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-vl-8b-runtime-w4a16.w4a16.text",
+      "family": "qwen3-vl",
+      "asset_alias": "qwen3-vl-8b-runtime-w4a16",
+      "precision": "w4a16",
+      "component": "text",
+      "variant": "runtime-align-v1",
+      "example": {
+        "runner_target": "qwen3_vl"
+      },
+      "input_envelope": {
+        "limits": {
+          "checkpoint_quant_profile": "qwen3_vl_8b_w4a16_awq_runtime_align_v1",
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-vl-8b-runtime-w8a16.w8a16.multimodal",
+      "family": "qwen3-vl",
+      "asset_alias": "qwen3-vl-8b-runtime-w8a16",
+      "precision": "w8a16",
+      "component": "multimodal",
+      "variant": "runtime-align-v1",
+      "example": {
+        "runner_target": "qwen3_vl"
+      },
+      "input_envelope": {
+        "limits": {
+          "checkpoint_quant_profile": "qwen3_vl_8b_w8a16_runtime_align_v1",
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-vl-8b-runtime-w8a16.w8a16.text",
+      "family": "qwen3-vl",
+      "asset_alias": "qwen3-vl-8b-runtime-w8a16",
+      "precision": "w8a16",
+      "component": "text",
+      "variant": "runtime-align-v1",
+      "example": {
+        "runner_target": "qwen3_vl"
+      },
+      "input_envelope": {
+        "limits": {
+          "checkpoint_quant_profile": "qwen3_vl_8b_w8a16_runtime_align_v1",
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-vl-8b.fp16.multimodal",
+      "family": "qwen3-vl",
+      "asset_alias": "qwen3-vl-8b",
+      "precision": "fp16",
+      "component": "multimodal",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3_vl"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-vl-8b.fp16.text",
+      "family": "qwen3-vl",
+      "asset_alias": "qwen3-vl-8b",
+      "precision": "fp16",
+      "component": "text",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3_vl"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3-vl-8b.fp16.vision",
+      "family": "qwen3-vl",
+      "asset_alias": "qwen3-vl-8b",
+      "precision": "fp16",
+      "component": "vision",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3_vl"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3_5-0.8b.fp16.text",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-0.8b",
+      "precision": "fp16",
+      "component": "text",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3_5"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3_5-0.8b.fp16.text-long-prefill",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-0.8b",
+      "precision": "fp16",
+      "component": "text",
+      "variant": "long-prefill",
+      "example": {
+        "runner_target": "qwen3_5"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3_5-0.8b.fp16.text-tp4",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-0.8b",
+      "precision": "fp16",
+      "component": "text",
+      "variant": "tp4",
+      "example": {
+        "runner_target": "qwen3_5"
+      },
+      "input_envelope": {
+        "limits": {
+          "num_cores": 4
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3_5-0.8b.fp16.text-tp6",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-0.8b",
+      "precision": "fp16",
+      "component": "text",
+      "variant": "tp6",
+      "example": {
+        "runner_target": "qwen3_5"
+      },
+      "input_envelope": {
+        "limits": {
+          "num_cores": 6
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3_5-0.8b.fp16.vision-controlled",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-0.8b",
+      "precision": "fp16",
+      "component": "vision",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3_5_vision"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": [
+        {
+          "kind": "env",
+          "name": "QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED",
+          "value": "1"
+        }
+      ]
+    },
+    {
+      "id": "qwen3_5-0.8b.w4a16.text-controlled",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-0.8b-w4a16",
+      "precision": "w4a16",
+      "component": "text",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3_5"
+      },
+      "input_envelope": {
+        "limits": {
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": [
+        {
+          "kind": "env",
+          "name": "QWEN3_5_QUANT_ALLOW_UNCERTIFIED",
+          "value": "1"
+        }
+      ]
+    },
+    {
+      "id": "qwen3_5-0.8b.w4a16.vision-controlled",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-0.8b-w4a16",
+      "precision": "w4a16",
+      "component": "vision",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3_5_vision"
+      },
+      "input_envelope": {
+        "limits": {
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": [
+        {
+          "kind": "env",
+          "name": "QWEN3_5_QUANT_ALLOW_UNCERTIFIED",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED",
+          "value": "1"
+        }
+      ]
+    },
+    {
+      "id": "qwen3_5-0.8b.w8a16.text-controlled",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-0.8b-w8a16",
+      "precision": "w8a16",
+      "component": "text",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3_5"
+      },
+      "input_envelope": {
+        "limits": {
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": [
+        {
+          "kind": "env",
+          "name": "QWEN3_5_QUANT_ALLOW_UNCERTIFIED",
+          "value": "1"
+        }
+      ]
+    },
+    {
+      "id": "qwen3_5-0.8b.w8a16.vision-controlled",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-0.8b-w8a16",
+      "precision": "w8a16",
+      "component": "vision",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3_5_vision"
+      },
+      "input_envelope": {
+        "limits": {
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": [
+        {
+          "kind": "env",
+          "name": "QWEN3_5_QUANT_ALLOW_UNCERTIFIED",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED",
+          "value": "1"
+        }
+      ]
+    },
+    {
+      "id": "qwen3_5-2b.fp16.text",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-2b",
+      "precision": "fp16",
+      "component": "text",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3_5"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3_5-2b.fp16.text-long-prefill",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-2b",
+      "precision": "fp16",
+      "component": "text",
+      "variant": "long-prefill",
+      "example": {
+        "runner_target": "qwen3_5"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3_5-2b.fp16.text-tp4",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-2b",
+      "precision": "fp16",
+      "component": "text",
+      "variant": "tp4",
+      "example": {
+        "runner_target": "qwen3_5"
+      },
+      "input_envelope": {
+        "limits": {
+          "num_cores": 4
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3_5-2b.fp16.text-tp6",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-2b",
+      "precision": "fp16",
+      "component": "text",
+      "variant": "tp6",
+      "example": {
+        "runner_target": "qwen3_5"
+      },
+      "input_envelope": {
+        "limits": {
+          "num_cores": 6
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3_5-2b.fp16.vision-controlled",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-2b",
+      "precision": "fp16",
+      "component": "vision",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3_5_vision"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": [
+        {
+          "kind": "env",
+          "name": "QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED",
+          "value": "1"
+        }
+      ]
+    },
+    {
+      "id": "qwen3_5-2b.w4a16.text-controlled",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-2b-w4a16",
+      "precision": "w4a16",
+      "component": "text",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3_5"
+      },
+      "input_envelope": {
+        "limits": {
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": [
+        {
+          "kind": "env",
+          "name": "QWEN3_5_QUANT_ALLOW_UNCERTIFIED",
+          "value": "1"
+        }
+      ]
+    },
+    {
+      "id": "qwen3_5-2b.w4a16.vision-controlled",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-2b-w4a16",
+      "precision": "w4a16",
+      "component": "vision",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3_5_vision"
+      },
+      "input_envelope": {
+        "limits": {
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": [
+        {
+          "kind": "env",
+          "name": "QWEN3_5_QUANT_ALLOW_UNCERTIFIED",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED",
+          "value": "1"
+        }
+      ]
+    },
+    {
+      "id": "qwen3_5-2b.w8a16.text-controlled",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-2b-w8a16",
+      "precision": "w8a16",
+      "component": "text",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3_5"
+      },
+      "input_envelope": {
+        "limits": {
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": [
+        {
+          "kind": "env",
+          "name": "QWEN3_5_QUANT_ALLOW_UNCERTIFIED",
+          "value": "1"
+        }
+      ]
+    },
+    {
+      "id": "qwen3_5-2b.w8a16.vision-controlled",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-2b-w8a16",
+      "precision": "w8a16",
+      "component": "vision",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3_5_vision"
+      },
+      "input_envelope": {
+        "limits": {
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": [
+        {
+          "kind": "env",
+          "name": "QWEN3_5_QUANT_ALLOW_UNCERTIFIED",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED",
+          "value": "1"
+        }
+      ]
+    },
+    {
+      "id": "qwen3_5-35b-a3b.mixed-e4m3.multimodal-tp4",
+      "family": "qwen3-5-moe",
+      "asset_alias": "qwen3_5-35b-a3b-mixed",
+      "precision": "mixed-e4m3",
+      "component": "multimodal",
+      "variant": "tp4",
+      "example": {
+        "runner_target": "qwen3_5_vision"
+      },
+      "input_envelope": {
+        "limits": {
+          "num_cores": 4,
+          "text_hidden_size": 2048
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3_5-35b-a3b.mixed-e4m3.multimodal-tp6",
+      "family": "qwen3-5-moe",
+      "asset_alias": "qwen3_5-35b-a3b-mixed",
+      "precision": "mixed-e4m3",
+      "component": "multimodal",
+      "variant": "tp6",
+      "example": {
+        "runner_target": "qwen3_5_vision"
+      },
+      "input_envelope": {
+        "limits": {
+          "num_cores": 6,
+          "text_hidden_size": 2048
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3_5-35b-a3b.mixed-e4m3.multimodal-tp8",
+      "family": "qwen3-5-moe",
+      "asset_alias": "qwen3_5-35b-a3b-mixed",
+      "precision": "mixed-e4m3",
+      "component": "multimodal",
+      "variant": "tp8",
+      "example": {
+        "runner_target": "qwen3_5_vision"
+      },
+      "input_envelope": {
+        "limits": {
+          "num_cores": 8,
+          "text_hidden_size": 2048
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3_5-35b-a3b.mixed-e4m3.text-tp4",
+      "family": "qwen3-5-moe",
+      "asset_alias": "qwen3_5-35b-a3b-mixed",
+      "precision": "mixed-e4m3",
+      "component": "text",
+      "variant": "tp4",
+      "example": {
+        "runner_target": "qwen3_5"
+      },
+      "input_envelope": {
+        "limits": {
+          "num_cores": 4,
+          "text_hidden_size": 2048
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3_5-35b-a3b.mixed-e4m3.text-tp6",
+      "family": "qwen3-5-moe",
+      "asset_alias": "qwen3_5-35b-a3b-mixed",
+      "precision": "mixed-e4m3",
+      "component": "text",
+      "variant": "tp6",
+      "example": {
+        "runner_target": "qwen3_5"
+      },
+      "input_envelope": {
+        "limits": {
+          "num_cores": 6,
+          "text_hidden_size": 2048
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3_5-35b-a3b.mixed-e4m3.text-tp8",
+      "family": "qwen3-5-moe",
+      "asset_alias": "qwen3_5-35b-a3b-mixed",
+      "precision": "mixed-e4m3",
+      "component": "text",
+      "variant": "tp8",
+      "example": {
+        "runner_target": "qwen3_5"
+      },
+      "input_envelope": {
+        "limits": {
+          "num_cores": 8,
+          "text_hidden_size": 2048
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3_5-4b.fp16.text",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-4b",
+      "precision": "fp16",
+      "component": "text",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3_5"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3_5-4b.fp16.text-long-prefill",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-4b",
+      "precision": "fp16",
+      "component": "text",
+      "variant": "long-prefill",
+      "example": {
+        "runner_target": "qwen3_5"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3_5-4b.fp16.text-tp4",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-4b",
+      "precision": "fp16",
+      "component": "text",
+      "variant": "tp4",
+      "example": {
+        "runner_target": "qwen3_5"
+      },
+      "input_envelope": {
+        "limits": {
+          "num_cores": 4
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3_5-4b.fp16.text-tp6",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-4b",
+      "precision": "fp16",
+      "component": "text",
+      "variant": "tp6",
+      "example": {
+        "runner_target": "qwen3_5"
+      },
+      "input_envelope": {
+        "limits": {
+          "num_cores": 6
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3_5-4b.fp16.vision-controlled",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-4b",
+      "precision": "fp16",
+      "component": "vision",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3_5_vision"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": [
+        {
+          "kind": "env",
+          "name": "QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED",
+          "value": "1"
+        }
+      ]
+    },
+    {
+      "id": "qwen3_5-4b.w4a16.text-controlled",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-4b-w4a16",
+      "precision": "w4a16",
+      "component": "text",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3_5"
+      },
+      "input_envelope": {
+        "limits": {
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": [
+        {
+          "kind": "env",
+          "name": "QWEN3_5_QUANT_ALLOW_UNCERTIFIED",
+          "value": "1"
+        }
+      ]
+    },
+    {
+      "id": "qwen3_5-4b.w4a16.vision-controlled",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-4b-w4a16",
+      "precision": "w4a16",
+      "component": "vision",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3_5_vision"
+      },
+      "input_envelope": {
+        "limits": {
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": [
+        {
+          "kind": "env",
+          "name": "QWEN3_5_QUANT_ALLOW_UNCERTIFIED",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED",
+          "value": "1"
+        }
+      ]
+    },
+    {
+      "id": "qwen3_5-4b.w8a16.text-controlled",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-4b-w8a16",
+      "precision": "w8a16",
+      "component": "text",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3_5"
+      },
+      "input_envelope": {
+        "limits": {
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": [
+        {
+          "kind": "env",
+          "name": "QWEN3_5_QUANT_ALLOW_UNCERTIFIED",
+          "value": "1"
+        }
+      ]
+    },
+    {
+      "id": "qwen3_5-4b.w8a16.vision-controlled",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-4b-w8a16",
+      "precision": "w8a16",
+      "component": "vision",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3_5_vision"
+      },
+      "input_envelope": {
+        "limits": {
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": [
+        {
+          "kind": "env",
+          "name": "QWEN3_5_QUANT_ALLOW_UNCERTIFIED",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED",
+          "value": "1"
+        }
+      ]
+    },
+    {
+      "id": "qwen3_5-9b.fp16.text",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-9b",
+      "precision": "fp16",
+      "component": "text",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3_5"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3_5-9b.fp16.text-long-prefill",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-9b",
+      "precision": "fp16",
+      "component": "text",
+      "variant": "long-prefill",
+      "example": {
+        "runner_target": "qwen3_5"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3_5-9b.fp16.text-tp4",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-9b",
+      "precision": "fp16",
+      "component": "text",
+      "variant": "tp4",
+      "example": {
+        "runner_target": "qwen3_5"
+      },
+      "input_envelope": {
+        "limits": {
+          "num_cores": 4
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3_5-9b.fp16.text-tp6",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-9b",
+      "precision": "fp16",
+      "component": "text",
+      "variant": "tp6",
+      "example": {
+        "runner_target": "qwen3_5"
+      },
+      "input_envelope": {
+        "limits": {
+          "num_cores": 6
+        }
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "qwen3_5-9b.fp16.vision-controlled",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-9b",
+      "precision": "fp16",
+      "component": "vision",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3_5_vision"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": [
+        {
+          "kind": "env",
+          "name": "QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED",
+          "value": "1"
+        }
+      ]
+    },
+    {
+      "id": "qwen3_5-9b.w4a16.text-controlled",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-9b-w4a16",
+      "precision": "w4a16",
+      "component": "text",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3_5"
+      },
+      "input_envelope": {
+        "limits": {
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": [
+        {
+          "kind": "env",
+          "name": "QWEN3_5_QUANT_ALLOW_UNCERTIFIED",
+          "value": "1"
+        }
+      ]
+    },
+    {
+      "id": "qwen3_5-9b.w8a16.text-controlled",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-9b-w8a16",
+      "precision": "w8a16",
+      "component": "text",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3_5"
+      },
+      "input_envelope": {
+        "limits": {
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": [
+        {
+          "kind": "env",
+          "name": "QWEN3_5_QUANT_ALLOW_UNCERTIFIED",
+          "value": "1"
+        }
+      ]
+    },
+    {
+      "id": "qwen3_5-9b.w8a16.vision-controlled",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_5-9b-w8a16",
+      "precision": "w8a16",
+      "component": "vision",
+      "variant": "default",
+      "example": {
+        "runner_target": "qwen3_5_vision"
+      },
+      "input_envelope": {
+        "limits": {
+          "num_cores": 8
+        }
+      },
+      "controlled_gates": [
+        {
+          "kind": "env",
+          "name": "QWEN3_5_QUANT_ALLOW_UNCERTIFIED",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED",
+          "value": "1"
+        }
+      ]
+    },
+    {
+      "id": "qwen3_8-27b.w8a16.text-controlled",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_8-27b-w8a16",
+      "precision": "w8a16",
+      "component": "text",
+      "variant": "controlled",
+      "example": {
+        "runner_target": "qwen3_5"
+      },
+      "input_envelope": {
+        "limits": {
+          "text_hidden_size": 5120
+        }
+      },
+      "controlled_gates": [
+        {
+          "kind": "env",
+          "name": "QWEN3_5_QUANT_ALLOW_UNCERTIFIED",
+          "value": "1"
+        }
+      ]
+    },
+    {
+      "id": "qwen3_8-27b.w8a16.text-controlled-tp4",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_8-27b-w8a16",
+      "precision": "w8a16",
+      "component": "text",
+      "variant": "controlled-tp4",
+      "example": {
+        "runner_target": "qwen3_5"
+      },
+      "input_envelope": {
+        "limits": {
+          "text_hidden_size": 5120,
+          "num_cores": 4
+        }
+      },
+      "controlled_gates": [
+        {
+          "kind": "env",
+          "name": "QWEN3_5_QUANT_ALLOW_UNCERTIFIED",
+          "value": "1"
+        }
+      ]
+    },
+    {
+      "id": "qwen3_8-27b.w8a16.text-controlled-tp6",
+      "family": "qwen3-5",
+      "asset_alias": "qwen3_8-27b-w8a16",
+      "precision": "w8a16",
+      "component": "text",
+      "variant": "controlled-tp6",
+      "example": {
+        "runner_target": "qwen3_5"
+      },
+      "input_envelope": {
+        "limits": {
+          "text_hidden_size": 5120,
+          "num_cores": 6
+        }
+      },
+      "controlled_gates": [
+        {
+          "kind": "env",
+          "name": "QWEN3_5_QUANT_ALLOW_UNCERTIFIED",
+          "value": "1"
+        }
+      ]
+    },
+    {
+      "id": "rhinovla.v1.fp16.trusted-factory",
+      "family": "rhinovla",
+      "asset_alias": "rhinovla-controlled",
+      "precision": "fp16",
+      "component": "vla",
+      "variant": "v1-trusted-factory",
+      "example": {
+        "runner_target": "rhinovla"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "rhinovla.v3.fp16.trusted-factory",
+      "family": "rhinovla",
+      "asset_alias": "rhinovla-controlled",
+      "precision": "fp16",
+      "component": "vla",
+      "variant": "v3-trusted-factory",
+      "example": {
+        "runner_target": "rhinovla"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "rhinovla.v3.w8a16.expert.trusted-factory",
+      "family": "rhinovla",
+      "asset_alias": "rhinovla-controlled",
+      "precision": "w8a16",
+      "component": "vla",
+      "variant": "expert-w8a16-trusted-factory",
+      "example": {
+        "runner_target": "rhinovla"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": [
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_PACKED_QKV",
+          "value": "0"
+        }
+      ]
+    },
+    {
+      "id": "rhinovla.v3.w8a16.full-expert.trusted-factory",
+      "family": "rhinovla",
+      "asset_alias": "rhinovla-controlled",
+      "precision": "w8a16",
+      "component": "vla",
+      "variant": "full-expert-w8a16-trusted-factory",
+      "example": {
+        "runner_target": "rhinovla"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": [
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_PACKED_QKV",
+          "value": "0"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_PRECOMPUTE_ADARMS",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_SKIP_ADARMS_GEMV",
+          "value": "0"
+        }
+      ]
+    },
+    {
+      "id": "wall-oss-0.5-w4a16-pgrp.w4a16-pgrp.vla",
+      "family": "wall-oss",
+      "asset_alias": "wall-oss-0.5-w4a16-pgrp",
+      "precision": "w4a16-pgrp",
+      "component": "vla",
+      "variant": "default",
+      "example": {
+        "runner_target": "wall_oss"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "wall-oss-0.5-w4a16.w4a16.vla",
+      "family": "wall-oss",
+      "asset_alias": "wall-oss-0.5-w4a16",
+      "precision": "w4a16",
+      "component": "vla",
+      "variant": "default",
+      "example": {
+        "runner_target": "wall_oss"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "wall-oss-0.5-w8a16.w8a16.vla",
+      "family": "wall-oss",
+      "asset_alias": "wall-oss-0.5-w8a16",
+      "precision": "w8a16",
+      "component": "vla",
+      "variant": "default",
+      "example": {
+        "runner_target": "wall_oss"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    },
+    {
+      "id": "wall-oss-0.5.fp16.vla",
+      "family": "wall-oss",
+      "asset_alias": "wall-oss-0.5",
+      "precision": "fp16",
+      "component": "vla",
+      "variant": "default",
+      "example": {
+        "runner_target": "wall_oss"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": []
+    }
+  ]
+}

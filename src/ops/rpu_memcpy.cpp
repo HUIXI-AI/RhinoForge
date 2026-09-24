@@ -1,4 +1,8 @@
-// Multi-core DDR/SPM transfer wrappers.
+// rpu_memcpy.cpp - DDR to SPM memory copy for RPU backend (multi-core)
+//
+// 功能: 将 DDR 上的 fp16 tensor 拷贝到 8 个 core 的 SPM 上
+// 每个 core 获得相同的数据副本
+//
 
 #include "rhino_launch_buffer.h"
 #include "rhino_launch_program.h"
@@ -19,14 +23,18 @@ using namespace ::rhino_lkn;
 // DDR to SPM Multi-Core Kernel Launcher
 // =============================================================================
 //
-// Public launch ABI:
-//   param0/1: element count
-//   param2/3: iteration stride
-//   param4/5: DDR source address in 256-byte units
-//   param6/7: SPM destination byte address
-//   param10/11: block stride
-//   param12/13: core stride
-// A zero core stride broadcasts the same DDR region to each core's local SPM.
+// 参数约定:
+//   param0/param1   : 元素数量
+//   param2/param3   : 步进值 (v16 数量)
+//   param4/param5   : DDR 源地址 (32-bit, 已右移8位, 256B粒度)
+//   param6/param7   : SPM 目标地址 (32-bit, 字节地址)
+//   param10/param11 : block_stride (32-bit) - 每个 block 的偏移量
+//   param12/param13 : core_stride (32-bit) - 每个 core 的偏移量
+//
+// 多核行为:
+//   设置 core_stride = 0，所有 core 从同一个 DDR 地址读取
+//   写入各自的 local SPM (相同的 local 地址)
+//
 // =============================================================================
 
 constexpr int NUM_CORES_MEMCPY = 8;
@@ -47,10 +55,10 @@ static void submit_immediate_batch(Queue_t* wq, const char* caller) {
 }
 
 // =============================================================================
-// Store-loop split for the v2 transfer contract.
+// Store-count split for the v2 transfer contract
 // =============================================================================
-// The v2 ABI accepts an outer count plus a bounded remainder. Split large
-// transfers into 32256-element chunks so both fields stay in range.
+// Split large transfers into full 32256-element chunks and a bounded remainder
+// so both fields stay in range.
 // 32256 = 126 * 256, aligned to the 256-element loop step.
 // =============================================================================
 constexpr int64_t STORE_INNER_STEP = 32256;  // 126 * 256, max safe for s16
@@ -77,16 +85,18 @@ static void compute_store_split(int64_t elements_per_block,
 
 
 // =============================================================================
-// SPM Memset (多核, 8 个 core 的 SPM 同一地址清零)
+// SPM Memset (selected execution cores, default 8)
 // =============================================================================
-// 将全部 8 个 core 的 SPM 在 spm_addr 起始的 num_elements 个 fp16 元素清零。
+// Clear num_elements fp16 values at the same SPM address on the selected cores.
 // 参数约定与 ddr2spm_multi_core_v2 一致，使用 memset_spm_multi_core_v2 kernel。
 // =============================================================================
 
 void rpu_launch_memset_spm_multicore(
     uint32_t spm_addr,
-    int64_t num_elements)
+    int64_t num_elements, int num_cores)
 {
+    TORCH_CHECK(num_cores >= 1 && num_cores <= 8,
+                "memset_spm: execution cores must be in [1,8]");
     TORCH_CHECK((spm_addr % SPM_BANK_SIZE) == 0,
                 "memset_spm: spm_addr must be 32-byte aligned");
     TORCH_CHECK(num_elements > 0,
@@ -130,17 +140,19 @@ void rpu_launch_memset_spm_multicore(
       kernel->reset_regs();
       setup_regs(kernel);
 
-      auto* wq = GET_QUEUE(NUM_CORES_MEMCPY);
+      auto* wq = GET_QUEUE(num_cores);
       wq->set_broadcast_mode(true);
-      wq->enqueu_kernel(*kernel, {(uint16_t)num_blocks, 1, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
+      std::vector<uint8_t> cores;
+      for (int i = 0; i < num_cores; ++i)
+          cores.push_back(static_cast<uint8_t>(i));
+      wq->enqueu_kernel(*kernel, {(uint16_t)num_blocks, 1, 1}, cores);
 }
 
 // =============================================================================
 // Fill SPM (multi-core broadcast): write `value` into num_elements halfs at the
-// per-core SPM addr. Uses the graph-aware operator-library `fill` (1D) kernel.
-// Host ABI: reg0/1 SPM byte offset, reg2/3 element count, reg4 fp16 value,
-// reg5 mem-flag (0=SPM), grid.x=ceil(n/2048). Graph-aware fetch records it into
-// the fused graph, so get_program requires it to be preloaded.
+// per-core SPM addr. The graph-aware `fill` kernel uses reg0/1 for the SPM byte
+// address, reg2/3 for element count, reg4 for the fp16 value, and reg5=0 for SPM.
+// grid.x=ceil(n/2048).
 void rpu_launch_fill_spm_kernel(uint32_t spm_addr, int64_t num_elements,
                                 c10::Half value, int num_cores,
                                 int core_begin) {
@@ -200,14 +212,7 @@ void rpu_launch_fill_spm_kernel(uint32_t spm_addr, int64_t num_elements,
 // Each core reads DDR data from ddr_base + core_id * core_stride_bytes,
 // writes to the SAME local SPM address (spm_addr) on each core.
 //
-// Implementation: per-core kernel launch with a compensated SPM base. The
-// public wrapper ABI applies core_stride to both DDR and SPM addresses:
-//   DDR_addr = ddr_base + core_id * stride  (wanted)
-//   SPM_addr = spm_base + core_id * stride  (unwanted)
-// We set spm_base = spm_addr - core_id * stride per launch, so:
-//   effective SPM = (spm_addr - core_id*stride) + core_id*stride = spm_addr
-//
-// core_stride is expressed in bytes. DDR base must be 256-byte aligned.
+// core_stride is in bytes; DDR base must be 256-byte aligned.
 // =============================================================================
 
 
@@ -218,8 +223,8 @@ void rpu_launch_fill_spm_kernel(uint32_t spm_addr, int64_t num_elements,
 // =============================================================================
 // File-local helper: recover the local SPM offset from the unified-mode
 // address returned by FusedModelBase::addr(0, name), then compose the
-// per-core absolute address from SPM_ALLOC.addr(core, offset), matching the
-// SPM→DDR direction.
+// per-core absolute address from SPM_ALLOC.addr(core, offset). Matches the
+// existing pattern for the SPM→DDR direction. See spec §5.
 static inline uint64_t spm_unified_to_per_core_abs(int core,
                                                     uint32_t spm_addr_unified) {
     uint32_t local_offset = spm_addr_unified - SPM_ALLOC.addr(0, 0);
@@ -1110,8 +1115,13 @@ void rpu_launch_spm_copy_ddr_dma_mutable(
 // =============================================================================
 // DMA-based memcpy primitives (immediate / graph-outside variants)
 // =============================================================================
-// One-shot DMA batches for calls outside a normal active Graph scope, plus the
-// plain PASSTHROUGH compatibility case described below.
+// One-shot batches that execute synchronously. Replace the immediate-mode
+// branches of rpu_launch_ddr2spm_multicore / rpu_launch_spm2ddr_multicore at
+// call sites that run outside a normal active Graph scope (SigLIP patch
+// embedding, standalone preprocess), plus the single plain PASSTHROUGH
+// compatibility suffix described below. The legacy kernel-launch path has
+// known correctness issues at certain sizes; this DMA path is the structural
+// fix.
 //
 // MUST pass RpuKernelGraph::check_direct_immediate_dma_allowed before any data
 // or SDK side effect.  A normal RECORDING / REPLAYING or nested scope would

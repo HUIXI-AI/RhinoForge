@@ -1,4 +1,4 @@
-// graph_spm_reset_guard.cpp — Graph-aware temporary SPM reset guard.
+// graph_spm_reset_guard.cpp — 支线 S (docs/graph_rules.md §12.4)
 //
 // spm_alloc_reset_temporary 的 graph-aware 入口。从 rpu_backend.cpp 的
 // `m.def("spm_alloc_reset_temporary", ...)` 转入这里,按 active() graph state
@@ -10,7 +10,7 @@
 //
 //   RECORDING:
 //     仍执行 SPM_ALLOC.reset_temporary() — Python 侧 ensure_allocated 需要靠
-//     gen_changed 触发 Path 2 重新分配临时缓冲区（见 FusedModelBase）。
+//     gen_changed 触发 Path 2 重 alloc temp buffers (`fused_model_base.cpp:331`)。
 //     但 RECORDING 期 RPU kernel 还在 nodes_ 没跑,subsystem 边界 SPM 已被 host
 //     侧"释放"却仍被后续 graph kernel 引用(同一段 SPM 地址会被下一 subsystem
 //     的 ensure_allocated 重 alloc 并 bake 进 kernel set_regs)。kernel 真正执行
@@ -33,7 +33,7 @@
 
 #include "graph/graph_runtime.h"
 #include "rpu_spm_allocator.h"
-#include "rpu_profile.h"        // log_at(N)
+#include "rpu_profile.h"        // P3a (debug-level): log_at(N)
 
 #include <c10/util/Exception.h>
 #include <iostream>
@@ -69,12 +69,12 @@ void graph_aware_spm_alloc_reset_temporary() {
                 std::cerr << "[RpuKernelGraph] WARN: spm_alloc_reset_temporary "
                              "called during RECORDING. Graph marked "
                              "non-replayable; sync_point flushes recorded prefix "
-                             "(Pi0.5 adapter `output.to(cpu)` would "
+                             "(Q2 fix: Pi0.5 adapter `output.to(cpu)` would "
                              "otherwise read stale DDR).\n";
             }
         }
         g.mark_non_replayable("spm_alloc_reset_temporary during RECORDING");
-        // Pi0.5 adapter 模式是 fused_op → reset_temporary →
+        // Q2 (task #63):Pi0.5 adapter 模式是 fused_op → reset_temporary →
         // output.to(cpu)。RPU→CPU copy 走 PyTorch CompositeImplicitAutograd 分解
         // (empty + copy_),copy_ 按 dst 设备分派到 CPU side → 直接 memcpy 共享
         // DDR,完全绕过我们 PrivateUse1 的 rpu_to_copy / rpu_to_cpu_zerocopy 实现。
@@ -97,7 +97,8 @@ void graph_aware_spm_alloc_reset_temporary() {
             "spm_alloc_reset_temporary called during graph REPLAYING. "
             "This indicates a graph state machine bug — RECORDING should "
             "have marked the graph non_replayable on the first reset call, "
-            "preventing subsequent REPLAYING entry.");
+            "preventing subsequent REPLAYING entry. Check graph_rules.md "
+            "§12.4 支线 S.");
     }
 }
 
@@ -111,9 +112,9 @@ void process_guarded_spm_alloc_reset_all() {
     SPM_ALLOC.reset_all();
 }
 
-// RPU→CPU zero-copy 在 graph RECORDING 期需要先 sync。
-// rpu_to_cpu_zerocopy 返回的是共享 DDR view,绕过任何等待/同步；Python adapter
-// 在 graph
+// Q2 验证 (task #63): RPU→CPU zero-copy 在 graph RECORDING 期需要先 sync。
+// rpu_to_cpu_zerocopy (rpu_backend.cpp:804) 返回的是共享 DDR view,绕过任何
+// 等待/同步;Python adapter (e.g. adapters/pi05/adarms.py:399) 在 graph
 // RECORDING 期调 output.to(cpu) 会拿到 stale DDR (kernels 还在 nodes_ 没跑)。
 // Pi0.5 denoise loop 内 action_out_proj(stale) + Euler `x_t += dt*v_t`
 // 累积放大成 0.6 量级偏差。

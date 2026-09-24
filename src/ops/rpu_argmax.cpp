@@ -75,9 +75,7 @@ static void rpu_launch_argmax_reduceC_kernel(const at::Tensor &input, at::Tensor
     uint64_t r_bytes = B * N * r_dwidth;
 
     // Allocate SPM buffers.
-    // The public wrapper contract requires workspace only for the *_C128
-    // variants. Avoid allocating it for other variants, where a large C would
-    // otherwise exceed the per-core SPM budget.
+    // Only the *_C128 variants require workspace in reg22/23.
     std::optional<LocalSPM_t> spm_workspace;
     if (is_C128) {
         const uint64_t workspace_bytes = Align(Align(C, 16) * 256 * 2, 32);
@@ -574,6 +572,8 @@ at::Tensor rpu_argmax(const at::Tensor &self, c10::optional<int64_t> dim,
         } else {
             // reduce_dim == 0: reduce over B (batch dim). Kernel can't reduce
             // over batch; fall back to CPU. Mirrors the >3D path below.
+            // (Previous impl reshaped to [1, B*N, C] + reduceN — both wrong
+            // semantically AND crashed for N>1 on output reshape.)
             if (log_at(2)) {
                 std::cout << "[RPU_ARGMAX] 3D reduce_dim=0 (batch), falling back to CPU" << std::endl;
             }
@@ -711,6 +711,8 @@ at::Tensor rpu_argmin(const at::Tensor &self, c10::optional<int64_t> dim,
         } else {
             // reduce_dim == 0: reduce over B (batch dim). Kernel can't reduce
             // over batch; fall back to CPU. Mirrors the >3D path below.
+            // (Previous impl reshaped to [1, B*N, C] + reduceN — both wrong
+            // semantically AND crashed for N>1 on output reshape.)
             if (log_at(2)) {
                 std::cout << "[RPU_ARGMIN] 3D reduce_dim=0 (batch), falling back to CPU" << std::endl;
             }

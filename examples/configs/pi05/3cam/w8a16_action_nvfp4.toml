@@ -1,0 +1,17 @@
+# Public configuration; provide your own checkpoint and input assets.
+
+[pi05]
+precision = "w8a16_action_nvfp4"
+
+[input]
+checkpoint = "/path/to/pi05_action_nvfp4"
+batch = "/path/to/pi05_3cam_t32_batch.pt"
+cameras = 3
+text_tokens = 32
+num_steps = 10
+
+[run]
+warmup = 2
+runs = 6
+seed = 0
+output_dir = "./pi05_results/3cam/w8a16_action_nvfp4"

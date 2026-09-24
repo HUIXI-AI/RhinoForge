@@ -1,26 +1,12 @@
-// rpu_hyvla_merger.cpp — Hy-VLA merger 的组轴（DwPooler）算子，两个独立 op。
+// rpu_hyvla_merger.cpp — Hy-VLA DwPooler merger operations.
 //
-// 背景：merger 的 proj1 已经 fuse 在 ViT 的 fused 图尾部，余下的 DwPooler
-// （4 成员分组 → pooled → predictor → 组内 softmax → 加权求和）若整段在 host 上跑，
-// `mean.dim` / `softmax.int` 对**非最后一维**会静默
-// 回落 CPU（见 `rpu_reduce.cpp` / `rpu_backend.cpp`），放在 RPU 上反而更慢。
-//
-// 这里把组轴那两段搬回 device。能搬的**前提是 member-major 布局**
-// `[4, G, D]`（G = 相机数 × 49 组）：这样"同一成员的全部组"在内存里是一整块，
-// 组轴的三件事（pooled / softmax over 4 / 加权求和）全都退化成**扁平算子**，
-// 可以直接按元素区间在 8 核间等分 —— 既不需要跨步 kernel，也不需要把数据复制到每核。
-// member-major 由 ViT 尾部的两次 permute3d 产出（见 rpu_hyvit2_vision_model.cpp）。
-//
-// 分片：每核 N/8 个元素，N = G*D。**允许切在行中间** —— 这里全是逐元素运算，
-// 行边界没有语义。`ddr_scatter_spm_dma` 正好是"按固定 core_stride 等分一段连续
-// DDR"，与这个分片一一对应。
-//
-// ⚠️ 这**两个** op 都在 `GraphCache.capture` **之外**调用（merger 在 ViT 的 capture
-// 结束之后、VLM 的 capture 之前），所以走 immediate 变体；峰值约 830 KB/核。
-//
-// 本文件末尾的 `merger_fused` 把这两个 op 连同 host 侧的 4 次
-// `F.linear` 一起收进**一个图内 op**（`RPU_HY_VLA_MERGER_IN_GRAPH`，默认 ON）。
-// 开关 ON 时不调用这两个 immediate op；它们保留为回退路径。
+// member-major [4,G,D] layout makes each member's groups contiguous, turning
+// pooling, four-member softmax and weighted sum into flat elementwise work.
+// The immediate pool/combine variants split N=G*D evenly across eight cores;
+// row boundaries do not matter for those elementwise slices.
+// The ViT produces this ordering with permute3d. merger_fused additionally
+// captures the linear and activation stages in one graph. The immediate
+// variants remain available when that graph route is disabled.
 
 #include "rpu_ops.h"
 #include "rpu_spm_allocator.h"
@@ -35,34 +21,13 @@ constexpr int     kCores   = 8;
 
 inline uint32_t align256(uint32_t v) { return (v + 255u) & ~255u; }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// RPU_HY_VLA_PROJ1_IN_MERGER —— **C++ 侧默认 ON**（`0`/`off`/`false` 回旧路径）。
-//
-// 把 merger 的 `proj1 [2048,1152]` 从 ViT 尾部搬进本 op。DDR 路径在
-// partition=1 下要求每个核重读完整的 [588,1152] 输入，并产生额外的
-// SPM→DDR→SPM 往返。
-//
-// 搬进来之后：ViT 尾部直接把 [S,1152] 落到 tracked output；本 op 广播的是
-// [S,1152] 而不是 [S,2048]，proj1 变成和另外 4 个投影同型的
-// col-partition acc32 GEMM + 一次 all_gather。
-//
-// ⭐ **不新增任何 SPM**：proj1 的输入借 `a_sc`（它第一次被写是在步 ③ 的 gather，
-// 此前是空的；需要 M4*K = 677376 元素 ≤ N4 = 1204224），输出借 `a_cs`（尺寸恰好
-// 就是 col-shard M4*ln），只多一个 ln 大小的 bias 槽（512 B）。
-//
-// ⚠️ **Python 与 C++ 必须同开同关**（`runtime.py::_proj1_in_merger`）——
-// 错配 = ViT 的输出维与本 op 期望的输入维对不上，会在 check 里报错而不是静默算错，
-// 但 ViT 侧若单独关掉则会把已经 proj1 过的 [S,2048] 再 proj1 一次 ⇒ **静默算错**。
-// ─────────────────────────────────────────────────────────────────────────────
-bool proj1_in_merger_on() {
-    static const bool on = [] {
-        const char* e = std::getenv("RPU_HY_VLA_PROJ1_IN_MERGER");
-        if (!e || !*e) return true;
-        const std::string v(e);
-        return !(v == "0" || v == "off" || v == "false" || v == "False");
-    }();
-    return on;
-}
+// Move proj1 [2048,1152] into the merger when optional wp1/bp1 are supplied.
+// ViT then emits [S,1152]; this op broadcasts it and runs column-partitioned
+// ACC32 GEMM followed by all_gather.
+// Reuse a_sc for the input before its later gather use, and a_cs for the
+// column-sharded output; their declared capacities must cover both roles.
+// Python binds the same cold choice to ViT set_weights and these optional
+// tensors. Their presence is this launcher's sole authority.
 
 // 校验 + 取形状。nxc/sc 都是 [4, G, D] fp16 RPU contiguous（member-major）。
 struct MergerDims { int64_t G, D, N, per_core; };
@@ -105,17 +70,9 @@ std::vector<uint32_t> stage_members(const at::Tensor& t, const MergerDims& d,
 
 }  // namespace
 
-// =============================================================================
-// merger_pool — pooled = Σ_m nxc[m]，**不除 4**，并平铺成 [4,G,D]
-//
-// 不除 4：pooled 的唯一消费者是 host 侧 `F.linear(pooled, Wb)`（predictor.0 按 K
-// 拆分的后一半），所以 1/4 折进 Wb 即可。fp16 里乘 0.25 是精确的 2 的幂缩放
-// （Wb 的量级 ~1e-2，缩放后 ~2.5e-3，远离非规格化），⇒ 少一次 kernel 且不损精度。
-//
-// 平铺成 [4,G,D]：这样 host 的两个 K 拆分 GEMM 输出形状相同，直接相加即可，
-// **避开首轴隐式广播**（该路径在 RPU 上会静默产 NaN）。
-// 额外的三份写入只改变存储量，不改变数值。
-// =============================================================================
+// merger_pool computes sum over four members and tiles it as [4,G,D].
+// The consumer folds the factor 1/4 into Wb. Equal-shaped predictor outputs
+// can then be added without an implicit leading-axis broadcast.
 at::Tensor rpu_hyvla_merger_pool(const at::Tensor& nxc) {
     const auto d = check_member_major(nxc, "hyvla_merger_pool");
 
@@ -220,37 +177,19 @@ at::Tensor rpu_hyvla_merger_combine(const at::Tensor& nxc, const at::Tensor& sc)
     return out;
 }
 
-// =============================================================================
-// merger_fused — 整条 merger 余部（pool → predictor → 组内 softmax 加权 → proj2）
-// 收进**一个图内 op**。取代 host 侧的 `4×F.linear + 2×F.gelu + pool + combine`。
+// merger_fused captures pool, predictor, member softmax, weighted sum and proj2
+// in one graph. Call it inside graph_cache.capture after the ViT capture has
+// completed and its temporary SPM allocations have been reset.
 //
-// 图内执行把多次同步派发合并为一次批量提交，并让线性层使用 SPM 路径，
-// 避免中间结果在 DDR 间往返。
+// Column-partitioned GEMMs consume full inputs and produce column shards;
+// all_gather restores full outputs. Elementwise stages operate redundantly on
+// each full copy, avoiding a full-to-shard conversion that the wrappers cannot
+// express with one shared SPM address.
+// The pooled predictor input is common to all four members, so compute it once
+// per group and broadcast its contribution to the member results.
 //
-// ⚠️ **必须在 `graph_cache.capture` 之内调用**（用的全是 graph-only wrapper）。
-// 调用点在 ViT 的 capture **之后**、且要先 `spm_alloc_reset_temporary()` ——
-// 本 op 峰值约 7.07 MB/核，调用前必须回收 ViT 的 temporary 才能满足 SPM 预算。
-//
-// ── 布局：为什么是这样切的（这段是本 op 唯一的设计难点）──────────────────
-// 三种分片在这条链上轮流出现，而**只有两种转换是有原语的**：
-//   full（每核一份完整副本） --col-partition GEMM--> col-shard（每核 N/8 列）
-//   col-shard --all_gather--> full
-// 反过来（full → shard）**没有原语**：所有 kernel 收的是一个 SPM 地址、8 核共用，
-// 无法让核 c 读自己那 1/8。⇒ 设计约束是"**永远不要产生一个之后还要再切片的 full**"。
-//
-// 由此定下：4 个 GEMM 全走 col-partition（输入 full、输出 col-shard），每个之后
-// all_gather 回 full；而 pool / softmax / 加权求和这些**逐元素**运算直接在 full 上
-// 做 —— 8 个核各算一遍同样的结果。冗余 8×，但它们是 SPM 内的 eltwise，
-// 相比省下的 DDR 往返可以忽略；换取的是整条链一次 DDR 中转都没有。
-//
-// 数值上与 host 版逐项对应，只有一处**代数重排**：host 版把 `pooled` 平铺成
-// [4,G,D] 再做 M=588 的 GEMM，这里改成 M=147 算一次、再广播加到 4 个成员上
-// （`pooled` 对 4 个成员本来就相同），因此只计算一个代表值再广播。
-//
-// ⚠️⚠️ **GEMM 必须用 `linear_spm_to_spm`（acc32），不能用 `_acc16`。**
-// 这不是性能选择，而是数值契约：`F.linear` 对应的 DDR 路径使用 fp32 累加；
-// acc16 会改变 K=2048 时的累加结果。这里必须保持 acc32。
-// =============================================================================
+// Use ACC32 linear_spm_to_spm to preserve the accumulation policy of the
+// original F.linear path; changing to ACC16 changes the numerical operation.
 at::Tensor rpu_hyvla_merger_fused(
     const at::Tensor& nxc,
     const at::Tensor& wa,  const at::Tensor& b0,
@@ -325,14 +264,15 @@ at::Tensor rpu_hyvla_merger_fused(
     stage_bias(b2, a_b2);
     stage_bias(bp2, a_bp);
 
-    // ── ⓪ proj1（避免 ViT 尾部的 linear_ddr 路径）─────────────────────────
-    // 与另外 4 枪同型：col-partition ACC32 GEMM（输入 full → 输出 col-shard）
-    // + all_gather 回 full。proj1 必须使用 ACC32。
+    // proj1 uses column-partitioned ACC32 GEMM (full input, column-sharded output)
+    // followed by all_gather. Keep the merger's ACC32 accumulation policy.
     if (proj1) {
         stage_bias(*bp1, a_bp1);
         rpu_launch_linear_spm_to_spm_kernel(a_sc, *wp1, a_cs, M4, D, K,
                                             /*partition=*/1, kCores, a_bp1);
-        rpu_launch_all_gather_spm_kernel(a_cs, a_nxc, M4, ln, (int64_t)B, kCores);
+        rpu_launch_all_gather_spm_kernel(
+            a_cs, a_nxc, M4, ln, (int64_t)B, kCores,
+            rpu_resolve_all_gather_schedule(ln, (int64_t)B));
     }
 
     // ── ① pooled = Σ_m nxc[m]（**不除 4**，1/4 折在 Wb 里，与 host 版同）──
@@ -361,10 +301,14 @@ at::Tensor rpu_hyvla_merger_fused(
                                         /*is_gelu=*/true, kCores);
 
     // ── ③ predictor.2 ────────────────────────────────────────────────────
-    rpu_launch_all_gather_spm_kernel(a_cs, a_sc, M4, ln, (int64_t)B, kCores);
+    rpu_launch_all_gather_spm_kernel(
+        a_cs, a_sc, M4, ln, (int64_t)B, kCores,
+        rpu_resolve_all_gather_schedule(ln, (int64_t)B));
     rpu_launch_linear_spm_to_spm_kernel(a_sc, w2, a_cs, M4, D, D,
                                               /*partition=*/1, kCores, a_b2);
-    rpu_launch_all_gather_spm_kernel(a_cs, a_sc, M4, ln, (int64_t)B, kCores);
+    rpu_launch_all_gather_spm_kernel(
+        a_cs, a_sc, M4, ln, (int64_t)B, kCores,
+        rpu_resolve_all_gather_schedule(ln, (int64_t)B));
 
     // ── ④ 组内 softmax + 加权求和（算法与 merger_combine 逐行相同）──────
     //   e_m = exp(sc_m - max_m sc_m)；out = (Σ_m nxc_m·e_m) / (Σ_m e_m)
@@ -402,7 +346,9 @@ at::Tensor rpu_hyvla_merger_fused(
                                         /*is_gelu=*/true, kCores);
     rpu_launch_linear_spm_to_spm_kernel(a_out, wp2, a_cso, G, D, D,
                                               /*partition=*/1, kCores, a_bp);
-    rpu_launch_all_gather_spm_kernel(a_cso, a_sum, G, ln, (int64_t)B, kCores);
+    rpu_launch_all_gather_spm_kernel(
+        a_cso, a_sum, G, ln, (int64_t)B, kCores,
+        rpu_resolve_all_gather_schedule(ln, (int64_t)B));
 
     at::Tensor out = at::empty({G, D},
         at::TensorOptions().dtype(at::kHalf).device(at::kPrivateUse1));

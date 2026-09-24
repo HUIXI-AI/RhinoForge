@@ -3,13 +3,12 @@
 [简体中文](performance.zh.md) | English
 
 RhinoForge performance results are meaningful only for one exact model and
-runtime profile. Do not compare or publish a latency number until the same run
-has passed the applicable gates in
+runtime profile. Use applicable correctness checks from
 [Model validation policy](validation_policy.md).
 
-This repository intentionally does not carry a moving table of internal board
-results. Release notes may publish measurements that are bound to an immutable
-software, asset, model, input, and measurement record.
+Internal board measurements and performance comparisons stay outside the
+repository, release notes and distribution artifacts. This guide describes how
+to diagnose and tune an application; it does not publish benchmark results.
 
 ## Bind the measured profile
 
@@ -17,10 +16,10 @@ Record these fields before running:
 
 - RhinoForge source revision and installed package version;
 - Rhino Launch package and combined operator-asset compatibility identifiers;
-- model checkpoint revision, file hashes, precision, and quantization metadata;
+- model checkpoint revision, precision, and quantization metadata;
 - board/runtime version and relevant host software versions;
 - input shape or request envelope, generation or action settings, and batch;
-- TOML hash and effective public runtime settings; and
+- TOML path and effective public runtime settings; and
 - warmup count, measured sample count, and profiler state.
 
 Run one model profile per fresh process. A different checkpoint, precision,
@@ -48,16 +47,15 @@ is not being presented as end-to-end latency.
 1. Fix deterministic or recorded inputs. For stochastic policies, reuse the
    same initial noise or random state for correctness and timing comparisons.
 2. Run the required correctness and lifecycle checks without profilers.
-3. Start a fresh process, apply the exact same profile, and complete the stated
-   warmup or graph-preparation phase.
+3. Apply the same profile and complete graph preparation and 2 warmups. Use
+   5–10 measured iterations unless a different protocol was requested.
 4. Measure complete public API calls, including any output materialization
-   required by the caller. Report sample count plus at least median and a tail
-   percentile; do not publish only the fastest run.
-5. Repeat the baseline and candidate in interleaved or otherwise temperature-
-   controlled order when evaluating a small optimization. Report absolute
-   values as well as the delta.
-6. Run Torch or hardware profiling in separate diagnostic processes. Profiler-
-   enabled latency is not a release performance result.
+   required by the caller. Report sample count and median; report tail
+   percentiles only with enough samples to interpret them.
+5. Reuse a valid baseline. A small, interleaved baseline/candidate comparison
+   is useful when environmental noise leaves a specific gain unresolved.
+6. Run Torch profiling in a separate diagnostic process. Profiler-
+   enabled latency does not represent normal inference.
 
 For language models, distinguish prefill throughput, decode throughput, and
 end-to-end request latency. Count logical input and generated tokens, not padded
@@ -65,20 +63,21 @@ execution rows. For VLM/VLA paths, report image/view count, prompt envelope,
 denoise steps, action horizon, and end-to-end policy-call latency; use
 `action chunks/s` only when the chunk definition is stated.
 
-## Minimal publication record
+## Local measurement notes
 
-Every published result should include:
+Keep the following context with local measurements so they remain useful when
+diagnosing a regression:
 
 | Field | Required content |
 |---|---|
-| Profile | Model revision, precision/quantization, input envelope, and TOML hash |
+| Profile | Model revision, precision/quantization, input envelope, and TOML path |
 | Runtime | RhinoForge revision, Launch package, operator asset, and board/runtime version |
-| Correctness | Gate name, reference identity, result, and any pending scope |
-| Timing | Boundary, warmup, sample count, median, tail percentile, and units |
+| Correctness | Checks performed, reference source, result, and uncovered scope |
+| Timing | Boundary, warmup, sample count, summary statistics, and units |
 | Lifecycle | Cold/startup or steady-state; Graph BUILD/REPLAY evidence where applicable |
 | Conditions | Profiler off/on, host configuration relevant to the measurement, and date |
 
-Torch traces can expose application shapes and source paths. Keep them out of
-the repository and publish only the reviewed summary. See the
+Torch traces can expose application shapes and source paths. Keep traces and
+measurement reports outside the repository and release artifacts. See the
 [profiling guide](model_testing.md#torch-profile) for the supported TOML entry
 points.

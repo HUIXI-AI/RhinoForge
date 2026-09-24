@@ -9,14 +9,15 @@
 // SDPA(attn_tp=4 自动)、KV insert、RoPE 与 SwiGLU, 仅 override
 // declare_buffers / build_layer_subgraph 做双权重计算 + 行掩码合并。
 //
-// 本实现使用 MoT 双权重 + 常量行掩码，数值一律以 Hy-VLA 为准：
+// 本文件自 rpu_halo_action_expert_model.* 派生 —— 同为 MoT 双权重 + 常量行掩码,
+// 实质手术只有步 3 (见 .cpp)。凡注释提到 HALO 处均为溯源, 数值一律以 Hy-VLA 为准:
 // hidden=2048, inter=6144, 32 层, 16/4 heads × hd=128, eps=1e-5, prefix 192
-// (= ceil16(181 有效行); 物理 240 里 59 行是 reference padding, mask 整行 False,
+// (= ceil16(181 有效行); 物理 240 里 59 行是 vendor padding, mask 整行 False,
 // 因果 mask 保证有效行只 attend 有效行 ⇒ 截断数学等价)。
 //
 // 数学正确性的关键: 行掩码 merge (out = x_text*text_mask + x_vis*vis_mask) 与
 // 双 GEMM 是逐行独立运算, 所以"先合并 norm 输出再双 GEMM"与逐行选权重等价。
-// SDPA 跨行混合 KV, 但两套权重的 K/V/Q 在 SDPA 前已按行合并, 与参考模型的
+// SDPA 跨行混合 KV, 但两套权重的 K/V/Q 在 SDPA 前已按行合并, 与 vendor 的
 // per-token mask_apply 一致。
 #pragma once
 
@@ -34,6 +35,11 @@ public:
     HyVlaVlmModel();
     ~HyVlaVlmModel() override;
 
+    void set_runtime_config(
+        bool fast_replay, bool fast_replay_preload, bool mask_once,
+        bool partial_rope, int64_t mot_norm_nomerge, bool silu_mul,
+        int64_t rmsnorm_capability);
+
     // 单层 vision (*_v) 孪生权重 (布局与基类 LayerWeights 主权重逐一对应):
     //   q/k/v/o_w     [out, in]  col/row-partition 预 swizzle fp16 (RPU DDR)
     //   q/k_norm_w    [head_dim] fp16
@@ -42,10 +48,9 @@ public:
     //   q/k/v_bias    [out] fp16 — 与 text 侧 has_qkv_bias_ 同进退
     // 所有权: set_moe_weights 持有 at::Tensor 引用 (DDR keepalive),
     // 跨 forward 稳定; invalidate_model_state 使图缓存重建后 preload 重发。
-    // Hy-VLA 权重与计算约束：
+    // ⚠️ 相对 HALO 的两点差异（字段仍全部保留，属**刻意的最小改动**）：
     //  1. q_norm_w / k_norm_w 在 Hy-VLA 里**不参与计算** —— query/key_layernorm
-    //     由 VLM 与 expert 两塔共享。这两个 norm 仅在 VLM 组参与计算，故
-    //     build_layer_subgraph 步 3 只用
+    //     由 VLM 与 expert 两塔共享。故 build_layer_subgraph 步 3 只用
     //     基类单份权重，不对它们做双算/merge。调用方给这两项传与 text 相同的张量即可
     //     （会被 preload DMA 但不被读取）；保留字段是为了不动 set_moe_weights 的
     //     签名与校验链，把改动面收敛到层体一处。
@@ -120,7 +125,7 @@ public:
     //   x_emb       [1, chunk_size, hidden=2048] fp16 RPU contig — host 已把
     //               vision embedding 与 text embedding 混排好的 prefix。
     //   k/v_caches  基类 7-D swizzled KV cache; 本步在 prefix_len 处追加。
-    //               prefill 后即为 action expert 消费的 prefix KV。
+    //               prefill 后即为 action expert (P3) 消费的 prefix KV。
     //   attn_mask_4d 显式 additive mask, 末两维 [chunk_size, prefix+cs]
     //               (基类 sdpa_prepare_mask 降维 + MASK_2D)。⚠️ 整行 masked 的
     //               padding 行在 CPU softmax 下退化成均匀分布, RPU kernel 未必 —
@@ -129,10 +134,10 @@ public:
     // 返回: 末隐藏 [1, chunk_size, hidden] fp16 RPU (含 final_norm) —— 基类
     //   output DMA 的 output_tensor_ (graph 写目标)。调用方须在 capture 作用域
     //   **退出后**读 (此时图已 end() 执行写入); 切勿在作用域内提前 copy —— 那会
-    //   读到尚未执行的全 0 output_tensor_（见 FusedModelBase 输出契约）。
+    //   读到尚未执行的全 0 output_tensor_ (见 fused_model_base.cpp:1066-1086 契约)。
     // 所有权: caller 持有输入张量; 返回张量由基类 registry 持有 (跨 forward 稳定)。
     // ⚠️ capture 路径下返回的是 graph 写目标 raw 指针而非 clone
-    //   按 FusedModelBase 契约，每次 forward 后**必须立刻读回**,
+    //   (fused_model_base.cpp:1220-1246 契约): 每次 forward 后**必须立刻读回**,
     //   攒着多次返回值会互相别名。PASSTHROUGH 路径才返回 .clone()。
     at::Tensor step_forward(
         const at::Tensor& x_emb,
@@ -141,23 +146,38 @@ public:
         const at::Tensor& cos,           // per-forward RoPE 表 (CFG 三分支各异)
         const at::Tensor& sin,
         const at::Tensor& attn_mask_4d,
-        int64_t prefix_len);
+        int64_t prefix_len,
+        at::IntArrayRef planned_stage_descriptor = {});
+
+    std::vector<int64_t> resolve_stage_domain(
+        int64_t seq_len, int64_t prefix_len, int64_t mask_kv_len);
 
 protected:
     std::vector<BufferDecl> declare_buffers(const LayoutContext& ctx) override;
     void build_layer_subgraph(int layer_idx, const ChunkInfo& chunk) override;
     // 只为挂 RPU_HY_VLA_FAST_REPLAY 的逐座开关（默认 OFF），其余全继承。
     ModelStaticConfig static_config() override;
-    // dynamic_config: 基类已做单 chunk 断言 + 自己的 mask 准备; 这里再准备一份
-    // 子类可见的 PreparedMask (基类的是 private)。forward/static_config 继承。
+    // dynamic_config: 基类完成单 chunk 断言与显式 mask 准备；本类直接复用
+    // 基类 protected 的 prepared_attn_mask_。forward/static_config 继承。
     ModelDynamicConfig dynamic_config(const ChunkPlan& plan) override;
+    ModelDynamicConfig planning_dynamic_config(
+        const ChunkPlan& plan) override;
     // prefill 永远单块 (整个 prefix 一次送 MASK_2D 非因果 SDPA)。Hy-VLA 的
     // seq=192 > 176 ⇒ tile_m_v16 封顶 8 → tile_m=128 → grid=2；16/4 GQA 在
     // attn_tp=4 下 gqa=4 ⇒ product=8，**正好压在** keeper 的 product<=8 上限。
     // override 只表达行掩码/KV merge 的单块语义 (cs>=seq_len)，不是绕过守卫；
     // 更长的 prefix 会让 grid 变大而触上限，届时须改成分块 + 掩码按 offset 取切片。
+    // 历史旧 tiling 的 product=12 事件见 halo-chunk-validator debug session。
     bool subclass_chunk_size_valid(int64_t cs, int64_t seq_len,
                                    int64_t position) const override;
+    FmbPhysicalExecutionManifest physical_manifest_for_candidate(
+        const FmbThreeStageChunkPlan& plan,
+        const LayoutContext& layout,
+        int64_t physical_len, int64_t logical_len,
+        int64_t position) const override;
+    FmbPhysicalManifestForwardCapability
+    physical_manifest_forward_capability(
+        const FmbPhysicalExecutionManifest& manifest) const override;
 
 private:
     // 行掩码 merge: out = text*text_mask + vis*vis_mask。
@@ -167,9 +187,61 @@ private:
                         uint32_t text_mask_addr, uint32_t act_mask_addr,
                         int64_t rows, int64_t cols, int num_cores);
 
+    bool cold_fast_replay_ = false;
+    bool cold_fast_replay_preload_ = false;
+    bool cold_mask_once_ = false;
+    bool cold_partial_rope_ = false;
+    unsigned cold_mot_norm_nomerge_ = 0;
+    bool cold_silu_mul_ = false;
+    RpuRmsNormSpmContract cold_rmsnorm_spm_contract_;
+    bool cold_config_bound_ = false;
+
+    std::vector<int64_t> kvinsert_cost_weight_identity() const override {
+        auto identity = causal_kvinsert_cost_weight_identity();
+        if (identity.empty()) return {};
+        append_kvinsert_cost_scalar_identity(identity, eps_hyvla_);
+        identity.insert(identity.end(), {
+            static_cast<int64_t>(cold_fast_replay_),
+            static_cast<int64_t>(cold_fast_replay_preload_),
+            static_cast<int64_t>(cold_mask_once_),
+            static_cast<int64_t>(cold_partial_rope_),
+            static_cast<int64_t>(cold_mot_norm_nomerge_),
+            static_cast<int64_t>(cold_silu_mul_),
+            static_cast<int64_t>(cold_rmsnorm_spm_contract_.capability)});
+        identity.push_back(static_cast<int64_t>(text_layers_.size()));
+        for (const auto& weights : text_layers_) {
+            for (const auto* tensor : {
+                    &weights.q_w, &weights.k_w, &weights.v_w, &weights.o_w,
+                    &weights.q_norm_w, &weights.k_norm_w, &weights.input_norm_w, &weights.post_norm_w,
+                    &weights.gate_w, &weights.up_w, &weights.down_w, &weights.q_bias,
+                    &weights.k_bias, &weights.v_bias, &weights.q_ws, &weights.k_ws,
+                    &weights.v_ws, &weights.o_ws, &weights.gate_ws, &weights.up_ws,
+                    &weights.down_ws}) {
+                append_kvinsert_cost_tensor_identity(identity, *tensor);
+            }
+        }
+        identity.push_back(static_cast<int64_t>(moe_layers_.size()));
+        for (const auto& weights : moe_layers_) {
+            for (const auto* tensor : {
+                    &weights.q_w, &weights.k_w, &weights.v_w, &weights.o_w,
+                    &weights.q_norm_w, &weights.k_norm_w, &weights.input_norm_w, &weights.post_norm_w,
+                    &weights.gate_w, &weights.up_w, &weights.down_w, &weights.q_bias,
+                    &weights.k_bias, &weights.v_bias, &weights.q_ws, &weights.k_ws,
+                    &weights.v_ws, &weights.o_ws, &weights.gate_ws, &weights.up_ws,
+                    &weights.down_ws}) {
+                append_kvinsert_cost_tensor_identity(identity, *tensor);
+            }
+        }
+        for (const auto* tensor : {
+                &final_norm_text_}) {
+            append_kvinsert_cost_tensor_identity(identity, *tensor);
+        }
+        return identity;
+    }
+
     std::vector<MoeLayerWeights> text_layers_;  // [num_layers] text 权重影子 (基类副本)
     at::Tensor cos_hyvla_, sin_hyvla_;          // RoPE 表影子 (build 期 host 指针)
-    double eps_hyvla_ = 1e-5;                   // rms_norm_eps 影子
+    double eps_hyvla_ = 1e-5;                   // rms_norm_eps 影子 (HALO 是 1e-6)
     std::vector<MoeLayerWeights> moe_layers_;   // [num_layers] vision (*_v) 孪生权重
     at::Tensor final_norm_text_;                // [hidden] final RMSNorm γ 影子 (基类的是
                                                 // private)。仅用于在 set_moe_weights 里
@@ -179,10 +251,9 @@ private:
     // [chunk_size, 1] fp16 RPU 常量行掩码 (Persistent 槽 preload 源)。
     at::Tensor text_mask_ddr_, act_mask_ddr_;
     int64_t moe_chunk_size_ = 0;                // 掩码/槽固化的 chunk_size (0 = 未设)
-    PreparedMask prepared_mask_hyvla_;           // 每 forward 在 dynamic_config 重备
 };
 
 }  // namespace v3
 
-// C API 自由函数原型集中在 src/core/rpu_kernel_decls.h，
+// C API 自由函数原型集中在 src/core/rpu_kernel_decls.h (Hy-VLA VLM 段),
 // rpu_backend.cpp 经 TORCH_FN 绑定, 不引入本重头文件。

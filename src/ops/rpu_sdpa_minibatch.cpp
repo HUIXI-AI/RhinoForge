@@ -1,8 +1,15 @@
 // rpu_sdpa_minibatch.cpp
-// SPM-based minibatch SDPA with per-image K/V slicing. Image i attends only
-// cache rows [i*per_image_ctx_len, (i+1)*per_image_ctx_len). The operator
-// supports MHA only, and its public cache layout matches the unified K/V insert
-// wrappers.
+// SPM-based SDPA using the vctxlen *minibatch* kernel — per-image K/V slicing.
+//
+// Kernel binary: llm_fp16_32b_prefill_flash_attn_univ_vctxlen_minibatch
+// reg[0,1] is per_image_ctx_len; reg[34] is image_batch_count.
+// Image i attends only cache rows [i*per_image_ctx_len, (i+1)*per_image_ctx_len).
+// No mask. Requires num_kv_heads == num_heads (MHA); GQA is unsupported.
+//
+// The cache swizzle stride params (section/chapter/page/row, nKVHeadChunk,
+// headDimVx) are computed IDENTICALLY to the plain vctxlen / FLASH_ATTN_SPM
+// launchers, so a K/V cache populated by rpu_launch_insert_{k,v}cache_spm_unified
+// at position i*per_image_ctx_len lines up with this kernel's per-image read.
 
 #include "rpu_ops.h"
 #include "rpu_spm_allocator.h"
@@ -33,7 +40,7 @@ void rpu_launch_sdpa_spm_minibatch_kernel(
     int64_t core_num = num_cores;
     int64_t vtp = (virtual_num_cores > 0) ? virtual_num_cores : core_num;
 
-    // Minibatch hard constraint: MHA only.
+    // Minibatch hard constraint: MHA only (no warp-shared KV cache).
     TORCH_CHECK(num_heads == num_kv_heads,
                 "minibatch SDPA requires num_kv_heads == num_heads (MHA); got nq=",
                 num_heads, " nkv=", num_kv_heads);
@@ -65,7 +72,7 @@ void rpu_launch_sdpa_spm_minibatch_kernel(
 
     int64_t seq_q_v16 = CeilDiv(seq_q, (int64_t)16);
 
-    // Tiling uses the total packed query length.
+    // Compute tiling from the total packed seq_q.
     SdpaConfig tiling_cfg{SdpaKernelType::FLASH_ATTN_SPM,
                           head_dim, virtual_num_heads, virtual_num_kv_heads,
                           static_cast<int>(vtp), attn_mask_type};
@@ -75,7 +82,9 @@ void rpu_launch_sdpa_spm_minibatch_kernel(
                     "minibatch SDPA tile_m_override must be a multiple of 16");
         tiling.tile_m = tile_m_override;
         tiling.tile_m_v16 = tile_m_override / 16;
-        // The short-sequence isolation path uses the same K and M tile.
+        // The short-sequence isolation path uses the same K tile as M.  This
+        // keeps the temporary workspace equal to the default packed-sequence
+        // allocation while providing at least two blocks per image.
         tiling.tile_k = tile_m_override;
         tiling.tile_k_v16 = tile_m_override / 16;
         TORCH_CHECK(
@@ -87,7 +96,9 @@ void rpu_launch_sdpa_spm_minibatch_kernel(
     float scale_factor = scale.value_or(1.0 / std::sqrt(static_cast<double>(head_dim)));
     uint32_t scale_u32 = float32_to_uint32(scale_factor);
 
-    // Each image must own a whole number of launch blocks.
+    // Grid: gridDim.x must be evenly divisible by image_batch_count, and each
+    // image's queries (per_image_ctx_len) must be a whole number of tile_m
+    // blocks — else the block→image mapping (blkid.x / (gdim.x/N)) misroutes.
     uint16_t grid_dim_x = CeilDiv(seq_q, tiling.tile_m);
     uint16_t grid_dim_y = num_heads_per_core;
     uint16_t grid_dim_z = 1;
@@ -97,14 +108,14 @@ void rpu_launch_sdpa_spm_minibatch_kernel(
     TORCH_CHECK(per_image_ctx_len % tiling.tile_m == 0,
                 "per_image_ctx_len (", per_image_ctx_len, ") must be a multiple of tile_m (",
                 tiling.tile_m, ")");
-    // The operator requires at least two launch blocks per image.
+    // Require at least two grid blocks per image: the one-block geometry
+    // violates this payload's memory-isolation contract.
     TORCH_CHECK(per_image_ctx_len / tiling.tile_m >= 2,
                 "minibatch SDPA needs >=2 grid blocks per image; got per_image_ctx_len (",
                 per_image_ctx_len, ") / tile_m (", tiling.tile_m,
                 ") = ", per_image_ctx_len / tiling.tile_m,
                 " (1-block-per-image corrupts memory — pick smaller tile_m)");
-    // Launch constraint: when the grid product exceeds 8, it must be a
-    // multiple of 8.
+    // grid_dim_x*gqa_group_size must be a multiple of 8 when greater than 8.
     if ((int64_t)grid_dim_x * gqa_group_size > 8) {
         TORCH_CHECK(((int64_t)grid_dim_x * gqa_group_size) % 8 == 0,
                     "minibatch SDPA: grid_dim_x*gqa_group_size (", grid_dim_x * gqa_group_size,

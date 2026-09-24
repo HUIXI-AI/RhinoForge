@@ -1,12 +1,16 @@
-// On-device embedding gather. It loads `num_ids` fp16 rows from the DDR vocab
-// table into contiguous SPM scratch, then uses DMA for the DDR result. The
-// operator is loaded by name from the combined operator asset.
+// rpu_embedding.cpp — on-device embedding gather (llama_gather_embedding).
 //
-// Public launch ABI; a 32-bit value occupies two consecutive parameters:
+// Hardware kernel: `llama_gather_embedding`, fetched by name via KernelCache.
+// Gather num_ids fp16 rows from the DDR vocabulary without embedding scaling.
+// Output must be SPM with a 32-bit byte address; copy it to DDR after the gather.
+// DDR input addresses use 256-byte units.
+// Register contract; a u32 occupies two consecutive u16 slots:
 //     param0 (reg0/1): ids_count   param2 (reg2): blk=32   param3 (reg3): last_blk
 //     param4 (reg4/5): ids>>8      param6 (reg6/7): vocab>>8
 //     param8 (reg8/9): output addr param10 (reg10): hidden  param21 (reg21): tp
 //     grid (reg64-66): {ceil(ids/32),1,1}
+// The CPU-vs-RPU cos-gate (tests/ops/test_embedding_gather_isolated.py) is the
+// oracle that this packing is correct.
 
 #include <ATen/ATen.h>
 #include <ATen/record_function.h>
@@ -23,7 +27,7 @@ using namespace ::rhino_lkn;
 void rpu_launch_gather_embedding_kernel(
     c10::Half *vocab_ptr,   // [V, H] fp16 DDR (256B aligned)
     int32_t *ids_ptr,       // [num_ids] int32 DDR (256B aligned)
-    uint32_t out_spm_addr,  // [num_ids, H] fp16 SPM (core-0 base)
+    uint32_t out_spm_addr,  // [num_ids, H] fp16 SPM (32-bit core-0 byte address)
     int64_t num_ids,
     int64_t hidden_size,
     int num_cores)
@@ -36,15 +40,16 @@ void rpu_launch_gather_embedding_kernel(
 
     const uint64_t ids_addr_raw = RpuGetDevAddr(ids_ptr);
     const uint64_t vocab_addr_raw = RpuGetDevAddr(vocab_ptr);
-    // The wrapper ABI encodes DDR addresses in 256-byte units.
+    // ids + vocab are read via glarge (>>8) → require 256B alignment. Fail loud
+    // (silent low-bit truncation would give deterministically wrong rows = P3).
     TORCH_CHECK((ids_addr_raw & 0xFFu) == 0,
-                "gather_embedding: ids must be 256B aligned");
+                "gather_embedding: ids must be 256B aligned (got ", ids_addr_raw, ")");
     TORCH_CHECK((vocab_addr_raw & 0xFFu) == 0,
-                "gather_embedding: vocab must be 256B aligned");
+                "gather_embedding: vocab must be 256B aligned (got ", vocab_addr_raw, ")");
 
-    const uint64_t ids_addr = ids_addr_raw >> 8;
-    const uint64_t vocab_addr = vocab_addr_raw >> 8;
-    const uint32_t out_addr = out_spm_addr;
+    const uint64_t ids_addr = ids_addr_raw >> 8;     // glarge
+    const uint64_t vocab_addr = vocab_addr_raw >> 8; // glarge
+    const uint32_t out_addr = out_spm_addr;          // g1b byte address (SPM, < 4 GB)
 
     const int normal_blk = 32;
     const int blk_cnt = static_cast<int>((num_ids + normal_blk - 1) / normal_blk);
@@ -108,8 +113,7 @@ at::Tensor rpu_gather_embedding(const at::Tensor &vocab, const at::Tensor &ids)
     // writes SPM, DMAs SPM→DDR). Coherency contract: (1) vocab + ids were flushed by
     // their .to('rpu') upload (rpu_copy_ flushes CPU→RPU) and the CPU never rewrites
     // them; (2) the output is consumed on-device by the next kernel (no CPU read) — or,
-    // if a caller reads it back, the .cpu() copy (rpu_copy_ RPU→CPU) flushes it. A
-    // per-call flush of the immutable vocabulary table is redundant.
+    // if a caller reads it back, the .cpu() copy (rpu_copy_ RPU→CPU) flushes it.
     if (!SPM_ALLOC.is_initialized()) SPM_ALLOC.init();
     using AR = SpmAllocator::AllocRequest;
     auto offsets = SPM_ALLOC.alloc_temporary_aliased({

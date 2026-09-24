@@ -1,0 +1,40 @@
+# Public configuration; provide your own checkpoint and input assets.
+
+[example]
+profile_id = "rhinovla.v1.fp16.trusted-factory"
+registry_alias = "rhinovla-controlled"
+target = "rhinovla"
+dtype = "fp16"
+
+[input]
+runtime_factory = "your_package.rhinovla_v1:create_runtime"
+request = "/path/to/rhinovla_request.pt"
+factory_config = "/path/to/rhinovla_factory.json"
+trust_model_code = true
+num_steps = 10
+
+[run]
+warmup = 1
+runs = 3
+hwperf = false
+profile = false
+seed = 0
+
+[rpu_execution]
+
+[rpu_execution.components]
+
+[rpu_execution.components.language_model]
+
+[rpu_execution.components.language_model.prefill]
+chunk_size = "auto"
+
+[rpu_execution.components.vision_encoder]
+
+[rpu_execution.components.vision_encoder.vision]
+chunk_size = "auto"
+
+[rpu_execution.components.action_expert]
+
+[rpu_execution.components.action_expert.action]
+chunk_size = "auto"

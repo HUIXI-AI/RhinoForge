@@ -5,6 +5,10 @@ __all__ = [
     "Qwen25VLBackbone",
     "build_qwen25vl_backbone",
     "build_internvla_vision",
+    "NextDiTRPURuntime",
+    "build_nextdit_runtime",
+    "InternVLAExecutionController",
+    "bind_internvla_execution_runtime",
 ]
 
 def __getattr__(name):
@@ -15,6 +19,10 @@ def __getattr__(name):
         "Qwen25VLBackbone": ".backbone",
         "build_qwen25vl_backbone": ".backbone",
         "build_internvla_vision": ".vision",
+        "NextDiTRPURuntime": ".nextdit",
+        "build_nextdit_runtime": ".nextdit",
+        "InternVLAExecutionController": ".execution",
+        "bind_internvla_execution_runtime": ".execution",
     }
     if name in modules:
         import importlib

@@ -5,7 +5,7 @@ configuration block below. The ``_template`` package is skipped by in-tree
 adapter discovery, so this file is safe to keep as a copy source.
 
 This is intentionally smaller than the production Qwen3/Llama adapters. It
-shows the required order: fail-fast profile guard, instance-level
+shows the required v5 order: fail-fast profile guard, instance-level
 ``.to("rpu")`` interception, irreversible swizzle, CausalDecoder install,
 hardware-attribute validator, and registry binding.
 """
@@ -32,11 +32,11 @@ from rpu_backend.runtime.registry import register_adapter
 from rpu_backend.runtime.weights import swizzle_model_inplace
 from rpu_backend.runtime.chunk_envelope import ChunkEnvelope, make_lookup
 
-# ── Certified chunk envelope — TEMPLATE ──
+# ── MR-A: certified chunk envelope — TEMPLATE ──
 # Every CausalDecoderModel handle must declare one before its first prefill, or
-# the planner rejects the request. Replace the row below with the target
-# geometry and measured envelope; see
-# ``docs/model_porting.md#8-verification-gates``.
+# the C++ planner refuses (deny-by-default; an over-picked chunk busts SPM and
+# WEDGES the board). Replace the row below with YOUR geometry and YOUR measured
+# numbers, and add the matching row to docs/roadmap/chunk_certified_envelope.md.
 # chunk=0 means "auto is certified up to max_kv_len" — only claim a length you
 # have actually run.
 _CHUNK_ENVELOPE = {
@@ -156,7 +156,7 @@ def _apply_runtime_attrs(model: nn.Module) -> None:
 
 
 class MinimalCausalLMAdapter:
-    """Smallest adapter shape for a decoder-only HF CausalLM."""
+    """Smallest v5 adapter shape for a decoder-only HF CausalLM."""
 
     @classmethod
     def preflight(cls, config: Any) -> None:

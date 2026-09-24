@@ -1,0 +1,17 @@
+# Public configuration; provide your own checkpoint and input assets.
+
+[pi05]
+precision = "fp16"
+
+[input]
+checkpoint = "pi05-libero-finetuned"
+batch = "/path/to/pi05_2cam_t32_batch.pt"
+cameras = 2
+text_tokens = 32
+num_steps = 10
+
+[run]
+warmup = 2
+runs = 6
+seed = 0
+output_dir = "./pi05_results/2cam/fp16"

@@ -10,6 +10,7 @@ import sys as _sys
 from . import admission as _admission
 from ._runtime import (
     GraphCache,
+    GraphRuntimePolicy,
     GraphSignature,
     configure_backend as _configure_runtime_backend,
     get_default_graph_cache,
@@ -70,17 +71,25 @@ class Graph:
     """RPU KernelGraph — capture/replay execution graph.
 
     Usage:
-        from rpu_backend.graph import Graph
-
-        g = Graph()
+        g = torch.rpu.Graph()
         with g.capture():
             output = model(input)
     """
-    def __init__(self):
+    def __init__(self, *, runtime_policy=None):
+        if runtime_policy is None:
+            runtime_policy = GraphRuntimePolicy.from_environment()
+        if not isinstance(runtime_policy, GraphRuntimePolicy):
+            raise TypeError("runtime_policy must be a GraphRuntimePolicy")
+        self._runtime_policy = runtime_policy
         if so_path:
-            self._impl = rpu_backend.Graph()
+            self._impl = rpu_backend.Graph(runtime_policy._native())
         else:
             self._impl = None
+
+    @property
+    def runtime_policy(self) -> "GraphRuntimePolicy":
+        """Read-only view of this graph's construction policy."""
+        return self._runtime_policy
 
     def capture(self, sig: "GraphSignature | None" = None):
         """Return a context manager for graph capture/replay scope.
@@ -115,6 +124,11 @@ class Graph:
         if self._impl is not None:
             self._impl.invalidate()
 
+    def release_prepared_queues(self):
+        """Release retained prepared queues; replay will re-prepare segments."""
+        if self._impl is not None:
+            self._impl.release_prepared_queues()
+
     def state(self) -> int:
         """Get state (0=PASSTHROUGH,1=RECORDING,2=BUILT,3=REPLAYING)."""
         if self._impl is not None:
@@ -132,6 +146,19 @@ class Graph:
         if self._impl is not None:
             return self._impl.replayable()
         return False
+
+    def skip_op_stream_for_fast_replay(self):
+        """Skip remaining op emission during REPLAYING and replay the built graph."""
+        if self._impl is not None:
+            self._impl.skip_op_stream_for_fast_replay()
+
+    def skip_op_stream_with_patches(self, register_patches=None, data_patches=None):
+        """Apply explicit patches, then skip remaining op emission during REPLAYING."""
+        if self._impl is not None:
+            self._impl.skip_op_stream_with_patches(
+                [] if register_patches is None else register_patches,
+                [] if data_patches is None else data_patches,
+            )
 
     def has_built_signature(self) -> bool:
         """Return whether this graph has a built signature for replay."""
@@ -151,13 +178,40 @@ class Graph:
             return self._impl.debug_stats()
         return None
 
+    def record_branch(
+        self,
+        branch_key: int,
+        sig: "GraphSignature | None" = None,
+        label: str = "",
+    ):
+        """Record or consume a branch marker node.
+
+        This is a diagnostic graph-tree marker and segment boundary. It does not
+        perform device-side branch dispatch.
+        """
+        if self._impl is None:
+            return
+        backend_sig = (sig._impl if isinstance(sig, GraphSignature) else sig)
+        if backend_sig is None:
+            backend_sig = rpu_backend.GraphSignature()
+        self._impl.record_branch(int(branch_key), backend_sig, str(label))
+
     def dump_replay_plan(self) -> str:
-        """Return a pointer-free linear node and segment summary."""
-        return self._impl.dump_replay_plan() if self._impl is not None else ""
+        """Render full node sequence (one line per node) for human inspection."""
+        if self._impl is not None:
+            return self._impl.dump_replay_plan()
+        return ""
 
     def dump_tree(self) -> str:
-        """Return a pointer-free segment-grouped graph summary."""
-        return self._impl.dump_tree() if self._impl is not None else ""
+        """Render segment-grouped view + inter-segment data nodes + boundary flush."""
+        if self._impl is not None:
+            return self._impl.dump_tree()
+        return ""
+
+
+
+
+
 
 
 def layered_from(sig: "GraphSignature"):
@@ -168,7 +222,37 @@ def layered_from(sig: "GraphSignature"):
     return rpu_backend.layered_from(backend_sig)
 
 
-# Dynamo lazy-init guard hazard preflight.
+def graph_cache_invariant_ok() -> bool:
+    if so_path:
+        return bool(rpu_backend.graph_cache_invariant_ok())
+    return True
+
+
+def graph_cache_debug_bucket_counts() -> dict:
+    if so_path:
+        return dict(rpu_backend.graph_cache_debug_bucket_counts())
+    return {}
+
+
+def graph_cache_debug_branch_counts() -> dict:
+    if so_path:
+        return dict(rpu_backend.graph_cache_debug_branch_counts())
+    return {}
+
+
+def graph_cache_dump_signature_tree() -> str:
+    if so_path:
+        return rpu_backend.graph_cache_dump_signature_tree()
+    return "<empty>"
+
+
+def graph_cache_explain_miss(sig: "GraphSignature") -> str:
+    if so_path:
+        return rpu_backend.graph_cache_explain_miss(sig._impl)
+    return "miss at GmId: backend unavailable"
+
+
+# P7.1h L2 防线 — Dynamo lazy-init guard hazard preflight.
 #
 # Keep this genuinely lazy: the graph package is wired whenever the native
 # backend is available, but importing the backend must not pull Dynamo's model
@@ -177,7 +261,7 @@ def layered_from(sig: "GraphSignature"):
 _LAZY_DYNAMO_EXPORTS = frozenset({
     "verify_lazy_init",
     "UninitializedLazyStateError",
-    # Misnomers kept for the packaged runtime API; see lazy_init_guard.py.
+    # Misnomers kept for the shipped wheel's API; see lazy_init_guard.py.
     "freeze_for_dynamo",
     "DynamoUnsafeLazyStateError",
 })
@@ -193,6 +277,7 @@ def __getattr__(name):
 __all__ = [
     "Graph",
     "GraphCache",
+    "GraphRuntimePolicy",
     "GraphSignature",
     "get_default_graph_cache",
     "layered_from",

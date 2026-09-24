@@ -1,10 +1,16 @@
-"""Hy-Embodied-0.5-VLA action 解码：归一化网格 → 物理双臂 EE 位姿。
+"""Hy-Embodied-0.5-VLA 的 action 解码 —— 归一化网格 → 物理双臂 EE 位姿。
 
-模型输出是归一化的 RT 相对增量，不能直接作为关节或位姿指令。
-`HyEmbodiedActionOutput.actions` 在未配置解码器时会抛出异常，避免把归一化值
-误当成物理动作。
+存在的理由
+    模型吐的是**归一化的 RT-相对增量**，不是可以直接下发的关节/位姿指令。
+    vendor 的评测封装（`robodojo_eval/policy_wrapper.py::_infer_chunk_wxyz`）在
+    交给机器人之前一定会走完下面这条链；RPU 交付此前只把归一化网格原样返回，
+    调用方一旦直接下发就是错的。同类交付上已经出过事故：LingBot-VLA-V2 的
+    `api/action_denorm.py` 记录了"漏掉反归一化 ⇒ 肩关节偏 1.84 rad ≈ 106°"。
 
-解码链：
+    ⇒ 本模块补上这一步，并由 `HyEmbodiedActionOutput.actions` 强制：**没配解码
+    器就抛异常**，绝不把归一化值伪装成物理动作。
+
+解码链（逐字对应 vendor）
     1. `rel = actions[:, :20] * act_std + act_mean`
        ⚠️ `act_std/act_mean` 形状是 **(50, 20)** —— **逐时间步**的统计量，不是
           一条 20 维向量。当成 1-D 广播会把整个 chunk 算错。
@@ -14,30 +20,45 @@
        `T_i = T_0 @ ΔT_i` → 位置 + 四元数
     5. （UMI ckpt）`convert_frame_umi_to_robo`
     6. xyzw → wxyz
-    7. **丢掉第 0 行** —— 第 0 行的增量≈0，对应"当前位姿"，执行序列使用
+    7. **丢掉第 0 行** —— 第 0 行的增量≈0，对应"当前位姿"，vendor 下发的是
        `actions_wxyz[1 : n+1]`
 
-⚠️ 该转换只实现模型的坐标与归一化约定，不构成真机安全认证。真机接入前必须
-确认 `umi_coord_frame`、`umi_gripper_space`、EE 位姿帧与原点、夹爪量纲；首次
-上机必须有人在场并可立即急停。
+⚠️⚠️ **口径：只能声明"与 vendor 代码一致"，不能声明"可下发真机"。**
+
+交付 golden 里**只有归一化的** `p7.action_valid20` —— vendor 没有留下解码后的参考
+轨迹，也没有留下当时的 `observation.state`。⇒ **不存在"物理动作 vs golden"这种对拍**，
+凡是这么说的都是把两件事混了。
+
+已经做到的：在隔离进程里跑 **vendor 官方 `_decode_actions` 源码**产出 oracle，再由
+另一个进程加载本模块比对，解码轨迹 `max_abs_diff 0.000e+00`（逐位相同）。
+⚠️ 那一轮是在**重放到主干之前**的基点上跑的，按本轮纪律记作**历史参考**；
+本模块自身在重放中未发生逻辑改动（仅措辞），但**重放后尚未重跑** ⇒ 标 NOT RUN。
+
+即使重跑通过，它也**只**支持"与 vendor 代码一致"。真机接入前仍必须：
+  ① 与机器人团队确认 `umi_coord_frame` / `umi_gripper_space` / EE 位姿帧与原点 /
+     夹爪量纲（见 DEPLOYMENT.md 的"未决契约"一节）—— 这是**业务契约**，
+     任何数值对拍都替代不了；
+  ② 首次上机必须有人在场并握住急停。
 """
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Mapping
+import pickle
 
 import numpy as np
 
-# 参考转换使用 scipy；这里保持同一四元数数值约定。
+# vendor `robotwin_eval/transforms.py` 与 `hy_vla/utils/transform_utils.py` 的
+# 每一步旋转都用 scipy，这里照用同一个库：oracle 也是跑 vendor 那份 scipy 代码得到的，
+# 再换一套四元数实现只会多引入一层无法归因的差异。
 try:
     from scipy.spatial.transform import Rotation as _R
 except ImportError as exc:                                  # pragma: no cover
     raise ImportError(
-        "Hy-VLA 的 action 解码需要 scipy，用于 "
-        "6D 旋转 ↔ 四元数。请安装 RhinoForge 的 `vla` 可选依赖。"
+        "Hy-VLA 的 action 解码需要 scipy（vendor 的 transforms.py 用它做 "
+        "6D 旋转 ↔ 四元数）。`pip install scipy`，或见 requirements.txt。"
     ) from exc
 
-# UMI ↔ RoboTwin 的世界/局部坐标变换：
+# UMI ↔ RoboTwin 的世界/局部坐标变换（vendor transform_utils.py）：
 #   世界 W = [[0,1,0],[-1,0,0],[0,0,1]]，局部列轮换 P = [[0,0,1],[1,0,0],[0,1,0]]
 #   p_umi = W @ p_native ，R_umi = W @ R_native @ P
 _W = np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]], dtype=np.float64)
@@ -49,7 +70,7 @@ _R_POS, _R_QUAT, _R_GRIP = slice(8, 11), slice(11, 15), 15
 
 
 def _rotation_6d_to_matrix(d6: np.ndarray) -> np.ndarray:
-    """`(N,6)` Gram-Schmidt 6D 表示 → `(N,3,3)` 旋转矩阵。"""
+    """`(N,6)` Gram-Schmidt 6D 表示 → `(N,3,3)` 旋转矩阵（vendor 同名函数）。"""
     a1, a2 = d6[:, :3], d6[:, 3:]
     b1 = a1 / np.linalg.norm(a1, axis=1, keepdims=True)
     b2 = a2 - np.sum(b1 * a2, axis=1, keepdims=True) * b1
@@ -74,7 +95,7 @@ def _relative_matrices_to_poses(rel: np.ndarray, start_xyzw: np.ndarray) -> np.n
 
 
 def relative_to_dual_arm_poses(rel20: np.ndarray, start_dual_xyzw: np.ndarray) -> np.ndarray:
-    """`(N,20)` RT-相对输出 → `(N,16)` 双臂 PosQuat(xyzw)。
+    """`(N,20)` RT-相对输出 → `(N,16)` 双臂 PosQuat(xyzw)（vendor 同名函数）。
 
     `rel20` 的分段：[左平移3, 左6D6, 左夹爪1, 右平移3, 右6D6, 右夹爪1]。
     夹爪**不参与位姿合成**，原样透传。
@@ -85,7 +106,7 @@ def relative_to_dual_arm_poses(rel20: np.ndarray, start_dual_xyzw: np.ndarray) -
 
 
 def _convert_frame(qpos: np.ndarray, *, to_umi: bool, convert_gripper: bool) -> np.ndarray:
-    """UMI ↔ RoboTwin 世界/局部帧互转。
+    """UMI ↔ RoboTwin 世界/局部帧互转（vendor `convert_frame_{robo_to_umi,umi_to_robo}`）。
 
     夹爪约定（`convert_gripper=True` 时）：RoboTwin 开=1/闭=0（归一化）
     ↔ UMI 开=0/闭=90（mm）。
@@ -120,7 +141,8 @@ def _quat_xyzw_to_wxyz(a: np.ndarray) -> np.ndarray:
 
 
 def _pos_quat_to_rot6d(pq16_xyzw: np.ndarray) -> np.ndarray:
-    """Convert `(N,16)` PosQuat(xyzw) to `(N,20)` PosRot6d.
+    """`(N,16)` PosQuat(xyzw) → `(N,20)` PosRot6d
+    （vendor `convert_PosQuat2PosRotationMatrix_batch`）。
 
     6D 旋转 = 旋转矩阵的**前两行**（不是前两列），与训练时的约定一致。
     """
@@ -143,8 +165,9 @@ class HyVlaActionDecoder:
     帧开关 —— 分开配就一定会有人只配一半，然后得到一条方向自洽、数值全错的轨迹。
 
     ⚠️ 每一个约定都来自配置，**不硬编码任何机器人**：统计量来自
-    `norm_stats.pkl`，坐标帧/夹爪空间由构造参数给出。默认值为
-    `umi_coord_frame=True`, `umi_gripper_space=False`，不保证适用于目标机器人。
+    `norm_stats.pkl`，坐标帧/夹爪空间由构造参数给出。默认值取的是 vendor
+    `HyVLARoboDojoPolicyWrapper.__init__` 的默认值（`umi_coord_frame=True`,
+    `umi_gripper_space=False`），**它们对你的机器人未必成立**。
     """
 
     act_mean: np.ndarray                 # (H, 20) 逐时间步
@@ -153,7 +176,7 @@ class HyVlaActionDecoder:
     qpos_std: np.ndarray | None = None   # (20,)
     umi_coord_frame: bool = True
     umi_gripper_space: bool = False
-    drop_first: bool = True              # 执行序列使用 actions[1:]
+    drop_first: bool = True              # vendor 下发 actions[1:]
 
     def __post_init__(self):
         if self.act_mean.shape != self.act_std.shape:
@@ -162,17 +185,12 @@ class HyVlaActionDecoder:
         if self.act_mean.ndim != 2 or self.act_mean.shape[1] != 20:
             raise ValueError(f"统计量应为 (H, 20)，得到 {self.act_mean.shape}")
         if self.umi_gripper_space and not self.umi_coord_frame:
-            raise ValueError("umi_gripper_space=True 需要 umi_coord_frame=True")
+            raise ValueError("umi_gripper_space=True 需要 umi_coord_frame=True"
+                             "（vendor 的同一条断言）")
 
     @classmethod
-    def from_norm_stats_mapping(
-        cls,
-        info: Mapping,
-        *,
-        source: str = "norm_stats",
-        **kwargs,
-    ) -> "HyVlaActionDecoder":
-        """从已验证并反序列化的归一化统计量构造。
+    def from_norm_stats(cls, path, **kwargs) -> "HyVlaActionDecoder":
+        """从 ckpt 目录里的 `norm_stats.pkl` 构造。
 
         需要 `action_mean` / `action_std`（`(50,20)`）；`qpos_mean` / `qpos_std`
         （`(20,)`）有则一并读入，供 `encode_state` 用。若该 pickle 还带
@@ -180,18 +198,16 @@ class HyVlaActionDecoder:
         ckpt），说明它是**另一种**解码分支 —— 本类未实现，显式拒绝而不是按纯
         relative 静默算错。
         """
-        if not isinstance(info, Mapping):
-            raise TypeError(
-                f"{source} 必须反序列化为 mapping，得到 {type(info).__name__}"
-            )
+        with open(path, "rb") as f:
+            info = pickle.load(f)
         for k in ("action_mean", "action_std"):
             if k not in info:
-                raise KeyError(f"{source} 缺 {k!r}（有: {sorted(info)}）")
+                raise KeyError(f"{path} 缺 {k!r}（有: {sorted(info)}）")
         if info.get("action_mean_abs") is not None and info.get("action_std_abs") is not None:
             raise NotImplementedError(
-                f"{source} 带 action_*_abs ⇒ 该 ckpt 是 "
-                f"`relative_chunk_ee_RT_with_absolute` 训练的，需要混合绝对/相对"
-                f"解码；本类只实现纯 relative。")
+                f"{path} 带 action_*_abs ⇒ 该 ckpt 是 "
+                f"`relative_chunk_ee_RT_with_absolute` 训练的，解码要走 vendor "
+                f"`_decode_actions` 的前/后半段混合分支，本类只实现了纯 relative。")
         arr = lambda k: (None if info.get(k) is None
                          else np.asarray(info[k], dtype=np.float64))
         return cls(act_mean=np.asarray(info["action_mean"], dtype=np.float64),
@@ -205,10 +221,12 @@ class HyVlaActionDecoder:
     def encode_state(self, ee_pose16_wxyz) -> np.ndarray:
         """`(16,)` 当前双臂 EE 位姿（wxyz）→ `(1,20)` 归一化 state（模型入参）。
 
-        处理顺序为 wxyz→xyzw →（UMI checkpoint）帧转换
+        逐字对应 vendor `_convert_pose_robo_dojo`：wxyz→xyzw → （UMI ckpt）帧转换
         → 四元数转 6D 旋转 → `(x - qpos_mean) / (qpos_std + 1e-8)`。
 
-        分母加 `1e-8`，避免零标准差导致除零。
+        ⚠️ vendor 另有一处 `transforms.convert_pose` 除的是 `qpos_std`（无 1e-8）。
+        本 ckpt 的 `qpos_std` 最小 0.0712，两者相对差 ~1.4e-7，可忽略；这里取
+        real-robot 那条（robodojo）的写法。
         """
         if self.qpos_mean is None or self.qpos_std is None:
             raise ValueError("norm_stats 里没有 qpos_mean/qpos_std，无法编码 state")

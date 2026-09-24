@@ -1,29 +1,33 @@
-"""Annotated ``adapter.py`` template for a new model port.
+"""Template ``adapter.py`` — v5 canonical entry point for a new model port.
 
 Copy this directory to ``python/rpu_backend/adapters/<your_arch>/`` and edit
 the placeholders, OR extract this file's body into a single
-``python/rpu_backend/adapters/<your_arch>.py``. See
-``docs/model_porting.md#2-start-from-the-adapter-template``.
+``python/rpu_backend/adapters/<your_arch>.py`` per the v5 flat-layout
+convention. See ``docs/porting_guide.md#hello-world-skeleton`` for the full
+walkthrough.
 
-The template separates five concerns within one entry point:
+This consolidated template replaces the v4 5-file pattern
+(``loader.py + model.py + weights.py + patches.py + runtime.py``) with a
+single canonical entry point. The five concerns are still separated as
+sections within this file:
 
   1. **Loader** — HF config validation + AutoModelForCausalLM load.
   2. **Weights** — per-Linear partition selection + swizzle.
-  3. **Patches** — small layout-boundary patches; class swaps go through
-     ``runtime.decoder._install_*_class_swap``.
+  3. **Patches** — §3a (a)/(b) residual patches only; (d) class swaps go
+     through ``runtime.decoder._install_*_class_swap``.
   4. **Runtime** — per-instance hardware attributes + first-forward setup.
   5. **Adapter class** — registration via
      ``runtime.registry.register_adapter("<HF_ARCH>", <ArchName>Adapter)``.
 
 References:
 
-- FusedModelBase contract: ``docs/architecture.md#fusedmodelbase-contract``
-- Porting workflow: ``docs/model_porting.md#2-start-from-the-adapter-template``
-- Verification gates: ``docs/model_porting.md#8-verification-gates``
+- v3 framework contract: ``docs/architecture.md#fusedmodelbase-v3--framework-contract``
+- 5-step porting checklist: ``docs/porting_guide.md#5-step-porting-checklist``
+- Pitfall traps: ``docs/pitfalls.md``
 - Concrete examples in tree:
   - ``python/rpu_backend/adapters/qwen3.py`` (Qwen3 reference)
   - ``python/rpu_backend/adapters/llama.py`` (Llama reference; proves shared
-    ``causal_decoder_*`` operator reuse)
+    ``causal_decoder_*`` op family per REN-03)
   - ``python/rpu_backend/adapters/pi05/`` (Pi0.5 multi-component VLA)
 """
 from __future__ import annotations
@@ -51,13 +55,14 @@ def load(repo_id: str, dtype: torch.dtype = torch.float16,
          **hf_kwargs: Any) -> nn.Module:
     """Return CPU-resident HF model ready for ``.to("rpu")``.
 
-    Loader responsibilities:
+    The 6-step loader contract (D-3-03 canonical pattern, derived from
+    ``adapters/pi05/loader.py:270-300`` and ``adapters/qwen3.py:47-87``):
 
       1. Validate the HF config tuple is in ``_SUPPORTED_PROFILES``. Raise
          ``UnsupportedModelError`` BEFORE the weight download.
       2. Probe optional dependencies (e.g., lerobot for VLA models). On
          missing, raise ``ImportError`` with ``"pip install <dep>"``
-         as an actionable hint.
+         actionable hint per D-4-09.
       3. Validate the user-supplied dtype (most ports require fp16; raise
          ``RPUUnsupportedDtypeError`` otherwise).
       4. Call ``AutoModelForCausalLM.from_pretrained(repo_id, **safe_hf_kwargs)``
@@ -79,11 +84,10 @@ def load(repo_id: str, dtype: torch.dtype = torch.float16,
         RPUUnsupportedDtypeError: dtype != fp16 (port-dependent).
         ImportError: missing optional dependency (port-dependent).
 
-    See ``docs/model_porting.md#2-start-from-the-adapter-template``.
+    See ``docs/porting_guide.md`` Step 1 for the full walkthrough.
     """
     raise NotImplementedError(
-        "implement checkpoint loading; see "
-        "docs/model_porting.md#2-start-from-the-adapter-template"
+        "see docs/porting_guide.md Step 1 — Port HF model body to C++"
     )
 
 
@@ -91,7 +95,8 @@ def load(repo_id: str, dtype: torch.dtype = torch.float16,
 # Section 2 — Weights: per-Linear partition selection + swizzle
 # =============================================================================
 #
-# Double-swizzle guard: specialized Linear modules (e.g.,
+# P1 SKIP_LINEAR_NAMES rule (CLAUDE.md "Pitfall red flags" +
+# docs/pitfalls.md#p1--double-swizzle): specialized Linear modules (e.g.,
 # ``PiGemmaRMSNorm.dense``) MUST be in ``SKIP_LINEAR_NAMES`` OR save/restore
 # weights around ``swizzle_model_inplace``. For plain CausalLM ports the 7
 # standard Linears (q/k/v/o/gate/up/down_proj) all use the recursive walk —
@@ -129,30 +134,40 @@ def swizzle(model: nn.Module,
 
     Side effects:
         Mutates ``model`` parameters in place. Caller MUST NOT call this twice
-        on the same model because a second swizzle corrupts weights with
+        on the same model — Pitfall 1 (double-swizzle) corrupts weights with
         no exception raised.
 
-    See ``docs/api_reference.md#weight-layout-api-for-adapter-authors`` for
-    the public swizzle helpers.
+    See ``docs/api_reference.md#weight-conversion-api`` for the canonical
+    swizzle entry point + RPUCache 7-D layout reference.
 
-    See
-    ``docs/model_porting.md#3-reuse-the-causal-decoder-when-it-matches``.
+    See ``docs/porting_guide.md`` Step 2 for the full walkthrough.
     """
     raise NotImplementedError(
-        "implement weight transformation; see "
-        "docs/model_porting.md#3-reuse-the-causal-decoder-when-it-matches"
+        "see docs/porting_guide.md Step 2 — Swizzle weights"
     )
 
 
 # =============================================================================
-# Section 3 — Small layout-boundary patches
+# Section 3 — Patches: §3a (a)/(b) residual patches only
 # =============================================================================
 #
-# Keep only a small patch for a layout mismatch where upstream HF exposes no
-# suitable seam, or for a model-specific runtime attribute. Use FusedModelBase
-# for a rewritten forward, the runtime decoder helpers for class swaps, and
-# Section 2 for pure weight transformation. Explain the concrete seam or
-# constraint above every retained patch.
+# §3a triage criteria (design notes 2026-04-22 §3a):
+#   (a) Forward-path op-tensor layout mismatch (RPU [b,s,h,d] vs torch
+#       [b,h,s,d]) where upstream HF exposes no seam.
+#       → Keep here; "# patch-reason: (a) <where + why>".
+#   (b) Model-specific hardware-constraint attribute injection (for example,
+#       the Gemma-family compatibility `_rpu_chunk_size` path).
+#       → Keep here; "# patch-reason: (b) <where + why>".
+#   (c) Entire forward() rewritten.
+#       → NOT a patch. Subclass via v3 FusedModelBase.
+#   (d) Single class swap (e.g., RMSNorm → RPURMSNorm).
+#       → Call runtime.decoder._install_rmsnorm_class_swap from Section 5.
+#   (e) Pure weight transformation.
+#       → Move to Section 2 (weights).
+#
+# scripts/check_patch_reasons.py enforces 100% comment coverage in CI; every
+# def patch_* MUST have a "# patch-reason: (a)" or "(b)" comment on the line
+# above. Categories (c)/(d)/(e) MUST NOT appear in this section.
 #
 # Idempotent class-level installer pattern (from adapters/pi05/patches.py):
 #
@@ -168,17 +183,16 @@ def swizzle(model: nn.Module,
 #         <SomeClass>._rpu_<thing>_patched = True
 
 
-# Example placeholder: replace it with a documented layout-boundary patch, or
-# delete it when the port needs no patches.
+# patch-reason: (a) example placeholder — REPLACE with your real (a)/(b) patch
+# OR delete this stub if your port needs no patches.
 def patch_template_forward_path_layout(*args: Any, **kwargs: Any) -> None:
-    """Placeholder for an operator-tensor layout patch.
+    """Placeholder for a §3a (a) op-tensor layout patch.
 
-    Most ports do not need this. See
-    ``docs/model_porting.md#3-reuse-the-causal-decoder-when-it-matches``.
+    Most ports do NOT need this. Delete this stub for ports without (a)
+    patches. See ``docs/porting_guide.md`` Step 3 for the full walkthrough.
     """
     raise NotImplementedError(
-        "implement the required layout-boundary patch; see "
-        "docs/model_porting.md#3-reuse-the-causal-decoder-when-it-matches"
+        "see docs/porting_guide.md Step 3 — Declare SPM + register handle"
     )
 
 
@@ -188,8 +202,8 @@ def patch_template_forward_path_layout(*args: Any, **kwargs: Any) -> None:
 #
 # Execution planning is cold: public entry points normalize ``rpu_execution``
 # before loading weights and adapters pass it to their native handle installer.
-# It must not be reimplemented as a hot attribute. Supported compatibility
-# attributes are set on ``model`` AFTER ``.to("rpu")``:
+# It must not be reimplemented as a hot attribute. Remaining A9 hw-attribute
+# slots are set on ``model`` AFTER ``.to("rpu")``:
 #
 # | Slot                  | Type           | Cold-set | Hot-set | Default                  |
 # |-----------------------|----------------|----------|---------|--------------------------|
@@ -202,16 +216,17 @@ def patch_template_forward_path_layout(*args: Any, **kwargs: Any) -> None:
 # Hot-set = between forwards; requires ``rpu_backend.reset_graph_cache()``.
 # Unknown ``_rpu_*`` attrs → ``RPUConfigError``.
 #
-# Gemma-family adapters may explicitly read ``_rpu_chunk_size``. Plain
-# CausalDecoder adapters use the cold ``rpu_execution`` mapping instead; see
-# ``docs/model_porting.md#3-reuse-the-causal-decoder-when-it-matches``.
+# Pitfall 5 (``docs/pitfalls.md#p5--per-instance-_rpu_chunk_size``) applies to
+# Gemma-family adapters that explicitly read ``_rpu_chunk_size``. Plain
+# CausalDecoder adapters use the cold ``rpu_execution`` mapping instead.
 #
 # VLA models compose components (Pi0.5: siglip → reset → gemma → reset →
 # adarms → reset) in this section. CausalLM models (Qwen3, Llama, Phi,
 # Mistral) use the all-layers-once direct path — this section is ≤ 100 LOC
 # for plain CausalLM.
 
-# Attributes accepted by the runtime validator at ``.to("rpu")`` time.
+# A9 supported attributes (used by the runtime to validate user-set
+# ``_rpu_*`` attrs at .to("rpu") cold-set time).
 _A9_SUPPORTED_ATTRS: frozenset[str] = frozenset({
     "_rpu_chunk_size",
     "_rpu_execution",
@@ -238,12 +253,10 @@ def apply_rpu_runtime(model: nn.Module,
           (so subsequent forwards REPLAY the cached graph; hot-set requires
           ``rpu_backend.reset_graph_cache()``).
 
-    See
-    ``docs/model_porting.md#3-reuse-the-causal-decoder-when-it-matches``.
+    See ``docs/porting_guide.md`` Step 3 for the full walkthrough.
     """
     raise NotImplementedError(
-        "implement native handle setup; see "
-        "docs/model_porting.md#3-reuse-the-causal-decoder-when-it-matches"
+        "see docs/porting_guide.md Step 3 — Declare SPM + register handle"
     )
 
 
@@ -251,7 +264,7 @@ def apply_rpu_runtime(model: nn.Module,
 # Section 5 — Adapter class + registry binding
 # =============================================================================
 #
-# Reference form (mirrors adapters/qwen3.py / adapters/llama.py):
+# CANONICAL FORM (mirrors adapters/qwen3.py / adapters/llama.py):
 #
 #     class <ArchName>Adapter:
 #         """Adapter for <HF_ARCH>ForCausalLM."""
@@ -277,10 +290,10 @@ def apply_rpu_runtime(model: nn.Module,
 #     from rpu_backend.runtime.registry import register_adapter
 #     register_adapter("<HF_ARCH>ForCausalLM", <ArchName>Adapter)
 #
-# Replace ``<ArchName>``, ``<HF_ARCH>`` with your model's identifiers. Use
-# ``adapters/qwen3.py`` as the reference port.
+# Replace ``<ArchName>``, ``<HF_ARCH>`` with your model's identifiers. See
+# ``adapters/qwen3.py:47-87`` for the canonical reference port.
 #
-# When extracting this template into the flat layout, the resulting
+# When extracting this template into the v5 flat layout, the resulting
 # ``adapters/<your_arch>.py`` typically ends with the ``register_adapter(...)``
 # call at module scope.
 

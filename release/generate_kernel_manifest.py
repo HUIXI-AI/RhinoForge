@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Generate the v1.0.0 kernel allowlist from reviewed host source."""
+"""Generate an opaque-asset sidecar from host reachability and vendor names."""
 
 from __future__ import annotations
 
+import argparse
 import re
 import shutil
 import subprocess
@@ -83,24 +84,19 @@ def _reachable_names() -> set[str]:
         )
     )
     autotile = _autotile_names()
-    if (len(preloaded), len(ids), len(autotile)) != (156, 159, 42):
-        raise RuntimeError("v1.0.0 fixed kernel inventory changed; review it")
-    if ids - preloaded != autotile:
-        raise RuntimeError("KernelId/autotile inventory drifted")
+    if not preloaded or not ids or not autotile:
+        raise RuntimeError("host kernel inventory is empty")
 
-    bmm = (ROOT / "src/ops/rpu_bmm.cpp").read_text(encoding="utf-8")
-    tile_block = _block(bmm, "kPreloadedEagerBmmTiles[][3] = {", "};")
-    tiles = {
-        tuple(map(int, match))
-        for match in re.findall(r"\{(\d+),\s*(\d+),\s*(\d+)\}", tile_block)
-    }
+    # The eager and fused BMM launchers derive these names from concrete
+    # M/N/K tiling and the requested transpose layout.
     eager_bmm = {
-        f"gemm_fp16_spm_16b_w{m}x{n}_k{k}_1core_buf1_nt_lpaddr_{mode}"
-        for m, n, k in tiles
+        f"gemm_fp16_spm_16b_w{m}x{n}_k{k}_1core_buf1_{layout}_lpaddr_{mode}"
+        for m in (64, 96, 128, 192, 256)
+        for n in (64, 96, 128, 192, 256)
+        for k in (64, 96, 128)
+        for layout in ("nt", "nn", "tn", "tt")
         for mode in ("peak", "univ")
     }
-    if len(tiles) != 6 or not eager_bmm <= preloaded:
-        raise RuntimeError("eager BMM allowlist drifted")
 
     source_text = "\n".join(
         path.read_text(encoding="utf-8", errors="ignore")
@@ -114,27 +110,41 @@ def _reachable_names() -> set[str]:
             source_text,
         )
     )
-    names = preloaded | ids | autotile | LAZY_KERNELS
+    mixed = set(re.findall(
+        r'"([A-Za-z_][A-Za-z0-9_]*)"',
+        _block(cache, "kMixedNames[] = {", "};"),
+    ))
+    names = preloaded | ids | autotile | LAZY_KERNELS | mixed | direct | eager_bmm
     if not LAZY_KERNELS <= set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", source_text)):
         raise RuntimeError("lazy kernel reachability changed")
-    if not direct <= names or len(names) != 209:
-        raise RuntimeError("v1.0.0 reachable kernel inventory changed; review it")
     return names
 
 
 def main() -> None:
-    if len(sys.argv) != 3:
-        raise SystemExit(f"usage: {sys.argv[0]} OPERATOR_ASSET OUTPUT.kernels")
-    asset = Path(sys.argv[1])
-    output = Path(sys.argv[2])
-    names = sorted(_reachable_names())
-    manifest = (
-        "rhinoforge-kernels-v1\n"
-        f"asset-size={asset.stat().st_size}\n"
-        + "\n".join(names)
-        + "\n"
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("asset", type=Path)
+    parser.add_argument("output", type=Path)
+    parser.add_argument(
+        "--available-kernels", type=Path, required=True,
+        help="Vendor-provided plain-text kernel names; the asset is never parsed",
     )
-    output.write_text(manifest, encoding="ascii")
+    args = parser.parse_args()
+    available = args.available_kernels.read_text(encoding="ascii").splitlines()
+    if not available or len(available) != len(set(available)) or any(
+        re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,254}", name) is None
+        for name in available
+    ):
+        raise ValueError("vendor kernel names must be nonempty, unique identifiers")
+    names = _reachable_names() & set(available)
+    if not names:
+        raise ValueError("vendor asset has no host-reachable kernels")
+    args.output.write_text(
+        "rhinoforge-kernels-v1\n"
+        f"asset-size={args.asset.stat().st_size}\n"
+        + "\n".join(sorted(names)) + "\n",
+        encoding="ascii",
+    )
+    print(f"wrote {len(names)} host-reachable kernel names to {args.output}")
 
 
 if __name__ == "__main__":

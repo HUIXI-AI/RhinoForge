@@ -94,12 +94,15 @@ to change allocator mode.
 - The adapter claims the shared caching policy before its first RPU or reserved
   Launch allocation. Long-running varied-image validation must prove its
   address-free mapping count stays bounded.
-- The 32B W8A16 path remains Source-only. Its exact public single-image
-  candidate passes bounded Vision/prefill/decode Graph lifecycle and keeps
-  logits nonzero, but independent numerical, task, performance, derived-asset,
-  and released runtime-set gates remain pending. The legacy-named opt-in is
-  controlled evaluation only.
-  [Examples](../../docs/model_support.md)
+- The legacy 32B W8A16 path remains Source-only and controlled/uncertified:
+  only Text7 is INT8; the head, embedding and Vision stay FP16. Its independent
+  TP8 planning bounds (336 physical prefill rows, chunk at most 64) do not
+  certify that entire length range or set KV capacity. The public single-image
+  P78/D4 run has bounded CLI, same-teacher CPU numerical and Graph lifetime
+  evidence. Full-range, task-quality and performance certification remain
+  separate gates; the explicit opt-in remains required. Runtime-quantized 32B
+  is a distinct recipe and cannot supply this legacy profile's evidence.
+  [Qwen3-VL configurations](../../examples/configs/qwen3_vl/README.md)
 
 ### Pi0.5
 
@@ -121,6 +124,19 @@ to change allocator mode.
   preprocessing. Camera keys, image geometry, token length, and auxiliary
   fields belong to that checkpoint contract.
   [Pi0.5 example](../../examples/pi05.py)
+- For fixed-input comparisons, pass the same explicit CPU `float32` noise to
+  graph preparation and inference, or use `input.noise` in the example TOML.
+  Shape and finite-value validation precede inference; omitting noise keeps
+  the default sampling behavior. Keep numerical safety checks enabled.
+  [Policy API](../../docs/api_reference.md#policy-apis)
+  [Noise validation tests](../../tests/test_pi05_explicit_noise.py)
+- Cold installation reserves capacity for four retained component/safety
+  Graphs and one immediate queue before weight transformation. The example
+  constructs persistent tensors outside inference mode so version-based
+  prefix caching remains available; the request still uses the configured
+  inference mode.
+  [Pi0.5 installation](../../python/rpu_backend/adapters/pi05/__init__.py)
+  [Example runner](../../examples/_runner.py)
 
 ### Wall-OSS
 

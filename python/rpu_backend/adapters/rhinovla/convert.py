@@ -345,7 +345,7 @@ def _fold_final_norm_dense(final_norm):
 
 def _prepare_denoise_adarms_tables(expert, cond_all_cpu, *, full_w8a16=False,
                                    loop_weights=None, precompute_gate_tanh=False,
-                                   high_precision=False):
+                                   high_precision=False, quantize_final_norm=True, final_norm=None):
     """Precompute denoise-loop AdaRMS dense outputs for fixed timestep conds.
 
     RhinoVLA's denoise schedule uses the same timestep embedding for every
@@ -365,7 +365,8 @@ def _prepare_denoise_adarms_tables(expert, cond_all_cpu, *, full_w8a16=False,
     if full_w8a16:
         return _prepare_full_w8_adarms_tables(
             expert, cond_all_cpu, loop_weights, precompute_gate_tanh=precompute_gate_tanh,
-            high_precision=high_precision)
+            high_precision=high_precision, quantize_final_norm=quantize_final_norm,
+            final_norm=final_norm)
     cond = cond_all_cpu.detach().cpu().to(dtype=torch.float32).contiguous()
     if cond.dim() != 2:
         raise RuntimeError(
@@ -399,17 +400,45 @@ def _prepare_denoise_adarms_tables(expert, cond_all_cpu, *, full_w8a16=False,
 
 
 def _prepare_full_w8_adarms_tables(expert, cond_all_cpu, loop_weights, *,
-                                  precompute_gate_tanh=False, high_precision=False):
+                                  precompute_gate_tanh=False, high_precision=False,
+                                  quantize_final_norm=True, final_norm=None):
     """Run actual W8A16 RPU Linear once for each fixed-timestep projection."""
+    if type(quantize_final_norm) is not bool:
+        raise TypeError("RhinoVLA quantize_final_norm must be bool")
+    if not quantize_final_norm and (precompute_gate_tanh or high_precision):
+        raise ValueError("RhinoVLA HIGH and gate TANH precompute require full-pipeline W8")
     cond = cond_all_cpu.detach().to(dtype=torch.float16, device="cpu").contiguous()
     if tuple(cond.shape) != (10, 1024) or not torch.isfinite(cond).all():
         raise ValueError("RhinoVLA full W8 AdaRMS requires finite [10,1024] conditions")
     owners = getattr(expert, "_rpu_full_w8_cond_owners", None)
-    if owners is None or loop_weights is None or "final_norm_w_col" not in loop_weights:
-        raise ValueError("RhinoVLA full W8 AdaRMS requires installed quantized cond/IO owners")
-    weights = [*owners["cold_weights"], loop_weights["final_norm_w_col"]]
-    scales = [*owners["cold_scales"], loop_weights["io_scales"][4]]
-    biases = [*owners["cold_biases"], loop_weights["final_norm_b"]]
+    if (owners is None or loop_weights is None or
+            any(len(owners.get(name, ())) != 18 for name in
+                ("cold_weights", "cold_scales", "cold_biases"))):
+        raise ValueError("RhinoVLA full W8 AdaRMS requires eighteen installed condition owners")
+    weights = list(owners["cold_weights"])
+    scales = list(owners["cold_scales"])
+    biases = list(owners["cold_biases"])
+    if quantize_final_norm:
+        if "final_norm_w_col" not in loop_weights or len(loop_weights.get("io_scales", ())) < 5:
+            raise ValueError("RhinoVLA full W8 AdaRMS requires installed quantized cond/IO owners")
+        weights.append(loop_weights["final_norm_w_col"])
+        scales.append(loop_weights["io_scales"][4])
+        biases.append(loop_weights["final_norm_b"])
+    elif "io_scales" in loop_weights or "final_norm_w_col" in loop_weights:
+        raise ValueError("RhinoVLA expert-only W8 requires floating final norm and action IO")
+    if not quantize_final_norm:
+        source_norm = expert.norm if final_norm is None else final_norm
+        if any(not tensor.is_floating_point() for tensor in (
+                source_norm.cond.weight, source_norm.cond.bias, source_norm.norm.weight)):
+            raise ValueError("RhinoVLA expert-only W8 requires floating final norm owners")
+        final_w, final_b = _fold_final_norm_dense(source_norm)
+        if (tuple(final_w.shape) != (3072, 1024) or
+                tuple(final_b.shape) != (3072,) or
+                not torch.isfinite(final_w).all() or not torch.isfinite(final_b).all()):
+            raise ValueError("RhinoVLA expert-only W8 requires finite floating final norm [3072,1024]")
+        final_cond = cond_all_cpu.detach().cpu().to(torch.float32).contiguous()
+        final_table = torch.nn.functional.linear(final_cond, final_w, final_b).contiguous()
+        final_table[:, :1024] += 1.0
     cond_rpu = cond.to("rpu")
     results = []
     for index, (weight, scale, bias) in enumerate(zip(weights, scales, biases)):
@@ -430,7 +459,10 @@ def _prepare_full_w8_adarms_tables(expert, cond_all_cpu, loop_weights, *,
                 output[:, 5120:6144] = gates[:, 1024:]
         results.append(output)
     pair_table = torch.stack(results[:18], dim=1).to("rpu").contiguous()
-    final_table = results[18].to("rpu").contiguous()
+    if quantize_final_norm:
+        final_table = results[18].to("rpu").contiguous()
+    else:
+        final_table = final_table.to(dtype=torch.float16, device="rpu").contiguous()
     loop_weights["adarms_cold_owners"] = (weights, scales, biases)
     return pair_table, final_table, weights, scales, biases
 

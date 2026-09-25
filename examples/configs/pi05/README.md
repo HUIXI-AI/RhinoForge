@@ -41,6 +41,7 @@ NVFP4 是 E2M1 浮点编码，使用 block16 的 FP8 scale 和 FP32 tensor scale
 | `pi05.precision` | 选择上述四种精度，绑定对应的公开 `optimized_profile`。 |
 | `input.checkpoint` | alias 或本地模型目录；必须匹配量化元数据。 |
 | `input.batch` | CPU tensor 字典，包含 policy 要求的图像、相机 mask、状态、token 和文本 mask。 |
+| `input.noise` | 可选的 CPU float32 tensor 文件，形状 `[1,50,32]`，作为明确输入传给准备与预测；不设置时保留默认噪声采样。 |
 | `input.cameras` | 2 或 3 个相机槽位；与目录和真实 batch 一致。 |
 | `input.text_tokens` | 模板使用 32，固定文本容量；不是任意 prompt 字符长度。 |
 | `input.num_steps` | 模板固定 10 个 denoise step。 |
@@ -49,7 +50,7 @@ NVFP4 是 E2M1 浮点编码，使用 block16 的 FP8 scale 和 FP32 tensor scale
 
 `w8a16_action_nvfp4` 对应 API 的 `w8_action_nvfp4`，`w8a16_prefill_w8a8_action_nvfp4` 对应 `w8_prefill_a8_action_nvfp4`。runner 应用优化 profile 和准备 Graph，不需要逐项复制融合环境开关。
 
-真实 batch 必须使用 checkpoint 对应的预处理、状态归一化、相机槽位和 mask 约定，不能靠增加空图或复制 token 满足容量。公开 runner 不提供固定噪声文件注入。相同 shape 不表示输入内容或语义可以忽略；任务质量需使用应用真实观测判断。
+真实 batch 必须使用 checkpoint 对应的预处理、状态归一化、相机槽位和 mask 约定，不能靠增加空图或复制 token 满足容量。固定噪声对照可使用 `input.noise`；runner 仍拒绝通过诊断环境变量替换输入。相同 shape 不表示输入内容或语义可以忽略；任务质量需使用应用真实观测判断。
 
 ## 冷态配置与复用
 
@@ -58,3 +59,15 @@ NVFP4 是 E2M1 浮点编码，使用 block16 的 FP8 scale 和 FP32 tensor scale
 服务中复用同一个 `Pi05Policy`，安装后准备 Graph，再重复预测，结束时 `close()`。新请求保持已准备的相机、文本容量、mask 和 action 范围；变更精度、相机槽位或规划设置时创建新 policy。一个进程只保留一个 RPU policy owner，不要每次请求重载权重。
 
 CPU 线程与 allocator 是进程部署设置，不是 RPU 核数。正常计时关闭 profiler 和详细 trace；配置本身不是机器人任务质量认证。参见 [运行时配置](../../../docs/runtime_config.md)、[API 参考](../../../docs/api_reference.md) 和 [Pi profile 实现](../../../python/rpu_backend/adapters/pi05/optimized.py)。
+
+标准配置的两个示例入口均在导入 Torch 前绑定 `MIMALLOC_PURGE_DELAY=1000` 和
+`MIMALLOC_ARENA_PURGE_MULT=0`，避免遗漏优化 profile 的 CPU 分配器设置。
+这不改变模型精度或数值校验；应用程序调用库 API 时需自行在新进程启动前配置。
+
+## 数值验证
+
+首轮 fused 与 Python 路径对照保留相同权重、输入和噪声，并检查输出 shape、
+dtype、finite、prefix KV 与 Graph 生命周期。MSE、最大绝对误差、relative-L2、
+逐行分布及单侧零行计数仅作诊断，不再采用固定的跨模型浮点误差门限。
+运行通过不等于任务质量认证；量化实现应对照相同量化权重，原始浮点参考的
+动作差异与真实任务质量另行评估。READY 表示 Graph 生命周期准备完成。

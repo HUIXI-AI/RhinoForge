@@ -67,7 +67,7 @@ def validate_pi05_config(config):
         raise ValueError("Pi0.5 examples require [pi05], [input], [run], and optional [rpu_execution]")
     allowed = {
         "pi05": {"precision"},
-        "input": {"checkpoint", "batch", "cameras", "text_tokens", "num_steps"},
+        "input": {"checkpoint", "batch", "noise", "cameras", "text_tokens", "num_steps"},
         "run": {"warmup", "runs", "seed", "output_dir", "profile", "hwperf", "torch_num_threads", "inference_mode"},
     }
     for name, keys in allowed.items():
@@ -85,6 +85,8 @@ def validate_pi05_config(config):
     for key in ("checkpoint", "batch"):
         if not isinstance(inputs.get(key), str) or not inputs[key].strip():
             raise ValueError(f"[input].{key} must be a nonempty path or checkpoint alias")
+    if "noise" in inputs and (not isinstance(inputs["noise"], str) or not inputs["noise"].strip()):
+        raise ValueError("[input].noise must be a nonempty path to a CPU float32 tensor")
     for key, default, minimum in (("warmup", 2, 0), ("runs", 6, 1), ("seed", 0, 0), ("torch_num_threads", 8, 1)):
         if type(options.get(key, default)) is not int or options.get(key, default) < minimum:
             raise ValueError(f"[run].{key} must be an integer >= {minimum}")
@@ -102,7 +104,10 @@ def config_metadata(config):
     inputs = config["input"]
     precision = config["pi05"]["precision"]
     return {"target": "pi05", "profile_id": f"pi05.{inputs['cameras']}cam.t{inputs.get('text_tokens', 32)}.{precision}",
-            "registry_alias": inputs["checkpoint"], "dtype": precision, "opt_in": {}}
+            "registry_alias": inputs["checkpoint"], "dtype": precision,
+            # The shared runner binds these before importing Torch. Setting
+            # them during policy preparation is too late for the CPU allocator.
+            "opt_in": {"MIMALLOC_PURGE_DELAY": "1000", "MIMALLOC_ARENA_PURGE_MULT": "0"}}
 
 
 def _generic_environment(precision):
@@ -167,6 +172,13 @@ def prepare_pi05(config):
     batch = torch.load(Path(inputs["batch"]).expanduser(), map_location="cpu", weights_only=True)
     if not isinstance(batch, dict):
         raise ValueError("Pi0.5 batch must contain a tensor dictionary")
+    noise_kwargs = {}
+    if "noise" in inputs:
+        noise = torch.load(Path(inputs["noise"]).expanduser(), map_location="cpu", weights_only=True)
+        if (not isinstance(noise, torch.Tensor) or noise.dtype != torch.float32
+                or tuple(noise.shape) != (1, 50, 32) or not bool(torch.isfinite(noise).all())):
+            raise ValueError("Pi0.5 input.noise must be a finite CPU float32 tensor [1,50,32]")
+        noise_kwargs["noise"] = noise
     profile = {"precision": _PRECISIONS[precision], "num_cameras": inputs["cameras"],
                "text_tokens": inputs.get("text_tokens", 32)} if paired else None
     owner = _PolicyOwner({} if paired else _generic_environment(precision))
@@ -181,7 +193,7 @@ def prepare_pi05(config):
                     or model_config.num_inference_steps != 10):
                 raise ValueError("Pi0.5 requires horizon 50, max_action_dim 32 and 10 denoise steps")
         policy.to("rpu")
-        policy.prepare_graphs(batch, num_steps=10, precompute_adarms=paired)
+        policy.prepare_graphs(batch, num_steps=10, precompute_adarms=paired, **noise_kwargs)
     except BaseException as error:
         try:
             owner.close()
@@ -190,5 +202,5 @@ def prepare_pi05(config):
         raise
     def infer():
         # Pi's total-latency convention includes a caller-owned CPU action.
-        return policy.predict_action_chunk(batch, num_steps=10).detach().float().cpu().clone()
+        return policy.predict_action_chunk(batch, num_steps=10, **noise_kwargs).detach().float().cpu().clone()
     return infer, owner

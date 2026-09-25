@@ -370,6 +370,8 @@ def _language_weight_identity(model):
         )
     except AttributeError:
         return None
+    if weight.is_inference():
+        return None
     return id(weight), int(weight._version)
 
 
@@ -403,7 +405,8 @@ def _assemble_packed_prefix_ondevice(self, packed_emb, tokens):
     weight_identity = _language_weight_identity(self)
     cache = getattr(self, "_pi05_language_prefix_cache", None)
     cache_hit = (
-        cache is not None
+        weight_identity is not None
+        and cache is not None
         and cache["image_rows"] == image_rows
         and cache["weight_identity"] == weight_identity
         and cache["tokens"].shape == tokens.shape
@@ -447,7 +450,7 @@ def _assemble_packed_prefix_ondevice(self, packed_emb, tokens):
             "lang_cpu": lang_emb,
             "lang_rpu": lang_rpu,
             "ids_rpu": ids_rpu,
-        }
+        } if weight_identity is not None else None
 
     assembled = torch.ops.rpu.assemble_inputs_embeds(
         lang_rpu,

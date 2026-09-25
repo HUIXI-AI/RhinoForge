@@ -140,6 +140,18 @@ adapter。
 `prepare_graphs(...)` 对此配置默认预计算 AdaRMS；示例见
 [`examples/configs/pi05/`](../examples/configs/pi05/)。
 
+`Pi05Policy.prepare_graphs(batch, noise=...)` 和
+`Pi05Policy.predict_action_chunk(batch, noise=...)` 接受可选的初始噪声张量。
+张量必须位于 CPU、类型为 `float32`、所有值有限，形状为已加载 policy 配置定义的
+`[batch_size, chunk_size, max_action_dim]`。比较固定输入时，Graph 准备和推理应使用
+同一张量；不传此参数时保留原有的种子噪声生成行为。Pi0.5 示例 TOML 通过
+`input.noise` 指定 `torch.save` 保存的张量文件，优化示例要求形状为 `[1, 50, 32]`。
+
+Pi0.5 `prepare_graphs()` 返回 Graph 就绪状态与重放诊断。shape、dtype、
+finite 和 Graph 不变量仍需通过检查；MSE、最大绝对误差与逐行分布不设通用验收门限。
+`replay_parity.numerical_status` 为 `DIAGNOSTIC`，`task_quality` 为
+`NOT_EVALUATED`；`READY` 不表示动作或闭环任务质量已通过验证。
+
 对于发布绑定的 Pi0.5 组件 profile，传入 `profile="pi0.5-base"` 或
 `profile="pi0.5-libero-v044"`，并同时传入首个预处理后的 `admission_batch`。
 Loader 会在加载权重前校验精确公开 payload 和请求范围，后续 Graph 与推理请求继续按

@@ -104,7 +104,9 @@ The v3 W8 examples additionally bind the boolean `input.expert_w8a16` and
 `input.full_w8a16` fields to the expert constructor. Factory JSON must agree
 exactly; the runner checks the bound expert's installed integer weights and
 scales before inference. These fields describe the action expert's scope,
-not the precision of the entire policy.
+not the precision of the entire policy. The separate experimental full-pipeline
+templates add an explicit environment selection and full installed-owner check;
+they are not default recommendations or numerical certifications.
 
 ### Independent integration templates and caller-owned files
 
@@ -131,11 +133,20 @@ planning semantics are documented under [non-environment runtime controls](#non-
 
 ## Host execution settings
 
+The shared examples runner prepares every model under `no_grad()` with
+`inference_mode(False)`. Persistent weights and mutable Graph inputs therefore
+retain version counters; `run.inference_mode` still controls warmup and timed
+inference. Lazy component installation needs the same local preparation scope.
+For caches keyed by tensor versions, an inference tensor has no usable counter:
+refresh its derived data or compare owned content instead of assuming that an
+unchanged tensor object has unchanged values.
+
 These settings belong to the application process and its installed CPU runtime,
-not to the RPU planner. The optimized Pi example profiles set the values shown
-below through `run_model.py` before importing Torch. Library inference does not
-change them. Use a fresh process when changing them; direct example scripts do
-not apply `[runner.env]` on behalf of the common runner.
+not to the RPU planner. The canonical `[pi05]` examples bind the allocator values
+below before importing Torch, through either `run_model.py` or `pi05.py`.
+`run.torch_num_threads` defaults to eight. Library inference does not change
+these process settings. Use a fresh process when changing them; older direct
+example formats do not apply `[runner.env]` on behalf of the common runner.
 
 | Variable | Recommended Pi value | Read / change | Scope, effect, and risk |
 |---|---:|---|---|
@@ -151,8 +162,11 @@ The optimized Pi examples and quantized Qwen examples retain eight-core
 admission. `linear_acc32` is a boolean: `false` selects ACC16 and `true`
 selects ACC32. Qwen3 and Qwen3.5 text expose it under `prefill`; image-text
 entries also expose `vision`; Pi exposes `prefill`, `vision` and `action`.
-Qwen3-VL additionally accepts `prefill.fast_replay` (boolean, default `true`),
-not `vision.fast_replay` or a separate decode table. These settings bind before
+Qwen3-VL additionally accepts the cold boolean `prefill.fast_replay`,
+not `vision.fast_replay` or a separate decode table. Ordinary FP16 and quantized
+API entries default to `false` when it is omitted; the applicable FP16 and
+quantized example templates explicitly select `true`. Specialized profile
+policies and native owner/Graph checks remain authoritative. These settings bind before
 weight installation; close the model and load a new instance to change them.
 
 ## General and cache settings
@@ -434,6 +448,38 @@ itself is not an end-to-end contract.
 | `RPU_RHINOVLA_VISION_RPU_MERGER_OUTPUT_RPU` | **PB(false)** | Vision installation / **MODEL** | Keeps merger output on RPU. Consumers must accept device-resident output and stable ownership. |
 | `RPU_RHINOVLA_VISION_SKIP_RAW_SNAPSHOTS` | **PB(false)** | Vision installation / **MODEL** | `1` suppresses raw debug snapshots. Leaving it off adds memory/synchronization and may retain sensitive model inputs/intermediates. |
 
+
+### Expert-only W8 construction
+
+The trusted factory may pass `expert_w8a16` and `full_expert_w8a16` to
+`RhinoVLAOnRPU` before weight installation. The first selects the seven expert
+projections; the second additionally selects its AdaRMS condition projections
+and requires the first. Both accept strict booleans or `None` (retain existing
+environment selection). Public example `input.full_w8a16` maps to the constructor's
+`full_expert_w8a16`, not to `RPU_RHINOVLA_FULL_W8A16`.
+
+The exact full-expert mode binds 18 W8 condition owners and floating final-norm
+precomputation with FP16 tables and action IO. The existing full-pipeline switch
+still binds 19 W8 owners and six W8 IO scales, including its final norm. HIGH and
+gate-TANH precomputation continue to require the full-pipeline mode. Precision,
+IO owners and tables are cold state; changes require a new model. Neither scope
+changes numerical acceptance criteria.
+
+The separate full-pipeline examples explicitly enable `RPU_RHINOVLA_FULL_W8A16`
+and check the installed text, vision, action IO and cold AdaRMS owners before
+inference. The baseline template explicitly disables HIGH, gate-TANH
+precomputation and vector Q/K norm; the HIGH template enables them. This scope
+is distinct from expert-only W8; neither template is a numerical or task-quality
+certification.
+
+RhinoVLA also accepts cold boolean `linear_acc32` in
+`components.language_model.prefill` and `components.vision_encoder.vision`.
+The default is ACC16 (`false`); `true` uses the existing text Linear or vision
+block/fused-merger ACC32 path. Patch embedding, action and cold AdaRMS retain
+their existing arithmetic. The fields cannot change after construction and are
+not accepted for the action component. HIGH nonlinear/norm options are separate
+from Linear accumulation. See the [v3 templates](../examples/configs/rhinovla/v3/README.md).
+
 ## Wall-OSS profile
 
 `WallOssPolicy` supplies validated facade defaults before model construction.
@@ -526,7 +572,7 @@ weight loading.
 |---|---|---|
 | `model.num_cores` | Integer `4`, `6` or `8` | Cold compute budget, only for declaring entry points and admitted profiles. |
 | `<stage>.linear_acc32` | Boolean | ACC16 (`false`, default) or ACC32 (`true`), for the components listed above. This does not change checkpoint quantization. |
-| `prefill.fast_replay` | Boolean | Qwen3-VL only; defaults to `true`. |
+| `prefill.fast_replay` | Boolean | Qwen3-VL only; ordinary API default `false`, explicitly enabled by applicable FP16/quantized examples. |
 | `chunk_size` | `"auto"` or a positive integer multiple of 16 | Planner cap/choice for the named stage. It is bound to the model or policy; construct a new one to change it. |
 | `padding_rows` | `"auto"` or a non-negative integer | Exact/automatic execution padding for the named stage. An exact integer is mutually exclusive with `padding_budget`. |
 | `padding_budget` | Non-negative integer | Maximum optional padding considered by the stage planner. It cannot accompany an exact integer `padding_rows`. |

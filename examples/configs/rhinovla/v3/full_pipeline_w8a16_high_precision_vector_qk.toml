@@ -1,0 +1,80 @@
+# Experimental full-pipeline W8A16: expert, prefix, vision projections, action IO and cold AdaRMS.
+# HIGH affects nonlinear/norm arithmetic; Linear accumulation defaults to ACC16.
+# Runtime checks, floating diagnostics and independently evaluated task quality are separate.
+[example]
+profile_id = "rhinovla.v3.w8a16.full-pipeline-high.trusted-factory"
+registry_alias = "rhinovla-controlled"
+target = "rhinovla"
+dtype = "w8a16"
+
+[example.opt_in]
+RPU_RHINOVLA_VISION_BATCH_VIEWS = "1"
+RPU_RHINOVLA_VISION_PREP_CACHE = "1"
+RPU_RHINOVLA_DENOISE_STATIC_CONTEXT_CACHE = "1"
+RPU_RHINOVLA_PRECOMPUTE_ADARMS = "1"
+RPU_RHINOVLA_GATED_NO_SUB = "1"
+RPU_RHINOVLA_FUSED_SILU_MUL = "1"
+RPU_RHINOVLA_EXPERT_FUSIONS = "1"
+RPU_RHINOVLA_ADARMS_RESIDENT = "1"
+RPU_RHINOVLA_ALIGNED_KV = "1"
+RPU_RHINOVLA_FULL_W8A16 = "1"
+RPU_RHINOVLA_EXPERT_W8A16 = "1"
+RPU_RHINOVLA_PACKED_QKV = "0"
+RPU_RHINOVLA_SKIP_ADARMS_GEMV = "0"
+
+RPU_RHINOVLA_PRECOMPUTE_GATE_TANH = "1"
+RPU_RHINOVLA_VISION_INPUT_CACHE = "1"
+RPU_RHINOVLA_HIGH_PRECISION = "1"
+RPU_RHINOVLA_HIGH_PRECISION_FUSIONS = "1"
+RPU_RHINOVLA_VECTOR_K_NORM = "1"
+RPU_RHINOVLA_VECTOR_Q_NORM = "1"
+RPU_RHINOVLA_PARTIAL_ROPE = "0"
+
+[input]
+checkpoint = "/path/to/rhinovla-v3/checkpoint"
+runtime_factory = "your_package.rhinovla_v3:create_runtime"
+request = "/path/to/rhinovla-v3/request.pt"
+factory_config = "/path/to/rhinovla-v3/factory.json"
+trust_model_code = true
+num_steps = 10
+expert_w8a16 = true
+full_w8a16 = true
+
+[run]
+torch_num_threads = 12
+inference_mode = false
+warmup = 1
+runs = 3
+hwperf = false
+profile = false
+seed = 0
+
+[rpu_execution.components.vision_encoder.vision]
+linear_acc32 = false
+chunk_size = "auto"
+rpu_patch_embed = true
+rpu_mergers = true
+fused_merger = true
+fast_replay = true
+preload_replay_skip = true
+bake_merger = true
+
+[rpu_execution.components.language_model.prefill]
+linear_acc32 = false
+# Physical prefix padding; adjust to the caller's logical input envelope.
+padding_rows = 10
+chunk_size = "auto"
+prefix_prep_cache = true
+prefix_prep_rpu = true
+prefix_no_clone = true
+partial_mrope = true
+merger_scatter = true
+fast_replay = true
+preload_replay_skip = true
+
+[rpu_execution.components.action_expert.action]
+chunk_size = "auto"
+denoise_unroll = true
+shared_cache = true
+prefix_alias = true
+fast_replay = true

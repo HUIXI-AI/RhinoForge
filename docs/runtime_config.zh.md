@@ -109,9 +109,16 @@ chunk size 为 `"auto"` 或正 16 倍数，并受各 loader 的实际 profile �
 
 ## Host 执行设置
 
-这些参数属于应用进程及其安装的 CPU runtime，不属于 RPU planner。Pi 优化示例通过
-统一 `run_model.py` 在导入 Torch 前设置下列值；库内推理不会修改它们。更改后使用新
-进程；直接 example 脚本不会代替统一 runner 应用 `[runner.env]`。
+统一 examples runner 在 `no_grad()` 和 `inference_mode(False)` 下准备所有模型，
+使持久权重和可变 Graph 输入保留版本计数；`run.inference_mode` 仍控制 warmup
+和计时推理。延迟安装组件也需要局部使用相同的准备上下文。依赖 tensor 版本的缓存
+遇到 inference tensor 时，应刷新派生数据或比较独立保存的内容；不能把同一个
+tensor 对象当作内容未变的证明。
+
+这些参数属于应用进程及其安装的 CPU runtime，不属于 RPU planner。标准 `[pi05]`
+配置通过 `run_model.py` 或 `pi05.py` 运行时，都会在导入 Torch 前绑定下列 allocator
+值，`run.torch_num_threads` 默认八线程。库内推理不会修改这些进程设置；更改后使用
+新进程。旧版直接 example 格式不会代替统一 runner 应用 `[runner.env]`。
 
 | Variable | Pi 建议值 | 读取 / 更改 | 作用与影响 |
 |---|---:|---|---|
@@ -125,8 +132,9 @@ Qwen3、Qwen3-VL、Qwen3.5 和 Pi0.5 接受冷态 `model.num_cores` 与分组件
 收窄；Pi 优化 profile 和量化 Qwen 配置保持八核约束。`linear_acc32` 只接受布尔值，
 `false`（默认）选择 ACC16，`true` 选择 ACC32。Qwen3、Qwen3.5 文本入口在 `prefill`
 设置，图文入口还可在 `vision` 设置，Pi 分别在 `prefill/vision/action` 设置。
-Qwen3-VL 另接受 `prefill.fast_replay`（默认 `true`），不接受 `vision.fast_replay`
-或独立 `decode` 表。配置在安装权重前绑定；改变后应关闭模型、重新加载。
+Qwen3-VL 另接受冷态布尔值 `prefill.fast_replay`，不接受 `vision.fast_replay`
+或独立 `decode` 表。普通 FP16 和量化 API 入口省略时默认 `false`；适用的 FP16
+和量化示例模板显式设为 `true`。专用 profile 策略及原生 owner/Graph 检查仍具最终决定权。配置在安装权重前绑定；改变后应关闭模型、重新加载。
 
 ## 通用和 cache 设置
 
@@ -397,6 +405,33 @@ CPU FP32 merger。该选择在安装时固定；之后修改环境变量需要�
 | `RPU_RHINOVLA_VISION_RPU_MERGER_OUTPUT_RPU` | **PB(false)** | Vision 安装 / **MODEL** | 将 merger output 保留在 RPU 上。consumer 必须接受 device-resident output 和稳定 ownership。 |
 | `RPU_RHINOVLA_VISION_SKIP_RAW_SNAPSHOTS` | **PB(false)** | Vision 安装 / **MODEL** | `1` 抑制 raw debug snapshot。保持关闭会增加内存/同步，并可能保留敏感模型 input/intermediate。 |
 
+### RhinoVLA expert-only W8 冷安装
+
+可信 factory 可向 `RhinoVLAOnRPU` 传入 `expert_w8a16` 与 `full_expert_w8a16`。
+前者选择 expert 七类投影，后者还选择其 AdaRMS 条件投影并要求前者为真。
+两者只接受布尔值或 `None`（沿用现有环境选择）。公开示例的
+`input.full_w8a16` 对应构造参数 `full_expert_w8a16`，不对应全流水线环境开关。
+
+exact full-expert 模式绑定 18 组 W8 条件 owner，final norm 保持浮点预计算，
+最终表及 action IO 保持 FP16。既有 `RPU_RHINOVLA_FULL_W8A16` 路径仍要求
+19 组 W8 owner 与 6 个 IO scale，HIGH 和 gate-TANH 预计算仍限该路径。
+精度、IO owner 和表都在冷安装时固定，改变时须重建模型；数值门槛不变。
+FP16、expert W8 和 full-expert W8 模板的九项公开缓存/融合环境控制见
+[配置说明](../examples/configs/rhinovla/v3/README.md)，不会隐式扩大精度范围。
+
+
+独立的 full-pipeline 示例显式启用 `RPU_RHINOVLA_FULL_W8A16`，推理前检查
+实际安装的 text、vision、action IO 与冷 AdaRMS owner；其范围不同于 expert-only，
+基础版显式关闭 HIGH、gate-TANH 预计算与 vector Q/K norm，HIGH 版则启用它们。
+模板本身不代表数值或任务质量认证。
+
+RhinoVLA 在 `components.language_model.prefill` 与
+`components.vision_encoder.vision` 接受冷态布尔 `linear_acc32`。
+默认 `false` 使用 ACC16，`true` 选择现有 text Linear 或 vision block/融合 merger 的
+ACC32 路径。patch embedding、action 与冷 AdaRMS 保持既有累加策略。
+构造后不能改变这些字段，action 组件不接受该字段；HIGH 非线性/归一化选项
+与 Linear 累加精度互相独立。详见 [v3 模板](../examples/configs/rhinovla/v3/README.md)。
+
 <a id="wall-oss-profile"></a>
 ## Wall-OSS 配置
 
@@ -483,7 +518,7 @@ grid 和之后变化的 grid 分别会在进程级 claim 前或任何 Vision 工
 |---|---|---|
 | `model.num_cores` | 整数 `4/6/8` | 仅限入口声明并由模型 profile 准入的冷态计算预算。 |
 | `<stage>.linear_acc32` | 布尔值 | 上述组件的 ACC16（`false`，默认）或 ACC32（`true`）；不改变量化权重格式。 |
-| `prefill.fast_replay` | 布尔值 | 仅 Qwen3-VL，默认 `true`。 |
+| `prefill.fast_replay` | 布尔值 | 仅 Qwen3-VL；普通 API 默认 `false`，适用的 FP16/量化示例显式启用。 |
 | `chunk_size` | `"auto"` 或 16 的正整数倍 | 指定 stage 的 planner cap/choice。绑定到模型或 policy；改变时应构造新实例。 |
 | `padding_rows` | `"auto"` 或非负整数 | 指定 stage 的精确/自动 execution padding。精确整数与 `padding_budget` 互斥。 |
 | `padding_budget` | 非负整数 | stage planner 考虑的最大可选 padding。不能与精确整数 `padding_rows` 同时使用。 |

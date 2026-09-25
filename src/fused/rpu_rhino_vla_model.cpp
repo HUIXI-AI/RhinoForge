@@ -408,7 +408,7 @@ public:
         TORCH_CHECK(cold_config_bound_ && num_layers() > 0,
                     "RhinoVLA precision requires installed expert weights");
         TORCH_CHECK(!enabled ||
-                        (expert_w8a16_ && full_action_w8a16_ &&
+                        (expert_w8a16_ && expert_cond_w8a16_ &&
                          cold_config_.precompute_adarms && !cold_config_.skip_adarms_gemv &&
                          !cold_config_.packed_qkv && num_layers() == 18 &&
                          hidden_size() == 1024 && intermediate_size() == 3072 &&
@@ -560,11 +560,11 @@ public:
         at::TensorList io_scales = {}) {
         TORCH_CHECK(num_layers() > 0,
                     "RhinoVLAModel::set_denoise_loop_weights called before set_weights");
-        if (high_precision_) {
-            RpuExecutionCoordinator::require_graph_quiescent("rhino_vla_set_high_precision_io");
-            RpuExecutionCoordinator::check_current_thread_execution_allowed("rhino_vla_set_high_precision_io");
+        if (expert_cond_w8a16_ || high_precision_) {
+            RpuExecutionCoordinator::require_graph_quiescent("rhino_vla_set_w8_condition_io");
+            RpuExecutionCoordinator::check_current_thread_execution_allowed("rhino_vla_set_w8_condition_io");
             TORCH_CHECK(get_last_resolved_chunk_size() == 0,
-                        "RhinoVLA high precision IO must be installed before dispatch");
+                        "RhinoVLA W8 condition IO must be installed before dispatch");
         }
         TORCH_CHECK(action_dim > 0 && action_dim_pad >= action_dim &&
                     state_dim > 0 && state_dim_pad >= state_dim &&
@@ -574,9 +574,12 @@ public:
                         (direct_action_input && action_dim == 96 && state_dim == 96 &&
                          action_horizon == 30 && suffix_len == 31),
                     "RhinoVLA W8A16 requires the ordinary v3 96D/H30/M31 action loop");
-        TORCH_CHECK(full_action_w8a16_ ? io_scales.size() == 6 : io_scales.empty(),
-                    "RhinoVLA full W8 IO requires exactly six scales on a full W8 expert owner");
-        if (full_action_w8a16_) {
+        const bool next_io_w8a16 = !io_scales.empty();
+        TORCH_CHECK(!next_io_w8a16 || (expert_cond_w8a16_ && io_scales.size() == 6),
+                    "RhinoVLA W8 IO requires exactly six scales on a W8 condition owner");
+        TORCH_CHECK(!high_precision_ || next_io_w8a16,
+                    "RhinoVLA high precision requires W8 action IO");
+        if (next_io_w8a16) {
             TORCH_CHECK(!RpuKernelGraph::has_active() && action_dim_pad == 96 && state_dim_pad == 96,
                         "RhinoVLA full W8 IO requires cold exact 96D installation");
             check_rhino_full_w8_projection(action_in_w, io_scales[0], 1024, 96);
@@ -592,7 +595,7 @@ public:
                         "RhinoVLAModel::set_denoise_loop_weights: ", name,
                         " must be contiguous fp16 RPU tensor");
         };
-        if (!full_action_w8a16_) check_rpu(action_in_w, "action_in_w");
+        if (!next_io_w8a16) check_rpu(action_in_w, "action_in_w");
         check_rpu(action_in_b, "action_in_b");
         check_rpu(action_time_in_w, "action_time_in_w");
         check_rpu(action_time_in_b, "action_time_in_b");
@@ -601,15 +604,15 @@ public:
         check_rpu(time_in_b, "time_in_b");
         check_rpu(time_out_w, "time_out_w");
         check_rpu(time_out_b, "time_out_b");
-        if (!full_action_w8a16_) check_rpu(state_w, "state_w");
+        if (!next_io_w8a16) check_rpu(state_w, "state_w");
         check_rpu(state_b, "state_b");
-        if (!full_action_w8a16_) check_rpu(state_mask_w, "state_mask_w");
+        if (!next_io_w8a16) check_rpu(state_mask_w, "state_mask_w");
         check_rpu(state_mask_b, "state_mask_b");
-        if (!full_action_w8a16_) check_rpu(action_mask_w, "action_mask_w");
+        if (!next_io_w8a16) check_rpu(action_mask_w, "action_mask_w");
         check_rpu(action_mask_b, "action_mask_b");
-        if (!full_action_w8a16_) check_rpu(final_norm_w, "final_norm_w");
+        if (!next_io_w8a16) check_rpu(final_norm_w, "final_norm_w");
         check_rpu(final_norm_b, "final_norm_b");
-        if (!full_action_w8a16_) check_rpu(action_out_w, "action_out_w");
+        if (!next_io_w8a16) check_rpu(action_out_w, "action_out_w");
         check_rpu(action_out_b, "action_out_b");
         check_rpu(cos, "cos");
         check_rpu(sin, "sin");
@@ -632,7 +635,7 @@ public:
                     "RhinoVLA direct action input has no action/time MLP; "
                     "time projection precompute and folding are invalid");
         std::vector<at::Tensor> next_io_scales(io_scales.begin(), io_scales.end());
-        if (full_action_w8a16_) {
+        if (next_io_w8a16) {
             for (const auto& bias : {action_in_b, state_b, state_mask_b, action_mask_b}) {
                 TORCH_CHECK(bias.dim() == 1 && bias.numel() == 1024,
                             "RhinoVLA full W8 IO bias must be [1024]");
@@ -641,9 +644,10 @@ public:
                             action_out_b.dim() == 1 && action_out_b.numel() == 96,
                         "RhinoVLA full W8 final biases must be [3072]/[96]");
         }
+        full_action_w8a16_ = next_io_w8a16;
         direct_action_input_ = direct_action_input;
         full_io_scales_.swap(next_io_scales);
-        if (full_action_w8a16_) {
+        if (expert_cond_w8a16_) {
             denoise_adarms_tables_ready_ = false;
             gates_tanh_precomputed_ = false;
             full_cold_weights_.clear();
@@ -735,11 +739,11 @@ public:
                     "RhinoVLAModel::set_denoise_loop_adarms_tables before set_weights");
         TORCH_CHECK(high_precision == high_precision_,
                     "RhinoVLA AdaRMS table precision must match the installed owner");
-        if (high_precision_) {
-            RpuExecutionCoordinator::require_graph_quiescent("rhino_vla_set_high_precision_tables");
-            RpuExecutionCoordinator::check_current_thread_execution_allowed("rhino_vla_set_high_precision_tables");
+        if (expert_cond_w8a16_ || high_precision_) {
+            RpuExecutionCoordinator::require_graph_quiescent("rhino_vla_set_w8_condition_tables");
+            RpuExecutionCoordinator::check_current_thread_execution_allowed("rhino_vla_set_w8_condition_tables");
             TORCH_CHECK(get_last_resolved_chunk_size() == 0,
-                        "RhinoVLA high precision tables must be installed before dispatch");
+                        "RhinoVLA W8 condition tables must be installed before dispatch");
         }
         auto check_rpu = [](const at::Tensor& t, const char* name) {
             TORCH_CHECK(t.defined() && t.device().type() == at::kPrivateUse1 &&
@@ -767,10 +771,12 @@ public:
         TORCH_CHECK(final_table.size(1) == 3 * hidden_size(),
                     "RhinoVLA AdaRMS final_table last dim ", final_table.size(1),
                     " != 3H=", 3 * hidden_size());
-        TORCH_CHECK(full_action_w8a16_
-                        ? (cold_weights.size() == 19 && cold_scales.size() == 19 && cold_biases.size() == 19)
-                        : (cold_weights.empty() && cold_scales.empty() && cold_biases.empty()),
-                    "RhinoVLA full W8 AdaRMS tables require nineteen cold W8 projection owners");
+        const size_t expected_cold_owners =
+            expert_cond_w8a16_ ? (full_action_w8a16_ ? 19 : 18) : 0;
+        TORCH_CHECK(cold_weights.size() == expected_cold_owners &&
+                        cold_scales.size() == expected_cold_owners &&
+                        cold_biases.size() == expected_cold_owners,
+                    "RhinoVLA AdaRMS cold W8 owner count does not match expert/IO precision");
         TORCH_CHECK(!gates_tanh_precomputed ||
                         (full_action_w8a16_ && cold_config_.precompute_adarms &&
                          cold_config_.adarms_resident && !cold_config_.skip_adarms_gemv &&
@@ -781,10 +787,14 @@ public:
                          num_steps_ == 10 && action_dim_ == 96 && state_dim_ == 96 &&
                          action_horizon_ == 30 && suffix_len_ == 31),
                     "RhinoVLA gate TANH precompute requires cold full W8 resident AdaRMS exact v3 loop");
-        if (full_action_w8a16_) {
+        if (expert_cond_w8a16_) {
+            TORCH_CHECK(denoise_loop_weights_ready_,
+                        "RhinoVLA W8 AdaRMS tables require installed loop IO precision");
+            TORCH_CHECK(!high_precision_ || full_action_w8a16_,
+                        "RhinoVLA high precision requires W8 action IO");
             TORCH_CHECK(!RpuKernelGraph::has_active() && pair_table.size(0) == 10,
                         "RhinoVLA full W8 AdaRMS tables require cold ten-step installation");
-            for (int64_t i = 0; i < 19; ++i) {
+            for (size_t i = 0; i < expected_cold_owners; ++i) {
                 const int64_t n = i == 18 ? 3072 : 6144;
                 check_rhino_full_w8_projection(cold_weights[i], cold_scales[i], n, 1024);
                 check_rpu(cold_biases[i], "cold_bias");
@@ -1077,8 +1087,10 @@ public:
         local_kv_dim_ = num_kv_heads * head_dim / attn_tp();
         layer_weights_.swap(next_layer_weights);
         expert_w8a16_ = w8a16;
-        const bool retire_full_derived = full_w8a16 || full_action_w8a16_;
-        full_action_w8a16_ = full_w8a16;
+        const bool retire_full_derived =
+            full_w8a16 || expert_cond_w8a16_ || full_action_w8a16_;
+        expert_cond_w8a16_ = full_w8a16;
+        full_action_w8a16_ = false;
         if (retire_full_derived) {
             gates_tanh_precomputed_ = false;
             full_io_scales_.clear();
@@ -1384,7 +1396,8 @@ protected:
             denoise_adarms_tables_ready_, denoise_time_proj_table_ready_,
             direct_action_input_, cold_config_.expert_fusions,
             cold_config_.adarms_resident, cold_config_.packed_qkv,
-            cold_config_.aligned_kv, expert_w8a16_, full_action_w8a16_, gates_tanh_precomputed_,
+            cold_config_.aligned_kv, expert_w8a16_, expert_cond_w8a16_,
+            full_action_w8a16_, gates_tanh_precomputed_,
             high_precision_, high_precision_ ? 1 : 0};
         if (high_precision_) {
             identity.push_back(high_precision_fusions_);
@@ -1550,9 +1563,9 @@ protected:
             append(FmbRouteFamily::GRAPH_SCHEDULE, RHINO_EXPERT_W8A16_SITE,
                    1, 0, expert_w8a16_route_arguments(chunk.len));
         }
-        if (full_action_w8a16_) {
+        if (expert_cond_w8a16_) {
             append(FmbRouteFamily::GRAPH_SCHEDULE, RHINO_FULL_W8A16_SITE,
-                   1, gates_tanh_precomputed_ ? 1 : 0, {num_layers(), num_steps_, 37, 5, 8, 16});
+                   1, gates_tanh_precomputed_ ? 1 : 0, full_action_w8a16_route_arguments());
         }
         if (high_precision_) {
             append(FmbRouteFamily::GRAPH_SCHEDULE, RHINO_HIGH_PRECISION_SITE,
@@ -2003,6 +2016,7 @@ protected:
         h = detail::layout_mix(h, cold_config_.packed_qkv);
         h = detail::layout_mix(h, cold_config_.aligned_kv);
         h = detail::layout_mix(h, expert_w8a16_);
+        h = detail::layout_mix(h, expert_cond_w8a16_);
         h = detail::layout_mix(h, full_action_w8a16_);
         h = detail::layout_mix(h, gates_tanh_precomputed_);
         h = detail::layout_mix(h, high_precision_);
@@ -2726,11 +2740,16 @@ private:
         return full_action_w8a16_ ? std::vector<int64_t>{rows, n, k, 1, 1} : std::vector<int64_t>{};
     }
 
+    std::vector<int64_t> full_action_w8a16_route_arguments() const {
+        return {num_layers(), num_steps_, full_action_w8a16_ ? 37 : 36,
+                full_action_w8a16_ ? 5 : 0, 8, 16};
+    }
+
     void consume_full_action_w8a16_route() {
         validate_expert_transfer(suffix_len_);
         ctx().consume_physical_route(FmbRouteFamily::GRAPH_SCHEDULE,
             RHINO_FULL_W8A16_SITE, 1, gates_tanh_precomputed_ ? 1 : 0,
-            {num_layers(), num_steps_, 37, 5, 8, 16});
+            full_action_w8a16_route_arguments());
     }
 
     std::vector<int64_t> expert_projection_route_arguments(
@@ -2767,12 +2786,17 @@ private:
                         (cold_config_.precompute_adarms && !cold_config_.skip_adarms_gemv &&
                          denoise_adarms_tables_ready_),
                     "RhinoVLA expert transfer requires ready precomputed AdaRMS tables");
-        TORCH_CHECK(!full_action_w8a16_ ||
+        const size_t expected_cold_owners = full_action_w8a16_ ? 19 : 18;
+        TORCH_CHECK(!expert_cond_w8a16_ ||
                         (cold_config_.precompute_adarms && !cold_config_.skip_adarms_gemv &&
-                         denoise_adarms_tables_ready_ && full_io_scales_.size() == 6 &&
-                         full_cold_weights_.size() == 19 && full_cold_scales_.size() == 19 &&
-                         full_cold_biases_.size() == 19),
-                    "RhinoVLA full W8 requires bound IO scales and cold W8 AdaRMS table owners");
+                         denoise_adarms_tables_ready_ &&
+                         full_io_scales_.size() == (full_action_w8a16_ ? 6 : 0) &&
+                         full_cold_weights_.size() == expected_cold_owners &&
+                         full_cold_scales_.size() == expected_cold_owners &&
+                         full_cold_biases_.size() == expected_cold_owners),
+                    "RhinoVLA W8 condition owner requires matching IO precision and cold AdaRMS owners");
+        TORCH_CHECK(!high_precision_ || full_action_w8a16_,
+                    "RhinoVLA high precision requires W8 action IO");
     }
 
     void emit_aligned_kv_tail_zero(int64_t rows) {
@@ -3054,7 +3078,7 @@ private:
         const bool fold_action_time_in = cold_config_.fold_action_time_in;
 
         if (bit == 0) {
-            if (full_action_w8a16_) consume_full_action_w8a16_route();
+            if (expert_cond_w8a16_) consume_full_action_w8a16_route();
             if (high_precision_) consume_high_precision_route();
             if (cold_config_.adarms_resident) emit_resident_adarms_tables();
             ctx().consume_physical_route(
@@ -3405,6 +3429,7 @@ private:
     bool cold_config_bound_ = false;
     std::vector<LayerWeights> layer_weights_;
     bool expert_w8a16_ = false;
+    bool expert_cond_w8a16_ = false;
     bool full_action_w8a16_ = false;
     bool gates_tanh_precomputed_ = false;
     bool high_precision_ = false;
@@ -3700,7 +3725,10 @@ void rpu_rhino_vla_set_denoise_loop_adarms_tables_w8a16(
     const at::Tensor& final_table,
     at::TensorList cold_weights, at::TensorList cold_scales, at::TensorList cold_biases,
     bool gates_tanh_precomputed, bool high_precision) {
-    TORCH_CHECK(cold_weights.size() == 19, "RhinoVLA full W8 requires nineteen cold projections");
+    TORCH_CHECK((cold_weights.size() == 18 || cold_weights.size() == 19) &&
+                    cold_scales.size() == cold_weights.size() &&
+                    cold_biases.size() == cold_weights.size(),
+                "RhinoVLA W8 AdaRMS requires matching eighteen or nineteen cold projection lists");
     RhinoVLARegistry::get(handle, "rpu_rhino_vla_set_denoise_loop_adarms_tables_w8a16")
         ->set_denoise_loop_adarms_tables(pair_table, final_table, cold_weights, cold_scales,
                                        cold_biases, gates_tanh_precomputed, high_precision);

@@ -56,6 +56,19 @@ def _validate_num_steps(num_steps: int | None, *, entry_point: str) -> int | Non
     return num_steps
 
 
+def _validate_noise(noise, batch, config, *, entry_point):
+    if noise is None:
+        return
+    if not isinstance(noise, torch.Tensor) or noise.device.type != "cpu" or noise.dtype != torch.float32:
+        raise ValueError(f"{entry_point}: noise must be a CPU float32 tensor")
+    state = batch.get("observation.state")
+    if not isinstance(state, torch.Tensor) or state.ndim != 2:
+        raise ValueError(f"{entry_point}: explicit noise requires observation.state [batch, features]")
+    expected = (state.shape[0], config.chunk_size, config.max_action_dim)
+    if tuple(noise.shape) != expected or not bool(torch.isfinite(noise).all()):
+        raise ValueError(f"{entry_point}: noise must be finite with shape {expected}")
+
+
 class Pi05Policy:
     """Public Pi0.5 entry (D-02 thin wrapper)."""
 
@@ -238,6 +251,7 @@ class Pi05Policy:
         *,
         num_steps: "int | None" = None,
         precompute_adarms: bool | None = None,
+        noise: torch.Tensor | None = None,
     ) -> dict:
         """Prebuild one finite Pi0.5 signature, freeze it, and verify READY."""
         if not getattr(self, "_rpu_ready", False):
@@ -246,6 +260,9 @@ class Pi05Policy:
                 "prepare_graphs requires Pi05Policy.to('rpu') to complete first."
             )
         batch = _validate_batch(batch, entry_point="Pi05Policy.prepare_graphs")
+        if noise is not None:
+            _validate_noise(noise, batch, self._lerobot_policy.config,
+                            entry_point="Pi05Policy.prepare_graphs")
         num_steps = _validate_num_steps(
             num_steps, entry_point="Pi05Policy.prepare_graphs"
         )
@@ -260,7 +277,8 @@ class Pi05Policy:
         mark_first_forward_done(self._lerobot_policy)
         with profile_environment_scope(profile, self._rpu_execution):
             return self._adapter.prepare_graphs(
-                batch, num_steps=num_steps, precompute_adarms=precompute_adarms)
+                batch, num_steps=num_steps, precompute_adarms=precompute_adarms,
+                **({"noise": noise} if noise is not None else {}))
 
     @torch.no_grad()
     def predict_action_chunk(
@@ -268,6 +286,7 @@ class Pi05Policy:
         batch: dict,
         *,
         num_steps: "int | None" = None,
+        noise: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run one full Pi0.5 inference and return the complete action chunk."""
         if not getattr(self, "_rpu_ready", False):
@@ -279,6 +298,9 @@ class Pi05Policy:
         batch = _validate_batch(
             batch, entry_point="Pi05Policy.predict_action_chunk"
         )
+        if noise is not None:
+            _validate_noise(noise, batch, self._lerobot_policy.config,
+                            entry_point="Pi05Policy.predict_action_chunk")
         num_steps = _validate_num_steps(
             num_steps, entry_point="Pi05Policy.predict_action_chunk"
         )
@@ -288,9 +310,12 @@ class Pi05Policy:
         validate_profile_batch(self, batch, num_steps)
         # Installation already froze the profile on the Python/native owners.
         # Inference must not republish cold flags into the process environment.
-        if num_steps is None:
-            return self._lerobot_policy.predict_action_chunk(batch)
-        return self._lerobot_policy.predict_action_chunk(batch, num_steps=num_steps)
+        kwargs = {}
+        if num_steps is not None:
+            kwargs["num_steps"] = num_steps
+        if noise is not None:
+            kwargs["noise"] = noise
+        return self._lerobot_policy.predict_action_chunk(batch, **kwargs)
 
     @torch.no_grad()
     def select_action(self, batch: dict) -> torch.Tensor:

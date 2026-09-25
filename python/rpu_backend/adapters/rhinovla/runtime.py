@@ -45,11 +45,18 @@ _PIPELINE_COLD_ENV = {
         "fast_replay": "RPU_RHINOVLA_DENOISE_FAST_REPLAY",
     },
 }
+_PIPELINE_COLD_DEFAULTS = {
+    "prefill": {"linear_acc32": False},
+    "vision": {"linear_acc32": False},
+    "action": {},
+}
 RHINOVLA_EXECUTION_COMPONENTS = {
     RHINOVLA_TEXT_COMPONENT: {
-        "prefill": ("chunk_size", "padding_rows", "padding_budget", *_PIPELINE_COLD_ENV["prefill"]),
+        "prefill": ("chunk_size", "padding_rows", "padding_budget", *_PIPELINE_COLD_ENV["prefill"],
+                    *_PIPELINE_COLD_DEFAULTS["prefill"]),
     },
-    RHINOVLA_VISION_COMPONENT: {"vision": ("chunk_size", *_PIPELINE_COLD_ENV["vision"])},
+    RHINOVLA_VISION_COMPONENT: {"vision": ("chunk_size", *_PIPELINE_COLD_ENV["vision"],
+                                                    *_PIPELINE_COLD_DEFAULTS["vision"])},
     RHINOVLA_ACTION_COMPONENT: {"action": ("chunk_size", *_PIPELINE_COLD_ENV["action"])},
 }
 
@@ -104,6 +111,10 @@ class RhinoVLAPipelineColdConfig:
                 field: explicit[field] if field in explicit else rpu_env_bool(env)
                 for field, env in fields.items()
             }
+            stages[stage].update({
+                field: explicit.get(field, default)
+                for field, default in _PIPELINE_COLD_DEFAULTS[stage].items()
+            })
         snapshot = cls(_freeze_rpu_execution(stages))
         snapshot._validate_dependencies()
         return snapshot, snapshot.bind_defaults(root)
@@ -148,7 +159,7 @@ def _validate_pipeline_cold(runtime, value):
         snapshot.validate_bound(value)
         return
     _, *children = resolve_rhinovla_execution(value, entry_point="RhinoVLA runtime")
-    if any(set(child.get(stage, {})).intersection(fields)
+    if any(set(child.get(stage, {})).intersection((*fields, *_PIPELINE_COLD_DEFAULTS[stage]))
            for (stage, fields), child in zip(_PIPELINE_COLD_ENV.items(), children)):
         raise ValueError("RhinoVLA runtime must bind a pipeline cold snapshot before using physical bool controls")
 
@@ -795,6 +806,27 @@ def bind_rhinovla_execution_runtime(
     return controller
 
 
+def resolve_rhinovla_quantization(*, expert_w8a16=None, full_expert_w8a16=None):
+    """Resolve cold expert precision without widening the whole pipeline."""
+    from rpu_backend.runtime import rpu_env_bool
+
+    for name, value in (("expert_w8a16", expert_w8a16),
+                        ("full_expert_w8a16", full_expert_w8a16)):
+        if value is not None and type(value) is not bool:
+            raise TypeError(f"RhinoVLA {name} must be bool or None")
+    pipeline_full = rpu_env_bool("RPU_RHINOVLA_FULL_W8A16")
+    environment_expert = pipeline_full or rpu_env_bool("RPU_RHINOVLA_EXPERT_W8A16")
+    if pipeline_full and (expert_w8a16 is False or full_expert_w8a16 is False):
+        raise ValueError("RhinoVLA explicit expert precision conflicts with full-pipeline W8")
+    if expert_w8a16 is False and environment_expert:
+        raise ValueError("RhinoVLA explicit expert precision conflicts with EXPERT_W8A16")
+    full_expert = pipeline_full if full_expert_w8a16 is None else full_expert_w8a16
+    expert = (environment_expert or full_expert) if expert_w8a16 is None else expert_w8a16
+    if full_expert and not expert:
+        raise ValueError("RhinoVLA full expert W8 requires expert_w8a16=True")
+    return expert, full_expert, pipeline_full
+
+
 def build_rpu_expert(
     expert: Any,
     *,
@@ -811,6 +843,8 @@ def build_rpu_expert(
     its actual prefix/cache and right-padding mask.
     ``w8a16`` opts into the exact v3 ordinary-loop expert projection profile;
     its seven main projections are quantized before swizzling.
+    ``full_w8a16`` additionally quantizes the expert's AdaRMS conditions;
+    it does not select the precision of the pipeline's vision, text or IO.
     """
     import torch
 

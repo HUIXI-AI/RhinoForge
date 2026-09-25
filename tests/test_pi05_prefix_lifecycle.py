@@ -115,6 +115,27 @@ def prefix_runtime(monkeypatch):
     yield patches, calls
 
 
+def test_inference_embedding_mutation_refreshes_prefix(prefix_runtime):
+    patches, _ = prefix_runtime
+    with torch.inference_mode():
+        embedding = torch.nn.Embedding(8, 16, dtype=torch.float16)
+        model = SimpleNamespace(paligemma_with_expert=SimpleNamespace(
+            paligemma=SimpleNamespace(model=SimpleNamespace(
+                language_model=SimpleNamespace(embed_tokens=embedding))),
+            embed_language_tokens=embedding,
+        ))
+        images = _HostRpuTensor(torch.ones(1, 2, 16, dtype=torch.float16))
+        tokens = torch.tensor([[1, 2]])
+        first, _ = patches._assemble_packed_prefix_ondevice(model, images, tokens)
+        retained = first.cpu().clone()
+        embedding.weight.add_(1)
+        changed, _ = patches._assemble_packed_prefix_ondevice(model, images, tokens)
+        assert torch.equal(changed.cpu()[:, :2], retained[:, :2])
+        assert torch.equal(changed.cpu()[:, 2:], embedding(tokens) * 4)
+        assert not torch.equal(changed.cpu()[:, 2:], retained[:, 2:])
+        assert torch.equal(first.cpu(), retained)
+
+
 @pytest.mark.parametrize("prepare_inference", [False, True])
 def test_prepare_then_changed_input_prefix_in_opposite_mode(
     prefix_runtime, monkeypatch, prepare_inference,

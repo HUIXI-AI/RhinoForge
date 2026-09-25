@@ -72,7 +72,9 @@ def _pi05_graph_runtime_policy():
     """Freeze Pi's Graph choices without mutating process-wide defaults."""
     from rpu_backend.graph import GraphRuntimePolicy
 
-    inherited = GraphRuntimePolicy.from_environment()
+    # Vision, prefill, denoise and the first-call AdaRMS safety graph stay
+    # resident; device prefix assembly also needs one transient queue.
+    inherited = GraphRuntimePolicy.from_environment(graph_arena_count=5)
     fast_replay = rpu_env_bool("RPU_WALL_OSS_FAST_REPLAY", default=True)
     deep_replay = rpu_env_bool("RPU_DEEP_FAST_REPLAY", default=True)
     return replace(
@@ -1167,6 +1169,7 @@ class Pi05Adapter:
         *,
         num_steps: "int | None" = None,
         precompute_adarms: bool = False,
+        noise: torch.Tensor | None = None,
     ) -> dict:
         """Prebuild the finite Pi0.5 production signature and enter READY."""
         if not self._rpu_is_ready:
@@ -1289,7 +1292,7 @@ class Pi05Adapter:
 
         try:
             build_value = self._lerobot_policy.predict_action_chunk(
-                batch, num_steps=steps
+                batch, num_steps=steps, **({"noise": noise} if noise is not None else {})
             )
             if not isinstance(build_value, torch.Tensor):
                 raise RuntimeError(
@@ -1326,7 +1329,7 @@ class Pi05Adapter:
                 name: _stats(cache) for name, cache in frozen_caches
             }
             warm_value = self._lerobot_policy.predict_action_chunk(
-                batch, num_steps=steps
+                batch, num_steps=steps, **({"noise": noise} if noise is not None else {})
             )
             warm_action = warm_value.detach().cpu().clone()
             after_warming_replay = {
@@ -1347,10 +1350,9 @@ class Pi05Adapter:
                     f"after={after_warming_replay}"
                 )
 
-            # Preserve Pi05's existing bounded READY admission contract.
-            # The same CPU-fp32 action checks apply to the public cropped
-            # output; Graph counts, recapture and invariants stay hard
-            # requirements. Exact equality is retained as a diagnostic.
+            # Check the public CPU output boundary and record replay differences.
+            # Graph counts, recapture and invariants remain hard requirements.
+            # Floating-point metrics and exact equality are diagnostics.
             build_replay_bit_equal = bool(torch.equal(build_action, warm_action))
             build_replay_parity = _validate_fused_parity(
                 warm_action,
@@ -1366,7 +1368,7 @@ class Pi05Adapter:
                 name: _stats(cache) for name, cache in frozen_caches
             }
             ready_value = self._lerobot_policy.predict_action_chunk(
-                batch, num_steps=steps
+                batch, num_steps=steps, **({"noise": noise} if noise is not None else {})
             )
             ready_action = ready_value.detach().cpu().clone()
             after_ready = {
@@ -1432,7 +1434,9 @@ class Pi05Adapter:
             "replay_parity": {
                 "build_vs_warming": build_replay_parity,
                 "warming_vs_ready": ready_replay_parity,
-                "contract": "pi05-normalized-action-replay-v1",
+                "contract": "pi05-runtime-boundary-and-numeric-diagnostics-v2",
+                "numerical_status": "DIAGNOSTIC",
+                "task_quality": "NOT_EVALUATED",
             },
             "build_replay_max_abs": build_replay_max_abs,
             "ready_stats": after_ready,
@@ -1783,6 +1787,8 @@ class Pi05Adapter:
                 # their HostDDR mappings through the common, immutable tensor
                 # allocator policy before the first RPU tensor is materialized.
                 torch.rpu.set_caching_allocator(True)
+                if not graph_runtime_policy.prepare_arenas():
+                    raise RPUBackendError("Pi0.5 requires its cold Graph arena plan")
             except BaseException:
                 _release_live_instance(self._lerobot_policy)
                 raise

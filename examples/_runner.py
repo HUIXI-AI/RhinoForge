@@ -192,7 +192,10 @@ def run(config):
         grad_context = torch.inference_mode if options.get("inference_mode", True) else torch.no_grad
         with grad_context():
             torch.manual_seed(seed)
-            infer, owner = _prepare(config)
+            # Persistent weights and mutable Graph inputs need version
+            # counters for every model, including requests in inference mode.
+            with torch.inference_mode(False), torch.no_grad():
+                infer, owner = _prepare(config)
             # RPU PASSTHROUGH and Graph BUILD/REPLAY/one-shot launches wait for
             # completion before returning (enqueu_batch(wait_finish=true)).
             # The actual torch.rpu namespace has no CUDA-style synchronize().

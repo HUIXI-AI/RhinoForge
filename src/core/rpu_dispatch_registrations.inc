@@ -13,6 +13,8 @@ TORCH_LIBRARY(rpu, m) {
         TORCH_FN(rpu_causal_decoder_planner_cache_identity));
   m.def("qwen3_5_planner_cache_identity(int handle) -> int[]",
         TORCH_FN(rpu_qwen3_5_planner_cache_identity));
+  m.def("qwen3_5_moe_planner_cache_identity(int handle) -> int[]",
+        TORCH_FN(rpu_qwen3_5_moe_planner_cache_identity));
   m.def("qwen3_5_vision_planner_cache_identity(int handle) -> int[]",
         TORCH_FN(rpu_qwen3_5_vision_planner_cache_identity));
   m.def("gemma_planner_cache_identity(int handle) -> int[]",

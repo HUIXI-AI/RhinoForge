@@ -151,7 +151,7 @@ struct Model {
     bool partial_rope_ = false, partial_rope_bound_ = false;
     Tensor cos_ref_{0x100000}, sin_ref_{0x200000};
     bool denoise_loop_weights_ready_ = false, denoise_adarms_tables_ready_ = false;
-    bool expert_w8a16_ = true, full_action_w8a16_ = true, gates_tanh_precomputed_ = false;
+    bool expert_w8a16_ = true, expert_cond_w8a16_ = true, full_action_w8a16_ = true, gates_tanh_precomputed_ = false;
     int64_t suffix_len_ = 31, num_steps_ = 10, layers = 18, h = 1024, is = 3072;
     int64_t nq = 16, nkv = 8, hd = 128, tp = 8, last_chunk = 0, generation = 5;
     int64_t local_q_heads_ = 2;
@@ -211,7 +211,7 @@ int main() {
         if (damage == 2) model.last_chunk = 31;
         if (damage == 3) model.denoise_loop_weights_ready_ = true;
         if (damage == 4) model.denoise_adarms_tables_ready_ = true;
-        if (damage == 5) model.full_action_w8a16_ = false;
+        if (damage == 5) model.expert_cond_w8a16_ = false;
         if (damage == 6) model.layers = 17;
         if (damage == 7) model.cold_config_.skip_adarms_gemv = true;
         if (damage == 8) model.nq = 8;

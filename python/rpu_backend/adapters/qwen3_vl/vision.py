@@ -1466,6 +1466,11 @@ def install_qwen3_vl_vision_for_rpu(
     if _pack_fp16_block_weights and not (
         _use_fp16_vision_weight_banks(
             cfg, w8a16=w8a16, num_cores=num_cores, num_layers=len(vision_model.blocks))
+        or (_allow_graph_blocked_32b and not w8a16 and num_cores == 8
+            and len(vision_model.blocks) == 27 and _is_qwen3_vl_32b_vision_config(cfg)
+            and tuple(getattr(cfg, name, None) for name in (
+                "model_type", "in_channels", "num_position_embeddings"))
+            == ("qwen3_vl", 3, 2304))
         or (_allow_padded_8b and not w8a16 and num_cores == 8
             and len(vision_model.blocks) == 27 and _is_qwen3_vl_8b_vision_config(cfg)
             and tuple(getattr(cfg, name, None) for name in (
@@ -1474,7 +1479,7 @@ def install_qwen3_vl_vision_for_rpu(
     ):
         raise ValueError(
             "Vision weight banks require the exact eight-core 2B/4B FP16 tower "
-            "or gated padded 8B FP16 tower")
+            "or gated padded 8B/legacy32 FP16 tower")
     is_32b_vision = _is_qwen3_vl_32b_vision_config(cfg)
     is_8b_vision = _is_qwen3_vl_8b_vision_config(cfg)
     if is_8b_vision and not (_allow_padded_8b or _allow_runtime_quantized_large):

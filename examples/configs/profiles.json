@@ -2101,7 +2101,73 @@
       "input_envelope": {
         "limits": {}
       },
-      "controlled_gates": []
+      "controlled_gates": [
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_VISION_BATCH_VIEWS",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_VISION_PREP_CACHE",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_DENOISE_STATIC_CONTEXT_CACHE",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_PRECOMPUTE_ADARMS",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_GATED_NO_SUB",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_FUSED_SILU_MUL",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_EXPERT_FUSIONS",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_ADARMS_RESIDENT",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_ALIGNED_KV",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_FULL_W8A16",
+          "value": "0"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_EXPERT_W8A16",
+          "value": "0"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_PACKED_QKV",
+          "value": "0"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_SKIP_ADARMS_GEMV",
+          "value": "0"
+        }
+      ]
     },
     {
       "id": "rhinovla.v3.w8a16.expert.trusted-factory",
@@ -2119,7 +2185,67 @@
       "controlled_gates": [
         {
           "kind": "env",
+          "name": "RPU_RHINOVLA_VISION_BATCH_VIEWS",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_VISION_PREP_CACHE",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_DENOISE_STATIC_CONTEXT_CACHE",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_PRECOMPUTE_ADARMS",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_GATED_NO_SUB",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_FUSED_SILU_MUL",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_EXPERT_FUSIONS",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_ADARMS_RESIDENT",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_ALIGNED_KV",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_FULL_W8A16",
+          "value": "0"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_EXPERT_W8A16",
+          "value": "0"
+        },
+        {
+          "kind": "env",
           "name": "RPU_RHINOVLA_PACKED_QKV",
+          "value": "0"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_SKIP_ADARMS_GEMV",
           "value": "0"
         }
       ]
@@ -2140,8 +2266,18 @@
       "controlled_gates": [
         {
           "kind": "env",
-          "name": "RPU_RHINOVLA_PACKED_QKV",
-          "value": "0"
+          "name": "RPU_RHINOVLA_VISION_BATCH_VIEWS",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_VISION_PREP_CACHE",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_DENOISE_STATIC_CONTEXT_CACHE",
+          "value": "1"
         },
         {
           "kind": "env",
@@ -2150,7 +2286,279 @@
         },
         {
           "kind": "env",
+          "name": "RPU_RHINOVLA_GATED_NO_SUB",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_FUSED_SILU_MUL",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_EXPERT_FUSIONS",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_ADARMS_RESIDENT",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_ALIGNED_KV",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_FULL_W8A16",
+          "value": "0"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_EXPERT_W8A16",
+          "value": "0"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_PACKED_QKV",
+          "value": "0"
+        },
+        {
+          "kind": "env",
           "name": "RPU_RHINOVLA_SKIP_ADARMS_GEMV",
+          "value": "0"
+        }
+      ]
+    },
+    {
+      "id": "rhinovla.v3.w8a16.full-pipeline-high.trusted-factory",
+      "family": "rhinovla",
+      "asset_alias": "rhinovla-controlled",
+      "precision": "w8a16",
+      "component": "vla",
+      "variant": "full-pipeline-w8a16-high-trusted-factory",
+      "example": {
+        "runner_target": "rhinovla"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": [
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_VISION_BATCH_VIEWS",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_VISION_PREP_CACHE",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_DENOISE_STATIC_CONTEXT_CACHE",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_PRECOMPUTE_ADARMS",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_GATED_NO_SUB",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_FUSED_SILU_MUL",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_EXPERT_FUSIONS",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_ADARMS_RESIDENT",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_ALIGNED_KV",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_FULL_W8A16",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_EXPERT_W8A16",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_PACKED_QKV",
+          "value": "0"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_SKIP_ADARMS_GEMV",
+          "value": "0"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_PRECOMPUTE_GATE_TANH",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_VISION_INPUT_CACHE",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_HIGH_PRECISION",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_HIGH_PRECISION_FUSIONS",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_VECTOR_K_NORM",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_VECTOR_Q_NORM",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_PARTIAL_ROPE",
+          "value": "0"
+        }
+      ]
+    },
+    {
+      "id": "rhinovla.v3.w8a16.full-pipeline.trusted-factory",
+      "family": "rhinovla",
+      "asset_alias": "rhinovla-controlled",
+      "precision": "w8a16",
+      "component": "vla",
+      "variant": "full-pipeline-w8a16-trusted-factory",
+      "example": {
+        "runner_target": "rhinovla"
+      },
+      "input_envelope": {
+        "limits": {}
+      },
+      "controlled_gates": [
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_VISION_BATCH_VIEWS",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_VISION_PREP_CACHE",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_DENOISE_STATIC_CONTEXT_CACHE",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_PRECOMPUTE_ADARMS",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_GATED_NO_SUB",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_FUSED_SILU_MUL",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_EXPERT_FUSIONS",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_ADARMS_RESIDENT",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_ALIGNED_KV",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_FULL_W8A16",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_EXPERT_W8A16",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_PACKED_QKV",
+          "value": "0"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_SKIP_ADARMS_GEMV",
+          "value": "0"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_PRECOMPUTE_GATE_TANH",
+          "value": "0"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_VISION_INPUT_CACHE",
+          "value": "1"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_HIGH_PRECISION",
+          "value": "0"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_HIGH_PRECISION_FUSIONS",
+          "value": "0"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_VECTOR_K_NORM",
+          "value": "0"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_VECTOR_Q_NORM",
+          "value": "0"
+        },
+        {
+          "kind": "env",
+          "name": "RPU_RHINOVLA_PARTIAL_ROPE",
           "value": "0"
         }
       ]

@@ -588,9 +588,8 @@ def _projection_scale(linear, name):
                     f"Qwen3.5 W4A16 projection {name} scale shape "
                     f"{tuple(scale.shape)} incompatible with weight "
                     f"{tuple(weight.shape)}; expected [K/group_size, {n_out}]")
-        # Installation starts after the text stack is moved to RPU.  Scale
-        # swizzling is a controller-layout transform and must stay on CPU;
-        # only its finalized payload is uploaded below.
+        # Sources may already be on RPU or remain on CPU for legacy direct
+        # installation. Scale layout is a CPU transform in both cases.
         return _as_channel_first(scale.detach().to("cpu").contiguous())
     if weight.dtype != torch.float16:
         raise UnsupportedModelError(
@@ -1007,6 +1006,7 @@ def _install_qwen3_5_text_for_rpu_impl(
     import torch
     from rpu_backend.runtime.weights import (
         convert_linear_weights_inplace, transform_linear_weight, pad_decoder_mlp_projection,
+        _release_cpu_weight_pages,
     )
 
     inner = text_model
@@ -1081,6 +1081,9 @@ def _install_qwen3_5_text_for_rpu_impl(
     from rpu_backend.runtime.topology import decoder_mlp_intermediate_size
     mlp_physical_size = decoder_mlp_intermediate_size(tc.intermediate_size, mlp_cores)
     legacy_text = validate_legacy_text_profile(config)
+    if legacy_text and any(parameter.device.type != "cpu" for parameter in inner.parameters()):
+        raise UnsupportedModelError(
+            "Qwen3.8-27B installation requires original CPU source weights")
     # REVERT #1 (attn_tp → 8-core + KV replication): full-attn runs on all 8 cores
     # like the phase1-decode known-good. Replicate each KV head rep=8//nkv times so
     # nkv_eff==NUM_CORES (one whole KV head/core, per-core norm/rope path). GDN is NOT
@@ -1107,6 +1110,14 @@ def _install_qwen3_5_text_for_rpu_impl(
                     "in_proj_a", "out_proj"})
     free_raw_hf_weights = rpu_env_bool(
         "RPU_QWEN3_5_FREE_HF_WEIGHTS", default=True)
+    if legacy_text:
+        # Keep raw projections on CPU. Every large final projection is already
+        # transformed on CPU and uploaded by _prep_weight/_scale_to_rpu below.
+        # Only embedding and norm arithmetic need their original RPU storage.
+        for name, child in inner.named_children():
+            if name != "layers":
+                child.to("rpu")
+        _release_cpu_weight_pages()
 
     # ── GDN mixer weight prep for the 8-core (2-head/core) fused mixer ──
     # in_proj is 8-core col-partition: each core's contiguous output slice must
@@ -1236,6 +1247,14 @@ def _install_qwen3_5_text_for_rpu_impl(
                 int(tc.hidden_size)
             )
     for i, layer in enumerate(inner.layers):
+        if legacy_text:
+            layer.input_layernorm.to("rpu")
+            layer.post_attention_layernorm.to("rpu")
+            if is_full[i]:
+                layer.self_attn.q_norm.to("rpu")
+                layer.self_attn.k_norm.to("rpu")
+            else:
+                layer.linear_attn.norm.to("rpu")
         if not is_full[i]:
             # GDN layer: standard post_norm + MLP half collected like every
             # layer; the token mixer weights go into the GDN lists below.
@@ -1298,6 +1317,8 @@ def _install_qwen3_5_text_for_rpu_impl(
             del _qkvw, _qkvs
             if free_raw_hf_weights:
                 _drop_raw_hf_text_layer_weights(layer, False)
+            if legacy_text:
+                _release_cpu_weight_pages()
             continue
         for lst in (g_z, g_out, g_alog, g_dt, g_nrm,
                     g_q, g_k, g_v, g_cq, g_ck, g_cv, g_b_bg, g_a_bg):
@@ -1375,6 +1396,8 @@ def _install_qwen3_5_text_for_rpu_impl(
         del query_raw, gate_raw, qg_scale, k_scale, v_scale
         if free_raw_hf_weights:
             _drop_raw_hf_text_layer_weights(layer, True)
+        if legacy_text:
+            _release_cpu_weight_pages()
 
     # M-RoPE interleaved + partial rotary. The cos/sin tables contain exactly
     # rotary_dim/2 columns; the partial kernels receive rotary_dim explicitly.

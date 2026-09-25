@@ -39,7 +39,7 @@ def test_pi_cold_geometry_preserves_cores_and_pair_without_mutating_config(helpe
 
 
 @pytest.mark.parametrize("update,match", [
-    ({"input": {"noise": "/tmp/noise.pt"}}, "unsupported keys"),
+    ({"input": {"noise": ""}}, "noise"),
     ({"input": {"num_steps": 9}}, "num_steps=10"),
     ({"run": {"hwperf": True}}, "hardware trace"),
     ({"run": {"runs": 0}}, "runs"),
@@ -79,7 +79,8 @@ def test_pi_component_override_and_generic_admission(helpers):
     ("w8a16_prefill_w8a8_action_nvfp4", 8, "w8_prefill_a8_action_nvfp4"),
     ("fp16", 4, None), ("w8a16", 6, None),
 ])
-def test_pi_public_policy_precision_and_lifetime(helpers, monkeypatch, tmp_path, precision, cores, expected):
+@pytest.mark.parametrize("fixed_noise", [False, True])
+def test_pi_public_policy_precision_and_lifetime(helpers, monkeypatch, tmp_path, precision, cores, expected, fixed_noise):
     pi, _ = helpers
     import rpu_backend.api as api
 
@@ -98,6 +99,10 @@ def test_pi_public_policy_precision_and_lifetime(helpers, monkeypatch, tmp_path,
     path = tmp_path / "batch.pt"
     torch.save(batch, path)
     config["input"]["batch"] = str(path)
+    if fixed_noise:
+        noise = torch.randn(1, 50, 32)
+        torch.save(noise, tmp_path / "noise.pt")
+        config["input"]["noise"] = str(tmp_path / "noise.pt")
     calls = []
     policy = SimpleNamespace(_lerobot_policy=SimpleNamespace(config=SimpleNamespace(
         image_features=images, chunk_size=50, max_action_dim=32, num_inference_steps=10)))
@@ -118,8 +123,13 @@ def test_pi_public_policy_precision_and_lifetime(helpers, monkeypatch, tmp_path,
     infer, owner = pi.prepare_pi05(config)
     selected = calls[0][1]["optimized_profile"]
     assert (selected["precision"] if selected else None) == expected
-    assert calls[2] == ("prepare", {"num_steps": 10, "precompute_adarms": cores == 8})
+    prepared_kwargs = dict(calls[2][1])
+    if fixed_noise:
+        assert torch.equal(prepared_kwargs.pop("noise"), noise)
+    assert prepared_kwargs == {"num_steps": 10, "precompute_adarms": cores == 8}
     assert infer().shape == (1, 50, 32)
+    if fixed_noise:
+        assert torch.equal(calls[-1][1]["noise"], noise)
     owner.close()
     owner.close()
     assert calls.count(("close",)) == 1
@@ -416,3 +426,59 @@ def test_rhinovla_ignored_or_mismatched_quantization_closes_factory_owner(helper
     with pytest.raises(ValueError, match="RhinoVLA"):
         policies.prepare_policy(config)
     assert calls == ["close"]
+
+
+@pytest.mark.parametrize("filename,full", [("fp16.toml", None), ("w8a16.toml", False),
+                                          ("full_expert_w8a16.toml", True)])
+def test_rhinovla_v3_templates_keep_cold_optimizations_without_widening_precision(monkeypatch, filename, full):
+    root = Path(__file__).resolve().parents[1]
+    monkeypatch.syspath_prepend(str(root / "examples"))
+    common = importlib.import_module("_common")
+    config = common.load_config(root / "examples/configs/rhinovla/v3" / filename)
+    gates = config["example"]["opt_in"]
+    for name in ("VISION_BATCH_VIEWS", "VISION_PREP_CACHE", "DENOISE_STATIC_CONTEXT_CACHE",
+                 "PRECOMPUTE_ADARMS", "GATED_NO_SUB", "FUSED_SILU_MUL", "EXPERT_FUSIONS",
+                 "ADARMS_RESIDENT", "ALIGNED_KV"):
+        assert gates["RPU_RHINOVLA_" + name] == "1"
+    for name in ("FULL_W8A16", "EXPERT_W8A16", "PACKED_QKV", "SKIP_ADARMS_GEMV"):
+        assert gates["RPU_RHINOVLA_" + name] == "0"
+    if full is None:
+        assert "expert_w8a16" not in config["input"] and "full_w8a16" not in config["input"]
+    else:
+        assert config["input"]["expert_w8a16"] is True
+        assert config["input"]["full_w8a16"] is full
+
+
+@pytest.mark.parametrize("conflict", [False, True])
+def test_pi_allocator_profile_is_bound_before_torch_import(helpers, monkeypatch, conflict):
+    import builtins
+    pi, _ = helpers
+    runner = importlib.import_module("_runner")
+    config = pi_config()
+    for name in ("MIMALLOC_PURGE_DELAY", "MIMALLOC_ARENA_PURGE_MULT"):
+        monkeypatch.delenv(name, raising=False)
+    if conflict:
+        monkeypatch.setenv("MIMALLOC_PURGE_DELAY", "0")
+    imported = []
+    real_import = builtins.__import__
+
+    class ReachedTorch(Exception):
+        pass
+
+    def observe_import(name, *args, **kwargs):
+        if name == "torch":
+            imported.append(name)
+            assert os.environ["MIMALLOC_PURGE_DELAY"] == "1000"
+            assert os.environ["MIMALLOC_ARENA_PURGE_MULT"] == "0"
+            raise ReachedTorch
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", observe_import)
+    if conflict:
+        with pytest.raises(ValueError, match="MIMALLOC_PURGE_DELAY"):
+            runner.run(config)
+        assert not imported
+    else:
+        with pytest.raises(ReachedTorch):
+            runner.run(config)
+        assert imported == ["torch"]

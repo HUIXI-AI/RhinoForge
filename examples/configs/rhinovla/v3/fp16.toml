@@ -6,6 +6,21 @@ registry_alias = "rhinovla-controlled"
 target = "rhinovla"
 dtype = "fp16"
 
+[example.opt_in]
+RPU_RHINOVLA_VISION_BATCH_VIEWS = "1"
+RPU_RHINOVLA_VISION_PREP_CACHE = "1"
+RPU_RHINOVLA_DENOISE_STATIC_CONTEXT_CACHE = "1"
+RPU_RHINOVLA_PRECOMPUTE_ADARMS = "1"
+RPU_RHINOVLA_GATED_NO_SUB = "1"
+RPU_RHINOVLA_FUSED_SILU_MUL = "1"
+RPU_RHINOVLA_EXPERT_FUSIONS = "1"
+RPU_RHINOVLA_ADARMS_RESIDENT = "1"
+RPU_RHINOVLA_ALIGNED_KV = "1"
+RPU_RHINOVLA_FULL_W8A16 = "0"
+RPU_RHINOVLA_EXPERT_W8A16 = "0"
+RPU_RHINOVLA_PACKED_QKV = "0"
+RPU_RHINOVLA_SKIP_ADARMS_GEMV = "0"
+
 [input]
 checkpoint = "/path/to/rhinovla-v3/checkpoint"
 runtime_factory = "your_package.rhinovla_v3:create_runtime"

@@ -49,9 +49,23 @@ remove superseded copies and update script defaults, documentation and tests
 when reorganizing paths. Model TOML files belong in their family directories.
 The example catalog binds configuration identity and input settings; it does
 not expand the model's runtime admission or certify performance or quality.
+For performance comparisons, use the actual example command and bind the
+checkpoint, precision, input, execution settings, and runtime assets. For
+all example targets, keep persistent construction outside inference mode and
+apply the selected mode only to inference; see
+[host execution settings](../docs/runtime_config.md#host-execution-settings).
+Count retained Graph queues together with temporary capture and first-call
+validation queues when checking a fixed Graph arena pool. A successful replay
+alone does not cover the peak during cold construction.
+For Pi0.5 fixed-input comparisons, use the public `input.noise` field for both
+Graph preparation and inference; retain default-input failures separately.
+See the [policy API](../docs/api_reference.md#policy-apis) and
+[model family map](synthesis/model-family-map.md#pi05).
 When adding quantized examples, trace the checkpoint loader and installed
 projection storage, not just the `dtype` label. Document the component scope
-and retain its admission controls. For caller factories, bind precision inputs,
+and retain its admission controls. A controlled planning bound is not a
+certification: bind the exact recipe, input, numerical and lifetime evidence
+before widening its admitted scope. For caller factories, bind precision inputs,
 reject conflicting factory settings and verify the installed model before
 inference. See [quantization](../docs/quantization.md).
 

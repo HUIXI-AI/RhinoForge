@@ -1112,27 +1112,30 @@ class HyVlaRunner:
         prev = self._prefix_key
         if not (prev is not None and prev[0] == n_img
                 and torch.equal(prev[1], lang_tokens)):
-            c, tok, g, D = self.w.cfg, self.w.tok_emb, self.w.cfg.grid, self.w.cfg.proj_dim
-            rows = g + 1                       # 每行 7 个 patch + 1 个 split
-            per = g * rows                     # 每图 56 行
-            lang = tok[lang_tokens.long()]
-            # prefix 骨架直接采用其消费者所需的 FP16，避免每帧再转换常量部分。
-            # 逐元素转换不依赖这些行是在拼接前还是拼接后转换。
-            buf = torch.empty((1, 2 + n_img * (per + 2) + lang.shape[0], D),
-                              dtype=torch.float16)
-            buf[0, 0] = tok[c.tok_bos]
-            buf[0, 1] = tok[c.tok_user]
-            slots = []
-            for i in range(n_img):
-                base = 2 + i * (per + 2)
-                buf[0, base] = tok[c.tok_vision_start]
-                blk = buf[0, base + 1: base + 1 + per].view(g, rows, D)
-                blk[:, g] = tok[c.tok_vision_split]     # 每行末尾的 split
-                slots.append(blk[:, :g])                # ← 逐帧只写这个视图
-                buf[0, base + 1 + per] = tok[c.tok_vision_end]
-            buf[0, 2 + n_img * (per + 2):] = lang
-            self._prefix_key = (n_img, lang_tokens.clone())
-            self._prefix_val = (buf, slots, per)
+            # Keep the cached host template and its mutable views usable when
+            # later requests switch from inference_mode to no_grad.
+            with torch.inference_mode(False), torch.no_grad():
+                c, tok, g, D = self.w.cfg, self.w.tok_emb, self.w.cfg.grid, self.w.cfg.proj_dim
+                rows = g + 1                       # 每行 7 个 patch + 1 个 split
+                per = g * rows                     # 每图 56 行
+                lang = tok[lang_tokens.long()]
+                # prefix 骨架直接采用其消费者所需的 FP16，避免每帧再转换常量部分。
+                # 逐元素转换不依赖这些行是在拼接前还是拼接后转换。
+                buf = torch.empty((1, 2 + n_img * (per + 2) + lang.shape[0], D),
+                                  dtype=torch.float16)
+                buf[0, 0] = tok[c.tok_bos]
+                buf[0, 1] = tok[c.tok_user]
+                slots = []
+                for i in range(n_img):
+                    base = 2 + i * (per + 2)
+                    buf[0, base] = tok[c.tok_vision_start]
+                    blk = buf[0, base + 1: base + 1 + per].view(g, rows, D)
+                    blk[:, g] = tok[c.tok_vision_split]     # 每行末尾的 split
+                    slots.append(blk[:, :g])                # ← 逐帧只写这个视图
+                    buf[0, base + 1 + per] = tok[c.tok_vision_end]
+                buf[0, 2 + n_img * (per + 2):] = lang
+                self._prefix_key = (n_img, lang_tokens.clone())
+                self._prefix_val = (buf, slots, per)
         return self._prefix_val
 
     # ── 三段 ──────────────────────────────────────────────────────────────

@@ -24,4 +24,5 @@ seed = 0
 [rpu_execution]
 
 [rpu_execution.prefill]
+fast_replay = true
 chunk_size = "auto"

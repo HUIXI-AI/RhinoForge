@@ -31,7 +31,7 @@ between models or builds. See [performance measurement](performance.md).
 
 ## Numerical evaluation
 
-**Policy correction (2026-09-25, user decision):** use the three layers below.
+Use the three layers below for numerical evaluation.
 Inherited floating-point cutoffs such as `MSE <= 1e-4`, `max_abs <= 0.05`,
 their row-wise variants, and fixed cosine floors are not model acceptance
 gates. This supersedes older instructions to preserve those profile-local
@@ -71,7 +71,7 @@ Operator unit tests against a specified mathematical reference are distinct;
 their tolerances are not transferable end-to-end model-quality budgets.
 
 These methods follow the distinction visible in upstream tools, not a shared
-upstream numerical threshold (sources checked 2026-09-25):
+upstream numerical threshold:
 
 - [TensorRT accuracy guidance](https://docs.nvidia.com/deeplearning/tensorrt/latest/inference-library/accuracy-considerations.html)
   discusses precision-dependent rounding, overflow and sensitive operations;

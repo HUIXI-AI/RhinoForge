@@ -97,9 +97,9 @@ to change allocator mode.
 - The legacy 32B W8A16 path remains Source-only and controlled/uncertified:
   only Text7 is INT8; the head, embedding and Vision stay FP16. Its independent
   TP8 planning bounds (336 physical prefill rows, chunk at most 64) do not
-  certify that entire length range or set KV capacity. The public single-image
-  P78/D4 run has bounded CLI, same-teacher CPU numerical and Graph lifetime
-  evidence. Full-range, task-quality and performance certification remain
+  certify that entire length range or set KV capacity. Validate the public CLI,
+  same-teacher CPU numerical comparisons and Graph lifetime for the actual
+  input envelope. Full-range, task-quality and performance certification remain
   separate gates; the explicit opt-in remains required. Runtime-quantized 32B
   is a distinct recipe and cannot supply this legacy profile's evidence.
   [Qwen3-VL configurations](../../examples/configs/qwen3_vl/README.md)

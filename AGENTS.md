@@ -46,7 +46,7 @@ and [runtime configuration](docs/runtime_config.md) for supported controls.
   path is confirmed, record ordinary accumulated numerical differences instead of
   escalating them into additional gates.
 
-**Numerical policy correction (2026-09-25, user decision):** follow the
+**Numerical evaluation policy:** follow the
 three-layer policy in [model validation](docs/validation_policy.md#numerical-evaluation).
 Inherited fixed MSE/max-abs/row-error and cosine cutoffs are diagnostics, not
 model acceptance gates, even when an older profile says to preserve them.

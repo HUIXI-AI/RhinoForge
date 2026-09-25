@@ -51,7 +51,7 @@ python -m rpu_backend.quant.convert_qwen3_vl \
 
 32B 的 [兼容 W8 配置](vl/32b/w8a16_legacy.toml) 与 [runtime W8 配置](vl/32b/w8a16.toml) 是不同 checkpoint 合同。兼容格式仅量化 Text7，head、embedding 和 Vision 保持 FP16，仍要求 `example.opt_in.QWEN3_VL_32B_ALLOW_GRAPH_BLOCKED="1"`。
 该精确 TP8 格式使用独立的受控规划边界：prefill 物理执行长度上限 336、chunk 上限 64；336 不是 KV 容量或已验证的完整序列范围。逐层权重 bank 和冷态 Graph arena 准备保持原精度与所有权检查，不能借 runtime W8/W4 的 envelope 或权重替代该格式。
-公开单图配置已完成一次 P78、D4、W1/R2 的真实 CLI、同 teacher 链 CPU 数值对照及 Graph 生命周期检查。这个有界结果不构成完整长度、任务质量或性能认证；Source-only / controlled / uncertified 状态和显式 opt-in 保持不变。
+该配置仍需按实际输入范围验证公开 CLI、相同 teacher 链下的 CPU 数值对照及 Graph 生命周期。规划边界不构成完整长度、任务质量或性能认证；Source-only / controlled / uncertified 状态和显式 opt-in 保持不变。
 
 实际执行在 processor 和权重加载前绑定 checkpoint 元数据的尺寸与精度范围。
 FP16 配置不能静默加载量化模型，legacy32 配置也不能借 runtime W8 权重绕过
@@ -63,7 +63,7 @@ FP16 配置不能静默加载量化模型，legacy32 配置也不能借 runtime 
 |---|---|
 | `rpu_execution.model.num_cores` | 冷态拓扑，必须匹配具体模型和精度 profile。 |
 | `prefill.linear_acc32` / `vision.linear_acc32` | 默认 ACC16，`true` 选择 ACC32；prefill 精度同时用于文本 decode。 |
-| `prefill.fast_replay` | 2B/4B/8B 的文本和图文 FP16 模板显式设为 `true`，与性能脚本一致；API 省略此字段仍默认关闭。仅在原生 owner/Graph 检查满足时复用 prefill，没有独立 `vision.fast_replay`。 |
+| `prefill.fast_replay` | 2B/4B/8B 的文本和图文 FP16 模板显式设为 `true`；API 省略此字段仍默认关闭。仅在原生 owner/Graph 检查满足时复用 prefill，没有独立 `vision.fast_replay`。 |
 | `prefill.chunk_size` | 默认 `"auto"`；显式值须满足该模型 16 倍数及容量检查。 |
 | `prefill.padding_budget` | planner 可搜索的额外 padding 预算，默认 64；不改变真实 token。 |
 | `prefill.padding_rows` | `"auto"` 或精确非负整数；整数与 budget 互斥。 |

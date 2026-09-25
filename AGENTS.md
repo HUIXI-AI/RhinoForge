@@ -46,6 +46,16 @@ and [runtime configuration](docs/runtime_config.md) for supported controls.
   path is confirmed, record ordinary accumulated numerical differences instead of
   escalating them into additional gates.
 
+**Numerical evaluation policy:** follow the
+three-layer policy in [model validation](docs/validation_policy.md#numerical-evaluation).
+Inherited fixed MSE/max-abs/row-error and cosine cutoffs are diagnostics, not
+model acceptance gates, even when an older profile says to preserve them.
+Do not replace them with a new arbitrary or renamed composite threshold.
+Keep shape/dtype/finite, correct routes, KV/cache/Graph, artifact identity and
+explicit deterministic replay contracts. Compare matching reference semantics
+and preserve independently specified task-quality requirements. Runtime PASS
+and numerical observations do not automatically certify task quality or support.
+
 ## Required engineering contracts
 
 - Treat support as an exact checkpoint, precision, input-envelope, execution,
@@ -80,8 +90,9 @@ and [runtime configuration](docs/runtime_config.md) for supported controls.
   helpers before adding abstractions or dependencies.
 - Keep profile guards, cache ownership, teardown, and error paths explicit.
 - Run board-free checks before board validation. A port is not complete until
-  the exact profile passes the numerical, warmup, Graph-lifecycle, input-
-  envelope, and end-to-end gates in [model porting](docs/model_porting.md).
+  the exact profile satisfies the current numerical policy, warmup,
+  Graph-lifecycle, input-envelope, and end-to-end requirements in
+  [model porting](docs/model_porting.md).
   An ordinary existing-model fix does not start a full port or certification run.
 - Update public documentation and [the knowledge workflow](knowledge/WORKFLOWS.md)
   when a public contract changes.

@@ -1712,18 +1712,22 @@ def install_qwen3_5_vision_for_rpu(
                     )
                     validate_dense_9b_vision_weights(vision_model, config)
                     validate_cold_weight_dtype(vision_model, fp16=True)
-            handle = _install_qwen3_5_vision_for_rpu_impl(
-                model,
-                vision_config=vision_config,
-                execution_config=execution_config,
-                resolved_options=resolved_options,
-                max_hw=max_hw,
-                max_seq_len=max_seq_len,
-                num_cores=num_cores,
-                _graph_runtime_policy=_graph_runtime_policy,
-                _cold_numeric_opt_in=_cold_numeric_opt_in,
-                _prepared_profile=prepared_profile,
-            )
+            # Vision may install lazily inside an inference-mode request.
+            # Its position backing and cache buffers must still support
+            # in-place updates when a later request uses no_grad instead.
+            with torch.inference_mode(False), torch.no_grad():
+                handle = _install_qwen3_5_vision_for_rpu_impl(
+                    model,
+                    vision_config=vision_config,
+                    execution_config=execution_config,
+                    resolved_options=resolved_options,
+                    max_hw=max_hw,
+                    max_seq_len=max_seq_len,
+                    num_cores=num_cores,
+                    _graph_runtime_policy=_graph_runtime_policy,
+                    _cold_numeric_opt_in=_cold_numeric_opt_in,
+                    _prepared_profile=prepared_profile,
+                )
             if _text_bridge is not None:
                 state = _validate_qwen3_5_moe_vision_text_bridge(
                     _text_bridge, model, require_vision_policy=True

@@ -184,3 +184,40 @@ def test_returned_output_has_independent_storage_and_rejects_nonfinite():
         runner._cpu_output(torch.tensor([float("nan")]))
     with pytest.raises(ValueError, match="NaN/Inf"):
         runner._cpu_output({"score": float("inf")})
+
+
+@pytest.mark.parametrize("inference_mode", [True, False])
+@pytest.mark.parametrize("target", ["pi05", "qwen3", "internvla"])
+def test_setup_keeps_versioned_storage_and_request_mode(monkeypatch, tmp_path, inference_mode, target):
+    runner = load("pi_setup_runner_test", "examples/_runner.py")
+    performance = load("pi_setup_performance_test", "python/rpu_backend/runtime/performance.py")
+    common = ModuleType("_common")
+    common.config_metadata = lambda config: config["example"]
+    monkeypatch.setitem(sys.modules, "_common", common)
+    monkeypatch.setitem(sys.modules, "rpu_backend", ModuleType("rpu_backend"))
+    monkeypatch.setitem(sys.modules, "rpu_backend.runtime.performance", performance)
+    monkeypatch.setattr(torch, "rpu", SimpleNamespace(
+        _is_in_bad_fork=lambda: False, manual_seed_all=lambda seed: None), raising=False)
+    modes = []
+    owner = SimpleNamespace(close=Mock())
+
+    def prepare(_config):
+        assert not torch.is_grad_enabled()
+        weight = torch.ones(2)
+        assert not weight.is_inference()
+        version = weight._version
+        weight.add_(1)
+        assert weight._version == version + 1
+        def infer():
+            modes.append(torch.is_inference_mode_enabled())
+            assert not torch.is_grad_enabled()
+            return weight.clone()
+        return infer, owner
+
+    monkeypatch.setattr(runner, "_prepare", prepare)
+    config = {"example": {"target": target, "profile_id": target + ".test"}, "input": {},
+              "run": {"warmup": 1, "runs": 2, "output_dir": str(tmp_path),
+                      "inference_mode": inference_mode}}
+    assert runner.run(config) == 0
+    assert modes == [inference_mode] * 3
+    owner.close.assert_called_once()

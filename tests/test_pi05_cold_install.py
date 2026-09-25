@@ -30,6 +30,8 @@ def _policy():
 
 @pytest.fixture(autouse=True)
 def isolated_process(monkeypatch):
+    from rpu_backend.graph import GraphRuntimePolicy
+    monkeypatch.setattr(GraphRuntimePolicy, "prepare_arenas", lambda self: True)
     monkeypatch.setitem(sys.modules, patches.__name__, patches)
     monkeypatch.setattr(pi05, "patches", patches, raising=False)
     monkeypatch.setattr(causal_lm, "_LIVE_REF", None)
@@ -169,6 +171,7 @@ def test_pi_graph_policy_uses_generic_sync_default(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
     policy = pi05._pi05_graph_runtime_policy()
+    assert policy.graph_arena_count == 5
     assert policy.fmb_fast_replay is True
     assert policy.fast_replay_skip_sync is True
     assert policy.fmb_deep_fast_replay is True
@@ -185,3 +188,27 @@ def test_pi_graph_policy_uses_generic_sync_default(monkeypatch):
     assert disabled.fmb_fast_replay is False
     assert disabled.fast_replay_skip_sync is False
     assert disabled.fmb_deep_fast_replay is False
+
+
+@pytest.mark.parametrize("mode", ["reject", "raise"])
+def test_pi_arena_failure_releases_claim_before_any_weight_mutation(monkeypatch, mode):
+    from rpu_backend.graph import GraphRuntimePolicy
+    policy = _policy()
+    adapter = pi05.Pi05Adapter(policy)
+    events = []
+    monkeypatch.setattr(pi05, "_preflight_pi05_cold_model", lambda *a, **k: None)
+    monkeypatch.setattr(pi05, "_claim_live_instance", lambda owner: events.append("claim"))
+    monkeypatch.setattr(pi05, "_release_live_instance", lambda owner: events.append("release"))
+    monkeypatch.setattr(torch.rpu, "set_caching_allocator", lambda enabled: events.append("allocator"))
+    def reserve(plan):
+        assert plan.graph_arena_count == 5
+        assert not hasattr(policy, "_rpu_swizzle_started")
+        events.append("reserve")
+        if mode == "raise":
+            raise RuntimeError("Graph arena allocation failed")
+        return False
+    monkeypatch.setattr(GraphRuntimePolicy, "prepare_arenas", reserve)
+    with pytest.raises((RuntimeError, pi05.RPUBackendError), match="[Gg]raph arena"):
+        adapter.to_rpu()
+    assert events == ["claim", "allocator", "reserve", "release"]
+    assert not hasattr(policy, "_rpu_swizzle_started")

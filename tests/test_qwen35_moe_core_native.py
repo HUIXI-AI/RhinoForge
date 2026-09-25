@@ -17,6 +17,18 @@ INCLUDE_ROOT = (
 )
 
 
+def test_planner_cache_identity_is_registered_for_python_admission():
+    """The first prefill queries this dispatcher ABI before executing kernels."""
+    registrations = (ROOT / "src/core/rpu_dispatch_registrations.inc").read_text(
+        encoding="utf-8"
+    )
+    assert re.search(
+        r'm\.def\("qwen3_5_moe_planner_cache_identity\(int handle\) -> int\[\]",'
+        r'\s*TORCH_FN\(rpu_qwen3_5_moe_planner_cache_identity\)\);',
+        registrations,
+    ), "MoE planner cache identity must be exported through torch.ops.rpu"
+
+
 def _masked(source: str) -> str:
     return re.sub(
         r'//[^\n]*|/\*[\s\S]*?\*/|"(?:\\.|[^"\\])*"',

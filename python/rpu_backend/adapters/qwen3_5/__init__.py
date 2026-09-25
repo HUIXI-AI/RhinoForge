@@ -951,7 +951,11 @@ class Qwen3_5Adapter:
                 validate_cold_weight_dtype(model, fp16=True)
             inner = getattr(model.model, "language_model", model.model)
             _out_emb = model.get_output_embeddings()
-            inner.to("rpu")
+            # Legacy direct allocations may retain physical pages after the
+            # source tensor dies. Upload only the installer's finalized large
+            # projections instead of creating a second raw device copy.
+            if not is_legacy_text:
+                inner.to("rpu")
 
             # ── Step A: text backbone (swizzle + create + set_weights) ──
             handle = install_qwen3_5_text_for_rpu(

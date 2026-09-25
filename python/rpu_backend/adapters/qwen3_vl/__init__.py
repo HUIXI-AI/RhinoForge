@@ -1213,21 +1213,37 @@ class Qwen3VLAdapter:
         requested = text_execution.get("prefill", {}).get(
             "chunk_size", "auto"
         )
-        if isinstance(requested, int):
-            text = config.text_config
-            if runtime_quant_large and text.hidden_size == 5120:
-                from .text import _RUNTIME_QUANTIZED_32B_ENVELOPE
-                env = _RUNTIME_QUANTIZED_32B_ENVELOPE
-            else:
+        # Auto planning needs an admitted envelope too. Reject before the
+        # public loader stages weights, rather than during handle installation.
+        text = config.text_config
+        if _is_qwen3_vl_32b_w8a16_config(config):
+            # The exact controlled legacy recipe owns a separate narrow envelope.
+            # _check_profile retains its existing explicit opt-in and precision gate.
+            _check_profile(config)
+            from .text import _LEGACY_32B_CONTROLLED_ENVELOPE
+            env = _LEGACY_32B_CONTROLLED_ENVELOPE
+        elif runtime_quant_large and text.hidden_size == 5120:
+            from .text import _RUNTIME_QUANTIZED_32B_ENVELOPE
+            env = _RUNTIME_QUANTIZED_32B_ENVELOPE
+        else:
+            try:
                 env = lookup_causal_decoder(
                     QWEN3_VL_TEXT_ARCH,
                     int(text.num_hidden_layers),
                     int(text.hidden_size),
                 )
+            except RuntimeError as exc:
+                raise UnsupportedModelError(
+                    "Qwen3-VL has no certified chunk envelope for text "
+                    f"geometry ({text.num_hidden_layers}, {text.hidden_size}). "
+                    "A controlled-evaluation opt-in does not supply an envelope. "
+                    "Refusing before loading model weights."
+                ) from exc
+        if isinstance(requested, int):
             if requested > env.chunk:
                 raise UnsupportedModelError(
                     f"Qwen3-VL prefill chunk_size={requested} exceeds this "
-                    f"profile's certified ceiling {env.chunk}; max certified "
+                    f"profile's planning ceiling {env.chunk}; maximum prefill "
                     f"execution length is {env.max_kv_len}. Refusing before "
                     "loading model weights."
                 )
@@ -1815,8 +1831,9 @@ class Qwen3VLAdapter:
             runtime_quant_large = runtime_quant and text_cfg.hidden_size in (4096, 5120)
             graph_cache_max_entries = (
                 _QWEN3_VL_32B_RUNTIME_W8_GRAPH_ENTRIES
-                if runtime_quant and text_cfg.hidden_size == 5120
-                and cfg.quant_config["method"] == "w8a16" else None
+                if is_graph_blocked_32b_w8a16 or (runtime_quant
+                and text_cfg.hidden_size == 5120
+                and cfg.quant_config["method"] == "w8a16") else None
             )
             text_model = self.model.model.language_model
             vision_model = self.model.model.visual
@@ -1887,7 +1904,7 @@ class Qwen3VLAdapter:
                         graph_arena_count=3 * graph_cache_max_entries + 1)
                     if not arena_policy.prepare_arenas():
                         raise RPUBackendError(
-                            "Qwen3-VL-32B runtime W8 requires cold SDK graph arenas")
+                            "Qwen3-VL-32B W8 requires cold SDK graph arenas")
                     self._graph_arena_policy = arena_policy
             except BaseException:
                 _release_live_instance(self.model)
@@ -1913,6 +1930,10 @@ class Qwen3VLAdapter:
                 )
 
                 _materialize_staged_w8a16_imagetext_for_rpu(self.model)
+            elif is_graph_blocked_32b_w8a16:
+                from rpu_backend.quant.load import _move_materialized_decoder_for_rpu
+                _move_materialized_decoder_for_rpu(
+                    self.model, dtype=torch.int8, per_layer=True)
             elif is_runtime_align_4b_w8a16:
                 from rpu_backend.quant.load import (
                     _move_materialized_w8a16_decoder_for_rpu,
@@ -2020,7 +2041,7 @@ class Qwen3VLAdapter:
                 **({"_allow_runtime_quantized_large": True} if runtime_quant_large else {}),
                 **({"w8a16": True} if runtime_align_quantized else {}),
                 **({"_pack_fp16_block_weights": True}
-                   if use_fp16_vision_weight_banks or use_8b_fp16_weight_banks else {}),
+                   if use_fp16_vision_weight_banks or use_8b_fp16_weight_banks or is_graph_blocked_32b_w8a16 else {}),
                 **({"num_cores": 4} if topology is not None else {}),
                 **({"_graph_cache_max_entries": graph_cache_max_entries}
                    if graph_cache_max_entries is not None else {}),
@@ -2044,6 +2065,7 @@ class Qwen3VLAdapter:
                 enable_deepstack=True,
                 execution_config=self._text_execution,
                 **({"runtime_align_w8a16": True} if is_runtime_align_4b_w8a16 else {}),
+                **({"_legacy_32b_w8a16": True} if is_graph_blocked_32b_w8a16 else {}),
                 **({"_runtime_quantized_32b": True}
                    if runtime_quant_large and text_cfg.hidden_size == 5120 else {}),
                 **({"_graph_cache_max_entries": graph_cache_max_entries}

@@ -122,12 +122,17 @@ def official_runtime_factory(config, *, rpu_execution=None):
     """
     if not isinstance(config, Mapping):
         raise TypeError("RhinoVLA official factory config must be a mapping")
-    allowed = {"model_root", "checkpoint", "qin", "steps", "trust_model_code"}
+    allowed = {"model_root", "checkpoint", "qin", "steps", "trust_model_code",
+               "expert_w8a16", "full_w8a16"}
     if set(config) - allowed:
         raise ValueError(f"unsupported RhinoVLA official factory keys: {sorted(set(config) - allowed)}")
     if config.get("trust_model_code") is not True:
         raise PermissionError("official model code requires explicit trust_model_code=True")
     _reject_unsafe_diagnostics()
+    from .runtime import resolve_rhinovla_quantization
+    expert_w8a16, full_expert_w8a16, _ = resolve_rhinovla_quantization(
+        expert_w8a16=config.get("expert_w8a16"),
+        full_expert_w8a16=config.get("full_w8a16"))
     from .checkpoint import _path_argument
     from .action import denoise_schedule
     import torch
@@ -172,6 +177,7 @@ def official_runtime_factory(config, *, rpu_execution=None):
         qin=qin, prefix_len=int(ids.shape[1]), steps=steps,
         model=model, action_bundle=bundle, flow_direction="official_descending",
         rpu_execution=rpu_execution,
+        expert_w8a16=expert_w8a16, full_expert_w8a16=full_expert_w8a16,
     )
 
 

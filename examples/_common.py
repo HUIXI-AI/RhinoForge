@@ -132,6 +132,64 @@ def validate_qwen35_checkpoint(config: dict, checkpoint: str):
     return metadata
 
 
+def _validate_unbound_qwen_checkpoint(profile: dict, checkpoint: str) -> None:
+    """Bind older example labels whose catalog predates checkpoint-format fields.
+
+    Match model metadata, not a directory name. The public loader remains the
+    authority for complete tensor inventories and runtime admission.
+    """
+    family = profile["family"]
+    if family not in {"qwen3", "qwen3-vl"}:
+        return
+    from transformers import AutoConfig
+
+    metadata = AutoConfig.from_pretrained(
+        checkpoint, local_files_only=True, trust_remote_code=False)
+    multimodal = family == "qwen3-vl"
+    prefix = "qwen3-vl-" if multimodal else "qwen3-"
+    size = profile["asset_alias"].removeprefix(prefix).split("-")[0]
+    # These bind the catalog's size label, independently of loader admission.
+    geometries = ({"2b": (28, 2048, 6144), "4b": (36, 2560, 9728),
+                   "8b": (36, 4096, 12288), "32b": (64, 5120, 25600)}
+                  if multimodal else
+                  {"0.6b": (28, 1024, 3072), "1.7b": (28, 2048, 6144),
+                   "4b": (36, 2560, 9728), "8b": (36, 4096, 12288),
+                   "14b": (40, 5120, 17408), "32b": (64, 5120, 25600)})
+    text = getattr(metadata, "text_config", None) if multimodal else metadata
+    fields = ("num_hidden_layers", "hidden_size", "intermediate_size")
+    actual = tuple(getattr(text, key, None) for key in fields)
+    architecture = "Qwen3VLForConditionalGeneration" if multimodal else "Qwen3ForCausalLM"
+    if (size not in geometries or actual != geometries[size]
+            or any(type(value) is not int for value in actual)
+            or getattr(metadata, "model_type", None) != ("qwen3_vl" if multimodal else "qwen3")
+            or tuple(getattr(metadata, "architectures", ()) or ()) != (architecture,)):
+        raise ConfigError(f"profile {profile['id']} requires its declared Qwen3 architecture and size; check {checkpoint}")
+
+    precision = profile["precision"]
+    if precision == "fp16":
+        matches = all(getattr(owner, key, None) is None
+                      for owner in (metadata, text)
+                      for key in ("quant_config", "quantization_config"))
+    elif not multimodal and precision == "w8a16":
+        from rpu_backend.quant.qwen3_profiles import _W8_METADATA
+
+        quant = getattr(metadata, "quant_config", None)
+        matches = (isinstance(quant, dict) and quant == _W8_METADATA
+                   and all(type(quant[key]) is type(value) for key, value in _W8_METADATA.items())
+                   and getattr(metadata, "quantization_config", None) is None
+                   and getattr(metadata, "tie_word_embeddings", None) is False)
+    elif profile["asset_alias"] == "qwen3-vl-32b-w8a16":
+        from rpu_backend.quant.load import is_qwen3_vl_32b_w8a16_config
+
+        matches = is_qwen3_vl_32b_w8a16_config(metadata)
+    else:
+        matches = False
+    if not matches:
+        raise ConfigError(
+            f"profile {profile['id']} checkpoint precision/scope does not match "
+            f"{precision}; check {checkpoint}")
+
+
 def validate_checkpoint_profile(config: dict, checkpoint: str) -> None:
     """Bind quantized examples to their recipe before loading weights.
 
@@ -145,6 +203,7 @@ def validate_checkpoint_profile(config: dict, checkpoint: str) -> None:
     checkpoint_format = limits.get("checkpoint_format")
     on_install = limits.get("on_install_quantization")
     if expected is None and checkpoint_format is None and on_install is None:
+        _validate_unbound_qwen_checkpoint(profile, checkpoint)
         return
     if on_install is not None or checkpoint_format == "qwen3_32b_w8a16":
         from transformers import AutoConfig

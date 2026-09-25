@@ -88,6 +88,12 @@ def _chunk_envelope_for_execution(
 
 _RUNTIME_QUANTIZED_32B_ENVELOPE = ChunkEnvelope(4176, 64)
 
+# Independent bounded candidate for the original Text7-only W8 recipe.
+# Public support remains controlled/uncertified; never relabel this as runtime W8.
+# Native planning/SPM checks remain authoritative. Hardware evidence is separate.
+_LEGACY_32B_CONTROLLED_ENVELOPE = ChunkEnvelope(336, 64)
+
+
 
 def _validate_runtime_quantized_32b_text(text_model, cfg, scale_lists):
     """Bind the exact 32B envelope to the live quantized projection owners."""
@@ -137,16 +143,40 @@ def _validate_runtime_quantized_32b_text(text_model, cfg, scale_lists):
                 raise ValueError("runtime quantized 32B text requires matching projection weights and actual scale buffers")
 
 
+
+def _validate_legacy_32b_text(text_model, cfg, scale_lists):
+    import os
+    if os.environ.get("QWEN3_VL_32B_ALLOW_GRAPH_BLOCKED") != "1":
+        raise ValueError("legacy 32B text requires the exact controlled opt-in")
+    _validate_runtime_quantized_32b_text(text_model, cfg, scale_lists)
+    # Reuse only projection ABI validation, never the runtime-profile envelope.
+    if any(layer.self_attn.q_proj.weight.dtype != torch.int8
+           for layer in text_model.layers):
+        raise ValueError("legacy 32B text requires INT8 Text7, not packed W4")
+    embed = getattr(getattr(text_model, "embed_tokens", None), "weight", None)
+    if (not isinstance(embed, torch.Tensor) or embed.dtype != torch.float16
+            or tuple(embed.shape) != (151936, 5120) or not embed.is_contiguous()):
+        raise ValueError("legacy 32B text requires the original FP16 embedding")
+
+
 def install_qwen3_vl_text_for_rpu(
     text_model, *, text_config=None, max_seq_len=None, vision_config=None,
     deepstack_lang_layers=None, enable_deepstack=True, scale_lists=None,
     execution_config=None, topology=None, runtime_align_w8a16=False,
-    _runtime_quantized_32b=False,
+    _runtime_quantized_32b=False, _legacy_32b_w8a16=False,
     _graph_cache_max_entries=None,
 ) -> int:
-    """Bind this adapter's certified geometry to the shared M-RoPE installer."""
+    """Bind this exact profile's geometry to the shared M-RoPE installer."""
     if type(_runtime_quantized_32b) is not bool:
         raise ValueError("_runtime_quantized_32b must be a bool")
+    if type(_legacy_32b_w8a16) is not bool:
+        raise ValueError("_legacy_32b_w8a16 must be a bool")
+    if _legacy_32b_w8a16:
+        if (_runtime_quantized_32b or runtime_align_w8a16 or topology is not None
+                or execution_core_count(execution_config) != 8):
+            raise ValueError("legacy 32B text requires its own TP8 profile")
+        cfg = text_config if text_config is not None else getattr(text_model, "config", None)
+        _validate_legacy_32b_text(text_model, cfg, scale_lists)
     if _runtime_quantized_32b:
         if (runtime_align_w8a16 or topology is not None
                 or execution_core_count(execution_config) != 8):
@@ -165,6 +195,8 @@ def install_qwen3_vl_text_for_rpu(
         chunk_envelope_for=lambda arch, num_layers, hidden_size: (
             # Explicit candidate only; native planning/SPM checks still apply.
             # This is not an ordinary FP16 envelope or hardware certification.
+            _LEGACY_32B_CONTROLLED_ENVELOPE if _legacy_32b_w8a16
+            and (arch, num_layers, hidden_size) == (QWEN3_VL_TEXT_ARCH, 64, 5120) else
             _RUNTIME_QUANTIZED_32B_ENVELOPE if _runtime_quantized_32b
             and (arch, num_layers, hidden_size) == (QWEN3_VL_TEXT_ARCH, 64, 5120) else
             ChunkEnvelope(4176, 256) if runtime_align_w8a16 else
@@ -174,7 +206,7 @@ def install_qwen3_vl_text_for_rpu(
         vision_config=vision_config, deepstack_lang_layers=deepstack_lang_layers,
         enable_deepstack=enable_deepstack, scale_lists=scale_lists,
         execution_config=execution_config, topology=topology,
-        _kv_cache_layer_bank_size=8 if _runtime_quantized_32b else 1,
+        _kv_cache_layer_bank_size=8 if (_runtime_quantized_32b or _legacy_32b_w8a16) else 1,
         **({"_graph_cache_max_entries": _graph_cache_max_entries}
            if _graph_cache_max_entries is not None else {}),
     )

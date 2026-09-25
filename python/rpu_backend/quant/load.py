@@ -908,6 +908,7 @@ def _materialize_staged_w8a16_imagetext_for_rpu(model: nn.Module) -> None:
             "Qwen3-VL W8A16 streaming requires adapter ownership/poison first"
         )
 
+    legacy_per_layer = is_qwen3_vl_32b_w8a16_config(getattr(model, "config", None))
     projection_views = (
         _allocate_w8a16_decoder_projection_views(model, plan.layer_tensor_names)
         if is_qwen3_vl_4b_w8a16_config(getattr(model, "config", None)) else None
@@ -923,6 +924,12 @@ def _materialize_staged_w8a16_imagetext_for_rpu(model: nn.Module) -> None:
             raise KeyError(
                 f"W8A16 decoder layer remains incomplete before swizzle: {layer_meta[:8]}"
             )
+        if legacy_per_layer:
+            # Allocate only after this layer's INT8 parameters are materialized.
+            # Each existing helper-owned bank stays below 4GiB; Parameter views
+            # keep its storage alive after this temporary dictionary is dropped.
+            projection_views = _allocate_decoder_projection_views(
+                model, (names,), dtype=torch.int8)
         if projection_views is None:
             _swizzle_and_move_w8a16_decoder_layer(layer)
         else:
@@ -931,7 +938,11 @@ def _materialize_staged_w8a16_imagetext_for_rpu(model: nn.Module) -> None:
                 for name in names if name in projection_views
             }
             _swizzle_and_move_w8a16_decoder_layer(layer, projection_views=relative_views)
-        gc.collect()
+        if legacy_per_layer:
+            from rpu_backend.runtime.weights import _release_cpu_weight_pages
+            _release_cpu_weight_pages()
+        else:
+            gc.collect()
 
     _materialize_imagetext_meta_buffers(model)
     _raise_on_imagetext_meta(model)

@@ -249,6 +249,27 @@ def _prepare_vision_cached_patch_input(model, pixels: torch.Tensor, rows: int) -
     return resident
 
 
+def _cached_vision_patch_projection(model, pixels: torch.Tensor) -> torch.Tensor:
+    """Reuse private output storage while recomputing the complete projection."""
+    weight = model._rpu_vision_patch_embed_w_rpu
+    shape = (*pixels.shape[:-1], int(weight.shape[0]))
+    cache = model._rpu_vision_patch_input_cache
+    key = ("projection_output", shape, pixels.device, pixels.dtype)
+    output = cache.get(key)
+    if output is None:
+        with torch.inference_mode(False), torch.no_grad():
+            output = torch.empty(shape, device=pixels.device, dtype=pixels.dtype)
+        _bounded_cache_put(cache, key, output, _RPU_VISION_INPUT_CACHE_MAX_ENTRIES)
+    bias = model._rpu_vision_patch_embed_b_rpu
+    if model._rpu_vision_w8a16:
+        torch.ops.rpu.linear_w8a16_into(
+            pixels, weight, model._rpu_vision_patch_embed_scale, bias, output, False
+        )
+    else:
+        torch.ops.rpu.linear_into(pixels, weight, bias, output, True)
+    return output
+
+
 def _vision_cached_grid_key(model, grid: torch.Tensor) -> tuple[int, ...]:
     merge = int(model._rpu_vision_spatial_merge_size)
     if (not isinstance(grid, torch.Tensor) or grid.device.type != "cpu"
@@ -1506,6 +1527,7 @@ def _rpu_vision_forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tenso
             raise ValueError("RhinoVLA cached vision grid exceeds the native position keepalive")
 
     # ----- Input prep + patch_embed (Conv3d→Linear folded) ----------------
+    private_patch_output = False
     if getattr(self, "_rpu_vision_patch_embed_on_rpu", False):
         if input_cache_enabled:
             hidden_states_rpu = _prepare_vision_cached_patch_input(
@@ -1520,7 +1542,12 @@ def _rpu_vision_forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tenso
 
         pe_w = self._rpu_vision_patch_embed_w_rpu  # RPU fp16, col-swizzled
         pe_b = self._rpu_vision_patch_embed_b_rpu  # RPU fp16
-        if getattr(self, "_rpu_vision_w8a16", False):
+        if prep_cache_enabled:
+            # Keep the eager projection's original arithmetic: FP16 uses
+            # ACC32, W8 uses ACC16. This slot is private to input preparation.
+            embed_packed = _cached_vision_patch_projection(self, hidden_states_rpu)
+            private_patch_output = True
+        elif getattr(self, "_rpu_vision_w8a16", False):
             embed_packed = torch.ops.rpu.linear_w8a16(
                 hidden_states_rpu, pe_w, self._rpu_vision_patch_embed_scale, pe_b
             ).contiguous()
@@ -1559,7 +1586,11 @@ def _rpu_vision_forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tenso
                 pos_embeds,
                 _RPU_VISION_PREP_CACHE_MAX_ENTRIES,
             )
-    embed_packed = embed_packed + pos_embeds  # rpu_add
+    if private_patch_output:
+        # The next projection overwrites every element before this addition.
+        embed_packed.add_(pos_embeds)
+    else:
+        embed_packed = embed_packed + pos_embeds
 
     # ----- Per-image encoder loop -----------------------------------------
     keepalive = self._rpu_vision_position_idx_keepalive

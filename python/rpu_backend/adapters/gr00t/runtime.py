@@ -1887,25 +1887,28 @@ class Gr00tN1d7VLA:
         # needed and the buffer address stays pinned across REPLAY. Kills the CPU masked_scatter +
         # the RPU↔CPU bounces (the vision→backbone glue folds into device copies).
         if self._emb_text_rpu is None or not torch.equal(input_ids, self._emb_key):
-            self._emb_text_rpu = m.get_input_embeddings()(input_ids.to("rpu")).to(
-                torch.float16).contiguous()                                    # [1,S,H] RPU
-            ipos = (input_ids.reshape(-1) == img_tok).nonzero().reshape(-1).tolist()
-            runs = []                                                          # contiguous (start,len) per image
-            if ipos:
-                s = p = ipos[0]
-                for j in ipos[1:]:
-                    if j == p + 1: p = j
-                    else: runs.append((s, p - s + 1)); s = p = j
-                runs.append((s, p - s + 1))
-            self._img_runs = runs
-            self._emb_key = input_ids.clone()  # snapshot: catch in-place mutation of a reused input_ids
-            # Opt #2: one persistent RPU zero buffer per deepstack merger. Image rows are
-            # overwritten in-place each forward (same contiguous runs as the visual inject);
-            # non-image rows stay zero forever (overwrite-before-read). Replaces the per-forward
-            # torch.zeros + CPU index_put scatter (see the on-device dense build below).
-            self._ds_dense = [torch.zeros((input_ids.shape[1], cfg.text_config.hidden_size),
-                                          dtype=torch.float16, device="rpu").contiguous()
-                              for _ in range(len(vout.deepstack_features))]
+            # These owners are refreshed in place on every request. Cold
+            # allocation must not inherit the first request's inference mode.
+            with torch.inference_mode(False), torch.no_grad():
+                self._emb_text_rpu = m.get_input_embeddings()(input_ids.to("rpu")).to(
+                    torch.float16).contiguous()                                    # [1,S,H] RPU
+                ipos = (input_ids.reshape(-1) == img_tok).nonzero().reshape(-1).tolist()
+                runs = []                                                          # contiguous (start,len) per image
+                if ipos:
+                    s = p = ipos[0]
+                    for j in ipos[1:]:
+                        if j == p + 1: p = j
+                        else: runs.append((s, p - s + 1)); s = p = j
+                    runs.append((s, p - s + 1))
+                self._img_runs = runs
+                self._emb_key = input_ids.clone()  # snapshot: catch in-place mutation of a reused input_ids
+                # Opt #2: one persistent RPU zero buffer per deepstack merger. Image rows are
+                # overwritten in-place each forward (same contiguous runs as the visual inject);
+                # non-image rows stay zero forever (overwrite-before-read). Replaces the per-forward
+                # torch.zeros + CPU index_put scatter (see the on-device dense build below).
+                self._ds_dense = [torch.zeros((input_ids.shape[1], cfg.text_config.hidden_size),
+                                              dtype=torch.float16, device="rpu").contiguous()
+                                  for _ in range(len(vout.deepstack_features))]
         visual_rpu = visual_flat.to(device="rpu", dtype=torch.float16).contiguous()
         voff = 0
         for (start, length) in self._img_runs:

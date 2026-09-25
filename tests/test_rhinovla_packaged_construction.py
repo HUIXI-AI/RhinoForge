@@ -128,3 +128,36 @@ def test_host_preflight_and_allocator_failures_do_not_poison_owner(monkeypatch):
     assert events == [
         "process-preflight", "claim", ("allocator", True), "release"
     ]
+
+
+@pytest.mark.parametrize("expert,full", [(False, False), (True, False), (True, True)])
+def test_explicit_pipeline_expert_scope_keeps_other_components_fp16(monkeypatch, expert, full):
+    from types import SimpleNamespace as NS
+    from rpu_backend.runtime import hw_attrs
+
+    for name in tuple(__import__("os").environ):
+        if name.startswith("RPU_RHINOVLA_"):
+            monkeypatch.delenv(name)
+    monkeypatch.setenv("RPU_RHINOVLA_PRECOMPUTE_ADARMS", "1")
+    monkeypatch.setattr(hw_attrs, "validate_preinstall", lambda _: None)
+    model = NS(qwen=NS(model=NS(model=NS(language_model=object(), visual=object()),
+        config=NS(text_config=NS(num_hidden_layers=28, num_key_value_heads=8,
+                                 head_dim=128), vision_config=object()))))
+    cfg = NS(depth=18, mlp_dim=3072, action_horizon=30, use_state_token=True,
+             width=1024, num_attention_heads=16, num_key_value_heads=8, head_dim=128)
+    args = dict(qin={}, prefix_len=230, steps=10, model=model,
+                action_bundle=(object(), NS(), object(), cfg),
+                flow_direction="official_descending", expert_w8a16=expert,
+                full_expert_w8a16=full, rpu_execution={"action": {"denoise_unroll": True}})
+    cold = pipeline._preflight_rhinovla_cold_install(**args)
+    assert cold["expert_w8a16"] is expert
+    assert cold["full_expert_w8a16"] is full
+    assert cold["full_w8a16"] is False
+    if full:
+        monkeypatch.setenv("RPU_RHINOVLA_PRECOMPUTE_ADARMS", "0")
+        with pytest.raises(ValueError, match="PRECOMPUTE_ADARMS"):
+            pipeline._preflight_rhinovla_cold_install(**args)
+    monkeypatch.setenv("RPU_RHINOVLA_FULL_W8A16", "1")
+    if not full:
+        with pytest.raises(ValueError, match="conflicts"):
+            pipeline._preflight_rhinovla_cold_install(**args)

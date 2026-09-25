@@ -331,7 +331,7 @@ def test_exact_4b_projection_bank_offsets_beyond_two_gib(monkeypatch):
         assert packed.untyped_storage()._cdata == q.untyped_storage()._cdata
 
 
-def test_staged_32b_keeps_original_per_layer_transfer(monkeypatch,tmp_path):
+def test_staged_32b_uses_layer_local_storage_without_4b_bank(monkeypatch,tmp_path):
     cfg = config()
     cfg.quant_config = dict(load._QWEN3_VL_32B_W8A16_QUANT_CONFIG)
     vars(cfg.text_config).update(hidden_size=5120, intermediate_size=25600,
@@ -348,11 +348,30 @@ def test_staged_32b_keeps_original_per_layer_transfer(monkeypatch,tmp_path):
     def forbidden(*args,**kwargs):
         raise AssertionError("32B must not allocate the controlled 4B projection bank")
     monkeypatch.setattr(load,"_allocate_w8a16_decoder_projection_views",forbidden)
-    calls=[]
-    monkeypatch.setattr(load,"_swizzle_and_move_w8a16_decoder_layer",lambda layer:calls.append(layer))
+    original_empty = torch.empty
+    allocations = []
+    def host_empty(*args, **kwargs):
+        if kwargs.get("device") == "rpu":
+            allocations.append((args[0], kwargs["dtype"]))
+            kwargs["device"] = "cpu"
+        return original_empty(*args, **kwargs)
+    monkeypatch.setattr(torch, "empty", host_empty)
+    calls = []
+    def move(layer, *, projection_views):
+        assert set(projection_views) == {"self_attn.q_proj"}
+        view = projection_views["self_attn.q_proj"]
+        assert view.shape == layer.self_attn.q_proj.weight.shape
+        assert view.dtype == torch.int8 and view.is_contiguous()
+        assert torch.equal(layer.self_attn.q_proj.weight,
+                           data["model.language_model.layers.0.self_attn.q_proj.weight"])
+        calls.append(layer)
+    monkeypatch.setattr(load, "_swizzle_and_move_w8a16_decoder_layer", move)
     vars(model)["_rpu_swizzle_started"]=True
     load._materialize_staged_w8a16_imagetext_for_rpu(model)
     assert calls==list(model.model.language_model.layers)
+    assert allocations == [(6, torch.int8)]
+    assert torch.equal(model.lm_head.weight, data["lm_head.weight"])
+    assert model.lm_head.weight.dtype == torch.float16
 
 
 @pytest.mark.parametrize("selection", [slice(None), slice(-1, None), torch.tensor([0, 2])])

@@ -198,6 +198,10 @@ def _halo(runner):
 
 
 _RHINOVLA_QUANT_KEYS = ("expert_w8a16", "full_w8a16")
+_RHINOVLA_FULL_PIPELINE_PROFILES = frozenset({
+    "rhinovla.v3.w8a16.full-pipeline.trusted-factory",
+    "rhinovla.v3.w8a16.full-pipeline-high.trusted-factory",
+})
 
 
 def _rhinovla_quantization(config):
@@ -218,10 +222,15 @@ def _rhinovla_quantization(config):
     profiles = {
         "rhinovla.v3.w8a16.expert.trusted-factory": False,
         "rhinovla.v3.w8a16.full-expert.trusted-factory": True,
+        **dict.fromkeys(_RHINOVLA_FULL_PIPELINE_PROFILES, True),
     }
     profile_id = config["example"].get("profile_id")
     if profile_id in profiles and full is not profiles[profile_id]:
         raise ValueError("RhinoVLA full_w8a16 conflicts with the selected profile_id")
+    if profile_id in _RHINOVLA_FULL_PIPELINE_PROFILES and any(
+            config["example"].get("opt_in", {}).get(name) != "1"
+            for name in ("RPU_RHINOVLA_FULL_W8A16", "RPU_RHINOVLA_EXPERT_W8A16")):
+        raise ValueError("RhinoVLA full-pipeline profile requires both explicit W8 opt-ins")
     return {"expert_w8a16": expert, "full_w8a16": full}
 
 
@@ -238,7 +247,7 @@ def _bind_rhinovla_quantization(config, factory_config):
     return expected
 
 
-def _confirm_rhinovla_quantization(policy, expected):
+def _confirm_rhinovla_quantization(policy, expected, *, full_pipeline=False):
     """Inspect the installed expert, not a factory-provided precision label."""
     import torch
     from rpu_backend.adapters.rhinovla.convert import _gather_expert_scales
@@ -273,6 +282,15 @@ def _confirm_rhinovla_quantization(policy, expected):
                            or scale.ndim != 1 or not scale.numel() or scale.device != weight.device
                            for weight, scale in zip(group, scale_group))):
                 raise ValueError("RhinoVLA full expert W8 requires INT8 AdaRMS weights with FP16 scales")
+    if full_pipeline:
+        from rpu_backend.adapters.rhinovla.precision import full_w8_inventory
+        if (runtime.er is not expert
+                or controller.text_model is not runtime.text_model
+                or controller.vision_model is not runtime.vision_model
+                or children.get("language_model") is not runtime.text_model
+                or children.get("vision_encoder") is not runtime.vision_model):
+            raise ValueError("RhinoVLA full W8 child owners do not match the runtime")
+        full_w8_inventory(runtime)
 
 
 def _rhinovla(runner):
@@ -298,7 +316,9 @@ def _rhinovla(runner):
     )
     runner.owner = policy
     if any(name in inputs or name in factory_config for name in _RHINOVLA_QUANT_KEYS):
-        _confirm_rhinovla_quantization(policy, quantization)
+        _confirm_rhinovla_quantization(
+            policy, quantization,
+            full_pipeline=config["example"].get("profile_id") in _RHINOVLA_FULL_PIPELINE_PROFILES)
     return lambda: policy.predict(**request)
 
 

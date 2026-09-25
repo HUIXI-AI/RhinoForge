@@ -169,6 +169,21 @@ Precision must match checkpoint metadata and the required operator capabilities.
 `prepare_graphs(...)` precomputes AdaRMS by default for these profiles. See
 [`examples/configs/pi05/`](../examples/configs/pi05/).
 
+`Pi05Policy.prepare_graphs(batch, noise=...)` and
+`Pi05Policy.predict_action_chunk(batch, noise=...)` accept an optional initial
+noise tensor. It must be finite CPU `float32` with shape
+`[batch_size, chunk_size, max_action_dim]` from the loaded policy configuration.
+Use the same tensor for graph preparation and inference when comparing fixed
+inputs. Omitting it preserves the policy's normal seeded noise generation.
+Pi0.5 example TOML files expose this as `input.noise`, a path to a tensor saved
+with `torch.save`; the optimized examples require shape `[1, 50, 32]`.
+
+Pi0.5 `prepare_graphs()` reports Graph readiness and replay diagnostics.
+Shape, dtype, finite values and Graph invariants are checked; MSE, maximum
+absolute error and row distributions carry no universal acceptance threshold.
+`replay_parity.numerical_status` is `DIAGNOSTIC` and `task_quality` is
+`NOT_EVALUATED`; `READY` does not certify action or rollout quality.
+
 For the release-bound Pi0.5 component profiles, pass `profile="pi0.5-base"`
 or `profile="pi0.5-libero-v044"` together with the first preprocessed
 `admission_batch`. The loader verifies the exact public payload and request

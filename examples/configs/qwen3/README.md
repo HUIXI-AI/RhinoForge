@@ -20,6 +20,10 @@ python examples/run_model.py --config examples/configs/qwen3/text/0_6b/fp16.toml
 
 从仓库根目录运行。需要自己的 checkpoint 时复制选定配置并设置 `input.checkpoint`；相对路径以启动目录为基准。`--check-config` 不加载权重或访问板卡，只检查配置和 profile 约束；checkpoint 格式、真实 token 长度与可行分块在运行时检查。
 
+实际执行在 tokenizer 和权重加载前核对 checkpoint 元数据的模型尺寸和精度范围。
+FP16 配置拒绝量化 checkpoint，W8 配置要求七类 decoder 投影与独立 LM head
+同时量化、embedding 保持浮点；兼容 checkpoint 的目录名称不受限制。
+
 ## 精度与权重范围
 
 - **FP16** 使用对应尺寸的无量化浮点 checkpoint，安装为 FP16。Instruct 是独立 alias，不靠修改提示词冒充另一套权重。

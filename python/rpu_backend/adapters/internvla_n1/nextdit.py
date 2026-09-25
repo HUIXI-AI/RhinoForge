@@ -46,6 +46,11 @@ EPS = 1e-5
 CONDITION_CACHE_SIZE = 8
 
 
+def _condition_version(condition: torch.Tensor) -> int | None:
+    # Without a mutation counter, use the existing content-checked cache.
+    return None if condition.is_inference() else condition._version
+
+
 class _FixedStepPrepare(torch.nn.Module):
     """Traceable fixed-width CPU glue for a batch of scheduler steps."""
 
@@ -770,9 +775,10 @@ class NextDiTRPURuntime:
     def _condition_bindings(
         self, condition: torch.Tensor
     ) -> list[tuple[int, _ConditionState]]:
-        version = condition._version
+        version = _condition_version(condition)
         if (
-            self._condition_batch_source is condition
+            version is not None
+            and self._condition_batch_source is condition
             and self._condition_batch_version == version
         ):
             return self._condition_batch_bindings
@@ -948,7 +954,7 @@ class NextDiTRPURuntime:
             reuse_condition=_reuse_condition,
         )
         self._condition_batch_source = condition
-        self._condition_batch_version = condition._version
+        self._condition_batch_version = _condition_version(condition)
         self._condition_batch_bindings = [(condition_index, condition_state)]
         prepared = self._prepare_step_batch_cpu(
             timesteps,

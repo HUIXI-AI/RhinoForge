@@ -133,7 +133,7 @@ def _pad_prefix_static_cache(cache, execution_len):
 
 def _preflight_rhinovla_cold_install(
     *, qin, prefix_len, steps, rpu_execution, model, action_bundle,
-    flow_direction,
+    flow_direction, expert_w8a16=None, full_expert_w8a16=None,
 ):
     """Resolve pipeline-owned host gates before selecting the allocator."""
     from rpu_backend.adapters.rhinovla.runtime import (
@@ -203,8 +203,9 @@ def _preflight_rhinovla_cold_install(
     from .fused import _RhinoVLANativeColdConfig
 
     native_cold = _RhinoVLANativeColdConfig.from_env()
-    full_w8a16 = rpu_env_bool("RPU_RHINOVLA_FULL_W8A16")
-    expert_w8a16 = full_w8a16 or rpu_env_bool("RPU_RHINOVLA_EXPERT_W8A16")
+    from .runtime import resolve_rhinovla_quantization
+    expert_w8a16, full_expert_w8a16, full_w8a16 = resolve_rhinovla_quantization(
+        expert_w8a16=expert_w8a16, full_expert_w8a16=full_expert_w8a16)
     precompute_gate_tanh = rpu_env_bool("RPU_RHINOVLA_PRECOMPUTE_GATE_TANH")
     high_precision = rpu_env_bool("RPU_RHINOVLA_HIGH_PRECISION")
     high_precision_fusions = rpu_env_bool("RPU_RHINOVLA_HIGH_PRECISION_FUSIONS")
@@ -242,6 +243,9 @@ def _preflight_rhinovla_cold_install(
         getattr(expert_cfg, "head_dim", None),
     ) != (1024, 16, 8, 128):
         raise ValueError("RhinoVLA PACKED_QKV/ALIGNED_KV/EXPERT_W8A16 requires H1024/Q16/KV8/D128")
+    if full_expert_w8a16 and (not native_cold.precompute_adarms or
+                              native_cold.skip_adarms_gemv):
+        raise ValueError("RhinoVLA full expert W8 requires PRECOMPUTE_ADARMS without SKIP_ADARMS_GEMV")
     if full_w8a16:
         if not (native_cold.precompute_adarms and not native_cold.skip_adarms_gemv
                 and vision_cold["rpu_patch_embed"] and vision_cold["rpu_mergers"]
@@ -339,6 +343,7 @@ def _preflight_rhinovla_cold_install(
         "expert": expert,
         "expert_w8a16": expert_w8a16,
         "full_w8a16": full_w8a16,
+        "full_expert_w8a16": full_expert_w8a16,
         "precompute_gate_tanh": precompute_gate_tanh,
         "high_precision": high_precision,
         "high_precision_fusions": high_precision_fusions,
@@ -361,7 +366,8 @@ def _preflight_rhinovla_cold_install(
 class RhinoVLAOnRPU:
     def __init__(self, *, qin, prefix_len, steps=5, instance_id=0,
                  rpu_execution=None, model=None, action_bundle=None,
-                 flow_direction="legacy_ascending"):
+                 flow_direction="legacy_ascending",
+                 expert_w8a16=None, full_expert_w8a16=None):
         if model is None or action_bundle is None:
             raise ValueError(
                 "RhinoVLAOnRPU requires an explicitly loaded model and "
@@ -386,6 +392,7 @@ class RhinoVLAOnRPU:
                 model=model,
                 action_bundle=action_bundle,
                 flow_direction=flow_direction,
+                expert_w8a16=expert_w8a16, full_expert_w8a16=full_expert_w8a16,
             )
             _claim_live_instance(self)
             claim_acquired = True
@@ -427,6 +434,8 @@ class RhinoVLAOnRPU:
         close_rhinovla_runtime(self)
 
     def __del__(self):
+        if vars(self).get("_rhinovla_closed"):
+            return
         from .runtime import gc_close_rhinovla_runtime
         gc_close_rhinovla_runtime(self)
 
@@ -571,7 +580,7 @@ class RhinoVLAOnRPU:
             scale_lists=prefix_scales,
             execution_config={"prefill": {
                 key: value for key, value in self._text_execution.get("prefill", {}).items()
-                if key in ("chunk_size", "padding_rows", "padding_budget")
+                if key in ("chunk_size", "padding_rows", "padding_budget", "linear_acc32")
             }})
         if cold["high_precision"]:
             torch.ops.rpu.causal_decoder_set_rhinovla_high_precision(
@@ -580,6 +589,10 @@ class RhinoVLAOnRPU:
             torch.ops.rpu.causal_decoder_set_rhinovla_high_precision_fusions(
                 self.text_model._rpu_decoder_handle, True)
         own_rhinovla_child(self, self.text_model, RHINOVLA_TEXT_COMPONENT)
+        from .precision import bind_pipeline_linear_accumulation
+        bind_pipeline_linear_accumulation(
+            self.text_model, self.vision_model,
+            prefill=prefill_cold["linear_acc32"], vision=vision_cold["linear_acc32"])
         self.prefix_gc = self.text_model._rpu_text_graph_cache
         self._prefill_fast_replay = prefill_cold["fast_replay"]
         if self._prefill_fast_replay:
@@ -654,7 +667,7 @@ class RhinoVLAOnRPU:
             suffix_len=self.suffix_len,
             max_seq_len=self.exp_max_seq,
             w8a16=cold["expert_w8a16"],
-            full_w8a16=cold["full_w8a16"],
+            full_w8a16=cold["full_expert_w8a16"],
         )
         if cold["high_precision"]:
             torch.ops.rpu.rhino_vla_set_high_precision(self.er._rpu_handle, True)
@@ -718,9 +731,10 @@ class RhinoVLAOnRPU:
                 times = torch.tensor(self._denoise_times, dtype=torch.float32)
                 cond_cpu = action_mod.create_sinusoidal_pos_embedding(
                     times, self.cfg.width).to(dtype=torch.float32).contiguous()
-                if cold["full_w8a16"]:
+                if cold["full_expert_w8a16"]:
                     pair_table, final_table, weights, scales, biases = _prepare_denoise_adarms_tables(
                         self.er, cond_cpu, full_w8a16=True, loop_weights=loop_w,
+                        quantize_final_norm=cold["full_w8a16"], final_norm=self.expert.norm,
                         precompute_gate_tanh=cold["precompute_gate_tanh"],
                         high_precision=cold["high_precision"])
                     torch.ops.rpu.rhino_vla_set_denoise_loop_adarms_tables_w8a16(
@@ -958,7 +972,8 @@ class RhinoVLAOnRPU:
             if self._prefix_no_clone:
                 inputs_embeds = cache.get("inputs_embeds_persist")
                 if inputs_embeds is None:
-                    inputs_embeds = cache["inputs_embeds_base_rpu"].clone()
+                    with torch.inference_mode(False), torch.no_grad():
+                        inputs_embeds = cache["inputs_embeds_base_rpu"].clone()
                     cache["inputs_embeds_persist"] = inputs_embeds
             else:
                 inputs_embeds = cache["inputs_embeds_base_rpu"].clone()
@@ -983,7 +998,8 @@ class RhinoVLAOnRPU:
                     # Persistent dense buffer per deepstack layer: non-visual positions
                     # stay zero (init), only the visual runs are re-scattered each predict.
                     if di >= len(dense_persist):
-                        dense_persist.append(cache["deepstack_zero_rpu"].clone())
+                        with torch.inference_mode(False), torch.no_grad():
+                            dense_persist.append(cache["deepstack_zero_rpu"].clone())
                     dense = dense_persist[di]
                 else:
                     dense = cache["deepstack_zero_rpu"].clone()

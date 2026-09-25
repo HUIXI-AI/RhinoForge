@@ -20,3 +20,44 @@
 板测前检查空闲并持有现有设备锁。环境必须隔离并绑定预期 worktree 和运行时资产。
 报告实际测量范围和限制，不把其他模型或构建的结果移用于当前版本。
 性能口径见[性能测量](performance.zh.md)。
+
+## 数值评估
+
+数值评估采用下述三层方法。旧有
+`MSE <= 1e-4`、`max_abs <= 0.05`、逐行误差上限和固定 cosine 下限不再作为
+模型验收门限；本条优先于旧 profile 中“保留原数值门”的要求。不得将这些门限
+换名为已校准或复合门限，也不以另一固定误差上限替代。历史测量和原判定仍作为
+历史保留，不能自动改写成当前通过。
+
+1. **运行正确性仍须满足。**检查约定的 shape、dtype、输出有限性、输入新鲜度、
+   执行路由以及 KV/cache/SPM/DMA 和 Graph 生命周期。资产身份、整数或结构相等、
+   明确要求的确定性回放属于独立约束，本次修正不放松这些要求。
+2. **在相同语义下比较实现。**绑定 checkpoint、量化配方、输入、预处理、参考计算
+   精度和输出空间。量化执行首先对照相同存储权重与 scale 语义；对照原始浮点模型
+   还会包含量化本身的影响。记录逐行、逐位置误差分布及 MSE、MAE、relative-L2、
+   max-abs 等有用的幅值指标，不只给展平 cosine。LLM 需对齐 token 前缀，记录
+   top-k/logprob 和近似并列情况。单凭生成文本是否完全相同，不能判定一般数值
+   正确性。可疑差异应结合真实路径、精度、输入和参考排查；普通有限的舍入或累计
+   差异不因超过旧门限而自动失败。
+3. **独立评估模型和任务质量。**说明数据集、协议和任务指标，例如 LLM 的
+   accuracy/NLL/PPL，或 VLA 的反归一化动作、轨迹和闭环成功率。保留独立规定的
+   任务质量要求。短输出对照不能替代任务评估；缺少任务证据时仍为未测或未认证。
+   移除标量门限不等于模型已认证。
+
+分别报告运行结果、数值观察和任务质量结果，并说明未测范围。同运行时的
+batch/chunk/fused 回归检查仍有价值，但两条路径在同一设备运行，不构成恢复旧
+标量门限的理由。对照明确数学参考的算子单测是另一层检查，其容差不能直接变成
+端到端模型质量预算。
+
+以下官方方法体现了上述区分，并不存在可直接移用的共同数值阈值：
+
+- [TensorRT 精度说明](https://docs.nvidia.com/deeplearning/tensorrt/latest/inference-library/accuracy-considerations.html)
+  讨论与精度有关的舍入、溢出和敏感运算；
+  [Polygraphy 比较器](https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/polygraphy/tool/args/comparator/compare.html)
+  支持按输出张量配置容差和误差统计。
+- [vLLM 模型测试](https://docs.vllm.ai/en/latest/contributing/model/tests/)
+  区分与 Hugging Face 的完全相同生成输出和 top-k logprob 相似性；这些是具体
+  测试方法，不是跨模型统一误差预算。
+- [TensorRT-LLM 评估](https://nvidia.github.io/TensorRT-LLM/commands/trtllm-eval.html)
+  使用 accuracy、ROUGE 等任务指标。开发评估工具本身不能证明生产或机器人任务
+  已通过验收。

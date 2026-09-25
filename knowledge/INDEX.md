@@ -84,7 +84,8 @@ and source remain authoritative; see [the schema](SCHEMA.md) and
   assessment to release evidence.
 - [Model family implementation map](synthesis/model-family-map.md): public APIs,
   adapter owners, and runtime contracts for Qwen3, Qwen3-VL, Pi0.5, RhinoVLA,
-  and the other indexed families.
+  and the other indexed families, including Pi0.5 fixed-noise comparisons and
+  cold Graph resource planning.
 - [Debugging and profiling playbook](synthesis/debugging-playbook.md): bounded
   numerical triage, pointer-free Graph structure, profiler choice, and stop
   conditions.

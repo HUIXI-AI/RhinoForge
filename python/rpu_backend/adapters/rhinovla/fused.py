@@ -285,9 +285,8 @@ _RHINO_RUNTIME_INSTALL_ATTRS = (
 def _rhino_tensor_version(tensor):
     """Return a mutation counter when PyTorch exposes one.
 
-    Inference tensors may deliberately omit version counters.  Identity still
-    protects those tensors from being replaced; ordinary tensors additionally
-    fail closed after an in-place update.
+    Inference tensors may omit version counters.  Their identity cannot prove
+    unchanged contents, so they cannot authorize reuse of a copied prefix.
     """
     try:
         return int(tensor._version)
@@ -336,7 +335,11 @@ def _rhino_prefix_source_matches(snapshot, candidate) -> bool:
     ):
         return False
     return all(
-        old_k is new_k
+        old_k_version is not None
+        and old_v_version is not None
+        and new_k_version is not None
+        and new_v_version is not None
+        and old_k is new_k
         and old_k_version == new_k_version
         and old_v is new_v
         and old_v_version == new_v_version

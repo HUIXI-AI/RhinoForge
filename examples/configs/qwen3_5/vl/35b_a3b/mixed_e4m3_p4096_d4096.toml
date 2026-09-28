@@ -16,7 +16,6 @@ stop_on_eos = false
 
 [run]
 warmup = 2
-warmup_decode_steps = 3
 runs = 1
 inference_mode = false
 hwperf = false

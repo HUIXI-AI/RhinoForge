@@ -60,7 +60,10 @@ alone does not cover the peak during cold construction.
 For steady-state timing, finish numerical checks and release their temporary
 exports before warming the real REPLAY path. The shared runner defaults to two
 warmup calls, reports them separately, and releases raw returned outputs after
-snapshotting them outside the timer. See [performance measurement](../docs/performance.md).
+snapshotting them outside the timer. With `warmup >= 2`, omit
+`warmup_decode_steps` or match `input.decode_steps`; config validation rejects
+shorter warmup before model loading. Fixed-length tests use `stop_on_eos=false`.
+Two short decode calls do not warm later positions or signatures. See [performance measurement](../docs/performance.md).
 For Pi0.5 fixed-input comparisons, use the public `input.noise` field for both
 Graph preparation and inference; retain default-input failures separately.
 See the [policy API](../docs/api_reference.md#policy-apis) and

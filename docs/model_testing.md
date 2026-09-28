@@ -51,7 +51,7 @@ For catalog configurations, use `[run].profile = true` or `--profile` instead.
 This collects one extra diagnostic inference after the timed runs. Set
 `run.warmup` and `run.runs` explicitly; short comparisons can use two warmups and
 two or three samples with `input.decode_steps = 32`. Preserve all other input
-and execution settings, and keep `warmup_decode_steps` at or below that limit.
+and execution settings; omit `warmup_decode_steps` so warmup follows that limit.
 Decode steps count calls after the first prefill token; EOS can stop them early.
 Long-decode templates run only when explicitly selected. Example images are
 placeholders, not the fixtures used for earlier performance reports.
@@ -59,8 +59,11 @@ placeholders, not the fixtures used for earlier performance reports.
 The shared runner defaults to two warmup calls so a lazy Graph can BUILD and
 then REPLAY before measured samples. It records their call latencies separately
 in `warmup_wall_ms_runs`; these do not enter the measured summary. Explicit
-`warmup=0` or `1` remains available for cold-path diagnostics. A shorter
-`warmup_decode_steps` covers only that decode envelope, not all later shapes.
+`warmup=0` or `1` remains available for cold-path diagnostics. With `warmup >= 2`,
+`warmup_decode_steps` must be omitted or equal `input.decode_steps`, so both warmup
+calls visit the measured decode workload, including later positions and shapes.
+Shortened decode warmup is allowed only with explicit cold diagnostic counts.
+For fixed-length comparisons, set `stop_on_eos=false` in both phases.
 See [performance measurement](performance.md#separate-startup-and-steady-state)
 for validation cleanup and the timing boundary.
 

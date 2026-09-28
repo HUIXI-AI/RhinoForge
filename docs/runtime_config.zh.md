@@ -112,7 +112,8 @@ chunk size 为 `"auto"` 或正 16 倍数，并受各 loader 的实际 profile �
 所有统一 runner 入口的 `run.warmup` 默认值都是两次推理调用。对延迟捕获的固定
 signature，这覆盖 BUILD 和一次 REPLAY。显式次数（含冷路径诊断的零次或一次）原样
 执行，不插入隐藏调用。每次预热耗时保存在 `warmup_wall_ms_runs`，与 `wall_ms_runs`
-分开。缩短 `warmup_decode_steps` 不能保证尚未经过的 decode 形状已就绪，见[性能测量](performance.zh.md)。
+分开。`warmup >= 2` 时，`warmup_decode_steps` 必须省略或等于 `input.decode_steps`；
+缩短预热会在加载模型前被拒绝。只有显式 `warmup=0` 或 `1` 才允许缩短 decode 的冷路径诊断。见[性能测量](performance.zh.md)。
 
 统一 examples runner 在 `no_grad()` 和 `inference_mode(False)` 下准备所有模型，
 使持久权重和可变 Graph 输入保留版本计数；`run.inference_mode` 仍控制 warmup

@@ -137,8 +137,9 @@ planning semantics are documented under [non-environment runtime controls](#non-
 For a lazily captured fixed signature, these cover BUILD and one REPLAY.
 Explicit counts, including zero and one for cold diagnostics, are honored
 without hidden calls. `warmup_wall_ms_runs` records every warmup call separately
-from `wall_ms_runs`. Reduced `warmup_decode_steps` does not establish readiness
-for unvisited decode shapes. See [performance measurement](performance.md).
+from `wall_ms_runs`. When `warmup >= 2`, `warmup_decode_steps` must be omitted or
+equal `input.decode_steps`; shortened decode warmup is rejected before model
+loading. Only explicit `warmup=0` or `1` permits a shortened cold diagnostic. See [performance measurement](performance.md).
 
 The shared examples runner prepares every model under `no_grad()` with
 `inference_mode(False)`. Persistent weights and mutable Graph inputs therefore

@@ -27,6 +27,7 @@ def _runner(monkeypatch):
     monkeypatch.setitem(sys.modules, "rpu_backend.runtime.performance", performance)
     monkeypatch.setattr(runner, "_provenance", lambda _: {})
     monkeypatch.setattr(torch, "manual_seed", lambda _: None)
+    monkeypatch.setattr(torch, "set_num_threads", lambda _: None)
     return runner
 
 
@@ -93,3 +94,29 @@ def test_runnable_catalog_templates_include_replay_warmup():
         config = tomllib.loads(path.read_text())
         if "example" in config or "pi05" in config:
             assert config["run"]["warmup"] >= 2, path
+            assert config["run"].get("warmup_decode_steps", config["input"].get("decode_steps")) == config["input"].get("decode_steps"), path
+
+
+@pytest.mark.parametrize("template", [
+    "qwen3/text/0_6b/fp16.toml", "llama/3_2_1b/fp16.toml",
+    "qwen3_5/text/2b/fp16.toml", "qwen3_vl/text/4b/fp16.toml",
+    "qwen3_5/vl/2b/fp16.toml", "gemma4/e4b/fp16.toml",
+])
+@pytest.mark.parametrize("warmup", [None, 0, 1, 2, 3])
+@pytest.mark.parametrize("warmup_decode_steps", [0, 3, 4])
+def test_short_decode_warmup_is_only_an_explicit_cold_diagnostic(
+        monkeypatch, tmp_path, template, warmup, warmup_decode_steps):
+    monkeypatch.syspath_prepend(str(ROOT / "examples"))
+    import _common
+
+    source = (ROOT / "examples/configs" / template).read_text()
+    source = source.replace("warmup = 2\n", "" if warmup is None else f"warmup = {warmup}\n")
+    source = source.replace("[run]\n", f"[run]\nwarmup_decode_steps = {warmup_decode_steps}\n")
+    path = tmp_path / "case.toml"
+    path.write_text(source)
+    if (warmup is None or warmup >= 2) and warmup_decode_steps != 4:
+        with pytest.raises(_common.ConfigError, match="requires full decode warmup"):
+            _common.load_config(path)
+    else:
+        config = _common.load_config(path)
+        assert config["run"]["warmup_decode_steps"] == warmup_decode_steps

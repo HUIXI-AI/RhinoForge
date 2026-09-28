@@ -28,7 +28,7 @@ and source remain authoritative; see [the schema](SCHEMA.md) and
 - [Runtime configuration](../docs/runtime_config.md): supported controls,
   defaults, lifecycle, and risk.
 - [Performance measurement](../docs/performance.md): correctness-first,
-  reproducible latency and throughput reporting.
+  validation cleanup, BUILD/REPLAY warmup, and reproducible latency and throughput reporting.
 - [Model assets](../docs/model_assets.md) and
   [quantization](../docs/quantization.md): checkpoint records and offline
   conversion.

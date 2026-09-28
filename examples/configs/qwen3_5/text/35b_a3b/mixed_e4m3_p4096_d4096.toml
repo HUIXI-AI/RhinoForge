@@ -15,7 +15,7 @@ decode_steps = 4096
 stop_on_eos = false
 
 [run]
-warmup = 1
+warmup = 2
 warmup_decode_steps = 3
 runs = 1
 inference_mode = false

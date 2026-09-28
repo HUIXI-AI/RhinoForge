@@ -12,7 +12,7 @@ dtype = "fp16"
 fixture = "/path/to/halo_step0_tensor_inputs.pt"
 
 [run]
-warmup = 1
+warmup = 2
 runs = 3
 hwperf = false
 profile = false

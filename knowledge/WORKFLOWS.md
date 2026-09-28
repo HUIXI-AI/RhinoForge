@@ -57,6 +57,10 @@ apply the selected mode only to inference; see
 Count retained Graph queues together with temporary capture and first-call
 validation queues when checking a fixed Graph arena pool. A successful replay
 alone does not cover the peak during cold construction.
+For steady-state timing, finish numerical checks and release their temporary
+exports before warming the real REPLAY path. The shared runner defaults to two
+warmup calls, reports them separately, and releases raw returned outputs after
+snapshotting them outside the timer. See [performance measurement](../docs/performance.md).
 For Pi0.5 fixed-input comparisons, use the public `input.noise` field for both
 Graph preparation and inference; retain default-input failures separately.
 See the [policy API](../docs/api_reference.md#policy-apis) and

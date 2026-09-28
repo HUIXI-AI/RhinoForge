@@ -18,7 +18,7 @@ decode_steps = 32
 stop_on_eos = false
 
 [run]
-warmup = 1
+warmup = 2
 runs = 3
 hwperf = false
 profile = false

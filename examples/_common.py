@@ -421,7 +421,7 @@ def load_config(path: Path) -> dict:
     for key in ("hwperf", "profile", "inference_mode"):
         if type(run.get(key, False)) is not bool:
             raise ConfigError(f"[run].{key} must be boolean")
-    for key, default, minimum in (("warmup", 1, 0), ("runs", 1, 1), ("seed", 0, 0)):
+    for key, default, minimum in (("warmup", 2, 0), ("runs", 1, 1), ("seed", 0, 0)):
         _integer(run.get(key, default), f"[run].{key}", minimum)
     if "output_dir" in run and (not isinstance(run["output_dir"], str) or not run["output_dir"]):
         raise ConfigError("[run].output_dir must be a non-empty path")

@@ -32,7 +32,7 @@ expert_w8a16 = true
 full_w8a16 = false
 
 [run]
-warmup = 1
+warmup = 2
 runs = 3
 hwperf = false
 profile = false

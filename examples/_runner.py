@@ -170,14 +170,14 @@ def run(config):
     parent.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix=example["profile_id"] + "-", dir=parent))
     seed = options.get("seed", 0)
-    warmup = options.get("warmup", 2 if example["target"] == "pi05" else 1)
+    warmup = options.get("warmup", 2)
     runs = options.get("runs", 6 if example["target"] == "pi05" else 1)
     if hw_enabled:
         raise ValueError("hardware trace export is unavailable in the public runtime")
     report = {"runner": "public_example", "profile_id": example["profile_id"],
               "formal_certification": False, "correctness": "not_run",
               "config": config, "warmup": warmup, "runs": runs,
-              "wall_ms_runs": [], "status": "RUNNING"}
+              "warmup_wall_ms_runs": [], "wall_ms_runs": [], "status": "RUNNING"}
     report["cpu_runtime"] = {
         "torch_version": torch.__version__, "torch_num_threads": torch.get_num_threads(),
         "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS"),
@@ -199,12 +199,17 @@ def run(config):
             # RPU PASSTHROUGH and Graph BUILD/REPLAY/one-shot launches wait for
             # completion before returning (enqueu_batch(wait_finish=true)).
             # The actual torch.rpu namespace has no CUDA-style synchronize().
+            # A lazy Graph needs both BUILD and an actual REPLAY before timing.
+            # Keep warmup observations separate, including the first replay.
             for _ in range(warmup):
                 torch.manual_seed(seed)
+                start = time.perf_counter()
                 if "warmup_decode_steps" in options:
-                    infer(decode_steps=options["warmup_decode_steps"])
+                    value = infer(decode_steps=options["warmup_decode_steps"])
                 else:
-                    infer()
+                    value = infer()
+                report["warmup_wall_ms_runs"].append((time.perf_counter() - start) * 1000)
+                del value
             output = None
             for _ in range(runs):
                 torch.manual_seed(seed)
@@ -212,6 +217,9 @@ def run(config):
                 value = infer()
                 report["wall_ms_runs"].append((time.perf_counter() - start) * 1000)
                 output = _cpu_output(value)
+                # The caller-owned CPU snapshot survives. Retire the original
+                # output now, not at `value = infer()` inside the next timer.
+                del value
                 if isinstance(output, dict) and "generation" in output:
                     report.setdefault("generation_runs", []).append(output["generation"])
             torch.save(output, directory / "output.pt")
@@ -238,6 +246,7 @@ def run(config):
             report["cleanup_error"] = f"{type(exc).__name__}: {exc}"
             raise
         text = [f"# {example['profile_id']}", "", "Inference only; correctness/certification not run.", "",
+                f"Warmup calls (ms; excluded): {report['warmup_wall_ms_runs']}", "",
                 f"Median: {report['median_ms']:.3f} ms; samples: {values}", ""]
         if "generation_runs" in report:
             text += [f"Generation summary statistic: {options.get('summary_statistic', 'mean')}; "

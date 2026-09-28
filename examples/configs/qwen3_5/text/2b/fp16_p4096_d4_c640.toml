@@ -15,7 +15,7 @@ decode_steps = 4
 prefill_tokens = 4096
 
 [run]
-warmup = 1
+warmup = 2
 runs = 3
 hwperf = false
 profile = false

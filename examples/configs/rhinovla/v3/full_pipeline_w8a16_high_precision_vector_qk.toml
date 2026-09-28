@@ -43,7 +43,7 @@ full_w8a16 = true
 [run]
 torch_num_threads = 12
 inference_mode = false
-warmup = 1
+warmup = 2
 runs = 3
 hwperf = false
 profile = false

@@ -1215,6 +1215,9 @@ class RhinoVLAOnRPU:
         return self._export_text_prefix_kv_cpu(), prep["prefix_mask"]
 
     def _export_text_prefix_kv_cpu(self):
+        # Diagnostic exports belong to the caller. Retaining one here would
+        # defer its release until the next predict() overwrites _last_prefix_kv,
+        # moving validation cleanup into the next inference's timing window.
         dyn = self._text_cache.to_dynamic_cache("cpu")
         physical_prefix_len = int(self._text_cache.position)
         kv = []
@@ -1224,7 +1227,6 @@ class RhinoVLAOnRPU:
                 k[:, :, :physical_prefix_len, :].float().contiguous(),
                 v[:, :, :physical_prefix_len, :].float().contiguous(),
             ))
-        self._last_prefix_kv = kv
         return kv
 
     def export_last_prefix_kv_cpu(self):

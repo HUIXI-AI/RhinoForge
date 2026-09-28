@@ -30,7 +30,7 @@ trust_model_code = true
 num_steps = 10
 
 [run]
-warmup = 1
+warmup = 2
 runs = 3
 hwperf = false
 profile = false

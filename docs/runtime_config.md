@@ -133,6 +133,13 @@ planning semantics are documented under [non-environment runtime controls](#non-
 
 ## Host execution settings
 
+`run.warmup` defaults to two inference calls for every shared-runner target.
+For a lazily captured fixed signature, these cover BUILD and one REPLAY.
+Explicit counts, including zero and one for cold diagnostics, are honored
+without hidden calls. `warmup_wall_ms_runs` records every warmup call separately
+from `wall_ms_runs`. Reduced `warmup_decode_steps` does not establish readiness
+for unvisited decode shapes. See [performance measurement](performance.md).
+
 The shared examples runner prepares every model under `no_grad()` with
 `inference_mode(False)`. Persistent weights and mutable Graph inputs therefore
 retain version counters; `run.inference_mode` still controls warmup and timed

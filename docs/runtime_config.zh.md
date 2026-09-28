@@ -109,6 +109,11 @@ chunk size 为 `"auto"` 或正 16 倍数，并受各 loader 的实际 profile �
 
 ## Host 执行设置
 
+所有统一 runner 入口的 `run.warmup` 默认值都是两次推理调用。对延迟捕获的固定
+signature，这覆盖 BUILD 和一次 REPLAY。显式次数（含冷路径诊断的零次或一次）原样
+执行，不插入隐藏调用。每次预热耗时保存在 `warmup_wall_ms_runs`，与 `wall_ms_runs`
+分开。缩短 `warmup_decode_steps` 不能保证尚未经过的 decode 形状已就绪，见[性能测量](performance.zh.md)。
+
 统一 examples runner 在 `no_grad()` 和 `inference_mode(False)` 下准备所有模型，
 使持久权重和可变 Graph 输入保留版本计数；`run.inference_mode` 仍控制 warmup
 和计时推理。延迟安装组件也需要局部使用相同的准备上下文。依赖 tensor 版本的缓存

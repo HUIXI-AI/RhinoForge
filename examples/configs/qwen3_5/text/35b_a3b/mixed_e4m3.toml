@@ -12,7 +12,7 @@ prompt = "A compiler translates source code into executable instructions. Its ma
 decode_steps = 31
 
 [run]
-warmup = 1
+warmup = 2
 runs = 3
 hwperf = false
 profile = false

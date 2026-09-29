@@ -3,7 +3,7 @@
 
 enum class Pi05OwnerNormResidual { Full, Compact };
 
-// Exact M272/M288/M304/M320/M400/M416/M432/M448, N2048, eight cores. Gamma has identical FP16 bytes on every
+// Exact M272/M288/M304/M320/M336/M400/M416/M432/M448/M464, N2048, eight cores. Gamma has identical FP16 bytes on every
 // core, as established by the model's broadcast preload and admission gate.
 // All addresses are absolute core-0 SPM addresses and operands are disjoint.
 void rpu_launch_pi05_owner_norm_spm_kernel(
@@ -14,7 +14,7 @@ void rpu_launch_pi05_owner_norm_spm_kernel(
 void rpu_launch_pi05_compact_residual_spm_kernel(
     uint32_t partial, uint32_t compact_residual, uint32_t full_raw, int64_t rows = 400);
 
-// Experimental compact C272/C288/C304/C320/C400/C416/C432/C448 OwnerNorm: resident full-row quantization, then
+// Experimental compact C272/C288/C304/C320/C336/C400/C416/C432/C448/C464 OwnerNorm: resident full-row quantization, then
 // gather A8[rows,2080] including embedded scales and emit FP16 scale[rows].
 void rpu_launch_pi05_owner_norm_a8_spm_kernel(
     uint32_t partial, uint32_t residual, uint32_t compact_raw,

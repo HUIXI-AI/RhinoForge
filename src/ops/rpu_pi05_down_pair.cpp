@@ -12,8 +12,8 @@ using namespace ::rhino_lkn;
 void rpu_launch_pi05_down_pair_spm_kernel(
     uint32_t input0, uint32_t input1, const at::Tensor& weight,
     uint32_t output0, uint32_t output1, const at::Tensor& scale, int64_t rows) {
-    TORCH_CHECK(rows == 272 || rows == 288 || rows == 304 || rows == 320 || rows == 400 || rows == 416 || rows == 432 || rows == 448,
-                "Pi Down pair requires C272/C288/C304/C320/C400/C416/C432/C448");
+    TORCH_CHECK(rows == 272 || rows == 288 || rows == 304 || rows == 320 || rows == 336 || rows == 400 || rows == 416 || rows == 432 || rows == 448 || rows == 464,
+                "Pi Down pair requires C272/C288/C304/C320/C336/C400/C416/C432/C448/C464");
     const bool fp16 = weight.defined() && weight.scalar_type() == at::kHalf;
     const uint32_t M=rows;
     constexpr uint32_t N=2048, K=2048, Cores=8;
@@ -43,6 +43,9 @@ void rpu_launch_pi05_down_pair_spm_kernel(
     const KernelId id = rows == 432
         ? (fp16 ? KernelId::PI05_DOWN_WEIGHT_OUTER_FP16_C432X2_M112N80K128
                 : KernelId::PI05_DOWN_WEIGHT_OUTER_W8A16_C432X2_M112N80K128) :
+        rows == 464
+        ? (fp16 ? KernelId::PI05_DOWN_WEIGHT_OUTER_FP16_C464X2_M80N80K128
+                : KernelId::PI05_DOWN_WEIGHT_OUTER_W8A16_C464X2_M80N80K128) :
         rows == 448
         ? (fp16 ? KernelId::PI05_DOWN_WEIGHT_OUTER_FP16_C448X2_M96N80K128
                 : KernelId::PI05_DOWN_WEIGHT_OUTER_W8A16_C448X2_M96N80K128) :
@@ -55,6 +58,9 @@ void rpu_launch_pi05_down_pair_spm_kernel(
         : rows == 304
         ? (fp16 ? KernelId::PI05_DOWN_WEIGHT_OUTER_FP16_C304X2_M160N80K128
                 : KernelId::PI05_DOWN_WEIGHT_OUTER_W8A16_C304X2_M160N80K128) :
+        rows == 336
+        ? (fp16 ? KernelId::PI05_DOWN_WEIGHT_OUTER_FP16_C336X2_M160N80K128
+                : KernelId::PI05_DOWN_WEIGHT_OUTER_W8A16_C336X2_M160N80K128) :
         rows == 320
         ? (fp16 ? KernelId::PI05_DOWN_WEIGHT_OUTER_FP16_C320X2_M160N80K128
                 : KernelId::PI05_DOWN_WEIGHT_OUTER_W8A16_C320X2_M160N80K128)

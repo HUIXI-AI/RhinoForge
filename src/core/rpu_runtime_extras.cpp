@@ -264,10 +264,12 @@ void launch_ring_all_reduce_sum_residual(
         ? (M == 512 ? KernelId::PI05_RING_XOR3_M512N1152
            : M == 272 ? KernelId::PI05_RING_XOR3_M272N2048
            : M == 432 ? KernelId::PI05_RING_XOR3_M432N2048
+           : M == 464 ? KernelId::PI05_RING_XOR3_M464N2048
            : M == 448 ? KernelId::PI05_RING_XOR3_M448N2048
            : M == 416 ? KernelId::PI05_RING_XOR3_M416N2048
            : M == 288 ? KernelId::PI05_RING_XOR3_M288N2048
            : M == 304 ? KernelId::PI05_RING_XOR3_M304N2048
+           : M == 336 ? KernelId::PI05_RING_XOR3_M336N2048
            : M == 320 ? KernelId::PI05_RING_XOR3_M320N2048
            : M == 768 ? KernelId::PI05_RING_XOR3_M768N1152
            : M == 400 ? KernelId::PI05_RING_XOR3_M400N2048 : KernelId::PI05_RING_XOR3_M50N1024)

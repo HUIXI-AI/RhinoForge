@@ -12,8 +12,8 @@ using namespace ::rhino_lkn;
 
 namespace {
 uint32_t prefill_full_bytes(int64_t rows) {
-    TORCH_CHECK(rows == 272 || rows == 288 || rows == 304 || rows == 320 || rows == 400 || rows == 416 || rows == 432 || rows == 448,
-                "Pi owner norm requires exact C272/C288/C304/C320/C400/C416/C432/C448");
+    TORCH_CHECK(rows == 272 || rows == 288 || rows == 304 || rows == 320 || rows == 336 || rows == 400 || rows == 416 || rows == 432 || rows == 448 || rows == 464,
+                "Pi owner norm requires exact C272/C288/C304/C320/C336/C400/C416/C432/C448/C464");
     return static_cast<uint32_t>(rows) * 2048 * sizeof(c10::Half);
 }
 
@@ -100,7 +100,10 @@ void rpu_launch_pi05_owner_norm_spm_kernel(
     const auto id = rows == 432
         ? (full ? KernelId::PI05_OWNER_NORM_FULL_RESIDUAL_M432N2048
                 : KernelId::PI05_OWNER_NORM_COMPACT_RESIDUAL_M432N2048)
-        : rows == 448
+        : rows == 464
+        ? (full ? KernelId::PI05_OWNER_NORM_FULL_RESIDUAL_M464N2048
+                : KernelId::PI05_OWNER_NORM_COMPACT_RESIDUAL_M464N2048) :
+        rows == 448
         ? (full ? KernelId::PI05_OWNER_NORM_FULL_RESIDUAL_M448N2048
                 : KernelId::PI05_OWNER_NORM_COMPACT_RESIDUAL_M448N2048)
         : rows == 416
@@ -112,6 +115,9 @@ void rpu_launch_pi05_owner_norm_spm_kernel(
         : rows == 304
         ? (full ? KernelId::PI05_OWNER_NORM_FULL_RESIDUAL_M304N2048
                 : KernelId::PI05_OWNER_NORM_COMPACT_RESIDUAL_M304N2048) :
+        rows == 336
+        ? (full ? KernelId::PI05_OWNER_NORM_FULL_RESIDUAL_M336N2048
+                : KernelId::PI05_OWNER_NORM_COMPACT_RESIDUAL_M336N2048) :
         rows == 320
         ? (full ? KernelId::PI05_OWNER_NORM_FULL_RESIDUAL_M320N2048
                 : KernelId::PI05_OWNER_NORM_COMPACT_RESIDUAL_M320N2048)
@@ -129,11 +135,13 @@ void rpu_launch_pi05_compact_residual_spm_kernel(
     const auto base=check_operands({{partial,FullBytes},
         {compact_residual,CompactBytes},{full_raw,FullBytes}});
     launch(rows == 432 ? KernelId::PI05_XOR3_COMPACT_RESIDUAL_RAW_FULL_M432N2048
-         : rows == 448 ? KernelId::PI05_XOR3_COMPACT_RESIDUAL_RAW_FULL_M448N2048
+         : rows == 464 ? KernelId::PI05_XOR3_COMPACT_RESIDUAL_RAW_FULL_M464N2048
+                : rows == 448 ? KernelId::PI05_XOR3_COMPACT_RESIDUAL_RAW_FULL_M448N2048
          : rows == 416 ? KernelId::PI05_XOR3_COMPACT_RESIDUAL_RAW_FULL_M416N2048
          : rows == 288 ? KernelId::PI05_XOR3_COMPACT_RESIDUAL_RAW_FULL_M288N2048
          : rows == 304 ? KernelId::PI05_XOR3_COMPACT_RESIDUAL_RAW_FULL_M304N2048
-         : rows == 320 ? KernelId::PI05_XOR3_COMPACT_RESIDUAL_RAW_FULL_M320N2048
+         : rows == 336 ? KernelId::PI05_XOR3_COMPACT_RESIDUAL_RAW_FULL_M336N2048
+                : rows == 320 ? KernelId::PI05_XOR3_COMPACT_RESIDUAL_RAW_FULL_M320N2048
          : rows == 272 ? KernelId::PI05_XOR3_COMPACT_RESIDUAL_RAW_FULL_M272N2048
                        : KernelId::PI05_XOR3_COMPACT_RESIDUAL_RAW_FULL_M400N2048,
            base,partial,compact_residual,full_raw,0,0,false,0,0,rows);
@@ -143,10 +151,10 @@ void rpu_launch_pi05_owner_norm_a8_spm_kernel(
     uint32_t partial,uint32_t residual,uint32_t compact_raw,
     uint32_t a8,uint32_t gamma,uint32_t row_scale,double eps,int64_t rows) {
     const uint32_t FullBytes = prefill_full_bytes(rows), CompactBytes = FullBytes / 8;
-    // C272/C288/C304/C320/C416/C432/C448 consumers read a vector past the final scalar scale.
+    // C272/C288/C304/C320/C416/C432/C448/C464 consumers read a vector past the final scalar scale.
     // Initialize the 32B tail even when all M48 tiles are complete.
     const uint32_t scale_bytes = static_cast<uint32_t>(rows) * sizeof(c10::Half) +
-        (rows == 272 || rows == 288 || rows == 304 || rows == 320 || rows == 416 || rows == 432 || rows == 448 ? 32 : 0);
+        (rows == 272 || rows == 288 || rows == 304 || rows == 320 || rows == 336 || rows == 416 || rows == 432 || rows == 448 || rows == 464 ? 32 : 0);
     TORCH_CHECK(std::isfinite(eps) && eps==1e-6,
                 "Pi A8 owner norm requires original epsilon 1e-6");
     const std::initializer_list<std::pair<uint32_t,uint32_t>> ranges{
@@ -162,11 +170,13 @@ void rpu_launch_pi05_owner_norm_a8_spm_kernel(
                     uint64_t(range.first)+range.second<=row_scale,
                     "Pi A8 owner norm scale aliases a live operand");
     launch(rows == 432 ? KernelId::PI05_OWNER_NORM_COMPACT_A8_M432N2048
-         : rows == 448 ? KernelId::PI05_OWNER_NORM_COMPACT_A8_M448N2048
+         : rows == 464 ? KernelId::PI05_OWNER_NORM_COMPACT_A8_M464N2048
+                : rows == 448 ? KernelId::PI05_OWNER_NORM_COMPACT_A8_M448N2048
          : rows == 416 ? KernelId::PI05_OWNER_NORM_COMPACT_A8_M416N2048
          : rows == 288 ? KernelId::PI05_OWNER_NORM_COMPACT_A8_M288N2048
          : rows == 304 ? KernelId::PI05_OWNER_NORM_COMPACT_A8_M304N2048
-         : rows == 320 ? KernelId::PI05_OWNER_NORM_COMPACT_A8_M320N2048
+         : rows == 336 ? KernelId::PI05_OWNER_NORM_COMPACT_A8_M336N2048
+                : rows == 320 ? KernelId::PI05_OWNER_NORM_COMPACT_A8_M320N2048
          : rows == 272 ? KernelId::PI05_OWNER_NORM_COMPACT_A8_M272N2048
                        : KernelId::PI05_OWNER_NORM_COMPACT_A8_M400N2048,base,
            partial,residual,compact_raw,a8,gamma,true,eps,row_scale,rows);

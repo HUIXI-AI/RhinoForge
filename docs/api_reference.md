@@ -164,7 +164,10 @@ The following classes are exported from `rpu_backend.api`:
 Public LIBERO optimized profiles use
 `Pi05Policy.from_pretrained(..., optimized_profile=...)` with `precision`
 (`fp16`, `w8a16`, `w8_action_nvfp4`, or `w8_prefill_a8_action_nvfp4`),
-`num_cameras` (2 or 3), and `text_tokens` (32, 64, 96, or 128).
+`num_cameras` (2 or 3), and `text_tokens` (32, 64, 96, 128, or 160).
+T160 uses exact paired prefill C336/C464 for two/three cameras and requires
+a compatible operator asset containing those shapes; the original v1.1.0
+asset does not contain them and is rejected before weight loading.
 Precision must match checkpoint metadata and the required operator capabilities.
 `prepare_graphs(...)` precomputes AdaRMS by default for these profiles. See
 [`examples/configs/pi05/`](../examples/configs/pi05/).

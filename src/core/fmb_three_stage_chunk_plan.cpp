@@ -340,7 +340,7 @@ int64_t fmb_ring_all_reduce_route_selector(int64_t rows, int64_t cols,
 
 int64_t fmb_ring_all_reduce_route_selector(int64_t rows, int64_t cols, bool pi05_xor3, int num_cores) {
     const bool exact = ((rows == 512 || rows == 768) && cols == 1152) ||
-        ((rows == 272 || rows == 288 || rows == 304 || rows == 320 || rows == 400 || rows == 416 || rows == 432 || rows == 448) && cols == 2048) || (rows == 50 && cols == 1024);
+        ((rows == 272 || rows == 288 || rows == 304 || rows == 320 || rows == 336 || rows == 400 || rows == 416 || rows == 432 || rows == 448 || rows == 464) && cols == 2048) || (rows == 50 && cols == 1024);
     if (!pi05_xor3 || !exact || num_cores != 8) return fmb_ring_all_reduce_route_selector(rows, cols, num_cores);
     return static_cast<int64_t>(FmbSharedAllReduceRouteSelector::RING_PI05_XOR3);
 }

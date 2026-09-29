@@ -144,3 +144,63 @@ def test_action_nvfp4_keeps_tensor_scale_fp32_and_packs_once():
     assert q.weight.shape == (128, 128)
     assert pack_int4_projections_inplace(expert, {"q_proj"}, attn_num_cores=8) == 0
     assert torch.equal(original, q.weight)
+
+
+@pytest.mark.parametrize("cameras,rows", [(2, 336), (3, 464)])
+@pytest.mark.parametrize("precision", ["fp16", "w8a16", "w8_action_nvfp4", "w8_prefill_a8_action_nvfp4"])
+def test_t160_profile_binds_exact_plan_and_requires_matching_assets(cameras, rows, precision, monkeypatch):
+    from rpu_backend.adapters.pi05 import _selected_prefill_pair_rows
+    from rpu_backend.adapters.pi05.optimized import required_kernel_names, require_profile_assets
+
+    profile = normalize_profile(dict(precision=precision, num_cameras=cameras, text_tokens=160))
+    execution = execution_for_profile(profile, None)
+    assert execution["prefill"]["chunk_size"] == rows
+    names = [f"observation.images.camera{i}" for i in range(cameras)]
+    adapter = SimpleNamespace(_rpu_prefill_text_tokens=160, _rpu_execution=execution,
+        _lerobot_policy=SimpleNamespace(config=SimpleNamespace(image_features=names)))
+    assert _selected_prefill_pair_rows(adapter) == rows
+    expected = required_kernel_names(profile)
+    with profile_environment_scope(profile):
+        assert os.environ["RPU_PI05_DENOISE_NVFP4_GEGLU_ACC16_M50"] == str(int("nvfp4" in precision))
+    if "nvfp4" in precision:
+        acc32 = {"action": {"linear_acc32": True}}
+        with profile_environment_scope(profile, acc32):
+            assert os.environ["RPU_PI05_DENOISE_NVFP4_GEGLU_ACC16_M50"] == "0"
+        assert "pi05_denoise_gate_up_geglu_nvfp4_acc16_m320n64k128" not in required_kernel_names(profile, acc32)
+    assert f"pi05_prefill_kv1_direct_cache_m{rows}d256p{rows}" in expected
+    dtype = "fp16" if precision == "fp16" else "w8a16"
+    tile = 80 if cameras == 3 else 160
+    assert f"pi05_down_weight_outer_{dtype}_c{rows}x2_m{tile}n80k128" in expected
+    with pytest.raises(ValueError, match="chunk_size"):
+        execution_for_profile(profile, {"prefill": {"chunk_size": rows - 16}})
+
+    def missing_asset(kernels):
+        assert kernels == expected
+        raise RuntimeError("required kernel is missing")
+
+    monkeypatch.setattr(torch.ops.rpu, "require_kernel_names", missing_asset, raising=False)
+    with pytest.raises(RuntimeError, match="required kernel is missing"):
+        require_profile_assets(profile)
+
+
+@pytest.mark.parametrize("cameras", [2, 3])
+def test_t160_mask_checks_complete_capacity_before_inference(cameras):
+    profile = normalize_profile(dict(precision="fp16", num_cameras=cameras, text_tokens=160))
+    names = [f"observation.images.camera{i}" for i in range(cameras)]
+    policy = SimpleNamespace(_optimized_profile=profile,
+        _lerobot_policy=SimpleNamespace(config=SimpleNamespace(image_features=names)))
+    batch = {name: torch.zeros(1, 3, 16, 16) for name in names}
+    batch["observation.language.tokens"] = torch.zeros(1, 160, dtype=torch.int64)
+    mask = batch["observation.language.attention_mask"] = torch.ones(1, 160, dtype=torch.bool)
+    validate_profile_batch(policy, batch, 10)
+    mask[:, 159:] = False
+    validate_profile_batch(policy, batch, 10)
+    mask[:, 32] = False
+    with pytest.raises(ValueError, match="right padding"):
+        validate_profile_batch(policy, batch, 10)
+    mask.zero_()
+    with pytest.raises(ValueError, match="nonempty"):
+        validate_profile_batch(policy, batch, 10)
+    batch["observation.language.tokens"] = torch.zeros(1, 161, dtype=torch.int64)
+    with pytest.raises(ValueError, match="exactly 160"):
+        validate_profile_batch(policy, batch, 10)

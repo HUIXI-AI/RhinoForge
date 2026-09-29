@@ -120,6 +120,16 @@ to change allocator mode.
   host profile checks and before the first RPU tensor allocation. This removes
   HostDDR allocation churn without creating a Pi-specific backend allocator or
   operator schedule.
+- Optimized profiles admit fixed language widths T32/T64/T96/T128/T160 with
+  two or three cameras. T160 binds paired prefill P672/C336 or P928/C464 and
+  requires the matching operator asset; the original runtime-v1.1.0 archive
+  lacks these kernels. Three-camera T160 keeps both residual stripes inside
+  four existing SPM roots and spills them together to the retained Q DDR
+  owner across paired GateUp/Down. It reuses scratch masks and paired
+  projections with smaller tiles. Action
+  NVFP4 ACC16 uses fused GeGLU at T160 as it does at T32.
+  [Optimized profiles](../../python/rpu_backend/adapters/pi05/optimized.py)
+  [Example configurations](../../examples/configs/pi05/README.md)
 - The input tensor dictionary must come from checkpoint-compatible
   preprocessing. Camera keys, image geometry, token length, and auxiliary
   fields belong to that checkpoint contract.

@@ -1096,8 +1096,8 @@ void rpu_launch_pi05_prefill_kv1_pair_owner_w8a16_m400n32x2k2048_kernel(
     const at::Tensor& v_full_weight,
     const at::Tensor& v_full_scale,
     uint32_t v_output_spm_addr, int64_t rows) {
-  TORCH_CHECK(rows == 272 || rows == 288 || rows == 304 || rows == 320 || rows == 400 || rows == 416 || rows == 432 || rows == 448,
-              "Pi Prefill KV1 requires C272/C288/C304/C320/C400/C416/C432/C448");
+  TORCH_CHECK(rows == 272 || rows == 288 || rows == 304 || rows == 320 || rows == 336 || rows == 400 || rows == 416 || rows == 432 || rows == 448 || rows == 464,
+              "Pi Prefill KV1 requires C272/C288/C304/C320/C336/C400/C416/C432/C448/C464");
   const bool fp16 = k_full_weight.defined() && k_full_weight.scalar_type() == at::kHalf;
   const uint32_t kRows = rows;
   constexpr uint32_t kLocalN = 32;
@@ -1111,6 +1111,12 @@ void rpu_launch_pi05_prefill_kv1_pair_owner_w8a16_m400n32x2k2048_kernel(
   const KernelId kKernelId = rows == 432
       ? (fp16 ? KernelId::PI05_PREFILL_KV1_PAIR_OWNER_FP16_M432N32X2K2048
               : KernelId::PI05_PREFILL_KV1_PAIR_OWNER_W8A16_M432N32X2K2048) :
+        rows == 464
+      ? (fp16 ? KernelId::PI05_PREFILL_KV1_PAIR_OWNER_FP16_M464N32X2K2048
+              : KernelId::PI05_PREFILL_KV1_PAIR_OWNER_W8A16_M464N32X2K2048) :
+        rows == 336
+      ? (fp16 ? KernelId::PI05_PREFILL_KV1_PAIR_OWNER_FP16_M336N32X2K2048
+              : KernelId::PI05_PREFILL_KV1_PAIR_OWNER_W8A16_M336N32X2K2048) :
         rows == 448
       ? (fp16 ? KernelId::PI05_PREFILL_KV1_PAIR_OWNER_FP16_M448N32X2K2048
               : KernelId::PI05_PREFILL_KV1_PAIR_OWNER_W8A16_M448N32X2K2048) :
@@ -3298,8 +3304,8 @@ void rpu_launch_pi05_prefill_gate_up_geglu_weight_outer_w8a16_c400x2_kernel(
     uint32_t output1_spm_addr,
     const at::Tensor& gate_scale,
     const at::Tensor& up_scale, int64_t rows) {
-  TORCH_CHECK(rows == 272 || rows == 288 || rows == 304 || rows == 320 || rows == 400 || rows == 416 || rows == 432 || rows == 448,
-              "Pi Prefill GateUp pair requires C272/C288/C304/C320/C400/C416/C432/C448");
+  TORCH_CHECK(rows == 272 || rows == 288 || rows == 304 || rows == 320 || rows == 336 || rows == 400 || rows == 416 || rows == 432 || rows == 448 || rows == 464,
+              "Pi Prefill GateUp pair requires C272/C288/C304/C320/C336/C400/C416/C432/C448/C464");
   const bool fp16 = gate_weight.defined() && gate_weight.scalar_type() == at::kHalf;
   const uint32_t kRows = rows;
   constexpr uint32_t kLocalN = 2048;
@@ -3354,6 +3360,12 @@ void rpu_launch_pi05_prefill_gate_up_geglu_weight_outer_w8a16_c400x2_kernel(
   const KernelId kernel_id = rows == 432
       ? (fp16 ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_FP16_C432X2_M112N80K128
               : KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_W8A16_C432X2_M112N80K128) :
+        rows == 464
+      ? (fp16 ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_FP16_C464X2_M80N80K128
+              : KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_W8A16_C464X2_M80N80K128) :
+        rows == 336
+      ? (fp16 ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_FP16_C336X2_M160N80K128
+              : KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_W8A16_C336X2_M160N80K128) :
         rows == 448
       ? (fp16 ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_FP16_C448X2_M96N80K128
               : KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_W8A16_C448X2_M96N80K128) :
@@ -3503,13 +3515,13 @@ void rpu_launch_pi05_prefill_gate_up_geglu_w8a8_split_kernel(
     const at::Tensor& gate_weight,const at::Tensor& up_weight,
     uint32_t output0,uint32_t output1,
     const at::Tensor& gate_scale,const at::Tensor& up_scale, int64_t rows) {
-  TORCH_CHECK(rows == 272 || rows == 288 || rows == 304 || rows == 320 || rows == 400 || rows == 416 || rows == 432 || rows == 448,
-              "Pi Prefill A8 requires exact C272/C288/C304/C320/C400/C416/C432/C448");
-  const uint32_t m=rows, panel=rows>=400 ? 384 : 256;
+  TORCH_CHECK(rows == 272 || rows == 288 || rows == 304 || rows == 320 || rows == 336 || rows == 400 || rows == 416 || rows == 432 || rows == 448 || rows == 464,
+              "Pi Prefill A8 requires exact C272/C288/C304/C320/C336/C400/C416/C432/C448/C464");
+  const uint32_t m=rows, panel=rows==464 ? 448 : rows==336 ? 320 : (rows>=400 ? 384 : 256);
   TORCH_CHECK(SPM_ALLOC.is_initialized(),"Pi Prefill A8 requires initialized SPM");
   const uint32_t base=SPM_ALLOC.addr(0,0);
   const std::array<std::pair<uint32_t,uint32_t>,5> ranges{{
-      {a8,2*m*2080},{row_scale,2*m*2+(rows==272 || rows==288 || rows==304 || rows==320 || rows==416 || rows==432 || rows==448 ? 32u : 0u)},{stage,2*panel*2048},
+      {a8,2*m*2080},{row_scale,2*m*2+(rows==272 || rows==288 || rows==304 || rows==320 || rows==336 || rows==416 || rows==432 || rows==448 || rows==464 ? 32u : 0u)},{stage,2*panel*2048},
       {output0,m*2048*2},{output1,m*2048*2}}};
   for(size_t i=0;i<ranges.size();++i) {
     const auto& range=ranges[i];
@@ -3532,6 +3544,8 @@ void rpu_launch_pi05_prefill_gate_up_geglu_w8a8_split_kernel(
         scale->storage_offset()==0 && scale->sizes()==at::IntArrayRef({16384}),
         "Pi Prefill A8 requires cold promoted RPU FP32 scales [16384]");
   const auto id=rows==432 ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_W8A8_SPLIT_C432_M48N32K2048 :
+               rows==464 ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_W8A8_SPLIT_C464_M48N32K2048 :
+               rows==336 ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_W8A8_SPLIT_C336_M48N32K2048 :
                rows==448 ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_W8A8_SPLIT_C448_M48N32K2048 :
                rows==416 ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_W8A8_SPLIT_C416_M48N32K2048 :
                rows==288 ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_W8A8_SPLIT_C288_M48N32K2048 :

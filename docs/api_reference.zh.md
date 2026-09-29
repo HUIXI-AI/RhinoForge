@@ -136,7 +136,9 @@ adapter。
 公开 LIBERO 优化配置通过 `Pi05Policy.from_pretrained(..., optimized_profile=...)`
 指定：`precision` 为 `fp16`、`w8a16`、`w8_action_nvfp4` 或
 `w8_prefill_a8_action_nvfp4`；`num_cameras` 为 2 或 3；`text_tokens` 为
-32、64、96 或 128。精度必须匹配 checkpoint 元数据，所需算子必须存在。
+32、64、96、128 或 160。精度必须匹配 checkpoint 元数据，所需算子必须存在。
+T160 对应双相机 P672/C336 或三相机 P928/C464，需要包含这两种形状算子的
+配套 runtime；原始 runtime-v1.1.0 算子包不包含它们，缺失时会在加载权重前报错。
 `prepare_graphs(...)` 对此配置默认预计算 AdaRMS；示例见
 [`examples/configs/pi05/`](../examples/configs/pi05/)。
 

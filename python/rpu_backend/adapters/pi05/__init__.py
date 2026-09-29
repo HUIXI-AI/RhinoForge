@@ -502,8 +502,8 @@ def _sync_adapter_runtime_state(adapter: Any, state: dict[str, Any]) -> None:
 def _selected_prefill_pair_rows(adapter) -> int:
     """Resolve only the explicitly selected cold text bucket, never tokenizer defaults."""
     text_tokens = getattr(adapter, "_rpu_prefill_text_tokens", 32)
-    if type(text_tokens) is not int or text_tokens not in (32, 64, 96, 128):
-        raise ValueError("Pi0.5 cold text bucket must be 32, 64, 96, or 128")
+    if type(text_tokens) is not int or text_tokens not in (32, 64, 96, 128, 160):
+        raise ValueError("Pi0.5 cold text bucket must be 32, 64, 96, 128, or 160")
     config = getattr(adapter._lerobot_policy, "config", None)
     if config is None:
         config = adapter._lerobot_policy.model.config

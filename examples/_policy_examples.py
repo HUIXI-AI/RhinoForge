@@ -78,8 +78,8 @@ def validate_pi05_config(config):
     inputs, options = config["input"], config["run"]
     if type(inputs.get("cameras")) is not int or inputs["cameras"] not in (2, 3):
         raise ValueError("[input].cameras must be 2 or 3")
-    if type(inputs.get("text_tokens", 32)) is not int or inputs.get("text_tokens", 32) not in (32, 64, 96, 128):
-        raise ValueError("[input].text_tokens must be 32, 64, 96, or 128")
+    if type(inputs.get("text_tokens", 32)) is not int or inputs.get("text_tokens", 32) not in (32, 64, 96, 128, 160):
+        raise ValueError("[input].text_tokens must be 32, 64, 96, 128, or 160")
     if type(inputs.get("num_steps", 10)) is not int or inputs.get("num_steps", 10) != 10:
         raise ValueError("Pi0.5 examples require num_steps=10")
     for key in ("checkpoint", "batch"):

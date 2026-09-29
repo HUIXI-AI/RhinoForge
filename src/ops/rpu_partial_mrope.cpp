@@ -294,10 +294,11 @@ void rpu_launch_pi05_k_rope_insert_spm_kernel(
                     plan.segment(0).kernel == KvInsertKernel::V16 &&
                     (plan.segment(0).position == 544 || plan.segment(0).position == 800 ||
                      plan.segment(0).position == 832 || plan.segment(0).position == 576 ||
-                     plan.segment(0).position == 864 || plan.segment(0).position == 896 || plan.segment(0).position == 608 || plan.segment(0).position == 640) &&
+                     plan.segment(0).position == 864 || plan.segment(0).position == 896 || plan.segment(0).position == 608 || plan.segment(0).position == 640 ||
+                     plan.segment(0).position == 672 || plan.segment(0).position == 928) &&
                     plan.segment(0).token_offset == 0 &&
                     plan.segment(0).rows == 64 && spm_rows == 64,
-                "Pi0.5 K-RoPE insert requires the complete M50/P544/P576/P608/P640/P800/P832/P864/P896/PAD16 V16 plan");
+                "Pi0.5 K-RoPE insert requires the complete M50/P544/P576/P608/P640/P672/P800/P832/P864/P896/P928/PAD16 V16 plan");
     constexpr uint32_t kBytes = 64 * 256 * sizeof(c10::Half);
     TORCH_CHECK((k_off & 255) == 0 &&
                     k_off <= SpmAllocator::SPM_USABLE - kBytes,

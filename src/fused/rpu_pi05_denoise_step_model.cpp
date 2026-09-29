@@ -126,7 +126,7 @@ namespace {
 // These two camera profiles share the same M50 Action math and storage ABI.
 // Keep the real prefix in every descriptor; never pad P544 into P800.
 bool pi05_action_prefix_admitted(int64_t prefix) {
-    return prefix == 544 || prefix == 576 || prefix == 608 || prefix == 640 || prefix == 800 || prefix == 832 || prefix == 864 || prefix == 896;
+    return prefix == 544 || prefix == 576 || prefix == 608 || prefix == 640 || prefix == 672 || prefix == 800 || prefix == 832 || prefix == 864 || prefix == 896 || prefix == 928;
 }
 
 // Bounded schedule extension. Per-body kernels are unchanged; the
@@ -1005,7 +1005,8 @@ bool Pi05DenoiseStepModel::use_pi05_nvfp4_geglu_m50(int64_t rows) const {
     return !linear_acc32_ && pi05_nvfp4_geglu_m50_opt_in_ && nvfp4_.enabled() &&
         num_cores() == 8 && attn_tp() == 8 && mlp_tp() == 8 && rows == 50 &&
         planned_num_steps_ == 10 &&
-        (planned_prefix_len_ == 544 || planned_prefix_len_ == 800) &&
+        (planned_prefix_len_ == 544 || planned_prefix_len_ == 672 ||
+         planned_prefix_len_ == 800 || planned_prefix_len_ == 928) &&
         pi05_nvfp4_weight_profile_admitted() && use_pi05_xor3_gated_mlp(rows) &&
         KernelCache::instance().has_loaded(
             KernelId::PI05_DENOISE_GATE_UP_GEGLU_NVFP4_ACC16_M320N64K128);

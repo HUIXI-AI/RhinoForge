@@ -78,8 +78,8 @@ def profile_environment(
     return result
 
 def _validate_text_profile(text_tokens: int, *, cameras: int, precision: str | None = None) -> None:
-    if type(text_tokens) is not int or text_tokens not in (32, 64, 96, 128):
-        raise ValueError("text_tokens must be 32, 64, 96, or 128")
+    if type(text_tokens) is not int or text_tokens not in (32, 64, 96, 128, 160):
+        raise ValueError("text_tokens must be 32, 64, 96, 128, or 160")
     if text_tokens != 32:
         if cameras not in (2, 3):
             raise ValueError(f"T{text_tokens} requires exactly two or three cameras")
@@ -198,7 +198,7 @@ def profile_environment_scope(profile, execution=None):
     _, _, _, action = resolve_pi05_execution_components(
         execution_for_profile(profile, execution), entry_point="optimized Pi0.5 environment")
     desired["RPU_PI05_DENOISE_NVFP4_GEGLU_ACC16_M50"] = str(int(
-        "nvfp4" in profile["precision"] and profile["text_tokens"] == 32
+        "nvfp4" in profile["precision"] and profile["text_tokens"] in (32, 160)
         and not action.get("action", {}).get("linear_acc32", False)))
     # These internal cold flags bridge the existing native constructor ABI.
     # The public profile owns them only for the operation and restores the
@@ -277,8 +277,8 @@ def required_kernel_names(profile, execution=None):
     rows = (256 * profile["num_cameras"] + profile["text_tokens"]) // 2
     vision = 256 * profile["num_cameras"]
     precision = "fp16" if profile["precision"] == "fp16" else "w8a16"
-    tile = 96 if rows == 448 else 112 if rows == 432 else 128 if rows == 416 else 160
-    o_tile = tile if rows in (416, 432, 448) else 128
+    tile = 80 if rows == 464 else 96 if rows == 448 else 112 if rows == 432 else 128 if rows == 416 else 160
+    o_tile = tile if rows in (416, 432, 448, 464) else 128
     names = [
         f"pi05_all_reduce_residual_xor3_m{vision}n1152",
         f"pi05_all_reduce_residual_xor3_m{rows}n2048",
@@ -307,7 +307,7 @@ def required_kernel_names(profile, execution=None):
         accumulation = "acc32" if action.get("action", {}).get("linear_acc32", False) else "acc16"
         names += [f"parallel_linear_wnvfp4a16_{accumulation}_m320n64k128",
                   f"parallel_linear_wnvfp4a16_{accumulation}_m384n48k128"]
-        if accumulation == "acc16" and profile["text_tokens"] == 32:
+        if accumulation == "acc16" and profile["text_tokens"] in (32, 160):
             names.append("pi05_denoise_gate_up_geglu_nvfp4_acc16_m320n64k128")
     else:
         names.append("pi05_denoise_gate_up_geglu_" + precision +

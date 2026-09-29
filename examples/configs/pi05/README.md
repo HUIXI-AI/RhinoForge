@@ -43,7 +43,7 @@ NVFP4 是 E2M1 浮点编码，使用 block16 的 FP8 scale 和 FP32 tensor scale
 | `input.batch` | CPU tensor 字典，包含 policy 要求的图像、相机 mask、状态、token 和文本 mask。 |
 | `input.noise` | 可选的 CPU float32 tensor 文件，形状 `[1,50,32]`，作为明确输入传给准备与预测；不设置时保留默认噪声采样。 |
 | `input.cameras` | 2 或 3 个相机槽位；与目录和真实 batch 一致。 |
-| `input.text_tokens` | 模板使用 32，固定文本容量；不是任意 prompt 字符长度。 |
+| `input.text_tokens` | 支持 32/64/96/128/160；模板使用 32，表示固定文本容量，不是 prompt 字符数。 |
 | `input.num_steps` | 模板固定 10 个 denoise step。 |
 | `run.warmup` / `runs` / `seed` | 预热、正式样本次数和种子；加载与 Graph 准备位于正式样本之外。 |
 | `run.output_dir` | 报告目录。`run.profile` 正常保持关闭；公开示例不采集硬件 trace。 |
@@ -54,7 +54,7 @@ NVFP4 是 E2M1 浮点编码，使用 block16 的 FP8 scale 和 FP32 tensor scale
 
 ## 冷态配置与复用
 
-`rpu_execution.model.num_cores` 保持 8。`vision/prefill/action.linear_acc32` 分别控制组件累加精度，默认 `false` 为 ACC16；更改后重新加载 policy。chunk 保留 `"auto"`，runner 按两/三相机与 T32 绑定 paired prefill；优化 profile 要求零额外 prefill padding，不能扩大 `padding_budget` 或随意修改 chunk 来绕过几何检查。
+`rpu_execution.model.num_cores` 保持 8。`vision/prefill/action.linear_acc32` 分别控制组件累加精度，默认 `false` 为 ACC16；更改后重新加载 policy。chunk 保留 `"auto"`，runner 按两/三相机与所选文本容量绑定 paired prefill；优化 profile 要求零额外 prefill padding，不能扩大 `padding_budget` 或随意修改 chunk 来绕过几何检查。
 
 服务中复用同一个 `Pi05Policy`，安装后准备 Graph，再重复预测，结束时 `close()`。新请求保持已准备的相机、文本容量、mask 和 action 范围；变更精度、相机槽位或规划设置时创建新 policy。一个进程只保留一个 RPU policy owner，不要每次请求重载权重。
 
@@ -71,3 +71,5 @@ dtype、finite、prefix KV 与 Graph 生命周期。MSE、最大绝对误差、r
 逐行分布及单侧零行计数仅作诊断，不再采用固定的跨模型浮点误差门限。
 运行通过不等于任务质量认证；量化实现应对照相同量化权重，原始浮点参考的
 动作差异与真实任务质量另行评估。READY 表示 Graph 生命周期准备完成。
+
+T160 使用两相机 C336×2、三相机 C464×2，需要包含这两组专用算子的匹配运行资产。原始 v1.1.0 资产不包含 T160 算子，加载器会在权重加载前拒绝。复制现有配置并设置 `input.text_tokens = 160`，同时提供 `[1,160]` token 和非空、右侧 padding 的布尔 attention mask；精度、相机、动作长度及十步 denoise 的约束保持不变。

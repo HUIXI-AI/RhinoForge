@@ -17,8 +17,8 @@ void rpu_launch_pi05_prefill_pair_spm_kernel(
                 kind==Pi05PrefillPairedProjection::AttentionOutputRow,
                 "Pi paired prefill invalid projection ABI");
     const bool column=kind==Pi05PrefillPairedProjection::QkvColumn;
-    TORCH_CHECK(rows == 272 || rows == 288 || rows == 304 || rows == 320 || rows == 400 || rows == 416 || rows == 432 || rows == 448,
-                "Pi paired prefill requires C272/C288/C304/C320/C400/C416/C432/C448");
+    TORCH_CHECK(rows == 272 || rows == 288 || rows == 304 || rows == 320 || rows == 336 || rows == 400 || rows == 416 || rows == 432 || rows == 448 || rows == 464,
+                "Pi paired prefill requires C272/C288/C304/C320/C336/C400/C416/C432/C448/C464");
     const bool fp16 = weight.defined() && weight.scalar_type() == at::kHalf;
     TORCH_CHECK(!column || (rows == 400 && !fp16), "Pi paired QKV prototype remains C400/W8");
     const uint32_t M=rows,N=column?256:2048,K=column?2048:256;
@@ -50,6 +50,8 @@ void rpu_launch_pi05_prefill_pair_spm_kernel(
     const auto id = column ? KernelId::PI05_PREFILL_QKV_WEIGHT_OUTER_W8A16_C400X2_M128N64K128 :
         rows == 432 ? (fp16 ? KernelId::PI05_PREFILL_O_WEIGHT_OUTER_FP16_C432X2_M112N80K128
                             : KernelId::PI05_PREFILL_O_WEIGHT_OUTER_W8A16_C432X2_M112N80K128) :
+        rows == 464 ? (fp16 ? KernelId::PI05_PREFILL_O_WEIGHT_OUTER_FP16_C464X2_M80N80K128
+                            : KernelId::PI05_PREFILL_O_WEIGHT_OUTER_W8A16_C464X2_M80N80K128) :
         rows == 448 ? (fp16 ? KernelId::PI05_PREFILL_O_WEIGHT_OUTER_FP16_C448X2_M96N80K128
                             : KernelId::PI05_PREFILL_O_WEIGHT_OUTER_W8A16_C448X2_M96N80K128) :
         rows == 416 ? (fp16 ? KernelId::PI05_PREFILL_O_WEIGHT_OUTER_FP16_C416X2_M128N80K128
@@ -58,6 +60,8 @@ void rpu_launch_pi05_prefill_pair_spm_kernel(
                             : KernelId::PI05_PREFILL_O_WEIGHT_OUTER_W8A16_C288X2_M128N80K128) :
         rows == 304 ? (fp16 ? KernelId::PI05_PREFILL_O_WEIGHT_OUTER_FP16_C304X2_M128N80K128
                             : KernelId::PI05_PREFILL_O_WEIGHT_OUTER_W8A16_C304X2_M128N80K128) :
+        rows == 336 ? (fp16 ? KernelId::PI05_PREFILL_O_WEIGHT_OUTER_FP16_C336X2_M128N80K128
+                            : KernelId::PI05_PREFILL_O_WEIGHT_OUTER_W8A16_C336X2_M128N80K128) :
         rows == 320 ? (fp16 ? KernelId::PI05_PREFILL_O_WEIGHT_OUTER_FP16_C320X2_M128N80K128
                             : KernelId::PI05_PREFILL_O_WEIGHT_OUTER_W8A16_C320X2_M128N80K128) :
         fp16 ? (rows == 400 ? KernelId::PI05_PREFILL_O_WEIGHT_OUTER_FP16_C400X2_M128N80K128 :

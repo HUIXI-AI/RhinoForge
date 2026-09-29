@@ -1132,10 +1132,11 @@ void rpu_launch_pi05_kv1_direct_cache_m50d256p64_kernel(
             plan.segment(0).kernel == KvInsertKernel::V16 &&
             (plan.segment(0).position == 544 || plan.segment(0).position == 800 ||
              plan.segment(0).position == 832 || plan.segment(0).position == 576 ||
-             plan.segment(0).position == 864 || plan.segment(0).position == 896 || plan.segment(0).position == 608 || plan.segment(0).position == 640) &&
+             plan.segment(0).position == 864 || plan.segment(0).position == 896 || plan.segment(0).position == 608 || plan.segment(0).position == 640 ||
+             plan.segment(0).position == 672 || plan.segment(0).position == 928) &&
             plan.segment(0).token_offset == 0 &&
             plan.segment(0).rows == kPhysicalRows,
-        "Pi0.5 KV1 direct-cache requires the exact P544/P576/P608/P640/P800/P832/P864/P896/M50/PAD64 plan");
+        "Pi0.5 KV1 direct-cache requires the exact P544/P576/P608/P640/P672/P800/P832/P864/P896/P928/M50/PAD64 plan");
     TORCH_CHECK(
         logical_rope_position >= 0 && logical_rope_position <= UINT32_MAX,
         "Pi0.5 KV1 direct-cache logical RoPE position exceeds u32");
@@ -1317,9 +1318,9 @@ void rpu_launch_pi05_prefill_kv1_direct_cache_m400d256p400_kernel(
     const KvInsertSegmentPlan& plan) {
     TORCH_CHECK(plan.logical_rows() == 272 || plan.logical_rows() == 288 ||
                 plan.logical_rows() == 304 || plan.logical_rows() == 320 ||
-                plan.logical_rows() == 400 ||
-                plan.logical_rows() == 416 || plan.logical_rows() == 432 || plan.logical_rows() == 448,
-                "Pi0.5 prefill KV1 direct-cache requires C272/C288/C304/C320/C400/C416/C432/C448");
+                plan.logical_rows() == 336 || plan.logical_rows() == 400 ||
+                plan.logical_rows() == 416 || plan.logical_rows() == 432 || plan.logical_rows() == 448 || plan.logical_rows() == 464,
+                "Pi0.5 prefill KV1 direct-cache requires C272/C288/C304/C320/C336/C400/C416/C432/C448/C464");
     const uint32_t kActiveRows = static_cast<uint32_t>(plan.logical_rows());
     const uint32_t kPhysicalRows = kActiveRows;
     constexpr uint32_t kHeadDim = 256;
@@ -1334,6 +1335,10 @@ void rpu_launch_pi05_prefill_kv1_direct_cache_m400d256p400_kernel(
         size_t{1} * 128 * 1 * 16 * 8 * 16 * 16 * sizeof(c10::Half);
     const KernelId kKernelId = kActiveRows == 432
         ? KernelId::PI05_PREFILL_KV1_DIRECT_CACHE_M432D256P432
+        : kActiveRows == 464
+        ? KernelId::PI05_PREFILL_KV1_DIRECT_CACHE_M464D256P464
+        : kActiveRows == 336
+        ? KernelId::PI05_PREFILL_KV1_DIRECT_CACHE_M336D256P336
         : kActiveRows == 448
         ? KernelId::PI05_PREFILL_KV1_DIRECT_CACHE_M448D256P448
         : kActiveRows == 416
@@ -1361,7 +1366,7 @@ void rpu_launch_pi05_prefill_kv1_direct_cache_m400d256p400_kernel(
              plan.segment(0).position == kActiveRows) &&
             plan.segment(0).token_offset == 0 &&
             plan.segment(0).rows == kPhysicalRows,
-        "Pi0.5 prefill KV1 direct-cache requires an exact P544/C272, P576/C288, P608/C304, P640/C320, P800/C400, P832/C416, P864/C432 or P896/C448 "
+        "Pi0.5 prefill KV1 direct-cache requires an exact P544/C272, P576/C288, P608/C304, P640/C320, P672/C336, P800/C400, P832/C416, P864/C432, P896/C448 or P928/C464 "
         "ALIGNED_V16 plan at physical start 0 or chunk rows");
     TORCH_CHECK(
         logical_rope_position == plan.segment(0).position,

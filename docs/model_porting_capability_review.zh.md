@@ -18,7 +18,7 @@ architecture 不是配置。
 - 精度和量化元数据；
 - batch、sequence、cache、image、video 和 action horizon 上限；
 - 预处理与返回输出契约；
-- RhinoForge、PyTorch、Rhino Launch 和合并算子资产版本；
+- RhinoForge、PyTorch、Rhino Launch 和main 与 DDR expansion 两份算子资产版本；
 - 下文五种 outcome 中的一个。
 
 未知值是评审缺口，不是继承相邻配置的许可。

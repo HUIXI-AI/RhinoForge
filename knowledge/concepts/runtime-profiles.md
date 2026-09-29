@@ -10,7 +10,7 @@ Treat a profile as a tuple of:
 - model/checkpoint revision and precision or quantization format;
 - admitted input, sequence, image/view, batch, and action envelope;
 - immutable per-handle execution planning;
-- RhinoForge, Rhino Launch, and combined operator-asset runtime set; and
+- RhinoForge, Rhino Launch, and main/expansion operator-asset runtime set; and
 - effective public runtime configuration.
 
 Changing any member creates a new profile that needs its own admission,

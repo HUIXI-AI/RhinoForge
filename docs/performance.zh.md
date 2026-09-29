@@ -13,7 +13,7 @@ RhinoForge 的性能结果只对一个确定的模型与运行时配置有意义
 运行前记录：
 
 - RhinoForge 源码 revision 和安装包版本；
-- Rhino Launch 包与合并算子资产的兼容标识；
+- Rhino Launch 包与main 与 DDR expansion 两份算子资产的兼容标识；
 - 模型 checkpoint revision、精度和量化元数据；
 - 板卡/runtime 版本及相关 host 软件版本；
 - 输入形状或请求范围、生成或动作参数和 batch；

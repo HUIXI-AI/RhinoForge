@@ -221,7 +221,7 @@ private:
 // Public provider release and opaque asset identities. A dependency bump
 // invalidates sealed hardware cost certificates; it does not relabel
 // historical calibration evidence. Hashes refer to the shared library and
-// combined operator payload supplied with this release.
+// DDR-expansion operator payload supplied with this release.
 inline constexpr char kKvInsertCostRuntimeRelease[] = "runtime-v1.1.0";
 inline constexpr char kKvInsertCostLaunchSha256[] =
     "30b98620d37645d72ecff4390cc95c0061ef9bf3a9c6b7fde69b359c2d00c423";

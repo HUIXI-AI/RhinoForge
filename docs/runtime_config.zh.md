@@ -46,7 +46,7 @@ RhinoForge 提供少量面向用户的设置，以及数量更多的精确模型
 直接使用 adapter 时采用下文记录的源码原始默认值。
 
 部署负责的路径和凭据不应写入 TOML。尤其应在经过验证的部署环境中设置
-`RPU_KERNEL_LIB_PATH`，并通过 loader 的显式 `rpu_execution` 参数传入冷态、按 handle
+`RPU_KERNEL_LIB_PATH` 和 `RPU_KERNEL_LIB_PATH_EXPANSION`，并通过 loader 的显式 `rpu_execution` 参数传入冷态、按 handle
 生效的规划。模型 preflight 始终具有最终决定权，并可能拒绝超出精确配置范围的环境值
 或执行设置。
 
@@ -146,7 +146,8 @@ Qwen3-VL 另接受冷态布尔值 `prefill.fast_replay`，不接受 `vision.fast
 
 | 变量 | 未设置时的默认值与接受值 | 读取 / 更改 | 作用域、效果与风险 |
 |---|---|---|---|
-| `RPU_KERNEL_LIB_PATH` | 扩展旁的 combined operator asset；现有文件路径及相邻 `.kernels` manifest | 首次访问 asset / **IMPORT** | 进程级 asset 选择。资产或 manifest 缺失、不兼容或不受信任都会阻止安全执行。 |
+| `RPU_KERNEL_LIB_PATH` | native 扩展旁的 `rhinoOpLib_current.ref`；现有文件路径及相邻 `.kernels` manifest | 首次访问 asset / **IMPORT** | rhino-ops `main` 角色，进程内冻结，两份资产均为必需。 |
+| `RPU_KERNEL_LIB_PATH_EXPANSION` | 所选 main 路径旁的 `rhinoExpansionOpLib_current.ref`；现有文件路径及相邻 `.kernels` manifest | 首次访问 asset / **IMPORT** | `feat/ddr-expansion-ops` 角色，包含全部 backend 新增算子。必须与 main 解析到不同文件；更换资产需启动新进程。 |
 | `RPU_MODEL_CACHE` | `~/.cache/rhinoforge/models`；目录路径 | 为 HF 默认值执行包 bootstrap / **IMPORT**，alias 解析 / **CALL** | RhinoForge 模型 alias 的根目录。显式值也会提供 HF cache 默认值；导入后修改会影响之后的 alias，但无法可靠地重新配置已导入的 HF 组件。 |
 | `RPU_LOG_LEVEL` | `3`；十进制整数 `0..5`；无效值会告警并回退到 `3` | 原生扩展加载 / **IMPORT** | 进程日志级别：`0` 静默，最高 `5` trace。较高级别会增加输出，并可能暴露路径或请求 metadata。 |
 | `RPU_WARMUP` | `0`；整数；无效值变为 `0`，负数收窄为 `0` | Adapter 构造 / **MODEL** | 支持 warmup 的 adapter 的 warmup forward 次数。会增加启动工作，并可能消耗诊断预算。 |

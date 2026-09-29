@@ -105,8 +105,9 @@ model and converter versions for reproducibility.
 Model assets do not replace the external runtime prerequisites:
 
 - A matching sanitized Release Rhino Launch package with headers and libraries.
-- The matching combined operator asset selected through `RPU_KERNEL_LIB_PATH`,
-  plus its adjacent `.kernels` manifest.
+- The matching main and DDR-expansion operator assets selected through
+  `RPU_KERNEL_LIB_PATH` and `RPU_KERNEL_LIB_PATH_EXPANSION`, each with its
+  adjacent `.kernels` manifest.
 - The matching board SDK/runtime configured according to the platform's
   installation instructions.
 

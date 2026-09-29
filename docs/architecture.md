@@ -25,12 +25,13 @@ Hugging Face model or policy API
              RPU
 ```
 
-The combined operator asset is loaded through the host launch interface. The
-asset is opaque to RhinoForge: the backend selects named operators and supplies
+The main and DDR-expansion operator assets are loaded through the host launch
+interface. Both assets are opaque to RhinoForge: the backend selects named operators and supplies
 the documented host ABI parameters, but does not parse the asset format or
-interpret device instructions. Kernel availability comes from the adjacent
-versioned `.kernels` release manifest, which contains the asset byte size and
-kernel names only.
+interpret device instructions. Kernel availability comes from each asset's adjacent
+versioned `.kernels` release manifest, which contains its byte size and kernel
+names only. Kernel ownership is fixed by role; both paths and immutable payload
+snapshots are retained for the process.
 
 ## Runtime layers
 

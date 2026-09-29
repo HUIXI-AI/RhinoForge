@@ -86,3 +86,9 @@ implementation. Treat model-support status as profile-specific. Use the entry
 points and runtime boundaries linked from [Examples](../docs/model_support.md)
 and follow [model validation policy](../docs/validation_policy.md). Update stale
 knowledge in the same change; do not preserve conflicting summaries.
+
+For runtime updates, keep exactly the main and DDR-expansion asset roles in
+[runtime assets](../docs/runtime_assets.md). Put backend additions in the
+DDR-expansion build and update both sidecars from their provider inventories.
+Verify role ownership, immutable snapshots, and profile preflight before board
+smoke tests; do not create a model-specific third asset.

@@ -33,8 +33,8 @@ source. Consult the linked upstream license text for the exact version used.
 
 Rhino Launch 1.0.0 is a separately distributed restricted prerequisite. It is
 not included in this repository and is governed by the terms delivered with
-that package. The versioned combined operator asset named by the matching
-runtime set is also distributed separately under its accompanying terms.
+that package. The versioned main and DDR-expansion operator assets named by the matching
+runtime set are also distributed separately under its accompanying terms.
 
 RhinoForge assumes a preconfigured board environment. System components
 provided by that environment remain governed by the platform terms and are not

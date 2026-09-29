@@ -72,7 +72,7 @@ def _reachable_names() -> set[str]:
     preloaded = set(
         re.findall(
             r'\{"([A-Za-z_][A-Za-z0-9_]*)",\s*'
-            r'(?:RHINO_OP|GEMM|SOFTMAX)_LIB_PATH\}',
+            r'(?:RHINO_OP|RHINO_EXPANSION_OP|GEMM|SOFTMAX)_LIB_PATH\}',
             _block(cache, "KERNEL_LIST = {", "};\n\nstatic void print_tensor_info"),
         )
     )

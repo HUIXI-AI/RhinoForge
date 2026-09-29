@@ -17,13 +17,13 @@
 // KernelCache 实现 - 预加载所有 kernel 以减少运行时开销
 // =============================================================================
 
-// The runtime consumes one combined operator asset. Deploy it next to this
-// shared object or point RPU_KERNEL_LIB_PATH at it explicitly.
+// Main and DDR-expansion are the only operator-asset roles. Both payloads
+// remain external and opaque; adjacent .kernels files provide host metadata.
 static std::string get_kernel_lib_path() {
     const char* env = std::getenv("RPU_KERNEL_LIB_PATH");
     if (env && *env) return std::string(env);
 
-    constexpr const char* REF_NAME = "rhinoOpLib_rhinoforge_v1.1.0.ref";
+    constexpr const char* REF_NAME = "rhinoOpLib_current.ref";
 
     auto try_dir = [](const std::string& dir) -> std::string {
         std::string p = dir + "/" + REF_NAME;
@@ -55,29 +55,48 @@ static const std::string& KERNEL_LIB_PATH() {
     return path;
 }
 
-#define RHINO_OP_LIB_PATH KERNEL_LIB_PATH().c_str()
-#define GEMM_LIB_PATH     KERNEL_LIB_PATH().c_str()
-#define SOFTMAX_LIB_PATH  KERNEL_LIB_PATH().c_str()
+static std::string get_kernel_lib_path_expansion() {
+    const char* env = std::getenv("RPU_KERNEL_LIB_PATH_EXPANSION");
+    if (env && *env) return std::string(env);
+
+    constexpr const char* EXP_REF_NAME = "rhinoExpansionOpLib_current.ref";
+    const std::string& current = KERNEL_LIB_PATH();
+    auto pos = current.rfind('/');
+    if (pos != std::string::npos) {
+        return current.substr(0, pos) + "/" + EXP_REF_NAME;
+    }
+    return EXP_REF_NAME;  // Main was explicitly selected relative to cwd.
+}
+
+static const std::string& KERNEL_LIB_PATH_EXPANSION() {
+    static const std::string path = get_kernel_lib_path_expansion();
+    return path;
+}
+
+#define RHINO_OP_LIB_PATH           KERNEL_LIB_PATH().c_str()
+#define RHINO_EXPANSION_OP_LIB_PATH KERNEL_LIB_PATH_EXPANSION().c_str()
+#define GEMM_LIB_PATH               KERNEL_LIB_PATH().c_str()
+#define SOFTMAX_LIB_PATH            KERNEL_LIB_PATH().c_str()
 
 // 需要预加载的 kernel 列表
 static const std::vector<std::pair<std::string, std::string>> KERNEL_LIST = {
     // Optional fused kernels supplied by the matching runtime asset.
-    {"partial_mrope_qk_fused", RHINO_OP_LIB_PATH},
-    {"llama_insert_kv_cache_multiwarp_v16", RHINO_OP_LIB_PATH},
-    {"llama_insert_kv_cache_multiwarp_decode", RHINO_OP_LIB_PATH},
-    {"llama_rms_norm_multiwarp_n_v64", RHINO_OP_LIB_PATH},
-    {"parallel_linear_w8a16_m448n64k128_qkv_planar", RHINO_OP_LIB_PATH},
-    {"llama_silu_mul_exact_strided", RHINO_OP_LIB_PATH},
+    {"partial_mrope_qk_fused", RHINO_EXPANSION_OP_LIB_PATH},
+    {"llama_insert_kv_cache_multiwarp_v16", RHINO_EXPANSION_OP_LIB_PATH},
+    {"llama_insert_kv_cache_multiwarp_decode", RHINO_EXPANSION_OP_LIB_PATH},
+    {"llama_rms_norm_multiwarp_n_v64", RHINO_EXPANSION_OP_LIB_PATH},
+    {"parallel_linear_w8a16_m448n64k128_qkv_planar", RHINO_EXPANSION_OP_LIB_PATH},
+    {"llama_silu_mul_exact_strided", RHINO_EXPANSION_OP_LIB_PATH},
     // Qwen3.5 decode fused kernels shipped by the current main op-lib ref.
     {"qwen3_5_rms_norm_gated", RHINO_OP_LIB_PATH},
     {"qwen3_5_rank1_fma", RHINO_OP_LIB_PATH},
     {"qwen3_5_mul_reduce_rows", RHINO_OP_LIB_PATH},
     {"llama_gemv", RHINO_OP_LIB_PATH},
     {"llama_gemv_wint8", RHINO_OP_LIB_PATH},
-    {"qwen3vl_gateup_swiglu_gemv", RHINO_OP_LIB_PATH},
-    {"qwen3vl_qk_norm_mrope_d128", RHINO_OP_LIB_PATH},
-    {"qwen3vl_qk_norm_mrope_kv_insert_d128", RHINO_OP_LIB_PATH},
-    {"qwen3vl_o_ring_norm_m1_h2560_w8", RHINO_OP_LIB_PATH},
+    {"qwen3vl_gateup_swiglu_gemv", RHINO_EXPANSION_OP_LIB_PATH},
+    {"qwen3vl_qk_norm_mrope_d128", RHINO_EXPANSION_OP_LIB_PATH},
+    {"qwen3vl_qk_norm_mrope_kv_insert_d128", RHINO_EXPANSION_OP_LIB_PATH},
+    {"qwen3vl_o_ring_norm_m1_h2560_w8", RHINO_EXPANSION_OP_LIB_PATH},
     // rhinoOpLib kernels
     {"parallel_linear_wnvfp4a16_acc32_m176n128k128", RHINO_OP_LIB_PATH},
     {"parallel_linear_wnvfp4a16_acc32_m208n112k128", RHINO_OP_LIB_PATH},
@@ -87,19 +106,19 @@ static const std::vector<std::pair<std::string, std::string>> KERNEL_LIST = {
     {"parallel_linear_wnvfp4a16_acc32_m384n48k128", RHINO_OP_LIB_PATH},
     {"parallel_linear_wnvfp4a16_acc32_m480n32k128", RHINO_OP_LIB_PATH},
     {"binary_sameshape", RHINO_OP_LIB_PATH},
-    {"binary_sameshape_ddr", RHINO_OP_LIB_PATH},
+    {"binary_sameshape_ddr", RHINO_EXPANSION_OP_LIB_PATH},
     {"binary_scalar", RHINO_OP_LIB_PATH},
-    {"binary_scalar_ddr", RHINO_OP_LIB_PATH},
+    {"binary_scalar_ddr", RHINO_EXPANSION_OP_LIB_PATH},
     {"binary_scalar_power", RHINO_OP_LIB_PATH},
-    {"binary_scalar_power_ddr", RHINO_OP_LIB_PATH},
+    {"binary_scalar_power_ddr", RHINO_EXPANSION_OP_LIB_PATH},
     {"binary_Nx1_NxC256_batch", RHINO_OP_LIB_PATH},
-    {"binary_Nx1_NxC256_batch_ddr", RHINO_OP_LIB_PATH},
+    {"binary_Nx1_NxC256_batch_ddr", RHINO_EXPANSION_OP_LIB_PATH},
     {"binary_Nx1_NxC256_batch_bopa", RHINO_OP_LIB_PATH},
-    {"binary_Nx1_NxC256_batch_bopa_ddr", RHINO_OP_LIB_PATH},
+    {"binary_Nx1_NxC256_batch_bopa_ddr", RHINO_EXPANSION_OP_LIB_PATH},
     {"binary_Nx1_NxC_v16_batch", RHINO_OP_LIB_PATH},
-    {"binary_Nx1_NxC_v16_batch_ddr", RHINO_OP_LIB_PATH},
+    {"binary_Nx1_NxC_v16_batch_ddr", RHINO_EXPANSION_OP_LIB_PATH},
     {"binary_Nx1_NxC_v16_batch_bopa", RHINO_OP_LIB_PATH},
-    {"binary_Nx1_NxC_v16_batch_bopa_ddr", RHINO_OP_LIB_PATH},
+    {"binary_Nx1_NxC_v16_batch_bopa_ddr", RHINO_EXPANSION_OP_LIB_PATH},
     // V2 tile-based Nx1_NxC (ConvertEltwiseBinary_Nx1_NxC_V2): runtime routes c%16!=0 || c>1024
     // || n>8192 here (e.g. GDN recurrent state *= exp(g_last), c=Dk*Dv=16384).
     {"binary_Nx1_NxC_tileN", RHINO_OP_LIB_PATH},
@@ -107,13 +126,13 @@ static const std::vector<std::pair<std::string, std::string>> KERNEL_LIST = {
     {"binary_Nx1_NxC_tileN_bopa", RHINO_OP_LIB_PATH},
     {"binary_Nx1_NxC_tileC_bopa", RHINO_OP_LIB_PATH},
     {"binary_1xC_NxC_v256_batch", RHINO_OP_LIB_PATH},
-    {"binary_1xC_NxC_v256_batch_ddr", RHINO_OP_LIB_PATH},
+    {"binary_1xC_NxC_v256_batch_ddr", RHINO_EXPANSION_OP_LIB_PATH},
     {"binary_1xC_NxC_v256_batch_bopa", RHINO_OP_LIB_PATH},
-    {"binary_1xC_NxC_v256_batch_bopa_ddr", RHINO_OP_LIB_PATH},
+    {"binary_1xC_NxC_v256_batch_bopa_ddr", RHINO_EXPANSION_OP_LIB_PATH},
     {"binary_1xC_NxC_v16_batch", RHINO_OP_LIB_PATH},
-    {"binary_1xC_NxC_v16_batch_ddr", RHINO_OP_LIB_PATH},
+    {"binary_1xC_NxC_v16_batch_ddr", RHINO_EXPANSION_OP_LIB_PATH},
     {"binary_1xC_NxC_v16_batch_bopa", RHINO_OP_LIB_PATH},
-    {"binary_1xC_NxC_v16_batch_bopa_ddr", RHINO_OP_LIB_PATH},
+    {"binary_1xC_NxC_v16_batch_bopa_ddr", RHINO_EXPANSION_OP_LIB_PATH},
     // V2 tile-based 1xC_NxC (ConvertEltwiseBinary_1xC_NxC_V2): the runtime routes
     // c%16!=0 || c>1024 || n>8192 here (e.g. GDN prep dt_bias/neg_exp_A, c=vg_c=4).
     {"binary_1xC_NxC_tileN", RHINO_OP_LIB_PATH},
@@ -125,10 +144,10 @@ static const std::vector<std::pair<std::string, std::string>> KERNEL_LIST = {
     {"unary_gelu_erf", RHINO_OP_LIB_PATH},
     {"unary_gelu_erf_ultra_precision", RHINO_OP_LIB_PATH},
     {"unary_softplus", RHINO_OP_LIB_PATH},
-    {"unary_ddr", RHINO_OP_LIB_PATH},
+    {"unary_ddr", RHINO_EXPANSION_OP_LIB_PATH},
     {"layer_norm", RHINO_OP_LIB_PATH},
     {"layer_norm_simple", RHINO_OP_LIB_PATH},
-    {"layer_norm_bf16", RHINO_OP_LIB_PATH},
+    {"layer_norm_bf16", RHINO_EXPANSION_OP_LIB_PATH},
     // gemm kernels (常用尺寸) - bmm 动态生成名称，这里预加载常见的组合
     // 格式: gemm_fp16_spm_16b_wMxN_kK_1core_buf1_nt_lpaddr_{peak|univ}
     {"gemm_fp16_spm_16b_w64x64_k64_1core_buf1_nt_lpaddr_peak", GEMM_LIB_PATH},
@@ -174,10 +193,10 @@ static const std::vector<std::pair<std::string, std::string>> KERNEL_LIST = {
     {"tile_general_smallC", RHINO_OP_LIB_PATH},
     // reduce mean kernels
     {"reduce_mean_last_dim", RHINO_OP_LIB_PATH},
-    {"reduce_mean_last_dim_ddr", RHINO_OP_LIB_PATH},
+    {"reduce_mean_last_dim_ddr", RHINO_EXPANSION_OP_LIB_PATH},
     // RMSNorm kernels (llama_rms_norm_fp16 dropped, llama_rms_norm_bf16 renamed
     // to llama_rms_norm in rhinoOpLib v0.1.1_38977cf7)
-    {"llama_rms_norm_bf16_ddr", RHINO_OP_LIB_PATH},
+    {"llama_rms_norm_bf16_ddr", RHINO_EXPANSION_OP_LIB_PATH},
     {"llama_rms_norm", RHINO_OP_LIB_PATH},  // SPM版本
     // R48b —— 多行/warp 变体（**optional**：ref 里没有就跳过，不影响启动）
     {"llama_rms_norm_v16", RHINO_OP_LIB_PATH},
@@ -189,7 +208,7 @@ static const std::vector<std::pair<std::string, std::string>> KERNEL_LIST = {
     // R50 —— mrope 的 SPM 表孪生（optional；只被隔离探针 / 打开开关的路径取用）
     {"llama_mrope_interleave_local_spm_tbl", RHINO_OP_LIB_PATH},
     {"llama_rms_norm_newton", RHINO_OP_LIB_PATH},  // conformance-only
-    {"llama_rope_ddr", RHINO_OP_LIB_PATH},
+    {"llama_rope_ddr", RHINO_EXPANSION_OP_LIB_PATH},
     // M-RoPE kernel (Qwen3-VL R-Phase 1)
     {"llama_mrope_interleave", RHINO_OP_LIB_PATH},
     // Partial RoPE kernels (Qwen3.5 partial rotary):
@@ -242,8 +261,8 @@ static const std::vector<std::pair<std::string, std::string>> KERNEL_LIST = {
     {"argmin_reduceC_tileN_C128_sli", RHINO_OP_LIB_PATH},
     {"argmin_reduceN_tileC", RHINO_OP_LIB_PATH},
     {"argmin_reduceN_tileC_sli", RHINO_OP_LIB_PATH},
-    // memset lives in the expansion ref when absent from the main ref.
-    {"memset_spm_multi_core_v2", RHINO_OP_LIB_PATH},
+    // memset is owned by the expansion role.
+    {"memset_spm_multi_core_v2", RHINO_EXPANSION_OP_LIB_PATH},
     // DDR to SPM memcpy, scatter read DDR, broadcast write spm
     // GDN prefill chunk zeroing: `fill` (1D) replaces the absent memset_v2 (rhino's
     // CreateFill drives this same kernel). Used by rpu_launch_fill_spm_kernel.
@@ -309,21 +328,21 @@ static const std::vector<std::pair<std::string, std::string>> KERNEL_LIST = {
     {"gather", RHINO_OP_LIB_PATH},
     {"llm_gather_mul_v2", RHINO_OP_LIB_PATH},
     {"scatternd_int16_reduction", RHINO_OP_LIB_PATH},
-    {"grouped_parallel_linear_acc32", RHINO_OP_LIB_PATH},
-    {"grouped_parallel_linear_w8a16_acc32", RHINO_OP_LIB_PATH},
-    {"parallel_linear_wnvfp4a16_acc16_m176n128k128", RHINO_OP_LIB_PATH},
-    {"parallel_linear_wnvfp4a16_acc16_m208n112k128", RHINO_OP_LIB_PATH},
-    {"parallel_linear_wnvfp4a16_acc16_m240n96k128", RHINO_OP_LIB_PATH},
-    {"parallel_linear_wnvfp4a16_acc16_m272n80k128", RHINO_OP_LIB_PATH},
-    {"parallel_linear_wnvfp4a16_acc16_m320n64k128", RHINO_OP_LIB_PATH},
-    {"parallel_linear_wnvfp4a16_acc16_m384n48k128", RHINO_OP_LIB_PATH},
-    {"parallel_linear_wnvfp4a16_acc16_m480n32k128", RHINO_OP_LIB_PATH},
-    {"pi05_denoise_gate_up_geglu_nvfp4_acc16_m320n64k128", RHINO_OP_LIB_PATH},
+    {"grouped_parallel_linear_acc32", RHINO_EXPANSION_OP_LIB_PATH},
+    {"grouped_parallel_linear_w8a16_acc32", RHINO_EXPANSION_OP_LIB_PATH},
+    {"parallel_linear_wnvfp4a16_acc16_m176n128k128", RHINO_EXPANSION_OP_LIB_PATH},
+    {"parallel_linear_wnvfp4a16_acc16_m208n112k128", RHINO_EXPANSION_OP_LIB_PATH},
+    {"parallel_linear_wnvfp4a16_acc16_m240n96k128", RHINO_EXPANSION_OP_LIB_PATH},
+    {"parallel_linear_wnvfp4a16_acc16_m272n80k128", RHINO_EXPANSION_OP_LIB_PATH},
+    {"parallel_linear_wnvfp4a16_acc16_m320n64k128", RHINO_EXPANSION_OP_LIB_PATH},
+    {"parallel_linear_wnvfp4a16_acc16_m384n48k128", RHINO_EXPANSION_OP_LIB_PATH},
+    {"parallel_linear_wnvfp4a16_acc16_m480n32k128", RHINO_EXPANSION_OP_LIB_PATH},
+    {"pi05_denoise_gate_up_geglu_nvfp4_acc16_m320n64k128", RHINO_EXPANSION_OP_LIB_PATH},
     {"unary_silu_high_precision", RHINO_OP_LIB_PATH},
     {"unary_tanh_high_precision", RHINO_OP_LIB_PATH},
     {"unary_gelu_erf_high_precision", RHINO_OP_LIB_PATH},
-    {"rhinovla_newton_norm_shift_h1024", RHINO_OP_LIB_PATH},
-    {"rhinovla_silu_high_mul", RHINO_OP_LIB_PATH},
+    {"rhinovla_newton_norm_shift_h1024", RHINO_EXPANSION_OP_LIB_PATH},
+    {"rhinovla_silu_high_mul", RHINO_EXPANSION_OP_LIB_PATH},
     {"unary_gelu_tanh_high_precision", RHINO_OP_LIB_PATH},
 };
 
@@ -344,9 +363,8 @@ static void print_tensor_info(const at::Tensor &t, const std::string &name) {
     }
     std::cout << "]" << std::endl;
 }
-// Kernels in KERNEL_LIST that the backend tolerates being ABSENT from both refs
-// (skipped, not fatal). Everything else is REQUIRED — absent from both refs ⇒ fail-fast, so a
-// missing/misconfigured expansion ref can't silently init an empty cache (→ later nullptr).
+// Optional startup entries may be absent from their designated role. A model
+// that requires one still fails before weight loading via require_names().
 static bool is_optional_kernel(const std::string& name) {
     static const std::unordered_set<std::string> optional = {
         "pi05_denoise_gate_up_geglu_nvfp4_acc16_m320n64k128",
@@ -394,6 +412,12 @@ static std::string canonical_payload_path(const std::string& path) {
 
 static const std::string& FROZEN_KERNEL_LIB_PATH() {
     static const std::string path = canonical_payload_path(KERNEL_LIB_PATH());
+    return path;
+}
+
+static const std::string& FROZEN_KERNEL_LIB_PATH_EXPANSION() {
+    static const std::string path =
+        canonical_payload_path(KERNEL_LIB_PATH_EXPANSION());
     return path;
 }
 
@@ -453,27 +477,58 @@ void KernelCache::initialize() {
     auto start = std::chrono::high_resolution_clock::now();
 
     const std::string& main_path = FROZEN_KERNEL_LIB_PATH();
-    const auto& available = kernel_manifest_names(main_path);
+    const std::string& expansion_path =
+        FROZEN_KERNEL_LIB_PATH_EXPANSION();
+    TORCH_CHECK(
+        main_path != expansion_path,
+        "[KernelCache] main and expansion op-lib paths resolve to the same "
+        "payload: '", main_path, "'");
+    const auto& main_symbols = kernel_manifest_names(main_path);
+    const auto& expansion_symbols = kernel_manifest_names(expansion_path);
+    static constexpr const char* kMainRoleCanaries[] = {
+        "qwen3_5_rms_norm_gated",
+        "qwen3_5_rank1_fma",
+        "qwen3_5_mul_reduce_rows",
+    };
+    for (const char* name : kMainRoleCanaries) {
+        TORCH_CHECK(
+            main_symbols.count(name) != 0 && expansion_symbols.count(name) == 0,
+            "[KernelCache] op-lib role mismatch for main-only kernel '", name,
+            "' (main='", main_path, "' expansion='", expansion_path, "')");
+    }
 
     std::vector<std::string> missing_required;
     for (const auto& [kernel_name, lib_path] : KERNEL_LIST) {
-        if (available.count(kernel_name) == 0) {
+        const bool expansion_role =
+            lib_path == KERNEL_LIB_PATH_EXPANSION();
+        const auto& selected_symbols =
+            expansion_role ? expansion_symbols : main_symbols;
+        if (expansion_role) {
+            TORCH_CHECK(
+                main_symbols.count(kernel_name) == 0,
+                "[KernelCache] expansion-only kernel '", kernel_name,
+                "' is also present in main op-lib '", main_path, "'");
+        }
+        if (selected_symbols.count(kernel_name) == 0) {
             // Probe before create_with_binary_file: the SDK aborts on a missing
             // symbol, so required kernels fail through an actionable exception.
             if (is_optional_kernel(kernel_name)) {
                 if (log_at(3)) {
                     std::cout << "[KernelCache] optional kernel '" << kernel_name
-                              << "' absent from combined asset; skipping" << std::endl;
+                              << "' absent from its designated "
+                              << (expansion_role ? "expansion" : "main")
+                              << " ref — skipping (tolerated)" << std::endl;
                 }
             } else {
                 missing_required.push_back(
+                    std::string(expansion_role ? "expansion:" : "main:") +
                     kernel_name);
             }
             continue;
         }
         try {
             CachedKernel cached = load_kernel_from_oplib(
-                main_path, kernel_name);
+                expansion_role ? expansion_path : main_path, kernel_name);
             kernels_.erase(kernel_name);
             kernels_.emplace(kernel_name, std::move(cached));
         } catch (const std::exception& e) {
@@ -486,6 +541,7 @@ void KernelCache::initialize() {
             // fail-fast as the absent-from-both-refs path, not leave a nullptr behind.
             if (!is_optional_kernel(kernel_name)) {
                 missing_required.push_back(
+                    std::string(expansion_role ? "expansion:" : "main:") +
                     kernel_name);
             }
         }
@@ -494,34 +550,46 @@ void KernelCache::initialize() {
     // Fail-fast instead of letting one ref silently satisfy the other role.
     TORCH_CHECK(missing_required.empty(),
                 "[KernelCache] ", missing_required.size(),
-                " required kernel(s) absent from combined operator asset '",
-                main_path, "'. First missing: '",
+                " required kernel(s) absent from their designated op-lib refs "
+                "(main='", main_path, "' expansion='", expansion_path,
+                "'). First missing: '",
                 (missing_required.empty() ? std::string() : missing_required.front()),
-                "'. Check the .ref install and RPU_KERNEL_LIB_PATH.");
+                "'. Check the .ref install and RPU_KERNEL_LIB_PATH[_EXPANSION].");
 
-    // Load all six 7-tile families from the active main
-    // ref: FP16/W8/W4 x ACC16/ACC32. Missing one is an artifact mismatch, not a
-    // recoverable fallback, because the corresponding base kernels are retired.
+    // All six 7-tile families remain required: FP16/W8 x ACC16/ACC32
+    // belong to main; the signed W4-pgrp ABI belongs to expansion.
+    // Never satisfy a missing tile from the other role.
     {
-        const std::string& at_lib = main_path;
         auto at_names = rpu_pl_tiling::autotile_kernel_names();
-        const auto& at_symbols = kernel_manifest_names(at_lib);
+        const auto autotile_library = [&](const std::string& name)
+            -> const std::string& {
+            return name.rfind("parallel_linear_wint4a16_pgrp_", 0) == 0
+                ? expansion_path : main_path;
+        };
         std::vector<std::string> missing_at;
         for (const auto& kname : at_names) {
-            if (!at_symbols.count(kname)) missing_at.push_back(kname);
+            const std::string& at_lib = autotile_library(kname);
+            const auto& at_symbols = kernel_manifest_names(at_lib);
+            if (!at_symbols.count(kname)) {
+                missing_at.push_back(
+                    std::string(at_lib == expansion_path ? "expansion:" : "main:")
+                    + kname);
+            }
         }
         // Program_t may terminate the process instead of throwing when a symbol
-        // is absent. Inspect the ref first so an old/wrong main artifact fails
+        // is absent. Inspect both roles first so an old/wrong artifact fails
         // through a normal, actionable TORCH_CHECK.
         TORCH_CHECK(
             missing_at.empty(),
             "[KernelCache] autotile ref mismatch: ", missing_at.size(), "/",
-            at_names.size(), " required tiled linear kernels are absent from '",
-            at_lib, "'. First missing: '",
+            at_names.size(), " required tiled linear kernels are absent from their "
+            "designated refs (main='", main_path, "' expansion='", expansion_path,
+            "'). First missing: '",
             (missing_at.empty() ? std::string() : missing_at.front()),
             "'. Install the op ref matching the selected runtime profile.");
         int at_loaded = 0;
         for (const auto& kname : at_names) {
+            const std::string& at_lib = autotile_library(kname);
             try {
                 CachedKernel cached = load_kernel_from_oplib(at_lib, kname);
                 // Some tiled names are also part of the fixed preload list.
@@ -539,20 +607,22 @@ void KernelCache::initialize() {
         TORCH_CHECK(
             at_loaded == static_cast<int>(at_names.size()),
             "[KernelCache] autotile ref mismatch: loaded ", at_loaded, "/",
-            at_names.size(), " required tiled linear kernels from '", at_lib,
-            "'. Install the op ref matching the selected runtime profile.");
+            at_names.size(), " required tiled linear kernels from their designated "
+            "refs (main='", main_path, "' expansion='", expansion_path,
+            "'). Install the op refs matching the selected runtime profile.");
         if (log_at(3)) {
             std::cout << "[KernelCache] autotile: loaded " << at_loaded
-                      << "/" << at_names.size() << " tiled linear variants from "
-                      << at_lib << std::endl;
+                      << "/" << at_names.size()
+                      << " tiled linear variants from main/expansion roles"
+                      << std::endl;
         }
     }
 
-    // Preload optional fused and compact-residual operators from the public asset.
+    // Preload optional fused and compact-residual operators from expansion.
     // Missing symbols are tolerated so unrelated installs remain unchanged;
     // an exact-profile caller fails at lookup with a targeted error.
     {
-        const std::string& mixed_lib = main_path;
+        const std::string& mixed_lib = expansion_path;
         int mixed_loaded = 0;
         static constexpr const char* kMixedNames[] = {
             "llm_all_reduce_residual_local_spm",
@@ -767,12 +837,12 @@ void KernelCache::initialize() {
 
     {
         const std::set<std::string> expected_paths = {
-            main_path};
+            main_path, expansion_path};
         std::lock_guard<std::mutex> lock(loaded_oplib_paths_mutex_);
         TORCH_CHECK(
             loaded_oplib_paths_ == expected_paths,
             "[KernelCache] loaded op-lib receipt does not match the frozen "
-            "combined payload");
+            "main/expansion roles");
     }
 
     auto end = std::chrono::high_resolution_clock::now();
@@ -819,16 +889,19 @@ void KernelCache::initialize() {
 
 void KernelCache::require_names(const std::vector<std::string>& names) {
     initialize();
-    const auto& available = kernel_manifest_names(FROZEN_KERNEL_LIB_PATH());
+    const auto& main_names = kernel_manifest_names(FROZEN_KERNEL_LIB_PATH());
+    const auto& expansion_names = kernel_manifest_names(
+        FROZEN_KERNEL_LIB_PATH_EXPANSION());
     for (const auto& name : names) {
-        TORCH_CHECK(!name.empty() && available.count(name) != 0,
+        TORCH_CHECK(!name.empty() &&
+                        (main_names.count(name) || expansion_names.count(name)),
                     "Selected model profile requires operator '", name,
-                    "'; install the matching RhinoForge operator asset before loading weights");
+                    "'; install the matching RhinoForge main/expansion assets before loading weights");
         const auto loaded = kernels_.find(name);
         TORCH_CHECK(loaded != kernels_.end() && loaded->second.kernel != nullptr,
                     "Selected model profile operator '", name,
                     "' was listed but could not be loaded; install a valid matching "
-                    "RhinoForge operator asset before loading weights");
+                    "RhinoForge main/expansion assets before loading weights");
     }
 }
 
@@ -872,8 +945,18 @@ void KernelCache::populate_fast_cache() {
     }
 
     const std::string& main_path = FROZEN_KERNEL_LIB_PATH();
-    const std::string* selected_path =
-        kernel_manifest_names(main_path).count(kernel_name) ? &main_path : nullptr;
+    const std::string& expansion_path = FROZEN_KERNEL_LIB_PATH_EXPANSION();
+    const std::string* selected_path = nullptr;
+    if (kernel_name.rfind("parallel_linear_wint4a16_pgrp_", 0) == 0) {
+        // Main's W4 ABI differs from the signed packed weights used here.
+        if (kernel_manifest_names(expansion_path).count(kernel_name)) {
+            selected_path = &expansion_path;
+        }
+    } else if (kernel_manifest_names(main_path).count(kernel_name)) {
+        selected_path = &main_path;
+    } else if (kernel_manifest_names(expansion_path).count(kernel_name)) {
+        selected_path = &expansion_path;
+    }
     if (selected_path != nullptr) {
         try {
             CachedKernel cached = load_kernel_from_oplib(

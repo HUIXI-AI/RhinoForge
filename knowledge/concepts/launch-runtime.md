@@ -2,28 +2,29 @@
 
 RhinoForge uses the separately distributed Rhino Launch development package as
 a link-time library dependency. Model code calls public host wrappers; the
-restricted library and combined operator asset remain outside the source tree.
+restricted library and the main/DDR-expansion operator pair remain outside
+the source tree.
 [Restricted runtime assets](../../docs/runtime_assets.md)
 
 ## Dependency and compatibility contract
 
 - CMake resolves one exact `rhino_launch` package version. Install its headers,
   shared library, and CMake package files from the same runtime set as the
-  combined operator asset.
+  main and DDR-expansion operator assets.
   [Build dependency](../../CMakeLists.txt)
 - The shared library is discovered by the board environment's normal loader;
   RhinoForge does not vendor or copy it into the Python package.
-  [Launch installation](../../docs/runtime_assets.md#4-install-without-root)
-- Treat the Launch package, operator asset, and RhinoForge release as one
+  [Launch installation](../../docs/runtime_assets.md#configure-paths)
+- Treat the Launch package, both operator assets, and RhinoForge release as one
   versioned runtime set. A successful link does not prove runtime compatibility.
-  [Runtime set](../../docs/runtime_assets.md#delivery-layout)
+  [Runtime set](../../docs/runtime_assets.md#operator-manifest)
 - Require the runtime set to bind
   `launch_capabilities=batch-buffer-reservation-v1`; the package version and
   SONAME do not identify that lifecycle contract.
-- Require the release-provided `<operator-asset>.kernels` sidecar before loading
+- Require each role's release-provided `<operator-asset>.kernels` sidecar before loading
   any program. It lists the asset size and names only; RhinoForge never parses
   the opaque asset.
-  [Kernel manifest](../../docs/runtime_assets.md#delivery-layout)
+  [Kernel manifest](../../docs/runtime_assets.md#operator-manifest)
 
 ## Public wrapper contract
 

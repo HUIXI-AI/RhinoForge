@@ -106,6 +106,6 @@ See [Getting started](docs/getting_started.md) for installation and a first run.
 ## License
 
 RhinoForge source code is licensed under the
-[Apache License 2.0](LICENSE). Model checkpoints, Rhino Launch, the combined
-operator asset, and other third-party materials are governed by their own terms
+[Apache License 2.0](LICENSE). Model checkpoints, Rhino Launch, the main and
+DDR-expansion operator assets, and other third-party materials are governed by their own terms
 and are not licensed by this repository's `LICENSE` file.

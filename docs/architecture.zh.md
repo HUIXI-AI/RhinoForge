@@ -24,7 +24,7 @@ Hugging Face model 或 policy API
              RPU
 ```
 
-合并算子资产由 host launch interface 加载。对 RhinoForge 它是 opaque 的：backend
+main 与 DDR expansion 两份算子资产由 host launch interface 加载。对 RhinoForge 它是 opaque 的：backend
 选择具名 operation 并提供公开 host ABI 参数，不解析资产格式或解释设备程序。kernel
 可用性来自相邻的版本化 `.kernels` 发行 manifest，其中只包含资产字节数和
 kernel 名称。

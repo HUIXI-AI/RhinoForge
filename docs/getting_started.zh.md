@@ -10,7 +10,8 @@
 
 需要 Python 3.12、C++17 编译器和已配置的板卡 SDK/runtime。按
 [运行时资产](runtime_assets.zh.md)获取匹配的外部资产，并设置
-`RHINO_LAUNCH_ROOT`、`RPU_KERNEL_LIB_PATH` 及动态库路径。
+`RHINO_LAUNCH_ROOT`、`RPU_KERNEL_LIB_PATH`、`RPU_KERNEL_LIB_PATH_EXPANSION`
+及动态库路径。
 
 为当前 checkout 创建新环境，与其他 RhinoForge 或 `rpu_backend` 安装隔离。
 在同一个 shell 中运行：

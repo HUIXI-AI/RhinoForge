@@ -20,7 +20,7 @@ Record these fields in the port proposal:
 - precision and quantization metadata;
 - batch, sequence, cache, image, video, and action-horizon limits;
 - preprocessing and returned-output contract;
-- RhinoForge, PyTorch, Rhino Launch, and combined operator-asset versions; and
+- RhinoForge, PyTorch, Rhino Launch, and main/expansion operator-asset versions; and
 - one final outcome from the five defined below.
 
 An unknown value is a review gap, not permission to inherit a nearby profile.

@@ -6,7 +6,10 @@ and model checkpoints are distributed separately under their own terms.
 
 The RhinoForge v1.1.0 internal prerelease uses the provider-delivered
 `RhinoForge-runtime-v1.1.0.tar.gz`, extracted under `RhinoForge-runtime-v1.1.0/`,
-with `rhinoOpLib_rhinoforge_v1.1.0.ref` and its adjacent `.ref.kernels` manifest.
+with `rhinoOpLib_current.ref` and `rhinoExpansionOpLib_current.ref`, each with
+its adjacent `.ref.kernels` manifest. The pair replaces the former combined ref
+and any model-specific add-on. All new operators belong to the DDR-expansion
+branch; main remains the rhino-ops main build.
 Rhino Launch remains version 1.0.0; `RELEASE.txt` selects the matching sanitized
 Release package. Verify the outer checksum and inner `SHA256SUMS` before using
 the [provider paths](../docs/runtime_assets.md#configure-paths). These filenames
@@ -29,3 +32,6 @@ installation, see [runtime assets](../docs/runtime_assets.md). Use the
 host-side kernel references intersected with a provider-supplied kernel inventory;
 it neither modifies nor verifies the implementation inside an opaque asset.
 Changing a sidecar cannot add missing kernels to the payload.
+
+Run the manifest generator separately for each role using that build's supplied
+inventory. Never merge role inventories or infer operator names from payload bytes.

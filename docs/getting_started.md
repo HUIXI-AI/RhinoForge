@@ -10,7 +10,8 @@ configuration and usage; its templates do not certify model quality.
 ## 1. Prepare the runtime and environment
 
 Use Python 3.12, a C++17 compiler and a configured board SDK/runtime. Obtain the
-matching external assets and set `RHINO_LAUNCH_ROOT`, `RPU_KERNEL_LIB_PATH` and
+matching external assets and set `RHINO_LAUNCH_ROOT`, `RPU_KERNEL_LIB_PATH`,
+`RPU_KERNEL_LIB_PATH_EXPANSION` and
 library paths as described in [Runtime assets](runtime_assets.md).
 
 Create a new environment for this checkout, separate from other RhinoForge or

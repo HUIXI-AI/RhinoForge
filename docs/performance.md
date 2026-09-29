@@ -15,7 +15,7 @@ to diagnose and tune an application; it does not publish benchmark results.
 Record these fields before running:
 
 - RhinoForge source revision and installed package version;
-- Rhino Launch package and combined operator-asset compatibility identifiers;
+- Rhino Launch package and main/expansion operator-asset compatibility identifiers;
 - model checkpoint revision, precision, and quantization metadata;
 - board/runtime version and relevant host software versions;
 - input shape or request envelope, generation or action settings, and batch;

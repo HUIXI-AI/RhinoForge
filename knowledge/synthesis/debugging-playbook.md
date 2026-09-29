@@ -8,7 +8,7 @@ payloads.
 ## Fast triage order
 
 1. **Bind the exact profile.** Record source revision, model/checkpoint revision,
-   dtype, input envelope, TOML, Launch package, combined operator asset, and
+   dtype, input envelope, TOML, Launch package, main and DDR-expansion operator assets, and
    compatibility identifiers. Stop on any mismatch.
    [Release-quality checks](../../docs/model_testing.md#what-a-release-quality-model-check-still-needs)
 2. **Reproduce both references and one RPU result.** Use the exact same-dtype

@@ -16,8 +16,8 @@ root:
 python -m pip install -e '.[dev]' --no-build-isolation
 ```
 
-Set `RPU_KERNEL_LIB_PATH` to the release-matched combined operator asset for
-board execution. Restricted packages and assets must stay outside the
+Set `RPU_KERNEL_LIB_PATH` and `RPU_KERNEL_LIB_PATH_EXPANSION` to the
+release-matched main and DDR-expansion assets for board execution. Restricted packages and assets must stay outside the
 repository.
 
 ## Change requirements

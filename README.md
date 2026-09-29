@@ -95,5 +95,5 @@ python examples/run_model.py --config qwen3.local.toml
 ## 许可证
 
 RhinoForge 源码采用 [Apache License 2.0](LICENSE)。模型 checkpoint、Rhino
-Launch、合并算子资产及其他第三方材料遵循各自条款，不属于本仓库 `LICENSE`
+Launch、main 与 DDR expansion 两份算子资产及其他第三方材料遵循各自条款，不属于本仓库 `LICENSE`
 文件的授权范围。

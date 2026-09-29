@@ -51,7 +51,8 @@ effective process environment still wins; direct adapter use receives the raw
 source defaults documented below.
 
 Deployment-owned paths and credentials do not belong in TOML. In particular,
-set `RPU_KERNEL_LIB_PATH` in the verified deployment environment, and pass
+set `RPU_KERNEL_LIB_PATH` and `RPU_KERNEL_LIB_PATH_EXPANSION` in the verified
+deployment environment, and pass
 cold per-handle planning through the loader's explicit `rpu_execution`
 argument. The model preflight remains authoritative and may reject an ambient
 environment or execution setting outside the exact profile.
@@ -181,7 +182,8 @@ weight installation; close the model and load a new instance to change them.
 
 | Variable | Unset/default and accepted values | Read / change | Scope, effect, and risk |
 |---|---|---|---|
-| `RPU_KERNEL_LIB_PATH` | Combined operator asset beside the extension; existing file path with an adjacent `.kernels` manifest | First asset access / **IMPORT** | Process-wide asset selection. A missing, incompatible, or untrusted asset or manifest prevents safe execution. |
+| `RPU_KERNEL_LIB_PATH` | `rhinoOpLib_current.ref` beside the extension; existing file path with an adjacent `.kernels` manifest | First asset access / **IMPORT** | Main role from rhino-ops `main`, frozen for the process. Both roles are required. |
+| `RPU_KERNEL_LIB_PATH_EXPANSION` | `rhinoExpansionOpLib_current.ref` beside the selected main path; existing file path with an adjacent `.kernels` manifest | First asset access / **IMPORT** | Expansion role from `feat/ddr-expansion-ops`, including all backend additions. Must resolve to a different file from main; restart the process to change either asset. |
 | `RPU_MODEL_CACHE` | `~/.cache/rhinoforge/models`; directory path | Package bootstrap for HF defaults / **IMPORT**, alias resolution / **CALL** | Root for RhinoForge model aliases. An explicit value also supplies HF cache defaults; a post-import change affects later aliases but does not reliably reconfigure already imported HF components. |
 | `RPU_LOG_LEVEL` | `3`; decimal integer `0..5`; invalid values warn and fall back to `3` | Native-extension load / **IMPORT** | Process logging: `0` silent through `5` trace. High levels add output and may expose paths or request metadata. |
 | `RPU_WARMUP` | `0`; integer, invalid becomes `0`, negative clamps to `0` | Adapter construction / **MODEL** | Warmup forward count for adapters that support it. Adds startup work and can consume diagnostic budgets. |

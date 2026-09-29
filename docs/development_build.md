@@ -14,9 +14,9 @@ the following matching assets from the runtime provider before building:
   and `lib/cmake/rhino_launch` package. Current CMake requires
   `graph-arena-pool-v2`, `register-state-token`, sanitized Chrome hwperf support and no development Program
   API. The package version or library filename alone does not prove compatibility.
-- The combined opaque operator asset selected for this source revision, with its
-  adjacent `.kernels` sidecar and provider-supplied integrity values. The current
-  backend consumes one combined asset containing the required public-model kernels.
+- The main and DDR-expansion operator assets selected for this source revision,
+  each with an adjacent `.kernels` sidecar and provider-supplied integrity values.
+  The backend consumes exactly these two roles; additions belong to expansion.
 - The matching board SDK/runtime and its required shared libraries. Keep the
   build-time and run-time Launch installation consistent.
 
@@ -34,12 +34,15 @@ export RHINOFORGE_SOURCE="/absolute/path/to/current/RhinoForge"
 export RHINOFORGE_DEV_ENV="/absolute/path/to/new/rhinoforge-dev-env"
 export RHINOFORGE_DEV_BUILD="/absolute/path/to/new/rhinoforge-dev-build"
 export RHINO_LAUNCH_ROOT="/absolute/path/to/matching/launch-install"
-export RPU_KERNEL_LIB_PATH="/absolute/path/to/matching/combined-operators.ref"
+export RPU_KERNEL_LIB_PATH="/absolute/path/to/matching/rhinoOpLib_current.ref"
+export RPU_KERNEL_LIB_PATH_EXPANSION="/absolute/path/to/matching/rhinoExpansionOpLib_current.ref"
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0
 
 test -r "$RHINO_LAUNCH_ROOT/lib/cmake/rhino_launch/rhino_launchConfig.cmake"
 test -r "$RPU_KERNEL_LIB_PATH"
 test -r "$RPU_KERNEL_LIB_PATH.kernels"
+test -r "$RPU_KERNEL_LIB_PATH_EXPANSION"
+test -r "$RPU_KERNEL_LIB_PATH_EXPANSION.kernels"
 export LD_LIBRARY_PATH="$RHINO_LAUNCH_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 ```
 

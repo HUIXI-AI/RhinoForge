@@ -94,7 +94,8 @@ source model 与 converter version 以便复现。
 模型资产不能替代外部运行时前置项：
 
 - 匹配的 sanitized Release Rhino Launch 包，包含头文件和动态库；
-- 由 `RPU_KERNEL_LIB_PATH` 选择的匹配合并算子资产，以及相邻的 `.kernels` 清单；
+- 由 `RPU_KERNEL_LIB_PATH` 和 `RPU_KERNEL_LIB_PATH_EXPANSION` 选择的配套
+  main 与 DDR expansion 两份算子资产，以及各自相邻的 `.kernels` 清单；
 - 匹配的板卡 SDK/runtime，按平台安装说明配置。
 
 这些组件均不存放在仓库、source archive 或 Python 包中。请向运行时提供方获取与源码

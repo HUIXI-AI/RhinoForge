@@ -21,7 +21,7 @@ and source remain authoritative; see [the schema](SCHEMA.md) and
 - [Getting started](../docs/getting_started.md): installation, metadata checks
   without device access, and first inference.
 - [Restricted runtime assets](../docs/runtime_assets.md): matching external
-  runtime packages, provider integrity checks, and installation.
+  main/DDR-expansion runtime pair, provider integrity checks, and installation.
 - [Model execution and profiling](../docs/model_testing.md): direct examples,
   TOML runner, and profiling.
 - [Model validation policy](../docs/validation_policy.md): proportionate host and hardware checks, numerical records and stop conditions.

@@ -2,13 +2,16 @@
 
 简体中文 | [English](runtime_assets.md)
 
-RhinoForge 源码和 wheel 不包含 Rhino Launch 二进制、合并算子资产、板卡 SDK 或
+RhinoForge 源码和 wheel 不包含 Rhino Launch 二进制、main 与 DDR expansion 两份算子资产、板卡 SDK 或
 模型权重。请向运行时提供方获取与待安装源码版本匹配的资产，按随包条款和完整性说明
 使用。历史运行时回执不能证明当前源码与资产兼容。
 
 RhinoForge v1.1.0 内部预发布的整包名为 `RhinoForge-runtime-v1.1.0.tar.gz`，
 请向提供方同时获取其 `.tar.gz.sha256`。解压目录为 `RhinoForge-runtime-v1.1.0/`，
-其中包含 `rhinoOpLib_rhinoforge_v1.1.0.ref` 和相邻的 `.ref.kernels` 清单。
+其中包含来自 rhino-ops `main` 的 `rhinoOpLib_current.ref`，以及来自
+`feat/ddr-expansion-ops` 的 `rhinoExpansionOpLib_current.ref`，各自带相邻的
+`.ref.kernels` 清单。所有 backend 新增算子（包括 Pi0.5 T160）统一进入 expansion，
+不再依赖模型专用的附加 ref。
 Rhino Launch 自身版本仍为 **1.0.0**，整包版本不会改名或改变该 API 版本；
 使用 `RELEASE.txt` 指定的准确 Launch 内包。内部预发布不表示 GitHub 已发布相应 release/tag。
 
@@ -18,7 +21,7 @@ Rhino Launch 自身版本仍为 **1.0.0**，整包版本不会改名或改变该
   `lib/cmake/rhino_launch/rhino_launchConfig.cmake`。当前 CMake 检查
   `graph-arena-pool-v2`、`register-state-token`、Chrome hwperf 能力，且要求
   不暴露 development Program API。
-- **一份合并算子资产**及相邻的 `<asset>.kernels` 清单：资产需匹配当前源码，
+- **两份算子资产**及各自相邻的 `<asset>.kernels` 清单：资产需匹配当前源码，
   并包含所用公开模型和精度配置要求的 kernel。
 - **匹配的板卡 SDK/runtime**：按平台安装说明配置。
 
@@ -32,18 +35,28 @@ Rhino Launch 自身版本仍为 **1.0.0**，整包版本不会改名或改变该
 
 ```bash
 export RHINO_LAUNCH_ROOT="/absolute/path/to/matching/launch-install"
-export RPU_KERNEL_LIB_PATH="/absolute/path/to/RhinoForge-runtime-v1.1.0/rhinoOpLib_rhinoforge_v1.1.0.ref"
+export RPU_KERNEL_LIB_PATH="/absolute/path/to/RhinoForge-runtime-v1.1.0/rhinoOpLib_current.ref"
+export RPU_KERNEL_LIB_PATH_EXPANSION="/absolute/path/to/RhinoForge-runtime-v1.1.0/rhinoExpansionOpLib_current.ref"
 export CMAKE_PREFIX_PATH="$RHINO_LAUNCH_ROOT${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
 export LD_LIBRARY_PATH="$RHINO_LAUNCH_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 test -r "$RHINO_LAUNCH_ROOT/lib/cmake/rhino_launch/rhino_launchConfig.cmake"
 test -r "$RPU_KERNEL_LIB_PATH"
 test -r "$RPU_KERNEL_LIB_PATH.kernels"
+test -r "$RPU_KERNEL_LIB_PATH_EXPANSION"
+test -r "$RPU_KERNEL_LIB_PATH_EXPANSION.kernels"
 ```
 
 将示例路径替换为实际交付文件。清除继承环境中冲突的 Launch 路径，同时保留 SDK
 必需路径。凭据和本机路径放在 shell 环境中，不写入模型 TOML。随后参考
 [入门指南](getting_started.zh.md)或[源码构建指南](development_build.md)。
+
+main 默认查找 native 扩展旁的 `rhinoOpLib_current.ref`（开发目录也会查找 `src/`）。
+expansion 默认使用所选 main 路径旁的 `rhinoExpansionOpLib_current.ref`，显式环境变量
+可覆盖位置。两个路径必须解析到不同文件；符号链接只解析一次，两份资产均保留为进程内
+不可变快照。升级时整体替换配套资产并启动新进程。运行时检查算子归属，只允许加载这两份
+资产，缺失算子不能由另一角色、合并 ref 或模型附加 ref 代替。有符号 packed W4 Linear
+使用 expansion 实现，FP16 和 W8 Linear 使用 main。
 
 ## 算子清单
 

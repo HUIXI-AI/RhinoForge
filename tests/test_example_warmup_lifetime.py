@@ -47,7 +47,8 @@ def _exercise(monkeypatch, tmp_path, target, warmup=None):
     runner = _runner(monkeypatch)
     clock = SimpleNamespace(seconds=0.0, active=False)
     refs, released, closed = [], [], []
-    durations = [0.500, 0.100, 0.087, 0.088, 0.086]
+    # Synthetic clock advances, unrelated to hardware measurements.
+    durations = [0.500, 0.250, 0.030, 0.040, 0.020]
 
     def tick():
         clock.active = not clock.active

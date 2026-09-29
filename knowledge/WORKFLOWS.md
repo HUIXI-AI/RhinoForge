@@ -64,6 +64,11 @@ snapshotting them outside the timer. With `warmup >= 2`, omit
 `warmup_decode_steps` or match `input.decode_steps`; config validation rejects
 shorter warmup before model loading. Fixed-length tests use `stop_on_eos=false`.
 Two short decode calls do not warm later positions or signatures. See [performance measurement](../docs/performance.md).
+For cache-maintenance changes, trace the actual CPU reads and writes through
+their producing copy operations. Device-only handoffs retain storage and DMA
+ownership without republishing data; host-backed device copies still need both
+boundaries. Check in-place request updates and mask changes before reusing a
+cached upload. See [component handoffs](concepts/component-handoff.md).
 For Pi0.5 fixed-input comparisons, use the public `input.noise` field for both
 Graph preparation and inference; retain default-input failures separately.
 See the [policy API](../docs/api_reference.md#policy-apis) and

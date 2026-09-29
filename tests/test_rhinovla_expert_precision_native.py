@@ -142,7 +142,10 @@ int main() {
         }
         at::Tensor pair({10,18,6144}), final({10,3072});
         auto check=[&] { install_tables(pair,final,m.full_cold_weights_,m.full_cold_scales_,m.full_cold_biases_); };
+        const int table_bind_flushes=flushes;
         check(); m.validate_expert_transfer(31);
+        // Keep the CPU scale-validation reads, without flushing device-only tables.
+        assert(flushes-table_bind_flushes==count);
         assert(m.generation==1 && m.full_action_w8a16_==full && m.expert_cond_w8a16_);
         assert(m.adarms_pair_table_.sizes()==pair.sizes() && m.adarms_final_table_.sizes()==final.sizes());
         const auto installed_generation=m.generation;

@@ -548,11 +548,16 @@ envelope；如果公共 policy API 有记录，它也会公开 resolved executio
   direct allocation，因此不是进程级 driver mapping 总数。
   `reset_peak_memory_stats()` 重置 peak counter，`reset_accumulated_memory_stats()` 重置
   累计 allocate/free counter。重置 counter 不会释放内存。
-- `torch.rpu.set_ddr_flush(bool)` 控制内部 RPU-to-RPU flush point（默认关闭）。模型
-  adapter 可在其 cross-component 契约需要时设置。
+- `torch.rpu.set_ddr_flush(bool)` 控制内部 RPU-to-RPU flush point（默认关闭）。
+  RhinoVLA 保留调用方的进程设置，不再自动开启跨组件的冗余刷新。
 - `torch.rpu.set_ddr_flush_force(bool)` 控制 CPU/RPU boundary coherency（默认开启）。
   普通推理应保持启用；除隔离 microbenchmark 外，禁用是不安全的。对应 `get_*` 函数
   报告当前进程状态。
+
+缓存同步应位于实际 CPU 数据访问处：CPU 写入后、设备读取前发布数据，CPU 读取
+设备输出前完成同步。RPU tensor view、静态表绑定及设备间直接交接不需要额外刷新。
+上传和 `.cpu()` 拷贝负责对应边界；通过主机 `memcpy` 实现的 RPU-to-RPU `copy_`
+仍需要读、写两侧的同步，不能只根据 tensor 的设备标签判断。
 
 ### Profiling 机制
 

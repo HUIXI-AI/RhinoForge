@@ -32,6 +32,51 @@ def _env_truthy(name):
     return rpu_env_bool(name)
 
 
+def _upload_denoise_inputs(owner, inputs):
+    """Publish CPU request fields once; returned device views are borrowed."""
+    if any(value.device.type != "cpu" for value in inputs):
+        return tuple(value.to(device="rpu", dtype=torch.float16).contiguous()
+                     for value in inputs)
+    shapes = tuple(tuple(value.shape) for value in inputs)
+    cached = getattr(owner, "_denoise_input_upload", None)
+    if cached is None or cached[0] != shapes:
+        # Each view begins on a 64-byte boundary. Keep only the current geometry;
+        # the native input DMAs update their live addresses on every forward.
+        sizes = tuple(value.numel() for value in inputs)
+        offsets, total = [], 0
+        for size in sizes:
+            offsets.append(total)
+            total += ((size + 31) // 32) * 32
+        # A first call under inference_mode must not prevent later copy_ updates
+        # from a normal no_grad caller.
+        with torch.inference_mode(False):
+            host = torch.zeros(total, dtype=torch.float16)
+            device = torch.empty_like(host, device="rpu")
+            host_views = tuple(host.narrow(0, offset, size).view(shape)
+                               for offset, size, shape in zip(offsets, sizes, shapes))
+            device_views = tuple(device.narrow(0, offset, size).view(shape)
+                                 for offset, size, shape in zip(offsets, sizes, shapes))
+        cached = (shapes, host, device, host_views, device_views)
+        owner._denoise_input_upload = cached
+    for destination, source in zip(cached[3], inputs):
+        destination.copy_(source)
+    # Refresh all fields, including masks, even for in-place/inference inputs.
+    # rpu_copy_ publishes the complete packed buffer with one sized flush.
+    cached[2].copy_(cached[1])
+    return cached[4]
+
+
+def _reuse_denoise_attention_mask(owner, mask):
+    """Retain an owned, tracked CPU mask only when its actual contents match."""
+    cached = getattr(owner, "_denoise_attention_mask_cpu", None)
+    if (cached is None or cached.dtype != mask.dtype or cached.shape != mask.shape
+            or not torch.equal(cached, mask)):
+        with torch.inference_mode(False):
+            cached = mask.detach().clone()
+        owner._denoise_attention_mask_cpu = cached
+    return cached
+
+
 def _spm_dump(rb, label):
     """Per-core SPM usage dump, gated by RHINO_SPM (diagnostic only).
     Bound on torch.rpu (v5 debug shim), not the rpu_backend module."""
@@ -686,6 +731,9 @@ class RhinoVLAOnRPU:
         self._precompute_time_proj = native_cold.precompute_time_proj
         self._fold_action_time_in = native_cold.fold_action_time_in
         self._denoise_cond_all_cpu = None
+        self._denoise_cond_all_rpu = None
+        self._denoise_input_upload = None
+        self._denoise_attention_mask_cpu = None
         self._denoise_adarms_tables = None
         self._denoise_time_proj_table = None
         self._denoise_loop_meta = None
@@ -763,6 +811,15 @@ class RhinoVLAOnRPU:
                 self._denoise_cond_all_cpu = cond_cpu
                 self._denoise_time_proj_table = time_proj_table
                 _trace("denoise time-proj precompute enabled")
+            # The denoise schedule is cold-bound above. Publish its immutable
+            # condition table once, independently of live request uploads.
+            if self._denoise_cond_all_cpu is None:
+                action_mod = sys.modules[self.action_io.__class__.__module__]
+                times = torch.tensor(self._denoise_times, dtype=torch.float32)
+                self._denoise_cond_all_cpu = action_mod.create_sinusoidal_pos_embedding(
+                    times, self.cfg.width).to(dtype=torch.float32).contiguous()
+            self._denoise_cond_all_rpu = self._denoise_cond_all_cpu.to(
+                device="rpu", dtype=torch.float16).contiguous()
         if action_cold["fast_replay"]:
             torch.ops.rpu.rhino_vla_set_fast_replay(self.er._rpu_handle, True)
             _trace("denoise fast replay enabled")
@@ -1268,7 +1325,6 @@ class RhinoVLAOnRPU:
         return x
 
     def _denoise_loop(self, prefix_kv, prefix_mask, state, x0, state_mask, action_mask):
-        import sys as _sys
         import torch.nn.functional as Fnn
         from rpu_backend.adapters.rhinovla.convert import (
             _plan_rhino_prefix_kv_execution,
@@ -1344,15 +1400,7 @@ class RhinoVLAOnRPU:
                 f"the installed RoPE table: {rope_position}+{S}>"
                 f"{int(self.er._rpu_rope_max_seq_len)}")
 
-        action_mod = _sys.modules[self.action_io.__class__.__module__]
-        if self._denoise_cond_all_cpu is not None:
-            cond_cpu = self._denoise_cond_all_cpu
-        else:
-            times = torch.tensor(self._denoise_times, dtype=torch.float32)
-            cond_cpu = action_mod.create_sinusoidal_pos_embedding(
-                times, self.cfg.width).to(dtype=torch.float32).contiguous()
-        cond_all = cond_cpu.to(dtype=torch.float16, device="rpu").contiguous()
-
+        cond_all = self._denoise_cond_all_rpu
         # Rebuild masks per predict: identity-only caching cannot detect in-place
         # updates and may collide when Python object ids are reused.
         suffix_mask = torch.ones((1, S), dtype=torch.bool)
@@ -1369,7 +1417,8 @@ class RhinoVLAOnRPU:
                 (0, pad_k),
                 value=torch.finfo(attention_mask.dtype).min,
             )
-        attention_mask = attention_mask.cpu().contiguous()
+        attention_mask = _reuse_denoise_attention_mask(
+            self, attention_mask.cpu().contiguous())
         _am = action_mask if action_mask is not None else torch.ones(
             (1, AH, AD), dtype=torch.float32
         )
@@ -1379,27 +1428,25 @@ class RhinoVLAOnRPU:
             _am = _am.expand(1, AH, AD)
         if _am.shape != (1, AH, AD):
             raise ValueError("RhinoVLA action_mask must match [1, horizon, action_dim]")
-        action_mask_pad = Fnn.pad(_am, (0, ADP - AD)).to(
-            dtype=torch.float16, device="rpu"
-        ).contiguous()
+        action_mask_pad = Fnn.pad(_am, (0, ADP - AD))
         _sm = state_mask if state_mask is not None else torch.ones(
             (state.shape[0], SD), dtype=torch.float32
         )
         _sm = _sm[:, 0] if _sm.ndim == 3 else _sm
-        state_mask_pad = Fnn.pad(_sm, (0, SDP - SD)).to(
-            dtype=torch.float16, device="rpu"
-        ).contiguous()
+        state_mask_pad = Fnn.pad(_sm, (0, SDP - SD))
 
         # Live per-predict: x0 (noise) + state (proprioception).
         if self._flow_direction == "official_descending":
             x0 = x0 * _am
-        x0_pad = Fnn.pad(x0, (0, ADP - AD)).to(
-            dtype=torch.float16, device="rpu").contiguous()
+        x0_pad = Fnn.pad(x0, (0, ADP - AD))
         state_2d = state[:, 0] if state.ndim == 3 else state
         if self._flow_direction == "official_descending":
             state_2d = state_2d * _sm
-        state_pad = Fnn.pad(state_2d, (0, SDP - SD)).to(
-            dtype=torch.float16, device="rpu").contiguous()
+        state_pad = Fnn.pad(state_2d, (0, SDP - SD))
+        action_mask_pad, state_mask_pad, x0_pad, state_pad = (
+            _upload_denoise_inputs(
+                self, (action_mask_pad, state_mask_pad, x0_pad, state_pad))
+        )
 
         # A3 (prefix alias): pass the text-cache prefix layers as the expert's KV
         # storage — zero copy. Stable DDR addresses → the captured graph bakes them

@@ -1715,12 +1715,14 @@ def _rpu_vision_forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tenso
         resolved_chunks.append(resolved_chunk)
         dispatched_descriptors.append(planned_stage_descriptor)
         batched_out = out_all_3d.squeeze(0)  # [total_patches, hidden]
-        batched_snaps = torch.ops.rpu.qwen3vl_vision_pop_deepstack_snapshots(handle)
-        if len(batched_snaps) != n_deepstack:
-            raise RuntimeError(
-                "batched: deepstack snapshot count "
-                f"{len(batched_snaps)} != {n_deepstack}"
-            )
+        if not _fused_merger:
+            # The fused merger already consumed these device slots in-graph.
+            batched_snaps = torch.ops.rpu.qwen3vl_vision_pop_deepstack_snapshots(handle)
+            if len(batched_snaps) != n_deepstack:
+                raise RuntimeError(
+                    "batched: deepstack snapshot count "
+                    f"{len(batched_snaps)} != {n_deepstack}"
+                )
 
     # T5b: when the fused merger ran on-device (RhinoVLA), the per-image last_hidden +
     # deepstack-snapshot clones are dead work — last_hidden_state is ignored downstream

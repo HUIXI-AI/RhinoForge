@@ -611,12 +611,19 @@ one.
   `reset_accumulated_memory_stats()` resets accumulated allocation/free
   counters. Resetting counters does not free memory.
 - `torch.rpu.set_ddr_flush(bool)` controls internal RPU-to-RPU flush points
-  (default off). Model adapters may set it when their cross-component contract
-  requires it.
+  (default off). RhinoVLA preserves this process setting instead of enabling
+  redundant flushes across its vision, text, and action components.
 - `torch.rpu.set_ddr_flush_force(bool)` controls CPU/RPU boundary coherency
   (default on). Keep it enabled for normal inference; disabling it is unsafe
   outside an isolated microbenchmark. The matching `get_*` functions report
   current process state.
+
+Cache maintenance belongs at actual CPU data accesses: publish a CPU write
+once before device consumption, and synchronize device output before a CPU
+read. RPU tensor views, static table bindings, and device-only handoffs do not
+need another flush. Uploads and `.cpu()` copies perform the boundary operation.
+An RPU-to-RPU `copy_` implemented with host `memcpy` still needs both read and
+write boundary synchronization; the tensor device labels alone are insufficient.
 
 ### Profiling mechanisms
 

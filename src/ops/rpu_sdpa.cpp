@@ -587,11 +587,12 @@ PreparedMask sdpa_prepare_mask(
         : mask_2d;
 
     // Route B: copy into the shape-keyed stable slot so graph-mode DMA can
-    // bake its address at BUILD and have it stay valid across REPLAYs.
-    at::Tensor mask_rpu_fresh = mask_padded.to(at::kPrivateUse1);
+    // bake its address at BUILD and have it stay valid across REPLAYs. Publish
+    // directly from CPU: a temporary RPU upload followed by host-backed RPU
+    // copy_ adds an unnecessary allocation and two cache-maintenance passes.
     at::Tensor slot = stable_cache.stable_slot(
-        seq_q, seq_k_aligned, mask_rpu_fresh.options(), ordinal);
-    slot.copy_(mask_rpu_fresh);
+        seq_q, seq_k_aligned, mask_padded.options().device(at::kPrivateUse1), ordinal);
+    slot.copy_(mask_padded);
     return {slot, 4};  // MASK_2D, stable slot
 }
 

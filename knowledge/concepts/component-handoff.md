@@ -20,6 +20,17 @@ just the next function call.
   them across another component or forward.
 - Treat direct SPM-to-final-DDR output as a transfer with explicit destination
   ownership. It removes staging, not the copy or lifetime contract.
+- Publish CPU writes at their producing upload/copy operation, and synchronize
+  device output when a CPU reader accesses it. A device-only consumer or output
+  view does not need another cache flush. An RPU-to-RPU copy implemented with
+  host `memcpy` still has both CPU read and write boundaries. See the
+  [cache controls](../../docs/runtime_config.md#memory-and-coherency-controls).
+- RhinoVLA's unrolled action path uploads its cold condition table once and
+  publishes the four live CPU request fields through one packed buffer per
+  forward. Every field is refreshed, including in-place mask changes. An owned
+  CPU attention-mask snapshot is reused only after a content comparison, so
+  the native version cache can skip unchanged uploads without trusting caller
+  identity. Changed masks copy directly into the existing stable device slot.
 
 ## Handoff sequence
 

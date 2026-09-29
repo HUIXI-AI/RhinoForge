@@ -44,7 +44,8 @@ PYBIND11_MODULE(rpu_backend, m) {
         launch_symbol, "Rhino launch library");
     result["oplibs"] = KernelCache::instance().loaded_oplib_paths();
     py::dict oplib_roles;
-    oplib_roles["combined"] = FROZEN_KERNEL_LIB_PATH();
+    oplib_roles["main"] = FROZEN_KERNEL_LIB_PATH();
+    oplib_roles["expansion"] = FROZEN_KERNEL_LIB_PATH_EXPANSION();
     result["oplib_roles"] = std::move(oplib_roles);
     // Hash only the sealed snapshots used by Program_t, never the mutable
     // source paths. Each library is hashed once regardless of kernel count.

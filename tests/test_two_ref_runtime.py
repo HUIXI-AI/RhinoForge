@@ -31,6 +31,9 @@ def loader(tmp_path_factory):
                   CACHE.index("void KernelCache::populate_fast_cache")]
     impl += CACHE[CACHE.index("::rhino_lkn::Kernel_t* KernelCache::get_kernel"):
                   CACHE.index("::rhino_lkn::Program_t* KernelCache::get_program")]
+    binding = (ROOT / "src/core/rpu_pybind.inc").read_text()
+    roles_binding = binding[binding.index("    py::dict oplib_roles;"):
+                            binding.index('    result["oplib_roles"]')]
     source = directory / "loader.cpp"
     source.write_text(r'''
 #include "rpu_kernel_manifest.h"
@@ -86,7 +89,13 @@ struct KernelCache {
     void require_names(const std::vector<std::string>&);
     rhino_lkn::Kernel_t* get_kernel(const std::string&);
 };
-''' + paths + impl + r'''
+''' + paths + impl + '''
+namespace py { using dict = std::unordered_map<std::string,std::string>; }
+py::dict identity_roles() {
+''' + roles_binding + '''
+    return oplib_roles;
+}
+''' + r'''
 int main(int argc, char** argv) {
     try {
         if (std::string(argv[1]) == "inventory") {
@@ -100,7 +109,15 @@ int main(int argc, char** argv) {
         }
         KernelCache cache;
         cache.initialize();
-        TORCH_CHECK(cache.loaded_oplib_paths().size() == 2, "expected exactly two assets");
+        const auto paths = cache.loaded_oplib_paths();
+        TORCH_CHECK(paths.size() == 2, "expected exactly two assets");
+        const auto roles = identity_roles();
+        TORCH_CHECK(roles.size() == 2 && roles.at("main") == FROZEN_KERNEL_LIB_PATH() &&
+                    roles.at("expansion") == FROZEN_KERNEL_LIB_PATH_EXPANSION(),
+                    "runtime identity must report main/expansion roles");
+        const std::set<std::string> role_paths = {roles.at("main"), roles.at("expansion")};
+        TORCH_CHECK(role_paths == std::set<std::string>(paths.begin(), paths.end()),
+                    "runtime identity disagrees with loaded assets");
         for (const auto& name : rpu_pl_tiling::autotile_kernel_names()) {
             const bool w4 = name.rfind("parallel_linear_wint4a16_pgrp_",0) == 0;
             TORCH_CHECK(loaded.at(name) == (w4 ? "expansion" : "main"), "wrong autotile ABI role");

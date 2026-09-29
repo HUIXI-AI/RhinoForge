@@ -853,7 +853,8 @@ def build_rpu_expert(
     from rpu_backend.api._execution import _require_execution_process_safe
 
     _require_execution_process_safe()
-    torch.rpu.set_ddr_flush(True)
+    # Upload/copy operations publish CPU writes. Building an expert must not
+    # enable process-wide flushes at subsequent device-only handoffs.
     converted = copy.deepcopy(expert)
     cpu_rotary = copy.deepcopy(converted.qwen_rotary_emb).cpu()
     converted = convert_expert_for_rpu(converted, w8a16=w8a16 or full_w8a16)

@@ -34,7 +34,7 @@ def test_full_pipeline_example_has_distinct_scope_and_explicit_acc16(modules, co
     assert components["language_model"]["prefill"]["linear_acc32"] is False
     assert components["vision_encoder"]["vision"]["linear_acc32"] is False
     assert components["language_model"]["prefill"]["padding_rows"] == 10
-    assert config["run"]["warmup"] == 1 and config["run"]["runs"] == 3
+    assert config["run"]["warmup"] == 2 and config["run"]["runs"] == 3
     assert config["run"]["torch_num_threads"] == 12
     assert config["run"]["inference_mode"] is False
     config["example"]["opt_in"]["RPU_RHINOVLA_FULL_W8A16"] = "0"

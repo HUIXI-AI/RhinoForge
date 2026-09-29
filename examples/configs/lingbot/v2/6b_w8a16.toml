@@ -16,7 +16,7 @@ prefix_length_range = [215, 225]
 seed = 0
 
 [run]
-warmup = 1
+warmup = 2
 runs = 3
 hwperf = false
 profile = false

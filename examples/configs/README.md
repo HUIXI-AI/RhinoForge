@@ -27,6 +27,6 @@ python examples/run_model.py --config examples/configs/qwen3_5/vl/2b/fp16.toml
 
 模型配置使用 `[example]`、`[input]`、`[run]` 和可选 `[rpu_execution]`，Pi 使用 `[pi05]`。`example.profile_id` 对应 [profiles.json](profiles.json) 中实际被模板引用的精度、组件和冷态约束。G0.5、GR00T、NavDP、SigLIP 的单个集成模板使用 `[runner/model/request]`；调用方自有的旧格式文件仍可运行，目录中不另放兼容副本。
 
-短测请复制目标配置，将 `run.warmup=1`、`run.runs=2` 或 `3`，生成模型的 `input.decode_steps=32`，并使 `warmup_decode_steps` 不超过它。保留需要比较的其他输入、精度和执行设置。长 P/D 配置仅在显式选择时运行。
+短测请复制目标配置，保留 `run.warmup=2`，将 `run.runs=2` 或 `3`，生成模型的 `input.decode_steps=32`，省略 `warmup_decode_steps` 或使其等于正式 decode 长度；`warmup >= 2` 时拒绝更短的预热。两次预热覆盖固定 signature 的 BUILD 和真实 REPLAY；预热耗时单独记录为 `warmup_wall_ms_runs`。显式零次或一次预热可用于冷路径诊断，但不代表稳态。保留需要比较的其他输入、精度和执行设置。长 P/D 配置仅在显式选择时运行。
 
 `assets/example.ppm` 是公开示意图片，不是历史性能或质量报告的原始输入。权重、batch、预处理 tensor 和应用请求由调用方提供。配置存在不扩大运行时准入或声明质量认证；本目录不包含客户模型、私有 fixture 或部署定制。

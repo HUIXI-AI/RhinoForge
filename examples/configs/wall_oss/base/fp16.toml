@@ -17,7 +17,7 @@ camera_names = ["face_view", "left_wrist_view", "right_wrist_view"]
 noise_seed = 0
 
 [run]
-warmup = 1
+warmup = 2
 runs = 3
 hwperf = false
 profile = false

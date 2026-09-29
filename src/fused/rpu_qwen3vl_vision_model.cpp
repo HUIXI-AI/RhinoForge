@@ -1135,15 +1135,8 @@ public:
             }
         }
 
-        // Flush the position_idx keepalive — adapter just wrote per-forward
-        // (row, col) entries into it via Python `.copy_()`. Without an explicit
-        // flush, the CPU write may sit in the caching allocator's write buffer
-        // and the RPU DMA reads stale (zero or prior-forward) data, silently
-        // collapsing 2D RoPE to identity. Same pattern as Qwen3 M-RoPE in
-        // CausalDecoderModel::forward (Phase 1 keepalive flush).
-        if (!pipeline_dispatch) {
-            rpu_ddr_flush_force(position_idx_keepalive_.data_ptr<int16_t>());
-        }
+        // The adapter's position_idx .copy_() already published the (row, col)
+        // entries. Binding this keepalive for device DMA needs no second flush.
 
         // Fixed-DMA Q staging must keep a stable address for every captured shape.
         // A grow-only tensor would invalidate an older shape's captured address after
@@ -2022,8 +2015,8 @@ public:
     // so the slot tensor stays valid and contains the most-recent forward's
     // hidden state. Caller MUST consume the tensors before issuing the next
     // forward (REPLAY at a different shape would route to a different slot
-    // but same-shape REPLAY would overwrite). Adapter flushes the DDR before
-    // reading to ensure RPU-DMA-written contents are visible CPU-side.
+    // but same-shape REPLAY would overwrite). These are device-only views;
+    // an eventual RPU-to-CPU copy synchronizes before reading their contents.
     std::vector<at::Tensor> pop_deepstack_snapshots() {
         std::vector<at::Tensor> out;
         out.reserve(deepstack_visual_indexes_.size());
@@ -2034,7 +2027,6 @@ public:
                         "qwen3vl_vision_pop_deepstack_snapshots: missing slot for "
                         "layer_idx=", layer_idx, " num_patches=", current_num_patches_,
                         " — forward() must run at this shape before popping");
-            rpu_ddr_flush_force(slot->data_ptr<c10::Half>());
             out.push_back(*slot);
         }
         return out;
@@ -2047,7 +2039,6 @@ public:
         TORCH_CHECK(slot != nullptr,
                     "qwen3vl_vision_pop_pooler_merged: missing pooler slot for num_patches=",
                     current_num_patches_, " — forward() with the fused merger must run first");
-        rpu_ddr_flush_force(slot->data_ptr<c10::Half>());
         return *slot;
     }
 
@@ -2065,7 +2056,6 @@ public:
                         "qwen3vl_vision_pop_deepstack_merged: missing merged slot for "
                         "layer_idx=", layer_idx, " num_patches=", current_num_patches_,
                         " — forward() with the fused merger must run at this shape first");
-            rpu_ddr_flush_force(slot->data_ptr<c10::Half>());
             out.push_back(*slot);
         }
         return out;
@@ -2074,7 +2064,7 @@ public:
     // Convenience: ALL in-graph merged outputs in one call — patch-merged pooler [seq/4, oh]
     // FIRST, then the N deepstack-merged features (same order as pop_deepstack_merged). One
     // op-dispatch instead of two for the fused-merger adapter hot path; composes the two pops
-    // above (each does its own DDR flush + stable-slot lookup). All are stable slots returned
+    // above (stable-slot lookups without CPU data access). All are stable slots returned
     // BY REFERENCE → the caller MUST clone before the next same-shape forward overwrites them.
     std::vector<at::Tensor> pop_merged() {
         std::vector<at::Tensor> out;

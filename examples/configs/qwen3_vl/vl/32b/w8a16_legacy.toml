@@ -17,7 +17,7 @@ decode_steps = 4
 images = ["assets/example.ppm"]
 
 [run]
-warmup = 1
+warmup = 2
 runs = 3
 hwperf = false
 profile = false

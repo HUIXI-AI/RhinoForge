@@ -816,8 +816,6 @@ public:
             ::rhino_lkn::RpuGetDevAddr(adarms_pair_table_.data_ptr());
         adarms_final_table_src_base_ =
             ::rhino_lkn::RpuGetDevAddr(adarms_final_table_.data_ptr());
-        rpu_ddr_flush_force(adarms_pair_table_.data_ptr<c10::Half>());
-        rpu_ddr_flush_force(adarms_final_table_.data_ptr<c10::Half>());
         denoise_adarms_tables_ready_ = true;
         invalidate_model_state();
     }
@@ -838,7 +836,6 @@ public:
         time_proj_table_ = table;
         time_proj_table_src_base_ =
             ::rhino_lkn::RpuGetDevAddr(time_proj_table_.data_ptr());
-        rpu_ddr_flush_force(time_proj_table_.data_ptr<c10::Half>());
         denoise_time_proj_table_ready_ = true;
         invalidate_model_state();
     }
@@ -1217,11 +1214,9 @@ public:
         cos_ref_ = cos;
         sin_ref_ = sin;
         // cond_src_base_ feeds rpu_launch_ddr_scatter_spm_dma_mutable in the
-        // cond scatter site below; REPLAY end() reads this live address. Per-
-        // forward flush mirrors fused_model_base's hidden_in_src_base_ pattern
-        // (caller may have CPU-dirty cache lines from an upstream op).
+        // cond scatter site below; REPLAY end() reads this live device address.
+        // CPU writes were already published by the producing upload/copy op.
         cond_src_base_ = ::rhino_lkn::RpuGetDevAddr(cond.data_ptr());
-        rpu_ddr_flush_force(cond.data_ptr<c10::Half>());
 
         prepare_sdpa_mask_cached(attention_mask, is_causal && hidden_states.size(1) > 1,
                                  hidden_states.size(1), position + hidden_states.size(1));
@@ -1294,8 +1289,6 @@ public:
                 ::rhino_lkn::RpuGetDevAddr(adarms_pair_table_.data_ptr());
             adarms_final_table_src_base_ =
                 ::rhino_lkn::RpuGetDevAddr(adarms_final_table_.data_ptr());
-            rpu_ddr_flush_force(adarms_pair_table_.data_ptr<c10::Half>());
-            rpu_ddr_flush_force(adarms_final_table_.data_ptr<c10::Half>());
         }
         if (cold_config_.precompute_time_proj) {
             TORCH_CHECK(denoise_time_proj_table_ready_,
@@ -1305,7 +1298,6 @@ public:
                         num_steps, " table_steps=", time_proj_table_.size(0));
             time_proj_table_src_base_ =
                 ::rhino_lkn::RpuGetDevAddr(time_proj_table_.data_ptr());
-            rpu_ddr_flush_force(time_proj_table_.data_ptr<c10::Half>());
         }
         TORCH_CHECK(prefix_len >= 0, "RhinoVLA denoise loop prefix_len must be >= 0");
         if (expert_w8a16_) validate_expert_transfer(suffix_len_);
@@ -1335,12 +1327,9 @@ public:
         state_mask_ref_ = state_mask_rpu;
         action_mask_ref_ = action_mask_rpu;
         x_out_ref_ = x_out;
-        rpu_ddr_flush_force(x0_rpu.data_ptr<c10::Half>());
-        rpu_ddr_flush_force(cond_all.data_ptr<c10::Half>());
-        rpu_ddr_flush_force(state_rpu.data_ptr<c10::Half>());
-        rpu_ddr_flush_force(state_mask_rpu.data_ptr<c10::Half>());
-        rpu_ddr_flush_force(action_mask_rpu.data_ptr<c10::Half>());
-        rpu_ddr_flush_force(x_out.data_ptr<c10::Half>());
+        // Inputs and static tables are already device-visible. This prologue
+        // only binds DMA addresses; x_out is written by the device. CPU reads
+        // and writes synchronize in the corresponding tensor copy operations.
         x0_src_base_ = ::rhino_lkn::RpuGetDevAddr(x0_rpu.data_ptr());
         cond_all_src_base_ = ::rhino_lkn::RpuGetDevAddr(cond_all.data_ptr());
         state_src_base_ = ::rhino_lkn::RpuGetDevAddr(state_rpu.data_ptr());

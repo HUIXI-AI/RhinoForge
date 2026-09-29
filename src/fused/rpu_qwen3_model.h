@@ -2286,9 +2286,6 @@ public:
                     : (!ka_geom_same || pos.data_ptr() != ka_last_pos_src_ ||
                        pos_content_changed)) {
                 position_ids_keepalive_.narrow(0, position, seq_len_in).copy_(pos);
-                rpu_ddr_flush_force_sized(
-                    position_ids_keepalive_.narrow(0, position, seq_len_in).data_ptr<int32_t>(),
-                    static_cast<size_t>(seq_len_in) * 3 * sizeof(int32_t));
                 ka_last_pos_src_ = pos.data_ptr();
                 ka_last_pos_src_version_ = pos_src_version;
                 if (qwen3vl_2b_w8_profile_) {
@@ -2387,9 +2384,8 @@ public:
         //      returns) so their storage cannot be reused by the caching
         //      allocator mid-graph.
         //   3. Per-replay, the mutable DMA cursor-patches the live DDR address.
-        //   4. A sized boundary flush on each dense tensor ensures CPU-side writes
-        //      (Python scatter-fill at adapter level) are visible to the RPU
-        //      DMA engine.
+        //   4. CPU scatter-fill/upload operations publish writes themselves.
+        //      Binding these device inputs does not touch their contents.
         // ─────────────────────────────────────────────────────────────────────
         const bool qwen3vl_pooler_z1_retained_deepstack_dispatch =
             qwen3vl_pooler_z1_dispatch_ &&
@@ -2412,24 +2408,6 @@ public:
             const int64_t h_local = hidden_size();
             deepstack_dense_refs_.clear();
             deepstack_dense_refs_.reserve(embeds.size());
-            const bool shared_source =
-                qwen3vl_2b_w8_profile_ &&
-                !embeds.empty() && embeds.front().defined() &&
-                std::all_of(
-                    embeds.begin() + 1, embeds.end(),
-                    [&](const at::Tensor& other) {
-                        return other.is_same(embeds.front());
-                    });
-            const int64_t shared_source_version =
-                shared_source && embeds.front().unsafeGetTensorImpl()
-                    ->version_counter().enabled()
-                ? static_cast<int64_t>(embeds.front().unsafeGetTensorImpl()
-                    ->version_counter().current_version()) : -1;
-            const bool shared_source_flush_hit =
-                shared_source_version >= 0 &&
-                shared_source && deepstack_shared_flush_source_.defined() &&
-                deepstack_shared_flush_source_.is_same(embeds.front()) &&
-                deepstack_shared_flush_version_ == shared_source_version;
             for (size_t i = 0; i < embeds.size(); ++i) {
                 const at::Tensor& d = embeds[i];
                 TORCH_CHECK(d.defined(),
@@ -2460,24 +2438,6 @@ public:
                 deepstack_dense_refs_.push_back(d);
                 deepstack_dense_src_base_[i] =
                     ::rhino_lkn::RpuGetDevAddr(d.data_ptr<c10::Half>());
-                bool duplicate_source = false;
-                for (size_t j = 0; qwen3vl_2b_w8_profile_ && j < i; ++j) {
-                    if (embeds[j].is_same(d)) {
-                        duplicate_source = true;
-                        break;
-                    }
-                }
-                if (!duplicate_source && !shared_source_flush_hit) {
-                    RECORD_FUNCTION("rpu_causal::deepstack_boundary_flush", {});
-                    // Chunk DMAs read only this contiguous view. A decode view
-                    // is one row of a much larger zero keepalive; flushing its
-                    // whole allocator segment repeats tens of MiB per merger.
-                    rpu_ddr_flush_force_sized(d.data_ptr<c10::Half>(), d.nbytes());
-                }
-            }
-            if (shared_source) {
-                deepstack_shared_flush_source_ = embeds.front();
-                deepstack_shared_flush_version_ = shared_source_version;
             }
         } else if (qwen3vl_pooler_z1_retained_deepstack_dispatch ||
                    qwen3vl_multiview_retained_deepstack_dispatch) {
@@ -7187,8 +7147,6 @@ protected:  // LingBot2 sparse-MoE subclass reuses the decoder's layer state.
     std::vector<int64_t> deepstack_lang_layers_;
     std::array<uint64_t, 3> deepstack_dense_src_base_{};
     std::vector<at::Tensor> deepstack_dense_refs_;
-    at::Tensor deepstack_shared_flush_source_;
-    int64_t deepstack_shared_flush_version_ = -1;
 
     // ── P4 (Wall-OSS): explicit 2D mask state ──
     //

@@ -39,10 +39,17 @@ with_stack = false
 ```
 
 `[run].profile` 在计时样本结束后额外执行一次诊断推理。
-显式设置 `run.warmup` 和 `run.runs`；短测可使用 1 次预热、2–3 个样本和
-`input.decode_steps = 32`，并保持其他输入及执行配置一致，`warmup_decode_steps` 不超过该值。
+显式设置 `run.warmup` 和 `run.runs`；短测可使用 2 次预热、2–3 个样本和
+`input.decode_steps = 32`，并保持其他输入及执行配置一致；省略 `warmup_decode_steps`，让预热跟随正式 decode 长度。
 decode 步数是 prefill 首 token 之后的调用数，EOS 可以提前终止。
 长 decode 模板只在显式选择后运行；示意图片不能复现历史报告的性能输入。
+
+统一 runner 默认预热两次，让延迟构图路径先 BUILD，再实际 REPLAY，之后才采集正式样本。
+预热调用耗时单独保存在 `warmup_wall_ms_runs`，不参与正式统计。显式 `warmup=0` 或 `1`
+仍可用于冷路径诊断。`warmup >= 2` 时，必须省略 `warmup_decode_steps` 或使其等于
+`input.decode_steps`，两次预热都覆盖正式测量的 decode 负载及后续位置、形状。缩短 decode
+预热仅允许用于显式零次或一次的冷路径诊断。固定长度比较应设置 `stop_on_eos=false`，
+预热和测量共用该设置。验证数据清理与计时边界见[性能测量](performance.zh.md#分开报告启动与稳态)。
 
 Profiler 包围一次执行并会改变时延；性能数字应在关闭 profiler 后采集。
 除非诊断需要，保持 shape、内存和调用栈采集关闭。trace 可能包含应用数据。

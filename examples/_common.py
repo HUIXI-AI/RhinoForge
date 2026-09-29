@@ -421,7 +421,7 @@ def load_config(path: Path) -> dict:
     for key in ("hwperf", "profile", "inference_mode"):
         if type(run.get(key, False)) is not bool:
             raise ConfigError(f"[run].{key} must be boolean")
-    for key, default, minimum in (("warmup", 1, 0), ("runs", 1, 1), ("seed", 0, 0)):
+    for key, default, minimum in (("warmup", 2, 0), ("runs", 1, 1), ("seed", 0, 0)):
         _integer(run.get(key, default), f"[run].{key}", minimum)
     if "output_dir" in run and (not isinstance(run["output_dir"], str) or not run["output_dir"]):
         raise ConfigError("[run].output_dir must be a non-empty path")
@@ -456,6 +456,12 @@ def load_config(path: Path) -> dict:
             raise ConfigError("warmup_decode_steps requires a text-generation example")
         if run["warmup_decode_steps"] > inputs.get("decode_steps", 4):
             raise ConfigError("warmup_decode_steps must not exceed input.decode_steps")
+        if (run.get("warmup", 2) >= 2
+                and run["warmup_decode_steps"] != inputs.get("decode_steps", 4)):
+            raise ConfigError(
+                "warmup >= 2 requires full decode warmup: omit warmup_decode_steps "
+                "or set it equal to input.decode_steps; use warmup=0 or 1 only "
+                "for cold-path diagnostics")
     if "stop_on_eos" in inputs and type(inputs["stop_on_eos"]) is not bool:
         raise ConfigError("[input].stop_on_eos must be boolean")
     if "prompt_token_ids" in inputs:

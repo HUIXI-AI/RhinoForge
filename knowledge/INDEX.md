@@ -28,7 +28,7 @@ and source remain authoritative; see [the schema](SCHEMA.md) and
 - [Runtime configuration](../docs/runtime_config.md): supported controls,
   defaults, lifecycle, and risk.
 - [Performance measurement](../docs/performance.md): correctness-first,
-  reproducible latency and throughput reporting.
+  validation cleanup, BUILD/REPLAY warmup, and reproducible latency and throughput reporting.
 - [Model assets](../docs/model_assets.md) and
   [quantization](../docs/quantization.md): checkpoint records and offline
   conversion.
@@ -61,7 +61,7 @@ and source remain authoritative; see [the schema](SCHEMA.md) and
   input/QKV/compute schedules, semantic spans, exact plan identity, and
   attention-storage fallback.
 - [Multi-component ownership and handoff](concepts/component-handoff.md):
-  Graph, SPM, DMA, output, HYViT input admission, and teardown boundaries between
+  Graph, SPM, DMA, CPU publication, output, HYViT input admission, and teardown boundaries between
   model components.
 - [Automatic residual reduction](concepts/allreduce-routing.md): one generated
   eight-core ring route, partial-producer preparation, and Graph ownership.

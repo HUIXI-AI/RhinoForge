@@ -16050,15 +16050,11 @@ at::Tensor FusedModelBase::run_all_layers_impl(
         pimpl_->ddr_bufB_ptr_ = nullptr;
     }
 
-    // Layer-0 mutable DMA: stash the caller's live dev addr and flush its DDR
-    // cache lines once per forward. The framework's REPLAY end() patches every
-    // layer-0 chunk DMA in kd_buf to use this address — no staging copy needed.
-    // Boundary-flush variant (force) — caller's hidden_states may have CPU-dirty
-    // lines from an upstream embedding op that wrote via host memcpy.
+    // Layer-0 mutable DMA: REPLAY end() patches every layer-0 chunk to read
+    // the caller's live device address. CPU producers publish their writes at
+    // the upload/copy boundary; device producers need no CPU cache maintenance.
     current_hidden_in_src_base() =
         ::rhino_lkn::RpuGetDevAddr(hidden_states.data_ptr());
-    rpu_ddr_flush_force_sized(
-        hidden_states.data_ptr<c10::Half>(), hidden_states.nbytes());
     // Keep hidden_states alive until deferred graph execution completes. Layer 0's
     // DMA stores its device address, not a tensor reference; Python may release the
     // input before RpuKernelGraph::end() executes the recorded work.

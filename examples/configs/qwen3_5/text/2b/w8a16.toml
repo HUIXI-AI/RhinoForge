@@ -15,7 +15,7 @@ prompt = "Explain what a compiler does."
 decode_steps = 4
 
 [run]
-warmup = 1
+warmup = 2
 runs = 3
 hwperf = false
 profile = false

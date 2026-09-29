@@ -18,7 +18,7 @@ noise_seed = 0
 fp16_registry_alias = "wall-oss-0.5"
 
 [run]
-warmup = 1
+warmup = 2
 runs = 3
 hwperf = false
 profile = false

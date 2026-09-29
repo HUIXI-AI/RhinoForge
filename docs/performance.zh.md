@@ -31,6 +31,20 @@ RhinoForge 的性能结果只对一个确定的模型与运行时配置有意义
 - **稳态阶段**只从规定的 warmup 和 Graph 准备完成后开始。复用同一输入范围，并确认
   重复 signature 使用文档规定的 replay 生命周期。
 
+数值验证及其临时导出的释放应在 replay 预热之前完成。RhinoVLA 的 CPU prefix-KV
+导出由调用方持有，导出函数不会额外保留到 runtime；让诊断对象存活到下一次推理，
+会把释放成本带入该次延迟。仅完成 Graph BUILD 不代表已经执行过 replay 路径。
+统一 runner 默认两次预热，并将预热耗时保存在 `warmup_wall_ms_runs`；显式次数不会被增加。
+两次预热均须覆盖正式负载：`warmup >= 2` 时，配置检查拒绝较短的 `warmup_decode_steps`。
+省略该字段即可跟随 `input.decode_steps`，固定长度测试还应设置 `stop_on_eos=false`。
+只预热最初几个 token 可能遗漏后续位置准备或 Graph signature，即使 prefill 和初始
+decode 已经 replay。显式零次/一次的冷路径诊断，以及文档规定的 one-shot Graph 路径，
+不构成稳态 replay 的证据。
+
+统一 runner 对推理 callable 计时。额外 CPU 快照和 finite 检查在计时之后执行，随后
+释放原始返回对象，再开始下一次调用。policy 内部的输出转换仍包含在计时内；报告完整
+应用延迟时应注明这一边界。
+
 不要从端到端时间中选择性扣除 host 工作。单独报告组件时，应定义其输入输出边界，
 并避免把组件耗时之和冒充端到端延迟。
 

@@ -38,6 +38,26 @@ Report startup and steady-state latency separately:
   Reuse the same admitted input envelope and confirm that repeated signatures
   use the documented replay lifecycle.
 
+Complete numerical validation and release its temporary exports before replay
+warmup. In particular, RhinoVLA CPU prefix-KV exports belong to the caller;
+the export helper does not retain them on the runtime. Retaining diagnostics
+until a later inference can move their deallocation into that call's latency.
+Graph BUILD alone does not exercise the replay path. The shared example runner
+defaults to two warmup calls and preserves their timings in
+`warmup_wall_ms_runs`; user-specified counts are not silently increased. Both
+warmup calls must cover the measured workload: with `warmup >= 2`, the runner's
+configuration check rejects a shorter `warmup_decode_steps`. Omit that option to
+follow `input.decode_steps`, and use `stop_on_eos=false` for fixed-length tests.
+A short decode can miss later position preparation or Graph signatures even
+when the prefill and first decode already replay. Explicit zero/one-warmup
+diagnostics and documented one-shot Graph routes are not steady-state replay
+evidence.
+
+The shared runner measures the inference callable. Its additional CPU snapshot
+and finite check happen after the timer; the original returned object is then
+released before the next call. Output conversion performed inside a policy is
+still included. State this boundary when reporting end-to-end application time.
+
 Do not subtract selected host work from an end-to-end number. If a component is
 reported separately, define its input/output boundaries and show that the sum
 is not being presented as end-to-end latency.

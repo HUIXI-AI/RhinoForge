@@ -30,6 +30,11 @@ python examples/run_model.py --config examples/configs/rhinovla/v3/full_pipeline
 
 此 JSON 仅展示常见模型源目录，实际字段由所选 factory 定义。factory、权重和请求全部由调用方管理；示例不加载隐含 fixture、golden 或私有 bundle。
 
+模板预热两次，分别覆盖延迟 BUILD 和真实 REPLAY。若 factory 在首次调用中做数值校验，
+应在返回前释放仅用于校验的 tensor，并按实际 `run.warmup` 区分后续预热与正式样本。
+CPU prefix-KV 导出属于调用方，runtime 不额外保留；这不改变推理使用的设备 KV cache。
+预热耗时见报告的 `warmup_wall_ms_runs`，不计入正式推理统计。
+
 W8 模板还显式绑定 `input.expert_w8a16` 与 `input.full_w8a16`，并以同名布尔值传入 factory JSON。重复值必须类型、取值都一致，数字 `0/1` 不视为布尔值。factory 必须把这些值传到公开 expert 构造 API；runner 会检查绑定的实际 expert 权重、scale 和安装模式，拒绝仅改变精度标签。`full_w8a16` 在此是 **expert 构造参数**：`w8a16.toml` 与 `full_expert_w8a16.toml` 没有选择全 Vision/Language/action-IO 量化。独立的 full-pipeline 实验模板另外显式开启全流水线环境控制，并检查 text/vision/IO/AdaRMS 实际存储；运行时结果、浮点差异观测与独立任务质量证据分别报告。详细映射见 [v3 说明](v3/README.md)。未使用量化字段的既有 FP16 factory 保持原调用参数。
 
 `rpu_execution` 的组件配置必须由 factory 在权重安装前消费，并通过公开 `bind_rhinovla_execution_runtime` 绑定实际 language、vision、action 子模块。公开 facade 会核对 factory 声明的能力和有效配置，拒绝静默忽略。v3 优化组合及条件见 [v3 说明](v3/README.md)。配置检查和运行计时都不代表数值或机器人任务通过。

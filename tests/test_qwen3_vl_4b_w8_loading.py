@@ -174,6 +174,28 @@ def test_prefill_head_keeps_requested_rows(monkeypatch,selection):
     assert calls[0][1] is head.weight and calls[0][2] is head.weight_scale and calls[0][0].is_contiguous()
 
 
+def test_prefill_head_uses_recorded_row_partition_for_lightnav(monkeypatch):
+    head = torch.nn.Linear(2, 16, bias=False).half()
+    head._rpu_linear_partition = 0
+    head._rpu_linear_num_cores = 8
+    hidden = torch.arange(4, dtype=torch.float16).reshape(1, 2, 2)
+
+    def native(x, weight, bias, partition, cores, acc32, scale):
+        assert (partition, cores, acc32, scale) == (0, 8, False, None)
+        return torch.nn.functional.linear(x, weight, bias)
+
+    monkeypatch.setattr(
+        torch.ops.rpu, "linear_with_accumulation", native, raising=False,
+    )
+    model = NS(
+        lm_head=head,
+        model=NS(language_model=NS(_rpu_execution={"prefill": {}})),
+    )
+    actual = adapter._apply_prefill_lm_head(model, hidden, slice(-1, None))
+    expected = torch.nn.functional.linear(hidden[:, -1:, :], head.weight)
+    assert torch.equal(actual, expected)
+
+
 def test_converter_rejects_quantized_or_incomplete_source(tmp_path):
     source=tmp_path/"src"
     source.mkdir()

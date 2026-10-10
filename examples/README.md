@@ -13,6 +13,7 @@
 | 理解文件名和定位原记录中的配置 | [命名规则](configs/NAMING.md)、[路径对照](configs/config_names.json) |
 | 查看日志与输出 | 模型页“结果说明”、[日志与结果](RESULTS.md) |
 | 查看登记范围和运行库要求 | [支持矩阵](../docs/model_support.zh.md)、[运行库准备](../docs/runtime_assets.md) |
+| 运行 LightNav-0 缓存评测 | [LightNav-0 R1 指南](../docs/lightnav_0_r1.zh.md) |
 
 <a id="run"></a>
 

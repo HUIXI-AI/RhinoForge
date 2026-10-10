@@ -16,6 +16,7 @@
 |---|---|---|
 | Qwen3 / Llama | `RPUModelForCausalLM`；[Qwen3](../examples/configs/qwen3/README.md)、[Llama](../examples/configs/llama/README.md) | Token 与匹配的 KV cache |
 | Qwen3-VL | `RPUModelForConditionalGeneration`；[指南](../examples/configs/qwen3_vl/README.md) | 文本、图片及 processor 生成的位置和网格信息 |
+| LightNav-0 | `RPUModelForConditionalGeneration`；[R1 指南](lightnav_0_r1.zh.md) | 文本与视频历史；上游源码和 checkpoint 另行提供 |
 | Qwen3.5 Dense / MoE | `RPUModelForConditionalGeneration`；[指南](../examples/configs/qwen3_5/README.md) | 文本或图文、对应 Dense/MoE cache 与 checkpoint 配置 |
 | Gemma4 | `Gemma4Adapter`；[指南](../examples/configs/gemma4/README.md) | E4B Instruct 文本生成；CPU 前后处理与设备 decoder |
 | DINOv3 | `DINOv3Adapter`；[指南](../examples/configs/dinov3/README.md) | 预处理后的图片 |

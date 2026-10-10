@@ -90,8 +90,9 @@ def test_neighboring_profiles_keep_independent_transfers(transfers, field, value
 
 
 @pytest.mark.parametrize("out_hidden", [2048, 2560])
-def test_fp16_storage_admission_does_not_enable_w8_default_pairing(out_hidden):
-    cfg = SimpleNamespace(**vars(_config()), model_type="qwen3_vl", patch_size=16,
+@pytest.mark.parametrize("model_type", ["qwen3_vl", "qwen3_vl_vision"])
+def test_fp16_storage_admission_does_not_enable_w8_default_pairing(out_hidden, model_type):
+    cfg = SimpleNamespace(**vars(_config()), model_type=model_type, patch_size=16,
         temporal_patch_size=2, in_channels=3, num_position_embeddings=2304,
         hidden_act="gelu_pytorch_tanh", deepstack_visual_indexes=[5, 11, 17])
     cfg.out_hidden_size = out_hidden

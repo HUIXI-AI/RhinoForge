@@ -12,6 +12,7 @@
 | 公开依赖环境包与发行工具 | [设计](environment_bundle.zh.md) | [Design](environment_bundle.md) |
 | 语音识别与生成 | [Qwen3 ASR/TTS](qwen3_audio.zh.md) | [Qwen3 ASR/TTS](qwen3_audio.md) |
 | 示例与运行范围 | [示例](model_support.zh.md) | [Examples](model_support.md) |
+| LightNav-0 R1 迁移与缓存评测 | [迁移与评测](lightnav_0_r1.zh.md) | [Port and benchmark](lightnav_0_r1.md) |
 | Rhino Launch 和主算子资产与扩展算子资产 | [受限运行时资产](runtime_assets.zh.md) | [Restricted runtime assets](runtime_assets.md) |
 | Checkpoint 来源、hash 和转换 | [模型资产](model_assets.zh.md) | [Model assets](model_assets.md) |
 | TOML、环境变量和运行时参数 | [运行时配置](runtime_config.zh.md) | [Runtime configuration](runtime_config.md) |

@@ -17,6 +17,7 @@ name alone does not specify its checkpoint, precision or supported shapes.
 |---|---|---|
 | Qwen3 / Llama | `RPUModelForCausalLM`; [Qwen3](../examples/configs/qwen3/README.md), [Llama](../examples/configs/llama/README.md) | Tokens and matching KV cache |
 | Qwen3-VL | `RPUModelForConditionalGeneration`; [guide](../examples/configs/qwen3_vl/README.md) | Text, images and processor-produced positions/grid metadata |
+| LightNav-0 | `RPUModelForConditionalGeneration`; [R1 guide](lightnav_0_r1.md) | Text and video history; upstream source and checkpoint supplied separately |
 | Qwen3.5 dense / MoE | `RPUModelForConditionalGeneration`; [guide](../examples/configs/qwen3_5/README.md) | Text or image/text; matching dense or MoE cache and checkpoint recipe |
 | Gemma4 | `Gemma4Adapter`; [guide](../examples/configs/gemma4/README.md) | E4B Instruct text generation; CPU frontend and device decoder |
 | DINOv3 | `DINOv3Adapter`; [guide](../examples/configs/dinov3/README.md) | Preprocessed images |

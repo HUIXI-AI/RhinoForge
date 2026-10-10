@@ -387,6 +387,49 @@ def _qwen3_vl_has_quant_metadata(config) -> bool:
     )
 
 
+def _is_lightnav_profile(config) -> bool:
+    """Match the public LightOriginsHQ/LightNav-0 Qwen3-VL checkpoint."""
+    try:
+        text, vision = config.text_config, config.vision_config
+        rope = getattr(text, "rope_parameters", None) or getattr(
+            text, "rope_scaling", None
+        ) or {}
+        return (
+            config.model_type == "qwen3_vl"
+            and config.architectures == ["Qwen3VLForConditionalGeneration"]
+            and getattr(config, "split_embeddings", None) is False
+            and int(getattr(config, "num_motion_tokens", -1)) == 0
+            and int(getattr(config, "motion_projection_layers", -1)) == 0
+            and _text_config_profile(text) == _QWEN3_VL_4B_TEXT_PROFILE
+            and not _qwen3_vl_has_quant_metadata(config)
+            and (
+                text.model_type, text.num_attention_heads, text.head_dim,
+                text.hidden_act, text.rms_norm_eps, text.vocab_size,
+                text.attention_bias, text.use_cache, config.tie_word_embeddings,
+                text.tie_word_embeddings, rope.get("rope_type"),
+                rope.get("rope_theta", getattr(text, "rope_theta", None)),
+                rope.get("mrope_interleaved"), tuple(rope.get("mrope_section", ())),
+            ) == (
+                "qwen3_vl_text", 32, 128, "silu", 1e-6, 156048,
+                False, True, True, True, "default", 5_000_000, True,
+                (24, 20, 20),
+            )
+            and (
+                vision.hidden_size, vision.intermediate_size, vision.depth,
+                vision.num_heads, vision.patch_size, vision.temporal_patch_size,
+                vision.spatial_merge_size, tuple(vision.deepstack_visual_indexes),
+                vision.hidden_act, vision.model_type, vision.in_channels,
+                vision.num_position_embeddings, vision.out_hidden_size,
+            ) == (*_SUPPORTED_VISION_PROFILE, "qwen3_vl_vision", 3, 2304, 2560)
+            and (
+                config.image_token_id, config.video_token_id,
+                config.vision_start_token_id, config.vision_end_token_id,
+            ) == (151655, 151656, 151652, 151653)
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
 def _is_qwen3_vl_dense_eager_profile(model) -> bool:
     """Match the validated ordinary dense FP16 2B/4B eager profiles.
 
@@ -397,6 +440,8 @@ def _is_qwen3_vl_dense_eager_profile(model) -> bool:
         return False
     try:
         config = model.config
+        if _is_lightnav_profile(config):
+            return True
         text, vision = config.text_config, config.vision_config
         profile = _text_config_profile(text)
         if (config.model_type != "qwen3_vl"
@@ -493,6 +538,14 @@ def _check_profile(config) -> None:
     is_graph_blocked_32b = _is_qwen3_vl_32b_w8a16_config(config)
     runtime_quant = _is_qwen3_vl_runtime_quant_config(config)
     runtime_quant_32b = runtime_quant and profile == _QWEN3_VL_32B_TEXT_PROFILE
+    if (
+        int(getattr(text_cfg, "vocab_size", 0)) % 128 != 0
+        and not _is_lightnav_profile(config)
+    ):
+        raise UnsupportedModelError(
+            "Qwen3VLAdapter: non-128-aligned vocabulary requires the exact "
+            "LightNav-0 profile."
+        )
     awq_config = getattr(config, "quantization_config", None)
     if (isinstance(awq_config, dict)
             and awq_config.get("quant_method") == "compressed-tensors"
@@ -883,7 +936,8 @@ def _apply_prefill_lm_head(model, hidden, slice_indices):
     cores = getattr(head, "_rpu_linear_num_cores", 8)
     scale = getattr(head, "weight_scale", None) if weight.dtype in (torch.int8, torch.uint8) else None
     return torch.ops.rpu.linear_with_accumulation(
-        head_input.contiguous(), weight, getattr(head, "bias", None), 1, cores,
+        head_input.contiguous(), weight, getattr(head, "bias", None),
+        getattr(head, "_rpu_linear_partition", 1), cores,
         getattr(text, "_rpu_execution", {}).get("prefill", {}).get("linear_acc32", False), scale,
     )
 
@@ -1825,6 +1879,7 @@ class Qwen3VLAdapter:
             cfg = self.model.config
             text_cfg = cfg.text_config
             vision_cfg = cfg.vision_config
+            is_lightnav = _is_lightnav_profile(cfg)
             is_padded_8b = (
                 _text_config_profile(text_cfg) == _QWEN3_VL_8B_TEXT_PROFILE
             )
@@ -2000,8 +2055,14 @@ class Qwen3VLAdapter:
                 # The strict loader already performed the sole physical pgrp pack.
                 swizzled = lm_head_cpu
             elif topology is None:
-                swizzled = transform_linear_weight(lm_head_cpu, partition=1)
+                lm_head_partition = 0 if is_lightnav else 1
+                swizzled = transform_linear_weight(
+                    lm_head_cpu, partition=lm_head_partition,
+                )
                 self.model.lm_head.weight = nn.Parameter(swizzled, requires_grad=False)
+                if is_lightnav:
+                    self.model.lm_head._rpu_linear_partition = lm_head_partition
+                    self.model.lm_head._rpu_linear_num_cores = 8
             else:
                 # Reduced text layers were streamed above; convert the
                 # untied vocabulary head separately with its own cold layout.
@@ -2197,7 +2258,11 @@ class Qwen3VLAdapter:
                             vision_model._rpu_vision_handle, True,
                         )
                         vision_model._rpu_vision_compact_encoder_fp16 = True
-            if runtime_align_quantized:
+            if is_lightnav:
+                # Its 156048-row vocabulary cannot use the fused TP8 column
+                # head; the regular forward applies the recorded TP8 row head.
+                pass
+            elif runtime_align_quantized:
                 lm_w = self.model.lm_head.weight.detach().contiguous()
                 lm_scale = self.model.lm_head.weight_scale.detach().contiguous()
                 self.model._rpu_lm_head_w_keepalive = lm_w
@@ -2663,11 +2728,17 @@ def _rpu_qwen3vl_forward(
             pooler, grid_in.detach().cpu(), spatial_merge_size,
         )
     elif precomputed_vision is not None:
-        if image_grid_thw is None:
+        if (image_grid_thw is None) == (video_grid_thw is None):
             raise ValueError(
-                "Qwen3VL device forward: image_grid_thw must accompany "
-                "rpu_precomputed_vision."
+                "Qwen3VL device forward: exactly one of image_grid_thw or "
+                "video_grid_thw must accompany rpu_precomputed_vision."
             )
+        if video_grid_thw is not None:
+            visual_grid_thw = video_grid_thw
+            visual_token_id = self.config.video_token_id
+        else:
+            visual_grid_thw = image_grid_thw
+            visual_token_id = self.config.image_token_id
         if not isinstance(precomputed_vision, dict):
             raise TypeError(
                 "Qwen3VL device forward: rpu_precomputed_vision must be a dict."
@@ -2703,7 +2774,7 @@ def _rpu_qwen3vl_forward(
                     "[0, len(pooler_output_parts))"
                 )
             expected_rows = int((
-                image_grid_thw.detach().cpu().prod(-1)
+                visual_grid_thw.detach().cpu().prod(-1)
                 // (spatial_merge_size ** 2)
             ).sum().item())
             actual_rows = sum(
@@ -2717,13 +2788,12 @@ def _rpu_qwen3vl_forward(
         else:
             visual_embeds_flat = _split_image_embeds_per_image(
                 precomputed_vision["pooler_output"],
-                image_grid_thw.detach().cpu(),
+                visual_grid_thw.detach().cpu(),
                 spatial_merge_size,
             )
             deepstack_features = list(
                 precomputed_vision["deepstack_features"]
             )
-        visual_token_id = self.config.image_token_id
 
     # ----- Build inputs_embeds + scatter image features --------------------
     input_ids_cpu = None

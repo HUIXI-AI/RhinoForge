@@ -743,11 +743,12 @@ def _use_fp16_vision_weight_banks(config, *, w8a16: bool,
                                 num_cores: int, num_layers: int) -> bool:
     return (not w8a16 and num_cores == 8 and num_layers == 24
             and getattr(config, "out_hidden_size", None) in (2048, 2560)
+            and getattr(config, "model_type", None) in ("qwen3_vl", "qwen3_vl_vision")
             and tuple(getattr(config, name, None) for name in (
-                "model_type", "depth", "hidden_size", "intermediate_size", "num_heads",
+                "depth", "hidden_size", "intermediate_size", "num_heads",
                 "patch_size", "temporal_patch_size", "spatial_merge_size",
                 "in_channels", "num_position_embeddings", "hidden_act"))
-            == ("qwen3_vl", 24, 1024, 4096, 16, 16, 2, 2, 3, 2304, "gelu_pytorch_tanh")
+            == (24, 1024, 4096, 16, 16, 2, 2, 3, 2304, "gelu_pytorch_tanh")
             and tuple(getattr(config, "deepstack_visual_indexes", ())) == (5, 11, 17))
 
 

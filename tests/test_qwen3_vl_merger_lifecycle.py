@@ -190,6 +190,16 @@ def _model_4b():
     return model
 
 
+def _lightnav_model():
+    model = _model_4b()
+    model.config.split_embeddings = False
+    model.config.num_motion_tokens = 0
+    model.config.motion_projection_layers = 0
+    model.config.text_config.vocab_size = 156048
+    model.config.vision_config.model_type = "qwen3_vl_vision"
+    return model
+
+
 def _model_8b():
     """Exact public config with the small installation doubles above."""
     model = _Model()
@@ -223,6 +233,16 @@ def test_dense_eager_profile_accepts_only_the_exact_ordinary_configs(
     model = factory()
     assert qvl._is_qwen3_vl_dense_eager_profile(model)
     assert qvl._is_qwen3_vl_2b_eager_profile(model) is legacy_2b
+
+
+def test_lightnav_profile_admits_only_its_extended_vocabulary_geometry():
+    model = _lightnav_model()
+    assert qvl._is_lightnav_profile(model.config)
+    assert qvl._is_qwen3_vl_dense_eager_profile(model)
+
+    model.config.text_config.vocab_size += 1
+    assert not qvl._is_lightnav_profile(model.config)
+    assert not qvl._is_qwen3_vl_dense_eager_profile(model)
 
 
 @pytest.mark.parametrize("factory", [_model_2b, _model_4b])

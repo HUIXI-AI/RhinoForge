@@ -46,6 +46,27 @@ def test_benchmark_contract_fixes_five_tokens_and_history_set():
         BENCHMARK.parse_histories("12,13")
 
 
+def test_benchmark_adds_current_frame_and_only_caches_history():
+    frames = list(range(14))
+    assert BENCHMARK._select_input_window(frames, 12, 0) == list(range(13))
+    assert BENCHMARK._select_input_window(frames, 12, 1) == list(range(1, 14))
+    with pytest.raises(RuntimeError, match="insufficient frames"):
+        BENCHMARK._select_input_window(frames, 12, 2)
+
+    class Cache:
+        def __init__(self):
+            self.values = {}
+
+        def put(self, key, value):
+            self.values[key] = value
+
+    cache = Cache()
+    history_only = BENCHMARK._HistoryOnlyCache(cache, current_frame_id=12)
+    history_only.put((10, 11, 8, 14), "history")
+    history_only.put((11, 12, 8, 14), "current")
+    assert cache.values == {(10, 11, 8, 14): "history"}
+
+
 def test_prepare_prompt_trims_answer_and_marks_video_tokens():
     inputs = {
         "input_ids": torch.tensor([7, 151656, 9, 10]),

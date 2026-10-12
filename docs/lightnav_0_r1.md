@@ -43,6 +43,11 @@ Each tier warms the full-window and current-tubelet RPU Graphs outside the
 measurement and retains one stable KV-cache address. Its Graphs are released
 before the next tier.
 
+When the application already uses upstream `VLN_EVAL_TRAJ_TOP1`, pass
+`--constrained-head` to install its 4,369-token action-allowlist projection,
+padded to 4,480 rows for column-parallel Linear. This opt-in changes the default
+full-vocabulary decoding domain and requires separate navigation-quality evaluation.
+
 `all_miss_median` uses a new empty vision cache for every request.
 `all_history_hit_median` preloads every selected tubelet that excludes the
 current frame, so only the single tubelet containing the current frame runs the
@@ -69,6 +74,22 @@ and already uses the fused RPU decoder and device argmax.
 | 36 | 718.7 | 647.3 | 9.9% |
 | 48 | 738.1 | 652.2 | 11.6% |
 | 64 | 762.7 | 668.9 | 12.3% |
+
+## RhinoVLA-derived decode evaluation
+
+LightNav already reuses stable KV addresses, Graph replay, and vision history.
+The added cold opt-in applies RhinoVLA's narrower-work and topology-matched Linear
+principles to reduce the 156,048-row output projection to the upstream action
+allowlist. It cuts five-token decode by about 11% and cached-history end-to-end
+latency by 4.7–6.3%.
+
+Temporal speculation with the previous request as a five-token draft was also
+probed. R1 rejects the required four-token continuation at `position=414` with
+`NO_FEASIBLE`; splitting it into four single-token calls has no benefit. MTP is
+not available because the checkpoint has no multi-token prediction heads or
+weights. The constrained-head result is stored in
+`benchmark_results/lightnav_0_r1_constrained_20261012.json`; its token choices
+can differ from full-vocabulary decoding, so it does not establish task accuracy.
 
 ## R1 results (2026-10-12)
 

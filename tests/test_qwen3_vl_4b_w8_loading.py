@@ -196,6 +196,37 @@ def test_prefill_head_uses_recorded_row_partition_for_lightnav(monkeypatch):
     assert torch.equal(actual, expected)
 
 
+def test_lightnav_constrained_head_uses_action_rows(monkeypatch):
+    candidate = torch.arange(32, dtype=torch.float16).reshape(16, 2)
+    hidden = torch.arange(4, dtype=torch.float16).reshape(1, 2, 2)
+
+    def native(x, weight, bias, partition, cores, acc32, scale):
+        assert weight is candidate
+        assert (bias, partition, cores, acc32, scale) == (None, 1, 8, False, None)
+        return torch.nn.functional.linear(x, weight)
+
+    monkeypatch.setattr(
+        torch.ops.rpu, "linear_with_accumulation", native, raising=False,
+    )
+    model = NS(
+        lm_head=torch.nn.Linear(2, 16, bias=False).half(),
+        model=NS(language_model=NS(_rpu_execution={"prefill": {}})),
+        _rpu_lightnav_constrained_head_enabled=True,
+        _rpu_lightnav_candidate_lm_head_w=candidate,
+    )
+    actual = adapter._apply_prefill_lm_head(model, hidden, slice(-1, None))
+    assert torch.equal(
+        actual, torch.nn.functional.linear(hidden[:, -1:, :], candidate),
+    )
+
+
+def test_lightnav_action_allowlist_is_column_partition_aligned():
+    ids = adapter._lightnav_candidate_token_ids()
+    assert len(ids) == 4369 and (len(ids) + 127) // 128 * 128 == 4480
+    assert ids[0] == 151645
+    assert ids[1] == 151674 and ids[2] == 151675 and ids[-1] == 156041
+
+
 def test_converter_rejects_quantized_or_incomplete_source(tmp_path):
     source=tmp_path/"src"
     source.mkdir()

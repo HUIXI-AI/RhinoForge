@@ -36,6 +36,11 @@ R1 运行时移除 `--check-config`。12/24/36/48/64 表示过去的历史帧数
 每次固定输出 5 个 token。输入使用确定性的 256×448 合成帧，因此结果用于比较
 推理性能和缓存收益，不代表导航任务准确率。
 
+若业务已经采用上游 `VLN_EVAL_TRAJ_TOP1` action allowlist，可增加
+`--constrained-head`。它在冷装载时只保留 4369 个候选 token 的输出头，物理补齐到
+4480 行后使用 column-parallel Linear。该选项改变默认全词表解码范围，必须单独验证
+真实导航质量。
+
 每个历史帧档位先预热完整窗口和仅当前 tubelet 两种 RPU Graph，建图耗时不计入
 结果；档位内部始终复用同一 KV cache 地址。档位结束后释放 Graph，再进入下一档，
 避免多种 prefill 形状同时占满 Graph arena。
@@ -76,6 +81,33 @@ pooling 缓存优化前后，历史全命中端到端耗时如下：
 | 36 | 718.7 | 647.3 | 9.9% |
 | 48 | 738.1 | 652.2 | 11.6% |
 | 64 | 762.7 | 668.9 | 12.3% |
+
+## RhinoVLA 优化手段与解码评估
+
+RhinoVLA 可迁移的原则是稳定 Graph、持久缓存、缩小重复计算范围和使用匹配几何的
+并行 Linear。LightNav 已使用稳定 KV 地址、Graph replay 和视觉缓存；本轮把默认
+156048 行输出投影缩小为上游 action allowlist 的 4369 个逻辑候选，并补齐到 4480 行
+启用 column-parallel 路径。该模式为冷态显式 opt-in，默认全词表路径不分配候选权重。
+
+投机解码探针尝试用上一请求的 5 个 token 作为 draft，并用一次 4-token target
+continuation 验证。R1 当前 planner 在 `position=414, seq_len=4` 返回 `NO_FEASIBLE`；
+退化为 4 次单 token 验证没有性能收益，因此未保留该实现。MTP 还需要 checkpoint
+提供 multi-token prediction heads 和训练权重，当前 LightNav-0 均不包含，不能只靠
+运行时开关启用。
+
+action allowlist 输出头的历史全命中结果如下；全词表基线来自上表相同测试口径：
+
+| 历史帧 | prepare | vision | prefill | decode 5 | total | 相对全词表 total |
+|---:|---:|---:|---:|---:|---:|---:|
+| 12 | 22.5 | 77.3 | 149.9 | 214.6 | 468.6 | -6.3% |
+| 24 | 23.0 | 80.1 | 220.6 | 216.4 | 541.4 | -5.4% |
+| 36 | 25.9 | 77.2 | 290.7 | 217.6 | 612.3 | -5.4% |
+| 48 | 24.8 | 81.3 | 294.6 | 217.4 | 618.5 | -5.2% |
+| 64 | 28.3 | 78.5 | 311.1 | 218.1 | 637.7 | -4.7% |
+
+5-token decode 相对全词表降低约 11%。候选范围和 FP16 并行布局会改变 token 选择，
+该性能结果不构成任务准确率结论。完整结果见
+`benchmark_results/lightnav_0_r1_constrained_20261012.json`。
 
 ## R1 实测结果（2026-10-12）
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
 import json
 import statistics
 import sys
@@ -40,6 +41,7 @@ class _HistoryOnlyCache:
     def __init__(self, cache, current_frame_id: int):
         self._cache = cache
         self._current_frame_id = current_frame_id
+        self._pooled_segments = OrderedDict()
 
     def __getattr__(self, name):
         return getattr(self._cache, name)
@@ -47,6 +49,21 @@ class _HistoryOnlyCache:
     def put(self, key, value) -> None:
         if self._current_frame_id not in key[:2]:
             self._cache.put(key, value)
+
+    def get_pooled_segment(self, key):
+        value = self._pooled_segments.get(key)
+        if value is not None:
+            self._pooled_segments.move_to_end(key)
+        return value
+
+    def put_pooled_segment(self, key, value) -> None:
+        tubelet_keys = key[0]
+        if any(self._current_frame_id in tubelet[:2] for tubelet in tubelet_keys):
+            return
+        self._pooled_segments[key] = value
+        self._pooled_segments.move_to_end(key)
+        if len(self._pooled_segments) > self._cache.max_entries:
+            self._pooled_segments.popitem(last=False)
 
 
 def _prepare_prompt(inputs: dict[str, Any], video_token_id: int):
@@ -84,12 +101,16 @@ def _cache_vision(
         [int(value) for value in segment["frame_indices"]]
         for segment in sample["video_segments"]
     ]
+    lookup_started = time.perf_counter()
     plan = cache.collect_misses(
         pixels, raw_grid.tolist(), frame_indices, merge_size=merge_size,
     )
+    lookup_ms = (time.perf_counter() - lookup_started) * 1000
 
+    vit_ms = 0.0
     if plan.missing_units:
         miss_grid = torch.tensor(plan.miss_grid_rows, dtype=torch.long)
+        vit_started = time.perf_counter()
         with torch.no_grad():
             output = model.model.visual(
                 plan.miss_pixels, grid_thw=miss_grid,
@@ -111,6 +132,7 @@ def _cache_vision(
             )
             cache.put(unit["key"], entry)
             plan.cached_map[unit["key"]] = entry
+        vit_ms = (time.perf_counter() - vit_started) * 1000
 
     pool_factors = inputs.get("_post_vit_pool_factors")
     if pool_factors is None:
@@ -119,29 +141,45 @@ def _cache_vision(
     deepstack_parts: list[list[Any]] = [[], [], []]
     pooled_grids: list[Any] = []
     offset = 0
+    pool_started = time.perf_counter()
     for segment_index, row in enumerate(raw_grid):
         tubelets = int(row[0].item())
+        segment_units = plan.unit_desc[offset : offset + tubelets]
         entries = [
             plan.cached_map[unit["key"]]
-            for unit in plan.unit_desc[offset : offset + tubelets]
+            for unit in segment_units
         ]
         offset += tubelets
-        base = torch.cat([entry.base_embed for entry in entries], dim=0)
-        deepstack = [
-            torch.cat([entry.deepstack_embeds[layer] for entry in entries], dim=0)
-            for layer in range(3)
-        ]
-        pooled, pooled_grid, pooled_deepstack = post_vit_spatial_pool(
-            base,
-            row.unsqueeze(0),
-            spatial_factor=int(pool_factors[segment_index].item()),
-            merge_size=merge_size,
-            deepstack_embeds=deepstack,
+        factor = int(pool_factors[segment_index].item())
+        segment_key = (
+            tuple(unit["key"] for unit in segment_units), factor, merge_size,
         )
-        base_parts.append(pooled.contiguous())
-        pooled_grids.append(pooled_grid)
+        pooled_segment = (
+            cache.get_pooled_segment(segment_key)
+            if hasattr(cache, "get_pooled_segment") else None
+        )
+        if pooled_segment is None:
+            base = torch.cat([entry.base_embed for entry in entries], dim=0)
+            deepstack = [
+                torch.cat(
+                    [entry.deepstack_embeds[layer] for entry in entries], dim=0,
+                )
+                for layer in range(3)
+            ]
+            pooled_segment = post_vit_spatial_pool(
+                base,
+                row.unsqueeze(0),
+                spatial_factor=factor,
+                merge_size=merge_size,
+                deepstack_embeds=deepstack,
+            )
+            if hasattr(cache, "put_pooled_segment"):
+                cache.put_pooled_segment(segment_key, pooled_segment)
+        pooled, pooled_grid, pooled_deepstack = pooled_segment
         if pooled_deepstack is None or len(pooled_deepstack) != 3:
             raise RuntimeError("LightNav ViT must return three DeepStack levels")
+        base_parts.append(pooled.contiguous())
+        pooled_grids.append(pooled_grid)
         for layer, value in enumerate(pooled_deepstack):
             deepstack_parts[layer].append(value.contiguous())
 
@@ -152,11 +190,16 @@ def _cache_vision(
             f"cached pooled grid {final_grid.tolist()} != processor grid "
             f"{expected_grid.tolist()}"
         )
+    pool_ms = (time.perf_counter() - pool_started) * 1000
     return {
         "pooler_output_parts": base_parts,
         "deepstack_feature_parts": deepstack_parts,
         "cached_prefix_parts": 0,
-    }, plan.hit, plan.miss
+    }, plan.hit, plan.miss, {
+        "vision_lookup_ms": lookup_ms,
+        "vision_vit_ms": vit_ms,
+        "vision_pool_ms": pool_ms,
+    }
 
 
 def _generate_five(model, input_ids, prefill: dict[str, Any], cache):
@@ -217,13 +260,16 @@ def _run_request(
             int(value) + offset for value in segment["frame_indices"]
         ]
     sample["_vit_cached_keys"] = cache.cached_keys()
+    sample_ms = (time.perf_counter() - started) * 1000
+    processor_started = time.perf_counter()
     inputs = data_processor.process_sample(
         sample, add_generation_prompt=True, validate_video_shapes=False,
     )
+    processor_ms = (time.perf_counter() - processor_started) * 1000
     prepare_ms = (time.perf_counter() - started) * 1000
 
     vision_started = time.perf_counter()
-    precomputed, hits, misses = _cache_vision(
+    precomputed, hits, misses, vision_parts = _cache_vision(
         model, processor, cache, sample, inputs,
     )
     vision_ms = (time.perf_counter() - vision_started) * 1000
@@ -254,7 +300,10 @@ def _run_request(
         "cache_hits": hits,
         "cache_misses": misses,
         "prepare_ms": prepare_ms,
+        "prepare_sample_ms": sample_ms,
+        "prepare_processor_ms": processor_ms,
         "vision_ms": vision_ms,
+        **vision_parts,
         "prefill_ms": prefill_ms,
         "decode_5_ms": decode_ms,
         "total_ms": (time.perf_counter() - started) * 1000,
@@ -298,7 +347,9 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     summary = {
         key: _median(rows, key)
         for key in (
-            "prepare_ms", "vision_ms", "prefill_ms", "decode_5_ms", "total_ms",
+            "prepare_ms", "prepare_sample_ms", "prepare_processor_ms", "vision_ms",
+            "vision_lookup_ms", "vision_vit_ms", "vision_pool_ms", "prefill_ms",
+            "decode_5_ms", "total_ms",
         )
     }
     for key in ("input_tokens", "output_tokens", "cache_hits", "cache_misses"):

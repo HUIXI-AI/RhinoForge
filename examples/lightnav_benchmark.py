@@ -27,6 +27,28 @@ def parse_histories(value: str) -> tuple[int, ...]:
     return histories
 
 
+def _select_input_window(frames, history_frames: int, offset: int):
+    window = frames[offset : offset + history_frames + 1]
+    if len(window) != history_frames + 1:
+        raise RuntimeError("insufficient frames for history plus current frame")
+    return window
+
+
+class _HistoryOnlyCache:
+    """Keep every tubelet except the one containing the current frame."""
+
+    def __init__(self, cache, current_frame_id: int):
+        self._cache = cache
+        self._current_frame_id = current_frame_id
+
+    def __getattr__(self, name):
+        return getattr(self._cache, name)
+
+    def put(self, key, value) -> None:
+        if self._current_frame_id not in key[:2]:
+            self._cache.put(key, value)
+
+
 def _prepare_prompt(inputs: dict[str, Any], video_token_id: int):
     import torch
 
@@ -188,7 +210,7 @@ def _run_request(
     from lightnav.inference.samples import build_tracking_sample
 
     started = time.perf_counter()
-    window = frames[offset : offset + history_frames]
+    window = _select_input_window(frames, history_frames, offset)
     sample = build_tracking_sample(window, instruction, None, bundle)
     for segment in sample["video_segments"]:
         segment["frame_indices"] = [
@@ -272,6 +294,21 @@ def _median(rows: list[dict[str, Any]], key: str) -> float:
     return round(statistics.median(row[key] for row in rows), 3)
 
 
+def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    summary = {
+        key: _median(rows, key)
+        for key in (
+            "prepare_ms", "vision_ms", "prefill_ms", "decode_5_ms", "total_ms",
+        )
+    }
+    for key in ("input_tokens", "output_tokens", "cache_hits", "cache_misses"):
+        values = {row[key] for row in rows}
+        if len(values) != 1:
+            raise RuntimeError(f"measured requests changed {key}: {sorted(values)}")
+        summary[key] = values.pop()
+    return summary
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True)
@@ -283,15 +320,14 @@ def main() -> int:
         default=DEFAULT_HISTORIES,
         help="comma-separated even frame counts (default: 12,24,36,48,64)",
     )
-    parser.add_argument("--warmups", type=int, default=6)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument(
         "--instruction", default="Navigate to the target and report the next action."
     )
     parser.add_argument("--check-config", action="store_true")
     args = parser.parse_args()
-    if args.warmups < 2 or args.repeats < 1:
-        parser.error("--warmups must be at least 2 and --repeats must be positive")
+    if args.repeats < 1:
+        parser.error("--repeats must be positive")
     source_dir = args.lightnav_source.expanduser().resolve() / "src"
     if not (source_dir / "lightnav/inference/vit_cache.py").is_file():
         parser.error("--lightnav-source must point to the LightNav-0 repository")
@@ -342,7 +378,7 @@ def main() -> int:
         trust_remote_code=False,
     )
     try:
-        max_frames = max(args.history_frames) + args.warmups + args.repeats
+        max_frames = max(args.history_frames) + 1
         frames = torch.empty((max_frames, 3, 256, 448), dtype=torch.float32)
         for index in range(max_frames):
             frames[index].fill_((index % 17) / 8.0 - 1.0)
@@ -351,8 +387,8 @@ def main() -> int:
             "checkpoint": str(checkpoint),
             "output_tokens": OUTPUT_TOKENS,
             "graph_warmup_excluded": True,
-            "warmups": args.warmups,
             "repeats": args.repeats,
+            "frame_count_semantics": "history_plus_current",
             "history": [],
         }
         for history_frames in args.history_frames:
@@ -360,94 +396,77 @@ def main() -> int:
                 model.model.language_model,
                 max_seq_len=MAX_PREFILL_TOKENS + OUTPUT_TOKENS,
             )
+            # Warm the full-window RPU graphs without retaining visual features.
             _run_request(
                 model, processor, data_processor, bundle,
                 VitTubeletCache(max_entries=256, store_device="cpu"), frames,
                 history_frames, 0, args.instruction, lm_cache,
             )
-            cache = VitTubeletCache(max_entries=256, store_device="cpu")
-            cold = _run_request(
-                model, processor, data_processor, bundle, cache, frames,
-                history_frames, 0, args.instruction, lm_cache,
-                capture_vision=True,
-            )
-            cached_repeat = _run_request(
-                model, processor, data_processor, bundle, cache, frames,
-                history_frames, 0, args.instruction, lm_cache,
-                capture_vision=True,
-            )
-            cold_vision = cold.pop("_vision")
-            cached_repeat_vision = cached_repeat.pop("_vision")
-            cache_feature_diff = _vision_feature_max_abs_diff(
-                cold_vision, cached_repeat_vision,
-            )
-            if cache_feature_diff != 0:
-                raise RuntimeError(
-                    f"history={history_frames}: cached repeat changed the "
-                    f"pooler or DeepStack features (max diff={cache_feature_diff})"
-                )
-            for offset in range(1, args.warmups + 1):
-                _run_request(
-                    model, processor, data_processor, bundle, cache, frames,
-                    history_frames, offset, args.instruction, lm_cache,
-                )
-            measured = []
-            for offset in range(
-                args.warmups + 1,
-                args.warmups + args.repeats + 1,
-            ):
-                measured.append(_run_request(
-                    model, processor, data_processor, bundle, cache, frames,
-                    history_frames, offset, args.instruction, lm_cache,
-                    capture_vision=not measured,
+            all_miss = []
+            for _ in range(args.repeats):
+                all_miss.append(_run_request(
+                    model, processor, data_processor, bundle,
+                    VitTubeletCache(max_entries=256, store_device="cpu"), frames,
+                    history_frames, 0, args.instruction, lm_cache,
+                    capture_vision=not all_miss,
                 ))
-            sliding_cached_vision = measured[0].pop("_vision")
-            sliding_fresh = _run_request(
-                model, processor, data_processor, bundle,
-                VitTubeletCache(max_entries=256, store_device="cpu"), frames,
-                history_frames, measured[0]["offset"], args.instruction,
-                lm_cache, capture_vision=True,
+            all_miss_vision = all_miss[0].pop("_vision")
+            if any(row["cache_hits"] != 0 for row in all_miss):
+                raise RuntimeError(f"history={history_frames}: all-miss cache hit")
+
+            history_cache = _HistoryOnlyCache(
+                VitTubeletCache(max_entries=256, store_device="cpu"),
+                current_frame_id=history_frames,
             )
-            sliding_fresh_vision = sliding_fresh.pop("_vision")
-            sliding_feature_diff = _vision_feature_max_abs_diff(
-                sliding_cached_vision, sliding_fresh_vision,
+            # Populate history entries, then warm the one-current-tubelet graph.
+            _run_request(
+                model, processor, data_processor, bundle, history_cache, frames,
+                history_frames, 0, args.instruction, lm_cache,
             )
-            if sliding_feature_diff > VISION_CACHE_ATOL:
+            _run_request(
+                model, processor, data_processor, bundle, history_cache, frames,
+                history_frames, 0, args.instruction, lm_cache,
+            )
+            all_history_hit = []
+            for _ in range(args.repeats):
+                all_history_hit.append(_run_request(
+                    model, processor, data_processor, bundle, history_cache, frames,
+                    history_frames, 0, args.instruction, lm_cache,
+                    capture_vision=not all_history_hit,
+                ))
+            history_hit_vision = all_history_hit[0].pop("_vision")
+            if any(row["cache_misses"] != 1 for row in all_history_hit):
                 raise RuntimeError(
-                    f"history={history_frames}: cached sliding window changed "
-                    "the pooler or DeepStack features "
-                    f"(max diff={sliding_feature_diff}, atol={VISION_CACHE_ATOL})"
+                    f"history={history_frames}: expected only the current "
+                    "tubelet to miss"
+                )
+            feature_diff = _vision_feature_max_abs_diff(
+                all_miss_vision, history_hit_vision,
+            )
+            if feature_diff > VISION_CACHE_ATOL:
+                raise RuntimeError(
+                    f"history={history_frames}: cached history changed the "
+                    "pooler or DeepStack features "
+                    f"(max diff={feature_diff}, atol={VISION_CACHE_ATOL})"
                 )
             report["history"].append({
                 "history_frames": history_frames,
-                "cold": cold,
-                "cached_repeat": cached_repeat,
-                "cache_features_identical": True,
-                "cache_feature_max_abs_diff": cache_feature_diff,
-                "cache_tokens_identical": (
-                    cached_repeat["token_ids"] == cold["token_ids"]
-                ),
-                "sliding_fresh": sliding_fresh,
-                "sliding_features_within_tolerance": True,
-                "sliding_feature_max_abs_diff": sliding_feature_diff,
-                "sliding_feature_atol": VISION_CACHE_ATOL,
-                "sliding_tokens_identical": (
-                    sliding_fresh["token_ids"] == measured[0]["token_ids"]
-                ),
-                "steady_median": {
-                    key: _median(measured, key)
-                    for key in (
-                        "cache_hits", "cache_misses", "prepare_ms", "vision_ms",
-                        "prefill_ms", "decode_5_ms", "total_ms",
-                    )
-                },
-                "measured": measured,
+                "current_frames": 1,
+                "total_raw_frames": history_frames + 1,
+                "all_miss_median": _summarize(all_miss),
+                "all_history_hit_median": _summarize(all_history_hit),
+                "vision_features_within_tolerance": True,
+                "vision_feature_max_abs_diff": feature_diff,
+                "vision_feature_atol": VISION_CACHE_ATOL,
+                "all_miss_measured": all_miss,
+                "all_history_hit_measured": all_history_hit,
             })
             print(
-                f"history={history_frames}: cold={cold['total_ms']:.1f}ms, "
-                f"steady={report['history'][-1]['steady_median']['total_ms']:.1f}ms, "
-                f"hit/miss={report['history'][-1]['steady_median']['cache_hits']}/"
-                f"{report['history'][-1]['steady_median']['cache_misses']}"
+                f"history={history_frames}+current: "
+                f"all_miss={report['history'][-1]['all_miss_median']['total_ms']:.1f}ms, "
+                f"history_hit={report['history'][-1]['all_history_hit_median']['total_ms']:.1f}ms, "
+                f"hit/miss={report['history'][-1]['all_history_hit_median']['cache_hits']}/"
+                f"{report['history'][-1]['all_history_hit_median']['cache_misses']}"
             )
             model.model.language_model._rpu_text_graph_cache.clear()
             model.model.visual._rpu_vision_graph_cache.clear()

@@ -33,41 +33,36 @@ python examples/lightnav_benchmark.py \
   --check-config
 ```
 
-Remove `--check-config` on R1. The script fixes history lengths to
-12/24/36/48/64 frames, performs six sliding-window warmups and five measured
-runs, and generates five tokens. It uses deterministic synthetic 256×448 frames,
-so the report measures inference and cache performance rather than navigation
-accuracy. Six warmups cover the SlowFast burst pairing cycle at 48/64 frames so
-the steady request has only the newest tubelet miss.
-After each history tier, the script clears that tier's RPU Graphs before warming
-the next shape; one stable KV-cache address is retained throughout each tier.
+Remove `--check-config` on R1. The values 12/24/36/48/64 are past-history
+counts; one current frame is added, so the actual inputs contain
+13/25/37/49/65 frames. Both scenarios run five times and report medians, while
+every request generates five tokens. Deterministic synthetic 256×448 frames make
+the report a latency and cache comparison rather than a navigation-accuracy test.
+Each tier warms the full-window and current-tubelet RPU Graphs outside the
+measurement and retains one stable KV-cache address. Its Graphs are released
+before the next tier.
 
-For each history length, an unmeasured request builds the RPU Graph, then `cold`
-is measured with an empty vision cache. `cached_repeat` is the all-hit upper
-bound and must reproduce the pooler and three DeepStack feature levels exactly;
-`steady_median` summarizes the five
-measured sliding requests. `sliding_fresh` recomputes the first measured window
-with an empty cache; its vision features must match within `1e-3` FP16 absolute
-tolerance. The report records tubelet
-hits/misses and preparation, vision, prefill, five-token decode, and end-to-end
-latency. The current SlowFast settings yield about
-252/420/568/624/708 pooled visual tokens for the five history lengths. Runtime
-admission still enforces the Qwen3-VL 4B P4176 limit on the complete request.
+`all_miss_median` uses a new empty vision cache for every request.
+`all_history_hit_median` preloads every selected tubelet that excludes the
+current frame, so only the single tubelet containing the current frame runs the
+ViT. Cached and fully recomputed pooler plus three DeepStack levels must match
+within `1e-3` FP16 absolute tolerance. The report records tubelet hits/misses and
+preparation, vision, prefill, five-token decode, and end-to-end latency. The
+current SlowFast settings yield about 288/456/568/624/708 pooled visual tokens.
+Runtime admission still enforces the Qwen3-VL 4B P4176 limit.
 
-## R1 results (2026-10-10)
+## R1 results (2026-10-12)
 
-These results use deterministic synthetic frames, six warmups, and five measured
-runs. `cold` has a warm RPU Graph and an empty vision cache; `steady` is the
-sliding-window median.
+Both scenarios exclude Graph construction and report the median of five runs.
 
-| History frames | Input tokens | cold (ms) | all-hit (ms) | steady (ms) | steady hit/miss | cold reduction |
-|---:|---:|---:|---:|---:|---:|---:|
-| 12 | 378 | 854.0 | 443.3 | 517.0 | 5 / 1 | 39.5% |
-| 24 | 594 | 1262.5 | 546.2 | 607.1 | 11 / 1 | 51.9% |
-| 36 | 790 | 1603.6 | 634.0 | 710.1 | 17 / 1 | 55.7% |
-| 48 | 864 | 1782.2 | 654.1 | 733.4 | 19 / 1 | 58.8% |
-| 64 | 975 | 1932.1 | 680.4 | 770.7 | 22 / 1 | 60.1% |
+| History + current | Input tokens | all miss (ms) | all history hit (ms) | tubelet hit/miss | E2E reduction |
+|---:|---:|---:|---:|---:|---:|
+| 12 + 1 | 414 | 897.6 | 532.2 | 6 / 1 | 40.7% |
+| 24 + 1 | 630 | 1288.8 | 616.5 | 12 / 1 | 52.2% |
+| 36 + 1 | 790 | 1643.7 | 718.7 | 17 / 1 | 56.3% |
+| 48 + 1 | 864 | 1763.3 | 738.1 | 19 / 1 | 58.1% |
+| 64 + 1 | 975 | 1934.2 | 762.7 | 22 / 1 | 60.6% |
 
-Same-window cached features are bit-identical. Sliding cached versus fresh
-features differ by at most `0.00048828125`, no more than one FP16 rounding step.
-The complete raw report is `benchmark_results/lightnav_0_r1_20261010.json`.
+Cached-history versus fully recomputed vision features differ by at most
+`0.00048828125`, passing the `1e-3` FP16 tolerance. The complete raw report is
+`benchmark_results/lightnav_0_r1_20261012.json`.

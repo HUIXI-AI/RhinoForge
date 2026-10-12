@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from collections import OrderedDict
 import json
+import os
 import statistics
 import sys
 import time
@@ -204,7 +205,15 @@ def _cache_vision(
 
 def _generate_five(model, input_ids, prefill: dict[str, Any], cache):
     import torch
-    from rpu_backend.api import greedy_token_ids
+
+    def next_token(logits):
+        from rpu_backend.api import greedy_token_ids
+
+        if getattr(model, "_rpu_lightnav_constrained_head_enabled", False):
+            candidates = model._rpu_lightnav_candidate_token_ids
+            token = greedy_token_ids(logits[..., : candidates.numel()])
+            return candidates.index_select(0, token.reshape(-1)).reshape(token.shape)
+        return greedy_token_ids(logits)
 
     if input_ids.shape[1] + OUTPUT_TOKENS > cache.max_seq_len:
         raise RuntimeError("LightNav prompt outgrew the stable RPU KV cache")
@@ -223,7 +232,7 @@ def _generate_five(model, input_ids, prefill: dict[str, Any], cache):
         prefill_ms = (time.perf_counter() - prefill_started) * 1000
         decode_started = time.perf_counter()
         for step in range(OUTPUT_TOKENS):
-            next_id = greedy_token_ids(output.logits)
+            next_id = next_token(output.logits)
             generated.append(int(next_id.item()))
             if step + 1 < OUTPUT_TOKENS:
                 output = model(
@@ -376,9 +385,16 @@ def main() -> int:
         "--instruction", default="Navigate to the target and report the next action."
     )
     parser.add_argument("--check-config", action="store_true")
+    parser.add_argument(
+        "--constrained-head",
+        action="store_true",
+        help="project only the checkpoint action-token allowlist",
+    )
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("--repeats must be positive")
+    if args.constrained_head:
+        os.environ["RPU_LIGHTNAV_CONSTRAINED_HEAD"] = "1"
     source_dir = args.lightnav_source.expanduser().resolve() / "src"
     if not (source_dir / "lightnav/inference/vit_cache.py").is_file():
         parser.error("--lightnav-source must point to the LightNav-0 repository")
@@ -428,6 +444,13 @@ def main() -> int:
         local_files_only=True,
         trust_remote_code=False,
     )
+    candidate_count = 0
+    if args.constrained_head:
+        from rpu_backend.adapters.qwen3_vl import (
+            set_lightnav_constrained_lm_head,
+        )
+
+        candidate_count = len(set_lightnav_constrained_lm_head(model))
     try:
         max_frames = max(args.history_frames) + 1
         frames = torch.empty((max_frames, 3, 256, 448), dtype=torch.float32)
@@ -440,6 +463,11 @@ def main() -> int:
             "graph_warmup_excluded": True,
             "repeats": args.repeats,
             "frame_count_semantics": "history_plus_current",
+            "lm_head": (
+                "action_allowlist" if args.constrained_head else "full_vocabulary"
+            ),
+            "lm_head_candidates": candidate_count,
+            "task_accuracy_evaluated": False,
             "history": [],
         }
         for history_frames in args.history_frames:

@@ -447,6 +447,7 @@ checkpoint 按 `use_embodied_system_prompt_ratio=0.0` 使用公开 `wall-x` 中�
 | `RPU_GRAPH_DDR_SPM_LOG` | 关闭；首字符不是 `0` 的非空值 | 首次 data-node 执行 / **NATIVE** | 记录 node index、byte count 和有界 source checksum。输出由模型数据派生，且日志会改变 timing。 |
 | `RPU_GRAPH_FORCE_ONESHOT_ON_REPLAY` | 关闭；首字符不是 `0` 的非空值 | 首次 replay 检查 / **NATIVE** | 执行 one-shot 路径而不是普通 replay。会使 Graph lifecycle 和性能结论失效。 |
 | `RPU_KVINSERT_V16_TRACE` | 关闭；除精确 `0` 或 `false` 外，任何出现的值都会启用；export 的空值也会启用 | 首次原生使用 / **NATIVE** | 记录 KV route selection 和 shape。它是诊断输出，不是 cache 正确性证明。 |
+| `RPU_LIGHTNAV_CONSTRAINED_HEAD` | 关闭；**PB(false)** | LightNav 模型装载 / **MODEL** | 为上游 `VLN_EVAL_TRAJ_TOP1` 的 4369-token action allowlist 安装精简 FP16 输出头；调用者仍须显式启用该输出头并把局部 argmax 映射回原 token ID。 |
 | `RPU_L2_BUFONLY` | 未出现时关闭；任意出现（包括 `0`）都会启用 | Grouped-expert Graph emission / **BUILD** | 声明 grouped buffer，但运行 per-expert 路径进行 bisection。会改变 Graph 和性能。 |
 | `RPU_L2_DOWN_ACC16` | 关闭；**E1** | Expert 权重安装 / **MODEL** | 强制 diagnostic ACC16 grouped-down 路径。它会改变数值结果，不是受支持 precision 配置。 |
 | `RPU_L2_RCHUNK` | Runtime fallback 为 `256`；正十进制数；受支持 grouped 配置要求精确 `1632` | Weight/config 校验（**MODEL**）和 Graph emission（**BUILD**）；新进程 | 覆盖 grouped scaling row chunk。错误值会使密封配置失败，或改变 Graph/timing。 |

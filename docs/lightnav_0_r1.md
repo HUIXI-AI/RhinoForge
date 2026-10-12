@@ -15,8 +15,9 @@ to the exact LightNav profile.
 
 The vision cache uses upstream two-frame tubelet keys. Each miss runs the ViT
 once and stores its pooler output plus three DeepStack levels on CPU. Post-ViT
-spatial pooling runs from the unpooled cached values with the current SlowFast
-segment factor. Sliding windows use a full feature scatter because token
+spatial pooling keeps the unpooled values and also caches an exact segment result
+by tubelet sequence and SlowFast factor. A changed sequence or factor therefore
+recomputes pooling. Sliding windows use a full feature scatter because token
 positions move between requests.
 
 ## Run
@@ -51,17 +52,35 @@ preparation, vision, prefill, five-token decode, and end-to-end latency. The
 current SlowFast settings yield about 288/456/568/624/708 pooled visual tokens.
 Runtime admission still enforces the Qwen3-VL 4B P4176 limit.
 
+## Stage analysis and optimization
+
+The processor already patchifies only the current miss tubelet, leaving cached
+prepare latency at 21–28 ms. The 64-frame profile showed about 77 ms for the
+current-tubelet ViT and 87 ms for repeated CPU pooling/concatenation. Exact
+segment pooling caching cuts pooling to about 3 ms and keeps cached vision at
+78–82 ms. Prefill remains complete because changing visual tokens and M-RoPE
+positions invalidate a reused KV prefix. Five-token decode remains autoregressive
+and already uses the fused RPU decoder and device argmax.
+
+| History | Before (ms) | After (ms) | Further reduction |
+|---:|---:|---:|---:|
+| 12 | 532.2 | 500.1 | 6.0% |
+| 24 | 616.5 | 572.4 | 7.1% |
+| 36 | 718.7 | 647.3 | 9.9% |
+| 48 | 738.1 | 652.2 | 11.6% |
+| 64 | 762.7 | 668.9 | 12.3% |
+
 ## R1 results (2026-10-12)
 
 Both scenarios exclude Graph construction and report the median of five runs.
 
 | History + current | Input tokens | all miss (ms) | all history hit (ms) | tubelet hit/miss | E2E reduction |
 |---:|---:|---:|---:|---:|---:|
-| 12 + 1 | 414 | 897.6 | 532.2 | 6 / 1 | 40.7% |
-| 24 + 1 | 630 | 1288.8 | 616.5 | 12 / 1 | 52.2% |
-| 36 + 1 | 790 | 1643.7 | 718.7 | 17 / 1 | 56.3% |
-| 48 + 1 | 864 | 1763.3 | 738.1 | 19 / 1 | 58.1% |
-| 64 + 1 | 975 | 1934.2 | 762.7 | 22 / 1 | 60.6% |
+| 12 + 1 | 414 | 886.8 | 500.1 | 6 / 1 | 43.6% |
+| 24 + 1 | 630 | 1283.4 | 572.4 | 12 / 1 | 55.4% |
+| 36 + 1 | 790 | 1639.9 | 647.3 | 17 / 1 | 60.5% |
+| 48 + 1 | 864 | 1744.6 | 652.2 | 19 / 1 | 62.6% |
+| 64 + 1 | 975 | 1922.8 | 668.9 | 22 / 1 | 65.2% |
 
 Cached-history versus fully recomputed vision features differ by at most
 `0.00048828125`, passing the `1e-3` FP16 tolerance. The complete raw report is

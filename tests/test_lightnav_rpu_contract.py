@@ -56,6 +56,7 @@ def test_benchmark_adds_current_frame_and_only_caches_history():
     class Cache:
         def __init__(self):
             self.values = {}
+            self.max_entries = 16
 
         def put(self, key, value):
             self.values[key] = value
@@ -65,6 +66,12 @@ def test_benchmark_adds_current_frame_and_only_caches_history():
     history_only.put((10, 11, 8, 14), "history")
     history_only.put((11, 12, 8, 14), "current")
     assert cache.values == {(10, 11, 8, 14): "history"}
+    history_key = (((10, 11, 8, 14),), 2, 2)
+    current_key = (((11, 12, 8, 14),), 1, 2)
+    history_only.put_pooled_segment(history_key, "pooled history")
+    history_only.put_pooled_segment(current_key, "pooled current")
+    assert history_only.get_pooled_segment(history_key) == "pooled history"
+    assert history_only.get_pooled_segment(current_key) is None
 
 
 def test_prepare_prompt_trims_answer_and_marks_video_tokens():
@@ -140,7 +147,7 @@ def test_vision_cache_reassembles_repeat_and_sliding_windows(monkeypatch):
 
     def run(cache, frame_ids, values):
         grid = torch.tensor([[2, 1, 1]])
-        result, hits, misses = BENCHMARK._cache_vision(
+        result, hits, misses, _ = BENCHMARK._cache_vision(
             model,
             processor,
             cache,

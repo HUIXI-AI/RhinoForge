@@ -53,7 +53,7 @@ frozen profile proves it does not apply.
 Use the public [adapter registry and plugins](../../../../docs/api_reference.md#adapter-registry-and-plugins),
 [Graph API](../../../../docs/api_reference.md#graph-api), and checked-in adapter
 source as evidence. A generic CPU fallback is never evidence that the category
-runs on RPU.
+runs on Rhino.
 
 ## Review-trigger screen
 
@@ -77,7 +77,7 @@ without exact public evidence.
 
 CPU glue is allowed only when the exact public profile names the boundary, the
 math remains identical to the upstream reference, and the boundary is included
-in end-to-end verification. It preserves correctness but does not count as RPU
+in end-to-end verification. It preserves correctness but does not count as Rhino
 execution evidence.
 
 | Boundary | Publicly reviewable contract |

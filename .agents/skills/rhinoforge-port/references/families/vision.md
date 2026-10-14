@@ -12,7 +12,7 @@ the public [SPM lifetime contract](../../../../../knowledge/concepts/spm-allocat
    every encoder block, pooling, and returned features on CPU.
 2. Decide who owns patch embedding and any projection. Do not apply the same
    projection in both Python and the fused path. If patch embedding remains on
-   the host, report it as explicit CPU glue rather than RPU execution.
+   the host, report it as explicit CPU glue rather than Rhino execution.
 3. Match bidirectional attention, masks, normalization, activation, residual
    ordering, and position semantics exactly.
 4. Define a deterministic SPM manifest for the maximum admitted image and

@@ -21,7 +21,7 @@ RhinoForge 验证的是精确模型配置，而不是模型家族名称。配置
 - 允许的 sequence、image、batch、cache 和执行设置。
 
 只要参考侧身份和输入 hash 全部不变，CPU FP32 golden 可以复用。仅 backend 源码变化时
-需要重新比较 RPU，不必重做 CPU golden。
+需要重新比较 Rhino，不必重做 CPU golden。
 
 ## 2. 硬语义与运行时门禁
 
@@ -44,7 +44,7 @@ RhinoForge 验证的是精确模型配置，而不是模型家族名称。配置
 
 | 参考 | 问题 |
 |---|---|
-| 同 dtype 参考 | RPU 是否保持所选 FP16 或量化执行路径的语义？ |
+| 同 dtype 参考 | Rhino 是否保持所选 FP16 或量化执行路径的语义？ |
 | CPU FP32 anchor | 相对更高精度模型损失了多少准确性？ |
 
 “同 dtype”仍不是完整身份。必须固定参考设备/backend、框架和库版本、累加 dtype、融合
@@ -75,7 +75,7 @@ rationale:          <参考波动与下游敏感性>
 新的证据版本。尚无校准契约的家族应先用指标分布定位错误，并保持 `Experimental` 或
 `Source-only`，直到任务关联契约被批准。
 
-量化配置做两次比较：RPU 对精确量化同 dtype 参考用于实现一致性；量化结果对 FP16 或
+量化配置做两次比较：Rhino 对精确量化同 dtype 参考用于实现一致性；量化结果对 FP16 或
 FP32 anchor 用于保留任务质量。
 
 ## 4. 任务和端到端质量

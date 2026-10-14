@@ -161,10 +161,10 @@ print("RhinoForge Python dependencies: OK")
 PY
 ```
 
-## 5. Verify the installation and RPU
+## 5. Verify the installation and Rhino
 
 First check the import and version path without running a device copy, then run
-the RPU copy check:
+the Rhino copy check:
 
 ```bash
 python examples/verify_install.py --check-config
@@ -172,7 +172,7 @@ python examples/verify_install.py
 ```
 
 Both commands must exit with status zero. If the second command reports a
-device-permission error, ask the board administrator to grant access to the RPU
+device-permission error, ask the board administrator to grant access to the Rhino
 device; do not reinstall the runtime assets with root.
 
 ## 6. Prepare Qwen3-0.6B
@@ -216,7 +216,7 @@ python examples/run_model.py --config qwen3.local.toml
 ```
 
 The command should print a completion and exit with status zero. One live
-RPU-resident model or policy is permitted per process on the fused CausalLM
+Rhino-resident model or policy is permitted per process on the fused CausalLM
 path.
 
 ## Common setup errors

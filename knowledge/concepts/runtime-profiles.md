@@ -71,7 +71,6 @@ selectors to reproduce an older run.
 - [Runtime configuration](../../docs/runtime_config.md)
 - [Model support](../../docs/model_support.md)
 - [Model execution and profiling](../../docs/model_testing.md)
-- [Performance measurement](../../docs/performance.md)
 - [Restricted runtime assets](../../docs/runtime_assets.md)
 - [Automatic residual reduction](allreduce-routing.md)
 - [Generated Linear auto-tiling](linear-autotiling.md)

@@ -120,9 +120,9 @@ plan.
 | DMA address ownership | BUILD passes, REPLAY reads or writes an earlier tensor | Use fixed DMA only for stable model-owned storage; use mutable DMA for caller inputs and fresh outputs |
 | Multi-core broadcast | An immediate multi-core operation updates only one core | Call `set_broadcast_mode(true)`; batch and Graph paths already apply it centrally |
 | Model invalidation | New weights or layout settings reuse an old plan | End every layout-, weight-, or Graph-affecting setter with `invalidate_model_state()` |
-| CPU fallback | End-to-end execution completes but a required model component did not run on RPU | List the fallback explicitly and keep the profile out of Supported status until the intended execution contract is validated |
+| CPU fallback | End-to-end execution completes but a required model component did not run on Rhino | List the fallback explicitly and keep the profile out of Supported status until the intended execution contract is validated |
 | Profile inheritance | One size or short input passes and nearby profiles are accepted | Guard exact configuration tuples and maximum envelopes before weight loading |
-| Process ownership | A second live fused model or transformed model move causes state conflicts | Use one live RPU-resident fused model or policy per process and reload a clean CPU instance for another placement |
+| Process ownership | A second live fused model or transformed model move causes state conflicts | Use one live Rhino-resident fused model or policy per process and reload a clean CPU instance for another placement |
 
 ## Fast triage order
 

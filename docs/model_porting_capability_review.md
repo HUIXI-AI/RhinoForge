@@ -74,8 +74,8 @@ Map every reference step to the smallest existing RhinoForge path:
 |---|---|
 | Existing adapter | The exact profile and input envelope already pass its preflight |
 | Shared causal decoder | The target math matches the `llama` or `qwen3` branch used by the checked-in template |
-| Existing RPU operation | Its public schema covers the exact shapes, dtypes, layouts, and state update |
-| Checked CPU fallback | Correctness is preserved, but the fallback is listed explicitly and is not treated as RPU support evidence |
+| Existing Rhino operation | Its public schema covers the exact shapes, dtypes, layouts, and state update |
+| Checked CPU fallback | Correctness is preserved, but the fallback is listed explicitly and is not treated as Rhino support evidence |
 | New host operation | Mathematical definition, tensor contract, validation, registration, and release-matched operator availability are all specified |
 | New fused subsystem | Repeated execution needs a new `FusedModelBase` SPM manifest and layer subgraph |
 

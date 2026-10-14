@@ -78,7 +78,7 @@ quantized checkpoint carries its own checked metadata.
   `padding_rows` value.
 
 The adapter may narrow these values to the exact profile envelope. Execution
-settings are cold: create a new model to change them after RPU installation.
+settings are cold: create a new model to change them after Rhino installation.
 
 The generic CausalLM and image-text loaders, and `Pi05Policy.from_pretrained`,
 support only built-in model code. `trust_remote_code` must be exactly `False`;
@@ -332,7 +332,7 @@ Store diagnostics as sensitive application artifacts and do not attach them to
 public issue reports. These APIs do not expose raw Graph register, resource, or
 plan payloads.
 
-CPU/RPU boundary flushing is enabled by default and should not be disabled in
+CPU/Rhino boundary flushing is enabled by default and should not be disabled in
 normal inference. Chunk size is a per-handle `rpu_execution` setting, not a
 process-global `torch.rpu` setter. Internal `torch.ops.rpu.*` schemas are host
 wrapper interfaces used by adapters; unless a function is documented here or

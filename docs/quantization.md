@@ -180,7 +180,7 @@ Before publishing or selecting a quantized profile:
 4. compare sampled or complete dequantized weights with the FP16 source;
 5. load the checkpoint through its public RhinoForge entry point and confirm
    fail-fast rejection of mismatched profiles;
-6. compare RPU with the exact quantized same-dtype reference for implementation
+6. compare Rhino with the exact quantized same-dtype reference for implementation
    parity, then compare retained task quality against the frozen FP16 or CPU
    FP32 anchor under [Model validation policy](validation_policy.md);
 7. verify warmup and graph lifecycle behavior; and

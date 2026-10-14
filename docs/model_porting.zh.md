@@ -144,7 +144,7 @@ Bounded one-shot 是变 shape 路径的显式例外：必须录制并执行 non-
 拒绝；registry/plugin discovery 确定；execution config 拒绝非法或超范围值；cache sizing
 和 output shape 符合参考；源码 build 和 package import 干净完成。
 
-随后在 RPU 板卡跑精确 release 配置：
+随后在 Rhino 板卡跑精确 release 配置：
 
 - 按[验证策略](validation_policy.zh.md)运行硬语义、同 dtype 一致性、CPU FP32 anchor
   与任务质量门禁；

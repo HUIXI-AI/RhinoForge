@@ -197,8 +197,8 @@ producer 在 reduction 前清理 inactive shard。见
 | 变量 | 未设置时的默认值与接受值 | 读取 / 更改 | 作用域、效果与风险 |
 |---|---|---|---|
 | `QWEN3_5_VISION_CHUNK` | Auto；十进制整数；空值/非正值表示 auto | 首次原生 vision plan / **NATIVE** | 限制 Qwen3.5 Vision chunk。正数 override 必须仍处于允许的 shape 和 memory envelope 内。 |
-| `RPU_VISION_MERGER` | **PB(true)** | Qwen3.5 Vision setup / **MODEL** | 启用 RPU merger 路径。`0` 选择 fallback，并改变性能/数值。 |
-| `RPU_VISION_STEP0` | **PB(true)** | Qwen3.5 Vision setup / **MODEL** | 启用 RPU first-stage 路径。`0` 选择 fallback，并改变性能/数值。 |
+| `RPU_VISION_MERGER` | **PB(true)** | Qwen3.5 Vision setup / **MODEL** | 启用 Rhino merger 路径。`0` 选择 fallback，并改变性能/数值。 |
+| `RPU_VISION_STEP0` | **PB(true)** | Qwen3.5 Vision setup / **MODEL** | 启用 Rhino first-stage 路径。`0` 选择 fallback，并改变性能/数值。 |
 
 <a id="gr00t-profile"></a>
 ## GR00T 配置
@@ -252,7 +252,7 @@ manifest；不能用环境路径替代。
 
 | 变量 | 未设置时的默认值与接受值 | 读取 / 更改 | 作用域、效果与风险 |
 |---|---|---|---|
-| `RPU_INTERNVLA_DINO_FINAL_NORM_RPU` | **PB(true)** | DINO tower 构造 / **MODEL** | 在 RPU 上运行 final normalization。`0` 会改变 host/device boundary 和 timing。 |
+| `RPU_INTERNVLA_DINO_FINAL_NORM_RPU` | **PB(true)** | DINO tower 构造 / **MODEL** | 在 Rhino 上运行 final normalization。`0` 会改变 host/device boundary 和 timing。 |
 | `RPU_INTERNVLA_DINO_NORM_FOLD` | **PB(false)** | DINO tower 构造 / **MODEL** | 将 input normalization 折叠进 patch 权重。它会改变已安装权重，必须重建。 |
 | `RPU_INTERNVLA_HOST_CACHE` | **PB(true)** | Backbone 构造 / **MODEL** | 启用 host memoization 和 stable owner。禁用会增加重复 host 工作。 |
 | `RPU_NAVDP_DENOISE_UNROLL` | 关闭；去除空白后，`1`/`true`/`True` 会启用，其他值禁用 | NavDP action 调用 / **CALL**；重建 Graph | capture 固定 denoise loop。它会改变 Graph 拓扑和 step 执行。 |
@@ -324,7 +324,7 @@ Pi0.5 loader 负责这些设置。Graph selector 必须在模型构造和首次 
 | `RPU_QWEN3VL_VISION_BATCH_CAP` | `3`；十进制整数，至少收窄为 `1` | Vision forward / **CALL**；重建 Graph | 每个 packed group 的最大兼容 image 数。更大值可能超过配置内存 envelope。 |
 | `RPU_QWEN3VL_VISION_FUSED_MERGER` | 原始默认关闭；**B01(false)** | Vision 构造 / **MODEL** | 将 merger 折叠进 Vision Graph。只有字面值 `0`/`1` 能保持 Python 与原生 reader 一致。 |
 | `RPU_QWEN3VL_VISION_HOST_FP32_PATCH` | `0`；**E1** | Vision forward / **CALL**；重建 Graph/model | 使用 host FP32 patch projection，而不是默认 FP16/device 配置。它会改变数值和 transfer cost。 |
-| `RPU_QWEN3VL_VISION_PATCH_EMBED_DEVICE` | `0`；**E1** | Vision 构造 / **MODEL** | 将 patch embedding 移到 RPU。它会改变已安装权重、数值和 Graph 拓扑。 |
+| `RPU_QWEN3VL_VISION_PATCH_EMBED_DEVICE` | `0`；**E1** | Vision 构造 / **MODEL** | 将 patch embedding 移到 Rhino。它会改变已安装权重、数值和 Graph 拓扑。 |
 | `RPU_QWEN3VL_VISION_ROPE_SPM` | 关闭；原生值以 `1`、`t` 或 `T` 开头时启用 | 首次原生 Vision 使用 / **NATIVE** | 将 Vision position table 保存在 SPM。它会改变 persistent memory 使用，并要求重建 Vision handle。 |
 
 <a id="rhinovla-profile"></a>
@@ -348,8 +348,8 @@ Pi0.5 loader 负责这些设置。Graph selector 必须在模型构造和首次 
 | `RPU_RHINOVLA_VISION_BATCH_VIEWS` | **PB(false)** | Vision forward / **CALL**；重建 Graph | 打包等尺寸 view，部分 batched merger 配置要求启用。混合 geometry 会回退或失败。 |
 | `RPU_RHINOVLA_VISION_CPU_MERGER_NORM_FP16` | **PB(false)** | Vision 安装 / **MODEL** | 为 CPU merger-normalization fallback 使用 FP16。会直接改变数值结果。 |
 | `RPU_RHINOVLA_VISION_PREP_CACHE` | **PB(false)** | Vision 安装 / **MODEL** | memoize stable preprocessing artifact。会保留 host 内存，并要求正确 cache key。 |
-| `RPU_RHINOVLA_VISION_RPU_MERGER_NORM` | **PB(false)** | Vision 安装 / **MODEL** | 在 RPU 上运行 merger normalization。它会改变 boundary 和数值配置。 |
-| `RPU_RHINOVLA_VISION_RPU_MERGER_OUTPUT_RPU` | **PB(false)** | Vision 安装 / **MODEL** | 将 merger output 保留在 RPU 上。consumer 必须接受 device-resident output 和稳定 ownership。 |
+| `RPU_RHINOVLA_VISION_RPU_MERGER_NORM` | **PB(false)** | Vision 安装 / **MODEL** | 在 Rhino 上运行 merger normalization。它会改变 boundary 和数值配置。 |
+| `RPU_RHINOVLA_VISION_RPU_MERGER_OUTPUT_RPU` | **PB(false)** | Vision 安装 / **MODEL** | 将 merger output 保留在 Rhino 上。consumer 必须接受 device-resident output 和稳定 ownership。 |
 | `RPU_RHINOVLA_VISION_SKIP_RAW_SNAPSHOTS` | **PB(false)** | Vision 安装 / **MODEL** | `1` 抑制 raw debug snapshot。保持关闭会增加内存/同步，并可能保留敏感模型 input/intermediate。 |
 
 <a id="wall-oss-profile"></a>
@@ -365,7 +365,7 @@ Pi0.5 loader 负责这些设置。Graph selector 必须在模型构造和首次 
 | `RPU_WALL_OSS_BATCH_MAX_SEQ` | `768`；十进制整数 | Vision grouping / **CALL**；重建 Graph | 限制 packed vision sequence length。过大可能超出内存；所选公开配置可能进一步约束。 |
 | `RPU_WALL_OSS_BATCH_VISION` | **PB(true)** | Vision forward / **CALL**；重建 Graph | 在上限内打包 equal-grid image。它会改变 signature 和内存。 |
 | `RPU_WALL_OSS_DENOISE_UNROLL` | **PB(true)** | Action 构造和调用 / **MODEL** | 使用 fused denoise loop。`0` 选择 host loop，并改变拓扑和 timing。 |
-| `RPU_WALL_OSS_DEVICE_PATCH_EMBED` | **PB(true)** | Vision 构造 / **MODEL** | 在 RPU 上运行 folded patch embedding。`0` 使用 CPU projection，并改变 boundary/性能。 |
+| `RPU_WALL_OSS_DEVICE_PATCH_EMBED` | **PB(true)** | Vision 构造 / **MODEL** | 在 Rhino 上运行 folded patch embedding。`0` 使用 CPU projection，并改变 boundary/性能。 |
 | `RPU_WALL_OSS_EXPERT0_DOWN_INT4` | **PB(true)** | 量化 LLM 权重安装 / **MODEL** | 使用允许的 compact expert-0 down projection。部分 W4 配置强制关闭；不匹配会校验失败。 |
 | `RPU_WALL_OSS_FAST_IMGPROC` | **PB(true)** | Policy 构造 / **MODEL** | 首次调用 parity 检查后使用 direct image-preprocessing 路径。`0` 强制使用 HF processor。 |
 | `RPU_WALL_OSS_FAST_PROCESSOR` | **PB(true)** | Policy 构造 / **MODEL** | 首次调用 parity 检查后绕过 combined processor wrapper。`0` 保留 wrapper。 |
@@ -376,7 +376,7 @@ Pi0.5 loader 负责这些设置。Graph selector 必须在模型构造和首次 
 | `RPU_WALL_OSS_HOST_CACHE` | **PB(true)** | Component 构造 / **MODEL** | 启用 host layout/prompt memoization 和 stable owner。`0` 增加重复 host 工作。 |
 | `RPU_WALL_OSS_KVINSERT_PAD16` | **PB(true)** | LLM 构造 / **MODEL** | 对 prefill KV row 做 padding/mask。它会改变 execution length、cache layout 和 Graph signature。 |
 | `RPU_WALL_OSS_MULTISUITE_PROLOGUE` | **PB(false)** | Prompt 构造 / **CALL** | 选择 multisuite prompt schema；与 generic/short mode 互斥。改变 token。 |
-| `RPU_WALL_OSS_ONDEVICE_EMBED` | **PB(true)** | Policy 构造 / **MODEL** | 在 RPU 上构造 token/vision embedding。`0` 使用 CPU fallback，并禁用 fused construction 路径。 |
+| `RPU_WALL_OSS_ONDEVICE_EMBED` | **PB(true)** | Policy 构造 / **MODEL** | 在 Rhino 上构造 token/vision embedding。`0` 使用 CPU fallback，并禁用 fused construction 路径。 |
 | `RPU_WALL_OSS_PARTIAL_MROPE` | **PB(true)**；facade 设置 `1` | LLM 构造 / **MODEL** | 使用必需的 Wall-OSS multimodal position-table 路径。已准入的 Wall-OSS input 会拒绝显式 `0`。 |
 | `RPU_WALL_OSS_PE_NORM_FOLD` | **PB(true)** | Policy 构造 / **MODEL** | fast preprocessing 开启时，将 image normalization 折叠进 patch 权重。改变时需重建已安装权重。 |
 | `RPU_WALL_OSS_SHORT_PROMPT` | **PB(false)** | Prompt 构造 / **CALL** | 选择 short prompt schema；与其他 prologue mode 互斥。改变 token。 |
@@ -414,7 +414,7 @@ Pi0.5 loader 负责这些设置。Graph selector 必须在模型构造和首次 
 | `RPU_SIGLIP_ISOLATE_PATCH_EMBED` | 关闭；除 `0`/`false`/`False` 外的非空值 | 首次 segment 规划 / **NATIVE** | 隔离 Pi0.5 patch-embedding segment，诊断 Graph finalization failure。改变 Graph segmentation。 |
 | `RPU_WALL_OSS_INSTRUMENT` | **PB(false)** | Wall-OSS forward stage / **CALL** | 打印 host stage timing。instrumentation 开销会使同一次运行不适合报告干净 latency。 |
 | `RPU_WALL_OSS_PROLOGUE_FILLER` | 空；任意字符串 | Prompt 构造 / **CALL** | 向 prompt 追加诊断内容。它会改变 token，使输出不适合正确性声明。 |
-| `RPU_WALL_OSS_VISION_DEVICE_MERGED` | **PB(false)** | Vision 构造 / **MODEL** | 将 eager merged result 保留在 RPU 上，作为普通 fused 路径的诊断替代。改变 ownership/topology。 |
+| `RPU_WALL_OSS_VISION_DEVICE_MERGED` | **PB(false)** | Vision 构造 / **MODEL** | 将 eager merged result 保留在 Rhino 上，作为普通 fused 路径的诊断替代。改变 ownership/topology。 |
 | `WALL_OSS_PROFILE_PREFIX` | 未设置；十进制整数 target length | 每次 prediction / **CALL**；prepared production Graph 禁止使用 | 保留 image token 后截断尾部 text，用于 profiling shape。所得 action 没有意义。 |
 
 ## 非环境变量 Runtime 控制
@@ -433,7 +433,7 @@ Pi0.5 loader 负责这些设置。Graph selector 必须在模型构造和首次 
 | `padding_rows` | `"auto"` 或非负整数 | 指定 stage 的精确/自动 execution padding。精确整数与 `padding_budget` 互斥。 |
 | `padding_budget` | 非负整数 | stage planner 考虑的最大可选 padding。不能与精确整数 `padding_rows` 同时使用。 |
 
-即使某字段只影响一个 Graph，全部三个 stage mapping 仍是冷态配置：应在 RPU 权重安装和
+即使某字段只影响一个 Graph，全部三个 stage mapping 仍是冷态配置：应在 Rhino 权重安装和
 首次 Graph BUILD 前传给 loader/factory。adapter 可以把请求收窄到其精确 capability
 envelope；如果公共 policy API 有记录，它也会公开 resolved execution plan。
 
@@ -449,9 +449,9 @@ envelope；如果公共 policy API 有记录，它也会公开 resolved executio
   direct allocation，也不是进程级 driver mapping 总数。
   `reset_peak_memory_stats()` 重置 peak counter，`reset_accumulated_memory_stats()` 重置
   累计 allocate/free counter。重置 counter 不会释放内存。
-- `torch.rpu.set_ddr_flush(bool)` 控制内部 RPU-to-RPU flush point（默认关闭）。模型
+- `torch.rpu.set_ddr_flush(bool)` 控制内部 Rhino-to-Rhino flush point（默认关闭）。模型
   adapter 可在其 cross-component 契约需要时设置。
-- `torch.rpu.set_ddr_flush_force(bool)` 控制 CPU/RPU boundary coherency（默认开启）。
+- `torch.rpu.set_ddr_flush_force(bool)` 控制 CPU/Rhino boundary coherency（默认开启）。
   普通推理应保持启用；除隔离 microbenchmark 外，禁用是不安全的。对应 `get_*` 函数
   报告当前进程状态。
 

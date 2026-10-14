@@ -215,8 +215,8 @@ has admitted Qwen3.5 Vision. They do not expand its Experimental status.
 | Variable | Unset/default and accepted values | Read / change | Scope, effect, and risk |
 |---|---|---|---|
 | `QWEN3_5_VISION_CHUNK` | Auto; decimal integer, empty/non-positive means auto | First native vision plan / **NATIVE** | Caps Qwen3.5 Vision chunking. Positive overrides must remain in the admitted shape and memory envelope. |
-| `RPU_VISION_MERGER` | **PB(true)** | Qwen3.5 Vision setup / **MODEL** | Enables the RPU merger path. `0` selects a fallback and changes performance/numerics. |
-| `RPU_VISION_STEP0` | **PB(true)** | Qwen3.5 Vision setup / **MODEL** | Enables the RPU first-stage path. `0` selects a fallback and changes performance/numerics. |
+| `RPU_VISION_MERGER` | **PB(true)** | Qwen3.5 Vision setup / **MODEL** | Enables the Rhino merger path. `0` selects a fallback and changes performance/numerics. |
+| `RPU_VISION_STEP0` | **PB(true)** | Qwen3.5 Vision setup / **MODEL** | Enables the Rhino first-stage path. `0` selects a fallback and changes performance/numerics. |
 
 <a id="gr00t-profile"></a>
 ## GR00T profile
@@ -270,7 +270,7 @@ asset manifest through its Python API; no environment path replaces it.
 
 | Variable | Unset/default and accepted values | Read / change | Scope, effect, and risk |
 |---|---|---|---|
-| `RPU_INTERNVLA_DINO_FINAL_NORM_RPU` | **PB(true)** | DINO tower construction / **MODEL** | Runs the final normalization on RPU. `0` changes the host/device boundary and timing. |
+| `RPU_INTERNVLA_DINO_FINAL_NORM_RPU` | **PB(true)** | DINO tower construction / **MODEL** | Runs the final normalization on Rhino. `0` changes the host/device boundary and timing. |
 | `RPU_INTERNVLA_DINO_NORM_FOLD` | **PB(false)** | DINO tower construction / **MODEL** | Folds input normalization into patch weights. It changes installed weights and must be rebuilt. |
 | `RPU_INTERNVLA_HOST_CACHE` | **PB(true)** | Backbone construction / **MODEL** | Enables host memoization and stable owners. Disabling increases repeated host work. |
 | `RPU_NAVDP_DENOISE_UNROLL` | Off; stripped `1`/`true`/`True` enables, other values disable | NavDP action call / **CALL**; rebuild Graph | Captures the fixed denoise loop. It changes Graph topology and step execution. |
@@ -342,7 +342,7 @@ that tower. Facades may set exact defaults before model construction.
 | `RPU_QWEN3VL_VISION_BATCH_CAP` | `3`; decimal integer clamped to at least `1` | Vision forward / **CALL**; rebuild Graph | Maximum compatible images per packed group. Larger values can exceed the profile memory envelope. |
 | `RPU_QWEN3VL_VISION_FUSED_MERGER` | Raw off; **B01(false)** | Vision construction / **MODEL** | Folds the merger into the Vision Graph. Only literal `0`/`1` keeps Python and native readers consistent. |
 | `RPU_QWEN3VL_VISION_HOST_FP32_PATCH` | `0`; **E1** | Vision forward / **CALL**; rebuild Graph/model | Uses host FP32 patch projection instead of the default FP16/device profile. It changes numerics and transfer cost. |
-| `RPU_QWEN3VL_VISION_PATCH_EMBED_DEVICE` | `0`; **E1** | Vision construction / **MODEL** | Moves patch embedding to RPU. It changes installed weights, numerics, and graph topology. |
+| `RPU_QWEN3VL_VISION_PATCH_EMBED_DEVICE` | `0`; **E1** | Vision construction / **MODEL** | Moves patch embedding to Rhino. It changes installed weights, numerics, and graph topology. |
 | `RPU_QWEN3VL_VISION_ROPE_SPM` | Off; native value beginning with `1`, `t`, or `T` enables | First native vision use / **NATIVE** | Keeps vision position tables in SPM. It changes persistent memory use and requires a rebuilt vision handle. |
 
 ## RhinoVLA profile
@@ -366,8 +366,8 @@ itself is not an end-to-end contract.
 | `RPU_RHINOVLA_VISION_BATCH_VIEWS` | **PB(false)** | Vision forward / **CALL**; rebuild Graph | Packs equal-size views and is required for some batched merger profiles. Mixed geometry falls back or fails. |
 | `RPU_RHINOVLA_VISION_CPU_MERGER_NORM_FP16` | **PB(false)** | Vision installation / **MODEL** | Uses FP16 for the CPU merger-normalization fallback. It directly changes numerical results. |
 | `RPU_RHINOVLA_VISION_PREP_CACHE` | **PB(false)** | Vision installation / **MODEL** | Memoizes stable preprocessing artifacts. It retains host memory and requires correct cache keys. |
-| `RPU_RHINOVLA_VISION_RPU_MERGER_NORM` | **PB(false)** | Vision installation / **MODEL** | Runs merger normalization on RPU. It changes the boundary and numerical profile. |
-| `RPU_RHINOVLA_VISION_RPU_MERGER_OUTPUT_RPU` | **PB(false)** | Vision installation / **MODEL** | Keeps merger output on RPU. Consumers must accept device-resident output and stable ownership. |
+| `RPU_RHINOVLA_VISION_RPU_MERGER_NORM` | **PB(false)** | Vision installation / **MODEL** | Runs merger normalization on Rhino. It changes the boundary and numerical profile. |
+| `RPU_RHINOVLA_VISION_RPU_MERGER_OUTPUT_RPU` | **PB(false)** | Vision installation / **MODEL** | Keeps merger output on Rhino. Consumers must accept device-resident output and stable ownership. |
 | `RPU_RHINOVLA_VISION_SKIP_RAW_SNAPSHOTS` | **PB(false)** | Vision installation / **MODEL** | `1` suppresses raw debug snapshots. Leaving it off adds memory/synchronization and may retain sensitive model inputs/intermediates. |
 
 ## Wall-OSS profile
@@ -383,7 +383,7 @@ performance-only switches.
 | `RPU_WALL_OSS_BATCH_MAX_SEQ` | `768`; decimal integer | Vision grouping / **CALL**; rebuild Graph | Caps packed vision sequence length. Too large can exceed memory; the selected public profile may further constrain it. |
 | `RPU_WALL_OSS_BATCH_VISION` | **PB(true)** | Vision forward / **CALL**; rebuild Graph | Packs equal-grid images up to the cap. It changes signatures and memory. |
 | `RPU_WALL_OSS_DENOISE_UNROLL` | **PB(true)** | Action construction and calls / **MODEL** | Uses the fused denoise loop. `0` selects the host loop and changes topology and timing. |
-| `RPU_WALL_OSS_DEVICE_PATCH_EMBED` | **PB(true)** | Vision construction / **MODEL** | Runs folded patch embedding on RPU. `0` uses CPU projection and changes boundary/performance. |
+| `RPU_WALL_OSS_DEVICE_PATCH_EMBED` | **PB(true)** | Vision construction / **MODEL** | Runs folded patch embedding on Rhino. `0` uses CPU projection and changes boundary/performance. |
 | `RPU_WALL_OSS_EXPERT0_DOWN_INT4` | **PB(true)** | Quantized LLM weight installation / **MODEL** | Uses the admitted compact expert-0 down projection. Some W4 profiles force it off; mismatches fail validation. |
 | `RPU_WALL_OSS_FAST_IMGPROC` | **PB(true)** | Policy construction / **MODEL** | Uses the direct image-preprocessing path after a first-call parity check. `0` forces the HF processor. |
 | `RPU_WALL_OSS_FAST_PROCESSOR` | **PB(true)** | Policy construction / **MODEL** | Bypasses the combined processor wrapper after a first-call parity check. `0` keeps the wrapper. |
@@ -394,7 +394,7 @@ performance-only switches.
 | `RPU_WALL_OSS_HOST_CACHE` | **PB(true)** | Component construction / **MODEL** | Enables host layout/prompt memoization and stable owners. `0` increases repeated host work. |
 | `RPU_WALL_OSS_KVINSERT_PAD16` | **PB(true)** | LLM construction / **MODEL** | Pads/masks prefill KV rows. It changes execution length, cache layout, and Graph signatures. |
 | `RPU_WALL_OSS_MULTISUITE_PROLOGUE` | **PB(false)** | Prompt construction / **CALL** | Selects the multisuite prompt schema; mutually exclusive with generic/short modes. Changes tokens. |
-| `RPU_WALL_OSS_ONDEVICE_EMBED` | **PB(true)** | Policy construction / **MODEL** | Builds token/vision embeddings on RPU. `0` uses the CPU fallback and disables the fused construction path. |
+| `RPU_WALL_OSS_ONDEVICE_EMBED` | **PB(true)** | Policy construction / **MODEL** | Builds token/vision embeddings on Rhino. `0` uses the CPU fallback and disables the fused construction path. |
 | `RPU_WALL_OSS_PARTIAL_MROPE` | **PB(true)**; facade sets `1` | LLM construction / **MODEL** | Uses the required Wall-OSS multimodal position-table path. Explicit `0` is rejected for admitted Wall-OSS input. |
 | `RPU_WALL_OSS_PE_NORM_FOLD` | **PB(true)** | Policy construction / **MODEL** | Folds image normalization into patch weights when fast preprocessing is active. Rebuild installed weights to change it. |
 | `RPU_WALL_OSS_SHORT_PROMPT` | **PB(false)** | Prompt construction / **CALL** | Selects the short prompt schema; mutually exclusive with other prologue modes. Changes tokens. |
@@ -434,7 +434,7 @@ sharing it.
 | `RPU_SIGLIP_ISOLATE_PATCH_EMBED` | Off; non-empty except `0`/`false`/`False` | First segment planning / **NATIVE** | Isolates Pi0.5 patch-embedding segments to diagnose graph-finalization failures. Changes graph segmentation. |
 | `RPU_WALL_OSS_INSTRUMENT` | **PB(false)** | Wall-OSS forward stages / **CALL** | Prints host stage timings. Instrumentation overhead makes the same run unsuitable for clean latency reporting. |
 | `RPU_WALL_OSS_PROLOGUE_FILLER` | Empty; arbitrary string | Prompt construction / **CALL** | Appends diagnostic content to the prompt. It changes tokens and makes output unsuitable for correctness claims. |
-| `RPU_WALL_OSS_VISION_DEVICE_MERGED` | **PB(false)** | Vision construction / **MODEL** | Keeps the eager merged result on RPU as a diagnostic alternative to the normal fused route. Changes ownership/topology. |
+| `RPU_WALL_OSS_VISION_DEVICE_MERGED` | **PB(false)** | Vision construction / **MODEL** | Keeps the eager merged result on Rhino as a diagnostic alternative to the normal fused route. Changes ownership/topology. |
 | `WALL_OSS_PROFILE_PREFIX` | Unset; decimal integer target length | Each prediction / **CALL**; forbidden with prepared production Graphs | Truncates trailing text for a profiling shape after preserving image tokens. Resulting actions are meaningless. |
 
 ## Non-environment runtime controls
@@ -455,7 +455,7 @@ weight loading.
 | `padding_budget` | Non-negative integer | Maximum optional padding considered by the stage planner. It cannot accompany an exact integer `padding_rows`. |
 
 All three stage mappings are cold even when a field influences only one Graph:
-pass them to the loader/factory before RPU weight installation and first Graph
+pass them to the loader/factory before Rhino weight installation and first Graph
 BUILD. The adapter may narrow a request to its exact capability envelope and
 will expose the resolved execution plan where its public policy API documents
 one.
@@ -473,10 +473,10 @@ one.
   driver mapping count. `reset_peak_memory_stats()` resets peak counters, while
   `reset_accumulated_memory_stats()` resets accumulated allocation/free
   counters. Resetting counters does not free memory.
-- `torch.rpu.set_ddr_flush(bool)` controls internal RPU-to-RPU flush points
+- `torch.rpu.set_ddr_flush(bool)` controls internal Rhino-to-Rhino flush points
   (default off). Model adapters may set it when their cross-component contract
   requires it.
-- `torch.rpu.set_ddr_flush_force(bool)` controls CPU/RPU boundary coherency
+- `torch.rpu.set_ddr_flush_force(bool)` controls CPU/Rhino boundary coherency
   (default on). Keep it enabled for normal inference; disabling it is unsafe
   outside an isolated microbenchmark. The matching `get_*` functions report
   current process state.

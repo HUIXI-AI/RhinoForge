@@ -13,7 +13,7 @@
 
 </div>
 
-RhinoForge 将 Rhino Processing Unit（RPU）接入为 `torch.rpu`。项目在同一个
+RhinoForge 将 Rhino 设备接入为 `torch.rpu`。项目在同一个
 PyTorch 后端中提供模型适配器、融合模型运行时、图捕获与重放、SPM 内存管理、
 多核执行、离线量化和模型移植模板。
 
@@ -22,7 +22,7 @@ PyTorch 后端中提供模型适配器、融合模型运行时、图捕获与重
 
 ## 主要能力
 
-- **PyTorch 集成：** 通过标准自定义设备路径和 `torch.rpu` API 使用 RPU。
+- **PyTorch 集成：** 通过标准自定义设备路径和 `torch.rpu` API 使用 Rhino。
 - **模型部署：** 通过模型适配器和 TOML 示例运行文本、视觉语言、视觉和 VLA
   配置。
 - **可扩展运行时：** 移植新模型时可复用公开的融合模型、图、SPM、多核、批量
@@ -45,21 +45,21 @@ playbook。规范流程见[模型移植](docs/model_porting.zh.md)。
 > 相邻配置不继承这些声明。
 
 | 模型 | 公开入口 | 状态 | 限制 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Qwen3 0.6B / 1.7B / 4B / 8B | `RPUModelForCausalLM` | Supported | FP16 推理；准确执行范围以发布版本为准 |
 | Qwen3 0.6B / 1.7B / 4B / 8B W8A16 | `RPUModelForCausalLM` | Source-only | 包含转换器和加载器源码，不声明可运行发布配置 |
 | Qwen3 14B W8A16 | `RPUModelForCausalLM` | Source-only | 仅包含 converter/loader 源码；v1.0.0 未绑定公开不可变派生 checkpoint 身份或 hash |
 | Qwen3 32B | `RPUModelForCausalLM` | Source-only | 无可运行配置；预检会拒绝不支持的配置 |
 | Llama-3.2-1B | `RPUModelForCausalLM` | Supported | 因果语言模型推理 |
 | Qwen3.5 text 2B / 9B | `Qwen3_5Adapter` | Supported | 仅 dense FP16 文本；不支持 `torch.compile` |
-| Qwen3.5 text 0.8B / 4B | `Qwen3_5Adapter` | Experimental | 本次 192-token 验证的 last-prefill full-vocabulary relative-L2 超过 `0.01`；numeric-blocked，仅供受控评估 |
+| Qwen3.5 text 0.8B / 4B | `Qwen3_5Adapter` | Experimental | Numeric-blocked，仅供受控评估 |
 | Qwen3.5 Vision 2B / 4B | `Qwen3_5Adapter` | Experimental | 官方真实图数值门未通过；默认拒绝图像推理，精确 `QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED=1` 仅供受控评估 |
 | Qwen3-VL 2B | `RPUModelForConditionalGeneration` | Supported | 图像和文本；视频不在发布范围内 |
 | Qwen3-VL 4B | `RPUModelForConditionalGeneration` | Supported | 仅限已验证的单图、多图、prefill、decode 和 chunk 范围 |
-| Qwen3-VL 8B | `RPUModelForConditionalGeneration` | Limited | 精确 dense-FP16 padded profile 的 4/4 numeric/task/Graph 已通过，包含 dual-full；base 5/5、long-text 9/9 token 精确一致；相邻长度、视频和量化路径不继承 |
+| Qwen3-VL 8B | `RPUModelForConditionalGeneration` | Limited | 仅限精确 dense-FP16 padded profile，包含 dual-full；相邻长度、视频和量化路径不继承 |
 | Qwen3-VL 32B W8A16 | `RPUModelForConditionalGeneration` | Source-only | 第三个 decode step 起存在全零 logits 硬失败；只保留显式放行的受控诊断入口 |
 | Gemma4-E4B text | `Gemma4Adapter` | Source-only | 运行时依赖和发布配置尚未冻结 |
-| Pi0.5 Libero FP16 | `Pi05Policy` | Supported | 精确 Libero FP16 profile 的 9/9 numeric/task 与 27/27 execution-plan record 已通过；独立 fresh-process Graph 生命周期门也已通过 |
+| Pi0.5 Libero FP16 | `Pi05Policy` | Supported | 仅限精确 Libero FP16 profile；量化和 reduced-step 配置不继承 |
 | Pi0.5 Libero W8A16 | `Pi05Policy` | Source-only | 仅包含 converter/runtime 源码；v1.0.0 未绑定公开不可变派生 checkpoint 身份或 hash |
 | Pi0.5 Libero W4A16 | `Pi05Policy` | Source-only | 仅包含 converter/runtime 源码；v1.0.0 未绑定公开不可变派生 checkpoint 身份或 hash |
 | Pi0.5 reduced-step / closed-loop | `Pi05Policy` | Source-only | 仅保留策略源码；验证仍待完成，不继承精确 FP16 profile 或量化路径的证据与状态 |
@@ -87,7 +87,7 @@ playbook。规范流程见[模型移植](docs/model_porting.zh.md)。
 
 ## 快速开始
 
-RhinoForge v1.0.0 从源码安装，需要已配置好的 RPU 板卡环境和 Python 3.12。
+RhinoForge v1.0.0 从源码安装，需要已配置好的 Rhino 板卡环境和 Python 3.12。
 授权接收方的安装路径如下：
 
 > **Draft 分支兼容性：** 本分支尚未绑定可发布 runtime-set，并要求 Rhino
@@ -136,7 +136,7 @@ RhinoForge 不分发模型 checkpoint 和生成的量化 checkpoint。完整的�
 ## 文档
 
 | 主题 | 文档 |
-|---|---|
+| --- | --- |
 | 完整文档导航 | [文档索引](docs/README.md) |
 | 安装与运行 | [入门指南](docs/getting_started.zh.md) |
 | 支持和排除的配置 | [模型支持](docs/model_support.zh.md) |
@@ -144,7 +144,6 @@ RhinoForge 不分发模型 checkpoint 和生成的量化 checkpoint。完整的�
 | 模型 checkpoint | [模型资产](docs/model_assets.zh.md) |
 | Runtime/TOML 参数与性能分析 | [运行时配置](docs/runtime_config.zh.md) |
 | 模型运行、测试与性能分析 | [模型运行与性能分析](docs/model_testing.zh.md) |
-| 可复现性能测量 | [性能测量](docs/performance.zh.md) |
 | 模型验证与状态门禁 | [模型验证策略](docs/validation_policy.zh.md) |
 | 运行时设计 | [架构](docs/architecture.zh.md) |
 | Python 与 C++ API | [API 参考](docs/api_reference.zh.md) |

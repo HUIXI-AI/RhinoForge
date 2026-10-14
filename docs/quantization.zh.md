@@ -157,7 +157,7 @@ metadata 或重命名 scale tensor。
 3. 检查输出 manifest、metadata、tensor name/dtype/shape 和 file hash；
 4. 对比采样或完整 dequantized weight 与 FP16 来源；
 5. 通过公开 RhinoForge 入口加载，并确认 mismatch profile fail fast；
-6. RPU 对精确量化同 dtype 参考验证实现一致性，再按
+6. Rhino 对精确量化同 dtype 参考验证实现一致性，再按
    [验证策略](validation_policy.zh.md)对固定 FP16/CPU FP32 anchor 检查任务质量；
 7. 验证 warmup 和 Graph lifecycle；
 8. 在新进程运行公开 E2E TOML example。

@@ -1,6 +1,6 @@
 # Live model and policy lifecycle
 
-Fused RhinoForge execution permits one live RPU-resident model or policy owner
+Fused RhinoForge execution permits one live Rhino-resident model or policy owner
 per process. Installation changes weights in place, creates model handles and
 Graph caches, and binds cold execution settings; it is a transaction, not a
 reversible device copy.
@@ -9,7 +9,7 @@ reversible device copy.
 
 1. Validate the complete profile and claim process ownership.
 2. Mark irreversible transformation as started.
-3. Transform each weight exactly once and move the admitted state to RPU.
+3. Transform each weight exactly once and move the admitted state to Rhino.
 4. Create handles, caches, Graph ownership, and cold execution configuration.
 5. Mark the instance ready only after every step succeeds.
 

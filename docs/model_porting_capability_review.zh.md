@@ -61,8 +61,8 @@ dtype 参考和 CPU FP32 anchor。从预处理到返回输出完整追踪一次�
 |---|---|
 | 现有 adapter | 精确配置和输入范围通过其 preflight |
 | 共享 causal decoder | 目标数学精确匹配模板使用的 `llama` 或 `qwen3` 分支 |
-| 现有 RPU operation | 公开 schema 覆盖准确 shape、dtype、layout 和状态更新 |
-| 已审查 CPU fallback | 保持正确性且明确列出，但不算 RPU 支持证据 |
+| 现有 Rhino operation | 公开 schema 覆盖准确 shape、dtype、layout 和状态更新 |
+| 已审查 CPU fallback | 保持正确性且明确列出，但不算 Rhino 支持证据 |
 | 新 host operation | 已定义数学、tensor 契约、验证、注册和 release 匹配的算子可用性 |
 | 新 fused subsystem | 重复执行需要新的 `FusedModelBase` SPM manifest 和 layer subgraph |
 

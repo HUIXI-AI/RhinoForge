@@ -19,7 +19,7 @@ remain in [the capability review](../../../../docs/model_porting_capability_revi
 - Record failed or incomplete probes as `needs human review`. Do not silently
   drop them or convert them into confident support or rejection.
 - CPU fallback preserves correctness only when the public profile explicitly
-  admits that boundary. It is not evidence of RPU execution.
+  admits that boundary. It is not evidence of Rhino execution.
 
 ## Family and capability map
 

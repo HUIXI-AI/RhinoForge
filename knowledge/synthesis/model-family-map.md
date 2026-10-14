@@ -32,7 +32,7 @@ assets in [Model support](../../docs/model_support.md) before loading weights.
   native handle or cache layout directly.
   [CausalLM API](../../docs/api_reference.md#causal-language-models)
 - `rpu_execution.prefill` is cold, per-handle configuration. Finalize it before
-  RPU installation, create the cache after the model profile is fixed, and
+  Rhino installation, create the cache after the model profile is fixed, and
   size the cache for prompt plus decode.
   [Qwen3 example](../../examples/causal_lm.py)
 - Weight conversion is irreversible and exactly once. If construction fails
@@ -88,7 +88,7 @@ assets in [Model support](../../docs/model_support.md) before loading weights.
   instances and temporary SPM lifetimes; component handoff is an ownership
   boundary, not a reason to use a process-global Graph cache.
   [Pi0.5 adapter](../../python/rpu_backend/adapters/pi05/__init__.py)
-- Construct through `Pi05Policy`, move the policy to RPU once, optionally call
+- Construct through `Pi05Policy`, move the policy to Rhino once, optionally call
   `prepare_graphs`, and use `predict_action_chunk` or `select_action`. Configure
   prefill, vision, and action planning through public `rpu_execution`, not
   undocumented module attributes or process-global chunk settings.
@@ -101,7 +101,7 @@ assets in [Model support](../../docs/model_support.md) before loading weights.
 ### Wall-OSS
 
 - Construct the policy through `WallOssPolicy.from_checkpoint(...)` or
-  `from_pretrained(...)`, bind one complete profile, move it to RPU once, and
+  `from_pretrained(...)`, bind one complete profile, move it to Rhino once, and
   prepare only the finite graph envelope owned by that policy. Directly mixing
   individual runtime switches from other VLA profiles is not a supported
   configuration.
@@ -122,7 +122,7 @@ assets in [Model support](../../docs/model_support.md) before loading weights.
 - The backend facade wraps a model-repository-owned runtime that combines a
   Qwen3-VL-style visual/text prefix with an action-expert path. The external
   runtime factory remains responsible for checkpoint composition,
-  preprocessing, irreversible RPU conversion, and live-input validation.
+  preprocessing, irreversible Rhino conversion, and live-input validation.
   [RhinoVLA facade](../../python/rpu_backend/api/rhinovla.py)
 - Use only an installed, reviewed `runtime_factory` callable or
   `module:callable` extension. When `rpu_execution` is supplied, the factory and

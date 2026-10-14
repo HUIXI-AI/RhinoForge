@@ -15,7 +15,7 @@ a shared contract in RhinoForge.
 | A cold execution option changes after model construction | Create a new model handle with the final `rpu_execution` mapping | [Runtime controls](../../docs/runtime_config.md#cold-per-handle-rpu_execution) |
 
 When the first check fails to explain a numerical mismatch, compare the CPU
-reference and RPU result at the smallest public model boundary, then widen one
+reference and Rhino result at the smallest public model boundary, then widen one
 phase at a time. Do not claim support from an end-to-end run alone.
 [Verification gates](../../docs/model_porting.md#8-verification-gates)
 

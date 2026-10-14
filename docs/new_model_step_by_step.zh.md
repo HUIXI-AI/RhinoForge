@@ -19,7 +19,7 @@
 - 最大允许 cache 长度；
 - shape 相同的两个不同输入。
 
-CPU 参考实例保持独立。RPU 权重转换是原地操作，不能安全逆转。
+CPU 参考实例保持独立。Rhino 权重转换是原地操作，不能安全逆转。
 
 **Done：** 不使用 RhinoForge 时，固定输入可重复产生两个 reference 契约。
 
@@ -145,7 +145,7 @@ python -m pytest \
 
 ## 8. 运行配置门禁并晋级
 
-在新进程中使用 release 匹配依赖和资产构建，然后在 RPU 板卡运行精确 TOML。证据包括：
+在新进程中使用 release 匹配依赖和资产构建，然后在 Rhino 板卡运行精确 TOML。证据包括：
 
 - [验证策略](validation_policy.zh.md)固定的硬语义、同 dtype 实现一致性、CPU FP32
   anchor 和代表性任务门禁；

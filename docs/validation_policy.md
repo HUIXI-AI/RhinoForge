@@ -26,7 +26,7 @@ Record these fields before evaluation:
 - admitted sequence, image, batch, cache, and execution settings.
 
 A CPU FP32 golden can be reused while every reference-side identity field and
-input hash remains unchanged. A backend-only source change requires a new RPU
+input hash remains unchanged. A backend-only source change requires a new Rhino
 comparison, not a new CPU golden.
 
 ## 2. Hard semantic and runtime gates
@@ -56,7 +56,7 @@ Use two references for different questions:
 
 | Reference | Question |
 |---|---|
-| Same-dtype reference | Does the RPU implementation preserve the semantics of the chosen FP16 or quantized execution path? |
+| Same-dtype reference | Does the Rhino implementation preserve the semantics of the chosen FP16 or quantized execution path? |
 | CPU FP32 anchor | How much accuracy is lost relative to the higher-precision model? |
 
 “Same dtype” is not a complete identity. Pin the reference device/backend,
@@ -97,7 +97,7 @@ reviewed explanation and a new evidence version. If a family has no calibrated
 contract, use the metric distribution to locate errors and keep the profile at
 Experimental or Source-only until a task-linked contract is approved.
 
-Quantized profiles use two comparisons: RPU against the exact quantized
+Quantized profiles use two comparisons: Rhino against the exact quantized
 same-dtype reference for implementation parity, then the quantized result
 against the FP16 or FP32 anchor for retained task quality.
 

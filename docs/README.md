@@ -13,7 +13,6 @@
 | Checkpoint 来源、hash 和转换 | [模型资产](model_assets.zh.md) | [Model assets](model_assets.md) |
 | TOML、环境变量和运行时参数 | [运行时配置](runtime_config.zh.md) | [Runtime configuration](runtime_config.md) |
 | 模型入口、配置检查和 profiling | [模型运行与性能分析](model_testing.zh.md) | [Model execution and profiling](model_testing.md) |
-| 可复现性能测量 | [性能测量](performance.zh.md) | [Performance measurement](performance.md) |
 | 支持状态与数值门禁 | [模型验证策略](validation_policy.zh.md) | [Model validation policy](validation_policy.md) |
 
 ## 开发、扩展与调试

@@ -195,7 +195,7 @@ Run board-free checks first:
 - cache sizing and output shapes match the reference contract; and
 - the source build and package import complete cleanly.
 
-Then run the exact release profile on an RPU board:
+Then run the exact release profile on an Rhino board:
 
 - run the hard semantic, same-dtype implementation-parity, CPU FP32 anchor,
   and task-quality gates defined by the exact profile in

@@ -16,7 +16,7 @@ model sizes or quantization formats.
 ## Status definitions
 
 | Status | Meaning |
-|---|---|
+| --- | --- |
 | Supported | The exact public profile passes checkpoint/input, numerical, warmup, graph-lifecycle, and end-to-end validation |
 | Limited | The same quality bar as Supported passes, but only for the exact named, narrower envelope; nearby profiles do not inherit the result |
 | Experimental | Hard semantic, required finite-output, declared-repeatability, and safe rejection gates pass, while parity coverage or representative task evidence may remain incomplete |
@@ -32,24 +32,24 @@ mean that a model is numerically wrong.
 ## Supported and Limited profiles
 
 | Model/profile | Public entry | Status | Exact scope |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Qwen3 0.6B / 1.7B / 4B / 8B | `rpu_backend.RPUModelForCausalLM` | Supported | FP16 inference; release-specific batch, prefill, and decode envelope |
 | Llama-3.2-1B | `rpu_backend.RPUModelForCausalLM` | Supported | Causal language-model inference |
 | Qwen3.5 text 2B / 9B | `rpu_backend.adapters.qwen3_5.Qwen3_5Adapter` with `rpu_backend.api.Qwen3_5Cache` | Supported | Dense FP16, text only; `torch.compile` is not supported |
 | Qwen3-VL 2B | `rpu_backend.api.RPUModelForConditionalGeneration` | Supported | Image and text; video is outside the first-release scope |
 | Qwen3-VL 4B | `rpu_backend.api.RPUModelForConditionalGeneration` | Supported | Within the validated single-image, multi-image, prefill, decode, and chunk envelope only |
-| Qwen3-VL 8B | `rpu_backend.api.RPUModelForConditionalGeneration` | Limited | Exact dense-FP16 padded profile: 4/4 numeric/task/Graph legs pass, including dual-full; base 5/5 and long-text 9/9 tokens are exact; nearby lengths, video, and quantized paths do not inherit |
-| Pi0.5 Libero FP16 | `rpu_backend.api.Pi05Policy` | Supported | Exact Libero FP16 profile: 9/9 numeric/task legs and 27/27 execution-plan records pass; an independent fresh-process Graph lifecycle cell also passes |
+| Qwen3-VL 8B | `rpu_backend.api.RPUModelForConditionalGeneration` | Limited | Exact dense-FP16 padded profile, including dual-full; nearby lengths, video and quantized paths do not inherit |
+| Pi0.5 Libero FP16 | `rpu_backend.api.Pi05Policy` | Supported | Exact Libero FP16 profile only; quantized and reduced-step profiles do not inherit |
 | Hy-Embodied-0.5-VLA | `rpu_backend.api.HyEmbodiedPolicy` | Limited | Exact FP16/W16 input profile only; numerical inference support is not robot-readiness certification |
 | DINOv3 ViT-B | `rpu_backend.adapters.dinov3.DINOv3Adapter` | Supported | ViT-B only |
 
 ## Experimental, Component-only, and Source-only profiles
 
 | Model/profile | Public entry | Status | Exact scope |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Qwen3 W8A16 (0.6B / 1.7B / 4B / 8B / 14B) | `rpu_backend.RPUModelForCausalLM` | Source-only | Converter and loader source are included; v1.0.0 binds no public immutable derived checkpoint identity or hash, and aliases resolve local outputs only |
 | Qwen3 32B | `rpu_backend.RPUModelForCausalLM` | Source-only | Known unsupported configuration; preflight remains fail-fast |
-| Qwen3.5 text 0.8B / 4B | `rpu_backend.adapters.qwen3_5.Qwen3_5Adapter` with `rpu_backend.api.Qwen3_5Cache` | Experimental | The 192-token validation's last-prefill full-vocabulary relative-L2 gate exceeds `0.01`; these profiles are numeric-blocked and controlled evaluation only |
+| Qwen3.5 text 0.8B / 4B | `rpu_backend.adapters.qwen3_5.Qwen3_5Adapter` with `rpu_backend.api.Qwen3_5Cache` | Experimental | Numeric-blocked; controlled evaluation only |
 | Qwen3.5 Vision 2B / 4B | `rpu_backend.adapters.qwen3_5.Qwen3_5Adapter` | Experimental | Official real-image standalone gates fail for both sizes; 2B real-image end-to-end also fails and 4B real-image end-to-end remains unrun. Image inference is fail-closed by default; exact `QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED=1` enables controlled evaluation only |
 | Qwen3-VL 32B W8A16 | `rpu_backend.api.RPUModelForConditionalGeneration` | Source-only | Retained Graph replay is known to produce all-zero logits from the third decode step. The default remains fail-closed; the explicit opt-in is only for controlled diagnostics and does not pass the hard Graph/lifecycle gate |
 | Pi0.5 Libero W8A16 / W4A16 | `rpu_backend.api.Pi05Policy` | Source-only | Converter and runtime source are included; v1.0.0 binds no public immutable derived checkpoint identity or hash |
@@ -78,14 +78,14 @@ The v1.0.0 release record binds each claimed profile to its reference identity,
 inputs, metrics, and thresholds. The current contracts are:
 
 | Profile | Hard semantics and lifecycle | Implementation parity | Task or release-quality evidence |
-|---|---|---|---|
-| Qwen3 FP16 | Valid positions, cache slots, warmup `0/1/3`, long-context bounds, and BUILD followed by stable REPLAY | CPU-FP32 versus RPU per-position cosine `>=0.99995`; every non-exact greedy near-tie is reported | Frozen perplexity/task accuracy and fixed-prompt generation for each named size and envelope |
+| --- | --- | --- | --- |
+| Qwen3 FP16 | Valid positions, cache slots, warmup `0/1/3`, long-context bounds, and BUILD followed by stable REPLAY | CPU-FP32 versus Rhino per-position cosine `>=0.99995`; every non-exact greedy near-tie is reported | Frozen perplexity/task accuracy and fixed-prompt generation for each named size and envelope |
 | Qwen3-VL 2B / 4B | Image/text ordering, corrected DeepStack routing, single- and multi-image inputs, and stable Vision/prefill/decode Graph lifecycles | Consumed text rows require mean cosine `>0.99` for single-image and `>0.98` for dual-image cases, with exact final argmax and ordered top-5; image-token metrics remain separate diagnostics | Frozen image-conditioned and multi-image task cases over only the named prompt, decode, and chunk envelope |
-| Qwen3-VL 8B dense FP16 | The same semantic and lifecycle gates as 2B/4B, plus exact padded-profile shape and physical-padding preflight; all 4/4 named legs pass their Graph lifecycle | All 4/4 named legs pass calibrated numeric and task gates, including dual-full; exact-token results are base 5/5 and long-text 9/9 | The Limited claim covers only the exact padded profile; nearby lengths, video, and quantized paths do not inherit |
+| Qwen3-VL 8B dense FP16 | The 2B/4B semantic and lifecycle constraints, plus padded-profile shape and physical-padding preflight | Compare single-image, multi-image, prefill and decode against the matching reference | The Limited claim covers only the exact padded profile; nearby lengths, video, and quantized paths do not inherit |
 | Qwen3.5 text 2B / 9B | Prefill uses its declared bounded one-shot and decode uses stable REPLAY | Text/decode cosine `>=0.999` and last-prefill full-vocabulary relative L2 `<=0.01`; accepted same/adjacent-FP16-bin near-ties are marked `greedy_exact=false` | Frozen dense-FP16 text cases pass for the named sizes |
-| Qwen3.5 text 0.8B / 4B | The same bounded-one-shot prefill and stable-REPLAY decode lifecycle is exercised | The 192-token validation's last-prefill full-vocabulary relative L2 exceeds `0.01` | Numeric-blocked; controlled evaluation does not constitute release support |
-| Qwen3.5 Vision 2B / 4B | Default image admission fails closed before the Vision handle or weight transformation; controlled evaluation uses a bounded retained cache and accepts images only | The declared row-mean cosine `>=0.999`, loose minimum `>=0.90`, and maximum relative error `<0.40` gate is not met by official real images for either size | No production-safe normal-image envelope is certified; controlled results do not constitute image or video support |
-| Pi0.5 Libero FP16 | Exact action shape/dtype, finite output, multi-camera and length behavior, and 27/27 action/prefill/vision execution-plan records; an independent fresh process proves READY stable Graph replay without recapture or invariant failure | All 9/9 same-noise numeric legs pass the source MSE ceiling `0.0072` | The exact 9/9 action/task matrix and independent Graph cell pass; quantized and reduced-step profiles do not inherit |
+| Qwen3.5 text 0.8B / 4B | The same bounded-one-shot prefill and stable-REPLAY decode lifecycle is exercised | Numeric-blocked; controlled evaluation only | Numeric-blocked; controlled evaluation does not constitute release support |
+| Qwen3.5 Vision 2B / 4B | Default image admission fails closed before the Vision handle or weight transformation; controlled evaluation uses a bounded retained cache and accepts images only | Controlled evaluation checks row-mean cosine `>=0.999`, loose minimum `>=0.90`, and maximum relative error `<0.40` | No production-safe normal-image envelope is certified; controlled results do not constitute image or video support |
+| Pi0.5 Libero FP16 | Check action shape/dtype, finite output, camera/length behavior and action/prefill/vision execution plans; verify Graph replay and cache invariants in a fresh process | Compare same-noise action outputs using the configured MSE ceiling `0.0072` | Exact Libero FP16 profile only; quantized and reduced-step profiles do not inherit |
 | Hy-Embodied FP16/W16 | Exact profile admission, finite outputs, four-call repeatability spread `<=1e-4`, stable Graph lifecycle, and A/B/A input refresh | Final action cosine `>=0.999` and MSE `<=0.01`; named intermediate stages use their separately frozen `0.99995` or `0.999` floors | Checkpoint-owned offline action evidence; robot safety and W8/W4 are outside the claim |
 
 See [Model validation policy](validation_policy.md) for reference identity,
@@ -99,7 +99,7 @@ This is an exclusion list, not a runnable model matrix. These profiles are
 intentionally absent from runnable aliases and examples:
 
 | Profile | Status | Public entry |
-|---|---|---|
+| --- | --- | --- |
 | Gemma2 and PaliGemma2 | Unsupported | None |
 | DINOv3 ViT-S and ViT-L | Unsupported | None; DINOv3 ViT-B remains in scope |
 | LingBot-VLA v1 | Unsupported | None; LingBot-VLA-V2 remains only in the scope listed above |
@@ -112,14 +112,14 @@ alias is nevertheless assigned to a release profile so a path alias cannot be
 mistaken for an extra support claim.
 
 | Registry alias(es) | Family/profile | Status | Classification |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `qwen3-0.6b`, `qwen3-1.7b`, `qwen3-4b`, `qwen3-8b` | Qwen3 FP16 | Supported | Asset aliases for the exact size named by each alias |
 | `qwen3-14b-w8a16-lmhead-int8` | Qwen3 14B W8A16 | Source-only | Local conversion-output alias; v1.0.0 binds no public immutable derived checkpoint identity or hash |
 | `qwen3_5-2b`, `qwen3_5-9b` | Qwen3.5 text FP16 | Supported | Asset aliases for the exact size named by each alias |
 | `qwen3_5-0.8b`, `qwen3_5-4b` | Qwen3.5 text FP16 | Experimental | Asset aliases for the exact numeric-blocked size; alias resolution does not imply release support |
 | `qwen3-vl-2b` | Qwen3-VL 2B Instruct | Supported | Asset alias |
 | `qwen3-vl-4b` | Qwen3-VL 4B Instruct | Supported | Asset alias for the validated image, prefill, decode, and chunk envelope only |
-| `qwen3-vl-8b` | Qwen3-VL 8B Instruct | Limited | Asset alias for the exact dense-FP16 padded profile whose 4/4 numeric/task/Graph legs include dual-full; nearby lengths, video, and quantized paths do not inherit |
+| `qwen3-vl-8b` | Qwen3-VL 8B Instruct | Limited | Exact dense-FP16 padded profile, including dual-full; nearby lengths, video and quantized paths do not inherit |
 | `llama-3.2-1b` | Llama-3.2-1B | Supported | Asset alias |
 | `pi05-libero-finetuned` | Pi0.5 Libero FP16 | Supported | Asset alias |
 | `pi05-libero-finetuned-w8a16-vlm-expert` | Pi0.5 Libero W8A16 | Source-only | Local conversion-output alias; no public immutable derived checkpoint identity or hash is bound |

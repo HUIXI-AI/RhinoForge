@@ -89,9 +89,9 @@ resolved plan。
 | DMA 地址 ownership | BUILD 通过，REPLAY 读写早期 tensor | fixed 仅用于稳定 model storage；caller input/新 output 用 mutable |
 | 多核 broadcast | immediate 多核 operation 只更新一核 | 调用 `set_broadcast_mode(true)`；batch/Graph 已统一处理 |
 | Model invalidation | 新 weight/layout 设置复用旧 plan | 每个影响 layout、weight 或 Graph 的 setter 以 `invalidate_model_state()` 结束 |
-| CPU fallback | E2E 完成但必需组件没在 RPU 跑 | 明确列出 fallback；预期执行契约未验证前不标 Supported |
+| CPU fallback | E2E 完成但必需组件没在 Rhino 跑 | 明确列出 fallback；预期执行契约未验证前不标 Supported |
 | 配置继承 | 一个尺寸/短输入通过就接受相邻配置 | 在 weight load 前 guard 精确配置 tuple 和最大范围 |
-| 进程 ownership | 第二个 live fused model 或搬动已转换模型导致冲突 | 每进程一个 live RPU fused model/policy；另一 placement 重载干净 CPU 实例 |
+| 进程 ownership | 第二个 live fused model 或搬动已转换模型导致冲突 | 每进程一个 live Rhino fused model/policy；另一 placement 重载干净 CPU 实例 |
 
 ## 快速定位顺序
 

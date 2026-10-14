@@ -66,7 +66,7 @@ architecture，只接受 `torch.float16`；量化 checkpoint 自带受检查 met
 - `padding_rows`：`"auto"` 或非负准确行数；
 - `padding_budget`：非负整数，与精确 `padding_rows` 互斥。
 
-Adapter 可以按配置进一步缩窄。Execution setting 是冷配置：RPU 安装后改变它，需要
+Adapter 可以按配置进一步缩窄。Execution setting 是冷配置：Rhino 安装后改变它，需要
 创建新模型。
 
 通用 CausalLM、image-text loader 和 `Pi05Policy.from_pretrained` 只支持 built-in model
@@ -275,6 +275,6 @@ Swizzle 原地改变 parameter storage，必须只运行一次。Fused subsystem
 Debug tensor 可能含模型输入或 activation。把这些视为敏感应用产物，不要附到公开
 issue；API 不暴露 raw Graph register/resource/plan payload。
 
-CPU/RPU boundary flush 默认打开，正常推理不要关闭。Chunk size 属于 per-handle
+CPU/Rhino boundary flush 默认打开，正常推理不要关闭。Chunk size 属于 per-handle
 `rpu_execution`，不是进程全局 `torch.rpu` setter。内部 `torch.ops.rpu.*` 是 adapter
 使用的 host wrapper interface；未在本页或 model example 中记录的函数视为实现细节。

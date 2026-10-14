@@ -11,7 +11,7 @@ payloads.
    dtype, input envelope, TOML, Launch package, combined operator asset, and
    compatibility identifiers. Stop on any mismatch.
    [Release-quality checks](../../docs/model_testing.md#what-a-release-quality-model-check-still-needs)
-2. **Reproduce both references and one RPU result.** Use the exact same-dtype
+2. **Reproduce both references and one Rhino result.** Use the exact same-dtype
    executable for implementation parity and CPU FP32 as the precision anchor.
    Preserve output hashes and top-level numerical/task metrics before adding
    probes. Only if top-level evidence fails, compare the smallest divergent
@@ -35,7 +35,7 @@ payloads.
    DMA address lifetime, Graph signature completeness, model-state
    invalidation, then profile-specific computation.
    [Pitfalls overview](pitfalls-overview.md)
-6. **Localize one boundary at a time.** Compare CPU and RPU at a stable public
+6. **Localize one boundary at a time.** Compare CPU and Rhino at a stable public
    stage, identify the first transition, and split only that stage. A stage that
    receives different inputs may be an amplifier rather than the originating
    defect; use a shared-input A/B before changing product code.
@@ -44,7 +44,7 @@ payloads.
 
 For Pi0.5, RhinoVLA, and other visual-language-action policies, keep the
 preprocessed request and any stochastic starting state identical between the
-reference and RPU paths. Check the visual output, prefix/text state, cache
+reference and Rhino paths. Check the visual output, prefix/text state, cache
 progression, and action path independently before relying on the final action
 chunk. A downstream component can consume the same wrong upstream state on two
 comparison paths, so final-output agreement alone does not localize every

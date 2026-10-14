@@ -5,24 +5,24 @@
 RhinoForge 提供两层手工执行入口：
 
 - `examples/` 下的脚本是最短、最易读的模型入口；
-- `examples/run_model.py` 调用同一批脚本，并从 TOML 应用已记录的运行时环境以及可选的 Torch、RPU 硬件 profile。
+- `examples/run_model.py` 调用同一批脚本，并从 TOML 应用已记录的运行时环境以及可选的 Torch、Rhino 硬件 profile。
 
 这些入口用于板卡冒烟和诊断。一次成功运行只能证明所选本地配置能够执行；它不能替代 CPU/golden 数值对比，也不会扩大[模型支持范围](model_support.zh.md)中的状态。
 
 ## 入口清单
 
 | 模型/配置 | 直接入口 | 统一 runner 目标 | 可用范围 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Qwen3 FP16、Llama-3.2-1B | `examples/causal_lm.py` | `causal_lm` | 有匹配的精确发布权重和配置时可运行 |
 | Qwen3 14B W8A16 | `examples/causal_lm.py` | `causal_lm` | Source-only 本地转换入口；v1.0.0 未绑定公开不可变派生 checkpoint 身份或 hash |
 | Qwen3.5 文本 | `examples/qwen3_5_text.py` | `qwen3_5_text` | 可运行文本入口 |
 | Qwen3.5 Vision 2B/4B | `examples/qwen3_5_vision.py` | `qwen3_5_vision` | Experimental/numeric-blocked 图像入口；受控评估必须精确设置 `QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED=1`，不构成支持声明 |
 | Qwen3-VL 2B/4B | `examples/qwen3_vl.py` | `qwen3_vl` | 可运行图文入口 |
-| Qwen3-VL 8B dense FP16 | `examples/qwen3_vl.py` | `qwen3_vl` | Limited 精确 padded profile 入口；4/4 numeric/task/Graph 已通过，包含 dual-full，base 5/5、long-text 9/9 token 精确一致；相邻长度、视频和量化路径不继承 |
+| Qwen3-VL 8B dense FP16 | `examples/qwen3_vl.py` | `qwen3_vl` | 仅限精确 dense-FP16 padded profile，包含 dual-full；相邻长度、视频和量化路径不继承 |
 | Qwen3-VL 32B W8A16 | `examples/qwen3_vl.py` | `qwen3_vl` | 仅源码诊断入口；显式 graph-blocked opt-in 只用于复现第三个 decode step 起的已知全零 logits |
 | DINOv3 ViT-B | `examples/dinov3.py` | `dinov3` | 可运行视觉入口 |
 | SigLIP | `examples/siglip.py` | `siglip` | 可运行组件入口，使用匹配 Pi0.5 包中的视觉塔 |
-| Pi0.5 Libero FP16 | `examples/pi05.py` | `pi05` | Supported 精确 profile；9/9 numeric/task 与 27/27 execution-plan record 已通过，另有独立 fresh-process Graph 生命周期门通过 |
+| Pi0.5 Libero FP16 | `examples/pi05.py` | `pi05` | 仅限精确 Libero FP16 profile；量化和 reduced-step 配置不继承 |
 | Pi0.5 Libero W8A16 | `examples/pi05.py` | `pi05` | Source-only 本地转换入口；未绑定公开不可变派生 checkpoint 身份或 hash |
 | Pi0.5 Libero W4A16 | `examples/pi05.py` | `pi05` | Source-only 本地转换入口；未绑定公开不可变派生 checkpoint 身份或 hash |
 | Pi0.5 减步数/闭环 | 公开策略 API | 无 | Source-only 且验证 pending；不提供公开冒烟声明，也不继承精确 FP16 或量化路径的结论 |
@@ -46,7 +46,7 @@ RhinoForge 提供两层手工执行入口：
 下表每个 stem 在 [`examples/configs`](../examples/configs) 下都只有一份 `.toml`。同一文件包含直接模型请求、runner 环境、Torch/硬件 profiling，以及目标接受的全部执行阶段。配置内容不会改变其支持状态。
 
 | 系列 | 配置 stem |
-|---|---|
+| --- | --- |
 | Qwen3 | `qwen3_0_6b`、`qwen3_1_7b`、`qwen3_4b`、`qwen3_8b`、`qwen3_14b_w8a16` |
 | Llama | `llama_3_2_1b` |
 | Qwen3.5 文本 | `qwen3_5_0_8b`、`qwen3_5_2b`、`qwen3_5_4b`、`qwen3_5_9b` |
@@ -135,7 +135,7 @@ padding_budget = 64
 统一 runner 验证该表并转交给现有模型入口。可接受的阶段如下：
 
 | 目标 | 接受的 `rpu_execution` 阶段 |
-|---|---|
+| --- | --- |
 | `causal_lm`、`qwen3_5_text`、`qwen3_5_vision` | `prefill` |
 | `gemma4` | `prefill`（仅 `chunk_size`） |
 | `qwen3_vl` | `prefill`、`vision` |
@@ -144,7 +144,7 @@ padding_budget = 64
 | `rhinovla` | 由可信运行时工厂声明，并通过能力握手检查 |
 | `hy_embodied`、`lingbot2`、`g05`、`internvla_navdp` | 无；非空表会被拒绝 |
 
-除 Gemma4 的窄范围外，`prefill` 接受 `chunk_size`、`padding_rows` 和 `padding_budget`；`vision` 与 `action` 接受 `chunk_size`。公开 loader 始终是配置边界的权威检查点，会在安装到 RPU 前拒绝不支持的值。
+除 Gemma4 的窄范围外，`prefill` 接受 `chunk_size`、`padding_rows` 和 `padding_budget`；`vision` 与 `action` 接受 `chunk_size`。公开 loader 始终是配置边界的权威检查点，会在安装到 Rhino 前拒绝不支持的值。
 
 ## Torch profile
 
@@ -156,7 +156,7 @@ padding_budget = 64
 
 ## 调试错误或不稳定运行
 
-应先调试正确性，再采集性能 trace。保留一份不可变运行记录，其中包括权重/配置哈希、TOML、输入张量、执行参数和依赖版本。对随机策略，应只采样一次初始噪声或其他随机状态，再把完全相同的张量克隆给 CPU 与 RPU 路径；连续两次 RNG 调用得到的是不同输入。
+应先调试正确性，再采集性能 trace。保留一份不可变运行记录，其中包括权重/配置哈希、TOML、输入张量、执行参数和依赖版本。对随机策略，应只采样一次初始噪声或其他随机状态，再把完全相同的张量克隆给 CPU 与 Rhino 路径；连续两次 RNG 调用得到的是不同输入。
 
 使用能够区分问题的最小公开检查：
 
@@ -173,3 +173,17 @@ padding_budget = 64
 支持声明必须把所有结果绑定到同一源码提交、Rhino Launch 包、合并算子资产、权重修订版本、输入边界、TOML 和输出哈希。应与 CPU 或批准的 golden 结果对比，覆盖 prefill 与 decode 或完整 policy 调用，warmup 后重复执行，并验证适用的图生命周期。未执行的门禁应记录为待完成，不能从冒烟运行推断。
 
 请使用[模型验证策略](validation_policy.zh.md)中相互独立的硬语义、同 dtype parity、FP32 锚点和代表性任务门禁。单个最差行 cosine 只是诊断证据，不是全仓统一的产品结论。
+
+## 运行边界
+
+本地运行记录包含源码及包版本、Launch 和算子资产、checkpoint 与量化元数据、
+主机及 runtime 版本、输入范围、TOML 参数、预热次数、样本数和 profiler 状态。
+每个新进程运行一个配置，使用相同的固定输入；随机策略复用同一次采样的噪声。
+
+导入、加载、转换、传输和 Graph 准备与稳态调用分别记录。完成声明的预热，确认
+重复签名进入 replay。计时覆盖完整公开调用及必要的输出物化；组件计时单独声明
+输入输出边界。token 按逻辑数量统计，不计 padding；策略调用记录相机数、denoise
+步数和 action horizon。
+
+本地结果同时记录样本数、统计口径和计时边界。基线与候选使用相同条件，profiler
+trace 单独采集。trace 和测量记录保存在仓库及发行资产之外。

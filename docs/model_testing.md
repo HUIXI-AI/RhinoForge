@@ -6,7 +6,7 @@ RhinoForge provides two manual execution layers:
 
 - the scripts in `examples/` are the shortest readable model entry points;
 - `examples/run_model.py` runs one of those same scripts while applying a
-  documented runtime environment and optional Torch and RPU hardware profiles
+  documented runtime environment and optional Torch and Rhino hardware profiles
   from TOML.
 
 These are board smoke and diagnostic entry points. A successful run proves
@@ -17,17 +17,17 @@ numerical comparison or expand the support status in
 ## Entry-point inventory
 
 | Model/profile | Direct entry | Full-runner target | Availability |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Qwen3 FP16, Llama-3.2-1B | `examples/causal_lm.py` | `causal_lm` | Runnable with a matching exact release checkpoint/profile |
 | Qwen3 14B W8A16 | `examples/causal_lm.py` | `causal_lm` | Source-only local-conversion entry; v1.0.0 binds no public immutable derived checkpoint identity or hash |
 | Qwen3.5 text | `examples/qwen3_5_text.py` | `qwen3_5_text` | Runnable text entry |
 | Qwen3.5 Vision 2B/4B | `examples/qwen3_5_vision.py` | `qwen3_5_vision` | Experimental/numeric-blocked image entry; exact `QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED=1` is required for controlled evaluation and is not a support claim |
 | Qwen3-VL 2B/4B | `examples/qwen3_vl.py` | `qwen3_vl` | Runnable image-and-text entry |
-| Qwen3-VL 8B dense FP16 | `examples/qwen3_vl.py` | `qwen3_vl` | Limited exact padded-profile entry; 4/4 numeric/task/Graph legs pass, including dual-full, with base 5/5 and long-text 9/9 tokens exact; nearby lengths, video, and quantized paths do not inherit |
+| Qwen3-VL 8B dense FP16 | `examples/qwen3_vl.py` | `qwen3_vl` | Exact dense-FP16 padded profile, including dual-full; nearby lengths, video and quantized paths do not inherit |
 | Qwen3-VL 32B W8A16 | `examples/qwen3_vl.py` | `qwen3_vl` | Source-only diagnostic entry; the explicit graph-blocked opt-in only reproduces the known all-zero logits from the third decode step |
 | DINOv3 ViT-B | `examples/dinov3.py` | `dinov3` | Runnable vision entry |
 | SigLIP | `examples/siglip.py` | `siglip` | Runnable component entry using the vision tower from a matching Pi0.5 bundle |
-| Pi0.5 Libero FP16 | `examples/pi05.py` | `pi05` | Supported exact profile; 9/9 numeric/task and 27/27 execution-plan records pass, plus an independent fresh-process Graph lifecycle cell |
+| Pi0.5 Libero FP16 | `examples/pi05.py` | `pi05` | Exact Libero FP16 profile only; quantized and reduced-step profiles do not inherit |
 | Pi0.5 Libero W8A16 | `examples/pi05.py` | `pi05` | Source-only local-conversion entry; no public immutable derived checkpoint identity or hash is bound |
 | Pi0.5 Libero W4A16 | `examples/pi05.py` | `pi05` | Source-only local-conversion entry; no public immutable derived checkpoint identity or hash is bound |
 | Pi0.5 reduced-step / closed-loop | Public policy API | None | Source-only and validation pending; no public smoke claim and no inheritance from the exact FP16 or quantized paths |
@@ -56,7 +56,7 @@ execution stage. Configuration contents do not change the profile's support
 status.
 
 | Family | Configuration stems |
-|---|---|
+| --- | --- |
 | Qwen3 | `qwen3_0_6b`, `qwen3_1_7b`, `qwen3_4b`, `qwen3_8b`, `qwen3_14b_w8a16` |
 | Llama | `llama_3_2_1b` |
 | Qwen3.5 text | `qwen3_5_0_8b`, `qwen3_5_2b`, `qwen3_5_4b`, `qwen3_5_9b` |
@@ -193,7 +193,7 @@ The comprehensive runner validates and forwards this table to the existing
 model entry point. The accepted stages are:
 
 | Target | Accepted `rpu_execution` stages |
-|---|---|
+| --- | --- |
 | `causal_lm`, `qwen3_5_text`, `qwen3_5_vision` | `prefill` |
 | `gemma4` | `prefill` (`chunk_size` only) |
 | `qwen3_vl` | `prefill`, `vision` |
@@ -205,7 +205,7 @@ model entry point. The accepted stages are:
 Except for Gemma4's narrower row, `prefill` accepts `chunk_size`,
 `padding_rows`, and `padding_budget`; `vision` and `action` accept
 `chunk_size`. The public loader remains the authoritative profile-envelope
-check and rejects unsupported values before RPU installation.
+check and rejects unsupported values before Rhino installation.
 
 ## Torch profile
 
@@ -228,7 +228,7 @@ Debug correctness before collecting performance traces. Keep one immutable
 run record containing the checkpoint/configuration hashes, TOML, input tensors,
 execution settings, and dependency versions. For a stochastic policy, sample
 the initial noise or other random state once and clone that exact tensor into
-the CPU and RPU paths; two successive RNG calls are different inputs.
+the CPU and Rhino paths; two successive RNG calls are different inputs.
 
 Use the smallest public checks that distinguish the failure:
 
@@ -264,3 +264,23 @@ inferring it from a smoke run. Use the independent hard semantic, same-dtype
 parity, FP32-anchor, and representative task gates in
 [Model validation policy](validation_policy.md); a single worst-row cosine is
 diagnostic evidence, not a repository-wide product verdict.
+
+## Run boundaries
+
+Keep the source/package revision, Launch and operator assets, checkpoint and
+quantization metadata, host/runtime versions, input envelope, TOML settings,
+warmup count, sample count and profiler state with local run records. Use one
+profile per fresh process and identical recorded inputs; stochastic policies
+must reuse the same sampled noise.
+
+Separate import, loading, conversion, transfer and Graph preparation from
+steady-state calls. Complete the declared warmup and verify replay for repeated
+signatures. Measure the complete public call, including required output
+materialization; give component measurements their own input/output boundaries.
+Count logical tokens rather than padded rows, and record camera count, denoise
+steps and action horizon for policy calls.
+
+Keep sample counts, summary statistics and timing boundaries with local results.
+Compare baseline and candidate under matching conditions and collect profiler
+traces separately. Keep traces and measurement records outside the repository
+and release artifacts.

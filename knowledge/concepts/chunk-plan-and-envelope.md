@@ -26,7 +26,7 @@ when the physical plan uses more rows.
 
 1. Reject a model or request outside the exact public profile before loading or
    transforming weights.
-2. Bind `rpu_execution` before RPU installation and the first Graph BUILD. A
+2. Bind `rpu_execution` before Rhino installation and the first Graph BUILD. A
    later change requires a new model or policy.
 3. Evaluate only deterministic candidates. A fused subsystem's
    `declare_buffers` and chunk-validity hooks must not launch work or depend on

@@ -24,7 +24,7 @@ outputs for:
 - the maximum admitted cache length; and
 - two different inputs with the same shapes.
 
-Keep the CPU reference instance separate. RPU weight transformation is in place
+Keep the CPU reference instance separate. Rhino weight transformation is in place
 and cannot be reversed safely.
 
 **Done means:** the same pinned inputs reproduce both reference contracts
@@ -179,7 +179,7 @@ and the existing public contracts pass without a board.
 ## 8. Run the profile gates and promote it
 
 Build from a clean process using the release-matched dependencies and asset,
-then run the exact TOML on an RPU board. The required evidence is:
+then run the exact TOML on an Rhino board. The required evidence is:
 
 - the hard semantic, same-dtype implementation-parity, CPU FP32 anchor, and
   representative task gates frozen under

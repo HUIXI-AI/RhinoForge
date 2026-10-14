@@ -148,9 +148,9 @@ print("RhinoForge Python dependencies: OK")
 PY
 ```
 
-## 5. 验证安装与 RPU
+## 5. 验证安装与 Rhino
 
-先检查 import 和版本路径但不执行 device copy，再执行 RPU 数据复制检查：
+先检查 import 和版本路径但不执行 device copy，再执行 Rhino 数据复制检查：
 
 ```bash
 python examples/verify_install.py --check-config
@@ -158,7 +158,7 @@ python examples/verify_install.py
 ```
 
 两条命令都必须以零状态码结束。如果第二条命令报告设备权限错误，请让板卡管理员授予
-RPU 设备访问权限；不要为此使用 root 重新安装运行时资产。
+Rhino 设备访问权限；不要为此使用 root 重新安装运行时资产。
 
 ## 6. 准备 Qwen3-0.6B
 
@@ -199,7 +199,7 @@ python examples/run_model.py --config qwen3.local.toml
 ```
 
 命令应输出生成结果并以零状态码结束。fused CausalLM 路径中，每个进程只允许一个
-存活的 RPU resident 模型或 policy。
+存活的 Rhino resident 模型或 policy。
 
 ## 常见配置错误
 

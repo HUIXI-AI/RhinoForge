@@ -7,7 +7,7 @@ agreed first.
 
 ## Development setup
 
-Use a preconfigured RPU board environment and install the exact Rhino Launch
+Use a preconfigured Rhino board environment and install the exact Rhino Launch
 1.0.0 development package. If its CMake package is outside the system search
 path, add its prefix to `CMAKE_PREFIX_PATH`, then install from the repository
 root:
@@ -30,15 +30,13 @@ repository.
 - Reuse public operators and the adapter template before adding a fused C++
   subsystem. Follow [`docs/model_porting.md`](docs/model_porting.md).
 - Add the smallest board-free test that protects new validation or planning
-  logic. Model execution changes also require CPU-reference versus RPU evidence
+  logic. Model execution changes also require CPU-reference versus Rhino evidence
   on the affected profile.
 - Update the model, asset, API, runtime-configuration, or quantization document
   whenever a public contract changes.
 
-Do not commit device assembly, ISA or opcode semantics, instruction streams,
-operator-asset format parsers, disassemblers, generator sources, restricted
-binaries or assets, credentials, private paths, private infrastructure details,
-or customer-confidential material. Host-side operator wrappers, SPM planning,
+Keep low-level device implementation details, restricted assets, credentials,
+private infrastructure and customer-confidential material outside this repository. Host-side operator wrappers, SPM planning,
 multi-core scheduling, graph/batch execution, DMA behavior, and launch ABI
 integration are in scope.
 

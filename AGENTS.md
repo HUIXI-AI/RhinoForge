@@ -37,7 +37,7 @@ and [runtime configuration](docs/runtime_config.md) for supported controls.
 - Transform a model's weight layout exactly once. Reload a clean model after a
   partial transformation or failed installation.
 - Respect process ownership: the main fused CausalLM path permits one live
-  RPU-resident model or policy per process.
+  Rhino-resident model or policy per process.
 - Keep `FusedModelBase::declare_buffers` deterministic and free of launch side
   effects. Declare state that must survive Graph replay as persistent.
 - For a repeated Graph signature, prove one BUILD followed by stable REPLAY:

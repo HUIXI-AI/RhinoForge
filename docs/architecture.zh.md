@@ -21,7 +21,7 @@ Hugging Face model 或 policy API
               |
        Rhino Launch 1.0.0
               |
-             RPU
+             Rhino
 ```
 
 合并算子资产由 host launch interface 加载。对 RhinoForge 它是 opaque 的：backend
@@ -37,14 +37,14 @@ kernel 名称。
 Hugging Face architecture，再从 adapter registry 取得实现。Adapter 随后：
 
 1. 在加载或修改权重前拒绝不支持的配置；
-2. 把支持的权重转换为 RPU operation 消费的 layout；
+2. 把支持的权重转换为 Rhino operation 消费的 layout；
 3. 把 tensor 移到 `rpu`；
 4. 创建 native model handle 与 cache；
 5. 安装模型专用 forward；
 6. 管理 Graph signature 和生命周期。
 
 权重转换是不可逆原地操作。不要对同一模型实例转换两次，也不要把转换后实例移回 CPU。
-主要 fused CausalLM 路径还限制每个进程只有一个 live RPU-resident model 或 policy。
+主要 fused CausalLM 路径还限制每个进程只有一个 live Rhino-resident model 或 policy。
 
 Built-in adapter 来自静态 manifest，仅在选中时导入。第三方 adapter 使用同一 registry，
 不能覆盖 built-in architecture。见 [API 参考](api_reference.zh.md)。
@@ -52,8 +52,8 @@ Built-in adapter 来自静态 manifest，仅在选中时导入。第三方 adapt
 ### Operation 与 CPU fallback
 
 Native operation 为 PyTorch `PrivateUse1` dispatch key 注册实现，并在 `torch.ops.rpu`
-注册模型 schema。支持的 tensor operation 会直接 launch RPU operation，或向 active
-Graph 添加 node。没有 RPU 实现的 operation 可以走受控 CPU fallback；所有调用能返回
+注册模型 schema。支持的 tensor operation 会直接 launch Rhino operation，或向 active
+Graph 添加 node。没有 Rhino 实现的 operation 可以走受控 CPU fallback；所有调用能返回
 并不等于模型配置受到支持。
 
 公开 operation 边界是 host wrapper：源码可表达 tensor shape、dtype、address、length、

@@ -13,7 +13,7 @@
 
 </div>
 
-RhinoForge exposes the Rhino Processing Unit (RPU) as `torch.rpu`. It combines
+RhinoForge exposes the Rhino device as `torch.rpu`. It combines
 model adapters, fused model runtimes, graph capture and replay, SPM memory
 management, multi-core execution, offline quantization, and a model-porting
 template in one PyTorch backend.
@@ -24,7 +24,7 @@ fine-tuning.
 
 ## Highlights
 
-- **PyTorch integration:** use the RPU through the standard custom-device path
+- **PyTorch integration:** use the Rhino through the standard custom-device path
   and `torch.rpu` APIs.
 - **Model deployment:** run text, vision-language, vision, and VLA profiles
   through model-specific adapters and TOML examples.
@@ -50,21 +50,21 @@ playbook. See [Model porting](docs/model_porting.md) for the canonical workflow.
 > inherit those claims.
 
 | Model | Public entry | Status | Limits |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Qwen3 0.6B / 1.7B / 4B / 8B | `RPUModelForCausalLM` | Supported | FP16 inference; exact execution envelope is release-specific |
 | Qwen3 0.6B / 1.7B / 4B / 8B W8A16 | `RPUModelForCausalLM` | Source-only | Converter and loader source are included without a runnable release claim |
 | Qwen3 14B W8A16 | `RPUModelForCausalLM` | Source-only | Converter and loader source only; v1.0.0 binds no public immutable derived checkpoint identity or hash |
 | Qwen3 32B | `RPUModelForCausalLM` | Source-only | No runnable profile; preflight rejects unsupported configurations |
 | Llama-3.2-1B | `RPUModelForCausalLM` | Supported | Causal language-model inference |
 | Qwen3.5 text 2B / 9B | `Qwen3_5Adapter` | Supported | Dense FP16, text only; `torch.compile` is not supported |
-| Qwen3.5 text 0.8B / 4B | `Qwen3_5Adapter` | Experimental | The 192-token validation's last-prefill full-vocabulary relative L2 exceeds `0.01`; numeric-blocked and controlled evaluation only |
+| Qwen3.5 text 0.8B / 4B | `Qwen3_5Adapter` | Experimental | Numeric-blocked; controlled evaluation only |
 | Qwen3.5 Vision 2B / 4B | `Qwen3_5Adapter` | Experimental | Official real-image numerical gates fail; image inference is rejected by default and exact `QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED=1` is controlled evaluation only |
 | Qwen3-VL 2B | `RPUModelForConditionalGeneration` | Supported | Image and text; video is outside the release scope |
 | Qwen3-VL 4B | `RPUModelForConditionalGeneration` | Supported | Only the validated single-image, multi-image, prefill, decode, and chunk envelope |
-| Qwen3-VL 8B | `RPUModelForConditionalGeneration` | Limited | Exact dense-FP16 padded profile passes 4/4 numeric/task/Graph legs, including dual-full; base 5/5 and long-text 9/9 tokens are exact; nearby lengths, video, and quantized paths do not inherit |
+| Qwen3-VL 8B | `RPUModelForConditionalGeneration` | Limited | Exact dense-FP16 padded profile, including dual-full; nearby lengths, video and quantized paths do not inherit |
 | Qwen3-VL 32B W8A16 | `RPUModelForConditionalGeneration` | Source-only | Known all-zero-logit hard failure from the third decode step; explicit opt-in remains for controlled diagnostics only |
 | Gemma4-E4B text | `Gemma4Adapter` | Source-only | Runtime dependency and release profile are not yet frozen |
-| Pi0.5 Libero FP16 | `Pi05Policy` | Supported | Exact Libero FP16 profile passes 9/9 numeric/task legs and 27/27 execution-plan records; an independent fresh-process Graph lifecycle cell also passes |
+| Pi0.5 Libero FP16 | `Pi05Policy` | Supported | Exact Libero FP16 profile only; quantized and reduced-step profiles do not inherit |
 | Pi0.5 Libero W8A16 | `Pi05Policy` | Source-only | Converter/runtime source only; v1.0.0 binds no public immutable derived checkpoint identity or hash |
 | Pi0.5 Libero W4A16 | `Pi05Policy` | Source-only | Converter/runtime source only; v1.0.0 binds no public immutable derived checkpoint identity or hash |
 | Pi0.5 reduced-step / closed-loop | `Pi05Policy` | Source-only | Policy source only; validation remains pending and these profiles do not inherit evidence or status from the exact FP16 or quantized paths |
@@ -94,7 +94,7 @@ and the general [Model validation policy](docs/validation_policy.md).
 
 ## Quick start
 
-RhinoForge v1.0.0 is installed from source and requires a preconfigured RPU
+RhinoForge v1.0.0 is installed from source and requires a preconfigured Rhino
 board environment and Python 3.12. The installation path for an authorized
 recipient is:
 
@@ -149,14 +149,13 @@ model entry paths.
 ## Documentation
 
 | Topic | Document |
-|---|---|
+| --- | --- |
 | Install and run | [Getting started](docs/getting_started.md) |
 | Supported and excluded profiles | [Model support](docs/model_support.md) |
 | Restricted Launch and operator assets | [Restricted runtime assets](docs/runtime_assets.md) |
 | Model checkpoints | [Model assets](docs/model_assets.md) |
 | Runtime and TOML parameters | [Runtime configuration](docs/runtime_config.md) |
 | Model execution, testing, and profiling | [Model execution and profiling](docs/model_testing.md) |
-| Reproducible performance measurement | [Performance measurement](docs/performance.md) |
 | Model validation and status gates | [Model validation policy](docs/validation_policy.md) |
 | Runtime design | [Architecture](docs/architecture.md) |
 | Python and C++ APIs | [API reference](docs/api_reference.md) |

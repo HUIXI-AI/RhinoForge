@@ -1,7 +1,7 @@
 # Weight swizzle
 
 RhinoForge transforms supported weights in place into the layout expected by
-RPU operators. The public helpers are `get_linear_partition`, `swizzle_linear`,
+Rhino operators. The public helpers are `get_linear_partition`, `swizzle_linear`,
 and `swizzle_model_inplace`. [Weight-layout API](../../docs/api_reference.md#weight-layout-api-for-adapter-authors)
 
 ## Rules
@@ -13,7 +13,7 @@ and `swizzle_model_inplace`. [Weight-layout API](../../docs/api_reference.md#wei
   do not transform it again or move the transformed instance back to CPU.
   [Architecture](../../docs/architecture.md#python-api-and-adapters)
 - A specialized `Linear` with its own authoritative conversion path belongs in
-  `skip_names`. The companion path, not the generic converter, owns its RPU
+  `skip_names`. The companion path, not the generic converter, owns its Rhino
   layout. [Adapter template](../../python/rpu_backend/adapters/_template/adapter.py)
 - The converter records the chosen partition on each transformed module so
   eager dispatch cannot silently assume a different layout.

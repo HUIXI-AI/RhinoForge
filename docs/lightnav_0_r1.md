@@ -1,4 +1,4 @@
-# LightNav-0 R1 port and benchmark
+# LightNav-0 runtime and cache
 
 [简体中文](lightnav_0_r1.zh.md) | English
 
@@ -39,7 +39,7 @@ counts; one current frame is added, so the actual inputs contain
 13/25/37/49/65 frames. Both scenarios run five times and report medians, while
 every request generates five tokens. Deterministic synthetic 256×448 frames make
 the report a latency and cache comparison rather than a navigation-accuracy test.
-Each tier warms the full-window and current-tubelet RPU Graphs outside the
+Each tier warms the full-window and current-tubelet Rhino Graphs outside the
 measurement and retains one stable KV-cache address. Its Graphs are released
 before the next tier.
 
@@ -57,52 +57,15 @@ preparation, vision, prefill, five-token decode, and end-to-end latency. The
 current SlowFast settings yield about 288/456/568/624/708 pooled visual tokens.
 Runtime admission still enforces the Qwen3-VL 4B P4176 limit.
 
-## Stage analysis and optimization
+## Execution notes
 
-The processor already patchifies only the current miss tubelet, leaving cached
-prepare latency at 21–28 ms. The 64-frame profile showed about 77 ms for the
-current-tubelet ViT and 87 ms for repeated CPU pooling/concatenation. Exact
-segment pooling caching cuts pooling to about 3 ms and keeps cached vision at
-78–82 ms. Prefill remains complete because changing visual tokens and M-RoPE
-positions invalidate a reused KV prefix. Five-token decode remains autoregressive
-and already uses the fused RPU decoder and device argmax.
+The processor patchifies only the current uncached tubelet. Exact segment
+pooling reuses pooled history while an empty cache runs the full-window vision
+path. Prefill remains complete because changed visual tokens and M-RoPE
+positions invalidate the old KV prefix. Five-token decode is autoregressive
+and uses the fused decoder and device argmax.
 
-| History | Before (ms) | After (ms) | Further reduction |
-|---:|---:|---:|---:|
-| 12 | 532.2 | 500.1 | 6.0% |
-| 24 | 616.5 | 572.4 | 7.1% |
-| 36 | 718.7 | 647.3 | 9.9% |
-| 48 | 738.1 | 652.2 | 11.6% |
-| 64 | 762.7 | 668.9 | 12.3% |
-
-## RhinoVLA-derived decode evaluation
-
-LightNav already reuses stable KV addresses, Graph replay, and vision history.
-The added cold opt-in applies RhinoVLA's narrower-work and topology-matched Linear
-principles to reduce the 156,048-row output projection to the upstream action
-allowlist. It cuts five-token decode by about 11% and cached-history end-to-end
-latency by 4.7–6.3%.
-
-Temporal speculation with the previous request as a five-token draft was also
-probed. R1 rejects the required four-token continuation at `position=414` with
-`NO_FEASIBLE`; splitting it into four single-token calls has no benefit. MTP is
-not available because the checkpoint has no multi-token prediction heads or
-weights. The constrained-head result is stored in
-`benchmark_results/lightnav_0_r1_constrained_20261012.json`; its token choices
-can differ from full-vocabulary decoding, so it does not establish task accuracy.
-
-## R1 results (2026-10-12)
-
-Both scenarios exclude Graph construction and report the median of five runs.
-
-| History + current | Input tokens | all miss (ms) | all history hit (ms) | tubelet hit/miss | E2E reduction |
-|---:|---:|---:|---:|---:|---:|
-| 12 + 1 | 414 | 886.8 | 500.1 | 6 / 1 | 43.6% |
-| 24 + 1 | 630 | 1283.4 | 572.4 | 12 / 1 | 55.4% |
-| 36 + 1 | 790 | 1639.9 | 647.3 | 17 / 1 | 60.5% |
-| 48 + 1 | 864 | 1744.6 | 652.2 | 19 / 1 | 62.6% |
-| 64 + 1 | 975 | 1922.8 | 668.9 | 22 / 1 | 65.2% |
-
-Cached-history versus fully recomputed vision features differ by at most
-`0.00048828125`, passing the `1e-3` FP16 tolerance. The complete raw report is
-`benchmark_results/lightnav_0_r1_20261012.json`.
+The constrained head follows the upstream action allowlist. Its narrower token
+domain can change token selection; select it to match the application's decoding
+contract. Temporal speculative decoding is not provided, and this checkpoint
+has no multi-token prediction heads or weights.

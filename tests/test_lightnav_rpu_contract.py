@@ -220,3 +220,79 @@ def test_generate_reuses_and_rewinds_one_rpu_cache(monkeypatch):
     BENCHMARK._generate_five(Model(), Input(), {}, cache)
 
     assert cache.rewinds == [0, 0]
+
+
+def test_generate_verifies_history_draft_and_falls_back(monkeypatch):
+    original_to = torch.Tensor.to
+    monkeypatch.setattr(
+        torch.Tensor, "to",
+        lambda tensor, *args, **kwargs: tensor
+        if args and args[0] == "rpu" else original_to(tensor, *args, **kwargs),
+    )
+    api = types.ModuleType("rpu_backend.api")
+    api.greedy_token_ids = lambda logits: logits[:, -1, :]
+    monkeypatch.setitem(sys.modules, "rpu_backend.api", api)
+
+    class Cache:
+        max_seq_len = 32
+
+        def __init__(self):
+            self.rewinds = []
+
+        def reset_to_position(self, position):
+            self.rewinds.append(position)
+
+    class Graphs:
+        clears = 0
+
+        def clear(self):
+            self.clears += 1
+
+    class Model:
+        def __init__(self, first_output, fallback):
+            self.outputs = [first_output]
+            if fallback:
+                self.outputs.extend([token] for token in draft)
+            self.calls = []
+            self.graphs = Graphs()
+            self.model = types.SimpleNamespace(
+                language_model=types.SimpleNamespace(
+                    _rpu_text_graph_cache=self.graphs,
+                ),
+            )
+
+        def __call__(self, **kwargs):
+            self.calls.append(kwargs)
+            output = self.outputs.pop(0)
+            return types.SimpleNamespace(
+                logits=torch.tensor(output).reshape(1, len(output), 1),
+            )
+
+    draft = [153740, 153743, 151680, 152090, 152327]
+    for first_output, expected_accept, expected_calls in (
+        (draft, True, 1),
+        ([0] * 5, False, 6),
+    ):
+        model = Model(first_output, fallback=not expected_accept)
+        cache = Cache()
+        tokens, _, decode_ms, accepted = BENCHMARK._generate_five(
+            model,
+            torch.tensor([[10, 11, 12]]),
+            {
+                "attention_mask": torch.ones((1, 3), dtype=torch.long),
+                "mm_token_type_ids": torch.zeros((1, 3), dtype=torch.long),
+            },
+            cache,
+            draft,
+        )
+
+        assert tokens == draft and accepted is expected_accept and decode_ms >= 0
+        if expected_accept:
+            assert decode_ms == 0
+        assert cache.rewinds == ([0] if expected_accept else [0, 0])
+        assert model.outputs == [] and len(model.calls) == expected_calls
+        assert model.graphs.clears == (0 if expected_accept else 2)
+        assert model.calls[0]["logits_to_keep"] == 5
+        assert model.calls[0]["input_ids"].tolist() == [[10, 11, 12, *draft[:-1]]]
+        assert model.calls[0]["attention_mask"].tolist() == [[1] * 7]
+        assert model.calls[0]["mm_token_type_ids"].tolist() == [[0] * 7]

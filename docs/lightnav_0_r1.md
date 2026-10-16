@@ -48,6 +48,12 @@ When the application already uses upstream `VLN_EVAL_TRAJ_TOP1`, pass
 padded to 4,480 rows for column-parallel Linear. This opt-in changes the default
 full-vocabulary decoding domain and requires separate navigation-quality evaluation.
 
+For consecutive navigation requests, pass `--history-draft`. The benchmark uses
+the previous five tokens as a draft, appends its first four tokens to the current
+prompt, and verifies all five positions in one prefill. A full match skips serial
+decode; any mismatch falls back to the original five-token greedy path. The first
+request remains serial and no MTP weights are required.
+
 `all_miss_median` uses a new empty vision cache for every request.
 `all_history_hit_median` preloads every selected tubelet that excludes the
 current frame, so only the single tubelet containing the current frame runs the
@@ -57,15 +63,21 @@ preparation, vision, prefill, five-token decode, and end-to-end latency. The
 current SlowFast settings yield about 288/456/568/624/708 pooled visual tokens.
 Runtime admission still enforces the Qwen3-VL 4B P4176 limit.
 
+`draft_attempts` and `draft_accepts` report verification and full five-token
+acceptance counts. With `--history-draft`, `prefill_ms` includes verification and
+an accepted request reports zero `decode_5_ms`; compare `total_ms` for the actual
+end-to-end gain.
+
 ## Execution notes
 
 The processor patchifies only the current uncached tubelet. Exact segment
 pooling reuses pooled history while an empty cache runs the full-window vision
 path. Prefill remains complete because changed visual tokens and M-RoPE
 positions invalidate the old KV prefix. Five-token decode is autoregressive
-and uses the fused decoder and device argmax.
+and uses the fused decoder and device argmax by default. History-draft mode
+instead verifies all five positions in one prefill.
 
 The constrained head follows the upstream action allowlist. Its narrower token
 domain can change token selection; select it to match the application's decoding
-contract. Temporal speculative decoding is not provided, and this checkpoint
-has no multi-token prediction heads or weights.
+contract. History-draft gains depend on acceptance across consecutive requests;
+this checkpoint has no multi-token prediction heads or weights.

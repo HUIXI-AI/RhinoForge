@@ -41,6 +41,11 @@ R1 运行时移除 `--check-config`。12/24/36/48/64 表示过去的历史帧数
 4480 行后使用 column-parallel Linear。该选项改变默认全词表解码范围，必须单独验证
 真实导航质量。
 
+连续导航请求可增加 `--history-draft`。脚本把上一请求的 5 个 token 作为候选，将
+前 4 个候选追加到当前 prompt，一次 prefill 同时复验 5 个位置；全部一致时跳过
+串行 decode，任一不一致时自动回退原有的 5-token 贪心解码。首个请求仍用串行解码
+产生候选，不需要额外的 MTP 权重。
+
 每个历史帧档位先预热完整窗口和仅当前 tubelet 两种 Rhino Graph，建图耗时不计入
 结果；档位内部始终复用同一 KV cache 地址。档位结束后释放 Graph，再进入下一档，
 避免多种 prefill 形状同时占满 Graph arena。
@@ -54,6 +59,10 @@ R1 运行时移除 `--check-config`。12/24/36/48/64 表示过去的历史帧数
 - `prepare_sample_ms/prepare_processor_ms`：样本构建和 processor 耗时；
 - `vision_lookup_ms/vision_vit_ms/vision_pool_ms`：视觉缓存查找、ViT 和 pooling 耗时；
 - `prefill_ms/decode_5_ms/total_ms`：文本预填充、5-token 解码和端到端耗时。
+- `draft_attempts/draft_accepts`：历史候选复验次数和全部 5 token 接受次数。
+
+启用 `--history-draft` 后，`prefill_ms` 包含候选复验；候选接受时
+`decode_5_ms` 为 0。应同时比较 `total_ms`，避免把阶段迁移误认为端到端优化。
 
 当前 SlowFast 配置下，12/24/36/48/64 帧历史加当前帧分别产生约
 288/456/568/624/708 个池化后视觉 token。脚本同时记录实际完整输入 token 数，
@@ -65,8 +74,9 @@ R1 运行时移除 `--check-config`。12/24/36/48/64 表示过去的历史帧数
 
 processor 只处理当前未缓存的 tubelet；精确 segment pooling 复用已池化历史，
 空缓存仍运行完整窗口的视觉路径。视觉 token 和 M-RoPE 位置变化会使旧 KV 前缀
-失效，因此每次执行完整 prefill。五个 token 按自回归顺序生成，使用融合 decoder
-和设备 argmax。
+失效，因此每次执行完整 prefill。默认模式下五个 token 按自回归顺序生成，使用融合
+decoder 和设备 argmax；历史候选模式在一次 prefill 中复验全部 5 个 token。
 
 约束输出头沿用上游 action allowlist，候选范围缩小可能改变 token 选择，应与应用的
-解码约定一致。当前不提供时序投机解码，checkpoint 也不包含多 token 预测头或权重。
+解码约定一致。历史候选的收益取决于连续请求的接受率；checkpoint 不包含多 token
+预测头或权重。

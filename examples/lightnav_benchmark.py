@@ -203,7 +203,10 @@ def _cache_vision(
     }
 
 
-def _generate_five(model, input_ids, prefill: dict[str, Any], cache):
+def _generate_five(
+    model, input_ids, prefill: dict[str, Any], cache,
+    draft_tokens: list[int] | None = None,
+):
     import torch
 
     def next_token(logits):
@@ -217,6 +220,46 @@ def _generate_five(model, input_ids, prefill: dict[str, Any], cache):
 
     if input_ids.shape[1] + OUTPUT_TOKENS > cache.max_seq_len:
         raise RuntimeError("LightNav prompt outgrew the stable RPU KV cache")
+    if draft_tokens is not None:
+        if len(draft_tokens) != OUTPUT_TOKENS:
+            raise ValueError("LightNav history draft must contain five tokens")
+        draft_prefix = torch.tensor(
+            draft_tokens[:-1], dtype=input_ids.dtype, device=input_ids.device,
+        ).unsqueeze(0)
+        verify_ids = torch.cat((input_ids, draft_prefix), dim=1)
+        verify_prefill = dict(prefill)
+        for key, value in (
+            ("attention_mask", 1), ("mm_token_type_ids", 0),
+        ):
+            current = verify_prefill[key]
+            suffix = current.new_full((current.shape[0], OUTPUT_TOKENS - 1), value)
+            verify_prefill[key] = torch.cat((current, suffix), dim=1)
+        cache.reset_to_position(0)
+        verify_started = time.perf_counter()
+        with torch.no_grad():
+            output = model(
+                input_ids=verify_ids.to("rpu"),
+                past_key_values=cache,
+                logits_to_keep=OUTPUT_TOKENS,
+                use_cache=True,
+                return_dict=True,
+                **verify_prefill,
+            )
+            predicted = [
+                int(next_token(output.logits[:, index : index + 1]).item())
+                for index in range(output.logits.shape[1])
+            ]
+        verify_ms = (time.perf_counter() - verify_started) * 1000
+        if predicted == draft_tokens:
+            return predicted, verify_ms, 0.0, True
+        text_graphs = model.model.language_model._rpu_text_graph_cache
+        text_graphs.clear()
+        generated, prefill_ms, decode_ms, _ = _generate_five(
+            model, input_ids, prefill, cache,
+        )
+        text_graphs.clear()
+        return generated, verify_ms + prefill_ms, decode_ms, False
+
     cache.reset_to_position(0)
     generated = []
     prefill_started = time.perf_counter()
@@ -243,7 +286,7 @@ def _generate_five(model, input_ids, prefill: dict[str, Any], cache):
                     return_dict=True,
                 )
         decode_ms = (time.perf_counter() - decode_started) * 1000
-    return generated, prefill_ms, decode_ms
+    return generated, prefill_ms, decode_ms, None
 
 
 def _run_request(
@@ -258,6 +301,7 @@ def _run_request(
     instruction: str,
     lm_cache,
     capture_vision: bool = False,
+    draft_tokens: list[int] | None = None,
 ):
     from lightnav.inference.samples import build_tracking_sample
 
@@ -290,7 +334,7 @@ def _run_request(
             f"LightNav prompt has {input_ids.shape[1]} tokens; "
             f"RPU Qwen3-VL 4B admits at most {MAX_PREFILL_TOKENS}"
         )
-    tokens, prefill_ms, decode_ms = _generate_five(
+    tokens, prefill_ms, decode_ms, draft_accepted = _generate_five(
         model,
         input_ids,
         {
@@ -300,6 +344,7 @@ def _run_request(
             "rpu_precomputed_vision": precomputed,
         },
         lm_cache,
+        draft_tokens,
     )
     result = {
         "offset": offset,
@@ -315,6 +360,7 @@ def _run_request(
         **vision_parts,
         "prefill_ms": prefill_ms,
         "decode_5_ms": decode_ms,
+        "draft_accepted": draft_accepted,
         "total_ms": (time.perf_counter() - started) * 1000,
     }
     if capture_vision:
@@ -366,6 +412,12 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         if len(values) != 1:
             raise RuntimeError(f"measured requests changed {key}: {sorted(values)}")
         summary[key] = values.pop()
+    summary["draft_attempts"] = sum(
+        row["draft_accepted"] is not None for row in rows
+    )
+    summary["draft_accepts"] = sum(
+        row["draft_accepted"] is True for row in rows
+    )
     return summary
 
 
@@ -389,6 +441,11 @@ def main() -> int:
         "--constrained-head",
         action="store_true",
         help="project only the checkpoint action-token allowlist",
+    )
+    parser.add_argument(
+        "--history-draft",
+        action="store_true",
+        help="verify the previous request's five tokens in one prefill",
     )
     args = parser.parse_args()
     if args.repeats < 1:
@@ -468,6 +525,9 @@ def main() -> int:
             ),
             "lm_head_candidates": candidate_count,
             "task_accuracy_evaluated": False,
+            "decode_mode": (
+                "verified_history_draft" if args.history_draft else "serial"
+            ),
             "history": [],
         }
         for history_frames in args.history_frames:
@@ -476,19 +536,33 @@ def main() -> int:
                 max_seq_len=MAX_PREFILL_TOKENS + OUTPUT_TOKENS,
             )
             # Warm the full-window RPU graphs without retaining visual features.
-            _run_request(
+            warm = _run_request(
                 model, processor, data_processor, bundle,
                 VitTubeletCache(max_entries=256, store_device="cpu"), frames,
                 history_frames, 0, args.instruction, lm_cache,
             )
+            draft = warm["token_ids"] if args.history_draft else None
+            if draft is not None:
+                model.model.language_model._rpu_text_graph_cache.clear()
+                warm = _run_request(
+                    model, processor, data_processor, bundle,
+                    VitTubeletCache(max_entries=256, store_device="cpu"), frames,
+                    history_frames, 0, args.instruction, lm_cache,
+                    draft_tokens=draft,
+                )
+                draft = warm["token_ids"]
             all_miss = []
             for _ in range(args.repeats):
-                all_miss.append(_run_request(
+                row = _run_request(
                     model, processor, data_processor, bundle,
                     VitTubeletCache(max_entries=256, store_device="cpu"), frames,
                     history_frames, 0, args.instruction, lm_cache,
                     capture_vision=not all_miss,
-                ))
+                    draft_tokens=draft,
+                )
+                all_miss.append(row)
+                if args.history_draft:
+                    draft = row["token_ids"]
             all_miss_vision = all_miss[0].pop("_vision")
             if any(row["cache_hits"] != 0 for row in all_miss):
                 raise RuntimeError(f"history={history_frames}: all-miss cache hit")
@@ -498,21 +572,30 @@ def main() -> int:
                 current_frame_id=history_frames,
             )
             # Populate history entries, then warm the one-current-tubelet graph.
-            _run_request(
+            warm = _run_request(
                 model, processor, data_processor, bundle, history_cache, frames,
                 history_frames, 0, args.instruction, lm_cache,
+                draft_tokens=draft if args.history_draft else None,
             )
-            _run_request(
+            draft = warm["token_ids"] if args.history_draft else None
+            warm = _run_request(
                 model, processor, data_processor, bundle, history_cache, frames,
                 history_frames, 0, args.instruction, lm_cache,
+                draft_tokens=draft,
             )
+            if args.history_draft:
+                draft = warm["token_ids"]
             all_history_hit = []
             for _ in range(args.repeats):
-                all_history_hit.append(_run_request(
+                row = _run_request(
                     model, processor, data_processor, bundle, history_cache, frames,
                     history_frames, 0, args.instruction, lm_cache,
                     capture_vision=not all_history_hit,
-                ))
+                    draft_tokens=draft,
+                )
+                all_history_hit.append(row)
+                if args.history_draft:
+                    draft = row["token_ids"]
             history_hit_vision = all_history_hit[0].pop("_vision")
             if any(row["cache_misses"] != 1 for row in all_history_hit):
                 raise RuntimeError(

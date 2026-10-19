@@ -35,13 +35,24 @@ def check(root: Path, *, branch: str = "", tag: str = "") -> dict:
                            "4 - Beta" if stage.startswith("rc") else "5 - Production/Stable")
     if "Development Status :: " + expected_classifier not in project["project"]["classifiers"]:
         raise ValueError("Python development-status classifier must match the release stage")
-    launch = json.loads((root / "release/runtime-dependencies.json").read_text())["launch_kernel"]
-    launch_match = (VERSION_PATTERN.fullmatch(launch["release_version"])
-                    if isinstance(launch["release_version"], str) else None)
-    if launch_match is None:
-        raise ValueError("Launch release version must be a canonical release, rc or dev version")
-    if launch["version"] != launch_match["base"] or launch["cmake_version"] != launch_match["base"]:
-        raise ValueError("Launch version and CMake version must match its release version's numeric version")
+    dependencies = json.loads((root / "release/runtime-dependencies.json").read_text())
+    runtime_version = dependencies["runtime_bundle"]["version"]
+    if VERSION_PATTERN.fullmatch(runtime_version) is None:
+        raise ValueError("Runtime bundle must have a canonical version")
+    launch = dependencies["launch_kernel"]
+    cmake_version = launch["cmake_version"]
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", cmake_version) or launch["version"] != cmake_version:
+        raise ValueError("Launch version fields disagree")
+    release_version = launch["release_version"]
+    if release_version is not None:
+        release_match = VERSION_PATTERN.fullmatch(release_version)
+        if release_match is None or release_match["base"] != cmake_version:
+            raise ValueError("Launch release and CMake versions disagree")
+    files = launch["files"]
+    if not files or not all(
+            re.fullmatch(r"(?:include|lib)/[A-Za-z0-9_./-]+", name) and ".." not in Path(name).parts
+            and re.fullmatch(r"[0-9a-f]{64}", digest) for name, digest in files.items()):
+        raise ValueError("Launch package requires relative file paths and SHA256 identities")
     if not isinstance(launch["abi_version"], int) or launch["abi_version"] < 1:
         raise ValueError("Launch ABI version must be a positive integer")
     if not re.fullmatch(r"[0-9a-f]{40}", launch["commit"]):
@@ -54,8 +65,7 @@ def check(root: Path, *, branch: str = "", tag: str = "") -> dict:
     if tag and (tag != "v" + version or stage.startswith(".dev")):
         raise ValueError("release tag must match VERSION and cannot identify a dev build")
     return {"version": version, "cmake_version": base, "stage": stage or "stable",
-            "launch_release_version": launch["release_version"], "launch_cmake_version": launch["cmake_version"],
-            "launch_commit": launch["commit"], "launch_abi": launch["abi_version"]}
+            "runtime_bundle_version": runtime_version, "launch_commit": launch["commit"], "launch_abi": launch["abi_version"]}
 
 
 def main() -> None:

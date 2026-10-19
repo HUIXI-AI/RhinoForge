@@ -1,11 +1,29 @@
 {
   "schema_version": 1,
+  "runtime_bundle": {
+    "version": "1.2.0"
+  },
   "launch_kernel": {
-    "commit": "3dd1b410f5f46373997fef3dfbf9b67eecec6a84",
-    "version": "1.2.0",
-    "release_version": "1.2.0",
-    "cmake_version": "1.2.0",
-    "abi_version": 1
+    "commit": "bdc0dae56a6176c2fed6ae94f7c8c38a42bc7f06",
+    "version": "1.0.0",
+    "release_version": null,
+    "cmake_version": "1.0.0",
+    "abi_version": 1,
+    "files": {
+      "include/rhino_launch_batch_snapshot.h": "59d698e6f363e2e50c0defc3e761414ce39236c8394e8f3e1b359e7223bc5e24",
+      "include/rhino_launch_buffer.h": "2b439f0b40be5bede15781045318b7d5aa4441dba477f2c7ed2f95652cf26406",
+      "include/rhino_launch_def.h": "0809bb36d5dc6b0fb11df07a0ae4a251f267fd33312a2d899e636d431bfc6d08",
+      "include/rhino_launch_features.h": "de1549217b945d6c941a08042ab751de0270295489917944f8264b02b53d1480",
+      "include/rhino_launch_kernel.h": "fe17d8e11fa223070dd43c5414ae2923512ae7b65cbce55fe512653883f2b26f",
+      "include/rhino_launch_program.h": "b74adbaea4358fd10191514d94327830bf17cb09b7dd3b313ed6bb219ea1b9b5",
+      "include/rhino_launch_queue.h": "9778e5bba3d627af4ba5c00e5e2dcb6085e1857cc44d1cde8fa02cde48f5fb64",
+      "include/version.h": "e59fe7c8d627205ebc37b0b170e680ae485b5b430e7f1a71d6cac43d47dc7f1d",
+      "lib/cmake/rhino_launch/rhino_launchConfig.cmake": "a232eda87bb7541924f74c40c78f9274a9b110041d2f5a76ba439a0a36bc2252",
+      "lib/cmake/rhino_launch/rhino_launchConfigVersion.cmake": "d24e24c7c2c71ab63d530ea0019c625fa8b7c19fb11bd10224a4f195fb668e34",
+      "lib/cmake/rhino_launch/rhino_launchTargets-release.cmake": "d2c553233010be1569abdce724e5ad5789019cb972b155bfc92210c4bd8c96f2",
+      "lib/cmake/rhino_launch/rhino_launchTargets.cmake": "beb04152afe5fcb8413a4e54cae8db914ece994a90969b9451063909e4e13b09",
+      "lib/librhino_launch.so.1.0.0": "93977d2bf5843552502ef236d6fab71a7a24718fae4a1780e88120eb19b5a630"
+    }
   },
   "artifacts": {
     "rhino_ops_main": {

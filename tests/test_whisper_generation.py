@@ -38,7 +38,6 @@ def test_log_mel_is_fixed_finite_and_resamples():
 class _Encoder:
     def __init__(self):
         self.closed = False
-        self.released = 0
 
     def encode(self, mel):
         assert mel.shape == (1, 80, 3000)
@@ -47,19 +46,11 @@ class _Encoder:
     def close(self):
         self.closed = True
 
-    def release_graph(self):
-        self.released += 1
-
-
 class _Decoder:
     def __init__(self, *, eos=True):
         self.calls = []
         self.eos = eos
         self.closed = False
-        self.released = 0
-
-    def release_graphs(self):
-        self.released += 1
 
     def prepare_audio(self, hidden):
         assert hidden.shape == (1, 1500, 512)
@@ -105,7 +96,6 @@ def test_generation_restricts_language_and_stops_on_eos(monkeypatch):
     assert result.text == "hello"
     assert result.finish_reason == "eos"
     assert decoder.calls == [50258, 50259, 50359, 50363, 10]
-    assert model._encoder.released == 1 and decoder.released == 1
 
 
 def test_generation_reports_length_and_close_owns_both_runtimes(monkeypatch):

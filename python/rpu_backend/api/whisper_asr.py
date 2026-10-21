@@ -247,13 +247,9 @@ class WhisperASRModel:
             if self._closed:
                 raise RuntimeError("Whisper model is closed")
             with torch.inference_mode():
-                self._decoder.release_graphs()
-                try:
-                    hidden = self._encoder.encode(
-                        _log_mel_spectrogram(waveform, operator.index(sample_rate))
-                    )
-                finally:
-                    self._encoder.release_graph()
+                hidden = self._encoder.encode(
+                    _log_mel_spectrogram(waveform, operator.index(sample_rate))
+                )
                 self._decoder.prepare_audio(hidden)
                 return self._generate(operator.index(max_new_tokens))
         finally:

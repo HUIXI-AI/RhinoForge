@@ -269,11 +269,6 @@ class WhisperEncoderRuntime:
             self._graph.freeze()
         return output.clone()
 
-    def release_graph(self) -> None:
-        if self._closed:
-            raise RuntimeError("Whisper encoder is closed")
-        self._graph.begin_warmup().clear()
-
     def close(self) -> None:
         if self._closed:
             return
@@ -315,7 +310,7 @@ class WhisperDecoderRuntime:
         self_cache = _make_decoder_cache(_TEXT_TOKENS)
         cross_cache = _make_decoder_cache(1536)
         cross_staging, ids, hidden, outputs = _make_decoder_staging()
-        graphs = tuple(rpu_backend.graph.GraphCache(max_entries=1) for _ in range(3))
+        graphs = tuple(rpu_backend.graph.GraphCache(max_entries=1) for _ in range(2))
         try:
             handle = torch.ops.rpu.whisper_decoder_create()
         except BaseException:
@@ -345,7 +340,7 @@ class WhisperDecoderRuntime:
         self._ids = ids
         self._hidden = hidden
         self._outputs = outputs
-        self._cross_graph, self._prefill_graph, self._decode_graph = graphs
+        self._prefill_graph, self._decode_graph = graphs
         self._position = 0
         self._prepared = False
         self._closed = False
@@ -364,21 +359,14 @@ class WhisperDecoderRuntime:
         self._cross_cache.reset()
         self._cross_staging.copy_(encoder_hidden)
         torch.ops.rpu.whisper_decoder_reset(self._handle, 0)
-        signature = rpu_backend.graph.GraphSignature(
-            op_id="whisper_decoder_cross", shapes=[1, _ENCODER_TOKENS, _HIDDEN],
-            dyn_dims=[_LAYERS], dtypes=[torch.float16],
-        )
         try:
-            with self._cross_graph.capture(signature):
-                torch.ops.rpu.whisper_decoder_prepare_cross(
-                    self._handle, self._cross_staging,
-                    list(self._cross_cache.k_caches),
-                    list(self._cross_cache.v_caches),
-                )
+            torch.ops.rpu.whisper_decoder_prepare_cross(
+                self._handle, self._cross_staging,
+                list(self._cross_cache.k_caches),
+                list(self._cross_cache.v_caches),
+            )
         finally:
             torch.ops.rpu.spm_alloc_reset_temporary()
-        if not self._cross_graph.is_frozen():
-            self._cross_graph.freeze()
         self._position = 0
         self._prepared = True
 
@@ -447,12 +435,6 @@ class WhisperDecoderRuntime:
         self._self_cache.update_position(1)
         return output.cpu()[:, :_VOCAB].clone()
 
-    def release_graphs(self) -> None:
-        if self._closed:
-            raise RuntimeError("Whisper decoder is closed")
-        for graph in (self._cross_graph, self._prefill_graph, self._decode_graph):
-            graph.begin_warmup().clear()
-
     def close(self) -> None:
         if self._closed:
             return
@@ -461,4 +443,4 @@ class WhisperDecoderRuntime:
         self._resource = None
         self._token_embedding = self._self_cache = self._cross_cache = None
         self._cross_staging = self._ids = self._hidden = self._outputs = None
-        self._cross_graph = self._prefill_graph = self._decode_graph = None
+        self._prefill_graph = self._decode_graph = None

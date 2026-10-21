@@ -301,7 +301,7 @@ def test_decoder_install_and_idempotent_close(monkeypatch):
     assert sum(call[0] == "cross" for call in calls) == 1
     assert sum(call[0] == "io" for call in calls) == 1
     assert sum(call[0] == "destroy" for call in calls) == 1
-    assert sum(call[0] == "clear" for call in calls) == 3
+    assert sum(call[0] == "clear" for call in calls) == 2
 
 
 def test_decoder_partial_install_failure_cleans_graphs_and_handle(monkeypatch):
@@ -311,4 +311,4 @@ def test_decoder_partial_install_failure_cleans_graphs_and_handle(monkeypatch):
         runtime.WhisperDecoderRuntime("encoder.onnx", "decoder.onnx")
 
     assert sum(call[0] == "destroy" for call in calls) == 1
-    assert sum(call[0] == "clear" for call in calls) == 3
+    assert sum(call[0] == "clear" for call in calls) == 2

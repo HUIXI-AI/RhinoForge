@@ -39,7 +39,6 @@
     "language_pairs_sha256": "da890f14c0e20a3fb18ca7c2aa5fc698f0b566d25304788c3f749e83fe5ba058"
   },
   "reference_probe": {
-    "location": "/mnt/ssd_data/whisper_rhinoforge_probe_20261019",
     "prefill_ref_sha256": "b071229dba523a2e967cd049b3ebb810ca80432807d83f76ac4bd319a4da4b65",
     "decode_ref_sha256": "1900442286600248e0004cc49ad02f2e36c0cc8779f34d7b3ac70cbfb5429755",
     "minimum_hidden_cosine": 0.9999996595305185,

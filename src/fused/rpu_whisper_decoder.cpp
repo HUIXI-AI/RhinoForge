@@ -328,8 +328,11 @@ private:
         uint32_t current = residual_a;
         uint32_t alternate = residual_b;
         if (logits) {
-            rpu_launch_ddr_broadcast_spm_dma(
-                position_, position * WHISPER_DECODER_HIDDEN, full,
+            position_src_base_ = ::rhino_lkn::RpuGetDevAddr(
+                position_.data_ptr<c10::Half>()) +
+                position * WHISPER_DECODER_HIDDEN * sizeof(c10::Half);
+            rpu_launch_ddr_broadcast_spm_dma_mutable(
+                &position_src_base_, 0, full,
                 address(normalized), WHISPER_DECODER_CORES);
             rpu_launch_eltwise_binary_spm_kernel(
                 address(current), address(normalized), address(current), full,
@@ -534,6 +537,7 @@ private:
     std::vector<Layer> layers_;
     std::vector<CrossLayer> cross_layers_;
     at::Tensor position_, final_w_, final_b_, lm_head_;
+    uint64_t position_src_base_ = 0;
     int64_t expected_position_ = 0;
     bool cross_ready_ = false;
     const void* prefill_input_ptr_ = nullptr;

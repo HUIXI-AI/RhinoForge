@@ -1,0 +1,15 @@
+[whisper_asr]
+checkpoint = "/path/to/sherpa-onnx-whisper-base"
+
+[input]
+audio = "/path/to/mono.wav"
+max_new_tokens = 448
+
+[cpu]
+threads = 4
+
+[run]
+warmup = 2
+runs = 10
+seed = 0
+output_dir = "/tmp/whisper-asr-result"

@@ -247,8 +247,10 @@ def render_config_index(configs: dict[Path, dict]) -> str:
                       "| 配置 | 入口 / 用途 | 精度 / 输入默认 | CPU 请求 | 登记支持 |",
                       "|---|---|---|---|---|"]
         metadata = COMMON.example_metadata(config)
-        custom = next((key for key in ("g05", "pi05", "hy_vla", "wall_oss", "wall_oss_sorting", "lingbot2", "qwen3_asr", "qwen3_tts")
-                       if key in config), None)
+        custom = next((key for key in (
+            "g05", "pi05", "hy_vla", "wall_oss", "wall_oss_sorting", "lingbot2",
+            "qwen3_asr", "qwen3_tts", "whisper_asr",
+        ) if key in config), None)
         fragment = "env" in config
         target = custom or (metadata or {}).get("target")
         if metadata is not None:

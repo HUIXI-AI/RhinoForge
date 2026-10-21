@@ -16,7 +16,7 @@
 - 输入统一重采样到 16 kHz；
 - Whisper encoder 音频上下文为 1500；
 - decoder 为 6 层，hidden size 512、8 个 attention head、head dim 64、FFN 2048；
-- 最多生成 448 token；
+- 448 个文本上下文位置，其中 4 个 prompt，最多生成 444 个内容 token；
 - 使用 FP16 RPU 计算；
 - 不支持流式识别、时间戳、beam search 和批量推理。
 
@@ -51,7 +51,7 @@ result = model.transcribe(audio, sample_rate=sample_rate)
 - `token_ids`：完整生成 token；
 - `finish_reason`：`eos` 或 `length`。
 
-达到 448 token 时返回已经生成的文本并标记 `length`，不静默丢弃结果。
+达到 448 个文本位置时返回已经生成的文本并标记 `length`，不静默丢弃结果。
 
 ## 4. 数据流
 
@@ -133,7 +133,7 @@ Graph 签名包含模型 profile、精度、阶段、batch、几何和 cache 容
 - 同一 Graph 签名一次 BUILD 后稳定 REPLAY，cache size 不增长且 `cache_invariant_ok()` 保持为真；
 - 相同 shape、不同音频和 token 的输入必须刷新，不能复用旧值；
 - 多次转写返回的 Python 可见输出不得共享可变存储；
-- 覆盖短音频、30 秒音频、正常 EOS 和达到 448-token 上限。
+- 覆盖短音频、30 秒音频、正常 EOS 和达到 448-position 上限。
 
 ### 7.3 性能记录
 

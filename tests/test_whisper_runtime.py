@@ -115,6 +115,13 @@ class _Graph:
     def cache_invariant_ok(self):
         return True
 
+    def size(self):
+        return int(self.frozen)
+
+    def snapshot(self):
+        return [SimpleNamespace(replay_count=max(0, sum(
+            call[0] == "capture" for call in self.calls) - 1))] if self.frozen else []
+
 
 class _Cache:
     max_seq_len = 1536
@@ -222,6 +229,11 @@ def test_encoder_build_replay_output_ownership_and_idempotent_close(monkeypatch)
     assert sum(call[0] == "create" for call in calls) == 1
     assert sum(call[0] == "freeze" for call in calls) == 1
     assert sum(call[0] == "capture" for call in calls) == 2
+    stats = encoder.execution_stats()
+    assert stats["build_ms"] >= 0
+    assert len(stats["replay_ms"]) == 1 and stats["replay_ms"][0] >= 0
+    encoder.encode(mel)
+    assert len(encoder.execution_stats()["replay_ms"]) == 1
     encoder.close()
     encoder.close()
     assert sum(call[0] == "destroy" for call in calls) == 1

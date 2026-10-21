@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import operator
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -137,7 +138,7 @@ def _resample(samples: torch.Tensor, sample_rate: int) -> torch.Tensor:
     if sample_rate == 16000:
         return samples
     ratio = 16000 / sample_rate
-    output = torch.empty(round(samples.numel() * ratio), dtype=torch.float32)
+    output = torch.empty(max(1, round(samples.numel() * ratio)), dtype=torch.float32)
     offsets = torch.arange(-31, 33)
     cutoff = min(1.0, ratio)
     for start in range(0, output.numel(), 32768):
@@ -159,6 +160,7 @@ def _resample(samples: torch.Tensor, sample_rate: int) -> torch.Tensor:
 def _log_mel_spectrogram(waveform: np.ndarray, sample_rate: int) -> torch.Tensor:
     samples = torch.from_numpy(waveform).float()
     samples = _resample(samples, sample_rate)
+    samples = F.pad(samples, (0, max(0, 160 - samples.numel())))
     window = torch.hann_window(400)
     spectrum = torch.stft(
         samples,
@@ -235,27 +237,48 @@ class WhisperASRModel:
         self._encoder = encoder
         self._decoder = decoder
         self._tokens = tokens
+        self._last_timing = None
         self._closed = encoder is None or decoder is None or tokens is None
 
     @classmethod
     def from_pretrained(cls, checkpoint, *, dtype=torch.float16) -> "WhisperASRModel":
+        from .causal_lm import _claim_live_instance, _release_live_instance
+
         if dtype is not torch.float16:
             raise RPUUnsupportedDtypeError("Whisper base supports only torch.float16")
         paths = validate_checkpoint(checkpoint)
         _require_native_backend()
-        encoder = WhisperEncoderRuntime(paths["base-encoder.onnx"])
+        model = cls()
+        _claim_live_instance(model)
+        encoder = None
         decoder = None
         try:
+            torch.rpu.set_caching_allocator(True)
+            encoder = WhisperEncoderRuntime(paths["base-encoder.onnx"])
             decoder = WhisperDecoderRuntime(
                 paths["base-encoder.onnx"], paths["base-decoder.onnx"]
             )
             tokens = _TokenTable.load(paths["base-tokens.txt"])
-        except BaseException:
-            if decoder is not None:
-                decoder.close()
-            encoder.close()
+        except BaseException as error:
+            for name, runtime in (("decoder", decoder), ("encoder", encoder)):
+                if runtime is None:
+                    continue
+                try:
+                    runtime.close()
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        f"Whisper {name} cleanup failed: {cleanup_error!r}"
+                    )
+            try:
+                _release_live_instance(model)
+            except BaseException as cleanup_error:
+                error.add_note(
+                    f"Whisper ownership cleanup failed: {cleanup_error!r}"
+                )
             raise
-        return cls(encoder, decoder, tokens)
+        model._encoder, model._decoder, model._tokens = encoder, decoder, tokens
+        model._closed = False
+        return model
 
     def transcribe(self, audio, *, sample_rate=16000, max_new_tokens=448) -> WhisperTranscription:
         """Validate one waveform before any RPU access."""
@@ -266,25 +289,41 @@ class WhisperASRModel:
             if self._closed:
                 raise RuntimeError("Whisper model is closed")
             with torch.inference_mode():
+                total_start = time.perf_counter()
+                started = total_start
+                mel = _log_mel_spectrogram(waveform, operator.index(sample_rate))
+                timing = {"preprocess_ms": (time.perf_counter() - started) * 1000}
+                started = time.perf_counter()
                 hidden = self._encoder.encode(
-                    _log_mel_spectrogram(waveform, operator.index(sample_rate))
+                    mel
                 )
+                timing["encoder_ms"] = (time.perf_counter() - started) * 1000
+                started = time.perf_counter()
                 self._decoder.prepare_audio(hidden)
-                return self._generate(operator.index(max_new_tokens))
+                timing["cross_ms"] = (time.perf_counter() - started) * 1000
+                result = self._generate(operator.index(max_new_tokens), timing)
+                timing["total_ms"] = (time.perf_counter() - total_start) * 1000
+                self._last_timing = timing
+                return result
         finally:
             self._lock.release()
 
-    def _generate(self, max_new_tokens: int) -> WhisperTranscription:
+    def _generate(self, max_new_tokens: int, timing: dict) -> WhisperTranscription:
+        started = time.perf_counter()
         language_logits = self._decoder.prefill(_SOT)[0, _SOT + 1:_TRANSLATE]
         if not torch.isfinite(language_logits).all():
             raise RuntimeError("Whisper language logits are not finite")
         language_index = int(torch.argmax(language_logits))
         language_token = _SOT + 1 + language_index
+        timing["language_ms"] = (time.perf_counter() - started) * 1000
+        started = time.perf_counter()
         self._decoder.decode(language_token)
         self._decoder.decode(_TRANSCRIBE)
         logits = self._decoder.decode(_NO_TIMESTAMPS)
+        timing["prompt_ms"] = (time.perf_counter() - started) * 1000
 
         generated = []
+        decode_steps = []
         finish_reason = "length"
         for step in range(min(max_new_tokens, 448 - 4)):
             scores = logits[0].clone()
@@ -299,7 +338,11 @@ class WhisperASRModel:
                 break
             generated.append(token_id)
             if step + 1 < min(max_new_tokens, 448 - 4):
+                started = time.perf_counter()
                 logits = self._decoder.decode(token_id)
+                decode_steps.append((time.perf_counter() - started) * 1000)
+        timing["decode_step_ms"] = tuple(decode_steps)
+        timing["decode_ms"] = sum(decode_steps)
         return WhisperTranscription(
             self._tokens.decode(generated).strip(),
             _LANGUAGE_CODES[language_index],
@@ -308,6 +351,8 @@ class WhisperASRModel:
         )
 
     def close(self) -> None:
+        from .causal_lm import _release_live_instance
+
         if not self._lock.acquire(blocking=False):
             raise RuntimeError("Whisper requests and close must be serial")
         try:
@@ -318,6 +363,26 @@ class WhisperASRModel:
             finally:
                 self._encoder.close()
             self._closed = True
+            _release_live_instance(self)
+        finally:
+            self._lock.release()
+
+    def execution_stats(self) -> dict:
+        if not self._lock.acquire(blocking=False):
+            raise RuntimeError("Whisper requests, statistics and close must be serial")
+        try:
+            if self._closed:
+                raise RuntimeError("Whisper model is closed")
+            encoder = self._encoder.execution_stats()
+            decoder = self._decoder.execution_stats()
+            return {
+                "encoder": encoder,
+                **decoder,
+                "timing": dict(self._last_timing or {}),
+                "graph_invariant_ok": encoder["invariant_ok"] and all(
+                    stage["invariant_ok"] for stage in decoder.values()
+                ),
+            }
         finally:
             self._lock.release()
 
@@ -328,3 +393,9 @@ class WhisperASRModel:
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass

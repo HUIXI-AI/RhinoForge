@@ -4,6 +4,7 @@ from pathlib import Path
 import subprocess
 import sys
 from types import SimpleNamespace
+import wave
 
 import pytest
 
@@ -12,7 +13,7 @@ from examples.runners.qwen3_audio import runner
 
 ROOT = Path(__file__).resolve().parents[1]
 TEMPLATES = ("qwen3_asr/0_6b/fp16.toml", "qwen3_tts/0_6b/base.toml",
-             "qwen3_tts/0_6b/base_rpu_codec.toml")
+             "qwen3_tts/0_6b/base_rpu_codec.toml", "whisper_asr/base/fp16.toml")
 
 
 @pytest.mark.parametrize("template", TEMPLATES)
@@ -109,3 +110,64 @@ def test_speech_summary_uses_rtf_not_token_rate():
     from examples.common.performance import summary
     lines = summary({"qwen3_tts": {}}, {"execution": {"status": "COMPLETED"}, "median_rtf": 0.9})
     assert lines == ["TTS RTF median=0.900; RTF = request time / audio duration"]
+    lines = summary({"whisper_asr": {}}, {"execution": {"status": "COMPLETED"}, "median_rtf": 0.2})
+    assert lines == ["Whisper ASR RTF median=0.200; RTF = request time / audio duration"]
+
+
+def test_speech_percentile_interpolates_measurements():
+    assert runner._percentile([0.0, 10.0], 0.95) == 9.5
+
+
+def test_whisper_runner_records_fixed_protocol(tmp_path, monkeypatch):
+    import numpy as np
+    from examples.common import libraries
+    from rpu_backend import api
+
+    audio_path = tmp_path / "audio.wav"
+    with wave.open(str(audio_path), "wb") as stream:
+        stream.setnchannels(1)
+        stream.setsampwidth(2)
+        stream.setframerate(16000)
+        stream.writeframes(np.ones(16000, dtype=np.int16).tobytes())
+    cfg = config.load_config(ROOT / "examples/configs" / TEMPLATES[3])
+    cfg["input"]["audio"] = str(audio_path)
+    cfg["run"]["output_dir"] = str(tmp_path / "out")
+    monkeypatch.setattr(libraries, "current_libraries", lambda root: ({}, {}))
+    monkeypatch.setattr(runner, "configure_cpu_threads", lambda value: {})
+
+    class Model:
+        calls = 0
+        closed = False
+
+        def transcribe(self, audio, **kwargs):
+            self.calls += 1
+            return api.WhisperTranscription("hello", "en", (1, 2), "eos")
+
+        def execution_stats(self):
+            return {
+                "graph_invariant_ok": True,
+                "timing": {
+                    "preprocess_ms": 1.0, "encoder_ms": 2.0, "cross_ms": 3.0,
+                    "language_ms": 4.0, "prompt_ms": 5.0, "decode_ms": 6.0,
+                    "total_ms": 21.0, "decode_step_ms": (2.0, 4.0),
+                },
+            }
+
+        def close(self):
+            self.closed = True
+
+    model = Model()
+    monkeypatch.setattr(
+        api, "WhisperASRModel",
+        SimpleNamespace(from_pretrained=lambda checkpoint: model),
+    )
+
+    assert runner.run_example_config(cfg) == 0
+    report = json.loads((tmp_path / "out/report.json").read_text())
+    transcription = json.loads((tmp_path / "out/transcription.json").read_text())
+    assert model.calls == 12 and model.closed
+    assert len(report["warmup_wall_ms_runs"]) == 2
+    assert len(report["wall_ms_runs"]) == 10
+    assert report["component_ms_p50"]["total_ms"] == 21.0
+    assert report["decode_step_ms_p95"] == 4.0
+    assert transcription["language"] == "en"

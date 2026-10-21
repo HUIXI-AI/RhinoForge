@@ -45,3 +45,10 @@ def test_whisper_encoder_owns_fixed_conv_frontend_and_position_add():
     assert "GeluMode::ERF" in source
     assert "rpu_launch_slice_spm_kernel(" in source
     assert "position_embedding_" in source
+
+
+def test_whisper_decoder_position_dma_is_mutable_across_replay():
+    source = (ROOT / "src/fused/rpu_whisper_decoder.cpp").read_text()
+
+    assert "position_src_base_" in source
+    assert "rpu_launch_ddr_broadcast_spm_dma_mutable(" in source

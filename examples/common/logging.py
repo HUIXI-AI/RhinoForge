@@ -145,7 +145,8 @@ def emit_performance(config, report):
 def _model_summary(config):
     example = config.get("example", {})
     special = next((name for name in ("lingbot2", "pi05", "g05", "hy_vla",
-                    "wall_oss", "wall_oss_sorting", "qwen3_asr", "qwen3_tts") if name in config), None)
+                    "wall_oss", "wall_oss_sorting", "qwen3_asr", "qwen3_tts",
+                    "whisper_asr") if name in config), None)
     profile = config.get(special, {}) if special else example
     model = special or example.get("profile_id", example.get("target", "model"))
     precision = profile.get("precision", example.get("dtype", "profile default"))

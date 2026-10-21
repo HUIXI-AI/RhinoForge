@@ -632,7 +632,7 @@ def load_config(path: Path) -> dict:
         cpu_runtime().resolve_cpu_threads(config)
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
-    if "qwen3_asr" in config or "qwen3_tts" in config:
+    if any(name in config for name in ("qwen3_asr", "qwen3_tts", "whisper_asr")):
         from examples.runners.qwen3_audio.runner import validate_example_config, resolve_paths
         try:
             validate_example_config(config)
@@ -845,7 +845,8 @@ def _hyvla_runner():
 
 def config_target(config):
     """Return the existing runner target of a validated, runnable configuration."""
-    for target in ("wall_oss", "wall_oss_sorting", "g05", "pi05", "hy_vla", "lingbot2", "qwen3_asr", "qwen3_tts"):
+    for target in ("wall_oss", "wall_oss_sorting", "g05", "pi05", "hy_vla", "lingbot2",
+                   "qwen3_asr", "qwen3_tts", "whisper_asr"):
         if target in config:
             return target
     return config.get("example", {}).get("target")

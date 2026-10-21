@@ -7,6 +7,7 @@ import torch
 from rpu_backend.api import WhisperASRModel, WhisperTranscription
 from rpu_backend.api import whisper_asr
 from rpu_backend.api.errors import RPUUnsupportedDtypeError, UnsupportedModelError
+from rpu_backend.api.errors import RPUSingleHandleError
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, "fp16"])
@@ -51,6 +52,8 @@ def test_from_pretrained_loads_and_owns_both_runtimes(tmp_path, monkeypatch):
     monkeypatch.setattr(whisper_asr, "WhisperEncoderRuntime", Runtime)
     monkeypatch.setattr(whisper_asr, "WhisperDecoderRuntime", Runtime)
     monkeypatch.setattr(whisper_asr._TokenTable, "load", lambda path: tokens)
+    allocator = []
+    monkeypatch.setattr(torch.rpu, "set_caching_allocator", allocator.append)
 
     model = WhisperASRModel.from_pretrained(tmp_path)
     model.close()
@@ -61,6 +64,7 @@ def test_from_pretrained_loads_and_owns_both_runtimes(tmp_path, monkeypatch):
         (paths["base-encoder.onnx"], paths["base-decoder.onnx"]),
     ]
     assert all(runtime.closed for runtime in created)
+    assert allocator == [True]
 
 
 def test_from_pretrained_closes_encoder_when_decoder_loading_fails(
@@ -88,6 +92,63 @@ def test_from_pretrained_closes_encoder_when_decoder_loading_fails(
     with pytest.raises(RuntimeError, match="decoder load"):
         WhisperASRModel.from_pretrained(tmp_path)
     assert Encoder.instance.closed
+
+
+def test_from_pretrained_preserves_load_error_when_cleanup_fails(
+        tmp_path, monkeypatch):
+    paths = {name: tmp_path / name for name in (
+        "base-encoder.onnx", "base-decoder.onnx", "base-tokens.txt"
+    )}
+    created = []
+
+    class Runtime:
+        def __init__(self, *args):
+            self.closed = False
+            created.append(self)
+
+        def close(self):
+            self.closed = True
+            if len(created) == 2 and self is created[1]:
+                raise RuntimeError("decoder cleanup")
+
+    monkeypatch.setattr(whisper_asr, "validate_checkpoint", lambda path: paths)
+    monkeypatch.setattr(whisper_asr, "_require_native_backend", lambda: None)
+    monkeypatch.setattr(whisper_asr, "WhisperEncoderRuntime", Runtime)
+    monkeypatch.setattr(whisper_asr, "WhisperDecoderRuntime", Runtime)
+    monkeypatch.setattr(whisper_asr._TokenTable, "load",
+                        lambda path: (_ for _ in ()).throw(ValueError("token load")))
+    monkeypatch.setattr(torch.rpu, "set_caching_allocator", lambda enabled: None)
+
+    with pytest.raises(ValueError, match="token load") as caught:
+        WhisperASRModel.from_pretrained(tmp_path)
+
+    assert all(runtime.closed for runtime in created)
+    assert any("decoder cleanup" in note for note in caught.value.__notes__)
+
+
+def test_from_pretrained_rejects_a_second_live_model(tmp_path, monkeypatch):
+    paths = {name: tmp_path / name for name in (
+        "base-encoder.onnx", "base-decoder.onnx", "base-tokens.txt"
+    )}
+
+    class Runtime:
+        def __init__(self, *args):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(whisper_asr, "validate_checkpoint", lambda path: paths)
+    monkeypatch.setattr(whisper_asr, "_require_native_backend", lambda: None)
+    monkeypatch.setattr(whisper_asr, "WhisperEncoderRuntime", Runtime)
+    monkeypatch.setattr(whisper_asr, "WhisperDecoderRuntime", Runtime)
+    monkeypatch.setattr(whisper_asr._TokenTable, "load", lambda path: object())
+    first = WhisperASRModel.from_pretrained(tmp_path)
+    try:
+        with pytest.raises(RPUSingleHandleError):
+            WhisperASRModel.from_pretrained(tmp_path)
+    finally:
+        first.close()
 
 
 @pytest.mark.parametrize("audio,rate,tokens", [

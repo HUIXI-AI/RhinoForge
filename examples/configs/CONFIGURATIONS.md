@@ -425,4 +425,12 @@ CPU 列为请求值，`继承` 表示按运行器或环境设置。固定 P/D �
 | [wall_oss/sorting/w8a16.toml](wall_oss/sorting/w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w8a16` | 继承 | 未登记；模型专用模板 |
 | [wall_oss/sorting/w8a16_action_w4a16_g32.toml](wall_oss/sorting/w8a16_action_w4a16_g32.toml) | [run.py](../run.py)<br>运行模板 | `w8a16_action_w4a16` | 继承 | 未登记；模型专用模板 |
 
-合计 **293** 份配置。
+## whisper_asr
+
+[配置说明](whisper_asr/README.md) · [权重准备](whisper_asr/README.md#quantization)
+
+| 配置 | 入口 / 用途 | 精度 / 输入默认 | CPU 请求 | 登记支持 |
+|---|---|---|---|---|
+| [whisper_asr/base/fp16.toml](whisper_asr/base/fp16.toml) | [run.py](../run.py)<br>运行模板 | `—` | 4 | 未登记；模型专用模板 |
+
+合计 **294** 份配置。

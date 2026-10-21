@@ -515,13 +515,15 @@ in a model example, treat it as an implementation detail.
 ## Bounded speech APIs
 
 ```python
-from rpu_backend.api import Qwen3ASRModel, Qwen3TTSModel
+from rpu_backend.api import Qwen3ASRModel, Qwen3TTSModel, WhisperASRModel
 ```
 
 | API | Input and result |
 |---|---|
 | `Qwen3ASRModel.from_pretrained(checkpoint, dtype=torch.float16)` | Local pinned Qwen3-ASR-0.6B checkpoint |
 | `model.transcribe(audio, sample_rate=16000, max_new_tokens=64)` | One finite CPU floating-point waveform, mono 16 kHz, 0.5–8 seconds; token limit 1–64. Returns `ASRTranscription(text, raw_text, token_ids)` |
+| `WhisperASRModel.from_pretrained(checkpoint, dtype=torch.float16)` | Local pinned `sherpa-onnx-whisper-base` checkpoint containing encoder, decoder and token table |
+| `model.transcribe(audio, sample_rate=16000, max_new_tokens=448)` | One finite non-silent CPU waveform up to 30 seconds; resamples and detects language automatically. Returns `WhisperTranscription(text, language, token_ids, finish_reason)`; the 448-position context includes four prompt tokens, leaving at most 444 content tokens |
 | `Qwen3TTSModel.from_pretrained(checkpoint, source=prepared_package, dtype=torch.float16, codec_backend="rpu")` | Local pinned Qwen3-TTS-12Hz-0.6B-Base checkpoint and prepared `qwen_tts/` source directory |
 | `model.synthesize(text, reference_audio=local_file, language="Chinese", max_new_tokens=256)` | Text of 1–1024 characters; `Chinese` or `English`; finite, nonzero mono 24 kHz reference audio, 0.5–20 seconds; token limit 2–256 per segment. Returns an independent float32 mono waveform and sample rate 24000 |
 
@@ -543,7 +545,7 @@ concatenation waits for all segments to succeed. A failed request returns no
 partial audio. Downloads,
 preparation and runnable API examples are in the [speech guide](qwen3_audio.md).
 
-Both APIs support `with`, idempotent `close()` and `execution_stats()`. Serialize
+All three APIs support `with`, idempotent `close()` and `execution_stats()`. Serialize
 requests, statistics and close, with one live device model/policy per process.
 Loaders validate assets before transformation and select the caching allocator
 before device allocation. TTS also declares six owner-specific arenas. Restart
@@ -564,6 +566,9 @@ errors propagate.
   `graph_size`, `graph_replays` and `graph_invariant_ok` describe the text cache.
   Replay totals reset when cached signatures are replaced. `audio_linear_calls`
   counts logical projections.
+- Whisper reports the retained encoder, prompt-prefill and decode Graph sizes,
+  replay counts, invariants, the one-time `build_ms`, and the current request's
+  `replay_ms`. Cross-K/V preparation runs once per audio input.
 - TTS reports `generation.steps`, `generation.eos` and `generation.segment_steps`;
   `codec_frontend.device` and `fallback_reason` describe the last segment. It also
   reports output-head calls and each component's calls, tokens and Graph state.

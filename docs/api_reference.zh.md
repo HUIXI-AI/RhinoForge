@@ -428,13 +428,15 @@ CPU/设备 boundary flush 默认打开，正常推理不要关闭。Chunk size �
 ## 语音 API
 
 ```python
-from rpu_backend.api import Qwen3ASRModel, Qwen3TTSModel
+from rpu_backend.api import Qwen3ASRModel, Qwen3TTSModel, WhisperASRModel
 ```
 
 | API | 输入与返回值 |
 |---|---|
 | `Qwen3ASRModel.from_pretrained(checkpoint, dtype=torch.float16)` | 本地固定 Qwen3-ASR-0.6B checkpoint |
 | `model.transcribe(audio, sample_rate=16000, max_new_tokens=64)` | 一维 CPU 有限浮点波形，单声道 16 kHz、0.5–8 秒；生成上限 1–64。返回 `ASRTranscription(text, raw_text, token_ids)` |
+| `WhisperASRModel.from_pretrained(checkpoint, dtype=torch.float16)` | 本地固定 `sherpa-onnx-whisper-base` checkpoint，含 encoder、decoder 和 token 表 |
+| `model.transcribe(audio, sample_rate=16000, max_new_tokens=448)` | 一维 CPU 有限非静音浮点波形，最长 30 秒；自动重采样和识别语言。返回 `WhisperTranscription(text, language, token_ids, finish_reason)`；448 位置上下文含 4 个 prompt token，内容最多 444 token |
 | `Qwen3TTSModel.from_pretrained(checkpoint, source=prepared_package, dtype=torch.float16, codec_backend="rpu")` | 本地固定 Qwen3-TTS-12Hz-0.6B-Base checkpoint 和准备后的 `qwen_tts/` 源码目录 |
 | `model.synthesize(text, reference_audio=local_file, language="Chinese", max_new_tokens=256)` | 文本 1–1024 字符；语言 `Chinese` / `English`；参考音频为有限、非全零的单声道 24 kHz、0.5–20 秒；每段生成上限 2–256。返回独立 float32 单声道波形及采样率 24000 |
 
@@ -450,7 +452,7 @@ prompt 加生成上限须在 512 个位置内；达到上限仍无 EOS 时，在
 调用方随机状态。各段独立复制，全部成功后拼接返回；失败不返回部分音频。下载、
 源码准备和 API 示例见[语音指南](qwen3_audio.zh.md)。
 
-两类 API 均支持 `with`、幂等 `close()` 和 `execution_stats()`。请求、统计及关闭
+三类 API 均支持 `with`、幂等 `close()` 和 `execution_stats()`。请求、统计及关闭
 串行调用，一个进程只保留一个存活设备模型/策略。加载器在转换前检查资产，并在
 设备分配前选择 caching allocator；TTS 还声明 owner 专属六个 arena。
 进程已冻结为不兼容 allocator 或 arena 计划时，启动新进程。
@@ -467,6 +469,9 @@ ASR 需要重编译的 native 提供 `siglip_set_audio_mode`、`siglip_set_audio
   `audio_graph_invariant_ok` 描述音频缓存；`graph_size`、`graph_replays`、
   `graph_invariant_ok` 描述文本缓存。替换缓存签名后重放计数重新累计；
   `audio_linear_calls` 统计逻辑投影调用。
+- Whisper 返回 encoder、prompt prefill 和 decode 三张常驻图的大小、重放次数、
+  invariant、一次性 `build_ms` 和当前请求的 `replay_ms`；每条音频只准备一次
+  cross-K/V。
 - TTS 返回 `generation.steps`、`generation.eos` 和 `generation.segment_steps`；
   `codec_frontend.device`、`fallback_reason` 描述最后一段。还返回输出头调用计数
   以及各组件的 calls、tokens 和 Graph 状态。`components.predictor.fused_head_calls`

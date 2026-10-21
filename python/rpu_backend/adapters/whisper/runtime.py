@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import time
 
 import numpy as np
 import torch
@@ -197,6 +198,16 @@ def _plan_whisper_encoder(handle: int, graph) -> _EncoderPlan:
     return _EncoderPlan(descriptor, signature)
 
 
+def _graph_stats(graph, timing) -> dict:
+    return {
+        "size": graph.size(),
+        "replays": sum(entry.replay_count for entry in graph.snapshot()),
+        "invariant_ok": graph.cache_invariant_ok(),
+        "build_ms": timing["build_ms"],
+        "replay_ms": tuple(timing["replay_ms"]),
+    }
+
+
 class WhisperEncoderRuntime:
     """Own one installed encoder, its fixed staging address and retained graph."""
 
@@ -245,6 +256,7 @@ class WhisperEncoderRuntime:
         self._staging = staging
         self._graph = graph
         self._plan = plan
+        self._graph_timing = {"build_ms": None, "replay_ms": []}
         self._closed = False
 
     @torch.no_grad()
@@ -253,6 +265,10 @@ class WhisperEncoderRuntime:
             raise RuntimeError("Whisper encoder is closed")
         _copy_mel_to_staging(self._staging, mel)
         self._cache.reset_to_position(0)
+        building = not self._graph.is_frozen()
+        if not building:
+            self._graph_timing["replay_ms"].clear()
+        started = time.perf_counter()
         try:
             with self._graph.capture(self._plan.signature):
                 output = torch.ops.rpu.whisper_encoder_forward(
@@ -267,7 +283,17 @@ class WhisperEncoderRuntime:
             torch.ops.rpu.spm_alloc_reset_temporary()
         if not self._graph.is_frozen():
             self._graph.freeze()
+        elapsed = (time.perf_counter() - started) * 1000.0
+        if building:
+            self._graph_timing["build_ms"] = elapsed
+        else:
+            self._graph_timing["replay_ms"].append(elapsed)
         return output.clone()
+
+    def execution_stats(self) -> dict:
+        if self._closed:
+            raise RuntimeError("Whisper encoder is closed")
+        return _graph_stats(self._graph, self._graph_timing)
 
     def close(self) -> None:
         if self._closed:
@@ -276,6 +302,7 @@ class WhisperEncoderRuntime:
         self._closed = True
         self._resource = None
         self._cache = self._staging = self._graph = self._plan = None
+        self._graph_timing = None
 
 
 def _make_decoder_cache(max_seq_len: int) -> RPUCache:
@@ -341,6 +368,10 @@ class WhisperDecoderRuntime:
         self._hidden = hidden
         self._outputs = outputs
         self._prefill_graph, self._decode_graph = graphs
+        self._graph_timing = {
+            "prefill": {"build_ms": None, "replay_ms": []},
+            "decode": {"build_ms": None, "replay_ms": []},
+        }
         self._position = 0
         self._prepared = False
         self._closed = False
@@ -357,6 +388,8 @@ class WhisperDecoderRuntime:
             )
         self._self_cache.reset()
         self._cross_cache.reset()
+        for timing in self._graph_timing.values():
+            timing["replay_ms"].clear()
         self._cross_staging.copy_(encoder_hidden)
         torch.ops.rpu.whisper_decoder_reset(self._handle, 0)
         try:
@@ -404,11 +437,14 @@ class WhisperDecoderRuntime:
         slot = 0 if prefill else 1
         hidden = self._embed(token_id, slot)
         graph = self._prefill_graph if prefill else self._decode_graph
+        timing = self._graph_timing["prefill" if prefill else "decode"]
+        building = not graph.is_frozen()
         output = self._outputs[slot]
         signature = rpu_backend.graph.GraphSignature(
             op_id="whisper_decoder_prefill" if prefill else "whisper_decoder_decode",
             shapes=[1, 1, _HIDDEN], dyn_dims=[_LAYERS], dtypes=[torch.float16],
         )
+        started = time.perf_counter()
         try:
             with graph.capture(signature):
                 if prefill:
@@ -431,9 +467,22 @@ class WhisperDecoderRuntime:
             torch.ops.rpu.spm_alloc_reset_temporary()
         if not graph.is_frozen():
             graph.freeze()
+        elapsed = (time.perf_counter() - started) * 1000.0
+        if building:
+            timing["build_ms"] = elapsed
+        else:
+            timing["replay_ms"].append(elapsed)
         self._position += 1
         self._self_cache.update_position(1)
         return output.cpu()[:, :_VOCAB].clone()
+
+    def execution_stats(self) -> dict:
+        if self._closed:
+            raise RuntimeError("Whisper decoder is closed")
+        return {
+            "prefill": _graph_stats(self._prefill_graph, self._graph_timing["prefill"]),
+            "decode": _graph_stats(self._decode_graph, self._graph_timing["decode"]),
+        }
 
     def close(self) -> None:
         if self._closed:
@@ -444,3 +493,4 @@ class WhisperDecoderRuntime:
         self._token_embedding = self._self_cache = self._cross_cache = None
         self._cross_staging = self._ids = self._hidden = self._outputs = None
         self._prefill_graph = self._decode_graph = None
+        self._graph_timing = None

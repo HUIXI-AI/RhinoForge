@@ -10,12 +10,21 @@ from examples.common.cpu import configure_cpu_threads, resolve_cpu_threads
 from examples.common.results import close_with_report, latency_timing, record_result
 
 
+def _percentile(values, quantile):
+    values = sorted(values)
+    position = (len(values) - 1) * quantile
+    lower = int(position)
+    fraction = position - lower
+    return values[lower] + fraction * (values[min(lower + 1, len(values) - 1)] - values[lower])
+
+
 def validate_example_config(config):
-    targets = set(config) & {"qwen3_asr", "qwen3_tts"}
+    targets = set(config) & {"qwen3_asr", "qwen3_tts", "whisper_asr"}
     if len(targets) != 1:
-        raise ValueError("select exactly one of [qwen3_asr] or [qwen3_tts]")
+        raise ValueError("select exactly one speech model")
     target = next(iter(targets))
     tts = target == "qwen3_tts"
+    whisper = target == "whisper_asr"
     if not {target, "input", "run"} <= set(config) or set(config) - {
             target, "input", "run", "cpu", "logging"}:
         raise ValueError("speech requires model, input and run tables, optional cpu/logging")
@@ -37,7 +46,8 @@ def validate_example_config(config):
     if tts and model.get("codec_backend", "rpu") not in ("cpu", "rpu"):
         raise ValueError("codec_backend must be cpu or rpu")
     for value, label, low, high in (
-            (inputs.get("max_new_tokens", 256 if tts else 64), "max_new_tokens", 2 if tts else 1, 256 if tts else 64),
+            (inputs.get("max_new_tokens", 256 if tts else (448 if whisper else 64)),
+             "max_new_tokens", 2 if tts else 1, 256 if tts else (448 if whisper else 64)),
             (run.get("warmup", 2), "warmup", 0, None),
             (run.get("runs", 5), "runs", 1, None),
             (run.get("seed", 0), "seed", 0, None)):
@@ -49,7 +59,8 @@ def validate_example_config(config):
 
 
 def resolve_paths(config, parent):
-    target = "qwen3_tts" if "qwen3_tts" in config else "qwen3_asr"
+    target = next(name for name in ("qwen3_tts", "qwen3_asr", "whisper_asr")
+                  if name in config)
     for table, keys in ((config[target], ("checkpoint", "source")),
                         (config["input"], ("audio", "reference_audio")),
                         (config["run"], ("output_dir",))):
@@ -63,8 +74,10 @@ def run_example_config(config):
     from examples.common.logging import prepare_output_directory
     from examples.common.libraries import current_libraries
 
-    target = "qwen3_tts" if "qwen3_tts" in config else "qwen3_asr"
+    target = next(name for name in ("qwen3_tts", "qwen3_asr", "whisper_asr")
+                  if name in config)
     tts = target == "qwen3_tts"
+    whisper = target == "whisper_asr"
     options, inputs, run = config[target], config["input"], config["run"]
     directory = prepare_output_directory(run["output_dir"])
     report = {"config": config, "wall_ms_runs": [], "cpu_ms_runs": [], "rtf_runs": [],
@@ -77,16 +90,28 @@ def run_example_config(config):
         _, report["libraries"] = current_libraries(Path(__file__).resolve().parents[3])
         report["cpu_runtime"] = configure_cpu_threads(resolve_cpu_threads(config, default=16 if tts else 4))
         import numpy as np
-        import soundfile as sf
         import torch
-        from rpu_backend.api import Qwen3ASRModel, Qwen3TTSModel
+        from rpu_backend.api import Qwen3ASRModel, Qwen3TTSModel, WhisperASRModel
 
-        limit = inputs.get("max_new_tokens", 256 if tts else 64)
+        limit = inputs.get("max_new_tokens", 256 if tts else (448 if whisper else 64))
         if tts:
+            import soundfile as sf
             from rpu_backend.api.qwen3_tts import _read_reference, _validate_request
             _validate_request(inputs["text"], inputs.get("language", "Chinese"), limit)
             _read_reference(inputs["reference_audio"])
+        elif whisper:
+            import wave
+            from rpu_backend.api.whisper_asr import _validate_audio
+            with wave.open(inputs["audio"], "rb") as stream:
+                if stream.getnchannels() != 1 or stream.getsampwidth() != 2:
+                    raise ValueError("Whisper input must be mono PCM16 WAV")
+                rate = stream.getframerate()
+                audio = np.frombuffer(
+                    stream.readframes(stream.getnframes()), np.int16
+                ).astype(np.float32) / 32768.0
+            _validate_audio(audio, rate, limit)
         else:
+            import soundfile as sf
             from rpu_backend.api.qwen3_asr import _validate_audio
             info = sf.info(inputs["audio"])
             if info.channels != 1 or info.samplerate != 16000 or not 8000 <= info.frames <= 128000:
@@ -102,12 +127,17 @@ def run_example_config(config):
                 def infer():
                     return owner.synthesize(inputs["text"], reference_audio=inputs["reference_audio"],
                         language=inputs.get("language", "Chinese"), max_new_tokens=limit)
+            elif whisper:
+                owner = WhisperASRModel.from_pretrained(options["checkpoint"])
+                def infer():
+                    return owner.transcribe(audio, sample_rate=rate, max_new_tokens=limit)
             else:
                 owner = Qwen3ASRModel.from_pretrained(options["checkpoint"])
                 def infer():
                     return owner.transcribe(audio, sample_rate=rate, max_new_tokens=limit)
             report["load_seconds"] = time.perf_counter() - start
-            warmup, runs = run.get("warmup", 2), run.get("runs", 5)
+            warmup = run.get("warmup", 2)
+            runs = run.get("runs", 10 if whisper else 5)
             for index in range(warmup + runs):
                 torch.manual_seed(run.get("seed", 0))
                 start, cpu_start = time.perf_counter(), time.process_time()
@@ -115,8 +145,12 @@ def run_example_config(config):
                 elapsed, cpu_elapsed = time.perf_counter() - start, time.process_time() - cpu_start
                 stats = owner.execution_stats()
                 components = stats["components"].values() if tts else (stats,)
-                if not all(part["graph_invariant_ok"] for part in components) or (
-                        not tts and not stats["audio_graph_invariant_ok"]):
+                if whisper:
+                    graph_ok = stats["graph_invariant_ok"]
+                else:
+                    graph_ok = all(part["graph_invariant_ok"] for part in components) and (
+                        tts or stats["audio_graph_invariant_ok"])
+                if not graph_ok:
                     raise RuntimeError("speech Graph invariant failed")
                 if index < warmup:
                     report["warmup_wall_ms_runs"].append(elapsed * 1000)
@@ -126,7 +160,14 @@ def run_example_config(config):
                 report["cpu_ms_runs"].append(cpu_elapsed * 1000)
                 report["rtf_runs"].append(elapsed / duration)
                 report.setdefault("audio_seconds_runs", []).append(duration)
+                if not tts:
+                    report.setdefault("token_count_runs", []).append(len(output.token_ids))
+                    report.setdefault("tokens_per_second_runs", []).append(
+                        len(output.token_ids) / elapsed
+                    )
                 report["execution_stats"].append(stats)
+                if whisper:
+                    report.setdefault("component_ms_runs", []).append(stats["timing"])
             if tts:
                 wave, sample_rate = output
                 if sample_rate != 24000 or wave.ndim != 1 or not np.isfinite(wave).all() or not np.any(wave):
@@ -144,6 +185,20 @@ def run_example_config(config):
             report["median_ms"] = statistics.median(report["wall_ms_runs"])
             report["median_cpu_ms"] = statistics.median(report["cpu_ms_runs"])
             report["median_rtf"] = statistics.median(report["rtf_runs"])
+            if whisper:
+                rows = report["component_ms_runs"]
+                report["component_ms_p50"] = {
+                    name: statistics.median([row[name] for row in rows])
+                    for name in ("preprocess_ms", "encoder_ms", "cross_ms",
+                                 "language_ms", "prompt_ms", "decode_ms", "total_ms")
+                }
+                report["component_ms_p95"] = {
+                    name: _percentile([row[name] for row in rows], 0.95)
+                    for name in report["component_ms_p50"]
+                }
+                decode_steps = [value for row in rows for value in row["decode_step_ms"]]
+                report["decode_step_ms_p50"] = statistics.median(decode_steps) if decode_steps else 0.0
+                report["decode_step_ms_p95"] = _percentile(decode_steps, 0.95) if decode_steps else 0.0
         finally:
             close_with_report(owner, report)
     return 0

@@ -49,7 +49,7 @@ def main(argv=None, *, keep_logging_until_exit=False) -> int:
 
 def _dispatch(config, args):
     from examples.common.logging import configuration_checked
-    if "qwen3_asr" in config or "qwen3_tts" in config:
+    if any(name in config for name in ("qwen3_asr", "qwen3_tts", "whisper_asr")):
         from examples.runners.qwen3_audio.runner import validate_example_config, run_example_config
         try:
             validate_example_config(config)

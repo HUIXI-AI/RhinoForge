@@ -13,6 +13,7 @@
 | GR00T | [gr00t](gr00t/README.md) | 224/256 × FP16/W8，text 在文件内修改 |
 | RhinoVLA | [rhinovla](rhinovla/README.md) | v1 官方/调用者 factory、v3 factory 与九种独立配置 |
 | Qwen3-ASR | [qwen3_asr](qwen3_asr/README.md) | 0.6B 音频转文字，固定 FP16 配方 |
+| Whisper ASR | [whisper_asr](whisper_asr/README.md) | base 离线转写，自动语言、固定 FP16 配方 |
 | Qwen3-TTS | [qwen3_tts](qwen3_tts/README.md) | 0.6B Base；默认卸载 12 层残差卷积到 RPU，可显式切回 CPU |
 | Qwen3 | [qwen3](qwen3/README.md) | 模型大小、精度、Instruct / lm_head recipe |
 | Qwen3.5 | [qwen3_5](qwen3_5/README.md) | text/VL、Dense/MoE、精度、固定 P/D 输入 |

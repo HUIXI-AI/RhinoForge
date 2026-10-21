@@ -1,6 +1,8 @@
 """Host generation, token decoding and feature preparation for Whisper base."""
 
 import base64
+import gc
+import weakref
 
 import numpy as np
 import pytest
@@ -35,6 +37,16 @@ def test_log_mel_is_fixed_finite_and_resamples():
     assert torch.count_nonzero(mel[:, :, 1600:]) == 0
 
 
+@pytest.mark.parametrize("samples,rate", [(1, 16000), (80, 16000), (159, 16000), (1, 48000)])
+def test_log_mel_accepts_short_non_silent_audio(samples, rate):
+    mel = whisper_asr._log_mel_spectrogram(
+        np.ones(samples, dtype=np.float32), rate
+    )
+
+    assert mel.shape == (1, 80, 3000)
+    assert torch.isfinite(mel).all()
+
+
 def test_resample_preserves_high_frequency_speech_band():
     time = torch.arange(800, dtype=torch.float32) / 8000
     source = torch.sin(2 * torch.pi * 3000 * time)
@@ -57,6 +69,9 @@ class _Encoder:
 
     def close(self):
         self.closed = True
+
+    def execution_stats(self):
+        return {"size": 1, "replays": 2, "invariant_ok": True}
 
 class _Decoder:
     def __init__(self, *, eos=True):
@@ -87,6 +102,12 @@ class _Decoder:
     def close(self):
         self.closed = True
 
+    def execution_stats(self):
+        return {
+            "prefill": {"size": 1, "replays": 2, "invariant_ok": True},
+            "decode": {"size": 1, "replays": 20, "invariant_ok": True},
+        }
+
 
 def _model(decoder):
     table = whisper_asr._TokenTable((b"",) * 10 + (b" hello",))
@@ -108,6 +129,7 @@ def test_generation_restricts_language_and_stops_on_eos(monkeypatch):
     assert result.text == "hello"
     assert result.finish_reason == "eos"
     assert decoder.calls == [50258, 50259, 50359, 50363, 10]
+    assert model.execution_stats()["graph_invariant_ok"]
 
 
 def test_generation_reports_length_and_close_owns_both_runtimes(monkeypatch):
@@ -126,6 +148,19 @@ def test_generation_reports_length_and_close_owns_both_runtimes(monkeypatch):
     assert model._encoder.closed and decoder.closed
 
 
+def test_generation_stops_at_448_position_context(monkeypatch):
+    monkeypatch.setattr(
+        whisper_asr, "_log_mel_spectrogram",
+        lambda wave, rate: torch.zeros((1, 80, 3000), dtype=torch.float16),
+    )
+    model = _model(_Decoder(eos=False))
+
+    result = model.transcribe(np.ones(16000, dtype=np.float32), max_new_tokens=448)
+
+    assert len(result.token_ids) == 444
+    assert result.finish_reason == "length"
+
+
 def test_close_attempts_encoder_cleanup_when_decoder_cleanup_fails():
     decoder = _Decoder()
     decoder.close = lambda: (_ for _ in ()).throw(RuntimeError("decoder close"))
@@ -135,3 +170,25 @@ def test_close_attempts_encoder_cleanup_when_decoder_cleanup_fails():
         model.close()
 
     assert model._encoder.closed
+
+
+def test_garbage_collection_closes_decoder_before_encoder():
+    events = []
+
+    class Runtime:
+        def __init__(self, name):
+            self.name = name
+
+        def close(self):
+            events.append(self.name)
+
+    model = whisper_asr.WhisperASRModel(
+        Runtime("encoder"), Runtime("decoder"), object()
+    )
+    reference = weakref.ref(model)
+
+    del model
+    gc.collect()
+
+    assert reference() is None
+    assert events == ["decoder", "encoder"]

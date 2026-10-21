@@ -32,7 +32,8 @@ def _counts(rows, name):
 
 
 def _identity(config, report):
-    for target, label in (("qwen3_asr", "ASR"), ("qwen3_tts", "TTS")):
+    for target, label in (("qwen3_asr", "ASR"), ("qwen3_tts", "TTS"),
+                          ("whisper_asr", "Whisper ASR")):
         if target in config:
             return label, False
     example = _mapping(config.get("example"))
@@ -82,7 +83,7 @@ def summary(config, report) -> list[str]:
     timings = [item for item in report.get("timing", ()) if isinstance(item, Mapping)]
     by_metric = {item.get("metric"): item for item in timings}
     lines = []
-    if label in {"ASR", "TTS"} and _number(report.get("median_rtf")):
+    if label in {"ASR", "TTS", "Whisper ASR"} and _number(report.get("median_rtf")):
         lines.append(f"{label} RTF median={report['median_rtf']:.3f}; "
                      "RTF = request time / audio duration")
     total = by_metric.get("total_latency")

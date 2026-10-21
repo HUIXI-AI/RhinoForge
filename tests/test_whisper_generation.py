@@ -35,6 +35,18 @@ def test_log_mel_is_fixed_finite_and_resamples():
     assert torch.count_nonzero(mel[:, :, 1600:]) == 0
 
 
+def test_resample_preserves_high_frequency_speech_band():
+    time = torch.arange(800, dtype=torch.float32) / 8000
+    source = torch.sin(2 * torch.pi * 3000 * time)
+
+    actual = whisper_asr._resample(source, 8000)
+    expected = torch.sin(2 * torch.pi * 3000 * torch.arange(1600) / 16000)
+
+    actual, expected = actual[64:-64], expected[64:-64]
+    assert torch.nn.functional.cosine_similarity(actual, expected, dim=0) > 0.999
+    assert 0.95 < actual.square().mean() / expected.square().mean() < 1.05
+
+
 class _Encoder:
     def __init__(self):
         self.closed = False

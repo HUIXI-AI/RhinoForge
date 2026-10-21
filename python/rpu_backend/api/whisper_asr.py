@@ -133,13 +133,32 @@ def _mel_filterbank() -> torch.Tensor:
 _MEL_FILTERBANK = _mel_filterbank()
 
 
+def _resample(samples: torch.Tensor, sample_rate: int) -> torch.Tensor:
+    if sample_rate == 16000:
+        return samples
+    ratio = 16000 / sample_rate
+    output = torch.empty(round(samples.numel() * ratio), dtype=torch.float32)
+    offsets = torch.arange(-31, 33)
+    cutoff = min(1.0, ratio)
+    for start in range(0, output.numel(), 32768):
+        stop = min(start + 32768, output.numel())
+        positions = torch.arange(start, stop, dtype=torch.float32) / ratio
+        indices = positions.floor().long()[:, None] + offsets
+        distance = positions[:, None] - indices
+        weights = cutoff * torch.sinc(cutoff * distance)
+        weights *= 0.5 + 0.5 * torch.cos(torch.pi * distance / 32)
+        valid = (indices >= 0) & (indices < samples.numel())
+        weights *= valid
+        weights /= weights.sum(dim=1, keepdim=True)
+        output[start:stop] = (
+            samples[indices.clamp(0, samples.numel() - 1)] * weights
+        ).sum(dim=1)
+    return output
+
+
 def _log_mel_spectrogram(waveform: np.ndarray, sample_rate: int) -> torch.Tensor:
     samples = torch.from_numpy(waveform).float()
-    if sample_rate != 16000:
-        length = round(samples.numel() * 16000 / sample_rate)
-        samples = F.interpolate(
-            samples.reshape(1, 1, -1), size=length, mode="linear", align_corners=False
-        ).reshape(-1)
+    samples = _resample(samples, sample_rate)
     window = torch.hann_window(400)
     spectrum = torch.stft(
         samples,

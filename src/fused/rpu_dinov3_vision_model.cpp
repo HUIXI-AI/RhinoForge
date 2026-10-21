@@ -60,6 +60,12 @@ constexpr int64_t DINOV3_VISION_MAX_KEEPALIVE_SEQ = 4096;
 // constant becomes a config-driven int64_t.
 constexpr int64_t DINOV3_VISION_NUM_SPECIAL_TOKENS = 5;
 constexpr int64_t WHISPER_ENCODER_QUERY_CHUNK = 128;
+constexpr int64_t WHISPER_MEL_BINS = 80;
+constexpr int64_t WHISPER_MEL_FRAMES = 3000;
+constexpr int64_t WHISPER_AUDIO_CTX = 1500;
+constexpr int64_t WHISPER_HIDDEN = 512;
+constexpr int64_t WHISPER_CONV_INPUT_PAD = 96;
+constexpr int64_t WHISPER_CONV_ROW_PAD = 528;
 
 // Stable physical-route identities. The remaining launchers implement fixed
 // DINO block math, debug export, or unconditional BufferDecl dataflow.
@@ -105,6 +111,82 @@ enum class DinoVisionMutableDmaRoute : int64_t {
     PRELOAD_DDR_SCATTER_TO_SPM = 3,
     PRELOAD_DDR_BROADCAST_TO_SPM_CORE0 = 4,
 };
+
+static void whisper_frontend_graph(
+    const at::Tensor& input,
+    const at::Tensor& conv1_weight, const at::Tensor& conv1_bias,
+    const at::Tensor& conv2_weight, const at::Tensor& conv2_bias,
+    const at::Tensor& position, at::Tensor& output) {
+    if (!SPM_ALLOC.is_initialized()) SPM_ALLOC.init();
+    SpmAllocator::ScopedTemporary temporary;
+    const int64_t input_elements =
+        WHISPER_MEL_FRAMES * WHISPER_CONV_INPUT_PAD;
+    const int64_t conv1_weight_elements = conv1_weight.numel();
+    const int64_t conv1_output_elements =
+        WHISPER_MEL_FRAMES * WHISPER_CONV_ROW_PAD;
+    const int64_t conv2_weight_elements = conv2_weight.numel();
+    const int64_t conv2_output_elements =
+        WHISPER_AUDIO_CTX * WHISPER_CONV_ROW_PAD;
+    const int64_t packed_elements = WHISPER_AUDIO_CTX * WHISPER_HIDDEN;
+    const uint32_t first_spm = SPM_ALLOC.addr(
+        0, SPM_ALLOC.alloc_temporary(
+               std::max(input_elements, conv2_weight_elements) *
+               sizeof(c10::Half)));
+    const uint32_t middle_spm = SPM_ALLOC.addr(
+        0, SPM_ALLOC.alloc_temporary(
+               conv1_output_elements * sizeof(c10::Half)));
+    const uint32_t last_spm = SPM_ALLOC.addr(
+        0, SPM_ALLOC.alloc_temporary(
+               std::max(conv1_weight_elements, conv2_output_elements) *
+               sizeof(c10::Half)));
+    const uint32_t bias_spm = SPM_ALLOC.addr(
+        0, SPM_ALLOC.alloc_temporary(
+               WHISPER_CONV_ROW_PAD * sizeof(c10::Half)));
+    const uint32_t spm_base = SPM_ALLOC.addr(0, 0);
+    auto v16 = [spm_base](uint32_t address) {
+        TORCH_CHECK(address >= spm_base && (address - spm_base) % 32 == 0,
+                    "Whisper frontend SPM address is not v16 aligned");
+        return (address - spm_base) / 32;
+    };
+
+    rpu_launch_ddr_broadcast_spm_dma(input, 0, input_elements, first_spm, 1);
+    rpu_launch_ddr_broadcast_spm_dma(
+        conv1_weight, 0, conv1_weight_elements, last_spm, 1);
+    rpu_launch_ddr_broadcast_spm_dma(
+        conv1_bias, 0, WHISPER_CONV_ROW_PAD, bias_spm, 1);
+    rpu_launch_conv2d_spm_kernel(
+        v16(first_spm), v16(last_spm), v16(middle_spm), v16(bias_spm),
+        1, WHISPER_MEL_BINS, 1, WHISPER_MEL_FRAMES,
+        WHISPER_HIDDEN, 1, 3,
+        0, 0, 1, 1, 1, 1, 1, 1, 1, true);
+    rpu_launch_eltwise_unary_spm_kernel(
+        middle_spm, middle_spm, conv1_output_elements,
+        ValuOpType::ADD, GeluMode::ERF, 1);
+
+    rpu_launch_ddr_broadcast_spm_dma(
+        conv2_weight, 0, conv2_weight_elements, first_spm, 1);
+    rpu_launch_ddr_broadcast_spm_dma(
+        conv2_bias, 0, WHISPER_CONV_ROW_PAD, bias_spm, 1);
+    rpu_launch_conv2d_spm_kernel(
+        v16(middle_spm), v16(first_spm), v16(last_spm), v16(bias_spm),
+        1, WHISPER_HIDDEN, 1, WHISPER_MEL_FRAMES,
+        WHISPER_HIDDEN, 1, 3,
+        0, 0, 1, 1, 1, 2, 1, 1, 1, true);
+    rpu_launch_eltwise_unary_spm_kernel(
+        last_spm, last_spm, conv2_output_elements,
+        ValuOpType::ADD, GeluMode::ERF, 1);
+
+    rpu_launch_slice_spm_kernel(
+        last_spm, first_spm,
+        {WHISPER_AUDIO_CTX, WHISPER_CONV_ROW_PAD},
+        {WHISPER_AUDIO_CTX, WHISPER_HIDDEN}, {0, 0}, 1);
+    rpu_launch_ddr_broadcast_spm_dma(
+        position, 0, packed_elements, middle_spm, 1);
+    rpu_launch_eltwise_binary_spm_kernel(
+        first_spm, middle_spm, first_spm, packed_elements,
+        ValuOpType::ADD, c10::Half(1.0), 1);
+    rpu_launch_spm_copy_ddr_dma(first_spm, output, 0, packed_elements);
+}
 
 namespace v3 {
 
@@ -1808,6 +1890,86 @@ public:
         set_identity_rope(true);
         set_whisper_query_chunks();
     }
+
+    void set_frontend(
+        const at::Tensor& conv1_weight, const at::Tensor& conv1_bias,
+        const at::Tensor& conv2_weight, const at::Tensor& conv2_bias,
+        const at::Tensor& position_embedding) {
+        TORCH_CHECK(get_last_resolved_chunk_size() == 0 && !has_frontend_,
+                    "Whisper encoder frontend must be installed once before planning");
+        auto check = [](const at::Tensor& tensor, at::IntArrayRef shape,
+                        const char* name) {
+            TORCH_CHECK(tensor.device().type() == at::kPrivateUse1 &&
+                            tensor.scalar_type() == at::kHalf &&
+                            tensor.is_contiguous() && tensor.sizes() == shape,
+                        "Whisper encoder ", name,
+                        " must be contiguous device FP16 with shape ", shape,
+                        ", got ", tensor.sizes());
+        };
+        check(conv1_weight,
+              {WHISPER_HIDDEN, 1, 3, WHISPER_CONV_INPUT_PAD},
+              "conv1_weight");
+        check(conv1_bias, {WHISPER_CONV_ROW_PAD}, "conv1_bias");
+        check(conv2_weight,
+              {WHISPER_HIDDEN, 1, 3, WHISPER_CONV_ROW_PAD},
+              "conv2_weight");
+        check(conv2_bias, {WHISPER_CONV_ROW_PAD}, "conv2_bias");
+        check(position_embedding, {WHISPER_AUDIO_CTX, WHISPER_HIDDEN},
+              "position_embedding");
+        conv1_weight_ = conv1_weight;
+        conv1_bias_ = conv1_bias;
+        conv2_weight_ = conv2_weight;
+        conv2_bias_ = conv2_bias;
+        position_embedding_ = position_embedding;
+        frontend_tokens_ = at::empty(
+            {1, WHISPER_AUDIO_CTX, WHISPER_HIDDEN}, conv1_weight.options());
+        has_frontend_ = true;
+        invalidate_model_state();
+    }
+
+    at::Tensor forward(
+        const at::Tensor& input,
+        std::vector<at::Tensor>& k_caches,
+        std::vector<at::Tensor>& v_caches,
+        int64_t num_tokens,
+        at::IntArrayRef planned_stage_descriptor) {
+        if (!has_frontend_) {
+            return DINOv3VisionModel::forward(
+                input, k_caches, v_caches, num_tokens,
+                planned_stage_descriptor);
+        }
+        TORCH_CHECK(input.device().type() == at::kPrivateUse1 &&
+                        input.scalar_type() == at::kHalf &&
+                        input.is_contiguous() &&
+                        input.sizes() == at::IntArrayRef(
+                            {1, 1, WHISPER_MEL_FRAMES,
+                             WHISPER_CONV_INPUT_PAD}),
+                    "Whisper encoder input must be contiguous device FP16 "
+                    "[1,1,3000,96]");
+        TORCH_CHECK(num_tokens == WHISPER_AUDIO_CTX,
+                    "Whisper encoder frontend requires num_tokens=1500");
+        const void* input_ptr = input.data_ptr();
+        TORCH_CHECK(frontend_input_ptr_ == nullptr ||
+                        frontend_input_ptr_ == input_ptr,
+                    "Whisper encoder Graph requires its retained input staging "
+                    "tensor; copy new mel data into that tensor");
+        frontend_input_ptr_ = input_ptr;
+        rpu_ddr_flush_force(input.data_ptr());
+
+        whisper_frontend_graph(
+            input, conv1_weight_, conv1_bias_, conv2_weight_, conv2_bias_,
+            position_embedding_, frontend_tokens_);
+        return DINOv3VisionModel::forward(
+            frontend_tokens_, k_caches, v_caches, num_tokens,
+            planned_stage_descriptor);
+    }
+
+private:
+    bool has_frontend_ = false;
+    const void* frontend_input_ptr_ = nullptr;
+    at::Tensor conv1_weight_, conv1_bias_, conv2_weight_, conv2_bias_;
+    at::Tensor position_embedding_;
+    at::Tensor frontend_tokens_;
 };
 
 }  // namespace v3
@@ -2041,6 +2203,16 @@ void rpu_whisper_encoder_set_final_norm(
     int64_t handle, const at::Tensor& weight, const at::Tensor& bias) {
     WhisperEncoderRegistry::get(handle, "rpu_whisper_encoder")
         ->set_final_norm(weight, bias);
+}
+
+void rpu_whisper_encoder_set_frontend(
+    int64_t handle,
+    const at::Tensor& conv1_weight, const at::Tensor& conv1_bias,
+    const at::Tensor& conv2_weight, const at::Tensor& conv2_bias,
+    const at::Tensor& position_embedding) {
+    WhisperEncoderRegistry::get(handle, "rpu_whisper_encoder")
+        ->set_frontend(conv1_weight, conv1_bias, conv2_weight, conv2_bias,
+                      position_embedding);
 }
 
 void rpu_whisper_encoder_set_chunk_envelope(

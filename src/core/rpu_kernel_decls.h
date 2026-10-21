@@ -5745,6 +5745,11 @@ void rpu_whisper_encoder_set_weights(
     int64_t hidden_size, int64_t intermediate_size, double eps);
 void rpu_whisper_encoder_set_final_norm(
     int64_t handle, const at::Tensor& weight, const at::Tensor& bias);
+void rpu_whisper_encoder_set_frontend(
+    int64_t handle,
+    const at::Tensor& conv1_weight, const at::Tensor& conv1_bias,
+    const at::Tensor& conv2_weight, const at::Tensor& conv2_bias,
+    const at::Tensor& position_embedding);
 void rpu_whisper_encoder_set_chunk_envelope(
     int64_t handle, int64_t max_kv_len, int64_t chunk);
 std::vector<int64_t> rpu_whisper_encoder_resolve_stage_domain(

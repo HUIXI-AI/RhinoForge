@@ -1638,6 +1638,9 @@ TORCH_LIBRARY(rpu, m) {
         "int intermediate_size, float eps) -> ()");
   m.def("whisper_encoder_set_final_norm(int handle, Tensor weight, "
         "Tensor bias) -> ()");
+  m.def("whisper_encoder_set_frontend(int handle, Tensor conv1_weight, "
+        "Tensor conv1_bias, Tensor conv2_weight, Tensor conv2_bias, "
+        "Tensor position_embedding) -> ()");
   m.def("whisper_encoder_set_chunk_envelope",
         TORCH_FN(rpu_whisper_encoder_set_chunk_envelope));
   m.def("whisper_encoder_resolve_stage_domain",
@@ -1894,6 +1897,8 @@ TORCH_LIBRARY_IMPL(rpu, PrivateUse1, m) {
          TORCH_FN(rpu_whisper_encoder_set_weights));
   m.impl("whisper_encoder_set_final_norm",
          TORCH_FN(rpu_whisper_encoder_set_final_norm));
+  m.impl("whisper_encoder_set_frontend",
+         TORCH_FN(rpu_whisper_encoder_set_frontend));
   m.impl("whisper_encoder_forward",
          TORCH_FN(rpu_whisper_encoder_forward));
 }

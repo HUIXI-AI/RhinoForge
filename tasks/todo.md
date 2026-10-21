@@ -17,8 +17,8 @@
 ## 阶段 B：encoder 闭环
 
 - [x] T3 新增公共 API 骨架、资产预检和音频边界测试
-- [ ] T4 接通 encoder native owner、6 层计算和 Graph 生命周期
-- [ ] T4 R1 encoder 余弦相似度 ≥ 0.9999
+- [x] T4 接通 encoder native owner、6 层计算和 Graph 生命周期
+- [x] T4 R1 encoder 余弦相似度 ≥ 0.9999（实测 1.000066，BUILD 1 次、REPLAY 完全一致）
 - [ ] T5 接通 encoder Python 安装、执行和清理
 - [ ] 检查点 B：重复输入刷新、输出不别名、BUILD/REPLAY 稳定
 

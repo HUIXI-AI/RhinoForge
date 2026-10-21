@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+import base64
 import operator
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from rpu_backend.adapters.whisper import validate_checkpoint
+from rpu_backend.adapters.whisper.runtime import (
+    WhisperDecoderRuntime,
+    WhisperEncoderRuntime,
+)
 
 from .errors import RPUUnsupportedDtypeError, UnsupportedModelError
 
@@ -18,13 +25,140 @@ _NATIVE_OPS = (
     "whisper_encoder_create",
     "whisper_encoder_destroy",
     "whisper_encoder_set_weights",
+    "whisper_encoder_set_final_norm",
+    "whisper_encoder_set_frontend",
+    "whisper_encoder_set_chunk_envelope",
+    "whisper_encoder_resolve_stage_domain",
     "whisper_encoder_forward",
     "whisper_decoder_create",
     "whisper_decoder_destroy",
     "whisper_decoder_set_weights",
-    "whisper_decoder_prefill",
-    "whisper_decoder_decode",
+    "whisper_decoder_set_cross_weights",
+    "whisper_decoder_set_io",
+    "whisper_decoder_reset",
+    "whisper_decoder_prepare_cross",
+    "whisper_decoder_prefill_logits",
+    "whisper_decoder_decode_logits",
+    "gather_embedding",
+    "spm_alloc_reset_temporary",
 )
+
+_EOT = 50257
+_SOT = 50258
+_BLANK = 220
+_TRANSLATE = 50358
+_TRANSCRIBE = 50359
+_NO_SPEECH = 50362
+_NO_TIMESTAMPS = 50363
+_LANGUAGE_CODES = (
+    "en", "zh", "de", "es", "ru", "ko", "fr", "ja", "pt", "tr", "pl",
+    "ca", "nl", "ar", "sv", "it", "id", "hi", "fi", "vi", "he", "uk",
+    "el", "ms", "cs", "ro", "da", "hu", "ta", "no", "th", "ur", "hr",
+    "bg", "lt", "la", "mi", "ml", "cy", "sk", "te", "fa", "lv", "bn",
+    "sr", "az", "sl", "kn", "et", "mk", "br", "eu", "is", "hy", "ne",
+    "mn", "bs", "kk", "sq", "sw", "gl", "mr", "pa", "si", "km", "sn",
+    "yo", "so", "af", "oc", "ka", "be", "tg", "sd", "gu", "am", "yi",
+    "lo", "uz", "fo", "ht", "ps", "tk", "nn", "mt", "sa", "lb", "my",
+    "bo", "tl", "mg", "as", "tt", "haw", "ln", "ha", "ba", "jw", "su",
+)
+assert len(_LANGUAGE_CODES) == 99
+
+
+@dataclass(frozen=True)
+class _TokenTable:
+    pieces: tuple[bytes, ...]
+
+    @classmethod
+    def load(cls, path: str | Path, *, expected_size: int = 50257) -> "_TokenTable":
+        pieces: list[bytes | None] = [None] * expected_size
+        try:
+            with Path(path).open(encoding="utf-8") as stream:
+                for line in stream:
+                    encoded, raw_index = line.split()
+                    index = int(raw_index)
+                    if not 0 <= index < expected_size or pieces[index] is not None:
+                        raise ValueError
+                    pieces[index] = base64.b64decode(encoded)
+            if any(piece is None for piece in pieces):
+                raise ValueError
+        except (OSError, TypeError, ValueError) as exc:
+            raise ValueError("Whisper token table is malformed") from exc
+        return cls(tuple(piece for piece in pieces if piece is not None))
+
+    def decode(self, token_ids) -> str:
+        value = b"".join(
+            self.pieces[token_id]
+            for token_id in token_ids
+            if 0 <= token_id < len(self.pieces)
+        )
+        return value.decode("utf-8", errors="replace")
+
+
+def _hz_to_mel(frequencies: np.ndarray) -> np.ndarray:
+    mels = frequencies / (200.0 / 3.0)
+    logarithmic = frequencies >= 1000.0
+    mels[logarithmic] = 15.0 + np.log(frequencies[logarithmic] / 1000.0) / (
+        np.log(6.4) / 27.0
+    )
+    return mels
+
+
+def _mel_to_hz(mels: np.ndarray) -> np.ndarray:
+    frequencies = (200.0 / 3.0) * mels
+    logarithmic = mels >= 15.0
+    frequencies[logarithmic] = 1000.0 * np.exp(
+        (np.log(6.4) / 27.0) * (mels[logarithmic] - 15.0)
+    )
+    return frequencies
+
+
+def _mel_filterbank() -> torch.Tensor:
+    frequencies = np.linspace(0.0, 8000.0, 201, dtype=np.float32)
+    mel_points = np.linspace(
+        _hz_to_mel(np.array([0.0], dtype=np.float32))[0],
+        _hz_to_mel(np.array([8000.0], dtype=np.float32))[0],
+        82,
+        dtype=np.float32,
+    )
+    mel_frequencies = _mel_to_hz(mel_points)
+    differences = np.diff(mel_frequencies)
+    ramps = mel_frequencies[:, None] - frequencies[None, :]
+    lower = -ramps[:-2] / differences[:-1, None]
+    upper = ramps[2:] / differences[1:, None]
+    weights = np.maximum(0.0, np.minimum(lower, upper))
+    weights *= (2.0 / (mel_frequencies[2:] - mel_frequencies[:-2]))[:, None]
+    return torch.from_numpy(weights)
+
+
+_MEL_FILTERBANK = _mel_filterbank()
+
+
+def _log_mel_spectrogram(waveform: np.ndarray, sample_rate: int) -> torch.Tensor:
+    samples = torch.from_numpy(waveform).float()
+    if sample_rate != 16000:
+        length = round(samples.numel() * 16000 / sample_rate)
+        samples = F.interpolate(
+            samples.reshape(1, 1, -1), size=length, mode="linear", align_corners=False
+        ).reshape(-1)
+    window = torch.hann_window(400)
+    spectrum = torch.stft(
+        samples,
+        400,
+        160,
+        window=window,
+        return_complex=True,
+        pad_mode="reflect" if samples.numel() > 200 else "constant",
+    ).abs().square()[:, :-1]
+    mel = _MEL_FILTERBANK @ spectrum
+    mel = mel.clamp_min(1e-10).log10()
+    mel = torch.maximum(mel, mel.max() - 8.0)
+    mel = (mel + 4.0) / 4.0
+    mel = F.pad(mel, (0, 1500))
+    if mel.shape[1] > 3000:
+        mel = F.pad(mel[:, :2950], (0, 50))
+    else:
+        mel = F.pad(mel, (0, 3000 - mel.shape[1]))
+    return mel.unsqueeze(0).half().contiguous()
 
 
 @dataclass(frozen=True)
@@ -75,36 +209,99 @@ def _require_native_backend() -> None:
 
 
 class WhisperASRModel:
-    """One frozen Whisper base FP16 model; native execution is added in later stages."""
+    """One frozen Whisper base FP16 model with host-side greedy generation."""
 
-    def __init__(self):
+    def __init__(self, encoder=None, decoder=None, tokens=None):
         self._lock = threading.Lock()
-        self._closed = True
+        self._encoder = encoder
+        self._decoder = decoder
+        self._tokens = tokens
+        self._closed = encoder is None or decoder is None or tokens is None
 
     @classmethod
     def from_pretrained(cls, checkpoint, *, dtype=torch.float16) -> "WhisperASRModel":
         if dtype is not torch.float16:
             raise RPUUnsupportedDtypeError("Whisper base supports only torch.float16")
-        validate_checkpoint(checkpoint)
+        paths = validate_checkpoint(checkpoint)
         _require_native_backend()
-        raise UnsupportedModelError("Whisper native backend loading is not implemented")
+        encoder = WhisperEncoderRuntime(paths["base-encoder.onnx"])
+        decoder = None
+        try:
+            decoder = WhisperDecoderRuntime(
+                paths["base-encoder.onnx"], paths["base-decoder.onnx"]
+            )
+            tokens = _TokenTable.load(paths["base-tokens.txt"])
+        except BaseException:
+            if decoder is not None:
+                decoder.close()
+            encoder.close()
+            raise
+        return cls(encoder, decoder, tokens)
 
     def transcribe(self, audio, *, sample_rate=16000, max_new_tokens=448) -> WhisperTranscription:
         """Validate one waveform before any RPU access."""
-        _validate_audio(audio, sample_rate, max_new_tokens)
+        waveform = _validate_audio(audio, sample_rate, max_new_tokens)
         if not self._lock.acquire(blocking=False):
             raise RuntimeError("Whisper requests and close must be serial")
         try:
             if self._closed:
                 raise RuntimeError("Whisper model is closed")
-            raise UnsupportedModelError("Whisper native backend loading is not implemented")
+            with torch.inference_mode():
+                self._decoder.release_graphs()
+                try:
+                    hidden = self._encoder.encode(
+                        _log_mel_spectrogram(waveform, operator.index(sample_rate))
+                    )
+                finally:
+                    self._encoder.release_graph()
+                self._decoder.prepare_audio(hidden)
+                return self._generate(operator.index(max_new_tokens))
         finally:
             self._lock.release()
+
+    def _generate(self, max_new_tokens: int) -> WhisperTranscription:
+        language_logits = self._decoder.prefill(_SOT)[0, _SOT + 1:_TRANSLATE]
+        if not torch.isfinite(language_logits).all():
+            raise RuntimeError("Whisper language logits are not finite")
+        language_index = int(torch.argmax(language_logits))
+        language_token = _SOT + 1 + language_index
+        self._decoder.decode(language_token)
+        self._decoder.decode(_TRANSCRIBE)
+        logits = self._decoder.decode(_NO_TIMESTAMPS)
+
+        generated = []
+        finish_reason = "length"
+        for step in range(min(max_new_tokens, 448 - 4)):
+            scores = logits[0].clone()
+            if not torch.isfinite(scores).all():
+                raise RuntimeError("Whisper decoder logits are not finite")
+            scores[[_NO_TIMESTAMPS, _SOT, _NO_SPEECH, _TRANSLATE]] = -torch.inf
+            if step == 0:
+                scores[[_EOT, _BLANK]] = -torch.inf
+            token_id = int(torch.argmax(scores))
+            if token_id == _EOT:
+                finish_reason = "eos"
+                break
+            generated.append(token_id)
+            if step + 1 < min(max_new_tokens, 448 - 4):
+                logits = self._decoder.decode(token_id)
+        return WhisperTranscription(
+            self._tokens.decode(generated).strip(),
+            _LANGUAGE_CODES[language_index],
+            tuple(generated),
+            finish_reason,
+        )
 
     def close(self) -> None:
         if not self._lock.acquire(blocking=False):
             raise RuntimeError("Whisper requests and close must be serial")
         try:
+            if self._closed:
+                return
+            try:
+                self._decoder.close()
+            finally:
+                self._encoder.close()
             self._closed = True
         finally:
             self._lock.release()

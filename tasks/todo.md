@@ -33,10 +33,10 @@
 
 ## 阶段 D：端到端能力
 
-- [ ] T8 实现合法语言 token 集合内的自动语言识别
-- [ ] T8 实现 prompt、贪心 decode、EOS/length 和 tokenizer 文本输出
-- [ ] T8 固定音频语言、逐 token、结束原因和文本与 ONNX 完全一致
-- [ ] 检查点 D：语义通过后才进入示例、性能和支持登记
+- [x] T8 实现合法语言 token 集合内的自动语言识别
+- [x] T8 实现 prompt、贪心 decode、EOS/length 和 tokenizer 文本输出
+- [x] T8 固定音频语言、逐 token、结束原因和文本与 ONNX 完全一致
+- [x] 检查点 D：R1 两次输出均与 ONNX 完全一致，进入示例、性能和支持登记
 
 ## 阶段 E：交付
 

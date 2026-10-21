@@ -30,6 +30,66 @@ def test_native_backend_absence_is_explicit(tmp_path, monkeypatch):
         WhisperASRModel.from_pretrained(tmp_path)
 
 
+def test_from_pretrained_loads_and_owns_both_runtimes(tmp_path, monkeypatch):
+    paths = {name: tmp_path / name for name in (
+        "base-encoder.onnx", "base-decoder.onnx", "base-tokens.txt"
+    )}
+    created = []
+
+    class Runtime:
+        def __init__(self, *args):
+            self.args = args
+            self.closed = False
+            created.append(self)
+
+        def close(self):
+            self.closed = True
+
+    tokens = object()
+    monkeypatch.setattr(whisper_asr, "validate_checkpoint", lambda path: paths)
+    monkeypatch.setattr(whisper_asr, "_require_native_backend", lambda: None)
+    monkeypatch.setattr(whisper_asr, "WhisperEncoderRuntime", Runtime)
+    monkeypatch.setattr(whisper_asr, "WhisperDecoderRuntime", Runtime)
+    monkeypatch.setattr(whisper_asr._TokenTable, "load", lambda path: tokens)
+
+    model = WhisperASRModel.from_pretrained(tmp_path)
+    model.close()
+
+    assert model._tokens is tokens
+    assert [runtime.args for runtime in created] == [
+        (paths["base-encoder.onnx"],),
+        (paths["base-encoder.onnx"], paths["base-decoder.onnx"]),
+    ]
+    assert all(runtime.closed for runtime in created)
+
+
+def test_from_pretrained_closes_encoder_when_decoder_loading_fails(
+        tmp_path, monkeypatch):
+    paths = {name: tmp_path / name for name in (
+        "base-encoder.onnx", "base-decoder.onnx", "base-tokens.txt"
+    )}
+
+    class Encoder:
+        def __init__(self, path):
+            self.closed = False
+            Encoder.instance = self
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(whisper_asr, "validate_checkpoint", lambda path: paths)
+    monkeypatch.setattr(whisper_asr, "_require_native_backend", lambda: None)
+    monkeypatch.setattr(whisper_asr, "WhisperEncoderRuntime", Encoder)
+    monkeypatch.setattr(
+        whisper_asr, "WhisperDecoderRuntime",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("decoder load")),
+    )
+
+    with pytest.raises(RuntimeError, match="decoder load"):
+        WhisperASRModel.from_pretrained(tmp_path)
+    assert Encoder.instance.closed
+
+
 @pytest.mark.parametrize("audio,rate,tokens", [
     (np.array([], dtype=np.float32), 16000, 448),
     (np.zeros(16000, dtype=np.float32), 16000, 448),

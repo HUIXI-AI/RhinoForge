@@ -269,6 +269,11 @@ class WhisperEncoderRuntime:
             self._graph.freeze()
         return output.clone()
 
+    def release_graph(self) -> None:
+        if self._closed:
+            raise RuntimeError("Whisper encoder is closed")
+        self._graph.begin_warmup().clear()
+
     def close(self) -> None:
         if self._closed:
             return
@@ -441,6 +446,12 @@ class WhisperDecoderRuntime:
         self._position += 1
         self._self_cache.update_position(1)
         return output.cpu()[:, :_VOCAB].clone()
+
+    def release_graphs(self) -> None:
+        if self._closed:
+            raise RuntimeError("Whisper decoder is closed")
+        for graph in (self._cross_graph, self._prefill_graph, self._decode_graph):
+            graph.begin_warmup().clear()
 
     def close(self) -> None:
         if self._closed:

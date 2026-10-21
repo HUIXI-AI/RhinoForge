@@ -37,6 +37,7 @@ set(RPU_FUSED_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_qwen3_5_vision_model.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_qwen25vl_vision_model.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_dinov3_vision_model.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_whisper_decoder.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_gr00t_dit_model.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_gr00t_vl_encoder_model.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_navdp_model.cpp"

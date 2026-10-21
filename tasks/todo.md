@@ -24,10 +24,10 @@
 
 ## 阶段 C：decoder 闭环
 
-- [ ] T6 实现第 0 层 prompt prefill 和单 token decode
-- [ ] T6 验证 hidden/self-KV/cross-KV 余弦相似度 ≥ 0.9999
-- [ ] T6 验证 cache 只追加、历史前缀不变、位置错误明确失败
-- [ ] 检查点 C：第 0 层全部通过后才扩展 6 层
+- [x] T6 实现第 0 层 prompt prefill 和单 token decode
+- [x] T6 验证 hidden/self-KV/cross-KV 余弦相似度 ≥ 0.9999（R1 实测最低 0.9999995）
+- [x] T6 验证 cache 只追加、历史前缀不变、位置错误明确失败
+- [x] 检查点 C：第 0 层数值、cache 与 Graph 复用全部通过
 - [ ] T7 扩展完整 6 层、cross-K/V、448 self-K/V 与 vocabulary head
 - [ ] T7 验证 warmup 0/1/3、跨音频 cache 清理和 Graph invariant
 

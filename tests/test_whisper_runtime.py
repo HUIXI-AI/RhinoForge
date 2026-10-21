@@ -48,6 +48,26 @@ def test_minimal_onnx_weight_reader_validates_shape(tmp_path):
         load_float_initializers(path, {"weight": (3, 2)})
 
 
+def test_decoder_weight_map_matches_frozen_layer_names(monkeypatch):
+    from rpu_backend.adapters.whisper import weights
+
+    requested = {}
+
+    def load(_path, expected):
+        requested.update(expected)
+        return {
+            name: np.zeros(shape, dtype=np.float32)
+            for name, shape in expected.items()
+        }
+
+    monkeypatch.setattr(weights, "load_float_initializers", load)
+    loaded = weights.load_decoder_weights("decoder.onnx", layer_count=1)
+
+    assert "onnx::MatMul_4196" in requested
+    assert "onnx::MatMul_4240" in requested
+    assert loaded["layers"][0]["ff2_w"].shape == (512, 2048)
+
+
 class _Graph:
     def __init__(self, calls):
         self.calls = calls

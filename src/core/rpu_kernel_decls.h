@@ -5760,6 +5760,31 @@ at::Tensor rpu_whisper_encoder_forward(
     at::TensorList k_caches_list, at::TensorList v_caches_list,
     int64_t num_tokens, at::IntArrayRef planned_stage_descriptor);
 
+int64_t rpu_whisper_decoder_create();
+void rpu_whisper_decoder_destroy(int64_t handle);
+void rpu_whisper_decoder_set_weights(
+    int64_t handle,
+    at::TensorList sq_w, at::TensorList sk_w,
+    at::TensorList sv_w, at::TensorList so_w,
+    at::TensorList cq_w, at::TensorList co_w,
+    at::TensorList ff1_w, at::TensorList ff2_w,
+    at::TensorList n1_w, at::TensorList n1_b,
+    at::TensorList n2_w, at::TensorList n2_b,
+    at::TensorList n3_w, at::TensorList n3_b,
+    at::TensorList sq_b, at::TensorList sv_b,
+    at::TensorList so_b, at::TensorList cq_b,
+    at::TensorList co_b, at::TensorList ff1_b,
+    at::TensorList ff2_b);
+void rpu_whisper_decoder_reset(int64_t handle, int64_t position);
+at::Tensor rpu_whisper_decoder_prefill(
+    int64_t handle, const at::Tensor& hidden, const at::Tensor& output,
+    at::TensorList self_k, at::TensorList self_v,
+    at::TensorList cross_k, at::TensorList cross_v);
+at::Tensor rpu_whisper_decoder_decode(
+    int64_t handle, const at::Tensor& hidden, const at::Tensor& output,
+    at::TensorList self_k, at::TensorList self_v,
+    at::TensorList cross_k, at::TensorList cross_v, int64_t position);
+
 
 // =============================================================================
 // Debug / Control Functions

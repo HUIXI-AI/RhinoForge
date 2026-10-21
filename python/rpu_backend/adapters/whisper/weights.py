@@ -1,4 +1,4 @@
-"""Dependency-free reader for the frozen Whisper encoder ONNX weights."""
+"""Dependency-free reader for the frozen Whisper ONNX weights."""
 
 from __future__ import annotations
 
@@ -179,3 +179,64 @@ def load_encoder_weights(path: str | Path) -> dict[str, object]:
         "final_b": tensors["audioEncoder.ln_post.bias"],
         "layers": layers,
     }
+
+
+def load_decoder_weights(
+    path: str | Path, *, layer_count: int = 6
+) -> dict[str, object]:
+    if layer_count not in {1, 6}:
+        raise ValueError("Whisper decoder layer_count must be 1 or 6")
+    expected = {}
+    for layer in range(layer_count):
+        base = 4195 + 59 * layer
+        expected.update({
+            f"textDecoder.blocks.{layer}.attn_ln.weight": (512,),
+            f"textDecoder.blocks.{layer}.attn_ln.bias": (512,),
+            f"textDecoder.blocks.{layer}.cross_attn_ln.weight": (512,),
+            f"textDecoder.blocks.{layer}.cross_attn_ln.bias": (512,),
+            f"textDecoder.blocks.{layer}.mlp_ln.weight": (512,),
+            f"textDecoder.blocks.{layer}.mlp_ln.bias": (512,),
+            f"onnx::Add_{base}": (512,),
+            f"onnx::MatMul_{base + 1}": (512, 512),
+            f"onnx::MatMul_{base + 3}": (512, 512),
+            f"onnx::Add_{base + 5}": (512,),
+            f"onnx::MatMul_{base + 6}": (512, 512),
+            f"onnx::Add_{base + 26}": (512,),
+            f"onnx::MatMul_{base + 27}": (512, 512),
+            f"onnx::Add_{base + 29}": (512,),
+            f"onnx::MatMul_{base + 30}": (512, 512),
+            f"onnx::Add_{base + 38}": (512,),
+            f"onnx::MatMul_{base + 39}": (512, 512),
+            f"onnx::Add_{base + 41}": (2048,),
+            f"onnx::MatMul_{base + 42}": (512, 2048),
+            f"onnx::Add_{base + 44}": (512,),
+            f"onnx::MatMul_{base + 45}": (2048, 512),
+        })
+    tensors = load_float_initializers(path, expected)
+    layers = []
+    for layer in range(layer_count):
+        base = 4195 + 59 * layer
+        layers.append({
+            "n1_w": tensors[f"textDecoder.blocks.{layer}.attn_ln.weight"],
+            "n1_b": tensors[f"textDecoder.blocks.{layer}.attn_ln.bias"],
+            "n2_w": tensors[f"textDecoder.blocks.{layer}.cross_attn_ln.weight"],
+            "n2_b": tensors[f"textDecoder.blocks.{layer}.cross_attn_ln.bias"],
+            "n3_w": tensors[f"textDecoder.blocks.{layer}.mlp_ln.weight"],
+            "n3_b": tensors[f"textDecoder.blocks.{layer}.mlp_ln.bias"],
+            "sq_b": tensors[f"onnx::Add_{base}"],
+            "sq_w": tensors[f"onnx::MatMul_{base + 1}"].T.copy(),
+            "sk_w": tensors[f"onnx::MatMul_{base + 3}"].T.copy(),
+            "sv_b": tensors[f"onnx::Add_{base + 5}"],
+            "sv_w": tensors[f"onnx::MatMul_{base + 6}"].T.copy(),
+            "so_b": tensors[f"onnx::Add_{base + 26}"],
+            "so_w": tensors[f"onnx::MatMul_{base + 27}"].T.copy(),
+            "cq_b": tensors[f"onnx::Add_{base + 29}"],
+            "cq_w": tensors[f"onnx::MatMul_{base + 30}"].T.copy(),
+            "co_b": tensors[f"onnx::Add_{base + 38}"],
+            "co_w": tensors[f"onnx::MatMul_{base + 39}"].T.copy(),
+            "ff1_b": tensors[f"onnx::Add_{base + 41}"],
+            "ff1_w": tensors[f"onnx::MatMul_{base + 42}"].T.copy(),
+            "ff2_b": tensors[f"onnx::Add_{base + 44}"],
+            "ff2_w": tensors[f"onnx::MatMul_{base + 45}"].T.copy(),
+        })
+    return {"layers": layers}

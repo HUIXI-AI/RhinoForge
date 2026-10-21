@@ -19,6 +19,7 @@
 测试环境：R1，RhinoForge runtime v1.2.0。第 0 层固定 prefill3/decode1
 产物在 2026-10-21 重新运行，结果如下：
 
+- RhinoForge 源码：commit `d85a63a`
 - Rhino Launch：v1.2.0，commit `3dd1b41`，共享库 SHA256
   `cd11d3a33e4c37da9434026d8f3298f9cde02bf404ea331f2e4e494d38e9333b`
 - 主算子资产：commit `63ff35f902e3f34d7bac00afc04970b3115cd50b`，SHA256

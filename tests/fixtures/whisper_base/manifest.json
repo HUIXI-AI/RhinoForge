@@ -1,0 +1,67 @@
+{
+  "model_id": "csukuangfj/sherpa-onnx-whisper-base",
+  "revision": "bb53ee204431c90d314c1cc08d28d23e5b7927cc",
+  "assets": {
+    "base-encoder.onnx": {
+      "bytes": 95087154,
+      "sha256": "5a6b87cb313993f6c9fefec9e7027556f6cb30becddf49655bee36c50ecc12d7"
+    },
+    "base-decoder.onnx": {
+      "bytes": 196548998,
+      "sha256": "8a12c3f6ad65bb5b86d7e6eccc302378f20f9fb2df6cb10747c62895da7ac194"
+    },
+    "base-tokens.txt": {
+      "bytes": 816730,
+      "sha256": "b34b360dbb493e781e479794586d661700670d65564001f23024971d1f2fa126"
+    }
+  },
+  "profile": {
+    "batch": 1,
+    "precision": "fp16",
+    "sample_rate": 16000,
+    "max_audio_samples": 480000,
+    "mel_bins": 80,
+    "mel_frames": 3000,
+    "audio_context": 1500,
+    "hidden_size": 512,
+    "attention_heads": 8,
+    "head_dim": 64,
+    "encoder_layers": 6,
+    "decoder_layers": 6,
+    "ffn_size": 2048,
+    "vocab_size": 51865,
+    "text_context": 448,
+    "eot": 50257,
+    "sot": 50258,
+    "transcribe": 50359,
+    "no_timestamps": 50363,
+    "language_token_count": 99,
+    "language_pairs_sha256": "da890f14c0e20a3fb18ca7c2aa5fc698f0b566d25304788c3f749e83fe5ba058"
+  },
+  "reference_probe": {
+    "location": "/mnt/ssd_data/whisper_rhinoforge_probe_20261019",
+    "prefill_ref_sha256": "b071229dba523a2e967cd049b3ebb810ca80432807d83f76ac4bd319a4da4b65",
+    "decode_ref_sha256": "1900442286600248e0004cc49ad02f2e36c0cc8779f34d7b3ac70cbfb5429755",
+    "minimum_hidden_cosine": 0.9999996595305185,
+    "minimum_cache_cosine": 0.9999998120614044
+  },
+  "sample_audio": {
+    "test_wavs/0.wav": "6bc58a4efdf20daac252b6b1502632601a71efe0308f6757dc1eda34891a7e4f",
+    "test_wavs/1.wav": "5143a6ba93c4b274e2c4ac22deb75c2c48936c853f0519add1de828b6c79cc5a",
+    "test_wavs/8k.wav": "f6f3c8b33e2534cdc154fe773ad2750f1f6a2ca5096179cdf037ae782456613e",
+    "test_wavs/trans.txt": "b9ac44e7b794abb1a2d5faf0005e98a665971e7ac2ed15435832cc34edaa9100"
+  },
+  "reference_transcriptions": {
+    "engine": "sherpa-onnx 1.12.26",
+    "test_wavs/0.wav": {
+      "language": "en",
+      "text": " After early nightfall, the yellow lamps would light up here and there, the squalid quarter of the brothels.",
+      "token_ids": [2381, 2440, 1818, 6691, 11, 264, 5566, 34887, 576, 1442, 493, 510, 293, 456, 11, 264, 2339, 31509, 6555, 295, 264, 18872, 1625, 13]
+    },
+    "test_wavs/1.wav": {
+      "language": "en",
+      "text": " God, as a direct consequence of the sin which man thus punished, had given her a lovely child, whose place was on that same dishonored bosom to connect her parent forever with the race and descent of mortals, and to be finally a blessed soul in heaven.",
+      "token_ids": [1265, 11, 382, 257, 2047, 18326, 295, 264, 3343, 597, 587, 8807, 22365, 11, 632, 2212, 720, 257, 7496, 1440, 11, 6104, 1081, 390, 322, 300, 912, 37127, 2769, 30641, 298, 281, 1745, 720, 2596, 5680, 365, 264, 4569, 293, 23475, 295, 6599, 1124, 11, 293, 281, 312, 2721, 257, 12351, 5133, 294, 7162, 13]
+    }
+  }
+}

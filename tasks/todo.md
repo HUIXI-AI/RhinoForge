@@ -4,15 +4,15 @@
 
 - [x] 设计已确认并提交：`a144458`
 - [x] 实施计划已拆分
-- [ ] 用户批准实施计划
+- [x] 用户批准实施计划
 
 ## 阶段 A：先消除不可落地风险
 
-- [ ] T1 锁定模型 profile、完整资产哈希和参考夹具
-- [ ] T1 验证 manifest 可重复、参考输出有限且可复现
-- [ ] T2 清点 Whisper 所需精确算子、Launch 与动态 KV 能力
-- [ ] T2 在 R1 复跑第 0 层 prefill3/decode1 探针
-- [ ] 检查点 A：能力齐全后才进入实现；缺失则提交最小复现并暂停
+- [x] T1 锁定模型 profile、完整资产哈希和参考夹具
+- [x] T1 验证 manifest 可重复、参考输出有限且可复现
+- [x] T2 清点 Whisper 所需精确算子、Launch 与动态 KV 能力
+- [x] T2 在 R1 复跑第 0 层 prefill3/decode1 探针
+- [x] 检查点 A：算子资产齐全；encoder 使用独立 owner，规避通用 Conv1d Graph 输入刷新问题
 
 ## 阶段 B：encoder 闭环
 

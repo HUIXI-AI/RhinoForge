@@ -31,6 +31,7 @@ from .hy_embodied import HyEmbodiedActionOutput, HyEmbodiedPolicy
 from .conditional_generation import RPUModelForConditionalGeneration
 from .generation import greedy_token_ids
 from .qwen3_asr import Qwen3ASRModel
+from .whisper_asr import WhisperASRModel, WhisperTranscription
 from .qwen3_tts import Qwen3TTSModel
 from ._execution import reconfigure_rpu_execution, rpu_execution_stats
 from rpu_backend._version import API_VERSION
@@ -68,6 +69,8 @@ __all__ = [
     "RPUModelForConditionalGeneration",
     "greedy_token_ids",
     "Qwen3ASRModel",
+    "WhisperASRModel",
+    "WhisperTranscription",
     "Qwen3TTSModel",
     "reconfigure_rpu_execution",
     "rpu_execution_stats",

@@ -5729,6 +5729,32 @@ at::Tensor rpu_dinov3_vision_forward(
     int64_t num_tokens,
     at::IntArrayRef planned_stage_descriptor);
 
+int64_t rpu_whisper_encoder_create();
+void rpu_whisper_encoder_destroy(int64_t handle);
+void rpu_whisper_encoder_set_weights(
+    int64_t handle,
+    at::TensorList q_w_list, at::TensorList k_w_list,
+    at::TensorList v_w_list, at::TensorList o_w_list,
+    at::TensorList up_w_list, at::TensorList down_w_list,
+    at::TensorList ln1_w_list, at::TensorList ln1_b_list,
+    at::TensorList ln2_w_list, at::TensorList ln2_b_list,
+    at::TensorList q_b_list, at::TensorList v_b_list, at::TensorList o_b_list,
+    at::TensorList up_b_list, at::TensorList down_b_list,
+    at::TensorList gamma_attn_list, at::TensorList gamma_mlp_list,
+    int64_t num_heads, int64_t head_dim,
+    int64_t hidden_size, int64_t intermediate_size, double eps);
+void rpu_whisper_encoder_set_final_norm(
+    int64_t handle, const at::Tensor& weight, const at::Tensor& bias);
+void rpu_whisper_encoder_set_chunk_envelope(
+    int64_t handle, int64_t max_kv_len, int64_t chunk);
+std::vector<int64_t> rpu_whisper_encoder_resolve_stage_domain(
+    int64_t handle, int64_t num_tokens);
+int64_t rpu_whisper_encoder_get_resolved_chunk_size(int64_t handle);
+at::Tensor rpu_whisper_encoder_forward(
+    int64_t handle, const at::Tensor& input,
+    at::TensorList k_caches_list, at::TensorList v_caches_list,
+    int64_t num_tokens, at::IntArrayRef planned_stage_descriptor);
+
 
 // =============================================================================
 // Debug / Control Functions

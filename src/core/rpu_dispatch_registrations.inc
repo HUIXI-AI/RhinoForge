@@ -1623,6 +1623,31 @@ TORCH_LIBRARY(rpu, m) {
   m.def("dinov3_vision_set_output_mlp(int handle, Tensor first_weight, "
         "Tensor first_bias, Tensor second_weight, Tensor second_bias) -> ()");
 
+  m.def("whisper_encoder_create", TORCH_FN(rpu_whisper_encoder_create));
+  m.def("whisper_encoder_destroy", TORCH_FN(rpu_whisper_encoder_destroy));
+  m.def("whisper_encoder_set_weights(int handle, "
+        "Tensor[] q_w_list, Tensor[] k_w_list, "
+        "Tensor[] v_w_list, Tensor[] o_w_list, "
+        "Tensor[] up_w_list, Tensor[] down_w_list, "
+        "Tensor[] ln1_w_list, Tensor[] ln1_b_list, "
+        "Tensor[] ln2_w_list, Tensor[] ln2_b_list, "
+        "Tensor[] q_b_list, Tensor[] v_b_list, Tensor[] o_b_list, "
+        "Tensor[] up_b_list, Tensor[] down_b_list, "
+        "Tensor[] gamma_attn_list, Tensor[] gamma_mlp_list, "
+        "int num_heads, int head_dim, int hidden_size, "
+        "int intermediate_size, float eps) -> ()");
+  m.def("whisper_encoder_set_final_norm(int handle, Tensor weight, "
+        "Tensor bias) -> ()");
+  m.def("whisper_encoder_set_chunk_envelope",
+        TORCH_FN(rpu_whisper_encoder_set_chunk_envelope));
+  m.def("whisper_encoder_resolve_stage_domain",
+        TORCH_FN(rpu_whisper_encoder_resolve_stage_domain));
+  m.def("whisper_encoder_get_resolved_chunk_size",
+        TORCH_FN(rpu_whisper_encoder_get_resolved_chunk_size));
+  m.def("whisper_encoder_forward(int handle, Tensor input, "
+        "Tensor[] k_caches, Tensor[] v_caches, int num_tokens, "
+        "int[] planned_stage_descriptor=[]) -> Tensor");
+
   // v5-05 D-07 / D-10 (C2): deleted `fused_patch_embedding` op schema — its
   // body is now a TU-static helper inside rpu_siglip_model.cpp; only the
   // SigLIPModel::forward 4D auto-detect path uses it. Also deleted
@@ -1865,6 +1890,12 @@ TORCH_LIBRARY_IMPL(rpu, PrivateUse1, m) {
          TORCH_FN(rpu_dinov3_vision_set_final_norm));
   m.impl("dinov3_vision_set_output_mlp",
          TORCH_FN(rpu_dinov3_vision_set_output_mlp));
+  m.impl("whisper_encoder_set_weights",
+         TORCH_FN(rpu_whisper_encoder_set_weights));
+  m.impl("whisper_encoder_set_final_norm",
+         TORCH_FN(rpu_whisper_encoder_set_final_norm));
+  m.impl("whisper_encoder_forward",
+         TORCH_FN(rpu_whisper_encoder_forward));
 }
 
 TORCH_LIBRARY_IMPL(rpu, CPU, m) {

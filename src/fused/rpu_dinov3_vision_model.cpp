@@ -59,6 +59,7 @@ constexpr int64_t DINOV3_VISION_MAX_KEEPALIVE_SEQ = 4096;
 // unchanged. If a future profile relaxes the register-token count, this
 // constant becomes a config-driven int64_t.
 constexpr int64_t DINOV3_VISION_NUM_SPECIAL_TOKENS = 5;
+constexpr int64_t WHISPER_ENCODER_QUERY_CHUNK = 128;
 
 // Stable physical-route identities. The remaining launchers implement fixed
 // DINO block math, debug export, or unconditional BufferDecl dataflow.
@@ -440,7 +441,9 @@ public:
         // allocator's write buffer while the rope_2d kernel's DDR DMA reads
         // stale (zero or prior-forward) data — silently collapsing 2D RoPE
         // to identity. Same pattern as qwen3vl_vision_model::forward.
-        rpu_ddr_flush_force(position_idx_keepalive_.data_ptr<int16_t>());
+        if (!identity_rope_) {
+            rpu_ddr_flush_force(position_idx_keepalive_.data_ptr<int16_t>());
+        }
 
         // Vision encoder is single-chunk, bidirectional (no causal mask).
         // The adapter may cold-pin the one-chunk 16-aligned capacity through
@@ -719,6 +722,12 @@ protected:
                     (use_16b_sdpa_ ? DINO_ATTENTION_FLAG_USE_16B : 0) |
                     (!raw_spm_eligible
                          ? DINO_ATTN_CAPABILITY_FALLBACK_DDR_REQUIRED : 0);
+                std::vector<int64_t> arguments{
+                    use_16b_sdpa_ ? 1 : 0, hybrid_layer_count_,
+                    chunk.len, num_q_heads(), head_dim(), NUM_CORES};
+                if (whisper_query_chunks_) {
+                    arguments.push_back(WHISPER_ENCODER_QUERY_CHUNK);
+                }
                 manifest.routes.push_back({
                     raw_spm
                         ? DINO_ATTENTION_RAW_SPM_SITE
@@ -729,9 +738,7 @@ protected:
                         raw_spm
                             ? AttentionExecutionPolicy::SPM_KV_BY_MHA
                             : AttentionExecutionPolicy::DDR_KV),
-                    raw_spm ? 0 : ddr_flags,
-                    {use_16b_sdpa_ ? 1 : 0, hybrid_layer_count_,
-                     chunk.len, num_q_heads(), head_dim(), NUM_CORES}, layer});
+                    raw_spm ? 0 : ddr_flags, std::move(arguments), layer});
             }
         }
         append(
@@ -1334,6 +1341,29 @@ protected:
                     addr(0, "sdpa_out"), /*mask_spm=*/0,
                     /*MASK_NONE=*/0, attn_scale, /*batch=*/1,
                     seq_len, seq_len, nq, nq, hd, NUM_CORES);
+            } else if (whisper_query_chunks_) {
+                std::vector<int64_t> arguments{
+                    0, hybrid_layer_count_, seq_len, nq, hd, NUM_CORES,
+                    WHISPER_ENCODER_QUERY_CHUNK};
+                ctx().consume_physical_route(
+                    FmbRouteFamily::ATTENTION, DINO_ATTENTION_32B_SITE,
+                    static_cast<int64_t>(AttentionExecutionPolicy::DDR_KV),
+                    DINO_ATTN_CAPABILITY_FALLBACK_DDR_REQUIRED,
+                    arguments, layer_idx);
+                for (int64_t query_offset = 0; query_offset < seq_len;
+                     query_offset += WHISPER_ENCODER_QUERY_CHUNK) {
+                    const int64_t query_len = std::min(
+                        WHISPER_ENCODER_QUERY_CHUNK, seq_len - query_offset);
+                    const uint32_t query_bytes = static_cast<uint32_t>(
+                        query_offset * local_q_dim * DWIDTH);
+                    rpu_launch_sdpa_spm_unified_kernel_v2(
+                        k_cache, v_cache, 0 /*MASK_NONE*/, attn_scale,
+                        addr_offset("q").value + query_bytes,
+                        addr_offset("sdpa_out").value + query_bytes,
+                        addr_offset("sdpa_tmp").value, 0,
+                        query_len, nq, nq, hd,
+                        seq_len, NUM_CORES, NUM_CORES);
+                }
             } else if (use_16b_sdpa_) {
                 const int64_t flags = DINO_ATTENTION_FLAG_USE_16B |
                     DINO_ATTN_CAPABILITY_FALLBACK_DDR_REQUIRED;
@@ -1604,7 +1634,8 @@ private:
             static_cast<int64_t>(use_acc32_),
             static_cast<int64_t>(use_16b_sdpa_),
             static_cast<int64_t>(standalone_compatibility_),
-            static_cast<int64_t>(identity_rope_)});
+            static_cast<int64_t>(identity_rope_),
+            static_cast<int64_t>(whisper_query_chunks_)});
         identity.push_back(static_cast<int64_t>(layer_weights_.size()));
         for (const auto& weights : layer_weights_) {
             for (const auto* tensor : {
@@ -1753,8 +1784,14 @@ public:
                     "DINO standalone compatibility precision/RoPE profile is immutable");
         if (identity_rope_ != enabled) {
             identity_rope_ = enabled;
+            has_rope_ = has_rope_ || enabled;
             invalidate_model_state();
         }
+    }
+
+    void set_whisper_query_chunks() {
+        whisper_query_chunks_ = true;
+        invalidate_model_state();
     }
 
 private:
@@ -1762,11 +1799,21 @@ private:
     bool use_acc32_ = false;
     bool use_16b_sdpa_ = false;
     bool identity_rope_ = false;
+    bool whisper_query_chunks_ = false;
+};
+
+class WhisperEncoderModel final : public DINOv3VisionModel {
+public:
+    WhisperEncoderModel() {
+        set_identity_rope(true);
+        set_whisper_query_chunks();
+    }
 };
 
 }  // namespace v3
 
 using DINOv3VisionRegistry = ModelHandleRegistry<v3::DINOv3VisionModel>;
+using WhisperEncoderRegistry = ModelHandleRegistry<v3::WhisperEncoderModel>;
 
 std::vector<int64_t> rpu_dinov3_vision_planner_cache_identity(int64_t handle) {
     return DINOv3VisionRegistry::get(handle, "rpu_dinov3_vision_planner_cache_identity")
@@ -1960,4 +2007,68 @@ void rpu_dinov3_vision_set_output_mlp(
 {
     DINOv3VisionRegistry::get(handle, "rpu_dinov3_vision")
         ->set_output_mlp(first_weight, first_bias, second_weight, second_bias);
+}
+
+int64_t rpu_whisper_encoder_create() {
+    return WhisperEncoderRegistry::create();
+}
+
+void rpu_whisper_encoder_destroy(int64_t handle) {
+    WhisperEncoderRegistry::destroy(handle, "rpu_whisper_encoder_destroy");
+}
+
+void rpu_whisper_encoder_set_weights(
+    int64_t handle,
+    at::TensorList q_w_list, at::TensorList k_w_list,
+    at::TensorList v_w_list, at::TensorList o_w_list,
+    at::TensorList up_w_list, at::TensorList down_w_list,
+    at::TensorList ln1_w_list, at::TensorList ln1_b_list,
+    at::TensorList ln2_w_list, at::TensorList ln2_b_list,
+    at::TensorList q_b_list, at::TensorList v_b_list, at::TensorList o_b_list,
+    at::TensorList up_b_list, at::TensorList down_b_list,
+    at::TensorList gamma_attn_list, at::TensorList gamma_mlp_list,
+    int64_t num_heads, int64_t head_dim,
+    int64_t hidden_size, int64_t intermediate_size, double eps) {
+    WhisperEncoderRegistry::get(handle, "rpu_whisper_encoder")->set_weights(
+        q_w_list, k_w_list, v_w_list, o_w_list, up_w_list, down_w_list,
+        ln1_w_list, ln1_b_list, ln2_w_list, ln2_b_list,
+        q_b_list, v_b_list, o_b_list, up_b_list, down_b_list,
+        gamma_attn_list, gamma_mlp_list,
+        num_heads, head_dim, hidden_size, intermediate_size, eps);
+}
+
+void rpu_whisper_encoder_set_final_norm(
+    int64_t handle, const at::Tensor& weight, const at::Tensor& bias) {
+    WhisperEncoderRegistry::get(handle, "rpu_whisper_encoder")
+        ->set_final_norm(weight, bias);
+}
+
+void rpu_whisper_encoder_set_chunk_envelope(
+    int64_t handle, int64_t max_kv_len, int64_t chunk) {
+    WhisperEncoderRegistry::get(handle, "rpu_whisper_encoder_set_chunk_envelope")
+        ->set_chunk_envelope(max_kv_len, chunk);
+}
+
+std::vector<int64_t> rpu_whisper_encoder_resolve_stage_domain(
+    int64_t handle, int64_t num_tokens) {
+    return WhisperEncoderRegistry::get(
+        handle, "rpu_whisper_encoder_resolve_stage_domain")
+        ->resolve_stage_domain(num_tokens);
+}
+
+int64_t rpu_whisper_encoder_get_resolved_chunk_size(int64_t handle) {
+    return WhisperEncoderRegistry::get(
+        handle, "rpu_whisper_encoder_get_resolved_chunk_size")
+        ->get_last_resolved_chunk_size();
+}
+
+at::Tensor rpu_whisper_encoder_forward(
+    int64_t handle, const at::Tensor& input,
+    at::TensorList k_caches_list, at::TensorList v_caches_list,
+    int64_t num_tokens, at::IntArrayRef planned_stage_descriptor) {
+    std::vector<at::Tensor> k_caches(k_caches_list.begin(), k_caches_list.end());
+    std::vector<at::Tensor> v_caches(v_caches_list.begin(), v_caches_list.end());
+    return WhisperEncoderRegistry::get(handle, "rpu_whisper_encoder")
+        ->forward(input, k_caches, v_caches, num_tokens,
+                  planned_stage_descriptor);
 }

@@ -17,7 +17,7 @@
 | Qwen3 / Llama | `RPUModelForCausalLM`；[Qwen3](../examples/configs/qwen3/README.md)、[Llama](../examples/configs/llama/README.md) | Token 与匹配的 KV cache |
 | Qwen3-VL | `RPUModelForConditionalGeneration`；[指南](../examples/configs/qwen3_vl/README.md) | 文本、图片及 processor 生成的位置和网格信息 |
 | Qwen3.5 Dense / MoE | `RPUModelForConditionalGeneration`；[指南](../examples/configs/qwen3_5/README.md) | 文本或图文、对应 Dense/MoE cache 与 checkpoint 配置 |
-| Whisper base | `WhisperASRModel`；[指南](../examples/configs/whisper_asr/README.md) | 最长 30 秒的单声道音频；自动语言、greedy、batch 1 |
+| Whisper base | `WhisperASRModel`；[指南](../examples/configs/whisper_asr/README.md) | 最长 30 分钟的单声道音频；自动语言、greedy、batch 1、每秒流式更新 |
 | Gemma4 | `Gemma4Adapter`；[指南](../examples/configs/gemma4/README.md) | E4B Instruct 文本生成；CPU 前后处理与设备 decoder |
 | DINOv3 | `DINOv3Adapter`；[指南](../examples/configs/dinov3/README.md) | 预处理后的图片 |
 | Pi0.5 | `Pi05Policy`；[指南](../examples/configs/pi05/README.md) | 与 checkpoint 匹配的观测，可显式指定 action noise |
@@ -45,6 +45,7 @@ adapter 所有权与共享运行约定见[实现索引](../knowledge/synthesis/m
 
 `WhisperASRModel` 支持固定版本的 `csukuangfj/sherpa-onnx-whisper-base`：CPU 执行
 音频读取、重采样、log-mel、贪心选词和文本解码，RPU 执行 encoder、decoder、
-cross-attention、KV cache 和 logits。固定范围为 FP16、batch 1、最长 30 秒、自动语言，
-不支持流式、时间戳、Beam Search 或批量推理。资产、输入和运行方式见
+cross-attention、KV cache 和 logits。固定范围为 FP16、batch 1、最长 30 分钟、自动语言；
+CPU 分段支持每秒流式更新，临时文字可修改，连续静音 1 秒后确认。暂不支持时间戳、
+Beam Search 或批量推理。资产、输入和运行方式见
 [Whisper 示例](../examples/configs/whisper_asr/README.md)。

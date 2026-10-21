@@ -148,6 +148,16 @@ def test_generation_reports_length_and_close_owns_both_runtimes(monkeypatch):
     assert model._encoder.closed and decoder.closed
 
 
+def test_generation_uses_pinned_language_without_changing_prompt_order():
+    decoder = _Decoder()
+    model = _model(decoder)
+
+    result = model._generate(8, {}, language_index=1)
+
+    assert result.language == "zh"
+    assert decoder.calls == [50258, 50260, 50359, 50363, 10]
+
+
 def test_generation_stops_at_448_position_context(monkeypatch):
     monkeypatch.setattr(
         whisper_asr, "_log_mel_spectrogram",

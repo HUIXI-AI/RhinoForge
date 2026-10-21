@@ -109,7 +109,7 @@ def run_example_config(config):
                 audio = np.frombuffer(
                     stream.readframes(stream.getnframes()), np.int16
                 ).astype(np.float32) / 32768.0
-            _validate_audio(audio, rate, limit)
+            _validate_audio(audio, rate, limit, max_seconds=30 * 60)
         else:
             import soundfile as sf
             from rpu_backend.api.qwen3_asr import _validate_audio

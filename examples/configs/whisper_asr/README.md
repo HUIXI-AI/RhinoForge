@@ -6,9 +6,24 @@
 `csukuangfj/sherpa-onnx-whisper-base` 的 encoder、decoder、KV cache 和 logits。
 CPU 负责读取音频、重采样、log-mel、贪心选词和文本解码。
 
-输入是单声道 PCM16 WAV，时长不超过 30 秒；模型自动判断语言。首期固定 batch 1、
-FP16、greedy、文本上下文共 448 个位置（4 个 prompt，最多 444 个内容 token），
-不支持流式、时间戳、Beam Search 或批量推理。
+输入是单声道 PCM16 WAV，单次最长 30 分钟；模型自动判断语言。30 秒以内保持
+原单段路径，长音频由 CPU 切分后复用同一组 RPU Graph。固定 batch 1、FP16、
+greedy，单段文本上下文共 448 个位置（4 个 prompt，最多 444 个内容 token）。
+不支持时间戳、Beam Search 或批量推理。
+
+流式调用每累计 1 秒返回一次结果，连续静音 1 秒后把当前句子从临时文字移入
+已确认文字：
+
+```python
+stream = model.create_stream(sample_rate=16000)
+for update in stream.accept_audio(audio_chunk):
+    text = update.confirmed_text + update.partial_text
+final = stream.finish()
+```
+
+`confirmed_text` 后续不再变化，`partial_text` 在句子确认前允许修正。语言在首句
+确认后固定。连续讲话达到 28 秒时会执行技术分段，并用 2 秒重叠 token 去重。
+静音判断采用 -40 dBFS 固定门限，不包含降噪或通用 VAD。
 
 <a id="quantization"></a>
 ## 准备与运行

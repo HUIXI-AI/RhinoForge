@@ -523,11 +523,15 @@ from rpu_backend.api import Qwen3ASRModel, Qwen3TTSModel, WhisperASRModel
 | `Qwen3ASRModel.from_pretrained(checkpoint, dtype=torch.float16)` | Local pinned Qwen3-ASR-0.6B checkpoint |
 | `model.transcribe(audio, sample_rate=16000, max_new_tokens=64)` | One finite CPU floating-point waveform, mono 16 kHz, 0.5–8 seconds; token limit 1–64. Returns `ASRTranscription(text, raw_text, token_ids)` |
 | `WhisperASRModel.from_pretrained(checkpoint, dtype=torch.float16)` | Local pinned `sherpa-onnx-whisper-base` checkpoint containing encoder, decoder and token table |
-| `model.transcribe(audio, sample_rate=16000, max_new_tokens=448)` | One finite non-silent CPU waveform up to 30 seconds; resamples and detects language automatically. Returns `WhisperTranscription(text, language, token_ids, finish_reason)`; the 448-position context includes four prompt tokens, leaving at most 444 content tokens |
+| `model.transcribe(audio, sample_rate=16000, max_new_tokens=448)` | One finite non-silent CPU waveform up to 30 minutes; resamples, segments long input and detects language automatically. Returns `WhisperTranscription(text, language, token_ids, finish_reason)`; each segment has at most 444 content tokens |
+| `model.create_stream(sample_rate=16000, max_new_tokens=448)` | Creates a 30-minute streaming session. `accept_audio(chunk)` returns an immutable update for each complete audio second; `finish()` confirms the tail. Each update has confirmed/partial text, language, elapsed audio time and final status |
 | `Qwen3TTSModel.from_pretrained(checkpoint, source=prepared_package, dtype=torch.float16, codec_backend="rpu")` | Local pinned Qwen3-TTS-12Hz-0.6B-Base checkpoint and prepared `qwen_tts/` source directory |
 | `model.synthesize(text, reference_audio=local_file, language="Chinese", max_new_tokens=256)` | Text of 1–1024 characters; `Chinese` or `English`; finite, nonzero mono 24 kHz reference audio, 0.5–20 seconds; token limit 2–256 per segment. Returns an independent float32 mono waveform and sample rate 24000 |
 
-ASR uses greedy generation without context prompts, timestamps or streaming.
+Qwen3 ASR uses greedy generation without context prompts, timestamps or streaming.
+Whisper uses greedy generation without timestamps; its host-side stream confirms
+after one second below -40 dBFS and forces a 28-second window with two seconds
+of exact-token overlap.
 TTS uses non-streaming speaker-embedding-only voice cloning with the pinned
 checkpoint sampling recipe: top-k 50, temperature 0.9 and top-p 1.0. Set
 `torch.manual_seed` after loading and before a request to repeat sampling on the

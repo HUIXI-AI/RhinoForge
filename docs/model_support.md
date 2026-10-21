@@ -18,7 +18,7 @@ name alone does not specify its checkpoint, precision or supported shapes.
 | Qwen3 / Llama | `RPUModelForCausalLM`; [Qwen3](../examples/configs/qwen3/README.md), [Llama](../examples/configs/llama/README.md) | Tokens and matching KV cache |
 | Qwen3-VL | `RPUModelForConditionalGeneration`; [guide](../examples/configs/qwen3_vl/README.md) | Text, images and processor-produced positions/grid metadata |
 | Qwen3.5 dense / MoE | `RPUModelForConditionalGeneration`; [guide](../examples/configs/qwen3_5/README.md) | Text or image/text; matching dense or MoE cache and checkpoint recipe |
-| Whisper base | `WhisperASRModel`; [guide](../examples/configs/whisper_asr/README.md) | Mono audio up to 30 seconds; automatic language, greedy, batch 1 |
+| Whisper base | `WhisperASRModel`; [guide](../examples/configs/whisper_asr/README.md) | Mono audio up to 30 minutes; automatic language, greedy, batch 1, one-second streaming updates |
 | Gemma4 | `Gemma4Adapter`; [guide](../examples/configs/gemma4/README.md) | E4B Instruct text generation; CPU frontend and device decoder |
 | DINOv3 | `DINOv3Adapter`; [guide](../examples/configs/dinov3/README.md) | Preprocessed images |
 | Pi0.5 | `Pi05Policy`; [guide](../examples/configs/pi05/README.md) | Checkpoint-compatible observations; optional explicit action noise |
@@ -49,6 +49,8 @@ the dedicated speech APIs remain separate from the CausalLM/VLM registry.
 export. CPU work is limited to audio loading, resampling, log-mel features,
 greedy token choice and text decoding; encoder, decoder, cross-attention, KV
 cache and logits run on RPU. The fixed profile is FP16, batch 1, automatic
-language detection and at most 30 seconds of audio. Streaming, timestamps,
-beam search and batched inference are unsupported. See the
+language detection and at most 30 minutes of audio. Host-side segmentation
+also provides one-second streaming updates with revisable partial text and
+confirmation after one second of silence. Timestamps, beam search and batched
+inference are unsupported. See the
 [Whisper example](../examples/configs/whisper_asr/README.md).

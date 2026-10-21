@@ -51,6 +51,13 @@ _TRANSLATE = 50358
 _TRANSCRIBE = 50359
 _NO_SPEECH = 50362
 _NO_TIMESTAMPS = 50363
+_MAX_AUDIO_SECONDS = 30 * 60
+_STREAM_WINDOW_SECONDS = 28
+_STREAM_OVERLAP_SECONDS = 2
+_SILENCE_FRAME_SAMPLES = 320
+_SILENCE_FRAMES = 50
+_SILENCE_RMS = 10 ** (-40 / 20)
+# shortcut: fixed RMS VAD and exact token overlap; upgrade for noisy or continuous speech.
 _LANGUAGE_CODES = (
     "en", "zh", "de", "es", "ru", "ko", "fr", "ja", "pt", "tr", "pl",
     "ca", "nl", "ar", "sv", "it", "id", "hi", "fi", "vi", "he", "uk",
@@ -190,7 +197,18 @@ class WhisperTranscription:
     finish_reason: str
 
 
-def _validate_audio(audio, sample_rate: int, max_new_tokens: int) -> np.ndarray:
+@dataclass(frozen=True)
+class WhisperStreamingTranscription:
+    confirmed_text: str
+    partial_text: str
+    language: str | None
+    audio_seconds: float
+    is_final: bool
+
+
+def _validate_audio(
+    audio, sample_rate: int, max_new_tokens: int, *, max_seconds: int = 30
+) -> np.ndarray:
     if isinstance(sample_rate, bool):
         raise ValueError("sample_rate must be a positive integer")
     try:
@@ -214,12 +232,121 @@ def _validate_audio(audio, sample_rate: int, max_new_tokens: int) -> np.ndarray:
     waveform = np.asarray(audio)
     if waveform.ndim != 1 or waveform.dtype.kind != "f":
         raise ValueError("audio must be one mono floating-point waveform")
-    if waveform.size == 0 or waveform.size > rate * 30 or not np.isfinite(waveform).all():
-        raise ValueError("audio must be finite, non-empty and at most 30 seconds")
+    if waveform.size == 0 or waveform.size > rate * max_seconds or not np.isfinite(waveform).all():
+        limit = "30 minutes" if max_seconds == _MAX_AUDIO_SECONDS else f"{max_seconds} seconds"
+        raise ValueError(f"audio must be finite, non-empty and at most {limit}")
     waveform = np.asarray(waveform, dtype=np.float32)
     if not np.isfinite(waveform).all() or not np.any(waveform):
         raise ValueError("audio must remain finite and must not be silent")
     return waveform
+
+
+def _validate_audio_chunk(audio) -> np.ndarray:
+    if torch.is_tensor(audio):
+        if audio.device.type != "cpu" or not audio.is_floating_point():
+            raise ValueError("audio tensor must contain CPU floating-point samples")
+        audio = audio.detach().float().numpy()
+    waveform = np.asarray(audio)
+    if (waveform.ndim != 1 or waveform.dtype.kind != "f" or waveform.size == 0
+            or not np.isfinite(waveform).all()):
+        raise ValueError("audio chunk must be one non-empty finite floating-point waveform")
+    return np.asarray(waveform, dtype=np.float32)
+
+
+def _to_16khz(waveform: np.ndarray, sample_rate: int) -> np.ndarray:
+    return _resample(torch.from_numpy(waveform), sample_rate).numpy()
+
+
+def _speech_frames(samples: np.ndarray) -> np.ndarray:
+    frame_count = samples.size // _SILENCE_FRAME_SAMPLES
+    frames = samples[:frame_count * _SILENCE_FRAME_SAMPLES].reshape(
+        frame_count, _SILENCE_FRAME_SAMPLES
+    )
+    power = np.einsum("ij,ij->i", frames, frames, dtype=np.float64)
+    return power >= _SILENCE_RMS ** 2 * _SILENCE_FRAME_SAMPLES
+
+
+def _speech_state(waveform: np.ndarray, sample_rate: int) -> tuple[bool, int | None]:
+    samples = _to_16khz(waveform, sample_rate)
+    speech = _speech_frames(samples)
+    if speech.size:
+        has_speech = False
+        silence_run = 0
+        for index, active in enumerate(speech):
+            if active:
+                has_speech = True
+                silence_run = 0
+            elif has_speech:
+                silence_run += 1
+                if silence_run == _SILENCE_FRAMES:
+                    boundary_16k = (index + 1) * _SILENCE_FRAME_SAMPLES
+                    boundary = round(boundary_16k * sample_rate / 16000)
+                    return True, min(boundary, waveform.size)
+        return has_speech, None
+    rms = float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
+    return rms >= _SILENCE_RMS, None
+
+
+def _long_audio_segments(waveform: np.ndarray):
+    frame = _SILENCE_FRAME_SAMPLES
+    speech = _speech_frames(waveform)
+    start = 0
+    overlaps_previous = False
+    window = _STREAM_WINDOW_SECONDS * 16000
+    overlap = _STREAM_OVERLAP_SECONDS * 16000
+    while start < waveform.size:
+        frame_index = start // frame
+        if not overlaps_previous:
+            speech_index = frame_index
+            while speech_index < speech.size and not speech[speech_index]:
+                speech_index += 1
+            if speech_index >= speech.size:
+                break
+            first_speech = speech_index * frame
+            start = max(start, first_speech // 16000 * 16000)
+            frame_index = start // frame
+        limit = min(start + window, waveform.size)
+        silence_run = 0
+        has_speech = False
+        natural_end = None
+        for index in range(frame_index, min(speech.size, limit // frame)):
+            if speech[index]:
+                has_speech = True
+                silence_run = 0
+            elif has_speech:
+                silence_run += 1
+            if has_speech and silence_run == _SILENCE_FRAMES:
+                natural_end = (index + 1) * frame
+                break
+        if natural_end is not None:
+            yield waveform[start:natural_end], overlaps_previous
+            start = natural_end
+            overlaps_previous = False
+        elif limit < waveform.size:
+            yield waveform[start:limit], overlaps_previous
+            start = limit - overlap
+            overlaps_previous = True
+        else:
+            yield waveform[start:], overlaps_previous
+            break
+
+
+def _trim_token_overlap(existing: tuple[int, ...], incoming: tuple[int, ...]) -> tuple[int, ...]:
+    for count in range(min(len(existing), len(incoming)), 0, -1):
+        if existing[-count:] == incoming[:count]:
+            return incoming[count:]
+    return incoming
+
+
+def _aggregate_timings(rows: list[dict], total_ms: float) -> dict:
+    names = ("preprocess_ms", "encoder_ms", "cross_ms", "language_ms",
+             "prompt_ms", "decode_ms")
+    timing = {name: sum(row[name] for row in rows) for name in names}
+    timing["decode_step_ms"] = tuple(
+        value for row in rows for value in row["decode_step_ms"]
+    )
+    timing["total_ms"] = total_ms
+    return timing
 
 
 def _require_native_backend() -> None:
@@ -281,8 +408,12 @@ class WhisperASRModel:
         return model
 
     def transcribe(self, audio, *, sample_rate=16000, max_new_tokens=448) -> WhisperTranscription:
-        """Validate one waveform before any RPU access."""
-        waveform = _validate_audio(audio, sample_rate, max_new_tokens)
+        """Transcribe one finite waveform of at most 30 minutes."""
+        waveform = _validate_audio(
+            audio, sample_rate, max_new_tokens, max_seconds=_MAX_AUDIO_SECONDS
+        )
+        rate = operator.index(sample_rate)
+        count = operator.index(max_new_tokens)
         if not self._lock.acquire(blocking=False):
             raise RuntimeError("Whisper requests and close must be serial")
         try:
@@ -290,30 +421,113 @@ class WhisperASRModel:
                 raise RuntimeError("Whisper model is closed")
             with torch.inference_mode():
                 total_start = time.perf_counter()
-                started = total_start
-                mel = _log_mel_spectrogram(waveform, operator.index(sample_rate))
-                timing = {"preprocess_ms": (time.perf_counter() - started) * 1000}
-                started = time.perf_counter()
-                hidden = self._encoder.encode(
-                    mel
-                )
-                timing["encoder_ms"] = (time.perf_counter() - started) * 1000
-                started = time.perf_counter()
-                self._decoder.prepare_audio(hidden)
-                timing["cross_ms"] = (time.perf_counter() - started) * 1000
-                result = self._generate(operator.index(max_new_tokens), timing)
+                if waveform.size <= rate * 30:
+                    result, timing = self._run_one_locked(
+                        waveform, rate, count
+                    )
+                else:
+                    result, timing = self._run_long_locked(
+                        _to_16khz(waveform, rate), count, total_start
+                    )
                 timing["total_ms"] = (time.perf_counter() - total_start) * 1000
                 self._last_timing = timing
                 return result
         finally:
             self._lock.release()
 
-    def _generate(self, max_new_tokens: int, timing: dict) -> WhisperTranscription:
+    def create_stream(
+        self, *, sample_rate=16000, max_new_tokens=448
+    ) -> "WhisperASRStream":
+        """Create one host-side streaming session backed by this model."""
+        _validate_audio(
+            np.ones(1, dtype=np.float32), sample_rate, max_new_tokens,
+            max_seconds=_MAX_AUDIO_SECONDS,
+        )
+        if self._closed:
+            raise RuntimeError("Whisper model is closed")
+        return WhisperASRStream(
+            self, operator.index(sample_rate), operator.index(max_new_tokens)
+        )
+
+    def _run_one_locked(
+        self, waveform: np.ndarray, sample_rate: int, max_new_tokens: int,
+        language_index: int | None = None,
+    ) -> tuple[WhisperTranscription, dict]:
+        total_start = time.perf_counter()
+        started = total_start
+        mel = _log_mel_spectrogram(waveform, sample_rate)
+        timing = {"preprocess_ms": (time.perf_counter() - started) * 1000}
+        started = time.perf_counter()
+        hidden = self._encoder.encode(mel)
+        timing["encoder_ms"] = (time.perf_counter() - started) * 1000
+        started = time.perf_counter()
+        self._decoder.prepare_audio(hidden)
+        timing["cross_ms"] = (time.perf_counter() - started) * 1000
+        result = self._generate(max_new_tokens, timing, language_index)
+        timing["total_ms"] = (time.perf_counter() - total_start) * 1000
+        return result, timing
+
+    def _run_long_locked(
+        self, waveform: np.ndarray, max_new_tokens: int, total_start: float
+    ) -> tuple[WhisperTranscription, dict]:
+        tokens: tuple[int, ...] = ()
+        language_index = None
+        finish_reason = "eos"
+        timings = []
+        for segment, overlaps_previous in _long_audio_segments(waveform):
+            result, timing = self._run_one_locked(
+                segment, 16000, max_new_tokens, language_index
+            )
+            timings.append(timing)
+            incoming = result.token_ids
+            if overlaps_previous:
+                incoming = _trim_token_overlap(tokens, incoming)
+            tokens += incoming
+            if language_index is None:
+                language_index = _LANGUAGE_CODES.index(result.language)
+            if result.finish_reason == "length":
+                finish_reason = "length"
+        if language_index is None:
+            raise RuntimeError("Whisper long-form segmentation found no speech")
+        timing = _aggregate_timings(
+            timings, (time.perf_counter() - total_start) * 1000
+        )
+        return WhisperTranscription(
+            self._tokens.decode(tokens).strip(),
+            _LANGUAGE_CODES[language_index],
+            tokens,
+            finish_reason,
+        ), timing
+
+    def _transcribe_stream_segment(
+        self, waveform: np.ndarray, sample_rate: int, max_new_tokens: int,
+        language_index: int | None,
+    ) -> WhisperTranscription:
+        if not self._lock.acquire(blocking=False):
+            raise RuntimeError("Whisper requests and close must be serial")
+        try:
+            if self._closed:
+                raise RuntimeError("Whisper model is closed")
+            with torch.inference_mode():
+                result, timing = self._run_one_locked(
+                    waveform, sample_rate, max_new_tokens, language_index
+                )
+                self._last_timing = timing
+                return result
+        finally:
+            self._lock.release()
+
+    def _generate(
+        self, max_new_tokens: int, timing: dict, language_index: int | None = None
+    ) -> WhisperTranscription:
         started = time.perf_counter()
         language_logits = self._decoder.prefill(_SOT)[0, _SOT + 1:_TRANSLATE]
         if not torch.isfinite(language_logits).all():
             raise RuntimeError("Whisper language logits are not finite")
-        language_index = int(torch.argmax(language_logits))
+        if language_index is None:
+            language_index = int(torch.argmax(language_logits))
+        elif not 0 <= language_index < len(_LANGUAGE_CODES):
+            raise ValueError("Whisper language index is out of range")
         language_token = _SOT + 1 + language_index
         timing["language_ms"] = (time.perf_counter() - started) * 1000
         started = time.perf_counter()
@@ -399,3 +613,150 @@ class WhisperASRModel:
             self.close()
         except Exception:
             pass
+
+
+class WhisperASRStream:
+    """One bounded host-side streaming session for a resident Whisper model."""
+
+    def __init__(self, model: WhisperASRModel, sample_rate: int, max_new_tokens: int):
+        self._model = model
+        self._sample_rate = sample_rate
+        self._max_new_tokens = max_new_tokens
+        self._queued = np.empty(0, dtype=np.float32)
+        self._current = np.empty(0, dtype=np.float32)
+        self._confirmed_tokens: tuple[int, ...] = ()
+        self._language_index = None
+        self._received_samples = 0
+        self._processed_samples = 0
+        self._overlaps_previous = False
+        self._finished = False
+
+    def accept_audio(self, audio) -> tuple[WhisperStreamingTranscription, ...]:
+        self._require_active()
+        waveform = _validate_audio_chunk(audio)
+        limit = self._sample_rate * _MAX_AUDIO_SECONDS
+        if self._received_samples + waveform.size > limit:
+            raise ValueError("stream audio must be at most 30 minutes")
+        self._received_samples += waveform.size
+        self._queued = np.concatenate((self._queued, waveform))
+        updates = []
+        while self._queued.size >= self._sample_rate:
+            second = self._queued[:self._sample_rate]
+            self._queued = self._queued[self._sample_rate:].copy()
+            self._current = np.concatenate((self._current, second))
+            self._processed_samples += self._sample_rate
+            updates.append(self._update(self._processed_samples / self._sample_rate))
+        return tuple(updates)
+
+    def finish(self) -> WhisperStreamingTranscription:
+        self._require_active()
+        if self._queued.size:
+            self._current = np.concatenate((self._current, self._queued))
+            self._processed_samples += self._queued.size
+            self._queued = np.empty(0, dtype=np.float32)
+        has_speech, _ = (
+            _speech_state(self._current, self._sample_rate)
+            if self._current.size else (False, False)
+        )
+        while has_speech:
+            _, boundary = _speech_state(self._current, self._sample_rate)
+            segment = self._current if boundary is None else self._current[:boundary]
+            result = self._infer(segment)
+            incoming = self._deduplicate(result.token_ids)
+            self._confirmed_tokens += incoming
+            self._pin_language(result.language)
+            if boundary is None:
+                self._current = np.empty(0, dtype=np.float32)
+            else:
+                self._current = self._current[boundary:].copy()
+            self._overlaps_previous = False
+            has_speech, _ = (
+                _speech_state(self._current, self._sample_rate)
+                if self._current.size else (False, None)
+            )
+        self._current = np.empty(0, dtype=np.float32)
+        self._finished = True
+        return self._snapshot((), None, self._received_samples / self._sample_rate, True)
+
+    def _update(self, audio_seconds: float) -> WhisperStreamingTranscription:
+        has_speech, silence_boundary = _speech_state(
+            self._current, self._sample_rate
+        )
+        if not has_speech:
+            self._current = np.empty(0, dtype=np.float32)
+            return self._snapshot((), None, audio_seconds, False)
+
+        if silence_boundary is not None:
+            result = self._infer(self._current[:silence_boundary])
+            incoming = self._deduplicate(result.token_ids)
+            self._confirmed_tokens += incoming
+            self._pin_language(result.language)
+            self._current = self._current[silence_boundary:].copy()
+            self._overlaps_previous = False
+            remainder_has_speech, _ = (
+                _speech_state(self._current, self._sample_rate)
+                if self._current.size else (False, None)
+            )
+            if not remainder_has_speech:
+                self._current = np.empty(0, dtype=np.float32)
+                return self._snapshot((), None, audio_seconds, False)
+            result = self._infer(self._current)
+            return self._snapshot(
+                result.token_ids, result.language, audio_seconds, False
+            )
+
+        result = self._infer(self._current)
+        incoming = self._deduplicate(result.token_ids)
+        language = result.language
+        if self._current.size >= self._sample_rate * _STREAM_WINDOW_SECONDS:
+            self._confirmed_tokens += incoming
+            self._pin_language(language)
+            keep = self._sample_rate * _STREAM_OVERLAP_SECONDS
+            self._current = self._current[-keep:].copy()
+            self._overlaps_previous = True
+            incoming = ()
+        return self._snapshot(incoming, language, audio_seconds, False)
+
+    def _infer(self, waveform: np.ndarray) -> WhisperTranscription:
+        return self._model._transcribe_stream_segment(
+            waveform,
+            self._sample_rate,
+            self._max_new_tokens,
+            self._language_index,
+        )
+
+    def _deduplicate(self, tokens: tuple[int, ...]) -> tuple[int, ...]:
+        if self._overlaps_previous:
+            return _trim_token_overlap(self._confirmed_tokens, tokens)
+        return tokens
+
+    def _pin_language(self, language: str) -> None:
+        if self._language_index is None:
+            self._language_index = _LANGUAGE_CODES.index(language)
+
+    def _snapshot(
+        self, partial_tokens: tuple[int, ...], language: str | None,
+        audio_seconds: float, is_final: bool,
+    ) -> WhisperStreamingTranscription:
+        confirmed = self._model._tokens.decode(self._confirmed_tokens).strip()
+        combined = self._model._tokens.decode(
+            self._confirmed_tokens + partial_tokens
+        ).strip()
+        if combined.startswith(confirmed):
+            partial = combined[len(confirmed):]
+        else:
+            value = self._model._tokens.decode(partial_tokens).strip()
+            partial = (" " if confirmed and value else "") + value
+        current_language = (
+            _LANGUAGE_CODES[self._language_index]
+            if self._language_index is not None else language
+        )
+        return WhisperStreamingTranscription(
+            confirmed, partial, current_language, audio_seconds, is_final
+        )
+
+    def _require_active(self) -> None:
+        if self._finished:
+            raise RuntimeError("Whisper stream is already finished")
+        if self._model._closed:
+            raise RuntimeError("Whisper model is closed")

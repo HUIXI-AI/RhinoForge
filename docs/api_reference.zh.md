@@ -436,11 +436,14 @@ from rpu_backend.api import Qwen3ASRModel, Qwen3TTSModel, WhisperASRModel
 | `Qwen3ASRModel.from_pretrained(checkpoint, dtype=torch.float16)` | 本地固定 Qwen3-ASR-0.6B checkpoint |
 | `model.transcribe(audio, sample_rate=16000, max_new_tokens=64)` | 一维 CPU 有限浮点波形，单声道 16 kHz、0.5–8 秒；生成上限 1–64。返回 `ASRTranscription(text, raw_text, token_ids)` |
 | `WhisperASRModel.from_pretrained(checkpoint, dtype=torch.float16)` | 本地固定 `sherpa-onnx-whisper-base` checkpoint，含 encoder、decoder 和 token 表 |
-| `model.transcribe(audio, sample_rate=16000, max_new_tokens=448)` | 一维 CPU 有限非静音浮点波形，最长 30 秒；自动重采样和识别语言。返回 `WhisperTranscription(text, language, token_ids, finish_reason)`；448 位置上下文含 4 个 prompt token，内容最多 444 token |
+| `model.transcribe(audio, sample_rate=16000, max_new_tokens=448)` | 一维 CPU 有限非静音浮点波形，最长 30 分钟；自动重采样、切分长音频和识别语言。返回 `WhisperTranscription(text, language, token_ids, finish_reason)`；每段最多 444 个内容 token |
+| `model.create_stream(sample_rate=16000, max_new_tokens=448)` | 创建最长 30 分钟的流式会话。`accept_audio(chunk)` 每形成完整 1 秒音频返回一项不可变更新，`finish()` 确认尾部；更新包含已确认/临时文字、语言、音频时长和结束状态 |
 | `Qwen3TTSModel.from_pretrained(checkpoint, source=prepared_package, dtype=torch.float16, codec_backend="rpu")` | 本地固定 Qwen3-TTS-12Hz-0.6B-Base checkpoint 和准备后的 `qwen_tts/` 源码目录 |
 | `model.synthesize(text, reference_audio=local_file, language="Chinese", max_new_tokens=256)` | 文本 1–1024 字符；语言 `Chinese` / `English`；参考音频为有限、非全零的单声道 24 kHz、0.5–20 秒；每段生成上限 2–256。返回独立 float32 单声道波形及采样率 24000 |
 
-ASR 使用 greedy，不提供 context、时间戳或流式接口。TTS 使用非流式 speaker
+Qwen3 ASR 使用 greedy，不提供 context、时间戳或流式接口。Whisper 使用 greedy，
+不提供时间戳；流式入口在低于 -40 dBFS 达到 1 秒后确认，连续语音使用 28 秒窗口和
+2 秒精确 token 重叠。TTS 使用非流式 speaker
 embedding 克隆，按固定 checkpoint 配置采样：top-k 50、temperature 0.9、top-p 1.0。
 在加载后、请求前调用 `torch.manual_seed`，可在同一执行配置下复现采样。每段 Talker
 prompt 加生成上限须在 512 个位置内；达到上限仍无 EOS 时，在波形解码前报错。

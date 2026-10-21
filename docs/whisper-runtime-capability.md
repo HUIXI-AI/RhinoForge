@@ -34,5 +34,17 @@ Conv1d 0.999996781，均通过 0.9999 门槛。
 A/B 输入刷新测试失败。因此 Whisper encoder 不复用该 Graph 封装，必须由独立
 native owner 管理持久 buffer、输入 DMA、执行和释放，并增加 A/B/A 刷新回归测试。
 
+2026-10-21 又在 R1 检查了复用 DINO encoder owner 的可能性。Whisper 的
+`6×H512×8-head×1500-token` 几何可以生成完整 native descriptor，但普通和
+16-bit attention 路径都会被同一条 SDPA 同步约束拒绝：`grid_dim_x=12` 既不
+小于等于 8，也不是 8 的倍数。不能通过补齐音频 token 规避，因为无 mask 的
+额外 K/V 会改变 softmax。专用 owner 应保持完整 1500 行 K/V，并将 query 切成
+满足同步约束的小块；已有 `Q≤3,K=1500` 探针证明长 K/V 路径可用，完整实现仍需
+做 `Q` 分块后的端到端数值验证。
+
+固定同一个输入 tensor 再原位更新也不能修复通用 Conv1d Graph：其内部布局
+转换产生的缓冲仍保留首轮内容。专用卷积前端必须直接管理布局后的稳定输入缓冲，
+并在每次 REPLAY 前显式 DMA 新内容，不能只固定 Python tensor 地址。
+
 R1 的 `/mnt/ssd_data` 当前已满。临时真机产物应写入 `/dev/shm`，不得清理或覆盖
 其他用户数据。

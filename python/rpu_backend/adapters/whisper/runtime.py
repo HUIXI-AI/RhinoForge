@@ -1,4 +1,4 @@
-"""Resident RPU runtime for the frozen Whisper base encoder."""
+"""Resident RPU runtime for the frozen Whisper base encoder and decoder."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from rpu_backend.runtime.decoder import plan_bounded_prefill_execution
 from rpu_backend.runtime.execution_planner import GRAPH_RETAINED_CACHE
 from rpu_backend.runtime.weights import transform_linear_weight
 
-from .weights import load_encoder_weights
+from .weights import load_decoder_weights, load_encoder_weights
 
 
 _LAYERS = 6
@@ -25,6 +25,9 @@ _INTERMEDIATE = 2048
 _HEADS = 8
 _HEAD_DIM = 64
 _ENCODER_TOKENS = 1500
+_TEXT_TOKENS = 448
+_VOCAB = 51865
+_PADDED_VOCAB = 51968
 
 
 @dataclass(frozen=True)
@@ -39,6 +42,15 @@ class _PreparedEncoder:
 class _EncoderPlan:
     descriptor: list[int]
     signature: object
+
+
+@dataclass(frozen=True)
+class _PreparedDecoder:
+    weight_args: tuple
+    cross_args: tuple
+    io_args: tuple
+    token_embedding: torch.Tensor
+    keepalive: tuple
 
 
 def _device(array) -> torch.Tensor:
@@ -87,6 +99,44 @@ def _prepare_encoder_tensors(weights: dict[str, object]) -> _PreparedEncoder:
         final_args=final_args,
         frontend_args=frontend_args,
         keepalive=(weight_args, final_args, frontend_args),
+    )
+
+
+def _prepare_decoder_tensors(
+    encoder_weights: dict[str, object], decoder_weights: dict[str, object]
+) -> _PreparedDecoder:
+    layers = decoder_weights["layers"]
+    weight_args = tuple(
+        [[_swizzle(layer[name], partition) for layer in layers]
+         for name, partition in (
+             ("sq_w", 1), ("sk_w", 1), ("sv_w", 1), ("so_w", 0),
+             ("cq_w", 1), ("co_w", 0), ("ff1_w", 1), ("ff2_w", 0),
+         )]
+        + [[_device(layer[name]) for layer in layers]
+           for name in (
+               "n1_w", "n1_b", "n2_w", "n2_b", "n3_w", "n3_b",
+               "sq_b", "sv_b", "so_b", "cq_b", "co_b", "ff1_b", "ff2_b",
+           )]
+    )
+    cross_layers = encoder_weights["cross_layers"]
+    cross_args = (
+        [_swizzle(layer["k_w"], 1) for layer in cross_layers],
+        [_swizzle(layer["v_w"], 1) for layer in cross_layers],
+        [_device(layer["v_b"]) for layer in cross_layers],
+    )
+    token_embedding = _device(decoder_weights["token_embedding"])
+    padded_head = np.pad(
+        decoder_weights["token_embedding"], ((0, _PADDED_VOCAB - _VOCAB), (0, 0))
+    )
+    io_args = (
+        _device(decoder_weights["position"]),
+        _device(decoder_weights["final_w"]),
+        _device(decoder_weights["final_b"]),
+        _swizzle(padded_head, 1),
+    )
+    return _PreparedDecoder(
+        weight_args, cross_args, io_args, token_embedding,
+        (weight_args, cross_args, io_args, token_embedding),
     )
 
 
@@ -226,3 +276,178 @@ class WhisperEncoderRuntime:
         self._closed = True
         self._resource = None
         self._cache = self._staging = self._graph = self._plan = None
+
+
+def _make_decoder_cache(max_seq_len: int) -> RPUCache:
+    return RPUCache(
+        _LAYERS, 1, max_seq_len, _HEADS, _HEAD_DIM,
+        dtype=torch.float16, attn_tp=8,
+    )
+
+
+def _make_decoder_staging():
+    return (
+        torch.empty((1, _ENCODER_TOKENS, _HIDDEN),
+                    dtype=torch.float16, device="rpu"),
+        [torch.empty(1, dtype=torch.int32, device="rpu") for _ in range(2)],
+        [torch.empty((1, 1, _HIDDEN), dtype=torch.float16, device="rpu")
+         for _ in range(2)],
+        [torch.empty((1, _PADDED_VOCAB), dtype=torch.float16, device="rpu")
+         for _ in range(2)],
+    )
+
+
+class WhisperDecoderRuntime:
+    """Own the six-layer decoder, both KV banks and fixed Graph addresses."""
+
+    def __init__(self, encoder_path: str | Path, decoder_path: str | Path):
+        self._handle = None
+        self._resource = None
+        self._closed = True
+        prepared = _prepare_decoder_tensors(
+            load_encoder_weights(encoder_path), load_decoder_weights(decoder_path)
+        )
+        self_cache = _make_decoder_cache(_TEXT_TOKENS)
+        cross_cache = _make_decoder_cache(1536)
+        cross_staging, ids, hidden, outputs = _make_decoder_staging()
+        graphs = tuple(rpu_backend.graph.GraphCache(max_entries=1) for _ in range(3))
+        try:
+            handle = torch.ops.rpu.whisper_decoder_create()
+        except BaseException:
+            for graph in graphs:
+                graph.clear()
+            raise
+        self._handle = handle
+        resource = _InstalledNativeResource(
+            self, handle, torch.ops.rpu.whisper_decoder_destroy,
+            graphs=graphs,
+            keepalive=(prepared.keepalive, self_cache, cross_cache, cross_staging,
+                       ids, hidden, outputs),
+            label="Whisper decoder", handle_name="_handle",
+        )
+        self._resource = resource
+        try:
+            torch.ops.rpu.whisper_decoder_set_weights(handle, *prepared.weight_args)
+            torch.ops.rpu.whisper_decoder_set_cross_weights(handle, *prepared.cross_args)
+            torch.ops.rpu.whisper_decoder_set_io(handle, *prepared.io_args)
+        except BaseException as error:
+            resource.cleanup_failure(error, prepared, self_cache, cross_cache)
+            raise
+        self._token_embedding = prepared.token_embedding
+        self._self_cache = self_cache
+        self._cross_cache = cross_cache
+        self._cross_staging = cross_staging
+        self._ids = ids
+        self._hidden = hidden
+        self._outputs = outputs
+        self._cross_graph, self._prefill_graph, self._decode_graph = graphs
+        self._position = 0
+        self._prepared = False
+        self._closed = False
+
+    def prepare_audio(self, encoder_hidden: torch.Tensor) -> None:
+        if self._closed:
+            raise RuntimeError("Whisper decoder is closed")
+        if (not isinstance(encoder_hidden, torch.Tensor)
+                or encoder_hidden.device.type != "rpu"
+                or encoder_hidden.dtype is not torch.float16
+                or tuple(encoder_hidden.shape) != (1, _ENCODER_TOKENS, _HIDDEN)):
+            raise ValueError(
+                "Whisper decoder requires one RPU FP16 encoder tensor [1, 1500, 512]"
+            )
+        self._self_cache.reset()
+        self._cross_cache.reset()
+        self._cross_staging.copy_(encoder_hidden)
+        torch.ops.rpu.whisper_decoder_reset(self._handle, 0)
+        signature = rpu_backend.graph.GraphSignature(
+            op_id="whisper_decoder_cross", shapes=[1, _ENCODER_TOKENS, _HIDDEN],
+            dyn_dims=[_LAYERS], dtypes=[torch.float16],
+        )
+        try:
+            with self._cross_graph.capture(signature):
+                torch.ops.rpu.whisper_decoder_prepare_cross(
+                    self._handle, self._cross_staging,
+                    list(self._cross_cache.k_caches),
+                    list(self._cross_cache.v_caches),
+                )
+        finally:
+            torch.ops.rpu.spm_alloc_reset_temporary()
+        if not self._cross_graph.is_frozen():
+            self._cross_graph.freeze()
+        self._position = 0
+        self._prepared = True
+
+    def _embed(self, token_id: int, slot: int) -> torch.Tensor:
+        if isinstance(token_id, bool) or not isinstance(token_id, int):
+            raise TypeError("Whisper token_id must be an integer")
+        if not 0 <= token_id < _VOCAB:
+            raise ValueError(f"Whisper token_id must be in [0, {_VOCAB})")
+        self._ids[slot].copy_(torch.tensor([token_id], dtype=torch.int32))
+        gathered = torch.ops.rpu.gather_embedding(
+            self._token_embedding, self._ids[slot]
+        )
+        self._hidden[slot].copy_(gathered.reshape(1, 1, _HIDDEN))
+        return self._hidden[slot]
+
+    @torch.no_grad()
+    def prefill(self, token_id: int) -> torch.Tensor:
+        if self._closed:
+            raise RuntimeError("Whisper decoder is closed")
+        if not self._prepared or self._position != 0:
+            raise RuntimeError("Whisper decoder requires freshly prepared audio")
+        return self._forward(token_id, prefill=True)
+
+    @torch.no_grad()
+    def decode(self, token_id: int) -> torch.Tensor:
+        if self._closed:
+            raise RuntimeError("Whisper decoder is closed")
+        if not self._prepared or self._position == 0:
+            raise RuntimeError("Whisper decoder requires prefill before decode")
+        if self._position >= _TEXT_TOKENS:
+            raise RuntimeError("Whisper decoder reached the 448-token limit")
+        return self._forward(token_id, prefill=False)
+
+    def _forward(self, token_id: int, *, prefill: bool) -> torch.Tensor:
+        slot = 0 if prefill else 1
+        hidden = self._embed(token_id, slot)
+        graph = self._prefill_graph if prefill else self._decode_graph
+        output = self._outputs[slot]
+        signature = rpu_backend.graph.GraphSignature(
+            op_id="whisper_decoder_prefill" if prefill else "whisper_decoder_decode",
+            shapes=[1, 1, _HIDDEN], dyn_dims=[_LAYERS], dtypes=[torch.float16],
+        )
+        try:
+            with graph.capture(signature):
+                if prefill:
+                    torch.ops.rpu.whisper_decoder_prefill_logits(
+                        self._handle, hidden, output,
+                        list(self._self_cache.k_caches),
+                        list(self._self_cache.v_caches),
+                        list(self._cross_cache.k_caches),
+                        list(self._cross_cache.v_caches),
+                    )
+                else:
+                    torch.ops.rpu.whisper_decoder_decode_logits(
+                        self._handle, hidden, output,
+                        list(self._self_cache.k_caches),
+                        list(self._self_cache.v_caches),
+                        list(self._cross_cache.k_caches),
+                        list(self._cross_cache.v_caches), self._position,
+                    )
+        finally:
+            torch.ops.rpu.spm_alloc_reset_temporary()
+        if not graph.is_frozen():
+            graph.freeze()
+        self._position += 1
+        self._self_cache.update_position(1)
+        return output.cpu()[:, :_VOCAB].clone()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._resource.retire()
+        self._closed = True
+        self._resource = None
+        self._token_embedding = self._self_cache = self._cross_cache = None
+        self._cross_staging = self._ids = self._hidden = self._outputs = None
+        self._cross_graph = self._prefill_graph = self._decode_graph = None

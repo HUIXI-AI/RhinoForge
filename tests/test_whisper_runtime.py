@@ -68,6 +68,31 @@ def test_decoder_weight_map_matches_frozen_layer_names(monkeypatch):
     assert loaded["layers"][0]["ff2_w"].shape == (512, 2048)
 
 
+def test_full_decoder_weight_map_includes_tied_io_and_encoder_cross_kv(monkeypatch):
+    from rpu_backend.adapters.whisper import weights
+
+    requests = []
+
+    def load(_path, expected):
+        requests.append(expected)
+        return {
+            name: np.broadcast_to(np.float32(0), shape)
+            for name, shape in expected.items()
+        }
+
+    monkeypatch.setattr(weights, "load_float_initializers", load)
+    encoder = weights.load_encoder_weights("encoder.onnx")
+    decoder = weights.load_decoder_weights("decoder.onnx")
+
+    assert requests[0]["onnx::MatMul_1363"] == (512, 512)
+    assert requests[0]["onnx::Add_1390"] == (512,)
+    assert encoder["cross_layers"][5]["v_w"].shape == (512, 512)
+    assert requests[1]["textDecoder.token_embedding.weight"] == (51865, 512)
+    assert requests[1]["textDecoder.positional_embedding"] == (448, 512)
+    assert decoder["token_embedding"].shape == (51865, 512)
+    assert decoder["final_w"].shape == (512,)
+
+
 class _Graph:
     def __init__(self, calls):
         self.calls = calls
@@ -211,3 +236,79 @@ def test_encoder_partial_install_failure_cleans_graph_and_handle(monkeypatch):
 
     assert sum(call[0] == "destroy" for call in calls) == 1
     assert sum(call[0] == "clear" for call in calls) == 1
+
+
+def _install_decoder_mocks(monkeypatch, *, fail_cross=False):
+    from rpu_backend.adapters.whisper import runtime
+
+    calls = []
+    prepared = SimpleNamespace(
+        weight_args=("layers",), cross_args=("cross",), io_args=("io",),
+        token_embedding=torch.ones(1), keepalive=("keepalive",),
+    )
+    monkeypatch.setattr(runtime, "load_encoder_weights", lambda path: {})
+    monkeypatch.setattr(runtime, "load_decoder_weights", lambda path: {})
+    monkeypatch.setattr(runtime, "_prepare_decoder_tensors", lambda *args: prepared)
+    monkeypatch.setattr(runtime, "_make_decoder_cache", lambda length: _Cache())
+    monkeypatch.setattr(
+        runtime, "_make_decoder_staging",
+        lambda: (torch.empty(1), [torch.empty(1), torch.empty(1)],
+                 [torch.empty(1), torch.empty(1)],
+                 [torch.empty(1), torch.empty(1)]),
+    )
+    monkeypatch.setattr(
+        runtime.rpu_backend.graph, "GraphCache",
+        lambda max_entries=1: _Graph(calls),
+    )
+    monkeypatch.setattr(
+        torch.ops.rpu, "whisper_decoder_create",
+        lambda: calls.append(("create",)) or 23, raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops.rpu, "whisper_decoder_destroy",
+        lambda handle: calls.append(("destroy", handle)), raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops.rpu, "whisper_decoder_set_weights",
+        lambda handle, *args: calls.append(("weights", handle, args)), raising=False,
+    )
+
+    def set_cross(handle, *args):
+        calls.append(("cross", handle, args))
+        if fail_cross:
+            raise RuntimeError("cross failed")
+
+    monkeypatch.setattr(
+        torch.ops.rpu, "whisper_decoder_set_cross_weights",
+        set_cross, raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops.rpu, "whisper_decoder_set_io",
+        lambda handle, *args: calls.append(("io", handle, args)), raising=False,
+    )
+    return runtime, calls
+
+
+def test_decoder_install_and_idempotent_close(monkeypatch):
+    runtime, calls = _install_decoder_mocks(monkeypatch)
+
+    decoder = runtime.WhisperDecoderRuntime("encoder.onnx", "decoder.onnx")
+    decoder.close()
+    decoder.close()
+
+    assert sum(call[0] == "create" for call in calls) == 1
+    assert sum(call[0] == "weights" for call in calls) == 1
+    assert sum(call[0] == "cross" for call in calls) == 1
+    assert sum(call[0] == "io" for call in calls) == 1
+    assert sum(call[0] == "destroy" for call in calls) == 1
+    assert sum(call[0] == "clear" for call in calls) == 3
+
+
+def test_decoder_partial_install_failure_cleans_graphs_and_handle(monkeypatch):
+    runtime, calls = _install_decoder_mocks(monkeypatch, fail_cross=True)
+
+    with pytest.raises(RuntimeError, match="cross failed"):
+        runtime.WhisperDecoderRuntime("encoder.onnx", "decoder.onnx")
+
+    assert sum(call[0] == "destroy" for call in calls) == 1
+    assert sum(call[0] == "clear" for call in calls) == 3

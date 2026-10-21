@@ -25,6 +25,8 @@ constexpr int64_t WHISPER_DECODER_HEADS = 8;
 constexpr int64_t WHISPER_DECODER_HEAD_DIM = 64;
 constexpr int64_t WHISPER_DECODER_CROSS_TOKENS = 1500;
 constexpr int64_t WHISPER_DECODER_TEXT_TOKENS = 448;
+constexpr int64_t WHISPER_DECODER_VOCAB = 51865;
+constexpr int64_t WHISPER_DECODER_PADDED_VOCAB = 51968;
 constexpr int64_t WHISPER_DECODER_CORES = 8;
 constexpr int64_t WHISPER_DECODER_DWIDTH = 2;
 constexpr double WHISPER_DECODER_EPS = 1e-5;
@@ -66,6 +68,10 @@ public:
         at::Tensor sq_b, sv_b, so_b, cq_b, co_b, ff1_b, ff2_b;
     };
 
+    struct CrossLayer {
+        at::Tensor k_w, v_w, v_b;
+    };
+
     void set_weights(
         at::TensorList sq_w, at::TensorList sk_w,
         at::TensorList sv_w, at::TensorList so_w,
@@ -81,8 +87,8 @@ public:
         TORCH_CHECK(layers_.empty(),
                     "Whisper decoder weights may be installed only once");
         const int64_t count = static_cast<int64_t>(sq_w.size());
-        TORCH_CHECK(count == 1,
-                    "Whisper decoder layer probe requires exactly one layer");
+        TORCH_CHECK(count == 1 || count == 6,
+                    "Whisper decoder requires one probe layer or all six layers");
         auto same_count = [count](at::TensorList values, const char* name) {
             TORCH_CHECK(static_cast<int64_t>(values.size()) == count,
                         "Whisper decoder ", name, " must contain ", count,
@@ -130,10 +136,73 @@ public:
         }
     }
 
+    void set_cross_weights(
+        at::TensorList k_w, at::TensorList v_w, at::TensorList v_b) {
+        TORCH_CHECK(cross_layers_.empty(),
+                    "Whisper decoder cross weights may be installed only once");
+        TORCH_CHECK(k_w.size() == 6 && v_w.size() == 6 && v_b.size() == 6,
+                    "Whisper decoder cross weights require six layers");
+        for (int64_t i = 0; i < 6; ++i) {
+            check_device_half(k_w[i], {WHISPER_DECODER_HIDDEN,
+                                       WHISPER_DECODER_HIDDEN}, "cross_k_w");
+            check_device_half(v_w[i], {WHISPER_DECODER_HIDDEN,
+                                       WHISPER_DECODER_HIDDEN}, "cross_v_w");
+            check_device_half(v_b[i], {WHISPER_DECODER_HIDDEN}, "cross_v_b");
+            cross_layers_.push_back({k_w[i], v_w[i], v_b[i]});
+        }
+    }
+
+    void set_io(
+        const at::Tensor& position, const at::Tensor& final_w,
+        const at::Tensor& final_b, const at::Tensor& lm_head) {
+        TORCH_CHECK(!position_.defined(),
+                    "Whisper decoder IO weights may be installed only once");
+        check_device_half(position, {WHISPER_DECODER_TEXT_TOKENS,
+                                     WHISPER_DECODER_HIDDEN}, "position");
+        check_device_half(final_w, {WHISPER_DECODER_HIDDEN}, "final_w");
+        check_device_half(final_b, {WHISPER_DECODER_HIDDEN}, "final_b");
+        check_device_half(lm_head, {WHISPER_DECODER_PADDED_VOCAB,
+                                    WHISPER_DECODER_HIDDEN}, "lm_head");
+        position_ = position;
+        final_w_ = final_w;
+        final_b_ = final_b;
+        lm_head_ = lm_head;
+    }
+
     void reset(int64_t position) {
         TORCH_CHECK(position == 0,
                     "Whisper decoder reset position must be zero");
         expected_position_ = 0;
+        cross_ready_ = false;
+    }
+
+    void prepare_cross(
+        const at::Tensor& encoder_hidden,
+        at::TensorList cross_k, at::TensorList cross_v) {
+        TORCH_CHECK(layers_.size() == 6 && cross_layers_.size() == 6,
+                    "Whisper decoder cross preparation requires six layers");
+        check_device_half(encoder_hidden,
+                          {1, WHISPER_DECODER_CROSS_TOKENS,
+                           WHISPER_DECODER_HIDDEN}, "encoder_hidden");
+        TORCH_CHECK(cross_k.size() == 6 && cross_v.size() == 6,
+                    "Whisper decoder cross caches require six layers");
+        std::vector<const void*> live;
+        for (const auto& list : {cross_k, cross_v}) {
+            for (const auto& cache : list) {
+                check_cache(cache, 94, "cross_cache");
+                live.push_back(cache.data_ptr());
+            }
+        }
+        TORCH_CHECK(cross_input_ptr_ == nullptr ||
+                        cross_input_ptr_ == encoder_hidden.data_ptr(),
+                    "Whisper decoder Graph requires its retained encoder staging tensor");
+        TORCH_CHECK(cross_cache_ptrs_.empty() || cross_cache_ptrs_ == live,
+                    "Whisper decoder cross caches changed after Graph capture");
+        cross_input_ptr_ = encoder_hidden.data_ptr();
+        if (cross_cache_ptrs_.empty()) cross_cache_ptrs_ = std::move(live);
+        rpu_ddr_flush_force(encoder_hidden.data_ptr());
+        run_cross(encoder_hidden, cross_k, cross_v);
+        cross_ready_ = true;
     }
 
     at::Tensor forward(
@@ -141,20 +210,47 @@ public:
         at::TensorList self_k, at::TensorList self_v,
         at::TensorList cross_k, at::TensorList cross_v,
         int64_t position, bool prefill) {
+        return forward_impl(hidden, output, self_k, self_v, cross_k, cross_v,
+                            position, prefill, false);
+    }
+
+    at::Tensor forward_logits(
+        const at::Tensor& hidden, const at::Tensor& output,
+        at::TensorList self_k, at::TensorList self_v,
+        at::TensorList cross_k, at::TensorList cross_v,
+        int64_t position, bool prefill) {
+        TORCH_CHECK(layers_.size() == 6 && position_.defined() &&
+                        final_w_.defined() && lm_head_.defined(),
+                    "Whisper decoder logits path requires all six layers and IO weights");
+        TORCH_CHECK(cross_ready_,
+                    "Whisper decoder cross caches must be prepared for this audio");
+        check_device_half(output, {1, WHISPER_DECODER_PADDED_VOCAB}, "logits");
+        return forward_impl(hidden, output, self_k, self_v, cross_k, cross_v,
+                            position, prefill, true);
+    }
+
+private:
+    at::Tensor forward_impl(
+        const at::Tensor& hidden, const at::Tensor& output,
+        at::TensorList self_k, at::TensorList self_v,
+        at::TensorList cross_k, at::TensorList cross_v,
+        int64_t position, bool prefill, bool logits) {
         TORCH_CHECK(!layers_.empty(), "Whisper decoder weights are not installed");
         TORCH_CHECK(hidden.dim() == 3,
                     "Whisper decoder hidden must be [1, seq, 512]");
         const int64_t seq = hidden.size(1);
         check_device_half(hidden, {1, seq, WHISPER_DECODER_HIDDEN}, "hidden");
-        check_device_half(output, {1, seq, WHISPER_DECODER_HIDDEN}, "output");
+        if (!logits) {
+            check_device_half(output, {1, seq, WHISPER_DECODER_HIDDEN}, "output");
+        }
         TORCH_CHECK(seq > 0 && position >= 0 &&
                         position + seq <= WHISPER_DECODER_TEXT_TOKENS,
                     "Whisper decoder position range exceeds 448 tokens");
         TORCH_CHECK(position == expected_position_,
                     "Whisper decoder position must append exactly at ",
                     expected_position_, ", got ", position);
-        TORCH_CHECK(prefill ? position == 0 && seq > 1 : seq == 1,
-                    prefill ? "Whisper decoder prefill requires position 0 and seq > 1"
+        TORCH_CHECK(prefill ? position == 0 : seq == 1,
+                    prefill ? "Whisper decoder prefill requires position 0"
                             : "Whisper decoder decode requires one token");
         TORCH_CHECK(self_k.size() == layers_.size() &&
                         self_v.size() == layers_.size() &&
@@ -168,12 +264,11 @@ public:
             check_cache(cross_v[i], 94, "cross_v");
         }
         bind_addresses(hidden, output, self_k, self_v, cross_k, cross_v, prefill);
-        run(hidden, output, self_k, self_v, cross_k, cross_v, position, seq);
+        run(hidden, output, self_k, self_v, cross_k, cross_v,
+            position, seq, logits);
         expected_position_ += seq;
         return output;
     }
-
-private:
     void bind_addresses(
         const at::Tensor& hidden, const at::Tensor& output,
         at::TensorList self_k, at::TensorList self_v,
@@ -199,7 +294,7 @@ private:
         const at::Tensor& hidden, const at::Tensor& output,
         at::TensorList self_k, at::TensorList self_v,
         at::TensorList cross_k, at::TensorList cross_v,
-        int64_t position, int64_t seq) {
+        int64_t position, int64_t seq, bool logits) {
         if (!SPM_ALLOC.is_initialized()) SPM_ALLOC.init();
         SpmAllocator::ScopedTemporary temporary;
         auto alloc = [](size_t bytes) {
@@ -224,12 +319,22 @@ private:
         const uint32_t col_bias = alloc(aligned_bytes(
             WHISPER_DECODER_INTERMEDIATE / WHISPER_DECODER_CORES));
         const uint32_t row_bias = alloc(aligned_bytes(WHISPER_DECODER_HIDDEN));
+        const uint32_t lm_logits = logits ? alloc(aligned_bytes(
+            WHISPER_DECODER_PADDED_VOCAB / WHISPER_DECODER_CORES)) : 0;
         auto address = [](uint32_t offset) { return SPM_ALLOC.addr(0, offset); };
         rpu_launch_ddr_broadcast_spm_dma(
             hidden, 0, full, address(residual_a), WHISPER_DECODER_CORES);
 
         uint32_t current = residual_a;
         uint32_t alternate = residual_b;
+        if (logits) {
+            rpu_launch_ddr_broadcast_spm_dma(
+                position_, position * WHISPER_DECODER_HIDDEN, full,
+                address(normalized), WHISPER_DECODER_CORES);
+            rpu_launch_eltwise_binary_spm_kernel(
+                address(current), address(normalized), address(current), full,
+                ValuOpType::ADD, c10::Half(1.0f), WHISPER_DECODER_CORES);
+        }
         const int64_t kv_len = position + seq;
         const double scale = 1.0 / std::sqrt(
             static_cast<double>(WHISPER_DECODER_HEAD_DIM));
@@ -299,8 +404,73 @@ private:
             current = alternate;
             alternate = current == residual_a ? residual_b : residual_a;
         }
-        rpu_launch_spm_copy_ddr_dma(
-            address(current), output.data_ptr<c10::Half>(), full);
+        if (!logits) {
+            rpu_launch_spm_copy_ddr_dma(
+                address(current), output.data_ptr<c10::Half>(), full);
+            return;
+        }
+        layer_norm(current, normalized, norm_w, norm_b,
+                   final_w_, final_b_, seq);
+        rpu_launch_linear_spm_to_spm_acc16_kernel(
+            address(normalized) + static_cast<uint32_t>(
+                (seq - 1) * WHISPER_DECODER_HIDDEN * WHISPER_DECODER_DWIDTH),
+            lm_head_, address(lm_logits), 1, WHISPER_DECODER_PADDED_VOCAB,
+            WHISPER_DECODER_HIDDEN, 1, WHISPER_DECODER_CORES, 0);
+        const int64_t local_vocab =
+            WHISPER_DECODER_PADDED_VOCAB / WHISPER_DECODER_CORES;
+        rpu_launch_spm_scatter_ddr_dma(
+            address(lm_logits), output, 0, local_vocab,
+            local_vocab * WHISPER_DECODER_DWIDTH, WHISPER_DECODER_CORES);
+    }
+
+    void run_cross(
+        const at::Tensor& encoder_hidden,
+        at::TensorList cross_k, at::TensorList cross_v) {
+        if (!SPM_ALLOC.is_initialized()) SPM_ALLOC.init();
+        SpmAllocator::ScopedTemporary temporary;
+        auto alloc = [](size_t bytes) {
+            return SPM_ALLOC.alloc_temporary((bytes + 255) / 256 * 256);
+        };
+        constexpr int64_t chunk_limit = 256;
+        const uint32_t input = alloc(aligned_bytes(
+            chunk_limit * WHISPER_DECODER_HIDDEN));
+        const uint32_t k = alloc(aligned_bytes(
+            chunk_limit * WHISPER_DECODER_HEAD_DIM));
+        const uint32_t v = alloc(aligned_bytes(
+            chunk_limit * WHISPER_DECODER_HEAD_DIM));
+        const uint32_t bias = alloc(aligned_bytes(
+            WHISPER_DECODER_HIDDEN / WHISPER_DECODER_CORES));
+        auto address = [](uint32_t offset) { return SPM_ALLOC.addr(0, offset); };
+        for (int64_t layer = 0; layer < 6; ++layer) {
+            const CrossLayer& weights = cross_layers_[layer];
+            for (int64_t position = 0;
+                 position < WHISPER_DECODER_CROSS_TOKENS;
+                 position += chunk_limit) {
+                const int64_t seq = std::min(
+                    chunk_limit, WHISPER_DECODER_CROSS_TOKENS - position);
+                rpu_launch_ddr_broadcast_spm_dma(
+                    encoder_hidden, position * WHISPER_DECODER_HIDDEN,
+                    seq * WHISPER_DECODER_HIDDEN, address(input),
+                    WHISPER_DECODER_CORES);
+                zero_col_projection(
+                    input, k, bias, weights.k_w, seq,
+                    WHISPER_DECODER_HIDDEN);
+                col_projection(
+                    input, v, bias, weights.v_w, weights.v_b, seq,
+                    WHISPER_DECODER_HIDDEN);
+                const KvInsertSegmentPlan plan =
+                    rpu_resolve_kvinsert_segment_plan(
+                        position, seq, seq, WHISPER_DECODER_CORES,
+                        WHISPER_DECODER_HEADS, WHISPER_DECODER_HEAD_DIM,
+                        WHISPER_DECODER_KV_CAPABILITIES, KvInsertRoute::V2);
+                auto ck = cross_k[layer];
+                auto cv = cross_v[layer];
+                rpu_launch_insert_kvcache_spm_unified_with_plan(
+                    ck, cv, k, v,
+                    WHISPER_DECODER_HEADS, WHISPER_DECODER_HEAD_DIM,
+                    WHISPER_DECODER_CORES, 0, 0, 0, plan);
+            }
+        }
     }
 
     static void layer_norm(
@@ -362,12 +532,17 @@ private:
     }
 
     std::vector<Layer> layers_;
+    std::vector<CrossLayer> cross_layers_;
+    at::Tensor position_, final_w_, final_b_, lm_head_;
     int64_t expected_position_ = 0;
+    bool cross_ready_ = false;
     const void* prefill_input_ptr_ = nullptr;
     const void* prefill_output_ptr_ = nullptr;
     const void* decode_input_ptr_ = nullptr;
     const void* decode_output_ptr_ = nullptr;
     std::vector<const void*> cache_ptrs_;
+    const void* cross_input_ptr_ = nullptr;
+    std::vector<const void*> cross_cache_ptrs_;
 };
 
 using WhisperDecoderRegistry = ModelHandleRegistry<WhisperDecoderModel>;
@@ -402,9 +577,31 @@ void rpu_whisper_decoder_set_weights(
             sq_b, sv_b, so_b, cq_b, co_b, ff1_b, ff2_b);
 }
 
+void rpu_whisper_decoder_set_cross_weights(
+    int64_t handle, at::TensorList k_w, at::TensorList v_w,
+    at::TensorList v_b) {
+    WhisperDecoderRegistry::get(
+        handle, "rpu_whisper_decoder_set_cross_weights")
+        ->set_cross_weights(k_w, v_w, v_b);
+}
+
+void rpu_whisper_decoder_set_io(
+    int64_t handle, const at::Tensor& position, const at::Tensor& final_w,
+    const at::Tensor& final_b, const at::Tensor& lm_head) {
+    WhisperDecoderRegistry::get(handle, "rpu_whisper_decoder_set_io")
+        ->set_io(position, final_w, final_b, lm_head);
+}
+
 void rpu_whisper_decoder_reset(int64_t handle, int64_t position) {
     WhisperDecoderRegistry::get(handle, "rpu_whisper_decoder_reset")
         ->reset(position);
+}
+
+void rpu_whisper_decoder_prepare_cross(
+    int64_t handle, const at::Tensor& encoder_hidden,
+    at::TensorList cross_k, at::TensorList cross_v) {
+    WhisperDecoderRegistry::get(handle, "rpu_whisper_decoder_prepare_cross")
+        ->prepare_cross(encoder_hidden, cross_k, cross_v);
 }
 
 at::Tensor rpu_whisper_decoder_prefill(
@@ -423,4 +620,24 @@ at::Tensor rpu_whisper_decoder_decode(
     return WhisperDecoderRegistry::get(handle, "rpu_whisper_decoder_decode")
         ->forward(hidden, output, self_k, self_v, cross_k, cross_v,
                   position, /*prefill=*/false);
+}
+
+at::Tensor rpu_whisper_decoder_prefill_logits(
+    int64_t handle, const at::Tensor& hidden, const at::Tensor& output,
+    at::TensorList self_k, at::TensorList self_v,
+    at::TensorList cross_k, at::TensorList cross_v) {
+    return WhisperDecoderRegistry::get(
+        handle, "rpu_whisper_decoder_prefill_logits")
+        ->forward_logits(hidden, output, self_k, self_v, cross_k, cross_v,
+                         /*position=*/0, /*prefill=*/true);
+}
+
+at::Tensor rpu_whisper_decoder_decode_logits(
+    int64_t handle, const at::Tensor& hidden, const at::Tensor& output,
+    at::TensorList self_k, at::TensorList self_v,
+    at::TensorList cross_k, at::TensorList cross_v, int64_t position) {
+    return WhisperDecoderRegistry::get(
+        handle, "rpu_whisper_decoder_decode_logits")
+        ->forward_logits(hidden, output, self_k, self_v, cross_k, cross_v,
+                         position, /*prefill=*/false);
 }

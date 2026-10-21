@@ -28,8 +28,8 @@
 - [x] T6 验证 hidden/self-KV/cross-KV 余弦相似度 ≥ 0.9999（R1 实测最低 0.9999995）
 - [x] T6 验证 cache 只追加、历史前缀不变、位置错误明确失败
 - [x] 检查点 C：第 0 层数值、cache 与 Graph 复用全部通过
-- [ ] T7 扩展完整 6 层、cross-K/V、448 self-K/V 与 vocabulary head
-- [ ] T7 验证 warmup 0/1/3、跨音频 cache 清理和 Graph invariant
+- [x] T7 扩展完整 6 层、cross-K/V、448 self-K/V 与 vocabulary head
+- [x] T7 验证 warmup 0/1/3、跨音频 cache 清理和 Graph invariant（logits 最低余弦 0.9999933）
 
 ## 阶段 D：端到端能力
 

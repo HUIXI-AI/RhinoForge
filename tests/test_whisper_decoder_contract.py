@@ -43,3 +43,14 @@ def test_whisper_decode_position_is_checked_and_uses_fixed_v2_topology():
     assert "position + seq <= WHISPER_DECODER_TEXT_TOKENS" in source
     assert "KvInsertRoute::V2" in source
     assert "kv_len = position + seq" in source
+
+
+def test_full_decoder_reuses_layer_path_and_owns_cross_kv_and_logits():
+    source = (ROOT / "src/fused/rpu_whisper_decoder.cpp").read_text()
+
+    assert "count == 1 || count == 6" in source
+    assert "prepare_cross" in source
+    assert "cross_ready_" in source
+    assert "final_w_" in source
+    assert "WHISPER_DECODER_PADDED_VOCAB = 51968" in source
+    assert "rpu_launch_spm_scatter_ddr_dma(" in source

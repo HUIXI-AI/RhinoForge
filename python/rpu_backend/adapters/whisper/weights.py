@@ -148,6 +148,12 @@ def load_encoder_weights(path: str | Path) -> dict[str, object]:
             f"onnx::Add_{base + 20}": (512,),
             f"onnx::MatMul_{base + 21}": (2048, 512),
         })
+        cross = 1363 + 5 * layer
+        expected.update({
+            f"onnx::MatMul_{cross}": (512, 512),
+            f"onnx::Add_{cross + 2}": (512,),
+            f"onnx::MatMul_{cross + 3}": (512, 512),
+        })
     tensors = load_float_initializers(path, expected)
     layers = []
     for layer in range(6):
@@ -169,6 +175,14 @@ def load_encoder_weights(path: str | Path) -> dict[str, object]:
             "down_b": tensors[f"onnx::Add_{base + 20}"],
             "down_w": tensors[f"onnx::MatMul_{base + 21}"].T.copy(),
         })
+    cross_layers = []
+    for layer in range(6):
+        base = 1363 + 5 * layer
+        cross_layers.append({
+            "k_w": tensors[f"onnx::MatMul_{base}"].T.copy(),
+            "v_b": tensors[f"onnx::Add_{base + 2}"],
+            "v_w": tensors[f"onnx::MatMul_{base + 3}"].T.copy(),
+        })
     return {
         "conv1_w": tensors["onnx::Conv_1218"],
         "conv1_b": tensors["onnx::Conv_1219"],
@@ -178,6 +192,7 @@ def load_encoder_weights(path: str | Path) -> dict[str, object]:
         "final_w": tensors["audioEncoder.ln_post.weight"],
         "final_b": tensors["audioEncoder.ln_post.bias"],
         "layers": layers,
+        "cross_layers": cross_layers,
     }
 
 
@@ -187,6 +202,13 @@ def load_decoder_weights(
     if layer_count not in {1, 6}:
         raise ValueError("Whisper decoder layer_count must be 1 or 6")
     expected = {}
+    if layer_count == 6:
+        expected.update({
+            "textDecoder.token_embedding.weight": (51865, 512),
+            "textDecoder.positional_embedding": (448, 512),
+            "textDecoder.ln.weight": (512,),
+            "textDecoder.ln.bias": (512,),
+        })
     for layer in range(layer_count):
         base = 4195 + 59 * layer
         expected.update({
@@ -239,4 +261,12 @@ def load_decoder_weights(
             "ff2_b": tensors[f"onnx::Add_{base + 44}"],
             "ff2_w": tensors[f"onnx::MatMul_{base + 45}"].T.copy(),
         })
-    return {"layers": layers}
+    loaded = {"layers": layers}
+    if layer_count == 6:
+        loaded.update({
+            "token_embedding": tensors["textDecoder.token_embedding.weight"],
+            "position": tensors["textDecoder.positional_embedding"],
+            "final_w": tensors["textDecoder.ln.weight"],
+            "final_b": tensors["textDecoder.ln.bias"],
+        })
+    return loaded

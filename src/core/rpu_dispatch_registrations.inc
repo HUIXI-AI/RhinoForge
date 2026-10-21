@@ -1660,13 +1660,25 @@ TORCH_LIBRARY(rpu, m) {
         "Tensor[] n3_w, Tensor[] n3_b, Tensor[] sq_b, Tensor[] sv_b, "
         "Tensor[] so_b, Tensor[] cq_b, Tensor[] co_b, Tensor[] ff1_b, "
         "Tensor[] ff2_b) -> ()");
+  m.def("whisper_decoder_set_cross_weights(int handle, Tensor[] k_w, "
+        "Tensor[] v_w, Tensor[] v_b) -> ()");
+  m.def("whisper_decoder_set_io(int handle, Tensor position, Tensor final_w, "
+        "Tensor final_b, Tensor lm_head) -> ()");
   m.def("whisper_decoder_reset", TORCH_FN(rpu_whisper_decoder_reset));
+  m.def("whisper_decoder_prepare_cross(int handle, Tensor encoder_hidden, "
+        "Tensor(a!)[] cross_k, Tensor(b!)[] cross_v) -> ()");
   m.def("whisper_decoder_prefill(int handle, Tensor hidden, Tensor(a!) output, "
         "Tensor[] self_k, Tensor[] self_v, Tensor[] cross_k, "
         "Tensor[] cross_v) -> Tensor(a!)");
   m.def("whisper_decoder_decode(int handle, Tensor hidden, Tensor(a!) output, "
         "Tensor[] self_k, Tensor[] self_v, Tensor[] cross_k, "
         "Tensor[] cross_v, int position) -> Tensor(a!)");
+  m.def("whisper_decoder_prefill_logits(int handle, Tensor hidden, "
+        "Tensor(a!) output, Tensor[] self_k, Tensor[] self_v, "
+        "Tensor[] cross_k, Tensor[] cross_v) -> Tensor(a!)");
+  m.def("whisper_decoder_decode_logits(int handle, Tensor hidden, "
+        "Tensor(a!) output, Tensor[] self_k, Tensor[] self_v, "
+        "Tensor[] cross_k, Tensor[] cross_v, int position) -> Tensor(a!)");
 
   // v5-05 D-07 / D-10 (C2): deleted `fused_patch_embedding` op schema — its
   // body is now a TU-static helper inside rpu_siglip_model.cpp; only the
@@ -1920,10 +1932,20 @@ TORCH_LIBRARY_IMPL(rpu, PrivateUse1, m) {
          TORCH_FN(rpu_whisper_encoder_forward));
   m.impl("whisper_decoder_set_weights",
          TORCH_FN(rpu_whisper_decoder_set_weights));
+  m.impl("whisper_decoder_set_cross_weights",
+         TORCH_FN(rpu_whisper_decoder_set_cross_weights));
+  m.impl("whisper_decoder_set_io",
+         TORCH_FN(rpu_whisper_decoder_set_io));
+  m.impl("whisper_decoder_prepare_cross",
+         TORCH_FN(rpu_whisper_decoder_prepare_cross));
   m.impl("whisper_decoder_prefill",
          TORCH_FN(rpu_whisper_decoder_prefill));
   m.impl("whisper_decoder_decode",
          TORCH_FN(rpu_whisper_decoder_decode));
+  m.impl("whisper_decoder_prefill_logits",
+         TORCH_FN(rpu_whisper_decoder_prefill_logits));
+  m.impl("whisper_decoder_decode_logits",
+         TORCH_FN(rpu_whisper_decoder_decode_logits));
 }
 
 TORCH_LIBRARY_IMPL(rpu, CPU, m) {

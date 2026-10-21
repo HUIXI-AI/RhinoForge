@@ -5775,12 +5775,29 @@ void rpu_whisper_decoder_set_weights(
     at::TensorList so_b, at::TensorList cq_b,
     at::TensorList co_b, at::TensorList ff1_b,
     at::TensorList ff2_b);
+void rpu_whisper_decoder_set_cross_weights(
+    int64_t handle, at::TensorList k_w, at::TensorList v_w,
+    at::TensorList v_b);
+void rpu_whisper_decoder_set_io(
+    int64_t handle, const at::Tensor& position, const at::Tensor& final_w,
+    const at::Tensor& final_b, const at::Tensor& lm_head);
 void rpu_whisper_decoder_reset(int64_t handle, int64_t position);
+void rpu_whisper_decoder_prepare_cross(
+    int64_t handle, const at::Tensor& encoder_hidden,
+    at::TensorList cross_k, at::TensorList cross_v);
 at::Tensor rpu_whisper_decoder_prefill(
     int64_t handle, const at::Tensor& hidden, const at::Tensor& output,
     at::TensorList self_k, at::TensorList self_v,
     at::TensorList cross_k, at::TensorList cross_v);
 at::Tensor rpu_whisper_decoder_decode(
+    int64_t handle, const at::Tensor& hidden, const at::Tensor& output,
+    at::TensorList self_k, at::TensorList self_v,
+    at::TensorList cross_k, at::TensorList cross_v, int64_t position);
+at::Tensor rpu_whisper_decoder_prefill_logits(
+    int64_t handle, const at::Tensor& hidden, const at::Tensor& output,
+    at::TensorList self_k, at::TensorList self_v,
+    at::TensorList cross_k, at::TensorList cross_v);
+at::Tensor rpu_whisper_decoder_decode_logits(
     int64_t handle, const at::Tensor& hidden, const at::Tensor& output,
     at::TensorList self_k, at::TensorList self_v,
     at::TensorList cross_k, at::TensorList cross_v, int64_t position);

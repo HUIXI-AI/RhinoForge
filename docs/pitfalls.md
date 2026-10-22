@@ -111,6 +111,109 @@ to change a cold setting.
 admitted setting in a fresh process reports and executes the expected resolved
 plan.
 
+## Pi0.5 v1.2.0 denoise known issues (2026-10-22)
+
+This section records two related failures confirmed during a v1.2.0 customer
+investigation. They affect the default Graph loop and the Graph-disabled host
+loop respectively. The current RhinoForge source contains adapter-level
+compatible fixes without changing the v1.2.0 Runtime/Launch package or operator
+assets. Unpatched v1.2.0 RhinoForge builds remain affected.
+
+### Changing logical prefixes retain Graphs until the arena pool is exhausted
+
+**Symptom:** `pi05_denoise_loop` repeatedly BUILDs across control frames and
+fails with `graph arena pool capacity exhausted` after the number of retained
+Graphs reaches the cold arena count. This is one new complete loop Graph per
+top-level action call, not one rebuild per denoise step within a frame.
+
+**Cause:** [`_set_denoise_rope_position`](../python/rpu_backend/adapters/pi05/runtime.py)
+derives the logical RoPE start from the prefix mask's valid-token count. State
+is part of the tokenized prompt, so that value can change across control
+frames. The RoPE start is baked into the kernel at BUILD, and
+[`_run_denoise_loop`](../python/rpu_backend/adapters/pi05/runtime.py) therefore
+correctly includes it and the physical execution plan in the `GraphSignature`.
+Different values miss the cache, while Python
+[`GraphCache`](../python/rpu_backend/graph/_runtime.py) and native
+[`RpuGraphCache::get_or_create`](../src/graph/graph_infra.cpp) enforce capacity
+without automatic eviction. Old Graphs retain the finite physical arenas until
+the pool is exhausted. This “leak” is an unbounded retained-Graph lifecycle,
+not an ordinary host-heap leak.
+
+**Fix:**
+
+- Current fix: retain only the current denoise signature and use the existing
+  `GraphCache.evict()` to safely evict the old Graph before creating a
+  different signature. The same signature still REPLAYs; different signatures
+  retain rebuild cost but cannot consume arenas without bound.
+- Long-term performance option: make the logical RoPE start and any dependent route/register
+  fields validated Graph-mutable register/DMA inputs. Only then may those
+  values be removed from the signature/physical-plan digest for stable REPLAY.
+- Invalid fixes: increasing `graph_arena_count` only delays failure; deleting
+  the RoPE start from the signature without a mutable semantic path silently
+  replays stale values.
+
+**Gate:** run multiple frames whose valid-token counts change and prove cache
+size and arena use remain bounded. The production fix must also prove one
+BUILD followed by stable REPLAY, `cache_invariant_ok()` throughout, and
+numerical parity at different logical positions. Eviction must retain the
+active/use-count guards.
+
+### Disabling the denoise Graph corrupts steady-state actions
+
+**Symptom:** setting `RPU_PI05_DENOISE_GRAPH=0` avoids arena exhaustion, but
+later fixed-input, fixed-noise outputs change substantially after a first-frame
+`[Pi05Fused] runtime checks PASS`; robot actions diverge within seconds.
+
+**Cause:** [`_run_denoise_fused`](../python/rpu_backend/adapters/pi05/runtime.py)
+already computes a complete `action_plan`. The Graph branch passes the selected
+`physical_descriptor`, but the host branch passes an empty list. Native
+[`restore_planned_route_profile`](../src/fused/rpu_pi05_denoise_step_model.cpp)
+then enters the legacy immediate path without Graph proof. Outside Graph,
+[`FusedModelBase::run_preload_callbacks_`](../src/core/fused_model_base.cpp) may
+skip preloads when the generation appears unchanged and the dirty flag is
+false. Intervening SigLIP/Gemma Graphs can reuse and overwrite physical SPM, so
+denoise Persistent biases such as `action_in_proj_b_spm` and
+`action_out_proj_b_spm` can read clobbered data. The first frame can pass after
+a correct preload, while `_rpu_fuse_validated` is only a one-time check and
+does not prove steady-state correctness.
+
+In a three-call fixed-input, fixed-noise diagnostic, the original path changed
+from the first to second call with RMSE `0.8649037` and maximum difference
+`2.6068361`. Retaining and passing the same COMPLETE descriptor made all three
+outputs bit-identical, with zero RMSE and maximum difference. This excludes
+host FP32 Euler as the cause and isolates descriptor loss and incomplete
+preload/route authority.
+
+**Fix:**
+
+- Current fix: pass the selected COMPLETE `physical_descriptor` in the host
+  branch too, so immediate execution follows the current physical manifest and
+  performs the required preloads.
+- Reject a Graph-only optimized descriptor early and explicitly when Graph is
+  disabled; never fall through silently to the empty-descriptor legacy path.
+- Do not globally force every legacy `FusedModelBase` forward to preload. That
+  has a much wider blast radius than using the exact descriptor already
+  computed for this call.
+
+**Gate:** run at least three fixed-input, fixed-noise calls with intervening
+SigLIP/Gemma Graph replays and require stable output. Then compare the host loop
+against the reference/Graph loop across multiple frames. Graph-only profiles
+must fail closed when `RPU_PI05_DENOISE_GRAPH=0`. A one-time first-frame
+`runtime checks PASS` is not a steady-state gate.
+
+### v1.2.0 operational guidance
+
+For a v1.2.0 RhinoForge build without the source patch, do not work around these
+failures by adding arenas or disabling the denoise Graph. Use a validated v1.0
+combination or rebuild RhinoForge with both adapter fixes. In representative
+W8A16/R1 validation, the denoise cache stayed at one entry across ten changing-
+prefix frames and the final repeated signature REPLAYed; with Graph disabled,
+three fixed-input/fixed-noise outputs were bit-identical with zero maximum
+difference. The customer's original checkpoint still requires the same focused
+acceptance run before delivery. Prefix-composition fallback after arena failure
+and a shutdown-time `sys.meta_path is None` cleanup error are consequences or
+secondary issues, not the causes of these failures.
+
 ## Other high-value checks
 
 | Check | Failure pattern | Required correction |

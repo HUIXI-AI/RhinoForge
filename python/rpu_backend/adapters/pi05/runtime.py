@@ -20,6 +20,7 @@ _kv_prefix_full_hash, _run_denoise_fused, _run_denoise_python_baseline,
 and replaced nested _run_denoise with dispatcher.
 """
 from __future__ import annotations
+from contextlib import contextmanager
 import os
 import threading
 import weakref
@@ -1363,7 +1364,7 @@ def _run_denoise_fused(self, x_t_cpu_fp32, prefix_pad_masks, past_key_values,
     for step in range(num_steps):
         cond_step = adarms_cond_all_rpu.select(0, step).contiguous()
         if use_graph:
-            with cache.capture(sig):
+            with _capture_bounded_denoise_graph(cache, sig):
                 torch.ops.rpu.pi05_denoise_step_forward(
                     handle, x_t_rpu,
                     past_key_values.k_caches, past_key_values.v_caches,
@@ -1374,7 +1375,7 @@ def _run_denoise_fused(self, x_t_cpu_fp32, prefix_pad_masks, past_key_values,
                 handle, x_t_rpu,
                 past_key_values.k_caches, past_key_values.v_caches,
                 cond_step, mask_4d, v_t_buf, prefix_len,
-                [])
+                action_plan.selected.stage_tuple.physical_descriptor)
         # Euler CPU fp32 (Diff-B fix preserved):
         x_t_cpu_fp32 = x_t_cpu_fp32 + dt * v_t_buf.to('cpu', torch.float32)
         if _euler_fp16_enabled():  # A/B: model an on-device fp16 Euler
@@ -1417,6 +1418,18 @@ def _set_denoise_rope_position(handle, prefix_pad_masks) -> int:
     pos = int(prefix_pad_masks[0].sum())
     torch.ops.rpu.pi05_denoise_step_set_rope_position(handle, pos)
     return pos
+
+
+@contextmanager
+def _capture_bounded_denoise_graph(cache, sig):
+    """Keep one retained denoise Graph while preserving same-signature replay."""
+    previous = vars(cache).get("_pi05_denoise_graph_signature")
+    if previous is not None and previous != sig:
+        cache.evict(previous)
+    with cache.capture(sig):
+        yield
+    vars(cache)["_pi05_denoise_graph_signature"] = sig
+
 
 def _run_denoise_loop(self, x_t_cpu_fp32, prefix_pad_masks, past_key_values,
                       num_steps, prefix_len, bsize):
@@ -1486,7 +1499,7 @@ def _run_denoise_loop(self, x_t_cpu_fp32, prefix_pad_masks, past_key_values,
                   *action_plan.graph_key_words()],  # physical child authority
         dtypes=[torch.float16],
     )
-    with cache.capture(sig):
+    with _capture_bounded_denoise_graph(cache, sig):
         torch.ops.rpu.pi05_denoise_loop_forward(
             handle, x0,
             past_key_values.k_caches, past_key_values.v_caches,

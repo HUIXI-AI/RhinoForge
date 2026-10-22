@@ -80,6 +80,88 @@ native handle。
 **门禁：** 非法设置在 weight mutation 前失败；每种允许设置在新进程报告并执行预期
 resolved plan。
 
+## Pi0.5 v1.2.0 denoise 已知故障（2026-10-22）
+
+本节记录 v1.2.0 客户现场排查确认的两个关联故障。它们分别影响默认 Graph loop 和
+关闭 Graph 后的 host loop。当前 RhinoForge 源码已在 adapter 层完成兼容修复，不改变
+v1.2.0 Runtime/Launch 包或算子资产；未包含该源码补丁的 v1.2.0 构建仍受影响。
+
+### 故障一：不同逻辑前缀持续 BUILD，耗尽 Graph arena
+
+**现象：** `pi05_denoise_loop` 随控制帧连续 BUILD；保留 Graph 数达到冷态 arena 数后报
+`graph arena pool capacity exhausted`。这不是同一帧内部每个 denoise step 都重建，而是
+每个顶层 action 调用保留一张新的完整 loop Graph。
+
+**根因：** [`_set_denoise_rope_position`](../python/rpu_backend/adapters/pi05/runtime.py)
+用 prefix mask 的有效 token 数计算逻辑 RoPE 起点；状态进入 tokenized prompt 后，该值可
+随控制帧变化。RoPE 起点会在 BUILD 时写入 kernel，因此
+[`_run_denoise_loop`](../python/rpu_backend/adapters/pi05/runtime.py) 正确地把它和物理执行计划
+放入 `GraphSignature`。不同值产生 cache miss，而
+[`GraphCache`](../python/rpu_backend/graph/_runtime.py) 与 native
+[`RpuGraphCache::get_or_create`](../src/graph/graph_infra.cpp) 只做容量检查，不自动淘汰；旧
+Graph 继续持有有限的物理 arena，最终耗尽。这里的“泄漏”是 retained Graph 的生命周期
+未受界，并非普通 host heap 泄漏。
+
+**解决方案：**
+
+- 当前正式修复：denoise cache 只常驻当前 signature；创建不同 signature 前通过现有
+  `GraphCache.evict()` 安全、显式淘汰旧 Graph。相同 signature 保持 REPLAY，不同
+  signature 仍有重建开销，但不会无限占用 arena。
+- 长期性能方案：把逻辑 RoPE 起点及依赖它的 route/register 字段改成经过校验的 Graph
+  mutable register/DMA 输入。只有完成该语义更新后，才能从 signature/物理计划摘要中移除
+  对应值并稳定 REPLAY。
+- 不可用方案：单纯增大 `graph_arena_count` 只会推迟失败；直接从 signature 删除 RoPE
+  起点会让 Graph 重放旧语义，造成静默数值错误。
+
+**修复门禁：** 用有效 token 数持续变化的多帧输入验证 cache size 与 arena 占用有界；
+长期方案还必须证明一张 Graph 只 BUILD 一次、随后稳定 REPLAY，`cache_invariant_ok()`
+始终为 true，并逐位置对比数值一致性。淘汰不得绕过 active/use-count 保护。
+
+### 故障二：关闭 denoise Graph 后稳态动作发散
+
+**现象：** `RPU_PI05_DENOISE_GRAPH=0` 后不再耗尽 arena，但首帧
+`[Pi05Fused] runtime checks PASS` 后，固定输入和固定 noise 的后续输出仍发生大幅变化，
+真机动作数秒内发散。
+
+**根因：** [`_run_denoise_fused`](../python/rpu_backend/adapters/pi05/runtime.py) 已经计算出完整
+`action_plan`，Graph 分支传入所选 `physical_descriptor`，host 分支却传入空列表。native
+[`restore_planned_route_profile`](../src/fused/rpu_pi05_denoise_step_model.cpp) 因此进入没有
+Graph proof 的 legacy immediate 路径。Graph 外的
+[`FusedModelBase::run_preload_callbacks_`](../src/core/fused_model_base.cpp) 可在 generation 看似
+未变化且 dirty flag 为 false 时跳过 preload；其间 SigLIP/Gemma Graph 会复用并改写物理
+SPM，于是 denoise 的 `action_in_proj_b_spm`、`action_out_proj_b_spm` 等 Persistent bias 可能
+读取到被覆盖的数据。首帧在正确 preload 后可通过，而 `_rpu_fuse_validated` 只做一次安全
+检查，不能证明后续稳态正确。
+
+固定输入、固定 noise 的三次诊断中，原路径首帧到第二帧 RMSE 为 `0.8649037`、最大差
+`2.6068361`；仅保留并传入同一 COMPLETE descriptor 后，三次输出 bit-identical，RMSE
+和最大差均为 `0`。这排除了 host FP32 Euler 本身，定位到 descriptor 丢失及 preload/route
+authority 不完整。
+
+**解决方案：**
+
+- 当前正式修复：host 分支也传入已选择的 COMPLETE `physical_descriptor`，让 immediate 调用按
+  当前物理 manifest 执行并完成所需 preload。
+- Graph-only 的 optimized descriptor 在 Graph 关闭时必须提前、明确拒绝，不能静默退回
+  空 descriptor 的 legacy 路径。
+- 不建议全局改成“所有 legacy forward 都无条件 preload”；该改动影响全部
+  `FusedModelBase` 调用方，范围远大于使用本次已经计算好的精确 descriptor。
+
+**修复门禁：** 固定输入与 noise 连续运行至少三次，并在两次 action 之间执行
+SigLIP/Gemma Graph replay，输出必须保持一致；再比较 host loop 与参考/Graph loop 的多帧
+数值。Graph-only profile 在 `RPU_PI05_DENOISE_GRAPH=0` 时必须 fail closed。首帧一次性的
+`runtime checks PASS` 不计作稳态门禁。
+
+### v1.2.0 处置建议
+
+未包含 RhinoForge 源码补丁的 v1.2.0 构建，不要通过增加 arena 或关闭 denoise Graph
+规避问题；使用已验证的 v1.0 组合，或重新构建包含两项 adapter 修复的 RhinoForge 包。
+代表性 W8A16/R1 验证中，10 帧变化前缀下 denoise cache 始终为 1，最后相同 signature
+进入 REPLAY；Graph 关闭后固定输入/noise 连续三次输出 bit-identical、最大差为 0。客户
+原始 checkpoint 仍需在交付前执行同样的针对性验收。arena 失败后的 prefix composition
+fallback 和进程退出时的 `sys.meta_path is None` 清理异常是后果/次要问题，不是本次两个
+故障的根因。
+
 ## 其他高价值检查
 
 | 检查 | 失败模式 | 必需修正 |

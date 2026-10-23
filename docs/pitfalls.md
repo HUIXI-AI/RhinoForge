@@ -111,12 +111,12 @@ to change a cold setting.
 admitted setting in a fresh process reports and executes the expected resolved
 plan.
 
-## Pi0.5 v1.2.0 denoise known issues (2026-10-22)
+## Pi0.5 v1.2.0 denoise known issues (updated 2026-10-23)
 
 This section records two related failures confirmed during a v1.2.0 customer
 investigation. They affect the default Graph loop and the Graph-disabled host
-loop respectively. The current RhinoForge source contains adapter-level
-compatible fixes without changing the v1.2.0 Runtime/Launch package or operator
+loop respectively. The current RhinoForge source contains compatible host and
+native-extension fixes without changing the v1.2.0 Runtime/Launch package or operator
 assets. Unpatched v1.2.0 RhinoForge builds remain affected.
 
 ### Changing logical prefixes retain Graphs until the arena pool is exhausted
@@ -141,13 +141,14 @@ not an ordinary host-heap leak.
 
 **Fix:**
 
-- Current fix: retain only the current denoise signature and use the existing
-  `GraphCache.evict()` to safely evict the old Graph before creating a
-  different signature. The same signature still REPLAYs; different signatures
-  retain rebuild cost but cannot consume arenas without bound.
-- Long-term performance option: make the logical RoPE start and any dependent route/register
-  fields validated Graph-mutable register/DMA inputs. Only then may those
-  values be removed from the signature/physical-plan digest for stable REPLAY.
+- The bounded-cache fix remains a safety net: retain only the current denoise
+  signature and use `GraphCache.evict()` before creating a different one.
+- The production performance fix makes the logical RoPE start replay-mutable.
+  It is removed from the Python Graph signature and native plan identity, while
+  the Pi0.5 denoise owner re-emits its host layer body on REPLAY so the live
+  scalar registers are written into the retained Graph kernels. Physical route
+  validation remains keyed by the canonical padded prefix length. Vision and
+  prefill retain their existing full fast-replay path.
 - Invalid fixes: increasing `graph_arena_count` only delays failure; deleting
   the RoPE start from the signature without a mutable semantic path silently
   replays stale values.
@@ -157,6 +158,15 @@ size and arena use remain bounded. The production fix must also prove one
 BUILD followed by stable REPLAY, `cache_invariant_ok()` throughout, and
 numerical parity at different logical positions. Eviction must retain the
 active/use-count guards.
+
+**R1 evidence:** with the supplied six T160 frames (149--154 valid tokens), two
+warmups and six measured W8A16 iterations used one denoise Graph with ten
+replays, zero recaptures and a valid cache invariant. Mean end-to-end latency
+was 168.27 ms (median 168.54 ms, P95 169.72 ms), down from 209.14 ms before the
+mutable replay fix. Mean denoise time fell from 101.94 ms to 60.01 ms. Against
+the Graph-disabled reference, per-frame action RMSE was 0.00049--0.00055,
+maximum absolute error was at most 0.00340, and cosine similarity was at least
+0.99999988. The v1.2.0 Runtime/Launch package and operator assets were unchanged.
 
 ### Disabling the denoise Graph corrupts steady-state actions
 

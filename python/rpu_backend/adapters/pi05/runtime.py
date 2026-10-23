@@ -1337,7 +1337,7 @@ def _run_denoise_fused(self, x_t_cpu_fp32, prefix_pad_masks, past_key_values,
     effective_num_kv_heads = int(getattr(
         expert_model, "_rpu_effective_num_kv_heads", ec.num_key_value_heads
     ))
-    rope_pos = _set_denoise_rope_position(handle, prefix_pad_masks)
+    _set_denoise_rope_position(handle, prefix_pad_masks)
     action_plan = _plan_pi05_denoise_action_execution(
         self,
         handle=int(handle),
@@ -1356,7 +1356,6 @@ def _run_denoise_fused(self, x_t_cpu_fp32, prefix_pad_masks, past_key_values,
                   ec.num_attention_heads, effective_num_kv_heads,
                   ec.head_dim, prefix_len, num_steps,
                   self.action_in_proj.out_features,
-                  rope_pos,
                   *action_plan.graph_key_words()],  # physical child authority
         dtypes=[torch.float16],
     )
@@ -1401,7 +1400,7 @@ def _run_denoise_fused(self, x_t_cpu_fp32, prefix_pad_masks, past_key_values,
 
 
 
-def _set_denoise_rope_position(handle, prefix_pad_masks) -> int:
+def _set_denoise_rope_position(handle, prefix_pad_masks) -> None:
     """Give the fused denoise expert the suffix's LOGICAL RoPE start.
 
     `prefix_len` (= prefix_pad_masks.shape[1]) is the PHYSICAL cache row the
@@ -1412,12 +1411,11 @@ def _set_denoise_rope_position(handle, prefix_pad_masks) -> int:
     scalar start is enough here; the PREFIX needs a gathered table instead
     (adapters/pi05/gemma.py).
 
-    Returns the value so callers can put it in the graph signature — it is
-    baked into the kernel at BUILD.
+    The native launchers publish this value through replay-mutable registers;
+    it is deliberately not a Graph-signature axis.
     """
     pos = int(prefix_pad_masks[0].sum())
     torch.ops.rpu.pi05_denoise_step_set_rope_position(handle, pos)
-    return pos
 
 
 @contextmanager
@@ -1476,7 +1474,7 @@ def _run_denoise_loop(self, x_t_cpu_fp32, prefix_pad_masks, past_key_values,
     effective_num_kv_heads = int(getattr(
         expert_model, "_rpu_effective_num_kv_heads", ec.num_key_value_heads
     ))
-    rope_pos = _set_denoise_rope_position(handle, prefix_pad_masks)
+    _set_denoise_rope_position(handle, prefix_pad_masks)
     action_plan = _plan_pi05_denoise_action_execution(
         self,
         handle=int(handle),
@@ -1495,7 +1493,6 @@ def _run_denoise_loop(self, x_t_cpu_fp32, prefix_pad_masks, past_key_values,
                   ec.num_attention_heads, effective_num_kv_heads,
                   ec.head_dim, prefix_len, num_steps,
                   self.action_in_proj.out_features,
-                  rope_pos,
                   *action_plan.graph_key_words()],  # physical child authority
         dtypes=[torch.float16],
     )

@@ -80,10 +80,10 @@ native handle。
 **门禁：** 非法设置在 weight mutation 前失败；每种允许设置在新进程报告并执行预期
 resolved plan。
 
-## Pi0.5 v1.2.0 denoise 已知故障（2026-10-22）
+## Pi0.5 v1.2.0 denoise 已知故障（更新于 2026-10-23）
 
 本节记录 v1.2.0 客户现场排查确认的两个关联故障。它们分别影响默认 Graph loop 和
-关闭 Graph 后的 host loop。当前 RhinoForge 源码已在 adapter 层完成兼容修复，不改变
+关闭 Graph 后的 host loop。当前 RhinoForge 源码已在 host 与 native extension 层完成兼容修复，不改变
 v1.2.0 Runtime/Launch 包或算子资产；未包含该源码补丁的 v1.2.0 构建仍受影响。
 
 ### 故障一：不同逻辑前缀持续 BUILD，耗尽 Graph arena
@@ -104,18 +104,25 @@ Graph 继续持有有限的物理 arena，最终耗尽。这里的“泄漏”�
 
 **解决方案：**
 
-- 当前正式修复：denoise cache 只常驻当前 signature；创建不同 signature 前通过现有
-  `GraphCache.evict()` 安全、显式淘汰旧 Graph。相同 signature 保持 REPLAY，不同
-  signature 仍有重建开销，但不会无限占用 arena。
-- 长期性能方案：把逻辑 RoPE 起点及依赖它的 route/register 字段改成经过校验的 Graph
-  mutable register/DMA 输入。只有完成该语义更新后，才能从 signature/物理计划摘要中移除
-  对应值并稳定 REPLAY。
+- 有界 cache 修复继续作为兜底：denoise cache 只常驻当前 signature；创建不同 signature
+  前通过 `GraphCache.evict()` 安全淘汰旧 Graph。
+- 正式性能修复把逻辑 RoPE 起点改为 replay-mutable：从 Python Graph signature 和 native
+  plan identity 中移除该值；Pi0.5 denoise 在 REPLAY 时重发 host layer body，把当前帧标量
+  寄存器写入保留的 Graph kernel。物理 route 仍使用规范化的 padded prefix length 校验；
+  Vision 和 Prefill 继续使用原有完整 fast replay。
 - 不可用方案：单纯增大 `graph_arena_count` 只会推迟失败；直接从 signature 删除 RoPE
   起点会让 Graph 重放旧语义，造成静默数值错误。
 
 **修复门禁：** 用有效 token 数持续变化的多帧输入验证 cache size 与 arena 占用有界；
 长期方案还必须证明一张 Graph 只 BUILD 一次、随后稳定 REPLAY，`cache_invariant_ok()`
 始终为 true，并逐位置对比数值一致性。淘汰不得绕过 active/use-count 保护。
+
+**R1 实测：** 客户提供的 6 帧 T160 数据（有效 token 为 149--154），2 次预热后测量 6 次。
+denoise Graph 保持 1 张，累计 10 次 REPLAY、0 次 recapture，cache invariant 正常。W8A16
+端到端平均 168.27 ms（中位 168.54 ms，P95 169.72 ms），相对修复前动态多帧 209.14 ms
+下降 19.54%；denoise 阶段从 101.94 ms 降至 60.01 ms。逐帧对比关闭 Graph 的参考结果，
+动作 RMSE 为 0.00049--0.00055，最大绝对误差不超过 0.00340，余弦相似度不低于
+0.99999988。v1.2.0 Runtime/Launch 包和算子资产均未修改。
 
 ### 故障二：关闭 denoise Graph 后稳态动作发散
 

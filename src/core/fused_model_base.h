@@ -978,6 +978,9 @@ struct ModelStaticConfig {
     // preserves the older fast-replay guardrails for all other models.
     bool fast_replay_skip_full_body = false;
 
+    // Keep replayed kernel registers live for models with mutable scalar inputs.
+    bool replay_reemit_layer_body = false;
+
     // Skip the preload_fn host re-walk on GraphCache REPLAYING (RhinoVLA vision
     // opt-in via RPU_RHINOVLA_VISION_PRELOAD_REPLAY_SKIP). Only honored when
     // weights are clean; default false leaves all other models unchanged.

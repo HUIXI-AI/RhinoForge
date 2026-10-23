@@ -15659,6 +15659,7 @@ at::Tensor FusedModelBase::run_all_layers_impl(
         ? &RpuKernelGraph::active().runtime_policy() : nullptr;
     const bool deep_full_skip =
         expected_layout_hash == 0 &&
+        !static_cfg.replay_reemit_layer_body &&
         graph_runtime_policy != nullptr &&
         graph_runtime_policy->fmb_deep_fast_replay &&
         graph_runtime_policy->fmb_fast_replay
@@ -16332,6 +16333,7 @@ at::Tensor FusedModelBase::run_all_layers_impl(
     }
 
     const bool fast_skip = !checked_body_replay &&
+        !static_cfg.replay_reemit_layer_body &&
         ((graph_runtime_policy != nullptr &&
           graph_runtime_policy->fmb_fast_replay) ||
          static_cfg.fast_replay_skip_layer_loop)

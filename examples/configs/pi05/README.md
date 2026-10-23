@@ -13,7 +13,7 @@
 | 配方 | 两图 TP8 | 三图 TP8 | 使用的权重与获取步骤 |
 |---|---|---|---|
 | FP16 | [配置](2cam/fp16.toml) | [配置](3cam/fp16.toml) | [原始 LIBERO 目录](#download-parent) |
-| W8A16 | [配置](2cam/w8a16.toml) | [配置](3cam/w8a16.toml) | [W8 转换目录](#run-w8) |
+| W8A16 | [配置](2cam/w8a16.toml) | [T32 配置](3cam/w8a16.toml) / [T160 配置](3cam/w8a16_t160.toml) | [W8 转换目录](#run-w8) |
 | W8 + 动作 NVFP4 | [配置](2cam/w8a16_action_nvfp4.toml) | [配置](3cam/w8a16_action_nvfp4.toml) | [动作 NVFP4 转换目录](#w8--action-nvfp4离线转换后运行) |
 | 预填充 W8A8 + 动作 NVFP4 | [配置](2cam/w8a16_prefill_w8a8_action_nvfp4.toml) | [配置](3cam/w8a16_prefill_w8a8_action_nvfp4.toml) | [复用动作 NVFP4 目录](#w8--prefill-w8a8--action-nvfp4) |
 

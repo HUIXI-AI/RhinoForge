@@ -51,6 +51,7 @@ def test_shipped_configs_resolve_physical_choices_and_registered_scope():
                                   "w8a16_prefill_w8a8_action_nvfp4")}
     expected |= {CONFIGS / f"generic/3cam/{precision}_tp{cores}.toml"
                  for precision in ("fp16", "w8a16") for cores in (4, 6)}
+    expected.add(CONFIGS / "3cam/w8a16_t160.toml")
     assert paths == expected
     registered = set()
     for path in sorted(paths):

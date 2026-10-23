@@ -1,0 +1,17 @@
+# Three-camera Pi0.5 W8A16 profile with the largest supported text slot.
+[pi05]
+precision = "w8a16"
+
+[input]
+checkpoint = "pi05-libero-finetuned-w8a16-vlm-expert"
+batch = "/path/to/pi05_3cam_t160_batch.pt"
+cameras = 3
+text_tokens = 160
+num_steps = 10
+# noise = "/path/to/fixed_cpu_noise.pt"
+
+[run]
+warmup = 2
+runs = 6
+seed = 0
+output_dir = "./pi05_results/3cam/w8a16_t160"

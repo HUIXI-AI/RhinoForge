@@ -55,6 +55,8 @@ def test_shipped_configs_resolve_physical_choices_and_registered_scope():
     expected.add(CONFIGS / "3cam/w8a16_action_nvfp4_t160.toml")
     expected.add(CONFIGS / "3cam/w8a16_prefill_w8a8_action_nvfp4_t160.toml")
     assert paths == expected
+    assert common.load_config(
+        CONFIGS / "3cam/w8a16_prefill_w8a8_action_nvfp4_t160.toml")["cpu"]["threads"] == 2
     registered = set()
     for path in sorted(paths):
         config = common.load_config(path)
@@ -546,7 +548,10 @@ def test_measurement_preserves_cold_execution_and_closes_before_reporting(
     monkeypatch.setenv("MKL_NUM_THREADS", "8")
     monkeypatch.setattr(torch, "set_num_threads", lambda count: threads.__setitem__(0, count))
     monkeypatch.setattr(torch, "get_num_threads", lambda: threads[0])
-    monkeypatch.setattr(torch, "set_num_interop_threads", lambda *args: None)
+    interop_threads = [None]
+    monkeypatch.setattr(torch, "set_num_interop_threads",
+                        lambda count: interop_threads.__setitem__(0, count))
+    monkeypatch.setattr(torch, "get_num_interop_threads", lambda: interop_threads[0])
 
     @contextmanager
     def observe(policy):
@@ -609,6 +614,7 @@ def test_measurement_preserves_cold_execution_and_closes_before_reporting(
         assert report["artifacts"]["report"] == str(tmp_path / "result/report.json")
         assert len(report["samples_ms"]) == 3 and report["warmup"] == 2
         assert report["cpu_runtime"]["torch_num_threads"] == 3
+        assert report["cpu_runtime"]["torch_num_interop_threads"] == 24
         assert report["cpu_runtime"]["OMP_NUM_THREADS"] == "3"
         assert report["execution_route"] == ("paired_tp8" if paired else "generic")
         assert report["precision"] == precision

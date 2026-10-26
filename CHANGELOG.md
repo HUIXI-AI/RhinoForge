@@ -12,7 +12,7 @@
 - 修复 Pi0.5 denoise Graph 因逻辑前缀变化持续占用 arena，以及关闭 Graph 后 host loop
   丢失物理执行描述导致稳态数值漂移的问题；动态 RoPE 位置现在可在同一张 Graph 上稳定
   回放；T160 快速路径只更新 Graph kernel 的位置寄存器，并增加 Action NVFP4、Prefill W8A8
-  与 4 CPU 线程的 T160 配置；loader 同时支持官方 checkpoint 省略未使用的 tied LM heads，
+  与 2 CPU / 1 inter-op 线程的 T160 配置；loader 同时支持官方 checkpoint 省略未使用的 tied LM heads，
   无需更改 v1.2.0 Runtime/Launch 包。
 
 Development has moved to 1.3; this line currently provides source only.
@@ -26,7 +26,7 @@ Development has moved to 1.3; this line currently provides source only.
   steady-state host-loop drift caused by dropping the physical execution
   descriptor. Dynamic RoPE positions now replay through one retained Graph;
   the T160 fast path updates only Graph-kernel position registers and adds T160
-  Action NVFP4, Prefill W8A8 and four-CPU-thread configurations. The loader also
+  Action NVFP4, Prefill W8A8 and a two-CPU/one-inter-op-thread configuration. The loader also
   accepts the official checkpoint's omitted unused tied LM heads. The v1.2.0
   Runtime/Launch package is unchanged.
 

@@ -17,4 +17,4 @@ seed = 0
 output_dir = "./pi05_results/3cam/w8a16_prefill_w8a8_action_nvfp4_t160"
 
 [cpu]
-threads = 4
+threads = 2

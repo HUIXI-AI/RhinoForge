@@ -94,6 +94,19 @@ def test_profiles_reject_wrong_precision_scope():
             assert env["RPU_PI05_DENOISE_" + flag] == "1"
 
 
+@pytest.mark.parametrize("profile,expected", [
+    ((True, "w4a16", True, 3, 160), 1),
+    ((True, "w4a16", False, 3, 160), 24),
+    ((True, "w4a16", True, 2, 160), 24),
+    ((False, "w4a16", True, 3, 160), 24),
+])
+def test_cpu_interop_threads_are_bounded_only_for_validated_t160_profile(profile, expected):
+    paired, precision, prefill_w8a8, cameras, text_tokens = profile
+    assert RUNNER["_cpu_interop_threads"](
+        paired=paired, precision=precision, prefill_w8a8=prefill_w8a8,
+        cameras=cameras, text_tokens=text_tokens) == expected
+
+
 def test_fp16_profile_keeps_weights_unquantized_and_rejects_quantized_checkpoint():
     env = RUNNER["profile_environment"]("fp16")
     for flag in ("SIGLIP_W8A16", "ADARMS_DENSE_W8A16", "PREFILL_GATEUP_W8A8",

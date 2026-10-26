@@ -509,6 +509,13 @@ public:
     at::Tensor       output_tensor_;
     at::Tensor       post_output_tensor_;
     InferenceContext ctx_;
+    struct ReplayKernelU32Patch {
+        uint16_t kernel_id = 0;
+        uint32_t reg_lo = 0;
+        uint32_t value = 0;
+        size_t expected_count = 0;
+    };
+    std::vector<ReplayKernelU32Patch> replay_kernel_u32_patches_;
     // First resolution is sticky per model/plan/layout identity so AUTO cannot
     // switch a live Graph signature between DDR and SPM when unrelated global
     // SPM occupancy later changes.

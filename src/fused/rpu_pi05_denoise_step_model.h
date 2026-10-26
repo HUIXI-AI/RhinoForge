@@ -226,6 +226,7 @@ private:
     void validate_pi05_q_rope_manifest(const FmbPhysicalExecutionManifest& manifest) const;
     void validate_pi05_q_rope_policy(const FmbPrefillStageCandidate* candidate) const;
     void emit_pi05_q_rope_epilogue(const LayerWeights& weights,const ChunkInfo& chunk);
+    bool use_pi05_rope_register_patch() const;
     void emit_pre_layers_body();
     void emit_post_layers_body();
 

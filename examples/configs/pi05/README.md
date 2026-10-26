@@ -14,8 +14,8 @@
 |---|---|---|---|
 | FP16 | [配置](2cam/fp16.toml) | [配置](3cam/fp16.toml) | [原始 LIBERO 目录](#download-parent) |
 | W8A16 | [配置](2cam/w8a16.toml) | [T32 配置](3cam/w8a16.toml) / [T160 配置](3cam/w8a16_t160.toml) | [W8 转换目录](#run-w8) |
-| W8 + 动作 NVFP4 | [配置](2cam/w8a16_action_nvfp4.toml) | [配置](3cam/w8a16_action_nvfp4.toml) | [动作 NVFP4 转换目录](#w8--action-nvfp4离线转换后运行) |
-| 预填充 W8A8 + 动作 NVFP4 | [配置](2cam/w8a16_prefill_w8a8_action_nvfp4.toml) | [配置](3cam/w8a16_prefill_w8a8_action_nvfp4.toml) | [复用动作 NVFP4 目录](#w8--prefill-w8a8--action-nvfp4) |
+| W8 + 动作 NVFP4 | [配置](2cam/w8a16_action_nvfp4.toml) | [T32 配置](3cam/w8a16_action_nvfp4.toml) / [T160 配置](3cam/w8a16_action_nvfp4_t160.toml) | [动作 NVFP4 转换目录](#w8--action-nvfp4离线转换后运行) |
+| 预填充 W8A8 + 动作 NVFP4 | [配置](2cam/w8a16_prefill_w8a8_action_nvfp4.toml) | [T32 配置](3cam/w8a16_prefill_w8a8_action_nvfp4.toml) / [T160 配置](3cam/w8a16_prefill_w8a8_action_nvfp4_t160.toml) | [复用动作 NVFP4 目录](#w8--prefill-w8a8--action-nvfp4) |
 
 三图 T32 还提供 [FP16 TP4](generic/3cam/fp16_tp4.toml) / [TP6](generic/3cam/fp16_tp6.toml) 和 [W8 TP4](generic/3cam/w8a16_tp4.toml) / [TP6](generic/3cam/w8a16_tp6.toml)，分别复用上表原始目录和 W8 目录。全部 12 份配置对应三套权重，无需按相机数或核数重新转换。
 
@@ -104,6 +104,8 @@ python python/rpu_backend/quant/convert_pi05.py \
 ```
 
 启用预填充 W8A8 只需选择相应 TOML，继续使用 `PI05_NVFP4`。
+官方 checkpoint 可省略与 embedding 绑定且推理路径不调用的两个 `lm_head.weight`；loader
+会按该结构禁用对应 head，不需要复制或补造约 1.58 GB 的无用权重。
 
 <a id="使用"></a>
 
@@ -141,7 +143,7 @@ TOML 中填写实际绝对路径。保留模板 registry 别名时，`pi05-liber
 | `rpu_execution.prefill.chunk_size` | auto | 自动或有效整数 | NVFP4/A8 使用上述两段预填充尺寸 |
 | `rpu_execution.prefill/vision/action.linear_acc32` | 未写时 false | false / true | 分组件选择 ACC16/ACC32，权重目录不变 |
 | `pi05.instruction_residency` | 模板省略 | auto / off | 按运行条件选择快照重放；off 保留普通 Graph replay |
-| `cpu.threads` | 模板省略，入口默认 8 | 正整数 | CPU 线程，与设备核数分别设置 |
+| `cpu.threads` | T160 NVFP4 模板为 4；其他模板省略、入口默认 8 | 正整数 | CPU 线程，与设备核数分别设置；限制同机应用争抢 |
 | `run.warmup/runs/seed` | 2 / 6 / 0 | 预热≥0、采样≥1、seed≥0 | `input.noise` 可指定固定 CPU 噪声文件 |
 
 例如 T64/96/128/160 时，两图 chunk 为 288/304/320/336，三图为 416/432/448/464。公共运行、诊断和输出字段见[参数说明](../PARAMETERS.md)；运行库采用[正式 main/DDR 两份 REF](../../../docs/runtime_assets.md)。更换权重、核数或 ACC 后使用新进程。

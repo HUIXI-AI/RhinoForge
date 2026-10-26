@@ -80,7 +80,7 @@ native handle。
 **门禁：** 非法设置在 weight mutation 前失败；每种允许设置在新进程报告并执行预期
 resolved plan。
 
-## Pi0.5 v1.2.0 denoise 已知故障（更新于 2026-10-23）
+## Pi0.5 v1.2.0 denoise 已知故障（更新于 2026-10-26）
 
 本节记录 v1.2.0 客户现场排查确认的两个关联故障。它们分别影响默认 Graph loop 和
 关闭 Graph 后的 host loop。当前 RhinoForge 源码已在 host 与 native extension 层完成兼容修复，不改变
@@ -107,9 +107,10 @@ Graph 继续持有有限的物理 arena，最终耗尽。这里的“泄漏”�
 - 有界 cache 修复继续作为兜底：denoise cache 只常驻当前 signature；创建不同 signature
   前通过 `GraphCache.evict()` 安全淘汰旧 Graph。
 - 正式性能修复把逻辑 RoPE 起点改为 replay-mutable：从 Python Graph signature 和 native
-  plan identity 中移除该值；Pi0.5 denoise 在 REPLAY 时重发 host layer body，把当前帧标量
-  寄存器写入保留的 Graph kernel。物理 route 仍使用规范化的 padded prefix length 校验；
-  Vision 和 Prefill 继续使用原有完整 fast replay。
+  plan identity 中移除该值。已验证的 TP8/T160/10-step 路径在 REPLAY 前只更新
+  `PARTIAL_MROPE` 和 KV1 direct-cache 节点中的两个 32 位位置寄存器，并校验命中的节点数；
+  其他路径保留重发 host layer body 的安全回退。物理 route 仍使用规范化的 padded prefix
+  length 校验；Vision 和 Prefill 继续使用原有完整 fast replay。
 - 不可用方案：单纯增大 `graph_arena_count` 只会推迟失败；直接从 signature 删除 RoPE
   起点会让 Graph 重放旧语义，造成静默数值错误。
 
@@ -123,6 +124,14 @@ denoise Graph 保持 1 张，累计 10 次 REPLAY、0 次 recapture，cache inva
 下降 19.54%；denoise 阶段从 101.94 ms 降至 60.01 ms。逐帧对比关闭 Graph 的参考结果，
 动作 RMSE 为 0.00049--0.00055，最大绝对误差不超过 0.00340，余弦相似度不低于
 0.99999988。v1.2.0 Runtime/Launch 包和算子资产均未修改。
+
+在同一批数据上进一步将精确寄存器更新和 4 个 CPU 线程用于 W8A16 后，端到端平均为
+153.69 ms（中位 153.93 ms，P95 154.25 ms），denoise 平均 50.91 ms；六帧动作与上述正确的
+整层重发实现逐位一致。Action NVFP4 + Prefill W8A8 的正式 T160 配置平均为 142.97 ms
+（中位 142.76 ms，P95 143.93 ms），其中 Vision/Prefill/denoise 分别为
+22.36/67.69/44.85 ms。4 线程和 8 线程输出逐位一致，且 4 线程比 8 线程的 145.88 ms 更快，
+因此 T160 NVFP4 模板将 CPU 线程限制为 4，避免与同机应用争抢。Prefill W8A8 会引入额外
+量化差异，仍需用客户任务成功率验收，不作为无条件默认替换。
 
 ### 故障二：关闭 denoise Graph 后稳态动作发散
 

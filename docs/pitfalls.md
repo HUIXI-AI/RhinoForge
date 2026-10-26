@@ -111,7 +111,7 @@ to change a cold setting.
 admitted setting in a fresh process reports and executes the expected resolved
 plan.
 
-## Pi0.5 v1.2.0 denoise known issues (updated 2026-10-23)
+## Pi0.5 v1.2.0 denoise known issues (updated 2026-10-26)
 
 This section records two related failures confirmed during a v1.2.0 customer
 investigation. They affect the default Graph loop and the Graph-disabled host
@@ -144,11 +144,12 @@ not an ordinary host-heap leak.
 - The bounded-cache fix remains a safety net: retain only the current denoise
   signature and use `GraphCache.evict()` before creating a different one.
 - The production performance fix makes the logical RoPE start replay-mutable.
-  It is removed from the Python Graph signature and native plan identity, while
-  the Pi0.5 denoise owner re-emits its host layer body on REPLAY so the live
-  scalar registers are written into the retained Graph kernels. Physical route
-  validation remains keyed by the canonical padded prefix length. Vision and
-  prefill retain their existing full fast-replay path.
+  It is removed from the Python Graph signature and native plan identity. Before
+  REPLAY, the validated TP8/T160/10-step path updates only the two 32-bit position
+  registers in `PARTIAL_MROPE` and KV1 direct-cache nodes and verifies the exact
+  node count; other paths retain the safe host-layer-body re-emission fallback.
+  Physical route validation remains keyed by the canonical padded prefix length.
+  Vision and prefill retain their existing full fast-replay path.
 - Invalid fixes: increasing `graph_arena_count` only delays failure; deleting
   the RoPE start from the signature without a mutable semantic path silently
   replays stale values.
@@ -167,6 +168,17 @@ mutable replay fix. Mean denoise time fell from 101.94 ms to 60.01 ms. Against
 the Graph-disabled reference, per-frame action RMSE was 0.00049--0.00055,
 maximum absolute error was at most 0.00340, and cosine similarity was at least
 0.99999988. The v1.2.0 Runtime/Launch package and operator assets were unchanged.
+
+With the exact register update and four CPU threads, the same W8A16 workload
+averaged 153.69 ms end to end (median 153.93 ms, P95 154.25 ms) and 50.91 ms in
+denoise; all six actions were bit-identical to the correct layer-body re-emission
+implementation. The formal T160 Action NVFP4 + Prefill W8A8 profile averaged
+142.97 ms (median 142.76 ms, P95 143.93 ms), with Vision/Prefill/denoise means of
+22.36/67.69/44.85 ms. Four and eight CPU threads produced bit-identical outputs,
+while four threads improved on the eight-thread 145.88 ms mean, so the T160 NVFP4
+templates cap CPU threads at four to reduce contention with colocated applications.
+Prefill W8A8 adds quantization differences and still requires task-success
+acceptance; it is not an unconditional default replacement.
 
 ### Disabling the denoise Graph corrupts steady-state actions
 

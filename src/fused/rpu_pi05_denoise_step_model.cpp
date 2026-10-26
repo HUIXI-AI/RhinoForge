@@ -1511,6 +1511,13 @@ void Pi05DenoiseStepModel::set_rope_position(int64_t position) {
     rope_position_ = position;
 }
 
+bool Pi05DenoiseStepModel::use_pi05_rope_register_patch() const {
+    return loop_mode_ && num_steps_ == 10 &&
+        rope_position_ >= 0 && rope_position_ <= UINT32_MAX &&
+        !pi05_q_rope_epilogue_opt_in_ &&
+        use_pi05_kv1_direct_cache(chunk_size_);
+}
+
 void Pi05DenoiseStepModel::set_adarms_table(const at::Tensor& table) {
     TORCH_CHECK(!RpuKernelGraph::has_active() && num_layers() > 0
                     && get_last_resolved_chunk_size() == 0,
@@ -2530,7 +2537,17 @@ ModelStaticConfig Pi05DenoiseStepModel::static_config() {
     cfg.post_layers_fn = reinterpret_cast<void (FusedModelBase::*)()>(
         &Pi05DenoiseStepModel::emit_post_layers_body);
     cfg.body_iterations = loop_mode_ ? num_steps_ : 1;  // EXT-unroll (denoise loop)
-    cfg.replay_reemit_layer_body = true;  // refresh per-frame RoPE registers
+    cfg.replay_reemit_layer_body = !use_pi05_rope_register_patch();
+    clear_replay_kernel_u32_patches();
+    if (!cfg.replay_reemit_layer_body) {
+        const auto expected = static_cast<size_t>(num_layers() * num_steps_);
+        const auto position = static_cast<uint32_t>(rope_position_);
+        stage_replay_kernel_u32_patch(
+            KernelId::PARTIAL_MROPE, 8, position, expected);
+        stage_replay_kernel_u32_patch(
+            KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_M50D256P64,
+            12, position, expected);
+    }
     return cfg;
 }
 

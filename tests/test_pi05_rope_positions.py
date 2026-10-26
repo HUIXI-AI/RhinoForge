@@ -110,7 +110,13 @@ def test_native_denoise_plan_excludes_mutable_rope_position():
 
     static_config = source[source.index("Pi05DenoiseStepModel::static_config()") :]
     static_config = static_config[:static_config.index("return cfg;")]
-    assert "cfg.replay_reemit_layer_body = true;" in static_config
+    assert "cfg.replay_reemit_layer_body = !use_pi05_rope_register_patch();" in static_config
+    assert "clear_replay_kernel_u32_patches();" in static_config
+    assert "KernelId::PARTIAL_MROPE, 8" in static_config
+    assert "KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_M50D256P64" in static_config
+    assert "12, position, expected" in static_config
+    assert "num_layers() * num_steps_" in static_config
+    assert static_config.count("position, expected") == 2
 
 
 def test_logical_and_physical_only_agree_without_pad_rows():

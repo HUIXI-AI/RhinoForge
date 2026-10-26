@@ -40,6 +40,7 @@ class GraphDmaSemanticEndpoint;
 class GraphKernelRegisterCensusGuard;
 class SdpaStableMaskCache;
 class KvInsertSegmentPlan;
+enum class KernelId : uint16_t;
 
 namespace v3 {
 
@@ -1821,6 +1822,13 @@ protected:
     // unchanged. Subclasses use these for every row-parallel kernel's M.
     int64_t chunk_rows_(const ChunkInfo& chunk) const;
     int64_t chunk_row_offset_(const ChunkInfo& chunk) const;
+    void clear_replay_kernel_u32_patches();
+    void stage_replay_kernel_u32_patch(
+        KernelId id, uint32_t reg_lo, uint32_t value,
+        size_t expected_count);
+    size_t patch_replay_kernel_u32(
+        KernelId id, uint32_t reg_lo, uint32_t value,
+        size_t expected_count);
 
     void emit_layer_input_dma (int layer_idx, const ChunkInfo& chunk,
                                const char* dst_buf = "residual1",

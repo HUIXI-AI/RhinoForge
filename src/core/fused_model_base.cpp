@@ -3205,6 +3205,55 @@ FusedModelBase::~FusedModelBase() {
 
 InferenceContext&       FusedModelBase::ctx()       { return pimpl_->ctx_; }
 const InferenceContext& FusedModelBase::ctx() const { return pimpl_->ctx_; }
+
+void FusedModelBase::clear_replay_kernel_u32_patches() {
+    pimpl_->replay_kernel_u32_patches_.clear();
+}
+
+void FusedModelBase::stage_replay_kernel_u32_patch(
+        KernelId id, uint32_t reg_lo, uint32_t value,
+        size_t expected_count) {
+    TORCH_CHECK(expected_count > 0,
+                "replay register patch requires a positive occurrence count");
+    pimpl_->replay_kernel_u32_patches_.push_back({
+        static_cast<uint16_t>(id), reg_lo, value, expected_count});
+}
+
+size_t FusedModelBase::patch_replay_kernel_u32(
+        KernelId id, uint32_t reg_lo, uint32_t value,
+        size_t expected_count) {
+    TORCH_CHECK(RpuKernelGraph::has_active(),
+                "replay register patch requires an active Graph");
+    auto& graph = RpuKernelGraph::active();
+    TORCH_CHECK(graph.state_ == RpuKernelGraph::State::REPLAYING &&
+                    !graph.kernel_register_census_active_ &&
+                    !graph.has_kernel_register_census_nodes_,
+                "replay register patch requires a legacy REPLAY Graph");
+    size_t count = 0;
+    for (const auto& node : graph.nodes_) {
+        if (node.kind != GraphNodeKind::Kernel) continue;
+        const auto& kernel_node = node.as_kernel();
+        if (!kernel_node.kernel_id.has_value() ||
+            *kernel_node.kernel_id != id) continue;
+        TORCH_CHECK(kernel_node.kernel_idx < graph.kernels_.size(),
+                    "replay register patch kernel index is out of range");
+        auto* kernel = graph.kernels_[kernel_node.kernel_idx].get();
+        TORCH_CHECK(
+            kernel->set_regs(reg_lo, static_cast<uint16_t>(value)) ==
+                    ::rhino_lkn::kKernelRegOk &&
+                kernel->set_regs(reg_lo + 1,
+                                 static_cast<uint16_t>(value >> 16)) ==
+                    ::rhino_lkn::kKernelRegOk,
+            "replay register patch rejected registers ", reg_lo, "/",
+            reg_lo + 1);
+        ++count;
+    }
+    TORCH_CHECK(count == expected_count,
+                "replay register patch occurrence mismatch: got ", count,
+                ", expected ", expected_count);
+    graph.kernel_params_dirty_this_replay_ = true;
+    return count;
+}
 void FusedModelBase::begin_external_physical_manifest_prologue(
     const FmbPhysicalExecutionManifest& manifest,
     int64_t physical_length,
@@ -16344,6 +16393,11 @@ at::Tensor FusedModelBase::run_all_layers_impl(
         && RpuKernelGraph::active().state() == RpuKernelGraph::State::REPLAYING;
     if (fast_skip) {
         auto& g = RpuKernelGraph::active();
+        for (const auto& patch : pimpl_->replay_kernel_u32_patches_) {
+            patch_replay_kernel_u32(
+                static_cast<KernelId>(patch.kernel_id), patch.reg_lo,
+                patch.value, patch.expected_count);
+        }
         if (static_cfg.post_fn != nullptr && g.has_post_fn_cursor()
             && !static_cfg.fast_replay_bake_post_fn) {
             // D-501 post_fn graph: skip only the layer body, leave post_fn's

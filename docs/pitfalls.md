@@ -175,15 +175,8 @@ denoise; all six actions were bit-identical to the correct layer-body re-emissio
 implementation. The formal T160 Action NVFP4 + Prefill W8A8 profile averaged
 142.97 ms (median 142.76 ms, P95 143.93 ms), with Vision/Prefill/denoise means of
 22.36/67.69/44.85 ms. Four and eight CPU threads produced bit-identical outputs,
-while four threads improved on the eight-thread 145.88 ms mean. A follow-up CPU
-contention sweep fixed inter-op threads at one. Across two trials, two intra-op
-threads averaged 142.84--143.47 ms and four averaged 142.77--142.80 ms; all six
-outputs were bit-identical. The validated Prefill W8A8 + Action NVFP4 T160
-template therefore accepts about 0.26% mean latency cost to halve intra-op use,
-using two intra-op and one inter-op thread. One intra-op thread regressed to
-146.43 ms. Existing denoise DMA-elision and SPM-staging experiments were also
-tested alone and together; their means were 143.52/143.09/144.01 ms, so none is
-enabled in the production profile.
+while four threads improved on the eight-thread 145.88 ms mean, so the T160 NVFP4
+templates cap CPU threads at four to reduce contention with colocated applications.
 Prefill W8A8 adds quantization differences and still requires task-success
 acceptance; it is not an unconditional default replacement.
 

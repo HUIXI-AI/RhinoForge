@@ -130,12 +130,7 @@ denoise Graph 保持 1 张，累计 10 次 REPLAY、0 次 recapture，cache inva
 整层重发实现逐位一致。Action NVFP4 + Prefill W8A8 的正式 T160 配置平均为 142.97 ms
 （中位 142.76 ms，P95 143.93 ms），其中 Vision/Prefill/denoise 分别为
 22.36/67.69/44.85 ms。4 线程和 8 线程输出逐位一致，且 4 线程比 8 线程的 145.88 ms 更快，
-随后固定 inter-op 为 1 继续测试 CPU 争用。两轮测试中，2 个 intra-op 线程平均为
-142.84--143.47 ms，4 个线程为 142.77--142.80 ms，
-六帧输出仍逐位一致。因此已验证的 Prefill W8A8 + Action NVFP4 T160 模板接受约 0.26% 的
-平均延迟代价，换取 intra-op 使用量减半，正式使用 2 个 intra-op 和 1 个 inter-op 线程；
-1 个 intra-op 线程会退化到 146.43 ms。另对现有 denoise 最终回写省略、片上动作暂存及两者组合
-进行了实测，平均分别为 143.52/143.09/144.01 ms，均未在正式配置中启用。Prefill W8A8 会引入额外
+因此 T160 NVFP4 模板将 CPU 线程限制为 4，避免与同机应用争抢。Prefill W8A8 会引入额外
 量化差异，仍需用客户任务成功率验收，不作为无条件默认替换。
 
 ### 故障二：关闭 denoise Graph 后稳态动作发散

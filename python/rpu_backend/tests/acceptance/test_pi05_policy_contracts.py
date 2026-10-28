@@ -190,6 +190,18 @@ def test_pi05_top_level_is_serialized_and_child_graphs_key_physical_plan():
     decorator_names = {node.id for node in patched.decorator_list if isinstance(node, ast.Name)}
     assert 'execution_serialized' in decorator_names
     assert runtime_source.count('action_plan.graph_key_words()') == 2
+    denoise_step_calls = [
+        node for node in ast.walk(runtime_tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == 'pi05_denoise_step_forward'
+    ]
+    assert len(denoise_step_calls) == 2
+    assert all(
+        ast.unparse(call.args[-1])
+        == 'action_plan.selected.stage_tuple.physical_descriptor'
+        for call in denoise_step_calls
+    )
     siglip_source = (root / 'python/rpu_backend/adapters/siglip.py').read_text(encoding='utf-8')
     adarms_source = (root / 'python/rpu_backend/adapters/pi05/adarms.py').read_text(encoding='utf-8')
     assert '_component_plan.graph_key_words()' in siglip_source
@@ -200,6 +212,47 @@ def test_pi05_top_level_is_serialized_and_child_graphs_key_physical_plan():
     siglip_cpp = (root / 'src/fused/rpu_siglip_model.cpp').read_text(encoding='utf-8')
     assert 'image_batch_count_ = packed_image_count;' in siglip_cpp
     assert siglip_cpp.count('configure_chunk_for_shape(') == 4
+
+
+def test_pi05_denoise_graph_keeps_only_the_current_signature():
+    from rpu_backend.adapters.pi05.runtime import _capture_bounded_denoise_graph
+
+    events = []
+
+    class _Scope:
+
+        def __init__(self, sig):
+            self.sig = sig
+
+        def __enter__(self):
+            events.append(('enter', self.sig))
+
+        def __exit__(self, *_exc):
+            events.append(('exit', self.sig))
+
+    class _Cache:
+
+        def capture(self, sig):
+            events.append(('capture', sig))
+            return _Scope(sig)
+
+        def evict(self, sig):
+            events.append(('evict', sig))
+
+    cache = _Cache()
+    sig_a = object()
+    sig_b = object()
+    with _capture_bounded_denoise_graph(cache, sig_a):
+        pass
+    with _capture_bounded_denoise_graph(cache, sig_a):
+        pass
+    with _capture_bounded_denoise_graph(cache, sig_b):
+        pass
+
+    assert [event for event in events if event[0] == 'evict'] == [
+        ('evict', sig_a),
+    ]
+    assert vars(cache)['_pi05_denoise_graph_signature'] is sig_b
 
 def test_pi05_regular_and_packed_siglip_share_component_plan_authority():
     root = Path(__file__).resolve().parents[4]

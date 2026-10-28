@@ -19,8 +19,11 @@ def test_loader_passes_loaded_group_config_and_preserves_mixed_weights(tmp_path,
             self.model.paligemma_with_expert = torch.nn.Module()
             pawe = self.model.paligemma_with_expert
             pawe.paligemma = torch.nn.Module()
+            pawe.paligemma.lm_head = torch.nn.Linear(64, 128, bias=False)
             pawe.paligemma.model = torch.nn.Module()
             pawe.paligemma.model.language_model = torch.nn.Module()
+            pawe.gemma_expert = torch.nn.Module()
+            pawe.gemma_expert.lm_head = torch.nn.Linear(64, 128, bias=False)
             layer = torch.nn.Module()
             layer.self_attn = torch.nn.Module()
             layer.self_attn.q_proj = torch.nn.Linear(64, 128, bias=False)
@@ -58,6 +61,8 @@ def test_loader_passes_loaded_group_config_and_preserves_mixed_weights(tmp_path,
     policy = _load_and_fp16_cast(str(tmp_path), torch.float16)
 
     assert TinyPI05.__init__ is original_init
+    assert policy.model.paligemma_with_expert.paligemma.lm_head is None
+    assert policy.model.paligemma_with_expert.gemma_expert.lm_head is None
     assert not policy.training and policy._pi05_quant_config == config
     projections = policy.model.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn
     for name, expected_scale_shape in (("q_proj", (128,)), ("k_proj", (128,))):

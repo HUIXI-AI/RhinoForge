@@ -109,6 +109,12 @@ def _validate_text_profile(text_tokens: int, *, cameras: int, precision: str | N
             raise ValueError(f"T{text_tokens} requires FP16, W8A16, or Action NVFP4 precision")
 
 
+def _cpu_interop_threads(*, paired: bool, precision: str, prefill_w8a8: bool,
+                         cameras: int, text_tokens: int) -> int:
+    return 1 if (paired and precision == "w4a16" and prefill_w8a8
+                 and cameras == 3 and text_tokens == 160) else 24
+
+
 def resolve_prefill_chunk_size(*, cameras: int, prefill_w8a8: bool, requested: int | None,
                                text_tokens: int = 32) -> int:
     """Bind the selected A8 ABI to its exact chunk before importing the backend."""
@@ -554,7 +560,10 @@ def run_profile(args, *, bind_libraries=False) -> dict:
     from rpu_backend.model_registry import model_path
 
     actual_payloads = runtime_payloads(libraries)
-    torch.set_num_interop_threads(24)
+    torch.set_num_interop_threads(_cpu_interop_threads(
+        paired=paired, precision=args.precision, prefill_w8a8=args.prefill_w8a8,
+        cameras=args.cameras, text_tokens=args.text_tokens))
+    effective_cpu["torch_num_interop_threads"] = torch.get_num_interop_threads()
     checkpoint = Path(args.checkpoint).expanduser()
     if not checkpoint.is_dir():
         checkpoint = model_path(args.checkpoint)

@@ -91,7 +91,6 @@ public:
 
     std::vector<int64_t> planner_cache_identity() const {
         auto identity = FusedModelBase::planner_cache_identity();
-        identity.push_back(rope_position_);
         for (const auto& table : nvfp4_.values) append_kvinsert_cost_tensor_identity(identity, table);
         if (linear_acc32_) identity.insert(identity.end(), {0x4143433332LL, 1});
         return identity;
@@ -227,6 +226,7 @@ private:
     void validate_pi05_q_rope_manifest(const FmbPhysicalExecutionManifest& manifest) const;
     void validate_pi05_q_rope_policy(const FmbPrefillStageCandidate* candidate) const;
     void emit_pi05_q_rope_epilogue(const LayerWeights& weights,const ChunkInfo& chunk);
+    bool use_pi05_rope_register_patch() const;
     void emit_pre_layers_body();
     void emit_post_layers_body();
 
@@ -399,7 +399,7 @@ private:
                     static_cast<int64_t>(
                         KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_M50D256P64),
                     68, 2, 1, 1, 0, 68, 4, 1, 1, 0,
-                    rope_position_ >= 0 ? rope_position_ : planned_prefix_len_});
+                    0});  // logical RoPE is a replay-mutable register
             } else {
                 identity[2] = 10;
                 // Direct-cache schema, route mode, exact profile, pair map,
@@ -410,7 +410,7 @@ private:
                     256, 32, 16, 1024, 2048, 592, 32, 128, 0, 8, 4, 1,
                     0x4b56314c494e4541LL,  // "KV1LINEA" fixed producer identity
                     0x4b56314449524543LL,  // "KV1DIREC" direct-cache identity
-                    rope_position_ >= 0 ? rope_position_ : planned_prefix_len_});
+                    0});  // logical RoPE is a replay-mutable register
             }
         }
         if (pi05_geglu_m50_opt_in_) {

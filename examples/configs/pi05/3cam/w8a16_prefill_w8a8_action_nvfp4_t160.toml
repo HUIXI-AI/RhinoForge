@@ -1,0 +1,20 @@
+# Three-camera Pi0.5 Prefill W8A8 + Action NVFP4 profile with a T160 text slot.
+[pi05]
+precision = "w8a16_prefill_w8a8_action_nvfp4"
+
+[input]
+checkpoint = "/path/to/pi05_action_nvfp4"
+batch = "/path/to/pi05_3cam_t160_batch.pt"
+cameras = 3
+text_tokens = 160
+num_steps = 10
+# noise = "/path/to/fixed_cpu_noise.pt"
+
+[run]
+warmup = 2
+runs = 6
+seed = 0
+output_dir = "./pi05_results/3cam/w8a16_prefill_w8a8_action_nvfp4_t160"
+
+[cpu]
+threads = 2

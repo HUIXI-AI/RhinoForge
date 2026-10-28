@@ -136,7 +136,10 @@ CPU 列为请求值，`继承` 表示按运行器或环境设置。固定 P/D �
 | [pi05/3cam/fp16.toml](pi05/3cam/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；相机=3；T=32 | 8（运行器默认） | `SUPPORTED_LIMITED`<br>`PI05_LIBERO_FP16_SUPPORTED` |
 | [pi05/3cam/w8a16.toml](pi05/3cam/w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；相机=3；T=32 | 8（运行器默认） | `SUPPORTED_LIMITED`<br>`PI05_LIBERO_W8A16_SUPPORTED_LIMITED` |
 | [pi05/3cam/w8a16_action_nvfp4.toml](pi05/3cam/w8a16_action_nvfp4.toml) | [run.py](../run.py)<br>运行模板 | `w8a16_action_nvfp4`；相机=3；T=32 | 8（运行器默认） | 未登记；模型专用模板 |
+| [pi05/3cam/w8a16_action_nvfp4_t160.toml](pi05/3cam/w8a16_action_nvfp4_t160.toml) | [run.py](../run.py)<br>运行模板 | `w8a16_action_nvfp4`；相机=3；T=160 | 4 | 未登记；模型专用模板 |
 | [pi05/3cam/w8a16_prefill_w8a8_action_nvfp4.toml](pi05/3cam/w8a16_prefill_w8a8_action_nvfp4.toml) | [run.py](../run.py)<br>运行模板 | `w8a16_prefill_w8a8_action_nvfp4`；相机=3；T=32 | 8（运行器默认） | 未登记；模型专用模板 |
+| [pi05/3cam/w8a16_prefill_w8a8_action_nvfp4_t160.toml](pi05/3cam/w8a16_prefill_w8a8_action_nvfp4_t160.toml) | [run.py](../run.py)<br>运行模板 | `w8a16_prefill_w8a8_action_nvfp4`；相机=3；T=160 | 2 | 未登记；模型专用模板 |
+| [pi05/3cam/w8a16_t160.toml](pi05/3cam/w8a16_t160.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；相机=3；T=160 | 8（运行器默认） | 未登记；模型专用模板 |
 | [pi05/generic/3cam/fp16_tp4.toml](pi05/generic/3cam/fp16_tp4.toml) | [run.py](../run.py)<br>通用执行 | `fp16`；相机=3；T=32；TP=4 | 8（运行器默认） | `IMPLEMENTED_UNVERIFIED_HW`<br>`PI05_LIBERO_FP16_TP4_UNVERIFIED_HW` |
 | [pi05/generic/3cam/fp16_tp6.toml](pi05/generic/3cam/fp16_tp6.toml) | [run.py](../run.py)<br>通用执行 | `fp16`；相机=3；T=32；TP=6 | 8（运行器默认） | `IMPLEMENTED_UNVERIFIED_HW`<br>`PI05_LIBERO_FP16_TP6_UNVERIFIED_HW` |
 | [pi05/generic/3cam/w8a16_tp4.toml](pi05/generic/3cam/w8a16_tp4.toml) | [run.py](../run.py)<br>通用执行 | `w8a16`；相机=3；T=32；TP=4 | 8（运行器默认） | `IMPLEMENTED_UNVERIFIED_HW`<br>`PI05_LIBERO_W8A16_TP4_UNVERIFIED_HW` |
@@ -430,4 +433,4 @@ CPU 列为请求值，`继承` 表示按运行器或环境设置。固定 P/D �
 | [wall_oss/sorting/w8a16.toml](wall_oss/sorting/w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w8a16` | 继承 | 未登记；模型专用模板 |
 | [wall_oss/sorting/w8a16_action_w4a16_g32.toml](wall_oss/sorting/w8a16_action_w4a16_g32.toml) | [run.py](../run.py)<br>运行模板 | `w8a16_action_w4a16` | 继承 | 未登记；模型专用模板 |
 
-合计 **298** 份配置。
+合计 **301** 份配置。

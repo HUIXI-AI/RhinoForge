@@ -9,6 +9,11 @@
 - 修复环境包中的 wheel 排除规则、严格 shell 模式下的激活，以及 Wall-OSS 从已安装环境运行时的源码身份和路径检查。
 - 增加 RhinoVLA v3 FP16 RTC 示例与接口，支持 `action_prefix` 和整数 `delay=0..6`；限定 batch 1、30 步动作窗口、96 维动作及 10 步去噪配置。
 - RTC 按 delay 缓存 Graph、刷新历史动作输入并提前预留所需 arena；不支持的精度、融合和执行配置会提前报错。该配置仍为 `example_only`，需配套新编译的原生扩展，不能直接使用此前制作的环境包。
+- 修复 Pi0.5 denoise Graph 因逻辑前缀变化持续占用 arena，以及关闭 Graph 后 host loop
+  丢失物理执行描述导致稳态数值漂移的问题；动态 RoPE 位置现在可在同一张 Graph 上稳定
+  回放；T160 快速路径只更新 Graph kernel 的位置寄存器，并增加 Action NVFP4、Prefill W8A8
+  与 2 CPU / 1 inter-op 线程的 T160 配置；loader 同时支持官方 checkpoint 省略未使用的 tied LM heads，
+  无需更改 v1.2.0 Runtime/Launch 包。
 
 Development has moved to 1.3; this line currently provides source only.
 
@@ -17,6 +22,13 @@ Development has moved to 1.3; this line currently provides source only.
 - Fixed wheel exclusions and strict-shell activation in environment bundles, and source identity/path checks when running Wall-OSS from an installed environment.
 - Added a RhinoVLA v3 FP16 RTC example and API with `action_prefix` and integer `delay=0..6`, restricted to batch 1, a 30-action horizon, 96 action dimensions and ten denoising steps.
 - RTC caches Graphs by delay, refreshes action history inputs and reserves the required arenas before conversion. Unsupported precision, fusion and execution profiles fail early. The profile remains `example_only` and requires a newly built native extension; earlier environment bundles do not include RTC support.
+- Fixed Pi0.5 denoise arena retention across changing logical prefixes and
+  steady-state host-loop drift caused by dropping the physical execution
+  descriptor. Dynamic RoPE positions now replay through one retained Graph;
+  the T160 fast path updates only Graph-kernel position registers and adds T160
+  Action NVFP4, Prefill W8A8 and a two-CPU/one-inter-op-thread configuration. The loader also
+  accepts the official checkpoint's omitted unused tied LM heads. The v1.2.0
+  Runtime/Launch package is unchanged.
 
 ## v1.2.0
 

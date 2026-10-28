@@ -582,6 +582,7 @@ bool Pi05DenoiseStepModel::use_pi05_q_rope_epilogue(int64_t rows,int64_t logical
 void Pi05DenoiseStepModel::validate_pi05_q_rope_manifest(
     const FmbPhysicalExecutionManifest& manifest) const {
     const int64_t logical_position=rope_position_>=0 ? rope_position_ : planned_prefix_len_;
+    const int64_t descriptor_position=planned_prefix_len_;
     if (pi05_q_rope_epilogue_opt_in_)
         TORCH_CHECK(use_pi05_q_rope_epilogue(manifest.physical_length,logical_position) &&
             manifest.state==FmbPhysicalManifestState::COMPLETE &&
@@ -602,8 +603,8 @@ void Pi05DenoiseStepModel::validate_pi05_q_rope_manifest(
             ++fusions;
             TORCH_CHECK(pi05_q_rope_epilogue_opt_in_ && route.family==FmbRouteFamily::LINEAR &&
                 route.selector==PI05_DENOISE_Q_PAIR16_ROPE && route.flags==0 && route.invocation==0 &&
-                route.arguments==pi05_q_rope_arguments(logical_position),
-                "Pi Q-RoPE fused physical route or logical position mismatch");
+                route.arguments==pi05_q_rope_arguments(descriptor_position),
+                "Pi Q-RoPE fused physical route mismatch");
         } else if (pi05_q_rope_epilogue_opt_in_) {
             TORCH_CHECK(route.site_id!=PI05_DENOISE_Q_LINEAR_SITE &&
                 route.site_id!=PI05_DENOISE_Q_ROPE_SITE,
@@ -611,8 +612,8 @@ void Pi05DenoiseStepModel::validate_pi05_q_rope_manifest(
             if (route.site_id==PI05_DENOISE_K_ROPE_SITE) {
                 ++paired_k_rope;
                 TORCH_CHECK(route.family==FmbRouteFamily::ROPE && route.invocation==0 &&
-                    !route.arguments.empty() && route.arguments.front()==logical_position,
-                    "Pi Q/K routes disagree on frozen logical RoPE position");
+                    !route.arguments.empty() && route.arguments.front()==descriptor_position,
+                    "Pi Q/K routes disagree on canonical RoPE descriptor position");
             }
         }
     }
@@ -1333,8 +1334,7 @@ void Pi05DenoiseStepModel::validate_pi05_xor3_gated_mlp_policy(
 
 void Pi05DenoiseStepModel::validate_pi05_kv1_direct_cache_manifest(
     const FmbPhysicalExecutionManifest& manifest) const {
-    const int64_t logical_position =
-        rope_position_ >= 0 ? rope_position_ : planned_prefix_len_;
+    const int64_t descriptor_position = planned_prefix_len_;
     const bool enabled = use_pi05_kv1_direct_cache(manifest.physical_length);
     const bool pair_owner =
         use_pi05_kv1_pair_owner(manifest.physical_length);
@@ -1373,10 +1373,10 @@ void Pi05DenoiseStepModel::validate_pi05_kv1_direct_cache_manifest(
             ++policies;
             const auto expected_policy = pi05_kv1_pair_owner_opt_in_
                 ? pi05_kv1_pair_owner_policy_arguments(
-                      pi05_kv1_pair_owner_opt_in_, logical_position,
+                      pi05_kv1_pair_owner_opt_in_, descriptor_position,
                       planned_prefix_len_, pi05_is_fp16_action(layer_weights_), planned_num_steps_)
                 : pi05_kv1_direct_policy_arguments(
-                      pi05_kv1_direct_cache_opt_in_, logical_position, planned_prefix_len_);
+                      pi05_kv1_direct_cache_opt_in_, descriptor_position, planned_prefix_len_);
             TORCH_CHECK(
                 route.family == FmbRouteFamily::GRAPH_SCHEDULE &&
                     route.selector == 1 && route.flags == 0 &&
@@ -1429,7 +1429,7 @@ void Pi05DenoiseStepModel::validate_pi05_kv1_direct_cache_manifest(
                                 Pi05DenoiseRopeRoute::FULL_ROPE_TILED) &&
                             route.invocation == 0 &&
                             route.arguments ==
-                                std::vector<int64_t>{logical_position},
+                                std::vector<int64_t>{descriptor_position},
                         "Pi KV1 direct-cache K-RoPE semantic route drifted");
                 } else {
                     const auto frozen = restore_kvinsert_plan_from_manifest(
@@ -1501,13 +1501,21 @@ void Pi05DenoiseStepModel::emit_pi05_q_rope_epilogue(
         "Pi Q-RoPE runtime owner/profile drift");
     pi05_require_stable_graph_dma_capture();
     ctx().consume_physical_route(FmbRouteFamily::LINEAR,PI05_DENOISE_Q_EPILOGUE_LINEAR_SITE,
-        PI05_DENOISE_Q_PAIR16_ROPE,0,pi05_q_rope_arguments(logical_position),chunk.idx);
+        PI05_DENOISE_Q_PAIR16_ROPE,0,
+        pi05_q_rope_arguments(ctx().position + chunk.offset),chunk.idx);
     rpu_launch_pi05_q_rope_spm_kernel(addr(0,"input_norm"),weights.q_w,addr(0,"q"),
         weights.q_ws,cos_,sin_,logical_position);
 }
 
 void Pi05DenoiseStepModel::set_rope_position(int64_t position) {
     rope_position_ = position;
+}
+
+bool Pi05DenoiseStepModel::use_pi05_rope_register_patch() const {
+    return loop_mode_ && num_steps_ == 10 &&
+        rope_position_ >= 0 && rope_position_ <= UINT32_MAX &&
+        !pi05_q_rope_epilogue_opt_in_ &&
+        use_pi05_kv1_direct_cache(chunk_size_);
 }
 
 void Pi05DenoiseStepModel::set_adarms_table(const at::Tensor& table) {
@@ -2529,6 +2537,17 @@ ModelStaticConfig Pi05DenoiseStepModel::static_config() {
     cfg.post_layers_fn = reinterpret_cast<void (FusedModelBase::*)()>(
         &Pi05DenoiseStepModel::emit_post_layers_body);
     cfg.body_iterations = loop_mode_ ? num_steps_ : 1;  // EXT-unroll (denoise loop)
+    cfg.replay_reemit_layer_body = !use_pi05_rope_register_patch();
+    clear_replay_kernel_u32_patches();
+    if (!cfg.replay_reemit_layer_body) {
+        const auto expected = static_cast<size_t>(num_layers() * num_steps_);
+        const auto position = static_cast<uint32_t>(rope_position_);
+        stage_replay_kernel_u32_patch(
+            KernelId::PARTIAL_MROPE, 8, position, expected);
+        stage_replay_kernel_u32_patch(
+            KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_M50D256P64,
+            12, position, expected);
+    }
     return cfg;
 }
 
@@ -2668,11 +2687,10 @@ Pi05DenoiseStepModel::physical_manifest_for_candidate(
             pi05_kv1_pair_owner_opt_in_
                 ? pi05_kv1_pair_owner_policy_arguments(
                       /*enabled=*/pi05_kv1_pair_owner_opt_in_,
-                      rope_position_ >= 0 ? rope_position_ : position,
+                      position,
                       planned_prefix_len_, pi05_is_fp16_action(layer_weights_), planned_num_steps_)
                 : pi05_kv1_direct_policy_arguments(
-                      /*enabled=*/true,
-                      rope_position_ >= 0 ? rope_position_ : position, planned_prefix_len_));
+                      /*enabled=*/true, position, planned_prefix_len_));
     }
     TORCH_CHECK(!pi05_q_rope_epilogue_opt_in_ ||
         (use_pi05_q_rope_epilogue(physical_len,rope_position_>=0?rope_position_:position) &&
@@ -2771,8 +2789,7 @@ Pi05DenoiseStepModel::physical_manifest_for_candidate(
     append(FmbRouteFamily::GRAPH_SCHEDULE,
            PI05_DENOISE_ZERO_GATED_RESIDUAL_SITE,
            pi05_denoise_residual_route(physical_len), {hidden_size()});
-    const int64_t rope_base = rope_position_ >= 0
-        ? rope_position_ : position;
+    const int64_t rope_base = position;
     for (const ChunkInfo& chunk : plan.compute.chunks) {
         const int64_t invocation = chunk.idx;
         for (const int64_t site : {PI05_DENOISE_ATTN_NORM_SITE,
@@ -3294,9 +3311,9 @@ void Pi05DenoiseStepModel::rebind_kvinsert_exact_candidate(
     TORCH_CHECK(rope != manifest.routes.end() && kv != manifest.routes.end() &&
                     chunk != chunks.end() && !rope->arguments.empty(),
                 "Pi0.5 exact KV mint lost its paired K-RoPE site or compute chunk");
-    // Logical RoPE is frozen in the admitted source descriptor. It is not the
-    // physical KV position and must not come from a later mutable rope_position_.
-    const int64_t logical_position = rope->arguments.front();
+    // Route metadata binds topology to the physical prefix. The live logical
+    // RoPE start is replay-mutable and does not belong in the descriptor.
+    const int64_t descriptor_position = rope->arguments.front();
     const bool source_fused =
         (rope->flags & PI05_DENOISE_K_ROPE_INSERT_FLAG) != 0;
     const bool source_gathered =
@@ -3313,9 +3330,9 @@ void Pi05DenoiseStepModel::rebind_kvinsert_exact_candidate(
                     rope->selector == static_cast<int64_t>(head_dim() == 256
                         ? Pi05DenoiseRopeRoute::FULL_ROPE_TILED : Pi05DenoiseRopeRoute::ROPE_1D) &&
                     rope->arguments == (source_fused
-                        ? pi05_k_rope_insert_arguments(logical_position,
+                        ? pi05_k_rope_insert_arguments(descriptor_position,
                               planned_k_rope_cache_capacity_, planned_k_rope_cache_capacity_, planned_prefix_len_)
-                        : std::vector<int64_t>{logical_position}),
+                        : std::vector<int64_t>{descriptor_position}),
                 "Pi0.5 exact KV mint source K-RoPE metadata is not canonical");
     const bool k_fused = manifest.physical_length == 50 &&
         manifest.logical_length == 50 && chunks.size() == 1 && chunk->offset == 0 &&
@@ -3323,7 +3340,7 @@ void Pi05DenoiseStepModel::rebind_kvinsert_exact_candidate(
         layout.attention_policy == AttentionExecutionPolicy::DDR_KV &&
         !source_direct &&
         use_pi05_k_rope_insert(chunk->len, plan.segment(0).position,
-                              logical_position, layout.batch_size, plan);
+                              descriptor_position, layout.batch_size, plan);
     const bool kv1_stripe = use_pi05_kv1_stripe_gather(chunk->len);
     const bool kv1_direct = use_pi05_kv1_direct_cache(chunk->len);
     rope->flags = kv1_direct
@@ -3331,9 +3348,9 @@ void Pi05DenoiseStepModel::rebind_kvinsert_exact_candidate(
         : (k_fused ? PI05_DENOISE_K_ROPE_INSERT_FLAG : 0) |
             (kv1_stripe ? PI05_DENOISE_KV1_GATHERED_SOURCE_FLAG : 0);
     rope->arguments = k_fused
-        ? pi05_k_rope_insert_arguments(logical_position,
+        ? pi05_k_rope_insert_arguments(descriptor_position,
               planned_k_rope_cache_capacity_, planned_k_rope_cache_capacity_, planned_prefix_len_)
-        : std::vector<int64_t>{logical_position};
+        : std::vector<int64_t>{descriptor_position};
     kv->flags = rope->flags;
     // KV selector and all22 codec words are already authoritative from mint.
     // Leave them intact; the unmodified exact forward consumer checks both sites.
@@ -3781,13 +3798,14 @@ void Pi05DenoiseStepModel::build_layer_subgraph(int layer_idx, const ChunkInfo& 
     // (see rope_position_). Equal only when the prefix has no pad rows.
     const int64_t rope_start = (rope_position_ >= 0)
         ? rope_position_ + chunk.offset : cos_sin_start;
+    const int64_t descriptor_rope_start = ctx().position + chunk.offset;
     if (!pi05_q_rope_epilogue_opt_in_) {
         if (ctx().has_complete_physical_manifest()) {
             ctx().consume_physical_route(
                 FmbRouteFamily::ROPE, PI05_DENOISE_Q_ROPE_SITE,
                 static_cast<int64_t>(head_dim() == 256
                     ? Pi05DenoiseRopeRoute::FULL_ROPE_TILED : Pi05DenoiseRopeRoute::ROPE_1D),
-                /*resolved_flags=*/0, {rope_start}, chunk.idx);
+                /*resolved_flags=*/0, {descriptor_rope_start}, chunk.idx);
         }
         if (hd == 256) {
             rpu_launch_partial_mrope_spm_kernel(
@@ -3854,8 +3872,8 @@ void Pi05DenoiseStepModel::build_layer_subgraph(int layer_idx, const ChunkInfo& 
             static_cast<int64_t>(head_dim() == 256
                 ? Pi05DenoiseRopeRoute::FULL_ROPE_TILED : Pi05DenoiseRopeRoute::ROPE_1D),
             kv_route_flags,
-            k_fused ? pi05_k_rope_insert_arguments(rope_start, k_capacity, v_capacity, planned_prefix_len_)
-                    : std::vector<int64_t>{rope_start}, chunk.idx);
+            k_fused ? pi05_k_rope_insert_arguments(descriptor_rope_start, k_capacity, v_capacity, planned_prefix_len_)
+                    : std::vector<int64_t>{descriptor_rope_start}, chunk.idx);
         const auto kv_arguments = rpu_kvinsert_route_arguments(kv_plan, tp, nkv, hd);
         ctx().consume_physical_route(
             FmbRouteFamily::KV_INSERT, PI05_DENOISE_KV_INSERT_SITE,
@@ -4379,13 +4397,11 @@ void Pi05DenoiseStepModel::emit_pre_layers_body() {
                 pi05_kv1_pair_owner_opt_in_
                     ? pi05_kv1_pair_owner_policy_arguments(
                           /*enabled=*/pi05_kv1_pair_owner_opt_in_,
-                          rope_position_ >= 0
-                              ? rope_position_ : ctx().position,
+                          ctx().position,
                           planned_prefix_len_, pi05_is_fp16_action(layer_weights_), planned_num_steps_)
                     : pi05_kv1_direct_policy_arguments(
                           /*enabled=*/true,
-                          rope_position_ >= 0
-                              ? rope_position_ : ctx().position, planned_prefix_len_));
+                          ctx().position, planned_prefix_len_));
         }
     }
     validate_pi05_graph_dma_runtime();

@@ -325,6 +325,13 @@ def _load_and_fp16_cast(model_path: str, dtype: "torch.dtype", **lerobot_kwargs:
 
     # Load weights via safetensors.
     state_dict = load_file(remapped_path)
+    for module_name in (
+        "model.paligemma_with_expert.paligemma",
+        "model.paligemma_with_expert.gemma_expert",
+    ):
+        # LeRobot's Pi0.5 forward bypasses both causal-LM heads; tied checkpoints omit them.
+        if f"{module_name}.lm_head.weight" not in state_dict:
+            policy.get_submodule(module_name).lm_head = None
     w8a16_consumed = _pop_pi05_w8a16_tensors(policy, state_dict, quant_config)
     _consumed_method = quant_config.get("method")
     if _consumed_method in ("w4a16_fake_int8", "w4a16", "nvfp4a16") and not w8a16_consumed:

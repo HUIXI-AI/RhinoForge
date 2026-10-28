@@ -20,6 +20,7 @@ _kv_prefix_full_hash, _run_denoise_fused, _run_denoise_python_baseline,
 and replaced nested _run_denoise with dispatcher.
 """
 from __future__ import annotations
+from contextlib import contextmanager
 import os
 import threading
 import weakref
@@ -1336,7 +1337,7 @@ def _run_denoise_fused(self, x_t_cpu_fp32, prefix_pad_masks, past_key_values,
     effective_num_kv_heads = int(getattr(
         expert_model, "_rpu_effective_num_kv_heads", ec.num_key_value_heads
     ))
-    rope_pos = _set_denoise_rope_position(handle, prefix_pad_masks)
+    _set_denoise_rope_position(handle, prefix_pad_masks)
     action_plan = _plan_pi05_denoise_action_execution(
         self,
         handle=int(handle),
@@ -1355,7 +1356,6 @@ def _run_denoise_fused(self, x_t_cpu_fp32, prefix_pad_masks, past_key_values,
                   ec.num_attention_heads, effective_num_kv_heads,
                   ec.head_dim, prefix_len, num_steps,
                   self.action_in_proj.out_features,
-                  rope_pos,
                   *action_plan.graph_key_words()],  # physical child authority
         dtypes=[torch.float16],
     )
@@ -1363,7 +1363,7 @@ def _run_denoise_fused(self, x_t_cpu_fp32, prefix_pad_masks, past_key_values,
     for step in range(num_steps):
         cond_step = adarms_cond_all_rpu.select(0, step).contiguous()
         if use_graph:
-            with cache.capture(sig):
+            with _capture_bounded_denoise_graph(cache, sig):
                 torch.ops.rpu.pi05_denoise_step_forward(
                     handle, x_t_rpu,
                     past_key_values.k_caches, past_key_values.v_caches,
@@ -1374,7 +1374,7 @@ def _run_denoise_fused(self, x_t_cpu_fp32, prefix_pad_masks, past_key_values,
                 handle, x_t_rpu,
                 past_key_values.k_caches, past_key_values.v_caches,
                 cond_step, mask_4d, v_t_buf, prefix_len,
-                [])
+                action_plan.selected.stage_tuple.physical_descriptor)
         # Euler CPU fp32 (Diff-B fix preserved):
         x_t_cpu_fp32 = x_t_cpu_fp32 + dt * v_t_buf.to('cpu', torch.float32)
         if _euler_fp16_enabled():  # A/B: model an on-device fp16 Euler
@@ -1400,7 +1400,7 @@ def _run_denoise_fused(self, x_t_cpu_fp32, prefix_pad_masks, past_key_values,
 
 
 
-def _set_denoise_rope_position(handle, prefix_pad_masks) -> int:
+def _set_denoise_rope_position(handle, prefix_pad_masks) -> None:
     """Give the fused denoise expert the suffix's LOGICAL RoPE start.
 
     `prefix_len` (= prefix_pad_masks.shape[1]) is the PHYSICAL cache row the
@@ -1411,12 +1411,23 @@ def _set_denoise_rope_position(handle, prefix_pad_masks) -> int:
     scalar start is enough here; the PREFIX needs a gathered table instead
     (adapters/pi05/gemma.py).
 
-    Returns the value so callers can put it in the graph signature — it is
-    baked into the kernel at BUILD.
+    The native launchers publish this value through replay-mutable registers;
+    it is deliberately not a Graph-signature axis.
     """
     pos = int(prefix_pad_masks[0].sum())
     torch.ops.rpu.pi05_denoise_step_set_rope_position(handle, pos)
-    return pos
+
+
+@contextmanager
+def _capture_bounded_denoise_graph(cache, sig):
+    """Keep one retained denoise Graph while preserving same-signature replay."""
+    previous = vars(cache).get("_pi05_denoise_graph_signature")
+    if previous is not None and previous != sig:
+        cache.evict(previous)
+    with cache.capture(sig):
+        yield
+    vars(cache)["_pi05_denoise_graph_signature"] = sig
+
 
 def _run_denoise_loop(self, x_t_cpu_fp32, prefix_pad_masks, past_key_values,
                       num_steps, prefix_len, bsize):
@@ -1463,7 +1474,7 @@ def _run_denoise_loop(self, x_t_cpu_fp32, prefix_pad_masks, past_key_values,
     effective_num_kv_heads = int(getattr(
         expert_model, "_rpu_effective_num_kv_heads", ec.num_key_value_heads
     ))
-    rope_pos = _set_denoise_rope_position(handle, prefix_pad_masks)
+    _set_denoise_rope_position(handle, prefix_pad_masks)
     action_plan = _plan_pi05_denoise_action_execution(
         self,
         handle=int(handle),
@@ -1482,11 +1493,10 @@ def _run_denoise_loop(self, x_t_cpu_fp32, prefix_pad_masks, past_key_values,
                   ec.num_attention_heads, effective_num_kv_heads,
                   ec.head_dim, prefix_len, num_steps,
                   self.action_in_proj.out_features,
-                  rope_pos,
                   *action_plan.graph_key_words()],  # physical child authority
         dtypes=[torch.float16],
     )
-    with cache.capture(sig):
+    with _capture_bounded_denoise_graph(cache, sig):
         torch.ops.rpu.pi05_denoise_loop_forward(
             handle, x0,
             past_key_values.k_caches, past_key_values.v_caches,

@@ -16,10 +16,9 @@ sites had it; all three are fixed (2026-08-12):
                     sharing a buffer.
 
 This file gates (1) and (2), the two whose plumbing lives in Python: they must
-be sent on EVERY forward, because which table/offset the kernel reads is decided
-at graph BUILD and a handle that only sometimes sets it would replay one
-forward's positions against another's input. (3) is C++-only and is covered by
-the device legs.
+be sent on EVERY forward.  The suffix start is a replay-mutable kernel register,
+so it must not split otherwise identical denoise Graphs. (3) is C++-only and is
+covered by the device legs.
 
 Host-only: reads the adapters as source, loads no extension.
 """
@@ -80,28 +79,44 @@ def test_positions_are_sent_unconditionally(module, fn, op):
     calls = _calls(node, op)
     assert len(calls) == 1, f"{fn} must call {op} exactly once, found {len(calls)}"
     assert not _guarding_ifs(node, calls[0]), (
-        f"{op} is inside an `if` — it must run on every forward, because the "
-        f"kernel's choice of table/offset is baked at graph BUILD")
+        f"{op} is inside an `if` — it must run on every forward")
 
 
-def test_the_expert_start_is_in_the_graph_signature():
-    """The suffix RoPE start is a scalar baked into the kernel at BUILD, so it
-    has to be part of the signature or a replay applies the wrong one."""
+def test_the_expert_start_is_replay_mutable_not_a_graph_signature_axis():
+    """Changing valid text length must update registers without rebuilding."""
     src = (_PI05 / "runtime.py").read_text()
     tree = ast.parse(src)
-    helper = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
-                  and n.name == "_set_denoise_rope_position")
-    assert any(isinstance(n, ast.Return) for n in ast.walk(helper)), \
-        "_set_denoise_rope_position must RETURN the start so callers can key on it"
-    # Both denoise paths must feed the returned value into their GraphSignature.
+    # Both denoise paths set the live value, but do not key the Graph on it.
     for fn in ("_run_denoise_fused", "_run_denoise_loop"):
         node = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
                     and n.name == fn)
         text = ast.unparse(node)
         assert "_set_denoise_rope_position(" in text, f"{fn} never sets it"
         sig = text[text.index("GraphSignature("):]
-        assert "rope_pos" in sig[:sig.index(")\n") if ")\n" in sig else len(sig)], \
-            f"{fn}: rope_pos is not in the GraphSignature"
+        assert "rope_pos" not in sig[:sig.index("dtypes=")], \
+            f"{fn}: replay-mutable rope_pos must not split the Graph"
+
+
+def test_native_denoise_plan_excludes_mutable_rope_position():
+    header = (_ROOT / "src/fused/rpu_pi05_denoise_step_model.h").read_text()
+    planner = header[header.index("planner_cache_identity() const") :]
+    planner = planner[:planner.index("void set_configured_chunk_size")]
+    assert "rope_position_" not in planner
+
+    source = (_ROOT / "src/fused/rpu_pi05_denoise_step_model.cpp").read_text()
+    manifest = source[source.index("physical_manifest_for_candidate") :]
+    manifest = manifest[:manifest.index("return manifest;")]
+    assert "const int64_t rope_base = position;" in manifest
+
+    static_config = source[source.index("Pi05DenoiseStepModel::static_config()") :]
+    static_config = static_config[:static_config.index("return cfg;")]
+    assert "cfg.replay_reemit_layer_body = !use_pi05_rope_register_patch();" in static_config
+    assert "clear_replay_kernel_u32_patches();" in static_config
+    assert "KernelId::PARTIAL_MROPE, 8" in static_config
+    assert "KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_M50D256P64" in static_config
+    assert "12, position, expected" in static_config
+    assert "num_layers() * num_steps_" in static_config
+    assert static_config.count("position, expected") == 2
 
 
 def test_logical_and_physical_only_agree_without_pad_rows():

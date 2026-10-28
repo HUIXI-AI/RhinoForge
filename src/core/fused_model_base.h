@@ -40,6 +40,7 @@ class GraphDmaSemanticEndpoint;
 class GraphKernelRegisterCensusGuard;
 class SdpaStableMaskCache;
 class KvInsertSegmentPlan;
+enum class KernelId : uint16_t;
 
 namespace v3 {
 
@@ -978,6 +979,9 @@ struct ModelStaticConfig {
     // preserves the older fast-replay guardrails for all other models.
     bool fast_replay_skip_full_body = false;
 
+    // Keep replayed kernel registers live for models with mutable scalar inputs.
+    bool replay_reemit_layer_body = false;
+
     // Skip the preload_fn host re-walk on GraphCache REPLAYING (RhinoVLA vision
     // opt-in via RPU_RHINOVLA_VISION_PRELOAD_REPLAY_SKIP). Only honored when
     // weights are clean; default false leaves all other models unchanged.
@@ -1818,6 +1822,13 @@ protected:
     // unchanged. Subclasses use these for every row-parallel kernel's M.
     int64_t chunk_rows_(const ChunkInfo& chunk) const;
     int64_t chunk_row_offset_(const ChunkInfo& chunk) const;
+    void clear_replay_kernel_u32_patches();
+    void stage_replay_kernel_u32_patch(
+        KernelId id, uint32_t reg_lo, uint32_t value,
+        size_t expected_count);
+    size_t patch_replay_kernel_u32(
+        KernelId id, uint32_t reg_lo, uint32_t value,
+        size_t expected_count);
 
     void emit_layer_input_dma (int layer_idx, const ChunkInfo& chunk,
                                const char* dst_buf = "residual1",

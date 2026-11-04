@@ -120,7 +120,8 @@ def _install_rotary_class_swap(rotary_emb_class) -> None:
 
 def _rotary_table_capacity(rotary, model) -> int:
     """Return the full configured RoPE table length across HF versions."""
-    requested = getattr(model, "_rpu_max_seq_len", None)
+    requested = getattr(model, "_rpu_requested_max_seq_len",
+                        getattr(model, "_rpu_max_seq_len", None))
     if requested is not None:
         from numbers import Integral
         if isinstance(requested, bool) or not isinstance(requested, Integral) or requested <= 0:

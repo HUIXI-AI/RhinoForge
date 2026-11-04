@@ -142,6 +142,7 @@ PLANNER_SENSITIVE_ATTRS: frozenset[str] = frozenset({
     "_rpu_linear_partition",
     "_rpu_max_seq",
     "_rpu_max_seq_len",
+    "_rpu_requested_max_seq_len",
     "_rpu_merger_hidden_size",
     "_rpu_num_layers",
     "_rpu_prefill_execution_alignment",
@@ -218,6 +219,9 @@ INTERNAL_HW_ATTRS_TRANSITIONAL: frozenset[str] = frozenset({
     "_rpu_attn_tp",
     "_rpu_effective_num_kv_heads",
     "_rpu_max_seq_len",
+    # Public loaders stage this request before installation. Keep it separate
+    # from installed capacity so preinstall still rejects stale runtime state.
+    "_rpu_requested_max_seq_len",
     "_rpu_cache",
     "_rpu_weights_converted",
     "_rpu_gemm_weight",
@@ -430,6 +434,7 @@ _MONOTONIC_INTERNAL_HW_ATTRS: frozenset[str] = frozenset({
     "_rpu_attn_tp",
     "_rpu_effective_num_kv_heads",
     "_rpu_max_seq_len",
+    "_rpu_requested_max_seq_len",
     "_rpu_weights_converted",
     "_rpu_gemm_weight",
     "_rpu_pos_emb_fused",
@@ -518,6 +523,13 @@ def _validate_hw_attr_write(module: Any, name: str, value: Any) -> None:
     if name == "_rpu_cache":
         return  # runtime-mutable
 
+    if name == "_rpu_requested_max_seq_len":
+        _raise_config_error(
+            "_rpu_requested_max_seq_len is a loader-owned cold capacity request; "
+            "modification after .to('rpu') is forbidden. Reload the model with "
+            "max_seq_len to change capacity."
+        )
+
     if name in _MONOTONIC_INTERNAL_HW_ATTRS:
         # Check if already set on this module — if yes, raise.
         if name in vars(module):
@@ -555,10 +567,11 @@ def _raise_config_error(msg: str) -> None:
 
 def validate_preinstall(root: Any) -> None:
     """H6 iter-2: PRE-stamp scan. Called BEFORE the adapter writes any
-    INTERNAL_HW_ATTRS_TRANSITIONAL state. Allows ONLY PUBLIC_HW_ATTRS.
+    INTERNAL_HW_ATTRS_TRANSITIONAL state. Allows public controls and the
+    loader's validated cold capacity request, never installed capacity.
 
     Raises RPUConfigError if any `_rpu_*` attr exists on any module in the
-    tree that is NOT in PUBLIC_HW_ATTRS.
+    tree that is neither a public control nor that cold request.
     """
     _scan_modules(root, _validate_preinstall_on_one)
 
@@ -569,13 +582,22 @@ def _validate_preinstall_on_one(module: Any) -> None:
             continue
         if name in PUBLIC_HW_ATTRS:
             continue
+        if name == "_rpu_requested_max_seq_len":
+            capacity = vars(module)[name]
+            if type(capacity) is not int or capacity <= 0:
+                _raise_config_error(
+                    "_rpu_requested_max_seq_len must be a positive integer "
+                    "from the loader's max_seq_len option"
+                )
+            continue
         # iter-1 allowed INTERNAL_HW_ATTRS_TRANSITIONAL here; H6 removes that
         # allowance because pre-install the adapter has NOT yet written those
         # names — any that exist are stale or user-injected.
         _raise_config_error(
             f"Unexpected `_rpu_*` attribute `{name}` on "
             f"{type(module).__name__} BEFORE `.to('rpu')` adapter setup. "
-            f"Only PUBLIC_HW_ATTRS {sorted(PUBLIC_HW_ATTRS)} are allowed pre-install. "
+            f"Only PUBLIC_HW_ATTRS {sorted(PUBLIC_HW_ATTRS)} and the loader's "
+            f"cold capacity request are allowed pre-install. "
             f"Clear stale state or load a fresh model instance (D-27)."
         )
 

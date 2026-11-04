@@ -330,10 +330,10 @@ class RPUModelForCausalLM:
         model.eval()
         model._rpu_execution = execution_config
         if max_seq_len is not None:
-            model._rpu_max_seq_len = max_seq_len
+            model._rpu_requested_max_seq_len = max_seq_len
             inner = getattr(model, "model", None)
             if inner is not None:
-                inner._rpu_max_seq_len = max_seq_len
+                inner._rpu_requested_max_seq_len = max_seq_len
 
         # D-02: instantiate adapter on the loaded model. The adapter's __init__
         # re-checks the profile (belt-and-suspenders — preflight already ran).

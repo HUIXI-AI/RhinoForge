@@ -130,7 +130,7 @@ def test_conditional_exact_32b_w8_stages_metadata_before_adapter_owns_rpu(monkey
 
         def __init__(self, seen_model):
             assert seen_model is model
-            assert getattr(model, '_rpu_max_seq_len', None) == capacity
+            assert getattr(model, '_rpu_requested_max_seq_len', None) == capacity
             events.append('adapter-init')
 
         def to_rpu(self):

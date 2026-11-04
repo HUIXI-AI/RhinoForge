@@ -818,7 +818,7 @@ class Qwen3_5Adapter:
         """
         model = self.model
         if max_seq_len is None:
-            max_seq_len = getattr(model, "_rpu_max_seq_len", 8192)
+            max_seq_len = getattr(model, "_rpu_requested_max_seq_len", 8192)
         from rpu_backend.adapters.qwen3_5.cores import (
             validate_core_profile, validate_text_weight_geometry, topology_tuple,
             is_dense_large_vl_candidate, validate_dense_large_vl_weights, validate_cold_weight_dtype,

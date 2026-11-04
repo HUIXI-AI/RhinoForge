@@ -19,7 +19,7 @@ def test_adapter_consumes_cold_loader_capacity(monkeypatch, family, loaded, expl
     adapter_type = module.Qwen3_5Adapter if family == "dense" else module.Qwen3_5MoeAdapter
     model = SimpleNamespace(_rpu_execution={})
     if loaded is not None:
-        model._rpu_max_seq_len = loaded
+        model._rpu_requested_max_seq_len = loaded
     adapter = adapter_type.__new__(adapter_type)
     adapter.model = model
     adapter._rpu_is_ready = False
@@ -43,7 +43,7 @@ def test_ready_adapter_keeps_installed_capacity(monkeypatch, family):
     module = qwen3_5 if family == "dense" else qwen3_5_moe
     adapter_type = module.Qwen3_5Adapter if family == "dense" else module.Qwen3_5MoeAdapter
     state_getter = "_qwen3_5_text_runtime_state" if family == "dense" else "_qwen3_5_moe_text_runtime_state"
-    model = SimpleNamespace(_rpu_max_seq_len=32768)
+    model = SimpleNamespace(_rpu_requested_max_seq_len=32768)
     state = SimpleNamespace(max_seq_len=16384)
     adapter = adapter_type.__new__(adapter_type)
     adapter.model = model

@@ -2058,7 +2058,7 @@ class Qwen3VLAdapter:
             install_qwen3_vl_text_for_rpu(
                 text_model,
                 text_config=text_cfg,
-                max_seq_len=getattr(self.model, "_rpu_max_seq_len", None),
+                max_seq_len=getattr(self.model, "_rpu_requested_max_seq_len", None),
                 vision_config=vision_cfg,
                 deepstack_lang_layers=deepstack_lang_layers,
                 enable_deepstack=True,

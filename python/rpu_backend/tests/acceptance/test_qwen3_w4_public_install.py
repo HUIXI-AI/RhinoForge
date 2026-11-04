@@ -64,7 +64,7 @@ def test_public_load_is_cpu_first_and_recipe_is_not_an_hf_kwarg(monkeypatch, acc
     monkeypatch.setattr(causal_lm.AutoModelForCausalLM, 'from_pretrained', load)
     loaded = causal_lm.RPUModelForCausalLM.from_pretrained('source', quantization='w4a16', rpu_execution=model._rpu_execution, max_seq_len=capacity, local_files_only=True)
     assert loaded is model and loaded.to.__rpu_quantization__ == 'w4a16'
-    assert getattr(model.model, '_rpu_max_seq_len', None) == capacity
+    assert getattr(model.model, '_rpu_requested_max_seq_len', None) == capacity
     assert calls == [dict(torch_dtype=torch.float16, device_map='cpu', low_cpu_mem_usage=True, local_files_only=True)]
     assert all((p.dtype == torch.float16 and p.device.type == 'cpu' for p in model.parameters()))
     assert not getattr(model, '_rpu_swizzle_started', False)

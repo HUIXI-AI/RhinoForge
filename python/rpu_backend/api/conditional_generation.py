@@ -250,7 +250,7 @@ class RPUModelForConditionalGeneration:
         model.eval()
         model._rpu_execution = execution_config
         if max_seq_len is not None:
-            model._rpu_max_seq_len = max_seq_len
+            model._rpu_requested_max_seq_len = max_seq_len
 
         adapter = adapter_cls(model)
         adapter._rpu_execution = execution_config

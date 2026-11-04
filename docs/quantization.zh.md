@@ -173,12 +173,6 @@ controller-striped layout；不要添加模型专用 packing 或 tile override�
 Linear 都使用共享 generated auto-tiling，见
 [Linear 自动分块](../knowledge/concepts/linear-autotiling.md)。
 
-[Wall-OSS 分拣](../examples/configs/wall_oss/sorting/README.md)同时保留原始 FP16 和 W8
-目录。Action-W4 模板通过 `input.action_w4_checkpoint` 增加单独转换的 G32 目录，只替换
-Action expert1；Vision、Language 继续使用 W8。该选择在创建子模型前绑定，需要配对的 RTC
-资产；原始目录仍提供浮点预处理与输出权重。相机和动作输入按分拣模板填写，先运行
-`python -m examples.run --config <TOML> --check-config` 检查配置，再执行模型。
-
 ## Qwen3.5 Dense
 
 离线入口为 `python -m rpu_backend.quant.convert_qwen3_5 --src SOURCE_DIR --dst OUTPUT_DIR`。

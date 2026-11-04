@@ -87,6 +87,11 @@ their producing copy operations. Device-only handoffs retain storage and DMA
 ownership without republishing data; host-backed device copies still need both
 boundaries. Check in-place request updates and mask changes before reusing a
 cached upload. See [component handoffs](concepts/component-handoff.md).
+For cache-capacity changes, distinguish allocator capacity from execution
+admission. Bind MoE rotary tables and its padded prefill envelope during cold
+installation; keep actual cache bounds, rotary indices, SPM feasibility and
+operator register checks before state mutation. Test allocation failure without
+silently shortening the request. See [KV cache](concepts/kv-cache.md).
 For Pi0.5 fixed-input comparisons, use the public `input.noise` field for both
 Graph preparation and inference; retain default-input failures separately.
 See the [policy API](../docs/api_reference.md#policy-apis) and

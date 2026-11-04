@@ -23,6 +23,19 @@ CONFIG_INDEX = CONFIGS / "CONFIGURATIONS.md"
 RETIRED_PUBLIC_CONFIG_PROFILES = {
     "pi05-libero-finetuned-w4real-kvint8.w4a16-kvint8.vla",
 }
+# Retained integration fixtures are validated with the full inventory, but are
+# not part of the published example documentation.
+UNDOCUMENTED_CONFIG_DIRS = (
+    Path("g05"),
+    Path("wall_oss/rtc"),
+    Path("wall_oss/sorting"),
+)
+
+
+def documented_config(path: Path) -> bool:
+    relative = path.relative_to(CONFIGS)
+    return not any(relative.is_relative_to(directory)
+                   for directory in UNDOCUMENTED_CONFIG_DIRS)
 
 
 def _load_common():
@@ -172,9 +185,9 @@ def render(
         switch = "English | [简体中文](model_matrix.zh.md)"
 
     inventory_link = (
-        "完整配置及用途见[配置索引](../examples/configs/CONFIGURATIONS.md)；本页仅列登记 profile。"
+        "公开配置及用途见[配置索引](../examples/configs/CONFIGURATIONS.md)；本页仅列公开登记 profile。"
         if language == "zh" else
-        "See the [complete configuration index](../examples/configs/CONFIGURATIONS.md) for all templates and their purposes; this page lists registered profiles."
+        "See the [configuration index](../examples/configs/CONFIGURATIONS.md) for public templates and their purposes; this page lists public registered profiles."
     )
     lines = [title, "", switch, "", intro, "", inventory_link, "", api_scope_title, "",
              api_scope_header, "|---|---|"]
@@ -204,6 +217,9 @@ def render(
             item[1][0][3]["family"], profile_order[item[0]]
         )
     ):
+        group = [entry for entry in group if documented_config(entry[1])]
+        if not group:
+            continue
         entry_path, _config_path, _config, profile = group[0]
         entry = entry_path.relative_to(ROOT).as_posix()
         lines.append(
@@ -228,8 +244,10 @@ def render_config_index(configs: dict[Path, dict]) -> str:
     """Navigation describes configuration facts; it never grants support."""
     profiles = COMMON.example_profiles()
     entry_path = _runtime_entry()
-    lines = ["# 完整配置索引", "",
-             "由 `python scripts/check_examples.py --write` 生成，覆盖所有 TOML。"
+    configs = {path: config for path, config in configs.items()
+               if documented_config(path)}
+    lines = ["# 公开配置索引", "",
+             "由 `python scripts/check_examples.py --write` 生成，列出公开示例 TOML。"
              "登记状态来自各配置的 profile。配置差异、权重来源和路径绑定见模型指南。", "",
              "[选型与使用](README.md) · [登记支持矩阵](../../docs/model_matrix.zh.md) · "
              "[权重准备](WEIGHTS.md) · [通用参数](PARAMETERS.md)", "",

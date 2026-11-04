@@ -40,7 +40,7 @@ enabled before model setup/Graph BUILD and stores hardware traces under the run'
 `hwperf/` directory; missing or unreadable requested traces fail the run.
 `[runner.hw_profile].max_dumps` bounds dumps (default 32). Tracing affects the
 execution window, so do not compare its latency to uninstrumented runs. Support
-depends on the runner: Wall-OSS base/sorting latency entries reject these tracing
+depends on the runner: Wall-OSS base latency entries reject these tracing
 flags. Keep hardware traces outside the repository and record the source, runtime
 assets and input shape. See [runtime configuration](runtime_config.md#profiling-mechanisms)
 and [validation](validation_policy.md).

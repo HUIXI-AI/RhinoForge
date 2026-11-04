@@ -295,7 +295,7 @@ def _exact_config():
     }
 
 
-@pytest.mark.parametrize("capacity", [0, -1, 8193, True, 512.0])
+@pytest.mark.parametrize("capacity", [0, -1, True, 512.0])
 def test_unsupported_capacity_fails_before_loading_or_allocating(capacity):
     from rpu_backend.adapters.qwen3_5_moe import Qwen3_5MoeAdapter
     from rpu_backend.adapters.qwen3_5_moe.text import install_qwen3_5_moe_text_for_rpu
@@ -309,15 +309,15 @@ def test_unsupported_capacity_fails_before_loading_or_allocating(capacity):
         install_qwen3_5_moe_text_for_rpu(None, None, max_seq_len=capacity)
 
 
-@pytest.mark.parametrize("installed,position", [(512, 512), (16384, 8192)])
-def test_decode_cannot_exceed_installed_or_profile_kv_capacity(monkeypatch, installed, position):
+@pytest.mark.parametrize("installed,position", [(512, 512), (16384, 16384)])
+def test_decode_cannot_exceed_installed_kv_capacity(monkeypatch, installed, position):
     from types import SimpleNamespace
     from rpu_backend.adapters.qwen3_5.cores import core_topology, topology_tuple
     from rpu_backend.adapters.qwen3_5_moe import text
 
     topology = core_topology({"model": {"num_cores": 8}})
     state = SimpleNamespace(execution_topology=topology, max_seq_len=installed,
-                            chunk_envelope=(8192, 512))
+                            chunk_envelope=text._qwen3_5_moe_prefill_envelope(40, 2048, installed))
     owner = SimpleNamespace(_rpu_qwen3_5_moe=state)
     cache = SimpleNamespace(execution_topology=topology_tuple(topology),
                             position=position, max_seq_len=16384)

@@ -39,7 +39,7 @@ from .cores import core_topology
 from .loader import load_qwen3_5_moe_model
 from .quant_scope import EXACT_PROFILE_ID, runtime_capabilities, validate_exact_profile
 from .text import (
-    CERTIFIED_CHUNK_ENVELOPE,
+    PREFILL_CHUNK_CEILING,
     _bind_qwen35_moe_retirement,
     _clear_qwen35_moe_graphs,
     _preflight_qwen3_5_moe_text,
@@ -431,9 +431,9 @@ class Qwen3_5MoeAdapter:
                     "Qwen3.5-MoE prefill chunk_size must be a multiple of 64"
                 )
             tc = _text_config(config)
-            ceiling = CERTIFIED_CHUNK_ENVELOPE[
+            ceiling = PREFILL_CHUNK_CEILING[
                 (int(tc.num_hidden_layers), int(tc.hidden_size))
-            ][1]
+            ]
             if requested > ceiling:
                 raise UnsupportedModelError(
                     f"Qwen3.5-MoE prefill chunk_size={requested} exceeds {ceiling}"
@@ -452,9 +452,9 @@ class Qwen3_5MoeAdapter:
         )
 
     def to_rpu(self, max_seq_len=8192):
-        if type(max_seq_len) is not int or not 0 < max_seq_len <= 8192:
+        if type(max_seq_len) is not int or max_seq_len <= 0:
             raise ValueError(
-                "Qwen3.5-35B-A3B max_seq_len must be an integer in [1, 8192]"
+                "Qwen3.5-35B-A3B max_seq_len must be a positive integer"
             )
         model = self.model
         state = _qwen3_5_moe_text_runtime_state(model)

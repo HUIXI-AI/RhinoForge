@@ -6,7 +6,7 @@
 | LingBot v2 | Runtime Graph entry, FP16/W8A16, two/three cameras, image/observation/case inputs and training configuration alignment |
 | Graph | Per-instance `batch_snapshot_mode`, capability checks, automatic ordinary-replay fallback and public policy constructors |
 | Memory | Bounded CPU/device synchronization, refreshed mutable inputs and reused persistent storage |
-| Examples | Weight download/conversion guides, independent G0.5 processes for multiple lengths and current configuration index |
+| Examples | Weight download/conversion guides and current configuration index |
 | Runtime assets | Matching Launch, main and DDR-expansion assets |
 
 Model and execution settings remain bound before weight installation. See [examples](../examples/README.md) and [runtime configuration](runtime_config.md) for accepted inputs and controls.

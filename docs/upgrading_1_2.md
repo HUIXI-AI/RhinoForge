@@ -43,7 +43,6 @@ see the [naming guide](../examples/configs/NAMING.md).
 | [LingBot v2](../examples/configs/lingbot/v2/README.md) | Select camera count and language length; provide the checkpoint, training YAML and matching case, observation or image/state inputs. Preserve camera order and action normalization. |
 | [Qwen3.5 MoE](../examples/configs/qwen3_5/README.md) | Long-prompt templates use `prompt_file`, `prompt_sha256`, `input_ids_sha256` and explicit prefill/decode lengths. Use the template's `run.timing_mode`. |
 | [RhinoVLA](../examples/configs/rhinovla/README.md) | v1 uses the pinned source, checkpoint and fixture. v3 uses the documented runtime factory and paired prepared inputs. |
-| [G0.5](../examples/configs/g05/README.md) | Select the two- or three-camera template and prepare its source, checkpoint and observation package. |
 
 For templates that require `input_ids_sha256`, hash the first `prefill_tokens`
 contiguous INT64 token-ID bytes produced by the matching tokenizer with

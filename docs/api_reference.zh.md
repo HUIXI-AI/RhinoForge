@@ -120,6 +120,18 @@ rewind 重建非零 recurrent state。
 `Qwen3_5Cache.from_model(model, max_seq_len=...)`，让 KV 和 convolution storage
 匹配实际拓扑。直接从 config 创建 cache 时须传入与模型相同的核数。
 
+Cache 申请没有固定的 8192-token 上限。指定正整数容量，由分配器申请完整的对齐
+K/V 存储；混合模型还需递推和卷积状态。内存不足时直接返回分配失败，不会静默缩小
+容量。可用内存还须容纳模型权重、位置表和运行时工作区。
+
+Qwen3.5 MoE 使用相同的容量调用 `Qwen3_5MoeAdapter.to_rpu(max_seq_len=L)` 和
+`Qwen3_5MoeCache.from_model(model, max_seq_len=L)`。安装时按 `L` 创建 decode
+旋转位置表，并为原生 prefill 执行范围预留物理 padding；安装后调整容量须重新创建
+模型和 cache。申请成功不等于新执行范围已通过硬件验证：模型上下文、旋转位置、
+算子寄存器范围和 SPM 规划仍须满足要求。当前 MoE SDPA 寄存器最多表示
+1,048,560 个执行 K/V 行，包含 prefill padding；其他 adapter 保留各自的
+prefill 和位置表边界。
+
 ### Greedy token 选择
 
 ```python

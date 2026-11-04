@@ -26,9 +26,9 @@ class Qwen3_5MoeCache(Qwen3_5Cache):
             validate_exact_profile,
         )
 
-        if type(max_seq_len) is not int or not 0 < max_seq_len <= 8192:
+        if type(max_seq_len) is not int or max_seq_len <= 0:
             raise ValueError(
-                "Qwen3.5-35B-A3B cache max_seq_len must be an integer in [1, 8192]"
+                "Qwen3.5-35B-A3B cache max_seq_len must be a positive integer"
             )
         if type(num_cores) is not int or num_cores not in (4, 6, 8):
             raise ValueError(

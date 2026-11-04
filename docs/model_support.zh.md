@@ -20,7 +20,7 @@
 | Gemma4 | `Gemma4Adapter`；[指南](../examples/configs/gemma4/README.md) | E4B Instruct 文本生成；CPU 前后处理与设备 decoder |
 | DINOv3 | `DINOv3Adapter`；[指南](../examples/configs/dinov3/README.md) | 预处理后的图片 |
 | Pi0.5 | `Pi05Policy`；[指南](../examples/configs/pi05/README.md) | 与 checkpoint 匹配的观测，可显式指定 action noise |
-| Wall-OSS | `WallOssPolicy`；[基础](../examples/configs/wall_oss/README.md)、[RTC](../examples/configs/wall_oss/rtc/README.md)、[分拣](../examples/configs/wall_oss/sorting/README.md) | 图片、指令、本体状态及对应 mask |
+| Wall-OSS | `WallOssPolicy`；[基础](../examples/configs/wall_oss/README.md) | 图片、指令、本体状态及对应 mask |
 | HY Embodied / HyVLA | `HyEmbodiedPolicy` 或组件 adapter；[UMI](../examples/configs/hy_embodied/README.md)、[HyVLA](../examples/configs/hy_vla/README.md) | 预处理后的相机、文本和状态张量 |
 | GR00T | 专用 adapter/runner；[指南](../examples/configs/gr00t/README.md) | 匹配 checkpoint 的观测 batch 和 backbone 资产 |
 | G0.5 | `patch_g05_policy_for_rpu`；[指南](../examples/configs/g05/README.md) | 相机、文本、状态输入包及外部 policy 源码 |

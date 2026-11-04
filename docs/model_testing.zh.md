@@ -38,7 +38,7 @@ python -m examples.run --config qwen3.local.toml --hwperf
 配置检查本身不采集或验证 trace。HWPerf 在模型准备及 Graph BUILD 前启用，硬件
 trace 写入本次结果的 `hwperf/` 目录；请求后未生成 trace 或无法解析时执行失败。
 `[runner.hw_profile].max_dumps` 限制 dump 数，默认 32。硬件跟踪影响执行窗口，
-不能将其耗时与未跟踪运行直接比较。支持情况取决于 runner：Wall-OSS base/sorting
+不能将其耗时与未跟踪运行直接比较。支持情况取决于 runner：Wall-OSS base
 延迟入口仍拒绝这些跟踪开关。trace 应保存在仓库外，并记录源码、运行资产和输入
 shape。详见[运行时配置](runtime_config.zh.md#profiling-机制)和[模型验证](validation_policy.zh.md)。
 

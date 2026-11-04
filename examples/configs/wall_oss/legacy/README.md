@@ -41,7 +41,7 @@ patch/merger、norm/bias、embedding、动作预处理及输出回投保持浮�
 
 当前转换器生成的 G32 文件覆盖 Language 与 Action 的七类投影。旧 G32 包若仍把 Language expert0 Down 保存为 INT8，加载器默认通过 `RPU_WALL_OSS_EXPERT0_DOWN_INT4=1` 将该投影转换为逐通道 INT4；其余投影仍按包中的分组读取。
 
-INT4 值保存在 INT8 容器中，加载时打包；容器类型不改变逻辑位宽。这两档 W4 同时量化 Language 和 Action，均使用整数格式；base 的动作 NVFP4 和 sorting 的仅动作 W4 各有单独配方。
+INT4 值保存在 INT8 容器中，加载时打包；容器类型不改变逻辑位宽。这两档 W4 同时量化 Language 和 Action，均使用整数格式；base 的动作 NVFP4 使用单独配方。
 
 转换使用 [W8 CLI](../../../../python/rpu_backend/quant/convert_wall_oss_w8a16.py)和 [W4 转换器](../../../../python/rpu_backend/quant/convert_wall_oss.py)，加载细节见 [llm.py](../../../../python/rpu_backend/adapters/wall_oss/llm.py)。
 

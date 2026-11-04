@@ -198,16 +198,6 @@ controller-striped layout. Do not add a model-specific packing or tile
 override. FP16, W8A16, and W4A16 Linear paths all use the shared generated auto-tiler described in
 [Generated Linear auto-tiling](../knowledge/concepts/linear-autotiling.md).
 
-For [Wall-OSS sorting](../examples/configs/wall_oss/sorting/README.md), retain the
-original FP16 directory alongside the W8 directory. The Action-W4 template
-adds a separately converted G32 directory through `input.action_w4_checkpoint`:
-only Action expert1 is replaced, while Vision and Language retain W8. The
-constructor binds this choice before creating child models; it requires the
-paired RTC assets. The original directory still supplies floating processing
-and output weights. Use the sorting templates for the fixed camera/action
-input contract and `python -m examples.run --config <TOML> --check-config`
-before device execution.
-
 ## Qwen3.5 Dense
 
 Convert with `python -m rpu_backend.quant.convert_qwen3_5 --src SOURCE_DIR --dst OUTPUT_DIR`.

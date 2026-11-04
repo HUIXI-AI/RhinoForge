@@ -149,6 +149,22 @@ For a loaded or reduced-core model, prefer
 match its installed topology. A cache created from configuration alone must
 use the same core budget as its model.
 
+Cache allocation has no fixed 8192-token ceiling. Request a positive capacity;
+the allocator must provide the complete aligned K/V storage and, for hybrid
+models, recurrent and convolution states. Allocation failure propagates to the
+caller without silently reducing capacity. Available memory also has to hold
+weights, position tables and runtime workspaces.
+
+For Qwen3.5 MoE, pass the same capacity to `Qwen3_5MoeAdapter.to_rpu(max_seq_len=L)`
+and `Qwen3_5MoeCache.from_model(model, max_seq_len=L)`. The installation builds
+the decode rotary tables for `L` and binds the native prefill envelope with
+space for physical padding. Recreate the model and cache to change that
+capacity after installation. A larger allocation does not certify a new
+execution range: model context, rotary positions, operator register limits and
+the SPM plan still apply. The current MoE SDPA register domain permits at most
+1,048,560 execution K/V rows, including prefill padding. Other adapters retain
+their own prefill and position-table bounds.
+
 ### Greedy token selection
 
 ```python

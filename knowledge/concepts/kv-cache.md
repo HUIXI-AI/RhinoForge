@@ -24,6 +24,17 @@ Create the cache after model configuration is final, size it for the complete
 prefill-plus-decode envelope, and let the adapter advance or rewind its logical
 position. [CausalLM API](../../docs/api_reference.md#causal-language-models)
 
+Allocation has no fixed 8K ceiling: aligned storage must fit the allocator's
+available memory, and allocation errors propagate without truncating capacity.
+For Qwen3.5 MoE, install the model and create its cache with the same explicit
+`max_seq_len`. Installation sizes rotary tables and the physical prefill
+envelope, including padding, from that capacity. Changing it requires a fresh
+model/cache. Keep allocation separate from execution admission: model context,
+rotary bounds, SPM feasibility and operator register limits remain mandatory.
+In particular, MoE SDPA execution K/V length is at most 1,048,560 rows including
+padding; larger allocated storage does not authorize that execution. Other
+adapters retain their model-specific prefill/position limits. [MoE adapter](../../python/rpu_backend/adapters/qwen3_5_moe/text.py)
+
 ## Wall-OSS KV head replication
 
 The admitted Wall-OSS attention profile has 16 query heads and two real KV

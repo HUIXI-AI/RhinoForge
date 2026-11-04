@@ -120,7 +120,7 @@ to change allocator mode. [Runtime configuration](../../docs/runtime_config.md#m
   define different inputs and cannot inherit public-profile evidence.
 - Camera names and action geometry bind at construction. The request supplies
   one image per camera; compatible grids may use packed Vision within the
-  configured capacity. RTC uses its separately admitted fixed profile.
+  configured capacity.
 - Text prefill uses the shared bounded planner. An integer `chunk_size` is an
   exact request; native shape and SPM checks must admit the complete plan.
 - Vision, prefix/text, cache, and action stages retain independent ownership

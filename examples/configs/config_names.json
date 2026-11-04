@@ -1,6 +1,4 @@
 {
-  "examples/configs/g05/2cam/w8a16_nvfp4.toml": "examples/configs/g05/2cam/w8a16_action_nvfp4.toml",
-  "examples/configs/g05/3cam/w8a16_nvfp4.toml": "examples/configs/g05/3cam/w8a16_action_nvfp4.toml",
   "examples/configs/gr00t/n1_7_droid/fp16.toml": "examples/configs/gr00t/n1_7_droid/224/fp16.toml",
   "examples/configs/gr00t/n1_7_droid/fp16_256.toml": "examples/configs/gr00t/n1_7_droid/256/fp16.toml",
   "examples/configs/gr00t/n1_7_droid/w8a16.toml": "examples/configs/gr00t/n1_7_droid/224/w8a16.toml",
@@ -158,6 +156,5 @@
   "examples/configs/rhinovla/v3/full_pipeline_w8a16.toml": "examples/configs/rhinovla/v3/w8a16_pipeline.toml",
   "examples/configs/rhinovla/v3/full_pipeline_w8a16_high_precision_vector_qk.toml": "examples/configs/rhinovla/v3/w8a16_pipeline_high_fused_vector_qk.toml",
   "examples/configs/wall_oss/legacy/w4a16.toml": "examples/configs/wall_oss/legacy/w4a16_channel.toml",
-  "examples/configs/wall_oss/legacy/w4a16_pgrp.toml": "examples/configs/wall_oss/legacy/w4a16_g32.toml",
-  "examples/configs/wall_oss/sorting/w8a16_action_w4a16.toml": "examples/configs/wall_oss/sorting/w8a16_action_w4a16_g32.toml"
+  "examples/configs/wall_oss/legacy/w4a16_pgrp.toml": "examples/configs/wall_oss/legacy/w4a16_g32.toml"
 }

@@ -111,14 +111,14 @@ def test_position_counts_toward_the_envelope(h4b, no_global_chunk):
 
 def test_qwen3_5_promotes_the_mr54_language_envelope():
     from rpu_backend.adapters.qwen3_5 import text as q35
-    assert q35.CERTIFIED_CHUNK_ENVELOPE == {(24, 1024): (8192, 512), (24, 2048): (8192, 640), (32, 2560): (8192, 448), (32, 4096): (8192, 256)}
+    assert q35.PREFILL_CHUNK_CEILING == {(24, 1024): 512, (24, 2048): 640, (32, 2560): 448, (32, 4096): 256, (64, 5120): 128}
 
 def test_qwen3_5_language_handle_does_not_use_the_vision_envelope(monkeypatch):
     from rpu_backend.adapters.qwen3_5 import text as q35
     calls = []
     monkeypatch.setattr(torch.ops.rpu, 'qwen3_5_set_chunk_envelope', lambda handle, max_kv, chunk: calls.append((handle, max_kv, chunk)), raising=False)
-    q35._declare_qwen3_5_chunk_envelope('language-handle', 32, 2560)
-    assert calls == [('language-handle', 8192, 448)]
+    q35._declare_qwen3_5_chunk_envelope('language-handle', 32, 2560, 16384)
+    assert calls == [('language-handle', 16512, 448)]
 
 def test_chunk_caps_are_ceilings_not_exact_aligned_requests():
     causal = torch.ops.rpu.causal_decoder_create()

@@ -24,16 +24,33 @@ Create the cache after model configuration is final, size it for the complete
 prefill-plus-decode envelope, and let the adapter advance or rewind its logical
 position. [CausalLM API](../../docs/api_reference.md#causal-language-models)
 
-Allocation has no fixed 8K ceiling: aligned storage must fit the allocator's
-available memory, and allocation errors propagate without truncating capacity.
-For Qwen3.5 MoE, install the model and create its cache with the same explicit
-`max_seq_len`. Installation sizes rotary tables and the physical prefill
-envelope, including padding, from that capacity. Changing it requires a fresh
-model/cache. Keep allocation separate from execution admission: model context,
-rotary bounds, SPM feasibility and operator register limits remain mandatory.
-In particular, MoE SDPA execution K/V length is at most 1,048,560 rows including
-padding; larger allocated storage does not authorize that execution. Other
-adapters retain their model-specific prefill/position limits. [MoE adapter](../../python/rpu_backend/adapters/qwen3_5_moe/text.py)
+Currently supported adapters have no fixed 8K or profile-table allocation ceiling.
+Aligned storage must fit the allocator's available memory; allocation errors
+propagate without truncating capacity. Weights, position tables, hybrid states
+and runtime workspaces also consume memory. Existing defaults do not impose an
+upper allocation limit.
+
+Set installation capacity before device placement. Both
+`RPUModelForCausalLM.from_pretrained(..., max_seq_len=L)` and
+`RPUModelForConditionalGeneration.from_pretrained(..., max_seq_len=L)` preserve
+the value for a later `model.to("rpu")`. Qwen3.5 Dense/MoE direct adapters also
+accept `to_rpu(max_seq_len=L)`. Pi0.5 policy constructors accept `max_seq_len`;
+`Qwen3TTSModel.from_pretrained` uses it for the talker; GR00T's builder accepts
+`max_prefix_len` as a positive multiple of 16. Exact specialized input shapes,
+such as the GR00T SPM Z1 route, remain separate constraints.
+[Capacity entry points](../../docs/api_reference.md#rpucache)
+
+Create a cache no larger than the installed model capacity, normally using the
+same `L`. Installation binds rotary tables, physical prefill bounds including
+padding, and fixed-address storage to the requested capacity. Changing that
+capacity requires a fresh model/cache. Allocation success does not expand model
+context guarantees or the hardware-validated profile. Actual cache and rotary
+bounds, SPM feasibility, operator/register and coordinate widths, and semantic
+input shapes remain mandatory. For example, Qwen3.5 Dense/MoE
+`FLASH_ATTN_SPM` execution K/V length is at most 1,048,560 rows including padding;
+larger allocated storage does not authorize that execution.
+[Dense adapter](../../python/rpu_backend/adapters/qwen3_5/text.py),
+[MoE adapter](../../python/rpu_backend/adapters/qwen3_5_moe/text.py)
 
 ## Wall-OSS KV head replication
 

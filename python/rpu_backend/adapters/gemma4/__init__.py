@@ -131,15 +131,9 @@ def _check_profile(config) -> None:
         )
 
 
-def _validate_max_seq(
-    value, *, name="model._rpu_max_seq", maximum=None
-) -> int:
+def _validate_max_seq(value, *, name="model._rpu_max_seq") -> int:
     if isinstance(value, bool) or not isinstance(value, Integral) or value < 1:
         raise ValueError(f"{name} must be a positive integer, got {value!r}")
-    if maximum is not None and value > maximum:
-        raise ValueError(
-            f"{name}={value} exceeds the certified model horizon {maximum}"
-        )
     return int(value)
 
 
@@ -236,7 +230,6 @@ class Gemma4Adapter:
         _check_profile(model.config)
         max_seq = _validate_max_seq(
             getattr(model, "_rpu_max_seq", DEFAULT_MAX_SEQ),
-            maximum=int(_text_config(model.config).max_position_embeddings),
         )
         if not _BUILD_LOCK.acquire(blocking=False):
             raise RPUBackendError(
@@ -374,7 +367,6 @@ def _build_rpu_model(model, *, max_seq=None, _install_state=None):
     max_seq = _validate_max_seq(
         getattr(model, "_rpu_max_seq", DEFAULT_MAX_SEQ)
         if max_seq is None else max_seq,
-        maximum=int(tc.max_position_embeddings),
     )
     install_state = _install_state if _install_state is not None else {}
     install_state.update(native_created=False, cleanup_ok=True)

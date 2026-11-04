@@ -236,8 +236,8 @@ def test_unknown_and_partial_rpu_profiles_fail_before_swizzle_or_handle(monkeypa
         build_qwen25vl_backbone(tmp_path, asset_manifest=manifest)
     assert 'head_dim=None' not in str(exc.value)
     assert 'missing model.norm.weight' in str(exc.value)
-    with pytest.raises(ValueError, match='max_seq_len=1904.*expected 4096'):
-        build_qwen25vl_backbone(tmp_path, max_seq_len=1904, asset_manifest=manifest)
+    with pytest.raises(ValueError, match='positive integer'):
+        build_qwen25vl_backbone(tmp_path, max_seq_len=0, asset_manifest=manifest)
     nav_checkpoint = tmp_path / 'navdp.safetensors'
     nav_checkpoint.write_bytes(b'manifest-verified mock')
     nav_manifest = {nav_checkpoint: hashlib.sha256(nav_checkpoint.read_bytes()).hexdigest()}
@@ -369,9 +369,8 @@ def test_controlled_context_and_vision_builder_are_exact(monkeypatch, tmp_path):
     build_internvla_vision(tmp_path, asset_manifest=manifest)
     assert captured['kwargs'] == {'window': True, 'max_hw': 32, 'max_seq_len': 1024, 'w8a16': False, 'fp16_ckpt_dir': str(tmp_path.resolve()), 'execution_config': {'vision': {'chunk_size': 'auto'}}, 'per_window_sdpa': True}
 
-def test_backbone_installs_the_measured_customer_chunk_envelope():
+def test_backbone_installs_requested_capacity_and_measured_chunk():
     import rpu_backend.adapters.internvla_n1.backbone as backbone
-    assert backbone._CERTIFIED_MAX_KV_LEN == 1936
     assert backbone._CERTIFIED_CHUNK_SIZE == 176
     source = inspect.getsource(backbone.build_qwen25vl_backbone)
     weights = source.index('set_weights(handle, *args)')

@@ -477,25 +477,13 @@ def _destroy_causal_decoder_handle(h):
 # MR-A: certified chunk envelope for the Wall-OSS decoders
 # (docs/runtime_config.md).
 #
-# The chunk half is NOT a new number: it is the cap this adapter already computes
-# in _prefill_chunk_size_cap(), whose own docstring calls 384 "within the measured
-# SPM envelope only for TP8". The envelope makes that already-measured value
-# enforceable on the EXPLICIT-OVERRIDE route too, which the cap never covered
-# (compute_chunks_impl:489 does not read the cap).
-#
-# The length half is the RPUCache capacity these handles are built against. This
-# is the 2D-rect-mask path, so kv length is genuinely SPM-load-bearing here —
-# declare_buffers adds sdpa_mask = comp_cs * ceil16(kv) * 32
-# (rpu_qwen3_model.h:1266) — and the cache bound is the limit the adapter already
-# enforces. Green evidence: the four wall_oss cells at .gitlab-ci.yml:2058-2059
-# (toml3img = 3 images, P=217).
-_CHUNK_ENVELOPE_MAX_KV = 8192
-
+# Chunk scheduling remains bounded by the supported per-step SPM geometry.
+# Total KV capacity comes from the cache installed for this handle.
 
 def _configure_causal_decoder_handle(
     *, set_weights, weight_args, chunk_size_cap, equal_two_prefill,
     wall_prefill_routes=(False, False, _RMSNORM_CAP_BASE, False),
-    chunk_size_override=0, sorting=None, linear_acc32=False,
+    chunk_size_override=0, sorting=None, linear_acc32=False, max_seq_len=2048,
 ):
     """Create/configure a decoder handle, destroying it on any failed gate."""
     from rpu_backend.api._execution import _require_execution_process_safe
@@ -516,7 +504,7 @@ def _configure_causal_decoder_handle(
             handle, chunk_size_cap
         )
         torch.ops.rpu.causal_decoder_set_chunk_envelope(
-            handle, _CHUNK_ENVELOPE_MAX_KV, chunk_size_cap
+            handle, int(max_seq_len), chunk_size_cap
         )
         torch.ops.rpu.causal_decoder_set_equal_two_prefill(
             handle, equal_two_prefill
@@ -615,9 +603,7 @@ class WallOssLLM:
                 f"Wall-OSS reserve_rows must be a non-negative integer, got "
                 f"{reserve_rows!r}"
             )
-        physical_limit = min(
-            int(self.cache.max_seq_len), _CHUNK_ENVELOPE_MAX_KV
-        ) - reserve_rows
+        physical_limit = int(self.cache.max_seq_len) - reserve_rows
         if physical_limit <= 0:
             raise ValueError(
                 "Wall-OSS cache has no room for prefill after reserving the "
@@ -1436,6 +1422,7 @@ def build_wall_oss_llm(
     handle = _configure_causal_decoder_handle(
         set_weights=set_weights,
         weight_args=weight_args,
+        max_seq_len=max_seq_len,
         chunk_size_cap=PREFILL_CHUNK_SIZE_CAP,
         equal_two_prefill=PREFILL_EQUAL_TWO,
         wall_prefill_routes=(

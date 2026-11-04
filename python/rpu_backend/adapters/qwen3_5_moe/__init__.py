@@ -451,7 +451,9 @@ class Qwen3_5MoeAdapter:
             path, config=config, dtype=dtype, **hf_kwargs
         )
 
-    def to_rpu(self, max_seq_len=8192):
+    def to_rpu(self, max_seq_len=None):
+        if max_seq_len is None:
+            max_seq_len = getattr(self.model, "_rpu_max_seq_len", 8192)
         if type(max_seq_len) is not int or max_seq_len <= 0:
             raise ValueError(
                 "Qwen3.5-35B-A3B max_seq_len must be a positive integer"

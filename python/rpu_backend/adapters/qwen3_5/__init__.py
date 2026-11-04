@@ -765,15 +765,14 @@ class Qwen3_5Adapter:
                     f"{requested}. Refusing before loading model weights."
                 )
             tc = _text_config(config)
-            from .text import CERTIFIED_CHUNK_ENVELOPE
-            env = CERTIFIED_CHUNK_ENVELOPE.get(
+            from .text import PREFILL_CHUNK_CEILING
+            ceiling = PREFILL_CHUNK_CEILING.get(
                 (int(tc.num_hidden_layers), int(tc.hidden_size))
             )
-            if env is not None and env[1] > 0 and requested > env[1]:
+            if ceiling is not None and ceiling > 0 and requested > ceiling:
                 raise UnsupportedModelError(
                     f"Qwen3.5 prefill chunk_size={requested} exceeds this profile's "
-                    f"declared ceiling {env[1]}; max declared KV length is "
-                    f"{env[0]}. Refusing before loading model weights."
+                    f"declared ceiling {ceiling}. Refusing before loading model weights."
                 )
         vision = execution_config.get("vision", {})
         vision_chunk = vision.get("chunk_size", "auto")
@@ -810,7 +809,7 @@ class Qwen3_5Adapter:
         return load_qwen3_5_model(
             path, config=config, dtype=dtype, **hf_kwargs)
 
-    def to_rpu(self, max_seq_len=8192):
+    def to_rpu(self, max_seq_len=None):
         """Install text backbone + lm_head and patch the top-level forward.
 
         Order (A→B→C→D matters): text first (creates the handle the rest read),
@@ -818,6 +817,8 @@ class Qwen3_5Adapter:
         and forward replacement last.
         """
         model = self.model
+        if max_seq_len is None:
+            max_seq_len = getattr(model, "_rpu_max_seq_len", 8192)
         from rpu_backend.adapters.qwen3_5.cores import (
             validate_core_profile, validate_text_weight_geometry, topology_tuple,
             is_dense_large_vl_candidate, validate_dense_large_vl_weights, validate_cold_weight_dtype,

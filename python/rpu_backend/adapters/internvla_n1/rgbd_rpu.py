@@ -242,6 +242,8 @@ class RGBDTowerRPU:
         try:
             self._install()
             torch.ops.rpu.dinov3_vision_set_chunk_envelope(self.handle, int(self.cache.max_seq_len), 0)
+            self.keepalive = torch.ops.rpu.dinov3_vision_position_idx_keepalive(self.handle)
+            self._native_keepalive.append(self.keepalive)
             self._install_stem_and_tail()
             # Board-validated DINOv2-S profile: ACC32 linears + 16-bank fp16 SDPA.
             torch.ops.rpu.dinov3_vision_set_acc32(self.handle, True)
@@ -320,8 +322,6 @@ class RGBDTowerRPU:
         self._native_keepalive.append((cos, sin))
         torch.ops.rpu.dinov3_vision_set_rope(self.handle, cos, sin)
         torch.ops.rpu.dinov3_vision_set_identity_rope(self.handle, True)
-        self.keepalive = torch.ops.rpu.dinov3_vision_position_idx_keepalive(self.handle)
-        self._native_keepalive.append(self.keepalive)
         self.num_layers = len(blocks)
         # Bidirectional vision SDPA inserts at position 0 and reads once, so a
         # standard cache sized to the worst-case token count is sufficient.

@@ -1923,8 +1923,9 @@ def patch_g05_vlm_for_rpu(
             **quant_kwargs,
         )
         if _allow_certified_g05_k1:
-            torch.ops.rpu.qwen3_5_set_chunk_envelope(handle, 256, 256)
-            vlm._rpu_qwen3_5.prefill_capability_envelope = (256, 256)
+            physical_capacity = vlm._rpu_qwen3_5.chunk_envelope[0]
+            torch.ops.rpu.qwen3_5_set_chunk_envelope(handle, physical_capacity, 256)
+            vlm._rpu_qwen3_5.prefill_capability_envelope = (physical_capacity, 256)
         torch.ops.rpu.qwen3_5_set_linear_acc32(
             handle, linear_accumulation == "acc32")
         torch.ops.rpu.qwen3_5_set_fast_replay(handle, True)

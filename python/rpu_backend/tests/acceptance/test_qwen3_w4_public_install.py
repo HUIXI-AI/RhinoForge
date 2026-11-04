@@ -52,7 +52,8 @@ def test_unknown_recipe_rejected_before_config_load(monkeypatch, recipe):
         causal_lm.RPUModelForCausalLM.from_pretrained('source', quantization=recipe)
 
 @pytest.mark.parametrize('acc32', [False, True])
-def test_public_load_is_cpu_first_and_recipe_is_not_an_hf_kwarg(monkeypatch, acc32):
+@pytest.mark.parametrize('capacity', [None, 16384, 32768])
+def test_public_load_is_cpu_first_and_recipe_is_not_an_hf_kwarg(monkeypatch, acc32, capacity):
     model = _model(acc32)
     monkeypatch.setattr(causal_lm.AutoConfig, 'from_pretrained', lambda *a, **k: model.config)
     calls = []
@@ -61,8 +62,9 @@ def test_public_load_is_cpu_first_and_recipe_is_not_an_hf_kwarg(monkeypatch, acc
         calls.append(kwargs)
         return model
     monkeypatch.setattr(causal_lm.AutoModelForCausalLM, 'from_pretrained', load)
-    loaded = causal_lm.RPUModelForCausalLM.from_pretrained('source', quantization='w4a16', rpu_execution=model._rpu_execution, local_files_only=True)
+    loaded = causal_lm.RPUModelForCausalLM.from_pretrained('source', quantization='w4a16', rpu_execution=model._rpu_execution, max_seq_len=capacity, local_files_only=True)
     assert loaded is model and loaded.to.__rpu_quantization__ == 'w4a16'
+    assert getattr(model.model, '_rpu_max_seq_len', None) == capacity
     assert calls == [dict(torch_dtype=torch.float16, device_map='cpu', low_cpu_mem_usage=True, local_files_only=True)]
     assert all((p.dtype == torch.float16 and p.device.type == 'cpu' for p in model.parameters()))
     assert not getattr(model, '_rpu_swizzle_started', False)
@@ -410,7 +412,7 @@ def test_32b_public_staging_claim_arena_banks_and_cache_capacity(monkeypatch):
     assert events.index('materialize') < events.index('decoder_install')
     assert model._rpu_kv_cache_layer_bank_size == model.model._rpu_kv_cache_layer_bank_size == 8
     assert installs[0]['_graph_cache_max_entries'] == 8
-    assert installs[0]['chunk_envelope_for']('qwen3', 64, 5120) == (4096, 64)
+    assert installs[0]['chunk_envelope_for']('qwen3', 64, 5120).bind_capacity(32768) == (32768, 64)
     assert model.to('rpu') is model and events.count('materialize') == 1
 
 def test_32b_w8_banks_decoder_before_remaining_tree(monkeypatch):
@@ -453,5 +455,5 @@ def test_32b_w8_banks_decoder_before_remaining_tree(monkeypatch):
     assert not packed and len(converted) == 1
     assert events.index('decoder_bank') < events.index('remaining') < events.index('decoder_install')
     assert installs[0]['_graph_cache_max_entries'] == 8
-    assert installs[0]['chunk_envelope_for']('qwen3', 64, 5120) == (4096, 64)
+    assert installs[0]['chunk_envelope_for']('qwen3', 64, 5120).bind_capacity(32768) == (32768, 64)
     assert model._rpu_kv_cache_layer_bank_size == model.model._rpu_kv_cache_layer_bank_size == 8

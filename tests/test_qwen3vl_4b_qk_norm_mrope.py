@@ -302,7 +302,9 @@ def test_cold_capability_layout_and_logical_position_backing(tmp_path):
         for field in ("qwen3vl_4b_decode_gateup_fused_", "qwen3vl_4b_decode_qk_fused_",
                       "qwen3vl_4b_decode_qk_kv_fused_", "qwen3vl_4b_decode_o_ring_norm_fused_"))
     wall_fields = "\n".join(re.findall(r"    bool wall_base_\w+_ = false;", source))
-    padding_start = source.index("            if (qwen3vl_4b_decode_qk_fused_ || qwen3vl_4b_decode_qk_kv_fused_)")
+    capacity_start = source.index("            const int64_t mrope_capacity")
+    capacity_binding = source[capacity_start:source.index("            ka_cpu_pos_published_rows_.assign", capacity_start)]
+    padding_start = source.index("            if (!position_ids_keepalive_.defined()", capacity_start)
     padding = source[padding_start:source.index("            // partial_mrope keepalives", padding_start)]
     constants = definition(base, "enum class FmbLinearRouteSelector") + ";\n"
     constants += definition(source, "enum class CausalDecoderLinearRoute") + ";\n"
@@ -320,7 +322,9 @@ def test_cold_capability_layout_and_logical_position_backing(tmp_path):
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
+#include <limits>
 #include <vector>
+#define TORCH_CHECK(condition, ...) do { if (!(condition)) throw std::runtime_error("rejected"); } while (false)
 namespace at {
 constexpr int kInt=1,kChar=2,kHalf=3,kPrivateUse1=4,kByte=5;
 struct TensorOptions {TensorOptions& dtype(int){return *this;}TensorOptions& device(int){return *this;}};
@@ -346,7 +350,7 @@ struct Model {
  __WALL_FIELDS__
  __LINGBOT_UNBOUND__
  bool rhinovla_high_precision_=false,rhinovla_high_precision_fusions_=false;
- bool tts_codec_mode_=false;
+ bool tts_codec_mode_=false;std::vector<at::Tensor> tts_predictor_heads_;
  bool has_scale=true,has_nvfp4=false,use_silu=true,has_qk_norm_=true,has_qkv_bias_=false;
  std::vector<int64_t> mrope_section{24,20,20},deepstack_lang_layers{0,1,2};
  std::vector<at::Tensor> q_w_list{36},k_w_list{36},v_w_list{36},o_w_list{36},gate_list{36},up_list{36},down_list{36};
@@ -355,13 +359,26 @@ struct Model {
  bool wall_prefill_staged_mlp_=false,decode_gate_up_fusion_=false,prefill_packed_gate_up_strided_=false,qwen3vl_4b_packed_qkv_weights_=false;
  std::vector<int64_t> deepstack_lang_layers_{0,1,2};int configured_vocab_size_=0,cores=8;
  int num_cores()const{return cores;}int attn_tp()const{return cores;}int mlp_tp()const{return cores;}int lm_head_tp()const{return cores;}
+ struct Table{int64_t rows=8192;int64_t size(int)const{return rows;}}cos;
+ struct Envelope{int64_t max_kv_len=0;bool declared()const{return max_kv_len>0;}}envelope;
+ const Envelope& chunk_envelope()const{return envelope;}
  at::Tensor position_ids_keepalive_;
- void cold(){__PROFILE__ __PADDING__}
+ void cold(){__PROFILE__ __CAPACITY__ __PADDING__}
  __LAYOUT__
 };
 int main(){
+ for(int64_t capacity:{1,8193,16384,32768}){Model m;m.cos.rows=capacity*2;m.envelope.max_kv_len=capacity;m.cold();
+  assert(m.position_ids_keepalive_.rows==capacity&&m.position_ids_keepalive_.owner->size()==static_cast<size_t>((capacity+8)*3));
+  assert(static_cast<size_t>((capacity-1)*12+32)<=m.position_ids_keepalive_.owner->size()*4);
+  auto owner=m.position_ids_keepalive_.owner;m.cold();assert(m.position_ids_keepalive_.owner==owner);
+ }
+ for(bool overflow:{false,true}){Model m;m.cos.rows=overflow?std::numeric_limits<int64_t>::max():8192;
+  m.envelope.max_kv_len=overflow?m.cos.rows:8193;bool rejected=false;
+  try{m.cold();}catch(const std::runtime_error&){rejected=true;}
+  assert(rejected&&!m.position_ids_keepalive_.defined());
+ }
  auto& cap=KernelCache::instance();Model old;old.cold();assert(old.qwen3vl_4b_w8_profile_&&!old.qwen3vl_4b_decode_qk_fused_);
- const auto oldhash=old.subclass_layout_hash();assert(old.position_ids_keepalive_.rows==8192&&old.position_ids_keepalive_.owner->size()==8192*3);
+ const auto oldhash=old.subclass_layout_hash();assert(old.position_ids_keepalive_.rows==8192&&old.position_ids_keepalive_.owner->size()==8200*3);
  auto oldowner=old.position_ids_keepalive_.owner;old.position_ids_keepalive_.owner->at(1)=99;old.cold();assert(oldowner==old.position_ids_keepalive_.owner&&oldowner->at(1)==0);
  cap.qk=true;Model fused;fused.cold();assert(fused.qwen3vl_4b_decode_qk_fused_&&!fused.qwen3vl_4b_decode_gateup_fused_);
  assert(fused.subclass_layout_hash()!=oldhash);const auto fusedhash=fused.subclass_layout_hash();
@@ -396,7 +413,7 @@ int main(){
    if(fault==4)b.hidden_size=2048;if(fault==5)b.intermediate_size=6144;if(fault==6)b.num_q_heads=16;
    if(fault==7)b.mrope_section={16,24,24};if(fault==8)b.deepstack_lang_layers={1,2,3};
    if(fault==9)b.use_silu=false;if(fault==10)b.has_qk_norm_=false;if(fault==11)b.has_qkv_bias_=true;
-   b.cold();assert(!b.qwen3vl_4b_w8_profile_&&!b.qwen3vl_4b_decode_qk_fused_&&!b.qwen3vl_4b_decode_qk_kv_fused_&&!b.qwen3vl_4b_decode_o_ring_norm_fused_&&b.position_ids_keepalive_.owner->size()==8192*3);
+   b.cold();assert(!b.qwen3vl_4b_w8_profile_&&!b.qwen3vl_4b_decode_qk_fused_&&!b.qwen3vl_4b_decode_qk_kv_fused_&&!b.qwen3vl_4b_decode_o_ring_norm_fused_&&b.position_ids_keepalive_.owner->size()==8200*3);
  }
  for(auto field:{&Model::q_w_list,&Model::k_w_list,&Model::v_w_list,&Model::o_w_list,&Model::gate_list,&Model::up_list,&Model::down_list}){
   Model b;(b.*field)[17].dtype=at::kHalf;b.cold();assert(!b.qwen3vl_4b_decode_qk_fused_);
@@ -404,7 +421,7 @@ int main(){
 }
 '''
     for key, value in {"MIX": definition(base, "inline int64_t layout_mix("), "CONSTANTS": constants,
-                       "PROFILE": profile, "PADDING": padding, "LAYOUT": layout, "WALL_FIELDS": wall_fields}.items():
+                       "PROFILE": profile, "CAPACITY": capacity_binding, "PADDING": padding, "LAYOUT": layout, "WALL_FIELDS": wall_fields}.items():
         program = program.replace(f"__{key}__", value)
     program = program.replace("__LINGBOT_UNBOUND__", unbound_lingbot_prefill_members(source))
     cpp, exe = tmp_path / "qk_cold.cpp", tmp_path / "qk_cold"

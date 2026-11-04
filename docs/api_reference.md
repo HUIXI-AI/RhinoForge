@@ -76,6 +76,7 @@ RPUModelForCausalLM.from_pretrained(
     device=None,
     rpu_execution=None,
     quantization=None,  # CausalLM: explicit dense Qwen3 W4/G32 installation recipe
+    max_seq_len=None,
     **hf_kwargs,
 )
 ```
@@ -85,6 +86,10 @@ selects an adapter by `config.architectures[0]`, and rejects unsupported
 profiles early. It currently admits the built-in Qwen3 and Llama CausalLM
 architectures. Only `torch.float16` is accepted by this entry point; a
 quantized checkpoint carries its own checked metadata.
+
+Pass `max_seq_len=L` to bind a positive installation capacity before device
+installation. This also applies when loading on CPU and later calling
+`model.to("rpu")`. Omitting it keeps the adapter's existing default.
 
 With `device="rpu"`, the CausalLM loader checks native-backend availability and
 `O_RDWR` access to an RPU node and `/dev/mem` before loading full weights.
@@ -149,21 +154,36 @@ For a loaded or reduced-core model, prefer
 match its installed topology. A cache created from configuration alone must
 use the same core budget as its model.
 
-Cache allocation has no fixed 8192-token ceiling. Request a positive capacity;
-the allocator must provide the complete aligned K/V storage and, for hybrid
-models, recurrent and convolution states. Allocation failure propagates to the
-caller without silently reducing capacity. Available memory also has to hold
-weights, position tables and runtime workspaces.
+Across the currently supported model adapters, cache allocation has no fixed
+8192-token or profile-table ceiling. Request a positive capacity; the allocator
+must provide the complete aligned K/V storage and, for hybrid models, recurrent
+and convolution states. Allocation failure propagates without silently reducing
+capacity. Available memory must also hold weights, position tables and runtime
+workspaces. Default capacities remain defaults, not allocation limits.
 
-For Qwen3.5 MoE, pass the same capacity to `Qwen3_5MoeAdapter.to_rpu(max_seq_len=L)`
-and `Qwen3_5MoeCache.from_model(model, max_seq_len=L)`. The installation builds
-the decode rotary tables for `L` and binds the native prefill envelope with
-space for physical padding. Recreate the model and cache to change that
-capacity after installation. A larger allocation does not certify a new
-execution range: model context, rotary positions, operator register limits and
-the SPM plan still apply. The current MoE SDPA register domain permits at most
-1,048,560 execution K/V rows, including prefill padding. Other adapters retain
-their own prefill and position-table bounds.
+Bind capacity during cold installation using the applicable entry point:
+
+| Entry point | Capacity argument |
+|---|---|
+| `RPUModelForCausalLM.from_pretrained(...)`, `RPUModelForConditionalGeneration.from_pretrained(...)` | `max_seq_len=L` |
+| `Qwen3_5Adapter.to_rpu(...)`, `Qwen3_5MoeAdapter.to_rpu(...)` | `max_seq_len=L`; an explicit value overrides the loader's setting |
+| `Pi05Policy.from_pretrained(...)`, `Pi05Policy.from_lerobot_policy(...)` | `max_seq_len=L` |
+| `Qwen3TTSModel.from_pretrained(...)` | `max_seq_len=L` for the talker; the code predictor retains its fixed sequence semantics |
+| `rpu_backend.adapters.gr00t.runtime.build_gr00t_vla(...)` | `max_prefix_len=L`, a positive multiple of 16; the specialized SPM Z1 route retains its exact 256-row shape |
+
+Create the cache with a capacity no greater than the installed model's capacity;
+using the same `L` is the usual choice. Qwen3.5 Dense and MoE use
+`Qwen3_5Cache.from_model(...)` and `Qwen3_5MoeCache.from_model(...)`, respectively.
+Installation binds position tables and native planning bounds, including any
+required physical padding. Recreate the model and cache to change installation
+capacity.
+
+Allocation success does not extend hardware validation or model-context
+guarantees. Requests must still fit actual cache and rotary storage, operator
+register and coordinate widths, input-shape semantics, and the SPM plan. For
+example, Qwen3.5 Dense/MoE `FLASH_ATTN_SPM` permits at most 1,048,560 execution
+K/V rows including padding; its chunk-size constraints remain independent of
+the installed KV capacity.
 
 ### Greedy token selection
 
@@ -226,7 +246,9 @@ model = RPUModelForConditionalGeneration.from_pretrained(
 ```
 
 It has the same CPU-first loading and fail-fast profile behavior as the
-CausalLM loader. The `vision` stage accepts `chunk_size`; the `prefill` stage
+CausalLM loader. Pass `max_seq_len=L` to set the text installation capacity,
+including for a later `model.to("rpu")`; cache capacity must be at most `L`.
+The `vision` stage accepts `chunk_size`; the `prefill` stage
 accepts the fields described above. Video and profiles outside
 [Examples](model_support.md) are not implied by this class.
 

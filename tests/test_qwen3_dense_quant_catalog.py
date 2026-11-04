@@ -81,7 +81,9 @@ def test_dense_32b_w8_uses_existing_converted_asset_without_inheriting_support(c
     assert limits["checkpoint_format"] == "qwen3_32b_w8a16"
     assert "checkpoint_quant_profile" not in limits
     assert "on_install_quantization" not in limits
-    assert limits["max_kv_len"] == 4096 and limits["max_chunk_size"] == 64
+    assert "max_kv_len" not in limits
+    assert limits["kv_capacity"] == "requested-at-install; allocation must succeed"
+    assert limits["max_chunk_size"] == 64
     assert limits["load_device"] == "rpu"
     assert profile["support"]["status"] == "CONTROLLED_EVALUATION"
     assert profile["hw_status"] == "IMPLEMENTED_UNVERIFIED_HW"

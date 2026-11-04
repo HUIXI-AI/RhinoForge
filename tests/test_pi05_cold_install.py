@@ -242,6 +242,26 @@ def test_public_graph_runtime_policy_reaches_cold_adapter_without_loader_leak(mo
             batch_snapshot_mode="off" if mode == "auto" else "auto"))
 
 
+def test_public_cache_capacity_is_cold_bound_without_loader_leak(monkeypatch):
+    from rpu_backend.api import Pi05Policy
+    from rpu_backend.adapters.pi05 import loader
+
+    cold = _policy()
+    calls = []
+    monkeypatch.setattr(loader, "_load_and_fp16_cast", lambda path, dtype, **kwargs:
+                        calls.append(kwargs) or cold)
+    public = Pi05Policy.from_pretrained("/unused", max_seq_len=16384)
+    assert calls == [{"trust_remote_code": False}]
+    assert public._adapter._max_seq_len == 16384
+    assert pi05.Pi05Adapter(cold)._max_seq_len == 16384
+    with pytest.raises(ValueError, match="cold-bound"):
+        Pi05Policy.from_lerobot_policy(cold, max_seq_len=32768)
+    for invalid in (True, 0, -1, 16384.0):
+        with pytest.raises(ValueError, match="positive integer"):
+            Pi05Policy.from_pretrained("/must-not-load", max_seq_len=invalid)
+    assert calls == [{"trust_remote_code": False}]
+
+
 @pytest.mark.parametrize("value", (True, "auto", {}, 1))
 def test_graph_runtime_policy_type_rejected_before_pi_loading_or_owner_mutation(monkeypatch, value):
     from rpu_backend.api import Pi05Policy

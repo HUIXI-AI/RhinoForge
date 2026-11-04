@@ -60,6 +60,8 @@ public:
     // Cold finite tower topology. A root budget of six uses this four-core
     // tower; physical DDR controller striping remains eight-wide.
     void configure_execution_cores(int64_t cores);
+    // Bind before weights or fixed-DMA storage; it cannot grow after capture.
+    void configure_cache_capacity(int64_t max_seq_len);
     std::vector<int64_t> execution_topology() const;
 
     // Cold precision policy: public explicit ACC32 may pair with ultra ERF;
@@ -98,7 +100,7 @@ public:
 
     // set_rope_tables — register FreqCos / FreqSin static tables [max_hw, head_dim/4]
     // FP16 DDR (indexed by BOTH row_idx and col_idx) + pre-alloc the position_idx
-    // keepalive [MAX_KEEPALIVE_SEQ, 2] int16.
+    // keepalive [installed physical capacity, 2] int16.
     void set_rope_tables(const at::Tensor& freq_cos, const at::Tensor& freq_sin);
 
     // set_patch_embed — opt into in-graph STEP 0 (patch_embed + pos_embed).
@@ -461,6 +463,8 @@ private:
     at::Tensor freq_cos_;
     at::Tensor freq_sin_;
     at::Tensor position_idx_keepalive_;
+    int64_t cache_capacity_ = 0;
+    int64_t keepalive_capacity_ = 0;
     int64_t max_hw_ = 0;
     bool has_rope_ = false;
     int64_t current_num_patches_ = 0;

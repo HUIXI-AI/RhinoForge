@@ -363,7 +363,7 @@ void WallOssActionStepModel::stage_execution_chunk_size(
         chunk_size);
     const int64_t old_chunk = configured_chunk_size_;
     stage_execution_controls(
-        token, chunk_size, ChunkEnvelope{/*max_kv_len=*/8192, chunk_size},
+        token, chunk_size, ChunkEnvelope{/*max_kv_len=*/cos_.size(0), chunk_size},
         [this, chunk_size] { configured_chunk_size_ = chunk_size; },
         [this, old_chunk] { configured_chunk_size_ = old_chunk; },
         "WallOssActionStepModel::stage_execution_chunk_size");
@@ -1248,7 +1248,7 @@ void rpu_wall_oss_action_step_set_weights(
     // Declared here because the bound is intrinsic to the subsystem, not an
     // adapter policy.
     // See docs/runtime_config.md.
-    m->set_chunk_envelope(/*max_kv_len=*/8192, /*chunk=*/chunk_size);
+    m->set_chunk_envelope(/*max_kv_len=*/cos.size(0), /*chunk=*/chunk_size);
     m->set_action_weights(w_comb, w3, proj_back, w2_t, w2_a, action_dim, k_comb_pad, chunk_size);
 }
 

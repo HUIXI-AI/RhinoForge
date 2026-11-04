@@ -59,12 +59,8 @@ using namespace ::rhino_lkn;
 
 #define DWIDTH 2
 
-// Position-table keepalive cap. 4096 patches covers up to 64×64 grid (typical
-// single-image is 28×28 = 784; pre-merger grid for 4096 is overkill but cheap
-// at 4096 × 2 × 2 = 16 KB DDR. Aligned to allow 256B-boundary writes).
 constexpr int64_t RHINOVLA_VISION_HIGH_ACTIVATION_SITE = 108086773956923057LL;
 constexpr int64_t RHINOVLA_VISION_HIGH_ENCODER_ACTIVATION_SITE = 4642981117179055386LL;
-constexpr int64_t QWEN3VL_VISION_MAX_KEEPALIVE_SEQ = 4096;
 
 constexpr int64_t QWEN3VL_VISION_DEFAULT_CHUNK_SIZE = 144;
 constexpr int64_t QWEN3VL_VISION_LARGE_IMAGE_THRESHOLD = 1024;
@@ -616,6 +612,9 @@ public:
                     "head_dim/4=", orig_head_dim_ / 4, ", got ",
                     freq_cos.size(1));
 
+        const int64_t capacity = chunk_envelope().max_kv_len;
+        TORCH_CHECK(capacity > 0 && get_last_resolved_chunk_size() == 0,
+                    "qwen3vl_vision_set_rope: bind positive cache capacity before RoPE and first forward");
         freq_cos_ = freq_cos;
         freq_sin_ = freq_sin;
         max_hw_ = freq_cos.size(0);
@@ -627,10 +626,10 @@ public:
         rope_spm_enabled_ =
             rope_route_request_ == Qwen3VLVisionRopeRouteRequest::SPM;
 
-        // Lazy-alloc on first call; reuse on subsequent calls (sizes never change).
-        if (!position_idx_keepalive_.defined()) {
+        // Capacity is cold-bound to the allocated cache, never a fixed patch count.
+        if (!position_idx_keepalive_.defined() || position_idx_keepalive_.size(0) != capacity) {
             position_idx_keepalive_ = at::empty(
-                {QWEN3VL_VISION_MAX_KEEPALIVE_SEQ, 2},
+                {capacity, 2},
                 at::TensorOptions().dtype(at::kShort).device(at::kPrivateUse1));
             position_idx_keepalive_.zero_();
         }
@@ -751,13 +750,23 @@ public:
         invalidate_model_state();
     }
 
-    int64_t max_keepalive_seq() const { return QWEN3VL_VISION_MAX_KEEPALIVE_SEQ; }
+    int64_t max_keepalive_seq() const {
+        return position_idx_keepalive_.defined()
+            ? position_idx_keepalive_.size(0) : chunk_envelope().max_kv_len;
+    }
+
+    void set_execution_envelope(int64_t capacity, int64_t chunk) {
+        TORCH_CHECK(!position_idx_keepalive_.defined() ||
+                        capacity == position_idx_keepalive_.size(0),
+                    "Qwen3-VL Vision cache capacity cannot change after position storage is installed");
+        set_chunk_envelope(capacity, chunk);
+    }
 
     void set_configured_chunk_size(int64_t chunk_size) {
         TORCH_CHECK(chunk_size == 0
-                        || (chunk_size >= 16 && chunk_size % 16 == 0),
+                        || (chunk_size >= 16 && chunk_size % 16 == 0 && chunk_size <= UINT16_MAX),
                     "Qwen3-VL vision chunk size must be 0 (auto) or a "
-                    "positive multiple of 16, got ", chunk_size);
+                    "positive multiple of 16 within the uint16 RoPE token domain, got ", chunk_size);
         TORCH_CHECK(get_last_resolved_chunk_size() == 0,
                     "Qwen3-VL vision chunk size must be configured before "
                     "the first forward");
@@ -915,10 +924,10 @@ public:
                     "Qwen3VLVisionModel::resolve_stage_domain: pooler Z1 or "
                     "multiview layout is prepared or active");
         TORCH_CHECK(num_patches > 0 &&
-                        num_patches <= QWEN3VL_VISION_MAX_KEEPALIVE_SEQ,
+                        num_patches <= max_keepalive_seq(),
                     "Qwen3VLVisionModel::resolve_stage_domain: num_patches=",
-                    num_patches, " must be in (0, MAX_KEEPALIVE_SEQ=",
-                    QWEN3VL_VISION_MAX_KEEPALIVE_SEQ, "]");
+                    num_patches, " must be in (0, installed capacity=",
+                    max_keepalive_seq(), "]");
         TORCH_CHECK(image_batch_count >= 1 &&
                         num_patches % image_batch_count == 0,
                     "Qwen3VLVisionModel::resolve_stage_domain: num_patches=",
@@ -1037,9 +1046,9 @@ public:
         TORCH_CHECK(input.dim() == 3,
                     "Qwen3VLVisionModel::forward: input must be 3D [1,N,H] (adapter "
                     "unsqueezes batch axis), got ", input.dim(), "D");
-        TORCH_CHECK(num_patches_in > 0 && num_patches_in <= QWEN3VL_VISION_MAX_KEEPALIVE_SEQ,
+        TORCH_CHECK(num_patches_in > 0 && num_patches_in <= max_keepalive_seq(),
                     "Qwen3VLVisionModel::forward: num_patches=", num_patches_in,
-                    " must be in (0, MAX_KEEPALIVE_SEQ=", QWEN3VL_VISION_MAX_KEEPALIVE_SEQ, "]");
+                    " must be in (0, installed capacity=", max_keepalive_seq(), "]");
         TORCH_CHECK(input.size(0) == 1,
                     "Qwen3VLVisionModel::forward: batch must be 1, got ", input.size(0));
         TORCH_CHECK(input.size(1) == num_patches_in,
@@ -2927,6 +2936,9 @@ protected:
 
     int64_t subclass_chunk_size_cap(
         int64_t seq_len, int64_t /*position*/) const override {
+        TORCH_CHECK(seq_len > 0 && seq_len <= max_keepalive_seq() &&
+                        seq_len <= int64_t{UINT16_MAX} * 16,
+                    "RPU_PLANNER_REJECT:CAPABILITY: Vision sequence exceeds installed capacity or SDPA registers");
         if (configured_chunk_size_ > 0) {
             return configured_chunk_size_;
         }
@@ -2950,6 +2962,7 @@ protected:
         int64_t chunk_size,
         int64_t seq_len,
         int64_t position) const override {
+        if (chunk_size <= 0 || chunk_size > UINT16_MAX) return false;
         if (compact_encoder_active()) {
             return seq_len == 1200 && position == 0 && chunk_size == 1200;
         }
@@ -5409,7 +5422,7 @@ private:
     }
     void prepare_resident_spm(int64_t num_patches, int64_t image_batch_count) {
         TORCH_CHECK(resident_preloads_enabled() && num_patches > 0 &&
-                        num_patches <= QWEN3VL_VISION_MAX_KEEPALIVE_SEQ &&
+                        num_patches <= max_keepalive_seq() &&
                         image_batch_count > 0 && num_patches % image_batch_count == 0 &&
                         (num_patches / image_batch_count) % 4 == 0,
                     "resident Vision reservation requires complete per-image patch groups");
@@ -6049,7 +6062,7 @@ void rpu_qwen3vl_vision_set_preload_replay_skip(int64_t handle, bool enabled) {
 
 void rpu_qwen3vl_vision_set_chunk_envelope(int64_t handle, int64_t max_kv_len, int64_t chunk) {
     Qwen3VLVisionRegistry::get(handle, "rpu_qwen3vl_vision_set_chunk_envelope")
-        ->set_chunk_envelope(std::min(max_kv_len, QWEN3VL_VISION_MAX_KEEPALIVE_SEQ), chunk);
+        ->set_execution_envelope(max_kv_len, chunk);
 }
 
 void rpu_qwen3vl_vision_set_chunk_size(int64_t handle, int64_t chunk_size) {

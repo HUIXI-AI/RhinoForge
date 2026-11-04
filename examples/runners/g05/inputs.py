@@ -307,29 +307,14 @@ def prepare_inputs(policy, processor, inputs, run, checkpoint, checkpoint_manife
 
 
 def configure_text_envelope(policy, metadata):
-    """Example-only extension of the already measured cold P512/C256 scope."""
-    import torch
-
+    """Record the installed capacity without narrowing it to an example length."""
     prefix = metadata["prefix_rows"]
     cameras = metadata.get("cameras", int(getattr(policy, "num_input_images", 3)))
     if (type(cameras) is not int or cameras not in (2, 3)
             or type(prefix) is not int or not 32 + 64 * cameras + 1 <= prefix <= 256 + 64 * cameras + 1
             or ("text_tokens" in metadata and prefix != metadata["text_tokens"] + 64 * cameras + 1)):
         raise ValueError("G05 example prefix must equal actual T32..256 plus64*cameras+1")
-    if prefix <= 256:
-        metadata["prefill_capability_envelope"] = [256, 256]
-        return
-    policy._execution_session.require_cold()
-    if not getattr(policy, "_rpu_g05_fm_only_customer_release", False):
-        raise ValueError("extended text input requires exact G05 K1 release")
-    model = policy.model
-    state = model.vlm._rpu_qwen3_5
-    caches = (state.prefill_graph_cache, model.action_expert._rpu_qwen3_5.action_graph_cache,
-              model.vision_tower._rpu_vision_graph_cache)
-    if any(cache.size() for cache in caches):
-        raise RuntimeError("G05 example text envelope must be configured before Graph BUILD")
-    torch.ops.rpu.qwen3_5_set_chunk_envelope(state.handle, 512, 256)
-    # Publish only after the native cold setter succeeds. No public default changes.
-    state.prefill_capability_envelope = (512, 256)
-    metadata["prefill_capability_envelope"] = [512, 256]
-    metadata["extended_text_measurement"] = True
+    state = policy.model.vlm._rpu_qwen3_5
+    if prefix > state.max_seq_len:
+        raise ValueError("G05 example prefix exceeds the installed KV capacity")
+    metadata["prefill_capability_envelope"] = list(state.prefill_capability_envelope)

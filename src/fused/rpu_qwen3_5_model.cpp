@@ -1734,6 +1734,27 @@ at::Tensor Qwen3_5Model::forward_impl(
     TORCH_CHECK(seq_len == 1 || seq_len % 64 == 0,
                 "Qwen3.5 text expects decode length 1 or a prefill execution "
                 "length divisible by 64; use the Python adapter for ragged prefill");
+    // Validate the installed capacity before any cache state or fixed-DMA
+    // buffers can change. The Action entrypoints own their separate geometry.
+    (void)subclass_chunk_size_cap(seq_len, position);
+    if (!action_mode_) {
+        const bool use_prefill_rope = seq_len > 1 && has_mrope_ &&
+            prefill_cos_.defined() && prefill_cos_.numel() > 0;
+        const auto& rope_cos = use_prefill_rope ? prefill_cos_ : cos_;
+        const auto& rope_sin = use_prefill_rope ? prefill_sin_ : sin_;
+        TORCH_CHECK(
+            rope_cos.defined() && rope_sin.defined() &&
+                rope_cos.dim() == 2 && rope_cos.sizes() == rope_sin.sizes() &&
+                seq_len <= rope_cos.size(0) && position <= rope_cos.size(0) - seq_len,
+            "Qwen3.5 request exceeds the installed rotary table capacity");
+        // Per-token prefill tables already encode M-RoPE positions. Compare
+        // static decode offsets before adding them to avoid integer overflow.
+        TORCH_CHECK(
+            use_prefill_rope ||
+                (mrope_pos_delta_ >= -position &&
+                 mrope_pos_delta_ <= rope_cos.size(0) - seq_len - position),
+            "Qwen3.5 rotary position delta exceeds the installed table capacity");
+    }
     gdn_states_  = &gdn_states;
     conv_states_ = &conv_states;
     fast_replay_active_ = fast_replay_enabled_ && seq_len > 1;
@@ -5983,6 +6004,12 @@ int64_t Qwen3_5Model::subclass_chunk_size_cap(int64_t seq_len,
     // G0.5 action mode is a fixed all-full-attention expert, not a Qwen3.5
     // text-prefill profile. Its action-length override is checked separately.
     if (action_mode_) return 0;
+    constexpr int64_t max_kv_rows = int64_t{UINT16_MAX} * 16;
+    TORCH_CHECK(
+        seq_len > 0 && position >= 0 && seq_len <= max_kv_rows &&
+            position <= max_kv_rows - seq_len,
+        "RPU_PLANNER_REJECT:CAPABILITY: Qwen3.5 attention key length "
+        "exceeds the positive kernel register domain");
     const int64_t envelope_chunk =
         enforce_chunk_envelope(seq_len, position, "Qwen3_5Model");
     if (chunk_size_cap_ <= 0) return envelope_chunk;

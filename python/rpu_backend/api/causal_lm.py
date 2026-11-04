@@ -192,8 +192,14 @@ class RPUModelForCausalLM:
         device: str | torch.device | None = None,
         rpu_execution=None,
         quantization: str | None = None,
+        max_seq_len: int | None = None,
         **hf_kwargs,
     ):
+        if max_seq_len is not None:
+            from numbers import Integral
+            if isinstance(max_seq_len, bool) or not isinstance(max_seq_len, Integral) or max_seq_len <= 0:
+                raise ValueError("max_seq_len must be a positive integer")
+            max_seq_len = int(max_seq_len)
         if quantization not in (None, "w4a16", "w4a16_lm_head"):
             raise UnsupportedModelError(
                 "quantization must be None, 'w4a16' or 'w4a16_lm_head' (dense Qwen3, G32, TP8)"
@@ -323,6 +329,11 @@ class RPUModelForCausalLM:
             )
         model.eval()
         model._rpu_execution = execution_config
+        if max_seq_len is not None:
+            model._rpu_max_seq_len = max_seq_len
+            inner = getattr(model, "model", None)
+            if inner is not None:
+                inner._rpu_max_seq_len = max_seq_len
 
         # D-02: instantiate adapter on the loaded model. The adapter's __init__
         # re-checks the profile (belt-and-suspenders — preflight already ran).

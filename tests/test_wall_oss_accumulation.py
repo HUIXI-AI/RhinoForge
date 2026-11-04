@@ -13,6 +13,24 @@ from rpu_backend.tests.acceptance.test_wall_oss_builder_lifecycle import (
 )
 
 
+@pytest.mark.parametrize("kind", ["prefill", "action"])
+def test_decoder_envelope_uses_requested_capacity(native_ops, monkeypatch, kind):
+    calls = []
+    monkeypatch.setattr(torch.ops.rpu, "causal_decoder_set_chunk_envelope",
+                        lambda *args: calls.append(args))
+    kwargs = dict(set_weights=lambda handle, *_: native_ops["step"]("weights", handle),
+                  weight_args=(), max_seq_len=16384)
+    if kind == "prefill":
+        handle = llm._configure_causal_decoder_handle(
+            **kwargs, chunk_size_cap=384, equal_two_prefill=False)
+    else:
+        handle = action._configure_action_handle(**kwargs, fused=False)
+    try:
+        assert calls[0][:2] == (handle, 16384)
+    finally:
+        torch.ops.rpu.causal_decoder_destroy(handle)
+
+
 @pytest.mark.parametrize("stage", ["prefill", "vision", "action"])
 def test_public_accumulation_bool_and_rtc_rejection(stage):
     for value in (False, True):

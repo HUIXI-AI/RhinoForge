@@ -138,12 +138,12 @@ def test_quant_policy_requires_exact_opt_in_before_model_access(monkeypatch):
 
 def test_qwen3_5_language_envelope_contains_the_mr54_rows():
     expected = {
-        (24, 1024): (8192, 512),
-        (24, 2048): (8192, 640),
-        (32, 2560): (8192, 448),
-        (32, 4096): (8192, 256),
+        (24, 1024): 512,
+        (24, 2048): 640,
+        (32, 2560): 448,
+        (32, 4096): 256,
     }
-    assert {key: text_module.CERTIFIED_CHUNK_ENVELOPE[key] for key in expected} == expected
+    assert {key: text_module.PREFILL_CHUNK_CEILING[key] for key in expected} == expected
 
 
 def test_vision_config_does_not_change_language_chunk_envelope(monkeypatch):
@@ -159,17 +159,17 @@ def test_vision_config_does_not_change_language_chunk_envelope(monkeypatch):
 
     profiles = ((24, 2048), (32, 2560), (24, 1024), (32, 4096))
     for handle, key in enumerate(profiles):
-        text_module._declare_qwen3_5_chunk_envelope(handle, *key)
+        text_module._declare_qwen3_5_chunk_envelope(handle, *key, 16384)
     assert calls == [
-        (0, 8192, 640),
-        (1, 8192, 448),
-        (2, 8192, 512),
-        (3, 8192, 256),
+        (0, 16512, 640),
+        (1, 16512, 448),
+        (2, 16512, 512),
+        (3, 16512, 256),
     ]
 
     calls.clear()
-    text_module._declare_qwen3_5_chunk_envelope(4, 24, 2048)
-    assert calls == [(4, 8192, 640)]
+    text_module._declare_qwen3_5_chunk_envelope(4, 24, 2048, 32768)
+    assert calls == [(4, 32896, 640)]
 
 
 def test_multimodal_request_uses_the_shared_stage_ceiling():
@@ -219,7 +219,8 @@ def _text_preflight_owner(*, exact_chunk_size=None, retained=False):
         handle=7,
         num_layers=24,
         hidden_size=2048,
-        chunk_envelope=(8192, 640),
+        max_seq_len=8192,
+        chunk_envelope=(8320, 640),
         padding_budget=0,
         padding_rows="auto",
         exact_chunk_size=exact_chunk_size,
@@ -241,8 +242,8 @@ def _text_preflight_owner(*, exact_chunk_size=None, retained=False):
 def test_image_and_text_requests_share_the_actual_language_domain(monkeypatch, profile, exact):
     from test_execution_planner import _native_candidate_v2
 
-    envelope = text_module.CERTIFIED_CHUNK_ENVELOPE[profile]
-    ceiling = envelope[1]
+    ceiling = text_module.PREFILL_CHUNK_CEILING[profile]
+    envelope = (8320, ceiling)
     text, cache = _text_preflight_owner(exact_chunk_size=ceiling if exact else None)
     state = text._rpu_qwen3_5
     state.num_layers, state.hidden_size = profile
@@ -275,7 +276,7 @@ def test_language_preflight_rejects_beyond_installed_envelope_without_native_pro
         raising=False,
     )
 
-    with pytest.raises(adapter_module.UnsupportedModelError, match="limit 8192"):
+    with pytest.raises(ValueError, match="limit=8192"):
         text_module._preflight_qwen3_5_text(
             text, cache, 8193, multimodal_prefill=image
         )

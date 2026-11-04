@@ -301,7 +301,7 @@ def _destroy_action_handle(h, fused):
 
 def _configure_action_handle(
     *, fused, set_weights, weight_args, chunk_size_override=0,
-    kv_owner_fanout=False, sorting=None, linear_acc32=False,
+    kv_owner_fanout=False, sorting=None, linear_acc32=False, max_seq_len=2048,
 ):
     """Create/configure an action handle, destroying it on failure."""
     from rpu_backend.api._execution import _require_execution_process_safe
@@ -332,18 +332,9 @@ def _configure_action_handle(
                 handle, True
             )
         if not fused:
-            # MR-A: certified chunk envelope (docs/runtime_config.md
-            # row #11). ONLY the unfused path is a CausalDecoderModel — the fused
-            # path is wall_oss_action_step, a different C++ class that does not
-            # participate in the envelope regime. Values are the text expert's
-            # (llm.py): same geometry family, same 2D-rect-mask layout, and the
-            # same green evidence (the four cells at .gitlab-ci.yml:2058-2059).
-            from rpu_backend.adapters.wall_oss.llm import (
-                _CHUNK_ENVELOPE_MAX_KV,
-                _PREFILL_CHUNK_SIZE_CAP_SAFE,
-            )
+            from rpu_backend.adapters.wall_oss.llm import _PREFILL_CHUNK_SIZE_CAP_SAFE
             torch.ops.rpu.causal_decoder_set_chunk_envelope(
-                handle, _CHUNK_ENVELOPE_MAX_KV, _PREFILL_CHUNK_SIZE_CAP_SAFE)
+                handle, int(max_seq_len), _PREFILL_CHUNK_SIZE_CAP_SAFE)
             if chunk_size_override:
                 torch.ops.rpu.causal_decoder_set_chunk_size_override(
                     handle, chunk_size_override
@@ -1576,6 +1567,7 @@ def _load_expert1_decoder(st, cfg, num_layers, max_seq_len, *, w8a16: bool = Fal
             fused=True,
             set_weights=torch.ops.rpu.wall_oss_action_step_set_weights,
             weight_args=weight_args,
+            max_seq_len=max_seq_len,
             kv_owner_fanout=kv_owner_fanout, sorting=sorting,
             linear_acc32=linear_acc32,
         )
@@ -1644,6 +1636,7 @@ def _load_expert1_decoder(st, cfg, num_layers, max_seq_len, *, w8a16: bool = Fal
         args.extend([q_b_list, k_b_list, v_b_list])
     handle = _configure_action_handle(
         fused=False, set_weights=set_weights, weight_args=args, sorting=sorting,
+        max_seq_len=max_seq_len,
         chunk_size_override=action_chunk_size,
         linear_acc32=linear_acc32,
     )

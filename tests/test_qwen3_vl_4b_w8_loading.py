@@ -143,12 +143,12 @@ def test_4b_long_envelope_cold_binding_preserves_other_profiles(monkeypatch):
     model=NS(config=cfg)
     text.install_qwen3_vl_text_for_rpu(model,scale_lists=([],)*7,runtime_align_w8a16=True)
     actual=captured["chunk_envelope_for"]("qwen3_vl_text",36,2560)
-    assert actual == text.ChunkEnvelope(4176,256)
+    assert actual == text.ChunkEnvelope(0,256)
     text.install_qwen3_vl_text_for_rpu(model)
-    assert captured["chunk_envelope_for"]("qwen3_vl_text",36,2560) == text.ChunkEnvelope(4176,256)
-    assert text.lookup_causal_decoder("qwen3_vl_text",28,2048) == text.ChunkEnvelope(4176,320)
-    assert text.lookup_causal_decoder("qwen3_vl_text",36,4096) == text.ChunkEnvelope(4176,128)
-    assert text.lookup_causal_decoder("qwen3_vl_text",16,2048) == text.ChunkEnvelope(512)
+    assert captured["chunk_envelope_for"]("qwen3_vl_text",36,2560) == text.ChunkEnvelope(0,256)
+    assert text.lookup_causal_decoder("qwen3_vl_text",28,2048) == text.ChunkEnvelope(0,320)
+    assert text.lookup_causal_decoder("qwen3_vl_text",36,4096) == text.ChunkEnvelope(0,128)
+    assert text.lookup_causal_decoder("qwen3_vl_text",16,2048) == text.ChunkEnvelope(0,512)
     with pytest.raises(RuntimeError,match="no certified chunk envelope"):
         text.lookup_causal_decoder("qwen3_vl_text",36,2561)
     with pytest.raises(ValueError,match="scales"):

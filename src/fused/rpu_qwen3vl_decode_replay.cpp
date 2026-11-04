@@ -70,13 +70,13 @@ struct DecodeKernelSlot { size_t kernel, node; std::string name; };
 
 // Physical packed-cache rows, independent of the cold prefill envelope. The
 // public runner separately checks RPUCache's logical (possibly unaligned) limit.
-constexpr int64_t kCheckedDecodeMaxCacheRows = 4352;
+constexpr int64_t kCheckedDecodeMaxKeyRows = int64_t{UINT16_MAX} * 16;
 
 std::optional<int64_t> decode_cache_capacity(at::TensorList k, at::TensorList v, int layers) {
     if ((layers != 5 && layers != 28 && layers != 36) || k.size() != size_t(layers) || v.size() != size_t(layers) || !k[0].defined() || k[0].dim() != 7)
         return std::nullopt;
     const int64_t blocks = k[0].size(1);
-    if (blocks <= 0 || blocks > kCheckedDecodeMaxCacheRows / 16)
+    if (blocks <= 0 || blocks > std::numeric_limits<int64_t>::max() / 16)
         return std::nullopt;
     const auto valid = [blocks](const at::Tensor& t) {
         if (!t.defined() || t.device().type() != at::kPrivateUse1 ||
@@ -208,8 +208,9 @@ void update_decode_patches(std::vector<RegisterPatch>& patches, int64_t position
     TORCH_CHECK((layers == 5 || layers == 28 || layers == 36) &&
                     (patches.size() == size_t(layers * 10) || patches.size() == size_t(layers * 14) ||
                      patches.size() == size_t(layers * 16)) &&
-                    cache_capacity > 0 && cache_capacity <= kCheckedDecodeMaxCacheRows &&
-                    cache_capacity % 16 == 0 && position >= 0 && position < cache_capacity,
+                    cache_capacity > 0 && cache_capacity % 16 == 0 &&
+                    position >= 0 && position < cache_capacity &&
+                    position < kCheckedDecodeMaxKeyRows,
                 "unsealed Qwen3-VL decode patch recipe");
     const uint32_t p = position, s = p + 1;
     const size_t stride = patches.size() / layers;
@@ -242,7 +243,7 @@ bool readable_elements(const at::Tensor& tensor, uint64_t count) {
 
 void check_decode_position(const at::Tensor& positions, const at::Tensor& cos,
                            int64_t position, int64_t cache_capacity) {
-    TORCH_CHECK(position >= 0 && position < cache_capacity && position < cos.size(0) &&
+    TORCH_CHECK(position >= 0 && position < cache_capacity && position < kCheckedDecodeMaxKeyRows && position < cos.size(0) &&
                     position < positions.size(0),
                 "Qwen3-VL checked decode position exceeds physical cache/logical RoPE bounds");
     TORCH_CHECK(readable_elements(positions, static_cast<uint64_t>(position) * 3 + 8),
@@ -364,10 +365,9 @@ struct CausalDecoderModel::Qwen3VlDecodeReplayState {
         }
         return tensor_shape(model.final_norm_w_, at::kHalf, {h}) &&
             (!p.packed_qkv || tensor_shape(model.qwen3vl_4b_qkv_scale_bank_, at::kHalf, {36, 6144})) &&
-            // Ordinary 2B/8B use an exact-size THW table; only the bounded
-            // cache envelope is reachable. 4B retains its fused-kernel tail proof.
+            // Every installed THW owner retains initialized final-row overfetch.
             (p.tts_predictor || readable_elements(model.position_ids_keepalive_,
-                ((h == 2560 ? 8192 : kCheckedDecodeMaxCacheRows) - 1) * 3 + 8));
+                (uint64_t(model.position_ids_keepalive_.size(0)) - 1) * 3 + 8));
     }
 
     bool owners_match(CausalDecoderModel& model) const {
@@ -445,11 +445,8 @@ bool CausalDecoderModel::begin_qwen3vl_decode_replay(
     const bool ordinary = qwen3vl_ordinary_resident_prefill_profile_ || qwen3vl_4b_w8_profile_ || exact_8b || tts_predictor;
     const bool geometry = (num_layers() == 28 && hidden_size() == 2048 && intermediate_size() == 6144 && num_q_heads() == 16) ||
         (num_layers() == 36 && hidden_size() == 2560 && intermediate_size() == 9728 && num_q_heads() == 32) || exact_8b || tts_predictor;
-    const bool envelope = tts_predictor || (exact_8b
-        ? (chunk_envelope().max_kv_len == 320 || chunk_envelope().max_kv_len == 4176) &&
-          chunk_envelope().chunk == 128
-        : (chunk_envelope().max_kv_len == 2048 || chunk_envelope().max_kv_len == 4176) &&
-          chunk_envelope().chunk == (num_layers() == 28 ? 320 : 256));
+    const bool envelope = tts_predictor || (chunk_envelope().max_kv_len > 0 &&
+        chunk_envelope().chunk == (exact_8b ? 128 : num_layers() == 28 ? 320 : 256));
     if (typeid(*this) != typeid(CausalDecoderModel) || !RpuKernelGraph::has_active() ||
         !ordinary || !geometry || !is_causal || mask.has_value() || partial_mrope_active_ ||
         decoder_mixed_precision_ || adarms_ || planning_mode_ != CausalDecoderPlanningMode::ORDINARY ||
@@ -465,7 +462,7 @@ bool CausalDecoderModel::begin_qwen3vl_decode_replay(
         sdpa_kernel_ != SdpaKernelType::FLASH_ATTN_SPM ||
         (!tts_predictor && (mrope_section_ != std::vector<int32_t>({24, 20, 20}) ||
          deepstack_lang_layers_ != std::vector<int64_t>({0, 1, 2}))) ||
-        // Preserve each named prefill envelope; actual KV owners bound decode.
+        // Preserve per-profile chunk policy; actual owners bound decode length.
         !envelope ||
         get_debug_export() || descriptor.empty() || k.size() != size_t(num_layers()) || v.size() != size_t(num_layers()) ||
         !tensor_shape(hidden, at::kHalf, {1, 1, hidden_size()})) return false;
@@ -480,7 +477,10 @@ bool CausalDecoderModel::begin_qwen3vl_decode_replay(
     if (profile.acc32 && profile.dtype != at::kHalf) return false;
     if ((!tts_predictor && (!Qwen3VlDecodeReplayState::projection_shape(lm_head_w_, lm_head_w_scale_,
             profile.dtype, 151936, hidden_size(), false) ||
-        !tensor_shape(position_ids_keepalive_, at::kInt, {8192, 3}))) ||
+        !cos_.defined() || cos_.dim() != 2 || cos_.size(0) <= 0 ||
+        !position_ids_keepalive_.defined() || position_ids_keepalive_.dim() != 2 ||
+        position_ids_keepalive_.size(0) <= 0 || position_ids_keepalive_.size(0) > cos_.size(0) ||
+        !tensor_shape(position_ids_keepalive_, at::kInt, {position_ids_keepalive_.size(0), 3}))) ||
         !cos_.defined() || cos_.dim() != 2 || cos_.size(1) != 64 ||
         cos_.scalar_type() != at::kHalf || !tensor_shape(sin_, at::kHalf, cos_.sizes())) return false;
     const auto cache_capacity = decode_cache_capacity(k, v, num_layers());

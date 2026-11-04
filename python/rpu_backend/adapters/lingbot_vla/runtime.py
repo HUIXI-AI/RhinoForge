@@ -385,7 +385,6 @@ def _build_rope_tables(head_dim, theta, max_seq):
     return _h(freqs.cos().float()), _h(freqs.sin().float())
 
 
-_VLM_CERTIFIED_MAX_PREFIX = 178
 _VLM_EXACT_CHUNK_CEILING = 176
 _ACTION_CHUNK_SIZE = 64
 
@@ -490,7 +489,7 @@ def _build_vlm_decoder(gw, max_seq, chunk_size=0):
         # the certified ceiling on both so later public chunk transactions
         # need not change this cold envelope. Native SDPA/SPM still filter each
         # concrete shape; a ceiling is not admission of every smaller chunk.
-        envelope_max_kv = min(int(max_seq), _VLM_CERTIFIED_MAX_PREFIX)
+        envelope_max_kv = int(max_seq)
         torch.ops.rpu.causal_decoder_set_chunk_envelope(
             handle, envelope_max_kv, _VLM_EXACT_CHUNK_CEILING)
         torch.ops.rpu.causal_decoder_set_chunk_size_override(
@@ -754,13 +753,6 @@ class LingbotVlaPolicy:
     def _plan_prefill_execution(self, logical_len: int):
         """Resolve the complete native A6 winner before any mutation."""
         logical_len = int(logical_len)
-        if logical_len > _VLM_CERTIFIED_MAX_PREFIX:
-            raise ValueError(
-                "LingBot-VLA prefill is certified only through logical prefix "
-                f"length {_VLM_CERTIFIED_MAX_PREFIX}; got {logical_len}. "
-                "The larger cache capacity is not evidence that this SPM/SDPA "
-                "shape is executable."
-            )
         largest_exact = ((logical_len + 15) // 16) * 16
         if self._prefill_chunk_size and self._prefill_chunk_size > largest_exact:
             raise ValueError(
@@ -772,10 +764,7 @@ class LingbotVlaPolicy:
         try:
             execution_len, resolved = plan_bounded_prefill_execution(
                 logical_len,
-                min(
-                    _VLM_CERTIFIED_MAX_PREFIX,
-                    int(self._max_seq) - (N_ACTION + 1),
-                ),
+                int(self._max_seq) - (N_ACTION + 1),
                 0,
                 execution_owner=self,
                 execution_component="language_model",

@@ -198,55 +198,31 @@ def test_qwen3_vl_long_prefill_envelope_is_profile_specific():
         literal_key = ast.literal_eval(key)
         if literal_key[:1] == ("qwen3_vl_text",) and literal_key[1] in (28, 36):
             rows[literal_key] = tuple(ast.literal_eval(arg) for arg in value.args)
-    assert rows[("qwen3_vl_text", 28, 2048)] == (4176, 320)
-    assert rows[("qwen3_vl_text", 36, 2560)] == (4176, 256)
-    assert rows[("qwen3_vl_text", 36, 4096)] == (4176, 128)
+    assert rows[("qwen3_vl_text", 28, 2048)] == (0, 320)
+    assert rows[("qwen3_vl_text", 36, 2560)] == (0, 256)
+    assert rows[("qwen3_vl_text", 36, 4096)] == (0, 128)
 
 
-def test_prefill_planner_refuses_to_plan_past_the_8192_physical_limit():
-    """Reject requests beyond the actual M-RoPE keepalive capacity.
-
-    The forward passes physical_limit = min(max_seq_len-position,
-    sKeyVx*sKeyChunk, sValVx*sValChunk, _QWEN3_VL_MROPE_KEEPALIVE_ROWS);
-    the M-RoPE keepalive is 8192 rows
-    (adapters/qwen3_vl/__init__.py), sized to match RPUCache's 8192-token
-    capacity (src/fused/rpu_qwen3_model.h QWEN3_MROPE_MAX_KEEPALIVE_SEQ).
-
-    So 8192 is the LAST plannable execution length. One token past it the
-    ceil16 base leaves the candidate window empty and the planner must RAISE —
-    silently truncating, or wrapping into row 0 of the keepalive table, would
-    corrupt positions instead of failing.
-    """
+@pytest.mark.parametrize("limit", [8192, 16384, 32768])
+def test_prefill_planner_respects_installed_physical_capacity(limit):
+    """Padding cannot extend execution beyond the installed owner."""
     plan = _load_function("plan_bounded_prefill_execution", _DECODER)
-    limit = 8192
     resolve = _stage_domain(lambda _n: 512)
-
-    # 8191 and 8192 both ceil16 to exactly the limit -> still plannable.
-    assert plan(
-        8191, limit, 64, resolve_stage_domain=resolve, alignment=16
-    )[0] == limit
-    assert plan(
-        8192, limit, 64, resolve_stage_domain=resolve, alignment=16
-    )[0] == limit
-
-    # 8193 ceil16s to 8208 > limit; the padding budget must NOT rescue it.
-    for real_len in (8193, 8208, 9000):
+    for real_len in (limit - 1, limit):
+        assert plan(real_len, limit, 64,
+                    resolve_stage_domain=resolve, alignment=16)[0] == limit
+    for real_len in (limit + 1, limit + 16, limit + 1024):
         with pytest.raises(_PLANNER.PlannerRejectError, match="NO_FEASIBLE"):
-            plan(
-                real_len, limit, 64,
-                resolve_stage_domain=resolve,
-                alignment=16,
-            )
+            plan(real_len, limit, 64,
+                 resolve_stage_domain=resolve, alignment=16)
 
 
-def test_keepalive_bound_matches_the_cpp_cache_capacity():
-    """The Python keepalive row count and the C++ one must not drift apart.
-
-    They are two independent literals describing one buffer; if they diverge the
-    planner would admit a length the fused decoder cannot address.
-    """
-    assert "_QWEN3_VL_MROPE_KEEPALIVE_ROWS = 8192" in _ADAPTER.read_text()
-    assert "QWEN3_MROPE_MAX_KEEPALIVE_SEQ = 8192" in _MODEL_H.read_text()
+def test_keepalive_capacity_is_bound_to_installed_rope_tables():
+    assert "_rpu_mrope_capacity" in _ADAPTER.read_text()
+    header = _MODEL_H.read_text()
+    assert "? chunk_envelope().max_kv_len : cos.size(0);" in header
+    assert "{mrope_capacity + 8, 3}" in header
+    assert "QWEN3_MROPE_MAX_KEEPALIVE_SEQ" not in header
 
 
 def test_qwen3_vl_prefill_padding_covers_both_position_layouts_and_restore():
@@ -347,7 +323,7 @@ def test_qwen3_vl_prefill_planner_wiring_contract():
     assert "cache.sKeyVx" in plan_source
     assert "cache.sValVx" in plan_source
     assert "cache.max_seq_len" in plan_source
-    assert "_QWEN3_VL_MROPE_KEEPALIVE_ROWS" in plan_source
+    assert "_rpu_mrope_capacity" in plan_source
     assert "causal_decoder_resolve_prefill_stage_domain" in plan_source
     assert "causal_decoder_resolve_prefill_chunk_size" not in plan_source
     assert forward_source.index("_qwen3_vl_prefill_plan(") < forward_source.index("run_continuation_segments(")

@@ -137,8 +137,8 @@ def test_exact_preflight_has_own_narrow_envelope(monkeypatch,chunk):
     monkeypatch.setenv("QWEN3_VL_32B_ALLOW_GRAPH_BLOCKED","1")
     adapter.Qwen3VLAdapter.preflight(config())
     adapter.Qwen3VLAdapter.preflight_execution(config(),{"prefill":{"chunk_size":chunk}})
-    assert text._LEGACY_32B_CONTROLLED_ENVELOPE==(336,64)
-    assert text._RUNTIME_QUANTIZED_32B_ENVELOPE==(4176,64)
+    assert text._LEGACY_32B_CONTROLLED_ENVELOPE==(0,64)
+    assert text._RUNTIME_QUANTIZED_32B_ENVELOPE==(0,64)
 
 @pytest.mark.parametrize("chunk",[80,128,256])
 def test_wrong_chunk_early_reject(monkeypatch,chunk):
@@ -171,7 +171,7 @@ def test_exact_live_binding_and_independent_envelope(monkeypatch):
     m,scales=meta_text();seen={}
     monkeypatch.setattr(text,"install_mrope_text_decoder_for_rpu",lambda m,**kw:seen.update(kw) or 1)
     assert text.install_qwen3_vl_text_for_rpu(m,scale_lists=scales,_legacy_32b_w8a16=True)==1
-    assert seen['chunk_envelope_for']('qwen3_vl_text',64,5120)==(336,64)
+    assert seen['chunk_envelope_for']('qwen3_vl_text',64,5120)==(0,64)
     assert seen['_kv_cache_layer_bank_size']==8
     assert '_runtime_quantized_32b' not in seen
 

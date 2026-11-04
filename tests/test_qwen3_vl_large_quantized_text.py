@@ -63,7 +63,7 @@ def test_private_32b_binds_actual_quantized_owners_and_bounded_envelope(dtype, s
     assert kwargs["execution_config"] is execution and kwargs["topology"] is None
     assert kwargs["_kv_cache_layer_bank_size"] == 8
     envelope = kwargs["chunk_envelope_for"]
-    assert envelope("qwen3_vl_text", 64, 5120) == text.ChunkEnvelope(4176, 64)
+    assert envelope("qwen3_vl_text", 64, 5120) == text.ChunkEnvelope(0, 64)
     with pytest.raises(RuntimeError, match="no certified chunk envelope"):
         envelope("qwen3_vl_text", 63, 5120)
     assert not hasattr(model, "_rpu_decoder_handle")
@@ -138,5 +138,5 @@ def test_ordinary_32b_remains_without_envelope_and_existing_profiles_unchanged(s
     envelope = shared_installer[0][1]["chunk_envelope_for"]
     with pytest.raises(RuntimeError, match="no certified chunk envelope"):
         envelope("qwen3_vl_text", 64, 5120)
-    assert envelope("qwen3_vl_text", 36, 4096) == text.ChunkEnvelope(4176, 128)
-    assert envelope("qwen3_vl_text", 36, 2560) == text.ChunkEnvelope(4176, 256)
+    assert envelope("qwen3_vl_text", 36, 4096) == text.ChunkEnvelope(0, 128)
+    assert envelope("qwen3_vl_text", 36, 2560) == text.ChunkEnvelope(0, 256)

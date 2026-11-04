@@ -11,6 +11,9 @@ admitted profile.
   action rows.
 - **Execution length** includes any adapter-owned padding needed by the exact
   profile.
+- **Installed capacity** is the cold-bound logical storage/position capacity
+  requested for one model. A cache must fit it; aligned physical storage also
+  includes any required padding.
 - **Chunk size** bounds the rows handled by one planned unit. It is `"auto"` or
   a positive multiple of 16 on the public configuration surface.
 - **Padding budget** limits optional padding considered by a planner;
@@ -22,19 +25,30 @@ admitted profile.
 The adapter must return logical outputs and keep logical cache position even
 when the physical plan uses more rows.
 
+KV allocation and per-chunk feasibility are independent. Supported adapters
+bind planning length bounds to installed capacity and physical padding instead
+of a fixed historical token limit. Chunk ceilings, SPM usage, operator/register
+and coordinate widths, alignment and semantic input shapes still constrain
+execution. The allocator either provides the requested storage or reports
+failure; it does not silently shorten it. Default capacity is not an allocation
+ceiling, and a larger successful allocation does not extend hardware-validation
+evidence. See [KV cache](kv-cache.md) for capacity entry points.
+
 ## Planning contract
 
 1. Reject a model or request outside the exact public profile before loading or
    transforming weights.
 2. Bind cold `rpu_execution` fields before device installation. Use
    `reconfigure_rpu_execution` between requests for session-supported planning
-   fields; it replaces stages and retires affected Graphs. Core count and
-   precision changes require a new model or policy.
+   fields; it replaces stages and retires affected Graphs. Core count, precision
+   and installation-capacity changes require a new model or policy.
 3. Evaluate only deterministic candidates. A fused subsystem's
    `declare_buffers` and chunk-validity hooks must not launch work or depend on
    mutable runtime state.
-4. Treat SPM capacity, alignment, operator shape limits, cache capacity, and
-   model-specific constraints as hard feasibility gates.
+4. Treat SPM capacity, alignment, operator/coordinate widths, semantic input
+   shapes, actual cache/position capacity, and model-specific constraints as
+   hard feasibility gates. A profile's chunk ceiling does not impose a total
+   KV-capacity ceiling.
 5. Let the generic planner choose an unpadded feasible chunk. If an adapter
    admits logical padding, it owns the search, semantic inputs, output slicing,
    and cache rewind.

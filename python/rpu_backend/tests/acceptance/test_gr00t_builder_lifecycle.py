@@ -459,7 +459,7 @@ def test_actual_gr00t_cold_envelope_precedes_prepare_and_reuses_owner_caches(col
         assert cold_builder['envelopes'] == {'vl': (1, 144, 0), 'dit': (2, 384, 0)}
         assert len(cold_builder['caches']) == 3
         assert owner._max_prefix_len == 256
-        assert [row['max_seq_len'] for row in cold_builder['cache_requests']] == [256, 256, 512]
+        assert [row['max_seq_len'] for row in cold_builder['cache_requests']] == [256, 256, 256]
         assert owner._a_cache is cold_builder['caches'][0]
         assert owner._d_cache is cold_builder['caches'][1]
         assert ('vl_w8' if w8 else 'vl_fp16', 1) in cold_builder['events']
@@ -577,7 +577,7 @@ def test_actual_gr00t_cold_schedule_and_matching_action_reuse(cold_builder, monk
     finally:
         owner.close()
 
-@pytest.mark.parametrize('capacity,logical', [(16, 16), (256, 238), (288, 270), (304, 289), (336, 334), (512, 512)])
+@pytest.mark.parametrize('capacity,logical', [(16, 16), (256, 238), (288, 270), (304, 289), (336, 334), (512, 512), (16384, 8200)])
 def test_actual_gr00t_prefix_capacity_binds_caches_envelopes_and_reconfigure(cold_builder, monkeypatch, capacity, logical):
     from rpu_backend.tests.acceptance.test_gr00t_execution_config import _install_reconfigure_ops
     _install_reconfigure_ops(monkeypatch)
@@ -586,10 +586,10 @@ def test_actual_gr00t_prefix_capacity_binds_caches_envelopes_and_reconfigure(col
     owner = runtime.build_gr00t_vla('unused', 'unused', max_prefix_len=capacity, rpu_execution=exact)
     try:
         assert owner._max_prefix_len == capacity and owner._num_steps == 4
-        assert [row['max_seq_len'] for row in cold_builder['cache_requests']] == [capacity, capacity, 512]
+        assert [row['max_seq_len'] for row in cold_builder['cache_requests']] == [capacity, capacity, capacity]
         assert cold_builder['envelopes'] == {'vl': (1, capacity, 0), 'dit': (2, capacity, 0)}
         assert owner._a_cache.max_seq_len == owner._d_cache.max_seq_len == capacity
-        assert owner._bb_cache.max_seq_len == 512
+        assert owner._bb_cache.max_seq_len == capacity
         assert owner._vl_execution['prefill']['chunk_size'] == capacity
         caches = tuple(cold_builder['caches'])
         owner._execution_session.reconfigure({'components': {'vl_encoder': {'prefill': {'chunk_size': 'auto'}}}})
@@ -617,7 +617,7 @@ def test_actual_gr00t_prefix_capacity_binds_caches_envelopes_and_reconfigure(col
     finally:
         owner.close()
 
-@pytest.mark.parametrize('capacity', [None, True, False, 0, -16, 15, 257, 528, 256.0, '256'])
+@pytest.mark.parametrize('capacity', [None, True, False, 0, -16, 15, 257, 256.0, '256'])
 def test_actual_gr00t_invalid_prefix_capacity_precedes_model_read(cold_builder, capacity):
     with pytest.raises(ValueError, match='max_prefix_len'):
         runtime.build_gr00t_vla('unused', 'unused', max_prefix_len=capacity)

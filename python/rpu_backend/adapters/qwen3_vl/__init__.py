@@ -176,7 +176,6 @@ _QWEN3_VL_TEXT_PROJECTIONS = (
 _SWIZZLE_LOCK = threading.Lock()
 
 _QWEN3_VL_PREFILL_PADDING_BUDGET = 64
-_QWEN3_VL_MROPE_KEEPALIVE_ROWS = 8192
 _QWEN3_VL_TEXT_COMPONENT = "language_model"
 _QWEN3_VL_VISION_COMPONENT = "vision_encoder"
 _QWEN3_VL_EXECUTION_COMPONENTS = {
@@ -1243,17 +1242,16 @@ class Qwen3VLAdapter:
             if requested > env.chunk:
                 raise UnsupportedModelError(
                     f"Qwen3-VL prefill chunk_size={requested} exceeds this "
-                    f"profile's planning ceiling {env.chunk}; maximum prefill "
-                    f"execution length is {env.max_kv_len}. Refusing before "
+                    f"profile's planning ceiling {env.chunk}. Refusing before "
                     "loading model weights."
                 )
         vision_chunk = vision_execution.get("vision", {}).get(
             "chunk_size", "auto"
         )
-        if isinstance(vision_chunk, int) and vision_chunk > 4096:
+        if isinstance(vision_chunk, int) and vision_chunk > 65535:
             raise UnsupportedModelError(
-                "Qwen3-VL vision chunk_size exceeds the native 4096-patch "
-                f"planning horizon: got {vision_chunk}."
+                "Qwen3-VL vision chunk_size exceeds the uint16 token register "
+                f"domain: got {vision_chunk}."
             )
 
     def __init__(self, model) -> None:
@@ -2060,6 +2058,7 @@ class Qwen3VLAdapter:
             install_qwen3_vl_text_for_rpu(
                 text_model,
                 text_config=text_cfg,
+                max_seq_len=getattr(self.model, "_rpu_max_seq_len", None),
                 vision_config=vision_cfg,
                 deepstack_lang_layers=deepstack_lang_layers,
                 enable_deepstack=True,
@@ -2096,10 +2095,10 @@ class Qwen3VLAdapter:
                     "support"
                 )
             enable_reconfigure(handle)
-            # The P576/C192 candidate is delivery-only and unverified here. Keep the default
-            # 2B envelope at 336, including FP16 and component-only callers.
+            # Preserve the delivery-only P576/C192 policy at the installed capacity.
             if delivery_w8_text:
-                torch.ops.rpu.causal_decoder_set_chunk_envelope(handle, 608, 192)
+                torch.ops.rpu.causal_decoder_set_chunk_envelope(
+                    handle, text_model._rpu_mrope_capacity, 192)
             # Bind both policies before configuring any precision-specific route.
             vision_linear_acc32 = _qwen3_vl_linear_acc32(self._vision_execution, "vision")
             text_linear_acc32 = _qwen3_vl_linear_acc32(self._text_execution, "prefill")
@@ -2412,7 +2411,8 @@ def _qwen3_vl_prefill_plan(text_model, cache, logical_len, position):
         int(cache.max_seq_len) - int(position),
         int(cache.sKeyVx) * int(cache.sKeyChunk),
         int(cache.sValVx) * int(cache.sValChunk),
-        _QWEN3_VL_MROPE_KEEPALIVE_ROWS,
+        int(getattr(text_model, "_rpu_mrope_capacity", cache.max_seq_len)) - int(position),
+        65535 * 16 - int(position),
     )
     handle = text_model._rpu_decoder_handle
     rope_mode = int(getattr(text_model, "_qwen3_vl_delivery_profile", None)
@@ -2483,7 +2483,6 @@ def _rpu_qwen3vl_forward(
         position = int(getattr(past_key_values, "position", -1))
         if (pixel_values_videos is not None or video_grid_thw is not None
                 or not isinstance(logits_to_keep, int) or logits_to_keep != 1
-                or getattr(past_key_values, "max_seq_len", None) != 608
                 or not ((length == 576 and position == 0) or
                         (length == 1 and 576 <= position <= 579))):
             raise UnsupportedModelError("fixed delivery requires P576, four decode positions 576..579 and logits_to_keep=1; video is unsupported")
@@ -3082,7 +3081,7 @@ def _rpu_qwen3vl_forward(
             execution_len=execution_seq_len,
         )
     else:
-        # Zero-copy views of the persistent 8192-row keepalive: request the
+        # Zero-copy views of the installed-capacity keepalive: request the
         # final execution shape directly instead of concatenating three zeros.
         dense_visual_embeds = make_zero_visual_embeds(
             text_model, execution_seq_len,

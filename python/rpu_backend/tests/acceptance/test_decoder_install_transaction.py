@@ -28,6 +28,12 @@ from rpu_backend.runtime import decoder
 
 
 class _FakeTensor:
+    def __init__(self, capacity=128):
+        self.shape = (capacity, 8)
+
+    def size(self, dim):
+        return self.shape[dim]
+
     def to(self, *, dtype, device):
         if dtype is not torch.float16 or device != "rpu":
             raise AssertionError(f"unexpected fake tensor conversion: {dtype}/{device}")
@@ -594,3 +600,68 @@ def test_six_producer_reduced_install_rejects_legal_but_wrong_mlp_template_befor
     with pytest.raises(ValueError, match="bound cold topology"):
         _install(model, arch="qwen3", execution_config={"model": {"num_cores": 6}}, topology=wrong)
     assert native_install["events"] == [] and not native_install["alive"]
+
+
+@pytest.mark.parametrize("arch", ["llama", "qwen3"])
+@pytest.mark.parametrize("capacity", [8193, 16384, 32768])
+def test_install_binds_capacity_to_rotary_tables_not_profile_history(native_install, monkeypatch, arch, capacity):
+    model = _model(model_type=arch)
+    table = _FakeTensor(capacity)
+    envelopes = []
+    monkeypatch.setattr(decoder.torch.ops.rpu, "causal_decoder_set_chunk_envelope",
+                        lambda handle, rows, chunk: envelopes.append((rows, chunk)), raising=False)
+    decoder._install_causal_decoder_forward(
+        model, arch=arch, cos_sin=(table, table),
+        chunk_envelope_for=lookup_causal_decoder)
+    assert envelopes == [(capacity, 0)]
+    _finalize(model)
+
+
+@pytest.mark.parametrize("capacity", [8193, 16384, 32768])
+def test_explicit_rotary_capacity_overrides_checkpoint_default(capacity):
+    rotary = SimpleNamespace(max_seq_len_cached=4096)
+    model = SimpleNamespace(_rpu_max_seq_len=capacity,
+                            config=SimpleNamespace(max_position_embeddings=131072))
+    assert decoder._rotary_table_capacity(rotary, model) == capacity
+
+
+@pytest.mark.parametrize("capacity", [None, 16384, 32768])
+@pytest.mark.parametrize("position_horizon", [4096, 262144])
+def test_mrope_capacity_is_independent_of_rotary_horizon(monkeypatch, capacity, position_horizon):
+    """A long spatial table must not implicitly enlarge KV/DeepStack buffers."""
+    model = SimpleNamespace(config=SimpleNamespace(
+        rope_parameters={"mrope_section": [24, 20, 20]},
+        max_position_embeddings=position_horizon,
+        num_hidden_layers=28, hidden_size=2048))
+    seen = {}
+    monkeypatch.setattr(decoder, "_validate_mrope_decoder_topology", lambda *a, **k: None)
+    monkeypatch.setattr(decoder, "_new_decoder_graph_cache", lambda *a, **k: object())
+    def tables(config, **kwargs):
+        seen["rotary_rows"] = kwargs["max_seq_len"]
+        return object(), object()
+    def install(owner, **kwargs):
+        seen["kv_capacity"] = kwargs["_kv_capacity"]
+        return 71
+    monkeypatch.setattr(decoder, "build_mrope_cos_sin_tables", tables)
+    monkeypatch.setattr(decoder, "_install_causal_decoder_forward", install)
+    decoder.install_mrope_text_decoder_for_rpu(
+        model, arch="qwen3_vl_text", chunk_envelope_for=lambda *a: (0, 256),
+        max_seq_len=capacity)
+    expected = 8192 if capacity is None else capacity
+    assert seen == {"rotary_rows": max(position_horizon, expected), "kv_capacity": expected}
+    assert model._rpu_mrope_capacity == expected
+
+
+def test_capacity_is_bound_before_weights_allocate_native_keepalives(native_install, monkeypatch):
+    events = []
+    monkeypatch.setattr(decoder.torch.ops.rpu, "causal_decoder_set_chunk_envelope",
+                        lambda handle, rows, chunk: events.append(("capacity", rows)), raising=False)
+    monkeypatch.setattr(decoder.torch.ops.rpu, "causal_decoder_set_weights",
+                        lambda *args: events.append(("weights",)), raising=False)
+    model = _model()
+    table = _FakeTensor(32768)
+    decoder._install_causal_decoder_forward(
+        model, arch="llama", cos_sin=(table, table), _kv_capacity=16384,
+        chunk_envelope_for=lookup_causal_decoder)
+    assert events == [("capacity", 16384), ("weights",)]
+    model._rpu_decoder_handle_finalizer()

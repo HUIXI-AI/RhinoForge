@@ -141,15 +141,21 @@ def test_required_padding_cannot_cross_kernel_register_capacity(monkeypatch):
         text._preflight_qwen3_5_moe_text(owner, cache, 1048560)
 
 
-def test_native_capacity_binding_and_prework_rope_checks(tmp_path):
+@pytest.mark.parametrize("family", ["dense", "moe"])
+def test_native_capacity_binding_and_prework_rope_checks(tmp_path, family):
     from test_qwen35_moe_core_native import NATIVE, _definition, _run_cpp
 
     source = NATIVE.read_text()
-    cap = _definition(source, "int64_t Qwen3_5MoeModel::subclass_chunk_size_cap(")
     install = _definition(source, "void Qwen3_5MoeModel::set_weights(")
     binding = install[install.index("    constexpr int64_t total_padding"):
                       install.index("    has_qk_norm_ =")]
-    forward = _definition(source, "at::Tensor Qwen3_5MoeModel::forward_impl(")
+    model_name = "Qwen3_5MoeModel"
+    if family == "dense":
+        source = NATIVE.with_name("rpu_qwen3_5_model.cpp").read_text()
+        model_name = "Qwen3_5Model"
+    cap = _definition(source, f"int64_t {model_name}::subclass_chunk_size_cap(")
+    cap = cap.replace(model_name, "Qwen3_5MoeModel")
+    forward = _definition(source, f"at::Tensor {model_name}::forward_impl(")
     checks = forward[forward.index("    TORCH_CHECK(seq_len == 1 ||"):
                      forward.index("    gdn_states_  =")]
     assert forward.index("rotary position delta exceeds") < forward.index("gdn_states_  =")
@@ -173,7 +179,7 @@ struct Tensor {
 struct Qwen3_5MoeModel {
     int64_t physical_capacity = 0, chunk = 0, chunk_size_cap_ = 0;
     int64_t mrope_pos_delta_ = 0, work = 0;
-    bool has_mrope_ = true;
+    bool has_mrope_ = true, action_mode_ = false;
     Tensor cos_, sin_, prefill_cos_, prefill_sin_;
     void set_chunk_envelope(int64_t maximum, int64_t ceiling) {
         physical_capacity = maximum; chunk = ceiling;

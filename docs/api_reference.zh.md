@@ -64,6 +64,7 @@ RPUModelForCausalLM.from_pretrained(
     dtype=torch.float16,
     device=None,
     rpu_execution=None,
+    max_seq_len=None,
     **hf_kwargs,
 )
 ```
@@ -71,6 +72,9 @@ RPUModelForCausalLM.from_pretrained(
 Loader 在完整权重加载前读取 Hugging Face 配置，按 `config.architectures[0]` 选择
 adapter，并提前拒绝 unsupported profile。当前入口接收 built-in Qwen3、Llama CausalLM
 architecture，只接受 `torch.float16`；量化 checkpoint 自带受检查 metadata。
+
+通过 `max_seq_len=L` 在设备安装前绑定正整数容量；先加载到 CPU、随后调用
+`model.to("rpu")` 时也会使用该值。省略时沿用 adapter 的既有默认值。
 
 指定 `device="rpu"` 时，CausalLM loader 在加载完整权重前检查 native backend，
 以及对一个 RPU 节点和 `/dev/mem` 的 `O_RDWR` 权限。设备不可访问会抛出包含
@@ -120,17 +124,30 @@ rewind 重建非零 recurrent state。
 `Qwen3_5Cache.from_model(model, max_seq_len=...)`，让 KV 和 convolution storage
 匹配实际拓扑。直接从 config 创建 cache 时须传入与模型相同的核数。
 
-Cache 申请没有固定的 8192-token 上限。指定正整数容量，由分配器申请完整的对齐
-K/V 存储；混合模型还需递推和卷积状态。内存不足时直接返回分配失败，不会静默缩小
-容量。可用内存还须容纳模型权重、位置表和运行时工作区。
+当前支持模型的 cache 申请不再受固定 8192-token 或 profile 表中的容量上限约束。
+指定正整数容量，由分配器申请完整的对齐 K/V 存储；混合模型还需递推和卷积状态。
+内存不足时直接返回分配失败，不会静默缩小容量。可用内存还须容纳模型权重、位置表
+和运行时工作区。既有默认容量保持不变，默认值不代表申请上限。
 
-Qwen3.5 MoE 使用相同的容量调用 `Qwen3_5MoeAdapter.to_rpu(max_seq_len=L)` 和
-`Qwen3_5MoeCache.from_model(model, max_seq_len=L)`。安装时按 `L` 创建 decode
-旋转位置表，并为原生 prefill 执行范围预留物理 padding；安装后调整容量须重新创建
-模型和 cache。申请成功不等于新执行范围已通过硬件验证：模型上下文、旋转位置、
-算子寄存器范围和 SPM 规划仍须满足要求。当前 MoE SDPA 寄存器最多表示
-1,048,560 个执行 K/V 行，包含 prefill padding；其他 adapter 保留各自的
-prefill 和位置表边界。
+在冷安装时通过对应入口设置容量：
+
+| 入口 | 容量参数 |
+|---|---|
+| `RPUModelForCausalLM.from_pretrained(...)`、`RPUModelForConditionalGeneration.from_pretrained(...)` | `max_seq_len=L` |
+| `Qwen3_5Adapter.to_rpu(...)`、`Qwen3_5MoeAdapter.to_rpu(...)` | `max_seq_len=L`；显式值优先于 loader 设置 |
+| `Pi05Policy.from_pretrained(...)`、`Pi05Policy.from_lerobot_policy(...)` | `max_seq_len=L` |
+| `Qwen3TTSModel.from_pretrained(...)` | talker 使用 `max_seq_len=L`；code predictor 保留其固定序列语义 |
+| `rpu_backend.adapters.gr00t.runtime.build_gr00t_vla(...)` | `max_prefix_len=L`，须为正的 16 倍数；专用 SPM Z1 路径保留精确 256 行形状 |
+
+创建 cache 时，其容量不得超过模型已安装容量，通常使用相同的 `L`。Qwen3.5 Dense
+和 MoE 分别使用 `Qwen3_5Cache.from_model(...)`、
+`Qwen3_5MoeCache.from_model(...)`。安装时绑定位置表和原生规划范围，并计入所需
+物理 padding；修改安装容量须重新创建模型和 cache。
+
+申请成功不扩大硬件验证范围，也不保证更长上下文的模型效果。请求仍须满足实际
+cache 和旋转位置表容量、算子寄存器及坐标位宽、输入形状语义和 SPM 规划约束。
+例如，Qwen3.5 Dense/MoE 的 `FLASH_ATTN_SPM` 最多表示 1,048,560 个执行 K/V 行，
+包含 padding；chunk size 约束独立于安装的 KV 容量。
 
 ### Greedy token 选择
 
@@ -188,7 +205,9 @@ model = RPUModelForConditionalGeneration.from_pretrained(
 )
 ```
 
-它与 CausalLM loader 一样 CPU-first、profile fail-fast。`vision` 接受 `chunk_size`，
+它与 CausalLM loader 一样 CPU-first、profile fail-fast。通过 `max_seq_len=L` 设置
+文本安装容量，随后调用 `model.to("rpu")` 时也会使用该值；cache 容量须不超过 `L`。
+`vision` 接受 `chunk_size`，
 `prefill` 接受前述字段。Class 存在不自动扩展视频或
 [示例](model_support.zh.md)之外的配置。Qwen3.5 Dense 的纯文本与图文请求都可使用
 这个 loader，由 checkpoint 元数据选择 adapter；Gemma4 使用独立 adapter 入口。

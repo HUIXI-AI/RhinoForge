@@ -9,19 +9,24 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_paired_kv_admits_real_cache_and_rejects_invalid_owners_before_staging(tmp_path):
+@pytest.mark.parametrize("capacity", [608, 16384, 32768])
+def test_paired_kv_admits_real_cache_and_rejects_invalid_owners_before_staging(tmp_path, capacity):
     from rpu_backend.api.cache import RPUCache
 
     compiler = shutil.which("g++")
     if compiler is None:
         pytest.skip("C++ compiler unavailable")
-    cache = RPUCache(num_layers=1, batch_size=1, max_seq_len=608,
+    cache = RPUCache(num_layers=1, batch_size=1, max_seq_len=capacity,
                      num_kv_heads=8, head_dim=128, device="cpu", attn_tp=8)
     key, value = cache.k_caches[0], cache.v_caches[0]
     source = (ROOT / "src/ops/rpu_llama_kvcache.cpp").read_text()
     start = source.index("    TORCH_CHECK(", source.index("void launch_owned_paired_kv_insert("))
     end = source.index("    const KernelId kernel_id =", start)
     guard = source[start:end]
+    from test_qwen3vl_prefill_gateup_launcher import definition
+    header = (ROOT / "src/fused/rpu_qwen3_model.h").read_text()
+    start = header.index('"Call torch.ops.rpu.causal_decoder_set_weights(...) first.");')
+    delivery_guard = definition(header[start:], "if (qwen3vl_2b_w8_profile_)")
     # Keep every admission check before typed DDR register staging. Only device
     # allocation is doubled; dimensions and byte extents come from real RPUCache.
     program = r"""
@@ -29,6 +34,7 @@ def test_paired_kv_admits_real_cache_and_rejects_invalid_owners_before_staging(t
 #include <cstdint>
 #include <cstddef>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -57,7 +63,16 @@ struct Tensor {
     int64_t dim() const { return shape.size(); }
     bool is_contiguous() const { return contiguous; }
     int64_t size(size_t dim) const { return shape.at(dim); }
+    struct ShapeView {const std::vector<int64_t>& shape;const std::vector<int64_t>& vec()const{return shape;}};
+    ShapeView sizes()const{return {shape};}
 };
+}
+bool delivery_admits(at::Tensor key,at::Tensor value){
+    at::Tensor hidden_states{0,{1,576,2048}};
+    std::vector<at::Tensor> k_caches(28,key),v_caches(28,value);
+    bool qwen3vl_2b_w8_profile_=true,is_causal=true;int64_t position=0;
+    std::optional<int> attention_mask;
+    try{__DELIVERY_GUARD__}catch(const std::runtime_error&){return false;}return true;
 }
 int staged = 0;
 void admit(at::Tensor k_cache, at::Tensor v_cache, int64_t position,
@@ -82,13 +97,16 @@ int main(int argc, char** argv) {
     for (int i=8; i<=14; ++i) v_shape.push_back(std::stoll(argv[i]));
     at::Tensor key{0x10000000, k_shape}, value{0x20000000, v_shape};
     assert(key.nbytes() == std::stoull(argv[15]) && value.nbytes() == std::stoull(argv[16]));
+    assert(delivery_admits(key,value));
+    auto unequal=value;unequal.shape[1]++;assert(!delivery_admits(key,unequal));
+    const int64_t capacity=key.shape[1]*16;
     // The actual P576/C192 caller and all four actual decode positions.
     for (auto pos : {0,192,384}) check(key,value,true,pos,192,false);
     for (auto pos : {576,577,578,579}) check(key,value,true,pos);
-    check(key,value,true,607);  // last owned token
-    check(key,value,true,416,192,false);  // exactly fills the owner
-    check(key,value,false,608);
-    check(key,value,false,432,192,false);
+    check(key,value,true,capacity-1);  // last owned token
+    check(key,value,true,capacity-192,192,false);  // exactly fills the owner
+    check(key,value,false,capacity);
+    check(key,value,false,capacity-176,192,false);
     check(key,value,false,-1);
     check(key,value,false,1,192,false);  // prefill requires 16 alignment
     check(key,value,false,0,191,false);
@@ -132,7 +150,7 @@ int main(int argc, char** argv) {
     ranges(high-extent/2+1,high-extent+1,2,false);
     ranges(high-2*extent+1,high-extent+1,1,true);
 }
-""".replace("__GUARD__", guard)
+""".replace("__GUARD__", guard).replace("__DELIVERY_GUARD__", delivery_guard)
     path = tmp_path / "paired_kv_admission.cpp"
     path.write_text(program)
     binary = tmp_path / "paired_kv_admission"

@@ -495,6 +495,7 @@ def load_and_construct_pi05_policy(
     trust_remote_code: bool = False,
     rpu_execution=None,
     graph_runtime_policy=None,
+    max_seq_len: int | None = None,
     **lerobot_kwargs: Any,
 ) -> "Any":
     """D-01 canonical loader for Pi0.5. Delegated from Pi05Policy.from_pretrained per D-3-03.
@@ -502,6 +503,8 @@ def load_and_construct_pi05_policy(
     D-19 fp16 guard fires here BEFORE any lerobot load. trust_remote_code is an
     EXPLICIT kwarg with default False (D-CR3-SEC1 security).
     """
+    if max_seq_len is not None and (type(max_seq_len) is not int or max_seq_len < 1):
+        raise ValueError("max_seq_len must be a positive integer")
     if graph_runtime_policy is not None:
         from rpu_backend.graph import GraphRuntimePolicy
         if not isinstance(graph_runtime_policy, GraphRuntimePolicy):
@@ -531,6 +534,8 @@ def load_and_construct_pi05_policy(
     # in v4 with a thin shim). Late import keeps loader -> policy circular-free.
     from rpu_backend.api.policy import Pi05Policy
     options = {}
+    if max_seq_len is not None:
+        options["max_seq_len"] = max_seq_len
     if rpu_execution is not None:
         options["rpu_execution"] = rpu_execution
     if graph_runtime_policy is not None:

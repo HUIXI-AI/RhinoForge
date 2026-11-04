@@ -279,6 +279,24 @@ def test_dtype_rejected_before_loading(monkeypatch):
         Qwen3TTSModel.from_pretrained("missing", source="missing", dtype=torch.bfloat16)
 
 
+def test_tts_cache_capacity_reaches_cold_install_and_rejects_invalid_before_load(monkeypatch):
+    from rpu_backend.adapters import qwen3_tts
+    from rpu_backend.api import causal_lm
+
+    loaded, installed = [], []
+    monkeypatch.setattr(qwen3_tts, "load_cpu_model", lambda *args: loaded.append(args) or object())
+    monkeypatch.setattr(torch, "rpu", SimpleNamespace(set_caching_allocator=lambda enabled: None), raising=False)
+    monkeypatch.setattr(causal_lm, "_claim_live_instance", lambda model: None)
+    monkeypatch.setattr(causal_lm, "_release_live_instance", lambda model: None)
+    monkeypatch.setattr(Qwen3TTSModel, "_install_rpu", lambda model: installed.append(model._max_seq_len))
+    with Qwen3TTSModel.from_pretrained("checkpoint", source="source", max_seq_len=16384):
+        assert installed == [16384]
+    for invalid in (True, 0, -1, 512.0):
+        with pytest.raises(ValueError, match="positive integer"):
+            Qwen3TTSModel.from_pretrained("must-not-load", source="source", max_seq_len=invalid)
+    assert loaded == [("checkpoint", "source")]
+
+
 @pytest.mark.parametrize("options,expected", [({}, "rpu"), ({"codec_backend": "cpu"}, "cpu"),
                                              ({"codec_backend": "rpu"}, "rpu")])
 def test_codec_backend_default_and_explicit_override(monkeypatch, options, expected):

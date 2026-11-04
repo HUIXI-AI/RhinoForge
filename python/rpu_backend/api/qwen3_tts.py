@@ -148,7 +148,7 @@ class Qwen3TTSModel:
         self._codec_convolutions = {"backend": "cpu", "layers": 0, "calls": 0}
 
     @classmethod
-    def from_pretrained(cls, checkpoint, *, source, dtype=torch.float16, codec_backend="rpu"):
+    def from_pretrained(cls, checkpoint, *, source, dtype=torch.float16, codec_backend="rpu", max_seq_len=512):
         """Load frozen weights/source; codec_backend=cpu restores CPU FP32 Conv1d."""
         from rpu_backend.adapters.qwen3_tts import load_cpu_model
         from .causal_lm import _claim_live_instance
@@ -157,7 +157,10 @@ class Qwen3TTSModel:
             raise RPUUnsupportedDtypeError("TTS device components require torch.float16; CPU components use float32")
         if codec_backend not in ("cpu", "rpu"):
             raise ValueError("codec_backend must be cpu or rpu (experimental codec Conv1d)")
+        if type(max_seq_len) is not int or max_seq_len < 1:
+            raise ValueError("max_seq_len must be a positive integer")
         model = cls()
+        model._max_seq_len = max_seq_len
         model._codec_convolutions["backend"] = codec_backend
         _claim_live_instance(model)
         model._closed = False
@@ -187,7 +190,7 @@ class Qwen3TTSModel:
             graph = GraphCache(runtime_policy=self._graph_runtime_policy)
             handle = torch.ops.rpu.causal_decoder_create()
             part = {"handle": handle, "graph": graph, "calls": 0, "tokens": 0,
-                    "capacity": 512 if name == "talker" else 32, "layers": len(core.layers),
+                    "capacity": getattr(self, "_max_seq_len", 512) if name == "talker" else 32, "layers": len(core.layers),
                     "name": name, "generation_limit": 256, "device_head_only": name == "predictor"}
             self._components[name] = part
             handle_name = "_native_" + name + "_handle"
@@ -234,7 +237,7 @@ class Qwen3TTSModel:
 
                 envelope = lookup_causal_decoder("qwen3", part["layers"], 1024)
                 torch.ops.rpu.causal_decoder_set_chunk_envelope(
-                    handle, min(part["capacity"], envelope.max_kv_len), envelope.chunk)
+                    handle, part["capacity"], envelope.chunk)
             else:
                 torch.ops.rpu.causal_decoder_set_chunk_envelope(handle, 32, 32)
             descriptor = list(torch.ops.rpu.causal_decoder_resolve_decode_stage_descriptor(handle))

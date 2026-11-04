@@ -369,7 +369,8 @@ def patch_adarms_model_for_rpu_all_layers_once(
             "layers[0].self_attn.rotary_emb)"
         )
 
-    max_pos = getattr(rotary, "max_position_embeddings", 4096)
+    max_pos = max(int(getattr(rotary, "max_position_embeddings", 4096)),
+                  int(getattr(model, "_rpu_max_seq_len", 2048)))
     dummy = torch.zeros(1, 1, hidden_size, dtype=torch.float16, device="rpu")
     dummy_pos = torch.arange(max_pos, device="rpu").unsqueeze(0)
     cos_cached, sin_cached = rotary(dummy, dummy_pos)

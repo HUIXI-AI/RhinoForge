@@ -226,11 +226,17 @@ TORCH_DEVICE_BACKEND_AUTOLOAD=0 python3 python/rpu_backend/quant/convert_qwen3.p
 | 长度：`input.prefill_tokens/decode_steps/stop_on_eos` | 基础自然 P/D4/`true`；量化 Text P512、VL P430，均 D31/`false`；省略值为自然 P、D4、`true` | P≥1、D≥0；VL 的 P 包括视觉与 chat token，不能截断已有输入。P4096/D4096 对应 8192 位置缓存 |
 | 拓扑：`rpu_execution.model.num_cores` | 基础默认 8，量化模板显式 8；省略为 8 | 量化模板使用 TP8；FP16 的 4/6/8 核须选已登记尺寸与 profile |
 | 累加：`rpu_execution.prefill/vision.linear_acc32` | 量化模板显式 `false`；省略均为 ACC16 | 两组件独立；`true` 为 ACC32。文本项同时控制 prefill/decode Linear，权重不变 |
-| 分块：`rpu_execution.prefill.chunk_size` | 模板与省略值为 `auto` | 显式值是 16 的正整数倍；2/4/8B 上限分别为 320/256/128，prefill 执行行上限为 4176；32B 兼容配方≤64 |
+| 分块：`rpu_execution.prefill.chunk_size` | 模板与省略值为 `auto` | 显式值是 16 的正整数倍；2/4/8B 的 chunk 上限分别为 320/256/128；32B 兼容配方≤64。总 prefill 长度由实际安装容量、物理 padding 和算子/SPM 约束决定 |
 | 重放：`rpu_execution.prefill.fast_replay` | 普通 Text/VL 显式 `true`，32B 兼容模板省略；省略为 `false` | 复用符合条件的 prefill 执行记录；Vision 没有此字段 |
 | 测量：`cpu.threads`、`run.*` | CPU 省略时沿用环境；轮次见上表；省略 W/R 为 2/1、`inference_mode=true` | 普通量化和长输入模板显式 no_grad；`warmup≥0`、`runs≥1`，对比时统一 |
 
 完整尺寸与组件范围见[模型矩阵](../../../docs/model_support.md)。改变精度、核数和 ACC 等安装参数后用新进程运行。
+
+公开 loader 可通过
+`RPUModelForConditionalGeneration.from_pretrained(..., max_seq_len=L)`
+绑定文本安装容量，再创建容量不超过 `L` 的 cache。默认容量和示例长度不是硬上限；
+更大申请由实际内存分配结果决定，位置表、算子及坐标位宽、输入形状和 SPM 约束仍然
+适用。修改安装容量须重新创建模型和 cache，申请成功不扩大现有硬件验证范围。
 
 <a id="使用"></a>
 

@@ -19,7 +19,7 @@
         "limits": {
           "chunk_alignment": 16,
           "max_chunk_size": 512,
-          "max_kv_len": 1024
+          "kv_capacity": "requested-at-install; allocation must succeed"
         }
       },
       "owner": "fmb-causal-decoder",
@@ -47,7 +47,7 @@
         "limits": {
           "chunk_alignment": 16,
           "max_chunk_size": 512,
-          "max_kv_len": 1024
+          "kv_capacity": "requested-at-install; allocation must succeed"
         }
       },
       "owner": "fmb-causal-decoder",
@@ -75,7 +75,7 @@
         "limits": {
           "chunk_alignment": 16,
           "max_chunk_size": 512,
-          "max_kv_len": 1024
+          "kv_capacity": "requested-at-install; allocation must succeed"
         }
       },
       "owner": "fmb-causal-decoder",
@@ -103,7 +103,7 @@
         "limits": {
           "chunk_alignment": 16,
           "max_chunk_size": 256,
-          "max_kv_len": 1024
+          "kv_capacity": "requested-at-install; allocation must succeed"
         }
       },
       "owner": "fmb-causal-decoder",
@@ -131,7 +131,7 @@
         "limits": {
           "chunk_alignment": 16,
           "max_chunk_size": 256,
-          "max_kv_len": 1024
+          "kv_capacity": "requested-at-install; allocation must succeed"
         }
       },
       "owner": "fmb-causal-decoder",
@@ -159,7 +159,7 @@
         "limits": {
           "chunk_alignment": 16,
           "max_chunk_size": 128,
-          "max_kv_len": 4096
+          "kv_capacity": "requested-at-install; allocation must succeed"
         }
       },
       "owner": "fmb-causal-decoder",
@@ -187,7 +187,7 @@
         "limits": {
           "chunk_alignment": 16,
           "max_chunk_size": 512,
-          "max_kv_len": 1024
+          "kv_capacity": "requested-at-install; allocation must succeed"
         }
       },
       "owner": "fmb-causal-decoder",
@@ -215,7 +215,7 @@
         "limits": {
           "chunk_alignment": 16,
           "max_chunk_size": 512,
-          "max_kv_len": 1024
+          "kv_capacity": "requested-at-install; allocation must succeed"
         }
       },
       "owner": "fmb-causal-decoder",
@@ -243,7 +243,7 @@
         "limits": {
           "chunk_alignment": 16,
           "max_chunk_size": 256,
-          "max_kv_len": 1024
+          "kv_capacity": "requested-at-install; allocation must succeed"
         }
       },
       "owner": "fmb-causal-decoder",
@@ -271,7 +271,7 @@
         "limits": {
           "chunk_alignment": 16,
           "max_chunk_size": 128,
-          "max_kv_len": 4096
+          "kv_capacity": "requested-at-install; allocation must succeed"
         }
       },
       "owner": "fmb-causal-decoder",
@@ -299,7 +299,7 @@
         "limits": {
           "chunk_alignment": 16,
           "max_chunk_size": 32,
-          "max_kv_len": 192
+          "kv_capacity": "requested-at-install; allocation must succeed"
         }
       },
       "owner": "fmb-causal-decoder",
@@ -327,7 +327,7 @@
         "limits": {
           "chunk_alignment": 64,
           "max_chunk_size": 128,
-          "max_kv_len": 192
+          "kv_capacity": "requested-at-install; allocation must succeed"
         }
       },
       "owner": "fmb-qwen35-text",
@@ -355,7 +355,7 @@
         "limits": {
           "chunk_alignment": 64,
           "max_chunk_size": 512,
-          "max_kv_len": 8192
+          "kv_capacity": "requested-at-install; allocation must succeed"
         }
       },
       "owner": "fmb-qwen35-text",
@@ -413,7 +413,7 @@
         "limits": {
           "chunk_alignment": 64,
           "max_chunk_size": 128,
-          "max_kv_len": 192
+          "kv_capacity": "requested-at-install; allocation must succeed"
         }
       },
       "owner": "fmb-qwen35-text",
@@ -441,7 +441,7 @@
         "limits": {
           "chunk_alignment": 64,
           "max_chunk_size": 640,
-          "max_kv_len": 8192
+          "kv_capacity": "requested-at-install; allocation must succeed"
         }
       },
       "owner": "fmb-qwen35-text",
@@ -502,7 +502,7 @@
         "limits": {
           "chunk_alignment": 64,
           "max_chunk_size": 128,
-          "max_kv_len": 192
+          "kv_capacity": "requested-at-install; allocation must succeed"
         }
       },
       "owner": "fmb-qwen35-text",
@@ -530,7 +530,7 @@
         "limits": {
           "chunk_alignment": 64,
           "max_chunk_size": 448,
-          "max_kv_len": 8192
+          "kv_capacity": "requested-at-install; allocation must succeed"
         }
       },
       "owner": "fmb-qwen35-text",
@@ -591,7 +591,7 @@
         "limits": {
           "chunk_alignment": 64,
           "max_chunk_size": 128,
-          "max_kv_len": 192
+          "kv_capacity": "requested-at-install; allocation must succeed"
         }
       },
       "owner": "fmb-qwen35-text",
@@ -619,7 +619,7 @@
         "limits": {
           "chunk_alignment": 64,
           "max_chunk_size": 256,
-          "max_kv_len": 8192
+          "kv_capacity": "requested-at-install; allocation must succeed"
         }
       },
       "owner": "fmb-qwen35-text",
@@ -1931,7 +1931,7 @@
         "limits": {
           "chunk_alignment": 16,
           "max_chunk_size": 64,
-          "max_kv_len": 64
+          "kv_capacity": "requested-at-install; allocation must succeed"
         }
       },
       "owner": "fmb-causal-decoder",
@@ -2026,7 +2026,7 @@
         "limits": {
           "batch_size": 1,
           "num_cores": 8,
-          "max_kv_len": 8192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_alignment": 64,
           "chunk_policy": "native-exact-spm-and-kernel-oracle"
         }
@@ -2062,7 +2062,7 @@
         "limits": {
           "chunk_alignment": 64,
           "max_chunk_size": 128,
-          "max_kv_len": 8192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "text_hidden_size": 5120,
           "text_intermediate_size": 17408,
           "text_num_hidden_layers": 64,
@@ -2630,7 +2630,7 @@
           "mlp_cores": 4,
           "physical_kv_cores": 8,
           "vision_mode": "serial256",
-          "max_kv_len": 2048,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_alignment": 16,
           "chunk_policy": "native-exact-spm-and-kernel-oracle"
         }
@@ -2682,7 +2682,7 @@
           "mlp_cores": 6,
           "physical_kv_cores": 8,
           "vision_mode": "serial256",
-          "max_kv_len": 2048,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_alignment": 16,
           "chunk_policy": "native-exact-spm-and-kernel-oracle"
         }
@@ -2734,7 +2734,7 @@
           "mlp_cores": 4,
           "physical_kv_cores": 8,
           "vision_mode": "serial256",
-          "max_kv_len": 2048,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_alignment": 16,
           "chunk_policy": "native-exact-spm-and-kernel-oracle"
         }
@@ -2786,7 +2786,7 @@
           "mlp_cores": 6,
           "physical_kv_cores": 8,
           "vision_mode": "serial256",
-          "max_kv_len": 2048,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_alignment": 16,
           "chunk_policy": "native-exact-spm-and-kernel-oracle"
         }
@@ -2822,7 +2822,7 @@
         "limits": {
           "chunk_alignment": 64,
           "max_chunk_size": 128,
-          "max_kv_len": 8192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "text_hidden_size": 5120,
           "text_intermediate_size": 17408,
           "text_num_hidden_layers": 64,
@@ -2877,7 +2877,7 @@
         "limits": {
           "chunk_alignment": 64,
           "max_chunk_size": 128,
-          "max_kv_len": 8192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "text_hidden_size": 5120,
           "text_intermediate_size": 17408,
           "text_num_hidden_layers": 64,
@@ -2932,7 +2932,7 @@
           "lm_head_cores": 4,
           "physical_kv_cores": 8,
           "chunk_alignment": 64,
-          "max_kv_len": 8192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_policy": "native-exact-spm-and-kernel-oracle"
         }
       },
@@ -2967,7 +2967,7 @@
           "lm_head_cores": 4,
           "physical_kv_cores": 8,
           "chunk_alignment": 64,
-          "max_kv_len": 8192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_policy": "native-exact-spm-and-kernel-oracle"
         }
       },
@@ -3002,7 +3002,7 @@
           "lm_head_cores": 4,
           "physical_kv_cores": 8,
           "chunk_alignment": 64,
-          "max_kv_len": 8192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_policy": "native-exact-spm-and-kernel-oracle"
         }
       },
@@ -3037,7 +3037,7 @@
           "lm_head_cores": 4,
           "physical_kv_cores": 8,
           "chunk_alignment": 64,
-          "max_kv_len": 8192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_policy": "native-exact-spm-and-kernel-oracle"
         }
       },
@@ -3072,7 +3072,7 @@
           "lm_head_cores": 4,
           "physical_kv_cores": 8,
           "chunk_alignment": 64,
-          "max_kv_len": 8192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_policy": "native-exact-spm-and-kernel-oracle"
         }
       },
@@ -3107,7 +3107,7 @@
           "lm_head_cores": 4,
           "physical_kv_cores": 8,
           "chunk_alignment": 64,
-          "max_kv_len": 8192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_policy": "native-exact-spm-and-kernel-oracle"
         }
       },
@@ -3142,7 +3142,7 @@
           "lm_head_cores": 4,
           "physical_kv_cores": 8,
           "chunk_alignment": 64,
-          "max_kv_len": 8192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_policy": "native-exact-spm-and-kernel-oracle"
         }
       },
@@ -3177,7 +3177,7 @@
           "lm_head_cores": 4,
           "physical_kv_cores": 8,
           "chunk_alignment": 64,
-          "max_kv_len": 8192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_policy": "native-exact-spm-and-kernel-oracle"
         }
       },
@@ -3212,7 +3212,7 @@
         "limits": {
           "batch_size": 1,
           "num_cores": 8,
-          "max_kv_len": 8192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_alignment": 64,
           "chunk_policy": "native-exact-spm-and-kernel-oracle"
         }
@@ -3248,7 +3248,7 @@
         "limits": {
           "batch_size": 1,
           "num_cores": 8,
-          "max_kv_len": 8192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_alignment": 64,
           "chunk_policy": "native-exact-spm-and-kernel-oracle"
         }
@@ -3284,7 +3284,7 @@
         "limits": {
           "batch_size": 1,
           "num_cores": 8,
-          "max_kv_len": 8192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_alignment": 64,
           "chunk_policy": "native-exact-spm-and-kernel-oracle"
         }
@@ -3320,7 +3320,7 @@
         "limits": {
           "batch_size": 1,
           "num_cores": 8,
-          "max_kv_len": 8192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_alignment": 64,
           "chunk_policy": "native-exact-spm-and-kernel-oracle"
         }
@@ -3356,7 +3356,7 @@
         "limits": {
           "batch_size": 1,
           "num_cores": 8,
-          "max_kv_len": 8192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_alignment": 64,
           "chunk_policy": "native-exact-spm-and-kernel-oracle"
         }
@@ -3392,7 +3392,7 @@
         "limits": {
           "batch_size": 1,
           "num_cores": 8,
-          "max_kv_len": 8192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_alignment": 64,
           "chunk_policy": "native-exact-spm-and-kernel-oracle"
         }
@@ -3428,7 +3428,7 @@
         "limits": {
           "batch_size": 1,
           "num_cores": 8,
-          "max_kv_len": 8192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_alignment": 64,
           "chunk_policy": "native-exact-spm-and-kernel-oracle"
         }
@@ -5445,7 +5445,7 @@
             "batch_size": 1
           },
           "load_device": "cpu or rpu",
-          "max_kv_len": 192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "max_chunk_size": 32,
           "chunk_alignment": 16
         }
@@ -5504,7 +5504,7 @@
             "batch_size": 1
           },
           "load_device": "cpu or rpu",
-          "max_kv_len": 192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "max_chunk_size": 32,
           "chunk_alignment": 16
         }
@@ -5563,7 +5563,7 @@
             "batch_size": 1
           },
           "load_device": "rpu",
-          "max_kv_len": 4096,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "max_chunk_size": 64,
           "chunk_alignment": 16
         }
@@ -5622,7 +5622,7 @@
             "batch_size": 1
           },
           "load_device": "rpu",
-          "max_kv_len": 4096,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "max_chunk_size": 64,
           "chunk_alignment": 16
         }
@@ -5666,7 +5666,7 @@
           "num_key_value_heads": 8,
           "head_dim": 128,
           "vocab_size": 151936,
-          "max_kv_len": 4096,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "max_chunk_size": 64,
           "chunk_alignment": 16,
           "load_device": "rpu",
@@ -5961,7 +5961,7 @@
         "limits": {
           "batch_size": 1,
           "num_cores": 8,
-          "max_kv_len": 8192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_alignment": 64,
           "chunk_policy": "native-exact-spm-and-kernel-oracle",
           "text_hidden_size": 5120,
@@ -6010,7 +6010,7 @@
         "limits": {
           "batch_size": 1,
           "num_cores": 8,
-          "max_kv_len": 8192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_alignment": 64,
           "chunk_policy": "native-exact-spm-and-kernel-oracle",
           "text_hidden_size": 5120,
@@ -6056,7 +6056,7 @@
         "limits": {
           "batch_size": 1,
           "num_cores": 4,
-          "max_kv_len": 8192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_alignment": 64,
           "chunk_policy": "native-exact-spm-and-kernel-oracle",
           "text_hidden_size": 5120,
@@ -6105,7 +6105,7 @@
         "limits": {
           "batch_size": 1,
           "num_cores": 4,
-          "max_kv_len": 8192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_alignment": 64,
           "chunk_policy": "native-exact-spm-and-kernel-oracle",
           "text_hidden_size": 5120,
@@ -6151,7 +6151,7 @@
         "limits": {
           "batch_size": 1,
           "num_cores": 6,
-          "max_kv_len": 8192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_alignment": 64,
           "chunk_policy": "native-exact-spm-and-kernel-oracle",
           "text_hidden_size": 5120,
@@ -6200,7 +6200,7 @@
         "limits": {
           "batch_size": 1,
           "num_cores": 6,
-          "max_kv_len": 8192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_alignment": 64,
           "chunk_policy": "native-exact-spm-and-kernel-oracle",
           "text_hidden_size": 5120,
@@ -6246,7 +6246,7 @@
         "limits": {
           "batch_size": 1,
           "num_cores": 8,
-          "max_kv_len": 8192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_alignment": 64,
           "chunk_policy": "native-exact-spm-and-kernel-oracle",
           "text_hidden_size": 5120,
@@ -6296,7 +6296,7 @@
         "limits": {
           "batch_size": 1,
           "num_cores": 8,
-          "max_kv_len": 8192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_alignment": 64,
           "chunk_policy": "native-exact-spm-and-kernel-oracle",
           "text_hidden_size": 5120,
@@ -7349,7 +7349,7 @@
           "checkpoint_format": "qwen3_5_2b_w4_mlp_only_g32",
           "batch_size": 1,
           "num_cores": 8,
-          "max_kv_len": 8192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_alignment": 64,
           "chunk_policy": "native-exact-spm-and-kernel-oracle"
         }
@@ -7386,7 +7386,7 @@
           "checkpoint_format": "qwen3_5_2b_w4_mlp_w8_attn_gdn_g32",
           "batch_size": 1,
           "num_cores": 8,
-          "max_kv_len": 8192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_alignment": 64,
           "chunk_policy": "native-exact-spm-and-kernel-oracle"
         }
@@ -7423,7 +7423,7 @@
           "checkpoint_format": "qwen3_5_2b_quanttrio_awq_g128",
           "batch_size": 1,
           "num_cores": 8,
-          "max_kv_len": 8192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_alignment": 64,
           "chunk_policy": "native-exact-spm-and-kernel-oracle"
         }
@@ -7460,7 +7460,7 @@
           "checkpoint_format": "qwen3_5_4b_quanttrio_awq_g128",
           "batch_size": 1,
           "num_cores": 8,
-          "max_kv_len": 8192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_alignment": 64,
           "chunk_policy": "native-exact-spm-and-kernel-oracle"
         }
@@ -7497,7 +7497,7 @@
           "checkpoint_format": "qwen3_5_9b_quanttrio_awq_g128",
           "batch_size": 1,
           "num_cores": 8,
-          "max_kv_len": 8192,
+          "kv_capacity": "requested-at-install; allocation must succeed",
           "chunk_alignment": 64,
           "chunk_policy": "native-exact-spm-and-kernel-oracle"
         }

@@ -125,6 +125,19 @@ def test_delivery_position_or_length_rejects_before_transport(position, length):
             past_key_values=NS(position=position, max_seq_len=608), logits_to_keep=1)
 
 
+@pytest.mark.parametrize("capacity", [608, 16384, 32768])
+def test_delivery_accepts_larger_cache_before_transport(capacity):
+    from types import SimpleNamespace as NS
+    from rpu_backend.adapters import qwen3_vl as q
+    model = NS(_qwen3_vl_delivery_profile=q._QWEN3_VL_DELIVERY_PROFILE)
+    # The unsupported loss sentinel follows profile admission and precedes any
+    # native transport, so it proves large owners retain the exact decode path.
+    with pytest.raises(NotImplementedError, match="labels"):
+        q._rpu_qwen3vl_forward(model, input_ids=torch.zeros((1, 1), dtype=torch.long),
+            past_key_values=NS(position=576, max_seq_len=capacity),
+            logits_to_keep=1, labels=torch.zeros(1))
+
+
 def test_delivery_graph_key_owns_each_scalar_decode_position():
     from types import SimpleNamespace as NS
     from rpu_backend.adapters import qwen3_vl as q

@@ -5488,6 +5488,7 @@ std::vector<at::Tensor> rpu_qwen3vl_vision_pop_merged(int64_t handle);
 
 int64_t rpu_qwen3_5_vision_create();
 void rpu_qwen3_5_vision_set_execution_cores(int64_t handle, int64_t num_cores);
+void rpu_qwen3_5_vision_set_cache_capacity(int64_t handle, int64_t max_seq_len);
 std::vector<int64_t> rpu_qwen3_5_vision_get_execution_topology(int64_t handle);
 bool rpu_qwen3_5_vision_k1_b3_available(int64_t handle);
 bool rpu_qwen3_5_vision_k1_camera_group_available(int64_t handle,int64_t cameras);

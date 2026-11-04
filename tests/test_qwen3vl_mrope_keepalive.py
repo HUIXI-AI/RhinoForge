@@ -133,7 +133,7 @@ def test_native_cpu_positions_refresh_aliases_and_invalidate_overlapping_sources
                           source.index('    static bool keepalive_segment_hit(')]
     methods = (_function(source, '    static bool keepalive_segment_hit(') + '\n' +
                _function(source, '    static void record_keepalive_segment('))
-    authority_fields = source[source.index('    std::array<uint8_t, QWEN3_MROPE_MAX_KEEPALIVE_SEQ>'):
+    authority_fields = source[source.index('    std::vector<uint8_t> ka_cpu_pos_published_rows_'):
                               source.index('    void invalidate_cpu_position_keepalive(')]
     authority_methods = '\n'.join(_function(source, marker) for marker in (
         '    void invalidate_cpu_position_keepalive(',
@@ -160,7 +160,7 @@ def test_native_cpu_positions_refresh_aliases_and_invalidate_overlapping_sources
                           if 'cos_dst' not in line and 'sin_dst' not in line
                           and 'cos_dst.copy_' not in line and 'sin_dst.copy_' not in line)
         primes.append(f' void {name}(const HostTensor& position_ids,int64_t execution_len){{\n{block}\n }}')
-    clear_rows = 'ka_cpu_pos_published_rows_.fill(0);'
+    clear_rows = 'std::fill(ka_cpu_pos_published_rows_.begin(), ka_cpu_pos_published_rows_.end(), 0);'
     setup = source[source.index('        const bool has_mrope = (mrope_section.size() > 0);'):
                    source.index('        if (has_mrope) {', source.index('        const bool has_mrope ='))]
     assert clear_rows in setup
@@ -259,7 +259,6 @@ void raw_fill(const HostTensor& value,int x){
  auto* data=value.data_ptr<int32_t>();for(int64_t i=0;i<value.value.numel();++i)data[i]=x;
 }
 int64_t version(const HostTensor& t){return t.value.is_inference()?-1:t.value._version();}
-constexpr int64_t QWEN3_MROPE_MAX_KEEPALIVE_SEQ=8192;
 constexpr int64_t QWEN3VL_POOLER_Z1_CANARY_EXECUTION_LEN=128;
 constexpr int64_t QWEN3VL_MULTIVIEW_TEXT_EXECUTION_LEN=256;
 struct RpuKernelGraph{static bool has_active(){return false;}};
@@ -275,6 +274,7 @@ struct Model {
  int64_t ka_last_position_=-1,ka_last_seq_=-1,ka_last_pos_src_version_=-1;
  const void* ka_last_pos_src_=nullptr;
  __AUTHORITY_FIELDS__
+ Model(int capacity=8192){position_ids_keepalive_=tensor(capacity,777,at::kPrivateUse1);ka_cpu_pos_published_rows_.assign(capacity,0);}
  __AUTHORITY_METHODS__
  __EXPORT_TYPE__
  __OWNER_EXPORT__
@@ -310,6 +310,12 @@ extern "C" int64_t refresh_numpy_cpu_source(void* data,bool reset,bool inference
  return flushed.size()-calls;
 }
 int main(){
+ for(int capacity:{8193,16384,32768}){
+  Model m(capacity);auto source=tensor(1,17);g_rpu_ddr_flush_force_enabled=true;
+  m.run(source,capacity-1,1);expect_rows(m,capacity-1,1,17,true);
+  rejects(m,[&]{m.run(source,capacity,1);});
+  rejects(m,[&]{m.run(source,-1,1);});
+ }
  for(bool normal:{false,true})for(bool force:{false,true})
  for(bool inference:{false,true})for(bool w8:{false,true}){
   c10::InferenceMode mode(inference);

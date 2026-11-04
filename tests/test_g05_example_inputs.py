@@ -75,7 +75,9 @@ def release(monkeypatch, tmp_path):
     module(monkeypatch, "vla_rtc.replay", ReplayRunner=ReplayRunner)
     module(monkeypatch, "vla_rtc.models.g05.g05_policy", _ensure_sample_list=lambda x: x)
     processor = Processor()
-    policy = SimpleNamespace(processor=ContextProcessor())
+    policy = SimpleNamespace(processor=ContextProcessor(),
+        model=SimpleNamespace(vlm=SimpleNamespace(_rpu_qwen3_5=SimpleNamespace(
+            max_seq_len=16384, prefill_capability_envelope=(16512, 256)))))
     checkpoint = tmp_path / "checkpoint"
     checkpoint.mkdir()
     (checkpoint / "model.pt").write_bytes(b"model")
@@ -185,33 +187,21 @@ def test_invalid_context_and_golden_fail_before_input_publish(release):
     assert not (release.tmp / "bad/input_batch.pt").exists()
 
 
-def test_cold_envelope_binds_native_before_python_and_preserves_default(monkeypatch):
-    cache = lambda: SimpleNamespace(size=Mock(return_value=0))
-    state = SimpleNamespace(handle=44, prefill_capability_envelope=(256, 256), prefill_graph_cache=cache())
-    session = SimpleNamespace(require_cold=Mock())
-    policy = SimpleNamespace(_execution_session=session, _rpu_g05_fm_only_customer_release=True,
-        model=SimpleNamespace(vlm=SimpleNamespace(_rpu_qwen3_5=state),
-            action_expert=SimpleNamespace(_rpu_qwen3_5=SimpleNamespace(action_graph_cache=cache())),
-            vision_tower=SimpleNamespace(_rpu_vision_graph_cache=cache())))
+def test_example_preserves_installed_capacity_and_checks_prefix(monkeypatch):
+    state = SimpleNamespace(handle=44, max_seq_len=16384,
+                            prefill_capability_envelope=(16512, 256))
+    policy = SimpleNamespace(model=SimpleNamespace(vlm=SimpleNamespace(_rpu_qwen3_5=state)))
     setter = Mock()
     monkeypatch.setattr(torch.ops.rpu, "qwen3_5_set_chunk_envelope", setter, raising=False)
-    INPUTS.configure_text_envelope(policy, {"prefix_rows": 245})
-    setter.assert_not_called(); session.require_cold.assert_not_called()
-    setter.side_effect = RuntimeError("cold native rejection")
-    with pytest.raises(RuntimeError, match="cold native"):
-        INPUTS.configure_text_envelope(policy, {"prefix_rows": 449})
-    assert state.prefill_capability_envelope == (256, 256)
-    setter.side_effect = None
-    metadata = {"prefix_rows": 449}
-    INPUTS.configure_text_envelope(policy, metadata)
-    setter.assert_called_with(44, 512, 256)
-    assert state.prefill_capability_envelope == (512, 256)
-    assert metadata["extended_text_measurement"]
-    setter.reset_mock()
-    state.prefill_graph_cache.size.return_value = 1
-    with pytest.raises(RuntimeError, match="before Graph"):
-        INPUTS.configure_text_envelope(policy, {"prefix_rows": 257})
+    for prefix in (245, 449):
+        metadata = {"prefix_rows": prefix}
+        INPUTS.configure_text_envelope(policy, metadata)
+        assert metadata["prefill_capability_envelope"] == [16512, 256]
     setter.assert_not_called()
+    assert state.prefill_capability_envelope == (16512, 256)
+    state.max_seq_len = 256
+    with pytest.raises(ValueError, match="installed KV capacity"):
+        INPUTS.configure_text_envelope(policy, {"prefix_rows": 449})
     with pytest.raises(ValueError, match="actual T32"):
         INPUTS.configure_text_envelope(policy, {"prefix_rows": 450})
 
@@ -279,8 +269,10 @@ def test_two_camera_context_counts_actual_images_and_rejects_reordered_batch(rel
     assert meta["cameras"] == 2 and meta["prefix_rows"] == 181
     assert meta["token_counts"]["image"] == 128
     assert meta["camera_names"] == ["head_rgb", "left_wrist_rgb"]
+    policy.model = SimpleNamespace(vlm=SimpleNamespace(_rpu_qwen3_5=SimpleNamespace(
+        max_seq_len=16384, prefill_capability_envelope=(16512, 256))))
     INPUTS.configure_text_envelope(policy, meta)
-    assert meta["prefill_capability_envelope"] == [256, 256]
+    assert meta["prefill_capability_envelope"] == [16512, 256]
     with pytest.raises(ValueError, match="actual T32"):
         INPUTS.configure_text_envelope(policy, dict(meta, prefix_rows=245))
     batch["pixel_values"] = dict(reversed(list(batch["pixel_values"].items())))

@@ -39,7 +39,7 @@ from rpu_backend.runtime.chunk_envelope import ChunkEnvelope, make_lookup
 # and chunk bound; document its runtime profile in docs/runtime_config.md.
 # chunk=0 selects automatic planning up to the configured max_kv_len.
 _CHUNK_ENVELOPE = {
-    ("llama", 2, 128): ChunkEnvelope(128),
+    ("llama", 2, 128): ChunkEnvelope(0, 128),
 }
 lookup_causal_decoder = make_lookup(
     _CHUNK_ENVELOPE,
@@ -178,7 +178,7 @@ class MinimalCausalLMAdapter:
             raise UnsupportedModelError(
                 f"{HF_ARCH} prefill chunk_size={requested} has no certified "
                 f"exact profile; ceiling={env.chunk}, max certified KV "
-                f"length={env.max_kv_len}."
+                "capacity is bound at installation."
             )
 
     def __init__(self, model: nn.Module) -> None:

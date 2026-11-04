@@ -524,7 +524,7 @@ def _selected_prefill_pair_rows(adapter) -> int:
 class Pi05Adapter:
     """Internal orchestrator for `Pi05Policy.to('rpu')` mutation."""
 
-    def __init__(self, lerobot_policy: Any, *, graph_runtime_policy=None) -> None:
+    def __init__(self, lerobot_policy: Any, *, graph_runtime_policy=None, max_seq_len=None) -> None:
         if graph_runtime_policy is not None:
             from rpu_backend.graph import GraphRuntimePolicy
             if not isinstance(graph_runtime_policy, GraphRuntimePolicy):
@@ -539,6 +539,14 @@ class Pi05Adapter:
                 "RPU_PI05_PREFILL_MASK_FP16", default=False
             )
         existing_session = getattr(model, "_execution_session", None)
+        inherited_capacity = getattr(existing_session, "_pi05_cache_capacity", None)
+        if max_seq_len is None:
+            max_seq_len = inherited_capacity if inherited_capacity is not None else 2048
+        if type(max_seq_len) is not int or max_seq_len < 1:
+            raise ValueError("max_seq_len must be a positive integer")
+        if inherited_capacity is not None and max_seq_len != inherited_capacity:
+            raise ValueError("Pi0.5 KV capacity is already cold-bound; reload the model")
+        self._max_seq_len = max_seq_len
         if existing_session is not None and hasattr(existing_session, "_pi05_graph_policy_request"):
             inherited_graph_policy = existing_session._pi05_graph_policy_request
             if graph_runtime_policy is not None and graph_runtime_policy != inherited_graph_policy:
@@ -629,6 +637,7 @@ class Pi05Adapter:
         )
         self._execution_session._pi05_legacy_pad16_requests = self._legacy_pad16_requests
         self._execution_session._pi05_graph_policy_request = self._graph_runtime_policy_request
+        self._execution_session._pi05_cache_capacity = self._max_seq_len
         self._execution_session.register_config_view(self)
         # Prefix/denoise methods live on the policy model; standalone child
         # forwards use their real module objects. Both address the same cold
@@ -1942,14 +1951,14 @@ class Pi05Adapter:
 
                 # --- Step D: move subsystems to device ---
                 vlm._rpu_attn_tp = vlm_attn_tp
-                vlm._rpu_max_seq_len = 2048
+                vlm._rpu_max_seq_len = self._max_seq_len
                 vlm.to('rpu')
                 # Iteration 6: embed_tokens MUST stay on CPU.
                 if getattr(vlm, "embed_tokens", None) is not None:
                     vlm.embed_tokens = vlm.embed_tokens.to('cpu')
 
                 expert._rpu_attn_tp = expert_attn_tp
-                expert._rpu_max_seq_len = 2048
+                expert._rpu_max_seq_len = self._max_seq_len
                 expert.to('rpu')
 
                 # BLOCKER 4: in-place .to('cpu').

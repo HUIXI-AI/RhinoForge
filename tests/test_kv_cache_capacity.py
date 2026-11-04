@@ -60,3 +60,50 @@ def test_cache_propagates_allocator_failure_without_truncating(monkeypatch):
     assert caught.value is error
     assert len(calls) == 1
     assert calls[0][1] * 16 == 32768
+
+
+@pytest.mark.parametrize('capacity', [True, 0, -1, 1.5, '16384'])
+@pytest.mark.parametrize('conditional', [False, True])
+def test_loader_rejects_invalid_capacity_before_loading(monkeypatch, capacity, conditional):
+    from rpu_backend.api import causal_lm, conditional_generation
+    module = conditional_generation if conditional else causal_lm
+    loader = module.RPUModelForConditionalGeneration if conditional else module.RPUModelForCausalLM
+    monkeypatch.setattr(module.AutoConfig, 'from_pretrained',
+                        lambda *a, **kw: pytest.fail('invalid capacity reached model loading'))
+    with pytest.raises(ValueError, match='positive integer'):
+        loader.from_pretrained('unused', max_seq_len=capacity)
+
+
+def test_gemma4_native_span_preserves_register_and_overflow_bounds(tmp_path):
+    from pathlib import Path
+    import subprocess
+    from test_siglip_cold_profile import _body
+
+    source = (Path(__file__).resolve().parents[1] / 'src/fused/rpu_gemma4_model.cpp').read_text()
+    body = _body(source, 'void validate_gemma4_kv_span(')
+    code = r'''
+#include <cassert>
+#include <cstdint>
+#include <limits>
+#include <stdexcept>
+#define TORCH_CHECK(ok, ...) do { if (!(ok)) throw std::runtime_error("invalid span"); } while (false)
+void validate_gemma4_kv_span(int64_t length, int64_t position) __BODY__
+int main() {
+    for (int64_t capacity : {16384, 32768, 131073, 1048560}) {
+        validate_gemma4_kv_span(capacity, 0);
+        validate_gemma4_kv_span(1, capacity - 1);
+    }
+    for (auto pair : {std::pair<int64_t,int64_t>{0,0}, {-1,0}, {1,-1},
+                      {1,1048560}, {1048561,0},
+                      {1,std::numeric_limits<int64_t>::max()}}) {
+        bool rejected = false;
+        try { validate_gemma4_kv_span(pair.first, pair.second); }
+        catch (const std::runtime_error&) { rejected = true; }
+        assert(rejected);
+    }
+}
+'''.replace('__BODY__', body)
+    cpp, executable = tmp_path / 'span.cpp', tmp_path / 'span'
+    cpp.write_text(code)
+    subprocess.run(['g++', '-std=c++17', '-O0', str(cpp), '-o', str(executable)], check=True)
+    subprocess.run([str(executable)], check=True)

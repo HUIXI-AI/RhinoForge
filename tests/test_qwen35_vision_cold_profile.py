@@ -672,7 +672,6 @@ struct Tensor {
     bool defined() const { return present; }
     int scalar_type() const { return dtype; }
     bool is_contiguous() const { return contiguous; }
-    bool defined() const { return false; }
     int64_t dim() const { return static_cast<int64_t>(shape.size()); }
     int64_t size(int axis) const { return shape.at(axis); }
 };

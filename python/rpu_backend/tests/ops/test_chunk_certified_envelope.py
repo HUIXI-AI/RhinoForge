@@ -101,12 +101,12 @@ def test_explicit_override_within_envelope_still_works(h06, no_global_chunk):
 def test_qwen3_4b_above_certified_prefill_is_rejected(h4b, no_global_chunk):
     torch.ops.rpu.causal_decoder_set_chunk_envelope(h4b, CERTIFIED_4B_MAX_KV, 0)
     assert _resolve(h4b, CERTIFIED_4B_MAX_KV) > 0
-    with pytest.raises(RuntimeError, match="exceeds this handle's CERTIFIED"):
+    with pytest.raises(RuntimeError, match="exceeds this handle's installed"):
         _resolve(h4b, 3072)
 
 def test_position_counts_toward_the_envelope(h4b, no_global_chunk):
     torch.ops.rpu.causal_decoder_set_chunk_envelope(h4b, CERTIFIED_4B_MAX_KV, 0)
-    with pytest.raises(RuntimeError, match="exceeds this handle's CERTIFIED"):
+    with pytest.raises(RuntimeError, match="exceeds this handle's installed"):
         _resolve(h4b, 512, position=CERTIFIED_4B_MAX_KV)
 
 def test_qwen3_5_promotes_the_mr54_language_envelope():

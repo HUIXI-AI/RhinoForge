@@ -1,4 +1,4 @@
-# Parcel-sorting WRC v728 only; see README.md for assets and input format.
+# Wall-OSS integration configuration; supply matching assets and inputs.
 # Action uses packed W4A16-pgrp. This is distinct from Pi0.5 Action NVFP4.
 [wall_oss_sorting]
 precision = "w8a16_action_w4a16"
@@ -8,7 +8,7 @@ fp16_checkpoint = "/path/to/wrc_sf_v728_0_15000"
 w8_checkpoint = "/path/to/wrc_v728_w8a16"
 action_w4_checkpoint = "/path/to/wrc_v728_action_w4a16_pgrp"
 batch = "/path/to/wrc_v728_batch.pt"
-inference_delay = 0 # RTC delay: 0, 1, 3, or 10; nonzero requires prefix_actions.
+inference_delay = 0 # Action delay: 0, 1, 3, or 10; nonzero requires prefix_actions.
 
 [run]
 warmup = 2

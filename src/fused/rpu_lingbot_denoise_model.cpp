@@ -470,7 +470,7 @@ void rpu_lingbot_denoise_set_weights(
     // suffix requires one ceil16-aligned chunk, so both auto and exact requests
     // share the admitted positive ceiling 64.
     // See docs/runtime_config.md.
-    m->set_chunk_envelope(/*max_kv_len=*/8192, /*chunk=*/64);
+    m->set_chunk_envelope(/*max_kv_len=*/cos.size(0), /*chunk=*/64);
     m->set_action_weights(wc, mo, mo_bias, op, op_bias, time_all,
                           action_dim, k_comb_pad, num_steps, chunk_size);
     m->set_adarms_unroll(adarms_is, adarms_ish, adarms_ps, adarms_psh);

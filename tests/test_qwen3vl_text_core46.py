@@ -63,8 +63,10 @@ def _model(size="2b", cores=6):
 @pytest.fixture
 def native(monkeypatch):
     state = dec.native_install.__wrapped__(monkeypatch)
-    table = dec._FakeTensor()
-    monkeypatch.setattr(decoder, "build_mrope_cos_sin_tables", lambda *a, **kw: (table, table))
+    def tables(config, **kwargs):
+        table = dec._FakeTensor(kwargs.get("max_seq_len") or config.max_position_embeddings)
+        return table, table
+    monkeypatch.setattr(decoder, "build_mrope_cos_sin_tables", tables)
     monkeypatch.setattr(torch.ops.rpu, "causal_decoder_topology",
         lambda _handle: (state["create_topologies"][-1]["num_cores"], 4,
                         state["create_topologies"][-1]["num_cores"], 4, 8), raising=False)
@@ -235,7 +237,7 @@ def test_actual_cold_text_installer_binds_lingbot_kv_only_envelope(
     assert install_qwen3_vl_text_for_rpu(model,
         max_seq_len=512, deepstack_lang_layers=[0, 1, 2], scale_lists=scales,
         folded_rmsnorm=kv_only, prefill_kv_only=kv_only) == 1
-    assert envelopes == [(1, 4176, 400 if kv_only else 256)]
+    assert envelopes == [(1, 512, 400 if kv_only else 256)]
     assert modes == ([(1, True, True)] if kv_only else [])
     assert bool(model._rpu_prefill_kv_only) is kv_only
     assert native["chunk_overrides"] == [(1, 0)]  # AUTO, never an unsafe override

@@ -51,6 +51,8 @@ constexpr int64_t kRoutedUint4GroupSize = 128;
 constexpr int64_t kRoutedUint4DownGroupSize = 64;
 // Only the post-mixer MLP is sliced; Attention/GDN keep the outer chunk.
 constexpr int64_t kMoeChunkSize = 128;
+// FLASH_ATTN_SPM's key-length register counts groups of 16 rows.
+constexpr int64_t kSdpaMaxKvRows = int64_t{UINT16_MAX} * 16;
 
 template <class Fn>
 void for_each_moe_slice(const v3::ChunkInfo& chunk, Fn&& emit) {
@@ -517,6 +519,26 @@ at::Tensor Qwen3_5MoeModel::forward_impl(
     TORCH_CHECK(seq_len == 1 || seq_len % 64 == 0,
                 "Qwen3.5 text expects decode length 1 or a prefill execution "
                 "length divisible by 64; use the Python adapter for ragged prefill");
+    // Check the installed physical capacity and kernel register domain before
+    // touching recurrent/KV state, including direct native forwards.
+    (void)subclass_chunk_size_cap(seq_len, position);
+    const bool use_prefill_rope = seq_len > 1 && has_mrope_ &&
+        prefill_cos_.defined() && prefill_cos_.numel() > 0;
+    const auto& rope_cos = use_prefill_rope ? prefill_cos_ : cos_;
+    const auto& rope_sin = use_prefill_rope ? prefill_sin_ : sin_;
+    TORCH_CHECK(
+        rope_cos.defined() && rope_sin.defined() &&
+            rope_cos.dim() == 2 && rope_cos.sizes() == rope_sin.sizes() &&
+            seq_len <= rope_cos.size(0) && position <= rope_cos.size(0) - seq_len,
+        "Qwen3.5 MoE request exceeds the installed rotary table capacity");
+    // Prefill tables already encode the per-token M-RoPE positions. Static
+    // decode lookup additionally applies the image-derived position delta.
+    // Compare before adding so malformed offsets cannot overflow int64.
+    TORCH_CHECK(
+        use_prefill_rope ||
+            (mrope_pos_delta_ >= -position &&
+             mrope_pos_delta_ <= rope_cos.size(0) - seq_len - position),
+        "Qwen3.5 MoE rotary position delta exceeds the installed table capacity");
     gdn_states_  = &gdn_states;
     conv_states_ = &conv_states;
     fast_replay_active_ = fast_replay_enabled_ && seq_len > 1;
@@ -2033,6 +2055,11 @@ bool Qwen3_5MoeModel::subclass_chunk_size_valid(int64_t cs, int64_t seq_len,
 // planner entry points (fused_model_base.cpp:615 dry, :1024 forward).
 int64_t Qwen3_5MoeModel::subclass_chunk_size_cap(int64_t seq_len,
                                               int64_t position) const {
+    TORCH_CHECK(
+        seq_len > 0 && position >= 0 && seq_len <= kSdpaMaxKvRows &&
+            position <= kSdpaMaxKvRows - seq_len,
+        "RPU_PLANNER_REJECT:CAPABILITY: Qwen3.5 MoE attention key length "
+        "exceeds the positive kernel register domain");
     const int64_t envelope_chunk =
         enforce_chunk_envelope(seq_len, position, "Qwen3_5MoeModel");
     if (chunk_size_cap_ <= 0) return envelope_chunk;
@@ -3060,18 +3087,19 @@ void Qwen3_5MoeModel::set_weights(
             "qwen3_5_moe set_weights: failed to allocate the TP6 router bridge");
     }
 
-    // Bind the exact profile's development admission in the native owner.
-    // Python retains the same (8192, 4096/top_k) bounds, but that state alone
-    // cannot authorize the base planner. The route storage can only narrow
-    // the chunk bound. The 8192-row bound describes physical prefill execution:
-    // do not clip it to the static decode rotary table's logical capacity,
-    // because prefill uses dynamic rotary tables and padded KV storage.
-    // The public preflight checks the installed logical KV/rotary capacity.
-    // Every candidate still passes the native SPM and
-    // kernel predicates; this declaration is not a hardware certificate.
+    // Bind capacity to this installation's rotary tables. Match the hybrid
+    // cache's 63 mandatory + 64 optional padding rows and 16-row allocation
+    // alignment; prefill uses dynamic rotary tables for those padded rows.
+    // Chunk size remains bounded by the route kernel and table storage.
+    // Every candidate still passes native SPM and kernel predicates.
     // The cold-only check must precede any retained-weight mutation.
+    constexpr int64_t total_padding = 63 + 64;
+    TORCH_CHECK(cos.size(0) <= std::numeric_limits<int64_t>::max() - total_padding - 15,
+                "qwen3_5_moe set_weights: padded KV capacity overflows int64");
+    const int64_t physical_kv_capacity =
+        ((cos.size(0) + total_padding + 15) / 16) * 16;
     set_chunk_envelope(
-        /*max_kv_len=*/8192,
+        physical_kv_capacity,
         std::min<int64_t>(4096 / top_k, expert_ids.size(0)));
 
     has_qk_norm_ = q_norm_list.size() > 0;

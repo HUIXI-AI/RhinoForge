@@ -1,4 +1,4 @@
-# Parcel-sorting WRC v728 only; see README.md for assets and input format.
+# Wall-OSS integration configuration; supply matching assets and inputs.
 # W8 checkpoint must be paired with this exact FP16 source checkpoint.
 [wall_oss_sorting]
 precision = "w8a16"
@@ -7,7 +7,7 @@ precision = "w8a16"
 fp16_checkpoint = "/path/to/wrc_sf_v728_0_15000"
 w8_checkpoint = "/path/to/wrc_v728_w8a16"
 batch = "/path/to/wrc_v728_batch.pt"
-inference_delay = 0 # RTC delay: 0, 1, 3, or 10; nonzero requires prefix_actions.
+inference_delay = 0 # Action delay: 0, 1, 3, or 10; nonzero requires prefix_actions.
 
 [run]
 warmup = 2

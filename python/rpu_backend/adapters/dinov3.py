@@ -737,6 +737,10 @@ def _validate_dinov3_input_bounds(
     max_seq_len: int,
 ) -> None:
     """Fail before allocation/native dispatch when an image exceeds install bounds."""
+    if not (0 < num_patches_h <= 2**15 and 0 < num_patches_w <= 2**15):
+        raise RPUBackendError("DINOv3 patch-grid axes must fit nonnegative int16 positions")
+    if num_patches_h * num_patches_w > 2**16 - 1:
+        raise RPUBackendError("DINOv3 patch count exceeds the 2D-RoPE uint16 token domain")
     if num_patches_h > max_hw or num_patches_w > max_hw:
         raise RPUBackendError(
             "DINOv3 forward: patch grid "
@@ -1002,9 +1006,10 @@ def build_dinov3_rope_tables(
             f"build_dinov3_rope_tables: head_dim must be divisible by 4, "
             f"got {head_dim}"
         )
-    if max_hw <= 0:
+    if not 0 < max_hw <= 2**15:
         raise ValueError(
-            f"build_dinov3_rope_tables: max_hw must be positive, got {max_hw}"
+            "build_dinov3_rope_tables: max_hw must be positive and fit "
+            f"nonnegative int16 position indices, got {max_hw}"
         )
 
     inv_freq = 1.0 / (
@@ -1028,6 +1033,8 @@ def build_position_idx(
     Matches HF DINOv3's `get_patches_center_coordinates` ordering
     (`meshgrid(..., indexing='ij')` → flatten(0,1)).
     """
+    if not (0 < num_patches_h <= 2**15 and 0 < num_patches_w <= 2**15):
+        raise ValueError("DINOv3 patch-grid axes must fit nonnegative int16 positions")
     row_idx = (
         torch.arange(num_patches_h, dtype=torch.long)[:, None]
         .expand(num_patches_h, num_patches_w).reshape(-1)

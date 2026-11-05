@@ -878,7 +878,8 @@ def test_g05_reuses_decoder_only_qwen35_install_contract():
     assert "fast_replay_active_ = fast_replay_enabled_ && seq_len > 1;" in qwen_cpp
     assert "cfg.fast_replay_skip_layer_loop = fast_replay_active_;" in qwen_cpp
     assert "convert_linear_weights_inplace(\n        inner.layers," in qwen_text
-    chunk_call = "torch.ops.rpu.qwen3_5_set_chunk_envelope(handle, 256, 256)"
+    chunk_call = "torch.ops.rpu.qwen3_5_set_chunk_envelope(handle, physical_capacity, 256)"
+    assert "physical_capacity = vlm._rpu_qwen3_5.chunk_envelope[0]" in vlm_install
     assert vlm_install.count(chunk_call) == 1
     chunk_index = vlm_install.index(chunk_call)
     assert vlm_install.rfind(
@@ -1669,6 +1670,7 @@ def _g05_vlm_installer_fixture(monkeypatch, module, events, request, *, linear_a
             graph_cache=Cache(),
             prefill_graph=types.SimpleNamespace(invalidate=lambda: events.append("discard")),
             max_seq_len=2048,
+            chunk_envelope=(2176, 640),
             num_layers=24,
             hidden_size=2048,
             linear_acc32=linear_acc32,
@@ -1742,7 +1744,7 @@ def test_g05_exact_vlm_installer_publishes_chunk_envelope_before_ready(monkeypat
     assert model._rpu_g05_vlm_ready is True
     assert events[2:9] == [
         "install",
-        ("chunk_envelope", 23, 256, 256),
+        ("chunk_envelope", 23, 2176, 256),
         ("linear_acc32", 23, True),
         ("fast_replay", 23, True),
         ("retained_prefill_graph", 23, True),
@@ -1750,8 +1752,9 @@ def test_g05_exact_vlm_installer_publishes_chunk_envelope_before_ready(monkeypat
         ("graph_cache", 1),
     ]
     assert [event for event in events if event[0] == "chunk_envelope"] == [
-        ("chunk_envelope", 23, 256, 256)
+        ("chunk_envelope", 23, 2176, 256)
     ]
+    assert vlm._rpu_qwen3_5.prefill_capability_envelope == (2176, 256)
 
     previous = list(events)
     assert module.patch_g05_vlm_for_rpu(
@@ -2780,7 +2783,7 @@ def test_g05_compact_vision_production_contract_is_scoped():
     assert '"s0_layout_b"' in vision_cpp
     assert "Persistent" not in compact_step0
     assert '{"transpose_qnbc_c16", RHINO_OP_LIB_PATH}' in kernel_cache
-    assert "QWEN3_5_VISION_GENERIC_MAX_SEQ = 4096" in vision_cpp
+    assert "configure_cache_capacity(int64_t max_seq_len)" in vision_cpp
     geometry = vision_cpp.split(
         "void Qwen3_5VisionModel::configure_execution_geometry(", 1
     )[1].split(
@@ -2789,7 +2792,7 @@ def test_g05_compact_vision_production_contract_is_scoped():
     generic_branch = geometry.split("    } else {", 1)[1].split(
         "    if (compact_input)", 1
     )[0]
-    assert "execution_len <= QWEN3_5_VISION_GENERIC_MAX_SEQ" in generic_branch
+    assert "execution_len <= cache_capacity_" in generic_branch
     assert "current_output_patches_ = execution_len" in generic_branch
 
 

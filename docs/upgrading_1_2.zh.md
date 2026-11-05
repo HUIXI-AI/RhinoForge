@@ -41,7 +41,6 @@ python -m examples.run --config qwen3.local.toml
 | [LingBot v2](../examples/configs/lingbot/v2/README.md) | 选择相机数量和语言长度，提供 checkpoint、训练 YAML 及配套 case、observation 或图像/状态输入；保持相机顺序与动作归一化一致。 |
 | [Qwen3.5 MoE](../examples/configs/qwen3_5/README.md) | 长文本模板使用 `prompt_file`、`prompt_sha256`、`input_ids_sha256` 和明确的 prefill/decode 长度；采用模板的 `run.timing_mode`。 |
 | [RhinoVLA](../examples/configs/rhinovla/README.md) | v1 使用固定源码、checkpoint 和 fixture；v3 按指南配置 runtime factory 和配对的预处理输入。 |
-| [G0.5](../examples/configs/g05/README.md) | 选择两相机或三相机模板，准备该配置的源码、checkpoint 和观测包。 |
 
 模板要求 `input_ids_sha256` 时，用配套 tokenizer 设置 `add_special_tokens=False`，
 对前 `prefill_tokens` 个连续 INT64 token ID 的字节计算 SHA256。文本须包含足够 token，

@@ -413,8 +413,7 @@ checkpoint 按 `use_embodied_system_prompt_ratio=0.0` 使用公开 `wall-x` 中�
 
 构造时绑定 `camera_names`，每次请求按名称提供对应图像。Vision 分块通过
 `rpu_execution.vision` 选择；packed Vision 在 `RPU_WALL_OSS_BATCH_MAX_SEQ` 容量内合并
-兼容的图像 grid。RTC 构造器绑定固定相机/动作配置，拒绝组件 `linear_acc32=true`；
-普通配置使用各 stage 显式设置。
+兼容的图像 grid。使用所选模型配置允许的各 stage 显式设置。
 
 | 变量 | 未设置时的默认值与接受值 | 读取 / 更改 | 作用域、效果与风险 |
 |---|---|---|---|
@@ -627,21 +626,19 @@ heading 之后。
 | `RPU_RHINOVLA_VECTOR_Q_NORM` | 0 | `0`/`1`、`false`/`true`、`off`/`on`，忽略大小写 | 固定全 W8 v3 开启 HIGH_PRECISION 时，将 Q 归一化补齐到向量形状，并在每层/每次回放清零新增行。 |
 | `RPU_RHINOVLA_VISION_INPUT_CACHE` | 0 | `0`/`1`、`false`/`true`、`off`/`on`，忽略大小写 | 复用视觉类型转换、patch 输入和带版本的位置缓冲区，每次调用刷新像素；绑定已安装视觉实例，最多保留四条缓存。 |
 | `RPU_WALL_OSS_ACTION_KV_OWNER_FANOUT` | 0 | `0`/`1`、`false`/`true`、`off`/`on`，忽略大小写 | 固定非驻留动作路径只生成一次 K/V 并经 SPM 分发；M32 不支持此路径。 |
-| `RPU_WALL_OSS_ACTION_WEIGHT_RESIDENCY` | 0 | `0`/`1`、`false`/`true`、`off`/`on`，忽略大小写 | 每次执行图时预装支持的动作权重：W8 第 1–4 层或 FP16 第 1–2 层；base H32 要求 sorting SiLU，FP16 还要求 transfer bit4。 |
+| `RPU_WALL_OSS_ACTION_WEIGHT_RESIDENCY` | 0 | `0`/`1`、`false`/`true`、`off`/`on`，忽略大小写 | 每次执行图时预装支持的动作权重：W8 第 1–4 层或 FP16 第 1–2 层；base H32 要求融合 SiLU×Mul，FP16 还要求 transfer bit4。 |
 | `RPU_WALL_OSS_FP16_MLP_M224` | 0 | `0`/`1`、`false`/`true`、`off`/`on`，忽略大小写 | 将 FP16 M640 Gate/Up 拆为 224+224+192 行；M320 边界调用保留原路径。 |
 | `RPU_WALL_OSS_FP16_TRANSFER_MASK` | 0 | 十进制 `0..7` | 位 1/2/4 选择固定 FP16 Vision/Prefill/Action 调度，权重保持 FP16。 |
-| `RPU_WALL_OSS_PREFILL_MIXED_PRECISION` | 0 | `0`/`1`、`false`/`true`、`off`/`on`，忽略大小写 | 为固定 TP8、H2048/I11008/L36 RTC prefill 选择 FP16/BF16 边界，须配合视觉混合精度；RTC 模板显式设置取值。 |
+| `RPU_WALL_OSS_PREFILL_MIXED_PRECISION` | 0 | `0`/`1`、`false`/`true`、`off`/`on`，忽略大小写 | 为允许的 TP8、H2048/I11008/L36 配置选择 prefill FP16/BF16 边界，须配合视觉混合精度。 |
 | `RPU_WALL_OSS_PREFILL_OWNER_DIRECT_KV` | 0 | `0`/`1`、`false`/`true`、`off`/`on`，忽略大小写 | 固定混合精度、分阶段 P640 owner-QKV 路径在部分 RoPE 后直接写 K/V。 |
-| `RPU_WALL_OSS_PREFILL_STAGED_MLP` | 0 | `0`/`1`、`false`/`true`、`off`/`on`，忽略大小写 | 选择层优先的 W8 P640/C320×2 MLP 调度；要求混合 prefill、TP8、因果位置 0 及固定 RTC 权重，P672 保留自身调度。 |
-| `RPU_WALL_OSS_RTC_ALLOW_NUMERIC_BLOCKED` | 0 | 仅字面值 `1` 开启 | 允许具名 RTC FP16/W8A16 配置通过入口限制；仍拒绝 W4 和不匹配配置，不会自动设置其他开关。 |
-| `RPU_WALL_OSS_RTC_EMBODIMENT` | X2 ex001_desktop | 非空字符串 | RTC 提示词中的机器人名称；非 RTC 调用使用数据集名称。应填写调用方机器人映射中的对应名称。 |
-| `RPU_WALL_OSS_SORTING_SILU_MUL` | 0 | `0`/`1`、`false`/`true`、`off`/`on`，忽略大小写 | 为支持的 sorting/base 路径融合 SiLU×Mul；固定 FP16 路径还要求对应 transfer 位，配对小图像视觉路径可跨层保留稠密 mask。 |
+| `RPU_WALL_OSS_PREFILL_STAGED_MLP` | 0 | `0`/`1`、`false`/`true`、`off`/`on`，忽略大小写 | 选择层优先的 W8 P640/C320×2 MLP 调度；要求混合 prefill、TP8、因果位置 0 及匹配的受支持权重，P672 保留自身调度。 |
+| `RPU_WALL_OSS_SORTING_SILU_MUL` | 0 | `0`/`1`、`false`/`true`、`off`/`on`，忽略大小写 | 为支持的路径融合 SiLU×Mul；固定 FP16 路径还要求对应 transfer 位，配对小图像视觉路径可跨层保留稠密 mask。 |
 | `RPU_WALL_OSS_VISION_LAYER_GROUP` | 0 | `0` 或 `32` | 固定三图像、每图 576 patch 的批量视觉配置中，让每幅图连续经过全部视觉层；与 weight-outer 调度互斥，构建时在进程内固定。 |
-| `RPU_WALL_OSS_VISION_MIXED_PRECISION` | 0 | `0`/`1`、`false`/`true`、`off`/`on`，忽略大小写 | 在融合 merger、每图 576 patch 的 RTC 视觉配置中选择 FP16/BF16 边界，须配合 prefill 混合精度；RTC 模板显式设置取值。 |
+| `RPU_WALL_OSS_VISION_MIXED_PRECISION` | 0 | `0`/`1`、`false`/`true`、`off`/`on`，忽略大小写 | 在允许的融合 merger、每图 576 patch 视觉配置中选择 FP16/BF16 边界，须配合 prefill 混合精度。 |
 | `RPU_WALL_OSS_VISION_NATIVE_WINDOW_SDPA` | 0 | `0`/`1`、`false`/`true`、`off`/`on`，忽略大小写 | 在支持的 W8 weight-outer 配置或开启行复用和 SiLU 的 base 双/三 224 图像配置中使用原生窗口注意力；FP16 还要求 transfer bit1。 |
-| `RPU_WALL_OSS_VISION_PAIR_252` | 0 | `0`/`1`、`false`/`true`、`off`/`on`，忽略大小写 | 固定三幅 252 图像时配对前两幅视觉输入，第三幅独立处理；要求通用窗口视觉、融合 merger、sorting SiLU 及 batch 容量至少 672。 |
+| `RPU_WALL_OSS_VISION_PAIR_252` | 0 | `0`/`1`、`false`/`true`、`off`/`on`，忽略大小写 | 固定三幅 252 图像时配对前两幅视觉输入，第三幅独立处理；要求通用窗口视觉、融合 merger、融合 SiLU×Mul 及 batch 容量至少 672。 |
 | `RPU_WALL_OSS_VISION_ROW_WEIGHT_OUTER` | 0 | `0`/`1`、`false`/`true`、`off`/`on`，忽略大小写 | 在支持的紧凑/base 形状中跨视觉行块复用完整本地权重；FP16 要求 transfer bit1，小图像路径关闭混合精度。 |
-| `RPU_WALL_OSS_VISION_WEIGHT_OUTER` | 0；RTC W8 默认 1 | `0`/`1`、`false`/`true`、`off`/`on`，忽略大小写 | 选择固定三图像、每图 576 patch 的批量视觉、混合精度和融合 merger 调度；FP16/W4 RTC 强制关闭，与 layer-group32 互斥，进程内固定。 |
+| `RPU_WALL_OSS_VISION_WEIGHT_OUTER` | 0；构造器可覆盖 | `0`/`1`、`false`/`true`、`off`/`on`，忽略大小写 | 选择固定三图像、每图 576 patch 的批量视觉、混合精度和融合 merger 调度；要求受支持的权重与形状组合，与 layer-group32 互斥，进程内固定。 |
 | `RPU_WALL_OSS_W16_NEXT3_MASK` | 0 | `0` 或 `1` | 为 prefill O 投影选择 M160×4/N96 行调度。 |
 | `RPU_WALL_OSS_W16_NEXT4_MASK` | 0 | 十进制 `0..3` | 位 1 选择 W8 M640 Gate/Up 行调度，位 2 选择配对 ring/postnorm。 |
 | `RPU_WALL_OSS_W16_REUSE_MASK` | 0 | `0` 或 `8` | 为驻留动作 Gate/Up 启用 A16 复用，其他位组合会被拒绝。 |

@@ -59,6 +59,26 @@ def test_g05_custom_default_keeps_registered_legacy_profile_separate(example_cat
     assert legacy['example']['profile_id'] == 'g05-base.fp16.k1-rtc-fm'
     assert rows[0][3]['support']['status'] == 'CONTROLLED_EVALUATION'
 
+def test_integration_configs_remain_runnable_without_public_documentation(example_catalog):
+    checker = example_catalog
+    configs = checker.load_configs()
+    catalog = checker.catalog(configs)
+    private_paths = [path for path in configs if not checker.documented_config(path)]
+    assert len(private_paths) == 12
+    assert len(configs) > len(private_paths)
+    rendered = checker.render_config_index(configs)
+    for language in ('en', 'zh'):
+        rendered += checker.render(language, catalog)
+    for path in private_paths:
+        assert path.is_file()
+        assert path.relative_to(checker.CONFIGS).as_posix() not in rendered
+        metadata = checker.COMMON.example_metadata(configs[path])
+        if metadata is not None:
+            assert metadata['profile_id'] in catalog['vla']
+            assert metadata['profile_id'] not in rendered
+    assert 'wall_oss/base/3cam/224/fp16.toml' in rendered
+    assert 'wall_oss/legacy/fp16.toml' in rendered
+
 def test_hyvla_optimized_default_keeps_registered_fixture_separate(example_catalog):
     checker = example_catalog
     default = checker.CONFIGS / 'hy_vla/3cam/fp16.toml'
@@ -308,7 +328,7 @@ def test_registry_alias_is_validated_but_not_promoted_to_support(tmp_path):
     assert result.returncode == 2
     assert 'does not match profile' in result.stderr
 
-def test_profile_metadata_is_the_matrix_support_authority(tmp_path, monkeypatch):
+def test_profile_metadata_is_the_matrix_support_authority(tmp_path, monkeypatch, example_catalog):
     common = _load_common()
     profiles = common.example_profiles()
     for config_path in (EXAMPLES / 'configs').rglob('*.toml'):
@@ -320,6 +340,10 @@ def test_profile_metadata_is_the_matrix_support_authority(tmp_path, monkeypatch)
         for matrix in ('model_matrix.md', 'model_matrix.zh.md'):
             text = (ROOT / 'docs' / matrix).read_text(encoding='utf-8')
             rows = [line for line in text.splitlines() if f"`{profile['id']}`" in line]
+            copied_path = example_catalog.CONFIGS / config_path.relative_to(EXAMPLES / 'configs')
+            if not example_catalog.documented_config(copied_path):
+                assert not rows, (profile['id'], matrix)
+                continue
             assert len(rows) == 1, (profile['id'], matrix)
             row = rows[0]
             if profile.get('example_only'):

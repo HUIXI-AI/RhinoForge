@@ -79,6 +79,7 @@ class Pi05Policy:
         vlm_chunk_size: int | None = None,
         rpu_execution=None,
         graph_runtime_policy=None,
+        max_seq_len: int | None = None,
         **lerobot_kwargs: Any,
     ) -> "Pi05Policy":
         """D-01 canonical (delegates to loader.py per D-3-03).
@@ -87,6 +88,8 @@ class Pi05Policy:
         ``rpu_backend.adapters.pi05.loader`` (v5-02 D-12 relocated from
         ``transformers/pi05/``).
         """
+        if max_seq_len is not None and (type(max_seq_len) is not int or max_seq_len < 1):
+            raise ValueError("max_seq_len must be a positive integer")
         if graph_runtime_policy is not None:
             from rpu_backend.graph import GraphRuntimePolicy
             if not isinstance(graph_runtime_policy, GraphRuntimePolicy):
@@ -119,6 +122,7 @@ class Pi05Policy:
             ),
             **({"graph_runtime_policy": graph_runtime_policy}
                if graph_runtime_policy is not None else {}),
+            **({"max_seq_len": max_seq_len} if max_seq_len is not None else {}),
             **lerobot_kwargs,
         )
 
@@ -144,6 +148,7 @@ class Pi05Policy:
         *,
         rpu_execution=None,
         graph_runtime_policy=None,
+        max_seq_len: int | None = None,
     ) -> "Pi05Policy":
         """D-01 convenience.
 
@@ -152,6 +157,8 @@ class Pi05Policy:
         relocated from ``transformers/pi05/adapter.py``; the class body now
         sits in the package's ``__init__.py``).
         """
+        if max_seq_len is not None and (type(max_seq_len) is not int or max_seq_len < 1):
+            raise ValueError("max_seq_len must be a positive integer")
         if graph_runtime_policy is not None:
             from rpu_backend.graph import GraphRuntimePolicy
             if not isinstance(graph_runtime_policy, GraphRuntimePolicy):
@@ -171,7 +178,9 @@ class Pi05Policy:
             supported_components=PI05_EXECUTION_COMPONENTS,
         )
         inst._adapter = Pi05Adapter(
-            lerobot_policy, **({"graph_runtime_policy": graph_runtime_policy}
+            lerobot_policy,
+            **({"max_seq_len": max_seq_len} if max_seq_len is not None else {}),
+            **({"graph_runtime_policy": graph_runtime_policy}
                               if graph_runtime_policy is not None else {}))
         inst._rpu_ready = inst._adapter._rpu_is_ready
         inst._rpu_execution = execution_config

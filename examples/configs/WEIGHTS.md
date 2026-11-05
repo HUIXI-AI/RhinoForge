@@ -1,6 +1,6 @@
 # 权重准备
 
-[模型目录](README.md) · [通用参数](PARAMETERS.md) · [完整配置索引](CONFIGURATIONS.md)
+[模型目录](README.md) · [通用参数](PARAMETERS.md) · [公开配置索引](CONFIGURATIONS.md)
 
 从模型页的配置表选择 TOML，并进入该行的权重准备步骤。每个步骤给出来源、下载或转换命令、最终目录及其配置字段。同一份权重可由多个输入或执行配置复用，模型页会明确列出适用范围。
 
@@ -65,14 +65,12 @@
 | Gemma4 E4B-it | Google 官方 BF16 权重，按组件加载 | [对应表](gemma4/README.md#weight-recipes) | [操作步骤](gemma4/README.md#quantization) |
 | DINOv3 ViT-B | Meta 官方 FP32 权重，加载为 FP16 | [对应表](dinov3/README.md#weight-recipes) | [操作步骤](dinov3/README.md#quantization) |
 | <a id="cmd-pi05"></a>Pi0.5 LIBERO | 指定 LeRobot LIBERO 微调权重；W8/NVFP4 离线转换，Prefill A8 共用 NVFP4 包 | [对应表](pi05/README.md#weight-recipes) | [操作步骤](pi05/README.md#quantization) |
-| G0.5 K1 | 配对客户 checkpoint、release 源码和输入；加载时量化 | [对应表](g05/README.md#weight-recipes) | [操作步骤](g05/README.md#quantization) |
 | HyVLA | 腾讯 UMI 官方权重；FP16/W8/动作 NVFP4 共用浮点源目录 | [对应表](hy_vla/README.md#weight-recipes) | [操作步骤](hy_vla/README.md#quantization) |
 | HY Embodied UMI | 腾讯 UMI 权重及该入口的配套输入 | [对应表](hy_embodied/README.md#weight-recipes) | [操作步骤](hy_embodied/README.md#quantization) |
 | GR00T N1.7-3B | NVIDIA 策略权重和配套 Qwen 配置；加载时量化 | [对应表](gr00t/README.md#weight-recipes) | [操作步骤](gr00t/README.md#quantization) |
 | RhinoVLA v1 | HuixiAI 固定 checkpoint、源码和 LIBERO fixture | [对应表](rhinovla/v1/README.md#weight-recipes) | [操作步骤](rhinovla/v1/README.md#quantization) |
 | RhinoVLA v3 | 客户 96D 模型、factory 和请求；五份配置共用原始权重，加载时量化 | [对应表](rhinovla/v3/README.md#weight-recipes) | [操作步骤](rhinovla/v3/README.md#quantization) |
 | <a id="cmd-wall"></a>Wall-OSS base | 官方 wall-oss-0.5 权重；W8/NVFP4 转换与浮点目录配对 | [对应表](wall_oss/base/README.md#weight-recipes) | [操作步骤](wall_oss/base/README.md#quantization) |
-| Wall-OSS RTC / 分拣 | 各自的客户 WRC 权重和输入 | [RTC](wall_oss/rtc/README.md#weight-recipes) / [分拣](wall_oss/sorting/README.md#weight-recipes) | [RTC 步骤](wall_oss/rtc/README.md#quantization) / [分拣步骤](wall_oss/sorting/README.md#quantization) |
 | <a id="cmd-internvla"></a>InternVLA-N1 NavDP | 官方模型及 System2 W8 配对包；System2 decoder W8，其余组件按混合精度执行 | [对应表](internvla/README.md#weight-recipes) | [操作步骤](internvla/README.md#quantization) |
 | LingBot v2 | Robbyant 官方 FP32 权重；FP16/W8 加载时转换 | [对应表](lingbot/v2/README.md#weight-recipes) | [操作步骤](lingbot/v2/README.md#quantization) |
 | LingBot v1 | 对应 4B 权重，CPU/设备混合执行 | [对应表](lingbot/README.md#weight-recipes) | [操作步骤](lingbot/README.md#quantization) |

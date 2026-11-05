@@ -87,6 +87,18 @@ their producing copy operations. Device-only handoffs retain storage and DMA
 ownership without republishing data; host-backed device copies still need both
 boundaries. Check in-place request updates and mask changes before reusing a
 cached upload. See [component handoffs](concepts/component-handoff.md).
+For cache-capacity changes, distinguish allocator capacity from execution
+admission across supported adapters. Bind requested model capacity, rotary
+tables, physical prefill padding and fixed-address keepalives during cold
+installation; require cache capacity to fit the installed model. Public
+CausalLM/ConditionalGeneration loaders accept `max_seq_len`, as do Pi0.5 policy
+constructors and the TTS talker; GR00T exposes `max_prefix_len`. Check default,
+explicit and deferred device-installation paths. Keep actual cache bounds,
+rotary indices, coordinate/register widths, SPM feasibility and semantic input
+shapes checked before state mutation. Test allocation failure without silently
+shortening the request. Defaults are not hard allocation limits, and expanded
+allocation does not expand hardware-validation claims.
+See [KV cache](concepts/kv-cache.md).
 For Pi0.5 fixed-input comparisons, use the public `input.noise` field for both
 Graph preparation and inference; retain default-input failures separately.
 See the [policy API](../docs/api_reference.md#policy-apis) and

@@ -13,10 +13,9 @@ from rpu_backend.api._execution import execution_serialized
 from rpu_backend.runtime import rpu_env_bool
 from rpu_backend.runtime.chunk_envelope import ChunkEnvelope, make_lookup
 
-# Preserve the 2B backbone boundary previously supplied by qwen3_vl.text.
-# This is an inherited admission ceiling, not official full-chain certification.
+# Retain the 2B backbone chunk bound; the installer binds actual KV capacity.
 _TEXT_ENVELOPE = make_lookup(
-    {("qwen3_vl_text", 28, 2048): ChunkEnvelope(336, 320)},
+    {("qwen3_vl_text", 28, 2048): ChunkEnvelope(0, 320)},
     "rpu_backend/adapters/rhinovla/pipeline.py::_TEXT_ENVELOPE",
 )
 

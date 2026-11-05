@@ -1089,9 +1089,8 @@ def _install_qwen3_vl_vision_for_rpu_impl(
         max_hw: max(h, w) bound for FreqCos/Sin table size. Default 48 covers
             up to 768×768 px with patch_size=16.
         max_seq_len: bound for RPUCache + position_idx keepalive. Default 1024
-            covers any image up to 32×32 grid pre-merger. The C++ side caps
-            at QWEN3VL_VISION_MAX_KEEPALIVE_SEQ (4096) — raising this also
-            requires raising the C++ constant.
+            covers any image up to 32×32 grid pre-merger. Native position
+            storage is allocated from this capacity during installation.
         rpu_patch_embed: optional RhinoVLA perf path. Default False preserves
             the shared Qwen3-VL CPU-fp16 patch_embed behavior.
         rpu_mergers: optional RhinoVLA perf path for merger and DeepStack

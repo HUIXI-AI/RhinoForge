@@ -86,21 +86,20 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm, Qwen3RotaryEm
 from rpu_backend.runtime.chunk_envelope import ChunkEnvelope, make_lookup
 
 # (arch, num_hidden_layers, hidden_size) -> (max_kv_len, safe chunk ceiling).
-# The length bounds position + physical execution length for multi-token
-# prefill; single-token decode retains its separate cache/RoPE bounds. These
-# geometry-based limits are shared by FP16 and W8A16. Keep chunk ceilings fixed
-# as context grows: the native planner still checks padding, tails and SPM.
+# Capacity is bound to installed rotary/storage rows, independently of these
+# geometry-based chunk ceilings shared by FP16 and W8A16. The native planner
+# still checks padding, tails and SPM for the actual requested context length.
 # A geometry without a row cannot prefill.
 _CHUNK_ENVELOPE = {
-    ("qwen3", 28, 1024): ChunkEnvelope(4096, 512),   # 0.6b
-    ("qwen3", 28, 2048): ChunkEnvelope(4096, 512),   # 1.7b
-    ("qwen3", 36, 2560): ChunkEnvelope(4096, 256),   # 4b
+    ("qwen3", 28, 1024): ChunkEnvelope(0, 512),   # 0.6b
+    ("qwen3", 28, 2048): ChunkEnvelope(0, 512),   # 1.7b
+    ("qwen3", 36, 2560): ChunkEnvelope(0, 256),   # 4b
     # 8b — 128 is the largest currently selectable/certified chunk. Historical
     # cs=224 measurements predate the current SDPA validity predicate; 224 is
     # no longer a legal exact request and therefore must not be advertised as
     # the public ceiling. The large certificate covers 64/128 through P4096.
-    ("qwen3", 36, 4096): ChunkEnvelope(4096, 128),   # 8b    fp16 + w8a16
-    ("qwen3", 40, 5120): ChunkEnvelope(192, 32),     # 14b   w8a16 only
+    ("qwen3", 36, 4096): ChunkEnvelope(0, 128),   # 8b    fp16 + w8a16
+    ("qwen3", 40, 5120): ChunkEnvelope(0, 32),     # 14b   w8a16 only
 }
 
 # Exact values whose attention geometry is admissible at each profile's
@@ -119,7 +118,7 @@ lookup_causal_decoder = make_lookup(
 # remains authoritative for each request. This adds no FP16 geometry profile.
 _QUANT_CHUNK_ENVELOPE = {
     **_CHUNK_ENVELOPE,
-    ("qwen3", 64, 5120): ChunkEnvelope(4096, 64),
+    ("qwen3", 64, 5120): ChunkEnvelope(0, 64),
 }
 lookup_quantized_causal_decoder = make_lookup(
     _QUANT_CHUNK_ENVELOPE, "rpu_backend/adapters/qwen3.py::_QUANT_CHUNK_ENVELOPE")
@@ -459,8 +458,7 @@ class Qwen3Adapter:
         if env.chunk > 0 and requested > env.chunk:
             raise UnsupportedModelError(
                 f"Qwen3 prefill chunk_size={requested} exceeds this profile's "
-                f"certified ceiling {env.chunk}; max certified KV length is "
-                f"{env.max_kv_len}. Refusing before loading model weights."
+                f"chunk ceiling {env.chunk}. Refusing before loading model weights."
             )
         admissible = (frozenset((16, 32, 64)) if key == ("qwen3", 64, 5120)
                       else _EXACT_CHUNKS.get(key))

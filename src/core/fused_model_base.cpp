@@ -3685,6 +3685,9 @@ void FusedModelBase::stage_execution_controls(
 int64_t FusedModelBase::enforce_chunk_envelope(int64_t seq_len, int64_t position,
                                                const char* model_name) const {
     const ChunkEnvelope& e = pimpl_->chunk_envelope_;
+    TORCH_CHECK(seq_len > 0 && position >= 0 &&
+                    seq_len <= std::numeric_limits<int64_t>::max() - position,
+                "RPU_PLANNER_REJECT:CAPABILITY: invalid or overflowing KV span");
 
     // Decode is exempt BY MECHANISM, not by convenience: a single-token step
     // resolves to the 16-row minimum, so it cannot reach a chunk large enough to
@@ -3703,11 +3706,11 @@ int64_t FusedModelBase::enforce_chunk_envelope(int64_t seq_len, int64_t position
     TORCH_CHECK(kv_len <= e.max_kv_len,
         "RPU_PLANNER_REJECT:CAPABILITY: REFUSING PREFILL: ", model_name,
         " kv_len=", kv_len, " (position=",
-        position, " + seq_len=", seq_len, ") exceeds this handle's CERTIFIED "
+        position, " + seq_len=", seq_len, ") exceeds this handle's installed "
         "envelope max_kv_len=", e.max_kv_len, " (chunk=", e.chunk,
         ", 0 means auto). "
-        "The combination is outside the supported runtime profile. Validate the "
-        "SPM capacity before adding or increasing the bound.");
+        "Reinstall with sufficient cache/position capacity. The planner still "
+        "checks actual SPM and kernel constraints for each request.");
 
     return e.chunk;
 }

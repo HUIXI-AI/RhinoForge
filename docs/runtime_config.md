@@ -446,8 +446,7 @@ plain `You are a helpful assistant.` system prompt from public `wall-x`.
 Bind `camera_names` at construction and pass one image for each name on every
 request. Vision chunking is selected through `rpu_execution.vision`; packed
 Vision groups compatible image grids within `RPU_WALL_OSS_BATCH_MAX_SEQ`.
-The RTC constructor binds its fixed camera/action profile and rejects component
-`linear_acc32=true`; ordinary profiles use their explicit stage settings.
+Use the explicit stage settings admitted by the selected model profile.
 
 | Variable | Unset/default and accepted values | Read / change | Scope, effect, and risk |
 |---|---|---|---|
@@ -676,21 +675,19 @@ values from the current invocation and stay in the caller's output directory.
 | `RPU_RHINOVLA_VECTOR_Q_NORM` | 0 | `0`/`1`, `false`/`true`, `off`/`on`; case-insensitive | With HIGH_PRECISION in exact full-W8 v3, pad Q normalization to its vector shape and clear the added rows each layer/replay. |
 | `RPU_RHINOVLA_VISION_INPUT_CACHE` | 0 | `0`/`1`, `false`/`true`, `off`/`on`; case-insensitive | Reuse vision cast, patch-input and versioned position buffers; refresh pixels every call. Bound to the installed vision owner, with at most four entries. |
 | `RPU_WALL_OSS_ACTION_KV_OWNER_FANOUT` | 0 | `0`/`1`, `false`/`true`, `off`/`on`; case-insensitive | For the exact non-resident action route, produce K/V once and distribute through SPM; M32 does not admit this route. |
-| `RPU_WALL_OSS_ACTION_WEIGHT_RESIDENCY` | 0 | `0`/`1`, `false`/`true`, `off`/`on`; case-insensitive | Preload eligible action weights once per graph: W8 layers1–4 or FP16 layers1–2. Base H32 requires sorting SiLU and FP16 transfer bit4 when using FP16. |
+| `RPU_WALL_OSS_ACTION_WEIGHT_RESIDENCY` | 0 | `0`/`1`, `false`/`true`, `off`/`on`; case-insensitive | Preload eligible action weights once per graph: W8 layers1–4 or FP16 layers1–2. Base H32 requires fused SiLU×Mul and FP16 transfer bit4 when using FP16. |
 | `RPU_WALL_OSS_FP16_MLP_M224` | 0 | `0`/`1`, `false`/`true`, `off`/`on`; case-insensitive | Split FP16 M640 Gate/Up into224+224+192 rows; M320 boundary calls retain their route. |
 | `RPU_WALL_OSS_FP16_TRANSFER_MASK` | 0 | decimal `0..7` | Bits1/2/4 select exact FP16 Vision/Prefill/Action schedules; weights remain FP16. |
-| `RPU_WALL_OSS_PREFILL_MIXED_PRECISION` | 0 | `0`/`1`, `false`/`true`, `off`/`on`; case-insensitive | Select the RTC prefill FP16/BF16 boundary for the exact TP8 H2048/I11008/L36 profile; enable with Vision mixed precision. RTC templates set their explicit values. |
+| `RPU_WALL_OSS_PREFILL_MIXED_PRECISION` | 0 | `0`/`1`, `false`/`true`, `off`/`on`; case-insensitive | Select the prefill FP16/BF16 boundary for the admitted TP8 H2048/I11008/L36 profile; enable with Vision mixed precision. |
 | `RPU_WALL_OSS_PREFILL_OWNER_DIRECT_KV` | 0 | `0`/`1`, `false`/`true`, `off`/`on`; case-insensitive | Write K/V directly from the exact mixed, staged P640 owner-QKV route after partial RoPE. |
-| `RPU_WALL_OSS_PREFILL_STAGED_MLP` | 0 | `0`/`1`, `false`/`true`, `off`/`on`; case-insensitive | Select layer-major W8 P640/C320×2 MLP scheduling; requires mixed prefill, TP8, causal position0 and the exact RTC checkpoint. P672 retains its own schedule. |
-| `RPU_WALL_OSS_RTC_ALLOW_NUMERIC_BLOCKED` | 0 | only literal `1` enables | Allow the named RTC FP16/W8A16 configurations through admission; W4 and unmatched profiles remain rejected. Does not set the other profile switches. |
-| `RPU_WALL_OSS_RTC_EMBODIMENT` | X2 ex001_desktop | non-empty string | Robot name inserted into the RTC prompt; non-RTC calls use the dataset name. Supply the name matching the caller's robot mapping. |
-| `RPU_WALL_OSS_SORTING_SILU_MUL` | 0 | `0`/`1`, `false`/`true`, `off`/`on`; case-insensitive | Fuse SiLU×Mul for admitted sorting/base paths; exact FP16 routes also require their transfer bit. Paired small-image Vision can retain its dense mask across layers. |
+| `RPU_WALL_OSS_PREFILL_STAGED_MLP` | 0 | `0`/`1`, `false`/`true`, `off`/`on`; case-insensitive | Select layer-major W8 P640/C320×2 MLP scheduling; requires mixed prefill, TP8, causal position0 and a matching admitted checkpoint. P672 retains its own schedule. |
+| `RPU_WALL_OSS_SORTING_SILU_MUL` | 0 | `0`/`1`, `false`/`true`, `off`/`on`; case-insensitive | Fuse SiLU×Mul for admitted paths; exact FP16 routes also require their transfer bit. Paired small-image Vision can retain its dense mask across layers. |
 | `RPU_WALL_OSS_VISION_LAYER_GROUP` | 0 | `0` or `32` | For exact three-image576-patch batched vision, keep each image through all vision layers. Mutually exclusive with weight-outer scheduling; process-pinned at construction. |
-| `RPU_WALL_OSS_VISION_MIXED_PRECISION` | 0 | `0`/`1`, `false`/`true`, `off`/`on`; case-insensitive | Select the RTC vision FP16/BF16 boundary with fused merger and576 patches per image; pair with prefill mixed precision. RTC templates set their explicit values. |
+| `RPU_WALL_OSS_VISION_MIXED_PRECISION` | 0 | `0`/`1`, `false`/`true`, `off`/`on`; case-insensitive | Select the admitted vision FP16/BF16 boundary with fused merger and576 patches per image; pair with prefill mixed precision. |
 | `RPU_WALL_OSS_VISION_NATIVE_WINDOW_SDPA` | 0 | `0`/`1`, `false`/`true`, `off`/`on`; case-insensitive | Use native window attention for the admitted W8 weight-outer profile or base two/three224 images with row reuse and SiLU; FP16 also requires transfer bit1. |
-| `RPU_WALL_OSS_VISION_PAIR_252` | 0 | `0`/`1`, `false`/`true`, `off`/`on`; case-insensitive | For exactly three252 images, pair the first two vision inputs and retain the third separately. Requires generic window vision, fused merger, sorting SiLU and batch capacity>=672. |
+| `RPU_WALL_OSS_VISION_PAIR_252` | 0 | `0`/`1`, `false`/`true`, `off`/`on`; case-insensitive | For exactly three252 images, pair the first two vision inputs and retain the third separately. Requires generic window vision, fused merger, fused SiLU×Mul and batch capacity>=672. |
 | `RPU_WALL_OSS_VISION_ROW_WEIGHT_OUTER` | 0 | `0`/`1`, `false`/`true`, `off`/`on`; case-insensitive | Reuse complete local weight slabs across vision row tiles for admitted compact/base shapes. FP16 requires transfer bit1; small-image mixed precision stays off. |
-| `RPU_WALL_OSS_VISION_WEIGHT_OUTER` | 0; RTC W8 default1 | `0`/`1`, `false`/`true`, `off`/`on`; case-insensitive | Select the exact three-image576-patch schedule with batched vision, mixed precision and fused merger. FP16/W4 RTC force it off; incompatible with layer-group32 and pinned per process. |
+| `RPU_WALL_OSS_VISION_WEIGHT_OUTER` | 0; constructor may override | `0`/`1`, `false`/`true`, `off`/`on`; case-insensitive | Select the exact three-image576-patch schedule with batched vision, mixed precision and fused merger. Requires an admitted weight and geometry combination; incompatible with layer-group32 and pinned per process. |
 | `RPU_WALL_OSS_W16_NEXT3_MASK` | 0 | `0` or `1` | Select the M160×4/N96 row schedule for prefill O projection. |
 | `RPU_WALL_OSS_W16_NEXT4_MASK` | 0 | decimal `0..3` | Bit1 selects W8 M640 Gate/Up row scheduling; bit2 selects paired ring/postnorm. |
 | `RPU_WALL_OSS_W16_REUSE_MASK` | 0 | `0` or `8` | Enable A16 reuse for resident action Gate/Up; other bit patterns are rejected. |

@@ -28,7 +28,7 @@ Architecture decisions:
   - The patch merger runs in-graph and uses mutable-destination DMA for direct
     text fusion; standalone vision still returns a normal pooler tensor.
   - 2D RoPE: position_idx built per forward, copy_in to the model-owned keepalive
-    ``[MAX_KEEPALIVE_SEQ, 2] int16``.
+    ``[installed physical capacity, 2] int16``.
 """
 from __future__ import annotations
 
@@ -1259,7 +1259,7 @@ def _plan_qwen3_5_vision_group(
     plan_bounded_prefill_execution(
         logical_len,
         4608 if int(temporal_num_frames) > 1 else 256*int(camera_batch_count) if int(camera_batch_count) in (2,3) else min(
-            4096, int(getattr(vision_model._rpu_vision_kv_cache,
+            65535 * 16, int(getattr(vision_model._rpu_vision_kv_cache,
                               "max_seq_len", logical_len))),
         0,
         alignment=1, padding_rows=0, exact_chunk_size=exact,
@@ -1594,7 +1594,7 @@ def install_qwen3_5_vision_for_rpu(
     _cold_numeric_opt_in: bool = False,
     _text_bridge: Qwen3_5MoeVisionTextBridge | None = None,
     max_hw: int = 128,        # 每维 patch 上限(2D rope 表 [max_hw,hd/4] 行数,~4KB 近乎免费)；128→单边 ≤2048px、~4:1 长宽比。原 48 卡 >768px
-    max_seq_len: int = 4096,  # generic vision KV cache cap; G0.5 B3 reuses it in isolated 768-row spatial minibatches
+    max_seq_len: int = 4096,  # default spatial KV capacity; callers may request larger storage
     _allow_certified_g05_k1: bool = False,
     _g05_w8a16: bool = False,
     _g05_acc16_experiment: bool = False,
@@ -1905,12 +1905,14 @@ def _install_qwen3_5_vision_for_rpu_impl(
     if (
         isinstance(max_seq_len, bool)
         or not isinstance(max_seq_len, Integral)
-        or not 0 < int(max_seq_len) <= 4096
+        or int(max_seq_len) <= 0
     ):
         raise ValueError(
-            "Qwen3.5 generic vision max_seq_len must be an integer in [1, 4096]"
+            "Qwen3.5 generic vision max_seq_len must be a positive integer"
         )
     max_seq_len = int(max_seq_len)
+    if type(max_hw) is not int or not 0 < max_hw <= 32768:
+        raise ValueError("Qwen3.5 vision max_hw must fit positive int16 position indices")
     (
         chunk_size_cap,
         exact_chunk_size,
@@ -1968,6 +1970,7 @@ def _install_qwen3_5_vision_for_rpu_impl(
     set_cap = getattr(
         torch.ops.rpu, "qwen3_5_vision_set_chunk_size_cap", None
     )
+    set_capacity = getattr(torch.ops.rpu, "qwen3_5_vision_set_cache_capacity", None)
     resolver = getattr(
         torch.ops.rpu, "qwen3_5_vision_resolve_prefill_domain", None
     )
@@ -1992,7 +1995,7 @@ def _install_qwen3_5_vision_for_rpu_impl(
         raise RuntimeError("Qwen3.5 vision binary lacks qwen3_5_vision_set_gelu_erf_ultra; rebuild before installing")
     if (
         set_cap is None or set_exact is None or resolver is None
-        or set_linear_acc32 is None
+        or set_linear_acc32 is None or set_capacity is None
     ):
         missing = [
             name
@@ -2001,6 +2004,7 @@ def _install_qwen3_5_vision_for_rpu_impl(
                 ("qwen3_5_vision_set_prefill_chunk_size", set_exact),
                 ("qwen3_5_vision_resolve_prefill_domain", resolver),
                 ("qwen3_5_vision_set_linear_acc32", set_linear_acc32),
+                ("qwen3_5_vision_set_cache_capacity", set_capacity),
             )
             if value is None
         ]
@@ -2038,6 +2042,7 @@ def _install_qwen3_5_vision_for_rpu_impl(
         graphs=(), keepalive=(), label="Qwen3.5 Vision", handle_name="handle")
     handle_finalizer = retirement_state.handle_finalizer = resource.finalizer
     vars(vision_model)["_rpu_vision_installing_finalizer"] = handle_finalizer
+    set_capacity(handle, max_seq_len)
     # Bind both MoE choices atomically, before any weight transform/upload.
     # Dense explicit ACC32 and G0.5 retain their existing setter semantics.
     if num_cores != 8:

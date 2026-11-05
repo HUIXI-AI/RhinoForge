@@ -28,7 +28,10 @@ import types
 from contextlib import contextmanager
 
 from rpu_backend.api.errors import RPUBackendError, UnsupportedModelError
-from rpu_backend.api._execution import _resolve_text_install_options
+from rpu_backend.api._execution import (
+    QWEN3_5_TOTAL_PADDING_CAP,
+    _resolve_text_install_options,
+)
 from rpu_backend.runtime.decoder import plan_bounded_prefill_execution
 from rpu_backend.runtime.execution_planner import GRAPH_RETAINED_CACHE
 
@@ -378,25 +381,31 @@ _VALID_LAYER_TYPES = {"linear_attention", "full_attention"}
 # actual declarations, allocator budget, and kernel validity for every candidate.
 # Keep a positive admission bound so public exact requests retain the same SPM
 # checks. Auto has no additional 64/128-row ceiling. Native set_weights binds
-# this same development admission before any forward; its historical name
-# does not imply hardware certification (IMPLEMENTED_UNVERIFIED_HW).
+# this same development admission before any forward. The KV length is bound
+# separately to each installation, including the cache's physical padding.
 _KV_SORT_MAX_ROWS = 4096
-CERTIFIED_CHUNK_ENVELOPE: dict[tuple[int, int], tuple[int, int]] = {
-    (40, 2048): (8192, _KV_SORT_MAX_ROWS // 8),
+# FLASH_ATTN_SPM represents key length in uint16 groups of 16 rows. This is an
+# execution constraint, not a limit on cache allocation.
+_SDPA_MAX_KV_ROWS = 65535 * 16
+PREFILL_CHUNK_CEILING: dict[tuple[int, int], int] = {
+    (40, 2048): _KV_SORT_MAX_ROWS // 8,
 }
 
 
-def _qwen3_5_moe_prefill_envelope(num_layers, hidden_size) -> tuple[int, int]:
+def _qwen3_5_moe_prefill_envelope(
+    num_layers, hidden_size, max_seq_len
+) -> tuple[int, int]:
     key = (int(num_layers), int(hidden_size))
-    env = CERTIFIED_CHUNK_ENVELOPE.get(key)
-    if env is None:
+    max_chunk = PREFILL_CHUNK_CEILING.get(key)
+    if max_chunk is None:
         raise UnsupportedModelError(
             f"Qwen3.5-MoE: no chunk admission for (num_hidden_layers, "
             f"hidden_size)={key}. This profile has never been measured on "
             f"hardware; running it on the auto chunk planner risks busting SPM "
             f"and WEDGING the board. Measure it on a resettable board first."
         )
-    return env
+    physical_capacity = ((max_seq_len + QWEN3_5_TOTAL_PADDING_CAP + 15) // 16) * 16
+    return physical_capacity, max_chunk
 
 
 def _validate_layer_types(config) -> None:
@@ -634,9 +643,9 @@ def install_qwen3_5_moe_text_for_rpu(
     _graph_runtime_policy=None,
 ):
     """Install an admitted exact 35B-A3B text owner transactionally."""
-    if type(max_seq_len) is not int or not 0 < max_seq_len <= 8192:
+    if type(max_seq_len) is not int or max_seq_len <= 0:
         raise ValueError(
-            "Qwen3.5-35B-A3B max_seq_len must be an integer in [1, 8192]"
+            "Qwen3.5-35B-A3B max_seq_len must be a positive integer"
         )
     import rpu_backend as _rb
     import torch
@@ -701,7 +710,8 @@ def install_qwen3_5_moe_text_for_rpu(
             f"{exact_chunk_size}"
         )
     envelope = _qwen3_5_moe_prefill_envelope(
-        _text_config(config).num_hidden_layers, _text_config(config).hidden_size
+        _text_config(config).num_hidden_layers, _text_config(config).hidden_size,
+        max_seq_len,
     )
     if exact_chunk_size and exact_chunk_size > envelope[1]:
         raise UnsupportedModelError(
@@ -1143,11 +1153,9 @@ def _install_qwen3_5_moe_text_for_rpu_impl(
             ).contiguous().to("rpu")
             pending_state.retirement.keepalive += (final_norm,)
         max_admitted_kv, max_chunk = _qwen3_5_moe_prefill_envelope(
-            tc.num_hidden_layers, tc.hidden_size
+            tc.num_hidden_layers, tc.hidden_size, max_seq_len
         )
-        route_table_chunk = min(
-            max_admitted_kv, _KV_SORT_MAX_ROWS // int(tc.num_experts_per_tok)
-        )
+        route_table_chunk = _KV_SORT_MAX_ROWS // int(tc.num_experts_per_tok)
         if route_table_chunk != max_chunk or route_table_chunk != 512:
             raise RuntimeError("Qwen3.5-MoE route-table and planner ceilings diverged")
         expert_ids, token_ids = build_route_tables(
@@ -1243,16 +1251,16 @@ def _preflight_qwen3_5_moe_text(
         )
     real_len = int(real_len)
     envelope = st.chunk_envelope
-    if cache.position + real_len > min(st.max_seq_len, envelope[0]):
+    if cache.position + real_len > st.max_seq_len:
         raise ValueError(
             "Qwen3.5-MoE request exceeds the installed KV/rotary capacity: "
             f"position={cache.position}, input={real_len}, "
-            f"limit={min(st.max_seq_len, envelope[0])}"
+            f"limit={st.max_seq_len}"
         )
-    if real_len > envelope[0]:
+    if cache.position + real_len > _SDPA_MAX_KV_ROWS:
         raise UnsupportedModelError(
-            f"Qwen3.5-MoE {'multimodal' if multimodal_prefill else 'text'} "
-            f"prefill length {real_len} exceeds the declared limit {envelope[0]}"
+            f"Qwen3.5-MoE attention key length exceeds the kernel register "
+            f"capacity {_SDPA_MAX_KV_ROWS}"
         )
     if cache.position + real_len > cache.max_seq_len:
         raise ValueError(
@@ -1269,7 +1277,7 @@ def _preflight_qwen3_5_moe_text(
     plan_box = {}
     pad_len, planned_chunk_size = _plan_prefill_execution(
         real_len,
-        cache.allocated_max_seq_len,
+        min(cache.allocated_max_seq_len, envelope[0], _SDPA_MAX_KV_ROWS),
         st.padding_budget,
         execution_owner=text_model,
         execution_native=("qwen3_5_moe", int(st.handle)),

@@ -120,6 +120,13 @@ def _install_rotary_class_swap(rotary_emb_class) -> None:
 
 def _rotary_table_capacity(rotary, model) -> int:
     """Return the full configured RoPE table length across HF versions."""
+    requested = getattr(model, "_rpu_requested_max_seq_len",
+                        getattr(model, "_rpu_max_seq_len", None))
+    if requested is not None:
+        from numbers import Integral
+        if isinstance(requested, bool) or not isinstance(requested, Integral) or requested <= 0:
+            raise ValueError("max_seq_len must be a positive integer")
+        return int(requested)
     candidates = (
         getattr(rotary, "max_position_embeddings", None),
         getattr(rotary, "max_seq_len_cached", None),
@@ -245,6 +252,7 @@ _CAUSAL_DECODER_INSTALL_ATTRS = (
     "_rpu_prefill_kv_only",
     "_rpu_prefill_execution_alignment",
     "_rpu_kv_cache_layer_bank_size",
+    "_rpu_mrope_capacity",
     "_rpu_execution",
     "_rpu_execution_generation",
     "_rpu_last_execution_plan",
@@ -1543,10 +1551,9 @@ def build_mrope_cos_sin_tables(
     Args:
         text_config: Qwen3VLTextConfig (or anything quack-compatible with
             head_dim / num_attention_heads / hidden_size / rope_parameters).
-        max_seq_len: Defaults to `text_config.max_position_embeddings`.
-            R-Phase 1 sizes the table to match the runtime keepalive
-            (QWEN3_MROPE_MAX_KEEPALIVE_SEQ = 8192). Larger values are safe
-            but waste DDR.
+        max_seq_len: Position-table horizon; defaults to
+            `text_config.max_position_embeddings`. Multimodal position IDs may
+            exceed the number of tokens stored in the KV cache.
         device: target device (default "rpu").
         dtype: target dtype (default torch.float16 — matches the kernel
             register format).
@@ -1580,6 +1587,10 @@ def build_mrope_cos_sin_tables(
 
     if max_seq_len is None:
         max_seq_len = int(getattr(text_config, "max_position_embeddings", 8192))
+    from numbers import Integral
+    if isinstance(max_seq_len, bool) or not isinstance(max_seq_len, Integral) or max_seq_len <= 0:
+        raise ValueError("max_seq_len must be a positive integer")
+    max_seq_len = int(max_seq_len)
 
     half = head_dim // 2
     inv_freq = 1.0 / (
@@ -1790,8 +1801,9 @@ def install_mrope_text_decoder_for_rpu(
     Args:
         text_model: Qwen3VLTextModel instance (already moved to device).
         text_config: optional; defaults to `text_model.config`.
-        max_seq_len: cos/sin table length; defaults to
-            text_config.max_position_embeddings.
+        max_seq_len: Installed KV/position-buffer capacity (default 8192).
+            The cos/sin horizon also preserves text_config.max_position_embeddings
+            so spatial position IDs are not truncated by a smaller token cache.
         vision_config: optional; used only to infer the number of leading text
             layers that receive DeepStack when `deepstack_lang_layers` is None.
             Pass `model.config.vision_config` for end-to-end Qwen3-VL flows.
@@ -1866,8 +1878,15 @@ def install_mrope_text_decoder_for_rpu(
     )
     mrope_section = [int(x) for x in mrope_section]
     ds_layers = [int(x) for x in ds_layers]
+    from numbers import Integral
+    if max_seq_len is None:
+        max_seq_len = getattr(text_model, "_rpu_max_seq_len", 8192)
+    if isinstance(max_seq_len, bool) or not isinstance(max_seq_len, Integral) or max_seq_len <= 0:
+        raise ValueError("max_seq_len must be a positive integer")
+    kv_capacity = int(max_seq_len)
+    position_horizon = max(kv_capacity, int(getattr(cfg, "max_position_embeddings", 8192)))
     cos, sin = build_mrope_cos_sin_tables(
-        cfg, max_seq_len=max_seq_len, device="rpu", dtype=torch.float16,
+        cfg, max_seq_len=position_horizon, device="rpu", dtype=torch.float16,
     )
 
     # Capture the text decoder under its cold topology and cache capacity.
@@ -1888,6 +1907,7 @@ def install_mrope_text_decoder_for_rpu(
         "_rpu_text_num_layers": text_num_layers,
         "_rpu_text_hidden_size": text_hidden_size,
         "_rpu_text_deepstack_hash": _ds_hash,
+        "_rpu_mrope_capacity": kv_capacity,
     }
     model_vars = vars(text_model)
     snapshot = {
@@ -1906,6 +1926,7 @@ def install_mrope_text_decoder_for_rpu(
             arch=arch,
             mrope_section=mrope_section,
             cos_sin=(cos, sin),
+            _kv_capacity=kv_capacity,
             deepstack_lang_layers=ds_layers,
             scale_lists=scale_lists,
             chunk_envelope_for=chunk_envelope_for,
@@ -2003,6 +2024,7 @@ def _install_causal_decoder_forward(
     qk_norm_lists=None,
     mrope_section=None,
     cos_sin=None,
+    _kv_capacity=None,
     deepstack_lang_layers=None,
     scale_lists=None,
     chunk_envelope_for,
@@ -2261,7 +2283,10 @@ def _install_causal_decoder_forward(
 
         cos_cached = getattr(rotary, "cos_cached", None)
         sin_cached = getattr(rotary, "sin_cached", None)
-        if cos_cached is None or sin_cached is None:
+        max_pos = _rotary_table_capacity(rotary, model)
+        if (cos_cached is None or sin_cached is None
+                or cos_cached.shape[-2] != max_pos
+                or sin_cached.shape[-2] != max_pos):
             device = next(model.parameters()).device
             # Newer HF Qwen3 rotary modules expose max_seq_len_cached/config,
             # not max_position_embeddings directly. Falling back to 4096 here
@@ -2269,7 +2294,6 @@ def _install_causal_decoder_forward(
             # was correct, then decode position 4096 read past the table and
             # produced a confidently wrong token. Read every supported spelling
             # and keep the largest authoritative capacity.
-            max_pos = _rotary_table_capacity(rotary, model)
             dummy = torch.zeros(1, 1, hidden_size, dtype=torch.float16, device=device)
             dummy_pos = torch.arange(max_pos, device=device).unsqueeze(0)
             cos_cached, sin_cached = rotary(dummy, dummy_pos)
@@ -2551,6 +2575,14 @@ def _install_causal_decoder_forward(
     # live until every Python assignment succeeds. Publication or old-handle
     # retirement failure restores the snapshot. An unsafe retirement retains
     # the pending handle too: no more native work is allowed in that process.
+    # Bind actual installed storage separately from the per-model chunk/SPM
+    # ceiling. M-RoPE allocates its stable position/DeepStack buffers in
+    # set_weights, so declare this capacity before installing weights. Its
+    # rotary-table horizon can be larger than the token capacity.
+    from rpu_backend.runtime.chunk_envelope import ChunkEnvelope
+    _envelope = ChunkEnvelope(*chunk_envelope_for(
+        arch, decoder_num_layers, decoder_hidden_size)).bind_capacity(
+            int(cos_cached.size(0)) if _kv_capacity is None else _kv_capacity)
     handle = torch.ops.rpu.causal_decoder_create(
         rpu_env_bool("RPU_QWEN3_SPM_KV_BY_MHA", default=True),
         rpu_env_bool("RPU_ADARMS_FUSED_BCAST"),
@@ -2564,6 +2596,8 @@ def _install_causal_decoder_forward(
         handle_name="_rpu_decoder_handle")
     handle_finalizer = resource.finalizer
     try:
+        torch.ops.rpu.causal_decoder_set_chunk_envelope(
+            handle, _envelope.max_kv_len, _envelope.chunk)
         set_weights_op(handle, *set_weights_args)
         if folded_rmsnorm or prefill_kv_only:
             torch.ops.rpu.causal_decoder_set_lingbot_prefill_mode(
@@ -2578,19 +2612,6 @@ def _install_causal_decoder_forward(
                 raise RuntimeError(
                     "native decoder topology differs from the bound weight/cache layout: "
                     f"actual={native_topology}, expected={topology.identity()[1:]}")
-        # MR-A: declare the certified chunk envelope BEFORE the first forward.
-        # Deny-by-default — the C++ planner refuses to prefill an undeclared
-        # handle, because the auto search can otherwise pick a chunk above the
-        # model's true SPM ceiling and WEDGE the board.
-        #
-        # The TABLE is not here: DAG-03 forbids arch tokens in runtime/, and it is
-        # real arch coupling (scripts/check_import_graph_v5.py:61 rejected an
-        # earlier draft that put it in runtime/chunk_envelope.py). The caller hands
-        # us the lookup; we own only the geometry, which we already derived above.
-        _envelope = chunk_envelope_for(
-            arch, decoder_num_layers, decoder_hidden_size)
-        torch.ops.rpu.causal_decoder_set_chunk_envelope(
-            handle, int(_envelope[0]), int(_envelope[1]))
 
         _prefill_cfg = execution_config.get("prefill", {})
         if arch == "qwen3":

@@ -72,6 +72,7 @@ struct Model {
     bool linear_acc32_ = false;
     bool generic = true, mixed_precision_ = false, per_window_sdpa_enabled_ = false, z1_bound_ = false;
     int64_t layers = 32, hidden = 1280, heads = 16, dim = 80, intermediate = 3584;
+    int64_t max_keepalive_seq_ = 4096;
     int64_t image_batch_count_ = 3, current_num_patches_ = 768, valid_patches_per_image_ = 0;
     bool window_mask_present_ = true;
     uint32_t small_rmsnorm_capability_ = RPU_RMSNORM_CAP_BASE;

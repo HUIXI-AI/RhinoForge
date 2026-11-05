@@ -47,10 +47,8 @@ using namespace ::rhino_lkn;
 #define NUM_CORES 8
 #define DWIDTH 2
 
-// Position-table keepalive cap. ViT-B/16 224×224 → 196 patches; ViT-L/16
-// same. 4096 covers up to 64×64 grid (1024×1024 image) — far beyond the
-// 224×224 first-port profile.
-constexpr int64_t DINOV3_VISION_MAX_KEEPALIVE_SEQ = 4096;
+// FLASH_ATTN_SPM encodes K/V length in uint16 groups of 16 rows.
+constexpr int64_t DINOV3_SDPA_MAX_KV_ROWS = int64_t{UINT16_MAX} * 16;
 
 // Number of leading special tokens (CLS + register tokens) at the start of
 // every DINOv3 sequence. Layer enforces num_register_tokens == 4 in the
@@ -59,6 +57,13 @@ constexpr int64_t DINOV3_VISION_MAX_KEEPALIVE_SEQ = 4096;
 // unchanged. If a future profile relaxes the register-token count, this
 // constant becomes a config-driven int64_t.
 constexpr int64_t DINOV3_VISION_NUM_SPECIAL_TOKENS = 5;
+
+bool dinov3_execution_length_valid(int64_t tokens, bool identity_rope) {
+    // 2D-RoPE encodes its complete patch count in one uint16 register.
+    return tokens > DINOV3_VISION_NUM_SPECIAL_TOKENS &&
+        tokens <= DINOV3_SDPA_MAX_KV_ROWS &&
+        (identity_rope || tokens - DINOV3_VISION_NUM_SPECIAL_TOKENS <= UINT16_MAX);
+}
 
 // Stable physical-route identities. The remaining launchers implement fixed
 // DINO block math, debug export, or unconditional BufferDecl dataflow.
@@ -134,6 +139,22 @@ public:
 
     DINOv3VisionModel() = default;
 
+    void set_cache_envelope(int64_t capacity, int64_t chunk) {
+        TORCH_CHECK(capacity > DINOV3_VISION_NUM_SPECIAL_TOKENS,
+                    "DINO Vision capacity must include patches and special tokens");
+        const int64_t patches = capacity - DINOV3_VISION_NUM_SPECIAL_TOKENS;
+        TORCH_CHECK(!position_idx_keepalive_.defined() ||
+                        position_idx_keepalive_.size(0) == patches,
+                    "DINO Vision capacity changes require a fresh owner");
+        auto positions = position_idx_keepalive_;
+        if (!positions.defined()) {
+            positions = at::zeros({patches, 2},
+                at::TensorOptions().dtype(at::kShort).device(at::kPrivateUse1));
+        }
+        set_chunk_envelope(capacity, chunk);
+        position_idx_keepalive_ = std::move(positions);
+    }
+
     int64_t resolve_vision_chunk_size(int64_t num_tokens) {
         return resolve_chunk_size_for_shape(
             num_tokens, /*position=*/0, std::nullopt, /*is_causal=*/false);
@@ -143,9 +164,8 @@ public:
         TORCH_CHECK(num_layers() > 0 && has_rope_,
                     "RPU_PLANNER_REJECT:CAPABILITY: DINO Vision weights/RoPE "
                     "are not initialized");
-        TORCH_CHECK(num_tokens > DINOV3_VISION_NUM_SPECIAL_TOKENS &&
-                        num_tokens <= DINOV3_VISION_MAX_KEEPALIVE_SEQ +
-                            DINOV3_VISION_NUM_SPECIAL_TOKENS,
+        TORCH_CHECK(dinov3_execution_length_valid(num_tokens, identity_rope_) &&
+                        num_tokens <= chunk_envelope().max_kv_len,
                     "RPU_PLANNER_REJECT:CAPABILITY: invalid DINO Vision "
                     "token count ", num_tokens);
         const std::vector<ChunkInfo> input_chunks{
@@ -304,7 +324,7 @@ public:
     // indexes the SAME table by both row_idx and col_idx (DINOv3 normalized
     // patch centers map symmetrically across H/W). 256B alignment required —
     // the Python adapter must pad alloc if natural size doesn't align.
-    // Lazy-allocs `position_idx_keepalive_` once on first call.
+    // The cold cache-envelope setter owns the stable position allocation.
     // ========================================================================
     void set_rope_tables(const at::Tensor& freq_cos, const at::Tensor& freq_sin)
     {
@@ -315,6 +335,8 @@ public:
                     freq_cos.dim(), "/", freq_sin.dim(), "D");
         TORCH_CHECK(freq_cos.sizes() == freq_sin.sizes(),
                     "dinov3_vision_set_rope: freq_cos / freq_sin shape mismatch");
+        TORCH_CHECK(freq_cos.size(0) > 0 && freq_cos.size(0) <= int64_t{INT16_MAX} + 1,
+                    "dinov3_vision_set_rope: table rows must fit nonnegative int16 positions");
         TORCH_CHECK(freq_cos.scalar_type() == at::kHalf
                     && freq_sin.scalar_type() == at::kHalf,
                     "dinov3_vision_set_rope: freq_cos / freq_sin must be fp16");
@@ -328,19 +350,13 @@ public:
         freq_sin_ = freq_sin;
         max_hw_ = freq_cos.size(0);
 
-        // Lazy-alloc on first call; reuse afterwards (sizes never change).
-        if (!position_idx_keepalive_.defined()) {
-            position_idx_keepalive_ = at::empty(
-                {DINOV3_VISION_MAX_KEEPALIVE_SEQ, 2},
-                at::TensorOptions().dtype(at::kShort).device(at::kPrivateUse1));
-            position_idx_keepalive_.zero_();
-        }
-
         has_rope_ = true;
         invalidate_model_state();
     }
 
-    int64_t max_keepalive_seq() const { return DINOV3_VISION_MAX_KEEPALIVE_SEQ; }
+    int64_t max_keepalive_seq() const {
+        return position_idx_keepalive_.defined() ? position_idx_keepalive_.size(0) : 0;
+    }
 
     // Expose the keepalive base for adapter-side per-forward `.copy_()`.
     at::Tensor& position_idx_keepalive() { return position_idx_keepalive_; }
@@ -426,13 +442,11 @@ public:
         TORCH_CHECK(input.size(1) == num_tokens_in,
                     "DINOv3VisionModel::forward: input.size(1)=", input.size(1),
                     " must match num_tokens=", num_tokens_in);
-        TORCH_CHECK(num_tokens_in > DINOV3_VISION_NUM_SPECIAL_TOKENS
-                    && num_tokens_in <= DINOV3_VISION_MAX_KEEPALIVE_SEQ
-                                        + DINOV3_VISION_NUM_SPECIAL_TOKENS,
+        TORCH_CHECK(dinov3_execution_length_valid(num_tokens_in, identity_rope_)
+                    && position_idx_keepalive_.defined()
+                    && num_tokens_in <= chunk_envelope().max_kv_len,
                     "DINOv3VisionModel::forward: num_tokens=", num_tokens_in,
-                    " must lie in (", DINOV3_VISION_NUM_SPECIAL_TOKENS, ", ",
-                    DINOV3_VISION_MAX_KEEPALIVE_SEQ
-                      + DINOV3_VISION_NUM_SPECIAL_TOKENS, "]");
+                    " must fit the installed capacity and attention/RoPE register domains");
 
         // Flush per-forward position_idx keepalive. Python adapter just wrote
         // [num_patches, 2] int16 (row, col) into the keepalive base; without
@@ -581,7 +595,8 @@ protected:
         int64_t /*position*/) const override {
         // Filter the candidate domain before dynamic_config/manifest building;
         // invalid small candidates must not abort AUTO or a later exact match.
-        return chunk_size >= seq_len;
+        return dinov3_execution_length_valid(seq_len, identity_rope_) &&
+            seq_len <= chunk_envelope().max_kv_len && chunk_size >= seq_len;
     }
 
     ModelDynamicConfig dynamic_config(const ChunkPlan& plan) override {
@@ -1852,8 +1867,7 @@ at::Tensor rpu_dinov3_vision_position_idx_keepalive(int64_t handle) {
 
 void rpu_dinov3_vision_set_chunk_envelope(int64_t handle, int64_t max_kv_len, int64_t chunk) {
     DINOv3VisionRegistry::get(handle, "rpu_dinov3_vision_set_chunk_envelope")
-        ->set_chunk_envelope(std::min(max_kv_len,
-            DINOV3_VISION_MAX_KEEPALIVE_SEQ + DINOV3_VISION_NUM_SPECIAL_TOKENS), chunk);
+        ->set_cache_envelope(max_kv_len, chunk);
 }
 
 void rpu_dinov3_vision_set_chunk_size(int64_t handle, int64_t chunk_size) {

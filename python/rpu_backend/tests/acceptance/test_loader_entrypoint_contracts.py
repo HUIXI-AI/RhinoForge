@@ -109,7 +109,8 @@ def test_conditional_exact_32b_w8_rejects_unsupported_loader_kwargs(monkeypatch,
     with pytest.raises(ValueError, match=key):
         conditional_generation.RPUModelForConditionalGeneration.from_pretrained('unused/path', **loader_kwarg)
 
-def test_conditional_exact_32b_w8_stages_metadata_before_adapter_owns_rpu(monkeypatch):
+@pytest.mark.parametrize('capacity', [None, 16384, 32768])
+def test_conditional_exact_32b_w8_stages_metadata_before_adapter_owns_rpu(monkeypatch, capacity):
     events = []
     config = _qwen3_vl_32b_w8_config()
 
@@ -129,6 +130,7 @@ def test_conditional_exact_32b_w8_stages_metadata_before_adapter_owns_rpu(monkey
 
         def __init__(self, seen_model):
             assert seen_model is model
+            assert getattr(model, '_rpu_requested_max_seq_len', None) == capacity
             events.append('adapter-init')
 
         def to_rpu(self):
@@ -144,7 +146,7 @@ def test_conditional_exact_32b_w8_stages_metadata_before_adapter_owns_rpu(monkey
     monkeypatch.setattr(conditional_generation.AutoConfig, 'from_pretrained', lambda *_args, **_kwargs: events.append('config') or config)
     monkeypatch.setattr(conditional_generation, 'get_adapter', lambda _arch: events.append('adapter-lookup') or Adapter)
     monkeypatch.setattr(w8a16_load, 'stage_w8a16_imagetext_for_rpu', staged_loader)
-    result = conditional_generation.RPUModelForConditionalGeneration.from_pretrained('unused/path', device='rpu', revision='weights-rev', subfolder='weights', local_files_only=True)
+    result = conditional_generation.RPUModelForConditionalGeneration.from_pretrained('unused/path', device='rpu', revision='weights-rev', subfolder='weights', max_seq_len=capacity, local_files_only=True)
     assert result == 'rpu-model'
     assert events == ['config', 'adapter-lookup', 'preflight', 'metadata-stage', 'eval', 'adapter-init', 'adapter-to-rpu']
 

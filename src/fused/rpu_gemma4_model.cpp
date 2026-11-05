@@ -41,6 +41,15 @@ using namespace ::rhino_lkn;
 namespace v3 {
 
 namespace {
+void validate_gemma4_kv_span(int64_t length, int64_t position) {
+    // FLASH_ATTN_SPM encodes total K/V rows in uint16 groups of 16.
+    constexpr int64_t max_rows = int64_t{UINT16_MAX} * 16;
+    TORCH_CHECK(length > 0 && position >= 0 && length <= max_rows &&
+                    position <= max_rows - length,
+                "RPU_PLANNER_REJECT:CAPABILITY: Gemma4 KV span exceeds "
+                "the attention register domain");
+}
+
 // GEMMA4_FIXED_KERNEL_BASIS: RMSNorm and elementwise GELU/mul/add/sub/scalar
 // launchers implement the E4B checkpoint's exact math and have no selector.
 // Persistent norm-weight preload DMA is fixed by BufferDecl ownership. Only
@@ -288,6 +297,7 @@ public:
     std::vector<int64_t> resolve_stage_domain(
         int64_t execution_len, int64_t planning_position,
         int64_t max_kv_len, int64_t requested_chunk_size) {
+        validate_gemma4_kv_span(execution_len, planning_position);
         detail::validate_fmb_planning_shape(
             execution_len, planning_position, "Gemma4 planner");
         TORCH_CHECK(
@@ -356,6 +366,13 @@ public:
         TORCH_CHECK(position >= 0, "Gemma4Model::forward: position must be >= 0");
 
         const int64_t request_seq_len = hidden_states.size(1);
+        validate_gemma4_kv_span(request_seq_len, position);
+        TORCH_CHECK(cos_sliding_.defined() && cos_global_.defined() &&
+                        request_seq_len <= cos_sliding_.size(0) &&
+                        position <= cos_sliding_.size(0) - request_seq_len &&
+                        request_seq_len <= cos_global_.size(0) &&
+                        position <= cos_global_.size(0) - request_seq_len,
+                    "Gemma4Model::forward exceeds the installed rotary capacity");
         detail::validate_fmb_planning_shape(
             request_seq_len, position, "Gemma4Model::forward");
         TORCH_CHECK(

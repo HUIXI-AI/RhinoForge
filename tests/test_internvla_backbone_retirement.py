@@ -76,7 +76,7 @@ def test_cold_prefill_and_forward_share_original_planner(native, monkeypatch, le
     monkeypatch.setattr(torch.ops.rpu, "causal_decoder_resolve_prefill_stage_domain", resolve, raising=False)
     def bounded(logical, limit, budget, **kwargs):
         execution, chunk, padding, expected_budget = expected
-        assert (logical, limit, budget) == (length, 1936, expected_budget)
+        assert (logical, limit, budget) == (length, model.cache.max_seq_len, expected_budget)
         assert kwargs["execution_owner"] is model
         assert kwargs["execution_native"] == ("causal_decoder", 41)
         assert (kwargs["execution_component"], kwargs["execution_stage"], kwargs["graph_mode"]) == (

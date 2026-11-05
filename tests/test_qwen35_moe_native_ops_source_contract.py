@@ -248,8 +248,8 @@ def test_installed_native_owner_binds_its_prefill_admission_before_weights():
     assert install.index("cos/sin shapes must match") < bind
     assert install.index("same max_chunk as expert_ids") < bind
     assert bind < install.index("layer_is_full_.assign(")
-    assert "/*max_kv_len=*/8192" in install
-    assert "std::min<int64_t>(8192, cos.size(0))" not in install
+    assert "physical_kv_capacity," in install
+    assert "cos.size(0) + total_padding + 15" in install
     assert "std::min<int64_t>(4096 / top_k, expert_ids.size(0))" in install
     assert install.index("invalidate_model_state();") > bind
     valid = native.split("bool Qwen3_5MoeModel::subclass_chunk_size_valid(", 1)[1]

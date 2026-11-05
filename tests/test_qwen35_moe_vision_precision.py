@@ -133,6 +133,7 @@ def test_moe_installer_binds_both_controls_before_weight_conversion(monkeypatch,
         ("set_linear_acc32", lambda *_: pytest.fail("MoE used coupled dense setter")),
         ("set_gelu_erf_ultra", lambda *_: pytest.fail("MoE used coupled dense setter")),
         ("set_chunk_size_cap", lambda *_: None),
+        ("set_cache_capacity", lambda *_: None),
         ("set_prefill_chunk_size", lambda *_: None),
         ("resolve_prefill_domain", lambda *_: None),
     ):

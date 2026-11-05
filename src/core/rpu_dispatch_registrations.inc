@@ -1442,6 +1442,7 @@ TORCH_LIBRARY(rpu, m) {
   // has no deepstack_visual_indexes arg.
   m.def("qwen3_5_vision_create", TORCH_FN(rpu_qwen3_5_vision_create));
   m.def("qwen3_5_vision_set_execution_cores", TORCH_FN(rpu_qwen3_5_vision_set_execution_cores));
+  m.def("qwen3_5_vision_set_cache_capacity", TORCH_FN(rpu_qwen3_5_vision_set_cache_capacity));
   m.def("qwen3_5_vision_get_execution_topology", TORCH_FN(rpu_qwen3_5_vision_get_execution_topology));
   m.def("qwen3_5_vision_k1_b3_available", TORCH_FN(rpu_qwen3_5_vision_k1_b3_available));
   m.def("qwen3_5_vision_k1_camera_group_available", TORCH_FN(rpu_qwen3_5_vision_k1_camera_group_available));

@@ -75,7 +75,7 @@ from rpu_backend.runtime.chunk_envelope import ChunkEnvelope, make_lookup
 
 # Explicit chunk bounds for the supported Llama-3.2-1B configuration.
 _CHUNK_ENVELOPE = {
-    ("llama", 16, 2048): ChunkEnvelope(64, 64),      # Llama-3.2-1B
+    ("llama", 16, 2048): ChunkEnvelope(0, 64),      # Llama-3.2-1B
 }
 lookup_causal_decoder = make_lookup(
     _CHUNK_ENVELOPE, "rpu_backend/adapters/llama.py::_CHUNK_ENVELOPE")
@@ -174,8 +174,7 @@ class LlamaAdapter:
         if requested > env.chunk:
             raise UnsupportedModelError(
                 f"Llama prefill chunk_size={requested} exceeds this profile's "
-                f"certified ceiling {env.chunk}; max certified KV length is "
-                f"{env.max_kv_len}. Refusing before loading model weights."
+                f"chunk ceiling {env.chunk}. Refusing before loading model weights."
             )
 
     def __init__(self, model: nn.Module) -> None:

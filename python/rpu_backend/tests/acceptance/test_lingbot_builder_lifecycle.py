@@ -146,12 +146,12 @@ def test_decoder_builders_apply_certified_exact_envelopes(decoder_ops):
     weight = torch.zeros(2, 2)
     (vlm, _) = runtime._build_vlm_decoder(lambda key: weight, 256, 80)
     (expert, _) = runtime._build_expert(lambda key: weight, 256, 64)
-    assert decoder_ops['events'] == [('create', vlm), ('set', vlm), ('envelope', vlm, 178, 176), ('chunk', vlm, 80), ('create', expert), ('mask_residency', expert, True), ('set', expert), ('envelope', expert, 256, 64), ('chunk', expert, 64)]
+    assert decoder_ops['events'] == [('create', vlm), ('set', vlm), ('envelope', vlm, 256, 176), ('chunk', vlm, 80), ('create', expert), ('mask_residency', expert, True), ('set', expert), ('envelope', expert, 256, 64), ('chunk', expert, 64)]
 
 def test_vlm_auto_keeps_certified_capability_for_later_exact_requests(decoder_ops):
     weight = torch.zeros(2, 2)
     (vlm, _) = runtime._build_vlm_decoder(lambda key: weight, 256, 0)
-    assert decoder_ops['events'] == [('create', vlm), ('set', vlm), ('envelope', vlm, 178, 176), ('chunk', vlm, 0)]
+    assert decoder_ops['events'] == [('create', vlm), ('set', vlm), ('envelope', vlm, 256, 176), ('chunk', vlm, 0)]
 
 def test_fused_denoise_configuration_base_exception_destroys_handle(monkeypatch):
 
@@ -499,11 +499,12 @@ def test_prefill_dry_plan_rejects_uncertified_values_before_graph_mutation(monke
     owner._prefill_chunk_size = 80
     with pytest.raises(ValueError, match='requested=80.*ceil16.*64'):
         owner._plan_prefill_execution(64)
-    with pytest.raises(ValueError, match='only through.*178.*179'):
-        owner._plan_prefill_execution(179)
     monkeypatch.setattr(torch.ops.rpu, 'causal_decoder_resolve_prefill_stage_domain', lambda handle, seq, position, is_causal, mask_kv_len, rope_mode, graph_lifecycle, logical_len: (StageTuple(96 if seq == 81 else 80, 96 if seq == 81 else 80, 96 if seq == 81 else 80, physical_descriptor=(1, seq, position)),), raising=False)
     assert owner._plan_prefill_execution(65).selected.stage_tuple.compute_chunk == 80
     assert owner._plan_prefill_execution(80).selected.stage_tuple.compute_chunk == 80
+    assert owner._plan_prefill_execution(179).selected.stage_tuple.compute_chunk == 80
+    with pytest.raises(ValueError):
+        owner._plan_prefill_execution(206)
     with pytest.raises(ValueError, match='no certified native plan.*81'):
         owner._plan_prefill_execution(81)
     owner._prefill_chunk_size = 0

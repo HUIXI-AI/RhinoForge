@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <typeinfo>
 #include <vector>
 #include <algorithm>
@@ -398,8 +399,6 @@ inline int resolve_causal_decoder_lm_head_tp(int core_count, int64_t vocab_size)
     // bound even when the optional fused weight is absent or later cleared.
     return core_count == 8 ? 8 : 4;
 }
-
-inline constexpr int64_t QWEN3_MROPE_MAX_KEEPALIVE_SEQ = 8192;
 
 // =============================================================================
 // CausalDecoderModel — v3::FusedModelBase subclass (Qwen3 + Llama; future Phi/Mistral)
@@ -1739,7 +1738,7 @@ public:
         //   cos/sin) and compute strobe masks + allocate position_ids keepalive.
         // ─────────────────────────────────────────────────────────────────────
         const bool has_mrope = (mrope_section.size() > 0);
-        ka_cpu_pos_published_rows_.fill(0);
+        std::fill(ka_cpu_pos_published_rows_.begin(), ka_cpu_pos_published_rows_.end(), 0);
         if (has_mrope) {
             // C1: mrope_section must be exactly 3 axes (T, H, W), all non-negative,
             // sum == head_dim/2 (rotary half-dim).
@@ -1768,40 +1767,46 @@ public:
             mrope_strobe_masks_ = rpu_compute_mrope_strobe_masks(
                 mrope_section_, static_cast<int32_t>(head_dim));
 
-            // Lazy-allocate keepalive on device. Stable across forwards;
+            TORCH_CHECK(cos.dim() == 2 && cos.size(0) > 0 && sin.sizes() == cos.sizes(),
+                        "causal_decoder_set_weights: M-RoPE requires matching positive table capacity");
+            // KV rows and T/H/W table indices have different horizons. Bind
+            // storage before weights when the table also covers larger image
+            // coordinates; component callers may use the table-sized default.
+            const int64_t mrope_capacity = chunk_envelope().declared()
+                ? chunk_envelope().max_kv_len : cos.size(0);
+            TORCH_CHECK(mrope_capacity > 0 && mrope_capacity <= cos.size(0) &&
+                            mrope_capacity <= std::numeric_limits<int64_t>::max() - 8,
+                        "causal_decoder_set_weights: M-RoPE storage capacity exceeds table or allocation bounds");
+            ka_cpu_pos_published_rows_.assign(mrope_capacity, 0);
+            // Cold allocation only. Stable across forwards;
             // forward() copies per-forward [seq_len, 3] position_ids into the
             // appropriate row range at index `ctx().position`.
-            if (qwen3vl_4b_decode_qk_fused_ || qwen3vl_4b_decode_qk_kv_fused_) {
-                // The fused leaf keeps original M-RoPE's 32B position load.
-                // Initialize backing for its final-row overfetch, while the
-                // public/forward logical capacity and shape remain unchanged.
-                auto backing = at::zeros(
-                    {QWEN3_MROPE_MAX_KEEPALIVE_SEQ + 8, 3},
-                    at::TensorOptions().dtype(at::kInt).device(at::kPrivateUse1));
-                position_ids_keepalive_ = backing.narrow(
-                    0, 0, QWEN3_MROPE_MAX_KEEPALIVE_SEQ);
-            } else if (!position_ids_keepalive_.defined()
-                || position_ids_keepalive_.size(0) != QWEN3_MROPE_MAX_KEEPALIVE_SEQ
+            if (!position_ids_keepalive_.defined()
+                || position_ids_keepalive_.size(0) != mrope_capacity
                 || position_ids_keepalive_.size(1) != 3
                 || position_ids_keepalive_.device().type() != at::kPrivateUse1) {
-                position_ids_keepalive_ = at::zeros(
-                    {QWEN3_MROPE_MAX_KEEPALIVE_SEQ, 3},
+                // Both original and fused M-RoPE load 32B of THW positions.
+                // Keep initialized overfetch backing beyond the logical view.
+                auto backing = at::zeros(
+                    {mrope_capacity + 8, 3},
                     at::TensorOptions().dtype(at::kInt).device(at::kPrivateUse1));
+                position_ids_keepalive_ = backing.narrow(
+                    0, 0, mrope_capacity);
             } else {
                 position_ids_keepalive_.zero_();
             }
 
-            // partial_mrope keepalives [MAX_KEEPALIVE_SEQ, head_dim/2] fp16 —
+            // partial_mrope keepalives [installed_capacity, head_dim/2] fp16 —
             // populated per-forward only when the adapter supplies interleaved
             // cos/sin; idle (allocated, never written) for the legacy mrope path.
             const int64_t half = head_dim / 2;
             if (!cos_il_keepalive_.defined()
-                || cos_il_keepalive_.size(0) != QWEN3_MROPE_MAX_KEEPALIVE_SEQ
+                || cos_il_keepalive_.size(0) != mrope_capacity
                 || cos_il_keepalive_.size(1) != half
                 || cos_il_keepalive_.device().type() != at::kPrivateUse1) {
                 auto il_opts = at::TensorOptions().dtype(at::kHalf).device(at::kPrivateUse1);
-                cos_il_keepalive_ = at::zeros({QWEN3_MROPE_MAX_KEEPALIVE_SEQ, half}, il_opts);
-                sin_il_keepalive_ = at::zeros({QWEN3_MROPE_MAX_KEEPALIVE_SEQ, half}, il_opts);
+                cos_il_keepalive_ = at::zeros({mrope_capacity, half}, il_opts);
+                sin_il_keepalive_ = at::zeros({mrope_capacity, half}, il_opts);
             }
             // This block (re)allocated and/or zeroed the keepalives. Retained
             // source stamps must therefore never suppress the next refill.
@@ -1822,6 +1827,7 @@ public:
             mrope_section_.clear();
             mrope_strobe_masks_ = {};
             position_ids_keepalive_ = at::Tensor{};
+            ka_cpu_pos_published_rows_.clear();
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -2477,14 +2483,18 @@ public:
                 ((hidden_states.size(1) == 576 && position == 0) ||
                  (hidden_states.size(1) == 1 && position >= 576 && position <= 579)),
                 "fixed Qwen3-VL delivery admits only P576 and four decode positions 576..579");
-            const std::vector<int64_t> expected_cache_shape{1, 38, 1, 8, 8, 16, 16};
             TORCH_CHECK(k_caches.size() == 28 && v_caches.size() == 28,
                         "fixed delivery requires 28 paired KV caches");
+            TORCH_CHECK(k_caches.front().defined() && k_caches.front().dim() == 7 &&
+                            k_caches.front().size(1) > 0,
+                        "fixed delivery requires positive actual KV capacity");
+            const std::vector<int64_t> expected_cache_shape{
+                1, k_caches.front().size(1), 1, 8, 8, 16, 16};
             for (size_t layer = 0; layer < k_caches.size(); ++layer) {
                 TORCH_CHECK(k_caches[layer].defined() && v_caches[layer].defined() &&
                     k_caches[layer].sizes().vec() == expected_cache_shape &&
                     v_caches[layer].sizes().vec() == expected_cache_shape,
-                    "fixed delivery requires actual paired KV capacity 608 and exact geometry");
+                    "fixed delivery requires matching paired KV capacities and exact geometry");
             }
         }
 
@@ -2516,6 +2526,9 @@ public:
         }
         detail::validate_fmb_planning_shape(
             seq_len_in, position, "CausalDecoderModel::forward");
+        TORCH_CHECK(seq_len_in <= int64_t{UINT16_MAX} * 16 &&
+                        position <= int64_t{UINT16_MAX} * 16 - seq_len_in,
+                    "CausalDecoderModel::forward: attention key length exceeds uint16-v16 registers");
 
         if (num_cores() != 8) {
             if (attention_mask.has_value()) {
@@ -2656,7 +2669,7 @@ public:
         //
         // Contract:
         //   1. set_weights allocated position_ids_keepalive_ at
-        //      [MAX_KEEPALIVE_SEQ, 3] int32 device DDR (stable across forwards).
+        //      [installed_capacity, 3] int32 device DDR (stable across forwards).
         //   2. Caller passes per-forward position_ids [seq_len, 3] int32 device;
         //      we copy it into the keepalive at row `ctx().position` and flush.
         //   3. build_layer_subgraph dispatches rpu_launch_mrope_spm_kernel with
@@ -2734,14 +2747,13 @@ public:
             TORCH_CHECK(pos.device().is_cpu() || pos.device().type() == at::kPrivateUse1,
                         "CausalDecoderModel::forward: position_ids must be on CPU or device device, got ",
                         pos.device());
-            TORCH_CHECK(position + seq_len_in <= QWEN3_MROPE_MAX_KEEPALIVE_SEQ,
-                        "CausalDecoderModel::forward: position+seq_len (",
-                        position, "+", seq_len_in, ") exceeds keepalive capacity (",
-                        QWEN3_MROPE_MAX_KEEPALIVE_SEQ,
-                        "). Bump QWEN3_MROPE_MAX_KEEPALIVE_SEQ in rpu_qwen3_model.cpp.");
             TORCH_CHECK(position_ids_keepalive_.defined(),
                         "CausalDecoderModel::forward: position_ids_keepalive_ undefined "
                         "(set_weights with non-empty mrope_section must precede forward).");
+            TORCH_CHECK(seq_len_in > 0 && position >= 0 &&
+                            seq_len_in <= position_ids_keepalive_.size(0) &&
+                            position <= position_ids_keepalive_.size(0) - seq_len_in,
+                        "CausalDecoderModel::forward: position+seq_len exceeds installed M-RoPE keepalive capacity");
             // Cache non-overlapping keepalive segments, not merely the previous
             // call. A sequential service revisits decode positions after every
             // request; retaining those tiny source tensors avoids three device
@@ -5839,6 +5851,7 @@ protected:
     // by definition any cs we approve here will not be rejected downstream.
     // ═══════════════════════════════════════════════════════════════════════
     bool subclass_chunk_size_valid(int64_t cs, int64_t seq_len, int64_t position) const override {
+        if (cs <= 0 || cs > UINT16_MAX) return false;
         // The explicit-mask implementation prepares one rectangular mask for
         // the whole query. Multi-chunk candidates are not part of its domain.
         if (ctx().attention_mask.has_value() && cs < seq_len) return false;
@@ -5918,6 +5931,10 @@ protected:
     }
 
     int64_t subclass_chunk_size_cap(int64_t seq_len, int64_t position) const override {
+        TORCH_CHECK(seq_len > 0 && position >= 0 &&
+                        seq_len <= int64_t{UINT16_MAX} * 16 &&
+                        position <= int64_t{UINT16_MAX} * 16 - seq_len,
+                    "RPU_PLANNER_REJECT:CAPABILITY: attention key length exceeds uint16-v16 registers");
         // MR-A: hard half of the certified envelope. Called ONCE per resolve, and
         // — this is what makes it a complete gate — called UNCONDITIONALLY by both
         // planner entry points before compute_chunks_impl branches on the override
@@ -9220,9 +9237,9 @@ protected:
         // src base; the [chunk.offset → spm_dst] mapping is BUILD-baked).
         //
         // For text-only / decode forwards the caller passes a zero buffer (view
-        // into a persistent zero keepalive [MAX_KEEPALIVE_SEQ, hidden]) so the
+        // into a persistent zero keepalive [installed_capacity, hidden]) so the
         // add reduces to a no-op while keeping a single GraphCache slot
-        // (findings F22B + F27 — buffer MUST be sized to MAX_KEEPALIVE_SEQ
+        // (findings F22B + F27 — buffer MUST be sized to installed_capacity
         // because src_offset_bytes is baked at BUILD; chunk N > 0 reads past
         // the per-forward seq_len region).
         //
@@ -9445,7 +9462,7 @@ protected:  // LingBot2 sparse-MoE subclass reuses the decoder's layer state.
         uint32_t residual_addr);
 
     std::vector<int64_t> delivery_topology_arguments() const {
-        return {28, 2048, 6144, 16, 8, 128, 576, 192, 608,
+        return {28, 2048, 6144, 16, 8, 128, 576, 192, chunk_envelope().max_kv_len,
                 decode_qkv_fusion_ ? 1 : 0, decode_gate_up_fusion_ ? 1 : 0,
                 prefill_packed_qkv_planar_direct_ ? 1 : 0,
                 prefill_packed_gate_up_strided_ ? 1 : 0,
@@ -9455,10 +9472,11 @@ protected:  // LingBot2 sparse-MoE subclass reuses the decoder's layer state.
                 fast_replay_skip_layer_loop_ ? 1 : 0, preload_replay_skip_ ? 1 : 0};
     }
 
-    static std::vector<int64_t> delivery_kv_arguments(int64_t rows, int64_t position) {
+    std::vector<int64_t> delivery_kv_arguments(int64_t rows, int64_t position) const {
         // The fused scalar-position ABI owns four bounded decode graphs. Its
-        // descriptor binds the actual cache position, capacity and K/V geometry.
-        return {rows, position, 608, 1, 8, 128, 8, rows == 1 ? 1 : 0};
+        // descriptor binds the position, installed capacity and K/V geometry;
+        // forward and the paired launcher also validate the actual cache owners.
+        return {rows, position, chunk_envelope().max_kv_len, 1, 8, 128, 8, rows == 1 ? 1 : 0};
     }
 
     RpuRmsNormSpmRoute consume_delivery_rmsnorm_route(
@@ -10372,8 +10390,8 @@ protected:  // LingBot2 sparse-MoE subclass reuses the decoder's layer state.
     bool has_mrope_ = false;
     std::vector<int32_t> mrope_section_;                            // [T, H, W] half-dim split
     std::array<std::array<uint16_t, 16>, 3> mrope_strobe_masks_{};  // T/H/W × WARP_SIZE strobe
-    at::Tensor position_ids_keepalive_;                             // [MAX_KEEPALIVE_SEQ, 3] int32 device DDR
-    std::array<uint8_t, QWEN3_MROPE_MAX_KEEPALIVE_SEQ> ka_cpu_pos_published_rows_{};
+    at::Tensor position_ids_keepalive_;                             // [installed_capacity, 3] int32 device DDR
+    std::vector<uint8_t> ka_cpu_pos_published_rows_;
     uint64_t ka_cpu_pos_model_generation_ = 0;
     mutable bool ka_cpu_pos_owner_exported_ = false;
 
@@ -10402,7 +10420,7 @@ protected:  // LingBot2 sparse-MoE subclass reuses the decoder's layer state.
         const at::Tensor& source, int64_t position, int64_t rows) {
         const uint64_t generation = installed_model_state_generation();
         if (ka_cpu_pos_model_generation_ != generation) {
-            ka_cpu_pos_published_rows_.fill(0);
+            std::fill(ka_cpu_pos_published_rows_.begin(), ka_cpu_pos_published_rows_.end(), 0);
             ka_cpu_pos_model_generation_ = generation;
         }
         if (!g_rpu_ddr_flush_force_enabled || ka_cpu_pos_owner_exported_ ||
@@ -10434,12 +10452,12 @@ protected:  // LingBot2 sparse-MoE subclass reuses the decoder's layer state.
     // When the caller supplies per-forward interleaved cos/sin (rope_cos_il), the
     // 4 M-RoPE launchers swap from llama_mrope_interleave (in-kernel position_ids
     // gather + strobe masks) to partial_mrope (streams these tables). Stable-addr
-    // keepalives [MAX_KEEPALIVE_SEQ, head_dim/2] fp16; contents refreshed per
+    // keepalives [installed_capacity, head_dim/2] fp16; contents refreshed per
     // forward in the prologue (FAST_REPLAY-safe). partial_mrope_active_ is set
     // per-forward from rope_cos_il.defined() and read by build_layer_subgraph.
     bool partial_mrope_active_ = false;
-    at::Tensor cos_il_keepalive_;                                   // [MAX_KEEPALIVE_SEQ, hd/2] fp16 device DDR
-    at::Tensor sin_il_keepalive_;                                   // [MAX_KEEPALIVE_SEQ, hd/2] fp16 device DDR
+    at::Tensor cos_il_keepalive_;                                   // [installed_capacity, hd/2] fp16 device DDR
+    at::Tensor sin_il_keepalive_;                                   // [installed_capacity, hd/2] fp16 device DDR
     using KeepaliveSegmentKey = std::pair<int64_t, int64_t>;
     struct KeepaliveSourceStamp {
         at::Tensor tensor;

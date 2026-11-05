@@ -44,7 +44,6 @@ using namespace ::rhino_lkn;
 #define NUM_CORES 8
 #define DWIDTH 2
 
-constexpr int64_t QWEN25VL_VISION_MAX_KEEPALIVE_SEQ = 4096;
 constexpr int64_t QWEN25VL_VISION_SDPA_QUERY_CHUNK = 144;
 constexpr int64_t QWEN25VL_VISION_DEBUG_PHASE_LAYER = 17;
 constexpr int64_t QWEN25VL_VISION_DEBUG_PHASE_COUNT = 3;
@@ -381,9 +380,10 @@ public:
 
     void set_configured_chunk_size(int64_t chunk_size) {
         TORCH_CHECK(chunk_size == 0
-                        || (chunk_size >= 16 && chunk_size % 16 == 0),
+                        || (chunk_size >= 16 && chunk_size <= UINT16_MAX &&
+                            chunk_size % 16 == 0),
                     "qwen25vl vision chunk_size must be 0 (auto) or a positive "
-                    "multiple of 16, got ", chunk_size);
+                    "multiple of 16 within the uint16 RoPE token domain, got ", chunk_size);
         TORCH_CHECK(get_last_resolved_chunk_size() == 0,
                     "qwen25vl vision chunk_size must be set before first forward");
         configured_chunk_size_ = chunk_size;
@@ -392,9 +392,10 @@ public:
 
     void stage_configured_chunk_size(uint64_t token, int64_t chunk_size) {
         TORCH_CHECK(chunk_size == 0 ||
-                        (chunk_size >= 16 && chunk_size % 16 == 0),
+                        (chunk_size >= 16 && chunk_size <= UINT16_MAX &&
+                         chunk_size % 16 == 0),
                     "qwen25vl vision chunk_size must be AUTO(0) or a positive "
-                    "multiple of 16, got ", chunk_size);
+                    "multiple of 16 within the uint16 RoPE token domain, got ", chunk_size);
         const int64_t old_chunk = configured_chunk_size_;
         stage_execution_controls(
             token, chunk_size, std::nullopt,
@@ -809,8 +810,10 @@ public:
         max_hw_ = freq_cos.size(0);
 
         if (!position_idx_keepalive_.defined()) {
+            TORCH_CHECK(max_keepalive_seq_ > 0,
+                        "qwen25vl_vision_set_rope: bind KV capacity before RoPE tables");
             position_idx_keepalive_ = at::empty(
-                {QWEN25VL_VISION_MAX_KEEPALIVE_SEQ, 2},
+                {max_keepalive_seq_, 2},
                 at::TensorOptions().dtype(at::kShort).device(at::kPrivateUse1));
             position_idx_keepalive_.zero_();
         }
@@ -819,7 +822,17 @@ public:
         invalidate_model_state();
     }
 
-    int64_t max_keepalive_seq() const { return QWEN25VL_VISION_MAX_KEEPALIVE_SEQ; }
+    void set_execution_envelope(int64_t capacity, int64_t chunk) {
+        TORCH_CHECK(capacity > 0,
+                    "qwen25vl_vision KV capacity must be positive");
+        TORCH_CHECK(!position_idx_keepalive_.defined() ||
+                        capacity == max_keepalive_seq_,
+                    "qwen25vl_vision position capacity is cold-bound; rebuild the model");
+        set_chunk_envelope(capacity, chunk);
+        max_keepalive_seq_ = capacity;
+    }
+
+    int64_t max_keepalive_seq() const { return max_keepalive_seq_; }
     at::Tensor& position_idx_keepalive() { return position_idx_keepalive_; }
 
     // ========================================================================
@@ -879,9 +892,9 @@ public:
         TORCH_CHECK(input.dim() == 3,
                     "Qwen25VLVisionModel::forward: input must be 3D [1,N,H], got ",
                     input.dim(), "D");
-        TORCH_CHECK(num_patches_in > 0 && num_patches_in <= QWEN25VL_VISION_MAX_KEEPALIVE_SEQ,
+        TORCH_CHECK(num_patches_in > 0 && num_patches_in <= max_keepalive_seq_,
                     "Qwen25VLVisionModel::forward: num_patches=", num_patches_in,
-                    " must be in (0, MAX_KEEPALIVE_SEQ=", QWEN25VL_VISION_MAX_KEEPALIVE_SEQ, "]");
+                    " must be in (0, MAX_KEEPALIVE_SEQ=", max_keepalive_seq_, "]");
         TORCH_CHECK(input.size(0) == 1,
                     "Qwen25VLVisionModel::forward: batch must be 1, got ", input.size(0));
         TORCH_CHECK(input.size(1) == num_patches_in,
@@ -1578,7 +1591,8 @@ protected:
         TORCH_INTERNAL_ASSERT(image_batch_count_ > 0);
         const int64_t native_rows = is_generic()
             ? seq_len : seq_len / image_batch_count_;
-        return cs == Align(native_rows, int64_t{16});
+        return native_rows > 0 && native_rows <= UINT16_MAX &&
+            cs <= UINT16_MAX && cs == Align(native_rows, int64_t{16});
     }
 
     void consume_manifest_route(
@@ -1652,7 +1666,7 @@ protected:
                 for (int64_t image = 0; image < image_batch_count_; ++image) {
                     sites.push_back({
                         QWEN25_MISC_DDR_ATTN_SITE,
-                        chunk.idx * QWEN25VL_VISION_MAX_KEEPALIVE_SEQ + image,
+                        chunk.idx * max_keepalive_seq_ + image,
                         /*batch=*/1, per_image, per_image,
                         shared_mask_domain});
                 }
@@ -1667,7 +1681,7 @@ protected:
                     for (int64_t off = 0; off < rows; off += query_chunk) {
                         sites.push_back({
                             QWEN25_WINDOW_DDR_ATTN_SITE,
-                            chunk.idx * QWEN25VL_VISION_MAX_KEEPALIVE_SEQ +
+                            chunk.idx * max_keepalive_seq_ +
                                 invocation++,
                             /*batch=*/1, std::min(query_chunk, rows - off),
                             rows, /*MASK_NONE=*/1});
@@ -1681,7 +1695,7 @@ protected:
                      off += query_chunk, ++invocation) {
                     sites.push_back({
                         QWEN25_STANDARD_DDR_ATTN_SITE,
-                        chunk.idx * QWEN25VL_VISION_MAX_KEEPALIVE_SEQ +
+                        chunk.idx * max_keepalive_seq_ +
                             invocation,
                         /*batch=*/1,
                         std::min(query_chunk, chunk.len - off), chunk.len,
@@ -1696,7 +1710,7 @@ protected:
                      off += query_chunk, ++invocation) {
                     sites.push_back({
                         QWEN25_STANDARD_DDR_ATTN_SITE,
-                        chunk.idx * QWEN25VL_VISION_MAX_KEEPALIVE_SEQ +
+                        chunk.idx * max_keepalive_seq_ +
                             invocation,
                         /*batch=*/1,
                         std::min(query_chunk, chunk.len - off), chunk.len,
@@ -4484,7 +4498,7 @@ protected:
                                    + (uint32_t)(i * per_image_ctx * qd * DWIDTH);
                 const GenericAttentionGeometry site{
                     QWEN25_MISC_DDR_ATTN_SITE,
-                    chunk.idx * QWEN25VL_VISION_MAX_KEEPALIVE_SEQ + i,
+                    chunk.idx * max_keepalive_seq_ + i,
                     /*batch=*/1, per_image_ctx, per_image_ctx, mask_domain};
                 const AttentionExecutionPolicy policy =
                     generic_attention_policy(site, mask_type);
@@ -4550,7 +4564,7 @@ protected:
                         + static_cast<uint32_t>(query_begin * qd * DWIDTH);
                     const GenericAttentionGeometry site{
                         QWEN25_WINDOW_DDR_ATTN_SITE,
-                        chunk.idx * QWEN25VL_VISION_MAX_KEEPALIVE_SEQ +
+                        chunk.idx * max_keepalive_seq_ +
                             route_invocation++,
                         /*batch=*/1, query_len, window_len,
                         /*MASK_NONE=*/1};
@@ -4633,7 +4647,7 @@ protected:
                         q_begin * mask_row_elems * DWIDTH);
                 const GenericAttentionGeometry site{
                     QWEN25_STANDARD_DDR_ATTN_SITE,
-                    chunk.idx * QWEN25VL_VISION_MAX_KEEPALIVE_SEQ +
+                    chunk.idx * max_keepalive_seq_ +
                         route_invocation++,
                     /*batch=*/1, query_len, seq_len, mask_domain};
                 const AttentionExecutionPolicy policy =
@@ -5216,6 +5230,7 @@ private:
     // 2D RoPE state
     at::Tensor freq_cos_;
     at::Tensor freq_sin_;
+    int64_t max_keepalive_seq_ = 0;
     at::Tensor position_idx_keepalive_;
     int64_t max_hw_ = 0;
     bool has_rope_ = false;
@@ -5432,7 +5447,7 @@ void rpu_qwen25vl_vision_set_rope(
 
 void rpu_qwen25vl_vision_set_chunk_envelope(int64_t handle, int64_t max_kv_len, int64_t chunk) {
     Qwen25VLVisionRegistry::get(handle, "rpu_qwen25vl_vision_set_chunk_envelope")
-        ->set_chunk_envelope(std::min(max_kv_len, QWEN25VL_VISION_MAX_KEEPALIVE_SEQ), chunk);
+        ->set_execution_envelope(max_kv_len, chunk);
 }
 
 void rpu_qwen25vl_vision_set_chunk_size(

@@ -1,6 +1,6 @@
-# 完整配置索引
+# 公开配置索引
 
-由 `python scripts/check_examples.py --write` 生成，覆盖所有 TOML。登记状态来自各配置的 profile。配置差异、权重来源和路径绑定见模型指南。
+由 `python scripts/check_examples.py --write` 生成，列出公开示例 TOML。登记状态来自各配置的 profile。配置差异、权重来源和路径绑定见模型指南。
 
 [选型与使用](README.md) · [登记支持矩阵](../../docs/model_matrix.zh.md) · [权重准备](WEIGHTS.md) · [通用参数](PARAMETERS.md)
 
@@ -13,20 +13,6 @@ CPU 列为请求值，`继承` 表示按运行器或环境设置。固定 P/D �
 | 配置 | 入口 / 用途 | 精度 / 输入默认 | CPU 请求 | 登记支持 |
 |---|---|---|---|---|
 | [dinov3/vit_b/fp16.toml](dinov3/vit_b/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16` | 继承 | `SUPPORTED`<br>`DINOV3_VIT_B_SUPPORTED` |
-
-## g05
-
-[配置说明](g05/README.md) · [权重准备](g05/README.md#quantization)
-
-| 配置 | 入口 / 用途 | 精度 / 输入默认 | CPU 请求 | 登记支持 |
-|---|---|---|---|---|
-| [g05/2cam/fp16.toml](g05/2cam/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；相机=2；T列表=[32, 52, 64, 128, 192, 256] | 8 | 未登记；模型专用模板 |
-| [g05/2cam/w8a16.toml](g05/2cam/w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；相机=2；T列表=[32, 52, 64, 128, 192, 256] | 8 | 未登记；模型专用模板 |
-| [g05/2cam/w8a16_action_nvfp4.toml](g05/2cam/w8a16_action_nvfp4.toml) | [run.py](../run.py)<br>运行模板 | `w8a16_nvfp4`；相机=2；T列表=[32, 52, 64, 128, 192, 256] | 8 | 未登记；模型专用模板 |
-| [g05/3cam/fp16.toml](g05/3cam/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；相机=3；T列表=[32, 52, 64, 128, 192, 256] | 8 | 未登记；模型专用模板 |
-| [g05/3cam/w8a16.toml](g05/3cam/w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；相机=3；T列表=[32, 52, 64, 128, 192, 256] | 8 | 未登记；模型专用模板 |
-| [g05/3cam/w8a16_action_nvfp4.toml](g05/3cam/w8a16_action_nvfp4.toml) | [run.py](../run.py)<br>运行模板 | `w8a16_nvfp4`；相机=3；T列表=[32, 52, 64, 128, 192, 256] | 8 | 未登记；模型专用模板 |
-| [g05/legacy/fp16.toml](g05/legacy/fp16.toml) | [run.py](../run.py)<br>历史复现 | `fp16` | 8（运行器默认） | `CONTROLLED_EVALUATION`<br>`G05_EXACT_K1_CONTROLLED_TEMPORARY_SUPPORT` |
 
 ## gemma4
 
@@ -427,10 +413,5 @@ CPU 列为请求值，`继承` 表示按运行器或环境设置。固定 P/D �
 | [wall_oss/legacy/w4a16_channel.toml](wall_oss/legacy/w4a16_channel.toml) | [run.py](../run.py)<br>历史复现 | `w4a16` | 继承 | `EXPERIMENTAL`<br>`WALL_OSS_W4A16_EXPERIMENTAL_RETEST` |
 | [wall_oss/legacy/w4a16_g32.toml](wall_oss/legacy/w4a16_g32.toml) | [run.py](../run.py)<br>历史复现 | `w4a16-pgrp` | 继承 | `EXPERIMENTAL`<br>`WALL_OSS_W4A16_PGRP_EXPERIMENTAL_RETEST` |
 | [wall_oss/legacy/w8a16.toml](wall_oss/legacy/w8a16.toml) | [run.py](../run.py)<br>历史复现 | `w8a16` | 继承 | `EXPERIMENTAL`<br>`WALL_OSS_W8A16_EXPERIMENTAL_RETEST` |
-| [wall_oss/rtc/fp16.toml](wall_oss/rtc/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16` | 继承 | `CONTROLLED_EVALUATION`<br>`WALL_OSS_RTC_FP16_CONTROLLED_TEMPORARY_SUPPORT` |
-| [wall_oss/rtc/w8a16.toml](wall_oss/rtc/w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w8a16` | 继承 | `CONTROLLED_EVALUATION`<br>`WALL_OSS_RTC_W8A16_CONTROLLED_TEMPORARY_SUPPORT` |
-| [wall_oss/sorting/fp16.toml](wall_oss/sorting/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16` | 继承 | 未登记；模型专用模板 |
-| [wall_oss/sorting/w8a16.toml](wall_oss/sorting/w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w8a16` | 继承 | 未登记；模型专用模板 |
-| [wall_oss/sorting/w8a16_action_w4a16_g32.toml](wall_oss/sorting/w8a16_action_w4a16_g32.toml) | [run.py](../run.py)<br>运行模板 | `w8a16_action_w4a16` | 继承 | 未登记；模型专用模板 |
 
-合计 **301** 份配置。
+合计 **289** 份配置。

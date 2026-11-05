@@ -28,23 +28,20 @@ from rpu_backend.runtime.decoder import (
 from rpu_backend.runtime.chunk_envelope import ChunkEnvelope, make_lookup
 from rpu_backend.runtime.topology import execution_core_count
 
-# Declared execution-length and chunk ceilings for each text geometry.
+# Chunk ceilings for each text geometry; installation binds the table capacity.
 _CHUNK_ENVELOPE = {
-    # Bound the padded execution length, not the logical token count.
-    # P4097 requires E4112; optional padding can extend the search to E4176.
     # Per-chunk ceilings do not bypass native SPM/SDPA feasibility checks.
-    ("qwen3_vl_text", 28, 2048): ChunkEnvelope(4176, 320),  # 2b
+    ("qwen3_vl_text", 28, 2048): ChunkEnvelope(0, 320),  # 2b
     # 4B long-context admission retains C256 and every native SPM/SDPA check.
-    # 4176 bounds padded prefill execution; P4096D128 separately needs KV4224.
-    ("qwen3_vl_text", 36, 2560): ChunkEnvelope(4176, 256),  # 4b
+    ("qwen3_vl_text", 36, 2560): ChunkEnvelope(0, 256),  # 4b
     # Exact padded 8B retains C128; the extended length window does not
     # enlarge native SPM/SDPA candidates or the separately allocated KV cache.
-    ("qwen3_vl_text", 36, 4096): ChunkEnvelope(4176, 128),  # padded 8b
+    ("qwen3_vl_text", 36, 4096): ChunkEnvelope(0, 128),  # padded 8b
     # GR00T-N1.7-3B backbone — a TRUNCATED 16-layer Qwen3-VL-2B (select_layer=16)
     # installed through install_qwen3_vl_text_for_rpu, so it lands on this arch
-    # key with its own geometry. Auto is independently certified to length 512;
+    # key with its own geometry. Retain the AUTO search ceiling of 512;
     # no exact chunk is certified for this truncated geometry.
-    ("qwen3_vl_text", 16, 2048): ChunkEnvelope(512),
+    ("qwen3_vl_text", 16, 2048): ChunkEnvelope(0, 512),
 }
 lookup_causal_decoder = make_lookup(
     _CHUNK_ENVELOPE, "rpu_backend/adapters/qwen3_vl/text.py::_CHUNK_ENVELOPE")
@@ -85,14 +82,14 @@ def _chunk_envelope_for_execution(
 # Exact ordinary LingBot TP8 KV-only prefill also admits C320/C400. The native
 # single-chunk SDPA predicate and actual SPM layout still determine feasibility;
 # the ordinary Qwen3-VL-4B certificate remains C256.
-_LINGBOT_KV_ONLY_ENVELOPE = ChunkEnvelope(4176, 400)
+_LINGBOT_KV_ONLY_ENVELOPE = ChunkEnvelope(0, 400)
 
-_RUNTIME_QUANTIZED_32B_ENVELOPE = ChunkEnvelope(4176, 64)
+_RUNTIME_QUANTIZED_32B_ENVELOPE = ChunkEnvelope(0, 64)
 
 # Independent bounded candidate for the original Text7-only W8 recipe.
 # Public support remains controlled/uncertified; never relabel this as runtime W8.
 # Native planning/SPM checks remain authoritative. Hardware evidence is separate.
-_LEGACY_32B_CONTROLLED_ENVELOPE = ChunkEnvelope(336, 64)
+_LEGACY_32B_CONTROLLED_ENVELOPE = ChunkEnvelope(0, 64)
 
 
 
@@ -222,7 +219,7 @@ def install_qwen3_vl_text_for_rpu(
             and (arch, num_layers, hidden_size) == (QWEN3_VL_TEXT_ARCH, 64, 5120) else
             _RUNTIME_QUANTIZED_32B_ENVELOPE if _runtime_quantized_32b
             and (arch, num_layers, hidden_size) == (QWEN3_VL_TEXT_ARCH, 64, 5120) else
-            ChunkEnvelope(4176, 256) if runtime_align_w8a16 else
+            ChunkEnvelope(0, 256) if runtime_align_w8a16 else
             _LINGBOT_KV_ONLY_ENVELOPE if prefill_kv_only
             and (arch, num_layers, hidden_size) == (QWEN3_VL_TEXT_ARCH, 36, 2560) else
             _chunk_envelope_for_execution(arch, num_layers, hidden_size, execution_config)
@@ -250,7 +247,7 @@ def get_or_create_zero_keepalive(
     text_model,
     *,
     text_config: Any | None = None,
-    max_seq_len: int = 8192,
+    max_seq_len: int | None = None,
 ) -> torch.Tensor:
     """Return a per-model `[max_seq_len, hidden_size]` fp16 device zero buffer.
 
@@ -259,15 +256,26 @@ def get_or_create_zero_keepalive(
     DeepStack fused-graph injection reads when there are no actual visual
     tokens to add (text-only prefill, decode, multi-chunk text prefill).
 
-    Sized to MAX_KEEPALIVE_SEQ rather than max_chunk per findings F27 — the
+    Sized to the installed capacity rather than max_chunk per findings F27 — the
     mutable DMA's `src_offset_bytes = chunk.offset × hidden × 2` is baked at
     BUILD time, so chunk N > 0 reads beyond the per-forward seq_len region.
     """
     existing = getattr(text_model, "_rpu_deepstack_zero_keepalive", None)
+    cfg = text_config if text_config is not None else getattr(text_model, "config", None)
+    installed_capacity = getattr(text_model, "_rpu_mrope_capacity", None)
+    if max_seq_len is None:
+        max_seq_len = installed_capacity or getattr(cfg, "max_position_embeddings", None)
+        if max_seq_len is None and existing is not None:
+            max_seq_len = int(existing.shape[0])
+    if type(max_seq_len) is not int or max_seq_len <= 0:
+        raise ValueError("DeepStack zero keepalive requires a positive installed capacity")
+    if installed_capacity is not None and max_seq_len > installed_capacity:
+        raise ValueError("DeepStack zero keepalive exceeds installed M-RoPE capacity")
+    if installed_capacity is not None:
+        max_seq_len = installed_capacity
     if existing is not None and existing.shape[0] >= max_seq_len:
         return existing
 
-    cfg = text_config if text_config is not None else text_model.config
     hidden_size = cfg.hidden_size
     z = torch.zeros(
         (max_seq_len, hidden_size),

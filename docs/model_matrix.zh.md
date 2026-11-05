@@ -4,7 +4,7 @@
 
 由 `python scripts/check_examples.py --write` 生成。配置与登记状态来自 `examples/configs/profiles.json`；同一 profile 的 TOML 汇总在一行。使用 `python examples/run.py --config <TOML>` 运行，按配置准备权重和输入。
 
-完整配置及用途见[配置索引](../examples/configs/CONFIGURATIONS.md)；本页仅列登记 profile。
+公开配置及用途见[配置索引](../examples/configs/CONFIGURATIONS.md)；本页仅列公开登记 profile。
 
 ## API 范围
 
@@ -147,7 +147,6 @@
 
 | Family | Profile / 精度 | Planner 支持状态 | 共享入口 | TOML / alias |
 |---|---|---|---|---|
-| `g05` | `g05-base.fp16.k1-rtc-fm` / `fp16` | `CONTROLLED_EVALUATION`<br>`G05_EXACT_K1_CONTROLLED_TEMPORARY_SUPPORT` | [`examples/run.py`](../examples/run.py) | [`examples/configs/g05/legacy/fp16.toml`](../examples/configs/g05/legacy/fp16.toml) / `g05-base` |
 | `gr00t` | `gr00t-n1d7-3b.fp16.vla` / `fp16` | `SUPPORTED_LIMITED`<br>`GR00T_N1D7_DELIVERY_SUPPORTED` | [`examples/run.py`](../examples/run.py) | [`examples/configs/gr00t/n1_7_droid/224/fp16.toml`](../examples/configs/gr00t/n1_7_droid/224/fp16.toml) / `gr00t-n1d7-3b`<br>[`examples/configs/gr00t/n1_7_droid/256/fp16.toml`](../examples/configs/gr00t/n1_7_droid/256/fp16.toml) / `gr00t-n1d7-3b` |
 | `gr00t` | `gr00t-n1d7-3b.w8a16.vla` / `w8a16` | `SUPPORTED_LIMITED`<br>`GR00T_EXISTING_W8A16_DELIVERY_PATH` | [`examples/run.py`](../examples/run.py) | [`examples/configs/gr00t/n1_7_droid/224/w8a16.toml`](../examples/configs/gr00t/n1_7_droid/224/w8a16.toml) / `gr00t-n1d7-3b`<br>[`examples/configs/gr00t/n1_7_droid/256/w8a16.toml`](../examples/configs/gr00t/n1_7_droid/256/w8a16.toml) / `gr00t-n1d7-3b` |
 | `halo` | `halo_action_expert.fp16.action-step` / `fp16` | `SUPPORTED_LIMITED`<br>`HALO_SINGLE_ACTION_EXPERT_STEP_SUPPORTED` | [`examples/run.py`](../examples/run.py) | [`examples/configs/halo/action_expert/fp16.toml`](../examples/configs/halo/action_expert/fp16.toml) / `halo_action_expert` |
@@ -173,8 +172,6 @@
 | `rhinovla` | `rhinovla.v3.w8a16.full-pipeline.trusted-factory` / `w8a16` | Caller factory template; not evaluated | [`examples/run.py`](../examples/run.py) | [`examples/configs/rhinovla/v3/w8a16_pipeline.toml`](../examples/configs/rhinovla/v3/w8a16_pipeline.toml) / `rhinovla-controlled` |
 | `rhinovla` | `rhinovla.v3.rtc.w8a16.full-pipeline.trusted-factory` / `w8a16` | Caller factory template; not evaluated | [`examples/run.py`](../examples/run.py) | [`examples/configs/rhinovla/v3/rtc_w8a16_pipeline.toml`](../examples/configs/rhinovla/v3/rtc_w8a16_pipeline.toml) / `rhinovla-controlled` |
 | `wall-oss` | `wall-oss-0.5.fp16.vla` / `fp16` | `SUPPORTED_LIMITED`<br>`WALL_OSS_RC9_FP16_DELIVERY_SUPPORTED` | [`examples/run.py`](../examples/run.py) | [`examples/configs/wall_oss/legacy/fp16.toml`](../examples/configs/wall_oss/legacy/fp16.toml) / `wall-oss-0.5` |
-| `wall-oss` | `wall-oss-0.5.fp16.rtc-controlled` / `fp16` | `CONTROLLED_EVALUATION`<br>`WALL_OSS_RTC_FP16_CONTROLLED_TEMPORARY_SUPPORT` | [`examples/run.py`](../examples/run.py) | [`examples/configs/wall_oss/rtc/fp16.toml`](../examples/configs/wall_oss/rtc/fp16.toml) / `wall-oss-0.5` |
 | `wall-oss` | `wall-oss-0.5-w8a16.w8a16.vla` / `w8a16` | `EXPERIMENTAL`<br>`WALL_OSS_W8A16_EXPERIMENTAL_RETEST` | [`examples/run.py`](../examples/run.py) | [`examples/configs/wall_oss/legacy/w8a16.toml`](../examples/configs/wall_oss/legacy/w8a16.toml) / `wall-oss-0.5-w8a16` |
 | `wall-oss` | `wall-oss-0.5-w4a16.w4a16.vla` / `w4a16` | `EXPERIMENTAL`<br>`WALL_OSS_W4A16_EXPERIMENTAL_RETEST` | [`examples/run.py`](../examples/run.py) | [`examples/configs/wall_oss/legacy/w4a16_channel.toml`](../examples/configs/wall_oss/legacy/w4a16_channel.toml) / `wall-oss-0.5-w4a16` |
 | `wall-oss` | `wall-oss-0.5-w4a16-pgrp.w4a16-pgrp.vla` / `w4a16-pgrp` | `EXPERIMENTAL`<br>`WALL_OSS_W4A16_PGRP_EXPERIMENTAL_RETEST` | [`examples/run.py`](../examples/run.py) | [`examples/configs/wall_oss/legacy/w4a16_g32.toml`](../examples/configs/wall_oss/legacy/w4a16_g32.toml) / `wall-oss-0.5-w4a16-pgrp` |
-| `wall-oss` | `wall-oss-0.5-w8a16.w8a16.rtc-controlled` / `w8a16` | `CONTROLLED_EVALUATION`<br>`WALL_OSS_RTC_W8A16_CONTROLLED_TEMPORARY_SUPPORT` | [`examples/run.py`](../examples/run.py) | [`examples/configs/wall_oss/rtc/w8a16.toml`](../examples/configs/wall_oss/rtc/w8a16.toml) / `wall-oss-0.5-w8a16` |

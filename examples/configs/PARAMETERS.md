@@ -14,7 +14,7 @@
 | `example.target/architecture` | 选择运行器与模型架构 | 使用模板已有值 |
 | `example.opt_in` | 模型安装及执行开关 | 按该配方保留；单项调整的条件在模型页说明 |
 | `input.checkpoint` 等资产字段 | 显式指定权重或配套文件 | 仅在接受该字段的模型中使用；填写模型页下载/转换步骤得到的路径 |
-| `pi05.precision`、`g05.precision` 等模型字段 | 模型专用入口的配方选择 | 与对应权重目录配套，直接选择相应模板 |
+| `pi05.precision` 等模型字段 | 模型专用入口的配方选择 | 与对应权重目录配套，直接选择相应模板 |
 
 不同模型使用的资产字段不同。Qwen 系列通过 `registry_alias` 定位目录；Pi0.5 等还接受 checkpoint 绝对路径。多数入口填写实际路径；LingBot v2 等支持环境变量展开的入口按其模板设置。TOML 本身不执行 Shell 替换。
 

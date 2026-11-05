@@ -65,6 +65,7 @@ struct Vision {
  int64_t configured_chunk_size_=0,last_resolved=0,invalidations=0;
  std::vector<int64_t> deepstack_visual_indexes_{5,11,17};
  std::vector<Weights> layer_weights_=std::vector<Weights>(24);
+ int64_t max_keepalive_seq()const{return 32768;}
  int64_t num_cores()const{return cores;}int64_t num_layers()const{return layers;}
  int64_t hidden_size()const{return hidden;}int64_t intermediate_size()const{return intermediate;}
  int64_t num_q_heads()const{return heads;}int64_t head_dim()const{return dim;}
@@ -79,12 +80,14 @@ struct Vision {
 template<class F>void rejected(F f){bool raised=false;try{f();}catch(const std::runtime_error&){raised=true;}assert(raised);}
 int main(){
  Vision v;
+ rejected([&]{v.subclass_chunk_size_cap(32769,0);});
+ rejected([&]{v.set_configured_chunk_size(65536);});
  // The shared Vision/VLA installer has not granted the root-only opt-in.
  assert(v.subclass_chunk_size_cap(1200,0)==144);
  v.set_large_image_auto_chunk(true);
  assert(v.large_image_auto_chunk_&&v.invalidations==1&&v.configured_chunk_size_==0);
  for(int n:{16,256,512,784,1024})assert(v.subclass_chunk_size_cap(n,0)==144);
- for(int n:{1040,1200,1536,4096})assert(v.subclass_chunk_size_cap(n,0)==608);
+ for(int n:{1040,1200,1536,4096,8192,16384,32768})assert(v.subclass_chunk_size_cap(n,0)==608);
  // It remains a cap: exact configuration is separate and wins both ways.
  v.set_configured_chunk_size(144);
  assert(v.subclass_chunk_size_cap(1200,0)==144&&v.large_image_auto_chunk_);

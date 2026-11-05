@@ -33,9 +33,7 @@ checkpoint formats, conversion options and input constraints for their examples.
 The public Wall-OSS base checkpoint is
 [`x-square-robot/wall-oss-0.5`](https://huggingface.co/x-square-robot/wall-oss-0.5).
 Use its processor, normalizer and action definitions as described in the
-[Wall-OSS example](../examples/configs/README.md). For G0.5, the
-[configuration](../examples/configs/g05/2cam/fp16.toml) records the source,
-revision, subfolder and implementation. Consult the model owner's access and
+[Wall-OSS example](../examples/configs/wall_oss/README.md). Consult the model owner's access and
 license terms and [third-party notices](../THIRD_PARTY_NOTICES.md); RhinoForge's
 source license does not grant rights to these weights.
 

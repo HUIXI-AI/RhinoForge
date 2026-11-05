@@ -162,7 +162,8 @@ def test_loader_preserves_checkpoint_generation_config(tmp_path, monkeypatch, su
     assert torch.equal(model.linear.weight, torch.ones(2, 2, dtype=torch.float16))
 
 
-def test_valid_install_resolves_options_before_hardware(monkeypatch):
+@pytest.mark.parametrize("capacity", [512, 8193, 16384, 32768])
+def test_valid_install_resolves_options_before_hardware(monkeypatch, capacity):
     from rpu_backend.adapters import qwen3_5_moe as moe
     from rpu_backend.runtime import hw_attrs
 
@@ -182,7 +183,7 @@ def test_valid_install_resolves_options_before_hardware(monkeypatch):
 
     monkeypatch.setattr(hw_attrs, "validate_preinstall", before_hardware)
     with pytest.raises(RuntimeError, match="reached preinstall boundary"):
-        adapter.to_rpu(max_seq_len=512)
+        adapter.to_rpu(max_seq_len=capacity)
     assert not getattr(model, "_rpu_swizzle_started", False)
     assert not moe._SWIZZLE_LOCK.locked()
 

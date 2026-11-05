@@ -208,11 +208,11 @@ void patches(const RpuKernelGraph&g,int p){
  for(int l=0;l<36;++l){
   const size_t node=prefix+l*((combined_route?10:12)-(combined_o?2:0)+(fp16_route?5:0))+std::min(l,3);
   for(int j=0;j<positions;++j){const auto& x=g.applied[l*stride+j];
-   assert(x.reg_idx==uint32_t(j%2)&&x.value==uint64_t(j%2?0:p)&&x.width==2);
+   assert(x.reg_idx==uint32_t(j%2)&&x.value==uint64_t(uint16_t(j%2?(p>>16):p))&&x.width==2);
    assert(x.kernel_idx==g.nodes[node+(fp16_route?4:2)+j/2].kernel.kernel_idx);
   }
   const std::array<int,8> regs{0,1,4,5,16,17,29,31};
-  const std::array<int,8> values{s,0,(s+15)/16,(p+15)/16,p,0,(s+15)/16,(s+15)/16};
+  const std::array<int,8> values{uint16_t(s),s>>16,(s+15)/16,(p+15)/16,uint16_t(p),p>>16,(s+15)/16,(s+15)/16};
   for(int j=0;j<8;++j){const auto& x=g.applied[l*stride+positions+j];
    assert(x.reg_idx==uint32_t(regs[j])&&x.value==uint64_t(values[j])&&x.width==2);
    assert(x.kernel_idx==g.nodes[node+(fp16_route?4:2)+positions/2].kernel.kernel_idx);
@@ -234,7 +234,7 @@ void ordinary_fixture(Fixture& f,int layers,at::ScalarType dtype,bool acc32,bool
  if(large){assert(layers==36);m.h=4096;m.intermediate=12288;m.envelope={320,128};
   m.qwen3vl_ordinary_resident_prefill_profile_=m.qwen3vl_fp16_decode_profile_=false;}
  m.layer_weights_.resize(layers);f.k.resize(layers);f.v.resize(layers);
- if(layers==28||large)m.position_ids_keepalive_=at::zeros({8192,3},at::TensorOptions().dtype(at::kInt));
+ if(layers==28||large)m.position_ids_keepalive_=at::zeros({8192+8,3},at::TensorOptions().dtype(at::kInt)).narrow(0,0,8192);
  f.hidden=metadata(at::kHalf,{1,1,m.h});
  auto projection=[&](Tensor&w,Tensor&scale,int n,int k,bool row){w=metadata(dtype,{n,dtype==at::kByte?k/2:k});scale=quant_scale(dtype,n,k,row);};
  for(auto&w:m.layer_weights_){
@@ -398,7 +398,7 @@ void exact_8b_cases(){
  run(319);run(320);assert(g.ordinary==5);
  for(int fault=0;fault<7;++fault){Fixture bad;ordinary_fixture(bad,36,at::kHalf,true,true);RpuKernelGraph other;
   if(fault==0)bad.m.linear_acc32_=false;
-  if(fault==1)bad.m.envelope.max_kv_len=4192;
+  if(fault==1)bad.m.envelope.max_kv_len=0;
   if(fault==2)bad.m.envelope.chunk=256;
   if(fault==3)bad.m.intermediate=12304;
   if(fault==4)bad.m.layer_weights_[0].q_w=metadata(at::kChar,{4096,4096});
@@ -497,8 +497,11 @@ int main(){
   for(int axis=0;axis<3;++axis){auto* row=f.m.position_ids_keepalive_.data_ptr<int32_t>()+15*3;
    row[axis]=8192;rejects([&]{f.begin(g,15);});row[axis]=-1;rejects([&]{f.begin(g,15);});row[axis]=0;}
   f.m.has_mrope_=false;assert(!f.begin(g,15));f.m.has_mrope_=true;
-  for(int64_t unknown:{0,336,2047,2049,4096,4175,4177,8192}){
-   f.m.envelope.max_kv_len=unknown;assert(!f.begin(g,15));
+  for(int64_t invalid:{-1,0}){
+   f.m.envelope.max_kv_len=invalid;assert(!f.begin(g,15));
+  }
+  for(int64_t capacity:{336,2047,2049,4096,4175,4177,8192,16384,32768}){
+   f.m.envelope.max_kv_len=capacity;assert(f.begin(g,15));f.m.cancel_qwen3vl_decode_replay();
   }f.m.envelope.max_kv_len=cap;
   f.m.envelope.chunk=320;assert(!f.begin(g,15));f.m.envelope.chunk=256;
   // Every layer and both K/V must share the same physical capacity.
@@ -512,19 +515,30 @@ int main(){
   f.m.partial_mrope_active_=true;assert(!f.begin(g,15));f.m.partial_mrope_active_=false;
  }
  // Real public matrix allocations include small caches; none is exactly 2048.
- // The existing short allocation and the gate's 4352-row allocation also replay.
- for(int rows:{16,496,576,640,1088,1152,1392,2048,2112,2176,2608,3504,4160,4224,4352}){
-  Fixture f;f.cache_rows(rows);RpuKernelGraph g;call(f,g,0);
+ // Arbitrary larger installed capacities use the same checked replay recipe.
+ for(int rows:{16,496,576,640,1088,1152,1392,2048,2112,2176,2608,3504,4160,4224,4352,16384,32768,65536,1048560}){
+  Fixture f;f.cache_rows(rows);
+  f.m.cos_=metadata(at::kHalf,{rows*2,64});f.m.sin_=metadata(at::kHalf,{rows*2,64});
+  f.m.position_ids_keepalive_=at::zeros({rows+8,3},at::TensorOptions().dtype(at::kInt)).narrow(0,0,rows);
+  // M-RoPE T/H/W indices may exceed KV positions while remaining in the table.
+  f.m.position_ids_keepalive_.data_ptr<int32_t>()[0]=rows+1;
+  RpuKernelGraph g;call(f,g,0);
   assert(f.m.qwen3vl_decode_replay_state_->recipe->cache_capacity==rows);
   for(int p:{rows-2,rows-1,0}){call(f,g,p);patches(g,p);}
   assert(g.ordinary==1&&g.skips==3);const int skips=g.skips;
   rejects([&]{f.begin(g,rows);});assert(g.skips==skips);
+ }
+ {Fixture f;constexpr int max_rows=65535*16;f.cache_rows(max_rows+16);
+  f.m.cos_=metadata(at::kHalf,{max_rows+16,64});f.m.sin_=metadata(at::kHalf,{max_rows+16,64});
+  f.m.position_ids_keepalive_=at::zeros({max_rows+24,3},at::TensorOptions().dtype(at::kInt)).narrow(0,0,max_rows+16);
+  RpuKernelGraph g;rejects([&]{f.begin(g,max_rows);});assert(g.skips==0);
  }
  {Fixture f;f.cache_rows(4352);RpuKernelGraph g;call(f,g,2047);
   for(int p:{2048,4095,4096,4351,2047}){call(f,g,p);patches(g,p);}
   assert(g.ordinary==1&&g.skips==5);
   // Smaller tables cannot borrow the packed cache's extra rows.
   f.m.cos_=metadata(at::kHalf,{4096,64});f.m.sin_=metadata(at::kHalf,{4096,64});
+  f.m.position_ids_keepalive_=f.m.position_ids_keepalive_.narrow(0,0,4096);
   call(f,g,4095);assert(g.ordinary==2);const int skips=g.skips;
   rejects([&]{f.begin(g,4096);});assert(g.skips==skips);
   f.m.position_ids_keepalive_.data_ptr<int32_t>()[4095*3+2]=4096;
@@ -539,7 +553,7 @@ int main(){
  }
  for(int variant=0;variant<7;++variant){Fixture f;RpuKernelGraph g;
   if(variant==0)f.cache_rows(0);
-  if(variant==1)f.cache_rows(4368);
+  if(variant==1)f.k[0]=metadata(at::kHalf,{1,273,1,8,8,16,16});
   if(variant==2)f.k[4]=metadata(at::kHalf,{1,128,1,8,8,16});
   if(variant==3)f.v[7]=metadata(at::kFloat,{1,128,1,8,8,16,16});
   if(variant==4)f.k[12]=f.k[12].transpose(5,6);

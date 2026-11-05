@@ -176,7 +176,8 @@ def patch_gemma_model_for_rpu_all_layers_once(
     # [head_dim] on CPU but [head_dim/2] on device.
     # NOTE: next(model.parameters()).device may be CPU (embed_tokens kept on CPU),
     # so we must explicitly use "rpu" device.
-    max_pos = getattr(rotary, "max_position_embeddings", 4096)
+    max_pos = max(int(getattr(rotary, "max_position_embeddings", 4096)),
+                  int(getattr(model, "_rpu_max_seq_len", 2048)))
     dummy = torch.zeros(1, 1, hidden_size, dtype=torch.float16, device="rpu")
     dummy_pos = torch.arange(max_pos, device="rpu").unsqueeze(0)
     cos_cached, sin_cached = rotary(dummy, dummy_pos)

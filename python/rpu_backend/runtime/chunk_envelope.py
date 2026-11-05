@@ -1,4 +1,4 @@
-"""Shared chunk-envelope value and lookup; each adapter owns its admitted rows.
+"""Shared chunk-envelope value and lookup; adapters own safe chunk ceilings.
 
 The envelope bounds the native planner's search so it cannot select chunks
 outside the model's SPM capacity. Missing geometries are rejected before prefill.
@@ -15,12 +15,10 @@ class ChunkEnvelope(tuple):
                 footprint is monotone in chunk size, so at-or-below a
                 measured-safe chunk is safe a fortiori. 0 = "auto is certified
                 within max_kv_len".
-    max_kv_len  bounds the AUTO SEARCH SPACE, because compute_chunks_impl:513
-                searches up to hi = ceil16(seq_len) — a longer prefill lets auto
-                reach a bigger, never-measured chunk. (On the explicit-mask path
-                it additionally bounds sdpa_mask, the only length-scaled buffer
-                in declare_buffers.) This is why a PINNED row can afford a
-                generous length and an AUTO row cannot.
+    max_kv_len  installed storage/position capacity, bound before native planning.
+                Adapter tables use 0 for an unbound capacity; their chunk ceiling
+                remains independent of context length. Per-request native checks
+                still account for length-dependent masks, SPM and kernel limits.
     """
     __slots__ = ()
 
@@ -29,6 +27,13 @@ class ChunkEnvelope(tuple):
 
     max_kv_len = property(lambda self: self[0])
     chunk = property(lambda self: self[1])
+
+    def bind_capacity(self, capacity: int) -> "ChunkEnvelope":
+        """Bind actual cold-installed capacity without a historical length cap."""
+        from numbers import Integral
+        if isinstance(capacity, bool) or not isinstance(capacity, Integral) or capacity <= 0:
+            raise ValueError("chunk envelope capacity must be a positive integer")
+        return ChunkEnvelope(capacity, self.chunk)
 
 
 def make_lookup(table, table_location: str):

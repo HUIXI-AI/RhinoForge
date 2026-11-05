@@ -36,6 +36,7 @@ from rpu_backend.api.errors import RPUBackendError, UnsupportedModelError
 from rpu_backend.api.qwen3_5_cache import qwen3_5_kv_replication
 from rpu_backend.api._execution import (
     QWEN3_5_OPTIONAL_PADDING_CAP,
+    QWEN3_5_TOTAL_PADDING_CAP,
     _resolve_text_install_options,
 )
 from rpu_backend.runtime.decoder import plan_bounded_prefill_execution
@@ -423,16 +424,18 @@ def _plan_prefill_execution(real_len, physical_limit, padding_budget,
 
 _VALID_LAYER_TYPES = {"linear_attention", "full_attention"}
 
-# Declared text chunk envelope, keyed by (num_hidden_layers, hidden_size).
-# Entries are upper bounds; requests outside the table are rejected.
-CERTIFIED_CHUNK_ENVELOPE: dict[tuple[int, int], tuple[int, int]] = {
-    (24, 1024): (8192, 512),  # qwen3_5-0.8b
-    (24, 2048): (8192, 640),  # qwen3_5-2b
-    (32, 2560): (8192, 448),  # qwen3_5-4b
-    (32, 4096): (8192, 256),  # qwen3_5-9b
+# Chunk ceilings are independent of the model's installed KV capacity.
+PREFILL_CHUNK_CEILING: dict[tuple[int, int], int] = {
+    (24, 1024): 512,  # qwen3_5-0.8b
+    (24, 2048): 640,  # qwen3_5-2b
+    (32, 2560): 448,  # qwen3_5-4b
+    (32, 4096): 256,  # qwen3_5-9b
     # Legacy text-only entry retained for compatibility.
-    (64, 5120): (8192, 128),
+    (64, 5120): 128,
 }
+# FLASH_ATTN_SPM encodes key length as uint16 groups of 16 rows. Cache
+# allocation remains independent of this execution-only register constraint.
+_SDPA_MAX_KV_ROWS = 65535 * 16
 
 def _qwen3_5_prefill_envelope(state) -> tuple[int, int]:
     """Return this Language owner's declared native envelope, not a Vision gate.
@@ -444,12 +447,12 @@ def _qwen3_5_prefill_envelope(state) -> tuple[int, int]:
 
 
 def _declare_qwen3_5_chunk_envelope(
-    handle, num_layers, hidden_size
+    handle, num_layers, hidden_size, max_seq_len
 ) -> tuple[int, int]:
     import torch as _torch
     key = (int(num_layers), int(hidden_size))
-    env = CERTIFIED_CHUNK_ENVELOPE.get(key)
-    if env is None:
+    ceiling = PREFILL_CHUNK_CEILING.get(key)
+    if ceiling is None:
         raise UnsupportedModelError(
             f"Qwen3.5: no declared chunk envelope for (num_hidden_layers, "
             f"hidden_size)={key}. This profile has no implemented/qualified "
@@ -458,7 +461,9 @@ def _declare_qwen3_5_chunk_envelope(
             f"board, then add "
             f"a row here AND to docs/roadmap/chunk_certified_envelope.md."
         )
-    _torch.ops.rpu.qwen3_5_set_chunk_envelope(handle, env[0], env[1])
+    physical_capacity = ((max_seq_len + QWEN3_5_TOTAL_PADDING_CAP + 15) // 16) * 16
+    env = (physical_capacity, ceiling)
+    _torch.ops.rpu.qwen3_5_set_chunk_envelope(handle, *env)
     return env
 
 
@@ -1618,6 +1623,7 @@ def _install_qwen3_5_text_for_rpu_impl(
             handle,
             int(tc.num_hidden_layers),
             int(tc.hidden_size),
+            max_seq_len,
         )
         if getattr(pending_state, "public_retained_prefill", False):
             torch.ops.rpu.qwen3_5_set_retained_prefill_graph(handle, True)
@@ -1767,6 +1773,16 @@ def _preflight_qwen3_5_text(
             raise ValueError("Qwen3.5 prefill chunk_size must be a multiple of 64")
     profile = (int(st.num_layers), int(st.hidden_size))
     envelope = _qwen3_5_prefill_envelope(st)
+    if cache.position + real_len > st.max_seq_len:
+        raise ValueError(
+            "Qwen3.5 request exceeds the installed KV/rotary capacity: "
+            f"position={cache.position}, input={real_len}, limit={st.max_seq_len}"
+        )
+    if cache.position + real_len > _SDPA_MAX_KV_ROWS:
+        raise UnsupportedModelError(
+            "Qwen3.5 attention key length exceeds the kernel register "
+            f"capacity {_SDPA_MAX_KV_ROWS}"
+        )
     if envelope is None or real_len > envelope[0]:
         limit = None if envelope is None else envelope[0]
         raise UnsupportedModelError(
@@ -1839,7 +1855,7 @@ def _preflight_qwen3_5_text(
     plan_box = {}
     pad_len, planned_chunk_size = _plan_prefill_execution(
         real_len,
-        cache.allocated_max_seq_len,
+        min(cache.allocated_max_seq_len, envelope[0], _SDPA_MAX_KV_ROWS),
         padding_budget,
         execution_owner=text_model,
         execution_native=("qwen3_5", int(st.handle)),

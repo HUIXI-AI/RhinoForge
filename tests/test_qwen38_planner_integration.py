@@ -41,7 +41,7 @@ def test_canonical_legacy_admission(legacy, monkeypatch, chunk):
     adapter.Qwen3_5Adapter.preflight(legacy)
     adapter.Qwen3_5Adapter.preflight_execution(
         legacy, {"prefill": {"chunk_size": chunk}})
-    assert text.CERTIFIED_CHUNK_ENVELOPE[(64, 5120)] == (8192, 128)
+    assert text.PREFILL_CHUNK_CEILING[(64, 5120)] == 128
 
 
 def test_rejected_legacy_requests_fail_before_loading(legacy, monkeypatch):

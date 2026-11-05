@@ -703,8 +703,8 @@ def _cleanup_gr00t_partial_build(
 
 
 def _validate_gr00t_max_prefix_len(max_prefix_len, *, qwen_z1=False):
-    if type(max_prefix_len) is not int or not (0 < max_prefix_len <= 512) or max_prefix_len % 16:
-        raise ValueError("GR00T max_prefix_len must be a positive multiple of 16 no larger than 512")
+    if type(max_prefix_len) is not int or max_prefix_len <= 0 or max_prefix_len % 16:
+        raise ValueError("GR00T max_prefix_len must be a positive multiple of 16")
     if qwen_z1 and max_prefix_len != 256:
         raise ValueError("GR00T Qwen3-VL SPM Z1 requires max_prefix_len=256")
     return max_prefix_len
@@ -786,9 +786,9 @@ class Gr00tN1d7VLA:
         self._d_cache = d_cache
         # Opt1: backbone KV-cache hoisted out of the per-action _backbone (single non-incremental
         # prefill → one cache, reused via reset_to_position(0); kills the dominant per-forward
-        # 16-layer alloc+zero_ and pins REPLAY KV addresses). cap 512 ≥ max prompt S.
+        # 16-layer alloc+zero_ and pins REPLAY KV addresses). Capacity is cold-bound.
         self._bb_cache = RPUCache(num_layers=cfg.text_config.num_hidden_layers, batch_size=1,
-                                  max_seq_len=512, num_kv_heads=cfg.text_config.num_key_value_heads,
+                                  max_seq_len=self._max_prefix_len, num_kv_heads=cfg.text_config.num_key_value_heads,
                                   head_dim=cfg.text_config.head_dim)
         # Opt2/3: per-prompt memo slots (keyed on input_ids identity). rope = CPU M-RoPE index math;
         # masks = the two cross-attn MASK_2D subsets (cached device tensors also pin denoise REPLAY addrs).
@@ -2594,7 +2594,7 @@ def build_gr00t_vla(
     num_steps=_NSTEPS,
     max_prefix_len=256,
 ):
-    """Build with a cold 4/10-step schedule and a 16-aligned prefix capacity <=512."""
+    """Build with a cold 4/10-step schedule and a 16-aligned prefix capacity."""
     num_steps = _validate_gr00t_num_steps(num_steps)
     max_prefix_len = _validate_gr00t_max_prefix_len(max_prefix_len)
     from rpu_backend.api._execution import _require_execution_process_safe
@@ -2771,6 +2771,7 @@ def build_gr00t_vla(
         install_qwen3_vl_text_for_rpu(
             text_model,
             text_config=cfg.text_config,
+            max_seq_len=max_prefix_len,
             vision_config=cfg.vision_config,
             deepstack_lang_layers=list(range(n_ds)),
             enable_deepstack=True,

@@ -42,11 +42,11 @@ using namespace ::rhino_lkn;
 
 #define DWIDTH 2
 
-// Generic images keep their original 4096 limit; 4608 exists only for the exact
-// G0.5 camera-major B_camera=3 × K=6 × P=256 temporal profile.
-constexpr int64_t QWEN3_5_VISION_GENERIC_MAX_SEQ = 4096;
-constexpr int64_t QWEN3_5_VISION_MAX_KEEPALIVE_SEQ = 4608;
 constexpr int64_t G05_MAX_CAMERA_BATCH = 3;
+// Temporal execution has a fixed semantic shape, independent of spatial KV
+// capacity. Reserve its position rows before Python retains the fixed buffer.
+constexpr int64_t G05_TEMPORAL_MAX_SEQ = G05_MAX_CAMERA_BATCH * 6 * 256;
+constexpr int64_t QWEN3_5_VISION_SDPA_MAX_KV_ROWS = int64_t{UINT16_MAX} * 16;
 constexpr int64_t G05_VISION_HIGH_ENCODER_ACTIVATION_SITE = 3127033570831610403LL;
 constexpr int64_t G05_VISION_HIGH_MERGER_ACTIVATION_SITE = 7199989347316866274LL;
 constexpr int64_t G05_COMPACT_STEP0_FRAMES = 3;
@@ -291,9 +291,25 @@ static bool dbg_q_enabled() {
 namespace v3 {
 
 Qwen3_5VisionModel::Qwen3_5VisionModel() {
-    // Publish the existing native planning bound, not a new numeric certificate.
-    // Python cache capacity and configure_execution_geometry remain narrower gates.
-    set_chunk_envelope(QWEN3_5_VISION_GENERIC_MAX_SEQ, 0);
+    // Compatibility default for direct native callers; adapters bind the
+    // requested cache capacity before installing any weights.
+    cache_capacity_ = 4096;
+    keepalive_capacity_ = std::max(cache_capacity_, G05_TEMPORAL_MAX_SEQ);
+    set_chunk_envelope(cache_capacity_, 0);
+}
+
+void Qwen3_5VisionModel::configure_cache_capacity(int64_t max_seq_len) {
+    TORCH_CHECK(max_seq_len > 0 &&
+                    max_seq_len <= (std::numeric_limits<int64_t>::max() - 128) / 2,
+                "Qwen3.5 Vision capacity must be positive and fit position storage");
+    TORCH_CHECK(num_layers() == 0 && get_last_resolved_chunk_size() == 0 &&
+                    !position_idx_keepalive_.defined() && !q_ddr_buf_.defined() &&
+                    !hidden_buf_.defined() && !merged_buf_.defined(),
+                "Qwen3.5 Vision cache capacity must be bound before weights or fixed-DMA storage");
+    set_chunk_envelope(max_seq_len, 0);
+    cache_capacity_ = max_seq_len;
+    keepalive_capacity_ = std::max(max_seq_len, G05_TEMPORAL_MAX_SEQ);
+    invalidate_model_state();
 }
 
 void Qwen3_5VisionModel::configure_execution_cores(int64_t cores) {
@@ -395,10 +411,11 @@ void Qwen3_5VisionModel::configure_execution_geometry(
     TORCH_CHECK(num_cores() == 8 ||
                     (temporal_num_frames == 1 && camera_batch_count == 1 && !compact_input),
                 "Reduced Qwen3.5 Vision admits only single-image spatial execution");
-    TORCH_CHECK(execution_len > 0 &&
-                    execution_len <= QWEN3_5_VISION_MAX_KEEPALIVE_SEQ,
+    TORCH_CHECK(execution_len > 0 && execution_len <= keepalive_capacity_,
                 "Qwen3_5VisionModel: execution_len=", execution_len,
-                " must be in (0, ", QWEN3_5_VISION_MAX_KEEPALIVE_SEQ, "]");
+                " exceeds installed physical capacity ", keepalive_capacity_);
+    TORCH_CHECK(execution_len <= QWEN3_5_VISION_SDPA_MAX_KV_ROWS,
+                "RPU_PLANNER_REJECT:CAPABILITY: Qwen3.5 Vision key length exceeds the kernel register domain");
     TORCH_CHECK(temporal_num_frames >= 1,
                 "Qwen3_5VisionModel: temporal_num_frames must be positive");
     TORCH_CHECK(camera_batch_count >= 1 &&
@@ -427,10 +444,9 @@ void Qwen3_5VisionModel::configure_execution_geometry(
         current_output_patches_ =
             camera_batch_count * temporal_patches_per_frame_;
     } else {
-        TORCH_CHECK(execution_len <= QWEN3_5_VISION_GENERIC_MAX_SEQ,
-                    "Qwen3_5VisionModel: generic/single-frame vision supports "
-                    "at most ", QWEN3_5_VISION_GENERIC_MAX_SEQ,
-                    " patches, got ", execution_len);
+        TORCH_CHECK(execution_len <= cache_capacity_,
+                    "Qwen3_5VisionModel: spatial input exceeds installed KV capacity ",
+                    cache_capacity_, "; got ", execution_len);
         TORCH_CHECK(camera_batch_count == 1 ||
                         (execution_len == camera_batch_count * 256 &&
                          g05_k1_camera_group_available(camera_batch_count)),
@@ -563,9 +579,9 @@ at::Tensor Qwen3_5VisionModel::forward_impl(
     TORCH_CHECK(input.dim() == 3 || compact_input,
                 "Qwen3_5VisionModel::forward: input must be 3D [1,N,H] or the "
                 "canonical compact 5D [1,18,3,256,256], got ", input.dim(), "D");
-    TORCH_CHECK(num_patches_in > 0 && num_patches_in <= QWEN3_5_VISION_MAX_KEEPALIVE_SEQ,
+    TORCH_CHECK(num_patches_in > 0 && num_patches_in <= keepalive_capacity_,
                 "Qwen3_5VisionModel::forward: num_patches=", num_patches_in,
-                " must be in (0, MAX_KEEPALIVE_SEQ=", QWEN3_5_VISION_MAX_KEEPALIVE_SEQ, "]");
+                " exceeds installed physical capacity ", keepalive_capacity_);
     TORCH_CHECK(input.size(0) == 1,
                 "Qwen3_5VisionModel::forward: batch must be 1, got ", input.size(0));
     if (!compact_input) {
@@ -734,7 +750,7 @@ at::Tensor Qwen3_5VisionModel::forward_impl(
     // adapter 可在建图前把 legacy cap 翻译到本 handle。q_ddr_buf_ 存每 core 的 rope 后 Q
     // 跨两相（Phase1 emit_kv_first_body 写 / Phase2 build_layer_subgraph 读）。
     //
-    // 按 MAX_KEEPALIVE_SEQ 铺满、一次分配后**永不重分配**。
+    // 按 cold install 绑定的 keepalive_capacity_ 铺满，Graph 存活期间不重分配。
     // 不能沿用 gemma 的 grow-only（rpu_gemma_model.cpp:440-448，本文件原样抄来）：存/读 Q 走
     // 的是 FIXED DMA，其地址在 BUILD 时写进 kd_buf，而 REPLAY 的 sync-only 快路径
     // （graph_runtime_execute.cpp:842-885）只对登记过的 mutable DMA 调 update_dma_kernel，
@@ -743,11 +759,11 @@ at::Tensor Qwen3_5VisionModel::forward_impl(
     // 糊掉它。（Q 自身反而是对的：存和读烤的是同一个旧地址+旧 stride，自洽。）
     // Replay's sync-only fast path does not rebuild fixed DMA nodes, so the
     // backing allocation must remain stable for the graph lifetime.
-    // 铺满可行的前提：num_patches 有硬上限（本函数开头的 TORCH_CHECK）。
+    // 请求必须在安装时分配的容量内（本函数开头的 TORCH_CHECK）。
     if (temporal_num_frames == 1 && !q_ddr_buf_.defined()) {
         const int64_t local_q_dim = (num_q_heads() / attention_tp_) * head_dim();
         q_ddr_buf_ = at::empty(
-            {(int64_t)attention_tp_, QWEN3_5_VISION_MAX_KEEPALIVE_SEQ, local_q_dim},
+            {(int64_t)attention_tp_, keepalive_capacity_, local_q_dim},
             input.options());
     }
     if (temporal_num_frames > 1 && !temporal_k_cache_.defined()) {
@@ -832,7 +848,7 @@ at::Tensor Qwen3_5VisionModel::forward_impl(
         }
         if (!hidden_buf_.defined()) {
             hidden_buf_ = at::empty(
-                {1, QWEN3_5_VISION_MAX_KEEPALIVE_SEQ, hidden_size()}, input.options());
+                {1, keepalive_capacity_, hidden_size()}, input.options());
         }
         // Narrow to the live length — the framework reads seq_len off size(1), and
         // hidden_buf_ is padded to MAX. Offset 0, and dim 0 is size 1, so the view
@@ -904,7 +920,7 @@ at::Tensor Qwen3_5VisionModel::forward_impl(
                     "Qwen3_5VisionModel::forward: fusion_row_starts require fusion_target");
         if (!merged_buf_.defined()) {
             merged_buf_ = at::empty(
-                {1, QWEN3_5_VISION_MAX_KEEPALIVE_SEQ / QWEN3_5_SPATIAL_MERGE_UNIT,
+                {1, keepalive_capacity_ / QWEN3_5_SPATIAL_MERGE_UNIT,
                  out_hidden_size_},
                 input.options());
         }
@@ -4379,6 +4395,8 @@ void Qwen3_5VisionModel::set_rope_tables(const at::Tensor& freq_cos, const at::T
                 freq_cos.dim(), "/", freq_sin.dim(), "D");
     TORCH_CHECK(freq_cos.sizes() == freq_sin.sizes(),
                 "qwen3_5_vision_set_rope: freq_cos / freq_sin shape mismatch");
+    TORCH_CHECK(freq_cos.size(0) > 0 && freq_cos.size(0) <= int64_t{INT16_MAX} + 1,
+                "qwen3_5_vision_set_rope: table height exceeds int16 position indices");
     TORCH_CHECK(orig_head_dim_ > 0,
                 "qwen3_5_vision_set_rope: call set_weights() first");
     TORCH_CHECK(freq_cos.size(1) == orig_head_dim_ / 4,
@@ -4401,7 +4419,7 @@ void Qwen3_5VisionModel::set_rope_tables(const at::Tensor& freq_cos, const at::T
     // guarantees 32B. Mirror the adapter's overallocate+narrow alignment scheme.
     if (!position_idx_keepalive_.defined()) {
         auto storage = at::empty(
-            {QWEN3_5_VISION_MAX_KEEPALIVE_SEQ * 2 + 128},
+            {keepalive_capacity_ * 2 + 128},
             at::TensorOptions().dtype(at::kShort).device(at::kPrivateUse1));
         const uint64_t raw = RpuGetDevAddr(storage.data_ptr<int16_t>());
         const int64_t off_bytes =
@@ -4410,8 +4428,8 @@ void Qwen3_5VisionModel::set_rope_tables(const at::Tensor& freq_cos, const at::T
                     "qwen3_5_vision_set_rope: cannot 256B-align position_idx keepalive");
         position_idx_keepalive_ = storage
             .narrow(0, off_bytes / static_cast<int64_t>(sizeof(int16_t)),
-                    QWEN3_5_VISION_MAX_KEEPALIVE_SEQ * 2)
-            .view({QWEN3_5_VISION_MAX_KEEPALIVE_SEQ, 2});
+                    keepalive_capacity_ * 2)
+            .view({keepalive_capacity_, 2});
         position_idx_keepalive_.zero_();
         TORCH_CHECK(
             (RpuGetDevAddr(position_idx_keepalive_.data_ptr<int16_t>()) & 0xFFu) == 0,
@@ -4577,9 +4595,8 @@ void Qwen3_5VisionModel::set_temporal(
                 "qwen3_5_vision_set_temporal: temporal_pe must be [6,1024], got ",
                 temporal_pe.sizes());
 
-    // Only this validated installed temporal capability admits the larger bound.
-    // The setter also retires any earlier cold native-domain query snapshot.
-    set_chunk_envelope(QWEN3_5_VISION_MAX_KEEPALIVE_SEQ, 0);
+    // Keep spatial capacity while admitting the exact temporal input geometry.
+    set_chunk_envelope(keepalive_capacity_, 0);
     temporal_pe_ = temporal_pe;
     temporal_num_frames_ = num_frames;
     temporal_patches_per_frame_ = patches_per_frame;
@@ -4590,6 +4607,11 @@ void Qwen3_5VisionModel::set_temporal(
 }  // namespace v3
 
 using Qwen3_5VisionRegistry = ModelHandleRegistry<v3::Qwen3_5VisionModel>;
+
+void rpu_qwen3_5_vision_set_cache_capacity(int64_t handle, int64_t max_seq_len) {
+    Qwen3_5VisionRegistry::get(handle, "rpu_qwen3_5_vision_set_cache_capacity")
+        ->configure_cache_capacity(max_seq_len);
+}
 
 void rpu_qwen3_5_vision_prepare_persistent_spm(int64_t handle, int64_t execution_len) {
     Qwen3_5VisionRegistry::get(handle, "rpu_qwen3_5_vision_prepare_persistent_spm")

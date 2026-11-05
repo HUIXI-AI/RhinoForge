@@ -82,7 +82,7 @@ def test_fused_action_keeps_exact_native_chunk_override():
     source = (root / 'src/fused/rpu_wall_oss_action_step_model.cpp').read_text(encoding='utf-8')
     assert 'configured_chunk_size_' in source
     assert 'ceil16(horizon)' in source
-    assert 'set_chunk_envelope(/*max_kv_len=*/8192, /*chunk=*/chunk_size)' in source
+    assert 'set_chunk_envelope(/*max_kv_len=*/cos.size(0), /*chunk=*/chunk_size)' in source
     assert source.count('set_chunk_size_override(configured_chunk_size_)') >= 3
     assert 'set_chunk_size_override(0);' not in source
 

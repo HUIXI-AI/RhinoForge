@@ -1,4 +1,4 @@
-# G05 K1: 3 real cameras, one frame each, ten FM steps.
+# G0.5: 3 real cameras, one frame each, ten FM steps.
 # Edit linear_accumulation (acc16/acc32), math_precision (base/high) and text_lengths.
 # For one length use text_tokens instead; the two fields are exclusive.
 # Actual prefix = T + 193; no fake token/image padding.

@@ -57,7 +57,6 @@ _PROFILE = {
 }
 _MROPE_SECTION = [16, 24, 24]
 _MAX_SEQ_LEN = 4096
-_CERTIFIED_MAX_KV_LEN = 1936
 _CERTIFIED_CHUNK_SIZE = 176
 _DEFAULT_LOGICAL_PREFILL = 1904
 _DEFAULT_EXECUTION_PREFILL = 1936
@@ -228,7 +227,7 @@ class Qwen25VLBackbone:
         plan_box = {}
         execution_seq, planned_chunk = plan_bounded_prefill_execution(
             logical_seq,
-            min(int(self.cache.max_seq_len), _CERTIFIED_MAX_KV_LEN),
+            int(self.cache.max_seq_len),
             padding_budget,
             execution_owner=self,
             execution_component="system2_backbone",
@@ -385,10 +384,8 @@ def build_qwen25vl_backbone(
         errors.append(f"mrope_section={actual_mrope!r} (expected {_MROPE_SECTION!r})")
     if layer_indices is not None:
         errors.append("layer_indices must be None (partial checkpoints are not accepted)")
-    if max_seq_len != _MAX_SEQ_LEN:
-        errors.append(
-            f"max_seq_len={max_seq_len!r} (expected {_MAX_SEQ_LEN})"
-        )
+    if type(max_seq_len) is not int or max_seq_len < 1:
+        errors.append("max_seq_len must be a positive integer")
     if attn_tp != 4:
         errors.append(f"attn_tp={attn_tp!r} (expected 4)")
     if w8a16 is not True:
@@ -486,7 +483,7 @@ def build_qwen25vl_backbone(
     try:
         set_weights(handle, *args)
         torch.ops.rpu.causal_decoder_set_chunk_envelope(
-            handle, _CERTIFIED_MAX_KV_LEN, _CERTIFIED_CHUNK_SIZE)
+            handle, int(max_seq_len), _CERTIFIED_CHUNK_SIZE)
         torch.ops.rpu.causal_decoder_set_chunk_size_override(handle, 0)
         Qwen25VLBackbone.__init__(pending,
             handle=handle, cache=cache,

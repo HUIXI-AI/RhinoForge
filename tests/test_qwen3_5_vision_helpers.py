@@ -52,6 +52,9 @@ def _planner_ops(monkeypatch):
     monkeypatch.setattr(_execution, "_UNSAFE_PROCESS_REASON", None)
     monkeypatch.setenv("QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED", "1")
     monkeypatch.setattr(
+        _vision.torch.ops.rpu, "qwen3_5_vision_set_cache_capacity", MagicMock(), raising=False
+    )
+    monkeypatch.setattr(
         _vision.torch.ops.rpu,
         "qwen3_5_vision_set_chunk_size_cap",
         MagicMock(),
@@ -705,18 +708,34 @@ def test_vision_install_requires_planner_ops_before_handle_creation(monkeypatch)
     convert.assert_not_called()
 
 
-def test_vision_install_rejects_cache_length_above_native_generic_limit(
-    monkeypatch,
-):
+@pytest.mark.parametrize("capacity", [0, -1, True, 4096.0])
+def test_vision_install_rejects_invalid_cache_length(monkeypatch, capacity):
     create = MagicMock(side_effect=AssertionError("must not create handle"))
     monkeypatch.setattr(
         _vision.torch.ops.rpu, "qwen3_5_vision_create", create, raising=False
     )
-    with pytest.raises(ValueError, match=r"\[1, 4096\]"):
+    with pytest.raises(ValueError, match="positive integer"):
         _vision.install_qwen3_5_vision_for_rpu(
-            _runtime_capable_vision(), max_seq_len=4097
+            _runtime_capable_vision(), max_seq_len=capacity
         )
     create.assert_not_called()
+
+
+@pytest.mark.parametrize("capacity", [4097, 16384, 32768])
+def test_vision_install_binds_requested_capacity_before_weights(monkeypatch, capacity):
+    vision = _runtime_capable_vision()
+    destroy = MagicMock()
+    monkeypatch.setattr(torch.ops.rpu, "qwen3_5_vision_create", lambda: 17, raising=False)
+    monkeypatch.setattr(torch.ops.rpu, "qwen3_5_vision_destroy", destroy, raising=False)
+
+    def stop(*args, **kwargs):
+        torch.ops.rpu.qwen3_5_vision_set_cache_capacity.assert_called_once_with(17, capacity)
+        raise RuntimeError("reached weight boundary")
+
+    monkeypatch.setattr(_vision, "_convert_vision_block_weights_for_rpu", stop)
+    with pytest.raises(RuntimeError, match="reached weight boundary"):
+        _vision.install_qwen3_5_vision_for_rpu(vision, max_seq_len=capacity)
+    destroy.assert_called_once_with(17)
 
 
 def _complete_vision_descriptor():

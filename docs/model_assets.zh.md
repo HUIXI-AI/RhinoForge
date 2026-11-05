@@ -28,9 +28,8 @@ RhinoForge 不分发模型 checkpoint。请从模型 owner 或授权资产渠道
 
 公开 Wall-OSS 底座来源为
 [`x-square-robot/wall-oss-0.5`](https://huggingface.co/x-square-robot/wall-oss-0.5)。
-按 [Wall-OSS 示例](../examples/configs/README.md)使用其 processor、normalizer
-和动作定义。G0.5 的[配置](../examples/configs/g05/2cam/fp16.toml)记录了来源、
-revision、subfolder 和实现。请查阅模型 owner 的访问与许可条款及
+按 [Wall-OSS 示例](../examples/configs/wall_oss/README.md)使用其 processor、normalizer
+和动作定义。请查阅模型 owner 的访问与许可条款及
 [第三方声明](../THIRD_PARTY_NOTICES.md)；RhinoForge 的源码许可证不授予这些权重的使用权。
 
 保留完整 checkpoint，包括配置、tokenizer 和 processor 文件。Pi0.5 的 SigLIP

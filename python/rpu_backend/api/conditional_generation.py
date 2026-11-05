@@ -69,8 +69,14 @@ class RPUModelForConditionalGeneration:
         dtype: torch.dtype = torch.float16,
         device: str | torch.device | None = None,
         rpu_execution=None,
+        max_seq_len: int | None = None,
         **hf_kwargs,
     ):
+        if max_seq_len is not None:
+            from numbers import Integral
+            if isinstance(max_seq_len, bool) or not isinstance(max_seq_len, Integral) or max_seq_len <= 0:
+                raise ValueError("max_seq_len must be a positive integer")
+            max_seq_len = int(max_seq_len)
         execution_config = None
         if not (
             isinstance(rpu_execution, Mapping)
@@ -243,6 +249,8 @@ class RPUModelForConditionalGeneration:
                 )
         model.eval()
         model._rpu_execution = execution_config
+        if max_seq_len is not None:
+            model._rpu_requested_max_seq_len = max_seq_len
 
         adapter = adapter_cls(model)
         adapter._rpu_execution = execution_config

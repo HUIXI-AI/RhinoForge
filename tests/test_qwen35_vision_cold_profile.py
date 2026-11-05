@@ -38,6 +38,7 @@ def test_g05_k1_native_fast_replay_keeps_build_and_other_vision_profiles(tmp_pat
 #include <cassert>
 #include <cstdint>
 #include <stdexcept>
+#include <vector>
 #define TORCH_CHECK(ok, ...) do { if (!(ok)) throw std::runtime_error(#ok); } while(false)
 struct ChunkInfo {};
 struct ChunkPlan {};
@@ -46,6 +47,7 @@ struct ModelStaticConfig {
     int num_layers=0, cross_layer_batch_size=0, body_iterations=1;
     bool fast_replay_skip_layer_loop=false, fast_replay_skip_preload=false;
     bool fast_replay_bake_post_fn=false, batch_decode_active=false;
+    bool replay_reemit_layer_body=false;
     void (FusedModelBase::*preload_fn)()=nullptr;
     void (FusedModelBase::*pre_layers_fn)()=nullptr;
     void (FusedModelBase::*post_layers_fn)()=nullptr;
@@ -103,7 +105,11 @@ struct Context {
     bool has_complete_physical_manifest() const { return true; }
     void inherit_physical_routes_from_matching_graph_replay() { ++inherited; }
 };
-struct Impl { uint64_t pipeline_lease_epoch_=0; Context ctx_; } impl;
+struct ReplayPatch { int kernel_id=0, reg_lo=0, value=0, expected_count=0; };
+enum class KernelId { unused };
+void patch_replay_kernel_u32(KernelId,int,int,int) { assert(false); }
+struct Impl { uint64_t pipeline_lease_epoch_=0; Context ctx_;
+    std::vector<ReplayPatch> replay_kernel_u32_patches_; } impl;
 struct RuntimePolicy { bool fmb_fast_replay=false; };
 int actual_body_iterations(const ModelStaticConfig& static_cfg,
                            bool matching_physical_manifest_replay_branch=true) {
@@ -294,7 +300,7 @@ def test_actual_qwen35_cold_profile_and_temporal_admission(tmp_path):
     source = (ROOT / "src/fused/rpu_qwen3_5_vision_model.cpp").read_text()
     header = (ROOT / "src/fused/rpu_qwen3_5_vision_model.h").read_text()
     base = (ROOT / "src/core/fused_model_base.cpp").read_text()
-    constants = source[source.index("constexpr int64_t QWEN3_5_VISION_GENERIC_MAX_SEQ"):
+    constants = source[source.index("constexpr int64_t G05_MAX_CAMERA_BATCH"):
                        source.index("// STEP 0 row-chunk.")]
     constructor = ("{}" if "Qwen3_5VisionModel() = default;" in header else
                    _body(source, "Qwen3_5VisionModel::Qwen3_5VisionModel()"))
@@ -318,6 +324,7 @@ struct Tensor {
     Device device() const { return {device_type}; }
     int scalar_type() const { return dtype; }
     bool is_contiguous() const { return contiguous; }
+    bool defined() const { return false; }
     int64_t dim() const { return rank; }
     int64_t size(int axis) const { return axis ? width : rows; }
 };
@@ -354,13 +361,15 @@ struct FusedModelBase {
 void FusedModelBase::set_chunk_envelope(int64_t max_kv_len, int64_t chunk) __SETTER__
 std::vector<int64_t> FusedModelBase::installed_profile_identity() const __PROFILE__
 struct Qwen3_5VisionModel : FusedModelBase {
-    at::Tensor temporal_pe_;
+    at::Tensor temporal_pe_, position_idx_keepalive_,q_ddr_buf_,hidden_buf_,merged_buf_;
     int64_t temporal_num_frames_=0, temporal_patches_per_frame_=0;
     bool has_temporal_=false, has_step0_=true, high_precision_=false;
     int64_t patch_dim_=1536, current_temporal_num_frames_=1, current_camera_batch_count_=1;
     bool current_compact_step0_=false;
     int64_t current_output_patches_=0, generation=0;
+    int64_t cache_capacity_=0, keepalive_capacity_=0;
     Qwen3_5VisionModel();
+    void configure_cache_capacity(int64_t);
     void set_temporal(const at::Tensor&, int64_t, int64_t);
     void configure_execution_geometry(int64_t, int64_t, int64_t, bool);
     void invalidate_model_state() { ++generation; }
@@ -368,6 +377,7 @@ struct Qwen3_5VisionModel : FusedModelBase {
     bool g05_k1_camera_group_available(int64_t) const { return false; }
 };
 Qwen3_5VisionModel::Qwen3_5VisionModel() __CTOR__
+void Qwen3_5VisionModel::configure_cache_capacity(int64_t max_seq_len) __CAPACITY__
 void Qwen3_5VisionModel::set_temporal(const at::Tensor& temporal_pe,
     int64_t num_frames, int64_t patches_per_frame) __TEMPORAL__
 void Qwen3_5VisionModel::configure_execution_geometry(int64_t execution_len,
@@ -383,7 +393,7 @@ void profile(const Qwen3_5VisionModel& model) {
 }
 int main() {
     Qwen3_5VisionModel generic;
-    assert(generic.chunk_envelope().max_kv_len == QWEN3_5_VISION_GENERIC_MAX_SEQ);
+    assert(generic.chunk_envelope().max_kv_len == 4096);
     assert(generic.chunk_envelope().chunk == 0);
     const auto before=generic.installed_profile_identity();
     generic.configure_execution_geometry(4096,1,1,false);
@@ -417,7 +427,7 @@ int main() {
     generic.impl.kv_cost_layout_scope_=5;
     generic.impl.kv_cost_snapshot_reason_="READY";
     generic.set_temporal(at::Tensor{},6,256);
-    assert(generic.chunk_envelope().max_kv_len==QWEN3_5_VISION_MAX_KEEPALIVE_SEQ);
+    assert(generic.chunk_envelope().max_kv_len==G05_TEMPORAL_MAX_SEQ);
     assert(generic.chunk_envelope().chunk==0 && generic.generation==1);
     assert(generic.impl.kv_cost_candidates_.empty() && !generic.impl.kv_cost_planning_context_);
     assert(generic.impl.kv_cost_layout_scope_==0 &&
@@ -430,6 +440,22 @@ int main() {
     reject([&] { generic.configure_execution_geometry(4096,6,3,false); });
     assert(generic.chunk_envelope().max_kv_len==4608);
     profile(generic);
+    Qwen3_5VisionModel wide;
+    wide.layers=0;
+    wide.configure_cache_capacity(32768);
+    wide.layers=24;
+    wide.configure_execution_geometry(16384,1,1,false);
+    wide.configure_execution_geometry(32768,1,1,false);
+    reject([&] { wide.configure_execution_geometry(32769,1,1,false); });
+    wide.set_temporal(at::Tensor{},6,256);
+    assert(wide.chunk_envelope().max_kv_len==32768);
+    wide.configure_execution_geometry(4608,6,3,true);
+    Qwen3_5VisionModel huge;
+    huge.layers=0;
+    huge.configure_cache_capacity(2097152);
+    huge.layers=24;
+    huge.configure_execution_geometry(1048560,1,1,false);
+    reject([&] { huge.configure_execution_geometry(1048576,1,1,false); });
     Qwen3_5VisionModel reduced;
     reduced.cores=4;
     reduced.configure_execution_geometry(4096,1,1,false);
@@ -440,6 +466,7 @@ int main() {
 }
 '''
     for marker, value in (("__CONSTANTS__", constants), ("__CTOR__", constructor),
+        ("__CAPACITY__", _body(source, "void Qwen3_5VisionModel::configure_cache_capacity(")),
         ("__SETTER__", _body(base, "void FusedModelBase::set_chunk_envelope(")),
         ("__INVALIDATE_PLANNER__", _body(base, "void FusedModelBase::invalidate_planner_cache()")),
         ("__PROFILE__", _body(base, "std::vector<int64_t> FusedModelBase::installed_profile_identity()")),
@@ -459,8 +486,8 @@ int main() {
 
 def test_existing_python_cache_and_native_finer_bounds_stay_independent():
     source = (ROOT / "python/rpu_backend/adapters/qwen3_5/vision.py").read_text()
-    assert "not 0 < int(max_seq_len) <= 4096" in source
-    assert re.search(r"4608 if int\(temporal_num_frames\) > 1 else 256\*int\(camera_batch_count\) if int\(camera_batch_count\) in \(2,3\) else min\(\s*4096,", source)
+    assert "or int(max_seq_len) <= 0" in source
+    assert re.search(r"4608 if int\(temporal_num_frames\) > 1 else 256\*int\(camera_batch_count\) if int\(camera_batch_count\) in \(2,3\) else min\(\s*65535 \* 16,", source)
     assert '"max_seq_len", logical_len)' in source
     native = (ROOT / "src/fused/rpu_qwen3_5_vision_model.cpp").read_text()
     setter = _body(native, "void Qwen3_5VisionModel::set_chunk_size_cap(")

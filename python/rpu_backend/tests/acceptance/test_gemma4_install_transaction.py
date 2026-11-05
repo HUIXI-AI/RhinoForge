@@ -373,15 +373,13 @@ def test_invalid_max_seq_fails_before_claim_or_native_create(
     assert install_runtime["events"] == []
 
 
-def test_max_seq_above_checkpoint_horizon_fails_before_claim(install_runtime):
+def test_requested_capacity_above_checkpoint_default_is_installed(install_runtime):
     adapter = _adapter()
     adapter.model._rpu_max_seq = 131073
 
-    with pytest.raises(ValueError, match="exceeds the certified model horizon"):
-        adapter.to_rpu()
-
-    assert install_runtime["claims"] == []
-    assert install_runtime["events"] == []
+    model = adapter.to_rpu()
+    assert model.build_rpu_cache().max_seq_len == 131073
+    assert install_runtime["claims"]
 
 
 def test_prepare_failure_releases_owner_without_creating_handle(

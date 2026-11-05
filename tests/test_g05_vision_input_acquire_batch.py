@@ -25,12 +25,12 @@ def test_vision_four_original_ranges_before_delayed_consumer(tmp_path, monkeypat
     body = body.replace('__asm__ volatile("dsb sy" ::: "memory");',
                         "system_barrier();")
     allocation = """at::empty(
-                {1, QWEN3_5_VISION_MAX_KEEPALIVE_SEQ / QWEN3_5_SPATIAL_MERGE_UNIT,
+                {1, keepalive_capacity_ / QWEN3_5_SPATIAL_MERGE_UNIT,
                  out_hidden_size_},
                 input.options())"""
     assert body.count(allocation) == 1
     body = body.replace(allocation,
-                        "bank({1, QWEN3_5_VISION_MAX_KEEPALIVE_SEQ / "
+                        "bank({1, keepalive_capacity_ / "
                         "QWEN3_5_SPATIAL_MERGE_UNIT, out_hidden_size_})")
     predicates = []
     for name in ("is_g05_k1_fast_replay_profile", "g05_k1_b3_available",
@@ -54,7 +54,7 @@ def test_vision_four_original_ranges_before_delayed_consumer(tmp_path, monkeypat
 #include <optional>
 #include <vector>
 bool g_rpu_ddr_flush_enabled=false,g_rpu_ddr_flush_force_enabled=true;
-constexpr int64_t QWEN3_5_VISION_MAX_KEEPALIVE_SEQ=4608;
+constexpr int64_t keepalive_capacity_=4608;
 constexpr int64_t QWEN3_5_SPATIAL_MERGE_UNIT=4,G05_MAX_CAMERA_BATCH=3;
 constexpr int64_t G05_COMPACT_CHANNELS=3,G05_COMPACT_PATCH_SIDE=16;
 constexpr int64_t G05_COMPACT_IMAGE_SIDE=256,G05_TEMPORAL_PATCH_GROUP=16;

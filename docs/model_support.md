@@ -21,7 +21,7 @@ name alone does not specify its checkpoint, precision or supported shapes.
 | Gemma4 | `Gemma4Adapter`; [guide](../examples/configs/gemma4/README.md) | E4B Instruct text generation; CPU frontend and device decoder |
 | DINOv3 | `DINOv3Adapter`; [guide](../examples/configs/dinov3/README.md) | Preprocessed images |
 | Pi0.5 | `Pi05Policy`; [guide](../examples/configs/pi05/README.md) | Checkpoint-compatible observations; optional explicit action noise |
-| Wall-OSS | `WallOssPolicy`; [base](../examples/configs/wall_oss/README.md), [RTC](../examples/configs/wall_oss/rtc/README.md), [sorting](../examples/configs/wall_oss/sorting/README.md) | Images, instruction, proprioception and profile masks |
+| Wall-OSS | `WallOssPolicy`; [base](../examples/configs/wall_oss/README.md) | Images, instruction, proprioception and profile masks |
 | HY Embodied / HyVLA | `HyEmbodiedPolicy` or component adapter; [UMI](../examples/configs/hy_embodied/README.md), [HyVLA](../examples/configs/hy_vla/README.md) | Preprocessed camera, text and state tensors |
 | GR00T | Dedicated adapter/runner; [guide](../examples/configs/gr00t/README.md) | Checkpoint-compatible observation batch and backbone assets |
 | G0.5 | `patch_g05_policy_for_rpu`; [guide](../examples/configs/g05/README.md) | Prepared camera/text/state input bundle and external policy source |

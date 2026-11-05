@@ -48,11 +48,11 @@ summary = true
 修改同一 TOML 中的 `level` 后，运行命令保持不变：
 
 ```bash
-python examples/run.py --config /tmp/g05.toml
+python examples/run.py --config /tmp/pi05.toml
 ```
 
 `summary = false` 只关闭 `[MODEL]` 和 `[PERF]`，不改变诊断等级过滤。没有 `[logging].file` 字段。原生 stdout/stderr 保留在 `run.output_dir` 下的 `native-*.stdout.log`、`native-*.stderr.log`；运行结束时按所选级别回放，因此可能出现在运行摘要之后；SDK 原始输出不会直接刷终端。完整 `report.json` 的保存不受终端日志级别影响。
 
 ## 输出文件
 
-`run.output_dir` 指定输出位置；runner 可以在其中创建子目录，例如 G0.5 的 `text_N/`。`report.json` 记录实际配置、输入身份和产物路径；动作、特征和生成结果的文件名见模型页。文件保存不受终端日志级别影响。
+`run.output_dir` 指定输出位置；runner 可以在其中创建子目录。`report.json` 记录实际配置、输入身份和产物路径；动作、特征和生成结果的文件名见模型页。文件保存不受终端日志级别影响。

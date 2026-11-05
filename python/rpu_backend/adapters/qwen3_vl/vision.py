@@ -1644,8 +1644,8 @@ def _install_qwen3_vl_vision_for_rpu_impl(
             up to 768×768 px with patch_size=16.
         max_seq_len: RPUCache capacity. Default 2048. Equal-size image batches
             are split into groups that fit this capacity; a single image that
-            exceeds it fails before dispatch. The C++ side also caps position
-            keepalive at QWEN3VL_VISION_MAX_KEEPALIVE_SEQ (4096).
+            exceeds it fails before dispatch. The native position keepalive is
+            allocated to this same capacity during installation.
 
     Returns the C++ handle (also stashed at `vision_model._rpu_vision_handle`).
     """

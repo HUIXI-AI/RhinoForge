@@ -15,6 +15,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 PYTHON_ROOT = REPO_ROOT / "python" / "rpu_backend"
 CPP_ROOT = REPO_ROOT / "src"
 RUNTIME_CONFIG = REPO_ROOT / "docs" / "runtime_config.md"
+# Internal integration controls retain their runtime readers without becoming
+# part of the public configuration reference.
+INTERNAL_ENV_NAMES = frozenset({
+    "RPU_WALL_OSS_RTC_ALLOW_NUMERIC_BLOCKED",
+    "RPU_WALL_OSS_RTC_EMBODIMENT",
+})
 
 ENV_NAME_RE = re.compile(r"[A-Z_][A-Z0-9_]*\Z")
 ENV_PREFIXES = (
@@ -309,7 +315,8 @@ def _check() -> int:
 
     failed = False
 
-    missing = sorted(set(reads) - documented)
+    public_reads = set(reads) - INTERNAL_ENV_NAMES
+    missing = sorted(public_reads - documented)
     if missing:
         print(
             "FAIL: production environment reads missing from "
@@ -339,7 +346,7 @@ def _check() -> int:
 
     print(
         "PASS: docs/runtime_config.md covers all "
-        f"{len(reads)} production environment reads, and all "
+        f"{len(public_reads)} public production environment reads, and all "
         f"{len(declared)} documented variables are referenced"
     )
     return 0

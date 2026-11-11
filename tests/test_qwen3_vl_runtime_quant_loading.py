@@ -74,6 +74,18 @@ def test_lightnav_w8_quantizes_text_only_and_keeps_exact_admission():
     assert not runtime.is_qwen3_vl_runtime_quant_config(changed)
 
 
+def test_lightnav_conversion_copies_action_tokenizer_bundle(tmp_path):
+    source, destination = tmp_path / "source", tmp_path / "destination"
+    (source / "action_tokenizer").mkdir(parents=True)
+    (source / "action_tokenizer" / "manifest.json").write_text("{}")
+    destination.mkdir()
+    convert._copy_lightnav_action_tokenizer(source, destination)
+    assert (destination / "action_tokenizer" / "manifest.json").read_text() == "{}"
+
+    with pytest.raises(FileNotFoundError, match="action_tokenizer"):
+        convert._copy_lightnav_action_tokenizer(tmp_path / "missing", destination)
+
+
 @pytest.fixture(autouse=True)
 def bounded_threads():
     previous = torch.get_num_threads()

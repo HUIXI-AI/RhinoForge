@@ -93,6 +93,13 @@ def lightnav_w8_quant_config() -> dict:
     return result
 
 
+def _copy_lightnav_action_tokenizer(src: Path, dst: Path) -> None:
+    source = src / "action_tokenizer"
+    if not source.is_dir():
+        raise FileNotFoundError("LightNav source is missing action_tokenizer/")
+    shutil.copytree(source, dst / source.name)
+
+
 def _get(config, name, default=None):
     return config.get(name, default) if isinstance(config, dict) else getattr(config, name, default)
 
@@ -459,6 +466,8 @@ def convert_checkpoint(src: str | Path, dst: str | Path, *, bits: int = 8) -> di
         config["quant_config"] = quant_config
         (tmp / "config.json").write_text(json.dumps(config, indent=2) + "\n")
         _copy_sidecar_files(src, tmp, set(shards))
+        if is_lightnav:
+            _copy_lightnav_action_tokenizer(src, tmp)
         tmp.rename(dst)
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)

@@ -7,9 +7,9 @@
 `3015508b70fb6e30bbd66701e94c9b916dcb8df8`。模型每次固定输出 5 个 token：
 2 个指向 token 和 3 个 RVQ 动作 token。
 
-RhinoForge 复用现有 Qwen3-VL 4B 文本、视觉和 DeepStack 路径。LightNav 的
-156048 行词表不能使用要求输出维度按 128 对齐的融合列切分输出头，因此 decoder
-返回 hidden states 后，通过 TP8 行切分输出头计算 logits。该分支只允许精确的
+RhinoForge 复用现有 Qwen3-VL 4B 文本、视觉和 DeepStack 路径。LightNav 的完整
+156048 行词表不能使用要求输出维度按 128 对齐的融合列切分输出头；启用约束输出头
+后，4369 个候选补齐为 4480 行，可并入设备侧 decode Graph。该分支只允许精确的
 LightNav 配置，不放宽其他扩展词表模型。
 
 视觉缓存沿用上游按 2 帧 tubelet 建立的 key。每个 miss 只运行一次 ViT，并把
@@ -38,8 +38,48 @@ R1 运行时移除 `--check-config`。12/24/36/48/64 表示过去的历史帧数
 
 若业务已经采用上游 `VLN_EVAL_TRAJ_TOP1` action allowlist，可增加
 `--constrained-head`。它在冷装载时只保留 4369 个候选 token 的输出头，物理补齐到
-4480 行后使用 column-parallel Linear。该选项改变默认全词表解码范围，必须单独验证
-真实导航质量。
+4480 行后使用 column-parallel Linear，并把单 token decode 的输出头纳入同一个
+设备 Graph。该选项改变默认全词表解码范围，必须单独验证真实导航质量。
+
+## Prefill 与 Decode 设备优化
+
+这里复用了 Pi0.5 已验证的两个原则：固定执行结构后重放设备 Graph，以及把阶段末尾
+的小算子留在同一设备执行边界内。Prefill 开启受所有权检查保护的 fast replay；相同
+输入形状再次执行时复用已经构建的内核序列，但仍会根据本轮 prompt 计算完整注意力和
+KV。Decode 把 4480 行候选输出头融合进 decoder Graph，并使用 checked replay 更新
+当前位置和 KV 地址，避免每个 token 重走 Python 输出头和主机侧内核发射流程。
+
+以下命令不启用历史候选复验，只测标准的 5-token 自回归 decode：
+
+```bash
+python examples/lightnav_benchmark.py \
+  --checkpoint /path/to/LightNav-0 \
+  --lightnav-source /path/to/LightNav-0-source \
+  --history-frames 12,24,36,48,64 \
+  --repeats 5 \
+  --constrained-head \
+  --output benchmark_results/lightnav_0_r1_serial.json
+```
+
+R1 v1.2.0 上使用确定性 256×448 输入、每档 5 次取中位数。全历史缓存命中时：
+
+| 历史帧 | 准备 | 视觉 | Prefill | Decode 5 token | 总耗时 | 优化前总耗时 | 总耗时降幅 |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 12 | 19.1 ms | 71.5 ms | 147.1 ms | 209.9 ms | 448.0 ms | 460.1 ms | 2.6% |
+| 24 | 23.3 ms | 73.4 ms | 216.6 ms | 211.2 ms | 524.1 ms | 535.4 ms | 2.1% |
+| 36 | 25.1 ms | 75.6 ms | 292.9 ms | 215.1 ms | 609.5 ms | 610.9 ms | 0.2% |
+| 48 | 26.3 ms | 70.0 ms | 289.5 ms | 212.5 ms | 597.4 ms | 618.4 ms | 3.4% |
+| 64 | 27.1 ms | 72.6 ms | 305.9 ms | 213.0 ms | 618.3 ms | 635.6 ms | 2.7% |
+
+相对同一分支优化前结果，Decode 5 token 降低 2.1%–3.3%，Prefill 在多数长度降低
+2.4%–2.8%；36 帧历史全命中的 Prefill 变化为 0.1%。全未命中总耗时依次为
+803.9/1169.5/1521.7/1574.8/1764.0 ms，其中 36 帧档受视觉和 processor 波动影响，
+端到端比基线高 1.7%，但该档 Prefill 和 Decode 分别降低 2.3% 和 2.3%。全部 50 个
+计时请求的 token 序列与优化前逐项一致，缓存与重算的视觉特征最大绝对误差为
+`4.88e-4`。
+
+这项优化不复用上一请求的 token，也不减少 prompt token 数。历史帧增加后，池化后的
+视觉 token 仍会增加，因此 Prefill 耗时仍随输入长度增长。
 
 连续导航请求可增加 `--history-draft`。脚本把上一请求的 5 个 token 作为候选，将
 前 4 个候选追加到当前 prompt，一次 prefill 同时复验 5 个位置；全部一致时跳过

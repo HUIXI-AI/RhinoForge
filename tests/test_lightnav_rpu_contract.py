@@ -9,12 +9,17 @@ import types
 import pytest
 import torch
 
+import rpu_backend.adapters.qwen3_vl as qwen3_vl
 from rpu_backend.runtime.weights import transform_linear_weight
 
 
 SOURCE = (
     Path(__file__).resolve().parents[1]
     / "python/rpu_backend/adapters/qwen3_vl/__init__.py"
+).read_text()
+DECODE_REPLAY_SOURCE = (
+    Path(__file__).resolve().parents[1]
+    / "src/fused/rpu_qwen3vl_decode_replay.cpp"
 ).read_text()
 EXAMPLE_PATH = Path(__file__).resolve().parents[1] / "examples/lightnav_benchmark.py"
 SPEC = importlib.util.spec_from_file_location("lightnav_benchmark", EXAMPLE_PATH)
@@ -44,6 +49,70 @@ def test_benchmark_contract_fixes_five_tokens_and_history_set():
     assert BENCHMARK.parse_histories("12,24,36,48,64") == (12, 24, 36, 48, 64)
     with pytest.raises(argparse.ArgumentTypeError, match="positive even"):
         BENCHMARK.parse_histories("12,13")
+    assert 'rpu_execution={"prefill": {"fast_replay": True}}' in EXAMPLE_PATH.read_text()
+
+
+def test_lightnav_candidate_head_uses_checked_decode_replay():
+    assert "lightnav_candidate_head" in DECODE_REPLAY_SOURCE
+    assert "vocab_size_ == 4480" in DECODE_REPLAY_SOURCE
+    assert "profile.dtype, vocab_size_, hidden_size()" in DECODE_REPLAY_SOURCE
+
+
+def test_lightnav_candidate_head_reconfigures_native_decode_once(monkeypatch):
+    class Cache:
+        def __init__(self):
+            self.events = []
+
+        def begin_warmup(self):
+            self.events.append("warmup")
+
+        def clear(self):
+            self.events.append("clear")
+
+    cache = Cache()
+    text = types.SimpleNamespace(
+        _rpu_decoder_handle=7,
+        _rpu_text_graph_cache=cache,
+        _rpu_decoder_graph_cache=cache,
+    )
+    token_ids = torch.tensor([1, 2])
+    weight = torch.ones((128, 16), dtype=torch.float16)
+    model = types.SimpleNamespace(
+        config=object(),
+        model=types.SimpleNamespace(language_model=text),
+        _rpu_lightnav_candidate_token_ids=token_ids,
+        _rpu_lightnav_candidate_lm_head_w=weight,
+        _rpu_lightnav_constrained_head_enabled=False,
+    )
+    native_calls = []
+    monkeypatch.setattr(qwen3_vl, "_is_lightnav_profile", lambda _config: True)
+    monkeypatch.setattr(
+        qwen3_vl, "_text_decode_execution_plan",
+        lambda *args, **kwargs: native_calls.append(("plan", args, kwargs)),
+    )
+    monkeypatch.setattr(
+        torch.ops.rpu, "causal_decoder_set_lm_head",
+        lambda *args: native_calls.append(("set", args)), raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops.rpu, "causal_decoder_clear_lm_head",
+        lambda *args: native_calls.append(("clear", args)), raising=False,
+    )
+
+    assert qwen3_vl.set_lightnav_constrained_lm_head(model) is token_ids
+    assert cache.events == ["warmup", "clear"]
+    assert [call[0] for call in native_calls] == ["set", "plan"]
+    assert model._rpu_lightnav_constrained_head_enabled is True
+
+    qwen3_vl.set_lightnav_constrained_lm_head(model)
+    assert [call[0] for call in native_calls] == ["set", "plan"]
+
+    qwen3_vl.set_lightnav_constrained_lm_head(model, False)
+    assert cache.events == ["warmup", "clear", "warmup", "clear"]
+    assert [call[0] for call in native_calls] == [
+        "set", "plan", "clear", "plan",
+    ]
+    assert model._rpu_lightnav_constrained_head_enabled is False
 
 
 def test_benchmark_adds_current_frame_and_only_caches_history():

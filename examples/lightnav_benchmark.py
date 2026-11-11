@@ -498,6 +498,7 @@ def main() -> int:
         checkpoint,
         dtype=torch.float16,
         device="rpu",
+        rpu_execution={"prefill": {"fast_replay": True}},
         local_files_only=True,
         trust_remote_code=False,
     )

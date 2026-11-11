@@ -442,6 +442,8 @@ bool CausalDecoderModel::begin_qwen3vl_decode_replay(
         !lm_head_w_scale_.defined() && deepstack_lang_layers_.empty() && rope_position_base_ < 0 &&
         !layer_weights_.empty() && layer_weights_.front().q_w.defined() &&
         layer_weights_.front().q_w.scalar_type() == at::kHalf;
+    const bool lightnav_candidate_head = qwen3vl_fp16_decode_profile_ &&
+        fuse_lm_head_ && vocab_size_ == 4480 && !linear_acc32_;
     const bool ordinary = qwen3vl_ordinary_resident_prefill_profile_ || qwen3vl_4b_w8_profile_ || exact_8b || tts_predictor;
     const bool geometry = (num_layers() == 28 && hidden_size() == 2048 && intermediate_size() == 6144 && num_q_heads() == 16) ||
         (num_layers() == 36 && hidden_size() == 2560 && intermediate_size() == 9728 && num_q_heads() == 32) || exact_8b || tts_predictor;
@@ -454,7 +456,9 @@ bool CausalDecoderModel::begin_qwen3vl_decode_replay(
         !has_qk_norm_ || (!tts_predictor && !has_mrope_) || num_kv_heads() != 8 || head_dim() != 128 ||
         layer_weights_.size() != size_t(num_layers()) ||
         num_cores() != 8 || attn_tp() != 8 || mlp_tp() != 8 || lm_head_tp() != 8 ||
-        (!tts_predictor && (!fuse_lm_head_ || vocab_size_ != 151936)) || lm_head_exact_candidates_ || reuse_lm_head_output_ ||
+        (!tts_predictor && (!fuse_lm_head_ ||
+         (vocab_size_ != 151936 && !lightnav_candidate_head))) ||
+        lm_head_exact_candidates_ || reuse_lm_head_output_ ||
         !use_silu_ || nvfp4_ || has_qkv_bias_ || norm_slab_active() ||
         equal_two_prefill_ || configured_chunk_size_cap_ ||
         adarms_mutable_ || adarms_unroll_ || adarms_schedule_select_ || adarms_fused_bcast_enabled_ ||
@@ -476,7 +480,7 @@ bool CausalDecoderModel::begin_qwen3vl_decode_replay(
     // retain the generic recorded-Graph execution for those profiles.
     if (profile.acc32 && profile.dtype != at::kHalf) return false;
     if ((!tts_predictor && (!Qwen3VlDecodeReplayState::projection_shape(lm_head_w_, lm_head_w_scale_,
-            profile.dtype, 151936, hidden_size(), false) ||
+            profile.dtype, vocab_size_, hidden_size(), false) ||
         !cos_.defined() || cos_.dim() != 2 || cos_.size(0) <= 0 ||
         !position_ids_keepalive_.defined() || position_ids_keepalive_.dim() != 2 ||
         position_ids_keepalive_.size(0) <= 0 || position_ids_keepalive_.size(0) > cos_.size(0) ||

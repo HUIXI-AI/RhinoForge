@@ -7,11 +7,11 @@ Hugging Face revision `826dc5fbfa37afa8293d2e336d329b6ffc0bfb64` and upstream
 LightNav commit `3015508b70fb6e30bbd66701e94c9b916dcb8df8`. Every request
 produces exactly five tokens: two pointing tokens and three RVQ action tokens.
 
-RhinoForge reuses its Qwen3-VL 4B text, vision, and DeepStack paths. The
+RhinoForge reuses its Qwen3-VL 4B text, vision, and DeepStack paths. The full
 156048-row vocabulary cannot use the fused column-partitioned head, whose output
-dimension must be 128-aligned. The decoder therefore returns hidden states and
-an eager TP8 row-partitioned head computes logits. Admission remains restricted
-to the exact LightNav profile.
+dimension must be 128-aligned. With the constrained head enabled, its 4,369
+candidates are padded to 4,480 rows and fused into the device decode Graph.
+Admission remains restricted to the exact LightNav profile.
 
 The vision cache uses upstream two-frame tubelet keys. Each miss runs the ViT
 once and stores its pooler output plus three DeepStack levels on CPU. Post-ViT
@@ -45,8 +45,45 @@ before the next tier.
 
 When the application already uses upstream `VLN_EVAL_TRAJ_TOP1`, pass
 `--constrained-head` to install its 4,369-token action-allowlist projection,
-padded to 4,480 rows for column-parallel Linear. This opt-in changes the default
-full-vocabulary decoding domain and requires separate navigation-quality evaluation.
+padded to 4,480 rows for column-parallel Linear and fused into single-token
+decode. This opt-in changes the default full-vocabulary decoding domain and
+requires separate navigation-quality evaluation.
+
+## Prefill and decode device optimization
+
+This path applies two established Pi0.5 principles: replay a fixed device Graph
+and keep the stage-final projection inside the same device boundary. Prefill uses
+owner-checked fast replay. Decode fuses the 4,480-row candidate head into the
+decoder Graph and uses checked replay to patch the current position and KV
+addresses. It does not reuse tokens from an earlier request.
+
+Run the serial five-token path without `--history-draft`:
+
+```bash
+python examples/lightnav_benchmark.py \
+  --checkpoint /path/to/LightNav-0 \
+  --lightnav-source /path/to/LightNav-0-source \
+  --history-frames 12,24,36,48,64 \
+  --repeats 5 \
+  --constrained-head \
+  --output benchmark_results/lightnav_0_r1_serial.json
+```
+
+R1 v1.2.0 medians for the all-history-cached scenario are:
+
+| History | Prepare | Vision | Prefill | Decode 5 | Total | Previous total | Reduction |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 12 | 19.1 ms | 71.5 ms | 147.1 ms | 209.9 ms | 448.0 ms | 460.1 ms | 2.6% |
+| 24 | 23.3 ms | 73.4 ms | 216.6 ms | 211.2 ms | 524.1 ms | 535.4 ms | 2.1% |
+| 36 | 25.1 ms | 75.6 ms | 292.9 ms | 215.1 ms | 609.5 ms | 610.9 ms | 0.2% |
+| 48 | 26.3 ms | 70.0 ms | 289.5 ms | 212.5 ms | 597.4 ms | 618.4 ms | 3.4% |
+| 64 | 27.1 ms | 72.6 ms | 305.9 ms | 213.0 ms | 618.3 ms | 635.6 ms | 2.7% |
+
+Decode improves by 2.1%-3.3%. Prefill improves by 2.4%-2.8% for most lengths;
+the 36-frame all-history-cached result changes by 0.1%. The timed requests
+produce exactly the same token sequences as the previous implementation. More
+history still produces more pooled visual tokens, so prefill continues to grow
+with input length.
 
 For consecutive navigation requests, pass `--history-draft`. The benchmark uses
 the previous five tokens as a draft, appends its first four tokens to the current

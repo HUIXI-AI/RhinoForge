@@ -454,7 +454,30 @@ def set_lightnav_constrained_lm_head(model, enabled: bool = True):
     weight = state.get("_rpu_lightnav_candidate_lm_head_w")
     if token_ids is None or weight is None:
         raise RuntimeError("LightNav constrained lm_head is not installed")
-    state["_rpu_lightnav_constrained_head_enabled"] = bool(enabled)
+    enabled = bool(enabled)
+    if state.get("_rpu_lightnav_constrained_head_enabled", False) == enabled:
+        return token_ids
+    text = model.model.language_model
+    seen = set()
+    for name in ("_rpu_text_graph_cache", "_rpu_decoder_graph_cache"):
+        cache = getattr(text, name, None)
+        if cache is not None and id(cache) not in seen:
+            seen.add(id(cache))
+            cache.begin_warmup()
+            cache.clear()
+    if enabled:
+        torch.ops.rpu.causal_decoder_set_lm_head(
+            text._rpu_decoder_handle, weight,
+        )
+    else:
+        torch.ops.rpu.causal_decoder_clear_lm_head(
+            text._rpu_decoder_handle,
+        )
+    _text_decode_execution_plan(
+        text, text._rpu_decoder_handle,
+        graph_cache=text._rpu_text_graph_cache,
+    )
+    state["_rpu_lightnav_constrained_head_enabled"] = enabled
     return token_ids
 
 
@@ -2334,8 +2357,8 @@ class Qwen3VLAdapter:
                         )
                         vision_model._rpu_vision_compact_encoder_fp16 = True
             if is_lightnav:
-                # Its 156048-row vocabulary cannot use the fused TP8 column
-                # head; the regular forward applies the recorded TP8 row head.
+                # The full 156048-row head stays eager; the opt-in action head
+                # is installed later after its candidate rows are prepared.
                 pass
             elif runtime_align_quantized:
                 lm_w = self.model.lm_head.weight.detach().contiguous()
@@ -3540,6 +3563,11 @@ def _rpu_qwen3vl_forward(
     else:
         slice_indices = logits_to_keep
 
+    candidate_weight = (
+        getattr(self, "_rpu_lightnav_candidate_lm_head_w", None)
+        if getattr(self, "_rpu_lightnav_constrained_head_enabled", False)
+        else None
+    )
     if raw.size(-1) == vocab_size + hidden_dim:
         # Approximate W4 logits plus final normalized hidden state. The
         # explicit exact-rerank helper recomputes only the best two rows with
@@ -3548,6 +3576,11 @@ def _rpu_qwen3vl_forward(
         logits = raw[..., :vocab_size]
     elif raw.size(-1) == vocab_size:
         # Decode-fused lm_head — C++ already produced [B, 1, vocab] logits.
+        self._rpu_last_decode_hidden = None
+        logits = raw
+    elif (candidate_weight is not None
+          and raw.size(-1) == candidate_weight.size(0)):
+        # The constrained decode head is fused into the retained decoder Graph.
         self._rpu_last_decode_hidden = None
         logits = raw
     elif raw.size(-1) == hidden_dim:

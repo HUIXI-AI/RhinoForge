@@ -596,9 +596,10 @@ from rpu_backend.api import Qwen3ASRModel, Qwen3TTSModel
 | `model.transcribe(audio, sample_rate=16000, max_new_tokens=64)` | One finite CPU floating-point waveform, mono 16 kHz, 0.5–8 seconds; token limit 1–64. Returns `ASRTranscription(text, raw_text, token_ids)` |
 | `Qwen3TTSModel.from_pretrained(checkpoint, source=prepared_package, dtype=torch.float16, codec_backend="rpu")` | Local pinned Qwen3-TTS-12Hz-0.6B-Base checkpoint and prepared `qwen_tts/` source directory |
 | `model.synthesize(text, reference_audio=local_file, language="Chinese", max_new_tokens=256)` | Text of 1–1024 characters; `Chinese` or `English`; finite, nonzero mono 24 kHz reference audio, 0.5–20 seconds; token limit 2–256 per segment. Returns an independent float32 mono waveform and sample rate 24000 |
+| `model.stream_synthesize(text, reference_audio=local_file, language="Chinese", max_new_tokens=256)` | Same input limits; returns a Python generator yielding one independent `(waveform, 24000)` tuple after each text segment |
 
 ASR uses greedy generation without context prompts, timestamps or streaming.
-TTS uses non-streaming speaker-embedding-only voice cloning with the pinned
+TTS uses speaker-embedding-only voice cloning with the pinned
 checkpoint sampling recipe: top-k 50, temperature 0.9 and top-p 1.0. Set
 `torch.manual_seed` after loading and before a request to repeat sampling on the
 same execution profile. Talker prompt plus generation must fit 512 positions
@@ -612,10 +613,14 @@ sentence stops can change token counts, pauses and intonation. Each segment
 starts with the request's initial CPU RNG state; later segments restore the
 caller RNG state left by the first. Each waveform is copied independently;
 concatenation waits for all segments to succeed. A failed request returns no
-partial audio. Downloads,
+partial audio. `stream_synthesize()` instead yields each completed segment; a
+later failure cannot retract chunks already consumed by the caller. It is
+segment-level streaming, so a short single-segment request still yields one
+chunk only. The generator holds the model request lock until exhaustion, error
+or `close()`; callers that stop early must close it. Downloads,
 preparation and runnable API examples are in the [speech guide](qwen3_audio.md).
 
-Both APIs support `with`, idempotent `close()` and `execution_stats()`. Serialize
+Both model classes support `with`, idempotent `close()` and `execution_stats()`. Serialize
 requests, statistics and close, with one live device model/policy per process.
 Loaders validate assets before transformation and select the caching allocator
 before device allocation. TTS also declares six owner-specific arenas. Restart

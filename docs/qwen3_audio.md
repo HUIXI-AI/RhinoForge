@@ -20,7 +20,7 @@ text and reference audio. Both retain dedicated Python APIs and now have TOML en
 | Model | Inputs | Generation and output |
 |---|---|---|
 | ASR | Batch one; finite mono floating-point samples at 16 kHz, 0.5–8 seconds | Greedy, `max_new_tokens=1..64`; text, raw text with language metadata, and token IDs; no context prompt, timestamps or streaming |
-| TTS Base | Batch one; `Chinese` / `English`; 1–1024 text characters; finite, nonzero mono 24 kHz reference audio, 0.5–20 seconds | Non-streaming sampling, `max_new_tokens=2..256` per segment (default 256); independent float32 mono waveform and sample rate 24000 |
+| TTS Base | Batch one; `Chinese` / `English`; 1–1024 text characters; finite, nonzero mono 24 kHz reference audio, 0.5–20 seconds | Whole-waveform or segment-level streaming sampling, `max_new_tokens=2..256` per segment (default 256); independent float32 mono waveform chunks at 24000 Hz |
 
 TTS uses only the reference speaker embedding. ICL transcripts, CustomVoice and
 VoiceDesign are unavailable. Talker prompt plus the generation limit must fit
@@ -36,6 +36,9 @@ intonation. Every segment starts from the request's initial CPU RNG state; later
 segments restore the caller state left by the first. All segments must succeed
 before their independently stored waveforms are concatenated.
 Sentence-stop-only tails join the preceding segment within those bounds.
+`stream_synthesize()` yields each completed segment instead. It is not acoustic
+frame streaming: a short request that stays in one segment still yields one
+chunk after that segment finishes.
 
 Loaders check the pinned checkpoint, configuration and tokenizer before weight
 transformation. ASR identities are in
@@ -140,6 +143,26 @@ with open("/path/to/output/hello.wav", "xb") as output:
     sf.write(output, waveform, sample_rate, format="WAV", subtype="FLOAT")
 ```
 
+To consume completed text segments as soon as they are ready, use the Python
+generator and close it when stopping early:
+
+```python
+stream = model.stream_synthesize(
+    "A longer sentence to synthesize.",
+    reference_audio="/path/to/mono-24k.wav",
+    language="English",
+)
+try:
+    for waveform, sample_rate in stream:
+        play(waveform, sample_rate)
+finally:
+    stream.close()
+```
+
+The generator holds the model request lock from its first iteration until it
+finishes, fails or is closed. A later segment failure cannot retract chunks the
+caller already consumed. `synthesize()` continues to return no partial audio.
+
 Set the process thread count for your host before loading; the APIs leave it
 unchanged. Set the seed after loading and before each request to repeat sampling
 on the same execution profile. Reuse the model context for multiple requests.
@@ -171,7 +194,7 @@ and its 72-frame sliding attention.
   total generation steps, EOS and per-segment steps. Other execution errors
   propagate to the caller.
 - Keep one live model/policy per process. Serialize requests, `execution_stats()`
-  and `close()`. Both APIs support `with`, idempotent `close()` and outputs with
+  and model `close()`. Both models support `with`, idempotent `close()` and outputs with
   storage independent of later replay.
 - Loaders select the caching allocator before device allocation. TTS requests
   six owner-specific arenas: five retained Graphs and one serial immediate call.

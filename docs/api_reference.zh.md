@@ -494,8 +494,9 @@ from rpu_backend.api import Qwen3ASRModel, Qwen3TTSModel
 | `model.transcribe(audio, sample_rate=16000, max_new_tokens=64)` | 一维 CPU 有限浮点波形，单声道 16 kHz、0.5–8 秒；生成上限 1–64。返回 `ASRTranscription(text, raw_text, token_ids)` |
 | `Qwen3TTSModel.from_pretrained(checkpoint, source=prepared_package, dtype=torch.float16, codec_backend="rpu")` | 本地固定 Qwen3-TTS-12Hz-0.6B-Base checkpoint 和准备后的 `qwen_tts/` 源码目录 |
 | `model.synthesize(text, reference_audio=local_file, language="Chinese", max_new_tokens=256)` | 文本 1–1024 字符；语言 `Chinese` / `English`；参考音频为有限、非全零的单声道 24 kHz、0.5–20 秒；每段生成上限 2–256。返回独立 float32 单声道波形及采样率 24000 |
+| `model.stream_synthesize(text, reference_audio=local_file, language="Chinese", max_new_tokens=256)` | 输入限制相同；返回 Python generator，每完成一个文本分段便产出一个独立的 `(waveform, 24000)` |
 
-ASR 使用 greedy，不提供 context、时间戳或流式接口。TTS 使用非流式 speaker
+ASR 使用 greedy，不提供 context、时间戳或流式接口。TTS 使用 speaker
 embedding 克隆，按固定 checkpoint 配置采样：top-k 50、temperature 0.9、top-p 1.0。
 在加载后、请求前调用 `torch.manual_seed`，可在同一执行配置下复现采样。每段 Talker
 prompt 加生成上限须在 512 个位置内；达到上限仍无 EOS 时，在波形解码前报错。
@@ -504,10 +505,13 @@ prompt 加生成上限须在 512 个位置内；达到上限仍无 EOS 时，在
 不超过 128 字符且 32 tokenizer token 的文本保持单段。长文本按标点分段，原始
 片段最多 128 字符，目标 12 token；短句尾可与前一分句合并至 16 token。段尾补
 句号可能改变 token 数、停顿和语调。每段从本次请求初始 CPU 随机状态开始，后续分段恢复第一段留下的
-调用方随机状态。各段独立复制，全部成功后拼接返回；失败不返回部分音频。下载、
+调用方随机状态。各段独立复制，全部成功后拼接返回；失败不返回部分音频。
+`stream_synthesize()` 则逐段产出；后续分段失败时，调用方已经消费的块无法撤回。
+这是文本分段级流式，因此短文本仍只产出一个块。generator 从首次迭代到完成、
+报错或 `close()` 前一直持有模型请求锁；提前停止的调用方必须关闭 generator。下载、
 源码准备和 API 示例见[语音指南](qwen3_audio.zh.md)。
 
-两类 API 均支持 `with`、幂等 `close()` 和 `execution_stats()`。请求、统计及关闭
+两类模型均支持 `with`、幂等 `close()` 和 `execution_stats()`。请求、统计及关闭
 串行调用，一个进程只保留一个存活设备模型/策略。加载器在转换前检查资产，并在
 设备分配前选择 caching allocator；TTS 还声明 owner 专属六个 arena。
 进程已冻结为不兼容 allocator 或 arena 计划时，启动新进程。

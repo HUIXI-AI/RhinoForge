@@ -173,10 +173,19 @@ def test_vision_cache_reassembles_repeat_and_sliding_windows(monkeypatch):
         def put(self, key, value):
             self.values[key] = value
 
+        def cached_keys(self):
+            return set(self.values)
+
         def collect_misses(self, pixels, grid, frame_indices, merge_size):
-            keys = [tuple(frame_indices[0][i : i + 2]) for i in range(0, len(frame_indices[0]), 2)]
+            keys = [
+                (*frame_indices[0][i : i + 2], 1, 1)
+                for i in range(0, len(frame_indices[0]), 2)
+            ]
             units = [
-                {"key": key, "out_len": 1, "pixels": pixels[index : index + 1]}
+                {
+                    "key": key, "h": 1, "w": 1, "out_len": 1,
+                    "pixels": pixels[index : index + 1],
+                }
                 for index, key in enumerate(keys)
             ]
             missing = [unit for unit in units if unit["key"] not in self.values]
@@ -215,28 +224,32 @@ def test_vision_cache_reassembles_repeat_and_sliding_windows(monkeypatch):
 
     visual = Visual()
     model = types.SimpleNamespace(model=types.SimpleNamespace(visual=visual))
-    processor = types.SimpleNamespace(video_processor=types.SimpleNamespace(merge_size=1))
+    processor = types.SimpleNamespace(video_processor=types.SimpleNamespace(
+        merge_size=1, temporal_patch_size=2, patch_size=1,
+    ))
 
-    def run(cache, frame_ids, values):
-        grid = torch.tensor([[2, 1, 1]])
-        result, hits, misses, _ = BENCHMARK._cache_vision(
+    def run(cache, frame_ids, values, *, prefetch=False):
+        tubelets = len(frame_ids) // 2
+        grid = torch.tensor([[tubelets, 1, 1]])
+        result, hits, misses, timing = BENCHMARK._cache_vision(
             model,
             processor,
             cache,
             {"video_segments": [{"frame_indices": frame_ids}]},
             {
-                "pixel_values_videos": torch.tensor(values, dtype=torch.float16).reshape(2, 1),
+                "pixel_values_videos": torch.tensor(values, dtype=torch.float16).reshape(tubelets, -1),
                 "video_grid_thw": grid,
                 "_original_video_grid_thw": grid,
             },
+            prefetch_latest=prefetch,
         )
-        return result, hits, misses
+        return result, hits, misses, timing
 
     cache = Cache()
-    cold, cold_hits, cold_misses = run(cache, [0, 1, 2, 3], [10, 20])
-    repeat, repeat_hits, repeat_misses = run(cache, [0, 1, 2, 3], [10, 20])
-    sliding, sliding_hits, sliding_misses = run(cache, [2, 3, 4, 5], [20, 30])
-    fresh, _, _ = run(Cache(), [2, 3, 4, 5], [20, 30])
+    cold, cold_hits, cold_misses, _ = run(cache, [0, 1, 2, 3], [10, 20])
+    repeat, repeat_hits, repeat_misses, _ = run(cache, [0, 1, 2, 3], [10, 20])
+    sliding, sliding_hits, sliding_misses, _ = run(cache, [2, 3, 4, 5], [20, 30])
+    fresh, _, _, _ = run(Cache(), [2, 3, 4, 5], [20, 30])
 
     assert (cold_hits, cold_misses) == (0, 2)
     assert (repeat_hits, repeat_misses) == (2, 0)
@@ -255,6 +268,27 @@ def test_vision_cache_reassembles_repeat_and_sliding_windows(monkeypatch):
             sliding["deepstack_feature_parts"][layer][0],
             fresh["deepstack_feature_parts"][layer][0],
         )
+
+    prefetch_cache = Cache()
+    _, _, _, first_timing = run(
+        prefetch_cache,
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        [10, 11, 20, 21, 30, 31, 40, 41, 50, 51],
+        prefetch=True,
+    )
+    _, next_hits, next_misses, next_timing = run(
+        prefetch_cache,
+        [2, 3, 4, 5, 6, 7, 9, 9, 10, 11],
+        [20, 21, 30, 31, 40, 41, 51, 51, 60, 61],
+        prefetch=True,
+    )
+    assert (next_hits, next_misses) == (4, 1)
+    assert first_timing["vision_prefetches"] == 1
+    assert next_timing["vision_prefetches"] == 1
+    assert torch.equal(
+        prefetch_cache.values[(9, 9, 1, 1)].base_embed,
+        torch.tensor([[51, 51]], dtype=torch.float16),
+    )
 
 
 def test_generate_reuses_and_rewinds_one_rpu_cache(monkeypatch):

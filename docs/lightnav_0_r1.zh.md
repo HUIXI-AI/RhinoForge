@@ -19,6 +19,27 @@ pooler output 与 3 层 DeepStack 特征保存到 CPU；同一会话后续窗口
 缓存整段 post-ViT pooling 结果；历史组成或倍率变化时 key 不匹配，会重新池化。
 滑动窗口位置会变化，所以每次完整 scatter 缓存特征，不启用 prefix scatter 复用。
 
+真实 8 帧历史加当前帧的滑窗可调用
+`_run_request(..., prefetch_latest=True)`。它在本轮 ViT batch 中额外计算“最新帧复制
+成 2 帧”的下轮边界 tubelet，使稳定窗口从 3/2 提升到 4/1；报告中的
+`vision_prefetches` 用于区分预取。该策略把一个缺失前移，稳态 ViT 实际仍计算
+2 个 tubelet，不能把 4/1 解释为 ViT 计算量下降一半。
+
+同一物理 prompt 形状的 prefill Graph 会原位刷新 prompt/视觉 embedding 和
+M-RoPE 稳定槽位。KV cache 地址不同时，运行时按实际 chunk→layer 或 layer→chunk
+顺序，同时重绑 KV insert 写地址和 attention 读地址；形状、步幅、dtype、存储容量
+或设备不兼容时拒绝快速重放。增长窗口应在首次完整 8 帧窗口建好前清理旧 text
+Graph，之后只复用固定形状，避免多个 prefill 形状占满 Graph arena。
+
+R1 v1.2.0、Text W8A16、35 帧客户数据的稳定段（第 9 帧之后）结果如下。固定 KV
+地址的 35 帧快速重放与逐帧重建的同预取基线 token 完全一致；双 KV 地址交替的
+第 9–11 帧也完全一致。
+
+| KV 地址 | 视觉 hit/miss | Vision | Prefill | Decode 5 | Total |
+|---|---:|---:|---:|---:|---:|
+| 固定 | 4/1 | 121.06 ms | 89.18 ms | 114.80 ms | 345.37 ms |
+| 双地址交替 | 4/1 | 122.05 ms | 89.26 ms | 115.84 ms | 348.94 ms |
+
 ## 运行
 
 先准备 RhinoForge、模型目录和 LightNav 上游源码。模型目录必须包含权重、

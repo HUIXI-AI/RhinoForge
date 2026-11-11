@@ -555,10 +555,9 @@ public:
     // Ordinary Qwen3-VL initial prefill may use the existing FMB cursor skip,
     // but only when its KV owners match the last body emitted for that graph.
     // The graph signature does not contain KV addresses; keep this small owner
-    // witness here so a same-shape replacement cache falls back to normal
-    // emission instead of replaying registers bound to the old cache. Bind the
-    // witness to one graph capture: another signature may still contain the
-    // previous cache addresses even after this model has used the new cache.
+    // witness here so a same-layout replacement cache can patch every captured
+    // K/V register before replay. Bind exact-address reuse to one graph capture;
+    // another signature is admitted only through the explicit register patch.
     struct FastReplayOwner {
         at::Tensor tensor;  // retain the owner; raw pointer equality is not ABA-safe
         const c10::TensorImpl* impl = nullptr;
@@ -577,6 +576,7 @@ public:
     uint64_t fast_replay_prefill_generation_ = 0, fast_replay_bound_generation_ = 0;
     bool fast_replay_prefill_candidate_ = false;
     bool fast_replay_owner_bound_ = false;
+    bool fast_replay_owner_rebind_ = false;
 
     static FastReplayOwner fast_replay_owner(const at::Tensor& tensor) {
         if (!tensor.defined() ||
@@ -606,11 +606,22 @@ public:
             current.storage_offset == lhs.storage_offset;
     }
 
+    static bool fast_replay_owner_compatible(const FastReplayOwner& lhs,
+                                             const at::Tensor& rhs) {
+        const auto current = fast_replay_owner(rhs);
+        return lhs.impl != nullptr && current.impl != nullptr &&
+            current.address != 0 && current.storage_bytes == lhs.storage_bytes &&
+            current.dtype == lhs.dtype && current.sizes == lhs.sizes &&
+            current.strides == lhs.strides &&
+            current.storage_offset == lhs.storage_offset;
+    }
+
     void prepare_fast_replay_prefill_owners(at::TensorList k_caches,
                                             at::TensorList v_caches,
                                             bool candidate) {
         fast_replay_prefill_candidate_ = false;
         fast_replay_owner_bound_ = false;
+        fast_replay_owner_rebind_ = false;
         if (!candidate || k_caches.size() != v_caches.size() ||
             k_caches.empty() || !RpuKernelGraph::has_active()) {
             return;
@@ -624,18 +635,31 @@ public:
         fast_replay_prefill_generation_ = installed_model_state_generation();
         fast_replay_prefill_candidate_ = true;
         if (graph.state() == RpuKernelGraph::State::REPLAYING &&
-            fast_replay_bound_lifetime_ == fast_replay_prefill_lifetime_ &&
+            fast_replay_prefill_stamp_.position == 0 &&
             fast_replay_bound_generation_ == fast_replay_prefill_generation_ &&
-            graph.is_op_stream_stamp_current(fast_replay_bound_stamp_) &&
-            fast_replay_bound_stamp_.position == fast_replay_prefill_stamp_.position &&
             fast_replay_k_owners_.size() == k_caches.size() &&
             fast_replay_v_owners_.size() == v_caches.size()) {
-            bool same = true;
-            for (size_t i = 0; i < k_caches.size() && same; ++i) {
-                same = fast_replay_owner_equal(fast_replay_k_owners_[i], k_caches[i]) &&
-                    fast_replay_owner_equal(fast_replay_v_owners_[i], v_caches[i]);
+            bool same = true, compatible = true;
+            for (size_t i = 0; i < k_caches.size() && compatible; ++i) {
+                const bool k_same = fast_replay_owner_equal(
+                    fast_replay_k_owners_[i], k_caches[i]);
+                const bool v_same = fast_replay_owner_equal(
+                    fast_replay_v_owners_[i], v_caches[i]);
+                same = same && k_same && v_same;
+                compatible = fast_replay_owner_compatible(
+                    fast_replay_k_owners_[i], k_caches[i]) &&
+                    fast_replay_owner_compatible(
+                        fast_replay_v_owners_[i], v_caches[i]);
             }
-            fast_replay_owner_bound_ = same;
+            const bool exact_graph =
+                fast_replay_bound_lifetime_ == fast_replay_prefill_lifetime_ &&
+                fast_replay_bound_generation_ == fast_replay_prefill_generation_ &&
+                graph.is_op_stream_stamp_current(fast_replay_bound_stamp_) &&
+                fast_replay_bound_stamp_.position ==
+                    fast_replay_prefill_stamp_.position;
+            fast_replay_owner_bound_ = compatible;
+            fast_replay_owner_rebind_ = fast_replay_owner_bound_ &&
+                (!exact_graph || !same);
         }
     }
 
@@ -675,6 +699,7 @@ public:
             fast_replay_prefill_stamp_ = {};
             fast_replay_prefill_candidate_ = false;
             fast_replay_owner_bound_ = false;
+            fast_replay_owner_rebind_ = false;
             invalidate_model_state();
         }
     }
@@ -5592,6 +5617,9 @@ protected:
         const bool checked_decode_replay = qwen3vl_decode_replay_scope_active_;
         const bool owner_safe_prefill_fast_replay =
             fast_replay_prefill_candidate_ && fast_replay_owner_bound_;
+        clear_replay_kernel_u32_patches();
+        cfg.fast_replay_rebind_kv_cache =
+            fast_replay_prefill_candidate_ && fast_replay_owner_rebind_;
         cfg.fast_replay_skip_layer_loop =
             !qwen3vl_multiview_text_composite_prepared_ &&
             !checked_decode_replay && fast_replay_skip_layer_loop_ &&

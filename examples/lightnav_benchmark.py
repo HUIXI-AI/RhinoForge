@@ -89,6 +89,7 @@ def _cache_vision(
     cache,
     sample: dict[str, Any],
     inputs: dict[str, Any],
+    prefetch_latest: bool = False,
 ):
     import torch
     from lightnav.inference.vit_cache import CachedTubeletEmbeds
@@ -109,23 +110,59 @@ def _cache_vision(
     )
     lookup_ms = (time.perf_counter() - lookup_started) * 1000
 
+    vit_units = list(plan.missing_units)
+    if prefetch_latest and plan.unit_desc:
+        current = plan.unit_desc[-1]
+        key = current["key"]
+        missing = next(
+            (unit for unit in plan.missing_units if unit["key"] == key), None
+        )
+        if missing is not None and key[0] != key[1]:
+            prefetch_key = (key[1], key[1], key[2], key[3])
+            if prefetch_key not in cache.cached_keys():
+                temporal = int(processor.video_processor.temporal_patch_size)
+                patch = int(processor.video_processor.patch_size)
+                columns = int(missing["pixels"].shape[1])
+                frame_columns = patch * patch
+                if temporal != 2 or columns % (temporal * frame_columns):
+                    raise RuntimeError(
+                        "LightNav latest-frame prefetch requires temporal_patch_size=2 "
+                        "and canonical packed video patches"
+                    )
+                channels = columns // (temporal * frame_columns)
+                packed = missing["pixels"].reshape(
+                    -1, channels, temporal, patch, patch
+                )
+                duplicate = packed[:, :, -1:, :, :].expand(
+                    -1, -1, temporal, -1, -1
+                ).contiguous().reshape_as(missing["pixels"])
+                vit_units.append({
+                    **missing, "key": prefetch_key, "pixels": duplicate,
+                })
+
     vit_ms = 0.0
-    if plan.missing_units:
-        miss_grid = torch.tensor(plan.miss_grid_rows, dtype=torch.long)
+    if vit_units:
+        miss_grid_rows = list(plan.miss_grid_rows)
+        if len(vit_units) != len(plan.missing_units):
+            unit = vit_units[-1]
+            miss_grid_rows.append([1, int(unit["h"]), int(unit["w"])])
+        miss_grid = torch.tensor(miss_grid_rows, dtype=torch.long)
         vit_started = time.perf_counter()
         with torch.no_grad():
             output = model.model.visual(
-                plan.miss_pixels, grid_thw=miss_grid,
+                torch.cat([unit["pixels"] for unit in vit_units]),
+                grid_thw=miss_grid,
             )
         base = output.pooler_output.detach().to("cpu", dtype=torch.float16)
         deepstack = [
             value.detach().to("cpu", dtype=torch.float16)
             for value in output.deepstack_features
         ]
-        split_sizes = [int(unit["out_len"]) for unit in plan.missing_units]
+        split_sizes = [int(unit["out_len"]) for unit in vit_units]
         base_parts = torch.split(base, split_sizes, dim=0)
         deep_parts = [torch.split(value, split_sizes, dim=0) for value in deepstack]
-        for index, unit in enumerate(plan.missing_units):
+        requested_keys = {unit["key"] for unit in plan.missing_units}
+        for index, unit in enumerate(vit_units):
             entry = CachedTubeletEmbeds(
                 base_embed=base_parts[index].contiguous(),
                 deepstack_embeds=[
@@ -133,7 +170,8 @@ def _cache_vision(
                 ],
             )
             cache.put(unit["key"], entry)
-            plan.cached_map[unit["key"]] = entry
+            if unit["key"] in requested_keys:
+                plan.cached_map[unit["key"]] = entry
         vit_ms = (time.perf_counter() - vit_started) * 1000
 
     pool_factors = inputs.get("_post_vit_pool_factors")
@@ -201,6 +239,7 @@ def _cache_vision(
         "vision_lookup_ms": lookup_ms,
         "vision_vit_ms": vit_ms,
         "vision_pool_ms": pool_ms,
+        "vision_prefetches": len(vit_units) - len(plan.missing_units),
     }
 
 
@@ -303,6 +342,7 @@ def _run_request(
     lm_cache,
     capture_vision: bool = False,
     draft_tokens: list[int] | None = None,
+    prefetch_latest: bool = False,
 ):
     from lightnav.inference.samples import build_tracking_sample
 
@@ -325,6 +365,7 @@ def _run_request(
     vision_started = time.perf_counter()
     precomputed, hits, misses, vision_parts = _cache_vision(
         model, processor, cache, sample, inputs,
+        prefetch_latest=prefetch_latest,
     )
     vision_ms = (time.perf_counter() - vision_started) * 1000
     input_ids, attention_mask, mm_token_type_ids = _prepare_prompt(
@@ -408,7 +449,10 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "decode_5_ms", "total_ms",
         )
     }
-    for key in ("input_tokens", "output_tokens", "cache_hits", "cache_misses"):
+    for key in (
+        "input_tokens", "output_tokens", "cache_hits", "cache_misses",
+        "vision_prefetches",
+    ):
         values = {row[key] for row in rows}
         if len(values) != 1:
             raise RuntimeError(f"measured requests changed {key}: {sorted(values)}")

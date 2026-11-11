@@ -101,19 +101,19 @@ int main() {
  assert(prepare(m, a, xk, xv)); commit(m, a, xk, xv);
  assert(!prepare(m, b, xk, xv)); commit(m, b, xk, xv);
  // The old model-global witness allowed B/Y to skip although B still held X.
- assert(!prepare(m, a, yk, yv)); commit(m, a, yk, yv);
- assert(!prepare(m, b, yk, yv)); commit(m, b, yk, yv);
+ assert(prepare(m, a, yk, yv) && m.fast_replay_owner_rebind_); commit(m, a, yk, yv);
+ assert(prepare(m, b, yk, yv) && m.fast_replay_owner_rebind_); commit(m, b, yk, yv);
  for (int replay = 0; replay < 3; ++replay) {
   assert(prepare(m, b, yk, yv)); commit(m, b, yk, yv);
  }
- // Alternating already-built graphs remains safe with the bounded one-entry witness.
- assert(!prepare(m, a, yk, yv)); commit(m, a, yk, yv);
+ // Alternating already-built graphs patches every K/V register before skipping.
+ assert(prepare(m, a, yk, yv) && m.fast_replay_owner_rebind_); commit(m, a, yk, yv);
  assert(prepare(m, a, yk, yv));
- // Every identity component, including same-address Graph lifetime ABA, matters.
+ // A live replacement Graph is safe only through the explicit rebind path.
  for (auto member : {&RpuKernelGraph::lifetime, &RpuKernelGraph::generation,
                      &RpuKernelGraph::signature, &RpuKernelGraph::segment}) {
   ++(a.*member);
-  assert(!prepare(m, a, yk, yv)); commit(m, a, yk, yv);
+  assert(prepare(m, a, yk, yv) && m.fast_replay_owner_rebind_); commit(m, a, yk, yv);
   assert(prepare(m, a, yk, yv));
  }
  ++m.model_generation;
@@ -125,28 +125,28 @@ int main() {
  assert(!prepare(m, a, yk, yv, false));
  m.commit_fast_replay_prefill_owners(xk, xv);
  assert(prepare(m, a, yk, yv));
- // Owner replacement and metadata changes require normal emission.
+ // Same-layout owner replacement is rebound; metadata changes remain rejected.
  for (bool replace_k : {false, true}) {
   auto k = yk, v = yv;
   (replace_k ? k : v)[1] = cache()[0];
-  assert(!prepare(m, a, k, v)); commit(m, a, k, v);
+  assert(prepare(m, a, k, v) && m.fast_replay_owner_rebind_); commit(m, a, k, v);
   assert(prepare(m, a, k, v));
  }
  auto k = yk;
- assert(!prepare(m, a, k, yv)); commit(m, a, k, yv);
+ assert(prepare(m, a, k, yv) && m.fast_replay_owner_rebind_); commit(m, a, k, yv);
  k[0].transpose_(1, 2);
  assert(!prepare(m, a, k, yv));
  k[0].transpose_(1, 2);
- // Failed/aborted or moved graph scopes must never publish a new owner proof.
- assert(!prepare(m, a, xk, xv));
+ // Failed/aborted or moved graph scopes must not publish an exact-address proof.
+ assert(prepare(m, a, xk, xv) && m.fast_replay_owner_rebind_);
  ++a.generation;
  m.commit_fast_replay_prefill_owners(xk, xv);
- assert(!prepare(m, a, xk, xv)); commit(m, a, xk, xv);
- assert(!prepare(m, a, yk, yv));
+ assert(prepare(m, a, xk, xv) && m.fast_replay_owner_rebind_); commit(m, a, xk, xv);
+ assert(prepare(m, a, yk, yv) && m.fast_replay_owner_rebind_);
  RpuKernelGraph::current = &b;
  m.commit_fast_replay_prefill_owners(yk, yv);
- assert(!prepare(m, b, yk, yv)); commit(m, b, yk, yv);
- assert(!prepare(m, b, xk, xv));
+ assert(prepare(m, b, yk, yv) && m.fast_replay_owner_rebind_); commit(m, b, yk, yv);
+ assert(prepare(m, b, xk, xv) && m.fast_replay_owner_rebind_);
  ++m.model_generation;
  m.commit_fast_replay_prefill_owners(xk, xv);
  assert(!prepare(m, b, xk, xv)); commit(m, b, xk, xv);

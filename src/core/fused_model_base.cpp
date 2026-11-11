@@ -3216,7 +3216,79 @@ void FusedModelBase::stage_replay_kernel_u32_patch(
     TORCH_CHECK(expected_count > 0,
                 "replay register patch requires a positive occurrence count");
     pimpl_->replay_kernel_u32_patches_.push_back({
-        static_cast<uint16_t>(id), reg_lo, value, expected_count});
+        static_cast<uint16_t>(id), std::numeric_limits<size_t>::max(),
+        reg_lo, value, expected_count});
+}
+
+void FusedModelBase::stage_replay_kv_cache_u32_patches(
+        at::TensorList k_caches, at::TensorList v_caches,
+        size_t chunk_count, bool chunk_outer_within_group) {
+    TORCH_CHECK(k_caches.size() == v_caches.size() && !k_caches.empty(),
+                "KV replay patch requires matching non-empty cache lists");
+    TORCH_CHECK(chunk_count > 0,
+                "KV replay patch requires a positive chunk count");
+    TORCH_CHECK(RpuKernelGraph::has_active() &&
+                    RpuKernelGraph::active().state_ ==
+                        RpuKernelGraph::State::REPLAYING,
+                "KV replay patch requires an active REPLAY Graph");
+    auto& graph = RpuKernelGraph::active();
+    std::vector<size_t> k_kernels, v_kernels, attention_kernels;
+    for (const auto& node : graph.nodes_) {
+        if (node.kind != GraphNodeKind::Kernel ||
+            !node.as_kernel().kernel_id.has_value()) continue;
+        const auto id = *node.as_kernel().kernel_id;
+        if (id == KernelId::LLAMA_INSERT_KCACHE ||
+            id == KernelId::LLAMA_INSERT_KCACHE_V16) {
+            k_kernels.push_back(node.as_kernel().kernel_idx);
+        } else if (id == KernelId::LLAMA_INSERT_VCACHE ||
+                   id == KernelId::LLAMA_INSERT_VCACHE_V16) {
+            v_kernels.push_back(node.as_kernel().kernel_idx);
+        } else if (id == KernelId::SDPA_FLASH_ATTN_SPM ||
+                   id == KernelId::SDPA_FLASH_ATTN_SPM_16B) {
+            attention_kernels.push_back(node.as_kernel().kernel_idx);
+        }
+    }
+    const size_t callback_count = k_caches.size() * chunk_count;
+    TORCH_CHECK(!k_kernels.empty() && k_kernels.size() == v_kernels.size() &&
+                    k_kernels.size() % callback_count == 0 &&
+                    !attention_kernels.empty() &&
+                    attention_kernels.size() % callback_count == 0,
+                "KV replay patch found an unsupported cache-insert topology");
+    auto layer_for = [&](size_t occurrence, size_t occurrences) {
+        const size_t occurrences_per_callback = occurrences / callback_count;
+        const size_t callback = occurrence / occurrences_per_callback;
+        return std::pair<size_t, size_t>{
+            chunk_outer_within_group
+                ? callback % k_caches.size() : callback / chunk_count,
+            occurrences_per_callback};
+    };
+    auto stage = [&](const std::vector<size_t>& kernels,
+                     at::TensorList caches, uint32_t reg_lo) {
+        for (size_t occurrence = 0; occurrence < kernels.size(); ++occurrence) {
+            const auto [layer, occurrences_per_callback] =
+                layer_for(occurrence, kernels.size());
+            const at::Tensor& cache = caches[layer];
+            TORCH_CHECK(cache.defined() && cache.device().type() == at::kPrivateUse1 &&
+                            cache.scalar_type() == at::kHalf && cache.is_contiguous(),
+                        "KV replay patch requires contiguous device FP16 caches");
+            const uint64_t address =
+                ::rhino_lkn::RpuGetDevAddr(cache.data_ptr());
+            TORCH_CHECK(address != 0 && address % 256 == 0 &&
+                            (address >> 8) <=
+                                std::numeric_limits<uint32_t>::max(),
+                        "KV replay patch requires a representable 256-aligned address");
+            if (occurrence % occurrences_per_callback == 0) {
+                graph.keep_alive(cache);
+            }
+            pimpl_->replay_kernel_u32_patches_.push_back({
+                0, kernels[occurrence], reg_lo,
+                static_cast<uint32_t>(address >> 8), 1});
+        }
+    };
+    stage(k_kernels, k_caches, 8);
+    stage(v_kernels, v_caches, 8);
+    stage(attention_kernels, k_caches, 50);
+    stage(attention_kernels, v_caches, 52);
 }
 
 size_t FusedModelBase::patch_replay_kernel_u32(
@@ -15923,6 +15995,12 @@ at::Tensor FusedModelBase::run_all_layers_impl(
 
     // 6. dynamic config
     auto dyn_cfg = dynamic_config(plan);
+    if (static_cfg.fast_replay_rebind_kv_cache) {
+        stage_replay_kv_cache_u32_patches(
+            *pimpl_->ctx_.k_caches, *pimpl_->ctx_.v_caches,
+            static_cast<size_t>(plan.num_chunks),
+            dyn_cfg.chunk_outer_within_group);
+    }
     if (defer_physical_manifest_branch) {
         auto& physical_graph = RpuKernelGraph::active();
         const bool replaying =
@@ -16397,9 +16475,26 @@ at::Tensor FusedModelBase::run_all_layers_impl(
     if (fast_skip) {
         auto& g = RpuKernelGraph::active();
         for (const auto& patch : pimpl_->replay_kernel_u32_patches_) {
-            patch_replay_kernel_u32(
-                static_cast<KernelId>(patch.kernel_id), patch.reg_lo,
-                patch.value, patch.expected_count);
+            if (patch.kernel_idx == std::numeric_limits<size_t>::max()) {
+                patch_replay_kernel_u32(
+                    static_cast<KernelId>(patch.kernel_id), patch.reg_lo,
+                    patch.value, patch.expected_count);
+            } else {
+                TORCH_CHECK(patch.kernel_idx < g.kernels_.size() &&
+                                g.kernels_[patch.kernel_idx] != nullptr,
+                            "replay register patch kernel index is out of range");
+                auto* kernel = g.kernels_[patch.kernel_idx].get();
+                TORCH_CHECK(
+                    kernel->set_regs(patch.reg_lo,
+                                     static_cast<uint16_t>(patch.value)) ==
+                            ::rhino_lkn::kKernelRegOk &&
+                        kernel->set_regs(
+                            patch.reg_lo + 1,
+                            static_cast<uint16_t>(patch.value >> 16)) ==
+                            ::rhino_lkn::kKernelRegOk,
+                    "replay register patch rejected indexed registers");
+                g.kernel_params_dirty_this_replay_ = true;
+            }
         }
         if (static_cfg.post_fn != nullptr && g.has_post_fn_cursor()
             && !static_cfg.fast_replay_bake_post_fn) {

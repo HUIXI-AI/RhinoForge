@@ -511,6 +511,7 @@ public:
     InferenceContext ctx_;
     struct ReplayKernelU32Patch {
         uint16_t kernel_id = 0;
+        size_t kernel_idx = std::numeric_limits<size_t>::max();
         uint32_t reg_lo = 0;
         uint32_t value = 0;
         size_t expected_count = 0;

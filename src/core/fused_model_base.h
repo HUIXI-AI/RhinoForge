@@ -973,6 +973,10 @@ struct ModelStaticConfig {
     // built stream. Default false keeps existing model paths unchanged.
     bool fast_replay_skip_layer_loop = false;
 
+    // Rebind captured per-layer K/V insert addresses after the live chunk
+    // traversal has resolved its layer/chunk ordering.
+    bool fast_replay_rebind_kv_cache = false;
+
     // Narrow opt-in for in-graph denoise loops: the captured stream includes
     // pre_layers_fn/body_iterations/post_layers_fn, and replay-time drift is
     // refreshed before run_all_layers via live_base variables. Default false
@@ -1826,6 +1830,9 @@ protected:
     void stage_replay_kernel_u32_patch(
         KernelId id, uint32_t reg_lo, uint32_t value,
         size_t expected_count);
+    void stage_replay_kv_cache_u32_patches(
+        at::TensorList k_caches, at::TensorList v_caches,
+        size_t chunk_count, bool chunk_outer_within_group);
     size_t patch_replay_kernel_u32(
         KernelId id, uint32_t reg_lo, uint32_t value,
         size_t expected_count);

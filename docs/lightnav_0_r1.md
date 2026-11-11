@@ -21,6 +21,31 @@ by tubelet sequence and SlowFast factor. A changed sequence or factor therefore
 recomputes pooling. Sliding windows use a full feature scatter because token
 positions move between requests.
 
+A real eight-history-plus-current sliding caller can pass
+`prefetch_latest=True` to `_run_request`. The current ViT batch also computes
+the duplicated-latest-frame boundary tubelet needed by the next request, moving
+steady-state accounting from 3/2 to 4/1. `vision_prefetches` reports that work.
+This moves one miss earlier; the ViT still evaluates two tubelets per steady
+request.
+
+For one physical prompt shape, prefill Graph replay refreshes stable prompt,
+visual-embedding, and M-RoPE slots in place. A compatible replacement KV cache
+rebinds both KV-insert write registers and attention read registers according to
+the resolved chunk/layer traversal. Incompatible layout, dtype, capacity, or
+device metadata rejects fast replay. Growing windows should clear old text
+Graphs through the first full eight-frame window, then reuse only the fixed
+shape so multiple prefill shapes do not exhaust the Graph arena.
+
+On R1 v1.2.0 with Text W8A16 and the customer sequence, the steady section
+after frame 8 measured as follows. The fixed-address 35-frame replay matched a
+same-prefetch rebuild baseline token-for-token; alternating two KV addresses
+also matched on frames 9--11.
+
+| KV addresses | Vision hit/miss | Vision | Prefill | Decode 5 | Total |
+|---|---:|---:|---:|---:|---:|
+| Fixed | 4/1 | 121.06 ms | 89.18 ms | 114.80 ms | 345.37 ms |
+| Alternating two | 4/1 | 122.05 ms | 89.26 ms | 115.84 ms | 348.94 ms |
+
 ## Run
 
 Prepare RhinoForge, the complete checkpoint directory, and a separate checkout

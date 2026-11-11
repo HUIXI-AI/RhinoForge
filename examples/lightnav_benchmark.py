@@ -16,7 +16,8 @@ from typing import Any
 
 OUTPUT_TOKENS = 5
 MAX_PREFILL_TOKENS = 4176
-DEFAULT_HISTORIES = (12, 24, 36, 48, 64)
+DEFAULT_HISTORIES = (8,)
+VISION_CACHE_ENTRIES = 1024
 VISION_CACHE_ATOL = 1e-3
 
 
@@ -430,7 +431,7 @@ def main() -> int:
         "--history-frames",
         type=parse_histories,
         default=DEFAULT_HISTORIES,
-        help="comma-separated even frame counts (default: 12,24,36,48,64)",
+        help="comma-separated even frame counts (default: 8)",
     )
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument(
@@ -509,6 +510,7 @@ def main() -> int:
         )
 
         candidate_count = len(set_lightnav_constrained_lm_head(model))
+    quant_config = getattr(model.config, "quant_config", {}) or {}
     try:
         max_frames = max(args.history_frames) + 1
         frames = torch.empty((max_frames, 3, 256, 448), dtype=torch.float32)
@@ -525,6 +527,11 @@ def main() -> int:
                 "action_allowlist" if args.constrained_head else "full_vocabulary"
             ),
             "lm_head_candidates": candidate_count,
+            "text_precision": quant_config.get("method", "fp16"),
+            "vision_precision": (
+                "fp16" if quant_config.get("vision_quantization") == "fp16"
+                else quant_config.get("method", "fp16")
+            ),
             "task_accuracy_evaluated": False,
             "decode_mode": (
                 "verified_history_draft" if args.history_draft else "serial"
@@ -539,7 +546,7 @@ def main() -> int:
             # Warm the full-window RPU graphs without retaining visual features.
             warm = _run_request(
                 model, processor, data_processor, bundle,
-                VitTubeletCache(max_entries=256, store_device="cpu"), frames,
+                VitTubeletCache(max_entries=VISION_CACHE_ENTRIES, store_device="cpu"), frames,
                 history_frames, 0, args.instruction, lm_cache,
             )
             draft = warm["token_ids"] if args.history_draft else None
@@ -547,7 +554,7 @@ def main() -> int:
                 model.model.language_model._rpu_text_graph_cache.clear()
                 warm = _run_request(
                     model, processor, data_processor, bundle,
-                    VitTubeletCache(max_entries=256, store_device="cpu"), frames,
+                    VitTubeletCache(max_entries=VISION_CACHE_ENTRIES, store_device="cpu"), frames,
                     history_frames, 0, args.instruction, lm_cache,
                     draft_tokens=draft,
                 )
@@ -556,7 +563,7 @@ def main() -> int:
             for _ in range(args.repeats):
                 row = _run_request(
                     model, processor, data_processor, bundle,
-                    VitTubeletCache(max_entries=256, store_device="cpu"), frames,
+                    VitTubeletCache(max_entries=VISION_CACHE_ENTRIES, store_device="cpu"), frames,
                     history_frames, 0, args.instruction, lm_cache,
                     capture_vision=not all_miss,
                     draft_tokens=draft,
@@ -569,7 +576,7 @@ def main() -> int:
                 raise RuntimeError(f"history={history_frames}: all-miss cache hit")
 
             history_cache = _HistoryOnlyCache(
-                VitTubeletCache(max_entries=256, store_device="cpu"),
+                VitTubeletCache(max_entries=VISION_CACHE_ENTRIES, store_device="cpu"),
                 current_frame_id=history_frames,
             )
             # Populate history entries, then warm the one-current-tubelet graph.

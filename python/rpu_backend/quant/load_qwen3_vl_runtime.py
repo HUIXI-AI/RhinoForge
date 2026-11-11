@@ -19,7 +19,10 @@ from torch import nn
 from safetensors import safe_open
 from transformers import AutoModelForImageTextToText
 
-from .convert_qwen3_vl import _get, matches_runtime_geometry, runtime_quant_config
+from .convert_qwen3_vl import (
+    _get, lightnav_w8_quant_config, matches_lightnav_geometry,
+    matches_runtime_geometry, runtime_quant_config,
+)
 from .int4_pgrp_pack import swizzle_int4_pgrp_scale, swizzle_pack_int4_pgrp
 from .load_qwen3_vl_awq import (
     _ROLES, _config_signature, _inventory, _projection_inventory,
@@ -34,12 +37,21 @@ def is_qwen3_vl_runtime_quant_config(config) -> bool:
     try:
         text, vision = _get(config, "text_config"), _get(config, "vision_config")
         qc = _get(config, "quant_config")
-        if not isinstance(qc, dict) or not matches_runtime_geometry(config):
+        lightnav = matches_lightnav_geometry(config)
+        if not isinstance(qc, dict) or not (
+            matches_runtime_geometry(config) or lightnav
+        ):
             return False
         h = _get(text, "hidden_size")
         bits = {"w8a16": 8, "w4a16": 4}.get(qc.get("method"))
-        if bits is None or (h == 2560 and bits == 8):
+        if bits is None or (h == 2560 and bits == 8 and not lightnav):
             return False
+        expected = (
+            lightnav_w8_quant_config() if lightnav else
+            runtime_quant_config(
+                h, bits, source_quantization=qc.get("source_quantization"),
+            )
+        )
         return (
             _get(config, "tie_word_embeddings") is False
             and _get(text, "tie_word_embeddings") is False
@@ -47,8 +59,7 @@ def is_qwen3_vl_runtime_quant_config(config) -> bool:
             and all(_get(owner, key) is None for owner in (text, vision)
                     for key in ("quant_config", "quantization_config"))
             # JSON identity also rejects bool-as-int and 32.0-as-32 controls.
-            and json.dumps(qc, sort_keys=True) == json.dumps(runtime_quant_config(
-                h, bits, source_quantization=qc.get("source_quantization")), sort_keys=True)
+            and json.dumps(qc, sort_keys=True) == json.dumps(expected, sort_keys=True)
         )
     except (AttributeError, TypeError, ValueError):
         return False
@@ -61,7 +72,9 @@ def _quantized_modules(model):
         raise ValueError("runtime quantization requires an independent bias-free Linear head")
     if head.weight is model.model.language_model.embed_tokens.weight:
         raise ValueError("runtime quantized head must not alias embedding")
-    return [*modules, ("lm_head", head, 1)]
+    if model.config.quant_config["quantized_lm_head"]:
+        modules.append(("lm_head", head, 1))
+    return modules
 
 
 def _pack_w4_projection(weight, scale, *, n, k, partition):
@@ -167,8 +180,12 @@ def load_qwen3_vl_runtime_imagetext(
         model = AutoModelForImageTextToText.from_config(skeleton)
     model.config.quant_config = copy.deepcopy(config.quant_config)
     projections = _quantized_modules(model)
-    if len(projections) != model.config.text_config.num_hidden_layers * 7 + 1:
-        raise ValueError("runtime loader requires Text7 for every layer plus one independent head")
+    expected_projections = (
+        model.config.text_config.num_hidden_layers * 7
+        + int(model.config.quant_config["quantized_lm_head"])
+    )
+    if len(projections) != expected_projections:
+        raise ValueError("runtime loader requires the configured Text7/head scope")
     bits = 4 if config.quant_config["method"] == "w4a16" else 8
     shapes = {name: tuple(t.shape) for name, t in model.named_parameters(remove_duplicate=False)}
     expected = {name: (shape, "F16") for name, shape in shapes.items()}

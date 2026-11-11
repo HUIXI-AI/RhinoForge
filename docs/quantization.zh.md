@@ -52,8 +52,10 @@ Verifier 检查 method、INT8/scale tensor 配对和代表性 dequantized weight
 
 ## Qwen3-VL
 
-2B/4B/8B 的离线转换入口为 `python -m rpu_backend.quant.convert_qwen3_vl`。
-`--bits 8` 从公开 FP16 权重生成 W8A16。使用 `awq_w4.toml` 时，
+2B/4B/8B 和精确 LightNav-0 配置的离线转换入口为
+`python -m rpu_backend.quant.convert_qwen3_vl`。LightNav-0 的 `--bits 8` 只量化
+Text7 投影，动作输出头和 Vision 保持 FP16；其他公开模型按原有 W8A16 配方转换。
+使用 `awq_w4.toml` 时，
 `--bits 4` 的输入应为 symmetric G32 compressed-tensors AWQ：保留 Text AWQ，
 LM head 转为 RTN W4，Vision 为 W8。转换器也接受精确匹配的公开 2B/4B/8B FP16
 配置配合 `--bits 4`，但生成的是 Text/LM head RTN W4，不是 AWQ；两种 recipe 的

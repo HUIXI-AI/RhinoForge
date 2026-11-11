@@ -13,7 +13,8 @@ dimension must be 128-aligned. With the constrained head enabled, its 4,369
 candidates are padded to 4,480 rows and fused into the device decode Graph.
 Admission remains restricted to the exact LightNav profile.
 
-The vision cache uses upstream two-frame tubelet keys. Each miss runs the ViT
+The vision cache uses upstream two-frame tubelet keys and defaults to 1,024
+entries, following the upstream Thor long-session recommendation. Each miss runs the ViT
 once and stores its pooler output plus three DeepStack levels on CPU. Post-ViT
 spatial pooling keeps the unpooled values and also caches an exact segment result
 by tubelet sequence and SlowFast factor. A changed sequence or factor therefore
@@ -34,9 +35,9 @@ python examples/lightnav_benchmark.py \
   --check-config
 ```
 
-Remove `--check-config` on R1. The values 12/24/36/48/64 are past-history
-counts; one current frame is added, so the actual inputs contain
-13/25/37/49/65 frames. Both scenarios run five times and report medians, while
+Remove `--check-config` on R1. The default uses eight past frames plus one
+current frame, for nine actual input frames; `--history-frames` can still
+override it. Both scenarios run five times and report medians, while
 every request generates five tokens. Deterministic synthetic 256×448 frames make
 the report a latency and cache comparison rather than a navigation-accuracy test.
 Each tier warms the full-window and current-tubelet Rhino Graphs outside the
@@ -48,6 +49,52 @@ When the application already uses upstream `VLN_EVAL_TRAJ_TOP1`, pass
 padded to 4,480 rows for column-parallel Linear and fused into single-token
 decode. This opt-in changes the default full-vocabulary decoding domain and
 requires separate navigation-quality evaluation.
+
+## Thor approach and 8-bit weights
+
+The [upstream Thor guide](https://github.com/lightorigins/LightNav-0/blob/main/docs/JETSON_THOR.md)
+quantizes only the language model and keeps Vision in BF16; it reports that
+full-model FP8 changed visual decisions and made the ViT slower. R1 does not
+provide the same CUDA FP8/vLLM kernels, so this port keeps the same boundary:
+the 36-layer Text7 projections use offline W8A16 while the action head,
+embeddings, norms, and Vision stay FP16. Admission remains limited to the exact
+LightNav-0 profile.
+
+```bash
+PYTHONPATH=python python -m rpu_backend.quant.convert_qwen3_vl \
+  --bits 8 \
+  --src /path/to/LightNav-0 \
+  --dst /path/to/LightNav-0-text-w8a16
+```
+
+The weight file falls from 9.70 GB to 6.06 GB, a 37.5% reduction. It does not
+halve because Vision, the action head, and other non-Linear weights remain FP16.
+
+Five fixed output tokens are still autoregressive: tokens two through five each
+depend on the previous token. On R1 v1.2.0, retaining the second
+position-specific decode Graph already exhausted the Graph arena, so four such
+Graphs cannot stay resident. Clearing and rebuilding for every position would
+add latency. The delivered path therefore keeps one shared checked-replay
+decode Graph and no separate fixed-position option.
+
+R1 v1.2.0 used eight history frames plus one current frame, deterministic
+256x448 input, the 4,369-token action allowlist, and five measured requests per
+cache scenario. No previous-request token draft was used:
+
+| Cache scenario | Precision | Prepare | Vision | Prefill | Decode 5 | Total |
+|---|---|---:|---:|---:|---:|---:|
+| All miss (0/5) | FP16 | 44.3 ms | 316.4 ms | 140.3 ms | 213.6 ms | 716.7 ms |
+| All miss (0/5) | Text W8A16 | 24.1 ms | 292.5 ms | 89.8 ms | 116.0 ms | 525.3 ms |
+| All history hit (4/1) | FP16 | 22.0 ms | 75.4 ms | 138.6 ms | 209.7 ms | 446.9 ms |
+| All history hit (4/1) | Text W8A16 | 15.9 ms | 72.1 ms | 89.5 ms | 116.2 ms | 294.9 ms |
+
+For the all-history-hit case, Text W8A16 reduces prefill by 35.4%, decode by
+44.6%, and end-to-end latency by 34.0%. The all-miss end-to-end reduction is
+26.7%. All 20 timed requests at both precisions produced
+`[153716, 153743, 151675, 151961, 152205]`. This establishes consistency only
+for the deterministic benchmark input and does not replace navigation task
+evaluation. Cached and recomputed visual features differed by at most
+`2.44e-4`.
 
 ## Prefill and decode device optimization
 

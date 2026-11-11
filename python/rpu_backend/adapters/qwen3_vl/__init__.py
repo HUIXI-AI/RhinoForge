@@ -399,6 +399,7 @@ def _is_lightnav_profile(config) -> bool:
         rope = getattr(text, "rope_parameters", None) or getattr(
             text, "rope_scaling", None
         ) or {}
+        runtime_quant = _is_qwen3_vl_runtime_quant_config(config)
         return (
             config.model_type == "qwen3_vl"
             and config.architectures == ["Qwen3VLForConditionalGeneration"]
@@ -406,17 +407,23 @@ def _is_lightnav_profile(config) -> bool:
             and int(getattr(config, "num_motion_tokens", -1)) == 0
             and int(getattr(config, "motion_projection_layers", -1)) == 0
             and _text_config_profile(text) == _QWEN3_VL_4B_TEXT_PROFILE
-            and not _qwen3_vl_has_quant_metadata(config)
+            and (
+                not _qwen3_vl_has_quant_metadata(config)
+                or runtime_quant
+            )
+            and (
+                (config.tie_word_embeddings, text.tie_word_embeddings)
+                == ((False, False) if runtime_quant else (True, True))
+            )
             and (
                 text.model_type, text.num_attention_heads, text.head_dim,
                 text.hidden_act, text.rms_norm_eps, text.vocab_size,
-                text.attention_bias, text.use_cache, config.tie_word_embeddings,
-                text.tie_word_embeddings, rope.get("rope_type"),
+                text.attention_bias, text.use_cache, rope.get("rope_type"),
                 rope.get("rope_theta", getattr(text, "rope_theta", None)),
                 rope.get("mrope_interleaved"), tuple(rope.get("mrope_section", ())),
             ) == (
                 "qwen3_vl_text", 32, 128, "silu", 1e-6, 156048,
-                False, True, True, True, "default", 5_000_000, True,
+                False, True, "default", 5_000_000, True,
                 (24, 20, 20),
             )
             and (
@@ -1909,6 +1916,10 @@ class Qwen3VLAdapter:
         if runtime_quant != getattr(self, "_is_runtime_quant", False):
             raise RPUBackendError("Qwen3-VL runtime quantized config changed after adapter construction; reload")
         runtime_align_quantized = is_runtime_align_4b_w8a16 or runtime_quant
+        quantized_vision = (
+            runtime_align_quantized
+            and self.model.config.quant_config.get("vision_quantization") != "fp16"
+        )
         runtime_w4 = runtime_quant and self.model.lm_head.weight.dtype == torch.uint8
         from rpu_backend.quant.load import _validate_qwen3_vl_awq_model
         text_awq = _validate_qwen3_vl_awq_model(self.model)
@@ -1990,8 +2001,11 @@ class Qwen3VLAdapter:
                 topology is None and not delivery_w8_text and not lm_head_w4a16
                 and getattr(self.model, "_qwen3_vl_delivery_profile", None) is None
                 and _text_config_profile(text_cfg) == _QWEN3_VL_4B_TEXT_PROFILE
-                and _is_qwen3_vl_dense_eager_profile(self.model)
-                and _qwen3_vl_text_projection_weights_are_fp16(text_model)
+                and (
+                    (_is_qwen3_vl_dense_eager_profile(self.model)
+                     and _qwen3_vl_text_projection_weights_are_fp16(text_model))
+                    or (is_lightnav and runtime_quant and not quantized_vision)
+                )
             )
             # Exact padded 8B reuses storage only. Keep its accumulation
             # policy, C128 ceiling and Vision schedule unchanged.
@@ -2197,7 +2211,7 @@ class Qwen3VLAdapter:
                 _allow_graph_blocked_32b=is_graph_blocked_32b_w8a16,
                 _allow_padded_8b=is_padded_8b and not runtime_quant_large,
                 **({"_allow_runtime_quantized_large": True} if runtime_quant_large else {}),
-                **({"w8a16": True} if runtime_align_quantized else {}),
+                **({"w8a16": True} if quantized_vision else {}),
                 **({"_pack_fp16_block_weights": True}
                    if use_fp16_vision_weight_banks or use_8b_fp16_weight_banks or is_graph_blocked_32b_w8a16 else {}),
                 **({"num_cores": 4} if topology is not None else {}),
@@ -2223,7 +2237,9 @@ class Qwen3VLAdapter:
                 deepstack_lang_layers=deepstack_lang_layers,
                 enable_deepstack=True,
                 execution_config=self._text_execution,
-                **({"runtime_align_w8a16": True} if is_runtime_align_4b_w8a16 else {}),
+                **({"runtime_align_w8a16": True}
+                   if is_runtime_align_4b_w8a16 or (is_lightnav and runtime_quant)
+                   else {}),
                 **({"_legacy_32b_w8a16": True} if is_graph_blocked_32b_w8a16 else {}),
                 **({"_runtime_quantized_32b": True}
                    if runtime_quant_large and text_cfg.hidden_size == 5120 else {}),
@@ -2299,7 +2315,7 @@ class Qwen3VLAdapter:
                     torch.ops.rpu.qwen3vl_vision_set_preload_replay_skip(
                         vision_model._rpu_vision_handle, True,
                     )
-                if runtime_align_quantized:
+                if quantized_vision:
                     enable_qwen3_vl_vision_merger_on_device(vision_model, w8a16=True)
                     if not runtime_quant_large and not vision_linear_acc32:
                         register_qwen3vl_vision_fused_merger(vision_model, w8a16=True)
@@ -2330,6 +2346,7 @@ class Qwen3VLAdapter:
                 elif (
                     topology is None and (
                         text_w8_2b or text_awq
+                        or (is_lightnav and runtime_quant and not quantized_vision)
                         or (
                             ((is_padded_8b and _is_qwen3_vl_8b_vision_config(vision_cfg))
                              or _is_qwen3_vl_dense_eager_profile(self.model))
@@ -2345,8 +2362,11 @@ class Qwen3VLAdapter:
                     # an explicit CPU FP32 patch profile remains unchanged.
                     enable_qwen3_vl_vision_merger_on_device(vision_model)
                     if (use_fp16_vision_weight_banks and vision_linear_acc32
-                            and _is_qwen3_vl_dense_eager_profile(self.model)
-                            and _qwen3_vl_text_projection_weights_are_fp16(text_model)):
+                            and (
+                                (_is_qwen3_vl_dense_eager_profile(self.model)
+                                 and _qwen3_vl_text_projection_weights_are_fp16(text_model))
+                                or (is_lightnav and runtime_quant)
+                            )):
                         register_qwen3vl_vision_fused_merger(vision_model)
                         torch.ops.rpu.qwen3vl_vision_set_fp16_chunked_merger(
                             vision_model._rpu_vision_handle, True,

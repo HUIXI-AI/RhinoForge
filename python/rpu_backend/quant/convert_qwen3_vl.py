@@ -26,6 +26,7 @@ from .int4_pgrp_pack import quantize_int4_group_wise
 
 
 PROFILE = "qwen3_vl_4b_w8a16_runtime_align_v1"
+LIGHTNAV_W8_PROFILE = "lightnav_0_4b_w8a16_text_v1"
 QUANT_CONFIG = {
     "method": "w8a16",
     "profile": PROFILE,
@@ -80,6 +81,18 @@ def runtime_quant_config(hidden_size: int, bits: int, *, source_quantization=Non
     return result
 
 
+def lightnav_w8_quant_config() -> dict:
+    """LightNav Text7 W8; preserve its action head and vision tower in FP16."""
+    result = runtime_quant_config(2560, 8)
+    result.update(
+        profile=LIGHTNAV_W8_PROFILE,
+        skip_modules=["model.language_model.embed_tokens", "lm_head", "model.visual"],
+        quantized_lm_head=False,
+        vision_quantization="fp16",
+    )
+    return result
+
+
 def _get(config, name, default=None):
     return config.get(name, default) if isinstance(config, dict) else getattr(config, name, default)
 
@@ -102,7 +115,9 @@ def matches_runtime_geometry(config) -> bool:
                 "temporal_patch_size", "spatial_merge_size", "out_hidden_size", "in_channels", "num_position_embeddings")))
 
 
-def _matches_geometry(config, hidden_size) -> bool:
+def _matches_geometry(
+    config, hidden_size, *, vocab_size=151936, vision_model_type="qwen3_vl",
+) -> bool:
     try:
         text = _get(config, "text_config")
         vision = _get(config, "vision_config")
@@ -117,7 +132,7 @@ def _matches_geometry(config, hidden_size) -> bool:
                 "model_type", "hidden_size", "intermediate_size", "num_hidden_layers",
                 "num_attention_heads", "num_key_value_heads", "head_dim", "vocab_size",
                 "hidden_act", "rms_norm_eps", "attention_bias", "use_cache", "max_position_embeddings",
-            )) == ("qwen3_vl_text", hidden_size, intermediate, layers, heads, 8, 128, 151936,
+            )) == ("qwen3_vl_text", hidden_size, intermediate, layers, heads, 8, 128, vocab_size,
                   "silu", 1e-6, False, True, 262144)
             and _get(text, "attention_dropout", 0.0) == 0.0
             and rope.get("rope_type") == "default"
@@ -128,7 +143,7 @@ def _matches_geometry(config, hidden_size) -> bool:
                 "model_type", "hidden_size", "intermediate_size", "depth", "num_heads",
                 "patch_size", "temporal_patch_size", "spatial_merge_size", "out_hidden_size",
                 "hidden_act", "in_channels", "num_position_embeddings",
-            )) == ("qwen3_vl", vh, vi, depth, 16, 16, 2, 2, hidden_size,
+            )) == (vision_model_type, vh, vi, depth, 16, 16, 2, 2, hidden_size,
                   "gelu_pytorch_tanh", 3, 2304)
             and tuple(_get(vision, "deepstack_visual_indexes", ())) == taps
             and tuple(_get(config, key) for key in (
@@ -137,6 +152,18 @@ def _matches_geometry(config, hidden_size) -> bool:
         )
     except (AttributeError, KeyError, TypeError, ValueError):
         return False
+
+
+def matches_lightnav_geometry(config) -> bool:
+    return (
+        _matches_geometry(
+            config, 2560, vocab_size=156048,
+            vision_model_type="qwen3_vl_vision",
+        )
+        and _get(config, "split_embeddings") is False
+        and _get(config, "num_motion_tokens") == 0
+        and _get(config, "motion_projection_layers") == 0
+    )
 
 
 def quantize_weight(weight: torch.Tensor, *, bits: int = 8) -> tuple[torch.Tensor, torch.Tensor]:
@@ -176,7 +203,7 @@ def _checkpoint_tensor_shapes(config):
         "mlp.down_proj": (h, inter),
     }
     return {f"{TEXT_PREFIX}{i}.{name}.weight": shape for i in range(text["num_hidden_layers"])
-            for name, shape in projections.items()}, (151936, h)
+            for name, shape in projections.items()}, (text["vocab_size"], h)
 
 
 def _awq_logical_projection(packed, shape, scale, *, n, k):
@@ -336,12 +363,18 @@ def convert_checkpoint(src: str | Path, dst: str | Path, *, bits: int = 8) -> di
                   (text.get("tie_word_embeddings") is None or
                    type(text.get("tie_word_embeddings")) is bool)) if large else
                  (source_tied is True and text.get("tie_word_embeddings") is True))
-    if (not matches_runtime_geometry(config) or not valid_tie
+    is_lightnav = matches_lightnav_geometry(config)
+    if (not (matches_runtime_geometry(config) or is_lightnav) or not valid_tie
             or any(_get(owner, key) is not None for owner in
                    (config, config["text_config"], config["vision_config"])
                    for key in ("quant_config", "quantization_config"))):
         raise ValueError("conversion requires an exact unquantized official Qwen3-VL-Instruct config")
-    quant_config = runtime_quant_config(config["text_config"]["hidden_size"], bits)
+    if is_lightnav and bits != 8:
+        raise ValueError("LightNav runtime quantization supports Text7 W8A16 only")
+    quant_config = (
+        lightnav_w8_quant_config() if is_lightnav else
+        runtime_quant_config(config["text_config"]["hidden_size"], bits)
+    )
     if dst.exists():
         raise FileExistsError(f"destination already exists: {dst}")
     sharded, shards, weight_map, index = _checkpoint_layout(src)
@@ -388,14 +421,17 @@ def convert_checkpoint(src: str | Path, dst: str | Path, *, bits: int = 8) -> di
                 shape = expected.get(name, head_shape if name in (HEAD_NAME, EMBED_NAME) else None)
                 if shape is not None and tuple(tensor.shape) != shape:
                     raise ValueError(f"source tensor {name} has shape {tuple(tensor.shape)}, expected {shape}")
-                if name in expected or name == HEAD_NAME:
+                if name in expected or (
+                    name == HEAD_NAME and quant_config["quantized_lm_head"]
+                ):
                     out[name], out[name[:-7] + ".weight_scale"] = quantize_weight(tensor, bits=bits)
                     stats["n_quantized"] += 1
                 else:
                     out[name] = tensor.to(torch.float16).contiguous()
                     if not bool(torch.isfinite(out[name]).all()):
                         raise ValueError(f"source tensor {name} is not finite FP16")
-                if name == EMBED_NAME and HEAD_NAME not in source_names:
+                if (name == EMBED_NAME and HEAD_NAME not in source_names
+                        and quant_config["quantized_lm_head"]):
                     out[HEAD_NAME], out["lm_head.weight_scale"] = quantize_weight(tensor, bits=bits)
                     stats["n_quantized"] += 1
             save_file(out, str(tmp / shard), metadata={"format": "pt"})
@@ -405,8 +441,12 @@ def convert_checkpoint(src: str | Path, dst: str | Path, *, bits: int = 8) -> di
                 output_map[name] = shard
                 stats["bytes_out"] += tensor.numel() * tensor.element_size()
             del tensors, out
-        if stats["n_quantized"] != len(expected) + 1:
-            raise ValueError(f"expected {len(expected)} text projections and one head, got {stats['n_quantized']}")
+        expected_quantized = len(expected) + int(quant_config["quantized_lm_head"])
+        if stats["n_quantized"] != expected_quantized:
+            raise ValueError(
+                f"expected {expected_quantized} quantized tensors, "
+                f"got {stats['n_quantized']}"
+            )
         if sharded:
             index = copy.deepcopy(index)
             index["metadata"] = {**index.get("metadata", {}), "total_size": stats["bytes_out"]}

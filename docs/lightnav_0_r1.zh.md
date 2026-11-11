@@ -12,7 +12,8 @@ RhinoForge 复用现有 Qwen3-VL 4B 文本、视觉和 DeepStack 路径。LightN
 后，4369 个候选补齐为 4480 行，可并入设备侧 decode Graph。该分支只允许精确的
 LightNav 配置，不放宽其他扩展词表模型。
 
-视觉缓存沿用上游按 2 帧 tubelet 建立的 key。每个 miss 只运行一次 ViT，并把
+视觉缓存沿用上游按 2 帧 tubelet 建立的 key，默认容量按上游 Thor 长会话建议设为
+1024。每个 miss 只运行一次 ViT，并把
 pooler output 与 3 层 DeepStack 特征保存到 CPU；同一会话后续窗口直接复用。
 缓存继续保存池化前特征，并额外按“精确 tubelet 序列 + SlowFast pooling factor”
 缓存整段 post-ViT pooling 结果；历史组成或倍率变化时 key 不匹配，会重新池化。
@@ -31,8 +32,8 @@ python examples/lightnav_benchmark.py \
   --check-config
 ```
 
-R1 运行时移除 `--check-config`。12/24/36/48/64 表示过去的历史帧数，每档额外
-加入 1 帧当前画面，所以实际输入 13/25/37/49/65 帧。两个场景各测 5 次取中位数，
+R1 运行时移除 `--check-config`。默认使用 8 帧历史并额外加入 1 帧当前画面，所以
+实际输入 9 帧；仍可用 `--history-frames` 显式覆盖。两个场景各测 5 次取中位数，
 每次固定输出 5 个 token。输入使用确定性的 256×448 合成帧，因此结果用于比较
 推理性能和缓存收益，不代表导航任务准确率。
 
@@ -40,6 +41,45 @@ R1 运行时移除 `--check-config`。12/24/36/48/64 表示过去的历史帧数
 `--constrained-head`。它在冷装载时只保留 4369 个候选 token 的输出头，物理补齐到
 4480 行后使用 column-parallel Linear，并把单 token decode 的输出头纳入同一个
 设备 Graph。该选项改变默认全词表解码范围，必须单独验证真实导航质量。
+
+## Thor 思路与 8bit
+
+[上游 Thor 方案](https://github.com/lightorigins/LightNav-0/blob/main/docs/JETSON_THOR.md)
+只量化语言模型，视觉编码器保留 BF16；其记录显示全模型 FP8 会使视觉结果翻转，ViT
+还会变慢。R1 没有对应的 CUDA FP8/vLLM 内核，因此这里采用相同的量化边界，将 36 层
+Text7 投影离线转为 W8A16，动作输出头、embedding、norm 和 Vision 保持 FP16。
+准入仍要求精确 LightNav-0 配置，不会把这套混合精度规则扩展到其他模型。
+
+```bash
+PYTHONPATH=python python -m rpu_backend.quant.convert_qwen3_vl \
+  --bits 8 \
+  --src /path/to/LightNav-0 \
+  --dst /path/to/LightNav-0-text-w8a16
+```
+
+本次权重文件由 9.70 GB 降到 6.06 GB，减少 37.5%。没有达到一半，是因为 Vision、
+动作输出头及其他非 Linear 权重仍保留 FP16。
+
+固定输出 5 token 不等于 5 个 token 能并行计算：第 2～5 个 token 分别依赖前一个
+token。R1 v1.2.0 实测在保留第 2 个位置专属 decode Graph 时已经耗尽 Graph arena，
+无法同时常驻 4 个位置 Graph；逐位置清理并重建会增加开销。因此交付继续使用一个
+共享的 checked-replay decode Graph，没有保留单独的固定位置开关。
+
+R1 v1.2.0 使用 8 帧历史加 1 帧当前画面、确定性 256×448 输入、4369-token action
+allowlist，每个缓存场景测 5 次取中位数。测试不使用上一请求 token 候选：
+
+| 缓存场景 | 精度 | 准备 | 视觉 | Prefill | Decode 5 token | 总耗时 |
+|---|---|---:|---:|---:|---:|---:|
+| 全未命中（0/5） | FP16 | 44.3 ms | 316.4 ms | 140.3 ms | 213.6 ms | 716.7 ms |
+| 全未命中（0/5） | Text W8A16 | 24.1 ms | 292.5 ms | 89.8 ms | 116.0 ms | 525.3 ms |
+| 历史全命中（4/1） | FP16 | 22.0 ms | 75.4 ms | 138.6 ms | 209.7 ms | 446.9 ms |
+| 历史全命中（4/1） | Text W8A16 | 15.9 ms | 72.1 ms | 89.5 ms | 116.2 ms | 294.9 ms |
+
+Text W8A16 在历史全命中场景把 Prefill 降低 35.4%、Decode 降低 44.6%、端到端
+降低 34.0%；全未命中场景端到端降低 26.7%。两种精度的 20 个正式计时请求均输出
+同一序列 `[153716, 153743, 151675, 151961, 152205]`。这只证明当前确定性输入的
+一致性，不替代真实导航数据的任务准确率评测。缓存与重算视觉特征的最大绝对误差均为
+`2.44e-4`。
 
 ## Prefill 与 Decode 设备优化
 

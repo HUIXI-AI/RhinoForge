@@ -44,6 +44,8 @@ def test_row_swizzle_accepts_lightnav_vocabulary_alignment():
 
 def test_benchmark_contract_fixes_five_tokens_and_history_set():
     assert BENCHMARK.OUTPUT_TOKENS == 5
+    assert BENCHMARK.DEFAULT_HISTORIES == (8,)
+    assert BENCHMARK.VISION_CACHE_ENTRIES == 1024
     assert BENCHMARK.MAX_PREFILL_TOKENS == 4176
     assert BENCHMARK.VISION_CACHE_ATOL == 1e-3
     assert BENCHMARK.parse_histories("12,24,36,48,64") == (12, 24, 36, 48, 64)
@@ -55,7 +57,8 @@ def test_benchmark_contract_fixes_five_tokens_and_history_set():
 def test_lightnav_candidate_head_uses_checked_decode_replay():
     assert "lightnav_candidate_head" in DECODE_REPLAY_SOURCE
     assert "vocab_size_ == 4480" in DECODE_REPLAY_SOURCE
-    assert "profile.dtype, vocab_size_, hidden_size()" in DECODE_REPLAY_SOURCE
+    assert "profile.head_dtype, vocab_size_, hidden_size()" in DECODE_REPLAY_SOURCE
+    assert "qwen3vl_4b_w8_profile_" in DECODE_REPLAY_SOURCE
 
 
 def test_lightnav_candidate_head_reconfigures_native_decode_once(monkeypatch):

@@ -93,7 +93,7 @@ std::optional<int64_t> decode_cache_capacity(at::TensorList k, at::TensorList v,
 // The actual recorded stream must match in full before any emission is skipped.
 struct DecodeProfile {
     int layers = 36;
-    at::ScalarType dtype = at::kChar;
+    at::ScalarType dtype = at::kChar, head_dtype = at::kChar;
     bool acc32 = false, gemv = true, packed_qkv = true, fused_mlp = true;
     bool tts_predictor = false, tts_head = false;
 };
@@ -102,15 +102,16 @@ bool linear_name(const std::string& name, const DecodeProfile& profile, bool hea
     if (!head && profile.gemv)
         return name == (profile.dtype == at::kHalf ? "llama_gemv" : "llama_gemv_wint8");
     const bool acc32 = profile.acc32 && !(head && profile.tts_head);
+    const auto dtype = head ? profile.head_dtype : profile.dtype;
     using namespace rpu_pl_tiling;
     for (int n : {128, 112, 96, 80, 64, 48, 32}) {
         std::string expected;
-        if (profile.dtype == at::kByte)
+        if (dtype == at::kByte)
             expected = acc32
                 ? autotile_kernel_name_int4_acc32(mtile_int4_acc32(n), n)
                 : autotile_kernel_name_int4(mtile_int4(n), n);
         else {
-            const bool half = profile.dtype == at::kHalf;
+            const bool half = dtype == at::kHalf;
             expected = acc32
                 ? autotile_kernel_name_acc32(half, half ? mtile_fp16_acc32(n) : mtile_w8a16_acc32(n), n)
                 : autotile_kernel_name(half, half ? mtile_w16(n) : mtile_w8a16(n), n);
@@ -287,6 +288,7 @@ struct CausalDecoderModel::Qwen3VlDecodeReplayState {
         p.fused_mlp = p.gemv && model.qwen3vl_4b_decode_gateup_fused_;
         p.tts_predictor = model.num_layers() == 5;
         p.tts_head = !model.tts_predictor_heads_.empty();
+        p.head_dtype = p.tts_head ? at::kHalf : model.lm_head_w_.scalar_type();
         return p;
     }
 
@@ -318,7 +320,7 @@ struct CausalDecoderModel::Qwen3VlDecodeReplayState {
         for (const auto& head : model.tts_predictor_heads_)
             if (!fn(head, true)) return false;
         if (p.packed_qkv && !fn(model.qwen3vl_4b_qkv_scale_bank_, true)) return false;
-        if (p.dtype != at::kHalf && !fn(model.lm_head_w_scale_, true)) return false;
+        if (p.head_dtype != at::kHalf && !fn(model.lm_head_w_scale_, true)) return false;
         return p.tts_predictor || fn(model.position_ids_keepalive_, false);
     }
 
@@ -418,7 +420,7 @@ struct CausalDecoderModel::Qwen3VlDecodeReplayState {
         if (!profile(model).tts_predictor) rpu_ddr_flush(model.lm_head_w_.data_ptr());
         if (!model.tts_predictor_heads_.empty())
             rpu_ddr_flush(model.tts_predictor_heads_.at(model.tts_predictor_head_index_).data_ptr());
-        if (profile(model).dtype != at::kHalf) rpu_ddr_flush(model.lm_head_w_scale_.data_ptr());
+        if (profile(model).head_dtype != at::kHalf) rpu_ddr_flush(model.lm_head_w_scale_.data_ptr());
     }
 };
 
@@ -442,8 +444,10 @@ bool CausalDecoderModel::begin_qwen3vl_decode_replay(
         !lm_head_w_scale_.defined() && deepstack_lang_layers_.empty() && rope_position_base_ < 0 &&
         !layer_weights_.empty() && layer_weights_.front().q_w.defined() &&
         layer_weights_.front().q_w.scalar_type() == at::kHalf;
-    const bool lightnav_candidate_head = qwen3vl_fp16_decode_profile_ &&
-        fuse_lm_head_ && vocab_size_ == 4480 && !linear_acc32_;
+    const bool lightnav_candidate_head =
+        (qwen3vl_fp16_decode_profile_ || qwen3vl_4b_w8_profile_) &&
+        fuse_lm_head_ && vocab_size_ == 4480 && !linear_acc32_ &&
+        lm_head_w_.scalar_type() == at::kHalf;
     const bool ordinary = qwen3vl_ordinary_resident_prefill_profile_ || qwen3vl_4b_w8_profile_ || exact_8b || tts_predictor;
     const bool geometry = (num_layers() == 28 && hidden_size() == 2048 && intermediate_size() == 6144 && num_q_heads() == 16) ||
         (num_layers() == 36 && hidden_size() == 2560 && intermediate_size() == 9728 && num_q_heads() == 32) || exact_8b || tts_predictor;
@@ -480,7 +484,7 @@ bool CausalDecoderModel::begin_qwen3vl_decode_replay(
     // retain the generic recorded-Graph execution for those profiles.
     if (profile.acc32 && profile.dtype != at::kHalf) return false;
     if ((!tts_predictor && (!Qwen3VlDecodeReplayState::projection_shape(lm_head_w_, lm_head_w_scale_,
-            profile.dtype, vocab_size_, hidden_size(), false) ||
+            profile.head_dtype, vocab_size_, hidden_size(), false) ||
         !cos_.defined() || cos_.dim() != 2 || cos_.size(0) <= 0 ||
         !position_ids_keepalive_.defined() || position_ids_keepalive_.dim() != 2 ||
         position_ids_keepalive_.size(0) <= 0 || position_ids_keepalive_.size(0) > cos_.size(0) ||

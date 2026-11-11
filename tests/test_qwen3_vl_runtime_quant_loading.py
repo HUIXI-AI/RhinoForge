@@ -13,6 +13,7 @@ from transformers import Qwen3VLConfig
 from rpu_backend.quant import convert_qwen3_vl as convert
 from rpu_backend.quant import load_qwen3_vl_runtime as runtime
 from rpu_backend.quant import load
+from rpu_backend.adapters import qwen3_vl as adapter
 from rpu_backend.quant.int4_pgrp_pack import quantize_int4_group_wise
 from test_qwen3_vl_awq_packing import exact_config, inverse_rpu_weight, inverse_rpu_scale, source_pack
 
@@ -41,6 +42,36 @@ def awq_runtime_config(size=2):
     result.quant_config = convert.runtime_quant_config(result.text_config.hidden_size, 4,
         source_quantization=convert.AWQ_SOURCE_QUANTIZATION)
     return result
+
+
+def lightnav_config(*, source=False):
+    result = exact_config(4)
+    del result.quantization_config
+    result.split_embeddings = False
+    result.num_motion_tokens = 0
+    result.motion_projection_layers = 0
+    result.text_config.vocab_size = 156048
+    result.vision_config.model_type = "qwen3_vl_vision"
+    result.tie_word_embeddings = result.text_config.tie_word_embeddings = source
+    if not source:
+        result.quant_config = convert.lightnav_w8_quant_config()
+    return result
+
+
+def test_lightnav_w8_quantizes_text_only_and_keeps_exact_admission():
+    source = lightnav_config(source=True)
+    quantized = lightnav_config()
+    assert convert.matches_lightnav_geometry(source)
+    assert not runtime.is_qwen3_vl_runtime_quant_config(source)
+    assert runtime.is_qwen3_vl_runtime_quant_config(quantized)
+    assert adapter._is_lightnav_profile(source)
+    assert adapter._is_lightnav_profile(quantized)
+    assert quantized.quant_config["quantized_lm_head"] is False
+    assert quantized.quant_config["vision_quantization"] == "fp16"
+
+    changed = copy.deepcopy(quantized)
+    changed.quant_config["vision_quantization"] = "per_channel_on_install"
+    assert not runtime.is_qwen3_vl_runtime_quant_config(changed)
 
 
 @pytest.fixture(autouse=True)

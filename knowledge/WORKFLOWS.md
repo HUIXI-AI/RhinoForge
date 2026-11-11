@@ -210,6 +210,11 @@ Start with the [Qwen3 speech guide](../docs/qwen3_audio.md) and retain these con
   Use sentence stops and the request-initial CPU RNG state for each segment.
   Later segments restore the caller RNG state left by the first; return owned
   concatenated audio only after every segment succeeds.
+- Keep `stream_synthesize()` on the same segment generation path. Hold the model
+  request lock across the generator lifetime, but leave inference mode before
+  yielding each owned waveform. Early-stop callers close the generator; failure
+  and cancellation release the lock and retain only completed-segment statistics.
+  Keep `synthesize()` as the no-partial-output consumer of that generator.
 - Bind output-head reuse to the exact current hidden object and consume it once.
   Predictor borrows the final device row for its immediate head; requests for
   hidden states retain owned CPU outputs. Never retain a borrowed row across

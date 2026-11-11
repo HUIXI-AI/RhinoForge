@@ -122,7 +122,7 @@ def _tts_mlp_weight(weight, component, layer_index, path):
 
 
 class Qwen3TTSModel:
-    """Frozen 0.6B Base, bounded non-streaming voice cloning, batch one.
+    """Frozen 0.6B Base, bounded voice cloning, batch one.
 
     Talker, Code Predictor and their output heads execute FP16 on device.
     The codec frontend also uses device FP16 when the native RoPE contract is available.
@@ -315,18 +315,19 @@ class Qwen3TTSModel:
             raise RuntimeError("TTS reached max_new_tokens without EOS; shorten the text or increase the limit (up to 256)")
         return result
 
-    def synthesize(self, text, *, reference_audio, language="Chinese", max_new_tokens=256):
-        """Return an independent float32 mono waveform and sample rate (24 kHz).
+    def stream_synthesize(self, text, *, reference_audio, language="Chinese", max_new_tokens=256):
+        """Return a generator yielding independent float32 mono chunks at 24 kHz.
 
-        Sampling follows the frozen checkpoint. Set torch.manual_seed for repeatability.
-        Long text uses 12-token segments, up to 16 tokens to retain short sentence endings.
-        max_new_tokens applies to each segment; no partial waveform is returned on failure.
-        Reaching the cap without EOS raises before waveform decoding. Reference audio
-        is a local mono 24 kHz file; cloning uses speaker embedding without a transcript.
+        Chunks follow internal text segments. Close the generator when stopping early.
         """
         limit = _validate_request(text, language, max_new_tokens)
+        return self._stream_synthesize(text, reference_audio, language, limit)
+
+    def _stream_synthesize(self, text, reference_audio, language, limit):
         if not self._lock.acquire(blocking=False):
             raise RuntimeError("TTS requests, stats and close must be serial")
+        steps = []
+        generation_started = completed = False
         try:
             if self._closed:
                 raise RuntimeError("TTS model is closed")
@@ -347,15 +348,15 @@ class Qwen3TTSModel:
                     self._voice_clone_prompt = dict(ref_code=[None], ref_spk_embedding=[embedding],
                         x_vector_only_mode=[True], icl_mode=[False])
                     self._reference_key = key
-                outputs = []
-                steps = []
-                segment_rng = torch.random.get_rng_state() if len(segments) > 1 else None
-                for index, segment in enumerate(segments):
+            segment_rng = torch.random.get_rng_state() if len(segments) > 1 else None
+            generation_started = True
+            for index, segment in enumerate(segments):
+                try:
                     self._last_generation = None
                     utterance = segment
                     if len(segments) > 1 and not segment.endswith(("。", "！", "？", ".", "!", "?")):
                         utterance = segment.rstrip(",，;；:：、") + ("。" if language == "Chinese" else ".")
-                    try:
+                    with torch.inference_mode():
                         # A segment's sampling must not depend on earlier segments' lengths.
                         with torch.random.fork_rng(devices=[]) if index else nullcontext():
                             if index:
@@ -363,9 +364,6 @@ class Qwen3TTSModel:
                             waves, rate = self._wrapper.generate_voice_clone(text=utterance, language=language,
                                 voice_clone_prompt=self._voice_clone_prompt, non_streaming_mode=True,
                                 do_sample=True, subtalker_dosample=True, max_new_tokens=limit)
-                    except RuntimeError as error:
-                        error.add_note(f"TTS segment {index + 1} of {len(segments)} failed; no partial audio returned")
-                        raise
                     if self._last_generation is None or not self._last_generation["eos"]:
                         raise RuntimeError("TTS segment did not complete generation")
                     if len(waves) != 1 or rate != 24000:
@@ -375,13 +373,41 @@ class Qwen3TTSModel:
                         raise FloatingPointError("TTS produced empty or non-finite audio")
                     if not np.any(waveform):
                         raise FloatingPointError("TTS produced silent audio")
-                    outputs.append(waveform.copy())
                     steps.append(self._last_generation["steps"])
-                self._last_generation = {"steps": sum(steps), "eos": True,
-                                         "segment_steps": tuple(steps)}
-            return (outputs[0] if len(outputs) == 1 else np.concatenate(outputs)), rate
+                except Exception as error:
+                    error.add_note(
+                        f"TTS segment {index + 1} of {len(segments)} failed after "
+                        f"{len(steps)} completed audio chunk(s)")
+                    raise
+                yield waveform.copy(), rate
+            self._last_generation = {"steps": sum(steps), "eos": True,
+                                     "segment_steps": tuple(steps)}
+            completed = True
         finally:
+            if generation_started and not completed:
+                self._last_generation = {"steps": sum(steps), "eos": False,
+                                         "segment_steps": tuple(steps)}
             self._lock.release()
+
+    def synthesize(self, text, *, reference_audio, language="Chinese", max_new_tokens=256):
+        """Return an independent float32 mono waveform and sample rate (24 kHz).
+
+        Sampling follows the frozen checkpoint. Set torch.manual_seed for repeatability.
+        Long text uses 12-token segments, up to 16 tokens to retain short sentence endings.
+        max_new_tokens applies to each segment; no partial waveform is returned on failure.
+        Reaching the cap without EOS raises before waveform decoding. Reference audio
+        is a local mono 24 kHz file; cloning uses speaker embedding without a transcript.
+        """
+        stream = self.stream_synthesize(text, reference_audio=reference_audio,
+                                        language=language, max_new_tokens=max_new_tokens)
+        outputs = []
+        try:
+            for waveform, rate in stream:
+                outputs.append(waveform)
+        except Exception as error:
+            error.add_note("TTS synthesis failed; no partial audio returned")
+            raise
+        return (outputs[0] if len(outputs) == 1 else np.concatenate(outputs)), rate
 
     def execution_stats(self):
         if not self._lock.acquire(blocking=False):

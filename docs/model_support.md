@@ -37,7 +37,8 @@ runtime contracts are indexed in the [implementation map](../knowledge/synthesis
 ## Qwen3 speech
 
 `Qwen3ASRModel` and `Qwen3TTSModel` provide dedicated ASR and TTS entry points
-with CPU and device components. Use the [speech guide](qwen3_audio.md) for pinned
+with CPU and device components. TTS supports whole-waveform synthesis and
+segment-level Python streaming. Use the [speech guide](qwen3_audio.md) for pinned
 assets, input limits, source preparation and process ownership. Use the [ASR](../examples/configs/qwen3_asr/README.md) and
 [TTS](../examples/configs/qwen3_tts/README.md) TOMLs with `examples.run`;
 the dedicated speech APIs remain separate from the CausalLM/VLM registry.

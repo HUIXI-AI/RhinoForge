@@ -19,7 +19,7 @@
 | 模型 | 输入范围 | 生成方式与输出 |
 |---|---|---|
 | ASR | batch 1；单声道 16 kHz、0.5–8 秒；有限浮点样本 | greedy，`max_new_tokens=1..64`；返回文本、含语言元数据的原始文本和 token ID；无 context、时间戳或流式接口 |
-| TTS Base | batch 1；`Chinese` / `English`；文本 1–1024 字符；参考音频为有限、非全零的单声道 24 kHz、0.5–20 秒 | 非流式采样，每段 `max_new_tokens=2..256`（默认 256）；返回独立存储的 float32 单声道波形和 24000 Hz 采样率 |
+| TTS Base | batch 1；`Chinese` / `English`；文本 1–1024 字符；参考音频为有限、非全零的单声道 24 kHz、0.5–20 秒 | 支持整段返回或文本分段级流式采样，每段 `max_new_tokens=2..256`（默认 256）；返回独立存储的 float32 单声道 24 kHz 波形块 |
 
 TTS 只使用参考音频的 speaker embedding；不接受 ICL transcript、CustomVoice 或
 VoiceDesign。每段 Talker prompt 加生成上限须在 512 个位置内。采样沿用固定
@@ -31,6 +31,8 @@ checkpoint 配置：top-k 50、temperature 0.9、top-p 1.0。未生成 EOS 时�
 16 token。段尾补句号可能改变 token 数、停顿和语调。每段从本次请求初始 CPU 随机状态开始，后续分段
 恢复第一段留下的调用方状态。各段独立复制，全部成功后拼接返回；失败不返回部分音频。
 在上述长度范围内，仅含句末标点的尾段并回前一段，避免单独合成句号。
+`stream_synthesize()` 会逐个返回已完成的文本分段。它不是声学帧级流式：短文本
+如果只形成一个分段，仍要等该段完成后才返回一个音频块。
 
 加载器先核对固定 checkpoint、配置和 tokenizer 身份，再转换权重。ASR 身份见
 [`qwen3_asr.py`](../python/rpu_backend/api/qwen3_asr.py)，TTS 身份见
@@ -127,6 +129,24 @@ with open("/path/to/output/hello.wav", "xb") as output:
     sf.write(output, waveform, sample_rate, format="WAV", subtype="FLOAT")
 ```
 
+如需在每个文本分段完成后立即消费音频，可使用 Python generator；提前停止时必须关闭：
+
+```python
+stream = model.stream_synthesize(
+    "这是一段较长的待合成文本。",
+    reference_audio="/path/to/mono-24k.wav",
+    language="Chinese",
+)
+try:
+    for waveform, sample_rate in stream:
+        play(waveform, sample_rate)
+finally:
+    stream.close()
+```
+
+generator 从首次迭代到完成、失败或关闭前一直持有模型请求锁。后续分段失败时，
+已经被调用方消费的块无法撤回；`synthesize()` 仍保持失败不返回部分音频。
+
 加载前按主机配置设置线程数，API 不会修改该值；加载后、每次请求前设置种子，
 可在同一执行配置下复现采样。多次合成可复用同一个模型上下文。ASR 也接受一维
 CPU 浮点 Tensor。
@@ -150,8 +170,8 @@ FP32 Linear 累加，Talker/Predictor 输出头仍使用 FP16 累加；codec 前
 - TTS codec 通过 `causal_decoder_set_tts_codec_mode` 显式启用设备路径；缺少 setter
   时前段留在 CPU。`execution_stats()` 返回最后一段的设备和原因，以及总生成步数、
   EOS 和每段步数；其他执行错误直接报告。
-- 一个进程只保留一个存活模型/策略；请求、`execution_stats()` 和 `close()` 串行调用。
-  两类 API 均支持 `with` 和幂等 `close()`，输出存储独立于后续重放。
+- 一个进程只保留一个存活模型/策略；请求、`execution_stats()` 和模型 `close()` 串行调用。
+  两类模型均支持 `with` 和幂等 `close()`，输出存储独立于后续重放。
 - 加载器在设备分配前选择 caching allocator。TTS 同时申请 owner 专属六个 arena：
   五个保留 Graph 和一个串行即时调用。allocator 或 arena 计划已冻结且不兼容时，启动新进程。
 - ASR 保留当前长度的一张音频图和最多两张文本图；TTS 保留 Talker prefill/decode、

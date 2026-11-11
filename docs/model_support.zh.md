@@ -35,7 +35,8 @@ adapter 所有权与共享运行约定见[实现索引](../knowledge/synthesis/m
 ## Qwen3 语音
 
 `Qwen3ASRModel` 和 `Qwen3TTSModel` 提供独立的 ASR/TTS 入口，由 CPU 和设备组件
-共同执行。固定资产、输入范围、源码准备和进程所有权见[语音指南](qwen3_audio.zh.md)。
+共同执行；TTS 支持整段波形返回和 Python 文本分段级流式返回。固定资产、输入范围、
+源码准备和进程所有权见[语音指南](qwen3_audio.zh.md)。
 使用 [ASR](../examples/configs/qwen3_asr/README.md) 和
 [TTS](../examples/configs/qwen3_tts/README.md) TOML，通过 `examples.run` 调用语音 API；
 仍不经过 CausalLM/VLM registry。

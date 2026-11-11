@@ -194,6 +194,7 @@ def test_long_synthesis_owns_chunks_and_never_returns_partial_audio(monkeypatch,
     torch.manual_seed(17)
     buffer = np.ones(8, dtype=np.float32)
     def generate(**kwargs):
+        assert torch.is_inference_mode_enabled()
         calls.append(kwargs["text"])
         if fail_second and len(calls) == 2:
             raise RuntimeError("segment failure")
@@ -220,6 +221,77 @@ def test_long_synthesis_owns_chunks_and_never_returns_partial_audio(monkeypatch,
             assert model._last_generation == {"steps": 9, "eos": True, "segment_steps": (2, 3, 4)}
         assert len(set(draws)) == 1
         assert torch.equal(torch.random.get_rng_state(), expected_rng)
+        assert model._lock.acquire(blocking=False)
+        model._lock.release()
+    finally:
+        model._closed = True
+
+
+def test_stream_synthesis_yields_owned_chunks_and_releases_lock_on_close(monkeypatch):
+    model = Qwen3TTSModel()
+    model._closed = False
+    model._components = {"talker": {}}
+    calls = []
+    buffer = np.ones(8, dtype=np.float32)
+    def generate(**kwargs):
+        calls.append(kwargs["text"])
+        buffer[:] = len(calls)
+        model._last_generation = {"steps": len(calls) + 1, "eos": True}
+        return [buffer], 24000
+    model._wrapper = SimpleNamespace(
+        model=SimpleNamespace(speaker_encoder_sample_rate=24000,
+            extract_speaker_embedding=lambda **kwargs: torch.ones(1)),
+        processor=SimpleNamespace(tokenizer=lambda value: {"input_ids": list(value)}),
+        generate_voice_clone=generate)
+    monkeypatch.setattr(tts, "_read_reference", lambda path: (np.ones(12000, dtype=np.float32), 24000))
+    try:
+        with pytest.raises(ValueError, match="1–1024"):
+            model.stream_synthesize("", reference_audio="unused")
+        unstarted = model.stream_synthesize("甲", reference_audio="unused")
+        unstarted.close()
+        assert model._last_generation is None
+        stream = model.stream_synthesize(("甲" * 10 + "。") * 3, reference_audio="unused")
+        first, rate = next(stream)
+        assert not torch.is_inference_mode_enabled()
+        second, _ = next(stream)
+        assert rate == 24000 and first.tolist() == [1] * 8 and second.tolist() == [2] * 8
+        assert not np.shares_memory(first, second)
+        with pytest.raises(RuntimeError, match="serial"):
+            model.execution_stats()
+        stream.close()
+        assert model._last_generation == {"steps": 5, "eos": False, "segment_steps": (2, 3)}
+        assert model._lock.acquire(blocking=False)
+        model._lock.release()
+    finally:
+        model._closed = True
+
+
+def test_stream_synthesis_keeps_yielded_chunk_when_later_segment_fails(monkeypatch):
+    model = Qwen3TTSModel()
+    model._closed = False
+    model._components = {"talker": {}}
+    calls = 0
+    def generate(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("segment failure")
+        model._last_generation = {"steps": 2, "eos": True}
+        return [np.ones(8, dtype=np.float32)], 24000
+    model._wrapper = SimpleNamespace(
+        model=SimpleNamespace(speaker_encoder_sample_rate=24000,
+            extract_speaker_embedding=lambda **kwargs: torch.ones(1)),
+        processor=SimpleNamespace(tokenizer=lambda value: {"input_ids": list(value)}),
+        generate_voice_clone=generate)
+    monkeypatch.setattr(tts, "_read_reference", lambda path: (np.ones(12000, dtype=np.float32), 24000))
+    try:
+        stream = model.stream_synthesize(("甲" * 10 + "。") * 3, reference_audio="unused")
+        first, rate = next(stream)
+        with pytest.raises(RuntimeError, match="segment failure") as captured:
+            next(stream)
+        assert rate == 24000 and first.tolist() == [1] * 8
+        assert "after 1 completed audio chunk(s)" in captured.value.__notes__[0]
+        assert model._last_generation == {"steps": 2, "eos": False, "segment_steps": (2,)}
         assert model._lock.acquire(blocking=False)
         model._lock.release()
     finally:

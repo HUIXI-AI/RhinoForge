@@ -183,10 +183,15 @@ def _decoder():
     ])
     block_type = type("Qwen3TTSTokenizerV2ConvNeXtBlock", (torch.nn.Module,), {})
     decoder.convnext = torch.nn.ModuleList()
-    for _ in range(2):
+    for index in range(2):
         block = block_type()
+        block.dwconv = torch.nn.Module()
+        block.dwconv.conv = decoder.convs[-3 + index]
+        block.norm = torch.nn.LayerNorm(1024, eps=1e-6)
         block.pwconv1 = torch.nn.Linear(1024, 4096)
+        block.act = torch.nn.GELU()
         block.pwconv2 = torch.nn.Linear(4096, 1024)
+        block.gamma = torch.nn.Parameter(torch.full((1024,), 1e-6))
         decoder.convnext.append(block)
     return decoder
 
@@ -408,6 +413,68 @@ def test_residual_pair_binding_padding_calls_errors_and_restore(monkeypatch):
     for module, original in reversed(restore):
         module.forward = original
     assert all(m.forward == forward for m, forward in originals.items())
+
+
+def test_spm_codec_binds_full_residual_and_convnext_blocks(monkeypatch):
+    from rpu_backend.runtime import weights
+    decoder = _paired_decoder()
+    for stage, channels in enumerate((1536, 768, 384, 192), start=1):
+        snake = SnakeBeta()
+        snake.alpha = torch.nn.Parameter(torch.zeros(channels))
+        snake.beta = torch.nn.Parameter(torch.zeros(channels))
+        decoder.decoder[stage].block[0] = snake
+    final_snake = SnakeBeta()
+    final_snake.alpha = torch.nn.Parameter(torch.zeros(96))
+    final_snake.beta = torch.nn.Parameter(torch.zeros(96))
+    decoder.decoder.append(final_snake)
+    for unit in (module for module in decoder.modules()
+                 if type(module).__name__ == "Qwen3TTSTokenizerV2DecoderDecoderResidualUnit"):
+        unit.act1 = SnakeBeta()
+        unit.act1.alpha = torch.nn.Parameter(torch.zeros(unit.conv1.conv.in_channels))
+        unit.act1.beta = torch.nn.Parameter(torch.zeros(unit.conv1.conv.in_channels))
+    original_to = torch.Tensor.to
+    monkeypatch.setattr(torch.Tensor, "to", lambda self, *a, **kw:
+                        self if a == ("rpu",) else original_to(self, *a, **kw))
+    monkeypatch.setattr(weights, "transform_linear_weight", lambda weight, *args: weight)
+    monkeypatch.setattr(torch.ops.rpu, "tts_codec_conv1d_spm", lambda *args: args[0], raising=False)
+    monkeypatch.setattr(torch.ops.rpu, "tts_codec_conv_transpose1d", lambda *args: args[0], raising=False)
+    residual_calls, convnext_calls, snake_calls = [], [], []
+    def residual(hidden, first, affine, second, dilation, channels):
+        padded = (channels + 127) // 128 * 128
+        assert first.shape == (padded, channels * 7)
+        assert second.shape == (padded, padded)
+        assert affine.shape == (4, padded) and affine.dtype == torch.float16
+        residual_calls.append((dilation, channels))
+        return torch.zeros_like(hidden)
+    def convnext(hidden, depthwise, depthwise_bias, norm_weight, norm_bias,
+                 first, first_bias, second, second_bias, gamma, eps):
+        assert depthwise.shape == (1024, 7 * 1024)
+        assert first.shape == (4096, 1024) and second.shape == (1024, 4096)
+        assert all(value.dtype == torch.float16 for value in
+                   (depthwise_bias, norm_weight, norm_bias, first_bias,
+                    second_bias, gamma))
+        assert eps == 1e-6
+        convnext_calls.append(hidden.shape)
+        return hidden.clone()
+    monkeypatch.setattr(torch.ops.rpu, "tts_codec_residual_unit", residual, raising=False)
+    monkeypatch.setattr(torch.ops.rpu, "tts_codec_convnext_block", convnext, raising=False)
+    monkeypatch.setattr(torch.ops.rpu, "tts_codec_snake",
+                        lambda hidden, affine, channels:
+                        snake_calls.append((affine.shape, channels)) or hidden.clone(),
+                        raising=False)
+    restore, stats = [], {"calls": 0}
+    install_rpu_convolutions(decoder, restore, stats)
+    assert stats["transport"] == "spm_im2col"
+    assert stats["residual_pairs"] == 12 and stats["convnext_blocks"] == 2
+    assert stats["standalone_snakes"] == 5
+    hidden = torch.randn(1, 96, 17)
+    assert torch.equal(decoder.decoder[4].block[3](hidden), hidden)
+    assert residual_calls == [(3, 96)] and stats["paired_calls"] == 1
+    block_hidden = torch.randn(1, 1024, 9)
+    assert torch.equal(decoder.convnext[0](block_hidden), block_hidden)
+    assert convnext_calls == [block_hidden.shape] and stats["convnext_block_calls"] == 1
+    assert torch.equal(decoder.decoder[5](hidden), hidden)
+    assert snake_calls == [((2, 128), 96)] and stats["standalone_snake_calls"] == 1
 
 
 @pytest.mark.parametrize("invalid", ["geometry", "child_dilation", "range"])

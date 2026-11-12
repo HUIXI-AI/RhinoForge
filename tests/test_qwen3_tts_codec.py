@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 from rpu_backend.adapters.qwen3_tts.codec import (
     install_codec_activations, install_codec_convolutions,
-    install_rpu_convolutions, _rpu_convolution,
+    install_rpu_convolutions, _rpu_convolution, _rpu_transpose_convolution,
 )
 
 
@@ -172,7 +172,14 @@ def _decoder():
         torch.nn.Conv1d(1024, 1024, 7, groups=1024),
         torch.nn.Conv1d(1024, 1024, 7, groups=1024), torch.nn.Conv1d(96, 1, 7),
     ])
-    decoder.transpose = torch.nn.ConvTranspose1d(16, 16, 2, stride=2)
+    decoder.transposes = torch.nn.ModuleList([
+        torch.nn.ConvTranspose1d(1024, 1024, 2, stride=2),
+        torch.nn.ConvTranspose1d(1024, 1024, 2, stride=2),
+        torch.nn.ConvTranspose1d(1536, 768, 16, stride=8),
+        torch.nn.ConvTranspose1d(768, 384, 10, stride=5),
+        torch.nn.ConvTranspose1d(384, 192, 8, stride=4),
+        torch.nn.ConvTranspose1d(192, 96, 6, stride=3),
+    ])
     return decoder
 
 
@@ -209,11 +216,15 @@ def test_rpu_install_covers_decoding_convs_and_preserves_unused_layers(monkeypat
         assert weight.shape[0] % 128 == 0 and (partition, cores) == (1, 8)
         return weight
     monkeypatch.setattr(weights, "transform_linear_weight", transform)
+    monkeypatch.setattr(torch.ops.rpu, "tts_codec_conv_transpose1d", lambda *args: None,
+                        raising=False)
     restore, stats = [], {"calls": 0}
     install_rpu_convolutions(decoder, restore, stats)
-    assert stats["layers"] == len(restore) == len(converted) == 31
+    assert stats["layers"] == 31
+    assert stats["transposed_layers"] == 6 and stats["transposed_calls"] == 0
+    assert len(restore) == len(converted) == 37
     for module in (decoder.quantizer.rvq_first.input_proj,
-                   decoder.quantizer.rvq_rest.input_proj, decoder.transpose):
+                   decoder.quantizer.rvq_rest.input_proj):
         assert module.forward == originals[module]
     assert all(m.weight.device.type == "cpu" and m.weight.dtype == torch.float32 for m, _ in restore)
     # The diagonal expansion is checked using the actual prepared forward weight.
@@ -225,6 +236,31 @@ def test_rpu_install_covers_decoding_convs_and_preserves_unused_layers(monkeypat
     for module, forward in reversed(restore):
         module.forward = forward
     assert all(m.forward == forward for m, forward in originals.items())
+
+
+@pytest.mark.parametrize("kernel,stride", [(2, 2), (16, 8)])
+def test_native_transpose_transport_preserves_arguments_and_errors(monkeypatch, kernel, stride):
+    module = torch.nn.ConvTranspose1d(8, 5, kernel, stride=stride).eval()
+    hidden = torch.randn(1, 8, 7)
+    weight = object()
+    output = torch.randn(1, 5, (hidden.shape[-1] - 1) * stride + kernel)
+    stats = {"transposed_calls": 0}
+
+    def native(value, packed, bias, channels, native_kernel, native_stride):
+        assert value is hidden and packed is weight and bias is module.bias
+        assert (channels, native_kernel, native_stride) == (5, kernel, stride)
+        return output
+
+    monkeypatch.setattr(torch.ops.rpu, "tts_codec_conv_transpose1d", native, raising=False)
+    assert _rpu_transpose_convolution(module, hidden, weight, stats) is output
+    assert stats["transposed_calls"] == 1
+    with pytest.raises(ValueError, match="CPU FP32"):
+        _rpu_transpose_convolution(module, hidden.half(), weight, stats)
+    monkeypatch.setattr(torch.ops.rpu, "tts_codec_conv_transpose1d",
+                        lambda *args: (_ for _ in ()).throw(RuntimeError("device failure")))
+    with pytest.raises(RuntimeError, match="device failure"):
+        _rpu_transpose_convolution(module, hidden, weight, stats)
+    assert stats["transposed_calls"] == 1
 
 
 def test_native_codec_transport_preserves_arguments_and_propagates_errors(monkeypatch):

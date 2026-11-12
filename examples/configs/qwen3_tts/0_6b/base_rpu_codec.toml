@@ -1,4 +1,4 @@
-# Experimental: 31 decoding Conv1d layers on RPU; transposed convolutions/activations on CPU.
+# Experimental: 31 Conv1d and six transposed-convolution projections on RPU; remaining activations on CPU.
 [qwen3_tts]
 checkpoint = "/path/to/Qwen3-TTS-12Hz-0.6B-Base"
 source = "/path/to/qwen3-tts-prepared/qwen_tts"

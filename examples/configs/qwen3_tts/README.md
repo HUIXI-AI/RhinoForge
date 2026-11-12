@@ -4,7 +4,7 @@
 
 | 模板 | 声码器后段 |
 |---|---|
-| [0_6b/base.toml](0_6b/base.toml) | 默认：31 层解码 Conv1d 使用 RPU FP16/ACC32，转置卷积与激活仍为 CPU |
+| [0_6b/base.toml](0_6b/base.toml) | 默认：31 层解码 Conv1d 与 6 层转置卷积投影使用 RPU FP16/ACC32，剩余激活为 CPU |
 | [0_6b/base_rpu_codec.toml](0_6b/base_rpu_codec.toml) | 显式选择同一 RPU 配方，保留既有配置路径 |
 
 两者均复用设备 Talker、Predictor 及现有 codec Transformer 路由。
@@ -46,4 +46,4 @@ RTF = 整句耗时 / 实际音频时长；正式计时排除加载、预热及�
 
 `execution_stats[].codec_convolutions` 记录后段选择、31 个已安装层和累计 RPU 调用次数。
 RPU 模式会改变波形舍入，需比较同 tokens 的 CPU 基准并核验内容；不能用运行成功替代音质检查。
-它保留 CPU 补边、列展开、bias、SnakeBeta、转置卷积和上采样整理，不保证所有文本都更快。
+它保留 CPU 补边、列展开、bias、SnakeBeta、转置卷积重叠相加和上采样整理，不保证所有文本都更快。

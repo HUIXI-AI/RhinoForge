@@ -199,6 +199,8 @@ TORCH_LIBRARY(rpu, m) {
         TORCH_FN(rpu_tts_codec_conv1d));
   m.def("tts_codec_conv_pair(Tensor input, Tensor first_weight, Tensor affine, Tensor second_weight, Tensor second_bias, int dilation, int channels) -> Tensor",
         TORCH_FN(rpu_tts_codec_conv_pair));
+  m.def("tts_codec_conv_transpose1d(Tensor input, Tensor weight, Tensor? bias, int out_channels, int kernel, int stride) -> Tensor",
+        TORCH_FN(rpu_tts_codec_conv_transpose1d));
   // SDPA unified layout: [batch, seq_len, heads, head_dim] instead of standard [batch, heads, seq_len, head_dim]
   m.def("scaled_dot_product_attention_unified(Tensor query, Tensor key, Tensor value, Tensor? attn_mask=None, float dropout_p=0.0, bool is_causal=False, float? scale=None, bool enable_gqa=False) -> Tensor");
   // Fused QKV Attention (SPM版本，减少DDR搬运)

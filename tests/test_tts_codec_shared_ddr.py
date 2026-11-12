@@ -150,3 +150,71 @@ int main(){
         f"-Wl,-rpath,{torch_root / 'lib'}", "-o", str(exe),
     ], check=True)
     subprocess.run([str(exe)], check=True)
+
+
+def test_codec_transpose_device_matmul_layout_and_rejections(tmp_path):
+    source = (ROOT / "src/ops/rpu_linear.cpp").read_text()
+    function = "Tensor rpu_tts_codec_conv_transpose1d(" + source.split(
+        "Tensor rpu_tts_codec_conv_transpose1d(", 1)[1].split("Tensor rpu_linear_with_core_count(", 1)[0]
+    function = function.replace("weight.device().type() == at::kPrivateUse1", "weight.device().type() == at::kCPU")
+    harness = r'''
+#include <ATen/ATen.h>
+#include <ATen/Parallel.h>
+#include <cassert>
+using at::Tensor;
+struct RpuKernelGraph {static inline bool active=false;static bool has_active(){return active;}};
+int calls=0,flushes=0;
+Tensor rpu_to_cpu_zerocopy_no_graph_sync(const Tensor&t,bool flush){assert(!flush);return t;}
+Tensor rpu_to_cpu_zerocopy(const Tensor&t){++flushes;return t;}
+void rpu_ddr_flush_force_sized(void*,size_t){++flushes;}
+Tensor rpu_linear_with_accumulation(const Tensor&x,const Tensor&w,const c10::optional<Tensor>&bias,
+ int64_t partition,int64_t cores,bool acc32,const c10::optional<Tensor>&scale){
+ assert(x.scalar_type()==at::kHalf&&x.is_contiguous()&&!bias&&!scale&&partition==1&&cores==8&&acc32);
+ ++calls;return at::mm(x.to(at::kFloat),w.to(at::kFloat).t()).to(at::kHalf);
+}
+template<class F>void rejects(F fn){int before=calls;bool caught=false;try{fn();}catch(const c10::Error&){caught=true;}assert(caught&&calls==before);}
+'''
+    cases = r'''
+int main(){
+ at::manual_seed(41);at::set_num_threads(2);
+ for(auto geometry:{std::tuple<int,int,int,int>{1024,1024,2,2},{1536,768,16,8}}){
+  auto [c,n,k,s]=geometry;int count=5,padded=((n*k+127)/128)*128;
+  auto input=at::randn({1,c,count});auto saved=input.clone();
+  auto weight=(at::randn({padded,c})/32).to(at::kHalf);auto bias=at::randn({n});
+  auto projected=at::mm(input.transpose(1,2).reshape({count,c}).to(at::kHalf).to(at::kFloat),
+                         weight.to(at::kFloat).t()).to(at::kHalf).narrow(1,0,n*k);
+  Tensor expected;
+  if(k==s) expected=projected.view({1,count,n,s}).permute({0,2,1,3}).reshape({1,n,count*s}).to(at::kFloat);
+  else {
+   auto chunks=projected.view({1,count,n,2,s});
+   expected=at::empty({1,n,count+1,s});
+   expected.select(2,0).copy_(chunks.select(1,0).select(2,0));
+   expected.select(2,count).copy_(chunks.select(1,count-1).select(2,1));
+   expected.slice(2,1,count).copy_(chunks.slice(1,1,count).select(3,0).permute({0,2,1,3}));
+   expected.slice(2,1,count).add_(chunks.slice(1,0,count-1).select(3,1).permute({0,2,1,3}));
+   expected=expected.flatten(2);
+  }
+  expected.add_(bias.view({1,n,1}));
+  auto output=rpu_tts_codec_conv_transpose1d(input,weight,bias,n,k,s);
+  assert(at::equal(output,expected)&&at::equal(input,saved)&&output.is_contiguous());
+  rejects([&]{rpu_tts_codec_conv_transpose1d(input.to(at::kHalf),weight,bias,n,k,s);});
+  rejects([&]{rpu_tts_codec_conv_transpose1d(input,weight.to(at::kFloat),bias,n,k,s);});
+  rejects([&]{rpu_tts_codec_conv_transpose1d(input,weight,bias,n,k,7);});
+  RpuKernelGraph::active=true;
+  rejects([&]{rpu_tts_codec_conv_transpose1d(input,weight,bias,n,k,s);});
+  RpuKernelGraph::active=false;
+ }
+ assert(calls==2&&flushes==4);
+}
+'''
+    cpp, exe = tmp_path / "transpose.cpp", tmp_path / "transpose"
+    cpp.write_text(harness + function + cases)
+    torch_root = Path(torch.__file__).resolve().parent
+    subprocess.run([
+        "g++", "-std=c++17", "-O0",
+        f"-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}",
+        "-I", str(torch_root / "include"), str(cpp),
+        "-L", str(torch_root / "lib"), "-ltorch_cpu", "-lc10",
+        f"-Wl,-rpath,{torch_root / 'lib'}", "-o", str(exe),
+    ], check=True)
+    subprocess.run([str(exe)], check=True)

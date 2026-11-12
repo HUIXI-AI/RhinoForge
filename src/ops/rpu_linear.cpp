@@ -4027,6 +4027,63 @@ Tensor rpu_tts_codec_conv_pair(
   return output;
 }
 
+Tensor rpu_tts_codec_conv_transpose1d(
+    const Tensor& input, const Tensor& weight,
+    const c10::optional<Tensor>& bias,
+    int64_t out_channels, int64_t kernel, int64_t stride) {
+  TORCH_CHECK(!RpuKernelGraph::has_active(),
+              "tts_codec_conv_transpose1d: shared-DDR staging requires eager execution");
+  TORCH_CHECK(input.device().is_cpu() && input.scalar_type() == at::kFloat &&
+                  input.layout() == at::kStrided && input.dim() == 3 && input.size(0) == 1,
+              "tts_codec_conv_transpose1d: expected CPU FP32 [1, channels, samples]");
+  const int64_t channels = input.size(1);
+  const bool upsample = channels == 1024 && out_channels == 1024 && kernel == 2 && stride == 2;
+  const bool decoder =
+      (channels == 1536 && out_channels == 768 && kernel == 16 && stride == 8) ||
+      (channels == 768 && out_channels == 384 && kernel == 10 && stride == 5) ||
+      (channels == 384 && out_channels == 192 && kernel == 8 && stride == 4) ||
+      (channels == 192 && out_channels == 96 && kernel == 6 && stride == 3);
+  TORCH_CHECK(upsample || decoder,
+              "tts_codec_conv_transpose1d: outside the frozen six-layer decode profile");
+  const int64_t count = input.size(2);
+  const int64_t padded = ((out_channels * kernel + 127) / 128) * 128;
+  TORCH_CHECK(count > 0 && count <= 255 * 640,
+              "tts_codec_conv_transpose1d: invalid or unbounded sample count");
+  TORCH_CHECK(weight.device().type() == at::kPrivateUse1 &&
+                  weight.scalar_type() == at::kHalf && weight.is_contiguous() &&
+                  weight.sizes().equals({padded, channels}),
+              "tts_codec_conv_transpose1d: expected device FP16 col-swizzled padded weight");
+  TORCH_CHECK(!bias.has_value() ||
+                  (bias->device().is_cpu() && bias->scalar_type() == at::kFloat &&
+                   bias->is_contiguous() && bias->sizes().equals({out_channels})),
+              "tts_codec_conv_transpose1d: expected CPU FP32 channel bias");
+
+  auto rows = at::empty({count, channels}, weight.options());
+  auto writable = rpu_to_cpu_zerocopy_no_graph_sync(rows, false);
+  writable.copy_(input.transpose(1, 2).reshape({count, channels}));
+  rpu_ddr_flush_force_sized(rows.data_ptr(), rows.nbytes());
+  auto projected = rpu_linear_with_accumulation(
+      rows, weight, c10::nullopt, 1, 8, true, c10::nullopt);
+  auto readable = rpu_to_cpu_zerocopy(projected).narrow(1, 0, out_channels * kernel);
+  Tensor output;
+  if (kernel == stride) {
+    output = at::empty({1, out_channels, count * stride}, input.options());
+    output.copy_(readable.view({1, count, out_channels, stride})
+                     .permute({0, 2, 1, 3}).reshape(output.sizes()));
+  } else {
+    auto chunks = readable.view({1, count, out_channels, 2, stride});
+    output = at::empty({1, out_channels, count + 1, stride}, input.options());
+    output.select(2, 0).copy_(chunks.select(1, 0).select(2, 0));
+    output.select(2, count).copy_(chunks.select(1, count - 1).select(2, 1));
+    auto middle = output.slice(2, 1, count);
+    middle.copy_(chunks.slice(1, 1, count).select(3, 0).permute({0, 2, 1, 3}));
+    middle.add_(chunks.slice(1, 0, count - 1).select(3, 1).permute({0, 2, 1, 3}));
+    output = output.flatten(2);
+  }
+  if (bias.has_value()) output.add_(bias->view({1, out_channels, 1}));
+  return output;
+}
+
 Tensor rpu_linear_with_core_count(
     const Tensor& input, const Tensor& weight,
     const c10::optional<Tensor>& bias_opt,

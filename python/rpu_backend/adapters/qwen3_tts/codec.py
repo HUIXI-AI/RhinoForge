@@ -100,6 +100,19 @@ def _rpu_convolution(owner, hidden, weight, stats):
     return result.T.unsqueeze(0).contiguous()
 
 
+def _rpu_transpose_convolution(owner, hidden, weight, stats, output_size=None):
+    if output_size is not None:
+        raise ValueError("TTS codec uses the configured transposed-convolution output size")
+    if (hidden.device.type != "cpu" or hidden.dtype != torch.float32 or
+            hidden.ndim != 3 or hidden.shape[:2] != (1, owner.in_channels)):
+        raise ValueError("TTS RPU transposed convolution requires batch-one CPU FP32 input")
+    result = torch.ops.rpu.tts_codec_conv_transpose1d(
+        hidden, weight, owner.bias, owner.out_channels,
+        owner.kernel_size[0], owner.stride[0])
+    stats["transposed_calls"] += 1
+    return result
+
+
 def install_rpu_convolutions(decoder, restore, stats):
     """FP16/ACC32 Linear for every Conv1d used by the frozen decoder."""
     from collections import Counter
@@ -123,6 +136,24 @@ def install_rpu_convolutions(decoder, restore, stats):
                 (module.bias is not None and
                  (module.bias.device.type != "cpu" or module.bias.dtype != torch.float32))):
             raise ValueError("TTS RPU convolution requires CPU FP32 source weights")
+    transposed = [module for module in decoder.modules()
+                  if isinstance(module, torch.nn.ConvTranspose1d)]
+    expected_transposed = Counter([
+        (1024, 1024, 2, 2), (1024, 1024, 2, 2),
+        (1536, 768, 16, 8), (768, 384, 10, 5),
+        (384, 192, 8, 4), (192, 96, 6, 3),
+    ])
+    if Counter((module.in_channels, module.out_channels,
+                module.kernel_size[0], module.stride[0])
+               for module in transposed) != expected_transposed:
+        raise ValueError("TTS RPU transposed-convolution geometry differs from the six-layer decode profile")
+    for module in transposed:
+        if (module.weight.device.type != "cpu" or module.weight.dtype != torch.float32 or
+                module.groups != 1 or module.dilation != (1,) or module.padding != (0,) or
+                module.output_padding != (0,) or module.padding_mode != "zeros" or
+                (module.bias is not None and
+                 (module.bias.device.type != "cpu" or module.bias.dtype != torch.float32))):
+            raise ValueError("TTS RPU transposed convolution requires CPU FP32 source weights")
     pairs = _residual_pair_affines(decoder) if hasattr(torch.ops.rpu, "tts_codec_conv_pair") else []
     prepared = []
     for module in modules:
@@ -146,6 +177,21 @@ def install_rpu_convolutions(decoder, restore, stats):
     stats["transport"] = "shared_ddr" if hasattr(torch.ops.rpu, "tts_codec_conv1d") else "staged"
     stats["residual_pairs"] = len(pairs)
     stats["paired_calls"] = 0
+    stats["transposed_layers"] = 0
+    stats["transposed_calls"] = 0
+    if hasattr(torch.ops.rpu, "tts_codec_conv_transpose1d"):
+        for module in transposed:
+            weight = module.weight.detach().flatten(1).T.contiguous().half()
+            weight = torch.nn.functional.pad(weight, (0, 0, 0, (-weight.shape[0]) % 128))
+            packed = transform_linear_weight(weight, 1, 8).to("rpu")
+
+            def forward(owner, hidden, output_size=None, packed=packed):
+                return _rpu_transpose_convolution(
+                    owner, hidden, packed, stats, output_size=output_size)
+
+            restore.append((module, module.forward))
+            module.forward = types.MethodType(forward, module)
+        stats["transposed_layers"] = len(transposed)
     weights = dict(zip(modules, prepared))
     for unit, affine in pairs:
         channels = unit.conv2.conv.in_channels

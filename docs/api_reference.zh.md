@@ -545,5 +545,6 @@ speaker embedding，每次请求仍读取和校验参考文件。输出存储独
 12 组卷积还将中间 SnakeBeta 和首层 bias 留在 RPU 上，以 FP16 执行。
 显式设置 `codec_backend="cpu"` 恢复 CPU FP32 卷积和激活。
 `execution_stats().codec_convolutions` 返回 backend、已安装层数、累计卷积调用次数、
-`transport`（`shared_ddr` 或旧版 `staged`）、`residual_pairs` 和成功的 `paired_calls`。
+`transport`（`shared_ddr` 或旧版 `staged`）、`residual_pairs`、成功的 `paired_calls`、
+`transposed_layers` 和成功的 `transposed_calls`。
 每组成对执行也计入两次卷积调用。剩余 CPU 工作和精度边界见[语音指南](qwen3_audio.zh.md#实验性-rpu-声码器卷积)。

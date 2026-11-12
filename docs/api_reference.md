@@ -663,6 +663,7 @@ layers. With matching native support, twelve pairs also keep their intermediate
 SnakeBeta and first bias on RPU in FP16. Select `codec_backend="cpu"` to restore
 CPU FP32 convolutions and activations. `execution_stats().codec_convolutions`
 reports backend, installed layers, cumulative convolution calls, `transport`
-(`shared_ddr` or older `staged`), `residual_pairs` and completed `paired_calls`.
+(`shared_ddr` or older `staged`), `residual_pairs`, completed `paired_calls`,
+`transposed_layers` and completed `transposed_calls`.
 Each pair contributes two convolution calls. See the [speech guide](qwen3_audio.md#experimental-rpu-vocoder-convolutions)
 for remaining CPU work and the changed numerical boundary.

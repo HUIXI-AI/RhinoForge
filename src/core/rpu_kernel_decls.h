@@ -172,6 +172,10 @@ at::Tensor rpu_tts_codec_conv1d(
     const at::Tensor& input, const at::Tensor& weight,
     const c10::optional<at::Tensor>& bias,
     int64_t kernel, int64_t dilation, int64_t out_channels);
+at::Tensor rpu_tts_codec_conv_transpose1d(
+    const at::Tensor& input, const at::Tensor& weight,
+    const c10::optional<at::Tensor>& bias,
+    int64_t out_channels, int64_t kernel, int64_t stride);
 
 void rpu_linear_into(const at::Tensor &input, const at::Tensor &weight,
                      const c10::optional<at::Tensor> &bias_opt,

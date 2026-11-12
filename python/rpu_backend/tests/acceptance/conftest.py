@@ -7,7 +7,7 @@ def _skip_key(nodeid: str) -> str:
     return f"{parts[0].split('/')[-1]}::{parts[-1].split('[')[0]}"
 
 def pytest_configure(config):
-    config.addinivalue_line('markers', 'hardware: requires Rhino device device (skipped in CI / non-hardware runs)')
+    config.addinivalue_line('markers', 'hardware: requires Rhino RPU (skipped in CI / non-hardware runs)')
     config._acceptance_skipped = set()
     config._acceptance_ran = set()
 

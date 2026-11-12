@@ -1,4 +1,4 @@
-"""NVFP4A16 weight quantization and packing for Rhino parallel linear.
+"""NVFP4A16 weight quantization and packing for Rhino RPU parallel linear.
 
 Contract:
   weight       FP4 E2M1, TP swizzle + deinterleaved K32 nibble pairs
@@ -63,7 +63,7 @@ def quantize_nvfp4(
     groups = k // 16
     blocked = w.view(n, groups, 16)
     block_max = blocked.abs().amax(dim=2)
-    # Standard NVFP4 two-level scaling. The canonical Rhino kernel reads this
+    # Standard NVFP4 two-level scaling. The canonical Rhino RPU kernel reads this
     # value from an FP32 projection-family array preloaded into SPM.
     tensor_scale = (w.abs().amax() / (6.0 * 448.0)).clamp_min_(2.0 ** -24)
     tensor_scale = tensor_scale.to(torch.float32)
@@ -189,7 +189,7 @@ def swizzle_nvfp4_scales(
 
 def swizzle_pack_nvfp4_v2(codes: torch.Tensor, scale_gn: torch.Tensor,
                           partition: int, num_cores: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Rhino ACC32 ABI: deinterleaved nibbles and TP-striped FP8 scales.
+    """Rhino RPU ACC32 ABI: deinterleaved nibbles and TP-striped FP8 scales.
 
     This entry retains the Pi0.5 striped_v2 metadata and tensor-shape contract;
     other callers use the generic tiled packing functions independently.

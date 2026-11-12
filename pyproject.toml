@@ -9,7 +9,7 @@ build-backend = "scikit_build_core.build"
 name = "rhinoforge"
 dynamic = ["version"]
 authors = [{name = "HUIXI-AI"}]
-description = "PyTorch inference backend and model deployment toolkit for Rhino devices"
+description = "PyTorch inference backend and model deployment toolkit for Rhino RPU"
 readme = "README.md"
 license = {file = "LICENSE"}
 requires-python = ">=3.12,<3.13"

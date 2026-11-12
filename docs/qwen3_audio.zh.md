@@ -154,7 +154,7 @@ CPU 浮点 Tensor。
 
 ## 执行与资源
 
-| 模型 | CPU | Rhino 设备 |
+| 模型 | CPU | Rhino RPU |
 |---|---|---|
 | ASR | 音频读取、mel/分块、卷积与层间激活、单 token embedding、有限值检查、argmax、文本解码 | conv_out、位置和有效行处理、音频 encoder 与末尾投影、prefill 文本/音频组装、文本 decoder 和输出头 |
 | TTS | embedding、参考音频、speaker encoder、生成控制、码本、转置卷积/上采样、剩余 17 层 SnakeBeta、波形输出 | 默认卸载的 31 层解码 Conv1d，以及匹配 native 下的 12 层中间 SnakeBeta；Talker、Predictor 和输出头；具备对应 native 接口时还包括 codec 输入/输出投影和 Transformer 前段 |

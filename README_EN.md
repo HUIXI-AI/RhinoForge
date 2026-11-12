@@ -4,7 +4,7 @@
 
 # RhinoForge
 
-**PyTorch inference and model deployment for the Rhino Processing Unit**
+**PyTorch inference and model deployment for Rhino RPU**
 
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](pyproject.toml)
@@ -13,7 +13,7 @@
 
 </div>
 
-RhinoForge exposes the Rhino device as `torch.rpu`. It combines
+RhinoForge exposes Rhino RPU as `torch.rpu`. It combines
 model adapters, fused model runtimes, graph capture and replay, SPM memory
 management, multi-core execution, offline quantization, and a model-porting
 template in one PyTorch backend.

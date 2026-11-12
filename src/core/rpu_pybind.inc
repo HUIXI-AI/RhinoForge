@@ -17,7 +17,7 @@ static std::string runtime_shared_object_path(
 }
 
 PYBIND11_MODULE(rpu_backend, m) {
-  m.doc() = "device backend extension";
+  m.doc() = "Rhino RPU backend extension";
 
   // Explicit startup chain: PrivateUse1 allocator/guard, then kernel cache.
   initialize_rpu_backend_runtime();

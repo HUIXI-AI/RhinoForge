@@ -171,7 +171,7 @@ ASR also accepts a one-dimensional CPU floating-point Tensor. See
 
 ## Execution and resources
 
-| Model | CPU | Rhino device |
+| Model | CPU | Rhino RPU |
 |---|---|---|
 | ASR | Audio reading, mel features/chunking, convolutions and their activations, single-token embedding, finite checks, argmax, text decoding | conv_out, positions and valid rows, audio encoder and output projections, prefill text/audio composition, text decoder and vocabulary head |
 | TTS | Embedding, reference processing, speaker encoder, generation control, codebook, transposed convolutions/upsampling, remaining 17 SnakeBeta layers, waveform output | All 31 decoding Conv1d layers and 12 intermediate SnakeBeta layers with the matching native extension; Talker, Predictor and output heads; codec input/output projections and Transformer frontend when supported by native interfaces |

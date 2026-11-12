@@ -1,4 +1,4 @@
-"""Pure CPU helpers for Rhino-compatible per-output-channel FP8 weights."""
+"""Pure CPU helpers for Rhino RPU-compatible per-output-channel FP8 weights."""
 from __future__ import annotations
 
 import torch
@@ -51,7 +51,7 @@ def dequantize_fp8_e4m3_per_output(
 def pack_grouped_weight(
     weight: torch.Tensor, *, partition: str, num_cores: int = 8
 ) -> torch.Tensor:
-    """Apply the exact Rhino grouped TP swizzle to logical ``[E,N,K]``."""
+    """Apply the exact Rhino RPU grouped TP swizzle to logical ``[E,N,K]``."""
     if weight.dim() != 3:
         raise ValueError(f"grouped weight must be [E,N,K], got {tuple(weight.shape)}")
     if partition not in {"col", "row"}:

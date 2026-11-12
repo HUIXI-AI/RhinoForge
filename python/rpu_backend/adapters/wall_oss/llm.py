@@ -404,7 +404,7 @@ def _pack_nvfp4_rpu(
 
 
 def _nvfp4_tensor_scale_array(values: list[torch.Tensor]) -> torch.Tensor:
-    # Tiled Rhino NVFP4 ACC32 reads one FP32 value by layer_id from a
+    # Tiled Rhino RPU NVFP4 ACC32 reads one FP32 value by layer_id from a
     # projection-family array through one aligned 32-byte vector load. Pad the
     # source to a whole eight-fp32 block so the persistent preload initializes
     # every byte fetched by the kernel (and remains legal for 1..7-layer probes).

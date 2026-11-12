@@ -97,7 +97,7 @@ def test_qwen3_8b_invalid_exact_chunk_fails_before_weight_load():
         MockAutoConfig.from_pretrained.return_value = fake_8b.config
         from rpu_backend import RPUModelForCausalLM
         import torch
-        with pytest.raises(UnsupportedModelError, match='certified ceiling 128'):
+        with pytest.raises(UnsupportedModelError, match='chunk ceiling 128'):
             RPUModelForCausalLM.from_pretrained('local/qwen3-8b', dtype=torch.float16, rpu_execution={'prefill': {'chunk_size': 224}})
         MockAutoConfig.from_pretrained.assert_called_once()
         MockAutoModel.from_pretrained.assert_not_called()

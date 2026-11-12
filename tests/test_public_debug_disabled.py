@@ -20,7 +20,7 @@ def test_text_prefill_keeps_retained_owner_with_debug_disabled(monkeypatch):
     )
     state = SimpleNamespace(
         handle=1, num_layers=24, hidden_size=2048, chunk_envelope=(8192, 640),
-        exact_chunk_size=None, padding_rows="auto", padding_budget=0,
+        max_seq_len=1024, exact_chunk_size=None, padding_rows="auto", padding_budget=0,
         prefill_graph_cache=retained, public_retained_prefill=True,
         rotary_dim=64, mrope_section=None,
     )

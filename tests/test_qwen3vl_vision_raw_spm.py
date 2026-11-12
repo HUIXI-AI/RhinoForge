@@ -47,7 +47,11 @@ def _program():
 #define DWIDTH 2
 template<class T> T CeilDiv(T a,T b){return (a+b-1)/b;}
 int64_t Align(int64_t a,int64_t b){return CeilDiv(a,b)*b;}
-class FusedModelBase {};
+class FusedModelBase {
+public:
+ struct ChunkEnvelope { int64_t max_kv_len=4096, chunk=0; } chunk_envelope_;
+ const ChunkEnvelope& chunk_envelope() const { return chunk_envelope_; }
+};
 namespace at {constexpr int kChar=1,kHalf=2,kPrivateUse1=19;}
 namespace c10 {using Half=uint16_t;}
 struct Tensor {
@@ -179,6 +183,7 @@ public:
  std::vector<Tensor> ds_merger_m0_w_{3},ds_merger_m2_w_{3};
  Tensor merger_m0_scale_,merger_m2_scale_;
  std::vector<Tensor> ds_merger_m0_scale_{3},ds_merger_m2_scale_{3};
+ Tensor position_idx_keepalive_{at::kHalf,0,8192,false};
  int64_t num_cores()const{return cores;}int64_t num_layers()const{return layers;}
  int64_t hidden_size()const{return hidden;}int64_t intermediate_size()const{return intermediate;}
  int64_t num_q_heads()const{return heads;}int64_t head_dim()const{return hd;}
@@ -207,6 +212,7 @@ public:
         'std::vector<int64_t> fp16_compact_residual_arguments(',
         'bool merger_active(', 'bool adaptive_w8_merger(', 'bool deepstack_merger_active(',
         'void set_fp16_chunked_merger(', 'bool large_image_auto_chunk_profile(',
+        'int64_t max_keepalive_seq(',
         'int64_t subclass_chunk_size_cap(', 'bool subclass_chunk_size_valid(',
         'bool lingbot_residual_resident_chunk(',
         'bool lingbot_residual_resident_for_plan(',

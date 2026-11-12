@@ -155,10 +155,10 @@ def test_large_profile_chunk_ceiling_fails_before_weight_load():
     from rpu_backend.adapters.qwen3_vl import Qwen3VLAdapter
     from rpu_backend.api.errors import UnsupportedModelError
     qwen14 = SimpleNamespace(num_hidden_layers=40, hidden_size=5120)
-    with pytest.raises(UnsupportedModelError, match='certified ceiling 32'):
+    with pytest.raises(UnsupportedModelError, match='chunk ceiling 32'):
         Qwen3Adapter.preflight_execution(qwen14, {'prefill': {'chunk_size': 64}})
     qwen8 = SimpleNamespace(num_hidden_layers=36, hidden_size=4096)
-    with pytest.raises(UnsupportedModelError, match='certified ceiling 128'):
+    with pytest.raises(UnsupportedModelError, match='chunk ceiling 128'):
         Qwen3Adapter.preflight_execution(qwen8, {'prefill': {'chunk_size': 224}})
     with pytest.raises(UnsupportedModelError, match='not admissible'):
         Qwen3Adapter.preflight_execution(qwen8, {'prefill': {'chunk_size': 48}})
@@ -174,7 +174,7 @@ def test_large_profile_chunk_ceiling_fails_before_weight_load():
     with pytest.raises(ValueError, match='vision padding is unsupported'):
         Qwen3_5Adapter.preflight_execution(q35_9b, {'prefill': {'chunk_size': 'auto'}, 'vision': {'padding_budget': 1}})
     llama = SimpleNamespace(num_hidden_layers=16, hidden_size=2048)
-    with pytest.raises(UnsupportedModelError, match='certified ceiling 64'):
+    with pytest.raises(UnsupportedModelError, match='chunk ceiling 64'):
         LlamaAdapter.preflight_execution(llama, {'prefill': {'chunk_size': 128}})
     qvl = SimpleNamespace(text_config=SimpleNamespace(num_hidden_layers=36, hidden_size=2560))
     with pytest.raises(UnsupportedModelError, match='planning ceiling 256'):

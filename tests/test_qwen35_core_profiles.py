@@ -359,8 +359,9 @@ def vision_install_boundary(monkeypatch):
     monkeypatch.setenv("RPU_VISION_MERGER", "0")
     events = []
     for name in ("create", "destroy", "set_execution_cores", "set_chunk_size_cap",
-                 "set_prefill_chunk_size", "set_linear_acc32", "resolve_prefill_domain",
-                 "set_weights", "set_rope", "position_idx_keepalive"):
+                 "set_cache_capacity", "set_prefill_chunk_size", "set_linear_acc32",
+                 "resolve_prefill_domain", "set_weights", "set_rope",
+                 "position_idx_keepalive"):
         def native(*args, _name=name):
             events.append(_name)
             return 23

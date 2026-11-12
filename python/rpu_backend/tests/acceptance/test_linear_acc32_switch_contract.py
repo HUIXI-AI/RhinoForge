@@ -67,7 +67,8 @@ def test_qwen3_vl_uses_cold_per_handle_acc32_without_touching_shared_installer()
     assert 'linear_acc32_ = enabled;' in setter
     assert 'invalidate_model_state();' in setter
     assert 'bool linear_acc32_ = false;' in model
-    assert model.count('/*force_acc32=*/linear_acc32_') == 10
+    assert model.count('/*force_acc32=*/linear_acc32_') == 9
+    assert model.count('/*force_acc32=*/tts_head ? false : linear_acc32_') == 1
     assert model.count('/*acc32=*/linear_acc32_') == 2
     vision_setter = vision[vision.index('void set_linear_acc32(bool enabled)'):]
     vision_setter = vision_setter[:vision_setter.index('int64_t resolved_chunk_size()')]

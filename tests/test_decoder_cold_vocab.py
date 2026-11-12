@@ -76,6 +76,7 @@ struct CausalDecoderModel {
     bool qwen3_spm_kv_by_mha_enabled_ = true, adarms_fused_bcast_enabled_ = false;
     __FIELDS__
     at::Tensor lm_head_w_, lm_head_w_scale_, lm_head_logits_out_;
+    std::vector<at::Tensor> tts_predictor_heads_;
     bool fuse_lm_head_ = false, fuse_prefill_last_lm_head_ = false;
     bool qwen3vl_2b_w8_profile_ = false, has_mrope_ = false, reuse_lm_head_output_ = false;
     int64_t vocab_size_ = 0, lm_head_exact_candidates_ = 0;

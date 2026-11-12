@@ -139,7 +139,8 @@ def test_acc16_vision_private_scope_and_native_cold_setter(monkeypatch, w8):
         g05_acc16_experiment=True, g05_w8a16=w8) == (False, False)
     owner = _runtime_capable_vision()
     calls = []
-    for name in ("qwen3_5_vision_set_chunk_size_cap", "qwen3_5_vision_resolve_prefill_domain",
+    for name in ("qwen3_5_vision_set_chunk_size_cap", "qwen3_5_vision_set_cache_capacity",
+                 "qwen3_5_vision_resolve_prefill_domain",
                  "qwen3_5_vision_set_prefill_chunk_size", "qwen3_5_vision_set_weight_scales",
                  "qwen3_5_vision_destroy"):
         monkeypatch.setattr(torch.ops.rpu, name, lambda *_: None, raising=False)

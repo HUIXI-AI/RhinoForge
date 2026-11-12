@@ -189,7 +189,8 @@ def test_vision_high_binds_after_acc_before_any_weight_transform(monkeypatch, li
 
     owner = _runtime_capable_vision()
     calls = []
-    for name in ('qwen3_5_vision_set_chunk_size_cap', 'qwen3_5_vision_resolve_prefill_domain',
+    for name in ('qwen3_5_vision_set_chunk_size_cap', 'qwen3_5_vision_set_cache_capacity',
+                 'qwen3_5_vision_resolve_prefill_domain',
                  'qwen3_5_vision_set_prefill_chunk_size', 'qwen3_5_vision_set_weight_scales',
                  'qwen3_5_vision_destroy'):
         monkeypatch.setattr(torch.ops.rpu, name, lambda *_: None, raising=False)

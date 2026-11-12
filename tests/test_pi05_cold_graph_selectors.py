@@ -64,7 +64,7 @@ def test_pi05_production_graph_routes_use_component_cold_snapshots():
     adapter = _source("python/rpu_backend/adapters/pi05/__init__.py")
     constructor = _section(
         adapter,
-        "    def __init__(self, lerobot_policy: Any, *, graph_runtime_policy=None) -> None:",
+        "    def __init__(self, lerobot_policy: Any, *, graph_runtime_policy=None, max_seq_len=None) -> None:",
         "    def _close_without_session(",
     )
     assert "_rpu_legacy_prefix_pad16_request" in constructor

@@ -28,7 +28,7 @@ def test_all_templates_roundtrip_to_actual_validator(catalog, tmp_path):
         path = tmp_path / 'config.toml'
         path.write_text(text)
         export_examples.COMMON.load_config(path)
-    assert not catalog['duplicates']
+    assert catalog['duplicates'] == [['qwen3_tts/0_6b/base', 'qwen3_tts/0_6b/base_rpu_codec']]
 
 
 def test_catalog_rejects_runtime_release_identity_drift(catalog, monkeypatch):

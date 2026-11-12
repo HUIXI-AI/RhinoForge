@@ -69,7 +69,19 @@ frames and 175/175 tokens, with 26.879 ms Vision, 248.388 ms Total, and 252.037 
 frame total. This reduces Vision by 57.6% and Total by 12.7% versus Vision FP16.
 This proves token equality on the customer set, not navigation-task
 accuracy on a broader evaluation. An independent cold reload repeated 35/35
-frames and 175/175 tokens. See
+frames and 175/175 tokens.
+
+On top of that calibrated Vision W8A16 configuration, the decode device trace
+attributed 44.8% to Gate/Up, 39.2% to the QKV and Down GEMVs combined, and only
+2.4% to attention. The existing projection/ring/norm kernel is therefore reused
+to combine Down, AllReduce, the residual update, and the next RMSNorm for layers
+3 through 34. Layers 0 through 2 keep the original path because DeepStack is
+injected after the MLP, and the final layer also stays unchanged. All 175/175
+tokens across the 35 frames remain identical. The steady-state mean
+`decode_5` time changes from 114.625 ms to 114.285 ms and Total from 248.851 ms
+to 248.617 ms. A single-decode device trace changes from 27.134 ms to 27.079 ms;
+this is a verified small gain, while Gate/Up and weight traffic remain the main
+bottlenecks. See
 `benchmark_results/lightnav_9_history_20261112/summary.json` for the full result.
 
 ## Run

@@ -61,6 +61,15 @@ Total 为 248.388 ms，帧间总耗时为 252.037 ms。相对 Vision FP16，Visi
 57.6%，Total 降低 12.7%。该结果证明客户数据上的逐 token
 一致性；独立冷重载复跑仍为 35/35 帧、175/175 token。它不替代更大规模真实导航
 成功率评测。
+
+在上述校准 Vision W8A16 配置上，decode 设备 trace 显示 Gate/Up 占 44.8%，QKV 与
+Down GEMV 合计占 39.2%，注意力仅占 2.4%。因此复用现有投影/ring/norm 内核，把
+第 3～34 层的 Down、AllReduce、残差和下一层 RMSNorm 合并；第 0～2 层因 DeepStack
+注入保留原路径，最后一层也保留原路径。35 帧的 175/175 token 保持一致，稳态
+`decode_5` 均值从 114.625 ms 降至 114.285 ms，Total 从 248.851 ms 降至
+248.617 ms。单次 decode 的设备 trace 从 27.134 ms 降至 27.079 ms；这是已验证的
+小收益，主要瓶颈仍是 Gate/Up 和权重读取。
+
 完整数据见 `benchmark_results/lightnav_9_history_20261112/summary.json`。
 
 ## 运行

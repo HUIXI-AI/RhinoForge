@@ -113,8 +113,8 @@ __BODY__
 using Inputs=std::array<at::Tensor,2>;
 using Spm=std::array<uint32_t,5>;
 const Spm initial{0x40001000,0x40002000,0x40004000,0x40006000,0x40008000};
-Inputs good(){Inputs in;in[1].type=at::kHalf;in[1].shape={2560};in[1].backing.bytes=(2560+256)*2;in[1].address+=0x2000000;return in;}
-void launch(const Inputs& in,Spm p=initial,double eps=1e-6){__NAME__(p[0],in[0],in[1],p[1],p[2],p[3],p[4],eps);}
+Inputs good(int64_t k=4096){Inputs in;in[0].shape[1]=k;in[0].backing.bytes=2560*k;in[1].type=at::kHalf;in[1].shape={2560};in[1].backing.bytes=(2560+256)*2;in[1].address+=0x2000000;return in;}
+void launch(const Inputs& in,Spm p=initial,double eps=1e-6,int64_t k=4096){__NAME__(p[0],in[0],in[1],p[1],p[2],p[3],p[4],eps,k);}
 void reject(std::function<void()> f,bool before_stage=true){
  const int old=submits,st=stages,fl=flushes,rs=kernel.resets;const auto keeps=RpuKernelGraph::active().owners.size();
  bool rejected=false;try{f();}catch(const std::runtime_error&){rejected=true;}
@@ -139,8 +139,10 @@ int main(){
   for(int c=0;c<8;++c){assert(kernel.scm_pair(c)==spm[1]-SPM_ALLOC.base+c*0x1000000);
    assert(kernel.scm_pair(16+c)==spm[3]-SPM_ALLOC.base+c*0x1000000);
    assert(kernel.scm_pair(32+c)==uint32_t(c*640)&&kernel.scm_pair(48+c)==320);}
-  if(submits==1)first=kernel.r;else assert((first==kernel.r)==(step==0));
+ if(submits==1)first=kernel.r;else assert((first==kernel.r)==(step==0));
  }
+ {auto in=good(9728);launch(in,initial,1e-6,9728);assert(kernel.r[0]==1216&&kernel.pair(16)==12160);}
+ for(int64_t k:{0,2048,4097,9729})reject([&]{launch(good(),initial,1e-6,k);});
  for(int i=0;i<2;++i){
   auto in=good();in[i].present=false;reject([&]{launch(in);});
   in=good();in[i].contiguous=false;reject([&]{launch(in);});

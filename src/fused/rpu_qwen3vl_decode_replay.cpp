@@ -95,6 +95,7 @@ struct DecodeProfile {
     int layers = 36;
     at::ScalarType dtype = at::kChar, head_dtype = at::kChar;
     bool acc32 = false, gemv = true, packed_qkv = true, fused_mlp = true;
+    bool fused_down_norm = false;
     bool tts_predictor = false, tts_head = false;
 };
 
@@ -153,7 +154,8 @@ bool bind_decode_patches(const std::vector<DecodeKernelSlot>& kernels,
     std::optional<int> qk_kind;
     std::optional<bool> combined_o;
     for (int layer = 0; layer < profile.layers; ++layer) {
-        if (!norm() || !linear()) return false;
+        if ((!profile.fused_down_norm || layer <= 3) && !norm()) return false;
+        if (!linear()) return false;
         if (!profile.packed_qkv && (!linear() || !linear())) return false;
         if (cursor == kernels.size()) return false;
         const auto& qk = kernels[cursor].name;
@@ -196,8 +198,10 @@ bool bind_decode_patches(const std::vector<DecodeKernelSlot>& kernels,
         } else if (profile.layers == 36 && profile.dtype == at::kChar && profile.gemv) {
             if (!linear() || !linear() || !take("silu_mul")) return false;
         } else if (!linear() || !take("unary") || !linear() || !take("binary_sameshape")) return false;
-        if (!linear() || !take("llm_all_reduce_residual_nopace") ||
-            (!profile.tts_predictor && layer < 3 && !take("binary_sameshape"))) return false;
+        if (profile.fused_down_norm && layer >= 3 && layer + 1 < profile.layers) {
+            if (!take("qwen3vl_o_ring_norm_m1_h2560_w8")) return false;
+        } else if (!linear() || !take("llm_all_reduce_residual_nopace")) return false;
+        if (!profile.tts_predictor && layer < 3 && !take("binary_sameshape")) return false;
     }
     if (!norm()) return false;
     return profile.tts_predictor && !profile.tts_head ? cursor == kernels.size() :
@@ -286,6 +290,8 @@ struct CausalDecoderModel::Qwen3VlDecodeReplayState {
         p.acc32 = model.linear_acc32_; p.gemv = model.qwen3vl_decode_gemv(1);
         p.packed_qkv = p.gemv && model.qwen3vl_4b_packed_qkv_weights_;
         p.fused_mlp = p.gemv && model.qwen3vl_4b_decode_gateup_fused_;
+        p.fused_down_norm = p.gemv && model.qwen3vl_4b_decode_down_ring_norm_fused_ &&
+            model.deepstack_lang_layers_ == std::vector<int64_t>{0, 1, 2};
         p.tts_predictor = model.num_layers() == 5;
         p.tts_head = !model.tts_predictor_heads_.empty();
         p.head_dtype = p.tts_head ? at::kHalf : model.lm_head_w_.scalar_type();
@@ -322,7 +328,8 @@ struct CausalDecoderModel::Qwen3VlDecodeReplayState {
         for (const auto& head : model.lightnav_heads_)
             if (!fn(head, true)) return false;
         if (p.packed_qkv && !fn(model.qwen3vl_4b_qkv_scale_bank_, true)) return false;
-        if (p.head_dtype != at::kHalf && !fn(model.lm_head_w_scale_, true)) return false;
+        if (!p.tts_predictor && p.head_dtype != at::kHalf &&
+            !fn(model.lm_head_w_scale_, true)) return false;
         return p.tts_predictor || fn(model.position_ids_keepalive_, false);
     }
 
@@ -372,6 +379,7 @@ struct CausalDecoderModel::Qwen3VlDecodeReplayState {
                                 !readable_elements(w.up_ws, i + 256))) return false;
             if (p.gemv && model.qwen3vl_4b_decode_o_ring_norm_fused_ &&
                 !readable_elements(w.o_ws, h + 256)) return false;
+            if (p.fused_down_norm && !readable_elements(w.down_ws, h + 256)) return false;
         }
         return tensor_shape(model.final_norm_w_, at::kHalf, {h}) &&
             (!p.packed_qkv || tensor_shape(model.qwen3vl_4b_qkv_scale_bank_, at::kHalf, {36, 6144})) &&
@@ -430,7 +438,8 @@ struct CausalDecoderModel::Qwen3VlDecodeReplayState {
             rpu_ddr_flush(model.tts_predictor_heads_.at(model.tts_predictor_head_index_).data_ptr());
         if (!model.lightnav_heads_.empty() && model.lightnav_head_index_ > 0)
             rpu_ddr_flush(model.lightnav_heads_.at(model.lightnav_head_index_ - 1).data_ptr());
-        if (profile(model).head_dtype != at::kHalf) rpu_ddr_flush(model.lm_head_w_scale_.data_ptr());
+        if (!profile(model).tts_predictor && profile(model).head_dtype != at::kHalf)
+            rpu_ddr_flush(model.lm_head_w_scale_.data_ptr());
     }
 };
 

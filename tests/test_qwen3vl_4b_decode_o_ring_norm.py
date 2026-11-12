@@ -181,7 +181,7 @@ int main(){
 def test_o_scale_backing(tmp_path):
     import torch
     source = (ROOT/'src/fused/rpu_qwen3_model.h').read_text()
-    method = definition(source, 'static at::Tensor retain_qwen3vl_4b_o_scale(')
+    method = definition(source, 'static at::Tensor retain_qwen3vl_4b_ring_norm_scale(')
     install = definition(source[source.index('            if (qwen3vl_4b_decode_o_ring_norm_fused_)'):], 'if (qwen3vl_4b_decode_o_ring_norm_fused_)')
     program = r'''
 #include <ATen/ATen.h>
@@ -189,19 +189,20 @@ def test_o_scale_backing(tmp_path):
 #include <cstring>
 #include <vector>
 size_t flushed=0;void rpu_ddr_flush_force_sized(void*,size_t n){flushed+=n;}
-struct Model{bool qwen3vl_4b_decode_o_ring_norm_fused_=false;struct W{at::Tensor o_ws;};std::vector<W> layer_weights_;
+struct Model{bool qwen3vl_4b_decode_o_ring_norm_fused_=false;struct W{at::Tensor o_ws,down_ws;};std::vector<W> layer_weights_;
 __METHOD__
 void install(){__INSTALL__}
 };
 int main(){
  auto source=(at::arange(2560,at::kFloat)/4096+.01).to(at::kHalf);auto original=source.clone();
- Model old;old.layer_weights_.push_back({source});old.install();assert(old.layer_weights_[0].o_ws.is_same(source)&&flushed==0);
- Model m;m.qwen3vl_4b_decode_o_ring_norm_fused_=true;m.layer_weights_.push_back({source});m.install();auto padded=m.layer_weights_[0].o_ws;
+ Model old;old.layer_weights_.push_back({source,source});old.install();assert(old.layer_weights_[0].o_ws.is_same(source)&&flushed==0);
+ Model m;m.qwen3vl_4b_decode_o_ring_norm_fused_=true;m.layer_weights_.push_back({source,source});m.install();auto padded=m.layer_weights_[0].o_ws;
  assert(padded.dim()==1&&padded.numel()==2560&&padded.is_contiguous());assert(at::equal(padded,source)&&at::equal(source,original));
- assert(padded.storage().unsafeGetStorageImpl()!=source.storage().unsafeGetStorageImpl());assert(padded.storage().nbytes()==2816*2&&flushed==2816*2);
+ assert(padded.storage().unsafeGetStorageImpl()!=source.storage().unsafeGetStorageImpl());assert(padded.storage().nbytes()==2816*2&&flushed==2*2816*2);
+ assert(at::equal(m.layer_weights_[0].down_ws,source)&&m.layer_weights_[0].down_ws.storage().nbytes()==2816*2);
  auto* data=padded.data_ptr<c10::Half>();for(int i=2560;i<2816;++i)assert(data[i]==c10::Half(0));
  for(const auto& bad:std::vector<at::Tensor>{source.to(at::kFloat),source.narrow(0,0,2559),source.view({1,2560}),at::empty({5120},at::kHalf).slice(0,0,5120,2)}){
-  bool rejected=false;try{Model::retain_qwen3vl_4b_o_scale(bad);}catch(const c10::Error&){rejected=true;}assert(rejected);
+  bool rejected=false;try{Model::retain_qwen3vl_4b_ring_norm_scale(bad);}catch(const c10::Error&){rejected=true;}assert(rejected);
  }
 }
 '''.replace('__METHOD__', method).replace('__INSTALL__', install)

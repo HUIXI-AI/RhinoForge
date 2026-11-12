@@ -2439,8 +2439,8 @@ void rpu_launch_qwen3vl_4b_decode_gate_up_swiglu_w8a16_spm_kernel(
     const at::Tensor& gate_scale,
     const at::Tensor& up_scale);
 
-// Exact M1/H2560/global-K4096 W8 ROW-TP8 O projection, original residual
-// ring and BASE post RMSNorm. All SPM addresses are absolute and disjoint;
+// Exact M1/H2560/global-K4096-or-9728 W8 ROW-TP8 projection, original residual
+// ring and BASE RMSNorm. All SPM addresses are absolute and disjoint;
 // full raw output is retained while normalized output reuses residual.
 // The [2560] scale view requires 256 readable padding halves; eps is 1e-6.
 void rpu_launch_qwen3vl_4b_decode_o_ring_norm_spm_kernel(
@@ -2451,7 +2451,8 @@ void rpu_launch_qwen3vl_4b_decode_o_ring_norm_spm_kernel(
     uint32_t residual_spm_addr,
     uint32_t raw_spm_addr,
     uint32_t gamma_spm_addr,
-    double eps);
+    double eps,
+    int64_t input_size = 4096);
 
 // Exact optional base Prefill M336/M384, W8 H2048/I11008, TP8. Shared K128
 // input tile; raw FP16 Gate/Up outputs, no bias or extra SPM scratch.

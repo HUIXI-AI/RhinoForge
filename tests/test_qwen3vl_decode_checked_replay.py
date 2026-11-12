@@ -75,10 +75,10 @@ class CausalDecoderModel{
 public:
  virtual ~CausalDecoderModel()=default;
  struct LayerWeights{Tensor q_w,k_w,v_w,q_ws,k_ws,v_ws,qkv_w,qkv_ws,o_w,o_ws,gate_w,gate_ws,up_w,up_ws,down_w,down_ws,input_norm_w,post_norm_w,q_norm_w,k_norm_w;};
- std::vector<Tensor> tts_predictor_heads_;int64_t tts_predictor_head_index_=0;
+ std::vector<Tensor> tts_predictor_heads_,lightnav_heads_;int64_t tts_predictor_head_index_=0,lightnav_head_index_=0;
  std::vector<LayerWeights> layer_weights_=std::vector<LayerWeights>(36);
  Tensor cos_,sin_,final_norm_w_,qwen3vl_4b_qkv_scale_bank_,lm_head_w_,lm_head_w_scale_,position_ids_keepalive_;
- bool qwen3vl_4b_decode_o_ring_norm_fused_=false;
+ bool qwen3vl_4b_decode_o_ring_norm_fused_=false,qwen3vl_4b_decode_down_ring_norm_fused_=false;
  bool qwen3vl_fp16_decode_profile_=false,linear_acc32_=false;
  bool qwen3vl_ordinary_resident_prefill_profile_=false,qwen3vl_4b_w8_profile_=true;
  bool decoder_mixed_precision_=false,wall_prefill_staged_mlp_=false,wall_prefill_mixed_requested_=false,wall_prefill_staged_requested_=false;
@@ -131,7 +131,7 @@ alignas(256) std::array<char,256> dummy{};
 // Metadata-only payload owners: the tested code never reads a weight value.
 // No multi-GB fixture is allocated and no numeric kernel result is fabricated.
 Tensor metadata(at::ScalarType dtype,at::IntArrayRef shape){return at::from_blob(dummy.data(),shape,at::TensorOptions().dtype(dtype));}
-bool combined_route=false,combined_o=false,fp16_route=false;
+bool combined_route=false,combined_o=false,combined_down=false,fp16_route=false;
 int64_t cold_envelope=2048;
 struct Fixture{
  Model m;Tensor hidden=metadata(at::kHalf,{1,1,2560});
@@ -139,12 +139,13 @@ struct Fixture{
  Fixture(){
   m.envelope.max_kv_len=cold_envelope;
   m.qwen3vl_4b_decode_o_ring_norm_fused_=combined_o;
+  m.qwen3vl_4b_decode_down_ring_norm_fused_=combined_down;
   for(auto&w:m.layer_weights_){
    w.q_w=metadata(at::kChar,{4096,2560});w.qkv_w=metadata(at::kChar,{6144,2560});w.qkv_ws=metadata(at::kHalf,{6144});
    w.o_w=metadata(at::kChar,{2560,4096});w.o_ws=metadata(at::kHalf,{2560+(combined_o?256:0)}).narrow(0,0,2560);
    w.gate_w=metadata(at::kChar,{9728,2560});w.up_w=metadata(at::kChar,{9728,2560});
    w.gate_ws=metadata(at::kHalf,{9728+256}).narrow(0,0,9728);w.up_ws=metadata(at::kHalf,{9728+256}).narrow(0,0,9728);
-   w.down_w=metadata(at::kChar,{2560,9728});w.down_ws=metadata(at::kHalf,{2560});
+   w.down_w=metadata(at::kChar,{2560,9728});w.down_ws=metadata(at::kHalf,{2560+(combined_down?256:0)}).narrow(0,0,2560);
    w.input_norm_w=metadata(at::kHalf,{2560});w.post_norm_w=metadata(at::kHalf,{2560});
    w.q_norm_w=metadata(at::kHalf,{128});w.k_norm_w=metadata(at::kHalf,{128});
    k.push_back(metadata(at::kHalf,{1,128,1,8,8,16,16}));v.push_back(metadata(at::kHalf,{1,128,1,8,8,16,16}));
@@ -175,7 +176,7 @@ struct Fixture{
 void populate(RpuKernelGraph&g){
  auto add=[&](const char*n){Node node;node.kind=GraphNodeKind::Kernel;node.kernel.kernel_idx=19+g.nodes.size()*7;node.kernel.kernel_name=n;g.nodes.push_back(node);};
  for(int l=0;l<36;++l){
-  add("llama_rms_norm");
+  if(!combined_down||l<=3)add("llama_rms_norm");
   if(fp16_route){add("llama_gemv");add("llama_gemv");add("llama_gemv");}
   else add("llama_gemv_wint8");
   if(combined_route)add("qwen3vl_qk_norm_mrope_kv_insert_d128");
@@ -184,7 +185,9 @@ void populate(RpuKernelGraph&g){
   if(combined_o)add("qwen3vl_o_ring_norm_m1_h2560_w8");
   else {add(fp16_route?"llama_gemv":"llama_gemv_wint8");add("llm_all_reduce_residual_nopace");add("llama_rms_norm");}
   if(fp16_route)for(const char*n:{"llama_gemv","unary","llama_gemv","binary_sameshape","llama_gemv","llm_all_reduce_residual_nopace"})add(n);
-  else for(const char*n:{"qwen3vl_gateup_swiglu_gemv","llama_gemv_wint8","llm_all_reduce_residual_nopace"})add(n);
+  else {add("qwen3vl_gateup_swiglu_gemv");
+   if(combined_down&&l>=3&&l<35)add("qwen3vl_o_ring_norm_m1_h2560_w8");
+   else {add("llama_gemv_wint8");add("llm_all_reduce_residual_nopace");}}
   if(l<3)add("binary_sameshape");
  }
  add("llama_rms_norm");add(fp16_route?"parallel_linear_m480n64k128":"parallel_linear_w8a16_m288n128k128");
@@ -588,6 +591,18 @@ int main(){
   bad=k;bad.push_back({99999,99999,"llama_rms_norm"});assert(!v3::bind_decode_patches(bad,p,v3::DecodeProfile{}));
  }
  }
+ }
+ // LightNav keeps DeepStack on layers 0..2, then fuses Down/ring/next-norm
+ // for layers 3..34. The checked replay grammar must match that exact stream.
+ {combined_route=true;combined_o=true;combined_down=true;Fixture f;
+  assert(Model::Qwen3VlDecodeReplayState::owner_shapes(f.m));
+  RpuKernelGraph g;populate(g);std::vector<v3::DecodeKernelSlot> kernels;
+  for(size_t i=0;i<g.nodes.size();++i)kernels.push_back({g.nodes[i].kernel.kernel_idx,i,g.nodes[i].kernel.kernel_name});
+  std::vector<RegisterPatch> patches;v3::DecodeProfile profile;profile.fused_down_norm=true;
+  assert(v3::bind_decode_patches(kernels,patches,profile));
+  f.m.layer_weights_[7].down_ws=metadata(at::kHalf,{2560});
+  assert(!Model::Qwen3VlDecodeReplayState::owner_shapes(f.m));
+  combined_down=false;combined_o=false;
  }
  // Old REF: separate Gate/Up GEMVs plus the existing fused silu_mul.
  {combined_route=true;combined_o=false;Fixture f;f.m.qwen3vl_4b_decode_gateup_fused_=false;

@@ -222,6 +222,8 @@ inline constexpr int64_t QWEN3VL_4B_DECODE_MLP_DOWN_SITE =
     8611354113246523844LL;
 inline constexpr int64_t QWEN3VL_4B_DECODE_MLP_REDUCE_SITE =
     6953872594742217143LL;
+inline constexpr int64_t QWEN3VL_4B_DECODE_MLP_DOWN_RING_NORM_SITE =
+    5247352637572653754LL;
 
 // Persistent preload routes.  These are part of the same COMPLETE descriptor
 // as the layer body: Graph BUILD and REPLAY execute the callbacks inside the
@@ -1509,6 +1511,7 @@ public:
             KernelCache::instance().has_loaded(KernelId::QWEN3VL_QK_NORM_MROPE_KV_INSERT_D128);
         qwen3vl_4b_decode_o_ring_norm_fused_ = qwen3vl_4b_w8_profile_ &&
             KernelCache::instance().has_loaded(KernelId::QWEN3VL_O_RING_NORM_M1_H2560_W8);
+        qwen3vl_4b_decode_down_ring_norm_fused_ = qwen3vl_4b_decode_o_ring_norm_fused_;
         // Reuse the FP16 dynamic-row QKV and ordinary SiLU/Mul packets for
         // the base owner's two-chunk prefill. This does not admit FP16 to
         // the W8 shared-input/no-Up payloads or change any SPM allocation.
@@ -1692,7 +1695,8 @@ public:
             }
             if (qwen3vl_4b_decode_o_ring_norm_fused_) {
                 auto& weights = layer_weights_.back();
-                weights.o_ws = retain_qwen3vl_4b_o_scale(weights.o_ws);
+                weights.o_ws = retain_qwen3vl_4b_ring_norm_scale(weights.o_ws);
+                weights.down_ws = retain_qwen3vl_4b_ring_norm_scale(weights.down_ws);
             }
         }
         cos_ = cos;
@@ -4296,6 +4300,9 @@ protected:
         if (qwen3vl_4b_decode_o_ring_norm_fused_) {
             h = detail::layout_mix(h, QWEN3VL_4B_DECODE_O_RING_NORM_SITE);
         }
+        if (qwen3vl_4b_decode_down_ring_norm_fused_) {
+            h = detail::layout_mix(h, QWEN3VL_4B_DECODE_MLP_DOWN_RING_NORM_SITE);
+        }
         if (configured_vocab_size_ != 0 || num_cores() != 8) {
             h = detail::layout_mix(h, 2);  // cold template schema version
             for (const auto value : {num_cores(), attn_tp(), mlp_tp(), lm_head_tp(), NUM_CORES}) {
@@ -4574,10 +4581,21 @@ protected:
             num_cores() == 8 && attn_tp() == 8 && eps_ == 1e-6;
     }
 
-    static at::Tensor retain_qwen3vl_4b_o_scale(const at::Tensor& scale) {
+    bool qwen3vl_4b_decode_down_ring_norm(
+        int layer_idx, int64_t physical_len, int64_t rows, bool is_causal,
+        bool use_attn_mask, int64_t batch_size, bool partial_mrope) const {
+        return qwen3vl_4b_decode_down_ring_norm_fused_ &&
+            layer_idx >= 0 && layer_idx + 1 < num_layers() &&
+            std::find(deepstack_lang_layers_.begin(), deepstack_lang_layers_.end(),
+                      static_cast<int64_t>(layer_idx)) == deepstack_lang_layers_.end() &&
+            qwen3vl_4b_decode_o_ring_norm(
+                physical_len, rows, is_causal, use_attn_mask, batch_size, partial_mrope);
+    }
+
+    static at::Tensor retain_qwen3vl_4b_ring_norm_scale(const at::Tensor& scale) {
         TORCH_CHECK(scale.scalar_type() == at::kHalf && scale.is_contiguous() &&
                         scale.dim() == 1 && scale.numel() == 2560,
-                    "4B fused O/ring/norm requires FP16 per-channel scales [2560]");
+                    "4B fused projection/ring/norm requires FP16 per-channel scales [2560]");
         // Original N320 GEMV reads 512 scales for its last 320-channel block.
         // Keep logical [2560], with initialized backing for the 192-half tail.
         auto backing = at::empty({2560 + 256}, scale.options());
@@ -5516,6 +5534,11 @@ protected:
                        static_cast<int64_t>(CausalDecoderLinearRoute::GEMV),
                        0, {1, hidden_size(), intermediate_size(), 0, 8}, chunk.idx);
                 append_ring(QWEN3VL_4B_DECODE_MLP_REDUCE_SITE, 1, chunk.idx);
+                if (qwen3vl_4b_decode_down_ring_norm_fused_) {
+                    append(FmbRouteFamily::LINEAR,
+                           QWEN3VL_4B_DECODE_MLP_DOWN_RING_NORM_SITE,
+                           1, 0, {1, 2560, 9728, 1216, 8, 320, 1, 63488}, chunk.idx);
+                }
             } else {
                 needs_shared_mlp = true;
             }
@@ -7314,7 +7337,8 @@ protected:
             rows, 2048, 8, 8);
     }
 
-    void emit_qwen3vl_decode_mlp(const LayerWeights& lw, const ChunkInfo& chunk) {
+    void emit_qwen3vl_decode_mlp(
+        const LayerWeights& lw, int layer_idx, const ChunkInfo& chunk) {
         TORCH_CHECK(ctx().stage_plan.chunk_mode == ChunkMode::SEQUENTIAL &&
                 qwen3vl_decode_mlp(seq_len_, chunk.len, ctx().is_causal,
                     ctx().attention_mask.has_value(), ctx().batch_size),
@@ -7350,6 +7374,19 @@ protected:
                 {1, intermediate_size() / 8, 8}, chunk.idx);
             rpu_launch_silu_mul_spm_kernel(
                 addr(0, "gate"), addr(0, "up"), addr(0, "gate"), intermediate_size() / 8, 8);
+        }
+        if (qwen3vl_4b_decode_down_ring_norm(
+                layer_idx, seq_len_, chunk.len, ctx().is_causal,
+                ctx().attention_mask.has_value(), ctx().batch_size,
+                partial_mrope_active_)) {
+            ctx().consume_physical_route(FmbRouteFamily::LINEAR,
+                QWEN3VL_4B_DECODE_MLP_DOWN_RING_NORM_SITE, 1, 0,
+                {1, 2560, 9728, 1216, 8, 320, 1, 63488}, chunk.idx);
+            rpu_launch_qwen3vl_4b_decode_o_ring_norm_spm_kernel(
+                addr(0, "gate"), lw.down_w, lw.down_ws, addr(0, "down"),
+                addr(0, "residual2"), addr(0, "residual1"),
+                norm_input_addr(layer_idx + 1, 0), eps_, 9728);
+            return;
         }
         ctx().consume_physical_route(FmbRouteFamily::LINEAR,
             QWEN3VL_4B_DECODE_MLP_DOWN_SITE,
@@ -8571,8 +8608,13 @@ protected:
         // Static Qwen uses the packed norm slab; dynamic/bias variants retain
         // the per-layer slot. Both are preloaded once per BUILD.
         // ─────────────────────────────────────────────────────────────────────
+        const bool qwen3vl_down_provided_input_norm = layer_idx > 0 &&
+            qwen3vl_4b_decode_down_ring_norm(
+                layer_idx - 1, seq_len_, chunk.len, ctx().is_causal,
+                ctx().attention_mask.has_value(), bs, partial_mrope_active_);
         if (layer_idx == 0 ||
-            (!wall_action_linear_ring_postnorm && !wall_base_nvfp4_down_ring_norm)) {
+            (!wall_action_linear_ring_postnorm && !wall_base_nvfp4_down_ring_norm &&
+             !qwen3vl_down_provided_input_norm)) {
             emit_adarms_mut_refresh_input(layer_idx);  // replay-safe AdaRMS: refresh scale+shift SPM
             if (residual_is_bf16) {
                 rpu_launch_rmsnorm_bf16in_fp16out_spm_kernel(
@@ -9219,7 +9261,7 @@ protected:
         } else if (ctx().stage_plan.chunk_mode == ChunkMode::SEQUENTIAL &&
             qwen3vl_decode_mlp(seq_len_, chunk.len, ctx().is_causal,
                 ctx().attention_mask.has_value(), bs)) {
-            emit_qwen3vl_decode_mlp(lw, chunk);
+            emit_qwen3vl_decode_mlp(lw, layer_idx, chunk);
         } else if (decode_gate_up_fusion_) {
             TORCH_CHECK(!transition_to_bf16 && !residual_is_bf16,
                         "Qwen3-VL packed gate/up does not support BF16 residuals");
@@ -10187,6 +10229,9 @@ protected:  // LingBot2 sparse-MoE subclass reuses the decoder's layer state.
         if (qwen3vl_4b_decode_o_ring_norm_fused_) {
             identity.push_back(QWEN3VL_4B_DECODE_O_RING_NORM_SITE);
         }
+        if (qwen3vl_4b_decode_down_ring_norm_fused_) {
+            identity.push_back(QWEN3VL_4B_DECODE_MLP_DOWN_RING_NORM_SITE);
+        }
         identity.push_back(static_cast<int64_t>(mrope_section_.size()));
         identity.insert(identity.end(), mrope_section_.begin(), mrope_section_.end());
         identity.push_back(static_cast<int64_t>(deepstack_lang_layers_.size()));
@@ -10426,6 +10471,7 @@ protected:  // LingBot2 sparse-MoE subclass reuses the decoder's layer state.
     bool qwen3vl_4b_decode_qk_fused_ = false;
     bool qwen3vl_4b_decode_qk_kv_fused_ = false;
     bool qwen3vl_4b_decode_o_ring_norm_fused_ = false;
+    bool qwen3vl_4b_decode_down_ring_norm_fused_ = false;
     bool qwen3vl_4b_packed_qkv_weights_ = false;
     at::Tensor qwen3vl_4b_qkv_scale_bank_;
     bool decode_qkv_fusion_ = false;

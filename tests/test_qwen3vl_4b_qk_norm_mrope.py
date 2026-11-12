@@ -300,7 +300,8 @@ def test_cold_capability_layout_and_logical_position_backing(tmp_path):
     profile += "\n" + "\n".join(re.search(
         rf"        {field} = [^;]+;", source[profile_start:]).group(0)
         for field in ("qwen3vl_4b_decode_gateup_fused_", "qwen3vl_4b_decode_qk_fused_",
-                      "qwen3vl_4b_decode_qk_kv_fused_", "qwen3vl_4b_decode_o_ring_norm_fused_"))
+                      "qwen3vl_4b_decode_qk_kv_fused_", "qwen3vl_4b_decode_o_ring_norm_fused_",
+                      "qwen3vl_4b_decode_down_ring_norm_fused_"))
     wall_fields = "\n".join(re.findall(r"    bool wall_base_\w+_ = false;", source))
     capacity_start = source.index("            const int64_t mrope_capacity")
     capacity_binding = source[capacity_start:source.index("            ka_cpu_pos_published_rows_.assign", capacity_start)]
@@ -350,11 +351,11 @@ struct Model {
  __WALL_FIELDS__
  __LINGBOT_UNBOUND__
  bool rhinovla_high_precision_=false,rhinovla_high_precision_fusions_=false;
- bool tts_codec_mode_=false;std::vector<at::Tensor> tts_predictor_heads_;
+ bool tts_codec_mode_=false;std::vector<at::Tensor> tts_predictor_heads_,lightnav_heads_;
  bool has_scale=true,has_nvfp4=false,use_silu=true,has_qk_norm_=true,has_qkv_bias_=false;
  std::vector<int64_t> mrope_section{24,20,20},deepstack_lang_layers{0,1,2};
  std::vector<at::Tensor> q_w_list{36},k_w_list{36},v_w_list{36},o_w_list{36},gate_list{36},up_list{36},down_list{36};
- bool qwen3vl_4b_w8_profile_=false,qwen3vl_4b_decode_gateup_fused_=false,qwen3vl_4b_decode_qk_fused_=false,qwen3vl_4b_decode_qk_kv_fused_=false,qwen3vl_4b_decode_o_ring_norm_fused_=false;
+ bool qwen3vl_4b_w8_profile_=false,qwen3vl_4b_decode_gateup_fused_=false,qwen3vl_4b_decode_qk_fused_=false,qwen3vl_4b_decode_qk_kv_fused_=false,qwen3vl_4b_decode_o_ring_norm_fused_=false,qwen3vl_4b_decode_down_ring_norm_fused_=false;
  bool explicit_mask_residency_requested_=false;
  bool wall_prefill_staged_mlp_=false,decode_gate_up_fusion_=false,prefill_packed_gate_up_strided_=false,qwen3vl_4b_packed_qkv_weights_=false;
  std::vector<int64_t> deepstack_lang_layers_{0,1,2};int configured_vocab_size_=0,cores=8;
@@ -395,7 +396,7 @@ int main(){
  auto newhash=new_only.subclass_layout_hash();const auto newqueries=cap.queries;cap.qkkv=false;
  assert(new_only.qwen3vl_4b_decode_qk_kv_fused_&&new_only.subclass_layout_hash()==newhash&&cap.queries==newqueries);
  new_only.cold();assert(!new_only.qwen3vl_4b_decode_qk_kv_fused_&&new_only.subclass_layout_hash()==oldhash);
- cap.o=true;Model fused_o;fused_o.cold();assert(fused_o.qwen3vl_4b_decode_o_ring_norm_fused_);
+ cap.o=true;Model fused_o;fused_o.cold();assert(fused_o.qwen3vl_4b_decode_o_ring_norm_fused_&&fused_o.qwen3vl_4b_decode_down_ring_norm_fused_);
  const auto ohash=fused_o.subclass_layout_hash();assert(ohash!=oldhash&&ohash!=fusedhash&&ohash!=newhash);
  const auto oqueries=cap.queries;cap.o=false;assert(fused_o.subclass_layout_hash()==ohash&&cap.queries==oqueries);
  fused_o.cold();assert(!fused_o.qwen3vl_4b_decode_o_ring_norm_fused_&&fused_o.subclass_layout_hash()==oldhash);

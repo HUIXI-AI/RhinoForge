@@ -26,6 +26,7 @@ def test_prefill_manifest_and_dispatch(tmp_path):
                                        "QWEN3VL_4B_DECODE_MLP_GATE_SITE","QWEN3VL_4B_DECODE_MLP_UP_SITE",
                                        "QWEN3VL_4B_DECODE_MLP_ACTIVATION_SITE","QWEN3VL_4B_DECODE_MLP_DOWN_SITE",
                                        "QWEN3VL_4B_DECODE_MLP_REDUCE_SITE",
+                                       "QWEN3VL_4B_DECODE_MLP_DOWN_RING_NORM_SITE",
                                        "LINGBOT2_PREFILL_GATEUP_SHARED_A_SITE",
                                        "WALL_BASE_FP16_PREFILL_SHARED_GATEUP_SITE",
                                        "WALL_BASE_PREFILL_SHARED_DOWN_SITE",
@@ -116,7 +117,7 @@ void rpu_launch_all_reduce_sum_residual_kernel(uint32_t partial,uint32_t residua
 }
 struct Model {
   bool qwen3vl_4b_w8_profile_=true,linear_acc32_=false,decoder_mixed_precision_=false,adarms_=false;
-  bool qwen3vl_4b_decode_gateup_fused_=false;
+      bool qwen3vl_4b_decode_gateup_fused_=false,qwen3vl_4b_decode_down_ring_norm_fused_=false;
   bool qwen3vl_pooler_z1_dispatch_=false,qwen3vl_multiview_text_composite_dispatch_=false;
   CausalDecoderPlanningMode planning_mode_=CausalDecoderPlanningMode::ORDINARY;
   int64_t seq_len_=560;Context context;bool last_shared=false;

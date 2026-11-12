@@ -103,12 +103,15 @@ void rpu_launch_linear_spm_to_spm_acc16_kernel(uint32_t input,const at::Tensor& 
 void rpu_launch_silu_mul_spm_kernel(uint32_t gate,uint32_t up,uint32_t output,int64_t count,int cores){
   assert(gate==live_base+0x3000&&up==live_base+0x4000&&output==gate&&count==__LOCAL_I__&&cores==8);emitted.push_back(3);
 }
-void rpu_launch_qwen3vl_4b_decode_gate_up_swiglu_w8a16_spm_kernel(uint32_t input,
+    void rpu_launch_qwen3vl_4b_decode_gate_up_swiglu_w8a16_spm_kernel(uint32_t input,
     const at::Tensor& gate,const at::Tensor& up,uint32_t output,
     const at::Tensor& gs,const at::Tensor& us){
   assert(input==live_base+0x1000&&output==live_base+0x3000);
-  assert(gate.id==1&&up.id==2&&gs.id==4&&us.id==5);emitted.push_back(6);
-}
+      assert(gate.id==1&&up.id==2&&gs.id==4&&us.id==5);emitted.push_back(6);
+    }
+    void rpu_launch_qwen3vl_4b_decode_o_ring_norm_spm_kernel(
+        uint32_t,const at::Tensor&,const at::Tensor&,uint32_t,uint32_t,uint32_t,
+        uint32_t,double,int64_t=4096){throw std::runtime_error("unexpected fused Down");}
 void rpu_launch_all_reduce_sum_residual_kernel(uint32_t partial,uint32_t residual,uint32_t output,
     int64_t rows,int64_t cols,int producer_cores,int cores) {
   assert(partial==live_base+0x5000&&residual==live_base+0x2000&&output==live_base+0x1000);
@@ -117,12 +120,15 @@ void rpu_launch_all_reduce_sum_residual_kernel(uint32_t partial,uint32_t residua
 struct Model {
  bool qwen3vl_fp16_decode_profile_=false;
  bool qwen3vl_4b_w8_profile_=__IS_4B__,linear_acc32_=false,decoder_mixed_precision_=false,adarms_=false;
-  bool qwen3vl_4b_decode_gateup_fused_=__FUSED__;
+      bool qwen3vl_4b_decode_gateup_fused_=__FUSED__,qwen3vl_4b_decode_down_ring_norm_fused_=false;
   bool qwen3vl_pooler_z1_dispatch_=false,qwen3vl_multiview_text_composite_dispatch_=false;
   CausalDecoderPlanningMode planning_mode_=CausalDecoderPlanningMode::ORDINARY;
-  int64_t seq_len_=1;Context context;bool last_shared=false;
+      int64_t seq_len_=1;double eps_=1e-6;bool partial_mrope_active_=false;Context context;bool last_shared=false;
   Context& ctx(){return context;}int num_cores() const{return 8;}int64_t hidden_size() const{return __H__;}
-  int64_t intermediate_size() const{return __I__;}
+      int64_t intermediate_size() const{return __I__;}
+      int num_layers() const{return 36;}
+      uint32_t norm_input_addr(int,int) const{return live_base+0x6000;}
+      bool qwen3vl_4b_decode_down_ring_norm(int,int64_t,int64_t,bool,bool,int64_t,bool)const{return false;}
   std::vector<int64_t> bind_cold_topology_arguments(std::vector<int64_t>) const {throw std::runtime_error("unexpected non-TP8");}
   uint32_t addr(int core,const char* name) const {
     assert(core==0);std::string s=name;
@@ -151,7 +157,8 @@ struct Model {
     last_shared=needs_shared_mlp;return manifest;
   }
   __EMITTER__
-  void dispatch(const LayerWeights& lw,const ChunkInfo& chunk){
+      void dispatch(const LayerWeights& lw,const ChunkInfo& chunk){
+        const int layer_idx=0;
     const int64_t bs=ctx().batch_size;
     __DISPATCH__ else {emitted.push_back(9);}
   }
@@ -175,7 +182,7 @@ int main(){
       m.context.position=pos;m.context.bind(manifest);live_base=0x40000000+pos*256;
       emitted.clear();m.dispatch(weights,plan.compute.chunks[0]);
       assert(emitted==std::vector<int>({9}));
-      rejected([&]{m.emit_qwen3vl_decode_mlp(weights,plan.compute.chunks[0]);},0);
+          rejected([&]{m.emit_qwen3vl_decode_mlp(weights,0,plan.compute.chunks[0]);},0);
     }
     return 0;
   }
@@ -199,7 +206,7 @@ int main(){
     model.seq_len_=physical;model.context.is_causal=l.is_causal;model.context.batch_size=l.batch_size;
     if(l.use_attn_mask)model.context.attention_mask=1;
     emitted.clear();model.dispatch(weights,p.compute.chunks[0]);assert(emitted==std::vector<int>({9}));
-    rejected([&]{model.emit_qwen3vl_decode_mlp(weights,p.compute.chunks[0]);},0);
+        rejected([&]{model.emit_qwen3vl_decode_mlp(weights,0,p.compute.chunks[0]);},0);
   };
   for(auto field:{&Model::linear_acc32_,&Model::decoder_mixed_precision_,&Model::adarms_,
       &Model::qwen3vl_pooler_z1_dispatch_,&Model::qwen3vl_multiview_text_composite_dispatch_}){

@@ -60,25 +60,27 @@ void rpu_launch_qwen3vl_4b_decode_o_ring_norm_spm_kernel(
     uint32_t residual_spm_addr,
     uint32_t raw_spm_addr,
     uint32_t gamma_spm_addr,
-    double eps) {
+    double eps,
+    int64_t input_size) {
   constexpr int64_t kH = 2560;
-  constexpr int64_t kK = 4096;
-  constexpr uint32_t kLocalK = kK / 8;
-  constexpr uint64_t kWeightBytes = kH * kK;
+  TORCH_CHECK(input_size == 4096 || input_size == 9728,
+              "Qwen3-VL 4B decode ring/Norm input must be 4096 or 9728");
+  const uint32_t kLocalK = input_size / 8;
+  const uint64_t kWeightBytes = kH * input_size;
   constexpr uint64_t kScaleBytes = (kH + 256) * sizeof(c10::Half);
   constexpr uint64_t kRowBytes = kH * sizeof(c10::Half);
   constexpr uint32_t kCoreStride = 0x1000000;
   TORCH_CHECK(eps == 1e-6,
               "Qwen3-VL 4B decode O/ring/Norm requires epsilon 1e-6");
-  auto check_tensor = [](const at::Tensor& tensor, bool is_scale) {
+  const auto check_tensor = [input_size, kWeightBytes](const at::Tensor& tensor, bool is_scale) {
     TORCH_CHECK(tensor.defined() &&
                     tensor.device().type() == c10::DeviceType::PrivateUse1 &&
                     tensor.layout() == c10::Layout::Strided &&
                     tensor.scalar_type() == (is_scale ? at::kHalf : at::kChar) &&
                     tensor.is_contiguous() && tensor.dim() == (is_scale ? 1 : 2) &&
-                    tensor.size(0) == kH && (is_scale || tensor.size(1) == kK),
+                    tensor.size(0) == kH && (is_scale || tensor.size(1) == input_size),
                 "Qwen3-VL 4B decode O/ring/Norm requires contiguous device "
-                "int8 [2560,4096] weight and fp16 [2560] scale");
+                "int8 [2560,K] weight and fp16 [2560] scale");
     const uint64_t element_bytes = is_scale ? sizeof(c10::Half) : 1;
     const uint64_t required_bytes = is_scale ? kScaleBytes : kWeightBytes;
     const int64_t offset = tensor.storage_offset();

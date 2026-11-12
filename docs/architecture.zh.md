@@ -2,7 +2,7 @@
 
 简体中文 | [English](architecture.md)
 
-RhinoForge 是面向 Rhino Processing Unit 推理的 PyTorch `PrivateUse1` backend。
+RhinoForge 是面向 Rhino RPU 推理的 PyTorch `PrivateUse1` backend。
 导入 `rpu_backend` 会注册设备名 `rpu`，在板卡可访问时加载 native extension，安装
 `torch.rpu` namespace，并延迟注册模型 adapter。
 
@@ -21,7 +21,7 @@ Hugging Face model 或 policy API
               |
        Rhino Launch
               |
-             device
+         Rhino RPU
 ```
 
 主算子资产与扩展算子资产由 host launch interface 加载。对 RhinoForge 它是 opaque 的：backend

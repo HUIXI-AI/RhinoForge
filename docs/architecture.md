@@ -2,8 +2,8 @@
 
 [简体中文](architecture.zh.md) | English
 
-RhinoForge is a PyTorch `PrivateUse1` backend for inference on the Rhino
-Processing Unit. Importing `rpu_backend` registers the device name `rpu`, loads
+RhinoForge is a PyTorch `PrivateUse1` backend for inference on Rhino RPU.
+Importing `rpu_backend` registers the device name `rpu`, loads
 the native extension when the board device is accessible, installs the
 `torch.rpu` namespace, and registers model adapters lazily.
 
@@ -22,7 +22,7 @@ Hugging Face model or policy API
               |
        Rhino Launch
               |
-             device
+         Rhino RPU
 ```
 
 The main and expansion operator assets is loaded through the host launch interface. The

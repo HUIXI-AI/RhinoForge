@@ -1,4 +1,4 @@
-"""Offline Rhino-compatible mixed-FP8 conversion for Qwen3.5-MoE.
+"""Offline Rhino RPU-compatible mixed-FP8 conversion for Qwen3.5-MoE.
 
 Routed experts and the dense Qwen3.5 text-mixer scope are quantized.  Each
 logical output row gets one FP16 scale and E4M3 raw uint8 codes.  The explicit

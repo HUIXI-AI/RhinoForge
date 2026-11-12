@@ -4,7 +4,7 @@
 
 # RhinoForge
 
-**面向 Rhino Processing Unit 的 PyTorch 推理与模型部署工具**
+**面向 Rhino RPU 的 PyTorch 推理与模型部署工具**
 
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](pyproject.toml)
@@ -13,7 +13,7 @@
 
 </div>
 
-RhinoForge 将 Rhino 设备接入为 `torch.rpu`。项目在同一个
+RhinoForge 将 Rhino RPU 接入为 `torch.rpu`。项目在同一个
 PyTorch 后端中提供模型适配器、融合模型运行时、图捕获与重放、SPM 内存管理、
 多核执行、离线量化和模型移植模板。
 

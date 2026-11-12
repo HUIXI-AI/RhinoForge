@@ -3,7 +3,7 @@
 The grouped kernel consumes one TP-swizzled DDR tensor per projection.  Raw
 Hugging Face experts are stored as ``gate_up_proj[E,2I,H]`` and
 ``down_proj[E,H,I]``; gate/up must be split before either quantization or
-swizzle.  FP8 is the Rhino grouped ABI (raw E4M3 codes plus FP16 per-output
+swizzle.  FP8 is the Rhino RPU grouped ABI (raw E4M3 codes plus FP16 per-output
 scale), not the official 128x128 block-scale checkpoint format.
 """
 from __future__ import annotations

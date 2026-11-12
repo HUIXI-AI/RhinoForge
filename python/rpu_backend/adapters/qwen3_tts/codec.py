@@ -100,6 +100,18 @@ def _rpu_convolution(owner, hidden, weight, stats):
     return result.T.unsqueeze(0).contiguous()
 
 
+def _rpu_linear(owner, hidden, weight, bias, stats):
+    if (hidden.device.type != "cpu" or hidden.dtype != torch.float32 or
+            hidden.ndim != 3 or hidden.shape[0] != 1 or hidden.shape[-1] != owner.in_features):
+        raise ValueError("TTS RPU ConvNeXt Linear requires batch-one CPU FP32 input")
+    device = hidden.half().contiguous().to("rpu")
+    result = torch.ops.rpu.linear_with_accumulation(
+        device, weight, bias, 1, 8, True)
+    output = result.cpu().float()
+    stats["convnext_linear_calls"] += 1
+    return output
+
+
 def _rpu_transpose_convolution(owner, hidden, weight, stats, output_size=None):
     if output_size is not None:
         raise ValueError("TTS codec uses the configured transposed-convolution output size")
@@ -154,6 +166,18 @@ def install_rpu_convolutions(decoder, restore, stats):
                 (module.bias is not None and
                  (module.bias.device.type != "cpu" or module.bias.dtype != torch.float32))):
             raise ValueError("TTS RPU transposed convolution requires CPU FP32 source weights")
+    blocks = [module for module in decoder.modules()
+              if type(module).__name__ == "Qwen3TTSTokenizerV2ConvNeXtBlock"]
+    if len(blocks) != 2:
+        raise ValueError("TTS RPU ConvNeXt geometry differs from the two-block decode profile")
+    linears = [module for block in blocks for module in (block.pwconv1, block.pwconv2)]
+    if [(module.in_features, module.out_features) for module in linears] != [
+            (1024, 4096), (4096, 1024), (1024, 4096), (4096, 1024)]:
+        raise ValueError("TTS RPU ConvNeXt Linear geometry differs from the four-layer decode profile")
+    if any(module.weight.device.type != "cpu" or module.weight.dtype != torch.float32 or
+           module.bias is None or module.bias.device.type != "cpu" or
+           module.bias.dtype != torch.float32 for module in linears):
+        raise ValueError("TTS RPU ConvNeXt Linear requires CPU FP32 source weights")
     pairs = _residual_pair_affines(decoder) if hasattr(torch.ops.rpu, "tts_codec_conv_pair") else []
     prepared = []
     for module in modules:
@@ -168,6 +192,11 @@ def install_rpu_convolutions(decoder, restore, stats):
         weight = weight.flatten(1)
         weight = torch.nn.functional.pad(weight, (0, 0, 0, (-module.out_channels) % 128))
         prepared.append(transform_linear_weight(weight, 1, 8).to("rpu"))
+    prepared_linears = [
+        (transform_linear_weight(module.weight.detach().half(), 1, 8).to("rpu"),
+         module.bias.detach().half().to("rpu"))
+        for module in linears
+    ]
     for module, weight in zip(modules, prepared):
         def forward(owner, hidden, weight=weight):
             return _rpu_convolution(owner, hidden, weight, stats)
@@ -192,6 +221,14 @@ def install_rpu_convolutions(decoder, restore, stats):
             restore.append((module, module.forward))
             module.forward = types.MethodType(forward, module)
         stats["transposed_layers"] = len(transposed)
+    for module, (weight, bias) in zip(linears, prepared_linears):
+        def forward(owner, hidden, weight=weight, bias=bias):
+            return _rpu_linear(owner, hidden, weight, bias, stats)
+
+        restore.append((module, module.forward))
+        module.forward = types.MethodType(forward, module)
+    stats["convnext_linears"] = len(linears)
+    stats["convnext_linear_calls"] = 0
     weights = dict(zip(modules, prepared))
     for unit, affine in pairs:
         channels = unit.conv2.conv.in_channels

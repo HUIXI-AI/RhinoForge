@@ -174,7 +174,7 @@ ASR also accepts a one-dimensional CPU floating-point Tensor. See
 | Model | CPU | Rhino RPU |
 |---|---|---|
 | ASR | Audio reading, mel features/chunking, convolutions and their activations, single-token embedding, finite checks, argmax, text decoding | conv_out, positions and valid rows, audio encoder and output projections, prefill text/audio composition, text decoder and vocabulary head |
-| TTS | Embedding, reference processing, speaker encoder, generation control, codebook, transposed-convolution overlap/layout, remaining 17 SnakeBeta layers, waveform output | All 31 decoding Conv1d layers, six transposed-convolution projections and 12 intermediate SnakeBeta layers with the matching native extension; Talker, Predictor and output heads; codec input/output projections and Transformer frontend when supported by native interfaces |
+| TTS | Embedding, reference processing, speaker encoder, generation control, codebook, ConvNeXt normalization/GELU, transposed-convolution overlap/layout, remaining 17 SnakeBeta layers, waveform output | All 31 decoding Conv1d layers, four ConvNeXt Linear layers, six transposed-convolution projections and 12 intermediate SnakeBeta layers with the matching native extension; Talker, Predictor and output heads; codec input/output projections and Transformer frontend when supported by native interfaces |
 
 ASR convolutions use channels-last storage and FP16-rounded weights in CPU FP32
 computation, then round outputs to FP16. The device audio Graph uses FP32 Linear
@@ -265,7 +265,7 @@ convolution outputs are padded to 128 alignment and sliced back before applying
 the original FP32 bias.
 
 CPU still performs padding, im2col, remaining bias/residual arithmetic, codebook,
-17 SnakeBeta layers, ConvNeXt Linear/normalization/GELU and upsampling layout
+17 SnakeBeta layers, ConvNeXt normalization/GELU and upsampling layout
 operations. Older native extensions also keep all six transposed convolutions on CPU.
 With native `tts_codec_conv1d`, CPU im2col writes rounded FP16 values directly into
 fresh device-owned DDR through the existing storage-retaining CPU view. After
@@ -292,6 +292,9 @@ activations on CPU.
 With native `tts_codec_conv_transpose1d`, the six frozen transposed-convolution
 projections use FP16 inputs and weights with ACC32 Linear on RPU. CPU retains
 overlap addition, FP32 bias and final layout, so no device Graph is introduced.
+The two ConvNeXt blocks also run their four pointwise Linear layers on RPU with
+FP16 inputs/weights and ACC32. LayerNorm and exact GELU remain CPU FP32 to avoid
+the v1.2.0 core-0 SPM bound; each Linear returns an independent CPU FP32 tensor.
 
 This remains partial vocoder offload. Each Linear
 uses the existing synchronous immediate path and the shared sixth arena; no new
@@ -301,7 +304,8 @@ errors propagate instead of silently reverting to CPU. `execution_stats()` adds
 RPU `calls`, `transport` (`shared_ddr` or the older `staged` route),
 `residual_pairs` (12 with the matching native extension, otherwise 0), and
 `paired_calls` (completed pair executions; each also adds two to `calls`), plus
-`transposed_layers` (6 with matching native support) and `transposed_calls`.
+`transposed_layers` (6 with matching native support), `transposed_calls`,
+`convnext_linears` (4) and `convnext_linear_calls`.
 The frontend's existing 63-frame device bound and CPU sliding-attention fallback
 remain unchanged.
 

@@ -5,7 +5,8 @@ import torch.nn.functional as F
 
 from rpu_backend.adapters.qwen3_tts.codec import (
     install_codec_activations, install_codec_convolutions,
-    install_rpu_convolutions, _rpu_convolution, _rpu_transpose_convolution,
+    install_rpu_convolutions, _rpu_convolution, _rpu_linear,
+    _rpu_transpose_convolution,
 )
 
 
@@ -180,6 +181,13 @@ def _decoder():
         torch.nn.ConvTranspose1d(384, 192, 8, stride=4),
         torch.nn.ConvTranspose1d(192, 96, 6, stride=3),
     ])
+    block_type = type("Qwen3TTSTokenizerV2ConvNeXtBlock", (torch.nn.Module,), {})
+    decoder.convnext = torch.nn.ModuleList()
+    for _ in range(2):
+        block = block_type()
+        block.pwconv1 = torch.nn.Linear(1024, 4096)
+        block.pwconv2 = torch.nn.Linear(4096, 1024)
+        decoder.convnext.append(block)
     return decoder
 
 
@@ -193,6 +201,18 @@ def test_rpu_install_validates_all_layers_before_transform(monkeypatch):
     with pytest.raises(ValueError, match="geometry"):
         install_rpu_convolutions(decoder, restore, {"calls": 0})
     assert restore == [] and [m.forward for m in decoder.modules()] == originals
+
+
+def test_rpu_install_rejects_convnext_profile_before_transform(monkeypatch):
+    from rpu_backend.runtime import weights
+    decoder = _decoder()
+    decoder.convnext[1].pwconv2 = torch.nn.Linear(4096, 1000)
+    monkeypatch.setattr(weights, "transform_linear_weight",
+                        lambda *args: pytest.fail("transformed before validation"))
+    restore = []
+    with pytest.raises(ValueError, match="ConvNeXt Linear geometry"):
+        install_rpu_convolutions(decoder, restore, {"calls": 0})
+    assert not restore
 
 
 def test_invalid_codec_backend_rejected_before_loading(monkeypatch):
@@ -222,7 +242,8 @@ def test_rpu_install_covers_decoding_convs_and_preserves_unused_layers(monkeypat
     install_rpu_convolutions(decoder, restore, stats)
     assert stats["layers"] == 31
     assert stats["transposed_layers"] == 6 and stats["transposed_calls"] == 0
-    assert len(restore) == len(converted) == 37
+    assert stats["convnext_linears"] == 4 and stats["convnext_linear_calls"] == 0
+    assert len(restore) == len(converted) == 41
     for module in (decoder.quantizer.rvq_first.input_proj,
                    decoder.quantizer.rvq_rest.input_proj):
         assert module.forward == originals[module]
@@ -236,6 +257,41 @@ def test_rpu_install_covers_decoding_convs_and_preserves_unused_layers(monkeypat
     for module, forward in reversed(restore):
         module.forward = forward
     assert all(m.forward == forward for m, forward in originals.items())
+
+
+def test_convnext_linear_uses_acc32_and_returns_owned_cpu_fp32(monkeypatch):
+    module = torch.nn.Linear(4, 8).eval()
+    hidden = torch.randn(1, 3, 4)
+    source = hidden.clone()
+    weight, bias = module.weight.detach().half(), module.bias.detach().half()
+    stats = {"convnext_linear_calls": 0}
+    original_to = torch.Tensor.to
+    monkeypatch.setattr(torch.Tensor, "to", lambda self, *a, **kw:
+                        self if a == ("rpu",) else original_to(self, *a, **kw))
+    seen = []
+
+    def linear(value, packed, device_bias, partition, cores, acc32):
+        assert value.dtype == packed.dtype == device_bias.dtype == torch.float16
+        assert (partition, cores, acc32) == (1, 8, True)
+        seen.append(value.clone())
+        return (value.float() @ packed.float().T + device_bias.float()).half()
+
+    monkeypatch.setattr(torch.ops.rpu, "linear_with_accumulation", linear, raising=False)
+    result = _rpu_linear(module, hidden, weight, bias, stats)
+    expected = (hidden.half().float() @ weight.float().T + bias.float()).half().float()
+    assert torch.equal(result, expected) and result.dtype == torch.float32
+    assert torch.equal(hidden, source) and stats["convnext_linear_calls"] == 1
+    retained = result.clone()
+    changed = _rpu_linear(module, hidden + 1, weight, bias, stats)
+    assert torch.equal(result, retained) and not torch.equal(changed, result)
+    assert stats["convnext_linear_calls"] == 2 and not torch.equal(*seen)
+    with pytest.raises(ValueError, match="CPU FP32"):
+        _rpu_linear(module, hidden.half(), weight, bias, stats)
+    monkeypatch.setattr(torch.ops.rpu, "linear_with_accumulation",
+                        lambda *args: (_ for _ in ()).throw(RuntimeError("linear failure")))
+    with pytest.raises(RuntimeError, match="linear failure"):
+        _rpu_linear(module, hidden, weight, bias, stats)
+    assert stats["convnext_linear_calls"] == 2
 
 
 @pytest.mark.parametrize("kernel,stride", [(2, 2), (16, 8)])

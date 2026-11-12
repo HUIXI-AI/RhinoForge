@@ -659,11 +659,13 @@ outputs. Retire Graphs before native handles and weights. Set CPU thread count
 with `torch.set_num_threads` before loading; the API leaves it unchanged.
 
 `codec_backend="rpu"` defaults to experimental offload of all 31 decoding Conv1d
-layers. With matching native support, twelve pairs also keep their intermediate
-SnakeBeta and first bias on RPU in FP16. Select `codec_backend="cpu"` to restore
+layers and four ConvNeXt Linear layers. With matching native support, twelve pairs
+also keep their intermediate SnakeBeta and first bias on RPU in FP16. Select
+`codec_backend="cpu"` to restore
 CPU FP32 convolutions and activations. `execution_stats().codec_convolutions`
 reports backend, installed layers, cumulative convolution calls, `transport`
 (`shared_ddr` or older `staged`), `residual_pairs`, completed `paired_calls`,
-`transposed_layers` and completed `transposed_calls`.
+`transposed_layers`, completed `transposed_calls`, `convnext_linears` and
+completed `convnext_linear_calls`.
 Each pair contributes two convolution calls. See the [speech guide](qwen3_audio.md#experimental-rpu-vocoder-convolutions)
 for remaining CPU work and the changed numerical boundary.

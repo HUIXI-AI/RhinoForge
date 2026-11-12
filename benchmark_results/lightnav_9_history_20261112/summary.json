@@ -78,6 +78,32 @@
       "token_equal_frames": "29/35",
       "different_tokens": "11/175",
       "decision": "experimental opt-in; requires navigation accuracy evaluation"
+    },
+    "vision_w8a16_calibrated": {
+      "input_tokens": 347,
+      "encoder_range_scale": 1.04,
+      "patch_merger_range_scale": 1.0,
+      "prepare": 17.310,
+      "vision": 26.879,
+      "vision_vit": 22.840,
+      "vision_pool": 4.516,
+      "prefill": 89.169,
+      "decode_5": 114.535,
+      "total": 248.388,
+      "frame_total": 252.037,
+      "token_equal_frames": "35/35",
+      "different_tokens": "0/175",
+      "repeat": {
+        "vision": 26.828,
+        "vision_vit": 22.637,
+        "prefill": 88.980,
+        "decode_5": 114.494,
+        "total": 247.856,
+        "frame_total": 251.554,
+        "token_equal_frames": "35/35",
+        "different_tokens": "0/175"
+      },
+      "decision": "token-exact on customer set; broader navigation accuracy evaluation required"
     }
   },
   "not_implemented": {
@@ -89,6 +115,9 @@
     "/run/customer_lightnav_repro_20261111/outputs/history9_pool_v1_35.json",
     "/run/customer_lightnav_repro_20261111/outputs/history9_position_heads_35.json",
     "/run/customer_lightnav_repro_20261111/outputs/history9_current_pool2_35.json",
-    "/run/customer_lightnav_repro_20261111/outputs/history9_vision_w8_35.json"
+    "/run/customer_lightnav_repro_20261111/outputs/history9_vision_w8_35.json",
+    "/run/customer_lightnav_repro_20261111/outputs/history9_vision_w8_encoder104_aux100_35.json",
+    "/run/customer_lightnav_repro_20261111/outputs/history9_vision_w8_encoder104_aux100_repeat_35.json",
+    "/run/customer_lightnav_repro_20261111/outputs/history9_vision_w8_production_final_35.json"
   ]
 }

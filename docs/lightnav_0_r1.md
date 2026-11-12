@@ -61,9 +61,15 @@ the previous token, while the current runtime lacks a device-side
 `top1 -> original token ID -> embedding -> next decoder` chain. Host selection
 and upload cost about 1.1 ms total; decoder model execution costs about 113.3 ms.
 
-Two aggressive experiments remain non-default. Current-frame `pool_spatial=2`
-reduced Total to 277.802 ms but matched only 1/35 frames. Vision W8A16 reduced
-Total to 247.730 ms but matched 29/35 frames, with 11/175 tokens changed. See
+Current-frame `pool_spatial=2` reduced Total to 277.802 ms but matched only 1/35
+frames, so it remains rejected. Uncalibrated Vision W8A16 reduced Total to
+247.730 ms but matched 29/35 frames and 164/175 tokens. Calibrating the encoder
+range to 1.04 while retaining the standard patch/merger range matched all 35/35
+frames and 175/175 tokens, with 26.879 ms Vision, 248.388 ms Total, and 252.037 ms
+frame total. This reduces Vision by 57.6% and Total by 12.7% versus Vision FP16.
+This proves token equality on the customer set, not navigation-task
+accuracy on a broader evaluation. An independent cold reload repeated 35/35
+frames and 175/175 tokens. See
 `benchmark_results/lightnav_9_history_20261112/summary.json` for the full result.
 
 ## Run
@@ -116,7 +122,7 @@ PYTHONPATH=python python -m rpu_backend.quant.convert_qwen3_vl \
 The weight file falls from 9.70 GB to 6.06 GB, a 37.5% reduction. It does not
 halve because Vision, the action head, and other non-Linear weights remain FP16.
 
-Vision W8A16 is available only for controlled evaluation:
+Vision W8A16 uses the calibrated LightNav profile:
 
 ```bash
 PYTHONPATH=python python -m rpu_backend.quant.convert_qwen3_vl \
@@ -125,9 +131,10 @@ PYTHONPATH=python python -m rpu_backend.quant.convert_qwen3_vl \
   --dst /path/to/LightNav-0-text-vision-w8a16
 ```
 
-This profile quantizes Vision per channel during installation. It substantially
-reduces ViT latency, but changed tokens on the customer sequence and must not
-replace the default Vision FP16 profile without navigation-accuracy evaluation.
+This profile quantizes Vision per channel during installation and applies the
+LightNav calibration above. It matched all 175 tokens on the customer sequence;
+Vision FP16 remains the conservative fallback until broader navigation-accuracy
+evaluation is complete.
 
 Five fixed output tokens are still autoregressive: tokens two through five each
 depend on the previous token. The delivered path uses one shared checked-replay

@@ -50,6 +50,25 @@ def _unswizzle(weight, col):
     return weight.view(n // 16, k // 256, 8, 16, 32).permute(0, 3, 2, 1, 4).reshape(n, k)
 
 
+def test_lightnav_encoder_range_calibration_keeps_symmetric_w8():
+    weight = torch.tensor([
+        [-2.0, -0.7, 0.4, 1.8],
+        [-0.6, -0.1, 0.3, 0.5],
+    ], dtype=torch.float16)
+    _, base_scale = vision._quantize_vision_w8_weight(weight)
+    quantized, scale = vision._quantize_vision_w8_weight(
+        weight, range_scale=1.04)
+    assert torch.equal(scale, (base_scale.float() * 1.04).half())
+    assert torch.equal(
+        quantized,
+        torch.round(weight.float() / scale.float()[:, None])
+        .clamp(-127, 127).to(torch.int8),
+    )
+    for value in (1, True, 1.03):
+        with pytest.raises(ValueError, match="range_scale"):
+            vision._quantize_vision_w8_weight(weight, range_scale=value)
+
+
 def test_real_w8_padding_quantization_swizzle_and_bank_preserve_logical_math(transfers):
     block = _block()
     raw = (*block.attn.qkv.weight.detach().chunk(3), block.attn.proj.weight.detach(),

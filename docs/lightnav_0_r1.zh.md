@@ -53,9 +53,14 @@ tubelet 级缓存消除了滑窗改变后重复的整段 pooling，Vision 减少
 上传 5 个 token 合计约 1.1 ms，而 decoder 模型本身约 113.3 ms，新增一套生成器
 无法解决主要耗时。
 
-另外两项只保留实验结果：当前画面使用 `pool_spatial=2` 虽把 Total 降到
-277.802 ms，但 35 帧仅 1 帧输出一致；Vision W8A16 把 Total 降到 247.730 ms，
-但仅 29/35 帧一致、175 个 token 中 11 个变化。两者都没有进入默认交付路径。
+当前画面使用 `pool_spatial=2` 虽把 Total 降到 277.802 ms，但 35 帧仅 1 帧输出
+一致，因此未采用。原始 Vision W8A16 把 Total 降到 247.730 ms，但只有 29/35 帧、
+164/175 token 一致。校准后 encoder 的量化范围为标准范围的 1.04 倍，patch/merger
+保持标准范围；35/35 帧、175/175 token 与 Vision FP16 一致，Vision 为 26.879 ms，
+Total 为 248.388 ms，帧间总耗时为 252.037 ms。相对 Vision FP16，Vision 降低
+57.6%，Total 降低 12.7%。该结果证明客户数据上的逐 token
+一致性；独立冷重载复跑仍为 35/35 帧、175/175 token。它不替代更大规模真实导航
+成功率评测。
 完整数据见 `benchmark_results/lightnav_9_history_20261112/summary.json`。
 
 ## 运行
@@ -98,7 +103,7 @@ PYTHONPATH=python python -m rpu_backend.quant.convert_qwen3_vl \
 本次权重文件由 9.70 GB 降到 6.06 GB，减少 37.5%。没有达到一半，是因为 Vision、
 动作输出头及其他非 Linear 权重仍保留 FP16。
 
-Vision W8A16 仅用于受控评估：
+Vision W8A16 使用 LightNav 专用校准配置：
 
 ```bash
 PYTHONPATH=python python -m rpu_backend.quant.convert_qwen3_vl \
@@ -107,8 +112,9 @@ PYTHONPATH=python python -m rpu_backend.quant.convert_qwen3_vl \
   --dst /path/to/LightNav-0-text-vision-w8a16
 ```
 
-该配置在安装时按通道量化 Vision。它显著降低 ViT 耗时，但本次客户数据已经出现
-token 变化，未经过导航成功率验证，不应替代默认的 Vision FP16 配置。
+该配置在安装时按通道量化 Vision，并自动使用上述 LightNav 专用校准范围。客户
+35 帧数据已达到 175/175 token 一致；在完成更大规模导航成功率验证前，Vision FP16
+仍是保守回退配置。
 
 固定输出 5 token 不等于 5 个 token 能并行计算：第 2～5 个 token 分别依赖前一个
 token。交付使用一个共享的 checked-replay decode Graph，每步只重绑对应位置的

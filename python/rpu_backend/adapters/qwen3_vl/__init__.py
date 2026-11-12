@@ -2260,6 +2260,8 @@ class Qwen3VLAdapter:
                 _allow_padded_8b=is_padded_8b and not runtime_quant_large,
                 **({"_allow_runtime_quantized_large": True} if runtime_quant_large else {}),
                 **({"w8a16": True} if quantized_vision else {}),
+                **({"_encoder_w8_range_scale": 1.04}
+                   if quantized_vision and is_lightnav else {}),
                 **({"_pack_fp16_block_weights": True}
                    if use_fp16_vision_weight_banks or use_8b_fp16_weight_banks or is_graph_blocked_32b_w8a16 else {}),
                 **({"num_cores": 4} if topology is not None else {}),

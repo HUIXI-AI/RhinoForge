@@ -32,7 +32,7 @@ def test_per_channel_quantization_metadata_and_values() -> None:
     assert quantized.dtype == torch.int8
     assert scale.dtype == torch.float16
     assert tuple(scale.shape) == (2,)
-    assert int(quantized.min()) >= -128
+    assert int(quantized.min()) >= -127
     assert int(quantized.max()) <= 127
     assert torch.nn.functional.cosine_similarity(
         restored.float(), weight, dim=1

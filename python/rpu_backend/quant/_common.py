@@ -23,7 +23,7 @@ def quantize_linear_per_channel(
         raise ValueError(f"expected bits to be 4 or 8, got {bits}")
 
     qmax = (1 << (bits - 1)) - 1
-    qmin = -(1 << (bits - 1))
+    qmin = -qmax
 
     w_fp16 = weight.detach().to(torch.float16)
     amax = w_fp16.to(torch.float32).abs().amax(dim=1)

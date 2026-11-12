@@ -460,11 +460,20 @@ def build_vision_rope_tables(
 _VISION_CONVERSION_IN_PROGRESS = "qwen3vl-vision-conversion-in-progress"
 
 
-def _quantize_vision_w8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _quantize_vision_w8_weight(
+    weight: torch.Tensor, *, range_scale: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Cold Vision-only quantization boundary; eager arithmetic does not scan scales."""
     from rpu_backend.quant._common import quantize_linear_per_channel
 
+    if type(range_scale) is not float or range_scale not in (1.0, 1.04):
+        raise ValueError("Qwen3-VL Vision W8 range_scale must be 1.0 or 1.04")
     quantized, scale = quantize_linear_per_channel(weight)
+    if range_scale != 1.0:
+        scale = (scale.float() * range_scale).half()
+        quantized = torch.round(
+            weight.detach().float() / scale.float().unsqueeze(1)
+        ).clamp_(-127, 127).to(torch.int8)
     if not bool(torch.isfinite(scale).all()) or not bool((scale > 0).all()):
         raise ValueError("Qwen3-VL Vision W8 quantization requires finite positive scales")
     return quantized, scale
@@ -488,6 +497,7 @@ def _convert_vision_block_weights_for_rpu(
     num_cores: int = 8,
     physical_head_dim: int | None = None,
     physical_intermediate_size: int | None = None,
+    w8_range_scale: float = 1.0,
 ) -> None:
     """In-place swizzle of a single Qwen3VLVisionBlock's weights.
 
@@ -601,7 +611,8 @@ def _convert_vision_block_weights_for_rpu(
 
     def _swz(w_unswz, swz_fn):       # -> (weight [int8 dwidth=1 if w8a16 else fp16], fp16 scale or None)
         if w8a16:
-            wq, ws = _quantize_vision_w8_weight(w_unswz.half())
+            wq, ws = _quantize_vision_w8_weight(
+                w_unswz.half(), range_scale=w8_range_scale)
             return swz_fn(wq, num_cores, dwidth=1).contiguous(), ws.to(torch.float16)
         # The public installer accepts a CPU model and owns the dtype conversion.
         # LingBot-VLA-V2 checkpoints are fp32, while the default swizzler's
@@ -1389,6 +1400,7 @@ def install_qwen3_vl_vision_for_rpu(
     _pack_fp16_block_weights: bool = False,
     _graph_cache_max_entries: int | None = None,
     graph_runtime_policy=None,
+    _encoder_w8_range_scale: float = 1.0,
 ) -> int:
     """Install or replace the Qwen3-VL vision runtime transactionally.
 
@@ -1423,6 +1435,11 @@ def install_qwen3_vl_vision_for_rpu(
             "install_qwen3_vl_vision_for_rpu: w8a16 must be a bool, "
             f"got {type(w8a16).__name__}."
         )
+    if (type(_encoder_w8_range_scale) is not float
+            or _encoder_w8_range_scale not in (1.0, 1.04)
+            or (_encoder_w8_range_scale != 1.0 and not w8a16)):
+        raise ValueError(
+            "_encoder_w8_range_scale must be 1.0, or 1.04 with w8a16=True")
     if execution_chunk_size != "auto" and (
         isinstance(execution_chunk_size, bool)
         or not isinstance(execution_chunk_size, int)
@@ -1566,6 +1583,7 @@ def install_qwen3_vl_vision_for_rpu(
             _pack_fp16_block_weights=_pack_fp16_block_weights,
             _graph_cache_max_entries=_graph_cache_max_entries,
             graph_runtime_policy=graph_runtime_policy,
+            _encoder_w8_range_scale=_encoder_w8_range_scale,
             _install_state=install_state,
         )
     except BaseException as error:
@@ -1628,6 +1646,7 @@ def _install_qwen3_vl_vision_for_rpu_impl(
     _pack_fp16_block_weights: bool = False,
     _graph_cache_max_entries: int | None = None,
     graph_runtime_policy=None,
+    _encoder_w8_range_scale: float = 1.0,
     _install_state: dict[str, Any],
 ) -> int:
     """Install device all-layers-once forward on a `Qwen3VLVisionModel` instance.
@@ -1687,6 +1706,7 @@ def _install_qwen3_vl_vision_for_rpu_impl(
             w8a16=w8a16,
             physical_head_dim=physical_head_dim,
             physical_intermediate_size=physical_intermediate_size,
+            w8_range_scale=_encoder_w8_range_scale,
             **({"num_cores": num_cores} if num_cores != 8 else {}),
         )
 

@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=71"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "my-rhino-plugin"
+version = "0.1.0"
+description = "Example out-of-tree model adapter plugin for RhinoForge"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "rhinoforge>=1.2,<2",
+]
+
+# RhinoForge discovers this hook on unknown-architecture lookup or discover_plugins().
+[project.entry-points."rpu_backend.plugins"]
+my_rhino_plugin = "my_rhino_plugin:register"

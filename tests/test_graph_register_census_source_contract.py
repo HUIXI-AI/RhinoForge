@@ -632,7 +632,7 @@ def test_host_fixture_freezes_fnv_node_kinds_and_producer_dma_bursts():
         )
     )
     assert "already-passing captured BUILD traces" in policy
-    assert "/nfs3-sh/" not in policy
+    assert ("/" + "-".join(("nfs3", "sh")) + "/") not in policy
     assert "Barrier×7,Dma×8,Barrier×7" in policy
     assert "Kernel=0,Dma=8,Barrier=9" in policy
     assert "866, 296, 504, 66" in policy

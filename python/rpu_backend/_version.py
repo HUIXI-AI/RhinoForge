@@ -22,12 +22,14 @@ def _resolve_distribution_version() -> str:
     source_version = _source_distribution_version()
     if source_version is not None:
         return source_version
-    try:
-        return _metadata.version("rhinoforge")
-    except _metadata.PackageNotFoundError:
-        # An unpacked package without its project metadata is not a release
-        # artifact. Keep imports usable while making the missing metadata loud.
-        return "0+unknown"
+    for dist_name in ("rhinoforge", "rpu_backend"):
+        try:
+            return _metadata.version(dist_name)
+        except _metadata.PackageNotFoundError:
+            continue
+    # An unpacked package without its project metadata is not a release
+    # artifact. Keep imports usable while making the missing metadata loud.
+    return "0+unknown"
 
 
 DISTRIBUTION_VERSION = _resolve_distribution_version()

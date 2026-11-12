@@ -12,6 +12,7 @@ def test_default_install_includes_model_loading_dependency():
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
     assert project["name"] == "rhinoforge"
     assert any(dependency.startswith("accelerate") for dependency in project["dependencies"])
+    assert project["entry-points"]["rpu_backend.plugins"] == {}
 
 
 def test_kernel_manifest_uses_host_symbols_without_reading_asset_format(tmp_path):

@@ -37,6 +37,13 @@ def set_launch(source, **fields):
     path.write_text(json.dumps(dependencies))
 
 
+def set_dependencies(source, **fields):
+    path = source / "release/runtime-dependencies.json"
+    dependencies = json.loads(path.read_text())
+    dependencies.update(fields)
+    path.write_text(json.dumps(dependencies))
+
+
 @pytest.mark.parametrize("version,branch,tag,launch_version", [
     ("1.2.0rc1", "release/1.2", "v1.2.0rc1", "1.2.0rc1"),
     ("1.2.0", "release/1.2", "v1.2.0", "1.2.0"),
@@ -52,15 +59,20 @@ def test_supported_versions_match_cmake(source, version, branch, tag, launch_ver
     result = version_check.check(source, branch=branch, tag=tag)
     driver = source / "check.cmake"
     driver.write_text('include("${CMAKE_CURRENT_LIST_DIR}/release/version.cmake")\n'
+                      'rhinoforge_generate_runtime_identity("${CMAKE_CURRENT_LIST_DIR}/generated")\n'
                       'file(WRITE "${CMAKE_CURRENT_LIST_DIR}/result.txt" '
                       '"${RHINOFORGE_VERSION}|${RHINOFORGE_CMAKE_VERSION}|${RHINOFORGE_VERSION_STAGE}|'
+                      '${RHINOFORGE_OP_ABI_EPOCH}|'
                       '${RHINOFORGE_LAUNCH_RELEASE_VERSION}|${RHINOFORGE_LAUNCH_CMAKE_VERSION}")\n')
     subprocess.run(["cmake", "-P", str(driver)], check=True)
     stage = result["stage"] if result["stage"] != "stable" else ""
     assert (source / "result.txt").read_text() == (
         f'{version}|{result["cmake_version"]}|{stage}|'
+        f'{result["op_abi_epoch"]}|'
         f'{result["launch_release_version"]}|{result["launch_cmake_version"]}'
     )
+    generated = (source / "generated/rhino_runtime_identity.h").read_text()
+    assert f'inline constexpr int kRhinoOpAbiEpoch = {result["op_abi_epoch"]};' in generated
 
 
 @pytest.mark.parametrize("version,branch,tag", [
@@ -107,6 +119,33 @@ def test_rejects_invalid_launch_abi_or_unpinned_source(source, field, value, err
         version_check.check(source)
 
 
+def test_accepts_valid_op_abi_epoch_in_python_and_cmake(source):
+    set_dependencies(source, op_abi_epoch=2)
+    result = version_check.check(source)
+    assert result["op_abi_epoch"] == 2
+    driver = source / "check_epoch.cmake"
+    driver.write_text(
+        'include("${CMAKE_CURRENT_LIST_DIR}/release/version.cmake")\n'
+        'rhinoforge_generate_runtime_identity("${CMAKE_CURRENT_LIST_DIR}/generated")\n'
+        'file(WRITE "${CMAKE_CURRENT_LIST_DIR}/epoch.txt" "${RHINOFORGE_OP_ABI_EPOCH}")\n'
+    )
+    subprocess.run(["cmake", "-P", str(driver)], check=True)
+    assert (source / "epoch.txt").read_text() == "2"
+    generated = (source / "generated/rhino_runtime_identity.h").read_text()
+    assert "inline constexpr int kRhinoOpAbiEpoch = 2;" in generated
+
+
+@pytest.mark.parametrize("bad_epoch", [0, "1", True])
+def test_rejects_invalid_op_abi_epoch(source, bad_epoch):
+    set_dependencies(source, op_abi_epoch=bad_epoch)
+    with pytest.raises(ValueError, match="positive integer"):
+        version_check.check(source)
+    failed = subprocess.run(["cmake", "-P", str(source / "release/version.cmake")],
+                            capture_output=True, text=True)
+    assert failed.returncode != 0
+    assert "positive integer" in " ".join(failed.stderr.split())
+
+
 def test_existing_build_reconfigures_after_version_or_lock_changes(source):
     set_version(source, "1.2.0rc1")
     (source / "CMakeLists.txt").write_text(
@@ -124,7 +163,12 @@ def test_existing_build_reconfigures_after_version_or_lock_changes(source):
     assert failed.returncode != 0
 
 
-def test_source_and_installed_package_resolve_their_own_version(tmp_path):
+@pytest.mark.parametrize("dist_name,expected_version", [
+    ("rhinoforge", "1.2.0rc1"),
+    ("rpu_backend", "1.2.0rc2"),
+    (None, "0+unknown"),
+])
+def test_source_and_installed_package_resolve_their_own_version(tmp_path, dist_name, expected_version):
     source_version = subprocess.check_output(
         [sys.executable, "-c", "import runpy; print(runpy.run_path('python/rpu_backend/_version.py')['DISTRIBUTION_VERSION'])"],
         cwd=ROOT, text=True).strip()
@@ -132,13 +176,16 @@ def test_source_and_installed_package_resolve_their_own_version(tmp_path):
     package = tmp_path / "site-packages/rpu_backend"
     package.mkdir(parents=True)
     shutil.copyfile(ROOT / "python/rpu_backend/_version.py", package / "_version.py")
-    metadata = package.parent / "rhinoforge-1.2.0rc1.dist-info"
-    metadata.mkdir()
-    (metadata / "METADATA").write_text("Metadata-Version: 2.1\nName: rhinoforge\nVersion: 1.2.0rc1\n")
+    if dist_name is not None:
+        metadata = package.parent / f"{dist_name}-{expected_version}.dist-info"
+        metadata.mkdir()
+        (metadata / "METADATA").write_text(
+            f"Metadata-Version: 2.1\nName: {dist_name}\nVersion: {expected_version}\n"
+        )
     installed_version = subprocess.check_output([
         sys.executable, "-I", "-c",
         "import runpy, sys; sys.path.insert(0, sys.argv[1]); "
         "print(runpy.run_path(sys.argv[2])['DISTRIBUTION_VERSION'])",
         str(package.parent), str(package / "_version.py"),
     ], text=True).strip()
-    assert installed_version == "1.2.0rc1"
+    assert installed_version == expected_version

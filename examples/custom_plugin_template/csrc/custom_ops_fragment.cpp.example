@@ -1,0 +1,26 @@
+// Out-of-tree C++ operator extension example for RhinoForge.
+// Loaded at runtime via `torch.ops.load_library(".../libmy_rhino_custom_ops.so")`.
+
+#include <ATen/Operators.h>
+#include <ATen/Tensor.h>
+#include <torch/library.h>
+
+namespace my_rhino_plugin {
+
+at::Tensor custom_scale_bias(const at::Tensor& input, double scale, double bias) {
+    return input.mul(scale).add(bias);
+}
+
+}  // namespace my_rhino_plugin
+
+TORCH_LIBRARY_FRAGMENT(rpu, m) {
+    m.def("custom_scale_bias(Tensor input, float scale=1.0, float bias=0.0) -> Tensor");
+}
+
+TORCH_LIBRARY_IMPL(rpu, CPU, m) {
+    m.impl("custom_scale_bias", TORCH_FN(my_rhino_plugin::custom_scale_bias));
+}
+
+TORCH_LIBRARY_IMPL(rpu, PrivateUse1, m) {
+    m.impl("custom_scale_bias", TORCH_FN(my_rhino_plugin::custom_scale_bias));
+}

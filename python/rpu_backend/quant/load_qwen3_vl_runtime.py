@@ -47,7 +47,9 @@ def is_qwen3_vl_runtime_quant_config(config) -> bool:
         if bits is None or (h == 2560 and bits == 8 and not lightnav):
             return False
         expected = (
-            lightnav_w8_quant_config() if lightnav else
+            lightnav_w8_quant_config(
+                vision=qc.get("vision_quantization") != "fp16",
+            ) if lightnav else
             runtime_quant_config(
                 h, bits, source_quantization=qc.get("source_quantization"),
             )

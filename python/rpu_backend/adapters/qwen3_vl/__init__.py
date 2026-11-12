@@ -129,6 +129,7 @@ _LIGHTNAV_ACTION_TOKEN_END = 156042
 _LIGHTNAV_EOS_TOKEN_ID = 151645
 _LIGHTNAV_STOP_TOKEN_ID = 151674
 _LIGHTNAV_CONSTRAINED_HEAD_ENV = "RPU_LIGHTNAV_CONSTRAINED_HEAD"
+_LIGHTNAV_POSITION_HEAD_ROWS = 1408
 _QWEN3_VL_8B_TEXT_SEMANTICS = (
     "qwen3_vl_text", "silu", 1e-6, 151936, False, True,
     "default", 5_000_000.0, True, (24, 20, 20), False,
@@ -450,8 +451,19 @@ def _lightnav_candidate_token_ids() -> tuple[int, ...]:
     )
 
 
+def _lightnav_position_token_ids() -> tuple[tuple[int, ...], ...]:
+    common = (_LIGHTNAV_EOS_TOKEN_ID, _LIGHTNAV_STOP_TOKEN_ID)
+    return (
+        (*common, *range(152443, 153743)),
+        (*common, *range(153743, 155040)),
+        (*common, *range(151675, 151931)),
+        (*common, *range(151931, 152187)),
+        (*common, *range(152187, 152443)),
+    )
+
+
 def set_lightnav_constrained_lm_head(model, enabled: bool = True):
-    """Select the exact checkpoint action-token allowlist head."""
+    """Select the five position-specific LightNav grammar heads."""
     if not _is_lightnav_profile(model.config):
         raise UnsupportedModelError(
             "constrained lm_head requires the exact LightNav-0 profile"
@@ -459,7 +471,8 @@ def set_lightnav_constrained_lm_head(model, enabled: bool = True):
     state = vars(model)
     token_ids = state.get("_rpu_lightnav_candidate_token_ids")
     weight = state.get("_rpu_lightnav_candidate_lm_head_w")
-    if token_ids is None or weight is None:
+    heads = state.get("_rpu_lightnav_position_lm_heads")
+    if token_ids is None or weight is None or heads is None:
         raise RuntimeError("LightNav constrained lm_head is not installed")
     enabled = bool(enabled)
     if state.get("_rpu_lightnav_constrained_head_enabled", False) == enabled:
@@ -476,7 +489,16 @@ def set_lightnav_constrained_lm_head(model, enabled: bool = True):
         torch.ops.rpu.causal_decoder_set_lm_head(
             text._rpu_decoder_handle, weight,
         )
+        torch.ops.rpu.causal_decoder_set_lightnav_heads(
+            text._rpu_decoder_handle, heads,
+        )
+        torch.ops.rpu.causal_decoder_set_lightnav_head_index(
+            text._rpu_decoder_handle, 0,
+        )
     else:
+        torch.ops.rpu.causal_decoder_clear_lightnav_heads(
+            text._rpu_decoder_handle,
+        )
         torch.ops.rpu.causal_decoder_clear_lm_head(
             text._rpu_decoder_handle,
         )
@@ -992,6 +1014,21 @@ def _apply_prefill_lm_head(model, hidden, slice_indices):
     )
     if candidate_weight is not None:
         text = model.model.language_model
+        position_weights = [candidate_weight, *getattr(
+            model, "_rpu_lightnav_position_lm_heads", (),
+        )]
+        if head_input.shape[1] == len(position_weights):
+            return torch.cat([
+                torch.ops.rpu.linear_with_accumulation(
+                    head_input[:, index:index + 1].contiguous(), weight,
+                    None, 1, 8,
+                    getattr(text, "_rpu_execution", {}).get(
+                        "prefill", {}
+                    ).get("linear_acc32", False),
+                    None,
+                )
+                for index, weight in enumerate(position_weights)
+            ], dim=1)
         return torch.ops.rpu.linear_with_accumulation(
             head_input.contiguous(), candidate_weight, None, 1, 8,
             getattr(text, "_rpu_execution", {}).get(
@@ -1262,6 +1299,8 @@ def uninstall_qwen3_vl_runtime(
     model_state.pop("_rpu_lm_head_raw_fp16_cpu", None)
     model_state.pop("_rpu_lightnav_candidate_lm_head_w", None)
     model_state.pop("_rpu_lightnav_candidate_token_ids", None)
+    model_state.pop("_rpu_lightnav_position_lm_heads", None)
+    model_state.pop("_rpu_lightnav_position_token_ids", None)
     model_state.pop("_rpu_lightnav_constrained_head_enabled", None)
     model_state.pop("_rpu_last_decode_hidden", None)
     model_state.pop("_rpu_visual_cached_prefix", None)
@@ -2124,25 +2163,28 @@ class Qwen3VLAdapter:
             )
             lightnav_candidate_ids = None
             lightnav_candidate_weight = None
+            lightnav_position_ids = None
+            lightnav_position_weights = None
             if is_lightnav and rpu_env_bool(_LIGHTNAV_CONSTRAINED_HEAD_ENV):
-                lightnav_candidate_ids = torch.tensor(
-                    _lightnav_candidate_token_ids(), dtype=torch.long,
+                lightnav_position_ids = tuple(
+                    torch.tensor(ids, dtype=torch.long)
+                    for ids in _lightnav_position_token_ids()
                 )
-                candidate_rows = lm_head_cpu.index_select(
-                    0, lightnav_candidate_ids,
-                ).contiguous()
-                # Column-parallel Linear needs N%128; callers hide these zero rows.
-                padding = (-candidate_rows.shape[0]) % 128
-                if padding:
+                lightnav_position_weights = []
+                for ids in lightnav_position_ids:
+                    candidate_rows = lm_head_cpu.index_select(0, ids).contiguous()
                     candidate_rows = torch.cat((
                         candidate_rows,
                         candidate_rows.new_zeros(
-                            padding, candidate_rows.shape[1],
+                            _LIGHTNAV_POSITION_HEAD_ROWS - candidate_rows.shape[0],
+                            candidate_rows.shape[1],
                         ),
                     ))
-                lightnav_candidate_weight = transform_linear_weight(
-                    candidate_rows, partition=1,
-                )
+                    lightnav_position_weights.append(transform_linear_weight(
+                        candidate_rows, partition=1,
+                    ))
+                lightnav_candidate_ids = lightnav_position_ids[0]
+                lightnav_candidate_weight = lightnav_position_weights[0]
                 del candidate_rows
             lm_head_w4_packed = None
             lm_head_w4_scale = None
@@ -2191,12 +2233,18 @@ class Qwen3VLAdapter:
                 self.model._rpu_lightnav_candidate_token_ids = (
                     lightnav_candidate_ids
                 )
+                self.model._rpu_lightnav_position_token_ids = lightnav_position_ids
+                self.model._rpu_lightnav_position_lm_heads = [
+                    weight.to("rpu").contiguous()
+                    for weight in lightnav_position_weights[1:]
+                ]
                 self.model._rpu_lightnav_constrained_head_enabled = False
             # These locals still own the old CPU storages after Module.to()
             # replaces its Parameter data. Keep only explicitly requested raw
             # candidate weights; release ordinary lm-head staging before the
             # vision tower and decoder handle allocate their own resources.
             del lm_head_w, lm_head_cpu, swizzled, lightnav_candidate_weight
+            del lightnav_position_weights
             gc.collect()
 
             # ---------- Step D: install vision encoder -----------------------

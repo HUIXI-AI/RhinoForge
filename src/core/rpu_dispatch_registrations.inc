@@ -239,6 +239,9 @@ TORCH_LIBRARY(rpu, m) {
         "Tensor? lm_head_scale=None, bool fuse_prefill_last=False, "
         "int exact_candidates=0) -> ()");
   m.def("causal_decoder_set_tts_predictor_heads(int handle, Tensor[] heads) -> ()");
+  m.def("causal_decoder_set_lightnav_heads(int handle, Tensor[] heads) -> ()");
+  m.def("causal_decoder_set_lightnav_head_index", TORCH_FN(rpu_causal_decoder_set_lightnav_head_index));
+  m.def("causal_decoder_clear_lightnav_heads", TORCH_FN(rpu_causal_decoder_clear_lightnav_heads));
   m.def("causal_decoder_tts_predictor_logits", TORCH_FN(rpu_causal_decoder_tts_predictor_logits));
   m.def("causal_decoder_clear_lm_head", TORCH_FN(rpu_causal_decoder_clear_lm_head));
   m.def("causal_decoder_set_fast_replay(int handle, bool enabled) -> ()",
@@ -1713,6 +1716,7 @@ TORCH_LIBRARY_IMPL(rpu, PrivateUse1, m) {
   m.impl("qwen3vl_pooler_spm_z1_pipeline_forward", TORCH_FN(rpu_qwen3vl_pooler_spm_z1_pipeline_forward));
   m.impl("causal_decoder_set_lm_head", TORCH_FN(rpu_causal_decoder_set_lm_head));
   m.impl("causal_decoder_set_tts_predictor_heads", TORCH_FN(rpu_causal_decoder_set_tts_predictor_heads));
+  m.impl("causal_decoder_set_lightnav_heads", TORCH_FN(rpu_causal_decoder_set_lightnav_heads));
   m.impl("lm_head_logits_top1", TORCH_FN(rpu_lm_head_logits_top1));
   m.impl("argmax_lastdim_host", TORCH_FN(rpu_argmax_lastdim_host));
   m.impl("gemma_set_weights", TORCH_FN(rpu_gemma_set_weights));
@@ -1952,6 +1956,7 @@ TORCH_LIBRARY_IMPL(rpu, AutogradPrivateUse1, m) {
   m.impl("qwen3vl_pooler_spm_z1_pipeline_forward", torch::CppFunction::makeFallthrough());
   m.impl("causal_decoder_set_lm_head", torch::CppFunction::makeFallthrough());
   m.impl("causal_decoder_set_tts_predictor_heads", torch::CppFunction::makeFallthrough());
+  m.impl("causal_decoder_set_lightnav_heads", torch::CppFunction::makeFallthrough());
   m.impl("lm_head_logits_top1", torch::CppFunction::makeFallthrough());
   m.impl("argmax_lastdim_host", torch::CppFunction::makeFallthrough());
   m.impl("gemma_set_weights", torch::CppFunction::makeFallthrough());

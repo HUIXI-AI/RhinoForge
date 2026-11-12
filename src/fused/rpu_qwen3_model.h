@@ -3107,6 +3107,37 @@ public:
         invalidate_model_state();
     }
 
+    void set_lightnav_heads(at::TensorList heads) {
+        TORCH_CHECK((qwen3vl_fp16_decode_profile_ || qwen3vl_4b_w8_profile_) &&
+                        num_layers() == 36 && hidden_size() == 2560 &&
+                        intermediate_size() == 9728 && num_q_heads() == 32 &&
+                        num_kv_heads() == 8 && head_dim() == 128 && has_mrope_ &&
+                        fuse_lm_head_ && vocab_size_ == 1408 &&
+                        lm_head_w_.scalar_type() == at::kHalf &&
+                        lightnav_heads_.empty() && heads.size() == 4,
+                    "LightNav head bank requires four FP16 grammar heads");
+        for (const auto& head : heads)
+            TORCH_CHECK(head.defined() && head.device().type() == at::kPrivateUse1 &&
+                            head.scalar_type() == at::kHalf && head.is_contiguous() &&
+                            head.sizes().equals({1408, 2560}),
+                        "LightNav grammar heads must be device FP16 [1408,2560]");
+        lightnav_heads_.assign(heads.begin(), heads.end());
+        lightnav_head_index_ = 0;
+        invalidate_model_state();
+    }
+
+    void set_lightnav_head_index(int64_t index) {
+        TORCH_CHECK(lightnav_heads_.size() == 4 && index >= 0 && index < 5,
+                    "LightNav grammar head index must be in [0,4]");
+        lightnav_head_index_ = index;
+    }
+
+    void clear_lightnav_heads() {
+        lightnav_heads_.clear();
+        lightnav_head_index_ = 0;
+        invalidate_model_state();
+    }
+
     at::Tensor tts_predictor_logits() const {
         TORCH_CHECK(!tts_predictor_heads_.empty() && lm_head_logits_out_.defined(),
                     "TTS fused Predictor has no logits; run its decoder first");
@@ -4150,6 +4181,7 @@ protected:
             0, deepstack_lang_layers_.empty() ? 0 : 1);
         h = detail::layout_mix(h, wall_prefill_staged_mlp_ ? 1 : 0);
         if (!tts_predictor_heads_.empty()) h = detail::layout_mix(h, 0x54545348);
+        if (!lightnav_heads_.empty()) h = detail::layout_mix(h, 0x4c4e4844);
         if (wall_base_paired_kv_) {
             h = detail::layout_mix(h, CAUSAL_DECODER_WALL_BASE_PAIRED_KV_SITE);
         }
@@ -9382,7 +9414,9 @@ protected:
                      (emit_prefill_last_lm_head ? rows - 1 : 0)) * h * DWIDTH);
             rpu_launch_linear_spm_to_spm_acc16_kernel(
                 lm_head_input_addr,        // final normed row(s), in SPM
-                tts_head ? tts_predictor_heads_.at(tts_predictor_head_index_) : lm_head_w_,
+                tts_head ? tts_predictor_heads_.at(tts_predictor_head_index_) :
+                    (lightnav_head_index_ == 0 ? lm_head_w_ :
+                     lightnav_heads_.at(lightnav_head_index_ - 1)),
                 addr(0, "lm_head_out"),    // SPM output per core, [rows][local_n]
                 /*M=*/lm_head_rows,
                 /*N=*/vocab_size_,
@@ -10249,6 +10283,11 @@ protected:  // LingBot2 sparse-MoE subclass reuses the decoder's layer state.
             for (const auto& head : tts_predictor_heads_)
                 append_kvinsert_cost_tensor_identity(identity, head);
         }
+        if (!lightnav_heads_.empty()) {
+            identity.insert(identity.end(), {0x4c4e4844, 1, 4});
+            for (const auto& head : lightnav_heads_)
+                append_kvinsert_cost_tensor_identity(identity, head);
+        }
         return identity;
     }
 
@@ -10318,6 +10357,8 @@ protected:  // LingBot2 sparse-MoE subclass reuses the decoder's layer state.
     bool cold_routes_configured_ = false;
     std::vector<at::Tensor> tts_predictor_heads_;
     int64_t tts_predictor_head_index_ = 0;
+    std::vector<at::Tensor> lightnav_heads_;
+    int64_t lightnav_head_index_ = 0;
     at::Tensor lm_head_w_;        // FP16/W8 [V,H] or packed W4 [V,H/2], device
     at::Tensor lm_head_w_scale_;  // W8 [V] or W4 pgrp controller-striped scale
     bool fuse_lm_head_ = false;

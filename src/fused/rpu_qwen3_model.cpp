@@ -2901,6 +2901,18 @@ void rpu_causal_decoder_set_tts_predictor_heads(int64_t handle, at::TensorList h
     CausalDecoderRegistry::get(handle, "rpu_causal_decoder")->set_tts_predictor_heads(heads);
 }
 
+void rpu_causal_decoder_set_lightnav_heads(int64_t handle, at::TensorList heads) {
+    CausalDecoderRegistry::get(handle, "rpu_causal_decoder")->set_lightnav_heads(heads);
+}
+
+void rpu_causal_decoder_set_lightnav_head_index(int64_t handle, int64_t index) {
+    CausalDecoderRegistry::get(handle, "rpu_causal_decoder")->set_lightnav_head_index(index);
+}
+
+void rpu_causal_decoder_clear_lightnav_heads(int64_t handle) {
+    CausalDecoderRegistry::get(handle, "rpu_causal_decoder")->clear_lightnav_heads();
+}
+
 at::Tensor rpu_causal_decoder_tts_predictor_logits(int64_t handle) {
     return CausalDecoderRegistry::get(handle, "rpu_causal_decoder")->tts_predictor_logits();
 }

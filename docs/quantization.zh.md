@@ -55,6 +55,8 @@ Verifier 检查 method、INT8/scale tensor 配对和代表性 dequantized weight
 2B/4B/8B 和精确 LightNav-0 配置的离线转换入口为
 `python -m rpu_backend.quant.convert_qwen3_vl`。LightNav-0 的 `--bits 8` 只量化
 Text7 投影，动作输出头和 Vision 保持 FP16；其他公开模型按原有 W8A16 配方转换。
+实验参数 `--lightnav-vision-w8` 会同时按通道量化 Vision；它会改变模型输出，只有
+完成真实导航准确率验证后才能用于部署。
 使用 `awq_w4.toml` 时，
 `--bits 4` 的输入应为 symmetric G32 compressed-tensors AWQ：保留 Text AWQ，
 LM head 转为 RTN W4，Vision 为 W8。转换器也接受精确匹配的公开 2B/4B/8B FP16

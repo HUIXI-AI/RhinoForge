@@ -7,19 +7,20 @@ Hugging Face revision `826dc5fbfa37afa8293d2e336d329b6ffc0bfb64` and upstream
 LightNav commit `3015508b70fb6e30bbd66701e94c9b916dcb8df8`. Every request
 produces exactly five tokens: two pointing tokens and three RVQ action tokens.
 
-RhinoForge reuses its Qwen3-VL 4B text, vision, and DeepStack paths. The full
-156048-row vocabulary cannot use the fused column-partitioned head, whose output
-dimension must be 128-aligned. With the constrained head enabled, its 4,369
-candidates are padded to 4,480 rows and fused into the device decode Graph.
-Admission remains restricted to the exact LightNav profile.
+RhinoForge reuses its Qwen3-VL 4B text, vision, and DeepStack paths. With the
+constrained head enabled, the five fixed output positions retain only the
+corresponding `apos/opos/L0/L1/L2` candidates plus EOS/STOP. Each physical head
+is padded to 1,408 rows. Prefill uses the first head, and the four decode calls
+rebind the following head addresses in one checked-replay Graph. Admission
+remains restricted to the exact LightNav profile.
 
 The vision cache uses upstream two-frame tubelet keys and defaults to 1,024
 entries, following the upstream Thor long-session recommendation. Each miss runs the ViT
 once and stores its pooler output plus three DeepStack levels on CPU. Post-ViT
-spatial pooling keeps the unpooled values and also caches an exact segment result
-by tubelet sequence and SlowFast factor. A changed sequence or factor therefore
-recomputes pooling. Sliding windows use a full feature scatter because token
-positions move between requests.
+spatial pooling keeps the unpooled values and caches each tubelet by SlowFast
+factor. New historical-factor results are computed on a CPU worker while the
+current request runs prefill/decode, so the next sliding window can reassemble
+them without recomputing the whole segment.
 
 A real eight-history-plus-current sliding caller can pass
 `prefetch_latest=True` to `_run_request`. The current ViT batch also computes
@@ -36,15 +37,34 @@ device metadata rejects fast replay. Growing windows should clear old text
 Graphs through the first full eight-frame window, then reuse only the fixed
 shape so multiple prefill shapes do not exhaust the Graph arena.
 
-On R1 v1.2.0 with Text W8A16 and the customer sequence, the steady section
-after frame 8 measured as follows. The fixed-address 35-frame replay matched a
-same-prefetch rebuild baseline token-for-token; alternating two KV addresses
-also matched on frames 9--11.
+## Sequential optimization for nine history frames plus current
 
-| KV addresses | Vision hit/miss | Vision | Prefill | Decode 5 | Total |
-|---|---:|---:|---:|---:|---:|
-| Fixed | 4/1 | 121.06 ms | 89.18 ms | 114.80 ms | 345.37 ms |
-| Alternating two | 4/1 | 122.05 ms | 89.26 ms | 115.84 ms | 348.94 ms |
+The benchmark uses the customer-provided 35-frame sequence, R1 v1.2.0, Text
+W8A16, and no previous-request token draft. Values are medians over the 25
+steady requests from frame index 10. Each request has nine history frames plus
+one current frame, 347 prompt tokens, and a stable 4/1 tubelet cache hit/miss.
+
+| Stage | Prepare | Vision | Prefill | Decode 5 | Total | Frame total |
+|---|---:|---:|---:|---:|---:|---:|
+| Before | 20.879 ms | 87.947 ms | 89.066 ms | 114.759 ms | 313.817 ms | 318.510 ms |
+| Tubelet pooling cache | 17.637 ms | 63.384 ms | 89.119 ms | 114.758 ms | 285.661 ms | 289.438 ms |
+| Plus position grammar heads | 17.448 ms | 63.451 ms | 88.486 ms | 114.396 ms | 284.663 ms | 288.472 ms |
+
+Tubelet-level pooling removes repeated whole-segment work after a window shift,
+reducing Vision by 24.563 ms and end-to-end latency by 28.156 ms. The five
+position heads reduce another roughly 1.0 ms. All 35 frames remain token-exact
+after both changes. Fixed-address replay, rebuild replay, and alternating KV
+addresses were also checked for token equality.
+
+A fixed four-step decode Graph was not added. Tokens two through five depend on
+the previous token, while the current runtime lacks a device-side
+`top1 -> original token ID -> embedding -> next decoder` chain. Host selection
+and upload cost about 1.1 ms total; decoder model execution costs about 113.3 ms.
+
+Two aggressive experiments remain non-default. Current-frame `pool_spatial=2`
+reduced Total to 277.802 ms but matched only 1/35 frames. Vision W8A16 reduced
+Total to 247.730 ms but matched 29/35 frames, with 11/175 tokens changed. See
+`benchmark_results/lightnav_9_history_20261112/summary.json` for the full result.
 
 ## Run
 
@@ -62,18 +82,19 @@ python examples/lightnav_benchmark.py \
 
 Remove `--check-config` on R1. The default uses eight past frames plus one
 current frame, for nine actual input frames; `--history-frames` can still
-override it. Both scenarios run five times and report medians, while
+override it. Pass `--history-frames 9` to reproduce the nine-history-plus-current
+case above. Both scenarios run five times and report medians, while
 every request generates five tokens. Deterministic synthetic 256×448 frames make
 the report a latency and cache comparison rather than a navigation-accuracy test.
 Each tier warms the full-window and current-tubelet Rhino Graphs outside the
 measurement and retains one stable KV-cache address. Its Graphs are released
 before the next tier.
 
-When the application already uses upstream `VLN_EVAL_TRAJ_TOP1`, pass
-`--constrained-head` to install its 4,369-token action-allowlist projection,
-padded to 4,480 rows for column-parallel Linear and fused into single-token
-decode. This opt-in changes the default full-vocabulary decoding domain and
-requires separate navigation-quality evaluation.
+When the application uses the fixed five-position LightNav action grammar, pass
+`--constrained-head` to install five position-specific 1,408-row projections
+and fuse them into single-token decode. This opt-in changes the default
+full-vocabulary decoding domain and requires separate navigation-quality
+evaluation.
 
 ## Thor approach and 8-bit weights
 
@@ -95,12 +116,22 @@ PYTHONPATH=python python -m rpu_backend.quant.convert_qwen3_vl \
 The weight file falls from 9.70 GB to 6.06 GB, a 37.5% reduction. It does not
 halve because Vision, the action head, and other non-Linear weights remain FP16.
 
+Vision W8A16 is available only for controlled evaluation:
+
+```bash
+PYTHONPATH=python python -m rpu_backend.quant.convert_qwen3_vl \
+  --bits 8 --lightnav-vision-w8 \
+  --src /path/to/LightNav-0 \
+  --dst /path/to/LightNav-0-text-vision-w8a16
+```
+
+This profile quantizes Vision per channel during installation. It substantially
+reduces ViT latency, but changed tokens on the customer sequence and must not
+replace the default Vision FP16 profile without navigation-accuracy evaluation.
+
 Five fixed output tokens are still autoregressive: tokens two through five each
-depend on the previous token. On R1 v1.2.0, retaining the second
-position-specific decode Graph already exhausted the Graph arena, so four such
-Graphs cannot stay resident. Clearing and rebuilding for every position would
-add latency. The delivered path therefore keeps one shared checked-replay
-decode Graph and no separate fixed-position option.
+depend on the previous token. The delivered path uses one shared checked-replay
+decode Graph and rebinds the matching 1,408-row head address at each step.
 
 R1 v1.2.0 used eight history frames plus one current frame, deterministic
 256x448 input, the 4,369-token action allowlist, and five measured requests per
@@ -125,9 +156,9 @@ evaluation. Cached and recomputed visual features differed by at most
 
 This path applies two established Pi0.5 principles: replay a fixed device Graph
 and keep the stage-final projection inside the same device boundary. Prefill uses
-owner-checked fast replay. Decode fuses the 4,480-row candidate head into the
-decoder Graph and uses checked replay to patch the current position and KV
-addresses. It does not reuse tokens from an earlier request.
+owner-checked fast replay. Decode fuses the current 1,408-row grammar head into
+the decoder Graph and uses checked replay to patch its weight, current position,
+and KV addresses. It does not reuse tokens from an earlier request.
 
 Run the serial five-token path without `--history-draft`:
 
@@ -240,14 +271,14 @@ end-to-end gain.
 
 ## Execution notes
 
-The processor patchifies only the current uncached tubelet. Exact segment
+The processor patchifies only the current uncached tubelet. Tubelet-level
 pooling reuses pooled history while an empty cache runs the full-window vision
 path. Prefill remains complete because changed visual tokens and M-RoPE
 positions invalidate the old KV prefix. Five-token decode is autoregressive
 and uses the fused decoder and device argmax by default. History-draft mode
 instead verifies all five positions in one prefill.
 
-The constrained head follows the upstream action allowlist. Its narrower token
-domain can change token selection; select it to match the application's decoding
-contract. History-draft gains depend on acceptance across consecutive requests;
+The constrained heads follow the five-position LightNav grammar. Their narrower
+token domains can change token selection; select them to match the application's
+decoding contract. History-draft gains depend on acceptance across consecutive requests;
 this checkpoint has no multi-token prediction heads or weights.

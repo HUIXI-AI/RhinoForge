@@ -49,16 +49,27 @@ def test_benchmark_contract_fixes_five_tokens_and_history_set():
     assert BENCHMARK.MAX_PREFILL_TOKENS == 4176
     assert BENCHMARK.VISION_CACHE_ATOL == 1e-3
     assert BENCHMARK.parse_histories("12,24,36,48,64") == (12, 24, 36, 48, 64)
-    with pytest.raises(argparse.ArgumentTypeError, match="positive even"):
-        BENCHMARK.parse_histories("12,13")
+    assert BENCHMARK.parse_histories("9") == (9,)
+    with pytest.raises(argparse.ArgumentTypeError, match="positive values"):
+        BENCHMARK.parse_histories("9,0")
     assert 'rpu_execution={"prefill": {"fast_replay": True}}' in EXAMPLE_PATH.read_text()
 
 
 def test_lightnav_candidate_head_uses_checked_decode_replay():
     assert "lightnav_candidate_head" in DECODE_REPLAY_SOURCE
-    assert "vocab_size_ == 4480" in DECODE_REPLAY_SOURCE
+    assert "vocab_size_ == 1408" in DECODE_REPLAY_SOURCE
     assert "profile.head_dtype, vocab_size_, hidden_size()" in DECODE_REPLAY_SOURCE
     assert "qwen3vl_4b_w8_profile_" in DECODE_REPLAY_SOURCE
+
+
+def test_lightnav_position_heads_follow_the_five_token_grammar():
+    heads = qwen3_vl._lightnav_position_token_ids()
+    assert tuple(len(head) for head in heads) == (1302, 1299, 258, 258, 258)
+    assert heads[0][2:] == tuple(range(152443, 153743))
+    assert heads[1][2:] == tuple(range(153743, 155040))
+    assert heads[2][2:] == tuple(range(151675, 151931))
+    assert heads[3][2:] == tuple(range(151931, 152187))
+    assert heads[4][2:] == tuple(range(152187, 152443))
 
 
 def test_lightnav_candidate_head_reconfigures_native_decode_once(monkeypatch):
@@ -85,6 +96,7 @@ def test_lightnav_candidate_head_reconfigures_native_decode_once(monkeypatch):
         model=types.SimpleNamespace(language_model=text),
         _rpu_lightnav_candidate_token_ids=token_ids,
         _rpu_lightnav_candidate_lm_head_w=weight,
+        _rpu_lightnav_position_lm_heads=[weight] * 4,
         _rpu_lightnav_constrained_head_enabled=False,
     )
     native_calls = []
@@ -101,19 +113,31 @@ def test_lightnav_candidate_head_reconfigures_native_decode_once(monkeypatch):
         torch.ops.rpu, "causal_decoder_clear_lm_head",
         lambda *args: native_calls.append(("clear", args)), raising=False,
     )
+    monkeypatch.setattr(
+        torch.ops.rpu, "causal_decoder_set_lightnav_heads",
+        lambda *args: native_calls.append(("heads", args)), raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops.rpu, "causal_decoder_set_lightnav_head_index",
+        lambda *args: native_calls.append(("index", args)), raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops.rpu, "causal_decoder_clear_lightnav_heads",
+        lambda *args: native_calls.append(("clear_heads", args)), raising=False,
+    )
 
     assert qwen3_vl.set_lightnav_constrained_lm_head(model) is token_ids
     assert cache.events == ["warmup", "clear"]
-    assert [call[0] for call in native_calls] == ["set", "plan"]
+    assert [call[0] for call in native_calls] == ["set", "heads", "index", "plan"]
     assert model._rpu_lightnav_constrained_head_enabled is True
 
     qwen3_vl.set_lightnav_constrained_lm_head(model)
-    assert [call[0] for call in native_calls] == ["set", "plan"]
+    assert [call[0] for call in native_calls] == ["set", "heads", "index", "plan"]
 
     qwen3_vl.set_lightnav_constrained_lm_head(model, False)
     assert cache.events == ["warmup", "clear", "warmup", "clear"]
     assert [call[0] for call in native_calls] == [
-        "set", "plan", "clear", "plan",
+        "set", "heads", "index", "plan", "clear_heads", "clear", "plan",
     ]
     assert model._rpu_lightnav_constrained_head_enabled is False
 
@@ -228,7 +252,7 @@ def test_vision_cache_reassembles_repeat_and_sliding_windows(monkeypatch):
         merge_size=1, temporal_patch_size=2, patch_size=1,
     ))
 
-    def run(cache, frame_ids, values, *, prefetch=False):
+    def run(cache, frame_ids, values, *, prefetch=False, pool_factor=1):
         tubelets = len(frame_ids) // 2
         grid = torch.tensor([[tubelets, 1, 1]])
         result, hits, misses, timing = BENCHMARK._cache_vision(
@@ -240,6 +264,7 @@ def test_vision_cache_reassembles_repeat_and_sliding_windows(monkeypatch):
                 "pixel_values_videos": torch.tensor(values, dtype=torch.float16).reshape(tubelets, -1),
                 "video_grid_thw": grid,
                 "_original_video_grid_thw": grid,
+                "_post_vit_pool_factors": torch.tensor([pool_factor]),
             },
             prefetch_latest=prefetch,
         )
@@ -268,6 +293,13 @@ def test_vision_cache_reassembles_repeat_and_sliding_windows(monkeypatch):
             sliding["deepstack_feature_parts"][layer][0],
             fresh["deepstack_feature_parts"][layer][0],
         )
+
+    factor_cache = Cache()
+    _, _, _, cold_pool = run(factor_cache, [0, 1, 2, 3], [10, 20], pool_factor=2)
+    _, _, _, repeat_pool = run(factor_cache, [0, 1, 2, 3], [10, 20], pool_factor=2)
+    assert cold_pool["vision_pool_async_submits"] == 2
+    assert repeat_pool["vision_pool_async_submits"] == 0
+    assert repeat_pool["vision_pool_wait_ms"] == 0
 
     prefetch_cache = Cache()
     _, _, _, first_timing = run(

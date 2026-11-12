@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import statistics
@@ -19,13 +20,14 @@ MAX_PREFILL_TOKENS = 4176
 DEFAULT_HISTORIES = (8,)
 VISION_CACHE_ENTRIES = 1024
 VISION_CACHE_ATOL = 1e-3
+_POOL_EXECUTOR = None
 
 
 def parse_histories(value: str) -> tuple[int, ...]:
     histories = tuple(int(item) for item in value.split(",") if item.strip())
-    if not histories or any(item < 2 or item % 2 for item in histories):
+    if not histories or any(item < 1 for item in histories):
         raise argparse.ArgumentTypeError(
-            "history frames must be a comma-separated list of positive even values"
+            "history frames must be a comma-separated list of positive values"
         )
     return histories
 
@@ -66,6 +68,52 @@ class _HistoryOnlyCache:
         self._pooled_segments.move_to_end(key)
         if len(self._pooled_segments) > self._cache.max_entries:
             self._pooled_segments.popitem(last=False)
+
+
+def _pool_executor():
+    global _POOL_EXECUTOR
+    if _POOL_EXECUTOR is None:
+        _POOL_EXECUTOR = ThreadPoolExecutor(max_workers=1)
+    return _POOL_EXECUTOR
+
+
+def _get_pooled_tubelet(cache, key):
+    if hasattr(cache, "get_pooled_segment"):
+        return cache.get_pooled_segment(((key[0],), key[1], key[2]))
+    pooled = getattr(cache, "_rpu_pooled_tubelets", None)
+    if pooled is None:
+        return None
+    value = pooled.get(key)
+    if value is not None:
+        pooled.move_to_end(key)
+    return value
+
+
+def _put_pooled_tubelet(cache, key, value) -> None:
+    if hasattr(cache, "put_pooled_segment"):
+        cache.put_pooled_segment(((key[0],), key[1], key[2]), value)
+        return
+    pooled = getattr(cache, "_rpu_pooled_tubelets", None)
+    if pooled is None:
+        pooled = OrderedDict()
+        cache._rpu_pooled_tubelets = pooled
+    pooled[key] = value
+    pooled.move_to_end(key)
+    if len(pooled) > getattr(cache, "max_entries", VISION_CACHE_ENTRIES):
+        pooled.popitem(last=False)
+
+
+def _pool_one_tubelet(entry, unit, factor, merge_size, pool):
+    import torch
+
+    grid = torch.tensor([[1, int(unit["h"]), int(unit["w"])]], dtype=torch.long)
+    return pool(
+        entry.base_embed,
+        grid,
+        spatial_factor=factor,
+        merge_size=merge_size,
+        deepstack_embeds=entry.deepstack_embeds,
+    )
 
 
 def _prepare_prompt(inputs: dict[str, Any], video_token_id: int):
@@ -109,6 +157,9 @@ def _cache_vision(
         pixels, raw_grid.tolist(), frame_indices, merge_size=merge_size,
     )
     lookup_ms = (time.perf_counter() - lookup_started) * 1000
+    pool_factors = inputs.get("_post_vit_pool_factors")
+    if pool_factors is None:
+        pool_factors = torch.ones(raw_grid.shape[0], dtype=torch.long)
 
     vit_units = list(plan.missing_units)
     if prefetch_latest and plan.unit_desc:
@@ -174,13 +225,39 @@ def _cache_vision(
                 plan.cached_map[unit["key"]] = entry
         vit_ms = (time.perf_counter() - vit_started) * 1000
 
-    pool_factors = inputs.get("_post_vit_pool_factors")
-    if pool_factors is None:
-        pool_factors = torch.ones(raw_grid.shape[0], dtype=torch.long)
+    pending = getattr(cache, "_rpu_pending_pooled_tubelets", None)
+    if pending is None:
+        pending = {}
+        cache._rpu_pending_pooled_tubelets = pending
+    for key, future in list(pending.items()):
+        if future.done():
+            _put_pooled_tubelet(cache, key, future.result())
+            del pending[key]
+
+    async_submits = 0
+    async_factors = {int(value.item()) for value in pool_factors if int(value.item()) > 1}
+    for unit in vit_units:
+        entry = plan.cached_map.get(unit["key"])
+        if entry is None:
+            continue
+        for factor in async_factors:
+            key = (unit["key"], factor, merge_size)
+            if _get_pooled_tubelet(cache, key) is None and key not in pending:
+                pending[key] = _pool_executor().submit(
+                    _pool_one_tubelet,
+                    entry,
+                    unit,
+                    factor,
+                    merge_size,
+                    post_vit_spatial_pool,
+                )
+                async_submits += 1
+
     base_parts: list[Any] = []
     deepstack_parts: list[list[Any]] = [[], [], []]
     pooled_grids: list[Any] = []
     offset = 0
+    pool_wait_ms = 0.0
     pool_started = time.perf_counter()
     for segment_index, row in enumerate(raw_grid):
         tubelets = int(row[0].item())
@@ -191,31 +268,35 @@ def _cache_vision(
         ]
         offset += tubelets
         factor = int(pool_factors[segment_index].item())
-        segment_key = (
-            tuple(unit["key"] for unit in segment_units), factor, merge_size,
-        )
-        pooled_segment = (
-            cache.get_pooled_segment(segment_key)
-            if hasattr(cache, "get_pooled_segment") else None
-        )
-        if pooled_segment is None:
-            base = torch.cat([entry.base_embed for entry in entries], dim=0)
-            deepstack = [
-                torch.cat(
-                    [entry.deepstack_embeds[layer] for entry in entries], dim=0,
-                )
-                for layer in range(3)
-            ]
-            pooled_segment = post_vit_spatial_pool(
-                base,
-                row.unsqueeze(0),
-                spatial_factor=factor,
-                merge_size=merge_size,
-                deepstack_embeds=deepstack,
-            )
-            if hasattr(cache, "put_pooled_segment"):
-                cache.put_pooled_segment(segment_key, pooled_segment)
-        pooled, pooled_grid, pooled_deepstack = pooled_segment
+        pooled_units = []
+        for unit, entry in zip(segment_units, entries):
+            key = (unit["key"], factor, merge_size)
+            pooled_unit = _get_pooled_tubelet(cache, key)
+            if pooled_unit is None:
+                future = pending.get(key)
+                if future is None:
+                    future = _pool_executor().submit(
+                        _pool_one_tubelet,
+                        entry,
+                        unit,
+                        factor,
+                        merge_size,
+                        post_vit_spatial_pool,
+                    )
+                    pending[key] = future
+                wait_started = time.perf_counter()
+                pooled_unit = future.result()
+                pool_wait_ms += (time.perf_counter() - wait_started) * 1000
+                del pending[key]
+                _put_pooled_tubelet(cache, key, pooled_unit)
+            pooled_units.append(pooled_unit)
+        pooled = torch.cat([value[0] for value in pooled_units], dim=0)
+        pooled_grid = pooled_units[0][1].clone()
+        pooled_grid[0, 0] = tubelets
+        pooled_deepstack = [
+            torch.cat([value[2][layer] for value in pooled_units], dim=0)
+            for layer in range(3)
+        ]
         if pooled_deepstack is None or len(pooled_deepstack) != 3:
             raise RuntimeError("LightNav ViT must return three DeepStack levels")
         base_parts.append(pooled.contiguous())
@@ -239,6 +320,8 @@ def _cache_vision(
         "vision_lookup_ms": lookup_ms,
         "vision_vit_ms": vit_ms,
         "vision_pool_ms": pool_ms,
+        "vision_pool_wait_ms": pool_wait_ms,
+        "vision_pool_async_submits": async_submits,
         "vision_prefetches": len(vit_units) - len(plan.missing_units),
     }
 
@@ -246,14 +329,15 @@ def _cache_vision(
 def _generate_five(
     model, input_ids, prefill: dict[str, Any], cache,
     draft_tokens: list[int] | None = None,
+    timing: dict[str, Any] | None = None,
 ):
     import torch
 
-    def next_token(logits):
+    def next_token(logits, step=0):
         from rpu_backend.api import greedy_token_ids
 
         if getattr(model, "_rpu_lightnav_constrained_head_enabled", False):
-            candidates = model._rpu_lightnav_candidate_token_ids
+            candidates = model._rpu_lightnav_position_token_ids[step]
             token = greedy_token_ids(logits[..., : candidates.numel()])
             return candidates.index_select(0, token.reshape(-1)).reshape(token.shape)
         return greedy_token_ids(logits)
@@ -277,16 +361,27 @@ def _generate_five(
         cache.reset_to_position(0)
         verify_started = time.perf_counter()
         with torch.no_grad():
+            upload_started = time.perf_counter()
+            verify_ids = verify_ids.to("rpu")
+            if timing is not None:
+                timing["prefill_upload_ms"] = (
+                    time.perf_counter() - upload_started
+                ) * 1000
+            model_started = time.perf_counter()
             output = model(
-                input_ids=verify_ids.to("rpu"),
+                input_ids=verify_ids,
                 past_key_values=cache,
                 logits_to_keep=OUTPUT_TOKENS,
                 use_cache=True,
                 return_dict=True,
                 **verify_prefill,
             )
+            if timing is not None:
+                timing["prefill_model_ms"] = (
+                    time.perf_counter() - model_started
+                ) * 1000
             predicted = [
-                int(next_token(output.logits[:, index : index + 1]).item())
+                int(next_token(output.logits[:, index : index + 1], index).item())
                 for index in range(output.logits.shape[1])
             ]
         verify_ms = (time.perf_counter() - verify_started) * 1000
@@ -295,7 +390,7 @@ def _generate_five(
         text_graphs = model.model.language_model._rpu_text_graph_cache
         text_graphs.clear()
         generated, prefill_ms, decode_ms, _ = _generate_five(
-            model, input_ids, prefill, cache,
+            model, input_ids, prefill, cache, timing=timing,
         )
         text_graphs.clear()
         return generated, verify_ms + prefill_ms, decode_ms, False
@@ -304,28 +399,63 @@ def _generate_five(
     generated = []
     prefill_started = time.perf_counter()
     with torch.no_grad():
+        upload_started = time.perf_counter()
+        rpu_input_ids = input_ids.to("rpu")
+        if timing is not None:
+            timing["prefill_upload_ms"] = (
+                time.perf_counter() - upload_started
+            ) * 1000
+        model_started = time.perf_counter()
         output = model(
-            input_ids=input_ids.to("rpu"),
+            input_ids=rpu_input_ids,
             past_key_values=cache,
             logits_to_keep=1,
             use_cache=True,
             return_dict=True,
             **prefill,
         )
+        if timing is not None:
+            timing["prefill_model_ms"] = (
+                time.perf_counter() - model_started
+            ) * 1000
         prefill_ms = (time.perf_counter() - prefill_started) * 1000
         decode_started = time.perf_counter()
+        select_ms = 0.0
+        upload_ms = 0.0
+        model_ms = 0.0
+        model_steps = []
         for step in range(OUTPUT_TOKENS):
-            next_id = next_token(output.logits)
+            step_started = time.perf_counter()
+            next_id = next_token(output.logits, step)
             generated.append(int(next_id.item()))
+            select_ms += (time.perf_counter() - step_started) * 1000
             if step + 1 < OUTPUT_TOKENS:
+                if getattr(model, "_rpu_lightnav_constrained_head_enabled", False):
+                    torch.ops.rpu.causal_decoder_set_lightnav_head_index(
+                        model.model.language_model._rpu_decoder_handle, step + 1,
+                    )
+                upload_started = time.perf_counter()
+                rpu_next_id = next_id.to("rpu")
+                upload_ms += (time.perf_counter() - upload_started) * 1000
+                model_started = time.perf_counter()
                 output = model(
-                    input_ids=next_id.to("rpu"),
+                    input_ids=rpu_next_id,
                     past_key_values=cache,
                     logits_to_keep=1,
                     use_cache=True,
                     return_dict=True,
                 )
+                elapsed = (time.perf_counter() - model_started) * 1000
+                model_ms += elapsed
+                model_steps.append(elapsed)
         decode_ms = (time.perf_counter() - decode_started) * 1000
+        if timing is not None:
+            timing.update({
+                "decode_select_ms": select_ms,
+                "decode_upload_ms": upload_ms,
+                "decode_model_ms": model_ms,
+                "decode_model_step_ms": model_steps,
+            })
     return generated, prefill_ms, decode_ms, None
 
 
@@ -376,6 +506,7 @@ def _run_request(
             f"LightNav prompt has {input_ids.shape[1]} tokens; "
             f"RPU Qwen3-VL 4B admits at most {MAX_PREFILL_TOKENS}"
         )
+    generation_parts: dict[str, Any] = {}
     tokens, prefill_ms, decode_ms, draft_accepted = _generate_five(
         model,
         input_ids,
@@ -387,6 +518,7 @@ def _run_request(
         },
         lm_cache,
         draft_tokens,
+        generation_parts,
     )
     result = {
         "offset": offset,
@@ -402,6 +534,7 @@ def _run_request(
         **vision_parts,
         "prefill_ms": prefill_ms,
         "decode_5_ms": decode_ms,
+        **generation_parts,
         "draft_accepted": draft_accepted,
         "total_ms": (time.perf_counter() - started) * 1000,
     }
@@ -445,8 +578,10 @@ def _summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         key: _median(rows, key)
         for key in (
             "prepare_ms", "prepare_sample_ms", "prepare_processor_ms", "vision_ms",
-            "vision_lookup_ms", "vision_vit_ms", "vision_pool_ms", "prefill_ms",
-            "decode_5_ms", "total_ms",
+            "vision_lookup_ms", "vision_vit_ms", "vision_pool_ms",
+            "vision_pool_wait_ms", "vision_pool_async_submits", "prefill_ms",
+            "prefill_upload_ms", "prefill_model_ms", "decode_5_ms",
+            "decode_select_ms", "decode_upload_ms", "decode_model_ms", "total_ms",
         )
     }
     for key in (
@@ -485,7 +620,7 @@ def main() -> int:
     parser.add_argument(
         "--constrained-head",
         action="store_true",
-        help="project only the checkpoint action-token allowlist",
+        help="use the five position-specific LightNav grammar heads",
     )
     parser.add_argument(
         "--history-draft",
@@ -568,7 +703,7 @@ def main() -> int:
             "repeats": args.repeats,
             "frame_count_semantics": "history_plus_current",
             "lm_head": (
-                "action_allowlist" if args.constrained_head else "full_vocabulary"
+                "position_grammar" if args.constrained_head else "full_vocabulary"
             ),
             "lm_head_candidates": candidate_count,
             "text_precision": quant_config.get("method", "fp16"),

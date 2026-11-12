@@ -319,6 +319,8 @@ struct CausalDecoderModel::Qwen3VlDecodeReplayState {
         if (!p.tts_predictor && !fn(model.lm_head_w_, true)) return false;
         for (const auto& head : model.tts_predictor_heads_)
             if (!fn(head, true)) return false;
+        for (const auto& head : model.lightnav_heads_)
+            if (!fn(head, true)) return false;
         if (p.packed_qkv && !fn(model.qwen3vl_4b_qkv_scale_bank_, true)) return false;
         if (p.head_dtype != at::kHalf && !fn(model.lm_head_w_scale_, true)) return false;
         return p.tts_predictor || fn(model.position_ids_keepalive_, false);
@@ -344,6 +346,12 @@ struct CausalDecoderModel::Qwen3VlDecodeReplayState {
                 model.vocab_size_ != 2048) return false;
             for (const auto& head : model.tts_predictor_heads_)
                 if (!tensor_shape(head, at::kHalf, {2048, 1024})) return false;
+        }
+        if (!model.lightnav_heads_.empty()) {
+            if (model.lightnav_heads_.size() != 4 || model.vocab_size_ != 1408)
+                return false;
+            for (const auto& head : model.lightnav_heads_)
+                if (!tensor_shape(head, at::kHalf, {1408, 2560})) return false;
         }
         for (const auto& w : model.layer_weights_) {
             if (p.packed_qkv) {
@@ -420,6 +428,8 @@ struct CausalDecoderModel::Qwen3VlDecodeReplayState {
         if (!profile(model).tts_predictor) rpu_ddr_flush(model.lm_head_w_.data_ptr());
         if (!model.tts_predictor_heads_.empty())
             rpu_ddr_flush(model.tts_predictor_heads_.at(model.tts_predictor_head_index_).data_ptr());
+        if (!model.lightnav_heads_.empty() && model.lightnav_head_index_ > 0)
+            rpu_ddr_flush(model.lightnav_heads_.at(model.lightnav_head_index_ - 1).data_ptr());
         if (profile(model).head_dtype != at::kHalf) rpu_ddr_flush(model.lm_head_w_scale_.data_ptr());
     }
 };
@@ -446,7 +456,7 @@ bool CausalDecoderModel::begin_qwen3vl_decode_replay(
         layer_weights_.front().q_w.scalar_type() == at::kHalf;
     const bool lightnav_candidate_head =
         (qwen3vl_fp16_decode_profile_ || qwen3vl_4b_w8_profile_) &&
-        fuse_lm_head_ && vocab_size_ == 4480 && !linear_acc32_ &&
+        fuse_lm_head_ && (vocab_size_ == 4480 || vocab_size_ == 1408) && !linear_acc32_ &&
         lm_head_w_.scalar_type() == at::kHalf;
     const bool ordinary = qwen3vl_ordinary_resident_prefill_profile_ || qwen3vl_4b_w8_profile_ || exact_8b || tts_predictor;
     const bool geometry = (num_layers() == 28 && hidden_size() == 2048 && intermediate_size() == 6144 && num_q_heads() == 16) ||
@@ -558,15 +568,23 @@ bool CausalDecoderModel::try_checked_layer_body_replay() {
     Qwen3VlDecodeReplayState::visibility(*this, state.k, state.v);
     // No fallback is allowed after this boundary. The existing Graph API owns
     // typed/census/semantic validation and register patch application.
-    if (tts_predictor_heads_.empty()) {
+    if (tts_predictor_heads_.empty() && lightnav_heads_.empty()) {
         graph.skip_op_stream_with_patches(recipe.patches, {});
     } else {
-        TORCH_CHECK(state.position >= 2 && state.position <= 15 &&
-                        tts_predictor_head_index_ == state.position - 1,
-                    "TTS checked replay head does not match its codec position");
+        if (!tts_predictor_heads_.empty()) {
+            TORCH_CHECK(state.position >= 2 && state.position <= 15 &&
+                            tts_predictor_head_index_ == state.position - 1,
+                        "TTS checked replay head does not match its codec position");
+        } else {
+            TORCH_CHECK(lightnav_head_index_ >= 1 && lightnav_head_index_ < 5,
+                        "LightNav checked replay requires decode head 1..4");
+        }
         // Same public Linear DDR ABI as the ordinary launcher; owners above
-        // prove all fifteen bindings, including their alignment and versions.
-        const uint64_t address = RpuGetDevAddr(tts_predictor_heads_.at(tts_predictor_head_index_).data_ptr());
+        // prove every head binding, including alignment and version.
+        const auto& head = !tts_predictor_heads_.empty()
+            ? tts_predictor_heads_.at(tts_predictor_head_index_)
+            : lightnav_heads_.at(lightnav_head_index_ - 1);
+        const uint64_t address = RpuGetDevAddr(head.data_ptr());
         const uint32_t encoded = static_cast<uint32_t>(address >> 8);
         auto patches = recipe.patches;
         patches.push_back({recipe.head_kernel, 2, uint16_t(encoded), 2});
@@ -611,8 +629,10 @@ void CausalDecoderModel::finish_qwen3vl_decode_replay() {
         if (admissible && Qwen3VlDecodeReplayState::owner_shapes(*this) &&
             bind_decode_patches(kernels, next->patches,
                                 Qwen3VlDecodeReplayState::profile(*this))) {
-            if (!tts_predictor_heads_.empty()) next->head_kernel = kernels.back().kernel;
-            next->owners.reserve(num_layers() * 20 + 7 + tts_predictor_heads_.size());
+            if (!tts_predictor_heads_.empty() || !lightnav_heads_.empty())
+                next->head_kernel = kernels.back().kernel;
+            next->owners.reserve(num_layers() * 20 + 7 +
+                                 tts_predictor_heads_.size() + lightnav_heads_.size());
             admissible = Qwen3VlDecodeReplayState::visit_owners(*this, state.k, state.v,
                 [&](const at::Tensor& t, bool fixed) {
                     DecodeOwner owner;

@@ -3305,6 +3305,9 @@ void rpu_causal_decoder_set_lm_head(
     bool fuse_prefill_last = false,
     int64_t exact_candidates = 0);
 void rpu_causal_decoder_set_tts_predictor_heads(int64_t handle, at::TensorList heads);
+void rpu_causal_decoder_set_lightnav_heads(int64_t handle, at::TensorList heads);
+void rpu_causal_decoder_set_lightnav_head_index(int64_t handle, int64_t index);
+void rpu_causal_decoder_clear_lightnav_heads(int64_t handle);
 at::Tensor rpu_causal_decoder_tts_predictor_logits(int64_t handle);
 void rpu_causal_decoder_clear_lm_head(int64_t handle);
 void rpu_causal_decoder_set_rhinovla_high_precision_fusions(int64_t handle, bool enabled);

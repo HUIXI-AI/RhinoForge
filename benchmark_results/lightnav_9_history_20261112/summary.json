@@ -1,0 +1,94 @@
+{
+  "setup": {
+    "device": "R1",
+    "runtime": "v1.2.0",
+    "data": "chip_provider_repro_minimal_20261111, 35 frames",
+    "steady_samples": "frame_index >= 10, 25 requests",
+    "input": "9 history frames + 1 current frame",
+    "input_tokens": 347,
+    "vision_cache_hit_miss": "4/1",
+    "text_precision": "W8A16",
+    "output_tokens": 5,
+    "previous_request_token_draft": false
+  },
+  "results_ms": {
+    "before": {
+      "prepare": 20.879,
+      "vision": 87.947,
+      "vision_vit": 68.502,
+      "vision_pool": 19.984,
+      "prefill": 89.066,
+      "decode_5": 114.759,
+      "total": 313.817,
+      "frame_total": 318.510
+    },
+    "tubelet_pool_cache": {
+      "prepare": 17.637,
+      "vision": 63.384,
+      "vision_vit": 60.138,
+      "vision_pool": 2.878,
+      "vision_pool_wait": 0.309,
+      "prefill": 89.119,
+      "prefill_model": 89.018,
+      "decode_5": 114.758,
+      "decode_model": 113.686,
+      "decode_select": 0.851,
+      "decode_upload": 0.207,
+      "total": 285.661,
+      "frame_total": 289.438,
+      "token_equal_frames": "35/35"
+    },
+    "position_grammar_heads": {
+      "prepare": 17.448,
+      "vision": 63.451,
+      "vision_vit": 59.817,
+      "vision_pool": 2.951,
+      "vision_pool_wait": 0.292,
+      "prefill": 88.486,
+      "prefill_model": 88.374,
+      "decode_5": 114.396,
+      "decode_model": 113.255,
+      "decode_select": 0.839,
+      "decode_upload": 0.204,
+      "total": 284.663,
+      "frame_total": 288.472,
+      "token_equal_frames": "35/35"
+    }
+  },
+  "experiments": {
+    "current_frame_pool2": {
+      "input_tokens": 263,
+      "vision": 61.938,
+      "prefill": 83.887,
+      "decode_5": 114.229,
+      "total": 277.802,
+      "frame_total": 281.280,
+      "token_equal_frames": "1/35",
+      "different_tokens": "142/175",
+      "decision": "rejected"
+    },
+    "vision_w8a16": {
+      "input_tokens": 347,
+      "vision": 26.881,
+      "vision_vit": 22.164,
+      "prefill": 88.901,
+      "decode_5": 114.421,
+      "total": 247.730,
+      "frame_total": 249.305,
+      "token_equal_frames": "29/35",
+      "different_tokens": "11/175",
+      "decision": "experimental opt-in; requires navigation accuracy evaluation"
+    }
+  },
+  "not_implemented": {
+    "fixed_four_step_decode_graph": "The four decode steps are autoregressive. Host token selection and upload cost only about 1.1 ms total, while decoder model execution costs about 113.3 ms. The current runtime has no device-side top1-to-token-to-embedding chain.",
+    "text_w4a16": "No original FP16 checkpoint was available for a fair conversion, and LightNav W4A16 has no validated runtime profile."
+  },
+  "source_results_on_r1": [
+    "/run/customer_lightnav_repro_20261111/outputs/history9_no_prefetch_35.json",
+    "/run/customer_lightnav_repro_20261111/outputs/history9_pool_v1_35.json",
+    "/run/customer_lightnav_repro_20261111/outputs/history9_position_heads_35.json",
+    "/run/customer_lightnav_repro_20261111/outputs/history9_current_pool2_35.json",
+    "/run/customer_lightnav_repro_20261111/outputs/history9_vision_w8_35.json"
+  ]
+}

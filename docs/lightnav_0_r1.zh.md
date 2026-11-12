@@ -7,17 +7,17 @@
 `3015508b70fb6e30bbd66701e94c9b916dcb8df8`。模型每次固定输出 5 个 token：
 2 个指向 token 和 3 个 RVQ 动作 token。
 
-RhinoForge 复用现有 Qwen3-VL 4B 文本、视觉和 DeepStack 路径。LightNav 的完整
-156048 行词表不能使用要求输出维度按 128 对齐的融合列切分输出头；启用约束输出头
-后，4369 个候选补齐为 4480 行，可并入设备侧 decode Graph。该分支只允许精确的
-LightNav 配置，不放宽其他扩展词表模型。
+RhinoForge 复用现有 Qwen3-VL 4B 文本、视觉和 DeepStack 路径。启用约束输出头后，
+5 个固定输出位置分别只保留 `apos/opos/L0/L1/L2` 对应候选及 EOS/STOP，各自补齐为
+1408 行。Prefill 使用第 1 个 head，4 次 decode 在同一个 checked-replay Graph 中
+重绑后续 head 的权重地址。该分支只允许精确的 LightNav 配置。
 
 视觉缓存沿用上游按 2 帧 tubelet 建立的 key，默认容量按上游 Thor 长会话建议设为
 1024。每个 miss 只运行一次 ViT，并把
 pooler output 与 3 层 DeepStack 特征保存到 CPU；同一会话后续窗口直接复用。
-缓存继续保存池化前特征，并额外按“精确 tubelet 序列 + SlowFast pooling factor”
-缓存整段 post-ViT pooling 结果；历史组成或倍率变化时 key 不匹配，会重新池化。
-滑动窗口位置会变化，所以每次完整 scatter 缓存特征，不启用 prefix scatter 复用。
+缓存继续保存池化前特征，并按“单个 tubelet + SlowFast pooling factor”缓存 post-ViT
+pooling 结果。新 tubelet 的历史倍率 pooling 在本轮 Prefill/Decode 期间用 CPU 后台
+线程预计算，滑窗移动后可直接重组，不再因整段历史 key 变化而重复池化。
 
 真实 8 帧历史加当前帧的滑窗可调用
 `_run_request(..., prefetch_latest=True)`。它在本轮 ViT batch 中额外计算“最新帧复制
@@ -31,14 +31,32 @@ M-RoPE 稳定槽位。KV cache 地址不同时，运行时按实际 chunk→laye
 或设备不兼容时拒绝快速重放。增长窗口应在首次完整 8 帧窗口建好前清理旧 text
 Graph，之后只复用固定形状，避免多个 prefill 形状占满 Graph arena。
 
-R1 v1.2.0、Text W8A16、35 帧客户数据的稳定段（第 9 帧之后）结果如下。固定 KV
-地址的 35 帧快速重放与逐帧重建的同预取基线 token 完全一致；双 KV 地址交替的
-第 9–11 帧也完全一致。
+## 9 帧历史加当前帧的逐项优化
 
-| KV 地址 | 视觉 hit/miss | Vision | Prefill | Decode 5 | Total |
-|---|---:|---:|---:|---:|---:|
-| 固定 | 4/1 | 121.06 ms | 89.18 ms | 114.80 ms | 345.37 ms |
-| 双地址交替 | 4/1 | 122.05 ms | 89.26 ms | 115.84 ms | 348.94 ms |
+使用客户提供的 35 帧数据、R1 v1.2.0、Text W8A16，关闭上一请求 5-token 候选复验。
+表中为第 10 帧起 25 次稳态请求的中位数；实际输入是 9 帧历史加 1 帧当前画面，
+347 个 prompt token，视觉缓存稳定为 4 个 tubelet 命中、1 个缺失。
+
+| 实施阶段 | 准备 | Vision | Prefill | Decode 5 | Total | 帧间总耗时 |
+|---|---:|---:|---:|---:|---:|---:|
+| 优化前 | 20.879 ms | 87.947 ms | 89.066 ms | 114.759 ms | 313.817 ms | 318.510 ms |
+| tubelet 级 pooling 缓存 | 17.637 ms | 63.384 ms | 89.119 ms | 114.758 ms | 285.661 ms | 289.438 ms |
+| 再加五位置语法 head | 17.448 ms | 63.451 ms | 88.486 ms | 114.396 ms | 284.663 ms | 288.472 ms |
+
+tubelet 级缓存消除了滑窗改变后重复的整段 pooling，Vision 减少 24.563 ms，端到端
+减少 28.156 ms。五位置 head 把每个位置的物理输出维度统一为 1408，继续减少约
+1.0 ms。两步优化的 35 帧输出均与优化前逐 token 一致。固定 KV 地址的快速重放与
+逐帧重建、双 KV 地址交替也已分别验证 token 一致。
+
+固定四步 decode Graph 没有实施。第 2～5 个 token 依赖前一个 token；当前运行时
+缺少设备侧 `top1 → 原 token ID → embedding → 下一步 decoder` 链。现有主机选择和
+上传 5 个 token 合计约 1.1 ms，而 decoder 模型本身约 113.3 ms，新增一套生成器
+无法解决主要耗时。
+
+另外两项只保留实验结果：当前画面使用 `pool_spatial=2` 虽把 Total 降到
+277.802 ms，但 35 帧仅 1 帧输出一致；Vision W8A16 把 Total 降到 247.730 ms，
+但仅 29/35 帧一致、175 个 token 中 11 个变化。两者都没有进入默认交付路径。
+完整数据见 `benchmark_results/lightnav_9_history_20261112/summary.json`。
 
 ## 运行
 
@@ -54,13 +72,12 @@ python examples/lightnav_benchmark.py \
 ```
 
 R1 运行时移除 `--check-config`。默认使用 8 帧历史并额外加入 1 帧当前画面，所以
-实际输入 9 帧；仍可用 `--history-frames` 显式覆盖。两个场景各测 5 次取中位数，
+实际输入 9 帧；可用 `--history-frames 9` 复现上面的 9 帧历史加当前帧。两个场景各测 5 次取中位数，
 每次固定输出 5 个 token。输入使用确定性的 256×448 合成帧，因此结果用于比较
 推理性能和缓存收益，不代表导航任务准确率。
 
-若业务已经采用上游 `VLN_EVAL_TRAJ_TOP1` action allowlist，可增加
-`--constrained-head`。它在冷装载时只保留 4369 个候选 token 的输出头，物理补齐到
-4480 行后使用 column-parallel Linear，并把单 token decode 的输出头纳入同一个
+若业务已经采用上游固定五位置动作语法，可增加 `--constrained-head`。它安装 5 个
+位置专用的 1408 行 column-parallel head，并把单 token decode 的输出头纳入同一个
 设备 Graph。该选项改变默认全词表解码范围，必须单独验证真实导航质量。
 
 ## Thor 思路与 8bit
@@ -81,10 +98,21 @@ PYTHONPATH=python python -m rpu_backend.quant.convert_qwen3_vl \
 本次权重文件由 9.70 GB 降到 6.06 GB，减少 37.5%。没有达到一半，是因为 Vision、
 动作输出头及其他非 Linear 权重仍保留 FP16。
 
+Vision W8A16 仅用于受控评估：
+
+```bash
+PYTHONPATH=python python -m rpu_backend.quant.convert_qwen3_vl \
+  --bits 8 --lightnav-vision-w8 \
+  --src /path/to/LightNav-0 \
+  --dst /path/to/LightNav-0-text-vision-w8a16
+```
+
+该配置在安装时按通道量化 Vision。它显著降低 ViT 耗时，但本次客户数据已经出现
+token 变化，未经过导航成功率验证，不应替代默认的 Vision FP16 配置。
+
 固定输出 5 token 不等于 5 个 token 能并行计算：第 2～5 个 token 分别依赖前一个
-token。R1 v1.2.0 实测在保留第 2 个位置专属 decode Graph 时已经耗尽 Graph arena，
-无法同时常驻 4 个位置 Graph；逐位置清理并重建会增加开销。因此交付继续使用一个
-共享的 checked-replay decode Graph，没有保留单独的固定位置开关。
+token。交付使用一个共享的 checked-replay decode Graph，每步只重绑对应位置的
+1408 行 head 地址，不为四个位置各建一份 Graph。
 
 R1 v1.2.0 使用 8 帧历史加 1 帧当前画面、确定性 256×448 输入、4369-token action
 allowlist，每个缓存场景测 5 次取中位数。测试不使用上一请求 token 候选：
@@ -107,8 +135,9 @@ Text W8A16 在历史全命中场景把 Prefill 降低 35.4%、Decode 降低 44.6
 这里复用了 Pi0.5 已验证的两个原则：固定执行结构后重放设备 Graph，以及把阶段末尾
 的小算子留在同一设备执行边界内。Prefill 开启受所有权检查保护的 fast replay；相同
 输入形状再次执行时复用已经构建的内核序列，但仍会根据本轮 prompt 计算完整注意力和
-KV。Decode 把 4480 行候选输出头融合进 decoder Graph，并使用 checked replay 更新
-当前位置和 KV 地址，避免每个 token 重走 Python 输出头和主机侧内核发射流程。
+KV。Decode 把当前位置的 1408 行语法 head 融合进 decoder Graph，并使用 checked
+replay 更新 head 权重、当前位置和 KV 地址，避免每个 token 重走 Python 输出头和
+主机侧内核发射流程。
 
 以下命令不启用历史候选复验，只测标准的 5-token 自回归 decode：
 
@@ -236,11 +265,11 @@ checkpoint 提供 MTP head；接受时把 4 次单 token decode 合并进一次�
 
 ## 执行说明
 
-processor 只处理当前未缓存的 tubelet；精确 segment pooling 复用已池化历史，
+processor 只处理当前未缓存的 tubelet；tubelet 级 pooling 复用已池化历史，
 空缓存仍运行完整窗口的视觉路径。视觉 token 和 M-RoPE 位置变化会使旧 KV 前缀
 失效，因此每次执行完整 prefill。默认模式下五个 token 按自回归顺序生成，使用融合
 decoder 和设备 argmax；历史候选模式在一次 prefill 中复验全部 5 个 token。
 
-约束输出头沿用上游 action allowlist，候选范围缩小可能改变 token 选择，应与应用的
+约束输出头遵循 LightNav 五位置动作语法，候选范围缩小可能改变 token 选择，应与应用的
 解码约定一致。历史候选的收益取决于连续请求的接受率；checkpoint 不包含多 token
 预测头或权重。

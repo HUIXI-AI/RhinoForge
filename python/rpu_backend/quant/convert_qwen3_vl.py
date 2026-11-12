@@ -27,6 +27,7 @@ from .int4_pgrp_pack import quantize_int4_group_wise
 
 PROFILE = "qwen3_vl_4b_w8a16_runtime_align_v1"
 LIGHTNAV_W8_PROFILE = "lightnav_0_4b_w8a16_text_v1"
+LIGHTNAV_W8_VISION_PROFILE = "lightnav_0_4b_w8a16_text_vision_v1"
 QUANT_CONFIG = {
     "method": "w8a16",
     "profile": PROFILE,
@@ -81,14 +82,17 @@ def runtime_quant_config(hidden_size: int, bits: int, *, source_quantization=Non
     return result
 
 
-def lightnav_w8_quant_config() -> dict:
+def lightnav_w8_quant_config(*, vision: bool = False) -> dict:
     """LightNav Text7 W8; preserve its action head and vision tower in FP16."""
     result = runtime_quant_config(2560, 8)
     result.update(
-        profile=LIGHTNAV_W8_PROFILE,
-        skip_modules=["model.language_model.embed_tokens", "lm_head", "model.visual"],
+        profile=LIGHTNAV_W8_VISION_PROFILE if vision else LIGHTNAV_W8_PROFILE,
+        skip_modules=[
+            "model.language_model.embed_tokens", "lm_head",
+            *([] if vision else ["model.visual"]),
+        ],
         quantized_lm_head=False,
-        vision_quantization="fp16",
+        vision_quantization="per_channel_on_install" if vision else "fp16",
     )
     return result
 
@@ -354,7 +358,10 @@ def _convert_awq_checkpoint(src, dst, config, *, bits):
     return stats
 
 
-def convert_checkpoint(src: str | Path, dst: str | Path, *, bits: int = 8) -> dict:
+def convert_checkpoint(
+    src: str | Path, dst: str | Path, *, bits: int = 8,
+    lightnav_vision_w8: bool = False,
+) -> dict:
     src, dst = Path(src).expanduser().resolve(), Path(dst).expanduser().resolve()
     config = json.loads((src / "config.json").read_text())
     from .load_qwen3_vl_awq import is_qwen3_vl_awq_config
@@ -371,6 +378,8 @@ def convert_checkpoint(src: str | Path, dst: str | Path, *, bits: int = 8) -> di
                    type(text.get("tie_word_embeddings")) is bool)) if large else
                  (source_tied is True and text.get("tie_word_embeddings") is True))
     is_lightnav = matches_lightnav_geometry(config)
+    if lightnav_vision_w8 and not is_lightnav:
+        raise ValueError("--lightnav-vision-w8 requires a LightNav checkpoint")
     if (not (matches_runtime_geometry(config) or is_lightnav) or not valid_tie
             or any(_get(owner, key) is not None for owner in
                    (config, config["text_config"], config["vision_config"])
@@ -379,7 +388,7 @@ def convert_checkpoint(src: str | Path, dst: str | Path, *, bits: int = 8) -> di
     if is_lightnav and bits != 8:
         raise ValueError("LightNav runtime quantization supports Text7 W8A16 only")
     quant_config = (
-        lightnav_w8_quant_config() if is_lightnav else
+        lightnav_w8_quant_config(vision=lightnav_vision_w8) if is_lightnav else
         runtime_quant_config(config["text_config"]["hidden_size"], bits)
     )
     if dst.exists():
@@ -480,8 +489,12 @@ def main():
     parser.add_argument("--src", required=True)
     parser.add_argument("--dst", required=True)
     parser.add_argument("--bits", type=int, choices=(8, 4), default=8)
+    parser.add_argument("--lightnav-vision-w8", action="store_true")
     args = parser.parse_args()
-    print(json.dumps(convert_checkpoint(args.src, args.dst, bits=args.bits), indent=2))
+    print(json.dumps(convert_checkpoint(
+        args.src, args.dst, bits=args.bits,
+        lightnav_vision_w8=args.lightnav_vision_w8,
+    ), indent=2))
 
 
 if __name__ == "__main__":

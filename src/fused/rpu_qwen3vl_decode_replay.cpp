@@ -93,19 +93,17 @@ std::optional<int64_t> decode_cache_capacity(at::TensorList k, at::TensorList v,
 // The actual recorded stream must match in full before any emission is skipped.
 struct DecodeProfile {
     int layers = 36;
-    at::ScalarType dtype = at::kChar, mlp_dtype = at::kChar, head_dtype = at::kChar;
+    at::ScalarType dtype = at::kChar, head_dtype = at::kChar;
     bool acc32 = false, gemv = true, packed_qkv = true, fused_mlp = true;
     bool fused_down_norm = false;
     bool tts_predictor = false, tts_head = false;
 };
 
-bool linear_name(const std::string& name, const DecodeProfile& profile, bool head,
-                 bool mlp = false) {
-    const auto dtype = head ? profile.head_dtype :
-        (mlp ? profile.mlp_dtype : profile.dtype);
-    if (!head && profile.gemv && dtype != at::kByte)
-        return name == (dtype == at::kHalf ? "llama_gemv" : "llama_gemv_wint8");
+bool linear_name(const std::string& name, const DecodeProfile& profile, bool head) {
+    if (!head && profile.gemv)
+        return name == (profile.dtype == at::kHalf ? "llama_gemv" : "llama_gemv_wint8");
     const bool acc32 = profile.acc32 && !(head && profile.tts_head);
+    const auto dtype = head ? profile.head_dtype : profile.dtype;
     using namespace rpu_pl_tiling;
     for (int n : {128, 112, 96, 80, 64, 48, 32}) {
         std::string expected;
@@ -146,11 +144,6 @@ bool bind_decode_patches(const std::vector<DecodeKernelSlot>& kernels,
     };
     const auto linear = [&]() {
         if (cursor == kernels.size() || !linear_name(kernels[cursor].name, profile, false)) return false;
-        ++cursor; return true;
-    };
-    const auto mlp_linear = [&]() {
-        if (cursor == kernels.size() ||
-            !linear_name(kernels[cursor].name, profile, false, true)) return false;
         ++cursor; return true;
     };
     const auto position_patch = [&]() {
@@ -201,14 +194,13 @@ bool bind_decode_patches(const std::vector<DecodeKernelSlot>& kernels,
         if (profile.fused_mlp) {
             if (!take("qwen3vl_gateup_swiglu_gemv")) return false;
         } else if (profile.tts_predictor && !profile.acc32) {
-            if (!mlp_linear() || !mlp_linear() || !take("llama_silu_mul")) return false;
+            if (!linear() || !linear() || !take("llama_silu_mul")) return false;
         } else if (profile.layers == 36 && profile.dtype == at::kChar && profile.gemv) {
-            if (!mlp_linear() || !mlp_linear() || !take("silu_mul")) return false;
-        } else if (!mlp_linear() || !take("unary") || !mlp_linear() ||
-                   !take("binary_sameshape")) return false;
+            if (!linear() || !linear() || !take("silu_mul")) return false;
+        } else if (!linear() || !take("unary") || !linear() || !take("binary_sameshape")) return false;
         if (profile.fused_down_norm && layer >= 3 && layer + 1 < profile.layers) {
             if (!take("qwen3vl_o_ring_norm_m1_h2560_w8")) return false;
-        } else if (!mlp_linear() || !take("llm_all_reduce_residual_nopace")) return false;
+        } else if (!linear() || !take("llm_all_reduce_residual_nopace")) return false;
         if (!profile.tts_predictor && layer < 3 && !take("binary_sameshape")) return false;
     }
     if (!norm()) return false;
@@ -295,7 +287,6 @@ struct CausalDecoderModel::Qwen3VlDecodeReplayState {
     static DecodeProfile profile(const CausalDecoderModel& model) {
         DecodeProfile p;
         p.layers = model.num_layers(); p.dtype = model.layer_weights_.front().q_w.scalar_type();
-        p.mlp_dtype = model.layer_weights_.front().gate_w.scalar_type();
         p.acc32 = model.linear_acc32_; p.gemv = model.qwen3vl_decode_gemv(1);
         p.packed_qkv = p.gemv && model.qwen3vl_4b_packed_qkv_weights_;
         p.fused_mlp = p.gemv && model.qwen3vl_4b_decode_gateup_fused_;
@@ -473,12 +464,10 @@ bool CausalDecoderModel::begin_qwen3vl_decode_replay(
         !layer_weights_.empty() && layer_weights_.front().q_w.defined() &&
         layer_weights_.front().q_w.scalar_type() == at::kHalf;
     const bool lightnav_candidate_head =
-        (qwen3vl_fp16_decode_profile_ || qwen3vl_4b_w8_profile_ ||
-         qwen3vl_4b_mlp_w4_profile_) &&
+        (qwen3vl_fp16_decode_profile_ || qwen3vl_4b_w8_profile_) &&
         fuse_lm_head_ && (vocab_size_ == 4480 || vocab_size_ == 1408) && !linear_acc32_ &&
         lm_head_w_.scalar_type() == at::kHalf;
-    const bool ordinary = qwen3vl_ordinary_resident_prefill_profile_ ||
-        qwen3vl_4b_w8_profile_ || qwen3vl_4b_mlp_w4_profile_ || exact_8b || tts_predictor;
+    const bool ordinary = qwen3vl_ordinary_resident_prefill_profile_ || qwen3vl_4b_w8_profile_ || exact_8b || tts_predictor;
     const bool geometry = (num_layers() == 28 && hidden_size() == 2048 && intermediate_size() == 6144 && num_q_heads() == 16) ||
         (num_layers() == 36 && hidden_size() == 2560 && intermediate_size() == 9728 && num_q_heads() == 32) || exact_8b || tts_predictor;
     const bool envelope = tts_predictor || (chunk_envelope().max_kv_len > 0 &&

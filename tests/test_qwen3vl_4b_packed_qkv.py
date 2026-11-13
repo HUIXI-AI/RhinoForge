@@ -52,7 +52,7 @@ struct BufferDecl {
 struct Layout { int64_t chunk_size=1,batch_size=1; bool is_causal=true,use_attn_mask=false; };
 struct Decoder {
  bool qwen3vl_fp16_decode_profile_=false;
- bool qwen3vl_4b_packed_qkv_weights_=true,qwen3vl_4b_w8_profile_=true,qwen3vl_4b_mlp_w4_profile_=false;
+ bool qwen3vl_4b_packed_qkv_weights_=true,qwen3vl_4b_w8_profile_=true;
  bool linear_acc32_=false,decoder_mixed_precision_=false,adarms_=false;
  CausalDecoderPlanningMode planning_mode_=CausalDecoderPlanningMode::ORDINARY;
 ''' + methods + r'''

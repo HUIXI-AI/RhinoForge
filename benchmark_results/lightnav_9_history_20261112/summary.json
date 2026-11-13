@@ -20,7 +20,7 @@
       "prefill": 89.066,
       "decode_5": 114.759,
       "total": 313.817,
-      "frame_total": 318.510
+      "frame_total": 318.51
     },
     "tubelet_pool_cache": {
       "prepare": 17.637,
@@ -104,11 +104,50 @@
         "different_tokens": "0/175"
       },
       "decision": "token-exact on customer set; broader navigation accuracy evaluation required"
+    },
+    "text_mlp_w4a16": {
+      "scope": "all 35 frames; calibrated Vision W8A16; MLP Gate/Up/Down W4A16 G32; attention W8A16",
+      "prepare": 17.311,
+      "vision": 26.313,
+      "vision_vit": 21.63,
+      "vision_pool": 4.337,
+      "prefill": 84.437,
+      "prefill_model": 84.322,
+      "decode_5": 91.843,
+      "decode_model": 90.7,
+      "decode_select": 0.844,
+      "decode_upload": 0.205,
+      "total": 220.2,
+      "frame_total": 222.779,
+      "token_equal_frames": "11/35",
+      "token_equal_tokens": "130/175",
+      "different_tokens": "45/175",
+      "decision": "rejected: token accuracy regression"
+    },
+    "text_gate_up_w4a16": {
+      "scope": "all 35 frames; calibrated Vision W8A16; Gate/Up W4A16 G32; attention/Down W8A16",
+      "prepare": 18.02,
+      "vision": 27.113,
+      "prefill": 89.448,
+      "decode_5": 101.874,
+      "total": 236.765,
+      "frame_total": 239.353,
+      "token_equal_frames": "19/35",
+      "token_equal_tokens": "144/175",
+      "different_tokens": "31/175",
+      "decision": "rejected: token accuracy regression"
+    },
+    "text_up_only_w4a16": {
+      "scope": "early accuracy gate on frames 0-8; calibrated Vision W8A16; Up W4A16 G32; attention/Gate/Down W8A16",
+      "token_equal_frames": "0/9",
+      "token_equal_tokens": "8/45",
+      "different_tokens": "37/45",
+      "decision": "rejected before full timing benchmark: token accuracy regression"
     }
   },
   "not_implemented": {
     "fixed_four_step_decode_graph": "The four decode steps are autoregressive. Host token selection and upload cost only about 1.1 ms total, while decoder model execution costs about 113.3 ms. The current runtime has no device-side top1-to-token-to-embedding chain.",
-    "text_w4a16": "No original FP16 checkpoint was available for a fair conversion, and LightNav W4A16 has no validated runtime profile."
+    "text_w4a16": "Three increasingly conservative W4/G32 profiles were tested. All-MLP matched 130/175 tokens, Gate/Up matched 144/175, and Up-only matched 8/45 in the nine-frame early gate. All were rejected; the token-exact W8A16 path remains production."
   },
   "source_results_on_r1": [
     "/run/customer_lightnav_repro_20261111/outputs/history9_no_prefetch_35.json",
@@ -119,5 +158,46 @@
     "/run/customer_lightnav_repro_20261111/outputs/history9_vision_w8_encoder104_aux100_35.json",
     "/run/customer_lightnav_repro_20261111/outputs/history9_vision_w8_encoder104_aux100_repeat_35.json",
     "/run/customer_lightnav_repro_20261111/outputs/history9_vision_w8_production_final_35.json"
-  ]
+  ],
+  "new_r1_validation_20261113": {
+    "device": "R1 10.10.32.153",
+    "runtime": "v1.2.0",
+    "scope": "chip_provider_repro_minimal_20261111, 35 frames; frame_index >= 10; 9 history + current; no previous-request draft",
+    "input_tokens": 347,
+    "vision_cache_hit_miss": "4/1",
+    "precision": "Text W8A16 + calibrated Vision W8A16",
+    "run_1_ms": {
+      "prepare": 20.448,
+      "vision": 47.655,
+      "vision_vit": 42.058,
+      "vision_pool": 5.028,
+      "vision_pool_wait": 0.122,
+      "prefill": 91.024,
+      "prefill_model": 90.901,
+      "decode_5": 114.988,
+      "decode_model": 113.734,
+      "decode_select": 0.919,
+      "decode_upload": 0.228,
+      "total": 276.413,
+      "frame_total": 279.12
+    },
+    "cold_repeat_ms": {
+      "prepare": 20.7,
+      "vision": 48.283,
+      "vision_vit": 42.583,
+      "vision_pool": 5.099,
+      "vision_pool_wait": 0.122,
+      "prefill": 91.196,
+      "prefill_model": 91.049,
+      "decode_5": 115.036,
+      "decode_model": 113.768,
+      "decode_select": 0.947,
+      "decode_upload": 0.227,
+      "total": 276.618,
+      "frame_total": 279.126
+    },
+    "cold_repeat_token_equal_frames": "35/35",
+    "cold_repeat_token_equal_tokens": "175/175",
+    "comparison_to_previous_r1": "Text stages remain within about 1.4 ms; Vision is about 20.8 ms slower and accounts for most of the about 27.8 ms Total increase."
+  }
 }

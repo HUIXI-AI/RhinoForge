@@ -28,8 +28,6 @@ from .int4_pgrp_pack import quantize_int4_group_wise
 PROFILE = "qwen3_vl_4b_w8a16_runtime_align_v1"
 LIGHTNAV_W8_PROFILE = "lightnav_0_4b_w8a16_text_v1"
 LIGHTNAV_W8_VISION_PROFILE = "lightnav_0_4b_w8a16_text_vision_v1"
-LIGHTNAV_MLP_W4_PROFILE = "lightnav_0_4b_mlp_w4a16_attn_w8a16_text_v1"
-LIGHTNAV_MLP_W4_VISION_PROFILE = "lightnav_0_4b_mlp_w4a16_attn_w8a16_text_vision_v1"
 QUANT_CONFIG = {
     "method": "w8a16",
     "profile": PROFILE,
@@ -97,31 +95,6 @@ def lightnav_w8_quant_config(*, vision: bool = False) -> dict:
         vision_quantization="per_channel_on_install" if vision else "fp16",
     )
     return result
-
-
-def lightnav_mlp_w4_quant_config(*, vision: bool = False) -> dict:
-    """LightNav MLP W4/G32 with attention W8; keep its action head FP16."""
-    result = lightnav_w8_quant_config(vision=vision)
-    result.update(
-        method="mixed_mlp_w4a16_attn_w8a16",
-        profile=(LIGHTNAV_MLP_W4_VISION_PROFILE if vision
-                 else LIGHTNAV_MLP_W4_PROFILE),
-        mode="per_projection_symmetric",
-        group_size=32,
-        projection_quantization={"self_attn": "w8a16", "mlp": "w4a16"},
-        weight_storage="mixed_int8_and_logical_twos_complement_uint8_n_kdiv2",
-        scale_storage="per_channel_fp16_n_or_logical_fp16_g_n",
-    )
-    return result
-
-
-def projection_bits(quant_config: dict, name: str) -> int:
-    method = quant_config["method"]
-    if method == "mixed_mlp_w4a16_attn_w8a16":
-        return 4 if ".mlp." in name else 8
-    if method in ("w8a16", "w4a16"):
-        return 4 if method == "w4a16" else 8
-    raise ValueError(f"unsupported Qwen3-VL runtime quantization method: {method}")
 
 
 def _copy_lightnav_action_tokenizer(src: Path, dst: Path) -> None:
@@ -387,7 +360,7 @@ def _convert_awq_checkpoint(src, dst, config, *, bits):
 
 def convert_checkpoint(
     src: str | Path, dst: str | Path, *, bits: int = 8,
-    lightnav_vision_w8: bool = False, lightnav_mlp_w4: bool = False,
+    lightnav_vision_w8: bool = False,
 ) -> dict:
     src, dst = Path(src).expanduser().resolve(), Path(dst).expanduser().resolve()
     config = json.loads((src / "config.json").read_text())
@@ -407,19 +380,15 @@ def convert_checkpoint(
     is_lightnav = matches_lightnav_geometry(config)
     if lightnav_vision_w8 and not is_lightnav:
         raise ValueError("--lightnav-vision-w8 requires a LightNav checkpoint")
-    if lightnav_mlp_w4 and not is_lightnav:
-        raise ValueError("--lightnav-mlp-w4 requires a LightNav checkpoint")
     if (not (matches_runtime_geometry(config) or is_lightnav) or not valid_tie
             or any(_get(owner, key) is not None for owner in
                    (config, config["text_config"], config["vision_config"])
                    for key in ("quant_config", "quantization_config"))):
         raise ValueError("conversion requires an exact unquantized official Qwen3-VL-Instruct config")
     if is_lightnav and bits != 8:
-        raise ValueError("LightNav recipes use --bits 8; select MLP W4 with --lightnav-mlp-w4")
+        raise ValueError("LightNav runtime quantization supports Text7 W8A16 only")
     quant_config = (
-        (lightnav_mlp_w4_quant_config(vision=lightnav_vision_w8)
-         if lightnav_mlp_w4 else
-         lightnav_w8_quant_config(vision=lightnav_vision_w8)) if is_lightnav else
+        lightnav_w8_quant_config(vision=lightnav_vision_w8) if is_lightnav else
         runtime_quant_config(config["text_config"]["hidden_size"], bits)
     )
     if dst.exists():
@@ -471,8 +440,7 @@ def convert_checkpoint(
                 if name in expected or (
                     name == HEAD_NAME and quant_config["quantized_lm_head"]
                 ):
-                    out[name], out[name[:-7] + ".weight_scale"] = quantize_weight(
-                        tensor, bits=projection_bits(quant_config, name))
+                    out[name], out[name[:-7] + ".weight_scale"] = quantize_weight(tensor, bits=bits)
                     stats["n_quantized"] += 1
                 else:
                     out[name] = tensor.to(torch.float16).contiguous()
@@ -522,12 +490,10 @@ def main():
     parser.add_argument("--dst", required=True)
     parser.add_argument("--bits", type=int, choices=(8, 4), default=8)
     parser.add_argument("--lightnav-vision-w8", action="store_true")
-    parser.add_argument("--lightnav-mlp-w4", action="store_true")
     args = parser.parse_args()
     print(json.dumps(convert_checkpoint(
         args.src, args.dst, bits=args.bits,
         lightnav_vision_w8=args.lightnav_vision_w8,
-        lightnav_mlp_w4=args.lightnav_mlp_w4,
     ), indent=2))
 
 

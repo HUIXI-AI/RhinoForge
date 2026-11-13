@@ -81,7 +81,30 @@ tokens across the 35 frames remain identical. The steady-state mean
 `decode_5` time changes from 114.625 ms to 114.285 ms and Total from 248.851 ms
 to 248.617 ms. A single-decode device trace changes from 27.134 ms to 27.079 ms;
 this is a verified small gain, while Gate/Up and weight traffic remain the main
-bottlenecks. See
+bottlenecks.
+
+Three W4A16/G32 profiles were then measured to reduce weight traffic further.
+All-MLP W4 reached 84.437/91.843/220.200 ms Prefill/Decode/Total, but matched
+only 130/175 tokens and 11/35 frames. Gate/Up W4 reached
+89.448/101.874/236.765 ms and matched 144/175 tokens and 19/35 frames. The final
+profile quantized only Up while retaining Attention, Gate, and Down at W8A16
+and the action head at FP16. Its early accuracy gate still matched only 8/45
+tokens and 0/9 frames on the first nine identical input windows, so a full
+timing run was not performed. All three W4 profiles are excluded from the
+delivery code; the token-exact 175/175 W8A16 weight path remains the production
+configuration. The lower W4 latency does not justify changing the hierarchical
+action tokens.
+
+The same production build was cold-loaded twice on a second R1 with the same
+35-frame input. Both runs matched each other for 35/35 frames and 175/175
+tokens. Steady-state medians were 47.655/48.283 ms Vision,
+91.024/91.196 ms Prefill, 114.988/115.036 ms Decode, and 276.413/276.618 ms
+Total. Prefill and Decode stayed within about 1.4 ms of the original R1 result.
+Most of the roughly 27.8 ms Total increase came from Vision, which was about
+20.8 ms slower. The stable repeat indicates a machine-side Vision performance
+difference rather than a regression in the W8 text-weight path.
+
+See
 `benchmark_results/lightnav_9_history_20261112/summary.json` for the full result.
 
 ## Run

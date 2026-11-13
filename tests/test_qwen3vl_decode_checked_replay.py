@@ -80,7 +80,7 @@ public:
  Tensor cos_,sin_,final_norm_w_,qwen3vl_4b_qkv_scale_bank_,lm_head_w_,lm_head_w_scale_,position_ids_keepalive_;
  bool qwen3vl_4b_decode_o_ring_norm_fused_=false,qwen3vl_4b_decode_down_ring_norm_fused_=false;
  bool qwen3vl_fp16_decode_profile_=false,linear_acc32_=false;
- bool qwen3vl_ordinary_resident_prefill_profile_=false,qwen3vl_4b_w8_profile_=true,qwen3vl_4b_mlp_w4_profile_=false;
+ bool qwen3vl_ordinary_resident_prefill_profile_=false,qwen3vl_4b_w8_profile_=true;
  bool decoder_mixed_precision_=false,wall_prefill_staged_mlp_=false,wall_prefill_mixed_requested_=false,wall_prefill_staged_requested_=false;
  bool adarms_=false,qwen3vl_pooler_z1_dispatch_=false,qwen3vl_multiview_text_composite_dispatch_=false;
  bool has_qk_norm_=true,has_mrope_=true;
@@ -411,10 +411,6 @@ void exact_8b_cases(){
  }
 }
 int main(){
- {v3::DecodeProfile mixed;mixed.mlp_dtype=at::kByte;bool found=false;
-  for(const auto&name:rpu_pl_tiling::autotile_kernel_names())
-   found=found||v3::linear_name(name,mixed,false,true);
-  assert(found&&!v3::linear_name("llama_gemv_wint8",mixed,false,true));}
  tts_cases();tts_fused_head_cases();
  for(auto flag:{&Model::decoder_mixed_precision_,&Model::wall_prefill_staged_mlp_,
                  &Model::wall_prefill_mixed_requested_,&Model::wall_prefill_staged_requested_}){

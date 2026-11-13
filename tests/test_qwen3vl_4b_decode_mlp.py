@@ -119,8 +119,9 @@ void rpu_launch_all_reduce_sum_residual_kernel(uint32_t partial,uint32_t residua
 }
 struct Model {
  bool qwen3vl_fp16_decode_profile_=false;
- bool qwen3vl_4b_w8_profile_=__IS_4B__,linear_acc32_=false,decoder_mixed_precision_=false,adarms_=false;
-      bool qwen3vl_4b_decode_gateup_fused_=__FUSED__,qwen3vl_4b_decode_down_ring_norm_fused_=false;
+ bool qwen3vl_4b_w8_profile_=__IS_4B__,qwen3vl_4b_mlp_w4_profile_=false;
+ bool linear_acc32_=false,decoder_mixed_precision_=false,adarms_=false;
+ bool qwen3vl_4b_decode_gateup_fused_=__FUSED__,qwen3vl_4b_decode_down_ring_norm_fused_=false;
   bool qwen3vl_pooler_z1_dispatch_=false,qwen3vl_multiview_text_composite_dispatch_=false;
   CausalDecoderPlanningMode planning_mode_=CausalDecoderPlanningMode::ORDINARY;
       int64_t seq_len_=1;double eps_=1e-6;bool partial_mrope_active_=false;Context context;bool last_shared=false;
@@ -212,6 +213,10 @@ int main(){
       &Model::qwen3vl_pooler_z1_dispatch_,&Model::qwen3vl_multiview_text_composite_dispatch_}){
     Model bad;bad.*field=true;excluded(bad,layout,1,1,ChunkMode::SEQUENTIAL);}
   {Model bad;bad.qwen3vl_4b_w8_profile_=false;excluded(bad,layout,1,1,ChunkMode::SEQUENTIAL);}
+  if(!fused){
+   Model mixed;mixed.qwen3vl_4b_w8_profile_=false;mixed.qwen3vl_4b_mlp_w4_profile_=true;
+   assert(mixed.qwen3vl_decode_mlp(1,1,true,false,1));
+  }
   for(auto mode:{CausalDecoderPlanningMode::WALL_Z1,CausalDecoderPlanningMode::QWEN3VL_POOLER_Z1,
       CausalDecoderPlanningMode::QWEN3VL_MULTIVIEW_TEXT}){Model bad;bad.planning_mode_=mode;excluded(bad,layout,1,1,ChunkMode::SEQUENTIAL);}
   excluded(Model{},layout,1,1,ChunkMode::KV_FIRST);

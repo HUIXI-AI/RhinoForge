@@ -294,7 +294,7 @@ def load_qwen3_vl_awq_imagetext(config, ckpt_dir: str, *, dtype=torch.float16, *
     return model
 
 
-def _allocate_awq_scale_views(model):
+def _allocate_awq_scale_views(model, names=None):
     """One FP16 scale owner; native retention still checks device alignment.
 
     Relative 4096B offsets preserve the pgrp controller alignment when the
@@ -303,6 +303,8 @@ def _allocate_awq_scale_views(model):
     """
     layout, size = [], 0
     for name, module, _ in _projection_inventory(model):
+        if names is not None and name not in names:
+            continue
         scale = module.weight_scale
         if (scale.device.type != "cpu" or scale.dtype != torch.float16
                 or scale.dim() != 2 or scale.size(0) != 32
@@ -311,6 +313,8 @@ def _allocate_awq_scale_views(model):
         offset = (size + 4095) // 4096 * 4096
         layout.append((name, scale, offset // 2))
         size = offset + scale.numel() * 2
+    if not layout:
+        raise ValueError("AWQ scale bank requires at least one selected projection")
     storage = torch.empty(size // 2, dtype=torch.float16, device="rpu")
     views = {}
     for name, scale, offset in layout:

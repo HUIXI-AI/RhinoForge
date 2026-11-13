@@ -120,7 +120,8 @@ struct Model {
  template<class... Args>bool emit_lingbot_prefill_kv_pair(Args...)const{return false;}
  bool qwen3vl_fp16_decode_profile_=false;
  bool rhinovla_high_precision_=false,rhinovla_high_precision_fusions_=false;
- bool qwen3vl_4b_w8_profile_=true,qwen3vl_4b_decode_qk_fused_=true,qwen3vl_4b_decode_qk_kv_fused_=false;
+     bool qwen3vl_4b_w8_profile_=true,qwen3vl_4b_mlp_w4_profile_=false;
+     bool qwen3vl_4b_decode_qk_fused_=true,qwen3vl_4b_decode_qk_kv_fused_=false;
   bool linear_acc32_=false,decoder_mixed_precision_=false,adarms_=false;
   bool qwen3vl_pooler_z1_dispatch_=false,qwen3vl_multiview_text_composite_dispatch_=false;
   bool has_qk_norm_=true,has_mrope_=true,partial_mrope_active_=false,qwen3vl_2b_w8_profile_=false;
@@ -355,7 +356,8 @@ struct Model {
  bool has_scale=true,has_nvfp4=false,use_silu=true,has_qk_norm_=true,has_qkv_bias_=false;
  std::vector<int64_t> mrope_section{24,20,20},deepstack_lang_layers{0,1,2};
  std::vector<at::Tensor> q_w_list{36},k_w_list{36},v_w_list{36},o_w_list{36},gate_list{36},up_list{36},down_list{36};
- bool qwen3vl_4b_w8_profile_=false,qwen3vl_4b_decode_gateup_fused_=false,qwen3vl_4b_decode_qk_fused_=false,qwen3vl_4b_decode_qk_kv_fused_=false,qwen3vl_4b_decode_o_ring_norm_fused_=false,qwen3vl_4b_decode_down_ring_norm_fused_=false;
+ bool qwen3vl_4b_w8_profile_=false,qwen3vl_4b_mlp_w4_profile_=false;
+ bool qwen3vl_4b_decode_gateup_fused_=false,qwen3vl_4b_decode_qk_fused_=false,qwen3vl_4b_decode_qk_kv_fused_=false,qwen3vl_4b_decode_o_ring_norm_fused_=false,qwen3vl_4b_decode_down_ring_norm_fused_=false;
  bool explicit_mask_residency_requested_=false;
  bool wall_prefill_staged_mlp_=false,decode_gate_up_fusion_=false,prefill_packed_gate_up_strided_=false,qwen3vl_4b_packed_qkv_weights_=false;
  std::vector<int64_t> deepstack_lang_layers_{0,1,2};int configured_vocab_size_=0,cores=8;

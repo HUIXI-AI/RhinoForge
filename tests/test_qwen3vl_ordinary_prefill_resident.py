@@ -86,7 +86,7 @@ struct LayerWeights { at::Tensor q_w; };
 struct CausalDecoderModel {
  int64_t N=28,H=2048,I=6144,Q=16,KV=8,D=128,cores=8;
  bool has_scale=true,has_nvfp4=false,use_silu=true,has_qk_norm_=true,has_qkv_bias_=false;
- bool qwen3vl_fp16_decode_profile_=false,qwen3vl_4b_w8_profile_=false;
+ bool qwen3vl_fp16_decode_profile_=false,qwen3vl_4b_w8_profile_=false,qwen3vl_4b_mlp_w4_profile_=false;
  bool qwen3vl_ordinary_resident_prefill_profile_=false,linear_acc32_=false,adarms_=false;
  bool decoder_mixed_precision_=false,decode_gate_up_fusion_=false,wall_prefill_staged_mlp_=false;
  bool pre_layers_residual1_ready_=false,wall_z1_dispatch_=false,qwen3vl_pooler_z1_dispatch_=false;

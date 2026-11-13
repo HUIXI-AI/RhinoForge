@@ -44,7 +44,7 @@ def awq_runtime_config(size=2):
     return result
 
 
-def lightnav_config(*, source=False):
+def lightnav_config(*, source=False, mlp_w4=False):
     result = exact_config(4)
     del result.quantization_config
     result.split_embeddings = False
@@ -54,7 +54,8 @@ def lightnav_config(*, source=False):
     result.vision_config.model_type = "qwen3_vl_vision"
     result.tie_word_embeddings = result.text_config.tie_word_embeddings = source
     if not source:
-        result.quant_config = convert.lightnav_w8_quant_config()
+        result.quant_config = (convert.lightnav_mlp_w4_quant_config()
+                               if mlp_w4 else convert.lightnav_w8_quant_config())
     return result
 
 
@@ -76,6 +77,20 @@ def test_lightnav_w8_quantizes_text_only_and_keeps_exact_admission():
     vision_w8 = copy.deepcopy(quantized)
     vision_w8.quant_config = convert.lightnav_w8_quant_config(vision=True)
     assert runtime.is_qwen3_vl_runtime_quant_config(vision_w8)
+
+
+def test_lightnav_mlp_w4_keeps_attention_w8_and_action_head_fp16():
+    mixed = lightnav_config(mlp_w4=True)
+    assert runtime.is_qwen3_vl_runtime_quant_config(mixed)
+    assert mixed.quant_config["quantized_lm_head"] is False
+    assert convert.projection_bits(
+        mixed.quant_config, "model.language_model.layers.0.self_attn.q_proj") == 8
+    assert convert.projection_bits(
+        mixed.quant_config, "model.language_model.layers.0.mlp.gate_proj") == 4
+
+    changed = copy.deepcopy(mixed)
+    changed.quant_config["projection_quantization"]["self_attn"] = "w4a16"
+    assert not runtime.is_qwen3_vl_runtime_quant_config(changed)
 
 
 def test_lightnav_conversion_copies_action_tokenizer_bundle(tmp_path):

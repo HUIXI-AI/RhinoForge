@@ -1451,6 +1451,22 @@ public:
                 up_list[i].scalar_type() == at::kChar &&
                 down_list[i].scalar_type() == at::kChar;
         }
+        qwen3vl_4b_mlp_w4_profile_ = N == 36 && num_cores() == 8 && has_scale &&
+            !has_nvfp4 && hidden_size == 2560 && intermediate_size == 9728 &&
+            num_q_heads == 32 && num_kv_heads == 8 && head_dim == 128 &&
+            mrope_section == std::vector<int64_t>{24, 20, 20} &&
+            deepstack_lang_layers == std::vector<int64_t>{0, 1, 2} &&
+            use_silu && has_qk_norm_ && !has_qkv_bias_;
+        for (int64_t i = 0; qwen3vl_4b_mlp_w4_profile_ && i < N; ++i) {
+            qwen3vl_4b_mlp_w4_profile_ =
+                q_w_list[i].scalar_type() == at::kChar &&
+                k_w_list[i].scalar_type() == at::kChar &&
+                v_w_list[i].scalar_type() == at::kChar &&
+                o_w_list[i].scalar_type() == at::kChar &&
+                gate_list[i].scalar_type() == at::kByte &&
+                up_list[i].scalar_type() == at::kByte &&
+                down_list[i].scalar_type() == at::kByte;
+        }
         // QK postprocessing consumes FP16 activations and BASE RMSNorm, not
         // projection weights. Its exact 4B geometry also applies to FP16
         // ACC32 and packed W4 without changing either Linear route.
@@ -1472,6 +1488,7 @@ public:
                 up_list[i].scalar_type() == projection_dtype &&
                 down_list[i].scalar_type() == projection_dtype;
         }
+        qwen3vl_4b_qk_profile = qwen3vl_4b_qk_profile || qwen3vl_4b_mlp_w4_profile_;
         // Bind the optional payload once, before planning/capture. Its presence
         // changes the actual COMPLETE route; an old REF keeps the original MLP.
         wall_base_prefill_shared_input_ = wall_sorting_.silu_mul &&
@@ -1509,9 +1526,9 @@ public:
             KernelCache::instance().has_loaded(KernelId::QWEN3VL_QK_NORM_MROPE_D128);
         qwen3vl_4b_decode_qk_kv_fused_ = qwen3vl_4b_qk_profile &&
             KernelCache::instance().has_loaded(KernelId::QWEN3VL_QK_NORM_MROPE_KV_INSERT_D128);
-        qwen3vl_4b_decode_o_ring_norm_fused_ = qwen3vl_4b_w8_profile_ &&
+        qwen3vl_4b_decode_o_ring_norm_fused_ = (qwen3vl_4b_w8_profile_ || qwen3vl_4b_mlp_w4_profile_) &&
             KernelCache::instance().has_loaded(KernelId::QWEN3VL_O_RING_NORM_M1_H2560_W8);
-        qwen3vl_4b_decode_down_ring_norm_fused_ = qwen3vl_4b_decode_o_ring_norm_fused_;
+        qwen3vl_4b_decode_down_ring_norm_fused_ = qwen3vl_4b_w8_profile_ && qwen3vl_4b_decode_o_ring_norm_fused_;
         // Reuse the FP16 dynamic-row QKV and ordinary SiLU/Mul packets for
         // the base owner's two-chunk prefill. This does not admit FP16 to
         // the W8 shared-input/no-Up payloads or change any SPM allocation.
@@ -1547,7 +1564,8 @@ public:
             }) && KernelCache::instance().has_loaded(KernelId::WALL_BASE_PREFILL_O_OWNER_RING_NORM_M224);
         // Cold opt-in by actual storage, not a model-name route override.
         // General native callers with independent Q/K/V keep separate GEMVs.
-        qwen3vl_4b_packed_qkv_weights_ = qwen3vl_4b_w8_profile_;
+        qwen3vl_4b_packed_qkv_weights_ =
+            qwen3vl_4b_w8_profile_ || qwen3vl_4b_mlp_w4_profile_;
         for (int64_t i = 0; qwen3vl_4b_packed_qkv_weights_ && i < N; ++i) {
             qwen3vl_4b_packed_qkv_weights_ = qwen3vl_4b_qkv_storage_contiguous(
                 q_w_list[i], k_w_list[i], v_w_list[i]) &&
@@ -1696,6 +1714,9 @@ public:
             if (qwen3vl_4b_decode_o_ring_norm_fused_) {
                 auto& weights = layer_weights_.back();
                 weights.o_ws = retain_qwen3vl_4b_ring_norm_scale(weights.o_ws);
+            }
+            if (qwen3vl_4b_decode_down_ring_norm_fused_) {
+                auto& weights = layer_weights_.back();
                 weights.down_ws = retain_qwen3vl_4b_ring_norm_scale(weights.down_ws);
             }
         }
@@ -3112,7 +3133,8 @@ public:
     }
 
     void set_lightnav_heads(at::TensorList heads) {
-        TORCH_CHECK((qwen3vl_fp16_decode_profile_ || qwen3vl_4b_w8_profile_) &&
+        TORCH_CHECK((qwen3vl_fp16_decode_profile_ || qwen3vl_4b_w8_profile_ ||
+                        qwen3vl_4b_mlp_w4_profile_) &&
                         num_layers() == 36 && hidden_size() == 2560 &&
                         intermediate_size() == 9728 && num_q_heads() == 32 &&
                         num_kv_heads() == 8 && head_dim() == 128 && has_mrope_ &&
@@ -4264,6 +4286,7 @@ protected:
             h = detail::layout_mix(h, CAUSAL_DECODER_MASK_SPM_SCHEDULE_SITE);
         }
         h = detail::layout_mix(h, decode_gate_up_fusion_ ? 1 : 0);
+        h = detail::layout_mix(h, qwen3vl_4b_mlp_w4_profile_ ? 1 : 0);
         h = detail::layout_mix(h, prefill_packed_gate_up_strided_ ? 1 : 0);
         if (qwen3vl_4b_packed_qkv_weights_) {
             h = detail::layout_mix(h, CAUSAL_DECODER_4B_W8_PACKED_QKV_SITE);
@@ -4541,7 +4564,8 @@ protected:
 
 
     bool qwen3vl_decode_gemv(int64_t physical_len) const {
-        return (qwen3vl_4b_w8_profile_ || qwen3vl_fp16_decode_profile_) &&
+        return (qwen3vl_4b_w8_profile_ || qwen3vl_4b_mlp_w4_profile_ ||
+                qwen3vl_fp16_decode_profile_) &&
             physical_len == 1 &&
             !linear_acc32_ && !decoder_mixed_precision_ && !adarms_ &&
             planning_mode_ == CausalDecoderPlanningMode::ORDINARY;
@@ -4550,7 +4574,8 @@ protected:
     bool qwen3vl_decode_mlp(
         int64_t physical_len, int64_t rows, bool is_causal,
         bool use_attn_mask, int64_t batch_size) const {
-        return qwen3vl_4b_w8_profile_ && qwen3vl_decode_gemv(physical_len) && rows == 1 &&
+        return (qwen3vl_4b_w8_profile_ || qwen3vl_4b_mlp_w4_profile_) &&
+            qwen3vl_decode_gemv(physical_len) && rows == 1 &&
             is_causal && !use_attn_mask && batch_size == 1 &&
             !qwen3vl_pooler_z1_dispatch_ && !qwen3vl_multiview_text_composite_dispatch_;
     }
@@ -10459,6 +10484,7 @@ protected:  // LingBot2 sparse-MoE subclass reuses the decoder's layer state.
     bool qwen3vl_2b_w8_profile_ = false;
     bool qwen3vl_ordinary_resident_prefill_profile_ = false;
     bool qwen3vl_4b_w8_profile_ = false;
+    bool qwen3vl_4b_mlp_w4_profile_ = false;
     bool qwen3vl_fp16_decode_profile_ = false;
     bool qwen3vl_4b_decode_gateup_fused_ = false;
     bool wall_base_prefill_shared_input_ = false;

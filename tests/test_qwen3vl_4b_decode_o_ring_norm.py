@@ -87,7 +87,8 @@ void rpu_launch_qwen3vl_4b_decode_o_ring_norm_spm_kernel(uint32_t input,const at
 }
 struct CausalDecoderModel{
  bool qwen3vl_fp16_decode_profile_=false;
- bool qwen3vl_4b_w8_profile_=true,qwen3vl_4b_decode_o_ring_norm_fused_=true;
+     bool qwen3vl_4b_w8_profile_=true,qwen3vl_4b_mlp_w4_profile_=false;
+     bool qwen3vl_4b_decode_o_ring_norm_fused_=true;
  bool linear_acc32_=false,decoder_mixed_precision_=false,adarms_=false,wall_z1_dispatch_=false;
  bool qwen3vl_pooler_z1_dispatch_=false,qwen3vl_multiview_text_composite_dispatch_=false,partial_mrope_active_=false;
  bool has_mrope_=true,has_qkv_bias_=false,nvfp4_=false,wall_prefill_staged_mlp_=false;

@@ -20,8 +20,9 @@ from safetensors import safe_open
 from transformers import AutoModelForImageTextToText
 
 from .convert_qwen3_vl import (
-    _get, lightnav_w8_quant_config, matches_lightnav_geometry,
-    matches_runtime_geometry, runtime_quant_config,
+    _get, lightnav_mlp_w4_quant_config, lightnav_w8_quant_config,
+    matches_lightnav_geometry, matches_runtime_geometry, projection_bits,
+    runtime_quant_config,
 )
 from .int4_pgrp_pack import swizzle_int4_pgrp_scale, swizzle_pack_int4_pgrp
 from .load_qwen3_vl_awq import (
@@ -43,17 +44,22 @@ def is_qwen3_vl_runtime_quant_config(config) -> bool:
         ):
             return False
         h = _get(text, "hidden_size")
-        bits = {"w8a16": 8, "w4a16": 4}.get(qc.get("method"))
-        if bits is None or (h == 2560 and bits == 8 and not lightnav):
-            return False
-        expected = (
-            lightnav_w8_quant_config(
-                vision=qc.get("vision_quantization") != "fp16",
-            ) if lightnav else
-            runtime_quant_config(
+        if lightnav:
+            factories = {
+                "w8a16": lightnav_w8_quant_config,
+                "mixed_mlp_w4a16_attn_w8a16": lightnav_mlp_w4_quant_config,
+            }
+            factory = factories.get(qc.get("method"))
+            if factory is None:
+                return False
+            expected = factory(vision=qc.get("vision_quantization") != "fp16")
+        else:
+            bits = {"w8a16": 8, "w4a16": 4}.get(qc.get("method"))
+            if bits is None or (h == 2560 and bits == 8):
+                return False
+            expected = runtime_quant_config(
                 h, bits, source_quantization=qc.get("source_quantization"),
             )
-        )
         return (
             _get(config, "tie_word_embeddings") is False
             and _get(text, "tie_word_embeddings") is False
@@ -188,11 +194,11 @@ def load_qwen3_vl_runtime_imagetext(
     )
     if len(projections) != expected_projections:
         raise ValueError("runtime loader requires the configured Text7/head scope")
-    bits = 4 if config.quant_config["method"] == "w4a16" else 8
     shapes = {name: tuple(t.shape) for name, t in model.named_parameters(remove_duplicate=False)}
     expected = {name: (shape, "F16") for name, shape in shapes.items()}
     for name, module, partition in projections:
         n, k = module.out_features, module.in_features
+        bits = projection_bits(config.quant_config, name)
         if bits == 4 and ((partition == 1 and (n % 128 or k % 64))
                          or (partition == 0 and (n % 16 or k % 512))):
             raise ValueError(f"runtime W4 projection is outside TP8 pgrp geometry: {name}")
@@ -222,6 +228,7 @@ def load_qwen3_vl_runtime_imagetext(
             return handles[tensor_shards[name]].get_tensor(name)
         for name, module, partition in projections:
             weight, scale = tensor(name + ".weight"), tensor(name + ".weight_scale")
+            bits = projection_bits(config.quant_config, name)
             if bits == 4:
                 weight, scale = _pack_w4_projection(weight, scale,
                     n=module.out_features, k=module.in_features, partition=partition)
@@ -265,6 +272,45 @@ def _move_materialized_runtime_decoder_for_rpu(model) -> None:
         return
     names = tuple(tuple(f"model.language_model.layers.{i}.{role}.weight" for role, _ in _ROLES)
                   for i in range(len(model.model.language_model.layers)))
+    if model.config.quant_config["method"] == "mixed_mlp_w4a16_attn_w8a16":
+        from rpu_backend.runtime.weights import (
+            _record_linear_layout, _release_cpu_weight_pages,
+            transform_linear_weight,
+        )
+        flat_names = tuple(name for layer_names in names for name in layer_names)
+        w4_layers = tuple(tuple(name for name in layer_names if ".mlp." in name)
+                          for layer_names in names)
+        w8_layers = tuple(tuple(name for name in layer_names if ".self_attn." in name)
+                          for layer_names in names)
+        w4_names = tuple(name for layer_names in w4_layers for name in layer_names)
+        for name in flat_names:
+            module = model.get_submodule(name[:-len(".weight")])
+            bits = projection_bits(model.config.quant_config, name)
+            dtype = torch.uint8 if bits == 4 else torch.int8
+            if (module.weight.device.type != "cpu" or module.weight.dtype != dtype
+                    or not module.weight.is_contiguous()):
+                raise ValueError(f"mixed LightNav decoder has invalid CPU weight: {name}")
+        w4_views = _allocate_decoder_projection_views(model, w4_layers, dtype=torch.uint8)
+        w8_views = _allocate_decoder_projection_views(model, w8_layers, dtype=torch.int8)
+        scale_views = _allocate_awq_scale_views(
+            model, {name[:-len(".weight")] for name in w4_names})
+        for i, layer in enumerate(model.model.language_model.layers):
+            for role, partition in _ROLES:
+                name = f"model.language_model.layers.{i}.{role}"
+                module = layer.get_submodule(role)
+                if ".mlp." in name:
+                    target = w4_views[name + ".weight"]
+                    target.copy_(module.weight.detach())
+                    module.weight_scale = scale_views[name]
+                else:
+                    target = w8_views[name + ".weight"]
+                    target.copy_(transform_linear_weight(
+                        module.weight.detach(), partition, num_cores=8))
+                    _record_linear_layout(module, partition, 8)
+                module.weight = nn.Parameter(target, requires_grad=False)
+            layer.to("rpu")
+            _release_cpu_weight_pages()
+        return
     views = (None if per_layer else
              _allocate_decoder_projection_views(model, names, dtype=torch.uint8))
     scale_views = _allocate_awq_scale_views(model)

@@ -26,6 +26,12 @@ SPEC = importlib.util.spec_from_file_location("lightnav_benchmark", EXAMPLE_PATH
 assert SPEC is not None and SPEC.loader is not None
 BENCHMARK = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(BENCHMARK)
+INFERENCE_PATH = Path(__file__).resolve().parents[1] / "examples/lightnav_inference.py"
+INFERENCE_SPEC = importlib.util.spec_from_file_location("lightnav_inference", INFERENCE_PATH)
+assert INFERENCE_SPEC is not None and INFERENCE_SPEC.loader is not None
+INFERENCE = importlib.util.module_from_spec(INFERENCE_SPEC)
+sys.modules["lightnav_benchmark"] = BENCHMARK
+INFERENCE_SPEC.loader.exec_module(INFERENCE)
 
 
 def test_precomputed_vision_selects_the_matching_video_grid_and_token():
@@ -53,6 +59,34 @@ def test_benchmark_contract_fixes_five_tokens_and_history_set():
     with pytest.raises(argparse.ArgumentTypeError, match="positive values"):
         BENCHMARK.parse_histories("9,0")
     assert 'rpu_execution={"prefill": {"fast_replay": True}}' in EXAMPLE_PATH.read_text()
+
+
+def test_episode_runner_disables_redundant_nine_frame_prefetch(monkeypatch):
+    calls = []
+
+    def run_request(*args, **kwargs):
+        calls.append((args[6], args[7], kwargs["prefetch_latest"]))
+        return {"token_ids": [1, 2, 3, 4, 5], "total_ms": 1.0}
+
+    monkeypatch.setattr(BENCHMARK, "_run_request", run_request)
+
+    class GraphCache:
+        def __init__(self):
+            self.clears = 0
+
+        def clear(self):
+            self.clears += 1
+
+    graph_cache = GraphCache()
+    results = INFERENCE.infer_episode(
+        object(), object(), object(), object(), list(range(12)), "track",
+        object(), object(), [f"frame-{index}" for index in range(12)],
+        history_frames=9, prefill_graph_cache=graph_cache,
+    )
+
+    assert len(results) == 12
+    assert graph_cache.clears == 10
+    assert calls[9:] == [(9, 0, False), (9, 1, False), (9, 2, False)]
 
 
 def test_lightnav_candidate_head_uses_checked_decode_replay():

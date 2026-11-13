@@ -110,6 +110,24 @@ R1 运行时移除 `--check-config`。默认使用 8 帧历史并额外加入 1 
 每次固定输出 5 个 token。输入使用确定性的 256×448 合成帧，因此结果用于比较
 推理性能和缓存收益，不代表导航任务准确率。
 
+客户有序图片可直接使用正式 episode 入口。该入口默认采用 9 帧历史加当前帧，
+视觉缓存稳定为 4/1 时明确关闭 `prefetch_latest`，并在完整窗口建立后复用安全重绑定的
+Prefill Graph：
+
+```bash
+python examples/lightnav_inference.py \
+  --input /path/to/dataset.json \
+  --images-dir /path/to/images \
+  --checkpoint /path/to/LightNav-0 \
+  --lightnav-source /path/to/LightNav-0-source \
+  --history-frames 9 \
+  --constrained-head \
+  --output /path/to/inference_result.json
+```
+
+输入 JSON 使用 `prompt`（或 `instruction`）和按时间排序的 `images` 数组；输出逐帧保存
+5 个 token、缓存命中/缺失和各阶段耗时。该正式入口不启用上一请求 token 候选复验。
+
 若业务已经采用上游固定五位置动作语法，可增加 `--constrained-head`。它安装 5 个
 位置专用的 1408 行 column-parallel head，并把单 token decode 的输出头纳入同一个
 设备 Graph。该选项改变默认全词表解码范围，必须单独验证真实导航质量。

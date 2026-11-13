@@ -136,6 +136,26 @@ Each tier warms the full-window and current-tubelet Rhino Graphs outside the
 measurement and retains one stable KV-cache address. Its Graphs are released
 before the next tier.
 
+For an ordered customer image sequence, use the production episode entry point.
+It defaults to nine history frames plus the current frame, explicitly disables
+`prefetch_latest` for the stable 4/1 cache path, and safely reuses the rebound
+Prefill Graph after the full window is established:
+
+```bash
+python examples/lightnav_inference.py \
+  --input /path/to/dataset.json \
+  --images-dir /path/to/images \
+  --checkpoint /path/to/LightNav-0 \
+  --lightnav-source /path/to/LightNav-0-source \
+  --history-frames 9 \
+  --constrained-head \
+  --output /path/to/inference_result.json
+```
+
+The input JSON contains `prompt` (or `instruction`) and an ordered `images`
+array. The output stores five tokens per frame, cache hit/miss counts, and stage
+timings. This entry point does not verify tokens from the previous request.
+
 When the application uses the fixed five-position LightNav action grammar, pass
 `--constrained-head` to install five position-specific 1,408-row projections
 and fuse them into single-token decode. This opt-in changes the default

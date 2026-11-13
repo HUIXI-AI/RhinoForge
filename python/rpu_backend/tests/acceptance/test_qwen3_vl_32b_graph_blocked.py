@@ -93,7 +93,7 @@ def test_direct_8b_vision_install_requires_the_top_level_padding_gate(monkeypatc
 
 def test_8b_long_text_envelope_retains_its_chunk_ceiling():
     envelope = qwen3vl_text.lookup_causal_decoder('qwen3_vl_text', 36, 4096)
-    assert (envelope.max_kv_len, envelope.chunk) == (4176, 128)
+    assert (envelope.max_kv_len, envelope.chunk) == (0, 128)
 
 def _tensor_module(weight, bias=None):
     module = SimpleNamespace(weight=torch.nn.Parameter(weight, requires_grad=False))

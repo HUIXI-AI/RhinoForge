@@ -18,6 +18,8 @@ export PIP_REQUIRE_VIRTUALENV=true PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
 # Explicit nodes keep local regression checks proportional to the change.
 if (( $# == 0 )); then
     "$rf_job_venv/bin/python" scripts/check_release_version.py
+    "$rf_job_venv/bin/python" scripts/check_dependency_release.py
+    "$rf_job_venv/bin/python" scripts/check_public_hygiene.py
     "$rf_job_venv/bin/python" scripts/check_examples.py
     set -- tests python/rpu_backend/tests/acceptance python/rpu_backend/tests/core/test_pi05_denoise_buffers.py \
         python/rpu_backend/tests/core/test_pi05_denoise_build_layer_compiles.py \

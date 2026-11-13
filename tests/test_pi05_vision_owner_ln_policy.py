@@ -40,7 +40,7 @@ def test_owner_ln_exact_profile_dry_live_and_missing_payloads(tmp_path, monkeypa
 #include <cassert>
 #include <iostream>
 using namespace v3;
-enum class KernelId { PI05_VISION_OWNER_REDUCE_LAYERNORM_M768N1152,
+enum class KernelId : uint16_t { PI05_VISION_OWNER_REDUCE_LAYERNORM_M768N1152,
     PI05_VISION_XOR3_COMPACT_RESIDUAL_RAW_FULL_M768N1152,
     PI05_VISION_OWNER_REDUCE_LAYERNORM_M512N1152,
     PI05_VISION_XOR3_COMPACT_RESIDUAL_RAW_FULL_M512N1152 };

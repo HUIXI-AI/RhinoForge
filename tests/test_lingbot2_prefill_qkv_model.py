@@ -272,7 +272,7 @@ def test_actual_lingbot_prefill_qkv_owner(tmp_path):
 using namespace v3;
 __CONSTANTS__
 __ENUMS__
-enum class KernelId {LINGBOT2_PREFILL_QKV_MULTIBASE_W8_M224,LINGBOT2_PREFILL_QKV_MULTIBASE_FP16_M224,LINGBOT2_PREFILL_GATEUP_SHARED_A_W8_M224};
+enum class KernelId : uint16_t {LINGBOT2_PREFILL_QKV_MULTIBASE_W8_M224,LINGBOT2_PREFILL_QKV_MULTIBASE_FP16_M224,LINGBOT2_PREFILL_GATEUP_SHARED_A_W8_M224};
 struct KernelCache{bool w8=true,fp16=true;static KernelCache&instance(){static KernelCache c;return c;}
  bool has_loaded(KernelId id)const{return id==KernelId::LINGBOT2_PREFILL_QKV_MULTIBASE_W8_M224?w8:fp16;}};
 struct RpuExecutionCoordinator {static bool quiet;static void require_graph_quiescent(const char*){TORCH_CHECK(quiet,"busy");}

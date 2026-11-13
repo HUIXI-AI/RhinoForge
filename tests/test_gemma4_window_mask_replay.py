@@ -163,6 +163,7 @@ def test_actual_ple_ingress_preserves_publication_owner_and_dirty_aliases(tmp_pa
     from test_siglip_attention_dry_live_contract import _function, _run_native
 
     source = (ROOT / "src/fused/rpu_gemma4_model.cpp").read_text()
+    kv_span_guard = _function(source, "void validate_gemma4_kv_span(")
     forward = _function(source, "    at::Tensor forward(")
     preflight = forward[forward.index("        TORCH_CHECK(num_layers() > 0"):
                         forward.index("        // dynamic_config also")]
@@ -269,6 +270,7 @@ struct RpuKernelGraph {
 };
 bool RpuKernelGraph::active_=false;std::vector<HostTensor> RpuKernelGraph::refs;
 namespace detail {__PLANNING_GUARD__}
+__KV_SPAN_GUARD__
 template<class A,class B>void cross_device_elementwise_copy(const HostTensor&,const HostTensor&){assert(false);}
 HostTensor& copy_transport(HostTensor& self,const HostTensor& src){
  const bool is_src_rpu=src.device().type()==at::kPrivateUse1;
@@ -280,6 +282,7 @@ HostTensor& copy_transport(HostTensor& self,const HostTensor& src){
 struct Model {
  bool has_ple_=true;int64_t seq_len_=3,ple_dim_=16;HostTensor side_input_;
  HostTensor hidden_input_;int64_t chunk_override=99;
+ at::Tensor cos_sliding_=at::zeros({64,1},at::kHalf),cos_global_=at::zeros({64,1},at::kHalf);
  uint64_t side_live_base_=0;int64_t num_layers()const{return 2;}
  int64_t hidden_size()const{return 8;}
  void set_chunk_size_override(int64_t value){chunk_override=value;}
@@ -448,5 +451,6 @@ int main(){
            .replace("__INGRESS__", ingress.replace("at::empty(", "fake_empty("))
            .replace("__HIDDEN_LEASE__", hidden_lease.replace("hidden_states", "live_hidden"))
            .replace("__PLANNING_GUARD__", planning_guard)
+           .replace("__KV_SPAN_GUARD__", kv_span_guard)
            .replace("__CROSS_DEVICE__", cross_device))
     _run_native(tmp_path, cpp, torch)

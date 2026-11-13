@@ -326,7 +326,7 @@ def test_prefill_chunk_cap_tp2_stays_256():
 # defect these tests exist to catch. The admissibility TRUTH is gated against the
 # real predicate in tests/ops/test_wall_oss_prefill_envelope.py (hw_mech). What
 # is gated here is the SEARCH STRUCTURE around it, with the predicate injected.
-_MEASURED_EQUAL_TWO = {   # hx-153 2026-08-10, sdpa_helpers.is_valid_chunk_size
+_MEASURED_EQUAL_TWO = {   # 2026-08-10, sdpa_helpers.is_valid_chunk_size
     160: True, 176: True, 192: True, 208: False, 224: True, 240: False,
     256: True, 288: False, 304: False, 320: True, 352: False, 384: False,
 }

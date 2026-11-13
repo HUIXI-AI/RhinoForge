@@ -116,11 +116,13 @@ def test_config_index_includes_unregistered_templates_without_support_inheritanc
     index = checker.render_config_index(configs)
     for path in configs:
         relative = path.relative_to(checker.CONFIGS).as_posix()
-        assert index.count(f"| [{relative}]({relative}) |") == 1
+        assert index.count(f"| [{relative}]({relative}) |") == (
+            1 if checker.documented_config(path) else 0
+        )
     rows = index.splitlines()
     def row(relative):
         return next(line for line in rows if line.startswith(f"| [{relative}]"))
-    assert "未登记；模型专用模板" in row("g05/3cam/fp16.toml")
+    assert "未登记；模型专用模板" in row("wall_oss/base/3cam/224/fp16.toml")
     assert "run.py" in row("hy_vla/3cam/fp16.toml")
     assert "12（运行器默认）" in row("hy_vla/3cam/fp16.toml")
     fragment = row("rhinovla/v3/controlled/fp16.toml")

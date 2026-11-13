@@ -17,7 +17,7 @@ Cases:
 
 Run:
     sudo LD_PRELOAD=$(g++ -print-file-name=libstdc++.so.6) \
-        /nfs3-sh/miniconda3/envs/torch_3.12/bin/python \
+        python \
         python/rpu_backend/tests/ops/test_embedding_gather_isolated.py
 """
 from __future__ import annotations

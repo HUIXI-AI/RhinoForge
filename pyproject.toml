@@ -60,6 +60,9 @@ dev = [
     "pytest>=8",
 ]
 
+# External model adapters register into this entry-point group; see examples/custom_plugin_template/.
+[project.entry-points."rpu_backend.plugins"]
+
 [tool.scikit-build]
 wheel.packages = ["python/rpu_backend"]
 build.verbose = true

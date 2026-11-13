@@ -224,7 +224,7 @@ def test_installed_fp16_and_w8_decoder_share_long_prefill_envelope(
 
     installed = runtime["install_kwargs"]
     assert installed["arch"] == "qwen3"
-    assert installed["chunk_envelope_for"]("qwen3", layers, hidden) == (4096, ceiling)
+    assert installed["chunk_envelope_for"]("qwen3", layers, hidden) == (0, ceiling)
     assert (installed["scale_lists"] is not None) is int8
     qwen3.Qwen3Adapter.preflight_execution(
         model.config, {"prefill": {"chunk_size": ceiling}},
@@ -240,7 +240,7 @@ def test_14b_and_unknown_geometry_do_not_inherit_long_prefill(runtime):
     model = _Model(14)
     qwen3.Qwen3Adapter(model).to_rpu()
     lookup = runtime["install_kwargs"]["chunk_envelope_for"]
-    assert lookup("qwen3", 40, 5120) == (192, 32)
+    assert lookup("qwen3", 40, 5120) == (0, 32)
     with pytest.raises(RuntimeError, match="no certified chunk envelope"):
         lookup("qwen3", 28, 1536)
     decoder._close_causal_lm_model(model)

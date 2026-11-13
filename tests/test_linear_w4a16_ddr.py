@@ -35,6 +35,7 @@ def test_native_w4_caller_preserves_logical_k_and_rejects_before_staging(tmp_pat
 #define RECORD_FUNCTION(...)
 #define NUM_CORES 8
 namespace c10 { template<class T> using optional = std::optional<T>;
+using Half = uint16_t;
 constexpr auto nullopt=std::nullopt; }
 namespace graph_dma { bool capturing=false; bool active(){return capturing;} }
 int allocations=0,copies=0,retentions=0,launches=0,last_k=0,last_cores=0;
@@ -55,6 +56,7 @@ struct Tensor {
  bool defined()const{return present;} bool is_contiguous()const{return dense;}
  Device device()const{return opts.where;} ScalarType scalar_type()const{return opts.value;}
  Sizes sizes()const{return shape;}Options options()const{return opts;}
+ template<class T> T* data_ptr()const{return reinterpret_cast<T*>(storage.get());}
  Tensor contiguous()const{++copies;auto t=*this;t.dense=true;return t;}
  Tensor view(std::initializer_list<int64_t> s)const{auto t=*this;t.shape=s;return t;}
 };
@@ -62,6 +64,14 @@ Tensor empty(const std::vector<int64_t>& shape,Options opts){++allocations;Tenso
  t.shape.assign(shape.begin(),shape.end());t.opts=opts;t.present=true;return t;}
 }
 using at::Tensor;
+uint64_t RpuGetDevAddr(void* ptr){return reinterpret_cast<uintptr_t>(ptr);}
+struct RpuKernelGraph {
+ static bool has_active(){return graph_dma::capturing;}
+ void begin(){}
+ void keep_alive(const Tensor&){}
+ void end(){}
+ void abort(){}
+};
 Tensor rpu_retain_linear_quant_scale(const Tensor&,const Tensor& scale){++retentions;return scale;}
 '''
     # Reuse the public declaration so omitted legacy arguments exercise their

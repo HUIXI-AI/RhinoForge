@@ -23,7 +23,7 @@ def test_three_stage_config_accepts_only_real_fixed_geometries():
 
 def test_prefill_truncated_geometry_is_auto_only():
     auto = qwen3_vl_text._chunk_envelope_for_execution('qwen3_vl_text', 16, 2048, {'prefill': {'chunk_size': 'auto'}})
-    assert tuple(auto) == (512, 0)
+    assert tuple(auto) == (0, 512)
 
 def test_prefill_uncertified_exact_envelope_fails_closed():
     with pytest.raises(ValueError, match='auto.*only'):

@@ -34,11 +34,12 @@ manifest, with download location and SHA256 recorded when an artifact is
 published. Source-only changes can reuse a compatible environment. Requirement or
 compatibility changes need revalidation and an updated source binding; publish a
 new environment version when its actual contents must change.
-GitHub Releases is the intended distribution channel for the dependency-only
-bundle after its contents and redistribution materials have been checked.
-**No public dependency environment bundle or download URL is available yet.**
-The existing restricted full-bundle tooling and archives do not implement this
-new distribution format and must not be presented as its public release.
+GitHub Releases distributes the reviewed dependency-only bundle. The current
+bound environment is [`deps-2026.10.1` (preview)](https://github.com/HUIXI-AI/RhinoForge/releases/tag/deps-2026.10.1),
+whose archive URL and SHA-256 digests are recorded in
+[environment.json](environment.json). Legacy restricted full-bundle tooling and
+archives remain separate and must not be tagged or uploaded as a public
+dependency environment release.
 
 Keep model evaluation data and reports outside source releases, package artifacts and release notes.
 

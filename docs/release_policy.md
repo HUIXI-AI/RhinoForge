@@ -34,18 +34,20 @@ commits. A development entry may provide source only.
 
 ## Build and dependency versions
 
-[runtime-dependencies.json](../release/runtime-dependencies.json) records the
-Launch source commit, full `release_version`, numeric `cmake_version` and
-`abi_version`. The legacy `version` field equals `cmake_version`, which is the
-numeric base of Launch's own `release_version`. CMake checks the installed Launch
-package against these exact dependency versions and ABI, and retains capability
-checks. Launch's version need not equal RhinoForge's version.
-Library SONAME and Python `API_VERSION` track
+[runtime-dependencies.json](../release/runtime-dependencies.json) records
+`op_abi_epoch` alongside the Launch source commit, full `release_version`,
+numeric `cmake_version` and `abi_version`. The legacy `version` field equals
+`cmake_version`, which is the numeric base of Launch's own `release_version`.
+CMake checks the installed Launch package against these exact dependency versions
+and ABI, and retains capability checks. Launch's version need not equal
+RhinoForge's version. Library SONAME and Python `API_VERSION` track
 compatibility independently of distribution versions.
 
 Runtime contains exactly the main and DDR-expansion operator assets pinned by
-commit and checksum. Their component source versions need not match the bundle
-version. Keep each payload and its `.kernels` manifest together.
+commit and checksum, governed by `op_abi_epoch` (currently `1`, incremented only
+on an incompatible operator payload ABI break). Their component source versions
+need not match the bundle version. Keep each payload and its `.kernels` manifest
+together.
 
 Run `python scripts/check_release_version.py` before packaging; CI also checks
 the branch or tag against `VERSION`. Validate Python metadata, the selected Launch
@@ -83,8 +85,9 @@ Launch 自身的开发分支为 `develop`；采用新 Launch 提交时，单独�
 
 CMake 数值版本不含开发后缀。Launch 的数值版本、完整发行版本和 ABI 按依赖清单
 精确核对，并保留能力检查；它们不要求与 RhinoForge 同号。Launch ABI 和 Python
-API 兼容版本独立维护。算子资产固定来自 main 与 DDR-expansion 两个分支，依赖
-清单记录准确 commit 和校验和。发布前检查版本、包装和受影响的构建或运行路径；
+API 兼容版本独立维护。依赖清单同时通过 `op_abi_epoch` 标记算子载荷 ABI 纪元（当前为
+`1`，仅在不兼容算子 ABI 变更时递增）；算子资产固定来自 main 与 DDR-expansion 两个分支，
+并记录准确 commit 和校验和。发布前检查版本、包装和受影响的构建或运行路径；
 模型评测记录不进入发行资产。
 
 公开依赖环境包采用独立版本，源码以环境 ID、依赖锁和校验和关联；不携带 RF、

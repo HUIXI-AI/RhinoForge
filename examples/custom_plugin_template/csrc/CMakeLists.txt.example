@@ -1,0 +1,31 @@
+cmake_minimum_required(VERSION 3.22)
+project(my_rhino_custom_ops VERSION 0.1.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(CMAKE_SKIP_RPATH ON)
+
+add_compile_options(
+    "-ffile-prefix-map=${CMAKE_SOURCE_DIR}=."
+    "-fmacro-prefix-map=${CMAKE_SOURCE_DIR}=."
+)
+
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+execute_process(
+    COMMAND "${Python3_EXECUTABLE}" -c "import torch; print(torch.utils.cmake_prefix_path)"
+    OUTPUT_VARIABLE TORCH_CMAKE_PREFIX
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    COMMAND_ERROR_IS_FATAL ANY
+)
+list(PREPEND CMAKE_PREFIX_PATH "${TORCH_CMAKE_PREFIX}")
+find_package(Torch REQUIRED)
+
+# Optional: link rhino_launch when dispatching directly to Rhino Launch queues/kernels.
+# find_package(rhino_launch 1.2.0 EXACT CONFIG REQUIRED)
+
+add_library(my_rhino_custom_ops SHARED
+    custom_ops_fragment.cpp
+)
+target_include_directories(my_rhino_custom_ops PRIVATE ${TORCH_INCLUDE_DIRS})
+target_link_libraries(my_rhino_custom_ops PRIVATE ${TORCH_LIBRARIES})

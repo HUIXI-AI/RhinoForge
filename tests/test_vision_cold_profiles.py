@@ -12,11 +12,21 @@ from test_siglip_cold_profile import _body
 
 ROOT = Path(__file__).resolve().parents[1]
 FAMILIES = (
-    ("qwen3vl_vision", "Qwen3VLVisionRegistry", "rpu_qwen3vl_vision_model.cpp", 4096),
-    ("qwen25vl_vision", "Qwen25VLVisionRegistry", "rpu_qwen25vl_vision_model.cpp", 4096),
-    ("dinov3_vision", "DINOv3VisionRegistry", "rpu_dinov3_vision_model.cpp", 4101),
+    ("qwen3vl_vision", "Qwen3VLVisionRegistry", "rpu_qwen3vl_vision_model.cpp", 8192),
+    ("qwen25vl_vision", "Qwen25VLVisionRegistry", "rpu_qwen25vl_vision_model.cpp", 8192),
+    ("dinov3_vision", "DINOv3VisionRegistry", "rpu_dinov3_vision_model.cpp", 8192),
     ("hyvit2", "HYViT2Registry", "rpu_hyvit2_vision_model.cpp", 8192),
 )
+
+
+def _member_method(source, signature):
+    start = source.index(signature)
+    body = source.index("{", start)
+    depth, end = 1, body + 1
+    while depth:
+        depth += (source[end] == "{") - (source[end] == "}")
+        end += 1
+    return source[start:end]
 
 
 @pytest.mark.parametrize("family,registry,filename,upper", FAMILIES)
@@ -32,8 +42,42 @@ def test_native_profile_intersects_actual_cache_with_original_geometry(
     native = (ROOT / "src/fused" / filename).read_text()
     assert native.count("set_chunk_envelope(") == 2  # cold op + unchanged FMB setter only
     constants = re.findall(r"constexpr int64_t \w*VISION_(?:MAX_KEEPALIVE_SEQ|NUM_SPECIAL_TOKENS) = \d+;", native)
+    extra_method = ""
+    for candidate in ("void set_execution_envelope(", "void set_cache_envelope("):
+        if candidate in native:
+            extra_method = _member_method(native, candidate)
+            break
+    at_stub = r'''
+namespace at {
+constexpr int kShort = 1, kPrivateUse1 = 2;
+struct TensorOptions {
+    TensorOptions dtype(int) const { return *this; }
+    TensorOptions device(int) const { return *this; }
+};
+struct Tensor {
+    int64_t rows = 0;
+    bool present = false;
+    bool defined() const { return present; }
+    int64_t size(int) const { return rows; }
+};
+inline Tensor zeros(std::initializer_list<int64_t> shape, TensorOptions) {
+    return {*shape.begin(), true};
+}
+}  // namespace at
+'''
     cpp = cpp.replace(
-        "struct FusedModelBase", "\n".join(constants) + "\nstruct FusedModelBase", 1)
+        "struct FusedModelBase",
+        "\n".join(constants) + at_stub + "\nstruct FusedModelBase",
+        1,
+    )
+    cpp = cpp.replace(
+        "    void set_chunk_envelope(int64_t max_kv_len, int64_t chunk);",
+        "    at::Tensor position_idx_keepalive_;\n"
+        "    int64_t max_keepalive_seq_ = 0;\n"
+        "    void set_chunk_envelope(int64_t max_kv_len, int64_t chunk);\n"
+        + extra_method,
+        1,
+    )
     base = (ROOT / "src/core/fused_model_base.cpp").read_text()
     for marker, source, signature in (
         ("__SETTER__", base, "void FusedModelBase::set_chunk_envelope("),
@@ -47,6 +91,10 @@ int main() {
     auto set=[](int64_t capacity, int64_t chunk) { __CALL__(42,capacity,chunk); };
     set(768,0);
     assert(model.installed_profile_identity()[8]==768);
+    if (model.position_idx_keepalive_.defined()) {
+        reject([&] { set(8192,0); });
+        model.position_idx_keepalive_ = {};
+    }
     model.impl.kv_cost_candidates_={1}; model.impl.kv_cost_planning_context_=3;
     model.impl.kv_cost_layout_scope_=5; model.impl.kv_cost_snapshot_reason_="READY";
     set(8192,0);
@@ -56,6 +104,7 @@ int main() {
     assert(model.impl.kv_cost_layout_scope_==0);
     assert(model.impl.kv_cost_snapshot_reason_=="NATIVE_STAGE_ORACLE_REQUIRED");
     reject([&] { set(0,0); }); reject([&] { set(-1,0); });
+    if (model.position_idx_keepalive_.defined()) model.position_idx_keepalive_ = {};
     reject([&] { set(768,15); }); reject([&] { __CALL__(43,768,0); });
     assert(model.installed_profile_identity()==profile);
     model.last=16; reject([&] { set(768,0); });

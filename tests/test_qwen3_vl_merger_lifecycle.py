@@ -551,7 +551,9 @@ def test_existing_2b_delivery_keeps_its_separate_fused_replay_install(install_ru
     ):
         monkeypatch.setattr(torch.ops.rpu, name,
                             lambda *args, name=name: calls.append(name), raising=False)
-    adapter = qvl.Qwen3VLAdapter(_Model())
+    delivery_model = _Model()
+    delivery_model.model.language_model._rpu_mrope_capacity = 576
+    adapter = qvl.Qwen3VLAdapter(delivery_model)
     model = adapter.to_rpu()
     assert calls == [
         "causal_decoder_set_chunk_envelope", "qwen3vl_vision_set_delivery_compatibility",

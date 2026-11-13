@@ -211,6 +211,7 @@ def test_real_vision_installer_binds_arithmetic_before_weight_conversion(monkeyp
         ("set_execution_cores", lambda handle, count: events.append(("cores", handle, count))),
         ("get_execution_topology", lambda *_: (4, 4, 4, 8)),
         ("set_chunk_size_cap", lambda *_: None),
+        ("set_cache_capacity", lambda *_: None),
         ("set_prefill_chunk_size", lambda *_: None),
         ("resolve_prefill_domain", lambda *_: None),
     ):

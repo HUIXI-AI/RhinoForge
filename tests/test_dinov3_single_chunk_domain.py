@@ -12,7 +12,8 @@ def test_native_dino_feasibility_filters_small_chunks_before_manifest():
         r"bool subclass_chunk_size_valid\(\s*int64_t chunk_size, int64_t seq_len,"
         r"\s*int64_t /\*position\*/\) const override \{([^}]+)\}", source)
     assert guard is not None
-    assert "return chunk_size >= seq_len;" in guard.group(1)
+    assert "dinov3_execution_length_valid(seq_len, identity_rope_)" in guard.group(1)
+    assert "seq_len <= chunk_envelope().max_kv_len && chunk_size >= seq_len;" in guard.group(1)
     assert "TORCH_CHECK(plan.num_chunks == 1" in source
     assert "TORCH_CHECK(plan.compute.chunks.size() == 1" in source
     base = (ROOT / "src/core/fused_model_base.cpp").read_text()

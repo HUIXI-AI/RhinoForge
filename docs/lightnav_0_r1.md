@@ -101,8 +101,13 @@ tokens. Steady-state medians were 47.655/48.283 ms Vision,
 91.024/91.196 ms Prefill, 114.988/115.036 ms Decode, and 276.413/276.618 ms
 Total. Prefill and Decode stayed within about 1.4 ms of the original R1 result.
 Most of the roughly 27.8 ms Total increase came from Vision, which was about
-20.8 ms slower. The stable repeat indicates a machine-side Vision performance
-difference rather than a regression in the W8 text-weight path.
+20.8 ms slower. A follow-up A/B found that the new-board runner had mistakenly
+enabled `prefetch_latest`. It computed one duplicate tubelet in addition to the
+one real miss without improving the next request's cache result. Disabling it
+kept the hit/miss result at 4/1 and reduced Vision/ViT from 49.042/43.314 ms to
+30.279/25.126 ms, with all 35 frames and 175 tokens unchanged. The production
+9-history-frame runner therefore leaves this redundant prefetch disabled; the
+remaining Vision difference between boards is about 3 ms.
 
 See
 `benchmark_results/lightnav_9_history_20261112/summary.json` for the full result.

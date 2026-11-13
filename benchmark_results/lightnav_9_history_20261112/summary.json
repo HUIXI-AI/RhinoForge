@@ -198,6 +198,21 @@
     },
     "cold_repeat_token_equal_frames": "35/35",
     "cold_repeat_token_equal_tokens": "175/175",
-    "comparison_to_previous_r1": "Text stages remain within about 1.4 ms; Vision is about 20.8 ms slower and accounts for most of the about 27.8 ms Total increase."
+    "comparison_to_previous_r1": "Text stages remain within about 1.4 ms; Vision is about 20.8 ms slower and accounts for most of the about 27.8 ms Total increase.",
+    "prefetch_ab_20261113": {
+      "enabled_ms": {
+        "vision": 49.042,
+        "vision_vit": 43.314
+      },
+      "disabled_ms": {
+        "vision": 30.279,
+        "vision_vit": 25.126
+      },
+      "cache_hit_miss": "4/1 in both runs",
+      "token_equal_frames": "35/35",
+      "token_equal_tokens": "175/175",
+      "rpu_clock": "core 1600 MHz, bus 800 MHz during the enabled run",
+      "conclusion": "prefetch_latest added one duplicate tubelet computation without improving this 9-history-frame sliding window; production runner disables it"
+    }
   }
 }

@@ -83,8 +83,12 @@ Prefill/Decode/Total 为 84.437/91.843/220.200 ms，但仅 130/175 token、11/35
 175/175 token 相互一致。第 10 帧起的稳态中位数分别为：Vision
 47.655/48.283 ms、Prefill 91.024/91.196 ms、Decode 114.988/115.036 ms、Total
 276.413/276.618 ms。Prefill 和 Decode 与原 R1 相差约 1.4 ms 以内；Total 增加约
-27.8 ms，主要来自 Vision 增加约 20.8 ms。复跑结果稳定，表现为机器侧 Vision
-性能差异，不是 W8 文本权重路径回退。
+27.8 ms，主要来自 Vision 增加约 20.8 ms。后续 A/B 定位到新机测试脚本误开了
+`prefetch_latest`：它在真实缺失的 1 个 tubelet 外又计算 1 个复制 tubelet，但没有
+改善下一请求的缓存命中。关闭后命中/缺失仍为 4/1，Vision/ViT 从
+49.042/43.314 ms 降到 30.279/25.126 ms，35/35 帧、175/175 token 保持一致。
+正式 9 帧历史流程因此关闭该冗余预取；剩余约 3 ms 的 Vision 差异属于两台机器的
+实测差异。
 
 完整数据见 `benchmark_results/lightnav_9_history_20261112/summary.json`。
 

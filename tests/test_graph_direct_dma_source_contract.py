@@ -348,6 +348,12 @@ IMMEDIATE_CALLERS: dict[tuple[str, str], Counter[str]] = {
     ("src/ops/rpu_l2norm.cpp", "rpu_l2norm_test"): _c(
         broadcast=1, spm_copy=1
     ),
+    ("src/ops/rpu_linear.cpp", "tts_codec_im2col_rows"): _c(
+        broadcast=1, spm_copy=1
+    ),
+    ("src/ops/rpu_linear.cpp", "tts_codec_layernorm_rows"): _c(
+        broadcast=3, spm_copy=1
+    ),
     ("src/ops/rpu_partial_mrope.cpp", "rpu_partial_mrope_test"): _c(
         broadcast=1, spm_copy=1, ddr_scatter=1, spm_scatter=1
     ),
@@ -932,8 +938,8 @@ def test_immediate_dma_call_inventory_is_exact() -> None:
             +expected_bare
         ), api
 
-    assert sum(actual.values()) == 78
-    assert len(IMMEDIATE_CALLERS) == 37
+    assert sum(actual.values()) == 84
+    assert len(IMMEDIATE_CALLERS) == 39
     assert Counter(
         {
             api: sum(
@@ -945,8 +951,8 @@ def test_immediate_dma_call_inventory_is_exact() -> None:
         }
         ) == Counter(
         {
-            BROADCAST: 31,
-            SPM_COPY: 30,
+            BROADCAST: 35,
+            SPM_COPY: 32,
             BYTE_COPY: 2,
             DDR_SCATTER: 9,
             SPM_SCATTER: 6,

@@ -168,10 +168,30 @@ at::Tensor rpu_tts_codec_conv_pair(
     const at::Tensor& input, const at::Tensor& first_weight, const at::Tensor& affine,
     const at::Tensor& second_weight, const at::Tensor& second_bias,
     int64_t dilation, int64_t channels);
+at::Tensor rpu_tts_codec_conv1d_spm(
+    const at::Tensor& input, const at::Tensor& weight,
+    const c10::optional<at::Tensor>& bias,
+    int64_t kernel, int64_t dilation, int64_t out_channels);
+at::Tensor rpu_tts_codec_residual_unit(
+    const at::Tensor& input, const at::Tensor& first_weight,
+    const at::Tensor& affine, const at::Tensor& second_weight,
+    int64_t dilation, int64_t channels);
+at::Tensor rpu_tts_codec_snake(
+    const at::Tensor& input, const at::Tensor& affine, int64_t channels);
+at::Tensor rpu_tts_codec_convnext_block(
+    const at::Tensor& input, const at::Tensor& depthwise_weight,
+    const at::Tensor& depthwise_bias, const at::Tensor& norm_weight,
+    const at::Tensor& norm_bias, const at::Tensor& first_weight,
+    const at::Tensor& first_bias, const at::Tensor& second_weight,
+    const at::Tensor& second_bias, const at::Tensor& gamma, double eps);
 at::Tensor rpu_tts_codec_conv1d(
     const at::Tensor& input, const at::Tensor& weight,
     const c10::optional<at::Tensor>& bias,
     int64_t kernel, int64_t dilation, int64_t out_channels);
+at::Tensor rpu_tts_codec_conv_transpose1d(
+    const at::Tensor& input, const at::Tensor& weight,
+    const c10::optional<at::Tensor>& bias,
+    int64_t out_channels, int64_t kernel, int64_t stride);
 
 void rpu_linear_into(const at::Tensor &input, const at::Tensor &weight,
                      const c10::optional<at::Tensor> &bias_opt,

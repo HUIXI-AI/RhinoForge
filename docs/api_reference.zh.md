@@ -541,9 +541,12 @@ speaker embedding，每次请求仍读取和校验参考文件。输出存储独
 紧接着的输出头；请求 hidden states 时仍返回独立 CPU 存储。加载前通过
 `torch.set_num_threads` 设置 CPU 线程数，API 不修改此值。
 
-默认 `codec_backend="rpu"` 实验性卸载全部 31 层解码 Conv1d；匹配 native 时，
+默认 `codec_backend="rpu"` 实验性卸载全部 31 层解码 Conv1d 和 4 层 ConvNeXt Linear；
+匹配 native 时，
 12 组卷积还将中间 SnakeBeta 和首层 bias 留在 RPU 上，以 FP16 执行。
 显式设置 `codec_backend="cpu"` 恢复 CPU FP32 卷积和激活。
 `execution_stats().codec_convolutions` 返回 backend、已安装层数、累计卷积调用次数、
-`transport`（`shared_ddr` 或旧版 `staged`）、`residual_pairs` 和成功的 `paired_calls`。
+`transport`（`shared_ddr` 或旧版 `staged`）、`residual_pairs`、成功的 `paired_calls`、
+`transposed_layers`、成功的 `transposed_calls`、`convnext_linears` 和成功的
+`convnext_linear_calls`。
 每组成对执行也计入两次卷积调用。剩余 CPU 工作和精度边界见[语音指南](qwen3_audio.zh.md#实验性-rpu-声码器卷积)。

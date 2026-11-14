@@ -199,6 +199,16 @@ TORCH_LIBRARY(rpu, m) {
         TORCH_FN(rpu_tts_codec_conv1d));
   m.def("tts_codec_conv_pair(Tensor input, Tensor first_weight, Tensor affine, Tensor second_weight, Tensor second_bias, int dilation, int channels) -> Tensor",
         TORCH_FN(rpu_tts_codec_conv_pair));
+  m.def("tts_codec_conv1d_spm(Tensor input, Tensor weight, Tensor? bias, int kernel, int dilation, int out_channels) -> Tensor",
+        TORCH_FN(rpu_tts_codec_conv1d_spm));
+  m.def("tts_codec_residual_unit(Tensor input, Tensor first_weight, Tensor affine, Tensor second_weight, int dilation, int channels) -> Tensor",
+        TORCH_FN(rpu_tts_codec_residual_unit));
+  m.def("tts_codec_snake(Tensor input, Tensor affine, int channels) -> Tensor",
+        TORCH_FN(rpu_tts_codec_snake));
+  m.def("tts_codec_convnext_block(Tensor input, Tensor depthwise_weight, Tensor depthwise_bias, Tensor norm_weight, Tensor norm_bias, Tensor first_weight, Tensor first_bias, Tensor second_weight, Tensor second_bias, Tensor gamma, float eps) -> Tensor",
+        TORCH_FN(rpu_tts_codec_convnext_block));
+  m.def("tts_codec_conv_transpose1d(Tensor input, Tensor weight, Tensor? bias, int out_channels, int kernel, int stride) -> Tensor",
+        TORCH_FN(rpu_tts_codec_conv_transpose1d));
   // SDPA unified layout: [batch, seq_len, heads, head_dim] instead of standard [batch, heads, seq_len, head_dim]
   m.def("scaled_dot_product_attention_unified(Tensor query, Tensor key, Tensor value, Tensor? attn_mask=None, float dropout_p=0.0, bool is_causal=False, float? scale=None, bool enable_gqa=False) -> Tensor");
   // Fused QKV Attention (SPM版本，减少DDR搬运)

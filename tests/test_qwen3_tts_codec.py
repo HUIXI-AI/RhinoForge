@@ -5,7 +5,8 @@ import torch.nn.functional as F
 
 from rpu_backend.adapters.qwen3_tts.codec import (
     install_codec_activations, install_codec_convolutions,
-    install_rpu_convolutions, _rpu_convolution,
+    install_rpu_convolutions, _rpu_convolution, _rpu_linear,
+    _rpu_transpose_convolution,
 )
 
 
@@ -172,7 +173,26 @@ def _decoder():
         torch.nn.Conv1d(1024, 1024, 7, groups=1024),
         torch.nn.Conv1d(1024, 1024, 7, groups=1024), torch.nn.Conv1d(96, 1, 7),
     ])
-    decoder.transpose = torch.nn.ConvTranspose1d(16, 16, 2, stride=2)
+    decoder.transposes = torch.nn.ModuleList([
+        torch.nn.ConvTranspose1d(1024, 1024, 2, stride=2),
+        torch.nn.ConvTranspose1d(1024, 1024, 2, stride=2),
+        torch.nn.ConvTranspose1d(1536, 768, 16, stride=8),
+        torch.nn.ConvTranspose1d(768, 384, 10, stride=5),
+        torch.nn.ConvTranspose1d(384, 192, 8, stride=4),
+        torch.nn.ConvTranspose1d(192, 96, 6, stride=3),
+    ])
+    block_type = type("Qwen3TTSTokenizerV2ConvNeXtBlock", (torch.nn.Module,), {})
+    decoder.convnext = torch.nn.ModuleList()
+    for index in range(2):
+        block = block_type()
+        block.dwconv = torch.nn.Module()
+        block.dwconv.conv = decoder.convs[-3 + index]
+        block.norm = torch.nn.LayerNorm(1024, eps=1e-6)
+        block.pwconv1 = torch.nn.Linear(1024, 4096)
+        block.act = torch.nn.GELU()
+        block.pwconv2 = torch.nn.Linear(4096, 1024)
+        block.gamma = torch.nn.Parameter(torch.full((1024,), 1e-6))
+        decoder.convnext.append(block)
     return decoder
 
 
@@ -186,6 +206,18 @@ def test_rpu_install_validates_all_layers_before_transform(monkeypatch):
     with pytest.raises(ValueError, match="geometry"):
         install_rpu_convolutions(decoder, restore, {"calls": 0})
     assert restore == [] and [m.forward for m in decoder.modules()] == originals
+
+
+def test_rpu_install_rejects_convnext_profile_before_transform(monkeypatch):
+    from rpu_backend.runtime import weights
+    decoder = _decoder()
+    decoder.convnext[1].pwconv2 = torch.nn.Linear(4096, 1000)
+    monkeypatch.setattr(weights, "transform_linear_weight",
+                        lambda *args: pytest.fail("transformed before validation"))
+    restore = []
+    with pytest.raises(ValueError, match="ConvNeXt Linear geometry"):
+        install_rpu_convolutions(decoder, restore, {"calls": 0})
+    assert not restore
 
 
 def test_invalid_codec_backend_rejected_before_loading(monkeypatch):
@@ -209,11 +241,16 @@ def test_rpu_install_covers_decoding_convs_and_preserves_unused_layers(monkeypat
         assert weight.shape[0] % 128 == 0 and (partition, cores) == (1, 8)
         return weight
     monkeypatch.setattr(weights, "transform_linear_weight", transform)
+    monkeypatch.setattr(torch.ops.rpu, "tts_codec_conv_transpose1d", lambda *args: None,
+                        raising=False)
     restore, stats = [], {"calls": 0}
     install_rpu_convolutions(decoder, restore, stats)
-    assert stats["layers"] == len(restore) == len(converted) == 31
+    assert stats["layers"] == 31
+    assert stats["transposed_layers"] == 6 and stats["transposed_calls"] == 0
+    assert stats["convnext_linears"] == 4 and stats["convnext_linear_calls"] == 0
+    assert len(restore) == len(converted) == 41
     for module in (decoder.quantizer.rvq_first.input_proj,
-                   decoder.quantizer.rvq_rest.input_proj, decoder.transpose):
+                   decoder.quantizer.rvq_rest.input_proj):
         assert module.forward == originals[module]
     assert all(m.weight.device.type == "cpu" and m.weight.dtype == torch.float32 for m, _ in restore)
     # The diagonal expansion is checked using the actual prepared forward weight.
@@ -225,6 +262,66 @@ def test_rpu_install_covers_decoding_convs_and_preserves_unused_layers(monkeypat
     for module, forward in reversed(restore):
         module.forward = forward
     assert all(m.forward == forward for m, forward in originals.items())
+
+
+def test_convnext_linear_uses_acc32_and_returns_owned_cpu_fp32(monkeypatch):
+    module = torch.nn.Linear(4, 8).eval()
+    hidden = torch.randn(1, 3, 4)
+    source = hidden.clone()
+    weight, bias = module.weight.detach().half(), module.bias.detach().half()
+    stats = {"convnext_linear_calls": 0}
+    original_to = torch.Tensor.to
+    monkeypatch.setattr(torch.Tensor, "to", lambda self, *a, **kw:
+                        self if a == ("rpu",) else original_to(self, *a, **kw))
+    seen = []
+
+    def linear(value, packed, device_bias, partition, cores, acc32):
+        assert value.dtype == packed.dtype == device_bias.dtype == torch.float16
+        assert (partition, cores, acc32) == (1, 8, True)
+        seen.append(value.clone())
+        return (value.float() @ packed.float().T + device_bias.float()).half()
+
+    monkeypatch.setattr(torch.ops.rpu, "linear_with_accumulation", linear, raising=False)
+    result = _rpu_linear(module, hidden, weight, bias, stats)
+    expected = (hidden.half().float() @ weight.float().T + bias.float()).half().float()
+    assert torch.equal(result, expected) and result.dtype == torch.float32
+    assert torch.equal(hidden, source) and stats["convnext_linear_calls"] == 1
+    retained = result.clone()
+    changed = _rpu_linear(module, hidden + 1, weight, bias, stats)
+    assert torch.equal(result, retained) and not torch.equal(changed, result)
+    assert stats["convnext_linear_calls"] == 2 and not torch.equal(*seen)
+    with pytest.raises(ValueError, match="CPU FP32"):
+        _rpu_linear(module, hidden.half(), weight, bias, stats)
+    monkeypatch.setattr(torch.ops.rpu, "linear_with_accumulation",
+                        lambda *args: (_ for _ in ()).throw(RuntimeError("linear failure")))
+    with pytest.raises(RuntimeError, match="linear failure"):
+        _rpu_linear(module, hidden, weight, bias, stats)
+    assert stats["convnext_linear_calls"] == 2
+
+
+@pytest.mark.parametrize("kernel,stride", [(2, 2), (16, 8)])
+def test_native_transpose_transport_preserves_arguments_and_errors(monkeypatch, kernel, stride):
+    module = torch.nn.ConvTranspose1d(8, 5, kernel, stride=stride).eval()
+    hidden = torch.randn(1, 8, 7)
+    weight = object()
+    output = torch.randn(1, 5, (hidden.shape[-1] - 1) * stride + kernel)
+    stats = {"transposed_calls": 0}
+
+    def native(value, packed, bias, channels, native_kernel, native_stride):
+        assert value is hidden and packed is weight and bias is module.bias
+        assert (channels, native_kernel, native_stride) == (5, kernel, stride)
+        return output
+
+    monkeypatch.setattr(torch.ops.rpu, "tts_codec_conv_transpose1d", native, raising=False)
+    assert _rpu_transpose_convolution(module, hidden, weight, stats) is output
+    assert stats["transposed_calls"] == 1
+    with pytest.raises(ValueError, match="CPU FP32"):
+        _rpu_transpose_convolution(module, hidden.half(), weight, stats)
+    monkeypatch.setattr(torch.ops.rpu, "tts_codec_conv_transpose1d",
+                        lambda *args: (_ for _ in ()).throw(RuntimeError("device failure")))
+    with pytest.raises(RuntimeError, match="device failure"):
+        _rpu_transpose_convolution(module, hidden, weight, stats)
+    assert stats["transposed_calls"] == 1
 
 
 def test_native_codec_transport_preserves_arguments_and_propagates_errors(monkeypatch):
@@ -316,6 +413,68 @@ def test_residual_pair_binding_padding_calls_errors_and_restore(monkeypatch):
     for module, original in reversed(restore):
         module.forward = original
     assert all(m.forward == forward for m, forward in originals.items())
+
+
+def test_spm_codec_binds_full_residual_and_convnext_blocks(monkeypatch):
+    from rpu_backend.runtime import weights
+    decoder = _paired_decoder()
+    for stage, channels in enumerate((1536, 768, 384, 192), start=1):
+        snake = SnakeBeta()
+        snake.alpha = torch.nn.Parameter(torch.zeros(channels))
+        snake.beta = torch.nn.Parameter(torch.zeros(channels))
+        decoder.decoder[stage].block[0] = snake
+    final_snake = SnakeBeta()
+    final_snake.alpha = torch.nn.Parameter(torch.zeros(96))
+    final_snake.beta = torch.nn.Parameter(torch.zeros(96))
+    decoder.decoder.append(final_snake)
+    for unit in (module for module in decoder.modules()
+                 if type(module).__name__ == "Qwen3TTSTokenizerV2DecoderDecoderResidualUnit"):
+        unit.act1 = SnakeBeta()
+        unit.act1.alpha = torch.nn.Parameter(torch.zeros(unit.conv1.conv.in_channels))
+        unit.act1.beta = torch.nn.Parameter(torch.zeros(unit.conv1.conv.in_channels))
+    original_to = torch.Tensor.to
+    monkeypatch.setattr(torch.Tensor, "to", lambda self, *a, **kw:
+                        self if a == ("rpu",) else original_to(self, *a, **kw))
+    monkeypatch.setattr(weights, "transform_linear_weight", lambda weight, *args: weight)
+    monkeypatch.setattr(torch.ops.rpu, "tts_codec_conv1d_spm", lambda *args: args[0], raising=False)
+    monkeypatch.setattr(torch.ops.rpu, "tts_codec_conv_transpose1d", lambda *args: args[0], raising=False)
+    residual_calls, convnext_calls, snake_calls = [], [], []
+    def residual(hidden, first, affine, second, dilation, channels):
+        padded = (channels + 127) // 128 * 128
+        assert first.shape == (padded, channels * 7)
+        assert second.shape == (padded, padded)
+        assert affine.shape == (4, padded) and affine.dtype == torch.float16
+        residual_calls.append((dilation, channels))
+        return torch.zeros_like(hidden)
+    def convnext(hidden, depthwise, depthwise_bias, norm_weight, norm_bias,
+                 first, first_bias, second, second_bias, gamma, eps):
+        assert depthwise.shape == (1024, 7 * 1024)
+        assert first.shape == (4096, 1024) and second.shape == (1024, 4096)
+        assert all(value.dtype == torch.float16 for value in
+                   (depthwise_bias, norm_weight, norm_bias, first_bias,
+                    second_bias, gamma))
+        assert eps == 1e-6
+        convnext_calls.append(hidden.shape)
+        return hidden.clone()
+    monkeypatch.setattr(torch.ops.rpu, "tts_codec_residual_unit", residual, raising=False)
+    monkeypatch.setattr(torch.ops.rpu, "tts_codec_convnext_block", convnext, raising=False)
+    monkeypatch.setattr(torch.ops.rpu, "tts_codec_snake",
+                        lambda hidden, affine, channels:
+                        snake_calls.append((affine.shape, channels)) or hidden.clone(),
+                        raising=False)
+    restore, stats = [], {"calls": 0}
+    install_rpu_convolutions(decoder, restore, stats)
+    assert stats["transport"] == "spm_im2col"
+    assert stats["residual_pairs"] == 12 and stats["convnext_blocks"] == 2
+    assert stats["standalone_snakes"] == 5
+    hidden = torch.randn(1, 96, 17)
+    assert torch.equal(decoder.decoder[4].block[3](hidden), hidden)
+    assert residual_calls == [(3, 96)] and stats["paired_calls"] == 1
+    block_hidden = torch.randn(1, 1024, 9)
+    assert torch.equal(decoder.convnext[0](block_hidden), block_hidden)
+    assert convnext_calls == [block_hidden.shape] and stats["convnext_block_calls"] == 1
+    assert torch.equal(decoder.decoder[5](hidden), hidden)
+    assert snake_calls == [((2, 128), 96)] and stats["standalone_snake_calls"] == 1
 
 
 @pytest.mark.parametrize("invalid", ["geometry", "child_dilation", "range"])

@@ -157,7 +157,7 @@ CPU 浮点 Tensor。
 | 模型 | CPU | Rhino RPU |
 |---|---|---|
 | ASR | 音频读取、mel/分块、卷积与层间激活、单 token embedding、有限值检查、argmax、文本解码 | conv_out、位置和有效行处理、音频 encoder 与末尾投影、prefill 文本/音频组装、文本 decoder 和输出头 |
-| TTS | embedding、参考音频、speaker encoder、生成控制、码本、转置卷积/上采样、剩余 17 层 SnakeBeta、波形输出 | 默认卸载的 31 层解码 Conv1d，以及匹配 native 下的 12 层中间 SnakeBeta；Talker、Predictor 和输出头；具备对应 native 接口时还包括 codec 输入/输出投影和 Transformer 前段 |
+| TTS | embedding、参考音频、speaker encoder、生成控制、码本、ConvNeXt 归一化/GELU、转置卷积重叠与布局、剩余 17 层 SnakeBeta、波形输出 | 默认卸载的 31 层解码 Conv1d、4 层 ConvNeXt Linear，以及匹配 native 下的 6 层转置卷积投影和 12 层中间 SnakeBeta；Talker、Predictor 和输出头；具备对应 native 接口时还包括 codec 输入/输出投影和 Transformer 前段 |
 
 ASR 卷积使用 FP16 舍入权重进行 CPU FP32 计算，再转回 FP16；卷积采用 channels-last。
 设备音频 Graph 使用 FP32 Linear 累加。TTS CPU 组件保持 FP32，设备组件使用 FP16、
@@ -216,8 +216,8 @@ RPU 模式将解码实际调用的全部 31 层 Conv1d 转换成显式八核 Lin
 编码使用的两个 input_proj 不转换。权重只转换一次，保留原 CPU FP32 权重；独立卷积的输出通道
 补齐到 128 对齐后裁回原大小，再加原 FP32 bias。
 
-CPU 仍执行补边、列展开、剩余 bias/残差相加、码本、17 层 SnakeBeta、6 层转置卷积、ConvNeXt 的
-Linear/归一化/GELU 及上采样整理，因此属于部分卸载。native 提供 `tts_codec_conv1d` 时，
+CPU 仍执行补边、列展开、剩余 bias/残差相加、码本、17 层 SnakeBeta、ConvNeXt 的
+归一化/GELU 及上采样整理；旧 native 还会把 6 层转置卷积留在 CPU。native 提供 `tts_codec_conv1d` 时，
 CPU 通过保留存储所有权的共享视图，将展开并舍入后的 FP16 输入直接写入新分配的设备 DDR。
 同步 ACC32 Linear 完成后，读取已同步的共享 DDR 输出，先裁剪有效通道，再一次性转换并
 写入独立的 NCT FP32 输出；独立卷积路径保留原 FP32 bias 运算。CPU 别名不向调用者暴露，输入发布与
@@ -232,11 +232,19 @@ native 提供 `tts_codec_conv_pair` 时，12 个残差单元各自将 kernel-7 �
 并非单个融合设备程序或单张 Graph，仍保留逐算子提交和边界 flush。旧 native 保留全部
 CPU SnakeBeta；`codec_backend="cpu"` 下卷积和激活均在 CPU。
 
+native 提供 `tts_codec_conv_transpose1d` 时，6 层固定转置卷积的投影使用 RPU FP16
+输入/权重和 ACC32 Linear；重叠相加、FP32 bias 与最终布局仍由 CPU 完成，不新增设备 Graph。
+两个 ConvNeXt 块的 4 层逐点 Linear 同样使用 RPU FP16 输入/权重和 ACC32；LayerNorm
+与精确 GELU 保留 CPU FP32，以避开 v1.2.0 的 core-0 SPM 容量边界。每层 Linear 返回
+独立的 CPU FP32 张量。
+
 复用同步 immediate Linear 和第六个共享 arena，不新增常驻 Graph。几何不匹配会拒绝
 安装，执行错误直接抛出，不静默退回 CPU。`execution_stats().codec_convolutions`
 记录 `backend`、安装的 `layers`（RPU 模式为 31）、累计 RPU `calls`，以及
 `transport`（`shared_ddr` 或旧路径 `staged`）、`residual_pairs`（匹配 native 时为 12，
-否则为 0）和 `paired_calls`（成功完成的成组调用次数，每次也使 `calls` 增加 2）。
+否则为 0）、`paired_calls`（成功完成的成组调用次数，每次也使 `calls` 增加 2），以及
+`transposed_layers`（匹配 native 时为 6）、`transposed_calls`、
+`convnext_linears`（4）和 `convnext_linear_calls`。
 前段 Transformer 的 63 帧设备
 边界和更长序列的 CPU 滑窗注意力保持不变。
 

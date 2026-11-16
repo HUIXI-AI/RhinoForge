@@ -10,6 +10,20 @@ from rpu_backend.adapters.qwen3_tts.codec import (
 )
 
 
+def test_spm_convolution_passes_prepared_bias_without_host_add(monkeypatch):
+    module = torch.nn.Conv1d(96, 1, 7)
+    hidden, weight = torch.randn(1, 96, 9), torch.randn(128, 672).half()
+    bias, output = torch.randn(128).half(), torch.randn(1, 1, 3)
+    def native(x, w, b, kernel, dilation, channels):
+        assert x is hidden and w is weight and b is bias
+        assert (kernel, dilation, channels) == (7, 1, 1)
+        return output
+    monkeypatch.setattr(torch.ops.rpu, "tts_codec_conv1d_spm_bias", native, raising=False)
+    stats = {"calls": 0, "spm_im2col_calls": 0}
+    assert _rpu_convolution(module, hidden, weight, stats, bias) is output
+    assert stats == {"calls": 1, "spm_im2col_calls": 1}
+
+
 class SnakeBeta(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -194,6 +208,19 @@ def _decoder():
         block.gamma = torch.nn.Parameter(torch.full((1024,), 1e-6))
         decoder.convnext.append(block)
     return decoder
+
+
+def test_device_bias_overflow_rejects_before_transform(monkeypatch):
+    from rpu_backend.runtime import weights
+    decoder = _decoder()
+    with torch.no_grad():
+        decoder.convs[-1].bias.fill_(1e10)
+    monkeypatch.setattr(torch.ops.rpu, "tts_codec_conv1d_spm_bias", lambda *a: None, raising=False)
+    monkeypatch.setattr(weights, "transform_linear_weight", lambda *a: pytest.fail("premature transform"))
+    restore = []
+    with pytest.raises(ValueError, match="bias exceeds finite FP16"):
+        install_rpu_convolutions(decoder, restore, {"calls": 0})
+    assert not restore
 
 
 def test_rpu_install_validates_all_layers_before_transform(monkeypatch):
@@ -415,7 +442,8 @@ def test_residual_pair_binding_padding_calls_errors_and_restore(monkeypatch):
     assert all(m.forward == forward for m, forward in originals.items())
 
 
-def test_spm_codec_binds_full_residual_and_convnext_blocks(monkeypatch):
+@pytest.mark.parametrize("complete", [False, True])
+def test_spm_codec_binds_full_residual_and_convnext_blocks(monkeypatch, complete):
     from rpu_backend.runtime import weights
     decoder = _paired_decoder()
     for stage, channels in enumerate((1536, 768, 384, 192), start=1):
@@ -443,9 +471,9 @@ def test_spm_codec_binds_full_residual_and_convnext_blocks(monkeypatch):
         padded = (channels + 127) // 128 * 128
         assert first.shape == (padded, channels * 7)
         assert second.shape == (padded, padded)
-        assert affine.shape == (4, padded) and affine.dtype == torch.float16
+        assert affine.shape == (6 if complete else 4, padded) and affine.dtype == torch.float16
         residual_calls.append((dilation, channels))
-        return torch.zeros_like(hidden)
+        return hidden.clone() if complete else torch.zeros_like(hidden)
     def convnext(hidden, depthwise, depthwise_bias, norm_weight, norm_bias,
                  first, first_bias, second, second_bias, gamma, eps):
         assert depthwise.shape == (1024, 7 * 1024)
@@ -457,12 +485,23 @@ def test_spm_codec_binds_full_residual_and_convnext_blocks(monkeypatch):
         convnext_calls.append(hidden.shape)
         return hidden.clone()
     monkeypatch.setattr(torch.ops.rpu, "tts_codec_residual_unit", residual, raising=False)
+    if complete:
+        monkeypatch.setattr(torch.ops.rpu, "tts_codec_residual_unit_complete", residual, raising=False)
     monkeypatch.setattr(torch.ops.rpu, "tts_codec_convnext_block", convnext, raising=False)
     monkeypatch.setattr(torch.ops.rpu, "tts_codec_snake",
                         lambda hidden, affine, channels:
                         snake_calls.append((affine.shape, channels)) or hidden.clone(),
                         raising=False)
     restore, stats = [], {"calls": 0}
+    if complete:
+        alpha = decoder.decoder[4].block[3].act1.alpha
+        with torch.no_grad():
+            alpha.fill_(1000)
+        with pytest.raises(ValueError, match="finite FP16"):
+            install_rpu_convolutions(decoder, restore, stats)
+        assert not restore
+        with torch.no_grad():
+            alpha.zero_()
     install_rpu_convolutions(decoder, restore, stats)
     assert stats["transport"] == "spm_im2col"
     assert stats["residual_pairs"] == 12 and stats["convnext_blocks"] == 2

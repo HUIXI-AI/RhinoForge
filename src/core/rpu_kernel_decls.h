@@ -176,6 +176,10 @@ at::Tensor rpu_tts_codec_residual_unit(
     const at::Tensor& input, const at::Tensor& first_weight,
     const at::Tensor& affine, const at::Tensor& second_weight,
     int64_t dilation, int64_t channels);
+at::Tensor rpu_tts_codec_residual_unit_complete(
+    const at::Tensor& input, const at::Tensor& first_weight,
+    const at::Tensor& affine, const at::Tensor& second_weight,
+    int64_t dilation, int64_t channels);
 at::Tensor rpu_tts_codec_snake(
     const at::Tensor& input, const at::Tensor& affine, int64_t channels);
 at::Tensor rpu_tts_codec_convnext_block(

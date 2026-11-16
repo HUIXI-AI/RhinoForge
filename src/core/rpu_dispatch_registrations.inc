@@ -201,8 +201,12 @@ TORCH_LIBRARY(rpu, m) {
         TORCH_FN(rpu_tts_codec_conv_pair));
   m.def("tts_codec_conv1d_spm(Tensor input, Tensor weight, Tensor? bias, int kernel, int dilation, int out_channels) -> Tensor",
         TORCH_FN(rpu_tts_codec_conv1d_spm));
+  m.def("tts_codec_conv1d_spm_bias(Tensor input, Tensor weight, Tensor? bias, int kernel, int dilation, int out_channels) -> Tensor",
+        TORCH_FN(rpu_tts_codec_conv1d_spm));
   m.def("tts_codec_residual_unit(Tensor input, Tensor first_weight, Tensor affine, Tensor second_weight, int dilation, int channels) -> Tensor",
         TORCH_FN(rpu_tts_codec_residual_unit));
+  m.def("tts_codec_residual_unit_complete(Tensor input, Tensor first_weight, Tensor affine, Tensor second_weight, int dilation, int channels) -> Tensor",
+        TORCH_FN(rpu_tts_codec_residual_unit_complete));
   m.def("tts_codec_snake(Tensor input, Tensor affine, int channels) -> Tensor",
         TORCH_FN(rpu_tts_codec_snake));
   m.def("tts_codec_convnext_block(Tensor input, Tensor depthwise_weight, Tensor depthwise_bias, Tensor norm_weight, Tensor norm_bias, Tensor first_weight, Tensor first_bias, Tensor second_weight, Tensor second_bias, Tensor gamma, float eps) -> Tensor",

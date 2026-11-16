@@ -42,6 +42,12 @@ For model assessment or implementation, use the
 [`rhinoforge-port` skill](../.agents/skills/rhinoforge-port/SKILL.md) with
 [model porting](../docs/model_porting.md).
 
+For TTS codec migration, check the installed native capabilities and the
+[speech guide](../docs/qwen3_audio.md#experimental-rpu-vocoder-convolutions).
+Compare fixed codec tokens, not just equal generation lengths. Keep padded
+residual rows through device addition and crop through the owned CPU output;
+validate repeated outputs when changing a device layout or FP16 boundary.
+
 ## Add or update knowledge
 
 1. Confirm the statement in public source or documentation.

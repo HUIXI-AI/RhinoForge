@@ -306,6 +306,20 @@ RPU `calls`, `transport` (`shared_ddr` or the older `staged` route),
 `paired_calls` (completed pair executions; each also adds two to `calls`), plus
 `transposed_layers` (6 with matching native support), `transposed_calls`,
 `convnext_linears` (4) and `convnext_linear_calls`.
+Newer native extensions provide `tts_codec_residual_unit_complete`: the twelve
+residual units additionally execute their first SnakeBeta and final residual
+addition on RPU. Their six-row FP16 parameters retain the four-row legacy
+parameters followed by the first activation's alpha and scale. The original
+input is retained for the residual; 96/192-channel units additionally prepare a
+zero-padded shared-DDR residual to avoid a strided device compaction. This changes the first
+activation and final addition from CPU FP32 to device FP16; older extensions
+keep their previous CPU boundaries. The host-visible input and independently
+owned output remain CPU FP32. No retained Graph or runtime-package change is
+introduced. With `tts_codec_conv1d_spm_bias`, standalone Conv1d also retains a
+padded FP16 bias on device and passes it to the existing Linear projection;
+legacy CPU FP32 bias remains supported by the native wrapper. Transposed-
+convolution postprocessing remains on CPU.
+
 The frontend's existing 63-frame device bound and CPU sliding-attention fallback
 remain unchanged.
 

@@ -114,9 +114,29 @@ See
 
 ## Run
 
-Prepare RhinoForge, the complete checkpoint directory, and a separate checkout
-of the upstream LightNav source. Then validate the request without loading the
-model:
+When using this port from GitHub, check out the
+`feat/lightnav-0-r1-cache` branch and record its exact commit. The branch contains
+only RhinoForge source. It does not include the local untracked `lib/` directory,
+a prebuilt `rpu_backend.so`, Rhino Launch, operator assets, the upstream LightNav
+source, or model weights.
+
+Prepare the environment in this order:
+
+1. Follow the [unified installation guide](getting_started.md) to create the
+   Python 3.12 environment and build RhinoForge from the current checkout. Do not
+   reuse an `rpu_backend.so` built from another commit.
+2. Follow [runtime assets](runtime_assets.md#configure-paths) to verify and unpack
+   the official v1.2.0 runtime and set `RHINO_LAUNCH_ROOT`,
+   `RPU_KERNEL_LIB_PATH`, `RPU_KERNEL_LIB_PATH_EXPANSION`, and
+   `LD_LIBRARY_PATH`. The runtime must match
+   [`release/runtime-dependencies.json`](../release/runtime-dependencies.json).
+3. Separately obtain the upstream LightNav source commit and complete checkpoint
+   revision pinned at the top of this page. Do not run `pip install -e .` in the
+   LightNav checkout; the runner loads it through `--lightnav-source`.
+
+The checkpoint must include the weights, `eval_config.json`, processor/tokenizer
+files, and `action_tokenizer/`. After configuring the environment and runtime
+assets, validate the request without loading the model:
 
 ```bash
 python examples/lightnav_benchmark.py \

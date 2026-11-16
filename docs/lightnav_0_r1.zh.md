@@ -94,8 +94,23 @@ Prefill/Decode/Total 为 84.437/91.843/220.200 ms，但仅 130/175 token、11/35
 
 ## 运行
 
-先准备 RhinoForge、模型目录和 LightNav 上游源码。模型目录必须包含权重、
-`eval_config.json`、processor/tokenizer 文件和 `action_tokenizer/`。
+客户从 GitHub 使用本适配时，应检出 `feat/lightnav-0-r1-cache` 分支，并记录实际
+commit。该分支只包含 RhinoForge 源码，不包含本机未跟踪的 `lib/`、预编译
+`rpu_backend.so`、Rhino Launch、算子资产、LightNav 上游源码或模型权重。
+
+环境准备按以下顺序执行：
+
+1. 按[统一安装指南](getting_started.zh.md)创建 Python 3.12 环境，并从当前 checkout
+   编译安装 RhinoForge；不要沿用其他提交生成的 `rpu_backend.so`。
+2. 按[运行时资产说明](runtime_assets.zh.md#配置路径)校验并解开正式 v1.2.0 runtime，
+   设置 `RHINO_LAUNCH_ROOT`、`RPU_KERNEL_LIB_PATH`、
+   `RPU_KERNEL_LIB_PATH_EXPANSION` 和 `LD_LIBRARY_PATH`。runtime 需与当前
+   [`release/runtime-dependencies.json`](../release/runtime-dependencies.json)匹配。
+3. 单独准备本页开头固定 commit 的 LightNav 上游源码和固定 revision 的完整模型。
+   不要执行 LightNav 的 `pip install -e .`；运行脚本通过 `--lightnav-source` 加载它。
+
+模型目录必须包含权重、`eval_config.json`、processor/tokenizer 文件和
+`action_tokenizer/`。完成上述环境和运行资产配置后，再执行下面的配置检查：
 
 ```bash
 python examples/lightnav_benchmark.py \

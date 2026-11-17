@@ -4122,15 +4122,17 @@ Tensor rpu_tts_codec_conv1d_spm(
 static Tensor tts_codec_residual_unit_impl(
     const Tensor& input, const Tensor& first_weight, const Tensor& affine,
     const Tensor& second_weight, int64_t dilation, int64_t channels, bool complete,
-    bool resident = false) {
+    bool resident = false, bool padded_rows = false) {
   TORCH_CHECK(!RpuKernelGraph::has_active(),
               "tts_codec_residual_unit: eager tiled execution required");
+  const int64_t row_channels = padded_rows ? (channels == 96 ? 128 : 256) : channels;
   const bool valid_input = resident
-      ? complete && (channels == 384 || channels == 768) &&
+      ? complete && (padded_rows ? (channels == 96 || channels == 192)
+                                : (channels == 384 || channels == 768)) &&
             input.device().type() == at::kPrivateUse1 && input.device() == first_weight.device() &&
             input.device() == second_weight.device() && input.device() == affine.device() &&
             input.scalar_type() == at::kHalf && input.is_contiguous() && input.dim() == 2 &&
-            input.size(1) == channels && input.size(0) > 0 && input.size(0) <= 255 * 1920
+            input.size(1) == row_channels && input.size(0) > 0 && input.size(0) <= 255 * 1920
       : input.device().is_cpu() && input.scalar_type() == at::kFloat &&
             input.dim() == 3 && input.size(0) == 1 && input.size(1) == channels &&
             input.size(2) > 0 && input.size(2) <= 255 * 1920;
@@ -4141,7 +4143,7 @@ static Tensor tts_codec_residual_unit_impl(
               "tts_codec_residual_unit: outside the frozen residual profile");
   const int64_t padded = CeilDiv(channels, int64_t{128}) * 128;
   check_tts_codec_device_half(
-      first_weight, {padded, channels * 7},
+      first_weight, {padded, row_channels * 7},
       "tts_codec_residual_unit first weight");
   check_tts_codec_device_half(
       second_weight, {padded, padded},
@@ -4152,12 +4154,12 @@ static Tensor tts_codec_residual_unit_impl(
     return affine.select(0, row);
   };
   auto hidden = resident ? input : tts_codec_cpu_nct_to_device_rows(input, first_weight);
-  const auto residual = complete && padded != channels
+  const auto residual = !resident && complete && padded != channels
       ? tts_codec_cpu_nct_to_device_rows(input, first_weight, padded) : hidden;
   if (complete) {
     hidden = tts_codec_snake_rows(
-        hidden, channel(4).narrow(0, 0, channels),
-        channel(5).narrow(0, 0, channels));
+        hidden, channel(4).narrow(0, 0, row_channels),
+        channel(5).narrow(0, 0, row_channels));
   }
   auto patches = tts_codec_im2col_rows(hidden, 7, dilation, 6 * dilation);
   hidden = rpu_linear_with_accumulation(
@@ -4193,6 +4195,13 @@ Tensor rpu_tts_codec_residual_unit_rows(
     const Tensor& second_weight, int64_t dilation, int64_t channels) {
   return tts_codec_residual_unit_impl(
       input, first_weight, affine, second_weight, dilation, channels, true, true);
+}
+
+Tensor rpu_tts_codec_residual_unit_padded_rows(
+    const Tensor& input, const Tensor& first_weight, const Tensor& affine,
+    const Tensor& second_weight, int64_t dilation, int64_t channels) {
+  return tts_codec_residual_unit_impl(
+      input, first_weight, affine, second_weight, dilation, channels, true, true, true);
 }
 
 Tensor rpu_tts_codec_snake(

@@ -152,6 +152,12 @@ generator 从首次迭代到完成、失败或关闭前一直持有模型请求�
 CPU 浮点 Tensor。
 函数签名和返回类型见[语音 API](api_reference.zh.md#语音-api)。
 
+与其他 CPU 应用共享 R1 时，可先对照测试 `torch.set_num_threads(4)`，而非照搬示例的
+16 线程。使用 GNU OpenMP 的 PyTorch 还可在启动进程前设置 `OMP_WAIT_POLICY=PASSIVE`，
+减少线程等待时的 CPU 消耗；不要在导入 Torch 后才设置，也不要将它当作 RPU 等待策略。
+同时比较整句墙钟、进程 CPU 核秒、生成 token 和波形：线程/等待配置可能影响延迟，
+线程数变化也可能改变采样输出。API 不会覆盖调用方配置；应在客户应用实际并行时验证。
+
 ## 执行与资源
 
 | 模型 | CPU | Rhino RPU |
@@ -255,7 +261,10 @@ RPU 使用独立单核 SPM 缓冲和容量受限的分块完成末轴切片、�
 通过共享 DDR 边界函数合并 CPU 布局及类型转换，减少主机中间复制；返回的 CPU FP32
 张量拥有独立存储，但不代表整条反卷积链设备驻留。
 具备 `tts_codec_residual_unit_rows` 时，768/384 通道阶段中的
-三个残差单元保持设备驻留，省去两次中间 CPU 往返；192/96 通道保留原有边界。
+三个残差单元保持设备驻留，省去两次中间 CPU 往返。
+具备 `tts_codec_residual_unit_padded_rows` 时，192/96 通道阶段也通过补零至
+256/128 通道的 rows 将三个单元保持在设备上，仅在阶段入口补齐、出口裁剪；
+第一层卷积权重的每个 kernel 位置分别补齐输入通道。旧扩展保留原有 CPU 边界。
 上述路径需要重编译 RhinoForge 扩展，不修改 runtime 依赖包。
 匹配新版 native 还通过 `tts_codec_conv1d_spm`、`tts_codec_snake` 和
 `tts_codec_convnext_block` 在 RPU 上完成卷积准备、独立 SnakeBeta 及 ConvNeXt

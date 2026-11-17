@@ -209,6 +209,8 @@ TORCH_LIBRARY(rpu, m) {
         TORCH_FN(rpu_tts_codec_residual_unit_complete));
   m.def("tts_codec_residual_unit_rows(Tensor input, Tensor first_weight, Tensor affine, Tensor second_weight, int dilation, int channels) -> Tensor",
         TORCH_FN(rpu_tts_codec_residual_unit_rows));
+  m.def("tts_codec_residual_unit_padded_rows(Tensor input, Tensor first_weight, Tensor affine, Tensor second_weight, int dilation, int channels) -> Tensor",
+        TORCH_FN(rpu_tts_codec_residual_unit_padded_rows));
   m.def("tts_codec_snake(Tensor input, Tensor affine, int channels) -> Tensor",
         TORCH_FN(rpu_tts_codec_snake));
   m.def("tts_codec_convnext_block(Tensor input, Tensor depthwise_weight, Tensor depthwise_bias, Tensor norm_weight, Tensor norm_bias, Tensor first_weight, Tensor first_bias, Tensor second_weight, Tensor second_bias, Tensor gamma, float eps) -> Tensor",

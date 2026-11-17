@@ -153,13 +153,18 @@ def _rpu_residual_stage(owner, hidden, parameters, channels, stats):
             hidden.ndim != 3 or hidden.shape[:2] != (1, channels) or
             not 0 < hidden.shape[-1] <= 255 * 1920):
         raise ValueError("TTS residual stage requires bounded CPU FP32 input")
-    rows = hidden.squeeze(0).T.half().contiguous().to("rpu")
+    rows = hidden.squeeze(0).T.half().contiguous()
+    if channels in (96, 192):
+        rows = torch.nn.functional.pad(rows, (0, (-channels) % 128))
+    rows = rows.to("rpu")
+    native = (torch.ops.rpu.tts_codec_residual_unit_padded_rows if channels in (96, 192)
+              else torch.ops.rpu.tts_codec_residual_unit_rows)
     for dilation, (first, affine, second) in zip((1, 3, 9), parameters):
-        rows = torch.ops.rpu.tts_codec_residual_unit_rows(
+        rows = native(
             rows, first, affine, second, dilation, channels)
         stats["calls"] += 2
         stats["paired_calls"] += 1
-    return rows.cpu().float().T.unsqueeze(0).contiguous()
+    return rows.cpu().float()[:, :channels].T.unsqueeze(0).contiguous()
 
 
 def install_rpu_convolutions(decoder, restore, stats):
@@ -227,7 +232,8 @@ def install_rpu_convolutions(decoder, restore, stats):
     pairs = (_residual_pair_affines(decoder, full=fused_residuals, complete=complete_residuals)
              if fused_residuals or hasattr(torch.ops.rpu, "tts_codec_conv_pair") else [])
     if complete_residuals and fused_residuals and hasattr(torch.ops.rpu, "tts_codec_residual_unit_rows"):
-        if any(len(decoder.get_submodule(f"decoder.{index}").block) != 5 for index in (1, 2)):
+        stage_indices = (1, 2, 3, 4) if hasattr(torch.ops.rpu, "tts_codec_residual_unit_padded_rows") else (1, 2)
+        if any(len(decoder.get_submodule(f"decoder.{index}").block) != 5 for index in stage_indices):
             raise ValueError("TTS RPU resident residual stage requires exactly three units")
     standalone_snakes = []
     if hasattr(torch.ops.rpu, "tts_codec_snake"):
@@ -382,6 +388,11 @@ def install_rpu_convolutions(decoder, restore, stats):
             second = transform_linear_weight(weight, 1, 8).to("rpu")
         first, affine = weights[unit.conv1.conv], affine.to("rpu")
         resident_parameters[unit] = (first, affine, second)
+        if padding and complete_residuals and hasattr(torch.ops.rpu, "tts_codec_residual_unit_padded_rows"):
+            weight = unit.conv1.conv.weight.detach().permute(0, 2, 1).half()
+            weight = torch.nn.functional.pad(weight, (0, padding, 0, 0, 0, padding))
+            weight = weight.reshape(channels + padding, 7 * (channels + padding))
+            resident_parameters[unit] = (transform_linear_weight(weight, 1, 8).to("rpu"), affine, second)
 
         if fused_residuals:
             def forward(owner, hidden, first=first, affine=affine, second=second):
@@ -419,7 +430,10 @@ def install_rpu_convolutions(decoder, restore, stats):
         unit.forward = types.MethodType(forward, unit)
 
     if complete_residuals and fused_residuals and hasattr(torch.ops.rpu, "tts_codec_residual_unit_rows"):
-        for index, channels in ((1, 768), (2, 384)):
+        stages = [(1, 768), (2, 384)]
+        if hasattr(torch.ops.rpu, "tts_codec_residual_unit_padded_rows"):
+            stages.extend(((3, 192), (4, 96)))
+        for index, channels in stages:
             stage = decoder.get_submodule(f"decoder.{index}")
             parameters = tuple(resident_parameters[unit] for unit in stage.block[2:])
 

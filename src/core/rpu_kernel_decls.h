@@ -180,6 +180,9 @@ at::Tensor rpu_tts_codec_residual_unit_complete(
     const at::Tensor& input, const at::Tensor& first_weight,
     const at::Tensor& affine, const at::Tensor& second_weight,
     int64_t dilation, int64_t channels);
+at::Tensor rpu_tts_codec_residual_unit_padded_rows(
+    const at::Tensor& input, const at::Tensor& first_weight, const at::Tensor& affine,
+    const at::Tensor& second_weight, int64_t dilation, int64_t channels);
 at::Tensor rpu_tts_codec_residual_unit_rows(
     const at::Tensor& input, const at::Tensor& first_weight,
     const at::Tensor& affine, const at::Tensor& second_weight,

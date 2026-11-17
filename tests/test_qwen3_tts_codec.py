@@ -279,7 +279,8 @@ def test_transpose_new_layout_and_device_post_are_bound_together(monkeypatch):
     assert stats["transposed_calls"] == 6
 
 
-def test_resident_stage_keeps_three_units_on_device_and_restores(monkeypatch):
+@pytest.mark.parametrize("padded_rows", [False, True])
+def test_resident_stage_keeps_three_units_on_device_and_restores(monkeypatch, padded_rows):
     from rpu_backend.runtime import weights
     decoder = _paired_decoder()
     for stage in decoder.decoder[1:]:
@@ -298,22 +299,51 @@ def test_resident_stage_keeps_three_units_on_device_and_restores(monkeypatch):
     seen = []
     def native(rows, first, affine, second, dilation, channels):
         assert rows.dtype == torch.float16 and rows.is_contiguous()
-        assert affine.shape == (6, channels)
+        physical = (channels + 127) // 128 * 128
+        assert affine.shape == (6, physical)
+        assert first.shape == (physical, 7 * physical)
+        if channels != physical:
+            assert torch.count_nonzero(rows[:, channels:]) == 0
+            assert torch.count_nonzero(first.view(physical, 7, physical)[:, :, channels:]) == 0
+            assert torch.count_nonzero(first[channels:]) == 0
         seen.append((channels, dilation))
-        return rows + dilation
+        result = rows + dilation
+        result[:, channels:] = 0
+        return result
     monkeypatch.setattr(torch.ops.rpu, "tts_codec_residual_unit_rows", native, raising=False)
+    if padded_rows:
+        monkeypatch.setattr(torch.ops.rpu, "tts_codec_residual_unit_padded_rows", native, raising=False)
     restore, stats = [], {"calls": 0}
     install_rpu_convolutions(decoder, restore, stats)
-    for index, channels in ((1, 768), (2, 384)):
-        hidden = torch.randn(1, channels, 3)
+    stages = [(1, 768), (2, 384)] + ([(3, 192), (4, 96)] if padded_rows else [])
+    for index, channels in stages:
+        hidden = torch.randn(1, channels, 7)[..., 1::2]
         expected = ((hidden.half() + 1) + 3) + 9
         assert torch.equal(decoder.decoder[index](hidden), expected.float())
-    assert seen == [(c, d) for c in (768, 384) for d in (1, 3, 9)]
-    assert stats["paired_calls"] == 6 and stats["calls"] == 12
-    assert decoder.decoder[3].forward == original[decoder.decoder[3]]
+    assert seen == [(c, d) for _, c in stages for d in (1, 3, 9)]
+    assert stats["paired_calls"] == 3 * len(stages) and stats["calls"] == 6 * len(stages)
+    if not padded_rows:
+        assert decoder.decoder[3].forward == original[decoder.decoder[3]]
     for module, forward in reversed(restore):
         module.forward = forward
     assert all(module.forward == forward for module, forward in original.items())
+
+
+@pytest.mark.parametrize("index", [3, 4])
+def test_padded_resident_stage_rejects_extra_blocks_before_transform(monkeypatch, index):
+    from rpu_backend.adapters.qwen3_tts import codec
+    from rpu_backend.runtime import weights
+    decoder = _paired_decoder()
+    decoder.decoder[index].block.append(torch.nn.Identity())
+    for name in ("tts_codec_residual_unit", "tts_codec_residual_unit_complete",
+                 "tts_codec_residual_unit_rows", "tts_codec_residual_unit_padded_rows"):
+        monkeypatch.setattr(torch.ops.rpu, name, lambda *args: None, raising=False)
+    monkeypatch.setattr(codec, "_residual_pair_affines", lambda *args, **kwargs: [])
+    monkeypatch.setattr(weights, "transform_linear_weight", lambda *args: pytest.fail("transformed before validation"))
+    restore = []
+    with pytest.raises(ValueError, match="exactly three units"):
+        install_rpu_convolutions(decoder, restore, {"calls": 0})
+    assert not restore
 
 
 def test_rpu_install_validates_all_layers_before_transform(monkeypatch):

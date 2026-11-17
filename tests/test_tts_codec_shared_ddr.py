@@ -95,7 +95,7 @@ Tensor tts_codec_device_rows_to_cpu_nct(const Tensor&t){return t.t().unsqueeze(0
 Tensor tts_codec_snake_rows(const Tensor&x,const Tensor&a,const Tensor&s){auto v=at::sin(x*a);return x+(v*v)*s;}
 Tensor tts_codec_im2col_rows(const Tensor&x,int64_t,int64_t d,int64_t pad){
  auto y=at::constant_pad_nd(x.t(),{pad,0},0);
- return y.unfold(1,6*d+1,1).slice(2,0,6*d+1,d).permute({1,0,2}).reshape({x.size(0),x.size(1)*7}).contiguous();
+ return y.unfold(1,6*d+1,1).slice(2,0,6*d+1,d).permute({1,2,0}).reshape({x.size(0),x.size(1)*7}).contiguous();
 }
 Tensor rpu_linear_with_accumulation(const Tensor&x,const Tensor&w,const c10::optional<Tensor>&,
  int64_t,int64_t,bool,const c10::optional<Tensor>&){return at::mm(x.to(at::kFloat),w.to(at::kFloat).t()).to(at::kHalf);}
@@ -103,6 +103,28 @@ Tensor rpu_linear_with_accumulation(const Tensor&x,const Tensor&w,const c10::opt
     cases = r'''
 int main(){
  at::manual_seed(73);
+ for(int c:{96,192})for(int t:{1,3,17}){
+  int p=CeilDiv(c,128)*128;
+  auto x=at::randn({1,c,t})/10;
+  auto rows=tts_codec_cpu_nct_to_device_rows(x,at::empty({1},at::kHalf),p);
+  auto first=at::constant_pad_nd((at::randn({c,7,c})/64).to(at::kHalf),{0,p-c,0,0,0,p-c}).reshape({p,7*p});
+  auto second=at::constant_pad_nd((at::randn({c,c})/16).to(at::kHalf),{0,p-c,0,p-c});
+  auto affine=at::constant_pad_nd((at::randn({6,c})/10).to(at::kHalf),{0,p-c});
+  affine.select(0,4).narrow(0,c,p-c).fill_(1);
+  auto oldfirst=first.view({p,7,p}).narrow(2,0,c).contiguous().view({p,7*c});
+  auto reference=x;
+  for(int d:{1,3,9}){
+   reference=rpu_tts_codec_residual_unit_complete(reference,oldfirst,affine,second,d,c);
+   auto saved=rows.clone();
+   auto next=rpu_tts_codec_residual_unit_padded_rows(rows,first,affine,second,d,c);
+   assert(at::equal(saved,rows));rows=next;
+   assert(at::count_nonzero(rows.narrow(1,c,p-c)).item<int64_t>()==0);
+   assert(at::allclose(tts_codec_device_rows_to_cpu_nct(rows.narrow(1,0,c)),reference,1e-3,1e-3));
+  }
+  bool rejected=false;
+  try{rpu_tts_codec_residual_unit_padded_rows(rows,oldfirst,affine,second,1,c);}catch(const c10::Error&){rejected=true;}
+  assert(rejected);
+ }
  for(int c:{384,768}){
   auto input=at::randn({1,c,3})/10;
   auto rows=input.squeeze(0).t().to(at::kHalf).contiguous(),saved=rows.clone();

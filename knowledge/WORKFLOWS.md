@@ -176,7 +176,10 @@ Start with the [Qwen3 speech guide](../docs/qwen3_audio.md) and retain these con
   Missing setter selects CPU; report the route and propagate errors.
   New transpose postprocessing uses kernel-major weights and bounded single-core
   SPM last-axis slices, not DDR transpose. Keep 768/384-channel residual chains
-  in device rows; retain CPU boundaries for padded 192/96-channel chains.
+  in device rows. With `tts_codec_residual_unit_padded_rows`, keep 192/96-channel
+  chains in zero-padded 256/128-channel rows too: pad each kernel position's input
+  columns before transforming the first convolution weight, and crop only at stage
+  exit. Preserve the original per-unit weights for older-extension CPU boundaries.
   The optional `tts_codec_conv_transpose1d_device_post` boundary reuses shared-DDR
   conversion helpers and the existing projection/overlap math. Validate the full
   geometry before upload, and return independently owned CPU FP32 NCT storage.

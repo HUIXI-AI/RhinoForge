@@ -169,6 +169,15 @@ on the same execution profile. Reuse the model context for multiple requests.
 ASR also accepts a one-dimensional CPU floating-point Tensor. See
 [speech APIs](api_reference.md#bounded-speech-apis) for signatures and return types.
 
+When sharing R1 with other CPU applications, first compare `torch.set_num_threads(4)`
+against the example's 16 threads. For a GNU OpenMP Torch build, setting
+`OMP_WAIT_POLICY=PASSIVE` before process startup can also reduce CPU consumption
+while workers wait; setting it after importing Torch is too late, and it does not
+control RPU waits. Compare end-to-end wall time, process CPU core-seconds, generated
+tokens and waveforms: these settings can affect latency, and changing thread count
+can change sampled output. The API leaves caller settings untouched; validate with
+the customer's other applications actually running.
+
 ## Execution and resources
 
 | Model | CPU | Rhino RPU |
@@ -331,7 +340,11 @@ intermediate host copies. Returned CPU FP32 tensors own their storage; this does
 not make the full transposed-convolution chain device-resident.
 With `tts_codec_residual_unit_rows`, the three residual units in each 768/384-channel
 stage keep their activations on device, removing the two internal CPU round trips.
-The 192/96-channel stages keep their previous CPU boundaries. These paths require
+With `tts_codec_residual_unit_padded_rows`, the 192/96-channel stages also keep
+their three units on device using zero-padded 256/128-channel rows. Pad once at
+stage entry and crop once at exit; each first convolution pads the input channels
+within every kernel position. Older extensions retain the previous CPU boundaries.
+These paths require
 a rebuilt RhinoForge extension, not a changed runtime package.
 The matching extension also uses `tts_codec_conv1d_spm`, `tts_codec_snake` and
 `tts_codec_convnext_block` for convolution preparation, standalone SnakeBeta,

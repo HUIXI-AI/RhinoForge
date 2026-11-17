@@ -109,6 +109,59 @@ kept the hit/miss result at 4/1 and reduced Vision/ViT from 49.042/43.314 ms to
 9-history-frame runner therefore leaves this redundant prefetch disabled; the
 remaining Vision difference between boards is about 3 ms.
 
+### Complete conditions for the approximately 250 ms result
+
+This result comes from the customer-sequence test on
+`feat/lightnav-0-r1-cache`. It does not use the five tokens from the previous
+request as candidates. The test conditions and measurement method are:
+
+- R1 runtime v1.2.0, with the LightNav-0 revision and upstream source commit
+  pinned at the top of this page;
+- the ordered 35-frame customer sequence, with nine history frames plus one
+  current frame per request;
+- 347 prompt tokens at the full window and five tokens produced by standard
+  autoregressive decoding;
+- five position-specific 1,408-row grammar heads, with the action head,
+  embedding, and norms retained at FP16;
+- a steady 4/1 tubelet cache hit/miss result and `prefetch_latest` disabled;
+- safely rebound Prefill and Decode Graphs reused after the full window is
+  established;
+- medians over the 25 steady requests where `frame_index >= 10`, excluding
+  model loading and initial window fill;
+- `Total` measures the request itself, while `Frame total` also includes outer
+  request scheduling. Stage medians are computed independently, so they may
+  not add up exactly to the median Total.
+
+The retained configuration combines Text W8A16 with calibrated Vision W8A16.
+The Vision encoder range scale is 1.04, while patch embedding and merger use the
+standard 1.0 scale. The action head, embedding, and norms remain FP16.
+
+| Run | Prepare | Vision | Prefill | Standard Decode 5 | Total | Frame total | Output equality |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Calibrated W8A16 | 17.310 ms | 26.879 ms | 89.169 ms | 114.535 ms | **248.388 ms** | **252.037 ms** | 35/35 frames, 175/175 tokens |
+| Independent cold reload | — | 26.828 ms | 88.980 ms | 114.494 ms | **247.856 ms** | **251.554 ms** | 35/35 frames, 175/175 tokens |
+
+Decode still performs standard five-token autoregressive generation; no draft
+acceptance skips it. The “approximately 250 ms” figure therefore means
+247.856–248.388 ms of steady request latency, or 251.554–252.037 ms when
+measured between completed frames.
+
+The W4A16/G32 profiles were weight-traffic experiments on top of calibrated
+Vision W8A16:
+
+| Text configuration | Prefill | Decode 5 | Total | Equality to W8 reference | Decision |
+|---|---:|---:|---:|---:|---|
+| MLP Gate/Up/Down W4, Attention W8 | 84.437 ms | 91.843 ms | **220.200 ms** | 11/35 frames, 130/175 tokens | Rejected for accuracy regression |
+| Gate/Up W4, Attention/Down W8 | 89.448 ms | 101.874 ms | **236.765 ms** | 19/35 frames, 144/175 tokens | Rejected for accuracy regression |
+| Up only W4, remaining text projections W8 | Not fully measured | Not fully measured | Not fully measured | 8/45 tokens on the first nine frames | Rejected by the early accuracy gate |
+
+The delivery conclusion is that calibrated W8A16 is the only tested
+configuration that preserves every customer token, at about 248 ms steady
+request latency. Mixed W4/W8 reaches 220–237 ms but changes the hierarchical
+action tokens and is not a delivery result. Equality on these 35 offline frames
+still requires broader closed-loop navigation evaluation before it can stand
+for task success rate.
+
 See
 `benchmark_results/lightnav_9_history_20261112/summary.json` for the full result.
 

@@ -359,6 +359,9 @@ planner caps tiles at 512 rows per core and 4 MiB per-core scratch space.
 Transposed-convolution overlap/bias also uses one one-shot Graph per existing
 bounded tile. Im2col likewise batches each tile's fill, input DMA, expansion and
 output DMA, retaining its existing 4 MiB capacity plan and padding/dilation math.
+ConvNeXt LayerNorm groups at most sixteen 16-row tiles into each one-shot Graph,
+uploading affine parameters once per invocation without enlarging its SPM buffers
+or changing the per-tile reduction math.
 These paths complete and retire each Graph before reusing scratch
 space; they add no retained Graph, cross-request cache, or runtime dependency.
 Linear projections and other codec operations retain their existing paths.

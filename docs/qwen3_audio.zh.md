@@ -275,7 +275,9 @@ Codec SnakeBeta 的五步 FP16 算术现在保持在各核 SPM 中，按 rows �
 调用的临时 SPM 作用域内跨块复用，每次调用重新上传。分块上限为每核 512 行，
 临时空间上限为每核 4 MiB。反卷积重叠相加/bias 也按原有容量分块合入一次性 Graph。
 im2col 也将每块的清零、输入 DMA、展开和输出 DMA 合批，保持原有 4 MiB 容量规划、
-padding 和 dilation 数学。上述路径均在复用临时空间前完成并释放 Graph，不新增常驻图、
+padding 和 dilation 数学。ConvNeXt LayerNorm 将最多 16 个原有的 16 行小块合入一个
+一次性 Graph，每次调用仅上传一次仿射参数，不扩大 SPM 缓冲或改变块内归约数学。
+上述路径均在复用临时空间前完成并释放 Graph，不新增常驻图、
 跨请求缓存或 runtime 依赖。Linear 投影和其他 Codec 运算仍沿用原路径。
 
 FP16 舍入会改变波形，应使用同一份 codec tokens 对照 CPU FP32 并核验语音内容。

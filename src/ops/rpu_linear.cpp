@@ -4098,6 +4098,8 @@ Tensor tts_codec_snake_rows(const Tensor& rows, const Tensor& alpha,
 
 Tensor tts_codec_layernorm_rows(const Tensor& rows, const Tensor& weight,
                                 const Tensor& bias, double eps) {
+  TORCH_CHECK(!RpuKernelGraph::has_active() && rows.dim() == 2 && rows.size(0) > 0,
+              "TTS codec LayerNorm requires nonempty eager rows");
   const int64_t channels = rows.size(1);
   auto output = at::empty_like(rows);
   if (!SPM_ALLOC.is_initialized()) SPM_ALLOC.init();
@@ -4114,23 +4116,30 @@ Tensor tts_codec_layernorm_rows(const Tensor& rows, const Tensor& weight,
       0, SPM_ALLOC.alloc_temporary(channels * sizeof(c10::Half)));
   const uint32_t bias_spm = SPM_ALLOC.addr(
       0, SPM_ALLOC.alloc_temporary(channels * sizeof(c10::Half)));
-  rpu_launch_ddr_broadcast_spm_dma_immediate(
-      const_cast<c10::Half*>(weight.data_ptr<c10::Half>()),
-      channels, weight_spm, 1);
-  rpu_launch_ddr_broadcast_spm_dma_immediate(
-      const_cast<c10::Half*>(bias.data_ptr<c10::Half>()),
-      channels, bias_spm, 1);
   auto* source = const_cast<c10::Half*>(rows.data_ptr<c10::Half>());
   auto* destination = output.data_ptr<c10::Half>();
-  for (int64_t row = 0; row < rows.size(0); row += max_rows) {
-    const int64_t count = std::min(rows.size(0) - row, max_rows);
-    rpu_launch_ddr_broadcast_spm_dma_immediate(
-        source + row * channels, count * channels, input_spm, 1);
-    rpu_launch_layernorm_spm_kernel(
-        input_spm, output_spm, weight_spm, bias_spm,
-        count, channels, eps, false, 0, 1);
-    rpu_launch_spm_copy_ddr_dma_immediate(
-        output_spm, destination + row * channels, count * channels);
+  // Bound command storage while preserving the certified 16-row math tiles.
+  const int64_t batch_rows = 16 * max_rows;
+  for (int64_t start = 0; start < rows.size(0); start += batch_rows) {
+    const int64_t end = std::min(rows.size(0), start + batch_rows);
+    tts_codec_submit_tile(rows, output, [&] {
+      if (start == 0) {
+        rpu_launch_ddr_broadcast_spm_dma(
+            const_cast<c10::Half*>(weight.data_ptr<c10::Half>()), channels, weight_spm, 1);
+        rpu_launch_ddr_broadcast_spm_dma(
+            const_cast<c10::Half*>(bias.data_ptr<c10::Half>()), channels, bias_spm, 1);
+      }
+      for (int64_t row = start; row < end; row += max_rows) {
+        const int64_t count = std::min(end - row, max_rows);
+        rpu_launch_ddr_broadcast_spm_dma(
+            source + row * channels, count * channels, input_spm, 1);
+        rpu_launch_layernorm_spm_kernel(
+            input_spm, output_spm, weight_spm, bias_spm,
+            count, channels, eps, false, 0, 1);
+        rpu_launch_spm_copy_ddr_dma(
+            output_spm, destination + row * channels, count * channels);
+      }
+    });
   }
   return output;
 }

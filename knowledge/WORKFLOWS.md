@@ -190,6 +190,8 @@ Start with the [Qwen3 speech guide](../docs/qwen3_audio.md) and retain these con
   Preserve im2col padding, dilation and its 4 MiB capacity plan. Finish/abort and retire
   the Graph before releasing its SPM scope; never persist these temporary
   addresses across requests. Compare fixed inputs, tail tiles and retained outputs.
+  ConvNeXt LayerNorm batches at most sixteen original 16-row tiles, reusing its
+  scratch only in stream order; refresh affine parameters on each invocation.
 - Reset logical KV position per sequence. Talker keeps EOS and repetition penalties;
   Predictor uses a fixed 15-step sampling loop and resets KV per frame. Both use
   top-k 50, temperature 0.9 and top-p 1.0. Require EOS before waveform decoding;

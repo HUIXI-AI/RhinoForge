@@ -75,7 +75,7 @@ def install_codec_transformer(owner, core):
         groups.append([transform_linear_weight(_folded_weight(layer.get_submodule(path),
             layer.get_submodule(scale_path).scale if scale_path else None), partition, 8).to("rpu")
             for layer in core.layers])
-    cos, sin = core.rotary_emb(torch.zeros(1, 1, 512, dtype=torch.float16), torch.arange(64).view(1, -1))
+    cos, sin = core.rotary_emb(torch.zeros(1, 1, 512, dtype=torch.float16), torch.arange(256).view(1, -1))
     cos, sin = (value[0, :, :32].contiguous().to("rpu") for value in (cos, sin))
     norm = core.norm.weight.detach().half().to("rpu")
     part["storage"] = (groups, cos, sin, norm)
@@ -84,10 +84,10 @@ def install_codec_transformer(owner, core):
     set_codec_mode(handle)
     torch.ops.rpu.causal_decoder_set_linear_acc32(handle, True)
     # This codec's own bounded profile; it is not a Qwen3/Llama registry alias.
-    torch.ops.rpu.causal_decoder_set_chunk_envelope(handle, 64, 64)
+    torch.ops.rpu.causal_decoder_set_chunk_envelope(handle, 256, 256)
     core._rpu_decoder_handle = handle
     core._rpu_decoder_graph_cache = graph
-    part["cache"] = RPUCache(8, 1, 64, 16, 64)
+    part["cache"] = RPUCache(8, 1, 256, 16, 64)
     part["io_weights"] = [transform_linear_weight(module.weight.detach().half(), 1, 8).to("rpu")
                           for module in (core.input_proj, core.output_proj)]
     part["io_bias"] = [module.bias.detach().half().to("rpu") for module in (core.input_proj, core.output_proj)]
@@ -102,20 +102,26 @@ def install_codec_transformer(owner, core):
     return True
 
 
+def _sliding_mask(length):
+    from rpu_backend.runtime.masks import versioned_cpu_mask
+
+    positions = torch.arange(length)
+    visible = ((positions[None, :] <= positions[:, None]) &
+               (positions[None, :] > positions[:, None] - 72))
+    return versioned_cpu_mask(torch.zeros(length, length, dtype=torch.float16)
+                              .masked_fill(~visible, float("-inf")))
+
+
 def _forward(part, hidden):
     from transformers.modeling_outputs import BaseModelOutputWithPast
     from rpu_backend.graph import GraphSignature
-    from rpu_backend.runtime.decoder import _text_prefill_execution_plan
+    from rpu_backend.runtime.decoder import _text_prefill_execution_plan, plan_bounded_prefill_execution
 
     if (hidden is None or hidden.ndim != 3 or hidden.shape[0] != 1 or hidden.shape[2] != 1024
             or not 1 <= hidden.shape[1] <= 255 or hidden.dtype != torch.float32
             or hidden.device.type != "cpu" or not torch.isfinite(hidden).all()):
         raise ValueError("TTS codec frontend requires finite CPU FP32 [1, 1–255, 1024]")
     count = hidden.shape[1]
-    if count > 63:
-        # The original FP32 path preserves the codec's 72-frame sliding attention.
-        part["last_device"] = "cpu"
-        return part["cpu_forward"](inputs_embeds=hidden)
     part["last_device"] = "rpu"
     cache, graph, handle = part["cache"], part["graph"], part["handle"]
     cache.reset_to_position(0)
@@ -123,15 +129,29 @@ def _forward(part, hidden):
         execution_len = 1
         descriptor = list(torch.ops.rpu.causal_decoder_resolve_decode_stage_descriptor(handle))
         key = descriptor
-    else:
+    elif count <= 64:
         execution_len, _, plan = _text_prefill_execution_plan(part["planner"], handle, cache, count)
         descriptor = plan.selected.stage_tuple.physical_descriptor
         key = plan.graph_key_words()
+    else:
+        plans = []
+        execution_len, _ = plan_bounded_prefill_execution(
+            count, 256, 15, position=0,
+            execution_owner=part["planner"], execution_native=("causal_decoder", handle),
+            resolve_stage_domain=lambda n: torch.ops.rpu.causal_decoder_resolve_prefill_stage_domain(
+                handle, n, 0, False, n, 0, 1, count),
+            plan_signature=(72, count), graph_cache=graph,
+            queue_owner_id=handle, plan_result_sink=plans.append)
+        plan = plans[0]
+        descriptor = plan.selected.stage_tuple.physical_descriptor
+        key = plan.graph_key_words()
     signature = GraphSignature(op_id="qwen3_tts_codec_frontend", shapes=[1, count, execution_len, 512],
-                               dyn_dims=[handle, *key], dtypes=[torch.float16])
+                               dyn_dims=[handle, 72, int(count > 64), *key], dtypes=[torch.float16])
     if part.get("signature") != signature:
         if "signature" in part:
             graph.evict(part["signature"])
+            del part["signature"]
+        part["mask"] = _sliding_mask(execution_len) if count > 64 else None
     values = hidden.half()
     if execution_len > count:
         values = torch.nn.functional.pad(values, (0, 0, 0, execution_len - count))
@@ -139,7 +159,8 @@ def _forward(part, hidden):
         part["io_weights"][0], part["io_bias"][0], 1, 8, True).view(1, execution_len, 512)
     with graph.capture(signature):
         raw = torch.ops.rpu.causal_decoder_forward(handle, projected, cache.k_caches, cache.v_caches,
-                                                  None, 0, True, planned_stage_descriptor=descriptor)
+                                                  part["mask"], 0, count <= 64,
+                                                  planned_stage_descriptor=descriptor)
     part["signature"] = signature
     result = torch.ops.rpu.linear_with_accumulation(raw[:, :count].reshape(count, 512),
         part["io_weights"][1], part["io_bias"][1], 1, 8, True).cpu().float().reshape(1, count, 1024)

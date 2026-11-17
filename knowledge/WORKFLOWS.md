@@ -169,8 +169,14 @@ Start with the [Qwen3 speech guide](../docs/qwen3_audio.md) and retain these con
   its default-off state preserves other decoders' RoPE parameters and layout hash.
   Keep original CPU FP32 codec weights; fold LayerScale into new frontend copies
   before FP16 conversion and preserve FP32 rotary frequencies. Use the device
-  frontend for 1–63 codec frames and the original CPU FP32 sliding attention for
-  64–255 frames. Missing setter selects CPU; report the route and propagate errors.
+  frontend for 1–255 codec frames; above 64, plan MASK_2D single-chunk execution
+  with the original 72-position causal window and a versioned owned CPU mask.
+  Declare RoPE/KV/envelope 256 before first planning. Evict the old Graph and
+  clear its signature before replacing the mask, including failed length switches.
+  Missing setter selects CPU; report the route and propagate errors.
+  New transpose postprocessing uses kernel-major weights and bounded single-core
+  SPM last-axis slices, not DDR transpose. Keep 768/384-channel residual chains
+  in device rows; retain CPU boundaries for padded 192/96-channel chains.
 - Reset logical KV position per sequence. Talker keeps EOS and repetition penalties;
   Predictor uses a fixed 15-step sampling loop and resets KV per frame. Both use
   top-k 50, temperature 0.9 and top-p 1.0. Require EOS before waveform decoding;

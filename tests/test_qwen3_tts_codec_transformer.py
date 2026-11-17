@@ -82,13 +82,79 @@ def test_input_rejection_precedes_native_access(hidden):
         codec._forward({}, hidden)
 
 
-@pytest.mark.parametrize("count", [64, 72, 255])
-def test_long_codec_uses_original_sliding_window_without_native_access(count):
-    hidden = torch.randn(1, count, 1024)
-    result = object()
-    def cpu_forward(*, inputs_embeds):
-        assert inputs_embeds is hidden
-        return result
-    part = {"cpu_forward": cpu_forward}
-    assert codec._forward(part, hidden) is result
-    assert part["last_device"] == "cpu"
+@pytest.mark.parametrize("count", [63, 64])
+def test_device_boundary_uses_the_shared_planner(monkeypatch, count):
+    from rpu_backend.runtime import decoder
+    def plan(planner, handle, cache, length):
+        assert length == count
+        raise RuntimeError("shared planner reached")
+    monkeypatch.setattr(decoder, "_text_prefill_execution_plan", plan)
+    part = dict(cache=SimpleNamespace(reset_to_position=lambda value: None),
+                graph=None, handle=1, planner=None)
+    with pytest.raises(RuntimeError, match="shared planner reached"):
+        codec._forward(part, torch.zeros(1, count, 1024))
+    assert part["last_device"] == "rpu"
+
+
+@pytest.mark.parametrize("count", [65, 73, 255])
+def test_long_codec_plans_explicit_mask_single_chunk(monkeypatch, count):
+    from rpu_backend.runtime import decoder
+    def resolve(*args):
+        assert args == (7, count, 0, False, count, 0, 1, count)
+        raise RuntimeError("masked planner reached")
+    def plan(real, limit, padding, **kwargs):
+        assert (real, limit, padding) == (count, 256, 15)
+        assert kwargs["plan_signature"] == (72, count)
+        kwargs["resolve_stage_domain"](count)
+    monkeypatch.setattr(decoder, "plan_bounded_prefill_execution", plan)
+    monkeypatch.setattr(torch.ops, "rpu", SimpleNamespace(causal_decoder_resolve_prefill_stage_domain=resolve))
+    part = dict(cache=SimpleNamespace(reset_to_position=lambda value: None),
+                graph=None, handle=7, planner=None)
+    with pytest.raises(RuntimeError, match="masked planner reached"):
+        codec._forward(part, torch.zeros(1, count, 1024))
+
+
+@pytest.mark.parametrize("length", [65, 73, 80, 255, 256])
+def test_sliding_mask_keeps_exactly_72_causal_positions(length):
+    with torch.inference_mode():
+        mask = codec._sliding_mask(length)
+    assert mask.device.type == "cpu" and mask.dtype == torch.float16
+    assert mask.is_contiguous() and mask._version >= 0
+    for q in range(length):
+        for k in range(length):
+            assert float(mask[q, k]) == (0 if max(0, q - 71) <= k <= q else float("-inf"))
+    assert torch.equal((mask == 0).sum(1), torch.arange(1, length + 1).clamp_max(72))
+
+
+def test_failed_length_switch_does_not_reuse_previous_signature(monkeypatch):
+    from rpu_backend import graph
+    from rpu_backend.runtime import decoder
+
+    plan = SimpleNamespace(selected=SimpleNamespace(stage_tuple=SimpleNamespace(
+        physical_descriptor=[1])), graph_key_words=lambda: [1])
+    def bounded(count, *args, **kwargs):
+        kwargs["plan_result_sink"](plan)
+        return count, count
+    monkeypatch.setattr(decoder, "plan_bounded_prefill_execution", bounded)
+    monkeypatch.setattr(decoder, "_text_prefill_execution_plan",
+                        lambda planner, handle, cache, count: (count, count, plan))
+    original_to = torch.Tensor.to
+    def fail_upload(self, *args, **kwargs):
+        if args and args[0] == "rpu":
+            raise RuntimeError("upload failed")
+        return original_to(self, *args, **kwargs)
+    monkeypatch.setattr(torch.Tensor, "to", fail_upload)
+    monkeypatch.setattr(torch.ops, "rpu", SimpleNamespace(linear_with_accumulation=lambda *args: None))
+    evicted = []
+    monkeypatch.setattr(graph, "GraphSignature", lambda **kwargs: SimpleNamespace(**kwargs))
+    signature = graph.GraphSignature(op_id="qwen3_tts_codec_frontend", shapes=[1, 65, 65, 512],
+                               dyn_dims=[7, 72, 1, 1], dtypes=[torch.float16])
+    part = dict(cache=SimpleNamespace(reset_to_position=lambda value: None),
+                graph=SimpleNamespace(evict=evicted.append), handle=7, planner=None,
+                signature=signature, mask=codec._sliding_mask(65))
+    for count in (64, 65):
+        with pytest.raises(RuntimeError, match="upload failed"):
+            codec._forward(part, torch.zeros(1, count, 1024))
+        assert "signature" not in part
+        assert (part["mask"] is None) if count == 64 else part["mask"].shape == (65, 65)
+    assert evicted == [signature]

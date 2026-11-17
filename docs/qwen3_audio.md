@@ -174,7 +174,7 @@ ASR also accepts a one-dimensional CPU floating-point Tensor. See
 | Model | CPU | Rhino RPU |
 |---|---|---|
 | ASR | Audio reading, mel features/chunking, convolutions and their activations, single-token embedding, finite checks, argmax, text decoding | conv_out, positions and valid rows, audio encoder and output projections, prefill text/audio composition, text decoder and vocabulary head |
-| TTS | Embedding, reference processing, speaker encoder, generation control, codebook, ConvNeXt normalization/GELU, transposed-convolution overlap/layout, remaining 17 SnakeBeta layers, waveform output | All 31 decoding Conv1d layers, four ConvNeXt Linear layers, six transposed-convolution projections and 12 intermediate SnakeBeta layers with the matching native extension; Talker, Predictor and output heads; codec input/output projections and Transformer frontend when supported by native interfaces |
+| TTS (matching native extension) | Embedding, reference processing, speaker encoder, generation control/sampling, codebook, boundary layout/cropping and waveform output | Talker/Predictor and heads; codec frontend, 31 Conv1d, six transposed convolutions including overlap/bias, all SnakeBeta and residual arithmetic, two ConvNeXt blocks |
 
 ASR convolutions use channels-last storage and FP16-rounded weights in CPU FP32
 computation, then round outputs to FP16. The device audio Graph uses FP32 Linear
@@ -182,8 +182,9 @@ accumulation. TTS CPU components stay FP32; device components use FP16 with FP32
 Linear accumulation, except Talker/Predictor output heads, which retain FP16
 accumulation. Codec LayerScale is folded into projections in FP32 before
 conversion to FP16, while RoPE retains FP32 frequencies. The device codec frontend
-accepts 1–63 frames. Sequences of 64–255 frames use the original CPU FP32 frontend
-and its 72-frame sliding attention.
+accepts 1–255 frames. Above 64 frames it uses an explicit 72-frame causal sliding
+mask with a planner-selected single chunk. RoPE/KV capacity is 256; only the
+current length's Graph and owned mask are retained.
 
 - ASR requires a rebuilt native extension exposing `siglip_set_audio_mode`,
   `siglip_set_audio_projection` and `assemble_inputs_embeds`; loading fails if
@@ -264,7 +265,7 @@ from independent copies; original CPU FP32 weights remain intact. Standalone
 convolution outputs are padded to 128 alignment and sliced back before applying
 the original FP32 bias.
 
-CPU still performs padding, im2col, remaining bias/residual arithmetic, codebook,
+Without the newer native operations described below, CPU performs padding, im2col, remaining bias/residual arithmetic, codebook,
 17 SnakeBeta layers, ConvNeXt normalization/GELU and upsampling layout
 operations. Older native extensions also keep all six transposed convolutions on CPU.
 With native `tts_codec_conv1d`, CPU im2col writes rounded FP16 values directly into
@@ -317,11 +318,21 @@ keep their previous CPU boundaries. The host-visible input and independently
 owned output remain CPU FP32. No retained Graph or runtime-package change is
 introduced. With `tts_codec_conv1d_spm_bias`, standalone Conv1d also retains a
 padded FP16 bias on device and passes it to the existing Linear projection;
-legacy CPU FP32 bias remains supported by the native wrapper. Transposed-
-convolution postprocessing remains on CPU.
+legacy CPU FP32 bias remains supported by the native wrapper.
 
-The frontend's existing 63-frame device bound and CPU sliding-attention fallback
-remain unchanged.
+With `tts_codec_transpose_overlap`, installation orders the six transposed-convolution
+weights by kernel position. RPU performs last-axis slicing, overlap addition and
+bias in FP16, using independent single-core SPM buffers and capacity-bounded tiles;
+it does not use the older DDR transpose route. CPU still converts NCT boundaries
+and crops the final output. This changes rounding relative to CPU FP32 postprocessing.
+With `tts_codec_residual_unit_rows`, the three residual units in each 768/384-channel
+stage keep their activations on device, removing the two internal CPU round trips.
+The 192/96-channel stages keep their previous CPU boundaries. These paths require
+a rebuilt RhinoForge extension, not a changed runtime package.
+The matching extension also uses `tts_codec_conv1d_spm`, `tts_codec_snake` and
+`tts_codec_convnext_block` for convolution preparation, standalone SnakeBeta,
+and ConvNeXt normalization/GELU/residual arithmetic. CPU still orchestrates eager
+launches and converts boundaries; this is not an end-to-end device-resident decoder.
 
 FP16 rounding changes the waveform. Compare identical codec tokens against the
 CPU FP32 anchor and inspect speech content; runtime checks alone do not certify

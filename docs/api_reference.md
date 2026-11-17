@@ -629,9 +629,10 @@ if the process has an incompatible frozen allocator or arena plan.
 ASR requires `siglip_set_audio_mode`, `siglip_set_audio_projection` and
 `assemble_inputs_embeds` in the rebuilt native extension. TTS codec uses the
 explicit `causal_decoder_set_tts_codec_mode`; without it, the frontend stays on
-CPU. With the setter, 1–63 codec frames use the device; 64–255 frames use the
-original CPU FP32 frontend and its 72-frame sliding attention. Other execution
-errors propagate.
+CPU. With the setter, 1–255 codec frames use the device; above 64 frames an explicit
+72-frame causal sliding mask preserves the original attention window. Execution
+uses a planner-selected single chunk and retains only the current Graph/mask.
+Other execution errors propagate.
 
 `execution_stats()` exposes call and cache state:
 

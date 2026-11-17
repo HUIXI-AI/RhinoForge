@@ -15,6 +15,7 @@ def test_complete_residual_keeps_legacy_affine_contract(tmp_path):
     function = "static Tensor tts_codec_residual_unit_impl(" + source.split(
         "static Tensor tts_codec_residual_unit_impl(", 1)[1].split(
         "Tensor rpu_tts_codec_snake(", 1)[0]
+    function = function.replace("at::kPrivateUse1", "at::kCPU")
     harness = r'''
 #include <ATen/ATen.h>
 #include <cassert>
@@ -38,6 +39,26 @@ Tensor rpu_linear_with_accumulation(const Tensor&x,const Tensor&w,const c10::opt
     cases = r'''
 int main(){
  at::manual_seed(73);
+ for(int c:{384,768}){
+  auto input=at::randn({1,c,3})/10;
+  auto rows=input.squeeze(0).t().to(at::kHalf).contiguous(),saved=rows.clone();
+  auto w1=(at::randn({c,c*7})/64).to(at::kHalf);
+  auto w2=(at::randn({c,c})/16).to(at::kHalf);
+  auto affine=(at::randn({6,c})/10).to(at::kHalf);
+  Tensor expected=input;
+  for(int dilation:{1,3,9}){
+   expected=rpu_tts_codec_residual_unit_complete(expected,w1,affine,w2,dilation,c);
+   rows=rpu_tts_codec_residual_unit_rows(rows,w1,affine,w2,dilation,c);
+  }
+  assert(at::equal(rows.t().unsqueeze(0).to(at::kFloat),expected));
+  assert(at::equal(saved,input.squeeze(0).t().to(at::kHalf)));
+  auto retained=rows.clone();
+  rpu_tts_codec_residual_unit_rows(rows,w1,affine,w2,1,c);
+  assert(at::equal(rows,retained));
+  bool rejected=false;
+  try{rpu_tts_codec_residual_unit_rows(input,w1,affine,w2,1,c);}catch(const c10::Error&){rejected=true;}
+  assert(rejected);
+ }
  for(int c:{96,192}){
   int n=CeilDiv(c,128)*128;
   auto x=at::randn({1,c,3});auto saved=x.clone();

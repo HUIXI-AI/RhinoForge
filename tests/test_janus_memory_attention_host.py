@@ -29,6 +29,53 @@ def load(name):
 
 
 class JanusTests(unittest.TestCase):
+    def test_device_attention_handles_zero_mass_history_blocks(self):
+        attention = load("attention")
+        q = torch.ones(1, 2, 19, 64)
+        k = torch.ones(1, 2, 1100, 64)
+        k[:, :, 1024:] = -100
+        v = torch.randn_like(k)
+        with patch.object(attention, "RPUProjection", side_effect=lambda layer: layer):
+            actual = attention.rpu_online_attention(q, k, v)
+        expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        self.assertTrue(actual.isfinite().all())
+        torch.testing.assert_close(actual, expected, atol=0.001, rtol=0.01)
+
+    def test_vision_attention_preserves_window_isolation(self):
+        module = load("vision")
+        original = torch.nn.Module()
+        original.num_heads = 16
+        original.qkv = torch.nn.Linear(1280, 3840).half()
+        original.proj = torch.nn.Linear(1280, 1280).half()
+        with patch.object(module, "RPUProjection", side_effect=lambda layer: layer):
+            attention = module.RPUVisionAttention(original)
+        x = torch.randn(7, 1280).half()
+        boundaries = torch.tensor([0, 3, 7])
+        positions = (torch.ones(7, 80), torch.zeros(7, 80))
+        with patch.object(module, "rpu_online_attention", side_effect=lambda q, k, v:
+                          torch.nn.functional.scaled_dot_product_attention(q.float(), k.float(), v.float())):
+            actual = attention(x, boundaries, position_embeddings=positions)
+            changed = x.clone()
+            changed[3:] *= 10
+            other = attention(changed, boundaries, position_embeddings=positions)
+            torch.testing.assert_close(actual[:3], other[:3], atol=0, rtol=0)
+            self.assertFalse(torch.equal(actual[3:], other[3:]))
+            with self.assertRaises(ValueError):
+                attention(x, torch.tensor([0, 8]), position_embeddings=positions)
+
+    def test_patch_convolutions_keep_original_layout(self):
+        module = load("vision")
+        with patch.object(module, "RPUProjection", side_effect=lambda layer: layer):
+            conv = torch.nn.Conv2d(3, 16, 14, stride=14)
+            projector = module.RPUPatchConv(conv)
+            image = torch.randn(1, 3, 28, 42)
+            torch.testing.assert_close(projector(image), conv(image))
+            original = torch.nn.Module()
+            original.proj = torch.nn.Conv3d(3, 16, (2, 14, 14), stride=(2, 14, 14), bias=False)
+            projector = module.RPUVisionPatch(original)
+            pixels = torch.randn(6, 1176)
+            torch.testing.assert_close(projector(pixels), original.proj(pixels.reshape(6, 3, 2, 14, 14)).reshape(6, 16))
+
     def test_streamed_tensor_integrity_and_truncation(self):
         module = load("checkpoint")
         payload = torch.arange(4).half().numpy().tobytes()

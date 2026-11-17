@@ -93,20 +93,20 @@ def memory_plan(weight_bytes, largest_tensor_bytes, *, text_capacity=4096,
         "cpu_online_attention_scratch": 32 * 1024**2,
         "frontend_activation_reserve": 2 * 1024**3,
         "bounded_graph_and_device_workspace_reserve": 512 * 1024**2,
+        "rpu_weight_padding_reserve": 64 * 1024**2,
         "runtime_os_reserve": 4 * 1024**3,
     }
     return {
         "allocations_bytes": allocations,
         "conservative_host_peak_bytes": sum(allocations.values()),
         "estimated_device_allocation_bytes": (
-            28 * 2 * (2 * 3584**2 + 2 * 512 * 3584 + 3 * 3584 * 18944
-                      + 3584 + 512 + 512 + 2 * 3584) + 3584 * 2
-            + 48 * 2 * (1024 * 3072 + 3072 + 1024**2 + 1024)
-            + allocations["text_kv"] + allocations["bounded_graph_and_device_workspace_reserve"]),
+            weights
+            + allocations["text_kv"] + allocations["bounded_graph_and_device_workspace_reserve"]
+            + allocations["rpu_weight_padding_reserve"]),
         "spatial_tokens_at_step_57": 57 * 1615,
         "query_chunk": 128, "key_chunk": 1024,
-        "attention_location": "CPU FP32 online softmax; projections RPU FP16",
-        "spm_scope": "projection tiles only; no full-frame norm or history in SPM",
+        "attention_location": "RPU FP16 tiled QK/PV/projections; CPU FP32 online softmax",
+        "spm_scope": "bounded shared-arena Linear tiles; no full-frame norm or history in SPM",
         "status": "planning estimate; native decoder/frontend residency needs measurement",
     }
 

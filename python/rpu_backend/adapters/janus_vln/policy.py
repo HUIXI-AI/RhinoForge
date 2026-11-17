@@ -12,7 +12,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .attention import adapt_attention
+from .attention import adapt_attention, RPUProjection
+from .vision import RPUPatchConv, RPUVisionPatch, RPUVisionAttention, install_rpu_linears
 from .memory import checkpoint_bytes, admit_memory
 
 
@@ -56,10 +57,23 @@ def load_frontend(model_class, config, checkpoint):
             if buffer.device.type == "meta":
                 raise ValueError(f"unmaterialized frontend buffer: {prefix}.{name}")
         module.half().eval()
+        if prefix == "visual":
+            module.patch_embed = RPUVisionPatch(module.patch_embed)
+            for block in module.blocks:
+                block.attn = RPUVisionAttention(block.attn)
+            install_rpu_linears(module)
+        elif prefix == "vggt.aggregator":
+            module.patch_embed.patch_embed.proj = RPUPatchConv(module.patch_embed.patch_embed.proj)
+            for blocks in (module.patch_embed.blocks, module.frame_blocks, module.global_blocks):
+                for block in blocks:
+                    block.attn = adapt_attention(block.attn)
+            install_rpu_linears(module)
+        elif prefix == "merger":
+            install_rpu_linears(module)
+        elif prefix == "lm_head":
+            model.lm_head = RPUProjection(module)
+        print(f"Janus frontend ready {prefix}", flush=True)
     model.eval()
-    for blocks in (model.vggt.aggregator.frame_blocks, model.vggt.aggregator.global_blocks):
-        for block in blocks:
-            block.attn = adapt_attention(block.attn)
     return model
 
 

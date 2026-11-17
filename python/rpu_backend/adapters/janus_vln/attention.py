@@ -1,12 +1,13 @@
 """Bounded host attention for the controlled Janus R1 hybrid port.
 
-RPU owns FP16 projections. CPU owns normalization, RoPE and FP32 softmax.
+RPU owns FP16 projections and tiled attention matrix products. CPU owns normalization, RoPE and online softmax.
 This explicit route does not claim a native RPU SDPA kernel.
 """
 import copy
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 @torch.inference_mode()
@@ -40,6 +41,46 @@ def online_attention(q, k, v, *, query_chunk=128, key_chunk=1024):
     return output
 
 
+@torch.inference_mode()
+def rpu_online_attention(q, k, v):
+    """Device QK/PV through shared-arena Linear; online softmax stays on CPU."""
+    if (q.ndim != 4 or k.ndim != 4 or v.shape != k.shape
+            or q.shape[:2] != k.shape[:2] or q.shape[-1] != k.shape[-1]
+            or q.shape[-1] not in (64, 80) or not k.shape[-2]
+            or any(t.device.type != "cpu" for t in (q, k, v))):
+        raise ValueError("RPU attention requires CPU [B,H,S,64/80] tensors")
+    shape = q.shape
+    q, k, v = (t.flatten(0, 1) for t in (q, k, v))
+    output = torch.empty_like(q, dtype=torch.float32)
+    scale = shape[-1] ** -0.5
+    def projection(weight):
+        linear = nn.Linear(weight.shape[1], weight.shape[0], bias=False, device="meta")
+        linear.weight = nn.Parameter(weight.detach(), requires_grad=False)
+        return RPUProjection(linear)
+    # Eager BMM owns a separate SPM allocator and cannot coexist with fused decoders.
+    for head in range(q.shape[0]):
+        query = q[head].float() * scale
+        maximum = torch.full((query.shape[0], 1), -torch.inf)
+        denominator = torch.zeros_like(maximum)
+        accumulator = torch.zeros_like(query)
+        for offset in range(0, k.shape[1], 1024):
+            qk = projection(k[head, offset:offset + 1024])
+            pv = projection(v[head, offset:offset + 1024].transpose(0, 1))
+            for start in range(0, query.shape[0], 128):
+                rows = slice(start, start + 128)
+                scores = qk(query[rows]).float()
+                new_maximum = torch.maximum(maximum[rows], scores.amax(-1, keepdim=True))
+                correction = (maximum[rows] - new_maximum).exp()
+                scores.sub_(new_maximum).exp_()
+                block_sum = scores.sum(-1, keepdim=True)
+                product = pv(scores / block_sum.clamp_min(torch.finfo(torch.float32).tiny)).float()
+                accumulator[rows].mul_(correction).add_(product * block_sum)
+                denominator[rows].mul_(correction).add_(block_sum)
+                maximum[rows] = new_maximum
+        output[head] = accumulator / denominator
+    return output.reshape(shape)
+
+
 class HostAttention(nn.Module):
     """VGGT attention contract; raw host K/V remains owned by the caller."""
 
@@ -48,6 +89,7 @@ class HostAttention(nn.Module):
         if (original.num_heads != 16 or original.head_dim != 64
                 or original.qkv.in_features != 1024 or original.training):
             raise ValueError("expected evaluation-mode VGGT H1024/16-head attention")
+        self.attention_fn = online_attention
         self.qkv = original.qkv
         self.proj = original.proj
         self.q_norm = copy.deepcopy(original.q_norm).cpu().float()
@@ -91,7 +133,7 @@ class HostAttention(nn.Module):
             output[..., start:start + tokens, :] = key
         if self.rope is not None:
             q = self.rope(q, pos)
-        result = online_attention(q, output, v).transpose(1, 2).reshape(batch, tokens, channels)
+        result = self.attention_fn(q, output, v).transpose(1, 2).reshape(batch, tokens, channels)
         result = self.proj(result.half())
         if use_cache and new_kv[0].shape[2] > 56:
             # Crop after attending to frame 57, one layer at a time.
@@ -107,21 +149,33 @@ class RPUProjection(nn.Module):
         from rpu_backend.runtime.weights import swizzle_model_inplace
         if linear.weight.device.type != "cpu" or hasattr(linear, "_rpu_linear_partition"):
             raise ValueError("projection requires fresh CPU row-major weights")
-        self.linear = copy.deepcopy(linear).half()
+        self.in_features, self.out_features = linear.in_features, linear.out_features
+        padded_in = (self.in_features + 15) // 16 * 16
+        padded_out = (self.out_features + 127) // 128 * 128
+        self.linear = nn.Linear(padded_in, padded_out, bias=linear.bias is not None,
+                                device="meta", dtype=torch.float16)
+        self.linear.weight = nn.Parameter(F.pad(linear.weight.detach().half(),
+            (0, padded_in - self.in_features, 0, padded_out - self.out_features)), requires_grad=False)
+        if linear.bias is not None:
+            self.linear.bias = nn.Parameter(F.pad(linear.bias.detach().half(),
+                (0, padded_out - self.out_features)), requires_grad=False)
         swizzle_model_inplace(self)
         self.linear.to("rpu")
 
     @torch.inference_mode()
     def forward(self, x):
-        flat = x.reshape(-1, x.shape[-1]).half()
-        output = torch.empty((flat.shape[0], self.linear.out_features), dtype=torch.float16)
+        if x.device.type != "cpu" or x.shape[-1] != self.in_features:
+            raise ValueError("projection requires CPU input with the original feature width")
+        flat = F.pad(x.reshape(-1, x.shape[-1]).half(), (0, self.linear.in_features - self.in_features))
+        output = torch.empty((flat.shape[0], self.out_features), dtype=torch.float16)
         for start in range(0, flat.shape[0], 64):
-            output[start:start + 64] = self.linear(flat[start:start + 64].to("rpu")).cpu()
-        return output.reshape(*x.shape[:-1], self.linear.out_features)
+            output[start:start + 64] = self.linear(flat[start:start + 64].to("rpu")).cpu()[:, :self.out_features]
+        return output.reshape(*x.shape[:-1], self.out_features)
 
 
 def adapt_attention(original):
     adapted = HostAttention(original)
+    adapted.attention_fn = rpu_online_attention
     adapted.qkv = RPUProjection(original.qkv)
     adapted.proj = RPUProjection(original.proj)
     return adapted.eval()

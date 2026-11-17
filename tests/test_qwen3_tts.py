@@ -100,6 +100,95 @@ def test_predictor_uses_checkpoint_sampling_and_rejects_other_recipes():
                 max_new_tokens=15, do_sample=True, **recipe)
 
 
+@pytest.mark.parametrize("fail", [False, True])
+@pytest.mark.parametrize("group", ["none", "new", "cached"])
+def test_native_predictor_updates_progress_and_propagates_failure(monkeypatch, fail, group):
+    import sys
+    from rpu_backend.graph import _runtime
+
+    class Cache:
+        position = 16
+        k_caches = v_caches = []
+        def reset_to_position(self, pos):
+            self.position = pos
+        def update_position(self, count):
+            self.position += count
+    cache = Cache()
+    cleared = []
+    graph = SimpleNamespace(state=lambda: 2, replayable=lambda: True)
+    graph_cache = SimpleNamespace(lookup=lambda sig: graph, _impl=object(),
+        _validate_ready_graph=lambda *args: None,
+        _execution_plans=SimpleNamespace(clear=lambda: cleared.append(True)))
+    part = dict(handle=1, fused_heads=True, native_prefill=(16, [7]), cache=cache,
+                prefill_signature=SimpleNamespace(_impl="prefill"),
+                signature=SimpleNamespace(_impl="decode"), descriptor=[8], graph=graph_cache,
+                calls=15, tokens=16, fused_head_calls=15, head_hidden=object())
+    embedding = torch.nn.Embedding(2048, 1024)
+    owner = SimpleNamespace(small_to_mtp_projection=torch.nn.Identity(),
+        model=SimpleNamespace(get_input_embeddings=lambda: [embedding] * 14))
+    heads = [1] * 16
+    graph_references = sys.getrefcount(graph)
+    def native(handle, hidden, weights, keys, values, graph_impl, prefill, decode, pd, dd, length, progress):
+        assert sys.getrefcount(graph) == graph_references
+        assert cache.position == 0 and "head_hidden" not in part
+        assert handle == 1 and prefill == "prefill" and decode == "decode"
+        assert pd == [7] and dd == [8] and length == 16
+        assert all(w is embedding.weight for w in weights)
+        progress.copy_(torch.tensor([2, 3, 2, 1] if fail else [15, 16, 15, 15]))
+        if fail:
+            raise RuntimeError("native failed")
+        return torch.zeros(1, 15, dtype=torch.int64)
+    class Group:
+        def __init__(self, path):
+            assert path == "test-assets"
+        generate = staticmethod(native)
+    if group != "none":
+        monkeypatch.setenv("RPU_TTS_SAMPLING_EXPERIMENT", "test-assets")
+        monkeypatch.setenv("RPU_TTS_PREDICTOR_GROUP", "1")
+        part["experimental_embeddings"] = [embedding.weight] * 14
+        part["experimental_group_enabled"] = True
+        if group == "cached":
+            part["experimental_group"] = Group("test-assets")
+            part["experimental_group_asset"] = "test-assets"
+            graph_cache.lookup = lambda sig: pytest.fail("retired step Graph lookup")
+    monkeypatch.setattr(_runtime, "_cpp_ext", SimpleNamespace(
+        tts_predictor_generate=native, TtsPredictorGroup=Group))
+    if fail:
+        with pytest.raises(RuntimeError, match="native failed"):
+            tts._predictor_native(owner, torch.zeros(1, 2, 1024), part, heads)
+        assert cache.position == 0 and cleared == [True]
+        assert (part["calls"], part["tokens"], part["fused_head_calls"]) == (17, 19, 17)
+        assert heads == [1, 2] + [1] * 14
+    else:
+        assert tts._predictor_native(owner, torch.zeros(1, 2, 1024), part, heads).shape == (1, 15)
+        assert cache.position == 16 and not cleared
+        assert (part["calls"], part["tokens"], part["fused_head_calls"]) == (30, 32, 30)
+        assert heads == [1] + [2] * 15
+        if group != "none":
+            monkeypatch.setenv("RPU_TTS_PREDICTOR_GROUP", "0")
+            with pytest.raises(RuntimeError, match="configuration changed; reload"):
+                tts._predictor_native(owner, torch.zeros(1, 2, 1024), part, heads)
+            assert cache.position == 16
+
+
+@pytest.mark.parametrize("reason", ["old_native", "cold", "projection", "graph_miss"])
+def test_native_predictor_keeps_python_fallback(monkeypatch, reason):
+    from rpu_backend.graph import _runtime
+
+    part = dict(fused_heads=True, native_prefill=(16, []), prefill_signature=None,
+                signature=None, graph=SimpleNamespace(lookup=lambda sig: None))
+    owner = SimpleNamespace(small_to_mtp_projection=torch.nn.Identity())
+    extension = SimpleNamespace(tts_predictor_generate=lambda *args: pytest.fail("native called"))
+    if reason == "old_native":
+        extension = None
+    elif reason == "cold":
+        part.pop("native_prefill")
+    elif reason == "projection":
+        owner.small_to_mtp_projection = torch.nn.Linear(1, 1)
+    monkeypatch.setattr(_runtime, "_cpp_ext", extension)
+    assert tts._predictor_native(owner, torch.zeros(1, 2, 1024), part, []) is None
+
+
 @pytest.mark.parametrize("text,language,limit", [
     ("", "English", 32), ("  ", "Chinese", 32), ("x" * 1025, "English", 32),
     ("hello", "French", 32), ("hello", "English", 1), ("hello", "English", 257),
@@ -458,6 +547,41 @@ def test_graph_creation_failure_does_not_create_native_handle(monkeypatch):
     with pytest.raises(RuntimeError, match="graph allocation failed"):
         model._install_rpu()
     assert model._components == {}
+
+
+def test_experimental_group_retires_after_graph_before_native_owner(monkeypatch):
+    from rpu_backend.api import causal_lm
+
+    monkeypatch.setattr(causal_lm, "_release_live_instance", lambda model: None)
+    events = []
+    model = Qwen3TTSModel()
+    model._closed = False
+    graph = SimpleNamespace(clear=lambda: events.append("graph"), _impl=object())
+    def retire(cache):
+        assert cache is graph._impl
+        events.append("group")
+    model._components["predictor"] = dict(handle=1, graph=graph,
+        experimental_group=SimpleNamespace(retire=retire),
+        resource=SimpleNamespace(retire=lambda: events.append("native")))
+    model.close()
+    assert events == ["graph", "group", "native"]
+    model.close()
+    assert events == ["graph", "group", "native"]
+
+
+def test_experimental_group_reports_cumulative_hardware_submissions():
+    model = Qwen3TTSModel()
+    model._closed = False
+    entries = [SimpleNamespace(replay_count=10, hw_batch_submit_total=11),
+               SimpleNamespace(replay_count=11, hw_batch_submit_total=12)]
+    graph = SimpleNamespace(size=lambda: 2, snapshot=lambda: entries, cache_invariant_ok=lambda: True)
+    model._components["predictor"] = dict(calls=345, tokens=368, graph=graph, experimental_group=object())
+    try:
+        stats = model.execution_stats()["components"]["predictor"]
+        assert stats["group_hw_submits_total"] == 23
+        assert stats["graph_replays"] == 21
+    finally:
+        model._closed = True
 
 
 @pytest.mark.parametrize("failure", ["graph", "destroy"])

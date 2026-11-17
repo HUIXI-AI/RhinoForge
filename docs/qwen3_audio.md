@@ -351,6 +351,18 @@ The matching extension also uses `tts_codec_conv1d_spm`, `tts_codec_snake` and
 and ConvNeXt normalization/GELU/residual arithmetic. CPU still orchestrates eager
 launches and converts boundaries; this is not an end-to-end device-resident decoder.
 
+Codec SnakeBeta now keeps its five FP16 arithmetic stages in per-core SPM,
+splitting rows across up to eight cores and returning only the final rows to DDR.
+Each capacity-bounded tile uses a one-shot Graph; alpha/scale remain in the same
+temporary SPM scope across tiles and are refreshed on every invocation. The
+planner caps tiles at 512 rows per core and 4 MiB per-core scratch space.
+Transposed-convolution overlap/bias also uses one one-shot Graph per existing
+bounded tile. Im2col likewise batches each tile's fill, input DMA, expansion and
+output DMA, retaining its existing 4 MiB capacity plan and padding/dilation math.
+These paths complete and retire each Graph before reusing scratch
+space; they add no retained Graph, cross-request cache, or runtime dependency.
+Linear projections and other codec operations retain their existing paths.
+
 FP16 rounding changes the waveform. Compare identical codec tokens against the
 CPU FP32 anchor and inspect speech content; runtime checks alone do not certify
 audio quality. The RPU path remains experimental even though it is now the default; it does

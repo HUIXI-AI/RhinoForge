@@ -882,6 +882,36 @@ void RpuKernelGraph::record_dma_node(DmaNodeData data) {
     }
 }
 
+void RpuKernelGraph::snapshot_legacy_dma_bases(
+        const GraphOpStreamStamp& begin, std::deque<uint64_t>& slots) {
+    const auto end = op_stream_stamp();
+    TORCH_CHECK(is_op_stream_stamp_current(begin) && begin.state == end.state &&
+                    begin.position <= end.position,
+                "DMA snapshot requires the current Graph invocation window");
+    size_t count = 0;
+    for (size_t i = begin.position; i < end.position; ++i) {
+        if (nodes_[i].kind != GraphNodeKind::Dma) continue;
+        const auto& data = nodes_[i].as_dma();
+        TORCH_CHECK(data.semantic_endpoint_id == 0 && !data.outer_fast_owner_bound,
+                    "DMA snapshots cannot rebind semantic or typed owner slots");
+        if (data.variant != DmaNodeData::Variant::Fixed) ++count;
+    }
+    if (state_ == State::RECORDING) {
+        TORCH_CHECK(slots.empty(), "DMA snapshot BUILD slots must be empty");
+        slots.resize(count);
+    }
+    TORCH_CHECK(slots.size() == count, "DMA snapshot invocation topology changed");
+    size_t index = 0;
+    for (size_t i = begin.position; i < end.position; ++i) {
+        if (nodes_[i].kind != GraphNodeKind::Dma) continue;
+        auto& data = nodes_[i].as_dma();
+        if (data.variant == DmaNodeData::Variant::Fixed) continue;
+        TORCH_CHECK(data.live_base != nullptr, "DMA snapshot has no live base");
+        slots[index] = *data.live_base;
+        data.live_base = &slots[index++];
+    }
+}
+
 void RpuKernelGraph::record_barrier(uint8_t self_stream, uint8_t target_stream) {
     check_kernel_register_node_emission("Graph-visible Barrier emission");
     TORCH_CHECK(!canonical_dma_callback_active_ ||

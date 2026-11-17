@@ -427,7 +427,10 @@ commit_semantic_spm_producer_yield_after_kernel_enqueue() noexcept {
 // 通过 Program_t 克隆 Kernel_t 独享 reg,REPLAYING 按 cursor 前向扫 Kernel node
 // 校验 kernel_name 一致。
 
-::rhino_lkn::Kernel_t* RpuKernelGraph::get_kernel(const std::string& name) {
+::rhino_lkn::Kernel_t* RpuKernelGraph::get_kernel(
+        const std::string& name, ::rhino_lkn::Program_t* program) {
+    const std::string identity = program
+        ? name + "@" + std::to_string(reinterpret_cast<uintptr_t>(program)) : name;
     check_foreign_graph_execution_allowed(
         "RpuKernelGraph: foreign Graph dynamic kernel lookup");
     TORCH_CHECK(!canonical_dma_poisoned_,
@@ -441,18 +444,20 @@ commit_semantic_spm_producer_yield_after_kernel_enqueue() noexcept {
     validate_semantic_spm_producer_yield_before_kernel_lookup();
     // Exact-name policy admission precedes every Graph/raw lookup mutation.
     admit_kernel_register_lookup(name);
+    TORCH_CHECK(program == nullptr || state_ == State::RECORDING || state_ == State::REPLAYING,
+                "external programs require an active captured Graph");
     switch (state_) {
     case State::PASSTHROUGH:
         return KernelCache::instance().get_kernel(name);
 
     case State::RECORDING: {
-        ::rhino_lkn::Program_t* prog = KernelCache::instance().get_program(name);
+        ::rhino_lkn::Program_t* prog = program ? program : KernelCache::instance().get_program(name);
         TORCH_CHECK(prog != nullptr,
                     "RpuKernelGraph: program not found for kernel name '",
                     name, "'");
 
         pending_kernel_idx_ = kernels_.size();
-        pending_kernel_name_ = name;
+        pending_kernel_name_ = identity;
         pending_kernel_id_.reset();  // dynamic 路径,enum 侧必须空
 
         auto k = std::make_unique<::rhino_lkn::Kernel_t>(*prog, name.c_str());
@@ -478,7 +483,7 @@ commit_semantic_spm_producer_yield_after_kernel_enqueue() noexcept {
                         replay_child_skip_.parent_node_idx,
                         " child_cursor=", replay_child_skip_.child_cursor);
             auto& kn = child.nodes_[scan].as_kernel();
-            TORCH_CHECK(!kn.kernel_name.empty() && name == kn.kernel_name,
+            TORCH_CHECK(!kn.kernel_name.empty() && identity == kn.kernel_name,
                         "RpuKernelGraph: child kernel_name drift in replay at "
                         "child node ", scan, " (parent cursor=",
                         replay_child_skip_.parent_node_idx,
@@ -495,7 +500,7 @@ commit_semantic_spm_producer_yield_after_kernel_enqueue() noexcept {
                     "RpuKernelGraph: no upcoming Kernel node for get_kernel(name='",
                     name, "') at cursor ", cursor_);
         auto& kn = nodes_[scan].as_kernel();
-        TORCH_CHECK(!kn.kernel_name.empty() && name == kn.kernel_name,
+        TORCH_CHECK(!kn.kernel_name.empty() && identity == kn.kernel_name,
                     "RpuKernelGraph: kernel_name drift in replay at node ",
                     scan, " (cursor=", cursor_,
                     ") expected='", kn.kernel_name, "' got='", name, "'");
@@ -533,6 +538,15 @@ commit_semantic_spm_producer_yield_after_kernel_enqueue() noexcept {
     ::rhino_lkn::Kernel_t* k = get_kernel(name);
     TORCH_CHECK(k != nullptr,
                 "RpuKernelGraph: kernel not found for name '", name, "'");
+    bind_semantic_spm_producer_yield_kernel_lookup(*k);
+    bind_pending_kernel_register_lookup(*k);
+    k->reset_regs();
+    return k;
+}
+
+::rhino_lkn::Kernel_t* RpuKernelGraph::get_kernel_reset(
+        const std::string& name, ::rhino_lkn::Program_t& program) {
+    auto* k = get_kernel(name, &program);
     bind_semantic_spm_producer_yield_kernel_lookup(*k);
     bind_pending_kernel_register_lookup(*k);
     k->reset_regs();

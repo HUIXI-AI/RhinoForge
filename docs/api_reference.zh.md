@@ -536,6 +536,25 @@ ASR 需要重编译的 native 提供 `siglip_set_audio_mode`、`siglip_set_audio
   Talker 在 prompt 长度变化时替换 prefill 图并保留
   decode；Predictor 保留双 token 条件 prefill 图和一张 decode 图；codec 在帧数变化时替换自己的图。
 
+匹配 native 时，Predictor 在两张重放图准备完成后，以 C++ 执行固定的 15 步循环。
+embedding 和 FP32 采样仍在 CPU 上执行，沿用原 CPU RNG；减少的是 Python 调度，
+不是设备往返。旧扩展或图未准备好时保留 Python 循环；执行错误直接上抛，不重新采样，
+逻辑调用计数不变。
+
+可选的设备采样实验需要匹配的外部算子资产。logits 中心化以及有限值
+`[-100, 100]` 范围检查在设备执行；异常值先替换为安全值，15 步结束后统一回读
+有效性标记，发现异常则整组报错、不返回结果。此路径尚未消除逐步设备提交，
+其 FP16 采样也不保证与默认 FP32 路径在同种子下输出相同。
+
+使用匹配的实验资产时，在加载模型前设置 `RPU_TTS_PREDICTOR_GROUP=1` 和
+`RPU_TTS_SAMPLING_EXPERIMENT=<资产目录>`，可启用组级 Predictor。decoder、采样和
+embedding 合入两张常驻图（8 步＋7 步），每张图每次执行都检查实际硬件提交增量为 1。
+保留框架的保守批次预算，不扩容；初次单步准备完成后，释放原两张单步图并由组图替代。
+此模式禁用仅适用于单次 forward 的 prefill 快速路径，普通组级重放仍执行物理规划和
+DMA 校验。切换配置或外部清理缓存后须重新加载模型。`execution_stats()` 中 Predictor 的
+`group_hw_submits_total` 是累计硬件提交数，应取请求前后差值。关闭时先清图，再释放组持有的
+Program 和缓冲区。默认执行路径不变。
+
 每个新序列重置逻辑 KV 位置并保留私有存储。TTS 按解码后的音频内容只缓存最新
 speaker embedding，每次请求仍读取和校验参考文件。输出存储独立于重放；释放时
 先清 Graph，再释放 native handle 和权重。Predictor 的最后一行设备 hidden 只借给

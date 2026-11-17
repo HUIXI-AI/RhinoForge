@@ -183,11 +183,40 @@ Start with the [Qwen3 speech guide](../docs/qwen3_audio.md) and retain these con
   The optional `tts_codec_conv_transpose1d_device_post` boundary reuses shared-DDR
   conversion helpers and the existing projection/overlap math. Validate the full
   geometry before upload, and return independently owned CPU FP32 NCT storage.
+  Codec SnakeBeta retains its five rounded stages in per-core temporary SPM;
+  split rows across cores, bound scratch to 4 MiB and tiles to 512 rows/core,
+  and upload alpha/scale once per invocation. Submit each tile as a bounded
+  one-shot Graph, as for overlap/bias postprocessing and im2col fill/DMA/expansion.
+  Preserve im2col padding, dilation and its 4 MiB capacity plan. Finish/abort and retire
+  the Graph before releasing its SPM scope; never persist these temporary
+  addresses across requests. Compare fixed inputs, tail tiles and retained outputs.
 - Reset logical KV position per sequence. Talker keeps EOS and repetition penalties;
   Predictor uses a fixed 15-step sampling loop and resets KV per frame. Both use
   top-k 50, temperature 0.9 and top-p 1.0. Require EOS before waveform decoding;
   each segment allows up to 256 steps. Compare deterministic outputs after
   resetting the same seed when changing sampling.
+- With `tts_predictor_generate`, run the fixed Predictor loop natively only after
+  both exact signatures are BUILT and replayable. Keep embedding, FP32 top-k and
+  default-generator multinomial on CPU, preserving token order and RNG state.
+  Release Python lookup references before execution; native shared ownership ends
+  on return or failure. Abort failed replays, retain partial logical counters and
+  propagate errors without resampling. This reduces Python dispatch, not the
+  fifteen serial device round trips per frame; older extensions use the Python loop.
+- The external-asset device-sampling experiment keeps centering and finite/range
+  validation on-device. Sanitize invalid logits before top-k/softmax/gather, retain
+  every step's validity flags, and reject the group on readback before returning
+  tokens. Verify NaN/Inf and both envelope endpoints on the target operator assets;
+  do not assume device comparison semantics match CPU. This removes per-step
+  logits readback, not the remaining decoder/sampler submissions.
+- The optional TTS Predictor group path records decoder, sampler and embedding
+  directly into 8-step and 7-step Graphs under the existing batch budget. Retire
+  the old two step Graphs first; keep Programs, per-invocation mutable DMA slots
+  and managed initialization/noise buffers alive until group retirement. Disable
+  the single-forward prefill shortcut at installation, and do not use it to skip
+  a group stream. Check the **delta** of `hw_batch_submit_total` around each end;
+  it is cumulative across BUILD/REPLAY. Each group must submit once; per-request
+  totals exclude Talker, Codec and boundary copies. Compare speech/RNG and CPU
+  core-seconds as well as wall time; reduced submissions alone are not acceptance.
 - Predictor checked decode replay retains the ordinary input/output route and
   sampling. Bind its exact five-layer FP16/32-row/1D-RoPE grammar, versioned
   immutable weights and tables, KV owners, Graph lifetime and physical layout

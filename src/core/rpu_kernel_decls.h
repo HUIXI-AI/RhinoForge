@@ -3343,6 +3343,14 @@ void rpu_causal_decoder_set_lm_head(
     int64_t exact_candidates = 0);
 void rpu_causal_decoder_set_tts_predictor_heads(int64_t handle, at::TensorList heads);
 at::Tensor rpu_causal_decoder_tts_predictor_logits(int64_t handle);
+class RpuGraphCache;
+struct GraphSignature;
+at::Tensor rpu_tts_predictor_generate(
+    int64_t handle, const at::Tensor& input, at::TensorList embeddings,
+    at::TensorList keys, at::TensorList values, RpuGraphCache& cache,
+    const GraphSignature& prefill_signature, const GraphSignature& decode_signature,
+    at::IntArrayRef prefill_descriptor, at::IntArrayRef decode_descriptor,
+    int64_t execution_len, const at::Tensor& progress);
 void rpu_causal_decoder_clear_lm_head(int64_t handle);
 void rpu_causal_decoder_set_rhinovla_high_precision_fusions(int64_t handle, bool enabled);
 void rpu_causal_decoder_set_rhinovla_high_precision(int64_t handle, bool enabled);

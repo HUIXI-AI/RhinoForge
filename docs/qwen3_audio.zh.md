@@ -270,5 +270,13 @@ RPU 使用独立单核 SPM 缓冲和容量受限的分块完成末轴切片、�
 `tts_codec_convnext_block` 在 RPU 上完成卷积准备、独立 SnakeBeta 及 ConvNeXt
 归一化/GELU/残差计算。CPU 仍负责 eager 调度和边界转换，并非整段 decoder 完全设备驻留。
 
+Codec SnakeBeta 的五步 FP16 算术现在保持在各核 SPM 中，按 rows 分配给最多八个核，
+只将最终结果写回 DDR。每个容量受限的分块使用一次性 Graph；alpha/scale 在同一次
+调用的临时 SPM 作用域内跨块复用，每次调用重新上传。分块上限为每核 512 行，
+临时空间上限为每核 4 MiB。反卷积重叠相加/bias 也按原有容量分块合入一次性 Graph。
+im2col 也将每块的清零、输入 DMA、展开和输出 DMA 合批，保持原有 4 MiB 容量规划、
+padding 和 dilation 数学。上述路径均在复用临时空间前完成并释放 Graph，不新增常驻图、
+跨请求缓存或 runtime 依赖。Linear 投影和其他 Codec 运算仍沿用原路径。
+
 FP16 舍入会改变波形，应使用同一份 codec tokens 对照 CPU FP32 并核验语音内容。
 该路径虽已设为默认，仍属实验性实现，不继承此前 CPU 残差卷积配置的音质结论；运行成功不等于音质认证。

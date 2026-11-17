@@ -629,9 +629,10 @@ if the process has an incompatible frozen allocator or arena plan.
 ASR requires `siglip_set_audio_mode`, `siglip_set_audio_projection` and
 `assemble_inputs_embeds` in the rebuilt native extension. TTS codec uses the
 explicit `causal_decoder_set_tts_codec_mode`; without it, the frontend stays on
-CPU. With the setter, 1–63 codec frames use the device; 64–255 frames use the
-original CPU FP32 frontend and its 72-frame sliding attention. Other execution
-errors propagate.
+CPU. With the setter, 1–255 codec frames use the device; above 64 frames an explicit
+72-frame causal sliding mask preserves the original attention window. Execution
+uses a planner-selected single chunk and retains only the current Graph/mask.
+Other execution errors propagate.
 
 `execution_stats()` exposes call and cache state:
 
@@ -660,7 +661,12 @@ with `torch.set_num_threads` before loading; the API leaves it unchanged.
 
 `codec_backend="rpu"` defaults to experimental offload of all 31 decoding Conv1d
 layers and four ConvNeXt Linear layers. With matching native support, twelve pairs
-also keep their intermediate SnakeBeta and first bias on RPU in FP16. Select
+also keep their intermediate SnakeBeta and first bias on RPU in FP16.
+With `tts_codec_residual_unit_complete`, the pairs also execute the
+first SnakeBeta and final residual addition in device FP16; older extensions
+retain the CPU FP32 boundary for those two operations.
+With `tts_codec_conv1d_spm_bias`, standalone Conv1d uses a retained FP16 device
+bias in its Linear projection, instead of adding CPU FP32 bias afterward. Select
 `codec_backend="cpu"` to restore
 CPU FP32 convolutions and activations. `execution_stats().codec_convolutions`
 reports backend, installed layers, cumulative convolution calls, `transport`

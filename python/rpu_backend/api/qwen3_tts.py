@@ -422,7 +422,7 @@ class Qwen3TTSModel:
             codec_rpu = "codec_transformer" in self._components
             device = self._components["codec_transformer"].get("last_device", "rpu") if codec_rpu else "cpu"
             result["codec_frontend"] = {"device": device,
-                "fallback_reason": (None if device == "rpu" else "sequence exceeds 63 device codec frames")
+                "fallback_reason": (None if device == "rpu" else "native codec frontend unavailable")
                     if codec_rpu else "native lacks explicit TTS codec mode"}
             result["codec_convolutions"] = dict(self._codec_convolutions)
             for name, part in self._components.items():

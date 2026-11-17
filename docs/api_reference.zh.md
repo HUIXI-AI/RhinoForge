@@ -518,8 +518,9 @@ prompt 加生成上限须在 512 个位置内；达到上限仍无 EOS 时，在
 
 ASR 需要重编译的 native 提供 `siglip_set_audio_mode`、`siglip_set_audio_projection`
 和 `assemble_inputs_embeds`。TTS codec 显式调用 `causal_decoder_set_tts_codec_mode`；
-缺少 setter 时前段保留 CPU 路径。有该接口时，1–63 帧使用设备，64–255 帧使用
-原始 CPU FP32 前段及其 72 帧滑窗注意力；其他执行错误直接报告。
+缺少 setter 时前段保留 CPU 路径。有该接口时，1–255 帧使用设备，超过 64 帧采用
+显式 72 帧因果滑窗，保持原注意力窗口；由规划器选择单块，仅保留当前图和 mask。
+其他执行错误直接报告。
 
 `execution_stats()` 返回调用及缓存状态：
 

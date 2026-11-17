@@ -176,6 +176,17 @@ at::Tensor rpu_tts_codec_residual_unit(
     const at::Tensor& input, const at::Tensor& first_weight,
     const at::Tensor& affine, const at::Tensor& second_weight,
     int64_t dilation, int64_t channels);
+at::Tensor rpu_tts_codec_residual_unit_complete(
+    const at::Tensor& input, const at::Tensor& first_weight,
+    const at::Tensor& affine, const at::Tensor& second_weight,
+    int64_t dilation, int64_t channels);
+at::Tensor rpu_tts_codec_residual_unit_padded_rows(
+    const at::Tensor& input, const at::Tensor& first_weight, const at::Tensor& affine,
+    const at::Tensor& second_weight, int64_t dilation, int64_t channels);
+at::Tensor rpu_tts_codec_residual_unit_rows(
+    const at::Tensor& input, const at::Tensor& first_weight,
+    const at::Tensor& affine, const at::Tensor& second_weight,
+    int64_t dilation, int64_t channels);
 at::Tensor rpu_tts_codec_snake(
     const at::Tensor& input, const at::Tensor& affine, int64_t channels);
 at::Tensor rpu_tts_codec_convnext_block(
@@ -188,6 +199,12 @@ at::Tensor rpu_tts_codec_conv1d(
     const at::Tensor& input, const at::Tensor& weight,
     const c10::optional<at::Tensor>& bias,
     int64_t kernel, int64_t dilation, int64_t out_channels);
+at::Tensor rpu_tts_codec_conv_transpose1d_device_post(
+    const at::Tensor& input, const at::Tensor& weight, const c10::optional<at::Tensor>& bias,
+    int64_t channels, int64_t kernel, int64_t stride);
+at::Tensor rpu_tts_codec_transpose_overlap(
+    const at::Tensor& projected, const c10::optional<at::Tensor>& bias,
+    int64_t channels, int64_t kernel, int64_t stride);
 at::Tensor rpu_tts_codec_conv_transpose1d(
     const at::Tensor& input, const at::Tensor& weight,
     const c10::optional<at::Tensor>& bias,

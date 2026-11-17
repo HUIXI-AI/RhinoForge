@@ -74,7 +74,7 @@ def install_codec_convolutions(decoder, restore):
         module.forward = types.MethodType(forward, module)
 
 
-def _rpu_convolution(owner, hidden, weight, stats):
+def _rpu_convolution(owner, hidden, weight, stats, device_bias=None):
     if (hidden.device.type != "cpu" or hidden.dtype != torch.float32 or
             hidden.ndim != 3 or hidden.shape[:2] != (1, owner.in_channels)):
         raise ValueError("TTS RPU convolution requires batch-one CPU FP32 input")
@@ -83,9 +83,11 @@ def _rpu_convolution(owner, hidden, weight, stats):
     count = hidden.shape[-1] - width + 1
     if count <= 0:
         raise ValueError("TTS RPU convolution input is shorter than its kernel")
-    native = getattr(torch.ops.rpu, "tts_codec_conv1d_spm", None)
+    native = getattr(torch.ops.rpu, "tts_codec_conv1d_spm_bias" if device_bias is not None
+                     else "tts_codec_conv1d_spm", None)
     if native is not None:
-        result = native(hidden, weight, owner.bias, owner.kernel_size[0], dilation, owner.out_channels)
+        result = native(hidden, weight, device_bias if device_bias is not None else owner.bias,
+                        owner.kernel_size[0], dilation, owner.out_channels)
         stats["calls"] += 1
         stats["spm_im2col_calls"] += 1
         return result
@@ -118,17 +120,51 @@ def _rpu_linear(owner, hidden, weight, bias, stats):
     return output
 
 
-def _rpu_transpose_convolution(owner, hidden, weight, stats, output_size=None):
+def _rpu_transpose_convolution(owner, hidden, weight, stats, output_size=None,
+                               device_post=False, bias=None):
     if output_size is not None:
         raise ValueError("TTS codec uses the configured transposed-convolution output size")
     if (hidden.device.type != "cpu" or hidden.dtype != torch.float32 or
             hidden.ndim != 3 or hidden.shape[:2] != (1, owner.in_channels)):
         raise ValueError("TTS RPU transposed convolution requires batch-one CPU FP32 input")
-    result = torch.ops.rpu.tts_codec_conv_transpose1d(
-        hidden, weight, owner.bias, owner.out_channels,
-        owner.kernel_size[0], owner.stride[0])
+    if not 0 < hidden.shape[-1] <= 255 * 640:
+        raise ValueError("TTS RPU transposed convolution sample count is out of bounds")
+    native_post = getattr(torch.ops.rpu, "tts_codec_conv_transpose1d_device_post", None)
+    if device_post and native_post is not None:
+        result = native_post(hidden, weight, bias, owner.out_channels,
+                             owner.kernel_size[0], owner.stride[0])
+    elif device_post:
+        rows = hidden.squeeze(0).T.half().contiguous().to("rpu")
+        projected = torch.ops.rpu.linear_with_accumulation(rows, weight, None, 1, 8, True)
+        result = torch.ops.rpu.tts_codec_transpose_overlap(
+            projected, bias, owner.out_channels, owner.kernel_size[0], owner.stride[0])
+        result = result.cpu().float()[:, :owner.out_channels].T.unsqueeze(0).contiguous()
+    else:
+        result = torch.ops.rpu.tts_codec_conv_transpose1d(
+            hidden, weight, owner.bias, owner.out_channels,
+            owner.kernel_size[0], owner.stride[0])
     stats["transposed_calls"] += 1
     return result
+
+
+def _rpu_residual_stage(owner, hidden, parameters, channels, stats):
+    hidden = owner.block[1](owner.block[0](hidden))
+    if (hidden.device.type != "cpu" or hidden.dtype != torch.float32 or
+            hidden.ndim != 3 or hidden.shape[:2] != (1, channels) or
+            not 0 < hidden.shape[-1] <= 255 * 1920):
+        raise ValueError("TTS residual stage requires bounded CPU FP32 input")
+    rows = hidden.squeeze(0).T.half().contiguous()
+    if channels in (96, 192):
+        rows = torch.nn.functional.pad(rows, (0, (-channels) % 128))
+    rows = rows.to("rpu")
+    native = (torch.ops.rpu.tts_codec_residual_unit_padded_rows if channels in (96, 192)
+              else torch.ops.rpu.tts_codec_residual_unit_rows)
+    for dilation, (first, affine, second) in zip((1, 3, 9), parameters):
+        rows = native(
+            rows, first, affine, second, dilation, channels)
+        stats["calls"] += 2
+        stats["paired_calls"] += 1
+    return rows.cpu().float()[:, :channels].T.unsqueeze(0).contiguous()
 
 
 def install_rpu_convolutions(decoder, restore, stats):
@@ -192,8 +228,13 @@ def install_rpu_convolutions(decoder, restore, stats):
            for block in blocks):
         raise ValueError("TTS RPU ConvNeXt normalization geometry differs")
     fused_residuals = hasattr(torch.ops.rpu, "tts_codec_residual_unit")
-    pairs = (_residual_pair_affines(decoder, full=fused_residuals)
+    complete_residuals = hasattr(torch.ops.rpu, "tts_codec_residual_unit_complete")
+    pairs = (_residual_pair_affines(decoder, full=fused_residuals, complete=complete_residuals)
              if fused_residuals or hasattr(torch.ops.rpu, "tts_codec_conv_pair") else [])
+    if complete_residuals and fused_residuals and hasattr(torch.ops.rpu, "tts_codec_residual_unit_rows"):
+        stage_indices = (1, 2, 3, 4) if hasattr(torch.ops.rpu, "tts_codec_residual_unit_padded_rows") else (1, 2)
+        if any(len(decoder.get_submodule(f"decoder.{index}").block) != 5 for index in stage_indices):
+            raise ValueError("TTS RPU resident residual stage requires exactly three units")
     standalone_snakes = []
     if hasattr(torch.ops.rpu, "tts_codec_snake"):
         standalone_snakes = [(name, module) for name, module in decoder.named_modules()
@@ -209,6 +250,25 @@ def install_rpu_convolutions(decoder, restore, stats):
                for _, module in standalone_snakes):
             raise ValueError("TTS RPU standalone SnakeBeta parameters differ")
     spm_im2col = hasattr(torch.ops.rpu, "tts_codec_conv1d_spm")
+    biases = []
+    for module in modules:
+        bias = None
+        if hasattr(torch.ops.rpu, "tts_codec_conv1d_spm_bias") and module.bias is not None:
+            bias = torch.nn.functional.pad(module.bias.detach(),
+                                            (0, (-module.out_channels) % 128)).half()
+            if not torch.isfinite(bias).all():
+                raise ValueError("TTS RPU convolution bias exceeds finite FP16 range")
+        biases.append(bias)
+    device_post = hasattr(torch.ops.rpu, "tts_codec_transpose_overlap")
+    transpose_biases = []
+    for module in transposed:
+        bias = None
+        if device_post and module.bias is not None:
+            bias = torch.nn.functional.pad(module.bias.detach(),
+                                            (0, (-module.out_channels) % 128)).half()
+            if not torch.isfinite(bias).all():
+                raise ValueError("TTS RPU transposed-convolution bias exceeds finite FP16 range")
+        transpose_biases.append(bias)
     prepared = []
     for module in modules:
         weight = module.weight.detach().half()
@@ -228,9 +288,10 @@ def install_rpu_convolutions(decoder, restore, stats):
          module.bias.detach().half().to("rpu"))
         for module in linears
     ]
-    for module, weight in zip(modules, prepared):
-        def forward(owner, hidden, weight=weight):
-            return _rpu_convolution(owner, hidden, weight, stats)
+    for module, weight, bias in zip(modules, prepared, biases):
+        bias = bias.to("rpu") if bias is not None else None
+        def forward(owner, hidden, weight=weight, bias=bias):
+            return _rpu_convolution(owner, hidden, weight, stats, bias)
         restore.append((module, module.forward))
         module.forward = types.MethodType(forward, module)
     stats["layers"] = len(modules)
@@ -242,15 +303,21 @@ def install_rpu_convolutions(decoder, restore, stats):
     stats["paired_calls"] = 0
     stats["transposed_layers"] = 0
     stats["transposed_calls"] = 0
-    if hasattr(torch.ops.rpu, "tts_codec_conv_transpose1d"):
-        for module in transposed:
-            weight = module.weight.detach().flatten(1).T.contiguous().half()
-            weight = torch.nn.functional.pad(weight, (0, 0, 0, (-weight.shape[0]) % 128))
+    if device_post or hasattr(torch.ops.rpu, "tts_codec_conv_transpose1d"):
+        for module, bias in zip(transposed, transpose_biases):
+            if device_post:
+                weight = torch.nn.functional.pad(module.weight.detach().permute(2, 1, 0),
+                    (0, 0, 0, (-module.out_channels) % 128)).reshape(-1, module.in_channels).half()
+            else:
+                weight = module.weight.detach().flatten(1).T.contiguous().half()
+                weight = torch.nn.functional.pad(weight, (0, 0, 0, (-weight.shape[0]) % 128))
             packed = transform_linear_weight(weight, 1, 8).to("rpu")
+            bias = bias.to("rpu") if bias is not None else None
 
-            def forward(owner, hidden, output_size=None, packed=packed):
+            def forward(owner, hidden, output_size=None, packed=packed, bias=bias):
                 return _rpu_transpose_convolution(
-                    owner, hidden, packed, stats, output_size=output_size)
+                    owner, hidden, packed, stats, output_size=output_size,
+                    device_post=device_post, bias=bias)
 
             restore.append((module, module.forward))
             module.forward = types.MethodType(forward, module)
@@ -310,6 +377,7 @@ def install_rpu_convolutions(decoder, restore, stats):
 
         restore.append((module, module.forward))
         module.forward = types.MethodType(forward, module)
+    resident_parameters = {}
     for unit, affine in pairs:
         channels = unit.conv2.conv.in_channels
         padding = (-channels) % 128
@@ -319,14 +387,24 @@ def install_rpu_convolutions(decoder, restore, stats):
                                              (0, padding, 0, padding))
             second = transform_linear_weight(weight, 1, 8).to("rpu")
         first, affine = weights[unit.conv1.conv], affine.to("rpu")
+        resident_parameters[unit] = (first, affine, second)
+        if padding and complete_residuals and hasattr(torch.ops.rpu, "tts_codec_residual_unit_padded_rows"):
+            weight = unit.conv1.conv.weight.detach().permute(0, 2, 1).half()
+            weight = torch.nn.functional.pad(weight, (0, padding, 0, 0, 0, padding))
+            weight = weight.reshape(channels + padding, 7 * (channels + padding))
+            resident_parameters[unit] = (transform_linear_weight(weight, 1, 8).to("rpu"), affine, second)
 
         if fused_residuals:
             def forward(owner, hidden, first=first, affine=affine, second=second):
                 channels = owner.conv1.conv.in_channels
-                output = torch.ops.rpu.tts_codec_residual_unit(
-                    owner.act1(hidden), first, affine, second,
-                    owner.conv1.dilation, channels)
-                output.add_(hidden)
+                if complete_residuals:
+                    output = torch.ops.rpu.tts_codec_residual_unit_complete(
+                        hidden, first, affine, second, owner.conv1.dilation, channels)
+                else:
+                    output = torch.ops.rpu.tts_codec_residual_unit(
+                        owner.act1(hidden), first, affine, second,
+                        owner.conv1.dilation, channels)
+                    output.add_(hidden)
                 stats["calls"] += 2
                 stats["paired_calls"] += 1
                 return output
@@ -351,8 +429,22 @@ def install_rpu_convolutions(decoder, restore, stats):
         restore.append((unit, unit.forward))
         unit.forward = types.MethodType(forward, unit)
 
+    if complete_residuals and fused_residuals and hasattr(torch.ops.rpu, "tts_codec_residual_unit_rows"):
+        stages = [(1, 768), (2, 384)]
+        if hasattr(torch.ops.rpu, "tts_codec_residual_unit_padded_rows"):
+            stages.extend(((3, 192), (4, 96)))
+        for index, channels in stages:
+            stage = decoder.get_submodule(f"decoder.{index}")
+            parameters = tuple(resident_parameters[unit] for unit in stage.block[2:])
 
-def _residual_pair_affines(decoder, *, full=False):
+            def forward(owner, hidden, parameters=parameters, channels=channels):
+                return _rpu_residual_stage(owner, hidden, parameters, channels, stats)
+
+            restore.append((stage, stage.forward))
+            stage.forward = types.MethodType(forward, stage)
+
+
+def _residual_pair_affines(decoder, *, full=False, complete=False):
     units = {name: module for name, module in decoder.named_modules()
              if type(module).__name__ == "Qwen3TTSTokenizerV2DecoderDecoderResidualUnit"}
     expected = {f"decoder.{stage}.block.{block}" for stage in range(1, 5) for block in range(2, 5)}
@@ -379,7 +471,7 @@ def _residual_pair_affines(decoder, *, full=False):
             raise ValueError("TTS RPU residual pair requires CPU FP32 channel parameters")
         values = [p.detach() for p in parameters]
         if full:
-            _, _, bias1, act2_alpha, act2_beta, bias2 = values
+            act1_alpha, act1_beta, bias1, act2_alpha, act2_beta, bias2 = values
             padding = (-channels) % 128
             affine = torch.stack((
                 torch.nn.functional.pad(bias1, (0, padding)),
@@ -388,6 +480,12 @@ def _residual_pair_affines(decoder, *, full=False):
                     1 / (act2_beta.exp() + unit.act2.no_div_by_zero), (0, padding)),
                 torch.nn.functional.pad(bias2, (0, padding)),
             )).half()
+            if complete:
+                affine = torch.cat((affine, torch.stack((
+                    torch.nn.functional.pad(act1_alpha.exp(), (0, padding), value=1),
+                    torch.nn.functional.pad(
+                        1 / (act1_beta.exp() + unit.act1.no_div_by_zero), (0, padding)),
+                )).half()))
             if not torch.isfinite(affine).all():
                 raise ValueError("TTS RPU residual pair parameters exceed finite FP16 range")
             prepared.append((unit, affine))

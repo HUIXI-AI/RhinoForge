@@ -29,14 +29,27 @@ at::Tensor rpu_gelu_erf(const at::Tensor& input) {
   constexpr int64_t block = 25600;
   const uint32_t spm = SPM_ALLOC.addr(0, SPM_ALLOC.alloc_temporary(
       std::min(input.numel(), block) * sizeof(c10::Half)));
-  for (int64_t offset = 0; offset < input.numel(); offset += block) {
-    const int64_t count = std::min(input.numel() - offset, block);
-    rpu_launch_ddr_broadcast_spm_dma_immediate(
-        input.data_ptr<c10::Half>() + offset, count, spm, 1);
-    rpu_launch_eltwise_unary_spm_kernel(
-        spm, spm, count, ValuOpType::ADD, GeluMode::ERF, 1);
-    rpu_launch_spm_copy_ddr_dma_immediate(
-        spm, output.data_ptr<c10::Half>() + offset, count);
+  for (int64_t start = 0; start < input.numel(); start += 8 * block) {
+    const int64_t end = std::min(input.numel(), start + 8 * block);
+    RpuKernelGraph graph;
+    graph.begin();
+    try {
+      graph.keep_alive(input);
+      graph.keep_alive(output);
+      for (int64_t offset = start; offset < end; offset += block) {
+        const int64_t count = std::min(end - offset, block);
+        rpu_launch_ddr_broadcast_spm_dma(
+            input.data_ptr<c10::Half>() + offset, count, spm, 1);
+        rpu_launch_eltwise_unary_spm_kernel(
+            spm, spm, count, ValuOpType::ADD, GeluMode::ERF, 1);
+        rpu_launch_spm_copy_ddr_dma(
+            spm, output.data_ptr<c10::Half>() + offset, count);
+      }
+      graph.end();
+    } catch (...) {
+      graph.abort();
+      throw;
+    }
   }
   return output;
 }

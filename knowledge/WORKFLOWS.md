@@ -185,13 +185,18 @@ Start with the [Qwen3 speech guide](../docs/qwen3_audio.md) and retain these con
   geometry before upload, and return independently owned CPU FP32 NCT storage.
   Codec SnakeBeta retains its five rounded stages in per-core temporary SPM;
   split rows across cores, bound scratch to 4 MiB and tiles to 512 rows/core,
-  and upload alpha/scale once per invocation. Submit each tile as a bounded
-  one-shot Graph, as for overlap/bias postprocessing and im2col fill/DMA/expansion.
+  and upload alpha/scale once per invocation. Group at most eight original tiles
+  per one-shot Graph, as for overlap/bias postprocessing and im2col fill/DMA/expansion.
+  Upload overlap bias in the first batch. ERF GELU likewise batches at most eight
+  25,600-element tiles without changing its per-tile math or scratch size.
   Preserve im2col padding, dilation and its 4 MiB capacity plan. Finish/abort and retire
   the Graph before releasing its SPM scope; never persist these temporary
   addresses across requests. Compare fixed inputs, tail tiles and retained outputs.
   ConvNeXt LayerNorm batches at most sixteen original 16-row tiles, reusing its
   scratch only in stream order; refresh affine parameters on each invocation.
+  Codec-only FP16/ACC32 Linear uses the shared launcher in a one-shot Graph,
+  retaining input, weight, optional bias and fresh output through completion.
+  Keep single-row scatter eager and retain the existing segment resource budgets.
 - Reset logical KV position per sequence. Talker keeps EOS and repetition penalties;
   Predictor uses a fixed 15-step sampling loop and resets KV per frame. Both use
   top-k 50, temperature 0.9 and top-p 1.0. Require EOS before waveform decoding;

@@ -54,12 +54,15 @@ void rpu_launch_eltwise_binary_spm_kernel(uint32_t a,uint32_t b,uint32_t o,int64
     cases = r'''
 int main(){
  at::manual_seed(19);at::set_num_threads(2);
- for(int c:{96,128,192,256,384,768,1536})for(int n:{1,7,9,1025,4105}){
+ for(int c:{96,128,192,256,384,768,1536})for(int n:{1,7,9,1025,4105,32769}){
+  if(n==32769&&c!=128)continue;
   auto x=at::randn({n,c}).to(at::kHalf),saved=x.clone();
   auto a=at::randn({c}).to(at::kHalf),s=at::randn({c}).to(at::kHalf);
   auto v=at::sin(x*a),expected=x+(v*v)*s;
   int before=submissions,uploads=broadcasts;auto y=tts_codec_snake_rows(x,a,s);
-  assert(submissions>before&&broadcasts-uploads==2&&at::equal(y,expected)&&at::equal(x,saved));
+  int tile=std::min<int64_t>(512,((4ULL<<20)-4*c-512)/(6*c)),tiles=0;
+  for(int start=0;start<n;++tiles){int cores=std::min(8,n-start);start+=cores*std::min(tile,(n-start)/cores);}
+  assert(submissions-before==(tiles+7)/8&&broadcasts-uploads==2&&at::equal(y,expected)&&at::equal(x,saved));
   tts_codec_snake_rows(x+1,a,s);assert(at::equal(y,expected));
   a.add_(1);v=at::sin(x*a);expected=x+(v*v)*s;
   assert(at::equal(tts_codec_snake_rows(x,a,s),expected));

@@ -93,7 +93,9 @@ int main(){
    if(use_bias)expected.add_(bias);
    int before=tile_submits;
    auto y=rpu_tts_codec_transpose_overlap(x,use_bias?c10::optional<Tensor>(bias):c10::nullopt,c,k,s);
-   assert(tile_submits>before&&!RpuKernelGraph::active);
+   int groups=count+(k>s),block=s*p;
+   int tile=std::min<int64_t>(std::min(512,groups),((4ULL<<20)-4*block-2*p-512)/(12*block));
+   assert(tile_submits-before==(groups+8*tile-1)/(8*tile)&&!RpuKernelGraph::active);
    assert(at::equal(y,expected)&&at::equal(x,saved)&&y.data_ptr()!=x.data_ptr());
    rpu_tts_codec_transpose_overlap(x+1,c10::nullopt,c,k,s);
    assert(at::equal(y,expected));

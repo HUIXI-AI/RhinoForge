@@ -5,6 +5,11 @@ import subprocess
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
+LINEAR_BRIDGE = r'''
+Tensor tts_codec_linear_rows(const Tensor&x,const Tensor&w,const c10::optional<Tensor>&b){
+ return rpu_linear_with_accumulation(x,w,b,1,8,true,c10::nullopt);
+}
+'''
 
 
 def test_transpose_device_post_boundary_and_owned_output(tmp_path):
@@ -62,7 +67,7 @@ int main(){
 }
 '''
     cpp, exe = tmp_path / "post.cpp", tmp_path / "post"
-    cpp.write_text(harness + helpers + function + cases)
+    cpp.write_text(harness + LINEAR_BRIDGE + helpers + function + cases)
     root = Path(torch.__file__).resolve().parent
     subprocess.run(["g++", "-std=c++17", "-O0",
         f"-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}",
@@ -179,7 +184,7 @@ int main(){
 }
 '''
     cpp, exe = tmp_path / "residual.cpp", tmp_path / "residual"
-    cpp.write_text(harness + upload + function + cases)
+    cpp.write_text(harness + LINEAR_BRIDGE + upload + function + cases)
     torch_root = Path(torch.__file__).resolve().parent
     subprocess.run([
         "g++", "-std=c++17", "-O0",
@@ -255,7 +260,7 @@ int main(){
 }
 '''
     cpp, exe = tmp_path / "codec.cpp", tmp_path / "codec"
-    cpp.write_text(harness + function + cases)
+    cpp.write_text(harness + LINEAR_BRIDGE + function + cases)
     torch_root = Path(torch.__file__).resolve().parent
     subprocess.run([
         "g++", "-std=c++17", "-O0", "-include", "ATen/Parallel.h",
@@ -324,7 +329,7 @@ int main(){
 }
 '''
     cpp, exe = tmp_path / "pair.cpp", tmp_path / "pair"
-    cpp.write_text(harness + function + cases)
+    cpp.write_text(harness + LINEAR_BRIDGE + function + cases)
     torch_root = Path(torch.__file__).resolve().parent
     subprocess.run([
         "g++", "-std=c++17", "-O0",
@@ -392,7 +397,7 @@ int main(){
 }
 '''
     cpp, exe = tmp_path / "transpose.cpp", tmp_path / "transpose"
-    cpp.write_text(harness + function + cases)
+    cpp.write_text(harness + LINEAR_BRIDGE + function + cases)
     torch_root = Path(torch.__file__).resolve().parent
     subprocess.run([
         "g++", "-std=c++17", "-O0",

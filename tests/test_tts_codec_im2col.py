@@ -54,7 +54,7 @@ int main(){
   for(int i=0;i<n;++i)for(int j=0;j<k;++j){int pos=i+j*d-left;if(pos>=0&&pos<samples)expected[i][j].copy_(x[pos]);}
   int before=submits;auto y=tts_codec_im2col_rows(x,k,d,left);
   int tile=std::min<int64_t>(n,((4ULL<<20)-(k-1)*d*c*2-512)/((k+1)*c*2));
-  assert(submits-before==(n+tile-1)/tile&&!RpuKernelGraph::active);
+  assert(submits-before==(n+8*tile-1)/(8*tile)&&!RpuKernelGraph::active);
   assert(at::equal(y,expected.view({n,k*c}))&&at::equal(x,saved));
   tts_codec_im2col_rows(x+1,k,d,left);assert(at::equal(y,expected.view({n,k*c})));
  }

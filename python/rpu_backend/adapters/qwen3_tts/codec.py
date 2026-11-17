@@ -129,7 +129,11 @@ def _rpu_transpose_convolution(owner, hidden, weight, stats, output_size=None,
         raise ValueError("TTS RPU transposed convolution requires batch-one CPU FP32 input")
     if not 0 < hidden.shape[-1] <= 255 * 640:
         raise ValueError("TTS RPU transposed convolution sample count is out of bounds")
-    if device_post:
+    native_post = getattr(torch.ops.rpu, "tts_codec_conv_transpose1d_device_post", None)
+    if device_post and native_post is not None:
+        result = native_post(hidden, weight, bias, owner.out_channels,
+                             owner.kernel_size[0], owner.stride[0])
+    elif device_post:
         rows = hidden.squeeze(0).T.half().contiguous().to("rpu")
         projected = torch.ops.rpu.linear_with_accumulation(rows, weight, None, 1, 8, True)
         result = torch.ops.rpu.tts_codec_transpose_overlap(

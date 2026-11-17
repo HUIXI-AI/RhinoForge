@@ -251,7 +251,10 @@ native 提供 `tts_codec_conv_transpose1d` 时，6 层固定转置卷积的投�
 具备 `tts_codec_transpose_overlap` 时，安装阶段按 kernel 位置重排六层反卷积权重，
 RPU 使用独立单核 SPM 缓冲和容量受限的分块完成末轴切片、重叠相加及 FP16 bias，
 不使用旧 DDR transpose 路径。CPU 仍处理 NCT 边界转换及最终裁剪；相对 CPU FP32
-后处理会有舍入差异。具备 `tts_codec_residual_unit_rows` 时，768/384 通道阶段中的
+后处理会有舍入差异。具备 `tts_codec_conv_transpose1d_device_post` 时，保持设备计算不变，
+通过共享 DDR 边界函数合并 CPU 布局及类型转换，减少主机中间复制；返回的 CPU FP32
+张量拥有独立存储，但不代表整条反卷积链设备驻留。
+具备 `tts_codec_residual_unit_rows` 时，768/384 通道阶段中的
 三个残差单元保持设备驻留，省去两次中间 CPU 往返；192/96 通道保留原有边界。
 上述路径需要重编译 RhinoForge 扩展，不修改 runtime 依赖包。
 匹配新版 native 还通过 `tts_codec_conv1d_spm`、`tts_codec_snake` 和

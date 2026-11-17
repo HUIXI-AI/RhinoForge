@@ -4436,6 +4436,33 @@ Tensor rpu_linear_with_core_count(
       input, weight, bias_opt, partition, num_cores, true, c10::nullopt);
 }
 
+Tensor rpu_tts_codec_conv_transpose1d_device_post(
+    const Tensor& input, const Tensor& weight, const c10::optional<Tensor>& bias,
+    int64_t channels, int64_t kernel, int64_t stride) {
+  TORCH_CHECK(!RpuKernelGraph::has_active(), "tts_codec_conv_transpose1d_device_post requires eager execution");
+  TORCH_CHECK(input.device().is_cpu() && input.scalar_type() == at::kFloat &&
+                  input.layout() == at::kStrided && input.dim() == 3 && input.size(0) == 1 &&
+                  input.size(2) > 0 && input.size(2) <= 255 * 640,
+              "tts_codec_conv_transpose1d_device_post expects bounded CPU FP32 NCT");
+  const int64_t in = input.size(1);
+  TORCH_CHECK((in == 1024 && channels == 1024 && kernel == 2 && stride == 2) ||
+                  (in == 1536 && channels == 768 && kernel == 16 && stride == 8) ||
+                  (in == 768 && channels == 384 && kernel == 10 && stride == 5) ||
+                  (in == 384 && channels == 192 && kernel == 8 && stride == 4) ||
+                  (in == 192 && channels == 96 && kernel == 6 && stride == 3),
+              "tts_codec_conv_transpose1d_device_post: unsupported geometry");
+  const int64_t padded = ((channels + 127) / 128) * 128;
+  check_tts_codec_device_half(weight, {kernel * padded, in}, "TTS device-post weight");
+  TORCH_CHECK(!bias.has_value() ||
+                  (bias->device() == weight.device() && bias->scalar_type() == at::kHalf &&
+                   bias->is_contiguous() && bias->sizes().equals({padded})),
+              "tts_codec_conv_transpose1d_device_post expects padded FP16 device bias");
+  auto rows = tts_codec_cpu_nct_to_device_rows(input, weight);
+  auto projected = rpu_linear_with_accumulation(rows, weight, c10::nullopt, 1, 8, true, c10::nullopt);
+  auto output = rpu_tts_codec_transpose_overlap(projected, bias, channels, kernel, stride);
+  return tts_codec_device_rows_to_cpu_nct(output.narrow(1, 0, channels));
+}
+
 Tensor rpu_tts_codec_transpose_overlap(
     const Tensor& projected, const c10::optional<Tensor>& bias,
     int64_t channels, int64_t kernel, int64_t stride) {

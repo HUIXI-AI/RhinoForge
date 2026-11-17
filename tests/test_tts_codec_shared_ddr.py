@@ -7,6 +7,70 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_transpose_device_post_boundary_and_owned_output(tmp_path):
+    source = (ROOT / "src/ops/rpu_linear.cpp").read_text()
+    helpers = "Tensor tts_codec_cpu_nct_to_device_rows(" + source.split(
+        "Tensor tts_codec_cpu_nct_to_device_rows(", 1)[1].split("Tensor tts_codec_im2col_rows(", 1)[0]
+    function = "Tensor rpu_tts_codec_conv_transpose1d_device_post(" + source.split(
+        "Tensor rpu_tts_codec_conv_transpose1d_device_post(", 1)[1].split(
+        "Tensor rpu_tts_codec_transpose_overlap(", 1)[0]
+    harness = r'''
+#include <ATen/ATen.h>
+#include <ATen/Parallel.h>
+#include <cassert>
+using at::Tensor;
+int launches=0;
+struct RpuKernelGraph{static inline bool active=false;static bool has_active(){return active;}};
+void check_tts_codec_device_half(const Tensor&t,c10::IntArrayRef shape,const char*){
+ TORCH_CHECK(t.scalar_type()==at::kHalf && t.is_contiguous() && t.sizes().equals(shape));
+}
+Tensor rpu_to_cpu_zerocopy_no_graph_sync(const Tensor&t,bool){return t;}
+Tensor rpu_to_cpu_zerocopy(const Tensor&t){return t;}
+void rpu_ddr_flush_force_sized(void*,size_t){}
+Tensor rpu_linear_with_accumulation(const Tensor&x,const Tensor&w,const c10::optional<Tensor>&,
+ int64_t,int64_t,bool,const c10::optional<Tensor>&){++launches;return at::mm(x.to(at::kFloat),w.to(at::kFloat).t()).to(at::kHalf);}
+Tensor rpu_tts_codec_transpose_overlap(const Tensor&x,const c10::optional<Tensor>&bias,int64_t c,int64_t k,int64_t s){
+ int64_t p=(c+127)/128*128,t=x.size(0);
+ auto y=at::zeros({(t-1)*s+k,p},x.options());
+ for(int i=0;i<t;++i)y.narrow(0,i*s,k).add_(x[i].view({k,p}));
+ if(bias)y.add_(*bias);return y;
+}
+'''
+    cases = r'''
+int main(){
+ at::manual_seed(2);at::set_num_threads(2);
+ for(int c:{1024,768,384,192,96}){
+  int in=c==1024?1024:c*2,k=c==1024?2:c==768?16:c==384?10:c==192?8:6,s=k==2?2:k/2,p=(c+127)/128*128;
+  auto x=at::randn({1,in,6}).slice(2,0,6,2),saved=x.clone();
+  auto w=(at::randn({k*p,in})/64).to(at::kHalf),bias=at::randn({p}).to(at::kHalf);
+  auto rows=x.squeeze(0).t().to(at::kHalf).contiguous();
+  auto projected=at::mm(rows.to(at::kFloat),w.to(at::kFloat).t()).to(at::kHalf);
+  auto expected=rpu_tts_codec_transpose_overlap(projected,bias,c,k,s).to(at::kFloat).narrow(1,0,c).t().unsqueeze(0).contiguous();
+  auto y=rpu_tts_codec_conv_transpose1d_device_post(x,w,bias,c,k,s);
+  assert(at::equal(y,expected)&&at::equal(x,saved)&&y.is_contiguous());
+  rpu_tts_codec_conv_transpose1d_device_post(x+1,w,bias,c,k,s);assert(at::equal(y,expected));
+  for(int bad=0;bad<8;++bad){
+   int before=launches;bool rejected=false;RpuKernelGraph::active=bad==0;
+   auto invalid=bad==5?x.narrow(2,0,0):bad==6?x.narrow(2,0,1).expand({1,in,255*640+1}):x;
+   try{rpu_tts_codec_conv_transpose1d_device_post(bad==1?x.to(at::kHalf):invalid,bad==2?w.to(at::kFloat):w,
+       bad==3?bias.narrow(0,0,p-1):bias,bad==7?INT64_MAX:c,k,bad==4?s+1:s);}
+   catch(const c10::Error&){rejected=true;}
+   assert(rejected&&before==launches);
+  }
+  RpuKernelGraph::active=false;
+ }
+}
+'''
+    cpp, exe = tmp_path / "post.cpp", tmp_path / "post"
+    cpp.write_text(harness + helpers + function + cases)
+    root = Path(torch.__file__).resolve().parent
+    subprocess.run(["g++", "-std=c++17", "-O0",
+        f"-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}",
+        "-I", str(root / "include"), str(cpp), "-L", str(root / "lib"),
+        "-ltorch_cpu", "-lc10", f"-Wl,-rpath,{root / 'lib'}", "-o", str(exe)], check=True)
+    subprocess.run([str(exe)], check=True)
+
+
 def test_complete_residual_keeps_legacy_affine_contract(tmp_path):
     source = (ROOT / "src/ops/rpu_linear.cpp").read_text()
     upload = "Tensor tts_codec_cpu_nct_to_device_rows(" + source.split(

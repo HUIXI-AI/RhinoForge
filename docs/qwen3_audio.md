@@ -325,6 +325,10 @@ weights by kernel position. RPU performs last-axis slicing, overlap addition and
 bias in FP16, using independent single-core SPM buffers and capacity-bounded tiles;
 it does not use the older DDR transpose route. CPU still converts NCT boundaries
 and crops the final output. This changes rounding relative to CPU FP32 postprocessing.
+With `tts_codec_conv_transpose1d_device_post`, the same device computation uses
+shared-DDR boundary helpers to combine CPU layout/dtype conversion and avoid
+intermediate host copies. Returned CPU FP32 tensors own their storage; this does
+not make the full transposed-convolution chain device-resident.
 With `tts_codec_residual_unit_rows`, the three residual units in each 768/384-channel
 stage keep their activations on device, removing the two internal CPU round trips.
 The 192/96-channel stages keep their previous CPU boundaries. These paths require

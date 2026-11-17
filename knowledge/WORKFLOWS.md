@@ -177,6 +177,9 @@ Start with the [Qwen3 speech guide](../docs/qwen3_audio.md) and retain these con
   New transpose postprocessing uses kernel-major weights and bounded single-core
   SPM last-axis slices, not DDR transpose. Keep 768/384-channel residual chains
   in device rows; retain CPU boundaries for padded 192/96-channel chains.
+  The optional `tts_codec_conv_transpose1d_device_post` boundary reuses shared-DDR
+  conversion helpers and the existing projection/overlap math. Validate the full
+  geometry before upload, and return independently owned CPU FP32 NCT storage.
 - Reset logical KV position per sequence. Talker keeps EOS and repetition penalties;
   Predictor uses a fixed 15-step sampling loop and resets KV per frame. Both use
   top-k 50, temperature 0.9 and top-p 1.0. Require EOS before waveform decoding;

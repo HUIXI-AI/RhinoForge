@@ -444,6 +444,30 @@ def test_native_transpose_transport_preserves_arguments_and_errors(monkeypatch, 
     assert stats["transposed_calls"] == 1
 
 
+@pytest.mark.parametrize("channels,kernel,stride", [(1024, 2, 2), (768, 16, 8),
+                                                  (384, 10, 5), (192, 8, 4), (96, 6, 3)])
+def test_device_post_native_boundary_preserves_arguments(monkeypatch, channels, kernel, stride):
+    from rpu_backend.adapters.qwen3_tts.codec import _rpu_transpose_convolution
+    in_channels = 1024 if channels == 1024 else channels * 2
+    module = torch.nn.ConvTranspose1d(in_channels, channels, kernel, stride=stride)
+    hidden = torch.zeros(1, in_channels, 6)[..., ::2]
+    weight, bias, output = object(), object(), object()
+    def native(*args):
+        assert args == (hidden, weight, bias, channels, kernel, stride)
+        return output
+    monkeypatch.setattr(torch.ops.rpu, "tts_codec_conv_transpose1d_device_post", native, raising=False)
+    stats = {"transposed_calls": 0}
+    assert _rpu_transpose_convolution(module, hidden, weight, stats, device_post=True, bias=bias) is output
+    assert stats["transposed_calls"] == 1
+    with pytest.raises(ValueError, match="CPU FP32"):
+        _rpu_transpose_convolution(module, hidden.half(), weight, stats)
+    monkeypatch.setattr(torch.ops.rpu, "tts_codec_conv_transpose1d_device_post",
+                        lambda *args: (_ for _ in ()).throw(RuntimeError("device failure")))
+    with pytest.raises(RuntimeError, match="device failure"):
+        _rpu_transpose_convolution(module, hidden, weight, stats, device_post=True, bias=bias)
+    assert stats["transposed_calls"] == 1
+
+
 def test_native_codec_transport_preserves_arguments_and_propagates_errors(monkeypatch):
     module = torch.nn.Conv1d(96, 96, 7, dilation=3).eval()
     hidden = torch.randn(1, 96, 50)[:, :, ::2]

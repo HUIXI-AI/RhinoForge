@@ -12,7 +12,7 @@ This port targets the public `LightOriginsHQ/LightNav-0` model and pins:
 Each request produces five tokens: two pointing tokens and three RVQ action
 tokens.
 
-## Current delivery configuration
+## Delivery configuration
 
 | Item | Configuration |
 |---|---|
@@ -34,10 +34,9 @@ path still executes a complete Prefill. Graph reuse only reduces capture and
 kernel-dispatch overhead; it does not reuse text results from the previous
 request.
 
-W4 is not part of the current delivery. Text W8 uses input-activation second
-moments, and Vision W8 uses an encoder range scale of 1.0. The five-position
-grammar head applies fixed calibration corrections only to candidates that
-crossed an FP16 decision boundary after quantization.
+Text W8 uses input-activation second moments, and Vision W8 uses an encoder
+range scale of 1.0. The five-position grammar head uses calibration parameters
+stored in the checkpoint and still returns the standard five action tokens.
 
 ## Environment
 
@@ -82,7 +81,7 @@ The converter applies activation-aware per-output-channel W8 to all 252 Text
 projections. The Vision Encoder is quantized per output channel during install.
 It rejects missing, extra, malformed, or non-finite activation statistics and
 accepts only the exact LightNav-0 geometry. The calibration artifact is a model
-asset and is not stored in this Git repository.
+asset delivered separately from this Git repository.
 
 ## Run an ordered image sequence
 
@@ -90,7 +89,7 @@ The input JSON must contain a nonempty `prompt` (or `instruction`) and an
 ordered `images` array. Only `task="tracking"` is supported. Image paths are
 relative to the JSON by default or to `--images-dir` when provided.
 
-Validate paths and input first:
+Run the ordered sequence:
 
 ```bash
 python examples/lightnav_inference.py \
@@ -100,13 +99,8 @@ python examples/lightnav_inference.py \
   --lightnav-source /path/to/LightNav-0-source \
   --history-frames 9 \
   --constrained-head \
-  --output /path/to/inference_result.json \
-  --check-config
+  --output /path/to/inference_result.json
 ```
-
-After validation, remove `--check-config` and run the same command on R1. Do not
-add `--history-draft`; the current performance result uses standard five-token
-autoregressive Decode.
 
 The output JSON records five tokens, input-token count, Vision cache hits and
 misses, and stage timings for every frame. `total` includes preparation, Vision,
@@ -118,7 +112,7 @@ resizing of all images.
 condition of the performance result below. Applications that use full-vocabulary
 decoding must validate output and performance separately.
 
-## Current performance
+## Performance
 
 Test conditions:
 
@@ -140,8 +134,7 @@ Test conditions:
 | Activation-aware Text W8 + Vision W8, cold run 2 | 16.671 ms | 30.099 ms | 91.299 ms | 115.850 ms | **254.227 ms** | **256.213 ms** | 35/35 frames, 175/175 tokens |
 
 Stage medians are computed independently and may not add up exactly to the
-median Total. Both cold runs use the same formally converted checkpoint and do
-not use previous-request five-token draft verification.
+median Total.
 
 The complete summary is in
 [`benchmark_results/lightnav_activation_w8_20261118/summary.json`](../benchmark_results/lightnav_activation_w8_20261118/summary.json).

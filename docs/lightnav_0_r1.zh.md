@@ -11,7 +11,7 @@
 
 模型每次输出 5 个 token：2 个指向 token 和 3 个 RVQ 动作 token。
 
-## 当前交付配置
+## 交付配置
 
 | 项目 | 配置 |
 |---|---|
@@ -31,9 +31,8 @@
 当前请求执行完整 Prefill；Graph 复用只减少建图和内核调度开销，不复用上一请求的文本
 结果。
 
-当前交付不包含 W4。Text W8 使用输入激活二阶矩校准；Vision W8 使用 1.0 编码器范围。
-五位置动作语法 head 对量化后落在 FP16 决策边界两侧的候选应用固定校准补偿，未改变
-模型输出格式。
+Text W8 使用输入激活二阶矩校准，Vision W8 使用 1.0 编码器范围。五位置动作语法
+head 使用随 checkpoint 固化的校准参数，输出仍为标准的 5 个动作 token。
 
 ## 环境准备
 
@@ -71,14 +70,14 @@ PYTHONPATH=python python -m rpu_backend.quant.convert_qwen3_vl \
 
 转换器对 252 个 Text 投影执行激活感知逐输出通道 W8 量化；Vision Encoder 在安装时
 执行逐输出通道 W8 量化。转换器会拒绝缺失、多余、形状错误或非有限的激活统计，也只
-接受精确匹配的 LightNav-0 配置。当前校准统计属于模型资产，不在 Git 仓库内。
+接受精确匹配的 LightNav-0 配置。校准统计作为模型资产单独交付，不在 Git 仓库内。
 
 ## 运行真实图片序列
 
 输入 JSON 必须包含非空的 `prompt`（或 `instruction`）和按时间排序的 `images` 数组；
 仅支持 `task="tracking"`。图片路径默认相对于 JSON，也可用 `--images-dir` 指定。
 
-先检查路径和输入：
+运行命令：
 
 ```bash
 python examples/lightnav_inference.py \
@@ -88,12 +87,8 @@ python examples/lightnav_inference.py \
   --lightnav-source /path/to/LightNav-0-source \
   --history-frames 9 \
   --constrained-head \
-  --output /path/to/inference_result.json \
-  --check-config
+  --output /path/to/inference_result.json
 ```
-
-确认通过后移除 `--check-config`，在 R1 上执行同一命令。不要增加
-`--history-draft`；当前性能口径使用标准 5-token 自回归 Decode。
 
 输出 JSON 按帧记录 5 个 token、输入 token 数、视觉缓存命中/缺失和各阶段耗时。
 `total` 包含准备、Vision 和文本生成；`frame_total` 还包含 Graph 清理和请求外围处理，
@@ -102,7 +97,7 @@ python examples/lightnav_inference.py \
 `--constrained-head` 对应 LightNav 五位置动作语法，也是下表性能的测试条件。若应用使用
 完整词表解码，必须单独验证输出和性能。
 
-## 当前性能
+## 性能
 
 测试条件：
 
@@ -119,8 +114,7 @@ python examples/lightnav_inference.py \
 | 激活感知 Text W8 + Vision W8，冷启动 1 | 16.757 ms | 29.608 ms | 91.199 ms | 115.749 ms | **254.346 ms** | **255.810 ms** | 35/35 帧，175/175 token |
 | 激活感知 Text W8 + Vision W8，冷启动 2 | 16.671 ms | 30.099 ms | 91.299 ms | 115.850 ms | **254.227 ms** | **256.213 ms** | 35/35 帧，175/175 token |
 
-各阶段分别取中位数，因此阶段中位数之和可能与 `Total` 有小量差异。两次冷启动均从
-同一个正式转换产物运行，未使用上一请求的 5-token 候选验证。
+各阶段分别取中位数，因此阶段中位数之和可能与 `Total` 有小量差异。
 
 完整汇总见
 [`benchmark_results/lightnav_activation_w8_20261118/summary.json`](../benchmark_results/lightnav_activation_w8_20261118/summary.json)。

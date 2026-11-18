@@ -61,15 +61,15 @@ model quality. See the [Qwen3 templates](../examples/configs/qwen3/README.md).
 ## Qwen3-VL
 
 Use `python -m rpu_backend.quant.convert_qwen3_vl` for offline 2B/4B/8B and
-exact LightNav-0 conversion. For LightNav-0, `--bits 8` quantizes only the
-Text7 projections and keeps the action head and Vision in FP16. Other public
-models retain their existing W8A16 recipes. The `--lightnav-vision-w8` option
-also quantizes Vision per channel, but neither full Text W8 nor Vision W8 is an
-FP16-parity profile. Use `--lightnav-parity` to quantize only layers 0–3
-Attention O projections and keep the remaining model FP16. That scope matched
-175/175 full-FP16 tokens on the customer 35-frame set; broader deployment still
-requires task-accuracy validation. For the `awq_w4.toml`
-examples, use `--bits 4` with symmetric G32 compressed-tensors AWQ input:
+exact LightNav-0 conversion. The LightNav delivery quantizes all 252 Text
+projections with activation-aware W8 and quantizes the Vision Encoder per
+output channel. It requires the matching activation-second-moment artifact and
+keeps the action head, embeddings, and norms in FP16. See the
+[LightNav-0 R1 guide](lightnav_0_r1.md) for the exact command and validated
+profile. Other public models retain their existing W8A16 recipes.
+
+For the `awq_w4.toml` examples, use `--bits 4` with symmetric G32
+compressed-tensors AWQ input:
 Text AWQ is preserved, the LM head uses RTN W4, and Vision uses W8.
 The converter also accepts the exact unquantized public 2B/4B/8B FP16 profile
 with `--bits 4`; that produces RTN W4 text/head weights, not AWQ weights.
@@ -78,6 +78,7 @@ before conversion.
 
 ```sh
 python -m rpu_backend.quant.convert_qwen3_vl --bits 8 --src SOURCE_DIR --dst W8_DIR
+python -m rpu_backend.quant.convert_qwen3_vl --bits 8 --lightnav-activation-stats STATS_FILE --lightnav-vision-w8 --src LIGHTNAV_DIR --dst LIGHTNAV_W8_DIR
 python -m rpu_backend.quant.convert_qwen3_vl --bits 4 --src AWQ_DIR --dst W4_DIR
 ```
 

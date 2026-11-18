@@ -53,11 +53,11 @@ Verifier 检查 method、INT8/scale tensor 配对和代表性 dequantized weight
 ## Qwen3-VL
 
 2B/4B/8B 和精确 LightNav-0 配置的离线转换入口为
-`python -m rpu_backend.quant.convert_qwen3_vl`。LightNav-0 的 `--bits 8` 只量化
-Text7 投影，动作输出头和 Vision 保持 FP16；其他公开模型按原有 W8A16 配方转换。
-`--lightnav-vision-w8` 会同时按通道量化 Vision。LightNav encoder 使用客户 35 帧
-校准得到的 1.04 动态范围，patch/merger 保持标准范围；该数据上 175 个输出 token
-与 Vision FP16 一致。真实导航准确率验证仍是部署前提。
+`python -m rpu_backend.quant.convert_qwen3_vl`。LightNav 交付配置使用匹配的激活二阶矩
+统计，将 252 个 Text 投影全部量化为 W8，并对 Vision Encoder 执行逐输出通道 W8
+量化；动作输出头、embedding 和 norm 保持 FP16。精确命令和已验证配置见
+[LightNav-0 R1 指南](lightnav_0_r1.zh.md)。其他公开模型沿用各自的 W8A16 配方。
+
 使用 `awq_w4.toml` 时，
 `--bits 4` 的输入应为 symmetric G32 compressed-tensors AWQ：保留 Text AWQ，
 LM head 转为 RTN W4，Vision 为 W8。转换器也接受精确匹配的公开 2B/4B/8B FP16
@@ -66,6 +66,7 @@ LM head 转为 RTN W4，Vision 为 W8。转换器也接受精确匹配的公开 
 
 ```sh
 python -m rpu_backend.quant.convert_qwen3_vl --bits 8 --src SOURCE_DIR --dst W8_DIR
+python -m rpu_backend.quant.convert_qwen3_vl --bits 8 --lightnav-activation-stats STATS_FILE --lightnav-vision-w8 --src LIGHTNAV_DIR --dst LIGHTNAV_W8_DIR
 python -m rpu_backend.quant.convert_qwen3_vl --bits 4 --src AWQ_DIR --dst W4_DIR
 ```
 

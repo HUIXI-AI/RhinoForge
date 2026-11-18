@@ -65,7 +65,10 @@ static at::Tensor binary_op_impl(
   // dtype-ORDER-dependent and silently wrong: with fp16 `a` and fp32 `b` this
   // fell through to step 3, which does `b.to(a.scalar_type())` — downcasting
   // the fp32 operand and returning fp16, where PyTorch promotion says fp32.
-  // at::result_type keeps the fast path for Half op Half and for
+  // Measured on the dev host, [1024] * [1,128,1024]: `w_fp16 * x_fp32` gave
+  // cos 0.705944 / max_abs 9.51, while the SAME product written the other way
+  // round (`x_fp32 * w_fp16`, where `a` is fp32 so step 1 caught it) gave
+  // cos 1.000010. at::result_type keeps the fast path for Half op Half and for
   // step 2's 0-dim/scalar operands, which do not promote. In-place keeps a's
   // dtype by definition (`a *= b` stays fp16), so it still gates on `a`.
   //
@@ -866,10 +869,37 @@ void rpu_launch_eltwise_binary_scalar_kernel(const at::Tensor &input_a,
 #define THD_VECTOR_SIZE 16
 #define WARP_SIZE 16
 
-// DDR batch-broadcast geometry uses reg10/11 in 256-byte units, multiplied by
-// C for the NxC operands. Supply rows_per_block * sizeof(FP16) / 256 exactly:
-// multiple blocks require rows_per_block to be a multiple of 128. Truncating
-// this stride would repeat or misplace rows after the first block.
+// ===================== DDR batch broadcast geometry =====================
+//
+// Both DDR "batch" broadcast kernels below split N over gridDim.x and derive
+// each block's base addresses from reg10/11. That register is NOT a byte
+// stride: it is in the same 256-byte (v128) units as the DDR base addresses in
+// reg4..9, and the KERNEL multiplies it by C for the two NxC operands
+// (rhino-ops asm/eltwise/binary_{1xC_NxC,Nx1_NxC}_v*_batch_ddr.asm):
+//
+//     wr0 = param10_32 * blkid.x
+//     wr8 = param12 * {16,256}          // c_loopcnt * vector width == C
+//     wr0 = wr0 * wr8
+//     b_base = param6 + wr0 ;  out_base = param8 + wr0
+//
+// So the value the launcher must supply is rows_per_block * sizeof(fp16) / 256
+// EXACTLY — an integer only when rows_per_block is a multiple of 128. Below
+// that the shift truncates, and at rows_per_block <= 127 it truncates to ZERO,
+// which makes every block after the first recompute block 0's rows.
+//
+// Measured on the dev host (fp16 mul vs CPU), before this was guarded:
+//   [1,128,1024]*[1,1,1024]  blk_cnt 2, rows/blk 64,  stride 0   cos 0.706753
+//   [1,256,1024]*[1,1,1024]  blk_cnt 4, rows/blk 64,  stride 0   cos 0.498905
+//   [1,704,256] *[1,1,256]   blk_cnt 2, rows/blk 352, stride 2    cos 0.928764
+//   [1,512,256] *[1,1,256]   blk_cnt 2, rows/blk 256, stride 2    cos 0.999995 (exact)
+//   [1,352,256] *[1,1,256]   blk_cnt 1 (stride unused)            cos 0.999994
+// i.e. the error tracks stride exactness, not the pattern or the op.
+//
+// The kernels also step C in whole v16 vectors (c_loopcnt = C/16 or C/256), so
+// a C that is not v16-aligned drops its tail columns: measured C=100 cos
+// 0.851449, C=24 cos 0.769591. C > 1024 is fine here (measured C=2048/4096 cos
+// 0.999998) even though rhino-runtime's ConvertEltwiseBinary routes it to the
+// V2 tile kernels, so it is NOT part of the guard.
 //
 // C must be v16-aligned because the payload advances whole vectors. The SPM
 // variants use an ordinary byte stride and do not share the DDR >>8 constraint.
@@ -887,10 +917,30 @@ struct EltwiseDdrBatchGeom {
   uint16_t thread_params[WARP_SIZE];    // v16 kernels only (SCM regs 4096+)
 };
 
-// The available VLM row budget decreases with C and can become nonpositive.
-// Check that budget before CeilDiv: zero or negative divisors cannot produce a
-// valid block count or stride. Mark such geometry degenerate and fall back to
-// the same-shape kernel rather than submitting an empty or overflowed grid.
+// Both geometries divide by a VLM budget that SHRINKS as C grows, because VLM
+// is a fixed 384 entries and the kernel reserves a share of them per v16 column
+// vector. The budget reaches zero at a finite C — 3072 for 1xC_NxC, 6144 for
+// Nx1_NxC — and CeilDiv is a signed int64 macro (src/core/rpu_profile.h:275),
+// so dividing anyway went one of two ways, and BOTH ended in the same place:
+//   C exactly at the zero point : NOT a SIGFPE on this aarch64 host — SDIV
+//                                 returns 0 for a zero divisor instead of
+//                                 trapping — so blk_cnt came back 0.
+//   C beyond it                 : divisor NEGATIVE => blk_cnt negative, which
+//                                 casts to a huge size_t.
+// Either way rows_per_block truncated to 0, stride_bytes was 0, and
+// `0 % 256 == 0` made finish_geom report the stride EXACT: the predicate whose
+// only job is to say "demote this" CERTIFIED a geometry that addresses nothing,
+// and the caller got back its untouched `at::empty` output. Measured on the dev host
+// (fp16 mul vs CPU, before this guard):
+//   [1,100,3072]*[1,1,3072]  blk_cnt 0                     rows/blk 0  launchable TRUE  cos nan
+//   [1,100,4304]*[1,1,4304]  blk_cnt 18446744073709551607  rows/blk 0  launchable TRUE  cos nan
+//   [1,100,6144]*[1,100,1]   blk_cnt 0                     rows/blk 0  launchable TRUE  cos nan
+// (4304 = SigLIP-so400m / Qwen3.5-vision intermediate.)
+// So mark the geometry degenerate instead of dividing. `degenerate` is what the
+// _launchable predicates below reject; a rejected pattern is demoted to the
+// sameshape kernel, which is correct for any shape. The arithmetic itself is
+// pre-existing; the predicates are the contract that says "false means demote",
+// so this is where it is enforced.
 static void finish_geom(EltwiseDdrBatchGeom &g) {
   if (g.rows_per_block <= 0) {  // nothing to address per block
     g.degenerate = true;
@@ -1526,8 +1576,9 @@ at::Tensor rpu_pow_scalar_tensor(const c10::Scalar &self, const at::Tensor &expo
 void rpu_launch_pi05_gated_residual_spm_kernel(
     uint32_t input_spm, uint32_t residual_spm, uint32_t gate_spm,
     uint32_t output_spm, int64_t rows, int cores) {
-  TORCH_CHECK(rows >= 1 && rows <= 64 && (cores == 1 || cores == 8),
-              "Pi0.5 gated residual requires H1024, M1..64, cores1/8");
+  TORCH_CHECK(rows >= 1 && rows <= 64 &&
+                  (cores == 1 || cores == 4 || cores == 6 || cores == 8),
+              "Pi0.5 gated residual requires H1024, M1..64, cores1/4/6/8");
   TORCH_CHECK(SPM_ALLOC.is_initialized(), "Pi0.5 gated residual requires live SPM");
   constexpr uint64_t row_bytes = 2048;
   const uint64_t bytes = rows * row_bytes, base = SPM_ALLOC.addr(0, 0);
@@ -2339,11 +2390,12 @@ void rpu_launch_eltwise_mul_spm_kernel(
     uint32_t a_spm_addr,               // First operand SPM address
     uint32_t b_spm_addr,               // Second operand SPM address
     uint32_t output_spm_addr,          // Output SPM address
-    int64_t num_elements)              // Total elements per core
+    int64_t num_elements,              // Total elements per core
+    int num_cores)                     // Participating core prefix
 {
   rpu_launch_eltwise_binary_spm_kernel(
       a_spm_addr, b_spm_addr, output_spm_addr,
-      num_elements, ValuOpType::MUL, c10::Half(1.0));
+      num_elements, ValuOpType::MUL, c10::Half(1.0), num_cores);
 }
 
 // Convenience wrapper for element-wise add (used in residual connections)
@@ -2352,11 +2404,12 @@ void rpu_launch_eltwise_add_spm_kernel(
     uint32_t b_spm_addr,               // Second operand SPM address
     uint32_t output_spm_addr,          // Output SPM address
     int64_t num_elements,              // Total elements per core
-    c10::Half alpha)                   // Scale for B: out = A + alpha * B
+    c10::Half alpha,                   // Scale for B: out = A + alpha * B
+    int num_cores)                     // Participating core prefix
 {
   rpu_launch_eltwise_binary_spm_kernel(
       a_spm_addr, b_spm_addr, output_spm_addr,
-      num_elements, ValuOpType::ADD, alpha);
+      num_elements, ValuOpType::ADD, alpha, num_cores);
 }
 
 // Convenience wrapper for element-wise sub
@@ -2365,11 +2418,12 @@ void rpu_launch_eltwise_sub_spm_kernel(
     uint32_t b_spm_addr,
     uint32_t output_spm_addr,
     int64_t num_elements,
-    c10::Half alpha)
+    c10::Half alpha,
+    int num_cores)
 {
   rpu_launch_eltwise_binary_spm_kernel(
       a_spm_addr, b_spm_addr, output_spm_addr,
-      num_elements, ValuOpType::SUB, alpha);
+      num_elements, ValuOpType::SUB, alpha, num_cores);
 }
 
 // Convenience wrapper for element-wise div

@@ -66,8 +66,8 @@ void rpu_launch_g05_text_owner_rms_m256h2048_kernel(
 
 namespace {
 uint32_t prefill_full_bytes(int64_t rows) {
-    TORCH_CHECK(rows == 272 || rows == 288 || rows == 304 || rows == 320 || rows == 336 || rows == 400 || rows == 416 || rows == 432 || rows == 448 || rows == 464,
-                "Pi owner norm requires exact C272/C288/C304/C320/C336/C400/C416/C432/C448/C464");
+    TORCH_CHECK(rows == 272 || rows == 288 || rows == 304 || rows == 320 || rows == 336 || rows == 400 || rows == 416 || rows == 432 || rows == 448 || rows == 464 || rows == 480,
+                "Pi owner norm requires exact C272/C288/C304/C320/C336/C400/C416/C432/C448/C464/C480");
     return static_cast<uint32_t>(rows) * 2048 * sizeof(c10::Half);
 }
 
@@ -151,7 +151,10 @@ void rpu_launch_pi05_owner_norm_spm_kernel(
     const auto base=check_operands({{partial,FullBytes},
         {residual,full?FullBytes:CompactBytes},{compact_raw,CompactBytes},
         {normalized,FullBytes},{gamma,4096}});
-    const auto id = rows == 432
+    const auto id = rows == 480
+        ? (full ? KernelId::PI05_OWNER_NORM_FULL_RESIDUAL_M480N2048
+                : KernelId::PI05_OWNER_NORM_COMPACT_RESIDUAL_M480N2048)
+        : rows == 432
         ? (full ? KernelId::PI05_OWNER_NORM_FULL_RESIDUAL_M432N2048
                 : KernelId::PI05_OWNER_NORM_COMPACT_RESIDUAL_M432N2048)
         : rows == 464
@@ -188,7 +191,8 @@ void rpu_launch_pi05_compact_residual_spm_kernel(
     const uint32_t FullBytes = prefill_full_bytes(rows), CompactBytes = FullBytes / 8;
     const auto base=check_operands({{partial,FullBytes},
         {compact_residual,CompactBytes},{full_raw,FullBytes}});
-    launch(rows == 432 ? KernelId::PI05_XOR3_COMPACT_RESIDUAL_RAW_FULL_M432N2048
+    launch(rows == 480 ? KernelId::PI05_XOR3_COMPACT_RESIDUAL_RAW_FULL_M480N2048
+         : rows == 432 ? KernelId::PI05_XOR3_COMPACT_RESIDUAL_RAW_FULL_M432N2048
          : rows == 464 ? KernelId::PI05_XOR3_COMPACT_RESIDUAL_RAW_FULL_M464N2048
                 : rows == 448 ? KernelId::PI05_XOR3_COMPACT_RESIDUAL_RAW_FULL_M448N2048
          : rows == 416 ? KernelId::PI05_XOR3_COMPACT_RESIDUAL_RAW_FULL_M416N2048
@@ -204,6 +208,7 @@ void rpu_launch_pi05_compact_residual_spm_kernel(
 void rpu_launch_pi05_owner_norm_a8_spm_kernel(
     uint32_t partial,uint32_t residual,uint32_t compact_raw,
     uint32_t a8,uint32_t gamma,uint32_t row_scale,double eps,int64_t rows) {
+    TORCH_CHECK(rows != 480, "Pi A8 owner norm has no C480 payload");
     const uint32_t FullBytes = prefill_full_bytes(rows), CompactBytes = FullBytes / 8;
     // C272/C288/C304/C320/C416/C432/C448/C464 consumers read a vector past the final scalar scale.
     // Initialize the 32B tail even when all M48 tiles are complete.
@@ -273,7 +278,8 @@ uint32_t check_vision_operands(
 
 void launch_vision_owner(KernelId id, uint32_t base, uint32_t partial,
                         uint32_t residual, uint32_t raw, uint32_t normalized,
-                        uint32_t gamma, uint32_t beta, bool layer_norm, double eps, int64_t rows) {
+                        uint32_t gamma, uint32_t beta, bool layer_norm, double eps, int64_t rows,
+                        uint32_t quantized_row_scale = 0) {
     const uint32_t VisionCompactBytes = vision_full_bytes(rows) / 8;
     auto& graph = RpuKernelGraph::active();
     if (graph.kernel_register_census_active()) {
@@ -317,6 +323,7 @@ void launch_vision_owner(KernelId id, uint32_t base, uint32_t partial,
         set(28, c10::Half(std::sqrt(static_cast<float>(VisionColumns))).x);
         set(29, 1);  // Affine gamma and beta.
     }
+    if (quantized_row_scale) pair(30, quantized_row_scale);
     set(42, 0);  // Every native launch starts from freshly initialized SCU.
     set(64, 8);
     set(65, 1);
@@ -334,6 +341,13 @@ void launch_vision_owner(KernelId id, uint32_t base, uint32_t partial,
                 uint16_t(field.second), "Pi Vision owner LayerNorm");
             rpu_set_legacy_scm_u16_checked(kernel, 4096 + field.first + 8 + core,
                 uint16_t(field.second >> 16), "Pi Vision owner LayerNorm");
+        }
+        if (quantized_row_scale) {
+            const auto scale_offset = SPM_ALLOC.addr(core, quantized_row_scale - base) - base;
+            rpu_set_legacy_scm_u16_checked(kernel, 4096 + 80 + core,
+                uint16_t(scale_offset), "Pi Vision owner LayerNorm Q/SX");
+            rpu_set_legacy_scm_u16_checked(kernel, 4096 + 88 + core,
+                uint16_t(scale_offset >> 16), "Pi Vision owner LayerNorm Q/SX");
         }
     }
     auto* queue = GET_QUEUE(8);
@@ -356,6 +370,29 @@ void rpu_launch_pi05_vision_owner_layernorm_spm_kernel(
                                     : KernelId::PI05_VISION_OWNER_REDUCE_LAYERNORM_M768N1152,
                        base, partial, residual, compact_raw, normalized,
                        gamma, beta, true, eps, rows);
+}
+
+void rpu_launch_pi05_vision_owner_layernorm_quantize_w8a8_spm_kernel(
+    uint32_t partial, uint32_t residual, uint32_t compact_raw,
+    uint32_t output_int8, uint32_t row_scale, uint32_t gamma, uint32_t beta,
+    double eps, int64_t rows) {
+    const uint32_t full_bytes = vision_full_bytes(rows);
+    TORCH_CHECK(std::isfinite(eps) && eps == 1e-6,
+                "Pi Vision owner LayerNorm Q/SX requires original epsilon 1e-6");
+    // The existing exact-root alias is safe only after reduce-scatter has
+    // consumed the full FP16 partial. Preserve that input extent in validation.
+    const auto base = check_vision_operands({
+        {partial, full_bytes}, {residual, full_bytes},
+        {compact_raw, full_bytes / 8}, {output_int8, full_bytes / 2},
+        {gamma, VisionAffineBytes}, {beta, VisionAffineBytes},
+        {row_scale, static_cast<uint32_t>(rows) * 2}}, true);
+    const auto id = rows == 512
+        ? KernelId::PI05_VISION_OWNER_LAYERNORM_QUANTIZE_W8A8_M512N1152
+        : KernelId::PI05_VISION_OWNER_LAYERNORM_QUANTIZE_W8A8_M768N1152;
+    TORCH_CHECK(KernelCache::instance().has_loaded(id),
+                "Pi Vision owner LayerNorm Q/SX requires the complete expansion payload");
+    launch_vision_owner(id, base, partial, residual, compact_raw, output_int8,
+                       gamma, beta, true, eps, rows, row_scale);
 }
 
 void rpu_launch_pi05_vision_compact_residual_spm_kernel(

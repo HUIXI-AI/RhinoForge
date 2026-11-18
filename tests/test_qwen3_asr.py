@@ -1,5 +1,7 @@
 """Host-only admission, preprocessing and ownership checks for the ASR profile."""
 from types import SimpleNamespace
+import hashlib
+import json
 
 import numpy as np
 import pytest
@@ -23,23 +25,153 @@ def test_unreviewed_config_rejected_before_loading(tmp_path, monkeypatch):
         Qwen3ASRModel.from_pretrained(tmp_path)
 
 
+@pytest.mark.parametrize("version", ["5.3.0", "5.19.0"])
+def test_reviewed_transformers_versions_reach_checkpoint_checks(tmp_path, monkeypatch, version):
+    monkeypatch.setattr("importlib.metadata.version", lambda _: version)
+    with pytest.raises(UnsupportedModelError, match="config.json"):
+        asr._preflight(tmp_path, torch.float16)
+
+
+@pytest.mark.parametrize("version", ["4.57.3", "5.18.0", "5.19.1"])
+def test_unreviewed_transformers_rejected_before_checkpoint(tmp_path, monkeypatch, version):
+    monkeypatch.setattr("importlib.metadata.version", lambda _: version)
+    with pytest.raises(UnsupportedModelError, match="transformers==5.3.0 or ==5.19.0"):
+        asr._preflight(tmp_path / "missing", torch.float16)
+
+
+def _empty_checkpoint(tmp_path, monkeypatch):
+    (tmp_path / "config.json").write_text('{"thinker_config":{}}')
+    (tmp_path / "model.safetensors").touch()
+    digest = hashlib.sha256((tmp_path / "config.json").read_bytes()).hexdigest()
+    monkeypatch.setattr(asr, "_IDENTITIES", {})
+    monkeypatch.setattr(asr, "_PROFILES", {digest: {
+        "index": None, "weights": {"model.safetensors": (0, hashlib.sha256(b"").hexdigest())}}})
+
+
 @pytest.mark.parametrize("extra", ["tokenizer.json", "added_tokens.json", "special_tokens_map.json"])
 def test_tokenizer_overrides_rejected_before_loading(tmp_path, monkeypatch, extra):
-    monkeypatch.setattr(asr, "_IDENTITIES", {})
-    monkeypatch.setattr(asr, "_WEIGHT_SIZE", 0)
-    (tmp_path / "model.safetensors").touch()
+    _empty_checkpoint(tmp_path, monkeypatch)
     (tmp_path / extra).write_text("{}")
     with pytest.raises(UnsupportedModelError, match="original tokenizer files"):
         asr._preflight(tmp_path, torch.float16)
 
 
 def test_old_native_rejected_before_loading(tmp_path, monkeypatch):
-    monkeypatch.setattr(asr, "_IDENTITIES", {})
-    monkeypatch.setattr(asr, "_WEIGHT_SIZE", 0)
+    _empty_checkpoint(tmp_path, monkeypatch)
     monkeypatch.setattr(torch.ops, "rpu", SimpleNamespace())
-    (tmp_path / "model.safetensors").touch()
     with pytest.raises(UnsupportedModelError, match="rebuilt native backend"):
         asr._preflight(tmp_path, torch.float16)
+
+
+@pytest.mark.parametrize("extra", ["unreviewed.safetensors", "model.safetensors.index.json"])
+def test_extra_weight_inputs_rejected(tmp_path, monkeypatch, extra):
+    _empty_checkpoint(tmp_path, monkeypatch)
+    (tmp_path / extra).write_text("{}")
+    with pytest.raises(UnsupportedModelError, match="unexpected weight"):
+        asr._preflight(tmp_path, torch.float16)
+
+
+@pytest.mark.parametrize("precision,execution", [
+    ("w4a16", None), ("bf16", None), ("fp16", {"model": {"num_cores": 5}}),
+    ("w8a16", {"model": {"num_cores": True}}), ("w4a16_g32", {"prefill": {"linear_acc32": 1}}),
+])
+def test_invalid_precision_rejects_before_checkpoint(tmp_path, monkeypatch, precision, execution):
+    monkeypatch.setattr(asr, "_preflight", lambda *args: pytest.fail("checkpoint accessed"))
+    with pytest.raises(ValueError):
+        Qwen3ASRModel.from_pretrained(tmp_path, precision=precision, rpu_execution=execution)
+
+
+def _write_weight_shards(tmp_path, shards):
+    from safetensors.torch import save_file
+
+    profile = {"index": "test-index", "weights": {}}
+    weight_map = {}
+    for filename, tensors in shards.items():
+        path = tmp_path / filename
+        save_file(tensors, path)
+        profile["weights"][filename] = (path.stat().st_size, hashlib.sha256(path.read_bytes()).hexdigest())
+        weight_map.update({name: filename for name in tensors})
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+    return profile
+
+
+def test_original_embedding_and_head_remain_distinct_across_shards(tmp_path):
+    embedding = torch.arange(8, dtype=torch.bfloat16).reshape(4, 2)
+    head = embedding + 8
+    profile = _write_weight_shards(tmp_path, {
+        "first.safetensors": {"thinker.model.embed_tokens.weight": embedding},
+        "second.safetensors": {"thinker.lm_head.weight": head},
+    })
+    states = asr._read_frozen_weights(tmp_path, profile, {
+        "thinker.model.embed_tokens.weight": (4, 2), "thinker.lm_head.weight": (4, 2)})
+    torch.testing.assert_close(states["thinker.model.embed_tokens.weight"], embedding.half())
+    torch.testing.assert_close(states["thinker.lm_head.weight"], head.half())
+    assert states["thinker.model.embed_tokens.weight"].data_ptr() != states["thinker.lm_head.weight"].data_ptr()
+
+
+def test_component_loader_preserves_original_head_and_float32_rope(tmp_path, monkeypatch):
+    import transformers
+    from transformers.models.qwen3_omni_moe import modeling_qwen3_omni_moe as audio_module
+    from transformers.models.qwen3 import modeling_qwen3 as text_module
+
+    class Audio(torch.nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.proj = torch.nn.Linear(2, 2, bias=False)
+
+    class Text(torch.nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.embed_tokens = torch.nn.Embedding(config.vocab_size, config.hidden_size)
+            self.rotary_emb = torch.nn.Module()
+            self.rotary_emb.register_buffer("inv_freq", torch.tensor([1 / 8193]), persistent=False)
+
+    monkeypatch.setattr(text_module, "Qwen3Model", Text)
+    monkeypatch.setattr(transformers, "Qwen3Model", Text)
+    monkeypatch.setattr(audio_module, "Qwen3OmniMoeAudioEncoder", Audio)
+    embedding = torch.arange(8, dtype=torch.bfloat16).reshape(4, 2)
+    head = embedding + 8
+    profile = _write_weight_shards(tmp_path, {
+        "first.safetensors": {"thinker.model.embed_tokens.weight": embedding,
+                              "thinker.audio_tower.proj.weight": torch.ones(2, 2, dtype=torch.bfloat16)},
+        "second.safetensors": {"thinker.lm_head.weight": head},
+    })
+    monkeypatch.setattr(asr, "_checkpoint_profile", lambda path: profile)
+    _, text, loaded_head = asr._load_components(tmp_path, {"audio_config": {}, "text_config": {
+        "hidden_size": 2, "vocab_size": 4, "rope_scaling": {}, "rope_theta": 1000000,
+        "num_attention_heads": 1, "num_key_value_heads": 1, "head_dim": 2}})
+    torch.testing.assert_close(text.embed_tokens.weight, embedding.half())
+    torch.testing.assert_close(loaded_head, head.half())
+    assert loaded_head.data_ptr() != text.embed_tokens.weight.data_ptr()
+    assert text.rotary_emb.inv_freq.dtype == torch.float32
+    torch.testing.assert_close(text.rotary_emb.inv_freq, torch.tensor([1 / 8193]), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("failure", ["missing", "wrong-shard", "duplicate", "shape", "dtype", "nonfinite", "hash"])
+def test_frozen_shards_reject_corrupt_payloads(tmp_path, failure):
+    first = torch.ones(4, 2, dtype=torch.bfloat16)
+    second = torch.zeros_like(first)
+    if failure == "shape":
+        second = second.reshape(2, 4)
+    elif failure == "dtype":
+        second = second.half()
+    elif failure == "nonfinite":
+        second[0, 0] = float("inf")
+    profile = _write_weight_shards(tmp_path, {
+        "first.safetensors": {"embedding": first},
+        "second.safetensors": {"head": second, **({"embedding": first} if failure == "duplicate" else {})},
+    })
+    expected = {"embedding": (4, 2), "head": (4, 2)}
+    if failure == "missing":
+        expected["layer"] = (2, 2)
+    elif failure == "wrong-shard":
+        (tmp_path / "model.safetensors.index.json").write_text(json.dumps({
+            "weight_map": {"embedding": "second.safetensors", "head": "first.safetensors"}}))
+    elif failure == "hash":
+        size, digest = profile["weights"]["second.safetensors"]
+        profile["weights"]["second.safetensors"] = (size, "0" * 64)
+    with pytest.raises(UnsupportedModelError):
+        asr._read_frozen_weights(tmp_path, profile, expected)
 
 
 @pytest.mark.parametrize("audio,rate,tokens", [
@@ -182,12 +314,17 @@ def test_decoder_install_bounds_graphs_to_leave_audio_launch_capacity(monkeypatc
     model = Qwen3ASRModel()
     table = torch.zeros(1, 512, 128, dtype=torch.float16)
     model._text = SimpleNamespace(
-        rotary_emb=lambda *args: (table, table),
+        config=SimpleNamespace(hidden_size=1024, intermediate_size=3072, num_attention_heads=16,
+            num_hidden_layers=28, num_key_value_heads=8, head_dim=128, vocab_size=151936),
+        rotary_emb=lambda *args: (table, table), layers=[],
         embed_tokens=SimpleNamespace(weight=torch.zeros(1, 1024, dtype=torch.float16)),
         to=lambda device: None,
     )
-    monkeypatch.setattr(topology, "resolve_decoder_topology", lambda **kwargs: object())
-    monkeypatch.setattr(weights, "convert_linear_weights_inplace", lambda model: None)
+    model._head_cpu_weight = torch.zeros(1, 1024, dtype=torch.float16)
+    from rpu_backend.api import _qwen3_audio_precision as precision
+    monkeypatch.setattr(precision, "pack_audio_linear", lambda weight, *args, **kwargs: (weight, None))
+    monkeypatch.setattr(topology, "resolve_decoder_topology", lambda **kwargs:
+        SimpleNamespace(num_cores=8, attn_tp=8, mlp_tp=8, lm_head_tp=8))
 
     def install(model, **kwargs):
         captured.update(kwargs)
@@ -197,6 +334,102 @@ def test_decoder_install_bounds_graphs_to_leave_audio_launch_capacity(monkeypatc
     with pytest.raises(RuntimeError, match="stop before audio"):
         model._install_rpu()
     assert captured["_graph_cache_max_entries"] == 2
+
+
+@pytest.mark.parametrize("precision,dtype", [("fp16", torch.float16), ("w8a16", torch.int8),
+                                           ("w4a16_g32", torch.uint8), ("nvfp4", torch.uint8)])
+@pytest.mark.parametrize("acc32", [False, True])
+def test_decoder_packing_keeps_embedding_and_binds_actual_scales(monkeypatch, precision, dtype, acc32):
+    from rpu_backend.adapters import qwen3
+    from rpu_backend.api import _qwen3_audio_precision as packing
+    from rpu_backend.runtime import decoder, topology
+
+    text = torch.nn.Module()
+    text.config = SimpleNamespace(hidden_size=1024, intermediate_size=3072, num_attention_heads=16,
+        num_hidden_layers=28, num_key_value_heads=8, head_dim=128, vocab_size=151936)
+    text.embed_tokens = torch.nn.Embedding(16, 512, dtype=torch.float16)
+    layer = torch.nn.Module()
+    layer.self_attn, layer.mlp = torch.nn.Module(), torch.nn.Module()
+    for group, names in ((layer.self_attn, ("q_proj", "k_proj", "v_proj", "o_proj")),
+                         (layer.mlp, ("gate_proj", "up_proj", "down_proj"))):
+        for name in names:
+            # Small real matrices satisfy both column and row packing geometry.
+            setattr(group, name, torch.nn.Linear(512, 128, bias=False, dtype=torch.float16))
+    if precision == "nvfp4":
+        from copy import deepcopy
+        text.layers = torch.nn.ModuleList([layer, *[deepcopy(layer) for _ in range(27)]])
+    else:
+        text.layers = torch.nn.ModuleList([layer])
+    tables = torch.zeros(1, 512, 128, dtype=torch.float16)
+    text.rotary_emb = lambda *args: (tables, tables)
+    text.to = lambda device: text
+    embedding = text.embed_tokens.weight.detach().clone()
+    original_head = torch.full((128, 512), 0.25, dtype=torch.float16)
+    model = Qwen3ASRModel()
+    model._text, model._head_cpu_weight = text, original_head
+    model._precision, model._linear_acc32 = precision, acc32
+    model._head_precision = "fp16" if precision == "nvfp4" else precision
+    head_dtype = torch.float16 if precision == "nvfp4" else dtype
+    packed_head = []
+    real_pack = packing.pack_audio_linear
+
+    def pack(weight, partition, precision, *, bounded_head=False, num_cores=8):
+        if bounded_head:
+            assert weight is original_head
+        result = real_pack(weight, partition, precision, bounded_head=bounded_head, num_cores=num_cores)
+        if bounded_head:
+            packed_head.append(result)
+        return result
+
+    monkeypatch.setattr(packing, "pack_audio_linear", pack)
+    monkeypatch.setattr(topology, "resolve_decoder_topology", lambda **kwargs:
+        SimpleNamespace(num_cores=8, attn_tp=8, mlp_tp=8, lm_head_tp=8))
+    original_to = torch.Tensor.to
+    monkeypatch.setattr(torch.Tensor, "to", lambda tensor, *args, **kwargs:
+        tensor if args == ("rpu",) else original_to(tensor, *args, **kwargs))
+    captured = {}
+
+    def install(inner, **kwargs):
+        assert inner is text
+        captured.update(kwargs)
+        # The real installer takes a new canonical snapshot, including its
+        # padding policy. The outer head must use this completed snapshot.
+        inner._rpu_execution = {"model": {"num_cores": 8},
+                                "prefill": {"linear_acc32": acc32, "padding_budget": 17}}
+
+    def fused(outer, *, _audio_precision):
+        assert _audio_precision == model._head_precision
+        assert outer._rpu_execution is text._rpu_execution
+        assert outer.lm_head.weight.dtype == head_dtype
+        assert outer.lm_head._rpu_linear_partition == 1
+        assert getattr(outer.lm_head, "weight_scale", None) is model._head_scale
+        raise RuntimeError("host packing complete")
+
+    monkeypatch.setattr(decoder, "_install_causal_decoder_forward", install)
+    monkeypatch.setattr(qwen3, "_apply_fused_lm_head_for_rpu", fused)
+    with pytest.raises(RuntimeError, match="host packing complete"):
+        model._install_rpu()
+    assert captured["_audio_component"] == "asr"
+    assert captured["execution_config"] == {"model": {"num_cores": 8}, "prefill": {"linear_acc32": acc32}}
+    torch.testing.assert_close(text.embed_tokens.weight, embedding)
+    assert text.embed_tokens.weight.dtype == torch.float16
+    assert packed_head[0][0].dtype == head_dtype
+    if precision == "nvfp4":
+        assert captured["nvfp4_tensor_scales"] is model._nvfp4_tensor_scales
+        assert len(model._nvfp4_tensor_scales) == 7
+        for scale in model._nvfp4_tensor_scales:
+            assert scale.dtype == torch.float32 and scale.shape == (32,)
+            assert torch.all(scale[28:] == 1)
+    roles = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
+             "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
+    for index, role in enumerate(roles):
+        linear = layer.get_submodule(role)
+        assert linear.weight.dtype == dtype
+        if precision == "fp16":
+            assert captured["scale_lists"] is None
+        else:
+            assert captured["scale_lists"][index][0] is linear.weight_scale
+            assert linear.weight_scale.dtype == (torch.uint8 if precision == "nvfp4" else torch.float16)
 
 
 def test_shape_switch_releases_graphs_before_audio_and_same_shape_replays(monkeypatch):
@@ -241,6 +474,7 @@ def test_request_reuses_kv_storage_and_resets_position_after_failure(monkeypatch
         return cache
     monkeypatch.setattr(cache_module, "RPUCache", allocate)
     model = Qwen3ASRModel()
+    model._topology = SimpleNamespace(attn_tp=8)
     def audio(*args, **kwargs):
         assert cache.position == 0
         cache.position = 17
@@ -265,6 +499,7 @@ def test_causal_lm_logits_keep_finite_rejection_and_eos(monkeypatch, invalid):
     monkeypatch.setattr(Qwen3ASRModel, "_embed_tokens", lambda self, ids, features=None:
         torch.zeros(*ids.shape, 1024, dtype=torch.float16))
     model = Qwen3ASRModel()
+    model._topology = SimpleNamespace(attn_tp=8)
     model._audio = lambda *args, **kwargs: SimpleNamespace(
         last_hidden_state=torch.zeros(1, 1024, dtype=torch.float16))
     logits = torch.zeros(1, 1, 151646, dtype=torch.float16)
@@ -333,7 +568,8 @@ def test_resident_audio_rejects_multiple_utterances_before_execution():
         encoder.forward(torch.zeros(128, 100, dtype=torch.float16), feature_lens=torch.tensor([50, 50]))
 
 
-def test_resident_graph_returns_final_projection_and_counts_both_projections(monkeypatch):
+@pytest.mark.parametrize("width,output_width", [(896, 1024), (1024, 2048)])
+def test_resident_graph_returns_final_projection_and_counts_both_projections(monkeypatch, width, output_width):
     from contextlib import nullcontext
     from rpu_backend.adapters import siglip
     from rpu_backend.api._qwen3_asr_audio import ResidentAudioEncoder
@@ -342,7 +578,8 @@ def test_resident_graph_returns_final_projection_and_counts_both_projections(mon
     monkeypatch.setattr(torch.Tensor, "to", lambda value, *args, **kwargs:
         value if args == ("rpu",) else original_to(value, *args, **kwargs))
     cleared = []
-    encoder = ResidentAudioEncoder(None, {"layers.0.fc1": 0, "proj1": 0, "proj2": 0, "conv_out": 0})
+    audio = SimpleNamespace(config=SimpleNamespace(d_model=width))
+    encoder = ResidentAudioEncoder(audio, {"layers.0.fc1": 0, "proj1": 0, "proj2": 0, "conv_out": 0})
     encoder.handle = 1
     encoder.graph = SimpleNamespace(clear=lambda: cleared.append(True), capture=lambda signature: nullcontext())
     encoder.cache = SimpleNamespace(k_caches=[], v_caches=[])
@@ -351,23 +588,25 @@ def test_resident_graph_returns_final_projection_and_counts_both_projections(mon
     monkeypatch.setattr(siglip, "_siglip_component_execution_plan", lambda *args, **kwargs: plan)
     monkeypatch.setattr(torch.rpu, "GraphSignature", lambda **kwargs: kwargs, raising=False)
     monkeypatch.setattr(torch.ops, "rpu", SimpleNamespace(
-        siglip_forward=lambda handle, inputs, *args: inputs[:, :, :1].expand(-1, -1, 1024).clone(),
+        siglip_forward=lambda handle, inputs, *args: inputs[:, :, :1].expand(-1, -1, output_width).clone(),
         spm_alloc_reset_temporary=lambda: None))
-    first = encoder.encode(torch.ones(7, 896, dtype=torch.float16))
-    second = encoder.encode(torch.full((7, 896), 2, dtype=torch.float16))
-    assert first.shape == second.shape == (7, 1024)
+    first = encoder.encode(torch.ones(7, width, dtype=torch.float16))
+    second = encoder.encode(torch.full((7, width), 2, dtype=torch.float16))
+    assert first.shape == second.shape == (7, output_width)
     assert torch.all(first == 1) and torch.all(second == 2)
     assert cleared == [True] and encoder.calls == 2
     assert encoder.counters == {"layers.0.fc1": 2, "proj1": 2, "proj2": 2, "conv_out": 0}
 
 
-def test_device_embedding_assembly_and_decode(monkeypatch):
+@pytest.mark.parametrize("hidden_size", [1024, 2048])
+def test_device_embedding_assembly_and_decode(monkeypatch, hidden_size):
     monkeypatch.setattr(asr, "_AUDIO_TOKEN_ID", 4)
     original_to = torch.Tensor.to
     monkeypatch.setattr(torch.Tensor, "to", lambda value, *args, **kwargs:
         value if args == ("rpu",) else original_to(value, *args, **kwargs))
-    weight = torch.arange(8 * 1024, dtype=torch.float32).reshape(8, 1024).half()
+    weight = torch.arange(8 * hidden_size, dtype=torch.float32).reshape(8, hidden_size).half()
     model = Qwen3ASRModel()
+    model._hidden_size = hidden_size
     model._text = SimpleNamespace(embed_tokens=SimpleNamespace(weight=weight))
     model._embedding_weight = weight
     calls = []
@@ -383,7 +622,7 @@ def test_device_embedding_assembly_and_decode(monkeypatch):
     monkeypatch.setattr(torch.ops, "rpu", SimpleNamespace(
         gather_embedding=gather, assemble_inputs_embeds=assemble))
     ids = torch.tensor([[1, 4, 4, 7]])
-    features = torch.full((2, 1024), -3, dtype=torch.float16)
+    features = torch.full((2, hidden_size), -3, dtype=torch.float16)
     value = model._embed_tokens(ids, features)
     expected = weight[ids].clone()
     expected[:, 1:3] = features
@@ -403,7 +642,8 @@ def test_device_embedding_assembly_and_decode(monkeypatch):
 
 
 @pytest.mark.parametrize("frames", [50, 99, 100, 101, 420, 800])
-def test_resident_frontend_keeps_only_the_valid_chunk_prefix(monkeypatch, frames):
+@pytest.mark.parametrize("hidden_size", [896, 1024])
+def test_resident_frontend_keeps_only_the_valid_chunk_prefix(monkeypatch, frames, hidden_size):
     from rpu_backend.api._qwen3_asr_audio import ResidentAudioEncoder
 
     original_to = torch.Tensor.to
@@ -412,15 +652,15 @@ def test_resident_frontend_keeps_only_the_valid_chunk_prefix(monkeypatch, frames
     monkeypatch.setattr(torch.nn.functional, "gelu", lambda value: value)
     def convolution(value):
         batch, width = value.shape[0], (value.shape[-1] + 7) // 8
-        return torch.arange(batch * width, dtype=torch.float16).reshape(batch, 1, 1, width).expand(-1, 896, 1, -1)
-    audio = SimpleNamespace(conv2d1=lambda value: value, conv2d2=lambda value: value,
+        return torch.arange(batch * width, dtype=torch.float16).reshape(batch, 1, 1, width).expand(-1, hidden_size, 1, -1)
+    audio = SimpleNamespace(config=SimpleNamespace(d_model=hidden_size), conv2d1=lambda value: value, conv2d2=lambda value: value,
                             conv2d3=convolution, conv_out=lambda value: value, proj2=lambda value: value)
     encoder = ResidentAudioEncoder(audio, {})
-    encoder.positions = torch.arange(13, dtype=torch.float16).reshape(1, 13, 1).expand(8, 13, 896).contiguous()
+    encoder.positions = torch.arange(13, dtype=torch.float16).reshape(1, 13, 1).expand(8, 13, hidden_size).contiguous()
     encoder.encode = lambda value: value
     result = encoder.forward(torch.zeros(128, frames, dtype=torch.float16),
                              feature_lens=torch.tensor([frames])).last_hidden_state
     width = (min(frames, 100) + 7) // 8
     expected = [i * width + 2 * j for i, start in enumerate(range(0, frames, 100))
                 for j in range((min(100, frames - start) + 7) // 8)]
-    assert torch.equal(result, torch.tensor(expected, dtype=torch.float16)[:, None].expand(-1, 896))
+    assert torch.equal(result, torch.tensor(expected, dtype=torch.float16)[:, None].expand(-1, hidden_size))

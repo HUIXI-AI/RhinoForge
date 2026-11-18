@@ -18,9 +18,11 @@
 
 #include "rpu_ops.h"
 #include "rpu_host_argmax.h"
+#include "rpu_host_sample.h"
 #include "rpu_tensor_ops.h"
 #include "rpu_profile.h"
 #include "graph/execution_coordinator.h"
+#include "graph/graph_async_end.h"
 
 #include "rpu_runtime_state.h"  // v5-07: g_chunk_size_override + g_debug_tensors + 9 accessors (D-06)
 
@@ -614,6 +616,52 @@ at::Tensor rpu_argmax_lastdim_host(const at::Tensor& logits) {
               "argmax_lastdim_host expects 2-D [rows, cols] logits, got ",
               logits.dim(), "-D");
   return host_top1_impl(logits, /*copy_result_to_rpu=*/false);
+}
+
+std::tuple<at::Tensor, at::Tensor> rpu_argmax_lastdim_host_values(
+    const at::Tensor& logits) {
+  const bool on_rpu = logits.device().type() == c10::DeviceType::PrivateUse1;
+  TORCH_CHECK(on_rpu || logits.device().is_cpu(),
+              "argmax_lastdim_host_values: logits must be on CPU or RPU, got ",
+              logits.device());
+  TORCH_CHECK(logits.dim() == 2,
+              "argmax_lastdim_host_values expects 2-D [rows, cols] logits, got ",
+              logits.dim(), "-D");
+  TORCH_CHECK(logits.scalar_type() == at::kHalf ||
+                  (!on_rpu && logits.scalar_type() == at::kFloat),
+              "argmax_lastdim_host_values: logits must be fp16 (or CPU fp32), got ",
+              logits.scalar_type());
+  TORCH_CHECK(logits.is_contiguous(),
+              "argmax_lastdim_host_values: logits must be contiguous");
+  TORCH_CHECK(logits.size(1) > 0,
+              "argmax_lastdim_host_values: empty last dimension");
+  const at::Tensor cpu_logits =
+      on_rpu ? rpu_to_cpu_zerocopy(logits, /*flush=*/true) : logits;
+  return rpu::host_argmax::reduce_cpu_rows_with_values(cpu_logits);
+}
+
+at::Tensor rpu_sample_topk_lastdim_host(
+    const at::Tensor& logits, double temperature, int64_t top_k,
+    std::optional<at::Generator> generator) {
+  if (logits.device().is_cpu()) {
+    return rpu::host_sample::sample_topk_lastdim_cpu(
+        logits, temperature, top_k, std::move(generator));
+  }
+  TORCH_CHECK(logits.device().type() == c10::DeviceType::PrivateUse1,
+              "host topk sample: logits must be on CPU or RPU, got ",
+              logits.device());
+  // The RPU side is read in place as FP16, as the greedy top1 route is; FP32 is
+  // the CPU compatibility entry the fixed TTS recipe actually hands over.
+  TORCH_CHECK(logits.scalar_type() == at::kHalf,
+              "host topk sample: RPU logits must be fp16, got ",
+              logits.scalar_type());
+  TORCH_CHECK(logits.dim() == 2,
+              "sample_topk_lastdim_host expects 2-D [rows, cols] logits, got ",
+              logits.dim(), "-D");
+  TORCH_CHECK(logits.is_contiguous(), "host topk sample: logits must be contiguous");
+  return rpu::host_sample::sample_topk_lastdim_cpu(
+      rpu_to_cpu_zerocopy(logits, /*flush=*/true), temperature, top_k,
+      std::move(generator));
 }
 
 void rpu_zero_contiguous_tensor_blocks_sized(

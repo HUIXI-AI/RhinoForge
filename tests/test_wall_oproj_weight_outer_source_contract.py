@@ -1,3 +1,5 @@
+from pi_wall_host_catalog import assert_current_catalog, CATALOG_INCLUDE
+from test_siglip_attention_dry_live_contract import _function
 """Board-free contract for exact Wall P640 O-proj weight reuse."""
 
 from pathlib import Path
@@ -14,34 +16,17 @@ LAUNCHER = "rpu_launch_wall_prefill_oproj_w8a16_c320x2_spm_kernel("
 
 
 def test_exact_oproj_launcher_preserves_typed_ddr_and_multicore_abi():
-    kernel_id = "WALL_OPROJ_WEIGHT_OUTER_W8A16_C320X2_N64"
-    assert kernel_id in CACHE_H
-    assert f"KernelId::{kernel_id}" in CACHE_INC
-    assert f'"{SYMBOL}"' in CACHE_H
-    assert f'"{SYMBOL}"' in CACHE_INC
-    assert LAUNCHER in DECLS
-
-    start = LINEAR.index(f"void {LAUNCHER}")
-    launcher = LINEAR[start:]
-    for geometry in (
-        "constexpr int64_t kM = 640;",
-        "constexpr int64_t kN = 2048;",
-        "constexpr int64_t kK = 2048;",
-        "constexpr int64_t kLocalK = kK / NUM_CORES;",
-    ):
-        assert geometry in launcher
+    assert_current_catalog("PairedLinear")
+    launcher=_function(LINEAR,"void rpu_launch_wall_prefill_oproj_w8a16_c320x2_spm_kernel(")
     assert launcher.count("GraphDdrRegisterOperandSpec{") == 2
     assert launcher.count("GraphDdrRegisterRole::Int8ModelWeight") == 1
     assert launcher.count("GraphDdrRegisterRole::PerChannelScale") == 1
-    assert "DevAddrShift8LoHi, 2, 3" in launcher
-    assert "DevAddrShift8LoHi, 20, 21" in launcher
-    assert "kernel->set_regs(24, static_cast<uint16_t>(output1_spm_addr));" in launcher
-    assert "kernel->set_regs(25, static_cast<uint16_t>(output1_spm_addr >> 16));" in launcher
-    assert "queue->set_broadcast_mode(true);" in launcher
-    assert "queue->enqueu_kernel(*kernel, {32, 1, 1}, cores);" in launcher
-    assert launcher.index("register_writer.write(*kernel);") < launcher.index(
-        "queue->enqueu_kernel("
-    )
+    for pair in ("2, 3","20, 21"):
+        assert "DevAddrShift8LoHi, "+pair in launcher
+    for contract in ("Operation::PairedLinear", "48, input0_spm_addr + (kM / 2) * kLocalK", "50, output1_spm_addr",
+                     "set_regs(52", "register_writer.write(*kernel);", "queue->set_broadcast_mode(true);",
+                     "{selected.grid_x, selected.grid_y, 1}"):
+        assert contract in launcher
 
 
 def test_only_layers4_to35_reorder_sdpa_and_use_inplace_carriers():

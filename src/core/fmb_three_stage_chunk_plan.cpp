@@ -13,10 +13,24 @@ namespace {
 constexpr int64_t kPrefillStageCandidateDescriptorVersionV1 = 1;
 constexpr int64_t kPrefillStageCandidateDescriptorVersionV2 = 2;
 constexpr int64_t kPrefillStageCandidateDescriptorVersion = 3;
+constexpr int64_t kPrefillStageCandidateDescriptorVersionV4 = 4;
 constexpr int64_t kPrefillStageDomainDescriptorVersion = 1;
 constexpr size_t kPrefillStageCandidateHeaderWords = 15;
 constexpr size_t kPhysicalManifestHeaderWords = 11;
 constexpr size_t kMaxPrefillStageCandidateDescriptorWords = 65536;
+
+void validate_prefill_ranking(const FmbPrefillStageCandidate& candidate) {
+    const auto& rank = candidate.ranking;
+    const bool legacy = rank.policy == FmbPrefillRankingPolicy::LEGACY;
+    TORCH_CHECK(
+        (legacy && rank.mixer_calls == 0) ||
+        ((rank.policy == FmbPrefillRankingPolicy::OUTER_THEN_MIXER_V1 ||
+          rank.policy == FmbPrefillRankingPolicy::OUTER_THEN_MIXER_LARGER_WINDOW_V2) &&
+         candidate.physical_manifest.state == FmbPhysicalManifestState::COMPLETE &&
+         rank.mixer_calls >= static_cast<int64_t>(candidate.stage_plan.compute.chunks.size()) &&
+         rank.mixer_calls <= candidate.physical_manifest.physical_length),
+        "RPU_PLANNER_REJECT:CAPABILITY: invalid prefill ranking policy or mixer count");
+}
 
 ResolvedFmbStageChunks make_stage(std::vector<ChunkInfo> chunks) {
     return {{chunks.empty() ? 0 : chunks.front().len,
@@ -290,22 +304,61 @@ bool fmb_prefill_stage_candidate_less(
                lhs.input_chunk_size, lhs.qkv_chunk_size,
                lhs.compute_chunk_size,
                physical_capability_rank(lhs.physical_manifest),
-               fmb_physical_manifest_fingerprint(lhs.physical_manifest)) <
+               fmb_physical_manifest_fingerprint(lhs.physical_manifest),
+               lhs.ranking.policy, lhs.ranking.mixer_calls) <
         std::make_tuple(
                rhs.input_chunk_size, rhs.qkv_chunk_size,
                rhs.compute_chunk_size,
                physical_capability_rank(rhs.physical_manifest),
-               fmb_physical_manifest_fingerprint(rhs.physical_manifest));
+               fmb_physical_manifest_fingerprint(rhs.physical_manifest),
+               rhs.ranking.policy, rhs.ranking.mixer_calls);
 }
 
 bool fmb_prefill_stage_candidate_same_identity(
     const FmbPrefillStageCandidate& lhs,
     const FmbPrefillStageCandidate& rhs) {
-    return lhs.input_chunk_size == rhs.input_chunk_size &&
+    return lhs.ranking.policy == rhs.ranking.policy &&
+        lhs.ranking.mixer_calls == rhs.ranking.mixer_calls &&
+        lhs.input_chunk_size == rhs.input_chunk_size &&
         lhs.qkv_chunk_size == rhs.qkv_chunk_size &&
         lhs.compute_chunk_size == rhs.compute_chunk_size &&
         fmb_physical_manifest_fingerprint(lhs.physical_manifest) ==
             fmb_physical_manifest_fingerprint(rhs.physical_manifest);
+}
+
+std::vector<uint64_t> fmb_prefill_stage_candidate_score(
+    const FmbPrefillStageCandidate& candidate) {
+    validate_prefill_ranking(candidate);
+    const auto& plan = candidate.stage_plan;
+    const int64_t total = validate_stage(plan.input, "rank input").total;
+    const auto deficit = [](int64_t capacity, const ResolvedFmbStageChunks& stage) {
+        return capacity - stage.chunks.back().len;
+    };
+    std::vector<uint64_t> score{std::max({plan.input.chunks.size(),
+        plan.qkv.chunks.size(), plan.compute.chunks.size()})};
+    if (candidate.ranking.policy != FmbPrefillRankingPolicy::LEGACY)
+        score.push_back(static_cast<uint64_t>(candidate.ranking.mixer_calls));
+    const auto& manifest = candidate.physical_manifest;
+    score.push_back(static_cast<uint64_t>(manifest.state == FmbPhysicalManifestState::COMPLETE
+        ? total - manifest.logical_length : 0));
+    if (candidate.ranking.policy == FmbPrefillRankingPolicy::OUTER_THEN_MIXER_LARGER_WINDOW_V2)
+        // Unsigned order equivalent to Python's -compute_chunk_size. Keep the
+        // full uint64 manifest fingerprint as the final stable tie-breaker.
+        score.push_back(std::numeric_limits<uint64_t>::max() -
+                        static_cast<uint64_t>(candidate.compute_chunk_size));
+    score.insert(score.end(), {
+        static_cast<uint64_t>(std::max({deficit(candidate.input_chunk_size, plan.input),
+            deficit(candidate.qkv_chunk_size, plan.qkv),
+            deficit(candidate.compute_chunk_size, plan.compute)})),
+        static_cast<uint64_t>(candidate.input_chunk_size),
+        static_cast<uint64_t>(candidate.qkv_chunk_size),
+        static_cast<uint64_t>(candidate.compute_chunk_size)});
+    if (manifest.state == FmbPhysicalManifestState::COMPLETE) {
+        const auto [ddr_sites, rope_rank] = physical_capability_rank(manifest);
+        score.insert(score.end(), {static_cast<uint64_t>(ddr_sites),
+            static_cast<uint64_t>(rope_rank), fmb_physical_manifest_fingerprint(manifest)});
+    }
+    return score;
 }
 
 }  // namespace detail
@@ -340,7 +393,7 @@ int64_t fmb_ring_all_reduce_route_selector(int64_t rows, int64_t cols,
 
 int64_t fmb_ring_all_reduce_route_selector(int64_t rows, int64_t cols, bool pi05_xor3, int num_cores) {
     const bool exact = ((rows == 512 || rows == 768) && cols == 1152) ||
-        ((rows == 272 || rows == 288 || rows == 304 || rows == 320 || rows == 336 || rows == 400 || rows == 416 || rows == 432 || rows == 448 || rows == 464) && cols == 2048) || (rows == 50 && cols == 1024);
+        ((rows == 272 || rows == 288 || rows == 304 || rows == 320 || rows == 336 || rows == 400 || rows == 416 || rows == 432 || rows == 448 || rows == 464 || rows == 480) && cols == 2048) || ((rows == 50 || rows == 10) && cols == 1024);
     if (!pi05_xor3 || !exact || num_cores != 8) return fmb_ring_all_reduce_route_selector(rows, cols, num_cores);
     return static_cast<int64_t>(FmbSharedAllReduceRouteSelector::RING_PI05_XOR3);
 }
@@ -365,6 +418,7 @@ void append_fmb_shared_runtime_routes(
     constexpr uint32_t kKnownRoutes =
         FMB_SHARED_LAYER_INPUT_DMA |
         FMB_SHARED_LAYER_INPUT_ROW_RUN_DMA |
+        FMB_SHARED_LAYER_INPUT_SCATTER_DMA |
         FMB_SHARED_PIPELINE_INGRESS_DMA |
         FMB_SHARED_MLP_AUTO_TILE |
         FMB_SHARED_MLP_ACC32_OUT_BF16 |
@@ -412,6 +466,13 @@ void append_fmb_shared_runtime_routes(
             FmbRouteFamily::MUTABLE_DMA,
             static_cast<int64_t>(
                 FmbSharedMutableDmaRouteSelector::DDR_BROADCAST_TO_SPM));
+    }
+    if (route_mask & FMB_SHARED_LAYER_INPUT_SCATTER_DMA) {
+        append(
+            FMB_SHARED_LAYER_INPUT_SCATTER_DMA_SITE,
+            FmbRouteFamily::MUTABLE_DMA,
+            static_cast<int64_t>(
+                FmbSharedMutableDmaRouteSelector::DDR_SCATTER_TO_SPM));
     }
     if (route_mask & FMB_SHARED_PIPELINE_INGRESS_DMA) {
         append(
@@ -1048,6 +1109,8 @@ uint64_t fmb_three_stage_chunk_plan_fingerprint(
 
 std::vector<int64_t> encode_fmb_prefill_stage_candidate(
     const FmbPrefillStageCandidate& candidate) {
+    validate_prefill_ranking(candidate);
+    const bool ranked = candidate.ranking.policy != FmbPrefillRankingPolicy::LEGACY;
     validate_fmb_three_stage_chunk_plan(candidate.stage_plan);
     validate_candidate_capacity(
         candidate.input_chunk_size, candidate.stage_plan.input,
@@ -1072,7 +1135,7 @@ std::vector<int64_t> encode_fmb_prefill_stage_candidate(
              candidate.stage_plan.qkv.chunks.size() +
              candidate.stage_plan.compute.chunks.size()) +
         3 * candidate.stage_plan.spans.size() +
-        kPhysicalManifestHeaderWords;
+        kPhysicalManifestHeaderWords + (ranked ? 2 : 0);
     for (const FmbRouteManifestEntry& route :
          candidate.physical_manifest.routes) {
         TORCH_CHECK(
@@ -1097,7 +1160,8 @@ std::vector<int64_t> encode_fmb_prefill_stage_candidate(
     std::vector<int64_t> descriptor;
     descriptor.reserve(total_words);
     descriptor.insert(descriptor.end(), {
-        kPrefillStageCandidateDescriptorVersion,
+        ranked ? kPrefillStageCandidateDescriptorVersionV4
+               : kPrefillStageCandidateDescriptorVersion,
         static_cast<int64_t>(total_words),
         candidate.input_chunk_size,
         candidate.qkv_chunk_size,
@@ -1147,6 +1211,8 @@ std::vector<int64_t> encode_fmb_prefill_stage_candidate(
         descriptor.insert(
             descriptor.end(), route.arguments.begin(), route.arguments.end());
     }
+    if (ranked) descriptor.insert(descriptor.end(), {
+        static_cast<int64_t>(candidate.ranking.policy), candidate.ranking.mixer_calls});
     TORCH_INTERNAL_ASSERT(descriptor.size() == total_words);
     return descriptor;
 }
@@ -1162,12 +1228,15 @@ FmbPrefillStageCandidate decode_fmb_prefill_stage_candidate(
     TORCH_CHECK(
         descriptor_version == kPrefillStageCandidateDescriptorVersionV1 ||
             descriptor_version == kPrefillStageCandidateDescriptorVersionV2 ||
-            descriptor_version == kPrefillStageCandidateDescriptorVersion,
+            descriptor_version == kPrefillStageCandidateDescriptorVersion ||
+            descriptor_version == kPrefillStageCandidateDescriptorVersionV4,
         reject, "unsupported prefill stage descriptor version ",
         descriptor_version);
     TORCH_CHECK(
         descriptor[1] == static_cast<int64_t>(descriptor.size()),
         reject, "prefill stage descriptor length field is stale");
+    const bool ranked = descriptor_version == kPrefillStageCandidateDescriptorVersionV4;
+    const size_t physical_end = descriptor.size() - (ranked ? 2 : 0);
 
     auto decode_count = [&](size_t index, const char* role) {
         const int64_t value = descriptor[index];
@@ -1191,8 +1260,8 @@ FmbPrefillStageCandidate decode_fmb_prefill_stage_candidate(
                     "prefill stage descriptor payload size is inconsistent");
     } else {
         TORCH_CHECK(
-            stage_words <= descriptor.size() &&
-                descriptor.size() - stage_words >=
+            stage_words <= physical_end &&
+                physical_end - stage_words >=
                     kPhysicalManifestHeaderWords,
             reject, "prefill stage descriptor physical payload is truncated");
     }
@@ -1299,10 +1368,10 @@ FmbPrefillStageCandidate decode_fmb_prefill_stage_candidate(
         manifest.routes.reserve(static_cast<size_t>(raw_route_count));
         for (int64_t ordinal = 0; ordinal < raw_route_count; ++ordinal) {
             const size_t route_header_words =
-                descriptor_version == kPrefillStageCandidateDescriptorVersion
+                descriptor_version >= kPrefillStageCandidateDescriptorVersion
                     ? 6 : 5;
             TORCH_CHECK(
-                descriptor.size() - cursor >= route_header_words,
+                physical_end - cursor >= route_header_words,
                 reject, "physical manifest route is truncated");
             const int64_t raw_family = descriptor[cursor++];
             FmbRouteManifestEntry route;
@@ -1312,12 +1381,12 @@ FmbPrefillStageCandidate decode_fmb_prefill_stage_candidate(
             route.flags = descriptor[cursor++];
             const int64_t raw_argument_count = descriptor[cursor++];
             route.invocation =
-                descriptor_version == kPrefillStageCandidateDescriptorVersion
+                descriptor_version >= kPrefillStageCandidateDescriptorVersion
                     ? descriptor[cursor++] : 0;
             TORCH_CHECK(
                 raw_argument_count >= 0 &&
                     static_cast<uint64_t>(raw_argument_count) <=
-                        descriptor.size() - cursor,
+                        physical_end - cursor,
                 reject, "physical manifest route argument count exceeds its "
                         "payload");
             route.arguments.assign(
@@ -1327,7 +1396,7 @@ FmbPrefillStageCandidate decode_fmb_prefill_stage_candidate(
             manifest.routes.push_back(std::move(route));
         }
         TORCH_CHECK(
-            cursor == descriptor.size(), reject,
+            cursor == physical_end, reject,
             "prefill stage descriptor physical payload has trailing words");
         const ValidatedStage stage =
             validate_stage(candidate.stage_plan.input, "input");
@@ -1343,6 +1412,16 @@ FmbPrefillStageCandidate decode_fmb_prefill_stage_candidate(
             reject, "physical manifest fingerprint is stale");
         candidate.physical_manifest = std::move(manifest);
     }
+    if (ranked) {
+        TORCH_CHECK(descriptor[physical_end] == static_cast<int64_t>(
+                        FmbPrefillRankingPolicy::OUTER_THEN_MIXER_V1) ||
+                        descriptor[physical_end] == static_cast<int64_t>(
+                        FmbPrefillRankingPolicy::OUTER_THEN_MIXER_LARGER_WINDOW_V2),
+                    reject, "unknown opt-in prefill ranking policy");
+        candidate.ranking = {static_cast<FmbPrefillRankingPolicy>(descriptor[physical_end]),
+                             descriptor[physical_end + 1]};
+    }
+    validate_prefill_ranking(candidate);
     validate_candidate_capacity(
         candidate.input_chunk_size, candidate.stage_plan.input,
         "input", /*require_v16=*/false);

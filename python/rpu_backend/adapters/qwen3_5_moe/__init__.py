@@ -313,7 +313,8 @@ class Qwen3_5MoeAdapter:
 
     _EXECUTION_SUPPORTED = {
         "model": ("num_cores",),
-        "prefill": ("chunk_size", "padding_rows", "padding_budget", "linear_acc32"),
+        "prefill": ("chunk_size", "padding_rows", "padding_budget", "linear_acc32",
+                    "moe_resident_prefill"),
         "vision": (
             "chunk_size", "padding_rows", "padding_budget",
             "linear_acc32", "gelu_erf_ultra",
@@ -415,6 +416,12 @@ class Qwen3_5MoeAdapter:
         )
         core_topology(execution_config, config=config)
         prefill = execution_config.get("prefill", {})
+        if prefill.get("moe_resident_prefill", False) and runtime_capabilities(
+            validate_exact_profile(config)["profile"]
+        ).routed_weight_mode not in (5, 6):
+            raise UnsupportedModelError(
+                "Qwen3.5 resident prefill requires a TP8 routed UINT4 or E4M3 profile"
+            )
         for field, limit in (
             ("padding_budget", QWEN3_5_OPTIONAL_PADDING_CAP),
             ("padding_rows", QWEN3_5_TOTAL_PADDING_CAP),
@@ -434,7 +441,9 @@ class Qwen3_5MoeAdapter:
             ceiling = PREFILL_CHUNK_CEILING[
                 (int(tc.num_hidden_layers), int(tc.hidden_size))
             ]
-            if requested > ceiling:
+            # Resident candidates are admitted by the native joint SPM/mixer
+            # planner; router batches do not impose an outer-window ceiling.
+            if requested > ceiling and not prefill.get("moe_resident_prefill", False):
                 raise UnsupportedModelError(
                     f"Qwen3.5-MoE prefill chunk_size={requested} exceeds {ceiling}"
                 )

@@ -1,11 +1,12 @@
-"""NavDP fused runtime — INCREMENT 2 (device runs the 16 decoder layers; host does glue+DDPM).
+"""NavDP fused runtime — INCREMENT 2 (RPU runs the 16 decoder layers; host does glue+DDPM).
 
 Weight source: extracted `navdp_head.safetensors` (`model.navdp.*`). The 16-layer
-`nn.TransformerDecoder` runs on device (`torch.ops.rpu.navdp_forward`); the small glue
+`nn.TransformerDecoder` runs on RPU (`torch.ops.rpu.navdp_forward`); the small glue
 (input_embed, out_pos_embed, final LayerNorm, action_head, time_emb, cond_pos_embed) and
 the DDPM 20-step loop run host-side (torch) — numerically verifiable, folded into hooks later.
 
-Use the corresponding CPU FP32 decoder as the numerical reference.
+Verification target: `internal validation notes` (CPU fp32) — which
+itself matches the deployed `.ref` at cos=1.0 on real inputs.
 """
 from __future__ import annotations
 
@@ -22,7 +23,6 @@ from rpu_backend.api._execution import (
     _require_execution_process_safe,
     bind_execution_session,
     execution_serialized,
-    native_execution_reconfigure,
     normalize_rpu_execution,
     resolve_component_rpu_execution,
 )
@@ -192,12 +192,12 @@ class NavdpRuntime:
             raise
 
     def _decoder_rpu(self, tgt_f32, memory_f32, *, output=None, output_published=False):
-        """Run one trajectory; an explicit device output defers the CPU readback."""
+        """Run one trajectory; an explicit RPU output defers the CPU readback."""
         self._require_execution_session()
         torch.ops.rpu.navdp_validate_execution_admission(
             self._handle, int(tgt_f32.shape[1]), 0)
         tgt_r = _hr(tgt_f32)          # [1,S,H]
-        mem_r = _hr(memory_f32)       # [1,M,H]; no-op for the shared FP16 device input
+        mem_r = _hr(memory_f32)       # [1,M,H]; no-op for the shared FP16 RPU input
         # Shared GraphCache + stable op_id → graph replay (memory drifts per step but the MUTABLE
         # broadcast rewrites its src from the device addr each replay; see rpu_navdp_model.cpp).
         generation = int(self._fmb_execution_generation)
@@ -239,7 +239,7 @@ class NavdpRuntime:
 
     def _predict_noise(self, last_actions, timestep, goal_embed, rgbd_embed,
                        *, _action_input_bank=None):
-        """NavDP predict_noise: device decoder + host glue. Mirrors navdp.py predict_noise."""
+        """NavDP predict_noise: RPU decoder + host glue. Mirrors navdp.py predict_noise."""
         g = self._glue
         action_embeds = F.linear(last_actions, g["ie_w"], g["ie_b"])            # input_embed 3->384 [B,32,384]
         time_embeds = self._time_emb(timestep).unsqueeze(1).to(last_actions.dtype)  # [1,1,384]
@@ -287,11 +287,11 @@ class NavdpRuntime:
 
     @execution_serialized
     def predict_action(self, goal_embed, rgbd_embed, sample_num=4, seed=20260706, init_noise=None):
-        """Full System-1 denoise: DDPM 20-step reverse loop over the device decoder.
+        """Full System-1 denoise: DDPM 20-step reverse loop over the RPU decoder.
 
         goal_embed[1,1,384], rgbd_embed[1,32,384] -> action[sample_num,32,3].
         Mirrors navdp.py predict_pointgoal_action_async. Scheduler host-side; each step's
-        predict_noise runs the 16 decoder layers on device (per trajectory).
+        predict_noise runs the 16 decoder layers on RPU (per trajectory).
         """
         self._require_execution_session()
         if self._denoise_unroll:
@@ -402,7 +402,7 @@ class NavdpRuntime:
                     self._native_resource.keepalive, self._batch_cache)
                 self._batch_n = sample_num
             x0 = init.reshape(BPS, AD16).to(torch.float16).to("rpu").contiguous()             # [BPS,16] traj-major
-            sz = sigz.permute(1, 0, 2, 3).reshape(DDPM_STEPS, BPS, AD16).contiguous()\
+            sz = sigz.permute(1, 0, 2, 3).reshape(DDPM_STEPS, BPS, AD16).contiguous() \
                      .to(torch.float16).to("rpu").contiguous()                                # [N,BPS,16]
             out = torch.empty(BPS, AD16, dtype=torch.float16, device="rpu")
             generation = int(self._fmb_execution_generation)
@@ -512,18 +512,16 @@ class NavdpRuntime:
     def _apply_execution_reconfigure(self, old, new, next_generation, *, force_rebuild=False):
         # The descriptor is the only chunk authority: no native scalar to stage.
         self._navdp_execution_journal = (self._rpu_execution, self._fmb_execution_generation)
-        with native_execution_reconfigure():
-            self._clear_execution_graph()
-            self._rpu_execution = _resolve_navdp_execution(new, entry_point="NavDP apply")
-            self._fmb_execution_generation = next_generation
+        self._clear_execution_graph()
+        self._rpu_execution = _resolve_navdp_execution(new, entry_point="NavDP apply")
+        self._fmb_execution_generation = next_generation
 
     def _rollback_execution_reconfigure(self, old, new, old_generation):
         journal = getattr(self, "_navdp_execution_journal", None)
         if journal is None:
             return
-        with native_execution_reconfigure():
-            self._clear_execution_graph()
-            self._rpu_execution, self._fmb_execution_generation = journal
+        self._clear_execution_graph()
+        self._rpu_execution, self._fmb_execution_generation = journal
         self._navdp_execution_journal = None
 
     def destroy(self):

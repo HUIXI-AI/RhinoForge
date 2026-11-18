@@ -68,7 +68,7 @@ struct Tensor {
 }
 namespace v3 {
 inline constexpr int64_t QWEN3_FUSED_LM_HEAD_MAX_VOCAB = 200000;
-at::Tensor rpu_retain_linear_quant_scale(const at::Tensor&, const at::Tensor& scale) { return scale; }
+at::Tensor rpu_retain_linear_quant_scale(const at::Tensor&, const at::Tensor& scale, int = 8) { return scale; }
 __HELPER__
 struct CausalDecoderModel {
     int cores = 8, layers = 0, invalidations = 0;
@@ -76,20 +76,26 @@ struct CausalDecoderModel {
     bool qwen3_spm_kv_by_mha_enabled_ = true, adarms_fused_bcast_enabled_ = false;
     __FIELDS__
     at::Tensor lm_head_w_, lm_head_w_scale_, lm_head_logits_out_;
-    std::vector<at::Tensor> tts_predictor_heads_;
+    // Installing a single head clears any multi-head bank, so that a later
+    // select cannot revive a head this cold path has already replaced.
+    std::vector<at::Tensor> lm_head_bank_w_, lm_head_bank_scale_;
+    int64_t lm_head_bank_index_ = -1;
     bool fuse_lm_head_ = false, fuse_prefill_last_lm_head_ = false;
     bool qwen3vl_2b_w8_profile_ = false, has_mrope_ = false, reuse_lm_head_output_ = false;
+    bool reduced_qwen3_w4_profile_ = false;
+    bool reduced_qwen3vl_profile_ = false;
+    int64_t logical_intermediate_size_ = 3072;
+    int hidden = 1024, q_heads = 16;
+    struct Weight { at::Tensor q_w; };
+    std::vector<Weight> layer_weights_;
     int64_t vocab_size_ = 0, lm_head_exact_candidates_ = 0;
     uintptr_t lm_head_logits_dst_base_ = 0;
     int num_cores() const { return cores; }
     int num_layers() const { return layers; }
-    int hidden_size() const { return 1024; }
-    int intermediate_size() const { return 2816; }
-    int num_q_heads() const { return 16; }
+    int hidden_size() const { return hidden; }
+    int num_q_heads() const { return q_heads; }
     int num_kv_heads() const { return 8; }
-    int head_dim() const { return 64; }
-    struct Layer { at::Tensor q_w, q_w_scale; };
-    std::vector<Layer> layer_weights_;
+    int head_dim() const { return 128; }
     int attn_tp() const { return cores != 8 ? 4 : 8; }
     int mlp_tp() const { return cores; }
     int64_t get_last_resolved_chunk_size() const { return resolved_chunk; }
@@ -147,6 +153,29 @@ int main(int argc, char** argv) {
             assert(model.reserved_bytes(1) == cold_bytes);
         }
         assert(model.invalidations == 4);
+    } else if (mode == "quantized_heads4" || mode == "quantized_heads6") {
+        const int budget = mode.back() - '0';
+        for (const auto& dims : std::vector<std::vector<int64_t>>{
+                {1024,3072,16,28}, {2048,6144,16,28}, {2560,9728,32,36},
+                {4096,12288,32,36}, {5120,17408,40,40}, {5120,25600,64,64}}) {
+            v3::CausalDecoderModel model;
+            model.configure_cold_routes(true, false, budget, 151936);
+            model.hidden = dims[0]; model.logical_intermediate_size_ = dims[1];
+            model.q_heads = dims[2]; model.layers = dims[3];
+            model.layer_weights_.push_back({at::Tensor{{1,1},at::kChar}});
+            model.set_lm_head(at::Tensor{{151936,model.hidden},at::kChar}, at::Tensor{{151936}});
+            assert(model.lm_head_w_.scalar_type() == at::kChar);
+            model.clear_lm_head();
+            model.reduced_qwen3_w4_profile_ = true;
+            model.layer_weights_[0].q_w.dtype = at::kByte;
+            const int64_t scale_elements = 4 * ((model.hidden / 32 + 3) / 4) *
+                ((151936 / 4 + 63) / 64) * 256;
+            model.set_lm_head(at::Tensor{{151936,model.hidden / 2},at::kByte},
+                              at::Tensor{{32,scale_elements / 32}});
+            assert(model.lm_head_w_.scalar_type() == at::kByte);
+            rejects([&] {model.set_lm_head(at::Tensor{{151936,model.hidden / 2},at::kByte},
+                                         at::Tensor{{32,scale_elements / 32 - 1}});});
+        }
     } else if (mode == "admission") {
         for (int64_t vocab : {0, -1, 151938, 152000, 200000}) {
             rejects([&] { rpu_causal_decoder_create(true, false, 6, vocab); });
@@ -164,6 +193,13 @@ int main(int argc, char** argv) {
         v3::CausalDecoderModel after_planning;
         after_planning.resolved_chunk = 16;
         rejects([&] { after_planning.configure_cold_routes(true, false, 6, 151936); });
+        // Exact Llama-3.2-1B vocabulary: the cold head reserve covers 128256/4.
+        for (int budget : {4, 6}) {
+            v3::CausalDecoderModel llama;
+            llama.configure_cold_routes(true, false, budget, 128256);
+            assert(llama.num_cores() == budget && llama.lm_head_tp() == 4);
+            assert(llama.reserved_bytes(1) >= 128256 / 4 * 2);
+        }
     } else if (mode == "legacy_eight") {
         v3::CausalDecoderModel legacy;
         legacy.configure_cold_routes(true, false);
@@ -182,6 +218,15 @@ int main(int argc, char** argv) {
         configured.layers = 28;
         configured.set_lm_head(real_weight);
         rejects([&] { configured.set_lm_head(at::Tensor{{12288, 1024}}); });
+        const at::Tensor packed{{152064, 512}, at::kByte};
+        const int64_t scale_elements = 8 * 8 * 297 * 256;
+        const at::Tensor scale{{32, scale_elements / 32}};
+        // N32K32 physical rows are not the logical vocabulary. A head owner
+        // must bind the latter cold, even for the default eight-core handle.
+        rejects([&] { legacy.set_lm_head(packed, scale); });
+        configured.set_lm_head(packed, scale);
+        assert(configured.vocab_size_ == 151936 && configured.lm_head_w_.size(0) == 152064);
+        rejects([&] { configured.set_lm_head(at::Tensor{{151936, 512}, at::kByte}, scale); });
         // Hidden-only default-eight models retain their existing admission;
         // the fused lm_head upper bound remains enforced by set_lm_head.
         v3::CausalDecoderModel larger;
@@ -206,7 +251,8 @@ int main(int argc, char** argv) {
     return binary
 
 
-@pytest.mark.parametrize("mode", ["cold_head_lifecycle4", "cold_head_lifecycle6", "admission", "legacy_eight"])
+@pytest.mark.parametrize("mode", ["cold_head_lifecycle4", "cold_head_lifecycle6",
+                                 "quantized_heads4", "quantized_heads6", "admission", "legacy_eight"])
 def test_native_decoder_cold_vocabulary(native_cold_vocab_probe, mode):
     subprocess.run([str(native_cold_vocab_probe), mode], check=True, capture_output=True, text=True)
 

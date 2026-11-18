@@ -73,7 +73,6 @@ def test_owner_apply_does_not_retire_undo_before_shared_publication(relative, fu
 def test_owner_undo_survives_shared_publication_interruption(monkeypatch, family):
     graph = Graph()
     if family == "intern":
-        monkeypatch.setattr(intern, "native_execution_reconfigure", lambda: nullcontext())
         owner = SimpleNamespace()
         child = SimpleNamespace(_gc=graph)
         component = intern.NAVDP_COMPONENT

@@ -241,7 +241,7 @@ def test_preinstall_vl_cache_rejects_changed_mrope_before_allocation(monkeypatch
     text = model.model.language_model
     text.config.rope_parameters["mrope_section"] = [32, 16, 16]
     monkeypatch.setattr(torch, "zeros", lambda *a, **kw: pytest.fail("invalid VL profile allocated cache"))
-    with pytest.raises(ValueError, match="exact dense FP16 Qwen3-VL"):
+    with pytest.raises(ValueError, match="exact dense Qwen3-VL"):
         RPUCache.from_model(text, max_seq_len=16, device="cpu")
 
 
@@ -309,7 +309,7 @@ def test_w8_text_inventory_is_rechecked_before_claim(monkeypatch, fault):
             last.self_attn.q_norm.weight = torch.nn.Parameter(last.self_attn.q_norm.weight[:-1])
         else:
             last.extra = torch.nn.Linear(16, 16, dtype=torch.float16)
-    monkeypatch.setattr(vl, "_claim_live_instance", lambda *_: pytest.fail("bad W8 tree claimed device"))
+    monkeypatch.setattr(vl, "_claim_live_instance", lambda *_: pytest.fail("bad W8 tree claimed RPU"))
     with pytest.raises((ValueError, vl.RPUBackendError)):
         adapter.to_rpu()
     assert not hasattr(model, "_rpu_swizzle_started")

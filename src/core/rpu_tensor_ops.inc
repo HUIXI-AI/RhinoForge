@@ -71,17 +71,28 @@ struct RPUAllocator final : public c10::Allocator {
         "device is unavailable to this process: require read/write access "
         "to /dev/rpu and /dev/mem");
 
-    return rpu_tensor_ddr_lifecycle().run_allocation([&]() -> at::DataPtr {
-      if (rpu_caching_allocator_for_allocation()) {
-        // 使用 caching allocator
-        return rpu::RPUCachingAllocatorAdapter::get().allocate(nbytes);
-      }
+    const auto allocate_once = [&]() -> at::DataPtr {
+      return rpu_tensor_ddr_lifecycle().run_allocation([&]() -> at::DataPtr {
+        if (rpu_caching_allocator_for_allocation()) {
+          // 使用 caching allocator
+          return rpu::RPUCachingAllocatorAdapter::get().allocate(nbytes);
+        }
 
-      // 使用 direct allocator
-      void* ptr = rpu_allocate_registered_ddr(nbytes);
-      return {ptr, ptr, &rpu_free_registered_ddr,
-              at::Device(c10::DeviceType::PrivateUse1, 0)};
-    });
+        // 使用 direct allocator
+        void* ptr = rpu_allocate_registered_ddr(nbytes);
+        return {ptr, ptr, &rpu_free_registered_ddr,
+                at::Device(c10::DeviceType::PrivateUse1, 0)};
+      });
+    };
+    try {
+      return allocate_once();
+    } catch (const std::bad_alloc&) {
+      // Frees deferred behind an asynchronously ended Graph still hold their
+      // memory: complete it, release them, then retry once.
+      if (!rpu_graph_async_end_pending()) throw;
+    }
+    rpu_graph_async_end_wait("allocation_retry");
+    return allocate_once();
   }
   void copy_data(void *dest, const void *src,
                  std::size_t count) const override {
@@ -401,7 +412,9 @@ static at::Tensor rpu_to_cpu_zerocopy_impl(const at::Tensor &rpu_tensor,
                                            bool flush,
                                            bool graph_sync) {
   TORCH_CHECK(rpu_tensor.device().type() == c10::DeviceType::PrivateUse1,
-              "rpu_to_cpu_zerocopy: input must be on device");
+              "rpu_to_cpu_zerocopy: input must be on RPU device");
+  // An asynchronously ended Graph may still write this storage.
+  rpu_graph_async_end_wait("zerocopy_to_cpu");
   // Q2 (task #63):defensive sync — 内部直接调本函数的 op (e.g.
   // rpu_linear CPU fallback / rpu_eltwise_binary CPU fallback) 期望立即拿到
   // 有效 DDR data。RECORDING + pending nodes 时 sync_point() 把已录前缀 oneshot
@@ -827,6 +840,24 @@ at::Tensor &rpu_copy_impl(at::Tensor &self, const at::Tensor &src,
   // Early exit: same underlying data
   if (self.is_same(src)) {
     return self;
+  }
+
+  // An asynchronously ended Graph may still read or write either side.  The
+  // one exception is a same-dtype host write into a contiguous RPU storage
+  // its owner marked independent of the pending Graph (graph_async_end.h):
+  // Case 3 below is a memcpy plus a ranged flush of the destination only.
+  if (rpu_graph_async_end_pending()) {
+    const bool independent_write =
+        src.device().is_cpu() &&
+        self.device().type() == c10::DeviceType::PrivateUse1 &&
+        self.dtype() == src.dtype() && self.is_contiguous() &&
+        rpu_graph_async_end_independent_write(
+            self.data_ptr(), self.nbytes(), src.storage());
+    if (!independent_write) {
+      rpu_graph_async_end_wait(
+          src.device().type() == c10::DeviceType::PrivateUse1 ? "copy_from_rpu"
+                                                               : "copy_to_rpu");
+    }
   }
 
   const bool same_dtype = (self.dtype() == src.dtype());

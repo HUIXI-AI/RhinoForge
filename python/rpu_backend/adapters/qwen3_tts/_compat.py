@@ -1,4 +1,4 @@
-"""Exact edits for the reviewed upstream source and Transformers 5.3.0.
+"""Exact edits for the reviewed source and Transformers 5.3.0/5.19.0.
 
 Weights are loaded with a normal CPU constructor and strict load_state_dict;
 none of the HF meta-loading/reinitialization workarounds belong here.
@@ -34,4 +34,22 @@ def patch_source(path: str, text: str) -> str:
                 "from transformers.utils.generic import merge_with_config_defaults\n"
                 "from transformers.utils.output_capturing import capture_outputs", 1)
         replace("    @check_model_inputs()", "    @merge_with_config_defaults\n    @capture_outputs", 1)
+    if path in ("core/models/modeling_qwen3_tts.py",
+                "core/tokenizer_12hz/modeling_qwen3_tts_tokenizer_v2.py"):
+        replace("logger = logging.get_logger(__name__)",
+                "from inspect import signature as _signature\n\n"
+                "_MASK_HAS_CACHE_POSITION = \"cache_position\" in _signature(create_causal_mask).parameters\n\n"
+                "logger = logging.get_logger(__name__)", 1)
+        replace('                "input_embeds": inputs_embeds,',
+                '                "inputs_embeds": inputs_embeds,', 1)
+        replace('                "cache_position": cache_position,',
+                '                **({"cache_position": cache_position} if _MASK_HAS_CACHE_POSITION else {}),', 1)
+        if path == "core/models/modeling_qwen3_tts.py":
+            replace("            input_embeds=inputs_embeds,", "            inputs_embeds=inputs_embeds,", 1)
+            replace("            cache_position=cache_position,\n"
+                    "            past_key_values=past_key_values,\n"
+                    "            position_ids=text_position_ids,",
+                    '            **({"cache_position": cache_position} if _MASK_HAS_CACHE_POSITION else {}),\n'
+                    "            past_key_values=past_key_values,\n"
+                    "            position_ids=text_position_ids,", 1)
     return text

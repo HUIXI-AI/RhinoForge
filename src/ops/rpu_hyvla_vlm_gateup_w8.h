@@ -3,6 +3,7 @@
 #include "rpu_kernel_decls.h"
 #include "rpu_spm_allocator.h"
 #include "rpu_linear_tiling.h"
+#include "rpu_specialized_linear_contracts.h"
 
 // Exact M240/H2048/I6144/TP8 VLM adapter. Both branches retain their own
 // installed INT8 weights and FP16 per-channel scales. The existing Wall payload
@@ -40,7 +41,7 @@ inline void launch_hyvla_vlm_gateup_w8(
     TORCH_CHECK(uint64_t(input) + regions[0].second <= output ||
                     uint64_t(output) + regions[1].second <= input,
                 "HyVLA VLM W8 requires disjoint SPM operands");
-    const KernelId id = KernelId::WALL_PREFILL_GATE_UP_SWIGLU_W8A16_M320N112;
+    const KernelId id = KernelId::HYVLA_VLM_GATEUP_SWIGLU_W8_V2;
     std::vector<GraphDdrRegisterOperandSpec> operands;
     auto add = [&](const at::Tensor& tensor, GraphDdrRegisterRole role, int lo) {
         TORCH_CHECK(rhino_lkn::RpuGetDevAddr(tensor.data_ptr()) % 256 == 0,
@@ -50,8 +51,8 @@ inline void launch_hyvla_vlm_gateup_w8(
     };
     add(gate_weight, GraphDdrRegisterRole::Int8ModelWeight, 2);
     add(gate_scale, GraphDdrRegisterRole::PerChannelScale, 20);
-    add(up_weight, GraphDdrRegisterRole::Int8ModelWeight, 24);
-    add(up_scale, GraphDdrRegisterRole::PerChannelScale, 26);
+    add(up_weight, GraphDdrRegisterRole::Int8ModelWeight, 32);
+    add(up_scale, GraphDdrRegisterRole::PerChannelScale, 34);
     auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(id, operands);
     for (auto* tensor : {&gate_weight, &up_weight, &gate_scale, &up_scale}) {
         rpu_ddr_flush(tensor->data_ptr());
@@ -66,5 +67,5 @@ inline void launch_hyvla_vlm_gateup_w8(
     writer.write(*kernel);
     auto* queue = GET_QUEUE(8);
     queue->set_broadcast_mode(true);
-    queue->enqueu_kernel(*kernel, {7, 1, 1}, {0,1,2,3,4,5,6,7});
+    queue->enqueu_kernel(*kernel, rpu_specialized_linear::grid(id), {0,1,2,3,4,5,6,7});
 }

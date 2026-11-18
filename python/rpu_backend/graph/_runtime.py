@@ -7,7 +7,7 @@ by the native queue/runtime lifecycle.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 import threading
 import types
@@ -108,6 +108,10 @@ class GraphRuntimePolicy:
     graph_arena_count: int = 0
     batch_snapshot_mode: str = "auto"
     qwen35_dense_27b_sdk_budget: bool = False
+    # A top-level REPLAY end() returns after submitting its final segment; the
+    # next device entry completes it (src/graph/graph_async_end.h). Owner
+    # opt-in only, through with_async_replay_end(); never an environment knob.
+    async_replay_end: bool = False
 
     def __post_init__(self) -> None:
         if self.batch_snapshot_mode not in ("auto", "off"):
@@ -121,6 +125,7 @@ class GraphRuntimePolicy:
             "fmb_deep_fast_replay",
             "qwen35_legacy_27b_sdk_budget",
             "qwen35_dense_27b_sdk_budget",
+            "async_replay_end",
         ):
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"{name} must be bool")
@@ -218,6 +223,24 @@ class GraphRuntimePolicy:
             + (("owner:qwen35_dense_27b_sdk_budget=1",) if qwen35_dense_27b_sdk_budget else ()),
         )
 
+    def with_async_replay_end(self) -> "GraphRuntimePolicy":
+        """Return this policy with an asynchronous top-level REPLAY end.
+
+        For an owner that checked its host work between Graphs: end() returns
+        after submitting the final segment, and the next device entry (Graph
+        replay, eager kernel, RPU copy, zero-copy view, immediate DMA, cleanup)
+        completes it first. RPU frees issued meanwhile are deferred to that
+        point. HWPerf replays, child Graphs and outer-fast staged Graphs stay
+        synchronous.
+        """
+        if self.async_replay_end:
+            return self
+        return replace(
+            self,
+            async_replay_end=True,
+            provenance=self.provenance + ("owner:async_replay_end=1",),
+        )
+
     def prepare_arenas(self) -> bool:
         """Reserve the owner's process plan before weights or graph capture.
 
@@ -246,6 +269,8 @@ class GraphRuntimePolicy:
         }
         if self.qwen35_dense_27b_sdk_budget:
             snapshot_args["qwen35_dense_27b_sdk_budget"] = True
+        if self.async_replay_end:
+            snapshot_args["async_replay_end"] = True
         return _cpp_ext.GraphRuntimePolicy(
             self.fast_replay_skip_sync,
             self.force_oneshot_on_replay,
@@ -495,8 +520,11 @@ class GraphCache:
     _WARMING = "WARMING"
     _READY = "READY"
 
-    def __init__(self, max_entries=None, *, runtime_policy=None):
+    def __init__(self, max_entries=None, *, runtime_policy=None, require_single_segment=False):
         from rpu_backend.runtime.execution_planner import PreparedExecutionPlans
+
+        if type(require_single_segment) is not bool:
+            raise TypeError("require_single_segment must be bool")
 
         if max_entries is None:
             max_entries = self.DEFAULT_MAX_ENTRIES
@@ -509,11 +537,14 @@ class GraphCache:
         if not isinstance(runtime_policy, GraphRuntimePolicy):
             raise TypeError("runtime_policy must be a GraphRuntimePolicy")
         self._runtime_policy = runtime_policy
+        self._max_entries = max_entries
+        self._require_single_segment = require_single_segment
         if not _cpp_loaded:
             self._impl = None
             return
         self._impl = _cpp_ext.GraphCache(
-            int(max_entries), runtime_policy._native()
+            int(max_entries), runtime_policy._native(),
+            *((True,) if require_single_segment else ()),
         )
         _LIVE_GRAPH_CACHES.add(self)
 
@@ -521,6 +552,25 @@ class GraphCache:
     def runtime_policy(self) -> "GraphRuntimePolicy":
         """The same cold policy passed to the native cache at construction."""
         return self._runtime_policy
+
+    def with_async_replay_end(self) -> "GraphCache":
+        """Return an empty cache like this one whose Graphs end asynchronously.
+
+        The policy is cold, so an owner that opts in after a shared installer
+        built its cache replaces that cache before any Graph exists in it.
+        See GraphRuntimePolicy.with_async_replay_end().
+        """
+        if self._runtime_policy.async_replay_end:
+            return self
+        if self._phase != self._CONFIGURING or (
+                self._impl is not None and self._impl.snapshot()):
+            raise RuntimeError(
+                "GraphCache.with_async_replay_end requires an empty CONFIGURING cache")
+        return GraphCache(
+            self._max_entries,
+            runtime_policy=self._runtime_policy.with_async_replay_end(),
+            require_single_segment=self._require_single_segment,
+        )
 
     def capture(self, sig):
         """Return the main ``with cache.capture(sig)`` scope."""

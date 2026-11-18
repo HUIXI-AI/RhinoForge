@@ -544,7 +544,6 @@ def _patch_vla_preflight(monkeypatch):
 
 
 def test_rtc_w4_requires_exact_w8_companion_before_runtime_env_mutation(monkeypatch):
-    monkeypatch.setenv("RPU_WALL_OSS_RTC_ALLOW_NUMERIC_BLOCKED", "1")
     monkeypatch.delenv("RPU_WALL_OSS_PREFILL_MIXED_PRECISION", raising=False)
     monkeypatch.setenv("RPU_LINEAR_ACC32", "1")
     monkeypatch.setenv("RPU_RMSNORM_NEWTON", "1")
@@ -578,7 +577,6 @@ def test_rtc_w4_default_pair_validation_precedes_runtime_env_mutation(monkeypatc
         lambda name: Path(f"/models/{name}"),
     )
     monkeypatch.setattr(runtime, "validate_rtc_w4_checkpoint_pair", reject_pair)
-    monkeypatch.setenv("RPU_WALL_OSS_RTC_ALLOW_NUMERIC_BLOCKED", "1")
     monkeypatch.setenv("RPU_LINEAR_ACC32", "1")
     monkeypatch.delenv("RPU_WALL_OSS_PREFILL_MIXED_PRECISION", raising=False)
 
@@ -618,7 +616,6 @@ def test_rtc_w8a16_keeps_only_the_overflow_boundaries_fp16(
     calls = []
     fake_llm = object()
     fake_action = SimpleNamespace(llm=fake_llm)
-    monkeypatch.setenv("RPU_WALL_OSS_RTC_ALLOW_NUMERIC_BLOCKED", "1")
     if weight_outer is None:
         monkeypatch.delenv("RPU_WALL_OSS_VISION_WEIGHT_OUTER", raising=False)
     else:
@@ -739,7 +736,6 @@ def test_rtc_w4a16_routes_exact_three_checkpoint_composition(monkeypatch):
     calls = []
     fake_llm = object()
     fake_action = SimpleNamespace(llm=fake_llm)
-    monkeypatch.setenv("RPU_WALL_OSS_RTC_ALLOW_NUMERIC_BLOCKED", "1")
     monkeypatch.setattr(runtime.torch, "load", lambda *a, **k: normalizer)
     monkeypatch.setattr(
         runtime.AutoProcessor, "from_pretrained", lambda *a, **k: object())
@@ -965,7 +961,6 @@ def test_action_kv_owner_control_op_uses_default_dispatch_registration():
 
 @pytest.mark.parametrize("flags", [{}, {"w8a16": True}, {"rtc": True}, {"rtc": True, "w4a16": True}])
 def test_action_only_w4_rejects_non_rtc_w8_compositions_before_assets(monkeypatch, flags):
-    monkeypatch.setenv("RPU_WALL_OSS_RTC_ALLOW_NUMERIC_BLOCKED", "1")
     with pytest.raises(ValueError, match="action_w4a16_ckpt_dir requires"):
         runtime.build_wall_oss_vla(
             "/must-not-be-read", action_w4a16_ckpt_dir="/must-not-be-read", **flags
@@ -973,7 +968,6 @@ def test_action_only_w4_rejects_non_rtc_w8_compositions_before_assets(monkeypatc
 
 
 def test_action_only_w4_validates_pair_before_rtc_side_effects(monkeypatch):
-    monkeypatch.setenv("RPU_WALL_OSS_RTC_ALLOW_NUMERIC_BLOCKED", "1")
     monkeypatch.delenv("RPU_WALL_OSS_PREFILL_MIXED_PRECISION", raising=False)
     monkeypatch.setattr(runtime, "validate_w8_nvfp4_checkpoint_pair", lambda *_: None)
 

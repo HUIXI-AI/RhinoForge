@@ -6,6 +6,7 @@
 #include "rhino_launch_buffer.h"
 
 #include <torch/torch.h>  // TORCH_CHECK
+#include <algorithm>
 
 using namespace rhino_lkn;
 
@@ -60,6 +61,31 @@ SpmAllocator::AliasedPlan SpmAllocator::plan_temporary_aliased(
 {
     size_t n = requests.size();
     if (n == 0) return {};
+
+    // A replay re-plans the same few request lists (residency estimate, final
+    // layout check, allocation) on every forward, and first-fit below is
+    // quadratic with an allocation per buffer. The plan is a pure function of
+    // the list, so an exact repeat returns the plan computed for it.
+    struct PlanMemo {
+        std::vector<AllocRequest> requests;
+        AliasedPlan plan;
+    };
+    constexpr size_t kPlanMemoEntries = 16;
+    thread_local std::vector<PlanMemo> memo;
+    for (size_t m = 0; m < memo.size(); ++m) {
+        const auto& cached = memo[m].requests;
+        bool same = cached.size() == n;
+        for (size_t i = 0; same && i < n; ++i) {
+            same = cached[i].bytes == requests[i].bytes &&
+                   cached[i].first_step == requests[i].first_step &&
+                   cached[i].last_step == requests[i].last_step &&
+                   cached[i].scope == requests[i].scope;
+        }
+        if (same) {
+            std::rotate(memo.begin(), memo.begin() + m, memo.begin() + m + 1);
+            return memo.front().plan;
+        }
+    }
 
     // Per-buffer state: aligned size + computed relative offset
     struct Slot {
@@ -150,6 +176,8 @@ SpmAllocator::AliasedPlan SpmAllocator::plan_temporary_aliased(
         plan.offsets[i] = static_cast<uint32_t>(slots[i].rel_offset);
     }
     plan.peak_bytes = peak;
+    if (memo.size() == kPlanMemoEntries) memo.pop_back();
+    memo.insert(memo.begin(), PlanMemo{requests, plan});
     return plan;
 }
 

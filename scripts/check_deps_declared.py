@@ -52,9 +52,8 @@ def _local_modules() -> set[str]:
         root = REPO_ROOT / rel
         for path in root.rglob("*.py"):
             names.add(path.stem)
-        for directory in root.iterdir():
-            if directory.is_dir() and (directory / "__init__.py").exists():
-                names.add(directory.name)
+        for init in root.rglob("__init__.py"):
+            names.add(init.parent.name)
     names.update(path.stem for _, path in iter_ci_executed_files())
     names.update(path.stem for path in REPO_ROOT.glob("*.py"))
     return names

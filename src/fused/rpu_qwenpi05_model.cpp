@@ -527,7 +527,8 @@ protected:
             manifest, plan, hidden_size(),
             FMB_SHARED_LAYER_INPUT_DMA |
                 FMB_SHARED_MLP_AUTO_TILE |
-                FMB_SHARED_MLP_RING_REDUCE);
+                FMB_SHARED_MLP_RING_REDUCE,
+        /*compute_row_multiplier=*/1, num_cores(), mlp_tp());
         std::sort(
             manifest.routes.begin(), manifest.routes.end(),
             [](const FmbRouteManifestEntry& lhs,

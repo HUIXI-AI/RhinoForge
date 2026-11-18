@@ -1,6 +1,6 @@
 """Actual SigLIP forward/CPU receipt on real ATen storage.
 
-SDK owner/cache, device labels/allocation, planner/SPM, patch/encoder math and Graph
+SDK owner/cache, RPU labels/allocation, planner/SPM, patch/encoder math and Graph
 execution are explicit doubles. The complete forward/core, setter validation,
 receipt comparison/copy/publication and mutable source code are actual source.
 This proves host-modeled boundaries only; it is not hardware or model numerics.
@@ -196,9 +196,11 @@ struct Siglip {
  int cores=4,attention=4,mlp=4,layers=27;uint64_t generation=1;
  int64_t pe_kh_=14,pe_kw_=14,pe_strideh_=14,pe_stridew_=14,pe_cin_orig_=3,pe_cin_padded_=16,pe_cout_=1152;
  int64_t orig_head_dim_=72,projection_dim_=2048,image_batch_count_=1;
- bool has_patch_emb_=true,linear_acc32_=false,pi05_vision_fc_weight_outer_opt_in_=false;
- bool audio_mode_=false;
+ bool has_patch_emb_=true,linear_acc32_=false,pi05_vision_fc_weight_outer_opt_in_=false,audio_mode_=false;
  bool pi05_vision_merge_segment_opt_in_=false,pi05_vision_owner_ln_opt_in_=false;
+ // LayerNorm streaming stays off here: set_weights leaves ln_stream_ddr_ empty.
+ bool pi05_vision_ln_stream_opt_in_=false;at::Tensor ln_stream_ddr_;
+ int64_t ln_stream_elems() const{assert(false);return 0;}
  bool pi05_vision_kv_spm_only_opt_in_=false,pi05_ring_xor3_opt_in_=false;
  int64_t logical_intermediate_size_=0,reduced_w8_projection_mask_=0,local_q_heads_=0;
  int64_t configured_chunk_size_=0,patch_kernel_size_=14,patch_stride_=14,last_resolved=0;
@@ -350,7 +352,7 @@ int main(){int scenarios=0;std::vector<at::Tensor> keys(27,at::zeros({1},at::kHa
   if(kind==1)input=slab.reshape({3*150528}).narrow(0,1,150528).view({1,3,224,224});
   if(kind==2)input=at::as_strided(input,{1,3,224,224},{0,50176,224,1});
   run(m,input,true,301056);assert(!m.private_serial_cpu_slab_published_);}
- // Public device dirty CPU aliases always publish their original nonzero N1 span.
+ // Public RPU dirty CPU aliases always publish their original nonzero N1 span.
  {Siglip m;auto slab=input_slab();auto back=bank({3*150528+64});
   nodes.clear();saved.clear();saved_bytes.clear();graph.held.clear();
   for(int camera=0;camera<3;++camera){auto view=back.narrow(0,32+camera*150528,150528).view({1,3,224,224});

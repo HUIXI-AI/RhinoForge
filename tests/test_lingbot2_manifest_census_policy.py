@@ -102,7 +102,7 @@ int main() {
   {D,{}},{M,{vision_key,{},label}},{K,{}},{B,{}},{M,{text_key,{},label}}};
  const std::array<uint64_t,4> keys={vision_key,vision_key,vision_key,text_key};
  GraphKernelRegisterPolicy old;
- old.name="original";old.fingerprint=0x4c423257385a3251ULL;
+ old.name="original";old.fingerprint=0x4c423257385a3242ULL;
  old.rules={{1,2,3},{4,8,20,21}};
  old.expected_node_count=6;old.expected_dma_count=2;old.expected_barrier_count=2;
  old.expected_kernel_count=2;old.expected_typed_kernel_count=1;old.expected_no_ddr_kernel_count=1;
@@ -118,8 +118,8 @@ int main() {
  stats.ordered_node_kind_hash=old.expected_ordered_node_kind_hash;
  old.phases.push_back({"outer",stats});
  const auto out=lingbot2_register_policy_with_manifest_branches(old,stream,keys);
- assert(out.name=="lingbot2_multiview_w8_outer_ring_register_census_v7_manifest");
- assert(out.fingerprint==0x4c423257385a324dULL && out.fingerprint!=old.fingerprint);
+ assert(out.name=="lingbot2_multiview_w8_n32k32_register_census_v1_manifest");
+ assert(out.fingerprint==(old.fingerprint ^ 0x464d424d41524b34ULL) && out.fingerprint!=old.fingerprint);
  assert(out.expected_node_count==10 && old.expected_node_count==6);
  assert(out.expected_ordered_node_kind_hash==hash(stream));
  assert(out.phases.size()==1 && out.phases[0].name==old.phases[0].name);

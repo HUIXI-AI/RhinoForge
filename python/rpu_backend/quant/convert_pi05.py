@@ -50,9 +50,13 @@ def _scale_name(weight_name: str) -> str:
 
 def _target_for_name(name: str) -> str | None:
     if name.endswith(PI05_PROJ_SUFFIXES):
-        if PI05_EXPERT_ANCHOR in name:
+        # A LeRobot policy save prefixes keys with "model."; a converted
+        # upstream checkpoint (lerobot/pi05_libero_base) has no prefix. The
+        # loaders accept both, so the anchors match either form.
+        dotted = "." + name
+        if PI05_EXPERT_ANCHOR in dotted:
             return "expert"
-        if PI05_VLM_ANCHOR in name:
+        if PI05_VLM_ANCHOR in dotted:
             return "vlm"
     return None
 
@@ -180,10 +184,10 @@ def _quant_config(*, bits: int, int8_keep_suffixes: tuple[str, ...] = (),
         int8_keep_suffixes, real_w4=real_w4)
     if bits == 4:
         method = "w4a16" if real_w4 else "w4a16_fake_int8"
-        kernel = "wint4a16" if real_w4 else "w8a16"
+        kernel = "w4a16_pgrp" if real_w4 else "w8a16"
         note = (
             "Real W4: int4 values stored in int8 on disk; runtime packs to uint8 "
-            "[N,K/2] and dispatches to the wINT4 kernel. mixed_int8_suffixes stay INT8."
+            "[N,K/2] and dispatches to the w4a16_pgrp kernel. mixed_int8_suffixes stay INT8."
         ) if real_w4 else (
             "Fake W4 numerical probe: signed int4 values stored in int8; "
             "runtime intentionally uses existing W8A16 kernel. "
@@ -371,7 +375,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help=(
             "tag the checkpoint method=w4a16 (real packed INT4): runtime packs to "
-            "uint8 [N,K/2] and uses the wINT4 kernel. Requires --fake-w4 quantization "
+            "uint8 [N,K/2] and uses the w4a16_pgrp kernel. Requires --fake-w4 quantization "
             "(same int4-in-int8 on-disk storage). k_proj/v_proj are automatically "
             "kept at INT8. Without this, method stays w4a16_fake_int8 (W8A16 kernel)."
         ),

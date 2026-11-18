@@ -158,4 +158,9 @@ def test_ring_xor3_append_only_optional_payload():
     assert cache.index(kernel) > cache.index("GR00T_QKV_MULTIBASE_W8A16_M592N32K128")
     assert symbol in cache
     assert symbol in implementation.split("kMixedNames[] = {", 1)[1].split("};", 1)[0]
-    assert f"KernelId::{kernel}" in implementation.split("bool optional_id =", 1)[1].split(";", 1)[0]
+    loader = _definition(implementation, "for (const char* name : kMixedNames)")
+    absent = _definition(loader, "if (mixed_symbols.count(kname) == 0)")
+    assert "continue;" in absent
+    assert "load_kernel_from_oplib(" not in absent
+    assert loader.index(absent) < loader.index("load_kernel_from_oplib(")
+    assert "fast_cache_[i] = nullptr;" in _definition(implementation, "void KernelCache::populate_fast_cache()")

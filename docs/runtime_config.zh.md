@@ -83,7 +83,7 @@ Qwen3-VL 另接受冷态布尔值 `prefill.fast_replay`，不接受 `vision.fast
 模型开关放在对应配置或启动进程中。显式环境值优先于 adapter 的 `setdefault`；示例 runner 在导入 adapter 前应用所选配置。日志、分配器及 Launch 初始化设置须在导入 backend 前准备。使用模板的 opt-in 与默认值，避免把模型优化开关导出到所有进程。
 
 Qwen3.5-35B-A3B mixed-E4M3 权重按
-[官方源下载与 CPU 转换命令](../examples/configs/qwen3_5/README.md#cmd-moe-mixed)准备。
+[官方源下载与 CPU 转换命令](../examples/configs/WEIGHTS.md#cmd-qwen35-moe)准备。
 Text/Vision、核数与 ACC 变体共用转换产物，运行参数不改变权重配方。
 
 ## 通用和 cache 设置
@@ -311,7 +311,7 @@ Pi0.5 loader 负责这些设置。Graph selector 必须在模型构造和首次 
 |---|---|---|---|
 | `RPU_PI05_ADARMS_GRAPH` | **PB(true)** | AdaRMS 构造 / **MODEL** | 启用 AdaRMS GraphCache 路径。`0` 使用 eager fallback，并改变 timing/lifecycle。 |
 | `RPU_PI05_ADARMS_W8A16_GRAPH` | **PB(true)** | 量化 AdaRMS 构造 / **MODEL** | 为 W8A16 AdaRMS 路径启用 GraphCache。必须匹配量化权重。 |
-| `RPU_PI05_DENOISE_GRAPH` | **PB(true)** | Action 构造 / **MODEL** | capture denoise step。未包含当前 RhinoForge 源码补丁的 v1.2.0 构建中，变化的逻辑 prefix 会让 Graph 持续 BUILD 并耗尽 arena；设为 `0` 的 host loop 又会丢失物理 descriptor，导致稳态数值错误。补丁前两者都不应作为生产规避方案，见[已知故障与修复](pitfalls.zh.md#pi05-v120-denoise-已知故障2026-10-22)。 |
+| `RPU_PI05_DENOISE_GRAPH` | **PB(true)** | Action 构造 / **MODEL** | capture denoise step。未包含当前 RhinoForge 源码补丁的 v1.2.0 构建中，变化的逻辑 prefix 会让 Graph 持续 BUILD 并耗尽 arena；设为 `0` 的 host loop 又会丢失物理 descriptor，导致稳态数值错误。补丁前两者都不应作为生产规避方案，见[已知故障与修复](pitfalls.zh.md)。 |
 | `RPU_PI05_DENOISE_UNROLL` | 原始为 **PB(false)**；Pi adapter 提供 `1` | Action 构造 / **MODEL** | 在一个 Graph 中记录固定 denoise loop，并使用 FP16 Euler state。相对 host loop 会改变数值。 |
 | `RPU_PI05_EMBED_PREFIX_PATCH` | **PB(true)** | Adapter class-patch 安装 / **MODEL** | 启用支持的 prefix-embedding patch。class hook 是进程状态，因此只能在新进程中改变。 |
 | `RPU_PI05_EULER_FP16` | **PB(false)** | 每次 action 调用 / **CALL**；重建 prepared Graph 配置 | 使用 FP16 而不是 host-FP32 Euler state。它会直接改变 action 数值。 |

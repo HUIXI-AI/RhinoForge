@@ -288,7 +288,7 @@ For image input, pass the processor's `input_ids`, `attention_mask`, `pixel_valu
 Prepare the separate mixed-E4M3 profile from the official unquantized
 `Qwen/Qwen3.5-35B-A3B` source using
 [`convert_qwen3_5_moe_fp8.py`](../python/rpu_backend/quant/convert_qwen3_5_moe_fp8.py).
-The [download, CPU conversion and run commands](../examples/configs/qwen3_5/README.md#cmd-moe-mixed)
+The [download, CPU conversion and run commands](../examples/configs/WEIGHTS.md#cmd-qwen35-moe)
 write `$RPU_MODEL_CACHE/Qwen3.5-35B-A3B-rpu-fp8-mixed`; pass that output to
 `from_pretrained` or the example's `--model`. Conversion needs no calibration
 and produces per-output E4M3 weights. Official block-FP8 checkpoints are not
@@ -301,7 +301,7 @@ The following classes are exported from `rpu_backend.api`:
 
 | Class | Primary construction and inference methods |
 |---|---|
-| `Pi05Policy` | `from_pretrained(...)` or `from_lerobot_policy(...)`; `to("rpu")`; `prepare_graphs(...)`; `predict_action_chunk(...)`; `select_action(...)` |
+| `Pi05Policy` | `from_pretrained(...)` or `from_lerobot_policy(...)`; `graph_arena_count(...)`; `to("rpu")`; `prepare_graphs(...)`; `predict_action_chunk(...)`; `select_action(...)` |
 | `RhinoVLAPolicy` | `from_runtime(...)`, `from_factory(...)`, or `from_pretrained(..., runtime_factory=...)`; `prepare_graphs(...)`; `predict(...)`; `predict_action_chunk(...)` |
 | `WallOssPolicy` | `from_checkpoint(...)` or `from_pretrained(...)`; `to("rpu")`; `prepare_graphs(...)`; `infer(...)`; `predict_action_chunk(...)` |
 | `Lingbot2Policy` | `from_checkpoint(...)`; `to("rpu")`; `prepare_graphs(...)`; `infer(...)`; `predict_action_chunk(...)`; `close()` |
@@ -325,6 +325,16 @@ with `torch.save`; the optimized examples require shape `[1, 50, 32]`.
 Pi0.5 `prepare_graphs()` reports Graph readiness and replay diagnostics.
 It checks shape, dtype, finite values and Graph invariants.
 `replay_parity.numerical_status` is `DIAGNOSTIC`; `task_quality` is `NOT_EVALUATED`.
+
+When live requests vary the valid language token count inside a fixed padded
+`text_tokens` bucket (such as openpi discrete-state prompts), pass
+`language_token_counts=...` to `Pi05Policy.prepare_graphs(...)` so startup
+prewarms one fused denoise Graph per reachable valid length and freezes the
+admitted set; requests outside that set are rejected before device execution.
+Size the cold Graph arena budget before loading via
+`GraphRuntimePolicy.from_environment(graph_arena_count=Pi05Policy.graph_arena_count(len(counts)))`.
+See [`serving.py`](../examples/runners/pi05/serving.py) and the
+[`kuavo_server` adapter guide](../examples/configs/pi05/README.md#kuavo-server).
 
 For the release-bound Pi0.5 component profiles, pass `profile="pi0.5-base"`
 or `profile="pi0.5-libero-v044"` together with the first preprocessed
@@ -629,10 +639,9 @@ if the process has an incompatible frozen allocator or arena plan.
 ASR requires `siglip_set_audio_mode`, `siglip_set_audio_projection` and
 `assemble_inputs_embeds` in the rebuilt native extension. TTS codec uses the
 explicit `causal_decoder_set_tts_codec_mode`; without it, the frontend stays on
-CPU. With the setter, 1–255 codec frames use the device; above 64 frames an explicit
-72-frame causal sliding mask preserves the original attention window. Execution
-uses a planner-selected single chunk and retains only the current Graph/mask.
-Other execution errors propagate.
+CPU. With the setter, 1–63 codec frames use the device; 64–255 frames use the
+original CPU FP32 frontend and its 72-frame sliding attention. Other execution
+errors propagate.
 
 `execution_stats()` exposes call and cache state:
 
@@ -660,18 +669,10 @@ outputs. Retire Graphs before native handles and weights. Set CPU thread count
 with `torch.set_num_threads` before loading; the API leaves it unchanged.
 
 `codec_backend="rpu"` defaults to experimental offload of all 31 decoding Conv1d
-layers and four ConvNeXt Linear layers. With matching native support, twelve pairs
-also keep their intermediate SnakeBeta and first bias on RPU in FP16.
-With `tts_codec_residual_unit_complete`, the pairs also execute the
-first SnakeBeta and final residual addition in device FP16; older extensions
-retain the CPU FP32 boundary for those two operations.
-With `tts_codec_conv1d_spm_bias`, standalone Conv1d uses a retained FP16 device
-bias in its Linear projection, instead of adding CPU FP32 bias afterward. Select
-`codec_backend="cpu"` to restore
+layers. With matching native support, twelve pairs also keep their intermediate
+SnakeBeta and first bias on RPU in FP16. Select `codec_backend="cpu"` to restore
 CPU FP32 convolutions and activations. `execution_stats().codec_convolutions`
 reports backend, installed layers, cumulative convolution calls, `transport`
-(`shared_ddr` or older `staged`), `residual_pairs`, completed `paired_calls`,
-`transposed_layers`, completed `transposed_calls`, `convnext_linears` and
-completed `convnext_linear_calls`.
+(`shared_ddr` or older `staged`), `residual_pairs` and completed `paired_calls`.
 Each pair contributes two convolution calls. See the [speech guide](qwen3_audio.md#experimental-rpu-vocoder-convolutions)
 for remaining CPU work and the changed numerical boundary.

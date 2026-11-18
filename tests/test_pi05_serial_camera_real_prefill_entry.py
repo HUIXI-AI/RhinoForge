@@ -440,3 +440,18 @@ def test_partial_precision_cold_profile_keeps_original_single_image_upload(bound
     uploads,_,_=b.run(b.candidate,owner,images,masks)
     assert [upload['shape'] for upload in uploads]==[(1,3,224,224)]*3
     assert [item[1] for item in owner.native_inputs]==['rpu']*3
+
+
+def test_masked_language_rows_reach_prefill_as_zero(boundary):
+    """With the H10 weights a pad row's own residuals overflow FP16 at layer 16."""
+    from rpu_backend.adapters.pi05 import patches
+    torch=boundary.torch
+    tokens=torch.tensor([[2,5,0,0]],dtype=torch.int64)
+    masks=tokens!=0
+    owner=SimpleNamespace(paligemma_with_expert=SimpleNamespace(
+        embed_language_tokens=lambda t:(t+1).to(torch.float16)[:,:,None].expand(-1,-1,4)))
+    full=patches._embed_language_rows(owner,tokens,torch.ones_like(masks))
+    padded=patches._embed_language_rows(owner,tokens,masks)
+    assert full[0,:,0].tolist()==[6,12,2,2]
+    assert torch.equal(padded[:,:2],full[:,:2])
+    assert not padded[:,2:].any()

@@ -4,8 +4,8 @@ import shutil
 import subprocess
 
 import pytest
-
 from _native_runtime_identity import runtime_identity_include
+from pi_wall_host_catalog import CATALOG_INCLUDE, absolute_candidate_includes
 
 ROOT = Path(__file__).resolve().parents[1]
 DECODER = (ROOT / 'src/fused/rpu_qwen3_model.h').read_text()
@@ -29,17 +29,21 @@ def compile_run(tmp_path, name, source):
         pytest.skip('C++ compiler unavailable')
     torch_root = Path(torch.__file__).resolve().parent
     cpp = tmp_path / (name + '.cpp')
+    if 'RPU_PL_CANDIDATE' in source:
+        # Extracted KernelId/name tables depend on the current generated catalog.
+        source = CATALOG_INCLUDE + absolute_candidate_includes(source)
     cpp.write_text(source)
     binary = tmp_path / name
     command = [compiler, '-std=c++17', '-O0', '-Wall', '-Wextra',
                f'-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}',
-               '-I' + str(ROOT / 'src'), '-I' + str(runtime_identity_include(tmp_path)), '-I' + str(torch_root / 'include'),
+               '-I' + str(ROOT / 'src'), '-I' + str(ROOT / 'src/ops'), '-I' + str(ROOT / 'src/core'), '-I' + str(runtime_identity_include(tmp_path)), '-I' + str(torch_root / 'include'),
                str(cpp), str(ROOT / 'src/ops/rpu_kvinsert_segment_plan.cpp'),
                '-L' + str(torch_root / 'lib'), '-Wl,-rpath,' + str(torch_root / 'lib'),
                '-lc10', '-o', str(binary)]
     result = subprocess.run(command, capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
-    subprocess.run([str(binary)], check=True, capture_output=True, text=True)
+    ran = subprocess.run([str(binary)], capture_output=True, text=True)
+    assert ran.returncode == 0, ran.stdout + ran.stderr
 
 
 COMMON = r'''
@@ -229,7 +233,6 @@ int paired=0,separate=0;
 void rpu_launch_wall_base_paired_kv_spm_kernel(at::Tensor&,at::Tensor&,uint32_t,uint32_t,int64_t,const KvInsertSegmentPlan&){++paired;}
 template<class... T> void rpu_launch_insert_kvcache_spm_unified_with_plan(T&&...){++separate;}
 struct Model {
- template<class...T> bool emit_lingbot_prefill_kv_pair(T...)const{return false;}
  struct LayerWeights {at::Tensor q_w,k_w,v_w,o_w,gate_w,up_w,down_w,input_norm_w,post_norm_w;
   at::Tensor q_ws,k_ws,v_ws,o_ws,gate_ws,up_ws,down_ws;};
  std::vector<LayerWeights> layer_weights_{36};WallSortingConfig wall_sorting_;at::Tensor final_norm_w_;
@@ -272,6 +275,7 @@ struct Model {
   at::Tensor k_cache,v_cache;int64_t bs=1,k_spm_stride=8192,nkv=8,hd=128,tp=8,slot0=0,k_cache_batch_stride=0,v_cache_batch_stride=0;
   EMIT
  }
+ template<class...T>bool emit_lingbot_prefill_kv_pair(T...){return false;}
 };
 int main(){
  for(int precision:{0,1,2})for(int p:{336,384})for(bool marker:{false,true}){

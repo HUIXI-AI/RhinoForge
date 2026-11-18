@@ -151,19 +151,15 @@ void rpu_launch_memset_spm_multicore(
 
 // =============================================================================
 // Fill SPM (multi-core broadcast): write `value` into num_elements halfs at the
-// per-core SPM addr. The graph-aware `fill` kernel uses reg0/1 for the SPM byte
-// address, reg2/3 for element count, reg4 for the fp16 value, and reg5=0 for SPM.
-// grid.x=ceil(n/2048).
-void rpu_launch_fill_spm_kernel(uint32_t spm_addr, int64_t num_elements,
-                                c10::Half value, int num_cores,
-                                int core_begin) {
+// per-core SPM addr. Uses the graph-aware oplib `fill` (1D) kernel — the one
+// rhino's CreateFill drives. Reg layout from
+// rhino-ops FillGenerator.get_config (1d branch): reg0/1 SPM byte offset, reg2/3
+// element count, reg4 fp16 value, reg5 mem-flag (0=SPM), grid.x=ceil(n/2048). Graph-
+// aware fetch so it records into the fused graph (get_program needs it preloaded).
+KernelRegisterImage fill_spm_registers(uint32_t spm_addr, int64_t num_elements,
+                                       c10::Half value) {
     TORCH_CHECK(num_elements > 0,
                 "fill_spm: num_elements must be > 0");
-    TORCH_CHECK(core_begin >= 0 && num_cores >= 1 &&
-                    core_begin + num_cores <= SpmAllocator::NUM_CORES,
-                "fill_spm: selected core range must be inside [0, ",
-                SpmAllocator::NUM_CORES, "), got [", core_begin, ", ",
-                core_begin + num_cores, ")");
     TORCH_CHECK(SPM_ALLOC.is_initialized(),
                 "fill_spm: SPM allocator is not initialized");
     const uint64_t element_count = static_cast<uint64_t>(num_elements);
@@ -182,29 +178,45 @@ void rpu_launch_fill_spm_kernel(uint32_t spm_addr, int64_t num_elements,
 
     constexpr uint16_t mem_flag = 0;  // SPM; never admit the DDR fill mode.
     static_assert(mem_flag == 0);
+    const int64_t VAL_NUM_PER_WRP = 2048;
+    const uint16_t gx = (uint16_t)(
+        (num_elements + VAL_NUM_PER_WRP - 1) / VAL_NUM_PER_WRP);
+    KernelRegisterImage image;
+    image.set(0, (uint16_t)(spm_addr & 0xFFFF));
+    image.set(1, (uint16_t)(spm_addr >> 16));
+    image.set(2, (uint16_t)(num_elements & 0xFFFF));
+    image.set(3, (uint16_t)(num_elements >> 16));
+    image.set(4, value.x);  // fp16 fill value (0 for zeroing)
+    image.set(5, mem_flag);
+    image.set(64, gx);
+    image.set(65, (uint16_t)1);
+    image.set(66, (uint16_t)1);
+    image.grid = {gx, 1, 1};
+    return image;
+}
+
+void rpu_launch_fill_spm_kernel(uint32_t spm_addr, int64_t num_elements,
+                                c10::Half value, int num_cores,
+                                int core_begin) {
+    TORCH_CHECK(core_begin >= 0 && num_cores >= 1 &&
+                    core_begin + num_cores <= SpmAllocator::NUM_CORES,
+                "fill_spm: selected core range must be inside [0, ",
+                SpmAllocator::NUM_CORES, "), got [", core_begin, ", ",
+                core_begin + num_cores, ")");
+    const KernelRegisterImage image = fill_spm_registers(spm_addr, num_elements, value);
     auto& graph = RpuKernelGraph::active();
     graph.stage_kernel_no_ddr("fill", GraphKernelNoDdrProof::FillSpm);
     Kernel_t* kernel = graph.get_kernel_reset("fill");
     TORCH_CHECK(kernel != nullptr, "fill_spm: failed to get fill kernel");
-    const int64_t VAL_NUM_PER_WRP = 2048;
-    const uint16_t gx = (uint16_t)(
-        (num_elements + VAL_NUM_PER_WRP - 1) / VAL_NUM_PER_WRP);
-    kernel->set_regs(0, (uint16_t)(spm_addr & 0xFFFF));
-    kernel->set_regs(1, (uint16_t)(spm_addr >> 16));
-    kernel->set_regs(2, (uint16_t)(num_elements & 0xFFFF));
-    kernel->set_regs(3, (uint16_t)(num_elements >> 16));
-    kernel->set_regs(4, value.x);  // fp16 fill value (0 for zeroing)
-    kernel->set_regs(5, mem_flag);
-    kernel->set_regs(64, gx);
-    kernel->set_regs(65, (uint16_t)1);
-    kernel->set_regs(66, (uint16_t)1);
+    for (size_t i = 0; i < image.count; ++i)
+        kernel->set_regs(image.regs[i].first, image.regs[i].second);
     auto* wq = GET_QUEUE(num_cores);
     wq->set_broadcast_mode(true);
     std::vector<uint8_t> cores;
     for (int i = 0; i < num_cores; ++i) {
         cores.push_back(static_cast<uint8_t>(core_begin + i));
     }
-    wq->enqueu_kernel(*kernel, {gx, 1, 1}, cores);
+    wq->enqueu_kernel(*kernel, {image.grid[0], image.grid[1], image.grid[2]}, cores);
 }
 
 // =============================================================================
@@ -339,11 +351,85 @@ void rpu_launch_ddr_broadcast_spm_dma(
         num_elements, spm_addr_unified, num_cores);
 }
 
+namespace {
+
+// Stream 0 belongs to compute. The remaining DMA engines must stay inside
+// the active Graph's immutable allocated core prefix, not the copy's fanout.
+int deferred_lane_count() {
+    const int cores = RpuKernelGraph::active().runtime_policy().execution_core_count;
+    TORCH_CHECK(cores >= 1 && cores <= 8, "deferred DMA: invalid Graph core budget");
+    return cores - 1;
+}
+
+uint8_t next_deferred_lane(DeferredDmaChannels& deferred) {
+    const int lanes = deferred_lane_count();
+    TORCH_CHECK(lanes > 0 && deferred.next < lanes,
+                "deferred DMA: no available lane or token from a different core budget");
+    const uint8_t ch = static_cast<uint8_t>(1 + deferred.next);
+    deferred.next = static_cast<uint8_t>((deferred.next + 1) % lanes);
+    return ch;
+}
+
+// End of lane `lane` when `total` bytes are cut into `lanes` equal
+// 64-byte-aligned runs; the last lane takes the remainder.
+size_t deferred_lane_end(size_t total, int lane, int lanes) {
+    return lane + 1 == lanes
+        ? total : total * static_cast<size_t>(lane + 1) / lanes / 64 * 64;
+}
+
+// The next channel of `deferred`'s rotation, fenced behind stream 0's work so
+// far.
+uint8_t open_deferred_lane(DeferredDmaChannels& deferred) {
+    const uint8_t ch = next_deferred_lane(deferred);
+    graph_dma::emit_barrier(static_cast<uint8_t>(ch * 2), 0);
+    deferred.used |= static_cast<uint8_t>(1u << ch);
+    return ch;
+}
+
+struct DeferredBroadcastPiece {
+    int core;       // destination core
+    size_t offset;  // byte offset into the copy (source and destination)
+    size_t bytes;
+    int lane;       // 0..6, one DMA channel per lane
+};
+
+// Every core's copy, laid end to end, cut into one equal 64-byte-aligned run
+// per lane. Eight per-core copies on seven channels would leave one channel a
+// second copy to finish alone.
+std::vector<DeferredBroadcastPiece> deferred_broadcast_pieces(
+        size_t bytes, int num_cores) {
+    TORCH_CHECK(num_cores >= 1 && num_cores <= 8 && bytes % 64 == 0 &&
+                    bytes <= (8ULL << 20),
+                "ddr_broadcast_spm_dma_mutable deferred: ", num_cores, " cores of ",
+                bytes, " bytes; needs 1..8 cores and a 64-byte multiple of at most 8 MB");
+    const int lanes = std::min(num_cores, deferred_lane_count());
+    TORCH_CHECK(lanes > 0, "deferred broadcast requires a non-compute DMA lane");
+    const size_t total = bytes * static_cast<size_t>(num_cores);
+    std::vector<DeferredBroadcastPiece> pieces;
+    size_t begin = 0;
+    for (int lane = 0; lane < lanes; ++lane) {
+        const size_t end = deferred_lane_end(total, lane, lanes);
+        for (size_t at = begin; at < end;) {
+            const int core = static_cast<int>(at / bytes);
+            const size_t offset = at % bytes;
+            const size_t n = std::min(end - at, bytes - offset);
+            pieces.push_back({core, offset, n, lane});
+            at += n;
+        }
+        begin = end;
+    }
+    return pieces;
+}
+
+}  // namespace
+
 void rpu_launch_ddr_broadcast_spm_dma_mutable(const uint64_t* live_src_base,
                                                 int64_t src_offset_bytes,
                                                 int64_t num_elements,
                                                 uint32_t spm_addr_unified,
-                                                int num_cores) {
+                                                int num_cores,
+                                                DeferredDmaChannels* deferred,
+                                                int64_t sync_elements) {
     TORCH_CHECK(live_src_base != nullptr,
                 "ddr_broadcast_spm_dma_mutable: null live_src_base");
     TORCH_CHECK(num_cores >= 1 && num_cores <= 8,
@@ -357,6 +443,12 @@ void rpu_launch_ddr_broadcast_spm_dma_mutable(const uint64_t* live_src_base,
     TORCH_CHECK(bytes <= (8ULL << 20),
                 "ddr_broadcast_spm_dma_mutable: single-DMA cap is 8 MB, got ", bytes,
                 " bytes (auto-split is future work)");
+    TORCH_CHECK(sync_elements >= 0 && sync_elements < num_elements &&
+                    (deferred != nullptr || sync_elements == 0) &&
+                    (sync_elements * sizeof(c10::Half)) % 16 == 0,
+                "ddr_broadcast_spm_dma_mutable: synchronous prefix ", sync_elements,
+                " must be a 16-byte multiple below ", num_elements,
+                " and needs a deferred token");
 
     // PASSTHROUGH fallback — deref live_src_base 一次,直接发 immediate batch。
     // graph_dma::emit_mutable_* 的"跨 replay re-deref"语义在 PASSTHROUGH 无意义,
@@ -381,16 +473,41 @@ void rpu_launch_ddr_broadcast_spm_dma_mutable(const uint64_t* live_src_base,
 
     // No rpu_ddr_flush here — caller flushes the live buffer per forward.
     // Same barrier structure as the immutable broadcast wrapper.
-    for (int ch = 1; ch < num_cores; ++ch)
-        graph_dma::emit_barrier(static_cast<uint8_t>(ch * 2), 0);
+    // With one allocated core there is no independent DMA stream. Complete
+    // the entire copy on stream 0 and leave the token empty.
+    const bool can_defer = deferred != nullptr && deferred_lane_count() > 0;
+    const size_t sync_bytes = can_defer
+        ? static_cast<size_t>(sync_elements) * sizeof(c10::Half) : bytes;
+    if (sync_bytes > 0) {
+        for (int ch = 1; ch < num_cores; ++ch)
+            graph_dma::emit_barrier(static_cast<uint8_t>(ch * 2), 0);
 
+        for (int c = 0; c < num_cores; ++c)
+            graph_dma::emit_mutable_src(live_src_base, src_offset_bytes,
+                                       spm_unified_to_per_core_abs(c, spm_addr_unified),
+                                       sync_bytes, c);
+
+        for (int ch = 1; ch < num_cores; ++ch)
+            graph_dma::emit_barrier(0, static_cast<uint8_t>(ch * 2));
+    }
+    if (!can_defer) return;
+
+    // The remainder leaves stream 0 free: allocated nonzero channels only, each fenced
+    // behind the work above, joined by rpu_join_deferred_dma.
+    uint8_t channels[8] = {}, fenced = 0;
+    for (int c = 0; c < num_cores; ++c) {
+        channels[c] = next_deferred_lane(*deferred);
+        if (!(fenced & (1u << channels[c]))) {
+            graph_dma::emit_barrier(static_cast<uint8_t>(channels[c] * 2), 0);
+            fenced |= static_cast<uint8_t>(1u << channels[c]);
+        }
+    }
     for (int c = 0; c < num_cores; ++c)
-        graph_dma::emit_mutable_src(live_src_base, src_offset_bytes,
-                                   spm_unified_to_per_core_abs(c, spm_addr_unified),
-                                   bytes, c);
-
-    for (int ch = 1; ch < num_cores; ++ch)
-        graph_dma::emit_barrier(0, static_cast<uint8_t>(ch * 2));
+        graph_dma::emit_mutable_src(
+            live_src_base, src_offset_bytes + static_cast<int64_t>(sync_bytes),
+            spm_unified_to_per_core_abs(c, spm_addr_unified) + sync_bytes,
+            bytes - sync_bytes, channels[c]);
+    deferred->used |= fenced;
 }
 
 void rpu_launch_ddr_broadcast_spm_dma_mutable(
@@ -399,7 +516,8 @@ void rpu_launch_ddr_broadcast_spm_dma_mutable(
         int64_t src_offset_bytes,
         int64_t num_elements,
         uint32_t spm_addr_unified,
-        int num_cores) {
+        int num_cores,
+        DeferredDmaChannels* deferred) {
     TORCH_CHECK(src_offset_bytes >= 0 && num_elements > 0,
                 "ddr_broadcast_spm_dma_mutable owned: invalid byte range");
     const size_t byte_begin = static_cast<size_t>(src_offset_bytes);
@@ -409,6 +527,26 @@ void rpu_launch_ddr_broadcast_spm_dma_mutable(
         owner_tensor, byte_begin, byte_count,
         "ddr_broadcast_spm_dma_mutable owned");
     if (graph_dma::active()) {
+        if (deferred != nullptr && deferred_lane_count() > 0) {
+            // One census occurrence per piece; stream 0 is left free.
+            const auto pieces = deferred_broadcast_pieces(byte_count, num_cores);
+            graph_dma::stage_census_mutable_burst(
+                live_src_base, owner_tensor, GraphOuterFastDmaSide::Source,
+                byte_begin, byte_count, pieces.size());
+            int lane = -1;
+            uint8_t ch = 0;
+            for (const auto& piece : pieces) {
+                if (piece.lane != lane) {
+                    lane = piece.lane;
+                    ch = open_deferred_lane(*deferred);
+                }
+                graph_dma::emit_mutable_src(
+                    &live_src_base, src_offset_bytes + static_cast<int64_t>(piece.offset),
+                    spm_unified_to_per_core_abs(piece.core, spm_addr_unified) + piece.offset,
+                    piece.bytes, ch);
+            }
+            return;
+        }
         graph_dma::stage_census_mutable_burst(
             live_src_base, owner_tensor, GraphOuterFastDmaSide::Source,
             byte_begin, byte_count, static_cast<size_t>(num_cores));
@@ -416,6 +554,14 @@ void rpu_launch_ddr_broadcast_spm_dma_mutable(
     rpu_launch_ddr_broadcast_spm_dma_mutable(
         &live_src_base, src_offset_bytes, num_elements,
         spm_addr_unified, num_cores);
+}
+
+void rpu_join_deferred_dma(DeferredDmaChannels& deferred) {
+    for (int ch = 1; ch < 8; ++ch) {
+        if (deferred.used & (1u << ch))
+            graph_dma::emit_barrier(0, static_cast<uint8_t>(ch * 2));
+    }
+    deferred = DeferredDmaChannels{};
 }
 
 namespace {
@@ -636,6 +782,78 @@ void rpu_launch_spm_scatter_spm_dma(uint32_t  spm_src_unified,
         const uint64_t dst =
             spm_unified_to_per_core_abs(c, spm_dst_unified);
         graph_dma::emit_fixed(src, dst, bytes, c);
+    }
+    emit_scatter_post_barriers(num_cores);
+}
+
+void rpu_launch_spm_group_broadcast_dma(uint32_t spm_src_unified,
+                                        int64_t elements_per_core,
+                                        uint32_t spm_dst_unified,
+                                        int source_cores,
+                                        int num_cores,
+                                        int source_core_base,
+                                        DeferredDmaChannels* deferred) {
+    constexpr const char* caller = "spm_group_broadcast_dma";
+    TORCH_CHECK(SPM_ALLOC.is_initialized(), caller, ": SPM is not initialized");
+    TORCH_CHECK(source_cores >= 1 && source_cores <= num_cores
+                    && num_cores <= 8 && num_cores % source_cores == 0,
+                caller, ": source cores must divide the consumer prefix [1,8]");
+    TORCH_CHECK(source_core_base >= 0
+                    && source_core_base + source_cores <= num_cores,
+                caller, ": source cores must lie inside the consumer prefix");
+    TORCH_CHECK(elements_per_core > 0
+                    && static_cast<uint64_t>(elements_per_core)
+                        <= SpmAllocator::SPM_USABLE / sizeof(c10::Half),
+                caller, ": element count exceeds one SPM window");
+    const uint64_t bytes =
+        static_cast<uint64_t>(elements_per_core) * sizeof(c10::Half);
+    const uint64_t base = SPM_ALLOC.addr(0, 0);
+    TORCH_CHECK(spm_src_unified >= base && spm_dst_unified >= base,
+                caller, ": expected core-0 unified SPM addresses");
+    const uint64_t src_off = spm_src_unified - base;
+    const uint64_t dst_off = spm_dst_unified - base;
+    TORCH_CHECK((bytes % 16) == 0 && (src_off % 16) == 0 && (dst_off % 16) == 0,
+                caller, ": source, destination and byte count must be 16-byte aligned");
+    TORCH_CHECK(src_off + bytes <= SpmAllocator::SPM_USABLE
+                    && dst_off + bytes <= SpmAllocator::SPM_USABLE,
+                caller, ": source or destination exceeds per-core SPM");
+    // Different channels may run in any order. A destination on a producer
+    // core must never overwrite source data still needed by another channel.
+    TORCH_CHECK(src_off + bytes <= dst_off || dst_off + bytes <= src_off,
+                caller, ": source and destination local ranges must be disjoint");
+    TORCH_CHECK(graph_dma::active(), caller, ": requires an active Graph");
+
+    const int repeat = num_cores / source_cores;
+    auto source = [&](int c) {
+        return spm_unified_to_per_core_abs(source_core_base + c / repeat,
+                                           spm_src_unified);
+    };
+    if (deferred != nullptr && deferred_lane_count() > 0) {
+        // Channel 0 is stream 0 itself; use only the allocated nonzero lanes. Any
+        // engine reaches every core's SPM; the channel only picks the stream.
+        uint8_t channels[8] = {};
+        uint8_t fenced = 0;
+        for (int c = 0; c < num_cores; ++c) {
+            channels[c] = next_deferred_lane(*deferred);
+            if (!(fenced & (1u << channels[c]))) {
+                // Fence this burst, not an earlier one: stream 0 may have
+                // run more work since the token last used the channel.
+                graph_dma::emit_barrier(static_cast<uint8_t>(channels[c] * 2), 0);
+                fenced |= static_cast<uint8_t>(1u << channels[c]);
+            }
+        }
+        for (int c = 0; c < num_cores; ++c) {
+            graph_dma::emit_fixed(source(c),
+                                  spm_unified_to_per_core_abs(c, spm_dst_unified),
+                                  bytes, channels[c]);
+        }
+        deferred->used |= fenced;
+        return;
+    }
+    emit_scatter_pre_barriers(num_cores);
+    for (int c = 0; c < num_cores; ++c) {
+        graph_dma::emit_fixed(
+            source(c), spm_unified_to_per_core_abs(c, spm_dst_unified), bytes, c);
     }
     emit_scatter_post_barriers(num_cores);
 }
@@ -1031,9 +1249,13 @@ void rpu_launch_spm_copy_ddr_dma(
         uint32_t spm_addr_unified,
         const at::Tensor& ddr_tensor,
         int64_t dst_offset_elements,
-        int64_t num_elements) {
+        int64_t num_elements,
+        DeferredDmaChannels* deferred,
+        bool source_replicated) {
     TORCH_CHECK(dst_offset_elements >= 0 && num_elements > 0,
                 "spm_copy_ddr_dma owned: invalid element range");
+    TORCH_CHECK(!source_replicated || deferred != nullptr,
+                "spm_copy_ddr_dma owned: a replicated source spreads deferred runs only");
     const size_t byte_begin =
         static_cast<size_t>(dst_offset_elements) * sizeof(c10::Half);
     const size_t byte_count =
@@ -1041,6 +1263,32 @@ void rpu_launch_spm_copy_ddr_dma(
     validate_fp16_dma_owner_slice(
         ddr_tensor, byte_begin, byte_count, "spm_copy_ddr_dma owned");
     if (graph_dma::active()) {
+        if (deferred != nullptr && deferred_lane_count() > 0) {
+            // One run per allocated nonzero channel; stream 0 is left free.
+            const int lanes = deferred_lane_count();
+            TORCH_CHECK(byte_count % 64 == 0 && byte_count >= 64 * lanes &&
+                            byte_count <= (8ULL << 20),
+                        "spm_copy_ddr_dma deferred: ", byte_count, " bytes must be a "
+                        "64-byte multiple of at least one run per channel and at most 8 MB");
+            graph_dma::stage_census_fixed_burst(
+                ddr_tensor, GraphOuterFastDmaSide::Destination,
+                byte_begin, byte_count, /*expected_occurrence_count=*/lanes);
+            c10::Half* ddr_ptr = ddr_tensor.data_ptr<c10::Half>() + dst_offset_elements;
+            rpu_ddr_flush(ddr_ptr);
+            const uint64_t ddr_abs = RpuGetDevAddr(ddr_ptr);
+            size_t begin = 0;
+            for (int lane = 0; lane < lanes; ++lane) {
+                const size_t end = deferred_lane_end(byte_count, lane, lanes);
+                // Every run reading core 0 contends with the overlapped kernel's
+                // own core-0 SPM traffic (measured ~80 us per Pi prefill layer).
+                const uint64_t spm_abs = spm_unified_to_per_core_abs(
+                    source_replicated ? lane + 1 : 0, spm_addr_unified);
+                graph_dma::emit_fixed(spm_abs + begin, ddr_abs + begin, end - begin,
+                                      open_deferred_lane(*deferred));
+                begin = end;
+            }
+            return;
+        }
         graph_dma::stage_census_fixed_burst(
             ddr_tensor, GraphOuterFastDmaSide::Destination,
             byte_begin, byte_count, /*expected_occurrence_count=*/1);
@@ -1489,5 +1737,63 @@ void rpu_launch_spm_scatter_ddr_dma_immediate(uint32_t  spm_addr_unified,
     submit_immediate_batch(wq, "spm_scatter_ddr_dma_immediate");
 
     // Post-flush so subsequent host reads see scatter-written data.
+    rpu_ddr_flush(ddr_base);
+}
+
+void rpu_launch_spm_scatter_rows_ddr_dma_immediate(uint32_t  spm_addr_unified,
+                                                    c10::Half* ddr_base,
+                                                    int64_t   rows,
+                                                    int64_t   elements_per_core,
+                                                    int64_t   spm_row_stride_bytes,
+                                                    int64_t   ddr_row_stride_bytes,
+                                                    int64_t   core_stride_bytes,
+                                                    int       num_cores) {
+    constexpr const char* caller = "spm_scatter_rows_ddr_dma_immediate";
+    RpuKernelGraph::check_direct_immediate_dma_allowed(caller);
+    TORCH_CHECK(!graph_dma::active(), caller, ": eager only");
+    TORCH_CHECK(ddr_base != nullptr, caller, ": null ddr_base");
+    TORCH_CHECK(num_cores >= 1 && num_cores <= 8,
+                caller, ": num_cores 1..8, got ", num_cores);
+    TORCH_CHECK(rows > 0 && elements_per_core > 0, caller,
+                ": rows and elements_per_core must be positive");
+    const size_t bytes =
+        static_cast<size_t>(elements_per_core) * sizeof(c10::Half);
+    TORCH_CHECK(bytes % 16 == 0 && spm_row_stride_bytes % 16 == 0 &&
+                    ddr_row_stride_bytes % 16 == 0 && core_stride_bytes % 16 == 0,
+                caller, ": bytes and strides must be 16-byte aligned");
+    TORCH_CHECK(bytes <= (8ULL << 20), caller, ": single-DMA cap is 8 MB, got ", bytes);
+    const uint32_t spm_base = SPM_ALLOC.addr(0, 0);
+    TORCH_CHECK(spm_addr_unified >= spm_base &&
+                    spm_row_stride_bytes >= static_cast<int64_t>(bytes) &&
+                    static_cast<uint64_t>(spm_addr_unified - spm_base) +
+                            static_cast<uint64_t>(rows - 1) *
+                                static_cast<uint64_t>(spm_row_stride_bytes) +
+                            bytes <= SpmAllocator::SPM_USABLE,
+                caller, ": SPM rows overlap or leave the core SPM");
+
+    rpu_ddr_flush(ddr_base);
+    const uint64_t ddr_abs = RpuGetDevAddr(ddr_base);
+    Queue_t* wq = QueueCache::instance().get(static_cast<uint8_t>(num_cores));
+
+    // Same barrier frame as one scatter; row r of core c lands at
+    // ddr_base + r*ddr_row_stride + c*core_stride, so every row is one batch.
+    for (int ch = 1; ch < num_cores; ++ch)
+        wq->add_barrier(static_cast<uint8_t>(ch * 2), 0);
+    for (int c = 0; c < num_cores; ++c)
+        for (int64_t r = 0; r < rows; ++r)
+            rpu_add_dma_checked(
+                *wq,
+                spm_unified_to_per_core_abs(
+                    c, spm_addr_unified +
+                           static_cast<uint32_t>(r * spm_row_stride_bytes)),
+                ddr_abs + static_cast<uint64_t>(r) *
+                              static_cast<uint64_t>(ddr_row_stride_bytes) +
+                    static_cast<uint64_t>(c) *
+                        static_cast<uint64_t>(core_stride_bytes),
+                bytes, c, caller);
+    for (int ch = 1; ch < num_cores; ++ch)
+        wq->add_barrier(0, static_cast<uint8_t>(ch * 2));
+
+    submit_immediate_batch(wq, caller);
     rpu_ddr_flush(ddr_base);
 }

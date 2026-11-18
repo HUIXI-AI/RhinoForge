@@ -11,6 +11,7 @@
 #pragma once
 
 #include "rpu_ops.h"  // KernelId, KernelCache, QueueCache, g_rpu_ddr_flush_enabled 等
+#include "rpu_dma_endpoint.h"
 #include "graph/execution_coordinator.h"
 #include "graph/graph_infra.h"
 #include "rpu_dma_endpoint.h"
@@ -231,7 +232,7 @@ private:
 void validate_graph_runtime_policy(const GraphRuntimePolicy& runtime_policy);
 bool prepare_graph_runtime_arenas(const GraphRuntimePolicy& runtime_policy);
 std::shared_ptr<RpuKernelGraph> make_registered_rpu_kernel_graph(
-    GraphRuntimePolicy runtime_policy = {});
+    GraphRuntimePolicy runtime_policy = {}, bool require_single_segment = false);
 void invalidate_registered_rpu_kernel_graphs();
 
 // Public allocator bindings route through these process-coordinated helpers.
@@ -1239,7 +1240,8 @@ public:
         REPLAYING
     };
 
-    explicit RpuKernelGraph(GraphRuntimePolicy runtime_policy = {});
+    explicit RpuKernelGraph(GraphRuntimePolicy runtime_policy = {},
+                            bool require_single_segment = false);
     ~RpuKernelGraph();
     RpuKernelGraph(const RpuKernelGraph&) = delete;
     RpuKernelGraph& operator=(const RpuKernelGraph&) = delete;
@@ -1545,7 +1547,7 @@ public:
 
     // ==================== Tensor / SPM 生命周期 ====================
 
-    // 纯生命周期锚点(docs/pitfalls.md#c-1):把 t 的所有权挂到 graph 上,直到
+    // 纯生命周期锚点(the SDK queue contract):把 t 的所有权挂到 graph 上,直到
     // 图真正执行完 —— tensor_refs_ 由 end() 在执行之后才 clear。RECORDING /
     // REPLAYING 之外是 no-op(PASSTHROUGH 下 op 返回前就同步跑完了,没有延迟窗口),
     // 这与 graph_dma::active() 的判据一致。不做 flush:相干性归调用点的
@@ -1832,7 +1834,8 @@ private:
     bool has_semantic_spm_producer_yield_marker_nodes() const;
     void verify_semantic_spm_producer_yield_replay_arm(
         const char* operation) const;
-    void verify_semantic_spm_producer_yield_end_preflight();
+    // Returns the marker scan it compared with the retained flag.
+    bool verify_semantic_spm_producer_yield_end_preflight();
     void verify_composite_fmb_end_preflight() const;
 
     // 取 kernel 的原始入口：PASSTHROUGH 返回共享 kernel；RECORDING 创建私有 kernel；
@@ -1928,9 +1931,14 @@ private:
     // 复用，不由 segment 持有。
     void execute_graph_for_recording();
 
-    // Replay entry-owned prepared batches where their fingerprints match;
-    // otherwise rebuild. Interleaved data nodes consume current bindings.
-    void execute_graph_for_replaying();
+    // REPLAYING 收尾：按 segment 走 QueueCache::get + build_batch +
+    // enqueu_batch。段间 data nodes 重复执行 (capture_data 已在 REPLAYING
+    // 期覆写过各 data node 的 dst/src)。
+    // async_end: submit the final segment without waiting when it takes the
+    // prepared sync-only path (graph/graph_async_end.h); *async_end_submitted
+    // reports whether that happened.
+    void execute_graph_for_replaying(bool async_end = false,
+                                     bool* async_end_submitted = nullptr);
 
     // Prepare a segment and snapshot both mutable and fixed DMA bindings.
     // Optional retained slots may fall back when the SDK rejects build_batch.
@@ -1939,8 +1947,14 @@ private:
         RpuDmaSubmissionLease& submission_lease,
         bool retain_replay_state = true);
     struct PreparedQueueSlot;
+    struct KernelTokenScan;
+    struct KernelTokenPrescan;
+    // `token_prescan` (replay entry only) carries a first-segment token scan
+    // taken before the async-end wait; the first launch consumes or drops it.
     ::rhino_lkn::Queue_t* launch_segment_for_replay(
-        Segment& seg, bool hw_perf_enabled);
+        Segment& seg, bool hw_perf_enabled, bool async_end = false,
+        bool* async_end_submitted = nullptr,
+        KernelTokenPrescan* token_prescan = nullptr);
     bool capture_segment_kernel_register_tokens(
         const Segment& seg,
         std::vector<std::pair<size_t, uint64_t>>& tokens) const;
@@ -1949,8 +1963,12 @@ private:
     void invalidate_batch_snapshots() noexcept;
     void capture_segment_batch_snapshot(
         Segment& seg, PreparedQueueSlot& slot, bool hw_perf_enabled) noexcept;
+    // A non-null `prescanned` result describes tokens already moved into
+    // slot.pending_kernel_register_tokens; otherwise the scan runs here.
     uint32_t launch_segment_sync_only(
-        Segment& seg, PreparedQueueSlot& slot);
+        Segment& seg, PreparedQueueSlot& slot, bool async_end = false,
+        bool* async_end_submitted = nullptr,
+        const KernelTokenScan* prescanned = nullptr);
     ::rhino_lkn::Queue_t* ensure_private_queue(size_t queue_slot_idx,
                                               size_t num_cores);
     size_t prepared_queue_slot_index(size_t segment_idx, bool retain);
@@ -1973,6 +1991,9 @@ private:
     // g_rpu_ddr_flush_enabled 为 false 则整体跳过。不 clear 集合,clear 由
     // 调用方控制(便于在 batch 前后各刷一次后再 clear)。
     void flush_boundary_ptrs();
+    // Async replay end: what the two post-execution flushes above would flush
+    // now, deferred to rpu_graph_async_end_wait().
+    std::vector<void*> post_execution_flush_ptrs();
 
     // 执行单个 data node（Memcpy / Memset）；末尾统一 __sync_synchronize()。
     // 三条 execute_graph_* 路径共享此 helper。
@@ -2061,6 +2082,9 @@ private:
     uint64_t semantic_spm_producer_yield_id_digest_ = 0;
     uint64_t semantic_spm_producer_yield_replay_arm_id_digest_ = 0;
     bool has_semantic_spm_producer_yield_nodes_ = false;
+    // end()'s marker scan, handed once to the execute_graph_for_replaying()
+    // it calls next. Nothing between the two touches nodes_.
+    std::optional<bool> end_scanned_semantic_spm_producer_yield_markers_;
     bool semantic_spm_producer_yield_replay_armed_ = false;
     bool semantic_spm_producer_yield_poisoned_ = false;
 
@@ -2149,6 +2173,7 @@ private:
     // Immutable per-Graph policy. Python freezes all legacy environment inputs
     // before construction; BUILD and every REPLAY consume this same snapshot.
     const GraphRuntimePolicy runtime_policy_;
+    const bool require_single_segment_ = false;
 
     struct ReplayChildSkipState {
         bool active = false;
@@ -2483,6 +2508,28 @@ private:
     };
     std::array<PreparedQueueSlot, kMaxPreparedQueueSlots>
         private_queue_slots_{};
+    // Kernel register-token comparison for the sync-only fast path. It only
+    // reads host Kernel_t tokens: no allocator lease, DMA or device access.
+    struct KernelTokenScan {
+        bool current_tokens_valid = false;
+        bool tokens_unchanged = false;
+    };
+    KernelTokenScan scan_kernel_register_tokens(
+        const Segment& seg, const PreparedQueueSlot& slot,
+        std::vector<std::pair<size_t, uint64_t>>& pending) const;
+    // While another Graph's async end is still running, replay scans its
+    // first segment's tokens before the wait. A use requires the same
+    // segment, slot 0 and committed-token basis; anything else rescans.
+    struct KernelTokenPrescan {
+        bool armed = false;
+        const Segment* seg = nullptr;
+        const PreparedQueueSlot* slot = nullptr;
+        bool basis_tokens_valid = false;
+        size_t basis_token_count = 0;
+        KernelTokenScan scan;
+        std::vector<std::pair<size_t, uint64_t>> tokens;
+    };
+    KernelTokenPrescan kernel_token_prescan_;
 
     // Synchronous DDR data nodes use a separate one-shot queue. A data copy
     // may run between segments whose completed batch remains in slot 0;

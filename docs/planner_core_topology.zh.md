@@ -57,7 +57,7 @@ projection 使用 signed INT8 和 FP16 per-channel scale；GDN b/a、卷积、�
 视频和其他量化结构仍按各自入口检查。
 
 Qwen3.5-35B-A3B mixed-E4M3 使用独立拓扑。权重按
-[官方源下载与 CPU 转换命令](../examples/configs/qwen3_5/README.md#cmd-moe-mixed)准备。
+[官方源下载与 CPU 转换命令](../examples/configs/WEIGHTS.md#cmd-qwen35-moe)准备。
 三种核数共用转换产物，核数对应的补齐和打包在冷态安装时完成：
 
 | 核数 | Attention / GDN / router / head / Vision | Routing / routed / shared | Expert 逻辑 / 物理 width |
@@ -70,10 +70,7 @@ Qwen3.5-35B-A3B mixed-E4M3 使用独立拓扑。权重按
 六核对应 `(2,6,4,4,4,6,6,6,4,8)`。新旧布局 getter 都要求权重已经安装；adapter、cache 和
 Vision bridge 检查完整元组。Gate/up 先拆分逻辑两半再补齐；routed E4M3 使用零 code 和单位
 scale，shared FP16 projection 同步补零。Router 结果先进入模型持有的固定缓冲区，再由六核
-routing 读取；replay 不重新打包权重。入口见
-[TP4](../examples/configs/qwen3_5/vl/35b_a3b/fp8_e4m3_experts_attn_gdn_tp4.toml)、
-[TP6](../examples/configs/qwen3_5/vl/35b_a3b/fp8_e4m3_experts_attn_gdn_tp6.toml) 和
-[TP8](../examples/configs/qwen3_5/vl/35b_a3b/fp8_e4m3_experts_attn_gdn.toml)。
+routing 读取；replay 不重新打包权重。入口见 [mixed-E4M3 模板](../examples/configs/qwen3_5/vl/35b_a3b/fp8_e4m3_experts_attn_gdn.toml)（通过 `rpu_execution.model.num_cores` 选择 `4`、`6` 或 `8` 核）。
 
 Pi0.5 FP16/W8A16 缩核使用 Vision4、attention4、conditioning4，以及 MLP4 或 MLP6。
 各相机分别以 256 行执行，物理 KV 保留八条分片。其他模型按自身入口检查；HALO 的 `attn_tp`

@@ -20,6 +20,13 @@
 #include "rpu_helpers.h"
 #include "rpu_kvinsert_segment_plan.h"
 #include "rpu_linear_tiling.h"
+#include "rpu_pi_wall_tiling.h"
+#include "rpu_pi_wall_runtime.h"
+#include "rpu_qwen3vl_linear_contracts.h"
+#include "rpu_specialized_linear_contracts.h"
+#include "rpu_qwen3_w8a8_contract.h"
+#include "rpu_qwen3_c192_contract.h"
+#include "rpu_qwen3_c512_contract.h"
 #include <ATen/record_function.h>
 #include <c10/util/Half.h>
 #include <c10/util/ScopeExit.h>
@@ -386,18 +393,21 @@ inline std::vector<int64_t> causal_deepstack_topology_arguments(
 //   Qwen3 系列 vocab 一致 = 151936 (0.6B/1.7B/4B/8B/14B/32B)
 //   per-core: 151936/8 = 18992 halves ≈ 38 KB
 //   上限设 200000 (per-core 25000 halves = 50 KB), 给未来更大 vocab 模型留余量
-// 八核默认50 KB/core；4/6核模板的冷态 head TP4 固定预留100 KB/core。
+// 八核默认50 KB/core；4核及小词表6核预留100 KB/core (TP4)，151936/128256词表6核使用TP6 (~67 KB/core)。
 inline constexpr int64_t QWEN3_FUSED_LM_HEAD_MAX_VOCAB = 200000;
 
 inline int resolve_causal_decoder_lm_head_tp(int core_count, int64_t vocab_size) {
     TORCH_CHECK(core_count == 8 || core_count == 6 || core_count == 4,
                 "causal decoder admits the default eight-core or reduced-core Qwen3 profile");
     TORCH_CHECK(vocab_size >= 0, "causal decoder configured vocab_size must be nonnegative");
-    TORCH_CHECK(core_count == 8 || vocab_size == 151936,
-                "reduced-core Qwen3 profile requires the actual Qwen3 vocab_size=151936 at creation");
+    TORCH_CHECK(core_count == 8 || vocab_size == 151936 || vocab_size == 128256 ||
+                    vocab_size == 3072 || vocab_size == 2048 || vocab_size == 0,
+                "reduced-core decoder requires its text/speech vocabulary or a headless profile");
     // The reserve ceiling describes capacity, not model geometry. TP remains
     // bound even when the optional fused weight is absent or later cleared.
-    return core_count == 8 ? 8 : 4;
+    if (core_count == 8) return 8;
+    if (core_count == 6 && (vocab_size == 151936 || vocab_size == 128256)) return 6;
+    return 4;
 }
 
 // =============================================================================
@@ -531,9 +541,16 @@ public:
     bool has_qk_norm_ = false;
     bool tts_codec_mode_ = false;
 
+    // No-QK-norm K RoPE normally rotates one local row of nkv*hd/tp channels,
+    // which equals one head when each core owns one KV head (Llama TP8). The
+    // codec and reduced Llama own several heads per core and rotate per head.
+    bool per_head_key_rope() const {
+        return tts_codec_mode_ || reduced_llama_profile_;
+    }
+
     void set_tts_codec_mode() {
         TORCH_CHECK(!tts_codec_mode_ && !RpuKernelGraph::has_active() &&
-                        num_cores() == 8 && num_layers() == 8 && hidden_size() == 512 &&
+                        (num_cores() == 8 || num_cores() == 4) && num_layers() == 8 && hidden_size() == 512 &&
                         intermediate_size() == 1024 && num_q_heads() == 16 &&
                         num_kv_heads() == 16 && head_dim() == 64 &&
                         !has_qk_norm_ && !has_qkv_bias_ && !adarms_ && use_silu_,
@@ -707,8 +724,13 @@ public:
                         !rhinovla_precision_bound_,
                     "RhinoVLA text precision must be bound once before forward");
         if (enabled) {
+            // 4/6 cores use the reduced Qwen3-VL text topology (attention 4,
+            // MLP on the budget); the HIGH norm and activation routes follow
+            // attn_tp()/mlp_tp() like the BASE ones.
             TORCH_CHECK(typeid(*this) == typeid(CausalDecoderModel) &&
-                            num_cores() == 8 && num_layers() == 28 && hidden_size() == 2048 &&
+                            (num_cores() == 8 ||
+                             (attn_tp() == 4 && mlp_tp() == num_cores())) &&
+                            num_layers() == 28 && hidden_size() == 2048 &&
                             intermediate_size() == 6144 && num_q_heads() == 16 &&
                             num_kv_heads() == 8 && head_dim() == 128 &&
                             has_qk_norm_ && has_mrope_ && use_silu_ && !adarms_ &&
@@ -744,10 +766,91 @@ public:
     }
 
     void set_linear_acc32(bool enabled) {
+        TORCH_CHECK((!qwen3_prefill_w8a8_ && !qwen3_inplace_capacity()) || !enabled,
+                    "Qwen3 prefill W8A8 cannot change its frozen ACC16 baseline/decode mode");
         TORCH_CHECK(
             get_last_resolved_chunk_size() == 0,
             "causal decoder linear accumulation mode must be set before the first forward");
         linear_acc32_ = enabled;
+        invalidate_model_state();
+    }
+
+    int64_t qwen3_inplace_capacity() const {
+        return qwen3_c512_ ? 512 : qwen3_c256_ ? 256 : qwen3_c192_ ? 192 : 0;
+    }
+
+    void set_qwen3_c512(bool enabled) {
+        constexpr const char* operation = "qwen3_c512";
+        RpuExecutionCoordinator::require_graph_quiescent(operation);
+        RpuExecutionCoordinator::check_current_thread_execution_allowed(operation);
+        TORCH_CHECK(!RpuKernelGraph::has_active() && get_last_resolved_chunk_size() == 0 &&
+                        !qwen3_c192_bound_ && !qwen3_c256_bound_ && !qwen3_c512_bound_ && !qwen3_prefill_w8a8_bound_,
+                    "Qwen3 C512 must be bound once after weights/envelope/ACC16 and before A8/planning");
+        if (enabled) {
+            require_qwen3_32b_w8_profile();
+            TORCH_CHECK(chunk_envelope().max_kv_len == 512 && chunk_envelope().chunk == 512 &&
+                            !fuse_prefill_last_lm_head_ && !get_debug_export() &&
+                            ordinary_rmsnorm_spm_contract_.resolve(128, 5120) == RpuRmsNormSpmRoute::V32_GRID8,
+                        "Qwen3 C512 requires P512/C512, segmented V32_GRID8 RMSNorm and external Prefill head");
+            TORCH_CHECK(KernelCache::instance().has_loaded(KernelId::QWEN3_UP_MUL_W8A8_M512N64K128) &&
+                            KernelCache::instance().has_loaded(KernelId::LLM_ALL_REDUCE_RESIDUAL_RING_LOCAL_SPM),
+                        "Qwen3 C512 requires its exact UpMul and compact-residual ring payloads");
+        }
+        qwen3_c512_ = enabled;
+        qwen3_c512_bound_ = true;
+        invalidate_model_state();
+    }
+
+    void set_qwen3_c256(bool enabled) {
+        constexpr const char* operation = "qwen3_c256";
+        RpuExecutionCoordinator::require_graph_quiescent(operation);
+        RpuExecutionCoordinator::check_current_thread_execution_allowed(operation);
+        TORCH_CHECK(!RpuKernelGraph::has_active() && get_last_resolved_chunk_size() == 0 &&
+                        !qwen3_c192_bound_ && !qwen3_c256_bound_ && !qwen3_c512_bound_ && !qwen3_prefill_w8a8_bound_,
+                    "Qwen3 C256 must be bound once after weights/envelope/ACC16 and before A8/planning");
+        if (enabled) {
+            require_qwen3_32b_w8_profile();
+            TORCH_CHECK(chunk_envelope().max_kv_len == 512 && chunk_envelope().chunk == 256 &&
+                            ordinary_rmsnorm_spm_contract_.resolve(256, 5120) == RpuRmsNormSpmRoute::V32_GRID8,
+                        "Qwen3 C256 requires exact P512/C256 and V32_GRID8 RMSNorm");
+            TORCH_CHECK(KernelCache::instance().has_loaded(KernelId::QWEN3_UP_MUL_W8A16_M320N112K128),
+                        "Qwen3 C256 requires its Up-Mul W8A16 expansion payload");
+        }
+        qwen3_c256_ = enabled;
+        qwen3_c256_bound_ = true;
+        invalidate_model_state();
+    }
+
+    void set_qwen3_c192(bool enabled) {
+        constexpr const char* operation = "qwen3_c192";
+        RpuExecutionCoordinator::require_graph_quiescent(operation);
+        RpuExecutionCoordinator::check_current_thread_execution_allowed(operation);
+        TORCH_CHECK(!RpuKernelGraph::has_active() && get_last_resolved_chunk_size() == 0 &&
+                        !qwen3_c192_bound_ && !qwen3_c256_bound_ && !qwen3_c512_bound_ && !qwen3_prefill_w8a8_bound_,
+                    "Qwen3 C192 must be bound once after weights/envelope/ACC16 and before A8/planning");
+        if (enabled) {
+            require_qwen3_32b_w8_profile();
+            TORCH_CHECK(ordinary_rmsnorm_spm_contract_.resolve(192, 5120) == RpuRmsNormSpmRoute::V32_GRID8,
+                        "Qwen3 C192 requires its original V32_GRID8 RMSNorm arithmetic");
+            TORCH_CHECK(chunk_envelope().max_kv_len == 512 && chunk_envelope().chunk == 192,
+                        "Qwen3 C192 requires the exact P512/C192 envelope");
+        }
+        qwen3_c192_ = enabled;
+        qwen3_c192_bound_ = true;
+        invalidate_model_state();
+    }
+
+    void set_prefill_w8a8(bool enabled) {
+        constexpr const char* operation = "qwen3_prefill_w8a8";
+        RpuExecutionCoordinator::require_graph_quiescent(operation);
+        RpuExecutionCoordinator::check_current_thread_execution_allowed(operation);
+        TORCH_CHECK(!RpuKernelGraph::has_active() && get_last_resolved_chunk_size() == 0 &&
+                        !qwen3_prefill_w8a8_bound_,
+                    "Qwen3 prefill W8A8 must be bound once after weights and before planning/forward");
+        TORCH_CHECK(!qwen3_c512_ || enabled, "Qwen3 C512 requires Prefill W8A8");
+        if (enabled) require_qwen3_prefill_w8a8_profile();
+        qwen3_prefill_w8a8_ = enabled;
+        qwen3_prefill_w8a8_bound_ = true;
         invalidate_model_state();
     }
 
@@ -1013,6 +1116,8 @@ public:
         at::Tensor up_nvfp4_tensor_scales = {},
         at::Tensor down_nvfp4_tensor_scales = {})
     {
+        TORCH_CHECK(!qwen3_prefill_w8a8_bound_ && !qwen3_c192_bound_ && !qwen3_c256_bound_ && !qwen3_c512_bound_,
+                    "Qwen3 weights cannot change after the prefill W8A8 mode is bound");
         TORCH_CHECK(!lingbot_prefill_mode_bound_,
                     "LingBot language weights cannot change after the cold mode is bound");
         // ─────────────────────────────────────────────────────────────────────
@@ -1294,55 +1399,297 @@ public:
         // ─────────────────────────────────────────────────────────────────────
         // Commit state
         // ─────────────────────────────────────────────────────────────────────
+        const bool reduced_packed_w4 = num_cores() != 8 && has_scale && !has_nvfp4 &&
+            !q_w_list.empty() && q_w_list[0].scalar_type() == at::kByte;
+        const bool speech_dense_geometry = num_q_heads == 16 && num_kv_heads == 8 &&
+            head_dim == 128 && eps == 1e-6 && qk_norm_present &&
+            mrope_section.empty() && deepstack_lang_layers.empty() &&
+            ((hidden_size == 1024 && intermediate_size == 3072) ||
+             (hidden_size == 2048 && intermediate_size == 6144));
+        const bool tts_talker_profile = configured_vocab_size_ == 3072 && N == 28 &&
+            speech_dense_geometry;
+        const bool tts_predictor_profile = configured_vocab_size_ == 2048 && N == 5 &&
+            hidden_size == 1024 && speech_dense_geometry;
+        const bool tts_codec_profile = num_cores() == 4 && configured_vocab_size_ == 0 &&
+            N == 8 && hidden_size == 512 && intermediate_size == 1024 &&
+            num_q_heads == 16 && num_kv_heads == 16 && head_dim == 64 && eps == 1e-5 &&
+            !qk_norm_present && !has_scale &&
+            mrope_section.empty() && deepstack_lang_layers.empty();
+        // Exact Llama-3.2-1B: the Qwen3 template without QK-norm, paired with
+        // its own cold vocabulary. FP16, or the on-install W8A16, G32 W4A16
+        // and NVFP4 decoder recipes admitted below (the head stays FP16).
+        const bool llama_text_profile = num_cores() != 8 &&
+            configured_vocab_size_ == 128256 && !qk_norm_present &&
+            mrope_section.empty() && deepstack_lang_layers.empty() &&
+            N == llama_fp16_profile_num_layers(num_q_heads, num_kv_heads, head_dim,
+                                               hidden_size, intermediate_size);
+        // Exact headless InternVLA-N1 System-2 text (Qwen2.5-VL-7B W8A16): QKV
+        // bias, no QK-norm and M-RoPE [16,24,24] without DeepStack.
+        const bool internvla_text_profile = num_cores() != 8 &&
+            configured_vocab_size_ == 0 && qkv_bias_present && !qk_norm_present &&
+            has_scale && !has_nvfp4 && !q_w_list.empty() &&
+            q_w_list[0].scalar_type() == at::kChar && eps == 1e-6 && use_silu &&
+            mrope_section == std::vector<int64_t>{16, 24, 24} &&
+            deepstack_lang_layers.empty() &&
+            N == internvla_text_profile_num_layers(num_q_heads, num_kv_heads, head_dim,
+                                                   hidden_size, intermediate_size);
+        // Exact headless Wall-OSS 0.5 text (expert 0) and action (expert 1)
+        // decoders: Qwen2.5 bias, no QK-norm and M-RoPE [16,24,24]. Text admits
+        // FP16 or W8A16; the action expert also admits its NVFP4 projections.
+        // Reduced RTC folds a 1/4 residual scale into the text decoder only,
+        // whose RMSNorm then takes eps/16 (RMSNorm(x/4, eps/16) == RMSNorm(x, eps)).
+        const bool wall_eps = eps == 1e-6 ||
+            (typeid(*this) == typeid(CausalDecoderModel) && eps == 1e-6 / 16.0);
+        const bool wall_qwen25_semantics = num_cores() != 8 &&
+            configured_vocab_size_ == 0 && qkv_bias_present && !qk_norm_present &&
+            wall_eps && use_silu && mrope_section == std::vector<int64_t>{16, 24, 24} &&
+            deepstack_lang_layers.empty() && !q_w_list.empty() &&
+            (!has_scale || (!has_nvfp4 && q_w_list[0].scalar_type() == at::kChar));
+        const bool wall_text_profile = wall_qwen25_semantics &&
+            typeid(*this) == typeid(CausalDecoderModel) &&
+            N == wall_oss_text_profile_num_layers(num_q_heads, num_kv_heads, head_dim,
+                                                  hidden_size, intermediate_size);
+        const bool wall_action_nvfp4 = num_cores() != 8 && configured_vocab_size_ == 0 &&
+            qkv_bias_present && !qk_norm_present && eps == 1e-6 && use_silu &&
+            mrope_section == std::vector<int64_t>{16, 24, 24} &&
+            deepstack_lang_layers.empty() && has_scale && has_nvfp4;
+        const bool wall_action_profile = (wall_qwen25_semantics || wall_action_nvfp4) &&
+            reduced_wall_action_owner() &&
+            N == wall_oss_action_profile_num_layers(num_q_heads, num_kv_heads, head_dim,
+                                                    hidden_size, intermediate_size);
+        // Exact headless HyVLA VLM (FP16/W8A16/G32 W4A16) and four-core action
+        // expert (FP16/W8A16/G32 W4A16/NVFP4): no bias, QK-norm, eps 1e-5 and
+        // no M-RoPE. Only the owning subclasses declare these semantics.
+        const bool hyvla_semantics = num_cores() != 8 && reduced_hyvla_owner() != 0 &&
+            configured_vocab_size_ == 0 && !qkv_bias_present && qk_norm_present &&
+            eps == 1e-5 && use_silu && mrope_section.empty() &&
+            deepstack_lang_layers.empty() && !q_w_list.empty();
+        const bool hyvla_vlm_profile = hyvla_semantics &&
+            reduced_hyvla_owner() == REDUCED_HYVLA_VLM_OWNER &&
+            (!has_scale || (!has_nvfp4 && (q_w_list[0].scalar_type() == at::kChar ||
+                                           reduced_packed_w4))) &&
+            N == hyvla_vlm_profile_num_layers(num_q_heads, num_kv_heads, head_dim,
+                                              hidden_size, intermediate_size);
+        const bool hyvla_expert_profile = hyvla_semantics && num_cores() == 4 &&
+            reduced_hyvla_owner() == REDUCED_HYVLA_EXPERT_OWNER &&
+            (!has_scale || has_nvfp4 || q_w_list[0].scalar_type() == at::kChar ||
+             reduced_packed_w4) &&
+            N == hyvla_expert_profile_num_layers(num_q_heads, num_kv_heads, head_dim,
+                                                 hidden_size, intermediate_size);
+        const bool hyvla_profile = hyvla_vlm_profile || hyvla_expert_profile;
+        // Exact headless LingBot v2 action expert, always a four-core child:
+        // Qwen2.5 QKV bias, no QK-norm, eps 1e-6, no M-RoPE. Its base W8A16
+        // binds the attention/shared-expert scales after set_weights, so a
+        // uniform int8 install arrives here without scale lists.
+        const bool lingbot2_expert_profile = num_cores() == 4 &&
+            reduced_lingbot2_expert_owner() && configured_vocab_size_ == 0 &&
+            qkv_bias_present && !qk_norm_present && eps == 1e-6 && use_silu &&
+            mrope_section.empty() && deepstack_lang_layers.empty() && !has_scale &&
+            !q_w_list.empty() &&
+            (q_w_list[0].scalar_type() == at::kHalf || q_w_list[0].scalar_type() == at::kChar) &&
+            N == lingbot2_expert_profile_num_layers(num_q_heads, num_kv_heads, head_dim,
+                                                    hidden_size, intermediate_size);
+        const bool lingbot2_deferred_w8 = lingbot2_expert_profile &&
+            q_w_list[0].scalar_type() == at::kChar;
+        bool reduced_dense_nvfp4 = false;
         if (num_cores() != 8) {
             const bool vl_semantics =
                 hidden_size != 1024 &&
                 mrope_section == std::vector<int64_t>{24, 20, 20} &&
                 deepstack_lang_layers == std::vector<int64_t>{0, 1, 2};
-            TORCH_CHECK(num_layers() == 0 || reduced_qwen3vl_profile_ == vl_semantics,
+            TORCH_CHECK(num_layers() == 0 || (reduced_qwen3vl_profile_ == vl_semantics &&
+                                              reduced_llama_profile_ == llama_text_profile &&
+                                              reduced_internvla_profile_ == internvla_text_profile &&
+                                              reduced_wall_text_profile_ == wall_text_profile &&
+                                              reduced_wall_action_profile_ == wall_action_profile &&
+                                              reduced_hyvla_profile_ == hyvla_profile &&
+                                              reduced_lingbot2_expert_profile_ ==
+                                                  lingbot2_expert_profile),
                         "reduced-core decoder cannot change its installed text semantics");
+            const bool plain_text_w8 = mrope_section.empty() && deepstack_lang_layers.empty() &&
+                (N == qwen3_fp16_profile_num_layers(num_q_heads, num_kv_heads,
+                                                   head_dim, hidden_size, intermediate_size) ||
+                 tts_predictor_profile);
+            const bool vl_text_w8 = vl_semantics &&
+                N == qwen3_fp16_profile_num_layers(num_q_heads, num_kv_heads,
+                                                  head_dim, hidden_size, intermediate_size);
+            // GR00T's headless 16-layer prefix of the 2B text: FP16, W8A16 or
+            // G32 packed W4 (its I6144 is 384-aligned); NVFP4 stays bound to
+            // the full models.
+            const bool vl_prefix_text = vl_semantics &&
+                N == qwen3_vl_text_prefix_num_layers(num_q_heads, num_kv_heads,
+                                                     head_dim, hidden_size, intermediate_size);
             const bool bounded_text_w8 = has_scale && !has_nvfp4 &&
-                N == 28 && num_q_heads == 16 &&
-                num_kv_heads == 8 && head_dim == 128 && hidden_size == 2048 &&
-                intermediate_size == 6144 &&
-                (vl_semantics || (mrope_section.empty() && deepstack_lang_layers.empty()));
-            TORCH_CHECK((!has_scale || bounded_text_w8) && !has_nvfp4 &&
-                            (vl_semantics || (mrope_section.empty() &&
-                                              deepstack_lang_layers.empty())) &&
-                            !wall_prefill_mixed_requested_ && !wall_prefill_staged_requested_,
-                        "reduced-core decoder requires plain Qwen3 / Qwen3-VL FP16 or exact Qwen3-1.7B / Qwen3-VL-2B W8A16");
-            TORCH_CHECK(cold_routes_configured_ && configured_vocab_size_ == 151936 &&
-                            lm_head_tp() == 4,
+                q_w_list[0].scalar_type() == at::kChar &&
+                (plain_text_w8 || vl_text_w8 || vl_prefix_text || internvla_text_profile ||
+                 wall_text_profile || wall_action_profile || hyvla_profile ||
+                 llama_text_profile);
+            // HyVLA's VLM I6144 and expert I2048 are already 384/256-aligned,
+            // so its packed G32 MLP keeps the logical width at four/six lanes.
+            const bool bounded_text_w4 = reduced_packed_w4 &&
+                (plain_text_w8 || vl_text_w8 || vl_prefix_text || llama_text_profile ||
+                 hyvla_profile);
+            const bool vl_2b_nvfp4 = vl_semantics && N == 28 && hidden_size == 2048 &&
+                intermediate_size == 6144 && num_q_heads == 16 && num_kv_heads == 8 &&
+                head_dim == 128 && eps == 1e-6 && qk_norm_present;
+            // Exact dense Qwen3 4B/8B/14B and Qwen3-VL 4B/8B text NVFP4 (the
+            // 64-layer 32B has no NVFP4 recipe). Like packed W4, a six-lane
+            // MLP that is not 384-aligned (I9728, I17408) is zero-padded at
+            // installation; four lanes and I12288 keep the logical width.
+            // Llama-3.2-1B (no QK-norm, eps 1e-5) pads its six-lane I8192 to 8448.
+            reduced_dense_nvfp4 = has_scale && has_nvfp4 && !qkv_bias_present && use_silu &&
+                ((qk_norm_present && eps == 1e-6 && hidden_size >= 2560 &&
+                  N != 64 && (plain_text_w8 || vl_text_w8)) ||
+                 llama_text_profile);
+            const bool bounded_nvfp4 = has_scale && has_nvfp4 &&
+                ((speech_dense_geometry && (N == 28 || tts_predictor_profile)) || vl_2b_nvfp4 ||
+                 reduced_dense_nvfp4 ||
+                 (wall_action_profile && wall_action_nvfp4) || hyvla_expert_profile);
+            TORCH_CHECK(num_layers() == 0 || (reduced_qwen3_w4_profile_ == bounded_text_w4 &&
+                                              reduced_qwen3_nvfp4_profile_ == reduced_dense_nvfp4),
+                        "reduced-core decoder cannot change its installed packed topology");
+            TORCH_CHECK((!has_scale || bounded_text_w8 || bounded_text_w4 || bounded_nvfp4) &&
+                            (!has_nvfp4 || bounded_nvfp4) &&
+                            (vl_semantics || internvla_text_profile || wall_text_profile ||
+                             wall_action_profile ||
+                             (mrope_section.empty() && deepstack_lang_layers.empty())) &&
+                            !wall_prefill_mixed_requested_ && !wall_prefill_staged_requested_ &&
+                            wall_sorting_.fp16_transfer_mask == 0 && !wall_sorting_.fp16_mlp_m224 &&
+                            !wall_sorting_.silu_mul && !wall_sorting_.action_activation_reuse &&
+                            !wall_sorting_.prefill_row_reuse && !wall_sorting_.prefill_mlp_retile &&
+                            !wall_sorting_.paired_postnorm_tile40 && !wall_sorting_.vision_row_reuse,
+                        "reduced-core decoder requires admitted dense FP16, W8A16, G32 W4A16 or NVFP4 "
+                        "without Wall mixed, staged or sorting routes");
+            TORCH_CHECK(cold_routes_configured_ && (configured_vocab_size_ == 151936 ||
+                            tts_talker_profile || tts_predictor_profile || tts_codec_profile ||
+                            llama_text_profile || internvla_text_profile ||
+                            wall_text_profile || wall_action_profile || hyvla_profile ||
+                            lingbot2_expert_profile) &&
+                            lm_head_tp() == ((configured_vocab_size_ == 151936 || llama_text_profile) &&
+                                             num_cores() == 6 ? 6 : 4),
                         "reduced-core Qwen3 profile requires cold vocabulary topology before weights");
             TORCH_CHECK((num_cores() == 4 || num_cores() == 6) &&
-                            N == qwen3_fp16_profile_num_layers(
+                            (N == qwen3_fp16_profile_num_layers(
                                 num_q_heads, num_kv_heads, head_dim,
-                                hidden_size, intermediate_size) && use_silu &&
-                            qk_norm_present && !qkv_bias_present &&
-                            typeid(*this) == typeid(CausalDecoderModel),
-                        "reduced-core decoder requires an exact FP16 Qwen3 or Qwen3-VL geometry and layer count");
+                                hidden_size, intermediate_size) ||
+                             vl_prefix_text ||
+                             tts_predictor_profile || tts_codec_profile ||
+                             llama_text_profile || internvla_text_profile ||
+                             wall_text_profile || wall_action_profile || hyvla_profile ||
+                             lingbot2_expert_profile) && use_silu &&
+                            (qk_norm_present || tts_codec_profile || llama_text_profile ||
+                             internvla_text_profile || wall_text_profile || wall_action_profile ||
+                             lingbot2_expert_profile) &&
+                            (!qkv_bias_present || internvla_text_profile || wall_text_profile ||
+                             wall_action_profile || lingbot2_expert_profile) &&
+                            (typeid(*this) == typeid(CausalDecoderModel) || wall_action_profile ||
+                             hyvla_profile || lingbot2_expert_profile),
+                        "reduced-core decoder requires an exact FP16 Qwen3, Qwen3-VL, GR00T text prefix, "
+                        "Llama-3.2-1B, InternVLA text, Wall-OSS text/action, HyVLA VLM/expert "
+                        "or LingBot v2 expert geometry and layer count");
             for (const auto* weights : {&q_w_list, &k_w_list, &v_w_list,
                                       &o_w_list, &gate_list, &up_list, &down_list}) {
                 for (const auto& weight : *weights) {
-                    TORCH_CHECK(weight.scalar_type() == (bounded_text_w8 ? at::kChar : at::kHalf),
-                                "reduced-core decoder requires a uniform admitted FP16 or INT8 projection inventory");
+                    TORCH_CHECK(weight.scalar_type() == (bounded_text_w4 || bounded_nvfp4 ? at::kByte :
+                                                        bounded_text_w8 || lingbot2_deferred_w8
+                                                            ? at::kChar : at::kHalf),
+                                "reduced-core decoder requires a uniform admitted projection precision");
                 }
             }
-            const auto topology = resolve_decoder_execution_topology(
-                num_cores(), num_q_heads, num_kv_heads, head_dim, hidden_size, intermediate_size);
-            const int64_t physical_intermediate = decoder_mlp_intermediate_size(
-                intermediate_size, topology.mlp_tp);
+            auto topology = tts_codec_profile ? DecoderExecutionTopology{4, 4, 4} :
+                resolve_decoder_execution_topology(
+                    num_cores(), num_q_heads, num_kv_heads, head_dim, hidden_size, intermediate_size);
+            // Packed G32 and dense NVFP4 keep the fixed MLP6 template; their
+            // installers zero-pad six-lane widths that are not 192-aligned
+            // (G32 values 0 and scales 1) or 384-aligned (NVFP4 codes/scales 0).
+            const int64_t physical_intermediate = bounded_text_w4
+                ? decoder_packed_w4_mlp_intermediate_size(intermediate_size, topology.mlp_tp)
+                : reduced_dense_nvfp4
+                ? decoder_nvfp4_mlp_intermediate_size(intermediate_size, topology.mlp_tp)
+                : decoder_mlp_intermediate_size(intermediate_size, topology.mlp_tp);
+            const int64_t storage_divisor = bounded_text_w4 || bounded_nvfp4 ? 2 : 1;
+            const auto storage_rows = [&](int64_t n, int partition, int cores) {
+                const int64_t local_n = partition == 1 ? n / cores : n;
+                return bounded_text_w4 ? ((local_n + 31) / 32) * 32 *
+                    (partition == 1 ? cores : 1) : n;
+            };
+            if (tts_talker_profile || tts_predictor_profile || tts_codec_profile) {
+                for (int64_t i = 0; i < N; ++i) {
+                    TORCH_CHECK(q_w_list[i].size(0) == num_q_heads * head_dim &&
+                                    q_w_list[i].size(1) == hidden_size / storage_divisor &&
+                                    k_w_list[i].size(0) == num_kv_heads * head_dim &&
+                                    k_w_list[i].size(1) == hidden_size / storage_divisor &&
+                                    v_w_list[i].size(0) == num_kv_heads * head_dim &&
+                                    v_w_list[i].size(1) == hidden_size / storage_divisor &&
+                                    o_w_list[i].size(0) == hidden_size &&
+                                    o_w_list[i].size(1) == num_q_heads * head_dim / storage_divisor,
+                                "speech decoder projection storage differs from its cold geometry");
+                }
+            }
             for (int64_t i = 0; i < N; ++i) {
-                TORCH_CHECK(gate_list[i].size(0) == physical_intermediate &&
-                                gate_list[i].size(1) == hidden_size &&
-                                up_list[i].size(0) == physical_intermediate &&
-                                up_list[i].size(1) == hidden_size &&
-                                down_list[i].size(0) == hidden_size &&
-                                down_list[i].size(1) == physical_intermediate,
+                TORCH_CHECK(gate_list[i].size(0) == storage_rows(physical_intermediate, 1, topology.mlp_tp) &&
+                                gate_list[i].size(1) == hidden_size / storage_divisor &&
+                                up_list[i].size(0) == storage_rows(physical_intermediate, 1, topology.mlp_tp) &&
+                                up_list[i].size(1) == hidden_size / storage_divisor &&
+                                down_list[i].size(0) == storage_rows(hidden_size, 0, topology.mlp_tp) &&
+                                down_list[i].size(1) == physical_intermediate / storage_divisor,
                             "reduced-core Qwen3 MLP weights must match the physical cold geometry at layer ", i);
             }
+            if (bounded_text_w4 || bounded_nvfp4) {
+                auto check_packed_projection = [&](const at::TensorList& weights,
+                        const at::TensorList& scales, int64_t n, int64_t k,
+                        int partition, int cores) {
+                    const int64_t local_n = partition == 1 ? n / cores : n;
+                    const int64_t local_k = partition == 0 ? k / cores : k;
+                    TORCH_CHECK(local_n % 16 == 0 &&
+                                    local_k % (bounded_text_w4 ? 32 : 64) == 0,
+                                "packed reduced Qwen3 requires aligned per-core geometry");
+                    const int64_t count = cores * ((local_k / 32 + 3) / 4) *
+                        ((local_n + 63) / 64) * 256;
+                    for (int64_t i = 0; i < N; ++i) {
+                        TORCH_CHECK(weights[i].size(0) == storage_rows(n, partition, cores) &&
+                                        weights[i].size(1) == k / 2,
+                                    "packed reduced decoder requires its exact weight geometry");
+                        if (bounded_nvfp4) {
+                            TORCH_CHECK(scales[i].scalar_type() == at::kByte &&
+                                            scales[i].dim() == 2 && scales[i].size(0) == k / 16 &&
+                                            scales[i].size(1) == n,
+                                        "reduced-core NVFP4 requires uniform UINT8 block scales [K/16,N]");
+                        } else {
+                            TORCH_CHECK(scales[i].scalar_type() == at::kHalf &&
+                                            scales[i].dim() == 2 && scales[i].size(0) == 32 &&
+                                            scales[i].numel() == count,
+                                        "packed reduced decoder requires its exact G32 scale layout");
+                        }
+                    }
+                };
+                check_packed_projection(q_w_list, q_w_scale_list, num_q_heads * head_dim,
+                                        hidden_size, 1, topology.attention_tp);
+                check_packed_projection(k_w_list, k_w_scale_list, num_kv_heads * head_dim,
+                                        hidden_size, 1, topology.attention_tp);
+                check_packed_projection(v_w_list, v_w_scale_list, num_kv_heads * head_dim,
+                                        hidden_size, 1, topology.attention_tp);
+                check_packed_projection(o_w_list, o_w_scale_list, hidden_size,
+                                        num_q_heads * head_dim, 0, topology.attention_tp);
+                check_packed_projection(gate_list, gate_scale_list, physical_intermediate,
+                                        hidden_size, 1, topology.mlp_tp);
+                check_packed_projection(up_list, up_scale_list, physical_intermediate,
+                                        hidden_size, 1, topology.mlp_tp);
+                check_packed_projection(down_list, down_scale_list, hidden_size,
+                                        physical_intermediate, 0, topology.mlp_tp);
+            }
         }
-        reduced_qwen3vl_profile_ = num_cores() != 8 && !mrope_section.empty();
+        reduced_qwen3vl_profile_ = num_cores() != 8 && !mrope_section.empty() &&
+            !internvla_text_profile && !wall_text_profile && !wall_action_profile;
+        reduced_hyvla_profile_ = hyvla_profile;
+        reduced_lingbot2_expert_profile_ = lingbot2_expert_profile;
+        reduced_qwen3_w4_profile_ = reduced_packed_w4;
+        reduced_qwen3_nvfp4_profile_ = reduced_dense_nvfp4;
+        reduced_llama_profile_ = llama_text_profile;
+        reduced_internvla_profile_ = internvla_text_profile;
+        reduced_wall_text_profile_ = wall_text_profile;
+        reduced_wall_action_profile_ = wall_action_profile;
+        logical_intermediate_size_ = intermediate_size;
         set_model_params(num_q_heads, num_kv_heads, head_dim, hidden_size, intermediate_size);
         set_num_layers(N);
         has_qk_norm_ = qk_norm_present;
@@ -1383,8 +1730,10 @@ public:
         const bool resident_4b_geometry = N == 36 && hidden_size == 2560 &&
             intermediate_size == 9728 && num_q_heads == 32;
         qwen3vl_ordinary_resident_prefill_profile_ =
-            typeid(*this) == typeid(CausalDecoderModel) && num_cores() == 8 &&
-            (resident_2b_geometry || resident_4b_geometry) && !has_nvfp4 &&
+            typeid(*this) == typeid(CausalDecoderModel) &&
+            ((num_cores() == 8 && (resident_2b_geometry || resident_4b_geometry)) ||
+             ((num_cores() == 4 || num_cores() == 6) && resident_2b_geometry)) &&
+            !has_nvfp4 &&
             num_kv_heads == 8 && head_dim == 128 && use_silu &&
             has_qk_norm_ && !has_qkv_bias_ &&
             mrope_section == std::vector<int64_t>{24, 20, 20} &&
@@ -1406,6 +1755,7 @@ public:
         // decode profile. Default ACC32 still selects AUTO_TILE at dispatch.
         qwen3vl_fp16_decode_profile_ =
             qwen3vl_ordinary_resident_prefill_profile_ &&
+            num_cores() == 8 &&
             resident_projection_dtype == at::kHalf;
         // Ordinary HF DeepStack consumers are 0/1/2. This separate profile
         // never inherits the fixed delivery's packed weights or position graphs.
@@ -1465,17 +1815,13 @@ public:
                 down_list[i].scalar_type() == at::kChar;
         }
         wall_base_prefill_shared_input_ = wall_base_prefill_shared_input_ &&
-            KernelCache::instance().has_loaded(
-                KernelId::WALL_BASE_PREFILL_GATE_UP_SHARED_A_M384N48K128);
+            rpu_pi_wall_operation_loaded(rpu_pi_wall::Operation::SharedRaw, rpu_pl_tiling::WeightType::Int8);
         wall_base_prefill_shared_silu_ = wall_base_prefill_shared_input_ &&
-            KernelCache::instance().has_loaded(
-                KernelId::WALL_BASE_PREFILL_GATE_UP_SHARED_SILU_M384N48K128);
+            rpu_pi_wall_operation_loaded(rpu_pi_wall::Operation::SharedSiluUp, rpu_pl_tiling::WeightType::Int8);
         wall_base_prefill_no_up_store_ = wall_base_prefill_shared_silu_ &&
-            KernelCache::instance().has_loaded(
-                KernelId::WALL_BASE_PREFILL_GATE_UP_SHARED_SILU_NOUP_M384N48K128);
+            rpu_pi_wall_operation_loaded(rpu_pi_wall::Operation::SharedSilu, rpu_pl_tiling::WeightType::Int8);
         wall_base_prefill_long_qkv_ = wall_base_prefill_no_up_store_ &&
-            KernelCache::instance().has_loaded(
-                KernelId::WALL_QKV_W8A16_MULTIBASE_M448N64);
+            rpu_pi_wall_operation_loaded(rpu_pi_wall::Operation::Qkv, rpu_pl_tiling::WeightType::Int8);
         qwen3vl_4b_decode_gateup_fused_ = qwen3vl_4b_w8_profile_ &&
             KernelCache::instance().has_loaded(KernelId::QWEN3VL_GATEUP_SWIGLU_GEMV);
         qwen3vl_4b_decode_qk_fused_ = qwen3vl_4b_qk_profile &&
@@ -1506,10 +1852,9 @@ public:
                 down_list[i].scalar_type() == at::kHalf;
         }
         wall_base_fp16_long_prefill_ = wall_base_fp16_long_prefill_ &&
-            KernelCache::instance().has_loaded(KernelId::WALL_PREFILL_QKV_FP16_M448N64K128);
+            rpu_pi_wall_operation_loaded(rpu_pi_wall::Operation::Qkv, rpu_pl_tiling::WeightType::Fp16);
         wall_base_fp16_shared_gateup_ = wall_base_fp16_long_prefill_ &&
-            KernelCache::instance().has_loaded(
-                KernelId::WALL_BASE_PREFILL_GATE_UP_SHARED_SILU_FP16_M320N80K128);
+            rpu_pi_wall_operation_loaded(rpu_pi_wall::Operation::SharedSilu, rpu_pl_tiling::WeightType::Fp16);
         // The C224 ring/norm payload consumes FP16 activations independently
         // of projection precision. Both owners retain their exact two-chunk proof.
         wall_base_prefill_owner_norm_ =
@@ -1644,19 +1989,19 @@ public:
                 has_qkv_bias_ ? q_bias_list[i] : at::Tensor(),
                 has_qkv_bias_ ? k_bias_list[i] : at::Tensor(),
                 has_qkv_bias_ ? v_bias_list[i] : at::Tensor(),
-                has_scale ? rpu_retain_linear_quant_scale(q_w_list[i], q_w_scale_list[i])
+                has_scale ? rpu_retain_linear_quant_scale(q_w_list[i], q_w_scale_list[i], attn_tp())
                           : at::Tensor(),
-                has_scale ? rpu_retain_linear_quant_scale(k_w_list[i], k_w_scale_list[i])
+                has_scale ? rpu_retain_linear_quant_scale(k_w_list[i], k_w_scale_list[i], attn_tp())
                           : at::Tensor(),
-                has_scale ? rpu_retain_linear_quant_scale(v_w_list[i], v_w_scale_list[i])
+                has_scale ? rpu_retain_linear_quant_scale(v_w_list[i], v_w_scale_list[i], attn_tp())
                           : at::Tensor(),
-                has_scale ? rpu_retain_linear_quant_scale(o_w_list[i], o_w_scale_list[i])
+                has_scale ? rpu_retain_linear_quant_scale(o_w_list[i], o_w_scale_list[i], attn_tp())
                           : at::Tensor(),
-                has_scale ? rpu_retain_linear_quant_scale(gate_list[i], gate_scale_list[i])
+                has_scale ? rpu_retain_linear_quant_scale(gate_list[i], gate_scale_list[i], mlp_tp())
                           : at::Tensor(),
-                has_scale ? rpu_retain_linear_quant_scale(up_list[i], up_scale_list[i])
+                has_scale ? rpu_retain_linear_quant_scale(up_list[i], up_scale_list[i], mlp_tp())
                           : at::Tensor(),
-                has_scale ? rpu_retain_linear_quant_scale(down_list[i], down_scale_list[i])
+                has_scale ? rpu_retain_linear_quant_scale(down_list[i], down_scale_list[i], mlp_tp())
                           : at::Tensor(),
                 qkv_ws, gate_up_ws,
             });
@@ -2024,7 +2369,8 @@ public:
         at::TensorList input_scales, at::TensorList input_shifts,
         at::TensorList post_scales,  at::TensorList post_shifts)
     {
-        TORCH_CHECK(num_cores() == 8, "set_adarms_step requires an eight-core profile");
+        TORCH_CHECK(num_cores() == 8 || reduced_lingbot2_expert_profile_,
+                    "set_adarms_step requires an eight-core profile or the reduced LingBot v2 expert");
         const int64_t N = num_layers();
         TORCH_CHECK(!layer_weights_.empty(), "set_adarms_step: call set_weights first");
         TORCH_CHECK(!adarms_schedule_select_,
@@ -2072,7 +2418,8 @@ public:
         const at::Tensor& input_scale, const at::Tensor& input_shift,
         const at::Tensor& post_scale,  const at::Tensor& post_shift)
     {
-        TORCH_CHECK(num_cores() == 8, "set_adarms_step_mutable requires an eight-core profile");
+        TORCH_CHECK(num_cores() == 8 || reduced_lingbot2_expert_profile_,
+                    "set_adarms_step_mutable requires an eight-core profile or the reduced LingBot v2 expert");
         const int64_t N = num_layers();
         const int64_t h = hidden_size();
         TORCH_CHECK(!layer_weights_.empty(), "set_adarms_step_mutable: call set_weights first");
@@ -2128,7 +2475,8 @@ public:
         const at::Tensor& input_scale, const at::Tensor& input_shift,
         const at::Tensor& post_scale,  const at::Tensor& post_shift)
     {
-        TORCH_CHECK(num_cores() == 8, "set_adarms_unroll requires an eight-core profile");
+        TORCH_CHECK(num_cores() == 8 || reduced_lingbot2_expert_profile_,
+                    "set_adarms_unroll requires an eight-core profile or the reduced LingBot v2 expert");
         const int64_t N = num_layers();
         const int64_t h = hidden_size();
         TORCH_CHECK(!layer_weights_.empty(), "set_adarms_unroll: call set_weights first");
@@ -2297,7 +2645,8 @@ public:
         int64_t execution_len,
         int64_t real_len,
         int64_t retained_deepstack_count = 0,
-        at::IntArrayRef selected_descriptor = {});
+        at::IntArrayRef selected_descriptor = {},
+        bool partial_mrope = false);
     SpmDense2DSpec qwen3vl_pooler_z1_destination_spec(
         int64_t execution_len) const;
     SpmDense2DSpec qwen3vl_pooler_z1_deepstack_spec(
@@ -2509,21 +2858,35 @@ public:
                     hidden_states.device());
         TORCH_CHECK(position >= 0,
                     "CausalDecoderModel::forward: position must be non-negative, got ", position);
+        // set_weights admits reduced-core NVFP4 only for the exact speech
+        // and Wall action profiles and validates all packed projections there.
+        // The Wall action expert is the one reduced owner that runs its
+        // rectangular [H, P+H] mask (MASK_2D) instead of causal LTM.
+        const bool reduced_wall_action_masked = reduced_wall_action_profile_ &&
+            !is_causal && attention_mask.has_value();
+        // HyVLA's VLM prefix and action expert likewise run their explicit
+        // additive prefix masks non-causally.
+        const bool reduced_hyvla_masked = reduced_hyvla_profile_ &&
+            !is_causal && attention_mask.has_value();
+        // The LingBot v2 action expert runs its [suffix, prefix + suffix]
+        // additive mask non-causally, with per-step AdaRMS FiLM.
+        const bool reduced_lingbot2_masked = reduced_lingbot2_expert_profile_ &&
+            !is_causal && attention_mask.has_value();
         TORCH_CHECK(num_cores() == 8 ||
-                        (hidden_states.dim() == 3 && hidden_states.size(0) == 1 && is_causal &&
-                         (reduced_qwen3vl_profile_ || !attention_mask.has_value()) &&
-                         (reduced_qwen3vl_profile_ || !has_mrope_) &&
-                         !adarms_ && !decoder_mixed_precision_ && !nvfp4_),
-                    "reduced-core decoder requires B1 causal FP16 execution for its installed profile");
+                        (hidden_states.dim() == 3 && hidden_states.size(0) == 1 &&
+                         (is_causal ? !reduced_wall_action_profile_ && !reduced_hyvla_profile_ &&
+                                          !reduced_lingbot2_expert_profile_
+                                    : reduced_wall_action_masked || reduced_hyvla_masked ||
+                                          reduced_lingbot2_masked) &&
+                         (reduced_qwen3vl_profile_ || reduced_wall_action_masked ||
+                          reduced_hyvla_masked || reduced_lingbot2_masked ||
+                          !attention_mask.has_value()) &&
+                         (reduced_qwen3vl_profile_ || reduced_internvla_profile_ ||
+                          reduced_wall_text_profile_ || reduced_wall_action_profile_ || !has_mrope_) &&
+                         (!adarms_ || reduced_lingbot2_masked) && !decoder_mixed_precision_),
+                    "reduced-core decoder requires B1 causal execution for its admitted profile "
+                    "(Wall action, HyVLA and LingBot v2 expert: B1 masked non-causal)");
         const int64_t seq_len_in = hidden_states.size(1);
-        if (!tts_predictor_heads_.empty()) {
-            TORCH_CHECK(linear_acc32_ && !fuse_lm_head_ && !decoder_mixed_precision_ &&
-                            is_causal && !attention_mask.has_value() && hidden_states.size(0) == 1 &&
-                            ((position == 0 && (seq_len_in == 2 || seq_len_in == 16 || seq_len_in == 32)) ||
-                             (seq_len_in == 1 && position >= 2 && position <= 15)),
-                        "TTS fused Predictor requires its two-token prefix (optionally padded to 16/32) or positions 2..15");
-            tts_predictor_head_index_ = position == 0 ? 0 : position - 1;
-        }
         detail::validate_fmb_planning_shape(
             seq_len_in, position, "CausalDecoderModel::forward");
         TORCH_CHECK(seq_len_in <= int64_t{UINT16_MAX} * 16 &&
@@ -2531,7 +2894,40 @@ public:
                     "CausalDecoderModel::forward: attention key length exceeds uint16-v16 registers");
 
         if (num_cores() != 8) {
-            if (attention_mask.has_value()) {
+            if (reduced_wall_action_masked) {
+                // The adapter's additive FP16 mask: H action rows over the
+                // P-row prefix plus the action block. sdpa_prepare_mask owns
+                // its upload; one planned chunk is asserted in dynamic_config.
+                const at::Tensor& mask = *attention_mask;
+                TORCH_CHECK(mask.defined() && mask.is_contiguous() &&
+                                mask.scalar_type() == at::kHalf && mask.dim() == 2 &&
+                                mask.size(0) == seq_len_in &&
+                                mask.size(1) == position + seq_len_in,
+                            "reduced-core Wall action mask must be contiguous FP16 "
+                            "[horizon, prefix + horizon]");
+            } else if (reduced_lingbot2_masked) {
+                // The adapter's versioned FP16 suffix mask: 51 action rows
+                // over the frozen prefix plus the suffix block.
+                const at::Tensor& mask = *attention_mask;
+                TORCH_CHECK(mask.defined() && mask.is_contiguous() &&
+                                mask.scalar_type() == at::kHalf && mask.dim() == 2 &&
+                                mask.size(0) == seq_len_in &&
+                                mask.size(1) == position + seq_len_in,
+                            "reduced-core LingBot v2 expert mask must be contiguous FP16 "
+                            "[suffix, prefix + suffix]");
+            } else if (reduced_hyvla_masked) {
+                // The adapter's additive mask keeps singleton leading axes
+                // over [rows, prefix + rows]; sdpa_prepare_mask owns its upload.
+                const at::Tensor& mask = *attention_mask;
+                bool singleton_leading = mask.defined() && mask.dim() >= 2 && mask.dim() <= 4;
+                for (int64_t axis = 0; singleton_leading && axis + 2 < mask.dim(); ++axis) {
+                    singleton_leading = mask.size(axis) == 1;
+                }
+                TORCH_CHECK(singleton_leading && mask.size(-2) == seq_len_in &&
+                                mask.size(-1) == position + seq_len_in,
+                            "reduced-core HyVLA mask must be [..., rows, prefix + rows] "
+                            "with singleton leading axes");
+            } else if (attention_mask.has_value()) {
                 // Exact VL's adapter admits all-valid caller tokens and only
                 // appends right-padding. FMB's causal path ignores this 2D
                 // token mask: LTM protects the logical prefix, and the adapter
@@ -2555,6 +2951,14 @@ public:
             TORCH_CHECK(static_cast<int64_t>(k_caches.size()) == num_layers() &&
                             static_cast<int64_t>(v_caches.size()) == num_layers(),
                         "reduced-core Qwen3 requires one paired KV cache per model layer");
+            TORCH_CHECK(attn_tp() == 4 && num_kv_heads() > 0 &&
+                            num_kv_heads() % attn_tp() == 0 &&
+                            head_dim() > 0 && head_dim() % 16 == 0,
+                        "reduced-core decoder KV geometry must match attention TP4");
+            // RPUCache keeps eight physical stripes; its local head and
+            // channel blocks follow the installed attention geometry.
+            const int64_t cache_head_blocks = num_kv_heads() / attn_tp();
+            const int64_t cache_dim_blocks = head_dim() / 16;
             int64_t cache_blocks = 0;
             for (size_t layer = 0; layer < k_caches.size(); ++layer) {
                 for (const at::Tensor& cache : {k_caches[layer], v_caches[layer]}) {
@@ -2565,7 +2969,7 @@ public:
                     if (cache_blocks == 0) cache_blocks = cache.size(1);
                     TORCH_CHECK(cache_blocks > 0 &&
                                     cache.sizes().vec() == std::vector<int64_t>(
-                                        {1, cache_blocks, 2, 8, 8, 16, 16}) &&
+                                        {1, cache_blocks, cache_head_blocks, cache_dim_blocks, NUM_CORES, 16, 16}) &&
                                     cache_blocks <= std::numeric_limits<int64_t>::max() / 16 &&
                                     seq_len_in <= cache_blocks * 16 &&
                                     position <= cache_blocks * 16 - seq_len_in,
@@ -2643,17 +3047,14 @@ public:
         //     kernel 分支 (c10::nullopt mask, mask_off=0)。故不再硬拒 is_causal=false 无
         //     mask;调用方对"双向无 mask vs 漏传 mask"负责。
 
-        // Chunk authority is per-handle. Exact SPM-pipeline dispatches scope a
-        // prepared chunk to this call only; ordinary forwards keep the cold
-        // adapter-installed value and never re-read process-global state.
+        // Qwen3-VL pooler Z1 already carries its COMPLETE C128 descriptor:
+        // preserve its caller policy rather than injecting a legacy override.
+        // Keep the existing Wall/multiview scoped policy behavior unchanged.
         const int64_t saved_chunk_size_override = get_chunk_size_override();
         const bool scoped_dispatch_chunk =
-            wall_z1_dispatch_ || qwen3vl_pooler_z1_dispatch_ ||
-            qwen3vl_multiview_text_composite_dispatch_;
+            wall_z1_dispatch_ || qwen3vl_multiview_text_composite_dispatch_;
         if (wall_z1_dispatch_) {
             set_chunk_size_override(wall_z1_prepared_chunk_size_);
-        } else if (qwen3vl_pooler_z1_dispatch_) {
-            set_chunk_size_override(qwen3vl_pooler_z1_prepared_chunk_size_);
         } else if (qwen3vl_multiview_text_composite_dispatch_) {
             set_chunk_size_override(0);
         }
@@ -2962,7 +3363,7 @@ public:
         const bool fused_lm_head_this_forward = decode_fused_lm_head ||
             (fuse_lm_head_ && fuse_prefill_last_lm_head_ &&
              is_causal && seq_len_in > 1);
-        if (fused_lm_head_this_forward || !tts_predictor_heads_.empty()) {
+        if (fused_lm_head_this_forward) {
             RECORD_FUNCTION("rpu_causal::lm_head_output_setup", {});
             TORCH_CHECK(vocab_size_ > 0 && vocab_size_ % lm_head_tp() == 0,
                         "CausalDecoderModel::forward: fuse_lm_head requires "
@@ -3049,6 +3450,15 @@ public:
         //   条件: decode，或已显式启用并验证的 prefill-last W4 路径。
         if (fused_lm_head_this_forward) {
             rpu_ddr_flush(lm_head_logits_out_.data_ptr<c10::Half>());
+            if (configured_vocab_size_ > 0 && configured_vocab_size_ < vocab_size_ &&
+                lm_head_exact_candidates_ == 0) {
+                if (lm_head_logits_out_.size(0) == 1) {
+                    return lm_head_logits_out_.as_strided(
+                        {1, 1, configured_vocab_size_},
+                        {configured_vocab_size_, configured_vocab_size_, 1});
+                }
+                return lm_head_logits_out_.narrow(2, 0, configured_vocab_size_).contiguous();
+            }
             return lm_head_logits_out_;
         }
 
@@ -3057,57 +3467,31 @@ public:
 
     // ── Phase 2.5: fused lm_head 入口 (per-instance state, called from C API) ──
 
-    void set_tts_predictor_heads(at::TensorList heads) {
-        TORCH_CHECK(num_layers() == 5 && hidden_size() == 1024 && intermediate_size() == 3072 &&
-                        num_q_heads() == 16 && num_kv_heads() == 8 && head_dim() == 128 &&
-                        num_cores() == 8 && attn_tp() == 8 && mlp_tp() == 8 && lm_head_tp() == 8 &&
-                        linear_acc32_ && !has_mrope_ && has_qk_norm_ && use_silu_ &&
-                        !fuse_lm_head_ && !lm_head_w_.defined() && !lm_head_w_scale_.defined() &&
-                        !decoder_mixed_precision_ && !nvfp4_ && !adarms_ && !has_qkv_bias_ &&
-                        deepstack_lang_layers_.empty() && rope_position_base_ < 0 &&
-                        tts_predictor_heads_.empty() && heads.size() == 15 &&
-                        layer_weights_.size() == 5,
-                    "TTS head bank requires the FP16/ACC32 0.6B Predictor profile, installed once");
-        for (const auto& layer : layer_weights_)
-            TORCH_CHECK(layer.q_w.scalar_type() == at::kHalf,
-                        "TTS fused Predictor requires FP16 body weights");
-        for (const auto& head : heads) {
-            TORCH_CHECK(head.defined() && head.device().type() == at::kPrivateUse1 &&
-                            head.scalar_type() == at::kHalf && head.is_contiguous() &&
-                            head.sizes().equals({2048, 1024}),
-                        "TTS head bank requires fifteen device FP16 [2048,1024] col-swizzled weights");
-        }
-        tts_predictor_heads_.assign(heads.begin(), heads.end());
-        vocab_size_ = 2048;
-        invalidate_model_state();
-    }
-
-    at::Tensor tts_predictor_logits() const {
-        TORCH_CHECK(!tts_predictor_heads_.empty() && lm_head_logits_out_.defined(),
-                    "TTS fused Predictor has no logits; run its decoder first");
-        return lm_head_logits_out_;
-    }
-
     void set_lm_head(
         const at::Tensor& lm_head_weight,
         const std::optional<at::Tensor>& lm_head_scale = std::nullopt,
         bool fuse_prefill_last = false,
         int64_t exact_candidates = 0) {
-        TORCH_CHECK(tts_predictor_heads_.empty(), "TTS head bank cannot be replaced by a generic head");
+        TORCH_CHECK(!qwen3_c512_ || !fuse_prefill_last,
+                    "Qwen3 C512 retains the external Prefill head; decode head remains supported");
         TORCH_CHECK(lm_head_weight.defined(),
                     "set_lm_head: lm_head_weight must be defined");
+        TORCH_CHECK(num_cores() == 8 || configured_vocab_size_ != 0,
+                    "the headless reduced TTS codec cannot install a vocabulary head");
         const bool reduced_qwen3_w8_head =
-            !has_mrope_ && num_layers() == 28 &&
-            hidden_size() == 2048 && intermediate_size() == 6144 &&
-            num_q_heads() == 16 && num_kv_heads() == 8 && head_dim() == 128 &&
+            (!has_mrope_ || reduced_qwen3vl_profile_) && num_layers() == qwen3_fp16_profile_num_layers(
+                num_q_heads(), num_kv_heads(), head_dim(), hidden_size(), logical_intermediate_size_) &&
             !layer_weights_.empty() && layer_weights_[0].q_w.scalar_type() == at::kChar &&
             lm_head_weight.scalar_type() == at::kChar;
+        const bool reduced_qwen3_w4_head = reduced_qwen3_w4_profile_ &&
+            lm_head_weight.scalar_type() == at::kByte;
         TORCH_CHECK(num_cores() == 8 ||
                         (((lm_head_weight.scalar_type() == at::kHalf &&
                          (!lm_head_scale.has_value() || !lm_head_scale->defined() ||
-                          lm_head_scale->numel() == 0)) || reduced_qwen3_w8_head) &&
+                          lm_head_scale->numel() == 0)) || reduced_qwen3_w8_head ||
+                         reduced_qwen3_w4_head) &&
                          !fuse_prefill_last && exact_candidates == 0),
-                    "reduced-core decoder requires FP16 or exact Qwen3-1.7B W8A16 decode head");
+                    "reduced-core decoder requires FP16 or admitted Qwen3 W8A16/W4A16 decode head");
         const bool lm_head_is_w8a16 =
             lm_head_weight.scalar_type() == at::kChar;
         const bool lm_head_is_w4a16 =
@@ -3121,15 +3505,23 @@ public:
                     "set_lm_head: lm_head_weight.size(1)=", lm_head_weight.size(1),
                     " must match ", expected_storage_k,
                     lm_head_is_w4a16 ? " packed bytes" : " hidden elements");
-        TORCH_CHECK(configured_vocab_size_ == 0 ||
-                        lm_head_weight.size(0) == configured_vocab_size_,
-                    "set_lm_head: weight vocab_size=", lm_head_weight.size(0),
-                    " does not match cold configured vocab_size=", configured_vocab_size_);
-        TORCH_CHECK(lm_head_weight.size(0) > 0
-                    && lm_head_weight.size(0) % lm_head_tp() == 0,
+        TORCH_CHECK(!lm_head_is_w4a16 || configured_vocab_size_ > 0,
+                    "set_lm_head: N32K32 W4 requires configured logical vocab_size");
+        const int64_t logical_vocab = configured_vocab_size_ > 0
+            ? configured_vocab_size_ : lm_head_weight.size(0);
+        const int64_t padded_vocab =
+            (lm_head_tp() == 6 && logical_vocab == 151936) ? int64_t{151968} : logical_vocab;
+        const int64_t physical_vocab = lm_head_is_w4a16
+            ? ((padded_vocab / lm_head_tp() + 31) / 32) * 32 * lm_head_tp()
+            : padded_vocab;
+        TORCH_CHECK(lm_head_weight.size(0) == physical_vocab,
+                    "set_lm_head: physical weight rows=", lm_head_weight.size(0),
+                    " expected ", physical_vocab, " for logical vocab_size=", logical_vocab);
+        TORCH_CHECK(padded_vocab > 0
+                    && padded_vocab % lm_head_tp() == 0,
                     "set_lm_head: vocab_size=", lm_head_weight.size(0),
                     " must be > 0 and divisible by lm_head_tp=", lm_head_tp());
-        TORCH_CHECK(lm_head_weight.size(0) <= QWEN3_FUSED_LM_HEAD_MAX_VOCAB,
+        TORCH_CHECK(padded_vocab <= QWEN3_FUSED_LM_HEAD_MAX_VOCAB,
                     "set_lm_head: vocab_size=", lm_head_weight.size(0),
                     " exceeds QWEN3_FUSED_LM_HEAD_MAX_VOCAB=",
                     QWEN3_FUSED_LM_HEAD_MAX_VOCAB,
@@ -3149,7 +3541,7 @@ public:
         TORCH_CHECK((!fuse_prefill_last && exact_candidates == 0) ||
                         (qwen3vl_2b_w8_profile_ && lm_head_is_w4a16 && has_mrope_ &&
                          num_layers() == 28 && hidden_size() == 2048 &&
-                         lm_head_weight.size(0) == 151936),
+                         logical_vocab == 151936),
                     "set_lm_head: prefill-last/exact-rerank is restricted to "
                     "the validated Qwen3-VL-2B W4 profile");
         if (lm_head_is_w8a16 || lm_head_is_w4a16) {
@@ -3176,10 +3568,10 @@ public:
                             "set_lm_head: packed int4 group_size must be 32, got ",
                             group_size);
                 const int64_t local_groups = hidden_size() / group_size;
-                const int64_t local_n = lm_head_weight.size(0) / NUM_CORES;
+                const int64_t local_n = padded_vocab / lm_head_tp();
                 const int64_t expected_scale_elements =
                     ((local_groups + 3) / 4) * ((local_n + 63) / 64) *
-                    NUM_CORES * 4 * 64;
+                    lm_head_tp() * 4 * 64;
                 TORCH_CHECK(
                     lm_head_scale->numel() == expected_scale_elements,
                             "set_lm_head: packed int4 scale must carry the "
@@ -3188,13 +3580,18 @@ public:
                             lm_head_scale->numel(), " elements, expected ",
                             expected_scale_elements);
                 lm_head_w_scale_ = rpu_retain_linear_quant_scale(
-                    lm_head_weight, *lm_head_scale);
+                    lm_head_weight, *lm_head_scale, lm_head_tp());
             }
         } else {
             lm_head_w_scale_ = at::Tensor{};
         }
+        // A single head supersedes a bank: both describe the one installed head,
+        // so leaving a stale bank would let select_lm_head resurrect it.
+        lm_head_bank_w_.clear();
+        lm_head_bank_scale_.clear();
+        lm_head_bank_index_ = -1;
         lm_head_w_ = lm_head_weight;
-        vocab_size_ = lm_head_weight.size(0);
+        vocab_size_ = padded_vocab;
         fuse_prefill_last_lm_head_ = fuse_prefill_last;
         lm_head_exact_candidates_ = exact_candidates;
         reuse_lm_head_output_ = false; // Returned logits own storage across subsequent forwards.
@@ -3202,8 +3599,74 @@ public:
         invalidate_model_state();  // D-503: last non-empty statement of set_lm_head
     }
 
+    // Install every head of a fixed multi-step sampling loop at once. The TTS
+    // Code Predictor applies a different head on each of its 15 MTP steps, so
+    // installing them one at a time would end set_lm_head — and therefore
+    // invalidate_model_state() — once per step, retiring the pipeline manifest
+    // and forcing a decode recipe rebuild 15 times per frame. Here the bank is
+    // one transaction and select_lm_head below only picks among its entries.
+    void set_lm_head_bank(const std::vector<at::Tensor>& weights,
+                          const std::vector<at::Tensor>& scales) {
+        TORCH_CHECK(!weights.empty() && weights.size() == scales.size(),
+                    "set_lm_head_bank: one scale per head is required; got ",
+                    weights.size(), " weights and ", scales.size(), " scales");
+        TORCH_CHECK(weights.size() <= kLmHeadBankMax,
+                    "set_lm_head_bank: bank holds at most ", kLmHeadBankMax,
+                    " heads, got ", weights.size());
+        for (size_t i = 0; i < weights.size(); ++i) {
+            TORCH_CHECK(weights[i].defined() && weights[i].dim() == 2 &&
+                            weights[i].sizes().equals(weights[0].sizes()) &&
+                            weights[i].scalar_type() == weights[0].scalar_type(),
+                        "set_lm_head_bank: head ", i,
+                        " must share head 0's [vocab, hidden] shape and dtype");
+            TORCH_CHECK(scales[i].defined() &&
+                            scales[i].sizes().equals(scales[0].sizes()) &&
+                            scales[i].scalar_type() == scales[0].scalar_type(),
+                        "set_lm_head_bank: head ", i,
+                        " scale must share head 0's shape and dtype");
+            // Selection rewrites a recorded weight-address register, so two
+            // heads sharing storage would silently alias instead of switching.
+            TORCH_CHECK(i == 0 ||
+                            (weights[i].data_ptr() != weights[0].data_ptr() &&
+                             scales[i].data_ptr() != scales[0].data_ptr()),
+                        "set_lm_head_bank: head ", i, " aliases head 0's storage");
+        }
+        // Install head 0 through the ordinary path so the bank inherits every
+        // check, cast and SPM consequence of a single head; it clears the bank
+        // it is replacing, so the entries are published after it returns.
+        set_lm_head(weights[0], scales[0], /*fuse_prefill_last=*/false,
+                    /*exact_candidates=*/0);
+        lm_head_bank_w_ = weights;
+        lm_head_bank_scale_ = scales;
+        lm_head_bank_index_ = 0;
+        invalidate_model_state();  // D-503: last statement of set_lm_head_bank
+    }
+
+    // Choose which installed head the next decode applies. Deliberately does
+    // NOT end with invalidate_model_state(): the bank was installed under a
+    // single generation and this transfers no ownership, so a retained decode
+    // Graph stays valid and the new address reaches it as a register patch.
+    void select_lm_head(int64_t index) {
+        TORCH_CHECK(lm_head_bank_index_ >= 0,
+                    "select_lm_head requires an installed head bank");
+        TORCH_CHECK(index >= 0 &&
+                        index < static_cast<int64_t>(lm_head_bank_w_.size()),
+                    "select_lm_head: index ", index, " is outside the ",
+                    lm_head_bank_w_.size(), "-head bank");
+        lm_head_bank_index_ = index;
+        lm_head_w_ = lm_head_bank_w_[index];
+        lm_head_w_scale_ = lm_head_bank_scale_[index];
+    }
+
+    int64_t lm_head_bank_size() const {
+        return static_cast<int64_t>(lm_head_bank_w_.size());
+    }
+    int64_t lm_head_bank_index() const { return lm_head_bank_index_; }
+
     void clear_lm_head() {
-        TORCH_CHECK(tts_predictor_heads_.empty(), "TTS head bank belongs to the Predictor handle");
+        lm_head_bank_w_.clear();
+        lm_head_bank_scale_.clear();
+        lm_head_bank_index_ = -1;
         lm_head_w_ = at::Tensor{};
         lm_head_w_scale_ = at::Tensor{};
         vocab_size_ = 0;
@@ -3217,6 +3680,28 @@ public:
     }
 
 protected:
+    DecoderExecutionTopology resolve_model_execution_topology(
+            int64_t num_q_heads, int64_t num_kv_heads, int64_t head_dim,
+            int64_t hidden_size, int64_t intermediate_size) const override {
+        if (num_cores() == 4 && configured_vocab_size_ == 0 &&
+                num_q_heads == 16 && num_kv_heads == 16 && head_dim == 64 &&
+                hidden_size == 512 && intermediate_size == 1024)
+            return {4, 4, 4};
+        return FusedModelBase::resolve_model_execution_topology(
+            num_q_heads, num_kv_heads, head_dim, hidden_size, intermediate_size);
+    }
+
+    // Packed reduced W4 (192-aligned) and dense NVFP4 (384-aligned) own their
+    // MLP6 physical widths checked in set_weights; every SPM declaration, GEMM
+    // and plan hash consumes this physical width.
+    int64_t resolve_model_mlp_intermediate_size(int64_t logical_size) const override {
+        return reduced_qwen3_w4_profile_
+            ? decoder_packed_w4_mlp_intermediate_size(logical_size, mlp_tp())
+            : reduced_qwen3_nvfp4_profile_
+            ? decoder_nvfp4_mlp_intermediate_size(logical_size, mlp_tp())
+            : FusedModelBase::resolve_model_mlp_intermediate_size(logical_size);
+    }
+
     KvCostLayoutScope capture_kvinsert_cost_layout_scope() override {
         return capture_kvinsert_cost_layout_fields(
             planning_rope_mode_, planning_graph_lifecycle_,
@@ -3347,9 +3832,75 @@ protected:
 
     virtual std::vector<BufferDecl> explicit_mask_baseline_buffer_declarations(
             const LayoutContext& ctx) {
-        return causal_baseline_buffer_declarations(ctx);
+        auto declarations = causal_baseline_buffer_declarations(ctx);
+        apply_gr00t_long_prefill_scratch_alias(declarations, ctx);
+        return declarations;
     }
     virtual int64_t explicit_mask_body_iterations() const { return 1; }
+    // The fused Wall action step is the only derived owner with a reduced-core
+    // profile; every other subclass keeps its eight-core admission.
+    virtual bool reduced_wall_action_owner() const { return false; }
+    // HyVLA's two decoder owners declare their reduced-core semantics; the
+    // ordinary decoder and every other subclass keep zero.
+    static constexpr int REDUCED_HYVLA_VLM_OWNER = 1;
+    static constexpr int REDUCED_HYVLA_EXPERT_OWNER = 2;
+    virtual int reduced_hyvla_owner() const { return 0; }
+    // Only the LingBot v2 sparse-MoE action expert declares its four-core
+    // child semantics (masked AdaRMS denoise over a shared four-lane cache).
+    virtual bool reduced_lingbot2_expert_owner() const { return false; }
+
+    bool gr00t_long_prefill_scratch_profile() const {
+        return num_layers() == 16 && hidden_size() == 2048 &&
+            intermediate_size() == 6144 && num_q_heads() == 16 &&
+            num_kv_heads() == 8 && head_dim() == 128 && num_cores() == 8 &&
+            has_mrope_ && mrope_section_.size() == 3 &&
+            mrope_section_[0] == 24 && mrope_section_[1] == 20 && mrope_section_[2] == 20 &&
+            deepstack_lang_layers_.size() == 3 && deepstack_lang_layers_[0] == 0 &&
+            deepstack_lang_layers_[1] == 1 && deepstack_lang_layers_[2] == 2 &&
+            use_silu_ && has_qk_norm_ && !has_qkv_bias_ && !fuse_lm_head_ &&
+            !nvfp4_ && !decoder_mixed_precision_ && !adarms_ && !adarms_mutable_ &&
+            !decode_gate_up_fusion_ && !wall_prefill_staged_mlp_ &&
+            !lingbot_prefill_mode_bound_ && !rhinovla_high_precision_ &&
+            !pre_layers_residual1_ready_ && !wall_z1_dispatch_ &&
+            !qwen3vl_pooler_z1_dispatch_ &&
+            qwen3vl_pooler_z1_prepared_execution_len_ == 0 &&
+            qwen3vl_pooler_z1_retained_deepstack_count_ == 0 &&
+            !qwen3vl_multiview_text_dry_prepared_ &&
+            !qwen3vl_multiview_text_composite_prepared_ &&
+            !qwen3vl_multiview_text_composite_dispatch_ &&
+            planning_mode_ == CausalDecoderPlanningMode::ORDINARY &&
+            sdpa_kernel_ == SdpaKernelType::FLASH_ATTN_SPM;
+    }
+
+    void apply_gr00t_long_prefill_scratch_alias(
+            std::vector<BufferDecl>& declarations, const LayoutContext& layout) const {
+        if (!gr00t_long_prefill_scratch_profile() || !layout.is_causal ||
+            layout.use_attn_mask || layout.batch_size != 1 ||
+            layout.attention_policy != AttentionExecutionPolicy::DDR_KV ||
+            layout.chunk_size <= 256 || layout.chunk_size > 464 ||
+            layout.effective_kv_cs() != layout.chunk_size) return;
+
+        // The ordinary SDPA reads Q and writes its temporary workspace before
+        // O-proj starts. Move BOTH lifetimes to phase 4: moving either alone
+        // could alias simultaneously live SDPA input/workspace. K/V and output
+        // retain their conservative original ranges.
+        // MLP Mul finishes Up before Down starts. The residual ring then
+        // finishes Down before the ordered DeepStack DMA/add reuses its root.
+        // Keep lm_head_out and every Persistent declaration unchanged.
+        for (auto& declaration : declarations) {
+            const std::string name = declaration.name;
+            if (name == "q") declaration.phase_end = 4;
+            if (name == "sdpa_tmp") {
+                declaration.phase_start = 4;
+                declaration.phase_end = 4;
+            }
+            if (name == "down") declaration.phase_start = 8;
+            if (name == "deepstack_scratch") {
+                declaration.size = 0;
+                declaration.alias_of = "down";
+            }
+        }
+    }
 
     bool lingbot_prefill_deepstack_reuses_down(const LayoutContext& layout) const {
         // These full C320/C400 prefixes use the ordinary MLP. Its ring consumes Down
@@ -3389,6 +3940,16 @@ protected:
         int64_t comp_cs = ctx.chunk_size;
         int64_t kv_cs = ctx.effective_kv_cs();
         int64_t wide_cs = std::max(comp_cs, kv_cs);
+        // FMB also calls declarations with a C16 capacity while probing a
+        // one-row decode and seeding chunk-independent Persistent slots.
+        // Only an admitted C192/C256 capacity selects this specialized layout;
+        // actual prefill legality is enforced by the plan/validity hooks.
+        const bool qwen_inplace = qwen3_inplace_capacity() && comp_cs == qwen3_inplace_capacity();
+        if (qwen_inplace)
+            TORCH_CHECK(comp_cs == qwen3_inplace_capacity() && kv_cs == comp_cs && ctx.max_kv_seq_len == 512 &&
+                            ctx.is_causal && !ctx.use_attn_mask && ctx.batch_size == 1 &&
+                            ctx.attention_policy == AttentionExecutionPolicy::DDR_KV,
+                        "Qwen3 C192/C256 scratch requires the exact P512 DDR-KV layout");
         // Batch decode: B sequences' rows are packed into the GEMM M dim, so
         // every ROW-PARALLEL slot (residual/q/k/v/mlp/down/lm_head_out) holds
         // B * chunk rows. sdpa_tmp deliberately does NOT scale: SDPA is emitted
@@ -3484,6 +4045,8 @@ protected:
             ctx.use_attn_mask ? 4 : ((kv_first_layout || comp_cs <= 1) ? 0 : 1);
         int64_t tmp = A(sdpa_compute_tmp_v16_size(
             make_sdpa_config(sdpa_tmp_mask), comp_cs) * 32);
+        if (qwen_inplace && !qwen3_c256_)
+            tmp = std::max(tmp, A(sdpa_compute_tmp_v16_size(make_sdpa_config(1), 128) * 32));
         const bool spm_kv_by_mha =
             ctx.attention_policy ==
             AttentionExecutionPolicy::SPM_KV_BY_MHA;
@@ -3510,9 +4073,22 @@ protected:
             kv_first_layout ? BufferScope::Compute : BufferScope::LayerWide;
 
         // Structural (alive all phases)
-        decls.push_back({"residual1",  res,      1, 8, StorageClass::Temp, 0, nullptr});
-        decls.push_back({"input_norm", work_res, 1, 8, StorageClass::Temp, 0, nullptr});
-        decls.push_back({"residual2",  0,    0, 0, StorageClass::Temp, 0, "input_norm"});
+        if (qwen_inplace) {
+            // Both reductions update the exact same complete raw residual root.
+            // Neither normalized activations nor Q/K scratch overwrite it.
+            decls.push_back({"residual1", res, 1, 9, StorageClass::Temp, 0, nullptr});
+            decls.push_back({"residual2", 0, 0, 0, StorageClass::Temp, 0, "residual1"});
+            if (!qwen3_prefill_w8a8_) {
+                decls.push_back({"input_norm", work_res, 1, 2, StorageClass::Temp, 0, nullptr});
+                decls.push_back({"mlp_norm", work_res, 6, 7, StorageClass::Temp, 0, nullptr});
+            }
+            decls.push_back({"k_norm_scratch", A(comp_cs * local_kv * DWIDTH), 3, 3,
+                             StorageClass::Temp, 0, nullptr});
+        } else {
+            decls.push_back({"residual1", res, 1, 8, StorageClass::Temp, 0, nullptr});
+            decls.push_back({"input_norm", work_res, 1, 8, StorageClass::Temp, 0, nullptr});
+            decls.push_back({"residual2", 0, 0, 0, StorageClass::Temp, 0, "input_norm"});
+        }
         if (wall_p640_staged_layout) {
             // Half 0's compact residual uses this explicit shard; half 1
             // reuses the front of input_norm after its QKV input is consumed.
@@ -3596,7 +4172,7 @@ protected:
         } else {
             decls.push_back({"gate",   mlp,      7, 8,
                              StorageClass::Temp, 0, nullptr, comp_scope});
-            if (!wall_p640_staged_layout) {
+            if (!wall_p640_staged_layout && !(qwen_inplace && qwen3_c256_)) {
                 decls.push_back({"up",     mlp,      7, 7,
                                  StorageClass::Temp, 0, nullptr, comp_scope});
             }
@@ -3614,9 +4190,14 @@ protected:
         //   Batch decode: the fused GEMM runs M = bs, so this holds bs rows of
         //   the col-partitioned vocab slice.
         if (!wall_p640_staged_layout) {
+            // Exact C256 retains raw residual1 through phase 9. The fused
+            // head is emitted only after final norm, so its output can reuse
+            // dead phase-8 Gate/Down storage while remaining disjoint from
+            // its residual input. Decode and every other layout keep phase 8.
+            const int lm_head_phase_start = qwen_inplace && qwen3_c256_ ? 9 : 8;
             decls.push_back({"lm_head_out",
                              A(bs * (QWEN3_FUSED_LM_HEAD_MAX_VOCAB / lm_head_tp()) * DWIDTH),
-                             8, 9, StorageClass::Temp, 0, nullptr});
+                             lm_head_phase_start, 9, StorageClass::Temp, 0, nullptr});
         }
 
         // ★ R-Phase 2 (Qwen3-VL): DeepStack scratch buffer.
@@ -4092,6 +4673,49 @@ protected:
             decls.push_back(final_norm);
         }
 
+        if ((qwen3_prefill_w8a8_ || qwen_inplace) && comp_cs > 1) {
+            // Q/tmp retire before O. Down quant retires Gate before Down writes;
+            // its independent Q/SX roots keep both source and output protected.
+            for (auto& d : decls) {
+                const std::string name = d.name;
+                if (name == "q") d.phase_end = 4;
+                if (name == "sdpa_tmp") d.phase_start = d.phase_end = 4;
+                if (name == "gate" && qwen3_prefill_w8a8_) d.phase_end = 7;
+                if (name == "down") d.phase_start = 8;
+            }
+            if (qwen3_prefill_w8a8_) for (const auto& b : qwen3_w8a8::buffers(comp_cs))
+                decls.push_back({b.name, b.bytes, b.first, b.last,
+                                StorageClass::Temp, 0, nullptr});
+        }
+        if (qwen_inplace && qwen3_c512_) {
+            TORCH_CHECK(qwen3_prefill_w8a8_ && tmp == 262144,
+                        "Qwen3 C512 requires A8 and its exact full-query SDPA workspace");
+            decls.erase(std::remove_if(decls.begin(), decls.end(), [](const BufferDecl& d) {
+                return d.storage == StorageClass::Temp;
+            }), decls.end());
+            for (const auto& b : qwen3_c512::kBuffers)
+                decls.push_back({b.name, b.bytes, b.first, b.last,
+                                StorageClass::Temp, 0, b.alias});
+        }
+        if (qwen_inplace && (qwen3_c256_ || qwen3_c512_)) {
+            // The external INT8 lm_head runs while the retained decoder owns
+            // its SPM allocation. Its eager allocator honors the same planning
+            // ceiling, so physical headroom alone does not prove this fits.
+            int64_t fixed = 0;
+            for (const auto& d : decls) {
+                if (d.alias_of) continue;
+                if (d.storage == StorageClass::Persistent)
+                    fixed += A(d.size);
+                else if (d.storage == StorageClass::PersistentPerLayer ||
+                         d.storage == StorageClass::TempPerLayer)
+                    fixed += A(d.size) * d.per_layer;
+            }
+            const int64_t budget = SpmAllocator::SPM_PLANNING_BUDGET &
+                ~(int64_t(SpmAllocator::ALIGN) - 1);
+            TORCH_CHECK(fixed + detail::estimate_temporary_total(decls) +
+                            qwen3_c192::kC256EagerHeadReserve <= budget,
+                        "Qwen3 C256/C512 must retain 64KiB within the planning budget for its eager lm_head");
+        }
         if (wall_p640_staged_layout) {
             constexpr int64_t kValidatedTempPeakBytes = 7'168'000;
             constexpr int64_t kFullVlaPersistentBytes = 591'360;
@@ -4123,8 +4747,17 @@ protected:
     int64_t subclass_layout_hash() const override {
         int64_t h = detail::layout_mix(
             0, deepstack_lang_layers_.empty() ? 0 : 1);
+        if (qwen3_inplace_capacity())
+            for (const auto value : (qwen3_c512_ ? qwen3_c512::identity() : qwen3_c192::identity(qwen3_inplace_capacity()))) h = detail::layout_mix(h, value);
+        if (qwen3_prefill_w8a8_)
+            for (const auto value : qwen3_prefill_w8a8_identity())
+                h = detail::layout_mix(h, value);
+        // Includes the no-LM-head and ordinary/non-Z1 predicates used by the
+        // bounded GR00T scratch layout; dry probes and COMPLETE use this key.
+        if (gr00t_long_prefill_scratch_profile()) {
+            h = detail::layout_mix(h, 0x47524f4f54);
+        }
         h = detail::layout_mix(h, wall_prefill_staged_mlp_ ? 1 : 0);
-        if (!tts_predictor_heads_.empty()) h = detail::layout_mix(h, 0x54545348);
         if (wall_base_paired_kv_) {
             h = detail::layout_mix(h, CAUSAL_DECODER_WALL_BASE_PAIRED_KV_SITE);
         }
@@ -4475,6 +5108,20 @@ protected:
                 linear_acc32_ ? 1 : 0};
     }
 
+    bool reduced_wall_resident_prefill(
+        int64_t physical_len, int64_t position, bool is_causal,
+        bool use_attn_mask, int64_t batch_size, int64_t num_chunks) const {
+        return !get_debug_export() && typeid(*this) == typeid(CausalDecoderModel) &&
+            reduced_wall_text_profile_ && physical_len > 1 && position == 0 &&
+            is_causal && !use_attn_mask && batch_size == 1 && num_chunks > 1 &&
+            !adarms_ && !decoder_mixed_precision_ &&
+            planning_mode_ == CausalDecoderPlanningMode::ORDINARY &&
+            !decode_gate_up_fusion_ && !wall_prefill_staged_mlp_ &&
+            !pre_layers_residual1_ready_ && !wall_z1_dispatch_ &&
+            !qwen3vl_pooler_z1_dispatch_ &&
+            !qwen3vl_multiview_text_composite_dispatch_;
+    }
+
 
     bool qwen3vl_decode_gemv(int64_t physical_len) const {
         return (qwen3vl_4b_w8_profile_ || qwen3vl_fp16_decode_profile_) &&
@@ -4632,11 +5279,387 @@ protected:
         return full_stage(plan.input) && full_stage(plan.qkv) && full_stage(plan.compute);
     }
 
+    KernelId qwen3_prefill_w8a8_linear_id(int64_t rows, qwen3_w8a8::Projection projection) const {
+        static constexpr KernelId ids[] = {
+#define RPU_W8A8_CANDIDATE(id, name, ordinal, m, n, k, lk, flags) KernelId::id,
+#include "../ops/rpu_linear_w8a8_candidates.inc"
+#undef RPU_W8A8_CANDIDATE
+        };
+        const auto s = qwen3_w8a8::shape(rows, projection);
+        return ids[rpu_pl_w8a8::installed_candidate(rpu_pl_w8a8::select_tile(s), s.local_k).ordinal];
+    }
+
+    std::vector<int64_t> qwen3_prefill_w8a8_identity() const {
+        auto identity = qwen3_w8a8::identity();
+        const auto& kernels = KernelCache::instance();
+        identity.push_back(kernels.has_loaded(KernelId::DYNAMIC_QUANTIZE_W8A8));
+        identity.push_back(kernels.has_loaded(KernelId::RMS_NORM_QUANTIZE_W8A8_H5120_M128));
+        identity.push_back(kernels.has_loaded(KernelId::MUL_QUANTIZE_W8A8_H3200_M128));
+        for (int64_t rows : {16, 32, 64, 128})
+            for (int p = 0; p < 7; ++p)
+                identity.push_back(kernels.has_loaded(qwen3_prefill_w8a8_linear_id(
+                    rows, static_cast<qwen3_w8a8::Projection>(p))));
+        if (qwen3_c192_) {
+            identity.push_back(kernels.has_loaded(KernelId::RMS_NORM_QUANTIZE_W8A8_H5120_M192));
+            identity.push_back(kernels.has_loaded(KernelId::MUL_QUANTIZE_W8A8_H3200_M192));
+            for (int p = 0; p < 7; ++p) {
+                auto args = qwen3_w8a8::linear_arguments(192, static_cast<qwen3_w8a8::Projection>(p));
+                identity.insert(identity.end(), args.begin(), args.end());
+                identity.push_back(kernels.has_loaded(qwen3_prefill_w8a8_linear_id(192, static_cast<qwen3_w8a8::Projection>(p))));
+            }
+            for (size_t r=0; r<4; ++r) {
+                auto args = qwen3_w8a8::quant_arguments(192, r);
+                identity.insert(identity.end(), args.begin(), args.end());
+            }
+        }
+        if (qwen3_c256_) {
+            identity.push_back(kernels.has_loaded(KernelId::RMS_NORM_QUANTIZE_W8A8_H5120_M256));
+            identity.push_back(kernels.has_loaded(KernelId::QWEN3_UP_MUL_W8A8_M272N64K384));
+            for (int p = 0; p < 7; ++p) {
+                const auto projection = static_cast<qwen3_w8a8::Projection>(p);
+                auto args = qwen3_w8a8::linear_arguments(256, projection);
+                identity.insert(identity.end(), args.begin(), args.end());
+                if (projection != qwen3_w8a8::Projection::Up)
+                    identity.push_back(kernels.has_loaded(qwen3_prefill_w8a8_linear_id(256, projection)));
+            }
+            for (size_t r = 0; r < 4; ++r) {
+                auto args = qwen3_w8a8::quant_arguments(256, r);
+                identity.insert(identity.end(), args.begin(), args.end());
+            }
+        }
+        if (qwen3_c512_) {
+            identity.push_back(kernels.has_loaded(KernelId::QWEN3_UP_MUL_W8A8_M512N64K128));
+            for (int p = 0; p < 7; ++p) {
+                const auto projection = static_cast<qwen3_w8a8::Projection>(p);
+                const auto args = qwen3_w8a8::linear_arguments(512, projection);
+                identity.insert(identity.end(), args.begin(), args.end());
+                if (projection != qwen3_w8a8::Projection::Up)
+                    identity.push_back(kernels.has_loaded(qwen3_prefill_w8a8_linear_id(512, projection)));
+            }
+            for (size_t role = 0; role < 4; ++role) {
+                const auto args = qwen3_w8a8::quant_arguments(512, role);
+                identity.insert(identity.end(), args.begin(), args.end());
+            }
+        }
+        return identity;
+    }
+
+    void require_qwen3_32b_w8_profile() const {
+        // SPM-KV enablement is an AUTO candidate capability, not the selected
+        // route. The exact 32B W8 profile is ineligible for that route; enforce
+        // DDR_KV on the resolved plan in qwen3_prefill_w8a8_plan_valid().
+        TORCH_CHECK(typeid(*this) == typeid(CausalDecoderModel) &&
+                        num_cores() == 8 && attn_tp() == 8 && mlp_tp() == 8 &&
+                        num_layers() == 64 && layer_weights_.size() == 64 &&
+                        hidden_size() == 5120 && intermediate_size() == 25600 &&
+                        num_q_heads() == 64 && num_kv_heads() == 8 && head_dim() == 128 &&
+                        has_qk_norm_ && use_silu_ && eps_ == 1e-6 && !linear_acc32_ &&
+                        !has_mrope_ && !has_qkv_bias_ && !nvfp4_ && !adarms_ &&
+                        !decoder_mixed_precision_ && !decode_gate_up_fusion_ &&
+                        !wall_prefill_staged_mlp_ && !wall_sorting_route_enabled() &&
+                        !lingbot_prefill_mode_bound_ && !rhinovla_high_precision_ &&
+                        deepstack_lang_layers_.empty() &&
+                        !pre_layers_residual1_ready_ && !equal_two_prefill_ &&
+                        !wall_z1_dispatch_ && !qwen3vl_pooler_z1_dispatch_ &&
+                        !qwen3vl_multiview_text_composite_dispatch_ &&
+                        planning_mode_ == CausalDecoderPlanningMode::ORDINARY,
+                    "Qwen3 prefill W8A8 requires plain 32B TP8 W8/ACC16 baseline, DDR KV and ordinary FP16 math");
+        TORCH_CHECK(ordinary_rmsnorm_route_enabled() &&
+                        ordinary_rmsnorm_spm_contract_.resolve(128, 5120) == RpuRmsNormSpmRoute::V32_GRID8,
+                    "Qwen3 prefill W8A8 RMSQuant requires the original V32_GRID8 RMSNorm contract");
+        for (const auto& layer : layer_weights_) {
+            const std::array<const at::Tensor*, 7> weights{
+                &layer.q_w, &layer.k_w, &layer.v_w, &layer.o_w,
+                &layer.gate_w, &layer.up_w, &layer.down_w};
+            const std::array<const at::Tensor*, 7> scales{
+                &layer.q_ws, &layer.k_ws, &layer.v_ws, &layer.o_ws,
+                &layer.gate_ws, &layer.up_ws, &layer.down_ws};
+            for (size_t p = 0; p < weights.size(); ++p) {
+                const auto& w = *weights[p]; const auto& sw = *scales[p];
+                TORCH_CHECK(w.defined() && w.scalar_type() == at::kChar &&
+                                w.device().type() == at::kPrivateUse1 && w.is_contiguous() &&
+                                w.dim() == 2 && w.size(0) == qwen3_w8a8::kGlobalN[p] &&
+                                w.size(1) == qwen3_w8a8::kGlobalK[p] &&
+                                sw.defined() && sw.scalar_type() == at::kHalf &&
+                                sw.device() == w.device() && sw.is_contiguous() &&
+                                sw.dim() == 1 && sw.numel() == qwen3_w8a8::kGlobalN[p],
+                            "Qwen3 prefill W8A8 requires all 64 layers' seven packed INT8 weights and FP16 per-channel scales");
+            }
+            for (const auto* gamma : {&layer.input_norm_w, &layer.post_norm_w})
+                TORCH_CHECK(gamma->defined() && gamma->scalar_type() == at::kHalf &&
+                                gamma->device() == layer.q_w.device() && gamma->is_contiguous() &&
+                                gamma->dim() == 1 && gamma->numel() == 5120,
+                            "Qwen3 prefill W8A8 RMSQuant requires all input/post RMSNorm FP16 H5120 weights");
+        }
+    }
+
+    void require_qwen3_prefill_w8a8_profile() const {
+        require_qwen3_32b_w8_profile();
+        TORCH_CHECK(chunk_envelope().max_kv_len == 512 &&
+                        chunk_envelope().chunk == (qwen3_c512_ ? 512 : qwen3_c256_ ? 256 : qwen3_c192_ ? 192 : 128),
+                    "Qwen3 prefill W8A8 requires its frozen P512/C128 or explicit C192/C256 envelope");
+        const auto& kernels = KernelCache::instance();
+        if (qwen3_c192_)
+            TORCH_CHECK(ordinary_rmsnorm_spm_contract_.resolve(192, 5120) == RpuRmsNormSpmRoute::V32_GRID8 &&
+                            kernels.has_loaded(KernelId::RMS_NORM_QUANTIZE_W8A8_H5120_M192) &&
+                            kernels.has_loaded(KernelId::MUL_QUANTIZE_W8A8_H3200_M192),
+                        "Qwen3 C192 A8 requires exact V32_GRID8 RMSQuant M192 payload");
+        if (qwen3_c256_)
+            TORCH_CHECK(ordinary_rmsnorm_spm_contract_.resolve(256, 5120) == RpuRmsNormSpmRoute::V32_GRID8 &&
+                            kernels.has_loaded(KernelId::RMS_NORM_QUANTIZE_W8A8_H5120_M256) &&
+                            kernels.has_loaded(KernelId::QWEN3_UP_MUL_W8A8_M272N64K384),
+                        "Qwen3 C256 A8 requires its exact RMSQuant and Up-Mul expansion payloads");
+        if (qwen3_c512_)
+            TORCH_CHECK(kernels.has_loaded(KernelId::QWEN3_UP_MUL_W8A8_M512N64K128) &&
+                            kernels.has_loaded(KernelId::LLM_ALL_REDUCE_RESIDUAL_RING_LOCAL_SPM) &&
+                            !fuse_prefill_last_lm_head_ && !get_debug_export(),
+                        "Qwen3 C512 A8 requires its exact Up-Mul payload and ordinary DDR output");
+        TORCH_CHECK(kernels.has_loaded(KernelId::DYNAMIC_QUANTIZE_W8A8),
+                    "Qwen3 prefill W8A8 requires dynamic_quantize_w8a8 expansion payload");
+        TORCH_CHECK(kernels.has_loaded(KernelId::RMS_NORM_QUANTIZE_W8A8_H5120_M128),
+                    "Qwen3 prefill W8A8 requires rms_norm_quantize_w8a8_h5120_m128; no unfused M128 fallback");
+        TORCH_CHECK(kernels.has_loaded(KernelId::MUL_QUANTIZE_W8A8_H3200_M128),
+                    "Qwen3 C128 A8 requires its exact FP16 Mul-to-Quant producer");
+        for (int64_t rows : {16, 32, 64, 128, 192, 256, 512})
+            for (int p = 0; p < 7; ++p)
+                TORCH_CHECK((rows == 192 && !qwen3_c192_) || (rows == 256 && (!qwen3_c256_ || p == 5)) || (rows == 512 && (!qwen3_c512_ || p == 5)) || kernels.has_loaded(qwen3_prefill_w8a8_linear_id(
+                    rows, static_cast<qwen3_w8a8::Projection>(p))),
+                    "Qwen3 prefill W8A8 requires its complete main Linear payloads; no A16 fallback");
+    }
+
+    bool qwen3_c192_plan_valid(const FmbThreeStageChunkPlan& plan,
+            const LayoutContext& layout, int64_t physical_len, int64_t position) const {
+        const int64_t capacity = qwen3_inplace_capacity();
+        if (!capacity || physical_len == 1) return true;
+        if (qwen3_c512_ && !qwen3_prefill_w8a8_) return false;
+        if (physical_len != 512 || position != 0 || layout.chunk_size != capacity ||
+            layout.effective_kv_cs() != capacity || !layout.is_causal || layout.use_attn_mask ||
+            layout.batch_size != 1 || layout.attention_policy != AttentionExecutionPolicy::DDR_KV ||
+            plan.chunk_mode != ChunkMode::SEQUENTIAL) return false;
+        const auto matches = [capacity](const auto& chunks) {
+            const int64_t count = capacity == 512 ? 1 : capacity == 256 ? 2 : 3;
+            if (chunks.size() != size_t(count)) return false;
+            int64_t end = 0;
+            for (int64_t i = 0; i < count; ++i) {
+                const auto& c = chunks[i];
+                const int64_t rows = std::min(capacity, 512 - end);
+                if (c.idx != i || c.offset != end || c.len != rows ||
+                    c.kv_seq_len != end + rows) return false;
+                end += rows;
+            }
+            return true;
+        };
+        // Ordinary text keeps one semantic input span; its DMA is sliced by
+        // the three compute chunks. Do not confuse that span with three images.
+        const auto& input = plan.input.chunks;
+        return input.size() == 1 && input[0].idx == 0 && input[0].offset == 0 &&
+            input[0].len == 512 && input[0].kv_seq_len == 512 &&
+            matches(plan.qkv.chunks) && matches(plan.compute.chunks);
+    }
+
+    bool qwen3_c512_manifest_valid(const FmbPhysicalExecutionManifest& manifest) const {
+        const bool active = qwen3_c512_ && manifest.physical_length > 1;
+        int policy = 0, final_norm = 0;
+        std::array<int, 6> dmas{};
+        std::array<int, 2> rings{};
+        for (const auto& route : manifest.routes) {
+            if (route.site_id == qwen3_c512::kPolicySite) {
+                if (!qwen3_c512_ || ++policy != 1 || route.family != FmbRouteFamily::GRAPH_SCHEDULE ||
+                    route.selector != 1 || route.flags || route.invocation ||
+                    route.arguments != qwen3_c512::policy_arguments(manifest.physical_length)) return false;
+            } else if (route.site_id == qwen3_c512::kDmaSite) {
+                if (!active || route.family != FmbRouteFamily::MUTABLE_DMA ||
+                    route.flags || route.invocation < 0 || route.invocation >= 6 ||
+                    route.selector != qwen3_c512::dma_selector(static_cast<qwen3_c512::DmaRole>(route.invocation)) ||
+                    route.invocation == static_cast<int64_t>(qwen3_c512::DmaRole::PostNorm) ||
+                    route.arguments != qwen3_c512::dma_arguments(static_cast<qwen3_c512::DmaRole>(route.invocation)) ||
+                    ++dmas[route.invocation] != 1) return false;
+            } else if (route.site_id == qwen3_c512::kFinalNormSite) {
+                if (!active || route.family != FmbRouteFamily::NORMALIZATION || route.selector != 1 ||
+                    route.flags || route.invocation || ++final_norm != 1 ||
+                    route.arguments != qwen3_c512::final_norm_arguments()) return false;
+            } else if (route.family == FmbRouteFamily::ALL_REDUCE &&
+                       route.selector == qwen3_c512::kRingSelector) {
+                const int role = route.site_id == CAUSAL_DECODER_REDUCE_SITE ? 0 :
+                    route.site_id == qwen3_c192::kDownReduceSite ? 1 : -1;
+                if (!active || role < 0 || route.flags || route.invocation ||
+                    route.arguments != qwen3_c512::ring_arguments() || ++rings[role] != 1) return false;
+            } else if ((active && route.site_id == qwen3_c192::kPolicySite) ||
+                       (active && (route.site_id == qwen3_c192::kMlpSite ||
+                                   route.site_id == qwen3_c192::kUpMulSite ||
+                                   (route.family == FmbRouteFamily::ALL_REDUCE &&
+                                    (route.site_id == CAUSAL_DECODER_REDUCE_SITE ||
+                                     route.site_id == qwen3_c192::kDownReduceSite))))) return false;
+        }
+        if (policy != (qwen3_c512_ ? 1 : 0)) return false;
+        if (!active) return true;
+        return qwen3_prefill_w8a8_ && manifest.state == FmbPhysicalManifestState::COMPLETE &&
+            manifest.logical_length == 512 && manifest.physical_length == 512 &&
+            manifest.kv_logical_length == 512 && final_norm == 1 && rings[0] == 1 && rings[1] == 1 &&
+            dmas[3] == 0 && std::all_of(qwen3_c512::kDmaRoles.begin(), qwen3_c512::kDmaRoles.end(),
+                [&](auto role) { return dmas[static_cast<size_t>(role)] == 1; });
+    }
+
+    bool qwen3_c192_manifest_valid(const FmbPhysicalExecutionManifest& manifest) const {
+        if (qwen3_c512_) return qwen3_c512_manifest_valid(manifest);
+        if (!qwen3_c512_manifest_valid(manifest)) return false;
+        const int64_t capacity = qwen3_inplace_capacity();
+        const bool active = capacity && manifest.physical_length > 1;
+        const int64_t count = capacity == 512 ? 1 : capacity == 256 ? 2 : 3;
+        int policy = 0;
+        std::array<std::array<int, 2>, 3> rings{};
+        std::array<int, 3> mlps{};
+        std::array<int, 3> up_mul{};
+        for (const auto& r : manifest.routes) {
+            if (r.site_id == qwen3_c192::kPolicySite) {
+                if (!capacity || ++policy != 1 || r.family != FmbRouteFamily::GRAPH_SCHEDULE ||
+                    r.selector != 1 || r.flags || r.invocation ||
+                    r.arguments != qwen3_c192::policy_arguments(
+                        manifest.physical_length, qwen3_prefill_w8a8_, capacity)) return false;
+                continue;
+            }
+            const bool c192ring = r.family == FmbRouteFamily::ALL_REDUCE &&
+                r.selector == qwen3_c192::kRingSelector;
+            const bool down = r.site_id == qwen3_c192::kDownReduceSite;
+            const bool mlp = r.site_id == qwen3_c192::kMlpSite;
+            const bool up = r.site_id == qwen3_c192::kUpMulSite;
+            if (!active) {
+                if (c192ring || down || mlp || up) return false;
+                continue;
+            }
+            const bool attn = r.site_id == CAUSAL_DECODER_REDUCE_SITE;
+            if (!attn && !down && !mlp && !up) {
+                if (c192ring) return false;
+                continue;
+            }
+            if (r.invocation < 0 || r.invocation >= count || r.flags) return false;
+            const int64_t rows = capacity == 256 ? 256 : r.invocation == 2 ? 128 : 192;
+            if (up) {
+                if (capacity != 256 || qwen3_prefill_w8a8_ || r.family != FmbRouteFamily::LINEAR ||
+                    r.selector != qwen3_c192::kUpMulSelector ||
+                    r.arguments != qwen3_c192::up_mul_arguments(false) ||
+                    ++up_mul[r.invocation] != 1) return false;
+            } else if (mlp) {
+                if (qwen3_prefill_w8a8_ || r.family != FmbRouteFamily::LINEAR ||
+                    r.selector != static_cast<int64_t>(CausalDecoderLinearRoute::AUTO_TILE) ||
+                    r.arguments != std::vector<int64_t>({1, rows, 5120, 25600, 8}) ||
+                    ++mlps[r.invocation] != 1) return false;
+            } else if (!c192ring || r.arguments != qwen3_c192::ring_arguments(rows) ||
+                       ++rings[r.invocation][down ? 1 : 0] != 1) return false;
+        }
+        if (policy != (capacity ? 1 : 0)) return false;
+        if (!active) return true;
+        if (manifest.physical_length != 512 || manifest.logical_length != 512 ||
+            manifest.kv_logical_length != 512 ||
+            manifest.state != FmbPhysicalManifestState::COMPLETE) return false;
+        for (int64_t i = 0; i < count; ++i)
+            if (rings[i][0] != 1 || rings[i][1] != 1 ||
+                mlps[i] != (qwen3_prefill_w8a8_ ? 0 : 1) ||
+                up_mul[i] != (capacity == 256 && !qwen3_prefill_w8a8_ ? 1 : 0)) return false;
+        return true;
+    }
+
+    bool qwen3_prefill_w8a8_plan_valid(const FmbThreeStageChunkPlan& plan,
+            const LayoutContext& layout, int64_t physical_len, int64_t position) const {
+        if (!qwen3_c192_plan_valid(plan, layout, physical_len, position)) return false;
+        if (!qwen3_prefill_w8a8_ || physical_len == 1) return true;
+        if (physical_len < 16 || physical_len > 512 || physical_len % 16 || position != 0 ||
+            !layout.is_causal || layout.use_attn_mask || layout.batch_size != 1 ||
+            layout.attention_policy != AttentionExecutionPolicy::DDR_KV ||
+            plan.chunk_mode != ChunkMode::SEQUENTIAL || plan.compute.chunks.empty()) return false;
+        int64_t end = 0, index = 0;
+        for (const auto& chunk : plan.compute.chunks) {
+            if (chunk.idx != index++ || chunk.offset != end || (!qwen3_w8a8::valid_rows(chunk.len) || (chunk.len == 192 && !qwen3_c192_) || (chunk.len == 256 && !qwen3_c256_) || (chunk.len == 512 && !qwen3_c512_)) ||
+                chunk.kv_seq_len != end + chunk.len) return false;
+            end += chunk.len;
+        }
+        return end == physical_len;
+    }
+
+    std::array<int64_t, 7> qwen3_prefill_w8a8_linear_sites() const {
+        return {CAUSAL_DECODER_Q_SITE, CAUSAL_DECODER_K_SITE, CAUSAL_DECODER_V_SITE,
+            CAUSAL_DECODER_O_SITE, qwen3_w8a8::kGateSite, qwen3_w8a8::kUpSite, qwen3_w8a8::kDownSite};
+    }
+
+    bool qwen3_prefill_w8a8_manifest_valid(const FmbPhysicalExecutionManifest& manifest) const {
+        const bool active = qwen3_prefill_w8a8_ && manifest.physical_length > 1;
+        const auto sites = qwen3_prefill_w8a8_linear_sites();
+        std::map<int64_t, std::array<int, 12>> seen;
+        std::map<int64_t, int64_t> rows;
+        int policies = 0;
+        for (const auto& route : manifest.routes) {
+            if (route.site_id == qwen3_w8a8::kPolicySite) {
+                if (!qwen3_prefill_w8a8_ || ++policies != 1 ||
+                    route.family != FmbRouteFamily::GRAPH_SCHEDULE || route.selector != 1 ||
+                    route.flags || route.invocation ||
+                    route.arguments != std::vector<int64_t>({qwen3_w8a8::kPolicyVersion, manifest.physical_length, 512, qwen3_c512_ ? 512 : qwen3_c256_ ? 256 : qwen3_c192_ ? 192 : 128, 8,
+                        active ? 7 : 0, active ? 4 : 0})) return false;
+                continue;
+            }
+            const auto q = std::find(qwen3_w8a8::kQuantSites.begin(), qwen3_w8a8::kQuantSites.end(), route.site_id);
+            const auto p = std::find(sites.begin(), sites.end(), route.site_id);
+            const bool quant = q != qwen3_w8a8::kQuantSites.end();
+            const bool projection = p != sites.end();
+            const bool reduce = route.site_id == qwen3_w8a8::kReduceSite ||
+                (active && qwen3_inplace_capacity() && route.site_id == qwen3_c192::kDownReduceSite);
+            if (active && qwen3_inplace_capacity() && route.site_id == qwen3_w8a8::kReduceSite) return false;
+            const bool linear_a8 = route.family == FmbRouteFamily::LINEAR &&
+                route.site_id != qwen3_c192::kUpMulSite &&
+                (route.selector == qwen3_w8a8::kLinearSelector ||
+                 route.selector == qwen3_c192::kUpMulSelector);
+            const bool private_projection = p != sites.end() && p - sites.begin() >= 4;
+            if (!active) {
+                if (quant || reduce || linear_a8 || private_projection) return false;
+                continue;
+            }
+            if (linear_a8 && !projection) return false;
+            if (!quant && !projection && !reduce) continue;
+            if (route.flags || route.invocation < 0 || route.invocation >= 32 || route.arguments.size() < 2)
+                return false;
+            const int64_t m = route.arguments[1];
+            if (!qwen3_w8a8::valid_rows(m) || (m == 192 && !qwen3_c192_) || (m == 256 && !qwen3_c256_) || (m == 512 && !qwen3_c512_)) return false;
+            auto [it, inserted] = rows.emplace(route.invocation, m);
+            if (!inserted && it->second != m) return false;
+            size_t slot;
+            if (quant) {
+                slot = static_cast<size_t>(q - qwen3_w8a8::kQuantSites.begin());
+                const auto family = qwen3_w8a8::uses_rms_quant(m, slot)
+                    ? FmbRouteFamily::NORMALIZATION : FmbRouteFamily::ACTIVATION;
+                if (route.family != family || route.selector != qwen3_w8a8::quant_selector(m, slot) ||
+                    route.arguments != qwen3_w8a8::quant_arguments(m, slot)) return false;
+            } else if (projection) {
+                const size_t role = static_cast<size_t>(p - sites.begin());
+                slot = 4 + role;
+                if (!linear_a8 || route.selector != qwen3_w8a8::linear_selector(
+                        m, static_cast<qwen3_w8a8::Projection>(role)) ||
+                    route.arguments != qwen3_w8a8::linear_arguments(
+                        m, static_cast<qwen3_w8a8::Projection>(role))) return false;
+            } else {
+                slot = 11;
+                if (route.family != FmbRouteFamily::ALL_REDUCE || route.selector != (qwen3_c512_ ? qwen3_c512::kRingSelector : qwen3_inplace_capacity() ? qwen3_c192::kRingSelector : causal_ring_route(m, 5120)) ||
+                    route.arguments != (qwen3_c512_ ? qwen3_c512::ring_arguments() : qwen3_inplace_capacity() ? qwen3_c192::ring_arguments(m) : std::vector<int64_t>({1, m, 5120, 8}))) return false;
+            }
+            if (++seen[route.invocation][slot] != 1) return false;
+        }
+        if (policies != (qwen3_prefill_w8a8_ ? 1 : 0)) return false;
+        if (!active) return true;
+        if (manifest.state != FmbPhysicalManifestState::COMPLETE || manifest.physical_length > 512 ||
+            manifest.kv_logical_length != manifest.logical_length ||
+            manifest.linear_accumulation != FmbLinearAccumulationPolicy::MIXED_BY_SITE) return false;
+        int64_t index = 0, total = 0;
+        for (const auto& item : seen) {
+            if (item.first != index++ || !std::all_of(item.second.begin(), item.second.end(), [](int n){return n == 1;})) return false;
+            total += rows.at(item.first);
+        }
+        return total == manifest.physical_length;
+    }
+
     std::vector<FmbPhysicalExecutionManifest> physical_manifest_domain_for_candidate(
         const FmbThreeStageChunkPlan& plan, const LayoutContext& layout,
         int64_t physical_len, int64_t logical_len, int64_t position) const override {
         if (lingbot_prefill_kv_only_ &&
             !lingbot_prefill_kv_only_for_plan(plan, layout, physical_len, position)) return {};
+        if (!qwen3_prefill_w8a8_plan_valid(plan, layout, physical_len, position)) return {};
         return {physical_manifest_for_candidate(plan, layout, physical_len, logical_len, position)};
     }
 
@@ -4645,6 +5668,11 @@ protected:
         const LayoutContext& layout,
         int64_t physical_len, int64_t logical_len,
         int64_t position) const override {
+        TORCH_CHECK(qwen3_prefill_w8a8_plan_valid(plan, layout, physical_len, position),
+                    "Qwen3 prefill W8A8 rejects a non-ordinary or out-of-envelope stage plan");
+        const bool qwen_inplace = qwen3_inplace_capacity() && physical_len > 1;
+        const bool qwen_c512 = qwen3_c512_ && physical_len > 1;
+        const bool qwen_a8 = qwen3_prefill_w8a8_ && physical_len > 1;
         FmbPhysicalExecutionManifest manifest;
         manifest.state = FmbPhysicalManifestState::COMPLETE;
         manifest.logical_length = logical_len;
@@ -4659,7 +5687,7 @@ protected:
         manifest.graph_lifecycle = planning_graph_lifecycle_;
         // NVFP4 follows the same immutable accumulation choice as the other
         // ordinary Linear formats; only the explicit mixed profile differs.
-        manifest.linear_accumulation = (decoder_mixed_precision_ || !tts_predictor_heads_.empty())
+        manifest.linear_accumulation = (decoder_mixed_precision_ || qwen_a8)
             ? FmbLinearAccumulationPolicy::MIXED_BY_SITE
             : (linear_acc32_
                    ? FmbLinearAccumulationPolicy::ACC32
@@ -4690,8 +5718,10 @@ protected:
         };
         auto append_ring = [&](int64_t site_id, int64_t rows,
                                int64_t invocation) {
+            const bool inplace = qwen_inplace && site_id == CAUSAL_DECODER_REDUCE_SITE;
             append(FmbRouteFamily::ALL_REDUCE, site_id,
-                   causal_ring_route(rows, hidden_size()), 0, {}, invocation);
+                   qwen_c512 && inplace ? qwen3_c512::kRingSelector : inplace ? qwen3_c192::kRingSelector : causal_ring_route(rows, hidden_size()), 0,
+                   qwen_c512 && inplace ? qwen3_c512::ring_arguments() : inplace ? qwen3_c192::ring_arguments(rows) : std::vector<int64_t>{}, invocation);
         };
         auto append_kv = [&](int64_t site_id, int64_t invocation,
                              int64_t insert_position, int64_t rows,
@@ -4702,6 +5732,13 @@ protected:
                 ? padded_rows : rows;
             uint32_t capabilities = KV_INSERT_CAP_V2;
             if (!dynamic_position) capabilities |= KV_INSERT_CAP_V16;
+            // A reduced-core prefix runs attention on 1/2/4 lanes; the V16
+            // writer is certified there (v16_shape_ok), so prefill no longer
+            // falls back to the multi-warp V2 insert. Eight-core handles keep
+            // their capability set, including Wall's two-lane attention.
+            if (!dynamic_position && num_cores() != NUM_CORES) {
+                capabilities |= KV_INSERT_CAP_NON8_TP_V16;
+            }
             if (physical_rows != rows) capabilities |= KV_INSERT_CAP_PAD16;
             const KvInsertSegmentPlan kv_plan = dynamic_position
                 ? rpu_resolve_kvinsert_segment_plan(
@@ -4723,7 +5760,34 @@ protected:
                    {arguments.begin(), arguments.end()}, invocation);
             return kv_plan;
         };
+        const auto append_a8_quant = [&](const ChunkInfo& chunk, size_t role) {
+            append(qwen3_w8a8::uses_rms_quant(chunk.len, role)
+                       ? FmbRouteFamily::NORMALIZATION : FmbRouteFamily::ACTIVATION,
+                   qwen3_w8a8::kQuantSites[role], qwen3_w8a8::quant_selector(chunk.len, role), 0,
+                   qwen3_w8a8::quant_arguments(chunk.len, role), chunk.idx);
+        };
+        const auto append_a8_linear = [&](const ChunkInfo& chunk, qwen3_w8a8::Projection projection) {
+            append(FmbRouteFamily::LINEAR,
+                   qwen3_prefill_w8a8_linear_sites()[static_cast<size_t>(projection)],
+                   qwen3_w8a8::linear_selector(chunk.len, projection), 0,
+                   qwen3_w8a8::linear_arguments(chunk.len, projection), chunk.idx);
+        };
+        if (qwen3_prefill_w8a8_)
+            append(FmbRouteFamily::GRAPH_SCHEDULE, qwen3_w8a8::kPolicySite, 1, 0,
+                   {qwen3_w8a8::kPolicyVersion, physical_len, 512, qwen3_c512_ ? 512 : qwen3_c256_ ? 256 : qwen3_c192_ ? 192 : 128, 8, qwen_a8 ? 7 : 0, qwen_a8 ? 4 : 0});
 
+        if (qwen3_inplace_capacity())
+            append(FmbRouteFamily::GRAPH_SCHEDULE,
+                   qwen3_c512_ ? qwen3_c512::kPolicySite : qwen3_c192::kPolicySite, 1, 0,
+                   qwen3_c512_ ? qwen3_c512::policy_arguments(physical_len) :
+                       qwen3_c192::policy_arguments(physical_len, qwen3_prefill_w8a8_, qwen3_inplace_capacity()));
+        if (qwen_c512) {
+            for (const auto role : qwen3_c512::kDmaRoles)
+                append(FmbRouteFamily::MUTABLE_DMA, qwen3_c512::kDmaSite, qwen3_c512::dma_selector(role), 0,
+                       qwen3_c512::dma_arguments(role), static_cast<int64_t>(role));
+            append(FmbRouteFamily::NORMALIZATION, qwen3_c512::kFinalNormSite, 1, 0,
+                   qwen3_c512::final_norm_arguments());
+        }
         const bool p640_staged = wall_prefill_staged_mlp_ &&
             decoder_mixed_precision_ && physical_len == 640 && position == 0 &&
             layout.is_causal && !layout.use_attn_mask;
@@ -4845,7 +5909,7 @@ protected:
                causal_deepstack_topology_arguments(deepstack_lang_layers_));
         append(FmbRouteFamily::GRAPH_SCHEDULE,
                CAUSAL_DECODER_LM_HEAD_TOPOLOGY_SITE, topology_selector, 0,
-               {!tts_predictor_heads_.empty() ? 2 : (fuse_lm_head_ ? 1 : 0), vocab_size_});
+               {fuse_lm_head_ ? 1 : 0, vocab_size_});
         if (lingbot_prefill_mode_bound_) {
             append(FmbRouteFamily::GRAPH_SCHEDULE, LINGBOT2_PREFILL_POLICY_SITE,
                    topology_selector, 0, lingbot_prefill_policy_arguments());
@@ -4996,7 +6060,7 @@ protected:
                            1, rhinovla_high_precision_fusions_ ? 1 : 0,
                            {chunk.len, intermediate_size() / mlp_tp(), 1}, chunk.idx);
                 }
-                if (!lingbot_folded_rmsnorm_) append_ordinary_rmsnorm(/*role=*/0);
+                if (!lingbot_folded_rmsnorm_ && !qwen_c512) append_ordinary_rmsnorm(/*role=*/0);
                 if (has_qk_norm_ && !qwen3vl4b_fused_qk) {
                     append_ordinary_rmsnorm(/*role=*/1);
                     append_ordinary_rmsnorm(/*role=*/2);
@@ -5195,8 +6259,7 @@ protected:
                        static_cast<int64_t>(
                            CausalDecoderMutableDmaRoute::DDR_BROADCAST_TO_SPM));
             }
-            if (!tts_predictor_heads_.empty() ||
-                (fuse_lm_head_ && (physical_len == 1 || fuse_prefill_last_lm_head_))) {
+            if (fuse_lm_head_ && (physical_len == 1 || fuse_prefill_last_lm_head_)) {
                 append_linear(CAUSAL_DECODER_KV_FIRST_LM_HEAD_SITE,
                               CausalDecoderLinearRoute::AUTO_TILE);
                 append(FmbRouteFamily::MUTABLE_DMA,
@@ -5205,7 +6268,13 @@ protected:
                            CausalDecoderMutableDmaRoute::SPM_SCATTER_TO_DDR));
             }
         } else {
-            if (lingbot_prefill_qkv_for_plan(plan, physical_len, position,
+            if (qwen_a8) {
+                for (const auto& chunk : plan.compute.chunks) {
+                    append_a8_quant(chunk, 0);
+                    for (auto p : {qwen3_w8a8::Projection::Q, qwen3_w8a8::Projection::K, qwen3_w8a8::Projection::V})
+                        append_a8_linear(chunk, p);
+                }
+            } else if (lingbot_prefill_qkv_for_plan(plan, physical_len, position,
                     layout.is_causal, layout.use_attn_mask, layout.batch_size,
                     layout.attention_policy)) {
                 append(FmbRouteFamily::LINEAR, LINGBOT2_PREFILL_QKV_MULTIBASE_SITE,
@@ -5328,7 +6397,7 @@ protected:
             }
             if (qwen3vl4b_fused_o) {
                 append(FmbRouteFamily::LINEAR, QWEN3VL_4B_DECODE_O_RING_NORM_SITE,
-                       1, 0, {1, 2560, 4096, 512, 8, 320, 1, 63488},
+                       1, 0, qwen3vl_decode_o_contract_arguments(),
                        plan.compute.chunks.front().idx);
             } else if (wall_base_nvfp4_o_ring_norm) {
                 append(FmbRouteFamily::LINEAR,
@@ -5358,7 +6427,12 @@ protected:
                        CAUSAL_DECODER_PREPARE_SITE,
                        static_cast<int64_t>(
                            CausalDecoderAllReduceRoute::PREPARE_RING_INPUT));
-                if (ordinary_row_weight_reuse_plan_enabled(
+                if (qwen_a8) {
+                    for (const auto& chunk : plan.compute.chunks) {
+                        append_a8_quant(chunk, 1);
+                        append_a8_linear(chunk, qwen3_w8a8::Projection::O);
+                    }
+                } else if (ordinary_row_weight_reuse_plan_enabled(
                         plan, layout.is_causal, layout.batch_size)) {
                     for (const auto& chunk : plan.compute.chunks) {
                         const bool reuse = rpu_pl_tiling::supports_w8a16_row_weight_reuse(
@@ -5382,8 +6456,7 @@ protected:
                        static_cast<int64_t>(
                            CausalDecoderMutableDmaRoute::DDR_BROADCAST_TO_SPM));
             }
-            if (!tts_predictor_heads_.empty() ||
-                (fuse_lm_head_ && (physical_len == 1 || fuse_prefill_last_lm_head_))) {
+            if (fuse_lm_head_ && (physical_len == 1 || fuse_prefill_last_lm_head_)) {
                 append_linear(CAUSAL_DECODER_LM_HEAD_SITE,
                               CausalDecoderLinearRoute::AUTO_TILE);
                 append(FmbRouteFamily::MUTABLE_DMA,
@@ -5405,7 +6478,27 @@ protected:
 
         bool needs_shared_mlp = false;
         for (const ChunkInfo& chunk : plan.compute.chunks) {
-            if (wall_base_fp16_shared_gateup_enabled(
+            if (qwen_a8) {
+                append_a8_quant(chunk, 2);
+                append_a8_linear(chunk, qwen3_w8a8::Projection::Gate);
+                append_a8_linear(chunk, qwen3_w8a8::Projection::Up);
+                append_a8_quant(chunk, 3);
+                append_a8_linear(chunk, qwen3_w8a8::Projection::Down);
+                append(FmbRouteFamily::ALL_REDUCE,
+                       qwen_inplace ? qwen3_c192::kDownReduceSite : qwen3_w8a8::kReduceSite,
+                       qwen_c512 ? qwen3_c512::kRingSelector : qwen_inplace ? qwen3_c192::kRingSelector : causal_ring_route(chunk.len, 5120), 0,
+                       qwen_c512 ? qwen3_c512::ring_arguments() : qwen_inplace ? qwen3_c192::ring_arguments(chunk.len) : std::vector<int64_t>{1,chunk.len,5120,8}, chunk.idx);
+            } else if (qwen_inplace) {
+                append(FmbRouteFamily::LINEAR, qwen3_c192::kMlpSite,
+                       static_cast<int64_t>(CausalDecoderLinearRoute::AUTO_TILE), 0,
+                       {1,chunk.len,5120,25600,8},chunk.idx);
+                if (qwen3_c256_)
+                    append(FmbRouteFamily::LINEAR, qwen3_c192::kUpMulSite,
+                           qwen3_c192::kUpMulSelector, 0,
+                           qwen3_c192::up_mul_arguments(false), chunk.idx);
+                append(FmbRouteFamily::ALL_REDUCE, qwen3_c192::kDownReduceSite,
+                       qwen3_c192::kRingSelector, 0, qwen3_c192::ring_arguments(chunk.len),chunk.idx);
+            } else if (wall_base_fp16_shared_gateup_enabled(
                     plan, physical_len, position, layout.is_causal,
                     layout.use_attn_mask, layout.batch_size)) {
                 append(FmbRouteFamily::LINEAR, WALL_BASE_FP16_PREFILL_SHARED_GATEUP_SITE,
@@ -5433,7 +6526,7 @@ protected:
                            1, 0, lingbot_prefill_gateup_arguments(), chunk.idx);
                 } else {
                 append(FmbRouteFamily::LINEAR, QWEN3VL_4B_PREFILL_GATEUP_SITE,
-                       1, 0, {chunk.len, 9728, 2560, 8, 320, 112}, chunk.idx);
+                       1, 0, qwen3vl_prefill_gateup_contract_arguments(chunk.len), chunk.idx);
                 }
                 append(FmbRouteFamily::LINEAR, QWEN3VL_4B_PREFILL_DOWN_SITE,
                        static_cast<int64_t>(CausalDecoderLinearRoute::AUTO_TILE),
@@ -5444,7 +6537,7 @@ protected:
                     layout.is_causal, layout.use_attn_mask, layout.batch_size)) {
                 if (qwen3vl_4b_decode_gateup_fused_) {
                     append(FmbRouteFamily::LINEAR, QWEN3VL_4B_DECODE_MLP_GATEUP_FUSED_SITE,
-                           1, 0, {1, 9728, 2560, 8, 160, 96}, chunk.idx);
+                           1, 0, qwen3vl_decode_gateup_contract_arguments(), chunk.idx);
                 } else {
                     append(FmbRouteFamily::LINEAR, QWEN3VL_4B_DECODE_MLP_GATE_SITE,
                            static_cast<int64_t>(CausalDecoderLinearRoute::GEMV),
@@ -5463,7 +6556,7 @@ protected:
                 needs_shared_mlp = true;
             }
         }
-        uint32_t shared_routes = 0;
+        uint32_t shared_routes = qwen_c512 ? FMB_SHARED_LAYER_INPUT_SCATTER_DMA : 0;
         if (multiview_mode) {
             shared_routes |= FMB_SHARED_LAYER_INPUT_ROW_RUN_DMA;
         } else if (!pooler_z1_mode &&
@@ -5496,7 +6589,7 @@ protected:
             (wall_base_prefill_shared_silu_ &&
              wall_base_prefill_shared_input_enabled(plan, physical_len, position,
                  layout.is_causal, layout.use_attn_mask, layout.batch_size));
-        if (!shared_prefill_silu && (wall_small_prefill_fused || wall_fp16_long_prefill_fused ||
+        if (!qwen_c512 && !shared_prefill_silu && (wall_small_prefill_fused || wall_fp16_long_prefill_fused ||
             (ordinary_silu_mul_route_enabled() && layout.is_causal &&
              layout.batch_size == 1 && plan.chunk_mode == ChunkMode::SEQUENTIAL))) {
             for (const auto& chunk : plan.compute.chunks) {
@@ -5516,12 +6609,16 @@ protected:
                                  static_cast<int64_t>(rhs.family), rhs.site_id,
                                  rhs.invocation);
                   });
+        TORCH_CHECK(qwen3_c192_manifest_valid(manifest) && qwen3_prefill_w8a8_manifest_valid(manifest),
+                    "Qwen3 prefill W8A8 requires complete exact quantization and seven Linear routes");
         return manifest;
     }
 
     FmbPhysicalManifestForwardCapability
     physical_manifest_forward_capability(
         const FmbPhysicalExecutionManifest& manifest) const override {
+        if (!qwen3_c192_manifest_valid(manifest) || !qwen3_prefill_w8a8_manifest_valid(manifest))
+            return {false, manifest.graph_lifecycle};
         // FMB calls this before installing the current stage plan. Check any
         // new owner-raw receipt structurally; exact plan admission is shared by
         // producer and consumer. No new site is valid for other chunk plans.
@@ -5637,7 +6734,8 @@ protected:
         } else {
             cfg.chunk_mode = ChunkMode::SEQUENTIAL;
         }
-        cfg.inter_layer_io = InterLayerIO::AUTO;     // chunks==1 → SPM_RESIDENT, 否则 → DDR_PINGPONG
+        cfg.inter_layer_io = qwen3_c512_ && ctx().seq_len > 1
+            ? InterLayerIO::DDR_PINGPONG : InterLayerIO::AUTO;
 
         // Every earlier chunk has populated each layer's causal KV before the
         // next chunk visits that layer. Keep its hidden in residual1 across
@@ -5655,6 +6753,13 @@ protected:
                 plan.num_chunks)) {
             // residual1 already spans all compute phases. Removing the
             // inter-layer DDR copies adds no buffers and does not replan chunks.
+            cfg.inter_layer_io = InterLayerIO::SPM_RESIDENT;
+            cfg.chunk_outer_within_group = true;
+        }
+        if (reduced_wall_resident_prefill(
+                ctx().seq_len, ctx().position, ctx().is_causal,
+                ctx().attention_mask.has_value(), ctx().batch_size,
+                plan.num_chunks)) {
             cfg.inter_layer_io = InterLayerIO::SPM_RESIDENT;
             cfg.chunk_outer_within_group = true;
         }
@@ -5852,6 +6957,10 @@ protected:
     // ═══════════════════════════════════════════════════════════════════════
     bool subclass_chunk_size_valid(int64_t cs, int64_t seq_len, int64_t position) const override {
         if (cs <= 0 || cs > UINT16_MAX) return false;
+        if (qwen3_prefill_w8a8_ && seq_len > 1 &&
+            (position != 0 || seq_len > 512 || seq_len % 16 ||
+             !qwen3_w8a8::valid_rows(cs) || (cs == 192 && !qwen3_c192_) || (cs == 256 && !qwen3_c256_) || (cs == 512 && !qwen3_c512_) ||
+             (seq_len % cs && !qwen3_w8a8::valid_rows(seq_len % cs)))) return false;
         // The explicit-mask implementation prepares one rectangular mask for
         // the whole query. Multi-chunk candidates are not part of its domain.
         if (ctx().attention_mask.has_value() && cs < seq_len) return false;
@@ -5885,6 +6994,17 @@ protected:
             && position == 0 && seq_len > configured_chunk_size_cap_
             && cs != seq_len / 2) {
             return false;
+        }
+        if (qwen3_inplace_capacity() && seq_len > 1) {
+            if (seq_len != 512 || cs != qwen3_inplace_capacity() || position != 0 || !ctx().is_causal ||
+                ctx().attention_mask.has_value() || ctx().batch_size != 1) return false;
+            const auto cfg=make_sdpa_config(1);
+            if (qwen3_c512_) return qwen3_prefill_w8a8_ && sdpa_call_valid(cfg, 512, 0);
+            if (qwen3_c256_)
+                return sdpa_call_valid(cfg, 256, 0) && sdpa_call_valid(cfg, 256, 256);
+            // The ordinary predicate additionally assumes tail scratch<=full.
+            // C192 declares max(full192,tail128), so validate the actual calls.
+            return sdpa_call_valid(cfg,192,0) && sdpa_call_valid(cfg,192,192) && sdpa_call_valid(cfg,128,384);
         }
         // Wall-OSS P672 keeps the Linear/MLP/ring/RMS work in two C336
         // chunks, but the accumulated 336@336 LTM SDPA shape is the known
@@ -5935,6 +7055,20 @@ protected:
                         seq_len <= int64_t{UINT16_MAX} * 16 &&
                         position <= int64_t{UINT16_MAX} * 16 - seq_len,
                     "RPU_PLANNER_REJECT:CAPABILITY: attention key length exceeds uint16-v16 registers");
+        if (qwen3_inplace_capacity() && seq_len > 1) {
+            require_qwen3_32b_w8_profile();
+            TORCH_CHECK(chunk_envelope().max_kv_len == 512 && chunk_envelope().chunk == qwen3_inplace_capacity() &&
+                            seq_len == 512 && position == 0 && ctx().is_causal &&
+                            !ctx().attention_mask.has_value() && ctx().batch_size == 1,
+                        "RPU_PLANNER_REJECT:CAPABILITY: Qwen3 C192/C256 requires exact causal batch1 P512 at position zero");
+        }
+        if (qwen3_prefill_w8a8_ && seq_len > 1) {
+            require_qwen3_prefill_w8a8_profile();
+            TORCH_CHECK(position == 0 && seq_len <= 512 && seq_len % 16 == 0 &&
+                            ctx().is_causal && !ctx().attention_mask.has_value() &&
+                            ctx().batch_size == 1,
+                        "RPU_PLANNER_REJECT:CAPABILITY: Qwen3 prefill W8A8 requires causal batch1 P16-aligned<=512 at position zero");
+        }
         // MR-A: hard half of the certified envelope. Called ONCE per resolve, and
         // — this is what makes it a complete gate — called UNCONDITIONALLY by both
         // planner entry points before compute_chunks_impl branches on the override
@@ -5972,7 +7106,8 @@ protected:
                 "docs/runtime_config.md.");
             return seq_len / 2;
         }
-        return tighten(configured_chunk_size_cap_, envelope_chunk);
+        const auto cap = tighten(configured_chunk_size_cap_, envelope_chunk);
+        return qwen3_prefill_w8a8_ && seq_len > 1 ? tighten(cap, qwen3_c512_ ? 512 : qwen3_c256_ ? 256 : qwen3_c192_ ? 192 : 128) : cap;
     }
 
 
@@ -6174,8 +7309,10 @@ protected:
     }
 
     std::vector<int64_t> wall_base_fp16_shared_gateup_arguments(int64_t rows) const {
-        // version, M/N/K/localN/TP, tile, grid, precision, VLM, fused SiLU.
-        return {1, rows, 11008, 2048, 1376, 8, 320, 80, 128, 18, 1, 1, 16, 400, 1};
+        const auto c = rpu_pi_wall::select(rpu_pi_wall::Operation::SharedSilu,
+            rpu_pl_tiling::WeightType::Fp16, false, rows, 1376, 2048);
+        return {2, rows, 11008, 2048, 1376, 8, c.tile.m_tile, c.tile.n_tile,
+                c.tile.k_tile, c.grid_x, c.grid_y, 1, 16, 1, 2, 32, 26, 27};
     }
 
     bool wall_base_prefill_owner_norm_enabled(
@@ -6219,21 +7356,25 @@ protected:
     }
 
     std::vector<int64_t> wall_base_prefill_shared_input_arguments(int64_t rows) const {
-        std::vector<int64_t> arguments{1, rows, 11008, 2048, 1376, 8, 384, 48, 128, 29, 1, 1, 378, 2};
-        if (wall_base_prefill_shared_silu_) {
-            arguments[0] = 2;
-            arguments.push_back(1);  // canonical in-VLM SiLU/Mul
-        }
-        if (wall_base_prefill_no_up_store_) {
-            arguments[0] = 3;
-            arguments[13] = 1;  // only activated Gate is written to SPM
-        }
-        return arguments;
+        const auto op = wall_base_prefill_no_up_store_ ? rpu_pi_wall::Operation::SharedSilu :
+            wall_base_prefill_shared_silu_ ? rpu_pi_wall::Operation::SharedSiluUp :
+                                          rpu_pi_wall::Operation::SharedRaw;
+        const auto c = rpu_pi_wall::select(op, rpu_pl_tiling::WeightType::Int8,
+            false, rows, 1376, 2048);
+        return {4, rows, 11008, 2048, 1376, 8, c.tile.m_tile, c.tile.n_tile,
+                c.tile.k_tile, c.grid_x, c.grid_y, 1,
+                wall_base_prefill_shared_silu_ ? 1 : 0,
+                wall_base_prefill_no_up_store_ ? 1 : 2, 2, 32, 20, 34, 4, 36, 26, 27};
     }
 
     std::vector<int64_t> wall_small_prefill_qkv_arguments(int64_t rows) const {
-        return {rows, 2048, 2048, 1024, NUM_CORES, 448, 64, 128,
-                layer_weights_.front().q_w.scalar_type() == at::kHalf ? 16 : 8};
+        const bool fp16 = layer_weights_.front().q_w.scalar_type() == at::kHalf;
+        const auto c = rpu_pi_wall::select(rpu_pi_wall::Operation::Qkv,
+            fp16 ? rpu_pl_tiling::WeightType::Fp16 : rpu_pl_tiling::WeightType::Int8,
+            false, rows, 256, 2048);
+        return {rows, 2048, 2048, 1024, NUM_CORES, c.tile.m_tile, c.tile.n_tile,
+                c.tile.k_tile, fp16 ? 16 : 8, c.grid_x, c.grid_y, 2, 32, 40,
+                20, 34, 42, 4, 36, 44, 6, 38, 46};
     }
 
     std::vector<int64_t> wall_sorting_route_arguments() const {
@@ -6707,6 +7848,252 @@ protected:
             invocation);
     }
 
+    void consume_qwen3_c512_dma(qwen3_c512::DmaRole role) {
+        ctx().consume_physical_route(FmbRouteFamily::MUTABLE_DMA,
+            qwen3_c512::kDmaSite, qwen3_c512::dma_selector(role), 0, qwen3_c512::dma_arguments(role),
+            static_cast<int64_t>(role));
+    }
+
+    uint32_t qwen3_c512_oproj_base() {
+        // Resolve both true owners so BUILD records the complete write span.
+        // a8_mlp is only a prefix alias, never a fictitious full O owner.
+        const uint32_t prefix = addr(0, "oproj");
+        const uint32_t suffix = addr(0, "oproj_suffix");
+        TORCH_CHECK(qwen3_c512::oproj_regions_valid(prefix, suffix, addr(0, "a8_mlp"),
+                        SPM_ALLOC.addr(0, 0), SpmAllocator::SPM_USABLE),
+                    "Qwen3 C512 O output requires adjacent owned prefix/suffix and an exact Q alias");
+        return prefix;
+    }
+
+    void emit_qwen3_c512_rms_quant(int layer_idx, const ChunkInfo& chunk, size_t role) {
+        TORCH_CHECK(qwen3_c512_ && qwen3_prefill_w8a8_ && chunk.idx == 0 &&
+                        chunk.offset == 0 && chunk.len == 512 && role == 0 &&
+                        !ctx().input_in_spm && !ctx().output_to_spm,
+                    "Qwen3 C512 input RMSQuant requires its complete DDR-owned prefix");
+        TORCH_CHECK(ordinary_rmsnorm_spm_contract_.resolve(128, 5120) == RpuRmsNormSpmRoute::V32_GRID8,
+                    "Qwen3 C512 RMSQuant lost its exact M128 V32 arithmetic contract");
+        ctx().consume_physical_route(FmbRouteFamily::NORMALIZATION,
+            qwen3_w8a8::kQuantSites[0], qwen3_c512::kRmsSelector, 0,
+            qwen3_w8a8::quant_arguments(512, 0), chunk.idx);
+        consume_qwen3_c512_dma(qwen3_c512::DmaRole::InputNorm);
+        const uint32_t q = addr(0, "a8_qkv");
+        const uint32_t sx = addr(0, "a8_qkv_sx");
+        for (int part = 0; part < 4; ++part) {
+            const ChunkInfo segment{part, part * 128, 128, (part + 1) * 128};
+            emit_layer_input_dma(layer_idx, segment, "residual1");
+            rpu_launch_rms_norm_quantize_w8a8_spm_kernel(addr(0, "residual1"),
+                q + part * 128 * 5120, sx + part * 128 * sizeof(c10::Half),
+                norm_input_addr(layer_idx, 0), 128, eps_, 8);
+        }
+    }
+
+    void emit_qwen3_c512_reduce(int layer_idx, const ChunkInfo& chunk, bool down) {
+        TORCH_CHECK(qwen3_c512_ && qwen3_prefill_w8a8_ && chunk.idx == 0 &&
+                        chunk.offset == 0 && chunk.len == 512 && !ctx().input_in_spm && !ctx().output_to_spm,
+                    "Qwen3 C512 residual restore requires its complete DDR-owned prefix");
+        ctx().consume_physical_route(FmbRouteFamily::ALL_REDUCE,
+            down ? qwen3_c192::kDownReduceSite : CAUSAL_DECODER_REDUCE_SITE,
+            qwen3_c512::kRingSelector, 0, qwen3_c512::ring_arguments(), chunk.idx);
+        consume_qwen3_c512_dma(down ? qwen3_c512::DmaRole::PostResidual :
+                                     qwen3_c512::DmaRole::InputResidual);
+        consume_qwen3_c512_dma(down ? qwen3_c512::DmaRole::Output :
+                                     qwen3_c512::DmaRole::PostStore);
+        const bool final = down && layer_idx == num_layers() - 1;
+        if (final) {
+            TORCH_CHECK(ordinary_rmsnorm_spm_contract_.resolve(128, 5120) == RpuRmsNormSpmRoute::V32_GRID8,
+                        "Qwen3 C512 final normalization requires M128 V32_GRID8");
+            ctx().consume_physical_route(FmbRouteFamily::NORMALIZATION,
+                qwen3_c512::kFinalNormSite, 1, 0, qwen3_c512::final_norm_arguments());
+        }
+        const char* residual = down ? "down_residual_tile" : "o_residual_tile";
+        const uint32_t partial = down ? addr(0, "down") : qwen3_c512_oproj_base();
+        const char* compact_name = down ? "down_compact_residual" : "o_compact_residual";
+        const uint32_t compact = addr(0, compact_name);
+        const uint32_t output = addr(0, residual);
+        TORCH_CHECK(qwen3_c512::residual_regions_valid(partial, compact, output,
+                        SPM_ALLOC.addr(0, 0), SpmAllocator::SPM_USABLE),
+                    "Qwen3 C512 residual scatter requires three complete disjoint SPM owners");
+        uint32_t post_sx = 0;
+        if (!down) {
+            TORCH_CHECK(ordinary_rmsnorm_spm_contract_.resolve(128, 5120) == RpuRmsNormSpmRoute::V32_GRID8,
+                        "Qwen3 C512 post normalization requires M128 V32_GRID8");
+            ctx().consume_physical_route(FmbRouteFamily::NORMALIZATION,
+                qwen3_w8a8::kQuantSites[2], qwen3_c512::kRmsSelector, 0,
+                qwen3_w8a8::quant_arguments(512, 2), chunk.idx);
+            post_sx = addr(0, "a8_mlp_sx");
+        }
+        for (int part = 0; part < 4; ++part) {
+            const ChunkInfo segment{part, part * 128, 128, (part + 1) * 128};
+            emit_layer_residual_shard_load(layer_idx, segment, compact_name, down);
+            rpu_launch_qwen3_c512_all_reduce_residual_local_spm_kernel(
+                partial + part * 128 * 5120 * sizeof(c10::Half), compact, output);
+            if (!down) {
+                // Ring has finished every core's reads of this partial segment.
+                // Compact Q occupies only its already-consumed prefix; the
+                // unchanged FP16 residual is still stored for the later Down.
+                rpu_launch_rms_norm_quantize_w8a8_spm_kernel(addr(0, residual),
+                    partial + part * 128 * 5120, post_sx + part * 128 * sizeof(c10::Half),
+                    norm_post_addr(layer_idx, 0), 128, eps_, 8);
+            }
+            if (final)
+                rpu_launch_rmsnorm_spm_kernel(addr(0, residual), addr(0, residual),
+                    norm_final_addr(0), 128, 5120, eps_, RpuRmsNormSpmRoute::V32_GRID8, 8);
+            if (down) emit_layer_output_dma(layer_idx, segment, residual);
+            else emit_layer_chain_scratch_store(layer_idx, segment, residual);
+        }
+    }
+
+    void emit_qwen3_prefill_w8a8_quant(const ChunkInfo& chunk, size_t role, uint32_t input) {
+        static constexpr const char* outputs[]{"a8_qkv", "a8_o", "a8_mlp", "a8_down"};
+        static constexpr const char* scales[]{"a8_qkv_sx", "a8_o_sx", "a8_mlp_sx", "a8_down_sx"};
+        TORCH_CHECK(role < 4, "Qwen3 W8A8 quantization role out of range");
+        TORCH_CHECK(!qwen3_w8a8::uses_rms_quant(chunk.len, role),
+                    "Qwen3 M128/M192/M256 input/post norm must use the fused RMSQuant producer");
+        TORCH_CHECK(!qwen3_w8a8::uses_mul_quant(chunk.len, role),
+                    "Qwen3 M128/M192 Down must consume its FP16 Mul-to-Quant producer");
+        ctx().consume_physical_route(FmbRouteFamily::ACTIVATION,
+            qwen3_w8a8::kQuantSites[role], qwen3_w8a8::kQuantSelector, 0,
+            qwen3_w8a8::quant_arguments(chunk.len, role), chunk.idx);
+        rpu_launch_dynamic_quantize_w8a8_spm_kernel(input, addr(0, outputs[role]),
+            addr(0, scales[role]), chunk.len, qwen3_w8a8::kQuantK[role], 8);
+    }
+
+    void emit_qwen3_prefill_w8a8_rms_quant(const ChunkInfo& chunk, size_t role,
+            uint32_t input, uint32_t gamma) {
+        TORCH_CHECK(qwen3_prefill_w8a8_ && chunk.len != 512 && qwen3_w8a8::uses_rms_quant(chunk.len, role),
+                    "Qwen3 fused RMSQuant is limited to M128/M192/M256 input/post normalization");
+        static_assert(static_cast<int64_t>(RpuRmsNormSpmRoute::V32_GRID8) ==
+                          qwen3_w8a8::kRmsNormV32Grid8Selector);
+        TORCH_CHECK(consume_ordinary_rmsnorm_route(chunk.len, 5120, chunk.idx, 0) ==
+                        RpuRmsNormSpmRoute::V32_GRID8,
+                    "Qwen3 fused RMSQuant lost the original V32_GRID8 arithmetic contract");
+        ctx().consume_physical_route(FmbRouteFamily::NORMALIZATION,
+            qwen3_w8a8::kQuantSites[role], qwen3_w8a8::quant_selector(chunk.len, role), 0,
+            qwen3_w8a8::quant_arguments(chunk.len, role), chunk.idx);
+        rpu_launch_rms_norm_quantize_w8a8_spm_kernel(input,
+            addr(0, role == 0 ? "a8_qkv" : "a8_mlp"),
+            addr(0, role == 0 ? "a8_qkv_sx" : "a8_mlp_sx"), gamma,
+            chunk.len, eps_, 8);
+    }
+
+    void emit_qwen3_prefill_w8a8_linear(const ChunkInfo& chunk,
+            qwen3_w8a8::Projection projection, const at::Tensor& weight,
+            const at::Tensor& scale, const char* output) {
+        static constexpr const char* inputs[]{"a8_qkv", "a8_qkv", "a8_qkv", "a8_o", "a8_mlp", "a8_mlp", "a8_down"};
+        static constexpr const char* scales[]{"a8_qkv_sx", "a8_qkv_sx", "a8_qkv_sx", "a8_o_sx", "a8_mlp_sx", "a8_mlp_sx", "a8_down_sx"};
+        const auto p = static_cast<size_t>(projection);
+        TORCH_CHECK(p < 7, "Qwen3 W8A8 projection out of range");
+        ctx().consume_physical_route(FmbRouteFamily::LINEAR,
+            qwen3_prefill_w8a8_linear_sites()[p], qwen3_w8a8::linear_selector(chunk.len, projection), 0,
+            qwen3_w8a8::linear_arguments(chunk.len, projection), chunk.idx);
+        if ((chunk.len == 256 || chunk.len == 512) && projection == qwen3_w8a8::Projection::Up) {
+            TORCH_CHECK(((chunk.len == 256 && qwen3_c256_) || (chunk.len == 512 && qwen3_c512_)) && std::string(output) == "gate",
+                        "Qwen3 C256 Up-Mul must overwrite its complete SiLU Gate");
+            rpu_launch_qwen3_up_mul_w8a8_spm_kernel(addr(0, inputs[p]), addr(0, scales[p]),
+                weight, scale, addr(0, "gate"), chunk.len);
+            return;
+        }
+        const uint32_t destination = qwen3_c512_ && chunk.len == 512 &&
+                projection == qwen3_w8a8::Projection::O
+            ? qwen3_c512_oproj_base() : addr(0, output);
+        rpu_launch_linear_w8a8_spm_kernel(addr(0, inputs[p]), addr(0, scales[p]),
+            weight, scale, destination, chunk.len,
+            qwen3_w8a8::kGlobalN[p], qwen3_w8a8::kGlobalK[p],
+            qwen3_w8a8::kPartition[p], 8);
+    }
+
+    void emit_qwen3_prefill_w8a8_mlp(const LayerWeights& lw, const ChunkInfo& chunk,
+            bool norm_quantized, int layer_idx = -1) {
+        TORCH_CHECK(norm_quantized == qwen3_w8a8::uses_rms_quant(chunk.len, 2),
+                    "Qwen3 MLP must consume its completed RMSQuant producer");
+        if (!norm_quantized)
+            emit_qwen3_prefill_w8a8_quant(chunk, 2, addr(0, "residual1"));
+        emit_qwen3_prefill_w8a8_linear(chunk, qwen3_w8a8::Projection::Gate, lw.gate_w, lw.gate_ws, "gate");
+        const bool fused_mul_quant = qwen3_w8a8::uses_mul_quant(chunk.len, 3);
+        const bool fused_up_mul = qwen3_c256_ || qwen3_c512_;
+        const bool fused_silu = !fused_mul_quant && !fused_up_mul && use_planned_silu_mul();
+        const int64_t elems = chunk.len * 3200;
+        if (!fused_silu)
+            rpu_launch_eltwise_unary_spm_kernel(addr(0, "gate"), addr(0, "gate"),
+                elems, ValuOpType::SILU, GeluMode::NONE, 8);
+        emit_qwen3_prefill_w8a8_linear(chunk, qwen3_w8a8::Projection::Up, lw.up_w, lw.up_ws,
+            fused_up_mul ? "gate" : "up");
+        if (fused_mul_quant) {
+            ctx().consume_physical_route(FmbRouteFamily::ACTIVATION,
+                qwen3_w8a8::kQuantSites[3], qwen3_w8a8::kMulQuantSelector, 0,
+                qwen3_w8a8::quant_arguments(chunk.len, 3), chunk.idx);
+            rpu_launch_mul_quantize_w8a8_spm_kernel(addr(0, "gate"), addr(0, "up"),
+                addr(0, "a8_down"), addr(0, "a8_down_sx"), chunk.len, 3200, 8);
+        } else if (fused_silu) {
+            ctx().consume_physical_route(FmbRouteFamily::ACTIVATION, FMB_SHARED_MLP_SILU_MUL_SITE,
+                1, 0, {chunk.len, 3200, 8}, chunk.idx);
+            rpu_launch_silu_mul_spm_kernel(addr(0, "gate"), addr(0, "up"), addr(0, "gate"), elems, 8);
+        } else if (!fused_up_mul) {
+            rpu_launch_eltwise_binary_spm_kernel(addr(0, "gate"), addr(0, "up"),
+                addr(0, "gate"), elems, ValuOpType::MUL, c10::Half(1.0), 8);
+        }
+        if (!fused_mul_quant)
+            emit_qwen3_prefill_w8a8_quant(chunk, 3, addr(0, "gate"));
+        emit_qwen3_prefill_w8a8_linear(chunk, qwen3_w8a8::Projection::Down, lw.down_w, lw.down_ws, "down");
+        if (qwen3_c512_) {
+            TORCH_CHECK(layer_idx >= 0 && layer_idx < num_layers(), "Qwen3 C512 requires its real layer owner");
+            emit_qwen3_c512_reduce(layer_idx, chunk, true);
+        } else if (qwen3_inplace_capacity()) {
+            emit_qwen3_c192_down_reduce(chunk);
+        } else {
+            ctx().consume_physical_route(FmbRouteFamily::ALL_REDUCE, qwen3_w8a8::kReduceSite,
+                causal_ring_route(chunk.len, 5120), 0, {1, chunk.len, 5120, 8}, chunk.idx);
+            rpu_launch_all_reduce_sum_residual_kernel(addr(0, "down"), addr(0, "residual2"),
+                addr(0, "residual1"), chunk.len, 5120, 8, 8);
+        }
+    }
+
+    void emit_qwen3_c192_down_reduce(const ChunkInfo& chunk) {
+        TORCH_CHECK(qwen3_inplace_capacity() && qwen3_c192::valid_rows(chunk.len, qwen3_inplace_capacity()) &&
+                        addr(0, "residual2") == addr(0, "residual1"),
+                    "Qwen3 C192/C256 Down requires the exact retained raw residual owner");
+        ctx().consume_physical_route(FmbRouteFamily::ALL_REDUCE, qwen3_c192::kDownReduceSite,
+            qwen3_c192::kRingSelector, 0, qwen3_c192::ring_arguments(chunk.len), chunk.idx);
+        rpu_launch_qwen3_c192_all_reduce_residual_inplace_kernel(
+            addr(0, "down"), addr(0, "residual1"), chunk.len);
+    }
+
+    void emit_qwen3_c192_a16_mlp(const LayerWeights& lw, const ChunkInfo& chunk) {
+        TORCH_CHECK(qwen3_inplace_capacity() && !qwen3_prefill_w8a8_ && qwen3_c192::valid_rows(chunk.len, qwen3_inplace_capacity()),
+                    "Qwen3 C192/C256 A16 MLP requires its exact cold profile");
+        ctx().consume_physical_route(FmbRouteFamily::LINEAR, qwen3_c192::kMlpSite,
+            static_cast<int64_t>(CausalDecoderLinearRoute::AUTO_TILE), 0,
+            {1, chunk.len, 5120, 25600, 8}, chunk.idx);
+        const auto linear = [&](const char* input, const at::Tensor& w, const at::Tensor& sw,
+                                const char* output, int64_t n, int64_t k, int partition) {
+            rpu_launch_linear_spm_to_spm_acc16_kernel(addr(0, input), w, addr(0, output),
+                chunk.len, n, k, partition, 8, 0, sw);
+        };
+        linear("mlp_norm", lw.gate_w, lw.gate_ws, "gate", 25600, 5120, 1);
+        const bool fused = !qwen3_c256_ && use_planned_silu_mul();
+        if (!fused)
+            rpu_launch_eltwise_unary_spm_kernel(addr(0, "gate"), addr(0, "gate"),
+                chunk.len * 3200, ValuOpType::SILU, GeluMode::NONE, 8);
+        if (qwen3_c256_) {
+            ctx().consume_physical_route(FmbRouteFamily::LINEAR, qwen3_c192::kUpMulSite,
+                qwen3_c192::kUpMulSelector, 0, qwen3_c192::up_mul_arguments(false), chunk.idx);
+            rpu_launch_qwen3_up_mul_w8a16_spm_kernel(addr(0, "mlp_norm"), lw.up_w, lw.up_ws,
+                addr(0, "gate"), chunk.len);
+        } else {
+            linear("mlp_norm", lw.up_w, lw.up_ws, "up", 25600, 5120, 1);
+            if (fused) {
+                ctx().consume_physical_route(FmbRouteFamily::ACTIVATION, FMB_SHARED_MLP_SILU_MUL_SITE,
+                    1, 0, {chunk.len, 3200, 8}, chunk.idx);
+                rpu_launch_silu_mul_spm_kernel(
+                    addr(0, "gate"), addr(0, "up"), addr(0, "gate"), chunk.len * 3200, 8);
+            } else
+                rpu_launch_eltwise_binary_spm_kernel(addr(0, "gate"), addr(0, "up"), addr(0, "gate"),
+                    chunk.len * 3200, ValuOpType::MUL, c10::Half(1.0), 8);
+        }
+        linear("gate", lw.down_w, lw.down_ws, "down", 5120, 25600, 0);
+        emit_qwen3_c192_down_reduce(chunk);
+    }
+
     void consume_qwen3vl_4b_w8_prefill_schedule(
         int layer_idx, const ChunkInfo& chunk) {
         const auto& plan = ctx().stage_plan;
@@ -6780,15 +8167,19 @@ protected:
                         layer.o_ws.defined() && layer.o_ws.scalar_type() == at::kHalf;
                 })) return false;
         return KernelCache::instance().has_loaded(
-            KernelId::W8A16_ROW_WEIGHT_REUSE_M352N80K256);
+            pi_wall_kernel_id(rpu_pi_wall::select(rpu_pi_wall::Operation::RowWeightReuse,
+                rpu_pl_tiling::WeightType::Int8, false, 512, 1024, 256).ordinal));
     }
 
     std::vector<int64_t> ordinary_o_route_arguments(int64_t rows, bool reuse) const {
         std::vector<int64_t> arguments{
             rows, hidden_size(), num_q_heads() * head_dim(), 0, attn_tp()};
         if (reuse) {
-            // Full-local-K capacity and the preserved FP16 K128 retirement.
-            arguments.insert(arguments.end(), {352, 80, 256, 128});
+            const auto c = rpu_pi_wall::select(rpu_pi_wall::Operation::RowWeightReuse,
+                rpu_pl_tiling::WeightType::Int8, false, rows, hidden_size(),
+                num_q_heads() * head_dim() / attn_tp());
+            arguments.insert(arguments.end(), {2, c.tile.m_tile, c.tile.n_tile,
+                c.tile.k_tile, c.grid_x, c.grid_y});
         }
         return arguments;
     }
@@ -7132,6 +8523,24 @@ protected:
             position, eps_);
     }
 
+    static std::vector<int64_t> qwen3vl_decode_o_contract_arguments() {
+        const auto c = rpu_qwen3vl_linear::contract(KernelId::QWEN3VL_O_RING_NORM_M1_H2560_W8);
+        return {2, 1, 2560, 4096, 512, 8, c.m, c.n, c.k, c.gx, c.gy,
+                1, 63488, 32, 33, 34, 36, 38, 40, 41, 42, 44, 46, 48, 50};
+    }
+
+    static std::vector<int64_t> qwen3vl_decode_gateup_contract_arguments() {
+        const auto c = rpu_qwen3vl_linear::contract(KernelId::QWEN3VL_GATEUP_SWIGLU_GEMV);
+        return {2, 1, 9728, 2560, 8, c.m, c.n, c.k, c.gx, c.gy, 32, 34};
+    }
+
+    static std::vector<int64_t> qwen3vl_prefill_gateup_contract_arguments(int64_t rows) {
+        const auto c = rpu_pi_wall::select(rpu_pi_wall::Operation::SharedSilu,
+            rpu_pl_tiling::WeightType::Int8, false, rows, 1216, 2560);
+        return {2, rows, 9728, 2560, 8, c.tile.m_tile, c.tile.n_tile,
+                c.tile.k_tile, c.grid_x, c.grid_y, 32, 34};
+    }
+
     void emit_qwen3vl_4b_decode_o_ring_norm(
         const LayerWeights& lw, int layer_idx, const ChunkInfo& chunk,
         uint32_t input_residual) {
@@ -7145,7 +8554,7 @@ protected:
                     "4B fused O/ring/norm requires its cold exact ordinary decode capability");
         ctx().consume_physical_route(FmbRouteFamily::LINEAR,
             QWEN3VL_4B_DECODE_O_RING_NORM_SITE, 1, 0,
-            {1, 2560, 4096, 512, 8, 320, 1, 63488}, chunk.idx);
+            qwen3vl_decode_o_contract_arguments(), chunk.idx);
         rpu_launch_qwen3vl_4b_decode_o_ring_norm_spm_kernel(
             addr(0, "output"), lw.o_w, lw.o_ws, addr(0, "oproj"),
             input_residual, addr(0, "residual2"), norm_post_addr(layer_idx, 0), eps_);
@@ -7165,7 +8574,7 @@ protected:
         } else {
         ctx().consume_physical_route(FmbRouteFamily::LINEAR,
             QWEN3VL_4B_PREFILL_GATEUP_SITE, 1, 0,
-            {rows, 9728, 2560, 8, 320, 112}, chunk.idx);
+            qwen3vl_prefill_gateup_contract_arguments(rows), chunk.idx);
         rpu_launch_qwen3vl_4b_prefill_gate_up_swiglu_w8a16_spm_kernel(
             addr(0, "residual1"), lw.gate_w, lw.up_w, addr(0, "gate"),
             rows, lw.gate_ws, lw.up_ws);
@@ -7262,7 +8671,7 @@ protected:
         if (qwen3vl_4b_decode_gateup_fused_) {
             ctx().consume_physical_route(FmbRouteFamily::LINEAR,
                 QWEN3VL_4B_DECODE_MLP_GATEUP_FUSED_SITE, 1, 0,
-                {1, 9728, 2560, 8, 160, 96}, chunk.idx);
+                qwen3vl_decode_gateup_contract_arguments(), chunk.idx);
             rpu_launch_qwen3vl_4b_decode_gate_up_swiglu_w8a16_spm_kernel(
                 addr(0, "residual1"), lw.gate_w, lw.up_w, addr(0, "gate"),
                 lw.gate_ws, lw.up_ws);
@@ -7514,7 +8923,8 @@ protected:
             rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
                 layer_addr(layer_idx, 0, "input_shift"),
                 addr(0, "input_norm"), addr(0, "input_norm"),
-                seq_len, h, c10::Half(1.0f), ValuOpType::ADD, /*is_bopa=*/false);
+                seq_len, h, c10::Half(1.0f), ValuOpType::ADD, /*is_bopa=*/false,
+                num_cores());
         }
 
         consume_causal_route(
@@ -7579,8 +8989,8 @@ protected:
             emit_qk_rope("input_norm", "k", local_kv_heads, hd, seq_len, cos_sin_start, tp);
         } else {
             emit_qk_rope("q_kv", "q_kv", local_q_heads, hd, seq_len, cos_sin_start, tp);
-            emit_qk_rope("k", "k", tts_codec_mode_ ? nkv / tp : 1,
-                         tts_codec_mode_ ? hd : local_kv_dim, seq_len, cos_sin_start, tp);
+            emit_qk_rope("k", "k", per_head_key_rope() ? nkv / tp : 1,
+                         per_head_key_rope() ? hd : local_kv_dim, seq_len, cos_sin_start, tp);
         }
 
         auto& k_cache = (*ctx().k_caches)[layer_idx];
@@ -8066,6 +9476,38 @@ protected:
     // ═══════════════════════════════════════════════════════════════════════
 
     void build_layer_subgraph(int layer_idx, const ChunkInfo& chunk) override {
+        const bool qwen_inplace = qwen3_inplace_capacity() && ctx().seq_len > 1;
+        const bool qwen_c512 = qwen3_c512_ && ctx().seq_len > 1;
+        if (qwen3_inplace_capacity()) {
+            if (layer_idx == 0 && chunk.idx == 0) require_qwen3_32b_w8_profile();
+            TORCH_CHECK(!qwen_inplace || (ctx().seq_len == 512 && ctx().position == 0 &&
+                                      (qwen_c512 ? chunk.idx == 0 && chunk.offset == 0 && chunk.len == 512 :
+                                       qwen3_c192::valid_rows(chunk.len, qwen3_inplace_capacity()))),
+                        "Qwen3 C192/C256/C512 runtime escaped its exact P512 prefix");
+            TORCH_CHECK(ctx().has_complete_physical_manifest() &&
+                            qwen3_c192_manifest_valid(ctx().physical_manifest()),
+                        "Qwen3 C192/C256 requires its exact COMPLETE in-place routes");
+            ctx().consume_physical_route(FmbRouteFamily::GRAPH_SCHEDULE,
+                qwen3_c512_ ? qwen3_c512::kPolicySite : qwen3_c192::kPolicySite, 1, 0,
+                qwen3_c512_ ? qwen3_c512::policy_arguments(ctx().seq_len) :
+                    qwen3_c192::policy_arguments(ctx().seq_len, qwen3_prefill_w8a8_, qwen3_inplace_capacity()));
+        }
+        const bool qwen_a8 = qwen3_prefill_w8a8_ && ctx().seq_len > 1;
+        const bool qwen_a8_rms_quant = qwen_a8 && qwen3_w8a8::uses_rms_quant(chunk.len, 0);
+        bool qwen_a8_postnorm_ready = false;
+        if (qwen3_prefill_w8a8_) {
+            TORCH_CHECK(ctx().has_complete_physical_manifest(),
+                        "Qwen3 prefill W8A8 requires COMPLETE execution descriptors");
+            if (layer_idx == 0 && chunk.idx == 0) {
+                require_qwen3_prefill_w8a8_profile();
+                TORCH_CHECK(qwen3_prefill_w8a8_manifest_valid(ctx().physical_manifest()),
+                            "Qwen3 prefill W8A8 rejects stale physical routes");
+            }
+            ctx().consume_physical_route(FmbRouteFamily::GRAPH_SCHEDULE,
+                qwen3_w8a8::kPolicySite, 1, 0,
+                {qwen3_w8a8::kPolicyVersion, ctx().seq_len, 512, qwen3_c512_ ? 512 : qwen3_c256_ ? 256 : qwen3_c192_ ? 192 : 128, 8, qwen_a8 ? 7 : 0, qwen_a8 ? 4 : 0});
+            if (qwen_a8) qwen3_w8a8::require_rows(chunk.len);
+        }
         const bool wall_base_nvfp4_qkv_rope = wall_base_nvfp4_qkv_rope_enabled(
             ctx().stage_plan, seq_len_, ctx().seq_len, ctx().position,
             ctx().is_causal, ctx().attention_mask.has_value(),
@@ -8102,6 +9544,16 @@ protected:
                     "Wall NVFP4 next input norm requires the preceding SPM-resident layer");
         consume_qwen3vl_4b_w8_prefill_schedule(layer_idx, chunk);
         consume_qwen3vl_ordinary_prefill_schedule(layer_idx, chunk);
+        if (reduced_wall_resident_prefill(
+                ctx().seq_len, ctx().position, ctx().is_causal,
+                ctx().attention_mask.has_value(), ctx().batch_size,
+                ctx().stage_plan.compute.chunks.size())) {
+            TORCH_CHECK(
+                ctx().stage_plan.chunk_mode == ChunkMode::SEQUENTIAL &&
+                    ctx().input_in_spm == (layer_idx != 0) &&
+                    ctx().output_to_spm == (layer_idx + 1 != num_layers()),
+                "Reduced Wall resident prefill requires one full-layer SPM-resident group");
+        }
         if (layer_idx == 0 && chunk.idx == 0) {
             const int64_t topology_selector = static_cast<int64_t>(
                 CausalDecoderGraphScheduleRoute::TOPOLOGY);
@@ -8141,7 +9593,7 @@ protected:
                 FmbRouteFamily::GRAPH_SCHEDULE,
                 CAUSAL_DECODER_LM_HEAD_TOPOLOGY_SITE, topology_selector,
                 /*resolved_flags=*/0,
-                {!tts_predictor_heads_.empty() ? 2 : (fuse_lm_head_ ? 1 : 0), vocab_size_});
+                {fuse_lm_head_ ? 1 : 0, vocab_size_});
             if (lingbot_prefill_mode_bound_) {
                 ctx().consume_physical_route(FmbRouteFamily::GRAPH_SCHEDULE,
                     LINGBOT2_PREFILL_POLICY_SITE, topology_selector, 0,
@@ -8209,11 +9661,8 @@ protected:
         const bool emit_prefill_last_lm_head =
             fuse_prefill_last_lm_head_ && ctx().is_causal &&
             !decode_forward && chunk.offset + chunk.len == ctx().seq_len;
-        const bool tts_head = !tts_predictor_heads_.empty();
-        TORCH_CHECK(!tts_head || (chunk.offset == 0 && chunk.len == ctx().seq_len),
-                    "TTS fused Predictor requires one bounded chunk per step");
-        const bool emit_fused_lm_head = is_last_layer &&
-            (tts_head || (fuse_lm_head_ && (decode_forward || emit_prefill_last_lm_head)));
+        const bool emit_fused_lm_head = is_last_layer && fuse_lm_head_ &&
+            (decode_forward || emit_prefill_last_lm_head);
         if (emit_fused_lm_head) {
             TORCH_CHECK(lm_head_logits_out_.defined()
                             && lm_head_logits_dst_base_ != 0,
@@ -8389,7 +9838,8 @@ protected:
                 rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
                     layer_addr(layer_idx, 0, "post_shift"),
                     addr(0, "residual1"), addr(0, "residual1"),
-                    seq_len, h, c10::Half(1.0f), ValuOpType::ADD, /*is_bopa=*/false);
+                    seq_len, h, c10::Half(1.0f), ValuOpType::ADD, /*is_bopa=*/false,
+                    num_cores());
             }
             if (decode_gate_up_fusion_) {
                 emit_qwen3vl_2b_mlp_pipeline(
@@ -8500,7 +9950,7 @@ protected:
         if (qwen3vl_multiview_text_composite_dispatch_ && layer_idx == 0) {
             emit_qwen3vl_multiview_text_complement_ingress(
                 layer_idx, chunk, input_residual);
-        } else if (!ctx().input_in_spm && !z1_input.external &&
+        } else if (!qwen_c512 && !ctx().input_in_spm && !z1_input.external &&
                    !(pre_layers_residual1_ready_ && layer_idx == 0)) {
             emit_layer_input_dma(layer_idx, chunk);
         }
@@ -8511,8 +9961,8 @@ protected:
         // Static Qwen uses the packed norm slab; dynamic/bias variants retain
         // the per-layer slot. Both are preloaded once per BUILD.
         // ─────────────────────────────────────────────────────────────────────
-        if (layer_idx == 0 ||
-            (!wall_action_linear_ring_postnorm && !wall_base_nvfp4_down_ring_norm)) {
+        if (!qwen_a8_rms_quant && (layer_idx == 0 ||
+            (!wall_action_linear_ring_postnorm && !wall_base_nvfp4_down_ring_norm))) {
             emit_adarms_mut_refresh_input(layer_idx);  // replay-safe AdaRMS: refresh scale+shift SPM
             if (residual_is_bf16) {
                 rpu_launch_rmsnorm_bf16in_fp16out_spm_kernel(
@@ -8534,7 +9984,8 @@ protected:
                 rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
                     layer_addr(layer_idx, 0, "input_shift"),
                     addr(0, "input_norm"), addr(0, "input_norm"),
-                    rows, h, c10::Half(1.0f), ValuOpType::ADD, /*is_bopa=*/false);
+                    rows, h, c10::Half(1.0f), ValuOpType::ADD, /*is_bopa=*/false,
+                    num_cores());
             }
         }
 
@@ -8687,6 +10138,16 @@ protected:
                 layer_addr(layer_idx, 0, "v_bias"), lw.v_ws,
                 nvfp4_scale_addr("nvfp4_v_ts"), v_nvfp4_tensor_scales_.numel(),
                 (uint16_t)layer_idx, nkv * hd);
+        } else if (qwen_a8) {
+            if (qwen_c512)
+                emit_qwen3_c512_rms_quant(layer_idx, chunk, 0);
+            else if (qwen_a8_rms_quant)
+                emit_qwen3_prefill_w8a8_rms_quant(chunk, 0, input_residual, norm_input_addr(layer_idx, 0));
+            else
+                emit_qwen3_prefill_w8a8_quant(chunk, 0, addr(0, "input_norm"));
+            emit_qwen3_prefill_w8a8_linear(chunk, qwen3_w8a8::Projection::Q, lw.q_w, lw.q_ws, "q");
+            emit_qwen3_prefill_w8a8_linear(chunk, qwen3_w8a8::Projection::K, lw.k_w, lw.k_ws, "k");
+            emit_qwen3_prefill_w8a8_linear(chunk, qwen3_w8a8::Projection::V, lw.v_w, lw.v_ws, "v");
         } else {
             consume_causal_route(
                 FmbRouteFamily::LINEAR, CAUSAL_DECODER_Q_SITE,
@@ -8798,14 +10259,14 @@ protected:
             int64_t local_kv_heads = nkv / tp;
 
             rpu_launch_rmsnorm_spm_kernel(
-                addr(0, "q"), addr(0, "output"),
+                addr(0, "q"), addr(0, qwen_c512 ? "q_norm_scratch" : "output"),
                 norm_q_addr(layer_idx, 0),
                 rows * local_q_heads, hd, eps_,
                 qwen3vl_2b_w8_profile_ ? consume_delivery_rmsnorm_route(rows * local_q_heads, hd, chunk.idx, 1)
                     : consume_ordinary_rmsnorm_route(rows * local_q_heads, hd, chunk.idx, 1),
                 attn_tp());
             rpu_launch_rmsnorm_spm_kernel(
-                addr(0, "k"), addr(0, "input_norm"),
+                addr(0, "k"), addr(0, qwen_inplace ? "k_norm_scratch" : "input_norm"),
                 norm_k_addr(layer_idx, 0),
                 rows * local_kv_heads, hd, eps_,
                 qwen3vl_2b_w8_profile_ ? consume_delivery_rmsnorm_route(rows * local_kv_heads, hd, chunk.idx, 2)
@@ -8813,7 +10274,7 @@ protected:
                 attn_tp());
             if (bs == 1) {
                 emit_qk_rope_pair(
-                    "output", "q", "input_norm", "k",
+                    qwen_c512 ? "q_norm_scratch" : "output", "q", qwen_inplace ? "k_norm_scratch" : "input_norm", "k",
                     local_q_heads, local_kv_heads, hd,
                     seq_len, cos_sin_start, tp, chunk.idx);
             } else {
@@ -8831,8 +10292,8 @@ protected:
             } else if (!wall_base_nvfp4_qkv_rope && !wall_action_fused_qkv_partial_mrope) {
                 emit_qk_rope("q", "q", bs * local_q_heads, hd, seq_len,
                              cos_sin_start, tp);
-                emit_qk_rope("k", "k", tts_codec_mode_ ? bs * (nkv / tp) : bs,
-                             tts_codec_mode_ ? hd : local_kv_dim, seq_len,
+                emit_qk_rope("k", "k", per_head_key_rope() ? bs * (nkv / tp) : bs,
+                             per_head_key_rope() ? hd : local_kv_dim, seq_len,
                              cos_sin_start, tp);
             }
         }
@@ -9075,6 +10536,10 @@ protected:
                     CausalDecoderAllReduceRoute::PREPARE_RING_INPUT));
             rpu_prepare_ring_all_reduce_input(
                 addr(0, "oproj"), rows, h, tp, num_cores());
+            if (qwen_a8) {
+                emit_qwen3_prefill_w8a8_quant(chunk, 1, addr(0, "output"));
+                emit_qwen3_prefill_w8a8_linear(chunk, qwen3_w8a8::Projection::O, lw.o_w, lw.o_ws, "oproj");
+            } else {
             const bool reuse_o_weight = consume_ordinary_o_route(
                 CAUSAL_DECODER_O_SITE, rows, chunk.idx);
             rpu_launch_linear_spm_to_spm_acc16_kernel(
@@ -9085,6 +10550,7 @@ protected:
                 /*force_acc32=*/linear_acc32_,
                 /*prefer_gemv=*/qwen3vl_decode_gemv(seq_len_), /*qkv_planar_direct=*/false,
                 /*prefer_row_weight_reuse=*/reuse_o_weight);
+            }
             if (wall_base_prefill_owner_norm_enabled(
                     ctx().stage_plan, seq_len_, ctx().position, ctx().is_causal,
                     ctx().attention_mask.has_value(), bs)) {
@@ -9103,6 +10569,16 @@ protected:
                     rpu_launch_all_reduce_fp16_partial_bf16_residual_spm_kernel(
                         addr(0, "oproj"), input_residual, addr(0, "residual2"),
                         rows, h);
+                } else if (qwen_c512) {
+                    emit_qwen3_c512_reduce(layer_idx, chunk, false);
+                } else if (qwen_inplace) {
+                    ctx().consume_physical_route(FmbRouteFamily::ALL_REDUCE,
+                        CAUSAL_DECODER_REDUCE_SITE, qwen3_c192::kRingSelector, 0,
+                        qwen3_c192::ring_arguments(rows), chunk.idx);
+                    TORCH_CHECK(input_residual == addr(0,"residual1") &&
+                                    addr(0,"residual2") == input_residual,
+                                "Qwen3 C192/C256 raw residual owner must be an exact alias");
+                    rpu_launch_qwen3_c192_all_reduce_residual_inplace_kernel(addr(0,"oproj"),input_residual,rows);
                 } else {
                     consume_causal_route(
                         FmbRouteFamily::ALL_REDUCE,
@@ -9113,7 +10589,13 @@ protected:
                         addr(0, "residual2"), rows, h, tp, num_cores());
                 }
                 emit_adarms_mut_refresh_post(layer_idx);
-                if (residual_is_bf16) {
+                if (qwen_c512) {
+                    // Each O-reduce segment already produced post-norm Q/SX.
+                    qwen_a8_postnorm_ready = true;
+                } else if (qwen_a8_rms_quant) {
+                    emit_qwen3_prefill_w8a8_rms_quant(chunk, 2, addr(0, "residual2"), norm_post_addr(layer_idx, 0));
+                    qwen_a8_postnorm_ready = true;
+                } else if (residual_is_bf16) {
                     rpu_launch_rmsnorm_bf16in_fp16out_spm_kernel(
                         addr(0, "residual2"), addr(0, "residual1"),
                         layer_addr(layer_idx, 0, "post_norm_w"), rows, h, eps_,
@@ -9125,7 +10607,7 @@ protected:
                         addr(0, "residual2"), addr(0, "residual1"), rows, chunk.idx);
                 } else {
                     rpu_launch_rmsnorm_spm_kernel(
-                        addr(0, "residual2"), addr(0, "residual1"),
+                        addr(0, "residual2"), addr(0, qwen_inplace ? "mlp_norm" : "residual1"),
                         norm_post_addr(layer_idx, 0), rows, h, eps_,
                         consume_wall_rmsnorm_route(rows, h, chunk.idx), num_cores());
                 }
@@ -9134,7 +10616,7 @@ protected:
                         layer_addr(layer_idx, 0, "post_shift"),
                         addr(0, "residual1"), addr(0, "residual1"),
                         rows, h, c10::Half(1.0f), ValuOpType::ADD,
-                        /*is_bopa=*/false);
+                        /*is_bopa=*/false, num_cores());
                 }
             }
         }
@@ -9142,7 +10624,12 @@ protected:
         // ─────────────────────────────────────────────────────────────────────
         // Phase 7-8: MLP (gate, up, silu?, mul, down) + reduce + residual → residual1
         // ─────────────────────────────────────────────────────────────────────
-        if (wall_base_nvfp4_gate_up && !is_last_layer) {
+        if (qwen_a8) {
+            emit_qwen3_prefill_w8a8_mlp(lw, chunk, qwen_a8_postnorm_ready, layer_idx);
+            if (qwen_c512) return;  // Segmented Down reduction published every final FP16 row.
+        } else if (qwen_inplace) {
+            emit_qwen3_c192_a16_mlp(lw, chunk);
+        } else if (wall_base_nvfp4_gate_up && !is_last_layer) {
             emit_wall_base_nvfp4_gate_up(lw, layer_idx, chunk);
         } else if (wall_base_fp16_shared_gateup_enabled(
                 ctx().stage_plan, seq_len_, ctx().position, ctx().is_causal,
@@ -9182,7 +10669,10 @@ protected:
                     wall_small_prefill_fused || wall_fp16_long_prefill_fused ||
                     wall_p640_staged0_w8a16 || wall_action_w8a16_silu_mul ||
                     (wall_sorting_.silu_mul && use_silu_ &&
-                     (rtc_prefill_mixed || wall_action_fuse_silu_mul_)),
+                     (rtc_prefill_mixed || wall_action_fuse_silu_mul_)) ||
+                    (num_cores() != 8 && use_silu_ && !linear_acc32_ &&
+                     !rhinovla_high_precision_ &&
+                     (rows * (intermediate_size() / mlp_tp())) % 256 == 0),
                 /*skip_down=*/wall_action_linear_ring_postnorm ||
                     (wall_base_nvfp4_down_ring_norm && !is_last_layer),
                 /*fuse_wall_gate_up=*/wall_action_w8a16_silu_mul,
@@ -9347,14 +10837,13 @@ protected:
                 FmbRouteFamily::LINEAR, CAUSAL_DECODER_LM_HEAD_SITE,
                 static_cast<int64_t>(CausalDecoderLinearRoute::AUTO_TILE));
             const int64_t lm_head_rows =
-                (tts_head || emit_prefill_last_lm_head) ? 1 : rows;
+                emit_prefill_last_lm_head ? 1 : rows;
             const uint32_t lm_head_input_addr = addr(0, "residual1") +
                 static_cast<uint32_t>(
-                    (tts_head ? (decode_forward ? 0 : 1) :
-                     (emit_prefill_last_lm_head ? rows - 1 : 0)) * h * DWIDTH);
+                    (emit_prefill_last_lm_head ? rows - 1 : 0) * h * DWIDTH);
             rpu_launch_linear_spm_to_spm_acc16_kernel(
                 lm_head_input_addr,        // final normed row(s), in SPM
-                tts_head ? tts_predictor_heads_.at(tts_predictor_head_index_) : lm_head_w_,
+                lm_head_w_,                // DDR weight [vocab, hidden]
                 addr(0, "lm_head_out"),    // SPM output per core, [rows][local_n]
                 /*M=*/lm_head_rows,
                 /*N=*/vocab_size_,
@@ -9365,7 +10854,7 @@ protected:
                 lm_head_w_scale_,
                 /*nvfp4_tensor_scale_spm_addr=*/0,
                 /*nvfp4_layer_id=*/0,
-                /*force_acc32=*/tts_head ? false : linear_acc32_);
+                /*force_acc32=*/linear_acc32_);
             const int64_t local_n = vocab_size_ / lm_head_tp();
             // The logits tensor is [bs, 1, vocab]; core c owns vocab slice
             // [c*local_n, (c+1)*local_n). SPM holds [rows][local_n] per core, so
@@ -9399,8 +10888,7 @@ protected:
                         /*num_elements=*/h);
                 }
             }
-        }
-        if ((!emit_fused_lm_head || tts_head) && !ctx().output_to_spm) {
+        } else if (!ctx().output_to_spm) {
             // 正常路径: spm2ddr 写回 output_tensor_ (或 chain buffer)
             emit_layer_output_dma(layer_idx, chunk);
         }
@@ -9633,7 +11121,7 @@ protected:  // LingBot2 sparse-MoE subclass reuses the decoder's layer state.
             addr(0, output_name),
             addr(0, output_name),
             seq_len, local_n, c10::Half(1.0f),
-            ValuOpType::ADD, /*is_bopa=*/false);
+            ValuOpType::ADD, /*is_bopa=*/false, num_cores());
     }
 
     void emit_explicit_mask_spm(int layer_idx, const ChunkInfo& chunk,
@@ -9762,7 +11250,10 @@ protected:  // LingBot2 sparse-MoE subclass reuses the decoder's layer state.
     }
 
     std::vector<int64_t> lingbot_prefill_gateup_arguments() const {
-        return {224, 9728, 2560, 8, 320, 96, 128, 13};
+        const auto c = rpu_specialized_linear::contract(
+            KernelId::LINGBOT2_PREFILL_GATEUP_SHARED_A_W8_M224);
+        return {224, 9728, 2560, 8, c.m, c.n, c.k, c.gx,
+                c.gy, 2, 32, 20, 34, 26, 27};
     }
 
     void validate_lingbot_prefill_gateup_schedule() const {
@@ -9835,9 +11326,11 @@ protected:  // LingBot2 sparse-MoE subclass reuses the decoder's layer state.
 
     std::vector<int64_t> lingbot_prefill_qkv_arguments() const {
         const bool w8 = lingbot_prefill_qkv_mode_ == 1;
-        return {1, lingbot_prefill_qkv_mode_, 224, 2560, 4096, 1024, 1024, 8, 0,
-                w8 ? 320 : 384, w8 ? 112 : 96, w8 ? 512 : 480, w8 ? 48 : 64,
-                128, w8 ? 11 : 10};
+        const auto c = rpu_specialized_linear::contract(w8
+            ? KernelId::LINGBOT2_PREFILL_QKV_MULTIBASE_W8_M224
+            : KernelId::LINGBOT2_PREFILL_QKV_MULTIBASE_FP16_M224);
+        return {2, lingbot_prefill_qkv_mode_, 224, 2560, 4096, 1024, 1024, 8, 0,
+                c.m, c.n, c.k, c.gx, c.gy, 2, 32, 40, 20, 34, 42, 4, 36, 44};
     }
 
     bool validate_lingbot_prefill_qkv_schedule(int layer_idx, const ChunkInfo& chunk) {
@@ -10216,10 +11709,13 @@ protected:  // LingBot2 sparse-MoE subclass reuses the decoder's layer state.
             identity.insert(identity.end(), {WALL_BASE_FP16_PREFILL_SHARED_GATEUP_SITE, 1});
         if (wall_base_prefill_owner_norm_)
             identity.insert(identity.end(), {WALL_BASE_PREFILL_O_OWNER_NORM_SITE, 1});
-        if (!tts_predictor_heads_.empty()) {
-            identity.insert(identity.end(), {0x54545348, 1, 15});
-            for (const auto& head : tts_predictor_heads_)
-                append_kvinsert_cost_tensor_identity(identity, head);
+        if (qwen3_inplace_capacity()) {
+            const auto c192 = (qwen3_c512_ ? qwen3_c512::identity() : qwen3_c192::identity(qwen3_inplace_capacity()));
+            identity.insert(identity.end(), c192.begin(), c192.end());
+        }
+        if (qwen3_prefill_w8a8_) {
+            const auto a8 = qwen3_prefill_w8a8_identity();
+            identity.insert(identity.end(), a8.begin(), a8.end());
         }
         return identity;
     }
@@ -10288,8 +11784,6 @@ protected:  // LingBot2 sparse-MoE subclass reuses the decoder's layer state.
     int64_t configured_vocab_size_ = 0;  // 0 preserves legacy eight-core callers
     int configured_lm_head_tp_ = 8;
     bool cold_routes_configured_ = false;
-    std::vector<at::Tensor> tts_predictor_heads_;
-    int64_t tts_predictor_head_index_ = 0;
     at::Tensor lm_head_w_;        // FP16/W8 [V,H] or packed W4 [V,H/2], device
     at::Tensor lm_head_w_scale_;  // W8 [V] or W4 pgrp controller-striped scale
     bool fuse_lm_head_ = false;
@@ -10303,6 +11797,14 @@ protected:  // LingBot2 sparse-MoE subclass reuses the decoder's layer state.
     int64_t vocab_size_ = 0;      // lm_head_w_.size(0)
     at::Tensor lm_head_logits_out_;   // graph-written logits (+hidden for rerank)
     uint64_t lm_head_logits_dst_base_ = 0;  // mutable DMA destination base
+    // Multi-head bank for a fixed multi-step sampling loop whose steps differ
+    // only in which head they apply. Installed in one transaction so the
+    // model-state generation binds the whole bank; selecting a step moves
+    // lm_head_w_/lm_head_w_scale_ among tensors this handle already owns.
+    static constexpr size_t kLmHeadBankMax = 64;
+    std::vector<at::Tensor> lm_head_bank_w_;
+    std::vector<at::Tensor> lm_head_bank_scale_;
+    int64_t lm_head_bank_index_ = -1;  // -1 = no bank installed
     // Adapter-owned per-handle auto-planner ceiling. The legacy process-global
     // override still wins when nonzero and remains an exact chunk request.
     int64_t configured_chunk_size_cap_ = 0;
@@ -10310,8 +11812,29 @@ protected:  // LingBot2 sparse-MoE subclass reuses the decoder's layer state.
     // equal chunks. Build-time immutable; Python pads the execution length to 32.
     bool equal_two_prefill_ = false;
     bool linear_acc32_ = false;
+    bool qwen3_c512_ = false;
+    bool qwen3_c512_bound_ = false;
+    bool qwen3_c256_ = false;
+    bool qwen3_c256_bound_ = false;
+    bool qwen3_c192_ = false;
+    bool qwen3_c192_bound_ = false;
+    bool qwen3_prefill_w8a8_ = false;
+    bool qwen3_prefill_w8a8_bound_ = false;
     // Bound by the first exact reduced-profile weight install, never an env knob.
     bool reduced_qwen3vl_profile_ = false;
+    // Exact headless InternVLA text at a reduced budget (M-RoPE without the VL mask).
+    bool reduced_internvla_profile_ = false;
+    // Exact headless Wall-OSS text (causal) and action expert (masked, non-causal).
+    bool reduced_wall_text_profile_ = false;
+    bool reduced_wall_action_profile_ = false;
+    bool reduced_hyvla_profile_ = false;
+    bool reduced_lingbot2_expert_profile_ = false;
+    bool reduced_qwen3_w4_profile_ = false;
+    bool reduced_qwen3_nvfp4_profile_ = false;
+    // Reduced Llama keeps two KV heads per attention core: its no-QK-norm K
+    // RoPE must rotate each D64 head, not one doubled-width local row.
+    bool reduced_llama_profile_ = false;
+    int64_t logical_intermediate_size_ = 0;
     bool decoder_mixed_precision_ = false;
     bool wall_prefill_staged_mlp_ = false;
     bool wall_prefill_mixed_requested_ = false;
@@ -10668,6 +12191,7 @@ protected:  // LingBot2 sparse-MoE subclass reuses the decoder's layer state.
     bool qwen3vl_pooler_z1_inputs_primed_ = false;
     std::vector<int64_t> qwen3vl_pooler_z1_stage_descriptor_;
     std::vector<int64_t> qwen3vl_pooler_z1_selected_stage_descriptor_;
+    std::vector<int64_t> qwen3vl_pooler_z1_layout_stage_descriptor_;
     at::Tensor qwen3vl_pooler_z1_output_owner_;
 
     bool qwen3vl_multiview_text_dry_prepared_ = false;

@@ -1,37 +1,34 @@
-"""LingBot-VLA V2 (robbyant/lingbot-vla-v2-6b) — device runtime (image+text → action, flow-matching).
+"""LingBot-VLA V2 (robbyant/lingbot-vla-v2-6b) — RPU runtime (image+text → action, flow-matching).
 
 Self-contained standalone runtime, mirroring `adapters/lingbot_vla/runtime.py` (V1) structure. V1 is
 NOT touched and NOT imported; this is an independent, default-OFF, opt-in package.
 
-  image  → Qwen3-VL ViT on device (install_qwen3_vl_vision_for_rpu)   → img_emb  [n_vis, 2560]
+  image  → Qwen3-VL ViT on RPU (install_qwen3_vl_vision_for_rpu)   → img_emb  [n_vis, 2560]
   text   → embed_tokens[lang_tokens]                               → lang_emb [1, L, 2560]
   prefix = image-placeholder tokens + lang tokens, visual embeds masked_scatter'd in
-         → device Qwen3-VL text decoder (M-RoPE; vision features from [5,11,17]
+         → RPU Qwen3-VL text decoder (M-RoPE; vision features from [5,11,17]
            injected into text layers [0,1,2]; CAUSAL — YAML vlm_causal: true)
            fills the SHARED RPUCache [0, S)
   state+noise → host encoders + per-(step,layer,norm) AdaRMS fold
-         → device sparse-MoE AdaRMS expert (768-d, 32 experts, top_k 4, joint shared-prefix-KV,
+         → RPU sparse-MoE AdaRMS expert (768-d, 32 experts, top_k 4, joint shared-prefix-KV,
            explicit 2D mask), 10-step host Euler (default) → action [1, 50, 55]
 
 Deliberately NOT inherited from V1
 ----------------------------------
 * V1's CPU-fp32 ViT. That was a V1-checkpoint-specific fp16-overflow workaround
-  (`vit_fp16_outlier_overflow`); V2 uses the validated Qwen3-VL device vision tower.
+  (`vit_fp16_outlier_overflow`); V2 uses the validated Qwen3-VL RPU vision tower.
 * V1's ROPE_BASE = 10000. The V2 expert does NOT own its RoPE — it is rotated by the VLM's
   rotary_emb (theta 5e6). See convert._build_rope_tables.
 * V1's separate in-graph denoise handle. V2 keeps the HOST Euler loop as its default path and
   offers a controlled, default-OFF unroll on the existing sparse-MoE handle. That experiment
   raises the launcher's configurable batch limits and keeps FP16 state between ACC32 linears.
 
-The exact-Z2 W8A16 three-image REAL215..225/P225 envelope has controlled
-temporary support under blocking CI, but is not formally or robot certified.
-FP16, W4 and other profiles remain evaluation-only. Every path stays fail-closed
-unless exact ``RPU_LINGBOT2_ALLOW_UNVALIDATED=1`` is set; the env name is retained
-for compatibility. Nothing here changes V1.
+The public FP16/W8A16 2- and 3-camera templates and the exact-Z2 W8A16
+three-image REAL215..225/P225 envelope are supported (2026-10-19 board runs);
+no opt-in is required. W4 and other selectors stay off by default. Nothing
+here changes V1.
 """
 from __future__ import annotations
-
-from rpu_backend.runtime.masks import versioned_cpu_mask
 
 import dataclasses
 import math
@@ -48,6 +45,7 @@ import torch.nn.functional as F
 import rpu_backend
 from rpu_backend.api import RPUCache
 from rpu_backend.runtime import rpu_env_bool
+from rpu_backend.runtime.masks import versioned_cpu_mask
 from rpu_backend.adapters.qwen3_vl import (
     install_qwen3_vl_text_for_rpu,
     install_qwen3_vl_vision_for_rpu,
@@ -945,7 +943,7 @@ def _validate_multiview_spm_z2() -> bool:
 
 
 def _validate_adarms_direct_schedule() -> bool:
-    """Cold preflight before any LingBot2 device materialization; return whether enabled."""
+    """Cold preflight before any LingBot2 RPU materialization; return whether enabled."""
     enabled = _env_on("RPU_LINGBOT2_ADARMS_DIRECT_SCHEDULE", "0")
     if not enabled:
         return False
@@ -990,16 +988,25 @@ def _make_att_2d_masks(pad_masks, att_masks):
 
 
 def precompute_enc_fused(W, time_embs):
-    """Fold the consecutive linears at the start of the suffix encoder.
+    r"""Collapse the two consecutive linears that open the per-step suffix encoder.
 
-    There is no nonlinearity between action_in_proj and action_time_mlp_in.
-    With Wa = mlp_in.weight[:, :768] and Wt = mlp_in.weight[:, 768:]:
+    The encoder is  action_in_proj -> cat(time) -> action_time_mlp_in -> silu -> mlp_out.
+    There is NO nonlinearity between in_proj and mlp_in, and mlp_in's time half is constant
+    per Euler step, so with Wa = mlp_in.weight[:, :768] / Wt = mlp_in.weight[:, 768:] the whole
+    pre-silu activation collapses to one 55-wide projection plus a step-constant bias:
+
         (x @ Wp.T + bp) @ Wa.T + (t @ Wt.T + b)
-            = x @ (Wa @ Wp).T + (bp @ Wa.T + t @ Wt.T + b)
-    The time term is constant per Euler step. Folding removes the expanded
-    time concatenation, but floating-point reassociation can change rounding.
+            == x @ (Wa @ Wp).T  +  (bp @ Wa.T + t @ Wt.T + b)
+               \_____ [768,55] _/   \_______ step-constant [768] _______/
 
-    Return contiguous W_fused [768,55] and [1,1,768] biases for each step."""
+    Per step this removes BOTH the [1,50,1536] expand+cat allocation and the 50x768x768 GEMM:
+    ~32 MFLOP/step instead of the original ~61 + ~59 = ~120. Exact algebraic identity; the only
+    difference is floating-point reassociation. The on-device encoder path already precomputes
+    the same time term (`_od_time_parts` [num_steps,768], see
+    internal validation notes) -- the host path had not caught up.
+
+    Returns (W_fused [768,55] contiguous, [num_steps] list of [1,1,768] step biases).
+    """
     Win = W["model.action_time_mlp_in.weight"]                 # [768, 1536]
     b_mlp = W["model.action_time_mlp_in.bias"]                 # [768]
     d = Win.shape[1] // 2                                      # 768 = action_emb width
@@ -1086,7 +1093,7 @@ def _contiguous_runs(mask_1d):
 
     The prefix layout puts the <image> placeholders in exactly `n_images` contiguous runs
     ([<vision_start> <image>*P <vision_end>] repeated), so scattering the visual embeddings needs
-    no boolean mask at all — `narrow().copy_()` per run is the same write with a device kernel
+    no boolean mask at all — `narrow().copy_()` per run is the same write with an RPU kernel
     behind it, instead of an `index_put_` that has none (it falls back to the CPU, round-tripping
     the whole [S, hidden] tensor twice).
 
@@ -1241,7 +1248,7 @@ def _clear_graph_caches_for_rebind(caches):
 
 
 def _build_suffix_mask(prefix_len, align_cfg, *, real_prefix_len=None):
-    """Versioned CPU FP16 mask [51, prefix_len + 51]."""
+    """Versioned CPU fp16 [51, prefix_len + 51]: 0 attend, big_neg masked."""
     full = build_suffix_mask_bool(
         prefix_len, align_cfg, real_prefix_len=real_prefix_len
     )
@@ -1299,7 +1306,7 @@ class LingbotVlaV2Policy:
         self._z2_position_ids = None
         self._z2_rope_cos_il = None
         self._z2_rope_sin_il = None
-        self._vlm = vlm                              # HF Qwen3VLModel (visual + language_model on device)
+        self._vlm = vlm                              # HF Qwen3VLModel (visual + language_model on RPU)
         self._cfg = cfg
         self._text = vlm.language_model
         self._visual = vlm.visual
@@ -1502,12 +1509,24 @@ class LingbotVlaV2Policy:
         # The suffix MASK is cached per prefix length S so its DDR address survives across calls
         # (a fresh per-call mask would be freed → a replayed graph would read garbage).
         self._mask_cache: dict[int, torch.Tensor] = {}
-        # Restrict the small per-step host encoder matmuls to one thread when enabled.
-        # Set the option to "0" to retain the caller's ambient thread configuration.
+        # Restrict the tiny per-step host encoders to 1 thread (thread-overhead-bound [50,768]
+        # matmuls). Default ON since 2026-07-22: the "leave the host default alone" reasoning that
+        # kept this OFF was never measured, and measuring it says the opposite. Sweep on the board
+        # (24 cores), per denoise step, 30 steps each:
+        #     threads   24     16      8      4      2      1
+        #     embed   4.694  5.395  6.693  7.231  8.049  4.007  ms
+        #     outproj 0.817  0.954  1.347  1.497  1.703  0.488  ms
+        # i.e. worse all the way down until 1, where torch takes the no-parallel-dispatch path.
+        # W16 ladder e2e_p50 569.7 -> 549.5 ms (-20.2), residual_host 58.82 -> 41.72 ms.
+        # Device time is untouched (denoise_per_step 33.02 vs 33.03). Set the env var to "0" to
+        # restore the old behaviour.
         self._enc_1thread = _env_on("RPU_LINGBOT2_ENCODER_1THREAD", "1")
-        # Prefix constants depend on image count, tokens per image, language tokens
-        # and grid. Cache them in device buffers and overwrite only the visual rows;
-        # disabling this option rebuilds the prefix for each request.
+        # Prompt-constant prefix assembly (default ON since 2026-07-22). See _build_prefix: the
+        # whole prefix except the visual rows is a pure function of the PROMPT (image count,
+        # tokens/image, language tokens, grid), which a deployed policy holds fixed for an entire
+        # episode while the camera frames change every control tick. Building it once into
+        # RPU-resident buffers and overwriting only the visual rows took prefix assembly from
+        # 23.21 -> 6.5 ms. Set to "0" to restore the rebuild-every-call behaviour.
         self._prefix_opt = _env_on("RPU_LINGBOT2_HOST_PREFIX_OPT", "1")
         self._pfx_memo = None          # prompt-keyed prefix buffers (see _build_prefix)
         # One stable-address carrier per execution length.  Graph fixed-DMA
@@ -1519,9 +1538,24 @@ class LingbotVlaV2Policy:
         self._pfx_memos = {}
         self._pos_ids_src = None       # identity key for the position_ids H2D memo (_vlm_fill)
         self._pos_rpu = None
-        # Cross-call VLM replay requires stable inputs_embeds, all DeepStack buffers
-        # and position_ids. Prefix preparation owns and updates those buffers in place.
-        # The replay default follows _prefix_opt and remains off without that ownership.
+        # Cross-call VLM prefill replay. This USED to default OFF with the note:
+        #     "the Qwen3-VL text path allocates its own per-forward tensors (dense deepstack
+        #      embeds, position_ids), so a stable-address prefix buffer alone does NOT make the
+        #      graph replay-safe here. Left OFF until proven on hardware."
+        # _prefix_opt is exactly what removes that objection: inputs_embeds, all three dense
+        # deepstack tensors and the device copy of position_ids are now allocated once and written
+        # in place, so there are no per-forward allocations left for the graph to go stale on.
+        # Hence the default now FOLLOWS _prefix_opt, and stays OFF without it.
+        #
+        # PROVEN ON HARDWARE (tmp/lingbot2/bench_vlmreplay_sound.py, results/lingbot2/vishost_fix/
+        # vlmreplay_soundness.json). The test that settles it is not "same input twice" — a replay
+        # that ignored its inputs would pass that. Three image sets of the SAME shape but very
+        # different content (max|action_A - action_B| = 0.75) fed INTERLEAVED, replay arm vs
+        # rebuild arm: bit-identical on all three, max|diff| = 0. If the replayed graph were
+        # reading a stale buffer, image B would have come back with image A's answer.
+        # Cost of leaving it off: e2e_p50 787.42 vs 490.92 ms, i.e. +296.5 ms/call, because
+        # get_action:489-490 throws away the C++ GraphCache and every call takes the RECORDING
+        # path (a full 36-layer op-stream walk + segment build) instead of a segment replay.
         self._vlm_replay = _env_on("RPU_LINGBOT2_VLM_REPLAY",
                                    "1" if self._prefix_opt else "0")
         if self._vlm_replay and not self._prefix_opt:
@@ -1672,7 +1706,7 @@ class LingbotVlaV2Policy:
         vars(self._text)["_rpu_execution"] = text
 
     def _drop_device_state(self) -> None:
-        """Drop policy-owned device tensors after confirmed native cleanup."""
+        """Drop policy-owned RPU tensors after confirmed native cleanup."""
         for attr in (
             "_cache",
             "_vgc",
@@ -2078,7 +2112,7 @@ class LingbotVlaV2Policy:
 
         READY admission calls this before Vision, cache reset, prefix DMA or any
         Graph capture.  A request outside the prepared envelope therefore cannot
-        partially execute a device subsystem before it is rejected.
+        partially execute an RPU subsystem before it is rejected.
         """
         if (not isinstance(images, torch.Tensor) or images.device.type != "cpu"
                 or images.dim() != 3):
@@ -2199,7 +2233,7 @@ class LingbotVlaV2Policy:
         resident["phase"] = "PRIMED"
 
     def _vision_execution_plans(self, metadata):
-        """Plan every Qwen3-VL dispatch group before its first device op."""
+        """Plan every Qwen3-VL dispatch group before its first RPU op."""
         image_count = len(metadata["keep_img"])
         grid_words = metadata["grid_key"]
         grids = tuple(
@@ -3120,7 +3154,7 @@ class LingbotVlaV2Policy:
             for word in _plan_digest_words(child.plan_digest)
         )
         if len(descriptor) != len(native) + _Z2_CHILD_DIGEST_WORDS:
-            raise RuntimeError("LingBot2 Z2 planner descriptor composition drifted")
+            raise RuntimeError("LingBot2 Z2 planner descriptor assembly drifted")
         parent_metadata = tuple(
             (f"descriptor_{index:02d}", value)
             for index, value in enumerate(descriptor)
@@ -3176,7 +3210,7 @@ class LingbotVlaV2Policy:
                 or metadata["fixed_real_rows"] != profile["fixed_real_rows"]):
             raise RuntimeError(
                 "LingBot2 image/prefix structure differs from the prepared profile; "
-                "no device graph was touched.")
+                "no RPU graph was touched.")
         real_len = metadata["real_len"]
         lo, hi = profile["prefix_length_range"]
         if not lo <= real_len <= hi:
@@ -3596,7 +3630,7 @@ class LingbotVlaV2Policy:
                 memo["rope_sin_il"].copy_(rope_sin_il_cpu)
                 memo.update(key=memo_key, real_S=real_S, p0=p0,
                             a6_plan=plan.a6_plan)
-            # Prefix preparation used immediate device ops before the Vision
+            # Prefix preparation used immediate RPU ops before the Vision
             # subsystem.  Release only temporary SPM allocations; persistent
             # targets above live in DDR and remain strongly owned by the memo.
             torch.ops.rpu.spm_alloc_reset_temporary()
@@ -3632,9 +3666,9 @@ class LingbotVlaV2Policy:
     ):
         """Run the exact three-camera Vision->Text physical Z2.
 
-        All prompt/layout validation and every device input allocation happen before
+        All prompt/layout validation and every RPU input allocation happen before
         the native prepare.  Once prepare acquires the physical arena, its first
-        forward is the immediately following device operation.  Later calls may
+        forward is the immediately following RPU operation.  Later calls may
         change images and any admitted REAL prompt.  Prompt owners keep their
         addresses; bytes are refreshed in place and position/M-RoPE changes are
         explicitly re-primed outside Graph capture before retained replay.
@@ -3769,7 +3803,7 @@ class LingbotVlaV2Policy:
         prompt_changed = prompt_key != current_prompt_key
         next_prompt_metadata = None
         if prompt_changed:
-            # Finish every fallible CPU copy before mutating stable device owners.
+            # Finish every fallible CPU copy before mutating stable RPU owners.
             next_prompt_metadata = {
                 "lang_ids": lang_ids.clone(),
                 "position_ids_cpu": position_ids_cpu.clone(),
@@ -3861,7 +3895,7 @@ class LingbotVlaV2Policy:
             3 * 256, images.size(2)
         )
         # This is preparation-only packing: one patch Linear/H2D/position add
-        # owns three adjacent device inputs, while native Vision remains three
+        # owns three adjacent RPU inputs, while native Vision remains three
         # sequential N=256 occurrences.  W8 Z2 explicitly selects the staged
         # device Linear; shared helper callers retain their CPU default.  Each
         # narrow view keeps the storage alive through the synchronous forward.
@@ -3890,7 +3924,7 @@ class LingbotVlaV2Policy:
 
         if not z2.get("prepared", False):
             # This reset and all allocations above precede prepare.  After the
-            # physical lease is acquired, forward is intentionally the next device
+            # physical lease is acquired, forward is intentionally the next RPU
             # operation; even stats are deferred until the caller regains control.
             torch.ops.rpu.spm_alloc_reset_temporary()
             z2["prepare_attempt_token"] = next(_Z2_PREPARE_ATTEMPTS)
@@ -3914,7 +3948,7 @@ class LingbotVlaV2Policy:
         if refresh_text_inputs:
             try:
                 # Re-prime last: the retained Text forward is the immediately
-                # following device operation, matching the physical-owner contract.
+                # following RPU operation, matching the physical-owner contract.
                 torch.ops.rpu.lingbot2_multiview_spm_z2_refresh_text_inputs(
                     z2["vision_handle"], z2["text_handle"],
                     z2["expert_handle"], self._z2_position_ids,
@@ -3952,12 +3986,12 @@ class LingbotVlaV2Policy:
         self, images, img_masks, lang_tokens, lang_masks, prefill_plan,
         grid_thw=None,
     ):
-        """Run the device ViT and assemble the prefix EXACTLY as the official embed_prefix does.
+        """Run the RPU ViT and assemble the prefix EXACTLY as the official embed_prefix does.
 
         Layout (authoritative YAML): [<vision_start> <image>*P <vision_end>]*n_img ++ lang
                                      ++ <eos>*8 (current_depth) ++ <eos>*8 (future_depth)
 
-        Returns (inputs_embeds [1,S,2560] device fp16, position_ids [3,1,S] CPU, dense_ds, S, p0).
+        Returns (inputs_embeds [1,S,2560] RPU fp16, position_ids [3,1,S] CPU, dense_ds, S, p0).
         """
         keep_img = [i for i in range(images.shape[0])
                     if img_masks is None or bool(img_masks.reshape(-1)[i])]
@@ -3979,8 +4013,10 @@ class LingbotVlaV2Policy:
                 images, keep_img, lang_tokens, lang_masks, grid_thw,
                 merged_per_img, prefill_plan)
         if self._prefix_opt and len(keep_img) == images.shape[0]:
-            # When every image is retained, reshape the contiguous processor output
-            # instead of using advanced indexing to copy the same read-only values.
+            # Every image kept ⇒ `images[keep_img]` is advanced indexing that copies the whole
+            # [n_img, num_patch, patch_dim] fp32 tensor (4.7 MB here) only to hand the ViT the
+            # same values. Reshape is a view when the source is contiguous, which it is coming
+            # from the processor; the ViT only READS it. 2.4 ms/call.
             pix = images.reshape(-1, images.shape[-1])
             if not pix.is_contiguous():
                 pix = pix.contiguous()
@@ -4001,11 +4037,28 @@ class LingbotVlaV2Policy:
             raise ValueError(f"lingbot2: ViT returned {pooler.shape[0]} tokens, expected "
                              f"{len(keep_img)} x {num_patch}")
 
-        # Prompt constants depend on image count, tokens per image, language tokens
-        # and grid. Build their device buffers once, then overwrite only each image's
-        # contiguous visual rows. Stable addresses support VLM Graph replay.
-        # The key also includes which images survive filtering, so dropping different
-        # cameras cannot reuse an incompatible prefix layout.
+        # ---- prompt-constant fast path -------------------------------------------------------
+        # EVERYTHING from here to the return, except the visual rows themselves, is a pure
+        # function of (n_images, tokens-per-image, language tokens, grid) — of the PROMPT, not of
+        # the PIXELS. A deployed policy holds all four fixed for a whole episode and re-runs this
+        # per control tick, so on the warm path the layout, the M-RoPE index, the embed_tokens
+        # lookup and its two device hops, the masked_scatter and the align writes are all
+        # recomputed to produce byte-identical bytes: 7.9 ms/call. `scatter_visual_embeds_to_dense`
+        # costs another 6.2 ms, most of it because a boolean-mask index_put has no RPU kernel and
+        # falls back to the host (`[CPU_FALLBACK] aten::_index_put_impl_` in the run log).
+        #
+        # So build it ONCE into RPU-resident buffers and per frame overwrite only the visual rows.
+        # Those rows are contiguous runs by construction (the layout is
+        # [<vision_start> <image>*P <vision_end>]*n_img ++ lang ++ <eos>*8 ++ <eos>*8), so the
+        # update is one narrow().copy_() per image per tensor and needs no mask at all.
+        #
+        # The resulting stable addresses are a bonus rather than an accident: they are exactly
+        # what RPU_LINGBOT2_VLM_REPLAY wants, and they remove the per-call allocate/free of four
+        # [S, 2560] fp16 device tensors.
+        #
+        # The key covers every input the cached bytes depend on. img_masks enters through
+        # len(keep_img) AND through which images survive — keep_img itself is in the key, not just
+        # its length, so dropping camera 0 vs camera 2 cannot collide.
         memo_key = None
         if self._prefix_opt:
             memo_key = (PREFIX_POLICY_VERSION, tuple(keep_img), int(num_patch),
@@ -4082,10 +4135,10 @@ class LingbotVlaV2Policy:
         )
 
         # ---- embeds: token embeds, then overwrite the placeholder spans ----
-        # embed_tokens.weight lives on device (text_model.to("rpu") in build_lingbot_vla_v2), so the
+        # embed_tokens.weight lives on RPU (text_model.to("rpu") in build_lingbot_vla_v2), so the
         # lookup itself must run there — torch.embedding(rpu_weight, cpu_ids) raises
-        # "rpu_to_cpu_zerocopy: input must be on device device". Pull the RESULT straight back to
-        # CPU so the placeholder composition below (masked_scatter / align-token writes) stays
+        # "rpu_to_cpu_zerocopy: input must be on RPU device". Pull the RESULT straight back to
+        # CPU so the placeholder assembly below (masked_scatter / align-token writes) stays
         # exactly as it was; :345 does the single final .to("rpu").
         embeds_cpu = self._vlm.get_input_embeddings()(
             execution.input_ids.to("rpu")
@@ -4228,7 +4281,7 @@ class LingbotVlaV2Policy:
         self._cache.reset_to_position(0)
         if position_ids_rpu is None:
             # Legacy non-memo caller.  Memoized buckets pass their own stable
-            # device owner explicitly so A(length-x)->B(length-y)->A(length-x)
+            # RPU owner explicitly so A(length-x)->B(length-y)->A(length-x)
             # returns to the address originally baked for x.
             if self._pos_rpu is None or position_ids is not self._pos_ids_src:
                 self._pos_ids_src = position_ids
@@ -4361,7 +4414,7 @@ class LingbotVlaV2Policy:
             weight_h = weight.detach().to(torch.float16).contiguous()
             return tp_col_swizzle_mc_weight(weight_h, 1).to("rpu").contiguous()
 
-        # P1 order is load-bearing: fp16 -> zero-pad -> single-core col-swizzle -> device.
+        # P1 order is load-bearing: fp16 -> zero-pad -> single-core col-swizzle -> RPU.
         state_w = col1(F.pad(state_w_cpu.half(), (0, state_pad - STATE_DIM)))
         if tp8_encoder:
             wc = tp_col_swizzle_mc_weight(
@@ -4405,13 +4458,13 @@ class LingbotVlaV2Policy:
     def _denoise_unroll_run(self, state, noise, mask_r, S, real_S, p0,
                             dt, num_steps, action_plan):
         """Refresh stable padded inputs, then execute all Euler steps in one graph op."""
-        # Publish each complete private input slab once through CPU->device copy.
+        # Publish each complete private input slab once through CPU->RPU copy.
         # The native entry consumes these published owners on BUILD and REPLAY.
         self._denoise_state_host[:, :STATE_DIM].copy_(state)
         self._denoise_x0_host[:, 1:, :ACTION_DIM].copy_(noise)
         self._denoise_state.copy_(self._denoise_state_host)
         self._denoise_x0.copy_(self._denoise_x0_host)
-        # Both private owners were published by these CPU->device copies. No host
+        # Both private owners were published by these CPU->RPU copies. No host
         # writes intervene before native consumes them, including on REPLAY.
         self._cache.reset_to_position(S)
         prepared = self._prepared_graph_profile is not None
@@ -4620,8 +4673,13 @@ class LingbotVlaV2Policy:
             dyn_dims=[*denoise_dyn_dims, *action_plan.graph_key_words()],
             dtypes=[torch.float16])
 
-        # The caching allocator may reuse the temporary suffix tensors across steps.
-        # Keep their ownership local to the current forward.
+        # NOT WORTH DOING (measured 2026-07-29): preallocating one fp16 staging buffer to kill
+        # the cat's [1,51,768] fp32 temporary, the .half()'s fp16 temporary, and the redundant
+        # per-step rewrite of the call-invariant state_emb row is VALUE-IDENTICAL but buys
+        # NOTHING -- same-process A/B x3 gave -2.35 / -0.56 / +3.11 ms, mean -0.07. torch's
+        # caching allocator already recycles those temporaries in the warm loop; the 0.456
+        # ms/step that a microbenchmark attributes to `cat` is a cold-allocation artefact.
+        # Don't re-try it without a new reason.
         _nt = torch.get_num_threads()
         if self._enc_1thread:
             torch.set_num_threads(1)
@@ -4637,9 +4695,14 @@ class LingbotVlaV2Policy:
                     self._suffix_buf, mask_r, S, graph_rope_offset, denoise_sig,
                     action_plan,
                     adarms_step=k if self._adarms_direct_schedule else None)
-                # Slice the action rows on device before reading them back and widening.
-                # Keep x_t + dt * v_t as separate multiply and add: an alpha-add formulation
-                # can fuse them and change floating-point rounding.
+                # Slice on DEVICE before the D2H: ships the 50 rows the out-proj consumes
+                # instead of all 51, and widens 50 rows to fp32 instead of 51. Verified
+                # BIT-IDENTICAL to the old `out.to("cpu").float()[:, -N_ACTION:]` (5/5 trials
+                # torch.equal, and both equal the pure-CPU reference). Worth ~0.1 ms/step.
+                #   NOTE: keep `x_t + dt * v_t` as written. `x_t.add(v_t, alpha=dt)` looks
+                #   equivalent but fuses the multiply-add, dropping a rounding step (differs
+                #   by 2.4e-7/step, and over 10 Euler steps moved golden cos_v16 0.97423 ->
+                #   0.97739). More accurate, but it breaks value-identity with the baseline.
                 suffix_out = out[:, -N_ACTION:].to("cpu").float()        # [1, 50, 768]
                 v_t = F.linear(suffix_out, aout_w, aout_b)               # [1, 50, 55]
                 x_t = x_t + dt * v_t
@@ -4667,18 +4730,9 @@ def _materialize_derived_buffers(root):
     formula is never re-derived by hand — transformers computes it, exactly as it would in a
     normal (non-meta) build.
 
-    Ground truth (transformers/models/qwen3_vl/modeling_qwen3_vl.py, the ONLY 3 register_buffer
-    sites in that file, all persistent=False):
-      :95-100  Qwen3VLVisionRotaryEmbedding.__init__(dim, theta=10000.0)
-                 -> self.dim, self.theta ; register_buffer("inv_freq", ..., persistent=False)
-                 real call site :637  Qwen3VLVisionRotaryEmbedding(head_dim // 2)
-                 ⚠️ transformers 4.57.x does NOT set self.dim/self.theta — recovered from
-                 inv_freq.shape + the ctor default at the call site below.
-      :295-309 Qwen3VLTextRotaryEmbedding.__init__(config, device=None)
-                 -> self.config ; register_buffer("inv_freq"/"original_inv_freq", persistent=False)
-                 real call site :845  Qwen3VLTextRotaryEmbedding(config=config)
-    Both classes store every ctor argument they need as a plain Python attribute, which meta-init
-    does not touch — so the reconstruction uses the same values the original build used.
+    Vision RoPE takes dim/theta in older HF versions and a vision config in
+    newer axial-RoPE versions. Reconstruct the installed class with its own
+    contract and restore every derived buffer, including original_inv_freq.
     """
     from transformers.models.qwen3_vl.modeling_qwen3_vl import (
         Qwen3VLTextRotaryEmbedding,
@@ -4693,17 +4747,14 @@ def _materialize_derived_buffers(root):
             continue
         # Rebuilt OUTSIDE any meta context => real CPU storage.
         if isinstance(mod, Qwen3VLVisionRotaryEmbedding):
-            # transformers 5.x records self.dim/self.theta; 4.57.x does NOT (its __init__
-            # only computes inv_freq and registers it). Recover the ctor args instead of
-            # requiring them: inv_freq is `1/(theta**(arange(0,dim,2)/dim))`, so its length
-            # is exactly dim//2 — and shape survives meta-init even though storage does not.
-            # theta is the ctor default on both versions: the only call site in either is
-            # `Qwen3VLVisionRotaryEmbedding(head_dim // 2)` (4.57.3:582, 5.3.0:637), which
-            # never passes it. So the rebuilt inv_freq is bit-identical to a normal build.
-            dim = getattr(mod, "dim", None)
-            if dim is None:
-                dim = 2 * mod.inv_freq.shape[0]
-            fresh = Qwen3VLVisionRotaryEmbedding(dim, getattr(mod, "theta", 10000.0))
+            if hasattr(mod, "compute_axial_rope_parameters"):
+                with torch.device(cpu):
+                    fresh = Qwen3VLVisionRotaryEmbedding(mod.config)
+            else:
+                # HF 4.57 lacks dim/theta attributes; its only vision call site
+                # uses the default theta and dim is recoverable from the shape.
+                dim = getattr(mod, "dim", 2 * mod.inv_freq.shape[0])
+                fresh = Qwen3VLVisionRotaryEmbedding(dim, getattr(mod, "theta", 10000.0))
         elif isinstance(mod, Qwen3VLTextRotaryEmbedding):
             fresh = Qwen3VLTextRotaryEmbedding(mod.config, device=cpu)
         else:
@@ -4778,7 +4829,7 @@ def _quantize_text_w4a16(text_model) -> int:
 def _pack_text_w4a16(text_model) -> int:
     """Pack the three text-MLP INT4 projections through the pgrp ABI."""
     import torch.nn as nn
-    from rpu_backend.quant.int4_pgrp_pack import pack_int4_per_channel_as_pgrp
+    from rpu_backend.quant.int4_pgrp_pack import pack_int4_per_channel_as_pgrp, w4_storage_shape
 
     n_packed = 0
     for layer in text_model.layers:
@@ -4799,7 +4850,7 @@ def _pack_text_w4a16(text_model) -> int:
                 partition=partition, num_cores=ATTN_TP,
             )
             module.weight = nn.Parameter(
-                packed.reshape(n, k // 2).contiguous().to(weight.device),
+                packed.reshape(w4_storage_shape(n, k, partition, ATTN_TP)).contiguous().to(weight.device),
                 requires_grad=False,
             )
             module._buffers["weight_scale"] = packed_scale.to(scale.device)
@@ -4809,7 +4860,8 @@ def _pack_text_w4a16(text_model) -> int:
 def _quantize_text_w8a16(text_model) -> None:
     """On-the-fly W8A16 for the Qwen3-VL TEXT decoder (the VLM prefill).
 
-    Replace each layer's 7 projection Linears' fp16 weight with
+    Byte-for-byte the gr00t recipe (gr00t/runtime.py:82-97), which is already validated on this
+    exact text tower: replace each layer's 7 projection Linears' fp16 weight with
     per-output-channel int8 + a fp16 `weight_scale` buffer.
 
     ORDER IS LOAD-BEARING: must run BEFORE convert_linear_weights_inplace (which then swizzles the
@@ -4869,7 +4921,7 @@ def _build_lingbot_vla_v2_impl(
     component_generations=None,
     graph_runtime_policy=None,
 ):
-    """Build the LingBot-VLA V2 device runtime.
+    """Build the LingBot-VLA V2 RPU runtime.
 
     Args:
         ckpt:        path to the lingbot-vla-v2-6b checkpoint dir (sharded fp32 safetensors).
@@ -4920,9 +4972,63 @@ def _build_lingbot_vla_v2_impl(
     # the legacy non-runtime-graph builder's behavior unchanged.
     if not native_cold.runtime_graph:
         torch.rpu.set_ddr_flush(True)
-    # The public facade scopes cold kernel controls to this model. The direct
-    # builder preserves the caller's environment. Vision batches equal-size
-    # cameras; fused mergers and expert quantization follow the selected profile.
+    # This direct builder does not mutate shared/global defaults. Several native
+    # helpers sample process-wide env state, so enabling them here would leak into a
+    # model loaded later. The public facade scopes and restores the audited FP16
+    # bundle; direct-builder A/Bs must still set explicit env in a fresh process.
+    #   KVINSERT_HYBRID_V16   KV-insert's v16 kernel does 16 tokens per warp (1/16 the grid of v2)
+    #                         but requires position%16==0 && seq_len%16==0, so everything except
+    #                         VLM prefill fell back to v2. This splits the seq into
+    #                         bulk(224,v16)+tail(1,v2), fixing the lingbot2 prefix (seq=225).
+    #   KVINSERT_HYBRID3_V16  Same idea where `position` is also unaligned: head(15,v2)+
+    #                         bulk(32,v16)+tail(4,v2), fixing denoise (position=225, seq=51).
+    #                         BOTH are needed — each covers a different stage.
+    #   ADARMS_FUSED_BCAST    The replay-safe AdaRMS re-broadcast was 4 DMAs/layer x 36 layers =
+    #                         144 launches/step of 1536 B each. With the per-layer SPM slots
+    #                         allocated ascending (BufferDecl.reverse_layer_alloc) one N*h
+    #                         broadcast per role replaces all of them: 4 launches/step.
+    # MEASURED on the board (probe_flag.py, golden obs, alternated A/B):
+    #   KV pair    : get_action 292.86 -> 278.82 (-13.0 ms), prefill 59.32 -> 54.48,
+    #                denoise/step 16.668 -> 16.229
+    #   +FUSED_BCAST: denoise/step 16.234 -> 16.147 (-0.087 ms/step = -0.87 ms over 10 steps),
+    #                graph nodes 14698 -> 11618 (= 140 launches x 22 nodes, exactly as designed)
+    #   Action tensor sha256 d22d7a22…9509 is IDENTICAL with all three on vs all three off.
+    # This direct builder does not select RPU_QWEN3VL_VISION_PATCH_EMBED_DEVICE itself.
+    # The ordinary LingBot2 facade now selects it as part of its scoped generic bundle; the
+    # measured numeric change remains record-only and an explicit runtime_env=0 opts it out.
+    # All residual reductions use the generator-scheduled ring launcher.
+    # Vision family — all four were already implemented and validated for gr00t
+    # (gr00t/runtime.py:521-525,595 + perf_configs/gr00t.toml); lingbot2 had simply never opted in.
+    #   ROPE_SPM      SPM-resident 2D-RoPE cos/sin instead of re-streaming the DDR tables per
+    #                 layer. Bit-identical math; the hwperf trace put rope_2d_ddr at 12.5% of
+    #                 the ViT graph.
+    #   BATCH         packs the 3 equal-size camera images into ONE vision forward (3 REPLAYs
+    #                 -> 1). Bit-exact vs the per-image loop
+    #                 (tests/model/qwen3_vl/verify_vision_batch_equiv.py); different-size
+    #                 neighbours split the batch automatically, so it is safe in production.
+    #   FUSED_MERGER  runs the patch merger + deepstack mergers INSIDE the vision graph instead
+    #                 of eagerly op-by-op. This is by far the biggest single win here.
+    # HISTORICAL cumulative measurements (3 warmup + 30 measured, old ref):
+    #   +ROPE_SPM+BATCH+retired launcher: E2E 730.13 -> 693.88,
+    #   vision 262.29 -> 230.54, cos 0.999992
+    #   +FUSED_MERGER             : E2E 693.88 -> 572.33, vision 230.54 ->  99.10, cos 0.999284
+    # NOTE the correctness cost of FUSED_MERGER: rel_L2 0.0034 -> 0.0378 (10x). It still clears
+    # the 0.999 gate, but the margin is real, not free — the mergers move from an eager host
+    # fp32 evaluation onto the fp16 device datapath. If a future gate requires materially tighter parity,
+    # FUSED_MERGER is the first thing to turn off (costs ~121 ms E2E).
+    # HOST_FP32_PATCH changes accumulation order and therefore remains explicit opt-in until the
+    # integrated main path is re-certified. The branch's SKIP_GROUP_CLONE shortcut is not carried:
+    # main deliberately returns fresh tensors that callers may retain (pitfall P4).
+    # Expert-only W8A16 (convert.py:build_expert_moe). int8 + per-output-channel fp16 scale on the
+    # ROUTED expert gate/up/down ONLY; router, attention, AdaRMS, shared expert, residual and the
+    # action head all stay fp16. Reuses the shipped quantiser (quant/_common) and the acc16 GEMM's
+    # native int8 path — no new quantisation machinery. Requires the dense grouped or sparse
+    # expert path; sparse packing retains the same per-output quantization values.
+    # *** DEFAULT OFF — opt-in only. *** W8A16 changes numerics, so it must never turn itself on:
+    # with the env unset the model stays on the FP16 expert path, byte-for-byte. Enable per-run with
+    # RPU_LINGBOT2_EXPERT_W8A16=1.
+    # MEASURED when opted in: E2E p50 572.33 -> 480.38, denoise/step 38.73 -> 29.83,
+    # final-action/step-0 cosine stays >= 0.999 but the margin narrows (see the acceptance JSON).
 
     # Qwen3-VL base dir resolution — CALL time, explicit source for diagnostics.
     # Precedence: explicit qwen3vl_base arg (threaded from from_checkpoint /
@@ -4963,8 +5069,8 @@ def _build_lingbot_vla_v2_impl(
         raise ValueError(
             f"lingbot2: Qwen3-VL scaffold/checkpoint mismatch.\n  missing={missing[:8]}\n"
             f"  unexpected={unexpected[:8]}")
-
-    # load_state_dict(assign=True) transferred the checkpoint storage to vlm.
+    # assign=True transfers storage ownership to the model. Retaining the source
+    # dict would pin the old FP32 weights through half/quantize/device conversion.
     del sd
 
     _materialize_derived_buffers(vlm)
@@ -4977,7 +5083,7 @@ def _build_lingbot_vla_v2_impl(
         torch.rpu.set_caching_allocator(True)
 
     text_model, vision_model = vlm.language_model, vlm.visual
-    # Publish partial ownership before the first irreversible swizzle/device
+    # Publish partial ownership before the first irreversible swizzle/RPU
     # allocation. The outer transaction can then retire any text/vision handle
     # installed before a later stage fails.
     policy._vlm = vlm
@@ -4987,7 +5093,7 @@ def _build_lingbot_vla_v2_impl(
     policy._gc_retirement_enabled = True
     policy._rpu_swizzle_started = True
 
-    # ---- Step A/C: swizzle text linears on CPU, THEN move to device (P1 order) ----
+    # ---- Step A/C: swizzle text linears on CPU, THEN move to RPU (P1 order) ----
     # RC-1: ckpt_reader normalizes source BF16/FP32 weights to CPU FP32, so the swizzle would
     # read element_size()==4 and emit a layout the fp16 kernel cannot consume. .half() must
     # precede BOTH the swizzle and .to("rpu"). The vision side casts its own weights explicitly.
@@ -5010,7 +5116,7 @@ def _build_lingbot_vla_v2_impl(
     else:
         convert_linear_weights_inplace(text_model, skip_names=set())
     if _env_exact_one("RPU_LINGBOT2_MULTIVIEW_SPM_Z2"):
-        # A retained physical arena cannot run an out-of-band device embedding
+        # A retained physical arena cannot run an out-of-band RPU embedding
         # lookup between replays.  Keep one host FP16 token table so arbitrary
         # admitted prompt bytes can refresh the stable P225 carrier using CPU
         # F.embedding + a DDR copy only.  This is Z2-only; generic execution
@@ -5046,13 +5152,21 @@ def _build_lingbot_vla_v2_impl(
     if native_cold.runtime_graph:
         torch.ops.rpu.qwen3vl_vision_set_lingbot_tap_merger(
             vision_model._rpu_vision_handle, True)
-    # ---- patch_embed on device (2026-07-29) ----------------------------------------------------
+    # ---- patch_embed on RPU (2026-07-29) ----------------------------------------------------
     # vision.py's `_rpu_patch_embed_on_device` branch runs the folded patch_embed Linear on the
-    # device instead of as a host GEMM. It ships inside enable_qwen3_vl_vision_merger_on_device(),
+    # RPU instead of as a host GEMM. It ships inside enable_qwen3_vl_vision_merger_on_device(),
     # which lingbot2 does NOT call (we use the in-graph fused merger above instead), so this one
     # branch had simply never been reachable here — the same "already in the .so, never called"
     # story as the flags above. Staged here directly so the merger path is left alone.
     #
+    # MEASURED on the board (w4a16, 3x256 golden obs, same-process A/B alternated 3x):
+    #   get_action  297.62 -> 286.97  (-10.65 ms)      visual.forward 38.92 -> 30.77 (-8.16 ms)
+    #   one-off weight staging at build: 6.3 ms
+    # NUMERICS: NOT bit-identical -- the GEMM moves from host fp32 to device fp16. golden
+    # cos_v16 goes 0.97423 -> 0.97780, i.e. CLOSER to the GPU reference (which also runs an
+    # fp16 patch_embed), but the action itself moves by cos 0.99929 / rel_l2 3.77% /
+    # max|d| 0.063. Because that is a real numerics change it is OPT-IN:
+    #   RPU_QWEN3VL_VISION_PATCH_EMBED_DEVICE=1
     if os.environ.get("RPU_QWEN3VL_VISION_PATCH_EMBED_DEVICE") == "1":
         if not getattr(vision_model, "_rpu_patch_embed_on_device", False):
             from rpu_backend.runtime.weights import tp_col_swizzle_mc_weight
@@ -5066,10 +5180,29 @@ def _build_lingbot_vla_v2_impl(
             vision_model._rpu_patch_embed_b_rpu = (
                 _pe_b.half().to(device="rpu").contiguous() if _pe_b is not None else None)
             vision_model._rpu_patch_embed_on_device = True
-    # Vision fast replay skips the recorded layer body's host traversal.
-    # Preload skip additionally avoids re-emitting host callbacks while recorded
-    # preload nodes still execute. Baking the fused merger permits skipping its
-    # post hook too, and requires the fused merger and vision fast-replay options.
+    # ---- Vision REPLAY host-walk elimination (2026-07-22) ------------------------------------
+    # Three per-model opt-ins that already exist in the .so, are already validated, and that
+    # lingbot2 had simply never called — the same story as the four vision flags above. RhinoVLA
+    # ships all three (tests/library/perf_configs/rhinovla_baseline_align/rhinovla.toml:27-42) and
+    # documents each as BIT-IDENTICAL; the C++ comments carry their measurements.
+    #   set_fast_replay           enables the per-model fast-replay opt-in. When the GLOBAL
+    #                             RPU_WALL_OSS_FAST_REPLAY is enabled by the FP16 facade or an
+    #                             explicit env, it already skips the layer
+    #                             body, but `fast_replay_skip_preload` is gated on the per-model
+    #                             flag (fused_model_base.cpp:566), so the two below are inert
+    #                             without it.
+    #   set_preload_replay_skip   vision is the ONLY model that binds weights via
+    #                             static_cfg.preload_fn (~144 broadcast/scatter/memset op-walk
+    #                             calls EVERY forward, not covered by the body skip). On REPLAY
+    #                             those nodes replay from the segment launch and the skip cursor
+    #                             overwrites preload's anyway (fused_model_base.cpp:1043).
+    #   set_bake_merger           with FUSED_MERGER the post_fn is re-emitted every REPLAY
+    #                             (~370 nodes) because fast_replay_bake_post_fn is false, which
+    #                             forces skip_layer_body instead of skip_op_stream
+    #                             (fused_model_base.cpp:1090). Baking it lets the whole op stream
+    #                             be skipped. Requires the fused merger + vision fast replay.
+    # MEASURED HERE: the vision op call on REPLAY (host-only; the device work happens in the
+    # capture scope's __exit__) was 9.84 ms of the 33.85 ms vision graph block.
     if _env_on("RPU_LINGBOT2_VISION_FAST_REPLAY", "0"):
         _vh = vision_model._rpu_vision_handle
         torch.ops.rpu.qwen3vl_vision_set_fast_replay(_vh, True)
@@ -5106,9 +5239,14 @@ def _build_lingbot_vla_v2_impl(
            if native_cold.runtime_graph else {}),
         execution_config=text_execution)
     _take_lingbot2_component_retirement(policy, text_model, "decoder")
-    # The VLM only writes prefix KV; this checkpoint has no lm_head.
-    # Prefill fast replay/preload skipping requires a persistent VLM GraphCache;
-    # a cache rebuilt on every request cannot enter REPLAY.
+    # NOTE: no lm_head. The checkpoint has none and the YAML sets `use_lm_head: false` — the VLM
+    # exists only to write the prefix KV.
+    # Same two opt-ins for the prefill decoder (RhinoVLA rhinovla.toml:73-80): the D-502
+    # preload-callback re-walk is ~140 norm-weight DMAs re-emitted every REPLAY purely to advance
+    # a cursor that skip_op_stream overwrites. RhinoVLA measured 4.05 of its 4.44 ms prefill
+    # forward there; lingbot2's prefill host is smaller (2.78 ms) because its prefix is shorter,
+    # so expect a proportionally smaller win. INERT unless RPU_LINGBOT2_VLM_REPLAY=1 — with the
+    # cache recreated per call the prefill always BUILDs and never reaches the REPLAY path.
     if _env_on("RPU_LINGBOT2_PREFILL_FAST_REPLAY", "0"):
         _th = text_model._rpu_decoder_handle
         torch.ops.rpu.causal_decoder_set_fast_replay(_th, True)
@@ -5171,11 +5309,11 @@ def build_lingbot_vla_v2(
     _component_generations=None,
     graph_runtime_policy=None,
 ):
-    """Build one process-exclusive LingBot-VLA-V2 device runtime.
+    """Build one process-exclusive LingBot-VLA-V2 RPU runtime.
 
     CPU-only preflight failures release the process slot immediately. Once
-    swizzling/device materialization starts, a failed owner keeps the slot claimed
-    until its traceback is collected, preventing traceback-held device tensors from
+    swizzling/RPU materialization starts, a failed owner keeps the slot claimed
+    until its traceback is collected, preventing traceback-held RPU tensors from
     overlapping a replacement policy.
     """
     if graph_runtime_policy is not None and not isinstance(
@@ -5195,15 +5333,6 @@ def build_lingbot_vla_v2(
         execution_config,
         multiview_spm_z2=_env_exact_one("RPU_LINGBOT2_MULTIVIEW_SPM_Z2"),
     )
-    if os.environ.get("RPU_LINGBOT2_ALLOW_UNVALIDATED") != "1":
-        raise RuntimeError(
-            "LingBot-VLA-V2 is fail-closed by default. Blocking CI grants "
-            "controlled temporary support only to exact-Z2 W8A16, three-image "
-            "REAL215..225/P225; FP16, W4 and other profiles remain "
-            "evaluation-only. Set exactly "
-            "RPU_LINGBOT2_ALLOW_UNVALIDATED=1 to enter a controlled path; "
-            "none is formally or robot certified."
-        )
     from rpu_backend.api.causal_lm import (
         _claim_live_instance,
         _release_live_instance,

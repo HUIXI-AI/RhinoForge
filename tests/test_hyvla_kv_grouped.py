@@ -11,7 +11,7 @@ def test_actual_helper_owners_registers_and_failure_boundaries(tmp_path, w8):
                    'inline void launch_hyvla_kv_grouped_spm(')
     source = COMMON + r'''
 #include "ops/rpu_linear_tiling.h"
-enum class KernelId {HYVLA_EXPERT_KV_FP16_S51,HYVLA_EXPERT_KV_W8_S51};
+enum class KernelId : uint16_t {HYVLA_EXPERT_KV_FP16_S51,HYVLA_EXPERT_KV_W8_S51};
 constexpr auto expected_id=W8?KernelId::HYVLA_EXPERT_KV_W8_S51:KernelId::HYVLA_EXPERT_KV_FP16_S51;
 enum class GraphDdrRegisterRole {ModelWeight,Int8ModelWeight,PerChannelScale};
 enum class GraphDdrRegisterAccess {Read};
@@ -70,9 +70,9 @@ int main(){
  };
  auto pair=[&](int i){return uint32_t(kernel.regs[i])|(uint32_t(kernel.regs[i+1])<<16);};
  run(true);
- assert(pair(0)==input && pair(6)==0 && pair(8)==51 && pair(10)==128);
+ assert(pair(0)==input && pair(6)==0 && kernel.regs[8]==1 && kernel.regs[9]==51 && pair(10)==128);
  assert(kernel.regs[12]==1024 && kernel.regs[13]==64 && kernel.regs[14]==0 && kernel.regs[15]==8);
- assert(pair(16)==2048 && pair(18)==256 && kernel.regs[22]==1 && kernel.regs[23]==(W8?1:2));
+ assert(pair(16)==2048 && pair(18)==256 && pair(22)==0 && pair(24)==0 && kernel.regs[26]==2 && kernel.regs[27]==(W8?1:2));
  assert(kernel.regs[64]==(W8?6:4) && kernel.regs[65]==1 && kernel.regs[66]==1);
  for(size_t i=0;i<2;++i){assert(pair(i?32:2)==weight[i].address>>8 && pair(i?36:4)==out[i]);
   assert(pair(i?34:20)==(W8?scale[i].address>>8:0));}

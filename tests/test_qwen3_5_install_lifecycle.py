@@ -115,25 +115,24 @@ def _vision_descriptor(
     ]
 
 
-def test_quant_policy_requires_exact_opt_in_before_model_access(monkeypatch):
+def test_quant_policy_needs_no_opt_in_but_rejects_unknown_scope(monkeypatch):
+    monkeypatch.delenv("QWEN3_5_QUANT_ALLOW_UNCERTIFIED", raising=False)
+    calls = []
+    monkeypatch.setattr(adapter_module, "resolve_quant_config", calls.append)
     config = types.SimpleNamespace(quant_config={"method": "w8a16"})
-    model = types.SimpleNamespace(config=config)
-
-    for value in (None, "true"):
-        if value is None:
-            monkeypatch.delenv("QWEN3_5_QUANT_ALLOW_UNCERTIFIED", raising=False)
-        else:
-            monkeypatch.setenv("QWEN3_5_QUANT_ALLOW_UNCERTIFIED", value)
-        with pytest.raises(adapter_module.UnsupportedModelError, match="uncertified"):
-            adapter_module.Qwen3_5Adapter.preflight(config)
-        with pytest.raises(adapter_module.UnsupportedModelError, match="uncertified"):
-            adapter_module.Qwen3_5Adapter(model)
-
-    monkeypatch.setenv("QWEN3_5_QUANT_ALLOW_UNCERTIFIED", "1")
     assert adapter_module._check_quant_policy(config) is None
+    assert calls == [config]
     assert adapter_module._check_quant_policy(
         types.SimpleNamespace(quant_config={})
     ) is None
+    assert calls == [config]
+
+    def reject(_config):
+        raise ValueError("unknown quant scope")
+
+    monkeypatch.setattr(adapter_module, "resolve_quant_config", reject)
+    with pytest.raises(ValueError, match="unknown quant scope"):
+        adapter_module._check_quant_policy(config)
 
 
 def test_qwen3_5_language_envelope_contains_the_mr54_rows():

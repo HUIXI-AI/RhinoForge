@@ -1,24 +1,54 @@
-[example]
-profile_id = "qwen3_5-35b-a3b.mixed-e4m3.text-tp8"
+# 未写出的执行参数（省略即按以下值运行）：
+#   [cpu].threads 省略时不设置线程：PyTorch 使用环境变量 OMP_NUM_THREADS，未设置时使用全部 CPU 核（参考板 24）；2026-10-19 测量环境预设为 16。
+[model]
+profile_id = "qwen3_5-35b-a3b.mixed-e4m3.text"
 registry_alias = "qwen3_5-35b-a3b-mixed"
 target = "qwen3_5"
-dtype = "mixed-e4m3"
+precision = "mixed-e4m3"
 architecture = "Qwen3_5MoeForConditionalGeneration"
 
 [input]
+# 固定 P 时改用 prompt_file + prompt_sha256 + input_ids_sha256，移除 prompt；
+# 同时设置 run.timing_mode="forward_argmax"、stop_on_eos=false；示例见模型说明。
+# prefill_tokens = 4096
+# 可替换文本；自然输入长度由 tokenizer 决定。
 prompt = "A compiler translates source code into executable instructions. Its main stages are"
-# At most 31 decode calls after the prefill token; stop earlier at EOS.
+# prefill 首 token 之后最多 31 次 decode；遇 EOS 提前结束。
+# 首 token 之后的 decode 调用数，整数 ≥0；P 与 D 受 cache 和模型输入范围共同约束。
 decode_steps = 31
 
 [run]
+# 预热次数；不计入正式测量。
 warmup = 2
-runs = 3
+# 正式执行次数，正整数。
+runs = 5
+# 按需开启硬件采样；保持 false 可减少测量干扰。
 hwperf = false
+# 按需开启 profiler；正式计时建议保持 false。
 profile = false
+# 随机种子，非负整数。
 seed = 0
 
 [rpu_execution.model]
+# RPU 核数预算。可选 4 / 6 / 8，默认 8；修改后需重新加载模型。
+# 6 核时文本组件分配为 Attention 4、MLP 6、输出头 4。
+# Vision 在 4/6 核下用 4 核。实际分配见模型页配置表的“4 核 / 6 核”列。
 num_cores = 8
 
 [rpu_execution.prefill]
+# Prefill 分块行数。可选 "auto"（默认），或不超过 512 的 64 的倍数；
+# 下面的 moe_resident_prefill = true 时上限放宽到 8192，仍须是 64 的倍数。
+# auto：实际行数 P 向上取整对齐后，在不超过上限的候选中选分块最少、补齐最少的一种；
+# P 不超过上限时通常只分一块（例：P=7 → 64、P=80 → 128），超过上限时按上限分块。
+# 2026-10-19 模板默认输入实测：8/6/4 核均为 64。
+# 实际值记录在结果 report.json 的执行计划中（compute_chunk）。
 chunk_size = "auto"
+# 路由专家常驻 prefill 数据流。可选 false（省略时）或 true；冷启动选定，改后重新加载模型。
+# true 要求 num_cores = 8、UINT4 或 E4M3 路由权重、ACC16，且该次请求是 prefill 起点
+# 为 0 的因果 B1；任一条不满足时在安装或该次 forward 前报错，不会静默退回普通数据流。
+# 开启后 chunk_size 上限见上；"auto" 改由 native 联合 SPM/mixer 规划选外窗，
+# 2026-10-26 实测最大 768，见模型性能页的“TP8 正文 prefill”一节。
+# 本模板取 true：2026-10-29 以 true 重测的 TP8 正文 prefill 矩阵（11 个 P 点、W2/R5、
+# 外窗逐点与 2026-10-26 批次一致（64/192/320/512/704，其余 768）。
+# 注意下方配置覆盖表与数值误差表仍是 false 时的实测身份，与本行取值不同。
+moe_resident_prefill = true

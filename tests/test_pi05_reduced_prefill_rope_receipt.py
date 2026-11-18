@@ -103,6 +103,10 @@ def test_private_cpu_tp46_rope_receipt_runs_whole_setter_and_copy_protocol(tmp_p
 #include <stdexcept>
 #include <vector>
 bool g_rpu_ddr_flush_enabled=true,g_rpu_ddr_flush_force_enabled=true;
+// No Graph submission is pending in this harness (graph/graph_async_end.h).
+bool rpu_graph_async_end_pending() noexcept{return false;}
+void rpu_graph_async_end_wait(const char*) noexcept{}
+template<class S> bool rpu_graph_async_end_independent_write(const void*,size_t,const S&) noexcept{return false;}
 struct Store{at::Tensor value;std::vector<uint8_t> ddr;bool rpu,device_dirty=false;};
 std::vector<std::weak_ptr<Store>> stores;
 std::vector<std::pair<void*,size_t>> flushes;

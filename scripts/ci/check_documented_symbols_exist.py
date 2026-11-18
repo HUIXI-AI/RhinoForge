@@ -147,6 +147,7 @@ class Universe:
         self.names: set[str] = set()
         self.names |= _cpp_code_identifiers(repo_root / "src")
         self.names |= _py_code_identifiers(repo_root / "python")
+        self.names |= _py_code_identifiers(repo_root / "examples")
         self.sdk_names: set[str] = set()
         for rel in SDK_DIRS:
             self.sdk_names |= _cpp_code_identifiers(repo_root / rel)
@@ -336,7 +337,7 @@ def run(repo_root: pathlib.Path) -> int:
         findings.extend(f)
         errors.extend(e)
 
-    sources = "src+python" + ("+sdk" if uni.sdk_present else "") + ("+so" if uni.so_present else "")
+    sources = "src+python+examples" + ("+sdk" if uni.sdk_present else "") + ("+so" if uni.so_present else "")
     print(f"scanned {len(docs)} doc files; universe = {len(uni.names)} identifiers ({sources})")
 
     if not uni.so_present:

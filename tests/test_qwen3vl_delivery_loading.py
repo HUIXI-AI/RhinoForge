@@ -9,7 +9,7 @@ from safetensors.torch import save_file
 from rpu_backend.adapters.qwen3_vl.delivery_load import _checkpoint_inventory
 from rpu_backend.adapters.qwen3_vl import _quantize_pack_lm_head_w4_groupwise as bounded
 from rpu_backend.quant.int4_pgrp_pack import (
-    quantize_int4_group_wise, swizzle_pack_int4_pgrp, swizzle_int4_pgrp_scale,
+    quantize_int4_group_wise, swizzle_pack_int4_pgrp, swizzle_int4_pgrp_scale, w4_storage_shape,
 )
 
 
@@ -57,7 +57,7 @@ def test_pack_exact(rows, hidden):
     weight = torch.randn(rows, hidden).half()
     weight[0].zero_()
     values, logical, _ = quantize_int4_group_wise(weight, 32)
-    expected_weight = swizzle_pack_int4_pgrp(values, 1, 8).reshape(rows, hidden // 2)
+    expected_weight = swizzle_pack_int4_pgrp(values, 1, 8).reshape(w4_storage_shape(rows, hidden, 1, 8))
     expected_scale = swizzle_int4_pgrp_scale(logical, 32, 1, 8)
     actual_weight, actual_scale = bounded(weight)
     assert torch.equal(actual_weight, expected_weight)

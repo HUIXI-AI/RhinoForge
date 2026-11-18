@@ -579,7 +579,7 @@ std::shared_ptr<RpuKernelGraph> RpuKernelGraph::extract_child_window(
         "be detached from their FMB owner and replay arm");
     ever_extracted_child_window_ = true;
 
-    auto child = std::make_shared<RpuKernelGraph>(runtime_policy_);
+    auto child = std::make_shared<RpuKernelGraph>(runtime_policy_, require_single_segment_);
     child->state_ = State::BUILT;
     child->replayable_ = true;
     child->scope_open_ = false;

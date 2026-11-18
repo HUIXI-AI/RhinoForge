@@ -3727,6 +3727,10 @@ DecoderExecutionTopology FusedModelBase::resolve_model_execution_topology(
     return {8, std::min(8, static_cast<int>(num_kv_heads)), 8};
 }
 
+int64_t FusedModelBase::resolve_model_mlp_intermediate_size(int64_t logical_size) const {
+    return decoder_mlp_intermediate_size(logical_size, pimpl_->mlp_tp_);
+}
+
 void FusedModelBase::set_model_params(int64_t num_q_heads, int64_t num_kv_heads,
                                       int64_t head_dim, int64_t hidden_size,
                                       int64_t intermediate_size) {
@@ -3744,8 +3748,7 @@ void FusedModelBase::set_model_params(int64_t num_q_heads, int64_t num_kv_heads,
     pimpl_->hidden_size_        = hidden_size;
     // All SPM declarations, GEMMs and plan/layout hashes consume the physical
     // width. The exact logical profile was checked before selecting its TP.
-    pimpl_->intermediate_size_  = decoder_mlp_intermediate_size(
-        intermediate_size, pimpl_->mlp_tp_);
+    pimpl_->intermediate_size_ = resolve_model_mlp_intermediate_size(intermediate_size);
 
 }
 
@@ -3773,11 +3776,11 @@ int64_t FusedModelBase::num_layers()        const { return pimpl_->num_layers_; 
 // Pitfall 4 structural mitigation — fresh at::empty per forward, PLUS the C-1
 // lifetime anchor that makes the "tracked" in the name true.
 //
-// The freshness half answers P4 (docs/pitfalls.md#p4): a caller that accumulates
+// The freshness half answers P4 (the SDK queue contract): a caller that accumulates
 // per-forward outputs (Pi0.5 embed_prefix's per-image list, GR00T's per-step
 // action) must get distinct DDR each time, or torch.cat replays the last slot.
 //
-// The tracking half answers C-1 (docs/pitfalls.md#c-1): subclasses bake
+// The tracking half answers C-1 (the SDK queue contract): subclasses bake
 // RpuGetDevAddr(out.data_ptr()) into a DEFERRED DMA destination — see
 // rpu_gr00t_dit_model.cpp x_out_dst_base_ in both step_forward and
 // unroll_forward — and the graph does not execute until RpuKernelGraph::end(),
@@ -4494,23 +4497,31 @@ detail::FmbPreparedSpmCost detail::FmbPreparedSpmCostCache::prepare(
 }
 
 int64_t detail::FmbPreparedSpmCost::available(
-    int64_t after_reset_free, bool persistent_allocated, int64_t planning_budget) const {
-    constexpr int64_t kOutOfBandReserve = 64 * 1024;
+    int64_t after_reset_free, bool persistent_allocated, int64_t planning_budget,
+    int64_t minimum_eager_bytes) const {
+    TORCH_CHECK(minimum_eager_bytes >= 0 &&
+                    minimum_eager_bytes <= static_cast<int64_t>(SpmAllocator::SPM_USABLE) &&
+                    minimum_eager_bytes % SpmAllocator::ALIGN == 0,
+                "FusedModelBase eager SPM reserve must be aligned and within physical SPM");
+    const int64_t kOutOfBandReserve =
+        std::max<int64_t>(64 * 1024, minimum_eager_bytes);
     return std::min(std::max<int64_t>(planning_budget - persistent - temp_per_layer, 0),
                     std::max<int64_t>(after_reset_free - kOutOfBandReserve - temp_per_layer -
                                          (persistent_allocated ? 0 : persistent), 0));
 }
 
 bool detail::FmbPreparedSpmCost::fits(
-    int64_t after_reset_free, bool persistent_allocated, int64_t planning_budget) const {
+    int64_t after_reset_free, bool persistent_allocated, int64_t planning_budget,
+    int64_t minimum_eager_bytes) const {
     const int64_t fixed = persistent + temp_per_layer;
     return fixed >= 0 && temporary >= 0 && fixed <= planning_budget &&
-        temporary <= available(after_reset_free, persistent_allocated, planning_budget);
+        temporary <= available(after_reset_free, persistent_allocated, planning_budget,
+                               minimum_eager_bytes);
 }
 
 static int64_t available_temporary_spm_after_reset(
     const std::vector<BufferDecl>& decls,
-    bool persistent_already_allocated) {
+    bool persistent_already_allocated, int64_t minimum_eager_bytes = 0) {
     const FixedSpmOverhead fixed = estimate_fixed_overhead(decls);
     const int64_t planning_budget =
         static_cast<int64_t>(SpmAllocator::SPM_PLANNING_BUDGET);
@@ -4521,7 +4532,12 @@ static int64_t available_temporary_spm_after_reset(
     // reset recovers only the current temporary region; preserve FMB's
     // board-proven physical reserve for both initial chunk selection and the
     // final dual-plan layout.
-    constexpr int64_t kOutOfBandReserve = 64 * 1024;
+    TORCH_CHECK(minimum_eager_bytes >= 0 &&
+                    minimum_eager_bytes <= static_cast<int64_t>(SpmAllocator::SPM_USABLE) &&
+                    minimum_eager_bytes % SpmAllocator::ALIGN == 0,
+                "FusedModelBase eager SPM reserve must be aligned and within physical SPM");
+    const int64_t kOutOfBandReserve =
+        std::max<int64_t>(64 * 1024, minimum_eager_bytes);
     const int64_t after_reset_free =
         static_cast<int64_t>(SPM_ALLOC.free_space()) +
         static_cast<int64_t>(SPM_ALLOC.temporary_used());
@@ -4536,13 +4552,13 @@ static int64_t available_temporary_spm_after_reset(
 
 static bool final_chunk_layout_fits(
     const std::vector<BufferDecl>& decls,
-    bool persistent_already_allocated) {
+    bool persistent_already_allocated, int64_t minimum_eager_bytes = 0) {
     const FixedSpmOverhead fixed = estimate_fixed_overhead(decls);
     const int64_t temporary = detail::estimate_temporary_total(decls);
     const int64_t budget =
         static_cast<int64_t>(SpmAllocator::SPM_PLANNING_BUDGET);
     const int64_t available = available_temporary_spm_after_reset(
-        decls, persistent_already_allocated);
+        decls, persistent_already_allocated, minimum_eager_bytes);
     return fixed.total() >= 0 && temporary >= 0 && fixed.total() <= budget &&
         temporary <= available;
 }
@@ -4551,7 +4567,8 @@ bool FusedModelBase::declared_spm_layout_fits(
     const std::vector<BufferDecl>& declarations) const {
     TORCH_CHECK(!RpuKernelGraph::has_active(),
                 "SPM residency selection requires a cold planning context");
-    return final_chunk_layout_fits(declarations, pimpl_->persistent_allocated_);
+    return final_chunk_layout_fits(declarations, pimpl_->persistent_allocated_,
+                                   minimum_eager_spm_bytes());
 }
 
 LayoutContext FusedModelBase::bind_physical_layout_context(
@@ -4576,13 +4593,13 @@ LayoutContext FusedModelBase::bind_physical_layout_context(
 static void validate_final_chunk_layout_fits(
     const std::vector<BufferDecl>& decls,
     bool persistent_already_allocated,
-    const char* contract) {
+    const char* contract, int64_t minimum_eager_bytes = 0) {
     const FixedSpmOverhead fixed = estimate_fixed_overhead(decls);
     const int64_t temporary = detail::estimate_temporary_total(decls);
     const int64_t budget =
         static_cast<int64_t>(SpmAllocator::SPM_PLANNING_BUDGET);
     const int64_t available = available_temporary_spm_after_reset(
-        decls, persistent_already_allocated);
+        decls, persistent_already_allocated, minimum_eager_bytes);
     const bool fits = fixed.total() >= 0 && temporary >= 0 &&
         fixed.total() <= budget && temporary <= available;
     TORCH_CHECK(
@@ -4994,6 +5011,12 @@ static void ensure_allocated_impl(
         persistent_invalidated) {
         params_changed = true;
     }
+    // A prepared component's offsets belong to its live lease. Reject drift
+    // before retiring the allocation manifest or touching the shared arena.
+    TORCH_CHECK(s.pipeline_lease_epoch_ == 0 ||
+                    (!params_changed && !gen_changed && !persistent_invalidated),
+                "FusedModelBase: leased component layout changed; release and "
+                "reprepare before dispatch");
 
     // Persistent shape detection: once allocated, shape cannot change.
     int64_t new_persistent_hash = compute_persistent_hash_impl(decls);
@@ -5139,7 +5162,7 @@ static std::vector<ChunkSizeProbe> enumerate_chunk_size_domain_impl(
     int64_t chunk_size_cap,
     int64_t seq_len,
     const LayoutContext& base_ctx,
-    bool apply_auto_cap) {
+    bool apply_auto_cap, int64_t minimum_eager_bytes = 0) {
     int64_t hi = ((seq_len + 15) / 16) * 16;
     if (apply_auto_cap && chunk_size_cap > 0) {
         const int64_t aligned_cap = (chunk_size_cap / 16) * 16;
@@ -5168,11 +5191,12 @@ static std::vector<ChunkSizeProbe> enumerate_chunk_size_domain_impl(
         const int64_t temporary =
             detail::estimate_temporary_total(declarations);
         const int64_t available = available_temporary_spm_after_reset(
-            declarations, s.persistent_allocated_);
+            declarations, s.persistent_allocated_, minimum_eager_bytes);
         result.push_back({chunk_size, temporary, available, valid,
                           temporary <= available &&
                               final_chunk_layout_fits(
-                                  declarations, s.persistent_allocated_)});
+                                  declarations, s.persistent_allocated_,
+                                  minimum_eager_bytes)});
     }
     return result;
 }
@@ -5225,7 +5249,8 @@ static std::vector<ChunkInfo> compute_chunks_impl(
     int64_t chunk_size_cap,
     int64_t seq_len, int64_t position, const LayoutContext& base_ctx,
     int64_t* resolved_chunk_size, int64_t planned_chunk_size = 0,
-    std::function<bool(int64_t)> hard_valid_fn = {})
+    std::function<bool(int64_t)> hard_valid_fn = {},
+    int64_t minimum_eager_bytes = 0)
 {
     TORCH_CHECK(planned_chunk_size == 0 ||
                     (planned_chunk_size >= 16 && planned_chunk_size % 16 == 0),
@@ -5240,7 +5265,7 @@ static std::vector<ChunkInfo> compute_chunks_impl(
     }
     const auto probes = enumerate_chunk_size_domain_impl(
         s, decl_fn, valid_fn, chunk_size_cap, seq_len, base_ctx,
-        /*apply_auto_cap=*/requested_chunk_size == 0);
+        /*apply_auto_cap=*/requested_chunk_size == 0, minimum_eager_bytes);
     const auto first_valid = std::find_if(probes.begin(), probes.end(),
         [](const ChunkSizeProbe& probe) { return probe.valid; });
     const int64_t available = first_valid == probes.end()
@@ -5317,9 +5342,9 @@ static std::vector<ChunkInfo> compute_chunks_impl(
             selected_probe.temporary_bytes = detail::estimate_temporary_total(
                 unsafe_declarations);
             selected_probe.available_bytes = available_temporary_spm_after_reset(
-                unsafe_declarations, s.persistent_allocated_);
+                unsafe_declarations, s.persistent_allocated_, minimum_eager_bytes);
             selected_probe.fits = final_chunk_layout_fits(
-                unsafe_declarations, s.persistent_allocated_);
+                unsafe_declarations, s.persistent_allocated_, minimum_eager_bytes);
         }
         TORCH_CHECK(selected_probe.fits,
             "RPU_PLANNER_REJECT:CAPABILITY: ",
@@ -5423,7 +5448,7 @@ int64_t FusedModelBase::resolve_chunk_size_for_shape(
     int64_t resolved = 0;
     auto chunks = compute_chunks_impl(
         *pimpl_, decl_fn, valid_fn, chunk_size_cap,
-        seq_len, position, layout_ctx, &resolved);
+        seq_len, position, layout_ctx, &resolved, 0, {}, minimum_eager_spm_bytes());
     TORCH_CHECK(
         !chunks.empty(),
         "RPU_PLANNER_REJECT:NO_FEASIBLE: resolve_chunk_size_for_shape: "
@@ -5893,7 +5918,7 @@ FusedModelBase::resolve_prefill_stage_domain_for_shape_impl(
         enumerate_chunk_size_domain_impl(
             *pimpl_, decl_fn, valid_fn, chunk_size_cap, seq_len, base_layout,
             /*apply_auto_cap=*/requested_chunk_size == 0 &&
-                effective_chunk_override == 0);
+                effective_chunk_override == 0, minimum_eager_spm_bytes());
 
     std::vector<FmbPrefillStageCandidate> result;
     result.reserve(probes.size());
@@ -5981,7 +6006,7 @@ FusedModelBase::resolve_prefill_stage_domain_for_shape_impl(
                     candidate_layout, physical_manifest);
                 if (!final_chunk_layout_fits(
                         decl_fn(physical_layout),
-                        pimpl_->persistent_allocated_)) {
+                        pimpl_->persistent_allocated_, minimum_eager_spm_bytes())) {
                     continue;
                 }
                 // Input is a caller-owned physical schedule.  The canonical scalar
@@ -5991,6 +6016,8 @@ FusedModelBase::resolve_prefill_stage_domain_for_shape_impl(
                 admitted.push_back({stage_plan.input.plan.chunk_size,
                                   qkv_chunk_size, compute_chunk_size,
                                   stage_plan, std::move(physical_manifest)});
+                admitted.back().ranking = prefill_candidate_ranking(
+                    admitted.back(), physical_layout);
             }
             return admitted;
         }, &candidate_layout);
@@ -6074,7 +6101,7 @@ FusedModelBase::resolve_spm_pipeline_causal_prefill_shape_for_cpu_contract(
     std::vector<ChunkInfo> chunks = compute_chunks_impl(
         *pimpl_, decl_fn, valid_fn, chunk_size_cap,
         execution_len, /*position=*/0, base_layout,
-        &resolved_chunk_size);
+        &resolved_chunk_size, 0, {}, minimum_eager_spm_bytes());
     TORCH_CHECK(
         !chunks.empty(),
         "RPU_PLANNER_REJECT:NO_FEASIBLE: ", api,
@@ -6128,7 +6155,8 @@ FusedModelBase::resolve_spm_pipeline_causal_prefill_shape_for_cpu_contract(
     allocation_layout.stage_plan_fingerprint =
         fmb_three_stage_chunk_plan_fingerprint(stage_plan);
     validate_final_chunk_layout_fits(
-        decl_fn(allocation_layout), pimpl_->persistent_allocated_, api);
+        decl_fn(allocation_layout), pimpl_->persistent_allocated_, api,
+        minimum_eager_spm_bytes());
     SpmPipelineCausalPrefillShape result;
     result.resolved_chunk_size = resolved_chunk_size;
     result.chunks = std::move(chunks);
@@ -6193,6 +6221,11 @@ SpmPipelineComponentLayout FusedModelBase::prepare_spm_pipeline_component_impl(
         "cancel the dry prepare first");
 
     auto decls = declare_buffers(layout_ctx);
+    if (minimum_eager_spm_bytes() != 0) {
+        validate_final_chunk_layout_fits(
+            decls, pimpl_->persistent_allocated_, "prepare_spm_pipeline_component",
+            minimum_eager_spm_bytes());
+    }
     auto estimate_fn = [this](const LayoutContext& ctx) {
         return detail::estimate_temporary_total(declare_buffers(ctx));
     };
@@ -6423,7 +6456,8 @@ bool FusedModelBase::spm_pipeline_component_layout_fits_for_cpu_contract(
         layout_ctx, stage_plan,
         "spm_pipeline_component_layout_fits_for_cpu_contract");
     return final_chunk_layout_fits(
-        declare_buffers(exact), pimpl_->persistent_allocated_);
+        declare_buffers(exact), pimpl_->persistent_allocated_,
+        minimum_eager_spm_bytes());
 }
 
 SpmPipelineComponentLayout
@@ -6448,6 +6482,15 @@ FusedModelBase::resolve_spm_pipeline_component_layout_for_cpu_contract(
                     planned.required_extent <=
                 SpmAllocator::SPM_PLANNING_BUDGET,
         "FusedModelBase CPU layout planner: layout exceeds SPM budget");
+    if (minimum_eager_spm_bytes() != 0) {
+        const detail::FmbPreparedSpmCost cost{
+            fixed.persistent, fixed.temp_per_layer,
+            detail::estimate_temporary_total(decls)};
+        TORCH_CHECK(cost.fits(SpmAllocator::SPM_USABLE, false,
+                             SpmAllocator::SPM_PLANNING_BUDGET,
+                             minimum_eager_spm_bytes()),
+                    "FusedModelBase CPU layout planner: eager SPM reserve does not fit");
+    }
     const int64_t params_hash = compute_params_hash_impl(
         exact, pimpl_->num_q_heads_, pimpl_->num_kv_heads_,
         pimpl_->head_dim_, pimpl_->hidden_size_,
@@ -6534,6 +6577,16 @@ FusedModelBase::prepare_spm_pipeline_component_for_cpu_contract_impl(
         }
     }
 
+    if (minimum_eager_spm_bytes() != 0) {
+        const FixedSpmOverhead fixed = estimate_fixed_overhead(decls);
+        const detail::FmbPreparedSpmCost cost{
+            fixed.persistent, fixed.temp_per_layer,
+            detail::estimate_temporary_total(decls)};
+        TORCH_CHECK(cost.fits(SpmAllocator::SPM_USABLE, false,
+                             SpmAllocator::SPM_PLANNING_BUDGET,
+                             minimum_eager_spm_bytes()),
+                    "FusedModelBase CPU manifest planner: eager SPM reserve does not fit");
+    }
     TORCH_CHECK(temporary.required_extent <= persistent_floor,
                 "FusedModelBase CPU manifest planner: temporary extent ",
                 temporary.required_extent, " overlaps persistent floor ",
@@ -8973,7 +9026,9 @@ void FusedModelBase::emit_spm_pipeline_composite_run_add(
 
 void FusedModelBase::emit_layer_output_dma(int layer_idx, const ChunkInfo& chunk,
                                            const char* src_buf,
-                                           uint32_t src_offset_bytes)
+                                           uint32_t src_offset_bytes,
+                                           DeferredDmaChannels* deferred,
+                                           bool source_replicated)
 {
     TORCH_CHECK(
         spm_fmb_runtime_member_capability() !=
@@ -8995,7 +9050,7 @@ void FusedModelBase::emit_layer_output_dma(int layer_idx, const ChunkInfo& chunk
     rpu_launch_spm_copy_ddr_dma(
         src_addr + src_offset_bytes, out_tensor,
         chunk_row_offset_(chunk) * pimpl_->hidden_size_,
-        chunk_rows_(chunk) * pimpl_->hidden_size_);
+        chunk_rows_(chunk) * pimpl_->hidden_size_, deferred, source_replicated);
 }
 
 void FusedModelBase::emit_layer_chain_scratch_store(
@@ -9014,6 +9069,89 @@ void FusedModelBase::emit_layer_chain_scratch_store(
         addr(0, src_buf), out_tensor,
         chunk_row_offset_(chunk) * pimpl_->hidden_size_,
         chunk_rows_(chunk) * pimpl_->hidden_size_);
+}
+
+void FusedModelBase::emit_layer_chain_scratch_load(
+    int layer_idx, const ChunkInfo& chunk, const char* dst_buf)
+{
+    TORCH_CHECK(
+        spm_fmb_runtime_member_capability() !=
+            SpmFmbRuntimeMemberCapability::CurrentCallbackDenseDdrRefs,
+        "schema-v12 canonical DMA STOP: legacy layer DMA helper is "
+        "forbidden");
+    TORCH_CHECK(layer_idx >= 0 && layer_idx < pimpl_->num_layers_,
+                "emit_layer_chain_scratch_load layer out of range: ", layer_idx);
+    TORCH_CHECK(pimpl_->ddr_bufA_ptr_ != nullptr && pimpl_->ddr_bufB_ptr_ != nullptr,
+                "emit_layer_chain_scratch_load requires DDR ping-pong buffers");
+    const int64_t batch = pimpl_->ctx_.batch_size;
+    const int64_t hidden = pimpl_->hidden_size_;
+    constexpr int64_t max = std::numeric_limits<int64_t>::max();
+    TORCH_CHECK(batch > 0 && hidden > 0 && chunk.offset >= 0 && chunk.len > 0 &&
+                    chunk.offset <= max / batch && chunk.len <= max / batch,
+                "emit_layer_chain_scratch_load invalid row geometry");
+    const int64_t offset = chunk_row_offset_(chunk);
+    const int64_t rows = chunk_rows_(chunk);
+    TORCH_CHECK(offset <= max / hidden && rows <= max / hidden,
+                "emit_layer_chain_scratch_load element geometry overflows int64");
+    // Match scratch_store even on the final layer: output_tensor_ contains
+    // final-normalized output, not the intermediate residual being reloaded.
+    const at::Tensor& owner = (layer_idx % 2 == 0)
+        ? pimpl_->ddr_bufB_ : pimpl_->ddr_bufA_;
+    rpu_launch_ddr_broadcast_spm_dma(
+        owner, offset * hidden, rows * hidden, addr(0, dst_buf), num_cores());
+}
+
+void FusedModelBase::emit_layer_residual_shard_load(
+    int layer_idx, const ChunkInfo& chunk, const char* dst_buf,
+    bool scratch_output_side)
+{
+    TORCH_CHECK(
+        spm_fmb_runtime_member_capability() !=
+            SpmFmbRuntimeMemberCapability::CurrentCallbackDenseDdrRefs,
+        "schema-v12 canonical DMA STOP: legacy layer DMA helper is forbidden");
+    TORCH_CHECK(layer_idx >= 0 && layer_idx < pimpl_->num_layers_,
+                "emit_layer_residual_shard_load layer out of range");
+    const int64_t batch = pimpl_->ctx_.batch_size;
+    const int64_t hidden = pimpl_->hidden_size_;
+    const int cores = num_cores();
+    constexpr int64_t max = std::numeric_limits<int64_t>::max();
+    TORCH_CHECK(batch > 0 && hidden > 0 && cores >= 1 && cores <= 8 &&
+                    chunk.offset >= 0 && chunk.len > 0 &&
+                    chunk.offset <= max / batch && chunk.len <= max / batch,
+                "emit_layer_residual_shard_load invalid row geometry");
+    const int64_t offset = chunk_row_offset_(chunk);
+    const int64_t rows = chunk_rows_(chunk);
+    TORCH_CHECK(rows % cores == 0 && hidden <= max / 2 &&
+                    offset <= max / (hidden * 2) &&
+                    rows <= max / (hidden * 2) - offset,
+                "emit_layer_residual_shard_load requires complete representable core row shards");
+    const int64_t elements = (rows / cores) * hidden;
+    const int64_t stride = elements * sizeof(c10::Half);
+    TORCH_CHECK(stride % 16 == 0,
+                "emit_layer_residual_shard_load requires aligned core row shards");
+    const uint32_t dst = addr(0, dst_buf);
+    if (layer_idx == 0 && !scratch_output_side) {
+        TORCH_CHECK(pimpl_->ctx_.hidden_states != nullptr,
+                    "emit_layer_residual_shard_load requires the live input owner");
+        consume_shared_runtime_route(
+            pimpl_->ctx_, FmbRouteFamily::MUTABLE_DMA,
+            FMB_SHARED_LAYER_INPUT_SCATTER_DMA_SITE,
+            static_cast<int64_t>(
+                FmbSharedMutableDmaRouteSelector::DDR_SCATTER_TO_SPM),
+            0, {}, cores, mlp_tp());
+        rpu_launch_ddr_scatter_spm_dma_mutable(
+            current_hidden_in_src_base(), *pimpl_->ctx_.hidden_states,
+            offset * hidden * sizeof(c10::Half), elements, stride, dst, cores);
+        return;
+    }
+    TORCH_CHECK(pimpl_->ddr_bufA_ptr_ != nullptr && pimpl_->ddr_bufB_ptr_ != nullptr,
+                "emit_layer_residual_shard_load requires DDR ping-pong buffers");
+    // Scratch load matches scratch_store even at the final layer. Input load
+    // reads the opposite side, populated by the previous layer's output.
+    const bool use_a = (layer_idx % 2 == 0) != scratch_output_side;
+    const at::Tensor& owner = use_a ? pimpl_->ddr_bufA_ : pimpl_->ddr_bufB_;
+    rpu_launch_ddr_scatter_spm_dma(
+        owner, offset * hidden, elements, stride, dst, cores);
 }
 
 const c10::Half* FusedModelBase::stable_layer_input_ddr_ptr(
@@ -10359,10 +10497,14 @@ void FusedModelBase::emit_mlp_pipeline(const at::Tensor& gate_w,
                      gate_weight_spm_addr == 0 && up_weight_spm_addr == 0),
                 "HIGH SiLU/Mul fusion requires the ordinary HIGH SiLU MLP path");
     const int kNumCores = mlp_tp();
-    TORCH_CHECK(num_cores() == 8 || !(down_out_bf16 || residual_is_bf16 ||
-                    fuse_silu_mul || skip_down),
-                "non-eight-core MLP requires the generic FP16 pipeline");
     int64_t elems = seq_len * (pimpl_->intermediate_size_ / kNumCores);
+    const bool reduced_core_silu_mul_ok =
+        fuse_silu_mul && act == ActivationKind::SILU && !acc32 &&
+        !fuse_wall_gate_up && !high_precision_silu_mul &&
+        elems > 0 && elems % 256 == 0;
+    TORCH_CHECK(num_cores() == 8 || !(down_out_bf16 || residual_is_bf16 ||
+                    (fuse_silu_mul && !reduced_core_silu_mul_ok) || skip_down),
+                "non-eight-core MLP requires the generic FP16 pipeline");
 
     TORCH_CHECK(!(down_out_bf16 && residual_is_bf16),
                 "MLP mixed residual transition cannot start from BF16");
@@ -15765,7 +15907,8 @@ at::Tensor FusedModelBase::run_all_layers_impl(
     const auto prepared_layout_fits = [&](const std::vector<BufferDecl>& declarations) {
         return pimpl_->prepared_spm_costs_.prepare(declarations).fits(
             live_after_reset_free(), pimpl_->persistent_allocated_,
-            static_cast<int64_t>(SpmAllocator::SPM_PLANNING_BUDGET));
+            static_cast<int64_t>(SpmAllocator::SPM_PLANNING_BUDGET),
+            minimum_eager_spm_bytes());
     };
 
     std::function<bool(int64_t)> boundary_valid_fn;
@@ -15891,7 +16034,8 @@ at::Tensor FusedModelBase::run_all_layers_impl(
         const int64_t exact_free = live_after_reset_free();
         const int64_t exact_budget = static_cast<int64_t>(SpmAllocator::SPM_PLANNING_BUDGET);
         const int64_t exact_available = exact_cost.available(
-            exact_free, pimpl_->persistent_allocated_, exact_budget);
+            exact_free, pimpl_->persistent_allocated_, exact_budget,
+            minimum_eager_spm_bytes());
         TORCH_CHECK(
             valid_fn(candidate.compute_chunk_size),
             "RPU_PLANNER_REJECT:CAPABILITY: stage descriptor compute "
@@ -15899,7 +16043,8 @@ at::Tensor FusedModelBase::run_all_layers_impl(
             " fails the model/kernel validity contract");
         TORCH_CHECK(
             exact_temporary <= exact_available &&
-                exact_cost.fits(exact_free, pimpl_->persistent_allocated_, exact_budget),
+                exact_cost.fits(exact_free, pimpl_->persistent_allocated_, exact_budget,
+                                minimum_eager_spm_bytes()),
             "RPU_PLANNER_REJECT:CAPABILITY: stage descriptor compute "
             "capacity=", candidate.compute_chunk_size,
             " exceeds the SPM budget: required=", exact_temporary,
@@ -15911,7 +16056,7 @@ at::Tensor FusedModelBase::run_all_layers_impl(
             *pimpl_, decl_fn, valid_fn, chunk_size_cap,
             seq_len, position, layout_ctx,
             &resolved_chunk_size, planned_chunk_size,
-            std::move(boundary_valid_fn));
+            std::move(boundary_valid_fn), minimum_eager_spm_bytes());
     }
     TORCH_CHECK(!chunks.empty(), "FusedModelBase: compute_chunks returned empty list");
     // Planning-only adapter queries must not alter this public observation.
@@ -16173,7 +16318,8 @@ at::Tensor FusedModelBase::run_all_layers_impl(
         RECORD_FUNCTION("rpu_fmb::declare_and_allocate", {});
         auto decls = decl_fn(alloc_ctx);
         validate_final_chunk_layout_fits(
-            decls, pimpl_->persistent_allocated_, "FusedModelBase");
+            decls, pimpl_->persistent_allocated_, "FusedModelBase",
+            minimum_eager_spm_bytes());
         TORCH_CHECK(prepared_layout_fits(decls),
                     "RPU_PLANNER_REJECT:CAPABILITY: FusedModelBase: final joint "
                     "compute/KV_FIRST layout exceeds SPM planning budget");
@@ -16276,6 +16422,10 @@ at::Tensor FusedModelBase::run_all_layers_impl(
         !composite_preload_follower &&
         !skip_clean_preload_callbacks_recording)
         run_preload_callbacks_(pimpl_->last_decls_, *this);
+    else if (skip_preload_callbacks_replay && !pimpl_->resident_preload_priming_)
+        // The skipped walk is where a resident owner re-proves its authority
+        // after step 7; keep that check without the walk.
+        validate_resident_preloads_();
 
     // 9. group count
     int64_t cross_batch = (static_cfg.cross_layer_batch_size > 0)

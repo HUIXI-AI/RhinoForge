@@ -44,7 +44,11 @@
 using namespace at;
 using namespace ::rhino_lkn;
 
-#define NUM_CORES 8
+// Execution cores come from the cold owner topology (num_cores()): 8 by
+// default, or 4/6 for the exact unpadded ViT-B profile. Attention and MLP use
+// that same count. DDR/KV controller striping stays eight lanes at every
+// budget, so the SDPA cache ABI keeps eight virtual cores.
+constexpr int DINO_PHYSICAL_KV_CORES = 8;
 #define DWIDTH 2
 
 // FLASH_ATTN_SPM encodes K/V length in uint16 groups of 16 rows.
@@ -121,6 +125,9 @@ public:
         //   q/k/v/up — col-partition, o/down — row-partition.
         at::Tensor q_w, k_w, v_w, o_w;
         at::Tensor up_w, down_w;
+        // Exact ViT-B W8A16 / W4A16-G32: FP16 scales from set_weight_scales
+        // (INT8 [N] or controller-striped pgrp); undefined for FP16.
+        at::Tensor q_s, k_s, v_s, o_s, up_s, down_s;
     };
 
     struct LayerBiasNorm {
@@ -237,6 +244,17 @@ public:
         check_list_size(gamma_attn_list, "gamma_attn_list");
         check_list_size(gamma_mlp_list,  "gamma_mlp_list");
 
+        // Projections are uniformly FP16, INT8 W8A16 or packed-UINT4 W4A16.
+        // Quantized storage is admitted only for exact ViT-B (12 heads, padded
+        // to 16 at eight cores); its scales arrive through set_weight_scales.
+        const at::ScalarType projection_type =
+            q_w_list[0].defined() ? q_w_list[0].scalar_type() : at::kHalf;
+        TORCH_CHECK(projection_type == at::kHalf ||
+                        ((projection_type == at::kChar || projection_type == at::kByte) &&
+                         N == 12 && hidden_size == 768 && intermediate_size == 3072 &&
+                         head_dim == 64 && num_heads == (num_cores() == 8 ? 16 : 12) &&
+                         !use_acc32_ && !standalone_compatibility_),
+                    "DINOv3 W8A16/W4A16 projections require the exact ACC16 ViT-B tower");
         auto check_rank = [&](const at::TensorList& list, const char* name, int64_t r) {
             for (int64_t i = 0; i < N; i++) {
                 TORCH_CHECK(list[i].defined(),
@@ -244,8 +262,9 @@ public:
                 TORCH_CHECK(list[i].dim() == r,
                             "dinov3_vision_set_weights: ", name, "[", i, "] must be ",
                             r, "D, got ", list[i].dim(), "D");
-                TORCH_CHECK(list[i].scalar_type() == at::kHalf,
-                            "dinov3_vision_set_weights: ", name, "[", i, "] must be fp16");
+                TORCH_CHECK(list[i].scalar_type() == (r == 2 ? projection_type : at::kHalf),
+                            "dinov3_vision_set_weights: ", name, "[", i, "] must be ",
+                            r == 2 ? "uniform projection storage" : "fp16");
                 TORCH_CHECK(list[i].device().type() == at::kPrivateUse1,
                             "dinov3_vision_set_weights: ", name, "[", i, "] must be on device");
                 TORCH_CHECK(list[i].is_contiguous(),
@@ -270,17 +289,18 @@ public:
         check_rank(gamma_attn_list, "gamma_attn_list", 1);
         check_rank(gamma_mlp_list,  "gamma_mlp_list",  1);
 
-        // Per-core attention slice must be exact (no NUM_CORES-dropped heads).
-        // ViT-L/16 (16 heads) maps cleanly; ViT-B/16 (12 heads) must be
-        // pre-padded to 16 heads by the Python adapter (P4.4). Enforced here
-        // to fail fast at set_weights, not later in the kernel sequence.
-        TORCH_CHECK(num_heads % NUM_CORES == 0,
+        // Per-core attention slice must be exact (no core-dropped heads).
+        // At eight cores ViT-L/16 (16 heads) maps cleanly; ViT-B/16 (12 heads)
+        // must be pre-padded to 16 heads by the Python adapter (P4.4). The
+        // cold 4/6-core ViT-B topology splits the 12 heads without padding.
+        // Enforced here to fail fast at set_weights, not later in the kernels.
+        TORCH_CHECK(num_heads % num_cores() == 0,
                     "dinov3_vision_set_weights: num_heads=", num_heads,
-                    " must be divisible by NUM_CORES=", NUM_CORES,
-                    " — ViT-B 12-head must be zero-padded to 16 before this call");
-        TORCH_CHECK(intermediate_size % NUM_CORES == 0,
+                    " must be divisible by the execution cores=", num_cores(),
+                    " — at eight cores ViT-B 12-head must be zero-padded to 16");
+        TORCH_CHECK(intermediate_size % num_cores() == 0,
                     "dinov3_vision_set_weights: intermediate_size=", intermediate_size,
-                    " must be divisible by NUM_CORES=", NUM_CORES);
+                    " must be divisible by the execution cores=", num_cores());
         TORCH_CHECK(head_dim % 4 == 0,
                     "dinov3_vision_set_weights: head_dim=", head_dim,
                     " must be divisible by 4 (rope_2d_ddr kernel constraint)");
@@ -315,6 +335,122 @@ public:
         }
 
         invalidate_model_state();
+    }
+
+    // ========================================================================
+    // Cold execution topology. Must precede set_weights: the Python adapter
+    // swizzles every Linear for this count before installation. Eight keeps
+    // the historical padded 16-head layout. Four and six admit only exact
+    // unpadded ViT-B (12 heads x D64, H768, I3072): attention, MLP and every
+    // replicated norm/eltwise kernel run on the same cores (3 or 2 heads,
+    // 768 or 512 MLP channels per core). The InternVLA DINOv2-S towers
+    // (D64, H384, I1536) run 6 unpadded heads on six cores and the 8-head
+    // padded layout on four (1 or 2 heads, 256 or 384 MLP channels per
+    // core). KV storage keeps eight stripes.
+    // ========================================================================
+    // Uniform W8A16 / W4A16 scales for the installed quantized ViT-B tower.
+    // Every weight/scale pair is checked before any scale is published.
+    void set_weight_scales(
+        at::TensorList q, at::TensorList k, at::TensorList v,
+        at::TensorList o, at::TensorList up, at::TensorList down) {
+        const int64_t n_layers = static_cast<int64_t>(layer_weights_.size());
+        TORCH_CHECK(get_last_resolved_chunk_size() == 0 && n_layers == 12 &&
+                        projection_type() != at::kHalf && !use_acc32_ &&
+                        !standalone_compatibility_ && !has_output_mlp_,
+                    "DINOv3 weight scales require the cold quantized ViT-B tower");
+        for (const auto scales : {q, k, v, o, up, down})
+            TORCH_CHECK(static_cast<int64_t>(scales.size()) == n_layers,
+                        "DINOv3 weight scales require one scale per layer and projection");
+        const bool packed_w4 = projection_type() == at::kByte;
+        const int64_t attention = num_q_heads() * head_dim();
+        const int64_t h = hidden_size(), inter = intermediate_size();
+        const int64_t cores = num_cores();
+        // {N, K, partition} of q, k, v, o, up, down.
+        const int64_t shapes[6][3] = {
+            {attention, h, 1}, {attention, h, 1}, {attention, h, 1},
+            {h, attention, 0}, {inter, h, 1}, {h, inter, 0}};
+        auto ceil_div = [](int64_t a, int64_t b) { return (a + b - 1) / b; };
+        for (int64_t layer = 0; layer < n_layers; ++layer) {
+            const auto& w = layer_weights_[layer];
+            const at::Tensor* weights[] = {&w.q_w, &w.k_w, &w.v_w, &w.o_w, &w.up_w, &w.down_w};
+            const at::Tensor* scales[] = {&q[layer], &k[layer], &v[layer],
+                                          &o[layer], &up[layer], &down[layer]};
+            for (int projection = 0; projection < 6; ++projection) {
+                const auto& weight = *weights[projection];
+                const auto& scale = *scales[projection];
+                const int64_t n = shapes[projection][0], kk = shapes[projection][1];
+                const bool col = shapes[projection][2] == 1;
+                TORCH_CHECK(weight.dim() == 2 && weight.size(0) == n &&
+                                weight.size(1) == (packed_w4 ? kk / 2 : kk) &&
+                                scale.defined() && scale.scalar_type() == at::kHalf &&
+                                scale.device().type() == at::kPrivateUse1 &&
+                                scale.is_contiguous() &&
+                                !scale.is_same(weight),
+                            "DINOv3 W8A16/W4A16 requires the exact projection weight "
+                            "and an independent contiguous FP16 RPU scale");
+                if (packed_w4) {
+                    // Controller-striped G32 pgrp payload, as the launcher reads it.
+                    const int64_t local_n = col ? n / cores : n;
+                    const int64_t local_k = col ? kk : kk / cores;
+                    TORCH_CHECK(scale.dim() == 2 && scale.size(0) == 32 &&
+                                    scale.numel() == ceil_div(local_k / 32, 4) *
+                                        ceil_div(local_n, 64) * cores * 256,
+                                "DINOv3 W4A16 requires the G32 controller-striped scale");
+                } else {
+                    TORCH_CHECK(scale.dim() == 1 && scale.size(0) == n,
+                                "DINOv3 W8A16 requires a per-channel FP16 scale [N]");
+                }
+            }
+        }
+        // Packed W4 scales are retained at the pgrp launcher's cores*512 B
+        // DDR alignment; W8 scales pass through unchanged.
+        auto retain = [cores](const at::Tensor& weight, const at::Tensor& scale) {
+            return rpu_retain_linear_quant_scale(weight, scale, cores);
+        };
+        for (int64_t layer = 0; layer < n_layers; ++layer) {
+            auto& w = layer_weights_[layer];
+            w.q_s = retain(w.q_w, q[layer]); w.k_s = retain(w.k_w, k[layer]);
+            w.v_s = retain(w.v_w, v[layer]); w.o_s = retain(w.o_w, o[layer]);
+            w.up_s = retain(w.up_w, up[layer]); w.down_s = retain(w.down_w, down[layer]);
+        }
+        invalidate_model_state();
+    }
+
+    at::ScalarType projection_type() const {
+        return layer_weights_.empty() ? at::kHalf
+                                      : layer_weights_.front().q_w.scalar_type();
+    }
+
+    void set_execution_cores(int64_t cores) {
+        TORCH_CHECK(cores == 4 || cores == 6 || cores == 8,
+                    "DINOv3 execution cores must be 4, 6 or 8");
+        TORCH_CHECK(layer_weights_.empty(),
+                    "DINOv3 execution cores must precede weight installation");
+        set_execution_core_count(static_cast<int>(cores));
+    }
+
+    std::vector<int64_t> execution_topology() const {
+        TORCH_CHECK(num_layers() > 0 && !layer_weights_.empty(),
+                    "DINOv3 topology requires installed model weights");
+        return {num_cores(), attn_tp(), mlp_tp(), DINO_PHYSICAL_KV_CORES,
+                num_q_heads(), intermediate_size()};
+    }
+
+    DecoderExecutionTopology resolve_model_execution_topology(
+            int64_t nq, int64_t nkv, int64_t hd, int64_t h,
+            int64_t intermediate) const override {
+        if (num_cores() == 8)
+            return FusedModelBase::resolve_model_execution_topology(
+                nq, nkv, hd, h, intermediate);
+        const bool vit_b = nq == 12 && nkv == 12 && hd == 64 && h == 768 &&
+            intermediate == 3072;
+        const bool dinov2_s = nq == nkv && nq == (num_cores() == 6 ? 6 : 8) &&
+            hd == 64 && h == 384 && intermediate == 1536;
+        TORCH_CHECK((num_cores() == 4 || num_cores() == 6) && (vit_b || dinov2_s),
+                    "no admitted reduced-core DINOv3 profile: 4/6 cores require "
+                    "unpadded ViT-B (12 heads, D64, H768, I3072) or DINOv2-S "
+                    "(6 heads on six cores, 8 padded heads on four; D64, H384, I1536)");
+        return {num_cores(), num_cores(), num_cores()};
     }
 
     // ========================================================================
@@ -497,12 +633,12 @@ public:
             // Layer-0 MLP-internal col/row-partition probes (per-core scatter).
             // up_proj output is col-partition [seq, local_inter]; down_proj
             // output is row-partition [seq, h] (full hidden, partial along K).
-            int64_t local_inter = intermediate_size() / NUM_CORES;
+            int64_t local_inter = intermediate_size() / num_cores();
             auto alloc_per_core = [&](at::Tensor& buf, int64_t per_core_dim) {
                 if (!buf.defined() ||
-                    buf.size(0) != NUM_CORES ||
+                    buf.size(0) != num_cores() ||
                     buf.size(1) != st || buf.size(2) != per_core_dim) {
-                    buf = at::empty({(int64_t)NUM_CORES, st, per_core_dim},
+                    buf = at::empty({(int64_t)num_cores(), st, per_core_dim},
                         at::TensorOptions().dtype(at::kHalf).device(at::kPrivateUse1));
                 }
             };
@@ -510,16 +646,16 @@ public:
             alloc_per_core(post_down_partial_debug_buf_, h);
             // Col-partition per-layer probes (per-core SPM "q"/"k"/"v"/"sdpa_out"
             // gathered to DDR via spm_scatter_ddr_dma). Shape
-            // [num_layers, NUM_CORES=8, seq_len, local_q_dim] — extended from
+            // [num_layers, cores, seq_len, local_q_dim] — extended from
             // layer-0-only so hybrid-CPU-SDPA driver can dump each layer's
             // q/k/v after prior layers have been SDPA-corrected.
-            int64_t local_q_dim = (num_q_heads() / NUM_CORES) * head_dim();
+            int64_t local_q_dim = (num_q_heads() / num_cores()) * head_dim();
             auto alloc_qkv = [&](at::Tensor& buf) {
                 if (!buf.defined() ||
                     buf.size(0) != N ||
-                    buf.size(1) != NUM_CORES ||
+                    buf.size(1) != num_cores() ||
                     buf.size(2) != st || buf.size(3) != local_q_dim) {
-                    buf = at::empty({N, (int64_t)NUM_CORES, st, local_q_dim},
+                    buf = at::empty({N, (int64_t)num_cores(), st, local_q_dim},
                         at::TensorOptions().dtype(at::kHalf).device(at::kPrivateUse1));
                 }
             };
@@ -683,23 +819,23 @@ protected:
                    static_cast<int64_t>(DinoVisionRopeRoute::ROPE_2D_DDR),
                    {identity_rope_ ? 1 : 0,
                     chunk.len - DINOV3_VISION_NUM_SPECIAL_TOKENS,
-                    num_q_heads() / NUM_CORES, head_dim(), head_dim(),
-                    NUM_CORES});
+                    num_q_heads() / num_cores(), head_dim(), head_dim(),
+                    num_cores()});
             append(FmbRouteFamily::ROPE, DINO_K_ROPE_DDR_SITE,
                    static_cast<int64_t>(DinoVisionRopeRoute::ROPE_2D_DDR),
                    {identity_rope_ ? 1 : 0,
                     chunk.len - DINOV3_VISION_NUM_SPECIAL_TOKENS,
-                    num_q_heads() / NUM_CORES, head_dim(), head_dim(),
-                    NUM_CORES});
+                    num_q_heads() / num_cores(), head_dim(), head_dim(),
+                    num_cores()});
         }
         const KvInsertSegmentPlan kv_plan =
             resolve_kvinsert_plan_auto(
                 DINO_KV_INSERT_SITE, manifest.graph_lifecycle,
-                position + chunk.offset, chunk.len, chunk.len, NUM_CORES,
+                position + chunk.offset, chunk.len, chunk.len, num_cores(),
                 num_q_heads(), head_dim(), DINO_KV_CAPABILITIES);
         const KvInsertRouteArguments kv_arguments =
             rpu_kvinsert_route_arguments(
-                kv_plan, NUM_CORES, num_q_heads(), head_dim());
+                kv_plan, num_cores(), num_q_heads(), head_dim());
         manifest.routes.push_back({
             DINO_KV_INSERT_SITE, FmbRouteFamily::KV_INSERT,
             static_cast<int64_t>(kv_plan.route()),
@@ -712,7 +848,7 @@ protected:
             const bool hybrid = layer < hybrid_layer_count_ &&
                 hybrid_cpu_sdpa_out_.defined();
             const int64_t per_core_qkv_elems = chunk.len *
-                (num_q_heads() / NUM_CORES) * head_dim();
+                (num_q_heads() / num_cores()) * head_dim();
             if (hybrid) {
                 manifest.routes.push_back({
                     DINO_HYBRID_ATTENTION_SITE,
@@ -720,7 +856,7 @@ protected:
                     static_cast<int64_t>(AttentionExecutionPolicy::DDR_KV),
                     DINO_HYBRID_FLAG_CPU_SDPA_DDR_REQUIRED,
                     {hybrid_layer_count_, chunk.len, num_q_heads(),
-                     head_dim(), NUM_CORES}, layer});
+                     head_dim(), num_cores()}, layer});
                 manifest.routes.push_back({
                     DINO_HYBRID_SDPA_DMA_SITE,
                     FmbRouteFamily::MUTABLE_DMA,
@@ -728,7 +864,7 @@ protected:
                         HYBRID_SDPA_DDR_SCATTER_TO_SPM),
                     DINO_HYBRID_FLAG_CPU_SDPA_DDR_REQUIRED,
                     {hybrid_layer_count_, per_core_qkv_elems,
-                     per_core_qkv_elems * DWIDTH, NUM_CORES}, layer});
+                     per_core_qkv_elems * DWIDTH, num_cores()}, layer});
             } else {
                 const int64_t ddr_flags =
                     (use_16b_sdpa_ ? DINO_ATTENTION_FLAG_USE_16B : 0) |
@@ -746,21 +882,21 @@ protected:
                             : AttentionExecutionPolicy::DDR_KV),
                     raw_spm ? 0 : ddr_flags,
                     {use_16b_sdpa_ ? 1 : 0, hybrid_layer_count_,
-                     chunk.len, num_q_heads(), head_dim(), NUM_CORES}, layer});
+                     chunk.len, num_q_heads(), head_dim(), num_cores()}, layer});
             }
         }
         append(
             FmbRouteFamily::ALL_REDUCE, DINO_ATTN_ALL_REDUCE_SITE,
-            fmb_ring_all_reduce_route_selector(chunk.len, hidden_size()));
+            fmb_ring_all_reduce_route_selector(chunk.len, hidden_size(), num_cores()));
         append(
             FmbRouteFamily::ALL_REDUCE, DINO_MLP_ALL_REDUCE_SITE,
-            fmb_ring_all_reduce_route_selector(chunk.len, hidden_size()));
+            fmb_ring_all_reduce_route_selector(chunk.len, hidden_size(), num_cores()));
         if (has_output_mlp_) {
             append(
                 FmbRouteFamily::ALL_REDUCE,
                 DINO_OUTPUT_MLP_ALL_REDUCE_SITE,
                 fmb_ring_all_reduce_route_selector(
-                    chunk.len, hidden_size()));
+                    chunk.len, hidden_size(), num_cores()));
         }
         if (has_final_norm_) {
             append(
@@ -768,13 +904,13 @@ protected:
                 DINO_FINAL_NORM_GAMMA_PRELOAD_SITE,
                 static_cast<int64_t>(DinoVisionMutableDmaRoute::
                     PRELOAD_DDR_BROADCAST_TO_SPM_ALL_CORES),
-                {has_final_norm_ ? 1 : 0, hidden_size(), NUM_CORES});
+                {has_final_norm_ ? 1 : 0, hidden_size(), num_cores()});
             append(
                 FmbRouteFamily::MUTABLE_DMA,
                 DINO_FINAL_NORM_BETA_PRELOAD_SITE,
                 static_cast<int64_t>(DinoVisionMutableDmaRoute::
                     PRELOAD_DDR_BROADCAST_TO_SPM_ALL_CORES),
-                {has_final_norm_ ? 1 : 0, hidden_size(), NUM_CORES});
+                {has_final_norm_ ? 1 : 0, hidden_size(), num_cores()});
         }
         if (has_output_mlp_) {
             append(
@@ -782,8 +918,8 @@ protected:
                 DINO_OUTPUT_MLP_BIAS1_PRELOAD_SITE,
                 static_cast<int64_t>(DinoVisionMutableDmaRoute::
                     PRELOAD_DDR_SCATTER_TO_SPM),
-                {has_output_mlp_ ? 1 : 0, hidden_size() / NUM_CORES,
-                 hidden_size() / NUM_CORES * DWIDTH, NUM_CORES});
+                {has_output_mlp_ ? 1 : 0, hidden_size() / num_cores(),
+                 hidden_size() / num_cores() * DWIDTH, num_cores()});
             append(
                 FmbRouteFamily::MUTABLE_DMA,
                 DINO_OUTPUT_MLP_BIAS2_PRELOAD_SITE,
@@ -792,7 +928,8 @@ protected:
                 {has_output_mlp_ ? 1 : 0, hidden_size(), 1});
         }
         append_fmb_shared_runtime_routes(
-            manifest, plan, hidden_size(), FMB_SHARED_LAYER_INPUT_DMA);
+            manifest, plan, hidden_size(), FMB_SHARED_LAYER_INPUT_DMA,
+            /*compute_row_multiplier=*/1, num_cores(), mlp_tp());
         std::sort(
             manifest.routes.begin(), manifest.routes.end(),
             [](const FmbRouteManifestEntry& lhs,
@@ -855,7 +992,9 @@ protected:
         const int64_t active_hybrid_layers =
             hybrid_cpu_sdpa_out_.defined()
             ? std::min<int64_t>(hybrid_layer_count_, num_layers()) : 0;
-        return chunk.offset == 0 && chunk.len == 201 &&
+        // Raw SPM attention is the exact eight-core padded 16-head profile;
+        // reduced 4/6-core ViT-B keeps the DDR KV route.
+        return num_cores() == 8 && chunk.offset == 0 && chunk.len == 201 &&
             chunk.kv_seq_len == 201 &&
             plan.input.chunks.front().offset == 0 &&
             plan.input.chunks.front().len == 201 &&
@@ -869,7 +1008,7 @@ protected:
             head_dim() == 64 && orig_head_dim_ == 64 &&
             sdpa_by_mha_spm_is_valid(
                 /*batch=*/1, /*seq_q=*/201, /*seq_k=*/201,
-                num_q_heads(), num_kv_heads(), head_dim(), NUM_CORES,
+                num_q_heads(), num_kv_heads(), head_dim(), num_cores(),
                 /*MASK_NONE=*/0);
     }
 
@@ -880,9 +1019,9 @@ protected:
         const int64_t hd   = head_dim();
         const int64_t is_  = intermediate_size();
 
-        const int64_t local_q_dim = (nq / NUM_CORES) * hd;
-        const int64_t local_inter = is_ / NUM_CORES;
-        const int64_t local_hidden = h / NUM_CORES;
+        const int64_t local_q_dim = (nq / num_cores()) * hd;
+        const int64_t local_inter = is_ / num_cores();
+        const int64_t local_hidden = h / num_cores();
         auto A = [](int64_t bytes) -> int64_t { return Align(bytes, 256); };
 
         const int64_t res   = A(cs * h * DWIDTH);
@@ -894,9 +1033,9 @@ protected:
 
         SdpaConfig sdpa_cfg{SdpaKernelType::FLASH_ATTN_SPM,
                             hd, /*nq=*/nq, /*nkv=*/nq,
-                            /*cores=*/NUM_CORES, /*mask=*/0};
+                            /*cores=*/num_cores(), /*mask=*/0};
         const SdpaTiling t = sdpa_compute_tiling(sdpa_cfg, cs);
-        const int64_t nkv_per_core = CeilDiv(nq, (int64_t)NUM_CORES);
+        const int64_t nkv_per_core = CeilDiv(nq, (int64_t)num_cores());
         int64_t sdpa_tmp =
             A(t.tile_n_v16 * t.tile_k * nkv_per_core * CeilDiv(cs, t.tile_m) * 32);
         if (raw_spm) {
@@ -1000,67 +1139,67 @@ protected:
 
     void emit_preload_weights() {
         const int64_t h = hidden_size();
-        const int64_t local_q_dim = (num_q_heads() / NUM_CORES) * head_dim();
-        const int64_t local_inter = intermediate_size() / NUM_CORES;
+        const int64_t local_q_dim = (num_q_heads() / num_cores()) * head_dim();
+        const int64_t local_inter = intermediate_size() / num_cores();
 
-        // Loop 1: 8-core DMAs for all layers (memset broadcast-bias slots,
+        // Loop 1: all-core DMAs for all layers (memset broadcast-bias slots,
         // broadcast norm γ/β and γ_attn/γ_mlp, scatter col-partition biases).
         for (int64_t L = 0; L < num_layers(); ++L) {
             const auto& bn = layer_bias_norm_[L];
 
-            // Memset o_bias / down_bias slots across all 8 cores; the real
+            // Memset o_bias / down_bias slots across all cores; the real
             // bias is broadcast-DMAd to core 0 only in Loop 2 below (so the
             // bias contribution comes in once during AllReduce-sum-residual,
-            // not 8× — same pattern as qwen3_vl).
-            rpu_launch_memset_spm_multicore(layer_addr(L, 0, "o_bias"), h);
-            rpu_launch_memset_spm_multicore(layer_addr(L, 0, "down_bias"), h);
+            // not once per core — same pattern as qwen3_vl).
+            rpu_launch_memset_spm_multicore(layer_addr(L, 0, "o_bias"), h, num_cores());
+            rpu_launch_memset_spm_multicore(layer_addr(L, 0, "down_bias"), h, num_cores());
 
             // k_bias slot is permanently zeroed (DINOv3 k_proj bias=None).
             // DINOv2 also uses this zero slot: its fused-QKV key bias adds a
             // query-independent row constant to QK^T, which softmax cancels.
             rpu_launch_memset_spm_multicore(layer_addr(L, 0, "k_bias"),
-                                             local_q_dim);
+                                             local_q_dim, num_cores());
 
             // LayerNorm γ/β: broadcast to every core.
             rpu_launch_ddr_broadcast_spm_dma(
                 bn.ln1_w.data_ptr<c10::Half>(), h,
-                layer_addr(L, 0, "ln1_gamma"));
+                layer_addr(L, 0, "ln1_gamma"), num_cores());
             rpu_launch_ddr_broadcast_spm_dma(
                 bn.ln1_b.data_ptr<c10::Half>(), h,
-                layer_addr(L, 0, "ln1_beta"));
+                layer_addr(L, 0, "ln1_beta"), num_cores());
             rpu_launch_ddr_broadcast_spm_dma(
                 bn.ln2_w.data_ptr<c10::Half>(), h,
-                layer_addr(L, 0, "ln2_gamma"));
+                layer_addr(L, 0, "ln2_gamma"), num_cores());
             rpu_launch_ddr_broadcast_spm_dma(
                 bn.ln2_b.data_ptr<c10::Half>(), h,
-                layer_addr(L, 0, "ln2_beta"));
+                layer_addr(L, 0, "ln2_beta"), num_cores());
 
             // LayerScale γ_attn / γ_mlp: broadcast to every core so the
             // eltwise 1xC_NxC kernel in phase 4 / 7 can read [1, hidden]
             // from each core's local SPM.
             rpu_launch_ddr_broadcast_spm_dma(
                 bn.gamma_attn.data_ptr<c10::Half>(), h,
-                layer_addr(L, 0, "gamma_attn"));
+                layer_addr(L, 0, "gamma_attn"), num_cores());
             rpu_launch_ddr_broadcast_spm_dma(
                 bn.gamma_mlp.data_ptr<c10::Half>(), h,
-                layer_addr(L, 0, "gamma_mlp"));
+                layer_addr(L, 0, "gamma_mlp"), num_cores());
 
             // Col-partition biases: scatter to per-core slots.
             rpu_launch_ddr_scatter_spm_dma(
                 bn.q_b.data_ptr<c10::Half>(),
                 local_q_dim, local_q_dim * DWIDTH,
                 layer_addr(L, 0, "q_bias"),
-                /*num_cores=*/NUM_CORES);
+                /*num_cores=*/num_cores());
             rpu_launch_ddr_scatter_spm_dma(
                 bn.v_b.data_ptr<c10::Half>(),
                 local_q_dim, local_q_dim * DWIDTH,
                 layer_addr(L, 0, "v_bias"),
-                /*num_cores=*/NUM_CORES);
+                /*num_cores=*/num_cores());
             rpu_launch_ddr_scatter_spm_dma(
                 bn.up_b.data_ptr<c10::Half>(),
                 local_inter, local_inter * DWIDTH,
                 layer_addr(L, 0, "up_bias"),
-                /*num_cores=*/NUM_CORES);
+                /*num_cores=*/num_cores());
         }
 
         if (has_final_norm_) {
@@ -1070,34 +1209,34 @@ protected:
                 static_cast<int64_t>(DinoVisionMutableDmaRoute::
                     PRELOAD_DDR_BROADCAST_TO_SPM_ALL_CORES),
                 /*resolved_flags=*/0,
-                {has_final_norm_ ? 1 : 0, h, NUM_CORES});
+                {has_final_norm_ ? 1 : 0, h, num_cores()});
             rpu_launch_ddr_broadcast_spm_dma(
                 final_norm_w_.data_ptr<c10::Half>(), h,
-                addr(0, "final_norm_gamma"));
+                addr(0, "final_norm_gamma"), num_cores());
             ctx().consume_physical_route(
                 FmbRouteFamily::MUTABLE_DMA,
                 DINO_FINAL_NORM_BETA_PRELOAD_SITE,
                 static_cast<int64_t>(DinoVisionMutableDmaRoute::
                     PRELOAD_DDR_BROADCAST_TO_SPM_ALL_CORES),
                 /*resolved_flags=*/0,
-                {has_final_norm_ ? 1 : 0, h, NUM_CORES});
+                {has_final_norm_ ? 1 : 0, h, num_cores()});
             rpu_launch_ddr_broadcast_spm_dma(
                 final_norm_b_.data_ptr<c10::Half>(), h,
-                addr(0, "final_norm_beta"));
+                addr(0, "final_norm_beta"), num_cores());
         }
         if (has_output_mlp_) {
-            rpu_launch_memset_spm_multicore(addr(0, "output_mlp_b2"), h);
+            rpu_launch_memset_spm_multicore(addr(0, "output_mlp_b2"), h, num_cores());
             ctx().consume_physical_route(
                 FmbRouteFamily::MUTABLE_DMA,
                 DINO_OUTPUT_MLP_BIAS1_PRELOAD_SITE,
                 static_cast<int64_t>(DinoVisionMutableDmaRoute::
                     PRELOAD_DDR_SCATTER_TO_SPM),
                 /*resolved_flags=*/0,
-                {has_output_mlp_ ? 1 : 0, h / NUM_CORES,
-                 h / NUM_CORES * DWIDTH, NUM_CORES});
+                {has_output_mlp_ ? 1 : 0, h / num_cores(),
+                 h / num_cores() * DWIDTH, num_cores()});
             rpu_launch_ddr_scatter_spm_dma(
-                output_mlp_b1_.data_ptr<c10::Half>(), h / NUM_CORES,
-                h / NUM_CORES * DWIDTH, addr(0, "output_mlp_b1"), NUM_CORES);
+                output_mlp_b1_.data_ptr<c10::Half>(), h / num_cores(),
+                h / num_cores() * DWIDTH, addr(0, "output_mlp_b1"), num_cores());
             ctx().consume_physical_route(
                 FmbRouteFamily::MUTABLE_DMA,
                 DINO_OUTPUT_MLP_BIAS2_PRELOAD_SITE,
@@ -1112,15 +1251,26 @@ protected:
 
         // Loop 2: 1-core DMAs for row-partition biases (o_b / down_b apply
         // once in the AllReduce-sum, hence broadcast-DMA only on core 0).
+        // Packed W4 adds them after the AllReduce instead, so every core
+        // holds the full bias.
+        const int row_bias_cores = projection_type() == at::kByte ? num_cores() : 1;
         for (int64_t L = 0; L < num_layers(); ++L) {
             const auto& bn = layer_bias_norm_[L];
             rpu_launch_ddr_broadcast_spm_dma(
                 bn.o_b.data_ptr<c10::Half>(), h,
-                layer_addr(L, 0, "o_bias"), /*num_cores=*/1);
+                layer_addr(L, 0, "o_bias"), row_bias_cores);
             rpu_launch_ddr_broadcast_spm_dma(
                 bn.down_b.data_ptr<c10::Half>(), h,
-                layer_addr(L, 0, "down_bias"), /*num_cores=*/1);
+                layer_addr(L, 0, "down_bias"), row_bias_cores);
         }
+    }
+
+    // Packed W4 refuses an in-kernel row-partition bias before the
+    // cross-core sum; add the full bias once to the reduced rows.
+    void emit_reduced_row_bias(uint32_t bias, uint32_t rows, int64_t seq_len) {
+        rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
+            bias, rows, rows, seq_len, hidden_size(), c10::Half(1.0f),
+            ValuOpType::ADD, /*is_bopa=*/false, num_cores());
     }
 
     void build_layer_subgraph(int layer_idx, const ChunkInfo& chunk) override {
@@ -1130,29 +1280,38 @@ protected:
         const int64_t nq = num_q_heads();
         const int64_t hd = head_dim();
         const int64_t is_ = intermediate_size();
-        const int64_t local_inter = is_ / NUM_CORES;
-        const int64_t local_q_dim = (nq / NUM_CORES) * hd;
+        const int64_t local_inter = is_ / num_cores();
+        const int64_t local_q_dim = (nq / num_cores()) * hd;
 
         const int64_t num_patches = seq_len - DINOV3_VISION_NUM_SPECIAL_TOKENS;
         const int64_t skip_bytes =
             DINOV3_VISION_NUM_SPECIAL_TOKENS * local_q_dim * DWIDTH;
+        // Quantized projections carry their FP16 scale; packed W4 row
+        // projections take no in-kernel bias (added after the AllReduce).
+        const bool reduced_row_bias = projection_type() == at::kByte;
         auto launch_linear = [&](uint32_t input, const at::Tensor& weight,
+                                 const at::Tensor& scale,
                                  uint32_t output, int64_t M, int64_t N,
                                  int64_t K, int partition, uint32_t bias) {
+            TORCH_CHECK(weight.scalar_type() == at::kHalf ||
+                            (scale.defined() && !use_acc32_),
+                        "DINOv3 quantized projections require their scales and ACC16");
+            if (weight.scalar_type() == at::kByte && partition == 0) bias = 0;
             if (use_acc32_) {
                 ctx().consume_physical_route(
                     FmbRouteFamily::LINEAR, DINO_LINEAR_ACC32_SITE,
                     static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
                     /*resolved_flags=*/0, {use_acc32_ ? 1 : 0});
                 rpu_launch_linear_spm_to_spm_kernel(
-                    input, weight, output, M, N, K, partition, NUM_CORES, bias);
+                    input, weight, output, M, N, K, partition, num_cores(), bias);
             } else {
                 ctx().consume_physical_route(
                     FmbRouteFamily::LINEAR, DINO_LINEAR_ACC16_SITE,
                     static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
                     /*resolved_flags=*/0, {use_acc32_ ? 1 : 0});
                 rpu_launch_linear_spm_to_spm_acc16_kernel(
-                    input, weight, output, M, N, K, partition, NUM_CORES, bias);
+                    input, weight, output, M, N, K, partition, num_cores(), bias,
+                    scale);
             }
         };
 
@@ -1175,7 +1334,7 @@ protected:
         // region, and the next forward initializes it again.
         if (layer_idx == 0) {
             rpu_launch_memset_spm_multicore(addr(0, "zero_residual"),
-                                             seq_len * h);
+                                             seq_len * h, num_cores());
         }
 
         ctx().consume_physical_route(
@@ -1183,7 +1342,7 @@ protected:
         rpu_launch_layernorm_selected_spm_kernel(
             addr(0, "residual1"), addr(0, "input_norm"),
             layer_addr(layer_idx, 0, "ln1_gamma"), layer_addr(layer_idx, 0, "ln1_beta"),
-            seq_len, h, eps_, false, 0, NUM_CORES);
+            seq_len, h, eps_, false, 0, num_cores());
 
         // [DEBUG] Layer-0 post-LN1 probe — broadcast-replicated, read core 0.
         if (layer_idx == 0 && get_debug_export() && post_ln1_debug_buf_.defined()) {
@@ -1196,17 +1355,17 @@ protected:
         // Phase 2: Q / K / V Linear with bias (col-partition).
         // k_bias slot is preload-zeroed (DINOv3 k_proj bias=None).
         const int64_t per_core_qkv_elems = seq_len * local_q_dim;
-        const int64_t per_layer_qkv_elems = NUM_CORES * per_core_qkv_elems;
+        const int64_t per_layer_qkv_elems = num_cores() * per_core_qkv_elems;
         launch_linear(
-            addr(0, "input_norm"), lw.q_w, addr(0, "q"),
+            addr(0, "input_norm"), lw.q_w, lw.q_s, addr(0, "q"),
             seq_len, nq * hd, h, 1,
             layer_addr(layer_idx, 0, "q_bias"));
         launch_linear(
-            addr(0, "input_norm"), lw.k_w, addr(0, "k"),
+            addr(0, "input_norm"), lw.k_w, lw.k_s, addr(0, "k"),
             seq_len, nq * hd, h, 1,
             layer_addr(layer_idx, 0, "k_bias"));
         launch_linear(
-            addr(0, "input_norm"), lw.v_w, addr(0, "v"),
+            addr(0, "input_norm"), lw.v_w, lw.v_s, addr(0, "v"),
             seq_len, nq * hd, h, 1,
             layer_addr(layer_idx, 0, "v_bias"));
 
@@ -1217,14 +1376,14 @@ protected:
         // tokens starting at `addr(0, "q") + skip_bytes` (i.e., the patch slice
         // within the per-core Q SPM buffer). Same for K.
         if (num_patches > 0 && !identity_rope_) {
-            const int64_t local_heads = nq / NUM_CORES;
+            const int64_t local_heads = nq / num_cores();
             const int64_t head_dim_pad = hd;  // head_dim=64, no padding.
             ctx().consume_physical_route(
                 FmbRouteFamily::ROPE, DINO_Q_ROPE_DDR_SITE,
                 static_cast<int64_t>(DinoVisionRopeRoute::ROPE_2D_DDR),
                 /*resolved_flags=*/0,
                 {identity_rope_ ? 1 : 0, num_patches, local_heads, hd,
-                 head_dim_pad, NUM_CORES});
+                 head_dim_pad, num_cores()});
             rpu_launch_rope_2d_ddr_kernel(
                 addr(0, "q") + skip_bytes, addr(0, "q") + skip_bytes,
                 freq_cos_.data_ptr<c10::Half>(),
@@ -1232,13 +1391,13 @@ protected:
                 position_idx_keepalive_.data_ptr<int16_t>(),
                 /*pos_offset=*/0,
                 num_patches,
-                local_heads, hd, head_dim_pad, NUM_CORES);
+                local_heads, hd, head_dim_pad, num_cores());
             ctx().consume_physical_route(
                 FmbRouteFamily::ROPE, DINO_K_ROPE_DDR_SITE,
                 static_cast<int64_t>(DinoVisionRopeRoute::ROPE_2D_DDR),
                 /*resolved_flags=*/0,
                 {identity_rope_ ? 1 : 0, num_patches, local_heads, hd,
-                 head_dim_pad, NUM_CORES});
+                 head_dim_pad, num_cores()});
             rpu_launch_rope_2d_ddr_kernel(
                 addr(0, "k") + skip_bytes, addr(0, "k") + skip_bytes,
                 freq_cos_.data_ptr<c10::Half>(),
@@ -1246,27 +1405,27 @@ protected:
                 position_idx_keepalive_.data_ptr<int16_t>(),
                 /*pos_offset=*/0,
                 num_patches,
-                local_heads, hd, head_dim_pad, NUM_CORES);
+                local_heads, hd, head_dim_pad, num_cores());
         }
 
-        // [DEBUG] Per-layer post-Q/K/V probe (post-RoPE). Gather 8 cores' SPM
-        // slice into a per-layer offset in the [N, 8, seq, local_q_dim] buf.
+        // [DEBUG] Per-layer post-Q/K/V probe (post-RoPE). Gather every core's SPM
+        // slice into a per-layer offset in the [N, cores, seq, local_q_dim] buf.
         if (get_debug_export() && post_q_debug_buf_.defined()) {
             c10::Half* q_base = post_q_debug_buf_.data_ptr<c10::Half>()
                                 + layer_idx * per_layer_qkv_elems;
             rpu_launch_spm_scatter_ddr_dma(
                 addr(0, "q"), q_base,
-                per_core_qkv_elems, per_core_qkv_elems * (int64_t)DWIDTH, NUM_CORES);
+                per_core_qkv_elems, per_core_qkv_elems * (int64_t)DWIDTH, num_cores());
             c10::Half* k_base = post_k_debug_buf_.data_ptr<c10::Half>()
                                 + layer_idx * per_layer_qkv_elems;
             rpu_launch_spm_scatter_ddr_dma(
                 addr(0, "k"), k_base,
-                per_core_qkv_elems, per_core_qkv_elems * (int64_t)DWIDTH, NUM_CORES);
+                per_core_qkv_elems, per_core_qkv_elems * (int64_t)DWIDTH, num_cores());
             c10::Half* v_base = post_v_debug_buf_.data_ptr<c10::Half>()
                                 + layer_idx * per_layer_qkv_elems;
             rpu_launch_spm_scatter_ddr_dma(
                 addr(0, "v"), v_base,
-                per_core_qkv_elems, per_core_qkv_elems * (int64_t)DWIDTH, NUM_CORES);
+                per_core_qkv_elems, per_core_qkv_elems * (int64_t)DWIDTH, num_cores());
         }
 
         // Phase 3: KV cache insert (position=0 always for vision) + bidir SDPA.
@@ -1276,7 +1435,7 @@ protected:
             FmbRouteFamily::KV_INSERT, DINO_KV_INSERT_SITE, chunk.idx);
         const KvInsertSegmentPlan kv_plan =
             restore_kvinsert_plan(
-                DINO_KV_INSERT_SITE, kv_route.arguments, NUM_CORES, nq, hd);
+                DINO_KV_INSERT_SITE, kv_route.arguments, num_cores(), nq, hd);
         TORCH_CHECK(
             kv_plan.logical_rows() == seq_len &&
                 kv_plan.physical_rows() == seq_len &&
@@ -1289,7 +1448,7 @@ protected:
         rpu_launch_insert_kvcache_spm_unified_with_plan(
             k_cache, v_cache,
             addr_offset("k").value, addr_offset("v").value,
-            nq, hd, NUM_CORES,
+            nq, hd, num_cores(),
             /*k_cache_batch_offset_elems=*/0,
             /*v_cache_batch_offset_elems=*/0,
             /*spm_rows=*/0, kv_plan);
@@ -1309,7 +1468,7 @@ protected:
                 DINO_HYBRID_ATTENTION_SITE,
                 static_cast<int64_t>(AttentionExecutionPolicy::DDR_KV),
                 DINO_HYBRID_FLAG_CPU_SDPA_DDR_REQUIRED,
-                {hybrid_layer_count_, seq_len, nq, hd, NUM_CORES},
+                {hybrid_layer_count_, seq_len, nq, hd, num_cores()},
                 layer_idx);
             ctx().consume_physical_route(
                 FmbRouteFamily::MUTABLE_DMA,
@@ -1318,11 +1477,11 @@ protected:
                     HYBRID_SDPA_DDR_SCATTER_TO_SPM),
                 DINO_HYBRID_FLAG_CPU_SDPA_DDR_REQUIRED,
                 {hybrid_layer_count_, per_core_qkv_elems,
-                 per_core_qkv_elems * DWIDTH, NUM_CORES}, layer_idx);
+                 per_core_qkv_elems * DWIDTH, num_cores()}, layer_idx);
             rpu_launch_ddr_scatter_spm_dma(
                 src, per_core_qkv_elems,
                 per_core_qkv_elems * (int64_t)DWIDTH,
-                addr(0, "sdpa_out"), NUM_CORES);
+                addr(0, "sdpa_out"), num_cores());
         } else {
             const double attn_scale =
                 1.0 / std::sqrt(static_cast<double>(orig_head_dim_));
@@ -1339,16 +1498,16 @@ protected:
                     static_cast<int64_t>(
                         AttentionExecutionPolicy::SPM_KV_BY_MHA),
                     /*resolved_flags=*/0,
-                    {0, hybrid_layer_count_, seq_len, nq, hd, NUM_CORES},
+                    {0, hybrid_layer_count_, seq_len, nq, hd, num_cores()},
                     layer_idx);
                 rpu_launch_v_transpose_spm(
                     addr(0, "v"), addr(0, "sdpa_tmp"),
-                    /*batch=*/1, seq_len, nq, hd, NUM_CORES);
+                    /*batch=*/1, seq_len, nq, hd, num_cores());
                 rpu_launch_sdpa_by_mha_spm(
                     addr(0, "q"), addr(0, "k"), addr(0, "sdpa_tmp"),
                     addr(0, "sdpa_out"), /*mask_spm=*/0,
                     /*MASK_NONE=*/0, attn_scale, /*batch=*/1,
-                    seq_len, seq_len, nq, nq, hd, NUM_CORES);
+                    seq_len, seq_len, nq, nq, hd, num_cores());
             } else if (use_16b_sdpa_) {
                 const int64_t flags = DINO_ATTENTION_FLAG_USE_16B |
                     DINO_ATTN_CAPABILITY_FALLBACK_DDR_REQUIRED;
@@ -1357,7 +1516,7 @@ protected:
                     static_cast<int64_t>(AttentionExecutionPolicy::DDR_KV),
                     flags,
                     {use_16b_sdpa_ ? 1 : 0, hybrid_layer_count_, seq_len,
-                     nq, hd, NUM_CORES},
+                     nq, hd, num_cores()},
                     layer_idx);
                 rpu_launch_sdpa_spm_unified_kernel_v2(
                     k_cache, v_cache,
@@ -1366,7 +1525,7 @@ protected:
                     addr_offset("sdpa_out").value,
                     addr_offset("sdpa_tmp").value, 0,
                     seq_len, nq, nq, hd,
-                    seq_len, NUM_CORES, NUM_CORES,
+                    seq_len, num_cores(), DINO_PHYSICAL_KV_CORES,
                     /*cache_batch_offset_elems=*/0,
                     /*use_16b=*/true);
             } else {
@@ -1384,7 +1543,7 @@ protected:
                     raw_profile
                         ? 0
                         : DINO_ATTN_CAPABILITY_FALLBACK_DDR_REQUIRED,
-                    {0, hybrid_layer_count_, seq_len, nq, hd, NUM_CORES},
+                    {0, hybrid_layer_count_, seq_len, nq, hd, num_cores()},
                     layer_idx);
                 rpu_launch_sdpa_spm_unified_kernel_v2(
                     k_cache, v_cache,
@@ -1393,7 +1552,7 @@ protected:
                     addr_offset("sdpa_out").value,
                     addr_offset("sdpa_tmp").value, 0,
                     seq_len, nq, nq, hd,
-                    seq_len, NUM_CORES, NUM_CORES,
+                    seq_len, num_cores(), DINO_PHYSICAL_KV_CORES,
                     /*cache_batch_offset_elems=*/0,
                     /*use_16b=*/false);
             }
@@ -1405,7 +1564,7 @@ protected:
                                    + layer_idx * per_layer_qkv_elems;
             rpu_launch_spm_scatter_ddr_dma(
                 addr(0, "sdpa_out"), sdpa_base,
-                per_core_qkv_elems, per_core_qkv_elems * (int64_t)DWIDTH, NUM_CORES);
+                per_core_qkv_elems, per_core_qkv_elems * (int64_t)DWIDTH, num_cores());
         }
 
         // Phase 4: O_proj (row-partition, with bias)
@@ -1421,15 +1580,19 @@ protected:
         // the sum in normal fp16 before the one γ scaling, matching HF math.
         const int64_t num_elems_full = seq_len * h;
         launch_linear(
-            addr(0, "sdpa_out"), lw.o_w, addr(0, "oproj"),
+            addr(0, "sdpa_out"), lw.o_w, lw.o_s, addr(0, "oproj"),
             seq_len, h, nq * hd, 0,
             layer_addr(layer_idx, 0, "o_bias"));
         consume_manifest_route(
             FmbRouteFamily::ALL_REDUCE, DINO_ATTN_ALL_REDUCE_SITE,
-            fmb_ring_all_reduce_route_selector(seq_len, h));
+            fmb_ring_all_reduce_route_selector(seq_len, h, num_cores()));
         rpu_launch_all_reduce_sum_residual_kernel(
             addr(0, "oproj"), addr(0, "zero_residual"), addr(0, "input_norm"),
-            seq_len, h, NUM_CORES, NUM_CORES);
+            seq_len, h, num_cores(), num_cores());
+        if (reduced_row_bias) {
+            emit_reduced_row_bias(
+                layer_addr(layer_idx, 0, "o_bias"), addr(0, "input_norm"), seq_len);
+        }
         // [DEBUG] Layer-0 post-OProj-AR probe — raw attn output (= attn(LN1(x)))
         // before LayerScale1 / residual. Reading 'input_norm' here is exactly
         // the AllReduce sum of per-core O_proj partials (broadcast).
@@ -1442,10 +1605,11 @@ protected:
         rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
             layer_addr(layer_idx, 0, "gamma_attn"),
             addr(0, "input_norm"), addr(0, "input_norm"),
-            seq_len, h, c10::Half(1.0f), ValuOpType::MUL, /*is_bopa=*/false);
+            seq_len, h, c10::Half(1.0f), ValuOpType::MUL, /*is_bopa=*/false,
+            num_cores());
         rpu_launch_eltwise_binary_spm_kernel(
             addr(0, "input_norm"), addr(0, "residual1"), addr(0, "input_norm"),
-            num_elems_full, ValuOpType::ADD, c10::Half(1.0f), NUM_CORES);
+            num_elems_full, ValuOpType::ADD, c10::Half(1.0f), num_cores());
 
         // [DEBUG] Layer-0 post-attn-block probe (input_norm = γ_attn·AR(Oproj)+residual1).
         if (layer_idx == 0 && get_debug_export() && post_attn_block_debug_buf_.defined()) {
@@ -1461,7 +1625,7 @@ protected:
         rpu_launch_layernorm_selected_spm_kernel(
             addr(0, "input_norm"), addr(0, "oproj"),
             layer_addr(layer_idx, 0, "ln2_gamma"), layer_addr(layer_idx, 0, "ln2_beta"),
-            seq_len, h, eps_, false, 0, NUM_CORES);
+            seq_len, h, eps_, false, 0, num_cores());
 
         // [DEBUG] Layer-0 post-LN2 probe — broadcast-replicated, read core 0.
         if (layer_idx == 0 && get_debug_export() && post_ln2_debug_buf_.defined()) {
@@ -1475,12 +1639,12 @@ protected:
         // HF DINOv3 default hidden_act = "gelu" (exact, NOT tanh-approx) per
         // configuration_dinov3_vit.py, so select the explicit erf formula.
         launch_linear(
-            addr(0, "oproj"), lw.up_w, addr(0, "up_buf"),
+            addr(0, "oproj"), lw.up_w, lw.up_s, addr(0, "up_buf"),
             seq_len, is_, h, 1,
             layer_addr(layer_idx, 0, "up_bias"));
         rpu_launch_eltwise_unary_spm_kernel(
             addr(0, "up_buf"), addr(0, "up_buf"),
-            seq_len * local_inter, ValuOpType::ADD, GeluMode::ERF, NUM_CORES);
+            seq_len * local_inter, ValuOpType::ADD, GeluMode::ERF, num_cores());
 
         // [DEBUG] Layer-0 post-up_proj+GELU probe (col-partition scatter).
         if (layer_idx == 0 && get_debug_export() && post_up_proj_debug_buf_.defined()) {
@@ -1488,7 +1652,7 @@ protected:
                 addr(0, "up_buf"),
                 post_up_proj_debug_buf_.data_ptr<c10::Half>(),
                 seq_len * local_inter,
-                seq_len * local_inter * (int64_t)DWIDTH, NUM_CORES);
+                seq_len * local_inter * (int64_t)DWIDTH, num_cores());
         }
 
         // Phase 7: down_proj (row-partition, with bias)
@@ -1498,28 +1662,32 @@ protected:
         //            for next layer's LN1 under SPM_RESIDENT mode).
         // Same fp16-subnormal reasoning as Phase 4 (P4.5 finding).
         launch_linear(
-            addr(0, "up_buf"), lw.down_w, addr(0, "oproj"),
+            addr(0, "up_buf"), lw.down_w, lw.down_s, addr(0, "oproj"),
             seq_len, h, is_, 0,
             layer_addr(layer_idx, 0, "down_bias"));
 
         // [DEBUG] Layer-0 post-down_proj per-core partial probe (BEFORE AR).
         // Each core holds the full [seq, h] but partial-sum over its slice of
-        // the K=intermediate dim. Gather all 8 cores' partials so Python can
+        // the K=intermediate dim. Gather every core's partials so Python can
         // distinguish per-core overflow vs AR-sum overflow.
         if (layer_idx == 0 && get_debug_export() && post_down_partial_debug_buf_.defined()) {
             rpu_launch_spm_scatter_ddr_dma(
                 addr(0, "oproj"),
                 post_down_partial_debug_buf_.data_ptr<c10::Half>(),
                 seq_len * h,
-                seq_len * h * (int64_t)DWIDTH, NUM_CORES);
+                seq_len * h * (int64_t)DWIDTH, num_cores());
         }
 
         consume_manifest_route(
             FmbRouteFamily::ALL_REDUCE, DINO_MLP_ALL_REDUCE_SITE,
-            fmb_ring_all_reduce_route_selector(seq_len, h));
+            fmb_ring_all_reduce_route_selector(seq_len, h, num_cores()));
         rpu_launch_all_reduce_sum_residual_kernel(
             addr(0, "oproj"), addr(0, "zero_residual"), addr(0, "residual1"),
-            seq_len, h, NUM_CORES, NUM_CORES);
+            seq_len, h, num_cores(), num_cores());
+        if (reduced_row_bias) {
+            emit_reduced_row_bias(
+                layer_addr(layer_idx, 0, "down_bias"), addr(0, "residual1"), seq_len);
+        }
 
         // [DEBUG] Layer-0 post-AR probe (broadcast residual1 after AllReduce,
         // BEFORE γ_mlp multiply and BEFORE the final residual add).
@@ -1533,17 +1701,18 @@ protected:
         rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
             layer_addr(layer_idx, 0, "gamma_mlp"),
             addr(0, "residual1"), addr(0, "residual1"),
-            seq_len, h, c10::Half(1.0f), ValuOpType::MUL, /*is_bopa=*/false);
+            seq_len, h, c10::Half(1.0f), ValuOpType::MUL, /*is_bopa=*/false,
+            num_cores());
         rpu_launch_eltwise_binary_spm_kernel(
             addr(0, "residual1"), addr(0, "input_norm"), addr(0, "residual1"),
-            num_elems_full, ValuOpType::ADD, c10::Half(1.0f), NUM_CORES);
+            num_elems_full, ValuOpType::ADD, c10::Half(1.0f), num_cores());
 
         // [DEBUG] Per-layer hidden-state SPM→DDR dump (gemma2 pattern). Gated
         // on get_debug_export() at graph BUILD time. The DMA target pointer
         // is baked into the cached graph; toggling debug export later
         // requires reset_graph_cache() (which set_debug_export() does).
         // residual1 holds the full layer output (post-MLP-block residual)
-        // broadcast-replicated across all 8 cores; reading core 0's slot
+        // broadcast-replicated across all cores; reading core 0's slot
         // is sufficient. DMA channel 0 lives on stream 0 (core 0's compute
         // stream), giving natural read-after-write serialization with the
         // upstream residual1 write without a redundant multi-core barrier.
@@ -1572,7 +1741,7 @@ protected:
                 addr(0, "residual1"),
                 addr(0, has_output_mlp_ ? "output_mlp_io" : "input_norm"),
                 addr(0, "final_norm_gamma"), addr(0, "final_norm_beta"),
-                seq_len, h, eps_, false, 0, NUM_CORES);
+                seq_len, h, eps_, false, 0, num_cores());
         }
         const bool apply_output_mlp =
             has_output_mlp_ && layer_idx == static_cast<int>(num_layers()) - 1;
@@ -1580,24 +1749,24 @@ protected:
             const uint32_t mlp_input = apply_final_norm
                 ? addr(0, "output_mlp_io") : addr(0, "residual1");
             launch_linear(
-                mlp_input, output_mlp_w1_, addr(0, "output_mlp_hidden"),
+                mlp_input, output_mlp_w1_, at::Tensor(), addr(0, "output_mlp_hidden"),
                 seq_len, h, h, /*partition=*/1, addr(0, "output_mlp_b1"));
             rpu_launch_eltwise_unary_spm_kernel(
                 addr(0, "output_mlp_hidden"), addr(0, "output_mlp_hidden"),
-                seq_len * (h / NUM_CORES), ValuOpType::ADD,
-                GeluMode::ERF, NUM_CORES);
+                seq_len * (h / num_cores()), ValuOpType::ADD,
+                GeluMode::ERF, num_cores());
             launch_linear(
-                addr(0, "output_mlp_hidden"), output_mlp_w2_,
+                addr(0, "output_mlp_hidden"), output_mlp_w2_, at::Tensor(),
                 addr(0, "output_mlp_partial"),
                 seq_len, h, h, /*partition=*/0, addr(0, "output_mlp_b2"));
             consume_manifest_route(
                 FmbRouteFamily::ALL_REDUCE,
                 DINO_OUTPUT_MLP_ALL_REDUCE_SITE,
-                fmb_ring_all_reduce_route_selector(seq_len, h));
+                fmb_ring_all_reduce_route_selector(seq_len, h, num_cores()));
             rpu_launch_all_reduce_sum_residual_kernel(
                 addr(0, "output_mlp_partial"), addr(0, "zero_residual"),
                 addr(0, "output_mlp_io"), seq_len, h,
-                NUM_CORES, NUM_CORES);
+                num_cores(), num_cores());
         }
         if (!ctx().output_to_spm) {
             emit_layer_output_dma(
@@ -1624,7 +1793,8 @@ private:
         for (const auto& weights : layer_weights_) {
             for (const auto* tensor : {
                     &weights.q_w, &weights.k_w, &weights.v_w, &weights.o_w,
-                    &weights.up_w, &weights.down_w}) {
+                    &weights.up_w, &weights.down_w, &weights.q_s, &weights.k_s,
+                    &weights.v_s, &weights.o_s, &weights.up_s, &weights.down_s}) {
                 append_kvinsert_cost_tensor_identity(identity, *tensor);
             }
         }
@@ -1678,7 +1848,7 @@ private:
     // Layer-0 MLP-internal per-core probes (col/row-partition scatter).
     at::Tensor post_up_proj_debug_buf_;      // 'up_buf' after up_proj + GELU (col-partition)
     at::Tensor post_down_partial_debug_buf_; // 'oproj' down_proj per-core partial (pre-AR)
-    // Col-partition layer-0 probes: shape [NUM_CORES=8, seq_len, local_q_dim].
+    // Col-partition layer-0 probes: shape [cores, seq_len, local_q_dim].
     at::Tensor post_q_debug_buf_;            // 'q' after RoPE (per-layer)
     at::Tensor post_k_debug_buf_;            // 'k' after RoPE (per-layer)
     at::Tensor post_v_debug_buf_;            // 'v' after V linear (per-layer)
@@ -1694,8 +1864,8 @@ public:
     // diagnostics to isolate FP16 attention overflow from the remaining layers.
     //
     // Shape contract:
-    //   hybrid_cpu_sdpa_out: [num_layers, NUM_CORES=8, num_tokens, local_q_dim]
-    //     fp16 on PrivateUse1 (device), contiguous. Per-core layout matches the
+    //   hybrid_cpu_sdpa_out: [num_layers, cores, num_tokens, local_q_dim]
+    //     fp16 on PrivateUse1 (RPU), contiguous. Per-core layout matches the
     //     dump produced by post_sdpa_debug_buf_ (head-major: core c holds head
     //     c when local_q_heads=1, or heads {c*lqh .. c*lqh+lqh-1} otherwise).
     //
@@ -1712,7 +1882,7 @@ public:
                         "hybrid_layer_count > 0");
             TORCH_CHECK(sdpa_out.dim() == 4,
                         "set_hybrid_cpu_sdpa: sdpa_out must be 4D "
-                        "[N, NUM_CORES, num_tokens, local_q_dim], got ",
+                        "[N, cores, num_tokens, local_q_dim], got ",
                         sdpa_out.dim(), "D");
             TORCH_CHECK(sdpa_out.scalar_type() == at::kHalf,
                         "set_hybrid_cpu_sdpa: sdpa_out must be fp16");
@@ -1748,6 +1918,8 @@ public:
     void set_acc32(bool enabled) {
         TORCH_CHECK(!standalone_compatibility_ || enabled,
                     "DINO standalone compatibility precision/RoPE profile is immutable");
+        TORCH_CHECK(!enabled || projection_type() == at::kHalf,
+                    "DINOv3 W8A16/W4A16 projections run ACC16 only");
         if (use_acc32_ != enabled) {
             use_acc32_ = enabled;
             invalidate_model_state();
@@ -1827,6 +1999,16 @@ void rpu_dinov3_vision_destroy(int64_t handle) {
     DINOv3VisionRegistry::destroy(handle, "rpu_dinov3_vision_destroy");
 }
 
+void rpu_dinov3_vision_set_execution_core_count(int64_t handle, int64_t cores) {
+    DINOv3VisionRegistry::get(handle, "rpu_dinov3_vision_set_execution_core_count")
+        ->set_execution_cores(cores);
+}
+
+std::vector<int64_t> rpu_dinov3_vision_get_execution_topology(int64_t handle) {
+    return DINOv3VisionRegistry::get(handle, "rpu_dinov3_vision_get_execution_topology")
+        ->execution_topology();
+}
+
 void rpu_dinov3_vision_set_weights(
     int64_t handle,
     at::TensorList q_w_list,  at::TensorList k_w_list,
@@ -1849,6 +2031,15 @@ void rpu_dinov3_vision_set_weights(
         up_b_list, down_b_list,
         gamma_attn_list, gamma_mlp_list,
         num_heads, head_dim, hidden_size, intermediate_size, eps);
+}
+
+void rpu_dinov3_vision_set_weight_scales(
+    int64_t handle,
+    at::TensorList q_scales, at::TensorList k_scales, at::TensorList v_scales,
+    at::TensorList o_scales, at::TensorList up_scales, at::TensorList down_scales)
+{
+    DINOv3VisionRegistry::get(handle, "rpu_dinov3_vision_set_weight_scales")
+        ->set_weight_scales(q_scales, k_scales, v_scales, o_scales, up_scales, down_scales);
 }
 
 void rpu_dinov3_vision_set_rope(

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import tomllib
 
 import pytest
+from _example_toml import load_example_toml
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -366,7 +367,7 @@ def test_public_templates_admit_same_file_text_and_accumulation_changes(cameras,
     """Public templates retain their input/weight routes when cold fields change."""
     runner = load('examples/runners/wall_oss/base.py')
     path = ROOT / f'examples/configs/wall_oss/base/{cameras}cam/{size}/{precision}.toml'
-    config = tomllib.loads(path.read_text())
+    config = load_example_toml(path)
     assert config['input']['text_tokens'] == 32
     for tokens in (32, 64, 96, 128, 160):
         config['input']['text_tokens'] = tokens

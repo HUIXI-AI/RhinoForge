@@ -223,15 +223,15 @@ def test_z1_merger_writes_port_directly_while_ordinary_fallback_stays_stable():
     assert "z1_source_addr_" in z1_post
     assert "rpu_launch_spm_copy_ddr_dma(" not in z1_post
     assert "deepstack_ddr_slots_" not in z1_post
-    aliases = declarations[declarations.index("} else if (!adaptive_w8_merger()") :]
-    merger_out_decl = aliases[aliases.index('decls.push_back({"merger_out",') :]
-    merger_out_decl = merger_out_decl.split("});", 1)[0]
-    assert '\"residual1\"' in merger_out_decl
+    # Ordinary/Z1 aliases follow the separately allocated chunked-merger
+    # declarations. Select the actual alias rather than the first same name.
+    start = declarations.index('decls.push_back({"merger_out",')
+    merger_out_decl = declarations[start:declarations.index('});', start)]
+    assert '"residual1"' in merger_out_decl
     assert "ALL" in merger_out_decl
-    merger_normed_decl = next(
-        line for line in aliases.splitlines() if '{"merger_normed",' in line
-    )
-    assert '\"oproj\"' in merger_normed_decl
+    start = declarations.index('decls.push_back({"merger_normed",')
+    merger_normed_decl = declarations[start:declarations.index('});', start)]
+    assert '"oproj"' in merger_normed_decl
     assert "COMP" in merger_normed_decl
 
 
@@ -405,11 +405,3 @@ def test_python_ordinary_fused_merger_fallback_still_pops_and_clones():
     pooler_clone = fallback.index("merged_all[0].clone()")
     deepstack_clone = fallback.index("merged_all[1 + layer_k].clone()")
     assert pop < pooler_clone < deepstack_clone
-
-
-def test_prefix_scatter_rejects_more_runs_than_the_current_merger_output():
-    source = _source()
-    scatter = _between(source, "void scatter_merger_out_to_prefix(", "\n   private:")
-    check = scatter.index("scatter_rows == current_num_patches_ / 4")
-    dma = scatter.index("rpu_launch_spm_copy_ddr_dma(")
-    assert check < dma

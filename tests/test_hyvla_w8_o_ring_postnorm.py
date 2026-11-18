@@ -65,13 +65,13 @@ int main(){
  run(good,true);
  auto pair=[&](int i,int step=1){return uint32_t(kernel.regs[i])|(uint32_t(kernel.regs[i+step])<<16);};
  assert(pair(0)==good[4] && pair(4)==good[0] && pair(2)==weight.address>>8);
- assert(pair(8)==51 && pair(10)==1024 && kernel.regs[12]==256 && kernel.regs[13]==16);
- assert(pair(16)==512 && pair(18)==2048 && kernel.regs[22]==0 && kernel.regs[23]==1);
+ assert(kernel.regs[8]==0 && kernel.regs[9]==51 && pair(10)==1024 && kernel.regs[12]==256 && kernel.regs[13]==16);
+ assert(pair(16)==512 && pair(18)==2048 && pair(22)==0 && pair(24)==0 && kernel.regs[26]==2 && kernel.regs[27]==1);
  assert(pair(20)==scale.address>>8);
- assert(pair(28)==good[1]-base && pair(36)==good[2] && pair(38)==good[1] && pair(40)==good[3]);
- assert(kernel.regs[24]==8 && kernel.regs[25]==1 && pair(26)==63488 && kernel.regs[30]==0);
- assert(kernel.regs[32]==1024 && kernel.regs[33]==c10::Half(1.f/1024).x && kernel.regs[34]==2048);
- assert(kernel.regs[35]==8 && kernel.regs[42]==c10::Half(1e-5).x && kernel.phase==0);
+ assert(pair(36)==good[1]-base && pair(44)==good[2] && pair(46)==good[1] && pair(48)==good[3]);
+ assert(kernel.regs[32]==8 && kernel.regs[33]==1 && pair(34)==63488 && kernel.regs[38]==0);
+ assert(kernel.regs[40]==1024 && kernel.regs[41]==c10::Half(1.f/1024).x && kernel.regs[42]==2048);
+ assert(kernel.regs[43]==8 && kernel.regs[50]==c10::Half(1e-5).x && kernel.phase==0);
  for(int c=0;c<8;++c){
   assert(pair(4096+c,8)==spm.addr(c,good[0]-base)-base);
   assert(pair(4112+c,8)==spm.addr(c,good[2]-base)-base);

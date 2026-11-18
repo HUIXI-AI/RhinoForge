@@ -109,19 +109,21 @@ def test_awq_words_use_n_axis_reorder_and_direct_zero():
 @pytest.mark.parametrize("partition", [0, 1])
 def test_uint4_payload_and_zero_metadata_match_independent_addresses(partition):
     n, k, cores_count = 128, 1024, 8
-    q = (torch.arange(n)[:, None] * 7 + torch.arange(k)[None, :] * 3).remainder(16).byte()
+    q = ((torch.arange(n)[:, None] * 131 + torch.arange(k)[None, :] * 7) // 13).remainder(16).byte()
     actual = swizzle_pack_uint4_pgrp(q, partition).numpy()
     expected = []
     local_n, local_k = (n // 8, k) if partition else (n, k // 8)
-    for nt in range(local_n // 16):
-        for kt in range(local_k // 64):
+    for nt in range((local_n + 31) // 32):
+        for kt in range(local_k // 32):
             for core in range(cores_count):
                 for ni in range(16):
-                    ni_global = nt * 16 + ni + (core * local_n if partition else 0)
-                    for block in (0, 32):
+                    for half_n in (0, 16):
+                        nl = nt * 32 + half_n + ni
+                        ni_global = nl + (core * local_n if partition else 0)
                         for lane in range(16):
-                            ki = kt * 64 + block + lane + (0 if partition else core * local_k)
-                            expected.append(int(q[ni_global, ki]) | (int(q[ni_global, ki + 16]) << 4))
+                            ki = kt * 32 + lane + (0 if partition else core * local_k)
+                            expected.append(0 if nl >= local_n else
+                                int(q[ni_global, ki]) | (int(q[ni_global, ki + 16]) << 4))
     assert np.array_equal(actual, np.array(expected, dtype=np.uint8))
     zero = (torch.arange(k // 128)[:, None] + torch.arange(n)[None, :]).remainder(16).byte()
     z = swizzle_awq_negative_zero(zero, partition)
@@ -163,8 +165,8 @@ class _TinyModel(torch.nn.Module):
             self.lm_head.weight = self.model.language_model.embed_tokens.weight
 
 
-def _checkpoint(tmp_path, monkeypatch, *, size=2, missing_zero=False, mutate=None):
-    config = Qwen3_5Config.from_dict(config_dict(size))
+def _checkpoint(tmp_path, monkeypatch, *, size=2, missing_zero=False, mutate=None, config=None):
+    config = config if config is not None else Qwen3_5Config.from_dict(config_dict(size))
     quant = resolve_quant_config(config)
     model = _TinyModel(config)
     source = {k: torch.full_like(v, 1.003, dtype=torch.bfloat16) for k, v in model.state_dict().items()}
@@ -190,7 +192,7 @@ def _checkpoint(tmp_path, monkeypatch, *, size=2, missing_zero=False, mutate=Non
     save_file(b, str(tmp_path / "two.safetensors"))
     (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {
         k: "one.safetensors" if k in a else "two.safetensors" for k in source}}))
-    (tmp_path / "config.json").write_text(json.dumps(config_dict(size)))
+    (tmp_path / "config.json").write_text(json.dumps(config.to_dict()))
     def skeleton(cfg):
         assert not hasattr(cfg, "quantization_config")
         return _TinyModel(cfg)
@@ -198,6 +200,49 @@ def _checkpoint(tmp_path, monkeypatch, *, size=2, missing_zero=False, mutate=Non
     monkeypatch.setattr(loader.AutoModelForImageTextToText, "from_pretrained",
                         lambda *a, **kw: pytest.fail("HF AWQ handler must not run"))
     return config, source
+
+
+@pytest.mark.parametrize("profile", ["quanttrio_awq_g128", "activation_awq_g128_v1"])
+def test_official_27b_awq_loader_reads_real_shards_and_keeps_recipe_identity(tmp_path, monkeypatch, profile):
+    from test_qwen35_dense27_profiles import runtime_config27
+    config, _ = _checkpoint(tmp_path, monkeypatch, config=runtime_config27(profile))
+    model = loader.load_qwen3_5_model(tmp_path, config=config)
+    assert loader.validate_awq_loaded_model(model)
+    assert model._qwen3_5_awq_import["profile"] == profile
+    assert model._qwen3_5_awq_import["triplet_roundtrip_count"] == 63 * 3
+    assert model.config.text_config.hidden_size == 5120
+    inner = model.model.language_model
+    assert model.lm_head.weight is not inner.embed_tokens.weight
+    assert inner.layers[0].mlp.gate_proj.weight.dtype == torch.float16
+    assert inner.layers[-1].mlp.down_proj.weight.dtype == torch.uint8
+    text._validate_projection_specs(inner,
+        is_full_from_layer_types(config.text_config.layer_types), model.config.quant_config)
+
+
+@pytest.mark.parametrize("recipe", ["w4_mlp_only", "w4_mlp_w8_attn_gdn", "w4_main_w8_gdn", "w8_main_w8_gdn"])
+def test_official_27b_named_mixed_loader_preserves_actual_projection_storage(tmp_path, monkeypatch, recipe):
+    from test_qwen35_dense27_profiles import runtime_config27
+    config = runtime_config27(recipe)
+    source_model = _TinyModel(config).half()
+    state = dict(source_model.state_dict())
+    specs = resolve_quant_specs(is_full_from_layer_types(config.text_config.layer_types), config.quant_config)
+    for name, spec in specs.items():
+        if spec.method == FP16:
+            continue
+        stem = "model.language_model." + name
+        state[stem + ".weight"] = torch.zeros_like(state[stem + ".weight"], dtype=torch.int8)
+        shape = (128,) if spec.method == "w8a16" else (128 // spec.group_size, 128)
+        state[stem + ".weight_scale"] = torch.ones(shape, dtype=torch.float16)
+    save_file(state, str(tmp_path / "model.safetensors"))
+    monkeypatch.setattr(loader.AutoModelForImageTextToText, "from_config", _TinyModel)
+    model = loader.load_qwen3_5_model(tmp_path, config=config)
+    assert model._qwen3_5_quant_config == config.quant_config
+    inner = model.model.language_model
+    text._validate_projection_specs(inner,
+        is_full_from_layer_types(config.text_config.layer_types), config.quant_config)
+    assert model.lm_head.weight is not inner.embed_tokens.weight
+    for name, spec in specs.items():
+        assert inner.get_submodule(name).weight.dtype == (torch.float16 if spec.method == FP16 else torch.int8)
 
 
 @pytest.mark.parametrize("inference", [False, True])
@@ -346,8 +391,8 @@ def test_9b_awq_retained_text_is_separate_from_vl_and_reduced(monkeypatch):
     assert not text._public_retained_prefill(config, public_owner=True, vision_admitted=True)
     with pytest.raises(ValueError, match="Vision"):
         cores.validate_dense_9b_vl_profile(config)
-    with pytest.raises(ValueError, match="TP8"):
-        Qwen3_5Adapter.preflight_execution(config, {"model": {"num_cores": 4}})
+    for count in (4, 6):
+        Qwen3_5Adapter.preflight_execution(config, {"model": {"num_cores": count}})
 
 
 def test_native_capability_requires_all_three_typed_tail_parameters(monkeypatch):
@@ -391,7 +436,6 @@ def test_awq_adapter_rewrap_uses_complete_live_runtime_after_source_release(
         tmp_path, monkeypatch, request):
     from rpu_backend.adapters.qwen3_5 import _qwen3_5_text_runtime_state
 
-    monkeypatch.setenv("QWEN3_5_QUANT_ALLOW_UNCERTIFIED", "1")
     monkeypatch.delenv("QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED", raising=False)
     config, _ = _checkpoint(tmp_path, monkeypatch)
     model = loader.load_qwen3_5_model(tmp_path, config=config)
@@ -418,7 +462,6 @@ def test_awq_adapter_rewrap_rejects_incomplete_runtime_even_with_original_owners
         tmp_path, monkeypatch, request, fault):
     from rpu_backend.adapters.qwen3_5 import _qwen3_5_text_runtime_state
 
-    monkeypatch.setenv("QWEN3_5_QUANT_ALLOW_UNCERTIFIED", "1")
     monkeypatch.delenv("QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED", raising=False)
     config, _ = _checkpoint(tmp_path, monkeypatch)
     model = loader.load_qwen3_5_model(tmp_path, config=config)
@@ -438,7 +481,6 @@ def test_awq_adapter_rewrap_rejects_incomplete_runtime_even_with_original_owners
 @pytest.mark.parametrize("size", [2, 4, 9])
 def test_awq_public_cold_session_retains_prefill_without_large_model_arenas(
         tmp_path, monkeypatch, graph_factories, text_install_boundary, size):
-    monkeypatch.setenv("QWEN3_5_QUANT_ALLOW_UNCERTIFIED", "1")
     monkeypatch.delenv("QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED", raising=False)
     config, _ = _checkpoint(tmp_path, monkeypatch, size=size)
     model = loader.load_qwen3_5_model(tmp_path, config=config)

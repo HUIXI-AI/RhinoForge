@@ -92,7 +92,7 @@ def test_group4_cold_complete_and_fallbacks(tmp_path, monkeypatch):
     ids = ["G05_Q_NORM_PARTIAL_ROPE_M32D256R64_GROUP4", "G05_K_OWNER_NORM_PARTIAL_ROPE_M32D256R64_GROUP4"]
     cpp = cpp.replace("enum class KernelId{", "enum class KernelId{" + ",".join(ids) + ",")
     cpp = cpp.replace("struct KernelCache{", "struct KernelCache{bool q4=true,k4=true;")
-    cpp = cpp.replace("bool has_loaded(KernelId id){++queries;", "bool has_loaded(KernelId id){++queries;if(id==KernelId::" + ids[0] + ")return q4;if(id==KernelId::" + ids[1] + ")return k4;")
+    cpp = cpp.replace("bool has_loaded(KernelId id){++queries;", "bool has_loaded(KernelId id){++queries;if(id==KernelId::" + ids[0] + ")return q4;if(id==KernelId::" + ids[1] + ")return k4;\n ")
     cpp = cpp.replace("idx=2,offset=0", "idx=0,offset=0")
     cpp = cpp.replace("std::vector<int64_t>action_nvfp4_arguments(int)const{assert(false);return {};}", "std::vector<int64_t>action_nvfp4_arguments(int family)const{return {family};}")
     support = r'''

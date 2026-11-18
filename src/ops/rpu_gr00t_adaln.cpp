@@ -9,13 +9,14 @@ using namespace ::rhino_lkn;
 
 at::Tensor rpu_gr00t_precompute_adaln(
     const at::Tensor& cond, at::TensorList weights,
-    at::TensorList biases, at::TensorList scales) {
+    at::TensorList biases, at::TensorList scales, int cores) {
     constexpr int64_t layers = 32, h = 1536, output = 2 * h;
-    constexpr int cores = 8;
     RpuExecutionCoordinator::require_graph_quiescent("gr00t_precompute_adaln");
     TORCH_CHECK(RpuExecutionCoordinator::current_physical_token_if_owned("gr00t_precompute_adaln") != 0,
                 "GR00T AdaLN cold preparation requires its owned execution claim");
     TORCH_CHECK(!RpuKernelGraph::has_active(), "GR00T AdaLN preparation is cold-only");
+    TORCH_CHECK(cores == 4 || cores == 8,
+                "GR00T AdaLN preparation requires four or eight execution cores");
     TORCH_CHECK(cond.defined() && cond.device().type() == at::kPrivateUse1 &&
                     cond.scalar_type() == at::kHalf && cond.is_contiguous() &&
                     cond.dim() == 2 && (cond.size(0) == 4 || cond.size(0) == 10) && cond.size(1) == h &&
@@ -38,12 +39,13 @@ at::Tensor rpu_gr00t_precompute_adaln(
                     "GR00T AdaLN preparation scale does not match installed precision");
     }
     if (!SPM_ALLOC.is_initialized()) SPM_ALLOC.init();
-    constexpr int64_t scratch_bytes = 512 + 3 * output * 2;
+    const int64_t input_bytes = ((h / cores * 2 + 255) / 256) * 256;
+    const int64_t scratch_bytes = input_bytes + 3 * output * 2;
     TORCH_CHECK(SPM_ALLOC.total_used() + scratch_bytes <= SpmAllocator::SPM_PLANNING_BUDGET &&
                     SPM_ALLOC.free_space() >= scratch_bytes,
                 "GR00T AdaLN cold scratch exceeds the SPM planning budget");
     SpmAllocator::ScopedTemporary scratch;
-    const uint32_t input = SPM_ALLOC.addr(0, SPM_ALLOC.alloc_temporary(512));
+    const uint32_t input = SPM_ALLOC.addr(0, SPM_ALLOC.alloc_temporary(input_bytes));
     const uint32_t bias = SPM_ALLOC.addr(0, SPM_ALLOC.alloc_temporary(output * 2));
     const uint32_t partial = SPM_ALLOC.addr(0, SPM_ALLOC.alloc_temporary(output * 2));
     const uint32_t result = SPM_ALLOC.addr(0, SPM_ALLOC.alloc_temporary(output * 2));
@@ -58,7 +60,7 @@ at::Tensor rpu_gr00t_precompute_adaln(
                 input, weights[layer], partial, 1, output, h, 0, cores, 0, scales[layer]);
             rpu_launch_all_reduce_sum_residual_kernel(partial, bias, result, 1, output, cores, cores);
             rpu_launch_eltwise_binary_scalar_spm_kernel(
-                result, c10::Half(1.0), result, h, ValuOpType::ADD);
+                result, c10::Half(1.0), result, h, ValuOpType::ADD, cores);
             rpu_launch_spm_copy_ddr_dma(result, table, (step * layers + layer) * output, output);
         }
     }

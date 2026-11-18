@@ -1,5 +1,6 @@
 """Execute the real G05 QKV transport admission, layout, plan and callback bodies."""
 from pathlib import Path
+from pi_wall_host_catalog import with_actual_linear_contracts
 import re
 import subprocess
 
@@ -36,6 +37,9 @@ def _qkv_native_cpp():
     carry = manifest[manifest.index('    const bool carry_qkv ='):manifest.index('    auto append_kv_route')]
     plan = _block(manifest, manifest[manifest.rindex('        for (const ChunkInfo& chunk : plan.qkv.chunks)'):][:70])
     constants = re.findall(r'constexpr int64_t ((?:G05_VISION|QWEN35_VISION)_[A-Z0-9_]+)\s*=\s*([0-9]+)(?:LL)?;', source)
+    kernel_header = (ROOT / 'src/core/rpu_kernel_cache.h').read_text()
+    start = kernel_header.index('enum class KernelId')
+    kernel_enum = kernel_header[start:kernel_header.index('};', start) + 2]
     cpp = r'''
 #include <algorithm>
 #include <cassert>
@@ -61,7 +65,7 @@ void append_kvinsert_cost_tensor_identity(std::vector<int64_t>& out,const at::Te
 namespace detail{int64_t layout_mix(int64_t a,int64_t b){return uint64_t(a)*131+uint64_t(b);}}
 __CONSTANTS__
 constexpr int DWIDTH=2;constexpr int QWEN35_VISION_KV_CAPABILITIES=1;
-enum class KernelId{G05_VISION_FC2_WEIGHT_OUTER_W8A16_ACC16_M768N1024K512,G05_VISION_OWNER_REDUCE_LAYERNORM_M256N1024,G05_VISION_XOR3_COMPACT_RESIDUAL_RAW_FULL_M256N1024,G05_VISION_QKV_FP16_ACC32_M256N128K1024,G05_VISION_QKV_W8A16_ACC32_M256N128K1024,G05_VISION_QKV_W8A16_ACC16_M256N128K1024,PL_AT_W8A16_M512N48,PL_AT_W8A16_ACC32_M288N80};
+__KERNEL_ENUM__
 struct KernelCache{ bool is_initialized()const{return true;} void* get(KernelId id){return has_loaded(id)?this:nullptr;}bool qkv=false,w8=false,acc16=false,owner=false;int queries=0;static KernelCache& instance(){static KernelCache c;return c;}bool has_loaded(KernelId id){++queries;if(id==KernelId::G05_VISION_FC2_WEIGHT_OUTER_W8A16_ACC16_M768N1024K512)return false;if(id==KernelId::G05_VISION_QKV_FP16_ACC32_M256N128K1024)return qkv;if(id==KernelId::G05_VISION_QKV_W8A16_ACC32_M256N128K1024)return w8;if(id==KernelId::G05_VISION_QKV_W8A16_ACC16_M256N128K1024)return acc16;return owner;}};
 enum class AttentionExecutionPolicy{DDR_KV,SPM_KV_BY_MHA};enum class ChunkMode{KV_FIRST,SEQ_FIRST};
 struct ChunkInfo{int64_t idx=0,offset=0,len=256,kv_seq_len=256;};
@@ -172,7 +176,7 @@ int main(){
  cold([](auto&x){x.layer_weights_.back().fc2_w.dtype=2;});cold([](auto&x){x.layer_bias_norm_.back().fc2_b.present=false;});cold([](auto&x){x.layer_bias_norm_.back().ln2_w.location=0;});cold([](auto&x){x.layer_weights_.back().v_w.contiguous=false;});cold([](auto&x){x.linear_acc32_=false;});
 }
 '''
-    replacements = {'__CONSTANTS__': '\n'.join(f'constexpr int64_t {name}={value}LL;' for name, value in constants),
+    replacements = {'__KERNEL_ENUM__': kernel_enum, '__CONSTANTS__': '\n'.join(f'constexpr int64_t {name}={value}LL;' for name, value in constants),
                     '__METHODS__': '\n'.join(decl + _block(source, marker) for decl, marker in methods),
                     '__IDENTITY__': _block(header, 'std::vector<int64_t> kvinsert_cost_weight_identity() const'),
                     '__LAYOUT_PREFIX__': layout_prefix, '__DECLARATIONS__': declarations,
@@ -180,13 +184,13 @@ int main(){
     for marker, value in replacements.items():
         cpp = cpp.replace(marker, value)
     cpp = chr(10).join(('#include <array>', '#include "' + str(ROOT / "src/ops/rpu_linear_tiling.h") + '"', cpp))
-    return cpp
+    return with_actual_linear_contracts(cpp)
 
 
 def _compile_qkv(tmp_path, cpp):
     path, exe = tmp_path / 'qkv.cpp', tmp_path / 'qkv'
     path.write_text(cpp)
-    result = subprocess.run(['c++', '-std=c++17', '-Wall', '-Wextra', str(path), '-o', str(exe)], capture_output=True, text=True)
+    result = subprocess.run(['c++', '-std=c++17', '-Wall', '-Wextra', '-I', str(ROOT / 'src/core'), str(path), '-o', str(exe)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     result = subprocess.run([str(exe)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr

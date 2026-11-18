@@ -3,6 +3,8 @@
 from pathlib import Path
 import re
 
+from test_qwen3vl_prefill_gateup_launcher import definition
+
 
 ROOT = Path(__file__).resolve().parents[1]
 VISION = ROOT / "src/fused/rpu_qwen3vl_vision_model.cpp"
@@ -31,11 +33,7 @@ def test_exact_three_input_occurrence_capability_is_composite_only():
 
 def test_each_n256_occurrence_has_three_layer_yields_and_one_postfn_yield():
     source = VISION.read_text(encoding="utf-8")
-    layer = _between(
-        source,
-        "void build_layer_subgraph(int layer_idx, const ChunkInfo& chunk)",
-        "bool merger_active() const",
-    )
+    layer = definition(source, "void build_layer_subgraph(int layer_idx, const ChunkInfo& chunk)")
     post = _between(
         source,
         "void multiview_composite_post_fn()",
@@ -70,11 +68,7 @@ def test_typed_scope_wraps_only_the_existing_terminal_allreduce():
 
 def test_composite_suppresses_raw_bridges_and_component_fast_replay():
     source = VISION.read_text(encoding="utf-8")
-    layer = _between(
-        source,
-        "void build_layer_subgraph(int layer_idx, const ChunkInfo& chunk)",
-        "bool merger_active() const",
-    )
+    layer = definition(source, "void build_layer_subgraph(int layer_idx, const ChunkInfo& chunk)")
     static_config = _between(
         source,
         "ModelStaticConfig static_config() override",
@@ -88,21 +82,13 @@ def test_composite_suppresses_raw_bridges_and_component_fast_replay():
 
 def test_composite_manifest_omits_the_ordinary_snapshot_reload_alias():
     source = VISION.read_text(encoding="utf-8")
-    declarations = _between(
-        source,
-        "// Fused merger (patch + 3 deepstack), single- AND batched-image.",
-        "// Cold merger residency",
-    )
+    declarations = definition(source, "std::vector<BufferDecl> declare_buffers(")
     guard = re.search(r"if \(!multiview_dry_prepared_ &&\s+!multiview_composite_prepared_\) \{", declarations)
     assert guard is not None
     guarded = declarations[guard.start() :]
     assert guarded.index('{"merger_in"') < guarded.index("}\n")
 
-    layer = _between(
-        source,
-        "void build_layer_subgraph(int layer_idx, const ChunkInfo& chunk)",
-        "bool merger_active() const",
-    )
+    layer = definition(source, "void build_layer_subgraph(int layer_idx, const ChunkInfo& chunk)")
     post = _between(
         source,
         "void multiview_composite_post_fn()",

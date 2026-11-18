@@ -549,7 +549,10 @@ def test_actual_navdp_first_batched_forward_cache_survives_failed_gc(native, mon
     monkeypatch.setattr(navdp, "_publish_navdp_execution_receipt", lambda *args, **kwargs: None)
     monkeypatch.setattr(torch.ops.rpu, "navdp_get_resolved_chunk_size", lambda _: 64, raising=False)
     admissions = []
-    monkeypatch.setattr(torch.ops.rpu, "navdp_validate_execution_admission", lambda *args: admissions.append(args), raising=False)
+    def admit(handle, rows, steps):
+        assert handle == owner._handle and rows == 64 and steps == navdp.DDPM_STEPS
+        admissions.append((handle, rows, steps))
+    monkeypatch.setattr(torch.ops.rpu, "navdp_validate_execution_admission", admit, raising=False)
     def forward(handle, x0, memory, noise, coeff, k, v, out, descriptor):
         assert any(value is owner._batch_cache for value in owner._native_resource.keepalive)
         out.zero_()
@@ -557,7 +560,7 @@ def test_actual_navdp_first_batched_forward_cache_survives_failed_gc(native, mon
     monkeypatch.setattr(torch.ops.rpu, "navdp_denoise_loop_forward", forward, raising=False)
     result = owner.predict_action(torch.zeros(1, 1, 384), torch.zeros(1, 32, 384), sample_num=2)
     assert result.shape == (2, 32, 3)
-    assert admissions == [(41, 64, 20)]
+    assert admissions == [(owner._handle, 64, navdp.DDPM_STEPS)]
     # The real first-use setter is installed once; replay does not rebind it.
     owner._ensure_glue_installed()
     assert native["events"].count(("navdp_set_denoise_glue", 41)) == 1
@@ -604,7 +607,7 @@ def test_nextdit_actual_debug_caller_reads_three_slots_and_rejects_mode_drift(na
         def forward(handle, x, modulation, scale, raw, action, populate, unroll, prepare,
                     euler, cross, sk, sv, ck, cv, probes, collect, descriptor):
             assert handle == owner._handle and collect and not unroll and not prepare and not euler
-            assert probes is owner._layer_outputs_rpu and descriptor == (1, 2, 3)
+            assert probes is owner._layer_outputs_rpu and tuple(descriptor) == (1, 2, 3)
             assert mode[0] is debug and owner._fused_qkq is fused_qkq
             calls.append((handle, action, populate))
             for slot in range(15):

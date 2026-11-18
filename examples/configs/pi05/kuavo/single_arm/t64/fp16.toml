@@ -1,0 +1,52 @@
+# 未写出的执行参数（省略即按以下值运行）：
+#   [cpu].threads 省略时本入口使用 8。
+#   分块（chunk_size）模板未写出，按 auto 由入口选择：prefill 为 (256×3+T)/2 行。可调范围见模型页。
+# Pi0.5 统一入口：openpi pi05 Kuavo 单臂（右臂 7 关节 + 右手 1），T64 短指令版本，输入为相机原尺寸帧、指令和物理 state。
+[model]
+target = "pi05"
+# 本文件的权重/计算配方；切换精度须同时使用对应权重。
+precision = "fp16"
+# 替换为 action/state 宽度为 8 的 pi05 checkpoint（准备方法见权重页 Kuavo 一节）。
+checkpoint = "/path/to/pi05_base_kuavo_a8"
+
+[input]
+# 三路相机原尺寸 RGB 帧，顺序为 头部 / 左腕 / 右腕（base_0_rgb / left_wrist_0_rgb / right_wrist_0_rgb）；
+# 公开示例帧（真机 848×480）由 scripts/prepare_pi05_kuavo_inputs.py 生成。
+images = ["/path/to/kuavo/frames/cam_h.png", "/path/to/kuavo/frames/cam_l.png", "/path/to/kuavo/frames/cam_r.png"]
+# 相机帧尺寸 [宽, 高]，即 kuavo_deploy 的 env.image_size：真机 [848, 480]，仿真 [640, 480]；尺寸不符的帧拒绝运行。
+# 每次推理在计时内按 openpi resize_with_pad 缩放到模型输入 224×224（848×480 → 224×126，上下各补 49 行黑边）。
+frame_size = [848, 480]
+# 本入口的 openpi 原始输入固定 3 路相机。
+cameras = 3
+# 任务指令取自公开数据集 RoboCOIN/Leju_Kuavo_4_box_storage_parcel 的 meta/tasks.jsonl（task_index 0，原文照录），
+# 含 BOS 共 14 个 PaliGemma token；入口按 openpi 格式拼入离散化 state。
+instruction = "moved the parcel from conveyor to table for the left to box."
+# 物理 state，顺序 [右臂 7, 右手 1]；臂关节单位 rad；手为 0..1（LeTools 把 0..100 指令值除以 100）。
+state = [-0.25121337, 0.127788, 0.13694778, -0.93423015, 0.27275506, -0.69047725, -0.60087013, 0.0]
+# openpi norm_stats.json（quantile 归一化，须含 state；含 actions 时额外输出物理动作）。
+norm_stats = "/path/to/kuavo/norm_stats/single_arm/norm_stats.json"
+# openpi 的 PaliGemma sentencepiece 模型；需要 pip install sentencepiece。
+tokenizer = "/path/to/paligemma_tokenizer.model"
+# 训练时按 delta 表示的动作维（openpi make_bool_mask）；用于把输出还原为绝对动作。
+delta_action_mask = [true, true, true, true, true, true, true, false]
+# 输出动作宽度，须与 checkpoint 的 output_features.action 一致。
+action_dim = 8
+# 语言存储宽度可选 32 / 64 / 96 / 128 / 160 / 192（192 仅限 3 路相机、FP16 / W8A16）；有效 token（BOS + 指令 + 离散 state + "Action: "）超过宽度时拒绝运行。
+# 本模板的 14 token 指令加 8 维 state 在任何 state 下需要 39–55 token，T64 是放得下的最小宽度（75 token 指令的版本见上一级目录）。
+text_tokens = 64
+# 当前模型路径的固定去噪步数，不作为任意可调范围。
+num_steps = 10
+
+[run]
+# 预热次数；不计入正式测量。
+warmup = 2
+# 正式执行次数，正整数。
+runs = 5
+# 随机种子，非负整数。
+seed = 0
+# 结果输出目录；并发运行使用不同目录。
+output_dir = "./pi05_results/kuavo/single_arm/t64/fp16"
+
+[rpu_execution.model]
+# RPU 核数预算；T≠32 仅支持 8 核。
+num_cores = 8

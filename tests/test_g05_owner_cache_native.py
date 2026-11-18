@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_owner_norm_rope_and_segmented_cache_actual_wrappers(tmp_path):
     source = (ROOT / 'src/ops/rpu_llama_kvcache.cpp').read_text()
-    actual = source[source.index('// Exact G05 W8 Action continuation.'):source.index('void rpu_launch_wall_prefill_owner_direct_kv_spm_kernel(')]
+    actual = source[source.index('// Exact G05 W8 Action continuation.'):]
     cpp = r'''
 #include <array>
 #include <cassert>

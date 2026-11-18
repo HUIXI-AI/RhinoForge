@@ -1,5 +1,5 @@
 """Standalone/embedded NavDP lifecycle, with no device initialization."""
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 import sys
 from types import ModuleType, SimpleNamespace
 import weakref
@@ -30,9 +30,9 @@ def make_runtime(monkeypatch):
     monkeypatch.setattr(navdp.torch.ops.rpu, "navdp_destroy", destroyed.append, raising=False)
     owners = []
 
-    def make(*, deferred=False):
+    def make(*, deferred=False, graph_cache=None):
         owner = navdp.NavdpRuntime(
-            len(owners) + 1, [], {}, Cache(), SimpleNamespace(),
+            len(owners) + 1, [], {}, Cache() if graph_cache is None else graph_cache, SimpleNamespace(),
             denoise_unroll=False, batch_unroll=False,
             _defer_execution_session=deferred,
         )
@@ -103,7 +103,6 @@ def test_embedded_destroy_cannot_retire_a_live_parent_graph(make_runtime):
 def test_standalone_hot_chunk_changes_generation_and_native_descriptor_input(make_runtime, monkeypatch):
     make, _ = make_runtime
     owner = make()
-    monkeypatch.setattr(navdp, "native_execution_reconfigure", lambda: nullcontext())
     monkeypatch.setattr(owner, "_predict_noise", lambda *_: None)
     owner.predict_noise(None, None, None, None)
     owner.reconfigure_rpu_execution({"components": {"navdp_action": {"action": {"chunk_size": 32}}}})
@@ -125,7 +124,6 @@ def test_same_config_calibration_retires_actual_navdp_graph(make_runtime, monkey
     from rpu_backend.runtime.execution_planner import PlannerCalibrationSelection, PlannerCostScope
     make, _ = make_runtime
     owner = make()
-    monkeypatch.setattr(navdp, "native_execution_reconfigure", lambda: nullcontext())
     session = owner._execution_session
     record_planner_native(owner, "action", "navdp_action", ("navdp", owner._handle))
     selection = PlannerCalibrationSelection(
@@ -140,18 +138,16 @@ def test_same_config_calibration_retires_actual_navdp_graph(make_runtime, monkey
 def test_standalone_commit_failure_compensates_and_can_retry(make_runtime, monkeypatch):
     make, _ = make_runtime
     owner = make()
-    calls = []
+    clear = owner._gc.clear
 
-    @contextmanager
-    def transaction():
-        calls.append(len(calls))
-        yield
-        if len(calls) == 1:
-            raise RuntimeError("native commit interrupted")
+    def interrupted_clear():
+        clear()
+        if owner._gc.clears == 1:
+            raise RuntimeError("graph cleanup interrupted")
 
-    monkeypatch.setattr(navdp, "native_execution_reconfigure", transaction)
+    monkeypatch.setattr(owner._gc, "clear", interrupted_clear)
     before = owner._rpu_execution
-    with pytest.raises(RuntimeError, match="commit interrupted"):
+    with pytest.raises(RuntimeError, match="cleanup interrupted"):
         owner.reconfigure_rpu_execution({"action": {"chunk_size": 32}})
     assert owner._rpu_execution == before
     assert owner._fmb_execution_generation == 0
@@ -161,6 +157,66 @@ def test_standalone_commit_failure_compensates_and_can_retry(make_runtime, monke
     owner.reconfigure_rpu_execution({"action": {"chunk_size": 32}})
     assert owner._fmb_execution_generation == 1
     assert owner._execution_session.generation == 1
+
+
+@pytest.mark.parametrize("embedded", [False, True])
+def test_descriptor_reconfigure_cleans_under_session_without_native_transaction(
+    make_runtime, monkeypatch, embedded,
+):
+    from rpu_backend.api._execution import native_execution_reconfigure
+    from test_graph_cache_freeze import _cache, _sig
+
+    make, _ = make_runtime
+    cache = _cache()
+    cache._impl.cache_invariant_ok = lambda: True
+    with cache.capture(_sig("ready")):
+        pass
+    cache.freeze()
+    owner = make(deferred=embedded, graph_cache=cache)
+    controller = (InternVLAExecutionController(SimpleNamespace(), {"navdp_action": owner})
+                  if embedded else None)
+    session = owner._execution_session
+    state = {"active": False, "begins": 0, "clears": 0}
+
+    def begin(attempt):
+        state["active"] = True
+        state["begins"] += 1
+        return attempt
+
+    def finish(token):
+        state["active"] = False
+
+    for name, fn in (("begin", begin), ("commit", finish), ("abort", finish),
+                     ("abort_attempt", finish)):
+        monkeypatch.setattr(torch.ops.rpu, "execution_reconfigure_" + name, fn,
+                            raising=False)
+    clear = cache._impl.clear
+
+    def cleanup():
+        # Model the native enter_cleanup contract, beneath the real GraphCache.
+        if state["active"]:
+            raise RuntimeError("cleanup reserved for owning quiesce callback")
+        assert session._lock._is_owned()
+        state["clears"] += 1
+        clear()
+
+    monkeypatch.setattr(cache._impl, "clear", cleanup)
+    with pytest.raises(RuntimeError, match="owning quiesce"):
+        with session._lock, native_execution_reconfigure():
+            cache.clear()
+    assert cache.size() == 1 and not state["active"]
+    before_begins = state["begins"]
+    reconfigure = (controller.reconfigure_rpu_execution if embedded
+                   else owner.reconfigure_rpu_execution)
+    reconfigure({"action": {"chunk_size": 32}})
+    assert state == {"active": False, "begins": before_begins, "clears": 1}
+    assert cache.size() == 0 and not cache.is_frozen()
+    assert owner._fmb_execution_generation == session.generation == 1
+    assert owner._rpu_execution["action"]["chunk_size"] == 32
+    if controller is not None:
+        controller.close()
+    else:
+        owner.destroy()
 
 
 def test_latched_native_mode_rejects_before_upload_or_glue(make_runtime, monkeypatch):

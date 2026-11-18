@@ -1,5 +1,6 @@
 """Host execution of actual K1 camera-group routes; no hardware claims."""
 from pathlib import Path
+from pi_wall_host_catalog import with_actual_linear_contracts
 import ast
 import re
 import pytest
@@ -208,12 +209,13 @@ def test_camera_group_cold_actual_generated_capabilities_and_no_hot_lookup(tmp_p
         'std::vector<int64_t> g05_k1_camera_group_arguments() const'))
     cpp=cpp.replace(' std::vector<int64_t>kvinsert_cost_weight_identity()const',methods+'\n std::vector<int64_t>kvinsert_cost_weight_identity()const')
     # The actual cold source links without either dispatcher-private helper.
-    assert 'autotile_linear_kernel_id' not in cpp
-    assert 'autotile_linear_acc32_kernel_id' not in cpp
+    cpp_without_comments = re.sub(r'//[^\n]*|/\*.*?\*/', '', cpp, flags=re.S)
+    assert 'autotile_linear_kernel_id' not in cpp_without_comments
+    assert 'autotile_linear_acc32_kernel_id' not in cpp_without_comments
     cpp=cpp.replace('bool qkv=false,w8=false,acc16=false,owner=false;', 'bool qkv=false,w8=false,acc16=false,owner=false,generated16=true,generated32=true;')
-    cpp=cpp.replace('void* get(KernelId id){return has_loaded(id)?this:nullptr;}', 'void* get(KernelId id){++queries;if(id==KernelId::PL_AT_W8A16_M512N48)return generated16?this:nullptr;if(id==KernelId::PL_AT_W8A16_ACC32_M288N80)return generated32?this:nullptr;throw std::runtime_error("generic only");}')
+    cpp=cpp.replace('void* get(KernelId id){return has_loaded(id)?this:nullptr;}', 'void* get(KernelId id){++queries;for(bool acc32:{false,true})for(int cameras:{2,3}){auto tile=acc32?rpu_pl_tiling::select_tile_acc32(cameras*256,1024,512,false):rpu_pl_tiling::select_tile_acc16(cameras*256,1024,512,false);if(id==parallel_linear_kernel_id(rpu_pl_tiling::WeightType::Int8,acc32,tile))return (acc32?generated32:generated16)?this:nullptr;}throw std::runtime_error("generic only");}')
     # Production atomic has_loaded has no registered snapshot for generic IDs.
-    cpp=cpp.replace('bool has_loaded(KernelId id){++queries;', 'bool has_loaded(KernelId id){++queries;if(id==KernelId::PL_AT_W8A16_M512N48||id==KernelId::PL_AT_W8A16_ACC32_M288N80)throw std::runtime_error("unregistered generic availability");',1)
+    cpp=cpp.replace('bool has_loaded(KernelId id){++queries;', 'bool has_loaded(KernelId id){++queries;if(static_cast<size_t>(id)>=static_cast<size_t>(KernelId::PL_AUTOTILE_BEGIN))throw std::runtime_error("unregistered generic availability");',1)
     cpp=cpp.replace(' bool g05_k1_b3_available_=false;', ' bool g05_k1_b3_available(int64_t=0)const{return g05_k1_b3_available_;}\n bool g05_k1_b3_available_=false;')
     cpp+=r'''
 int main(){
@@ -252,7 +254,7 @@ def test_camera_group_cold_linkage_and_real_private_dispatch_mapping(tmp_path, m
     cold_cpp=tmp_path/'cold_link.cpp'
     cold_so=tmp_path/'cold_link.so'
     cold_cpp.write_text(captured[0])
-    result=subprocess.run(['c++','-std=c++17','-Wall','-Wextra','-fPIC','-shared','-Wl,--no-undefined',str(cold_cpp),'-o',str(cold_so)],capture_output=True,text=True)
+    result=subprocess.run(['c++','-std=c++17','-Wall','-Wextra','-fPIC','-shared','-Wl,--no-undefined','-I',str(ROOT/'src/core'),str(cold_cpp),'-o',str(cold_so)],capture_output=True,text=True)
     assert result.returncode==0,result.stderr
     undefined=subprocess.run(['nm','-D','--undefined-only',str(cold_so)],capture_output=True,text=True,check=True).stdout
     assert 'autotile_linear' not in undefined
@@ -261,19 +263,20 @@ def test_camera_group_cold_linkage_and_real_private_dispatch_mapping(tmp_path, m
     # Preserve the real source's anonymous namespace and compare its two ID
     # choices with the canonical IDs now used directly by Vision cold admission.
     linear=(ROOT/'src/ops/rpu_linear.cpp').read_text()
-    begin=linear.index('namespace {\n\nint autotile_n_index(')
-    end=linear.index('KernelId autotile_pgrp_kernel_id(',begin)
-    private_mapping=linear[begin:end]+'\n}\n'
+    from test_qwen3vl_prefill_gateup_launcher import definition
+    private_mapping = "namespace {\n" + "\n".join(definition(linear, signature) for signature in (
+        "KernelId autotile_linear_kernel_id(bool is_fp16, const rpu_pl_tiling::TilePick& tile)",
+        "KernelId autotile_linear_acc32_kernel_id(bool is_fp16, const rpu_pl_tiling::TilePick& tile) {")) + "\n}\n"
     cache_header=(ROOT/'src/core/rpu_kernel_cache.h').read_text()
     begin=cache_header.index('enum class KernelId : uint16_t {')
     enum=cache_header[begin:cache_header.index('};',begin)+2]
     mapping_cpp=tmp_path/'mapping.cpp'
     mapping_so=tmp_path/'mapping.so'
-    mapping_cpp.write_text('#include <cstdint>\n#include <stdexcept>\n#define TORCH_CHECK(ok,...) do{if(!(ok))throw std::runtime_error("rejected");}while(false)\n'+enum+'\n'+private_mapping+'''\nextern "C" int selected_acc16(){return static_cast<int>(autotile_linear_kernel_id(false,48));}
-extern "C" int canonical_acc16(){return static_cast<int>(KernelId::PL_AT_W8A16_M512N48);}
-extern "C" int selected_acc32(){return static_cast<int>(autotile_linear_acc32_kernel_id(false,80));}
-extern "C" int canonical_acc32(){return static_cast<int>(KernelId::PL_AT_W8A16_ACC32_M288N80);}
-''')
+    mapping_cpp.write_text(with_actual_linear_contracts('#include <cstdint>\n#include <stdexcept>\n#define TORCH_CHECK(ok,...) do{if(!(ok))throw std::runtime_error("rejected");}while(false)\n'+enum+'\n'+private_mapping+'''\nextern "C" int selected_acc16(){return static_cast<int>(autotile_linear_kernel_id(false,{48,512,128}));}
+extern "C" int canonical_acc16(){return static_cast<int>(KernelId::PL_U_INT8_ACC16_M512N48K128);}
+extern "C" int selected_acc32(){return static_cast<int>(autotile_linear_acc32_kernel_id(false,{80,288,128}));}
+extern "C" int canonical_acc32(){return static_cast<int>(KernelId::PL_U_INT8_ACC32_M288N80K128);}
+'''))
     result=subprocess.run(['c++','-std=c++17','-Wall','-Wextra','-Werror','-fPIC','-shared','-Wl,--no-undefined',str(mapping_cpp),'-o',str(mapping_so)],capture_output=True,text=True)
     assert result.returncode==0,result.stderr
     undefined=subprocess.run(['nm','-D','--undefined-only',str(mapping_so)],capture_output=True,text=True,check=True).stdout

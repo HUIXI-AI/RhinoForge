@@ -34,6 +34,7 @@ set(RPU_FUSED_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_hyvit2_vision_model.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_qwen3vl_vision_model.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_qwen3vl_decode_replay.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_qwen3_5_decode_replay.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_qwen3_5_vision_model.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_qwen25vl_vision_model.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/fused/rpu_dinov3_vision_model.cpp"
@@ -65,11 +66,14 @@ set(RPU_GRAPH_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/graph/graph_pybind.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/graph/custom_cpu_fallback_dispatch.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/graph/graph_spm_reset_guard.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/graph/graph_async_end.cpp"
 )
 
 set(RPU_OPS_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_gather.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_grouped_parallel_linear.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_grouped_indexed_linear.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_pi_nvfp4_sspm.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_moe_gather_mul.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_moe_index_shuffle.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_moe_topk_prob_norm.cpp"
@@ -121,6 +125,7 @@ set(RPU_OPS_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_fast_pos_embed.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_kvinsert_segment_plan.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_linear_gemv.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_linear_w8a8.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/ops/rpu_qwen3_5_gdn_fused.cpp"
 )
 

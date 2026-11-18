@@ -259,3 +259,176 @@ def test_wall_graph_policy_type_rejects_before_assets(value):
     ):
         with pytest.raises(TypeError, match="graph_runtime_policy"):
             call()
+
+
+@pytest.mark.parametrize("checkpoint_mode", ["channel", "g32"])
+def test_wall_w4_11008_real_builder_packing_and_cold_geometry(
+        monkeypatch, tmp_path, checkpoint_mode):
+    """Exercise both legacy checkpoint compositions through actual host packing.
+
+    Only uploads, asset reads and the native installation boundary are replaced.
+    This checks logical codes/scales, not floating-point TP reduction equivalence.
+    """
+    monkeypatch.setenv("RPU_WALL_OSS_ATTN_TP8", "1")
+    monkeypatch.setenv("RPU_WALL_OSS_EXPERT0_DOWN_INT4", "1")
+    monkeypatch.setenv("RPU_WALL_OSS_PREFILL_MIXED_PRECISION", "0")
+    monkeypatch.setenv("RPU_WALL_OSS_PREFILL_STAGED_MLP", "0")
+    hidden, intermediate = 2048, 11008
+    cfg = {"hidden_size": hidden, "num_attention_heads": 16,
+           "num_key_value_heads": 2, "head_dim": 128,
+           "intermediate_size": intermediate, "rms_norm_eps": 1e-6,
+           "rope_theta": 1000000, "rope_scaling": {"mrope_section": [16, 24, 24]},
+           "num_hidden_layers": 1}
+    (tmp_path / "config.json").write_text(json.dumps(cfg))
+    tensors = {}
+
+    def codes(n, k, is_down=False):
+        period = 255 if is_down and checkpoint_mode == "g32" else 15
+        return ((torch.arange(n, dtype=torch.int32)[:, None] * 3
+                 + torch.arange(k, dtype=torch.int32)[None, :]) % period
+                - period // 2).to(torch.int8)
+
+    def get_tensor(key):
+        if key in tensors:
+            return tensors[key]
+        if "qkv_proj" in key:
+            n, k = 2560, hidden
+        elif "o_proj" in key:
+            n, k = hidden, hidden
+        elif "gate_up_proj" in key:
+            n, k = 2 * intermediate, hidden
+        elif "down_proj" in key:
+            n, k = hidden, intermediate
+        else:
+            return torch.ones((1, hidden) if "embed_tokens" in key else hidden)
+        if key.endswith("weight_scale"):
+            channel = (torch.arange(n) % 7 + 1).half() / 128
+            value = (channel if checkpoint_mode == "channel" or "down_proj" in key
+                     else channel[None, :] * (torch.arange(k // 32) % 3 + 1).half()[:, None])
+        elif key.endswith("bias"):
+            value = torch.zeros(n)
+        else:
+            value = codes(n, k, "down_proj" in key)
+        tensors[key] = value
+        return value
+
+    monkeypatch.setattr(llm, "_SafeTensorStore", lambda *_: SimpleNamespace(get_tensor=get_tensor))
+    monkeypatch.setattr(llm, "_to_rpu_half", lambda value: value.half())
+    monkeypatch.setattr(llm, "_build_rope_tables", lambda *_: (torch.ones(1), torch.ones(1)))
+    monkeypatch.setattr(llm, "RPUCache", lambda **_: object())
+    monkeypatch.setattr(llm.rpu_backend.graph, "GraphCache", lambda **_: object())
+    monkeypatch.setattr(torch.ops.rpu, "causal_decoder_set_weights_w8a16", lambda *_: None, raising=False)
+    original_to = torch.Tensor.to
+
+    def cpu_upload(tensor, *args, **kwargs):
+        if kwargs.get("device") == "rpu":
+            kwargs["device"] = "cpu"
+        return original_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", cpu_upload)
+    captured = {}
+
+    def stop_at_native(**kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("checked cold packed W4 boundary")
+
+    monkeypatch.setattr(llm, "_configure_causal_decoder_handle", stop_at_native)
+    with pytest.raises(RuntimeError, match="checked cold packed W4 boundary"):
+        llm.build_wall_oss_llm(str(tmp_path), w4a16=True, max_seq_len=16)
+    args = captured["weight_args"]
+    assert args[14:19] == [16, 8, 128, hidden, intermediate]
+    assert captured["wall_prefill_routes"][0:2] == (False, False)
+    gate_up = tensors["model.layers.0.moe.experts.0.gate_up_proj.weight"]
+    down = tensors["model.layers.0.moe.experts.0.down_proj.weight"]
+    down_scale = tensors["model.layers.0.moe.experts.0.down_proj.weight_scale"]
+    if checkpoint_mode == "g32":
+        amax = down.float().abs().amax(1)
+        down = torch.round(down.float() * (7 / amax[:, None])).clamp(-7, 7).to(torch.int8)
+        down_scale = (down_scale.float() * (amax / 7)).half()
+
+    gu_scale = tensors["model.layers.0.moe.experts.0.gate_up_proj.weight_scale"]
+    if gu_scale.dim() == 1:
+        gu_scale = gu_scale[None, :].expand(hidden // 32, 2 * intermediate)
+    for weight, scale, values, expected_scale, partition in (
+        (args[8][0], args[27][0], gate_up[:intermediate],
+         gu_scale[:, :intermediate], 1),
+        (args[9][0], args[28][0], gate_up[intermediate:],
+         gu_scale[:, intermediate:], 1),
+        (args[10][0], args[29][0], down,
+         down_scale[None, :].expand(intermediate // 32, hidden), 0),
+    ):
+        n, k = values.shape
+        assert weight.shape == (n, k // 2) and weight.dtype == torch.uint8
+        assert scale.shape == (32, 22528) and scale.dtype == torch.float16
+        ln_max, lk_max = (n // 8, k) if partition else (n, k // 8)
+        # Independently address every logical code, using bounded row slices.
+        for start in range(0, n, 64):
+            nn = torch.arange(start, min(start + 64, n))[:, None]
+            kk = torch.arange(k)[None, :]
+            core = nn // ln_max if partition else kk // lk_max
+            ln, lk = nn % ln_max, kk % lk_max
+            address = (((((ln // 32) * (lk_max // 32) + lk // 32) * 8 + core)
+                        * 16 + ln % 16) * 2 + ln % 32 // 16) * 16 + lk % 16
+            decoded = ((weight.flatten()[address] >> ((lk % 32 // 16) * 4)) & 15).to(torch.int8)
+            decoded = torch.where(decoded >= 8, decoded - 16, decoded)
+            assert torch.equal(decoded, values[start:start + 64])
+        lg = k // 32 if partition else k // 32 // 8
+        ln = n // 8 if partition else n
+        gb, nb = (lg + 3) // 4, (ln + 63) // 64
+        local = scale.view(gb, nb, 8, 4, 64).permute(2, 0, 3, 1, 4).reshape(8, gb * 4, nb * 64)
+        assert torch.count_nonzero(local[:, lg:, :]) == 0
+        assert torch.count_nonzero(local[:, :, ln:]) == 0
+        real = local[:, :lg, :ln]
+        restored = (real.permute(1, 0, 2).reshape(k // 32, n)
+                    if partition else real.reshape(k // 32, n))
+        assert torch.equal(restored, expected_scale)
+
+
+@pytest.mark.parametrize("mode,down_int4,expected", [
+    ("w4", True, 11008), ("w4", False, 11008),
+    ("nvfp4", False, 11264), ("nvfp4_w8_down", False, 11008),
+])
+def test_wall_cold_width_keeps_nvfp4_and_w8_down_contract(
+        monkeypatch, tmp_path, mode, down_int4, expected):
+    monkeypatch.setenv("RPU_WALL_OSS_EXPERT0_DOWN_INT4", str(int(down_int4)))
+    monkeypatch.setenv("RPU_WALL_OSS_PREFILL_MIXED_PRECISION", "0")
+    monkeypatch.setenv("RPU_WALL_OSS_PREFILL_STAGED_MLP", "0")
+    cfg = {"hidden_size": 2048, "num_attention_heads": 16, "num_key_value_heads": 2,
+           "head_dim": 128, "intermediate_size": 11008, "rms_norm_eps": 1e-6,
+           "rope_theta": 1000000, "rope_scaling": {"mrope_section": [16, 24, 24]},
+           "num_hidden_layers": 0}
+    (tmp_path / "config.json").write_text(json.dumps(cfg))
+    value = torch.ones(2048)
+    monkeypatch.setattr(llm, "_SafeTensorStore", lambda *_: SimpleNamespace(get_tensor=lambda _: value))
+    monkeypatch.setattr(llm, "_to_rpu_half", lambda value: value)
+    monkeypatch.setattr(llm, "_build_rope_tables", lambda *_: (value, value))
+    monkeypatch.setattr(llm, "RPUCache", lambda **_: object())
+    monkeypatch.setattr(llm.rpu_backend.graph, "GraphCache", lambda **_: object())
+    monkeypatch.setattr(llm, "validate_w8_nvfp4_checkpoint_pair", lambda *_: None)
+    monkeypatch.setattr(llm, "_nvfp4_tensor_scale_array", lambda _: torch.zeros(8))
+    for name in ("causal_decoder_set_weights_w8a16", "causal_decoder_set_weights_nvfp4"):
+        monkeypatch.setattr(torch.ops.rpu, name, lambda *_: None, raising=False)
+
+    def stop_at_native(**kwargs):
+        assert kwargs["weight_args"][18] == expected
+        raise RuntimeError("checked cold width")
+
+    monkeypatch.setattr(llm, "_configure_causal_decoder_handle", stop_at_native)
+    options = {"w4a16": True} if mode == "w4" else {"nvfp4a16": True}
+    if mode == "nvfp4_w8_down":
+        options["w8_down_ckpt_dir"] = str(tmp_path)
+    with pytest.raises(RuntimeError, match="checked cold width"):
+        llm.build_wall_oss_llm(str(tmp_path), **options)
+
+
+@pytest.mark.parametrize("group_size", [64, 128])
+def test_wall_scale_larger_groups_keep_actual_row_divisibility(monkeypatch, group_size):
+    monkeypatch.setattr(llm, "_to_rpu_half", lambda value: value)
+    # Wider groups cannot split across TP8. The G32 width optimization does not
+    # weaken the existing scale packer's admission for a hypothetical Down group.
+    with pytest.raises(ValueError, match="G%cores"):
+        llm._scale_to_rpu(torch.ones(2048, 11008 // group_size, dtype=torch.float16),
+            in_features=11008, partition=0, num_cores=8)
+    scale = llm._scale_to_rpu(torch.ones(2048, 11264 // group_size, dtype=torch.float16),
+        in_features=11264, partition=0, num_cores=8)
+    assert scale.shape[0] == group_size

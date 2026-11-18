@@ -1,5 +1,6 @@
 """Execute the real Pi C272 owner/domain/manifest code without device allocation."""
 from pathlib import Path
+from pi_wall_host_catalog import CATALOG_INCLUDE, absolute_candidate_includes
 
 from test_siglip_attention_dry_live_contract import _function, _run_native
 
@@ -30,8 +31,8 @@ def test_c272_a8_exact_domain_manifest_and_payload_lifecycle(tmp_path, monkeypat
     guard = dry[begin:dry.index(");", begin) + 2]
     append = _function(dry, "        if (pi05_prefill_a8_short()) {")
     availability = _function(cache, "class KernelPayloadAvailability final")
-    kernel_ids = _function(cache, "enum class KernelId")
-    code = r'''
+    kernel_ids = absolute_candidate_includes(_function(cache, "enum class KernelId"))
+    code = CATALOG_INCLUDE + r'''
 #include "core/fused_model_base.h"
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
@@ -41,6 +42,7 @@ def test_c272_a8_exact_domain_manifest_and_payload_lifecycle(tmp_path, monkeypat
 #include <iostream>
 using namespace v3;
 ''' + kernel_ids + ";\n" + availability + r''';
+KernelId pi_wall_kernel_id(std::size_t ordinal) { return static_cast<KernelId>(static_cast<unsigned>(KernelId::PI_WALL_BEGIN)+ordinal); }
 struct KernelCache {
     KernelPayloadAvailability availability;
     static KernelCache& instance() { static KernelCache cache; return cache; }
@@ -51,7 +53,7 @@ namespace v3 {
 struct Owner {
     bool linear_acc32_=false;
     bool pi05_prefill_a8_=true, pi05_prefill_gateup_pair_=false;
-    bool pi05_prefill_o_chain_=false, pi05_prefill_o_pair_=false;
+    bool pi05_prefill_o_pair_=false;
     bool pi05_prefill_qkv_pair_=false, pi05_prefill_down_pair_=false;
     bool pi05_prefill_owner_norm_=false, pi05_prefill_kv1_pair_direct_=false;
     bool pi05_prefill_kv_only_=false, pi05_ring_xor3_opt_in_=false;
@@ -106,7 +108,11 @@ template<class F> void rejects(F run) {
 int main() {
     at::set_num_threads(1);
     auto& payload=KernelCache::instance().availability;
-    payload.publish(true,true,false,false,false,true);
+    KernelPayloadAvailability::ExtendedPayloads current;
+    current.set(static_cast<size_t>(pi_wall_kernel_id(rpu_pi_wall::select(
+        rpu_pi_wall::Operation::A8OnlineGelu,rpu_pl_tiling::WeightType::Int8,true,272,2048,2048).ordinal))
+        - KernelPayloadAvailability::kExtendedBegin);
+    payload.publish(true,true,false,false,false,false,current);
     Owner owner;
     FmbThreeStageChunkPlan plan;
     plan.chunk_mode=ChunkMode::KV_FIRST;
@@ -206,7 +212,7 @@ int main() {
     assert(pair.routes.empty() && pair.linear_accumulation==FmbLinearAccumulationPolicy::MIXED_BY_SITE);
     rejects([&]{owner.pi05_prefill_a8_short_validate_manifest(valid);});
     owner.pi05_prefill_gateup_pair_=false;
-    for(auto flag : {&owner.pi05_prefill_o_chain_,&owner.pi05_prefill_o_pair_,
+    for(auto flag : {&owner.pi05_prefill_o_pair_,
         &owner.pi05_prefill_qkv_pair_,&owner.pi05_prefill_down_pair_,&owner.pi05_prefill_owner_norm_,
         &owner.pi05_prefill_kv1_pair_direct_,&owner.pi05_prefill_kv_only_,&owner.pi05_ring_xor3_opt_in_}) {
         *flag=true;assert(!owner.pi05_prefill_a8_short_owner());
@@ -231,7 +237,7 @@ int main() {
     owner.pi05_prefill_gateup_pair_=false;
     payload.withdraw();
     rejects([&]{owner.pi05_prefill_a8_short_owner();});
-    payload.publish(true,true,false,false,false,true);
+    payload.publish(true,true,false,false,false,false,current);
     owner.pi05_prefill_a8_short_validate_manifest(valid);
     std::cout << "Pi C272 A8 real owner/domain/manifest/payload: PASS\n";
 }

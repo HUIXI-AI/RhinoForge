@@ -17,6 +17,8 @@ from pathlib import Path
 import shutil
 
 import torch
+
+from rpu_backend.runtime.vision_position import canonical_vision_type
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
@@ -124,11 +126,11 @@ def _matches_geometry(config, hidden_size) -> bool:
             and float(rope.get("rope_theta", _get(text, "rope_theta", 0))) == 5_000_000.0
             and rope.get("mrope_interleaved") is True
             and tuple(rope.get("mrope_section", ())) == (24, 20, 20)
-            and tuple(_get(vision, key) for key in (
-                "model_type", "hidden_size", "intermediate_size", "depth", "num_heads",
+            and (canonical_vision_type(vision, "qwen3_vl"), *tuple(_get(vision, key) for key in (
+                "hidden_size", "intermediate_size", "depth", "num_heads",
                 "patch_size", "temporal_patch_size", "spatial_merge_size", "out_hidden_size",
                 "hidden_act", "in_channels", "num_position_embeddings",
-            )) == ("qwen3_vl", vh, vi, depth, 16, 16, 2, 2, hidden_size,
+            ))) == ("qwen3_vl", vh, vi, depth, 16, 16, 2, 2, hidden_size,
                   "gelu_pytorch_tanh", 3, 2304)
             and tuple(_get(vision, "deepstack_visual_indexes", ())) == taps
             and tuple(_get(config, key) for key in (

@@ -38,12 +38,26 @@ inline int qwen35_reduced_profile_num_layers(
     return 0;
 }
 
+// Exact G05 action expert (adaLN, 24 full-attention layers): its two KV heads
+// arrive replicated to the four attention lanes. I4096 cannot split across six
+// lanes, so the action owner is admitted on the four-core template only; a
+// six-core G05 budget runs this expert at four cores. set_weights additionally
+// binds the all-full schedule, SiLU, eps and M-RoPE before committing state.
+inline int g05_action_profile_num_layers(
+        int64_t q_heads, int64_t effective_kv_heads, int64_t head_dim,
+        int64_t hidden, int64_t intermediate) {
+    return q_heads == 8 && effective_kv_heads == 4 && head_dim == 256 &&
+           hidden == 1024 && intermediate == 4096 ? 24 : 0;
+}
+
 inline DecoderExecutionTopology resolve_qwen35_reduced_execution_topology(
         int owner, int64_t q_heads, int64_t effective_kv_heads,
         int64_t head_dim, int64_t hidden, int64_t intermediate) {
-    if ((owner != 4 && owner != 6) ||
+    const bool action = owner == 4 && g05_action_profile_num_layers(
+        q_heads, effective_kv_heads, head_dim, hidden, intermediate) != 0;
+    if (!action && ((owner != 4 && owner != 6) ||
         qwen35_reduced_profile_num_layers(q_heads, effective_kv_heads,
-                                         head_dim, hidden, intermediate) == 0) {
+                                         head_dim, hidden, intermediate) == 0)) {
         throw std::invalid_argument("no admitted reduced-core Qwen3.5 template");
     }
     return {owner, 4, owner};

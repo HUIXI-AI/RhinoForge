@@ -69,6 +69,10 @@ public:
     // Both choices must be bound before set_weights().
     void set_linear_acc32(bool enabled);
     void set_gelu_erf_ultra(bool enabled);
+    // Opt-in REPLAY host skip for single-frame, single-camera, 256-patch
+    // STEP0+merger groups of any tower width. forward_impl refreshes the pixel,
+    // position and merger destination bases each call; set before the first forward.
+    void set_fast_replay(bool enabled);
     // Exact G05 K1 arithmetic policy. Formula and Linear accumulation are
     // independent; bind once before weights, and retain FP16 activations.
     void set_high_precision(bool enabled);
@@ -551,6 +555,7 @@ private:
     int attention_tp_ = 0;
     bool linear_acc32_ = false;
     bool gelu_erf_ultra_ = false;
+    bool fast_replay_requested_ = false;
     bool moe_precision_ = false;
     bool high_precision_ = false;
     bool high_precision_bound_ = false;

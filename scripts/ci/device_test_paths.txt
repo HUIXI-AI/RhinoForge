@@ -13,6 +13,7 @@ python/rpu_backend/tests/core/test_wall_oss_action_step_skeleton.py
 python/rpu_backend/tests/graph/test_dynamo_compile_frontend.py
 python/rpu_backend/tests/graph/test_graph_capture_decode.py
 python/rpu_backend/tests/graph/test_graph_comprehensive_v5.py
+python/rpu_backend/tests/graph/test_graph_end_releases_gil.py
 python/rpu_backend/tests/graph/test_manual_multigraph_barrier.py
 python/rpu_backend/tests/graph/test_pi05_graph_capture.py
 python/rpu_backend/tests/graph/test_pi05_isolate_subsystem.py

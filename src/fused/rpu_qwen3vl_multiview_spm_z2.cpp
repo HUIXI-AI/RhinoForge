@@ -4,6 +4,7 @@
 #include "core/rpu_kernel_decls.h"
 #include "core/rpu_spm_allocator.h"
 #include "graph/graph_runtime.h"
+#include "rpu_parallel_linear_register_policies.h"
 #include "rpu_runtime_state.h"
 
 #include <c10/util/Exception.h>
@@ -463,198 +464,8 @@ v3::SpmDense2DSpec produced_spec() {
     return spec;
 }
 
-GraphDdrRegisterAbi outer_ddr_abi(
-    GraphDdrRegisterRole role,
-    GraphDdrRegisterAccess access,
-    uint16_t reg_lo,
-    uint16_t reg_hi) {
-    return GraphDdrRegisterAbi{
-        role, access, GraphDdrRegisterEncoding::DevAddrShift8LoHi,
-        reg_lo, reg_hi};
-}
-
-GraphKernelRegisterRule outer_typed_rule(
-    KernelId id,
-    size_t count,
-    std::vector<GraphDdrRegisterAbi> operands) {
-    GraphKernelRegisterRule rule;
-    rule.kernel_id = id;
-    rule.kind = GraphKernelRegisterRuleKind::TypedDdr;
-    rule.operands = std::move(operands);
-    rule.expected_count = count;
-    return rule;
-}
-
-GraphKernelRegisterRule outer_intrinsic_no_ddr_rule(
-    KernelId id,
-    size_t count) {
-    GraphKernelRegisterRule rule;
-    rule.kernel_id = id;
-    rule.kind = GraphKernelRegisterRuleKind::IntrinsicNoDdr;
-    rule.expected_count = count;
-    return rule;
-}
-
-GraphKernelRegisterRule outer_explicit_no_ddr_rule(
-    KernelId id,
-    size_t count,
-    GraphKernelNoDdrProof proof) {
-    GraphKernelRegisterRule rule;
-    rule.kernel_id = id;
-    rule.kind = GraphKernelRegisterRuleKind::ExplicitNoDdr;
-    rule.no_ddr_proof = proof;
-    rule.expected_count = count;
-    return rule;
-}
-
-GraphKernelRegisterCensusStats outer_phase_stats(
-    size_t nodes,
-    size_t dmas,
-    size_t barriers,
-    size_t kernels,
-    size_t typed,
-    size_t no_ddr,
-    size_t operands,
-    size_t weights,
-    size_t keys,
-    size_t values,
-    size_t semantic_inputs,
-    uint64_t node_hash,
-    uint64_t kernel_hash) {
-    GraphKernelRegisterCensusStats stats;
-    stats.node_count = nodes;
-    stats.dma_count = dmas;
-    stats.barrier_count = barriers;
-    stats.kernel_count = kernels;
-    stats.typed_kernel_count = typed;
-    stats.no_ddr_kernel_count = no_ddr;
-    stats.operand_count = operands;
-    stats.weight_operand_count = weights;
-    stats.key_cache_operand_count = keys;
-    stats.value_cache_operand_count = values;
-    stats.semantic_input_operand_count = semantic_inputs;
-    stats.ordered_node_kind_hash = node_hash;
-    stats.ordered_kernel_hash = kernel_hash;
-    return stats;
-}
-
 const GraphKernelRegisterPolicy& lingbot2_multiview_w8_register_policy() {
-    // Counts and ordered streams are frozen from one bounded post-oplib
-    // LKN_SKIP BUILD census covering the combined linear/GELU/MRoPE/ring
-    // migration. The shared QK-pair path now emits Q/K norm before Q/K RoPE;
-    // its 36 adjacent swaps preserve every rule/count and produce the exact
-    // updated kernel hash below. Any other stream drift still fails closed.
-    constexpr uint64_t kOrderedNodeKindHash =
-        UINT64_C(0x1bf03075ed732d0b);
-    constexpr uint64_t kOrderedKernelHash =
-        UINT64_C(0x4502093998e4d8e5);
-    static const GraphKernelRegisterPolicy policy = [] {
-        GraphKernelRegisterPolicy value;
-        value.fingerprint = UINT64_C(0x4c423257385a3251);  // LB2W8Z2Q
-        value.name =
-            "lingbot2_multiview_w8_outer_ring_register_census_v6_qk_pair";
-
-        const auto int8_weight = outer_ddr_abi(
-            GraphDdrRegisterRole::Int8ModelWeight,
-            GraphDdrRegisterAccess::Read, 2, 3);
-        const auto scale = outer_ddr_abi(
-            GraphDdrRegisterRole::PerChannelScale,
-            GraphDdrRegisterAccess::Read, 20, 21);
-        const auto fp16_weight = outer_ddr_abi(
-            GraphDdrRegisterRole::ModelWeight,
-            GraphDdrRegisterAccess::Read, 2, 3);
-        const auto key_write = outer_ddr_abi(
-            GraphDdrRegisterRole::KeyCache,
-            GraphDdrRegisterAccess::Write, 8, 9);
-        const auto value_write = outer_ddr_abi(
-            GraphDdrRegisterRole::ValueCache,
-            GraphDdrRegisterAccess::Write, 8, 9);
-        const auto key_read = outer_ddr_abi(
-            GraphDdrRegisterRole::KeyCache,
-            GraphDdrRegisterAccess::Read, 50, 51);
-        const auto value_read = outer_ddr_abi(
-            GraphDdrRegisterRole::ValueCache,
-            GraphDdrRegisterAccess::Read, 52, 53);
-        const auto rope_position = outer_ddr_abi(
-            GraphDdrRegisterRole::SemanticInput,
-            GraphDdrRegisterAccess::Read, 0, 1);
-        const auto partial_mrope_cos = outer_ddr_abi(
-            GraphDdrRegisterRole::SemanticInput,
-            GraphDdrRegisterAccess::Read, 0, 1);
-        const auto partial_mrope_sin = outer_ddr_abi(
-            GraphDdrRegisterRole::SemanticInput,
-            GraphDdrRegisterAccess::Read, 2, 3);
-
-        value.rules = {
-            outer_typed_rule(
-                KernelId::PL_AT_W8A16_M320N112, 144,
-                {int8_weight, scale}),
-            outer_typed_rule(
-                KernelId::PL_AT_W8A16_M352N96, 180,
-                {int8_weight, scale}),
-            outer_typed_rule(
-                KernelId::PL_AT_W8A16_M400N80, 72,
-                {int8_weight, scale}),
-            outer_typed_rule(
-                KernelId::PL_AT_W8A16_M512N48, 288,
-                {int8_weight, scale}),
-            outer_typed_rule(
-                KernelId::PL_AT_FP16_M528N48, 12, {fp16_weight}),
-            outer_typed_rule(
-                KernelId::PL_AT_FP16_M608N32, 12, {fp16_weight}),
-            outer_typed_rule(
-                KernelId::ROPE_2D_SPM, 144, {rope_position}),
-            outer_typed_rule(
-                KernelId::PARTIAL_MROPE, 72,
-                {partial_mrope_cos, partial_mrope_sin}),
-            outer_typed_rule(
-                KernelId::LLAMA_INSERT_KCACHE, 36, {key_write}),
-            outer_typed_rule(
-                KernelId::LLAMA_INSERT_VCACHE, 36, {value_write}),
-            outer_typed_rule(
-                KernelId::LLAMA_INSERT_KCACHE_V16, 72, {key_write}),
-            outer_typed_rule(
-                KernelId::LLAMA_INSERT_VCACHE_V16, 72, {value_write}),
-            outer_typed_rule(
-                KernelId::SDPA_FLASH_ATTN_SPM, 108,
-                {key_read, value_read}),
-            outer_explicit_no_ddr_rule(
-                KernelId::LLM_ALL_REDUCE_RESIDUAL_RING_PACED, 228,
-                GraphKernelNoDdrProof::RingAllReduceSpmResidual),
-            outer_intrinsic_no_ddr_rule(
-                KernelId::MEMSET_SPM_MULTI_CORE_V2, 72),
-            outer_intrinsic_no_ddr_rule(KernelId::LAYER_NORM, 156),
-            outer_intrinsic_no_ddr_rule(KernelId::RMS_NORM_BF16_SPM, 145),
-            outer_intrinsic_no_ddr_rule(KernelId::BINARY_SAMESHAPE, 45),
-            outer_intrinsic_no_ddr_rule(KernelId::UNARY_SPM, 36),
-            outer_intrinsic_no_ddr_rule(
-                KernelId::UNARY_GELU_TANH_SPM, 72),
-            outer_intrinsic_no_ddr_rule(
-                KernelId::UNARY_GELU_ERF_SPM, 12),
-        };
-
-        value.expected_node_count = 16818;
-        value.expected_dma_count = 5466;
-        value.expected_barrier_count = 9338;
-        value.expected_kernel_count = 2014;
-        value.expected_typed_kernel_count = 1248;
-        value.expected_no_ddr_kernel_count = 766;
-        value.expected_operand_count = 2112;
-        value.expected_weight_operand_count = 1392;
-        value.expected_key_cache_operand_count = 216;
-        value.expected_value_cache_operand_count = 216;
-        value.expected_semantic_input_operand_count = 288;
-        value.expected_ordered_node_kind_hash = kOrderedNodeKindHash;
-        value.expected_ordered_kernel_hash = kOrderedKernelHash;
-        value.phases = {GraphKernelRegisterPhaseExpectation{
-            "outer",
-            outer_phase_stats(
-                16818, 5466, 9338, 2014, 1248, 766,
-                2112, 1392, 216, 216, 288,
-                kOrderedNodeKindHash, kOrderedKernelHash)}};
-        return value;
-    }();
-    return policy;
+    return rpu_pl_census::policy("lingbot2_multiview_w8_register_policy");
 }
 
 GraphKernelRegisterPolicy lingbot2_register_policy_with_manifest_branches(
@@ -713,8 +524,8 @@ GraphKernelRegisterPolicy lingbot2_register_policy_with_manifest_branches(
                 "LingBot2 manifest census changed the original ordered execution stream");
 
     auto policy = baseline;
-    policy.fingerprint = UINT64_C(0x4c423257385a324d);  // LB2W8Z2M
-    policy.name = "lingbot2_multiview_w8_outer_ring_register_census_v7_manifest";
+    policy.fingerprint = baseline.fingerprint ^ UINT64_C(0x464d424d41524b34);
+    policy.name = "lingbot2_multiview_w8_n32k32_register_census_v1_manifest";
     policy.expected_node_count += kOccurrenceCount;
     policy.expected_ordered_node_kind_hash = full_hash;
     policy.phases[0].stats.node_count += kOccurrenceCount;

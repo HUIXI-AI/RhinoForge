@@ -8,7 +8,8 @@ Public surface:
 
 Scope (P4 install + forward):
   - Install path: config preflight → patch_embed Conv2d→Linear CPU fp16
-    fold + ViT-B 12→16 head zero-pad + linear swizzle → move to device →
+    fold + ViT-B 12→16 head zero-pad (eight cores; none at the cold 4/6-core
+    budget) + linear swizzle for that core count → move to device →
     install device keepalives (CLS+reg / γ_attn / γ_mlp stacks) → install
     fused C++ vision handle (set_weights / set_rope / KV cache) → set
     hardware attrs → replace forward.
@@ -58,6 +59,7 @@ from rpu_backend.api.errors import RPUBackendError, UnsupportedModelError
 from rpu_backend.runtime.decoder import plan_bounded_prefill_execution
 from rpu_backend.runtime.execution_planner import GRAPH_RETAINED_CACHE
 from rpu_backend.runtime.registry import register_adapter
+from rpu_backend.runtime.topology import execution_core_count
 from rpu_backend.runtime.weights import convert_linear_weights_inplace
 
 
@@ -72,10 +74,19 @@ __all__ = [
 
 DINOV3_VIT_ARCH = "DINOv3ViTModel"
 
-# Mirrors C++ NUM_CORES. Attention head count must be a multiple of this; the
-# Python adapter pads ViT-B (12 heads) → 16 heads with zero rows/cols before
-# the linear swizzle (see `_pad_attn_heads_to_multiple_of_cores`).
+# Default (and physical KV-stripe) core count. The cold execution budget
+# `rpu_execution.model.num_cores` selects 4, 6 or 8 (default 8). Attention head
+# count must be a multiple of the selected count: at eight cores the adapter
+# pads ViT-B (12 heads) → 16 heads with zero rows/cols before the linear
+# swizzle (see `_pad_attn_heads_to_multiple_of_cores`); at four or six cores
+# the 12 heads split 3 or 2 per core without padding.
 _NUM_CORES = 8
+# Exact geometry admitted below eight cores: ViT-B/16 224x224, 4 registers,
+# hidden 768, 12 heads x D64, GELU MLP 3072. Every Q/K/V/O and MLP partition
+# width (768, 3072) divides by 16 x 4 and 16 x 6, as the native Linear,
+# swizzle, SDPA (heads % cores) and KV-insert partitions require.
+_REDUCED_CORE_PROFILE = (768, 12, 12, 16, 224, 4)
+_REDUCED_CORE_INTERMEDIATE = 3072
 _LOG = logging.getLogger(__name__)
 
 
@@ -173,23 +184,67 @@ def _check_profile(config: Any) -> None:
 SKIP_LINEAR_NAMES: set[str] = set()
 
 
-def _padded_num_heads(num_heads: int) -> int:
-    """Round `num_heads` up to the next multiple of NUM_CORES.
+def _check_execution_cores(config: Any, execution: Any) -> int:
+    """Return the admitted cold core budget for this config (4, 6 or 8).
 
-    DINOv3 ViT-B (12 heads) → 16; ViT-L (16 heads) → 16; ViT-S (6 heads) → 8.
-    The framework hard-assumes `nq % NUM_CORES == 0` (it computes per-core
-    head slices via `nq // NUM_CORES`; non-divisible counts silently drop the
+    Eight keeps the historical padded-head layout. Four and six admit only the
+    exact ViT-B geometry; the native owner re-checks the same geometry.
+    """
+    cores = execution_core_count(execution)
+    if cores == _NUM_CORES:
+        return cores
+    heads = int(config.num_attention_heads)
+    hidden = int(config.hidden_size)
+    intermediate = int(config.intermediate_size)
+    head_dim = hidden // heads if heads else 0
+    if (_profile(config) != _REDUCED_CORE_PROFILE
+            or intermediate != _REDUCED_CORE_INTERMEDIATE
+            or bool(getattr(config, "use_gated_mlp", False))
+            or head_dim != 64 or heads % cores
+            or (heads * head_dim) % (16 * cores) or intermediate % (16 * cores)):
+        raise ValueError(
+            f"DINOv3 model.num_cores={cores} admits only exact ViT-B/16 "
+            "(hidden 768, 12 heads x 64, MLP 3072, 224x224, 4 registers); "
+            "omit model.num_cores or use 8 for other profiles")
+    return cores
+
+
+def _dinov3_execution_cores(model: nn.Module) -> int:
+    """Cold core budget bound to this model's execution session."""
+    return _check_execution_cores(
+        model.config, getattr(model, "_rpu_execution", {}))
+
+
+def _dinov3_layers(model: nn.Module):
+    """Resolve HF's encoder container without registering a second module path."""
+    layers = getattr(model, "layer", None)
+    if layers is None:
+        layers = getattr(getattr(model, "model", None), "layer", None)
+    if layers is None:
+        raise UnsupportedModelError("DINOv3 model has no supported encoder layer container")
+    return layers
+
+
+def _padded_num_heads(num_heads: int, num_cores: int = _NUM_CORES) -> int:
+    """Round `num_heads` up to the next multiple of the execution cores.
+
+    At eight cores DINOv3 ViT-B (12 heads) → 16; ViT-L (16 heads) → 16;
+    ViT-S (6 heads) → 8. At four or six cores ViT-B stays 12 (3 or 2 heads per
+    core). The framework hard-assumes `nq % cores == 0` (it computes per-core
+    head slices via `nq // cores`; non-divisible counts silently drop the
     remainder). Padding with zero attention weights yields zero contribution
     from the phantom heads while keeping the kernel sequence unchanged.
     """
     if num_heads <= 0:
         raise ValueError(f"_padded_num_heads: num_heads must be positive, got {num_heads}")
-    return ((num_heads + _NUM_CORES - 1) // _NUM_CORES) * _NUM_CORES
+    if num_cores not in (4, 6, 8):
+        raise ValueError(f"_padded_num_heads: num_cores must be 4, 6 or 8, got {num_cores}")
+    return ((num_heads + num_cores - 1) // num_cores) * num_cores
 
 
-def _pad_attn_heads_to_multiple_of_cores(model: nn.Module) -> None:
+def _pad_attn_heads_to_multiple_of_cores(model: nn.Module, num_cores: int = _NUM_CORES) -> None:
     """Zero-pad q/k/v/o weights (and q/v biases) so `num_heads` becomes a
-    multiple of NUM_CORES.
+    multiple of the execution cores.
 
     HF DINOv3 attention layout:
       - q_proj / k_proj / v_proj: `nn.Linear(hidden, nq * head_dim)` with
@@ -205,7 +260,8 @@ def _pad_attn_heads_to_multiple_of_cores(model: nn.Module) -> None:
         input columns zero (silent zero contribution to o_proj sum).
       o_proj.bias and k_proj.bias are unchanged.
 
-    No-op if `nq` is already divisible by NUM_CORES (e.g., ViT-L).
+    No-op if `nq` is already divisible by the cores (e.g., ViT-L, or ViT-B
+    at four/six cores).
 
     Must run BEFORE `convert_linear_weights_inplace` — the swizzle interleaves
     bytes assuming the canonical `[out, in]` shape, so the pad-then-swizzle
@@ -215,14 +271,14 @@ def _pad_attn_heads_to_multiple_of_cores(model: nn.Module) -> None:
     """
     cfg = model.config
     num_heads = int(cfg.num_attention_heads)
-    target = _padded_num_heads(num_heads)
+    target = _padded_num_heads(num_heads, num_cores)
     if target == num_heads:
         return
     head_dim = int(cfg.hidden_size) // num_heads
     pad_rows = (target - num_heads) * head_dim
 
     with torch.no_grad():
-        for layer in model.layer:
+        for layer in _dinov3_layers(model):
             attn = layer.attention
             for name in ("q_proj", "k_proj", "v_proj"):
                 lin = getattr(attn, name)
@@ -256,11 +312,15 @@ def _convert_dinov3_weights_for_rpu(model: nn.Module) -> None:
     1. Capture HF `embeddings.patch_embeddings` Conv2d weight `[H, 3, k, k]`
        folded to `[H, 3·k·k]` plus its bias, both CPU fp16 contiguous,
        stashed on `model._rpu_dinov3_patch_embed_w` / `_b`.
-    2. Pad attention heads up to a multiple of NUM_CORES (no-op for ViT-L).
+    2. Pad attention heads up to a multiple of the cold execution cores
+       (no-op for ViT-L, and for ViT-B at four/six cores).
     3. Swizzle every leaf `nn.Linear` weight in-place (attention q/k/v/o,
-       MLP up_proj/down_proj). k_proj has bias=None — preserved because
-       `convert_linear_weights_inplace` only touches `.weight`.
+       MLP up_proj/down_proj) for that core count. k_proj has bias=None —
+       preserved because `convert_linear_weights_inplace` only touches
+       `.weight`. The applied count is recorded as `_rpu_vision_num_cores`;
+       the native installer binds the same count.
     """
+    num_cores = _dinov3_execution_cores(model)
     with torch.no_grad():
         pe = model.embeddings.patch_embeddings
         pe_w = pe.weight.data  # [hidden, in_channels, k, k]
@@ -279,8 +339,16 @@ def _convert_dinov3_weights_for_rpu(model: nn.Module) -> None:
             pe.bias.data.to(dtype=torch.float16, device="cpu").contiguous()
         )
 
-    _pad_attn_heads_to_multiple_of_cores(model)
-    convert_linear_weights_inplace(model, skip_names=SKIP_LINEAR_NAMES)
+    _pad_attn_heads_to_multiple_of_cores(model, num_cores)
+    if num_cores == _NUM_CORES:
+        convert_linear_weights_inplace(model, skip_names=SKIP_LINEAR_NAMES)
+    else:
+        # One budget for every role; the reduced budget rejects unknown Linears.
+        convert_linear_weights_inplace(
+            model, skip_names=SKIP_LINEAR_NAMES, attn_num_cores=num_cores,
+            mlp_num_cores=num_cores, lm_head_num_cores=num_cores,
+            execution_core_count=num_cores)
+    model._rpu_vision_num_cores = num_cores
 
 
 # =============================================================================
@@ -313,7 +381,8 @@ def _install_dinov3_rpu_keepalives(model: nn.Module) -> None:
     cfg = model.config
     hidden = int(cfg.hidden_size)
     num_reg = int(cfg.num_register_tokens)
-    num_layers = len(model.layer)
+    layers = _dinov3_layers(model)
+    num_layers = len(layers)
 
     with torch.no_grad():
         cls = model.embeddings.cls_token.data.view(1, hidden)
@@ -330,7 +399,7 @@ def _install_dinov3_rpu_keepalives(model: nn.Module) -> None:
         gamma_mlp = torch.empty(
             (num_layers, hidden), dtype=torch.float16, device="rpu"
         )
-        for layer_idx, layer in enumerate(model.layer):
+        for layer_idx, layer in enumerate(layers):
             gamma_attn[layer_idx].copy_(
                 layer.layer_scale1.lambda1.data.to(torch.float16)
             )
@@ -560,12 +629,14 @@ def _dinov3_shared_position_cpu_view_matches(keepalive, cpu_view) -> bool:
 
 def _make_dummy_dinov3_kv_caches(
     num_layers: int, max_seq_len: int, num_heads: int, head_dim: int,
+    num_cores: int = _NUM_CORES,
 ) -> RPUCache:
     """Per-layer RPUCache sized for bidirectional vision SDPA.
 
     Vision encoder always inserts at position=0 and reads all tokens once —
     no autoregressive growth. We size to `max_seq_len` (worst-case num_tokens)
-    so any forward shape fits.
+    so any forward shape fits. `attn_tp` is the execution core count; the
+    cache keeps eight physical KV stripes at every budget.
     """
     return RPUCache(
         num_layers=num_layers,
@@ -573,7 +644,7 @@ def _make_dummy_dinov3_kv_caches(
         max_seq_len=max_seq_len,
         num_kv_heads=num_heads,
         head_dim=head_dim,
-        attn_tp=min(_NUM_CORES, num_heads),
+        attn_tp=min(num_cores, num_heads),
     )
 
 
@@ -588,8 +659,8 @@ def _install_dinov3_vision_for_rpu_impl(
 
     Preconditions (all enforced by the adapter `to_rpu()` sequence):
       - `_convert_dinov3_weights_for_rpu` has run (patch_embed folded to CPU
-        fp16, attention heads padded to multiple of NUM_CORES, all Linear
-        weights swizzled).
+        fp16, attention heads padded to a multiple of the execution cores, all
+        Linear weights swizzled for `_rpu_vision_num_cores`; absent means 8).
       - `model.to('rpu')` has moved all params + tensors to fp16 device.
       - `_install_dinov3_rpu_keepalives` has stashed `_rpu_dinov3_cls_reg`,
         `_rpu_dinov3_gamma_attn`, `_rpu_dinov3_gamma_mlp`.
@@ -606,8 +677,11 @@ def _install_dinov3_vision_for_rpu_impl(
     hidden = int(cfg.hidden_size)
     intermediate = int(cfg.intermediate_size)
     head_dim = hidden // int(cfg.num_attention_heads)
-    num_heads_padded = _padded_num_heads(int(cfg.num_attention_heads))
-    num_layers = len(vision_model.layer)
+    # The weight layout already applied is the topology authority.
+    num_cores = int(vars(vision_model).get("_rpu_vision_num_cores", _NUM_CORES))
+    num_heads_padded = _padded_num_heads(int(cfg.num_attention_heads), num_cores)
+    layers = list(_dinov3_layers(vision_model))
+    num_layers = len(layers)
     num_register = int(cfg.num_register_tokens)
     num_special_tokens = 1 + num_register
     eps = float(cfg.layer_norm_eps)
@@ -624,7 +698,6 @@ def _install_dinov3_vision_for_rpu_impl(
     # Gather per-layer tensors. Weights are post-swizzle nn.Parameters; we
     # pass `.weight` directly so the C++ side holds the same storage (no copy,
     # P4 lifetime managed by the Python model object).
-    layers = list(vision_model.layer)
     q_w  = [L.attention.q_proj.weight for L in layers]
     k_w  = [L.attention.k_proj.weight for L in layers]
     v_w  = [L.attention.v_proj.weight for L in layers]
@@ -663,7 +736,7 @@ def _install_dinov3_vision_for_rpu_impl(
         device="rpu", dtype=torch.float16, theta=theta,
     )
     kv_cache = _make_dummy_dinov3_kv_caches(
-        num_layers, max_seq_len, num_heads_padded, head_dim,
+        num_layers, max_seq_len, num_heads_padded, head_dim, num_cores,
     )
 
     # GraphCache for the fused encoder forward. PASSTHROUGH queue hygiene is
@@ -674,7 +747,11 @@ def _install_dinov3_vision_for_rpu_impl(
     # (sync-only fast path) instead of synchronously dispatching every kernel
     # and rebuilding every immediate DMA batch — same pattern as
     # qwen3_vl_vision / siglip_compute / pi05_gemma / pi05_adarms.
-    graph_cache = rpu_backend.graph.GraphCache()
+    # A reduced owner binds its Graph queue/DMA-engine prefix to the same budget.
+    graph_cache = (rpu_backend.graph.GraphCache() if num_cores == _NUM_CORES
+                   else rpu_backend.graph.GraphCache(
+                       runtime_policy=rpu_backend.graph.GraphRuntimePolicy.from_environment(
+                           execution_core_count=num_cores)))
 
     # Configure the pending native entry only after all Python-side state is
     # ready. The public wrapper owns immediate cleanup until commit.
@@ -685,7 +762,17 @@ def _install_dinov3_vision_for_rpu_impl(
         label="DINOv3", handle_name="_rpu_dinov3_handle")
     handle_finalizer = resource.finalizer
     _install_state["pending_resource"] = resource
+    if num_cores != _NUM_CORES:
+        # Cold topology precedes weights; eight-core installs keep the old calls.
+        torch.ops.rpu.dinov3_vision_set_execution_core_count(handle, num_cores)
     torch.ops.rpu.dinov3_vision_set_weights(handle, *weight_args)
+    if num_cores != _NUM_CORES:
+        actual = tuple(torch.ops.rpu.dinov3_vision_get_execution_topology(handle))
+        expected = (num_cores, num_cores, num_cores, _NUM_CORES,
+                    num_heads_padded, intermediate)
+        if actual != expected:
+            raise RuntimeError(
+                f"DINOv3 native topology mismatch: {actual} != {expected}")
     torch.ops.rpu.dinov3_vision_set_chunk_envelope(handle, int(kv_cache.max_seq_len), 0)
     torch.ops.rpu.dinov3_vision_set_rope(handle, freq_cos, freq_sin)
     configured_chunk = _configured_vision_chunk(vision_model)
@@ -1108,6 +1195,9 @@ class DINOv3Adapter:
     pooler_output)`.
     """
 
+    # Cold model budget (4/6/8, default 8) plus the one Vision chunk control.
+    _EXECUTION_SUPPORTED = {"model": ("num_cores",), "vision": ("chunk_size",)}
+
     @classmethod
     def preflight(cls, config: Any) -> None:
         """Fail-fast config-only check. Called BEFORE the HF weight load."""
@@ -1115,6 +1205,7 @@ class DINOv3Adapter:
 
     @classmethod
     def preflight_execution(cls, config: Any, execution_config) -> None:
+        _check_execution_cores(config, execution_config)
         requested = execution_config.get("vision", {}).get(
             "chunk_size", "auto")
         if not isinstance(requested, int):
@@ -1135,7 +1226,7 @@ class DINOv3Adapter:
             normalize_rpu_execution,
         )
 
-        supported_execution = {"vision": ("chunk_size",)}
+        supported_execution = self._EXECUTION_SUPPORTED
         normalized_execution = None
         if rpu_execution is not None:
             normalized_execution = normalize_rpu_execution(
@@ -1234,6 +1325,13 @@ class DINOv3Adapter:
 
     def validate_execution_reconfigure(self, config) -> None:
         self.preflight_execution(self.model.config, config)
+        state = vars(self.model)
+        if (state.get("_rpu_swizzle_started", False)
+                and execution_core_count(config)
+                != state.get("_rpu_vision_num_cores", _NUM_CORES)):
+            raise ValueError(
+                "DINOv3 model.num_cores is cold-only: the weights are swizzled "
+                "for another core count; reload the model to change it")
         if getattr(self.model, "_rpu_dinov3_handle", None) is not None:
             required = (
                 "dinov3_vision_get_chunk_size_override",
@@ -1305,10 +1403,10 @@ class DINOv3Adapter:
 
         P4 scope:
           A. Pre-move: fold patch_embed Conv2d to CPU fp16 Linear, zero-pad
-             attention heads up to a multiple of NUM_CORES (no-op for ViT-L),
-             swizzle every leaf Linear.
-          B. Move model to device device.
-          C. Install device fp16 keepalives (CLS+reg stacked, γ_attn / γ_mlp
+             attention heads up to a multiple of the cold execution cores
+             (no-op for ViT-L and for ViT-B at 4/6), swizzle every leaf Linear.
+          B. Move model to device.
+          C. Install RPU fp16 keepalives (CLS+reg stacked, γ_attn / γ_mlp
              per-layer stacks).
           C.5. Transactionally install the fused C++ vision handle:
                set_weights / set_rope / position_idx_keepalive / dummy KV cache.
@@ -1333,6 +1431,15 @@ class DINOv3Adapter:
             )
 
         self._execution_session.require_cold()
+        num_cores = _dinov3_execution_cores(self.model)
+        if num_cores != _NUM_CORES and not all(
+                hasattr(torch.ops.rpu, name) for name in (
+                    "dinov3_vision_set_execution_core_count",
+                    "dinov3_vision_get_execution_topology")):
+            # Refuse before the irreversible swizzle.
+            raise RPUBackendError(
+                f"DINOv3 model.num_cores={num_cores} requires a native "
+                "extension built with the DINOv3 core-count ops; rebuild it")
         if not _SWIZZLE_LOCK.acquire(blocking=False):
             raise RPUBackendError(
                 "DINOv3Adapter.to_rpu(): another swizzle in progress."
@@ -1371,9 +1478,9 @@ class DINOv3Adapter:
             )
 
             _LOG.info(
-                "DINOv3Adapter installed: profile=%s, "
+                "DINOv3Adapter installed: profile=%s, num_cores=%d, "
                 "num_heads_padded=%d, num_layers=%d",
-                _profile(self.model.config),
+                _profile(self.model.config), num_cores,
                 self.model._rpu_dinov3_num_heads_padded,
                 self.model._rpu_dinov3_num_layers,
             )

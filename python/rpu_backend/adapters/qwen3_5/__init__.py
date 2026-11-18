@@ -72,11 +72,30 @@ from .text import (  # noqa: F401
 )
 # Vision tower (== HF Qwen3_5VisionModel).
 from .vision import (
+    qwen35_vision_requested,
     _prepare_qwen3_5_multimodal_spm,
     _resolve_vision_install_options,
     install_qwen3_5_vision_for_rpu,
     fuse_visual_embeds,
 )
+
+
+def _upload_lm_head_weight(output, embedding, num_cores, *, release_source=False):
+    """Upload the final head without keeping an unused untied CPU copy alive."""
+    weight = output.weight if output is not None else embedding.weight
+    packed = transform_linear_weight(
+        weight.detach().to("cpu").to(torch.float16).contiguous(), 1, num_cores)
+    # The text embedding remains live. Preserve both Parameter tying and
+    # storage aliases; only an independent CPU head can retire here.
+    if (release_source and output is not None and weight.device.type == "cpu"
+            and weight.untyped_storage().data_ptr()
+            != embedding.weight.untyped_storage().data_ptr()):
+        from rpu_backend.runtime.weights import _release_cpu_weight_pages
+
+        output.weight.data = weight.new_empty(0)
+        del weight
+        _release_cpu_weight_pages()
+    return packed.to("rpu")
 
 
 # (hidden_size, intermediate_size, num_hidden_layers, num_key_value_heads).
@@ -327,7 +346,7 @@ def _validate_qwen3_5_execution_reconfigure(adapter, execution_config) -> None:
         session = getattr(adapter, "_execution_session", None)
         mode = ("RETAINED_CACHE" if _public_retained_prefill(
             model.config, execution_config, public_owner=True,
-            vision_admitted=os.environ.get("QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED") == "1")
+            vision_admitted=qwen35_vision_requested(execution_config))
             else "BOUNDED_ONESHOT")
         if session is not None and session.graph_mode != mode:
             raise ValueError("Qwen3.5 cold prefill lifecycle is immutable; reload the model")
@@ -563,16 +582,15 @@ def _check_quant_checkpoint_loaded(model) -> None:
 
 
 def _check_quant_policy(config) -> None:
+    """Validate the declared quantization scope before loading weights.
+
+    Dense W8A16/W4A16 recipes are supported (2026-10-19 board runs at 4/6/8
+    cores), so no opt-in is needed; resolve_quant_config still rejects an
+    unknown or conflicting per-module scope.
+    """
     if not getattr(config, "quant_config", None) and getattr(config, "quantization_config", None) is None:
         return
-    quant = resolve_quant_config(config)
-    if not quant or os.environ.get("QWEN3_5_QUANT_ALLOW_UNCERTIFIED") == "1":
-        return
-    raise UnsupportedModelError(
-        "Qwen3.5 W8A16/W4A16 is available only for controlled, uncertified "
-        "evaluation; Dense FP16 is the supported path. Set exact "
-        "QWEN3_5_QUANT_ALLOW_UNCERTIFIED=1 to opt in before loading weights."
-    )
+    resolve_quant_config(config)
 
 
 def _check_profile(config) -> None:
@@ -591,13 +609,14 @@ def _check_profile(config) -> None:
             f"validated). Supported profiles: {sorted(_SUPPORTED_PROFILES)}."
         )
     try:
+        from .cores import validate_official_27b_runtime_profile
         legacy = validate_legacy_text_profile(config)
-        modern27 = validate_modern_27b_profile(config)
+        modern27 = validate_official_27b_runtime_profile(config)
     except ValueError as exc:
         raise UnsupportedModelError(str(exc)) from exc
     if profile == (5120, 17408, 64, 4) and not (legacy or modern27):
         raise UnsupportedModelError(
-            "Qwen3.5-27B requires the official uniform W8/W4-group32 profile "
+            "Qwen3.5-27B requires an admitted official dense profile "
             "or the separate legacy text-only bundle.")
 
 
@@ -681,7 +700,7 @@ class Qwen3_5Adapter:
             supported=supported_execution,
             graph_mode=("RETAINED_CACHE" if _public_retained_prefill(
                 model.config, self._rpu_execution, public_owner=True,
-                vision_admitted=os.environ.get("QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED") == "1")
+                vision_admitted=qwen35_vision_requested(self._rpu_execution))
                         else "BOUNDED_ONESHOT"),
             **session_callbacks,
         )
@@ -742,15 +761,14 @@ class Qwen3_5Adapter:
         )
         validate_core_profile(config, execution_config)
         awq = quanttrio_awq_config(config)
-        if (awq is not None or is_mlp_only_text_profile(config)) and (execution_config.get("vision")
-                or os.environ.get("QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED") == "1"):
+        if (awq is not None or is_mlp_only_text_profile(config)) and qwen35_vision_requested(execution_config):
             recipe = "QuantTrio AWQ" if awq is not None else "Qwen3.5 MLP-only W4"
             raise UnsupportedModelError(f"{recipe} supports pure text only; Vision is not admitted")
         from .text import _validate_qwen35_linear_accumulation
         _validate_qwen35_linear_accumulation(config, execution_config)
         if (is_dense_large_vl_candidate(config)
                 and (not resolve_quant_config(config)
-                     or os.environ.get("QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED") == "1")):
+                     or qwen35_vision_requested(execution_config))):
             validate_dense_large_vl_profile(config)
         if validate_legacy_text_profile(config) and execution_config.get("vision"):
             raise UnsupportedModelError(
@@ -812,9 +830,9 @@ class Qwen3_5Adapter:
     def to_rpu(self, max_seq_len=None):
         """Install text backbone + lm_head and patch the top-level forward.
 
-        Order (A→B→C→D matters): text first (creates the handle the rest read),
-        lm_head after (uses ``get_output_embeddings``), lazy vision state next,
-        and forward replacement last.
+        Graph arenas and dtype validation precede all weight uploads. The
+        diagnostic official27B FP16 path reserves the head before Step A;
+        other profiles retain A→B→C→D. Vision and forward replacement stay last.
         """
         model = self.model
         if max_seq_len is None:
@@ -823,6 +841,7 @@ class Qwen3_5Adapter:
             validate_core_profile, validate_text_weight_geometry, topology_tuple,
             is_dense_large_vl_candidate, validate_dense_large_vl_weights, validate_cold_weight_dtype,
             validate_text_mlp_padding_storage,
+            validate_official_27b_runtime_profile,
         )
         topology = validate_core_profile(getattr(model, "config", None), getattr(model, "_rpu_execution", None))
         state = _qwen3_5_text_runtime_state(model)
@@ -845,7 +864,7 @@ class Qwen3_5Adapter:
                 "Qwen3_5Adapter.to_rpu(): a prior install failed after mutation; "
                 "reload the model before retrying."
             )
-        modern27 = validate_modern_27b_profile(getattr(model, "config", None))
+        modern27 = validate_official_27b_runtime_profile(getattr(model, "config", None))
         awq = quanttrio_awq_config(getattr(model, "config", None))
         if awq is not None:
             from .loader import validate_awq_loaded_model
@@ -857,7 +876,7 @@ class Qwen3_5Adapter:
                 resolve_quant_config(model.config))
         arena_candidate = is_dense_large_vl_candidate(getattr(model, "config", None))
         arena_opt_in = (arena_candidate
-                        and os.environ.get("QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED") == "1")
+                        and qwen35_vision_requested(getattr(model, "_rpu_execution", None)))
         # The Session chooses this lifecycle before installation. Recheck cold
         # scope drift before ownership or weight mutation; never silently switch
         # the native descriptor mode or add a queue to a different arena plan.
@@ -995,6 +1014,17 @@ class Qwen3_5Adapter:
                 validate_cold_weight_dtype(model, fp16=True)
             inner = getattr(model.model, "language_model", model.model)
             _out_emb = model.get_output_embeddings()
+            # Diagnostic initialization order only: the exact official27B FP16
+            # head reserves its large contiguous storage after the Graph arenas
+            # and half conversion, before smaller text-layer weight uploads.
+            head_uploaded_early = modern27 and not resolve_quant_config(model.config)
+            if head_uploaded_early:
+                from rpu_backend.runtime import rpu_env_bool
+
+                model._lm_head_w_rpu_keepalive = _upload_lm_head_weight(
+                    _out_emb, inner.embed_tokens, topology.lm_head_tp,
+                    release_source=(modern27 and rpu_env_bool(
+                        "RPU_QWEN3_5_FREE_HF_WEIGHTS", default=True)))
             # Legacy direct allocations may retain physical pages after the
             # source tensor dies. Upload only the installer's finalized large
             # projections instead of creating a second raw device copy.
@@ -1040,10 +1070,13 @@ class Qwen3_5Adapter:
             # get_output_embeddings() returns the tied embedding when tie_word_embeddings
             # (0.8B/2B/4B) and the SEPARATE lm_head weight when NOT tied (9B). Using
             # embed.weight directly is wrong for untied models (garbage logits).
-            _lm_head_w = _out_emb.weight if _out_emb is not None else embed.weight
-            model._lm_head_w_rpu_keepalive = transform_linear_weight(
-                _lm_head_w.detach().to("cpu").to(torch.float16).contiguous(),
-                1, topology.lm_head_tp).to("rpu")
+            from rpu_backend.runtime import rpu_env_bool
+
+            if not head_uploaded_early:
+                model._lm_head_w_rpu_keepalive = _upload_lm_head_weight(
+                    _out_emb, embed, topology.lm_head_tp,
+                    release_source=(modern27 and rpu_env_bool(
+                        "RPU_QWEN3_5_FREE_HF_WEIGHTS", default=True)))
 
             # ── Step C: vision tower — LAZY (installed on first image forward) ──
             # Not installed here on purpose: a Qwen3.5 checkpoint is used for BOTH

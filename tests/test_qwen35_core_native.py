@@ -29,6 +29,7 @@ def _run_cpp(tmp_path, source):
     exe = tmp_path / "probe"
     cpp.write_text(source)
     subprocess.run([compiler, "-std=c++17", "-O0", "-I", str(ROOT / "src"),
+                    "-I", str(ROOT / "src/core"), "-I", str(ROOT / "src/ops"),
                     str(cpp), "-o", str(exe)], check=True, capture_output=True, text=True)
     subprocess.run([str(exe)], check=True, capture_output=True, text=True)
 
@@ -221,6 +222,7 @@ def test_actual_qwen35_weight_guards_distinguish_logical_and_prepared_mlp(tmp_pa
 #include <vector>
 #include "fused/qwen3_5_execution_topology.h"
 #include "ops/rpu_linear_tiling.h"
+#include "ops/rpu_pi_wall_tiling.h"
 using namespace v3;
 #define TORCH_CHECK(ok, ...) do { if (!(ok)) throw std::runtime_error(#ok); } while(false)
 namespace at {
@@ -235,7 +237,7 @@ struct Tensor {
     int64_t dim() const {return shape.size();}
     int64_t size(int axis) const {return shape.at(axis);}
     const IntArrayRef& sizes() const {return shape;}
-    int scalar_type() const {return dtype;}
+    int scalar_type() const {if(!defined()) throw std::runtime_error("undefined dtype");return dtype;}
     bool is_contiguous() const {return contiguous;}
     struct Device {int value;int type() const{return value;}
         bool operator==(const Device& other)const{return value==other.value;}};
@@ -245,7 +247,7 @@ struct Tensor {
 };
 using TensorList=std::vector<Tensor>;
 }
-at::Tensor rpu_retain_linear_quant_scale(const at::Tensor&,const at::Tensor& zero) {return zero;}
+at::Tensor rpu_retain_linear_quant_scale(const at::Tensor&,const at::Tensor& zero,int = 8) {return zero;}
 // These device preflights must stay unreachable for the ordinary dense inputs.
 __NVFP4_METADATA__
     void install(at::TensorList) {assert(false);}
@@ -263,6 +265,9 @@ struct FusedModelBase {
     } impl;
     Impl* pimpl_=&impl;
     int num_cores() const {return impl.num_cores_;}
+    virtual int64_t resolve_model_mlp_intermediate_size(int64_t logical_size) const {
+        return decoder_mlp_intermediate_size(logical_size,impl.mlp_tp_);
+    }
     virtual DecoderExecutionTopology resolve_model_execution_topology(
         int64_t num_q_heads,int64_t num_kv_heads,int64_t head_dim,
         int64_t hidden_size,int64_t intermediate_size) const __BASE_RESOLVE__
@@ -277,7 +282,8 @@ struct Qwen3_5Model : FusedModelBase {
     int64_t gdn_num_v_heads=16,gdn_key_head_dim=128,gdn_value_head_dim=128;
     int64_t gdn_conv_dim=6144,gdn_conv_kernel=4;
     bool use_silu=true,action_mode_=false,z2_bound_=false,linear_acc32_=false,validated=false;
-    bool high_precision_=false;
+    bool high_precision_=false,mlp_packed_w4_=false,mlp_awq_g128_=false;
+    int64_t resolve_model_mlp_intermediate_size(int64_t logical_size) const override __MODEL_MLP_WIDTH__
     double eps=1e-6;
     int gdn_tp() const {return num_cores()==8?8:4;}
     DecoderExecutionTopology resolve_model_execution_topology(
@@ -343,9 +349,11 @@ struct Qwen3_5Model : FusedModelBase {
                 &gdn_a_bg_scale_list,&gate_scale_list,&up_scale_list,&down_scale_list})
             for(auto& scale:*list) scale={};
         gate_negative_zero_list.resize(24);up_negative_zero_list.resize(24);down_negative_zero_list.resize(24);
-        const auto quant=[](at::Tensor& w,at::Tensor& s,at::Tensor& z,bool row) {
-            const auto local_n=w.size(0)/(row?1:8),local_g=w.size(1)/128/(row?8:1);
-            const auto elements=((local_n+63)/64)*((local_g+3)/4)*8*4*64;
+        const auto quant=[this](at::Tensor& w,at::Tensor& s,at::Tensor& z,bool row) {
+            const int cores=num_cores();
+            const auto local_n=w.size(0)/(row?1:cores),local_g=w.size(1)/128/(row?cores:1);
+            const auto elements=((local_n+63)/64)*((local_g+3)/4)*cores*4*64;
+            w.shape[0]=((local_n+31)/32)*32*(row?1:cores);
             w.dtype=at::kByte;w.shape[1]/=2;s={128,elements/128};z=s;
         };
         for(int i=1;i<24;++i) {
@@ -384,15 +392,18 @@ struct Qwen3_5Model : FusedModelBase {
     }
     void use_modern27(bool w4=false) {
         use_legacy();
-        const auto quant=[w4](at::Tensor& w,at::Tensor& s,bool row=false) {
+        const auto quant=[w4,this](at::Tensor& w,at::Tensor& s,bool row=false,bool mlp=false) {
             if(!w4) {w.dtype=at::kChar;s={w.size(0)};return;}
-            const auto local_n=w.size(0)/(row?1:8),local_g=w.size(1)/32/(row?8:1);
-            const auto elements=((local_n+63)/64)*((local_g+3)/4)*8*4*64;
+            const int cores=mlp?num_cores():gdn_tp();
+            if(mlp && num_cores()==6) w.shape[row?1:0]=17472;
+            const auto local_n=w.size(0)/(row?1:cores),local_g=w.size(1)/32/(row?cores:1);
+            const auto elements=((local_n+63)/64)*((local_g+3)/4)*cores*4*64;
+            w.shape[0]=((local_n+31)/32)*32*(row?1:cores);
             w.dtype=at::kByte;w.shape[1]/=2;s={32,elements/32};
         };
         for(int i=0;i<64;++i) {
-            quant(gate_list[i],gate_scale_list[i]);quant(up_list[i],up_scale_list[i]);
-            quant(down_list[i],down_scale_list[i],true);
+            quant(gate_list[i],gate_scale_list[i],false,true);quant(up_list[i],up_scale_list[i],false,true);
+            quant(down_list[i],down_scale_list[i],true,true);
             if(layer_is_full[i]) {
                 quant(q_w_list[i],q_scale_list[i]);quant(k_w_list[i],k_scale_list[i]);
                 quant(v_w_list[i],v_scale_list[i]);quant(attn_gate_list[i],attn_gate_scale_list[i]);
@@ -405,9 +416,73 @@ struct Qwen3_5Model : FusedModelBase {
             }
         }
     }
+    void use_recipe27(const std::string& recipe) {
+        use_legacy();
+        for(auto* list : {&q_w_list,&k_w_list,&v_w_list,&o_w_list,&attn_gate_list,
+                &gdn_q_list,&gdn_k_list,&gdn_v_list,&gdn_in_z_list,&gdn_out_list,
+                &gdn_b_bg_list,&gdn_a_bg_list,&gate_list,&up_list,&down_list})
+            for(auto& weight:*list) weight.dtype=at::kHalf;
+        for(auto* list : {&q_scale_list,&k_scale_list,&v_scale_list,&o_scale_list,
+                &attn_gate_scale_list,&gdn_q_scale_list,&gdn_k_scale_list,&gdn_v_scale_list,
+                &gdn_in_z_scale_list,&gdn_out_scale_list,&gdn_b_bg_scale_list,
+                &gdn_a_bg_scale_list,&gate_scale_list,&up_scale_list,&down_scale_list})
+            for(auto& scale:*list) scale={};
+        const bool awq=recipe=="awq";
+        const bool packed=recipe=="mlp_only"||recipe=="mlp_w8"||recipe=="main_w4"||awq;
+        const int mlp_dtype=packed?at::kByte:recipe=="main_w8"?at::kChar:at::kHalf;
+        const int attn_dtype=recipe=="main_w4"?at::kByte:
+            recipe=="mlp_w8"||recipe=="main_w8"?at::kChar:at::kHalf;
+        const int gdn_dtype=recipe=="mlp_w8"||recipe=="main_w8"||recipe=="main_w4"?at::kChar:at::kHalf;
+        const int scalar_dtype=recipe=="mlp_w8"?at::kChar:at::kHalf;
+        if(awq) {gate_negative_zero_list.resize(64);up_negative_zero_list.resize(64);down_negative_zero_list.resize(64);}
+        const auto quant=[this](at::Tensor& w,at::Tensor& scale,int dtype,bool row,bool mlp,int group) {
+            if(dtype==at::kHalf)return;
+            if(dtype==at::kChar) {w.dtype=dtype;scale={w.size(0)};return;}
+            const int cores=mlp?num_cores():gdn_tp();
+            const auto local_n=w.size(0)/(row?1:cores),local_g=w.size(1)/group/(row?cores:1);
+            const auto elements=((local_n+63)/64)*((local_g+3)/4)*cores*4*64;
+            w.shape[0]=((local_n+31)/32)*32*(row?1:cores);
+            w.dtype=dtype;w.shape[1]/=2;scale={group,elements/group};
+        };
+        for(int i=0;i<64;++i) {
+            // The first AWQ layer is FP16 but shares every later layer's
+            // physical MLP width. This is the actual Python caller layout.
+            if(packed && num_cores()==6) {
+                const int64_t physical = awq ? 17664 : 17472;
+                gate_list[i].shape[0]=up_list[i].shape[0]=physical;
+                down_list[i].shape[1]=physical;
+            }
+            const int dtype=awq&&i==0?at::kHalf:mlp_dtype;
+            quant(gate_list[i],gate_scale_list[i],dtype,false,true,awq?128:32);
+            quant(up_list[i],up_scale_list[i],dtype,false,true,awq?128:32);
+            quant(down_list[i],down_scale_list[i],dtype,true,true,awq?128:32);
+            if(awq && i>0) {
+                gate_negative_zero_list[i]=gate_scale_list[i];
+                up_negative_zero_list[i]=up_scale_list[i];
+                down_negative_zero_list[i]=down_scale_list[i];
+            }
+            if(layer_is_full[i]) {
+                quant(q_w_list[i],q_scale_list[i],attn_dtype,false,false,32);
+                quant(k_w_list[i],k_scale_list[i],attn_dtype,false,false,32);
+                quant(v_w_list[i],v_scale_list[i],attn_dtype,false,false,32);
+                quant(attn_gate_list[i],attn_gate_scale_list[i],attn_dtype,false,false,32);
+                quant(o_w_list[i],o_scale_list[i],attn_dtype,true,false,32);
+            } else {
+                quant(gdn_q_list[i],gdn_q_scale_list[i],gdn_dtype,false,false,32);
+                quant(gdn_k_list[i],gdn_k_scale_list[i],gdn_dtype,false,false,32);
+                quant(gdn_v_list[i],gdn_v_scale_list[i],gdn_dtype,false,false,32);
+                quant(gdn_in_z_list[i],gdn_in_z_scale_list[i],gdn_dtype,false,false,32);
+                quant(gdn_out_list[i],gdn_out_scale_list[i],gdn_dtype,true,false,32);
+                quant(gdn_b_bg_list[i],gdn_b_bg_scale_list[i],scalar_dtype,false,false,32);
+                quant(gdn_a_bg_list[i],gdn_a_bg_scale_list[i],scalar_dtype,false,false,32);
+            }
+        }
+    }
     void validate() {
         __VALIDATION__
-        // Actual late logical call, isolated from device allocations and uploads.
+        // Actual late logical call, isolated from RPU allocations and uploads.
+        mlp_packed_w4_=packed_mlp;
+        mlp_awq_g128_=!gate_negative_zero_list.empty();
         __PARAMETER_CALL__
         validated=true;
     }
@@ -434,9 +509,23 @@ template<class F> void reject_modern27(int cores,bool w4,F mutate) {
     try {m.validate();} catch(const std::exception&) {rejected=true;}
     assert(rejected && !m.validated && m.impl.hidden_size_==0);
 }
+template<class F> void reject_recipe27(int cores,const std::string& recipe,F mutate) {
+    Qwen3_5Model m(cores);m.use_recipe27(recipe);mutate(m);bool rejected=false;
+    try {m.validate();} catch(const std::exception&) {rejected=true;}
+    assert(rejected && !m.validated && m.impl.hidden_size_==0);
+}
 int main() {
-
-    { Qwen3_5Model awq(8);awq.use_awq_2b();awq.validate();assert(awq.validated); }
+    // Ordinary eight-core full-attention callers carry no GDN owners.
+    { Qwen3_5Model full(8);
+      full.layer_is_full.assign(24,1);
+      for(auto* list : {&full.q_w_list,&full.k_w_list,&full.v_w_list,&full.o_w_list,
+              &full.attn_gate_list,&full.q_norm_list,&full.k_norm_list})
+          for(int i=0;i<24;++i) (*list)[i]=(*list)[3];
+      for(auto* list : {&full.gdn_q_list,&full.gdn_b_bg_list})
+          for(auto& tensor : *list) tensor={};
+      full.validate();assert(full.validated);
+    }
+    for(int cores : {4,6,8}) { Qwen3_5Model awq(cores);awq.use_awq_2b();awq.validate();assert(awq.validated); }
     for(int fault=0;fault<11;++fault) {
         Qwen3_5Model awq(8);awq.use_awq_2b();
         if(fault==0)awq.gate_negative_zero_list.pop_back();
@@ -464,20 +553,68 @@ int main() {
         reject_modern27(cores,false,[](auto& m){m.gdn_a_bg_list[62].dtype=at::kHalf;m.gdn_a_bg_scale_list[62]={};});
         reject_modern27(cores,false,[](auto& m){m.gate_list[63].dtype=at::kHalf;m.gate_scale_list[63]={};});
         reject_modern27(cores,false,[](auto& m){m.gdn_q_scale_list[62]={2047};});
-        if(cores==8) {
+        {
             Qwen3_5Model w4(cores);w4.use_modern27(true);w4.validate();assert(w4.validated);
+            assert(w4.gdn_b_bg_list[0].shape==at::IntArrayRef({32*w4.gdn_tp(),2560}));
+            // Logical N16/core is still the output geometry, but the old N16
+            // byte owner and arbitrary overpadding are no longer accepted.
+            reject_modern27(cores,true,[](auto& m){m.gdn_b_bg_list[0].shape[0]/=2;});
+            reject_modern27(cores,true,[](auto& m){m.gdn_a_bg_list[62].shape[0]/=2;});
+            reject_modern27(cores,true,[](auto& m){m.gdn_b_bg_list[0].shape[0]*=2;});
+            reject_modern27(cores,true,[](auto& m){m.gdn_q_list[0].shape[0]+=32*m.gdn_tp();});
+            reject_modern27(cores,true,[](auto& m){m.gdn_out_list[0].shape[0]+=32;});
+            reject_modern27(cores,true,[](auto& m){m.gate_list[0].shape[0]+=32*m.num_cores();});
+            if(cores==6)
+                reject_modern27(cores,true,[](auto& m){m.gdn_b_bg_list[0].shape[0]=32*m.num_cores();});
             reject_modern27(cores,true,[](auto& m){m.gdn_a_bg_scale_list[62]={64,320};});
             reject_modern27(cores,true,[](auto& m){m.gdn_a_bg_scale_list[62]={32,1};});
             reject_modern27(cores,true,[](auto& m){m.down_list[63].shape[1]++;});
             reject_modern27(cores,true,[](auto& m){m.gdn_q_list[62].dtype=at::kChar;});
-        } else reject_modern27(cores,true,[](auto&){});
+        }
+        for(const std::string recipe : {"fp16","mlp_only","mlp_w8","main_w4","main_w8","awq"}) {
+            Qwen3_5Model candidate(cores);candidate.use_recipe27(recipe);candidate.validate();
+            assert(candidate.validated && candidate.impl.num_kv_heads_==24);
+            assert(candidate.impl.attn_tp_==(cores==8?8:4) && candidate.impl.mlp_tp_==cores);
+            assert(candidate.impl.intermediate_size_==(cores!=6 ? 17408 : (recipe=="awq" ? 17664 : 17472)));
+            reject_recipe27(cores,recipe,[](auto& m){m.gate_list[63].contiguous=false;});
+            reject_recipe27(cores,recipe,[](auto& m){m.gate_list[63].dtype=99;});
+            reject_recipe27(cores,recipe,[](auto& m){m.gdn_out_list[62].device_type=0;});
+            reject_recipe27(cores,recipe,[](auto& m){m.gdn_q_list[62].dtype=99;});
+            reject_recipe27(cores,recipe,[](auto& m){m.num_kv_heads=4;});
+            reject_recipe27(cores,recipe,[](auto& m){m.num_kv_heads=8;});
+            reject_recipe27(cores,recipe,[](auto& m){m.num_q_heads=32;});
+            reject_recipe27(cores,recipe,[](auto& m){m.layer_is_full[63]=0;});
+            reject_recipe27(cores,recipe,[](auto& m){m.gdn_num_v_heads=32;});
+            reject_recipe27(cores,recipe,[](auto& m){m.down_list[63].shape[1]++;});
+            reject_recipe27(cores,recipe,[](auto& m){m.gdn_b_bg_list[62].dtype=99;});
+            reject_recipe27(cores,recipe,[](auto& m){m.q_w_list[63].dtype=99;});
+            if(recipe!="fp16")
+                reject_recipe27(cores,recipe,[](auto& m){m.gate_scale_list[63]={32,1};});
+            else
+                reject_recipe27(cores,recipe,[](auto& m){m.gate_scale_list[63]={1};});
+            if(recipe=="awq") {
+                reject_recipe27(cores,recipe,[](auto& m){m.down_negative_zero_list[63]={};});
+                reject_recipe27(cores,recipe,[](auto& m){m.up_negative_zero_list[0]=m.up_negative_zero_list[1];});
+                reject_recipe27(cores,recipe,[](auto& m){m.down_negative_zero_list[63].contiguous=false;});
+                reject_recipe27(cores,recipe,[](auto& m){m.up_negative_zero_list[63].device_type=0;});
+                reject_recipe27(cores,recipe,[](auto& m){m.gate_scale_list[63].shape[0]=32;});
+                reject_recipe27(cores,recipe,[](auto& m){m.gate_list[0].dtype=at::kByte;});
+                if(cores==6)
+                    reject_recipe27(cores,recipe,[](auto& m){m.gate_list[0]={17472,5120};});
+            } else if(recipe=="mlp_only" || recipe=="mlp_w8" || recipe=="main_w4") {
+                reject_recipe27(cores,recipe,[](auto& m){
+                    m.gate_scale_list[63].shape[0]=128;
+                    m.gate_scale_list[63].shape[1]/=4;
+                });
+            }
+        }
     }
     for(int cores:{4,6}) {
         Qwen3_5Model w8(cores);w8.use_w8_2b();w8.validate();
         assert(w8.validated && w8.impl.hidden_size_==2048 && w8.impl.intermediate_size_==6144);
         assert(w8.impl.attn_tp_==4 && w8.impl.mlp_tp_==cores && w8.gdn_tp()==4);
-        reject_w8(cores,[](auto& m){m.gdn_b_bg_list[0].dtype=at::kChar;m.gdn_b_bg_scale_list[0]={64};});
-        reject_w8(cores,[](auto& m){m.gdn_a_bg_list[0].dtype=at::kChar;m.gdn_a_bg_scale_list[0]={64};});
+        reject_w8(cores,[](auto& m){m.gdn_b_bg_list[1].dtype=at::kChar;m.gdn_b_bg_scale_list[1]={64};});
+        reject_w8(cores,[](auto& m){m.gdn_a_bg_list[1].dtype=at::kChar;m.gdn_a_bg_scale_list[1]={64};});
         reject_w8(cores,[](auto& m){m.gdn_v_list[0].dtype=at::kHalf;m.gdn_v_scale_list[0]={};});
         reject_w8(cores,[](auto& m){m.gdn_q_scale_list[0]={2047};});
         reject_w8(cores,[](auto& m){m.gdn_out_scale_list[0].dtype=at::kChar;});
@@ -536,10 +673,69 @@ int main() {
         ("__VALIDATION__", validation), ("__PARAMETER_CALL__", parameter_call),
         ("__BASE_SET_PARAMS__", method_body(base, "void FusedModelBase::set_model_params(")),
         ("__BASE_RESOLVE__", method_body(base, "DecoderExecutionTopology FusedModelBase::resolve_model_execution_topology(")),
+        ("__MODEL_MLP_WIDTH__", method_body(source, "int64_t Qwen3_5Model::resolve_model_mlp_intermediate_size(")),
         ("__MODEL_RESOLVE__", method_body(source, "DecoderExecutionTopology Qwen3_5Model::resolve_model_execution_topology(")),
     ):
         cpp = cpp.replace(marker, value)
     _run_cpp(tmp_path, cpp)
+
+
+def test_actual_qwen35_packed_shape_guard_matches_python_storage(tmp_path):
+    import torch
+    from rpu_backend.quant.int4_pgrp_pack import swizzle_pack_int4_pgrp, w4_storage_shape
+
+    source = (ROOT / "src/fused/rpu_qwen3_5_model.cpp").read_text()
+    start = source.index("            const auto shape = [i]")
+    shape_guard = source[start:source.index("\n            };", start) + len("\n            };")]
+    cases = []
+    for cores in (4, 6, 8):
+        for partition in (0, 1):
+            for local_n in (16, 32, 48):
+                n, k = (local_n * cores, 96) if partition else (local_n, 96 * cores)
+                codes = torch.zeros((n, k), dtype=torch.int8)
+                weight = swizzle_pack_int4_pgrp(codes, partition, cores).reshape(
+                    w4_storage_shape(n, k, partition, cores))
+                cases.append("{" + ",".join(map(str, (n, k, partition, cores, *weight.shape))) + "}")
+    _run_cpp(tmp_path, r'''
+#include <cassert>
+#include <cstdint>
+#include <stdexcept>
+#include <vector>
+#define TORCH_CHECK(ok, ...) do { if (!(ok)) throw std::runtime_error(#ok); } while(false)
+namespace at {
+constexpr int kHalf=2,kChar=3,kByte=4;
+using IntArrayRef=std::vector<int64_t>;
+struct Tensor {
+    IntArrayRef shape; int dtype=kByte;
+    bool defined() const {return !shape.empty();}
+    const IntArrayRef& sizes() const {return shape;}
+    int scalar_type() const {return dtype;}
+};
+}
+int main() {
+    const int64_t i=0;
+    __SHAPE_GUARD__
+    struct Case {int64_t n,k,partition,cores,pn,pk;};
+    for(const Case c : {__CASES__}) {
+        at::Tensor packed{{c.pn,c.pk}};
+        shape(packed,{c.n,c.k},"projection",c.partition,c.cores);
+        auto reject=[&](at::Tensor tensor,int partition,int64_t cores) {
+            bool rejected=false;
+            try {shape(tensor,{c.n,c.k},"projection",partition,cores);}
+            catch(const std::runtime_error&) {rejected=true;}
+            assert(rejected);
+        };
+        // Reject malformed dimensions even when their product/byte count matches.
+        reject({{c.pn/2,c.pk*2}},c.partition,c.cores);
+        reject({{c.pn+32,c.pk}},c.partition,c.cores);
+        if(c.n!=c.pn) reject({{c.n,c.pk}},c.partition,c.cores);
+        reject(packed,-1,c.cores);
+        reject(packed,c.partition,0);
+        for(int dtype:{at::kHalf,at::kChar})
+            shape({{c.n,c.k},dtype},{c.n,c.k},"unpacked",c.partition,c.cores);
+    }
+}
+'''.replace("__SHAPE_GUARD__", shape_guard).replace("__CASES__", ",".join("Case" + c for c in cases)))
 
 
 def test_actual_gdn_scalar_dma_copies_every_local_head(tmp_path):
@@ -590,3 +786,50 @@ int main() {
     }
 }
 '''.replace("__SCALAR_DMA__", scalar_dma))
+
+
+def test_actual_dense27_linear_route_preserves_existing_padded_routing(tmp_path):
+    source = (ROOT / "src/fused/rpu_qwen3_5_model.cpp").read_text()
+    start = source.index("FmbLinearRouteSelector Qwen3_5Model::linear_route_selector(")
+    route = source[start:source.index("\n}", start) + 2]
+    _run_cpp(tmp_path, r'''
+#include <cassert>
+#include <cstdint>
+#include <initializer_list>
+namespace at {
+enum ScalarType {kHalf,kChar,kByte};
+struct Tensor {ScalarType dtype; ScalarType scalar_type() const {return dtype;}};
+}
+enum class FmbLinearRouteSelector {AUTO_TILE,GEMV};
+struct Qwen3_5Model {
+    bool linear_acc32_=false;
+    int cores=8; int64_t layers=64,hidden=5120,intermediate=17408,heads=24,dimension=256;
+    int num_cores() const {return cores;}
+    int64_t num_layers() const {return layers;}
+    int64_t hidden_size() const {return hidden;}
+    int64_t intermediate_size() const {return intermediate;}
+    int64_t num_q_heads() const {return heads;}
+    int64_t head_dim() const {return dimension;}
+    FmbLinearRouteSelector linear_route_selector(const at::Tensor&,int64_t) const;
+};
+__ROUTE__
+int main() {
+    for(int cores:{4,6,8}) for(int64_t physical:{17408,17472}) {
+        if(cores!=6 && physical!=17408)continue;
+        Qwen3_5Model model;model.cores=cores;model.intermediate=physical;
+        for(auto dtype:{at::kHalf,at::kChar,at::kByte}) for(int rows:{1,64}) {
+            const bool padded_decode = physical!=17408 && rows==1 && dtype!=at::kByte;
+            const auto expected = padded_decode ? FmbLinearRouteSelector::GEMV
+                                                 : FmbLinearRouteSelector::AUTO_TILE;
+            assert(model.linear_route_selector({dtype},rows)==expected);
+        }
+    }
+    Qwen3_5Model small;small.layers=24;small.hidden=2048;small.intermediate=6144;small.heads=8;
+    for(auto dtype:{at::kHalf,at::kChar}) {
+        assert(small.linear_route_selector({dtype},1)==FmbLinearRouteSelector::GEMV);
+        small.linear_acc32_=true;
+        assert(small.linear_route_selector({dtype},1)==FmbLinearRouteSelector::AUTO_TILE);
+        small.linear_acc32_=false;
+    }
+}
+'''.replace("__ROUTE__", route))

@@ -1,6 +1,6 @@
 """Pi05 four-bit weight preparation, applied once before generic swizzle.
 
-INT4 uses int8 [N,K] codes with per-channel or G32/G64/G128 group scales and
+INT4 uses int8 [N,K] codes with per-channel or genuine K128 group scales and
 packs to the controller-striped pgrp ABI. NVFP4 uses uint8 E2M1 codes and a
 separate striped_v2 weight/FP8-scale ABI. K/V remains W8 in Action-only profiles.
 """
@@ -9,7 +9,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from rpu_backend.quant.int4_pgrp_pack import (pack_int4_per_channel_as_pgrp, swizzle_pack_int4_pgrp, swizzle_int4_pgrp_scale)
+from rpu_backend.quant.int4_pgrp_pack import (pack_int4_per_channel_as_pgrp, swizzle_pack_int4_pgrp, swizzle_int4_pgrp_scale, w4_storage_shape, W4_WEIGHT_LAYOUT)
 from rpu_backend.runtime.weights import ROW_PARTITION_NAMES
 
 # All Pi05/Gemma projection child names.
@@ -22,7 +22,8 @@ _ALL_PROJ = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "do
 # in `skip_names` when they are real-INT4, so the recursive walker never sees
 # them and cannot record a layout for them — but the ROW half of the rule is
 # THE SAME rule, so it is derived from `ROW_PARTITION_NAMES` rather than
-# re-typed here and kept in lockstep by hand.
+# re-typed here. (Before 2026-08-09 this was an independent copy that had to be
+# kept in lockstep by hand.)
 _PROJ_PARTITION = {
     name: (0 if name in ROW_PARTITION_NAMES else 1) for name in _ALL_PROJ
 }
@@ -62,10 +63,10 @@ def int4_child_names(quant_config: dict, *, component: str | None = None) -> set
 
 
 def pack_int4_projections_inplace(decoder, int4_children: set[str], *, attn_num_cores: int, group_size: int = 32) -> int:
-    """Pack selected logical [N,K] projections to uint8 [N,K/2] in place.
+    """Pack selected [N,K] projections to N32K32 physical storage in place.
 
     Other projections use their normal swizzle. Packed INT4 is identified by
-    uint8 plus pgrp scale shape; NVFP4 requires its explicit packed marker.
+    an explicit N32K32 marker; NVFP4 retains its distinct packed marker.
     Returns the number of newly packed projections.
     """
     if type(group_size) is not int or group_size not in (32, 64, 128):
@@ -95,10 +96,11 @@ def pack_int4_projections_inplace(decoder, int4_children: set[str], *, attn_num_
                     continue
                 if w.dtype == torch.uint8:
                     scale = getattr(module, "weight_scale", None)
-                    if scale is None or scale.dim() != 2 or scale.size(0) != group_size:
+                    if (getattr(module, "_rpu_w4_layout", None) != W4_WEIGHT_LAYOUT
+                            or scale is None or scale.dim() != 2 or scale.size(0) != group_size):
                         raise RuntimeError(
                             f"pack_int4: {parent_name}.{proj_name} is already uint8 "
-                            "but does not carry a pgrp 2-D scale payload"
+                            "but does not carry an installed N32K32 weight and pgrp scale payload"
                         )
                     continue
                 if w.dtype != torch.int8:
@@ -128,8 +130,9 @@ def pack_int4_projections_inplace(decoder, int4_children: set[str], *, attn_num_
                         w.detach().cpu(), scale.detach().cpu(),
                         partition, num_cores, group_size=group_size,
                     )
-                packed = packed.reshape(N, K // 2).contiguous().to(w.device)
+                packed = packed.reshape(w4_storage_shape(N, K, partition, num_cores)).contiguous().to(w.device)
                 module.weight = nn.Parameter(packed, requires_grad=False)
+                module._rpu_w4_layout = W4_WEIGHT_LAYOUT
                 if "weight_scale" in module._buffers:
                     module._buffers["weight_scale"] = packed_scale.to(scale.device)
                 else:

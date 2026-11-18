@@ -245,7 +245,7 @@ TORCH_DEVICE_BACKEND_AUTOLOAD=0 python python/rpu_backend/quant/convert_qwen3_5_
   --src SOURCE_DIR --dst OUTPUT_DIR --expert-chunk 1 --threads 8
 ```
 
-The [complete download and run recipe](../examples/configs/qwen3_5/README.md#cmd-moe-mixed)
+The [complete download and run recipe](../examples/configs/WEIGHTS.md#cmd-qwen35-moe)
 uses `$RPU_MODEL_CACHE/Qwen3.5-35B-A3B-rpu-fp8-mixed` for the output. Conversion
 requires PyTorch, safetensors and Transformers with `Qwen3_5MoeConfig`; it needs
 no calibration data or device runtime.

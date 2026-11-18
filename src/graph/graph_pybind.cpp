@@ -26,6 +26,7 @@
 
 #include "graph/graph_pybind.h"
 
+#include "graph/graph_async_end.h"
 #include "graph/graph_infra.h"
 #include "graph/graph_runtime.h"
 #include "core/rpu_kernel_decls.h"
@@ -38,8 +39,17 @@ namespace py = pybind11;
 namespace graph_pybind {
 
 void add_bindings(py::module_& m) {
+    m.attr("graph_single_segment_abi") = py::int_(1);
     m.def("get_hwperf_evidence_failure_total",
           &rpu_get_hwperf_evidence_failure_total);
+    // GraphRuntimePolicy.async_replay_end (graph/graph_async_end.h).
+    m.def("graph_async_end_pending", &rpu_graph_async_end_pending);
+    m.def("graph_async_end_wait", [] {
+        py::gil_scoped_release release;
+        rpu_graph_async_end_wait("python");
+    });
+    m.def("graph_async_end_stats", &rpu_graph_async_end_stats);
+    m.def("graph_async_end_reset_stats", &rpu_graph_async_end_reset_stats);
     // GraphSignature: A2 admission key 的 7 字段
     py::class_<GraphSignature>(m, "GraphSignature")
         .def(py::init<>())
@@ -124,7 +134,8 @@ void add_bindings(py::module_& m) {
                  int execution_core_count,
                  size_t graph_arena_count,
                  GraphBatchSnapshotMode batch_snapshot_mode,
-                 bool qwen35_dense_27b_sdk_budget) {
+                 bool qwen35_dense_27b_sdk_budget,
+                 bool async_replay_end) {
                  GraphRuntimePolicy result;
                  result.fast_replay_skip_sync = fast_replay_skip_sync;
                  result.force_oneshot_on_replay = force_oneshot_on_replay;
@@ -144,6 +155,7 @@ void add_bindings(py::module_& m) {
                  result.graph_arena_count = graph_arena_count;
                  result.batch_snapshot_mode = batch_snapshot_mode;
                  result.qwen35_dense_27b_sdk_budget = qwen35_dense_27b_sdk_budget;
+                 result.async_replay_end = async_replay_end;
                  validate_graph_runtime_policy(result);
                  return result;
              }),
@@ -161,7 +173,8 @@ void add_bindings(py::module_& m) {
              py::arg("execution_core_count") = 8,
              py::arg("graph_arena_count") = 0,
              py::arg("batch_snapshot_mode") = GraphBatchSnapshotMode::Auto,
-             py::arg("qwen35_dense_27b_sdk_budget") = false)
+             py::arg("qwen35_dense_27b_sdk_budget") = false,
+             py::arg("async_replay_end") = false)
         .def("prepare_arenas", &prepare_graph_runtime_arenas);
 
     py::class_<GraphSegmentCensus>(m, "GraphSegmentCensus")
@@ -241,7 +254,12 @@ void add_bindings(py::module_& m) {
              py::arg("signature"),
              "Open scope with signature: BUILT+sig match → REPLAYING,"
              " else RECORDING with sig pending until end()")
+        // end() executes the Graph and waits for the device without touching a
+        // Python object, so other Python threads (a CPU post-process worker) run
+        // meanwhile, as they already do inside torch.ops calls. RPU ownership is
+        // the execution coordinator's per-thread claim, not the GIL.
         .def("end",        &RpuKernelGraph::end,
+             py::call_guard<py::gil_scoped_release>(),
              "Close scope: RECORDING → BUILT (replayable) or PASSTHROUGH"
              " (non-replayable); REPLAYING → BUILT")
         .def("abort",      &RpuKernelGraph::abort,
@@ -296,8 +314,9 @@ void add_bindings(py::module_& m) {
     py::class_<RpuGraphCache>(m, "GraphCache")
         .def(py::init<>())
         .def(py::init<size_t>(), py::arg("max_entries"))
-        .def(py::init<size_t, GraphRuntimePolicy>(),
-             py::arg("max_entries"), py::arg("runtime_policy"))
+        .def(py::init<size_t, GraphRuntimePolicy, bool>(),
+             py::arg("max_entries"), py::arg("runtime_policy"),
+             py::arg("require_single_segment") = false)
         .def("get_or_create",
              [](RpuGraphCache& self, const GraphSignature& sig) {
                  return self.lookup_shared(sig)

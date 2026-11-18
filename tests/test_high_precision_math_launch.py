@@ -35,7 +35,8 @@ def _run(tmp_path, name, program):
         pytest.skip("requires a host C++ compiler")
     source, binary = tmp_path / f"{name}.cpp", tmp_path / name
     source.write_text(program)
-    built = subprocess.run([compiler, "-std=c++17", "-O0", str(source), "-o", str(binary)],
+    built = subprocess.run([compiler, "-std=c++17", "-O0", "-I", str(ROOT / "src/core"), "-I", str(ROOT / "src/ops"),
+                            str(source), "-o", str(binary)],
                            capture_output=True, text=True, timeout=30)
     assert built.returncode == 0, built.stderr
     subprocess.run([str(binary)], check=True, timeout=30)
@@ -54,6 +55,8 @@ COMMON = r'''
 #include <memory>
 #include <stdexcept>
 #include <vector>
+#include "rpu_linear_tiling.h"
+#include "rpu_pi_wall_tiling.h"
 #define TORCH_CHECK(c, ...) do { if (!(c)) throw std::runtime_error("rejected"); } while (0)
 namespace c10 { struct Half { uint16_t x; Half(double v = 0): x(uint16_t(v * 1024)) {} }; }
 uint16_t half_to_u16(c10::Half h) { return h.x; }
@@ -197,6 +200,17 @@ int main() {
   rejects([] { rpu_launch_eltwise_unary_spm_kernel(1,1,0,ValuOpType::SILU); });
   rejects([] { rpu_launch_eltwise_unary_spm_kernel(1,1,8,ValuOpType::SILU,GeluMode::NONE,0); });
   rejects([] { rpu_launch_eltwise_unary_spm_kernel(1,1,int64_t(25600)*65536,ValuOpType::TANH); });
+
+  rpu_launch_eltwise_unary_spm_kernel(1,1,8,ValuOpType::CLIP,GeluMode::NONE,8,RpuUnaryPrecision::BASE,1.0,2.0);
+  assert(selected == KernelId::UNARY_SPM);
+  assert(kernel.regs[59] == c10::Half(2.0).x && kernel.regs[60] == c10::Half(1.0).x);
+  const int before_clip_rejections = queue.launches;
+  rejects([] { rpu_launch_eltwise_unary_spm_kernel(1,1,8,ValuOpType::CLIP,GeluMode::NONE,8,RpuUnaryPrecision::BASE,2.0,1.0); });
+  rejects([] { rpu_launch_eltwise_unary_spm_kernel(1,1,8,ValuOpType::CLIP,GeluMode::NONE,8,RpuUnaryPrecision::BASE,-70000.0,1.0); });
+  rejects([] { rpu_launch_eltwise_unary_spm_kernel(1,1,8,ValuOpType::CLIP,GeluMode::NONE,8,RpuUnaryPrecision::BASE,0.0,INFINITY); });
+  rejects([] { rpu_launch_eltwise_unary_spm_kernel(1,1,8,ValuOpType::CLIP,GeluMode::NONE,8,RpuUnaryPrecision::BASE,NAN,1.0); });
+  rejects([] { rpu_launch_eltwise_unary_spm_kernel(1,1,8,ValuOpType::SILU,GeluMode::NONE,8,RpuUnaryPrecision::BASE,1.0,2.0); });
+  assert(queue.launches == before_clip_rejections);
 
   for (auto op : {ValuOpType::SILU, ValuOpType::TANH}) {
     const int64_t block = op == ValuOpType::SILU ? 15872 : 25600;

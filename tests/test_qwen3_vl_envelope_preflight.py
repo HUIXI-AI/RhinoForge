@@ -34,8 +34,7 @@ def test_legacy_32b_excess_chunk_rejects_before_any_checkpoint_loader(monkeypatc
     cfg = runtime_32b_config(8)
     cfg.quant_config = copy.deepcopy(load._QWEN3_VL_32B_W8A16_QUANT_CONFIG)
     assert load.is_qwen3_vl_32b_w8a16_config(cfg)
-    monkeypatch.setenv("QWEN3_VL_32B_ALLOW_GRAPH_BLOCKED", "1")
-    # Controlled metadata admission does not widen this recipe's own chunk bound.
+    # Admission does not widen this recipe's own chunk bound.
     Qwen3VLAdapter.preflight(cfg)
     monkeypatch.setattr(conditional_generation.AutoConfig, "from_pretrained", lambda *a, **k: cfg)
 

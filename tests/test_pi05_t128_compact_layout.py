@@ -50,6 +50,7 @@ def test_c448_single_compact_schedule_preserves_both_residuals(tmp_path, monkeyp
 #include <string>
 #include <vector>
 using namespace v3;
+struct DeferredDmaChannels{uint8_t used=0,next=0;};
 ''' + constants + r'''
 enum class Pi05PrefillPairedProjection { AttentionOutputRow };
 enum class Pi05OwnerNormResidual { Compact };
@@ -119,7 +120,10 @@ struct Context {
 };
 struct Owner {
     int64_t pi05_pair_rows_=C;
-    bool pi05_prefill_a8_=false,pi05_prefill_o_pair_=true,pi05_prefill_gateup_pair_=true;
+    bool pi05_prefill_a8_=false,pi05_prefill_o_pair_=true,pi05_prefill_gateup_pair_=true,carried_=false;
+    DeferredDmaChannels pi05_o_pair_output_dma_;
+    int pi05_o_pair_carried_layer_=-1;
+    bool pi05_o_pair_output_carried(int) const{return carried_;}
     double eps_=1e-6;
     struct Weights {at::Tensor o_w,o_ws,gate_proj_w,up_proj_w,gate_ws,up_ws,down_proj_w,down_ws;};
     std::vector<Weights> layer_weights_=std::vector<Weights>(18);
@@ -141,7 +145,14 @@ struct Owner {
     }
     uint32_t layer_addr(int,int,const char*) const{return 0;}
     int consume_rmsnorm_route(int64_t,const ChunkInfo&) const{return 0;}
-    void emit_layer_output_dma(int,const ChunkInfo& c,const char* name){
+    void emit_layer_output_dma(int,const ChunkInfo& c,const char* name,uint32_t offset=0,
+                               DeferredDmaChannels* deferred=nullptr,bool replicated=false){
+        // A carried layer copies only half 0, on the lanes and from the
+        // all-gathered S2 of cores 1..7; half 1 stays in S0.
+        assert(offset==0 && !(carried_ && c.idx==1));
+        assert(deferred==(carried_ ? &pi05_o_pair_output_dma_ : nullptr));
+        assert(replicated==carried_);
+        if(deferred)deferred->used=0xfe;
         has(addr(0,name),F,c.idx==0?11:12);ops.push_back(c.idx==0?9:11);
     }
 ''' + methods + r'''
@@ -149,20 +160,37 @@ struct Owner {
 template<class F> void rejects(F f){bool bad=false;try{f();}catch(const c10::Error&){bad=true;}assert(bad);}
 int main(){
     at::set_num_threads(1);
-    for(bool quant:{false,true})for(int capacity:{896,1024}){
-        Owner o;o.pi05_prefill_a8_=quant;
+    for(bool carried:{false,true})for(bool quant:{false,true})for(int capacity:{896,1024}){
+        Owner o;o.pi05_prefill_a8_=quant;o.carried_=carried;
         o.q_ddr_buf_=at::zeros({8,capacity,256},at::TensorOptions().dtype(at::kHalf));
         std::fill(spm.begin(),spm.end(),0);ops.clear();
         assert(o.pi05_pair_compact_root_bytes()==D && o.pi05_pair_tile_rows()==96);
         assert(o.pi05_pair_input_compact_address(0)==C0 && o.pi05_pair_input_compact_address(1)==S3+4*D);
         // A production policy regression back to S3 would overwrite input C1.
         put(C0,D,1);put(S3+4*D,D,2);
-        const auto kvroot=std::string(o.pi05_pair_kv_norm_name(false));
-        assert(kvroot=="input_norm_kv");put(kvroot=="input_norm_kv"?S1:S3,F,50);has(S3+4*D,D,2);
+        const auto kvroot=std::string(o.pi05_pair_kv_norm_name(false,true));
+        assert(kvroot=="input_norm_kv");
+        // A generic chunk plan at the same cold rows declares no input_norm_kv.
+        assert(std::string(o.pi05_pair_kv_norm_name(false,false))=="input_norm");
+        assert(std::string(o.pi05_pair_kv_norm_name(true,false))=="input_norm_kv");put(kvroot=="input_norm_kv"?S1:S3,F,50);has(S3+4*D,D,2);
         // Include a full final M128 SDPA tile, beyond the logical second half.
         put(S3,512*512,21);put(S3+D,512*512,22);put(S3,D,21);has(S3+4*D,D,2);
         o.emit_pi05_o_pair_finish(0);
-        assert(ops==std::vector<int>({1,2,3,4,5,6,7,8,9,10,11}));
+        if(carried){
+            assert(ops==std::vector<int>({1,2,3,4,5,6,7,8,9,10}));
+            // Half 1's companion ran while half 0's copy was still reading S2.
+            has(S2,F,11);
+            assert(o.pi05_o_pair_carried_layer_==0 && o.pi05_o_pair_output_dma_.used==0xfe);
+            // Until the next layer's KV body joins, no later finish may start.
+            const auto before=ops;
+            rejects([&]{o.emit_pi05_o_pair_finish(1);});
+            assert(ops==before);
+            o.pi05_o_pair_carried_layer_=-1;rejects([&]{o.emit_pi05_o_pair_finish(1);});
+            assert(ops==before);
+        } else {
+            assert(ops==std::vector<int>({1,2,3,4,5,6,7,8,9,10,11}));
+            assert(o.pi05_o_pair_carried_layer_<0 && o.pi05_o_pair_output_dma_.used==0);
+        }
         const auto expected=o.pi05_o_pair_routes();
         for(const auto& actual:o.context.consumed){
             if(actual.site_id==PI05_GATEUP_PAIR_LINEAR_SITE || actual.site_id==PI05_DOWN_PAIR_LINEAR_SITE || actual.site_id==PI05_DOWN_PAIR_OUTPUT_SITE)continue;
@@ -178,8 +206,10 @@ int main(){
     for(int rows:{272,288,304,320,400,416,432}){
         Owner o;o.pi05_pair_rows_=rows;assert(!o.pi05_pair_single_compact());
         assert(o.pi05_pair_compact_root_bytes()==rows*1024);
-        assert(std::string(o.pi05_pair_kv_norm_name(false))=="input_norm");
-        assert(std::string(o.pi05_pair_kv_norm_name(true))=="input_norm_kv");
+        for(bool paired:{false,true}){
+            assert(std::string(o.pi05_pair_kv_norm_name(false,paired))=="input_norm");
+            assert(std::string(o.pi05_pair_kv_norm_name(true,paired))=="input_norm_kv");
+        }
         assert(o.pi05_pair_input_compact_arguments(1)==std::vector<int64_t>({rows*256,rows*512,8,1}));
         const auto routes=o.pi05_o_pair_routes();
         assert(std::none_of(routes.begin(),routes.end(),[](const auto& route){return route.site_id==PI05_O_PAIR_SPILL_SITE;}));
@@ -187,3 +217,38 @@ int main(){
 }
 '''
     _run_native(tmp_path, code, torch)
+
+
+def test_carried_output_copy_is_joined_before_the_next_layer_writes_s2():
+    """The next layer's first KV body joins the lanes before any S2 writer."""
+    source = (ROOT / "src/fused/rpu_gemma_model.cpp").read_text()
+    body = _function(source, "    void emit_kv_first_body(")
+    join = body.index("rpu_join_deferred_dma(pi05_o_pair_output_dma_);")
+    check = body.index("pi05_o_pair_carried_layer_ + 1 == layer_idx")
+    assert check < join
+    for later in ("emit_pi05_qkv_pair_body(layer_idx, chunk);",
+                  "emit_layer_input_dma(layer_idx, chunk);",
+                  "rpu_launch_spm_local_shard_copy_dma(",
+                  "rpu_launch_rmsnorm_spm_kernel(",
+                  "rpu_launch_linear_spm_to_spm_acc16_kernel("):
+        assert join < body.index(later), later
+    finish = _function(source, "    void emit_pi05_o_pair_finish(")
+    assert finish.count("&pi05_o_pair_output_dma_") == 1
+    assert finish.index("pi05_o_pair_carried_layer_ < 0") < finish.index("consume_physical_route")
+
+
+def test_replicated_lane_source_is_opt_in_and_reads_cores_1_to_7():
+    """Only the all-gathered paired-O half 0 spreads its runs off core 0."""
+    memcpy = (ROOT / "src/ops/rpu_memcpy.cpp").read_text()
+    start = memcpy.index("void rpu_launch_spm_copy_ddr_dma(\n        uint32_t spm_addr_unified,\n"
+                         "        const at::Tensor& ddr_tensor,")
+    owned = memcpy[start:memcpy.index("\n}\n", start)]
+    assert "TORCH_CHECK(!source_replicated || deferred != nullptr," in owned
+    assert owned.count("source_replicated ? lane + 1 : 0") == 1
+    assert owned.index("if (deferred != nullptr)") < owned.index("source_replicated ? lane + 1 : 0")
+    users = [path for path in (ROOT / "src").rglob("*.cpp")
+             if "/*source_replicated=*/true" in path.read_text()]
+    assert [path.relative_to(ROOT).as_posix() for path in users] == ["src/fused/rpu_gemma_model.cpp"]
+    finish = _function((ROOT / "src/fused/rpu_gemma_model.cpp").read_text(),
+                       "    void emit_pi05_o_pair_finish(")
+    assert finish.count("/*source_replicated=*/true") == 1

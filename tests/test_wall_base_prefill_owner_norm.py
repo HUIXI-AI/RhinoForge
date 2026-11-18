@@ -4,6 +4,7 @@ import re
 
 import pytest
 
+from pi_wall_host_catalog import CATALOG_INCLUDE, absolute_candidate_includes
 from test_wall_base_nvfp4_qkv_bias import META
 from test_wall_base_paired_kv import block, compile_run
 
@@ -30,6 +31,7 @@ def test_actual_prefill_owner_norm_cold_complete_and_fallback(tmp_path, fp16):
     base = (ROOT / 'src/core/fused_model_base.h').read_text()
     decls = (ROOT / 'src/core/rpu_kernel_decls.h').read_text()
     cache = (ROOT / 'src/core/rpu_kernel_cache.h').read_text()
+    runtime = (ROOT / 'src/ops/rpu_pi_wall_runtime.h').read_text()
     start = decoder.index('        wall_base_prefill_shared_input_ =')
     cold = decoder[start:decoder.index('        qwen3vl_4b_decode_gateup_fused_ =', start)]
     start = decoder.index('        wall_base_fp16_long_prefill_ =')
@@ -76,7 +78,7 @@ def test_actual_prefill_owner_norm_cold_complete_and_fallback(tmp_path, fp16):
         'WALL_BASE_PREFILL_SHARED_NOUP_SITE', 'WALL_BASE_PREFILL_SHARED_DOWN_SITE',
         'WALL_BASE_PREFILL_SHARED_REDUCE_SITE', 'WALL_BASE_FP16_PREFILL_SHARED_GATEUP_SITE',
     ))
-    source = META + r'''
+    source = CATALOG_INCLUDE + META + r'''
 #include <atomic>
 #include <bitset>
 #include <cmath>
@@ -86,23 +88,26 @@ def test_actual_prefill_owner_norm_cold_complete_and_fallback(tmp_path, fp16):
 #define TORCH_INTERNAL_ASSERT(x) TORCH_CHECK(x)
 KERNEL_IDS
 AVAILABILITY
+PI_WALL_ID
 struct KernelCache {
  KernelPayloadAvailability availability;
  static auto& instance(){static KernelCache k;return k;}
  bool has_loaded(KernelId id)const{return availability.has_loaded(id);}
 };
+PI_WALL_RUNTIME
 constexpr bool FP16=IS_FP16;
 void publish(bool candidate=true,bool fp16_qkv=true,bool w8_payloads=true,bool fp16_gateup=true){
  KernelPayloadAvailability::ExtendedPayloads b;
- for(auto id:{KernelId::WALL_BASE_PREFILL_GATE_UP_SHARED_A_M384N48K128,
-             KernelId::WALL_BASE_PREFILL_GATE_UP_SHARED_SILU_M384N48K128,
-             KernelId::WALL_BASE_PREFILL_GATE_UP_SHARED_SILU_NOUP_M384N48K128,
-             KernelId::WALL_QKV_W8A16_MULTIBASE_M448N64}){
-  if(size_t(id)>=KernelPayloadAvailability::kExtendedBegin)
-   b.set(size_t(id)-KernelPayloadAvailability::kExtendedBegin,w8_payloads);
+ for(const auto& p:rpu_pi_wall::profiles){
+  const bool shared=p.operation==rpu_pi_wall::Operation::SharedRaw||
+   p.operation==rpu_pi_wall::Operation::SharedSiluUp||p.operation==rpu_pi_wall::Operation::SharedSilu;
+  if(p.weight==rpu_pl_tiling::WeightType::Int8&&(shared||p.operation==rpu_pi_wall::Operation::Qkv))
+   b.set(size_t(pi_wall_kernel_id(p.ordinal))-KernelPayloadAvailability::kExtendedBegin,w8_payloads);
+  if(p.weight==rpu_pl_tiling::WeightType::Fp16&&p.operation==rpu_pi_wall::Operation::Qkv)
+   b.set(size_t(pi_wall_kernel_id(p.ordinal))-KernelPayloadAvailability::kExtendedBegin,fp16_qkv);
+  if(p.weight==rpu_pl_tiling::WeightType::Fp16&&p.operation==rpu_pi_wall::Operation::SharedSilu)
+   b.set(size_t(pi_wall_kernel_id(p.ordinal))-KernelPayloadAvailability::kExtendedBegin,fp16_gateup);
  }
- b.set(size_t(KernelId::WALL_PREFILL_QKV_FP16_M448N64K128)-KernelPayloadAvailability::kExtendedBegin,fp16_qkv);
- b.set(size_t(KernelId::WALL_BASE_PREFILL_GATE_UP_SHARED_SILU_FP16_M320N80K128)-KernelPayloadAvailability::kExtendedBegin,fp16_gateup);
  b.set(size_t(KernelId::WALL_BASE_PREFILL_O_OWNER_RING_NORM_M224)-KernelPayloadAvailability::kExtendedBegin,candidate);
  KernelCache::instance().availability.publish(false,false,false,false,false,false,b,
   false,false,false,false,false,false,false,w8_payloads);
@@ -182,12 +187,9 @@ template<class... A>void rpu_launch_silu_mul_spm_kernel(A...){assert(false);}
 template<class... A>void rpu_launch_all_reduce_fp16_partial_bf16_residual_spm_kernel(A...){assert(false);}
 template<class... A>void rpu_launch_rmsnorm_bf16in_fp16out_spm_kernel(A...){assert(false);}
 template<class... A>void rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(A...){assert(false);}
-namespace rpu_pl_tiling {bool supports_w8a16_row_weight_reuse(int64_t,int64_t,int64_t,int,int){return false;}}
 struct Model {
  bool lingbot_folded_rmsnorm_=false;
- void emit_lingbot_nogamma_norm(uint32_t,uint32_t,int64_t,int64_t) {
-  throw std::runtime_error("Wall fixture cannot enter Lingbot normalization");
- }
+ template<class...T>void emit_lingbot_nogamma_norm(T...){throw std::runtime_error("unbound LingBot normalization");}
  struct LayerWeights {at::Tensor q_w,k_w,v_w,o_w,gate_w,up_w,down_w,o_ws,gate_ws,up_ws,down_ws,post_norm_w;};
  std::vector<LayerWeights> layer_weights_=std::vector<LayerWeights>(36);WallSortingConfig wall_sorting_;
  bool has_qkv_bias_=true,has_qk_norm_=false,has_mrope_=true,use_silu_=true,scale=true;
@@ -373,8 +375,10 @@ int main(){
 '''
     rms_types = decls[decls.index('enum RpuRmsNormCapability'):decls.index('enum class RpuMixedRmsNormSpmRoute')]
     substitutions = {
-        'KERNEL_IDS': block(cache, 'enum class KernelId : uint16_t') + ';',
+        'KERNEL_IDS': absolute_candidate_includes(block(cache, 'enum class KernelId : uint16_t') + ';'),
         'AVAILABILITY': block(cache, 'class KernelPayloadAvailability final') + ';',
+        'PI_WALL_ID': block(cache, 'inline KernelId pi_wall_kernel_id('),
+        'PI_WALL_RUNTIME': block(runtime, 'inline bool rpu_pi_wall_operation_loaded('),
         'ROUTE_FAMILY': block(base, 'enum class FmbRouteFamily : int') + ';',
         'GRAPH_LIFECYCLE': block(base, 'enum class FmbGraphLifecycle : int') + ';',
         'ACCUMULATION': block(base, 'enum class FmbLinearAccumulationPolicy : int') + ';',

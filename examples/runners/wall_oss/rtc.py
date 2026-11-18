@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from examples.common.inputs import _controlled_images as _images, _controlled_checkpoint as _checkpoint
+from examples.runners.wall_oss.runner import wall_stage_boundaries
 
 def _wall_rtc(runner):
     from rpu_backend.api import WallOssPolicy
@@ -37,6 +38,7 @@ def _wall_rtc(runner):
         rpu_execution=config.get("rpu_execution"),
     ).to("rpu")
     runner.owner = policy
+    runner.stage_boundaries = wall_stage_boundaries(getattr(policy, "_vla", None))
     policy.prepare_graphs(
         **request, prefix_length_range=inputs.get("prefix_length_range", [599, 640]))
     request.update(use_rtc=True, inference_delay=inputs.get("inference_delay", 0))

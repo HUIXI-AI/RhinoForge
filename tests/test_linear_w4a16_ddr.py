@@ -38,7 +38,8 @@ namespace c10 { template<class T> using optional = std::optional<T>;
 using Half = uint16_t;
 constexpr auto nullopt=std::nullopt; }
 namespace graph_dma { bool capturing=false; bool active(){return capturing;} }
-int allocations=0,copies=0,retentions=0,launches=0,last_k=0,last_cores=0;
+int allocations=0,copies=0,retentions=0,launches=0,last_k=0,last_cores=0,retained_cores=0;
+uint32_t last_pitch=0;
 bool last_acc32=false; int spm_routes=0,fp16_acc32_routes=0;
 namespace at {
 enum ScalarType {kHalf,kFloat,kByte,kChar}; constexpr int kPrivateUse1=1;
@@ -64,21 +65,21 @@ Tensor empty(const std::vector<int64_t>& shape,Options opts){++allocations;Tenso
  t.shape.assign(shape.begin(),shape.end());t.opts=opts;t.present=true;return t;}
 }
 using at::Tensor;
-uint64_t RpuGetDevAddr(void* ptr){return reinterpret_cast<uintptr_t>(ptr);}
-struct RpuKernelGraph {
- static bool has_active(){return graph_dma::capturing;}
- void begin(){}
- void keep_alive(const Tensor&){}
- void end(){}
- void abort(){}
-};
-Tensor rpu_retain_linear_quant_scale(const Tensor&,const Tensor& scale){++retentions;return scale;}
+Tensor rpu_retain_linear_quant_scale(const Tensor&,const Tensor& scale,int64_t cores=8){
+ ++retentions;retained_cores=cores;return scale;}
 '''
-    # Reuse the public declaration so omitted legacy arguments exercise their
-    # actual compatibility defaults instead of duplicating those defaults here.
+    # Reuse the public declaration so omitted arguments exercise their
+    # actual public defaults instead of duplicating those defaults here.
     header = (ROOT / "src/core/rpu_kernel_decls.h").read_text()
+    # That declaration's trailing conv-slab handle needs the type first. This
+    # caller never passes one, but the struct is taken from the header rather
+    # than restated here, so a changed layout reaches this contract.
+    program += _definition(header, "struct LinearConv1dSlab") + ";\n"
     begin = header.index("void rpu_launch_linear_ddr_kernel(")
     program += header[begin:header.index(";", begin) + 1]
+    for declaration in ("at::Tensor rpu_linear_w4a16(", "at::Tensor rpu_linear_with_accumulation("):
+        begin = header.index(declaration)
+        program += header[begin:header.index(";", begin) + 1]
     program += _definition(source, "static void check_linear_shapes(")
     program += _definition(source, "void validate_parallel_linear_geometry(")
     program += _definition(source, "static void check_linear_w4a16_operands(")
@@ -86,18 +87,18 @@ Tensor rpu_retain_linear_quant_scale(const Tensor&,const Tensor& scale){++retent
     # only SPM/device work. This catches a dropped or inverted accumulator flag.
     route_begin = body.index("    if (w8a16 || w4a16 || !use_acc32) {")
     route_else = body.index("    } else {", route_begin)
-    fp16_tile_end = body.index(";", body.index("const auto tile =", route_else))
-    route = body[route_begin:fp16_tile_end + 1] + "\n    }\n"
+    route_end = body.index("\n    }", route_else) + len("\n    }")
+    route = body[route_begin:route_end]
     program += r'''
 void rpu_launch_linear_spm_to_spm_acc16_kernel(
  uint32_t,const Tensor&,uint32_t,int64_t,int64_t,int64_t,int,int cores,
  uint32_t,const Tensor&,int,int,bool acc32){
  ++spm_routes;last_acc32=acc32;last_cores=cores;
 }
-namespace rpu_pl_tiling {
-int select_tile_acc32(int,int,int,bool fp16){
- assert(fp16);++fp16_acc32_routes;last_acc32=true;return 0;
-}
+void rpu_launch_linear_spm_to_spm_kernel(
+ uint32_t,const Tensor&,uint32_t,int64_t,int64_t,int64_t,int,int cores,uint32_t,
+ uint32_t pitch){
+ ++fp16_acc32_routes;last_acc32=true;last_cores=cores;last_pitch=pitch;
 }
 '''
     program += admission + r'''
@@ -107,6 +108,10 @@ int select_tile_acc32(int,int,int,bool fp16){
   assert(input.is_contiguous()&&output.is_contiguous());
   const int64_t cur_m=input.size(0),n=weight.size(0),k=input.size(1);
   const int64_t local_n=partition?n/num_cores:n,local_k=partition?k:k/num_cores;
+  // Plain-GEMM geometry: an A row spans the whole local K. Only the conv-slab
+  // route narrows the pitch, and this caller never supplies a slab, so the
+  // forwarded pitch below must stay local_k.
+  const size_t a_dwidth=2,in_pitch=local_k;
   const uint32_t x_addr=256,y_addr=512,b_addr=has_bias?768:0;
   last_cores=num_cores;
 ''' + route + r'''
@@ -119,20 +124,21 @@ int select_tile_acc32(int,int,int,bool fp16){
     program += r'''
 int main(){
  for(int k:{64,2048,2560}) for(int n:{128,151936}){
-  Tensor x({2,17,k}),w({n,k/2},at::kByte),b({n});x.dense=false;
+  const int physical_n=((n/8+31)/32)*32*8;
+  Tensor x({2,17,k}),w({physical_n,k/2},at::kByte),b({n});x.dense=false;
   const int elements=((k/32+3)/4)*((n/8+63)/64)*8*4*64;
   Tensor scale({32,elements/32});
-  auto first=rpu_linear_w4a16(x,w,scale,b);const int snapshot=*first.storage;
-  auto second=rpu_linear_w4a16(x,w,scale,{});
+  auto first=rpu_linear_w4a16(x,w,scale,b,n);const int snapshot=*first.storage;
+  auto second=rpu_linear_w4a16(x,w,scale,{},n);
   assert((first.shape==at::Sizes{2,17,n})&&last_k==k&&!last_acc32);
   assert(first.storage!=second.storage&&*first.storage==snapshot);
-  auto one=rpu_linear_w4a16(Tensor({k}),w,scale,{});
+  auto one=rpu_linear_w4a16(Tensor({k}),w,scale,{},n);
   assert((one.shape==at::Sizes{n}));
  }
- Tensor x({1,256}),w({128,128},at::kByte),s({32,128}),b({128});
+ Tensor x({1,256}),w({256,128},at::kByte),s({32,128}),b({128});
  auto reject=[&](Tensor input,Tensor weight,Tensor scale,c10::optional<Tensor> bias={}){
   int a=allocations,c=copies,r=retentions,l=launches;bool failed=false;
-  try{rpu_linear_w4a16(input,weight,scale,bias);}catch(const std::runtime_error&){failed=true;}
+  try{rpu_linear_w4a16(input,weight,scale,bias,128);}catch(const std::runtime_error&){failed=true;}
   assert(failed&&a==allocations&&c==copies&&r==retentions&&l==launches);
  };
  reject(Tensor({}),w,s);reject(Tensor({0,256}),w,s);
@@ -144,6 +150,7 @@ int main(){
  bad=w;bad.opts.where.index=1;reject(x,bad,s);
  bad=x;bad.opts.where.kind=0;reject(bad,w,s);
  reject(x,w,{});reject(x,w,Tensor({32,127}));reject(x,w,Tensor({64,64}));
+ reject(x,w,Tensor({16,256}));
  reject(x,w,Tensor({4096}));reject(x,w,Tensor({32,128},at::kByte));
  bad=s;bad.dense=false;reject(x,w,bad);
  bad=s;bad.opts.where.index=1;reject(x,w,bad);
@@ -159,26 +166,38 @@ int main(){
  failed=false;
  try{rpu_launch_linear_ddr_kernel(x,w,output,{},false,1,nullptr,0,nullptr,4,s);}
  catch(const std::runtime_error&){failed=true;} assert(failed&&launches==before);
- rpu_linear_w4a16(x,w,s,{});assert(launches==before+1&&!last_acc32);
+ rpu_linear_w4a16(x,w,s,{},128);assert(launches==before+1&&!last_acc32);
  // Public explicit accumulation must reach the selected DDR/SPM family for
- // FP16, natural-scale W8 and packed G32 W4; reduced W8 uses the actual core count.
+ // FP16, natural-scale W8 and packed G32 W4 use the actual core count.
  for(auto dtype:{at::kHalf,at::kChar,at::kByte}) for(bool acc32:{false,true})
- for(int cores:{4,8}){
-  if(dtype==at::kByte&&cores!=8)continue;
-  Tensor input({2,17,256}),weight({128,dtype==at::kByte?128:256},dtype);
+ for(int cores:{4,6,8}){
+  const int n=cores*32;
+  Tensor input({2,17,256}),weight({n,dtype==at::kByte?128:256},dtype);
   input.dense=false;
   c10::optional<Tensor> scale;
-  if(dtype==at::kChar)scale=Tensor({128});
-  if(dtype==at::kByte)scale=s;
+  if(dtype==at::kChar)scale=Tensor({n});
+  if(dtype==at::kByte)scale=Tensor({32,((256/32+3)/4)*((n/cores+63)/64)*cores*8});
   const int old_spm=spm_routes,old_acc32=fp16_acc32_routes;
   auto first=rpu_linear_with_accumulation(input,weight,{},1,cores,acc32,scale);
   const int snapshot=*first.storage;
   assert(last_acc32==acc32&&last_cores==cores&&last_k==256);
-  assert((first.shape==at::Sizes{2,17,128}));
+  assert((first.shape==at::Sizes{2,17,n}));
+  if(dtype==at::kByte)assert(retained_cores==cores);
   assert(fp16_acc32_routes-old_acc32==(dtype==at::kHalf&&acc32));
+  // A plain GEMM must forward the whole local K as the A-operand row pitch.
+  // Dropping the argument would silently restore it for a conv slab too.
+  if(dtype==at::kHalf&&acc32)assert(last_pitch==256*2);
   assert(spm_routes-old_spm!=(dtype==at::kHalf&&acc32));
-  auto second=rpu_linear_with_accumulation(input,weight,Tensor({128}),1,cores,acc32,scale);
+  auto second=rpu_linear_with_accumulation(input,weight,Tensor({n}),1,cores,acc32,scale);
   assert(first.storage!=second.storage&&*first.storage==snapshot);
+ }
+ // Exercise real Qwen3 vocab/head dimensions, including the TP4 head selected
+ // for a six-core budget; all supported leading shapes preserve logical K.
+ for(int cores:{4,8})for(int k:{1024,2048,2560,4096,5120}){
+  const int n=151936,elements=((k/32+3)/4)*((n/cores+63)/64)*cores*256;
+  auto head=rpu_linear_with_accumulation(Tensor({1,k}),Tensor({((n/cores+31)/32)*32*cores,k/2},at::kByte),
+      {},1,cores,true,Tensor({32,elements/32}),n);
+  assert((head.shape==at::Sizes{1,n})&&last_k==k&&last_cores==cores&&retained_cores==cores);
  }
  Tensor fpweight({128,256}),w8weight({128,256},at::kChar);
  rpu_linear_with_core_count(x,fpweight,{},1,4);
@@ -204,8 +223,22 @@ int main(){
  reject_explicit(x,w8weight,Tensor({128}),0);
  reject_explicit(x,w8weight,Tensor({128}),1,3);
  reject_explicit(x,fpweight,Tensor({128}));
- reject_explicit(x,w,s,1,4); // G32 stripes remain TP8 on this eager public ABI
+ reject_explicit(x,w,s,1,4); // TP8 stripes cannot be reused for this TP4 geometry.
  reject_explicit(x,w,{});
+ // Packed metadata must reject before staging or scale retention.
+ for(int cores:{0,3,9}){
+  const int a=allocations,c=copies,r=retentions;
+  reject_explicit(x,w,s,1,cores);
+  assert(a==allocations&&c==copies&&r==retentions);
+ }
+ {
+  const int a=allocations,c=copies,r=retentions;
+  reject_explicit(x,w,s,0);
+  reject_explicit(x,w,s,1,4);
+  reject_explicit(x,w,Tensor({16,256}));
+  reject_explicit(x,w,Tensor({64,64}));
+  assert(a==allocations&&c==copies&&r==retentions);
+ }
  graph_dma::capturing=true;
  reject_explicit(x,fpweight,{});
  reject_explicit(x,w8weight,Tensor({128}));
@@ -240,15 +273,15 @@ def test_w4_fake_preserves_selected_rows_and_fp16_output(shape):
     function = _fake_function()
     with FakeTensorMode():
         x = torch.empty(shape, dtype=torch.float16)
-        w = torch.empty((128,128), dtype=torch.uint8)
+        w = torch.empty((256,128), dtype=torch.uint8)
         s = torch.empty((32,128), dtype=torch.float16)
-        out = function(x,w,s)
+        out = function(x,w,s,logical_out_features=128)
         assert isinstance(out,FakeTensor) and out.shape == (*shape[:-1],128)
         assert out.dtype == torch.float16
         with pytest.raises(RuntimeError, match="scale"):
-            function(x,w,s[:,:-1])
+            function(x,w,s[:,:-1],logical_out_features=128)
         with pytest.raises(RuntimeError, match="packed"):
-            function(x,w.half(),s)
+            function(x,w.half(),s,logical_out_features=128)
     with pytest.raises(RuntimeError, match="non-Fake"):
         function(torch.empty(shape).half(),torch.empty((128,128),dtype=torch.uint8),
                  torch.empty((32,128)).half())

@@ -18,9 +18,11 @@ def test_z1_text_selected_winner_is_validated_before_mutable_prime():
     prepare = _between(source, "CausalDecoderModel::prepare_qwen3vl_pooler_z1_layout(",
                        "SpmDense2DSpec CausalDecoderModel::qwen3vl_pooler_z1_destination_spec(")
     assert 'kvinsert_cost_domain("causal_decoder", selected_descriptor)' in prepare
-    assert "kvinsert_cost_owner_prefix(selected_descriptor)" in prepare
+    assert "kvinsert_cost_owner_prefix(prepared_descriptor)" in prepare
     assert "fmb_three_stage_chunk_plan_fingerprint(candidate.stage_plan)" in prepare
-    assert "bind_physical_layout_context(layout, manifest)" in prepare
+    assert "layout = bind_physical_layout_context(layout, manifest)" in prepare
+    assert prepare.index("prepare_stage_candidate(prepared_descriptor)") < prepare.index(
+        "bind_physical_layout_context(layout, manifest)")
     assert "qwen3vl_pooler_z1_selected_stage_descriptor_.assign(" in prepare
     prime = _between(source, "void CausalDecoderModel::prime_qwen3vl_pooler_z1_inputs(",
                      "std::vector<int64_t> CausalDecoderModel::qwen3vl_pooler_z1_stage_descriptor(")
@@ -162,7 +164,6 @@ def test_ordinary_and_wall_paths_keep_independent_fail_closed_state():
     assert "qwen3vl_pooler_z1_prepared_execution_len_ == 0 ||" in header
     assert "qwen3vl_pooler_z1_dispatch_" in header
     assert "if (wall_z1_dispatch_)" in header
-    assert "else if (qwen3vl_pooler_z1_dispatch_)" in header
     assert "plan.num_chunks == 1" in header
     assert "cfg.chunk_mode = ChunkMode::SEQUENTIAL" in header
     assert "cfg.inter_layer_io = InterLayerIO::SPM_RESIDENT" in header

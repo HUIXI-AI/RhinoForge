@@ -1,6 +1,7 @@
 #pragma once
 #include "rpu_helpers.h"
 #include "ops/rpu_linear_tiling.h"
+#include "rpu_specialized_linear_contracts.h"
 
 // Exact W8 O projection with installed core-major 16x32 weight tiles in SPM.
 // The model retains the cold bundle/preload owner; scales stay in DDR.
@@ -34,9 +35,6 @@ inline void launch_hyvla_w8_o_resident_spm(
     constexpr uint64_t limit = UINT64_C(1) << 40;
     TORCH_CHECK(saddr % 256 == 0 && saddr < limit && scale.nbytes() <= limit - saddr,
                 "HyVLA W8 resident O requires a complete encodable DDR scale range");
-    const auto tile = rpu_pl_tiling::select_tile_acc16(51, 1024, 256, false);
-    TORCH_CHECK(tile.m_tile == 448 && tile.n_tile == 64,
-                "HyVLA W8 resident O requires the original auto tile M448N64");
     constexpr auto id = KernelId::HYVLA_EXPERT_O_RESIDENT_W8_S51;
     auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(id, {
         {GraphDdrRegisterAbi{GraphDdrRegisterRole::PerChannelScale,
@@ -52,6 +50,6 @@ inline void launch_hyvla_w8_o_resident_spm(
     writer.write(*kernel);
     auto* queue = GET_QUEUE(8);
     queue->set_broadcast_mode(true);
-    queue->enqueu_kernel(*kernel, {uint16_t(16), uint16_t(1), uint16_t(1)},
+    queue->enqueu_kernel(*kernel, rpu_specialized_linear::grid(id),
                         {0, 1, 2, 3, 4, 5, 6, 7});
 }

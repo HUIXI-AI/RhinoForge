@@ -1,0 +1,2911 @@
+{
+  "schema": "parallel_linear_register_census.v1",
+  "main_revision": "3a214f0bbeba2f984af3654ea52c818034ffdd21",
+  "capture_contract": "Private diagnostic build preserves typed DDR ABI/owner/writer checks, emits complete stream, aborts before the captured Graph is submitted. LingBot first executes its authenticated bootstrap Graph. Counts, ABI roles and both hashes are independently recomputed from each stream. Production policy is frozen and never learned online.",
+  "profiles": {
+    "qwen3vl_pooler_z1_register_policy": {
+      "total": {
+        "node_count": 10054,
+        "dma_count": 3337,
+        "barrier_count": 5712,
+        "kernel_count": 1003,
+        "typed_kernel_count": 602,
+        "no_ddr_kernel_count": 401,
+        "operand_count": 766,
+        "weight_operand_count": 454,
+        "key_cache_operand_count": 104,
+        "value_cache_operand_count": 104,
+        "semantic_input_operand_count": 104,
+        "ordered_node_kind_hash": 11529240712230217195,
+        "ordered_kernel_hash": 6626988698990263061
+      },
+      "phases": [
+        {
+          "phase": "vision",
+          "node_count": 6958,
+          "dma_count": 2416,
+          "barrier_count": 4102,
+          "kernel_count": 439,
+          "typed_kernel_count": 266,
+          "no_ddr_kernel_count": 173,
+          "operand_count": 290,
+          "weight_operand_count": 146,
+          "key_cache_operand_count": 48,
+          "value_cache_operand_count": 48,
+          "semantic_input_operand_count": 48,
+          "ordered_node_kind_hash": 9366793630454980650,
+          "ordered_kernel_hash": 11671027566085133265
+        },
+        {
+          "phase": "handoff",
+          "node_count": 47,
+          "dma_count": 16,
+          "barrier_count": 28,
+          "kernel_count": 3,
+          "typed_kernel_count": 0,
+          "no_ddr_kernel_count": 3,
+          "operand_count": 0,
+          "weight_operand_count": 0,
+          "key_cache_operand_count": 0,
+          "value_cache_operand_count": 0,
+          "semantic_input_operand_count": 0,
+          "ordered_node_kind_hash": 11682094705337116283,
+          "ordered_kernel_hash": 9800548481440915612
+        },
+        {
+          "phase": "text",
+          "node_count": 3049,
+          "dma_count": 905,
+          "barrier_count": 1582,
+          "kernel_count": 561,
+          "typed_kernel_count": 336,
+          "no_ddr_kernel_count": 225,
+          "operand_count": 476,
+          "weight_operand_count": 308,
+          "key_cache_operand_count": 56,
+          "value_cache_operand_count": 56,
+          "semantic_input_operand_count": 56,
+          "ordered_node_kind_hash": 2517068873866879458,
+          "ordered_kernel_hash": 17389571104133805460
+        }
+      ],
+      "rules": [
+        {
+          "kernel": "parallel_linear_m1040n32k64",
+          "kind": 1,
+          "proof": 0,
+          "count": 56,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m544n48k128",
+          "kind": 1,
+          "proof": 0,
+          "count": 24,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m480n64k128",
+          "kind": 1,
+          "proof": 0,
+          "count": 72,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m432n80k128",
+          "kind": 1,
+          "proof": 0,
+          "count": 24,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m240n80k256",
+          "kind": 1,
+          "proof": 0,
+          "count": 56,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m96n80k512",
+          "kind": 1,
+          "proof": 0,
+          "count": 1,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m208n96k256",
+          "kind": 1,
+          "proof": 0,
+          "count": 28,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m80n96k512",
+          "kind": 1,
+          "proof": 0,
+          "count": 1,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m192n112k256",
+          "kind": 1,
+          "proof": 0,
+          "count": 28,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m480n128k64",
+          "kind": 1,
+          "proof": 0,
+          "count": 28,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m336n128k128",
+          "kind": 1,
+          "proof": 0,
+          "count": 24,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llama_rms_norm_v32",
+          "kind": 2,
+          "proof": 0,
+          "count": 113,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "rope_2d_spm",
+          "kind": 1,
+          "proof": 0,
+          "count": 48,
+          "operands": [
+            [
+              4,
+              1,
+              1,
+              0,
+              1
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llama_mrope_interleave",
+          "kind": 1,
+          "proof": 0,
+          "count": 56,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              6,
+              7
+            ],
+            [
+              1,
+              1,
+              1,
+              8,
+              9
+            ],
+            [
+              4,
+              1,
+              1,
+              12,
+              13
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llama_insert_kcache_multiwarp_v16",
+          "kind": 1,
+          "proof": 0,
+          "count": 52,
+          "operands": [
+            [
+              2,
+              2,
+              1,
+              8,
+              9
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llama_insert_vcache_multiwarp_v16",
+          "kind": 1,
+          "proof": 0,
+          "count": 52,
+          "operands": [
+            [
+              3,
+              2,
+              1,
+              8,
+              9
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llm_fp16_32b_prefill_flash_attn_univ_dp",
+          "kind": 1,
+          "proof": 0,
+          "count": 52,
+          "operands": [
+            [
+              2,
+              1,
+              1,
+              50,
+              51
+            ],
+            [
+              3,
+              1,
+              1,
+              52,
+              53
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llm_all_reduce_residual",
+          "kind": 3,
+          "proof": 6,
+          "count": 105,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "memset_spm_multi_core_v2",
+          "kind": 2,
+          "proof": 0,
+          "count": 50,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "layer_norm",
+          "kind": 2,
+          "proof": 0,
+          "count": 49,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "binary_sameshape",
+          "kind": 2,
+          "proof": 0,
+          "count": 28,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "unary",
+          "kind": 2,
+          "proof": 0,
+          "count": 28,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "unary_gelu_tanh",
+          "kind": 2,
+          "proof": 0,
+          "count": 24,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "unary_gelu_erf",
+          "kind": 2,
+          "proof": 0,
+          "count": 1,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "fill",
+          "kind": 3,
+          "proof": 4,
+          "count": 1,
+          "operands": [],
+          "dynamic": true
+        },
+        {
+          "kernel": "slice_single_axis",
+          "kind": 3,
+          "proof": 5,
+          "count": 2,
+          "operands": [],
+          "dynamic": true
+        }
+      ],
+      "capture_sha256": {
+        ".stats.jsonl": "8e2af83c3dd56ce784e2bfd8c1cf4667bb05c244c44afeb2b5cfa12aee3132fd",
+        ".nodes.jsonl": "aca53135aa04e3908efc064611d84d2fc4426f7027d528348ed7c30b9454c8dd",
+        ".args.jsonl": "769f6d9f69f2c0bfc55adae2d3aabbefb0ae22af0d80c4f69dcf82f90de253fe",
+        ".rules.jsonl": "72b1d58eb544ad96c05d46a82dc94a0756a2b5606b4f6e8dbc6465d96eea25aa"
+      }
+    },
+    "qwen3vl_pooler_ds1_register_policy": {
+      "total": {
+        "node_count": 10129,
+        "dma_count": 3362,
+        "barrier_count": 5754,
+        "kernel_count": 1011,
+        "typed_kernel_count": 604,
+        "no_ddr_kernel_count": 407,
+        "operand_count": 768,
+        "weight_operand_count": 456,
+        "key_cache_operand_count": 104,
+        "value_cache_operand_count": 104,
+        "semantic_input_operand_count": 104,
+        "ordered_node_kind_hash": 18056810519737813435,
+        "ordered_kernel_hash": 12520515535875931172
+      },
+      "phases": [
+        {
+          "phase": "vision",
+          "node_count": 7032,
+          "dma_count": 2441,
+          "barrier_count": 4144,
+          "kernel_count": 446,
+          "typed_kernel_count": 268,
+          "no_ddr_kernel_count": 178,
+          "operand_count": 292,
+          "weight_operand_count": 148,
+          "key_cache_operand_count": 48,
+          "value_cache_operand_count": 48,
+          "semantic_input_operand_count": 48,
+          "ordered_node_kind_hash": 4578590802713803344,
+          "ordered_kernel_hash": 8549330236181650161
+        },
+        {
+          "phase": "handoff",
+          "node_count": 47,
+          "dma_count": 16,
+          "barrier_count": 28,
+          "kernel_count": 3,
+          "typed_kernel_count": 0,
+          "no_ddr_kernel_count": 3,
+          "operand_count": 0,
+          "weight_operand_count": 0,
+          "key_cache_operand_count": 0,
+          "value_cache_operand_count": 0,
+          "semantic_input_operand_count": 0,
+          "ordered_node_kind_hash": 11682094705337116283,
+          "ordered_kernel_hash": 9800548481440915612
+        },
+        {
+          "phase": "text",
+          "node_count": 3050,
+          "dma_count": 905,
+          "barrier_count": 1582,
+          "kernel_count": 562,
+          "typed_kernel_count": 336,
+          "no_ddr_kernel_count": 226,
+          "operand_count": 476,
+          "weight_operand_count": 308,
+          "key_cache_operand_count": 56,
+          "value_cache_operand_count": 56,
+          "semantic_input_operand_count": 56,
+          "ordered_node_kind_hash": 7088643910191652534,
+          "ordered_kernel_hash": 4120478074820475829
+        }
+      ],
+      "rules": [
+        {
+          "kernel": "parallel_linear_m1040n32k64",
+          "kind": 1,
+          "proof": 0,
+          "count": 56,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m544n48k128",
+          "kind": 1,
+          "proof": 0,
+          "count": 24,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m480n64k128",
+          "kind": 1,
+          "proof": 0,
+          "count": 72,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m432n80k128",
+          "kind": 1,
+          "proof": 0,
+          "count": 24,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m240n80k256",
+          "kind": 1,
+          "proof": 0,
+          "count": 56,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m96n80k512",
+          "kind": 1,
+          "proof": 0,
+          "count": 2,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m208n96k256",
+          "kind": 1,
+          "proof": 0,
+          "count": 28,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m80n96k512",
+          "kind": 1,
+          "proof": 0,
+          "count": 2,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m192n112k256",
+          "kind": 1,
+          "proof": 0,
+          "count": 28,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m480n128k64",
+          "kind": 1,
+          "proof": 0,
+          "count": 28,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m336n128k128",
+          "kind": 1,
+          "proof": 0,
+          "count": 24,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llama_rms_norm_v32",
+          "kind": 2,
+          "proof": 0,
+          "count": 113,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "rope_2d_spm",
+          "kind": 1,
+          "proof": 0,
+          "count": 48,
+          "operands": [
+            [
+              4,
+              1,
+              1,
+              0,
+              1
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llama_mrope_interleave",
+          "kind": 1,
+          "proof": 0,
+          "count": 56,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              6,
+              7
+            ],
+            [
+              1,
+              1,
+              1,
+              8,
+              9
+            ],
+            [
+              4,
+              1,
+              1,
+              12,
+              13
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llama_insert_kcache_multiwarp_v16",
+          "kind": 1,
+          "proof": 0,
+          "count": 52,
+          "operands": [
+            [
+              2,
+              2,
+              1,
+              8,
+              9
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llama_insert_vcache_multiwarp_v16",
+          "kind": 1,
+          "proof": 0,
+          "count": 52,
+          "operands": [
+            [
+              3,
+              2,
+              1,
+              8,
+              9
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llm_fp16_32b_prefill_flash_attn_univ_dp",
+          "kind": 1,
+          "proof": 0,
+          "count": 52,
+          "operands": [
+            [
+              2,
+              1,
+              1,
+              50,
+              51
+            ],
+            [
+              3,
+              1,
+              1,
+              52,
+              53
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llm_all_reduce_residual",
+          "kind": 3,
+          "proof": 6,
+          "count": 106,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "memset_spm_multi_core_v2",
+          "kind": 2,
+          "proof": 0,
+          "count": 52,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "layer_norm",
+          "kind": 2,
+          "proof": 0,
+          "count": 50,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "binary_sameshape",
+          "kind": 2,
+          "proof": 0,
+          "count": 29,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "unary",
+          "kind": 2,
+          "proof": 0,
+          "count": 28,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "unary_gelu_tanh",
+          "kind": 2,
+          "proof": 0,
+          "count": 24,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "unary_gelu_erf",
+          "kind": 2,
+          "proof": 0,
+          "count": 2,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "fill",
+          "kind": 3,
+          "proof": 4,
+          "count": 1,
+          "operands": [],
+          "dynamic": true
+        },
+        {
+          "kernel": "slice_single_axis",
+          "kind": 3,
+          "proof": 5,
+          "count": 2,
+          "operands": [],
+          "dynamic": true
+        }
+      ],
+      "capture_sha256": {
+        ".stats.jsonl": "fdf0c201619b100b27854cc717d9f43dce2ad1853693331e29cc3c8ab80226c3",
+        ".nodes.jsonl": "e5c7c8c74faa707bf9fee15ee8c791d72fb64f55bd65d9d8923030a1cd342f86",
+        ".args.jsonl": "0c0e37bd93309524a5b02b1b9c0fc1264fd42aea141ca0388757d229a7ac75e2",
+        ".rules.jsonl": "4313dbee8f14f172daa20839b41dd6476e3590285d7596880ef9bb29037fa58e"
+      }
+    },
+    "qwen3vl_pooler_ds3_register_policy": {
+      "total": {
+        "node_count": 10279,
+        "dma_count": 3412,
+        "barrier_count": 5838,
+        "kernel_count": 1027,
+        "typed_kernel_count": 608,
+        "no_ddr_kernel_count": 419,
+        "operand_count": 772,
+        "weight_operand_count": 460,
+        "key_cache_operand_count": 104,
+        "value_cache_operand_count": 104,
+        "semantic_input_operand_count": 104,
+        "ordered_node_kind_hash": 1360380342500442655,
+        "ordered_kernel_hash": 6754690670107611112
+      },
+      "phases": [
+        {
+          "phase": "vision",
+          "node_count": 7180,
+          "dma_count": 2491,
+          "barrier_count": 4228,
+          "kernel_count": 460,
+          "typed_kernel_count": 272,
+          "no_ddr_kernel_count": 188,
+          "operand_count": 296,
+          "weight_operand_count": 152,
+          "key_cache_operand_count": 48,
+          "value_cache_operand_count": 48,
+          "semantic_input_operand_count": 48,
+          "ordered_node_kind_hash": 16561418658276849532,
+          "ordered_kernel_hash": 16113356892370221317
+        },
+        {
+          "phase": "handoff",
+          "node_count": 47,
+          "dma_count": 16,
+          "barrier_count": 28,
+          "kernel_count": 3,
+          "typed_kernel_count": 0,
+          "no_ddr_kernel_count": 3,
+          "operand_count": 0,
+          "weight_operand_count": 0,
+          "key_cache_operand_count": 0,
+          "value_cache_operand_count": 0,
+          "semantic_input_operand_count": 0,
+          "ordered_node_kind_hash": 11682094705337116283,
+          "ordered_kernel_hash": 9800548481440915612
+        },
+        {
+          "phase": "text",
+          "node_count": 3052,
+          "dma_count": 905,
+          "barrier_count": 1582,
+          "kernel_count": 564,
+          "typed_kernel_count": 336,
+          "no_ddr_kernel_count": 228,
+          "operand_count": 476,
+          "weight_operand_count": 308,
+          "key_cache_operand_count": 56,
+          "value_cache_operand_count": 56,
+          "semantic_input_operand_count": 56,
+          "ordered_node_kind_hash": 2775786179859952870,
+          "ordered_kernel_hash": 9771984127544768069
+        }
+      ],
+      "rules": [
+        {
+          "kernel": "parallel_linear_m1040n32k64",
+          "kind": 1,
+          "proof": 0,
+          "count": 56,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m544n48k128",
+          "kind": 1,
+          "proof": 0,
+          "count": 24,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m480n64k128",
+          "kind": 1,
+          "proof": 0,
+          "count": 72,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m432n80k128",
+          "kind": 1,
+          "proof": 0,
+          "count": 24,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m240n80k256",
+          "kind": 1,
+          "proof": 0,
+          "count": 56,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m96n80k512",
+          "kind": 1,
+          "proof": 0,
+          "count": 4,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m208n96k256",
+          "kind": 1,
+          "proof": 0,
+          "count": 28,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m80n96k512",
+          "kind": 1,
+          "proof": 0,
+          "count": 4,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m192n112k256",
+          "kind": 1,
+          "proof": 0,
+          "count": 28,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m480n128k64",
+          "kind": 1,
+          "proof": 0,
+          "count": 28,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m336n128k128",
+          "kind": 1,
+          "proof": 0,
+          "count": 24,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llama_rms_norm_v32",
+          "kind": 2,
+          "proof": 0,
+          "count": 113,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "rope_2d_spm",
+          "kind": 1,
+          "proof": 0,
+          "count": 48,
+          "operands": [
+            [
+              4,
+              1,
+              1,
+              0,
+              1
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llama_mrope_interleave",
+          "kind": 1,
+          "proof": 0,
+          "count": 56,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              6,
+              7
+            ],
+            [
+              1,
+              1,
+              1,
+              8,
+              9
+            ],
+            [
+              4,
+              1,
+              1,
+              12,
+              13
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llama_insert_kcache_multiwarp_v16",
+          "kind": 1,
+          "proof": 0,
+          "count": 52,
+          "operands": [
+            [
+              2,
+              2,
+              1,
+              8,
+              9
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llama_insert_vcache_multiwarp_v16",
+          "kind": 1,
+          "proof": 0,
+          "count": 52,
+          "operands": [
+            [
+              3,
+              2,
+              1,
+              8,
+              9
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llm_fp16_32b_prefill_flash_attn_univ_dp",
+          "kind": 1,
+          "proof": 0,
+          "count": 52,
+          "operands": [
+            [
+              2,
+              1,
+              1,
+              50,
+              51
+            ],
+            [
+              3,
+              1,
+              1,
+              52,
+              53
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llm_all_reduce_residual",
+          "kind": 3,
+          "proof": 6,
+          "count": 108,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "memset_spm_multi_core_v2",
+          "kind": 2,
+          "proof": 0,
+          "count": 56,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "layer_norm",
+          "kind": 2,
+          "proof": 0,
+          "count": 52,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "binary_sameshape",
+          "kind": 2,
+          "proof": 0,
+          "count": 31,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "unary",
+          "kind": 2,
+          "proof": 0,
+          "count": 28,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "unary_gelu_tanh",
+          "kind": 2,
+          "proof": 0,
+          "count": 24,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "unary_gelu_erf",
+          "kind": 2,
+          "proof": 0,
+          "count": 4,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "fill",
+          "kind": 3,
+          "proof": 4,
+          "count": 1,
+          "operands": [],
+          "dynamic": true
+        },
+        {
+          "kernel": "slice_single_axis",
+          "kind": 3,
+          "proof": 5,
+          "count": 2,
+          "operands": [],
+          "dynamic": true
+        }
+      ],
+      "capture_sha256": {
+        ".stats.jsonl": "566f9c414a3a732fd92916dedb36ca31c1d1fed7ebb405e147c600a2f0c8d307",
+        ".nodes.jsonl": "a74415a758a935fe72be3613ac29bcb2ca2d6cb3c40a3bc4159550a5d53a8446",
+        ".args.jsonl": "1c4f09dc7c1585b12e82fa9ec5d8b4ab1be335711bfca1cada999461451c5035",
+        ".rules.jsonl": "feaa0677b6db5944ba382ae3e85c8d2048fbd0630730d83b99f9f73ed7f3593a"
+      }
+    },
+    "qwen3vl_pooler_ds3_partial_mrope_register_policy": {
+      "total": {
+        "node_count": 10279,
+        "dma_count": 3412,
+        "barrier_count": 5838,
+        "kernel_count": 1027,
+        "typed_kernel_count": 608,
+        "no_ddr_kernel_count": 419,
+        "operand_count": 716,
+        "weight_operand_count": 348,
+        "key_cache_operand_count": 104,
+        "value_cache_operand_count": 104,
+        "semantic_input_operand_count": 160,
+        "ordered_node_kind_hash": 1360380342500442655,
+        "ordered_kernel_hash": 9681059067678563608
+      },
+      "phases": [
+        {
+          "phase": "vision",
+          "node_count": 7180,
+          "dma_count": 2491,
+          "barrier_count": 4228,
+          "kernel_count": 460,
+          "typed_kernel_count": 272,
+          "no_ddr_kernel_count": 188,
+          "operand_count": 296,
+          "weight_operand_count": 152,
+          "key_cache_operand_count": 48,
+          "value_cache_operand_count": 48,
+          "semantic_input_operand_count": 48,
+          "ordered_node_kind_hash": 16561418658276849532,
+          "ordered_kernel_hash": 16113356892370221317
+        },
+        {
+          "phase": "handoff",
+          "node_count": 47,
+          "dma_count": 16,
+          "barrier_count": 28,
+          "kernel_count": 3,
+          "typed_kernel_count": 0,
+          "no_ddr_kernel_count": 3,
+          "operand_count": 0,
+          "weight_operand_count": 0,
+          "key_cache_operand_count": 0,
+          "value_cache_operand_count": 0,
+          "semantic_input_operand_count": 0,
+          "ordered_node_kind_hash": 11682094705337116283,
+          "ordered_kernel_hash": 9800548481440915612
+        },
+        {
+          "phase": "text",
+          "node_count": 3052,
+          "dma_count": 905,
+          "barrier_count": 1582,
+          "kernel_count": 564,
+          "typed_kernel_count": 336,
+          "no_ddr_kernel_count": 228,
+          "operand_count": 420,
+          "weight_operand_count": 196,
+          "key_cache_operand_count": 56,
+          "value_cache_operand_count": 56,
+          "semantic_input_operand_count": 112,
+          "ordered_node_kind_hash": 2775786179859952870,
+          "ordered_kernel_hash": 9987954047047895125
+        }
+      ],
+      "rules": [
+        {
+          "kernel": "parallel_linear_m1040n32k64",
+          "kind": 1,
+          "proof": 0,
+          "count": 56,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m544n48k128",
+          "kind": 1,
+          "proof": 0,
+          "count": 24,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m480n64k128",
+          "kind": 1,
+          "proof": 0,
+          "count": 72,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m432n80k128",
+          "kind": 1,
+          "proof": 0,
+          "count": 24,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m240n80k256",
+          "kind": 1,
+          "proof": 0,
+          "count": 56,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m96n80k512",
+          "kind": 1,
+          "proof": 0,
+          "count": 4,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m208n96k256",
+          "kind": 1,
+          "proof": 0,
+          "count": 28,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m80n96k512",
+          "kind": 1,
+          "proof": 0,
+          "count": 4,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m192n112k256",
+          "kind": 1,
+          "proof": 0,
+          "count": 28,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m480n128k64",
+          "kind": 1,
+          "proof": 0,
+          "count": 28,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m336n128k128",
+          "kind": 1,
+          "proof": 0,
+          "count": 24,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llama_rms_norm_v32",
+          "kind": 2,
+          "proof": 0,
+          "count": 113,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "rope_2d_spm",
+          "kind": 1,
+          "proof": 0,
+          "count": 48,
+          "operands": [
+            [
+              4,
+              1,
+              1,
+              0,
+              1
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "partial_mrope",
+          "kind": 1,
+          "proof": 0,
+          "count": 56,
+          "operands": [
+            [
+              4,
+              1,
+              1,
+              0,
+              1
+            ],
+            [
+              4,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llama_insert_kcache_multiwarp_v16",
+          "kind": 1,
+          "proof": 0,
+          "count": 52,
+          "operands": [
+            [
+              2,
+              2,
+              1,
+              8,
+              9
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llama_insert_vcache_multiwarp_v16",
+          "kind": 1,
+          "proof": 0,
+          "count": 52,
+          "operands": [
+            [
+              3,
+              2,
+              1,
+              8,
+              9
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llm_fp16_32b_prefill_flash_attn_univ_dp",
+          "kind": 1,
+          "proof": 0,
+          "count": 52,
+          "operands": [
+            [
+              2,
+              1,
+              1,
+              50,
+              51
+            ],
+            [
+              3,
+              1,
+              1,
+              52,
+              53
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llm_all_reduce_residual",
+          "kind": 3,
+          "proof": 6,
+          "count": 108,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "memset_spm_multi_core_v2",
+          "kind": 2,
+          "proof": 0,
+          "count": 56,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "layer_norm",
+          "kind": 2,
+          "proof": 0,
+          "count": 52,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "binary_sameshape",
+          "kind": 2,
+          "proof": 0,
+          "count": 31,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "unary",
+          "kind": 2,
+          "proof": 0,
+          "count": 28,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "unary_gelu_tanh",
+          "kind": 2,
+          "proof": 0,
+          "count": 24,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "unary_gelu_erf",
+          "kind": 2,
+          "proof": 0,
+          "count": 4,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "fill",
+          "kind": 3,
+          "proof": 4,
+          "count": 1,
+          "operands": [],
+          "dynamic": true
+        },
+        {
+          "kernel": "slice_single_axis",
+          "kind": 3,
+          "proof": 5,
+          "count": 2,
+          "operands": [],
+          "dynamic": true
+        }
+      ],
+      "capture_sha256": {
+        ".stats.jsonl": "5197ed7956b51ae85532cff993895efba92d5f1942bbe4d86f63bfca21004657",
+        ".nodes.jsonl": "8b68341c2ff693a5968894b868d0371d3d237d7b7a32337ab988ae5303fea165",
+        ".args.jsonl": "11f3696783af244384fa2bf42caf8957afaf584df1a6d739064b9326ee0139d3",
+        ".rules.jsonl": "e244e69fe681c308db4b883364db77f157699182796ce28fea9c6da4d323f24c"
+      }
+    },
+    "groot_n17_pooler_ds3_register_policy": {
+      "total": {
+        "node_count": 8983,
+        "dma_count": 3028,
+        "barrier_count": 5166,
+        "kernel_count": 787,
+        "typed_kernel_count": 464,
+        "no_ddr_kernel_count": 323,
+        "operand_count": 568,
+        "weight_operand_count": 328,
+        "key_cache_operand_count": 80,
+        "value_cache_operand_count": 80,
+        "semantic_input_operand_count": 80,
+        "ordered_node_kind_hash": 14823316030506397823,
+        "ordered_kernel_hash": 5495043508973745736
+      },
+      "phases": [
+        {
+          "phase": "vision",
+          "node_count": 7180,
+          "dma_count": 2491,
+          "barrier_count": 4228,
+          "kernel_count": 460,
+          "typed_kernel_count": 272,
+          "no_ddr_kernel_count": 188,
+          "operand_count": 296,
+          "weight_operand_count": 152,
+          "key_cache_operand_count": 48,
+          "value_cache_operand_count": 48,
+          "semantic_input_operand_count": 48,
+          "ordered_node_kind_hash": 16561418658276849532,
+          "ordered_kernel_hash": 16113356892370221317
+        },
+        {
+          "phase": "handoff",
+          "node_count": 47,
+          "dma_count": 16,
+          "barrier_count": 28,
+          "kernel_count": 3,
+          "typed_kernel_count": 0,
+          "no_ddr_kernel_count": 3,
+          "operand_count": 0,
+          "weight_operand_count": 0,
+          "key_cache_operand_count": 0,
+          "value_cache_operand_count": 0,
+          "semantic_input_operand_count": 0,
+          "ordered_node_kind_hash": 11682094705337116283,
+          "ordered_kernel_hash": 9800548481440915612
+        },
+        {
+          "phase": "text",
+          "node_count": 1756,
+          "dma_count": 521,
+          "barrier_count": 910,
+          "kernel_count": 324,
+          "typed_kernel_count": 192,
+          "no_ddr_kernel_count": 132,
+          "operand_count": 272,
+          "weight_operand_count": 176,
+          "key_cache_operand_count": 32,
+          "value_cache_operand_count": 32,
+          "semantic_input_operand_count": 32,
+          "ordered_node_kind_hash": 13137966862420191558,
+          "ordered_kernel_hash": 1505101218419592005
+        }
+      ],
+      "rules": [
+        {
+          "kernel": "parallel_linear_m1040n32k64",
+          "kind": 1,
+          "proof": 0,
+          "count": 32,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m544n48k128",
+          "kind": 1,
+          "proof": 0,
+          "count": 24,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m480n64k128",
+          "kind": 1,
+          "proof": 0,
+          "count": 72,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m432n80k128",
+          "kind": 1,
+          "proof": 0,
+          "count": 24,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m240n80k256",
+          "kind": 1,
+          "proof": 0,
+          "count": 32,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m96n80k512",
+          "kind": 1,
+          "proof": 0,
+          "count": 4,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m208n96k256",
+          "kind": 1,
+          "proof": 0,
+          "count": 16,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m80n96k512",
+          "kind": 1,
+          "proof": 0,
+          "count": 4,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m192n112k256",
+          "kind": 1,
+          "proof": 0,
+          "count": 16,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m480n128k64",
+          "kind": 1,
+          "proof": 0,
+          "count": 16,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m336n128k128",
+          "kind": 1,
+          "proof": 0,
+          "count": 24,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llama_rms_norm_v32",
+          "kind": 2,
+          "proof": 0,
+          "count": 65,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "rope_2d_spm",
+          "kind": 1,
+          "proof": 0,
+          "count": 48,
+          "operands": [
+            [
+              4,
+              1,
+              1,
+              0,
+              1
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llama_mrope_interleave",
+          "kind": 1,
+          "proof": 0,
+          "count": 32,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              6,
+              7
+            ],
+            [
+              1,
+              1,
+              1,
+              8,
+              9
+            ],
+            [
+              4,
+              1,
+              1,
+              12,
+              13
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llama_insert_kcache_multiwarp_v16",
+          "kind": 1,
+          "proof": 0,
+          "count": 40,
+          "operands": [
+            [
+              2,
+              2,
+              1,
+              8,
+              9
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llama_insert_vcache_multiwarp_v16",
+          "kind": 1,
+          "proof": 0,
+          "count": 40,
+          "operands": [
+            [
+              3,
+              2,
+              1,
+              8,
+              9
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llm_fp16_32b_prefill_flash_attn_univ_dp",
+          "kind": 1,
+          "proof": 0,
+          "count": 40,
+          "operands": [
+            [
+              2,
+              1,
+              1,
+              50,
+              51
+            ],
+            [
+              3,
+              1,
+              1,
+              52,
+              53
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llm_all_reduce_residual",
+          "kind": 3,
+          "proof": 6,
+          "count": 84,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "memset_spm_multi_core_v2",
+          "kind": 2,
+          "proof": 0,
+          "count": 56,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "layer_norm",
+          "kind": 2,
+          "proof": 0,
+          "count": 52,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "binary_sameshape",
+          "kind": 2,
+          "proof": 0,
+          "count": 19,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "unary",
+          "kind": 2,
+          "proof": 0,
+          "count": 16,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "unary_gelu_tanh",
+          "kind": 2,
+          "proof": 0,
+          "count": 24,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "unary_gelu_erf",
+          "kind": 2,
+          "proof": 0,
+          "count": 4,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "fill",
+          "kind": 3,
+          "proof": 4,
+          "count": 1,
+          "operands": [],
+          "dynamic": true
+        },
+        {
+          "kernel": "slice_single_axis",
+          "kind": 3,
+          "proof": 5,
+          "count": 2,
+          "operands": [],
+          "dynamic": true
+        }
+      ],
+      "capture_sha256": {
+        ".stats.jsonl": "7a0e8e81c5826136c415dbe4ce68dc26106b536f85585670c5b5514394e38d1d",
+        ".nodes.jsonl": "34b5595bc50f40cf9f4877804110599cc8979c7a9dba9cde66e9675fb4ff9945",
+        ".args.jsonl": "f4437ded5023af4df3d9647f07deff81e5d2c4df5b27ff9389bf0b99c2c870eb",
+        ".rules.jsonl": "2f567b907bd10361513ced634795c7cf70da1cdefc50df20c803946dc50c6d92"
+      }
+    },
+    "gr00t_z2_register_policy": {
+      "total": {
+        "node_count": 10784,
+        "dma_count": 3033,
+        "barrier_count": 5124,
+        "kernel_count": 2625,
+        "typed_kernel_count": 1350,
+        "no_ddr_kernel_count": 1275,
+        "operand_count": 1482,
+        "weight_operand_count": 954,
+        "key_cache_operand_count": 264,
+        "value_cache_operand_count": 264,
+        "semantic_input_operand_count": 0,
+        "ordered_node_kind_hash": 13031538058907754679,
+        "ordered_kernel_hash": 11427861983983949179
+      },
+      "phases": [
+        {
+          "phase": "vl_encoder",
+          "node_count": 867,
+          "dma_count": 296,
+          "barrier_count": 504,
+          "kernel_count": 66,
+          "typed_kernel_count": 36,
+          "no_ddr_kernel_count": 30,
+          "operand_count": 40,
+          "weight_operand_count": 24,
+          "key_cache_operand_count": 8,
+          "value_cache_operand_count": 8,
+          "semantic_input_operand_count": 0,
+          "ordered_node_kind_hash": 11581826440345241992,
+          "ordered_kernel_hash": 4432766800490327833
+        },
+        {
+          "phase": "denoise",
+          "node_count": 9917,
+          "dma_count": 2737,
+          "barrier_count": 4620,
+          "kernel_count": 2559,
+          "typed_kernel_count": 1314,
+          "no_ddr_kernel_count": 1245,
+          "operand_count": 1442,
+          "weight_operand_count": 930,
+          "key_cache_operand_count": 256,
+          "value_cache_operand_count": 256,
+          "semantic_input_operand_count": 0,
+          "ordered_node_kind_hash": 5760881864155543248,
+          "ordered_kernel_hash": 8225890535945606279
+        }
+      ],
+      "rules": [
+        {
+          "kernel": "parallel_linear_m208n32k384",
+          "kind": 1,
+          "proof": 0,
+          "count": 256,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m384n48k192",
+          "kind": 1,
+          "proof": 0,
+          "count": 4,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m192n48k384",
+          "kind": 1,
+          "proof": 0,
+          "count": 5,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m128n48k512",
+          "kind": 1,
+          "proof": 0,
+          "count": 128,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m80n48k768",
+          "kind": 1,
+          "proof": 0,
+          "count": 4,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m208n96k256",
+          "kind": 1,
+          "proof": 0,
+          "count": 272,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m128n96k384",
+          "kind": 1,
+          "proof": 0,
+          "count": 140,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m80n96k512",
+          "kind": 1,
+          "proof": 0,
+          "count": 1,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m352n112k128",
+          "kind": 1,
+          "proof": 0,
+          "count": 128,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m192n112k256",
+          "kind": 1,
+          "proof": 0,
+          "count": 4,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m480n128k64",
+          "kind": 1,
+          "proof": 0,
+          "count": 12,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llama_insert_kcache_multiwarp_v16",
+          "kind": 1,
+          "proof": 0,
+          "count": 128,
+          "operands": [
+            [
+              2,
+              2,
+              1,
+              8,
+              9
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llama_insert_vcache_multiwarp_v16",
+          "kind": 1,
+          "proof": 0,
+          "count": 128,
+          "operands": [
+            [
+              3,
+              2,
+              1,
+              8,
+              9
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llama_insert_kcache_multiwarp",
+          "kind": 1,
+          "proof": 0,
+          "count": 4,
+          "operands": [
+            [
+              2,
+              2,
+              1,
+              8,
+              9
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llama_insert_vcache_multiwarp",
+          "kind": 1,
+          "proof": 0,
+          "count": 4,
+          "operands": [
+            [
+              3,
+              2,
+              1,
+              8,
+              9
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llm_fp16_32b_prefill_flash_attn_univ_dp",
+          "kind": 1,
+          "proof": 0,
+          "count": 132,
+          "operands": [
+            [
+              2,
+              1,
+              1,
+              50,
+              51
+            ],
+            [
+              3,
+              1,
+              1,
+              52,
+              53
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llm_all_reduce_residual",
+          "kind": 3,
+          "proof": 6,
+          "count": 264,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "llm_all_reduce_residual_nopace",
+          "kind": 3,
+          "proof": 6,
+          "count": 128,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "memset_spm_multi_core_v2",
+          "kind": 2,
+          "proof": 0,
+          "count": 328,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "layer_norm",
+          "kind": 2,
+          "proof": 0,
+          "count": 269,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "binary_scalar",
+          "kind": 2,
+          "proof": 0,
+          "count": 137,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "unary_gelu_tanh",
+          "kind": 2,
+          "proof": 0,
+          "count": 132,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "binary_sameshape",
+          "kind": 2,
+          "proof": 0,
+          "count": 12,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "unary",
+          "kind": 2,
+          "proof": 0,
+          "count": 4,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "binary_1xC_NxC_tileC",
+          "kind": 2,
+          "proof": 0,
+          "count": 1,
+          "operands": [],
+          "dynamic": true
+        }
+      ],
+      "capture_sha256": {
+        ".stats.jsonl": "4b8af3405c02d7f7744ee5277d59d0b4d1d5f526fb1ac97421b68547eeb09ccc",
+        ".nodes.jsonl": "888357b0a302161fc96bc7e0917627ca91e7798d61066aa21eb8c8c110fa762f",
+        ".args.jsonl": "de90b63e7d0497c3425501ef302fac4b62ccf0957a5d7e53e4e39721f7ab4f7e",
+        ".rules.jsonl": "e99b269ee856217f6c4f31d87d4f5372e4d85bb8a53c4840df1e9c601abc0c92"
+      }
+    },
+    "lingbot2_multiview_w8_register_policy": {
+      "total": {
+        "node_count": 16818,
+        "dma_count": 5466,
+        "barrier_count": 9338,
+        "kernel_count": 2014,
+        "typed_kernel_count": 1248,
+        "no_ddr_kernel_count": 766,
+        "operand_count": 2112,
+        "weight_operand_count": 1392,
+        "key_cache_operand_count": 216,
+        "value_cache_operand_count": 216,
+        "semantic_input_operand_count": 288,
+        "ordered_node_kind_hash": 2013162316487666955,
+        "ordered_kernel_hash": 2543826271071876521
+      },
+      "phases": [
+        {
+          "phase": "outer",
+          "node_count": 16818,
+          "dma_count": 5466,
+          "barrier_count": 9338,
+          "kernel_count": 2014,
+          "typed_kernel_count": 1248,
+          "no_ddr_kernel_count": 766,
+          "operand_count": 2112,
+          "weight_operand_count": 1392,
+          "key_cache_operand_count": 216,
+          "value_cache_operand_count": 216,
+          "semantic_input_operand_count": 288,
+          "ordered_node_kind_hash": 2013162316487666955,
+          "ordered_kernel_hash": 2543826271071876521
+        }
+      ],
+      "rules": [
+        {
+          "kernel": "parallel_linear_m96n80k512",
+          "kind": 1,
+          "proof": 0,
+          "count": 12,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_m208n96k256",
+          "kind": 1,
+          "proof": 0,
+          "count": 12,
+          "operands": [
+            [
+              1,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_w8a16_m512n48k128",
+          "kind": 1,
+          "proof": 0,
+          "count": 288,
+          "operands": [
+            [
+              5,
+              1,
+              1,
+              2,
+              3
+            ],
+            [
+              6,
+              1,
+              1,
+              20,
+              21
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_w8a16_m400n80k128",
+          "kind": 1,
+          "proof": 0,
+          "count": 72,
+          "operands": [
+            [
+              5,
+              1,
+              1,
+              2,
+              3
+            ],
+            [
+              6,
+              1,
+              1,
+              20,
+              21
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_w8a16_m368n96k128",
+          "kind": 1,
+          "proof": 0,
+          "count": 252,
+          "operands": [
+            [
+              5,
+              1,
+              1,
+              2,
+              3
+            ],
+            [
+              6,
+              1,
+              1,
+              20,
+              21
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "parallel_linear_w8a16_m320n112k128",
+          "kind": 1,
+          "proof": 0,
+          "count": 72,
+          "operands": [
+            [
+              5,
+              1,
+              1,
+              2,
+              3
+            ],
+            [
+              6,
+              1,
+              1,
+              20,
+              21
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "rope_2d_spm",
+          "kind": 1,
+          "proof": 0,
+          "count": 144,
+          "operands": [
+            [
+              4,
+              1,
+              1,
+              0,
+              1
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "partial_mrope",
+          "kind": 1,
+          "proof": 0,
+          "count": 72,
+          "operands": [
+            [
+              4,
+              1,
+              1,
+              0,
+              1
+            ],
+            [
+              4,
+              1,
+              1,
+              2,
+              3
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llama_insert_kcache_multiwarp",
+          "kind": 1,
+          "proof": 0,
+          "count": 36,
+          "operands": [
+            [
+              2,
+              2,
+              1,
+              8,
+              9
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llama_insert_vcache_multiwarp",
+          "kind": 1,
+          "proof": 0,
+          "count": 36,
+          "operands": [
+            [
+              3,
+              2,
+              1,
+              8,
+              9
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llama_insert_kcache_multiwarp_v16",
+          "kind": 1,
+          "proof": 0,
+          "count": 72,
+          "operands": [
+            [
+              2,
+              2,
+              1,
+              8,
+              9
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llama_insert_vcache_multiwarp_v16",
+          "kind": 1,
+          "proof": 0,
+          "count": 72,
+          "operands": [
+            [
+              3,
+              2,
+              1,
+              8,
+              9
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llm_fp16_32b_prefill_flash_attn_univ_dp",
+          "kind": 1,
+          "proof": 0,
+          "count": 108,
+          "operands": [
+            [
+              2,
+              1,
+              1,
+              50,
+              51
+            ],
+            [
+              3,
+              1,
+              1,
+              52,
+              53
+            ]
+          ],
+          "dynamic": false
+        },
+        {
+          "kernel": "llm_all_reduce_residual",
+          "kind": 3,
+          "proof": 6,
+          "count": 228,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "memset_spm_multi_core_v2",
+          "kind": 2,
+          "proof": 0,
+          "count": 72,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "layer_norm",
+          "kind": 2,
+          "proof": 0,
+          "count": 156,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "llama_rms_norm",
+          "kind": 2,
+          "proof": 0,
+          "count": 145,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "binary_sameshape",
+          "kind": 2,
+          "proof": 0,
+          "count": 45,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "unary",
+          "kind": 2,
+          "proof": 0,
+          "count": 36,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "unary_gelu_tanh",
+          "kind": 2,
+          "proof": 0,
+          "count": 72,
+          "operands": [],
+          "dynamic": false
+        },
+        {
+          "kernel": "unary_gelu_erf",
+          "kind": 2,
+          "proof": 0,
+          "count": 12,
+          "operands": [],
+          "dynamic": false
+        }
+      ],
+      "capture_sha256": {
+        ".stats.jsonl": "d8b5b99cff152e7b73e4c0404ed9d3f803b9c80f27e72b317c201f109d4e35f9",
+        ".nodes.jsonl": "f6641c0ef4f2c53d80d05e650f823ed78c636111a3c67b1e65dbcf55ac76a4f1",
+        ".args.jsonl": "7f4c2f9b6005adec8289581de034a052d46e37e650dc927ca27f697183b26b74",
+        ".rules.jsonl": "5bdff9a58cafb65e197f73463f20d34b9ee83a427fc8931273c1338fc38a6ba5"
+      }
+    }
+  }
+}

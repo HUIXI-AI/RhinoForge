@@ -1,8 +1,18 @@
-"""Hy-Embodied-0.5-VLA 权重装载：safetensors → swizzled FP16 device 张量。
+"""Hy-Embodied-0.5-VLA 权重装载：safetensors (bf16) → 预 swizzle fp16 RPU 张量。
 
-checkpoint 源张量逐个读取和释放；三个子系统的权重必须在任何 forward
-之前全部就位，避免后续安装扰动已构建的 Graph。
-转换顺序为 .half() → swizzle → .to('rpu')，使布局与 FP16 kernel 一致。"""
+三座子系统的权重在这里全部就位，但 checkpoint 源张量逐个读取和释放。这不是风格
+选择，是硬约束：
+
+    所有子系统的权重必须在任何 forward 之前全部 swizzle 上 RPU。
+
+实测（`internal validation notes`）：「只有 ViT」与「ViT + VLM/expert 权重都已
+上 RPU」两种情形，ViT 连跑 4 轮 `img_emb` 恒为 cos 0.99997383；而按「ViT 权重 →
+跑 ViT → 之后才 swizzle VLM 权重」的顺序，前两轮会抖到 0.9999x（第 3 轮才收敛），
+严重时曾掉破旧 CPU cosine 门（现已停用）—— 后续的权重上传会扰动已 BUILD 的图。
+
+RC-1 顺序在每个 swizzle 里都是 `.half()` → swizzle → `.to('rpu')`；反了会走 fp32
+分支，布局与 fp16 kernel 不兼容。
+"""
 from __future__ import annotations
 
 import dataclasses
@@ -22,7 +32,7 @@ from rpu_backend.adapters.hy_vla.nvfp4 import (
     quantize_expert_nvfp4_cpu,
 )
 from rpu_backend.quant._common import quantize_linear_per_channel
-from rpu_backend.quant.int4_pgrp_pack import pack_int4_per_channel_as_pgrp
+from rpu_backend.quant.int4_pgrp_pack import pack_int4_per_channel_as_pgrp, w4_storage_shape
 from rpu_backend.quant.hyvla_nvfp4_resident_scales import pack_hyvla_nvfp4_resident_scales
 from rpu_backend.runtime.weights import (tp_col_swizzle_mc_weight,
                                          tp_row_swizzle_mc_weight,
@@ -33,7 +43,8 @@ _VIT = "model.dual_tower.vlm.model.visual.vision_tower."
 _MERGER = "model.dual_tower.vlm.model.visual.merger."
 _VLM = "model.dual_tower.vlm.model.language_model.model."
 _EXPERT = "model.dual_tower.expert.model."
-# embed_tokens 与 lm_head 共享权重；checkpoint 没有独立的 embed_tokens。
+# embed_tokens 与 lm_head **tied** —— ckpt 里没有独立的 embed_tokens，
+# 实测 lm_head[lang_tokens] 与 vendor 的 prefix 语言段逐位相同（max|diff| = 0）。
 _LM_HEAD = "model.dual_tower.vlm.model.language_model.lm_head.weight"
 
 _HOST_TENSORS = (
@@ -51,12 +62,12 @@ _VIT_PATCH_SIZE = 16
 
 @dataclasses.dataclass(frozen=True)
 class HyVlaConfig:
-    """Hy-VLA-UMI 的 checkpoint 几何；字段必须与配置及权重形状一致。"""
+    """Hy-VLA-UMI 的几何。字段全部来自 config.json / ckpt 实测，不要手改。"""
     # ViT（HYViT2-400M AnyRes）
     vit_layers: int = 27
     vit_heads: int = 16
     vit_hidden: int = 1152
-    vit_head_dim: int = 72            # → padded 80（device 要求 16 对齐）
+    vit_head_dim: int = 72            # → padded 80（RPU 要求 16 对齐）
     vit_inter: int = 4304             # → padded 4352（8 核 × 128 对齐）
     vit_seq: int = 196                # 14×14 patch
     num_cameras: int = 3              # 固定工作负载；ViT packed 路径的 KV cache 按它定长
@@ -82,7 +93,7 @@ class HyVlaConfig:
     # 使实际 base = 10000 × 1000^(hd/(hd-2)) ≈ 1.115884e7。照抄 rope_theta 会全错。
     rope_alpha: float = 1000.0
     rope_theta: float = 10000.0
-    # 特殊 token id，直接取自模型词表，不依赖 tokenizer。
+    # 特殊 token id（反查得到，不依赖 tokenizer；5 个全部 max|diff| = 0）
     tok_bos: int = 120000
     tok_user: int = 120006
     tok_vision_start: int = 120684
@@ -99,12 +110,22 @@ class HyVlaConfig:
 
     @property
     def kv_heads_rpu(self) -> int:
-        """device 使用的物理 KV head 数。
+        """**喂给 RPU 的** KV head 数（不是模型真实的 4）。
 
-        RPU_HY_VLA_ATTN_TP8 将每个逻辑 KV head 复制到两个物理槽，使 attention
-        使用 8 核。核 c 的 q head 为 2c、2c+1，对应逻辑 KV head floor(c/2)；
-        o 投影的行切分保持同样的 head 对应关系。
-        该布局增加 K/V 权重与 cache 存储，VLM 和 expert 必须同时采用。"""
+        `RPU_HY_VLA_ATTN_TP8` 打开后把 4 个 KV head **各复制一份**成 8 个槽位
+        （槽 c = 原 head `floor(c/2)`），于是 `attn_tp = min(8, 8) = 8`，
+        q/k/v/o 四个投影从 4 核变 8 核 —— 那是本模型 device 侧最后一块结构性余量：
+        `attn_tp=4` 只用到 4 个 DMA 通道，被"每核 24 GB/s"压在 96 GB/s，
+        而 MLP 那三个走 8 核能吃到聚合的 136.6（结论 23）。
+
+        **为什么复制正好对得上**：q 按 `_col(·,8)` 落成核 c ↔ q head 2c,2c+1；
+        原始 gqa 分组是 q head h ↔ kv head `h//4` ⇒ 核 c 要的是 `floor(2c/4)`
+        = `floor(c/2)` = 槽 c ✅。o 按 `_row(·,8)` 落成核 c ↔ 输入维
+        [256c,256c+256) = 同样那两个 q head ✅。
+
+        代价：k/v 权重与 KV cache 的 DDR 各翻一倍（cache 19→38 MB），SDPA 读 KV 翻倍。
+        净账见 HANDOFF §5（毛 −12.5 / 净 −7.0）。
+        """
         return self.num_kv_heads * 2 if _attn_tp8() else self.num_kv_heads
 
     @property
@@ -229,7 +250,7 @@ def _expected_materialized_keys(
 
 
 def _validate_checkpoint_keys(keys, cfg: HyVlaConfig) -> tuple[str, ...]:
-    """Reject a different checkpoint inventory before the first device upload."""
+    """Reject a different checkpoint inventory before the first RPU upload."""
     actual = tuple(keys)
     expected = _expected_checkpoint_keys(cfg)
     actual_set = set(actual)
@@ -273,7 +294,7 @@ def _validate_checkpoint_schema(handle, cfg: HyVlaConfig) -> tuple[str, ...]:
 def preflight_hy_vla_checkpoint(
         ckpt_path: "str | Path",
         cfg: HyVlaConfig = HyVlaConfig()) -> None:
-    """Pure-host exact-profile validation with no tensor or device materialization."""
+    """Pure-host exact-profile validation with no tensor or RPU materialization."""
     with safe_open(Path(ckpt_path), framework="pt", device="cpu") as handle:
         _validate_checkpoint_schema(handle, cfg)
 
@@ -529,7 +550,7 @@ class _HyVlaWeightColdPlan:
 
 
 def _q8(w: torch.Tensor, partition: int, nc: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """fp16 `[N,K]` → (int8 已 swizzle 的 device 权重, fp16 `[N]` device scale)。
+    """fp16 `[N,K]` → (int8 已 swizzle 的 RPU 权重, fp16 `[N]` RPU scale)。
 
     per-output-channel 对称 int8（`quant/_common.py`），kernel 侧由
     `rpu_linear.cpp` 按 `weight.scalar_type()==at::kChar` 自动派发到 generated
@@ -565,13 +586,13 @@ def _q4(w: torch.Tensor, partition: int, nc: int) -> Tuple[torch.Tensor, torch.T
     packed, packed_scale = pack_int4_per_channel_as_pgrp(
         v4, sc.to(torch.float16), partition, nc
     )
-    packed = packed.view(n, k // 2)
+    packed = packed.view(w4_storage_shape(n, k, partition, nc))
     return (packed.to("rpu").contiguous(),
             packed_scale.to("rpu").contiguous())
 
 
 def _quant(w: torch.Tensor, partition: int, nc: int, bits: int):
-    """按位宽派发。返回 (device 权重, device scale)；bits==16 时 scale 为 None。"""
+    """按位宽派发。返回 (RPU 权重, RPU scale)；bits==16 时 scale 为 None。"""
     if bits == 4:
         return _q4(w, partition, nc)
     if bits == 8:
@@ -588,9 +609,9 @@ def _rpu_nvfp4(tensor: torch.Tensor) -> torch.Tensor:
 
 @dataclasses.dataclass
 class HyVlaWeights:
-    """三座子系统的 device 权重 + 留在 host 的 boundary 权重。
+    """三座子系统的 RPU 权重 + 留在 host 的 boundary 权重。
 
-    所有 device 张量在本对象构造完毕时就已全部驻留 DDR —— 见模块 docstring 的顺序约束。
+    所有 RPU 张量在本对象构造完毕时就已全部驻留 DDR —— 见模块 docstring 的顺序约束。
     """
     cfg: HyVlaConfig
     patch_embed_cores: int                    # cold physical layout authority
@@ -602,7 +623,7 @@ class HyVlaWeights:
     vit_proj1_b: torch.Tensor
     vit_patch_gemm_w: torch.Tensor              # patch_embed 折成 im2col GEMM
     vit_pos_fused: torch.Tensor                 # pos_embed + conv.bias 预融合
-    merger_rest: Dict[str, torch.Tensor]        # DwPooler→GELU→proj2（P1b，全 device）
+    merger_rest: Dict[str, torch.Tensor]        # DwPooler→GELU→proj2（P1b，全 RPU）
     vlm_text: Dict[str, List[torch.Tensor]]     # VLM text 塔
     vlm_vision: Dict[str, List[torch.Tensor]]   # VLM `_v` 塔
     vlm_final_norm: torch.Tensor
@@ -641,7 +662,7 @@ def _build_vit(
     bits = cold.vit_bits
     for li in range(cfg.vit_layers):
         b = f"blocks.{li}."
-        # Keep the existing device upload order (q/k/v/o/fc1/fc2, then biases and
+        # Keep the existing RPU upload order (q/k/v/o/fc1/fc2, then biases and
         # norms), while retaining at most the current source tensor.  qkv is a
         # single checkpoint tensor, so share that one materialization across
         # its three projections.
@@ -713,8 +734,9 @@ def _build_mot_branch(
                          "gate_w up_w down_w "
                          "q_ws k_ws v_ws o_ws gate_ws up_ws down_ws").split()}
     tp, mc = (8 if cold.attn_tp8 else min(8, cfg.num_kv_heads)), 8
-    # MoT 的 text 与 _v 分支使用不同权重，必须分别计算 scale。
-    # 两个独立 native setter 允许分别选择分支位宽。
+    # ⚠️ MoT 两条孪生**各量各的 scale** —— text 与 `_v` 是两组不同的权重。
+    # R42：位宽也可以逐孪生选（`RPU_HY_VLA_W8A16=vlm_vision`），因为两条走的是
+    # 两个独立的 C++ setter。每条孪生 3.22 GB/帧 ⇒ 单量一条约值 −10 ms。
     bits = cold.vlm_vision_bits if suffix else cold.vlm_text_bits
     for li in range(cfg.layers):
         b, sa, mlp = f"layers.{li}.", f"layers.{li}.self_attn.", f"layers.{li}.mlp{suffix}."
@@ -772,11 +794,16 @@ def _build_expert(
     cfg: HyVlaConfig,
     cold: _HyVlaWeightColdPlan,
 ) -> Dict[str, List[torch.Tensor]]:
-    """构造 32 层 expert 的 _v 分支。
+    """expert 32 层。**单塔**：只取 `_v` 半边。
 
-    expert 的 modality_mask 恒为 True，因此只使用 _v 权重。
-    q/k head-norm 必须取 VLM 对应层：原模型的层循环共享 VLM 的
-    query/key_layernorm，不能替换为 expert 中同形状的张量。"""
+    两处只会静默算错、不会报错的地方：
+
+    · expert 的 `modality_mask` 恒 True（P0 实测 51/51）⇒ vendor 的 `mask_apply`
+      永远只选 `_v` 分支，非 `_v` 的 369.2M 参数是死权重。
+    · **q/k head-norm 必须取 VLM 层的那一份** —— vendor 的层循环里写死
+      `vlm_layer = models[0].layers[layer_idx]`，两塔共享它的 query/key_layernorm；
+      expert 自己那份同名张量形状相同但从未被使用（P0 hook calls=0）。
+    """
     d = {k: [] for k in ("q_w k_w v_w o_w q_norm k_norm input_norm post_norm "
                          "gate_w up_w down_w "
                          "q_ws k_ws v_ws o_ws gate_ws up_ws down_ws").split()}
@@ -796,7 +823,7 @@ def _build_expert(
     resident = None
     d["gateup_resident"] = []
     if cold.gateup_resident:
-        allowed_layers = (12, 24) if nvfp4 else (6, 12) if bits == 8 else (6,)
+        allowed_layers = [12, 24] if nvfp4 else [6, 12] if bits == 8 else [6]
         if cold.gateup_resident_layers not in allowed_layers:
             raise ValueError("HyVLA Gate/Up residency supports FP16 six, W8 six/twelve, or NVFP4 twelve/twenty-four layers")
         if (cfg.layers, cfg.expert_hidden, cfg.expert_inter, cfg.suffix_len,
@@ -877,7 +904,7 @@ def sample_vit_pos_embedding(pos_embed: torch.Tensor, h: int, w: int) -> torch.T
     ⚠️ 这是 `grid_sample`（`padding_mode="border"`），**不是** `F.interpolate`。
     vendor 里两条路都存在：`rescale_positional_embedding` 走 interpolate，
     `sample_positional_embedding` 走 grid_sample，本模型的 ViT 只走后者
-    （`use_grid_sampling: true`）。两者结果不同，别互换。
+    （golden 的 `use_grid_sampling: true`）。两者结果不同，别互换。
 
     ⚠️ 返回 **fp32**，不跟 vendor 那样 `.bfloat16()`：vendor 在
     `to_bfloat16_like_physical_intelligence()` 里把它连同权重一起降成 bf16，
@@ -907,7 +934,7 @@ def load_hy_vla_weights(
     *,
     _cold_plan: _HyVlaWeightColdPlan | None = None,
 ) -> HyVlaWeights:
-    """在首次 forward 前装载全部 device 权重（见模块 docstring 的顺序约束）。
+    """在首次 forward 前装载全部 RPU 权重（见模块 docstring 的顺序约束）。
 
     checkpoint 名称先完整校验，随后源张量按需逐个转成 fp32、变换并释放；不会把
     checkpoint 的全部 fp32 副本同时留在 host。
@@ -915,8 +942,9 @@ def load_hy_vla_weights(
     Args:
         ckpt_path: `model.safetensors`（4.5B，全 bf16）。
         pos_embedding: ViT 的 `[1, 196, 1152]` fp32 位置编码。**默认 `None` =
-            从 ckpt 自己的 `pos_embed` 重采样**（`sample_vit_pos_embedding`）。
-            传入张量则原样使用。
+            从 ckpt 自己的 `pos_embed` 重采样**（`sample_vit_pos_embedding`），
+            这样交付包不必外挂一个 golden 文件。传入张量则原样使用（回归/对拍
+            用，例如直接喂 golden 的 `c0.v0.pos_embedding`）。
     """
     cold = (
         _HyVlaWeightColdPlan.from_environment()
@@ -962,7 +990,8 @@ def load_hy_vla_weights(
         pos_fused = _rpu16(pos_embedding
                            + vit_w["patch_embed.proj.bias"].view(1, 1, -1))
 
-        # device aten::linear 上的 merger 余部要求 col-swizzled 权重。
+        # merger 余部（DwPooler→GELU→proj2）跑在 RPU 的 aten::linear 上，
+        # 它**要求 col-swizzled 权重**（P1b 实测：raw 0.023 / col 1.000 / row 0.025）。
         merger_rest = {}
         for key in merger_w:
             if key.startswith("proj1"):
@@ -995,7 +1024,7 @@ def load_hy_vla_weights(
         expert_final_norm = _rpu16(expert_w["norm.weight"])
 
         # These are the only persistent CPU fp32 weights.  Materialize them
-        # after all device uploads so they do not inflate the upload peak.
+        # after all RPU uploads so they do not inflate the upload peak.
         tok_emb = root_w[_LM_HEAD]
         host = {name: host_w[name] for name in _HOST_TENSORS}
         _validate_materialized_keys(
@@ -1031,12 +1060,16 @@ def load_hy_vla_weights(
 
 def build_rope_tables(positions: torch.Tensor, cfg: HyVlaConfig,
                       vendor_bf16: bool = True):
-    """构造 [rows, head_dim/2] FP16 device RoPE 表。
+    """`[rows, head_dim/2]` fp16 RPU —— kernel 格式是 HF 展开 `cat(f,f)` 的前半。
 
-    第 i 行对应 positions[i]，不是行号 i。suffix 的 position 从 prefix
-    有效长度起算，与 KV 中从 S 开始的绝对下标不同。
-    vendor_bf16 保留 checkpoint 将 inv_freq 量化为 BF16 的推理语义；
-    改用未经该量化的频率会改变旋转值。"""
+    第 i 行放 `positions[i]`（**不是** i）：suffix 的 position 从 prefix 的**有效**
+    长度起算（实测 181..231），与它在 KV 里的绝对下标（S..S+50）不相等。
+
+    `vendor_bf16=True` 复现 vendor 把 `inv_freq` 量化成 bf16 的行为。这是**生产
+    默认**：权重是在这个 rotary 下训练交付的，bf16 量化后的 `inv_freq` 就是本 ckpt
+    的推理语义；fp32 公式才是"另一个模型"。实测 fp32 路径下 key 掉到 0.99960
+    （value 仍 0.99999903 —— 量化只作用于 RoPE 的指纹）。
+    """
     hd = cfg.head_dim
     inv = 1.0 / (cfg.rope_base ** (torch.arange(0, hd, 2, dtype=torch.float64) / hd))
     if vendor_bf16:
@@ -1069,7 +1102,7 @@ def _time_bias_list(cfg: HyVlaConfig, host: Dict[str, torch.Tensor]) -> List[tor
 
 def build_unroll_weights(cfg: HyVlaConfig, host: Dict[str, torch.Tensor],
                          action_mlp_cores: int):
-    """图内 10 步 unroll 需要的 6 个 device 张量。
+    """图内 10 步 unroll 需要的 6 个 RPU 张量。
 
     ⚠️ swizzle 不是统一的：`mo` 默认 **8 核 row 切分**（见 frozen cold plan），
     其余 5 个仍是单核 col-swizzle。
@@ -1082,7 +1115,7 @@ def build_unroll_weights(cfg: HyVlaConfig, host: Dict[str, torch.Tensor],
 
     ⚠️ 这**不是**恒等重排：① 折叠本身是矩阵重结合（在 fp32 host 上做一次）；
     ② 折完的 GEMM 与 out_proj 都改在 device 上跑 **fp16**，而单步路径是 host
-    fp32。因此此路径可能出现由运算重结合及 dtype 转换带来的数值差异。
+    fp32。两者叠加必然有数值漂移 —— 收益换精度的取舍，验收看 cos 分布。
 
     `action_dim=32` 已是 16 的倍数 ⇒ 无需 out/K padding（图内 Euler 要求
     encoder 的 K 与 out_proj 的 N 同宽）。
@@ -1094,8 +1127,10 @@ def build_unroll_weights(cfg: HyVlaConfig, host: Dict[str, torch.Tensor],
     B_in = host["action_in_proj.bias"]                    # [D]
     time_all = torch.stack([(F.linear(B_in[None], W1a) + tb).reshape(-1)
                             for tb in _time_bias_list(cfg, host)])
-    # wc 与 mo 的核数必须一致：native 使用列并行后接行并行的配对布局。
-    # 只改变其中一侧会让消费者读取错误的核分片；核数随权重绑定到 handle。
+    # mo 是这 6 个里唯一的大件（[D,D] = 2 MB fp16），单核跑满 24.5 GB/s = 85.5 µs/步
+    # ⇒ 默认切 8 核。⚠️ **wc 与 mo 要一起改**：C++ 侧接的是
+    # 「A4 列并行 → A6 行(K)并行」这一对（层体里 gate/up→down 的同一套 TP 模式），
+    # 只改一个 = 另一个读到别的核的段 ⇒ 静默算错。核数随权重显式绑定到 native。
     amc = action_mlp_cores
     mo_w = host["action_time_mlp_out.weight"]
     return (_col(W1a @ W_in0, amc),                        # wc      [D, action_dim] 列并行
@@ -1107,13 +1142,20 @@ def build_unroll_weights(cfg: HyVlaConfig, host: Dict[str, torch.Tensor],
 
 
 def build_time_embed(cfg: HyVlaConfig, host: Dict[str, torch.Tensor]):
-    """预计算固定 timestep 的 boundary 常量并返回逐步 embed 闭包。
+    """预算 10 个 timestep 的 boundary 常量 + 返回逐步 embed 闭包。
 
-    sinusoidal 时间项按固定 Euler 序列预计算。action_in_proj 使用预转置
-    权重与 addmm；time_mlp_in 按列拆分：
-        W1 @ [act; te] + b = W1[:, :D] @ act + (W1[:, D:] @ te + b)
-    右项只依赖 timestep，可复用并省去每步的拼接。
-    较大的 GEMM 保留 F.linear 及其惰性转置权重布局。"""
+    三处**精确等价**的 host 重排（`p4_traj.py` 实测，零风险）：
+      ① sinusoidal 全预算 —— 10 个 timestep 是固定的 {1.0, .9, …, .1}；
+      ② `action_in_proj` 预转置 + `addmm` —— K=32 的小 GEMM，batch 维让 BLAS 走
+         低效路径（0.351 → 0.096 ms）；
+      ③ `time_mlp_in` 按列拆分，代数恒等式
+         `W1 @ [act;te] + b = W1[:,:D] @ act + (W1[:,D:] @ te + b)`，
+         右项只依赖 timestep ⇒ 全预算，每步 GEMM 输入规模减半，还省一次 cat。
+
+    ⚠️ 大 GEMM **保持 `F.linear`**（权重不转置）—— 它的 `W.t()` 是 lazy 的，BLAS
+    直接用 CblasTrans；手工 `.t().contiguous()` 反而把它推下快路径（实测 10 步
+    host 从 57 ms 涨到 257 ms）。
+    """
     D = cfg.expert_hidden
     W_in = host["action_in_proj.weight"].t().contiguous()   # K=32 ⇒ 预转置有利
     B_in = host["action_in_proj.bias"]

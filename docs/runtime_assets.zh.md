@@ -8,10 +8,11 @@ RhinoForge 源码和 wheel 不包含 Rhino Launch 二进制、主算子资产与
 提供，匹配的 Launch 与算子资产仍单独交付。各包按随包条款和完整性说明使用。
 
 当前 `1.3.0.dev0` 开发线依赖已归档的 **Rhino Launch 1.2.0**，
-commit 为 `3dd1b410f5f46373997fef3dfbf9b67eecec6a84`，CMake 数值版本为 `1.2.0`，ABI 为 `1`。
-向提供方获取正式版 `RhinoForge-runtime-v1.2.0.tar.gz` 及其 `.tar.gz.sha256`。
-其中 Launch 开发包目录为 `rhino-launch-kernel-v1.2.0-linux-aarch64`，main 和
-DDR-expansion 资产与[依赖清单](../release/runtime-dependencies.json)一致，
+commit 为 `3dd1b410f5f46373997fef3dfbf9b67eecec6a84`，CMake 数值版本为 `1.2.0`，ABI 为 `1`，
+并将 `op_abi_epoch` 升级为 **`2`**。向提供方获取配套的 `RhinoForge-runtime-v1.3.0.dev0.tar.gz`
+及其 `.tar.gz.sha256`（`RhinoForge-runtime-v1.2.0.tar.gz` 固定对应 `v1.2.0` / `op_abi_epoch = 1`）。
+其中嵌套的 Launch 开发包目录仍为 `rhino-launch-kernel-v1.2.0-linux-aarch64`，main 和
+DDR-expansion 资产与[依赖清单](../release/runtime-dependencies.json)中的 `op_abi_epoch = 2` 一致，
 两份资产都需保留相邻的 `.ref.kernels` 清单。
 历史候选包可能使用同一整包文件名，须核对校验和、`RELEASE.txt` 和 Launch commit。
 `v1.1.0-2-gbdc0dae` 目录对应旧 Launch 开发包，其 CMake 版本为 `1.0.0`，不满足当前依赖。
@@ -44,7 +45,7 @@ DDR-expansion 资产与[依赖清单](../release/runtime-dependencies.json)一�
 
 ## 配置路径
 
-从提供方的受控交付入口下载 `RhinoForge-runtime-v1.2.0.tar.gz` 和其 `.sha256`，
+从提供方的受控交付入口下载 `RhinoForge-runtime-v1.3.0.dev0.tar.gz` 和其 `.sha256`，
 放入同一下载目录。以下命令校验并解开两层包；只解外层包并不会产生可安装的
 Launch 前缀。使用源码和 Python 环境之外的新目录，任何校验失败都应停止：
 
@@ -52,10 +53,10 @@ Launch 前缀。使用源码和 Python 环境之外的新目录，任何校验�
 export RHINOFORGE_DOWNLOADS="/absolute/path/to/runtime-downloads"
 export RHINOFORGE_RUNTIME="/absolute/path/to/new/runtime"
 cd "$RHINOFORGE_DOWNLOADS"
-sha256sum -c RhinoForge-runtime-v1.2.0.tar.gz.sha256
+sha256sum -c RhinoForge-runtime-v1.3.0.dev0.tar.gz.sha256
 mkdir -p "$RHINOFORGE_RUNTIME"
-tar -xzf RhinoForge-runtime-v1.2.0.tar.gz -C "$RHINOFORGE_RUNTIME"
-export RHINOFORGE_BUNDLE="$RHINOFORGE_RUNTIME/RhinoForge-runtime-v1.2.0"
+tar -xzf RhinoForge-runtime-v1.3.0.dev0.tar.gz -C "$RHINOFORGE_RUNTIME"
+export RHINOFORGE_BUNDLE="$RHINOFORGE_RUNTIME/RhinoForge-runtime-v1.3.0.dev0"
 cd "$RHINOFORGE_BUNDLE"
 sha256sum -c SHA256SUMS
 cat RELEASE.txt
@@ -79,7 +80,7 @@ ls "$RHINO_LAUNCH_ROOT/lib/"librhino_launch.so*
 
 ```text
 runtime/
-  RhinoForge-runtime-v1.2.0/
+  RhinoForge-runtime-v1.3.0.dev0/
     RELEASE.txt, SHA256SUMS
     rhino-launch-kernel-v1.2.0-linux-aarch64.tar.gz
     rhinoOpLib_current.ref, rhinoOpLib_current.ref.kernels

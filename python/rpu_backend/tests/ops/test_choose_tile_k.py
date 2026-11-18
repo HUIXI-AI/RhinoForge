@@ -5,7 +5,8 @@ def test_default_mode_is_conservative():
     assert h.kSdpaTilePolicyMode == 1, 'default must be conservative (mode=1); aggressive is opt-in'
 
 def test_policy_version_encoding():
-    assert h.kSdpaTilePolicyBase == 2
+    # base * 2 + mode_bit; base=3 includes the sync-compatible LTM fallback.
+    assert h.kSdpaTilePolicyBase == 3
     assert h.kSdpaTilePolicyVersion == h.kSdpaTilePolicyBase * 2 + h.kSdpaTilePolicyMode
 
 def test_max_vlm_size_matches_header():

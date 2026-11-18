@@ -47,14 +47,15 @@ def complete_descriptor_evidence(descriptor: Iterable[int], *, expected_lifecycl
     if not all((isinstance(value, str) and value for value in (component_path, stage))):
         raise AssertionError('descriptor component_path and stage must be explicit')
     words = tuple((int(value) for value in descriptor))
-    if len(words) < 26 or words[0] != 3 or words[1] != len(words):
-        raise AssertionError('hardware closure requires a complete v3 stage descriptor')
+    if len(words) < 26 or words[0] not in (3, 4) or words[1] != len(words):
+        raise AssertionError('hardware closure requires a complete v3/v4 stage descriptor')
+    physical_end = len(words) - (2 if words[0] == 4 else 0)
     counts = words[11:14]
     span_count = words[14]
     if any((value <= 0 for value in (*counts, span_count))):
         raise AssertionError('stage descriptor has invalid chunk/span counts')
     cursor = 15 + 4 * sum(counts) + 3 * span_count
-    if cursor + 11 > len(words):
+    if cursor + 11 > physical_end:
         raise AssertionError('stage descriptor physical manifest is truncated')
     (state, logical_length, physical_length, execution_padding_rows, kv_logical_length, kv_insert_physical_rows, lifecycle, linear_accumulation, route_count, fingerprint_hi, fingerprint_lo) = words[cursor:cursor + 11]
     cursor += 11
@@ -66,11 +67,11 @@ def complete_descriptor_evidence(descriptor: Iterable[int], *, expected_lifecycl
     routes: list[dict[str, object]] = []
     previous = (-1, -1, -1)
     for _ in range(route_count):
-        if cursor + 6 > len(words):
+        if cursor + 6 > physical_end:
             raise AssertionError('physical route header is truncated')
         (family, site_id, selector, flags, argument_count, invocation) = words[cursor:cursor + 6]
         cursor += 6
-        if argument_count < 0 or cursor + argument_count > len(words):
+        if argument_count < 0 or cursor + argument_count > physical_end:
             raise AssertionError('physical route arguments are truncated')
         arguments = list(words[cursor:cursor + argument_count])
         cursor += argument_count
@@ -79,10 +80,16 @@ def complete_descriptor_evidence(descriptor: Iterable[int], *, expected_lifecycl
             raise AssertionError('physical route is invalid or non-canonical')
         routes.append({'family': family, 'site_id': site_id, 'invocation': invocation, 'selector': selector, 'flags': flags, 'arguments': arguments})
         previous = identity
-    if cursor != len(words):
+    if cursor != physical_end:
         raise AssertionError('stage descriptor has trailing words')
+    ranking = {}
+    if words[0] == 4:
+        policy, mixer_calls = words[-2:]
+        if policy not in (1, 2) or not counts[2] <= mixer_calls <= physical_length:
+            raise AssertionError('stage descriptor has invalid ranking policy or mixer count')
+        ranking = {'ranking_policy': policy, 'ranking_mixer_calls': mixer_calls}
     manifest_header = (state, logical_length, physical_length, execution_padding_rows, kv_logical_length, kv_insert_physical_rows, lifecycle, linear_accumulation, route_count)
     fingerprint = fingerprint_hi << 32 | fingerprint_lo
     if fingerprint != _manifest_fingerprint(manifest_header, routes):
         raise AssertionError('physical manifest fingerprint is stale')
-    return {'schema': SCHEMA, 'descriptor_version': 3, 'component_path': component_path, 'stage': stage, 'manifest': {'state': 'COMPLETE', 'logical_length': logical_length, 'physical_length': physical_length, 'execution_padding_rows': execution_padding_rows, 'kv_logical_length': kv_logical_length, 'kv_insert_physical_rows': kv_insert_physical_rows, 'graph_lifecycle': lifecycle_name, 'linear_accumulation': linear_accumulation, 'route_count': route_count, 'fingerprint': f'{fingerprint:016x}'}, 'routes': routes}
+    return {'schema': SCHEMA, 'descriptor_version': words[0], **ranking, 'component_path': component_path, 'stage': stage, 'manifest': {'state': 'COMPLETE', 'logical_length': logical_length, 'physical_length': physical_length, 'execution_padding_rows': execution_padding_rows, 'kv_logical_length': kv_logical_length, 'kv_insert_physical_rows': kv_insert_physical_rows, 'graph_lifecycle': lifecycle_name, 'linear_accumulation': linear_accumulation, 'route_count': route_count, 'fingerprint': f'{fingerprint:016x}'}, 'routes': routes}

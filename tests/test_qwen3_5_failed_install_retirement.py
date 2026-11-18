@@ -217,7 +217,7 @@ def test_real_pending_failure_preserves_primary_and_cleanup_identity(resources, 
     monkeypatch.setattr(torch.ops.rpu, "qwen3_5_set_weights", fail_install if install_failure == "weights" else lambda *_a: None, raising=False)
     for name in ("qwen3_5_set_chunk_size_cap", "qwen3_5_set_prefill_chunk_size"):
         monkeypatch.setattr(torch.ops.rpu, name, lambda *_a: None, raising=False)
-    monkeypatch.setattr(text, "_declare_qwen3_5_chunk_envelope", lambda *_a: (64, 64))
+    monkeypatch.setattr(text, "_declare_qwen3_5_chunk_envelope", lambda *_a, **_k: (64, 64))
     if install_failure == "retained":
         # Exact cold scope/cache binding is covered by the real 9B Session
         # tests. Empty weight lists isolate the actual native flag transaction.

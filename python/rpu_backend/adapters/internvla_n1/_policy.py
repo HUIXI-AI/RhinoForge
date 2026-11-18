@@ -1,4 +1,4 @@
-"""Fail-closed policy shared by controlled InternVLA-N1 device paths."""
+"""Fail-closed policy shared by controlled InternVLA-N1 RPU paths."""
 from __future__ import annotations
 
 import hashlib
@@ -11,18 +11,16 @@ from pathlib import Path
 from rpu_backend.runtime import UnsupportedModelError
 
 
-NUMERIC_BLOCKED_ENV = "RPU_INTERNVLA_N1_ALLOW_NUMERIC_BLOCKED"
 S2_SDPA_BF16_ENV = "RPU_S2_SDPA_BF16"
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
 def require_numeric_blocked_opt_in() -> None:
-    if os.environ.get(NUMERIC_BLOCKED_ENV) != "1":
-        raise UnsupportedModelError(
-            "InternVLA-N1 device is a controlled numeric-blocked evaluation; "
-            "full-hidden metrics are record-only and final-action gates remain "
-            f"authoritative. Use exact {NUMERIC_BLOCKED_ENV}=1."
-        )
+    """Reject the retired BF16 SDPA selector.
+
+    The System2/RGBD/NavDP chain is supported (2026-10-19 board run), so no
+    numeric-blocked opt-in is required any more.
+    """
     sdpa_bf16 = os.environ.get(S2_SDPA_BF16_ENV)
     if sdpa_bf16 not in (None, "", "0"):
         if sdpa_bf16 != "1":
@@ -31,8 +29,8 @@ def require_numeric_blocked_opt_in() -> None:
             )
         raise UnsupportedModelError(
             f"{S2_SDPA_BF16_ENV}=1 is unavailable with the current latest "
-            "device op-library: its BF16 flash-attention kernel was removed. "
-            "Do not side-load a retired operator library; leave the variable "
+            "RPU op-library: its BF16 flash-attention kernel was removed. "
+            "Do not side-load the retired MR33 op-library; leave the variable "
             "unset for the controlled FP16-SDPA evaluation."
         )
 
@@ -40,12 +38,6 @@ def require_numeric_blocked_opt_in() -> None:
 def require_controlled_environment() -> None:
     """Reject unsafe ambient selectors before any controlled-evaluation I/O."""
     require_numeric_blocked_opt_in()
-
-    numeric_blocked = os.environ.get(NUMERIC_BLOCKED_ENV)
-    if numeric_blocked not in (None, "0", "1"):
-        raise UnsupportedModelError(
-            f"{NUMERIC_BLOCKED_ENV} accepts only literal '0' or '1'."
-        )
 
 
 def require_controlled_evaluation(
@@ -63,7 +55,7 @@ def verify_asset_hashes(
     required_assets: Sequence[str | Path],
     asset_manifest: Mapping[str | Path, str] | None,
 ) -> None:
-    """Verify caller-supplied SHA-256 values without changing device policy."""
+    """Verify caller-supplied SHA-256 values without changing RPU policy."""
     if not asset_manifest:
         raise UnsupportedModelError(
             "InternVLA-N1 exact assets require a caller-supplied asset_manifest."
@@ -108,6 +100,6 @@ def verify_asset_manifest(
     required_assets: Sequence[str | Path],
     asset_manifest: Mapping[str | Path, str] | None,
 ) -> None:
-    """Verify controlled-device policy and caller-supplied asset SHA-256 values."""
+    """Verify controlled-RPU policy and caller-supplied asset SHA-256 values."""
     require_controlled_evaluation(asset_manifest)
     verify_asset_hashes(required_assets, asset_manifest)

@@ -88,6 +88,7 @@ def _moe_owner(policy=None):
             num_cores=8,
             attn_tp=8,
             mlp_tp=8,
+            routed_tp=8,
             lm_head_tp=8,
             physical_kv_cores=8,
         ),
@@ -641,7 +642,8 @@ def test_moe_image_prefill_replans_after_both_persistent_floors(
     )
     cache = SimpleNamespace(
         position=0, max_seq_len=8192, allocated_max_seq_len=8192,
-        execution_topology=(8, 8, 8, 8, 8))
+        execution_topology=(8, 8, 8, 8, 8),
+        moe_execution_topology=(2, 8, 8, 8, 8, 8, 8, 8, 8, 8))
     ids = torch.ones(1, 512, dtype=torch.long)
     ids[:, :196] = 99
     pixels, grid = torch.zeros(784, 1536), torch.tensor([[1, 28, 28]])

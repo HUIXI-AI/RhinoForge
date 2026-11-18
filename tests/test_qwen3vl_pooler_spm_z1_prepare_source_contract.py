@@ -1,6 +1,7 @@
 """Board-free source gates for the Qwen3-VL pooler-only Z1 lifecycle."""
 
 from pathlib import Path
+import json
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,6 +16,16 @@ MODEL = ROOT / "src/fused/rpu_qwen3_model.cpp"
 def _between(source: str, begin: str, end: str) -> str:
     start = source.index(begin)
     return source[start : source.index(end, start)]
+
+
+
+def _assert_current_profile(name):
+    policies = (ROOT / "src/fused/rpu_parallel_linear_register_policies.h").read_text()
+    assert f"inline const GraphKernelRegisterPolicy& {name}()" in policies
+    block = _between(policies, f"inline const GraphKernelRegisterPolicy& {name}()", "return value;")
+    assert "p.fingerprint = UINT64_C(" in block and "rule(" in block
+    source = COORDINATOR.read_text()
+    assert f'return rpu_pl_census::policy("{name}");' in source
 
 
 def test_exact_n256_geometry_and_budget_are_frozen():
@@ -107,7 +118,7 @@ def test_retained_deepstack_routes_and_prepare_cardinality_are_fail_closed():
     assert "int64_t retained_deepstack_count = 0" in header
     registrations = REGISTRATIONS.read_text(encoding="utf-8")
     assert ("int retained_deepstack_count=0, int[] vision_stage_descriptor=[], "
-            "int[] text_stage_descriptor=[]) -> int") in registrations
+            "int[] text_stage_descriptor=[], bool partial_mrope=False) -> int") in registrations
 
 
 def test_prepare_failure_and_unprepare_are_reverse_component_transactions():
@@ -401,48 +412,7 @@ def test_physical_lifecycle_is_declared_and_registered_without_export():
 
 def test_exact_typed_register_policy_and_phase_boundaries_are_frozen():
     source = COORDINATOR.read_text(encoding="utf-8")
-    policy = _between(
-        source,
-        "const GraphKernelRegisterPolicy& qwen3vl_pooler_z1_register_policy()",
-        "void stage_non_image_rows_locked(",
-    )
-    for token in (
-        "0x5133564c5a315633",
-        'value.name = "qwen3vl_pooler_z1_register_census_v3"',
-        "KernelId::PL_AT_FP16_M320N128, 52",
-        "KernelId::PL_AT_FP16_M384N96, 162",
-        "KernelId::PL_AT_FP16_M480N64, 128",
-        "KernelId::ROPE_2D_SPM, 48",
-        "KernelId::MROPE, 56",
-        "KernelId::LLAMA_INSERT_KCACHE_V16, 52",
-        "KernelId::LLAMA_INSERT_VCACHE_V16, 52",
-        "KernelId::SDPA_FLASH_ATTN_SPM, 52",
-        "KernelId::LLM_ALL_REDUCE_RESIDUAL_RING_PACED, 105",
-        "KernelId::UNARY_GELU_TANH_SPM, 24",
-        "KernelId::UNARY_GELU_ERF_SPM, 1",
-        '"fill", 1, GraphKernelNoDdrProof::FillSpm',
-        '"slice_single_axis", 2',
-        "GraphKernelNoDdrProof::SliceSpm",
-        "value.expected_node_count = 10052",
-        "value.expected_dma_count = 3337",
-        "value.expected_barrier_count = 5712",
-        "value.expected_kernel_count = 1003",
-        "value.expected_typed_kernel_count = 602",
-        "value.expected_no_ddr_kernel_count = 401",
-        "value.expected_operand_count = 766",
-        "value.expected_weight_operand_count = 454",
-        "value.expected_key_cache_operand_count = 104",
-        "value.expected_value_cache_operand_count = 104",
-        "value.expected_semantic_input_operand_count = 104",
-        "0xa3d08d6dc871e859",
-        "0xef7fcd5d46561585",
-        "0xeb9c5bbe550fd821",
-        "0x40a4fb74c129a684",
-        '"vision"',
-        '"handoff"',
-        '"text"',
-    ):
-        assert token in policy
+    _assert_current_profile("qwen3vl_pooler_z1_register_policy")
 
     pipeline = source[
         source.index("at::Tensor rpu_qwen3vl_pooler_spm_z1_pipeline_forward("):
@@ -493,44 +463,14 @@ def test_z1_selected_descriptors_are_cold_authority_not_a_new_executor():
     qwen_prepare = _between(qwen, "SpmPipelineComponentLayout prepare_text(",
                             "SpmPipelineComponentLayout prepare_text_deepstack1(")
     assert "selected_descriptor" not in wall_prepare
-    assert "at::IntArrayRef selected_descriptor)" in qwen_prepare
+    assert "at::IntArrayRef selected_descriptor," in qwen_prepare
+    assert "bool partial_mrope)" in qwen_prepare
     assert "/*retained_deepstack_count=*/0, selected_descriptor" in qwen_prepare
 
 
 def test_deepstack1_typed_register_policy_is_frozen_separately():
     source = COORDINATOR.read_text(encoding="utf-8")
-    policy = _between(
-        source,
-        "const GraphKernelRegisterPolicy& qwen3vl_pooler_ds1_register_policy()",
-        "void validate_text_hidden(",
-    )
-    for token in (
-        "0x5133564c44533133",
-        'value.name = "qwen3vl_pooler_ds1_register_census_v3"',
-        "KernelId::PL_AT_FP16_M320N128, 52",
-        "KernelId::PL_AT_FP16_M384N96, 164",
-        "KernelId::LLM_ALL_REDUCE_RESIDUAL_RING_PACED, 106",
-        "KernelId::MEMSET_SPM_MULTI_CORE_V2, 52",
-        "KernelId::LAYER_NORM, 50",
-        "KernelId::BINARY_SAMESHAPE, 29",
-        "KernelId::UNARY_GELU_TANH_SPM, 24",
-        "KernelId::UNARY_GELU_ERF_SPM, 2",
-        "value.expected_node_count = 10127",
-        "value.expected_dma_count = 3362",
-        "value.expected_barrier_count = 5754",
-        "value.expected_kernel_count = 1011",
-        "value.expected_typed_kernel_count = 604",
-        "value.expected_no_ddr_kernel_count = 407",
-        "value.expected_operand_count = 768",
-        "value.expected_weight_operand_count = 456",
-        "0xbd88d2887877515d",
-        "0xc0f97cf612a17608",
-        "0x94c72c177a2770b7",
-        "0x564531093ab6d335",
-        "0x4ac36c18252961c9",
-        "0x426d67efee2c461d",
-    ):
-        assert token in policy
+    _assert_current_profile("qwen3vl_pooler_ds1_register_policy")
 
     pipeline = source[
         source.index("at::Tensor rpu_qwen3vl_pooler_spm_z1_pipeline_forward("):
@@ -543,39 +483,7 @@ def test_deepstack1_typed_register_policy_is_frozen_separately():
 
 def test_deepstack3_typed_register_policy_is_frozen_separately():
     source = COORDINATOR.read_text(encoding="utf-8")
-    policy = _between(
-        source,
-        "const GraphKernelRegisterPolicy& qwen3vl_pooler_ds3_register_policy()",
-        "void validate_text_hidden(",
-    )
-    for token in (
-        "0x5133564c44533333",
-        'value.name = "qwen3vl_pooler_ds3_register_census_v3"',
-        "KernelId::PL_AT_FP16_M320N128, 52",
-        "KernelId::PL_AT_FP16_M384N96, 168",
-        "KernelId::PL_AT_FP16_M480N64, 128",
-        "KernelId::LLM_ALL_REDUCE_RESIDUAL_RING_PACED, 108",
-        "KernelId::MEMSET_SPM_MULTI_CORE_V2, 56",
-        "KernelId::LAYER_NORM, 52",
-        "KernelId::BINARY_SAMESHAPE, 31",
-        "KernelId::UNARY_GELU_TANH_SPM, 24",
-        "KernelId::UNARY_GELU_ERF_SPM, 4",
-        "value.expected_node_count = 10277",
-        "value.expected_dma_count = 3412",
-        "value.expected_barrier_count = 5838",
-        "value.expected_kernel_count = 1027",
-        "value.expected_typed_kernel_count = 608",
-        "value.expected_no_ddr_kernel_count = 419",
-        "value.expected_operand_count = 772",
-        "value.expected_weight_operand_count = 460",
-        "0xacaca5524c817c49",
-        "0x2432d00094747250",
-        "0x9279f1545ffacb9b",
-        "0xcf5fef9e2fa1b385",
-        "0x01f2f9249027e721",
-        "0xd030a24b4f411df5",
-    ):
-        assert token in policy
+    _assert_current_profile("qwen3vl_pooler_ds3_register_policy")
 
     pipeline = source[
         source.index("at::Tensor rpu_qwen3vl_pooler_spm_z1_pipeline_forward("):
@@ -587,25 +495,7 @@ def test_deepstack3_typed_register_policy_is_frozen_separately():
 
 def test_deepstack3_partial_mrope_policy_and_keepalive_owner_are_scoped():
     source = COORDINATOR.read_text(encoding="utf-8")
-    policy = _between(
-        source,
-        "qwen3vl_pooler_ds3_partial_mrope_register_policy()",
-        "const GraphKernelRegisterPolicy& groot_n17_pooler_ds3_register_policy()",
-    )
-    for token in (
-        "0x5133564c44535034",
-        '"qwen3vl_pooler_ds3_partial_mrope_register_census_v4"',
-        "rule.kernel_id = KernelId::PARTIAL_MROPE",
-        "value.expected_operand_count = 716",
-        "value.expected_weight_operand_count = 348",
-        "value.expected_semantic_input_operand_count = 160",
-        "0x96f763aafa93dc70",
-        "value.phases[2].stats.operand_count = 420",
-        "value.phases[2].stats.weight_operand_count = 196",
-        "value.phases[2].stats.semantic_input_operand_count = 112",
-        "0x63af0dcc2969bed5",
-    ):
-        assert token in policy
+    _assert_current_profile("qwen3vl_pooler_ds3_partial_mrope_register_policy")
 
     model = MODEL.read_text(encoding="utf-8")
     prime = _between(
@@ -643,53 +533,7 @@ def test_groot_16_layer_s82_ds3_profile_and_register_policy_are_exact():
     ):
         assert token in shape
 
-    policy = _between(
-        source,
-        "const GraphKernelRegisterPolicy& groot_n17_pooler_ds3_register_policy()",
-        "void validate_text_hidden(",
-    )
-    for token in (
-        "0x4752544453335633",
-        'value.name = "groot_n17_pooler_ds3_register_census_v3"',
-        "KernelId::PL_AT_FP16_M320N128, 40",
-        "KernelId::PL_AT_FP16_M384N96, 120",
-        "KernelId::PL_AT_FP16_M480N64, 104",
-        "KernelId::ROPE_2D_SPM, 48",
-        "KernelId::MROPE, 32",
-        "KernelId::LLAMA_INSERT_KCACHE_V16, 40",
-        "KernelId::LLAMA_INSERT_VCACHE_V16, 40",
-        "KernelId::SDPA_FLASH_ATTN_SPM, 40",
-        "KernelId::LLM_ALL_REDUCE_RESIDUAL_RING_PACED, 84",
-        "KernelId::MEMSET_SPM_MULTI_CORE_V2, 56",
-        "KernelId::LAYER_NORM, 52",
-        "KernelId::RMS_NORM_BF16_SPM, 65",
-        "KernelId::BINARY_SAMESHAPE, 19",
-        "KernelId::UNARY_SPM, 16",
-        "KernelId::UNARY_GELU_TANH_SPM, 24",
-        "KernelId::UNARY_GELU_ERF_SPM, 4",
-        "value.expected_node_count = 8981",
-        "value.expected_dma_count = 3028",
-        "value.expected_barrier_count = 5166",
-        "value.expected_kernel_count = 787",
-        "value.expected_typed_kernel_count = 464",
-        "value.expected_no_ddr_kernel_count = 323",
-        "value.expected_operand_count = 568",
-        "value.expected_weight_operand_count = 328",
-        "value.expected_key_cache_operand_count = 80",
-        "value.expected_value_cache_operand_count = 80",
-        "value.expected_semantic_input_operand_count = 80",
-        "0xf94c8ed7da98d029",
-        "0x50ab7f6c7f63c5f0",
-        "0x9279f1545ffacb9b",
-        "0xcf5fef9e2fa1b385",
-        "0xa21f233d7817267b",
-        "0x88028aeb1847a09c",
-        "1755, 521, 910, 324, 192, 132",
-        "272, 176, 32, 32, 32",
-        "0x4323d1115effb901",
-        "0x0556eab27b7313c5",
-    ):
-        assert token in policy
+    _assert_current_profile("groot_n17_pooler_ds3_register_policy")
 
     pipeline = source[
         source.index("at::Tensor rpu_qwen3vl_pooler_spm_z1_pipeline_forward("):
@@ -701,11 +545,8 @@ def test_groot_16_layer_s82_ds3_profile_and_register_policy_are_exact():
 
 def test_profile_identity_and_ingress_geometry_hash_the_live_real_length():
     source = COORDINATOR.read_text(encoding="utf-8")
-    digest = _between(
-        source,
-        "uint64_t physical_binding_digest(",
-        "GraphDdrRegisterAbi ddr_abi(",
-    )
+    from test_fmb_standalone_layout_rebuild import _definition
+    digest = _definition(source, "uint64_t physical_binding_digest(")
     assert "static_cast<uint64_t>(s.real_len)" in digest
     assert "static_cast<uint64_t>(kRealLen)" not in digest
 
@@ -725,11 +566,8 @@ def test_profile_identity_and_ingress_geometry_hash_the_live_real_length():
 
 def test_outer_fast_seals_physical_components_and_one_shot_authority():
     source = COORDINATOR.read_text(encoding="utf-8")
-    digest = _between(
-        source,
-        "uint64_t physical_binding_digest(",
-        "GraphDdrRegisterAbi ddr_abi(",
-    )
+    from test_fmb_standalone_layout_rebuild import _definition
+    digest = _definition(source, "uint64_t physical_binding_digest(")
     for token in (
         "physical_arena_base()",
         "physical_arena_end()",
@@ -831,3 +669,34 @@ def test_outer_fast_replay_exactly_rebinds_three_mutable_source_slots():
     assert locked_postflight.index(
         "physical_binding_digest(s) == physical_digest"
     ) < locked_postflight.index("commit_outer_fast_replay(")
+
+
+def test_default_text_prepare_binds_complete_descriptor_before_allocation():
+    model = MODEL.read_text(encoding="utf-8")
+    prepare = _between(model, "CausalDecoderModel::prepare_qwen3vl_pooler_z1_layout(",
+                       "SpmDense2DSpec CausalDecoderModel::qwen3vl_pooler_z1_destination_spec(")
+    default = prepare.index("if (prepared_descriptor.empty())")
+    resolve = prepare.index("encode_causal_physical_stage_descriptor(", default)
+    bind = prepare.index("layout = bind_physical_layout_context(layout, manifest)", resolve)
+    allocate = prepare.index("prepare_spm_pipeline_component(layout, stage_plan)", bind)
+    assert default < resolve < bind < allocate
+    assert "descriptor_partial_mrope == partial_mrope" in prepare
+    assert "qwen3vl_pooler_z1_selected_stage_descriptor_.assign(" in prepare
+    assert "set_chunk_size_override(" not in prepare
+    header = (ROOT / "src/fused/rpu_qwen3_model.h").read_text()
+    dispatch = _between(header, "const int64_t saved_chunk_size_override =",
+                        "// R-Phase 1 (Qwen3-VL):")
+    # COMPLETE Z1 already supplies C128 and preserves the caller's policy.
+    # Only the existing Wall/multiview paths acquire a scoped override.
+    assert "wall_z1_dispatch_ || qwen3vl_multiview_text_composite_dispatch_" in dispatch
+    assert "qwen3vl_pooler_z1_dispatch_" not in dispatch
+    assert "set_chunk_size_override(saved_chunk_size_override)" in dispatch
+
+
+def test_leased_layout_drift_fails_before_retiring_the_owner_manifest():
+    source = (ROOT / "src/core/fused_model_base.cpp").read_text()
+    ensure = _between(source, "static void ensure_allocated_impl(", "struct ChunkSizeProbe")
+    guard = ensure.index("s.pipeline_lease_epoch_ == 0 ||")
+    assert "!params_changed && !gen_changed && !persistent_invalidated" in ensure
+    assert guard < ensure.index("retire_pipeline_manifest(s)")
+    assert guard < ensure.index("SPM_ALLOC.reset_temporary()")

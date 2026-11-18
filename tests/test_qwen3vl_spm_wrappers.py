@@ -4,6 +4,7 @@ These doubles observe register/grid/queue behavior. They do not execute device
 instructions or certify arithmetic, cache coherency, or model performance.
 """
 from pathlib import Path
+from pi_wall_host_catalog import with_actual_linear_contracts
 import shutil
 import subprocess
 
@@ -145,9 +146,9 @@ int main(int argc, char** argv) {
                .replace("__SDPA_ADMISSION__", admission))
     directory = tmp_path_factory.mktemp("qwen3vl-spm-wrappers")
     source, binary = directory / "wrappers.cpp", directory / "wrappers"
-    source.write_text(program)
+    source.write_text(with_actual_linear_contracts(program))
     subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", "-fsanitize=undefined",
-                    "-fno-sanitize-recover=undefined", str(source), "-o", str(binary)],
+                    "-fno-sanitize-recover=undefined", "-I", str(ROOT / "src/core"), str(source), "-o", str(binary)],
                    check=True, capture_output=True, text=True)
     return binary
 

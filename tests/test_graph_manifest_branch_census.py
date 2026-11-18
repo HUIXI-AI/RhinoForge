@@ -86,6 +86,7 @@ void validate_shape(const Policy& policy) {
 struct Probe {
     enum class State { RECORDING, REPLAYING, PASSTHROUGH, BUILT };
     State state_=State::RECORDING;
+    bool require_single_segment_=false;
     bool kernel_register_census_active_=true, has_kernel_register_census_nodes_=false;
     bool kernel_register_census_complete_=false, kernel_register_census_poisoned_=false;
     std::optional<int> pending_kernel_register_census_;

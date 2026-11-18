@@ -5,6 +5,7 @@ import subprocess
 
 from test_siglip_cold_profile import _body
 from test_g05_vision_owner_model import _block
+from pi_wall_host_catalog import with_actual_linear_contracts
 from test_g05_q_gate_native import _with_actual_g05_site_helpers
 
 
@@ -320,7 +321,7 @@ int main() {
     // sentinel must therefore use an unsigned semantic value, not -1.
     for(const auto& r:m.routes) {
         for(auto value:r.arguments)assert(value>=0);
-        assert(r.arguments.size()==16 && r.arguments[0]==2 && r.arguments[2]==3 &&
+        assert(r.arguments.size()==16 && r.arguments[0]==3 && r.arguments[2]==3 &&
                r.arguments[10]==6291456);
     }
     for(int projection=0;projection<6;++projection) {
@@ -405,7 +406,7 @@ int main() {
  {auto x=w8;++x.layer_weights_[6].up_ws.id;assert(x.kvinsert_cost_weight_identity()!=cost);}
  {auto x=w8;x.action_gateup_resident_.back()={};assert(!x.use_action_gateup_resident(32));}
  {auto x=w8;x.action_gateup_resident_.resize(3);assert(!x.use_action_gateup_resident(32)&&x.kvinsert_cost_weight_identity()!=cost);}
- for(int i=0;i<12;++i){const auto&r=w8.routes[i];assert(r.site==QWEN35_ACTION_GATEUP_RESIDENT_W8_SITE&&r.selector==6&&r.invocation==i&&r.arguments.size()==18&&r.arguments[0]==4&&r.arguments[1]==1+i/2&&r.arguments[2]==6&&r.arguments[10]==6291456&&r.arguments[14]==i%2&&r.arguments[15]==i*524288);}
+ for(int i=0;i<12;++i){const auto&r=w8.routes[i];assert(r.site==QWEN35_ACTION_GATEUP_RESIDENT_W8_SITE&&r.selector==6&&r.invocation==i&&r.arguments.size()==18&&r.arguments[0]==6&&r.arguments[1]==1+i/2&&r.arguments[2]==6&&r.arguments[10]==6291456&&r.arguments[14]==i%2&&r.arguments[15]==i*524288);}
  for(int i=0;i<6;++i){const auto&r=w8.routes[i+12];assert(r.site==QWEN35_ACTION_GATEUP_PRELOAD_W8_SITE&&r.invocation==i&&r.arguments[1]==i+1&&r.arguments[14]==2&&r.arguments[15]==i*1048576);}
  // Every preload receipt, including member six, must validate before any DMA.
  for(int arg:{0,2,10,15}){auto x=w8;++x.routes.back().arguments[arg];reject([&]{x.preload_action_gateup_resident();});assert(dmas==0);}
@@ -428,7 +429,7 @@ int main() {
  {auto x=w8;x.layer_weights_.back().up_ws.rows=2048;x.prepare_action_gateup_resident();assert(!x.action_gateup_resident_available_&&!x.action_gateup_resident_w8_&&x.action_gateup_resident_.empty()&&packs==12);}
  // ACC16 uses the same six owners/arena and ordering, with its own tile and descriptor.
  {auto x=w8;x.linear_acc32_=false;x.prepare_action_gateup_resident();x.plan();assert(x.action_mod_body_w8_&&x.use_action_gateup_resident(32)&&x.buffers()[0].size==6291456&&x.subclass_layout_hash()!=w8_hash&&x.kvinsert_cost_weight_identity()!=cost);
-  for(const auto&r:x.routes)assert(r.arguments.size()==19&&r.arguments[0]==5&&r.arguments[11]==352&&r.arguments.back()==16);
+  for(const auto&r:x.routes)assert(r.arguments.size()==19&&r.arguments[0]==6&&r.arguments[11]==64&&r.arguments.back()==16);
   auto valid=x.routes;x.routes=w8.routes;const int before_dma=dmas;reject([&]{x.preload_action_gateup_resident();});assert(dmas==before_dma);reject([&]{x.launch_action_gateup_resident(1,0,0x40010000);});x.routes=valid;
   linear_modes.clear();for(int body=0;body<10;++body){x.body_iter=body;x.preload_action_gateup_resident();for(int layer=1;layer<=6;++layer){calls.clear();x.mlp(layer);for(int i=0;i<5;++i)assert(calls[i].kind==i+1);}}
   assert(dmas==before_dma+6&&linear_modes.size()==120&&std::none_of(linear_modes.begin(),linear_modes.end(),[](bool mode){return mode;}));
@@ -461,9 +462,9 @@ int main() {
     cpp = cpp.replace("__IDENTITY__", identity).replace("__WEIGHTS__", weights)
     cpp = cpp.replace("struct Model {", "struct Model {\n" + _precision_site_methods(source), 1)
     path, binary = tmp_path / "g05-resident.cpp", tmp_path / "g05-resident"
-    cpp = _with_actual_g05_site_helpers(cpp)
+    cpp = with_actual_linear_contracts(_with_actual_g05_site_helpers(cpp))
     path.write_text(cpp)
-    compiled = subprocess.run(["g++", "-std=c++17", "-Wall", "-Wextra", str(path), "-o", str(binary)],
+    compiled = subprocess.run(["g++", "-std=c++17", "-Wall", "-Wextra", "-I", str(Path(__file__).resolve().parents[1] / "src/ops"), "-I", str(Path(__file__).resolve().parents[1] / "src/core"), str(path), "-o", str(binary)],
                               capture_output=True, text=True, timeout=30)
     assert compiled.returncode == 0, compiled.stderr
     result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=5)
@@ -731,9 +732,9 @@ int main() {
     cpp = cpp.replace("__ALLOCATION__", allocation).replace("__MANIFEST__", manifest)
     cpp = cpp.replace("struct Model {", "struct Model {\n" + _precision_site_methods(source), 1)
     path, binary = tmp_path / "g05-mod-body.cpp", tmp_path / "g05-mod-body"
-    cpp = _with_actual_g05_site_helpers(cpp)
+    cpp = with_actual_linear_contracts(_with_actual_g05_site_helpers(cpp))
     path.write_text(cpp)
-    compiled = subprocess.run(["g++", "-std=c++17", "-Wall", "-Wextra", str(path), "-o", str(binary)],
+    compiled = subprocess.run(["g++", "-std=c++17", "-Wall", "-Wextra", "-I", str(Path(__file__).resolve().parents[1] / "src/ops"), "-I", str(Path(__file__).resolve().parents[1] / "src/core"), str(path), "-o", str(binary)],
                               capture_output=True, text=True, timeout=30)
     assert compiled.returncode == 0, compiled.stderr
     result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=5)
@@ -940,9 +941,9 @@ int main() {
     cpp = (cpp.replace("__QUERY__", query).replace("__MANIFEST__", manifest).replace("__CONSUME__", consume)
            .replace("__LIFECYCLE__", lifecycle).replace("__CONSTANTS__", constants))
     path, binary = tmp_path / "g05-cold.cpp", tmp_path / "g05-cold"
-    cpp = _with_actual_g05_site_helpers(cpp)
+    cpp = with_actual_linear_contracts(_with_actual_g05_site_helpers(cpp))
     path.write_text(cpp)
-    compiled = subprocess.run(["g++", "-std=c++17", "-Wall", "-Wextra", str(path), "-o", str(binary)],
+    compiled = subprocess.run(["g++", "-std=c++17", "-Wall", "-Wextra", "-I", str(Path(__file__).resolve().parents[1] / "src/ops"), "-I", str(Path(__file__).resolve().parents[1] / "src/core"), str(path), "-o", str(binary)],
                               capture_output=True, text=True, timeout=30)
     assert compiled.returncode == 0, compiled.stderr
     result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=5)
@@ -1378,9 +1379,9 @@ int main() {
                        ("RAW_RESIDUAL", raw_residual)):
         cpp = cpp.replace(f"__{key}__", value)
     path, binary = tmp_path / "g05-norm-shift.cpp", tmp_path / "g05-norm-shift"
-    cpp = _with_actual_g05_site_helpers(cpp)
+    cpp = with_actual_linear_contracts(_with_actual_g05_site_helpers(cpp))
     path.write_text(cpp)
-    compiled = subprocess.run(["g++", "-std=c++17", "-Wall", "-Wextra", str(path), "-o", str(binary)],
+    compiled = subprocess.run(["g++", "-std=c++17", "-Wall", "-Wextra", "-I", str(Path(__file__).resolve().parents[1] / "src/ops"), "-I", str(Path(__file__).resolve().parents[1] / "src/core"), str(path), "-o", str(binary)],
                               capture_output=True, text=True, timeout=30)
     assert compiled.returncode == 0, compiled.stderr
     result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=5)

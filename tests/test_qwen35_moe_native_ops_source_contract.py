@@ -117,18 +117,24 @@ def test_ordinary_linear_keeps_full_byte_e4m3_separate_from_packed_4bit():
 
 
 def test_grouped_mode5_uses_typed_weight_and_scale_registers():
-    grouped = read("src/ops/rpu_grouped_parallel_linear.cpp")
-    assert "only mode 1(int8), 2(fp16), or 5(fp8_e4m3)" in grouped
+    from test_qwen3vl_prefill_gateup_launcher import definition
+
+    source = read("src/ops/rpu_grouped_parallel_linear.cpp")
+    grouped = definition(source, "void launch_grouped_parallel_linear_spm(")
+    assert "only mode 1(int8), 2(fp16), or 5(fp8_e4m3)" in definition(
+        source, "int64_t resolve_weight_mode(")
     assert "GraphDdrRegisterRole::Fp8ModelWeight" in grouped
     assert "GraphDdrRegisterRole::PerChannelScale" in grouped
     assert "stage_kernel_ddr_registers(" in grouped
     assert "2, 3" in grouped
     assert "20, 21" in grouped
+    # Optional LingBot payload lookup may precede staging. All register
+    # mutation still follows typed staging, including the ordinary FP8 route.
     staged = grouped.index("stage_kernel_ddr_registers(")
-    required_kernel = grouped.index("if (!kernel) kernel = GET_KERNEL(kernel_id)", staged)
-    assert staged < required_kernel < grouped.index("register_writer.write(*kernel)", staged)
-    launcher = grouped[grouped.index("static void launch_grouped_parallel_linear_spm("):grouped.index("void rpu_launch_grouped_parallel_linear_spm_kernel(")]
-    assert "RpuGetDevAddr" not in launcher
+    lookup = grouped.index("if (!kernel) kernel = GET_KERNEL(kernel_id)", staged)
+    assert staged < lookup < grouped.index("kernel->reset_regs()", lookup)
+    assert lookup < grouped.index("register_writer.write(*kernel)", lookup)
+    assert "RpuGetDevAddr" not in grouped
 
 
 def test_routing_kernel_ids_names_declarations_and_sources_are_complete():
@@ -137,9 +143,6 @@ def test_routing_kernel_ids_names_declarations_and_sources_are_complete():
     decls = read("src/core/rpu_kernel_decls.h")
     cmake = read("src/CMakeLists.txt")
     ids_and_names = {
-        "GROUPED_PARALLEL_LINEAR_ACC16": "grouped_parallel_linear_acc16",
-        "GROUPED_PARALLEL_LINEAR_8BIT_ACC16":
-            "grouped_parallel_linear_w8a16_acc16",
         "MOE_TOPK_SCALAR_FP16": "topk_scalar_fp16",
         "MOE_TOPK_BY_KVSORT_FP16": "topk_by_kvsort_fp16",
         "MOE_BINCOUNT_SCALAR": "bincount_scalar",

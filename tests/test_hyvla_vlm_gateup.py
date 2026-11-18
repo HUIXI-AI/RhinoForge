@@ -15,7 +15,7 @@ def test_actual_launcher_owned_ddr_registers_spm_bounds_and_grid(tmp_path, profi
     launch += "\n" + block(cpp, f"void rpu_launch_hyvla_{profile}_gateup_swiglu_fp16_spm_kernel(")
     source = COMMON + r'''
 #include "ops/rpu_linear_tiling.h"
-enum class KernelId {WALL_PREFILL_GATE_UP_SWIGLU_FP16_M320N112K128};
+enum class KernelId : uint16_t {WALL_PREFILL_GATE_UP_SWIGLU_FP16_M320N112K128};
 enum class GraphDdrRegisterRole {ModelWeight};
 enum class GraphDdrRegisterAccess {Read};
 enum class GraphDdrRegisterEncoding {DevAddrShift8LoHi};
@@ -40,12 +40,12 @@ struct RpuKernelGraph {
    assert(o.abi.access==GraphDdrRegisterAccess::Read);
    assert(o.abi.encoding==GraphDdrRegisterEncoding::DevAddrShift8LoHi);
    assert(o.tensor.nbytes()==6144*2048*2);}
-  assert(v[0].abi.lo==2 && v[0].abi.hi==3 && v[1].abi.lo==24 && v[1].abi.hi==25);
+  assert(v[0].abi.lo==2 && v[0].abi.hi==3 && v[1].abi.lo==32 && v[1].abi.hi==33);
   return {v};}
 };
 struct Queue {bool broadcast=false;void set_broadcast_mode(bool b){broadcast=b;}
  void enqueu_kernel(Kernel&,std::vector<uint16_t> grid,std::vector<uint8_t> cores){
-  assert(broadcast && grid==std::vector<uint16_t>({7,1,1}));
+  assert(broadcast && grid==std::vector<uint16_t>({10,1,1}));
   assert(cores==std::vector<uint8_t>({0,1,2,3,4,5,6,7}));++queued;}
 } queue;
 #define GET_KERNEL(id) (&::kernel)
@@ -70,10 +70,10 @@ int main(){
  run(gate,up,0x20000000,0x20200000,true);
  auto pair=[&](int i){return uint32_t(kernel.regs[i])|(uint32_t(kernel.regs[i+1])<<16);};
  assert(pair(0)==0x20000000 && pair(4)==0x20200000);
- assert(pair(2)==gate.address>>8 && pair(24)==up.address>>8);
- assert(pair(8)==240 && pair(10)==768 && kernel.regs[12]==2048 && kernel.regs[13]==128);
+ assert(pair(2)==gate.address>>8 && pair(32)==up.address>>8);
+ assert(kernel.regs[8]==1 && kernel.regs[9]==240 && pair(10)==768 && kernel.regs[12]==2048 && kernel.regs[13]==128);
  assert(kernel.regs[14]==0 && kernel.regs[15]==8 && pair(16)==4096 && pair(18)==1536);
- assert(pair(20)==0 && kernel.regs[22]==1 && kernel.regs[23]==1 && pair(28)==0);
+ assert(pair(20)==0 && pair(22)==0 && pair(24)==0 && kernel.regs[26]==2 && kernel.regs[27]==2 && pair(28)==0);
  for(int rows:{0,51,239,241,320,640})run(gate,up,0x20000000,0x20200000,false,rows);
  for(auto in:{0x1fffff00u,0x20000001u,0x207fff00u})run(gate,up,in,0x20200000,false);
  for(auto out:{0x1fffff00u,0x20200001u,0x207fff00u})run(gate,up,0x20000000,out,false);
@@ -96,7 +96,7 @@ int main(){
 '''
     if profile == "expert":
         source = source.replace("hyvla_vlm_", "hyvla_expert_")
-        source = source.replace("({7,1,1})", "({3,1,1})")
+        source = source.replace("({10,1,1})", "({3,1,1})")
         source = source.replace("{0,51,239,241,320,640}", "{0,50,52,64,320,640}")
         source = source.replace("kernel.regs[13]==128", "kernel.regs[13]==64")
         replacements = {"6144":"2048", "2048":"1024", "768":"256", "240":"51",
@@ -168,7 +168,7 @@ struct Model {
 };
 int main(){
  Model m;assert(m.gateup_swiglu_enabled(240,0));
- assert(m.gateup_swiglu_arguments()==std::vector<int64_t>({1,32,31,2,240,0,2048,6144,768,8,320,112,128,7,0}));
+ assert(m.gateup_swiglu_arguments()==std::vector<int64_t>({3,32,31,2,240,0,2048,6144,768,8,320,80,128,10,0,2,32,20,34,26,27,28,29}));
  for(bool* flag:{&m.cold_gateup_swiglu_available_,&m.cold_prefill_kv_only_}){
   *flag=false;assert(!m.gateup_swiglu_enabled(240,0));*flag=true;}
  m.cold_silu_mul_=true;assert(!m.gateup_swiglu_enabled(240,0));m.cold_silu_mul_=false;
@@ -212,7 +212,7 @@ int main(){
  assert(!m.gateup_swiglu_enabled(240,0));m.cold_w8_vlm_gateup_available_=true;
  assert(!m.gateup_swiglu_enabled(240,0));m.cold_w8_optimizations_available_=true;
  assert(m.gateup_swiglu_enabled(240,0));
- assert(m.gateup_swiglu_arguments()==std::vector<int64_t>({2,32,31,2,240,0,2048,6144,768,8,320,112,128,7,0}));
+ assert(m.gateup_swiglu_arguments()==std::vector<int64_t>({4,32,31,2,240,0,2048,6144,768,8,288,80,128,10,0,2,32,20,34,26,27,28,29}));
  auto w8=manifest;w8.routes.back().arguments=m.gateup_swiglu_arguments();
  assert(admitted(w8) && !admitted(manifest));
  for(auto* tower:{&m.text_layers_,&m.moe_layers_}){
@@ -424,12 +424,12 @@ struct KernelCache {
   if(name=="hyvla_mot_paired_rmsnorm_v32")return v32_marker_exists?this:nullptr;
   if(name=="hyvla_vlm_vision_gu176_w8")return w8_marker_exists?this:nullptr;
   if(name=="hyvla_w8a16_optimizations_s240_s51")return nullptr;
-  if(name=="hyvla_vlm_gateup_swiglu_w8_s240")return w8_marker_exists?this:nullptr;
+  if(name=="hyvla_vlm_gateup_swiglu_w8_v2")return w8_marker_exists&&payload_exists?this:nullptr;
   if(name=="hyvla_mot_row_merge_s240" || name=="hyvla_mot_paired_rmsnorm_s240")return payload_exists?this:nullptr;
-  assert(name=="hyvla_vlm_gateup_swiglu_s240");
-  ++lazy_loads;marker_loaded=marker_exists;return marker_loaded?this:nullptr;}
+  assert(name=="hyvla_vlm_gateup_swiglu_fp16_v2");
+  ++lazy_loads;marker_loaded=marker_exists&&payload_exists;return marker_loaded?this:nullptr;}
  void* get_program(const std::string& name){
-  if(name=="hyvla_vlm_gateup_swiglu_s240")return marker_loaded?this:nullptr;
+  if(name=="hyvla_vlm_gateup_swiglu_fp16_v2")return marker_loaded?this:nullptr;
   assert(name=="wall_prefill_gate_up_swiglu_fp16_m320n112k128" || name=="fused_gate_up_swiglu_w8a16_m320n112k128");return payload_exists?this:nullptr;}
 };
 struct Model {
@@ -447,7 +447,7 @@ struct Model {
 int main(){
  for(bool marker:{false,true})for(bool payload:{false,true})for(bool w8_marker:{false,true})for(bool v32_marker:{false,true}){
   auto& cache=KernelCache::instance();cache={marker,payload,false,0,w8_marker,v32_marker};
-  assert(cache.get_program("hyvla_vlm_gateup_swiglu_s240")==nullptr);
+  assert(cache.get_program("hyvla_vlm_gateup_swiglu_fp16_v2")==nullptr);
   Model m;m.set_runtime_config(true,true,true,true,3,false,1);
   assert(m.cold_gateup_swiglu_available_==(marker&&payload));
   assert(m.cold_vision_gu176_available_==w8_marker);

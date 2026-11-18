@@ -211,7 +211,7 @@ TORCH_DEVICE_BACKEND_AUTOLOAD=0 python python/rpu_backend/quant/convert_qwen3_5_
   --src SOURCE_DIR --dst OUTPUT_DIR --expert-chunk 1 --threads 8
 ```
 
-[完整下载与运行命令](../examples/configs/qwen3_5/README.md#cmd-moe-mixed)
+[完整下载与运行命令](../examples/configs/WEIGHTS.md#cmd-qwen35-moe)
 默认输出到 `$RPU_MODEL_CACHE/Qwen3.5-35B-A3B-rpu-fp8-mixed`。转换需要 PyTorch、
 safetensors 和支持 `Qwen3_5MoeConfig` 的 Transformers，无需校准数据或设备运行时。
 

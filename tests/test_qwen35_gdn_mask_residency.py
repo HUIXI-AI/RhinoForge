@@ -48,6 +48,7 @@ def source_probe():
 #include <array>
 #include <cassert>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <initializer_list>
 #include <iostream>
@@ -132,11 +133,21 @@ public:
     Tensor action_input_w_,action_input_b_,action_output_b_,final_norm_w_,expert_ids_,token_ids_,gdn_tril_,gdn_strict_;
     struct Weight {Tensor input_norm_w,post_norm_w,q_norm_w,k_norm_w;};
     std::vector<Weight> layer_weights_=std::vector<Weight>(48);
+    static constexpr int kRoutedUint4Mode=6;
+    struct MoeWeight {int routed_weight_mode=5;};
+    std::vector<MoeWeight> moe_layer_weights_=std::vector<MoeWeight>(48);
     std::vector<int> layer_is_full_={1,0,0,1};
     struct Moe {int64_t num_experts=256,top_k=8,tensor_parallel=8,routed_intermediate=512,shared_intermediate=512;
         void validate(int64_t) const {}} moe_;
     Context context;
     const Context& ctx() const {return context;}
+    int64_t override_chunk=0;
+    int64_t get_chunk_size_override() const {return override_chunk;}
+    static constexpr int64_t kTextGdnInputWorkspaceSite=7200073926787961303LL;
+    bool use_text_gdn_input_workspace() const;
+    static int gdn_input_workspace_slot(const char*);
+    std::vector<int64_t> gdn_input_workspace_arguments(int64_t) const;
+    int64_t gdn_input_workspace_offset(const char*,int64_t) const;
     int num_cores() const {return cores;}
     int attn_tp() const {return cores==8?8:4;}
     int mlp_tp() const {return cores;}
@@ -171,6 +182,9 @@ public:
         declaration=definition(source, f"std::vector<BufferDecl> {cls}::declare_legacy_buffers(")
         declaration = declaration.replace("::declare_legacy_buffers(", "::declare_buffers(")
         declaration = declaration.replace("const LayoutContext& ctx) const", "const LayoutContext& ctx)")
+        declaration = declaration.replace(
+            "const LayoutContext& ctx, int64_t sdpa_workspace_bytes) const",
+            "const LayoutContext& ctx, int64_t sdpa_workspace_bytes)")
         if prefix.endswith('TEXT'):
             code += "int64_t qwen35_gdn_scalar_slots(int64_t h,int64_t n){return std::max<int64_t>(8,Align(h/n,8));}\n"
             code += "\n".join(re.findall(
@@ -188,9 +202,19 @@ public:
         start=source.index("    bool load_chunk_masks = !decode;")
         end=source.index("\n\n    // ── in_proj",start)
         schedule=source[start:end]
-        code += model_shim.replace('CLASS',cls).replace('SCHEDULE',schedule)
+        shim = model_shim.replace('CLASS',cls).replace('SCHEDULE',schedule)
+        if prefix.endswith("MOE"):
+            shim = shim.replace(
+                "declare_buffers(const LayoutContext&);",
+                "declare_buffers(const LayoutContext&, int64_t sdpa_workspace_bytes = -1);")
+        code += shim
         code += declaration+"\n"
         if prefix.endswith("TEXT"):
+            for marker in ("bool Qwen3_5Model::use_text_gdn_input_workspace(",
+                           "int Qwen3_5Model::gdn_input_workspace_slot(",
+                           "std::vector<int64_t> Qwen3_5Model::gdn_input_workspace_arguments(",
+                           "int64_t Qwen3_5Model::gdn_input_workspace_offset("):
+                code += definition(source, marker)+"\n"
             code += definition(source,f"std::vector<int64_t> {cls}::gdn_mask_schedule_arguments(")+"\n"
     code += r'''
 const BufferDecl& slot(const std::vector<BufferDecl>& rows,const char* name) {

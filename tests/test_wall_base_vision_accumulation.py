@@ -122,7 +122,7 @@ def test_actual_projection_manifest_and_accumulation_replay_identity(tmp_path):
              +block(source, 'constexpr int64_t qwen25_vision_linear_route()'))
     cpp = _source()
     cpp = cpp.replace('struct Model {', sites+'\n'+enums+'\nstruct Model {',1)
-    methods = block(source, '    std::vector<int64_t> small_image_gate_up_arguments(')+r'''
+    methods = block(source, '    std::vector<int64_t> vision_row_arguments(')+'\n'+block(source, '    std::vector<int64_t> small_image_gate_up_arguments(')+r'''
  auto projection_manifest(const ChunkInfo& chunk){
   FmbPhysicalExecutionManifest manifest;
   MODE

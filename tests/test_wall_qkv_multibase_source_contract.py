@@ -1,3 +1,5 @@
+from pi_wall_host_catalog import assert_current_catalog, CATALOG_INCLUDE
+from test_siglip_attention_dry_live_contract import _function
 """Board-free contracts for the Wall fused-QKV paths."""
 
 from pathlib import Path
@@ -5,7 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CACHE_H = (ROOT / "src/core/rpu_kernel_cache.h").read_text()
-CACHE_INC = ((ROOT / "src/core/rpu_kernel_cache.inc").read_text() + (ROOT / "src/core/rpu_kernel_cache.h").read_text())
+CACHE_INC = (ROOT / "src/core/rpu_kernel_cache.inc").read_text()
 DECLS = (ROOT / "src/core/rpu_kernel_decls.h").read_text()
 LINEAR = (ROOT / "src/ops/rpu_linear.cpp").read_text()
 KVCACHE = (ROOT / "src/ops/rpu_llama_kvcache.cpp").read_text()
@@ -23,59 +25,32 @@ ACTION_FUSED_ROPE_KERNEL_NAME = (
 
 
 def test_multibase_launcher_preserves_expansion_graph_and_multicore_contracts():
-    assert "WALL_QKV_W8A16_MULTIBASE_M448N64" in CACHE_H
-    assert "WALL_QKV_W8A16_MULTIBASE_M320X2N64" in CACHE_H
-    assert "WALL_QKV_W8A16_MULTIBASE_TILE_OWNER_M320X2N64" in CACHE_H
+    assert_current_catalog("Qkv", "QkvTileOwner")
     assert "WALL_PREFILL_OWNER_DIRECT_KV_M640" in CACHE_H
-    assert f'"{KERNEL_NAME}"' in CACHE_H
-    assert f'"{PACKED_KERNEL_NAME}"' in CACHE_H
-    assert f'"{OWNER_KERNEL_NAME}"' in CACHE_H
-    assert f'"{DIRECT_KERNEL_NAME}"' in CACHE_H
-    # Optional exact-profile symbols resolve against the two frozen library roles.
-    fallback = CACHE_INC[CACHE_INC.index("::rhino_lkn::Kernel_t* KernelCache::get_kernel("):]
-    assert "kernel_manifest_names(main_path).count(kernel_name)" in fallback
-    assert "kernel_manifest_names(expansion_path).count(kernel_name)" in fallback
-    assert "*selected_path, kernel_name" in fallback
-    assert "KERNEL_LIB_PATH_EXPANSION()" in CACHE_INC
-    assert "rpu_launch_wall_qkv_w8a16_multibase_spm_kernel(" in DECLS
-
-    start = LINEAR.index("void rpu_launch_wall_qkv_w8a16_multibase_spm_kernel(")
-    launcher = LINEAR[
-        start : LINEAR.index(
-            "void rpu_launch_wall_action_qkv_w8a16_multibase_spm_kernel(", start
-        )
-    ]
+    launcher = _function(LINEAR,"void rpu_launch_wall_qkv_w8a16_multibase_spm_kernel(")
     assert launcher.count("GraphDdrRegisterOperandSpec{") == 6
     assert launcher.count("GraphDdrRegisterRole::Int8ModelWeight") == 3
     assert launcher.count("GraphDdrRegisterRole::PerChannelScale") == 3
-    ddr_abi_order = (
-        "GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3",
-        "GraphDdrRegisterEncoding::DevAddrShift8LoHi, 20, 21",
-        "GraphDdrRegisterEncoding::DevAddrShift8LoHi, 24, 25",
-        "GraphDdrRegisterEncoding::DevAddrShift8LoHi, 26, 27",
-        "GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33",
-        "GraphDdrRegisterEncoding::DevAddrShift8LoHi, 34, 35",
-    )
-    assert [launcher.index(abi) for abi in ddr_abi_order] == sorted(
-        launcher.index(abi) for abi in ddr_abi_order
-    )
-    assert "GET_KERNEL(kernel_id)" in launcher
-    assert "kernel->reset_regs();" in launcher
-    assert "register_writer.write(*kernel);" in launcher
-    assert "queue->set_broadcast_mode(true);" in launcher
-    assert "rows == 320 || rows == 640" in launcher
-    assert "? KernelId::WALL_QKV_W8A16_MULTIBASE_TILE_OWNER_M320X2N64" in launcher
-    assert ": rows == 640 ? KernelId::WALL_QKV_W8A16_MULTIBASE_M320X2N64" in launcher
-    assert "!kv_tile_owner || rows == 640" in launcher
-    assert "queue->enqueu_kernel(*kernel, {8, 1, 1}, cores);" in launcher
+    pairs=("2, 3","20, 21","32, 33","34, 35","40, 41","42, 43")
+    positions=[launcher.index("DevAddrShift8LoHi, "+pair) for pair in pairs]
+    assert positions == sorted(positions)
+    for contract in ("Operation::QkvTileOwner", "Operation::Qkv", "!kv_tile_owner || rows == 640",
+                     "kernel->reset_regs();", "register_writer.write(*kernel);",
+                     "queue->set_broadcast_mode(true);", "{selected.grid_x, selected.grid_y, 1}"):
+        assert contract in launcher
+    for slot,base in ((36,"k_output_spm_addr"),(44,"v_output_spm_addr"),(38,"k_bias_spm_addr"),(46,"v_bias_spm_addr")):
+        assert f"set_u32({slot}, {base});" in launcher
 
 
 def test_owner_direct_kv_launcher_declares_typed_operands_and_multicore_contracts():
     start = KVCACHE.index(
         "void rpu_launch_wall_prefill_owner_direct_kv_spm_kernel("
     )
-    from test_rmsnorm_capability_publication_host import _block
-    launcher = _block(KVCACHE, "void rpu_launch_wall_prefill_owner_direct_kv_spm_kernel(")
+    launcher = KVCACHE[
+        start : KVCACHE.index(
+            "void rpu_launch_insert_kcache_spm_unified_with_plan(", start
+        )
+    ]
     assert launcher.count("GraphDdrRegisterOperandSpec{") == 4
     assert launcher.count("GraphDdrRegisterRole::KeyCache") == 1
     assert launcher.count("GraphDdrRegisterRole::ValueCache") == 1
@@ -250,7 +225,11 @@ int main() {
         assert(model.wall_small_prefill_fusion(plan,rows,0,true,false,1));
         routes.clear();launched_rows=0;model.produce(plan,rows);model.emit(plan,rows);
         assert(routes.size()==1 && launched_rows==rows);
-        assert((routes[0].args==std::vector<int64_t>{rows,2048,2048,1024,8,448,64,128,fp16?16:8}));
+        const auto selected=rpu_pi_wall::select(rpu_pi_wall::Operation::Qkv,
+            fp16?rpu_pl_tiling::WeightType::Fp16:rpu_pl_tiling::WeightType::Int8,false,rows,256,2048);
+        assert((routes[0].args==std::vector<int64_t>{rows,2048,2048,1024,8,
+            selected.tile.m_tile,selected.tile.n_tile,selected.tile.k_tile,fp16?16:8,
+            selected.grid_x,selected.grid_y,2,32,40,20,34,42,4,36,44,6,38,46}));
         routes[0].args[0]+=16;launched_rows=0;
         bool rejected=false;try { model.emit(plan,rows); } catch(const std::runtime_error&) { rejected=true; }
         assert(rejected && launched_rows==0);
@@ -299,7 +278,7 @@ int main() {
     }
 }
 '''
-    _compile_and_run(tmp_path, "wall_small_prefill_route", program)
+    _compile_and_run(tmp_path, "wall_small_prefill_route", CATALOG_INCLUDE + program)
 
 
 def test_long_prefill_actual_cold_proof_and_complete_routes(tmp_path):
@@ -332,25 +311,38 @@ def test_long_prefill_actual_cold_proof_and_complete_routes(tmp_path):
         "static_cast<int64_t>(FmbLinearRouteSelector::ROW_WEIGHT_REUSE)", "5") + ";"
     q_site = next(line for line in DECODER.splitlines()
                   if line.startswith("inline constexpr int64_t CAUSAL_DECODER_Q_SITE ="))
-    source = META + r'''
+    source = CATALOG_INCLUDE + META + r'''
 #include <tuple>
 #include <functional>
 enum class ChunkMode{SEQUENTIAL,KV_FIRST};
 enum class CausalDecoderPlanningMode{ORDINARY,WALL_Z1};
 ROUTE_ENUM
 Q_SITE_DECLARATION
-enum class KernelId{WALL_BASE_PREFILL_GATE_UP_SHARED_A_M384N48K128,
- WALL_BASE_PREFILL_GATE_UP_SHARED_SILU_M384N48K128,
- WALL_BASE_PREFILL_GATE_UP_SHARED_SILU_NOUP_M384N48K128,WALL_QKV_W8A16_MULTIBASE_M448N64};
+enum class KernelId:uint16_t{};
+KernelId pi_wall_kernel_id(std::size_t ordinal){return static_cast<KernelId>(ordinal);}
 struct KernelCache{
  bool base=true,silu=true,no_up=true,qkv=true;
  static auto& instance(){static KernelCache c;return c;}
  bool has_loaded(KernelId id)const{
-  switch(id){case KernelId::WALL_BASE_PREFILL_GATE_UP_SHARED_A_M384N48K128:return base;
-   case KernelId::WALL_BASE_PREFILL_GATE_UP_SHARED_SILU_M384N48K128:return silu;
-   case KernelId::WALL_BASE_PREFILL_GATE_UP_SHARED_SILU_NOUP_M384N48K128:return no_up;
-   case KernelId::WALL_QKV_W8A16_MULTIBASE_M448N64:return qkv;}return false;}
+  for(const auto& p:rpu_pi_wall::profiles) if(p.ordinal==static_cast<std::size_t>(id)) {
+   switch(p.operation){case rpu_pi_wall::Operation::SharedRaw:return base;
+    case rpu_pi_wall::Operation::SharedSiluUp:return silu;
+    case rpu_pi_wall::Operation::SharedSilu:return no_up;
+    case rpu_pi_wall::Operation::Qkv:return qkv;default:return false;}
+  }return false;
+ }
 };
+inline bool rpu_pi_wall_operation_loaded(rpu_pi_wall::Operation operation,
+                                         rpu_pl_tiling::WeightType weight) {
+    bool found = false;
+    for (const auto& p : rpu_pi_wall::profiles) {
+        if (p.operation != operation || p.weight != weight) continue;
+        found = true;
+        if (!KernelCache::instance().has_loaded(pi_wall_kernel_id(p.ordinal)))
+            return false;
+    }
+    return found;
+}
 struct ChunkInfo{int64_t idx,offset,len,kv_seq_len;};
 struct Stage{struct{int64_t chunk_size=0,num_chunks=0;}plan;std::vector<ChunkInfo>chunks;};
 struct FmbThreeStageChunkPlan{ChunkMode chunk_mode=ChunkMode::SEQUENTIAL;Stage input,qkv,compute;};
@@ -437,7 +429,9 @@ int main(){
   assert(valid.size()==2);const int64_t rows=p/2;
   for(int c=0;c<2;++c){const auto& r=valid[c];assert(r.family==FmbRouteFamily::LINEAR&&r.site_id==CAUSAL_DECODER_Q_SITE);
    assert(r.selector==int64_t(CausalDecoderLinearRoute::WALL_QKV_MULTIBASE)&&r.flags==0&&r.invocation==c);
-   assert((r.arguments==std::vector<int64_t>{rows,2048,2048,1024,8,448,64,128,8}));}
+   const auto selected=rpu_pi_wall::select(rpu_pi_wall::Operation::Qkv,rpu_pl_tiling::WeightType::Int8,false,rows,256,2048);
+   assert((r.arguments==std::vector<int64_t>{rows,2048,2048,1024,8,selected.tile.m_tile,
+    selected.tile.n_tile,selected.tile.k_tile,8,selected.grid_x,selected.grid_y,2,32,40,20,34,42,4,36,44,6,38,46}));}
   launches.clear();for(int c=0;c<2;++c)for(int l=0;l<36;++l)m.emit(c,l);
   assert(launches.size()==72);for(int i=0;i<72;++i)assert(launches[i].layer==i%36&&launches[i].rows==rows);
   assert(m.context.consumed_==std::vector<int>({1,1}));
@@ -531,40 +525,81 @@ int main(){
     compile_run(tmp_path, "wall_long_prefill_qkv_leaf_rows", source)
 
 
-def test_exact_action_qkv_reuses_existing_spm_buffers_and_falls_back_safely():
-    assert "WALL_ACTION_QKV_W8A16_MULTIBASE_M592N32" in CACHE_H
-    assert f'"{ACTION_KERNEL_NAME}"' in CACHE_H
-    assert f'"{ACTION_KERNEL_NAME}"' in CACHE_INC
-    assert "WALL_ACTION_QKV_PARTIAL_MROPE_W8A16_M20N64" in CACHE_H
-    assert f'"{ACTION_FUSED_ROPE_KERNEL_NAME}"' in CACHE_H
-    assert f'"{ACTION_FUSED_ROPE_KERNEL_NAME}"' in CACHE_INC
-    assert "rpu_launch_wall_action_qkv_w8a16_multibase_spm_kernel(" in DECLS
+def test_native_qkv_fixture_forwards_cold_config_to_actual_leaf(tmp_path):
+    """Connect the real conformance branches to production admission guards."""
+    from test_wall_base_nvfp4_qkv_bias import META
+    from test_wall_base_paired_kv import block, compile_run
 
-    start = LINEAR.index(
-        "void rpu_launch_wall_action_qkv_w8a16_multibase_spm_kernel("
-    )
-    launcher = LINEAR[
-        start : LINEAR.index(
-            "void rpu_launch_wall_vision_qkv_w8a16_multibase_spm_kernel(", start
-        )
-    ]
-    for exact_dim in (
-        "wall_action_fused_rows_supported(rows, sorting)",
-        "const int64_t kM = rows;",
-        "constexpr int64_t kK = 1024;",
-        "constexpr int64_t kQ = 2048;",
-        "constexpr int64_t kKv = 1024;",
-    ):
-        assert exact_dim in launcher
+    harness = (ROOT / "python/rpu_backend/tests/conformance/_cpp/"
+               "test_production_linear_launchers.cpp").read_text()
+    fp16 = block(harness, 'else if (profile == "wall_qkv_pair_fp16")')
+    w8 = block(harness, 'else if (profile == "wall_qkv_w8")')
+    dispatch = fp16.removeprefix("else ") + " " + w8
+    leaf = block(LINEAR, "void rpu_launch_wall_qkv_w8a16_multibase_spm_kernel(")
+    admission = leaf[:leaf.index("  auto check_weight =")] + "\n}\n"
+    source = META + "\n#include <iostream>\n" + admission + r'''
+void call_fixture(const std::string& profile, int64_t rows, int mode) {
+ std::vector<at::Tensor> owners(6);
+ for(auto& owner:owners) owner.dtype=profile=="wall_qkv_pair_fp16"?at::kHalf:at::kChar;
+ auto w=[&](int index)->const at::Tensor& {return owners.at(index);};
+ auto s=[](int index){return uint32_t(0x20000000+index*4096);};
+ DISPATCH
+ else throw std::runtime_error("unexpected fixture profile");
+}
+int main() {
+ struct Case {const char* name;const char* profile;int rows;int mode;};
+ const Case cases[] = {
+  {"wall_qkv_w8","wall_qkv_w8",320,0},
+  {"wall_qkv_pair_p118","wall_qkv_pair_fp16",640,1},
+  {"wall_qkv_pair_p136","wall_qkv_pair_fp16",640,0},
+  {"wall_qkv_remaining_p131","wall_qkv_pair_fp16",224,0},
+  {"wall_qkv_remaining_p132","wall_qkv_pair_fp16",256,0},
+  {"wall_qkv_remaining_p133","wall_qkv_pair_fp16",320,0},
+  {"wall_qkv_remaining_p134","wall_qkv_pair_fp16",336,0},
+  {"wall_qkv_remaining_p135","wall_qkv_pair_fp16",384,0},
+  {"wall_qkv_remaining_p138","wall_qkv_w8",224,0},
+  {"wall_qkv_remaining_p139","wall_qkv_w8",256,0},
+  {"wall_qkv_remaining_p143","wall_qkv_w8",640,0},
+ };
+ int failures=0;
+ for(const auto& c:cases) {
+  try {call_fixture(c.profile,c.rows,c.mode);}
+  catch(const std::exception& error) {
+   ++failures;std::cerr<<"rejected "<<c.name<<": "<<error.what()<<"\n";
+  }
+ }
+ std::cerr<<"accepted "<<11-failures<<"/11 fixture calls\n";
+ for(const auto* profile:{"wall_qkv_pair_fp16","wall_qkv_w8"})
+ for(int rows:{0,32,223,225,255,257,335,337,383,385,639,641}) {
+  bool rejected=false;
+  try {call_fixture(profile,rows,0);} catch(const std::exception&) {rejected=true;}
+  assert(rejected);
+ }
+ for(int rows:{224,256,320,336,384}) {
+  bool rejected=false;
+  try {call_fixture("wall_qkv_pair_fp16",rows,1);}
+  catch(const std::exception&) {rejected=true;}
+  assert(rejected);
+ }
+ assert(failures==0);
+}
+'''
+    compile_run(tmp_path, "wall_qkv_fixture_cold_config", source.replace("DISPATCH", dispatch))
+
+
+def test_exact_action_qkv_reuses_existing_spm_buffers_and_falls_back_safely():
+    assert_current_catalog("Qkv")
+    launcher=_function(LINEAR,"void rpu_launch_wall_action_qkv_w8a16_multibase_spm_kernel(")
     assert launcher.count("GraphDdrRegisterOperandSpec{") == 8
     assert launcher.count("GraphDdrRegisterRole::Int8ModelWeight") == 3
     assert launcher.count("GraphDdrRegisterRole::PerChannelScale") == 3
     assert launcher.count("GraphDdrRegisterRole::SemanticInput") == 2
-    assert "GraphDdrRegisterEncoding::DevAddrShift8LoHi, 10, 11" in launcher
-    assert "GraphDdrRegisterEncoding::DevAddrShift8LoHi, 18, 19" in launcher
-    assert "kernel->set_regs(128, static_cast<uint16_t>(0));" in launcher
-    assert "queue->set_broadcast_mode(true);" in launcher
-    assert "static_cast<uint16_t>(fuse_partial_mrope ? 8 : 16)" in launcher
+    for pair in ("2, 3","20, 21","32, 33","34, 35","40, 41","42, 43","48, 49","50, 51"):
+        assert "DevAddrShift8LoHi, "+pair in launcher
+    for guard in ("wall_action_fused_rows_supported(rows, sorting)","kK = 1024", "kQ = 2048",
+                  "kKv = 1024", "reg = 128; reg <= 255", "rpu_wall_action_qkv::grid(kernel_id)",
+                  "plain.grid_x, plain.grid_y, 1", "queue->set_broadcast_mode(true);"):
+        assert guard in launcher
 
     start = DECODER.index("void build_layer_subgraph(")
     action = DECODER[start:]

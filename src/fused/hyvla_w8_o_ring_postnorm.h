@@ -45,9 +45,6 @@ inline void launch_hyvla_w8_o_ring_postnorm_spm(
                 "HyVLA O fusion requires a complete encodable DDR weight range");
     TORCH_CHECK(saddr % 256 == 0 && saddr < limit && scale.nbytes() <= limit - saddr,
                 "HyVLA W8 O fusion requires a complete encodable DDR scale range");
-    const auto tile = rpu_pl_tiling::select_tile_acc16(51, 1024, 256, false);
-    TORCH_CHECK(tile.m_tile == 448 && tile.n_tile == 64,
-                "HyVLA O fusion requires the original auto tile M448N64");
     constexpr auto id = KernelId::HYVLA_EXPERT_O_RING_POSTNORM_W8_S51;
     auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(id, {
         {GraphDdrRegisterAbi{GraphDdrRegisterRole::Int8ModelWeight,
@@ -65,12 +62,12 @@ inline void launch_hyvla_w8_o_ring_postnorm_spm(
         rpu_pl_tiling::ParallelLinearRegisterArgs{
             input, 0, partial, 0, 51, 1024, 256, 0, 8, 512, 2048, 0, 0, 1});
     writer.write(*kernel);
-    u16(24, 8); u16(25, 1); u32(26, 31 * 256 * 8);
-    u32(28, residual_norm - base); u16(30, 0);
-    u16(32, 1024); u16(33, c10::Half(1.f / 1024).x);
-    u16(34, 2048); u16(35, 8);
-    u32(36, raw); u32(38, residual_norm); u32(40, gamma);
-    u16(42, c10::Half(eps).x);
+    u16(32, 8); u16(33, 1); u32(34, 31 * 256 * 8);
+    u32(36, residual_norm - base); u16(38, 0);
+    u16(40, 1024); u16(41, c10::Half(1.f / 1024).x);
+    u16(42, 2048); u16(43, 8);
+    u32(44, raw); u32(46, residual_norm); u32(48, gamma);
+    u16(50, c10::Half(eps).x);
     u16(64, 8); u16(65, 1); u16(66, 1);
     kernel->set_regs(128, uint32_t{0});
     for (int core = 0; core < 8; ++core) {

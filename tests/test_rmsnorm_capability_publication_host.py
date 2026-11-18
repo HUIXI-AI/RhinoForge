@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from pi_wall_host_catalog import with_actual_linear_contracts
 import shutil
 import subprocess
 
@@ -41,13 +42,14 @@ def _compile_and_run(tmp_path: Path, name: str, program: str) -> None:
         pytest.skip("requires a host C++ compiler")
     source = tmp_path / f"{name}.cpp"
     executable = tmp_path / name
-    source.write_text(program, encoding="utf-8")
+    source.write_text(with_actual_linear_contracts(program), encoding="utf-8")
     subprocess.run(
         [
             compiler,
             "-std=c++17",
             "-O2",
             "-pthread",
+            "-I", str(ROOT / "src/core"),
             str(source),
             "-o",
             str(executable),
@@ -83,7 +85,8 @@ def test_kernel_payload_availability_is_atomic_and_withdrawn_before_clear(
         "initialized_ = true;"
     )
     publication = initialize.split("payload_availability_.publish(", 1)[1].split(");", 1)[0]
-    assert "fast_cache_[static_cast<size_t>(KernelId::WALL_QKV_W8A16_MULTIBASE_M448N64)] != nullptr" in publication
+    assert "pi05_extended_payloads" in publication
+    assert "if (fast_cache_[i]) pi05_extended_payloads.set(i - extended_begin);" in initialize
 
     program = (
         r'''
@@ -111,20 +114,21 @@ int main() {
     assert(rejected);
 
     availability.publish(true, false);
-    assert(!availability.has_loaded(KernelId::WALL_QKV_W8A16_MULTIBASE_M448N64));
-    availability.publish(true, false, false, false, false, false, {},
-                         false, false, false, false, false, false, false, true);
-    assert(availability.has_loaded(KernelId::WALL_QKV_W8A16_MULTIBASE_M448N64));
+    assert(!availability.has_loaded(KernelId::PI_WALL_QKV_W8A16_ACC16_M464N64K128_256X128X128));
+    KernelPayloadAvailability::ExtendedPayloads wall;
+    wall.set(static_cast<size_t>(KernelId::PI_WALL_QKV_W8A16_ACC16_M464N64K128_256X128X128) - KernelPayloadAvailability::kExtendedBegin);
+    availability.publish(true, false, false, false, false, false, wall);
+    assert(availability.has_loaded(KernelId::PI_WALL_QKV_W8A16_ACC16_M464N64K128_256X128X128));
     assert(availability.has_loaded(KernelId::RMS_NORM_SPM_V16));
     assert(!availability.has_loaded(KernelId::RMS_NORM_SPM_V32));
     assert(!availability.has_loaded(KernelId::RMS_NORM_SPM_NEWTON_V32));
     availability.publish(true, false);
-    assert(!availability.has_loaded(KernelId::WALL_QKV_W8A16_MULTIBASE_M448N64));
+    assert(!availability.has_loaded(KernelId::PI_WALL_QKV_W8A16_ACC16_M464N64K128_256X128X128));
     assert(availability.has_loaded(KernelId::RMS_NORM_SPM_V16));
     assert(!availability.has_loaded(KernelId::RMS_NORM_SPM_V32));
     assert(!availability.has_loaded(KernelId::PI05_VISION_OWNER_REDUCE_LAYERNORM_M768N1152));
     assert(!availability.has_loaded(KernelId::PI05_VISION_XOR3_COMPACT_RESIDUAL_RAW_FULL_M768N1152));
-    assert(!availability.has_loaded(KernelId::PI05_PREFILL_GATE_UP_GEGLU_ONLINE_W8A8_P544_C272));
+    assert(!availability.has_loaded(KernelId::PI_WALL_PI_GEGLU_A8_ONLINE_I32_C272_M48N32K2048));
     availability.publish(true, false, false, true, false);
     assert(availability.has_loaded(KernelId::RMS_NORM_SPM_V16));
     assert(!availability.has_loaded(KernelId::RMS_NORM_SPM_V32));
@@ -135,37 +139,42 @@ int main() {
     assert(availability.has_loaded(KernelId::RMS_NORM_SPM_V32));
     assert(!availability.has_loaded(KernelId::PI05_VISION_OWNER_REDUCE_LAYERNORM_M768N1152));
     assert(availability.has_loaded(KernelId::PI05_VISION_XOR3_COMPACT_RESIDUAL_RAW_FULL_M768N1152));
-    assert(!availability.has_loaded(KernelId::PI05_PREFILL_GATE_UP_GEGLU_ONLINE_W8A8_P544_C272));
-    availability.publish(false, true, false, false, true, true);
-    assert(availability.has_loaded(KernelId::PI05_PREFILL_GATE_UP_GEGLU_ONLINE_W8A8_P544_C272));
+    assert(!availability.has_loaded(KernelId::PI_WALL_PI_GEGLU_A8_ONLINE_I32_C272_M48N32K2048));
+    KernelPayloadAvailability::ExtendedPayloads a8;
+    a8.set(static_cast<size_t>(KernelId::PI_WALL_PI_GEGLU_A8_ONLINE_I32_C272_M48N32K2048));
+    availability.publish(false, true, false, false, true, false, a8);
+    assert(availability.has_loaded(KernelId::PI_WALL_PI_GEGLU_A8_ONLINE_I32_C272_M48N32K2048));
     assert(availability.has_loaded(KernelId::PI05_VISION_XOR3_COMPACT_RESIDUAL_RAW_FULL_M768N1152));
     availability.publish(false, true, false, false, true, false);
-    assert(!availability.has_loaded(KernelId::PI05_PREFILL_GATE_UP_GEGLU_ONLINE_W8A8_P544_C272));
-    assert(!availability.has_loaded(KernelId::W8A16_ROW_WEIGHT_REUSE_M352N80K256));
-    availability.publish(false, false, true);
-    assert(availability.has_loaded(KernelId::W8A16_ROW_WEIGHT_REUSE_M352N80K256));
+    assert(!availability.has_loaded(KernelId::PI_WALL_PI_GEGLU_A8_ONLINE_I32_C272_M48N32K2048));
+    assert(!availability.has_loaded(KernelId::PI_WALL_WALL_ROW_REUSE_W8A16_ACC16_M208N80K256));
+    KernelPayloadAvailability::ExtendedPayloads row_reuse;
+    row_reuse.set(static_cast<size_t>(KernelId::PI_WALL_WALL_ROW_REUSE_W8A16_ACC16_M208N80K256));
+    availability.publish(false, false, false, false, false, false, row_reuse);
+    assert(availability.has_loaded(KernelId::PI_WALL_WALL_ROW_REUSE_W8A16_ACC16_M208N80K256));
     assert(!availability.has_loaded(KernelId::RMS_NORM_SPM_V16));
     assert(!availability.has_loaded(KernelId::PI05_VISION_OWNER_REDUCE_LAYERNORM_M768N1152));
     availability.publish(false, false, false, true);
-    assert(!availability.has_loaded(KernelId::W8A16_ROW_WEIGHT_REUSE_M352N80K256));
+    assert(!availability.has_loaded(KernelId::PI_WALL_WALL_ROW_REUSE_W8A16_ACC16_M208N80K256));
     assert(availability.has_loaded(KernelId::PI05_VISION_OWNER_REDUCE_LAYERNORM_M768N1152));
-    constexpr auto first = static_cast<size_t>(KernelId::PI05_DENOISE_KV1_PAIR_OWNER_FP16_M50N32X2K1024);
+    constexpr auto first = static_cast<size_t>(KernelId::PL_AUTOTILE_BEGIN);
+    constexpr auto base = KernelPayloadAvailability::kExtendedBegin;
     constexpr auto last = static_cast<size_t>(KernelId::_COUNT) - 1;
     static_assert(last > 255, "exercise IDs beyond the old uint8 boundary");
     KernelPayloadAvailability::ExtendedPayloads payloads;
     static_assert(last - first >= 64, "exercise capability publication beyond one word");
-    payloads.set(last - first);
+    payloads.set(last - base);
     availability.publish(false, false, false, false, false, false, payloads);
     assert(availability.has_loaded(static_cast<KernelId>(last)));
     assert(!availability.has_loaded(static_cast<KernelId>(first)));
-    payloads.reset();payloads.set(0);
+    payloads.reset();payloads.set(first - base);
     availability.publish(false, false, false, false, false, false, payloads);
     assert(!availability.has_loaded(static_cast<KernelId>(last)));
     assert(availability.has_loaded(static_cast<KernelId>(first)));
     for (size_t bit : {size_t{63}, size_t{64}, last - first}) {
-        payloads.reset();payloads.set(bit);
+        payloads.reset();payloads.set(first + bit - base);
         availability.publish(false, false, false, false, false, false, payloads);
-        for (size_t other = 0; other < payloads.size(); ++other)
+        for (size_t other = 0; other <= last - first; ++other)
             assert(availability.has_loaded(static_cast<KernelId>(first + other)) == (other == bit));
     }
     rejected = false;
@@ -189,11 +198,11 @@ int main() {
                 try {
                     (void)availability.has_loaded(KernelId::RMS_NORM_SPM_V16);
                     (void)availability.has_loaded(KernelId::RMS_NORM_SPM_V32);
-                    (void)availability.has_loaded(KernelId::W8A16_ROW_WEIGHT_REUSE_M352N80K256);
-                    (void)availability.has_loaded(KernelId::WALL_QKV_W8A16_MULTIBASE_M448N64);
+                    (void)availability.has_loaded(KernelId::PI_WALL_WALL_ROW_REUSE_W8A16_ACC16_M208N80K256);
+                    (void)availability.has_loaded(KernelId::PI_WALL_QKV_W8A16_ACC16_M464N64K128_256X128X128);
                     (void)availability.has_loaded(KernelId::PI05_VISION_OWNER_REDUCE_LAYERNORM_M768N1152);
                     (void)availability.has_loaded(KernelId::PI05_VISION_XOR3_COMPACT_RESIDUAL_RAW_FULL_M768N1152);
-                    (void)availability.has_loaded(KernelId::PI05_PREFILL_GATE_UP_GEGLU_ONLINE_W8A8_P544_C272);
+                    (void)availability.has_loaded(KernelId::PI_WALL_PI_GEGLU_A8_ONLINE_I32_C272_M48N32K2048);
                     (void)availability.has_loaded(static_cast<KernelId>(first + 63));
                     (void)availability.has_loaded(static_cast<KernelId>(first + 64));
                     (void)availability.has_loaded(static_cast<KernelId>(last));
@@ -210,13 +219,12 @@ int main() {
         for (int i = 0; i < 100000; ++i) {
             availability.withdraw();
             KernelPayloadAvailability::ExtendedPayloads current;
-            current.set((i & 1) ? 63 : 64);
-            current.set(last - first, (i & 2) != 0);
+            current.set(first + ((i & 1) ? 63 : 64) - base);
+            current.set(static_cast<size_t>(KernelId::PI_WALL_QKV_W8A16_ACC16_M464N64K128_256X128X128) - base, (i & 64) != 0);
+            current.set(last - base, (i & 2) != 0);
             availability.publish((i & 1) != 0, (i & 2) != 0,
                                  (i & 4) != 0, (i & 8) != 0, (i & 16) != 0,
-                                 (i & 32) != 0, current,
-                                 false, false, false, false, false, false, false,
-                                 (i & 64) != 0);
+                                 (i & 32) != 0, current);
         }
         done.store(true, std::memory_order_release);
     });
@@ -230,12 +238,12 @@ int main() {
     try { (void)availability.has_loaded(KernelId::RMS_NORM_SPM_V32); }
     catch (const std::runtime_error&) { rejected = true; }
     assert(rejected);
-    for (auto id : {KernelId::W8A16_ROW_WEIGHT_REUSE_M352N80K256,
-                    KernelId::WALL_QKV_W8A16_MULTIBASE_M448N64,
+    for (auto id : {KernelId::PI_WALL_WALL_ROW_REUSE_W8A16_ACC16_M208N80K256,
+                    KernelId::PI_WALL_QKV_W8A16_ACC16_M464N64K128_256X128X128,
                     KernelId::PI05_VISION_OWNER_REDUCE_LAYERNORM_M768N1152,
                     KernelId::PI05_VISION_XOR3_COMPACT_RESIDUAL_RAW_FULL_M768N1152,
-                    KernelId::PI05_PREFILL_GATE_UP_GEGLU_ONLINE_W8A8_P544_C272,
-                    KernelId::PI05_PREFILL_GATE_UP_GEGLU_W8A8_SPLIT_C272_M48N32K2048}) {
+                    KernelId::PI_WALL_PI_GEGLU_A8_ONLINE_I32_C272_M48N32K2048,
+                    KernelId::PI_WALL_PI_GEGLU_A8_PAIRED_I32_C272_M48N32K2048}) {
         rejected = false;
         try { (void)availability.has_loaded(id); }
         catch (const std::runtime_error&) { rejected = true; }

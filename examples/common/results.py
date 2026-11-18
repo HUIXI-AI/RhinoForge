@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import statistics
 import sys
+import time
 
 
 def latency_timing(values, boundary, *, metric="total_latency", statistic="median"):
@@ -30,9 +31,94 @@ def phase_timings(rows, boundary, *, statistic="median", phase_boundary=None, me
         metric=metric_prefix + key.removesuffix("_ms") + "_latency", statistic=statistic)]
 
 
+def stage_phase_timings(rows, boundary, **options):
+    """phase_timings of the stages observed in every run; a stage missing from one run is unmeasured."""
+    rows = list(rows)
+    stages = [key for key in rows[0] if all(key in row for row in rows)] if rows else []
+    return phase_timings([{key: row[key] for key in stages} for row in rows], boundary,
+                         **options) if stages else []
+
+
+def available_stage_boundaries(boundaries):
+    """Declared (stage, owner, method) calls split into those present and labels of absent ones.
+
+    Stage timing is diagnostic: an owner without the method leaves that stage
+    unmeasured instead of failing the run.
+    """
+    available, missing = [], []
+    for stage, owner, name in boundaries:
+        if callable(getattr(owner, name, None)):
+            available.append((stage, owner, name))
+        else:
+            missing.append(f"{stage}: {name}")
+    return tuple(available), missing
+
+
+@contextmanager
+def stage_timings(boundaries):
+    """Host wall time of named stage calls, yielded as {"<stage>_ms": total}.
+
+    ``boundaries`` holds ``(stage, owner, method_name)``. Calls of one stage
+    accumulate; a call nested inside the same stage counts once. The caller
+    clears the dict between requests. Originals are restored on exit.
+    """
+    phases, active, restore = {}, set(), []
+    try:
+        for stage, owner, name in boundaries:
+            original = getattr(owner, name, None)
+            if not callable(original):
+                label = owner.__name__ if isinstance(owner, type) else type(owner).__name__
+                raise TypeError(f"stage {stage}: {label}.{name} is missing or not callable")
+            local = name in vars(owner)
+
+            def timed(*args, _fn=original, _key=stage + "_ms", **kwargs):
+                if _key in active:
+                    return _fn(*args, **kwargs)
+                active.add(_key)
+                start = time.perf_counter()
+                try:
+                    return _fn(*args, **kwargs)
+                finally:
+                    active.discard(_key)
+                    phases[_key] = phases.get(_key, 0.0) + (time.perf_counter() - start) * 1000
+            setattr(owner, name, timed)
+            restore.append((owner, name, original, local))
+        yield phases
+    finally:
+        for owner, name, original, local in reversed(restore):
+            if local:
+                setattr(owner, name, original)
+            else:
+                delattr(owner, name)
+
+
+def _reference_status(report, completed, reference_keys, reference_mode):
+    """Measured CPU/saved comparisons; with reference=off, exactly the old fields."""
+    compared = [key for key in reference_keys
+                if isinstance(report.get(key), dict) and report[key].get("metrics")]
+    status = {"status": "MEASURED" if compared else "NOT_RUN", "report_fields": compared}
+    if reference_mode in (None, "off"):
+        return status
+    status["mode"] = reference_mode
+    if compared:
+        return status
+    skipped = next((report[key] for key in reference_keys if isinstance(report.get(key), dict)
+                    and report[key].get("status") == "SKIPPED"), None)
+    if skipped is not None:
+        status.update(status="SKIPPED", reason=skipped.get("reason"))
+    else:
+        status["reason"] = "CPU reference comparison is not configured" if completed else "execution did not complete"
+    return status
+
+
 def add_result_fields(report, output_dir, *, completed, timing=(),
-                      runtime_checks=(), reference_keys=(), output_names=()):
-    """Add discoverable output/timing fields; measured errors are not a pass."""
+                      runtime_checks=(), reference_keys=(), output_names=(), reference_mode=None):
+    """Add discoverable output/timing fields; measured errors are not a pass.
+
+    ``reference_mode`` is the requested [run].reference. Omitted or "off"
+    keeps the historical reference fields; otherwise an absent comparison
+    records NOT_RUN or SKIPPED with its reason.
+    """
     report["result_schema_version"] = 1
     report["execution"] = {"status": "COMPLETED" if completed else "FAILED"}
     for key in ("error", "cleanup_error"):
@@ -57,14 +143,11 @@ def add_result_fields(report, output_dir, *, completed, timing=(),
     artifacts["hwperf_directory"] = (
         str(directory / "hwperf") if completed and directory is not None
         and requested_hwperf and (directory / "hwperf").is_dir() else None)
-    compared = [key for key in reference_keys
-                if isinstance(report.get(key), dict) and report[key].get("metrics")]
     report["validation"] = {
         "runtime": {"status": "CHECKED" if completed and runtime_checks else
                                "NOT_COMPLETED" if not completed else "NOT_EVALUATED",
                     "checks": list(runtime_checks) if completed else []},
-        "reference": {"status": "MEASURED" if compared else "NOT_RUN",
-                      "report_fields": compared},
+        "reference": _reference_status(report, completed, reference_keys, reference_mode),
         "task": {"status": "NOT_EVALUATED"},
     }
     report["timing"] = list(timing)
@@ -108,7 +191,8 @@ def write_report(report, output_dir, **json_options):
 
 
 @contextmanager
-def record_result(report, output_dir, *, timing, runtime_checks=(), reference_keys=(), output_names=()):
+def record_result(report, output_dir, *, timing, runtime_checks=(), reference_keys=(), output_names=(),
+                  reference_mode=None):
     """Persist success and failure from the existing execution block."""
     primary = None
     try:
@@ -121,7 +205,8 @@ def record_result(report, output_dir, *, timing, runtime_checks=(), reference_ke
         try:
             add_result_fields(report, output_dir, completed=primary is None,
                               timing=timing(), runtime_checks=runtime_checks,
-                              reference_keys=reference_keys, output_names=output_names)
+                              reference_keys=reference_keys, output_names=output_names,
+                              reference_mode=reference_mode)
             if primary is None:
                 report.setdefault("status", "completed")
             if output_dir is not None:

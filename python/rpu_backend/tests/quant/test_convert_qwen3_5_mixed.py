@@ -40,10 +40,12 @@ def test_mixed_converter_emits_declared_tensor_formats(tmp_path):
     torch.manual_seed(0)
     src, dst = tmp_path / "fp16", tmp_path / "mixed"
     is_full = _mini_checkpoint(src)
+    (src / "SHA256SUMS").write_text("source checkpoint checksum\n")
 
     stats = convert.convert_checkpoint(
         src, dst, profile="w4_main_w8_gdn"
     )
+    assert not (dst / "SHA256SUMS").exists()
 
     with (dst / "config.json").open() as f:
         quant_config = json.load(f)["quant_config"]

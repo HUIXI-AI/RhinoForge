@@ -69,6 +69,16 @@ class Pi05Policy:
             "Pi05Policy.from_pretrained(...) or Pi05Policy.from_lerobot_policy(...)."
         )
 
+    @staticmethod
+    def graph_arena_count(language_token_counts: int = 1) -> int:
+        """Cold SDK Graph arenas for ``prepare_graphs`` with this many valid language counts.
+
+        A policy that prepares more than one count must be loaded with
+        ``graph_runtime_policy=GraphRuntimePolicy.from_environment(graph_arena_count=...)``.
+        """
+        from rpu_backend.adapters.pi05 import graph_arena_count
+        return graph_arena_count(language_token_counts)
+
     @classmethod
     def from_pretrained(
         cls,
@@ -238,8 +248,14 @@ class Pi05Policy:
         num_steps: "int | None" = None,
         precompute_adarms: bool = False,
         noise: torch.Tensor | None = None,
+        language_token_counts=None,
     ) -> dict:
-        """Prebuild one finite Pi0.5 signature, freeze it, and verify READY."""
+        """Prebuild the finite Pi0.5 signatures, freeze them, and verify READY.
+
+        ``language_token_counts`` optionally lists every valid language-token
+        count the READY policy serves (one denoise Graph each); it must contain
+        the batch's own count. A request with another count is refused.
+        """
         if not getattr(self, "_rpu_ready", False):
             from rpu_backend.api.errors import RPUBackendError
             raise RPUBackendError(
@@ -261,6 +277,8 @@ class Pi05Policy:
         return self._adapter.prepare_graphs(
             batch, num_steps=num_steps, precompute_adarms=precompute_adarms,
             **({"noise": noise} if noise is not None else {}),
+            **({"language_token_counts": language_token_counts}
+               if language_token_counts is not None else {}),
         )
 
     @torch.no_grad()

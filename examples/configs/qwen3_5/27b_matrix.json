@@ -1,0 +1,114 @@
+{
+  "schema_version": 2,
+  "description": "Qwen3.5-27B configuration index. It records public TOML and profile bindings only; runtime results are not distributed.",
+  "configs": [
+    {
+      "id": "text_fp16",
+      "config": "examples/configs/qwen3_5/text/27b/fp16.toml",
+      "profile_id": "qwen3_5-27b.fp16.text-controlled",
+      "component": "text",
+      "precision": "fp16",
+      "allowed_num_cores": [
+        4,
+        6,
+        8
+      ]
+    },
+    {
+      "id": "text_w4a16_mlp_activation_awq_g128",
+      "config": "examples/configs/qwen3_5/text/27b/w4a16_mlp_activation_awq_g128.toml",
+      "profile_id": "qwen3_5-27b.activation-awq-g128.text-controlled",
+      "component": "text",
+      "precision": "w4a16",
+      "allowed_num_cores": [
+        4,
+        6,
+        8
+      ]
+    },
+    {
+      "id": "text_w4a16_mlp_rtn_g32",
+      "config": "examples/configs/qwen3_5/text/27b/w4a16_mlp_rtn_g32.toml",
+      "profile_id": "qwen3_5-27b.w4-mlp-only-g32.text-controlled",
+      "component": "text",
+      "precision": "w4a16",
+      "allowed_num_cores": [
+        4,
+        6,
+        8
+      ]
+    },
+    {
+      "id": "text_w4a16_mlp_rtn_g32_attn_gdn_w8a16",
+      "config": "examples/configs/qwen3_5/text/27b/w4a16_mlp_rtn_g32_attn_gdn_w8a16.toml",
+      "profile_id": "qwen3_5-27b.w4-mlp-w8-attn-gdn-g32.text-controlled",
+      "component": "text",
+      "precision": "w4a16",
+      "allowed_num_cores": [
+        4,
+        6,
+        8
+      ]
+    },
+    {
+      "id": "text_w4a16_text_rtn_g32",
+      "config": "examples/configs/qwen3_5/text/27b/w4a16_text_rtn_g32.toml",
+      "profile_id": "qwen3_5-27b.w4a16.text-controlled",
+      "component": "text",
+      "precision": "w4a16",
+      "allowed_num_cores": [
+        4,
+        6,
+        8
+      ]
+    },
+    {
+      "id": "text_w8a16_text",
+      "config": "examples/configs/qwen3_5/text/27b/w8a16_text.toml",
+      "profile_id": "qwen3_5-27b.w8a16.text-controlled",
+      "component": "text",
+      "precision": "w8a16",
+      "allowed_num_cores": [
+        4,
+        6,
+        8
+      ]
+    },
+    {
+      "id": "vl_fp16",
+      "config": "examples/configs/qwen3_5/vl/27b/fp16.toml",
+      "profile_id": "qwen3_5-27b.fp16.vision-controlled",
+      "component": "vl",
+      "precision": "fp16",
+      "allowed_num_cores": [
+        4,
+        6,
+        8
+      ]
+    },
+    {
+      "id": "vl_w4a16_text_rtn_g32",
+      "config": "examples/configs/qwen3_5/vl/27b/w4a16_text_rtn_g32.toml",
+      "profile_id": "qwen3_5-27b.w4a16.vision-controlled",
+      "component": "vl",
+      "precision": "w4a16",
+      "allowed_num_cores": [
+        4,
+        6,
+        8
+      ]
+    },
+    {
+      "id": "vl_w8a16_text",
+      "config": "examples/configs/qwen3_5/vl/27b/w8a16_text.toml",
+      "profile_id": "qwen3_5-27b.w8a16.vision-controlled",
+      "component": "vl",
+      "precision": "w8a16",
+      "allowed_num_cores": [
+        4,
+        6,
+        8
+      ]
+    }
+  ]
+}

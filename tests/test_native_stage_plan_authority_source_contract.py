@@ -58,14 +58,26 @@ def test_qwen35_fixed_decode_reuses_one_complete_descriptor_across_positions(
     )
     # The graph signature uses the full physical digest, while the native
     # consumer must still receive the complete descriptor selected above.
-    assert "*decode_plan_result.graph_key_words()" in adapter
+    tree = ast.parse(adapter)
+    functions = {node.name: node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+    assert "*plan.graph_key_words()" in ast.unparse(functions["_qwen3_5_decode_signature"])
+    assert "graph_cache.capture(_qwen3_5_decode_signature(st, decode_plan_result))" in adapter
     forwards = [
-        node for node in ast.walk(ast.parse(adapter))
+        node for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and ast.unparse(node.func) == "torch.ops.rpu.qwen3_5_forward"
     ]
     assert len(forwards) == 1
     assert ast.unparse(forwards[0].args[-1]) == "planned_stage_descriptor"
+    # The prepared later-step closure reuses the same plan's signature and
+    # complete descriptor; neither depends on the position.
+    step = ast.unparse(functions["_qwen3_5_decode_step"])
+    assert "signature = _qwen3_5_decode_signature(st, plan)" in step
+    assert "descriptor = plan.selected.stage_tuple.physical_descriptor" in step
+    assert "forward = torch.ops.rpu.qwen3_5_forward" in step
+    step_calls = [node for node in ast.walk(functions["_qwen3_5_decode_step"])
+                  if isinstance(node, ast.Call) and ast.unparse(node.func) == "forward"]
+    assert len(step_calls) == 1 and ast.unparse(step_calls[0].args[-1]) == "descriptor"
     assert "prefill_plan_result.graph_mode" in adapter
     assert "if is_prefill else GRAPH_RETAINED_CACHE" in adapter
     assert "qwen3_5_set_retained_prefill_graph(handle, True)" in g05
@@ -249,7 +261,7 @@ def test_extracted_complete_manifest_immediate_and_graph_authority(tmp_path):
     context = header[start:header.index("\n};", start)].replace("private:\n    friend class FusedModelBase;", "")
     start = base.index("    const FmbPhysicalExecutionManifest unspecified_physical_manifest{};")
     entry = base[start:base.index("    // Deep fast-replay", start)]
-    # The receipt is emitted after dynamic_config(), which may read an device mask
+    # The receipt is emitted after dynamic_config(), which may read an RPU mask
     # through a host view. Include that real second part of the entry flow;
     # stopping at Deep fast-replay would only exercise the deferred-branch flag.
     start = base.index("    auto dyn_cfg = dynamic_config(plan);", start)

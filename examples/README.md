@@ -1,49 +1,43 @@
 # 模型示例
 
+从[模型目录](configs/README.md)选择模型和 TOML，准备对应权重与输入，再运行 `examples/run.py`。命令从仓库根目录执行；环境需已安装后端、模型依赖及[运行库](../docs/runtime_assets.zh.md)。
+
+本页说明配置与运行，不列性能或数值误差测量结果；维护位置见文档分工。
+
 <a id="model-examples"></a>
 <a id="choose-a-model"></a>
 
-从[模型目录](configs/README.md)选择模型，再按模型页的三个部分操作：**配置说明 → 准备与运行 → 结果说明**。配置表同时给出 TOML 入口和对应的权重获取步骤。
-
-| 要做什么 | 查看哪里 |
+| 需要了解的内容 | 查看位置 |
 |---|---|
-| 选择模型、版本和配置 | [模型目录](configs/README.md)、[公开 TOML 索引](configs/CONFIGURATIONS.md) |
-| 理解权重来源、量化与加载的关系 | [权重准备](configs/WEIGHTS.md)；具体下载和转换命令在模型页 |
-| 填写输入、线程、核数和采样参数 | 模型页“准备与运行”、[通用参数](configs/PARAMETERS.md) |
-| 理解文件名和定位原记录中的配置 | [命名规则](configs/NAMING.md)、[路径对照](configs/config_names.json) |
-| 查看日志与输出 | 模型页“结果说明”、[日志与结果](RESULTS.md) |
-| 查看登记范围和运行库要求 | [支持矩阵](../docs/model_support.zh.md)、[运行库准备](../docs/runtime_assets.md) |
+| 模型、变体和配置入口 | [配置总览](configs/README.md) |
+| 4/6/8 核支持与验证状态 | [核数支持矩阵](../docs/planner_core_topology.zh.md) |
+| 权重目录和准备步骤 | [权重准备](configs/WEIGHTS.md) |
+| 输入、运行和输出参数 | [通用参数](configs/PARAMETERS.md)、对应模型页 |
+| 文件名和路径规则 | [命名规则](configs/NAMING.md) |
 
 <a id="run"></a>
+<a id="运行一个配置"></a>
 
-## 运行一个配置
+## 准备并运行
 
-在已安装后端和模型依赖的环境中，从仓库根目录执行。先按模型页准备权重和输入，再复制所选模板：
+1. 在模型页确认任务、输入规格、精度配方和 4/6/8 核支持情况。每个模型页的“全部配置与输入范围”列出该模型的全部 TOML 路径。
+2. 复制所选 TOML，按[权重准备](configs/WEIGHTS.md)定位资产，填写输入路径和输出目录。`registry_alias` 指向本地缓存中的目录，不会自动下载权重。
+3. 先检查配置，再运行模型。以下以 Qwen3 4B FP16 为例：
 
 ```bash
-cp examples/configs/pi05/3cam/fp16.toml /tmp/pi05.toml
-# 按模型页填写配套权重、输入和 run.output_dir。
-vi /tmp/pi05.toml
-python examples/run.py --config /tmp/pi05.toml --check-config
-python examples/run.py --config /tmp/pi05.toml
+python examples/run.py --config examples/configs/qwen3/text/4b/fp16.toml --check-config
+python examples/run.py --config examples/configs/qwen3/text/4b/fp16.toml
 ```
 
-`--check-config` 检查配置结构及登记关系，无需加载 Torch/设备。最后一条命令执行模型加载和推理。RhinoVLA 的 `controlled/` 配置使用模型页给出的独立验证入口。[RhinoVLA v3 RTC](configs/rhinovla/v3/README.md#rtc) 提供与五档 FP16/W8 配方对应的模板；九份独立配置通过 `--rtc --delay 6` 启用 RTC，delay 可选 `0..6`。
+`--check-config` 成功时显示 `configuration OK`，表示字段和登记关系通过检查；权重文件、输入张量与设备环境还需在实际运行时检查。输入、权重、核数或累加选项发生变化后，重新检查并启动新进程。
 
-<a id="logging-and-output"></a>
-<a id="日志与输出"></a>
-<a id="logging-and-performance-output"></a>
-<a id="日志与性能输出"></a>
-<a id="日志等级对照"></a>
-<a id="模型与性能摘要"></a>
 <a id="results"></a>
+<a id="logging-and-performance-output"></a>
 
-## 查看输出
+## 查看结果
 
-默认终端显示 `[MODEL]` 配置摘要、`[PERF]` 本次运行摘要和错误信息。需要加载过程或生成文本时，在 TOML 中设置 `[logging].level="INFO"`。完整字段、日志文件和结果解读见[日志与结果](RESULTS.md)。
+终端默认显示模型与性能摘要，结果文件写入 `run.output_dir`。先核对实际输入、输出形状及运行次数，再比较耗时；日志设置和计时字段见[结果说明](RESULTS.md)，已保存的测量见性能报告。
 
 <a id="已归档示例"></a>
 
-LingBot [exact-Z2](configs/lingbot/legacy/exact_z2/README.md)、各模型的 `legacy/` 和 RhinoVLA 独立验证配置，使用各自页面列出的资产和输入。它们也列在[公开配置索引](configs/CONFIGURATIONS.md)中。
-
-版本升级见[升级指南](../docs/upgrading_1_2.zh.md)；语音 API 见[Qwen3 ASR/TTS](../docs/qwen3_audio.zh.md)。
+受控配置使用各自页面列出的资产和输入；其中 RhinoVLA `controlled/` 是带固定开关组合的 v3 源码入口。归档目录用于复现历史配置，支持范围以各模型页配置表中的支持状态为准。

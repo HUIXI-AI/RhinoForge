@@ -18,6 +18,8 @@ def runtime(monkeypatch):
         cache = _cache()
         cache._runtime_policy = kwargs.get("runtime_policy", policy)
         cache._impl.cache_invariant_ok = lambda: True
+        if "max_entries" in kwargs:
+            cache._impl.max_entries = lambda: kwargs["max_entries"]
         caches.append(cache)
         return cache
     monkeypatch.setattr(rpu_backend.graph, "GraphCache", graph_cache)
@@ -837,7 +839,6 @@ def _cold_9b_owner(monkeypatch, *, precision="fp16", cores=8, vision=False):
     model.model.language_model = torch.nn.Module()
     model.model.language_model.config = model.config.text_config
     if precision != "fp16":
-        monkeypatch.setenv("QWEN3_5_QUANT_ALLOW_UNCERTIFIED", "1")
         model.config.quant_config = {"method": precision}
         if precision == "w4a16_pgrp":
             model.config.quant_config["group_size"] = 32
@@ -954,8 +955,6 @@ def test_9b_retained_failure_precedes_native_rope_or_valid_len(runtime, monkeypa
         f.run(129, execution=192)
     assert f.events == before and f.kv.position == 0
     assert f.state.prefill_graph_cache.size() == 1
-
-
 
 
 @pytest.mark.parametrize("family", ["dense", "moe"])
@@ -1199,6 +1198,7 @@ def test_moe_private_initial_prefill_failure_keeps_mutable_setters_and_graph_unt
     """Actual public/preflight/planner path; retirement/device/native are boundaries."""
     from rpu_backend.adapters import qwen3_5_moe as moe
     from rpu_backend.adapters.qwen3_5 import cores
+    from rpu_backend.adapters.qwen3_5_moe import cores as moe_cores
     from rpu_backend.adapters.qwen3_5_moe import text as moe_text
     from rpu_backend.api._execution import prepared_execution_plan_cache
 
@@ -1207,10 +1207,11 @@ def test_moe_private_initial_prefill_failure_keeps_mutable_setters_and_graph_unt
     c.cache.position = int(fault == "continuation")
     initial_position = c.cache.position
     c.state.last_a6_plan = None
-    c.state.execution_topology = cores.core_topology()
+    c.state.execution_topology = moe_cores.core_topology()
     c.state.max_seq_len, c.state.chunk_envelope = 128, (128, 64)
     c.state.padding_budget, c.state.padding_rows, c.state.exact_chunk_size = 64, "auto", None
     c.cache.execution_topology = cores.topology_tuple(c.state.execution_topology)
+    c.cache.moe_execution_topology = moe_cores.full_topology_tuple(c.state.execution_topology)
     c.cache.max_seq_len = 6 if fault == "capacity" else 128
     c.cache.allocated_max_seq_len = 191
     # Lifecycle ownership is a hardware-installation boundary. Execute the real
@@ -1288,7 +1289,7 @@ def test_moe_private_initial_prefill_failure_keeps_mutable_setters_and_graph_unt
 ])
 def test_private_initial_prefill_public_fallback_preserves_current_payload(
         runtime, monkeypatch, family, route):
-    """Whole public fallback with real CPU embedding/cat; device labels are doubles."""
+    """Whole public fallback with real CPU embedding/cat; RPU labels are doubles."""
     import weakref
     from contextlib import contextmanager
     from rpu_backend.adapters import qwen3_5 as dense, qwen3_5_moe as moe
@@ -1380,7 +1381,7 @@ def test_private_initial_prefill_public_fallback_preserves_current_payload(
     def public_embedding(ids, weight, *args, **kwargs):
         public_inputs.append(ids.clone())
         # Model the existing public embedding dispatch: real ATen CPU gather
-        # then its ordinary full device publication before mandatory mixed cat.
+        # then its ordinary full RPU publication before mandatory mixed cat.
         return c.cpu_embedding(ids.as_subclass(torch.Tensor), weight, *args, **kwargs).to("rpu")
 
     monkeypatch.setattr(torch.nn.functional, "embedding", public_embedding)

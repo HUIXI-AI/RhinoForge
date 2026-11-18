@@ -1,13 +1,23 @@
 # V3 RTC: same precision and optimizations as w8a16_action.toml.
 # factory.json must set rtc=true; request.pt supplies action_prefix and delay=0..6.
-[example]
+# 未写出的执行参数（省略即按以下值运行）：
+#   [cpu].threads 省略时不设置线程：PyTorch 使用环境变量 OMP_NUM_THREADS，未设置时使用全部 CPU 核（参考板 24）；2026-10-19 测量环境预设为 16。
+#   rpu_execution.model.num_cores 固定 8 核（可显式写 8；4/6 核不支持，原因见模型页配置表）。
+# V3 调用者 factory 模板：action expert 七投影为 W8A16。
+# 本配方不对 vision/language 模型和动作 IO 使用 W8。
+[model]
 profile_id = "rhinovla.v3.rtc.w8a16.expert.trusted-factory"
 registry_alias = "rhinovla-controlled"
 target = "rhinovla"
-dtype = "w8a16"
+precision = "w8a16"
+# 替换为匹配本模型与量化配方的本地资产路径或既有权重别名。
+checkpoint = "/path/to/rhinovla-v3/checkpoint"
+# 调用者可信 module:callable；实际 request 格式由该 factory 定义。
+runtime_factory = "rpu_backend.adapters.rhinovla.factory:v3_runtime_factory"
+factory_config = "/path/to/rhinovla-v3/rtc_factory.json"
 
-[example.opt_in]
-RPU_RHINOVLA_VISION_BATCH_VIEWS = "0"
+[model.opt_in]
+RPU_RHINOVLA_VISION_BATCH_VIEWS = "1"
 RPU_RHINOVLA_VISION_PREP_CACHE = "1"
 RPU_RHINOVLA_DENOISE_STATIC_CONTEXT_CACHE = "1"
 RPU_RHINOVLA_PRECOMPUTE_ADARMS = "1"
@@ -22,44 +32,67 @@ RPU_RHINOVLA_PACKED_QKV = "0"
 RPU_RHINOVLA_SKIP_ADARMS_GEMV = "0"
 
 [input]
-checkpoint = "/path/to/rhinovla-v3/checkpoint"
-runtime_factory = "rpu_backend.adapters.rhinovla.factory:v3_runtime_factory"
+# 替换为匹配下列输入形状的文件；固定 fixture 须保留其身份与格式。
 request = "/path/to/rhinovla-v3/rtc_request.pt"
-factory_config = "/path/to/rhinovla-v3/rtc_factory.json"
+# 此入口要求显式 true，仅加载调用者信任的模型代码。
 trust_model_code = true
+# 当前模型路径的固定去噪步数，不作为任意可调范围。
 num_steps = 10
 expert_w8a16 = true
 full_w8a16 = false
 
 [run]
+# 预热次数；不计入正式测量。
 warmup = 2
-runs = 3
+# 正式执行次数，正整数。
+runs = 5
+# 按需开启硬件采样；保持 false 可减少测量干扰。
 hwperf = false
+# 按需开启 profiler；正式计时建议保持 false。
 profile = false
+# 随机种子，非负整数。
 seed = 0
 
 [rpu_execution.components.vision_encoder.vision]
+# Vision 分块行数。可选 "auto"（默认）或 16 的倍数整数；不补齐行。
+# auto：由原生 planner 按图像 patch 数与本模型的核数选择。
+# 2026-10-19 模板默认输入实测：8 核均为 768。
+# 实际值记录在结果 report.json 的执行计划中（compute_chunk）。
 chunk_size = "auto"
 rpu_patch_embed = true
 rpu_mergers = true
 fused_merger = true
+# vision Graph 快速回放，冷启动时选定，与累加精度设置无关。true 开启（模板默认），false 关闭。
+# 省略时为 false。修改后需重新加载模型。
 fast_replay = true
 preload_replay_skip = true
 bake_merger = true
 
 [rpu_execution.components.language_model.prefill]
+# prefill 分块行数。可选 "auto"（默认）或满足本组件形状限制的 16 的倍数整数。
+# auto：由原生 planner 按实际输入行数选择。
+# 2026-10-19 模板默认输入实测：8 核均为 240。
+# 实际值记录在结果 report.json 的执行计划中（compute_chunk）。
 chunk_size = "auto"
 prefix_prep_cache = true
 prefix_prep_rpu = true
 prefix_no_clone = true
 partial_mrope = true
 merger_scatter = true
+# prefill Graph 快速回放，冷启动时选定，与累加精度设置无关。true 开启（模板默认），false 关闭。
+# 省略时为 false。修改后需重新加载模型。
 fast_replay = true
 preload_replay_skip = true
 
 [rpu_execution.components.action_expert.action]
+# action 分块行数。可选 "auto"（默认）或满足本组件形状限制的 16 的倍数整数。
+# auto：由原生 planner 按实际输入行数选择。
+# 2026-10-19 模板默认输入实测：8 核均为 32。
+# 实际值记录在结果 report.json 的执行计划中（compute_chunk）。
 chunk_size = "auto"
 denoise_unroll = true
 shared_cache = true
 prefix_alias = true
+# action Graph 快速回放，冷启动时选定，与累加精度设置无关。true 开启（模板默认），false 关闭。
+# 省略时为 false。修改后需重新加载模型。
 fast_replay = true

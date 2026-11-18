@@ -272,7 +272,7 @@ def test_plain_text_prepare_keeps_cpu_prompt_and_generated_ids(
 
 def test_dinov3_public_vision_reuses_hidden_readback_with_owned_cls(monkeypatch, greedy_api):
     runner = load("example_dinov3_cpu_cls", "examples/runners/dinov3/runner.py")
-    images, pixels, hf_config = [object()], torch.ones((1, 3, 224, 224)), object()
+    images, pixels, hf_config = [SimpleNamespace(size=(224, 224))], torch.ones((1, 3, 224, 224)), object()
     monkeypatch.setattr(importlib.import_module("examples.common.generation"), "_image_inputs", lambda _: images)
     registry = ModuleType("rpu_backend.model_registry")
     registry.model_path = lambda _: "/cache/dinov3"
@@ -358,7 +358,7 @@ def test_qwen3vl_prepare_reads_current_cpu_ids_and_preserves_cold_geometry(
     transformers.AutoProcessor = SimpleNamespace(from_pretrained=lambda *_a, **_kw: processor)
     monkeypatch.setitem(sys.modules, registry.__name__, registry)
     monkeypatch.setitem(sys.modules, transformers.__name__, transformers)
-    monkeypatch.setattr(importlib.import_module("examples.common.generation"), "_image_inputs", lambda _: [object()])
+    monkeypatch.setattr(importlib.import_module("examples.common.generation"), "_image_inputs", lambda _: [SimpleNamespace(size=(32, 32))])
 
     cache, language, visual = Mock(), object(), Mock(return_value="vision-output")
     seen = []
@@ -405,8 +405,11 @@ def test_qwen3vl_prepare_reads_current_cpu_ids_and_preserves_cold_geometry(
     infer, owner = runner.prepare(config, state)
     assert owner is state.owner is model
     validate.assert_called_once_with(config, "/cache/qwen3-vl")
+    # Configured image grids size the cold Vision install; text has none.
+    grids = {} if component == "text" else {"image_grid_thw": grid}
     loader.assert_called_once_with("/cache/qwen3-vl", dtype=torch.float16, device="rpu",
-                                  rpu_execution=execution, local_files_only=True, trust_remote_code=False)
+                                  rpu_execution=execution, local_files_only=True, trust_remote_code=False,
+                                  **grids)
     if component == "vision":
         assert infer() == "vision-output" and len(uploads) == 1
         assert visual.call_args.kwargs["grid_thw"] is grid
@@ -885,6 +888,100 @@ def test_cleanup_failure_never_prints_success(monkeypatch, tmp_path, capsys):
     test_example_times_actual_inference_and_records_failures(
         monkeypatch, tmp_path, "cleanup", "SUPPORTED", False)
     assert "inference PASS:" not in capsys.readouterr().out
+
+
+def test_stage_timings_time_declared_calls_once_and_restore_owners(monkeypatch):
+    results = importlib.import_module("examples.common.results")
+    clock = iter(range(100))
+    monkeypatch.setattr(results.time, "perf_counter", lambda: next(clock))
+
+    class Runtime:
+        def denoise(self, steps):
+            # A stage method reached again inside the same stage is one span.
+            return self.denoise(steps - 1) if steps else "action"
+
+    runtime = Runtime()
+    local = runtime.vision = lambda: "tokens"
+    boundaries = (("vision", runtime, "vision"), ("denoise", runtime, "denoise"),
+                  ("vision", Runtime, "denoise"))
+    with pytest.raises(LookupError):
+        with results.stage_timings(boundaries[:2]) as phases:
+            assert runtime.vision() == "tokens" and runtime.denoise(2) == "action"
+            assert runtime.vision() == "tokens"
+            assert phases == {"vision_ms": 2000., "denoise_ms": 1000.}
+            raise LookupError("inference failed")
+    assert runtime.vision is local and "denoise" not in vars(runtime)
+    with pytest.raises(TypeError, match="vision: Runtime.missing is missing or not callable"):
+        with results.stage_timings(boundaries[:2] + (("vision", runtime, "missing"),)):
+            pass
+    runtime.missing = None
+    with pytest.raises(TypeError, match="Runtime.missing is missing or not callable"):
+        with results.stage_timings(boundaries[:2] + (("vision", runtime, "missing"),)):
+            pass
+    assert runtime.vision is local and "denoise" not in vars(runtime)
+    with results.stage_timings(boundaries[2:]) as phases:
+        assert runtime.denoise(0) == "action" and phases == {"vision_ms": 1000.}
+    assert vars(Runtime)["denoise"].__name__ == "denoise"
+
+
+def test_stage_phase_timings_keep_only_stages_measured_in_every_run():
+    results = importlib.import_module("examples.common.results")
+    rows = [{"vision_ms": 1., "denoise_ms": 4.}, {"vision_ms": 3., "denoise_ms": 6., "prefill_ms": 2.}]
+    timings = results.stage_phase_timings(rows, "stage calls")
+    assert [(item["metric"], item["value"], item["samples"]) for item in timings] == [
+        ("vision_latency", 2., [1., 3.]), ("denoise_latency", 5., [4., 6.])]
+    assert results.stage_phase_timings([{}, {}], "stage calls") == []
+    assert results.stage_phase_timings([], "stage calls") == []
+
+
+def test_measurement_times_declared_stages_in_measured_runs_only(monkeypatch, tmp_path):
+    runner = load("public_runner_stage_test", "examples/common/measurement.py")
+    performance = load("performance_runner_stage_test", "python/rpu_backend/runtime/performance.py")
+    common = importlib.import_module("examples.common.config")
+    monkeypatch.setattr(common, "cpu_runtime", lambda: load("example_cpu_stage_test", "examples/common/cpu.py"))
+    monkeypatch.setattr(common, "example_profiles", lambda: {"test.profile": {"id": "test.profile"}})
+    monkeypatch.setitem(sys.modules, "rpu_backend", ModuleType("rpu_backend"))
+    monkeypatch.setitem(sys.modules, "rpu_backend.runtime.performance", performance)
+    monkeypatch.setattr(runner, "_provenance", lambda config: {})
+
+    class Policy:
+        calls = 0
+
+        def vision(self):
+            return torch.ones(2)
+
+        def denoise(self, features):
+            return features * 2
+
+        def predict(self):
+            self.calls += 1
+            return self.denoise(self.vision())
+
+        def close(self):
+            pass
+
+    policy = Policy()
+
+    def infer():
+        return policy.predict()
+    # An owner without a declared method leaves that stage unmeasured; the run still passes.
+    infer.stage_boundaries = (("vision", policy, "vision"), ("prefill", policy, "prefill"),
+                              ("denoise", policy, "denoise"), ("action", None, "forward"))
+    monkeypatch.setattr(runner, "_prepare", lambda config: (infer, policy))
+    runner.run({"example": {"profile_id": "test.profile", "target": "hy_vla"}, "input": {},
+                "run": {"output_dir": str(tmp_path), "warmup": 2, "runs": 3}})
+    report = json.loads(next(tmp_path.glob("*/report.json")).read_text())
+    assert policy.calls == 5 and "vision" not in vars(policy)
+    assert report["status"] == "PASS"
+    assert report["stage_boundaries"] == ["vision: Policy.vision", "denoise: Policy.denoise"]
+    assert report["stage_boundaries_missing"] == ["prefill: prefill", "action: forward"]
+    assert len(report["stage_runs"]) == 3
+    assert all(set(row) == {"vision_ms", "denoise_ms"} for row in report["stage_runs"])
+    metrics = {item["metric"]: item for item in report["timing"]}
+    assert list(metrics) == ["total_latency", "vision_latency", "denoise_latency"]
+    assert metrics["vision_latency"]["samples"] == [row["vision_ms"] for row in report["stage_runs"]]
+    assert all(row["vision_ms"] + row["denoise_ms"] <= total
+               for row, total in zip(report["stage_runs"], report["wall_ms_runs"]))
 
 
 def test_public_examples_do_not_import_certification_harnesses():

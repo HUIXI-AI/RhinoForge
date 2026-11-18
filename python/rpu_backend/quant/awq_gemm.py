@@ -1,7 +1,7 @@
 """Lossless QuantTrio AWQ GEMM codecs; direct zero, never GPTQ zero-plus-one.
 
 Source words pack the N axis, not K. Logical codes are uint8 [N,K], scales and
-integer zero points [K/128,N]. Runtime W4 uses the existing dense TP permutation;
+integer zero points [K/128,N]. Runtime UINT4 uses the BASE N32K32 TP permutation;
 scale and FP16 negative zero use the same controller-striped metadata layout.
 """
 from __future__ import annotations
@@ -9,7 +9,8 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from .int4_pgrp_pack import _pgrp_swizzle_perm, swizzle_int4_pgrp_scale
+from .int4_pgrp_pack import swizzle_int4_pgrp_scale
+from .grouped_uint4_n32k32 import pack_grouped_uint4_n32k32
 
 
 _BIT_TO_LOGICAL = (0, 2, 4, 6, 1, 3, 5, 7)
@@ -70,15 +71,19 @@ def unpack_awq_gemm(qweight, qzeros, scales, *, n: int, k: int):
 def swizzle_pack_uint4_pgrp(codes, partition, num_cores=8):
     """Dense shared-W4 payload, with a distinct unsigned range contract."""
     _check_uint4(codes)
-    if type(num_cores) is not int or num_cores != 8:
-        raise ValueError("QuantTrio AWQ requires TP8")
-    physical = _pgrp_swizzle_perm(codes, partition, num_cores).to(torch.uint8)
-    return (physical[0::2] | (physical[1::2] << 4)).contiguous()
+    if type(num_cores) is not int or num_cores not in (4, 6, 8):
+        raise ValueError("QuantTrio AWQ requires 4, 6 or 8 cores")
+    if type(partition) is not int or partition not in (0, 1):
+        raise ValueError("partition must be 0(row) or 1(col)")
+    return pack_grouped_uint4_n32k32(
+        codes.unsqueeze(0), partition="col" if partition else "row",
+        num_cores=num_cores,
+    ).reshape(-1)
 
 
 def swizzle_awq_negative_zero(zero, partition, num_cores=8):
     _check_uint4(zero)
-    if type(num_cores) is not int or num_cores != 8:
-        raise ValueError("QuantTrio AWQ requires TP8")
+    if type(num_cores) is not int or num_cores not in (4, 6, 8):
+        raise ValueError("QuantTrio AWQ requires 4, 6 or 8 cores")
     # Conversion precedes negation: negating uint8 would wrap modulo 256.
     return swizzle_int4_pgrp_scale(-zero.to(torch.float16), 128, partition, num_cores)

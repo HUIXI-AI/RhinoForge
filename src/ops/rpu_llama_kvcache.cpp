@@ -215,6 +215,7 @@ void rpu_launch_llama_insert_vcache(
     uint64_t cache_addr = RpuGetDevAddr(v_cache.data_ptr<c10::Half>()) >> 8;
 
     // ========== 7. 设置寄存器 ==========
+    // 参考 ASM 文档 (用户更正后):
     // param0/1: position (int32 value, 直接是数值)
     // param2: num_kv_percore_heads (每核的 head 数)
     // param3: head_dim
@@ -226,7 +227,7 @@ void rpu_launch_llama_insert_vcache(
     uint32_t v_spm_addr = spm_v[0]->get_rpu_addr();
     uint32_t position_val = static_cast<uint32_t>(position);
 
-    // Per-core element count is param2 * param3.
+    // ASM kernel: data_size = param2 * param3
     int64_t kern_heads = num_kv_percore_heads;
     int64_t kern_hdim = head_dim;
     if (total_kv_heads < NUM_CORES) {
@@ -246,6 +247,7 @@ void rpu_launch_llama_insert_vcache(
 
     // ========== 8. 启动 Kernel ==========
     // grid: [seq_len, 1, 1]
+    // 每个 warp 使用 %blkid.x 来获取它处理的 seq 索引
     wq->enqueu_kernel(*kernel,
         {(uint16_t)seq_len, (uint16_t)1, (uint16_t)1},
         {0, 1, 2, 3, 4, 5, 6, 7});
@@ -399,7 +401,7 @@ void rpu_launch_llama_insert_kcache(
     uint32_t k_spm_addr = spm_k[0]->get_rpu_addr();
     uint32_t position_val = static_cast<uint32_t>(position);
 
-    // Per-core element count is param2 * param3.
+    // ASM kernel: data_size = param2 * param3
     int64_t kern_heads = num_kv_percore_heads;
     int64_t kern_hdim = head_dim;
     if (total_kv_heads < NUM_CORES) {
@@ -481,6 +483,129 @@ static void validate_kvinsert_spm_rows(
         " logical_rows=", plan.logical_rows());
 }
 
+void rpu_launch_wall_prefill_owner_direct_kv_spm_kernel(
+    at::Tensor& k_cache,
+    at::Tensor& v_cache,
+    uint32_t k_spm_addr,
+    uint32_t v_spm_addr,
+    const at::Tensor& cos,
+    const at::Tensor& sin) {
+    constexpr int64_t kRows = 640;
+    constexpr int64_t kRotaryHalf = 64;
+    constexpr uint64_t kCompactBytes =
+        kRows * kRotaryHalf * sizeof(c10::Half);
+
+    auto check_cache = [](const at::Tensor& cache, const char* name) {
+        TORCH_CHECK(
+            cache.defined() &&
+                cache.device().type() == c10::DeviceType::PrivateUse1 &&
+                cache.scalar_type() == at::kHalf && cache.is_contiguous() &&
+                cache.dim() == 7 && cache.size(0) == 1 &&
+                cache.size(1) >= 40 && cache.size(2) == 1 &&
+                cache.size(3) == 8 && cache.size(4) == 8 &&
+                cache.size(5) == 16 && cache.size(6) == 16,
+            "Wall P640 owner-direct ", name,
+            " cache must be contiguous RPU fp16 "
+            "[1,>=40,1,8,8,16,16], got ", cache.sizes());
+    };
+    check_cache(k_cache, "K");
+    check_cache(v_cache, "V");
+    TORCH_CHECK(
+        cos.defined() && sin.defined() &&
+            cos.device().type() == c10::DeviceType::PrivateUse1 &&
+            sin.device().type() == c10::DeviceType::PrivateUse1 &&
+            cos.scalar_type() == at::kHalf && sin.scalar_type() == at::kHalf &&
+            cos.is_contiguous() && sin.is_contiguous() &&
+            cos.dim() == 2 && sin.dim() == 2 && cos.sizes() == sin.sizes() &&
+            cos.size(0) >= kRows && cos.size(1) == kRotaryHalf,
+        "Wall P640 owner-direct cos/sin must be matching contiguous RPU fp16 "
+        "tables [>=640,64]");
+
+    const uint32_t spm_base0 = SPM_ALLOC.addr(0, 0);
+    auto checked_offset = [&](uint32_t address, const char* name) {
+        TORCH_CHECK(
+            address >= spm_base0 && address % 256 == 0 &&
+                static_cast<uint64_t>(address - spm_base0) <=
+                    SpmAllocator::SPM_USABLE - kCompactBytes,
+            "Wall P640 owner-direct ", name,
+            " must be a 256-byte-aligned local SPM range");
+        return address - spm_base0;
+    };
+    const uint32_t k_offset = checked_offset(k_spm_addr, "K input");
+    const uint32_t v_offset = checked_offset(v_spm_addr, "V input");
+    TORCH_CHECK(
+        static_cast<uint64_t>(k_offset) + kCompactBytes <= v_offset ||
+            static_cast<uint64_t>(v_offset) + kCompactBytes <= k_offset,
+        "Wall P640 owner-direct K/V SPM input ranges must not overlap");
+
+    auto register_writer =
+        RpuKernelGraph::active().stage_kernel_ddr_registers(
+            KernelId::WALL_PREFILL_OWNER_DIRECT_KV_M640,
+            std::vector<GraphDdrRegisterOperandSpec>{
+                GraphDdrRegisterOperandSpec{
+                    GraphDdrRegisterAbi{
+                        GraphDdrRegisterRole::KeyCache,
+                        GraphDdrRegisterAccess::Write,
+                        GraphDdrRegisterEncoding::DevAddrShift8LoHi, 4, 5},
+                    k_cache},
+                GraphDdrRegisterOperandSpec{
+                    GraphDdrRegisterAbi{
+                        GraphDdrRegisterRole::ValueCache,
+                        GraphDdrRegisterAccess::Write,
+                        GraphDdrRegisterEncoding::DevAddrShift8LoHi, 6, 7},
+                    v_cache},
+                GraphDdrRegisterOperandSpec{
+                    GraphDdrRegisterAbi{
+                        GraphDdrRegisterRole::SemanticInput,
+                        GraphDdrRegisterAccess::Read,
+                        GraphDdrRegisterEncoding::DevAddrShift8LoHi, 8, 9},
+                    cos},
+                GraphDdrRegisterOperandSpec{
+                    GraphDdrRegisterAbi{
+                        GraphDdrRegisterRole::SemanticInput,
+                        GraphDdrRegisterAccess::Read,
+                        GraphDdrRegisterEncoding::DevAddrShift8LoHi, 10, 11},
+                    sin}});
+
+    const at::Tensor* ddr_operands[] = {&k_cache, &v_cache, &cos, &sin};
+    for (const at::Tensor* tensor : ddr_operands) {
+        rpu_ddr_flush(tensor->data_ptr());
+        TORCH_CHECK(
+            RpuGetDevAddr(tensor->data_ptr()) % 256 == 0,
+            "Wall P640 owner-direct DDR operand is not 256-byte aligned");
+    }
+    const uint64_t k_cache_addr = RpuGetDevAddr(k_cache.data_ptr());
+    const uint64_t v_cache_addr = RpuGetDevAddr(v_cache.data_ptr());
+    const uint64_t k_cache_bytes =
+        static_cast<uint64_t>(k_cache.numel()) * sizeof(c10::Half);
+    const uint64_t v_cache_bytes =
+        static_cast<uint64_t>(v_cache.numel()) * sizeof(c10::Half);
+    TORCH_CHECK(
+        k_cache_addr + k_cache_bytes <= v_cache_addr ||
+            v_cache_addr + v_cache_bytes <= k_cache_addr,
+        "Wall P640 owner-direct K/V DDR cache ranges must not overlap");
+
+    Kernel_t* kernel =
+        GET_KERNEL(KernelId::WALL_PREFILL_OWNER_DIRECT_KV_M640);
+    TORCH_CHECK(kernel != nullptr,
+                "owner_direct_kv_m640 missing from expansion ref");
+    kernel->reset_regs();
+    kernel->set_regs(0, static_cast<uint16_t>(k_offset));
+    kernel->set_regs(1, static_cast<uint16_t>(k_offset >> 16));
+    kernel->set_regs(2, static_cast<uint16_t>(v_offset));
+    kernel->set_regs(3, static_cast<uint16_t>(v_offset >> 16));
+    kernel->set_regs(12, static_cast<uint16_t>(0));
+    register_writer.write(*kernel);
+
+    auto* queue = GET_QUEUE(NUM_CORES);
+    queue->set_broadcast_mode(true);
+    const std::vector<uint8_t> cores{0, 1, 2, 3, 4, 5, 6, 7};
+    queue->enqueu_kernel(*kernel, {40, 1, 1}, cores);
+
+    rpu_ddr_flush(k_cache.data_ptr<c10::Half>());
+    rpu_ddr_flush(v_cache.data_ptr<c10::Half>());
+}
+
 void rpu_launch_insert_kcache_spm_unified_with_plan(
     at::Tensor &k_cache,         // DDR K-cache (swizzle format)
     uint32_t k_off,              // SPM offset for K buffer
@@ -523,7 +648,7 @@ void rpu_launch_insert_kcache_spm_unified_with_plan(
         k_cache, cache_batch_offset_elems, "insert_kcache_spm_unified");
     // ===== 设置寄存器 =====
     uint32_t k_spm_addr = SPM_ALLOC.addr(0, k_off);
-    // Per-core element count per position is param2 * param3.
+    // ASM kernel: data_size = param2 * param3 = elements per core per position.
     // When nhkv >= num_cores: param2=local_kv_heads, param3=head_dim
     // When nhkv < num_cores: param2=1, param3=local_kv_dim (head_dim split across cores)
     int64_t kern_heads = num_kv_percore_heads;
@@ -694,7 +819,7 @@ void rpu_launch_insert_vcache_spm_unified_with_plan(
     // ===== 设置寄存器 =====
     uint32_t v_spm_addr = SPM_ALLOC.addr(0, v_off);
 
-    // Per-core element count is param2 * param3.
+    // ASM kernel: data_size = param2 * param3
     int64_t kern_heads = num_kv_percore_heads;
     int64_t kern_hdim = head_dim;
     if (total_kv_heads < num_cores) {
@@ -881,7 +1006,7 @@ void launch_owned_paired_kv_insert(
     TORCH_CHECK(cache_shape(k_cache) && cache_shape(v_cache) &&
                     k_cache.device() == v_cache.device() &&
                     k_cache.size(1) == v_cache.size(1),
-                "paired KV insert requires matching owned B1 FP16 device "
+                "paired KV insert requires matching owned B1 FP16 RPU "
                 "7D KV8/HD128 swizzled caches");
     TORCH_CHECK(static_cast<uint64_t>(position) <= UINT32_MAX - seq_len &&
                     (position + seq_len + 15) / 16 <= k_cache.size(1),
@@ -1225,7 +1350,7 @@ void rpu_launch_lingbot2_insert_kv_t51_spm_kernel(
                     k_cache.device() == v_cache.device() &&
                     k_cache.size(1) == v_cache.size(1) &&
                     (position + kRows + 15) / 16 <= k_cache.size(1),
-                "LingBot2 T51 KV insert requires matching full FP16 device "
+                "LingBot2 T51 KV insert requires matching full FP16 RPU "
                 "[1,S16,1,8,8,16,16] owners covering the logical append");
     TORCH_CHECK(SPM_ALLOC.is_initialized(),
                 "LingBot2 T51 KV insert requires initialized SPM");
@@ -1315,7 +1440,7 @@ static void validate_kv_arena_input(
     TORCH_CHECK(kv_input.scalar_type() == at::kHalf, "arena insert: input must be FP16");
     TORCH_CHECK(kv_input.is_contiguous(), "arena insert: input must be contiguous");
     TORCH_CHECK(kv_input.device().type() == at::kPrivateUse1,
-                "arena insert: input must be on the device");
+                "arena insert: input must be on the RPU device");
     // The address math below indexes core-local slices and ignores the batch dim,
     // and the 8-core head split requires nkv to divide (or be divided by) num_cores
     // — mirror the checks in rpu_launch_llama_insert_{k,v}cache so a bad shape fails
@@ -1448,21 +1573,54 @@ void rpu_launch_pi05_kv1_direct_cache_m50d256p64_kernel(
     const at::Tensor& cos,
     const at::Tensor& sin,
     int64_t logical_rope_position,
-    const KvInsertSegmentPlan& plan) {
-    constexpr uint32_t kActiveRows = 50;
-    constexpr uint32_t kPhysicalRows = 64;
+    const KvInsertSegmentPlan& plan,
+    uint16_t rotated_skip_mask,
+    const Pi05SplitKvRopePack* q_pack) {
+    // M50/PAD64 (four 16-row blocks, grid 4) or the H10 M10/PAD16 sibling
+    // (one block, grid 1); the logical row count selects the payload.
+    const bool h10 = plan.logical_rows() == 10;
+    const uint32_t kActiveRows = h10 ? 10 : 50;
+    const uint32_t kPhysicalRows = h10 ? 16 : 64;
+    const uint16_t kGrid = h10 ? 1 : 4;
     constexpr uint32_t kHeadDim = 256;
     constexpr uint16_t kPhysicalKvHeads = 8;
     constexpr uint32_t kCapacity = 2048;
     constexpr uint16_t kCompactWidth = 32;
     constexpr uint16_t kPairWidth = 16;
     constexpr uint16_t kAbiVersion = 1;
-    constexpr size_t kCompactActiveBytes =
+    // One FP16 cos or sin row, in the DDR tables and in the SPM rows alike.
+    constexpr uint32_t kRopeRowBytes = kHeadDim / 2 * sizeof(c10::Half);
+    const size_t kCompactActiveBytes =
         kActiveRows * kCompactWidth * sizeof(c10::Half);
     constexpr size_t kCacheBytes =
         size_t{1} * 128 * 1 * 16 * 8 * 16 * 16 * sizeof(c10::Half);
-    constexpr KernelId kKernelId =
-        KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_M50D256P64;
+    // A launch that packs has the chunk's cos/sin rows in SPM, so its writer
+    // reads them there too when the REF has that sibling (registers 40..45).
+    const KernelId kKernelId = pi05_kv1_direct_cache_q_rope_pack(kActiveRows)
+        ? (q_pack && pi05_kv1_direct_cache_spm_rope()
+               ? KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_ROT_Q_ROPE_PACK_SPM_ROPE_M64
+               : KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_ROT_Q_ROPE_PACK_M64)
+        : pi05_kv1_direct_cache_rotated(kActiveRows)
+        ? KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_M64D256_ROT
+        : pi05_kv1_direct_cache_overlapped(kActiveRows)
+        ? KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_M64D256_OVERLAP
+        : h10 ? KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_M10D256P16
+              : KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_M50D256P64;
+    const bool spm_rope =
+        kKernelId == KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_ROT_Q_ROPE_PACK_SPM_ROPE_M64;
+    // The fused payload is the rotated writer with the RoPE pack's blocks
+    // after its own and its registers 32 higher.
+    const bool fused = spm_rope ||
+        kKernelId == KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_ROT_Q_ROPE_PACK_M64;
+    const uint32_t base = fused ? 32 : 0;
+    TORCH_CHECK(
+        rotated_skip_mask == 0 || fused ||
+            kKernelId == KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_M64D256_ROT,
+        "Pi0.5 KV1 direct-cache: only the rotated writer skips head slots");
+    TORCH_CHECK(
+        q_pack == nullptr || (fused && q_pack->plan.seq_q == kActiveRows),
+        "Pi0.5 KV1 direct-cache: only the fused payload packs the query rows, "
+        "and only its own rows");
 
     TORCH_CHECK(
         RpuKernelGraph::has_active(),
@@ -1476,10 +1634,11 @@ void rpu_launch_pi05_kv1_direct_cache_m50d256p64_kernel(
             (plan.segment(0).position == 544 || plan.segment(0).position == 800 ||
              plan.segment(0).position == 832 || plan.segment(0).position == 576 ||
              plan.segment(0).position == 864 || plan.segment(0).position == 896 || plan.segment(0).position == 608 || plan.segment(0).position == 640 ||
-             plan.segment(0).position == 672 || plan.segment(0).position == 928) &&
+             plan.segment(0).position == 672 || plan.segment(0).position == 928 ||
+             plan.segment(0).position == 960) &&
             plan.segment(0).token_offset == 0 &&
             plan.segment(0).rows == kPhysicalRows,
-        "Pi0.5 KV1 direct-cache requires the exact P544/P576/P608/P640/P672/P800/P832/P864/P896/P928/M50/PAD64 plan");
+        "Pi0.5 KV1 direct-cache requires the exact P544/P576/P608/P640/P672/P800/P832/P864/P896/P928/P960 M50/PAD64 or M10/PAD16 plan");
     TORCH_CHECK(
         logical_rope_position >= 0 && logical_rope_position <= UINT32_MAX,
         "Pi0.5 KV1 direct-cache logical RoPE position exceeds u32");
@@ -1499,7 +1658,7 @@ void rpu_launch_pi05_kv1_direct_cache_m50d256p64_kernel(
             k_cache.device() == v_cache.device(),
         "Pi0.5 KV1 direct-cache requires full contiguous FP16 K/V owners "
         "[1,128,1,16,8,16,16]");
-    const auto table_ok = [logical_rope_position](const at::Tensor& table) {
+    const auto table_ok = [logical_rope_position, kActiveRows](const at::Tensor& table) {
         return table.defined() &&
             table.device().type() == c10::DeviceType::PrivateUse1 &&
             table.scalar_type() == at::kHalf && table.is_contiguous() &&
@@ -1520,7 +1679,7 @@ void rpu_launch_pi05_kv1_direct_cache_m50d256p64_kernel(
         SPM_ALLOC.is_initialized(),
         "Pi0.5 KV1 direct-cache requires the initialized SPM allocator");
     const uint64_t spm_base = SPM_ALLOC.addr(0, 0);
-    auto absolute_spm = [spm_base](uint32_t offset, const char* role) {
+    auto absolute_spm = [spm_base, kCompactActiveBytes](uint32_t offset, const char* role) {
         TORCH_CHECK(
             (offset & 255u) == 0 &&
                 kCompactActiveBytes <= SpmAllocator::SPM_USABLE &&
@@ -1543,6 +1702,20 @@ void rpu_launch_pi05_kv1_direct_cache_m50d256p64_kernel(
         uint64_t{k_spm} + kCompactActiveBytes <= v_spm ||
             uint64_t{v_spm} + kCompactActiveBytes <= k_spm,
         "Pi0.5 KV1 direct-cache compact K/V active SPM intervals overlap");
+    if (q_pack) {
+        pi05_split_kv_check_rope_pack_spm(q_pack->plan, q_pack->rope_rows_off);
+        // The pack writes every core's packed rows while the cache body reads
+        // its compact K/V rows; it writes no other SPM, the cache body none.
+        const uint64_t qp = SPM_ALLOC.addr(0, q_pack->qp_off);
+        const uint64_t qp_bytes = static_cast<uint64_t>(q_pack->plan.qp_bytes());
+        const auto clear_of = [qp, qp_bytes, kCompactActiveBytes](uint32_t spm) {
+            return qp + qp_bytes <= spm || uint64_t{spm} + kCompactActiveBytes <= qp;
+        };
+        TORCH_CHECK(
+            clear_of(k_spm) && clear_of(v_spm),
+            "Pi0.5 KV1 direct-cache + RoPE pack: the packed query rows overlap "
+            "the compact K/V rows");
+    }
 
     const uint64_t k_cache_addr = RpuGetDevAddr(k_cache.data_ptr<c10::Half>());
     const uint64_t v_cache_addr = RpuGetDevAddr(v_cache.data_ptr<c10::Half>());
@@ -1570,33 +1743,40 @@ void rpu_launch_pi05_kv1_direct_cache_m50d256p64_kernel(
             disjoint(cos_addr, table_bytes, sin_addr, table_bytes),
         "Pi0.5 KV1 direct-cache requires four independent DDR owners");
 
+    std::vector<GraphDdrRegisterOperandSpec> ddr_operands{
+        GraphDdrRegisterOperandSpec{
+            GraphDdrRegisterAbi{
+                GraphDdrRegisterRole::KeyCache,
+                GraphDdrRegisterAccess::Write,
+                GraphDdrRegisterEncoding::DevAddrShift8LoHi,
+                base + 4, base + 5},
+            k_cache},
+        GraphDdrRegisterOperandSpec{
+            GraphDdrRegisterAbi{
+                GraphDdrRegisterRole::ValueCache,
+                GraphDdrRegisterAccess::Write,
+                GraphDdrRegisterEncoding::DevAddrShift8LoHi,
+                base + 6, base + 7},
+            v_cache}};
+    // The SPM-RoPE sibling's registers 8..11 hold SPM addresses, set below.
+    if (!spm_rope) {
+        ddr_operands.push_back(GraphDdrRegisterOperandSpec{
+            GraphDdrRegisterAbi{
+                GraphDdrRegisterRole::SemanticInput,
+                GraphDdrRegisterAccess::Read,
+                GraphDdrRegisterEncoding::DevAddrShift8LoHi,
+                base + 8, base + 9},
+            cos});
+        ddr_operands.push_back(GraphDdrRegisterOperandSpec{
+            GraphDdrRegisterAbi{
+                GraphDdrRegisterRole::SemanticInput,
+                GraphDdrRegisterAccess::Read,
+                GraphDdrRegisterEncoding::DevAddrShift8LoHi,
+                base + 10, base + 11},
+            sin});
+    }
     auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(
-        kKernelId,
-        std::vector<GraphDdrRegisterOperandSpec>{
-            GraphDdrRegisterOperandSpec{
-                GraphDdrRegisterAbi{
-                    GraphDdrRegisterRole::KeyCache,
-                    GraphDdrRegisterAccess::Write,
-                    GraphDdrRegisterEncoding::DevAddrShift8LoHi, 4, 5},
-                k_cache},
-            GraphDdrRegisterOperandSpec{
-                GraphDdrRegisterAbi{
-                    GraphDdrRegisterRole::ValueCache,
-                    GraphDdrRegisterAccess::Write,
-                    GraphDdrRegisterEncoding::DevAddrShift8LoHi, 6, 7},
-                v_cache},
-            GraphDdrRegisterOperandSpec{
-                GraphDdrRegisterAbi{
-                    GraphDdrRegisterRole::SemanticInput,
-                    GraphDdrRegisterAccess::Read,
-                    GraphDdrRegisterEncoding::DevAddrShift8LoHi, 8, 9},
-                cos},
-            GraphDdrRegisterOperandSpec{
-                GraphDdrRegisterAbi{
-                    GraphDdrRegisterRole::SemanticInput,
-                    GraphDdrRegisterAccess::Read,
-                    GraphDdrRegisterEncoding::DevAddrShift8LoHi, 10, 11},
-                sin}});
+        kKernelId, std::move(ddr_operands));
     auto& graph = RpuKernelGraph::active();
     graph.keep_alive(k_cache);
     graph.keep_alive(v_cache);
@@ -1612,10 +1792,18 @@ void rpu_launch_pi05_kv1_direct_cache_m50d256p64_kernel(
         kernel != nullptr,
         "Pi0.5 KV1 direct-cache optional expansion symbol is absent");
     kernel->reset_regs();
-    const auto set_reg = [kernel](uint32_t index, uint16_t value) {
+    // The pack's registers 0..14 and SCM slot 0; its blocks follow the cache's.
+    const uint16_t pack_blocks = q_pack
+        ? pi05_split_kv_write_rope_pack_spm_regs(
+              kernel, q_pack->rope_rows_off, q_pack->q_off, q_pack->qp_off, q_pack->plan)
+        : 0;
+    const auto set_raw = [kernel](uint32_t index, uint16_t value) {
         TORCH_CHECK(
             kernel->set_regs(index, value) == kKernelRegOk,
             "Pi0.5 KV1 direct-cache rejected parameter ", index);
+    };
+    const auto set_reg = [&set_raw, base](uint32_t index, uint16_t value) {
+        set_raw(base + index, value);
     };
     const auto set_pair = [&set_reg](uint32_t index, uint32_t value) {
         set_reg(index, static_cast<uint16_t>(value & 0xffffu));
@@ -1623,9 +1811,18 @@ void rpu_launch_pi05_kv1_direct_cache_m50d256p64_kernel(
     };
     set_pair(0, k_spm);
     set_pair(2, v_spm);
-    // The four typed DDR pairs remain zero until writer.write below.
+    // The typed DDR pairs remain zero until writer.write below.
     for (uint32_t index = 4; index <= 10; index += 2) set_pair(index, 0);
     set_pair(12, static_cast<uint32_t>(logical_rope_position));
+    if (spm_rope) {
+        // The pack's own cos/sin rows (its params 0..3; its T is kActiveRows),
+        // which start at the chunk's first row, so the logical row is 0.
+        const uint32_t cos_rows =
+            SPM_ALLOC.addr(0, static_cast<uint32_t>(q_pack->rope_rows_off));
+        set_pair(8, cos_rows);
+        set_pair(10, cos_rows + kActiveRows * kRopeRowBytes);
+        set_pair(12, 0);
+    }
     set_pair(14, static_cast<uint32_t>(plan.segment(0).position));
     set_reg(16, kActiveRows);
     set_reg(17, kPhysicalRows);
@@ -1635,11 +1832,16 @@ void rpu_launch_pi05_kv1_direct_cache_m50d256p64_kernel(
     set_reg(21, kCompactWidth);
     set_reg(22, kPairWidth);
     set_reg(23, kAbiVersion);
-    for (uint32_t index = 24; index < 64; ++index) set_reg(index, 0);
-    set_reg(64, 4);
-    set_reg(65, 1);
-    set_reg(66, 1);
-    set_reg(67, 0);
+    for (uint32_t index = 24; index < 64 - base; ++index) set_reg(index, 0);
+    // Bit c: reader core c reads none of the written blocks (rotated writer only).
+    set_reg(25, rotated_skip_mask);
+    // Blocks below param28 run the cache body.
+    if (fused) set_raw(28, kGrid);
+    const uint16_t grid = kGrid + pack_blocks;
+    set_raw(64, grid);
+    set_raw(65, 1);
+    set_raw(66, 1);
+    set_raw(67, 0);
     writer.write(*kernel);
 
     auto* queue = GET_QUEUE(NUM_CORES);
@@ -1647,7 +1849,7 @@ void rpu_launch_pi05_kv1_direct_cache_m50d256p64_kernel(
                 "Pi0.5 KV1 direct-cache 8-core queue is absent");
     queue->set_broadcast_mode(true);
     queue->enqueu_kernel(
-        *kernel, {4, 1, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
+        *kernel, {grid, 1, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
 }
 
 void rpu_launch_pi05_prefill_kv1_direct_cache_m400d256p400_kernel(
@@ -1662,8 +1864,9 @@ void rpu_launch_pi05_prefill_kv1_direct_cache_m400d256p400_kernel(
     TORCH_CHECK(plan.logical_rows() == 272 || plan.logical_rows() == 288 ||
                 plan.logical_rows() == 304 || plan.logical_rows() == 320 ||
                 plan.logical_rows() == 336 || plan.logical_rows() == 400 ||
-                plan.logical_rows() == 416 || plan.logical_rows() == 432 || plan.logical_rows() == 448 || plan.logical_rows() == 464,
-                "Pi0.5 prefill KV1 direct-cache requires C272/C288/C304/C320/C336/C400/C416/C432/C448/C464");
+                plan.logical_rows() == 416 || plan.logical_rows() == 432 || plan.logical_rows() == 448 || plan.logical_rows() == 464 ||
+                plan.logical_rows() == 480,
+                "Pi0.5 prefill KV1 direct-cache requires C272/C288/C304/C320/C336/C400/C416/C432/C448/C464/C480");
     const uint32_t kActiveRows = static_cast<uint32_t>(plan.logical_rows());
     const uint32_t kPhysicalRows = kActiveRows;
     constexpr uint32_t kHeadDim = 256;
@@ -1676,7 +1879,9 @@ void rpu_launch_pi05_prefill_kv1_direct_cache_m400d256p400_kernel(
         kActiveRows * kCompactWidth * sizeof(c10::Half);
     constexpr size_t kCacheBytes =
         size_t{1} * 128 * 1 * 16 * 8 * 16 * 16 * sizeof(c10::Half);
-    const KernelId kKernelId = kActiveRows == 432
+    const KernelId kKernelId = kActiveRows == 480
+        ? KernelId::PI05_PREFILL_KV1_DIRECT_CACHE_M480D256P480
+        : kActiveRows == 432
         ? KernelId::PI05_PREFILL_KV1_DIRECT_CACHE_M432D256P432
         : kActiveRows == 464
         ? KernelId::PI05_PREFILL_KV1_DIRECT_CACHE_M464D256P464
@@ -1709,7 +1914,7 @@ void rpu_launch_pi05_prefill_kv1_direct_cache_m400d256p400_kernel(
              plan.segment(0).position == kActiveRows) &&
             plan.segment(0).token_offset == 0 &&
             plan.segment(0).rows == kPhysicalRows,
-        "Pi0.5 prefill KV1 direct-cache requires an exact P544/C272, P576/C288, P608/C304, P640/C320, P672/C336, P800/C400, P832/C416, P864/C432, P896/C448 or P928/C464 "
+        "Pi0.5 prefill KV1 direct-cache requires an exact P544/C272, P576/C288, P608/C304, P640/C320, P672/C336, P800/C400, P832/C416, P864/C432, P896/C448, P928/C464 or P960/C480 "
         "ALIGNED_V16 plan at physical start 0 or chunk rows");
     TORCH_CHECK(
         logical_rope_position == plan.segment(0).position,
@@ -2269,128 +2474,4 @@ void rpu_launch_g05_owner_insert_kvcache_joint_spm_with_plan(
     writer.write(*kernel);
     queue->enqueu_kernel(*kernel,
         {static_cast<uint16_t>(p0 ? 2 : 17), 2, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
-}
-
-
-void rpu_launch_wall_prefill_owner_direct_kv_spm_kernel(
-    at::Tensor& k_cache,
-    at::Tensor& v_cache,
-    uint32_t k_spm_addr,
-    uint32_t v_spm_addr,
-    const at::Tensor& cos,
-    const at::Tensor& sin) {
-    constexpr int64_t kRows = 640;
-    constexpr int64_t kRotaryHalf = 64;
-    constexpr uint64_t kCompactBytes =
-        kRows * kRotaryHalf * sizeof(c10::Half);
-
-    auto check_cache = [](const at::Tensor& cache, const char* name) {
-        TORCH_CHECK(
-            cache.defined() &&
-                cache.device().type() == c10::DeviceType::PrivateUse1 &&
-                cache.scalar_type() == at::kHalf && cache.is_contiguous() &&
-                cache.dim() == 7 && cache.size(0) == 1 &&
-                cache.size(1) >= 40 && cache.size(2) == 1 &&
-                cache.size(3) == 8 && cache.size(4) == 8 &&
-                cache.size(5) == 16 && cache.size(6) == 16,
-            "Wall P640 owner-direct ", name,
-            " cache must be contiguous device fp16 "
-            "[1,>=40,1,8,8,16,16], got ", cache.sizes());
-    };
-    check_cache(k_cache, "K");
-    check_cache(v_cache, "V");
-    TORCH_CHECK(
-        cos.defined() && sin.defined() &&
-            cos.device().type() == c10::DeviceType::PrivateUse1 &&
-            sin.device().type() == c10::DeviceType::PrivateUse1 &&
-            cos.scalar_type() == at::kHalf && sin.scalar_type() == at::kHalf &&
-            cos.is_contiguous() && sin.is_contiguous() &&
-            cos.dim() == 2 && sin.dim() == 2 && cos.sizes() == sin.sizes() &&
-            cos.size(0) >= kRows && cos.size(1) == kRotaryHalf,
-        "Wall P640 owner-direct cos/sin must be matching contiguous device fp16 "
-        "tables [>=640,64]");
-
-    const uint32_t spm_base0 = SPM_ALLOC.addr(0, 0);
-    auto checked_offset = [&](uint32_t address, const char* name) {
-        TORCH_CHECK(
-            address >= spm_base0 && address % 256 == 0 &&
-                static_cast<uint64_t>(address - spm_base0) <=
-                    SpmAllocator::SPM_USABLE - kCompactBytes,
-            "Wall P640 owner-direct ", name,
-            " must be a 256-byte-aligned local SPM range");
-        return address - spm_base0;
-    };
-    const uint32_t k_offset = checked_offset(k_spm_addr, "K input");
-    const uint32_t v_offset = checked_offset(v_spm_addr, "V input");
-    TORCH_CHECK(
-        static_cast<uint64_t>(k_offset) + kCompactBytes <= v_offset ||
-            static_cast<uint64_t>(v_offset) + kCompactBytes <= k_offset,
-        "Wall P640 owner-direct K/V SPM input ranges must not overlap");
-
-    auto register_writer =
-        RpuKernelGraph::active().stage_kernel_ddr_registers(
-            KernelId::WALL_PREFILL_OWNER_DIRECT_KV_M640,
-            std::vector<GraphDdrRegisterOperandSpec>{
-                GraphDdrRegisterOperandSpec{
-                    GraphDdrRegisterAbi{
-                        GraphDdrRegisterRole::KeyCache,
-                        GraphDdrRegisterAccess::Write,
-                        GraphDdrRegisterEncoding::DevAddrShift8LoHi, 4, 5},
-                    k_cache},
-                GraphDdrRegisterOperandSpec{
-                    GraphDdrRegisterAbi{
-                        GraphDdrRegisterRole::ValueCache,
-                        GraphDdrRegisterAccess::Write,
-                        GraphDdrRegisterEncoding::DevAddrShift8LoHi, 6, 7},
-                    v_cache},
-                GraphDdrRegisterOperandSpec{
-                    GraphDdrRegisterAbi{
-                        GraphDdrRegisterRole::SemanticInput,
-                        GraphDdrRegisterAccess::Read,
-                        GraphDdrRegisterEncoding::DevAddrShift8LoHi, 8, 9},
-                    cos},
-                GraphDdrRegisterOperandSpec{
-                    GraphDdrRegisterAbi{
-                        GraphDdrRegisterRole::SemanticInput,
-                        GraphDdrRegisterAccess::Read,
-                        GraphDdrRegisterEncoding::DevAddrShift8LoHi, 10, 11},
-                    sin}});
-
-    const at::Tensor* ddr_operands[] = {&k_cache, &v_cache, &cos, &sin};
-    for (const at::Tensor* tensor : ddr_operands) {
-        rpu_ddr_flush(tensor->data_ptr());
-        TORCH_CHECK(
-            RpuGetDevAddr(tensor->data_ptr()) % 256 == 0,
-            "Wall P640 owner-direct DDR operand is not 256-byte aligned");
-    }
-    const uint64_t k_cache_addr = RpuGetDevAddr(k_cache.data_ptr());
-    const uint64_t v_cache_addr = RpuGetDevAddr(v_cache.data_ptr());
-    const uint64_t k_cache_bytes =
-        static_cast<uint64_t>(k_cache.numel()) * sizeof(c10::Half);
-    const uint64_t v_cache_bytes =
-        static_cast<uint64_t>(v_cache.numel()) * sizeof(c10::Half);
-    TORCH_CHECK(
-        k_cache_addr + k_cache_bytes <= v_cache_addr ||
-            v_cache_addr + v_cache_bytes <= k_cache_addr,
-        "Wall P640 owner-direct K/V DDR cache ranges must not overlap");
-
-    Kernel_t* kernel =
-        GET_KERNEL(KernelId::WALL_PREFILL_OWNER_DIRECT_KV_M640);
-    TORCH_CHECK(kernel != nullptr,
-                "owner_direct_kv_m640 missing from expansion ref");
-    kernel->reset_regs();
-    kernel->set_regs(0, static_cast<uint16_t>(k_offset));
-    kernel->set_regs(1, static_cast<uint16_t>(k_offset >> 16));
-    kernel->set_regs(2, static_cast<uint16_t>(v_offset));
-    kernel->set_regs(3, static_cast<uint16_t>(v_offset >> 16));
-    kernel->set_regs(12, static_cast<uint16_t>(0));
-    register_writer.write(*kernel);
-
-    auto* queue = GET_QUEUE(NUM_CORES);
-    queue->set_broadcast_mode(true);
-    const std::vector<uint8_t> cores{0, 1, 2, 3, 4, 5, 6, 7};
-    queue->enqueu_kernel(*kernel, {40, 1, 1}, cores);
-
-    rpu_ddr_flush(k_cache.data_ptr<c10::Half>());
-    rpu_ddr_flush(v_cache.data_ptr<c10::Half>());
 }

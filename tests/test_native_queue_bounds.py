@@ -115,8 +115,11 @@ struct Segment {
 };
 struct SegmentResourceUse { size_t entries=0, kd_bytes=0, instr_bytes=0; uint16_t active_streams=0; };
 using SegmentResourceBudget = SegmentResourceUse;
-SegmentResourceBudget segment_resource_budget(const std::string&, const GraphRuntimePolicy&) {
+SegmentResourceBudget segment_resource_budget(const std::string&, const GraphRuntimePolicy&, bool = false) {
     return {1000, 1000, 1000};
+}
+bool causal_14b_c4_initial_prefill_needs_small_segments(const GraphSignature*, const GraphRuntimePolicy&) {
+    return false;
 }
 SegmentResourceUse segment_node_resources(const GraphNode&, const std::vector<int>&) { return {1,1,1}; }
 bool p7_should_force_isolate_kernel(const GraphNode& node) { return node.isolate; }
@@ -129,6 +132,7 @@ struct RpuKernelGraph {
     std::vector<Segment> segments_;
     std::vector<int> kernels_;
     std::optional<GraphSignature> pending_signature_;
+    bool require_single_segment_ = false;
     bool has_built_signature_ = false;
     GraphSignature built_signature_;
     uint64_t graph_lifetime_id_ = 1;

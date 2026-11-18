@@ -7,7 +7,7 @@ def test_actual_vlm_w8_launch_owned_registers_and_complete_regions(tmp_path):
                    'inline void launch_hyvla_vlm_gateup_w8(')
     source = COMMON + r'''
 #include "ops/rpu_linear_tiling.h"
-enum class KernelId {WALL_PREFILL_GATE_UP_SWIGLU_W8A16_M320N112};
+enum class KernelId : uint16_t {HYVLA_VLM_GATEUP_SWIGLU_W8_V2};
 enum class GraphDdrRegisterRole {Int8ModelWeight,PerChannelScale};
 enum class GraphDdrRegisterAccess {Read};
 enum class GraphDdrRegisterEncoding {DevAddrShift8LoHi};
@@ -26,10 +26,10 @@ struct RpuKernelGraph {
  static RpuKernelGraph& active(){static RpuKernelGraph g;return g;}
  void keep_alive(const at::Tensor&){++kept;}
  Writer stage_kernel_ddr_registers(KernelId id,std::vector<GraphDdrRegisterOperandSpec> v){
-  assert(id==KernelId::WALL_PREFILL_GATE_UP_SWIGLU_W8A16_M320N112);
+  assert(id==KernelId::HYVLA_VLM_GATEUP_SWIGLU_W8_V2);
   assert(v.size()==4);++staged;
   for(size_t i=0;i<v.size();++i){auto& o=v[i];bool scale=i%2==1;
-   assert(o.abi.lo==std::array<int,4>{2,20,24,26}[i]);
+   assert(o.abi.lo==std::array<int,4>{2,20,32,34}[i]);
    assert(o.abi.role==(scale?GraphDdrRegisterRole::PerChannelScale:GraphDdrRegisterRole::Int8ModelWeight));
    assert(o.tensor.nbytes()==size_t(scale?12288:12582912));assert(o.abi.hi==o.abi.lo+1);
    assert(o.abi.access==GraphDdrRegisterAccess::Read && o.abi.encoding==GraphDdrRegisterEncoding::DevAddrShift8LoHi);}
@@ -37,7 +37,7 @@ struct RpuKernelGraph {
 };
 struct Queue {void set_broadcast_mode(bool b){assert(b);}
  void enqueu_kernel(Kernel&,std::vector<uint16_t> grid,std::vector<uint8_t> cores){
-  assert(grid==std::vector<uint16_t>({7,1,1}));
+  assert(grid==std::vector<uint16_t>({10,1,1}));
   assert(cores==std::vector<uint8_t>({0,1,2,3,4,5,6,7}));++queued;}
 } queue;
 #define GET_KERNEL(id) (&::kernel)
@@ -61,11 +61,11 @@ int main(){
   assert(ok==expected && queued==q+int(expected));
   assert(staged==s+int(expected) && kept==k+4*int(expected));};
  run(true);auto pair=[&](int i){return uint32_t(kernel.regs[i])|(uint32_t(kernel.regs[i+1])<<16);};
- assert(pair(0)==in && pair(4)==out && pair(8)==240 && pair(10)==768);
+ assert(pair(0)==in && pair(4)==out && kernel.regs[8]==1 && kernel.regs[9]==240 && pair(10)==768);
  assert(kernel.regs[12]==2048 && kernel.regs[13]==128 && kernel.regs[15]==8);
- assert(pair(16)==4096 && pair(18)==1536 && kernel.regs[22]==1 && kernel.regs[23]==1);
- assert(pair(2)==ts[0].address>>8 && pair(24)==ts[1].address>>8);
- assert(pair(20)==ts[2].address>>8 && pair(26)==ts[3].address>>8);
+ assert(pair(16)==4096 && pair(18)==1536 && pair(22)==0 && pair(24)==0 && kernel.regs[26]==2 && kernel.regs[27]==1);
+ assert(pair(2)==ts[0].address>>8 && pair(32)==ts[1].address>>8);
+ assert(pair(20)==ts[2].address>>8 && pair(34)==ts[3].address>>8);
  for(int r:{0,51,239,241,320})run(false,r);
  for(auto* addr:{&in,&out}){auto saved=*addr;
   for(auto invalid:{0x1fffff00u,0x20000001u,0x207fff00u}){*addr=invalid;run(false);}*addr=saved;}
@@ -80,6 +80,6 @@ int main(){
  spm.base=0x20000000;in=spm.base;out=0x20200000;spm.ready=false;run(false);
 }
 '''
-    source = source.replace('assert(o.abi.lo==std::array<int,4>{2,20,24,26}[i]);',
-                            'assert((o.abi.lo==std::array<int,4>{2,20,24,26}[i]));')
+    source = source.replace('assert(o.abi.lo==std::array<int,4>{2,20,32,34}[i]);',
+                            'assert((o.abi.lo==std::array<int,4>{2,20,32,34}[i]));')
     compile_run(tmp_path, 'vlm_w8_gateup', source.replace('LAUNCH', launch))

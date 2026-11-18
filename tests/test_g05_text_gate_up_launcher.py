@@ -57,18 +57,18 @@ template<class F>void reject(F f){auto&g=RpuKernelGraph::active();auto before=g.
 int main(){
  auto&g=RpuKernelGraph::active();const uint32_t base=allocator.addr(0,0);
  for(uint32_t pass=0;pass<2;++pass){const uint32_t in=base+0x20000+pass*0x200000,q=in+1048576,gate=q+393216;at::Tensor qw{0x1234567800ULL+pass*0x400000},gw{0x2345678900ULL+pass*0x800000};gs.address+=0x40000;us.address+=0x80000;launch(in,qw,gw,q,gate);const auto&s=g.submissions.back();
-  assert(pair(s,0)==in&&pair(s,4)==q&&pair(s,26)==gate);assert(pair(s,2)==qw.address>>8&&pair(s,24)==gw.address>>8);
-  assert(pair(s,6)==0&&s.regs.at(8)==256&&pair(s,10)==768&&s.regs.at(12)==2048&&s.regs.at(13)==128&&s.regs.at(14)==0&&s.regs.at(15)==8);
-  assert(pair(s,16)==4096&&pair(s,18)==1536&&(W8||pair(s,20)==0)&&s.regs.at(22)==1&&s.regs.at(23)==(W8?1:2));
+  assert(pair(s,0)==in&&pair(s,4)==q&&pair(s,36)==gate);assert(pair(s,2)==qw.address>>8&&pair(s,32)==gw.address>>8);
+  assert(pair(s,6)==0&&s.regs.at(8)==1&&s.regs.at(9)==256&&pair(s,10)==768&&s.regs.at(12)==2048&&s.regs.at(13)==128&&s.regs.at(14)==0&&s.regs.at(15)==8);
+  assert(pair(s,16)==4096&&pair(s,18)==1536&&(W8||pair(s,20)==0)&&pair(s,22)==0&&pair(s,24)==0&&s.regs.at(26)==2&&s.regs.at(27)==(W8?1:2));
   assert(s.operands.size()==(W8?4:2)&&s.operands[0].owner.address==qw.address&&s.operands[1].owner.address==gw.address);
-  for(int i=0;i<2;++i){auto&abi=s.operands[i].abi;assert(abi.role==(W8?GraphDdrRegisterRole::Int8ModelWeight:GraphDdrRegisterRole::ModelWeight)&&abi.access==GraphDdrRegisterAccess::Read&&abi.encoding==GraphDdrRegisterEncoding::DevAddrShift8LoHi&&abi.lo==(i?24:2)&&abi.hi==(i?25:3));}
+  for(int i=0;i<2;++i){auto&abi=s.operands[i].abi;assert(abi.role==(W8?GraphDdrRegisterRole::Int8ModelWeight:GraphDdrRegisterRole::ModelWeight)&&abi.access==GraphDdrRegisterAccess::Read&&abi.encoding==GraphDdrRegisterEncoding::DevAddrShift8LoHi&&abi.lo==(i?32:2)&&abi.hi==(i?33:3));}
   const int fi=pass*(W8?4:2);assert(flushed[fi]==qw.address&&flushed[fi+1]==gw.address);
-  if(W8){assert(pair(s,20)==gs.address>>8&&pair(s,28)==us.address>>8);assert(s.operands[2].owner.address==gs.address&&s.operands[3].owner.address==us.address);assert(flushed[fi+2]==gs.address&&flushed[fi+3]==us.address);for(int i=2;i<4;++i){const auto&abi=s.operands[i].abi;assert(abi.role==GraphDdrRegisterRole::PerChannelScale&&abi.access==GraphDdrRegisterAccess::Read&&abi.encoding==GraphDdrRegisterEncoding::DevAddrShift8LoHi&&abi.lo==(i==2?20:28)&&abi.hi==(i==2?21:29));}}
+  if(W8){assert(pair(s,20)==gs.address>>8&&pair(s,34)==us.address>>8);assert(s.operands[2].owner.address==gs.address&&s.operands[3].owner.address==us.address);assert(flushed[fi+2]==gs.address&&flushed[fi+3]==us.address);for(int i=2;i<4;++i){const auto&abi=s.operands[i].abi;assert(abi.role==GraphDdrRegisterRole::PerChannelScale&&abi.access==GraphDdrRegisterAccess::Read&&abi.encoding==GraphDdrRegisterEncoding::DevAddrShift8LoHi&&abi.lo==(i==2?20:34)&&abi.hi==(i==2?21:35));}}
  }
  const at::Tensor qw{0x1234567800ULL},gw{0x2345678900ULL};const uint32_t in=base+0x20000,q=in+1048576,gate=q+393216;
  launch(base,qw,gw,base+1048576,base+1441792);
  const uint32_t end=base+SpmAllocator::SPM_USABLE;launch(end-1835008,qw,gw,end-786432,end-393216);
- assert(pair(g.submissions.back(),26)==end-393216);
+ assert(pair(g.submissions.back(),36)==end-393216);
  for(auto regions:{std::array<uint32_t,3>{in,in,gate},{in,q,q},{in,q,in+256},{in,q-256,gate},{in,q,gate-256},{in+1,q,gate},{base-256,q,gate},{in,q,base+SpmAllocator::SPM_USABLE-8192}})reject([&]{launch(regions[0],qw,gw,regions[1],regions[2]);});
  allocator.initialized=false;reject([&]{launch(in,qw,gw,q,gate);});allocator.initialized=true;KernelCache::instance().available=false;reject([&]{launch(in,qw,gw,q,gate);});KernelCache::instance().available=true;
  for(int which:{0,1})for(int fault=0;fault<7;++fault){auto first=qw,second=gw;auto&w=which?second:first;if(fault==0){w.present=false;}if(fault==1){w.dtype=W8?at::kHalf:at::kChar;}if(fault==2){w.contiguous=false;}if(fault==3){w.location=c10::DeviceType::CPU;}if(fault==4){w.rank=1;}if(fault==5){w.rows=1024;}if(fault==6){w.cols=512;}reject([&]{launch(in,first,second,q,gate);});}

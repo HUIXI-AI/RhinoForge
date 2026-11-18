@@ -4,6 +4,7 @@
 #include "core/rpu_kernel_decls.h"
 #include "core/rpu_spm_allocator.h"
 #include "graph/graph_runtime.h"
+#include "rpu_parallel_linear_register_policies.h"
 
 #include <c10/util/Exception.h>
 
@@ -216,104 +217,7 @@ GraphKernelRegisterCensusStats phase_stats(
 }
 
 const GraphKernelRegisterPolicy& gr00t_z2_register_policy() {
-    // Frozen from already-passing captured BUILD traces (never learned by a
-    // live schema-5 run).
-    // v3 routes each reduction through one generated fused ring collective.
-    // v4 additionally routes every M=1 FP16
-    // projection through the shared auto-tile Linear family instead of the
-    // retired GEMV family. The hashes below are rebuilt mechanically from those
-    // same traces; the first guarded native BUILD must confirm them on the
-    // current oplib.
-    // Compute `ph=B` names provide the ordered Kernel stream. Graph DMA wrapper
-    // emission restores each 8-channel burst as Barrier×7,Dma×8,Barrier×7 and
-    // each channel-0-only burst as Dma; FNV-1a consumes the GraphNodeKind byte
-    // (Kernel=0,Dma=8,Barrier=9). This is Graph emission order, not the SDK's
-    // reordered/missing SYNC trace-event order.
-    static const GraphKernelRegisterPolicy policy = [] {
-        GraphKernelRegisterPolicy value;
-        value.fingerprint = UINT64_C(0x475230305a325634);  // GR00Z2V4
-        value.name = "gr00t_z2_register_census_v4";
-        const auto weight = ddr_abi(
-            GraphDdrRegisterRole::ModelWeight,
-            GraphDdrRegisterAccess::Read, 2, 3);
-        const auto key_write = ddr_abi(
-            GraphDdrRegisterRole::KeyCache,
-            GraphDdrRegisterAccess::Write, 8, 9);
-        const auto value_write = ddr_abi(
-            GraphDdrRegisterRole::ValueCache,
-            GraphDdrRegisterAccess::Write, 8, 9);
-        const auto key_read = ddr_abi(
-            GraphDdrRegisterRole::KeyCache,
-            GraphDdrRegisterAccess::Read, 50, 51);
-        const auto value_read = ddr_abi(
-            GraphDdrRegisterRole::ValueCache,
-            GraphDdrRegisterAccess::Read, 52, 53);
-        value.rules = {
-            typed_rule(KernelId::PL_AT_FP16_M384N96, 942, {weight}),
-            typed_rule(KernelId::PL_AT_FP16_M320N128, 12, {weight}),
-            typed_rule(KernelId::LLAMA_INSERT_KCACHE_V16, 128,
-                       {key_write}),
-            typed_rule(KernelId::LLAMA_INSERT_VCACHE_V16, 128,
-                       {value_write}),
-            typed_rule(KernelId::LLAMA_INSERT_KCACHE, 4, {key_write}),
-            typed_rule(KernelId::LLAMA_INSERT_VCACHE, 4, {value_write}),
-            typed_rule(KernelId::SDPA_FLASH_ATTN_SPM, 132,
-                       {key_read, value_read}),
-            explicit_no_ddr_rule(
-                KernelId::LLM_ALL_REDUCE_RESIDUAL_RING_PACED, 264,
-                GraphKernelNoDdrProof::RingAllReduceSpmResidual),
-            explicit_no_ddr_rule(
-                KernelId::LLM_ALL_REDUCE_RESIDUAL_RING_NOPACE, 128,
-                GraphKernelNoDdrProof::RingAllReduceSpmResidual),
-            intrinsic_no_ddr_rule(KernelId::MEMSET_SPM_MULTI_CORE_V2, 328),
-            intrinsic_no_ddr_rule(KernelId::LAYER_NORM, 269),
-            intrinsic_no_ddr_rule(KernelId::BINARY_SCALAR, 137),
-            intrinsic_no_ddr_rule(KernelId::UNARY_GELU_TANH_SPM, 132),
-            // Six M=1 projections previously needed a separate bias add after
-            // the retired M=1 path. The auto-tile Linear ABI consumes them in
-            // the projection kernel, leaving only the 12 model-level adds.
-            intrinsic_no_ddr_rule(KernelId::BINARY_SAMESHAPE, 12),
-            intrinsic_no_ddr_rule(KernelId::UNARY_SPM, 4),
-        };
-        GraphKernelRegisterRule dynamic_binary;
-        dynamic_binary.kernel_name = "binary_1xC_NxC_tileC";
-        dynamic_binary.kind = GraphKernelRegisterRuleKind::IntrinsicNoDdr;
-        dynamic_binary.expected_count = 1;
-        value.rules.push_back(std::move(dynamic_binary));
-
-        value.expected_node_count = 10782;
-        value.expected_dma_count = 3033;
-        value.expected_barrier_count = 5124;
-        value.expected_kernel_count = 2625;
-        value.expected_typed_kernel_count = 1350;
-        value.expected_no_ddr_kernel_count = 1275;
-        value.expected_operand_count = 1482;
-        value.expected_weight_operand_count = 954;
-        value.expected_key_cache_operand_count = 264;
-        value.expected_value_cache_operand_count = 264;
-        value.expected_semantic_input_operand_count = 0;
-        value.expected_ordered_node_kind_hash =
-            UINT64_C(0x1cfe991b4c0a51a5);
-        value.expected_ordered_kernel_hash =
-            UINT64_C(0x02a89226f052e980);
-        value.phases = {
-            GraphKernelRegisterPhaseExpectation{
-                "vl_encoder",
-                phase_stats(
-                    866, 296, 504, 66, 36, 30, 40, 24, 8, 8,
-                    UINT64_C(0xb07b80c16deb5555),
-                    UINT64_C(0x728c2112d7fcf9b9))},
-            GraphKernelRegisterPhaseExpectation{
-                "denoise",
-                phase_stats(
-                    9916, 2737, 4620, 2559, 1314, 1245,
-                    1442, 930, 256, 256,
-                    UINT64_C(0x72c4af3f08d45a75),
-                    UINT64_C(0xee5248a5e490c4e4))},
-        };
-        return value;
-    }();
-    return policy;
+    return rpu_pl_census::policy("gr00t_z2_register_policy");
 }
 
 }  // namespace

@@ -40,9 +40,20 @@ def _autotile_names() -> set[str]:
     if compiler is None:
         raise RuntimeError("c++ is required to evaluate the host autotile table")
     source = (
-        '#include "rpu_linear_tiling.h"\n#include <iostream>\n'
-        "int main(){for(const auto& n:rpu_pl_tiling::autotile_kernel_names())"
-        'std::cout<<n<<"\\n";}\n'
+        '#include "rpu_linear_tiling.h"\n'
+        '#include "rpu_linear_w8a8_contract.h"\n'
+        '#include "rpu_pi_wall_tiling.h"\n'
+        "#include <iostream>\n"
+        "int main(){\n"
+        "  for(const auto& n:rpu_pl_tiling::autotile_kernel_names()) std::cout<<n<<'\\n';\n"
+        "  for(const auto& n:rpu_pl_tiling::grouped_autotile_kernel_names()) std::cout<<n<<'\\n';\n"
+        "  for(const auto& c:rpu_pl_w8a8::installed_candidates()) std::cout<<c.name<<'\\n';\n"
+        "  for(const auto* n:rpu_pi_wall::candidate_names) std::cout<<n<<'\\n';\n"
+        '#define GIL(indexed, dtype, id, sym, m, n, k) std::cout<<sym<<"\\n";\n'
+        '#include "rpu_grouped_indexed_linear_tiles.inc"\n'
+        '#include "rpu_grouped_indexed_linear_current_tiles.inc"\n'
+        "#undef GIL\n"
+        "}\n"
     )
     with tempfile.TemporaryDirectory() as directory:
         executable = Path(directory) / "autotile_names"
@@ -51,6 +62,7 @@ def _autotile_names() -> set[str]:
                 compiler,
                 "-std=c++17",
                 f"-I{ROOT / 'src/ops'}",
+                f"-I{ROOT / 'src/core'}",
                 "-x",
                 "c++",
                 "-",

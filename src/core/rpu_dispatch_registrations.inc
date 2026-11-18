@@ -33,7 +33,8 @@ TORCH_LIBRARY(rpu, m) {
   m.def("require_kernel_names(str[] names) -> ()", [](const std::vector<std::string>& names) {
     KernelCache::instance().require_names(names);
   });
-  m.def("w4_pgrp_prepare_metadata(Tensor weight, Tensor metadata) -> Tensor",
+  // Small production-launcher probe; caller owns all fixed Graph operands.
+  m.def("w4_pgrp_prepare_metadata(Tensor weight, Tensor metadata, int num_cores=8) -> Tensor",
         TORCH_FN(rpu_retain_linear_quant_scale));
   m.def("parallel_linear_w4_test_out(Tensor input_per_core, Tensor weight, Tensor scale, Tensor? negative_zero, Tensor(a!) output_per_core, bool is_col_parallel, bool linear_acc32=False) -> ()",
         TORCH_FN(rpu_parallel_linear_w4_test_out));
@@ -44,6 +45,9 @@ TORCH_LIBRARY(rpu, m) {
         TORCH_FN(rpu_causal_decoder_planner_cache_identity));
   m.def("qwen3_5_planner_cache_identity(int handle) -> int[]",
         TORCH_FN(rpu_qwen3_5_planner_cache_identity));
+  m.def("qwen3_5_checked_decode_replay_counters(int handle) -> int[]",
+        TORCH_FN(rpu_qwen3_5_checked_decode_replay_counters));
+  m.def("qwen3_5_set_decode_candidate_head", TORCH_FN(rpu_qwen3_5_set_decode_candidate_head));
   m.def("qwen3_5_moe_planner_cache_identity(int handle) -> int[]",
         TORCH_FN(rpu_qwen3_5_moe_planner_cache_identity));
   m.def("qwen3_5_vision_planner_cache_identity(int handle) -> int[]",
@@ -185,41 +189,45 @@ TORCH_LIBRARY(rpu, m) {
         TORCH_FN(rpu_vision_input_fp32_to_fp16_into));
   m.def("linear_into(Tensor input, Tensor weight, Tensor? bias, Tensor(a!) out, bool linear_acc32=True) -> ()",
         TORCH_FN(rpu_linear_into));
+  m.def("linear_w8a8(Tensor input, Tensor weight, Tensor scale, Tensor? bias=None, int partition=1, int num_cores=8) -> Tensor",
+        TORCH_FN(rpu_linear_w8a8));
   m.def("linear_w8a16(Tensor input, Tensor weight, Tensor scale, Tensor? bias=None) -> Tensor",
         TORCH_FN(rpu_linear_w8a16));
   m.def("linear_w8a16_into(Tensor input, Tensor weight, Tensor scale, Tensor? bias, Tensor(a!) out, bool linear_acc32=False) -> ()",
         TORCH_FN(rpu_linear_w8a16_into));
-  m.def("linear_w4a16(Tensor input, Tensor weight, Tensor scale, Tensor? bias=None) -> Tensor",
+  m.def("linear_w4a16(Tensor input, Tensor weight, Tensor scale, Tensor? bias=None, int logical_out_features=-1) -> Tensor",
         TORCH_FN(rpu_linear_w4a16));
   m.def("linear_with_core_count(Tensor input, Tensor weight, Tensor? bias, int partition, int num_cores) -> Tensor",
         TORCH_FN(rpu_linear_with_core_count));
-  m.def("linear_with_accumulation(Tensor input, Tensor weight, Tensor? bias, int partition, int num_cores, bool linear_acc32, Tensor? scale=None) -> Tensor",
+  m.def("linear_with_accumulation(Tensor input, Tensor weight, Tensor? bias, int partition, int num_cores, bool linear_acc32, Tensor? scale=None, int logical_out_features=-1, bool gelu_erf=False) -> Tensor",
         TORCH_FN(rpu_linear_with_accumulation));
-  m.def("tts_codec_conv1d(Tensor input, Tensor weight, Tensor? bias, int kernel, int dilation, int out_channels) -> Tensor",
+  m.def("conv1d_slab_with_accumulation(Tensor input, Tensor weight, Tensor? bias, int taps, int dilation, int num_cores) -> Tensor",
+        TORCH_FN(rpu_conv1d_slab_with_accumulation));
+  m.def("tts_codec_conv1d(Tensor input, Tensor weight, Tensor? bias, int kernel, int dilation, int out_channels, int num_cores=8) -> Tensor",
         TORCH_FN(rpu_tts_codec_conv1d));
-  m.def("tts_codec_conv_pair(Tensor input, Tensor first_weight, Tensor affine, Tensor second_weight, Tensor second_bias, int dilation, int channels) -> Tensor",
+  m.def("tts_codec_conv_pair(Tensor input, Tensor first_weight, Tensor affine, Tensor second_weight, Tensor second_bias, int dilation, int channels, int num_cores=8) -> Tensor",
         TORCH_FN(rpu_tts_codec_conv_pair));
-  m.def("tts_codec_conv1d_spm(Tensor input, Tensor weight, Tensor? bias, int kernel, int dilation, int out_channels) -> Tensor",
+  m.def("tts_codec_conv1d_spm(Tensor input, Tensor weight, Tensor? bias, int kernel, int dilation, int out_channels, int num_cores=8) -> Tensor",
         TORCH_FN(rpu_tts_codec_conv1d_spm));
-  m.def("tts_codec_conv1d_spm_bias(Tensor input, Tensor weight, Tensor? bias, int kernel, int dilation, int out_channels) -> Tensor",
+  m.def("tts_codec_conv1d_spm_bias(Tensor input, Tensor weight, Tensor? bias, int kernel, int dilation, int out_channels, int num_cores=8) -> Tensor",
         TORCH_FN(rpu_tts_codec_conv1d_spm));
-  m.def("tts_codec_residual_unit(Tensor input, Tensor first_weight, Tensor affine, Tensor second_weight, int dilation, int channels) -> Tensor",
+  m.def("tts_codec_residual_unit(Tensor input, Tensor first_weight, Tensor affine, Tensor second_weight, int dilation, int channels, int num_cores=8) -> Tensor",
         TORCH_FN(rpu_tts_codec_residual_unit));
-  m.def("tts_codec_residual_unit_complete(Tensor input, Tensor first_weight, Tensor affine, Tensor second_weight, int dilation, int channels) -> Tensor",
+  m.def("tts_codec_residual_unit_complete(Tensor input, Tensor first_weight, Tensor affine, Tensor second_weight, int dilation, int channels, int num_cores=8) -> Tensor",
         TORCH_FN(rpu_tts_codec_residual_unit_complete));
-  m.def("tts_codec_residual_unit_rows(Tensor input, Tensor first_weight, Tensor affine, Tensor second_weight, int dilation, int channels) -> Tensor",
+  m.def("tts_codec_residual_unit_rows(Tensor input, Tensor first_weight, Tensor affine, Tensor second_weight, int dilation, int channels, int num_cores=8) -> Tensor",
         TORCH_FN(rpu_tts_codec_residual_unit_rows));
-  m.def("tts_codec_residual_unit_padded_rows(Tensor input, Tensor first_weight, Tensor affine, Tensor second_weight, int dilation, int channels) -> Tensor",
+  m.def("tts_codec_residual_unit_padded_rows(Tensor input, Tensor first_weight, Tensor affine, Tensor second_weight, int dilation, int channels, int num_cores=8) -> Tensor",
         TORCH_FN(rpu_tts_codec_residual_unit_padded_rows));
   m.def("tts_codec_snake(Tensor input, Tensor affine, int channels) -> Tensor",
         TORCH_FN(rpu_tts_codec_snake));
-  m.def("tts_codec_convnext_block(Tensor input, Tensor depthwise_weight, Tensor depthwise_bias, Tensor norm_weight, Tensor norm_bias, Tensor first_weight, Tensor first_bias, Tensor second_weight, Tensor second_bias, Tensor gamma, float eps) -> Tensor",
+  m.def("tts_codec_convnext_block(Tensor input, Tensor depthwise_weight, Tensor depthwise_bias, Tensor norm_weight, Tensor norm_bias, Tensor first_weight, Tensor first_bias, Tensor second_weight, Tensor second_bias, Tensor gamma, float eps, int num_cores=8) -> Tensor",
         TORCH_FN(rpu_tts_codec_convnext_block));
-  m.def("tts_codec_conv_transpose1d(Tensor input, Tensor weight, Tensor? bias, int out_channels, int kernel, int stride) -> Tensor",
+  m.def("tts_codec_conv_transpose1d(Tensor input, Tensor weight, Tensor? bias, int out_channels, int kernel, int stride, int num_cores=8) -> Tensor",
         TORCH_FN(rpu_tts_codec_conv_transpose1d));
   m.def("tts_codec_transpose_overlap(Tensor projected, Tensor? bias, int channels, int kernel, int stride) -> Tensor",
         TORCH_FN(rpu_tts_codec_transpose_overlap));
-  m.def("tts_codec_conv_transpose1d_device_post(Tensor input, Tensor weight, Tensor? bias, int channels, int kernel, int stride) -> Tensor",
+  m.def("tts_codec_conv_transpose1d_device_post(Tensor input, Tensor weight, Tensor? bias, int channels, int kernel, int stride, int num_cores=8) -> Tensor",
         TORCH_FN(rpu_tts_codec_conv_transpose1d_device_post));
   // SDPA unified layout: [batch, seq_len, heads, head_dim] instead of standard [batch, heads, seq_len, head_dim]
   m.def("scaled_dot_product_attention_unified(Tensor query, Tensor key, Tensor value, Tensor? attn_mask=None, float dropout_p=0.0, bool is_causal=False, float? scale=None, bool enable_gqa=False) -> Tensor");
@@ -247,6 +255,10 @@ TORCH_LIBRARY(rpu, m) {
   m.def("causal_decoder_set_weights_nvfp4(int handle, Tensor[] q_w_list, Tensor[] k_w_list, Tensor[] v_w_list, Tensor[] o_w_list, Tensor[] q_norm_list, Tensor[] k_norm_list, Tensor[] input_norm_list, Tensor[] post_norm_list, Tensor[] gate_list, Tensor[] up_list, Tensor[] down_list, Tensor cos, Tensor sin, Tensor final_norm_w, int num_q_heads, int num_kv_heads, int head_dim, int hidden_size, int intermediate_size, float eps, bool use_silu, int[] mrope_section, int[] deepstack_lang_layers, Tensor[] q_w_scale_list, Tensor[] k_w_scale_list, Tensor[] v_w_scale_list, Tensor[] o_w_scale_list, Tensor[] gate_scale_list, Tensor[] up_scale_list, Tensor[] down_scale_list, Tensor q_tensor_scales, Tensor k_tensor_scales, Tensor v_tensor_scales, Tensor o_tensor_scales, Tensor gate_tensor_scales, Tensor up_tensor_scales, Tensor down_tensor_scales, Tensor[]? q_bias_list=None, Tensor[]? k_bias_list=None, Tensor[]? v_bias_list=None) -> ()");
   m.def("causal_decoder_forward(int handle, Tensor hidden_states, Tensor[] k_caches, Tensor[] v_caches, Tensor? attention_mask, int position, bool is_causal, Tensor? position_ids=None, Tensor[]? deepstack_dense_visual_embeds=None, Tensor? rope_cos_il=None, Tensor? rope_sin_il=None, int cos_sin_offset=-1, int batch_slot=0, bool allow_batch_decode=False, int planned_chunk_size=0, int[] planned_stage_descriptor=[]) -> Tensor");
   m.def("causal_decoder_set_lingbot_prefill_mode(int handle, bool folded_rmsnorm, bool kv_only) -> ()", TORCH_FN(rpu_causal_decoder_set_lingbot_prefill_mode));
+  m.def("causal_decoder_set_prefill_w8a8(int handle, bool enabled) -> ()", TORCH_FN(rpu_causal_decoder_set_prefill_w8a8));
+  m.def("causal_decoder_set_qwen3_c192(int handle, bool enabled) -> ()", TORCH_FN(rpu_causal_decoder_set_qwen3_c192));
+  m.def("causal_decoder_set_qwen3_c256(int handle, bool enabled) -> ()", TORCH_FN(rpu_causal_decoder_set_qwen3_c256));
+  m.def("causal_decoder_set_qwen3_c512(int handle, bool enabled) -> ()", TORCH_FN(rpu_causal_decoder_set_qwen3_c512));
   m.def("causal_decoder_set_lingbot_prefill_kv_pair(int handle, bool enabled) -> ()", TORCH_FN(rpu_causal_decoder_set_lingbot_prefill_kv_pair));
   m.def("causal_decoder_set_lingbot_prefill_qk_norm_rope(int handle, bool enabled) -> ()", TORCH_FN(rpu_causal_decoder_set_lingbot_prefill_qk_norm_rope));
   m.def("causal_decoder_enable_resident_preloads(int handle) -> ()", TORCH_FN(rpu_causal_decoder_enable_resident_preloads));
@@ -260,8 +272,10 @@ TORCH_LIBRARY(rpu, m) {
   m.def("causal_decoder_set_lm_head(int handle, Tensor lm_head_w, "
         "Tensor? lm_head_scale=None, bool fuse_prefill_last=False, "
         "int exact_candidates=0) -> ()");
-  m.def("causal_decoder_set_tts_predictor_heads(int handle, Tensor[] heads) -> ()");
-  m.def("causal_decoder_tts_predictor_logits", TORCH_FN(rpu_causal_decoder_tts_predictor_logits));
+  m.def("causal_decoder_set_lm_head_bank(int handle, Tensor[] lm_head_w, "
+        "Tensor[] lm_head_scale) -> ()");
+  m.def("causal_decoder_select_lm_head(int handle, int index) -> ()",
+        TORCH_FN(rpu_causal_decoder_select_lm_head));
   m.def("causal_decoder_clear_lm_head", TORCH_FN(rpu_causal_decoder_clear_lm_head));
   m.def("causal_decoder_set_fast_replay(int handle, bool enabled) -> ()",
         TORCH_FN(rpu_causal_decoder_set_fast_replay));
@@ -454,6 +468,13 @@ TORCH_LIBRARY(rpu, m) {
   // `logits.cpu().float().argmax(-1)` pays. An explicit op rather than an
   // aten::argmax override, so callers opt in and generic argmax is untouched.
   m.def("argmax_lastdim_host(Tensor self) -> Tensor");
+  m.def("argmax_lastdim_host_values(Tensor self) -> (Tensor, Tensor)");
+  // Temperature + top-k + softmax + draw in one op. The same chain in Python is
+  // five dispatches per generated token, which at a 2048-wide vocabulary costs
+  // more than the arithmetic; an explicit op rather than an aten::multinomial
+  // override, so callers opt in and generic sampling is untouched.
+  m.def("sample_topk_lastdim_host(Tensor self, float temperature, int top_k, "
+        "Generator? generator=None) -> Tensor");
   m.def("zero_contiguous_tensor_blocks_sized(Tensor(a!)[] tensors, "
         "int block_index) -> ()");
   m.def("lm_head_logits_top2_rescore_cpu(Tensor logits, Tensor hidden, "
@@ -498,7 +519,7 @@ TORCH_LIBRARY(rpu, m) {
   m.def("lingbot2_multiview_spm_z2_stats(int vision_handle, int text_handle, int expert_handle, int plan_hash, int[] planner_descriptor, int[] planner_digest) -> int[]", TORCH_FN(rpu_lingbot2_multiview_spm_z2_stats));
   m.def("lingbot2_multiview_spm_z2_executed_owner(int vision_handle, int text_handle, int expert_handle, int plan_hash, int[] planner_descriptor, int[] planner_digest) -> int[][]", TORCH_FN(rpu_lingbot2_multiview_spm_z2_executed_owner));
   m.def("lingbot2_multiview_spm_z2_close(int vision_handle, int text_handle, int expert_handle, int plan_hash, int[] planner_descriptor, int[] planner_digest) -> ()", TORCH_FN(rpu_lingbot2_multiview_spm_z2_close));
-  m.def("qwen3vl_pooler_spm_z1_prepare(int vision_handle, int text_handle, int num_patches, int execution_len, int image_row_begin, int real_len, int retained_deepstack_count=0, int[] vision_stage_descriptor=[], int[] text_stage_descriptor=[]) -> int", TORCH_FN(rpu_qwen3vl_pooler_spm_z1_prepare));
+  m.def("qwen3vl_pooler_spm_z1_prepare(int vision_handle, int text_handle, int num_patches, int execution_len, int image_row_begin, int real_len, int retained_deepstack_count=0, int[] vision_stage_descriptor=[], int[] text_stage_descriptor=[], bool partial_mrope=False) -> int", TORCH_FN(rpu_qwen3vl_pooler_spm_z1_prepare));
   m.def("qwen3vl_pooler_spm_z1_unprepare(int vision_handle, int text_handle, int plan_hash) -> ()", TORCH_FN(rpu_qwen3vl_pooler_spm_z1_unprepare));
   m.def("qwen3vl_pooler_spm_z1_plan_stats(int vision_handle, int text_handle, int plan_hash) -> int[]", TORCH_FN(rpu_qwen3vl_pooler_spm_z1_plan_stats));
   m.def("qwen3vl_pooler_spm_z1_selected_owner(int vision_handle, int text_handle, int plan_hash) -> int[][]", TORCH_FN(rpu_qwen3vl_pooler_spm_z1_selected_owner));
@@ -527,11 +548,15 @@ TORCH_LIBRARY(rpu, m) {
   m.def("qwen3_5_set_linear_acc32", TORCH_FN(rpu_qwen3_5_set_linear_acc32));
   m.def("qwen3_5_set_high_precision", TORCH_FN(rpu_qwen3_5_set_high_precision));
   m.def("qwen3_5_set_fast_replay", TORCH_FN(rpu_qwen3_5_set_fast_replay));
+  m.def("qwen3_5_set_initial_prefill_state_flush_skip",
+        TORCH_FN(rpu_qwen3_5_set_initial_prefill_state_flush_skip));
   m.def("qwen3_5_set_retained_prefill_graph",
         TORCH_FN(rpu_qwen3_5_set_retained_prefill_graph));
   m.def("qwen3_5_enable_action_mode", TORCH_FN(rpu_qwen3_5_enable_action_mode));
   m.def("qwen3_5_set_action_chunk_size",
         TORCH_FN(rpu_qwen3_5_set_action_chunk_size));
+  m.def("qwen3_5_set_action_valid_len",
+        TORCH_FN(rpu_qwen3_5_set_action_valid_len));
   m.def("qwen3_5_stage_action_chunk_size",
         TORCH_FN(rpu_qwen3_5_stage_action_chunk_size));
   m.def("qwen3_5_enable_execution_reconfigure",
@@ -577,6 +602,10 @@ TORCH_LIBRARY(rpu, m) {
         TORCH_FN(rpu_qwen3_5_moe_set_mrope_position_delta));
   m.def("qwen3_5_moe_set_chunk_size_cap",
         TORCH_FN(rpu_qwen3_5_moe_set_chunk_size_cap));
+  m.def("qwen3_5_moe_set_resident_uint4_n32k32_weights",
+        TORCH_FN(rpu_qwen3_5_moe_set_resident_uint4_n32k32_weights));
+  m.def("qwen3_5_moe_set_resident_prefill",
+        TORCH_FN(rpu_qwen3_5_moe_set_resident_prefill));
   m.def("qwen3_5_moe_set_prefill_chunk_size",
         TORCH_FN(rpu_qwen3_5_moe_set_prefill_chunk_size));
   m.def("qwen3_5_moe_set_linear_acc32",
@@ -630,6 +659,13 @@ TORCH_LIBRARY(rpu, m) {
   m.def("gemma4_create", TORCH_FN(rpu_gemma4_create));
   m.def("gemma4_destroy", TORCH_FN(rpu_gemma4_destroy));
   m.def("gemma4_set_chunk_envelope", TORCH_FN(rpu_gemma4_set_chunk_envelope));
+  m.def("gemma4_set_execution_core_count", TORCH_FN(rpu_gemma4_set_execution_core_count));
+  m.def("gemma4_get_execution_topology", TORCH_FN(rpu_gemma4_get_execution_topology));
+  // Exact E4B W8A16 / W4A16-G32: FP16 scales for the installed quantized
+  // decoder projections, validated as a whole before publication.
+  m.def("gemma4_set_weight_scales(int handle, Tensor[] q_scales, "
+        "Tensor[] k_scales, Tensor[] v_scales, Tensor[] o_scales, "
+        "Tensor[] gate_scales, Tensor[] up_scales, Tensor[] down_scales) -> ()");
   m.def("gemma4_set_weights(int handle, Tensor[] q_w_list, Tensor[] k_w_list, Tensor[] v_w_list, Tensor[] o_w_list, Tensor[] q_norm_list, Tensor[] k_norm_list, Tensor[] input_norm_list, Tensor[] post_attn_norm_list, Tensor[] pre_ff_norm_list, Tensor[] post_ff_norm_list, Tensor[] gate_list, Tensor[] up_list, Tensor[] down_list, Tensor cos_sliding, Tensor sin_sliding, Tensor cos_global, Tensor sin_global, Tensor final_norm_w, Tensor[] ple_gate_list, Tensor[] ple_proj_list, Tensor[] ple_post_norm_list, Tensor layer_scalar, int[] layer_type_ids, int[] head_dim_per_layer, int[] num_kv_heads_per_layer, int[] kv_source_layer, int[] is_kv_shared, int num_q_heads, int num_kv_heads_max, int head_dim_max, int hidden_size, int intermediate_size, int ple_dim, float eps, float qk_scale, int sliding_window) -> ()");
   m.def("gemma4_resolve_stage_domain",
         TORCH_FN(rpu_gemma4_resolve_stage_domain));
@@ -646,6 +682,10 @@ TORCH_LIBRARY(rpu, m) {
   m.def("adarms_forward(int handle, Tensor hidden_states, Tensor cond, Tensor[] k_caches, Tensor[] v_caches, Tensor? attention_mask, int position, bool is_causal, int[] planned_stage_descriptor=[]) -> Tensor");
   // GR00T-N1.7 flow-matching DiT action head (src/fused/rpu_gr00t_dit_model.cpp)
   m.def("gr00t_dit_create", TORCH_FN(rpu_gr00t_dit_create));
+  m.def("gr00t_dit_set_execution_core_count(int handle, int cores) -> ()",
+        TORCH_FN(rpu_gr00t_dit_set_execution_core_count));
+  m.def("gr00t_dit_get_execution_topology(int handle) -> int[]",
+        TORCH_FN(rpu_gr00t_dit_get_execution_topology));
   m.def("gr00t_dit_prepare_persistent_spm(int handle, int execution_len) -> ()",
         TORCH_FN(rpu_gr00t_dit_prepare_persistent_spm));
   m.def("gr00t_dit_prepare_adaln_table", TORCH_FN(rpu_gr00t_dit_prepare_adaln_table));
@@ -674,6 +714,10 @@ TORCH_LIBRARY(rpu, m) {
   m.def("navdp_set_chunk_envelope", TORCH_FN(rpu_navdp_set_chunk_envelope));
   m.def("navdp_destroy", TORCH_FN(rpu_navdp_destroy));
   m.def("navdp_set_former_mode", TORCH_FN(rpu_navdp_set_former_mode));
+  m.def("navdp_set_execution_core_count(int handle, int cores) -> ()",
+        TORCH_FN(rpu_navdp_set_execution_core_count));
+  m.def("navdp_get_execution_topology(int handle) -> int[]",
+        TORCH_FN(rpu_navdp_get_execution_topology));
   m.def("navdp_set_weights(int handle, Tensor[] sq_w, Tensor[] sk_w, Tensor[] sv_w, Tensor[] so_w, Tensor[] sq_b, Tensor[] sk_b, Tensor[] sv_b, Tensor[] so_b, Tensor[] cq_w, Tensor[] ck_w, Tensor[] cv_w, Tensor[] co_w, Tensor[] cq_b, Tensor[] ck_b, Tensor[] cv_b, Tensor[] co_b, Tensor[] ff1_w, Tensor[] ff1_b, Tensor[] ff2_w, Tensor[] ff2_b, Tensor[] n1_w, Tensor[] n1_b, Tensor[] n2_w, Tensor[] n2_b, Tensor[] n3_w, Tensor[] n3_b, int num_heads, int head_dim, int hidden_size, int ff_inter, int memory_len, int predict_size, int action_dim, float eps) -> ()");
   m.def("navdp_resolve_stage_domain(int handle, int packed_rows, int denoise_steps=0) -> int[]", TORCH_FN(rpu_navdp_resolve_stage_domain));
   m.def("navdp_get_resolved_chunk_size(int handle) -> int", TORCH_FN(rpu_navdp_get_resolved_chunk_size));
@@ -682,6 +726,10 @@ TORCH_LIBRARY(rpu, m) {
   m.def("navdp_denoise_loop_forward(int handle, Tensor x0, Tensor mem_all, Tensor sigz, Tensor coeff, Tensor[] k_caches, Tensor[] v_caches, Tensor out, int[] planned_stage_descriptor=[]) -> Tensor");
   // GR00T-N1.7 Component A — vlln + 4-layer vl_self_attention (src/fused/rpu_gr00t_vl_encoder_model.cpp)
   m.def("gr00t_vl_encoder_create", TORCH_FN(rpu_gr00t_vl_encoder_create));
+  m.def("gr00t_vl_encoder_set_execution_core_count(int handle, int cores) -> ()",
+        TORCH_FN(rpu_gr00t_vl_encoder_set_execution_core_count));
+  m.def("gr00t_vl_encoder_get_execution_topology(int handle) -> int[]",
+        TORCH_FN(rpu_gr00t_vl_encoder_get_execution_topology));
   m.def("gr00t_vl_encoder_prepare_persistent_spm(int handle, int execution_len) -> ()",
         TORCH_FN(rpu_gr00t_vl_encoder_prepare_persistent_spm));
   m.def("gr00t_vl_encoder_set_chunk_envelope", TORCH_FN(rpu_gr00t_vl_encoder_set_chunk_envelope));
@@ -730,6 +778,7 @@ TORCH_LIBRARY(rpu, m) {
   // zero-Tensor ops does NOT dispatch — PyTorch needs a CppFunction binding.).
   m.def("pi05_denoise_step_create(bool linear_acc32=False) -> int", TORCH_FN(rpu_pi05_denoise_step_create));
   m.def("pi05_denoise_step_set_execution_core_count", TORCH_FN(rpu_pi05_denoise_step_set_execution_core_count));
+  m.def("pi05_denoise_step_set_kv_source_heads", TORCH_FN(rpu_pi05_denoise_step_set_kv_source_heads));
   m.def("pi05_denoise_step_get_execution_topology", TORCH_FN(rpu_pi05_denoise_step_get_execution_topology));
   m.def("pi05_denoise_step_destroy", TORCH_FN(rpu_pi05_denoise_step_destroy));
   m.def("pi05_denoise_step_set_chunk_envelope", TORCH_FN(rpu_pi05_denoise_step_set_chunk_envelope));
@@ -761,7 +810,12 @@ TORCH_LIBRARY(rpu, m) {
         "int num_steps, int[] planned_stage_descriptor=[]) -> ()");
   // WallOssActionStepModel (Wall-OSS-0.5 fused action-denoise step; inherits
   // CausalDecoderModel). create/destroy are zero-Tensor -> TORCH_FN m.def only.
-  m.def("wall_oss_action_step_create",  TORCH_FN(rpu_wall_oss_action_step_create));
+  m.def("wall_oss_action_step_set_wall_sorting_routes", TORCH_FN(rpu_wall_oss_action_step_set_wall_sorting_routes));
+  // num_cores is cold: 8 keeps the original owner, 4 binds the reduced lanes.
+  m.def("wall_oss_action_step_create(int num_cores=8) -> int",
+        TORCH_FN(rpu_wall_oss_action_step_create));
+  m.def("wall_oss_action_step_topology(int handle) -> int[]",
+        TORCH_FN(rpu_wall_oss_action_step_topology));
   m.def("wall_oss_action_step_set_linear_acc32", TORCH_FN(rpu_wall_oss_action_step_set_linear_acc32));
   m.def("wall_oss_action_step_destroy", TORCH_FN(rpu_wall_oss_action_step_destroy));
   m.def("wall_oss_action_step_set_weights("
@@ -839,9 +893,11 @@ TORCH_LIBRARY(rpu, m) {
         "bool adarms_fused_bcast=False, bool bufonly=False, bool addr=False, "
         "int schunk=32512, int rchunk_requested=0, "
         "bool dense_soft_router=False, bool fp16_top4=True, "
-        "bool routed_only=False, bool down_acc16=False) -> int",
+        "bool routed_only=False, bool down_acc16=False, int num_cores=8) -> int",
         TORCH_FN(rpu_lingbot_v2_moe_create));
   m.def("lingbot_v2_moe_destroy", TORCH_FN(rpu_lingbot_v2_moe_destroy));
+  m.def("lingbot_v2_moe_get_execution_topology",
+        TORCH_FN(rpu_lingbot_v2_moe_get_execution_topology));
   m.def("lingbot_v2_moe_set_weights("
         "int handle, "
         "Tensor[] q_w, Tensor[] k_w, Tensor[] v_w, Tensor[] o_w, "
@@ -947,6 +1003,10 @@ TORCH_LIBRARY(rpu, m) {
   m.def("hyvla_vlm_create",  TORCH_FN(rpu_hyvla_vlm_create));
   m.def("hyvla_vlm_create_kv_only", TORCH_FN(rpu_hyvla_vlm_create_kv_only));
   m.def("hyvla_vlm_destroy", TORCH_FN(rpu_hyvla_vlm_destroy));
+  m.def("hyvla_vlm_set_execution_core_count",
+        TORCH_FN(rpu_hyvla_vlm_set_execution_core_count));
+  m.def("hyvla_vlm_get_execution_topology",
+        TORCH_FN(rpu_hyvla_vlm_get_execution_topology));
   m.def("hyvla_vlm_set_runtime_config",
         TORCH_FN(rpu_hyvla_vlm_set_runtime_config));
   m.def("hyvla_vlm_set_weights("
@@ -997,6 +1057,8 @@ TORCH_LIBRARY(rpu, m) {
         "int handle, Tensor x_emb, Tensor[] k_caches, Tensor[] v_caches, "
         "Tensor cos, Tensor sin, Tensor attn_mask_4d, int prefix_len, "
         "int[] planned_stage_descriptor=[], bool inputs_published=False) -> ()");
+  m.def("hyvla_vlm_prepare_persistent_spm",
+        TORCH_FN(rpu_hyvla_vlm_prepare_persistent_spm));
   m.def("hyvla_vlm_resolve_stage_domain",
         TORCH_FN(rpu_hyvla_vlm_resolve_stage_domain));
   m.def("hyvla_vlm_get_resolved_chunk_size",
@@ -1010,6 +1072,10 @@ TORCH_LIBRARY(rpu, m) {
   // HyVlaExpertModel (action expert denoise, 单塔 rope→QK-norm)
   m.def("hyvla_expert_create",  TORCH_FN(rpu_hyvla_expert_create));
   m.def("hyvla_expert_destroy", TORCH_FN(rpu_hyvla_expert_destroy));
+  m.def("hyvla_expert_set_execution_core_count",
+        TORCH_FN(rpu_hyvla_expert_set_execution_core_count));
+  m.def("hyvla_expert_get_execution_topology",
+        TORCH_FN(rpu_hyvla_expert_get_execution_topology));
   m.def("hyvla_expert_set_runtime_config",
         TORCH_FN(rpu_hyvla_expert_set_runtime_config));
   m.def("hyvla_expert_set_weights("
@@ -1063,6 +1129,8 @@ TORCH_LIBRARY(rpu, m) {
         "Tensor x_traj, float dt, int prefix_len, int num_steps, "
         "int[] planned_stage_descriptor=[], bool inputs_published=False, "
         "Tensor? noise_cpu=None) -> ()");
+  m.def("hyvla_expert_prepare_persistent_spm",
+        TORCH_FN(rpu_hyvla_expert_prepare_persistent_spm));
   m.def("hyvla_expert_resolve_stage_domain",
         TORCH_FN(rpu_hyvla_expert_resolve_stage_domain));
   m.def("hyvla_expert_get_resolved_chunk_size",
@@ -1142,6 +1210,10 @@ TORCH_LIBRARY(rpu, m) {
         "bool fused_silu_mul, bool expert_fusions=False, bool adarms_resident=False, "
         "bool packed_qkv=False, bool aligned_kv=False) -> ()",
         TORCH_FN(rpu_rhino_vla_set_runtime_config));
+  m.def("rhino_vla_set_execution_core_count(int handle, int cores) -> ()",
+        TORCH_FN(rpu_rhino_vla_set_execution_core_count));
+  m.def("rhino_vla_get_execution_topology(int handle) -> int[]",
+        TORCH_FN(rpu_rhino_vla_get_execution_topology));
   m.def("rhino_vla_set_fast_replay(int handle, bool enabled) -> ()",
         TORCH_FN(rpu_rhino_vla_set_fast_replay));
   m.def("rhino_vla_set_chunk_size(int handle, int chunk_size) -> ()",
@@ -1236,7 +1308,7 @@ TORCH_LIBRARY(rpu, m) {
   // v5-05 D-08 / D-10 (C2): deleted v2 SigLIP shim ops (3 schemas) — replaced
   // by direct-handle SigLIPModel below (siglip_create / set_weights / forward).
   // SigLIPModel All-Layers-Once (Phase 5: FusedModelBase migration)
-  m.def("siglip_create(bool? linear_acc32=None) -> int", TORCH_FN(rpu_siglip_create));
+  m.def("siglip_create(bool? linear_acc32=None, bool qkv_w8a8=False, bool mlp_w8a8=False) -> int", TORCH_FN(rpu_siglip_create));
   m.def("siglip_set_audio_mode", TORCH_FN(rpu_siglip_set_audio_mode));
   m.def("siglip_set_audio_projection", TORCH_FN(rpu_siglip_set_audio_projection));
   m.def("siglip_set_execution_core_count", TORCH_FN(rpu_siglip_set_execution_core_count));
@@ -1256,6 +1328,22 @@ TORCH_LIBRARY(rpu, m) {
         "int num_heads, int head_dim, int hidden_size, "
         "int intermediate_size, int projection_dim, float eps) -> ()");
   m.def("siglip_set_weights_w8a16(int handle, "
+        "Tensor[] q_w_list, Tensor[] k_w_list, "
+        "Tensor[] v_w_list, Tensor[] o_w_list, "
+        "Tensor[] fc1_w_list, Tensor[] fc2_w_list, "
+        "Tensor[] ln1_w_list, Tensor[] ln1_b_list, "
+        "Tensor[] ln2_w_list, Tensor[] ln2_b_list, "
+        "Tensor[] q_b_list, Tensor[] k_b_list, "
+        "Tensor[] v_b_list, Tensor[] o_b_list, "
+        "Tensor[] fc1_b_list, Tensor[] fc2_b_list, "
+        "Tensor post_ln_w, Tensor post_ln_b, "
+        "Tensor proj_w, Tensor proj_b, "
+        "int num_heads, int head_dim, int hidden_size, "
+        "int intermediate_size, int projection_dim, float eps, "
+        "Tensor[] q_ws_list, Tensor[] k_ws_list, "
+        "Tensor[] v_ws_list, Tensor[] o_ws_list, "
+        "Tensor[] fc1_ws_list, Tensor[] fc2_ws_list) -> ()");
+  m.def("siglip_set_weights_w4a16(int handle, "
         "Tensor[] q_w_list, Tensor[] k_w_list, "
         "Tensor[] v_w_list, Tensor[] o_w_list, "
         "Tensor[] fc1_w_list, Tensor[] fc2_w_list, "
@@ -1295,6 +1383,8 @@ TORCH_LIBRARY(rpu, m) {
   // HYViT2-400M AnyRes ViT — 自 SigLIP 派生；set_weights 无 post_ln_w/b（24 参）。
   m.def("hyvit2_create", TORCH_FN(rpu_hyvit2_create));
   m.def("hyvit2_create_kv_spm_only", TORCH_FN(rpu_hyvit2_create_kv_spm_only));
+  m.def("hyvit2_set_execution_core_count", TORCH_FN(rpu_hyvit2_set_execution_core_count));
+  m.def("hyvit2_get_execution_topology", TORCH_FN(rpu_hyvit2_get_execution_topology));
   m.def("hyvit2_destroy", TORCH_FN(rpu_hyvit2_destroy));
   m.def("hyvit2_set_runtime_config",
         TORCH_FN(rpu_hyvit2_set_runtime_config));
@@ -1329,6 +1419,23 @@ TORCH_LIBRARY(rpu, m) {
         "Tensor[] q_ws_list, Tensor[] k_ws_list, "
         "Tensor[] v_ws_list, Tensor[] o_ws_list, "
         "Tensor[] fc1_ws_list, Tensor[] fc2_ws_list) -> ()");
+  m.def("hyvit2_set_weights_w4a16(int handle, "
+        "Tensor[] q_w_list, Tensor[] k_w_list, "
+        "Tensor[] v_w_list, Tensor[] o_w_list, "
+        "Tensor[] fc1_w_list, Tensor[] fc2_w_list, "
+        "Tensor[] ln1_w_list, Tensor[] ln1_b_list, "
+        "Tensor[] ln2_w_list, Tensor[] ln2_b_list, "
+        "Tensor[] q_b_list, Tensor[] k_b_list, "
+        "Tensor[] v_b_list, Tensor[] o_b_list, "
+        "Tensor[] fc1_b_list, Tensor[] fc2_b_list, "
+        "Tensor proj_w, Tensor proj_b, "
+        "int num_heads, int head_dim, int hidden_size, "
+        "int intermediate_size, int projection_dim, float eps, "
+        "bool fused_merger, bool proj1_in_merger, "
+        "int patch_embed_cores, "
+        "Tensor[] q_ws_list, Tensor[] k_ws_list, "
+        "Tensor[] v_ws_list, Tensor[] o_ws_list, "
+        "Tensor[] fc1_ws_list, Tensor[] fc2_ws_list) -> ()");
   m.def("hyvit2_model_set_patch_emb(int handle, Tensor weight, Tensor pos_emb, int kernel_size, int stride) -> ()");
   m.def("hyvit2_patch_embed(int handle, Tensor input, bool inputs_published=False) -> Tensor");
   m.def("hyvit2_patch_embed_multi(int handle, Tensor[] images, bool inputs_published=False) -> Tensor");
@@ -1338,6 +1445,9 @@ TORCH_LIBRARY(rpu, m) {
   m.def("hyvit2_resolve_stage_domain(int handle, int seq_len, "
         "int image_batch_count, bool external_patch_prologue=False) -> int[]",
         TORCH_FN(rpu_hyvit2_resolve_stage_domain));
+  m.def("hyvit2_prepare_persistent_spm(int handle, int seq_len, "
+        "int image_batch_count, bool external_patch_prologue=False) -> ()",
+        TORCH_FN(rpu_hyvit2_prepare_persistent_spm));
   m.def("hyvit2_get_resolved_chunk_size",
         TORCH_FN(rpu_hyvit2_get_resolved_chunk_size));
   m.def("hyvit2_set_chunk_size_override",
@@ -1350,8 +1460,8 @@ TORCH_LIBRARY(rpu, m) {
   m.def("hyvla_merger_pool(Tensor nxc) -> Tensor");
   m.def("hyvla_merger_combine(Tensor nxc, Tensor sc) -> Tensor");
   m.def("hyvla_merger_fused(Tensor nxc, Tensor wa, Tensor b0, Tensor wb, Tensor w2, "
-        "Tensor b2, Tensor wp2, Tensor bp2, Tensor? wp1=None, Tensor? bp1=None) "
-        "-> Tensor");
+        "Tensor b2, Tensor wp2, Tensor bp2, Tensor? wp1=None, Tensor? bp1=None, "
+        "int num_cores=8) -> Tensor");
 
   // Qwen3-VL Vision Encoder (R-Phase 3). See src/fused/rpu_qwen3vl_vision_model.cpp.
   m.def("qwen3vl_vision_create(int num_cores=8) -> int", TORCH_FN(rpu_qwen3vl_vision_create));
@@ -1386,6 +1496,37 @@ TORCH_LIBRARY(rpu, m) {
         "Tensor[] q_scale_list, Tensor[] k_scale_list, "
         "Tensor[] v_scale_list, Tensor[] o_scale_list, "
         "Tensor[] fc1_scale_list, Tensor[] fc2_scale_list) -> ()");
+  m.def("qwen3vl_vision_set_weights_w4a16(int handle, "
+        "Tensor[] q_w_list, Tensor[] k_w_list, "
+        "Tensor[] v_w_list, Tensor[] o_w_list, "
+        "Tensor[] fc1_w_list, Tensor[] fc2_w_list, "
+        "Tensor[] ln1_w_list, Tensor[] ln1_b_list, "
+        "Tensor[] ln2_w_list, Tensor[] ln2_b_list, "
+        "Tensor[] q_b_list, Tensor[] k_b_list, "
+        "Tensor[] v_b_list, Tensor[] o_b_list, "
+        "Tensor[] fc1_b_list, Tensor[] fc2_b_list, "
+        "int num_heads, int head_dim, "
+        "int hidden_size, int intermediate_size, "
+        "float eps, int[] deepstack_visual_indexes, "
+        "Tensor[] q_scale_list, Tensor[] k_scale_list, "
+        "Tensor[] v_scale_list, Tensor[] o_scale_list, "
+        "Tensor[] fc1_scale_list, Tensor[] fc2_scale_list) -> ()");
+  m.def("qwen3vl_vision_set_weights_nvfp4(int handle, "
+        "Tensor[] q_w_list, Tensor[] k_w_list, "
+        "Tensor[] v_w_list, Tensor[] o_w_list, "
+        "Tensor[] fc1_w_list, Tensor[] fc2_w_list, "
+        "Tensor[] ln1_w_list, Tensor[] ln1_b_list, "
+        "Tensor[] ln2_w_list, Tensor[] ln2_b_list, "
+        "Tensor[] q_b_list, Tensor[] k_b_list, "
+        "Tensor[] v_b_list, Tensor[] o_b_list, "
+        "Tensor[] fc1_b_list, Tensor[] fc2_b_list, "
+        "int num_heads, int head_dim, "
+        "int hidden_size, int intermediate_size, "
+        "float eps, int[] deepstack_visual_indexes, "
+        "Tensor[] q_scale_list, Tensor[] k_scale_list, "
+        "Tensor[] v_scale_list, Tensor[] o_scale_list, "
+        "Tensor[] fc1_scale_list, Tensor[] fc2_scale_list, "
+        "Tensor[] nvfp4_tensor_scales) -> ()");
   m.def("qwen3vl_vision_set_rope(int handle, Tensor freq_cos, Tensor freq_sin, bool rope_spm_enabled) -> ()");
   m.def("qwen3vl_vision_set_rope_route(int handle, Tensor freq_cos, Tensor freq_sin, int route_request) -> ()");
   m.def("qwen3vl_vision_set_fast_replay(int handle, bool enabled) -> ()",
@@ -1477,6 +1618,8 @@ TORCH_LIBRARY(rpu, m) {
         TORCH_FN(rpu_qwen3_5_vision_set_moe_precision));
   m.def("qwen3_5_vision_set_gelu_erf_ultra",
         TORCH_FN(rpu_qwen3_5_vision_set_gelu_erf_ultra));
+  m.def("qwen3_5_vision_set_fast_replay",
+        TORCH_FN(rpu_qwen3_5_vision_set_fast_replay));
   // Resolved chunk_size getter (int -> int, DEFAULT block only — no device dispatch,
   // same as qwen3_5_get_resolved_chunk_size). Read from Python after a forward.
   m.def("qwen3_5_vision_get_resolved_chunk_size", TORCH_FN(rpu_qwen3_5_vision_get_resolved_chunk_size));
@@ -1546,6 +1689,12 @@ TORCH_LIBRARY(rpu, m) {
   m.def("qwen25vl_vision_destroy", TORCH_FN(rpu_qwen25vl_vision_destroy));
   m.def("qwen25vl_vision_set_per_window_sdpa",
         TORCH_FN(rpu_qwen25vl_vision_set_per_window_sdpa));
+  m.def("qwen25vl_vision_set_wall_sorting_routes",
+        TORCH_FN(rpu_qwen25vl_vision_set_wall_sorting_routes));
+  m.def("qwen25vl_vision_set_execution_core_count(int handle, int cores) -> ()",
+        TORCH_FN(rpu_qwen25vl_vision_set_execution_core_count));
+  m.def("qwen25vl_vision_get_execution_topology(int handle) -> int[]",
+        TORCH_FN(rpu_qwen25vl_vision_get_execution_topology));
   m.def("qwen25vl_vision_set_execution_routes",
         TORCH_FN(rpu_qwen25vl_vision_set_execution_routes));
   m.def("qwen25vl_vision_set_weights(int handle, "
@@ -1610,6 +1759,11 @@ TORCH_LIBRARY(rpu, m) {
   // forward arrives in P4.3 (declare_buffers + build_layer_subgraph).
   m.def("dinov3_vision_create", TORCH_FN(rpu_dinov3_vision_create));
   m.def("dinov3_vision_destroy", TORCH_FN(rpu_dinov3_vision_destroy));
+  // Cold 4/6/8 execution cores; must precede set_weights. 8 is the default.
+  m.def("dinov3_vision_set_execution_core_count",
+        TORCH_FN(rpu_dinov3_vision_set_execution_core_count));
+  m.def("dinov3_vision_get_execution_topology",
+        TORCH_FN(rpu_dinov3_vision_get_execution_topology));
   m.def("dinov3_vision_set_weights(int handle, "
         "Tensor[] q_w_list, Tensor[] k_w_list, "
         "Tensor[] v_w_list, Tensor[] o_w_list, "
@@ -1622,6 +1776,11 @@ TORCH_LIBRARY(rpu, m) {
         "int num_heads, int head_dim, "
         "int hidden_size, int intermediate_size, "
         "float eps) -> ()");
+  // Exact ViT-B W8A16 / W4A16-G32: FP16 scales for the installed quantized
+  // projections, validated as a whole before publication.
+  m.def("dinov3_vision_set_weight_scales(int handle, Tensor[] q_scales, "
+        "Tensor[] k_scales, Tensor[] v_scales, Tensor[] o_scales, "
+        "Tensor[] up_scales, Tensor[] down_scales) -> ()");
   m.def("dinov3_vision_set_rope(int handle, Tensor freq_cos, Tensor freq_sin) -> ()");
   // No input Tensor for backend dispatch — register implementation directly.
   m.def("dinov3_vision_position_idx_keepalive(int handle) -> Tensor",
@@ -1734,9 +1893,11 @@ TORCH_LIBRARY_IMPL(rpu, PrivateUse1, m) {
   m.impl("lingbot2_multiview_spm_z2_forward", TORCH_FN(rpu_lingbot2_multiview_spm_z2_forward));
   m.impl("qwen3vl_pooler_spm_z1_pipeline_forward", TORCH_FN(rpu_qwen3vl_pooler_spm_z1_pipeline_forward));
   m.impl("causal_decoder_set_lm_head", TORCH_FN(rpu_causal_decoder_set_lm_head));
-  m.impl("causal_decoder_set_tts_predictor_heads", TORCH_FN(rpu_causal_decoder_set_tts_predictor_heads));
+  m.impl("causal_decoder_set_lm_head_bank", TORCH_FN(rpu_causal_decoder_set_lm_head_bank));
   m.impl("lm_head_logits_top1", TORCH_FN(rpu_lm_head_logits_top1));
   m.impl("argmax_lastdim_host", TORCH_FN(rpu_argmax_lastdim_host));
+  m.impl("argmax_lastdim_host_values", TORCH_FN(rpu_argmax_lastdim_host_values));
+  m.impl("sample_topk_lastdim_host", TORCH_FN(rpu_sample_topk_lastdim_host));
   m.impl("gemma_set_weights", TORCH_FN(rpu_gemma_set_weights));
   m.impl("gemma_forward", TORCH_FN(rpu_gemma_forward));
   m.impl("gemma_prefill_kv_only", TORCH_FN(rpu_gemma_prefill_kv_only));
@@ -1744,6 +1905,7 @@ TORCH_LIBRARY_IMPL(rpu, PrivateUse1, m) {
   m.impl("gemma2_set_weights", TORCH_FN(rpu_gemma2_set_weights));
   m.impl("gemma2_forward", TORCH_FN(rpu_gemma2_forward));
   m.impl("gemma4_set_weights", TORCH_FN(rpu_gemma4_set_weights));
+  m.impl("gemma4_set_weight_scales", TORCH_FN(rpu_gemma4_set_weight_scales));
   m.impl("gemma4_forward", TORCH_FN(rpu_gemma4_forward));
   m.impl("adarms_set_weights", TORCH_FN(rpu_adarms_set_weights));
   m.impl("adarms_forward", TORCH_FN(rpu_adarms_forward));
@@ -1850,6 +2012,7 @@ TORCH_LIBRARY_IMPL(rpu, PrivateUse1, m) {
   // rpu_siglip_model.cpp TU-static).
   m.impl("siglip_set_weights", TORCH_FN(rpu_siglip_set_weights));
   m.impl("siglip_set_weights_w8a16", TORCH_FN(rpu_siglip_set_weights_w8a16));
+  m.impl("siglip_set_weights_w4a16", TORCH_FN(rpu_siglip_set_weights_w4a16));
   m.impl("siglip_model_set_patch_emb", TORCH_FN(rpu_siglip_model_set_patch_emb));
   m.impl("siglip_patch_embed", TORCH_FN(rpu_siglip_patch_embed));
   m.impl("siglip_patch_embed_multi", TORCH_FN(rpu_siglip_patch_embed_multi));
@@ -1860,6 +2023,7 @@ TORCH_LIBRARY_IMPL(rpu, PrivateUse1, m) {
   // HYViT2-400M AnyRes ViT
   m.impl("hyvit2_set_weights", TORCH_FN(rpu_hyvit2_set_weights));
   m.impl("hyvit2_set_weights_w8a16", TORCH_FN(rpu_hyvit2_set_weights_w8a16));
+  m.impl("hyvit2_set_weights_w4a16", TORCH_FN(rpu_hyvit2_set_weights_w4a16));
   m.impl("hyvit2_model_set_patch_emb", TORCH_FN(rpu_hyvit2_model_set_patch_emb));
   m.impl("hyvit2_patch_embed", TORCH_FN(rpu_hyvit2_patch_embed));
   m.impl("hyvit2_patch_embed_multi", TORCH_FN(rpu_hyvit2_patch_embed_multi));
@@ -1873,6 +2037,8 @@ TORCH_LIBRARY_IMPL(rpu, PrivateUse1, m) {
   // Qwen3-VL Vision Encoder (R-Phase 3)
   m.impl("qwen3vl_vision_set_weights", TORCH_FN(rpu_qwen3vl_vision_set_weights));
   m.impl("qwen3vl_vision_set_weights_w8a16", TORCH_FN(rpu_qwen3vl_vision_set_weights_w8a16));
+  m.impl("qwen3vl_vision_set_weights_w4a16", TORCH_FN(rpu_qwen3vl_vision_set_weights_w4a16));
+  m.impl("qwen3vl_vision_set_weights_nvfp4", TORCH_FN(rpu_qwen3vl_vision_set_weights_nvfp4));
   m.impl("qwen3vl_vision_set_rope", TORCH_FN(rpu_qwen3vl_vision_set_rope));
   m.impl("qwen3vl_vision_set_rope_route", TORCH_FN(rpu_qwen3vl_vision_set_rope_route));
   m.impl("qwen3vl_vision_set_merger_weights", TORCH_FN(rpu_qwen3vl_vision_set_merger_weights));
@@ -1897,6 +2063,7 @@ TORCH_LIBRARY_IMPL(rpu, PrivateUse1, m) {
 
   // DINOv3 ViT Vision Encoder (P4.2 + P4.3)
   m.impl("dinov3_vision_set_weights", TORCH_FN(rpu_dinov3_vision_set_weights));
+  m.impl("dinov3_vision_set_weight_scales", TORCH_FN(rpu_dinov3_vision_set_weight_scales));
   m.impl("dinov3_vision_set_rope", TORCH_FN(rpu_dinov3_vision_set_rope));
   m.impl("dinov3_vision_forward", TORCH_FN(rpu_dinov3_vision_forward));
   m.impl("dinov3_vision_set_hybrid_cpu_sdpa", TORCH_FN(rpu_dinov3_vision_set_hybrid_cpu_sdpa));
@@ -1908,6 +2075,8 @@ TORCH_LIBRARY_IMPL(rpu, PrivateUse1, m) {
 
 TORCH_LIBRARY_IMPL(rpu, CPU, m) {
   m.impl("argmax_lastdim_host", TORCH_FN(rpu_argmax_lastdim_host));
+  m.impl("argmax_lastdim_host_values", TORCH_FN(rpu_argmax_lastdim_host_values));
+  m.impl("sample_topk_lastdim_host", TORCH_FN(rpu_sample_topk_lastdim_host));
   m.impl("gemma_set_prefill_rope", TORCH_FN(rpu_gemma_set_prefill_rope));
   m.impl("qwen3_5_moe_set_prefill_rope", TORCH_FN(rpu_qwen3_5_moe_set_prefill_rope));
 }
@@ -1973,9 +2142,11 @@ TORCH_LIBRARY_IMPL(rpu, AutogradPrivateUse1, m) {
   m.impl("lingbot2_multiview_spm_z2_forward", torch::CppFunction::makeFallthrough());
   m.impl("qwen3vl_pooler_spm_z1_pipeline_forward", torch::CppFunction::makeFallthrough());
   m.impl("causal_decoder_set_lm_head", torch::CppFunction::makeFallthrough());
-  m.impl("causal_decoder_set_tts_predictor_heads", torch::CppFunction::makeFallthrough());
+  m.impl("causal_decoder_set_lm_head_bank", torch::CppFunction::makeFallthrough());
   m.impl("lm_head_logits_top1", torch::CppFunction::makeFallthrough());
   m.impl("argmax_lastdim_host", torch::CppFunction::makeFallthrough());
+  m.impl("argmax_lastdim_host_values", torch::CppFunction::makeFallthrough());
+  m.impl("sample_topk_lastdim_host", torch::CppFunction::makeFallthrough());
   m.impl("gemma_set_weights", torch::CppFunction::makeFallthrough());
   m.impl("gemma_forward", torch::CppFunction::makeFallthrough());
   m.impl("gemma_prefill_kv_only", torch::CppFunction::makeFallthrough());
@@ -1983,6 +2154,7 @@ TORCH_LIBRARY_IMPL(rpu, AutogradPrivateUse1, m) {
   m.impl("gemma2_set_weights", torch::CppFunction::makeFallthrough());
   m.impl("gemma2_forward", torch::CppFunction::makeFallthrough());
   m.impl("gemma4_set_weights", torch::CppFunction::makeFallthrough());
+  m.impl("gemma4_set_weight_scales", torch::CppFunction::makeFallthrough());
   m.impl("gemma4_forward", torch::CppFunction::makeFallthrough());
   m.impl("adarms_set_weights", torch::CppFunction::makeFallthrough());
   m.impl("adarms_forward", torch::CppFunction::makeFallthrough());
@@ -2082,6 +2254,7 @@ TORCH_LIBRARY_IMPL(rpu, AutogradPrivateUse1, m) {
   m.impl("navdp_denoise_loop_forward", torch::CppFunction::makeFallthrough());
   m.impl("siglip_set_weights", torch::CppFunction::makeFallthrough());
   m.impl("siglip_set_weights_w8a16", torch::CppFunction::makeFallthrough());
+  m.impl("siglip_set_weights_w4a16", torch::CppFunction::makeFallthrough());
   m.impl("siglip_model_set_patch_emb", torch::CppFunction::makeFallthrough());
   m.impl("siglip_patch_embed", torch::CppFunction::makeFallthrough());
   m.impl("siglip_patch_embed_multi", torch::CppFunction::makeFallthrough());
@@ -2090,6 +2263,8 @@ TORCH_LIBRARY_IMPL(rpu, AutogradPrivateUse1, m) {
   m.impl("siglip_forward_multi", torch::CppFunction::makeFallthrough());
   m.impl("qwen3vl_vision_set_weights", torch::CppFunction::makeFallthrough());
   m.impl("qwen3vl_vision_set_weights_w8a16", torch::CppFunction::makeFallthrough());
+  m.impl("qwen3vl_vision_set_weights_w4a16", torch::CppFunction::makeFallthrough());
+  m.impl("qwen3vl_vision_set_weights_nvfp4", torch::CppFunction::makeFallthrough());
   m.impl("qwen3vl_vision_set_rope", torch::CppFunction::makeFallthrough());
   m.impl("qwen3vl_vision_set_rope_route", torch::CppFunction::makeFallthrough());
   m.impl("qwen3vl_vision_set_merger_weights", torch::CppFunction::makeFallthrough());

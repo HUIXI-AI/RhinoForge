@@ -380,7 +380,7 @@ def test_vision_install_requires_exact_numeric_blocked_opt_in(
         raising=False,
     )
 
-    with pytest.raises(NotImplementedError, match="experimental/numeric-blocked"):
+    with pytest.raises(NotImplementedError, match="Vision was not requested"):
         _vision.install_qwen3_5_vision_for_rpu(_runtime_capable_vision())
     create.assert_not_called()
 
@@ -425,7 +425,7 @@ def test_vision_candidate_still_fails_before_create_without_opt_in(monkeypatch):
         raising=False,
     )
 
-    with pytest.raises(NotImplementedError, match="experimental/numeric-blocked"):
+    with pytest.raises(NotImplementedError, match="Vision was not requested"):
         _vision.install_qwen3_5_vision_for_rpu(_unsupported_08b_vision())
     create.assert_not_called()
 

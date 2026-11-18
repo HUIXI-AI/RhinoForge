@@ -245,7 +245,7 @@ public:
 
     std::vector<int64_t> core_profile_arguments() const {
         auto args = execution_topology();
-        args.push_back(reduced_w8a16_ ? 1 : 0);
+        args.push_back(reduced_nvfp4_ ? 2 : reduced_w8a16_ ? 1 : 0);
         return args;
     }
 
@@ -389,22 +389,29 @@ public:
         // Commit model params (pimpl: hidden/q/kv/head_dim/intermediate + attn_tp_)
         int64_t physical_intermediate = intermediate_size;
         if (num_cores() != 8) {
+            // NVFP4 keeps K/V W8; the scale-list check above fixed its scope.
+            const bool nvfp4 = nvfp4_tables.enabled();
             const auto dtype = q_w_list[0].scalar_type();
-            TORCH_CHECK(dtype == at::kHalf || dtype == at::kChar,
-                        "reduced Pi0.5 supports FP16 or W8A16 projections");
+            TORCH_CHECK(nvfp4 || dtype == at::kHalf || dtype == at::kChar,
+                        "reduced Pi0.5 supports FP16, W8A16 or Action NVFP4 projections");
             physical_intermediate = validate_pi05_reduced_geometry(
                 num_cores(), num_q_heads, num_kv_heads, head_dim,
                 hidden_size, intermediate_size, N, true,
-                dtype == at::kChar);
+                nvfp4 ? Pi05ReducedPrecision::NVFP4
+                      : dtype == at::kChar ? Pi05ReducedPrecision::W8A16
+                                           : Pi05ReducedPrecision::FP16);
             for (int64_t i = 0; i < N; ++i) {
                 std::array<std::array<int64_t, 2>, 7> shapes;
                 size_t j = 0;
                 for (const auto* tensor : {&q_w_list[i], &k_w_list[i],
                         &v_w_list[i], &o_w_list[i], &gate_list[i],
                         &up_list[i], &down_list[i]}) {
-                    TORCH_CHECK(tensor->scalar_type() == dtype && tensor->dim() == 2,
+                    const bool kv = j == 1 || j == 2;
+                    const auto expected = nvfp4 ? (kv ? at::kChar : at::kByte) : dtype;
+                    TORCH_CHECK(tensor->scalar_type() == expected && tensor->dim() == 2,
                                 "Pi0.5 reduced projection precision/rank mismatch");
-                    shapes[j++] = {tensor->size(0), tensor->size(1)};
+                    shapes[j++] = {tensor->size(0),
+                                   tensor->size(1) * (expected == at::kByte ? 2 : 1)};
                 }
                 validate_pi05_reduced_projection_shapes(
                     shapes, hidden_size, physical_intermediate);
@@ -427,6 +434,7 @@ public:
         }
         logical_intermediate_size_ = intermediate_size;
         reduced_w8a16_ = q_w_list[0].scalar_type() == at::kChar;
+        reduced_nvfp4_ = nvfp4_tables.enabled();
         set_model_params(num_q_heads, num_kv_heads, head_dim,
                          hidden_size, physical_intermediate);
         set_num_layers(N);
@@ -483,6 +491,41 @@ public:
     // Cache key (D-404) excludes cond values; REPLAY cursor-patches the
     // cond DDR pointer on each subsequent denoise step.
     // ========================================================================
+    // Prepare a stable mask before any parent Graph work can require a host read.
+    // Ordinary direct callers retain their existing preparation path.
+    void prepare_attention_mask(
+        const std::optional<at::Tensor>& attention_mask,
+        int64_t seq_q, int64_t position, bool is_causal, bool require_graph_safe)
+    {
+        TORCH_CHECK(num_layers() > 0 && seq_q > 0 && position >= 0 &&
+                        position <= std::numeric_limits<int64_t>::max() - seq_q,
+                    "AdaRMS mask preparation requires installed weights and valid geometry");
+        const int64_t seq_k = position + seq_q;
+        const bool causal = is_causal && seq_q > 1;
+        const bool has_mask = attention_mask.has_value() && attention_mask->defined();
+        const void* input = has_mask ? attention_mask->data_ptr() : nullptr;
+        const void* cached = prepared_mask_input_ref_.defined()
+                             ? prepared_mask_input_ref_.data_ptr() : nullptr;
+        if (cached == input && prepared_mask_seq_q_ == seq_q &&
+                prepared_mask_seq_k_ == seq_k && prepared_mask_is_causal_ == causal) {
+            return;
+        }
+        if (require_graph_safe) {
+            auto& graph = RpuKernelGraph::active();
+            const auto state = graph.state();
+            TORCH_CHECK(state == RpuKernelGraph::State::PASSTHROUGH ||
+                            (state == RpuKernelGraph::State::RECORDING && graph.graph_size() == 0),
+                        "Pi05Model Graph: prepare a new attention mask before recorded work; "
+                        "REPLAY requires the prepared mask identity and geometry");
+        }
+        prepared_mask_ = sdpa_prepare_mask(attention_mask, causal, seq_q, seq_k,
+                                           sdpa_stable_mask_cache());
+        prepared_mask_input_ref_ = has_mask ? *attention_mask : at::Tensor();
+        prepared_mask_seq_q_ = seq_q;
+        prepared_mask_seq_k_ = seq_k;
+        prepared_mask_is_causal_ = causal;
+    }
+
     at::Tensor forward(
         const at::Tensor& hidden_states,
         const at::Tensor& cond,
@@ -546,42 +589,8 @@ public:
         //
         rpu_ddr_flush_force(cond.data_ptr<c10::Half>());
 
-        // PERF L1 (2026-05-07): hoist SDPA mask prepare out of the per-layer
-        // Phase 6. The mask is invariant across all expert layers within one
-        // forward; preparing once + DMA-only per layer drops constant_pad_nd
-        // calls 18× (Pi0.5 5-step e2e: 90 → 5). The single-chunk-per-forward
-        // assumption (suffix_len <= chunk_size auto-pick) matches the existing
-        // sdpa_prepare_mask shape contract: it asserts mask_2d.size(0)==seq_q,
-        // which already requires seq_q == ctx().seq_len == chunk.len.
-        //
-        // PERF L2 (2026-05-07): also cache the prepared mask across forwards
-        // when the caller passes the SAME attention_mask tensor. Pi0.5 denoise
-        // builds the mask once outside the 5-step loop (runtime.py L2 hoist),
-        // so steps 2-5 see the same data_ptr → cache hit → skip the prepare
-        // (saves 4 constant_pad_nd + 4 DDR copies per inference; 5 → 1).
-        // We hold a strong ref to the input tensor so its storage cannot be
-        // reallocated to a different tensor while the cache is valid.
-        const int64_t prep_seq_q = hidden_states.size(1);
-        const int64_t prep_seq_k = position + prep_seq_q;
-        const bool    prep_is_causal = is_causal && (prep_seq_q > 1);
-        const bool    has_mask = attention_mask.has_value() && attention_mask->defined();
-        const void*   in_ptr = has_mask ? attention_mask->data_ptr() : nullptr;
-        const void*   cached_ptr = prepared_mask_input_ref_.defined()
-                                   ? prepared_mask_input_ref_.data_ptr() : nullptr;
-        const bool cache_hit =
-            (cached_ptr               == in_ptr)        &&
-            (prepared_mask_seq_q_     == prep_seq_q)    &&
-            (prepared_mask_seq_k_     == prep_seq_k)    &&
-            (prepared_mask_is_causal_ == prep_is_causal);
-        if (!cache_hit) {
-            prepared_mask_ = sdpa_prepare_mask(
-                attention_mask, prep_is_causal, prep_seq_q, prep_seq_k,
-                sdpa_stable_mask_cache());
-            prepared_mask_input_ref_  = has_mask ? attention_mask.value() : at::Tensor();
-            prepared_mask_seq_q_      = prep_seq_q;
-            prepared_mask_seq_k_      = prep_seq_k;
-            prepared_mask_is_causal_  = prep_is_causal;
-        }
+        prepare_attention_mask(attention_mask, hidden_states.size(1), position,
+                               is_causal, /*require_graph_safe=*/false);
 
         return run_all_layers(hidden_states, k_caches, v_caches,
                               attention_mask, position, is_causal,
@@ -1314,6 +1323,7 @@ private:
 
     int64_t logical_intermediate_size_ = 0;
     bool reduced_w8a16_ = false;
+    bool reduced_nvfp4_ = false;
 
     // ----- Model state -----
     std::vector<int64_t> kvinsert_cost_weight_identity() const override {
@@ -1490,6 +1500,15 @@ void rpu_adarms_set_weights(
 void rpu_adarms_set_rope_position(int64_t handle, int64_t position) {
     AdaRMSRegistry::get(handle, "rpu_adarms_set_rope_position")
         ->set_rope_position(position);
+}
+
+void rpu_adarms_prepare_graph_mask(
+    int64_t handle, const std::optional<at::Tensor>& attention_mask,
+    int64_t seq_q, int64_t position, bool is_causal)
+{
+    AdaRMSRegistry::get(handle, "rpu_adarms_prepare_graph_mask")
+        ->prepare_attention_mask(attention_mask, seq_q, position, is_causal,
+                                 /*require_graph_safe=*/true);
 }
 
 at::Tensor rpu_adarms_forward(

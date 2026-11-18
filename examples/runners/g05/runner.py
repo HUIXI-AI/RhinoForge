@@ -56,6 +56,10 @@ def _g05(runner):
     # CPU input preparation owns no device resources. Publish the owner only when
     # patching begins so input failures do not trigger device retirement cleanup.
     runner.owner = policy
+    model = getattr(policy, "model", None)
+    runner.stage_boundaries = (("vision", model, "_forward_embed"),
+                               ("prefill", getattr(model, "vlm", None), "forward"),
+                               ("denoise", model, "inference_fm"))
     patch_g05_policy_for_rpu(
         policy.eval(), rpu_execution=config.get("rpu_execution"),
         **getattr(runner, "_g05_patch_options", {}))

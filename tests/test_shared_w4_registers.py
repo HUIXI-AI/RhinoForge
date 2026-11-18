@@ -1,4 +1,4 @@
-"""Execute the shared and retained legacy W4 register writers without RPU."""
+"""Execute the unified W4 register writers without RPU."""
 from pathlib import Path
 
 import pytest
@@ -17,6 +17,7 @@ def test_shared_w4_registers_match_runtime_abi(tmp_path):
 #include <array>
 #include <cassert>
 #include "src/ops/rpu_linear_tiling.h"
+#include "src/ops/rpu_pi_wall_tiling.h"
 struct Kernel {
   std::array<uint16_t, 30> regs{};
   unsigned wide_writes = 0, rejected_writes = 0;
@@ -63,22 +64,32 @@ int main() {
     const auto want = r == 22 || r == 23 ? 0 : r == 27 ? 9 : expected[r];
     assert(i.regs[r] == want);
   }
-  // Existing ordinary signed W4 and expansion fusions retain their protocol.
-  Kernel legacy;
-  set_parallel_linear_int4_group_regs(legacy,
+  // Signed and unsigned W4 now share the same main ABI; no old signed slots.
+  Kernel signed_w4;
+  set_parallel_linear_int4_group_regs(signed_w4,
       {args.linear, args.group_size, args.local_groups, args.scale_group_block_byte_step});
-  assert(legacy.regs[8] == 33 && legacy.regs[9] == 0);
-  assert(legacy.regs[22] == 1 && legacy.regs[23] == 1);
-  assert(legacy.regs[24] == 128 && legacy.regs[25] == 16);
-  assert(legacy.regs[26] == 0x200 && legacy.regs[27] == 0x10);
+  assert(signed_w4.regs == i.regs);
+  auto bf16 = args;
+  bf16.linear.x_dtype = 3;
+  Kernel b;
+  set_parallel_linear_w4_group_regs(b, bf16);
+  assert(b.regs[26] == 3 && b.regs[27] == 9);
+  // The weight backing is N32 padded; runtime stores retain logical N16 lanes.
+  // Source ASM's wr14 output loop advances by 16 and uses the supplied stride.
+  auto tail = args;
+  tail.linear.local_n = 48;
+  tail.linear.output_m_byte_step = 96;
+  Kernel t;
+  set_parallel_linear_w4_group_regs(t, tail);
+  assert(t.regs[10] == 48 && t.regs[11] == 0 && t.regs[18] == 96);
   for (bool acc32 : {false, true}) {
     const auto tile = acc32 ? select_tile_int4_acc32(1,768,2048)
                            : select_tile_int4(1,768,2048);
-    const auto name = acc32 ? autotile_kernel_name_int4_acc32(tile.m_tile,tile.n_tile)
-                           : autotile_kernel_name_int4(tile.m_tile,tile.n_tile);
-    assert(name.find("parallel_linear_wint4a16_pgrp_") == 0);
-    const auto uname = acc32 ? autotile_kernel_name_uint4_acc32(tile.m_tile,tile.n_tile)
-                            : autotile_kernel_name_uint4(tile.m_tile,tile.n_tile);
+    const auto name = acc32 ? autotile_kernel_name_int4_acc32(tile.m_tile,tile.n_tile,tile.k_tile)
+                           : autotile_kernel_name_int4(tile.m_tile,tile.n_tile,tile.k_tile);
+    assert(name.find("parallel_linear_w4a16_pgrp_") == 0);
+    const auto uname = acc32 ? autotile_kernel_name_uint4_acc32(tile.m_tile,tile.n_tile,tile.k_tile)
+                            : autotile_kernel_name_uint4(tile.m_tile,tile.n_tile,tile.k_tile);
     assert(uname.find("parallel_linear_w4a16_pgrp_") == 0);
     assert((uname.find("acc32_") != std::string::npos) == acc32);
     assert((name.find("acc32_") != std::string::npos) == acc32);
@@ -94,8 +105,8 @@ int main() {
 def test_selected_shared_w4_payloads_exist_in_pinned_main():
     """Prevent an ID/role rename from selecting an absent or legacy payload."""
     import re
-    header = (ROOT / "src/core/rpu_kernel_cache.h").read_text()
-    names = set(re.findall(r'"(parallel_linear_w4a16_pgrp_[^"]+)"', header))
+    catalog = (ROOT / "src/ops/rpu_linear_candidates.inc").read_text()
+    names = set(re.findall(r'"((?:grouped_)?parallel_linear_w4a16_pgrp_[^"]+)"', catalog))
     assert names
     ref = ROOT / "src/rhinoOpLib_current.ref"
     if not ref.exists():
@@ -140,7 +151,8 @@ using TensorList=std::vector<Tensor>;
 }
 int retained=0;
 int num_cores(){return 8;}
-at::Tensor rpu_retain_linear_quant_scale(const at::Tensor&,const at::Tensor& z){++retained;return z;}
+at::Tensor rpu_retain_linear_quant_scale(const at::Tensor&,const at::Tensor& z,int64_t cores=8){
+ assert(cores==num_cores());++retained;return z;}
 template<class F> bool rejected(F fn){try{fn();}catch(const std::runtime_error&){return true;}return false;}
 int main(){
   const int64_t N=2;
@@ -197,12 +209,12 @@ def test_production_w4_dispatch_preserves_signed_and_validates_uint4(tmp_path):
     start = impl.index('    TORCH_CHECK(scale.scalar_type() == at::kHalf,\n                "wINT4')
     end = impl.index('\n  // Weight in DDR', start)
     body = impl[start:end].removesuffix('  }\n')
-    start = impl.index('int autotile_n_index(')
-    end = impl.index('KernelId autotile_nvfp4_acc16_kernel_id(', start)
-    selectors = impl[start:end]
     header = (ROOT / "src/core/rpu_kernel_cache.h").read_text()
     start = header.index('enum class KernelId')
     enum = header[start:header.index('};', start) + 2]
+    start = header.index('inline KernelId parallel_linear_kernel_id(')
+    end = header.index('struct CachedKernel', start)
+    selectors = header[start:end]
     harness = r'''
 #include <array>
 #include <cassert>
@@ -212,6 +224,7 @@ def test_production_w4_dispatch_preserves_signed_and_validates_uint4(tmp_path):
 #include <string>
 #include <vector>
 #include "src/ops/rpu_linear_tiling.h"
+#include "src/ops/rpu_pi_wall_tiling.h"
 #define TORCH_CHECK(ok, ...) do { if (!(ok)) throw std::runtime_error(#ok); } while(0)
 namespace c10 { struct Half {uint16_t v;}; namespace DeviceType {constexpr int PrivateUse1=1;} }
 namespace at {
@@ -250,7 +263,7 @@ struct Queue {
 } queue;
 Queue* get_queue(int n){queue.n=n;return &queue;}
 #define GET_QUEUE(n) get_queue(n)
-enum class GraphDdrRegisterRole{PackedUint4ModelWeight,PerGroupScale,NegativeZeroPoint};
+enum class GraphDdrRegisterRole{PackedUint4ModelWeight,PackedInt4ModelWeight,PerGroupScale,NegativeZeroPoint};
 enum class GraphDdrRegisterAccess{Read};enum class GraphDdrRegisterEncoding{DevAddrShift8LoHi};
 struct Operand {GraphDdrRegisterRole role;GraphDdrRegisterAccess access;GraphDdrRegisterEncoding encoding;int lo,hi;};
 struct GraphDdrRegisterOperandSpec {Operand operand;at::Tensor tensor;};
@@ -262,9 +275,12 @@ struct Writer {
 struct RpuKernelGraph {
   static RpuKernelGraph& active(){static RpuKernelGraph graph;return graph;}
   Writer stage_kernel_ddr_registers(KernelId,std::vector<GraphDdrRegisterOperandSpec> specs){
-    assert(specs.size()==3);assert(specs[0].operand.role==GraphDdrRegisterRole::PackedUint4ModelWeight);
+    const bool u4=specs[0].operand.role==GraphDdrRegisterRole::PackedUint4ModelWeight;
+    assert(specs.size()==size_t(u4?3:2));
+    assert(u4||specs[0].operand.role==GraphDdrRegisterRole::PackedInt4ModelWeight);
     assert(specs[1].operand.role==GraphDdrRegisterRole::PerGroupScale);
-    assert(specs[2].operand.role==GraphDdrRegisterRole::NegativeZeroPoint);++staged;return {specs};
+    if(u4)assert(specs[2].operand.role==GraphDdrRegisterRole::NegativeZeroPoint);
+    ++staged;return {specs};
   }
 };
 void run(at::Tensor weight,at::Tensor scale,at::Tensor negative_zero,bool use_acc32,int partition,int num_cores,int64_t M=33,int group=128){
@@ -276,20 +292,21 @@ void run(at::Tensor weight,at::Tensor scale,at::Tensor negative_zero,bool use_ac
 __BODY__
 }
 int main(){
-  for(int group:{32,128})for(int cores:{2,8})for(int partition:{0,1})for(bool acc32:{false,true})for(bool u4:{false,true}){
+  for(int group:{32,64,128})for(int cores:{2,8})for(int partition:{0,1})for(bool acc32:{false,true})for(bool u4:{false,true}){
     const int64_t n=partition?2048/cores:2048,k=partition?2048:2048/cores,g=k/group;
     const int64_t elements=((g+3)/4)*((n+63)/64)*cores*256;
     at::Tensor w({2048,1024},at::kByte,0x100000),s({group,elements/group},at::kHalf,0x200000),z;
     if(u4)z=at::Tensor(s.shape,at::kHalf,0x300000);
     const int before=queue.calls,was_staged=staged;run(w,s,z,acc32,partition,cores);
-    assert(queue.calls==before+1&&staged==was_staged+int(u4));
-    auto tile=acc32?rpu_pl_tiling::select_tile_int4_acc32(33,n,k):rpu_pl_tiling::select_tile_int4(33,n,k);
-    assert(selected==(u4?(acc32?autotile_uint4_pgrp_acc32_kernel_id(tile.n_tile):autotile_uint4_pgrp_kernel_id(tile.n_tile)):
-                        (acc32?autotile_pgrp_acc32_kernel_id(tile.n_tile):autotile_pgrp_kernel_id(tile.n_tile))));
+    assert(queue.calls==before+1&&staged==was_staged+1);
+    const auto type=u4?rpu_pl_tiling::WeightType::Uint4:rpu_pl_tiling::WeightType::Int4;
+    const auto tile=rpu_pl_tiling::select_tile(33,n,k,type,acc32,rpu_pl_tiling::Family::Parallel,group);
+    assert(selected==parallel_linear_kernel_id(type,acc32,tile));
     const auto&r=kernel.regs;assert(r[2]==0x1000&&r[3]==0&&r[20]==0x2000&&r[21]==0);
     assert(r[6]==0&&r[7]==(partition?3:0)&&r[14]==partition);
-    if(u4){assert(r[8]==partition&&r[9]==33&&r[22]==0x3000&&r[23]==0&&r[26]==2&&r[27]==8&&r[28]==group&&r[29]==g);}
-    else{assert(r[8]==33&&r[9]==0&&r[22]==partition&&r[23]==1&&r[24]==group&&r[25]==g);}
+    assert(r[8]==partition&&r[9]==33&&r[22]==(u4?0x3000:0)&&r[23]==0);
+    assert(r[26]==2&&r[27]==(u4?8:9)&&r[28]==group&&r[29]==g);
+    assert(r[64]==(n+tile.n_tile-1)/tile.n_tile&&r[65]==(33+tile.m_tile-1)/tile.m_tile);
   }
   at::Tensor w({2048,1024},at::kByte,0x100000),s({128,256},at::kHalf,0x200000),z(s.shape,at::kHalf,0x300000);
   for(int fault=0;fault<9;++fault){
@@ -313,6 +330,6 @@ int main(){
     cpp.write_text(harness)
     binary = tmp_path / 'w4_dispatch'
     result = subprocess.run([shutil.which('g++'), '-std=c++17', '-I', str(ROOT),
-                             str(cpp), '-o', str(binary)], text=True, capture_output=True)
+                             '-I', str(ROOT / 'src/core'), '-I', str(ROOT / 'src/ops'), str(cpp), '-o', str(binary)], text=True, capture_output=True)
     assert result.returncode == 0, result.stderr
     subprocess.run([str(binary)], check=True)

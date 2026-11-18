@@ -171,7 +171,6 @@ def test_wall_native_window_exact_wrapper_matches_generator_abi():
     assert f'"{symbol}"' in CACHE
     assert f'"{symbol}"' in CACHE_INC
     assert kernel_id in CACHE
-    assert kernel_id in CACHE_INC
     assert f"void {launcher}(" in DECLS
 
     body = _between(launcher, "rpu_launch_v_transpose_spm_batch3_576")

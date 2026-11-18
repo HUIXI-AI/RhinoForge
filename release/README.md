@@ -6,12 +6,14 @@ and model checkpoints are distributed separately under their own terms.
 
 RhinoForge `1.3.0.dev0` depends on archived Rhino Launch `1.2.0` at
 `3dd1b410f5f46373997fef3dfbf9b67eecec6a84`, with CMake version `1.2.0` and ABI
-version `1`. Use the Launch package and two operator assets from the stable
-`RhinoForge-runtime-v1.2.0.tar.gz` distribution, as pinned in
-[runtime-dependencies.json](runtime-dependencies.json). Keep each operator payload
-with its adjacent `.ref.kernels` file. Advancing RhinoForge's development version
-does not change the Launch dependency version.
-See the [release policy](../docs/release_policy.md).
+version `1`, and advances `op_abi_epoch` to `2` in
+[runtime-dependencies.json](runtime-dependencies.json). Use the matching
+`RhinoForge-runtime-v1.3.0.dev0.tar.gz` bundle (which packages archived Launch
+`1.2.0` together with the `op_abi_epoch = 2` main and DDR-expansion operator
+assets). Keep each operator payload with its adjacent `.ref.kernels` file;
+`RhinoForge-runtime-v1.2.0.tar.gz` remains fixed for `v1.2.0` (`op_abi_epoch = 1`).
+Advancing RhinoForge's development version does not change the Launch dependency
+version. See the [release policy](../docs/release_policy.md).
 
 The recommended board SDK is **`EA_R1SDK_2026_08F-2156007a`**, validated on R1
 Linux `aarch64`, Ubuntu 22.04/glibc 2.35, GCC 11.4 and Python 3.12.15. It is a

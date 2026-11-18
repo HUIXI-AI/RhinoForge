@@ -26,7 +26,7 @@ def _forward(mlp, x):
                                       mlp.down_proj.weight.float())
 
 
-@pytest.mark.parametrize("logical, physical", [(3584, 3648), (9728, 9792)])
+@pytest.mark.parametrize("logical, physical", [(3584, 3648), (8192, 8256), (9728, 9792), (17408, 17472), (25600, 25728)])
 def test_static_padding_preserves_mlp_and_needs_no_activation_padding(monkeypatch, logical, physical):
     torch.manual_seed(91)
     model = _model(logical=logical)
@@ -50,7 +50,7 @@ def test_static_padding_preserves_mlp_and_needs_no_activation_padding(monkeypatc
         weights.pad_decoder_mlp_weights(model, logical_size=logical, physical_size=physical)
 
 
-@pytest.mark.parametrize("logical, physical", [(3584, 3648), (9728, 9792)])
+@pytest.mark.parametrize("logical, physical", [(3584, 3648), (8192, 8256), (9728, 9792), (17408, 17472), (25600, 25728)])
 def test_bad_last_projection_rejects_before_any_padding(logical, physical):
     model = _model(logical=logical)
     first = model.model.layers[0].mlp.gate_proj.weight
@@ -72,6 +72,34 @@ def test_physical_width_does_not_expand_logical_model_admission():
     geometry['intermediate_size'] = 9792
     with pytest.raises(ValueError, match='no admitted'):
         resolve_decoder_topology(num_cores=6, **geometry)
+
+
+@pytest.mark.parametrize("logical, physical", [(9728, 9792), (17408, 17472), (25600, 25728)])
+def test_int8_padding_preserves_dequantized_mlp_and_six_core_packing(logical, physical):
+    torch.manual_seed(23)
+    model = _model(logical=logical)
+    for layer in model.model.layers:
+        for projection in layer.mlp.children():
+            projection.weight = torch.nn.Parameter(
+                torch.randint(-8, 8, projection.weight.shape, dtype=torch.int8), requires_grad=False)
+            projection.register_buffer("weight_scale", torch.rand(projection.out_features).half() * .01)
+
+    def run(mlp, x):
+        def linear(name, value):
+            projection = getattr(mlp, name)
+            weight = projection.weight.float() * projection.weight_scale.float()[:, None]
+            return torch.nn.functional.linear(value, weight)
+        return linear("down_proj", torch.nn.functional.silu(linear("gate_proj", x)) * linear("up_proj", x))
+
+    x = torch.randn(2, 64) * .1
+    expected = [run(layer.mlp, x) for layer in model.model.layers]
+    weights.pad_decoder_mlp_weights(model, logical_size=logical, physical_size=physical)
+    for layer, want in zip(model.model.layers, expected):
+        torch.testing.assert_close(run(layer.mlp, x), want)
+        for name, projection in layer.mlp.named_children():
+            packed = weights.transform_linear_weight(projection.weight, 0 if name == "down_proj" else 1, 6)
+            assert packed.shape == projection.weight.shape
+            assert projection.weight_scale.shape == (projection.out_features,)
 
 
 def test_bad_padding_storage_rejects_before_claim(monkeypatch):

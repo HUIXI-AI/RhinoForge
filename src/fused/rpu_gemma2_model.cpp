@@ -669,7 +669,8 @@ protected:
             }
         }
         append_fmb_shared_runtime_routes(
-            manifest, plan, hidden_size(), FMB_SHARED_LAYER_INPUT_DMA);
+            manifest, plan, hidden_size(), FMB_SHARED_LAYER_INPUT_DMA,
+        /*compute_row_multiplier=*/1, num_cores(), mlp_tp());
         return manifest;
     }
 

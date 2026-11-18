@@ -29,6 +29,8 @@ import types
 from typing import Any
 
 import torch
+
+from rpu_backend.runtime.vision_position import canonical_vision_type
 import torch.nn as nn
 
 import rpu_backend
@@ -42,6 +44,7 @@ from rpu_backend.api._execution import (
     normalize_rpu_execution,
     resolve_component_rpu_execution,
     qwen3_vl_text_core_profile,
+    qwen3_vl_text_topology,
 )
 from rpu_backend.runtime.device import extract_to_device_target, is_rpu_device_target
 from rpu_backend.runtime.control import rpu_env_bool
@@ -84,6 +87,7 @@ from .vision import (
     build_vision_rope_tables,
     install_qwen3_vl_vision_for_rpu,
     enable_qwen3_vl_vision_merger_on_device,
+    qwen3_vl_vision_capacity,
     register_qwen3vl_vision_fused_merger,
     validate_qwen3_vl_vision_core_profile,
 )
@@ -150,11 +154,11 @@ _QWEN3_VL_8B_VISION_PROFILE = (
     "gelu_pytorch_tanh",
 )
 _QWEN3_VL_8B_VISION_SEMANTICS = ("qwen3_vl", 3, 2304)
-# Qwen3-VL-32B W8A16 is integrated only as a controlled-evaluation path.  The
-# source MR records a retained-Graph defect where the third and later decode
-# logits become exactly zero.  Keep it outside the supported profile registry
-# and require an exact opt-in before model loading or any irreversible mutation.
-_QWEN3_VL_32B_GRAPH_BLOCKED_ENV = "QWEN3_VL_32B_ALLOW_GRAPH_BLOCKED"
+# Qwen3-VL-32B W8A16: the source MR recorded a retained-Graph defect where the
+# third and later decode logits became exactly zero. The 2026-10-19 board runs
+# at 4/6/8 cores did not reproduce it, so its opt-in was retired (2026-10-20);
+# the exact logical profile and FP16 vision tower checks below still apply
+# before model loading or any irreversible mutation.
 _QWEN3_VL_32B_TEXT_PROFILE = (5120, 25600, 64, 8)
 # The full runtime-W8 weights exceed the SDK's instruction-address window.
 # Reserve low-address arenas before weights, bounded by all three caches plus
@@ -421,7 +425,7 @@ def _is_qwen3_vl_dense_eager_profile(model) -> bool:
                  vision.num_heads, vision.patch_size, vision.temporal_patch_size,
                  vision.spatial_merge_size, tuple(vision.deepstack_visual_indexes),
                  vision.hidden_act) == _SUPPORTED_VISION_PROFILE
-            and (vision.model_type, vision.in_channels, vision.num_position_embeddings,
+            and (canonical_vision_type(vision, "qwen3_vl"), vision.in_channels, vision.num_position_embeddings,
                  vision.out_hidden_size) == ("qwen3_vl", 3, 2304, profile[0])
             and (config.image_token_id, config.video_token_id,
                  config.vision_start_token_id, config.vision_end_token_id)
@@ -518,16 +522,9 @@ def _check_profile(config) -> None:
             "runtime-alignment or legacy 32B W8A16 profile."
         )
     if is_graph_blocked_32b:
-        if os.environ.get(_QWEN3_VL_32B_GRAPH_BLOCKED_ENV) != "1":
-            raise UnsupportedModelError(
-                "Qwen3VLAdapter: the exact Qwen3-VL-32B W8A16 profile is "
-                "graph-blocked: retained Graph replay produces all-zero logits "
-                "from the third decode step in the source MR. It is not a "
-                "supported profile. Set exact "
-                f"{_QWEN3_VL_32B_GRAPH_BLOCKED_ENV}=1 only for controlled "
-                "evaluation; clearing the graph per token is not an accepted "
-                "runtime workaround."
-            )
+        # Supported since the 2026-10-19 board run: retained Graph replay
+        # produced non-zero logits and coherent text through every decode step.
+        pass
     elif profile == _QWEN3_VL_32B_TEXT_PROFILE and not runtime_quant_32b:
         raise UnsupportedModelError(
             "Qwen3VLAdapter: only the exact Qwen3-VL-32B W8A16 config may enter "
@@ -592,7 +589,7 @@ def _check_profile(config) -> None:
         vision_semantics = None
         if profile == _QWEN3_VL_8B_TEXT_PROFILE:
             vision_semantics = (
-                vision_cfg.model_type,
+                canonical_vision_type(vision_cfg, "qwen3_vl"),
                 int(vision_cfg.in_channels),
                 int(vision_cfg.num_position_embeddings),
             )
@@ -652,18 +649,25 @@ def _qwen3_vl_core_topology(config, execution_config):
     vision = config.vision_config
     from rpu_backend.quant.load import is_qwen3_vl_2b_w8a16_config
     text_w8 = is_qwen3_vl_2b_w8a16_config(config)
+    runtime_quant = _is_qwen3_vl_runtime_quant_config(config)
+    text_awq = _is_qwen3_vl_awq_config(config)
+    quantized = (text_w8 or runtime_quant or text_awq
+                 or _is_qwen3_vl_32b_w8a16_config(config)
+                 or _is_qwen3_vl_4b_w8a16_config(config))
     if (getattr(config, "architectures", None) != ["Qwen3VLForConditionalGeneration"]
-            or (not text_w8 and any(getattr(cfg, key, None) is not None
+            or (not quantized and any(getattr(cfg, key, None) is not None
                    for cfg in (config, config.text_config, vision)
                    for key in ("quant_config", "quantization_config")))
-            or (vision.model_type, vision.in_channels, vision.num_position_embeddings)
+            or (canonical_vision_type(vision, "qwen3_vl"), vision.in_channels, vision.num_position_embeddings)
                 != ("qwen3_vl", 3, 2304)
             or tuple(getattr(config, key, None) for key in (
                 "image_token_id", "video_token_id", "vision_start_token_id", "vision_end_token_id"))
                 != (151655, 151656, 151652, 151653)
-            or getattr(config, "tie_word_embeddings", None) is not (profile.hidden_size != 4096)):
-        raise UnsupportedModelError("reduced-core Qwen3-VL requires exact FP16 Instruct or 2B text-only W8A16 config")
-    return resolve_decoder_topology(num_cores=cores, **profile.geometry())
+            or (not quantized and getattr(config, "tie_word_embeddings", None)
+                is not (profile.hidden_size != 4096))):
+        raise UnsupportedModelError("reduced-core Qwen3-VL requires an exact registered FP16 or quantized config")
+    packed_w4 = text_awq or (runtime_quant and config.quant_config["method"] == "w4a16")
+    return qwen3_vl_text_topology(config.text_config, cores, packed_w4=packed_w4)
 
 
 def _qwen3_vl_decoder_weight_view(model):
@@ -684,6 +688,36 @@ def _validate_qwen3_vl_reduced_weights(model, topology):
     actual = qwen3_vl_text_core_profile(model.model.language_model.config, topology.num_cores)
     if actual != profile:
         raise ValueError("Qwen3-VL loaded text geometry differs from the root config")
+    from rpu_backend.quant.load import _validate_staged_w8a16_imagetext
+    if vars(model).get("_rpu_w8a16_imagetext_load_plan") is not None:
+        _validate_staged_w8a16_imagetext(model)
+        return
+    from rpu_backend.quant.load_qwen3_vl_runtime import _validate_qwen3_vl_runtime_model
+    from rpu_backend.quant.load_qwen3_vl_awq import _validate_qwen3_vl_awq_model, _projection_inventory
+    runtime_quant = _validate_qwen3_vl_runtime_model(model)
+    text_awq = _validate_qwen3_vl_awq_model(model)
+    if runtime_quant or text_awq:
+        validate_qwen3_vl_text_semantics(model.model.language_model)
+        for name, module, partition in _projection_inventory(model):
+            if module.weight.dtype == torch.uint8:
+                cores = topology.mlp_tp if ".mlp." in name else topology.attn_tp
+                if (getattr(module, "_rpu_linear_partition", None),
+                        getattr(module, "_rpu_linear_num_cores", None)) != (partition, cores):
+                    raise ValueError("packed VL checkpoint differs from its selected cold topology")
+        if runtime_quant and model.lm_head.weight.dtype == torch.uint8:
+            if (getattr(model.lm_head, "_rpu_linear_partition", None),
+                    getattr(model.lm_head, "_rpu_linear_num_cores", None)) != (1, topology.lm_head_tp):
+                raise ValueError("packed VL head differs from its selected cold topology")
+        validate_qwen3_vl_vision_core_profile(model.model.visual,
+            num_cores=4, vision_config=model.config.vision_config)
+        return
+    if _is_qwen3_vl_32b_w8a16_config(model.config) or _is_qwen3_vl_4b_w8a16_config(model.config):
+        _validate_qwen3_vl_32b_w8a16_model(model)
+        _validate_qwen3_vl_4b_w8a16_model(model)
+        validate_qwen3_vl_text_semantics(model.model.language_model)
+        validate_qwen3_vl_vision_core_profile(model.model.visual,
+            num_cores=4, vision_config=model.config.vision_config)
+        return
     if _validate_qwen3_vl_2b_w8a16_model(model):
         return
     view = _qwen3_vl_decoder_weight_view(model)
@@ -881,9 +915,12 @@ def _apply_prefill_lm_head(model, hidden, slice_indices):
     text = model.model.language_model
     cores = getattr(head, "_rpu_linear_num_cores", 8)
     scale = getattr(head, "weight_scale", None) if weight.dtype in (torch.int8, torch.uint8) else None
+    logical_shape = ({"logical_out_features": head.out_features}
+                     if weight.dtype == torch.uint8 else {})
     return torch.ops.rpu.linear_with_accumulation(
         head_input.contiguous(), weight, getattr(head, "bias", None), 1, cores,
         getattr(text, "_rpu_execution", {}).get("prefill", {}).get("linear_acc32", False), scale,
+        **logical_shape,
     )
 
 
@@ -1192,11 +1229,19 @@ class Qwen3VLAdapter:
 
     _rpu_execution_components = _QWEN3_VL_EXECUTION_COMPONENTS
     _EXECUTION_SUPPORTED = _QWEN3_VL_EXECUTION_SUPPORTED
+    # Cold Vision (RoPE max_hw, KV max_seq_len). The public loader replaces it
+    # from image_grid_thw before to_rpu(); the default keeps the original install.
+    _rpu_vision_capacity = qwen3_vl_vision_capacity()
 
     @classmethod
     def preflight(cls, config) -> None:
         """Config-only check; called from RPUModelForConditionalGeneration."""
         _check_profile(config)
+
+    @staticmethod
+    def vision_capacity(image_grid_thw) -> tuple[int, int]:
+        """Cold Vision ``(max_hw, max_seq_len)`` for the loader's image grids."""
+        return qwen3_vl_vision_capacity(image_grid_thw)
 
     @classmethod
     def preflight_execution(cls, config, execution_config) -> None:
@@ -1216,7 +1261,7 @@ class Qwen3VLAdapter:
         # public loader stages weights, rather than during handle installation.
         text = config.text_config
         if _is_qwen3_vl_32b_w8a16_config(config):
-            # The exact controlled legacy recipe owns a separate narrow envelope.
+            # The exact controlled legacy recipe owns a separate envelope.
             # _check_profile retains its existing explicit opt-in and precision gate.
             _check_profile(config)
             from .text import _LEGACY_32B_CONTROLLED_ENVELOPE
@@ -1899,7 +1944,8 @@ class Qwen3VLAdapter:
                 torch.rpu.set_caching_allocator(True)
                 if graph_cache_max_entries is not None:
                     arena_policy = rpu_backend.graph.GraphRuntimePolicy.from_environment(
-                        graph_arena_count=3 * graph_cache_max_entries + 1)
+                        graph_arena_count=3 * graph_cache_max_entries + 1,
+                        execution_core_count=(topology.num_cores if topology is not None else 8))
                     if not arena_policy.prepare_arenas():
                         raise RPUBackendError(
                             "Qwen3-VL-32B W8 requires cold SDK graph arenas")
@@ -1917,7 +1963,8 @@ class Qwen3VLAdapter:
             if runtime_quant:
                 from rpu_backend.quant.load_qwen3_vl_runtime import _move_materialized_runtime_decoder_for_rpu
 
-                _move_materialized_runtime_decoder_for_rpu(self.model)
+                _move_materialized_runtime_decoder_for_rpu(self.model,
+                    **({"topology": topology} if topology is not None else {}))
             elif text_awq:
                 from rpu_backend.quant.load import _move_materialized_awq_decoder_for_rpu
 
@@ -1927,17 +1974,20 @@ class Qwen3VLAdapter:
                     _materialize_staged_w8a16_imagetext_for_rpu,
                 )
 
-                _materialize_staged_w8a16_imagetext_for_rpu(self.model)
+                _materialize_staged_w8a16_imagetext_for_rpu(self.model,
+                    **({"topology": topology} if topology is not None else {}))
             elif is_graph_blocked_32b_w8a16:
                 from rpu_backend.quant.load import _move_materialized_decoder_for_rpu
                 _move_materialized_decoder_for_rpu(
-                    self.model, dtype=torch.int8, per_layer=True)
+                    self.model, dtype=torch.int8, per_layer=True,
+                    **({"topology": topology} if topology is not None else {}))
             elif is_runtime_align_4b_w8a16:
                 from rpu_backend.quant.load import (
                     _move_materialized_w8a16_decoder_for_rpu,
                 )
 
-                _move_materialized_w8a16_decoder_for_rpu(self.model)
+                _move_materialized_w8a16_decoder_for_rpu(self.model,
+                    **({"topology": topology} if topology is not None else {}))
             elif use_2b_weight_banks or use_4b_fp16_weight_banks or use_8b_fp16_weight_banks:
                 from rpu_backend.quant.load import _move_materialized_decoder_for_rpu
 
@@ -2029,8 +2079,10 @@ class Qwen3VLAdapter:
             # The vision adapter handles its own per-block fused-QKV split +
             # swizzle. patch_embed / pos_embed / merger / deepstack_merger_list
             # remain on CPU per the adapter contract (findings F31/F32).
+            vision_max_hw, vision_max_seq_len = self._rpu_vision_capacity
             install_qwen3_vl_vision_for_rpu(
                 vision_model, vision_config=vision_cfg,
+                max_hw=vision_max_hw, max_seq_len=vision_max_seq_len,
                 execution_chunk_size=self._vision_execution.get(
                     "vision", {}
                 ).get("chunk_size", "auto"),
@@ -2039,7 +2091,8 @@ class Qwen3VLAdapter:
                 **({"_allow_runtime_quantized_large": True} if runtime_quant_large else {}),
                 **({"w8a16": True} if runtime_align_quantized else {}),
                 **({"_pack_fp16_block_weights": True}
-                   if use_fp16_vision_weight_banks or use_8b_fp16_weight_banks or is_graph_blocked_32b_w8a16 else {}),
+                   if topology is None and (use_fp16_vision_weight_banks or use_8b_fp16_weight_banks
+                                            or is_graph_blocked_32b_w8a16) else {}),
                 **({"num_cores": 4} if topology is not None else {}),
                 **({"_graph_cache_max_entries": graph_cache_max_entries}
                    if graph_cache_max_entries is not None else {}),
@@ -2063,6 +2116,8 @@ class Qwen3VLAdapter:
                 deepstack_lang_layers=deepstack_lang_layers,
                 enable_deepstack=True,
                 execution_config=self._text_execution,
+                **({"logical_vocab_size": text_cfg.vocab_size}
+                   if topology is None and (runtime_w4 or lm_head_w4a16) else {}),
                 **({"runtime_align_w8a16": True} if is_runtime_align_4b_w8a16 else {}),
                 **({"_legacy_32b_w8a16": True} if is_graph_blocked_32b_w8a16 else {}),
                 **({"_runtime_quantized_32b": True}
@@ -2140,8 +2195,9 @@ class Qwen3VLAdapter:
                         vision_model._rpu_vision_handle, True,
                     )
                 if runtime_align_quantized:
-                    enable_qwen3_vl_vision_merger_on_device(vision_model, w8a16=True)
-                    if not runtime_quant_large and not vision_linear_acc32:
+                    enable_qwen3_vl_vision_merger_on_device(vision_model, w8a16=True,
+                        **({"cores": 4} if topology is not None else {}))
+                    if topology is None and not runtime_quant_large and not vision_linear_acc32:
                         register_qwen3vl_vision_fused_merger(vision_model, w8a16=True)
                         vision_model._rpu_vision_chunked_merger_w8a16 = True
                         torch.ops.rpu.qwen3vl_vision_set_n1200_tm160(

@@ -77,17 +77,14 @@ void rpu_launch_fla_conv1d_spm_kernel(uint32_t cs_spm_addr, uint32_t x_spm_addr,
 // Input pad = [cs_init(3); x(L)] contiguous in SPM [B, 3+L, D] and remains
 // read-only. The kernel writes y[B,L,D] and cs_out[B,3,D] to separate buffers.
 // This removes the segmented in-place kernel's pre-saved halo requirement.
-void rpu_launch_fla_conv1d_prefill_noinplace_spm_kernel(
+KernelRegisterImage fla_conv1d_prefill_noinplace_registers(
     uint32_t pad_spm_addr, uint32_t out_spm_addr, uint32_t cs_out_spm_addr,
-    c10::Half* weight_ddr, int64_t B, int64_t local_d, int64_t Kc, int64_t L,
-    int num_cores) {
+    uint64_t weight_dev_addr, int64_t B, int64_t local_d, int64_t Kc, int64_t L) {
     TORCH_CHECK(local_d % 16 == 0, "fla_conv1d prefill: local_d must be %16, got ", local_d);
     TORCH_CHECK(Kc == 4, "fla_conv1d prefill: kernel size fixed to 4");
     TORCH_CHECK(L > 1, "fla_conv1d prefill: L must be > 1 (use decode for L=1)");
-    TORCH_CHECK(weight_ddr != nullptr, "fla_conv1d prefill: weight_ddr null");
-    rpu_ddr_flush(weight_ddr);
 
-    const uint64_t w_addr   = RpuGetDevAddr(weight_ddr) >> 8;
+    const uint64_t w_addr   = weight_dev_addr >> 8;
     const int64_t  ld_pad   = ceil_align_i(local_d, 128);
     const uint16_t d_v16    = (uint16_t)(local_d / 16);
     const int64_t  tiles    = (local_d + 255) / 256;
@@ -105,38 +102,94 @@ void rpu_launch_fla_conv1d_prefill_noinplace_spm_kernel(
     TORCH_CHECK(N == 1 || (N - 1) * seg_len * d_v16 < (1 << 16),
                 "fla_conv1d prefill: segment offset exceeds kernel's 16-bit multiply");
 
+    KernelRegisterImage image;
+    image.set(0,  (uint16_t)(pad_v16 & 0xFFFF));            // pad base (= cs_init head)
+    image.set(1,  (uint16_t)(pad_v16 >> 16));
+    image.set(4,  (uint16_t)(w_addr & 0xFFFF));
+    image.set(5,  (uint16_t)(w_addr >> 16));
+    image.set(6,  (uint16_t)(pad_batch_v16 & 0xFFFF));
+    image.set(7,  d_v16);
+    image.set(8,  (uint16_t)(ld_pad * 2));
+    image.set(9,  (uint16_t)L);
+    image.set(10, (uint16_t)1);                             // is_prefill
+    image.set(11, (uint16_t)(cs_out_v16 & 0xFFFF));
+    image.set(12, (uint16_t)(cs_out_v16 >> 16));
+    image.set(15, (uint16_t)(N > 1 ? 1 : 0));               // isSegmented
+    image.set(16, (uint16_t)(ld_v16 & 0xFFFF));
+    image.set(17, (uint16_t)(ld_v16 >> 16));
+    image.set(18, (uint16_t)seg_len);                       // base = L//N steps per segment
+    image.set(21, (uint16_t)(N - 1));                       // top segment idx (stores cs_out)
+    image.set(22, (uint16_t)seg_rem);                       // rem = L%N (all to seg0)
+    image.set(23, (uint16_t)(out_v16 & 0xFFFF));
+    image.set(24, (uint16_t)(out_v16 >> 16));
+    image.set(64, (uint16_t)tiles);                         // gridDim.x  (generator parity)
+    image.set(65, (uint16_t)B);                             // gridDim.y
+    image.set(66, (uint16_t)N);                             // gridDim.z = segment count
+    image.grid = {(uint16_t)tiles, (uint16_t)B, (uint16_t)N};
+    return image;
+}
+
+void rpu_launch_fla_conv1d_prefill_noinplace_spm_kernel(
+    uint32_t pad_spm_addr, uint32_t out_spm_addr, uint32_t cs_out_spm_addr,
+    c10::Half* weight_ddr, int64_t B, int64_t local_d, int64_t Kc, int64_t L,
+    int num_cores) {
+    TORCH_CHECK(weight_ddr != nullptr, "fla_conv1d prefill: weight_ddr null");
+    const KernelRegisterImage image = fla_conv1d_prefill_noinplace_registers(
+        pad_spm_addr, out_spm_addr, cs_out_spm_addr, RpuGetDevAddr(weight_ddr),
+        B, local_d, Kc, L);
+    rpu_ddr_flush(weight_ddr);
+
     Kernel_t* kernel = GET_KERNEL(KernelId::FLA_CONV1D_NOINPLACE);
     TORCH_CHECK(kernel != nullptr, "Failed to get llm_fla_conv1d_noinplace kernel");
     kernel->reset_regs();
-    kernel->set_regs(0,  (uint16_t)(pad_v16 & 0xFFFF));     // pad base (= cs_init head)
-    kernel->set_regs(1,  (uint16_t)(pad_v16 >> 16));
-    kernel->set_regs(4,  (uint16_t)(w_addr & 0xFFFF));
-    kernel->set_regs(5,  (uint16_t)(w_addr >> 16));
-    kernel->set_regs(6,  (uint16_t)(pad_batch_v16 & 0xFFFF));
-    kernel->set_regs(7,  d_v16);
-    kernel->set_regs(8,  (uint16_t)(ld_pad * 2));
-    kernel->set_regs(9,  (uint16_t)L);
-    kernel->set_regs(10, (uint16_t)1);                      // is_prefill
-    kernel->set_regs(11, (uint16_t)(cs_out_v16 & 0xFFFF));
-    kernel->set_regs(12, (uint16_t)(cs_out_v16 >> 16));
-    kernel->set_regs(15, (uint16_t)(N > 1 ? 1 : 0));        // isSegmented
-    kernel->set_regs(16, (uint16_t)(ld_v16 & 0xFFFF));
-    kernel->set_regs(17, (uint16_t)(ld_v16 >> 16));
-    kernel->set_regs(18, (uint16_t)seg_len);                // base = L//N steps per segment
-    kernel->set_regs(21, (uint16_t)(N - 1));                // top segment idx (stores cs_out)
-    kernel->set_regs(22, (uint16_t)seg_rem);                // rem = L%N (all to seg0)
-    kernel->set_regs(23, (uint16_t)(out_v16 & 0xFFFF));
-    kernel->set_regs(24, (uint16_t)(out_v16 >> 16));
-    kernel->set_regs(64, (uint16_t)tiles);                  // gridDim.x
-    kernel->set_regs(65, (uint16_t)B);                      // gridDim.y
-    kernel->set_regs(66, (uint16_t)N);                      // gridDim.z = segment count
+    for (size_t i = 0; i < image.count; ++i)
+        kernel->set_regs(image.regs[i].first, image.regs[i].second);
 
-    const uint16_t grid_x = (uint16_t)tiles;
     auto* wq = GET_QUEUE(num_cores);
     wq->set_broadcast_mode(true);
     std::vector<uint8_t> cores;
     for (int i = 0; i < num_cores; ++i) cores.push_back((uint8_t)i);
-    wq->enqueu_kernel(*kernel, {grid_x, (uint16_t)B, (uint16_t)N}, cores);
+    wq->enqueu_kernel(*kernel, {image.grid[0], image.grid[1], image.grid[2]}, cores);
+}
+
+KernelRegisterImage fla_conv1d_prefill_noinplace_pitched_registers(
+    uint32_t pad_spm_addr, uint32_t out_spm_addr, uint32_t cs_out_spm_addr,
+    uint64_t weight_dev_addr, int64_t pitch, int64_t channels, int64_t Kc, int64_t L) {
+    TORCH_CHECK(channels > 0 && channels % 256 == 0 && channels < pitch,
+                "fla_conv1d pitched prefill: channels must be whole tiles inside the pitch");
+    KernelRegisterImage image = fla_conv1d_prefill_noinplace_registers(
+        pad_spm_addr, out_spm_addr, cs_out_spm_addr, weight_dev_addr, 1, pitch, Kc, L);
+    const uint16_t tiles = static_cast<uint16_t>(channels / 256);
+    for (size_t i = 0; i < image.count; ++i) {
+        auto& reg = image.regs[i];
+        if (reg.first == 8) reg.second = static_cast<uint16_t>(channels * 2);  // weight row
+        if (reg.first == 64) reg.second = tiles;                               // gridDim.x
+    }
+    image.grid[0] = tiles;
+    return image;
+}
+
+void rpu_launch_fla_conv1d_prefill_noinplace_pitched_spm_kernel(
+    uint32_t pad_spm_addr, uint32_t out_spm_addr, uint32_t cs_out_spm_addr,
+    c10::Half* weight_ddr, int64_t pitch, int64_t channels, int64_t Kc, int64_t L,
+    int num_cores) {
+    TORCH_CHECK(weight_ddr != nullptr, "fla_conv1d pitched prefill: weight_ddr null");
+    const KernelRegisterImage image = fla_conv1d_prefill_noinplace_pitched_registers(
+        pad_spm_addr, out_spm_addr, cs_out_spm_addr, RpuGetDevAddr(weight_ddr),
+        pitch, channels, Kc, L);
+    rpu_ddr_flush(weight_ddr);
+
+    Kernel_t* kernel = GET_KERNEL(KernelId::FLA_CONV1D_NOINPLACE);
+    TORCH_CHECK(kernel != nullptr, "Failed to get llm_fla_conv1d_noinplace kernel");
+    kernel->reset_regs();
+    for (size_t i = 0; i < image.count; ++i)
+        kernel->set_regs(image.regs[i].first, image.regs[i].second);
+
+    auto* wq = GET_QUEUE(num_cores);
+    wq->set_broadcast_mode(true);
+    std::vector<uint8_t> cores;
+    for (int i = 0; i < num_cores; ++i) cores.push_back((uint8_t)i);
+    wq->enqueu_kernel(*kernel, {image.grid[0], image.grid[1], image.grid[2]}, cores);
 }
 
 // Isolated single-core test: cs [Kc, D], x [D], weight [Kc, D] (B=1, num_cores=1).

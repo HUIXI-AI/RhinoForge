@@ -470,7 +470,7 @@ def _adaptive_modulation_stack(expert, time_conditions) -> torch.Tensor:
 
 def _rpu_g05_encode_time(self, timestep: torch.Tensor) -> torch.Tensor:
     if tuple(timestep.shape) != (1,):
-        raise ValueError("G0.5 device time conditioning requires batch_size=1")
+        raise ValueError("G0.5 RPU time conditioning requires batch_size=1")
     timestep = timestep.detach().to(
         device="cpu", dtype=torch.float32
     ).contiguous()
@@ -574,11 +574,11 @@ def _check_action_mask(mask, *, action_len: int, prefix_len: int) -> None:
     expected = (1, 1, action_len, prefix_len + action_len)
     if tuple(mask.shape) != expected:
         raise NotImplementedError(
-            f"G0.5 device action mask must have shape {expected}, got {tuple(mask.shape)}"
+            f"G0.5 RPU action mask must have shape {expected}, got {tuple(mask.shape)}"
         )
     if not bool(mask.eq(0).all().item()):
         raise NotImplementedError(
-            "G0.5 device action bring-up supports only unpadded, non-causal action attention"
+            "G0.5 RPU action bring-up supports only unpadded, non-causal action attention"
         )
 
 
@@ -637,7 +637,7 @@ def _cached_action_position(
 
 
 def _cached_action_keep_mask(state, pad_mask):
-    """Keep the cold feature mask and its device allocation stable across REPLAY."""
+    """Keep the cold feature mask and its RPU allocation stable across REPLAY."""
     feature_mask = None
     if pad_mask is not None:
         if (
@@ -714,18 +714,18 @@ def _rpu_g05_action_forward(
 ):
     del attn_implementation, mixture_name
     if self.training:
-        raise NotImplementedError("G0.5 device action expert supports inference only")
+        raise NotImplementedError("G0.5 RPU action expert supports inference only")
     if inputs_embeds.device.type != "cpu" or inputs_embeds.shape[0] != 1:
         raise NotImplementedError(
-            "G0.5 device action expert requires batch_size=1 with host inputs"
+            "G0.5 RPU action expert requires batch_size=1 with host inputs"
         )
     if inputs_embeds.shape[1] != 32:
-        raise NotImplementedError("G0.5 device action expert requires horizon_steps=32")
+        raise NotImplementedError("G0.5 RPU action expert requires horizon_steps=32")
     if past_key_values is not None or kv_cache is None:
-        raise TypeError("G0.5 device action expert requires a sparse prefix kv_cache")
+        raise TypeError("G0.5 RPU action expert requires a sparse prefix kv_cache")
     if return_kv_cache or split_idx is not None or padding_mask is not None:
         raise NotImplementedError(
-            "G0.5 device action expert supports read-only prefix inference only"
+            "G0.5 RPU action expert supports read-only prefix inference only"
         )
     prefix_len = int(getattr(kv_cache, "_rpu_g05_prefix_len", -1))
     prefix_cache = getattr(kv_cache, "_rpu_g05_prefix_cache", kv_cache)
@@ -733,7 +733,7 @@ def _rpu_g05_action_forward(
         logical = getattr(prefix_cache, "num_items", None)
         prefix_len = int(logical() if callable(logical) else -1)
     if prefix_len < 0:
-        raise TypeError("G0.5 device action prefix cache is missing its prefix length")
+        raise TypeError("G0.5 RPU action prefix cache is missing its prefix length")
     _check_action_mask(
         attention_mask,
         action_len=int(inputs_embeds.shape[1]),
@@ -824,7 +824,7 @@ def _rpu_g05_action_step(
     prefix_lens: list[int],
     prefix_len: int,
 ) -> torch.Tensor:
-    """Run one device input-projection → decoder → output-projection → Euler step."""
+    """Run one RPU input-projection → decoder → output-projection → Euler step."""
     import rpu_backend as _rb
 
     state = expert._rpu_qwen3_5
@@ -837,7 +837,7 @@ def _rpu_g05_action_step(
         or action_input.data_ptr() == action_output.data_ptr()
     ):
         raise ValueError(
-            "G0.5 device action step expects distinct FP16 device input/output "
+            "G0.5 RPU action step expects distinct FP16 RPU input/output "
             f"buffers with shape {expected}"
         )
     if (
@@ -845,7 +845,7 @@ def _rpu_g05_action_step(
         or action_keep_mask.device.type != "rpu"
     ):
         raise ValueError(
-            "G0.5 device action keep mask must be a padded 1D device tensor"
+            "G0.5 RPU action keep mask must be a padded 1D RPU tensor"
         )
     plan = _plan_g05_action_execution(
         expert, prefix_len=prefix_len, include_action_io=True,
@@ -932,7 +932,7 @@ def _rpu_g05_action_loop(
     rtc_prefix: torch.Tensor | None = None,
     rtc_prefix_len: int = 0,
 ) -> torch.Tensor:
-    """Run the complete Euler trajectory in one captured device graph."""
+    """Run the complete Euler trajectory in one captured RPU graph."""
     import rpu_backend as _rb
 
     state = expert._rpu_qwen3_5
@@ -958,15 +958,15 @@ def _rpu_g05_action_loop(
         or action_input.data_ptr() == action_output.data_ptr()
     ):
         raise ValueError(
-            "G0.5 device action loop expects 10 steps and distinct FP16 "
-            f"CPU or device input and device output buffers with shape {expected}"
+            "G0.5 RPU action loop expects 10 steps and distinct FP16 "
+            f"CPU or RPU input and RPU output buffers with shape {expected}"
         )
     if (
         tuple(action_keep_mask.shape) != (state.action_dim_pad,)
         or action_keep_mask.device.type != "rpu"
     ):
         raise ValueError(
-            "G0.5 device action keep mask must be a padded 1D device tensor"
+            "G0.5 RPU action keep mask must be a padded 1D RPU tensor"
         )
     rtc_active = rtc_prefix is not None
     if rtc_active:
@@ -988,7 +988,7 @@ def _rpu_g05_action_loop(
             )
         ):
             raise ValueError(
-                "G0.5 RTC prefix must be plain contiguous FP16 CPU or device "
+                "G0.5 RTC prefix must be plain contiguous FP16 CPU or RPU "
                 "[1, inference_delay, action_dim_pad]"
             )
     elif rtc_prefix_len != 0:
@@ -1097,7 +1097,7 @@ def _rpu_g05_action_rtc_trace(
         or action_input.data_ptr() == action_output.data_ptr()
     ):
         raise ValueError(
-            "G0.5 RTC trace expects 10 steps, contiguous FP16 device inputs, "
+            "G0.5 RTC trace expects 10 steps, contiguous FP16 RPU inputs, "
             f"and distinct action buffers with shape {expected}"
         )
     if tuple(action_keep_mask.shape) != (state.action_dim_pad,):
@@ -1203,7 +1203,7 @@ def _rpu_g05_action_step_velocity(
     state = expert._rpu_qwen3_5
     if tuple(action.shape) != (1, 32, state.action_dim):
         raise ValueError(
-            "G0.5 device action step expects action shape "
+            "G0.5 RPU action step expects action shape "
             f"[1, 32, {state.action_dim}]"
         )
     action_input = F.pad(
@@ -1238,7 +1238,7 @@ def _rpu_g05_inference_fm(
     inference_delay=None,
     **kwargs,
 ) -> torch.Tensor:
-    """Canonical G0.5 FM loop with device-fused action I/O projections."""
+    """Canonical G0.5 FM loop with RPU-fused action I/O projections."""
     if prev_actions is None:
         prev_actions = kwargs.pop("prev_action", None)
     del kwargs
@@ -1248,11 +1248,11 @@ def _rpu_g05_inference_fm(
     first_image = next(iter(pixel_values.values()))
     if first_image.device.type != "cpu" or first_image.size(0) != 1:
         raise NotImplementedError(
-            "G0.5 device FM inference requires batch_size=1 with host inputs"
+            "G0.5 RPU FM inference requires batch_size=1 with host inputs"
         )
     dtype = first_image.dtype
     if dtype != torch.float32:
-        raise NotImplementedError("G0.5 device FM inference requires FP32 host state")
+        raise NotImplementedError("G0.5 RPU FM inference requires FP32 host state")
 
     pad_mask = (
         action_dim_is_pad.bool().unsqueeze(1)
@@ -1269,7 +1269,7 @@ def _rpu_g05_inference_fm(
     else:
         if bool(getattr(helper, "use_correlated_noise", False)):
             raise NotImplementedError(
-                "G0.5 device release inference does not support correlated noise"
+                "G0.5 RPU release inference does not support correlated noise"
             )
         action = torch.randn(
             (1, helper.horizon_steps, helper.action_dim),
@@ -1343,7 +1343,7 @@ def _rpu_g05_inference_fm(
     _ensure_action_rope(state, action_pos, helper.horizon_steps)
 
     # Native copies each current CPU action/prefix into fresh private DDR and
-    # publishes them with the existing Action Batch. device inputs keep their route.
+    # publishes them with the existing Action Batch. RPU inputs keep their route.
     action_input = F.pad(
         action, (0, state.action_dim_pad - state.action_dim)
     ).to(dtype=torch.float16).contiguous()
@@ -1398,7 +1398,7 @@ def patch_g05_action_expert_for_rpu(
     _g05_exact_k1: bool = False,
     math_precision: str = "base",
 ):
-    """Patch G0.5 action inference for diagnostic one-step and ten-step device graphs."""
+    """Patch G0.5 action inference for diagnostic one-step and ten-step RPU graphs."""
     from rpu_backend.api._execution import normalize_rpu_execution
     from rpu_backend.adapters.g05.quant import (
         check_installed_weight_dtype, normalize_weight_dtype,
@@ -1467,7 +1467,7 @@ def patch_g05_action_expert_for_rpu(
         )
     if expert.training:
         raise NotImplementedError(
-            "G0.5 device action expert supports inference only; call expert.eval()"
+            "G0.5 RPU action expert supports inference only; call expert.eval()"
         )
     if max_seq_len < 32:
         raise ValueError("max_seq_len must cover the 32-token action horizon")
@@ -1476,7 +1476,7 @@ def patch_g05_action_expert_for_rpu(
         parameter.device.type != "cpu" for parameter in parameters()
     ):
         raise NotImplementedError(
-            "G0.5 device action patch requires a CPU-hosted checkpoint"
+            "G0.5 RPU action patch requires a CPU-hosted checkpoint"
         )
     _check_g05_action_profile(expert.config)
     if not _ACTION_INSTALL_LOCK.acquire(blocking=False):

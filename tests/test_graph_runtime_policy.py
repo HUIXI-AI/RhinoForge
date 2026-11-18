@@ -35,9 +35,14 @@ class _NativePolicy:
 
 
 class _NativeCache:
-    def __init__(self, max_entries, runtime_policy):
+    def __init__(self, max_entries, runtime_policy, require_single_segment=False):
+        self.require_single_segment = require_single_segment
         self.max_entries = max_entries
         self.runtime_policy = runtime_policy
+        self.entries = []
+
+    def snapshot(self):
+        return list(self.entries)
 
 
 class _Backend:
@@ -259,12 +264,14 @@ def test_modern_27b_rejects_incompatible_arena_owners(runtime_module, arenas, le
             qwen35_dense_27b_sdk_budget=True, qwen35_legacy_27b_sdk_budget=legacy)
 
 
+
 def test_native_graph_execution_has_no_runtime_selector_getenv():
     graph_sources = "\n".join(
         (ROOT / path).read_text(encoding="utf-8")
         for path in (
             "src/graph/graph_runtime.cpp",
             "src/graph/graph_runtime_execute.cpp",
+            "src/graph/graph_async_end.cpp",
             "src/core/fused_model_base.cpp",
             "src/fused/rpu_qwen3vl_multiview_spm_z2.cpp",
         )
@@ -313,3 +320,56 @@ def test_batch_snapshot_policy_keeps_older_native_fallback(runtime_module, monke
     runtime_module.configure_backend(legacy)
     policy = runtime_module.GraphRuntimePolicy(batch_snapshot_mode="auto")
     assert policy._native().options == {}
+
+
+def test_single_segment_policy_is_cache_local(runtime_module):
+    enabled = runtime_module.GraphCache(require_single_segment=True)
+    default = runtime_module.GraphCache()
+    assert enabled._impl.require_single_segment is True
+    assert default._impl.require_single_segment is False
+    assert enabled.runtime_policy == default.runtime_policy
+    with pytest.raises(TypeError, match="must be bool"):
+        runtime_module.GraphCache(require_single_segment=1)
+
+
+def test_async_replay_end_is_an_owner_opt_in_and_reaches_native(runtime_module, monkeypatch):
+    # The removed measurement prototype was env-selected; the policy is not.
+    monkeypatch.setenv("RPU_EXP_ASYNC_GRAPH_END", "rpu_qwen35_vision")
+    base = runtime_module.GraphRuntimePolicy.from_environment()
+    assert base.async_replay_end is False
+    assert "async_replay_end" not in base._native().options
+    opted = base.with_async_replay_end()
+    assert base.async_replay_end is False
+    assert opted.async_replay_end is True
+    assert opted.with_async_replay_end() is opted
+    assert opted.provenance == base.provenance + ("owner:async_replay_end=1",)
+    assert opted._native().values == base._native().values
+    assert opted._native().options["async_replay_end"] is True
+    with pytest.raises(FrozenInstanceError):
+        opted.async_replay_end = False
+
+
+@pytest.mark.parametrize("value", [1, 0, "1", None])
+def test_async_replay_end_rejects_untyped_values(runtime_module, value):
+    with pytest.raises(TypeError, match="async_replay_end must be bool"):
+        runtime_module.GraphRuntimePolicy(async_replay_end=value)
+
+
+def test_cache_async_replay_end_replaces_only_an_empty_configuring_cache(runtime_module):
+    cache = runtime_module.GraphCache(max_entries=1, require_single_segment=True)
+    opted = cache.with_async_replay_end()
+    assert opted is not cache
+    assert cache.runtime_policy.async_replay_end is False
+    assert opted.runtime_policy == cache.runtime_policy.with_async_replay_end()
+    assert opted._impl.max_entries == 1
+    assert opted._impl.require_single_segment is True
+    assert opted._impl.runtime_policy.options["async_replay_end"] is True
+    assert opted.with_async_replay_end() is opted
+
+    warming = runtime_module.GraphCache().begin_warmup()
+    with pytest.raises(RuntimeError, match="empty CONFIGURING"):
+        warming.with_async_replay_end()
+    filled = runtime_module.GraphCache()
+    filled._impl.entries.append(object())
+    with pytest.raises(RuntimeError, match="empty CONFIGURING"):
+        filled.with_async_replay_end()

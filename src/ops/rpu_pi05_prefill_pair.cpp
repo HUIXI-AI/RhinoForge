@@ -1,6 +1,7 @@
 #include "rpu_pi05_prefill_pair.h"
 #include "rpu_ops.h"
 #include "rpu_linear_tiling.h"
+#include "rpu_pi_wall_tiling.h"
 #include "rpu_spm_allocator.h"
 #include "rhino_launch_buffer.h"
 #include "rhino_launch_queue.h"
@@ -17,8 +18,8 @@ void rpu_launch_pi05_prefill_pair_spm_kernel(
                 kind==Pi05PrefillPairedProjection::AttentionOutputRow,
                 "Pi paired prefill invalid projection ABI");
     const bool column=kind==Pi05PrefillPairedProjection::QkvColumn;
-    TORCH_CHECK(rows == 272 || rows == 288 || rows == 304 || rows == 320 || rows == 336 || rows == 400 || rows == 416 || rows == 432 || rows == 448 || rows == 464,
-                "Pi paired prefill requires C272/C288/C304/C320/C336/C400/C416/C432/C448/C464");
+    TORCH_CHECK(rows == 272 || rows == 288 || rows == 304 || rows == 320 || rows == 336 || rows == 400 || rows == 416 || rows == 432 || rows == 448 || rows == 464 || rows == 480,
+                "Pi paired prefill requires C272/C288/C304/C320/C336/C400/C416/C432/C448/C464/C480");
     const bool fp16 = weight.defined() && weight.scalar_type() == at::kHalf;
     TORCH_CHECK(!column || (rows == 400 && !fp16), "Pi paired QKV prototype remains C400/W8");
     const uint32_t M=rows,N=column?256:2048,K=column?2048:256;
@@ -45,30 +46,11 @@ void rpu_launch_pi05_prefill_pair_spm_kernel(
                 scale.scalar_type()==at::kHalf && scale.is_contiguous() &&
                 scale.sizes()==at::IntArrayRef({2048})),
                 "Pi paired prefill requires original FP16 per-channel scale [2048]");
-    const auto tile=rpu_pl_tiling::select_tile_acc16(M,N,K,false);
-    TORCH_CHECK(rows != 400 || fp16 || (tile.m_tile==(column?448:400) && tile.n_tile==(column?64:80)),
-                "Pi paired prefill original tile identity drift");
-    const auto id = column ? KernelId::PI05_PREFILL_QKV_WEIGHT_OUTER_W8A16_C400X2_M128N64K128 :
-        rows == 432 ? (fp16 ? KernelId::PI05_PREFILL_O_WEIGHT_OUTER_FP16_C432X2_M112N80K128
-                            : KernelId::PI05_PREFILL_O_WEIGHT_OUTER_W8A16_C432X2_M112N80K128) :
-        rows == 464 ? (fp16 ? KernelId::PI05_PREFILL_O_WEIGHT_OUTER_FP16_C464X2_M80N80K128
-                            : KernelId::PI05_PREFILL_O_WEIGHT_OUTER_W8A16_C464X2_M80N80K128) :
-        rows == 448 ? (fp16 ? KernelId::PI05_PREFILL_O_WEIGHT_OUTER_FP16_C448X2_M96N80K128
-                            : KernelId::PI05_PREFILL_O_WEIGHT_OUTER_W8A16_C448X2_M96N80K128) :
-        rows == 416 ? (fp16 ? KernelId::PI05_PREFILL_O_WEIGHT_OUTER_FP16_C416X2_M128N80K128
-                            : KernelId::PI05_PREFILL_O_WEIGHT_OUTER_W8A16_C416X2_M128N80K128) :
-        rows == 288 ? (fp16 ? KernelId::PI05_PREFILL_O_WEIGHT_OUTER_FP16_C288X2_M128N80K128
-                            : KernelId::PI05_PREFILL_O_WEIGHT_OUTER_W8A16_C288X2_M128N80K128) :
-        rows == 304 ? (fp16 ? KernelId::PI05_PREFILL_O_WEIGHT_OUTER_FP16_C304X2_M128N80K128
-                            : KernelId::PI05_PREFILL_O_WEIGHT_OUTER_W8A16_C304X2_M128N80K128) :
-        rows == 336 ? (fp16 ? KernelId::PI05_PREFILL_O_WEIGHT_OUTER_FP16_C336X2_M128N80K128
-                            : KernelId::PI05_PREFILL_O_WEIGHT_OUTER_W8A16_C336X2_M128N80K128) :
-        rows == 320 ? (fp16 ? KernelId::PI05_PREFILL_O_WEIGHT_OUTER_FP16_C320X2_M128N80K128
-                            : KernelId::PI05_PREFILL_O_WEIGHT_OUTER_W8A16_C320X2_M128N80K128) :
-        fp16 ? (rows == 400 ? KernelId::PI05_PREFILL_O_WEIGHT_OUTER_FP16_C400X2_M128N80K128 :
-                              KernelId::PI05_PREFILL_O_WEIGHT_OUTER_FP16_C272X2_M128N80K128) :
-        rows == 400 ? KernelId::PI05_PREFILL_O_WEIGHT_OUTER_W8A16_C400X2_M128N80K128 :
-                      KernelId::PI05_PREFILL_O_WEIGHT_OUTER_W8A16_C272X2_M128N80K128;
+    const auto selected = rpu_pi_wall::select(
+        rpu_pi_wall::Operation::PairedLinear,
+        fp16 ? rpu_pl_tiling::WeightType::Fp16 : rpu_pl_tiling::WeightType::Int8,
+        false, M, N, K);
+    const auto id = pi_wall_kernel_id(selected.ordinal);
     std::vector<GraphDdrRegisterOperandSpec> operands{
             {GraphDdrRegisterAbi{fp16 ? GraphDdrRegisterRole::ModelWeight : GraphDdrRegisterRole::Int8ModelWeight,
                 GraphDdrRegisterAccess::Read,GraphDdrRegisterEncoding::DevAddrShift8LoHi,2,3},weight}};
@@ -87,15 +69,17 @@ void rpu_launch_pi05_prefill_pair_spm_kernel(
     kernel->reset_regs();
     rpu_pl_tiling::set_parallel_linear_regs(*kernel,
         rpu_pl_tiling::ParallelLinearRegisterArgs{
-            input0,0,output0,0,M,N,K,/*has_bias=*/0,8,K*2,N*2,0,
-            /*partition=*/uint16_t(column?1:0),uint16_t(fp16 ? 0 : 1)});
+            input0,0,output0,0,2*M,N,K,/*has_bias=*/0,8,K*2,N*2,0,
+            /*partition=*/uint16_t(column?1:0),uint16_t(fp16 ? 2 : 1)});
     const auto pair=[kernel](uint32_t index,uint32_t value) {
         TORCH_CHECK(kernel->set_regs(index,uint16_t(value))==kKernelRegOk &&
                     kernel->set_regs(index+1,uint16_t(value>>16))==kKernelRegOk,
                     "Pi paired prefill rejected extra SPM register pair");
     };
-    pair(24,input1);pair(26,output1);writer.write(*kernel);
+    pair(48,input1);pair(50,output1);
+    kernel->set_regs(52, static_cast<uint16_t>(M));
+    writer.write(*kernel);
     auto* queue=GET_QUEUE(8);
     queue->set_broadcast_mode(true);
-    queue->enqueu_kernel(*kernel,{uint16_t(column?4:26),1,1},{0,1,2,3,4,5,6,7});
+    queue->enqueu_kernel(*kernel,{selected.grid_x,selected.grid_y,1},{0,1,2,3,4,5,6,7});
 }

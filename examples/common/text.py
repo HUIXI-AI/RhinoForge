@@ -18,16 +18,16 @@ def text_context(config):
     decode_steps = inputs.get("decode_steps", 4)
     return example, inputs, target, checkpoint, execution, decode_steps
 
-def text_inputs(config, checkpoint, decode_steps):
+def text_token_inputs(config, checkpoint):
+    """Tokenize the configured prompt on the CPU; shared with the golden producer.
+
+    No checkpoint-profile binding or backend import: the host producer runs
+    this against the float parent's tokenizer.
+    """
     from transformers import AutoTokenizer
     from examples.common.generation import _text_input_ids, _realtext_input_ids
-    example, inputs = config["example"], config["input"]
-    target = example["target"]
+    inputs = config["input"]
 
-    if target == "qwen3" or (target == "qwen3_5" and "profile_id" in example):
-        from examples.common.config import validate_checkpoint_profile
-
-        validate_checkpoint_profile(config, checkpoint)
     tokenizer = AutoTokenizer.from_pretrained(checkpoint, local_files_only=True)
     input_metadata = None
     if "prompt_file" in inputs:
@@ -37,6 +37,17 @@ def text_inputs(config, checkpoint, decode_steps):
         input_ids, input_metadata = _realtext_input_ids(tokenizer, inputs)
     else:
         input_ids = _text_input_ids(tokenizer, inputs)
+    return tokenizer, input_ids, input_metadata
+
+def text_inputs(config, checkpoint, decode_steps):
+    example = config["example"]
+    target = example["target"]
+
+    if target == "qwen3" or (target == "qwen3_5" and "profile_id" in example):
+        from examples.common.config import validate_checkpoint_profile
+
+        validate_checkpoint_profile(config, checkpoint)
+    tokenizer, input_ids, input_metadata = text_token_inputs(config, checkpoint)
     # Prefill returns the first token; D subsequent calls consume exactly D
     # further cache positions, even though D+1 output tokens are returned.
     capacity = int(input_ids.shape[1]) + decode_steps

@@ -22,35 +22,54 @@ def _rope(values, heads, width, position):
     return result
 
 
+# (per-head route, nkv, tp): the TTS codec (16 KV heads) at TP8/TP4, reduced
+# Llama-3.2-1B (8 KV heads) at TP4, and the unchanged one-head-per-core TP8 row.
+_CASES = [(True, 16, 8), (True, 16, 4), (True, 8, 4), (False, 8, 8)]
+
+
 @pytest.mark.parametrize("schedule", ["kv_first", "sequential"])
-@pytest.mark.parametrize("kv_heads", [8, 16])
+@pytest.mark.parametrize("per_head, kv_heads, tp", _CASES)
 @pytest.mark.parametrize("position", [1, 7])
-@pytest.mark.parametrize("codec_mode", [False, True])
-def test_no_qknorm_key_rope_is_scoped_to_codec(schedule, kv_heads, position, codec_mode):
+def test_no_qknorm_key_rope_rotates_each_local_head(schedule, per_head, kv_heads, tp, position):
     # Exercise the arguments emitted by each real source branch. In particular,
     # two heads must not become one doubled-width head (including its RoPE table).
     calls = re.findall(r'emit_qk_rope\("k", "k",\s*([^,]+),\s*([^,]+), seq_len,', SOURCE)
     assert len(calls) == 2
     head_expr, width_expr = calls[0 if schedule == "kv_first" else 1]
     batch = 1 if schedule == "kv_first" else 2
-    env = dict(nkv=kv_heads, tp=8, hd=64, bs=batch,
-               local_kv_dim=kv_heads * 64 // 8)
+    env = dict(nkv=kv_heads, tp=tp, hd=64, bs=batch,
+               local_kv_dim=kv_heads * 64 // tp)
     def evaluate(expression):
         if "?" in expression:
             condition, branches = expression.split("?")
-            assert condition.strip() == "tts_codec_mode_"
-            expression = branches.split(":")[0 if codec_mode else 1]
+            assert condition.strip() == "per_head_key_rope()"
+            expression = branches.split(":")[0 if per_head else 1]
         return int(eval(expression, {"__builtins__": {}}, env))
 
     heads, width = evaluate(head_expr), evaluate(width_expr)
-    per_core_heads = batch * kv_heads // 8
+    per_core_heads = batch * kv_heads // tp
     values = [math.sin(index * 0.37) for index in range(per_core_heads * 64)]
     actual = _rope(values, heads, width, position)
-    expected = (_rope(values, per_core_heads, 64, position) if codec_mode else
-                _rope(values, batch, kv_heads * 64 // 8, position))
-    if codec_mode:
-        assert width // 2 == 32  # The codec checkpoint table has 32 columns.
+    expected = _rope(values, per_core_heads, 64, position)  # every D64 head
+    assert width == 64 and width // 2 == 32  # the checkpoint table has 32 columns
     assert actual == pytest.approx(expected, abs=1e-12)
+
+
+def test_doubled_width_key_rope_would_be_wrong_for_two_local_heads():
+    # Negative control for reduced Llama TP4: one 128-wide row is not two heads.
+    values = [math.sin(index * 0.37) for index in range(2 * 64)]
+    assert _rope(values, 1, 128, 7) != pytest.approx(_rope(values, 2, 64, 7), abs=1e-6)
+
+
+def test_per_head_key_rope_is_bound_to_codec_or_reduced_llama_only():
+    accessor = SOURCE.split("bool per_head_key_rope() const {", 1)[1].split("}", 1)[0]
+    assert accessor.strip() == "return tts_codec_mode_ || reduced_llama_profile_;"
+    assert "bool reduced_llama_profile_ = false;" in SOURCE
+    assert "reduced_llama_profile_ = llama_text_profile;" in SOURCE
+    profile = SOURCE.split("const bool llama_text_profile =", 1)[1].split(";", 1)[0]
+    for clause in ("num_cores() != 8", "configured_vocab_size_ == 128256",
+                   "!qk_norm_present", "!has_scale", "llama_fp16_profile_num_layers("):
+        assert clause in profile
 
 
 def test_codec_mode_is_explicit_and_default_off():

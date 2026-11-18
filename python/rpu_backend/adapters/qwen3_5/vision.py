@@ -41,6 +41,21 @@ from numbers import Integral
 from types import MappingProxyType
 from typing import Any
 
+def qwen35_vision_requested(execution_config) -> bool:
+    """Whether this cold Qwen3.5 owner runs Vision on RPU.
+
+    A cold ``rpu_execution`` that declares a ``vision`` stage requests Vision
+    (every public image template does; text templates never do), so it also
+    selects the Vision-aware cold lifecycle. Text-only owners keep their
+    lifecycle. The legacy QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED=1 still requests
+    Vision for callers without an execution config. Bound and normalized
+    configs are read-only Mappings, not dicts.
+    """
+    if isinstance(execution_config, Mapping) and execution_config.get("vision") is not None:
+        return True
+    return os.environ.get("QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED") == "1"
+
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -54,6 +69,7 @@ from rpu_backend.runtime.weights import (
     tp_row_swizzle_mc_weight,
 )
 from rpu_backend.api.cache import RPUCache
+from rpu_backend.runtime.vision_position import canonical_vision_type, interpolate_vision_positions
 
 
 QWEN3_5_VISION_ARCH = "qwen3_5_vision"
@@ -403,7 +419,7 @@ def _validate_qwen3_5_moe_35b_vision_profile(
         and num_cores == expected_cores
         and geometry == expected
         and len(getattr(vision_model, "blocks", ())) == 27
-        and getattr(config, "model_type", None) == "qwen3_5_moe"
+        and canonical_vision_type(config, "qwen3_5_moe") == "qwen3_5_moe"
         and getattr(config, "hidden_act", None) == "gelu_pytorch_tanh"
         and not getattr(config, "deepstack_visual_indexes", ())
         and not any(
@@ -1634,7 +1650,7 @@ def install_qwen3_5_vision_for_rpu(
         )
         prepared_profile = _text_bridge.prepared_profile
     elif moe_35b_geometry or (
-        getattr(config, "model_type", None) == "qwen3_5_moe"
+        canonical_vision_type(config, "qwen3_5_moe") == "qwen3_5_moe"
         and not _allow_certified_g05_k1
     ):
         raise ValueError(
@@ -1726,6 +1742,8 @@ def install_qwen3_5_vision_for_rpu(
         execution_config, certified_g05=_allow_certified_g05_k1,
         prepared_profile=prepared_profile,
         g05_acc16_experiment=_g05_acc16_experiment, g05_w8a16=_g05_w8a16)
+    # HIGH binds its own ERF/TANH GELU payloads; native refuses it with ULTRA ERF.
+    requested_ultra = requested_ultra and math_precision != "high"
     if num_cores != 8:
         for name in ("qwen3_5_vision_set_execution_cores", "qwen3_5_vision_get_execution_topology"):
             if not hasattr(torch.ops.rpu, name):
@@ -1956,16 +1974,13 @@ def _install_qwen3_5_vision_for_rpu_impl(
     if (
         not _allow_certified_g05_k1
         and not _cold_numeric_opt_in
-        and os.environ.get("QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED") != "1"
+        and not qwen35_vision_requested(execution_config)
     ):
         raise NotImplementedError(
-            "Qwen3.5 Vision is experimental/numeric-blocked: profile-local "
-            "official real-image correctness gates are incomplete or fail, "
-            "and no production-safe "
-            "input envelope is certified. Image inference is disabled by "
-            "default; Qwen3.5 text remains supported. For controlled "
-            "evaluation only, set QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED=1 "
-            "before the first image forward."
+            "Qwen3.5 Vision was not requested for this owner: declare an "
+            "rpu_execution.vision stage before to_rpu (legacy callers without "
+            "an execution config may set QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED=1). "
+            "Text-only owners keep their text lifecycle."
         )
     set_cap = getattr(
         torch.ops.rpu, "qwen3_5_vision_set_chunk_size_cap", None
@@ -1984,6 +1999,7 @@ def _install_qwen3_5_vision_for_rpu_impl(
         execution_config, certified_g05=_allow_certified_g05_k1,
         prepared_profile=_prepared_profile,
         g05_acc16_experiment=_g05_acc16_experiment, g05_w8a16=_g05_w8a16)
+    ultra_erf = ultra_erf and _g05_math_precision != "high"
     if _g05_w8a16 and ((not linear_acc32 and not _g05_acc16_experiment) or ultra_erf or
             not hasattr(torch.ops.rpu, "qwen3_5_vision_set_weight_scales")):
         raise RuntimeError("G05 W8 Vision requires its cold accumulation policy and native scale installation")
@@ -2506,8 +2522,8 @@ def _rpu_vision_forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tenso
         embed_cpu = torch.nn.functional.linear(hidden_states_cpu, pe_w, pe_b)  # CPU fp16 [N_total, hidden]
         embed_packed = embed_cpu.to(device="rpu", dtype=torch.float16, non_blocking=False).contiguous()
 
-        # ----- fast_pos_embed_interpolate (CPU fp16 → device + add) (F32) --------
-        pos_embeds_cpu = type(self).fast_pos_embed_interpolate(self, grid_thw_cpu)  # [N_total, hidden] CPU fp16
+        # ----- fast_pos_embed_interpolate (CPU fp16 → RPU + add) (F32) --------
+        pos_embeds_cpu = interpolate_vision_positions(self, grid_thw_cpu)  # [N_total, hidden] CPU fp16
         pos_embeds = pos_embeds_cpu.to(device=embed_packed.device, dtype=embed_packed.dtype).contiguous()
         embed_packed = embed_packed + pos_embeds  # rpu_add
 
@@ -2550,7 +2566,7 @@ def _rpu_vision_forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tenso
             or cached_camera_batch != camera_batch_count
             or not torch.equal(cached_grid, grid_thw_cpu)
         ):
-            pos_cpu = type(self).fast_pos_embed_interpolate(self, grid_thw_cpu)
+            pos_cpu = interpolate_vision_positions(self, grid_thw_cpu)
             if temporal_num_frames > 1:
                 packed = []
                 pos_offset = 0
@@ -2768,8 +2784,9 @@ def _lazy_vision_graph_options(text_state, *, prepared_profile=None):
                 "before to_rpu; reload the model"
             )
         raise RuntimeError(
-            "Qwen3.5 large dense VL requires QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED=1 "
-            "before to_rpu; reload the model to prepare its cold graph arenas")
+            "Qwen3.5 large dense VL Vision must be requested (declare "
+            "rpu_execution.vision) before to_rpu; reload the model to prepare "
+            "its cold graph arenas")
     if prepared_profile is None:
         graph_cache = getattr(text_state, "graph_cache", None)
         policy = getattr(graph_cache, "runtime_policy", None)
@@ -2823,6 +2840,8 @@ def _lazy_vision_graph_options(text_state, *, prepared_profile=None):
 def _install_lazy_qwen3_5_vision(model, text_state, *, prepared_profile=None,
                                _text_bridge=None):
     """Reuse the transactional install and immutable cold controls."""
+    # Arena owners get their cold graph policy here; the install itself admits
+    # a config that declares rpu_execution.vision.
     handle = install_qwen3_5_vision_for_rpu(
         model,
         execution_config=getattr(model, "_rpu_execution", None),

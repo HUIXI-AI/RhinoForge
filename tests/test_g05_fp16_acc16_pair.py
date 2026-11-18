@@ -60,17 +60,17 @@ template<class F>void reject(F f){auto&g=RpuKernelGraph::active();auto before=g.
 int main(){
  auto&g=RpuKernelGraph::active();const uint32_t base=allocator.addr(0,0);
  for(uint32_t pass=0;pass<2;++pass){const uint32_t in=base+0x20000+pass*0x200000,gate=in+INPUT_BYTES,up=gate+OUTPUT_BYTES;at::Tensor gw{0x1234567800ULL+pass*0x400000},uw{0x2345678900ULL+pass*0x800000};launch(in,gw,uw,gate,up);const auto&s=g.submissions.back();
-  assert(pair(s,0)==in&&pair(s,4)==gate&&pair(s,26)==up);assert(pair(s,2)==gw.address>>8&&pair(s,24)==uw.address>>8);
-  assert(pair(s,6)==0&&s.regs.at(8)==M&&pair(s,10)==N&&s.regs.at(12)==K&&s.regs.at(13)==K/16&&s.regs.at(14)==0&&s.regs.at(15)==8);
-  assert(pair(s,16)==K*2&&pair(s,18)==N*2&&pair(s,20)==0&&s.regs.at(22)==1&&s.regs.at(23)==2);
+  assert(pair(s,0)==in&&pair(s,4)==gate&&pair(s,36)==up);assert(pair(s,2)==gw.address>>8&&pair(s,32)==uw.address>>8);
+  assert(pair(s,6)==0&&s.regs.at(8)==1&&s.regs.at(9)==M&&pair(s,10)==N&&s.regs.at(12)==K&&s.regs.at(13)==K/16&&s.regs.at(14)==0&&s.regs.at(15)==8);
+  assert(pair(s,16)==K*2&&pair(s,18)==N*2&&pair(s,20)==0&&pair(s,22)==0&&pair(s,24)==0&&s.regs.at(26)==2&&s.regs.at(27)==2&&s.regs.at(28)==0&&s.regs.at(29)==0);
   assert(s.operands.size()==2&&s.operands[0].owner.address==gw.address&&s.operands[1].owner.address==uw.address);
-  for(int i=0;i<2;++i){auto&abi=s.operands[i].abi;assert(abi.role==GraphDdrRegisterRole::ModelWeight&&abi.access==GraphDdrRegisterAccess::Read&&abi.encoding==GraphDdrRegisterEncoding::DevAddrShift8LoHi&&abi.lo==(i?24:2)&&abi.hi==(i?25:3));}
+  for(int i=0;i<2;++i){auto&abi=s.operands[i].abi;assert(abi.role==GraphDdrRegisterRole::ModelWeight&&abi.access==GraphDdrRegisterAccess::Read&&abi.encoding==GraphDdrRegisterEncoding::DevAddrShift8LoHi&&abi.lo==(i?32:2)&&abi.hi==(i?33:3));}
   assert(flushed[pass*2]==gw.address&&flushed[pass*2+1]==uw.address);
  }
  const at::Tensor gw{0x1234567800ULL},uw{0x2345678900ULL};const uint32_t in=base+0x20000,gate=in+INPUT_BYTES,up=gate+OUTPUT_BYTES;
  launch(base,gw,uw,base+INPUT_BYTES,base+INPUT_BYTES+OUTPUT_BYTES);
  const uint32_t end=base+SpmAllocator::SPM_USABLE;launch(end-INPUT_BYTES-2*OUTPUT_BYTES,gw,uw,end-2*OUTPUT_BYTES,end-OUTPUT_BYTES);
- assert(pair(g.submissions.back(),26)==end-OUTPUT_BYTES);
+ assert(pair(g.submissions.back(),36)==end-OUTPUT_BYTES);
  // Exact final encodable DDR byte is legal for either weight.
  for(int which:{0,1}){auto first=gw,second=uw;auto&w=which?second:first;w.address=(UINT64_C(1)<<40)-w.nbytes();launch(in,first,second,gate,up);}
  for(auto regions:{std::array<uint32_t,3>{in,in,up},{in,gate,gate},{in,gate,in+256},{in,gate-256,up},{in,gate,up-256},{in+1,gate,up},{in,gate+1,up},{in,gate,up+1},{base-256,gate,up},{in,gate,end-OUTPUT_BYTES+256},{end-INPUT_BYTES+256,gate,up}})reject([&]{launch(regions[0],gw,uw,regions[1],regions[2]);});
@@ -92,7 +92,7 @@ int main(){
 }
 '''
     values = {"M": 256 if text else 32, "N": 768 if text else 512,
-              "K": 2048 if text else 1024, "GRID": 20 if text else 14,
+              "K": 2048 if text else 1024, "GRID": 20 if text else 12,
               "ID": "G05_TEXT_GATE_UP_FP16_ACC16_M256N768K2048" if text
               else "G05_GATE_UP_FP16_ACC16_M32N512K1024",
               "BODY": _body(source, "void " + symbol + "(")}

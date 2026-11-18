@@ -45,7 +45,7 @@ def test_wall_base_default_keeps_legacy_profiles_separate(example_catalog):
     catalog = checker.catalog()
     legacy = catalog['vla']['wall-oss-0.5.fp16.vla']
     assert {row[1] for row in legacy} == {checker.CONFIGS / 'wall_oss/legacy/fp16.toml'}
-    assert legacy[0][3]['support']['status'] == 'SUPPORTED_LIMITED'
+    assert legacy[0][3]['support']['status'] == 'SUPPORTED'
 
 def test_g05_custom_default_keeps_registered_legacy_profile_separate(example_catalog):
     checker = example_catalog
@@ -57,7 +57,7 @@ def test_g05_custom_default_keeps_registered_legacy_profile_separate(example_cat
     assert {row[1] for row in rows} == {checker.CONFIGS / 'g05/legacy/fp16.toml'}
     legacy = rows[0][2]
     assert legacy['example']['profile_id'] == 'g05-base.fp16.k1-rtc-fm'
-    assert rows[0][3]['support']['status'] == 'CONTROLLED_EVALUATION'
+    assert rows[0][3]['support']['status'] == 'SUPPORTED'
 
 def test_integration_configs_remain_runnable_without_public_documentation(example_catalog):
     checker = example_catalog
@@ -86,7 +86,7 @@ def test_hyvla_optimized_default_keeps_registered_fixture_separate(example_catal
     assert checker.COMMON.example_metadata(checker.COMMON.load_config(default)) is None
     rows = checker.catalog()['vla']['hy-embodied-0.5-vla-umi.fp16.vla']
     assert {row[1] for row in rows} == {checker.CONFIGS / 'hy_embodied/umi/fp16.toml'}
-    assert rows[0][3]['support']['status'] == 'SUPPORTED_LIMITED'
+    assert rows[0][3]['support']['status'] == 'SUPPORTED'
 
 @pytest.mark.parametrize('setting', ['[env]\nRPU_OTHER_SWITCH = "1"', '[env]\nRPU_RHINOVLA_HIGH_PRECISION = true', '[rpu_execution.action]\nunknown_switch = true'])
 def test_rhinovla_runtime_fragments_validate_syntax_without_profile_inheritance(tmp_path, setting):
@@ -98,9 +98,10 @@ def test_rhinovla_runtime_fragments_validate_syntax_without_profile_inheritance(
     with pytest.raises(common.ConfigError):
         common.load_config(path)
 
-def test_rhinovla_v3_fragment_requires_its_own_runtime_entry(monkeypatch, capsys):
+def test_rhinovla_v3_fragment_requires_its_own_runtime_entry(tmp_path, monkeypatch, capsys):
     common = _load_common()
-    path = EXAMPLES / 'configs/rhinovla/v3/controlled/fp16.toml'
+    path = tmp_path / 'fragment.toml'
+    path.write_text('[env]\nRPU_RHINOVLA_HIGH_PRECISION = "1"\n[rpu_execution.action]\nfast_replay = true\n')
     assert common.example_metadata(common.load_config(path)) is None
     monkeypatch.setattr(sys, 'argv', ['run.py', '--config', str(path)])
     with pytest.raises(SystemExit) as caught:
@@ -224,7 +225,7 @@ def released_model_examples(tmp_path):
     assert not (bundle / 'python').exists() and (not (bundle / 'src').exists())
     return (bundle, installed, env)
 
-@pytest.mark.parametrize('relative', ('lingbot/v2/3cam_t160/w8a16.toml', 'pi05/2cam/w8a16.toml', 'wall_oss/base/2cam/256/w8a16.toml'))
+@pytest.mark.parametrize('relative', ('lingbot/v2/3cam/w8a16.toml', 'pi05/2cam/h50/w8a16.toml', 'wall_oss/base/2cam/256/w8a16.toml'))
 def test_release_model_check_config_without_backend_sources(released_model_examples, relative):
     (bundle, _, env) = released_model_examples
     path = bundle / 'examples/configs' / relative
@@ -364,48 +365,104 @@ def test_profile_metadata_is_the_matrix_support_authority(tmp_path, monkeypatch,
     ineligible.write_text(source.replace('profile_id = "qwen3-0.6b.fp16.text"', 'profile_id = "synthetic.asset-only"'))
     with pytest.raises(common.ConfigError, match='is not example.eligible=true'):
         common.load_config(ineligible)
-    ineligible.write_text(source.replace('target = "qwen3"', 'target = "pi05"'))
-    with pytest.raises(common.ConfigError, match='Pi0.5 uses \\[pi05\\]'):
+    ineligible.write_text('[example]\nprofile_id = "qwen3-0.6b.fp16.text"\nregistry_alias = "qwen3-0.6b"\ntarget = "pi05"\ndtype = "fp16"\n[input]\nprompt = "hi"\n[run]\nwarmup = 1\nruns = 1\nseed = 0\n')
+    with pytest.raises(common.ConfigError, match='Pi0.5 is a dedicated entry'):
         common.load_config(ineligible)
 
 def test_qwen3vl_32b_controlled_api_example_keeps_exact_admission(tmp_path):
+    # This API-admitted profile was absent from the registry: architecture-only
+    # coverage could pass while omitting the entire controlled model.
     common = _load_common()
-    path = EXAMPLES / 'configs/qwen3_vl/vl/32b/w8a16_text.toml'
+    path = EXAMPLES / "configs/qwen3_vl/vl/32b/w8a16_text.toml"
     config = common.load_config(path)
-    profile = common.planner_profiles()[config['example']['profile_id']]
-    assert profile['id'] == 'qwen3-vl-32b.w8a16.multimodal-controlled'
-    assert profile['support']['status'] == 'CONTROLLED_EVALUATION'
-    assert profile['hw_status'] == 'IMPLEMENTED_UNVERIFIED_HW'
-    assert config['example']['registry_alias'] == 'qwen3-vl-32b-w8a16'
-    assert config['example']['opt_in'] == {'QWEN3_VL_32B_ALLOW_GRAPH_BLOCKED': '1'}
+    profile = common.planner_profiles()[config["example"]["profile_id"]]
+    assert profile["id"] == "qwen3-vl-32b.w8a16.multimodal-controlled"
+    assert profile["support"]["status"] == "SUPPORTED"
+    assert profile["hw_status"] == "IMPLEMENTED_UNVERIFIED_HW"
+    assert config["example"]["registry_alias"] == "qwen3-vl-32b-w8a16"
+    assert not config["example"].get("opt_in")
     source = path.read_text()
-    for (old, new, reason) in (('QWEN3_VL_32B_ALLOW_GRAPH_BLOCKED = "1"', '', 'exact opt_in'), ('[example]', '[example]\nevaluation_only = false', 'unsupported keys'), ('[example]', '[example]\nevaluation_only = true', 'unsupported keys'), ('registry_alias = "qwen3-vl-32b-w8a16"', 'registry_alias = "qwen3-vl-8b"', 'does not match profile')):
-        bad = tmp_path / 'invalid.toml'
+    for old, new, reason in (
+        ('[model.opt_in]\n', '[model.opt_in]\nQWEN3_VL_32B_ALLOW_GRAPH_BLOCKED = "1"\n', 'exact opt_in'),
+        ('[model]', '[model]\nevaluation_only = false', 'unsupported keys'),
+        ('[model]', '[model]\nevaluation_only = true', 'unsupported keys'),
+        ('registry_alias = "qwen3-vl-32b-w8a16"',
+         'registry_alias = "qwen3-vl-8b"', 'does not match profile'),
+    ):
+        bad = tmp_path / "invalid.toml"
         bad.write_text(source.replace(old, new))
         with pytest.raises(common.ConfigError, match=reason):
             common.load_config(bad)
 
-@pytest.mark.parametrize('cores', [4, 6, 8])
-@pytest.mark.parametrize('file', ['qwen3/text/0_6b/fp16.toml', 'qwen3/text/1_7b/fp16.toml', 'qwen3/text/4b/fp16.toml', 'qwen3/text/8b/fp16.toml', 'qwen3_vl/vl/2b/fp16.toml', 'qwen3_vl/vl/4b/fp16.toml', 'qwen3_vl/vl/8b/fp16.toml', 'qwen3_5/vl/2b/fp16.toml', 'qwen3_5/vl/4b/fp16.toml', 'qwen3_5/vl/9b/fp16.toml', 'qwen3_5/text/2b/fp16.toml', 'qwen3_5/text/4b/fp16.toml', 'qwen3_5/text/9b/fp16.toml', 'qwen3_5/text/0_8b/fp16.toml', 'qwen3_5/vl/0_8b/fp16.toml'])
+
+def _with_model_settings(source, settings):
+    section = f"[rpu_execution.model]\n{settings}\n"
+    if "[rpu_execution.model]" in source:
+        return re.sub(r"\[rpu_execution\.model\]\n[^\[]*", section + "\n", source, count=1)
+    return source + "\n" + section
+
+
+@pytest.mark.parametrize("cores", [4, 6, 8])
+@pytest.mark.parametrize("file", [
+    "qwen3/text/0_6b/fp16.toml", "qwen3/text/1_7b/fp16.toml", "qwen3/text/4b/fp16.toml", "qwen3/text/8b/fp16.toml",
+    "qwen3_vl/vl/2b/fp16.toml", "qwen3_vl/vl/4b/fp16.toml", "qwen3_vl/vl/8b/fp16.toml",
+    "qwen3_5/vl/2b/fp16.toml", "qwen3_5/vl/4b/fp16.toml", "qwen3_5/vl/9b/fp16.toml",
+    "qwen3_5/text/2b/fp16.toml", "qwen3_5/text/4b/fp16.toml", "qwen3_5/text/9b/fp16.toml",
+    "qwen3_5/text/0_8b/fp16.toml", "qwen3_5/vl/0_8b/fp16.toml",
+    "qwen3/text/0_6b/w8a16_text_head.toml", "qwen3_5/text/0_8b/w8a16_text.toml",
+])
 def test_qwen3_example_accepts_public_core_budget_without_importing_backend(tmp_path, cores, file):
     common = _load_common()
-    path = tmp_path / 'cores.toml'
-    path.write_text((EXAMPLES / 'configs' / file).read_text() + f'\n[rpu_execution.model]\nnum_cores = {cores}\n')
+    path = tmp_path / "cores.toml"
+    path.write_text(_with_model_settings((EXAMPLES / "configs" / file).read_text(),
+                                        f"num_cores = {cores}"))
     config = common.load_config(path)
-    assert config['rpu_execution']['model'] == {'num_cores': cores}
+    assert config["rpu_execution"]["model"] == {"num_cores": cores}
 
-@pytest.mark.parametrize('file', ['qwen3_vl/text/2b/fp16.toml', 'qwen3_vl/vision/2b/fp16.toml', 'qwen3_vl/text/4b/fp16.toml', 'qwen3_vl/vision/4b/fp16.toml', 'qwen3_vl/text/8b/fp16.toml', 'qwen3_vl/vision/8b/fp16.toml', 'qwen3_vl/vl/32b/w8a16_text.toml'])
-def test_qwen3vl_component_and_controlled_examples_accept_explicit_default_core_budget(tmp_path, file):
+
+@pytest.mark.parametrize("cores", [4, 6])
+@pytest.mark.parametrize("profile_id, change, reason", [
+    ("qwen3_5-0.8b.fp16.vision-controlled", "unknown_fp16_alias", "admitted dense FP16"),
+    ("qwen3_5-0.8b.w8a16.text-controlled", "missing_quant_core_admission", "explicit admission"),
+])
+def test_qwen35_reduced_core_budget_rejects_unadmitted_profile(cores, profile_id, change, reason):
     common = _load_common()
-    path = tmp_path / 'default-cores.toml'
-    path.write_text((EXAMPLES / 'configs' / file).read_text() + '\n[rpu_execution.model]\nnum_cores = 8\n')
-    config = common.load_config(path)
-    assert config['rpu_execution']['model'] == {'num_cores': 8}
+    profile = json.loads(json.dumps(common.planner_profiles()[profile_id]))
+    if change == "unknown_fp16_alias":
+        profile["asset_alias"] = "qwen3_5-unknown"
+    else:
+        profile["input_envelope"]["limits"].pop("allowed_num_cores")
+    with pytest.raises(common.ConfigError, match=reason):
+        common._validate_execution({"model": {"num_cores": cores}}, profile=profile)
 
-@pytest.mark.parametrize('file, setting', [('qwen3/text/0_6b/fp16.toml', 'num_cores = 5'), ('qwen3/text/0_6b/fp16.toml', 'attn_tp = 4'), ('qwen3/text/1_7b/fp16.toml', 'num_cores = true'), ('qwen3/text/0_6b/w8a16_text_head.toml', 'num_cores = 4'), ('llama/3_2_1b/fp16.toml', 'num_cores = 8'), ('qwen3_5/text/0_8b/w8a16_text.toml', 'num_cores = 6')] + [(file, f'num_cores = {cores}') for file in ('qwen3_vl/text/2b/fp16.toml', 'qwen3_vl/vision/2b/fp16.toml', 'qwen3_vl/text/4b/fp16.toml', 'qwen3_vl/vision/4b/fp16.toml', 'qwen3_vl/text/8b/fp16.toml', 'qwen3_vl/vision/8b/fp16.toml', 'qwen3_vl/vl/32b/w8a16_text.toml') for cores in (4, 6)])
+
+@pytest.mark.parametrize("cores", [4, 6, 8])
+@pytest.mark.parametrize("file", [
+    "qwen3_vl/text/2b/fp16.toml", "qwen3_vl/vision/2b/fp16.toml",
+    "qwen3_vl/text/4b/fp16.toml", "qwen3_vl/vision/4b/fp16.toml",
+    "qwen3_vl/text/8b/fp16.toml", "qwen3_vl/vision/8b/fp16.toml",
+    "qwen3_vl/vl/32b/w8a16_text.toml",
+])
+def test_qwen3vl_component_and_controlled_examples_accept_explicit_default_core_budget(tmp_path, file, cores):
+    # All three VL component modes construct the same root conditional model.
+    common = _load_common()
+    path = tmp_path / "default-cores.toml"
+    path.write_text(_with_model_settings((EXAMPLES / "configs" / file).read_text(),
+                                        f"num_cores = {cores}"))
+    config = common.load_config(path)
+    assert config["rpu_execution"]["model"] == {"num_cores": cores}
+
+
+@pytest.mark.parametrize("file, setting", [
+    ("qwen3/text/0_6b/fp16.toml", "num_cores = 5"), ("qwen3/text/0_6b/fp16.toml", "attn_tp = 4"),
+    ("qwen3/text/1_7b/fp16.toml", "num_cores = true"),
+    # Llama-3.2-1B FP16 accepts 4/6/8 (tests/test_example_cores.py); other
+    # values and per-role knobs remain refused.
+    ("llama/3_2_1b/fp16.toml", "num_cores = 5"), ("llama/3_2_1b/fp16.toml", "attn_tp = 4"),
+])
 def test_example_core_budget_rejects_unsupported_profile_or_role_knob(tmp_path, file, setting):
     common = _load_common()
-    path = tmp_path / 'bad-cores.toml'
-    path.write_text((EXAMPLES / 'configs' / file).read_text() + f'\n[rpu_execution.model]\n{setting}\n')
-    with pytest.raises(common.ConfigError, match='num_cores|unknown field|unknown stage'):
+    path = tmp_path / "bad-cores.toml"
+    path.write_text(_with_model_settings((EXAMPLES / "configs" / file).read_text(), setting))
+    with pytest.raises(common.ConfigError, match="num_cores|unknown field|unknown stage"):
         common.load_config(path)

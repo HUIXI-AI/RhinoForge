@@ -53,6 +53,7 @@ from rpu_backend.adapters.wall_oss.checkpoint_validation import (
 from rpu_backend.quant.int4_pgrp_pack import (
     swizzle_int4_pgrp_scale,
     swizzle_pack_int4_pgrp,
+    w4_storage_shape,
 )
 from rpu_backend.quant.nvfp4_pack import (
     quantize_nvfp4, swizzle_pack_nvfp4, swizzle_nvfp4_scales,
@@ -377,14 +378,14 @@ def _to_rpu_int8(t: torch.Tensor) -> torch.Tensor:
 def _pack_int4_rpu(
     w_int4: torch.Tensor, partition: int, num_cores: int
 ) -> torch.Tensor:
-    # int4 values [N,K] (int8 container) -> packed uint8 [N, K/2] on device. The packer
-    # returns a flat [N*K/2] buffer; the fused set_weights + wINT4 kernel both require
-    # the 2D [N, K/2] shape (mirrors adapters/pi05/w4pack.py). All W4 weights use
-    # the pgrp swizzle consumed by the generated auto-tile family.
+    # Pack logical int4 [N,K] into the generated family's N32K32 storage.
+    # w4_storage_shape supplies the 2D physical [padded global N, global K/2]
+    # view after TP-aware per-shard N padding; the descriptor retains logical N.
+    # The fused setter and launcher consume this same pgrp physical layout.
     N, K = w_int4.shape
     packed = swizzle_pack_int4_pgrp(
         w_int4, partition, num_cores
-    ).reshape(N, K // 2)
+    ).reshape(w4_storage_shape(N, K, partition, num_cores))
     return packed.to(dtype=torch.uint8, device="rpu").contiguous()
 
 
@@ -1013,7 +1014,7 @@ def build_wall_oss_llm(
             when RTC prefill mixed precision and W8A16/W4A16 are enabled.
         w8_down_ckpt_dir: W8A16 source for expert-0 ``down_proj`` only. Valid
             exclusively with ``expert=0, nvfp4a16=True`` so NVFP4 covers the
-            same projection set as the retained WINT4A16 pgrp composition.
+            same projection set as the retained W4A16 pgrp composition.
     """
     if graph_runtime_policy is not None:
         from rpu_backend.graph import GraphRuntimePolicy
@@ -1072,17 +1073,17 @@ def build_wall_oss_llm(
     NKV = cfg["num_key_value_heads"]
     HD = cfg.get("head_dim") or (H // NQ)
     INTER = cfg["intermediate_size"]
-    # W4A16 int4 down_proj: down is row-partition (K=INTER), and int4 row swizzle needs
-    # K % (64*cores)==512==0. expert-1 INTER=2048 is aligned; expert-0 INTER=11008 is not
-    # (11008%512=256) -> pad INTER to 11264 (+256 zero channels) so the int4 swizzle is
-    # legal. Pad is bit-exact (gate/up pad rows -> silu(0)*0=0, down pad cols=0) and the
-    # fused decoder sizes the MLP SPM + down K from this padded INTER (rpu_qwen3_model.h:826).
-    # RPU_WALL_OSS_EXPERT0_DOWN_INT4=0 keeps expert-0 down in the int8 container (no pad)
-    # for the weight-DMA A/B (_expert0_down_int4; numerics identical).
+    # The signed-W4 Down scale is per-channel and is repeated into G32 by
+    # _scale_to_rpu. N32K32 row packing therefore needs K % (32*MLP cores)==0;
+    # expert-0 INTER=11008 already meets TP8 alignment. NVFP4 retains K64.
+    # The installed width owns Gate/Up/Down, their SPM layout and Graph recipe.
+    # Changing the width changes TP reduction partitions; do not assume bit equality.
     down_int4 = w4a16 and (expert != 0 or _expert0_down_int4())
     nvfp4_down_w8 = nvfp4a16 and w8_down_ckpt_dir is not None
     down_4bit = down_int4 or (nvfp4a16 and not nvfp4_down_w8)
-    INTER_PAD = (((INTER + 511) // 512) * 512) if down_4bit else INTER
+    down_alignment = (32 if down_int4 else 64) * _MLP_CORES
+    INTER_PAD = (((INTER + down_alignment - 1) // down_alignment)
+                 * down_alignment) if down_4bit else INTER
     EPS = cfg["rms_norm_eps"]
     THETA = cfg["rope_theta"]
     MROPE = list(cfg["rope_scaling"]["mrope_section"])  # [16, 24, 24]
@@ -1298,9 +1299,9 @@ def build_wall_oss_llm(
         elif w4a16:
             # gate/up always int4 (col). down int4 (default, INTER-pad above) OR int8
             # container (RPU_WALL_OSS_EXPERT0_DOWN_INT4=0; full DMA, same int4 numerics).
-            # When down_int4: pad gate/up output + down input to INTER_PAD with zero channels
-            # (bit-exact: silu(0)*0=0, down pad cols=0; col(gate/up)+row(down) pad both land
-            # on core 7's tail -> aligned). gate/up scale per-INTER-channel (padded, 1D);
+            # When needed, pad gate/up output + down input with zero channels.
+            # This preserves the logical quantized MLP, but different TP partitions
+            # can change floating-point reduction order. gate/up scale per-INTER-channel (padded, 1D);
             # down scale per-H-channel (unaffected by INTER pad).
             npad = INTER_PAD - INTER
             if down_int4 and npad:

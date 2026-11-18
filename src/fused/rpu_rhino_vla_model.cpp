@@ -79,7 +79,6 @@
 using namespace at;
 using namespace ::rhino_lkn;
 
-#define NUM_CORES 8
 #define DWIDTH 2
 
 namespace v3 {
@@ -143,6 +142,10 @@ constexpr int64_t RHINO_FULL_W8A16_SITE = 7661653982490056347LL;
 constexpr int64_t RHINO_HIGH_PRECISION_SITE = 1749523321564235290LL;
 constexpr int64_t RHINO_RTC_SCHEDULE_SITE = 3199266949682321047LL;
 constexpr int64_t RHINO_RTC_PREFIX_DMA_SITE = 3482081395520638223LL;
+constexpr int64_t RHINO_CORE_PROFILE_SITE = 212628249812231867LL;
+// Packed QKV, resident tables, aligned KV and live condition GEMV keep their
+// eight-core layout; cold admission refuses them on a reduced owner.
+constexpr int RHINO_TP8 = 8;
 
 void check_rhino_full_w8_projection(const at::Tensor& weight,
                                    const at::Tensor& scale,
@@ -171,7 +174,8 @@ enum class RhinoMaskSpmSchedule : int64_t {
 
 constexpr uint32_t RHINO_KV_CAPABILITIES =
     KV_INSERT_CAP_V2 | KV_INSERT_CAP_V16 |
-    KV_INSERT_CAP_HYBRID2 | KV_INSERT_CAP_HYBRID3;
+    KV_INSERT_CAP_HYBRID2 | KV_INSERT_CAP_HYBRID3 |
+    KV_INSERT_CAP_NON8_TP_V16;
 constexpr int64_t RHINO_KV_REASON_PREFIX_HISTORY_DDR_REQUIRED = 1;
 
 enum class RhinoRopeRoute : int64_t {
@@ -258,7 +262,7 @@ void rpu_launch_rhino_packed_qkv_split_spm_kernel(
     kernel->set_regs(66, static_cast<uint16_t>(1));
 
     constexpr uint32_t S = 4096;
-    for (int core = 0; core < NUM_CORES; ++core) {
+    for (int core = 0; core < RHINO_TP8; ++core) {
         rpu_set_legacy_scm_u16_checked(
             kernel, S + core, static_cast<uint16_t>(chunk_bytes & 0xFFFF), caller);
         rpu_set_legacy_scm_u16_checked(
@@ -288,10 +292,10 @@ void rpu_launch_rhino_packed_qkv_split_spm_kernel(
             static_cast<uint16_t>(destination >> 16), caller);
     }
 
-    auto* queue = GET_QUEUE(NUM_CORES);
+    auto* queue = GET_QUEUE(RHINO_TP8);
     queue->set_broadcast_mode(true);
     std::vector<uint8_t> cores;
-    for (int core = 0; core < NUM_CORES; ++core) {
+    for (int core = 0; core < RHINO_TP8; ++core) {
         cores.push_back(static_cast<uint8_t>(core));
     }
     queue->enqueu_kernel(
@@ -349,6 +353,32 @@ public:
 
     RhinoVLAModel() = default;
 
+    // A reduced owner runs attention on four lanes and the MLP on the whole
+    // budget. Physical KV striping stays eight lanes (see execution_topology.h).
+    void set_execution_cores(int64_t cores) {
+        TORCH_CHECK(cores == 4 || cores == 6 || cores == 8,
+                    "RhinoVLA execution cores must be 4, 6 or 8");
+        TORCH_CHECK(!cold_config_bound_ && layer_weights_.empty(),
+                    "RhinoVLA execution cores must precede runtime config and weights");
+        set_execution_core_count(static_cast<int>(cores));
+    }
+
+    std::vector<int64_t> execution_topology() const {
+        TORCH_CHECK(num_layers() > 0 && !layer_weights_.empty(),
+                    "RhinoVLA topology requires installed expert weights");
+        return {num_cores(), attn_tp(), mlp_tp(), DecoderExecutionTopology::physical_kv_cores};
+    }
+
+    DecoderExecutionTopology resolve_model_execution_topology(
+            int64_t nq, int64_t nkv, int64_t hd, int64_t h, int64_t intermediate) const override {
+        if (num_cores() == 8) {
+            return FusedModelBase::resolve_model_execution_topology(nq, nkv, hd, h, intermediate);
+        }
+        TORCH_CHECK(nq == 16 && nkv == 8 && hd == 128 && h == 1024 && intermediate == 3072,
+                    "RhinoVLA reduced cores require exact v3 Q16/KV8/D128/H1024/I3072");
+        return {num_cores(), 4, num_cores()};
+    }
+
     void set_runtime_config(
         bool denoise_static_context_cache,
         bool fused_adarms,
@@ -372,6 +402,10 @@ public:
                     "RhinoVLA expert transfer requires precomputed AdaRMS tables");
         TORCH_CHECK(!expert_fusions || gated_no_sub,
                     "RhinoVLA expert fusions require gated_no_sub");
+        TORCH_CHECK(num_cores() == 8 || !packed_qkv,
+                    "RhinoVLA packed QKV keeps its eight-core profile");
+        TORCH_CHECK(num_cores() == 8 || (precompute_adarms && !skip_adarms_gemv),
+                    "RhinoVLA reduced cores require precomputed AdaRMS tables without skip");
         // Bind payload availability while installing the cold owner. The dry
         // planner runs under a reconfiguration guard and must not GET_KERNEL.
         TORCH_CHECK(!expert_fusions ||
@@ -415,7 +449,7 @@ public:
                          !cold_config_.packed_qkv && num_layers() == 18 &&
                          hidden_size() == 1024 && intermediate_size() == 3072 &&
                          num_q_heads() == 16 && num_kv_heads() == 8 &&
-                         head_dim() == 128 && attn_tp() == 8),
+                         head_dim() == 128 && attn_tp() == (num_cores() == 8 ? 8 : 4)),
                     "RhinoVLA high precision requires exact full W8 v3 with precomputed AdaRMS");
         // Payload admission is cold and precedes every owner mutation. The
         // planner and replay never query the kernel cache or process env.
@@ -448,10 +482,12 @@ public:
                         get_last_resolved_chunk_size() == 0 && !denoise_loop_weights_ready_ &&
                         !denoise_adarms_tables_ready_,
                     "RhinoVLA vector K norm requires a cold HIGH owner before loop IO/tables and dispatch");
-        TORCH_CHECK(!enabled || cold_config_.aligned_kv,
-                    "RhinoVLA vector K norm requires aligned KV storage");
-        // HIGH admission already resolved the Newton V32 payload. No extra
-        // storage: K has 32 rows and input_norm has 31*1024 FP16 elements.
+        TORCH_CHECK(!enabled || cold_config_.aligned_kv || num_cores() != 8,
+                    "RhinoVLA eight-core vector K norm requires aligned KV storage");
+        // HIGH admission already resolved the Newton V32 payload. Eight cores
+        // reuse the aligned KV pad row: K has 32 rows and input_norm has
+        // 31*1024 FP16 elements. Four attention lanes own the same pad row in
+        // the K buffer itself (64 head rows) and still insert 31 logical rows.
         vector_k_norm_ = enabled;
         vector_k_norm_bound_ = true;
         invalidate_model_state();
@@ -577,6 +613,10 @@ public:
                         (direct_action_input && action_dim == 96 && state_dim == 96 &&
                          action_horizon == 30 && suffix_len == 31),
                     "RhinoVLA W8A16 requires the ordinary v3 96D/H30/M31 action loop");
+        TORCH_CHECK(num_cores() == 8 ||
+                        (direct_action_input && action_dim == 96 && state_dim == 96 &&
+                         action_horizon == 30 && suffix_len == 31),
+                    "RhinoVLA reduced cores require the ordinary v3 96D/H30/M31 action loop");
         const bool next_io_w8a16 = !io_scales.empty();
         TORCH_CHECK(!next_io_w8a16 || (expert_cond_w8a16_ && io_scales.size() == 6),
                     "RhinoVLA W8 IO requires exactly six scales on a W8 condition owner");
@@ -783,11 +823,15 @@ public:
                     "RhinoVLA AdaRMS cold W8 owner count does not match expert/IO precision");
         TORCH_CHECK(!gates_tanh_precomputed ||
                         (full_action_w8a16_ && cold_config_.precompute_adarms &&
-                         cold_config_.adarms_resident && !cold_config_.skip_adarms_gemv &&
+                         // 4/6 cores read the same tanh'd slices per layer
+                         // from the DDR table; only eight cores keep it resident.
+                         (cold_config_.adarms_resident || num_cores() != 8) &&
+                         !cold_config_.skip_adarms_gemv &&
                          denoise_loop_weights_ready_ && loop_mode_ && direct_action_input_ &&
                          num_layers() == 18 && hidden_size() == 1024 &&
                          intermediate_size() == 3072 && num_q_heads() == 16 &&
-                         num_kv_heads() == 8 && head_dim() == 128 && attn_tp() == 8 &&
+                         num_kv_heads() == 8 && head_dim() == 128 &&
+                         attn_tp() == (num_cores() == 8 ? 8 : 4) &&
                          num_steps_ == 10 && action_dim_ == 96 && state_dim_ == 96 &&
                          action_horizon_ == 30 && suffix_len_ == 31),
                     "RhinoVLA gate TANH precompute requires cold full W8 resident AdaRMS exact v3 loop");
@@ -1048,9 +1092,9 @@ public:
             }
         }
 
-        // Transfer opt-ins and W8A16 are scoped to the exact v3 expert. Validate
-        // all projections before committing any cold installation.
-        if (cold_config_.packed_qkv || cold_config_.aligned_kv || w8a16) {
+        // Transfer opt-ins, W8A16 and reduced cores are scoped to the exact v3
+        // expert. Validate all projections before committing any cold installation.
+        if (cold_config_.packed_qkv || cold_config_.aligned_kv || w8a16 || num_cores() != 8) {
             TORCH_CHECK(!RpuKernelGraph::has_active(),
                         "RhinoVLA QKV/KV optimization requires cold installation");
             TORCH_CHECK(N == 18 && hidden_size == 1024 && intermediate_size == 3072 &&
@@ -1223,6 +1267,9 @@ public:
         TORCH_CHECK(!loop_mode_,
                     "RhinoVLAModel::forward cannot replace an installed "
                     "denoise loop with step execution; rebuild the owner");
+        TORCH_CHECK(num_cores() == 8,
+                    "RhinoVLA step execution keeps its eight-core condition GEMV; "
+                    "reduced cores require the denoise loop");
         TORCH_CHECK(hidden_states.device().type() == at::kPrivateUse1,
                     "RhinoVLAModel::forward: hidden_states must be on device");
         TORCH_CHECK(hidden_states.is_contiguous(),
@@ -1679,6 +1726,10 @@ protected:
             append(FmbRouteFamily::GRAPH_SCHEDULE, RHINO_HIGH_PRECISION_SITE,
                    1, high_precision_route_flags(), high_precision_route_arguments());
         }
+        if (num_cores() != 8) {
+            append(FmbRouteFamily::GRAPH_SCHEDULE, RHINO_CORE_PROFILE_SITE,
+                   1, 0, execution_topology());
+        }
         if (cold_config_.adarms_resident) {
             const int64_t groups = rtc_mode_ ? 3 : 1;
             const int64_t resident_steps = rtc_mode_ ? 1 : num_steps_;
@@ -1712,7 +1763,7 @@ protected:
                        ? RhinoMaskSpmSchedule::FIRST_BODY_FIRST_LAYER
                        : RhinoMaskSpmSchedule::EVERY_LAYER), 0,
                    {physical_len, Align(position + physical_len, int64_t{16}),
-                    attn_tp(), NUM_CORES, loop_mode_ ? num_steps_ : 1, num_layers(),
+                    attn_tp(), num_cores(), loop_mode_ ? num_steps_ : 1, num_layers(),
                     mask_plan.original_peak_bytes, mask_plan.retained_peak_bytes,
                     position + physical_len});
         }
@@ -1750,7 +1801,7 @@ protected:
         if (cold_config_.packed_qkv) {
             append(FmbRouteFamily::LINEAR, RHINO_PACKED_QKV_LINEAR_SITE,
                    static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
-                   0, {chunk.len, 4096, 1024, 1, NUM_CORES});
+                   0, {chunk.len, 4096, 1024, 1, RHINO_TP8});
         } else {
             append_expert_linear(RHINO_Q_LINEAR_SITE, num_q_heads() * head_dim(), hidden_size(), 1);
             append_expert_linear(RHINO_K_LINEAR_SITE, num_kv_heads() * head_dim(), hidden_size(), 1);
@@ -1785,7 +1836,7 @@ protected:
         append_expert_linear(RHINO_O_LINEAR_SITE, hidden_size(), num_q_heads() * head_dim(), 0);
         append(FmbRouteFamily::ALL_REDUCE,
                RHINO_ATTN_ALL_REDUCE_SITE,
-               fmb_ring_all_reduce_route_selector(chunk.len, hidden_size()));
+               fmb_ring_all_reduce_route_selector(chunk.len, hidden_size(), num_cores()));
         append(FmbRouteFamily::GRAPH_SCHEDULE,
                RHINO_GATED_RESIDUAL_SCHEDULE_SITE,
                rhino_gated_residual_selector(gated_no_sub),
@@ -1800,7 +1851,7 @@ protected:
             append(FmbRouteFamily::ALL_REDUCE,
                    RHINO_MLP_ALL_REDUCE_SITE,
                    fmb_ring_all_reduce_route_selector(
-                       chunk.len, hidden_size()));
+                       chunk.len, hidden_size(), num_cores()));
         }
         if (loop_mode_) {
             append(FmbRouteFamily::GRAPH_SCHEDULE,
@@ -1862,7 +1913,7 @@ protected:
                 FMB_SHARED_MLP_AUTO_TILE | FMB_SHARED_MLP_RING_REDUCE;
         }
         append_fmb_shared_runtime_routes(
-            manifest, plan, hidden_size(), shared_routes);
+            manifest, plan, hidden_size(), shared_routes, 1, num_cores(), mlp_tp());
         std::sort(
             manifest.routes.begin(), manifest.routes.end(),
             [](const FmbRouteManifestEntry& lhs,
@@ -1922,11 +1973,14 @@ protected:
         const int64_t logical_q_bytes = A(cs * local_q * hd * DWIDTH);
         const int64_t q_rows = vector_q_norm_ ? Align(cs * local_q, int64_t{32}) : cs * local_q;
         int64_t q     = A(q_rows * hd * DWIDTH);
-        const int64_t kv_rows = cold_config_.aligned_kv ? Align(cs, int64_t{16}) : cs;
+        // Vector K norm at four attention lanes pads K to the aligned row grid
+        // without the aligned KV insert; eight cores require aligned KV for it.
+        const int64_t kv_rows = cold_config_.aligned_kv || vector_k_norm_
+            ? Align(cs, int64_t{16}) : cs;
         int64_t kv    = A(kv_rows * local_kv * DWIDTH);
         int64_t out   = q;
         int64_t oproj = A(cs * h * DWIDTH);
-        int64_t mlp   = A(cs * (is_ / NUM_CORES) * DWIDTH);
+        int64_t mlp   = A(cs * (is_ / mlp_tp()) * DWIDTH);
 
         // SDPA tmp and mask sizing
         SdpaConfig sdpa_cfg = make_sdpa_config(ctx.use_attn_mask ? 4 : 1);
@@ -1977,8 +2031,8 @@ protected:
             zr.storage = StorageClass::Persistent;
             zr.scope   = ALL;
             zr.preload_callback =
-                [res](FusedModelBase&, int, uint32_t core0_addr) {
-                    rpu_launch_memset_spm_multicore(core0_addr, res / DWIDTH);
+                [this, res](FusedModelBase&, int, uint32_t core0_addr) {
+                    rpu_launch_memset_spm_multicore(core0_addr, res / DWIDTH, num_cores());
                 };
             decls.push_back(zr);
         }
@@ -2097,7 +2151,7 @@ protected:
                 [this](FusedModelBase&, int L, uint32_t core0_addr) {
                     rpu_launch_ddr_broadcast_spm_dma(
                         layer_weights_[L].q_norm_w.data_ptr<c10::Half>(),
-                        head_dim(), core0_addr);
+                        head_dim(), core0_addr, num_cores());
                 };
             decls.push_back(q_norm);
         }
@@ -2112,7 +2166,7 @@ protected:
                 [this](FusedModelBase&, int L, uint32_t core0_addr) {
                     rpu_launch_ddr_broadcast_spm_dma(
                         layer_weights_[L].k_norm_w.data_ptr<c10::Half>(),
-                        head_dim(), core0_addr);
+                        head_dim(), core0_addr, num_cores());
                 };
             decls.push_back(k_norm);
         }
@@ -2152,6 +2206,11 @@ protected:
             h = detail::layout_mix(h, partial_rope_);
         }
         if (cold_config_.adarms_resident) h = detail::layout_mix(h, num_steps_);
+        if (num_cores() != 8) {
+            h = detail::layout_mix(h, num_cores());
+            h = detail::layout_mix(h, attn_tp());
+            h = detail::layout_mix(h, mlp_tp());
+        }
         return h;
     }
 
@@ -2193,7 +2252,7 @@ protected:
                                  const at::Tensor& down_ws) {
         const int64_t h   = hidden_size();
         const int64_t is_ = intermediate_size();
-        const int64_t elems = seq_len * (is_ / NUM_CORES);
+        const int64_t elems = seq_len * (is_ / mlp_tp());
 
         ctx().consume_physical_route(
             FmbRouteFamily::LINEAR, RHINO_MLP_GATE_LINEAR_SITE,
@@ -2202,7 +2261,7 @@ protected:
             expert_projection_route_arguments(seq_len, is_, h, 1));
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "residual1"), gate_w, addr(0, "gate"),
-            seq_len, is_, h, /*partition=*/1, NUM_CORES, /*bias=*/0, gate_ws);
+            seq_len, is_, h, /*partition=*/1, mlp_tp(), /*bias=*/0, gate_ws);
 
         if (fuse_silu_mul) {
             // up first, then fused silu(gate)*up -> gate
@@ -2214,15 +2273,15 @@ protected:
                 expert_projection_route_arguments(seq_len, is_, h, 1));
             rpu_launch_linear_spm_to_spm_acc16_kernel(
                 addr(0, "residual1"), up_w, addr(0, "up"),
-                seq_len, is_, h, /*partition=*/1, NUM_CORES, /*bias=*/0, up_ws);
+                seq_len, is_, h, /*partition=*/1, mlp_tp(), /*bias=*/0, up_ws);
             rpu_launch_silu_mul_spm_kernel(
                 addr(0, "gate"), addr(0, "up"), addr(0, "gate"),
-                elems, NUM_CORES);
+                elems, mlp_tp());
         } else {
             if (!high_precision_fusions_) {
                 rpu_launch_eltwise_unary_spm_kernel(
                     addr(0, "gate"), addr(0, "gate"), elems, ValuOpType::SILU,
-                    GeluMode::NONE, NUM_CORES, unary_precision());
+                    GeluMode::NONE, mlp_tp(), unary_precision());
             }
             ctx().consume_physical_route(
                 FmbRouteFamily::LINEAR,
@@ -2232,14 +2291,14 @@ protected:
                 expert_projection_route_arguments(seq_len, is_, h, 1));
             rpu_launch_linear_spm_to_spm_acc16_kernel(
                 addr(0, "residual1"), up_w, addr(0, "up"),
-                seq_len, is_, h, /*partition=*/1, NUM_CORES, /*bias=*/0, up_ws);
+                seq_len, is_, h, /*partition=*/1, mlp_tp(), /*bias=*/0, up_ws);
             if (high_precision_fusions_) {
                 rpu_launch_rhinovla_silu_high_mul_spm_kernel(
-                    addr(0, "gate"), addr(0, "up"), addr(0, "gate"), elems, NUM_CORES);
+                    addr(0, "gate"), addr(0, "up"), addr(0, "gate"), elems, mlp_tp());
             } else {
                 rpu_launch_eltwise_binary_spm_kernel(
                     addr(0, "gate"), addr(0, "up"), addr(0, "gate"),
-                    elems, ValuOpType::MUL, c10::Half(1.0));
+                    elems, ValuOpType::MUL, c10::Half(1.0), mlp_tp());
             }
         }
 
@@ -2250,17 +2309,17 @@ protected:
             expert_projection_route_arguments(seq_len, h, is_, 0));
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "gate"), down_w, addr(0, "down"),
-            seq_len, h, is_, /*partition=*/0, NUM_CORES, /*bias=*/0, down_ws);
+            seq_len, h, is_, /*partition=*/0, mlp_tp(), /*bias=*/0, down_ws);
 
         ctx().consume_physical_route(
             FmbRouteFamily::ALL_REDUCE, RHINO_MLP_ALL_REDUCE_SITE,
-            fmb_ring_all_reduce_route_selector(seq_len, h),
+            fmb_ring_all_reduce_route_selector(seq_len, h, num_cores()),
             /*resolved_flags=*/0);
         rpu_launch_all_reduce_sum_residual_kernel(
             addr(0, "down"),
             zero_residual ? addr(0, "zero_resid") : addr(0, "residual2"),
             addr(0, "residual1"),
-            seq_len, h);
+            seq_len, h, mlp_tp(), num_cores());
     }
 
     void build_layer_subgraph(int layer_idx, const ChunkInfo& chunk) override {
@@ -2287,6 +2346,11 @@ protected:
                 1, 0, {seq_len, h, num_layers(), num_steps_}, chunk.idx);
         }
         if (expert_w8a16_) consume_expert_w8a16_route(chunk);
+        if (num_cores() != 8) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::GRAPH_SCHEDULE, RHINO_CORE_PROFILE_SITE,
+                1, 0, execution_topology(), chunk.idx);
+        }
 
         // --------------------------------------------------------------------
         // Phase 0: cond DMA (once per forward)
@@ -2310,7 +2374,7 @@ protected:
                 static_cast<int64_t>(
                     RhinoMutableDmaRoute::DDR_SCATTER_TO_SPM),
                 /*resolved_flags=*/0, {loop_mode_ ? 1 : 0}, chunk.idx);
-            int64_t local_k           = h / NUM_CORES;
+            int64_t local_k           = h / RHINO_TP8;
             int64_t core_stride_bytes = local_k * DWIDTH;
             rpu_launch_ddr_scatter_spm_dma_mutable(
                 &cond_src_base_,
@@ -2318,7 +2382,7 @@ protected:
                 /*elements_per_core=*/local_k,
                 /*core_stride_bytes=*/core_stride_bytes,
                 addr(0, "cond"),
-                /*num_cores=*/NUM_CORES);
+                /*num_cores=*/RHINO_TP8);
             cond_loaded_this_forward_ = true;
         }
 
@@ -2351,7 +2415,7 @@ protected:
                         offset,
                         groups * 6 * h,
                         addr(0, "adarms_pair_gemv"),
-                        NUM_CORES);
+                        num_cores());
                 }
             } else if (fused_adarms) {
                 adarms_pair_gemv_to_spm(addr(0, "cond"),
@@ -2443,23 +2507,23 @@ protected:
         // DEBUG EXPORT (layer 0): Phase 3 Q/K prenorm snapshot.
         if (layer_idx == 0 && chunk.idx == 0 && get_debug_export()) {
             debug_dump_spm_per_core("rhino_vla_cond_L0",
-                addr(0, "cond"), h, NUM_CORES,
+                addr(0, "cond"), h, num_cores(),
                 addr_offset("cond").value);
             debug_dump_spm_per_core("rhino_vla_qnormw_L0",
-                layer_addr(layer_idx, 0, "q_norm_w"), hd, NUM_CORES,
+                layer_addr(layer_idx, 0, "q_norm_w"), hd, num_cores(),
                 layer_addr_offset(layer_idx, "q_norm_w").value);
             debug_dump_spm_per_core("rhino_vla_residual1_L0",
-                addr(0, "residual1"), seq_len * h, NUM_CORES,
+                addr(0, "residual1"), seq_len * h, num_cores(),
                 addr_offset("residual1").value);
             debug_dump_spm_per_core("rhino_vla_input_norm_L0",
-                addr(0, "input_norm"), seq_len * h, NUM_CORES,
+                addr(0, "input_norm"), seq_len * h, num_cores(),
                 addr_offset("input_norm").value);
 
             // In-graph copy: dbg_q_prenorm <- q
             int64_t q_elems_per_core = seq_len * local_q_heads_ * hd;
             rpu_launch_eltwise_binary_scalar_spm_kernel(
                 addr(0, "q"), c10::Half(0.0), addr(0, "dbg_q_prenorm"),
-                q_elems_per_core, ValuOpType::ADD);
+                q_elems_per_core, ValuOpType::ADD, num_cores());
             debug_dump_spm_per_core("rhino_vla_q_prenorm_L0",
                 addr(0, "dbg_q_prenorm"),
                 q_elems_per_core, tp,
@@ -2470,7 +2534,7 @@ protected:
             // In-graph copy: dbg_k_prenorm <- k
             rpu_launch_eltwise_binary_scalar_spm_kernel(
                 addr(0, "k"), c10::Half(0.0), addr(0, "dbg_k_prenorm"),
-                k_elems_per_core, ValuOpType::ADD);
+                k_elems_per_core, ValuOpType::ADD, num_cores());
             debug_dump_spm_per_core("rhino_vla_k_prenorm_L0",
                 addr(0, "dbg_k_prenorm"),
                 k_elems_per_core, tp,
@@ -2497,7 +2561,7 @@ protected:
             int64_t q_elems_per_core = seq_len * local_q_heads_ * hd;
             rpu_launch_eltwise_binary_scalar_spm_kernel(
                 addr(0, "output"), c10::Half(0.0), addr(0, "dbg_q_norm"),
-                q_elems_per_core, ValuOpType::ADD);
+                q_elems_per_core, ValuOpType::ADD, num_cores());
             debug_dump_spm_per_core("rhino_vla_q_norm_L0",
                 addr(0, "dbg_q_norm"),
                 q_elems_per_core, tp,
@@ -2506,7 +2570,7 @@ protected:
             int64_t k_elems_per_core = seq_len * local_kv_heads * hd;
             rpu_launch_eltwise_binary_scalar_spm_kernel(
                 addr(0, "input_norm"), c10::Half(0.0), addr(0, "dbg_k_norm"),
-                k_elems_per_core, ValuOpType::ADD);
+                k_elems_per_core, ValuOpType::ADD, num_cores());
             debug_dump_spm_per_core("rhino_vla_k_norm_L0",
                 addr(0, "dbg_k_norm"),
                 k_elems_per_core, tp,
@@ -2523,14 +2587,14 @@ protected:
             /*resolved_flags=*/0, {cos_sin_start}, chunk.idx);
         rpu_launch_rhinovla_rope_spm_kernel(
             addr(0, "output"), addr(0, "q"), cos_ref_, sin_ref_,
-            seq_len, local_q_heads_, hd, cos_sin_start, partial_rope_, NUM_CORES);
+            seq_len, local_q_heads_, hd, cos_sin_start, partial_rope_, tp);
         ctx().consume_physical_route(
             FmbRouteFamily::ROPE, RHINO_K_ROPE_SITE,
             rope_route_selector(),
             /*resolved_flags=*/0, {cos_sin_start}, chunk.idx);
         rpu_launch_rhinovla_rope_spm_kernel(
             addr(0, "input_norm"), addr(0, "k"), cos_ref_, sin_ref_,
-            seq_len, local_kv_heads, hd, cos_sin_start, partial_rope_, NUM_CORES);
+            seq_len, local_kv_heads, hd, cos_sin_start, partial_rope_, tp);
 
         // DEBUG EXPORT (layer 0, chunk 0 only): dump Q/K after RoPE
         if (layer_idx == 0 && chunk.idx == 0 && get_debug_export()) {
@@ -2605,14 +2669,14 @@ protected:
             addr_offset("sdpa_tmp").value,
             addr_offset("sdpa_mask").value,
             seq_len, nq, nkv, hd,
-            sdpa_kv_seq_len, tp, NUM_CORES);
+            sdpa_kv_seq_len, tp, DecoderExecutionTopology::physical_kv_cores);
 
         // DEBUG EXPORT: snapshot SDPA output before O_proj consumes it
         if (layer_idx == 0 && chunk.idx == 0 && get_debug_export()) {
             int64_t q_elems_per_core = seq_len * local_q_heads_ * hd;
             rpu_launch_eltwise_binary_scalar_spm_kernel(
                 addr(0, "output"), c10::Half(0.0), addr(0, "dbg_sdpa_out"),
-                q_elems_per_core, ValuOpType::ADD);
+                q_elems_per_core, ValuOpType::ADD, num_cores());
             debug_dump_spm_per_core("rhino_vla_sdpa_out_L0",
                 addr(0, "dbg_sdpa_out"),
                 q_elems_per_core, tp,
@@ -2628,7 +2692,7 @@ protected:
             static_cast<int64_t>(RhinoAllReduceRoute::PREPARE_RING_INPUT),
             /*resolved_flags=*/0, {}, chunk.idx);
         rpu_prepare_ring_all_reduce_input(
-            addr(0, "oproj"), seq_len, h, tp);
+            addr(0, "oproj"), seq_len, h, tp, num_cores());
         ctx().consume_physical_route(
             FmbRouteFamily::LINEAR, RHINO_O_LINEAR_SITE,
             static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
@@ -2644,10 +2708,10 @@ protected:
             int64_t oproj_elems_per_core = seq_len * h;
             rpu_launch_eltwise_binary_scalar_spm_kernel(
                 addr(0, "oproj"), c10::Half(0.0), addr(0, "dbg_oproj_out"),
-                oproj_elems_per_core, ValuOpType::ADD);
+                oproj_elems_per_core, ValuOpType::ADD, num_cores());
             debug_dump_spm_per_core("rhino_vla_oproj_out_L0",
                 addr(0, "dbg_oproj_out"),
-                oproj_elems_per_core, NUM_CORES,
+                oproj_elems_per_core, num_cores(),
                 addr_offset("dbg_oproj_out").value);
         }
 
@@ -2667,13 +2731,13 @@ protected:
         ctx().consume_physical_route(
             FmbRouteFamily::ALL_REDUCE,
             RHINO_ATTN_ALL_REDUCE_SITE,
-            fmb_ring_all_reduce_route_selector(seq_len, h),
+            fmb_ring_all_reduce_route_selector(seq_len, h, num_cores()),
             /*resolved_flags=*/0, {}, chunk.idx);
         rpu_launch_all_reduce_sum_residual_kernel(
             addr(0, "oproj"),
             gated_no_sub ? addr(0, "zero_resid") : addr(0, "residual1"),
             addr(0, "residual2"),
-            seq_len, h, tp, NUM_CORES);
+            seq_len, h, tp, num_cores());
 
         // --------------------------------------------------------------------
         // Phase 9: Gated attn residual (SUB -> TANH -> MUL -> ADD)
@@ -2685,14 +2749,14 @@ protected:
         if (!gated_no_sub) {
             rpu_launch_eltwise_binary_spm_kernel(
                 addr(0, "residual2"), addr(0, "residual1"), addr(0, "residual2"),
-                num_elems_full, ValuOpType::SUB, c10::Half(1.0), NUM_CORES);
+                num_elems_full, ValuOpType::SUB, c10::Half(1.0), num_cores());
         }
         // TANH: attn_gate = tanh(attn_gate) in-place [1,H]
         if (!rtc_mode_ && !gates_tanh_precomputed_) {
             rpu_launch_eltwise_unary_spm_kernel(
                 attn_gate, attn_gate,
                 h, ValuOpType::TANH,
-                /*is_gelu=*/false, /*num_cores=*/NUM_CORES, unary_precision());
+                /*is_gelu=*/false, /*num_cores=*/num_cores(), unary_precision());
         }
         // MUL: residual2 = attn_gate [1,H] * residual2 [S,H]
         if (rtc_mode_) {
@@ -2700,16 +2764,16 @@ protected:
         } else if (cold_config_.expert_fusions) {
             rpu_launch_pi05_gated_residual_spm_kernel(
                 addr(0, "residual2"), addr(0, "residual1"), attn_gate,
-                addr(0, "residual2"), seq_len, NUM_CORES);
+                addr(0, "residual2"), seq_len, num_cores());
         } else {
             rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
                 attn_gate, addr(0, "residual2"), addr(0, "residual2"),
                 seq_len, h,
-                c10::Half(1.0), ValuOpType::MUL, /*is_bopa=*/false);
+                c10::Half(1.0), ValuOpType::MUL, /*is_bopa=*/false, num_cores());
             // ADD: residual2 = residual2 + residual1 (gated result in residual2)
             rpu_launch_eltwise_binary_spm_kernel(
                 addr(0, "residual2"), addr(0, "residual1"), addr(0, "residual2"),
-                num_elems_full, ValuOpType::ADD, c10::Half(1.0), NUM_CORES);
+                num_elems_full, ValuOpType::ADD, c10::Half(1.0), num_cores());
         }
 
         // --------------------------------------------------------------------
@@ -2745,14 +2809,14 @@ protected:
         if (!gated_no_sub) {
             rpu_launch_eltwise_binary_spm_kernel(
                 addr(0, "residual1"), addr(0, "residual2"), addr(0, "residual1"),
-                num_elems_full, ValuOpType::SUB, c10::Half(1.0), NUM_CORES);
+                num_elems_full, ValuOpType::SUB, c10::Half(1.0), num_cores());
         }
         // TANH: mlp_gate = tanh(mlp_gate) in-place [1,H]
         if (!rtc_mode_ && !gates_tanh_precomputed_) {
             rpu_launch_eltwise_unary_spm_kernel(
                 mlp_gate, mlp_gate,
                 h, ValuOpType::TANH,
-                /*is_gelu=*/false, /*num_cores=*/NUM_CORES, unary_precision());
+                /*is_gelu=*/false, /*num_cores=*/num_cores(), unary_precision());
         }
         // MUL: residual1 = mlp_gate [1,H] * residual1 [S,H]
         if (rtc_mode_) {
@@ -2760,26 +2824,26 @@ protected:
         } else if (cold_config_.expert_fusions) {
             rpu_launch_pi05_gated_residual_spm_kernel(
                 addr(0, "residual1"), addr(0, "residual2"), mlp_gate,
-                addr(0, "residual1"), seq_len, NUM_CORES);
+                addr(0, "residual1"), seq_len, num_cores());
         } else {
             rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
                 mlp_gate, addr(0, "residual1"), addr(0, "residual1"),
                 seq_len, h,
-                c10::Half(1.0), ValuOpType::MUL, /*is_bopa=*/false);
+                c10::Half(1.0), ValuOpType::MUL, /*is_bopa=*/false, num_cores());
             // ADD: residual1 = residual1 + residual2 (final gated MLP result)
             rpu_launch_eltwise_binary_spm_kernel(
                 addr(0, "residual1"), addr(0, "residual2"), addr(0, "residual1"),
-                num_elems_full, ValuOpType::ADD, c10::Half(1.0), NUM_CORES);
+                num_elems_full, ValuOpType::ADD, c10::Half(1.0), num_cores());
         }
 
         // DEBUG EXPORT: snapshot per-layer final output (residual1)
         if (layer_idx == 0 && chunk.idx == 0 && get_debug_export()) {
             rpu_launch_eltwise_binary_scalar_spm_kernel(
                 addr(0, "residual1"), c10::Half(0.0), addr(0, "dbg_layer_out"),
-                num_elems_full, ValuOpType::ADD);
+                num_elems_full, ValuOpType::ADD, num_cores());
             debug_dump_spm_per_core("rhino_vla_layer_out_L0",
                 addr(0, "dbg_layer_out"),
-                num_elems_full, NUM_CORES,
+                num_elems_full, num_cores(),
                 addr_offset("dbg_layer_out").value);
         }
 
@@ -2804,18 +2868,23 @@ private:
     int64_t k_norm_rows(int64_t rows, int64_t local_kv_heads, int64_t cols) const {
         if (!vector_k_norm_) return rows * local_kv_heads;
         validate_expert_transfer(rows);
-        TORCH_CHECK(high_precision_ && cold_config_.aligned_kv && rows == 31 &&
-                        local_kv_heads == 1 && cols == 128,
+        // One K head per lane at eight cores, two at four attention lanes;
+        // either way the 31 rows pad to 32 and the head rows stay V32.
+        TORCH_CHECK(high_precision_ && rows == 31 && cols == 128 &&
+                        (num_cores() == 8 ? cold_config_.aligned_kv && local_kv_heads == 1
+                                          : local_kv_heads == 2),
                     "RhinoVLA vector K norm requires exact aligned v3 K geometry");
-        return 32;
+        return 32 * local_kv_heads;
     }
 
     int64_t q_norm_rows(int64_t rows, int64_t local_q_heads, int64_t cols) const {
         if (!vector_q_norm_) return rows * local_q_heads;
         validate_expert_transfer(rows);
-        TORCH_CHECK(high_precision_ && rows == 31 && local_q_heads == 2 && cols == 128,
+        TORCH_CHECK(high_precision_ && rows == 31 && cols == 128 &&
+                        local_q_heads == (num_cores() == 8 ? 2 : 4),
                     "RhinoVLA vector Q norm requires exact v3 Q geometry");
-        return 64;
+        // Align(31 * heads, 32): 64 rows at eight cores, 128 at four lanes.
+        return 32 * local_q_heads;
     }
 
     void emit_qk_norm(int64_t seq_len, int64_t local_kv_heads, int64_t hd, int layer_idx) {
@@ -2831,17 +2900,17 @@ private:
             const int64_t logical_q_rows = seq_len * local_q_heads_;
             const uint32_t tail_offset = static_cast<uint32_t>(logical_q_rows * hd * DWIDTH);
             rpu_launch_memset_spm_multicore(addr(0, "q") + tail_offset,
-                (q_rows - logical_q_rows) * hd, NUM_CORES);
+                (q_rows - logical_q_rows) * hd, attn_tp());
         }
         // PersistentPerLayer norm weights are preloaded at BUILD.
         rpu_launch_rmsnorm_spm_kernel(
             addr(0, "q"), addr(0, "output"),
             layer_addr(layer_idx, 0, "q_norm_w"),
-            q_rows, hd, eps_, rmsnorm_route(q_rows, hd));
+            q_rows, hd, eps_, rmsnorm_route(q_rows, hd), attn_tp());
         rpu_launch_rmsnorm_spm_kernel(
             addr(0, "k"), addr(0, "input_norm"),
             layer_addr(layer_idx, 0, "k_norm_w"),
-            k_rows, hd, eps_, rmsnorm_route(k_rows, hd));
+            k_rows, hd, eps_, rmsnorm_route(k_rows, hd), attn_tp());
     }
 
     int64_t high_precision_route_flags() const {
@@ -2876,7 +2945,7 @@ private:
 
     std::vector<int64_t> full_action_w8a16_route_arguments() const {
         return {num_layers(), num_steps_, full_action_w8a16_ ? 37 : 36,
-                full_action_w8a16_ ? 5 : 0, 8, 16};
+                full_action_w8a16_ ? 5 : 0, num_cores(), 16};
     }
 
     void consume_full_action_w8a16_route() {
@@ -2889,12 +2958,14 @@ private:
     std::vector<int64_t> expert_projection_route_arguments(
         int64_t rows, int64_t n, int64_t k, int partition) const {
         if (!expert_w8a16_) return {};
-        return {rows, n, k, partition, NUM_CORES};
+        const int lanes = n == intermediate_size() || k == intermediate_size()
+            ? mlp_tp() : attn_tp();
+        return {rows, n, k, partition, lanes};
     }
 
     std::vector<int64_t> expert_w8a16_route_arguments(int64_t rows) const {
         return {rows, hidden_size(), intermediate_size(), num_layers(),
-                num_steps_, 7, 8, 16, NUM_CORES};
+                num_steps_, 7, 8, 16, num_cores()};
     }
 
     void consume_expert_w8a16_route(const ChunkInfo& chunk) {
@@ -2912,7 +2983,8 @@ private:
         TORCH_CHECK(loop_mode_ && direct_action_input_ && num_steps_ == 10 &&
                         num_layers() == 18 && hidden_size() == 1024 &&
                         intermediate_size() == 3072 && num_q_heads() == 16 &&
-                        num_kv_heads() == 8 && head_dim() == 128 && attn_tp() == 8 &&
+                        num_kv_heads() == 8 && head_dim() == 128 &&
+                        attn_tp() == (num_cores() == 8 ? 8 : 4) &&
                         action_dim_ == 96 && state_dim_ == 96 &&
                         action_horizon_ == 30 && suffix_len_ == 31 && rows == 31,
                     "RhinoVLA expert transfer requires exact v3 H1024/18L/96D/M31/10-step FP16 activation loop");
@@ -2938,10 +3010,11 @@ private:
         // The last PAD16 lane is visible to the aligned SDPA tile under its
         // finite mask bias. Explicit +0 prevents stale NaNs from leaking through
         // QK or value accumulation, and is refreshed on every layer and replay.
+        // At four attention lanes it is only the vector K norm's pad row.
         const int64_t local_kv = num_kv_heads() * head_dim() / attn_tp();
         const uint32_t tail_offset = static_cast<uint32_t>(rows * local_kv * DWIDTH);
-        rpu_launch_memset_spm_multicore(addr(0, "k") + tail_offset, local_kv, NUM_CORES);
-        rpu_launch_memset_spm_multicore(addr(0, "v") + tail_offset, local_kv, NUM_CORES);
+        rpu_launch_memset_spm_multicore(addr(0, "k") + tail_offset, local_kv, attn_tp());
+        rpu_launch_memset_spm_multicore(addr(0, "v") + tail_offset, local_kv, attn_tp());
     }
 
     void emit_packed_qkv(const LayerWeights& weights, const ChunkInfo& chunk) {
@@ -2951,10 +3024,10 @@ private:
         ctx().consume_physical_route(
             FmbRouteFamily::LINEAR, RHINO_PACKED_QKV_LINEAR_SITE,
             static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
-            0, {chunk.len, 4096, 1024, 1, NUM_CORES}, chunk.idx);
+            0, {chunk.len, 4096, 1024, 1, RHINO_TP8}, chunk.idx);
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "input_norm"), weights.packed_qkv_w, addr(0, "packed_qkv"),
-            chunk.len, 4096, 1024, /*partition=*/1, NUM_CORES);
+            chunk.len, 4096, 1024, /*partition=*/1, RHINO_TP8);
         // Each core owns two Q heads, one K head and one V head. Split the
         // packed rows into the original non-overlapping buffers before QK norm
         // and RoPE using exact per-core byte copies, without numerical conversion.
@@ -2975,16 +3048,16 @@ private:
         // uses an additive Newton payload with the same live operand slots.
         if (high_precision_fusions_) {
             rpu_launch_rhinovla_newton_norm_shift_spm_kernel(
-                input, output, scale, shift, rows, eps_, NUM_CORES);
+                input, output, scale, shift, rows, eps_, num_cores());
         } else if (cold_config_.expert_fusions && !high_precision_) {
             rpu_launch_pi05_adarms_norm_shift_spm_kernel(
-                input, output, scale, shift, rows, eps_, NUM_CORES);
+                input, output, scale, shift, rows, eps_, num_cores());
         } else {
             rpu_launch_rmsnorm_spm_kernel(input, output, scale, rows, hidden_size(), eps_,
-                                        rmsnorm_route(rows, hidden_size()));
+                                        rmsnorm_route(rows, hidden_size()), num_cores());
             rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
                 shift, output, output, rows, hidden_size(),
-                c10::Half(1.0), ValuOpType::ADD, /*is_bopa=*/false);
+                c10::Half(1.0), ValuOpType::ADD, /*is_bopa=*/false, num_cores());
         }
     }
 
@@ -3022,22 +3095,22 @@ private:
             if (!gates_tanh_precomputed_) {
                 rpu_launch_eltwise_unary_spm_kernel(
                     group_gate, group_gate, h, ValuOpType::TANH,
-                    /*is_gelu=*/false, NUM_CORES, unary_precision());
+                    /*is_gelu=*/false, num_cores(), unary_precision());
             }
             if (cold_config_.expert_fusions) {
                 rpu_launch_pi05_gated_residual_spm_kernel(
                     update + row_offset, residual + row_offset, group_gate,
-                    update + row_offset, rows, NUM_CORES);
+                    update + row_offset, rows, num_cores());
             } else {
                 rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
                     group_gate, update + row_offset, update + row_offset,
-                    rows, h, c10::Half(1.0), ValuOpType::MUL, /*is_bopa=*/false);
+                    rows, h, c10::Half(1.0), ValuOpType::MUL, /*is_bopa=*/false, num_cores());
             }
         });
         if (!cold_config_.expert_fusions) {
             rpu_launch_eltwise_binary_spm_kernel(
                 update, residual, update, suffix_len_ * h,
-                ValuOpType::ADD, c10::Half(1.0), NUM_CORES);
+                ValuOpType::ADD, c10::Half(1.0), num_cores());
         }
     }
 
@@ -3104,7 +3177,7 @@ private:
             if (ctx().body_iter == 0 && layer_idx == 0 && chunk.idx == 0) {
                 ctx().consume_physical_route(FmbRouteFamily::GRAPH_SCHEDULE,
                     RHINO_MASK_SPM_SCHEDULE_SITE, route.selector, 0,
-                    {seq_q, sdpa_kv, tp, NUM_CORES, loop_mode_ ? num_steps_ : 1,
+                    {seq_q, sdpa_kv, tp, num_cores(), loop_mode_ ? num_steps_ : 1,
                      num_layers(), route.arguments[6], route.arguments[7], physical_kv}, chunk.idx);
             }
         }
@@ -3157,7 +3230,7 @@ private:
         rpu_launch_ddr_broadcast_spm_dma(
             dense_b.data_ptr<c10::Half>(), out_features, bias_temp_spm_addr);
         // Step 2: Row-partition GEMV. partial_spm_addr holds the per-core [3H]
-        // partial along the local_k = H/NUM_CORES split.
+        // partial along the local_k = H/8 split.
         ctx().consume_physical_route(
             FmbRouteFamily::LINEAR, RHINO_ADARMS_LINEAR_SITE,
             static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
@@ -3165,7 +3238,7 @@ private:
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             cond_spm_addr, dense_w, partial_spm_addr,
             /*M=*/1, /*N=*/out_features, /*K=*/h,
-            /*partition=*/0, /*num_cores=*/NUM_CORES,
+            /*partition=*/0, /*num_cores=*/RHINO_TP8,
             /*bias_spm_addr=*/0);
         // Step 3: Fused all_reduce + bias. reduce(partial) + bias -> gemv_out
         // broadcast to all output cores. Input and output MUST be distinct
@@ -3179,7 +3252,7 @@ private:
         rpu_launch_all_reduce_sum_residual_kernel(
             partial_spm_addr, bias_temp_spm_addr, gemv_out_spm_addr,
             /*M=*/1, /*N=*/out_features,
-            /*input_num_cores=*/NUM_CORES, /*output_num_cores=*/NUM_CORES);
+            /*input_num_cores=*/RHINO_TP8, /*output_num_cores=*/RHINO_TP8);
         // Step 4: (1+scale) -- add +1.0 only to the first hidden_size elements
         rpu_launch_eltwise_binary_scalar_spm_kernel(
             gemv_out_spm_addr, c10::Half(1.0),
@@ -3205,7 +3278,7 @@ private:
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             cond_spm_addr, dense_w, partial_spm_addr,
             /*M=*/1, /*N=*/out_features, /*K=*/h,
-            /*partition=*/0, /*num_cores=*/NUM_CORES,
+            /*partition=*/0, /*num_cores=*/RHINO_TP8,
             /*bias_spm_addr=*/0);
         ctx().consume_physical_route(
             FmbRouteFamily::ALL_REDUCE,
@@ -3216,7 +3289,7 @@ private:
         rpu_launch_all_reduce_sum_residual_kernel(
             partial_spm_addr, bias_temp_spm_addr, gemv_out_spm_addr,
             /*M=*/1, /*N=*/out_features,
-            /*input_num_cores=*/NUM_CORES, /*output_num_cores=*/NUM_CORES);
+            /*input_num_cores=*/RHINO_TP8, /*output_num_cores=*/RHINO_TP8);
 
         rpu_launch_eltwise_binary_scalar_spm_kernel(
             gemv_out_spm_addr, c10::Half(1.0),
@@ -3260,14 +3333,14 @@ private:
             0, {pair_elements});
         rpu_launch_ddr_broadcast_spm_dma_mutable(
             &adarms_pair_table_src_base_, table_step * pair_elements * DWIDTH, pair_elements,
-            addr(0, "adarms_pair_resident"), NUM_CORES);
+            addr(0, "adarms_pair_resident"), num_cores());
         ctx().consume_physical_route(
             FmbRouteFamily::MUTABLE_DMA, RHINO_RESIDENT_FINAL_DMA_SITE,
             static_cast<int64_t>(RhinoMutableDmaRoute::DDR_BROADCAST_TO_SPM),
             0, {final_elements});
         rpu_launch_ddr_broadcast_spm_dma_mutable(
             &adarms_final_table_src_base_, table_step * final_elements * DWIDTH, final_elements,
-            addr(0, "adarms_final_resident"), NUM_CORES);
+            addr(0, "adarms_final_resident"), num_cores());
     }
 
     void emit_loop_pre_layers_body() {
@@ -3344,11 +3417,11 @@ private:
                 static_cast<int64_t>(
                     RhinoMutableDmaRoute::DDR_SCATTER_TO_SPM),
                 /*resolved_flags=*/0);
-            const int64_t local_k = h / NUM_CORES;
+            const int64_t local_k = h / RHINO_TP8;
             const int64_t core_stride_bytes = local_k * DWIDTH;
             rpu_launch_ddr_scatter_spm_dma_mutable(
                 &cond_all_src_base_, bit * h * DWIDTH,
-                local_k, core_stride_bytes, addr(0, "cond"), NUM_CORES);
+                local_k, core_stride_bytes, addr(0, "cond"), RHINO_TP8);
         }
 
         if (fold_action_time_in) {
@@ -3527,7 +3600,7 @@ private:
                     offset,
                     groups * 3 * h,
                     addr(0, "final_gemv"),
-                    NUM_CORES);
+                    num_cores());
             }
         } else {
             adarms_gemv_to_spm(addr(0, "cond"),
@@ -3815,6 +3888,16 @@ void rpu_rhino_vla_set_runtime_config(
             adarms_resident,
             packed_qkv,
             aligned_kv);
+}
+
+void rpu_rhino_vla_set_execution_core_count(int64_t handle, int64_t cores) {
+    RhinoVLARegistry::get(handle, "rpu_rhino_vla_set_execution_core_count")
+        ->set_execution_cores(cores);
+}
+
+std::vector<int64_t> rpu_rhino_vla_get_execution_topology(int64_t handle) {
+    return RhinoVLARegistry::get(handle, "rpu_rhino_vla_get_execution_topology")
+        ->execution_topology();
 }
 
 void rpu_rhino_vla_set_fast_replay(int64_t handle, bool enabled) {

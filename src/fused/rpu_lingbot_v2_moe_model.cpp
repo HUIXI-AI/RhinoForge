@@ -51,6 +51,8 @@
 #include "rpu_lingbot_v2_moe_model.h"
 #include "model_handle_registry.h"
 #include "rpu_kernel_decls.h"
+#include "rpu_grouped_linear_tiling.h"
+#include "ops/rpu_specialized_linear_contracts.h"
 #include "rpu_ops.h"
 #include "rpu_eltwise.h"
 #include "rpu_helpers.h"
@@ -205,6 +207,17 @@ enum class LingbotV2LinearRoute : int64_t {
     SHARED_GATE_UP_RESIDENT_SILU_FP16_ACC16 = 13,
     ROUTED_COL_ACC16 = 6,
 };
+
+std::vector<int64_t> lingbot_shared_resident_arguments(
+    int64_t rows, int64_t local_i, int64_t k, int64_t cores, bool w8) {
+    const auto id = w8 ? KernelId::LINGBOT2_SHARED_GATEUP_RESIDENT_SILU_W8_T51
+                       : KernelId::LINGBOT2_SHARED_GATEUP_RESIDENT_SILU_FP16_T51;
+    const auto c = rpu_specialized_linear::contract(id);
+    // Bind semantic operands and the launcher's generated M/N/K, K passes and
+    // full grid. Both COMPLETE production and consumption use this identity.
+    return {rows, 2 * local_i, k, 1, cores, w8 ? 1 : 2, local_i,
+            c.m, c.n, c.k, (k + c.k - 1) / c.k, c.gx, c.gy, c.gz, 0x92, 0x3e00};
+}
 
 enum class LingbotV2RopeRoute : int64_t {
     FULL_ROTARY_PARTIAL_MROPE = 2,
@@ -752,11 +765,15 @@ void LingbotV2MoeExpertModel::set_moe_weights(
     TORCH_CHECK(Align(chunk_size, (int64_t)16) <= 128,
                 "aligned chunk_size must be <= 128 for backend MoE selection");
     // Pitfall H: N is the FULL output dim and the kernel divides it by num_cores.
-    TORCH_CHECK(routed_inter % NUM_CORES == 0,
-                "routed_inter(", routed_inter, ") must be divisible by NUM_CORES=", NUM_CORES);
+    TORCH_CHECK(routed_inter % num_cores() == 0,
+                "routed_inter(", routed_inter, ") must be divisible by num_cores=", num_cores());
     // THD_VECTOR_SIZE=16 — the Nx1_NxC per-row broadcast needs c % 16 == 0.
-    TORCH_CHECK((routed_inter / NUM_CORES) % 16 == 0,
-                "routed_inter/NUM_CORES(", routed_inter / NUM_CORES, ") must be a multiple of 16");
+    TORCH_CHECK((routed_inter / num_cores()) % 16 == 0,
+                "routed_inter/num_cores(", routed_inter / num_cores(), ") must be a multiple of 16");
+    // The four-core child keeps only the sparse grouped experts; the dense
+    // packed and per-expert paths stay eight-core.
+    TORCH_CHECK(num_cores() == 8 || !grouped_experts_requested,
+                "reduced-core LingBot2 expert rejects dense grouped experts");
     TORCH_CHECK(use_silu_, "LingbotV2MoeExpertModel requires SwiGLU (use_silu=true)");
     TORCH_CHECK((int64_t)router_gate_w.size() == nl && (int64_t)router_bias.size() == nl,
                 "router_gate_w/router_bias must have size num_layers=", nl);
@@ -985,7 +1002,7 @@ void LingbotV2MoeExpertModel::set_moe_weights(
         const char* est = std::getenv("RPU_L2_STAGES");
         debug_stages_ = (est != nullptr && est[0] == '1' && est[1] == '\0');
         if (debug_stages_) {
-            int64_t gw = num_experts_ * (routed_inter_ / NUM_CORES);
+            int64_t gw = num_experts_ * (routed_inter_ / num_cores());
             scap_ = at::zeros({tp_rows_, gw}, at::TensorOptions().dtype(at::kHalf).device(at::kPrivateUse1));
             ccap_ = at::zeros({tp_rows_, gw}, at::TensorOptions().dtype(at::kHalf).device(at::kPrivateUse1));
         }
@@ -1002,7 +1019,7 @@ void LingbotV2MoeExpertModel::set_moe_weights(
         const char* eg = std::getenv("RPU_L2_CAPTURE_GATE");
         debug_capture_gate_ = (eg != nullptr && eg[0] == '1' && eg[1] == '\0');
         if (debug_capture_gate_) {
-            gcap_ = at::zeros({tp_rows_, num_experts_ * (routed_inter_ / NUM_CORES)},
+            gcap_ = at::zeros({tp_rows_, num_experts_ * (routed_inter_ / num_cores())},
                 at::TensorOptions().dtype(at::kHalf).device(at::kPrivateUse1));
             acap_ = at::zeros({tp_rows_, hidden_size()},
                 at::TensorOptions().dtype(at::kHalf).device(at::kPrivateUse1));
@@ -1078,7 +1095,7 @@ bool LingbotV2MoeExpertModel::use_qk_rope_kv_t51(int64_t rows, int64_t position)
 // Bind one optional QKV schedule from the installed attention weights, not
 // the routed-expert precision. Mixed projection formats retain ordinary Linear.
 int LingbotV2MoeExpertModel::select_qkv_multibase_mode() const {
-    if (!sparse_experts_ || NUM_CORES != 8 || attn_tp() != 8 ||
+    if (!sparse_experts_ || num_cores() != 8 || attn_tp() != 8 ||
         num_layers() == 0 || hidden_size() != 768 || num_q_heads() != 32 ||
         num_kv_heads() != 8 || head_dim() != 128 || !has_qkv_bias_ ||
         has_mrope_ || has_qk_norm_ || num_experts_ != 32 || top_k_ != 4 ||
@@ -1130,7 +1147,7 @@ bool LingbotV2MoeExpertModel::use_qkv_multibase(int64_t rows) const {
 // both measured expert precisions. Bind it cold; live chunk shape remains exact.
 bool LingbotV2MoeExpertModel::select_sdpa_tail_t51() const {
     return sparse_experts_ && (sparse_weight_mode_ == 1 || sparse_weight_mode_ == 2) &&
-        NUM_CORES == 8 && attn_tp() == 8 && num_layers() > 0 &&
+        num_cores() == 8 && attn_tp() == 8 && num_layers() > 0 &&
         hidden_size() == 768 && num_q_heads() == 32 && num_kv_heads() == 8 &&
         head_dim() == 128 && !has_mrope_ && !has_qk_norm_ &&
         num_experts_ == 32 && top_k_ == 4 && routed_inter_ == 512 &&
@@ -1150,11 +1167,14 @@ bool LingbotV2MoeExpertModel::use_router_sigmoid_pad(int64_t rows) const {
 }
 
 std::vector<int64_t> LingbotV2MoeExpertModel::router_sigmoid_pad_arguments() const {
-    return {1, 51, 64, 32, 768, 1, 272, 96, 128, 19, 0x3c00};
+    return {2, 51, 64, 32, 768, 1, 64, 32, 512, 50, 0x3c00, 48, 49, 26, 2, 27, 2};
 }
 
 void LingbotV2MoeExpertModel::configure_runtime_graph(bool fused_router, bool routed_gemm) {
     RpuExecutionCoordinator::require_graph_quiescent("LingBot2 runtime graph");
+    TORCH_CHECK(num_cores() == 8,
+                "LingBot2 runtime graph (fused router, AdaRMS ring, T51 schedules) "
+                "requires eight cores");
     TORCH_CHECK(num_layers() > 0 && get_last_resolved_chunk_size() == 0 &&
                     !exact_suffix_mask_authority_,
                 "LingBot2 runtime graph must bind after weights and before planning/forward");
@@ -1183,10 +1203,10 @@ void LingbotV2MoeExpertModel::configure_runtime_graph(bool fused_router, bool ro
     // the supported model inputs; pad rows are exactly 1.0. Uniform FP16 and
     // W8 banks both use FP16 router/activation storage; dense keeps SAFE.
     const bool select_lane2 = select_fused && sparse_experts_ &&
-        (sparse_weight_mode_ == 1 || sparse_weight_mode_ == 2) && NUM_CORES == 8 &&
+        (sparse_weight_mode_ == 1 || sparse_weight_mode_ == 2) && num_cores() == 8 &&
         KernelCache::instance().has_loaded(KernelId::LINGBOT2_TOPK_E32_K4_LANE2_SAFE);
     const bool select_direct_route = select_fused && sparse_experts_ &&
-        (sparse_weight_mode_ == 1 || sparse_weight_mode_ == 2) && NUM_CORES == 8;
+        (sparse_weight_mode_ == 1 || sparse_weight_mode_ == 2) && num_cores() == 8;
     // Same FP16 router in both expert precisions. Preserve all six existing
     // SPM buffers and the zero-filled 9472-byte inverse-route publication ABI.
     const bool select_topk_compact = select_lane2 && select_direct_route &&
@@ -1199,7 +1219,7 @@ void LingbotV2MoeExpertModel::configure_runtime_graph(bool fused_router, bool ro
     // Router bias/ranking do not affect this independent normalization kernel.
     const bool adarms_norm_shift_profile = fused_router && sparse_experts_ &&
         (sparse_weight_mode_ == 1 || sparse_weight_mode_ == 2) &&
-        NUM_CORES == 8 && attn_tp() == 8 && eps_ == 1e-6;
+        num_cores() == 8 && attn_tp() == 8 && eps_ == 1e-6;
     const bool select_adarms_diagonal = adarms_norm_shift_profile &&
         KernelCache::instance().has_loaded(KernelId::LINGBOT2_ADARMS_NORM_SHIFT_H768_DIAGONAL);
     const bool select_adarms_norm_shift = adarms_norm_shift_profile &&
@@ -1211,7 +1231,7 @@ void LingbotV2MoeExpertModel::configure_runtime_graph(bool fused_router, bool ro
     const bool select_attn_ring_adarms = select_adarms_diagonal &&
         (sparse_weight_mode_ == 1 || sparse_weight_mode_ == 2) &&
         num_layers() == 36 && hidden_size() == 768 && chunk_size_ == 51 &&
-        tp_rows_ == 64 && attn_tp() == 8 && NUM_CORES == 8 && eps_ == 1e-6 &&
+        tp_rows_ == 64 && attn_tp() == 8 && num_cores() == 8 && eps_ == 1e-6 &&
         KernelCache::instance().has_loaded(KernelId::LINGBOT2_ATTN_ALL_REDUCE_ADARMS_T51_H768);
     const int select_qkv_multibase = fused_router ? select_qkv_multibase_mode() : 0;
     const bool select_sdpa_tail = fused_router && select_sdpa_tail_t51();
@@ -1266,11 +1286,11 @@ void LingbotV2MoeExpertModel::set_sparse_expert_weights(
                 "sparse experts require strict top-k and reject dense packing/debug modes");
     TORCH_CHECK(top_k_ <= 10 && chunk_size_ * top_k_ > 10 &&
                     chunk_size_ * top_k_ <= 4096 && num_experts_ < 1024 &&
-                    hidden_size() <= 4096 && routed_inter_ / NUM_CORES <= 4096,
+                    hidden_size() <= 4096 && routed_inter_ / num_cores() <= 4096,
                 "sparse experts exceed grouped routing/gather capacities");
     const int64_t nl = num_layers(), e = num_experts_;
     const int64_t h = hidden_size(), i = routed_inter_;
-    TORCH_CHECK(i % (64 * NUM_CORES) == 0,
+    TORCH_CHECK(i % (64 * num_cores()) == 0,
                 "sparse fused Gate/Up requires per-core I divisible by 64");
     TORCH_CHECK(static_cast<int64_t>(gate_up.size()) == nl &&
                     static_cast<int64_t>(down.size()) == nl,
@@ -1286,6 +1306,8 @@ void LingbotV2MoeExpertModel::set_sparse_expert_weights(
                         int64_t n, int64_t k) {
         TORCH_CHECK(static_cast<int64_t>(scales.size()) == (quantized ? nl : 0),
                     "sparse INT8 requires all scales; FP16 rejects scales");
+        // GroupedPL advances each expert's FP16 scales in 256-byte units.
+        const int64_t scale_n = Align(n, int64_t(128));
         for (int64_t layer = 0; layer < nl; ++layer) {
             const auto& w = weights[layer];
             TORCH_CHECK(w.defined() && w.scalar_type() == dtype &&
@@ -1298,15 +1320,15 @@ void LingbotV2MoeExpertModel::set_sparse_expert_weights(
                 TORCH_CHECK(scale.defined() && scale.scalar_type() == at::kHalf &&
                                 scale.device().type() == at::kPrivateUse1 &&
                                 scale.is_contiguous() && scale.dim() == 2 &&
-                                scale.size(0) == e && scale.size(1) == n,
-                            "sparse INT8 scale must be contiguous FP16 device [E,N]");
+                                scale.size(0) == e && scale.size(1) == scale_n,
+                            "sparse INT8 scale must be contiguous FP16 RPU [E,Align(N,128)]");
             }
         }
     };
     validate(gate_up, gate_up_scales, 2 * i, h);
     validate(down, down_scales, h, i);
 
-    const bool expert_y4 = h == 768 && i == 512 && e == 32 &&
+    const bool expert_y4 = num_cores() == 8 && h == 768 && i == 512 && e == 32 &&
         top_k_ == 4 && chunk_size_ == 51 &&
         KernelCache::instance().has_loaded(quantized
             ? KernelId::LINGBOT2_GROUPED_GATEUP_W8A16_EXPERT_Y4_ACC16
@@ -1314,7 +1336,7 @@ void LingbotV2MoeExpertModel::set_sparse_expert_weights(
     // Same y4/N64/K256 retirement and packed banks, but load original token
     // rows indirectly using the already selected raw-U16 route. No gather
     // workspace is removed: SwiGLU and Down still use moe_sparse_input.
-    const bool routed_gate_up = expert_y4 && tp_rows_ == 64 && NUM_CORES == 8 &&
+    const bool routed_gate_up = expert_y4 && tp_rows_ == 64 && num_cores() == 8 &&
         KernelCache::instance().has_loaded(quantized
             ? KernelId::LINGBOT2_GROUPED_GATEUP_ROUTED_W8A16_EXPERT_Y4_ACC16
             : KernelId::LINGBOT2_GROUPED_GATEUP_ROUTED_EXPERT_Y4_ACC16);
@@ -1328,20 +1350,20 @@ void LingbotV2MoeExpertModel::set_sparse_expert_weights(
     // Same dynamic N64/K64 Down and ACC16 arithmetic, with one combined
     // scale transpose/broadcast. Admit only the hardware-tested W8 profile.
     const bool down_scale_shuffle = quantized && h == 768 && i == 512 && e == 32 &&
-        top_k_ == 4 && chunk_size_ == 51 && tp_rows_ == 64 && NUM_CORES == 8 &&
+        top_k_ == 4 && chunk_size_ == 51 && tp_rows_ == 64 && num_cores() == 8 &&
         KernelCache::instance().has_loaded(
             KernelId::LINGBOT2_GROUPED_DOWN_W8A16_ACC16_SCALE_SHUFFLE);
     // The same FP16 K/V activation writer applies to both expert precisions.
     // Cache position is a per-candidate condition, checked by the shared helper.
     const bool kv_t51 = h == 768 && i == 512 && e == 32 && top_k_ == 4 &&
-        chunk_size_ == 51 && tp_rows_ == 64 && NUM_CORES == 8 &&
+        chunk_size_ == 51 && tp_rows_ == 64 && num_cores() == 8 &&
         attn_tp() == 8 && num_kv_heads() == 8 && head_dim() == 128 &&
         KernelCache::instance().has_loaded(KernelId::LINGBOT2_INSERT_KV_T51);
     // partial_mrope_qk_fused is an existing required payload. It dispatches
     // independent Q/K blocks with the same FP16 arithmetic as the two calls.
     // Bind the exact tested local Q4/K1 geometry for either expert precision.
     const bool qk_rope_t51 = h == 768 && i == 512 && e == 32 && top_k_ == 4 &&
-        chunk_size_ == 51 && tp_rows_ == 64 && NUM_CORES == 8 &&
+        chunk_size_ == 51 && tp_rows_ == 64 && num_cores() == 8 &&
         attn_tp() == 8 && num_q_heads() == 32 && num_kv_heads() == 8 &&
         head_dim() == 128 && !has_mrope_ && !has_qk_norm_;
     const bool qk_rope_kv_t51 = qk_rope_t51 && kv_t51 &&
@@ -1354,16 +1376,16 @@ void LingbotV2MoeExpertModel::set_sparse_expert_weights(
     // complete scales. Both grouped routes retire FP16 activations/partials;
     // combine preserves the original +0/four ordered FP16 additions.
     const bool combine_scan = h == 768 && e == 32 &&
-        top_k_ == 4 && chunk_size_ == 51 && tp_rows_ == 64 && NUM_CORES == 8 &&
+        top_k_ == 4 && chunk_size_ == 51 && tp_rows_ == 64 && num_cores() == 8 &&
         KernelCache::instance().has_loaded(
             KernelId::LINGBOT2_COMBINE_T51_R204_H768_SCAN);
     const bool swiglu_route = h == 768 && i == 512 && e == 32 &&
-        top_k_ == 4 && chunk_size_ == 51 && tp_rows_ == 64 && NUM_CORES == 8 &&
+        top_k_ == 4 && chunk_size_ == 51 && tp_rows_ == 64 && num_cores() == 8 &&
         KernelCache::instance().has_loaded(KernelId::LINGBOT2_SWIGLU_ROUTE_R204_D64);
     // Producer and consumer share one cold capability and one enlarged relay.
     // Missing either payload retains the prior compactor and combine layout.
     const bool inverse_combine = h == 768 && i == 512 &&
-        route_compact && NUM_CORES == 8 &&
+        route_compact && num_cores() == 8 &&
         KernelCache::instance().has_loaded(KernelId::LINGBOT2_ROUTE_COMPACT_INVERSE_E32_T51_TP64) &&
         KernelCache::instance().has_loaded(KernelId::LINGBOT2_COMBINE_T51_R204_H768_INVERSE);
     const bool inverse_shared_combine = inverse_combine &&
@@ -1491,7 +1513,7 @@ void LingbotV2MoeExpertModel::set_shared_gate_up_weights(
                         "shared Gate/Up FP16 binding rejects legacy scales");
         }
     }
-    const bool selected = !joint_weights.empty() && sparse_experts_ && NUM_CORES == 8 &&
+    const bool selected = !joint_weights.empty() && sparse_experts_ && num_cores() == 8 &&
         h == 768 && n == 768 && routed_inter_ == 512 && num_experts_ == 32 &&
         top_k_ == 4 && chunk_size_ == 51 && tp_rows_ == 64;
     // This is an existing required payload, not an optional-REF fallback.
@@ -1531,7 +1553,7 @@ void LingbotV2MoeExpertModel::set_shared_gate_up_weights(
 // all SPM capacities, DDR addresses and graph nodes stay fixed across replay.
 void LingbotV2MoeExpertModel::emit_moe_mlp_sparse(int layer_idx, int64_t seq_len) {
     const int64_t h = hidden_size(), e = num_experts_, k = top_k_;
-    const int64_t r = seq_len * k, local_i = routed_inter_ / NUM_CORES;
+    const int64_t r = seq_len * k, local_i = routed_inter_ / num_cores();
     const int64_t shared = intermediate_size();
     const uint32_t ids_offset = Align(tp_rows_ * e * DWIDTH, int64_t(256));
     const uint32_t tokens_offset = ids_offset + Align(tp_rows_ * k * DWIDTH, int64_t(256));
@@ -1587,16 +1609,16 @@ void LingbotV2MoeExpertModel::emit_moe_mlp_sparse(int layer_idx, int64_t seq_len
     // never treated as real tasks.
     auto* stage = sparse_route_stage_.data_ptr<c10::Half>() + layer_idx * route_elements;
     rpu_launch_spm_copy_ddr_dma(route, stage, route_elements);
-    rpu_launch_ddr_broadcast_spm_dma(stage, route_elements, broadcast, NUM_CORES);
+    rpu_launch_ddr_broadcast_spm_dma(stage, route_elements, broadcast, num_cores());
     const uint32_t counts = broadcast + counts_offset;
     const uint32_t tokens = broadcast + tokens_offset;
     const uint32_t experts = broadcast + ids_offset;
     if (!sparse_gate_up_routed_) {
         rpu_launch_cast_uint16_int32_spm_kernel(
-            tokens, addr(0, "moe_topk_ids_i32"), r, NUM_CORES);
+            tokens, addr(0, "moe_topk_ids_i32"), r, num_cores());
         rpu_launch_gather_fp16_spm_kernel(
             addr(0, "residual1"), addr(0, "moe_topk_ids_i32"),
-            addr(0, "moe_sparse_input"), seq_len, h, 0, r, NUM_CORES);
+            addr(0, "moe_sparse_input"), seq_len, h, 0, r, num_cores());
     }
     auto scale = [layer_idx](const std::vector<at::Tensor>& bank) -> c10::optional<at::Tensor> {
         return bank.empty() ? c10::nullopt : c10::optional<at::Tensor>(bank[layer_idx]);
@@ -1604,7 +1626,7 @@ void LingbotV2MoeExpertModel::emit_moe_mlp_sparse(int layer_idx, int64_t seq_len
     if (sparse_gate_up_activation_) {
         ctx().consume_physical_route(FmbRouteFamily::LINEAR, L2_SPARSE_ROUTED_GATE_UP_ACTIVATION,
             static_cast<int64_t>(LingbotV2LinearRoute::GROUPED_ROUTED_SWIGLU_ROUTE_ACC16), 0,
-            {2 * local_i, h, e, 1, NUM_CORES, sparse_weight_mode_,
+            {2 * local_i, h, e, 1, num_cores(), sparse_weight_mode_,
              seq_len, r, Align(tp_rows_ * top_k_, int64_t(128)) * 2,
              local_i, tp_rows_ * e * 2, local_i * 2});
         rpu_launch_lingbot2_grouped_gateup_routed_swiglu_route_spm_kernel(
@@ -1613,21 +1635,27 @@ void LingbotV2MoeExpertModel::emit_moe_mlp_sparse(int layer_idx, int64_t seq_len
     } else if (sparse_gate_up_routed_) {
         ctx().consume_physical_route(FmbRouteFamily::LINEAR, L2_SPARSE_ROUTED_GATE_UP,
             static_cast<int64_t>(LingbotV2LinearRoute::GROUPED_ROUTED_EXPERT_Y4_ACC16), 0,
-            {2 * local_i, h, e, 1, NUM_CORES, sparse_weight_mode_,
+            {2 * local_i, h, e, 1, num_cores(), sparse_weight_mode_,
              seq_len, r, Align(tp_rows_ * top_k_, int64_t(128)) * 2});
         rpu_launch_lingbot2_grouped_gateup_routed_spm_kernel(
             addr(0, "residual1"), tokens, sparse_gate_up_[layer_idx], counts,
             scale(sparse_gate_up_s_), addr(0, "moe_sparse_gate_up"), sparse_weight_mode_);
     } else {
+        std::vector<int64_t> arguments{2 * local_i, h, e, 1, num_cores(), sparse_weight_mode_};
+        if (!sparse_gate_up_expert_y4_) {
+            const auto dispatch = rpu_grouped_tiling::dispatch_identity(
+                r, 2 * local_i, h, sparse_weight_mode_, false);
+            arguments.insert(arguments.end(), dispatch.begin(), dispatch.end());
+        }
         ctx().consume_physical_route(FmbRouteFamily::LINEAR, L2_SPARSE_GATE_UP,
             static_cast<int64_t>(sparse_gate_up_expert_y4_
                 ? LingbotV2LinearRoute::GROUPED_EXPERT_Y4_ACC16
                 : LingbotV2LinearRoute::GROUPED_DYNAMIC_ACC16), 0,
-            {2 * local_i, h, e, 1, NUM_CORES, sparse_weight_mode_});
+            arguments);
         rpu_launch_grouped_parallel_linear_spm_kernel(
             addr(0, "moe_sparse_input"), sparse_gate_up_[layer_idx], counts,
             scale(sparse_gate_up_s_), addr(0, "moe_sparse_gate_up"), 0,
-            2 * local_i, h, e, true, NUM_CORES, sparse_weight_mode_, false,
+            2 * local_i, h, e, true, num_cores(), r, sparse_weight_mode_, false,
             sparse_gate_up_expert_y4_);
     }
     // Cold packing interleaves Gate/Up within each core's output slice. The
@@ -1637,19 +1665,19 @@ void LingbotV2MoeExpertModel::emit_moe_mlp_sparse(int layer_idx, int64_t seq_len
     if (!sparse_gate_up_activation_) {
         if (sparse_swiglu_route_) {
             ctx().consume_physical_route(FmbRouteFamily::ACTIVATION, L2_SPARSE_SWIGLU_ROUTE,
-                1, 0, {seq_len, r, local_i, e, NUM_CORES});
+                1, 0, {seq_len, r, local_i, e, num_cores()});
             rpu_launch_lingbot2_swiglu_route_r204_d64_spm_kernel(
                 addr(0, "moe_sparse_gate_up"), broadcast, tokens, experts,
                 addr(0, "moe_sparse_input"));
         } else {
             rpu_launch_silu_mul_exact_strided_spm_kernel(
                 addr(0, "moe_sparse_gate_up"), addr(0, "moe_sparse_input"),
-                r, local_i, NUM_CORES);
+                r, local_i, num_cores());
             // Preserve Lingbot's FP16 rounding boundary: weight each SwiGLU row
             // before Down. D=local_i also avoids weighting the larger H-wide output.
             rpu_launch_moe_gather_mul_v2_fp16_spm_kernel(
                 addr(0, "moe_sparse_input"), broadcast, tokens, experts,
-                addr(0, "moe_sparse_input"), seq_len, e, r, local_i, NUM_CORES);
+                addr(0, "moe_sparse_input"), seq_len, e, r, local_i, num_cores());
         }
     }
     // Routed activation has completed its last read of moe_sparse_gate_up.
@@ -1658,22 +1686,20 @@ void LingbotV2MoeExpertModel::emit_moe_mlp_sparse(int layer_idx, int64_t seq_len
     auto emit_shared = [&]() {
         const auto& lw = layer_weights_[layer_idx];
         if (sparse_shared_gate_up_resident_silu_w8_) {
-            // Gate/Up FP16 K128 retirements and custom SiLU remain in VLM;
+            // Gate/Up and custom SiLU remain in VLM;
             // write compact [51,96] directly into the existing gate owner.
             ctx().consume_physical_route(FmbRouteFamily::LINEAR, L2_SPARSE_SHARED_GATE_UP_RESIDENT_SILU_W8,
                 static_cast<int64_t>(LingbotV2LinearRoute::SHARED_GATE_UP_RESIDENT_SILU_W8_ACC16), 0,
-                {seq_len, 2 * shared / NUM_CORES, h, 1, NUM_CORES, 1,
-                 shared / NUM_CORES, 32, 128, 6, 3, 0x92, 0x3e00});
+                lingbot_shared_resident_arguments(seq_len, shared / num_cores(), h, num_cores(), true));
             rpu_launch_lingbot2_shared_gateup_resident_silu_w8_spm_kernel(
                 addr(0, "residual1"), shared_gate_up_[layer_idx],
                 shared_gate_up_scales_[layer_idx], addr(0, "gate"));
         } else if (sparse_shared_gate_up_resident_silu_fp16_) {
-            // The FP16 paired Gate48/Up48 kernel preserves all six K128
-            // retirements and the existing custom SiLU before compact stores.
+            // The paired FP16 projections use the generated retirement geometry
+            // and the existing custom SiLU before compact stores.
             ctx().consume_physical_route(FmbRouteFamily::LINEAR, L2_SPARSE_SHARED_GATE_UP_RESIDENT_SILU_FP16,
                 static_cast<int64_t>(LingbotV2LinearRoute::SHARED_GATE_UP_RESIDENT_SILU_FP16_ACC16), 0,
-                {seq_len, 2 * shared / NUM_CORES, h, 1, NUM_CORES, 2,
-                 shared / NUM_CORES, 48, 128, 6, 2, 0x92, 0x3e00});
+                lingbot_shared_resident_arguments(seq_len, shared / num_cores(), h, num_cores(), false));
             rpu_launch_lingbot2_shared_gateup_resident_silu_fp16_spm_kernel(
                 addr(0, "residual1"), shared_gate_up_[layer_idx], addr(0, "gate"));
         } else if (sparse_shared_gate_up_) {
@@ -1682,49 +1708,49 @@ void LingbotV2MoeExpertModel::emit_moe_mlp_sparse(int layer_idx, int64_t seq_len
             const auto& joint = shared_gate_up_[layer_idx];
             ctx().consume_physical_route(FmbRouteFamily::LINEAR, L2_SPARSE_SHARED_GATE_UP,
                 static_cast<int64_t>(LingbotV2LinearRoute::AUTO_TILE_ACC16), 0,
-                {seq_len, 2 * shared / NUM_CORES, h, 1, NUM_CORES, joint.scalar_type() == at::kChar ? 1 : 2});
+                {seq_len, 2 * shared / num_cores(), h, 1, num_cores(), joint.scalar_type() == at::kChar ? 1 : 2});
             rpu_launch_linear_spm_to_spm_acc16_kernel(
                 addr(0, "residual1"), joint, addr(0, "moe_sparse_gate_up"),
-                seq_len, 2 * shared, h, 1, NUM_CORES, 0,
+                seq_len, 2 * shared, h, 1, num_cores(), 0,
                 shared_gate_up_scales_.empty() ? at::Tensor() : shared_gate_up_scales_[layer_idx]);
             if (sparse_shared_silu_vector_) {
                 ctx().consume_physical_route(FmbRouteFamily::ACTIVATION, L2_SPARSE_SHARED_SILU_VECTOR,
-                    1, 0, {seq_len, shared / NUM_CORES, NUM_CORES});
+                    1, 0, {seq_len, shared / num_cores(), num_cores()});
                 rpu_launch_lingbot2_shared_silu_t51_d96_vector_spm_kernel(
-                    addr(0, "moe_sparse_gate_up"), addr(0, "gate"), seq_len, NUM_CORES);
+                    addr(0, "moe_sparse_gate_up"), addr(0, "gate"), seq_len, num_cores());
             } else {
                 ctx().consume_physical_route(FmbRouteFamily::ACTIVATION, L2_SPARSE_SHARED_SILU_D96,
-                    1, 0, {seq_len, shared / NUM_CORES, NUM_CORES});
+                    1, 0, {seq_len, shared / num_cores(), num_cores()});
                 rpu_launch_lingbot2_shared_silu_d96_spm_kernel(
-                    addr(0, "moe_sparse_gate_up"), addr(0, "gate"), seq_len, NUM_CORES);
+                    addr(0, "moe_sparse_gate_up"), addr(0, "gate"), seq_len, num_cores());
             }
         } else {
         ctx().consume_physical_route(FmbRouteFamily::LINEAR, L2_SPARSE_SHARED_GATE,
             static_cast<int64_t>(LingbotV2LinearRoute::AUTO_TILE_ACC16), 0);
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "residual1"), lw.gate_w, addr(0, "gate"),
-            seq_len, shared, h, 1, NUM_CORES, 0, lw.gate_ws);
+            seq_len, shared, h, 1, num_cores(), 0, lw.gate_ws);
         ctx().consume_physical_route(FmbRouteFamily::LINEAR, L2_SPARSE_SHARED_UP,
             static_cast<int64_t>(LingbotV2LinearRoute::AUTO_TILE_ACC16), 0);
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "residual1"), lw.up_w, addr(0, "up"),
-            seq_len, shared, h, 1, NUM_CORES, 0, lw.up_ws);
+            seq_len, shared, h, 1, num_cores(), 0, lw.up_ws);
         rpu_launch_silu_mul_spm_kernel(
             addr(0, "gate"), addr(0, "up"), addr(0, "gate"),
-            seq_len * (shared / NUM_CORES), NUM_CORES);
+            seq_len * (shared / num_cores()), num_cores());
         }
         ctx().consume_physical_route(FmbRouteFamily::LINEAR, L2_SPARSE_SHARED_DOWN,
             static_cast<int64_t>(LingbotV2LinearRoute::AUTO_TILE_ACC16), 0);
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "gate"), lw.down_w, addr(0, "down"),
-            seq_len, h, shared, 0, NUM_CORES, 0, lw.down_ws);
+            seq_len, h, shared, 0, num_cores(), 0, lw.down_ws);
     };
     if (sparse_down_ordered_combine_) {
         // Consume before changing schedule. Old or mismatched descriptors may
         // not execute the shared branch early, even though its math is identical.
         ctx().consume_physical_route(FmbRouteFamily::LINEAR, L2_SPARSE_DOWN_ORDERED_COMBINE,
             static_cast<int64_t>(LingbotV2LinearRoute::GROUPED_DOWN_ORDERED_COMBINE_ACC16), 0,
-            {1, seq_len, r, h, local_i, e, k, NUM_CORES, sparse_weight_mode_,
+            {1, seq_len, r, h, local_i, e, k, num_cores(), sparse_weight_mode_,
              64, 12, 5376, 4, sparse_down_ordered_combine_ ? 1 : 0});
         emit_shared();
         rpu_launch_lingbot2_grouped_down_ordered_combine_spm_kernel(
@@ -1735,35 +1761,39 @@ void LingbotV2MoeExpertModel::emit_moe_mlp_sparse(int layer_idx, int64_t seq_len
         if (sparse_down_scale_shuffle_) {
             ctx().consume_physical_route(FmbRouteFamily::LINEAR, L2_SPARSE_DOWN_SCALE_SHUFFLE,
                 static_cast<int64_t>(LingbotV2LinearRoute::GROUPED_DOWN_W8_SCALE_SHUFFLE_ACC16), 0,
-                {h, local_i, e, 0, NUM_CORES, sparse_weight_mode_, seq_len, r});
+                {h, local_i, e, 0, num_cores(), sparse_weight_mode_, seq_len, r});
             rpu_launch_lingbot2_grouped_down_w8_scale_shuffle_spm_kernel(
                 addr(0, "moe_sparse_input"), sparse_down_[layer_idx], counts,
                 sparse_down_s_[layer_idx], addr(0, "moe_sparse_output"));
         } else {
+            std::vector<int64_t> arguments{h, local_i, e, 0, num_cores(), sparse_weight_mode_};
+            const auto dispatch = rpu_grouped_tiling::dispatch_identity(
+                r, h, local_i, sparse_weight_mode_, false);
+            arguments.insert(arguments.end(), dispatch.begin(), dispatch.end());
             ctx().consume_physical_route(FmbRouteFamily::LINEAR, L2_SPARSE_DOWN,
                 static_cast<int64_t>(LingbotV2LinearRoute::GROUPED_DYNAMIC_ACC16), 0,
-                {h, local_i, e, 0, NUM_CORES, sparse_weight_mode_});
+                arguments);
             rpu_launch_grouped_parallel_linear_spm_kernel(
                 addr(0, "moe_sparse_input"), sparse_down_[layer_idx], counts,
                 scale(sparse_down_s_), addr(0, "moe_sparse_output"), 0,
-                h, local_i, e, false, NUM_CORES, sparse_weight_mode_, false);
+                h, local_i, e, false, num_cores(), r, sparse_weight_mode_, false);
         }
         if (!sparse_inverse_shared_combine_) {
             if (sparse_combine_scan_) {
                 ctx().consume_physical_route(FmbRouteFamily::ACTIVATION, L2_SPARSE_COMBINE_SCAN,
-                    1, 0, {seq_len, r, h, NUM_CORES});
+                    1, 0, {seq_len, r, h, num_cores()});
                 rpu_launch_lingbot2_combine_t51_r204_h768_scan_spm_kernel(
                     addr(0, "moe_sparse_output"), tokens, addr(0, "moe_acc"));
             } else if (sparse_inverse_combine_) {
                 ctx().consume_physical_route(FmbRouteFamily::ACTIVATION, L2_SPARSE_COMBINE_INVERSE,
-                    1, 0, {seq_len, r, h, e, NUM_CORES});
+                    1, 0, {seq_len, r, h, e, num_cores()});
                 rpu_launch_lingbot2_combine_t51_r204_h768_inverse_spm_kernel(
                     addr(0, "moe_sparse_output"), broadcast + 5376, addr(0, "moe_acc"));
             } else {
-                rpu_launch_fill_spm_kernel(addr(0, "moe_acc"), seq_len * h, c10::Half(0.0f), NUM_CORES);
+                rpu_launch_fill_spm_kernel(addr(0, "moe_acc"), seq_len * h, c10::Half(0.0f), num_cores());
                 rpu_launch_scatternd_add_u16_fp16_spm_kernel(
                     addr(0, "moe_acc"), tokens, addr(0, "moe_sparse_output"),
-                    seq_len, r, h, NUM_CORES);
+                    seq_len, r, h, num_cores());
             }
         }
 
@@ -1773,21 +1803,21 @@ void LingbotV2MoeExpertModel::emit_moe_mlp_sparse(int layer_idx, int64_t seq_len
             // Retire +0 and four expert-ordered FP16 adds before the shared ADD;
             // delaying this combine must not make shared Down the initial seed.
             ctx().consume_physical_route(FmbRouteFamily::ACTIVATION, L2_SPARSE_COMBINE_SHARED_INVERSE,
-                1, 0, {seq_len, r, h, e, NUM_CORES});
+                1, 0, {seq_len, r, h, e, num_cores()});
             rpu_launch_lingbot2_combine_shared_t51_r204_h768_inverse_spm_kernel(
                 addr(0, "moe_sparse_output"), broadcast + 5376,
                 addr(0, "down"), addr(0, "moe_acc"));
         } else {
             rpu_launch_eltwise_binary_spm_kernel(
                 addr(0, "moe_acc"), addr(0, "down"), addr(0, "moe_acc"),
-                seq_len * h, ValuOpType::ADD, c10::Half(1.0f), NUM_CORES);
+                seq_len * h, ValuOpType::ADD, c10::Half(1.0f), num_cores());
         }
     }
     ctx().consume_physical_route(FmbRouteFamily::ALL_REDUCE, L2_SPARSE_REDUCE,
-        fmb_ring_all_reduce_route_selector(seq_len, h), 0);
+        fmb_ring_all_reduce_route_selector(seq_len, h, num_cores()), 0);
     rpu_launch_all_reduce_sum_residual_kernel(
         addr(0, "moe_acc"), addr(0, "residual2"), addr(0, "residual1"),
-        seq_len, h, NUM_CORES, NUM_CORES);
+        seq_len, h, num_cores(), num_cores());
     if (debug_capture_l0_ && layer_idx == 0)
         rpu_launch_spm_copy_ddr_dma(addr(0, "residual1"), l0_out_.data_ptr<c10::Half>(), seq_len * h);
 }
@@ -1961,11 +1991,11 @@ LingbotV2MoeExpertModel::physical_manifest_for_candidate(
     if (sparse_adarms_norm_shift_capable_ && adarms_) {
         append(FmbRouteFamily::NORMALIZATION, L2_INPUT_ADARMS_NORM_SHIFT,
                sparse_adarms_norm_shift_diagonal_ ? 2 : 1, 0,
-               {physical_len, hidden_size(), NUM_CORES});
+               {physical_len, hidden_size(), num_cores()});
         if (!sparse_attn_ring_adarms_)
             append(FmbRouteFamily::NORMALIZATION, L2_POST_ADARMS_NORM_SHIFT,
                    sparse_adarms_norm_shift_diagonal_ ? 2 : 1, 0,
-                   {physical_len, hidden_size(), NUM_CORES});
+                   {physical_len, hidden_size(), num_cores()});
     }
 
     if (denoise_tp8_encoder_) {
@@ -1992,7 +2022,7 @@ LingbotV2MoeExpertModel::physical_manifest_for_candidate(
                        static_cast<int64_t>(LingbotV2AllReduceRoute::PREPARE_RING_INPUT),
                        0, {}, body);
                 append(FmbRouteFamily::ALL_REDUCE, L2_PRE_TP8_REDUCE,
-                       fmb_ring_all_reduce_route_selector(physical_len, hidden_size()),
+                       fmb_ring_all_reduce_route_selector(physical_len, hidden_size(), num_cores()),
                        0, {}, body);
             } else {
                 acc32(L2_PRE_WC_LINEAR, body);
@@ -2044,14 +2074,14 @@ LingbotV2MoeExpertModel::physical_manifest_for_candidate(
     }
     const bool grouped = grouped_experts_ && !cold_bufonly_;
     if (sparse_experts_) {
-        const int64_t local_i = routed_inter_ / NUM_CORES;
+        const int64_t local_i = routed_inter_ / num_cores();
         for (const int64_t site : {L2_SPARSE_GATE_UP, L2_SPARSE_DOWN}) {
             const bool col = site != L2_SPARSE_DOWN;
             if (!col && sparse_down_ordered_combine_) {
                 append(FmbRouteFamily::LINEAR, L2_SPARSE_DOWN_ORDERED_COMBINE,
                        static_cast<int64_t>(LingbotV2LinearRoute::GROUPED_DOWN_ORDERED_COMBINE_ACC16), 0,
                        {1, logical_len, logical_len * top_k_, hidden_size(), local_i,
-                        num_experts_, top_k_, NUM_CORES, sparse_weight_mode_,
+                        num_experts_, top_k_, num_cores(), sparse_weight_mode_,
                         64, 12, 5376, 4, sparse_down_ordered_combine_ ? 1 : 0});
                 continue;
             }
@@ -2060,7 +2090,7 @@ LingbotV2MoeExpertModel::physical_manifest_for_candidate(
             const bool down_scale_shuffle = !col && sparse_down_scale_shuffle_;
             std::vector<int64_t> arguments{
                 col ? 2 * local_i : hidden_size(), col ? hidden_size() : local_i,
-                num_experts_, col ? 1 : 0, NUM_CORES, sparse_weight_mode_};
+                num_experts_, col ? 1 : 0, num_cores(), sparse_weight_mode_};
             if (routed)
                 arguments.insert(arguments.end(),
                     {logical_len, logical_len * top_k_, Align(tp_rows_ * top_k_, int64_t(128)) * 2});
@@ -2068,6 +2098,13 @@ LingbotV2MoeExpertModel::physical_manifest_for_candidate(
                 arguments.insert(arguments.end(), {local_i, tp_rows_ * num_experts_ * 2, local_i * 2});
             if (down_scale_shuffle)
                 arguments.insert(arguments.end(), {logical_len, logical_len * top_k_});
+            if (!routed && !fused_activation && !down_scale_shuffle &&
+                !(col && sparse_gate_up_expert_y4_)) {
+                const auto dispatch = rpu_grouped_tiling::dispatch_identity(
+                    logical_len * top_k_, col ? 2 * local_i : hidden_size(),
+                    col ? hidden_size() : local_i, sparse_weight_mode_, false);
+                arguments.insert(arguments.end(), dispatch.begin(), dispatch.end());
+            }
             append(FmbRouteFamily::LINEAR, down_scale_shuffle ? L2_SPARSE_DOWN_SCALE_SHUFFLE
                                         : fused_activation ? L2_SPARSE_ROUTED_GATE_UP_ACTIVATION
                                                           : routed ? L2_SPARSE_ROUTED_GATE_UP : site,
@@ -2084,19 +2121,19 @@ LingbotV2MoeExpertModel::physical_manifest_for_candidate(
         }
         if (sparse_swiglu_route_ && !sparse_gate_up_activation_)
             append(FmbRouteFamily::ACTIVATION, L2_SPARSE_SWIGLU_ROUTE,
-                   1, 0, {logical_len, logical_len * top_k_, local_i, num_experts_, NUM_CORES});
+                   1, 0, {logical_len, logical_len * top_k_, local_i, num_experts_, num_cores()});
         if (sparse_combine_scan_)
             append(FmbRouteFamily::ACTIVATION, L2_SPARSE_COMBINE_SCAN,
-                   1, 0, {logical_len, logical_len * top_k_, hidden_size(), NUM_CORES});
+                   1, 0, {logical_len, logical_len * top_k_, hidden_size(), num_cores()});
         if (sparse_inverse_combine_) {
             if (sparse_down_ordered_combine_) {
                 // The new Down site owns the same four ordered adds + shared.
             } else if (sparse_inverse_shared_combine_)
                 append(FmbRouteFamily::ACTIVATION, L2_SPARSE_COMBINE_SHARED_INVERSE,
-                       1, 0, {logical_len, logical_len * top_k_, hidden_size(), num_experts_, NUM_CORES});
+                       1, 0, {logical_len, logical_len * top_k_, hidden_size(), num_experts_, num_cores()});
             else
                 append(FmbRouteFamily::ACTIVATION, L2_SPARSE_COMBINE_INVERSE,
-                       1, 0, {logical_len, logical_len * top_k_, hidden_size(), num_experts_, NUM_CORES});
+                       1, 0, {logical_len, logical_len * top_k_, hidden_size(), num_experts_, num_cores()});
             if (!sparse_topk_compact_)
                 append(FmbRouteFamily::GRAPH_SCHEDULE, L2_SPARSE_ROUTE_INVERSE,
                        1, 0, {logical_len, tp_rows_, num_experts_, top_k_, 9472});
@@ -2104,34 +2141,34 @@ LingbotV2MoeExpertModel::physical_manifest_for_candidate(
         if (sparse_shared_gate_up_resident_silu_w8_) {
             append(FmbRouteFamily::LINEAR, L2_SPARSE_SHARED_GATE_UP_RESIDENT_SILU_W8,
                    static_cast<int64_t>(LingbotV2LinearRoute::SHARED_GATE_UP_RESIDENT_SILU_W8_ACC16), 0,
-                   {logical_len, 2 * intermediate_size() / NUM_CORES, hidden_size(), 1, NUM_CORES, 1,
-                    intermediate_size() / NUM_CORES, 32, 128, 6, 3, 0x92, 0x3e00});
+                   lingbot_shared_resident_arguments(
+                       logical_len, intermediate_size() / num_cores(), hidden_size(), num_cores(), true));
         } else if (sparse_shared_gate_up_resident_silu_fp16_) {
             append(FmbRouteFamily::LINEAR, L2_SPARSE_SHARED_GATE_UP_RESIDENT_SILU_FP16,
                    static_cast<int64_t>(LingbotV2LinearRoute::SHARED_GATE_UP_RESIDENT_SILU_FP16_ACC16), 0,
-                   {logical_len, 2 * intermediate_size() / NUM_CORES, hidden_size(), 1, NUM_CORES, 2,
-                    intermediate_size() / NUM_CORES, 48, 128, 6, 2, 0x92, 0x3e00});
+                   lingbot_shared_resident_arguments(
+                       logical_len, intermediate_size() / num_cores(), hidden_size(), num_cores(), false));
         } else if (sparse_shared_gate_up_) {
             append(FmbRouteFamily::LINEAR, L2_SPARSE_SHARED_GATE_UP,
                    static_cast<int64_t>(LingbotV2LinearRoute::AUTO_TILE_ACC16), 0,
-                   {logical_len, 2 * intermediate_size() / NUM_CORES, hidden_size(), 1,
-                    NUM_CORES, shared_gate_up_[0].scalar_type() == at::kChar ? 1 : 2});
+                   {logical_len, 2 * intermediate_size() / num_cores(), hidden_size(), 1,
+                    num_cores(), shared_gate_up_[0].scalar_type() == at::kChar ? 1 : 2});
             append(FmbRouteFamily::ACTIVATION,
                    sparse_shared_silu_vector_ ? L2_SPARSE_SHARED_SILU_VECTOR : L2_SPARSE_SHARED_SILU_D96,
-                   1, 0, {logical_len, intermediate_size() / NUM_CORES, NUM_CORES});
+                   1, 0, {logical_len, intermediate_size() / num_cores(), num_cores()});
         } else {
             acc16(L2_SPARSE_SHARED_GATE);
             acc16(L2_SPARSE_SHARED_UP);
         }
         acc16(L2_SPARSE_SHARED_DOWN);
         append(FmbRouteFamily::ALL_REDUCE, L2_SPARSE_REDUCE,
-               fmb_ring_all_reduce_route_selector(physical_len, hidden_size()));
+               fmb_ring_all_reduce_route_selector(physical_len, hidden_size(), num_cores()));
     } else if (grouped) {
         for (const auto site : {L2_GROUP_GATE, L2_GROUP_UP}) {
             if (routed_gemm_)
                 append(FmbRouteFamily::LINEAR, site == L2_GROUP_GATE ? L2_ROUTED_COL_GATE : L2_ROUTED_COL_UP,
                     static_cast<int64_t>(LingbotV2LinearRoute::ROUTED_COL_ACC16), 0,
-                    {51, 64, 768, 32, 8, packed_w8a16_ ? 1 : 2});
+                    {51, 64, 768, 32, 8, packed_w8a16_ ? 1 : 2, 64, 64, 512, 48});
             else acc16(site);
         }
         if (debug_down_acc16_ || packed_w8a16_) acc16(L2_GROUP_DOWN_ACC16);
@@ -2142,7 +2179,7 @@ LingbotV2MoeExpertModel::physical_manifest_for_candidate(
             acc16(L2_GROUP_SHARED_DOWN);
         }
         append(FmbRouteFamily::ALL_REDUCE, L2_GROUP_REDUCE,
-               fmb_ring_all_reduce_route_selector(physical_len, hidden_size()));
+               fmb_ring_all_reduce_route_selector(physical_len, hidden_size(), num_cores()));
     } else {
         for (int64_t expert = 0; expert < num_experts_; ++expert) {
             acc16(L2_DENSE_GATE, expert);
@@ -2153,7 +2190,7 @@ LingbotV2MoeExpertModel::physical_manifest_for_candidate(
         acc16(L2_DENSE_SHARED_UP);
         acc16(L2_DENSE_SHARED_DOWN);
         append(FmbRouteFamily::ALL_REDUCE, L2_DENSE_REDUCE,
-               fmb_ring_all_reduce_route_selector(physical_len, hidden_size()));
+               fmb_ring_all_reduce_route_selector(physical_len, hidden_size(), num_cores()));
     }
 
     constexpr uint32_t kv_capabilities =
@@ -2231,19 +2268,20 @@ LingbotV2MoeExpertModel::physical_manifest_for_candidate(
         acc16(L2_O_LINEAR, invocation);
         if (sparse_attn_ring_adarms_ && adarms_)
             append(FmbRouteFamily::ALL_REDUCE, L2_ATTN_REDUCE_ADARMS,
-                   1, 0, {chunk.len, hidden_size(), NUM_CORES, 8, 4896, 63488,
+                   1, 0, {chunk.len, hidden_size(), num_cores(), 8, 4896, 63488,
                           static_cast<int64_t>(c10::Half(1.0f / 768).x),
                           static_cast<int64_t>(c10::Half(eps_).x), 1}, invocation);
         else
             append(FmbRouteFamily::ALL_REDUCE, L2_ATTN_REDUCE,
                    fmb_ring_all_reduce_route_selector(
-                       chunk.len, hidden_size()),
+                       chunk.len, hidden_size(), num_cores()),
                    0, {}, invocation);
     }
     append_causal_decoder_preload_manifest_routes(manifest);
     append_fmb_shared_runtime_routes(
         manifest, plan, hidden_size(),
-        denoise_tp8_encoder_ ? 0U : FMB_SHARED_LAYER_INPUT_DMA);
+        denoise_tp8_encoder_ ? 0U : FMB_SHARED_LAYER_INPUT_DMA,
+        /*compute_row_multiplier=*/1, num_cores(), mlp_tp());
     std::sort(
         manifest.routes.begin(), manifest.routes.end(),
         [](const FmbRouteManifestEntry& lhs,
@@ -2422,12 +2460,12 @@ std::vector<BufferDecl> LingbotV2MoeExpertModel::moe_baseline_buffer_declaration
     const int64_t half = A((E / 2) * Tp * DW);  // tree-reduction scratch (moe_sum)
     const int64_t tk16 = A(Tp * top_k_ * 2);     // fp16 key / raw uint16 ids
     const int64_t tk32 = A(Tp * top_k_ * 4);     // widened int32 ids for scatter
-    const int64_t mlp  = A(cs * (I / NUM_CORES) * DW);
+    const int64_t mlp  = A(cs * (I / num_cores()) * DW);
     const int64_t full = A(cs * h * DW);
 
-    // Router (core 0 computes; the 1xC_NxC/Nx1_NxC launchers have no num_cores
-    // parameter and always run broadcast on all 8 cores, so cores 1..7 compute
-    // garbage into these slots from garbage inputs — inert, never read).
+    // Router (core 0 computes; the 1xC_NxC/scalar launchers broadcast on every
+    // owned core, so cores 1..num_cores()-1 compute garbage into these slots
+    // from garbage inputs — inert, never read).
     // removed with the threshold-mask router: {"moe_logits" te,   7, 8, SC::Temp, 0, nullptr, ALL});
     // removed with the threshold-mask router: {"moe_scores" te,   7, 8, SC::Temp, 0, nullptr, ALL});
     // removed with the threshold-mask router: {"moe_choice" te,   7, 8, SC::Temp, 0, nullptr, ALL});
@@ -2476,7 +2514,7 @@ std::vector<BufferDecl> LingbotV2MoeExpertModel::moe_baseline_buffer_declaration
     //    weights are bound; a run has a fixed opt-in flag so the layout hash is
     //    stable within the run and the baseline path is byte-unchanged.
     if (grouped_experts_) {
-        const int64_t gpc = A(cs * (E * (I / NUM_CORES)) * DW);  // per-core [seq, E*Ic]
+        const int64_t gpc = A(cs * (E * (I / num_cores())) * DW);  // per-core [seq, E*Ic]
         // DIAG: Persistent (never aliased) to test whether Temp aliasing corrupts the big buffers.
         d.push_back({"moe_ggate", gpc, 7, 8, SC::Temp, 0, nullptr, ALL});
         d.push_back({"moe_gup",   gpc, 7, 8, SC::Temp, 0, nullptr, ALL});
@@ -2492,8 +2530,8 @@ std::vector<BufferDecl> LingbotV2MoeExpertModel::moe_baseline_buffer_declaration
             (sparse_inverse_combine_ ? 4096 : 0);
         d.push_back({"moe_sparse_route", route_bytes, 7, 8, SC::Temp, 0, nullptr, ALL});
         d.push_back({"moe_sparse_route_bcast", route_bytes, 7, 8, SC::Temp, 0, nullptr, ALL});
-        d.push_back({"moe_sparse_input", A(r * std::max(h, I / NUM_CORES) * DW), 7, 8, SC::Temp, 0, nullptr, ALL});
-        d.push_back({"moe_sparse_gate_up", A(r * 2 * (I / NUM_CORES) * DW), 7, 8, SC::Temp, 0, nullptr, ALL});
+        d.push_back({"moe_sparse_input", A(r * std::max(h, I / num_cores()) * DW), 7, 8, SC::Temp, 0, nullptr, ALL});
+        d.push_back({"moe_sparse_gate_up", A(r * 2 * (I / num_cores()) * DW), 7, 8, SC::Temp, 0, nullptr, ALL});
         d.push_back({"moe_sparse_output", A(r * h * DW), 7, 8, SC::Temp, 0, nullptr, ALL});
         if (!sparse_route_compact_) {
             for (const bool expert : {true, false}) {
@@ -2547,7 +2585,8 @@ std::vector<BufferDecl> LingbotV2MoeExpertModel::moe_baseline_buffer_declaration
         b.preload_callback =
             [this](FusedModelBase&, int L, uint32_t core0_addr) {
                 rpu_launch_ddr_broadcast_spm_dma(
-                    router_bias_[L].data_ptr<c10::Half>(), num_experts_, core0_addr);
+                    router_bias_[L].data_ptr<c10::Half>(), num_experts_, core0_addr,
+                    num_cores());
             };
         d.push_back(b);
     }
@@ -2756,7 +2795,7 @@ void LingbotV2MoeExpertModel::emit_denoise_tp8_pre_layers() {
     rpu_launch_linear_spm_to_spm_kernel(
         addr(0, "denoise_enc"), mo_, addr(0, "denoise_emb"), rows, h, h, 0, tp, 0);
     ctx().consume_physical_route(FmbRouteFamily::ALL_REDUCE, L2_PRE_TP8_REDUCE,
-        fmb_ring_all_reduce_route_selector(rows, h), 0, {}, bit);
+        fmb_ring_all_reduce_route_selector(rows, h, num_cores()), 0, {}, bit);
     rpu_launch_all_reduce_sum_residual_kernel(
         addr(0, "denoise_emb"), addr(0, "denoise_mo_bias_rows"),
         addr(0, "residual1"), rows, h, tp, tp);
@@ -3018,7 +3057,7 @@ void LingbotV2MoeExpertModel::emit_router_select(int layer_idx, int64_t seq_len)
             addr(0, "moe_work"),
             addr(0, "moe_sum"),
             addr(0, "moe_rwbc"),
-            Tp, E, top_k_);
+            Tp, E, top_k_, num_cores());
     }
 
     if (!fp16_top4_) {
@@ -3058,7 +3097,8 @@ void LingbotV2MoeExpertModel::emit_router_select(int layer_idx, int64_t seq_len)
     //       0 (the official 1e-20 protects a top-k gather, which we do not do).
     rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
         addr(0, "moe_sum"), addr(0, "moe_scoresT"), addr(0, "moe_rwbc"),
-        /*n=*/E, /*c=*/Tp, c10::Half(1.0f), ValuOpType::DIV, /*is_bopa=*/true);
+        /*n=*/E, /*c=*/Tp, c10::Half(1.0f), ValuOpType::DIV, /*is_bopa=*/true,
+        num_cores());
 
     }  // end !fp16_top4_ (dense-soft /sum weights)
     }  // end original selector
@@ -3075,7 +3115,7 @@ void LingbotV2MoeExpertModel::emit_router_select(int layer_idx, int64_t seq_len)
             {static_cast<int64_t>(routed_scaling_.x)});
         rpu_launch_eltwise_binary_scalar_spm_kernel(
             addr(0, "moe_rwbc"), routed_scaling_, addr(0, "moe_rwbc"),
-            E * Tp, ValuOpType::MUL);
+            E * Tp, ValuOpType::MUL, num_cores());
     }
 
     // ── 7. Relay core0 -> DDR -> all 8 cores: the router ran on core 0 only, but
@@ -3086,7 +3126,7 @@ void LingbotV2MoeExpertModel::emit_router_select(int layer_idx, int64_t seq_len)
         c10::Half* stage = rw_stage_.data_ptr<c10::Half>() + (int64_t)layer_idx * E * Tp;
         rpu_launch_spm_copy_ddr_dma(addr(0, "moe_rwbc"), stage, E * Tp);
         if (sparse_experts_) return;  // sparse relays token-major weights with IDs/counts
-        rpu_launch_ddr_broadcast_spm_dma(stage, E * Tp, addr(0, "moe_rwbc"), NUM_CORES);
+        rpu_launch_ddr_broadcast_spm_dma(stage, E * Tp, addr(0, "moe_rwbc"), num_cores());
     }
 }
 
@@ -3097,6 +3137,8 @@ void LingbotV2MoeExpertModel::emit_router_select(int layer_idx, int64_t seq_len)
 //   out: residual1 = residual2 + y_routed + y_shared
 // ─────────────────────────────────────────────────────────────────────────────
 void LingbotV2MoeExpertModel::emit_moe_mlp(int layer_idx, int64_t seq_len) {
+    TORCH_CHECK(num_cores() == 8 || sparse_experts_,
+                "reduced-core LingBot2 expert requires sparse experts");
     if (sparse_experts_) {
         emit_moe_mlp_sparse(layer_idx, seq_len);
         return;
@@ -3111,8 +3153,8 @@ void LingbotV2MoeExpertModel::emit_moe_mlp(int layer_idx, int64_t seq_len) {
     const int64_t Tp = tp_rows_;
     const int64_t I  = routed_inter_;
     const int64_t S  = intermediate_size();   // shared-expert intermediate (padded)
-    const int64_t Ic = I / NUM_CORES;
-    const int64_t Sc = S / NUM_CORES;
+    const int64_t Ic = I / num_cores();
+    const int64_t Sc = S / num_cores();
 
     // Produce dense [E,Tp] routing weights: normalized score times routed_scaling
     // for each selected expert, zero otherwise. Strict exactly-k selection is
@@ -3129,7 +3171,7 @@ void LingbotV2MoeExpertModel::emit_moe_mlp(int layer_idx, int64_t seq_len) {
             /*resolved_flags=*/0, {}, e);
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "residual1"), expert_gate_[wi], addr(0, "moe_gate"),
-            seq_len, /*N=*/I, /*K=*/h, /*partition=*/1, NUM_CORES);
+            seq_len, /*N=*/I, /*K=*/h, /*partition=*/1, num_cores());
         // up_e = h @ up_w_e.T
         ctx().consume_physical_route(
             FmbRouteFamily::LINEAR, L2_DENSE_UP,
@@ -3137,18 +3179,19 @@ void LingbotV2MoeExpertModel::emit_moe_mlp(int layer_idx, int64_t seq_len) {
             /*resolved_flags=*/0, {}, e);
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "residual1"), expert_up_[wi], addr(0, "moe_up"),
-            seq_len, /*N=*/I, /*K=*/h, /*partition=*/1, NUM_CORES);
+            seq_len, /*N=*/I, /*K=*/h, /*partition=*/1, num_cores());
         // act = silu(gate) * up   — exactly SwiGLU (rhino llama_silu_mul)
         rpu_launch_silu_mul_spm_kernel(
             addr(0, "moe_gate"), addr(0, "moe_up"), addr(0, "moe_gate"),
-            seq_len * Ic, NUM_CORES);
+            seq_len * Ic, num_cores());
         // act *= routed_scaling * w[:,e]. down_e is linear and bias-free, so
         // scaling the ACTIVATION is identical to scaling the expert output —
         // and it is 8x cheaper (Ic vs h columns). w[:,e] is the contiguous [Tp]
         // slice at e*Tp; n=seq_len uses only the real tokens. alpha folds in 4.0.
         rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel(
             addr(0, "moe_rwbc") + e * Tp * DWIDTH, addr(0, "moe_gate"), addr(0, "moe_gate"),
-            /*n=*/seq_len, /*c=*/Ic, routed_scaling_, ValuOpType::MUL, /*is_bopa=*/false);
+            /*n=*/seq_len, /*c=*/Ic, routed_scaling_, ValuOpType::MUL, /*is_bopa=*/false,
+            num_cores());
         // down_e (row-partition -> per-core partial).
         // [R4] e==0 writes the partial STRAIGHT into moe_acc, seeding the accumulator
         // without a copy and without a zero-fill (it fully overwrites [cs,h]).
@@ -3159,13 +3202,13 @@ void LingbotV2MoeExpertModel::emit_moe_mlp(int layer_idx, int64_t seq_len) {
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "moe_gate"), expert_down_[wi],
             e == 0 ? addr(0, "moe_acc") : addr(0, "moe_down"),
-            seq_len, /*N=*/h, /*K=*/I, /*partition=*/0, NUM_CORES);
+            seq_len, /*N=*/h, /*K=*/I, /*partition=*/0, num_cores());
         // Accumulate each core's expert partials locally. A single all-reduce after
         // the shared expert produces the complete sum by linearity.
         if (e != 0) {
             rpu_launch_eltwise_binary_spm_kernel(
                 addr(0, "moe_acc"), addr(0, "moe_down"), addr(0, "moe_acc"),
-                seq_len * h, ValuOpType::ADD, c10::Half(1.0), NUM_CORES);
+                seq_len * h, ValuOpType::ADD, c10::Half(1.0), num_cores());
         }
     }
 
@@ -3182,7 +3225,7 @@ void LingbotV2MoeExpertModel::emit_moe_mlp(int layer_idx, int64_t seq_len) {
         /*resolved_flags=*/0);
     rpu_launch_linear_spm_to_spm_acc16_kernel(
         addr(0, "residual1"), lw.gate_w, addr(0, "gate"),
-        seq_len, /*N=*/S, /*K=*/h, /*partition=*/1, NUM_CORES,
+        seq_len, /*N=*/S, /*K=*/h, /*partition=*/1, num_cores(),
         /*bias_spm_addr=*/0, lw.gate_ws);
     ctx().consume_physical_route(
         FmbRouteFamily::LINEAR, L2_DENSE_SHARED_UP,
@@ -3190,22 +3233,22 @@ void LingbotV2MoeExpertModel::emit_moe_mlp(int layer_idx, int64_t seq_len) {
         /*resolved_flags=*/0);
     rpu_launch_linear_spm_to_spm_acc16_kernel(
         addr(0, "residual1"), lw.up_w, addr(0, "up"),
-        seq_len, /*N=*/S, /*K=*/h, /*partition=*/1, NUM_CORES,
+        seq_len, /*N=*/S, /*K=*/h, /*partition=*/1, num_cores(),
         /*bias_spm_addr=*/0, lw.up_ws);
     rpu_launch_silu_mul_spm_kernel(
-        addr(0, "gate"), addr(0, "up"), addr(0, "gate"), seq_len * Sc, NUM_CORES);
+        addr(0, "gate"), addr(0, "up"), addr(0, "gate"), seq_len * Sc, num_cores());
     ctx().consume_physical_route(
         FmbRouteFamily::LINEAR, L2_DENSE_SHARED_DOWN,
         static_cast<int64_t>(LingbotV2LinearRoute::AUTO_TILE_ACC16),
         /*resolved_flags=*/0);
     rpu_launch_linear_spm_to_spm_acc16_kernel(
         addr(0, "gate"), lw.down_w, addr(0, "down"),
-        seq_len, /*N=*/h, /*K=*/S, /*partition=*/0, NUM_CORES,
+        seq_len, /*N=*/h, /*K=*/S, /*partition=*/0, num_cores(),
         /*bias_spm_addr=*/0, lw.down_ws);
     // [R4] Fold the shared expert's per-core partial into the SAME local accumulator...
     rpu_launch_eltwise_binary_spm_kernel(
         addr(0, "moe_acc"), addr(0, "down"), addr(0, "moe_acc"),
-        seq_len * h, ValuOpType::ADD, c10::Half(1.0), NUM_CORES);
+        seq_len * h, ValuOpType::ADD, c10::Half(1.0), num_cores());
     // ...then ONE all-reduce for the whole layer:
     //   residual1 = AllReduce_c(sum_e p_c(e) + p_c(shared)) + residual2
     // residual2 is still live here (declared [1,8]; only READ during phase 7-8), and
@@ -3213,11 +3256,11 @@ void LingbotV2MoeExpertModel::emit_moe_mlp(int layer_idx, int64_t seq_len) {
     // input/residual/output are all distinct, as required by the fused ring.
     ctx().consume_physical_route(
         FmbRouteFamily::ALL_REDUCE, L2_DENSE_REDUCE,
-        fmb_ring_all_reduce_route_selector(seq_len, h),
+        fmb_ring_all_reduce_route_selector(seq_len, h, num_cores()),
         /*resolved_flags=*/0);
     rpu_launch_all_reduce_sum_residual_kernel(
         addr(0, "moe_acc"), addr(0, "residual2"),
-        addr(0, "residual1"), seq_len, h, NUM_CORES, NUM_CORES);
+        addr(0, "residual1"), seq_len, h, num_cores(), num_cores());
     if (debug_capture_l0_ && layer_idx == 0)
         rpu_launch_spm_copy_ddr_dma(addr(0, "residual1"), l0_out_.data_ptr<c10::Half>(), seq_len * h);
 }
@@ -3243,8 +3286,8 @@ void LingbotV2MoeExpertModel::emit_moe_mlp_grouped(int layer_idx, int64_t seq_le
     const int64_t Tp  = tp_rows_;
     const int64_t I   = routed_inter_;
     const int64_t S   = intermediate_size();
-    const int64_t Sc  = S / NUM_CORES;
-    const int64_t Ic  = I / NUM_CORES;      // per-core rows of one expert (64)
+    const int64_t Sc  = S / num_cores();
+    const int64_t Ic  = I / num_cores();      // per-core rows of one expert (64)
     const int64_t GpC = E * Ic;             // per-core packed width (E*Ic = 2048)
     const int64_t NI  = E * I;              // packed N/K (16384)
 
@@ -3284,14 +3327,15 @@ void LingbotV2MoeExpertModel::emit_moe_mlp_grouped(int layer_idx, int64_t seq_le
         //   sum; is_bopa=true selects b/a = scores/sum, matching the [E,Tp] rwbc divide direction)
         rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel(
             addr(0, "moe_sum"), addr(0, "moe_scores"), addr(0, "moe_wtm"),
-            /*n=*/seq_len, /*c=*/E, c10::Half(1.0f), ValuOpType::DIV, /*is_bopa=*/true);
+            /*n=*/seq_len, /*c=*/E, c10::Half(1.0f), ValuOpType::DIV, /*is_bopa=*/true,
+            num_cores());
     }
     {
         c10::Half* stage = wtm_stage_.data_ptr<c10::Half>() + (int64_t)layer_idx * Tp * E;
         rpu_launch_spm_copy_ddr_dma(addr(0, "moe_wtm"), stage, seq_len * E);
         // Broadcast into a separate destination: source/destination aliasing would
         // make core 0 overwrite its own DMA source. All cores consume moe_wtmb.
-        rpu_launch_ddr_broadcast_spm_dma(stage, seq_len * E, addr(0, "moe_wtmb"), NUM_CORES);
+        rpu_launch_ddr_broadcast_spm_dma(stage, seq_len * E, addr(0, "moe_wtmb"), num_cores());
     }
 
     // ── GROUPED EXPERTS ──────────────────────────────────────────────────────
@@ -3309,16 +3353,16 @@ void LingbotV2MoeExpertModel::emit_moe_mlp_grouped(int layer_idx, int64_t seq_le
         auto* counts = routed_counts_stage_.data_ptr<c10::Half>() + layer_idx * 128;
         rpu_launch_spm_copy_ddr_dma(addr(0, "moe_routed_counts"), counts, E);
         ctx().consume_physical_route(FmbRouteFamily::MUTABLE_DMA, L2_ROUTED_COUNTS_BCAST, 1, 0, {32, 8});
-        rpu_launch_ddr_broadcast_spm_dma(counts, E, addr(0, "moe_routed_counts_bcast"), NUM_CORES);
+        rpu_launch_ddr_broadcast_spm_dma(counts, E, addr(0, "moe_routed_counts_bcast"), num_cores());
         ctx().consume_physical_route(FmbRouteFamily::LINEAR, L2_ROUTED_COL_GATE,
             static_cast<int64_t>(LingbotV2LinearRoute::ROUTED_COL_ACC16), 0,
-            {51, 64, 768, 32, 8, packed_w8a16_ ? 1 : 2});
+            {51, 64, 768, 32, 8, packed_w8a16_ ? 1 : 2, 64, 64, 512, 48});
         rpu_launch_lingbot2_routed_col_spm_kernel(
             addr(0, "residual1"), packed_gate_[layer_idx],
             addr(0, "moe_routed_counts_bcast"), addr(0, "moe_ggate"), gs);
         ctx().consume_physical_route(FmbRouteFamily::LINEAR, L2_ROUTED_COL_UP,
             static_cast<int64_t>(LingbotV2LinearRoute::ROUTED_COL_ACC16), 0,
-            {51, 64, 768, 32, 8, packed_w8a16_ ? 1 : 2});
+            {51, 64, 768, 32, 8, packed_w8a16_ ? 1 : 2, 64, 64, 512, 48});
         rpu_launch_lingbot2_routed_col_spm_kernel(
             addr(0, "residual1"), packed_up_[layer_idx],
             addr(0, "moe_routed_counts_bcast"), addr(0, "moe_gup"), us);
@@ -3329,7 +3373,7 @@ void LingbotV2MoeExpertModel::emit_moe_mlp_grouped(int layer_idx, int64_t seq_le
         /*resolved_flags=*/0);
     rpu_launch_linear_spm_to_spm_acc16_kernel(
         addr(0, "residual1"), packed_gate_[layer_idx], addr(0, "moe_ggate"),
-        seq_len, /*N=*/NI, /*K=*/h, /*partition=*/1, NUM_CORES,
+        seq_len, /*N=*/NI, /*K=*/h, /*partition=*/1, num_cores(),
         /*bias_spm_addr=*/0u, gs);
     ctx().consume_physical_route(
         FmbRouteFamily::LINEAR, L2_GROUP_UP,
@@ -3337,7 +3381,7 @@ void LingbotV2MoeExpertModel::emit_moe_mlp_grouped(int layer_idx, int64_t seq_le
         /*resolved_flags=*/0);
     rpu_launch_linear_spm_to_spm_acc16_kernel(
         addr(0, "residual1"), packed_up_[layer_idx], addr(0, "moe_gup"),
-        seq_len, /*N=*/NI, /*K=*/h, /*partition=*/1, NUM_CORES,
+        seq_len, /*N=*/NI, /*K=*/h, /*partition=*/1, num_cores(),
         /*bias_spm_addr=*/0u, us);
     }
     // act = silu(gate) * up over the whole per-core width.
@@ -3357,7 +3401,7 @@ void LingbotV2MoeExpertModel::emit_moe_mlp_grouped(int layer_idx, int64_t seq_le
             const int64_t nn = (total - off < CHUNK) ? (total - off) : CHUNK;
             rpu_launch_silu_mul_spm_kernel(
                 addr(0, "moe_ggate") + off * DWIDTH, addr(0, "moe_gup") + off * DWIDTH,
-                addr(0, silu_out) + off * DWIDTH, nn, NUM_CORES);
+                addr(0, silu_out) + off * DWIDTH, nn, num_cores());
         }
         if (debug_stages_ && layer_idx == 0) {
             rpu_launch_spm_copy_ddr_dma(addr(0,"moe_wtm"), gcap_.data_ptr<c10::Half>(), Tp * E);  // CORE0 wtm
@@ -3365,7 +3409,7 @@ void LingbotV2MoeExpertModel::emit_moe_mlp_grouped(int layer_idx, int64_t seq_le
         }
     }
     if (debug_capture_gate_ && layer_idx == 0)
-        rpu_launch_spm_copy_ddr_dma(addr(0, "moe_ggate"), gcap_.data_ptr<c10::Half>(), seq_len * (E * (I / NUM_CORES)));
+        rpu_launch_spm_copy_ddr_dma(addr(0, "moe_ggate"), gcap_.data_ptr<c10::Half>(), seq_len * (E * (I / num_cores())));
     // act[t,e,i] *= w[t,e] * routed_scaling. Per-core view [seq,E,Ic] as [seq*E, Ic];
     //   a = moe_wtm (row t*E+e = w[t,e], IDENTICAL on all cores), contiguous.
     // act[t,e,i] *= w[t,e] * routed_scaling. The packed grouped binding requires one
@@ -3386,7 +3430,8 @@ void LingbotV2MoeExpertModel::emit_moe_mlp_grouped(int layer_idx, int64_t seq_le
                 addr(0, "moe_wtmb") + r * DWIDTH,
                 addr(0, scale_in) + r * Ic * DWIDTH,
                 addr(0, scale_out) + r * Ic * DWIDTH,
-                /*n=*/rn, /*c=*/Ic, routed_scaling_, ValuOpType::MUL, /*is_bopa=*/false);
+                /*n=*/rn, /*c=*/Ic, routed_scaling_, ValuOpType::MUL, /*is_bopa=*/false,
+                num_cores());
         }
     }
     if (debug_stages_ && layer_idx == 0)
@@ -3403,7 +3448,7 @@ void LingbotV2MoeExpertModel::emit_moe_mlp_grouped(int layer_idx, int64_t seq_le
             /*resolved_flags=*/0);
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, scale_out), packed_down_[layer_idx], addr(0, "moe_acc"),
-            seq_len, /*N=*/h, /*K=*/NI, /*partition=*/0, NUM_CORES,
+            seq_len, /*N=*/h, /*K=*/NI, /*partition=*/0, num_cores(),
             /*bias_spm_addr=*/0u, ds);
     } else {
         ctx().consume_physical_route(
@@ -3412,7 +3457,7 @@ void LingbotV2MoeExpertModel::emit_moe_mlp_grouped(int layer_idx, int64_t seq_le
             /*resolved_flags=*/0);
         rpu_launch_linear_spm_to_spm_kernel(   // acc32 = fp32-accumulate (default)
             addr(0, scale_out), packed_down_[layer_idx], addr(0, "moe_acc"),
-            seq_len, /*N=*/h, /*K=*/NI, /*partition=*/0, NUM_CORES);
+            seq_len, /*N=*/h, /*K=*/NI, /*partition=*/0, num_cores());
     }
     if (debug_capture_gate_ && layer_idx == 0)
         rpu_launch_spm_copy_ddr_dma(addr(0, "moe_acc"), acap_.data_ptr<c10::Half>(), seq_len * h);
@@ -3430,34 +3475,34 @@ void LingbotV2MoeExpertModel::emit_moe_mlp_grouped(int layer_idx, int64_t seq_le
         /*resolved_flags=*/0);
     rpu_launch_linear_spm_to_spm_acc16_kernel(
         addr(0, "residual1"), lw.gate_w, addr(0, "gate"),
-        seq_len, /*N=*/S, /*K=*/h, /*partition=*/1, NUM_CORES, 0, lw.gate_ws);
+        seq_len, /*N=*/S, /*K=*/h, /*partition=*/1, num_cores(), 0, lw.gate_ws);
     ctx().consume_physical_route(
         FmbRouteFamily::LINEAR, L2_GROUP_SHARED_UP,
         static_cast<int64_t>(LingbotV2LinearRoute::AUTO_TILE_ACC16),
         /*resolved_flags=*/0);
     rpu_launch_linear_spm_to_spm_acc16_kernel(
         addr(0, "residual1"), lw.up_w, addr(0, "up"),
-        seq_len, /*N=*/S, /*K=*/h, /*partition=*/1, NUM_CORES, 0, lw.up_ws);
+        seq_len, /*N=*/S, /*K=*/h, /*partition=*/1, num_cores(), 0, lw.up_ws);
     rpu_launch_silu_mul_spm_kernel(
-        addr(0, "gate"), addr(0, "up"), addr(0, "gate"), seq_len * Sc, NUM_CORES);
+        addr(0, "gate"), addr(0, "up"), addr(0, "gate"), seq_len * Sc, num_cores());
     ctx().consume_physical_route(
         FmbRouteFamily::LINEAR, L2_GROUP_SHARED_DOWN,
         static_cast<int64_t>(LingbotV2LinearRoute::AUTO_TILE_ACC16),
         /*resolved_flags=*/0);
     rpu_launch_linear_spm_to_spm_acc16_kernel(
         addr(0, "gate"), lw.down_w, addr(0, "down"),
-        seq_len, /*N=*/h, /*K=*/S, /*partition=*/0, NUM_CORES, 0, lw.down_ws);
+        seq_len, /*N=*/h, /*K=*/S, /*partition=*/0, num_cores(), 0, lw.down_ws);
     rpu_launch_eltwise_binary_spm_kernel(
         addr(0, "moe_acc"), addr(0, "down"), addr(0, "moe_acc"),
-        seq_len * h, ValuOpType::ADD, c10::Half(1.0), NUM_CORES);
+        seq_len * h, ValuOpType::ADD, c10::Half(1.0), num_cores());
     }
     ctx().consume_physical_route(
         FmbRouteFamily::ALL_REDUCE, L2_GROUP_REDUCE,
-        fmb_ring_all_reduce_route_selector(seq_len, h),
+        fmb_ring_all_reduce_route_selector(seq_len, h, num_cores()),
         /*resolved_flags=*/0);
     rpu_launch_all_reduce_sum_residual_kernel(
         addr(0, "moe_acc"), addr(0, "residual2"),
-        addr(0, "residual1"), seq_len, h, NUM_CORES, NUM_CORES);
+        addr(0, "residual1"), seq_len, h, num_cores(), num_cores());
     if (debug_capture_l0_ && layer_idx == 0)
         rpu_launch_spm_copy_ddr_dma(addr(0, "residual1"), l0_out_.data_ptr<c10::Half>(), seq_len * h);
 }
@@ -3469,6 +3514,7 @@ void LingbotV2MoeExpertModel::set_packed_expert_weights(
     at::TensorList gate_packed, at::TensorList up_packed, at::TensorList down_packed) {
     const int64_t nl = num_layers();
     TORCH_CHECK(!sparse_experts_, "dense packed weights cannot replace a sparse bank");
+    TORCH_CHECK(num_cores() == 8, "reduced-core LingBot2 expert rejects dense packed experts");
     TORCH_CHECK(num_experts_ > 0, "set_packed_expert_weights must follow set_moe_weights");
     TORCH_CHECK((int64_t)gate_packed.size() == nl && (int64_t)up_packed.size() == nl
              && (int64_t)down_packed.size() == nl,
@@ -3551,6 +3597,9 @@ void LingbotV2MoeExpertModel::build_layer_subgraph(int layer_idx, const ChunkInf
         "chunk.len(", chunk.len, ") != set_moe_weights chunk_size(", chunk_size_, ")");
 
     const auto& lw = layer_weights_[layer_idx];
+    // set_base_scales binds all seven roles together on the reduced child.
+    TORCH_CHECK(num_cores() == 8 || lw.q_w.scalar_type() != at::kChar || lw.q_ws.defined(),
+                "reduced-core LingBot2 int8 expert requires set_base_scales before forward");
     const int64_t seq_len = chunk.len;
     const int64_t rope_base =
         (!has_mrope_ && rope_position_base_ >= 0) ? rope_position_base_ : ctx().position;
@@ -3601,11 +3650,11 @@ void LingbotV2MoeExpertModel::build_layer_subgraph(int layer_idx, const ChunkInf
     if (sparse_adarms_norm_shift_capable_ && adarms_) {
         ctx().consume_physical_route(
             FmbRouteFamily::NORMALIZATION, L2_INPUT_ADARMS_NORM_SHIFT,
-            sparse_adarms_norm_shift_diagonal_ ? 2 : 1, 0, {seq_len, h, NUM_CORES}, chunk.idx);
+            sparse_adarms_norm_shift_diagonal_ ? 2 : 1, 0, {seq_len, h, num_cores()}, chunk.idx);
         rpu_launch_lingbot2_adarms_norm_shift_h768_spm_kernel(
             addr(0, "residual1"), addr(0, "input_norm"),
             layer_addr(layer_idx, 0, "norm_w"),
-            layer_addr(layer_idx, 0, "input_shift"), seq_len, eps_, NUM_CORES,
+            layer_addr(layer_idx, 0, "input_shift"), seq_len, eps_, num_cores(),
             sparse_adarms_norm_shift_diagonal_);
         // Fusion already includes the FiLM shift. Capture the same shifted
         // activation consumed by QKV, without applying the shift a second time.
@@ -3615,19 +3664,22 @@ void LingbotV2MoeExpertModel::build_layer_subgraph(int layer_idx, const ChunkInf
     } else {
         rpu_launch_rmsnorm_spm_kernel(
             addr(0, "residual1"), addr(0, "input_norm"),
-            layer_addr(layer_idx, 0, "norm_w"), seq_len, h, eps_);
+            layer_addr(layer_idx, 0, "norm_w"), seq_len, h, eps_,
+            RpuRmsNormSpmRoute::BASE, num_cores());
         // Preserve the old debug recomputation into its nonaliased slot.
         if (cap_innorm) {
             rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
                 layer_addr(layer_idx, 0, "input_shift"),
                 addr(0, "input_norm"), addr(0, "innorm_dbg"),
-                seq_len, h, c10::Half(1.0f), ValuOpType::ADD, /*is_bopa=*/false);
+                seq_len, h, c10::Half(1.0f), ValuOpType::ADD, /*is_bopa=*/false,
+                num_cores());
         }
         if (adarms_) {
             rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
                 layer_addr(layer_idx, 0, "input_shift"),
                 addr(0, "input_norm"), addr(0, "input_norm"),
-                seq_len, h, c10::Half(1.0f), ValuOpType::ADD, /*is_bopa=*/false);
+                seq_len, h, c10::Half(1.0f), ValuOpType::ADD, /*is_bopa=*/false,
+                num_cores());
         }
         if (cap_innorm)
             rpu_launch_spm_copy_ddr_dma(addr(0, "innorm_dbg"),
@@ -3779,7 +3831,7 @@ void LingbotV2MoeExpertModel::build_layer_subgraph(int layer_idx, const ChunkInf
             sdpa_kernel_, k_cache, v_cache, mask_type, c10::nullopt,
             addr_offset("q").value, addr_offset("output").value,
             addr_offset("sdpa_tmp").value, mask_off,
-            seq_len, nq, nkv, hd, kv_seq_len, tp, NUM_CORES);
+            seq_len, nq, nkv, hd, kv_seq_len, tp, num_cores());
     }
 
     ctx().consume_physical_route(
@@ -3787,7 +3839,7 @@ void LingbotV2MoeExpertModel::build_layer_subgraph(int layer_idx, const ChunkInf
         static_cast<int64_t>(LingbotV2AllReduceRoute::PREPARE_RING_INPUT),
         /*resolved_flags=*/0, {}, chunk.idx);
     rpu_prepare_ring_all_reduce_input(
-        addr(0, "oproj"), seq_len, h, tp);
+        addr(0, "oproj"), seq_len, h, tp, num_cores());
     ctx().consume_physical_route(
         FmbRouteFamily::LINEAR, L2_O_LINEAR,
         static_cast<int64_t>(LingbotV2LinearRoute::AUTO_TILE_ACC16),
@@ -3801,7 +3853,7 @@ void LingbotV2MoeExpertModel::build_layer_subgraph(int layer_idx, const ChunkInf
     if (sparse_attn_ring_adarms_ && adarms_) {
         ctx().consume_physical_route(
             FmbRouteFamily::ALL_REDUCE, L2_ATTN_REDUCE_ADARMS, 1, 0,
-            {seq_len, h, NUM_CORES, 8, 4896, 63488,
+            {seq_len, h, num_cores(), 8, 4896, 63488,
              static_cast<int64_t>(c10::Half(1.0f / 768).x),
              static_cast<int64_t>(c10::Half(eps_).x), 1}, chunk.idx);
         // Refresh this Euler body's coefficients before the fused norm.
@@ -3811,15 +3863,15 @@ void LingbotV2MoeExpertModel::build_layer_subgraph(int layer_idx, const ChunkInf
             addr(0, "oproj"), addr(0, "residual1"),
             addr(0, "residual2"), addr(0, "residual1"),
             layer_addr(layer_idx, 0, "post_norm_w"),
-            layer_addr(layer_idx, 0, "post_shift"), seq_len, h, eps_, NUM_CORES);
+            layer_addr(layer_idx, 0, "post_shift"), seq_len, h, eps_, num_cores());
     } else {
         ctx().consume_physical_route(
             FmbRouteFamily::ALL_REDUCE, L2_ATTN_REDUCE,
-            fmb_ring_all_reduce_route_selector(seq_len, h),
+            fmb_ring_all_reduce_route_selector(seq_len, h, num_cores()),
             /*resolved_flags=*/0, {}, chunk.idx);
         rpu_launch_all_reduce_sum_residual_kernel(
             addr(0, "oproj"), addr(0, "residual1"),
-            addr(0, "residual2"), seq_len, h, tp, NUM_CORES);
+            addr(0, "residual2"), seq_len, h, tp, num_cores());
     }
 
     // ── DEBUG: capture the post-attention residual (residual2 = layer_in + attn_out). ──
@@ -3834,21 +3886,23 @@ void LingbotV2MoeExpertModel::build_layer_subgraph(int layer_idx, const ChunkInf
         if (sparse_adarms_norm_shift_capable_ && adarms_) {
             ctx().consume_physical_route(
                 FmbRouteFamily::NORMALIZATION, L2_POST_ADARMS_NORM_SHIFT,
-                sparse_adarms_norm_shift_diagonal_ ? 2 : 1, 0, {seq_len, h, NUM_CORES}, chunk.idx);
+                sparse_adarms_norm_shift_diagonal_ ? 2 : 1, 0, {seq_len, h, num_cores()}, chunk.idx);
             rpu_launch_lingbot2_adarms_norm_shift_h768_spm_kernel(
                 addr(0, "residual2"), addr(0, "residual1"),
                 layer_addr(layer_idx, 0, "post_norm_w"),
-                layer_addr(layer_idx, 0, "post_shift"), seq_len, eps_, NUM_CORES,
+                layer_addr(layer_idx, 0, "post_shift"), seq_len, eps_, num_cores(),
                 sparse_adarms_norm_shift_diagonal_);
         } else {
             rpu_launch_rmsnorm_spm_kernel(
                 addr(0, "residual2"), addr(0, "residual1"),
-                layer_addr(layer_idx, 0, "post_norm_w"), seq_len, h, eps_);
+                layer_addr(layer_idx, 0, "post_norm_w"), seq_len, h, eps_,
+                RpuRmsNormSpmRoute::BASE, num_cores());
             if (adarms_) {
                 rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
                     layer_addr(layer_idx, 0, "post_shift"),
                     addr(0, "residual1"), addr(0, "residual1"),
-                    seq_len, h, c10::Half(1.0f), ValuOpType::ADD, /*is_bopa=*/false);
+                    seq_len, h, c10::Half(1.0f), ValuOpType::ADD, /*is_bopa=*/false,
+                    num_cores());
             }
         }
     }
@@ -3860,7 +3914,8 @@ void LingbotV2MoeExpertModel::build_layer_subgraph(int layer_idx, const ChunkInf
     if (is_last_layer) {
         rpu_launch_rmsnorm_spm_kernel(
             addr(0, "residual1"), addr(0, "residual1"),
-            addr(0, "final_norm_w"), seq_len, h, eps_);
+            addr(0, "final_norm_w"), seq_len, h, eps_,
+            RpuRmsNormSpmRoute::BASE, num_cores());
     }
     if (!ctx().output_to_spm && !denoise_unroll_) {
         emit_layer_output_dma(layer_idx, chunk);
@@ -4042,12 +4097,19 @@ int64_t rpu_lingbot_v2_moe_create(
     bool adarms_fused_bcast, bool bufonly, bool addr,
     int64_t schunk, int64_t rchunk_requested,
     bool dense_soft_router, bool fp16_top4,
-    bool routed_only, bool down_acc16) {
+    bool routed_only, bool down_acc16, int64_t num_cores) {
+    // Eight cores, or the four-core child of a reduced LingBot v2 root
+    // (I512 routed experts do not split over six lanes).
+    TORCH_CHECK(num_cores == 8 || num_cores == 4,
+                "LingBot2 action expert admits eight cores or the reduced four-core child");
+    TORCH_CHECK(num_cores == 8 || !adarms_fused_bcast,
+                "reduced-core LingBot2 expert rejects the fused AdaRMS broadcast");
     const int64_t handle = LingbotV2MoeRegistry::create();
     auto* model = LingbotV2MoeRegistry::get(
         handle, "rpu_lingbot_v2_moe_create");
     model->configure_cold_routes(
-        /*qwen3_spm_kv_by_mha=*/false, adarms_fused_bcast);
+        /*qwen3_spm_kv_by_mha=*/false, adarms_fused_bcast,
+        static_cast<int>(num_cores), /*vocab_size=*/0);
     model->configure_moe_runtime(
         bufonly, addr, schunk, rchunk_requested,
         dense_soft_router, fp16_top4, routed_only, down_acc16);
@@ -4056,6 +4118,11 @@ int64_t rpu_lingbot_v2_moe_create(
 
 void rpu_lingbot_v2_moe_destroy(int64_t handle) {
     LingbotV2MoeRegistry::destroy(handle, "rpu_lingbot_v2_moe_destroy");
+}
+
+std::vector<int64_t> rpu_lingbot_v2_moe_get_execution_topology(int64_t handle) {
+    return LingbotV2MoeRegistry::get(handle, "rpu_lingbot_v2_moe_get_execution_topology")
+        ->execution_topology();
 }
 
 // Mandatory setter order (V1 precedent): base set_weights -> set_moe_weights.
@@ -4257,6 +4324,13 @@ void v3::LingbotV2MoeExpertModel::set_base_scales(
     const bool hq = chk(q_ws, "q"), hk = chk(k_ws, "k"), hv = chk(v_ws, "v"), ho = chk(o_ws, "o");
     const bool hg = chk(gate_ws, "shared_gate"), hu = chk(up_ws, "shared_up"),
                hd = chk(down_ws, "shared_down");
+    // The reduced child admits only a uniform int8 install (rpu_qwen3_model.h),
+    // so every attention and shared-expert role carries a scale.
+    TORCH_CHECK(num_cores() == 8 ||
+                    (hq && hk && hv && ho && hg && hu && hd &&
+                     layer_weights_[0].q_w.scalar_type() == at::kChar),
+                "reduced-core LingBot2 base W8A16 requires all seven scale lists "
+                "for a uniform int8 install");
     sparse_qkv_multibase_mode_ = 0;
     sparse_down_ordered_combine_ = false;
     sparse_shared_gate_up_ = false;

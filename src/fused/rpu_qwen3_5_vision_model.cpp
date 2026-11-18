@@ -1,3 +1,4 @@
+#include "rpu_g05_linear_contracts.h"
 // rpu_qwen3_5_vision_model.cpp — Qwen3.5 Vision Encoder (Option 2, deepstack
 // removed). See rpu_qwen3_5_vision_model.h for architecture/scope. A profile-sized
 // bidirectional ViT run as a KV_FIRST two-phase pass: Phase 1 inserts all K/V +
@@ -356,6 +357,10 @@ int64_t Qwen3_5VisionModel::subclass_layout_hash() const {
         for (const int value : {num_cores(), attn_tp(), mlp_tp(), 8}) {
             hash = detail::layout_mix(hash, value);
         }
+        // Four-lane G05 W8 uses the generic scaled launches; FP16 keeps its identity.
+        if (!layer_weights_.empty() && layer_weights_.front().q_w.defined() &&
+            layer_weights_.front().q_w.scalar_type() == at::kChar)
+            hash = detail::layout_mix(hash, 0x4730355738ULL);
     }
     if (g05_qkv_spm_available_) {
         hash = detail::layout_mix(hash, G05_VISION_QKV_SPM_TRANSPORT_SITE);
@@ -1529,7 +1534,7 @@ void Qwen3_5VisionModel::emit_temporal_layer(int layer_idx) {
                 rpu_launch_eltwise_binary_Bx1xC_BxNxC_spm_kernel(
                     addr(0, "temporal_pe"), temporal_hidden,
                     temporal_hidden, frames, group, h,
-                    c10::Half(1.0f), ValuOpType::ADD, false);
+                    c10::Half(1.0f), ValuOpType::ADD, false, num_cores());
 
                 // Accumulate each [frames,group] result patch-group-major in
                 // SPM. One permute below restores frame-major spatial rows.
@@ -2669,11 +2674,13 @@ bool Qwen3_5VisionModel::consume_g05_qkv_spm_transport(
 }
 
 std::vector<int64_t> Qwen3_5VisionModel::g05_qkv_linear_arguments() const {
-    // Version, M/local N/K, TP, ACC bits, parent M/N/K tile, blocks per
-    // projection/total grid, byte row strides, owners, bias bytes, has bias.
-    if (g05_w8a16_) return {1,256,128,1024,8,linear_acc32_ ? 32 : 16,
-        linear_acc32_ ? 400 : 512,48,128,3,9,2048,256,3,256,1,8,3};
-    return {1,256,128,1024,8,32,352,64,128,2,6,2048,256,3,256,1};
+    const auto c = rpu_g05_linear::contract(g05_w8a16_
+        ? (linear_acc32_ ? KernelId::G05_VISION_QKV_W8A16_ACC32_M256N128K1024
+                         : KernelId::G05_VISION_QKV_W8A16_ACC16_M256N128K1024)
+        : KernelId::G05_VISION_QKV_FP16_ACC32_M256N128K1024);
+    return {2,256,128,1024,8,linear_acc32_ ? 32 : 16,c.m,c.n,c.k,c.gx/3,c.gx,
+            2048,256,3,256,1,8,g05_w8a16_ ? 3 : 0,c.gy,
+            2,32,40,20,34,42,4,36,44,6,38,46};
 }
 
 bool Qwen3_5VisionModel::consume_g05_qkv_linear(
@@ -2741,11 +2748,9 @@ bool Qwen3_5VisionModel::g05_k1_b3_schedule(const FmbThreeStageChunkPlan& plan) 
 }
 
 std::vector<int64_t> Qwen3_5VisionModel::g05_k1_b3_arguments() const {
-    // Version, K, B, rows/camera, combined rows, original dimensions/ACC;
-    // per-camera residual/fc1 byte strides; shared scratch; raw-only intent;
-    // FC2 inner tile/grid and unchanged parent retirement ABI.
-    return {1,1,3,256,768,1024,16,16,64,4096,8,16,524288,262144,
-            65536,131072,1,G05_VISION_KV_RAW_SPM_ONLY,256,80,128,13,1};
+    const auto c = rpu_g05_linear::contract(KernelId::G05_VISION_FC2_WEIGHT_OUTER_W8A16_ACC16_M768N1024K512);
+    return {2,1,3,256,768,1024,16,16,64,4096,8,16,524288,262144,
+            65536,131072,1,G05_VISION_KV_RAW_SPM_ONLY,c.m,c.n,c.k,c.gx,c.gy};
 }
 
 void Qwen3_5VisionModel::append_g05_k1_b3_routes(FmbPhysicalExecutionManifest& manifest) const {
@@ -2913,7 +2918,7 @@ std::vector<int64_t> Qwen3_5VisionModel::g05_k1_camera_group_arguments() const {
     // tile/grid; fixed M256 primitives still act on isolated camera slices.
     return {2,1,current_camera_batch_count_,256,rows,1024,16,16,64,4096,8,
             linear_acc32_ ? 32 : 16,524288,262144,65536,131072,1,
-            G05_VISION_KV_RAW_SPM_ONLY,tile.m_tile,tile.n_tile,128,
+            G05_VISION_KV_RAW_SPM_ONLY,tile.m_tile,tile.n_tile,tile.k_tile,
             (1024+tile.n_tile-1)/tile.n_tile,(rows+tile.m_tile-1)/tile.m_tile};
 }
 
@@ -3119,14 +3124,8 @@ void Qwen3_5VisionModel::prepare_g05_owner_ln() {
             const auto tile = linear_acc32_
                 ? rpu_pl_tiling::select_tile_acc32(cameras*256,1024,512,false)
                 : rpu_pl_tiling::select_tile_acc16(cameras*256,1024,512,false);
-            // The dispatcher's mapping helpers have internal linkage. This
-            // exact W8 camera profile admits only these canonical generated IDs;
-            // require the real selector to agree before publishing capability.
-            if (tile.m_tile != (linear_acc32_ ? 288 : 512) ||
-                tile.n_tile != (linear_acc32_ ? 80 : 48)) continue;
-            const auto kernel = linear_acc32_
-                ? KernelId::PL_AT_W8A16_ACC32_M288N80
-                : KernelId::PL_AT_W8A16_M512N48;
+            const auto kernel = parallel_linear_kernel_id(
+                rpu_pl_tiling::WeightType::Int8, linear_acc32_, tile);
             g05_k1_generated_group_available_[cameras-2] =
                 KernelCache::instance().is_initialized() &&
                 KernelCache::instance().get(kernel) != nullptr;
@@ -3191,8 +3190,16 @@ ModelStaticConfig Qwen3_5VisionModel::static_config() {
     // preloads, STEP0, tower and merger even when their host emission is skipped.
     // FMB permits the skip only on REPLAY with the matching physical manifest;
     // standalone output cloning remains after capture in the Python caller.
-    cfg.fast_replay_skip_layer_loop = has_temporal_ || g05_k1_fast_replay || is_g05_k1_b3_profile() || is_g05_k1_camera_group_profile();
-    cfg.fast_replay_skip_preload = has_temporal_ || g05_k1_fast_replay || is_g05_k1_b3_profile() || is_g05_k1_camera_group_profile();
+    // The opt-in keeps the K1 call boundary: one frame, one 256-patch camera,
+    // STEP0 and merger, ordinary dispatch. Its stream differs from K1 only in
+    // tower width and routes, and every per-call address it reads is one of the
+    // refreshed bases.
+    const bool requested_fast_replay = fast_replay_requested_ && !has_temporal_ &&
+        !z2_bound_ && !get_debug_export() && has_step0_ && has_merger_ &&
+        current_temporal_num_frames_ == 1 && current_camera_batch_count_ == 1 &&
+        !current_compact_step0_ && current_output_patches_ == 256;
+    cfg.fast_replay_skip_layer_loop = has_temporal_ || g05_k1_fast_replay || is_g05_k1_b3_profile() || is_g05_k1_camera_group_profile() || requested_fast_replay;
+    cfg.fast_replay_skip_preload = has_temporal_ || g05_k1_fast_replay || is_g05_k1_b3_profile() || is_g05_k1_camera_group_profile() || requested_fast_replay;
 
     // KV_FIRST 双向分块两相（照 rpu_gemma_model.cpp）：Phase1 把全量 KV 插满 + 存 rope 后 Q，
     // Phase2 逐 query chunk 对全量 KV 做 SDPA + MLP。
@@ -4150,6 +4157,13 @@ void Qwen3_5VisionModel::set_gelu_erf_ultra(bool enabled) {
     invalidate_model_state();
 }
 
+void Qwen3_5VisionModel::set_fast_replay(bool enabled) {
+    TORCH_CHECK(get_last_resolved_chunk_size() == 0,
+                "qwen3_5_vision_set_fast_replay must be called before the first forward");
+    fast_replay_requested_ = enabled;
+    invalidate_model_state();
+}
+
 void Qwen3_5VisionModel::set_high_precision(bool enabled) {
     constexpr const char* operation = "qwen3_5_vision_set_high_precision";
     RpuExecutionCoordinator::require_graph_quiescent(operation);
@@ -4255,6 +4269,13 @@ void Qwen3_5VisionModel::set_weights(
     check_list(fc1_b_list, "fc1_b_list");
     check_list(fc2_b_list, "fc2_b_list");
 
+    // Four lanes admit uniform W8A16 projections only on the exact G05 2B
+    // tower; their FP16 [N] scales arrive later through set_weight_scales.
+    const bool reduced_w8 = num_cores() != 8 && q_w_list[0].defined() &&
+                            q_w_list[0].scalar_type() == at::kChar;
+    TORCH_CHECK(!reduced_w8 || (N == 24 && num_heads == 16 && head_dim == 64 &&
+                                hidden_size == 1024 && intermediate_size == 4096),
+                "Reduced Qwen3.5 Vision W8 requires the exact G05 2B tower");
     auto check_rank = [&](const at::TensorList& list, const char* name, int64_t r) {
         for (int64_t i = 0; i < N; i++) {
             TORCH_CHECK(list[i].defined(),
@@ -4263,7 +4284,8 @@ void Qwen3_5VisionModel::set_weights(
                         "qwen3_5_vision_set_weights: ", name, "[", i, "] must be ",
                         r, "D, got ", list[i].dim(), "D");
             if (num_cores() != 8) {
-                TORCH_CHECK(list[i].scalar_type() == at::kHalf &&
+                TORCH_CHECK(list[i].scalar_type() ==
+                                    (reduced_w8 && r == 2 ? at::kChar : at::kHalf) &&
                                 list[i].device().type() == at::kPrivateUse1 &&
                                 list[i].is_contiguous(),
                             "Reduced Qwen3.5 Vision weights must be contiguous FP16 device tensors");
@@ -4351,8 +4373,9 @@ void Qwen3_5VisionModel::set_weight_scales(
     at::TensorList q, at::TensorList k, at::TensorList v,
     at::TensorList o, at::TensorList fc1, at::TensorList fc2) {
     TORCH_CHECK(get_last_resolved_chunk_size() == 0 &&
-        !gelu_erf_ultra_ && !moe_precision_ && !has_temporal_ && num_cores() == 8 &&
-        attn_tp() == 8 && mlp_tp() == 8 && num_layers() == 24 &&
+        !gelu_erf_ultra_ && !moe_precision_ && !has_temporal_ &&
+        ((num_cores() == 8 && attn_tp() == 8 && mlp_tp() == 8) ||
+         (num_cores() == 4 && attn_tp() == 4 && mlp_tp() == 4)) && num_layers() == 24 &&
         hidden_size() == 1024 && intermediate_size() == 4096 &&
         num_q_heads() == 16 && num_kv_heads() == 16 && head_dim() == 64 &&
         orig_head_dim_ == 64 && eps_ == 1e-6 && layer_weights_.size() == 24,
@@ -4696,6 +4719,11 @@ void rpu_qwen3_5_vision_set_high_precision(int64_t handle, bool enabled) {
 void rpu_qwen3_5_vision_set_gelu_erf_ultra(int64_t handle, bool enabled) {
     Qwen3_5VisionRegistry::get(handle, "rpu_qwen3_5_vision_set_gelu_erf_ultra")
         ->set_gelu_erf_ultra(enabled);
+}
+
+void rpu_qwen3_5_vision_set_fast_replay(int64_t handle, bool enabled) {
+    Qwen3_5VisionRegistry::get(handle, "rpu_qwen3_5_vision_set_fast_replay")
+        ->set_fast_replay(enabled);
 }
 
 void rpu_qwen3_5_vision_destroy(int64_t handle) {

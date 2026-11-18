@@ -38,7 +38,7 @@ def _program():
 #include <vector>
 #include "core/rpu_spm_allocator.h"
 #define TORCH_CHECK(x, ...) do {if(!(x))throw std::runtime_error(#x);}while(0)
-#define TORCH_INTERNAL_ASSERT(x, ...) TORCH_CHECK(x, __VA_ARGS__)
+#define TORCH_INTERNAL_ASSERT(x) assert(x)
 #define DWIDTH 2
 #define NUM_CORES 8
 #define SDPA_MAX_VLM_SIZE 400
@@ -82,6 +82,7 @@ struct Watermarks {int64_t free=0,temporary=0;
     code += r'''
 class FusedModelBase {public:
  struct Impl{bool persistent_allocated_=false;}impl; Impl* pimpl_=&impl;
+ int64_t minimum_eager_spm_bytes()const{return 0;}
  bool declared_spm_layout_fits(const std::vector<BufferDecl>&)const;
 };
 '''
@@ -92,10 +93,10 @@ class FusedModelBase {public:
     code += r'''
 class CausalDecoderModel:public FusedModelBase {public:
  int64_t h=1024,nq=16,nkv=8,hd=128,inter=2048,layers=32;
- bool lingbot_folded_rmsnorm_=false,lingbot_prefill_kv_only_=false;
- bool lingbot_prefill_deepstack_reuses_down(const LayoutContext&) const {return false;}
  bool wall_prefill_staged_mlp_=false,decode_gate_up_fusion_=false,prefill_packed_gate_up_strided_=false;
  bool qwen3vl_multiview_text_dry_prepared_=false,qwen3vl_multiview_text_composite_prepared_=false;
+ bool lingbot_folded_rmsnorm_=false,lingbot_prefill_kv_only_=false;
+ bool lingbot_prefill_deepstack_reuses_down(const LayoutContext&)const{return false;}
  int qwen3vl_pooler_z1_retained_deepstack_count_=0;
  bool adarms_mutable_=false,adarms_fused_bcast_enabled_=false,adarms_=false;
  bool has_qk_norm_=true,has_qkv_bias_=false,nvfp4_=false;
@@ -131,7 +132,9 @@ class HyVlaExpertModel:public CausalDecoderModel {public:
  bool cold_mask_once_=true,cold_kvpad16_=true,cold_rmsnorm_pad16_=true,unroll_mode_=true,exact_profile=true;
  int64_t action_dim_pad_=32;int action_mlp_cores_=8;
  at::Tensor gateup_resident_bundle_;
- int64_t resident_storage_bytes()const{return 6291456;}
+ int resident_fp8_scale_layers_=0,o_resident_layers_=0;
+ int gateup_resident_layers()const{return 24;}
+ int64_t resident_storage_bytes()const{return 6291456+resident_fp8_scale_layers_*32768;}
  bool gateup_resident_profile()const{return exact_profile;}
  bool sdpa_m16_enabled(int64_t,int64_t)const{return false;}
  bool sdpa_k128_enabled(int64_t,int64_t)const{return false;}
@@ -312,3 +315,51 @@ def test_hyvla_complete_mask_budget_and_frozen_schedule(tmp_path):
     result = subprocess.run([str(binary)], text=True, capture_output=True)
     assert result.returncode == 0, result.stderr
     print(result.stdout)
+
+
+def test_gu8_reuses_finished_sdpa_scratch_with_stable_three_owner_budget(tmp_path):
+    code = _program().split("int main(){", 1)[0]
+    code += r"""
+int main(){
+ using namespace v3;using Mode=FmbForwardOperandResidency;
+ HyVlaExpertModel m;m.nvfp4_=true;m.resident_fp8_scale_layers_=8;
+ LayoutContext l;l.chunk_size=51;l.planning_chunk_capacity=64;l.max_kv_seq_len=259;
+ l.num_layers=32;l.batch_size=1;l.use_attn_mask=true;l.is_causal=false;
+ for(int rows:{51,64}){
+  l.chunk_size=rows;auto d=m.declare_buffers(l);auto f=estimate_fixed_overhead(d);
+  assert(f.persistent==151296&&f.temp_per_layer==0);
+  assert(slot(d,"gateup_resident_weights").size==6553600);
+  assert(std::string(slot(d,"sdpa_tmp").alias_of)=="oproj");
+  assert(slot(d,"sdpa_tmp").size==0&&slot(d,"oproj").size==(rows==51?104448:131072));
+  assert(detail::estimate_temporary_total(d)==(rows==51?7055104:7086080));
+  for(bool warm:{false,true}){
+   // First action can have expert alone. Warm replay has all three owners;
+   // temporary buffers are recovered and Persistent is charged exactly once.
+   set_watermarks(m,warm?1059840:0,f.persistent,warm);
+   assert(final_chunk_layout_fits(d,warm));assert(m.mask_schedule_for_layout(l)==4);
+   if(warm)assert(available_temporary_spm_after_reset(d,warm)==7110912);
+   const auto threshold=SpmAllocator::SPM_USABLE-f.persistent-65536-detail::estimate_temporary_total(d);
+   set_watermarks(m,threshold,f.persistent,warm);assert(final_chunk_layout_fits(d,warm));
+   set_watermarks(m,threshold+256,f.persistent,warm);assert(!final_chunk_layout_fits(d,warm));
+  }
+  l.forward_operand_residency=Mode::FORWARD;
+  rejects([&]{m.declare_buffers(l);});rejects([&]{m.mask_schedule_for_layout(l);});
+  l.forward_operand_residency=Mode::UNSPECIFIED;
+ }
+ l.chunk_size=51;Context c;c.attention_mask->cols=259;c.manifest=manifest(51,208,4);uploads=0;
+ for(int body=0;body<10;++body){int before=uploads;c.body_iter=body;for(int layer=0;layer<32;++layer)emit_mask(m,c,layer);assert(uploads-before==1);}
+ assert(uploads==10);
+ m.nvfp4_=false;rejects([&]{m.declare_buffers(l);});m.nvfp4_=true;
+ m.o_resident_layers_=1;rejects([&]{m.declare_buffers(l);});
+}
+"""
+    compiler = shutil.which("g++")
+    if not compiler:
+        pytest.skip("host C++ compiler unavailable")
+    cpp, binary = tmp_path / "hyvla_gu8.cpp", tmp_path / "hyvla_gu8"
+    cpp.write_text(code)
+    result = subprocess.run([compiler, "-std=c++17", "-O0", "-I", str(ROOT / "src"),
+                             str(cpp), "-o", str(binary)], text=True, capture_output=True)
+    assert result.returncode == 0, result.stderr
+    result = subprocess.run([str(binary)], text=True, capture_output=True)
+    assert result.returncode == 0, result.stderr

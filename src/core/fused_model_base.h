@@ -41,6 +41,7 @@ class GraphKernelRegisterCensusGuard;
 class SdpaStableMaskCache;
 class KvInsertSegmentPlan;
 enum class KernelId : uint16_t;
+struct DeferredDmaChannels;
 
 namespace v3 {
 
@@ -173,9 +174,9 @@ struct FmbPreparedSpmCost {
     int64_t temp_per_layer = 0;
     int64_t temporary = 0;
     int64_t available(int64_t after_reset_free, bool persistent_allocated,
-                      int64_t planning_budget) const;
+                      int64_t planning_budget, int64_t minimum_eager_bytes = 0) const;
     bool fits(int64_t after_reset_free, bool persistent_allocated,
-              int64_t planning_budget) const;
+              int64_t planning_budget, int64_t minimum_eager_bytes = 0) const;
 };
 
 // Cache pure allocator planning, not an admission result or live resource
@@ -487,6 +488,8 @@ inline constexpr int64_t FMB_SHARED_LAYER_INPUT_DMA_SITE =
     8256462186627229745LL;
 inline constexpr int64_t FMB_SHARED_LAYER_INPUT_ROW_RUN_DMA_SITE =
     7164742071837285576LL;
+inline constexpr int64_t FMB_SHARED_LAYER_INPUT_SCATTER_DMA_SITE =
+    0x464d4253494e444dLL;
 inline constexpr int64_t FMB_SHARED_PIPELINE_INGRESS_DMA_SITE =
     1763009975491617456LL;
 inline constexpr int64_t FMB_SHARED_MLP_AUTO_TILE_SITE =
@@ -515,11 +518,13 @@ enum FmbSharedRuntimeRouteMask : uint32_t {
     FMB_SHARED_MLP_RING_REDUCE = 1U << 7,
     FMB_SHARED_MLP_PREPARE_INPUT = 1U << 8,
     FMB_SHARED_MLP_GEMV = 1U << 9,
+    FMB_SHARED_LAYER_INPUT_SCATTER_DMA = 1U << 10,
 };
 
 enum class FmbSharedMutableDmaRouteSelector : int64_t {
     DDR_BROADCAST_TO_SPM = 1,
     CANONICAL_DDR_BROADCAST_TO_SPM_MUTABLE_SRC = 2,
+    DDR_SCATTER_TO_SPM = 3,
 };
 
 enum class FmbSharedAllReduceRouteSelector : int64_t {
@@ -665,12 +670,25 @@ private:
 // One native-feasible point in the bounded A6 stage domain. Chunk values are
 // capacities (so a one-chunk tail may be shorter); the complete physical
 // schedules remain owned by FmbThreeStageChunkPlan.
+enum class FmbPrefillRankingPolicy : int64_t {
+    LEGACY = 0,
+    OUTER_THEN_MIXER_V1 = 1,
+    OUTER_THEN_MIXER_LARGER_WINDOW_V2 = 2,
+};
+
+struct FmbPrefillRanking {
+    FmbPrefillRankingPolicy policy = FmbPrefillRankingPolicy::LEGACY;
+    // Actual internal calls across all compute windows, once per layer.
+    int64_t mixer_calls = 0;
+};
+
 struct FmbPrefillStageCandidate {
     int64_t input_chunk_size = 0;
     int64_t qkv_chunk_size = 0;
     int64_t compute_chunk_size = 0;
     FmbThreeStageChunkPlan stage_plan;
     FmbPhysicalExecutionManifest physical_manifest;
+    FmbPrefillRanking ranking;
 };
 
 namespace detail {
@@ -680,6 +698,9 @@ bool fmb_prefill_stage_candidate_less(
 bool fmb_prefill_stage_candidate_same_identity(
     const FmbPrefillStageCandidate& lhs,
     const FmbPrefillStageCandidate& rhs);
+// Structural AUTO rank; hardware cost certificates remain Python-owned.
+std::vector<uint64_t> fmb_prefill_stage_candidate_score(
+    const FmbPrefillStageCandidate& candidate);
 }  // namespace detail
 
 // Versioned int-only descriptor used at the Python/C++ planning boundary.
@@ -689,6 +710,8 @@ bool fmb_prefill_stage_candidate_same_identity(
 // span, boundary policy, mode, and the native stage-plan fingerprint. V2/V3
 // append a separately fingerprinted physical manifest (V3 adds invocation);
 // V1 remains decode-only compatibility and yields an UNSPECIFIED manifest.
+// V4 retains V3 and appends the opt-in ranking policy and actual mixer count.
+// Default owners continue to emit V3; full descriptor identity binds ranking.
 std::vector<int64_t> encode_fmb_prefill_stage_candidate(
     const FmbPrefillStageCandidate& candidate);
 FmbPrefillStageCandidate decode_fmb_prefill_stage_candidate(
@@ -1307,6 +1330,11 @@ protected:
     // as actual allocation. Runtime must validate its selected descriptor,
     // never use this query to select a replacement schedule.
     bool declared_spm_layout_fits(const std::vector<BufferDecl>& declarations) const;
+    // Cold physical free-space floor for an eager consumer after this owner's
+    // forward. No allocation is made here. Return aligned bytes and include a
+    // nonzero value in the owner's layout/cost identity. Default preserves the
+    // existing planning budget and 64 KiB physical out-of-band reserve.
+    virtual int64_t minimum_eager_spm_bytes() const { return 0; }
     virtual FmbForwardOperandResidency physical_forward_operand_residency(
         const FmbPhysicalExecutionManifest& /*manifest*/) const {
         return FmbForwardOperandResidency::UNSPECIFIED;
@@ -1582,6 +1610,12 @@ protected:
         FmbPrefillStageCandidate& /*candidate*/, const LayoutContext& /*layout*/,
         int64_t /*site_id*/, int64_t /*invocation*/,
         const KvInsertSegmentPlan& /*plan*/) const {}
+
+    // Explicit model-owned opt-in, after the immutable schedule is produced.
+    // The default preserves all existing owners' structural ranking.
+    virtual FmbPrefillRanking prefill_candidate_ranking(
+        const FmbPrefillStageCandidate& /*candidate*/,
+        const LayoutContext& /*layout*/) const { return {}; }
 
     // Planning-only query for adapters that must shape input before dispatch.
     // Uses the same exact SPM and model validator path as run_all_layers().
@@ -1866,9 +1900,17 @@ protected:
         int64_t row_count,
         const char* dst_buf = "residual1");
     void require_spm_pipeline_composite_consumer_physical_authority() const;
+    // With `deferred`, the copy runs on allocated nonzero DMA channels behind a stream-0
+    // barrier (see rpu_launch_spm_copy_ddr_dma); the caller joins the token
+    // before anything overwrites the source or reads the destination.
+    // `source_replicated` asserts every core's `src_buf` holds the same bytes
+    // (an all-gather output); the runs then read the allocated nonzero cores, and the join
+    // must precede a writer on any core.
     void emit_layer_output_dma(int layer_idx, const ChunkInfo& chunk,
                                const char* src_buf = "residual1",
-                               uint32_t src_offset_bytes = 0);
+                               uint32_t src_offset_bytes = 0,
+                               DeferredDmaChannels* deferred = nullptr,
+                               bool source_replicated = false);
     // DDR scratch at the current layer's ping-pong output side. Unlike
     // emit_layer_output_dma(), this never redirects the last layer to the final
     // output tensor. Multi-stage layer implementations use the pair to spill an
@@ -1876,6 +1918,17 @@ protected:
     // layer output with emit_layer_output_dma().
     void emit_layer_chain_scratch_store(int layer_idx, const ChunkInfo& chunk,
                                         const char* src_buf);
+    // Reload that same output-side owner into an independent SPM row tile.
+    // The Tensor-owned DMA keeps the registry allocation alive during replay.
+    void emit_layer_chain_scratch_load(int layer_idx, const ChunkInfo& chunk,
+                                      const char* dst_buf);
+    // Each core receives its contiguous row shard of a residual segment.
+    // Input side uses caller-owned mutable DDR at layer 0, then the previous
+    // layer's stable ping-pong output. Scratch side always uses this layer's
+    // intermediate output owner, including on the final layer.
+    void emit_layer_residual_shard_load(int layer_idx, const ChunkInfo& chunk,
+                                       const char* dst_buf,
+                                       bool scratch_output_side = false);
     // Registry-stable DDR addresses backing DDR_PINGPONG. These are for
     // kernels that consume DDR directly; layer 0's caller-owned input is not
     // stable and is intentionally rejected by stable_layer_input_ddr_ptr().
@@ -1947,6 +2000,7 @@ protected:
     virtual DecoderExecutionTopology resolve_model_execution_topology(
         int64_t num_q_heads, int64_t num_kv_heads, int64_t head_dim,
         int64_t hidden_size, int64_t intermediate_size) const;
+    virtual int64_t resolve_model_mlp_intermediate_size(int64_t logical_size) const;
     void set_model_params(int64_t num_q_heads, int64_t num_kv_heads,
                           int64_t head_dim, int64_t hidden_size,
                           int64_t intermediate_size);

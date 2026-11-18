@@ -4,10 +4,12 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
-import tomllib
 from pathlib import Path
 
 import pytest
+
+from _example_toml import load_example_toml
+from _support_status import expected_support_status
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -312,7 +314,8 @@ def test_unsupported_capacity_fails_before_loading_or_allocating(capacity):
 @pytest.mark.parametrize("installed,position", [(512, 512), (16384, 16384)])
 def test_decode_cannot_exceed_installed_kv_capacity(monkeypatch, installed, position):
     from types import SimpleNamespace
-    from rpu_backend.adapters.qwen3_5.cores import core_topology, topology_tuple
+    from rpu_backend.adapters.qwen3_5.cores import topology_tuple
+    from rpu_backend.adapters.qwen3_5_moe.cores import core_topology, full_topology_tuple
     from rpu_backend.adapters.qwen3_5_moe import text
 
     topology = core_topology({"model": {"num_cores": 8}})
@@ -320,6 +323,7 @@ def test_decode_cannot_exceed_installed_kv_capacity(monkeypatch, installed, posi
                             chunk_envelope=text._qwen3_5_moe_prefill_envelope(40, 2048, installed))
     owner = SimpleNamespace(_rpu_qwen3_5_moe=state)
     cache = SimpleNamespace(execution_topology=topology_tuple(topology),
+                            moe_execution_topology=full_topology_tuple(topology),
                             position=position, max_seq_len=16384)
     monkeypatch.setattr(text, "_qwen35_moe_retirement_ready", lambda value: value is state)
     with pytest.raises(ValueError, match="KV/rotary capacity"):

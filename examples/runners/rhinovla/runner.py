@@ -28,6 +28,15 @@ def _rhinovla_precision_profile(config):
     return _RHINOVLA_RTC_PROFILES.get(profile_id, profile_id)
 
 
+def _stage_boundaries(policy):
+    """Vision, Prefill and Denoise calls of the RPU pipeline; a caller runtime without them stays untimed."""
+    runtime = getattr(policy, "runtime", None)
+    stages = (("vision", "_vision"), ("prefill", "_prefill"), ("denoise", "_denoise"))
+    if all(callable(getattr(runtime, name, None)) for _, name in stages):
+        return tuple((stage, runtime, name) for stage, name in stages)
+    return ()
+
+
 def _rhinovla_quantization(config):
     """Bind example precision without importing the backend or loading weights."""
     inputs = config["input"]
@@ -57,9 +66,42 @@ def _rhinovla_quantization(config):
         raise ValueError("RhinoVLA full-pipeline profile requires both explicit W8 opt-ins")
     return {"expert_w8a16": expert, "full_w8a16": full}
 
+_V3_SOURCE_KEYS = frozenset({"source_dir", "checkpoint", "fixture", "trust_model_code", "num_steps"})
+_W8_SWITCHES = ("RPU_RHINOVLA_EXPERT_W8A16", "RPU_RHINOVLA_FULL_W8A16")
+
+
+def validate_v3_source_config(config):
+    """Check a v3 source entry (pinned source, checkpoint and CPU fixture)."""
+    inputs = config["input"]
+    if set(inputs) - _V3_SOURCE_KEYS:
+        raise ValueError(f"unsupported RhinoVLA v3 source fields: {sorted(set(inputs) - _V3_SOURCE_KEYS)}")
+    for key in ("source_dir", "checkpoint", "fixture"):
+        if not isinstance(inputs.get(key), str) or not inputs[key].strip():
+            raise ValueError(f"RhinoVLA v3 source requires a nonempty {key} path")
+    if inputs.get("trust_model_code") is not True:
+        raise ValueError("RhinoVLA v3 source requires explicit trust_model_code=true")
+    if type(inputs.get("num_steps", 10)) is not int or inputs.get("num_steps", 10) != 10:
+        raise ValueError("RhinoVLA v3 source requires num_steps=10")
+    expected = _v3_source_quantization(config)
+    if config["example"].get("dtype") != ("w8a16" if expected["expert_w8a16"] else "fp16"):
+        raise ValueError("RhinoVLA v3 source precision must match its W8A16 switches")
+
+
+def _v3_source_quantization(config):
+    """Expert/full W8 selection named by the profile's pinned switches."""
+    opt_in = config["example"].get("opt_in", {})
+    if any(opt_in.get(name) not in ("0", "1") for name in _W8_SWITCHES):
+        raise ValueError("RhinoVLA v3 source must pin both W8A16 switches to \"0\" or \"1\"")
+    full = opt_in["RPU_RHINOVLA_FULL_W8A16"] == "1"
+    return {"expert_w8a16": full or opt_in["RPU_RHINOVLA_EXPERT_W8A16"] == "1", "full_w8a16": full}
+
+
 def validate_rhinovla_config(config):
     """Reject invalid factory input before importing Torch or opening assets."""
     inputs = config["input"]
+    if "source_dir" in inputs:
+        validate_v3_source_config(config)
+        return
     allowed = {"checkpoint", "runtime_factory", "factory_config", "request",
                "trust_model_code", "num_steps", *_RHINOVLA_QUANT_KEYS}
     if set(inputs) - allowed:
@@ -180,6 +222,7 @@ def _factory(runner):
         rpu_execution=config.get("rpu_execution"),
     )
     runner.owner = policy
+    runner.stage_boundaries = _stage_boundaries(policy)
     if any(name in inputs or name in factory_config for name in _RHINOVLA_QUANT_KEYS):
         _confirm_rhinovla_quantization(
             policy, quantization,
@@ -216,13 +259,59 @@ def _official(runner):
         rpu_execution=config.get("rpu_execution"),
     )
     runner.owner = policy
+    runner.stage_boundaries = _stage_boundaries(policy)
     request = {"x0": fixture["noise"], "state": fixture["state"].unsqueeze(0),
                "state_mask": fixture["state_mask"].unsqueeze(0),
                "action_mask": fixture["action_mask"].view(1, 1, -1)}
     return lambda: policy.predict(**request)
 
 
+
+def _v3_source(runner):
+    """Build the pinned v3 runtime as validate_v3.py does; time fixture case 0."""
+    from pathlib import Path
+    from rpu_backend.api import RhinoVLAPolicy
+    from rpu_backend.adapters.rhinovla.factory import V3_CHECKPOINT_SHA256, V3_SOURCE_SHA
+
+    config, inputs = runner.source_config, runner.source_config["input"]
+    validate_v3_source_config(config)
+    quantization = _v3_source_quantization(config)
+    fixture = _load_mapping(inputs, "fixture")
+    if fixture.get("metadata") != {
+        "source_commit": V3_SOURCE_SHA, "checkpoint_sha256": V3_CHECKPOINT_SHA256,
+        "dtype": "float32", "steps": inputs.get("num_steps", 10), "rtc": False,
+        "action_dim": 96, "action_horizon": 30,
+    }:
+        raise ValueError("RhinoVLA v3 fixture does not match the pinned steps_150000 non-RTC source")
+    case = fixture["cases"][0]
+    policy = RhinoVLAPolicy.from_factory(
+        "rpu_backend.adapters.rhinovla.factory:v3_runtime_factory",
+        {"model_root": Path(inputs["source_dir"]).expanduser(),
+         "checkpoint": Path(inputs["checkpoint"]).expanduser(),
+         "qin": {key: value.clone() for key, value in case["qwen_inputs"].items()},
+         "steps": inputs.get("num_steps", 10), "trust_model_code": True, **quantization},
+        rpu_execution=config.get("rpu_execution"),
+    )
+    runner.owner = policy
+    runner.stage_boundaries = _stage_boundaries(policy)
+    _confirm_v3_source_quantization(policy.runtime, quantization)
+    return lambda: policy.predict(**case["request"])
+
+
+def _confirm_v3_source_quantization(runtime, expected):
+    """Inspect the installed expert as validate_v3.py does, not the requested label."""
+    from rpu_backend.adapters.rhinovla.convert import _gather_expert_scales
+    from rpu_backend.adapters.rhinovla.precision import full_w8_inventory
+
+    if bool(_gather_expert_scales(runtime.er)) is not expected["expert_w8a16"]:
+        raise ValueError("RhinoVLA v3 source expert precision does not match the selected profile")
+    if expected["full_w8a16"]:
+        full_w8_inventory(runtime)
+
+
 def prepare(runner):
+    if "source_dir" in runner.source_config["input"]:
+        return _v3_source(runner)
     if "runtime_factory" in runner.source_config["input"]:
         validate_rhinovla_config(runner.source_config)
         return _factory(runner)

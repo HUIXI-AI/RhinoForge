@@ -13,7 +13,7 @@ def _gr00t(runner):
     dtype = config["example"].get("dtype")
     if dtype not in {"fp16", "w8a16"}:
         raise ValueError("GR00T example requires explicit fp16 or w8a16 dtype")
-    three_camera_config = validate_config(config)
+    geometry_config = validate_config(config)
     observation = _load_mapping(inputs, "observation")
     # Existing benchmark archives wrap the same tensor mapping in inputs/meta.
     # Geometry and text length below are checked against tensors, not metadata.
@@ -32,7 +32,7 @@ def _gr00t(runner):
         inputs.get("qwen3vl_registry_alias"),
         label="[input].qwen3vl_registry_alias",
     )
-    if three_camera_config:
+    if geometry_config:
         from transformers import AutoTokenizer
         validate_observation(config, observation, AutoTokenizer.from_pretrained(str(qwen3vl)))
         import torch
@@ -61,11 +61,29 @@ def _gr00t(runner):
         else:
             os.environ["RPU_GR00T_W8A16"] = previous
     runner.owner = runtime
-    return lambda: runtime.get_action(
+    runner.stage_boundaries = (("backbone", runtime, "_backbone"), ("vl", runtime, "_vl_encode"),
+                               ("denoise", runtime, "_denoise"))
+    geometry = {"input_ids_shape": list(observation["input_ids"].shape)}
+    for _key in ("pixel_values", "pixel_values_videos", "attention_mask", "mm_token_type_ids"):
+        _val = observation.get(_key)
+        if _val is not None and hasattr(_val, "shape"):
+            geometry[_key + "_shape"] = list(_val.shape)
+    for _key in ("image_grid_thw", "video_grid_thw"):
+        if observation.get(_key) is not None:
+            geometry[_key] = observation[_key]
+    runner.input_geometry = geometry
+    runner.input_geometry.update(state_shape=list(observation["state"].shape),
+        prefix_rows=prefix_rows, max_prefix_len=max_prefix_len,
+        num_steps=inputs.get("num_steps", 4), embodiment_id=inputs.get("embodiment_id", 20))
+    if geometry_config:
+        runner.input_geometry["validated_geometry"] = {key: inputs[key]
+            for key in ("cameras", "image_size", "text_tokens", "action_horizon")}
+    call = lambda: runtime.get_action(
         dict(observation),
         seed=inputs.get("seed", 0),
         num_steps=inputs.get("num_steps", 4),
     )
+    return call
 
 
 prepare = _gr00t

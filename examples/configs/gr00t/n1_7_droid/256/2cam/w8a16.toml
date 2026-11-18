@@ -1,0 +1,53 @@
+# 未写出的执行参数（省略即按以下值运行）：
+#   rpu_execution.model.num_cores 固定 8 核（可显式写 8；4/6 核不支持，原因见模型页配置表）。
+#   分块（chunk_size）模板未写出，按 auto 由入口选择；2026-10-19 模板默认输入实测：vision 512、prefill 272、action 48。可调范围见模型页。
+# GR00T-N1.7 两路相机模板，按精度和输入选择已有优化。
+# 说明见 ../../../README.md；text_tokens 与 observation 必须一起修改。
+# 实测耗时与验证范围见 docs/model_performance/gr00t/n1_7_droid.md。
+[model]
+profile_id = "gr00t-n1d7-3b.w8a16.vla"
+registry_alias = "gr00t-n1d7-3b"
+target = "gr00t"
+precision = "w8a16"
+qwen3vl_registry_alias = "qwen3-vl-2b"
+
+[input]
+# 替换为匹配下列输入形状的文件；固定 fixture 须保留其身份与格式。
+observation = "/path/to/gr00t_2cam_256_t128_observation.pt"
+# 224 图像允许 2 / 3；256 图像允许 1 / 2 / 3。
+cameras = 2
+# 可选 224 / 256；同时修改真实输入 tensor 与视觉执行参数。
+image_size = 256
+# 有效文本 token 数可选 32 / 64 / 128 / 160 / 192 / 224 / 256。
+text_tokens = 128                      # Pure instruction tokens: 32/64/128/160/192/224/256.
+# 当前模型路径的固定动作长度，须匹配 checkpoint。
+action_horizon = 40
+# 可选 4 / 10；action_horizon 保持 40。
+num_steps = 4
+# 动作头按该下标选取 embodiment 专用权重；省略为 20，只测过 20。observation 若带 embodiment_id 须与之相同。
+embodiment_id = 20
+# 固定随机种子；更改会改变输入噪声。
+seed = 0
+# max_prefix_len 按实际 observation 推算（16 对齐，最大 512）。
+
+[run]
+# 预热次数；不计入正式测量。
+warmup = 2
+# 正式执行次数，正整数。
+runs = 5
+# 按需开启硬件采样；保持 false 可减少测量干扰。
+hwperf = false
+# 按需开启 profiler；正式计时建议保持 false。
+profile = false
+# 随机种子，非负整数。
+seed = 0
+# 结果输出目录；并发运行使用不同目录。
+output_dir = "./gr00t_results/2cam/256/w8a16"
+
+# 各组件按 auto 规划，并按实际 SPM/DDR 容量准入。
+[rpu_execution]
+
+[cpu]
+# CPU intra-op 线程数，正整数；与 RPU 核数无关。
+# 省略时不设置线程：PyTorch 使用环境变量 OMP_NUM_THREADS，未设置时使用全部 CPU 核（参考板 24）；2026-10-19 测量环境预设为 16。
+threads = 8

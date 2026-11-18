@@ -217,29 +217,61 @@ class RoutedInt4LayerSource:
         self.consumed = False
 
     def prepare(self, *, num_cores=8):
-        if num_cores != 8 or type(num_cores) is not int:
-            raise ValueError("Qwen3.5 routed INT4 requires TP8")
+        # Preserve the tuple interface; both callers use published N32K32.
+        projections = list(self.iter_prepared_projections(num_cores=num_cores))
+        return (*(item[1] for item in projections),
+                *(item[2] for item in projections), 6)
+
+    def iter_prepared_projections(self, *, num_cores=8):
+        """Yield one verified N32K32 projection plus metadata at a time.
+
+        No release occurs here. The installing caller releases the source only
+        after all owners and the rest of the layer upload successfully.
+        Shard identity is checked on context exit before each yield.
+        """
+        if type(num_cores) is not int or num_cores not in (4, 6, 8):
+            raise ValueError("Qwen3.5 routed INT4 requires TP4, TP6 or TP8")
         if self.consumed or self.checkpoint is None:
             raise ValueError("Qwen3.5 INT4 expert source was already consumed")
         checkpoint = self.checkpoint
         if (checkpoint.profile_id != self.profile_id or checkpoint.identity != self.identity):
             raise ValueError("INT4 expert source identity/profile changed after admission")
-        weights, scales = [], []
         for role in _ROLES:
             n, k = checkpoint.shape(role)
             partition = "row" if role == "down_proj" else "col"
+            physical_n, physical_k = n, k
+            if num_cores == 6:
+                if (k if partition == "row" else n) != 512:
+                    raise ValueError("Qwen3.5 reduced INT4 requires logical expert width 512")
+                if partition == "row":
+                    physical_k = 768
+                else:
+                    physical_n = 768
             keys = checkpoint.matrix_keys[self.layer][role]
             filenames = {checkpoint.tensor_shards[key]
                          for quartet in keys.values() for key in quartet.values()}
-            packed = torch.empty(checkpoint.num_experts, n * k // 2, dtype=torch.uint8)
+            from rpu_backend.quant.int4_pgrp_pack import w4_storage_shape
+            storage_n, storage_k = w4_storage_shape(
+                physical_n, physical_k, int(partition == "col"), num_cores)
+            packed = torch.empty(checkpoint.num_experts, storage_n * storage_k, dtype=torch.uint8)
             physical_scales = None
             with checkpoint.open_shards(filenames) as opened:
                 for expert in range(checkpoint.num_experts):
                     tensors = {suffix: opened[checkpoint.tensor_shards[key]].get_tensor(key)
                                for suffix, key in keys[expert].items()}
                     codes, logical_scales = checkpoint.decode_matrix(**tensors, n=n, k=k)
+                    if (physical_n, physical_k) != (n, k):
+                        padded = codes.new_full((physical_n, physical_k), 8)
+                        padded[:n, :k].copy_(codes)
+                        padded_scales = logical_scales.new_ones((physical_k // 128, physical_n))
+                        padded_scales[:k // 128, :n].copy_(logical_scales)
+                        codes, logical_scales = padded, padded_scales
                     physical, _group = runtime_group_scales(
-                        logical_scales, k=k, partition=partition, num_cores=num_cores)
+                        logical_scales, k=physical_k, partition=partition, num_cores=num_cores)
+                    # The native Down contract uses G64 for every core count.
+                    # Repeating G128 scale bits changes no quantized values.
+                    if partition == "row" and _group == 128:
+                        physical = physical.repeat_interleave(2, dim=0).contiguous()
                     if physical_scales is None:
                         physical_scales = torch.empty(
                             checkpoint.num_experts, *physical.shape, dtype=torch.float16)
@@ -247,12 +279,13 @@ class RoutedInt4LayerSource:
                         codes.unsqueeze(0), partition=partition, num_cores=num_cores)[0])
                     physical_scales[expert].copy_(physical)
                     del tensors, codes, logical_scales, physical
-            weights.append(packed)
-            # Group refinement above preserves checkpoint values. Only this
-            # final source-neutral step selects the installed REF metadata ABI.
-            scales.append(pack_grouped_uint4_metadata(
-                physical_scales, partition=partition, num_cores=num_cores))
-        return (*weights, *scales, 6)
+            # Both call paths reuse this metadata. Yield only after the shard
+            # identity guard has checked the complete projection.
+            metadata = pack_grouped_uint4_metadata(
+                physical_scales, partition=partition, num_cores=num_cores)
+            del physical_scales
+            yield role, packed, metadata
+            del packed, metadata
 
     def release(self):
         self.consumed = True

@@ -271,7 +271,6 @@ def test_z2_cancel_recovery_failure_keeps_first_cleanup_exception(monkeypatch):
 
 @pytest.mark.parametrize("fault", [None, 12])
 def test_partial_builder_preserves_original_exception_and_claim(monkeypatch, fault):
-    monkeypatch.setenv("RPU_LINGBOT2_ALLOW_UNVALIDATED", "1")
     saved = {}
     original = ValueError("original builder failure")
 

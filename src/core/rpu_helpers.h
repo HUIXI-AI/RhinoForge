@@ -116,7 +116,7 @@ inline uint32_t GetMhaAttnUnivVlmNeed(
 //   mode_bit: 0=aggressive, 1=conservative.
 // GraphCacheKey embeds kSdpaTilePolicyVersion so cache invalidates on any
 // algorithm change or mode flip.
-constexpr int kSdpaTilePolicyBase = 2;
+constexpr int kSdpaTilePolicyBase = 3;
 #ifdef RPU_SDPA_TILE_K_CONSERVATIVE_MODE
 constexpr int kSdpaTilePolicyMode = 1;
 #else
@@ -312,6 +312,40 @@ inline bool sdpa_try_compute_tiling(const SdpaConfig& cfg, int64_t seq_q,
         }
     }
     if (!tk_opt) return false;  // exhausted shrink iterations
+
+    // Halving tm can skip a legal LTM tile (for example 80 rows between
+    // 128 and 64). Preserve an existing legal tiling; only repair a sync
+    // product that the shared planner/launcher would otherwise reject.
+    if (cfg.attn_mask_type == 1 && seq_q > 176 && seq_q % 16 == 0
+            && cfg.num_cores > 0 && cfg.num_q_heads > 0
+            && cfg.num_q_heads % cfg.num_cores == 0
+            && cfg.num_kv_heads > 0) {
+        const int64_t q_per_core = cfg.num_q_heads / cfg.num_cores;
+        const int64_t kv_per_core = CeilDiv(cfg.num_kv_heads,
+                                          (int64_t)cfg.num_cores);
+        const int64_t gqa = q_per_core / kv_per_core;
+        const int64_t product = CeilDiv(seq_q, tile_m_v16 * 16) * gqa;
+        if (gqa > 0 && product > 8 && product % 8 != 0) {
+            for (int64_t candidate_m = sdpa_tile_m_v16_initial(seq_q);
+                    candidate_m >= 1; --candidate_m) {
+                if ((seq_q / 16) % candidate_m != 0) continue;
+                const int64_t candidate_product =
+                    (seq_q / (candidate_m * 16)) * gqa;
+                if (candidate_product > 8 && candidate_product % 8 != 0)
+                    continue;
+                if (cfg.max_sync_product > 0
+                        && candidate_product > cfg.max_sync_product)
+                    continue;
+                auto candidate_k = choose_tile_k(candidate_m, tile_n_v16,
+                                                 cfg.attn_mask_type,
+                                                 head_dim_v16);
+                if (!candidate_k) continue;
+                tile_m_v16 = candidate_m;
+                tk_opt = candidate_k;
+                break;
+            }
+        }
+    }
 
     const int64_t tile_k_v16 = *tk_opt;
 

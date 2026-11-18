@@ -19,7 +19,7 @@ def test_cli_dispatch_preserves_user_config_options(monkeypatch, tmp_path):
 
     config = tmp_path / "user.toml"
     config.write_text((EXAMPLES / "configs/qwen3/text/0_6b/fp16.toml").read_text().replace(
-        "runs = 3", "runs = 7"))
+        "runs = 5", "runs = 7"))
     seen = []
     monkeypatch.setattr(logging, "logging_session", lambda *a, **k: nullcontext())
     monkeypatch.setattr(cli, "_dispatch", lambda config, args: seen.append((config, args)) or 17)
@@ -35,7 +35,12 @@ def test_cli_symlink_keeps_prompt_relative_to_real_config(monkeypatch, tmp_path)
 
     actual = tmp_path / "inputs/config.toml"
     actual.parent.mkdir()
-    actual.write_text((EXAMPLES / "configs/qwen3_5/text/35b_a3b/fp8_e4m3_experts_attn_gdn_p4096_d4096.toml").read_text())
+    _base_toml = (EXAMPLES / "configs/qwen3_5/text/35b_a3b/fp8_e4m3_experts_attn_gdn.toml").read_text()
+    _base_toml = _base_toml.replace(
+        'prompt = "A compiler translates source code into executable instructions. Its main stages are"',
+        'prompt_file = "prefill_realtext.txt"\nprompt_sha256 = "' + "0" * 64 + '"\ninput_ids_sha256 = "' + "0" * 64 + '"\nprefill_tokens = 4096\nstop_on_eos = false',
+    ).replace("warmup = 2", 'warmup = 2\ntiming_mode = "forward_argmax"')
+    actual.write_text(_base_toml)
     alias = tmp_path / "config.toml"
     alias.symlink_to(actual)
     seen = []
@@ -80,9 +85,10 @@ def test_catalog_groups_nested_input_variants_without_executing_entries(example_
     assert {item[1] for item in catalog["api"][profile_id]} == {original, variant}
     public_paths = {item[1] for section in catalog.values()
                     for group in section.values() for item in group}
-    assert checker.CONFIGS / "pi05/2cam/fp16.toml" not in public_paths
+    assert checker.CONFIGS / "pi05/2cam/h50/fp16.toml" in public_paths
+    assert checker.CONFIGS / "pi05/2cam/h50/w8a16_action_nvfp4.toml" not in public_paths
     assert checker.CONFIGS / "wall_oss/sorting/fp16.toml" not in public_paths
-    assert checker.CONFIGS / "rhinovla/v3/controlled/fp16.toml" not in public_paths
+    assert checker.CONFIGS / "rhinovla/v3/controlled/fp16.toml" in public_paths
     for language in ("en", "zh"):
         rows = [line for line in checker.render(language, catalog).splitlines()
                 if f"`{profile_id}`" in line]
@@ -125,16 +131,15 @@ def test_config_index_includes_unregistered_templates_without_support_inheritanc
     assert "未登记；模型专用模板" in row("wall_oss/base/3cam/224/fp16.toml")
     assert "run.py" in row("hy_vla/3cam/fp16.toml")
     assert "12（运行器默认）" in row("hy_vla/3cam/fp16.toml")
-    fragment = row("rhinovla/v3/controlled/fp16.toml")
-    assert "独立验证片段" in fragment and "validate_rhinovla_v3.py" in fragment and "`--config`" in fragment
-    assert "SUPPORTED" not in fragment
+    controlled = row("rhinovla/v3/controlled/fp16.toml")
+    assert "受控验证" in controlled and "run.py" in controlled
+    assert "SUPPORTED" not in controlled
     assert "调用者 factory 模板" in row("rhinovla/v3/w8a16_action.toml")
-    assert "固定 P/D 复现" in row("qwen3_5/text/0_8b/fp16_p64_d4096.toml")
-    assert "SUPPORTED_LIMITED" in row("hy_embodied/umi/fp16.toml")
+    assert "SUPPORTED" in row("hy_embodied/umi/fp16.toml")
 
 
 @pytest.mark.parametrize("relative", [
-    "qwen3/text/4b/fp16.toml", "pi05/2cam/fp16.toml",
+    "qwen3/text/4b/fp16.toml", "pi05/2cam/h50/fp16.toml",
     "wall_oss/sorting/fp16.toml", "wall_oss/base/3cam/224/fp16.toml", "rhinovla/v3/controlled/fp16.toml",
 ])
 def test_catalog_validates_deep_public_and_custom_configs(example_catalog, relative):

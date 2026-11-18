@@ -133,24 +133,22 @@ def test_legacy_projection_banks_preserve_payload_and_owners(monkeypatch,tmp_pat
 
 
 @pytest.mark.parametrize("chunk",["auto",16,64])
-def test_exact_preflight_has_own_narrow_envelope(monkeypatch,chunk):
-    monkeypatch.setenv("QWEN3_VL_32B_ALLOW_GRAPH_BLOCKED","1")
+def test_exact_preflight_has_own_envelope(monkeypatch,chunk):
     adapter.Qwen3VLAdapter.preflight(config())
     adapter.Qwen3VLAdapter.preflight_execution(config(),{"prefill":{"chunk_size":chunk}})
-    assert text._LEGACY_32B_CONTROLLED_ENVELOPE==(0,64)
-    assert text._RUNTIME_QUANTIZED_32B_ENVELOPE==(0,64)
+    assert text._LEGACY_32B_CONTROLLED_ENVELOPE == (0, 64)
+    assert text._RUNTIME_QUANTIZED_32B_ENVELOPE == (0, 64)
 
 @pytest.mark.parametrize("chunk",[80,128,256])
 def test_wrong_chunk_early_reject(monkeypatch,chunk):
-    monkeypatch.setenv("QWEN3_VL_32B_ALLOW_GRAPH_BLOCKED","1")
     with pytest.raises(adapter.UnsupportedModelError,match="ceiling 64"):
         adapter.Qwen3VLAdapter.preflight_execution(config(),{"prefill":{"chunk_size":chunk}})
 
 @pytest.mark.parametrize("value",[None,"true","0"])
-def test_unchanged_optin_required(monkeypatch,value):
+def test_no_optin_required(monkeypatch,value):
     if value is None:monkeypatch.delenv("QWEN3_VL_32B_ALLOW_GRAPH_BLOCKED",raising=False)
     else:monkeypatch.setenv("QWEN3_VL_32B_ALLOW_GRAPH_BLOCKED",value)
-    with pytest.raises(adapter.UnsupportedModelError):adapter.Qwen3VLAdapter.preflight(config())
+    adapter.Qwen3VLAdapter.preflight(config())
 
 def meta_text(dtype=torch.int8):
     cfg=config().text_config;m=torch.nn.Module();m.config=cfg
@@ -167,7 +165,6 @@ def meta_text(dtype=torch.int8):
     return m,scales
 
 def test_exact_live_binding_and_independent_envelope(monkeypatch):
-    monkeypatch.setenv("QWEN3_VL_32B_ALLOW_GRAPH_BLOCKED","1")
     m,scales=meta_text();seen={}
     monkeypatch.setattr(text,"install_mrope_text_decoder_for_rpu",lambda m,**kw:seen.update(kw) or 1)
     assert text.install_qwen3_vl_text_for_rpu(m,scale_lists=scales,_legacy_32b_w8a16=True)==1
@@ -177,7 +174,6 @@ def test_exact_live_binding_and_independent_envelope(monkeypatch):
 
 @pytest.mark.parametrize("fault",['w4','scale_alias','scale_dtype','geometry','embed','both_profiles','tp4'])
 def test_reject_changed_live_binding_before_installer(monkeypatch,fault):
-    monkeypatch.setenv("QWEN3_VL_32B_ALLOW_GRAPH_BLOCKED","1")
     m,scales=meta_text(torch.uint8 if fault=='w4' else torch.int8);kw={}
     if fault=='scale_alias':scales[0][0]=scales[0][0].clone()
     elif fault=='scale_dtype':m.layers[0].self_attn.q_proj.weight_scale=scales[0][0]=scales[0][0].float()
@@ -203,14 +199,14 @@ from rpu_backend.tests.acceptance.test_qwen3_vl_install_lifecycle import install
 @pytest.mark.parametrize('failure',['claim','arena','post_poison'])
 def test_legacy_cold_arena_ownership_failure_boundary(install_runtime,monkeypatch,failure):
     import rpu_backend
-    monkeypatch.setenv('QWEN3_VL_32B_ALLOW_GRAPH_BLOCKED','1')
     model=_Model();model.config=config();state=install_runtime;released=[]
     # Tiny tensors test the real top-level lifecycle; exact shape/schema
     # admission is independently covered above and by the strict loader.
     monkeypatch.setattr(adapter,'_validate_qwen3_vl_32b_w8a16_model',lambda m:True)
     monkeypatch.setattr(adapter,'_release_live_instance',lambda m:released.append(m))
-    def arenas(*,graph_arena_count):
+    def arenas(*,graph_arena_count,execution_core_count):
         assert graph_arena_count==25
+        assert execution_core_count==8
         assert state['claims']==[model] and state['allocator_enabled']
         assert '_rpu_swizzle_started' not in vars(model)
         assert not any(e[0] in ('swizzle','rpu_allocation','install') for e in state['events'])

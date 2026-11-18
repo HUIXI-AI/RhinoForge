@@ -64,7 +64,7 @@ struct Qwen3_5VisionModel : FusedModelBase {
     double eps_=1e-6;
     bool linear_acc32_=true, gelu_erf_ultra_=false, moe_precision_=false,g05_w8a16_=false,g05_qkv_spm_available_=false;
     bool has_temporal_=false, has_rope_=true, has_step0_=true, has_merger_=true;
-    bool z2_bound_=false, debug=false, current_compact_step0_=false;
+    bool z2_bound_=false, debug=false, current_compact_step0_=false, fast_replay_requested_=false;
     int num_cores() const { return cores; }
     int attn_tp() const { return attn; }
     int mlp_tp() const { return mlp; }
@@ -191,6 +191,26 @@ int main() {
     graph.current=RpuKernelGraph::State::RECORDING;
     assert(actual_body_iterations(w8.static_config())==1);
     assert(actual_body_iterations(fp16.static_config())==1);
+
+    // The explicit opt-in extends the skip to another tower width (0.8B
+    // LIBERO), still only at the K1 call boundary.
+    auto small=v; small.layers=12; small.hidden=768; small.intermediate=3072; small.q=12; small.kv=12;
+    assert(!small.is_g05_k1_fast_replay_profile());
+    assert(!small.static_config().fast_replay_skip_layer_loop);
+    small.fast_replay_requested_=true;
+    assert(small.static_config().fast_replay_skip_layer_loop && small.static_config().fast_replay_skip_preload);
+    auto requested_excluded=[&](auto alter) {
+        auto other=small; alter(other); const auto c=other.static_config();
+        assert(!c.fast_replay_skip_layer_loop && !c.fast_replay_skip_preload);
+    };
+    requested_excluded([](auto& x){ x.z2_bound_=true; });
+    requested_excluded([](auto& x){ x.debug=true; });
+    requested_excluded([](auto& x){ x.has_step0_=false; });
+    requested_excluded([](auto& x){ x.has_merger_=false; });
+    requested_excluded([](auto& x){ x.current_temporal_num_frames_=2; });
+    requested_excluded([](auto& x){ x.current_camera_batch_count_=2; });
+    requested_excluded([](auto& x){ x.current_compact_step0_=true; });
+    requested_excluded([](auto& x){ x.current_output_patches_=128; });
 }
 '''
     for marker, value in (

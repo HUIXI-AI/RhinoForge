@@ -39,17 +39,18 @@ def export_catalog(*, commit=None):
     # Reuse the real validators, factory resolution and profile coverage checks.
     configs = examples.load_configs()
     catalog = examples.catalog(configs)
-    registered = {config_path: (entry, profile)
+    registered = {(config_path, profile["id"]): (entry, profile)
                   for group in catalog.values() for entries in group.values()
                   for entry, config_path, _, profile in entries}
     entry_point = examples._runtime_entry()
     aliases = examples.COMMON.registry_aliases()
     rows = []
     for path in sorted(examples.CONFIGS.rglob("*.toml")):
-        raw = tomllib.loads(path.read_text())
+        raw = examples.COMMON.normalize_config(tomllib.loads(path.read_text()))
         config = configs[path]
         metadata = examples.COMMON.example_metadata(config)
-        entry, profile = registered.get(path, (None, None))
+        profile_id = metadata.get("profile_id") if metadata else None
+        entry, profile = registered.get((path, profile_id), (None, None))
         if metadata:
             target = examples.COMMON.config_target(config)
             alias = metadata.get("registry_alias")

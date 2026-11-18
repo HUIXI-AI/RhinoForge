@@ -341,7 +341,8 @@ def _denoise_install_fixture(monkeypatch, cores, mode, *, fail_weights=False):
     model.paligemma_with_expert = SimpleNamespace(
         gemma_expert=SimpleNamespace(model=expert),
         paligemma=SimpleNamespace(model=SimpleNamespace(
-            language_model=SimpleNamespace(_rpu_cache=SimpleNamespace(max_seq_len=512)))))
+            language_model=SimpleNamespace(config=SimpleNamespace(num_key_value_heads=1),
+                                           _rpu_cache=SimpleNamespace(max_seq_len=512)))))
     model.action_in_proj = SimpleNamespace(out_features=1024,
         _rpu_w_num_cores_1=tensor, _rpu_bias=tensor)
     model.action_out_proj = SimpleNamespace(_rpu_w_num_cores_1=tensor, _rpu_bias=tensor)
@@ -389,6 +390,7 @@ def _denoise_install_fixture(monkeypatch, cores, mode, *, fail_weights=False):
 
     for name, callback in (
         ("create", create), ("set_execution_core_count", set_cores),
+        ("set_kv_source_heads", lambda handle, heads: events.append(("kv_heads", handle, heads))),
         ("set_weights", set_weights), ("get_execution_topology", get_topology),
         ("set_chunk_envelope", lambda handle, prefix, suffix: events.append(("envelope", handle, prefix, suffix))),
         ("set_chunk_size", lambda handle, chunk: events.append(("chunk", handle, chunk))),
@@ -403,10 +405,12 @@ def _denoise_install_fixture(monkeypatch, cores, mode, *, fail_weights=False):
 def test_actual_fused_denoise_install_binds_native_and_graph_policy(monkeypatch, cores, mode):
     adapter, model, policy, events, caches, _ = _denoise_install_fixture(monkeypatch, cores, mode)
     adapter._install_fused_denoise_handle(runtime_policy=policy)
-    assert events[0] == ("cache", {"runtime_policy": policy})
+    assert events[0] == ("cache", {"max_entries": 192, "runtime_policy": policy})
     assert events[1] == ("create", False)
     assert [event for event in events if event[0] == "cores"] == ([] if cores == 8 else [("cores", cores)])
     assert ("weights", cores) in events
+    kv_heads = [event for event in events if event[0] == "kv_heads"]
+    assert len(kv_heads) == 1 and events.index(kv_heads[0]) < events.index(("weights", cores))
     assert events[-2:] == [("envelope", 42, 512, 0), ("chunk", 42, 0)]
     resource = model._rpu_fused_denoise_retirement_state
     assert model._rpu_fused_denoise_handle == resource.handle == 42

@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+
+from rpu_backend.runtime.vision_position import canonical_vision_type
 import torch.nn as nn
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
@@ -107,7 +109,7 @@ def is_qwen3_vl_32b_w8a16_config(config) -> bool:
                 "silu", 1e-6,
             )
             and (
-                vision.model_type,
+                canonical_vision_type(vision, "qwen3_vl"),
                 int(vision.hidden_size),
                 int(vision.intermediate_size),
                 int(vision.depth),
@@ -149,7 +151,7 @@ def is_qwen3_vl_2b_w8a16_config(config) -> bool:
                     for key in ("quant_config", "quantization_config"))
             and (profile.hidden_size, profile.intermediate_size,
                  profile.num_layers, profile.num_q_heads) == (2048, 6144, 28, 16)
-            and (vision.model_type, vision.hidden_size, vision.intermediate_size,
+            and (canonical_vision_type(vision, "qwen3_vl"), vision.hidden_size, vision.intermediate_size,
                  vision.depth, vision.num_heads, vision.patch_size,
                  vision.temporal_patch_size, vision.spatial_merge_size,
                  tuple(vision.deepstack_visual_indexes), vision.out_hidden_size,
@@ -247,7 +249,8 @@ def _materialize_qwen3_rotary_buffer(module: nn.Module, name: str) -> torch.Tens
     if name not in {"inv_freq", "original_inv_freq"}:
         return None
     config = getattr(module, "config", None)
-    if config is None or not hasattr(module, "compute_default_rope_parameters"):
+    if config is None or not (hasattr(module, "compute_default_rope_parameters")
+                              or hasattr(module, "compute_axial_rope_parameters")):
         return None
 
     rope_type = getattr(module, "rope_type", None)
@@ -256,7 +259,9 @@ def _materialize_qwen3_rotary_buffer(module: nn.Module, name: str) -> torch.Tens
         rope_type = rope_params.get("rope_type", "default")
     rope_type = rope_type or "default"
 
-    if rope_type == "default":
+    if rope_type == "axial":
+        rope_init_fn = module.compute_axial_rope_parameters
+    elif rope_type == "default":
         rope_init_fn = module.compute_default_rope_parameters
     else:
         from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
@@ -817,10 +822,14 @@ def _allocate_w8a16_decoder_projection_views(
 def _swizzle_and_move_decoder_layer(
     layer: nn.Module, *, dtype: torch.dtype,
     projection_views: dict[str, torch.Tensor] | None = None,
+    topology=None,
 ) -> None:
     from rpu_backend.runtime.weights import convert_linear_weights_inplace
 
-    convert_linear_weights_inplace(layer, skip_names=set())
+    core_kwargs = ({} if topology is None else dict(
+        attn_num_cores=topology.attn_tp, mlp_num_cores=topology.mlp_tp,
+        lm_head_num_cores=topology.lm_head_tp, execution_core_count=topology.num_cores))
+    convert_linear_weights_inplace(layer, skip_names=set(), **core_kwargs)
     if projection_views is not None:
         for name, target in projection_views.items():
             module = layer.get_submodule(name)
@@ -839,22 +848,37 @@ def _swizzle_and_move_decoder_layer(
 
 def _swizzle_and_move_w8a16_decoder_layer(
     layer: nn.Module, *, projection_views: dict[str, torch.Tensor] | None = None,
+    topology=None,
 ) -> None:
-    _swizzle_and_move_decoder_layer(layer, dtype=torch.int8, projection_views=projection_views)
+    _swizzle_and_move_decoder_layer(layer, dtype=torch.int8, projection_views=projection_views,
+        **({"topology": topology} if topology is not None else {}))
 
 
-def _move_materialized_w8a16_decoder_for_rpu(model: nn.Module) -> None:
+def _pad_decoder_layer_for_topology(layer, config, topology):
+    if topology is None:
+        return
+    from types import SimpleNamespace
+    from rpu_backend.runtime.topology import decoder_mlp_intermediate_size
+    from rpu_backend.runtime.weights import pad_decoder_mlp_weights
+    view = SimpleNamespace(model=SimpleNamespace(layers=[layer]), config=config)
+    pad_decoder_mlp_weights(view, logical_size=config.intermediate_size,
+        physical_size=decoder_mlp_intermediate_size(config.intermediate_size, topology.mlp_tp))
+
+
+def _move_materialized_w8a16_decoder_for_rpu(model: nn.Module, *, topology=None) -> None:
     """Give the public CPU-load then .to('rpu') path the same 4B storage."""
     if not is_qwen3_vl_4b_w8a16_config(getattr(model, "config", None)):
         raise ValueError("Shared W8 decoder storage requires the exact controlled 4B profile")
-    _move_materialized_decoder_for_rpu(model, dtype=torch.int8)
+    _move_materialized_decoder_for_rpu(model, dtype=torch.int8,
+        **({"topology": topology} if topology is not None else {}))
 
 
 def _move_materialized_decoder_for_rpu(
     model: nn.Module, *, dtype: torch.dtype, per_layer: bool = False,
     decoder: nn.Module | None = None, decoder_prefix: str = "model.language_model",
+    topology=None,
 ) -> None:
-    """Pack decoder weights after the adapter admits the exact eight-core profile."""
+    """Pack the admitted decoder using its bound component topology."""
     from rpu_backend.runtime.weights import _release_cpu_weight_pages
 
     if dtype not in (torch.int8, torch.float16):
@@ -865,6 +889,8 @@ def _move_materialized_decoder_for_rpu(
     if model.get_submodule(decoder_prefix) is not decoder:
         raise ValueError("Decoder bank prefix must identify the supplied model-owned decoder")
     layers = decoder.layers
+    if topology is not None:
+        per_layer = True
     layer_tensor_names = tuple(
         tuple(f"{decoder_prefix}.layers.{index}.{name}"
               for name, _ in sorted(layer.named_parameters()))
@@ -888,20 +914,23 @@ def _move_materialized_decoder_for_rpu(
     views = (None if per_layer else
              _allocate_decoder_projection_views(model, layer_tensor_names, dtype=dtype))
     for layer, names in zip(layers, layer_tensor_names, strict=True):
+        if topology is not None:
+            _pad_decoder_layer_for_topology(layer, decoder.config, topology)
         if per_layer:
             views = _allocate_decoder_projection_views(model, (names,), dtype=dtype)
         relative_views = {
             name.rsplit(".layers.", 1)[1].split(".", 1)[1][:-len(".weight")]: views[name]
             for name in names if name in views
         }
-        _swizzle_and_move_decoder_layer(layer, dtype=dtype, projection_views=relative_views)
+        _swizzle_and_move_decoder_layer(layer, dtype=dtype, projection_views=relative_views,
+            **({"topology": topology} if topology is not None else {}))
         # HostDDR shares physical RAM with CPU weights. GC alone can leave
         # freed CPU arenas resident while the next device bank is allocated.
         _release_cpu_weight_pages()
 
 
-def _materialize_staged_w8a16_imagetext_for_rpu(model: nn.Module) -> None:
-    """Consume a metadata-only plan after the adapter owns and poisons device state."""
+def _materialize_staged_w8a16_imagetext_for_rpu(model: nn.Module, *, topology=None) -> None:
+    """Consume a metadata-only plan after the adapter owns and poisons RPU state."""
     plan = _validate_staged_w8a16_imagetext(model)
     if vars(model).get("_rpu_swizzle_started") is not True:
         raise RuntimeError(
@@ -911,7 +940,7 @@ def _materialize_staged_w8a16_imagetext_for_rpu(model: nn.Module) -> None:
     legacy_per_layer = is_qwen3_vl_32b_w8a16_config(getattr(model, "config", None))
     projection_views = (
         _allocate_w8a16_decoder_projection_views(model, plan.layer_tensor_names)
-        if is_qwen3_vl_4b_w8a16_config(getattr(model, "config", None)) else None
+        if topology is None and is_qwen3_vl_4b_w8a16_config(getattr(model, "config", None)) else None
     )
     _load_imagetext_plan_names(
         model, plan, plan.nondecoder_tensor_names, dtype=torch.float16
@@ -924,20 +953,24 @@ def _materialize_staged_w8a16_imagetext_for_rpu(model: nn.Module) -> None:
             raise KeyError(
                 f"W8A16 decoder layer remains incomplete before swizzle: {layer_meta[:8]}"
             )
-        if legacy_per_layer:
+        if topology is not None:
+            _pad_decoder_layer_for_topology(layer, model.config.text_config, topology)
+        if legacy_per_layer or topology is not None:
             # Allocate only after this layer's INT8 parameters are materialized.
             # Each existing helper-owned bank stays below 4GiB; Parameter views
             # keep its storage alive after this temporary dictionary is dropped.
             projection_views = _allocate_decoder_projection_views(
                 model, (names,), dtype=torch.int8)
         if projection_views is None:
-            _swizzle_and_move_w8a16_decoder_layer(layer)
+            _swizzle_and_move_w8a16_decoder_layer(layer,
+                **({"topology": topology} if topology is not None else {}))
         else:
             relative_views = {
                 name.rsplit(".layers.", 1)[1].split(".", 1)[1][:-len(".weight")]: projection_views[name]
                 for name in names if name in projection_views
             }
-            _swizzle_and_move_w8a16_decoder_layer(layer, projection_views=relative_views)
+            _swizzle_and_move_w8a16_decoder_layer(layer, projection_views=relative_views,
+                **({"topology": topology} if topology is not None else {}))
         if legacy_per_layer:
             from rpu_backend.runtime.weights import _release_cpu_weight_pages
             _release_cpu_weight_pages()

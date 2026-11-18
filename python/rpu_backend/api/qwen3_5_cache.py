@@ -38,13 +38,12 @@ def _positive_int(name: str, value) -> int:
 
 def qwen3_5_kv_replication(config, num_cores: int = 8) -> int:
     """One cold profile geometry for both cache allocation and native weights."""
-    from rpu_backend.adapters.qwen3_5.quant_scope import (
-        validate_legacy_text_profile, validate_modern_27b_profile,
-    )
+    from rpu_backend.adapters.qwen3_5.quant_scope import validate_legacy_text_profile
+    from rpu_backend.adapters.qwen3_5.cores import validate_official_27b_runtime_profile
 
     tc = getattr(config, "text_config", config)
     nkv = _positive_int("num_key_value_heads", tc.num_key_value_heads)
-    if validate_legacy_text_profile(config) or validate_modern_27b_profile(config):
+    if validate_legacy_text_profile(config) or validate_official_27b_runtime_profile(config):
         # The controlled 27B route duplicates each original KV head for all
         # its queries. GQA=1 avoids the accumulated SDPA product=6 erratum at
         # C128. The native planner still checks its actual SPM/SDPA domain.
@@ -83,6 +82,7 @@ class Qwen3_5Cache(RPUCache):
                 f"Qwen3_5Cache unsupported layer_types {invalid_types}; "
                 f"expected only {sorted(_VALID_LAYER_TYPES)}"
             )
+        self.layer_types = layer_types
         from rpu_backend.adapters.qwen3_5.cores import core_topology, topology_tuple
         topology = core_topology({"model": {"num_cores": num_cores}})
         gdn_cores = topology.attn_tp
@@ -131,6 +131,10 @@ class Qwen3_5Cache(RPUCache):
             for t in layer_types]
         # C++ forward takes `gdn_states` (== recurrent_states).
         self.gdn_states = self.recurrent_states
+
+    @property
+    def is_linear(self) -> list[bool]:
+        return [kind == "linear_attention" for kind in self.layer_types]
 
     def reset(self):
         """Reset to an empty conversation: KV cache + position (super) plus the

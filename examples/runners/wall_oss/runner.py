@@ -4,6 +4,13 @@ from __future__ import annotations
 
 from examples.common.inputs import _images, _policy_checkpoint as _checkpoint, _model_path
 
+def wall_stage_boundaries(vla):
+    """Vision, Prefill and Denoise calls of WallOssVLA.predict (both Vision entries)."""
+    return tuple((stage, getattr(vla, part, None), name) for stage, part, name in (
+        ("vision", "vision", "forward"), ("vision", "vision", "_forward_parts"),
+        ("prefill", "llm", "forward_embeds"), ("denoise", "action", "denoise_with_mask")))
+
+
 def _wall_oss(runner):
     from rpu_backend.api import WallOssPolicy
 
@@ -42,6 +49,7 @@ def _wall_oss(runner):
     ).to("rpu")
     # The facade has no close method; expose the runtime that owns all children.
     runner.owner = policy._vla
+    runner.stage_boundaries = wall_stage_boundaries(getattr(policy, "_vla", None))
     request = {
         "images": images,
         "instruction": inputs["instruction"],

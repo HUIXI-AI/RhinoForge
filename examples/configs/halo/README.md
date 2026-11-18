@@ -1,79 +1,63 @@
 # HALO Action Expert 配置
 
-[配置索引](../CONFIGURATIONS.md) · [使用](#使用)
+<a id="halo-配置"></a>
 
-本配置运行 FP16 Action Expert 的一个去噪 step。输入为已准备好的前缀 K/V 和单步 CPU 张量。
+<a id="配置矩阵"></a>
 
-<a id="weight-recipes"></a>
-<a id="quantization"></a>
-## 配置说明
+[配置总览](../README.md) · [全部配置](#configurations) · [权重准备](../WEIGHTS.md) · [参数说明](../PARAMETERS.md)
 
-| 配置 | 组件 / 精度 | 登记范围 |
-|---|---|---|
-| [action_expert/fp16.toml](action_expert/fp16.toml) | Action Expert 单步，投影 W16/A16 | `SUPPORTED_LIMITED` |
+[FP16 配置](action_expert/fp16.toml) 只执行一次 Action Expert step，需要预先准备的张量输入和 KV cache。完整机器人策略不在此入口的支持范围内。
 
-加载器将原 EMA 转为 FP16；无需离线量化。runner 先通过 `insert_prefix()` 安装逐层前缀 K/V，再重复调用 `step()`。单步 query 为 18 行：第 0、17 行为文本，1–16 行为动作；动作维度 14，前缀长度 4706。
+HALO 的后续测试目前暂缓，保留此配置用于已有路径的查阅和复现。单步 profile 的登记状态见[模型矩阵](../../../docs/model_matrix.zh.md)。
 
-动作专家保留 Graph 重放，Attention 使用 2 核，MLP 使用 8 核。`chunk_size="auto"` 按这一单步形状规划。图像编码、语言前缀生成和完整多步策略在调用前准备。实现见 [runner](../../runners/halo/runner.py)、[权重定义](../../../python/rpu_backend/adapters/halo/weights.py)和[运行时](../../../python/rpu_backend/adapters/halo/runtime.py)。
+<a id="运行"></a>
 
-<a id="weights"></a>
-<a id="weight-sources"></a>
-## 准备与运行
+## 输入与运行
 
-### 权重来源
+准备 `halo_action_expert` 权重和匹配的 `input.fixture`。fixture 中的文本/动作行数、prefix 长度和 `packed_position_ids` 必须满足单步约束，KV cache 必须包含张量形式的 `key_cache` 和 `value_cache`。
 
-| 资产 | 来源与存储精度 |
-|---|---|
-| 官方预训练 EMA | [qshou-coder/halo_pt_weight](https://huggingface.co/qshou-coder/halo_pt_weight)，revision `2bd3a209c6c1536afa43da6540c817196dde96e0`；`ema.safetensors` 的 1624 个张量均为 BF16 |
-| 官方无 EM-CoT 微调 EMA | [qshou-coder/halo_ft_weight](https://huggingface.co/qshou-coder/halo_ft_weight)，revision `d7a149753d76247d44ee5e73ca010ee43686cfe1`；`no_cot/ema.safetensors` 的 1615 个张量均为 BF16 |
-| 已登记动作专家 EMA | `halo_action_expert` → `$RPU_MODEL_CACHE/HALO/action_expert.safetensors`；原交付 CoT EMA，BF16，需提供来源清单和配对单步 fixture |
-
-官方源码见 [HALO](https://github.com/qshou-coder/HALO)。登记 EMA 与上述公开权重的对应关系尚未核实；公开下载文件应单独存放：
+具备配套资产、需要运行这一已登记单步路径时，从仓库根目录执行：
 
 ```bash
-hf download qshou-coder/halo_pt_weight ema.safetensors --revision 2bd3a209c6c1536afa43da6540c817196dde96e0 --local-dir /path/to/official-halo-pretrain
-hf download qshou-coder/halo_ft_weight no_cot/ema.safetensors --revision d7a149753d76247d44ee5e73ca010ee43686cfe1 --local-dir /path/to/official-halo-no-cot
+python examples/run.py --config examples/configs/halo/action_expert/fp16.toml --check-config
+python examples/run.py --config examples/configs/halo/action_expert/fp16.toml
 ```
 
-<a id="使用"></a>
+`--check-config` 只检查配置语法和 profile；fixture 内容在运行时检查。结果不能用于声明完整 HALO 支持或机器人任务验收通过。
 
-### 输入与运行
+仓库内没有生成 `input.fixture` 的脚本，也没有随仓库发布匹配的 fixture。已有的原始捕获把 KV cache 存为 Python 对象，不能用 `weights_only=True` 读取，因此不能直接作为本入口的输入。
 
-将匹配的 EMA 文件或符号链接放在 `$RPU_MODEL_CACHE/HALO/action_expert.safetensors`。未设置 `RPU_MODEL_CACHE` 时，缓存根目录为 `~/.cache/rhinoforge/models`。该别名指向文件，加载器不追加子目录。
+<!-- model-configurations-start -->
 
-复制模板，将 `input.fixture` 改为配对输入文件：
+<a id="configurations"></a>
+## 全部配置与输入范围
 
-```bash
-python examples/run.py --config /path/to/halo.toml --check-config
-python examples/run.py --config /path/to/halo.toml
-```
+每组先列各配置不同的项，再列本组配置相同的项；修改相机、文本长度、精度或核数时，同时满足联动限制。4/6/8 核列：● 已在板上运行通过（4/6 核写出各组件实际核数），○ 支持但未在板上运行，✕ 不支持（原因列在表下）。支持状态和 CPU 线程数的读法见配置表说明；实测耗时见性能报告：HALO。
 
-`--check-config` 检查 TOML；运行入口在加载权重前检查固定位置、文本/动作行索引、前缀长度、K/V 容器和 checkpoint 文件。
+### 保留Action fixture
 
-### 输入与参数
-
-fixture 为可用 `torch.load(..., weights_only=True)` 读取的 CPU 张量字典，可直接包含以下字段，也可放在 `kwargs` 中：
-
-| 字段 | 结构 |
+| 项目 | 值 |
 |---|---|
-| `x_t` / `timestep` | 浮点 `[16,14]` / `[16]`；数值有限，timestep 各行相同 |
-| `packed_action_position_ids` / `packed_text_ids` | 整数 `[16]` / `[2]` |
-| `packed_position_ids` | 整数 `[18]`，所有位置相同 |
-| `packed_text_indexes` / `packed_action_token_indexes` | `[0,17]` / `[1,...,16]` |
-| `key_values_lens` | `[4706]` |
-| `past_key_values` | `key_cache` 和 `value_cache` 各 28 层，每层浮点 `[4706,2,128]`；层容器可为整数键字典、序列或堆叠张量 |
+| 配置 | [action_expert/fp16.toml](action_expert/fp16.toml) |
+| 支持状态 | 受限支持（`SUPPORTED_LIMITED`）；未实测：仓库内没有本入口可读的单步 fixture（现有捕获的 KV cache 是 Python 对象，不能以 weights_only 读取），不是硬件限制 |
+| 精度 | fp16 |
+| 量化范围 | — |
+| 输入类型 | 单步Action tensor fixture |
+| 文本可调范围 | text/action rows与prefix匹配HaloConfig |
+| 图像/音频可调范围 | 由fixture给定 |
+| 生成可调范围 | 单Action step |
+| 其他输入形状 | past_key_values tensor字典；packed_position_ids单常数 |
+| 联动限制 | 后续测试暂缓；保留现有输入合同。 |
+| 默认核数 | 8 |
+| 4 核 | ✕ 不支持 |
+| 6 核 | ✕ 不支持 |
+| 8 核 | ○ 未实测 |
+| CPU线程数 | 未设置（沿用环境） |
+| 权重 | `halo_action_expert` |
+| 入口 | [run.py](../../run.py) |
 
-索引必须非负。保留原权重与 fixture 的配对关系，输出为单步动作张量。
+- ✕ 4/6 核不支持：延期模型：拓扑固定为注意力 2 核、MLP 8 核。
 
-| 可修改字段 | 默认 / 条件 |
-|---|---|
-| `input.fixture` | 配对的单步 CPU 张量文件 |
-| `rpu_execution.components.action_expert.action.chunk_size` | `auto`，遵循单步准入 |
-| `cpu.threads` | 可选正整数，省略时继承环境 |
-| `run.warmup/runs/seed` | 2 / 3 / 0 |
+输入校验来源：[runner.py](../../../examples/runners/halo/runner.py) · [weights.py](../../../python/rpu_backend/adapters/halo/weights.py)。
 
-完整模型、多步策略和 CPU 质量参考不在此入口范围内。环境准备见[示例指南](../../README.zh.md)和[运行资产](../../../docs/runtime_assets.md)。
-
-## 输出
-
-保存 `report.json` 和动作专家单步输出快照；保留独立输出后再提交下一次输入。
+<!-- model-configurations-end -->

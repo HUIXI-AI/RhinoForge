@@ -16,7 +16,7 @@ _SIZES = {"2b": (2048, 6144, 28, 16), "4b": (2560, 9728, 36, 32),
 
 
 def _model(size="2b", cores=6):
-    hidden, intermediate, layers, heads = _SIZES[size]
+    hidden, intermediate, layers, heads = {**_SIZES, "32b": (5120,25600,64,64)}[size]
     config = SimpleNamespace(model_type="qwen3_vl_text", hidden_size=hidden,
         intermediate_size=intermediate, num_hidden_layers=layers,
         num_attention_heads=heads, num_key_value_heads=8, head_dim=128,
@@ -262,3 +262,82 @@ def test_lingbot_kv_only_envelope_rejects_wrong_cold_owner_before_install(
         install_qwen3_vl_text_for_rpu(model, folded_rmsnorm=True,
             prefill_kv_only=True, deepstack_lang_layers=[0, 1, 2], **options)
     assert vars(model) == before and native["events"] == []
+
+
+def _quantized_model(size, cores, bits):
+    from rpu_backend.api._execution import qwen3_vl_text_topology
+
+    model, _ = _model(size,cores)
+    from rpu_backend.runtime.topology import decoder_packed_w4_mlp_intermediate_size
+    topology=qwen3_vl_text_topology(model.config,cores,packed_w4=bits==4)
+    hidden=model.config.hidden_size
+    width=decoder_packed_w4_mlp_intermediate_size if bits==4 else decoder_mlp_intermediate_size
+    intermediate=width(model.config.intermediate_size,topology.mlp_tp)
+    roles=("self_attn.q_proj","self_attn.k_proj","self_attn.v_proj","self_attn.o_proj",
+           "mlp.gate_proj","mlp.up_proj","mlp.down_proj")
+    scales=[[] for _ in roles]
+    for layer in model.layers:
+        layer.get_submodule=lambda name,layer=layer:getattr(getattr(layer,name.split('.')[0]),name.split('.')[1])
+        for j,role in enumerate(roles):
+            projection=layer.get_submodule(role)
+            n,k=projection.out_features,projection.in_features
+            if role.endswith(("gate_proj","up_proj")):n=intermediate
+            if role.endswith("down_proj"):k=intermediate
+            projection.out_features,projection.in_features=n,k
+            projection.weight=torch.empty((n,k//2 if bits==4 else k),device="meta",
+                                          dtype=torch.uint8 if bits==4 else torch.int8)
+            tp=topology.mlp_tp if role.startswith('mlp.') else topology.attn_tp
+            projection._rpu_linear_num_cores=tp
+            if bits==4:
+                col=projection._rpu_linear_partition==1
+                lg,ln=(k//32,n//tp) if col else (k//32//tp,n)
+                count=tp*((lg+3)//4)*((ln+63)//64)*256
+                shape=(32,count//32)
+            else:shape=(n,)
+            scale=torch.empty(shape,device="meta",dtype=torch.float16)
+            projection.weight_scale=scale;projection._buffers={"weight_scale":scale}
+            scales[j].append(scale)
+    return model,topology,scales
+
+
+@pytest.mark.parametrize("size", ["2b","4b","8b","32b"])
+@pytest.mark.parametrize("cores", [4,6])
+@pytest.mark.parametrize("bits", [4,8])
+def test_quantized_mrope_installer_binds_weight_cache_graph_and_native_topology(native,monkeypatch,size,cores,bits):
+    model,topology,scales=_quantized_model(size,cores,bits)
+    monkeypatch.setattr(torch.ops.rpu,"causal_decoder_set_weights_w8a16",
+        torch.ops.rpu.causal_decoder_set_weights,raising=False)
+    monkeypatch.setattr(torch.ops.rpu,"causal_decoder_topology",lambda handle:
+        (cores,4,topology.mlp_tp,4,8),raising=False)
+    options={"scale_lists":scales}
+    if size=="32b":options["_runtime_quantized_32b"]=True
+    assert _install(model,topology,**options)==1
+    assert model._rpu_decoder_topology==topology
+    assert model._rpu_decoder_graph_cache.runtime_policy.execution_core_count==cores
+    assert model._rpu_text_graph_cache.runtime_policy.execution_core_count==cores
+    # Packed W4 keeps MLP6; 4B/32B carry their zero-padded 9792/25728 width.
+    assert topology.mlp_tp==cores
+    if bits==4 and cores==6:
+        assert model.layers[0].mlp.down_proj.in_features=={
+            "2b":6144,"4b":9792,"8b":12288,"32b":25728}[size]
+    with torch._subclasses.fake_tensor.FakeTensorMode():
+        cache=RPUCache.from_model(model,max_seq_len=16,device="cpu")
+    assert (cache.attn_tp,cache.physical_kv_cores)==(4,8)
+    assert native["create_topologies"]==[{"num_cores":cores,"vocab_size":151936}]
+    model._rpu_decoder_retirement_state.retire()
+    assert native["alive"]==set()
+
+
+@pytest.mark.parametrize("fault", ["scale", "dtype", "shape", "layout", "topology"])
+def test_quantized_mrope_rejects_last_layer_or_wrong_cold_layout_before_creation(native,monkeypatch,fault):
+    from dataclasses import replace
+    model,topology,scales=_quantized_model("4b",6,4)
+    projection=model.layers[-1].mlp.down_proj
+    if fault=="scale":projection.weight_scale=projection.weight_scale.clone()
+    if fault=="dtype":projection.weight=projection.weight.to(torch.int8)
+    if fault=="shape":projection.weight=projection.weight[:,:-16]
+    # The retired packed MLP4 layout is now a wrong cold layout/template.
+    if fault=="layout":projection._rpu_linear_num_cores=4
+    if fault=="topology":topology=replace(topology,mlp_tp=4)
+    with pytest.raises(ValueError):_install(model,topology,scale_lists=scales)
+    assert native["events"]==[]

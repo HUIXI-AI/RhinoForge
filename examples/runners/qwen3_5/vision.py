@@ -9,7 +9,7 @@ def _qwen35_vision(runner):
 
     validate_generation_options(runner.source_config)
     import torch
-    from examples.common.generation import _extend_multimodal_input, _generate
+    from examples.common.generation import _generate, qwen3_5_vision_encode
     from transformers import AutoProcessor
     from rpu_backend.api import RPUModelForConditionalGeneration
 
@@ -21,16 +21,8 @@ def _qwen35_vision(runner):
 
         validate_checkpoint_profile(config, checkpoint)
     images = _images(inputs)
-    prompt = inputs.get("prompt", "Describe the image.")
     processor = AutoProcessor.from_pretrained(checkpoint, local_files_only=True)
-    messages = [{"role": "user", "content": [
-        *({"type": "image"} for _ in images), {"type": "text", "text": prompt}
-    ]}]
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    encoded = processor(text=[text], images=images, return_tensors="pt")
-    if "mm_token_type_ids" not in encoded:
-        raise ValueError("Qwen3.5 processor must return mm_token_type_ids for image inference")
-    encoded = _extend_multimodal_input(encoded, inputs, processor.tokenizer)
+    encoded = qwen3_5_vision_encode(processor, images, inputs)
     decode_steps = inputs.get("decode_steps", 4)
     required_len = int(encoded["input_ids"].shape[1]) + decode_steps
     max_seq_len = (required_len if timing_mode == "legacy_dense_vl"

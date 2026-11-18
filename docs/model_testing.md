@@ -9,7 +9,7 @@ Select a TOML from [model examples](../examples/README.md). Runners live in `exa
 ```sh
 python -m examples.run --config examples/configs/qwen3/text/0_6b/fp16.toml --check-config
 python -m examples.run --config examples/configs/qwen3_vl/vl/4b/w8a16_text_head_vision.toml
-python -m examples.run --config examples/configs/pi05/2cam/w8a16_action_nvfp4.toml
+python -m examples.run --config examples/configs/pi05/2cam/h50/w8a16_action_nvfp4.toml
 ```
 
 Replace placeholder paths and supply the checkpoint and inputs required by the model guide. Relative `input.prompt_file` and `input.prepared_input_safetensors` paths resolve from the configuration file's directory. Other asset paths follow the model guide. `--check-config` validates configuration without loading weights or accessing a device. Quantized checkpoints require the loader's metadata; see [quantization](quantization.md).
@@ -63,7 +63,7 @@ Install the `audio` extra and call `Qwen3ASRModel` or `Qwen3TTSModel`.
 The [speech guide](qwen3_audio.md) provides checkpoint downloads, TTS source
 preparation and complete Python examples.
 
-Speech CLI: `python -m examples.run --config examples/configs/qwen3_tts/0_6b/base.toml --check-config`; fill local paths before running. [ASR templates](../examples/configs/qwen3_asr/README.md) and [TTS templates](../examples/configs/qwen3_tts/README.md) record resident latency, process CPU time and RTF.
+Speech CLI: `python -m examples.run --config examples/configs/qwen3_tts/0_6b/fp16.toml --check-config`; fill local paths before running. [ASR templates](../examples/configs/qwen3_asr/README.md) and [TTS templates](../examples/configs/qwen3_tts/README.md) record resident latency, process CPU time and RTF.
 
 ## Repository checks
 

@@ -261,15 +261,17 @@ def test_tp6_cold_padding_preserves_split_expert_math_and_source():
     assert torch.count_nonzero(raw_down[:, :, logical:]) == 0
     assert torch.equal(gs[:, :logical], source[2][:, :logical])
     assert torch.equal(us[:, :logical], source[2][:, logical:])
-    assert torch.all(gs[:, logical:] == 1) and torch.all(us[:, logical:] == 1)
-    assert torch.equal(ds, source[3])
+    assert gs.shape == us.shape == (e, 640) and ds.shape == (e, 128)
+    assert torch.all(gs[:, logical:physical] == 1) and torch.all(us[:, logical:physical] == 1)
+    assert not torch.count_nonzero(gs[:, physical:]) and not torch.count_nonzero(us[:, physical:])
+    assert torch.equal(ds[:, :h], source[3]) and not torch.count_nonzero(ds[:, h:])
     x = torch.randn(e, h, 1, generator=generator)
     expected_gate = decode(source[0][:, :logical], source[2][:, :logical]) @ x
     expected_up = decode(source[0][:, logical:], source[2][:, logical:]) @ x
-    actual_gate, actual_up = decode(raw_gate, gs) @ x, decode(raw_up, us) @ x
+    actual_gate, actual_up = decode(raw_gate, gs[:, :physical]) @ x, decode(raw_up, us[:, :physical]) @ x
     torch.testing.assert_close(actual_gate[:, :logical], expected_gate, rtol=0, atol=0)
     torch.testing.assert_close(actual_up[:, :logical], expected_up, rtol=0, atol=0)
-    actual = decode(raw_down, ds).double() @ (actual_gate.double() * actual_up.double())
+    actual = decode(raw_down, ds[:, :h]).double() @ (actual_gate.double() * actual_up.double())
     expected = decode(source[1], source[3]).double() @ (expected_gate.double() * expected_up.double())
     torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-7)
     for actual_source, original in zip((gate_up, down, scales, down_scales), source):
@@ -300,6 +302,14 @@ def test_tp6_full_cold_preparation_keeps_router4_and_shared6_math():
             down_proj=SimpleNamespace(weight=raw["down"])),
         shared_expert_gate=SimpleNamespace(weight=raw["scalar"]))
     packed = prepare_moe_layer_weights(mlp, num_cores=6, device="cpu")
+    legacy = prepare_moe_layer_weights(mlp, num_cores=6, device="cpu", grouped_acc32=True)
+    for new, old, logical_width in ((packed.routed_gate_scale, legacy.routed_gate_scale, physical),
+                                    (packed.routed_up_scale, legacy.routed_up_scale, physical),
+                                    (packed.routed_down_scale, legacy.routed_down_scale, h)):
+        assert new.shape == (e, ((logical_width + 127) // 128) * 128)
+        assert old.shape == (e, ((logical_width + 127) // 128) * 128)
+        assert torch.equal(new.view(torch.int16), old.view(torch.int16))
+        assert torch.count_nonzero(new[:, logical_width:]) == 0
 
     def col(tensor, cores):
         n, k = tensor.shape
@@ -336,3 +346,23 @@ def test_grouped_packing_rejects_incomplete_hardware_tiles(partition, shape):
     with pytest.raises(ValueError, match="violates"):
         pack_grouped_weight(torch.zeros(shape, dtype=torch.uint8),
                             partition=partition, num_cores=8)
+
+
+@pytest.mark.parametrize("n", [16, 48, 96, 128, 576, 2048])
+def test_grouped_scale_stride_preserves_bits_and_zero_pads(n):
+    from rpu_backend.quant.fp8 import pack_grouped_scale
+
+    source = (torch.arange(3 * n).reshape(3, n) % 103 + 1).half() / 32
+    packed = pack_grouped_scale(source)
+    assert packed.is_contiguous() and packed.shape == (3, (n + 127) // 128 * 128)
+    assert packed.stride(0) * packed.element_size() % 256 == 0
+    assert torch.equal(packed[:, :n].view(torch.int16), source.view(torch.int16))
+    assert not torch.count_nonzero(packed[:, n:])
+
+
+@pytest.mark.parametrize("source", [torch.ones(2, 16), torch.ones(16).half(), torch.empty(0, 128).half()])
+def test_grouped_scale_rejects_non_fp16_or_missing_expert_axis(source):
+    from rpu_backend.quant.fp8 import pack_grouped_scale
+
+    with pytest.raises(ValueError, match="nonempty FP16"):
+        pack_grouped_scale(source)

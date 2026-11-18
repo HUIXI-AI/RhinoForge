@@ -39,6 +39,9 @@ public:
         bool fast_replay, bool fast_replay_preload, bool mask_once,
         bool partial_rope, int64_t mot_norm_nomerge, bool silu_mul,
         int64_t rmsnorm_capability);
+    // Cold, before the runtime config and weights. Eight cores keep the
+    // existing owner; four or six bind the reduced root {n, 4, n}.
+    void set_execution_cores(int64_t num_cores);
 
     // 单层 vision (*_v) 孪生权重 (布局与基类 LayerWeights 主权重逐一对应):
     //   q/k/v/o_w     [out, in]  col/row-partition 预 swizzle fp16 (device DDR)
@@ -160,8 +163,13 @@ public:
 
     std::vector<int64_t> resolve_stage_domain(
         int64_t seq_len, int64_t prefix_len, int64_t mask_kv_len);
+    // Cold composite barrier: reserve this owner's Persistent slots under the
+    // same geometry before any persistent Hy-VLA sibling searches its domain.
+    void prepare_persistent_spm_for_shape(
+        int64_t seq_len, int64_t prefix_len, int64_t mask_kv_len);
 
 protected:
+    int reduced_hyvla_owner() const override { return REDUCED_HYVLA_VLM_OWNER; }
     std::vector<BufferDecl> declare_buffers(const LayoutContext& ctx) override;
     void build_layer_subgraph(int layer_idx, const ChunkInfo& chunk) override;
     // 只为挂 RPU_HY_VLA_FAST_REPLAY 的逐座开关（默认 OFF），其余全继承。

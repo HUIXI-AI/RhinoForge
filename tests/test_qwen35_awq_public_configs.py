@@ -14,8 +14,11 @@ FIXTURES = ROOT / "tests/fixtures/qwen35_quanttrio_awq"
 
 
 def config(size, prefill=64):
-    return common.load_config(
-        ROOT / f"examples/configs/qwen3_5/text/{size}b/w4a16_mlp_awq_g128_p{prefill}_d4096.toml")
+    value = common.load_config(
+        ROOT / f"examples/configs/qwen3_5/text/{size}b/w4a16_mlp_awq_g128.toml")
+    value["input"].update(prefill_tokens=prefill, decode_steps=4096, stop_on_eos=False)
+    common.validate_generation_options(value)
+    return value
 
 
 @pytest.mark.parametrize("size", [2, 4, 9])
@@ -42,11 +45,15 @@ def test_public_awq_configs_bind_original_asset_without_mutation(size, tmp_path,
         assert value["example"]["registry_alias"] == alias
         assert value["rpu_execution"]["prefill"]["linear_acc32"] is False
         assert value["rpu_execution"]["model"]["num_cores"] == 8
-        assert len(value["input"]["prompt_token_ids"]) == length
+        profile = common.planner_profiles()[value["example"]["profile_id"]]
+        for cores in (4, 6, 8):
+            value["rpu_execution"]["model"]["num_cores"] = cores
+            common._validate_execution(value["rpu_execution"], profile=profile)
+        assert value["input"]["prefill_tokens"] == length
         assert value["input"]["decode_steps"] == 4096
         assert value["input"]["stop_on_eos"] is False
         assert value["run"]["warmup"] == 2 and value["run"]["runs"] == 5
-    assert short["input"]["prompt_token_ids"] == long["input"]["prompt_token_ids"][:64]
+    assert short["input"]["prompt"] == long["input"]["prompt"]
     assert (checkpoint / "config.json").read_bytes() == original
     assert list(checkpoint.iterdir()) == [checkpoint / "config.json"]
 

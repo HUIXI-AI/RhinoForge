@@ -208,9 +208,13 @@ std::vector<BufferDecl> WallOssActionStepModel::declare_buffers(const LayoutCont
     d.push_back({"x_t_spm",       A(cs * k_comb_pad_ * DW), 0, 9, SC::Temp, 0, nullptr, ALL});
     d.push_back({"ce_spm",        A(cs * h * DW),           0, 0, SC::Temp, 0, nullptr, ALL});
     d.push_back({"b_step_spm",    A(cs * h * DW),           0, 0, SC::Temp, 0, nullptr, ALL});
-    // Keep each TP8 w3 shard distinct from residual1 until all-gather consumes it.
-    d.push_back({"emb_core0_spm", A(cs * (h / NUM_CORES) * DW), 0, 1,
+    // Keep each w3 column shard distinct from residual1 until all-gather consumes it
+    // (or hold the full core-0 w3 output before SPM broadcast below eight cores).
+    d.push_back({"emb_core0_spm", A(cs * (h / num_cores()) * DW), 0, 1,
                  SC::Temp, 0, nullptr, ALL});
+    if (num_cores() != 8) {
+        d.back().size = A(cs * h * DW);
+    }
     // On-device base = ae_dof·w2_a and ct = te·w2_t (core 0; [1,h] each).
     // ct_spm keeps the step-invariant base across every unrolled body; ae_spm/te_spm are
     // per-body inputs/temps. All three are used only when have_te_.
@@ -436,11 +440,13 @@ WallOssActionStepModel::physical_manifest_for_candidate(
         {planned_rtc_delay_, planned_b_step_is_bias_ ? 1 : 0,
          planned_velocity_blend_ ? 1 : 0, planned_loop_mode_ ? 1 : 0,
          planned_have_te_ ? 1 : 0, planned_num_steps_});
-    append(
-        FmbRouteFamily::COLLECTIVE,
-        WALL_ACTION_PRE_W3_ALL_GATHER_SITE,
-        static_cast<int64_t>(rpu_resolve_all_gather_schedule(
-            hidden_size() / NUM_CORES, sizeof(c10::Half))));
+    if (num_cores() == 8) {
+        append(
+            FmbRouteFamily::COLLECTIVE,
+            WALL_ACTION_PRE_W3_ALL_GATHER_SITE,
+            static_cast<int64_t>(rpu_resolve_all_gather_schedule(
+                hidden_size() / num_cores(), sizeof(c10::Half))));
+    }
 
     // post_layers: proj_back is unconditional; mutable input/output sites are
     // present only in the branch that forward will actually dispatch.
@@ -514,7 +520,7 @@ void WallOssActionStepModel::emit_pre_layers_body() {
                 WallActionMutableDmaRoute::DDR_BROADCAST_TO_SPM));
         rpu_launch_ddr_broadcast_spm_dma_mutable(
             &x_t_src_base_, /*src_offset_bytes=*/0, /*num_elements=*/cs * k_comb_pad_,
-            addr(0, "x_t_spm"), /*num_cores=*/NUM_CORES);
+            addr(0, "x_t_spm"), /*num_cores=*/num_cores());
     }
     // RTC hard pin at every Euler-step entry. rtc_delay_ is part of the Python
     // GraphSignature, while the prefix address/value is refreshed through the
@@ -632,11 +638,16 @@ void WallOssActionStepModel::emit_pre_layers_body() {
         addr(0, "ce_spm"), addr(0, "ce_spm"), cs * h, ValuOpType::SILU,
         /*is_gelu=*/false, /*num_cores=*/1);
 
-    // [A3] Replicate the input, run the col-partitioned w3 on all cores, then
-    // gather its shards directly into every core's layer-0 residual input.
-    rpu_launch_spm_scatter_spm_dma(
-        addr(0, "ce_spm"), cs * h, /*core_stride_bytes=*/0,
-        addr(0, "b_step_spm"), NUM_CORES);
+    // [A3] At eight cores, replicate the input, run the col-partitioned w3 on
+    // every execution core, then gather its shards into each core's layer-0
+    // residual. Below eight cores, run w3 on core 0 and broadcast its output
+    // directly to residual1 via SPM scatter (stride=0).
+    const bool eight_cores = (num_cores() == 8);
+    if (eight_cores) {
+        rpu_launch_spm_scatter_spm_dma(
+            addr(0, "ce_spm"), cs * h, /*core_stride_bytes=*/0,
+            addr(0, "b_step_spm"), num_cores());
+    }
     consume_action_route(
         FmbRouteFamily::LINEAR, WALL_ACTION_PRE_W3_LINEAR_SITE,
         wall_action_linear_route(),
@@ -644,20 +655,27 @@ void WallOssActionStepModel::emit_pre_layers_body() {
          velocity_blend_ ? 1 : 0, loop_mode_ ? 1 : 0,
          have_te_ == 1 ? 1 : 0, loop_mode_ ? num_steps_ : 1});
     rpu_launch_linear_spm_to_spm_acc16_kernel(
-        addr(0, "b_step_spm"), w3_, addr(0, "emb_core0_spm"),
+        eight_cores ? addr(0, "b_step_spm") : addr(0, "ce_spm"),
+        w3_, addr(0, "emb_core0_spm"),
         /*M=*/cs, /*N=*/h, /*K=*/h, /*partition=*/1,
-        /*num_cores=*/NUM_CORES, /*bias_spm_addr=*/0, /*scale=*/{}, /*nvfp4_tensor_scale_spm_addr=*/0,
+        /*num_cores=*/eight_cores ? num_cores() : 1, /*bias_spm_addr=*/0, /*scale=*/{}, /*nvfp4_tensor_scale_spm_addr=*/0,
                     /*nvfp4_layer_id=*/0, /*force_acc32=*/linear_acc32_);
-    const RpuAllGatherSchedule schedule =
-        rpu_resolve_all_gather_schedule(h / NUM_CORES, sizeof(c10::Half));
-    consume_action_route(
-        FmbRouteFamily::COLLECTIVE,
-        WALL_ACTION_PRE_W3_ALL_GATHER_SITE,
-        static_cast<int64_t>(schedule));
-    rpu_launch_all_gather_spm_kernel(
-        addr(0, "emb_core0_spm"), addr(0, "residual1"),
-        /*n=*/cs, /*chunk_elems=*/h / NUM_CORES,
-        /*dwidth=*/sizeof(c10::Half), NUM_CORES, schedule);
+    if (eight_cores) {
+        const RpuAllGatherSchedule schedule =
+            rpu_resolve_all_gather_schedule(h / num_cores(), sizeof(c10::Half));
+        consume_action_route(
+            FmbRouteFamily::COLLECTIVE,
+            WALL_ACTION_PRE_W3_ALL_GATHER_SITE,
+            static_cast<int64_t>(schedule));
+        rpu_launch_all_gather_spm_kernel(
+            addr(0, "emb_core0_spm"), addr(0, "residual1"),
+            /*n=*/cs, /*chunk_elems=*/h / num_cores(),
+            /*dwidth=*/sizeof(c10::Half), num_cores(), schedule);
+    } else {
+        rpu_launch_spm_scatter_spm_dma(
+            addr(0, "emb_core0_spm"), cs * h, /*core_stride_bytes=*/0,
+            addr(0, "residual1"), num_cores());
+    }
 }
 
 void WallOssActionStepModel::emit_post_layers_body() {
@@ -1155,8 +1173,29 @@ std::string rpu_wall_oss_action_step_kvinsert_cost_catalog_sha256(int64_t handle
 // =============================================================================
 // Public C API for TORCH_LIBRARY_IMPL wrappers (file-scope, not namespaced)
 // =============================================================================
-int64_t rpu_wall_oss_action_step_create() {
-    return WallOssActionStepRegistry::create();
+int64_t rpu_wall_oss_action_step_create(int64_t num_cores) {
+    TORCH_CHECK(num_cores == 8 || num_cores == 4,
+                "Wall-OSS action step admits the eight-core or four-lane reduced profile");
+    const int64_t handle = WallOssActionStepRegistry::create();
+    if (num_cores != 8) {
+        // Cold, before weights: the headless reduced owner binds its lanes
+        // through the shared decoder route configuration.
+        try {
+            WallOssActionStepRegistry::get(handle, "rpu_wall_oss_action_step_create")
+                ->configure_cold_routes(/*qwen3_spm_kv_by_mha=*/true,
+                                        /*adarms_fused_bcast=*/false,
+                                        static_cast<int>(num_cores), /*vocab_size=*/0);
+        } catch (...) {
+            WallOssActionStepRegistry::destroy(handle, "rpu_wall_oss_action_step_create");
+            throw;
+        }
+    }
+    return handle;
+}
+
+std::vector<int64_t> rpu_wall_oss_action_step_topology(int64_t handle) {
+    return WallOssActionStepRegistry::get(handle, "rpu_wall_oss_action_step_topology")
+        ->execution_topology();
 }
 
 void rpu_wall_oss_action_step_set_linear_acc32(int64_t handle, bool enabled) {

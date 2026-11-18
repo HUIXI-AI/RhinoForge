@@ -19,6 +19,8 @@ def _hy_vla(runner):
         rpu_execution=config.get("rpu_execution"),
     ).to("rpu")
     runner.owner = policy
+    runner.stage_boundaries = tuple((stage, getattr(policy, "_runner", None), name) for stage, name in (
+        ("vision", "_run_vit"), ("prefill", "_run_vlm_prefill"), ("denoise", "_run_denoise")))
     request = {
         "images": images,
         "instruction": inputs["instruction"],

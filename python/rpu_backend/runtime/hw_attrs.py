@@ -83,6 +83,12 @@ COLD_ONLY_ATTRS: frozenset[str] = frozenset({
 # not torch modules and therefore never pass through HwAttrValidatorMixin, but
 # their planner state still requires one checked authority.
 PLANNER_SENSITIVE_ATTRS: frozenset[str] = frozenset({
+    "_rpu_audio_component",
+    "_rpu_decoder_topology",
+    "_rpu_vision_num_cores",
+    "_rpu_vision_aux_num_cores",
+    "_rpu_merger_num_cores",
+    "_rpu_qwen3vl_vision_num_cores",
     # Public request and debug controls.
     "_rpu_chunk_size",
     "_rpu_debug_export",
@@ -139,6 +145,7 @@ PLANNER_SENSITIVE_ATTRS: frozenset[str] = frozenset({
     "_rpu_effective_num_kv_heads",
     "_rpu_g05_max_seq_len",
     "_rpu_linear_num_cores",
+    "_rpu_w4_layout",
     "_rpu_linear_partition",
     "_rpu_max_seq",
     "_rpu_max_seq_len",
@@ -211,8 +218,11 @@ PLANNER_SENSITIVE_ATTRS: frozenset[str] = frozenset({
 # match the requested seed. It is test/internal harness state, not an A9 public
 # hardware tuning attribute, and remains mutable for reruns on the same object.
 INTERNAL_HW_ATTRS_TRANSITIONAL: frozenset[str] = frozenset({
+    "_rpu_audio_component",
     "_rpu_decoder_topology",
     "_rpu_vision_num_cores",
+    "_rpu_vision_aux_num_cores",
+    "_rpu_merger_num_cores",
     "_rpu_qwen3vl_vision_num_cores",
     "_rpu_swizzled",
     "_rpu_swizzle_started",
@@ -233,6 +243,7 @@ INTERNAL_HW_ATTRS_TRANSITIONAL: frozenset[str] = frozenset({
     # validate_postinstall. See runtime/weights.py `_record_linear_layout`.
     "_rpu_linear_partition",
     "_rpu_linear_num_cores",
+    "_rpu_w4_layout",
     # v5-04 HND-05 neutral cross-arch handle names (replaces per-arch names).
     "_rpu_decoder_handle",        # CausalLM (Qwen3 / Llama / future)
     "_rpu_decoder_handle_finalizer",
@@ -426,8 +437,11 @@ INTERNAL_HW_ATTRS_TRANSITIONAL: frozenset[str] = frozenset({
 # Names outside this subset are mutable adapter state (for example graph/cache
 # objects and Pi05 warm-inference caches).
 _MONOTONIC_INTERNAL_HW_ATTRS: frozenset[str] = frozenset({
+    "_rpu_audio_component",
     "_rpu_decoder_topology",
     "_rpu_vision_num_cores",
+    "_rpu_vision_aux_num_cores",
+    "_rpu_merger_num_cores",
     "_rpu_qwen3vl_vision_num_cores",
     "_rpu_swizzled",
     "_rpu_swizzle_started",
@@ -441,6 +455,7 @@ _MONOTONIC_INTERNAL_HW_ATTRS: frozenset[str] = frozenset({
     # Eager dispatch reads these as the layout of already-swizzled bytes.
     "_rpu_linear_partition",
     "_rpu_linear_num_cores",
+    "_rpu_w4_layout",
     "_rpu_legacy_prefix_pad16_request",
     "_rpu_legacy_kvinsert_pad16_request",
 })

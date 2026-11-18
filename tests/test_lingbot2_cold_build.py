@@ -12,6 +12,59 @@ from test_graph_cache_freeze import _cache
 from test_lingbot2_strict_retirement import _owner, isolated_process
 
 
+@pytest.mark.parametrize("theta", [10000.0, 20000.0])
+def test_real_hf_derived_buffers_restore_the_original_configuration(theta):
+    import torch
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+        Qwen3VLVisionConfig, Qwen3VLVisionRotaryEmbedding,
+        Qwen3VLTextConfig, Qwen3VLTextRotaryEmbedding,
+    )
+    from rpu_backend.runtime.vision_position import canonical_vision_type
+
+    vision_config = Qwen3VLVisionConfig(hidden_size=1024, num_heads=16,
+        rope_parameters={"rope_type": "axial", "rope_theta": theta})
+    text_config = Qwen3VLTextConfig(hidden_size=2560, num_attention_heads=32,
+        num_key_value_heads=8, head_dim=128,
+        rope_parameters={"rope_type": "default", "rope_theta": 5000000.0,
+                         "mrope_section": [24, 20, 20]})
+
+    def construct():
+        root = torch.nn.Module()
+        if hasattr(Qwen3VLVisionRotaryEmbedding, "compute_axial_rope_parameters"):
+            root.visual = Qwen3VLVisionRotaryEmbedding(vision_config)
+        else:
+            root.visual = Qwen3VLVisionRotaryEmbedding(32, theta)
+        root.text = Qwen3VLTextRotaryEmbedding(text_config)
+        return root
+
+    expected = construct()
+    with torch.device("meta"):
+        actual = construct()
+        actual.weights = torch.nn.Linear(2, 2)
+    original_names = set(dict(actual.named_buffers()))
+    fixed = runtime._materialize_derived_buffers(actual)
+    assert len(fixed) == len(original_names)
+    assert set(dict(actual.named_buffers())) == original_names
+    for name, value in actual.named_buffers():
+        assert value.device.type == "cpu" and torch.isfinite(value).all()
+        torch.testing.assert_close(value, expected.get_buffer(name), rtol=0, atol=0)
+    assert all(parameter.is_meta for parameter in actual.parameters())
+    assert actual.visual._non_persistent_buffers_set == expected.visual._non_persistent_buffers_set
+    assert actual.text._non_persistent_buffers_set == expected.text._non_persistent_buffers_set
+    # Restoring a config faithfully does not admit a new native RoPE profile.
+    assert (canonical_vision_type(vision_config, "qwen3_vl") is not None) == (theta == 10000.0)
+
+
+def test_derived_buffers_reject_unknown_meta_owners():
+    import torch
+
+    owner = torch.nn.Module()
+    owner.register_buffer("unknown", torch.empty(2, device="meta"))
+    with pytest.raises(RuntimeError, match="not a known config-derived module"):
+        runtime._materialize_derived_buffers(owner)
+    assert owner.unknown.is_meta
+
+
 def test_checkpoint_sources_release_before_precision_and_device_conversion(monkeypatch, tmp_path):
     """The FP32 source dictionary must not pin a second backbone during upload."""
     import torch
@@ -47,8 +100,7 @@ def test_checkpoint_sources_release_before_precision_and_device_conversion(monke
 
 
 def _facade():
-    policy = lingbot2.Lingbot2Policy.from_checkpoint(
-        "unused", qwen3vl_base="/models/processor", runtime_env={"RPU_LINGBOT2_ALLOW_UNVALIDATED": "1"})
+    policy = lingbot2.Lingbot2Policy.from_checkpoint("unused", qwen3vl_base="/models/processor")
     policy._preflight_processor_contract = lambda: None
     return policy
 
@@ -56,32 +108,32 @@ def _facade():
 @pytest.mark.parametrize("entry", ["facade", "runtime"])
 @pytest.mark.parametrize("opt_in", [None, "0", "true", "01"])
 def test_generic_evaluation_guard_rejects_before_any_materialization(monkeypatch, entry, opt_in):
-    """The generic source remains evaluation-only, outside exact-Z2 support."""
-    from rpu_backend.api import causal_lm
-    from rpu_backend.runtime import RPUBackendError
-
+    """Public FP16/W8 templates are supported: no opt-in guard precedes
+    materialization (name kept for the sensitive-attribute census)."""
     monkeypatch.delenv("RPU_LINGBOT2_MULTIVIEW_SPM_Z2", raising=False)
     monkeypatch.delenv("RPU_LINGBOT2_ALLOW_UNVALIDATED", raising=False)
     if opt_in is not None:
         monkeypatch.setenv("RPU_LINGBOT2_ALLOW_UNVALIDATED", opt_in)
     entered = []
-    def forbidden(*args, **kwargs):
+
+    class Reached(Exception):
+        pass
+
+    def materialize(*args, **kwargs):
         entered.append("materialize")
-        raise AssertionError("unvalidated generic policy reached materialization")
-    monkeypatch.setattr(runtime, "_build_lingbot_vla_v2_impl", forbidden)
-    before = causal_lm._LIVE_REF
+        raise Reached()
+    monkeypatch.setattr(runtime, "_build_lingbot_vla_v2_impl", materialize)
     policy = None
     if entry == "facade":
-        policy = lingbot2.Lingbot2Policy.from_checkpoint("must-not-be-read")
+        policy = lingbot2.Lingbot2Policy.from_checkpoint("must-not-be-read", qwen3vl_base="/models/processor")
+        policy._preflight_processor_contract = lambda: None
         invoke = lambda: policy.to("rpu")
     else:
         invoke = lambda: runtime.build_lingbot_vla_v2("must-not-be-read")
-    expected_error = RPUBackendError if entry == "facade" else RuntimeError
-    with pytest.raises(expected_error, match="evaluation-only"):
+    with pytest.raises(Exception) as caught:
         invoke()
-    assert entered == [] and causal_lm._LIVE_REF is before
+    assert entered == ["materialize"], caught.value
     if policy is not None:
-        assert not policy._rpu_ready and policy._policy is None
         policy.close()
 
 

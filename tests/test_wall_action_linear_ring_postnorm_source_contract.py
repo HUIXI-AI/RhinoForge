@@ -1,3 +1,5 @@
+from pi_wall_host_catalog import assert_current_catalog, CATALOG_INCLUDE
+from test_siglip_attention_dry_live_contract import _function
 """Board-free contract for the exact Wall Action linear/ring/postnorm path."""
 
 from pathlib import Path
@@ -52,16 +54,14 @@ def test_layer_zero_seeds_full_carry_then_later_layers_stay_compact():
 
 
 def test_exact_buffer_and_kernel_launch_contract_are_present():
+    assert_current_catalog("ActionRingPostnorm", "ActionRingPostnormSpmWeight")
     assert "h == 1024 && intermediate_size() == 2048" in ACTION
     assert "num_layers() == 36 && attn_tp() == NUM_CORES" in ACTION
-    assert (
-        '"wall_action_w8a16_n128_linear_ring_postnorm_m20n1024k256"'
-        in CACHE
-    )
-    assert "residual_local_shard ? 2 : 0" in LINEAR
-    assert "queue->set_broadcast_mode(true);" in LINEAR
-    assert "queue->enqueu_kernel(*kernel, {8, 1, 1}, cores);" in LINEAR
-    assert "missing from expansion ref" in LINEAR
+    launcher=_function(LINEAR,"void rpu_launch_wall_action_linear_ring_postnorm_spm_kernel(")
+    assert "residual_local_shard ? 2 : 0" in launcher
+    assert "queue->set_broadcast_mode(true);" in launcher
+    assert "{selected.grid_x, selected.grid_y, 1}" in launcher
+    assert "missing from expansion ref" in launcher
 
 
 def test_manifest_covers_actual_first_and_later_action_layers(tmp_path):
@@ -331,7 +331,7 @@ int main() {
                         "CONSUMER_DOWN": consumer_down}.items():
         program = program.replace(name, value)
     source = tmp_path / "wall_action_routes.cpp"
-    source.write_text(program)
+    source.write_text(CATALOG_INCLUDE + program)
     executable = tmp_path / "wall_action_routes"
     compiler = shutil.which("c++")
     assert compiler, "native route parity check requires a C++ compiler"

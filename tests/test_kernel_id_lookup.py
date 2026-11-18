@@ -50,6 +50,7 @@ def test_kernel_cache_and_graph_names_do_not_truncate_ids(tmp_path):
 #include <cstdint>
 #include <optional>
 #include <string>
+#include "rpu_pi_wall_tiling.h"
 ''' + enum + "\n" + names + r'''
 namespace rhino_lkn { struct Kernel_t {}; struct Program_t {}; }
 struct Cache {
@@ -82,11 +83,11 @@ int main() {
     cpp, executable = tmp_path / "kernel_ids.cpp", tmp_path / "kernel_ids"
     cpp.write_text(harness)
     subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
-                    str(cpp), "-o", str(executable)], check=True)
+                    "-I", str(ROOT / "src/core"), "-I", str(ROOT / "src/ops"), str(cpp), "-o", str(executable)], check=True)
     subprocess.run([str(executable)], check=True)
 
 
-def test_wall_legacy_publication_and_g05_capabilities_remain_independent(tmp_path):
+def test_generated_and_named_capabilities_remain_independent(tmp_path):
     compiler = shutil.which("g++")
     if compiler is None:
         pytest.skip("host C++ compiler unavailable")
@@ -101,27 +102,31 @@ def test_wall_legacy_publication_and_g05_capabilities_remain_independent(tmp_pat
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
+#include "rpu_pi_wall_tiling.h"
 #define TORCH_CHECK(c, ...) do { if (!(c)) throw std::runtime_error("rejected"); } while (0)
 ''' + enum + "\n" + availability + r'''
 int main() {
     KernelPayloadAvailability payload;
-    const std::array<KernelId, 5> optional{
-        KernelId::WALL_QKV_W8A16_MULTIBASE_M448N64,
+    const std::array<KernelId, 7> optional{
+        KernelId::PL_U_FP16_ACC16_M1584N32K32,
+        KernelId::PI_WALL_QKV_W8A16_ACC16_M464N64K128_256X128X128,
+        KernelId::GROUPED_PL_W8_ACC32_N48_DEVICE_M,
         KernelId::PI05_ADARMS_NORM_SHIFT_H1024,
         KernelId::PI05_GATED_RESIDUAL_H1024,
         KernelId::PARALLEL_LINEAR_NVFP4_V2_M320N64,
         KernelId::PARALLEL_LINEAR_NVFP4_V2_M384N48};
-    // Existing main callers pass Wall QKV in the original final argument.
-    payload.publish(false, false, false, false, false, false, {},
-                    false, false, false, false, false, false, false, true);
-    for (size_t i = 0; i < optional.size(); ++i)
-        assert(payload.has_loaded(optional[i]) == (i == 0));
-    // Each appended G05 capability is independent of Wall and its neighbours.
+    payload.publish(false, false);
+    for (const auto id : optional) assert(!payload.has_loaded(id));
+    // Generated tiles/device-M use the loaded-ID set; named capabilities keep
+    // their independent flags. Publishing either must not enable its neighbours.
     for (size_t selected = 0; selected < optional.size(); ++selected) {
-        payload.publish(false, false, false, false, false, false, {},
-                        false, false, false, false, false, false, false,
-                        selected == 0, selected == 1, selected == 2,
-                        selected == 3, selected == 4);
+        KernelPayloadAvailability::ExtendedPayloads loaded;
+        if (selected < 3)
+            loaded.set(static_cast<size_t>(optional[selected]) -
+                       KernelPayloadAvailability::kExtendedBegin);
+        payload.publish(false, false, false, false, false, false, loaded,
+                        false, false, false, false, false, false, false, false,
+                        selected == 3, selected == 4, selected == 5, selected == 6);
         for (size_t i = 0; i < optional.size(); ++i)
             assert(payload.has_loaded(optional[i]) == (i == selected));
     }
@@ -137,5 +142,5 @@ int main() {
     cpp, executable = tmp_path / "capabilities.cpp", tmp_path / "capabilities"
     cpp.write_text(harness)
     subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
-                    str(cpp), "-o", str(executable)], check=True)
+                    "-I", str(ROOT / "src/core"), "-I", str(ROOT / "src/ops"), str(cpp), "-o", str(executable)], check=True)
     subprocess.run([str(executable)], check=True)

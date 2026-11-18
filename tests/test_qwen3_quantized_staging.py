@@ -12,7 +12,7 @@ from safetensors.torch import save_file
 from transformers import Qwen3Config
 
 from rpu_backend.quant import load_qwen3_quantized as staged
-from rpu_backend.quant.convert_qwen3_w4a16 import _PROJECTIONS, pack_linear_int4_
+from rpu_backend.quant.convert_qwen3_w4a16 import _PROJECTIONS, pack_linear_int4_, packed_mlp_padded_size
 from rpu_backend.quant.int4_pgrp_pack import quantize_pack_int4_pgrp_col_bounded
 from rpu_backend.runtime.weights import transform_linear_weight
 
@@ -77,7 +77,7 @@ def stage(source, recipe="w4a16"):
 
 
 def cpu_device_surrogate(monkeypatch):
-    """Exercise packing/bank copies on host; no device semantics are claimed."""
+    """Exercise packing/bank copies on host; no RPU semantics are claimed."""
     original_empty, original_to = torch.empty, torch.Tensor.to
     allocations = []
 
@@ -210,11 +210,14 @@ def test_materializer_requires_poison_and_failed_install_is_not_reusable(source,
 
 
 @pytest.mark.parametrize("recipe", ["w4a16", "w4a16_lm_head"])
-def test_real_packing_matches_reference_and_banks_share_only_storage(source, monkeypatch, recipe):
+@pytest.mark.parametrize("cores", [4, 6, 8])
+def test_real_packing_matches_reference_and_banks_share_only_storage(source, monkeypatch, recipe, cores):
+    from rpu_backend.quant.qwen3_profiles import qwen3_w4_topology
     model = stage(source, recipe)
+    topology = qwen3_w4_topology(model.config, cores)
     allocations = cpu_device_surrogate(monkeypatch)
     model._rpu_swizzle_started = True
-    staged.materialize_staged_qwen3_w4a16_for_rpu(model, quantization=recipe)
+    staged.materialize_staged_qwen3_w4a16_for_rpu(model, quantization=recipe, topology=topology)
     assert staged._PLAN_ATTR not in vars(model)
     assert all(not value.is_meta for value in (*model.parameters(), *model.buffers()))
     assert len(allocations) == 2 * 64
@@ -227,23 +230,30 @@ def test_real_packing_matches_reference_and_banks_share_only_storage(source, mon
                 weight_owners.add(module.weight.untyped_storage().data_ptr())
                 scale_owners.add(module.weight_scale.untyped_storage().data_ptr())
                 pointers.add(module.weight.data_ptr())
-                assert (module._rpu_linear_partition, module._rpu_linear_num_cores) == (partition, 8)
+                tp = topology.mlp_tp if role.startswith("mlp.") else topology.attn_tp
+                assert (module._rpu_linear_partition, module._rpu_linear_num_cores) == (partition, tp)
                 if index == 0:
                     ref = nn.Linear(512, 128, bias=False)
                     ref.weight = nn.Parameter(reader.get_tensor(f"model.layers.{index}.{role}.weight").half())
-                    pack_linear_int4_(ref, partition, group_size=32)
+                    padded = packed_mlp_padded_size(role, ref, topology.mlp_tp)
+                    # Six-lane MLP leaves are zero-padded once; others keep their width.
+                    assert (padded is not None) == (role.startswith("mlp.") and cores == 6)
+                    pack_linear_int4_(ref, partition, group_size=32, num_cores=tp,
+                                      padded_size=padded)
                     assert torch.equal(module.weight, ref.weight)
                     assert torch.equal(module.weight_scale, ref.weight_scale)
+                    assert (module.out_features, module.in_features) == (
+                        ref.out_features, ref.in_features)
             assert len(weight_owners) == len(scale_owners) == 1 and len(pointers) == 7
             assert not banks.intersection(weight_owners)
             banks.update(weight_owners)
         head = reader.get_tensor("lm_head.weight").half()
         if recipe == "w4a16_lm_head":
-            weight, scale = quantize_pack_int4_pgrp_col_bounded(head)
+            weight, scale = quantize_pack_int4_pgrp_col_bounded(head, num_cores=topology.lm_head_tp)
             assert torch.equal(model.lm_head.weight, weight)
             assert torch.equal(model.lm_head.weight_scale, scale)
         else:
-            assert torch.equal(model.lm_head.weight, transform_linear_weight(head, 1))
+            assert torch.equal(model.lm_head.weight, transform_linear_weight(head, 1, num_cores=topology.lm_head_tp))
         assert torch.equal(model.model.embed_tokens.weight,
                            reader.get_tensor("model.embed_tokens.weight").half())
         assert model.model.embed_tokens.weight.data_ptr() != model.lm_head.weight.data_ptr()

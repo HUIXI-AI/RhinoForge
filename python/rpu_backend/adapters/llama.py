@@ -30,6 +30,7 @@ from transformers.models.llama.modeling_llama import (
     LlamaRMSNorm,
     LlamaRotaryEmbedding,
 )
+from rpu_backend._native_loader import require_native_backend
 from rpu_backend.runtime.decoder import (
     _install_rmsnorm_class_swap,
     _install_rotary_class_swap,
@@ -70,8 +71,12 @@ from rpu_backend.runtime.decoder import (
 
 from rpu_backend.api.errors import UnsupportedModelError, RPUBackendError
 from rpu_backend.api.causal_lm import _claim_live_instance
+from rpu_backend.api._execution import _LLAMA_EXECUTION_SUPPORTED, llama_core_profile
 from rpu_backend.runtime.device import extract_to_device_target, is_rpu_device_target
 from rpu_backend.runtime.chunk_envelope import ChunkEnvelope, make_lookup
+from rpu_backend.runtime.topology import (
+    decoder_mlp_intermediate_size, execution_core_count, resolve_decoder_topology,
+)
 
 # Explicit chunk bounds for the supported Llama-3.2-1B configuration.
 _CHUNK_ENVELOPE = {
@@ -147,6 +152,51 @@ def _check_profile(config) -> None:
         )
 
 
+def _execution_topology(config, execution_config):
+    """Cold topology for a reduced budget; ``None`` keeps the eight-core install.
+
+    Budget 8 (explicit or omitted) passes no topology to the shared installer,
+    so its native create/weights/Graph identity stays as before. Budgets 4/6
+    bind the shared reduced template (attention/MLP/head 4/4/4 or 4/6/4).
+    """
+    try:
+        cores = execution_core_count(execution_config)
+        if cores == 8:
+            return None
+        profile = llama_core_profile(config, cores)
+        return resolve_decoder_topology(num_cores=cores, **profile.geometry())
+    except ValueError as exc:
+        raise UnsupportedModelError(str(exc)) from exc
+
+
+def _validate_reduced_model_structure(model, topology, *, before_swizzle=False) -> None:
+    """Check the actual FP16 modules; ``before_swizzle`` adds the CPU MLP leaves.
+
+    The constructor also sees meta/CPU models; ``to_rpu`` repeats the complete
+    check, including the padding inputs, before claiming or mutating anything.
+    """
+    if topology is None:
+        return
+    from rpu_backend.runtime.weights import (
+        validate_decoder_mlp_padding, validate_decoder_weight_structure,
+    )
+    try:
+        profile = llama_core_profile(model.config, topology.num_cores)
+        if resolve_decoder_topology(num_cores=topology.num_cores,
+                                    **profile.geometry()) != topology:
+            raise ValueError("decoder geometry changed its bound cold topology")
+        if any(parameter.dtype != torch.float16 for parameter in model.parameters()):
+            raise ValueError("reduced-core Llama requires plain FP16 model weights")
+        validate_decoder_weight_structure(model, **profile.weight_geometry(), qk_norm=False)
+        if before_swizzle:
+            validate_decoder_mlp_padding(
+                model, logical_size=profile.intermediate_size,
+                physical_size=decoder_mlp_intermediate_size(profile.intermediate_size,
+                                                            topology.mlp_tp))
+    except ValueError as exc:
+        raise UnsupportedModelError(str(exc)) from exc
+
+
 class LlamaAdapter:
     """Per-instance adapter for HF `LlamaForCausalLM`.
 
@@ -156,6 +206,8 @@ class LlamaAdapter:
     violating the import-graph contract.
     """
 
+    EXECUTION_SUPPORTED = _LLAMA_EXECUTION_SUPPORTED
+
     @classmethod
     def preflight(cls, config) -> None:
         """Config-only fail-fast preflight (called by `from_pretrained`)."""
@@ -163,6 +215,7 @@ class LlamaAdapter:
 
     @classmethod
     def preflight_execution(cls, config, execution_config) -> None:
+        _execution_topology(config, execution_config)
         requested = execution_config.get("prefill", {}).get(
             "chunk_size", "auto"
         )
@@ -183,6 +236,10 @@ class LlamaAdapter:
         _check_profile(model.config)
         self.model = model
         self._all_layers_once_handle: int | None = None
+        self._topology = _execution_topology(
+            model.config, getattr(model, "_rpu_execution", None))
+        if not _causal_lm_runtime_complete(model):
+            _validate_reduced_model_structure(model, self._topology)
         # Mirror Qwen3Adapter pattern: readiness lives on the model so a second
         # adapter on the same instance does NOT re-swizzle (Pitfall 1).
         self._rpu_is_ready: bool = _causal_lm_runtime_complete(model)
@@ -275,11 +332,17 @@ class LlamaAdapter:
                 install_hw_attr_validator, validate_postinstall, validate_preinstall,
             )
             validate_preinstall(self.model)
+            if (_execution_topology(self.model.config, getattr(self.model, "_rpu_execution", None))
+                    != self._topology):
+                raise UnsupportedModelError("Llama core budget changed after adapter binding")
+            _validate_reduced_model_structure(self.model, self._topology, before_swizzle=True)
 
             require_native_backend()
             _claim_live_instance(self.model)
 
             self.model._rpu_swizzle_started = True
+            if self._topology is not None:
+                self.model._rpu_decoder_topology = self._topology
             inner = self.model.model
             inner_state = vars(inner)
             had_instance_forward = "forward" in inner_state
@@ -287,7 +350,23 @@ class LlamaAdapter:
             try:
                 # Plain Llama has no specialized Linear leaves, so an empty
                 # skip set is intentional.
-                swizzle_model_inplace(self.model, skip_names=set())
+                if self._topology is None:
+                    swizzle_model_inplace(self.model, skip_names=set())
+                else:
+                    # MLP6 needs 8192 -> 8256 (8192 % 96 == 32): zero rows/
+                    # columns are added once on CPU before the single swizzle.
+                    from rpu_backend.runtime.weights import pad_decoder_mlp_weights
+                    logical = self.model.config.intermediate_size
+                    pad_decoder_mlp_weights(self.model, logical_size=logical,
+                        physical_size=decoder_mlp_intermediate_size(
+                            logical, self._topology.mlp_tp))
+                    swizzle_model_inplace(
+                        self.model, skip_names=set(),
+                        attn_num_cores=self._topology.attn_tp,
+                        mlp_num_cores=self._topology.mlp_tp,
+                        lm_head_num_cores=self._topology.lm_head_tp,
+                        execution_core_count=self._topology.num_cores,
+                    )
                 original_to = type(self.model).to
                 original_to(self.model, "rpu")
                 self._all_layers_once_handle = _install_causal_decoder_forward(
@@ -296,6 +375,8 @@ class LlamaAdapter:
                     execution_config=getattr(
                         self.model, "_rpu_execution", None
                     ),
+                    **({"topology": self._topology}
+                       if self._topology is not None else {}),
                 )
                 _enable_causal_decoder_execution_reconfigure(inner)
                 self._execution_session = _bind_causal_decoder_execution_session(

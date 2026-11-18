@@ -207,6 +207,7 @@ struct Model{
  std::vector<int64_t> ordinary_o_route_arguments(int64_t,bool)const{return {};}
  CausalDecoderLinearRoute decoder_projection_route(int64_t)const{return CausalDecoderLinearRoute::AUTO_TILE;}
  bool qwen3vl_decode_gemv(int64_t)const{return false;}
+ static std::vector<int64_t> qwen3vl_decode_o_contract_arguments(){return {};}
  uint32_t addr(int,std::string s)const{return s=="output"?1:s=="oproj"?2:s=="residual2"?3:4;}
  uint32_t norm_post_addr(int,int)const{return 5;}uint32_t nvfp4_scale_addr(const char*)const{return 6;}
  HELPERS

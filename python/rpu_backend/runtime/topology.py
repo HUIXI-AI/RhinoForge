@@ -28,6 +28,9 @@ class DecoderGeometryProfile:
     head_dim: int
     vocab_size: int
     six_core_mlp_tp: int
+    # Per-head Q/K RMSNorm before RoPE. Adapters admit only rows whose decoder
+    # structure matches their architecture.
+    qk_norm: bool = True
 
     def geometry(self):
         return {name: getattr(self, name) for name in (
@@ -46,12 +49,35 @@ DECODER_GEOMETRY_PROFILES = (
     DecoderGeometryProfile(2048, 6144, 28, 16, 8, 128, 151936, 6),
     DecoderGeometryProfile(2560, 9728, 36, 32, 8, 128, 151936, 6),
     DecoderGeometryProfile(4096, 12288, 36, 32, 8, 128, 151936, 6),
+    # Large dense Qwen3 models use the same reduced execution template.  The
+    # attention/head domains remain on four lanes; only the MLP uses the
+    # six-lane padded width.
+    DecoderGeometryProfile(5120, 17408, 40, 40, 8, 128, 151936, 6),
+    DecoderGeometryProfile(5120, 25600, 64, 64, 8, 128, 151936, 6),
+    # Llama-3.2-1B reuses the same template: attention/head 4 (8 Q + 2 KV heads
+    # per core, D64, no QK-norm) and MLP6 on a padded 8256 physical width.
+    DecoderGeometryProfile(2048, 8192, 16, 32, 8, 64, 128256, 6, qk_norm=False),
 )
 
 
 def decoder_mlp_intermediate_size(logical_size: int, mlp_tp: int) -> int:
     """Physical width for an already admitted cold decoder topology."""
-    return {3584: 3648, 9728: 9792, 17408: 17472}.get(logical_size, logical_size) if mlp_tp == 6 else logical_size
+    return {3584: 3648, 8192: 8256, 9728: 9792, 17408: 17472,
+            25600: 25728}.get(logical_size, logical_size) if mlp_tp == 6 else logical_size
+
+
+# Signed W4 pgrp packing uses the unified N32K32 ABI. A row-partitioned Down
+# therefore needs K/TP % 32. Six lanes need only a 192-aligned physical width;
+# 4/8 lanes and already aligned widths keep logical storage.
+PACKED_W4_K_TILE = 32
+
+
+def decoder_packed_w4_mlp_intermediate_size(logical_size: int, mlp_tp: int) -> int:
+    """Physical MLP width for a packed signed-W4 G32 decoder (native mirror)."""
+    if mlp_tp != 6:
+        return logical_size
+    alignment = PACKED_W4_K_TILE * mlp_tp
+    return (logical_size + alignment - 1) // alignment * alignment
 
 
 def decoder_geometry_profile(*, hidden_size, intermediate_size, num_q_heads,

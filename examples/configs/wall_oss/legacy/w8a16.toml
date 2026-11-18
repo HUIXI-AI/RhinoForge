@@ -1,26 +1,38 @@
-[example]
+# 未写出的执行参数（省略即按以下值运行）：
+#   [cpu].threads 省略时不设置线程：PyTorch 使用环境变量 OMP_NUM_THREADS，未设置时使用全部 CPU 核（参考板 24）；2026-10-19 测量环境预设为 16。
+#   rpu_execution.model.num_cores 固定 8 核（可显式写 8；4/6 核不支持，原因见模型页配置表）。
+#   分块（chunk_size）模板未写出，按 auto 由入口选择；2026-10-19 模板默认输入实测：vision 576、prefill 320、action 32。可调范围见模型页。
+[model]
 profile_id = "wall-oss-0.5-w8a16.w8a16.vla"
 registry_alias = "wall-oss-0.5-w8a16"
 target = "wall_oss"
-dtype = "w8a16"
+precision = "w8a16"
+fp16_registry_alias = "wall-oss-0.5"
 
-[example.opt_in]
+[model.opt_in]
 
 [input]
+# 替换图像路径；相机数量、处理后尺寸和文本长度需满足本模型输入范围。
 images = ["/path/to/face.png", "/path/to/left_wrist.png", "/path/to/right_wrist.png"]
 instruction = "Move the object to the target."
 proprioception = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 state_mask = [1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+# Graph 准备的真实 prefix 范围；固定 profile 不能任意扩大。
 prefix_length_range = [545, 640]
 camera_names = ["face_view", "left_wrist_view", "right_wrist_view"]
+# 固定随机种子；更改会改变输入噪声。
 noise_seed = 0
-fp16_registry_alias = "wall-oss-0.5"
 
 [run]
+# 预热次数；不计入正式测量。
 warmup = 2
-runs = 3
+# 正式执行次数，正整数。
+runs = 5
+# 按需开启硬件采样；保持 false 可减少测量干扰。
 hwperf = false
+# 按需开启 profiler；正式计时建议保持 false。
 profile = false
+# 随机种子，非负整数。
 seed = 0
 
 [rpu_execution]

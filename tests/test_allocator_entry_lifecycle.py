@@ -24,6 +24,7 @@ def test_qwen35_quantized_9b_text_claims_caching_before_weight_upload(
     model.config = SimpleNamespace(quant_config=quant)
     model._rpu_execution = {}
     model.forward = original_forward = object()
+    model.half = lambda: model
     adapter = object.__new__(qwen3_5.Qwen3_5Adapter)
     adapter.model, adapter._rpu_is_ready = model, False
     adapter._handle = adapter._graph_cache = None
@@ -74,6 +75,7 @@ def test_qwen35_9b_allocator_failure_is_cold_and_releases_owner(
     model.config = SimpleNamespace(quant_config={"method": "w8a16"} if quantized else None)
     model._rpu_execution = {}
     model.forward = original_forward = object()
+    model.half = lambda: model
     adapter = object.__new__(qwen3_5.Qwen3_5Adapter)
     adapter.model = model
     adapter._rpu_is_ready = False
@@ -101,7 +103,8 @@ def test_qwen35_9b_allocator_failure_is_cold_and_releases_owner(
     class GraphPolicy:
         @classmethod
         def from_environment(cls, **kwargs):
-            assert kwargs == {"execution_core_count": 8, "graph_arena_count": 4, "qwen35_dense_27b_sdk_budget": False}
+            assert kwargs == {"execution_core_count": 8, "graph_arena_count": 4,
+                              "qwen35_dense_27b_sdk_budget": False}
             return cls()
 
         def prepare_arenas(self):

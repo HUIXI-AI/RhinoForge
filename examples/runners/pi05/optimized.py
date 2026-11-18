@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Shared Pi0.5 example engine and historical diagnostic CLI.
 
-T64, T96 and T128 are cold two/three-camera opt-ins.
-T32 remains the default.
+T64, T96, T128 and T160 are cold two/three-camera opt-ins; T192 is
+three-camera FP16/W8A16 only. T32 remains the default.
 
 Use a fresh process for each checkpoint/precision. See examples/configs/pi05/README.md.
 """
@@ -11,6 +11,7 @@ from __future__ import annotations
 from examples.common import cpu as _cpu_helpers
 from examples.common import libraries as _library_helpers
 from examples.common import results as _result_helpers
+from examples.runners.pi05 import openpi_inputs as _openpi
 
 import argparse
 from contextlib import contextmanager, nullcontext
@@ -26,11 +27,23 @@ from types import SimpleNamespace
 _CPU = vars(_cpu_helpers)
 
 _PRECISIONS = ("fp16", "w8a16", "w4a16", "int4_g128", "legacy_int4")
+# The action horizon is a checkpoint property (LeRobot `chunk_size`), so the
+# configured value only states which checkpoint this example expects; the run
+# rejects a checkpoint that disagrees. The same finite set is
+# `ACTION_HORIZONS` in rpu_backend.adapters.pi05.cores and
+# `pi05_action_rows_admitted` in src/fused/rpu_pi05_denoise_step_model.cpp;
+# this module cannot import the backend before binding the cold environment.
+_ACTION_HORIZONS = (10, 50)
 _EXAMPLE_PRECISIONS = ("fp16", "w8a16", "w4a16_kvint8", "w8a16_action_nvfp4", "w8a16_prefill_w8a8_action_nvfp4")
+# Assets with a registered planner profile, keyed by (action horizon,
+# precision): a registered asset carries its own horizon, so the same precision
+# at another horizon is a different checkpoint. The H10 assets
+# (pi05-libero-h10*) have no planner profile; their examples are profile-less
+# and take their status from board runs of the exact TOML.
 _REGISTERED_ASSETS = {
-    "fp16": "pi05-libero-finetuned",
-    "w8a16": "pi05-libero-finetuned-w8a16-vlm-expert",
-    "w4a16_kvint8": "pi05-libero-finetuned-w4real-kvint8",
+    (50, "fp16"): "pi05-libero-finetuned",
+    (50, "w8a16"): "pi05-libero-finetuned-w8a16-vlm-expert",
+    (50, "w4a16_kvint8"): "pi05-libero-finetuned-w4real-kvint8",
 }
 _ON = """
 RING_XOR3 K_ROPE_INSERT KVINSERT_PAD16 DENOISE_UNROLL PREFILL_MASK_FP16 PREFILL_KV_ONLY
@@ -47,18 +60,26 @@ KVINSERT_PAD16 DENOISE_UNROLL PREFILL_MASK_FP16 FUSED_DENOISE SIGLIP_BATCH
 _OFF = """
 GEGLU_PREFETCH SDPA_SINGLE_GROUP VISION_FC_WEIGHT_OUTER PREFILL_CARRY_A
 PREFILL_ROPE_CACHE DENOISE_GATEUP_RESIDENT DENOISE_ELIDE_UNUSED_DMA
-DENOISE_SPM_ACTION_STAGING DENOISE_Q_ROPE_EPILOGUE PREFILL_O_CHAIN
+DENOISE_SPM_ACTION_STAGING DENOISE_Q_ROPE_EPILOGUE
 PREFILL_QKV_PAIR DENOISE_ADARMS_BODY_STREAM DENOISE_GATEUP_RESIDENT_LAYERS
 DENOISE_KV1_GATHER
-DENOISE_NVFP4_GEGLU_ACC16_M50
+DENOISE_NVFP4_GEGLU_ACC16_M50 VISION_LN_STREAM
 """.split()
 
 
 _LOG = logging.getLogger(__name__)
+# Raw openpi inputs: each measured request starts from decoded native camera frames.
+RAW_TIMING_SCOPE = ("host wall time from decoded native camera frames to physical actions: openpi "
+                    "resize_with_pad/prompt/tokenize, RPU inference, CPU output copy, Unnormalize + "
+                    "AbsoluteActions; frame file decode, load, prepare, and warmup excluded")
+RAW_PHASE_BOUNDARY = ("preprocess = openpi host transforms of the native frames and state; instrumented "
+                      "Vision/Prefill/Denoise host calls; postprocess = physical action transform; "
+                      "CPU output copy only in the total")
 
 def profile_environment(
     precision: str, *, prefill_w8a8: bool | None = None,
     vision_owner_ln: bool | None = None, cameras: int = 3, text_tokens: int = 32,
+    action_horizon: int = 50,
 ) -> dict[str, str]:
     """Return cold settings; explicit opt-ins default off in the CLI.
 
@@ -69,6 +90,7 @@ def profile_environment(
         raise ValueError("precision must be fp16, w8a16, w4a16 (NVFP4), int4_g128, or legacy_int4")
     if type(cameras) is not int or cameras not in (2, 3):
         raise ValueError("cameras must be 2 or 3")
+    _validate_action_horizon(action_horizon)
     _validate_text_profile(text_tokens, cameras=cameras, precision=precision)
     for name, value in (("prefill_w8a8", prefill_w8a8),
                         ("vision_owner_ln", vision_owner_ln)):
@@ -76,6 +98,8 @@ def profile_environment(
             raise TypeError(f"{name} must be bool or None")
     if prefill_w8a8 and precision != "w4a16":
         raise ValueError("Prefill W8A8 is admitted only with Action NVFP4 (--precision w4a16)")
+    # Every route below takes its row count from a launch register, so the
+    # enabled set is the same at either horizon (examples/configs/pi05/README.md).
     result = {"RPU_PI05_" + name: str(int(cameras == 3 or precision in ("fp16", "w8a16", "w4a16") or name in _GENERIC_ON))
               for name in _ON}
     result.update({"RPU_PI05_" + name: "0" for name in _OFF})
@@ -96,23 +120,38 @@ def profile_environment(
                         ("VISION_OWNER_LN", vision_owner_ln)):
         if value is not None or precision == "fp16" or cameras == 2:
             result["RPU_PI05_" + name] = str(int(bool(value)))
+    # C480 (T192) fits the SPM only with the SigLIP LayerNorm vectors streamed
+    # per layer instead of held persistent (examples/configs/pi05/README.md).
+    result["RPU_PI05_VISION_LN_STREAM"] = str(int(text_tokens == _C480_TEXT_TOKENS))
     return result
 
 
+def _validate_action_horizon(action_horizon: int) -> None:
+    if type(action_horizon) is not int or action_horizon not in _ACTION_HORIZONS:
+        raise ValueError(f"action_horizon must be one of {_ACTION_HORIZONS}")
+
+
+# Three-camera T192 pairs P960 as C480: the C464 layout at 480 rows, with the
+# SigLIP LayerNorm vectors streamed; it has no A8 or Action NVFP4 route.
+# Off the paired geometry its AUTO prefill chunk is 320 rows (P960 = 3 x 320):
+# the planner's own AUTO picks 480 rows, which fit only the paired layout.
+_C480_TEXT_TOKENS = 192
+_C480_GENERIC_CHUNK = 320
+
+
 def _validate_text_profile(text_tokens: int, *, cameras: int, precision: str | None = None) -> None:
-    if type(text_tokens) is not int or text_tokens not in (32, 64, 96, 128, 160):
-        raise ValueError("text_tokens must be 32, 64, 96, 128, or 160")
+    if type(text_tokens) is not int or text_tokens not in (32, 64, 96, 128, 160, _C480_TEXT_TOKENS):
+        raise ValueError("text_tokens must be 32, 64, 96, 128, 160, or 192")
     if text_tokens != 32:
         if cameras not in (2, 3):
             raise ValueError(f"T{text_tokens} requires exactly two or three cameras")
-        if precision is not None and precision not in ("fp16", "w8a16", "w4a16"):
+        if text_tokens == _C480_TEXT_TOKENS:
+            if cameras != 3:
+                raise ValueError(f"T{text_tokens} requires exactly three cameras")
+            if precision is not None and precision not in ("fp16", "w8a16"):
+                raise ValueError(f"T{text_tokens} requires FP16 or W8A16 precision (C480 has no A8 or Action NVFP4 route)")
+        elif precision is not None and precision not in ("fp16", "w8a16", "w4a16"):
             raise ValueError(f"T{text_tokens} requires FP16, W8A16, or Action NVFP4 precision")
-
-
-def _cpu_interop_threads(*, paired: bool, precision: str, prefill_w8a8: bool,
-                         cameras: int, text_tokens: int) -> int:
-    return 1 if (paired and precision == "w4a16" and prefill_w8a8
-                 and cameras == 3 and text_tokens == 160) else 24
 
 
 def resolve_prefill_chunk_size(*, cameras: int, prefill_w8a8: bool, requested: int | None,
@@ -123,6 +162,8 @@ def resolve_prefill_chunk_size(*, cameras: int, prefill_w8a8: bool, requested: i
     if type(prefill_w8a8) is not bool:
         raise TypeError("prefill_w8a8 must be bool")
     _validate_text_profile(text_tokens, cameras=cameras)
+    if prefill_w8a8 and text_tokens == _C480_TEXT_TOKENS:
+        raise ValueError(f"T{text_tokens} has no Prefill W8A8 route")
     expected = (cameras * 256 + text_tokens) // 2
     chunk = expected if requested is None else requested
     if type(chunk) is not int or chunk <= 0 or chunk % 16:
@@ -192,6 +233,49 @@ def validate_camera_batch(batch: dict, image_features, *, cameras: int, text_tok
             raise ValueError(f"T{text_tokens} requires a nonempty boolean [1,{text_tokens}] language mask with right padding")
 
 
+LIBERO_IMAGE_SHAPE = (1, 3, 256, 256)
+
+
+def checkpoint_contract(checkpoint: Path, action_dim: int | None = None) -> dict:
+    """Camera image shapes and action width the checkpoint config declares, read before loading.
+
+    LIBERO batches keep their 256x256 host images, which the policy resizes to
+    its 224 resolution. A checkpoint whose every VISUAL feature is already
+    ``[3, *image_resolution]`` (pi05_base, openpi host-resized inputs) also
+    accepts images at that resolution; the policy then does no resize.
+    """
+    config = json.loads((Path(checkpoint) / "config.json").read_text(encoding="utf-8"))
+    action = ((config.get("output_features") or {}).get("action") or {}).get("shape")
+    if (not isinstance(action, list) or len(action) != 1 or type(action[0]) is not int
+            or not 1 <= action[0] <= int(config.get("max_action_dim", 32))):
+        raise ValueError(f"{checkpoint}/config.json must declare one-dimensional output_features.action "
+                         "within max_action_dim")
+    if action_dim is not None and action[0] != action_dim:
+        raise ValueError(f"[input].action_dim={action_dim}, but the checkpoint declares action [{action[0]}]")
+    shapes = [LIBERO_IMAGE_SHAPE]
+    resolution = config.get("image_resolution")
+    visual = [feature.get("shape") for feature in (config.get("input_features") or {}).values()
+              if isinstance(feature, dict) and feature.get("type") == "VISUAL"]
+    if (isinstance(resolution, list) and len(resolution) == 2 and visual
+            and all(shape == [3, *resolution] for shape in visual)):
+        native = (1, 3, *resolution)
+        if native not in shapes:
+            shapes.append(native)
+    return {"action_dim": action[0], "image_shapes": tuple(shapes)}
+
+
+def validate_image_shapes(batch: dict, shapes) -> None:
+    """Every camera image must share one admitted shape (see checkpoint_contract)."""
+    import torch
+
+    found = {tuple(value.shape) if torch.is_tensor(value) else None for key, value in batch.items()
+             if key.startswith("observation.images.") and not key.endswith("_padding_mask")}
+    # Missing camera slots are reported against the policy's image features after loading.
+    if found and (len(found) != 1 or next(iter(found)) not in shapes):
+        allowed = " or ".join("[" + ",".join(map(str, shape)) + "]" for shape in shapes)
+        raise ValueError(f"Pi0.5 example requires every camera image to have shape {allowed} for this checkpoint")
+
+
 def validate_three_camera_batch(batch: dict, image_features) -> None:
     """Compatibility entry for existing P800 experiment probes."""
     validate_camera_batch(batch, image_features, cameras=3)
@@ -233,6 +317,8 @@ def configure_text_profile(policy, text_tokens: int) -> dict:
     quant = getattr(lerobot, "_pi05_quant_config", {}) or {}
     if text_tokens != 32 and quant.get("method") not in (None, "w8a16", "nvfp4a16"):
         raise ValueError(f"T{text_tokens} requires FP16, W8A16, or Action NVFP4 precision")
+    if text_tokens == _C480_TEXT_TOKENS and quant.get("method") not in (None, "w8a16"):
+        raise ValueError(f"T{text_tokens} requires FP16 or W8A16 precision (C480 has no A8 or Action NVFP4 route)")
     previous = getattr(adapter, "_rpu_prefill_text_tokens", 32)
     adapter._rpu_prefill_text_tokens = text_tokens
     return {"previous_text_tokens": previous, "text_tokens": text_tokens,
@@ -240,14 +326,13 @@ def configure_text_profile(policy, text_tokens: int) -> dict:
             "configured_before_rpu_install": True}
 
 
-def configure_two_camera_policy(policy, batch: dict, *, text_tokens: int = 32) -> dict:
-    """Select two real VISUAL fields on the shared config before device install.
+def select_two_camera_features(config, batch: dict, *, text_tokens: int = 32):
+    """Keep the batch's two real VISUAL fields on one LeRobot Pi0.5 config.
 
-    LeRobot reads config.image_features dynamically during preprocessing; the
-    adapter reads the same object when choosing the packed Vision row count.
-    No weights or checkpoint quantization metadata are changed here.
+    Shared by the RPU policy below and the CPU reference producer, so both
+    consume the same cameras. Returns the previous image features and
+    empty_cameras value.
     """
-    lerobot, adapter, config = _require_cold_shared_policy(policy, "two-camera")
     before = dict(config.image_features)
     selected = {key: feature for key, feature in before.items()
                 if key in batch and not key.rsplit(".", 1)[-1].startswith("empty_camera_")}
@@ -258,6 +343,18 @@ def configure_two_camera_policy(policy, batch: dict, *, text_tokens: int = 32) -
     config.empty_cameras = 0
     if set(config.image_features) != set(selected):
         raise RuntimeError("shared config did not retain exactly the selected two VISUAL features")
+    return before, previous_empty
+
+
+def configure_two_camera_policy(policy, batch: dict, *, text_tokens: int = 32) -> dict:
+    """Select two real VISUAL fields on the shared config before RPU install.
+
+    LeRobot reads config.image_features dynamically during preprocessing; the
+    adapter reads the same object when choosing the packed Vision row count.
+    No weights or checkpoint quantization metadata are changed here.
+    """
+    lerobot, adapter, config = _require_cold_shared_policy(policy, "two-camera")
+    before, previous_empty = select_two_camera_features(config, batch, text_tokens=text_tokens)
     return {"before_image_features": list(before), "image_features": list(config.image_features),
             "before_empty_cameras": previous_empty, "empty_cameras": 0,
             "shared_config": True, "configured_before_rpu_install": True}
@@ -287,19 +384,23 @@ def resolve_execution(args):
     cores = execution.get("model", {}).get("num_cores", 8)
     if cores not in (4, 6, 8):
         raise ValueError("Pi0.5 num_cores must be 4, 6 or 8")
-    if cores != 8 and (args.precision not in ("fp16", "w8a16")
-                       or args.cameras != 3 or args.text_tokens != 32):
-        raise ValueError("Pi0.5 TP4/TP6 requires FP16/W8A16, three cameras and T32")
+    # TP4/TP6 run serial one-image SigLIP4 and the generic Gemma/Action
+    # kernels; neither depends on the camera count. The adapter binds only T32
+    # pair rows for reduced cores, and NVFP4/A8 keep their TP8 fused ABIs.
+    if cores != 8 and (args.precision not in ("fp16", "w8a16") or args.text_tokens != 32):
+        raise ValueError("Pi0.5 TP4/TP6 requires FP16/W8A16 and T32 (two or three cameras)")
     if args.precision == "w4a16_kvint8" and (cores != 8 or args.cameras != 3 or args.text_tokens != 32):
         raise ValueError("legacy whole-model INT4 requires TP8, three cameras and T32")
     pair = (256 * args.cameras + args.text_tokens) // 2
+    if args.text_tokens == _C480_TEXT_TOKENS and args.precision not in ("fp16", "w8a16"):
+        raise ValueError(f"T{args.text_tokens} requires FP16 or W8A16 precision (C480 has no A8 or Action NVFP4 route)")
     vision_chunk = vision.get("vision", {}).get("chunk_size", "auto")
     action_chunk = action.get("action", {}).get("chunk_size", "auto")
     allowed_vision = ("auto", 256, 256 * args.cameras) if cores == 8 else ("auto", 256)
     if vision_chunk not in allowed_vision:
         raise ValueError(f"Pi0.5 Vision chunk must be one of {allowed_vision}")
     if action_chunk not in ("auto", 64):
-        raise ValueError("Pi0.5 Action chunk must be auto or 64 for horizon 50")
+        raise ValueError("Pi0.5 Action chunk must be auto or 64")
     prefill = text.get("prefill", {})
     requested = prefill.get("chunk_size", "auto")
     diagnostic_chunk = getattr(args, "prefill_chunk_size", None)
@@ -327,6 +428,12 @@ def resolve_execution(args):
         requested = pair
     elif diagnostic_chunk is not None:
         execution.setdefault("prefill", {})["chunk_size"] = diagnostic_chunk
+    elif args.text_tokens == _C480_TEXT_TOKENS and requested == "auto":
+        requested = _C480_GENERIC_CHUNK
+        execution.setdefault("prefill", {})["chunk_size"] = requested
+        child = execution.get("components", {}).get("language_model", {}).get("prefill")
+        if child is not None:
+            child["chunk_size"] = requested
     return execution, paired, requested
 
 
@@ -339,7 +446,8 @@ def validate_example_config(config: dict) -> None:
     validate_logging_config(config)
     allowed = {
         "pi05": {"precision", "instruction_residency"},
-        "input": {"checkpoint", "batch", "noise", "cameras", "text_tokens", "num_steps"},
+        "input": {"checkpoint", "batch", "noise", "cameras", "text_tokens", "num_steps",
+                  "action_horizon", "action_dim", *_openpi.RAW_KEYS, "delta_action_mask"},
         "run": {"warmup", "runs", "seed", "output_dir", "profile", "hwperf", "cpu_threads", "torch_num_threads"},
     }
     for name, keys in allowed.items():
@@ -354,11 +462,18 @@ def validate_example_config(config: dict) -> None:
     if type(inputs.get("cameras")) is not int or inputs["cameras"] not in (2, 3):
         raise ValueError("[input].cameras must be 2 or 3 actual computed images")
     _validate_text_profile(inputs.get("text_tokens", 32), cameras=inputs["cameras"])
+    _validate_action_horizon(inputs.get("action_horizon", 50))
     if type(inputs.get("num_steps", 10)) is not int or inputs.get("num_steps", 10) != 10:
         raise ValueError("Pi0.5 examples require num_steps=10")
-    for key in ("checkpoint", "batch"):
-        if not isinstance(inputs.get(key), str) or not inputs[key].strip():
-            raise ValueError(f"[input].{key} must be a nonempty path or checkpoint alias")
+    if not isinstance(inputs.get("checkpoint"), str) or not inputs["checkpoint"].strip():
+        raise ValueError("[input].checkpoint must be a nonempty path or checkpoint alias")
+    raw = _openpi.validate_input_config(inputs)
+    if not raw and (not isinstance(inputs.get("batch"), str) or not inputs["batch"].strip()):
+        raise ValueError("[input].batch must be a nonempty path")
+    if "action_dim" in inputs and (type(inputs["action_dim"]) is not int or not 1 <= inputs["action_dim"] <= 32):
+        raise ValueError("[input].action_dim must be an integer in 1..32")
+    if raw and len(inputs.get("delta_action_mask") or ()) > inputs.get("action_dim", 32):
+        raise ValueError("[input].delta_action_mask is longer than [input].action_dim")
     if "noise" in inputs and (not isinstance(inputs["noise"], str) or not inputs["noise"].strip()):
         raise ValueError("[input].noise must be a nonempty path to a CPU noise tensor")
     for key, default, minimum in (("warmup", 2, 0), ("runs", 6, 1), ("seed", 0, 0)):
@@ -385,9 +500,13 @@ def _example_arguments(config):
         instruction_residency=profile.get("instruction_residency"),
         profile=run.get("profile", False), hwperf=run.get("hwperf", False),
         cameras=inputs["cameras"], text_tokens=inputs.get("text_tokens", 32),
+        action_horizon=inputs.get("action_horizon", 50),
         prefill_chunk_size=None, prefill_w8a8=precision == "w8a16_prefill_w8a8_action_nvfp4",
         vision_owner_ln=True, checkpoint=inputs["checkpoint"],
-        batch=Path(inputs["batch"]).expanduser(), warmup=run.get("warmup", 2),
+        batch=Path(inputs["batch"]).expanduser() if "batch" in inputs else None,
+        raw_inputs=None if "batch" in inputs else {
+            key: inputs[key] for key in (*_openpi.RAW_KEYS, "delta_action_mask") if key in inputs},
+        action_dim=inputs.get("action_dim"), warmup=run.get("warmup", 2),
         noise=Path(inputs["noise"]).expanduser() if "noise" in inputs else None,
         runs=run.get("runs", 6), seed=run.get("seed", 0),
         cpu_threads=_CPU["resolve_cpu_threads"](config, default=8),
@@ -404,16 +523,20 @@ def example_arguments(config: dict) -> SimpleNamespace:
 def registered_example(config):
     """Resolve only the exact existing asset/geometry profiles for the catalog.
 
-    Two cameras, longer text and NVFP4 have no inherited three-camera profile.
-    This identifies the registered scope, not a new numerical certification.
+    Two-camera TP8, longer text and NVFP4 have no inherited three-camera
+    profile. Two-camera FP16/W8A16 TP4/TP6 have their own reduced-core
+    profiles. This identifies the registered scope, not a new numerical
+    certification.
     """
     args = example_arguments(config)
-    alias = _REGISTERED_ASSETS.get(args.public_precision)
-    if alias is None or args.checkpoint != alias or args.cameras != 3 or args.text_tokens != 32:
+    alias = _REGISTERED_ASSETS.get((args.action_horizon, args.public_precision))
+    if alias is None or args.checkpoint != alias or args.text_tokens != 32:
         return None
     execution, _, _ = resolve_execution(args)
     cores = execution["model"]["num_cores"]
     if cores == 8:
+        if args.cameras != 3:
+            return None
         _, vision, text, _ = _execution_config(execution)
         prefill = text.get("prefill", {})
         if (prefill.get("chunk_size", "auto") not in ("auto", 400)
@@ -422,7 +545,8 @@ def registered_example(config):
                        for key in ("padding_rows", "padding_budget"))):
             return None
     precision = "w4a16-kvint8" if args.public_precision == "w4a16_kvint8" else args.public_precision
-    suffix = f"-tp{cores}" if cores != 8 else ""
+    cameras = "-2cam" if args.cameras == 2 else ""
+    suffix = f"{cameras}-tp{cores}" if cores != 8 else ""
     return {"profile_id": f"{alias}.{precision}.vla{suffix}",
             "registry_alias": alias, "target": "pi05"}
 
@@ -470,8 +594,9 @@ def stage_timings(policy):
     from rpu_backend.adapters.pi05 import runtime
     from rpu_backend.adapters import siglip
 
-    vlm = policy._lerobot_policy.model.paligemma_with_expert.paligemma.model.language_model
-    phases, restore = {}, []
+    expert = policy._lerobot_policy.model.paligemma_with_expert
+    vlm = expert.paligemma.model.language_model
+    phases, active, restore = {}, set(), []
 
     def observe(owner, name, phase):
         original = getattr(owner, name)
@@ -480,10 +605,15 @@ def stage_timings(policy):
         had_local = name in vars(owner)
 
         def call(*args, **kwargs):
+            # A boundary reached inside the same phase is already timed.
+            if phase in active:
+                return original(*args, **kwargs)
+            active.add(phase)
             start = time.perf_counter()
             try:
                 return original(*args, **kwargs)
             finally:
+                active.discard(phase)
                 phases[phase] = phases.get(phase, 0.0) + (time.perf_counter() - start) * 1000
 
         setattr(owner, name, call)
@@ -491,7 +621,11 @@ def stage_timings(policy):
 
     try:
         observe(runtime, "_run_denoise_fused", "denoise_ms")
+        # TP4/TP6 and other unpaired plans keep the generic baseline denoise.
+        observe(runtime, "_run_denoise_python_baseline", "denoise_ms")
         observe(siglip, "_siglip_forward_images", "vision_ms")
+        # Serial SigLIP (one embed_image call per camera) when images are not packed.
+        observe(expert, "embed_image", "vision_ms")
         entry = "_rpu_prefill_kv_only" if callable(getattr(vlm, "_rpu_prefill_kv_only", None)) else "forward"
         observe(vlm, entry, "prefill_ms")
         yield phases
@@ -504,19 +638,31 @@ def stage_timings(policy):
 
 
 def numerical_notes(*, cameras, text_tokens, valid_tokens, precision, prefill_w8a8):
-    return ["This example does not run a reference comparison or robot task."]
+    notes = ["Performance measurement only; no CPU numerical or robot/task acceptance is run."]
+    if cameras == 3 and text_tokens == 128 and valid_tokens == 128 and precision == "w4a16" and not prefill_w8a8:
+        notes.append("Known numerical NO-GO: three images, T128/full128, W8A16 + Action NVFP4 exceeded action MSE 0.0072.")
+    if cameras == 2 and text_tokens in (96, 128) and valid_tokens == 65:
+        notes.append("Known numerical NO-GO: two-image valid65 FP16 at T96/T128 and T96 mixed A8/NVFP4; other precisions do not inherit a pass.")
+    return notes
 
 
 _RESULTS = vars(_result_helpers)
 
 
-def run_profile(args, *, bind_libraries=False) -> dict:
+def cold_setup(args, *, bind_libraries=False) -> SimpleNamespace:
+    """Resolve the execution plan and bind every cold selector, then import torch.
+
+    Must run in a fresh process before rpu_backend is imported.
+    """
     execution, paired, chunk_size = resolve_execution(args)
     cores = execution["model"]["num_cores"]
+    action_horizon = getattr(args, "action_horizon", 50)
+    _validate_action_horizon(action_horizon)
     if paired:
         env = profile_environment(args.precision, prefill_w8a8=args.prefill_w8a8,
                                   vision_owner_ln=args.vision_owner_ln, cameras=args.cameras,
-                                  text_tokens=args.text_tokens)
+                                  text_tokens=args.text_tokens,
+                                  action_horizon=action_horizon)
     elif hasattr(args, "public_precision"):
         # TP4/TP6, legacy whole-model INT4 and explicitly different chunk plans
         # use the existing generic kernels. Never feed them TP8-only fusions.
@@ -534,7 +680,7 @@ def run_profile(args, *, bind_libraries=False) -> dict:
                    RPU_PI05_DENOISE_NVFP4_GEGLU_M50="0", RPU_PI05_PREFILL_GATEUP_W8A8="0",
                    RPU_PI05_VISION_OWNER_LN="0")
     _, _, _, action = _execution_config(execution)
-    # The uniform ACC16 fusion has a bounded M50/T32-or-T160/ten-step ABI.
+    # The uniform ACC16 fusion has a bounded M50-or-M10/T32-or-T160/ten-step ABI.
     # Component overrides take precedence over the root accumulation mode.
     env["RPU_PI05_DENOISE_NVFP4_GEGLU_ACC16_M50"] = str(int(
         paired and args.precision == "w4a16" and args.text_tokens in (32, 160)
@@ -556,14 +702,18 @@ def run_profile(args, *, bind_libraries=False) -> dict:
     # All cold selectors are installed before imports and before checkpoint mutation.
     effective_cpu = _CPU["configure_cpu_threads"](getattr(args, "cpu_threads", 8))
     import torch
-    from rpu_backend.api import Pi05Policy
-    from rpu_backend.model_registry import model_path
 
     actual_payloads = runtime_payloads(libraries)
-    torch.set_num_interop_threads(_cpu_interop_threads(
-        paired=paired, precision=args.precision, prefill_w8a8=args.prefill_w8a8,
-        cameras=args.cameras, text_tokens=args.text_tokens))
-    effective_cpu["torch_num_interop_threads"] = torch.get_num_interop_threads()
+    torch.set_num_interop_threads(24)
+    return SimpleNamespace(execution=execution, paired=paired,
+                           action_horizon=action_horizon, cores=cores, chunk_size=chunk_size, env=env, libraries=libraries,
+                           effective_cpu=effective_cpu, actual_payloads=actual_payloads)
+
+
+def resolve_checkpoint(args) -> tuple[Path, dict]:
+    """The checkpoint directory (path or model_registry alias) and its checked contract."""
+    from rpu_backend.model_registry import model_path
+
     checkpoint = Path(args.checkpoint).expanduser()
     if not checkpoint.is_dir():
         checkpoint = model_path(args.checkpoint)
@@ -580,72 +730,145 @@ def run_profile(args, *, bind_libraries=False) -> dict:
             raise ValueError("w4a16_kvint8 requires the legacy whole-model per-channel INT4 checkpoint")
     else:
         validate_checkpoint(quant, args.precision)
-    batch = torch.load(args.batch, map_location="cpu", weights_only=True)
-    if not isinstance(batch, dict):
-        raise ValueError("--batch must contain a tensor dictionary")
+    contract = checkpoint_contract(checkpoint, getattr(args, "action_dim", None))
+    return checkpoint, contract
+
+
+def load_policy(args, checkpoint: Path, execution: dict, *, language_counts: int = 1):
+    """Pi05Policy.from_pretrained with this profile's execution plan (still on CPU).
+
+    ``language_counts`` sizes the cold Graph arena plan for
+    ``prepare_graphs(language_token_counts=...)`` with that many counts.
+    """
+    import torch
+    from rpu_backend.api import Pi05Policy
+
+    graph_options = {}
+    if getattr(args, "instruction_residency", None) is not None:
+        graph_options["batch_snapshot_mode"] = args.instruction_residency
+    if language_counts != 1:
+        graph_options["graph_arena_count"] = Pi05Policy.graph_arena_count(language_counts)
+    policy_options = {}
+    if graph_options:
+        from rpu_backend.graph import GraphRuntimePolicy
+        policy_options["graph_runtime_policy"] = GraphRuntimePolicy.from_environment(**graph_options)
+    return Pi05Policy.from_pretrained(str(checkpoint), dtype=torch.float16,
+        trust_remote_code=False, rpu_execution=execution, **policy_options)
+
+
+def install_policy(policy, args, batch: dict):
+    """Bind the camera/text profile cold, check the batch, then install on RPU.
+
+    Graphs are not prepared yet. Returns the camera and text configurations.
+    """
+    camera_configuration = configure_two_camera_policy(policy, batch, text_tokens=args.text_tokens) if args.cameras == 2 else None
+    text_configuration = configure_text_profile(policy, args.text_tokens)
+    validate_camera_batch(batch, policy._lerobot_policy.config.image_features,
+                          cameras=args.cameras, text_tokens=args.text_tokens)
+    # The horizon is a property of the checkpoint, never an
+    # override: the configured value only says which one is expected.
+    action_horizon = getattr(args, "action_horizon", 50)
+    if int(policy._lerobot_policy.config.chunk_size) != action_horizon:
+        raise ValueError(
+            f"[input].action_horizon={action_horizon} requires a checkpoint with "
+            f"chunk_size={action_horizon}, got "
+            f"{int(policy._lerobot_policy.config.chunk_size)}")
+    policy.to("rpu")
+    return camera_configuration, text_configuration
+
+
+def run_profile(args, *, bind_libraries=False) -> dict:
+    setup = cold_setup(args, bind_libraries=bind_libraries)
+    execution, paired = setup.execution, setup.paired
+    cores, chunk_size, env, libraries = setup.cores, setup.chunk_size, setup.env, setup.libraries
+    effective_cpu, actual_payloads = setup.effective_cpu, setup.actual_payloads
+    action_horizon = setup.action_horizon
+    import torch
+    checkpoint, contract = resolve_checkpoint(args)
+    action_dim = contract["action_dim"]
+    raw_inputs = getattr(args, "raw_inputs", None)
+    input_record, loaded = None, None
+    if raw_inputs:
+        # Files are read once (not timed): native camera frames, norm stats, tokenizer.
+        loaded = _openpi.load_raw_inputs(raw_inputs)
+        # openpi host transforms; a prompt beyond text_tokens is refused here, before the load.
+        batch, input_record = _openpi.batch_from_loaded(loaded, raw_inputs, text_tokens=args.text_tokens)
+        input_record.update(frames=loaded["frame_records"], norm_stats=str(raw_inputs["norm_stats"]),
+                            tokenizer=str(raw_inputs["tokenizer"]))
+    else:
+        batch = torch.load(args.batch, map_location="cpu", weights_only=True)
+        if not isinstance(batch, dict):
+            raise ValueError("--batch must contain a tensor dictionary")
     if bind_libraries:
-        for key, value in batch.items():
-            if key.startswith("observation.images.") and not key.endswith("_padding_mask"):
-                if not torch.is_tensor(value) or tuple(value.shape) != (1, 3, 256, 256):
-                    raise ValueError(f"Pi0.5 example requires {key} shape [1,3,256,256]")
+        validate_image_shapes(batch, contract["image_shapes"])
     if args.output_dir is not None:
         args.output_dir.mkdir(parents=True, exist_ok=True)
+        if raw_inputs:
+            (args.output_dir / "actions_physical.pt").unlink(missing_ok=True)
     hwperf_dir = args.output_dir / "hwperf" if args.output_dir is not None else None
+    batch_label = str(args.batch) if args.batch is not None else None
     report = {"model": "pi05", "precision": getattr(args, "public_precision", args.precision),
-              "checkpoint": str(checkpoint), "batch": str(args.batch),
+              "checkpoint": str(checkpoint), "batch": batch_label, "action_dim": action_dim,
+              "inputs": input_record,
               "warmup": args.warmup, "runs": args.runs, "cameras": args.cameras,
-              "text_tokens": args.text_tokens, "cpu_runtime": effective_cpu,
+              "text_tokens": args.text_tokens, "action_horizon": action_horizon,
+              "cpu_runtime": effective_cpu,
               "rpu_execution": execution, "libraries": libraries,
               "formal_certification": False, "correctness": "not_run"}
     with _RESULTS["record_result"](report, args.output_dir,
-        timing=lambda: _RESULTS["phase_timings"](report.get("samples_ms", []),
+        timing=lambda: _RESULTS["stage_phase_timings"](report.get("samples_ms", []),
             report.get("timing_scope", "host predict_action_chunk including CPU output copy"), statistic="mean",
-            phase_boundary="instrumented Vision/Prefill/Denoise host calls during measured inference; CPU output copy excluded"),
-        runtime_checks=("finite action output shape [1,50,7]",),
-        output_names=("actions.pt",) +
+            phase_boundary=RAW_PHASE_BOUNDARY if raw_inputs else
+            "instrumented Vision/Prefill/Denoise host calls during measured inference; CPU output copy excluded"),
+        runtime_checks=(f"finite action output shape [1,{action_horizon},{action_dim}]",),
+        output_names=("actions.pt",) + (("actions_physical.pt",) if raw_inputs else ()) +
                      (("profile.trace.json", "profile.txt") if getattr(args, "profile", False) else ())):
         trace = (torch.rpu.hw_perf_trace(str(hwperf_dir), max_dumps=32)
                  if getattr(args, "hwperf", False) else nullcontext())
         with trace:
             policy = None
             try:
-                policy_options = {}
-                if getattr(args, "instruction_residency", None) is not None:
-                    from rpu_backend.graph import GraphRuntimePolicy
-                    policy_options["graph_runtime_policy"] = GraphRuntimePolicy.from_environment(
-                        batch_snapshot_mode=args.instruction_residency)
-                policy = Pi05Policy.from_pretrained(str(checkpoint), dtype=torch.float16,
-                    trust_remote_code=False, rpu_execution=execution, **policy_options)
-                camera_configuration = configure_two_camera_policy(policy, batch, text_tokens=args.text_tokens) if args.cameras == 2 else None
-                text_configuration = configure_text_profile(policy, args.text_tokens)
-                validate_camera_batch(batch, policy._lerobot_policy.config.image_features,
-                                      cameras=args.cameras, text_tokens=args.text_tokens)
-                if int(policy._lerobot_policy.config.chunk_size) != 50:
-                    raise ValueError("Pi0.5 profile requires checkpoint action horizon/chunk_size=50")
+                policy = load_policy(args, checkpoint, execution)
+                camera_configuration, text_configuration = install_policy(policy, args, batch)
                 mask = batch.get("observation.language.attention_mask")
                 valid_tokens = int(mask.sum()) if torch.is_tensor(mask) else args.text_tokens
                 notes = numerical_notes(cameras=args.cameras, text_tokens=args.text_tokens,
                                         valid_tokens=valid_tokens, precision=args.precision,
                                         prefill_w8a8=args.prefill_w8a8)
-                policy.to("rpu")
                 prepared = policy.prepare_graphs(batch, num_steps=10, precompute_adarms=paired)
                 if args.precision == "fp16" and (prepared.get("adarms_table") or {}).get("dense_w8a16", False):
                     raise RuntimeError("FP16 profile unexpectedly installed quantized AdaRMS dense weights")
                 rows = []
                 report["samples_ms"] = rows
-                with (stage_timings(policy) if paired else nullcontext({})) as phases:
+                physical = None
+                with stage_timings(policy) as phases:
                     for index in range(args.warmup + args.runs):
                         torch.manual_seed(args.seed)
                         phases.clear()
+                        host = {}
                         start = time.perf_counter()
+                        if raw_inputs:
+                            # Each request starts from the native camera frames: openpi
+                            # resize_with_pad to 224, discrete-state prompt, tokenization.
+                            batch, _ = _openpi.batch_from_loaded(loaded, raw_inputs, text_tokens=args.text_tokens)
+                            host["preprocess_ms"] = (time.perf_counter() - start) * 1000
                         output = policy.predict_action_chunk(batch, num_steps=10).cpu()
+                        if raw_inputs:
+                            converted = time.perf_counter()
+                            physical = _openpi.physical_actions(output, raw_inputs, loaded["stats"])
+                            host["postprocess_ms"] = (time.perf_counter() - converted) * 1000
                         total_ms = (time.perf_counter() - start) * 1000
-                        if tuple(output.shape) != (1, 50, 7) or not torch.isfinite(output).all():
-                            raise RuntimeError("expected finite action output [1,50,7]")
+                        if (tuple(output.shape) != (1, action_horizon, action_dim)
+                                or not torch.isfinite(output).all()):
+                            raise RuntimeError(
+                                f"expected finite action output [1,{action_horizon},{action_dim}]")
                         if paired and set(phases) != {"vision_ms", "prefill_ms", "denoise_ms"}:
                             raise RuntimeError(f"incomplete optimized timing boundaries: {sorted(phases)}")
                         if index >= args.warmup:
-                            rows.append({"total_ms": total_ms, **phases})
+                            rows.append({"total_ms": total_ms, **({"preprocess_ms": host["preprocess_ms"]}
+                                                                  if raw_inputs else {}),
+                                         **phases, **({"postprocess_ms": host["postprocess_ms"]}
+                                                      if raw_inputs else {})})
                 if getattr(args, "profile", False):
                     from rpu_backend.runtime.performance import _profile_ctx
                     with _profile_ctx(True) as profiler:
@@ -654,13 +877,16 @@ def run_profile(args, *, bind_libraries=False) -> dict:
                     profiler.export_chrome_trace(str(args.output_dir / "profile.trace.json"))
                     (args.output_dir / "profile.txt").write_text(
                         profiler.key_averages().table(sort_by="self_cpu_time_total", row_limit=100))
+                # Unpaired plans keep only the stages observed in every measured run.
+                timed = [key for key in rows[0] if all(key in row for row in rows)]
                 report.update({
                     "precision": getattr(args, "public_precision", args.precision), "num_steps": 10, "num_cores": cores,
                     "execution_route": "paired_tp8" if paired else "generic",
-                    "timed_phases": list(rows[0]),
+                    "timed_phases": timed,
                     "profile": getattr(args, "profile", False), "hwperf_enabled": getattr(args, "hwperf", False),
                     "rpu_execution": execution,
                     "instruction_residency": getattr(args, "instruction_residency", None),
+                    "action_horizon": action_horizon,
                     "cameras": args.cameras, "vision_rows": 256 * args.cameras,
                     "prefix_rows": 256 * args.cameras + args.text_tokens,
                     "text_tokens": args.text_tokens, "valid_text_tokens": valid_tokens,
@@ -668,25 +894,35 @@ def run_profile(args, *, bind_libraries=False) -> dict:
                     "text_configuration": text_configuration, "prefill_w8a8": args.prefill_w8a8,
                     "vision_owner_ln": args.vision_owner_ln if paired else False, "adarms_table": prepared.get("adarms_table"),
                     "action_nvfp4_geglu_acc16": env["RPU_PI05_DENOISE_NVFP4_GEGLU_ACC16_M50"] == "1",
-                    "checkpoint": str(checkpoint), "batch": str(args.batch), "libraries": libraries,
+                    "checkpoint": str(checkpoint), "batch": batch_label, "libraries": libraries,
+                    "action_dim": action_dim, "inputs": input_record,
+                    **({"source_image_sizes_wh": [raw_inputs["frame_size"]] * args.cameras} if raw_inputs else {}),
                     "runtime_payloads": actual_payloads,
                     "graph_prepare": {key: prepared.get(key) for key in (
                         "phase", "build_replay_bit_equal", "ready_replay_validated", "ready_stats")},
                     "noise": os.environ.get("RPU_PI05_LOAD_NOISE"),
                     "warmup": args.warmup, "runs": args.runs, "seed": args.seed,
                     "cpu_runtime": effective_cpu,
-                    "timing_scope": "host wall time; total includes CPU output copy; load, prepare, and warmup excluded",
-                    "mean_ms": {key: statistics.mean(row[key] for row in rows) for key in rows[0]},
-                    "median_ms": {key: statistics.median(row[key] for row in rows) for key in rows[0]},
+                    "timing_scope": RAW_TIMING_SCOPE if raw_inputs else
+                    "host wall time; total includes CPU output copy; load, prepare, and warmup excluded",
+                    "mean_ms": {key: statistics.mean(row[key] for row in rows) for key in timed},
+                    "median_ms": {key: statistics.median(row[key] for row in rows) for key in timed},
                     "mean_ms_including_output_copy": statistics.mean(row["total_ms"] for row in rows),
                     "samples_ms": rows, "output_shape": list(output.shape),
                     "registered_profile": getattr(args, "registered_profile", None),
                     "formal_certification": False, "correctness": "not_run",
                     "numerical_notes": notes,
                 })
+                if raw_inputs:
+                    report["physical_actions"] = None if physical is None else {
+                        "file": "actions_physical.pt", "transform": "openpi Unnormalize (quantile) + AbsoluteActions",
+                        "delta_action_mask": raw_inputs.get("delta_action_mask"),
+                        "finite": bool(torch.isfinite(physical).all())}
                 if args.output_dir is not None:
                     args.output_dir.mkdir(parents=True, exist_ok=True)
                     torch.save(output, args.output_dir / "actions.pt")
+                    if physical is not None:
+                        torch.save(physical, args.output_dir / "actions_physical.pt")
             finally:
                 _RESULTS["close_with_report"](policy, report)
         if getattr(args, "hwperf", False):
@@ -704,7 +940,6 @@ def run_example_config(config: dict) -> int:
     args.registered_profile = None
     if example is not None:
         from examples.common.config import example_profiles
-
         profile = example_profiles()[example["profile_id"]]
         args.registered_profile = {key: profile[key] for key in ("id", "support", "input_envelope")}
     run_profile(args, bind_libraries=True)
@@ -718,10 +953,13 @@ def main() -> int:
                         help="optional cold instruction snapshot policy; absent preserves runtime defaults")
     parser.add_argument("--cameras", type=int, choices=(2, 3), default=3,
                         help="exact present camera count; two cameras use a new controlled profile")
-    parser.add_argument("--text-tokens", type=int, choices=(32, 64, 96, 128, 160), default=32,
-                        help="cold physical text bucket; T64/T96/T128/T160 require two or three cameras")
+    parser.add_argument("--text-tokens", type=int, choices=(32, 64, 96, 128, 160, 192), default=32,
+                        help="cold physical text bucket; T64/T96/T128/T160 require two or three cameras, "
+                             "T192 three cameras and FP16/W8A16")
+    parser.add_argument("--action-horizon", type=int, choices=_ACTION_HORIZONS, default=50,
+                        help="action horizon the checkpoint was trained at; must equal its chunk_size")
     parser.add_argument("--prefill-chunk-size", type=int,
-                        help="cold prefill chunk; T32 defaults 400/272 for three/two cameras; T64 requires 416/288; T96 requires 432/304; T128 requires 448/320; T160 requires 464/336")
+                        help="cold prefill chunk; T32 defaults 400/272 for three/two cameras; T64 requires 416/288; T96 requires 432/304; T128 requires 448/320; T160 requires 464/336; T192 requires 480")
     parser.add_argument("--prefill-w8a8", action="store_true",
                         help="opt in to Prefill GateUp W8A8 with Action NVFP4 only")
     parser.add_argument("--vision-owner-ln", action="store_true",

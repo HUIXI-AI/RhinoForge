@@ -134,6 +134,7 @@ def test_gr00t_uses_registered_backbone_and_preprocessed_observation(monkeypatch
         "input_ids", "attention_mask", "pixel_values", "image_grid_thw", "state"
     )}
     observation["input_ids"] = SimpleNamespace(shape=(1, 82))
+    observation["state"] = SimpleNamespace(shape=(1, 1, 132))
     monkeypatch.setattr(runner, "_load_mapping", lambda *_: observation)
     monkeypatch.setattr(runner, "_checkpoint", lambda _: Path("/cache/gr00t"))
     monkeypatch.setattr(runner, "_model_path", lambda *_args, **_kwargs: Path("/cache/qwen3-vl"))
@@ -176,6 +177,7 @@ def test_gr00t_example_sizes_prefix_cache_from_actual_observation(monkeypatch, r
     observation = {name: object() for name in (
         "attention_mask", "pixel_values", "image_grid_thw", "state")}
     observation["input_ids"] = SimpleNamespace(shape=(1, rows))
+    observation["state"] = SimpleNamespace(shape=(1, 1, 132))
     monkeypatch.setattr(runner, "_load_mapping", lambda *_: observation)
     monkeypatch.setattr(runner, "_checkpoint", lambda _: Path("/cache/gr00t"))
     monkeypatch.setattr(runner, "_model_path", lambda *_args, **_kwargs: Path("/cache/qwen3-vl"))
@@ -383,9 +385,6 @@ def test_internvla_runs_exact_hash_bound_full_chain(monkeypatch, tmp_path, arena
         resolve_internvla_execution=lambda execution, **_kwargs: (execution, child_execution),
     )
     value = config("internvla_n1")
-    value["example"]["opt_in"] = {
-        "RPU_INTERNVLA_N1_ALLOW_NUMERIC_BLOCKED": "1"
-    }
     value["input"] = {
         "fixture": str(fixture_path),
         "asset_manifest": str(manifest_path),

@@ -78,10 +78,43 @@ def _constant(source: str, name: str) -> str:
     return found.group(0)
 
 
-def _production_preload_helper(source: str) -> str:
-    return _method_block(
-        source, "    void append_causal_decoder_preload_manifest_routes("
+def _current_preload_blocks_as_helper(source: str) -> str:
+    """Allow the executable test to be prototyped before the refactor lands.
+
+    The integration test still fails until the production helper exists and is
+    called by every owner.  This fallback only wraps the current production
+    append blocks, so the semantic matrix can be compiled while implementing
+    the refactor without maintaining a second handwritten route oracle.
+    """
+    begin = source.index(
+        "        const int64_t broadcast_selector = static_cast<int64_t>("
     )
+    end = source.index(
+        "\n\n        if (!wall_action_fused_qkv_partial_mrope", begin
+    )
+    body = source[begin:end]
+    return r'''void append_causal_decoder_preload_manifest_routes(
+        FmbPhysicalExecutionManifest& manifest) const {
+        const bool tensor_preload =
+            qwen3vl_pooler_z1_dispatch_ ||
+            qwen3vl_multiview_text_composite_dispatch_ ||
+            planning_mode_ == CausalDecoderPlanningMode::QWEN3VL_POOLER_Z1 ||
+            planning_mode_ == CausalDecoderPlanningMode::QWEN3VL_MULTIVIEW_TEXT;
+        auto append = [&](FmbRouteFamily family, int64_t site_id,
+                          int64_t selector, int64_t flags = 0,
+                          std::vector<int64_t> arguments = {},
+                          int64_t invocation = 0) {
+            manifest.routes.push_back({site_id, family, selector, flags,
+                                       std::move(arguments), invocation});
+        };
+''' + body + "\n    }"
+
+
+def _production_preload_helper(source: str) -> str:
+    marker = "    void append_causal_decoder_preload_manifest_routes("
+    if marker in source:
+        return _method_block(source, marker)
+    return _current_preload_blocks_as_helper(source)
 
 
 def test_helper_site_set_matches_base_buffer_consumers() -> None:
@@ -177,6 +210,9 @@ def test_production_preload_routes_match_text_and_act_consumers(
     planner = PLANNER.read_text(encoding="utf-8")
 
     preload_helper = _production_preload_helper(qwen)
+    topology_helpers = "\n".join(_method_block(qwen, marker) for marker in (
+        "    std::array<int64_t, 6> cold_topology_arguments(",
+        "    std::vector<int64_t> bind_cold_topology_arguments("))
     causal_dma_enum = _balanced_block(
         qwen, "enum class CausalDecoderMutableDmaRoute : int64_t"
     ) + ";"
@@ -215,10 +251,12 @@ def test_production_preload_routes_match_text_and_act_consumers(
         manifest_method, "    if (has_qkv_bias_) {", start=bias_begin
     )
 
-    base_bias_region = _balanced_block(
-        qwen, "        if (has_qkv_bias_) {",
-        start=qwen.index("        // q_bias / k_bias / v_bias only present"),
-    )
+    base_bias_region = qwen[
+        qwen.index("        // q_bias / k_bias / v_bias only present") :
+        qwen.index("        // Tiled NVFP4", qwen.index(
+            "        // q_bias / k_bias / v_bias only present"
+        ))
+    ]
     text_consume = _balanced_call(
         base_bias_region, "this->ctx().consume_physical_route("
     )
@@ -310,9 +348,9 @@ struct Tensor {
 
 struct Context {
     FmbPhysicalExecutionManifest manifest_;
+    const auto& manifest() const { return manifest_; }
     mutable std::vector<uint8_t> consumed_;
     bool has_complete_physical_manifest() const { return true; }
-    const FmbPhysicalExecutionManifest& manifest() const { return manifest_; }
     const FmbRouteManifestEntry& find_route(
         FmbRouteFamily family, int64_t site, int64_t invocation) const {
         const auto target = std::make_tuple(
@@ -337,8 +375,9 @@ __CONSUME_ROUTE__
 };
 
 struct Harness {
-    int64_t h = 2048, hd = 128, nq = 16, nkv = 4, layers = 2, tp = 4;
+    int64_t h = 2048, hd = 128, nq = 16, nkv = 4, layers = 2, tp = 4, cores = 8;
     bool has_qk_norm_ = true, has_qkv_bias_ = false;
+    bool lingbot_folded_rmsnorm_ = false, lingbot_prefill_kv_only_ = false;
     bool adarms_ = false, adarms_mutable_ = false;
     bool adarms_fused_bcast_enabled_ = false, nvfp4_ = false;
     bool norm_slab = false;
@@ -351,7 +390,6 @@ struct Harness {
     at::Tensor gate_nvfp4_tensor_scales_{15}, up_nvfp4_tensor_scales_{16};
     at::Tensor down_nvfp4_tensor_scales_{17};
     Context context;
-    bool lingbot_folded_rmsnorm_=false, lingbot_prefill_kv_only_=false;
 
     int64_t hidden_size() const { return h; }
     int64_t head_dim() const { return hd; }
@@ -359,15 +397,15 @@ struct Harness {
     int64_t num_kv_heads() const { return nkv; }
     int64_t num_layers() const { return layers; }
     int64_t attn_tp() const { return tp; }
-    int num_cores() const { return 8; }
-    int mlp_tp() const { return 8; }
-    int lm_head_tp() const { return 8; }
-__TOPOLOGY_METHODS__
+    int64_t num_cores() const { return cores; }
+    int64_t mlp_tp() const { return cores; }
+    int64_t lm_head_tp() const { return cores; }
     bool norm_slab_active() const { return norm_slab; }
     Context& ctx() { return context; }
     const Context& ctx() const { return context; }
 
 __PRELOAD_HELPER__
+__TOPOLOGY_HELPERS__
 
     void append_act_bias_routes(FmbPhysicalExecutionManifest& manifest) const {
         const int64_t nq = num_q_heads();
@@ -585,6 +623,21 @@ int main() {
     norm_slab();
     bias_consumers_and_uniqueness();
     adarms_and_nvfp4();
+    Harness topology;
+    topology.cores = 4;
+    topology.has_qkv_bias_ = true;
+    topology.context.bind(build(topology));
+    topology.cores = 8;
+    bool wrong_topology_rejected = false;
+    try { topology.consume_text_bias(0, 0); }
+    catch (const std::runtime_error&) { wrong_topology_rejected = true; }
+    assert(wrong_topology_rejected);
+    topology.cores = 4;
+    topology.consume_text_bias(0, 0);
+    Harness reduced;
+    reduced.cores = 4;
+    assert((reduced.bind_cold_topology_arguments({9, 10}) ==
+            std::vector<int64_t>{9, 10, 2, 4, 4, 4, 4, 8}));
 }
 '''
     replacements = {
@@ -595,10 +648,7 @@ int main() {
         "VALIDATOR": validator,
         "CONSUME_ROUTE": consume_route,
         "PRELOAD_HELPER": preload_helper,
-        "TOPOLOGY_METHODS": "\n".join(_method_block(qwen, marker) for marker in (
-            "    std::array<int64_t, 6> cold_topology_arguments() const",
-            "    std::vector<int64_t> bind_cold_topology_arguments(",
-        )),
+        "TOPOLOGY_HELPERS": topology_helpers,
         "ACT_MANIFEST_BLOCK": act_manifest_block,
         "TEXT_CONSUME": text_consume,
         "ACT_CONSUME": act_consume,

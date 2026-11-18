@@ -84,7 +84,10 @@ def test_qwen35_language_norm_preloads_follow_each_real_graph_dispatch(tmp_path)
     base = _source("src/core/fused_model_base.cpp")
     header = _source("src/core/fused_model_base.h")
     config = _section(source, "ModelStaticConfig Qwen3_5Model::static_config()", "\n}\n") + "\n}\n"
-    assert "checked_layer_body_replay_fn" not in config
+    # The checked decode body hook is bound only inside the checked decode
+    # scope; every forward exercised below runs outside it.
+    assert "if (checked_decode_replay_scope_active_) {\n        cfg.checked_layer_body_replay_fn" in config
+    assert config.count("checked_layer_body_replay_fn") == 1
     defaults = "\n".join(re.findall(
         r"bool (?:fast_replay_skip_\w+|clean_recording_skip_preload_callbacks) = false;", header))
     declarations = _section(source, "    // Per-layer input_layernorm weight", "    if (has_qk_norm_) {")
@@ -113,6 +116,7 @@ namespace c10 {using Half=uint16_t;}
 struct FusedModelBase {};
 struct ModelStaticConfig {int num_layers=0,cross_layer_batch_size=0,body_iterations=1;
     void (FusedModelBase::*pre_layers_fn)()=nullptr, (FusedModelBase::*post_layers_fn)()=nullptr;
+    bool (FusedModelBase::*checked_layer_body_replay_fn)()=nullptr;
 DEFAULTS
 };
 enum class StorageClass {Persistent,PersistentPerLayer};
@@ -133,6 +137,8 @@ namespace graph_dma {bool active(){return RpuKernelGraph::enabled;}}
 struct {int persistent_generation(){return 7;} uint32_t addr(int,uint32_t x){return x;}} SPM_ALLOC;
 struct Qwen3_5Model: FusedModelBase {
     bool fast_replay_active_=true,action_step_active_=false,action_loop_active_=false;
+    bool checked_decode_replay_scope_active_=false;
+    bool try_checked_layer_body_replay(){return false;}
     int action_num_steps_=1, active_cores=8;
     struct {Tensor input_norm_w,post_norm_w;} layer_weights_[2]; Tensor final_norm_w_;
     int num_layers(){return 2;} int hidden_size(){return 16;}
@@ -153,7 +159,7 @@ DECLARATIONS
         return decls;
     }
     bool resident_preloads_enabled()const{return false;}
-    void validate_resident_preloads_(){assert(false);}
+    void validate_resident_preloads_(){assert(!resident_preloads_enabled());}
     bool consume_spm_pipeline_composite_preload_follower(){return false;}
     void run_preload_callbacks_(const std::vector<BufferDecl>& decls,FusedModelBase& self){
 EARLY_GATE
@@ -161,13 +167,18 @@ EARLY_GATE
 DISPATCH
     }
     void forward_prelude(){const auto static_cfg=static_config(); bool deep_full_skip=false;
-        const bool checked_body_replay=false; // This Qwen3.5 config has no checked hook.
+        // Outside the checked decode scope this config binds no checked hook.
+        assert(static_cfg.checked_layer_body_replay_fn==nullptr);
+        const bool checked_body_replay=false;
         assert(!static_cfg.fast_replay_skip_full_body);
 OUTER
     }
 };
 CONFIG
-int main(){for(int cores:{4,6,8}) {
+int main(){
+    {Qwen3_5Model scoped; scoped.checked_decode_replay_scope_active_=true;
+     assert(scoped.static_config().checked_layer_body_replay_fn!=nullptr);}
+    for(int cores:{4,6,8}) {
     Qwen3_5Model m; m.active_cores=cores; m.state.last_decls_=m.declare_buffers();
     RpuKernelGraph::enabled=true;
     // Bounded one-shot RECORDING, then a new decode BUILD, then stable REPLAY.
@@ -191,6 +202,180 @@ int main(){for(int cores:{4,6,8}) {
     cpp, binary = tmp_path / "q35_norm_preload.cpp", tmp_path / "q35_norm_preload"
     cpp.write_text(harness)
     compiled = subprocess.run(["g++", "-std=c++17", str(cpp), "-o", str(binary)], capture_output=True, text=True, timeout=60)
+    assert compiled.returncode == 0, compiled.stderr
+    run = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10)
+    assert run.returncode == 0, run.stderr
+
+
+def test_nextdit_prepare_preloads_belong_to_each_new_graph(tmp_path):
+    """Compile actual config, preload callbacks and FMB dispatch/COMPLETE checks.
+
+    Allocator and DMA edges are doubles. This proves preload admission and
+    route consumption, not full graph execution or numerical equivalence.
+    """
+    import re
+
+    source = _source("src/fused/rpu_internvla_nextdit_model.cpp")
+    base = _source("src/core/fused_model_base.cpp")
+    header = _source("src/core/fused_model_base.h")
+    shared = _source("src/core/fmb_three_stage_chunk_plan.cpp")
+    config = _section(source, "    ModelStaticConfig static_config() override {",
+                      "\n    ModelDynamicConfig dynamic_config(").replace(" override", "")
+    declarations = _section(source, "            BufferDecl step_bias;",
+                            "\n        }\n\n        // Cores 0..5")
+    routes = _section(source, "            append_dma(\n                kNextDitPrepareBiasPreloadDmaSite,",
+                      "\n        }\n        append_dma(")
+    complete = (_section(shared, "void FmbPhysicalManifestConsumer::require_all_consumed() const",
+                         "\n}\n") + "\n}\n").replace("FmbPhysicalManifestConsumer::", "")
+    defaults = "\n".join(re.findall(
+        r"bool (?:fast_replay_skip_\w+|clean_recording_skip_preload_callbacks) = false;", header))
+    constants = "\n".join(re.findall(
+        r"constexpr int64_t kNextDitPrepare(?:Bias|Fold)PreloadDmaSite = \d+LL;", source))
+    preload = base[base.index("void FusedModelBase::run_preload_callbacks_("):]
+    early = _section(preload, "    const bool inside_graph = graph_dma::active();", "    // graph-naive:")
+    dispatch = _section(preload, "    for (const auto& d : decls)",
+                        "    if (record_composite_preload_routes)")
+    dispatch += _section(preload, "    // EXT-4: clear BOTH", "\n}\n")
+    outer = _section(base, "    const bool skip_preload_callbacks_replay =", "\n    // 9. group count")
+    harness = r'''
+#include <algorithm>
+#include <cassert>
+#include <cstdint>
+#include <functional>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#define TORCH_CHECK(c, ...) do { if (!(c)) throw std::runtime_error("route rejected"); } while(0)
+constexpr int NEXTDIT_DEVICE_CORES=8, NEXTDIT_DWIDTH=2, ALL=1;
+CONSTANTS
+namespace c10 {using Half=uint16_t;}
+struct FusedModelBase {};
+struct ModelStaticConfig {int num_layers=0,cross_layer_batch_size=0,body_iterations=1; DEFAULTS };
+enum class StorageClass {Persistent,PersistentPerLayer};
+enum class FmbRouteFamily {MUTABLE_DMA=6};
+enum class NextDitDmaRoute {DDR_TO_SPM=1};
+struct FmbRouteManifestEntry {int64_t site_id;FmbRouteFamily family;int64_t selector,flags;
+    std::vector<int64_t> arguments;int64_t invocation=0;};
+struct Manifest {std::vector<FmbRouteManifestEntry> routes;};
+struct Context {
+    Manifest manifest_;std::vector<uint8_t> consumed_;
+    bool complete()const{return true;} bool has_complete_physical_manifest()const{return true;}
+    const Manifest& manifest()const{return manifest_;}
+    void bind(Manifest m){manifest_=std::move(m);consumed_.assign(manifest_.routes.size(),0);}
+    void consume_physical_route(FmbRouteFamily family,int64_t site,int64_t selector,int64_t flags,
+                                std::vector<int64_t> arguments,int64_t invocation=0){
+        auto it=std::find_if(manifest_.routes.begin(),manifest_.routes.end(),[&](const auto& row){
+            return row.site_id==site && row.family==family && row.invocation==invocation;});
+        TORCH_CHECK(it!=manifest_.routes.end());
+        TORCH_CHECK(it->selector==selector && it->flags==flags && it->arguments==arguments);
+        consumed_[it-manifest_.routes.begin()]=1;
+    }
+COMPLETE
+};
+struct BufferDecl {const char* name;int64_t size=0;StorageClass storage;int scope=0,per_layer=0;
+    std::function<void(FusedModelBase&,int,uint32_t)> preload_callback;};
+struct Tensor {c10::Half value=7;template<class T>T* data_ptr(){return &value;}};
+std::vector<uint32_t> dma_addresses;
+int ordinary_preloads=0;
+void rpu_launch_ddr_scatter_spm_dma(const c10::Half*,int64_t n,int64_t stride,uint32_t dst,int cores){
+    assert(n==2352 && stride==4704 && cores==8);dma_addresses.push_back(dst);}
+void rpu_launch_ddr_broadcast_spm_dma(const c10::Half*,int64_t n,uint32_t dst,int cores){
+    assert(n==18432 && cores==1);dma_addresses.push_back(dst);}
+struct RpuKernelGraph {enum class State {RECORDING,REPLAYING};
+    static inline State current=State::RECORDING;
+    static bool has_active(){return true;} static RpuKernelGraph& active(){static RpuKernelGraph g;return g;}
+    State state(){return current;}};
+namespace graph_dma {bool active(){return true;}}
+struct {int persistent_generation(){return 7;}uint32_t addr(int,uint32_t offset){return offset;}} SPM_ALLOC;
+struct NextDiT: FusedModelBase {
+    bool denoise_unroll_=true,use_action_encoder_=true,packed_action_batch_=true,prepare_modulation_on_rpu_=false;
+    int denoise_steps_=10,action_batch_size_=4;
+    Tensor step_prepare_b_,step_fold_norm_w_;
+    int64_t num_layers(){return 12;}int64_t hidden_size(){return 384;}int64_t A(int64_t n){return n;}
+    struct State {Context ctx_;int cached_preload_gen_=7,pipeline_lease_epoch_=0;
+        bool preload_callbacks_dirty_=true,resident_preload_priming_=false;
+        std::vector<std::string> resident_preload_names_;
+        std::unordered_map<std::string,uint32_t> persistent_offsets_{{"step_bias",10},{"step_fold_norm",20},{"ordinary",30}};
+        std::vector<std::unordered_map<std::string,uint32_t>> persistent_per_layer_offsets_;
+        std::vector<BufferDecl> last_decls_;
+    } state;State* pimpl_=&state;
+    Context& ctx(){return state.ctx_;}
+CONFIG
+    Manifest preload_manifest(){Manifest manifest;
+        const auto append_dma=[&](int64_t site,NextDitDmaRoute selector,std::vector<int64_t> args){
+            manifest.routes.push_back({site,FmbRouteFamily::MUTABLE_DMA,int64_t(selector),0,std::move(args),0});};
+        if(prepare_modulation_on_rpu_){
+            const int64_t step_local=(num_layers()*4+1)*hidden_size()/NEXTDIT_DEVICE_CORES;
+ROUTES
+        }return manifest;
+    }
+    std::vector<BufferDecl> declare_preloads(){std::vector<BufferDecl> out;
+        if(prepare_modulation_on_rpu_){const int64_t h=hidden_size();
+            const int64_t step_local=(num_layers()*4+1)*h/NEXTDIT_DEVICE_CORES;
+DECLARATIONS
+        }
+        BufferDecl ordinary;ordinary.name="ordinary";ordinary.storage=StorageClass::Persistent;
+        ordinary.preload_callback=[](FusedModelBase&,int,uint32_t){++ordinary_preloads;};
+        out.push_back(ordinary);return out;
+    }
+    bool resident_preloads_enabled()const{return false;}
+    void validate_resident_preloads_(){assert(!resident_preloads_enabled());}
+    bool consume_spm_pipeline_composite_preload_follower(){return false;}
+    void run_preload_callbacks_(const std::vector<BufferDecl>& decls,FusedModelBase& self){
+EARLY
+        auto invoke_preload_callback=[&](const BufferDecl& d,int layer,uint32_t address){d.preload_callback(self,layer,address);};
+DISPATCH
+    }
+    void prelude(){const auto static_cfg=static_config();
+        const bool deep_full_skip=false,checked_body_replay=false;
+OUTER
+    }
+};
+int main(){
+    for(bool prepare:{false,true}){
+        NextDiT owner;owner.prepare_modulation_on_rpu_=prepare;
+        owner.state.last_decls_=owner.declare_preloads();
+        const auto cfg=owner.static_config();
+        assert(cfg.fast_replay_skip_preload && cfg.fast_replay_skip_layer_loop);
+        // Two distinct BUILD invocations: cold/dirty, then same-generation clean.
+        for(int build=0;build<2;++build){
+            RpuKernelGraph::current=RpuKernelGraph::State::RECORDING;
+            owner.ctx().bind(owner.preload_manifest());dma_addresses.clear();ordinary_preloads=0;
+            owner.prelude();owner.ctx().require_all_consumed();
+            assert(dma_addresses==(prepare?std::vector<uint32_t>{10,20}:std::vector<uint32_t>{}));
+            assert(ordinary_preloads==int(prepare || build==0));
+            assert(owner.state.cached_preload_gen_==7 && !owner.state.preload_callbacks_dirty_);
+        }
+        // REPLAY keeps the existing fast-skip path. Exact Graph receipt inheritance
+        // is a separate shared contract; this proof does not fabricate its receipt.
+        RpuKernelGraph::current=RpuKernelGraph::State::REPLAYING;
+        dma_addresses.clear();ordinary_preloads=0;owner.prelude();
+        assert(dma_addresses.empty() && ordinary_preloads==0);
+    }
+    // Neither declared preload may be silently omitted from a new COMPLETE BUILD.
+    for(const char* missing:{"step_bias","step_fold_norm"}){
+        NextDiT owner;owner.prepare_modulation_on_rpu_=true;
+        owner.state.last_decls_=owner.declare_preloads();owner.state.preload_callbacks_dirty_=false;
+        for(auto& d:owner.state.last_decls_)if(std::string(d.name)==missing)d.preload_callback={};
+        owner.ctx().bind(owner.preload_manifest());RpuKernelGraph::current=RpuKernelGraph::State::RECORDING;
+        dma_addresses.clear();owner.prelude();assert(dma_addresses.size()==1);
+        bool rejected=false;try{owner.ctx().require_all_consumed();}catch(const std::runtime_error&){rejected=true;}
+        assert(rejected);
+    }
+}
+'''
+    for marker, value in (("CONSTANTS", constants), ("DEFAULTS", defaults), ("COMPLETE", complete),
+                          ("CONFIG", config), ("ROUTES", routes), ("DECLARATIONS", declarations),
+                          ("EARLY", early), ("DISPATCH", dispatch), ("OUTER", outer)):
+        if marker == "DEFAULTS":
+            harness = harness.replace(" DEFAULTS ", " " + value + " ")
+        else:
+            harness = harness.replace("\n" + marker + "\n", "\n" + value + "\n")
+    cpp, binary = tmp_path / "nextdit_preload.cpp", tmp_path / "nextdit_preload"
+    cpp.write_text(harness)
+    compiled = subprocess.run(["g++", "-std=c++17", str(cpp), "-o", str(binary)],
+                              capture_output=True, text=True, timeout=60)
     assert compiled.returncode == 0, compiled.stderr
     run = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10)
     assert run.returncode == 0, run.stderr

@@ -97,7 +97,7 @@ def test_joint_cache_cold_complete_kv22_identity_and_fallbacks(tmp_path, monkeyp
     ids = ['G05_OWNER_INSERT_KV_CACHE_M32D256_P0', 'G05_OWNER_INSERT_KV_CACHE_M32D256_P245']
     cpp = cpp.replace('enum class KernelId{', 'enum class KernelId{' + ','.join(ids) + ',')
     cpp = cpp.replace('struct KernelCache{', 'struct KernelCache{bool p0=true,p245=true;')
-    cpp = cpp.replace('bool has_loaded(KernelId id){++queries;', 'bool has_loaded(KernelId id){++queries;if(id==KernelId::' + ids[0] + ')return p0;if(id==KernelId::' + ids[1] + ')return p245;')
+    cpp = cpp.replace('bool has_loaded(KernelId id){++queries;', 'bool has_loaded(KernelId id){++queries;if(id==KernelId::' + ids[0] + ')return p0;if(id==KernelId::' + ids[1] + ')return p245;\n ')
     cpp = cpp.replace('std::vector<int64_t>action_nvfp4_arguments(int)const{assert(false);return {};}', 'std::vector<int64_t>action_nvfp4_arguments(int family)const{return {family};}')
     old = 'void rpu_launch_g05_owner_insert_kvcache_joint_spm_with_plan(at::Tensor&,at::Tensor&,uint32_t,uint32_t,const KvInsertSegmentPlan&){assert(false);}'
     new = '''void rpu_launch_g05_owner_insert_kvcache_joint_spm_with_plan(at::Tensor&k,at::Tensor&v,uint32_t ko,uint32_t vo,const KvInsertSegmentPlan&p){assert(k.owner+100==v.owner&&ko==0x28000&&vo==0x2c000&&(p.segment(0).position==0||p.segment(0).position==245));launches.push_back("joint-cache");}'''

@@ -76,8 +76,17 @@ python -m rpu_backend.quant.convert_qwen3 \
 TORCH_DEVICE_BACKEND_AUTOLOAD=0 python python/rpu_backend/quant/convert_qwen3_5_moe_fp8.py \
   --src SOURCE_DIR --dst OUTPUT_DIR --expert-chunk 1 --threads 8
 
-# Pi0.5 W8A16
+# Pi0.5 W8A16（同时支持 `model.` 前缀与无前缀 `lerobot/pi05_base` 权重键）
 python -m rpu_backend.quant.convert_pi05 --src SOURCE_DIR --dst OUTPUT_DIR
+
+# Pi0.5 Kuavo 按动作维度为 `lerobot/pi05_base`（`22c30e5b`）生成符号链接视图
+for d in 8 16 20; do
+  python examples/runners/pi05/openpi_inputs.py checkpoint-view \
+    --src SOURCE_OR_W8_DIR --dst "${OUTPUT_DIR}_kuavo_a${d}" --action-dim "$d"
+done
+
+# 从公开数据集 RoboCOIN/Leju_Kuavo_4_box_storage_parcel 生成 Kuavo 相机原帧与 norm_stats
+python scripts/prepare_pi05_kuavo_inputs.py --dataset DATASET_DIR --out KUAVO_INPUT_DIR
 
 # Pi0.5 mixed W4A16-KV8 评估配置（不是纯 W4）
 python -m rpu_backend.quant.convert_pi05 \
@@ -93,7 +102,7 @@ python -m rpu_backend.quant.convert_wall_oss \
 ```
 
 MoE mixed E4M3 使用官方未量化 `Qwen/Qwen3.5-35B-A3B` 源，按
-[下载、CPU 转换与运行命令](../examples/configs/qwen3_5/README.md#cmd-moe-mixed)生成。
+[下载、CPU 转换与运行命令](../examples/configs/WEIGHTS.md#cmd-qwen35-moe)生成。
 脚本不需要校准数据；官方 block-FP8、GPTQ 和 RTN 包不能替代浮点源或逐输出通道 E4M3 产物。
 
 Converter 创建新 destination 并拒绝已有目录。转换后让匹配 TOML 指向该输出，并保留

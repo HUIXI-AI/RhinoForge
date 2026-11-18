@@ -3,68 +3,17 @@
 // dynamic DMA, allocation and COMPLETE routes. Only proven static emission is
 // omitted; the existing Graph patch API refreshes every dynamic kernel field.
 #include "rpu_qwen3_model.h"
+#include "rpu_decode_replay_common.h"
 #include <set>
-#include "../ops/rpu_linear_tiling.h"
+#include "rpu_linear_tiling.h"
 
 namespace v3 {
 namespace {
 
-struct DecodeOwner {
-    at::Tensor tensor; // retains storage even if the caller replaces its cache
-    c10::TensorImpl* impl = nullptr;
-    c10::StorageImpl* storage = nullptr;
-    at::ScalarType dtype = at::ScalarType::Undefined;
-    c10::Device device{c10::DeviceType::CPU};
-    std::vector<int64_t> shape, strides;
-    int64_t offset = 0;
-    uint32_t version = 0;
-    uint64_t address = 0;
-    size_t storage_bytes = 0;
-    bool immutable = false;
-
-    bool freeze(const at::Tensor& t, bool fixed) {
-        if (!t.defined() || t.device().type() != at::kPrivateUse1 ||
-            t.layout() != c10::Layout::Strided || !t.is_contiguous()) return false;
-        const auto& counter = t.unsafeGetTensorImpl()->version_counter();
-        // Versionless inference weights are still supported by the ordinary
-        // body; they cannot prove an immutable replay binding.
-        if (fixed && !counter.enabled()) return false;
-        tensor = t; impl = t.unsafeGetTensorImpl();
-        storage = t.storage().unsafeGetStorageImpl();
-        dtype = t.scalar_type(); device = t.device();
-        shape = t.sizes().vec(); strides = t.strides().vec();
-        offset = t.storage_offset(); storage_bytes = t.storage().nbytes();
-        address = RpuGetDevAddr(t.data_ptr()); immutable = fixed;
-        version = fixed ? counter.current_version() : 0;
-        return address && address < (1ULL << 40) && address % 256 == 0;
-    }
-
-    bool matches(const at::Tensor& t) const {
-        if (!t.defined() || t.unsafeGetTensorImpl() != impl ||
-            t.layout() != c10::Layout::Strided || t.scalar_type() != dtype ||
-            t.device() != device || t.storage().unsafeGetStorageImpl() != storage ||
-            t.storage().nbytes() != storage_bytes || t.storage_offset() != offset ||
-            !t.sizes().equals(shape) || !t.strides().equals(strides) ||
-            RpuGetDevAddr(t.data_ptr()) != address) return false;
-        const auto& counter = t.unsafeGetTensorImpl()->version_counter();
-        return !immutable || (counter.enabled() && counter.current_version() == version);
-    }
-};
-
-struct DecodeGraphKey {
-    const RpuKernelGraph* graph = nullptr;
-    uint64_t lifetime = 0, generation = 0, signature = 0, segment = 0;
-    bool operator==(const DecodeGraphKey& other) const {
-        return graph == other.graph && lifetime == other.lifetime &&
-            generation == other.generation && signature == other.signature &&
-            segment == other.segment;
-    }
-};
-
-DecodeGraphKey graph_key(RpuKernelGraph& graph, const GraphOpStreamStamp& stamp) {
-    return {&graph, graph.debug_stats().graph_lifetime_id, stamp.build_generation,
-            stamp.signature_identity, stamp.signature_segment_key};
-}
+using decode_replay::DecodeGraphKey;
+using decode_replay::DecodeOwner;
+using decode_replay::graph_key;
+using decode_replay::tensor_shape;
 
 struct DecodeKernelSlot { size_t kernel, node; std::string name; };
 
@@ -95,33 +44,34 @@ struct DecodeProfile {
     int layers = 36;
     at::ScalarType dtype = at::kChar;
     bool acc32 = false, gemv = true, packed_qkv = true, fused_mlp = true;
-    bool tts_predictor = false, tts_head = false;
+    bool tts_predictor = false;
+    // A fused head's weight dtype need not match the decoder layers'. It does on
+    // Qwen3-VL, where head_dtype resolves to dtype, and does not on the TTS
+    // Predictor, whose FP16 layers carry an int8 head.
+    at::ScalarType head_dtype = at::kChar;
+    bool head_bank = false;
 };
 
 bool linear_name(const std::string& name, const DecodeProfile& profile, bool head) {
     if (!head && profile.gemv)
         return name == (profile.dtype == at::kHalf ? "llama_gemv" : "llama_gemv_wint8");
-    const bool acc32 = profile.acc32 && !(head && profile.tts_head);
+    // A fused head's weight dtype need not match the decoder layers'.
+    const at::ScalarType dtype = head ? profile.head_dtype : profile.dtype;
+    if (dtype != at::kHalf && dtype != at::kChar && dtype != at::kByte)
+        return false;
     using namespace rpu_pl_tiling;
-    for (int n : {128, 112, 96, 80, 64, 48, 32}) {
-        std::string expected;
-        if (profile.dtype == at::kByte)
-            expected = acc32
-                ? autotile_kernel_name_int4_acc32(mtile_int4_acc32(n), n)
-                : autotile_kernel_name_int4(mtile_int4(n), n);
-        else {
-            const bool half = profile.dtype == at::kHalf;
-            expected = acc32
-                ? autotile_kernel_name_acc32(half, half ? mtile_fp16_acc32(n) : mtile_w8a16_acc32(n), n)
-                : autotile_kernel_name(half, half ? mtile_w16(n) : mtile_w8a16(n), n);
-        }
-        if (name == expected) return true;
+    const auto weight = dtype == at::kByte ? WeightType::Int4 :
+        dtype == at::kHalf ? WeightType::Fp16 : WeightType::Int8;
+    for (const auto& candidate : rpu_pl_tiling::detail::parallel_candidates) {
+        if (candidate.weight == weight && candidate.acc32 == profile.acc32 &&
+            name == candidate.name) return true;
     }
     return false;
 }
 
 bool bind_decode_patches(const std::vector<DecodeKernelSlot>& kernels,
                          std::vector<RegisterPatch>& patches,
+                         std::vector<RegisterPatch>& head_patches,
                          const DecodeProfile& profile) {
     size_t cursor = 0;
     std::set<size_t> indices;
@@ -149,6 +99,7 @@ bool bind_decode_patches(const std::vector<DecodeKernelSlot>& kernels,
             patches.push_back({kernels[cursor - 1].kernel, reg, 0, 2});
     };
     patches.clear(); patches.reserve(profile.layers * 16);
+    head_patches.clear();
     std::optional<int> qk_kind;
     std::optional<bool> combined_o;
     for (int layer = 0; layer < profile.layers; ++layer) {
@@ -181,16 +132,16 @@ bool bind_decode_patches(const std::vector<DecodeKernelSlot>& kernels,
         for (uint32_t reg : {0u, 1u, 4u, 5u, 16u, 17u, 29u, 31u})
             patches.push_back({kernels[cursor - 1].kernel, reg, 0, 2});
         if (cursor == kernels.size()) return false;
-        const bool fused_o = kernels[cursor].name == "qwen3vl_o_ring_norm_m1_h2560_w8";
+        const bool fused_o = kernels[cursor].name == "qwen3vl_o_ring_norm_w8_m1_h2560_v2";
         if (combined_o && *combined_o != fused_o) return false;
         combined_o = fused_o;
         if (fused_o) {
             if (profile.layers != 36 || profile.dtype != at::kChar || !profile.gemv ||
-                !take("qwen3vl_o_ring_norm_m1_h2560_w8")) return false;
+                !take("qwen3vl_o_ring_norm_w8_m1_h2560_v2")) return false;
         } else if (!linear() || !take("llm_all_reduce_residual_nopace") || !norm()) return false;
         if (profile.fused_mlp) {
-            if (!take("qwen3vl_gateup_swiglu_gemv")) return false;
-        } else if (profile.tts_predictor && !profile.acc32) {
+            if (!take("qwen3vl_gateup_swiglu_w8_m1_v2")) return false;
+        } else if (profile.tts_predictor && profile.dtype == at::kHalf && !profile.acc32) {
             if (!linear() || !linear() || !take("llama_silu_mul")) return false;
         } else if (profile.layers == 36 && profile.dtype == at::kChar && profile.gemv) {
             if (!linear() || !linear() || !take("silu_mul")) return false;
@@ -199,7 +150,18 @@ bool bind_decode_patches(const std::vector<DecodeKernelSlot>& kernels,
             (!profile.tts_predictor && layer < 3 && !take("binary_sameshape"))) return false;
     }
     if (!norm()) return false;
-    return profile.tts_predictor && !profile.tts_head ? cursor == kernels.size() :
+    if (profile.head_bank) {
+        // The bank's selected head is the one trailing projection. Its weight
+        // and scale addresses live in registers 2/3 and 20/21 as `addr >> 8`
+        // u16 pairs (set_parallel_linear_regs), so a selection reaches this
+        // retained stream as four patches rather than a rebuild.
+        if (cursor + 1 != kernels.size() ||
+            !linear_name(kernels[cursor].name, profile, true)) return false;
+        for (uint32_t reg : {2u, 3u, 20u, 21u})
+            head_patches.push_back({kernels[cursor].kernel, reg, 0, 2});
+        return true;
+    }
+    return profile.tts_predictor ? cursor == kernels.size() :
         cursor + 1 == kernels.size() && linear_name(kernels[cursor].name, profile, true);
 }
 
@@ -229,8 +191,25 @@ void update_decode_patches(std::vector<RegisterPatch>& patches, int64_t position
     }
 }
 
-bool tensor_shape(const at::Tensor& t, at::ScalarType dtype, at::IntArrayRef shape) {
-    return t.defined() && t.scalar_type() == dtype && t.sizes().equals(shape);
+void update_head_patches(std::vector<RegisterPatch>& patches,
+                         const at::Tensor& weight, const at::Tensor& scale) {
+    TORCH_CHECK(patches.size() == 4, "unsealed fused head patch recipe");
+    TORCH_CHECK(weight.defined() && scale.defined(),
+                "fused head patch requires an installed head");
+    const uint64_t w_addr = RpuGetDevAddr(weight.data_ptr());
+    const uint64_t s_addr = RpuGetDevAddr(scale.data_ptr());
+    // The ABI carries both as `addr >> 8` in a u16 pair, so the low 8 bits have
+    // nowhere to go. The recording launcher shifts without checking; a patch is
+    // the one place that can still refuse an address it would silently truncate.
+    TORCH_CHECK((w_addr & 0xff) == 0 && (s_addr & 0xff) == 0,
+                "fused head payload is not 256-byte aligned");
+    const uint64_t w = w_addr >> 8, s = s_addr >> 8;
+    TORCH_CHECK(w <= UINT32_MAX && s <= UINT32_MAX,
+                "fused head address exceeds the 32-bit register ABI");
+    patches[0].value = uint16_t(w & 0xffff);
+    patches[1].value = uint16_t((w >> 16) & 0xffff);
+    patches[2].value = uint16_t(s & 0xffff);
+    patches[3].value = uint16_t((s >> 16) & 0xffff);
 }
 
 bool readable_elements(const at::Tensor& tensor, uint64_t count) {
@@ -264,10 +243,13 @@ struct CausalDecoderModel::Qwen3VlDecodeReplayState {
         std::vector<int64_t> descriptor;
         std::vector<DecodeOwner> owners;
         std::vector<RegisterPatch> patches;
+        // Kept out of `patches` so update_decode_patches' layer-strided seal
+        // stays exact; empty unless a head bank is installed.
+        std::vector<RegisterPatch> head_patches;
         std::array<uint32_t, 8> bases{};
         // Persistent norms are not part of the temporary COMPLETE layout hash.
         std::vector<uint32_t> norms;
-        size_t temporary = 0, head_kernel = 0;
+        size_t temporary = 0;
         int64_t cache_capacity = 0;
     };
     std::unique_ptr<Recipe> recipe;
@@ -286,7 +268,9 @@ struct CausalDecoderModel::Qwen3VlDecodeReplayState {
         p.packed_qkv = p.gemv && model.qwen3vl_4b_packed_qkv_weights_;
         p.fused_mlp = p.gemv && model.qwen3vl_4b_decode_gateup_fused_;
         p.tts_predictor = model.num_layers() == 5;
-        p.tts_head = !model.tts_predictor_heads_.empty();
+        p.head_bank = model.lm_head_bank_index_ >= 0;
+        p.head_dtype = model.lm_head_w_.defined()
+            ? model.lm_head_w_.scalar_type() : p.dtype;
         return p;
     }
 
@@ -315,21 +299,33 @@ struct CausalDecoderModel::Qwen3VlDecodeReplayState {
         for (const auto* t : {&model.cos_, &model.sin_, &model.final_norm_w_})
             if (!fn(*t, true)) return false;
         if (!p.tts_predictor && !fn(model.lm_head_w_, true)) return false;
-        for (const auto& head : model.tts_predictor_heads_)
-            if (!fn(head, true)) return false;
+        if (p.head_bank)
+            for (size_t i = 0; i < model.lm_head_bank_w_.size(); ++i)
+                if (!fn(model.lm_head_bank_w_[i], true) ||
+                    !fn(model.lm_head_bank_scale_[i], true)) return false;
         if (p.packed_qkv && !fn(model.qwen3vl_4b_qkv_scale_bank_, true)) return false;
-        if (p.dtype != at::kHalf && !fn(model.lm_head_w_scale_, true)) return false;
+        if (!p.tts_predictor && p.dtype != at::kHalf && !fn(model.lm_head_w_scale_, true)) return false;
         return p.tts_predictor || fn(model.position_ids_keepalive_, false);
     }
 
     static bool projection_shape(const at::Tensor& w, const at::Tensor& scale,
                                   at::ScalarType dtype, int64_t n, int64_t k, bool row) {
-        if (!tensor_shape(w, dtype, {n, dtype == at::kByte ? k / 2 : k})) return false;
+        int64_t physical_n = n;
+        if (dtype == at::kByte) {
+            if (n <= 0 || k <= 0 || (row ? k % 8 : n % 8)) return false;
+            const int64_t local_n = row ? n : n / 8, local_k = row ? k / 8 : k;
+            if (local_n % 16 || local_k % 32) return false;
+            // New W4 storage pads each TP shard to N32; n remains the logical
+            // output width (including the unpadded vocabulary for the head).
+            physical_n = ((local_n + 31) / 32) * 32 * (row ? 1 : 8);
+        }
+        if (!tensor_shape(w, dtype, {physical_n, dtype == at::kByte ? k / 2 : k})) return false;
         if (dtype == at::kHalf) return !scale.defined();
         if (dtype == at::kChar) return tensor_shape(scale, at::kHalf, {n});
         if (dtype != at::kByte || !scale.defined() || scale.scalar_type() != at::kHalf ||
             scale.dim() != 2 || scale.size(0) != 32) return false;
         const int64_t local_n = row ? n : n / 8, local_k = row ? k / 8 : k;
+        // Scale storage still uses controller-striped N64/G4 blocks.
         return scale.numel() == ((local_k / 32 + 3) / 4) * ((local_n + 63) / 64) * 8 * 4 * 64;
     }
 
@@ -337,12 +333,6 @@ struct CausalDecoderModel::Qwen3VlDecodeReplayState {
         const auto p = profile(model);
         const int64_t h = model.hidden_size(), i = model.intermediate_size();
         const int64_t q = model.num_q_heads() * 128;
-        if (p.tts_head) {
-            if (!p.tts_predictor || !p.acc32 || model.tts_predictor_heads_.size() != 15 ||
-                model.vocab_size_ != 2048) return false;
-            for (const auto& head : model.tts_predictor_heads_)
-                if (!tensor_shape(head, at::kHalf, {2048, 1024})) return false;
-        }
         for (const auto& w : model.layer_weights_) {
             if (p.packed_qkv) {
                 if (!tensor_shape(w.qkv_w, at::kChar, {6144, 2560}) ||
@@ -416,9 +406,8 @@ struct CausalDecoderModel::Qwen3VlDecodeReplayState {
         }
         rpu_ddr_flush(model.final_norm_w_.data_ptr());
         if (!profile(model).tts_predictor) rpu_ddr_flush(model.lm_head_w_.data_ptr());
-        if (!model.tts_predictor_heads_.empty())
-            rpu_ddr_flush(model.tts_predictor_heads_.at(model.tts_predictor_head_index_).data_ptr());
-        if (profile(model).dtype != at::kHalf) rpu_ddr_flush(model.lm_head_w_scale_.data_ptr());
+        if (!profile(model).tts_predictor && profile(model).dtype != at::kHalf)
+            rpu_ddr_flush(model.lm_head_w_scale_.data_ptr());
     }
 };
 
@@ -436,12 +425,25 @@ bool CausalDecoderModel::begin_qwen3vl_decode_replay(
         !qwen3vl_decode_gemv(1) && !layer_weights_.empty() &&
         layer_weights_.front().q_w.defined() &&
         layer_weights_.front().q_w.scalar_type() == at::kHalf;
+    // The Predictor admits either no head at all (the head stays an eager op in
+    // Python) or a bank-installed int8 head, whose selected entry is patched into
+    // the retained stream per step. Nothing else may carry a fused head here.
+    const bool tts_head_bank = lm_head_bank_index_ >= 0 && fuse_lm_head_ &&
+        lm_head_w_.defined() && lm_head_w_scale_.defined() &&
+        lm_head_w_.scalar_type() == at::kChar &&
+        lm_head_w_scale_.scalar_type() == at::kHalf &&
+        !fuse_prefill_last_lm_head_ && vocab_size_ > 0 &&
+        vocab_size_ % lm_head_tp() == 0;
+    const bool tts_headless = !fuse_lm_head_ && !lm_head_w_.defined() &&
+        !lm_head_w_scale_.defined() && lm_head_bank_index_ < 0;
     const bool tts_predictor = fast_replay_skip_layer_loop_ && num_layers() == 5 &&
         hidden_size() == 1024 && intermediate_size() == 3072 && num_q_heads() == 16 &&
-        !has_mrope_ && !fuse_lm_head_ && !lm_head_w_.defined() &&
-        !lm_head_w_scale_.defined() && deepstack_lang_layers_.empty() && rope_position_base_ < 0 &&
+        !has_mrope_ && (tts_headless || tts_head_bank) &&
+        deepstack_lang_layers_.empty() && rope_position_base_ < 0 &&
         !layer_weights_.empty() && layer_weights_.front().q_w.defined() &&
-        layer_weights_.front().q_w.scalar_type() == at::kHalf;
+        (layer_weights_.front().q_w.scalar_type() == at::kHalf ||
+         layer_weights_.front().q_w.scalar_type() == at::kChar ||
+         layer_weights_.front().q_w.scalar_type() == at::kByte);
     const bool ordinary = qwen3vl_ordinary_resident_prefill_profile_ || qwen3vl_4b_w8_profile_ || exact_8b || tts_predictor;
     const bool geometry = (num_layers() == 28 && hidden_size() == 2048 && intermediate_size() == 6144 && num_q_heads() == 16) ||
         (num_layers() == 36 && hidden_size() == 2560 && intermediate_size() == 9728 && num_q_heads() == 32) || exact_8b || tts_predictor;
@@ -472,9 +474,9 @@ bool CausalDecoderModel::begin_qwen3vl_decode_replay(
         graph.kernel_register_census_active() || graph.runtime_policy().fmb_fast_replay ||
         graph.runtime_policy().fmb_deep_fast_replay) return false;
     const auto profile = Qwen3VlDecodeReplayState::profile(*this);
-    // Quantized ACC32 is not yet admitted to this specialized replay path;
-    // retain the generic recorded-Graph execution for those profiles.
-    if (profile.acc32 && profile.dtype != at::kHalf) return false;
+    // The exact TTS Predictor uses the checked tiled grammar for both ACC modes.
+    // Other quantized ACC32 profiles retain generic recorded-Graph execution.
+    if (!tts_predictor && profile.acc32 && profile.dtype != at::kHalf) return false;
     if ((!tts_predictor && (!Qwen3VlDecodeReplayState::projection_shape(lm_head_w_, lm_head_w_scale_,
             profile.dtype, 151936, hidden_size(), false) ||
         !cos_.defined() || cos_.dim() != 2 || cos_.size(0) <= 0 ||
@@ -483,6 +485,9 @@ bool CausalDecoderModel::begin_qwen3vl_decode_replay(
         !tensor_shape(position_ids_keepalive_, at::kInt, {position_ids_keepalive_.size(0), 3}))) ||
         !cos_.defined() || cos_.dim() != 2 || cos_.size(1) != 64 ||
         cos_.scalar_type() != at::kHalf || !tensor_shape(sin_, at::kHalf, cos_.sizes())) return false;
+    if (profile.head_bank &&
+        !Qwen3VlDecodeReplayState::projection_shape(lm_head_w_, lm_head_w_scale_,
+            at::kChar, vocab_size_, hidden_size(), false)) return false;
     const auto cache_capacity = decode_cache_capacity(k, v, num_layers());
     if (!cache_capacity) return false;
     if (tts_predictor) {
@@ -547,23 +552,18 @@ bool CausalDecoderModel::try_checked_layer_body_replay() {
     recipe.topology = topology; // First REPLAY seals the committed BUILD hash.
     RECORD_FUNCTION("rpu_causal::checked_decode_replay", {});
     update_decode_patches(recipe.patches, state.position, recipe.cache_capacity, num_layers());
+    if (!recipe.head_patches.empty())
+        update_head_patches(recipe.head_patches, lm_head_w_, lm_head_w_scale_);
     Qwen3VlDecodeReplayState::visibility(*this, state.k, state.v);
     // No fallback is allowed after this boundary. The existing Graph API owns
     // typed/census/semantic validation and register patch application.
-    if (tts_predictor_heads_.empty()) {
+    if (recipe.head_patches.empty()) {
         graph.skip_op_stream_with_patches(recipe.patches, {});
     } else {
-        TORCH_CHECK(state.position >= 2 && state.position <= 15 &&
-                        tts_predictor_head_index_ == state.position - 1,
-                    "TTS checked replay head does not match its codec position");
-        // Same public Linear DDR ABI as the ordinary launcher; owners above
-        // prove all fifteen bindings, including their alignment and versions.
-        const uint64_t address = RpuGetDevAddr(tts_predictor_heads_.at(tts_predictor_head_index_).data_ptr());
-        const uint32_t encoded = static_cast<uint32_t>(address >> 8);
-        auto patches = recipe.patches;
-        patches.push_back({recipe.head_kernel, 2, uint16_t(encoded), 2});
-        patches.push_back({recipe.head_kernel, 3, uint16_t(encoded >> 16), 2});
-        graph.skip_op_stream_with_patches(patches, {});
+        std::vector<RegisterPatch> applied = recipe.patches;
+        applied.insert(applied.end(), recipe.head_patches.begin(),
+                       recipe.head_patches.end());
+        graph.skip_op_stream_with_patches(applied, {});
     }
     state.skipped = true;
     return true;
@@ -601,10 +601,9 @@ void CausalDecoderModel::finish_qwen3vl_decode_replay() {
             }
         }
         if (admissible && Qwen3VlDecodeReplayState::owner_shapes(*this) &&
-            bind_decode_patches(kernels, next->patches,
+            bind_decode_patches(kernels, next->patches, next->head_patches,
                                 Qwen3VlDecodeReplayState::profile(*this))) {
-            if (!tts_predictor_heads_.empty()) next->head_kernel = kernels.back().kernel;
-            next->owners.reserve(num_layers() * 20 + 7 + tts_predictor_heads_.size());
+            next->owners.reserve(num_layers() * 20 + 7);
             admissible = Qwen3VlDecodeReplayState::visit_owners(*this, state.k, state.v,
                 [&](const at::Tensor& t, bool fixed) {
                     DecodeOwner owner;

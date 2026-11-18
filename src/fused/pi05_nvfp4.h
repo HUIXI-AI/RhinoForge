@@ -14,8 +14,10 @@ struct Pi05Nvfp4Tables {
         "nvfp4_q_ts", "nvfp4_o_ts", "nvfp4_gate_ts", "nvfp4_up_ts", "nvfp4_down_ts"};
     bool enabled() const { return !values.empty(); }
     void install(at::TensorList tables, int64_t layers, int cores) {
-        TORCH_CHECK(tables.empty() || (tables.size() == 5 && layers == 18 && cores == 8),
-                    "Pi05 NVFP4 striped-v2 requires five tensor-scale tables, 18 layers and TP8");
+        // One scalar per layer: the table layout does not depend on the lanes.
+        TORCH_CHECK(tables.empty() || (tables.size() == 5 && layers == 18 &&
+                                       (cores == 4 || cores == 6 || cores == 8)),
+                    "Pi05 NVFP4 striped-v2 requires five tensor-scale tables, 18 layers and 4, 6 or 8 cores");
         for (const auto& table : tables) {
             TORCH_CHECK(table.defined() && table.scalar_type() == at::kFloat &&
                             table.device().type() == at::kPrivateUse1 && table.is_contiguous() &&

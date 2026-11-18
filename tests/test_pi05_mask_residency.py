@@ -18,7 +18,8 @@ SOURCE = ROOT / "src/fused/rpu_pi05_denoise_step_model.cpp"
 
 
 def test_mask_lifetime_covers_every_declared_body_hook_scratch():
-    declare = _definition(SOURCE.read_text(), "std::vector<BufferDecl> Pi05DenoiseStepModel::declare_buffers(")
+    source = SOURCE.read_text()
+    declare = _definition(source, "std::vector<BufferDecl> Pi05DenoiseStepModel::base_buffer_declarations(")
     # A future phase/scope refactor must explicitly prove cross-body lifetime:
     # OutsideLayerLoop scratch would otherwise alias the all-body mask.
     rows = re.findall(
@@ -33,6 +34,18 @@ def test_mask_lifetime_covers_every_declared_body_hook_scratch():
     temporary = [row for row in rows if row[4] == "Temp"]
     assert all(row[2:4] == ("0", "0") and row[5] == "ALL" for row in temporary)
     assert len(temporary) == declare.count("SC::Temp,")
+    # The NVFP4 scale slab, the split-KV K/V share and the resident Q weights
+    # are the temps added outside the base list; all must keep the same
+    # all-body lifetime, or a hook clobbers them between bodies.
+    wrapper = _definition(source, "std::vector<BufferDecl> Pi05DenoiseStepModel::declare_buffers(")
+    added = re.findall(r'decls\.push_back\(\{"([^"]+)",\s*([^,]+),\s*(\d+),\s*(\d+),\s*'
+                       r'StorageClass::(\w+),\s*0,\s*nullptr,\s*BufferScope::(\w+)', wrapper)
+    assert added == [
+        ("nvfp4_spm_scale", "scale_layers * PI05_DENOISE_NVFP4_SPM_SCALE_LAYER", "0", "0", "Temp", "LayerWide"),
+        ("skv_share", "layers * bytes", "0", "0", "Temp", "LayerWide"),
+        ("q_spm_weight", "layers * PI05_DENOISE_Q_SPM_WEIGHT_LAYER", "0", "0", "Temp", "LayerWide"),
+    ]
+    assert wrapper.count("push_back(") == 3
 
 
 def test_mask_schedule_is_admitted_and_consumed_before_attention():
@@ -136,6 +149,11 @@ struct Nvfp4Tables {
 };
 constexpr int64_t PI05_DENOISE_ADARMS_BODY_BYTES=37*3072*2;
 constexpr int64_t PI05_DENOISE_RESIDENT_W8_BYTES=512*1024;
+constexpr int64_t PI05_DENOISE_ROPE_ROW_BYTES=128*2;
+struct Pi05SplitKvPlan {
+  int64_t qp_bytes()const{return 0;} int64_t part_bytes()const{return 0;}
+  int64_t tmp_bytes()const{return 0;} int64_t mask_bytes()const{return 0;}
+};
 class Pi05DenoiseStepModel {public:
   int cores=8; bool w8=false; int64_t max_action_dim_=32;
   FakeTensor action_in_proj_b_,action_out_proj_b_,adarms_table_;
@@ -145,6 +163,7 @@ class Pi05DenoiseStepModel {public:
   bool use_pi05_adarms_body_stream()const{return false;}
   bool use_pi05_gateup_resident(int64_t)const{return false;}
   bool use_pi05_gateup_bundle(int64_t)const{return false;}
+  bool use_pi05_spm_rope_rows_layout()const{return true;}
   int64_t hidden_size()const{return 1024;}
   int64_t num_q_heads()const{return 8;}
   int64_t num_kv_heads()const{return cores==8?8:4;}
@@ -153,17 +172,18 @@ class Pi05DenoiseStepModel {public:
   int num_cores()const{return cores;}
   int mlp_tp()const{return cores;}
   int64_t intermediate_size()const{return cores==6?(w8?4224:4128):4096;}
-  std::vector<BufferDecl> declare_buffers(const LayoutContext&);
+  std::optional<Pi05SplitKvPlan> split_kv_plan(int64_t,int64_t)const{return std::nullopt;}
+  std::vector<BufferDecl> base_buffer_declarations(const LayoutContext&, bool resident_table = false) const;
 };
 """
-    program += _definition(source, "std::vector<BufferDecl> Pi05DenoiseStepModel::declare_buffers(")
+    program += _definition(source, "std::vector<BufferDecl> Pi05DenoiseStepModel::base_buffer_declarations(")
     program += r"""
 int main() {
   Pi05DenoiseStepModel model;
   for (int cores:{4,6,8}) for(bool w8:{false,true}) for(int64_t kv:{288,832,1024}) {
     model.cores=cores;model.w8=w8;
     model.nvfp4_.values.resize(cores==8 && w8?5:0);
-    auto decls=model.declare_buffers({50,kv,true});
+    auto decls=model.base_buffer_declarations({50,kv,true});
     std::vector<SpmAllocator::AllocRequest> requests;
     size_t mask=0,persistent=0;
     for(auto& d:decls) {

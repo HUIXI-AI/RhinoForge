@@ -169,6 +169,7 @@ protected:
 
     std::vector<BufferDecl> declare_buffers(const LayoutContext& ctx) override;
     ModelStaticConfig static_config() override;
+    bool reduced_lingbot2_expert_owner() const override { return true; }
     int64_t subclass_layout_hash() const override {
         const int64_t base = CausalDecoderModel::subclass_layout_hash();
         return denoise_tp8_encoder_ ? detail::layout_mix(base, INT64_C(0x4c32494f545038)) : base;

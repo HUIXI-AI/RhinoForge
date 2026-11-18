@@ -8,6 +8,8 @@
 #include "core/rpu_tensor_ops.h"
 #include "core/rpu_runtime_state.h"
 
+#include "graph/graph_async_end.h"
+
 #include <ATen/record_function.h>
 #include <algorithm>
 #include <atomic>
@@ -1330,14 +1332,16 @@ bool prepare_graph_runtime_arenas(const GraphRuntimePolicy& runtime_policy) {
     return true;
 }
 
-RpuKernelGraph::RpuKernelGraph(GraphRuntimePolicy runtime_policy)
+RpuKernelGraph::RpuKernelGraph(GraphRuntimePolicy runtime_policy, bool require_single_segment)
     : lifetime_retirement_(next_graph_lifetime_id()),
       graph_lifetime_id_(lifetime_retirement_.lifetime_id),
-      runtime_policy_(std::move(runtime_policy)) {
+      runtime_policy_(std::move(runtime_policy)),
+      require_single_segment_(require_single_segment) {
     validate_graph_runtime_policy(runtime_policy_);
 }
 
 RpuKernelGraph::~RpuKernelGraph() {
+    rpu_graph_async_end_wait_for_graph(this, "graph_destroy");
     // Return process-wide retained-slot tokens even when a cache entry is
     // destroyed directly without a prior invalidate(). Queue destruction
     // precedes the kernels referenced by its mutable parameter bindings.
@@ -1427,6 +1431,7 @@ void RpuExecutionCoordinator::exit_graph_noexcept(
 
 RpuExecutionCoordinator::Claim RpuExecutionCoordinator::enter_physical(
         const char* operation) {
+    rpu_graph_async_end_wait("coordinator_physical");
     TORCH_CHECK(operation != nullptr && *operation != '\0',
                 "physical execution claim requires an operation name");
     auto& state = process_execution_state();
@@ -1493,6 +1498,7 @@ void RpuExecutionCoordinator::require_no_physical_claim(
 
 void RpuExecutionCoordinator::require_graph_quiescent(
         const char* operation) {
+    rpu_graph_async_end_wait("coordinator_quiescent");
     TORCH_CHECK(operation != nullptr && *operation != '\0',
                 "Graph-quiescent check requires an operation name");
     auto& state = process_execution_state();
@@ -1558,6 +1564,7 @@ RpuExecutionCoordinator::Claim RpuExecutionCoordinator::enter_cleanup(
         const char* operation,
         bool shutting_down,
         const char* owned_graph_diagnostic) {
+    rpu_graph_async_end_wait("coordinator_cleanup");
     TORCH_CHECK(operation != nullptr && *operation != '\0',
                 "runtime cleanup claim requires an operation name");
     auto& state = process_execution_state();
@@ -1645,6 +1652,7 @@ uint64_t RpuExecutionCoordinator::begin_reconfigure(
 
 uint64_t RpuExecutionCoordinator::begin_reconfigure(
         uint64_t attempt_token, const char* operation) {
+    rpu_graph_async_end_wait("coordinator_reconfigure");
     TORCH_CHECK(operation != nullptr && *operation != '\0',
                 "hot reconfigure requires an operation name");
     auto& state = process_execution_state();
@@ -1677,6 +1685,7 @@ uint64_t RpuExecutionCoordinator::begin_reconfigure_with_quiesce(
         ReconfigureCallback quiesce,
         uint64_t attempt_token,
         const char* operation) {
+    rpu_graph_async_end_wait("coordinator_reconfigure");
     TORCH_CHECK(operation != nullptr && *operation != '\0' && quiesce,
                 "hot reconfigure quiesce requires a callback and operation");
     auto& state = process_execution_state();
@@ -1906,6 +1915,9 @@ bool RpuExecutionCoordinator::abort_reconfigure_attempt(
 RpuExecutionCoordinator::Claim
 RpuExecutionCoordinator::enter_allocator_mutation(
         const char* operation, bool& graph_claim_active) {
+    // No async replay end wait: the only user is the SPM temporary reset, a
+    // host bookkeeping change. An in-flight Graph keeps its baked SPM
+    // addresses, and every later device entry waits on its own.
     TORCH_CHECK(operation != nullptr && *operation != '\0',
                 "allocator mutation admission requires an operation name");
     auto& state = process_execution_state();
@@ -1940,6 +1952,7 @@ RpuExecutionCoordinator::enter_graph_invalidation(
         const char* operation,
         uint64_t expected_physical_token,
         bool& physical_claim_active) {
+    rpu_graph_async_end_wait("coordinator_graph_invalidation");
     TORCH_CHECK(operation != nullptr && *operation != '\0',
                 "Graph invalidation admission requires an operation name");
     auto& state = process_execution_state();
@@ -2096,9 +2109,9 @@ bool rpu_execution_reconfigure_abort_attempt(int64_t attempt_token) {
 }
 
 std::shared_ptr<RpuKernelGraph> make_registered_rpu_kernel_graph(
-        GraphRuntimePolicy runtime_policy) {
+        GraphRuntimePolicy runtime_policy, bool require_single_segment) {
     validate_graph_runtime_policy(runtime_policy);
-    auto graph = std::make_shared<RpuKernelGraph>(std::move(runtime_policy));
+    auto graph = std::make_shared<RpuKernelGraph>(std::move(runtime_policy), require_single_segment);
     auto& registry = registered_graph_registry();
     std::lock_guard<std::mutex> lock(registry.mutex);
     registry.graphs.emplace_back(graph);
@@ -2152,6 +2165,7 @@ bool RpuKernelGraph::has_active() {
 
 void RpuKernelGraph::check_direct_immediate_dma_allowed(
         const char* operation) {
+    rpu_graph_async_end_wait("immediate_dma");
     TORCH_CHECK(operation != nullptr && *operation != '\0',
                 "direct/immediate DMA admission requires an operation name");
     RpuExecutionCoordinator::check_current_thread_execution_allowed(operation);
@@ -2753,7 +2767,7 @@ void RpuKernelGraph::verify_semantic_spm_producer_yield_replay_arm(
         ": semantic SPM producer-yield Graph is stale or unarmed");
 }
 
-void RpuKernelGraph::verify_semantic_spm_producer_yield_end_preflight() {
+bool RpuKernelGraph::verify_semantic_spm_producer_yield_end_preflight() {
     TORCH_CHECK(!semantic_spm_producer_yield_poisoned_ &&
                     !pending_semantic_spm_producer_yield_.has_value(),
                 "RpuKernelGraph: semantic SPM producer yield is poisoned or "
@@ -2762,7 +2776,7 @@ void RpuKernelGraph::verify_semantic_spm_producer_yield_end_preflight() {
     TORCH_CHECK(observed == has_semantic_spm_producer_yield_nodes_,
                 "RpuKernelGraph: semantic SPM producer yield marker state "
                 "drifted from the retained Graph");
-    if (!observed) return;
+    if (!observed) return false;
 
     const std::shared_ptr<const uint64_t> owner =
         semantic_spm_producer_yield_owner_generation_.lock();
@@ -2782,13 +2796,14 @@ void RpuKernelGraph::verify_semantic_spm_producer_yield_end_preflight() {
                     "RpuKernelGraph: producer-yield BUILD must remain signed "
                     "and cannot carry a replay arm");
         semantic_spm_producer_yield_id_digest_ = digest;
-        return;
+        return true;
     }
     TORCH_CHECK(state_ == State::REPLAYING &&
                     digest == semantic_spm_producer_yield_id_digest_,
                 "RpuKernelGraph: semantic SPM producer-yield Graph topology "
                 "drifted before REPLAY");
     verify_semantic_spm_producer_yield_replay_arm("RpuKernelGraph::end");
+    return true;
 }
 
 void RpuKernelGraph::verify_composite_fmb_end_preflight() const {
@@ -2859,6 +2874,8 @@ void RpuKernelGraph::check_foreign_graph_execution_allowed(
         return;
     }
     const RpuKernelGraph* outer = active_stack_.back();
+    TORCH_CHECK(!outer->require_single_segment_, operation,
+                " is forbidden inside a single-segment Graph scope");
     TORCH_CHECK(
         !outer->has_semantic_dma_nodes_ &&
             !outer->has_semantic_spm_producer_yield_nodes_ &&
@@ -2879,6 +2896,7 @@ void RpuKernelGraph::check_foreign_graph_execution_allowed(
 }
 
 void RpuKernelGraph::begin_impl(const std::optional<GraphSignature>& sig) {
+    rpu_graph_async_end_wait_for_graph(this, "begin_same_graph");
     auto execution_claim = RpuExecutionCoordinator::enter_graph(
         "RpuKernelGraph::begin");
     GraphClaimRollback execution_rollback(execution_claim);
@@ -3087,6 +3105,9 @@ bool RpuKernelGraph::force_oneshot_on_replay_enabled() const {
 }
 
 void RpuKernelGraph::end() {
+    if (state_ != State::REPLAYING || force_oneshot_on_replay_enabled()) {
+        rpu_graph_async_end_wait("end");
+    }
     RpuExecutionCoordinator::check_current_thread_execution_allowed(
         "RpuKernelGraph::end");
     TORCH_CHECK(scope_open_ && execution_claim_.has_value() &&
@@ -3098,7 +3119,8 @@ void RpuKernelGraph::end() {
                 "RpuKernelGraph: end() without matching begin() or non-top of "
                 "active stack");
     verify_composite_fmb_end_preflight();
-    verify_semantic_spm_producer_yield_end_preflight();
+    const bool semantic_spm_producer_yield_markers =
+        verify_semantic_spm_producer_yield_end_preflight();
     TORCH_CHECK(!canonical_dma_poisoned_ &&
                     !canonical_dma_callback_active_ &&
                     !canonical_dma_burst_permit_.active,
@@ -3147,6 +3169,8 @@ void RpuKernelGraph::end() {
 
     switch (state_) {
     case State::RECORDING:
+        TORCH_CHECK(!require_single_segment_ || !nodes_.empty(),
+                    "Single-segment Graph cannot be empty");
         if (nodes_.empty()) {
             // 空 capture（整个 scope 没提交任何 kernel）→ 直接落回 PASSTHROUGH
             pending_signature_.reset();
@@ -3224,6 +3248,7 @@ void RpuKernelGraph::end() {
         // execute / post-flush / stats 四段,Chrome tracing / Perfetto 里直接
         // 搜 `rpu_graph::*`。无语义改变。
         RECORD_FUNCTION("rpu_graph::end_REPLAYING", {});
+        bool async_end_submitted = false;
         // REPLAYING 同样需要 pre + post 双 flush。
         // 原因：虽然 data node 不会在 REPLAYING 期 eager 写 DDR，但本轮
         // forward 里仍可能有 CPU fallback / host tensor op 先产出 DDR 输入，
@@ -3246,10 +3271,47 @@ void RpuKernelGraph::end() {
                 execute_graph_oneshot();
                 segments_.clear();
             } else {
-                execute_graph_for_replaying();
+                end_scanned_semantic_spm_producer_yield_markers_ =
+                    semantic_spm_producer_yield_markers;
+                // Async replay end: a top-level Graph of an opted-in policy
+                // may return while its final segment runs. Child Graphs and
+                // HWPerf replays stay synchronous (execute_graph_for_replaying),
+                // and so do outer-fast staged Graphs, whose execution-success
+                // mark must follow the post visibility flush.
+                const bool async_end =
+                    runtime_policy_.async_replay_end &&
+                    active_stack_.size() == 1 &&
+                    !kernel_register_outer_fast_build_state_.staged;
+                try {
+                    execute_graph_for_replaying(async_end,
+                                                &async_end_submitted);
+                } catch (...) {
+                    // A failure after the asynchronous submission completes it
+                    // here, as the synchronous path would have.
+                    rpu_graph_async_end_wait_for_graph(this, "end_failure");
+                    throw;
+                }
             }
         }
-        {
+        bool post_flush_deferred = false;
+        if (async_end_submitted) {
+            // The final segment is still running: hand the post-execution
+            // flush and the keep-alive references to the wait.
+            RECORD_FUNCTION("rpu_graph::async_end_seal", {});
+            std::vector<void*> post_flush_ptrs;
+            try {
+                post_flush_ptrs = post_execution_flush_ptrs();
+            } catch (...) {
+                rpu_graph_async_end_wait_for_graph(this, "end_failure");
+                throw;
+            }
+            // False when already completed (a deleter or another entry
+            // waited): the synchronous post flush below runs instead.
+            post_flush_deferred = rpu_graph_async_end_seal(
+                this, built_signature_.op_id_str.c_str(), post_flush_ptrs,
+                tensor_refs_);
+        }
+        if (!post_flush_deferred) {
             RECORD_FUNCTION("rpu_graph::flush_post", {});
             flush_boundary_ptrs();
             flush_kernel_register_outer_fast_force_post_visibility();
@@ -3280,7 +3342,7 @@ void RpuKernelGraph::end() {
     }
 
     // keep_alive() 的引用在这里(执行之后)才丢 —— 这正是 C-1 要求的生命周期,
-    // 见 docs/pitfalls.md#c-1。纯生命周期锚点,不做 flush:相干性由 op 侧的
+    // 见 the SDK queue contract。纯生命周期锚点,不做 flush:相干性由 op 侧的
     // rpu_ddr_flush_force(执行前)和 boundary flush 机制负责。
     tensor_refs_.clear();
     pending_kernel_id_.reset();
@@ -3334,6 +3396,7 @@ void RpuKernelGraph::end() {
 // =============================================================================
 
 void RpuKernelGraph::abort() {
+    rpu_graph_async_end_wait("abort");
     // 已经 end/abort 过或从未 begin:保持幂等 no-op。打开的 scope 则先验证
     // process claim；foreign thread 即使没有这条线程的 TLS stack 也必须拒绝，
     // 不能把 owner 的 claim 静默遗留。
@@ -3390,6 +3453,7 @@ void RpuKernelGraph::invalidate() {
 }
 
 void RpuKernelGraph::invalidate_impl(bool from_abort) {
+    rpu_graph_async_end_wait("invalidate");
     TORCH_CHECK(from_abort || !scope_open_,
                 "RpuKernelGraph: invalidate is forbidden while a Graph scope "
                 "is open; use abort for scope cleanup");
@@ -3486,6 +3550,8 @@ void RpuKernelGraph::invalidate_impl(bool from_abort) {
 // 多次调用时只保留第一个 reason(避免后面 op 把更早的根因覆盖掉)。
 
 void RpuKernelGraph::mark_non_replayable(std::string reason) {
+    TORCH_CHECK(!require_single_segment_,
+                "Single-segment Graph forbids non-replayable downgrade");
     TORCH_CHECK(!pending_semantic_spm_producer_yield_.has_value() &&
                     !has_semantic_spm_producer_yield_nodes_ &&
                     !semantic_spm_producer_yield_poisoned_,
@@ -3557,6 +3623,38 @@ void RpuKernelGraph::flush_boundary_ptrs() {
         }
     }
     last_stats_.boundary_flush_count = boundary_flush_ptrs_.size();
+}
+
+std::vector<void*> RpuKernelGraph::post_execution_flush_ptrs() {
+    // Same pointers, order and gates as flush_boundary_ptrs() followed by
+    // flush_kernel_register_outer_fast_force_post_visibility(), collected for
+    // rpu_graph_async_end_wait() to flush after completion.
+    std::vector<void*> out;
+    last_stats_.boundary_flush_count = 0;
+    if (g_rpu_ddr_flush_enabled && !boundary_flush_ptrs_.empty()) {
+        std::sort(boundary_flush_ptrs_.begin(), boundary_flush_ptrs_.end());
+        boundary_flush_ptrs_.erase(
+            std::unique(boundary_flush_ptrs_.begin(), boundary_flush_ptrs_.end()),
+            boundary_flush_ptrs_.end());
+        for (void* p : boundary_flush_ptrs_) {
+            if (p != nullptr) out.push_back(p);
+        }
+        last_stats_.boundary_flush_count = boundary_flush_ptrs_.size();
+    }
+    if (kernel_register_outer_fast_build_state_.staged &&
+        kernel_register_census_invocation_armed_ &&
+        g_rpu_ddr_flush_force_enabled) {
+        for (void* ptr :
+             kernel_register_outer_fast_invocation_force_post_visibility_) {
+            if (g_rpu_ddr_flush_enabled &&
+                std::binary_search(boundary_flush_ptrs_.begin(),
+                                   boundary_flush_ptrs_.end(), ptr)) {
+                continue;
+            }
+            out.push_back(ptr);
+        }
+    }
+    return out;
 }
 // S2 / G1.5 — _to_copy admission:HostCallback stable storage tracking
 // =============================================================================

@@ -71,7 +71,7 @@ embedding and LM head stay FP16. Text accumulation is ACC16. The 9B image tower 
 80/4352. Video and other quantized geometries retain their own admission.
 
 The Qwen3.5-35B-A3B mixed-E4M3 profile has a separate topology. Prepare its
-checkpoint with the [official-source download and CPU conversion commands](../examples/configs/qwen3_5/README.md#cmd-moe-mixed).
+checkpoint with the [official-source download and CPU conversion commands](../examples/configs/qwen3_5/README.md).
 All three core budgets share the converted weights; core-specific padding and
 packing happen during cold installation:
 
@@ -88,9 +88,7 @@ bridge check the complete tuple. Gate/up logical halves are split before zero
 padding; routed E4M3 padding uses zero codes and unit scales, and shared FP16
 projections receive matching zeros. Router output uses a fixed model-owned
 buffer before the six-core routing stage. No weights are repacked during replay.
-Use the corresponding [TP4](../examples/configs/qwen3_5/vl/35b_a3b/fp8_e4m3_experts_attn_gdn_tp4.toml),
-[TP6](../examples/configs/qwen3_5/vl/35b_a3b/fp8_e4m3_experts_attn_gdn_tp6.toml) or
-[TP8](../examples/configs/qwen3_5/vl/35b_a3b/fp8_e4m3_experts_attn_gdn.toml) template.
+Configure `rpu_execution.model.num_cores` (`4`, `6`, or `8`) in the [mixed-E4M3 template](../examples/configs/qwen3_5/vl/35b_a3b/fp8_e4m3_experts_attn_gdn.toml).
 
 Pi0.5 reduced FP16/W8A16 uses Vision4, attention4 and conditioning4, with MLP4
 or MLP6. Cameras run separately at 256 rows and physical KV keeps eight stripes.

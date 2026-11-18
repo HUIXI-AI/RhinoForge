@@ -274,6 +274,32 @@ int main() {
            "a bound but unmeasured profile still reports capability selection");
 
     --fixture.dependency_identity;
+    // Historical main65d49a7b9 dependency tuple: preserve its identity and
+    // costs verbatim. A new BASE must not promote this old sealed receipt.
+    uint64_t old_hash = 1469598103934665603ULL;
+    for (const char* sha : {"bdc0dae56a6176c2fed6ae94f7c8c38a42bc7f06",
+                           "5f339220245a617056fb461b431f064449a6ad41",
+                           "f8d6b94b67d1be9416e35e79b5f8f94b03e7fab2"}) {
+        for (; *sha; ++sha) { old_hash ^= uint8_t(*sha); old_hash *= 1099511628211ULL; }
+        old_hash ^= uint8_t('|'); old_hash *= 1099511628211ULL;
+    }
+    const int64_t old_dependency = static_cast<int64_t>(old_hash & ((1ULL << 63) - 1));
+    auto historical = fixture;
+    historical.dependency_identity = old_dependency;
+    const std::array<KvInsertCostCertificate, 1> historical_catalog{historical};
+    EXPECT(old_dependency != rpu_kvinsert_cost_certificate().dependency_identity &&
+               !rpu_kvinsert_cost_certificate_matches(historical, measured_domain),
+           "new BASE tuple rejects the unchanged historical sealed receipt");
+    const auto unmeasured = rpu_resolve_kvinsert_segment_plan_auto(
+        225, 51, 51, 8, 8, 128, all_caps, measured_domain.scope, historical_catalog);
+    EXPECT(unmeasured.selection_state() == KvInsertSelectionState::CAPABILITY_RANKED &&
+               unmeasured.cost_certificate_identity() == 0 &&
+               !unmeasured.cost_certificate().sealed &&
+               unmeasured.dependency_identity() == rpu_kvinsert_cost_certificate().dependency_identity,
+           "new tuple without its own measurement stays unsealed and capability ranked");
+    EXPECT(historical_catalog[0].dependency_identity == old_dependency &&
+               historical_catalog[0].sealed && historical_catalog[0].route_costs_ns == fixture.route_costs_ns,
+           "historical receipt is neither mutated nor relabeled");
     const auto measured_plan = [&] {
         const std::vector<KvInsertCostCertificate> owner_catalog{fixture};
         return rpu_resolve_kvinsert_segment_plan_auto(
@@ -304,6 +330,11 @@ int main() {
         0, 11, 0, 0, 0, 26, 1};
     const auto owner_catalog = KvInsertCostCatalog::from_arguments(
         owner_identity, artifact_sha256, catalog_words);
+    auto historical_words = catalog_words;
+    historical_words[2] = old_dependency;
+    EXPECT(throws_c10([&] {
+        (void)KvInsertCostCatalog::from_arguments(owner_identity, artifact_sha256, historical_words);
+    }), "cold catalog admission rejects the old dependency tuple before installation");
     const std::vector<int64_t> six_core_catalog_words{
         2, 1, fixture.dependency_identity, artifact_projection,
         111, 222, 444, 555, 0, 260, 260, 6, 6, 64, 2,

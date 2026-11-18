@@ -39,7 +39,7 @@ struct Kernel_t {
     uint32_t pair(int i)const{return r[i]|(uint32_t(r[i+1])<<16);}
 };
 std::unordered_map<uint32_t,uint16_t> memory;
-int staged=0,lookups=0,launches=0,last_core_count=0;
+int staged=0,lookups=0,launches=0,last_core_count=0,active_cores=8;
 struct RpuKernelGraph {
     Kernel_t kernel;
     static RpuKernelGraph& active(){static RpuKernelGraph g;return g;}
@@ -91,25 +91,26 @@ void rpu_launch_slice_spm_kernel(uint32_t,uint32_t,const std::vector<int64_t>&,
     code += r'''
 
 size_t prod(const std::vector<int64_t>& shape){size_t n=1;for(auto x:shape)n*=x;return n;}
-void seed(uint32_t s,size_t n){memory.clear();for(int c=0;c<8;++c)for(size_t i=0;i<n;++i)memory[s+c*0x1000000+i*2]=uint16_t(c*733+i*19);}
-std::vector<uint16_t> snapshot(uint32_t d,size_t n){std::vector<uint16_t> r;for(int c=0;c<8;++c)for(size_t i=0;i<n;++i)r.push_back(memory.at(d+c*0x1000000+i*2));return r;}
+void seed(uint32_t s,size_t n){memory.clear();for(int c=0;c<active_cores;++c)for(size_t i=0;i<n;++i)memory[s+c*0x1000000+i*2]=uint16_t(c*733+i*19);}
+std::vector<uint16_t> snapshot(uint32_t d,size_t n){std::vector<uint16_t> r;for(int c=0;c<active_cores;++c)for(size_t i=0;i<n;++i)r.push_back(memory.at(d+c*0x1000000+i*2));return r;}
 int main(){
     const uint32_t s=SPM_ALLOC.addr(0,0xfe00),d=SPM_ALLOC.addr(0,0x180000);
-    const std::vector<std::vector<int64_t>> inputs={{64,16},{128,16},{192,16},{256,16},{2,64}};
-    const std::vector<std::vector<int64_t>> outputs={{64,2},{128,2},{192,2},{256,2},{2,1}};
-    const std::vector<std::vector<int64_t>> begins={{0,0},{0,0},{0,0},{0,0},{0,63}};
-    for(size_t i=0;i<inputs.size();++i){
+    const std::vector<std::vector<int64_t>> inputs={{64,16},{128,16},{192,16},{256,16},{2,64},{4,64},{6,64},{8,64},{12,64}};
+    const std::vector<std::vector<int64_t>> outputs={{64,2},{128,2},{192,2},{256,2},{2,1},{4,1},{6,1},{8,1},{12,1}};
+    const std::vector<std::vector<int64_t>> begins={{0,0},{0,0},{0,0},{0,0},{0,63},{0,63},{0,63},{0,63},{0,63}};
+    for(int nc:{4,8})for(size_t i=0;i<inputs.size();++i){
+        active_cores=nc;
         seed(s,prod(inputs[i]));launches=0;
-        for(int c=0;c<8;++c)
+        for(int c=0;c<nc;++c)
             rpu_launch_slice_spm_kernel(s+c*0x1000000,d+c*0x1000000,inputs[i],outputs[i],begins[i],1);
-        assert(launches==8&&last_core_count==1);auto expected=snapshot(d,prod(outputs[i]));
+        assert(launches==nc&&last_core_count==1);auto expected=snapshot(d,prod(outputs[i]));
         seed(s,prod(inputs[i]));launches=0;
-        rpu_launch_slice_spm_kernel(s,d,inputs[i],outputs[i],begins[i],8,true);
-        assert(launches==1&&last_core_count==8);
+        rpu_launch_slice_spm_kernel(s,d,inputs[i],outputs[i],begins[i],nc,true);
+        assert(launches==1&&last_core_count==nc);
         assert(snapshot(d,prod(outputs[i]))==expected);
         assert(RpuKernelGraph::active().kernel.pair(0)==0x10200+begins[i].back()*2);
         assert(RpuKernelGraph::active().kernel.pair(2)==0x180400);
-        for(size_t core=0;core<8;++core)for(size_t row=0;row<size_t(outputs[i][0]);++row)
+        for(size_t core=0;core<size_t(nc);++core)for(size_t row=0;row<size_t(outputs[i][0]);++row)
             for(size_t col=0;col<size_t(outputs[i][1]);++col)
                 assert(memory.at(d+core*0x1000000+(row*outputs[i][1]+col)*2)==
                        uint16_t(core*733+(row*inputs[i][1]+begins[i][1]+col)*19));

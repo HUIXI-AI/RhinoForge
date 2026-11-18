@@ -32,7 +32,8 @@ def test_owner_cache_cold_admission_routes_and_real_caller_fallbacks(tmp_path):
     assert len(ids) == 6
     cpp = cpp.replace('enum class KernelId{', 'enum class KernelId{' + ','.join(ids) + ',')
     cpp = cpp.replace('bool q=true,kv=true,fanout=true,joint=true;', 'bool q=true,kv=true,fanout=true,joint=true;int missing_owner=-1;')
-    cpp = cpp.replace('bool has_loaded(KernelId id){++queries;', 'bool has_loaded(KernelId id){++queries;if(static_cast<int>(id)<6)return static_cast<int>(id)!=missing_owner;')
+    owner_ids_arr = ','.join(f'KernelId::{name}' for name in ids)
+    cpp = cpp.replace('bool has_loaded(KernelId id){++queries;', f'bool has_loaded(KernelId id){{++queries;const std::array<KernelId,6> kOwnerIds{{{owner_ids_arr}}};for(int idx=0;idx<6;++idx)if(id==kOwnerIds[idx])return idx!=missing_owner;')
     cpp = cpp.replace('namespace c10{enum', 'namespace c10{using Half=uint16_t;enum')
     cpp = cpp.replace('int dim()const{return rank;}', 'int64_t numel()const{return rank==1?rows:rows*cols;}template<class T>T*data_ptr()const{return reinterpret_cast<T*>(owner);}int dim()const{return rank;}')
     support = r'''
@@ -176,7 +177,7 @@ int main(){
  Model fp16(false);fp16.owner_fixture();fp16.install();fp16.loop();fp16.full_plan(245);assert(!fp16.action_owner_cache_available_&&!has(fp16,linear));launches.clear();fp16.phase2(0);assert(launches==std::vector<std::string>({"qgate-fp16","kv-fp16"}));
  {auto x=m;++x.layer_weights_.back().k_norm_w.owner;assert(x.kvinsert_cost_weight_identity()!=identity);}
  // Accumulation changes only the projection; BASE K math and KV22 remain shared.
- {Model x;x.linear_acc32_=false;x.owner_fixture();x.install();x.loop();x.full_plan(245);assert(x.action_owner_cache_available_&&x.action_qkv_gate_owner_only_arguments()[5]==16&&x.action_qkv_gate_owner_only_arguments()[6]==288&&x.subclass_layout_hash()!=hash&&x.kvinsert_cost_weight_identity()!=identity);
+ {Model x;x.linear_acc32_=false;x.owner_fixture();x.install();x.loop();x.full_plan(245);assert(x.action_owner_cache_available_&&x.action_qkv_gate_owner_only_arguments()[5]==16&&x.action_qkv_gate_owner_only_arguments()[6]==48&&x.subclass_layout_hash()!=hash&&x.kvinsert_cost_weight_identity()!=identity);
   const auto valid=x.routes;x.routes=m.routes;reject([&]{x.phase2(23);});x.routes=valid;
   assert(x.action_k_owner_norm_rope_arguments()==m.action_k_owner_norm_rope_arguments()&&x.action_owner_cache_arguments(KvInsertSegmentPlan(245))==m.action_owner_cache_arguments(KvInsertSegmentPlan(245)));
   for(int layer=0;layer<24;++layer){linear_modes.clear();launches.clear();x.chain(layer);assert(launches==std::vector<std::string>({"owner-linear","q-norm","q-rope","owner-norm-rope","owner-cache"})&&linear_modes==std::vector<bool>({false}));}

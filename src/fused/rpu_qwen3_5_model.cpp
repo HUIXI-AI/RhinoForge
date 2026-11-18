@@ -1,3 +1,4 @@
+#include "rpu_g05_linear_contracts.h"
 // rpu_qwen3_5_model.cpp — Qwen3.5 hybrid-attention fused model (v3).
 // See rpu_qwen3_5_model.h for scope. Full-attention emission mirrors
 // CausalDecoderModel::build_layer_subgraph (rpu_qwen3_model.cpp) for the
@@ -76,6 +77,7 @@ constexpr int64_t QWEN35_TEXT_CORE_TOPOLOGY_SITE = 3215916181030544856LL;
 constexpr int64_t QWEN35_TEXT_GDN_PREPARE_ALL_REDUCE_SITE = 6288021177778164369LL;
 constexpr int64_t QWEN35_TEXT_GDN_MASK_RESIDENCY_SITE = 120356759196541611LL;
 constexpr int64_t QWEN35_TEXT_GDN_LOCAL_SLICE_SITE = 4624574716066886237LL;
+constexpr int64_t QWEN35_TEXT_GDN_GLAST_LOCAL_SITE = 5486472411379814366LL;
 constexpr int64_t QWEN35_TEXT_OWNER_RMS_SITE = 8722488789555919585LL;
 constexpr int64_t QWEN35_TEXT_GDN_OWNER_RMS_SITE = 7871266237092441430LL;
 constexpr int64_t QWEN35_TEXT_MLP_TAIL_SITE = 8475656447499929675LL;
@@ -287,6 +289,17 @@ std::vector<int64_t> Qwen3_5Model::execution_topology() const {
     return {num_cores(), attn_tp(), mlp_tp(), lm_head_tp(), NUM_CORES};
 }
 
+int64_t Qwen3_5Model::resolve_model_mlp_intermediate_size(int64_t logical_size) const {
+    if ((mlp_packed_w4_ || text_nvfp4_.enabled()) && num_cores() == 6) {
+        // Signed W4 group32 uses the new N32xK32 layout (32 per core). Text
+        // NVFP4 needs localK % 64 (64 per core); QuantTrio AWQ keeps G128.
+        const int64_t alignment =
+            (mlp_awq_g128_ ? 128 : text_nvfp4_.enabled() ? 64 : 32) * num_cores();
+        return ((logical_size + alignment - 1) / alignment) * alignment;
+    }
+    return FusedModelBase::resolve_model_mlp_intermediate_size(logical_size);
+}
+
 DecoderExecutionTopology Qwen3_5Model::resolve_model_execution_topology(
         int64_t nq, int64_t nkv, int64_t hd, int64_t h, int64_t intermediate) const {
     if (num_cores() == 8)
@@ -300,9 +313,55 @@ std::vector<int64_t> Qwen3_5Model::cold_topology_arguments() const {
     return {1, num_cores(), attn_tp(), gdn_tp(), mlp_tp(), lm_head_tp(), NUM_CORES};
 }
 
+bool Qwen3_5Model::use_text_gdn_input_workspace() const {
+    return !action_mode_ && !z2_bound_ && has_gdn_ &&
+        num_cores() == 6 && get_chunk_size_override() == 640 &&
+        num_layers() == 24 && hidden_size() == 2048 &&
+        intermediate_size() == 6144 && num_q_heads() == 8 &&
+        num_kv_heads() == 4 && head_dim() == 256 &&
+        gdn_nvh_ == 16 && gdn_dk_ == 128 && gdn_dv_ == 128 &&
+        gdn_conv_dim_ == 6144 && gdn_kc_ == 4;
+}
+
+int Qwen3_5Model::gdn_input_workspace_slot(const char* name) {
+    // Inclusive phases: slot reuse always begins after its previous last read.
+    // input_norm is dead after the six phase-1 projections and written at 17.
+    if (std::strcmp(name, "gdn_c_query") == 0) return 0; // 2..4
+    if (std::strcmp(name, "gdn_c_key") == 0) return 1;   // 2..5
+    if (std::strcmp(name, "gdn_c_value") == 0) return 2; // 2..6
+    if (std::strcmp(name, "gdn_c_q_h") == 0) return 3;   // 4..16
+    if (std::strcmp(name, "gdn_c_k_h") == 0) return 0;   // 5..16
+    if (std::strcmp(name, "gdn_c_v_h") == 0) return 1;   // 6..14
+    if (std::strcmp(name, "gdn_c_vnew") == 0) return 2;  // 14..16
+    if (std::strcmp(name, "gdn_c_kcd") == 0) return 1;   // 15..16
+    return -1;
+}
+
+std::vector<int64_t> Qwen3_5Model::gdn_input_workspace_arguments(int64_t rows) const {
+    TORCH_CHECK(use_text_gdn_input_workspace() && rows >= 64 &&
+                    rows <= 640 && rows % 64 == 0,
+                "Qwen3.5 GDN input workspace requires its bound 2B chunk schedule");
+    const int64_t slot_bytes = Align(rows * (gdn_nvh_ / gdn_tp()) * gdn_dk_ * DWIDTH, 256);
+    const int64_t input_bytes = Align(rows * hidden_size() * DWIDTH, 256);
+    TORCH_CHECK(4 * slot_bytes <= input_bytes,
+                "Qwen3.5 GDN workspace exceeds the input_norm owner");
+    return {1, rows, 4, slot_bytes, input_bytes, num_cores(), gdn_tp(), 2, 16};
+}
+
+int64_t Qwen3_5Model::gdn_input_workspace_offset(const char* name, int64_t rows) const {
+    const int slot = gdn_input_workspace_slot(name);
+    if (slot < 0) return -1;
+    return slot * gdn_input_workspace_arguments(rows)[3];
+}
+
 int64_t Qwen3_5Model::subclass_layout_hash() const {
     // Precision selects different generated arithmetic and specialized tiles.
     int64_t hash = detail::layout_mix(0, linear_acc32_);
+    if (use_text_gdn_input_workspace()) {
+        hash = detail::layout_mix(hash, kTextGdnInputWorkspaceSite);
+        for (const auto value : gdn_input_workspace_arguments(640))
+            hash = detail::layout_mix(hash, value);
+    }
     if (high_precision_) {
         hash = detail::layout_mix(hash, high_precision_site());
         for (const auto value : high_precision_arguments())
@@ -315,6 +374,14 @@ int64_t Qwen3_5Model::subclass_layout_hash() const {
                 hash = detail::layout_mix(hash, value);
             std::vector<int64_t> owner;
             append_kvinsert_cost_tensor_identity(owner, action_nvfp4_.values[family]);
+            for (const auto value : owner) hash = detail::layout_mix(hash, value);
+        }
+    }
+    if (text_nvfp4_.enabled()) {
+        hash = detail::layout_mix(hash, kTextNvfp4TablesSite);
+        for (const auto& table : text_nvfp4_.values) {
+            std::vector<int64_t> owner;
+            append_kvinsert_cost_tensor_identity(owner, table);
             for (const auto value : owner) hash = detail::layout_mix(hash, value);
         }
     }
@@ -356,6 +423,10 @@ int64_t Qwen3_5Model::subclass_layout_hash() const {
     if (use_g05_gdn_local_slice(256)) {
         hash = detail::layout_mix(hash, QWEN35_TEXT_GDN_LOCAL_SLICE_SITE);
         for (const auto value : g05_gdn_local_slice_arguments(256))
+            hash = detail::layout_mix(hash, value);
+    }
+    if (has_text_gdn_glast_local_capability()) {
+        for (const auto value : text_gdn_glast_local_identity())
             hash = detail::layout_mix(hash, value);
     }
     if (use_text_gateup_pair(256)) {
@@ -552,6 +623,31 @@ std::vector<int64_t> Qwen3_5Model::g05_gdn_local_slice_arguments(int64_t rows) c
             0x40000000, 0x1000000};
 }
 
+bool Qwen3_5Model::has_text_gdn_glast_local_capability() const {
+    const int nc = gdn_tp();
+    return !action_mode_ && !z2_bound_ && has_gdn_ &&
+           (nc == 4 || nc == 8) && gdn_nvh_ > 0 && gdn_nvh_ % nc == 0;
+}
+
+std::vector<int64_t> Qwen3_5Model::text_gdn_glast_local_identity() const {
+    // Cold policy/topology identity: independent of the previous forward and
+    // valid for every admitted C64-multiple chunk, not a probe at one length.
+    return {QWEN35_TEXT_GDN_GLAST_LOCAL_SITE, 1, gdn_nvh_, gdn_tp(),
+            64, 2, 128, 2, 63, 1};
+}
+
+bool Qwen3_5Model::use_text_gdn_glast_local(int64_t rows) const {
+    return has_text_gdn_glast_local_capability() && rows >= 64 &&
+           rows % 64 == 0 && !use_g05_gdn_local_slice(rows);
+}
+
+std::vector<int64_t> Qwen3_5Model::text_gdn_glast_local_arguments(int64_t rows) const {
+    // Version, chunk rows, C64, heads/core, logical cores, element bytes,
+    // source/output row bytes, final column, local mode, two calls/subchunk.
+    return {1, rows, 64, gdn_nvh_ / gdn_tp(), gdn_tp(),
+            2, 128, 2, 63, 1, 2 * (rows / 64)};
+}
+
 void Qwen3_5Model::set_chunk_size_cap(int64_t cap) {
     TORCH_CHECK(cap == 0 || cap >= 64,
                 "Qwen3.5 text chunk cap must be 0 or at least 64, got ", cap);
@@ -600,6 +696,8 @@ void Qwen3_5Model::set_linear_acc32(bool enabled) {
                 "Qwen3.5 action accumulation must be bound before enabling action mode");
     TORCH_CHECK(!action_nvfp4_.enabled() || enabled == linear_acc32_,
                 "G05 NVFP4 accumulation must be bound before installing weights");
+    TORCH_CHECK(!text_nvfp4_.enabled() || enabled == linear_acc32_,
+                "Qwen3.5 text NVFP4 accumulation must be bound before installing weights");
     linear_acc32_ = enabled;
     prepare_text_gateup_pair();
     prepare_text_owner_rms();
@@ -668,8 +766,19 @@ void Qwen3_5Model::set_fast_replay(bool enabled) {
     invalidate_model_state();
 }
 
+void Qwen3_5Model::set_initial_prefill_state_flush_skip(bool enabled) {
+    initial_prefill_state_flush_skip_ = enabled;
+}
+
 void Qwen3_5Model::enable_action_mode() {
-    TORCH_CHECK(num_cores() == 8, "Qwen3.5 action mode requires eight cores");
+    // The exact G05 action row also runs on the four-lane template; every
+    // fused action route below stays eight-core and selects its decomposed form.
+    TORCH_CHECK(num_cores() == 8 ||
+                    (num_cores() == 4 && attn_tp() == 4 && mlp_tp() == 4 &&
+                     g05_action_profile_num_layers(
+                         num_q_heads(), num_kv_heads(), head_dim(), hidden_size(),
+                         intermediate_size()) == num_layers()),
+                "Qwen3.5 action mode requires eight cores or the exact four-core G05 action");
     TORCH_CHECK(get_last_resolved_chunk_size() == 0,
                 "Qwen3.5 action mode must be enabled before the first forward");
     TORCH_CHECK(num_layers() > 0,
@@ -738,6 +847,7 @@ void Qwen3_5Model::set_action_io_weights(
     action_dim_ = action_dim;
     action_dim_pad_ = action_dim_pad;
     action_len_ = action_len;
+    action_valid_len_ = action_len;
     action_loop_active_ = false;
     action_rtc_active_ = false;
     action_rtc_prefix_len_ = 0;
@@ -919,6 +1029,22 @@ void Qwen3_5Model::set_action_chunk_size(int64_t chunk_size) {
         chunk_size, "Qwen3_5Model::set_action_chunk_size");
 }
 
+void Qwen3_5Model::set_action_valid_len(int64_t valid_len) {
+    TORCH_CHECK(action_mode_ && action_len_ > 0,
+                "Qwen3.5 action valid length requires action mode and I/O "
+                "weights");
+    TORCH_CHECK(get_last_resolved_chunk_size() == 0,
+                "Qwen3.5 action valid length must be set before the first "
+                "forward");
+    TORCH_CHECK(!action_nvfp4_.enabled() || valid_len == action_len_,
+                "G05 NVFP4 Action requires an unpadded horizon");
+    TORCH_CHECK(valid_len > 0 && valid_len <= action_len_,
+                "Qwen3.5 action valid length must be in [1, ", action_len_,
+                "], got ", valid_len);
+    action_valid_len_ = valid_len;
+    invalidate_model_state();
+}
+
 void Qwen3_5Model::stage_action_chunk_size(
         uint64_t token, int64_t chunk_size) {
     TORCH_CHECK(action_mode_ && action_len_ > 0,
@@ -1008,6 +1134,7 @@ SpmDense2DSpec Qwen3_5Model::z2_storage_spec(int64_t execution_len) const {
 
 void Qwen3_5Model::validate_z2_prefill_contract() const {
     TORCH_CHECK(num_cores() == 8, "Qwen3.5 Z2 canary requires eight cores");
+    TORCH_CHECK(!text_nvfp4_.enabled(), "Qwen3.5 text Z2 does not admit NVFP4 owners");
     TORCH_CHECK(z2_prepared_execution_len_ == 128 &&
                     z2_prepared_real_len_ == 72,
                 "Qwen3.5 text Z2: fixed prefill layout was not prepared");
@@ -1797,7 +1924,13 @@ at::Tensor Qwen3_5Model::forward_impl(
     // intra-device flush used by build_gdn().
     std::vector<void*> cache_flush_ptrs;
     std::vector<size_t> cache_flush_sizes;
-    if (fast_replay_active_ && g_rpu_ddr_flush_force_enabled) {
+    // build_gdn's initial_prefill_chunk (prefill, position 0, offset 0) fills the
+    // conv carry and the recurrent state with zeros in SPM; see the setter.
+    const bool state_flush =
+        g_rpu_ddr_flush_force_enabled &&
+        !(initial_prefill_state_flush_skip_ && position == 0 && seq_len > 1 &&
+          !action_mode_);
+    if (fast_replay_active_ && state_flush) {
         cache_flush_ptrs.reserve(2 * num_layers());
         cache_flush_sizes.reserve(2 * num_layers());
     }
@@ -1846,7 +1979,7 @@ at::Tensor Qwen3_5Model::forward_impl(
         conv_state_live_addr_[layer_idx] =
             ::rhino_lkn::RpuGetDevAddr(cv->data_ptr<c10::Half>());
         if (fast_replay_active_) {
-            if (g_rpu_ddr_flush_force_enabled) {
+            if (state_flush) {
                 collect_cache_flush(*st);
                 collect_cache_flush(*cv);
             }
@@ -1865,10 +1998,28 @@ at::Tensor Qwen3_5Model::forward_impl(
 #endif
     }
 
+    auto clear_checked_decode = c10::make_scope_exit([&] {
+        checked_decode_replay_scope_active_ = false;
+        cancel_checked_decode_replay();
+    });
+    checked_decode_replay_scope_active_ = begin_checked_decode_replay(
+        hidden_states, k_caches, v_caches, attention_mask, position, is_causal,
+        planned_stage_descriptor);
+
     at::Tensor out = run_all_layers(hidden_states, k_caches, v_caches,
                                     attention_mask, position, is_causal,
                                     planned_chunk_size,
                                     planned_stage_descriptor);
+
+    // Follows the output DMA, so it reads this step's final hidden. A skipped body
+    // already consumed these nodes with the rest of the stream.
+    if (decode_head_w_.defined() && seq_len == 1 && !checked_decode_replay_skipped()) {
+        emit_decode_candidate_head(out);
+    }
+
+    // Commit only after the layer body completed. A failed forward cannot make a
+    // later replay appear owner-safe.
+    if (checked_decode_replay_scope_active_) finish_checked_decode_replay();
 
     // PREFILL 的 resolved chunk_size 单独留一份。基类的 last_resolved_chunk_size_
     // (fused_model_base.cpp:546) 每次 compute_chunks 都覆写,而 decode 跑在 prefill 之后
@@ -2014,7 +2165,8 @@ bool Qwen3_5Model::use_action_nvfp4(int64_t rows) const {
     // set_weights proved every family and the exact L24/H1024 profile before
     // publishing these owners. The precision is cold and cannot change later.
     return action_nvfp4_.enabled() && action_mode_ &&
-        !z2_bound_ && rows == 32 && num_cores() == 8;
+        !z2_bound_ && rows == 32 &&
+        (num_cores() == 8 || (num_cores() == 4 && attn_tp() == 4 && mlp_tp() == 4));
 }
 
 std::vector<int64_t> Qwen3_5Model::action_nvfp4_arguments(int family) const {
@@ -2023,8 +2175,9 @@ std::vector<int64_t> Qwen3_5Model::action_nvfp4_arguments(int family) const {
     const int64_t n = G05Nvfp4Tables::output_sizes[family];
     const int64_t k = G05Nvfp4Tables::input_sizes[family];
     const int partition = G05Nvfp4Tables::partitions[family];
-    const int64_t local_n = partition ? n / 8 : n;
-    const int64_t local_k = partition ? k : k / 8;
+    const int64_t lanes = num_cores();
+    const int64_t local_n = partition ? n / lanes : n;
+    const int64_t local_k = partition ? k : k / lanes;
     const auto tile = linear_acc32_
         ? rpu_pl_tiling::TilePick{partition && n == 4096 ? 48 : 64,
                                   partition && n == 4096 ? 384 : 320}
@@ -2032,7 +2185,7 @@ std::vector<int64_t> Qwen3_5Model::action_nvfp4_arguments(int family) const {
     // Version, explicit family, layer-domain, M/N/K, TP layout, actual accumulation,
     // block16/striped_v2, 24 FP32 scales/256-byte slab, actual generated tile.
     return {1, action_nvfp4_.enabled() ? 1 : 0,
-            family, 24, 32, n, k, partition, 8, linear_acc32_ ? 32 : 16, 16, 2, 24, 256,
+            family, 24, 32, n, k, partition, lanes, linear_acc32_ ? 32 : 16, 16, 2, 24, 256,
             local_n, local_k, tile.m_tile, tile.n_tile, 128};
 }
 
@@ -2044,12 +2197,13 @@ void Qwen3_5Model::launch_linear(
     int nvfp4_family, int layer, const at::Tensor& negative_zero) {
     if (action_nvfp4_.enabled() && nvfp4_family >= 0) {
         TORCH_CHECK(use_action_nvfp4(m) && nvfp4_family < 5 &&
-                        layer >= 0 && layer < 24 && num_cores == 8 && bias_spm_addr == 0 &&
+                        layer >= 0 && layer < 24 && num_cores == this->num_cores() &&
+                        bias_spm_addr == 0 &&
                         n == G05Nvfp4Tables::output_sizes[nvfp4_family] &&
                         k == G05Nvfp4Tables::input_sizes[nvfp4_family] &&
                         partition == G05Nvfp4Tables::partitions[nvfp4_family] &&
                         ctx().has_complete_physical_manifest(),
-                    "G05 NVFP4 launch requires exact M32/L24/TP8 family and COMPLETE route");
+                    "G05 NVFP4 launch requires exact M32/L24 all-lane family and COMPLETE route");
         const auto& owner = layer_weights_[layer];
         const std::array<const at::Tensor*, 5> weights{
             &owner.q_w, &owner.o_w, &owner.gate_w, &owner.up_w, &owner.down_w};
@@ -2068,9 +2222,42 @@ void Qwen3_5Model::launch_linear(
             addr(0, G05Nvfp4Tables::names[nvfp4_family]), static_cast<uint16_t>(layer), linear_acc32_);
         return;
     }
-    TORCH_CHECK(!(weight.scalar_type() == at::kByte && scale.defined() &&
-                      scale.scalar_type() == at::kByte),
+    const bool nvfp4_weight = weight.scalar_type() == at::kByte && scale.defined() &&
+        scale.scalar_type() == at::kByte;
+    TORCH_CHECK(!nvfp4_weight || text_nvfp4_.enabled(),
                 "G05 NVFP4 must use an explicit projection family/layer route");
+    uint32_t nvfp4_table = 0;
+    uint16_t nvfp4_layer = 0;
+    if (nvfp4_weight) {
+        // Resolve the owner by tensor identity, so every text call site keeps
+        // its ordinary arguments and a foreign tensor never borrows a table.
+        int family = -1;
+        int64_t owner_layer = -1;
+        for (int64_t i = 0; family < 0 && i < static_cast<int64_t>(layer_weights_.size()); ++i) {
+            const auto& lw = layer_weights_[i];
+            const std::array<std::pair<const at::Tensor*, const at::Tensor*>,
+                             Qwen35TextNvfp4Tables::COUNT> owners{{
+                {&lw.q_w, &lw.q_ws}, {&lw.k_w, &lw.k_ws}, {&lw.v_w, &lw.v_ws},
+                {&lw.o_w, &lw.o_ws}, {&lw.attn_gate_w, &lw.attn_gate_ws},
+                {&lw.gdn_q_w, &lw.gdn_q_ws}, {&lw.gdn_k_w, &lw.gdn_k_ws},
+                {&lw.gdn_v_w, &lw.gdn_v_ws}, {&lw.gdn_in_z_w, &lw.gdn_in_z_ws},
+                {&lw.gdn_out_w, &lw.gdn_out_ws}, {&lw.gate_w, &lw.gate_ws},
+                {&lw.up_w, &lw.up_ws}, {&lw.down_w, &lw.down_ws}}};
+            for (int f = 0; f < Qwen35TextNvfp4Tables::COUNT; ++f) {
+                if (owners[f].first->defined() && weight.is_same(*owners[f].first)) {
+                    TORCH_CHECK(scale.is_same(*owners[f].second),
+                                "Qwen3.5 text NVFP4 weight and block scale owners differ");
+                    family = f;
+                    owner_layer = i;
+                    break;
+                }
+            }
+        }
+        TORCH_CHECK(family >= 0 && bias_spm_addr == 0,
+                    "Qwen3.5 text NVFP4 launch requires an installed bias-free projection owner");
+        nvfp4_table = addr(0, Qwen35TextNvfp4Tables::names[family]);
+        nvfp4_layer = static_cast<uint16_t>(owner_layer);
+    }
     const FmbLinearRouteSelector selector =
         linear_route_selector(weight, m);
     const int64_t invocation = linear_invocation(chunk_idx, selector);
@@ -2083,7 +2270,7 @@ void Qwen3_5Model::launch_linear(
     rpu_launch_linear_spm_to_spm_acc16_kernel(
         input, weight, output, m, n, k, partition, num_cores,
         bias_spm_addr, scale,
-        /*nvfp4_tensor_scale_spm_addr=*/0, /*nvfp4_layer_id=*/0,
+        /*nvfp4_tensor_scale_spm_addr=*/nvfp4_table, /*nvfp4_layer_id=*/nvfp4_layer,
         /*force_acc32=*/linear_acc32_,
         /*prefer_gemv=*/selector == FmbLinearRouteSelector::GEMV,
         /*qkv_planar_direct=*/false, /*prefer_row_weight_reuse=*/false,
@@ -2479,13 +2666,11 @@ int64_t Qwen3_5Model::text_gateup_pair_site() const {
 }
 
 std::vector<int64_t> Qwen3_5Model::text_gateup_pair_arguments() const {
-    // Version, M/local N/K, TP, ACC bits, parent M/N/K, blocks per projection,
-    // total grid, input/output row bytes, independent weight owners and layers.
-    if (text_gateup_pair_w8_)
-        return {2,256,768,2048,8,linear_acc32_ ? 32 : 16,linear_acc32_ ? 288 : 400,80,128,10,20,4096,1536,4,24,8,6144};
-    return {1,256,768,2048,8,linear_acc32_ ? 32 : 16,
-            linear_acc32_ ? 352 : 432,linear_acc32_ ? 64 : 80,128,
-            linear_acc32_ ? 12 : 10,linear_acc32_ ? 24 : 20,4096,1536,2,24};
+    const auto c = rpu_g05_linear::contract(text_gateup_pair_w8_
+        ? (linear_acc32_ ? KernelId::G05_TEXT_GATE_UP_W8A16_ACC32_M256N768K2048 : KernelId::G05_TEXT_GATE_UP_W8A16_ACC16_M256N768K2048)
+        : (linear_acc32_ ? KernelId::G05_TEXT_GATE_UP_FP16_ACC32_M256N768K2048 : KernelId::G05_TEXT_GATE_UP_FP16_ACC16_M256N768K2048));
+    return {3,256,768,2048,8,linear_acc32_ ? 32 : 16,c.m,c.n,c.k,c.gx/2,c.gx,
+            4096,1536,text_gateup_pair_w8_ ? 4 : 2,24,8,6144,2,32,20,34,4,36,c.gy};
 }
 
 void Qwen3_5Model::launch_text_gateup_pair(int layer, const ChunkInfo& chunk) {
@@ -2842,15 +3027,15 @@ int64_t Qwen3_5Model::action_gateup_pair_site() const {
 }
 
 std::vector<int64_t> Qwen3_5Model::action_gateup_pair_arguments() const {
-    // Version, M/local N/K, TP, ACC bits, parent tile, blocks per projection,
-    // combined grid, byte row strides, Gate/Up DDR pairs, resident layer count.
     if (action_gateup_pair_nvfp4_)
         return {3,32,512,1024,8,linear_acc32_ ? 32 : 16,176,128,128,4,8,2048,1024,4,24,
                 96,256,20,32,34,24,36,4,38,1,action_gateup_pair_nvfp4_ ? 1 : 0};
-    if (action_gateup_pair_w8_) return {1,32,512,1024,8,linear_acc32_ ? 32 : 16,linear_acc32_ ? 240 : 352,96,128,6,12,2048,1024,2,24,
-        use_action_gateup_resident(32) ? action_gateup_resident_layers() : 0,20,28,1};
-    return {1,32,512,1024,8,linear_acc32_ ? 32 : 16,linear_acc32_ ? 304 : 432,80,128,7,14,2048,1024,2,24,
-            use_action_gateup_resident(32) ? action_gateup_resident_layers() : 0};
+    const auto c = rpu_g05_linear::contract(action_gateup_pair_w8_
+        ? (linear_acc32_ ? KernelId::G05_GATE_UP_W8A16_ACC32_M32N512K1024 : KernelId::G05_GATE_UP_W8A16_ACC16_M32N512K1024)
+        : (linear_acc32_ ? KernelId::G05_GATE_UP_FP16_ACC32_M32N512K1024 : KernelId::G05_GATE_UP_FP16_ACC16_M32N512K1024));
+    return {4,32,512,1024,8,linear_acc32_ ? 32 : 16,c.m,c.n,c.k,c.gx/2,c.gx,
+            2048,1024,2,32,use_action_gateup_resident(32) ? action_gateup_resident_layers() : 0,
+            20,34,action_gateup_pair_w8_ ? 1 : 2,4,36,c.gy};
 }
 
 void Qwen3_5Model::launch_action_gateup_pair(int layer, const ChunkInfo& chunk) {
@@ -2942,10 +3127,11 @@ bool Qwen3_5Model::use_action_q_gate(int64_t rows) const {
 }
 
 std::vector<int64_t> Qwen3_5Model::action_q_gate_arguments() const {
-    // Version, M/local N/K, TP, ACC bits, parent tile, blocks per projection,
-    // combined grid, input/output row strides, Q/gate weight register pairs.
-    if (action_q_gate_w8_) return {1,32,256,1024,8,linear_acc32_ ? 32 : 16,linear_acc32_ ? 192 : 288,128,128,2,4,2048,512,2,24,20,28,1};
-    return {1,32,256,1024,8,32,240,112,128,3,6,2048,512,2,24};
+    const auto c = rpu_g05_linear::contract(action_q_gate_w8_
+        ? (linear_acc32_ ? KernelId::G05_Q_GATE_W8A16_ACC32_M32N256K1024 : KernelId::G05_Q_GATE_W8A16_ACC16_M32N256K1024)
+        : (KernelId::G05_Q_GATE_FP16_ACC32_M32N256K1024));
+    return {2,32,256,1024,8,linear_acc32_ ? 32 : 16,c.m,c.n,c.k,c.gx/2,c.gx,
+            2048,512,2,32,20,34,action_q_gate_w8_ ? 1 : 2,4,36,c.gy};
 }
 
 void Qwen3_5Model::launch_action_q_gate(int layer, const ChunkInfo& chunk) {
@@ -3000,10 +3186,11 @@ bool Qwen3_5Model::use_action_kv_owner(int64_t rows) const {
 }
 
 std::vector<int64_t> Qwen3_5Model::action_kv_owner_arguments() const {
-    // Version, M/K, logical/physical KV heads, D, TP, tile M/N/K,
-    // K owners, V owners, fanout extent. All values are nonnegative.
-    if (action_kv_owner_w8_) return {1,32,1024,2,8,256,8,linear_acc32_ ? 192 : 288,128,128,0,4,2,6,16384,20,28,1};
-    return {1,32,1024,2,8,256,8,240,112,128,0,4,2,6,16384};
+    const auto c = rpu_g05_linear::contract(action_kv_owner_w8_
+        ? (linear_acc32_ ? KernelId::G05_KV_OWNER_W8A16_ACC32_M32N256K1024 : KernelId::G05_KV_OWNER_W8A16_ACC16_M32N256K1024)
+        : (KernelId::G05_KV_OWNER_FP16_ACC32_M32N256K1024));
+    return {2,32,1024,2,8,256,8,c.m,c.n,c.k,0,4,2,6,16384,20,34,
+            action_kv_owner_w8_ ? 1 : 2,2,32,4,36,c.gx,c.gy};
 }
 
 void Qwen3_5Model::launch_action_kv_owner(int layer, const ChunkInfo& chunk) {
@@ -3038,11 +3225,11 @@ bool Qwen3_5Model::use_action_qkv_gate(int64_t rows) const {
 }
 
 std::vector<int64_t> Qwen3_5Model::action_qkv_gate_arguments() const {
-    // Version, M/local N/K, TP/ACC, parent tile, blocks/grid, row bytes,
-    // Q/gate/K/V weight and scale GP bases, replicas/logical KV, owner cores,
-    // fanout bytes and W8 dtype mode. Four independent output roots stay live.
-    return {1,32,256,1024,8,linear_acc32_ ? 32 : 16,linear_acc32_ ? 192 : 288,128,128,2,6,2048,512,
-            2,24,30,36,20,28,34,40,4,2,0,4,2,6,16384,1};
+    const auto c = rpu_g05_linear::contract(linear_acc32_
+        ? KernelId::G05_QKV_GATE_OWNER_W8A16_ACC32_M32N256K1024
+        : KernelId::G05_QKV_GATE_OWNER_W8A16_ACC16_M32N256K1024);
+    return {2,32,256,1024,8,linear_acc32_ ? 32 : 16,c.m,c.n,c.k,c.gx/3,c.gx,2048,512,
+            2,32,40,48,20,34,42,50,4,2,0,4,2,6,16384,1,4,36,44,52,c.gy};
 }
 
 void Qwen3_5Model::launch_action_qkv_gate(int layer, const ChunkInfo& chunk) {
@@ -3148,11 +3335,10 @@ bool Qwen3_5Model::use_action_gate_kv_owner(int64_t rows,int64_t prefix) const {
 
 std::vector<int64_t> Qwen3_5Model::action_gate_kv_owner_arguments(int64_t prefix) const {
     TORCH_CHECK(prefix==0 || prefix==245 || prefix==181 || (prefix>=161 && prefix<=449 && prefix%16==1),"G05 gate/KV owner requires bounded P0/P181/P245/P%16=1");
-    // Version/cold capability, M/localN/K/globalN, TP/ACC16, parent/grid,
-    // independent weight/scale/output bases, replica domain and zero fanout.
-    return {3,action_gate_kv_owner_available_?1:0,32,256,1024,2048,8,16,
-            288,128,128,2,4,2048,512,2,24,30,20,28,34,4,26,32,
-            4,2,0,4,2,6,0,1,24,0,245,prefix,161,449,16,1,181};
+    const auto c = rpu_g05_linear::contract(KernelId::G05_GATE_KV_OWNER_W8A16_ACC16_M32N256K1024_N128);
+    return {4,action_gate_kv_owner_available_?1:0,32,256,1024,2048,8,16,
+            c.m,c.n,c.k,c.gx/2,c.gx,2048,512,2,32,40,20,34,42,4,36,44,
+            4,2,0,4,2,6,0,1,24,0,245,prefix,161,449,16,1,181,c.gy};
 }
 
 void Qwen3_5Model::launch_action_gate_kv_owner(int layer,const ChunkInfo& chunk) {
@@ -3205,9 +3391,11 @@ bool Qwen3_5Model::use_action_owner_cache(int64_t rows, int64_t max_prefix) cons
 }
 
 std::vector<int64_t> Qwen3_5Model::action_qkv_gate_owner_only_arguments() const {
-    // Original joint projection ABI, with zero fanout bytes at its own site.
-    return {1,32,256,1024,8,linear_acc32_ ? 32 : 16,linear_acc32_ ? 192 : 288,128,128,2,6,2048,512,
-            2,24,30,36,20,28,34,40,4,2,0,4,2,6,0,1};
+    const auto c = rpu_g05_linear::contract(linear_acc32_
+        ? KernelId::G05_QKV_GATE_OWNER_W8A16_ACC32_M32N256K1024
+        : KernelId::G05_QKV_GATE_OWNER_W8A16_ACC16_M32N256K1024);
+    return {2,32,256,1024,8,linear_acc32_ ? 32 : 16,c.m,c.n,c.k,c.gx/3,c.gx,2048,512,
+            2,32,40,48,20,34,42,50,4,2,0,4,2,6,0,1,4,36,44,52,c.gy};
 }
 
 std::vector<int64_t> Qwen3_5Model::action_k_owner_norm_rope_arguments() const {
@@ -3544,7 +3732,7 @@ void Qwen3_5Model::prepare_action_o_resident() {
     action_o_resident_ = std::move(owners);
     action_o_resident_available_ = true;
     action_o_resident_n128_ = KernelCache::instance().has_loaded(
-        KernelId::G05_O_RESIDENT_W8A16_ACC16_M32N1024K256_N128);
+        KernelId::G05_O_RESIDENT_W8A16_ACC16_M32N1024K256);
 }
 
 bool Qwen3_5Model::use_action_o_resident(int64_t rows) const {
@@ -3559,13 +3747,10 @@ std::vector<int64_t> Qwen3_5Model::action_o_resident_arguments(
     int64_t layer, bool preload) const {
     TORCH_CHECK(layer >= 0 && layer < 24 && (!preload || layer % 4 == 0),
                 "G05 resident O layer/bundle is invalid");
-    // Version, layer/bundles/steps, global and local geometry, accumulation,
-    // packed byte strides, exact generated parent/grid, operation and SPM
-    // offset; original scale GP, weight-core stride and scale-core stride.
-    return {1,layer,24,4,6,10,32,1024,2048,256,8,16,
-            262144,1048576,QWEN35_ACTION_RESIDENT_TOTAL_BYTES,
-            action_o_resident_n128_ ? 288 : 448,action_o_resident_n128_ ? 128 : 64,
-            128,action_o_resident_n128_ ? 8 : 16,preload ? 1 : 0,layer * 262144,20,15,8,22,0};
+    const auto c = rpu_g05_linear::contract(KernelId::G05_O_RESIDENT_W8A16_ACC16_M32N1024K256);
+    return {2,layer,24,4,6,10,32,1024,2048,256,8,16,
+            262144,1048576,QWEN35_ACTION_RESIDENT_TOTAL_BYTES,c.m,c.n,c.k,c.gx,
+            preload ? 1 : 0,layer * 262144,20,15,8,8,0,c.gy};
 }
 
 void Qwen3_5Model::preload_action_o_resident() {
@@ -3637,11 +3822,9 @@ bool Qwen3_5Model::use_action_down_partial(int64_t rows, int64_t layer) const {
 }
 
 std::vector<int64_t> Qwen3_5Model::action_down_partial_arguments(bool preload) const {
-    // Version/layer/total-layers/bodies, full and local shape, TP/ACC,
-    // resident channels/blocks/bytes, unchanged parent tile/grid, operation,
-    // SPM/DDR weight GP, original scale GP, weight stride and row partition.
-    return {1,0,24,10,32,1024,4096,512,8,16,672,14,344064,
-            512,48,128,22,preload ? 1 : 0,24,2,20,15,8,22,0};
+    const auto c = rpu_g05_linear::contract(KernelId::G05_DOWN_PARTIAL672_W8A16_ACC16_M32N1024K512);
+    return {2,0,24,10,32,1024,4096,512,8,16,672,672/c.n,344064,
+            c.m,c.n,c.k,c.gx,preload ? 1 : 0,32,2,20,15,8,8,0,c.gy};
 }
 
 void Qwen3_5Model::preload_action_down_partial() {
@@ -3746,19 +3929,23 @@ std::vector<int64_t> Qwen3_5Model::action_gateup_resident_arguments(
     TORCH_CHECK(layer >= 1 && layer <= action_gateup_resident_layers() &&
                     projection >= 0 && projection <= 2,
                 "G05 resident Gate/Up layer/projection is invalid");
-    // Version, layer, pair count, steps, M/N/K, TP, matrix/bundle/total bytes, tile M/N/K,
+    const auto c = rpu_g05_linear::contract(action_gateup_resident_w8_
+        ? (linear_acc32_ ? KernelId::G05_GATEUP_RESIDENT_W8A16_ACC32_M240N96K128
+                         : KernelId::G05_GATEUP_RESIDENT_W8A16_ACC16_M352N96K128)
+        : KernelId::G05_GATEUP_RESIDENT_FP16_ACC32_M304N80K128);
+    // Layer/pair ownership and current generated tile identity.
     // projection (2 denotes the pair preload), offset within each core.
     if (action_gateup_resident_w8_) {
-        std::vector<int64_t> args{linear_acc32_ ? 4 : 5, layer, action_gateup_resident_layers(), 10, 32, 4096, 1024, 8,
-            524288,1048576,QWEN35_ACTION_RESIDENT_TOTAL_BYTES,linear_acc32_ ? 240 : 352,96,128,projection,
+        std::vector<int64_t> args{6, layer, action_gateup_resident_layers(), 10, 32, 4096, 1024, 8,
+            524288,1048576,QWEN35_ACTION_RESIDENT_TOTAL_BYTES,c.m,c.n,c.k,projection,
             (layer - 1) * 1048576 + (projection == 2 ? 0 : projection * 524288),20,1};
         if (!linear_acc32_) args.push_back(16);
         return args;
     }
-    return {2, layer, action_gateup_resident_layers(), 10, 32, 4096, 1024, 8,
+    return {3, layer, action_gateup_resident_layers(), 10, 32, 4096, 1024, 8,
             QWEN35_ACTION_RESIDENT_MATRIX_BYTES, QWEN35_ACTION_RESIDENT_BUNDLE_BYTES,
             QWEN35_ACTION_RESIDENT_TOTAL_BYTES,
-            304, 80, 128, projection,
+            c.m,c.n,c.k, projection,
             (layer - 1) * QWEN35_ACTION_RESIDENT_BUNDLE_BYTES +
                 (projection == 2 ? 0 : projection * QWEN35_ACTION_RESIDENT_MATRIX_BYTES)};
 }
@@ -3858,7 +4045,7 @@ void Qwen3_5Model::load_adaptive_mod_row(int64_t row) {
     rpu_launch_ddr_broadcast_spm_dma_mutable(
         &adaptive_mod_live_base_,
         step_row * width * static_cast<int64_t>(sizeof(c10::Half)),
-        elements, addr(0, "adaptive_mod"), NUM_CORES);
+        elements, addr(0, "adaptive_mod"), num_cores());
 }
 
 void Qwen3_5Model::prepare_action_newton_norm_shift() {
@@ -3918,7 +4105,7 @@ void Qwen3_5Model::apply_action_newton_norm_shift(
                 input + data_offset,output + data_offset,scale,rows,h,eps_,route,num_cores());
             rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
                 shift,output + data_offset,output + data_offset,
-                rows,h,c10::Half(1.0),ValuOpType::ADD,/*is_bopa=*/false);
+                rows,h,c10::Half(1.0),ValuOpType::ADD,/*is_bopa=*/false,num_cores());
         }
     };
     emit_segment(0,clean,modulation);
@@ -4001,7 +4188,7 @@ void Qwen3_5Model::apply_adaptive_norm(
             rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
                 shift, output + data_offset, output + data_offset,
                 row_count, h, c10::Half(1.0), ValuOpType::ADD,
-                /*is_bopa=*/false);
+                /*is_bopa=*/false, num_cores());
         }
     };
     if (!action_rtc_active_) {
@@ -4244,7 +4431,7 @@ void Qwen3_5Model::apply_raw_residual_gate(
     const int64_t elems = seq_len * hidden_size();
     rpu_launch_eltwise_binary_spm_kernel(
         output, residual, output, elems,
-        ValuOpType::SUB, c10::Half(1.0), NUM_CORES);
+        ValuOpType::SUB, c10::Half(1.0), num_cores());
     if (route == 2) {
         // Keep the preceding FP16 subtraction and the rounded FP16 product:
         // residual + round_fp16(gate * round_fp16(output - residual)).
@@ -4254,10 +4441,10 @@ void Qwen3_5Model::apply_raw_residual_gate(
     }
     rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
         gate, output, output, seq_len, hidden_size(),
-        c10::Half(1.0), ValuOpType::MUL, /*is_bopa=*/false);
+        c10::Half(1.0), ValuOpType::MUL, /*is_bopa=*/false, num_cores());
     rpu_launch_eltwise_binary_spm_kernel(
         output, residual, output, elems,
-        ValuOpType::ADD, c10::Half(1.0), NUM_CORES);
+        ValuOpType::ADD, c10::Half(1.0), num_cores());
 }
 
 void Qwen3_5Model::emit_action_input_projection() {
@@ -4387,7 +4574,7 @@ void Qwen3_5Model::emit_action_output_projection() {
     rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
         addr(0, "action_keep_mask"), addr(0, "action_input"),
         addr(0, "action_input"), action_len_, action_dim_pad_,
-        c10::Half(1.0f), ValuOpType::MUL, /*is_bopa=*/false);
+        c10::Half(1.0f), ValuOpType::MUL, /*is_bopa=*/false, num_cores());
     if (action_trace_active_) {
         consume_manifest_route(
             FmbRouteFamily::MUTABLE_DMA,
@@ -4654,9 +4841,13 @@ void Qwen3_5Model::build_full_attention(int layer_idx, const ChunkInfo& chunk,
             /*spm_rows=*/0, kv_plan);
     }
 
+    // Action keys end at the valid horizon: padded rows (action_valid_len_ <
+    // action_len_) are inserted after it but never attended by any row.
     int64_t kv_seq_len = action_mode_
-        ? action_prefix_lens_[layer_idx] + ctx().seq_len
+        ? action_prefix_lens_[layer_idx] + action_valid_len_
         : chunk.kv_seq_len;
+    TORCH_CHECK(!action_mode_ || ctx().seq_len == action_len_,
+                "Qwen3.5 action attention requires one whole-horizon chunk");
     bool sdpa_causal = ctx().is_causal && (seq_len > 1);
     const bool raw_spm = ctx().attention_policy ==
         AttentionExecutionPolicy::SPM_KV_BY_MHA;
@@ -4714,13 +4905,20 @@ void Qwen3_5Model::build_full_attention(int layer_idx, const ChunkInfo& chunk,
                 attention_invocation);
         }
         // DDR SDPA on tp cores; virtual_num_cores=NUM_CORES governs the
-        // KV-cache 7-D swizzle.
+        // KV-cache 7-D swizzle. Action queries stop at the valid horizon too:
+        // SDPA needs seq_k >= seq_q, and a self-only layer has only
+        // action_valid_len_ keys. Query/output rows are [row][head][dim] per
+        // core, so their addresses do not depend on the row count; padded rows
+        // feed only padded rows and keys that no row attends.
+        const int64_t sdpa_q_rows = action_mode_ ? action_valid_len_ : seq_len;
+        TORCH_CHECK(sdpa_q_rows == seq_len || !sdpa_causal,
+                    "Qwen3.5 partial action horizon requires non-causal attention");
         rpu_launch_sdpa_spm_dispatch(
             sdpa_kernel_, k_cache, v_cache, sdpa_causal ? 1 : 0,
             c10::nullopt,
             addr_offset("q").value, addr_offset("output").value,
             addr_offset("sdpa_tmp").value, 0,
-            seq_len, nq, nkv, hd, kv_seq_len, tp, NUM_CORES);
+            sdpa_q_rows, nq, nkv, hd, kv_seq_len, tp, NUM_CORES);
     }
 
     // Gated-attention output gate (Qwen3.5 attn_output_gate=true):
@@ -4810,7 +5008,23 @@ void Qwen3_5Model::build_gdn(int layer_idx, const ChunkInfo& chunk, bool decode,
     at::Tensor* cv = conv_state_for_layer(layer_idx);
     TORCH_CHECK(st && cv && st->defined() && cv->defined(),
                 "build_gdn: missing recurrent/conv state cache for layer ", layer_idx);
-    auto D = [&](const char* n) { return addr(0, n); };
+    const bool input_workspace = !decode && use_text_gdn_input_workspace();
+    if (input_workspace) {
+        TORCH_CHECK(ctx().has_complete_physical_manifest(),
+                    "Qwen3.5 GDN input workspace requires a COMPLETE schedule");
+        ctx().consume_physical_route(
+            FmbRouteFamily::GRAPH_SCHEDULE, kTextGdnInputWorkspaceSite,
+            1, 0, gdn_input_workspace_arguments(L), chunk.idx);
+    }
+    auto D = [&](const char* n) -> uint32_t {
+        const auto base = addr(0, n);
+        const int64_t offset = input_workspace ? gdn_input_workspace_offset(n, L) : -1;
+        if (offset < 0) return base;
+        TORCH_CHECK(base == addr(0, "input_norm") &&
+                        offset <= std::numeric_limits<uint32_t>::max() - base,
+                    "Qwen3.5 GDN workspace requires the declared input_norm alias");
+        return base + static_cast<uint32_t>(offset);
+    };
     const bool initial_prefill_chunk =
         !decode && ctx().position == 0 && chunk.offset == 0;
 
@@ -5135,6 +5349,26 @@ void Qwen3_5Model::build_gdn(int layer_idx, const ChunkInfo& chunk, bool decode,
     rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel(D("gdn_c_gexp"), D("gdn_c_kbeta"), D("gdn_c_kbeta"), HL, Dk, c10::Half(1.0f), ValuOpType::MUL, false, nc);
     rpu_launch_bmm_spm_kernel(D("gdn_c_attn"), D("gdn_c_kbeta"), D("gdn_c_kcd"), C, Dk, C, HN, nc);
 
+    // Only the two last-column copies change address mode. Beta/g continue
+    // through slice_pc above; the existing G05 all-slice route has priority.
+    const bool glast_local = use_text_gdn_glast_local(L);
+    if (glast_local) {
+        TORCH_CHECK(ctx().has_complete_physical_manifest(),
+                    "Local GDN glast slices require a COMPLETE physical schedule");
+        ctx().consume_physical_route(
+            FmbRouteFamily::GRAPH_SCHEDULE, QWEN35_TEXT_GDN_GLAST_LOCAL_SITE,
+            1, 0, text_gdn_glast_local_arguments(L), chunk.idx);
+    }
+    auto slice_glast = [&](uint32_t s, uint32_t d,
+                           const std::vector<int64_t>& is,
+                           const std::vector<int64_t>& os,
+                           const std::vector<int64_t>& b) {
+        if (glast_local)
+            rpu_launch_slice_spm_kernel(s, d, is, os, b, nc, true);
+        else
+            slice_pc(s, d, is, os, b);
+    };
+
     // ===== Phase 16: per-chunk recurrent loop. gdn_state [Hc,Dk,Dv] carried across i. =====
     // The state is consumed only by this loop, so load or initialize it after
     // the earlier phase scratch is dead.
@@ -5176,9 +5410,9 @@ void Qwen3_5Model::build_gdn(int layer_idx, const ChunkInfo& chunk, bool decode,
         rpu_launch_bmm_spm_kernel(a_qc, D("gdn_state"), a_outc, C, Dv, Dk, Hc, nc);
         rpu_launch_bmm_spm_kernel(D("gdn_c_attnc"), a_vc, D("gdn_c_loop_b"), C, Dv, C, Hc, nc);
         rpu_launch_eltwise_binary_spm_kernel(a_outc, D("gdn_c_loop_b"), a_outc, Hc * C * Dv, ValuOpType::ADD, c10::Half(1.0f), nc);
-        slice_pc(a_gexpc, D("gdn_c_glast"), sh_gl, sl_gl, bC);
+        slice_glast(a_gexpc, D("gdn_c_glast"), sh_gl, sl_gl, bC);
         rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel(D("gdn_c_glast"), D("gdn_state"), D("gdn_state"), Hc, Dk * Dv, c10::Half(1.0f), ValuOpType::MUL, false, nc);
-        slice_pc(a_gc, D("gdn_c_glast"), sh_gl, sl_gl, bC);
+        slice_glast(a_gc, D("gdn_c_glast"), sh_gl, sl_gl, bC);
         rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel(D("gdn_c_glast"), a_gc, a_gexpc, Hc, C, c10::Half(1.0f), ValuOpType::SUB, false, nc);
         rpu_launch_eltwise_unary_spm_kernel(a_gexpc, a_gexpc, Hc * C, ValuOpType::EXP, false, nc);
         rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel(a_gexpc, a_kc, a_kc, Hc * C, Dk, c10::Half(1.0f), ValuOpType::MUL, false, nc);
@@ -5532,6 +5766,7 @@ std::vector<BufferDecl> Qwen3_5Model::declare_legacy_buffers(
     // abusing KV_FIRST-only BufferScope values.
     std::vector<BufferDecl> decls;
     action_nvfp4_.declare(decls, num_cores());
+    text_nvfp4_.declare(decls, num_cores());
     decls.push_back({"residual1",  res,  1, 31, StorageClass::Temp, 0, nullptr});
     decls.push_back({"input_norm", res,  1, 31, StorageClass::Temp, 0, nullptr});
     decls.push_back({"residual2",  0,    0, 0, StorageClass::Temp, 0, "input_norm"});
@@ -5745,8 +5980,17 @@ std::vector<BufferDecl> Qwen3_5Model::declare_legacy_buffers(
         auto B = [&](const char* n, int64_t elems) -> BufferDecl {
             return {n, A(elems * DWIDTH), 1, 6, StorageClass::Temp, 0, nullptr};
         };
+        const bool input_workspace = ctx.chunk_size >= 64 && ctx.chunk_size <= 640 && use_text_gdn_input_workspace();
+        if (input_workspace) gdn_input_workspace_arguments(CS);
         auto BP = [&](const char* n, int64_t elems, int p0, int p1,
                       const char* alias = nullptr) -> BufferDecl {
+            if (input_workspace && gdn_input_workspace_slot(n) >= 0) {
+                const int64_t offset = gdn_input_workspace_offset(n, CS);
+                TORCH_CHECK(!alias && p0 >= 2 && p1 <= 16 &&
+                                offset + A(elems * DWIDTH) <= res,
+                            "Qwen3.5 GDN workspace view escapes its owner or lifetime");
+                alias = "input_norm";
+            }
             return {n, A(elems * DWIDTH), p0, p1,
                     StorageClass::Temp, 0, alias};
         };
@@ -5942,6 +6186,10 @@ ModelStaticConfig Qwen3_5Model::static_config() {
     cfg.num_layers = num_layers();
     cfg.cross_layer_batch_size = num_layers();   // single group (mirror Qwen3)
     cfg.fast_replay_skip_layer_loop = fast_replay_active_;
+    if (checked_decode_replay_scope_active_) {
+        cfg.checked_layer_body_replay_fn = static_cast<bool (FusedModelBase::*)()>(
+            &Qwen3_5Model::try_checked_layer_body_replay);
+    }
     if (action_step_active_) {
         cfg.pre_layers_fn = reinterpret_cast<void (FusedModelBase::*)()>(
             &Qwen3_5Model::emit_action_input_projection);
@@ -6248,6 +6496,11 @@ FmbPhysicalExecutionManifest Qwen3_5Model::physical_manifest_for_candidate(
         }
     }
     for (const ChunkInfo& chunk : plan.compute.chunks) {
+        if (physical_len > 1 && has_gdn && use_text_gdn_input_workspace()) {
+            manifest.routes.push_back({
+                kTextGdnInputWorkspaceSite, FmbRouteFamily::GRAPH_SCHEDULE,
+                1, 0, gdn_input_workspace_arguments(chunk.len), chunk.idx});
+        }
         if (use_action_attn_sigmoid_mul(chunk.len)) {
             manifest.routes.push_back({QWEN35_ACTION_ATTN_SIGMOID_MUL_SITE,
                 FmbRouteFamily::ACTIVATION,1,0,action_attn_sigmoid_mul_arguments(),chunk.idx});
@@ -6256,6 +6509,11 @@ FmbPhysicalExecutionManifest Qwen3_5Model::physical_manifest_for_candidate(
             manifest.routes.push_back({
                 QWEN35_TEXT_GDN_LOCAL_SLICE_SITE, FmbRouteFamily::GRAPH_SCHEDULE,
                 1, 0, g05_gdn_local_slice_arguments(chunk.len), chunk.idx});
+        }
+        if (use_text_gdn_glast_local(chunk.len)) {
+            manifest.routes.push_back({
+                QWEN35_TEXT_GDN_GLAST_LOCAL_SITE, FmbRouteFamily::GRAPH_SCHEDULE,
+                1, 0, text_gdn_glast_local_arguments(chunk.len), chunk.idx});
         }
         if (use_text_gateup_pair(chunk.len)) {
             manifest.routes.push_back({
@@ -6894,14 +7152,25 @@ void Qwen3_5Model::set_weights(
         rpu_require_high_precision_math_kernels();
     }
     const bool reduced = num_cores() != 8;
+    // The exact G05 action expert (all full attention, no GDN) is the only
+    // reduced owner outside the 3-GDN/1-full text templates; enable_action_mode
+    // follows set_weights, so the action layer schedule is bound here.
+    const bool reduced_action = reduced && g05_action_profile_num_layers(
+        num_q_heads, num_kv_heads, head_dim, hidden_size, intermediate_size) != 0;
     const bool dense27 = qwen35_legacy27_geometry(
         num_q_heads, num_kv_heads, head_dim, hidden_size, intermediate_size);
-    const bool reduced_legacy27 = reduced && dense27;
+    TORCH_CHECK(hidden_size != 5120 || intermediate_size != 17408 || dense27,
+                "Qwen3.5-27B requires its exact query and replicated KV geometry");
     // Admission and set_model_params keep logical geometry. Only the prepared
-    // gate/up/down tensors carry cold MLP padding (0.8B MLP6: 3584 -> 3648).
-    const int64_t prepared_intermediate_size =
-        decoder_mlp_intermediate_size(intermediate_size, num_cores());
-    if (reduced || dense27) {
+    // gate/up/down tensors carry precision-specific cold MLP padding.
+    if (reduced_action) {
+        TORCH_CHECK(num_cores() == 4 && N == 24 && !action_mode_ && !z2_bound_ &&
+                        use_silu && eps == 1e-6 &&
+                        mrope_section == at::IntArrayRef({11, 11, 10}) &&
+                        std::all_of(layer_is_full.begin(), layer_is_full.end(),
+                            [](int64_t full) { return full == 1; }),
+                    "Qwen3.5 reduced action requires the exact four-core G05 expert");
+    } else if (reduced || dense27) {
         const int expected_layers = dense27 ? 64 : qwen35_reduced_profile_num_layers(
             num_q_heads, num_kv_heads, head_dim, hidden_size, intermediate_size);
         const int64_t expected_value_heads =
@@ -6913,7 +7182,7 @@ void Qwen3_5Model::set_weights(
                         gdn_key_head_dim == 128 && gdn_value_head_dim == 128 &&
                         gdn_conv_kernel == 4 &&
                         gdn_conv_dim == (32 + expected_value_heads) * 128,
-                    "Qwen3.5 execution requires an exact dense FP16, 2B W8 or admitted 27B quantized text profile");
+                    "Qwen3.5 execution requires an exact dense FP16 or admitted quantized text profile");
         for (int64_t i = 0; i < N; ++i) {
             TORCH_CHECK(layer_is_full[i] == ((i + 1) % 4 == 0 ? 1 : 0),
                         "Qwen3.5 reduced execution requires the 3-GDN/1-full layer schedule");
@@ -6925,15 +7194,17 @@ void Qwen3_5Model::set_weights(
         const bool exact_geometry =
             (N == 24 && hidden_size == 2048 && intermediate_size == 6144 && num_q_heads == 8) ||
             (N == 32 && hidden_size == 2560 && intermediate_size == 9216 && num_q_heads == 16) ||
-            (N == 32 && hidden_size == 4096 && intermediate_size == 12288 && num_q_heads == 16);
-        const int64_t value_heads = hidden_size == 2048 ? 16 : 32;
-        TORCH_CHECK(num_cores() == 8 && nvfp4_tensor_scales.empty() && exact_geometry &&
-                        !action_mode_ && !z2_bound_ && num_kv_heads == 8 && head_dim == 256 &&
+            (N == 32 && hidden_size == 4096 && intermediate_size == 12288 && num_q_heads == 16) ||
+            (N == 64 && dense27);
+        const int64_t value_heads = dense27 ? 48 : hidden_size == 2048 ? 16 : 32;
+        TORCH_CHECK(nvfp4_tensor_scales.empty() && exact_geometry &&
+                        !action_mode_ && !z2_bound_ &&
+                        num_kv_heads == (dense27 ? 24 : reduced ? 4 : 8) && head_dim == 256 &&
                         use_silu && eps == 1e-6 && mrope_section == at::IntArrayRef({11, 11, 10}) &&
                         gdn_num_v_heads == value_heads && gdn_key_head_dim == 128 &&
                         gdn_value_head_dim == 128 && gdn_conv_kernel == 4 &&
                         gdn_conv_dim == (32 + value_heads) * 128,
-                    "QuantTrio UINT4 MLP requires exact dense 2B/4B/9B TP8 text without NVFP4");
+                    "UINT4 MLP requires exact dense 2B/4B/9B/27B text without NVFP4");
         for (int64_t layer = 0; layer < N; ++layer) {
             TORCH_CHECK(layer_is_full[layer] == ((layer + 1) % 4 == 0 ? 1 : 0),
                         "QuantTrio UINT4 MLP requires the 3-GDN/1-full layer schedule");
@@ -6989,24 +7260,58 @@ void Qwen3_5Model::set_weights(
     check_list(gdn_b_bg_scale_list, "gdn_b_bg_scale_list");
     check_list(gdn_a_bg_scale_list, "gdn_a_bg_scale_list");
 
-    const bool nvfp4 = !nvfp4_tensor_scales.empty();
+    // Thirteen tables select dense-text NVFP4; any other non-empty set is the
+    // exact G05 Action owner, whose installer requires exactly five.
+    const bool text_nvfp4 =
+        nvfp4_tensor_scales.size() == Qwen35TextNvfp4Tables::COUNT;
+    const bool nvfp4 = !nvfp4_tensor_scales.empty() && !text_nvfp4;
     G05Nvfp4Tables candidate_nvfp4;
+    Qwen35TextNvfp4Tables candidate_text_nvfp4;
+    if (text_nvfp4) {
+        bool schedule = qwen35_reduced_profile_num_layers(
+            num_q_heads, dense27 ? 24 : 4, head_dim, hidden_size, intermediate_size) == N;
+        for (int64_t layer = 0; schedule && layer < N; ++layer)
+            schedule = layer_is_full[layer] == ((layer + 1) % 4 == 0 ? 1 : 0);
+        const int64_t value_heads =
+            dense27 ? 48 : (hidden_size == 1024 || hidden_size == 2048) ? 16 : 32;
+        TORCH_CHECK(schedule && !reduced_action && !uint4_mlp && !high_precision_ &&
+                        !action_mode_ && !z2_bound_ &&
+                        num_kv_heads == (dense27 ? 24 : reduced ? 4 : 8) &&
+                        use_silu && eps == 1e-6 &&
+                        mrope_section == at::IntArrayRef({11, 11, 10}) &&
+                        gdn_num_v_heads == value_heads && gdn_key_head_dim == 128 &&
+                        gdn_value_head_dim == 128 && gdn_conv_kernel == 4 &&
+                        gdn_conv_dim == (32 + value_heads) * 128 && !gdn_q_list.empty(),
+                    "Qwen3.5 text NVFP4 requires exact dense 0.8B/2B/4B/9B/27B text "
+                    "with the 3-GDN/1-full schedule");
+        candidate_text_nvfp4.install(nvfp4_tensor_scales, N);
+        // Prefill rows select the tile at run time; require the whole family.
+        const int first = static_cast<int>(linear_acc32_
+            ? KernelId::PL_AT_NVFP4_ACC32_M176N128 : KernelId::PL_AT_NVFP4_ACC16_M176N128);
+        for (int tile = 0; tile < 7; ++tile)
+            TORCH_CHECK(KernelCache::instance().has_loaded(static_cast<KernelId>(first + tile)),
+                        "Qwen3.5 text NVFP4 requires every generated ",
+                        linear_acc32_ ? "ACC32" : "ACC16", " NVFP4 Linear payload");
+    }
     if (nvfp4) {
-        TORCH_CHECK(!reduced && !z2_bound_ && N == 24 &&
-                        num_q_heads == 8 && num_kv_heads == 8 && head_dim == 256 &&
+        TORCH_CHECK((!reduced || reduced_action) && !z2_bound_ && N == 24 &&
+                        num_q_heads == 8 && num_kv_heads == (reduced ? 4 : 8) &&
+                        head_dim == 256 &&
                         hidden_size == 1024 && intermediate_size == 4096 &&
                         use_silu && eps == 1e-6 &&
                         mrope_section == at::IntArrayRef({11, 11, 10}) &&
                         cos.dim() == 2 && cos.size(1) == 32 &&
                         std::all_of(layer_is_full.begin(), layer_is_full.end(),
                             [](int64_t full) { return full == 1; }),
-                    "G05 NVFP4 weights require exact full L24/H1024/I4096/Q8/KV8/D256 geometry");
+                    "G05 NVFP4 weights require exact full L24/H1024/I4096/Q8/D256 geometry "
+                    "with KV8 on eight lanes or KV4 on four");
         candidate_nvfp4.install(nvfp4_tensor_scales);
+        const int lanes = num_cores();
         for (int family = 0; family < 5; ++family) {
             const bool col = G05Nvfp4Tables::partitions[family] == 1;
             const auto tile = rpu_pl_tiling::select_tile_nvfp4_acc16(
-                32, G05Nvfp4Tables::output_sizes[family] / (col ? 8 : 1),
-                G05Nvfp4Tables::input_sizes[family] / (col ? 1 : 8));
+                32, G05Nvfp4Tables::output_sizes[family] / (col ? lanes : 1),
+                G05Nvfp4Tables::input_sizes[family] / (col ? 1 : lanes));
             const auto kernel = linear_acc32_
                 ? (col && G05Nvfp4Tables::output_sizes[family] == 4096
                     ? KernelId::PARALLEL_LINEAR_NVFP4_V2_M384N48
@@ -7033,21 +7338,56 @@ void Qwen3_5Model::set_weights(
                     "qwen3_5 set_weights: ", name, "[", layer,
                     "] must be ", dim, "D, got ", tensor.dim(), "D");
     };
-    // Exact 2B W8 main/GDN profile; b/a scalar projections remain FP16.
-    // Inspect only after list cardinalities have been validated above.
-    const bool reduced_w8_2b = reduced && !reduced_legacy27 &&
-        hidden_size == 2048 && gate_list[0].defined() &&
-        gate_list[0].scalar_type() == at::kChar;
-    // Geometry is shared by the historical mixed bundle and the official
-    // uniform checkpoint. Determine precision only after validating list sizes,
-    // then enforce the selected policy for every projection in every layer.
-    const bool dense27_w8 = dense27 && gdn_q_list[0].defined() &&
-        gdn_q_list[0].scalar_type() == at::kChar;
-    const bool dense27_w4 = dense27 && gdn_q_list[0].defined() &&
-        gdn_q_list[0].scalar_type() == at::kByte;
-    TORCH_CHECK(!dense27_w4 || !reduced,
-                "official Qwen3.5-27B W4 group32 requires eight cores");
-    const auto check_linear = [reduced, dense27, dense27_w8, dense27_w4, reduced_w8_2b, nvfp4, uint4_mlp](const at::Tensor& weight,
+    // Resolve precision only after validating list cardinalities. Each family
+    // keeps one dtype across all layers; scalar GDN b/a may remain FP16.
+    const auto mlp_dtype = gate_list[0].scalar_type();
+    const auto attention_dtype = reduced || dense27
+        ? q_w_list[3].scalar_type() : at::kHalf;
+    const auto gdn_dtype = reduced || dense27
+        ? gdn_q_list[0].scalar_type() : at::kHalf;
+    const auto scalar_dtype = reduced || dense27
+        ? gdn_b_bg_list[0].scalar_type() : at::kHalf;
+    // AWQ preserves layer zero in FP16. All MLP layers still share the same
+    // physical width, including its FP16 first layer and packed later layers.
+    // Text NVFP4 shares packed W4's six-core width: both need localK % 64.
+    const bool packed_mlp = !nvfp4 && std::any_of(gate_list.begin(), gate_list.end(),
+        [](const at::Tensor& weight) {
+            return weight.defined() && weight.scalar_type() == at::kByte;
+        });
+    const int64_t prepared_intermediate_size = packed_mlp && num_cores() == 6
+        ? (uint4_mlp ? ((intermediate_size + 767) / 768) * 768
+           : text_nvfp4 ? ((intermediate_size + 383) / 384) * 384
+                        : ((intermediate_size + 191) / 192) * 192)
+        : decoder_mlp_intermediate_size(intermediate_size, num_cores());
+    TORCH_CHECK(!reduced || scalar_dtype == at::kHalf || scalar_dtype == gdn_dtype,
+                "Qwen3.5 GDN b/a must share the GDN dtype or remain FP16");
+    // The historical W8-main/FP16-GDN bundle and official recipes share one
+    // geometry. Bind their actual projection families independently; GDN
+    // precision alone cannot identify the MLP or attention representation.
+    if (dense27 && !uint4_mlp) {
+        const bool dense_fp16 = mlp_dtype == at::kHalf && attention_dtype == at::kHalf &&
+            gdn_dtype == at::kHalf && scalar_dtype == at::kHalf;
+        const bool legacy_w8 = mlp_dtype == at::kChar && attention_dtype == at::kChar &&
+            gdn_dtype == at::kHalf && scalar_dtype == at::kHalf;
+        const bool ordinary_w8 = mlp_dtype == at::kChar && attention_dtype == at::kChar &&
+            gdn_dtype == at::kChar && (scalar_dtype == at::kChar || scalar_dtype == at::kHalf);
+        const bool ordinary_w4 = mlp_dtype == at::kByte && attention_dtype == at::kByte &&
+            gdn_dtype == at::kByte && scalar_dtype == at::kByte;
+        const bool mlp_w4_only = mlp_dtype == at::kByte && attention_dtype == at::kHalf &&
+            gdn_dtype == at::kHalf && scalar_dtype == at::kHalf;
+        const bool mlp_w4_rest_w8 = mlp_dtype == at::kByte && attention_dtype == at::kChar &&
+            gdn_dtype == at::kChar && scalar_dtype == at::kChar;
+        const bool main_w4_gdn_w8 = mlp_dtype == at::kByte && attention_dtype == at::kByte &&
+            gdn_dtype == at::kChar && scalar_dtype == at::kHalf;
+        const bool text_nvfp4_recipe = text_nvfp4 && mlp_dtype == at::kByte &&
+            attention_dtype == at::kByte && gdn_dtype == at::kByte && scalar_dtype == at::kHalf;
+        TORCH_CHECK(text_nvfp4 ? text_nvfp4_recipe : dense_fp16 || legacy_w8 || ordinary_w8 ||
+                        ordinary_w4 || mlp_w4_only || mlp_w4_rest_w8 || main_w4_gdn_w8,
+                    "Qwen3.5-27B requires an admitted exact projection-family recipe");
+    }
+    // NVFP4 K/V keep W8 owners at the replicated attention width; the gate keeps Q8.
+    const int64_t nvfp4_kv_rows = num_kv_heads * 256;
+    const auto check_linear = [reduced, dense27, mlp_dtype, attention_dtype, gdn_dtype, scalar_dtype, nvfp4, text_nvfp4, uint4_mlp, nvfp4_kv_rows, this](const at::Tensor& weight,
                                  const at::Tensor& scale,
                                  const char* name, int64_t layer) {
         TORCH_CHECK(weight.defined() && weight.numel() > 0 && weight.dim() == 2,
@@ -7073,10 +7413,30 @@ void Qwen3_5Model::set_weights(
                     TORCH_CHECK((values[element] & 0x7f) != 0x7f,
                                 "G05 NVFP4 block scale contains FP8 NaN");
             } else {
+                const int64_t rows = role == "attn_gate" ? 2048 : nvfp4_kv_rows;
                 TORCH_CHECK((role == "k" || role == "v" || role == "attn_gate") &&
                                 weight.scalar_type() == at::kChar &&
-                                weight.sizes() == at::IntArrayRef({2048, 1024}),
+                                weight.sizes() == at::IntArrayRef({rows, 1024}),
                             "G05 NVFP4 preserves W8 K/V/attention-gate owners");
+            }
+        }
+        if (text_nvfp4) {
+            if (role == "gdn_b_bg" || role == "gdn_a_bg") {
+                // Local N16 is below the smallest NVFP4 tile.
+                TORCH_CHECK(weight.scalar_type() == at::kHalf,
+                            "Qwen3.5 text NVFP4 keeps GDN ", name, " FP16");
+            } else {
+                const int64_t n = weight.size(0), k = weight.size(1) * 2;
+                TORCH_CHECK(weight.scalar_type() == at::kByte && k % 64 == 0 &&
+                                scale.defined() && scale.scalar_type() == at::kByte &&
+                                scale.device().type() == at::kPrivateUse1 &&
+                                scale.is_contiguous() &&
+                                scale.sizes() == at::IntArrayRef({k / 16, n}),
+                            "Qwen3.5 text NVFP4 requires packed uint8 [N,K/2] and striped FP8 "
+                            "[K/16,N] for ", name, "[", layer, "]");
+                TORCH_CHECK(!scale.cpu().bitwise_and(0x7f).eq(0x7f).any().item<bool>(),
+                            "Qwen3.5 text NVFP4 block scale contains FP8 NaN for ", name,
+                            "[", layer, "]");
             }
         }
         if (uint4_mlp && role != "gate" && role != "up" && role != "down") {
@@ -7084,16 +7444,14 @@ void Qwen3_5Model::set_weights(
                         "QuantTrio AWQ only quantizes MLP projections; ", name,
                         "[", layer, "] must remain FP16");
         }
-        const bool legacy_main = dense27 && !dense27_w8 && !dense27_w4 &&
-            role.rfind("gdn_", 0) != 0;
-        const bool w8_2b_projection = reduced_w8_2b &&
-            role != "gdn_b_bg" && role != "gdn_a_bg";
-        const auto expected_dtype = dense27_w4 ? at::kByte :
-            (dense27_w8 || legacy_main || w8_2b_projection ? at::kChar : at::kHalf);
-        TORCH_CHECK((!reduced && !dense27) || weight.scalar_type() == expected_dtype,
-                    "Qwen3.5 reduced projection dtype must match exact FP16, "
-                    "2B W8 with FP16 GDN b/a, official 27B uniform W8/W4, "
-                    "or legacy W8-main FP16-GDN policy");
+        const bool mlp_role = role == "gate" || role == "up" || role == "down";
+        const bool scalar_role = role == "gdn_b_bg" || role == "gdn_a_bg";
+        const auto family_dtype = mlp_role ? mlp_dtype : scalar_role ? scalar_dtype :
+            role.rfind("gdn_", 0) == 0 ? gdn_dtype : attention_dtype;
+        const auto expected_dtype = uint4_mlp ? (mlp_role && layer > 0 ? at::kByte : at::kHalf) :
+            family_dtype;
+        TORCH_CHECK((!reduced && !dense27) || nvfp4 || weight.scalar_type() == expected_dtype,
+                    "Qwen3.5 reduced projection dtype must match its cold family policy");
         TORCH_CHECK(weight.device().type() == at::kPrivateUse1
                     && weight.is_contiguous()
                     && (weight.scalar_type() == at::kHalf
@@ -7110,17 +7468,19 @@ void Qwen3_5Model::set_weights(
                         "qwen3_5 set_weights: W8A16 ", name, "[", layer,
                         "] requires contiguous FP16 device scale [N=",
                         weight.size(0), "]");
-        } else if (weight.scalar_type() == at::kByte && nvfp4) {
+        } else if (weight.scalar_type() == at::kByte && (nvfp4 || text_nvfp4)) {
             // Exact family shape and FP8 scale validation above; never W4 ABI.
         } else if (weight.scalar_type() == at::kByte) {
-            TORCH_CHECK(!dense27_w4 || (scale.defined() && scale.dim() == 2 && scale.size(0) == 32),
+            TORCH_CHECK(!(dense27 || reduced) || (scale.defined() && scale.dim() == 2 && scale.size(0) == (uint4_mlp ? 128 : 32)),
                         "official Qwen3.5-27B W4 requires group32 scales");
-            if (dense27_w4) {
+            if (dense27 || reduced) {
+                const int cores = mlp_role ? num_cores() : (num_cores() == 8 ? 8 : 4);
                 const bool row = role == "down" || role == "o" || role == "gdn_out";
-                const int64_t local_n = weight.size(0) / (row ? 1 : 8);
-                const int64_t local_g = (weight.size(1) * 2 / 32) / (row ? 8 : 1);
+                const int64_t local_n = weight.size(0) / (row ? 1 : cores);
+                const int group = uint4_mlp ? 128 : 32;
+                const int64_t local_g = (weight.size(1) * 2 / group) / (row ? cores : 1);
                 const int64_t scale_elements = ((local_g + 3) / 4) *
-                    ((local_n + 63) / 64) * 8 * 4 * 64;
+                    ((local_n + 63) / 64) * cores * 4 * 64;
                 TORCH_CHECK(scale.numel() == scale_elements,
                             "official Qwen3.5-27B W4 scale has incorrect controller padding for ", name);
             }
@@ -7156,37 +7516,56 @@ void Qwen3_5Model::set_weights(
         }
         if (reduced || dense27) {
             const auto shape = [i](const at::Tensor& tensor,
-                                    at::IntArrayRef expected, const char* name) {
+                                    at::IntArrayRef expected, const char* name,
+                                    int partition = -1, int64_t cores = 0) {
                 std::vector<int64_t> physical(expected.begin(), expected.end());
-                if (physical.size() == 2 && tensor.scalar_type() == at::kByte)
+                if (tensor.defined() && physical.size() == 2 &&
+                    tensor.scalar_type() == at::kByte) {
+                    // N32 padding belongs to each TP shard. Column projections
+                    // split N; row projections split K and share the padded N.
+                    // Logical output/SPM geometry (notably GDN b/a N16) stays intact.
+                    TORCH_CHECK((partition == 0 || partition == 1) && cores > 0 &&
+                                    physical[partition == 1 ? 0 : 1] % cores == 0,
+                                "Qwen3.5 W4 ", name, " has invalid TP partition");
+                    const int64_t local_n = physical[0] / (partition == 1 ? cores : 1);
+                    const int64_t local_k = physical[1] / (partition == 0 ? cores : 1);
+                    TORCH_CHECK(local_n > 0 && local_n % 16 == 0 &&
+                                    local_k > 0 && local_k % 32 == 0,
+                                "Qwen3.5 W4 ", name, " requires local N16/K32 geometry");
+                    physical[0] = ((local_n + 31) / 32) * 32 *
+                        (partition == 1 ? cores : 1);
                     physical[1] /= 2;
+                }
                 TORCH_CHECK(tensor.defined() && tensor.sizes() == at::IntArrayRef(physical),
-                            "Qwen3.5 reduced ", name, " shape mismatch at layer ", i);
+                            "Qwen3.5 reduced ", name, " shape mismatch at layer ", i,
+                            ": expected ", at::IntArrayRef(physical), ", got ",
+                            tensor.defined() ? tensor.sizes() : at::IntArrayRef{});
             };
+            const int64_t ac = num_cores() == 8 ? 8 : 4;
             shape(input_norm_list[i], {hidden_size}, "input norm");
             shape(post_norm_list[i], {hidden_size}, "post norm");
-            shape(gate_list[i], {prepared_intermediate_size, hidden_size}, "MLP gate");
-            shape(up_list[i], {prepared_intermediate_size, hidden_size}, "MLP up");
-            shape(down_list[i], {hidden_size, prepared_intermediate_size}, "MLP down");
+            shape(gate_list[i], {prepared_intermediate_size, hidden_size}, "MLP gate", 1, num_cores());
+            shape(up_list[i], {prepared_intermediate_size, hidden_size}, "MLP up", 1, num_cores());
+            shape(down_list[i], {hidden_size, prepared_intermediate_size}, "MLP down", 0, num_cores());
             if (layer_is_full[i]) {
-                shape(q_w_list[i], {num_q_heads * head_dim, hidden_size}, "Q");
-                shape(k_w_list[i], {num_kv_heads * head_dim, hidden_size}, "K");
-                shape(v_w_list[i], {num_kv_heads * head_dim, hidden_size}, "V");
-                shape(o_w_list[i], {hidden_size, num_q_heads * head_dim}, "O");
-                shape(attn_gate_list[i], {num_q_heads * head_dim, hidden_size}, "attention gate");
+                shape(q_w_list[i], {num_q_heads * head_dim, hidden_size}, "Q", 1, ac);
+                shape(k_w_list[i], {num_kv_heads * head_dim, hidden_size}, "K", 1, ac);
+                shape(v_w_list[i], {num_kv_heads * head_dim, hidden_size}, "V", 1, ac);
+                shape(o_w_list[i], {hidden_size, num_q_heads * head_dim}, "O", 0, ac);
+                shape(attn_gate_list[i], {num_q_heads * head_dim, hidden_size}, "attention gate", 1, ac);
                 shape(q_norm_list[i], {head_dim}, "Q norm");
                 shape(k_norm_list[i], {head_dim}, "K norm");
             } else {
                 const int64_t gc = gdn_tp();
                 const int64_t key = 16 * gdn_key_head_dim;
                 const int64_t value = gdn_num_v_heads * gdn_value_head_dim;
-                shape(gdn_q_list[i], {key, hidden_size}, "GDN Q");
-                shape(gdn_k_list[i], {key, hidden_size}, "GDN K");
-                shape(gdn_v_list[i], {value, hidden_size}, "GDN V");
-                shape(gdn_in_z_list[i], {value, hidden_size}, "GDN Z");
-                shape(gdn_out_list[i], {hidden_size, value}, "GDN output");
-                shape(gdn_b_bg_list[i], {16 * gc, hidden_size}, "GDN beta");
-                shape(gdn_a_bg_list[i], {16 * gc, hidden_size}, "GDN decay");
+                shape(gdn_q_list[i], {key, hidden_size}, "GDN Q", 1, gc);
+                shape(gdn_k_list[i], {key, hidden_size}, "GDN K", 1, gc);
+                shape(gdn_v_list[i], {value, hidden_size}, "GDN V", 1, gc);
+                shape(gdn_in_z_list[i], {value, hidden_size}, "GDN Z", 1, gc);
+                shape(gdn_out_list[i], {hidden_size, value}, "GDN output", 0, gc);
+                shape(gdn_b_bg_list[i], {16 * gc, hidden_size}, "GDN beta", 1, gc);
+                shape(gdn_a_bg_list[i], {16 * gc, hidden_size}, "GDN decay", 1, gc);
                 const int64_t scalar_slots = qwen35_gdn_scalar_slots(gdn_num_v_heads, gc);
                 shape(gdn_A_log_list[i], {scalar_slots * gc}, "GDN A_log");
                 shape(gdn_dt_bias_list[i], {scalar_slots * gc}, "GDN dt_bias");
@@ -7264,7 +7643,7 @@ void Qwen3_5Model::set_weights(
             const int64_t metadata_elements = ((local_k / 128 + 3) / 4) *
                 ((local_n + 63) / 64) * num_cores() * 4 * 64;
             TORCH_CHECK(local_k % 128 == 0 && local_n % 16 == 0,
-                        "QuantTrio AWQ projection does not preserve TP8 G128 geometry");
+                        "QuantTrio AWQ projection does not preserve its G128 core geometry");
             TORCH_CHECK(present && weight.scalar_type() == at::kByte &&
                             weight.sizes() == at::IntArrayRef({out_features, in_features / 2}) &&
                             scale.defined() && scale.dim() == 2 && scale.size(0) == 128 &&
@@ -7272,8 +7651,8 @@ void Qwen3_5Model::set_weights(
                             zero.device() == weight.device() && zero.scalar_type() == at::kHalf &&
                             zero.is_contiguous() && zero.sizes() == scale.sizes(),
                         "QuantTrio AWQ ", role, "[", layer,
-                        "] requires packed UINT4, G128 FP16 scale and matching device FP16 negative_zero");
-            owners[layer] = rpu_retain_linear_quant_scale(weight, zero);
+                        "] requires packed UINT4, G128 FP16 scale and matching RPU FP16 negative_zero");
+            owners[layer] = rpu_retain_linear_quant_scale(weight, zero, num_cores());
         }
         return owners;
     };
@@ -7285,6 +7664,7 @@ void Qwen3_5Model::set_weights(
         down_negative_zero_list, "down", hidden_size, prepared_intermediate_size);
 
     action_nvfp4_ = std::move(candidate_nvfp4);
+    text_nvfp4_ = std::move(candidate_text_nvfp4);
     action_nvfp4_o_resident_available_ = false;
     action_nvfp4_o_resident_ = {};
     action_nvfp4_down_resident_available_ = false;
@@ -7356,11 +7736,11 @@ void Qwen3_5Model::set_weights(
         lw.up_negative_zero = std::move(up_zero_owners[i]);
         lw.down_negative_zero = std::move(down_zero_owners[i]);
         lw.gate_ws = rpu_retain_linear_quant_scale(
-            gate_list[i], gate_scale_list[i]);
+            gate_list[i], gate_scale_list[i], num_cores());
         lw.up_ws = rpu_retain_linear_quant_scale(
-            up_list[i], up_scale_list[i]);
+            up_list[i], up_scale_list[i], num_cores());
         lw.down_ws = rpu_retain_linear_quant_scale(
-            down_list[i], down_scale_list[i]);
+            down_list[i], down_scale_list[i], num_cores());
         if (!layer_is_full_[i]) {
             // GDN mixer weights (attention slots stay empty).
             lw.gdn_in_z_w    = gdn_in_z_list[i];
@@ -7369,42 +7749,42 @@ void Qwen3_5Model::set_weights(
             lw.gdn_dt_bias   = gdn_dt_bias_list[i];
             lw.gdn_norm_w    = gdn_norm_list[i];
             lw.gdn_in_z_ws = rpu_retain_linear_quant_scale(
-                gdn_in_z_list[i], gdn_in_z_scale_list[i]);
+                gdn_in_z_list[i], gdn_in_z_scale_list[i], num_cores() == 8 ? 8 : 4);
             lw.gdn_out_ws = rpu_retain_linear_quant_scale(
-                gdn_out_list[i], gdn_out_scale_list[i]);
+                gdn_out_list[i], gdn_out_scale_list[i], num_cores() == 8 ? 8 : 4);
             // prefill (chunk) per-path weights (separate q/k/v proj + conv, N_bg b/a)
             if (gdn_q_list.size() > 0) {
                 lw.gdn_q_w = gdn_q_list[i]; lw.gdn_k_w = gdn_k_list[i]; lw.gdn_v_w = gdn_v_list[i];
                 lw.gdn_conv_q_w = gdn_cq_list[i]; lw.gdn_conv_k_w = gdn_ck_list[i]; lw.gdn_conv_v_w = gdn_cv_list[i];
                 lw.gdn_b_bg_w = gdn_b_bg_list[i]; lw.gdn_a_bg_w = gdn_a_bg_list[i];
                 lw.gdn_q_ws = rpu_retain_linear_quant_scale(
-                    gdn_q_list[i], gdn_q_scale_list[i]);
+                    gdn_q_list[i], gdn_q_scale_list[i], num_cores() == 8 ? 8 : 4);
                 lw.gdn_k_ws = rpu_retain_linear_quant_scale(
-                    gdn_k_list[i], gdn_k_scale_list[i]);
+                    gdn_k_list[i], gdn_k_scale_list[i], num_cores() == 8 ? 8 : 4);
                 lw.gdn_v_ws = rpu_retain_linear_quant_scale(
-                    gdn_v_list[i], gdn_v_scale_list[i]);
+                    gdn_v_list[i], gdn_v_scale_list[i], num_cores() == 8 ? 8 : 4);
                 lw.gdn_b_bg_ws = rpu_retain_linear_quant_scale(
-                    gdn_b_bg_list[i], gdn_b_bg_scale_list[i]);
+                    gdn_b_bg_list[i], gdn_b_bg_scale_list[i], num_cores() == 8 ? 8 : 4);
                 lw.gdn_a_bg_ws = rpu_retain_linear_quant_scale(
-                    gdn_a_bg_list[i], gdn_a_bg_scale_list[i]);
+                    gdn_a_bg_list[i], gdn_a_bg_scale_list[i], num_cores() == 8 ? 8 : 4);
             }
             continue;
         }
         lw.q_w = q_w_list[i]; lw.k_w = k_w_list[i];
         lw.v_w = v_w_list[i]; lw.o_w = o_w_list[i];
         lw.q_ws = rpu_retain_linear_quant_scale(
-            q_w_list[i], q_scale_list[i]);
+            q_w_list[i], q_scale_list[i], num_cores() == 8 ? 8 : 4);
         lw.k_ws = rpu_retain_linear_quant_scale(
-            k_w_list[i], k_scale_list[i]);
+            k_w_list[i], k_scale_list[i], num_cores() == 8 ? 8 : 4);
         lw.v_ws = rpu_retain_linear_quant_scale(
-            v_w_list[i], v_scale_list[i]);
+            v_w_list[i], v_scale_list[i], num_cores() == 8 ? 8 : 4);
         lw.o_ws = rpu_retain_linear_quant_scale(
-            o_w_list[i], o_scale_list[i]);
+            o_w_list[i], o_scale_list[i], num_cores() == 8 ? 8 : 4);
         lw.q_norm_w    = has_qk_norm_ ? q_norm_list[i] : at::Tensor();
         lw.k_norm_w    = has_qk_norm_ ? k_norm_list[i] : at::Tensor();
         lw.attn_gate_w = attn_gate_list[i];
         lw.attn_gate_ws = rpu_retain_linear_quant_scale(
-            attn_gate_list[i], attn_gate_scale_list[i]);
+            attn_gate_list[i], attn_gate_scale_list[i], num_cores() == 8 ? 8 : 4);
     }
     cos_ = keep_256b_aligned_rpu_copy(cos, "qwen3_5 set_weights: cos");
     sin_ = keep_256b_aligned_rpu_copy(sin, "qwen3_5 set_weights: sin");
@@ -7446,6 +7826,8 @@ void Qwen3_5Model::set_weights(
         }
     }
 
+    mlp_packed_w4_ = packed_mlp;
+    mlp_awq_g128_ = uint4_mlp;
     set_model_params(num_q_heads, num_kv_heads, head_dim, hidden_size, intermediate_size);
     set_num_layers(N);
 
@@ -7476,6 +7858,17 @@ using Qwen3_5Registry = ModelHandleRegistry<v3::Qwen3_5Model>;
 void rpu_qwen3_5_prepare_persistent_spm(int64_t handle, int64_t execution_len) {
     Qwen3_5Registry::get(handle, "rpu_qwen3_5_prepare_persistent_spm")
         ->prepare_persistent_spm(execution_len, 0, true);
+}
+
+void rpu_qwen3_5_set_decode_candidate_head(int64_t handle, const at::Tensor& weight,
+                                           const at::Tensor& output) {
+    Qwen3_5Registry::get(handle, "rpu_qwen3_5_set_decode_candidate_head")
+        ->set_decode_candidate_head(weight, output);
+}
+
+std::vector<int64_t> rpu_qwen3_5_checked_decode_replay_counters(int64_t handle) {
+    return Qwen3_5Registry::get(handle, "rpu_qwen3_5_checked_decode_replay_counters")
+        ->checked_decode_replay_counters();
 }
 
 std::vector<int64_t> rpu_qwen3_5_planner_cache_identity(int64_t handle) {
@@ -7646,6 +8039,11 @@ void rpu_qwen3_5_set_fast_replay(int64_t handle, bool enabled) {
         ->set_fast_replay(enabled);
 }
 
+void rpu_qwen3_5_set_initial_prefill_state_flush_skip(int64_t handle, bool enabled) {
+    Qwen3_5Registry::get(handle, "rpu_qwen3_5_set_initial_prefill_state_flush_skip")
+        ->set_initial_prefill_state_flush_skip(enabled);
+}
+
 void rpu_qwen3_5_set_retained_prefill_graph(
         int64_t handle, bool enabled) {
     Qwen3_5Registry::get(
@@ -7662,6 +8060,11 @@ void rpu_qwen3_5_set_action_chunk_size(
         int64_t handle, int64_t chunk_size) {
     Qwen3_5Registry::get(handle, "rpu_qwen3_5_set_action_chunk_size")
         ->set_action_chunk_size(chunk_size);
+}
+
+void rpu_qwen3_5_set_action_valid_len(int64_t handle, int64_t valid_len) {
+    Qwen3_5Registry::get(handle, "rpu_qwen3_5_set_action_valid_len")
+        ->set_action_valid_len(valid_len);
 }
 
 void rpu_qwen3_5_stage_action_chunk_size(

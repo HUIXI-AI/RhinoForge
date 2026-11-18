@@ -4,11 +4,12 @@ import json
 from pathlib import Path
 
 import pytest
+from _support_status import expected_support_status
 
 ROOT = Path(__file__).resolve().parents[1]
 FAMILY = ROOT / "examples/configs/qwen3_5"
-CASES = [(component, bits, cores) for component in ("text", "vl")
-         for bits, cores in ((8, 8), (8, 4), (8, 6), (4, 8))]
+CASES = [(component, precision, cores) for component in ("text", "vl")
+         for precision in ("fp16", "w4a16", "w8a16") for cores in (4, 6, 8)]
 
 
 @pytest.fixture
@@ -17,12 +18,10 @@ def common(monkeypatch):
     return importlib.import_module("examples.common.config")
 
 
-def _path(component, bits, cores):
-    stem = "w8a16_text" if bits == 8 else "w4a16_text_rtn_g32"
-    suffix = "" if cores == 8 else f"_tp{cores}"
-    if component == "vl" and cores != 8:
-        suffix += "_image_mascot_d31"
-    return FAMILY / f"{component}/27b/{stem}{suffix}.toml"
+def _path(component, precision, cores):
+    stem = {"fp16": "fp16", "w8a16": "w8a16_text",
+            "w4a16": "w4a16_text_rtn_g32"}[precision]
+    return FAMILY / f"{component}/27b/{stem}.toml"
 
 
 @pytest.fixture
@@ -53,21 +52,27 @@ def metadata():
     }
 
 
-@pytest.mark.parametrize("component,bits,cores", CASES)
-def test_official_27b_profiles_match_exact_config_topology(common, component, bits, cores, tmp_path):
-    path = _path(component, bits, cores)
-    config = common.load_config(path)
+@pytest.mark.parametrize("component,precision,cores", CASES)
+def test_official_27b_profiles_match_exact_config_topology(common, component, precision, cores, tmp_path):
+    path = _path(component, precision, cores)
+    selected = tmp_path / "selected.toml"
+    selected.write_text(path.read_text().replace("num_cores = 8", f"num_cores = {cores}"))
+    config = common.load_config(selected)
     profile = common.planner_profiles()[config["example"]["profile_id"]]
-    assert profile["asset_alias"] == f"qwen3_5-27b-w{bits}a16"
-    assert profile["input_envelope"]["limits"]["num_cores"] == cores
+    expected_alias = f"qwen3_5-27b-{precision}"
+    assert profile["asset_alias"] == expected_alias
+    assert profile["input_envelope"]["limits"]["allowed_num_cores"] == [4, 6, 8]
+    assert "num_cores" not in profile["input_envelope"]["limits"]
     assert profile["hw_status"] == "IMPLEMENTED_UNVERIFIED_HW"
-    assert profile["support"]["status"] == "CONTROLLED_EVALUATION"
+    expected_status = "IMPLEMENTED_UNVERIFIED_HW" if precision == "fp16" else "CONTROLLED_EVALUATION"
+    assert profile["support"]["status"] == expected_support_status(profile, expected_status)
     assert config["rpu_execution"]["model"]["num_cores"] == cores
-    assert config["rpu_execution"]["prefill"]["linear_acc32"] is False
-    assert config["run"]["warmup"] == 2 and config["run"]["runs"] == 5
-    bad_core = 4 if cores == 8 else 8
+    if precision != "fp16":
+        assert config["rpu_execution"]["prefill"]["linear_acc32"] is False
+    assert config["run"]["runs"] == 5
+    assert config["run"]["warmup"] == 2
     bad = tmp_path / "wrong_core.toml"
-    bad.write_text(path.read_text().replace(f"num_cores = {cores}", f"num_cores = {bad_core}"))
+    bad.write_text(path.read_text().replace("num_cores = 8", "num_cores = 5"))
     with pytest.raises(common.ConfigError, match=r"model\.num_cores"):
         common.load_config(bad)
     for gate in config["example"]["opt_in"]:
@@ -76,15 +81,20 @@ def test_official_27b_profiles_match_exact_config_topology(common, component, bi
             common.load_config(bad)
 
 
-def test_all_27b_runtime_templates_load_with_explicit_core_and_precision(common):
-    paths = sorted((FAMILY / "text/27b").glob("*.toml")) + sorted((FAMILY / "vl/27b").glob("*.toml"))
-    assert len(paths) >= len(CASES)
-    for path in paths:
-        config = common.load_config(path)
-        assert config["rpu_execution"]["model"]["num_cores"] in (4, 6, 8)
-        assert isinstance(config["rpu_execution"]["prefill"]["linear_acc32"], bool)
-        assert config["input"]["decode_steps"] > 0
-        assert "fp16" not in path.stem
+def test_matrix_is_a_pure_configuration_index(common):
+    matrix = json.loads((FAMILY / "27b_matrix.json").read_text())
+    cases = matrix["configs"]
+    assert matrix["schema_version"] == 2
+    assert len(cases) == len({row["id"] for row in cases}) == len({row["config"] for row in cases})
+    assert cases and all("_tp4" not in row["config"] and "_tp6" not in row["config"] for row in cases)
+    for row in cases:
+        config = common.load_config(ROOT / row["config"])
+        assert config["example"]["profile_id"] == row["profile_id"]
+        assert row["component"] in ("text", "vl")
+        assert row["precision"] in ("fp16", "w4a16", "w8a16")
+        assert row["allowed_num_cores"] == [4, 6, 8]
+        assert config["rpu_execution"]["model"]["num_cores"] in row["allowed_num_cores"]
+        assert all(key not in row for key in ("reference_ids", "measured_dataset", "reference_prefill_tokens", "cpu_threads"))
 
 
 @pytest.mark.parametrize("component,bits,version", [(component, bits, version)
@@ -96,7 +106,8 @@ def test_checkpoint_preflight_accepts_equivalent_uniform_quant_semantics(common,
     metadata["quant_config"] = ({"format_version": 2, "default": spec}
                                 if version == 2 else {"format_version": 1, **spec})
     (tmp_path / "config.json").write_text(json.dumps(metadata))
-    common.validate_checkpoint_profile(common.load_config(_path(component, bits, 8)), str(tmp_path))
+    precision = "w8a16" if bits == 8 else "w4a16"
+    common.validate_checkpoint_profile(common.load_config(_path(component, precision, 8)), str(tmp_path))
 
 
 @pytest.mark.parametrize("mutation", ["other_size", "legacy", "wrong_precision", "missing_quant", "wrong_architecture"])
@@ -117,15 +128,87 @@ def test_checkpoint_preflight_rejects_relabelling(common, metadata, mutation, tm
     (tmp_path / "config.json").write_text(json.dumps(metadata))
     for component in ("text", "vl"):
         with pytest.raises(common.ConfigError, match="rejects checkpoint"):
-            common.validate_checkpoint_profile(common.load_config(_path(component, 8, 8)), str(tmp_path))
+            common.validate_checkpoint_profile(
+                common.load_config(_path(component, "w8a16", 8)), str(tmp_path))
 
 
-def test_official_assets_do_not_replace_archived_legacy(common):
+def test_official_assets_keep_historical_profile_out_of_active_catalog(common):
+    registry = common._backend_leaf("model_registry.py")
+    assert "qwen3_8-27b-w8a16" not in registry.MODELS
+    assert registry.ARCHIVED_MODELS["qwen3_8-27b-w8a16"] == "Qwen3.8-27B-w8a16"
+    assert registry.archived_model_path("qwen3_8-27b-w8a16").name == "Qwen3.8-27B-w8a16"
+    assert "qwen3_5-27b-w8a16" in registry.MODELS
+    assert "qwen3_5-27b-w4a16" in registry.MODELS
+    assert registry.MODELS["qwen3_5-27b-fp16"] == "Qwen3.5-27B-FP16"
+    assert registry.MODELS["qwen3_5-27b"] == "Qwen3.5-27B"
     profiles = common.planner_profiles()
-    aliases = common._backend_leaf("model_registry.py").MODELS
-    assert aliases["qwen3_8-27b-w8a16"] == "Qwen3.8-27B-w8a16"
-    assert aliases["qwen3_5-27b-w8a16"] != aliases["qwen3_8-27b-w8a16"]
-    assert aliases["qwen3_5-27b-w4a16"] != aliases["qwen3_5-27b-w8a16"]
-    for suffix in ("", "_tp4", "_tp6"):
-        config = common.load_config(FAMILY / f"legacy/27b/w8a16_attn_mlp{suffix}.toml")
-        assert profiles[config["example"]["profile_id"]]["asset_alias"] == "qwen3_8-27b-w8a16"
+    for component in ("text", "vl"):
+        config = common.load_config(_path(component, "fp16", 8))
+        assert profiles[config["example"]["profile_id"]]["asset_alias"] == config["example"]["registry_alias"]
+    assert not (FAMILY / "text/27b/w8a16_legacy_text.toml").exists()
+
+
+RECIPES = {
+    "w4_mlp_only": ("w4a16_mlp_rtn_g32", "w4-mlp-only-g32"),
+    "w4_mlp_w8_attn_gdn": ("w4a16_mlp_rtn_g32_attn_gdn_w8a16", "w4-mlp-w8-attn-gdn-g32"),
+    "activation_awq_g128_v1": ("w4a16_mlp_activation_awq_g128", "activation-awq-g128"),
+}
+
+
+@pytest.mark.parametrize("recipe", RECIPES)
+@pytest.mark.parametrize("cores", [4, 6, 8])
+def test_official_27b_recipe_configs_bind_exact_scope(common, metadata, recipe, cores, tmp_path):
+    scope = common._backend_leaf("adapters/qwen3_5/quant_scope.py")
+    metadata["text_config"]["layer_types"] *= 16
+    if recipe == "activation_awq_g128_v1":
+        policy = scope._quanttrio_policy(scope.is_full_from_layer_types(metadata["text_config"]["layer_types"]))
+        policy["profile"] = recipe
+    else:
+        policy = {"format_version": 2, "architecture": "qwen3_5", "profile": recipe,
+                  "default": {"method": "fp16" if recipe == "w4_mlp_only" else "w8a16"},
+                  "projection_overrides": {f"mlp.{role}": {"method": "w4a16_pgrp", "group_size": 32}
+                                           for role in ("gate_proj", "up_proj", "down_proj")}}
+    metadata["quant_config"] = policy
+    (tmp_path / "config.json").write_text(json.dumps(metadata))
+    stem, public_recipe = RECIPES[recipe]
+    for prefill in (None, 64, 4096):
+        config = common.load_config(FAMILY / f"text/27b/{stem}.toml")
+        if prefill is not None:
+            config["input"].update(prefill_tokens=prefill, decode_steps=4096, stop_on_eos=False)
+            common.validate_generation_options(config)
+        profile = common.planner_profiles()[config["example"]["profile_id"]]
+        assert profile["support"]["status"] == expected_support_status(profile, "IMPLEMENTED_UNVERIFIED_HW")
+        assert config["example"]["registry_alias"] == f"qwen3_5-27b-{public_recipe}"
+        config["rpu_execution"]["model"]["num_cores"] = cores
+        common._validate_execution(config["rpu_execution"], profile=profile)
+        common.validate_checkpoint_profile(config, str(tmp_path))
+        metadata["text_config"]["hidden_size"] = 2048
+        (tmp_path / "config.json").write_text(json.dumps(metadata))
+        with pytest.raises(common.ConfigError):
+            common.validate_checkpoint_profile(config, str(tmp_path))
+        metadata["text_config"]["hidden_size"] = 5120
+        (tmp_path / "config.json").write_text(json.dumps(metadata))
+
+
+@pytest.mark.parametrize("component", ["text", "vl"])
+@pytest.mark.parametrize("owner,key,value", [
+    pytest.param("text_config", "hidden_size", 4096, id="other-size"),
+    pytest.param("vision_config", "out_hidden_size", 4096, id="vision-geometry"),
+    pytest.param(None, "architectures", ["Qwen3_5MoeForConditionalGeneration"],
+                 id="wrong-architecture"),
+    pytest.param(None, "quant_config", {"method": "w8a16"}, id="quantized"),
+    pytest.param("text_config", "quant_config", {"method": "w8a16"},
+                 id="nested-quantized"),
+    pytest.param(None, "quantization_config", {"quant_method": "awq"},
+                 id="foreign-quantization"),
+])
+def test_official_27b_fp16_checkpoint_preflight_is_bound(
+        common, metadata, component, owner, key, value, tmp_path):
+    metadata["text_config"]["layer_types"] *= 16
+    config = common.load_config(_path(component, "fp16", 8))
+    (tmp_path / "config.json").write_text(json.dumps(metadata))
+    common.validate_checkpoint_profile(config, str(tmp_path))
+    (metadata if owner is None else metadata[owner])[key] = value
+    (tmp_path / "config.json").write_text(json.dumps(metadata))
+    with pytest.raises(common.ConfigError, match="rejects checkpoint"):
+        common.validate_checkpoint_profile(config, str(tmp_path))

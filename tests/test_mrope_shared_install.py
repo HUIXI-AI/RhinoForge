@@ -51,12 +51,14 @@ def test_shared_install_preserves_transaction_and_explicit_certificate_authority
         assert kwargs["chunk_envelope_for"] is envelope
         assert kwargs["deepstack_lang_layers"] == [0, 1, 2]
         assert kwargs["cos_sin"] == ("cos", "sin")
+        assert kwargs["logical_vocab_size"] == 151936
         if interrupt:
             raise KeyboardInterrupt("publication interrupted")
         return 17
     namespace["_install_causal_decoder_forward"] = install
     call = lambda: namespace["install_mrope_text_decoder_for_rpu"](
         model, arch="bound-arch", chunk_envelope_for=envelope,
+        logical_vocab_size=151936,
         vision_config=SimpleNamespace(deepstack_visual_indexes=[5, 11, 17]))
     if interrupt:
         with pytest.raises(KeyboardInterrupt):

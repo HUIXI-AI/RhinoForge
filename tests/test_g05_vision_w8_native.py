@@ -36,12 +36,12 @@ int main(){
  m.has_step0_=m.has_rope_=m.has_merger_=true;m.plan(layout);
  auto hash=m.subclass_layout_hash();auto identity=m.kvinsert_cost_weight_identity();
  const auto&r=m.context.find_physical_route(FmbRouteFamily::LINEAR,G05_VISION_QKV_W8_LINEAR_SITE,0);
- assert(r.arguments==std::vector<int64_t>({1,256,128,1024,8,m.linear_acc32_?32:16,m.linear_acc32_?400:512,48,128,3,9,2048,256,3,256,1,8,3}));
+ assert(r.arguments==std::vector<int64_t>({2,256,128,1024,8,m.linear_acc32_?32:16,m.linear_acc32_?400:512,48,128,3,9,2048,256,3,256,1,8,3,1,2,32,40,20,34,42,4,36,44,6,38,46}));
  {auto other=m;other.linear_acc32_=!m.linear_acc32_;other.prepare_g05_owner_ln();assert(other.g05_qkv_linear_available_&&other.subclass_layout_hash()!=hash&&other.kvinsert_cost_weight_identity()!=identity);rejects_before_emission([&]{other.emit_kv_first_body(0,{});});}
  auto meta=at::Tensor::metadata_reads;auto queries=cache.queries;
  for(int layer=0;layer<24;++layer){emitted.clear();m.emit_kv_first_body(layer,{});m.compute(layer,{});assert(emitted==std::vector<std::string>({"ln",triple,"rope","rope"}));}
  assert(meta==at::Tensor::metadata_reads&&queries==cache.queries);
- for(int i=0;i<18;++i){auto x=m;for(auto&route:x.context.routes)if(route.site==G05_VISION_QKV_W8_LINEAR_SITE)++route.arguments[i];rejects_before_emission([&]{x.emit_kv_first_body(0,{});});}
+ for(size_t i=0;i<r.arguments.size();++i){auto x=m;for(auto&route:x.context.routes)if(route.site==G05_VISION_QKV_W8_LINEAR_SITE)++route.arguments[i];rejects_before_emission([&]{x.emit_kv_first_body(0,{});});}
  {auto x=m;x.context.complete=false;rejects_before_emission([&]{x.emit_kv_first_body(0,{});});}
  {auto x=m;x.context.routes.erase(x.context.routes.begin());rejects_before_emission([&]{x.emit_kv_first_body(0,{});});}
  {auto x=m;x.alias=false;rejects_before_emission([&]{x.emit_kv_first_body(0,{});});}

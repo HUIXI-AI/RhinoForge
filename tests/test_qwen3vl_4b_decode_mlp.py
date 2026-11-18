@@ -1,5 +1,6 @@
 """Execute exact decode MLP admission, descriptor and emitter with real consumer."""
 from pathlib import Path
+from pi_wall_host_catalog import with_actual_linear_contracts
 import hashlib
 import json
 import re
@@ -32,7 +33,9 @@ def test_decode_mlp_manifest_and_dispatch(tmp_path, size, fused):
     constants = "\n".join(re.findall(r"inline constexpr int64_t (?:QWEN3VL_4B_(?:PREFILL|DECODE)_\w+|WALL_BASE_(?:FP16_)?PREFILL_\w+)_SITE\s*=\s*[^;]+;",source))
     constants += "\n" + re.search(r"inline constexpr int64_t LINGBOT2_PREFILL_GATEUP_SHARED_A_SITE\s*=\s*[^;]+;",source).group(0)
     predicates = "\n".join(definition(source,marker) for marker in
-                           ("bool qwen3vl_decode_gemv(","bool qwen3vl_decode_mlp(",
+                           ("static std::vector<int64_t> qwen3vl_prefill_gateup_contract_arguments(int64_t rows)",
+                            "static std::vector<int64_t> qwen3vl_decode_gateup_contract_arguments()",
+                            "bool qwen3vl_decode_gemv(","bool qwen3vl_decode_mlp(",
                             "CausalDecoderLinearRoute decoder_projection_route("))
     start = source.index("FmbPhysicalExecutionManifest physical_manifest_for_candidate(")
     append = source.index("        auto append =",start)
@@ -250,7 +253,9 @@ int main(){
         "IS_4B":"false" if size == "2b" else "true"}
     for key,value in replacements.items():program=program.replace(f"__{key}__",value)
     cpp,exe = tmp_path/"decode_mlp.cpp",tmp_path/"decode_mlp"
-    cpp.write_text(program)
+    cpp.write_text(with_actual_linear_contracts(program))
     subprocess.run([compiler,"-std=c++17","-Wall","-Wextra","-Werror","-Wno-misleading-indentation",
                     str(cpp),"-o",str(exe)],check=True,capture_output=True,text=True)
     subprocess.run([str(exe)],check=True,capture_output=True,text=True)
+
+

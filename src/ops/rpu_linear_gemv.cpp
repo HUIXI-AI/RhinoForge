@@ -3,6 +3,8 @@
 #include "rhino_launch_queue.h"
 #include "rpu_ops.h"
 #include "rpu_spm_allocator.h"
+#include "rpu_linear_tiling.h"
+#include "rpu_qwen3vl_linear_contracts.h"
 
 #include <algorithm>
 #include <array>
@@ -65,7 +67,7 @@ void rpu_launch_qwen3vl_4b_decode_o_ring_norm_spm_kernel(
   constexpr int64_t kK = 4096;
   constexpr uint32_t kLocalK = kK / 8;
   constexpr uint64_t kWeightBytes = kH * kK;
-  constexpr uint64_t kScaleBytes = (kH + 256) * sizeof(c10::Half);
+  constexpr uint64_t kScaleBytes = kH * sizeof(c10::Half);
   constexpr uint64_t kRowBytes = kH * sizeof(c10::Half);
   constexpr uint32_t kCoreStride = 0x1000000;
   TORCH_CHECK(eps == 1e-6,
@@ -87,8 +89,7 @@ void rpu_launch_qwen3vl_4b_decode_o_ring_norm_spm_kernel(
                     static_cast<uint64_t>(offset) <= storage.nbytes() / element_bytes &&
                     required_bytes <= storage.nbytes() -
                         static_cast<uint64_t>(offset) * element_bytes,
-                "Qwen3-VL 4B decode O/ring/Norm DDR backing is too short; "
-                "scale requires 256 readable padding halves");
+                "Qwen3-VL 4B decode O/ring/Norm DDR backing is too short");
   };
   check_tensor(weight, false);
   check_tensor(scale, true);
@@ -130,17 +131,17 @@ void rpu_launch_qwen3vl_4b_decode_o_ring_norm_spm_kernel(
                   (weight_address + kWeightBytes <= scale_address ||
                    scale_address + kScaleBytes <= weight_address),
               "Qwen3-VL 4B decode O/ring/Norm requires disjoint aligned "
-              "40-bit weight and padded scale DDR ranges");
+              "40-bit weight and scale DDR ranges");
   auto& graph = RpuKernelGraph::active();
   auto register_writer = graph.stage_kernel_ddr_registers(
       id, std::vector<GraphDdrRegisterOperandSpec>{
           {{GraphDdrRegisterRole::Int8ModelWeight, GraphDdrRegisterAccess::Read,
-            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 6, 7}, weight},
+            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3}, weight},
           {{GraphDdrRegisterRole::PerChannelScale, GraphDdrRegisterAccess::Read,
-            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 8, 9}, scale}});
+            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 20, 21}, scale}});
   Kernel_t* kernel = GET_KERNEL(id);
   TORCH_CHECK(kernel != nullptr,
-              "qwen3vl_o_ring_norm_m1_h2560_w8 missing from main ref; "
+              "qwen3vl_o_ring_norm_w8_m1_h2560_v2 missing from expansion ref; "
               "the cold COMPLETE owner must select an available route");
   for (const at::Tensor* tensor : {&weight, &scale}) {
     rpu_ddr_flush(tensor->data_ptr());
@@ -156,17 +157,17 @@ void rpu_launch_qwen3vl_4b_decode_o_ring_norm_spm_kernel(
     reg(index, static_cast<uint16_t>(value));
     reg(index + 1, static_cast<uint16_t>(value >> 16));
   };
-  reg(0, kLocalK); reg(1, kH); reg(2, 0);
-  pair(4, input_spm_addr >> 8);
-  pair(10, partial_spm_addr >> 8);
-  pair(12, kCoreStride >> 8); pair(14, kCoreStride >> 8);
-  pair(16, 8 * 320 * kLocalK / 256);
-  reg(18, 320); reg(19, 320); reg(21, 8);
-  reg(22, 1); pair(24, 31 * 256 * 8);
-  pair(26, residual_spm_addr - base); reg(28, 0);
-  reg(29, c10::Half(1.0f / kH).x); reg(30, kRowBytes);
-  pair(32, raw_spm_addr); pair(34, residual_spm_addr);
-  pair(36, gamma_spm_addr); reg(38, c10::Half(static_cast<float>(eps)).x);
+  rpu_pl_tiling::set_parallel_linear_regs(*kernel,
+      rpu_pl_tiling::ParallelLinearRegisterArgs{
+          input_spm_addr, 0, partial_spm_addr, 0, 1, kH, kLocalK,
+          0, 8, kLocalK * 2, kRowBytes, 0, 0, 1});
+  // Four current N80 subtiles per physical block complete before the ring.
+  // Ring and BASE norm retain their original independent rounding order.
+  reg(32, 8); reg(33, 1); pair(34, 31 * 256 * 8);
+  pair(36, residual_spm_addr - base); reg(38, 0);
+  reg(40, kH); reg(41, c10::Half(1.0f / kH).x); reg(42, kRowBytes);
+  pair(44, raw_spm_addr); pair(46, residual_spm_addr);
+  pair(48, gamma_spm_addr); reg(50, c10::Half(static_cast<float>(eps)).x);
   reg(64, 8); reg(65, 1); reg(66, 1);
   for (int core = 0; core < 8; ++core) {
     const std::array<uint32_t, 4> values{
@@ -185,7 +186,7 @@ void rpu_launch_qwen3vl_4b_decode_o_ring_norm_spm_kernel(
   register_writer.write(*kernel);
   auto* queue = GET_QUEUE(8);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel, {8, 1, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
+  queue->enqueu_kernel(*kernel, rpu_qwen3vl_linear::grid(id), {0, 1, 2, 3, 4, 5, 6, 7});
 }
 
 void rpu_launch_qwen3vl_4b_decode_gate_up_swiglu_w8a16_spm_kernel(
@@ -207,9 +208,9 @@ void rpu_launch_qwen3vl_4b_decode_gate_up_swiglu_w8a16_spm_kernel(
                     tensor.size(0) == kN && (scale || tensor.size(1) == kK),
                 "Qwen3-VL 4B decode fused Gate/Up requires contiguous device "
                 "int8 [9728,2560] weights and fp16 [9728] scales");
-    // The unchanged payload reads 256 scales for the final 96-channel warp.
-    // Check the underlying storage, not merely the logical view size.
-    const uint64_t required_bytes = scale ? (kN + 160) * 2 : kN * kK;
+    // Current guarded N tails read exactly the logical scale extent.
+    // Validate the storage owner as well as the view geometry.
+    const uint64_t required_bytes = scale ? kN * 2 : kN * kK;
     const uint64_t element_bytes = scale ? 2 : 1;
     const int64_t offset = tensor.storage_offset();
     const auto& storage = tensor.storage();
@@ -217,8 +218,7 @@ void rpu_launch_qwen3vl_4b_decode_gate_up_swiglu_w8a16_spm_kernel(
                     static_cast<uint64_t>(offset) <= storage.nbytes() / element_bytes &&
                     required_bytes <= storage.nbytes() -
                         static_cast<uint64_t>(offset) * element_bytes,
-                "Qwen3-VL 4B decode fused Gate/Up DDR backing is too short; "
-                "each scale needs 160 readable padding halves");
+                "Qwen3-VL 4B decode fused Gate/Up DDR backing is too short");
   };
   check_tensor(gate_weight, false);
   check_tensor(up_weight, false);
@@ -243,46 +243,35 @@ void rpu_launch_qwen3vl_4b_decode_gate_up_swiglu_w8a16_spm_kernel(
   constexpr KernelId id = KernelId::QWEN3VL_GATEUP_SWIGLU_GEMV;
   Kernel_t* kernel = GET_KERNEL(id);
   TORCH_CHECK(kernel != nullptr,
-              "qwen3vl_gateup_swiglu_gemv missing from main ref; "
+              "qwen3vl_gateup_swiglu_w8_m1_v2 missing from expansion ref; "
               "the cold COMPLETE owner must select an available route");
   auto register_writer = RpuKernelGraph::active().stage_kernel_ddr_registers(
       id, std::vector<GraphDdrRegisterOperandSpec>{
           {{GraphDdrRegisterRole::Int8ModelWeight, GraphDdrRegisterAccess::Read,
-            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 6, 7}, gate_weight},
+            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3}, gate_weight},
           {{GraphDdrRegisterRole::PerChannelScale, GraphDdrRegisterAccess::Read,
-            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 8, 9}, gate_scale},
+            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 20, 21}, gate_scale},
           {{GraphDdrRegisterRole::Int8ModelWeight, GraphDdrRegisterAccess::Read,
-            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 24, 25}, up_weight},
+            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33}, up_weight},
           {{GraphDdrRegisterRole::PerChannelScale, GraphDdrRegisterAccess::Read,
-            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 26, 27}, up_scale}});
+            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 34, 35}, up_scale}});
   for (const at::Tensor* tensor : {&gate_weight, &up_weight, &gate_scale, &up_scale}) {
     rpu_ddr_flush(tensor->data_ptr());
     RpuKernelGraph::active().keep_alive(*tensor);
   }
   kernel->reset_regs();
-  kernel->set_regs(0, static_cast<uint16_t>(kK));
-  kernel->set_regs(1, static_cast<uint16_t>(kLocalN));
-  kernel->set_regs(2, static_cast<uint16_t>(1));
-  kernel->set_regs(4, static_cast<uint16_t>(input_spm_addr >> 8));
-  kernel->set_regs(5, static_cast<uint16_t>(input_spm_addr >> 24));
-  kernel->set_regs(10, static_cast<uint16_t>(output_spm_addr >> 8));
-  kernel->set_regs(11, static_cast<uint16_t>(output_spm_addr >> 24));
-  kernel->set_regs(12, static_cast<uint16_t>(0));
-  kernel->set_regs(13, static_cast<uint16_t>(1));
-  kernel->set_regs(14, static_cast<uint16_t>(0));
-  kernel->set_regs(15, static_cast<uint16_t>(1));
-  kernel->set_regs(16, static_cast<uint16_t>(12800));
-  kernel->set_regs(17, static_cast<uint16_t>(0));
-  kernel->set_regs(18, static_cast<uint16_t>(160));
-  kernel->set_regs(19, static_cast<uint16_t>(96));
-  kernel->set_regs(21, static_cast<uint16_t>(8));
-  kernel->set_regs(64, static_cast<uint16_t>(8));
-  kernel->set_regs(65, static_cast<uint16_t>(1));
-  kernel->set_regs(66, static_cast<uint16_t>(1));
+  rpu_pl_tiling::set_parallel_linear_regs(*kernel,
+      rpu_pl_tiling::ParallelLinearRegisterArgs{
+          input_spm_addr, 0, output_spm_addr, 0, 1, kLocalN, kK,
+          0, 8, kK * 2, kLocalN * 2, 0, 1, 1});
+  const auto contract = rpu_qwen3vl_linear::contract(id);
+  kernel->set_regs(64, contract.gx);
+  kernel->set_regs(65, contract.gy);
+  kernel->set_regs(66, contract.gz);
   register_writer.write(*kernel);
   auto* queue = GET_QUEUE(8);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel, {8, 1, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
+  queue->enqueu_kernel(*kernel, rpu_qwen3vl_linear::grid(id), {0, 1, 2, 3, 4, 5, 6, 7});
 }
 
 // Direct-address SPM GEMV launcher for the shared Linear M=1 opt-in. Dispatch

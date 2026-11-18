@@ -93,7 +93,7 @@ Omitting `model.num_cores` selects eight. For admitted reduced-core dense Qwen3,
 Keep model switches scoped to that model's configuration or launch process. Explicit environment values override adapter `setdefault` values; the example runner applies its selected configuration before adapter import. Logging, allocator and Launch initialization settings must be present before importing the backend. Use the model template's opt-ins and defaults instead of exporting optimization flags globally.
 
 Prepare Qwen3.5-35B-A3B mixed-E4M3 weights with the
-[official-source download and CPU conversion commands](../examples/configs/qwen3_5/README.md#cmd-moe-mixed).
+[official-source download and CPU conversion commands](../examples/configs/WEIGHTS.md#cmd-qwen35-moe).
 Text/Vision, core-count and ACC variants share the same converted checkpoint;
 these runtime settings do not select a different conversion recipe.
 
@@ -334,7 +334,7 @@ model construction and first capture.
 |---|---|---|---|
 | `RPU_PI05_ADARMS_GRAPH` | **PB(true)** | AdaRMS construction / **MODEL** | Enables the AdaRMS GraphCache path. `0` uses the eager fallback and changes timing/lifecycle. |
 | `RPU_PI05_ADARMS_W8A16_GRAPH` | **PB(true)** | Quantized AdaRMS construction / **MODEL** | Enables GraphCache for the W8A16 AdaRMS path. It must match quantized weights. |
-| `RPU_PI05_DENOISE_GRAPH` | **PB(true)** | Action construction / **MODEL** | Captures denoise steps. In a v1.2.0 RhinoForge build without the current source patch, changing logical prefixes repeatedly BUILD Graphs until arenas are exhausted, while `0` loses the physical descriptor in the host loop and corrupts steady-state numerics. Neither is a production workaround before patching; see the [known issues and fixes](pitfalls.md#pi05-v120-denoise-known-issues-2026-10-22). |
+| `RPU_PI05_DENOISE_GRAPH` | **PB(true)** | Action construction / **MODEL** | Captures denoise steps. In a v1.2.0 RhinoForge build without the current source patch, changing logical prefixes repeatedly BUILD Graphs until arenas are exhausted, while `0` loses the physical descriptor in the host loop and corrupts steady-state numerics. Neither is a production workaround before patching; see the [known issues and fixes](pitfalls.md). |
 | `RPU_PI05_DENOISE_UNROLL` | Raw **PB(false)**; Pi adapter supplies `1` | Action construction / **MODEL** | Records the fixed denoise loop in one Graph and uses FP16 Euler state. It changes numerics versus the host loop. |
 | `RPU_PI05_EMBED_PREFIX_PATCH` | **PB(true)** | Adapter class-patch installation / **MODEL** | Enables the supported prefix-embedding patch. Change it only in a fresh process because class hooks are process state. |
 | `RPU_PI05_EULER_FP16` | **PB(false)** | Each action call / **CALL**; rebuild prepared Graph profile | Uses FP16 rather than host-FP32 Euler state. It directly changes action numerics. |

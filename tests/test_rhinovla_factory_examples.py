@@ -213,8 +213,7 @@ def test_rhinovla_v3_templates_keep_cold_optimizations_without_widening_precisio
     common = importlib.import_module("examples.common.config")
     config = common.load_config(root / "examples/configs/rhinovla/v3" / filename)
     gates = config["example"]["opt_in"]
-    assert gates["RPU_RHINOVLA_VISION_BATCH_VIEWS"] == "0"
-    for name in ("VISION_PREP_CACHE", "DENOISE_STATIC_CONTEXT_CACHE",
+    for name in ("VISION_BATCH_VIEWS", "VISION_PREP_CACHE", "DENOISE_STATIC_CONTEXT_CACHE",
                  "PRECOMPUTE_ADARMS", "GATED_NO_SUB", "FUSED_SILU_MUL", "EXPERT_FUSIONS",
                  "ADARMS_RESIDENT", "ALIGNED_KV"):
         assert gates["RPU_RHINOVLA_" + name] == "1"

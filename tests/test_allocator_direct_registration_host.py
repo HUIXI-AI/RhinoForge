@@ -81,6 +81,10 @@ void rpu_unregister_ddr_dma_allocation(void* ptr) {
   ++unregistrations;
 }
 
+// Async replay end (graph/graph_async_end.h): no Graph submission is pending in
+// this harness, so no free is deferred.
+bool rpu_graph_async_end_defer_free(void*, bool) noexcept { return false; }
+
 TRANSACTION
 DIRECT_FREE
 

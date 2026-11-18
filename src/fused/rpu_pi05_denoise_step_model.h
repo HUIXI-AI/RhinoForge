@@ -19,10 +19,16 @@
 #include "pi05_execution_topology.h"
 #include "rpu_kernel_cache.h"
 #include "rpu_kernel_decls.h"
+#include "rpu_pi_kv_linear_contract.h"
 
 #include <ATen/ATen.h>
 #include <c10/util/Optional.h>
+#include <array>
 #include <cstdint>
+#include <map>
+#include <optional>
+#include <set>
+#include <utility>
 #include <vector>
 
 namespace v3 {
@@ -47,6 +53,10 @@ public:
         // D in order; direct-cache stores core c's rotate-half pair
         // {db=c,db=c+8}.  Both remain independent 32-channel/core owners.
         at::Tensor k_kv1_w, v_kv1_w, k_kv1_ws, v_kv1_ws;
+        // Optional tile-contiguous copies of q_ws/o_ws/down_ws for the
+        // NVFP4 ACC16 double-buffered Linear and of gate_ws/up_ws for the
+        // double-buffered GeGLU (rpu_pack_pi05_nvfp4_tile_scale).
+        at::Tensor q_wts, o_wts, down_wts, gate_wts, up_wts;
     };
 
     explicit Pi05DenoiseStepModel(bool linear_acc32 = false);
@@ -60,6 +70,18 @@ public:
         set_execution_core_count(static_cast<int>(cores));
     }
 
+    // Distinct checkpoint KV heads behind the cache's num_kv_heads() heads, which
+    // the adapter replicates (repeat_interleave) to one per attention core.
+    // Split-KV attention runs a group's query heads against one core's copy, so
+    // it requires a single source head; 0 (never set) keeps it off.
+    void set_kv_source_heads(int64_t heads) {
+        TORCH_CHECK(heads >= 1 && heads <= 8,
+                    "Pi0.5 denoise KV source heads must be in [1, 8]");
+        TORCH_CHECK(layer_weights_.empty(),
+                    "Pi0.5 denoise KV source heads must precede weight installation");
+        kv_source_heads_ = heads;
+    }
+
     int condition_tp() const { return num_cores() == 8 ? 8 : 4; }
 
     std::vector<int64_t> execution_topology() const {
@@ -71,7 +93,7 @@ public:
 
     std::vector<int64_t> core_profile_arguments() const {
         auto args = execution_topology();
-        args.push_back(reduced_w8a16_ ? 1 : 0);
+        args.push_back(reduced_nvfp4_ ? 2 : reduced_w8a16_ ? 1 : 0);
         args.push_back(final_norm_dense_ws_.defined() &&
                        final_norm_dense_ws_.numel() != 0 ? 1 : 0);
         return args;
@@ -209,6 +231,9 @@ protected:
         int64_t hash = pi05_w4_geglu_n64_opt_in_ ? detail::layout_mix(w4_geglu, 11) : w4_geglu;
         if (nvfp4_.enabled()) hash = detail::layout_mix(hash, 12);
         if (pi05_nvfp4_geglu_m50_opt_in_) hash = detail::layout_mix(hash, 14);
+        if (split_kv_share_admitted()) hash = detail::layout_mix(hash, 15);
+        if (nvfp4_spm_scale_admitted()) hash = detail::layout_mix(hash, 16);
+        if (q_spm_weight_admitted()) hash = detail::layout_mix(hash, 17);
         if (num_cores() != 8)
             for (const auto value : core_profile_arguments()) hash = detail::layout_mix(hash, value);
         return linear_acc32_ ? detail::layout_mix(hash, 32) : hash;
@@ -235,12 +260,68 @@ private:
     // exactly one place. Populates prepared_mask_ / prepared_mask_seq_*_.
     void prepare_sdpa_mask_cached(const at::Tensor& attention_mask_4d,
                                   int64_t prefix_len);
+    // Split-KV attention for (seq_q, kv_seq_len) when its payloads are loaded
+    // and the shape is admitted; launch also requires a layout that declared it.
+    std::optional<Pi05SplitKvPlan> split_kv_plan(int64_t seq_q,
+                                                 int64_t kv_seq_len) const;
+    // Every Pi05 buffer of the layout except the split-KV K/V share and the
+    // NVFP4 scale slab. `resident_table` sizes the AdaRMS table for all ten
+    // bodies whatever use_pi05_adarms_body_stream() says, for the one question
+    // that decision asks itself.
+    std::vector<BufferDecl> base_buffer_declarations(const LayoutContext& ctx,
+                                                     bool resident_table = false) const;
+    std::vector<BufferDecl> capacity_buffer_declarations(int64_t max_kv_seq_len,
+                                                         int64_t chunk,
+                                                         bool resident_table = false) const;
+    // What the planning budget leaves for the Temps next to these declarations.
+    static int64_t spm_room_above(const std::vector<BufferDecl>& decls);
+    // In a loop-mode profile with the SPM-scale payloads loaded: the layers
+    // [0, N) that read their FP8 scales from the slab in each core's SPM, for
+    // chunks of at most `chunk` rows at max_kv_seq_len. Declaration and launch
+    // both ask this; 0 otherwise.
+    int64_t nvfp4_spm_scale_layers(int64_t max_kv_seq_len, int64_t chunk) const;
+    bool nvfp4_spm_scale_admitted() const;
+    // This layer's slab run at `offset`, or 0 when its scales stay in DDR.
+    uint32_t nvfp4_spm_scale_addr(int layer, int64_t offset) const;
+    void emit_pi05_nvfp4_spm_scale_fill(int64_t layers);
+    // With the SPM-resident-Q pair owner loaded: the N first layers of the
+    // scale slab whose Q weights the first body copies into each core's SPM,
+    // sized to what the slab and the split-KV share leave. Declaration and
+    // launch both ask this; 0 otherwise.
+    int64_t q_spm_weight_layers(int64_t max_kv_seq_len, int64_t chunk) const;
+    // The same N from the slab's layers and the share already planned.
+    int64_t q_spm_weight_layers(int64_t max_kv_seq_len, int64_t chunk, int64_t scale_layers,
+                                std::pair<int64_t, int64_t> share) const;
+    bool q_spm_weight_admitted() const;
+    // This layer's per-core Q weight run, or 0 when the weight stays in DDR.
+    uint32_t q_spm_weight_addr(int layer) const;
+    void emit_pi05_q_spm_weight_fill(int64_t layers);
+    // The layout carries "rope_rows" with its split-KV buffers.
+    bool use_pi05_spm_rope_rows_layout() const;
+    // For a forward of one split-KV chunk: the first logical position p whose
+    // RoPE rows [p, p + rows) the first body stages in SPM, which every query
+    // RoPE then reads; -1 when the tables stay in DDR. Fill and launch both
+    // ask this.
+    int64_t pi05_spm_rope_rows_start() const;
+    void emit_pi05_spm_rope_rows_fill(int64_t start);
+    // In a loop-mode profile with the SPM-share attention loaded: the layers
+    // [0, first) whose split-KV attention keeps its K/V share in SPM across the
+    // bodies, and second = one layer's share bytes, for chunks of at most
+    // `chunk` rows at max_kv_seq_len. Declaration and launch both ask this;
+    // {0, 0} otherwise.
+    std::pair<int64_t, int64_t> split_kv_share_layers(int64_t max_kv_seq_len,
+                                                      int64_t chunk,
+                                                      bool resident_table = false) const;
+    // Without the NVFP4 scale slab: whether the resident ten-body AdaRMS table
+    // keeps the split-KV share at the planned geometry from holding every layer.
+    bool adarms_table_limits_split_kv_share() const;
     void restore_planned_route_profile(
         at::IntArrayRef descriptor, bool loop_mode, int64_t num_steps,
         int64_t prefix_len, int64_t cache_capacity);
     void validate_planned_route_profile(
         bool loop_mode, int64_t num_steps) const;
     bool use_spm_adarms_table() const;
+    bool split_kv_share_admitted() const;
     bool use_pi05_gateup_resident(int64_t rows) const;
     bool use_pi05_adarms_body_stream() const;
     bool use_pi05_gateup_bundle(int64_t rows) const;
@@ -261,6 +342,12 @@ private:
     uint64_t resident_gate_src_base_ = 0, resident_up_src_base_ = 0;
     at::Tensor resident_gateup_bundle_;
     uint64_t resident_gateup_bundle_src_base_ = 0;
+    // Row c holds core c's FP8 scales of every layer
+    // (rpu_pack_pi05_nvfp4_spm_scale); undefined without the SPM-scale payloads.
+    at::Tensor nvfp4_spm_scale_;
+    // Row c holds core c's 512-byte planes of every layer's Q weight, in unit
+    // order; undefined without the slab.
+    at::Tensor q_spm_weight_;
     bool use_pi05_ring_xor3(int64_t rows) const;
     const bool pi05_ring_xor3_opt_in_;
     bool use_pi05_xor3_gated_attn(int64_t rows) const;
@@ -276,18 +363,37 @@ private:
         const FmbPrefillStageCandidate* candidate) const;
     bool use_pi05_kv1_direct_cache(int64_t rows) const;
     bool use_pi05_kv1_pair_owner(int64_t rows) const;
+    // Installed weights and the cold REF: the W8 pair owner runs the layer's
+    // SPM-scale NVFP4 Q projection in its launch wherever the layer has a slab.
+    bool pi05_q_in_kv1_pair_owner() const;
+    // The pair owner's route arguments, with the fused payload when that holds.
+    std::vector<int64_t> pi05_kv1_pair_owner_route_arguments() const;
     bool use_pi05_geglu_m50(int64_t rows) const;
     std::vector<int64_t> pi05_geglu_m50_arguments() const;
     void validate_pi05_geglu_m50_manifest(
         const FmbPhysicalExecutionManifest& manifest) const;
     void validate_pi05_geglu_m50_policy(const FmbPrefillStageCandidate* candidate) const;
     void emit_pi05_geglu_m50_mlp(
-        const LayerWeights& weights, const ChunkInfo& chunk, uint32_t mlp_gate);
-    void emit_pi05_w4_xor3_mlp(
         const LayerWeights& weights, const ChunkInfo& chunk, uint32_t mlp_gate, int layer_idx);
+    // `norm`, when pi05_adarms_in_geglu holds, folds the MLP-side norm into the GeGLU.
+    void emit_pi05_w4_xor3_mlp(
+        const LayerWeights& weights, const ChunkInfo& chunk, uint32_t mlp_gate, int layer_idx,
+        const Pi05AdaRmsNormOperands* norm = nullptr);
     void emit_pi05_down_and_mlp_residual(
-        const LayerWeights& weights, const ChunkInfo& chunk, uint32_t mlp_gate, int layer_idx = 0);
+        const LayerWeights& weights, const ChunkInfo& chunk, uint32_t mlp_gate, int layer_idx);
     bool use_pi05_xor3_gated_mlp(int64_t rows) const;
+    // Both continuations over whole-row shards, the MLP-side AdaRMS norm fused
+    // into the attention one. The one decision for routes and dispatch.
+    bool use_pi05_xor3_gated_adarms_chain(int64_t rows) const;
+    // The MLP-side AdaRMS norm in the layer's SPM-scale GeGLU launch (9..16 rows).
+    bool pi05_adarms_in_geglu(int64_t rows, int layer) const;
+    // Under that chain, a layer whose output stays in SPM also applies the
+    // next layer's attention-side AdaRMS in its MLP continuation; that layer,
+    // entered from SPM, skips the launch. Both read the planner's IO context.
+    bool pi05_adarms_to_next_layer(int64_t rows);
+    bool pi05_adarms_from_previous_layer(int64_t rows);
+    // The normalized rows the MLP Gate/Up read: input_norm under that chain.
+    uint32_t pi05_mlp_input(int64_t rows);
     std::vector<int64_t> pi05_xor3_gated_mlp_arguments() const;
     void validate_pi05_xor3_gated_mlp_manifest(
         const FmbPhysicalExecutionManifest& manifest) const;
@@ -345,7 +451,7 @@ private:
     void emit_adarms_norm_shift(uint32_t input_spm, uint32_t output_spm,
                                uint32_t scale_spm, uint32_t shift_spm,
                                int64_t rows, int64_t site_id,
-                               int64_t invocation = 0);
+                               int64_t invocation = 0, bool launch = true);
 
     // Return the parameters' absolute SPM address, either a read-only table
     // row or the requested scratch output after DMA/GEMV.
@@ -357,6 +463,13 @@ private:
                             uint32_t partial_spm_addr,
                             const at::Tensor& dense_scale,
                             int64_t table_row);
+    // The SPM AdaRMS table row's address ([scale | shift | gate]) in this body.
+    uint32_t pi05_adarms_table_row(int64_t table_row);
+    // Issues `body`'s table rows on channels 1..7 into step_boundary_dma_.
+    void emit_pi05_adarms_body_dma(int64_t body);
+    // A body the next one follows: the last layer's DDR output, which the
+    // Graph caller discards, also goes on channels 1..7.
+    bool pi05_step_boundary_output(int layer_idx, const ChunkInfo& chunk) const;
 
     // --------- Weights (DDR, set_weights owns lifetime) ----------
     std::vector<int64_t> kvinsert_cost_weight_identity() const override {
@@ -389,25 +502,31 @@ private:
                 // Pair-owner schema: cold full-owner proof, exact profile,
                 // pair map, zero compact bytes, both kernel IDs, register ABI
                 // and producer/consumer grids.
+                // H10 (M10/P16) binds its own consumer; H50 bytes are unchanged.
+                const bool h10 = chunk_size_ == 10;
+                const auto kv_contract = rpu_pi_kv_linear::pair(false);
                 identity.insert(identity.end(), {
-                    3, pi05_kv1_pair_owner_full_owners_ ? 1 : 0,
-                    planned_num_steps_, 800, 50, 64, 850, 1024, 4096, 18, 8, 8,
+                    5, pi05_kv1_pair_owner_full_owners_ ? 1 : 0,
+                    planned_num_steps_, 800, chunk_size_, h10 ? 16 : 64, 800 + chunk_size_,
+                    1024, 4096, 18, 8, 8,
                     256, 32, 16, 1024, 2048,
                     0, 0, 8, 2048, 1024, 2048,
-                    static_cast<int64_t>(
-                        KernelId::PI05_DENOISE_KV1_PAIR_OWNER_W8A16_M50N32X2K1024),
-                    static_cast<int64_t>(
-                        KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_M50D256P64),
-                    68, 2, 1, 1, 0, 68, 4, 1, 1, 0,
-                    0});  // logical RoPE is a replay-mutable register
+                    static_cast<int64_t>(pi_wall_kernel_id(kv_contract.ordinal)),
+                    static_cast<int64_t>(h10
+                        ? KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_M10D256P16
+                        : KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_M50D256P64),
+                    68, kv_contract.grid_x, kv_contract.grid_y, 1, 0, 68, h10 ? 1 : 4, 1, 1, 0,
+                    rope_position_ >= 0 ? rope_position_ : planned_prefix_len_,
+                    kv_contract.tile.m_tile, kv_contract.tile.n_tile, kv_contract.tile.k_tile});
             } else {
                 identity[2] = 10;
                 // Direct-cache schema, route mode, exact profile, pair map,
                 // fixed producer/direct consumer IDs, register ABI and grid.
+                const auto kv_tile = rpu_pi_kv_linear::stripe_tile();
                 identity.insert(identity.end(), {
-                    2, pi05_kv1_direct_pair_owners_ ? 1 : 0,
+                    3, pi05_kv1_direct_pair_owners_ ? 1 : 0,
                     planned_num_steps_, 800, 50, 64, 850, 1024, 4096, 18, 8, 8,
-                    256, 32, 16, 1024, 2048, 592, 32, 128, 0, 8, 4, 1,
+                    256, 32, 16, 1024, 2048, kv_tile.m_tile, kv_tile.n_tile, kv_tile.k_tile, 0, 8, 4, 1,
                     0x4b56314c494e4541LL,  // "KV1LINEA" fixed producer identity
                     0x4b56314449524543LL,  // "KV1DIREC" direct-cache identity
                     0});  // logical RoPE is a replay-mutable register
@@ -496,12 +615,18 @@ private:
 
     int64_t logical_intermediate_size_ = 0;
     bool reduced_w8a16_ = false;
+    bool reduced_nvfp4_ = false;
     Pi05Nvfp4Tables nvfp4_;
     std::vector<LayerWeights> layer_weights_;
     at::Tensor final_norm_dense_w_, final_norm_dense_b_;
     at::Tensor final_norm_dense_ws_;  // W8A16 scale (empty ⇒ fp16)
     at::Tensor adarms_table_;  // [steps, 2 * layers + 1, 3H], loop only
     uint64_t adarms_table_src_base_ = 0;
+    // DMAs left running across a step boundary of a body-streamed table: the
+    // last layer's output copy and the next body's table rows. The next
+    // body's pre-layers joins them after the action-embedding chain.
+    DeferredDmaChannels step_boundary_dma_;
+    int64_t adarms_prefetch_body_ = -1;  // the last body whose rows were issued
     at::Tensor action_in_proj_w_,  action_in_proj_b_;
     at::Tensor action_out_proj_w_, action_out_proj_b_;
     at::Tensor cos_, sin_;
@@ -525,6 +650,10 @@ private:
     int64_t planned_kv_physical_rows_ = 0;
     int64_t planned_prefix_len_ = 0;
     int64_t planned_k_rope_cache_capacity_ = 0;
+    // adarms_table_limits_split_kv_share() per planned geometry: declare_buffers
+    // asks it on every forward, replays included.
+    mutable std::array<int64_t, 5> adarms_table_share_key_{-1, -1, -1, -1, -1};
+    mutable bool adarms_table_limits_share_ = false;
     double eps_ = 1e-6;
 
     // --------- Per-call inputs (set in step_forward) -------------
@@ -573,6 +702,14 @@ private:
     int64_t prepared_mask_seq_q_ = 0;
     int64_t prepared_mask_seq_k_ = 0;
     bool    prepared_mask_is_causal_ = false;
+    // Split-KV mask slices per (seq_q, kv_seq_len), [8, rows_pad, 16 * width]:
+    // stable device slots (Graph DMA bakes their address), refreshed with the
+    // prepared mask and kept until the model goes away.
+    std::map<std::pair<int64_t, int64_t>, at::Tensor> split_kv_mask_slots_;
+    // (chunk_size, max_kv_seq_len) of every layout that declared skv_* buffers,
+    // sized for every row count up to the chunk.
+    std::set<std::pair<int64_t, int64_t>> split_kv_layouts_;
+    int64_t kv_source_heads_ = 0;  // set_kv_source_heads(); 0 = unknown
 };
 
 }  // namespace v3

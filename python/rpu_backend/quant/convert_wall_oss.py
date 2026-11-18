@@ -114,7 +114,7 @@ def _quant_config(src: Path, extra_int8_suffixes, group_size=32):
         "target": "wall_oss_decoder_experts",
         "storage": "int8",
         "value_bits": 4,
-        "kernel": "wint4a16_pgrp",
+        "kernel": "w4a16_pgrp",
         "scale": "per_group_GxN" if gw else "per_output_channel",
         "int4_suffixes": int4,
         "int8_suffixes": int8,
@@ -122,7 +122,7 @@ def _quant_config(src: Path, extra_int8_suffixes, group_size=32):
                  + ("group-wise (pgrp/AWQ): scale is [G=K/group_size, N]. " if gw else
                     "logical per-channel scale [N] is repeated across K/32 groups at load. ")
                  + "runtime uses the pgrp swizzle, controller-striped scale, and generated "
-                   "parallel_linear_wint4a16_pgrp auto-tile family. "
+                   "parallel_linear_w4a16_pgrp auto-tile family. "
                  + "int8_suffixes (expert-0 down_proj, K=11008) keep the W8A16 path."),
     }
 

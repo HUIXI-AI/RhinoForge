@@ -20,7 +20,7 @@ int main(){
  const auto hash=m.subclass_layout_hash();const auto identity=m.kvinsert_cost_weight_identity();
  m.plan(layout);const auto&r=m.context.find_physical_route(FmbRouteFamily::LINEAR,G05_VISION_QKV_LINEAR_SITE,0);
  assert(G05_VISION_QKV_LINEAR_SITE==3357339527802085618LL);
- assert(r.selector==1&&r.flags==0&&r.arguments==std::vector<int64_t>({1,256,128,1024,8,32,352,64,128,2,6,2048,256,3,256,1}));
+ assert(r.selector==1&&r.flags==0&&r.arguments==std::vector<int64_t>({2,256,128,1024,8,32,368,64,128,2,6,2048,256,3,256,1,8,0,1,2,32,40,20,34,42,4,36,44,6,38,46}));
  auto has=[&](const Model&x,int64_t site){return std::any_of(x.context.routes.begin(),x.context.routes.end(),[&](auto&r){return r.site==site;});};
  for(auto s:{QWEN35_VISION_Q_SITE,QWEN35_VISION_K_SITE,QWEN35_VISION_V_SITE})assert(!has(m,s));
  assert(has(m,QWEN35_VISION_Q_ROPE_SITE)&&has(m,QWEN35_VISION_K_ROPE_SITE));
@@ -30,7 +30,7 @@ int main(){
  const auto metadata=at::Tensor::metadata_reads;const int queries=cache.queries;
  for(int layer=0;layer<24;++layer){emitted.clear();m.emit_kv_first_body(layer,{});m.compute(layer,{});assert(emitted==std::vector<std::string>({"input","ln","qkv","rope","rope","input"}));}
  assert(at::Tensor::metadata_reads==metadata&&cache.queries==queries);
- for(int argument=0;argument<16;++argument){auto x=m;for(auto&route:x.context.routes)if(route.site==G05_VISION_QKV_LINEAR_SITE)++route.arguments[argument];rejects_before_emission([&]{x.emit_kv_first_body(0,{});});}
+ for(size_t argument=0;argument<r.arguments.size();++argument){auto x=m;for(auto&route:x.context.routes)if(route.site==G05_VISION_QKV_LINEAR_SITE)++route.arguments[argument];rejects_before_emission([&]{x.emit_kv_first_body(0,{});});}
  for(int field=0;field<6;++field){auto x=m;for(auto&route:x.context.routes)if(route.site==G05_VISION_QKV_LINEAR_SITE){if(field==0)++route.selector;if(field==1)++route.flags;if(field==2)++route.invocation;if(field==3)route.family=FmbRouteFamily::ROPE;if(field==4)route.arguments.pop_back();if(field==5)++route.site;}rejects_before_emission([&]{x.emit_kv_first_body(0,{});});}
  {auto x=m;x.context.routes.erase(std::remove_if(x.context.routes.begin(),x.context.routes.end(),[](auto&r){return r.site==G05_VISION_QKV_LINEAR_SITE;}),x.context.routes.end());rejects_before_emission([&]{x.emit_kv_first_body(0,{});});}
  {auto x=m;x.context.complete=false;rejects_before_emission([&]{x.emit_kv_first_body(0,{});});}

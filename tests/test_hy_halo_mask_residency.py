@@ -60,7 +60,7 @@ template<class T,class U> T Align(T a,U b) {return CeilDiv(a,static_cast<T>(b))*
         "inline int64_t sdpa_compute_tmp_v16_size(",
     ):
         p += _definition(helpers, marker) + "\n"
-    p += "class SpmAllocator {public: static constexpr size_t ALIGN=256;\n"
+    p += "class SpmAllocator {public: static constexpr size_t ALIGN=256, SPM_USABLE=8*1024*1024-1024;\n"
     p += "static size_t align_up(size_t n){return (n+255)&~size_t{255};}\n"
     for marker in ("struct AllocRequest", "struct AliasedPlan"):
         p += _definition(allocator_h, marker) + ";\n"
@@ -125,6 +125,8 @@ class CausalDecoderModel {public:
     p += _definition(hy, "enum class HyVlaExpertGraphScheduleRoute") + ";\n"
     p += r'''
 class HyVlaExpertModel:public CausalDecoderModel {public:
+ int resident_fp8_scale_layers_=0,o_resident_layers_=0;bool nvfp4_=false;
+ int gateup_resident_layers()const{return 0;}
  bool cold_mask_once_=true,cold_kvpad16_=true,cold_rmsnorm_pad16_=true,unroll_mode_=true;
  int64_t action_dim_pad_=32;int action_mlp_cores_=8;
  struct UnboundBundle {bool defined()const{return false;}} gateup_resident_bundle_;

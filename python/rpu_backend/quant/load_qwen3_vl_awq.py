@@ -12,14 +12,19 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+
+from rpu_backend.runtime.vision_position import canonical_vision_type
 from torch import nn
 from safetensors import safe_open
 from transformers import AutoModelForImageTextToText
 
 from rpu_backend.quant.int4_pgrp_pack import (
+    pad_int4_mlp_stripe,
     swizzle_int4_pgrp_scale,
     swizzle_pack_int4_pgrp,
+    w4_storage_shape,
 )
+from rpu_backend.runtime.topology import decoder_packed_w4_mlp_intermediate_size
 
 _ROLES = (("self_attn.q_proj", 1), ("self_attn.k_proj", 1),
           ("self_attn.v_proj", 1), ("self_attn.o_proj", 0),
@@ -71,10 +76,10 @@ def is_qwen3_vl_awq_config(config, *, allow_padded_8b=False) -> bool:
                 or tuple(rope.get("mrope_section", ())) != (24, 20, 20)
                 or rope.get("rope_theta", _get(text, "rope_theta")) != 5000000):
             return False
-        if tuple(_get(vision, k) for k in (
-                "model_type", "hidden_size", "intermediate_size", "depth", "num_heads",
+        if (canonical_vision_type(vision, "qwen3_vl"), *tuple(_get(vision, k) for k in (
+                "hidden_size", "intermediate_size", "depth", "num_heads",
                 "patch_size", "temporal_patch_size", "spatial_merge_size", "out_hidden_size",
-                "hidden_act", "in_channels", "num_position_embeddings")) != (
+                "hidden_act", "in_channels", "num_position_embeddings"))) != (
                 "qwen3_vl", vh, vi, depth, 16, 16, 2, 2, h,
                 "gelu_pytorch_tanh", 3, 2304):
             return False
@@ -125,8 +130,20 @@ def is_qwen3_vl_awq_config(config, *, allow_padded_8b=False) -> bool:
         return False
 
 
-def _pack_projection(packed, shape, scale, *, n, k, partition):
-    """Source offset nibble -> existing physical pgrp; never requantize."""
+def packed_projection_geometry(name, n, k, partition, mlp_tp):
+    """Physical [N,K] of one packed Text7 leaf; six-lane MLP widths are padded."""
+    if ".mlp." not in name:
+        return n, k
+    if partition == 1:
+        return decoder_packed_w4_mlp_intermediate_size(n, mlp_tp), k
+    return n, decoder_packed_w4_mlp_intermediate_size(k, mlp_tp)
+
+
+def _pack_projection(packed, shape, scale, *, n, k, partition, num_cores=8,
+                     padded_size=None):
+    """Source offset nibble -> existing physical pgrp; never requantize.
+
+    ``padded_size`` zero-pads a six-lane MLP stripe (values 0, scales 1)."""
     if packed.dtype != torch.int32 or tuple(packed.shape) != (n, k // 8):
         raise ValueError("AWQ weight_packed must be INT32[N,K/8]")
     if shape.dtype != torch.int64 or tuple(shape.shape) != (2,) or shape.tolist() != [n, k]:
@@ -140,8 +157,14 @@ def _pack_projection(packed, shape, scale, *, n, k, partition):
         raise ValueError("AWQ scales are not representable as positive FP16")
     shifts = torch.arange(8, dtype=torch.int32) * 4
     values = ((packed.unsqueeze(-1) >> shifts) & 15).sub_(8).to(torch.int8).reshape(n, k)
-    weight = swizzle_pack_int4_pgrp(values, partition, 8).reshape(n, k // 2)
-    scales = swizzle_int4_pgrp_scale(scale_half.t().contiguous(), 32, partition, 8)
+    logical_scale = scale_half.t().contiguous()
+    if padded_size is not None:
+        values, logical_scale = pad_int4_mlp_stripe(
+            values, logical_scale, partition=partition, padded_size=padded_size)
+    pn, pk = values.shape
+    weight = swizzle_pack_int4_pgrp(values, partition, num_cores).reshape(
+        w4_storage_shape(pn, pk, partition, num_cores))
+    scales = swizzle_int4_pgrp_scale(logical_scale, 32, partition, num_cores)
     return weight, scales
 
 
@@ -208,7 +231,8 @@ def _checked_float(name, tensor):
 
 # Cold owners need version counters even when callers load inside inference_mode.
 @torch.inference_mode(False)
-def load_qwen3_vl_awq_imagetext(config, ckpt_dir: str, *, dtype=torch.float16, **resolve_kwargs):
+def load_qwen3_vl_awq_imagetext(config, ckpt_dir: str, *, dtype=torch.float16,
+                                topology=None, **resolve_kwargs):
     """Load both exact Text-W4 profiles on CPU, preserving actual AWQ constants."""
     from rpu_backend.quant.load import (
         _resolve_checkpoint_dir, _safetensor_shards, _install_parameter,
@@ -217,7 +241,14 @@ def load_qwen3_vl_awq_imagetext(config, ckpt_dir: str, *, dtype=torch.float16, *
     if dtype is not torch.float16:
         raise TypeError("Qwen3-VL AWQ requires torch.float16 activations")
     if not is_qwen3_vl_awq_config(config):
-        raise ValueError("Qwen3-VL AWQ requires exact2B/4B symmetric Text-W4 G32 TP8 profile")
+        raise ValueError("Qwen3-VL AWQ requires an exact 2B/4B symmetric Text-W4 G32 profile")
+    if topology is not None:
+        from rpu_backend.api._execution import qwen3_vl_text_topology
+        if topology != qwen3_vl_text_topology(config.text_config, topology.num_cores, packed_w4=True):
+            raise ValueError("AWQ loader topology differs from the selected text geometry")
+    def projection_cores(name):
+        return (topology.mlp_tp if ".mlp." in name else topology.attn_tp) if topology else 8
+    mlp_tp = topology.mlp_tp if topology else 8
     directory = _resolve_checkpoint_dir(ckpt_dir, **resolve_kwargs)
     source_config = json.loads((directory / "config.json").read_text())
     if (not is_qwen3_vl_awq_config(source_config)
@@ -238,9 +269,11 @@ def load_qwen3_vl_awq_imagetext(config, ckpt_dir: str, *, dtype=torch.float16, *
     expected = dict(shapes)
     for name, module, partition in projections:
         n, k = module.out_features, module.in_features
-        if (k % 32 or (partition == 1 and (n % 128 or k % 64))
-                or (partition == 0 and (n % 16 or k % 512))):
-            raise ValueError(f"AWQ projection is outside TP8 pgrp geometry: {name}")
+        cores = projection_cores(name)
+        pn, pk = packed_projection_geometry(name, n, k, partition, mlp_tp)
+        if (k % 32 or (partition == 1 and (pn % (16 * cores) or pk % 32))
+                or (partition == 0 and (pn % 16 or pk % (32 * cores)))):
+            raise ValueError(f"AWQ projection is outside its selected pgrp geometry: {name}")
         del expected[name + ".weight"]
         expected.update({name + ".weight_packed": (n, k // 8),
                          name + ".weight_shape": (2,), name + ".weight_scale": (n, k // 32)})
@@ -271,13 +304,18 @@ def load_qwen3_vl_awq_imagetext(config, ckpt_dir: str, *, dtype=torch.float16, *
         def tensor(name):
             return handles[tensor_shards[name]].get_tensor(name)
         for name, module, partition in projections:
+            n, k = module.out_features, module.in_features
+            pn, pk = packed_projection_geometry(name, n, k, partition, mlp_tp)
             weight, scale = _pack_projection(
                 tensor(name + ".weight_packed"), tensor(name + ".weight_shape"), tensor(name + ".weight_scale"),
-                n=module.out_features, k=module.in_features, partition=partition)
+                n=n, k=k, partition=partition, num_cores=projection_cores(name),
+                padded_size=None if (pn, pk) == (n, k) else (pn if partition == 1 else pk))
+            # Text config stays logical; the Linear records its physical width.
+            module.out_features, module.in_features = pn, pk
             module.weight = nn.Parameter(weight, requires_grad=False)
             module.register_buffer("weight_scale", scale, persistent=False)
             module._rpu_linear_partition = partition
-            module._rpu_linear_num_cores = 8
+            module._rpu_linear_num_cores = projection_cores(name)
         packed_names = {name + ".weight" for name, _, _ in projections}
         for name in sorted(set(shapes) - packed_names):
             _install_parameter(model, name, _checked_float(name, tensor(name)))
@@ -287,7 +325,7 @@ def load_qwen3_vl_awq_imagetext(config, ckpt_dir: str, *, dtype=torch.float16, *
     _raise_on_imagetext_meta(model)
     model.requires_grad_(False).eval()
     plan = _AWQLoadPlan(id(model), _config_signature(model.config), _inventory(model),
-        tuple((name, id(module), module.in_features, module.out_features, partition, 8)
+        tuple((name, id(module), module.in_features, module.out_features, partition, projection_cores(name))
               for name, module, partition in projections))
     setattr(model, _PLAN_ATTR, plan)
     _validate_qwen3_vl_awq_model(model)

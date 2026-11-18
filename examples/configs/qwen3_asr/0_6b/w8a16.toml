@@ -1,0 +1,39 @@
+# 未写出的执行参数（省略即按以下值运行）：
+#   分块（chunk_size）模板未写出，按 auto 由入口选择；2026-10-19 模板默认输入实测：prefill 96。可调范围见模型页。
+[model]
+target = "qwen3_asr"
+# 本文件的权重/计算配方；切换精度须同时使用对应权重。
+precision = "w8a16"
+checkpoint = "/path/to/Qwen3-ASR-0.6B"
+
+[rpu_execution.model]
+# RPU 核数预算。可选 4 / 6 / 8，默认 8；修改后需重新加载模型。
+# 6 核时文本组件分配为 Attention 4、MLP 6、输出头 4。
+# 音频编码器在 4/6 核下用 4 核。实际分配见模型页配置表的“4 核 / 6 核”列。
+num_cores = 8
+
+[rpu_execution.prefill]
+# Linear 累加精度。false 为 ACC16，true 为 ACC32；不改变权重位宽。
+# 省略时默认 true（ACC32）。修改后需重新加载模型。
+linear_acc32 = true
+
+[input]
+# 单声道 16 kHz，0.5–8 秒；有限浮点波形。
+audio = "/path/to/mono-16k.wav"
+# 生成 token 上限 1–64。
+max_new_tokens = 64
+
+[cpu]
+# CPU intra-op 线程数，正整数；与 RPU 核数无关。
+# 省略时本入口使用 4。
+threads = 4
+
+[run]
+# 预热次数；不计入正式测量。
+warmup = 2
+# 正式执行次数，正整数。
+runs = 5
+# 随机种子，非负整数。
+seed = 0
+# 结果输出目录；并发运行使用不同目录。
+output_dir = "/tmp/qwen3-asr-0_6b-w8a16-result"

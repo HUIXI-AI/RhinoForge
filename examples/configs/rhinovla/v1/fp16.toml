@@ -1,27 +1,49 @@
-[example]
+# 未写出的执行参数（省略即按以下值运行）：
+#   [cpu].threads 省略时不设置线程：PyTorch 使用环境变量 OMP_NUM_THREADS，未设置时使用全部 CPU 核（参考板 24）；2026-10-19 测量环境预设为 16。
+#   rpu_execution.model.num_cores 固定 8 核（可显式写 8；4/6 核不支持，原因见模型页配置表）。
+[model]
 profile_id = "rhinovla.fp16.official-nonrtc"
 registry_alias = "rhinovla-controlled"
 target = "rhinovla"
-dtype = "fp16"
+precision = "fp16"
 
 [input]
-# Executes only the clean source/checkpoint pinned by official_runtime_factory.
-# The bundle supplies the public LIBERO images and prepared CPU inputs.
+# 只运行 official_runtime_factory 固定的源码与 checkpoint。
+# 资产包内的 LIBERO 图像与 CPU 参考使用的相同。
+# 此入口要求显式 true，仅加载调用者信任的模型代码。
 trust_model_code = true
+# 当前模型路径的固定去噪步数，不作为任意可调范围。
 num_steps = 10
 
 [run]
+# 预热次数；不计入正式测量。
 warmup = 2
-runs = 3
+# 正式执行次数，正整数。
+runs = 5
+# 按需开启硬件采样；保持 false 可减少测量干扰。
 hwperf = false
+# 按需开启 profiler；正式计时建议保持 false。
 profile = false
+# 随机种子，非负整数。
 seed = 0
 
 [rpu_execution.components.language_model.prefill]
+# prefill 分块行数。可选 "auto"（默认）或满足本组件形状限制的 16 的倍数整数。
+# auto：由原生 planner 按实际输入行数选择。
+# 2026-10-19 模板默认输入实测：8 核均为 176。
+# 实际值记录在结果 report.json 的执行计划中（compute_chunk）。
 chunk_size = "auto"
 
 [rpu_execution.components.vision_encoder.vision]
+# Vision 分块行数。可选 "auto"（默认）或 16 的倍数整数；不补齐行。
+# auto：由原生 planner 按图像 patch 数与本模型的核数选择。
+# 2026-10-19 模板默认输入实测：8 核均为 128。
+# 实际值记录在结果 report.json 的执行计划中（compute_chunk）。
 chunk_size = "auto"
 
 [rpu_execution.components.action_expert.action]
+# action 分块行数。可选 "auto"（默认）或满足本组件形状限制的 16 的倍数整数。
+# auto：由原生 planner 按实际输入行数选择。
+# 2026-10-19 模板默认输入实测：8 核均为 32。
+# 实际值记录在结果 report.json 的执行计划中（compute_chunk）。
 chunk_size = "auto"

@@ -26,6 +26,7 @@ def _actual_functions(path, names, namespace):
 @pytest.mark.parametrize("direct_fusion", [False, True])
 def test_actual_k1_pack_and_whole_forward_consume_every_camera(monkeypatch, cameras, batch, direct_fusion):
     import torch
+    from rpu_backend.runtime.vision_position import interpolate_vision_positions
 
     # CPU doubles preserve the production Tensor operations and shape checks.
     # Only the explicit device transfer is redirected to CPU.
@@ -149,6 +150,7 @@ def test_actual_k1_pack_and_whole_forward_consume_every_camera(monkeypatch, came
         rpu = SimpleNamespace(get_debug_export=lambda: False)
         def __getattr__(self, name): return ops if name == "ops" else getattr(torch, name)
     namespace = dict(torch=TorchCPU(), _plan_qwen3_5_vision_group=plan,
+        interpolate_vision_positions=interpolate_vision_positions,
         _vision_group_graph_signature=lambda key, planned: key,
         _evict_vision_graph=lambda *args: None,
         _g05_packed_vision_capacity_enabled=lambda: False)

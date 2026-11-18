@@ -40,9 +40,8 @@ struct SpmAllocator{static constexpr uint32_t SPM_USABLE=8387584;bool initialize
 #define SPM_ALLOC allocator
 uint64_t RpuGetDevAddr(void*p){return reinterpret_cast<uint64_t>(p);}
 template<class T>void rpu_ddr_flush(T*){++flushes;}template<class T>void rpu_ddr_flush_force(T*){++flushes;}
-enum class KernelId{G05_O_RESIDENT_W8A16_ACC16_M32N1024K256,G05_O_RESIDENT_W8A16_ACC16_M32N1024K256_N128};constexpr auto O=KernelId::G05_O_RESIDENT_W8A16_ACC16_M32N1024K256;
-constexpr auto ON=KernelId::G05_O_RESIDENT_W8A16_ACC16_M32N1024K256_N128;
-struct KernelCache{bool available=true,n128_available=true;static KernelCache&instance(){static KernelCache c;return c;}bool has_loaded(KernelId id)const{assert(id==O||id==ON);return id==ON?n128_available:available;}};
+enum class KernelId{G05_O_RESIDENT_W8A16_ACC16_M32N1024K256};constexpr auto O=KernelId::G05_O_RESIDENT_W8A16_ACC16_M32N1024K256;
+struct KernelCache{bool available=true,n128_available=true;static KernelCache&instance(){static KernelCache c;return c;}bool has_loaded(KernelId id)const{assert(id==O);return available;}};
 enum class GraphDdrRegisterRole{PerChannelScale};enum class GraphDdrRegisterAccess{Read};enum class GraphDdrRegisterEncoding{DevAddrShift8LoHi};
 struct GraphDdrRegisterAbi{GraphDdrRegisterRole role;GraphDdrRegisterAccess access;GraphDdrRegisterEncoding encoding;int lo,hi;};
 struct GraphDdrRegisterOperandSpec{GraphDdrRegisterAbi abi;at::Tensor owner;};
@@ -51,7 +50,7 @@ struct Writer{void write(Kernel&);};struct Submission{std::map<int,uint16_t>regs
 bool capture=false;
 struct RpuKernelGraph{bool staged=false,pending=false,written=false;int stages=0,lookups=0;KernelId staged_id=O;Kernel kernel;at::Tensor scale;std::vector<Submission>submissions;
  static bool has_active(){return capture;}static RpuKernelGraph&active(){static RpuKernelGraph g;return g;}
- Writer stage_kernel_ddr_registers(KernelId id,std::vector<GraphDdrRegisterOperandSpec>s){assert((id==O||id==ON)&&!staged&&!pending&&s.size()==1);staged_id=id;assert(s[0].abi.lo==20&&s[0].abi.hi==21);scale=s[0].owner;staged=true;++stages;return {};}
+ Writer stage_kernel_ddr_registers(KernelId id,std::vector<GraphDdrRegisterOperandSpec>s){assert(id==O&&!staged&&!pending&&s.size()==1);staged_id=id;assert(s[0].abi.lo==20&&s[0].abi.hi==21);scale=s[0].owner;staged=true;++stages;return {};}
  Kernel*get(KernelId id){assert(id==staged_id&&KernelCache::instance().has_loaded(id)&&staged&&!pending);pending=true;++lookups;return &kernel;}};
 void Writer::write(Kernel&k){auto&g=RpuKernelGraph::active();assert(g.staged&&g.pending&&!g.written);uint64_t a=g.scale.address>>8;k.set_regs(20,uint16_t(a));k.set_regs(21,uint16_t(a>>16));g.written=true;}
 #define GET_KERNEL(id) RpuKernelGraph::active().get(id)
@@ -81,13 +80,13 @@ int main(){
  at::Tensor scale;scale.dtype=at::kHalf;scale.rank=1;scale.rows=1024;scale.address=0x3456789a00ULL;
  auto launch=[&](uint32_t a,uint32_t b,uint32_t c,const at::Tensor&s){rpu_launch_g05_o_resident_w8a16_acc16_kernel(a,b,c,s,n128);};
  auto&g=RpuKernelGraph::active();
- for(int pass=0;pass<2;++pass){scale.address+=256;launch(x,w,y,scale);auto&s=g.submissions.back();assert(g.staged_id==(n128?ON:O)&&s.grid==std::vector<uint16_t>({uint16_t(n128?8:16),1,1}));assert(pair(s,0)==x&&pair(s,2)==w&&pair(s,4)==y&&pair(s,6)==0&&pair(s,20)==scale.address>>8&&s.scale.address==scale.address);assert(s.regs.at(8)==32&&pair(s,10)==1024&&s.regs.at(12)==256&&s.regs.at(13)==16&&s.regs.at(14)==0&&s.regs.at(15)==8&&pair(s,16)==512&&pair(s,18)==2048&&s.regs.at(22)==0&&s.regs.at(23)==1);}
+ for(int pass=0;pass<2;++pass){scale.address+=256;launch(x,w,y,scale);auto&s=g.submissions.back();assert(g.staged_id==O&&s.grid==std::vector<uint16_t>({13,1,1}));assert(pair(s,0)==x&&pair(s,2)==w&&pair(s,4)==y&&pair(s,6)==0&&pair(s,20)==scale.address>>8&&s.scale.address==scale.address);assert(s.regs.at(8)==0&&s.regs.at(9)==32&&pair(s,10)==1024&&s.regs.at(12)==256&&s.regs.at(13)==16&&s.regs.at(14)==0&&s.regs.at(15)==8&&pair(s,16)==512&&pair(s,18)==2048&&pair(s,22)==0&&pair(s,24)==0&&s.regs.at(26)==2&&s.regs.at(27)==1&&s.regs.at(28)==0&&s.regs.at(29)==0);}
  for(int fault=0;fault<12;++fault){auto s=scale;if(fault==0)s.present=false;if(fault==1)s.dtype=at::kChar;if(fault==2)s.contig=false;if(fault==3)s.dev.value=c10::DeviceType::CPU;if(fault==4)s.rank=2;if(fault==5)s.rows=1023;if(fault==6)s.offset=256;if(fault==7)s.address=0;if(fault==8)s.address+=1;if(fault==9)s.address=UINT64_C(1)<<40;if(fault==10)s.address=(UINT64_C(1)<<40)-256;if(fault==11)s.rows=1025;reject([&]{launch(x,w,y,s);});}
  for(int index=0;index<3;++index)for(auto bad:{base-256,base+SpmAllocator::SPM_USABLE-256,0xffffff00u,x+1}){std::array<uint32_t,3>p{x,w,y};p[index]=bad;reject([&]{launch(p[0],p[1],p[2],scale);});}
  for(auto p:{std::array<uint32_t,3>{x,x,y},{x,w,x},{x,y,y},{x,w,x+256}})reject([&]{launch(p[0],p[1],p[2],scale);});
  auto edge=scale;edge.address=(UINT64_C(1)<<40)-2048;launch(x,w,base+SpmAllocator::SPM_USABLE-65536,edge);
- auto&cache=KernelCache::instance();bool&selected=n128?cache.n128_available:cache.available;bool&other=n128?cache.available:cache.n128_available;
- selected=false;reject([&]{launch(x,w,y,scale);});selected=true;other=false;launch(x,w,y,scale);other=true;
+ auto&cache=KernelCache::instance();
+ cache.available=false;reject([&]{launch(x,w,y,scale);});cache.available=true;cache.n128_available=false;launch(x,w,y,scale);cache.n128_available=true;
  allocator.initialized=false;reject([&]{launch(x,w,y,scale);});allocator.initialized=true;
  }
 }

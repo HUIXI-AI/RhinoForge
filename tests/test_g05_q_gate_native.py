@@ -1,5 +1,6 @@
 """Execute actual G05 Q/gate cold, route, caller and launcher bodies on CPU doubles."""
 from pathlib import Path
+from pi_wall_host_catalog import with_actual_linear_contracts
 import subprocess
 import re
 
@@ -17,6 +18,23 @@ def _with_actual_g05_site_helpers(cpp):
                'action_nvfp4_down_resident_site', 'high_precision_site')
     definitions = []
     constants = []
+    if ('has_text_gdn_glast_local_capability(' in cpp and not re.search(
+            r'bool\s+has_text_gdn_glast_local_capability\(', cpp)):
+        # These focused doubles do not install the independent text GDN local
+        # schedule. Its real capability/layout tests exercise that path.
+        definitions.append('bool has_text_gdn_glast_local_capability() const { return false; }')
+        definitions.append('std::vector<int64_t> text_gdn_glast_local_identity() const '
+                           '{ TORCH_CHECK(false, "GDN local schedule is not installed in this fixture"); return {}; }')
+    if ('use_text_gdn_input_workspace(' in cpp and not re.search(
+            r'bool\s+use_text_gdn_input_workspace\(', cpp)):
+        # These fixtures bind the existing G05 profiles. The separate Qwen
+        # six-core GDN workspace has its own native admission/owner tests.
+        definitions.append('bool use_text_gdn_input_workspace() const { return false; }')
+        definitions.append('std::vector<int64_t> gdn_input_workspace_arguments(int64_t) const '
+                           '{ TORCH_CHECK(false, "GDN workspace is not bound in this fixture"); return {}; }')
+        header = (ROOT / 'src/fused/rpu_qwen3_5_model.h').read_text()
+        definitions.append(re.search(
+            r'static constexpr int64_t kTextGdnInputWorkspaceSite\s*=.*?;', header)[0])
     for high_site in ('QWEN35_ACTION_SILU_HIGH_MUL_SITE',
                       'QWEN35_ACTION_NEWTON_NORM_SHIFT_SITE'):
         if (high_site in cpp and not re.search(
@@ -131,11 +149,11 @@ def _with_actual_g05_site_helpers(cpp):
 
 
 def _compile_run(tmp_path, name, cpp):
-    cpp = _with_actual_g05_site_helpers(cpp)
+    cpp = with_actual_linear_contracts(_with_actual_g05_site_helpers(cpp))
     path, exe = tmp_path / (name + '.cpp'), tmp_path / name
     path.write_text(cpp)
     compiled = subprocess.run(['c++', '-std=c++17', '-O0', '-Wall', '-Wextra', '-Werror',
-                               '-I', str(ROOT / 'src/ops'), str(path), '-o', str(exe)],
+                               '-I', str(ROOT / 'src/ops'), '-I', str(ROOT / 'src/core'), str(path), '-o', str(exe)],
                               capture_output=True, text=True)
     assert compiled.returncode == 0, compiled.stderr
     result = subprocess.run([str(exe)], capture_output=True, text=True)
@@ -213,7 +231,7 @@ int main(){
  Model m;m.prepare_action_q_gate();const int cold_proofs=tensor_proofs;assert(m.action_q_gate_available_&&cold_proofs>=48);
  m.plan();assert(m.routes.empty()&&!m.use_action_q_gate(32));m.phase2(0);assert(launches==std::vector<std::string>({"q","k","v","gate"}));
  m.action_step_active_=m.action_loop_active_=true;m.action_num_steps_=10;m.plan();
- assert(m.routes.size()==1&&m.routes[0].args==std::vector<int64_t>({1,32,256,1024,8,32,240,112,128,3,6,2048,512,2,24}));
+ assert(m.routes.size()==1&&m.routes[0].args==std::vector<int64_t>({2,32,256,1024,8,32,80,80,512,4,8,2048,512,2,32,20,34,2,4,36,1}));
  for(int layer=0;layer<24;++layer){launches.clear();m.phase2(layer);assert(launches==std::vector<std::string>({"q+gate","k","v"}));assert(weights_seen.back()==std::make_pair(uint64_t(2*layer+1),uint64_t(2*layer+2)));}
  assert(tensor_proofs==cold_proofs);m.action_kv_owner_available_=true;launches.clear();m.phase2(0);assert(launches==std::vector<std::string>({"q+gate","kv"}));
  m.complete=false;reject([&]{m.phase2(0);});m.complete=true;m.routes[0].args[12]=1024;reject([&]{m.phase2(0);});m.plan();
@@ -229,11 +247,11 @@ int main(){
  // W8 uses the same cold/COMPLETE flow with separately bound scale owners.
  for(auto&w:m.layer_weights_){w.q_w.dtype=w.attn_gate_w.dtype=at::kChar;w.q_ws.rank=w.attn_gate_ws.rank=1;w.q_ws.owner=w.q_w.owner+100;w.attn_gate_ws.owner=w.attn_gate_w.owner+200;}
  m.prepare_action_q_gate();assert(m.action_q_gate_available_&&m.action_q_gate_w8_);m.plan();
- assert(m.routes[0].site==QWEN35_ACTION_Q_GATE_W8_SITE&&m.routes[0].args==std::vector<int64_t>({1,32,256,1024,8,32,192,128,128,2,4,2048,512,2,24,20,28,1}));
+ assert(m.routes[0].site==QWEN35_ACTION_Q_GATE_W8_SITE&&m.routes[0].args==std::vector<int64_t>({2,32,256,1024,8,32,96,48,512,6,12,2048,512,2,32,20,34,1,4,36,1}));
  const int w8_cold_proofs=tensor_proofs;
  for(int layer=0;layer<24;++layer){launches.clear();m.phase2(layer);assert(launches==std::vector<std::string>({"q+gate-w8","kv"}));}
  assert(tensor_proofs==w8_cold_proofs);m.routes[0].args[16]=20;reject([&]{m.phase2(0);});m.plan();
- {auto x=m;x.linear_acc32_=false;x.action_mod_body_w8_=true;x.prepare_action_q_gate();x.plan();assert(x.use_action_q_gate(32)&&x.routes[0].args[5]==16&&x.routes[0].args[6]==288);auto valid=x.routes;x.routes=m.routes;reject([&]{x.phase2(0);});x.routes=valid;linear_modes.clear();launches.clear();x.phase2(23);assert(linear_modes==std::vector<bool>({false})&&launches==std::vector<std::string>({"q+gate-w8","kv"}));}
+ {auto x=m;x.linear_acc32_=false;x.action_mod_body_w8_=true;x.prepare_action_q_gate();x.plan();assert(x.use_action_q_gate(32)&&x.routes[0].args[5]==16&&x.routes[0].args[6]==48);auto valid=x.routes;x.routes=m.routes;reject([&]{x.phase2(0);});x.routes=valid;linear_modes.clear();launches.clear();x.phase2(23);assert(linear_modes==std::vector<bool>({false})&&launches==std::vector<std::string>({"q+gate-w8","kv"}));}
  m.layer_weights_.back().attn_gate_ws.present=false;m.prepare_action_q_gate();assert(!m.action_q_gate_available_&&!m.action_q_gate_w8_);m.layer_weights_.back().attn_gate_ws.present=true;
  KernelCache::instance().available=false;m.prepare_action_q_gate();m.plan();assert(!m.action_q_gate_available_&&m.routes.empty());launches.clear();m.phase2(0);assert(launches==std::vector<std::string>({"q","kv","gate"}));
 
@@ -280,7 +298,7 @@ struct RpuKernelGraph{bool staged=false,pending=false,written=false;int stages=0
 void Writer::write(Kernel&kernel){auto&g=RpuKernelGraph::active();assert(g.staged&&g.pending&&!g.written);for(auto&operand:g.operands){uint64_t v=operand.owner.address>>8;kernel.set_regs(operand.abi.lo,static_cast<uint16_t>(v));kernel.set_regs(operand.abi.hi,static_cast<uint16_t>(v>>16));}g.written=true;}
 #define GET_KERNEL(id) RpuKernelGraph::active().get(id)
 std::vector<uint64_t>flushed;void rpu_ddr_flush(c10::Half*p){flushed.push_back(reinterpret_cast<uint64_t>(p));}
-struct Queue{bool broadcast=false;void set_broadcast_mode(bool v){broadcast=v;}void enqueu_kernel(Kernel&k,std::vector<uint16_t>grid,std::vector<uint8_t>cores){auto&g=RpuKernelGraph::active();assert(broadcast&&g.staged&&g.pending&&g.written);assert(grid==std::vector<uint16_t>({6,1,1})&&cores==std::vector<uint8_t>({0,1,2,3,4,5,6,7}));g.submissions.push_back({k.regs,g.operands});g.operands.clear();g.staged=g.pending=g.written=false;}}queue;
+struct Queue{bool broadcast=false;void set_broadcast_mode(bool v){broadcast=v;}void enqueu_kernel(Kernel&k,std::vector<uint16_t>grid,std::vector<uint8_t>cores){auto&g=RpuKernelGraph::active();assert(broadcast&&g.staged&&g.pending&&g.written);assert(grid==std::vector<uint16_t>({8,1,1})&&cores==std::vector<uint8_t>({0,1,2,3,4,5,6,7}));g.submissions.push_back({k.regs,g.operands});g.operands.clear();g.staged=g.pending=g.written=false;}}queue;
 Queue*get_queue(int cores){assert(cores==8);return &queue;}
 #define GET_QUEUE(cores) get_queue(cores)
 void launch(uint32_t input,const at::Tensor&query_weight,const at::Tensor&gate_weight,uint32_t query_output,uint32_t gate_output)__BODY__
@@ -289,11 +307,11 @@ template<class F>void reject(F f){auto&g=RpuKernelGraph::active();auto before=g.
 int main(){
  auto&g=RpuKernelGraph::active();const uint32_t base=allocator.addr(0,0);
  for(uint32_t pass=0;pass<2;++pass){const uint32_t in=base+0x20000+pass*0x40000,q=in+65536,gate=q+16384;at::Tensor qw{0x1234567800ULL+pass*0x400000},gw{0x2345678900ULL+pass*0x800000};launch(in,qw,gw,q,gate);const auto&s=g.submissions.back();
-  assert(pair(s,0)==in&&pair(s,4)==q&&pair(s,26)==gate);assert(pair(s,2)==qw.address>>8&&pair(s,24)==gw.address>>8);
-  assert(pair(s,6)==0&&s.regs.at(8)==32&&pair(s,10)==256&&s.regs.at(12)==1024&&s.regs.at(13)==64&&s.regs.at(14)==0&&s.regs.at(15)==8);
-  assert(pair(s,16)==2048&&pair(s,18)==512&&pair(s,20)==0&&s.regs.at(22)==1&&s.regs.at(23)==2);
+  assert(pair(s,0)==in&&pair(s,4)==q&&pair(s,36)==gate);assert(pair(s,2)==qw.address>>8&&pair(s,32)==gw.address>>8);
+  assert(pair(s,6)==0&&s.regs.at(8)==1&&s.regs.at(9)==32&&pair(s,10)==256&&s.regs.at(12)==1024&&s.regs.at(13)==64&&s.regs.at(14)==0&&s.regs.at(15)==8);
+  assert(pair(s,16)==2048&&pair(s,18)==512&&pair(s,20)==0&&pair(s,22)==0&&pair(s,24)==0&&s.regs.at(26)==2&&s.regs.at(27)==2&&s.regs.at(28)==0&&s.regs.at(29)==0);
   assert(s.operands.size()==2&&s.operands[0].owner.address==qw.address&&s.operands[1].owner.address==gw.address);
-  for(int i=0;i<2;++i){auto&abi=s.operands[i].abi;assert(abi.role==GraphDdrRegisterRole::ModelWeight&&abi.access==GraphDdrRegisterAccess::Read&&abi.encoding==GraphDdrRegisterEncoding::DevAddrShift8LoHi&&abi.lo==(i?24:2)&&abi.hi==(i?25:3));}
+  for(int i=0;i<2;++i){auto&abi=s.operands[i].abi;assert(abi.role==GraphDdrRegisterRole::ModelWeight&&abi.access==GraphDdrRegisterAccess::Read&&abi.encoding==GraphDdrRegisterEncoding::DevAddrShift8LoHi&&abi.lo==(i?32:2)&&abi.hi==(i?33:3));}
   assert(flushed[pass*2]==qw.address&&flushed[pass*2+1]==gw.address);
  }
  const at::Tensor qw{0x1234567800ULL},gw{0x2345678900ULL};const uint32_t in=base+0x20000,q=in+65536,gate=q+16384;
@@ -304,3 +322,5 @@ int main(){
 '''
     cpp = cpp.replace('__BODY__', _body(source, 'void rpu_launch_g05_q_gate_linear_fp16_acc32_kernel('))
     _compile_run(tmp_path, 'launcher', cpp)
+
+

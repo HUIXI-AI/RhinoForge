@@ -86,6 +86,9 @@ namespace detail {int64_t estimate_temporary_total(const std::vector<BufferDecl>
     program += r'''
 using namespace v3;
 enum class AttentionExecutionPolicy {DDR_KV,SPM_KV_BY_MHA};
+'''
+    program += _definition(base, "enum class CausalDecoderPlanningMode") + ";\n"
+    program += r'''
 struct LayoutContext {
  int64_t chunk_size=51,max_kv_seq_len=276,num_layers=36,kv_insert_chunk_size=0,batch_size=1;
  bool use_attn_mask=true,is_causal=false;
@@ -94,9 +97,9 @@ struct LayoutContext {
 };
 class CausalDecoderModel {public:
  bool v1=false;
- bool lingbot_prefill_deepstack_reuses_down(const LayoutContext&) const { return false; }
  bool qwen3vl_4b_packed_decode_qkv(int64_t,bool,bool,int64_t)const{return false;}
- bool lingbot_folded_rmsnorm_=false,lingbot_prefill_kv_only_=false;
+ bool lingbot_folded_rmsnorm_=false,lingbot_prefill_kv_only_=false,lingbot_prefill_mode_bound_=false;
+ CausalDecoderPlanningMode planning_mode_=CausalDecoderPlanningMode::ORDINARY;
  bool wall_prefill_staged_mlp_=false,decode_gate_up_fusion_=false;
  bool prefill_packed_gate_up_strided_=false,qwen3vl_multiview_text_dry_prepared_=false;
  bool qwen3vl_multiview_text_composite_prepared_=false,has_qk_norm_=false,has_qkv_bias_=true;
@@ -112,7 +115,8 @@ class CausalDecoderModel {public:
  virtual std::vector<BufferDecl> explicit_mask_baseline_buffer_declarations(const LayoutContext& ctx){return causal_baseline_buffer_declarations(ctx);}
  std::vector<BufferDecl> declare_buffers(const LayoutContext& ctx);
 '''
-    program += _definition(base, "SdpaConfig make_sdpa_config(") + "\n};\n"
+    program += _definition(base, "SdpaConfig make_sdpa_config(") + "\n"
+    program += _definition(base, "bool lingbot_prefill_deepstack_reuses_down(") + "\n};\n"
     program += _definition(base, "std::vector<BufferDecl> declare_buffers(").replace(
         "std::vector<BufferDecl> declare_buffers(",
         "std::vector<BufferDecl> CausalDecoderModel::declare_buffers(", 1).replace(" override", "") + "\n"

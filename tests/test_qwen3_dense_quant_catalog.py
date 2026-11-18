@@ -8,6 +8,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from _support_status import expected_support_status
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_FILENAMES = {
@@ -52,10 +53,12 @@ def test_dense_w4_profiles_bind_exact_recipe_geometry_and_cold_defaults(common, 
         "hidden_size", "intermediate_size", "num_hidden_layers", "num_attention_heads"
     )) == SHAPES[size]
     assert (limits["num_key_value_heads"], limits["head_dim"], limits["vocab_size"]) == (8, 128, 151936)
-    assert (limits["num_cores"], limits["batch_size"], limits["group_size"]) == (8, 1, 32)
+    assert limits["allowed_num_cores"] == [4, 6, 8]
+    assert "num_cores" not in limits
+    assert (limits["batch_size"], limits["group_size"]) == (1, 32)
     assert limits["quantization"]["lm_head"] == (
         "symmetric RTN signed W4/G32 on install" if head else "FP16")
-    assert profile["support"]["status"] == "CONTROLLED_EVALUATION"
+    assert profile["support"]["status"] == expected_support_status(profile, "CONTROLLED_EVALUATION")
     assert profile["hw_status"] == "IMPLEMENTED_UNVERIFIED_HW"
     assert "formal_certification" not in limits
     assert config["input"]["prefill_tokens"] == 128
@@ -65,6 +68,9 @@ def test_dense_w4_profiles_bind_exact_recipe_geometry_and_cold_defaults(common, 
     request = {"model": {"num_cores": 8}, "prefill": {"linear_acc32": True}}
     common._validate_execution(request, profile=profile)
     for cores in (4, 6):
+        request["model"]["num_cores"] = cores
+        common._validate_execution(request, profile=profile)
+    for cores in (2, 5, 7):
         request["model"]["num_cores"] = cores
         with pytest.raises((ValueError, common.ConfigError)):
             common._validate_execution(request, profile=profile)
@@ -85,7 +91,7 @@ def test_dense_32b_w8_uses_existing_converted_asset_without_inheriting_support(c
     assert limits["kv_capacity"] == "requested-at-install; allocation must succeed"
     assert limits["max_chunk_size"] == 64
     assert limits["load_device"] == "rpu"
-    assert profile["support"]["status"] == "CONTROLLED_EVALUATION"
+    assert profile["support"]["status"] == expected_support_status(profile, "CONTROLLED_EVALUATION")
     assert profile["hw_status"] == "IMPLEMENTED_UNVERIFIED_HW"
     assert "formal_certification" not in limits
 

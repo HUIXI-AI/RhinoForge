@@ -21,6 +21,7 @@
 #include "fused_model_base.h"
 #include "model_handle_registry.h"
 #include "rpu_ops.h"
+#include "rpu_pi_wall_tiling.h"
 #include "rpu_eltwise.h"
 #include "rpu_helpers.h"
 #include "rpu_runtime_state.h"
@@ -30,6 +31,7 @@
 #include <ATen/record_function.h>
 #include <c10/util/Half.h>
 #include <cstdint>
+#include <cstring>
 #include <array>
 #include <vector>
 #include <algorithm>
@@ -41,6 +43,8 @@
 using namespace at;
 using namespace ::rhino_lkn;
 
+// Exact, fused and small-image routes are eight-core only and keep NUM_CORES;
+// the ordinary per-layer path and its descriptors use num_cores().
 #define NUM_CORES 8
 #define DWIDTH 2
 
@@ -138,8 +142,10 @@ constexpr int64_t QWEN25_SMALL_RAGGED_SDPA_SITE = 206720128084120004LL;
 
 constexpr int64_t QWEN25_WALL_SORTING_SITE = 570820779484829457LL;
 
+// NON8_TP_V16 lets the four-lane owner keep the V16 writer; eight-lane plans
+// are unchanged because v16_shape_ok reads it only below eight lanes.
 constexpr uint32_t QWEN25_KV_CAPABILITIES =
-    KV_INSERT_CAP_V2 | KV_INSERT_CAP_V16;
+    KV_INSERT_CAP_V2 | KV_INSERT_CAP_V16 | KV_INSERT_CAP_NON8_TP_V16;
 // Stable descriptor flags. Generic raw-SPM attention mirrors K/V into RPUCache
 // for paired DDR candidates/debugging. The cold three224 native-window route
 // has no DDR candidate or DDR consumer and can omit that mirror outside debug.
@@ -182,8 +188,8 @@ constexpr int64_t qwen25_vision_linear_route() {
     return static_cast<int64_t>(Qwen25VisionLinearRoute::AUTO_TILE);
 }
 
-int64_t qwen25_vision_ring_route(int64_t rows, int64_t cols) {
-    return v3::fmb_ring_all_reduce_route_selector(rows, cols);
+int64_t qwen25_vision_ring_route(int64_t rows, int64_t cols, int num_cores = 8) {
+    return v3::fmb_ring_all_reduce_route_selector(rows, cols, num_cores);
 }
 
 // First physical window-merger canary only. Keep this envelope intentionally
@@ -269,6 +275,46 @@ static VisionDispatch resolve_vision_dispatch(
             VisionImplementation::Generic};
 }
 
+// Ordinary four-lane layout. Gate is 2.7x the SDPA output there, and first-fit
+// places the phase-4 O-proj above the whole phase-2 group, so a separate
+// sdpa_out slot pushes Gate past the live set (InternVLA 784 patches: 7.88 MB
+// placed vs 7.38 MB live). sdpa_out is written in phase 3 and read by O-proj in
+// phase 4; Gate is first written in phase 5. Hosting sdpa_out in Gate's slot,
+// opened at phase 2, lets O-proj and Gate reach the live peak. The hosted
+// layout is kept only when its first-fit peak is lower, so small or dense-mask
+// images keep the original one.
+static std::vector<BufferDecl> host_sdpa_out_in_gate(
+    std::vector<BufferDecl> decls) {
+    const auto named = [](const char* want) {
+        return [want](const BufferDecl& d) {
+            return std::strcmp(d.name, want) == 0;
+        };
+    };
+    const auto gate_it = std::find_if(decls.begin(), decls.end(), named("gate"));
+    TORCH_CHECK(gate_it != decls.end(),
+                "Qwen2.5-VL Vision ordinary layout lacks gate");
+    BufferDecl gate_root = *gate_it;
+    std::vector<BufferDecl> hosted;
+    hosted.reserve(decls.size());
+    for (const BufferDecl& d : decls) {
+        if (named("gate")(d)) continue;
+        if (named("sdpa_out")(d)) {
+            TORCH_CHECK(d.size <= gate_root.size && d.alias_of == nullptr,
+                        "Qwen2.5-VL Vision sdpa_out cannot share gate");
+            gate_root.phase_start = d.phase_start;
+            hosted.push_back(gate_root);
+            BufferDecl out = d;
+            out.alias_of = "gate";
+            hosted.push_back(out);
+            continue;
+        }
+        hosted.push_back(d);
+    }
+    return detail::estimate_temporary_total(hosted)
+            < detail::estimate_temporary_total(decls)
+        ? hosted : decls;
+}
+
 class Qwen25VLVisionModel : public FusedModelBase {
 public:
     struct LayerWeights {
@@ -285,6 +331,28 @@ public:
         at::Tensor gate_b, up_b, down_b;
     };
 
+    // Cold four-lane owner (InternVLA): set the core budget before routes,
+    // weights and RoPE. Eight cores keep every existing Wall-OSS route.
+    void set_execution_cores(int64_t cores) {
+        TORCH_CHECK(cores == 4 || cores == 8,
+                    "Qwen2.5-VL Vision execution cores must be 4 or 8");
+        TORCH_CHECK(num_layers() == 0 && !has_rope_ && !z1_adopted_ && !z1_bound_ &&
+                        !rope_spm_enabled_ && !fused_merger_enabled_ &&
+                        !mixed_precision_enabled_ && !layer_group_enabled_ &&
+                        !exact_mimc_enabled_ && !linear_acc32_ &&
+                        wall_sorting_.fp16_transfer_mask == 0 &&
+                        !wall_sorting_.vision_row_reuse && !wall_sorting_.silu_mul,
+                    "Qwen2.5-VL Vision execution cores must precede routes, weights and RoPE");
+        set_execution_core_count(static_cast<int>(cores));
+    }
+
+    std::vector<int64_t> execution_topology() const {
+        TORCH_CHECK(num_layers() > 0,
+                    "Qwen2.5-VL Vision topology requires installed weights");
+        return {num_cores(), attn_tp(), mlp_tp(),
+                DecoderExecutionTopology::physical_kv_cores};
+    }
+
     void set_linear_acc32(bool enabled) {
         TORCH_CHECK(num_layers() == 0 && !has_rope_ && !z1_adopted_ && !z1_bound_,
                     "Wall Vision accumulation must be set before weights/RoPE");
@@ -299,6 +367,8 @@ public:
         TORCH_CHECK(num_layers() == 0 && !has_rope_,
                     "Wall Vision sorting routes must be set before weights/RoPE");
         TORCH_CHECK(mask >= 0 && mask <= 7, "Wall FP16 transfer mask must be 0..7");
+        TORCH_CHECK(num_cores() == 8 || (mask == 0 && !row && !silu),
+                    "Wall Vision sorting routes are eight-core only");
         wall_sorting_.fp16_transfer_mask = static_cast<uint32_t>(mask);
         wall_sorting_.vision_row_reuse = row;
         wall_sorting_.silu_mul = silu;
@@ -312,6 +382,11 @@ public:
                     "qwen25vl vision execution routes must be set before weights/RoPE");
         TORCH_CHECK(!linear_acc32_ || (!mixed_precision && !layer_group && !exact_mimc),
                     "Wall Vision ACC32 cannot use RTC mixed or exact execution routes");
+        TORCH_CHECK(num_cores() == 8 ||
+                        (!mixed_precision && !layer_group &&
+                         !exact_mimc && rmsnorm_capability == RPU_RMSNORM_CAP_BASE),
+                    "four-core Qwen2.5-VL Vision admits only DDR or SPM RoPE, the "
+                    "unfused or fused merger and BASE RMSNorm");
         TORCH_CHECK(!mixed_precision || fused_merger,
                     "qwen25vl vision mixed precision requires fused merger");
         TORCH_CHECK(!(layer_group && exact_mimc),
@@ -373,6 +448,14 @@ public:
                     "Wall Vision ACC32 requires 224/256 base image geometry");
     }
 
+    void validate_reduced_core_input() const {
+        // Per-window needs 16-aligned windows; the dense window mask serves the
+        // 252x252 grid, whose last window has four patches. Both stay on the DDR KV route.
+        TORCH_CHECK(num_cores() == 8 || (image_batch_count_ == 1 && is_generic()),
+                    "RPU_PLANNER_REJECT:CAPABILITY: four-core Qwen2.5-VL Vision "
+                    "admits one image per forward on the generic schedule");
+    }
+
     VisionDispatch resolve_vision_dispatch(int64_t image_batch_count) const {
         return v3::resolve_vision_dispatch(
             image_batch_count, layer_group_enabled_, exact_mimc_enabled_);
@@ -428,6 +511,7 @@ public:
         window_mask_present_ = window_mask_present;
         valid_patches_per_image_ = valid_patches_per_image;
         validate_acc32_base_input();
+        validate_reduced_core_input();
         TORCH_CHECK(valid_patches_per_image_ == 0 || padded_pair_enabled(),
                     "RPU_PLANNER_REJECT:CAPABILITY: padded Vision requires "
                     "exact uniform B2/M672/valid324 with fused merger and cold SiLU");
@@ -563,6 +647,21 @@ public:
         check_list(down_b_list, "down_b_list");
 
         const bool has_scale = !q_w_scale_list.empty();
+        // Four lanes admit uniform FP16 or uniform W8A16; the block-17 FP16
+        // Down of mixed precision stays eight-core with its fused routes.
+        TORCH_CHECK(num_cores() == 8 || !has_scale || [&] {
+                        for (const at::TensorList* list : {&q_w_list, &k_w_list, &v_w_list,
+                                                           &o_w_list, &gate_w_list,
+                                                           &up_w_list, &down_w_list}) {
+                            for (const auto& w : *list) {
+                                if (!w.defined() || w.scalar_type() != at::kChar) return false;
+                            }
+                        }
+                        return true;
+                    }(),
+                    "four-core Qwen2.5-VL Vision admits uniform FP16 or uniform W8A16 weights");
+        TORCH_CHECK(num_cores() == 8 || intermediate_size == (has_scale ? 3584 : 3456),
+                    "four-core Qwen2.5-VL Vision binds I3456 to FP16 and I3584 to W8A16");
         auto check_optional_scale_list = [&](const at::TensorList& list,
                                              const char* name) {
             if (has_scale) {
@@ -708,7 +807,8 @@ public:
         // Original V32 uses arithmetic to move BF16 partials and changes
         // Inf/NaN semantics. Only the bit-preserving task REF advertises this
         // alias; older REFs must keep the small Vision BASE route.
-        small_rmsnorm_capability_ = wall_sorting_.silu_mul &&
+        small_rmsnorm_capability_ =
+                (wall_sorting_.silu_mul || num_cores() != 8) &&
                 !mixed_precision_enabled_ && !exact_mimc_enabled_ &&
                 !layer_group_enabled_ &&
                 KernelCache::instance().get_kernel(
@@ -951,6 +1051,7 @@ public:
         window_mask_present_ = window_mask.has_value() && window_mask->defined();
         valid_patches_per_image_ = valid_patches_per_image;
         validate_acc32_base_input();
+        validate_reduced_core_input();
         TORCH_CHECK(valid_patches_per_image_ == 0 || padded_pair_enabled(),
                     "padded Vision requires exact uniform B2/M672/valid324 "
                     "with fused merger and cold SiLU");
@@ -1494,6 +1595,19 @@ public:
     }
 
 protected:
+    DecoderExecutionTopology resolve_model_execution_topology(
+            int64_t nq, int64_t nkv, int64_t hd, int64_t h,
+            int64_t intermediate) const override {
+        if (num_cores() == 8)
+            return FusedModelBase::resolve_model_execution_topology(
+                nq, nkv, hd, h, intermediate);
+        TORCH_CHECK(num_cores() == 4 && nq == 16 && nkv == 16 && hd == 80 &&
+                        h == 1280 && (intermediate == 3456 || intermediate == 3584),
+                    "no admitted four-core Qwen2.5-VL Vision geometry: 4 cores "
+                    "require Q16/KV16/D80/H1280 with I3456 FP16 or I3584 W8A16");
+        return {4, 4, 4};
+    }
+
     KvCostLayoutScope capture_kvinsert_cost_layout_scope() override {
         // Existing window geometry is native-owned; keep the diagnostic
         // snapshot bounded without narrowing ordinary forward admission.
@@ -1593,6 +1707,51 @@ protected:
             ? seq_len : seq_len / image_batch_count_;
         return native_rows > 0 && native_rows <= UINT16_MAX &&
             cs <= UINT16_MAX && cs == Align(native_rows, int64_t{16});
+    }
+
+    bool reduced_core_sisc_raw_kv_only_enabled() const {
+        return !get_debug_export() && num_cores() != 8 && is_generic() &&
+            !mixed_precision_ && !per_window_sdpa_enabled_ && !z1_bound_ &&
+            schedule_ == VisionSchedule::SISC && image_batch_count_ == 1 &&
+            (current_num_patches_ == 576 || current_num_patches_ == 256);
+    }
+
+    bool reduced_core_sisc_resident_mask_enabled() const {
+        if (!window_mask_present_ || num_cores() == 8 || !is_generic() ||
+            mixed_precision_ || per_window_sdpa_enabled_ || z1_bound_ ||
+            schedule_ != VisionSchedule::SISC || image_batch_count_ != 1 ||
+            !(current_num_patches_ == 576 || current_num_patches_ == 256) ||
+            num_layers() != 32 || layer_weights_.size() != 32 ||
+            hidden_size() != 1280 || num_q_heads() != 16 || head_dim() != 80 ||
+            fullatt_block_indexes_ != std::vector<int64_t>({7, 15, 23, 31})) {
+            return false;
+        }
+        return true;
+    }
+
+    bool reduced_core_sisc_single_raw_query_enabled(int64_t rows) const {
+        return reduced_core_sisc_raw_kv_only_enabled() &&
+            reduced_core_sisc_resident_mask_enabled() &&
+            rows == 576 && current_num_patches_ == 576 &&
+            sdpa_by_mha_spm_is_valid(
+                1, rows, rows, num_q_heads(), num_q_heads(), head_dim(),
+                num_cores(), 0) &&
+            sdpa_by_mha_spm_is_valid(
+                1, rows, rows, num_q_heads(), num_q_heads(), head_dim(),
+                num_cores(), 4);
+    }
+
+    int64_t reduced_core_sisc_schedule_flags() const {
+        if (num_cores() == 8) return 0;
+        const bool silu_mul = is_generic() && !mixed_precision_ &&
+            !per_window_sdpa_enabled_ && !z1_bound_ && !get_debug_export() &&
+            schedule_ == VisionSchedule::SISC && image_batch_count_ == 1 &&
+            (current_num_patches_ == 256 || current_num_patches_ == 576) &&
+            (current_num_patches_ * (intermediate_size() / num_cores())) % 32 == 0;
+        return (reduced_core_sisc_raw_kv_only_enabled() ? 4096 : 0) |
+            (reduced_core_sisc_resident_mask_enabled() ? 8192 : 0) |
+            (reduced_core_sisc_single_raw_query_enabled(current_num_patches_) ? 16384 : 0) |
+            (silu_mul ? 32768 : 0);
     }
 
     void consume_manifest_route(
@@ -1702,7 +1861,27 @@ protected:
                         /*MASK_NONE=*/1});
                 }
             } else {
-                const int64_t query_chunk = small_image_single_raw_query_enabled()
+                const bool reduced_single_raw_query =
+                    num_cores() != 8 && !get_debug_export() &&
+                    schedule_ == VisionSchedule::SISC &&
+                    image_batch_count_ == 1 &&
+                    chunk.len == 576 && current_num_patches_ == 576 &&
+                    is_generic() && !mixed_precision_ &&
+                    !per_window_sdpa_enabled_ && !z1_bound_ &&
+                    window_mask_present_ && num_layers() == 32 &&
+                    layer_weights_.size() == 32 && hidden_size() == 1280 &&
+                    num_q_heads() == 16 && head_dim() == 80 &&
+                    fullatt_block_indexes_ ==
+                        std::vector<int64_t>({7, 15, 23, 31}) &&
+                    sdpa_by_mha_spm_is_valid(
+                        1, chunk.len, chunk.len, num_q_heads(), num_q_heads(),
+                        head_dim(), num_cores(), 0) &&
+                    sdpa_by_mha_spm_is_valid(
+                        1, chunk.len, chunk.len, num_q_heads(), num_q_heads(),
+                        head_dim(), num_cores(), 4);
+                const int64_t query_chunk =
+                    (small_image_single_raw_query_enabled() ||
+                     reduced_single_raw_query)
                     ? chunk.len : (chunk.len > 256
                         ? QWEN25VL_VISION_SDPA_QUERY_CHUNK : chunk.len);
                 for (int64_t off = 0, invocation = 0;
@@ -1725,13 +1904,16 @@ protected:
         const GenericAttentionGeometry& site) const {
         return {
             site.batch, site.seq_q, site.seq_k,
-            num_q_heads(), num_q_heads(), head_dim(), NUM_CORES,
+            num_q_heads(), num_q_heads(), head_dim(), num_cores(),
             site.mask_domain, static_cast<int64_t>(schedule_),
             per_window_sdpa_enabled_ ? 1 : 0};
     }
 
     bool generic_attention_raw_valid(
         const GenericAttentionGeometry& site) const {
+        // Packed multi-image MISC stays eight-core only; single-image SISC
+        // admits both four-lane and eight-lane raw-SPM attention when valid.
+        if (num_cores() != 8 && schedule_ == VisionSchedule::MISC) return false;
         // MISC stores image-local K/V segments back-to-back in one packed
         // buffer. Raw K uses an align16(seq_k) stride, so an unaligned image
         // extent would overlap the next image's segment.
@@ -1745,7 +1927,7 @@ protected:
             }
             if (!sdpa_by_mha_spm_is_valid(
                     site.batch, site.seq_q, site.seq_k,
-                    num_q_heads(), num_q_heads(), head_dim(), NUM_CORES,
+                    num_q_heads(), num_q_heads(), head_dim(), num_cores(),
                     mask_type)) {
                 return false;
             }
@@ -2043,8 +2225,24 @@ protected:
                 });
     }
 
+    std::vector<int64_t> vision_row_arguments(int64_t rows, bool down, bool reuse) const {
+        if (!reuse) return down ? std::vector<int64_t>{mixed_precision_ ? 1 : 0}
+                                : std::vector<int64_t>{};
+        const bool fp16 = layer_weights_.front().q_w.scalar_type() == at::kHalf;
+        const int64_t k = down ? intermediate_size() : num_q_heads() * head_dim();
+        const auto c = rpu_pi_wall::select(rpu_pi_wall::Operation::RowWeightReuse,
+            fp16 ? rpu_pl_tiling::WeightType::Fp16 : rpu_pl_tiling::WeightType::Int8,
+            false, rows, hidden_size(), k / NUM_CORES);
+        return {2, rows, hidden_size(), k, NUM_CORES, fp16 ? 2 : 1,
+                c.tile.m_tile, c.tile.n_tile, c.tile.k_tile, c.grid_x, c.grid_y,
+                mixed_precision_ ? 1 : 0};
+    }
+
     std::vector<int64_t> small_image_gate_up_arguments(int64_t rows) const {
-        return {rows, 1280, 3584, NUM_CORES, 352, 96};
+        const auto c = rpu_pi_wall::select(rpu_pi_wall::Operation::SharedSiluBias,
+            rpu_pl_tiling::WeightType::Int8, false, rows, 448, 1280);
+        return {rows, 1280, 3584, NUM_CORES, c.tile.m_tile, c.tile.n_tile,
+                c.tile.k_tile, c.grid_x, c.grid_y, 2, 32, 20, 34, 6, 38};
     }
 
     bool small_image_native_window_shape() const {
@@ -2117,17 +2315,23 @@ protected:
     }
 
     RpuRmsNormSpmRoute small_image_rmsnorm_route(int64_t rows) const {
+        const bool reduced_sisc_rows =
+            num_cores() != 8 && schedule_ == VisionSchedule::SISC &&
+            image_batch_count_ == 1 && (rows == 256 || rows == 576);
         if (small_rmsnorm_capability_ !=
                 (RPU_RMSNORM_CAP_BASE | RPU_RMSNORM_CAP_V32) ||
-            !wall_sorting_.silu_mul || !is_generic() || mixed_precision_ ||
+            (!wall_sorting_.silu_mul && !reduced_sisc_rows) ||
+            !is_generic() || mixed_precision_ ||
             per_window_sdpa_enabled_ || z1_bound_ || get_debug_export() ||
             !merger_active() || num_layers() != 32 ||
             layer_bias_norm_.size() != 32 || num_kv_heads() != 16 ||
             rows != current_num_patches_ ||
-            !((rows == 256 * image_batch_count_ &&
-               (image_batch_count_ == 2 || image_batch_count_ == 3)) ||
-              (rows == 672 && padded_pair_enabled())) ||
-            !(small_image_native_window_enabled() ||
+            !(reduced_sisc_rows ||
+              ((rows == 256 * image_batch_count_ &&
+                (image_batch_count_ == 2 || image_batch_count_ == 3)) ||
+               (rows == 672 && padded_pair_enabled()))) ||
+            !(reduced_sisc_rows ||
+              small_image_native_window_enabled() ||
               small_image_resident_mask_enabled()) ||
             !merger_ln_q_w_.defined() ||
             merger_ln_q_w_.scalar_type() != at::kHalf ||
@@ -2439,7 +2643,7 @@ protected:
         auto append_ring = [&](int64_t site_id, int64_t rows, int64_t cols,
                                int64_t invocation = 0) {
             append(FmbRouteFamily::ALL_REDUCE, site_id,
-                   qwen25_vision_ring_route(rows, cols), invocation);
+                   qwen25_vision_ring_route(rows, cols, num_cores()), invocation);
         };
         auto append_mixed_rmsnorm = [&](int64_t site_id, int64_t rows,
                                         int64_t invocation = 0) {
@@ -2451,14 +2655,15 @@ protected:
                 invocation, {rows, hidden_size()});
         };
         auto append_kv = [&](const ChunkInfo& chunk) {
+            if (reduced_core_sisc_raw_kv_only_enabled()) return;
             const KvInsertSegmentPlan kv_plan =
                 resolve_kvinsert_plan_auto(
                     QWEN25_KV_INSERT_SITE, manifest.graph_lifecycle,
-                    /*position=*/0, chunk.len, chunk.len, NUM_CORES,
+                    /*position=*/0, chunk.len, chunk.len, num_cores(),
                     num_q_heads(), head_dim(), QWEN25_KV_CAPABILITIES);
             const KvInsertRouteArguments arguments =
                 rpu_kvinsert_route_arguments(
-                    kv_plan, NUM_CORES, num_q_heads(), head_dim());
+                    kv_plan, num_cores(), num_q_heads(), head_dim());
             manifest.routes.push_back({
                 QWEN25_KV_INSERT_SITE, FmbRouteFamily::KV_INSERT,
                 static_cast<int64_t>(kv_plan.route()),
@@ -2613,7 +2818,8 @@ protected:
                    row_weight_outer
                        ? static_cast<int64_t>(Qwen25VisionLinearRoute::WALL_ROW_FULL_LOCAL_K)
                        : qwen25_vision_linear_route(),
-                   plan.compute.chunks.front().idx);
+                   plan.compute.chunks.front().idx,
+                   vision_row_arguments(physical_len, false, row_weight_outer));
             for (size_t index = 0; index < active_chunks; ++index) {
                 const ChunkInfo& chunk = plan.compute.chunks[index];
                 if (!compact) {
@@ -2645,7 +2851,7 @@ protected:
                        row_weight_outer
                            ? static_cast<int64_t>(Qwen25VisionLinearRoute::WALL_ROW_FULL_LOCAL_K)
                            : qwen25_vision_linear_route(),
-                       chunk.idx, {mixed_precision_ ? 1 : 0});
+                       chunk.idx, vision_row_arguments(physical_len, true, row_weight_outer));
             }
             if (mixed_precision_ &&
                 QWEN25VL_VISION_MIXED_BOUNDARY_LAYER < num_layers()) {
@@ -2727,10 +2933,12 @@ protected:
                     append_linear(QWEN25_UP_LINEAR_SITE, chunk.idx);
                 }
                 append(FmbRouteFamily::LINEAR, QWEN25_O_LINEAR_SITE,
-                       row_route, chunk.idx);
+                       row_route, chunk.idx, vision_row_arguments(chunk.len, false,
+                           row_route == static_cast<int64_t>(Qwen25VisionLinearRoute::WALL_ROW_FULL_LOCAL_K)));
                 append(FmbRouteFamily::LINEAR,
                     QWEN25_DOWN_LINEAR_SITE, row_route, chunk.idx,
-                    {mixed_precision_ ? 1 : 0});
+                    vision_row_arguments(chunk.len, true,
+                        row_route == static_cast<int64_t>(Qwen25VisionLinearRoute::WALL_ROW_FULL_LOCAL_K)));
                 if (has_boundary_layer) {
                     append(
                         FmbRouteFamily::LINEAR,
@@ -2915,7 +3123,8 @@ protected:
         }
 
         append_fmb_shared_runtime_routes(
-            manifest, plan, hidden_size(), FMB_SHARED_LAYER_INPUT_DMA);
+            manifest, plan, hidden_size(), FMB_SHARED_LAYER_INPUT_DMA,
+            /*compute_row_multiplier=*/1, num_cores(), mlp_tp());
         std::sort(
             manifest.routes.begin(), manifest.routes.end(),
             [](const FmbRouteManifestEntry& lhs,
@@ -2940,7 +3149,8 @@ protected:
                 plan, layout, physical_len, logical_len, position)};
         }
 
-        if (small_image_native_window_enabled() || small_image_raw_kv_only_enabled()) {
+        if (small_image_native_window_enabled() || small_image_raw_kv_only_enabled() ||
+            reduced_core_sisc_raw_kv_only_enabled()) {
             // These controlled small-image schedules consume raw SPM K/V
             // directly. Omitting the mirror requires every consumer to be raw.
             LayoutContext raw_layout = layout;
@@ -3116,8 +3326,8 @@ protected:
             "RPU_PLANNER_REJECT:EXACT_MISMATCH: Qwen2.5-VL Vision "
             "descriptor conflicts with the cold exact 2D RoPE route");
 
-        int64_t local_q_dim = (nq / NUM_CORES) * hd;
-        int64_t local_inter = is_ / NUM_CORES;   // 3456/8 = 432
+        int64_t local_q_dim = (nq / num_cores()) * hd;
+        int64_t local_inter = is_ / num_cores();   // 3456/8 = 432
         auto A = [](int64_t bytes) -> int64_t { return Align(bytes, 256); };
 
         int64_t res  = A(cs * h * DWIDTH);
@@ -3127,11 +3337,23 @@ protected:
         const int64_t qkv_rows = raw_generic_layout
             ? Align(cs, int64_t{16}) : cs;
         int64_t qkv  = A(qkv_rows * local_q_dim * DWIDTH);
-        int64_t inter = A(cs * local_inter * DWIDTH);
+        // Four-lane long single-image Vision (e.g. InternVLA 784 patches)
+        // strip-mines MLP Gate/Up/SwiGLU/Down in two 16-row-aligned halves so
+        // 3*res + Gate fits inside the full 6-model composite SPM budget.
+        const bool reduced_mlp_strips =
+            num_cores() != 8 && is_generic() &&
+            !window_mask_present_ && cs > 576;
+        const int64_t mlp_rows = reduced_mlp_strips
+            ? Align(CeilDiv(cs, int64_t{2}), int64_t{16}) : cs;
+        int64_t inter = A(mlp_rows * local_inter * DWIDTH);
+        if (reduced_mlp_strips && merger_active()) {
+            inter = std::max(
+                inter, A((cs / 4) * (merge_hidden_ / num_cores()) * DWIDTH));
+        }
 
         SdpaConfig sdpa_cfg{SdpaKernelType::FLASH_ATTN_SPM,
                             hd, /*nq*/nq, /*nkv*/nq,
-                            /*cores*/NUM_CORES, /*mask*/0};
+                            /*cores*/static_cast<int>(num_cores()), /*mask*/0};
         // Size FLASH_ATTN scratch for the largest query call, not the packed/full
         // sequence. Batched vision calls SDPA per image; a long single image uses
         // 144-query strips below while retaining full-sequence K/V. This saves
@@ -3142,7 +3364,7 @@ protected:
             ? (cs / image_batch_count_)
             : (cs > 256 ? std::min(cs, QWEN25VL_VISION_SDPA_QUERY_CHUNK) : cs);
         SdpaTiling t = sdpa_compute_tiling(sdpa_cfg, sdpa_seq);
-        int64_t nkv_per_core = CeilDiv(nq, (int64_t)NUM_CORES);
+        int64_t nkv_per_core = CeilDiv(nq, static_cast<int64_t>(num_cores()));
         int64_t sdpa_tmp = A(t.tile_n_v16 * t.tile_k * nkv_per_core * CeilDiv(sdpa_seq, t.tile_m) * 32);
         if (raw_generic_layout) {
             // The raw pair uses this slot for V^T
@@ -3383,7 +3605,8 @@ protected:
             {"down_bias",  full_bias_sz,  0, 0, StorageClass::PersistentPerLayer, nl, nullptr},
         };
         if (window_mask_present_ && !small_image_native_window_enabled()) {
-            const bool resident_mask = small_image_resident_mask_enabled();
+            const bool resident_mask = small_image_resident_mask_enabled() ||
+                reduced_core_sisc_resident_mask_enabled();
             decls.push_back({"sdpa_mask", mask_sz,
                              resident_mask ? 1 : 3, resident_mask ? 9 : 4,
                              StorageClass::Temp, 0, nullptr});
@@ -3442,7 +3665,7 @@ protected:
         //     (res, 640K@256/1.97M@768). All hold.
         if (merger_active()) {
             const int64_t mrows    = cs / 4;
-            const int64_t local_mh = merge_hidden_ / NUM_CORES;   // 640
+            const int64_t local_mh = merge_hidden_ / num_cores(); // 640@8c, 1280@4c
             const int64_t oh       = merger_out_hidden_;          // 2048
             const int64_t normed_sz = A(cs * h * DWIDTH);                 // == oproj (res)
             const int64_t mid_sz    = A(mrows * local_mh * DWIDTH);
@@ -3454,6 +3677,10 @@ protected:
             decls.push_back({"merger_ln_q_w",  dma_safe(h),              0, 0, StorageClass::Persistent, 0, nullptr});
             decls.push_back({"merger_m0_bias", dma_safe(local_mh),       0, 0, StorageClass::Persistent, 0, nullptr});
             decls.push_back({"merger_m2_bias", dma_safe(oh),             0, 0, StorageClass::Persistent, 0, nullptr});
+        }
+        // Eight lanes keep their measured layout.
+        if (num_cores() != 8) {
+            decls = host_sdpa_out_in_gate(std::move(decls));
         }
         return decls;
     }
@@ -3488,6 +3715,10 @@ protected:
         }
         h = detail::layout_mix(
             h, exact_mimc_native_window_sdpa_enabled() ? 1 : 0);
+        if (const int64_t reduced_flags = reduced_core_sisc_schedule_flags();
+            reduced_flags != 0) {
+            h = detail::layout_mix(h, reduced_flags);
+        }
         return h;
     }
 
@@ -3510,8 +3741,8 @@ protected:
             }
         }
         int64_t h = hidden_size();
-        int64_t local_q_dim = (num_q_heads() / NUM_CORES) * head_dim();
-        int64_t local_inter = intermediate_size() / NUM_CORES;
+        int64_t local_q_dim = (num_q_heads() / num_cores()) * head_dim();
+        int64_t local_inter = intermediate_size() / num_cores();
 
         if (!is_exact_mimc()) {
             // Normal schedule: keep all 32 layers' small parameters resident.
@@ -3520,36 +3751,36 @@ protected:
             for (int64_t L = 0; L < num_layers(); ++L) {
                 auto& bn = layer_bias_norm_[L];
 
-                rpu_launch_memset_spm_multicore(layer_addr(L, 0, "o_bias"), h);
-                rpu_launch_memset_spm_multicore(layer_addr(L, 0, "down_bias"), h);
+                rpu_launch_memset_spm_multicore(layer_addr(L, 0, "o_bias"), h, num_cores());
+                rpu_launch_memset_spm_multicore(layer_addr(L, 0, "down_bias"), h, num_cores());
 
                 rpu_launch_ddr_broadcast_spm_dma(
                     bn.norm1_w.data_ptr<c10::Half>(), h,
-                    layer_addr(L, 0, "norm1_w"));
+                    layer_addr(L, 0, "norm1_w"), num_cores());
                 rpu_launch_ddr_broadcast_spm_dma(
                     bn.norm2_w.data_ptr<c10::Half>(), h,
-                    layer_addr(L, 0, "norm2_w"));
+                    layer_addr(L, 0, "norm2_w"), num_cores());
 
                 rpu_launch_ddr_scatter_spm_dma(
                     bn.q_b.data_ptr<c10::Half>(),
                     local_q_dim, local_q_dim * DWIDTH,
-                    layer_addr(L, 0, "q_bias"), /*num_cores=*/NUM_CORES);
+                    layer_addr(L, 0, "q_bias"), /*num_cores=*/num_cores());
                 rpu_launch_ddr_scatter_spm_dma(
                     bn.k_b.data_ptr<c10::Half>(),
                     local_q_dim, local_q_dim * DWIDTH,
-                    layer_addr(L, 0, "k_bias"), /*num_cores=*/NUM_CORES);
+                    layer_addr(L, 0, "k_bias"), /*num_cores=*/num_cores());
                 rpu_launch_ddr_scatter_spm_dma(
                     bn.v_b.data_ptr<c10::Half>(),
                     local_q_dim, local_q_dim * DWIDTH,
-                    layer_addr(L, 0, "v_bias"), /*num_cores=*/NUM_CORES);
+                    layer_addr(L, 0, "v_bias"), /*num_cores=*/num_cores());
                 rpu_launch_ddr_scatter_spm_dma(
                     bn.gate_b.data_ptr<c10::Half>(),
                     local_inter, local_inter * DWIDTH,
-                    layer_addr(L, 0, "gate_bias"), /*num_cores=*/NUM_CORES);
+                    layer_addr(L, 0, "gate_bias"), /*num_cores=*/num_cores());
                 rpu_launch_ddr_scatter_spm_dma(
                     bn.up_b.data_ptr<c10::Half>(),
                     local_inter, local_inter * DWIDTH,
-                    layer_addr(L, 0, "up_bias"), /*num_cores=*/NUM_CORES);
+                    layer_addr(L, 0, "up_bias"), /*num_cores=*/num_cores());
             }
 
             // Row-partition biases live on core 0 only so all-reduce adds them
@@ -3597,6 +3828,14 @@ protected:
             sdpa_dma_mask_to_spm(
                 prepared_window_mask_, addr_offset("sdpa_mask").value,
                 rows, rows, NUM_CORES);
+        } else if (reduced_core_sisc_resident_mask_enabled()) {
+            TORCH_CHECK(prepared_window_mask_.mask_type == 4 &&
+                            prepared_window_mask_.ddr_tensor.defined(),
+                        "reduced-core resident Vision mask is unavailable");
+            const int64_t rows = current_num_patches_ / image_batch_count_;
+            sdpa_dma_mask_to_spm(
+                prepared_window_mask_, addr_offset("sdpa_mask").value,
+                rows, rows, num_cores());
         }
 
         // Global: broadcast the 2D-RoPE cos/sin tables into SPM once (SPM-rope
@@ -3614,7 +3853,8 @@ protected:
                 /*resolved_flags=*/0,
                 {rope_spm_enabled_ ? 1 : 0, max_hw_, head_dim()});
             rpu_launch_ddr_broadcast_spm_dma(
-                freq_cos_.data_ptr<c10::Half>(), tbl_elems, addr(0, "rope_cos"));
+                freq_cos_.data_ptr<c10::Half>(), tbl_elems, addr(0, "rope_cos"),
+                num_cores());
             ctx().consume_physical_route(
                 FmbRouteFamily::MUTABLE_DMA,
                 QWEN25_ROPE_SIN_PRELOAD_SITE,
@@ -3623,7 +3863,8 @@ protected:
                 /*resolved_flags=*/0,
                 {rope_spm_enabled_ ? 1 : 0, max_hw_, head_dim()});
             rpu_launch_ddr_broadcast_spm_dma(
-                freq_sin_.data_ptr<c10::Half>(), tbl_elems, addr(0, "rope_sin"));
+                freq_sin_.data_ptr<c10::Half>(), tbl_elems, addr(0, "rope_sin"),
+                num_cores());
         }
 
         // Merger ln_q weight + biases (single-image fused path). ln_q broadcast;
@@ -3633,12 +3874,13 @@ protected:
         if (merger_active()) {
             rpu_launch_ddr_broadcast_spm_dma(
                 merger_ln_q_w_.data_ptr<c10::Half>(), hidden_size(),
-                addr(0, "merger_ln_q_w"));
+                addr(0, "merger_ln_q_w"), num_cores());
             rpu_launch_ddr_scatter_spm_dma(
                 merger_m0_b_.data_ptr<c10::Half>(),
-                merge_hidden_ / NUM_CORES, (merge_hidden_ / NUM_CORES) * DWIDTH,
-                addr(0, "merger_m0_bias"), NUM_CORES);
-            rpu_launch_memset_spm_multicore(addr(0, "merger_m2_bias"), merger_out_hidden_);
+                merge_hidden_ / num_cores(), (merge_hidden_ / num_cores()) * DWIDTH,
+                addr(0, "merger_m0_bias"), num_cores());
+            rpu_launch_memset_spm_multicore(
+                addr(0, "merger_m2_bias"), merger_out_hidden_, num_cores());
             rpu_launch_ddr_broadcast_spm_dma(
                 merger_m2_b_.data_ptr<c10::Half>(), merger_out_hidden_,
                 addr(0, "merger_m2_bias"), 1);
@@ -4004,7 +4246,8 @@ protected:
                 FmbRouteFamily::LINEAR, QWEN25_EXACT_O_LINEAR_SITE,
                 row_weight_outer
                     ? static_cast<int64_t>(Qwen25VisionLinearRoute::WALL_ROW_FULL_LOCAL_K)
-                    : qwen25_vision_linear_route(), chunk.idx);
+                    : qwen25_vision_linear_route(), chunk.idx,
+                vision_row_arguments(packed_seq, false, row_weight_outer));
             if (row_weight_outer) {
                 rpu_launch_wall_vision_row_weight_outer_w8a16_spm_kernel(
                     attention_output, lw.o_w, addr(0, "oproj"),
@@ -4133,7 +4376,7 @@ protected:
                 row_weight_outer
                     ? static_cast<int64_t>(Qwen25VisionLinearRoute::WALL_ROW_FULL_LOCAL_K)
                     : qwen25_vision_linear_route(), chunk.idx,
-                {mixed_precision_ ? 1 : 0});
+                vision_row_arguments(down_rows, true, row_weight_outer));
             if (row_weight_outer) {
                 rpu_launch_wall_vision_row_weight_outer_w8a16_spm_kernel(
                     gate_base, lw.down_w, first_packed_h_addr,
@@ -4251,7 +4494,7 @@ protected:
         int64_t nq = num_q_heads();
         int64_t hd = head_dim();
         int64_t is_ = intermediate_size();        // padded (3456)
-        int64_t local_inter = is_ / NUM_CORES;     // 432
+        int64_t local_inter = is_ / num_cores();   // 432 at 8 cores
         const bool residual_is_bf16 =
             mixed_precision_
             && layer_idx > QWEN25VL_VISION_MIXED_BOUNDARY_LAYER;
@@ -4291,7 +4534,8 @@ protected:
                 addr(0, "residual1"), addr(0, "input_norm"),
                 layer_addr(layer_idx, 0, "norm1_w"), seq_len, h, eps_,
                 consume_small_image_rmsnorm_route(
-                    QWEN25_SMALL_INPUT_RMSNORM_SITE, seq_len, chunk.idx));
+                    QWEN25_SMALL_INPUT_RMSNORM_SITE, seq_len, chunk.idx),
+                num_cores());
         }
         emit_debug_phase(0, "input_norm");
 
@@ -4301,25 +4545,25 @@ protected:
             qwen25_vision_linear_route(), chunk.idx);
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "input_norm"), lw.q_w, addr(0, "q"),
-            seq_len, nq * hd, h, 1, NUM_CORES, layer_addr(layer_idx, 0, "q_bias"), lw.q_ws,
+            seq_len, nq * hd, h, 1, num_cores(), layer_addr(layer_idx, 0, "q_bias"), lw.q_ws,
                 /*nvfp4_scale=*/0, /*nvfp4_layer=*/0, /*force_acc32=*/linear_acc32_);
         consume_manifest_route(
             FmbRouteFamily::LINEAR, QWEN25_K_LINEAR_SITE,
             qwen25_vision_linear_route(), chunk.idx);
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "input_norm"), lw.k_w, addr(0, "k"),
-            seq_len, nq * hd, h, 1, NUM_CORES, layer_addr(layer_idx, 0, "k_bias"), lw.k_ws,
+            seq_len, nq * hd, h, 1, num_cores(), layer_addr(layer_idx, 0, "k_bias"), lw.k_ws,
                 /*nvfp4_scale=*/0, /*nvfp4_layer=*/0, /*force_acc32=*/linear_acc32_);
         consume_manifest_route(
             FmbRouteFamily::LINEAR, QWEN25_V_LINEAR_SITE,
             qwen25_vision_linear_route(), chunk.idx);
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "input_norm"), lw.v_w, addr(0, "v"),
-            seq_len, nq * hd, h, 1, NUM_CORES, layer_addr(layer_idx, 0, "v_bias"), lw.v_ws,
+            seq_len, nq * hd, h, 1, num_cores(), layer_addr(layer_idx, 0, "v_bias"), lw.v_ws,
                 /*nvfp4_scale=*/0, /*nvfp4_layer=*/0, /*force_acc32=*/linear_acc32_);
 
-        // Phase 2.5: 2D RoPE on Q and K (in-place). Each core holds nq/8=2 heads.
-        const int64_t local_heads = nq / NUM_CORES;
+        // Phase 2.5: 2D RoPE on Q and K (in-place). Each core holds nq/num_cores() heads.
+        const int64_t local_heads = nq / num_cores();
         const int64_t head_dim_pad = hd;  // head_dim=80, no padding.
         if (small_image_qk_rope_enabled(seq_len)) {
             consume_small_image_qk_rope(seq_len, chunk.offset, chunk.idx);
@@ -4340,7 +4584,7 @@ protected:
                 addr(0, "q"), addr(0, "q"), cos_a, sin_a,
                 position_idx_keepalive_.data_ptr<int16_t>(),
                 /*pos_offset=*/chunk.offset, seq_len,
-                local_heads, hd, head_dim_pad, NUM_CORES);
+                local_heads, hd, head_dim_pad, num_cores());
             consume_manifest_route(
                 FmbRouteFamily::ROPE, QWEN25_K_ROPE_SPM_SITE,
                 static_cast<int64_t>(
@@ -4351,7 +4595,7 @@ protected:
                 addr(0, "k"), addr(0, "k"), cos_a, sin_a,
                 position_idx_keepalive_.data_ptr<int16_t>(),
                 /*pos_offset=*/chunk.offset, seq_len,
-                local_heads, hd, head_dim_pad, NUM_CORES);
+                local_heads, hd, head_dim_pad, num_cores());
         } else {
             consume_manifest_route(
                 FmbRouteFamily::ROPE, QWEN25_Q_ROPE_DDR_SITE,
@@ -4364,7 +4608,7 @@ protected:
                 freq_cos_.data_ptr<c10::Half>(), freq_sin_.data_ptr<c10::Half>(),
                 position_idx_keepalive_.data_ptr<int16_t>(),
                 /*pos_offset=*/chunk.offset, seq_len,
-                local_heads, hd, head_dim_pad, NUM_CORES);
+                local_heads, hd, head_dim_pad, num_cores());
             consume_manifest_route(
                 FmbRouteFamily::ROPE, QWEN25_K_ROPE_DDR_SITE,
                 static_cast<int64_t>(
@@ -4376,7 +4620,7 @@ protected:
                 freq_cos_.data_ptr<c10::Half>(), freq_sin_.data_ptr<c10::Half>(),
                 position_idx_keepalive_.data_ptr<int16_t>(),
                 /*pos_offset=*/chunk.offset, seq_len,
-                local_heads, hd, head_dim_pad, NUM_CORES);
+                local_heads, hd, head_dim_pad, num_cores());
         }
 
         // Phase 3: KV cache insert (position=0) + bidirectional SDPA (MASK_NONE).
@@ -4389,11 +4633,15 @@ protected:
             // Q/K/V remain in the declared phase-2..3 SPM buffers. The exact
             // full/window attention consumers below never read RPUCache. Do
             // not emit a durable DDR copy solely for the discarded candidate.
+        } else if (reduced_core_sisc_raw_kv_only_enabled()) {
+            TORCH_CHECK(ctx().has_complete_physical_manifest() &&
+                            ctx().attention_policy == AttentionExecutionPolicy::SPM_KV_BY_MHA,
+                        "reduced-core raw-only Vision requires its COMPLETE raw-SPM plan");
         } else {
             const KvInsertSegmentPlan kv_plan = [&] {
                 if (!ctx().has_complete_physical_manifest()) {
                     return rpu_resolve_kvinsert_segment_plan_auto(
-                        /*position=*/0, seq_len, seq_len, NUM_CORES, nq, hd,
+                        /*position=*/0, seq_len, seq_len, num_cores(), nq, hd,
                         QWEN25_KV_CAPABILITIES);
                 }
                 const FmbRouteManifestEntry& route = ctx().find_physical_route(
@@ -4401,7 +4649,7 @@ protected:
                     chunk.idx);
                 const KvInsertSegmentPlan planned =
                     restore_kvinsert_plan(
-                        QWEN25_KV_INSERT_SITE, route.arguments, NUM_CORES, nq, hd);
+                        QWEN25_KV_INSERT_SITE, route.arguments, num_cores(), nq, hd);
                 TORCH_CHECK(
                     planned.logical_rows() == seq_len &&
                         planned.physical_rows() == seq_len &&
@@ -4416,7 +4664,7 @@ protected:
             rpu_launch_insert_kvcache_spm_unified_with_plan(
                 k_cache, v_cache,
                 addr_offset("k").value, addr_offset("v").value,
-                nq, hd, NUM_CORES,
+                nq, hd, num_cores(),
                 /*k_cache_batch_offset_elems=*/0,
                 /*v_cache_batch_offset_elems=*/0,
                 /*spm_rows=*/0, kv_plan);
@@ -4537,7 +4785,7 @@ protected:
             // Controlled single-image path: window-reordered patches make each
             // [begin,end) range contiguous in Q/output and KV-cache storage. Run
             // MASK_NONE inside each window, avoiding the dense [seq,seq] mask.
-            const int64_t qd = (nq / NUM_CORES) * hd;
+            const int64_t qd = (nq / num_cores()) * hd;
             int64_t route_invocation = 0;
             for (size_t wi = 0; wi + 1 < cu_window_.size(); ++wi) {
                 const int64_t window_begin = cu_window_[wi];
@@ -4580,7 +4828,7 @@ protected:
                             rpu_launch_v_transpose_spm(
                                 addr(0, "v") + window_byte_offset,
                                 addr(0, "sdpa_tmp"), /*batch=*/1,
-                                window_len, nq, hd, NUM_CORES);
+                                window_len, nq, hd, num_cores());
                             raw_v_ready = true;
                         }
                         const uint32_t query_byte_offset =
@@ -4593,7 +4841,7 @@ protected:
                             addr(0, "sdpa_out") + query_byte_offset,
                             /*mask_spm=*/0, /*mask_type=*/0, attn_scale,
                             /*batch=*/1, query_len, window_len,
-                            nq, nq, hd, NUM_CORES);
+                            nq, nq, hd, num_cores());
                     } else {
                         consume_generic_attention_route(
                             site, /*mask_type=*/0,
@@ -4604,7 +4852,8 @@ protected:
                             k_slice, v_slice, /*mask_type=*/0, attn_scale,
                             q_off, out_off, addr_offset("sdpa_tmp").value,
                             /*mask_off=*/0, query_len, nq, nq, hd,
-                            window_len, NUM_CORES, NUM_CORES);
+                            window_len, num_cores(),
+                            DecoderExecutionTopology::physical_kv_cores);
                     }
                 }
             }
@@ -4613,8 +4862,10 @@ protected:
             if (!is_full) {
                 mask_off = addr_offset("sdpa_mask").value;
                 if (!small_image_resident_mask_enabled()) {
-                    sdpa_dma_mask_to_spm(prepared_window_mask_, mask_off,
-                                         seq_len, seq_len, NUM_CORES);
+                    if (!reduced_core_sisc_resident_mask_enabled()) {
+                        sdpa_dma_mask_to_spm(prepared_window_mask_, mask_off,
+                                             seq_len, seq_len, num_cores());
+                    }
                 }
             }
 
@@ -4626,9 +4877,11 @@ protected:
             // MASK_2D is row-major
             // [seq_q, aligned_seq_k], so each strip advances the mask base by
             // q_begin rows; MASK_NONE ignores the address.
-            const int64_t qd = (nq / NUM_CORES) * hd;
+            const int64_t qd = (nq / num_cores()) * hd;
             const int64_t mask_row_elems = Align(seq_len, 16);
-            const bool single_raw_query = small_image_single_raw_query_enabled();
+            const bool single_raw_query =
+                small_image_single_raw_query_enabled() ||
+                reduced_core_sisc_single_raw_query_enabled(seq_len);
             const int64_t query_chunk = single_raw_query
                 ? seq_len : ((seq_len > 256)
                     ? QWEN25VL_VISION_SDPA_QUERY_CHUNK : seq_len);
@@ -4664,7 +4917,7 @@ protected:
                     if (!raw_v_ready) {
                         rpu_launch_v_transpose_spm(
                             addr(0, "v"), addr(0, "sdpa_tmp"),
-                            /*batch=*/1, seq_len, nq, hd, NUM_CORES);
+                            /*batch=*/1, seq_len, nq, hd, num_cores());
                         raw_v_ready = true;
                     }
                     const uint32_t query_byte_offset =
@@ -4679,7 +4932,7 @@ protected:
                         addr(0, "sdpa_out") + query_byte_offset,
                         raw_mask, mask_type, attn_scale,
                         /*batch=*/1, query_len, seq_len,
-                        nq, nq, hd, NUM_CORES);
+                        nq, nq, hd, num_cores());
                 } else {
                     consume_generic_attention_route(
                         site, mask_type, AttentionExecutionPolicy::DDR_KV,
@@ -4689,7 +4942,8 @@ protected:
                         k_cache, v_cache, mask_type, attn_scale,
                         q_off, out_off, addr_offset("sdpa_tmp").value,
                         query_mask_off, query_len, nq, nq, hd,
-                        seq_len, NUM_CORES, NUM_CORES);
+                        seq_len, num_cores(),
+                        DecoderExecutionTopology::physical_kv_cores);
                 }
             }
         }
@@ -4706,7 +4960,7 @@ protected:
             : qwen25_vision_linear_route();
         consume_manifest_route(
             FmbRouteFamily::LINEAR, QWEN25_O_LINEAR_SITE,
-            row_route, chunk.idx);
+            row_route, chunk.idx, vision_row_arguments(seq_len, false, small_row_weight_outer));
         if (small_row_weight_outer) {
             rpu_launch_wall_vision_row_weight_outer_w8a16_spm_kernel(
                 addr(0, "sdpa_out"), lw.o_w, addr(0, "oproj"),
@@ -4715,7 +4969,7 @@ protected:
         } else {
             rpu_launch_linear_spm_to_spm_acc16_kernel(
                 addr(0, "sdpa_out"), lw.o_w, addr(0, "oproj"),
-                seq_len, h, nq * hd, 0, NUM_CORES,
+                seq_len, h, nq * hd, 0, num_cores(),
                 layer_addr(layer_idx, 0, "o_bias"), lw.o_ws,
                 /*nvfp4_scale=*/0, /*nvfp4_layer=*/0, /*force_acc32=*/linear_acc32_);
         }
@@ -4738,10 +4992,10 @@ protected:
         } else {
             consume_manifest_route(
                 FmbRouteFamily::ALL_REDUCE, QWEN25_ATTN_REDUCE_SITE,
-                qwen25_vision_ring_route(seq_len, h), chunk.idx);
+                qwen25_vision_ring_route(seq_len, h, num_cores()), chunk.idx);
             rpu_launch_all_reduce_sum_residual_kernel(
                 addr(0, "oproj"), addr(0, "residual1"),
-                addr(0, "input_norm"), seq_len, h, NUM_CORES, NUM_CORES);
+                addr(0, "input_norm"), seq_len, h, num_cores(), num_cores());
         }
         emit_debug_phase(1, "input_norm");
 
@@ -4758,67 +5012,119 @@ protected:
                 addr(0, "input_norm"), addr(0, "oproj"),
                 layer_addr(layer_idx, 0, "norm2_w"), seq_len, h, eps_,
                 consume_small_image_rmsnorm_route(
-                    QWEN25_SMALL_POST_RMSNORM_SITE, seq_len, chunk.idx));
+                    QWEN25_SMALL_POST_RMSNORM_SITE, seq_len, chunk.idx),
+                num_cores());
         }
         emit_debug_phase(2, "oproj");
 
-        if (small_image_acc16_gate_up_projection_enabled(seq_len)) {
-            consume_manifest_route(
-                FmbRouteFamily::LINEAR, QWEN25_GATE_LINEAR_SITE,
-                static_cast<int64_t>(
-                    Qwen25VisionLinearRoute::WALL_SINGLE_BASE_GATE_UP_SWIGLU),
-                chunk.idx, small_image_gate_up_arguments(seq_len));
-            rpu_launch_wall_vision_gate_up_swiglu_w8a16_spm_kernel(
-                addr(0, "oproj"), lw.gate_w, lw.up_w, addr(0, "gate"),
-                layer_addr(layer_idx, 0, "gate_bias"),
-                layer_addr(layer_idx, 0, "up_bias"), lw.gate_ws, lw.up_ws,
-                0, 0, 0, 0, wall_sorting_, seq_len);
-        } else {
-            const int64_t elems = seq_len * local_inter;
-            consume_manifest_route(
-                FmbRouteFamily::LINEAR, QWEN25_GATE_LINEAR_SITE,
-                qwen25_vision_linear_route(), chunk.idx);
-            rpu_launch_linear_spm_to_spm_acc16_kernel(
-                addr(0, "oproj"), lw.gate_w, addr(0, "gate"),
-                seq_len, is_, h, 1, NUM_CORES,
-                layer_addr(layer_idx, 0, "gate_bias"), lw.gate_ws,
-                /*nvfp4_scale=*/0, /*nvfp4_layer=*/0, /*force_acc32=*/linear_acc32_);
-            const bool fuse_silu_mul = wall_sorting_.silu_mul &&
-                (mixed_precision_ || small_image_row_weight_outer_enabled(seq_len));
-            if (!fuse_silu_mul) {
-                rpu_launch_eltwise_unary_spm_kernel(
-                    addr(0, "gate"), addr(0, "gate"), elems, ValuOpType::SILU);
-            }
-            consume_manifest_route(
-                FmbRouteFamily::LINEAR, QWEN25_UP_LINEAR_SITE,
-                qwen25_vision_linear_route(), chunk.idx);
-            rpu_launch_linear_spm_to_spm_acc16_kernel(
-                addr(0, "oproj"), lw.up_w, addr(0, "up"),
-                seq_len, is_, h, 1, NUM_CORES,
-                layer_addr(layer_idx, 0, "up_bias"), lw.up_ws,
-                /*nvfp4_scale=*/0, /*nvfp4_layer=*/0, /*force_acc32=*/linear_acc32_);
-            if (fuse_silu_mul) {
-                rpu_launch_silu_mul_spm_kernel(
-                    addr(0, "gate"), addr(0, "up"), addr(0, "gate"), elems, NUM_CORES);
+        const int64_t layout_cs =
+            ctx().stage_plan.compute.chunks.empty()
+                ? seq_len
+                : ctx().stage_plan.compute.chunks.front().len;
+        const int64_t mlp_strip_rows =
+            (num_cores() != 8 && is_generic() &&
+             !window_mask_present_ && layout_cs > 576)
+            ? Align(CeilDiv(layout_cs, int64_t{2}), int64_t{16})
+            : seq_len;
+        TORCH_CHECK(mlp_strip_rows >= seq_len ||
+                        (!small_image_acc16_gate_up_projection_enabled(seq_len) &&
+                         !mixed_precision_ && !small_row_weight_outer),
+                    "Qwen2.5-VL Vision reduced MLP strips require generic non-mixed execution");
+
+        for (int64_t mlp_off = 0; mlp_off < seq_len; mlp_off += mlp_strip_rows) {
+            const int64_t mlp_len = std::min(mlp_strip_rows, seq_len - mlp_off);
+            const uint32_t oproj_strip =
+                addr(0, "oproj") + static_cast<uint32_t>(mlp_off * h * DWIDTH);
+            if (small_image_acc16_gate_up_projection_enabled(seq_len)) {
+                consume_manifest_route(
+                    FmbRouteFamily::LINEAR, QWEN25_GATE_LINEAR_SITE,
+                    static_cast<int64_t>(
+                        Qwen25VisionLinearRoute::WALL_SINGLE_BASE_GATE_UP_SWIGLU),
+                    chunk.idx, small_image_gate_up_arguments(seq_len));
+                rpu_launch_wall_vision_gate_up_swiglu_w8a16_spm_kernel(
+                    oproj_strip, lw.gate_w, lw.up_w, addr(0, "gate"),
+                    layer_addr(layer_idx, 0, "gate_bias"),
+                    layer_addr(layer_idx, 0, "up_bias"), lw.gate_ws, lw.up_ws,
+                    0, 0, 0, 0, wall_sorting_, mlp_len);
             } else {
-                rpu_launch_eltwise_binary_spm_kernel(
-                    addr(0, "gate"), addr(0, "up"), addr(0, "gate"),
-                    elems, ValuOpType::MUL, c10::Half(1.0));
+                const int64_t elems = mlp_len * local_inter;
+                consume_manifest_route(
+                    FmbRouteFamily::LINEAR, QWEN25_GATE_LINEAR_SITE,
+                    qwen25_vision_linear_route(), chunk.idx);
+                rpu_launch_linear_spm_to_spm_acc16_kernel(
+                    oproj_strip, lw.gate_w, addr(0, "gate"),
+                    mlp_len, is_, h, 1, num_cores(),
+                    layer_addr(layer_idx, 0, "gate_bias"), lw.gate_ws,
+                    /*nvfp4_scale=*/0, /*nvfp4_layer=*/0, /*force_acc32=*/linear_acc32_);
+                bool fuse_silu_mul = wall_sorting_.silu_mul &&
+                    (mixed_precision_ || small_image_row_weight_outer_enabled(seq_len));
+                const bool reduced_sisc_silu_mul =
+                    num_cores() != 8 && is_generic() && !mixed_precision_ &&
+                    !per_window_sdpa_enabled_ && !z1_bound_ &&
+                    !get_debug_export() && schedule_ == VisionSchedule::SISC &&
+                    image_batch_count_ == 1 && (seq_len == 256 || seq_len == 576) &&
+                    elems % 32 == 0;
+                if (reduced_sisc_silu_mul) {
+                    fuse_silu_mul = true;
+                }
+                if (!fuse_silu_mul) {
+                    rpu_launch_eltwise_unary_spm_kernel(
+                        addr(0, "gate"), addr(0, "gate"), elems, ValuOpType::SILU,
+                        GeluMode::NONE, num_cores());
+                }
+                consume_manifest_route(
+                    FmbRouteFamily::LINEAR, QWEN25_UP_LINEAR_SITE,
+                    qwen25_vision_linear_route(), chunk.idx);
+                rpu_launch_linear_spm_to_spm_acc16_kernel(
+                    oproj_strip, lw.up_w, addr(0, "up"),
+                    mlp_len, is_, h, 1, num_cores(),
+                    layer_addr(layer_idx, 0, "up_bias"), lw.up_ws,
+                    /*nvfp4_scale=*/0, /*nvfp4_layer=*/0, /*force_acc32=*/linear_acc32_);
+                if (fuse_silu_mul) {
+                    rpu_launch_silu_mul_spm_kernel(
+                        addr(0, "gate"), addr(0, "up"), addr(0, "gate"), elems, num_cores());
+                } else {
+                    rpu_launch_eltwise_binary_spm_kernel(
+                        addr(0, "gate"), addr(0, "up"), addr(0, "gate"),
+                        elems, ValuOpType::MUL, c10::Half(1.0), num_cores());
+                }
+            }
+
+            // Phase 6a: down_proj (row-partition, with bias) per MLP strip.
+            if (mixed_precision_
+                && layer_idx == QWEN25VL_VISION_MIXED_BOUNDARY_LAYER) {
+                consume_manifest_route(
+                    FmbRouteFamily::LINEAR, QWEN25_DOWN_BF16_LINEAR_SITE,
+                    static_cast<int64_t>(
+                        Qwen25VisionLinearRoute::ACC32_OUT_BF16), chunk.idx);
+                rpu_launch_linear_spm_to_spm_acc32_out_bf16_kernel(
+                    addr(0, "gate"), lw.down_w, oproj_strip,
+                    mlp_len, h, is_, /*row=*/0, NUM_CORES,
+                    layer_addr(layer_idx, 0, "down_bias"));
+            } else {
+                consume_manifest_route(
+                    FmbRouteFamily::LINEAR, QWEN25_DOWN_LINEAR_SITE,
+                    row_route, chunk.idx,
+                    vision_row_arguments(seq_len, true, small_row_weight_outer));
+                if (small_row_weight_outer) {
+                    rpu_launch_wall_vision_row_weight_outer_w8a16_spm_kernel(
+                        addr(0, "gate"), lw.down_w, oproj_strip,
+                        mlp_len, h, is_, layer_addr(layer_idx, 0, "down_bias"),
+                        lw.down_ws, wall_sorting_);
+                } else {
+                    rpu_launch_linear_spm_to_spm_acc16_kernel(
+                        addr(0, "gate"), lw.down_w, oproj_strip,
+                        mlp_len, h, is_, 0, num_cores(),
+                        layer_addr(layer_idx, 0, "down_bias"), lw.down_ws,
+                        /*nvfp4_scale=*/0, /*nvfp4_layer=*/0, /*force_acc32=*/linear_acc32_);
+                }
             }
         }
 
-        // Phase 6: down_proj (row-partition, with bias) + AllReduce + Residual.
+        // Phase 6b: AllReduce + Residual over full chunk.
         // residual1 := reduce(oproj) + input_norm = block output (SPM_RESIDENT).
         if (mixed_precision_
             && layer_idx == QWEN25VL_VISION_MIXED_BOUNDARY_LAYER) {
-            consume_manifest_route(
-                FmbRouteFamily::LINEAR, QWEN25_DOWN_BF16_LINEAR_SITE,
-                static_cast<int64_t>(
-                    Qwen25VisionLinearRoute::ACC32_OUT_BF16), chunk.idx);
-            rpu_launch_linear_spm_to_spm_acc32_out_bf16_kernel(
-                addr(0, "gate"), lw.down_w, addr(0, "oproj"),
-                seq_len, h, is_, /*row=*/0, NUM_CORES,
-                layer_addr(layer_idx, 0, "down_bias"));
             consume_manifest_route(
                 FmbRouteFamily::ALL_REDUCE,
                 QWEN25_DOWN_BF16_REDUCE_SITE,
@@ -4829,48 +5135,30 @@ protected:
             rpu_launch_all_reduce_bf16_partial_fp16_residual_spm_kernel(
                 addr(0, "oproj"), addr(0, "input_norm"),
                 addr(0, "residual1"), seq_len, h);
+        } else if (residual_is_bf16) {
+            consume_manifest_route(
+                FmbRouteFamily::ALL_REDUCE,
+                QWEN25_DOWN_MIXED_REDUCE_SITE,
+                static_cast<int64_t>(
+                    Qwen25VisionAllReduceRoute::
+                        FP16_PARTIAL_BF16_RESIDUAL),
+                chunk.idx);
+            rpu_launch_all_reduce_fp16_partial_bf16_residual_spm_kernel(
+                addr(0, "oproj"), addr(0, "input_norm"),
+                addr(0, "residual1"), seq_len, h);
+        } else if (down_owner_norm && layer_idx + 1 < num_layers()) {
+            consume_small_image_down_owner_norm(seq_len, layer_idx);
+            rpu_launch_wall_base_vision_down_owner_ring_norm_m672_kernel(
+                addr(0, "oproj"), addr(0, "input_norm"), addr(0, "residual1"),
+                layer_addr(layer_idx + 1, 0, "norm1_w"), eps_);
         } else {
             consume_manifest_route(
-                FmbRouteFamily::LINEAR, QWEN25_DOWN_LINEAR_SITE,
-                row_route, chunk.idx,
-                {mixed_precision_ ? 1 : 0});
-            if (small_row_weight_outer) {
-                rpu_launch_wall_vision_row_weight_outer_w8a16_spm_kernel(
-                    addr(0, "gate"), lw.down_w, addr(0, "oproj"),
-                    seq_len, h, is_, layer_addr(layer_idx, 0, "down_bias"),
-                    lw.down_ws, wall_sorting_);
-            } else {
-                rpu_launch_linear_spm_to_spm_acc16_kernel(
-                    addr(0, "gate"), lw.down_w, addr(0, "oproj"),
-                    seq_len, h, is_, 0, NUM_CORES,
-                    layer_addr(layer_idx, 0, "down_bias"), lw.down_ws,
-                /*nvfp4_scale=*/0, /*nvfp4_layer=*/0, /*force_acc32=*/linear_acc32_);
-            }
-            if (residual_is_bf16) {
-                consume_manifest_route(
-                    FmbRouteFamily::ALL_REDUCE,
-                    QWEN25_DOWN_MIXED_REDUCE_SITE,
-                    static_cast<int64_t>(
-                        Qwen25VisionAllReduceRoute::
-                            FP16_PARTIAL_BF16_RESIDUAL),
-                    chunk.idx);
-                rpu_launch_all_reduce_fp16_partial_bf16_residual_spm_kernel(
-                    addr(0, "oproj"), addr(0, "input_norm"),
-                    addr(0, "residual1"), seq_len, h);
-            } else if (down_owner_norm && layer_idx + 1 < num_layers()) {
-                consume_small_image_down_owner_norm(seq_len, layer_idx);
-                rpu_launch_wall_base_vision_down_owner_ring_norm_m672_kernel(
-                    addr(0, "oproj"), addr(0, "input_norm"), addr(0, "residual1"),
-                    layer_addr(layer_idx + 1, 0, "norm1_w"), eps_);
-            } else {
-                consume_manifest_route(
-                    FmbRouteFamily::ALL_REDUCE, QWEN25_DOWN_REDUCE_SITE,
-                    qwen25_vision_ring_route(seq_len, h), chunk.idx);
-                rpu_launch_all_reduce_sum_residual_kernel(
-                    addr(0, "oproj"), addr(0, "input_norm"),
-                    addr(0, "residual1"), seq_len, h,
-                    NUM_CORES, NUM_CORES);
-            }
+                FmbRouteFamily::ALL_REDUCE, QWEN25_DOWN_REDUCE_SITE,
+                qwen25_vision_ring_route(seq_len, h, num_cores()), chunk.idx);
+            rpu_launch_all_reduce_sum_residual_kernel(
+                addr(0, "oproj"), addr(0, "input_norm"),
+                addr(0, "residual1"), seq_len, h,
+                num_cores(), num_cores());
         }
 
         if (get_debug_export() && per_layer_debug_buf_.defined()) {
@@ -4920,7 +5208,7 @@ protected:
         const int64_t mh       = merge_hidden_;           // 5120
         const int64_t oh       = merger_out_hidden_;      // 2048
         const int64_t mrows    = seq / 4;                 // merged rows (SMS*SMS=4)
-        const int64_t local_mh = mh / NUM_CORES;          // 640
+        const int64_t local_mh = mh / num_cores();        // 640@8c, 1280@4c
 
         // 1. RMSNorm(ln_q) over h: input_addr[seq,h] (full per core) ->
         //    merger_normed.
@@ -4939,7 +5227,8 @@ protected:
                     input_addr, normalized_addr,
                     addr(0, "merger_ln_q_w"), seq, h, eps_,
                     consume_small_image_rmsnorm_route(
-                        QWEN25_SMALL_MERGER_RMSNORM_SITE, seq, invocation));
+                        QWEN25_SMALL_MERGER_RMSNORM_SITE, seq, invocation),
+                    num_cores());
             }
         }
 
@@ -4950,14 +5239,14 @@ protected:
             qwen25_vision_linear_route(), invocation);
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             normalized_addr, merger_m0_w_, addr(0, "merger_mid"),
-            mrows, mh, mh, /*col*/1, NUM_CORES, addr(0, "merger_m0_bias"), at::Tensor{},
+            mrows, mh, mh, /*col*/1, num_cores(), addr(0, "merger_m0_bias"), at::Tensor{},
             /*nvfp4_scale=*/0, /*nvfp4_layer=*/0, /*force_acc32=*/linear_acc32_);
 
         // 3. GELU, per-core element count (col slice).
         rpu_launch_eltwise_unary_spm_kernel(
             addr(0, "merger_mid"), addr(0, "merger_mid"),
             mrows * local_mh, ValuOpType::ADD,
-            GeluMode::ERF, NUM_CORES);
+            GeluMode::ERF, num_cores());
 
         // 4. m2 GEMM (row): merger_mid [mrows, mh] (col slice = K-slice) ->
         //    merger_normed REUSED as PARTIAL [mrows, oh] per core + bias (core 0).
@@ -4970,23 +5259,23 @@ protected:
             qwen25_vision_linear_route(), invocation);
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "merger_mid"), merger_m2_w_, partial_addr,
-            mrows, oh, mh, /*row*/0, NUM_CORES, addr(0, "merger_m2_bias"), at::Tensor{},
+            mrows, oh, mh, /*row*/0, num_cores(), addr(0, "merger_m2_bias"), at::Tensor{},
             /*nvfp4_scale=*/0, /*nvfp4_layer=*/0, /*force_acc32=*/linear_acc32_);
 
         // 5. all-reduce(partial=merger_normed) + zero residual(merger_zero) ->
         //    merger_out [mrows, oh]. Three DISTINCT live slots (oproj/input_norm/
         //    residual1 offsets): partial=merger_normed, zero=merger_zero,
         //    out=merger_out. (no non-residual reduce variant; zero first.)
-        rpu_launch_memset_spm_multicore(addr(0, "merger_zero"), mrows * oh);
+        rpu_launch_memset_spm_multicore(addr(0, "merger_zero"), mrows * oh, num_cores());
         const uint32_t merger_out_addr = z1_bound_
             ? z1_source_addr_
             : (output_addr != 0 ? output_addr : addr(0, "merger_out"));
         consume_manifest_route(
             FmbRouteFamily::ALL_REDUCE, QWEN25_MERGER_REDUCE_SITE,
-            qwen25_vision_ring_route(mrows, oh), invocation);
+            qwen25_vision_ring_route(mrows, oh, num_cores()), invocation);
         rpu_launch_all_reduce_sum_residual_kernel(
             partial_addr, addr(0, "merger_zero"), merger_out_addr,
-            mrows, oh, NUM_CORES, NUM_CORES);
+            mrows, oh, num_cores(), num_cores());
 
         if (!z1_bound_) {
             // 6. SPM(core 0) -> the fresh post_output_tensor_. Its DDR address
@@ -5200,6 +5489,10 @@ private:
                 &merger_m2_b_}) {
             append_kvinsert_cost_tensor_identity(identity, *tensor);
         }
+        if (num_cores() != 8 && small_rmsnorm_capability_ != RPU_RMSNORM_CAP_BASE) {
+            identity.insert(identity.end(), {QWEN25_SMALL_INPUT_RMSNORM_SITE,
+                1, static_cast<int64_t>(small_rmsnorm_capability_)});
+        }
         if (small_owner_ring_norm_available_) {
             identity.insert(identity.end(), {QWEN25_SMALL_OWNER_RING_NORM_SITE,
                 1, static_cast<int64_t>(small_rmsnorm_capability_)});
@@ -5360,6 +5653,16 @@ void rpu_qwen25vl_vision_set_per_window_sdpa(int64_t handle, bool enabled) {
 void rpu_qwen25vl_vision_set_linear_acc32(int64_t handle, bool enabled) {
     Qwen25VLVisionRegistry::get(handle, "rpu_qwen25vl_vision_set_linear_acc32")
         ->set_linear_acc32(enabled);
+}
+
+void rpu_qwen25vl_vision_set_execution_core_count(int64_t handle, int64_t cores) {
+    Qwen25VLVisionRegistry::get(handle, "rpu_qwen25vl_vision_set_execution_core_count")
+        ->set_execution_cores(cores);
+}
+
+std::vector<int64_t> rpu_qwen25vl_vision_get_execution_topology(int64_t handle) {
+    return Qwen25VLVisionRegistry::get(handle, "rpu_qwen25vl_vision_get_execution_topology")
+        ->execution_topology();
 }
 
 void rpu_qwen25vl_vision_set_wall_sorting_routes(

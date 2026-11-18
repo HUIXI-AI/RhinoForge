@@ -90,6 +90,12 @@ bool RpuKernelGraph::capture_replay_child_skip_data(ND data) {
 
 template <typename ND>
 void RpuKernelGraph::capture_data(ND data) {
+    // HostCallback/Tier3 constructors record before invoking the CPU operator.
+    // Reject here, not only at end(), so an .out callback cannot mutate live
+    // DDR before the single-segment contract fails. Typed DMA and authenticated
+    // manifest metadata use their dedicated recorders and remain admissible.
+    TORCH_CHECK(!require_single_segment_,
+                "Single-segment Graph forbids host/data/child-graph capture");
     if constexpr (std::is_same_v<ND, BranchNodeData>) {
         TORCH_CHECK(data.label != BranchNodeData::physical_manifest_label(),
                     "capture_data: reserved physical manifest label is forbidden");

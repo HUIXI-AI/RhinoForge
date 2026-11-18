@@ -21,11 +21,20 @@ def prepare(config):
     module = import_module("examples.runners." + module_name)
     runner = SimpleNamespace(source_config=config, owner=None)
     policy = target in {"wall_oss", "gr00t", "hy_vla", "lingbot", "internvla_n1"} or (
-        target == "rhinovla" and "runtime_factory" in config["input"])
+        target == "rhinovla" and bool({"runtime_factory", "source_dir"} & set(config["input"])))
     try:
         if text:
-            return module.prepare(config, runner)
-        infer = module.prepare(runner)
+            infer, runner.owner = module.prepare(config, runner)
+        else:
+            infer = module.prepare(runner)
+        if hasattr(runner, "input_geometry"):
+            infer.input_geometry = runner.input_geometry
+        if hasattr(runner, "cpu_reference"):
+            # Set by runners holding a CPU reference when [run].reference != off.
+            infer.cpu_reference = runner.cpu_reference
+        if hasattr(runner, "stage_boundaries"):
+            # (stage, owner, method) calls timed during the measured runs.
+            infer.stage_boundaries = runner.stage_boundaries
         return infer, runner.owner
     except BaseException as error:
         try:

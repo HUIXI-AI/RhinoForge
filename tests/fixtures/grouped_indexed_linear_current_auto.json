@@ -1,0 +1,2742 @@
+{
+  "reference": "upstream Python selector; policy only, not performance",
+  "source_sha256": "4fa3089bc928ea8c3a849fd2b3acdc609dd85788a13bab0833995f79da7da3b2",
+  "cases": [
+    {
+      "indexed": true,
+      "mode": 2,
+      "T": 64,
+      "R": 512,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        544,
+        32,
+        128,
+        8
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 2,
+      "T": 64,
+      "R": 512,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        272,
+        48,
+        256,
+        8
+      ],
+      "source": "pl_m1_exact_capacity_filtered"
+    },
+    {
+      "indexed": true,
+      "mode": 2,
+      "T": 128,
+      "R": 1024,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        544,
+        32,
+        128,
+        8
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 2,
+      "T": 128,
+      "R": 1024,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        272,
+        48,
+        256,
+        8
+      ],
+      "source": "pl_m1_exact_capacity_filtered"
+    },
+    {
+      "indexed": true,
+      "mode": 2,
+      "T": 256,
+      "R": 2048,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        544,
+        32,
+        128,
+        8
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 2,
+      "T": 256,
+      "R": 2048,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        272,
+        48,
+        256,
+        8
+      ],
+      "source": "pl_m1_exact_capacity_filtered"
+    },
+    {
+      "indexed": true,
+      "mode": 2,
+      "T": 384,
+      "R": 2048,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        544,
+        32,
+        128,
+        8
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 2,
+      "T": 384,
+      "R": 2048,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        272,
+        48,
+        256,
+        8
+      ],
+      "source": "pl_m1_exact_capacity_filtered"
+    },
+    {
+      "indexed": true,
+      "mode": 2,
+      "T": 512,
+      "R": 2048,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        544,
+        32,
+        128,
+        8
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 2,
+      "T": 512,
+      "R": 2048,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        272,
+        48,
+        256,
+        8
+      ],
+      "source": "pl_m1_exact_capacity_filtered"
+    },
+    {
+      "indexed": true,
+      "mode": 2,
+      "T": 768,
+      "R": 2048,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        544,
+        32,
+        128,
+        8
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 2,
+      "T": 768,
+      "R": 2048,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        272,
+        48,
+        256,
+        8
+      ],
+      "source": "pl_m1_exact_capacity_filtered"
+    },
+    {
+      "indexed": true,
+      "mode": 2,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 96,
+      "K": 384,
+      "Q": 0,
+      "TP": 1,
+      "installation": "all",
+      "expected": [
+        320,
+        64,
+        192,
+        8
+      ],
+      "source": "pl_m1_neighbor"
+    },
+    {
+      "indexed": true,
+      "mode": 2,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 96,
+      "K": 384,
+      "Q": 0,
+      "TP": 1,
+      "installation": "retained",
+      "expected": [
+        176,
+        112,
+        256,
+        8
+      ],
+      "source": "pl_m1_neighbor"
+    },
+    {
+      "indexed": true,
+      "mode": 2,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 32,
+      "K": 32,
+      "Q": 0,
+      "TP": 1,
+      "installation": "all",
+      "expected": [
+        400,
+        80,
+        128,
+        8
+      ],
+      "source": "pl_m1_neighbor"
+    },
+    {
+      "indexed": true,
+      "mode": 2,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 32,
+      "K": 32,
+      "Q": 0,
+      "TP": 1,
+      "installation": "retained",
+      "expected": [
+        176,
+        112,
+        256,
+        8
+      ],
+      "source": "pl_m1_neighbor"
+    },
+    {
+      "indexed": true,
+      "mode": 2,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 64,
+      "K": 64000,
+      "Q": 0,
+      "TP": 1,
+      "installation": "all",
+      "expected": [
+        432,
+        64,
+        128,
+        8
+      ],
+      "source": "pl_m1_canonical"
+    },
+    {
+      "indexed": true,
+      "mode": 2,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 64,
+      "K": 64000,
+      "Q": 0,
+      "TP": 1,
+      "installation": "retained",
+      "expected": [
+        240,
+        64,
+        256,
+        8
+      ],
+      "source": "pl_m1_canonical"
+    },
+    {
+      "indexed": false,
+      "mode": 2,
+      "T": 64,
+      "R": 512,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        208,
+        96,
+        256,
+        1
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": false,
+      "mode": 2,
+      "T": 64,
+      "R": 512,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        208,
+        96,
+        256,
+        1
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": false,
+      "mode": 2,
+      "T": 128,
+      "R": 1024,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        208,
+        96,
+        256,
+        1
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": false,
+      "mode": 2,
+      "T": 128,
+      "R": 1024,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        208,
+        96,
+        256,
+        1
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": false,
+      "mode": 2,
+      "T": 256,
+      "R": 2048,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        208,
+        96,
+        256,
+        1
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": false,
+      "mode": 2,
+      "T": 256,
+      "R": 2048,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        208,
+        96,
+        256,
+        1
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": false,
+      "mode": 2,
+      "T": 384,
+      "R": 3072,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        208,
+        96,
+        256,
+        1
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": false,
+      "mode": 2,
+      "T": 384,
+      "R": 3072,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        208,
+        96,
+        256,
+        1
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": false,
+      "mode": 2,
+      "T": 512,
+      "R": 4096,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        208,
+        96,
+        256,
+        1
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": false,
+      "mode": 2,
+      "T": 512,
+      "R": 4096,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        208,
+        96,
+        256,
+        1
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": false,
+      "mode": 2,
+      "T": 768,
+      "R": 6144,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        208,
+        96,
+        256,
+        1
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": false,
+      "mode": 2,
+      "T": 768,
+      "R": 6144,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        208,
+        96,
+        256,
+        1
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": false,
+      "mode": 2,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 96,
+      "K": 384,
+      "Q": 0,
+      "TP": 1,
+      "installation": "all",
+      "expected": [
+        336,
+        64,
+        192,
+        1
+      ],
+      "source": "pl_m1_neighbor"
+    },
+    {
+      "indexed": false,
+      "mode": 2,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 96,
+      "K": 384,
+      "Q": 0,
+      "TP": 1,
+      "installation": "retained",
+      "expected": [
+        192,
+        112,
+        256,
+        1
+      ],
+      "source": "pl_m1_neighbor"
+    },
+    {
+      "indexed": false,
+      "mode": 2,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 32,
+      "K": 32,
+      "Q": 0,
+      "TP": 1,
+      "installation": "all",
+      "expected": [
+        432,
+        80,
+        128,
+        1
+      ],
+      "source": "pl_m1_neighbor"
+    },
+    {
+      "indexed": false,
+      "mode": 2,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 32,
+      "K": 32,
+      "Q": 0,
+      "TP": 1,
+      "installation": "retained",
+      "expected": [
+        192,
+        112,
+        256,
+        1
+      ],
+      "source": "pl_m1_neighbor"
+    },
+    {
+      "indexed": false,
+      "mode": 2,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 64,
+      "K": 64000,
+      "Q": 0,
+      "TP": 1,
+      "installation": "all",
+      "expected": [
+        480,
+        64,
+        128,
+        1
+      ],
+      "source": "pl_m1_canonical"
+    },
+    {
+      "indexed": false,
+      "mode": 2,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 64,
+      "K": 64000,
+      "Q": 0,
+      "TP": 1,
+      "installation": "retained",
+      "expected": [
+        752,
+        64,
+        64,
+        1
+      ],
+      "source": "pl_m1_canonical"
+    },
+    {
+      "indexed": true,
+      "mode": 1,
+      "T": 64,
+      "R": 512,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        288,
+        32,
+        256,
+        8
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 1,
+      "T": 64,
+      "R": 512,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        288,
+        32,
+        256,
+        8
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 1,
+      "T": 128,
+      "R": 1024,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        288,
+        32,
+        256,
+        8
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 1,
+      "T": 128,
+      "R": 1024,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        288,
+        32,
+        256,
+        8
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 1,
+      "T": 256,
+      "R": 2048,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        288,
+        32,
+        256,
+        8
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 1,
+      "T": 256,
+      "R": 2048,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        288,
+        32,
+        256,
+        8
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 1,
+      "T": 384,
+      "R": 2048,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        288,
+        32,
+        256,
+        8
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 1,
+      "T": 384,
+      "R": 2048,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        288,
+        32,
+        256,
+        8
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 1,
+      "T": 512,
+      "R": 2048,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        288,
+        32,
+        256,
+        8
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 1,
+      "T": 512,
+      "R": 2048,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        288,
+        32,
+        256,
+        8
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 1,
+      "T": 768,
+      "R": 2048,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        288,
+        32,
+        256,
+        8
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 1,
+      "T": 768,
+      "R": 2048,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        288,
+        32,
+        256,
+        8
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 1,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 96,
+      "K": 384,
+      "Q": 0,
+      "TP": 1,
+      "installation": "all",
+      "expected": [
+        528,
+        32,
+        128,
+        8
+      ],
+      "source": "pl_m1_neighbor"
+    },
+    {
+      "indexed": true,
+      "mode": 1,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 96,
+      "K": 384,
+      "Q": 0,
+      "TP": 1,
+      "installation": "retained",
+      "expected": [
+        160,
+        96,
+        256,
+        8
+      ],
+      "source": "pl_m1_neighbor"
+    },
+    {
+      "indexed": true,
+      "mode": 1,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 32,
+      "K": 32,
+      "Q": 0,
+      "TP": 1,
+      "installation": "all",
+      "expected": [
+        368,
+        80,
+        128,
+        8
+      ],
+      "source": "pl_m1_neighbor"
+    },
+    {
+      "indexed": true,
+      "mode": 1,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 32,
+      "K": 32,
+      "Q": 0,
+      "TP": 1,
+      "installation": "retained",
+      "expected": [
+        224,
+        64,
+        256,
+        8
+      ],
+      "source": "pl_m1_neighbor"
+    },
+    {
+      "indexed": true,
+      "mode": 1,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 64,
+      "K": 64000,
+      "Q": 0,
+      "TP": 1,
+      "installation": "all",
+      "expected": [
+        416,
+        64,
+        128,
+        8
+      ],
+      "source": "pl_m1_canonical"
+    },
+    {
+      "indexed": true,
+      "mode": 1,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 64,
+      "K": 64000,
+      "Q": 0,
+      "TP": 1,
+      "installation": "retained",
+      "expected": [
+        224,
+        64,
+        256,
+        8
+      ],
+      "source": "pl_m1_canonical"
+    },
+    {
+      "indexed": false,
+      "mode": 1,
+      "T": 64,
+      "R": 512,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        80,
+        96,
+        384,
+        1
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": false,
+      "mode": 1,
+      "T": 64,
+      "R": 512,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        160,
+        96,
+        256,
+        1
+      ],
+      "source": "pl_m1_exact_capacity_filtered"
+    },
+    {
+      "indexed": false,
+      "mode": 1,
+      "T": 128,
+      "R": 1024,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        80,
+        96,
+        384,
+        1
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": false,
+      "mode": 1,
+      "T": 128,
+      "R": 1024,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        160,
+        96,
+        256,
+        1
+      ],
+      "source": "pl_m1_exact_capacity_filtered"
+    },
+    {
+      "indexed": false,
+      "mode": 1,
+      "T": 256,
+      "R": 2048,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        80,
+        96,
+        384,
+        1
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": false,
+      "mode": 1,
+      "T": 256,
+      "R": 2048,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        160,
+        96,
+        256,
+        1
+      ],
+      "source": "pl_m1_exact_capacity_filtered"
+    },
+    {
+      "indexed": false,
+      "mode": 1,
+      "T": 384,
+      "R": 3072,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        80,
+        96,
+        384,
+        1
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": false,
+      "mode": 1,
+      "T": 384,
+      "R": 3072,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        160,
+        96,
+        256,
+        1
+      ],
+      "source": "pl_m1_exact_capacity_filtered"
+    },
+    {
+      "indexed": false,
+      "mode": 1,
+      "T": 512,
+      "R": 4096,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        80,
+        96,
+        384,
+        1
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": false,
+      "mode": 1,
+      "T": 512,
+      "R": 4096,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        160,
+        96,
+        256,
+        1
+      ],
+      "source": "pl_m1_exact_capacity_filtered"
+    },
+    {
+      "indexed": false,
+      "mode": 1,
+      "T": 768,
+      "R": 6144,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        80,
+        96,
+        384,
+        1
+      ],
+      "source": "pl_m1_exact"
+    },
+    {
+      "indexed": false,
+      "mode": 1,
+      "T": 768,
+      "R": 6144,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        160,
+        96,
+        256,
+        1
+      ],
+      "source": "pl_m1_exact_capacity_filtered"
+    },
+    {
+      "indexed": false,
+      "mode": 1,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 96,
+      "K": 384,
+      "Q": 0,
+      "TP": 1,
+      "installation": "all",
+      "expected": [
+        576,
+        32,
+        128,
+        1
+      ],
+      "source": "pl_m1_neighbor"
+    },
+    {
+      "indexed": false,
+      "mode": 1,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 96,
+      "K": 384,
+      "Q": 0,
+      "TP": 1,
+      "installation": "retained",
+      "expected": [
+        160,
+        96,
+        256,
+        1
+      ],
+      "source": "pl_m1_neighbor"
+    },
+    {
+      "indexed": false,
+      "mode": 1,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 32,
+      "K": 32,
+      "Q": 0,
+      "TP": 1,
+      "installation": "all",
+      "expected": [
+        400,
+        80,
+        128,
+        1
+      ],
+      "source": "pl_m1_neighbor"
+    },
+    {
+      "indexed": false,
+      "mode": 1,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 32,
+      "K": 32,
+      "Q": 0,
+      "TP": 1,
+      "installation": "retained",
+      "expected": [
+        224,
+        64,
+        256,
+        1
+      ],
+      "source": "pl_m1_neighbor"
+    },
+    {
+      "indexed": false,
+      "mode": 1,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 64,
+      "K": 64000,
+      "Q": 0,
+      "TP": 1,
+      "installation": "all",
+      "expected": [
+        448,
+        64,
+        128,
+        1
+      ],
+      "source": "pl_m1_canonical"
+    },
+    {
+      "indexed": false,
+      "mode": 1,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 64,
+      "K": 64000,
+      "Q": 0,
+      "TP": 1,
+      "installation": "retained",
+      "expected": [
+        720,
+        64,
+        64,
+        1
+      ],
+      "source": "pl_m1_canonical"
+    },
+    {
+      "indexed": true,
+      "mode": 5,
+      "T": 64,
+      "R": 512,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        288,
+        32,
+        256,
+        8
+      ],
+      "source": "reuse_int8:pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 5,
+      "T": 64,
+      "R": 512,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        288,
+        32,
+        256,
+        8
+      ],
+      "source": "reuse_int8:pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 5,
+      "T": 128,
+      "R": 1024,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        288,
+        32,
+        256,
+        8
+      ],
+      "source": "reuse_int8:pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 5,
+      "T": 128,
+      "R": 1024,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        288,
+        32,
+        256,
+        8
+      ],
+      "source": "reuse_int8:pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 5,
+      "T": 256,
+      "R": 2048,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        288,
+        32,
+        256,
+        8
+      ],
+      "source": "reuse_int8:pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 5,
+      "T": 256,
+      "R": 2048,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        288,
+        32,
+        256,
+        8
+      ],
+      "source": "reuse_int8:pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 5,
+      "T": 384,
+      "R": 2048,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        288,
+        32,
+        256,
+        8
+      ],
+      "source": "reuse_int8:pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 5,
+      "T": 384,
+      "R": 2048,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        288,
+        32,
+        256,
+        8
+      ],
+      "source": "reuse_int8:pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 5,
+      "T": 512,
+      "R": 2048,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        288,
+        32,
+        256,
+        8
+      ],
+      "source": "reuse_int8:pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 5,
+      "T": 512,
+      "R": 2048,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        288,
+        32,
+        256,
+        8
+      ],
+      "source": "reuse_int8:pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 5,
+      "T": 768,
+      "R": 2048,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        288,
+        32,
+        256,
+        8
+      ],
+      "source": "reuse_int8:pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 5,
+      "T": 768,
+      "R": 2048,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        288,
+        32,
+        256,
+        8
+      ],
+      "source": "reuse_int8:pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 5,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 96,
+      "K": 384,
+      "Q": 0,
+      "TP": 1,
+      "installation": "all",
+      "expected": [
+        528,
+        32,
+        128,
+        8
+      ],
+      "source": "reuse_int8:pl_m1_neighbor"
+    },
+    {
+      "indexed": true,
+      "mode": 5,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 96,
+      "K": 384,
+      "Q": 0,
+      "TP": 1,
+      "installation": "retained",
+      "expected": [
+        160,
+        96,
+        256,
+        8
+      ],
+      "source": "reuse_int8:pl_m1_neighbor"
+    },
+    {
+      "indexed": true,
+      "mode": 5,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 32,
+      "K": 32,
+      "Q": 0,
+      "TP": 1,
+      "installation": "all",
+      "expected": [
+        368,
+        80,
+        128,
+        8
+      ],
+      "source": "reuse_int8:pl_m1_neighbor"
+    },
+    {
+      "indexed": true,
+      "mode": 5,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 32,
+      "K": 32,
+      "Q": 0,
+      "TP": 1,
+      "installation": "retained",
+      "expected": [
+        224,
+        64,
+        256,
+        8
+      ],
+      "source": "reuse_int8:pl_m1_neighbor"
+    },
+    {
+      "indexed": true,
+      "mode": 5,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 64,
+      "K": 64000,
+      "Q": 0,
+      "TP": 1,
+      "installation": "all",
+      "expected": [
+        416,
+        64,
+        128,
+        8
+      ],
+      "source": "reuse_int8:pl_m1_canonical"
+    },
+    {
+      "indexed": true,
+      "mode": 5,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 64,
+      "K": 64000,
+      "Q": 0,
+      "TP": 1,
+      "installation": "retained",
+      "expected": [
+        224,
+        64,
+        256,
+        8
+      ],
+      "source": "reuse_int8:pl_m1_canonical"
+    },
+    {
+      "indexed": false,
+      "mode": 5,
+      "T": 64,
+      "R": 512,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        80,
+        96,
+        384,
+        1
+      ],
+      "source": "reuse_int8:pl_m1_exact"
+    },
+    {
+      "indexed": false,
+      "mode": 5,
+      "T": 64,
+      "R": 512,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        160,
+        96,
+        256,
+        1
+      ],
+      "source": "reuse_int8:pl_m1_exact_capacity_filtered"
+    },
+    {
+      "indexed": false,
+      "mode": 5,
+      "T": 128,
+      "R": 1024,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        80,
+        96,
+        384,
+        1
+      ],
+      "source": "reuse_int8:pl_m1_exact"
+    },
+    {
+      "indexed": false,
+      "mode": 5,
+      "T": 128,
+      "R": 1024,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        160,
+        96,
+        256,
+        1
+      ],
+      "source": "reuse_int8:pl_m1_exact_capacity_filtered"
+    },
+    {
+      "indexed": false,
+      "mode": 5,
+      "T": 256,
+      "R": 2048,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        80,
+        96,
+        384,
+        1
+      ],
+      "source": "reuse_int8:pl_m1_exact"
+    },
+    {
+      "indexed": false,
+      "mode": 5,
+      "T": 256,
+      "R": 2048,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        160,
+        96,
+        256,
+        1
+      ],
+      "source": "reuse_int8:pl_m1_exact_capacity_filtered"
+    },
+    {
+      "indexed": false,
+      "mode": 5,
+      "T": 384,
+      "R": 3072,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        80,
+        96,
+        384,
+        1
+      ],
+      "source": "reuse_int8:pl_m1_exact"
+    },
+    {
+      "indexed": false,
+      "mode": 5,
+      "T": 384,
+      "R": 3072,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        160,
+        96,
+        256,
+        1
+      ],
+      "source": "reuse_int8:pl_m1_exact_capacity_filtered"
+    },
+    {
+      "indexed": false,
+      "mode": 5,
+      "T": 512,
+      "R": 4096,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        80,
+        96,
+        384,
+        1
+      ],
+      "source": "reuse_int8:pl_m1_exact"
+    },
+    {
+      "indexed": false,
+      "mode": 5,
+      "T": 512,
+      "R": 4096,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        160,
+        96,
+        256,
+        1
+      ],
+      "source": "reuse_int8:pl_m1_exact_capacity_filtered"
+    },
+    {
+      "indexed": false,
+      "mode": 5,
+      "T": 768,
+      "R": 6144,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        80,
+        96,
+        384,
+        1
+      ],
+      "source": "reuse_int8:pl_m1_exact"
+    },
+    {
+      "indexed": false,
+      "mode": 5,
+      "T": 768,
+      "R": 6144,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 0,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        160,
+        96,
+        256,
+        1
+      ],
+      "source": "reuse_int8:pl_m1_exact_capacity_filtered"
+    },
+    {
+      "indexed": false,
+      "mode": 5,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 96,
+      "K": 384,
+      "Q": 0,
+      "TP": 1,
+      "installation": "all",
+      "expected": [
+        576,
+        32,
+        128,
+        1
+      ],
+      "source": "reuse_int8:pl_m1_neighbor"
+    },
+    {
+      "indexed": false,
+      "mode": 5,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 96,
+      "K": 384,
+      "Q": 0,
+      "TP": 1,
+      "installation": "retained",
+      "expected": [
+        160,
+        96,
+        256,
+        1
+      ],
+      "source": "reuse_int8:pl_m1_neighbor"
+    },
+    {
+      "indexed": false,
+      "mode": 5,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 32,
+      "K": 32,
+      "Q": 0,
+      "TP": 1,
+      "installation": "all",
+      "expected": [
+        400,
+        80,
+        128,
+        1
+      ],
+      "source": "reuse_int8:pl_m1_neighbor"
+    },
+    {
+      "indexed": false,
+      "mode": 5,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 32,
+      "K": 32,
+      "Q": 0,
+      "TP": 1,
+      "installation": "retained",
+      "expected": [
+        224,
+        64,
+        256,
+        1
+      ],
+      "source": "reuse_int8:pl_m1_neighbor"
+    },
+    {
+      "indexed": false,
+      "mode": 5,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 64,
+      "K": 64000,
+      "Q": 0,
+      "TP": 1,
+      "installation": "all",
+      "expected": [
+        448,
+        64,
+        128,
+        1
+      ],
+      "source": "reuse_int8:pl_m1_canonical"
+    },
+    {
+      "indexed": false,
+      "mode": 5,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 64,
+      "K": 64000,
+      "Q": 0,
+      "TP": 1,
+      "installation": "retained",
+      "expected": [
+        720,
+        64,
+        64,
+        1
+      ],
+      "source": "reuse_int8:pl_m1_canonical"
+    },
+    {
+      "indexed": true,
+      "mode": 8,
+      "T": 64,
+      "R": 512,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 128,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        64,
+        32,
+        768,
+        8
+      ],
+      "source": "reuse_g32:pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 8,
+      "T": 64,
+      "R": 512,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 128,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        272,
+        32,
+        256,
+        8
+      ],
+      "source": "reuse_g32:pl_m1_exact_capacity_filtered"
+    },
+    {
+      "indexed": true,
+      "mode": 8,
+      "T": 128,
+      "R": 1024,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 128,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        64,
+        32,
+        768,
+        8
+      ],
+      "source": "reuse_g32:pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 8,
+      "T": 128,
+      "R": 1024,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 128,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        272,
+        32,
+        256,
+        8
+      ],
+      "source": "reuse_g32:pl_m1_exact_capacity_filtered"
+    },
+    {
+      "indexed": true,
+      "mode": 8,
+      "T": 256,
+      "R": 2048,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 128,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        64,
+        32,
+        768,
+        8
+      ],
+      "source": "reuse_g32:pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 8,
+      "T": 256,
+      "R": 2048,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 128,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        272,
+        32,
+        256,
+        8
+      ],
+      "source": "reuse_g32:pl_m1_exact_capacity_filtered"
+    },
+    {
+      "indexed": true,
+      "mode": 8,
+      "T": 384,
+      "R": 2048,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 128,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        64,
+        32,
+        768,
+        8
+      ],
+      "source": "reuse_g32:pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 8,
+      "T": 384,
+      "R": 2048,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 128,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        272,
+        32,
+        256,
+        8
+      ],
+      "source": "reuse_g32:pl_m1_exact_capacity_filtered"
+    },
+    {
+      "indexed": true,
+      "mode": 8,
+      "T": 512,
+      "R": 2048,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 128,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        64,
+        32,
+        768,
+        8
+      ],
+      "source": "reuse_g32:pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 8,
+      "T": 512,
+      "R": 2048,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 128,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        272,
+        32,
+        256,
+        8
+      ],
+      "source": "reuse_g32:pl_m1_exact_capacity_filtered"
+    },
+    {
+      "indexed": true,
+      "mode": 8,
+      "T": 768,
+      "R": 2048,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 128,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        64,
+        32,
+        768,
+        8
+      ],
+      "source": "reuse_g32:pl_m1_exact"
+    },
+    {
+      "indexed": true,
+      "mode": 8,
+      "T": 768,
+      "R": 2048,
+      "E": 256,
+      "N": 64,
+      "K": 2048,
+      "Q": 128,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        272,
+        32,
+        256,
+        8
+      ],
+      "source": "reuse_g32:pl_m1_exact_capacity_filtered"
+    },
+    {
+      "indexed": true,
+      "mode": 8,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 96,
+      "K": 384,
+      "Q": 128,
+      "TP": 1,
+      "installation": "all",
+      "expected": [
+        176,
+        32,
+        384,
+        8
+      ],
+      "source": "reuse_g32:pl_m1_neighbor"
+    },
+    {
+      "indexed": true,
+      "mode": 8,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 96,
+      "K": 384,
+      "Q": 128,
+      "TP": 1,
+      "installation": "retained",
+      "expected": [
+        272,
+        32,
+        256,
+        8
+      ],
+      "source": "reuse_g32:pl_m1_neighbor"
+    },
+    {
+      "indexed": true,
+      "mode": 8,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 32,
+      "K": 32,
+      "Q": 32,
+      "TP": 1,
+      "installation": "all",
+      "expected": [
+        64,
+        32,
+        768,
+        8
+      ],
+      "source": "pl_m1_neighbor"
+    },
+    {
+      "indexed": true,
+      "mode": 8,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 32,
+      "K": 32,
+      "Q": 32,
+      "TP": 1,
+      "installation": "retained",
+      "expected": [
+        128,
+        128,
+        256,
+        8
+      ],
+      "source": "pl_m1_neighbor"
+    },
+    {
+      "indexed": true,
+      "mode": 8,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 64,
+      "K": 64000,
+      "Q": 128,
+      "TP": 1,
+      "installation": "all",
+      "expected": [
+        416,
+        64,
+        128,
+        8
+      ],
+      "source": "reuse_g32:pl_m1_canonical"
+    },
+    {
+      "indexed": true,
+      "mode": 8,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 64,
+      "K": 64000,
+      "Q": 128,
+      "TP": 1,
+      "installation": "retained",
+      "expected": [
+        224,
+        64,
+        256,
+        8
+      ],
+      "source": "reuse_g32:pl_m1_canonical"
+    },
+    {
+      "indexed": false,
+      "mode": 8,
+      "T": 64,
+      "R": 512,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 64,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        288,
+        128,
+        128,
+        1
+      ],
+      "source": "reuse_g32:pl_m1_exact"
+    },
+    {
+      "indexed": false,
+      "mode": 8,
+      "T": 64,
+      "R": 512,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 64,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        736,
+        64,
+        64,
+        1
+      ],
+      "source": "reuse_g32:pl_m1_neighbor"
+    },
+    {
+      "indexed": false,
+      "mode": 8,
+      "T": 128,
+      "R": 1024,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 64,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        288,
+        128,
+        128,
+        1
+      ],
+      "source": "reuse_g32:pl_m1_exact"
+    },
+    {
+      "indexed": false,
+      "mode": 8,
+      "T": 128,
+      "R": 1024,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 64,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        736,
+        64,
+        64,
+        1
+      ],
+      "source": "reuse_g32:pl_m1_neighbor"
+    },
+    {
+      "indexed": false,
+      "mode": 8,
+      "T": 256,
+      "R": 2048,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 64,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        288,
+        128,
+        128,
+        1
+      ],
+      "source": "reuse_g32:pl_m1_exact"
+    },
+    {
+      "indexed": false,
+      "mode": 8,
+      "T": 256,
+      "R": 2048,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 64,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        736,
+        64,
+        64,
+        1
+      ],
+      "source": "reuse_g32:pl_m1_neighbor"
+    },
+    {
+      "indexed": false,
+      "mode": 8,
+      "T": 384,
+      "R": 3072,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 64,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        288,
+        128,
+        128,
+        1
+      ],
+      "source": "reuse_g32:pl_m1_exact"
+    },
+    {
+      "indexed": false,
+      "mode": 8,
+      "T": 384,
+      "R": 3072,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 64,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        736,
+        64,
+        64,
+        1
+      ],
+      "source": "reuse_g32:pl_m1_neighbor"
+    },
+    {
+      "indexed": false,
+      "mode": 8,
+      "T": 512,
+      "R": 4096,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 64,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        288,
+        128,
+        128,
+        1
+      ],
+      "source": "reuse_g32:pl_m1_exact"
+    },
+    {
+      "indexed": false,
+      "mode": 8,
+      "T": 512,
+      "R": 4096,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 64,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        736,
+        64,
+        64,
+        1
+      ],
+      "source": "reuse_g32:pl_m1_neighbor"
+    },
+    {
+      "indexed": false,
+      "mode": 8,
+      "T": 768,
+      "R": 6144,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 64,
+      "TP": 8,
+      "installation": "all",
+      "expected": [
+        288,
+        128,
+        128,
+        1
+      ],
+      "source": "reuse_g32:pl_m1_exact"
+    },
+    {
+      "indexed": false,
+      "mode": 8,
+      "T": 768,
+      "R": 6144,
+      "E": 256,
+      "N": 2048,
+      "K": 64,
+      "Q": 64,
+      "TP": 8,
+      "installation": "retained",
+      "expected": [
+        736,
+        64,
+        64,
+        1
+      ],
+      "source": "reuse_g32:pl_m1_neighbor"
+    },
+    {
+      "indexed": false,
+      "mode": 8,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 96,
+      "K": 384,
+      "Q": 128,
+      "TP": 1,
+      "installation": "all",
+      "expected": [
+        176,
+        32,
+        384,
+        1
+      ],
+      "source": "reuse_g32:pl_m1_neighbor"
+    },
+    {
+      "indexed": false,
+      "mode": 8,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 96,
+      "K": 384,
+      "Q": 128,
+      "TP": 1,
+      "installation": "retained",
+      "expected": [
+        288,
+        32,
+        256,
+        1
+      ],
+      "source": "reuse_g32:pl_m1_neighbor"
+    },
+    {
+      "indexed": false,
+      "mode": 8,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 32,
+      "K": 32,
+      "Q": 32,
+      "TP": 1,
+      "installation": "all",
+      "expected": [
+        64,
+        32,
+        768,
+        1
+      ],
+      "source": "pl_m1_neighbor"
+    },
+    {
+      "indexed": false,
+      "mode": 8,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 32,
+      "K": 32,
+      "Q": 32,
+      "TP": 1,
+      "installation": "retained",
+      "expected": [
+        128,
+        128,
+        256,
+        1
+      ],
+      "source": "pl_m1_neighbor"
+    },
+    {
+      "indexed": false,
+      "mode": 8,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 64,
+      "K": 64000,
+      "Q": 128,
+      "TP": 1,
+      "installation": "all",
+      "expected": [
+        448,
+        64,
+        128,
+        1
+      ],
+      "source": "reuse_g32:pl_m1_canonical"
+    },
+    {
+      "indexed": false,
+      "mode": 8,
+      "T": 19,
+      "R": 17,
+      "E": 16,
+      "N": 64,
+      "K": 64000,
+      "Q": 128,
+      "TP": 1,
+      "installation": "retained",
+      "expected": [
+        224,
+        64,
+        256,
+        1
+      ],
+      "source": "reuse_g32:pl_m1_canonical"
+    }
+  ]
+}

@@ -1,7 +1,7 @@
 """Actual Qwen3.5 forward publication window; ATen storage, SDK/consumer doubles.
 
 This executes the checked-in forward loop and its real flush macros. Only the
-device device label is mapped to CPU. SDK allocation lookup, CPU/DDR coherence and
+RPU device label is mapped to CPU. SDK allocation lookup, CPU/DDR coherence and
 run_all_layers are host doubles: this is not an SDK or Graph lifecycle test.
 """
 from pathlib import Path
@@ -36,6 +36,7 @@ def test_actual_gdn_forward_publishes_sdk_allocation_tails_before_consumption(
     cpp = r'''
 #include <ATen/ATen.h>
 #include <c10/core/InferenceMode.h>
+#include <c10/util/ScopeExit.h>
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
@@ -148,6 +149,18 @@ void reset_observation() {
 }
 struct Model {
     bool fast_replay_active_ = true;
+    // Initial-prefill state flush skip (build_gdn zero-fills the GDN carry).
+    bool initial_prefill_state_flush_skip_ = false, action_mode_ = false;
+    int64_t harness_seq_len = 1;
+    // Checked decode replay and candidate head are inert in this fixture; the
+    // dense window still has to compile around the real consumer call.
+    bool checked_decode_replay_scope_active_ = false;
+    at::Tensor decode_head_w_;
+    template<class... Args> bool begin_checked_decode_replay(Args&&...) {return false;}
+    void cancel_checked_decode_replay() {}
+    void finish_checked_decode_replay() {}
+    bool checked_decode_replay_skipped() const {return false;}
+    void emit_decode_candidate_head(const at::Tensor&) {}
     int cores = 8;
     int64_t gdn_nvh_ = 2, gdn_dk_ = 8, gdn_dv_ = 8;
     int64_t gdn_kc_ = 2, gdn_conv_dim_ = 32;
@@ -187,7 +200,7 @@ struct Model {
         at::Tensor hidden_states;
         std::vector<at::Tensor> k_caches, v_caches;
         std::optional<at::Tensor> attention_mask;
-        int64_t position = 0, planned_chunk_size = 64;
+        int64_t position = 0, planned_chunk_size = 64, seq_len = harness_seq_len;
         bool is_causal = true;
         std::vector<int64_t> planned_stage_descriptor;
 __WINDOW__
@@ -240,6 +253,19 @@ int main() {
         // The same SDK allocation may occur twice: retain both original ranges.
         m.states[2]=m.states[0];reset_observation();m.forward();check_tails(m);
         assert(batches==1 && published.size()==4);
+        // Initial text prefill zero-fills the GDN carry in SPM, so its fast
+        // replay publishes nothing; action and decode calls still publish.
+        if (__DENSE__) {
+        m.initial_prefill_state_flush_skip_=true;m.harness_seq_len=16;
+        reset_observation();m.forward();
+        assert(batches==0 && singles==0 && lookups==0 && published.empty());
+        assert(consumers==1 && order.back()=="consumer");
+        m.action_mode_=true;reset_observation();m.forward();check_tails(m);
+        assert(batches==1 && singles==0);
+        m.action_mode_=false;m.harness_seq_len=1;reset_observation();m.forward();check_tails(m);
+        assert(batches==1 && singles==0);
+        m.initial_prefill_state_flush_skip_=false;
+        }
         // No GDN layers means no publication or lookup, even when force is on.
         m.layer_is_full_={true,true,true};reset_observation();m.forward();
         assert(batches==0 && singles==0 && lookups==0 && consumers==1);
@@ -289,5 +315,8 @@ int main() {
 }
 '''
     _run_native(
-        tmp_path, cpp.replace("__MACROS__", macros).replace("__WINDOW__", window), torch
+        tmp_path, cpp.replace("__MACROS__", macros)
+        .replace("__DENSE__", "true" if model == "dense" else "false")
+        .replace("__WINDOW__", window),
+        torch,
     )

@@ -1,5 +1,6 @@
 """Execute the exact QK fusion predicate, manifest and emitter with native consumer."""
 from pathlib import Path
+from pi_wall_host_catalog import with_actual_linear_contracts
 import hashlib
 import json
 import re
@@ -277,7 +278,7 @@ int main(){
         program = program.replace(f"__{key}__", value)
     program = program.replace("__LINGBOT_UNBOUND__", unbound_lingbot_prefill_members(source))
     cpp, exe = tmp_path / "qk_owner.cpp", tmp_path / "qk_owner"
-    cpp.write_text(program)
+    cpp.write_text(with_actual_linear_contracts(program))
     result = subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-Wno-misleading-indentation",
                             str(cpp), "-o", str(exe)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
@@ -359,6 +360,9 @@ struct Model {
  bool wall_prefill_staged_mlp_=false,decode_gate_up_fusion_=false,prefill_packed_gate_up_strided_=false,qwen3vl_4b_packed_qkv_weights_=false;
  std::vector<int64_t> deepstack_lang_layers_{0,1,2};int configured_vocab_size_=0,cores=8;
  int num_cores()const{return cores;}int attn_tp()const{return cores;}int mlp_tp()const{return cores;}int lm_head_tp()const{return cores;}
+ // This 4B facade only exercises N=35/36, never the GR00T 16-layer profile.
+ // The actual GR00T predicate and aliases run in test_gr00t_text_scratch_alias.py.
+ bool gr00t_long_prefill_scratch_profile()const{assert(N!=16);return false;}
  struct Table{int64_t rows=8192;int64_t size(int)const{return rows;}}cos;
  struct Envelope{int64_t max_kv_len=0;bool declared()const{return max_kv_len>0;}}envelope;
  const Envelope& chunk_envelope()const{return envelope;}
@@ -425,7 +429,7 @@ int main(){
         program = program.replace(f"__{key}__", value)
     program = program.replace("__LINGBOT_UNBOUND__", unbound_lingbot_prefill_members(source))
     cpp, exe = tmp_path / "qk_cold.cpp", tmp_path / "qk_cold"
-    cpp.write_text(program)
+    cpp.write_text(with_actual_linear_contracts(program))
     result = subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-Wno-misleading-indentation",
                              str(cpp), "-o", str(exe)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr

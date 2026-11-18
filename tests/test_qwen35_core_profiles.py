@@ -6,27 +6,53 @@ import torch
 from transformers import Qwen3_5Config
 
 from rpu_backend.adapters.qwen3_5.cores import (
-    core_topology, topology_tuple, validate_core_profile,
+    component_core_counts, core_topology, topology_tuple, validate_core_profile,
 )
 from rpu_backend.api.qwen3_5_cache import Qwen3_5Cache
 
 
-@pytest.mark.parametrize("size", ("0_8", "2", "4", "9"))
-@pytest.mark.parametrize("cores", (4, 6))
-def test_dense_text_example_core_profile_is_exact(size, cores, tmp_path):
-    from pathlib import Path
-    from examples.common.config import ConfigError, load_config, planner_profiles
+@pytest.mark.parametrize("cores, expected", [
+    (4, {"attention": 4, "mlp": 4, "lm_head": 4, "vision": 4}),
+    (6, {"attention": 4, "mlp": 6, "lm_head": 4, "vision": 4}),
+    (8, {"attention": 8, "mlp": 8, "lm_head": 8, "vision": 8}),
+])
+def test_component_core_layout_is_explicit(cores, expected):
+    execution = {"model": {"num_cores": cores}}
+    topology = core_topology(execution)
+    assert component_core_counts(execution) == expected
+    assert topology_tuple(topology) == (
+        cores, expected["attention"], expected["mlp"],
+        expected["lm_head"], 8,
+    )
 
-    path = Path(__file__).resolve().parents[1] / f"examples/configs/qwen3_5/text/{size}b/fp16_tp{cores}.toml"
+
+@pytest.mark.parametrize("size", ("0_8", "2", "4", "9"))
+@pytest.mark.parametrize("cores", (4, 6, 8))
+def test_dense_text_example_core_profile_accepts_four_six_or_eight(size, cores, tmp_path):
+    from pathlib import Path
+    from examples.common.config import load_config, planner_profiles
+
+    path = Path(__file__).resolve().parents[1] / f"examples/configs/qwen3_5/text/{size}b/fp16.toml"
     config = load_config(path)
-    assert config["rpu_execution"]["model"]["num_cores"] == cores
+    assert config["rpu_execution"]["model"]["num_cores"] == 8
     profile = planner_profiles()[config["example"]["profile_id"]]
-    assert profile["support"]["status"] == "IMPLEMENTED_UNVERIFIED_HW"
-    for other in (10 - cores, 8):
-        bad = tmp_path / f"bad{other}.toml"
-        bad.write_text(path.read_text().replace(f"num_cores = {cores}", f"num_cores = {other}"))
-        with pytest.raises(ConfigError, match="exact fixed profile"):
-            load_config(bad)
+    assert profile["variant"] == "default"
+    assert profile["support"]["status"] == "SUPPORTED"
+    assert "num_cores" not in profile["input_envelope"]["limits"]
+
+    selected = tmp_path / f"fp16_{cores}.toml"
+    selected.write_text(path.read_text().replace(
+        "num_cores = 8", f"num_cores = {cores}", 1))
+    selected_config = load_config(selected)
+    assert selected_config["example"]["profile_id"] == config["example"]["profile_id"]
+    assert selected_config["rpu_execution"]["model"]["num_cores"] == cores
+
+    # The canonical profile is intentionally shared by the supported core
+    # choices. A stale fixed-profile entry must not be required by the loader.
+    assert selected_config["example"]["profile_id"] not in {
+        f"qwen3_5-{size.replace('_', '.')}b.fp16.text-tp4",
+        f"qwen3_5-{size.replace('_', '.')}b.fp16.text-tp6",
+    }
 
 
 def _config(size=2):
@@ -83,7 +109,8 @@ def test_official_shapes_resolve_one_cold_role_template(size, cores, expected):
 def test_reduced_profile_rejects_semantic_near_neighbours(where, name, value):
     config = _config()
     owner = {"text": config.text_config, "vision": config.vision_config, "root": config}[where]
-    setattr(owner, name, value)
+    # Exercise backend admission even when HF rejects the assignment itself.
+    object.__setattr__(owner, name, value)
     with pytest.raises(ValueError):
         validate_core_profile(config, {"model": {"num_cores": 6}})
 

@@ -5,7 +5,8 @@ import pytest
 import torch
 
 from rpu_backend.adapters.qwen3_5_moe import text
-from rpu_backend.adapters.qwen3_5_moe.cores import core_topology
+from rpu_backend.adapters.qwen3_5.cores import topology_tuple
+from rpu_backend.adapters.qwen3_5_moe.cores import core_topology, full_topology_tuple
 from rpu_backend.api.qwen3_5_moe_cache import Qwen3_5MoeCache
 from test_qwen35_moe_python_integration import _exact_config
 
@@ -66,7 +67,9 @@ def _owner(monkeypatch, capacity, *, cache_capacity=None, position=0, padding_ro
     )
     owner = SimpleNamespace(_rpu_qwen3_5_moe=state)
     cache = SimpleNamespace(
-        execution_topology=(8, 8, 8, 8, 8), position=position,
+        execution_topology=topology_tuple(state.execution_topology),
+        moe_execution_topology=full_topology_tuple(state.execution_topology),
+        position=position,
         max_seq_len=capacity if cache_capacity is None else cache_capacity,
         allocated_max_seq_len=physical,
     )
@@ -156,8 +159,10 @@ def test_native_capacity_binding_and_prework_rope_checks(tmp_path, family):
     cap = _definition(source, f"int64_t {model_name}::subclass_chunk_size_cap(")
     cap = cap.replace(model_name, "Qwen3_5MoeModel")
     forward = _definition(source, f"at::Tensor {model_name}::forward_impl(")
+    checks_end = ("    if (resident_prefill_ && seq_len > 1) {" if family == "moe"
+                  else "    gdn_states_  =")
     checks = forward[forward.index("    TORCH_CHECK(seq_len == 1 ||"):
-                     forward.index("    gdn_states_  =")]
+                     forward.index(checks_end)]
     assert forward.index("rotary position delta exceeds") < forward.index("gdn_states_  =")
     probe = r'''
 #include <algorithm>

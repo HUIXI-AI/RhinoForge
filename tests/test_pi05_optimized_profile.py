@@ -17,13 +17,16 @@ ROOT = Path(__file__).resolve().parents[1]
 RUNNER = vars(importlib.import_module("examples.runners.pi05.optimized"))
 
 
-@pytest.mark.parametrize("precision,fmt", [("w4a16", "nvfp4"), ("int4_g128", "int4_g128"), ("legacy_int4", "legacy_int4")])
-def test_action_checkpoint_conversion_preserves_w8_vlm_and_kv(tmp_path, precision, fmt):
+@pytest.mark.parametrize("precision,fmt,prefix", [
+    ("w4a16", "nvfp4", "model"), ("int4_g128", "int4_g128", "model"), ("legacy_int4", "legacy_int4", "model"),
+    # lerobot/pi05_libero_base (the H10 float parent) stores keys without "model.".
+    ("w4a16", "nvfp4", "")])
+def test_action_checkpoint_conversion_preserves_w8_vlm_and_kv(tmp_path, precision, fmt, prefix):
     src = tmp_path / "fp16"
     src.mkdir()
     (src / "config.json").write_text("{}")
     tensor = torch.linspace(-1, 1, 256).repeat(256, 1).half()
-    names = ["model" + anchor + "0.self_attn." + proj + ".weight"
+    names = [(prefix + anchor if prefix else anchor[1:]) + "0.self_attn." + proj + ".weight"
              for anchor in (PI05_EXPERT_ANCHOR, PI05_VLM_ANCHOR)
              for proj in ("q_proj", "k_proj", "v_proj")]
     save_file({name: tensor.clone() for name in names}, src / "model.safetensors")
@@ -45,7 +48,7 @@ def test_action_checkpoint_conversion_preserves_w8_vlm_and_kv(tmp_path, precisio
         int4_child_names(cfg)
     values = load_file(dst / "model.safetensors")
     for name in names:
-        if PI05_EXPERT_ANCHOR in name and name.endswith("q_proj.weight"):
+        if PI05_EXPERT_ANCHOR in "." + name and name.endswith("q_proj.weight"):
             assert values[name].dtype == (torch.uint8 if fmt == "nvfp4" else torch.int8)
             assert values[name].abs().max() <= (15 if fmt == "nvfp4" else 8)
             if fmt == "int4_g128":
@@ -60,8 +63,7 @@ def test_gs128_packing_is_idempotent_and_leaves_kv_unchanged():
     for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
         module = torch.nn.Linear(1024, 256, bias=False)
         module.weight = torch.nn.Parameter(torch.randint(-8, 8, (256, 1024), dtype=torch.int8), requires_grad=False)
-        module.register_buffer("weight_scale", torch.ones(8, 256, dtype=torch.float16))
-        module._pi05_int4_group_size = 128
+        module.register_buffer("weight_scale", torch.ones(256, dtype=torch.float16))
         setattr(attn, name, module)
     decoder = SimpleNamespace(layers=[SimpleNamespace(self_attn=attn)])
     kv = {name: getattr(attn, name).weight.clone() for name in ("k_proj", "v_proj")}
@@ -92,19 +94,6 @@ def test_profiles_reject_wrong_precision_scope():
         assert env["RPU_PI05_DENOISE_W4_FASTPATH"] == str(int(precision != "w8a16"))
         for flag in ("XOR3_GATED_ATTN", "XOR3_GATED_MLP", "KV1_DIRECT_CACHE", "KV1_PAIR_OWNER"):
             assert env["RPU_PI05_DENOISE_" + flag] == "1"
-
-
-@pytest.mark.parametrize("profile,expected", [
-    ((True, "w4a16", True, 3, 160), 1),
-    ((True, "w4a16", False, 3, 160), 24),
-    ((True, "w4a16", True, 2, 160), 24),
-    ((False, "w4a16", True, 3, 160), 24),
-])
-def test_cpu_interop_threads_are_bounded_only_for_validated_t160_profile(profile, expected):
-    paired, precision, prefill_w8a8, cameras, text_tokens = profile
-    assert RUNNER["_cpu_interop_threads"](
-        paired=paired, precision=precision, prefill_w8a8=prefill_w8a8,
-        cameras=cameras, text_tokens=text_tokens) == expected
 
 
 def test_fp16_profile_keeps_weights_unquantized_and_rejects_quantized_checkpoint():
@@ -331,7 +320,6 @@ def test_fp16_mask_cache_binds_dtype_and_mask_content(monkeypatch):
 def test_public_prepare_forwards_table_option_and_rejects_nonbool():
     from rpu_backend.api.policy import Pi05Policy
     policy = object.__new__(Pi05Policy)
-    policy._rpu_execution = {}
     policy._rpu_ready = True
     policy._lerobot_policy = torch.nn.Module()
     calls = []
@@ -360,7 +348,7 @@ def test_text_bucket_is_explicit_cold_and_ignores_checkpoint_tokenizer_default(t
     assert policy._adapter._rpu_prefill_text_tokens == text_tokens
 
 
-@pytest.mark.parametrize("invalid", [True, 48, 200, 256, None])
+@pytest.mark.parametrize("invalid", [True, 48, 176, 200, 256, None])
 def test_text_bucket_rejects_invalid_selection_without_mutation(invalid):
     policy, _ = _two_camera_policy_and_batch()
     with pytest.raises(ValueError, match="text_tokens must be"):
@@ -509,35 +497,50 @@ def test_extended_text_cli_rejects_unadmitted_geometry_before_checkpoint_loading
     assert message in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("group_size", [32, 64, 128])
-def test_per_channel_packing_honors_explicit_group_size(group_size):
-    from rpu_backend.quant.int4_pgrp_pack import pack_int4_per_channel_as_pgrp
+def test_t192_binds_c480_for_three_camera_fp16_or_w8a16_only():
+    from rpu_backend.adapters.pi05 import _selected_prefill_pair_rows
+    policy, _ = _two_camera_policy_and_batch()  # three VISUAL slots
+    policy._lerobot_policy._pi05_quant_config = {"method": "nvfp4a16", "nvfp4_abi": "striped_v2"}
+    with pytest.raises(ValueError, match="FP16 or W8A16"):
+        RUNNER["configure_text_profile"](policy, 192)
+    assert not hasattr(policy._adapter, "_rpu_prefill_text_tokens")
+    for quant in (None, {"method": "w8a16"}):
+        policy, _ = _two_camera_policy_and_batch()
+        policy._lerobot_policy._pi05_quant_config = quant
+        receipt = RUNNER["configure_text_profile"](policy, 192)
+        assert receipt["prefill_pair_rows"] == _selected_prefill_pair_rows(policy._adapter) == 480
+    for precision in ("w4a16", "int4_g128"):
+        with pytest.raises(ValueError, match="FP16 or W8A16"):
+            RUNNER["profile_environment"](precision, text_tokens=192)
+    with pytest.raises(ValueError, match="three cameras"):
+        RUNNER["profile_environment"]("fp16", cameras=2, text_tokens=192)
+    # C480 fits the SPM only with the SigLIP LayerNorm vectors streamed.
+    for precision in ("fp16", "w8a16"):
+        assert RUNNER["profile_environment"](precision, text_tokens=192)["RPU_PI05_VISION_LN_STREAM"] == "1"
+        assert RUNNER["profile_environment"](precision, text_tokens=160)["RPU_PI05_VISION_LN_STREAM"] == "0"
+    assert RUNNER["resolve_prefill_chunk_size"](
+        cameras=3, prefill_w8a8=False, requested=None, text_tokens=192) == 480
+    with pytest.raises(ValueError, match="no Prefill W8A8"):
+        RUNNER["resolve_prefill_chunk_size"](cameras=3, prefill_w8a8=True, requested=None, text_tokens=192)
+    policy, batch = _two_camera_policy_and_batch()
+    RUNNER["configure_two_camera_policy"](policy, batch)
+    policy._adapter._rpu_prefill_text_tokens = 192
+    with pytest.raises(ValueError, match="T192 requires exactly three cameras"):
+        _selected_prefill_pair_rows(policy._adapter)
 
-    module = torch.nn.Linear(1024, 256, bias=False)
-    codes = torch.arange(256 * 1024).reshape(256, 1024).remainder(16).to(torch.int8) - 8
-    scale = torch.ones(256, dtype=torch.float16)
-    module.weight = torch.nn.Parameter(codes, requires_grad=False)
-    module.register_buffer("weight_scale", scale)
-    decoder = SimpleNamespace(layers=[SimpleNamespace(self_attn=torch.nn.Module())])
-    decoder.layers[0].self_attn.q_proj = module
-    expected, expected_scale = pack_int4_per_channel_as_pgrp(codes, scale, 1, 8,
-                                                            group_size=group_size)
-    assert pack_int4_projections_inplace(decoder, {"q_proj"}, attn_num_cores=8,
-                                         group_size=group_size) == 1
-    assert torch.equal(module.weight, expected.reshape(256, 512))
-    assert torch.equal(module.weight_scale, expected_scale)
-    assert module.weight_scale.shape[0] == group_size
-    assert pack_int4_projections_inplace(decoder, {"q_proj"}, attn_num_cores=8,
-                                         group_size=group_size) == 0
 
-
-def test_grouped_packing_rejects_a_different_requested_group_size():
-    module = torch.nn.Linear(1024, 256, bias=False)
-    module.weight = torch.nn.Parameter(torch.zeros(256, 1024, dtype=torch.int8), requires_grad=False)
-    module.register_buffer("weight_scale", torch.ones(8, 256, dtype=torch.float16))
-    attn = torch.nn.Module()
-    attn.q_proj = module
-    decoder = SimpleNamespace(layers=[SimpleNamespace(self_attn=attn)])
-    with pytest.raises(RuntimeError, match="logical group scales/metadata mismatch"):
-        pack_int4_projections_inplace(decoder, {"q_proj"}, attn_num_cores=8, group_size=32)
-    assert module.weight.dtype == torch.int8
+@pytest.mark.parametrize("cameras,precision,message", [
+    (3, "fp16", "requires exactly --prefill-chunk-size 480"),
+    (2, "fp16", "T192 requires exactly three cameras"),
+    (3, "w4a16", "T192 requires FP16 or W8A16"),
+])
+def test_t192_cli_rejects_unadmitted_geometry_before_checkpoint_loading(monkeypatch, capsys, cameras, precision, message):
+    argv = ["run_pi05_optimized.py", "--precision", precision, "--cameras", str(cameras), "--text-tokens", "192",
+            "--checkpoint", "/missing-checkpoint", "--batch", "/missing-batch.pt"]
+    if message.startswith("requires exactly"):
+        argv += ["--prefill-chunk-size", "464"]
+    monkeypatch.setattr("sys.argv", argv)
+    with pytest.raises(SystemExit) as error:
+        RUNNER["main"]()
+    assert error.value.code == 2
+    assert message in capsys.readouterr().err

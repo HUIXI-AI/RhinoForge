@@ -65,6 +65,17 @@ def test_dispatch_mode_and_denoise_topology_are_startup_fixed():
 
 
 def test_python_batch_unroll_latches_sample_num_before_native_dispatch():
+    builder = RUNTIME[RUNTIME.index("def build_navdp("):]
+    for env, field in (
+        ("RPU_NAVDP_BATCH", "batch_unroll"),
+        ("RPU_NAVDP_DENOISE_UNROLL", "denoise_unroll"),
+    ):
+        assert builder.index(f'{field} = rpu_env_bool("{env}"') < builder.index("load_file(str(checkpoint))")
+        assert f"{field}={field}" in builder
+        assert f"self._{field} = bool({field})" in RUNTIME
+    predict = RUNTIME[RUNTIME.index("    def predict_action("):RUNTIME.index("    def destroy(self):")]
+    assert "os.environ" not in predict and "rpu_env_bool(" not in predict
+    assert "if self._denoise_unroll:" in predict
     method = RUNTIME[
         RUNTIME.index("    def _predict_action_unroll("):
         RUNTIME.index("    def destroy(self):")

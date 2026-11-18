@@ -106,7 +106,7 @@ int main(){
  auto&cache=KernelCache::instance();Model m;m.fixture();m.install();assert(packs==1&&m.action_down_partial_available_&&m.action_o_resident_.size()==6);
  assert(!m.use_action_down_partial(32,0)&&m.down_buffers().empty());m.loop();m.down_plan();assert(m.routes.size()==2&&m.use_action_down_partial(32,0));
  auto buffers=m.down_buffers();assert(buffers.size()==1&&buffers[0].size==344064&&buffers[0].first==0&&buffers[0].last==31&&buffers[0].scope==BufferScope::LayerWide);
- assert(m.routes[0].args==std::vector<int64_t>({1,0,24,10,32,1024,4096,512,8,16,672,14,344064,512,48,128,22,0,24,2,20,15,8,22,0}));
+ assert(m.routes[0].args==std::vector<int64_t>({2,0,24,10,32,1024,4096,512,8,16,672,14,344064,48,48,768,22,0,32,2,20,15,8,8,0,1}));
  auto identity=m.kvinsert_cost_weight_identity();auto hash=m.subclass_layout_hash();int q=cache.queries;
  cache.down=false;for(int step=0;step<10;++step){m.body_iter=step;m.preload_action_down_partial();for(int layer=0;layer<24;++layer){launches.clear();m.down_stage(layer);assert(launches==std::vector<std::string>({layer==0?"partial-down":"ddr-down"}));}}
  assert(cache.queries==q&&preloads==1&&packs==1);cache.down=true;

@@ -380,14 +380,14 @@ void test_w8_role_and_abi_contract() {
 void test_grouped_uint4_roles_and_abi() {
     auto policy = w8_linear_policy();
     policy.name = "grouped_uint4_contract";
-    policy.rules[0].kernel_name = "grouped_parallel_linear_wuint4a16_pgrp_m128n128k256";
+    policy.rules[0].kernel_name = "grouped_parallel_linear_w4a16_pgrp_m128n128k256";
     policy.rules[0].operands = {
         {GraphDdrRegisterRole::PackedUint4ModelWeight, GraphDdrRegisterAccess::Read,
          GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3},
         {GraphDdrRegisterRole::PerGroupScale, GraphDdrRegisterAccess::Read,
-         GraphDdrRegisterEncoding::DevAddrShift8LoHi, 24, 25},
+         GraphDdrRegisterEncoding::DevAddrShift8LoHi, 20, 21},
         {GraphDdrRegisterRole::NegativeZeroPoint, GraphDdrRegisterAccess::Read,
-         GraphDdrRegisterEncoding::DevAddrShift8LoHi, 26, 27},
+         GraphDdrRegisterEncoding::DevAddrShift8LoHi, 22, 23},
     };
     policy.expected_operand_count = policy.expected_weight_operand_count = 3;
     policy.phases[0].stats.operand_count = policy.phases[0].stats.weight_operand_count = 3;
@@ -418,8 +418,8 @@ void test_grouped_uint4_roles_and_abi() {
         RpuKernelGraphContractTestAccess::validate_kernel_register_policy(missing_zero);
     }, "per-rule totals mismatch"), "grouped UINT4 policy rejects a missing negative-zero owner");
     auto overlap = policy;
-    overlap.rules[0].operands[2].reg_lo = 24;
-    overlap.rules[0].operands[2].reg_hi = 25;
+    overlap.rules[0].operands[2].reg_lo = 20;
+    overlap.rules[0].operands[2].reg_hi = 21;
     EXPECT(throws_with([&] {
         RpuKernelGraphContractTestAccess::validate_kernel_register_policy(overlap);
     }, "invalid/overlapping"), "grouped UINT4 policy rejects aliased scale/negative-zero registers");

@@ -77,6 +77,10 @@ struct GraphRuntimePolicy {
     // Official uniform-quantized 27B owner; its Text/Vision lifecycle reserves
     // four arenas. This does not inherit the legacy text-only loading policy.
     bool qwen35_dense_27b_sdk_budget = false;
+    // A top-level REPLAY end() submits its final prepared segment without
+    // waiting; the next device entry completes it (graph/graph_async_end.h).
+    // Set only by owners that audited their host work between Graphs.
+    bool async_replay_end = false;
 };
 
 // =============================================================================
@@ -657,7 +661,8 @@ class RpuGraphCache {
 public:
     RpuGraphCache();
     explicit RpuGraphCache(size_t max_entries);
-    RpuGraphCache(size_t max_entries, GraphRuntimePolicy runtime_policy);
+    RpuGraphCache(size_t max_entries, GraphRuntimePolicy runtime_policy,
+                  bool require_single_segment = false);
 
     RpuKernelGraph& get_or_create(const GraphSignature& sig);
     RpuKernelGraph* lookup(const GraphSignature& sig);
@@ -746,6 +751,7 @@ private:
         by_gm_branch_;
     size_t max_entries_ = std::numeric_limits<size_t>::max();
     const GraphRuntimePolicy runtime_policy_{};
+    const bool require_single_segment_ = false;
 };
 
 RpuGraphCache& default_graph_cache();

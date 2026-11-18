@@ -76,6 +76,14 @@ int main() {
     reject(fixed, 128, 256);
     State automatic{0};
     dispatch(automatic, 256, 128);
+    // Wall's 384-row envelope must not become a sticky 384-row override:
+    // the current COMPLETE descriptor owns the exact whole-bucket capacity.
+    State wall_sticky{384};
+    reject(wall_sticky, 320, 320);
+    for (int64_t bucket : {64, 128, 192, 256, 320, 384, 320}) {
+        dispatch(automatic, bucket, bucket);
+        assert(automatic.chunk_size_override_ == 0);
+    }
     State exact{128};
     dispatch(exact, 256, 128);
     reject(exact, 256, 256);

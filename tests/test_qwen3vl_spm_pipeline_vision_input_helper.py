@@ -80,7 +80,7 @@ def test_helper_stages_exact_inputs_without_entering_graph_or_spm_lifecycle():
     source, node = _helper_node()
     body = _helper_source(source, node)
 
-    fast_pos = body.index("type(vision_model).fast_pos_embed_interpolate(")
+    fast_pos = body.index("interpolate_vision_positions(vision_model,")
     pos_idx = body.index("_compute_vision_position_idx_cpu(")
     keepalive = body.index("keepalive.narrow(0, 0, 256).copy_(")
     raw_to_rpu = body.index("patch_input_rpu = hidden_states.contiguous().to(")

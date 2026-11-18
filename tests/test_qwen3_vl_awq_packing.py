@@ -65,23 +65,23 @@ def source_pack(q):
     return torch.sum(q << (torch.arange(8)*4), dim=-1).to(torch.int32)
 
 
-def inverse_rpu_weight(weight, n, k, partition):
-    b = weight.flatten().to(torch.int16)
-    q = torch.stack((b & 15, b >> 4), dim=-1).flatten()
-    q = torch.where(q >= 8, q-16, q).to(torch.int8)
-    order = torch.tensor([v for base in (0, 32) for i in range(16) for v in (base+i, base+i+16)])
-    if partition == 1:
-        q = q.view(n//128, k//64, 8, 16, 64)[..., order.argsort()]
-        return q.permute(2,0,3,1,4).reshape(n,k)
-    q = q.view(n//16, k//512, 8, 16, 64)[..., order.argsort()]
-    return q.permute(0,3,2,1,4).reshape(n,k)
+def inverse_rpu_weight(weight, n, k, partition, cores=8):
+    ln_max, lk_max = (n // cores, k) if partition else (n, k // cores)
+    nn, kk = torch.meshgrid(torch.arange(n), torch.arange(k), indexing="ij")
+    core = nn // ln_max if partition else kk // lk_max
+    ln, lk = nn % ln_max, kk % lk_max
+    address = (((((ln // 32) * (lk_max // 32) + lk // 32) * cores + core)
+                 * 16 + ln % 16) * 2 + ln % 32 // 16) * 16 + lk % 16
+    q = (weight.flatten()[address] >> ((lk % 32 // 16) * 4)) & 15
+    q = q.to(torch.int8)
+    return torch.where(q >= 8, q - 16, q)
 
 
-def inverse_rpu_scale(scale, n, k, partition):
+def inverse_rpu_scale(scale, n, k, partition, cores=8):
     g = k//32
-    lg, ln = (g,n//8) if partition == 1 else (g//8,n)
+    lg, ln = (g,n//cores) if partition == 1 else (g//cores,n)
     gb, nb = (lg+3)//4,(ln+63)//64
-    local = scale.view(gb,nb,8,4,64).permute(2,0,3,1,4).reshape(8,gb*4,nb*64)
+    local = scale.view(gb,nb,cores,4,64).permute(2,0,3,1,4).reshape(cores,gb*4,nb*64)
     assert torch.count_nonzero(local[:,lg:,:]) == 0
     assert torch.count_nonzero(local[:,:lg,ln:]) == 0
     real = local[:,:lg,:ln]
@@ -94,7 +94,8 @@ def test_actual_offset_nibbles_and_tp8_pgrp_scale_padding_roundtrip(partition,n,
     scales = (torch.arange(n*(k//32)).reshape(n,-1)%47+1).to(torch.bfloat16)/256
     source = source_pack(q)
     weight, scale = awq._pack_projection(source, torch.tensor([n,k]), scales,n=n,k=k,partition=partition)
-    assert weight.dtype == torch.uint8 and tuple(weight.shape)==(n,k//2)
+    from rpu_backend.quant.int4_pgrp_pack import w4_storage_shape
+    assert weight.dtype == torch.uint8 and tuple(weight.shape) == w4_storage_shape(n, k, partition, 8)
     assert scale.dtype == torch.float16 and scale.size(0)==32
     assert torch.equal(inverse_rpu_weight(weight,n,k,partition), q)
     assert torch.equal(inverse_rpu_scale(scale,n,k,partition),scales.half())
@@ -314,3 +315,25 @@ def test_public_loader_keeps_versioned_cold_tensors_inside_inference_context(tmp
         with pytest.raises(ReachedFactory):
             awq.load_qwen3_vl_awq_imagetext(c,str(tmp_path),local_files_only=True)
         assert torch.is_inference_mode_enabled()
+
+
+@pytest.mark.parametrize("cores", [4,6,8])
+@pytest.mark.parametrize("partition", [0,1])
+def test_real_awq_and_runtime_pack_use_selected_component_cores(cores, partition):
+    from rpu_backend.quant import load_qwen3_vl_runtime as runtime
+
+    n, k = ((cores*32,512) if partition else (128,cores*128))
+    q = ((torch.arange(n*k).reshape(n,k)*5+torch.arange(n)[:,None]*3)%16-8).to(torch.int8)
+    scales = (torch.arange(n*(k//32)).reshape(n,-1)%47+1).to(torch.bfloat16)/256
+    packed, scale = awq._pack_projection(source_pack(q),torch.tensor([n,k]),scales,
+        n=n,k=k,partition=partition,num_cores=cores)
+    assert torch.equal(inverse_rpu_weight(packed,n,k,partition,cores),q)
+    assert torch.equal(inverse_rpu_scale(scale,n,k,partition,cores),scales.half())
+    # The runtime checkpoint stores low/high signed nibbles, independently of
+    # AWQ's offset-eight int32 format. Both must reach identical physical bytes.
+    unsigned = q.to(torch.int16) & 15
+    raw = (unsigned[:,0::2] | (unsigned[:,1::2] << 4)).to(torch.uint8)
+    runtime_packed, runtime_scale = runtime._pack_w4_projection(raw,scales.half().t().contiguous(),
+        n=n,k=k,partition=partition,num_cores=cores)
+    assert torch.equal(runtime_packed,packed)
+    assert torch.equal(runtime_scale,scale)

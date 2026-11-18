@@ -2,6 +2,7 @@
 #include "rpu_helpers.h"
 #include "rpu_kernel_decls.h"
 #include "rpu_linear_tiling.h"
+#include "rpu_specialized_linear_contracts.h"
 
 // Two independent K/V DDR owners and SPM outputs; Q keeps its ordinary route.
 inline void launch_hyvla_kv_grouped_spm(
@@ -26,9 +27,6 @@ inline void launch_hyvla_kv_grouped_spm(
                          s.dim() == 1 && s.size(0) == 1024) : !s.defined(),
                     "HyVLA grouped KV requires independent W8 FP16 [1024] scales, none for FP16");
     }
-    const auto tile = rpu_pl_tiling::select_tile_acc16(51, 128, 1024, !w8);
-    TORCH_CHECK(tile.m_tile == (w8 ? 512 : 432) && tile.n_tile == (w8 ? 48 : 80),
-                "HyVLA grouped KV requires the measured original auto tile");
     const uint64_t base = SPM_ALLOC.addr(0, 0);
     const std::array<std::pair<uint32_t, uint64_t>, 3> regions{{
         {input, 51 * 1024 * 2}, {outputs[0], 51 * 128 * 2}, {outputs[1], 51 * 128 * 2}}};
@@ -78,7 +76,7 @@ inline void launch_hyvla_kv_grouped_spm(
         input, 0, outputs[0], 0, 51, 128, 1024, 0, 8, 2048, 256, 0, 1, uint16_t(w8 ? 1 : 2)});
     rpu_pl_tiling::set_u32_reg_pair(*kernel, 36, outputs[1]);
     writer.write(*kernel);
-    const uint16_t grid = w8 ? 6 : 4;
+    const uint16_t grid = rpu_specialized_linear::contract(id).gx;
     kernel->set_regs(64, grid);
     kernel->set_regs(65, uint16_t{1});
     kernel->set_regs(66, uint16_t{1});

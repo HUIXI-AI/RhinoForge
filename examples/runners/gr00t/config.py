@@ -1,4 +1,4 @@
-"""Cold policy for the measured GR00T three-camera public examples.
+"""Cold policy for the GR00T public examples.
 
 Config checking stays stdlib-only. Tensor/tokenizer checks run before model
 installation; native COMPLETE descriptors still select the actual SPM/DDR path.
@@ -15,12 +15,22 @@ def validate_config(config):
     geometry = {"cameras", "image_size", "text_tokens"}
     if not geometry.intersection(inputs):
         return False  # Existing caller-owned observations keep their old policy.
-    for name, choices in (("cameras", (3,)), ("image_size", (224, 256)),
-                          ("text_tokens", (32, 64, 128)),
+    for name, choices in (("image_size", (224, 256)),
                           ("num_steps", (4, 10)), ("action_horizon", (40,))):
         value = inputs.get(name)
         if type(value) is not int or value not in choices:
             raise ValueError(f"GR00T input.{name} must be one of {choices}")
+    # Both image sizes admit two/three cameras and the same instruction lengths;
+    # keep the existing single-camera 256 compatibility. Actual native capacity
+    # admission remains authoritative for every shape and precision.
+    choices_by_field = {
+        "cameras": (1, 2, 3) if inputs["image_size"] == 256 else (2, 3),
+        "text_tokens": (32, 64, 128, 160, 192, 224, 256),
+    }
+    for name, choices in choices_by_field.items():
+        value = inputs.get(name)
+        if type(value) is not int or value not in choices:
+            raise ValueError(f"GR00T input.{name} must be one of {choices} at image_size={inputs['image_size']}")
     if example.get("dtype") not in ("fp16", "w8a16"):
         raise ValueError("GR00T example requires explicit fp16 or w8a16 dtype")
     observation = inputs.get("observation")
@@ -70,14 +80,15 @@ def validate_observation(config, observation, tokenizer):
     import torch
 
     inputs = config["input"]
+    cameras = inputs["cameras"]
     edge = inputs["image_size"] // 16
-    patches = 3 * edge * edge
-    for name, shape in (("image_grid_thw", (3, 3)),
+    patches = cameras * edge * edge
+    for name, shape in (("image_grid_thw", (cameras, 3)),
                         ("pixel_values", (patches, 1536)), ("state", (1, 1, 132))):
         value = observation.get(name)
         if not isinstance(value, torch.Tensor) or tuple(value.shape) != shape:
             raise ValueError(f"GR00T observation.{name} must have shape {shape}")
-    if observation["image_grid_thw"].tolist() != [[1, edge, edge]] * 3:
+    if observation["image_grid_thw"].tolist() != [[1, edge, edge]] * cameras:
         raise ValueError("GR00T observation.image_grid_thw does not match cameras/image_size")
     for name in ("pixel_values", "state"):
         value = observation[name]
@@ -94,14 +105,14 @@ def validate_observation(config, observation, tokenizer):
     image_pad = tokenizer.convert_tokens_to_ids("<|image_pad|>")
     image = (encode("<|vision_start|>") + [image_pad] * (edge // 2) ** 2
              + encode("<|vision_end|>"))
-    prefix = encode("<|im_start|>user\n") + image * 3
+    prefix = encode("<|im_start|>user\n") + image * cameras
     suffix = encode("<|im_end|>\n<|im_start|>assistant\n")
     tokens = ids[0].tolist()
     text = tokens[len(prefix):-len(suffix)]
     if (tokens[:len(prefix)] != prefix or tokens[-len(suffix):] != suffix
             or len(text) != inputs["text_tokens"]
             or any(token in tokenizer.all_special_ids for token in text)):
-        raise ValueError("GR00T observation must contain three images followed by text_tokens instruction tokens in the Qwen user template")
+        raise ValueError(f"GR00T observation must contain {cameras} images followed by text_tokens instruction tokens in the Qwen user template")
     if "mm_token_type_ids" in observation:
         types = observation["mm_token_type_ids"]
         if (not isinstance(types, torch.Tensor) or types.shape != ids.shape

@@ -18,7 +18,7 @@ import torch.nn.functional as F
 
 SOURCE = Path(__file__).resolve().parents[1] / "python/rpu_backend/adapters/dinov3.py"
 FUNCTIONS = {
-    "_padded_num_heads", "_clear_dinov3_handle_install",
+    "_dinov3_layers", "_padded_num_heads", "_clear_dinov3_handle_install",
     "install_dinov3_vision_for_rpu", "_make_dummy_dinov3_kv_caches",
     "_install_dinov3_vision_for_rpu_impl", "_validate_dinov3_input_bounds",
     "_dinov3_single_chunk_size", "build_position_idx",
@@ -42,7 +42,7 @@ def _whole_functions():
 
 
 class RpuOwner(torch.Tensor):
-    """CPU ATen owner with a test-only device device label and copy spy."""
+    """CPU ATen owner with a test-only RPU device label and copy spy."""
     trace = None
     mode = "alias"
 
@@ -214,6 +214,7 @@ def boundary(monkeypatch):
                  _configured_vision_chunk=lambda owner: 0,
                  _plan_dinov3_vision_execution=plan, rpu_backend=backend,
                  execution_serialized=lambda fn: fn, RPUBackendError=RuntimeError,
+                 UnsupportedModelError=RuntimeError,
                  build_dinov3_rope_tables=lambda **kwargs: (torch.zeros((14, 16)), torch.zeros((14, 16))))
     exec(compile(_whole_functions(), str(SOURCE), "exec"), scope)
     package = types.ModuleType("transformers"); package.__path__ = []

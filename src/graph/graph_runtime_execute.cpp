@@ -5,10 +5,13 @@
 // execution, and execute_graph_* loops.
 #include "graph/graph_runtime.h"
 #include "graph/graph_runtime_internal.h"
+#include "graph/graph_async_end.h"
 #include "rpu_copy_safety.h"
 #include "rpu_profile.h"        // P2 (debug-level): log_at(N) gate
+#include "rpu_worker_pool.h"
 #include <fcntl.h>
 
+#include <ATen/Parallel.h>
 #include <ATen/record_function.h>
 #include <c10/util/ScopeExit.h>
 #include <algorithm>
@@ -21,6 +24,7 @@
 #include <dlfcn.h>
 #include <exception>
 #include <filesystem>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -79,10 +83,13 @@ void coalesce_fixed_dma_allocation_witnesses(
 
 uint8_t validated_kernel_core_extent(
         const GraphRuntimePolicy& policy,
-        const std::vector<uint8_t>& core_ids) {
+        const std::vector<uint8_t>& core_ids,
+        const char* kernel_name = nullptr) {
     TORCH_CHECK(!core_ids.empty(), "Graph kernel core IDs must not be empty");
     TORCH_CHECK(core_ids.size() <= static_cast<size_t>(policy.execution_core_count),
-                "Graph kernel core count exceeds execution_core_count");
+                "Graph kernel core count exceeds execution_core_count: kernel '",
+                kernel_name ? kernel_name : "", "' requests ", core_ids.size(),
+                " cores, execution_core_count=", policy.execution_core_count);
     for (size_t i = 0; i < core_ids.size(); ++i) {
         TORCH_CHECK(core_ids[i] < policy.execution_core_count,
                     "Graph kernel core ID ", static_cast<int>(core_ids[i]),
@@ -564,7 +571,12 @@ void RpuKernelGraph::enqueue(::rhino_lkn::Kernel_t& kernel,
                 "kernel enqueue is forbidden in a poisoned semantic SPM "
                 "producer-yield scope");
     const uint8_t core_extent =
-        validated_kernel_core_extent(runtime_policy_, core_ids);
+        validated_kernel_core_extent(runtime_policy_, core_ids, kernel.get_name());
+    // REPLAYING only patches this Graph's own prepared queue; every other
+    // state may submit or prepare device work now.
+    if (state_ != State::REPLAYING) {
+        rpu_graph_async_end_wait("eager_kernel");
+    }
     switch (state_) {
     case State::PASSTHROUGH: {
         // Keep the direct path on a queue
@@ -611,6 +623,8 @@ void RpuKernelGraph::enqueue(::rhino_lkn::Kernel_t& kernel,
         // 两者都空时才是 §12.4 raw-kernel 降级(调用者既没走 GET_KERNEL(id) 也
         // 没走 active().get_kernel_reset(name))。
         if (!pending_kernel_id_.has_value() && !pending_kernel_name_.has_value()) {
+            TORCH_CHECK(!require_single_segment_,
+                        "Single-segment Graph forbids raw-kernel downgrade");
             TORCH_CHECK(
                 composite_fmb_invocation_.phase ==
                     CompositeFmbInvocationState::Phase::None,
@@ -760,6 +774,10 @@ void RpuKernelGraph::enqueue(::rhino_lkn::Kernel_t& kernel,
 // =============================================================================
 
 void RpuKernelGraph::sync_point() {
+    rpu_graph_async_end_wait("sync_point");
+    TORCH_CHECK(!require_single_segment_ ||
+                    (state_ != State::RECORDING && state_ != State::REPLAYING),
+                "Single-segment Graph forbids partial execution at sync_point");
     check_foreign_graph_execution_allowed(
         "RpuKernelGraph: foreign Graph sync_point");
     TORCH_CHECK(
@@ -1173,15 +1191,48 @@ static bool lingbot2_exact_graph_owns_sdk_budget(
            graph_label == "lingbot2_denoise_unroll";
 }
 
+static bool causal_14b_c4_initial_prefill_needs_small_segments(
+        const GraphSignature* signature,
+        const GraphRuntimePolicy& runtime_policy) {
+    // Signed FNV1a("rpu_causal_decoder"), as used by GraphSignature in Python.
+    // op_id_str is diagnostic-only and must not select an execution policy.
+    constexpr int64_t kCausalDecoderOpId = -2109145083942724555LL;
+    if (signature == nullptr ||
+        signature->op_id != kCausalDecoderOpId ||
+        runtime_policy.execution_core_count != 4 ||
+        signature->flags != 0 || signature->branch_key != 0 ||
+        signature->segment_key != 0 ||
+        signature->shapes != std::vector<int64_t>{1, 192, 192, 5120} ||
+        signature->dtypes != std::vector<uint8_t>{
+            static_cast<uint8_t>(at::kHalf)} ||
+        signature->dyn_dims.size() != 20) {
+        return false;
+    }
+    // runtime/decoder.py owns this order: layers, DeepStack hash, topology
+    // (schema, root, attention, MLP, head, physical KV), generation, chunk
+    // policy, actual chunk rows, initial position, then eight plan-key words.
+    // Keep plan identities intact; those last words are not a precision tag.
+    const std::array<int64_t, 12> prefix{
+        40, 0, 2, 4, 4, 4, 4, 8, 0, 0, 32, 0};
+    return std::equal(prefix.begin(), prefix.end(), signature->dyn_dims.begin());
+}
+
 static SegmentResourceBudget segment_resource_budget(
         const std::string& graph_label,
-        const GraphRuntimePolicy& runtime_policy) {
+        const GraphRuntimePolicy& runtime_policy, bool require_single_segment) {
     constexpr size_t kMiB = 1u << 20;
     const size_t sdk_entries = runtime_policy.lkn_max_batch_entries;
     const size_t sdk_kd = runtime_policy.lkn_kd_buf_mb * kMiB;
     const size_t sdk_instr = runtime_policy.lkn_instr_buf_mb * kMiB;
     const SegmentResourceBudget sdk_budget{
         sdk_entries, sdk_kd, sdk_instr};
+    if (require_single_segment) {
+        TORCH_CHECK(runtime_policy.execution_core_count == 8,
+                    "Single-segment opt-in requires the eight-core queue profile");
+        return {std::min<size_t>(65536, sdk_entries / 2),
+                std::min<size_t>(32 * kMiB, sdk_kd / 2),
+                std::min<size_t>(256 * kMiB, sdk_instr / 2)};
+    }
     // The exact LingBot profile that shipped as one SDK batch retains only its
     // sealed envelope. The legacy 27B text owner's retained decode also uses
     // its SDK envelope: splitting rebuilds all but the final batch on REPLAY.
@@ -1281,6 +1332,11 @@ void RpuKernelGraph::build_segments_from_nodes() {
     // Validate the complete graph before forming any executable segment. Child
     // graphs retain private queues, so their resource policy must also fit.
     for (const auto& node : nodes_) {
+        TORCH_CHECK(!require_single_segment_ || node.kind == GraphNodeKind::Kernel
+                    || node.kind == GraphNodeKind::Dma || node.kind == GraphNodeKind::Barrier
+                    || (node.kind == GraphNodeKind::Branch
+                        && node.as_branch().is_physical_manifest_metadata()),
+                    "Single-segment Graph forbids host/data/child-graph boundaries");
         if (node.kind == GraphNodeKind::Kernel) {
             validated_kernel_core_extent(runtime_policy_, node.as_kernel().core_ids);
         } else if (node.kind == GraphNodeKind::Dma) {
@@ -1322,8 +1378,20 @@ void RpuKernelGraph::build_segments_from_nodes() {
     //   4. SDK footprint 达到共享安全预算 — 在跨 stream DMA fence 完整闭合的
     //      边界贪心切段，避免大图虽 build_batch rc=0 却在硬件静默错算。
     constexpr size_t kNoOpenSeg = std::numeric_limits<size_t>::max();
-    const SegmentResourceBudget resource_budget =
-        segment_resource_budget(graph_label, runtime_policy_);
+    SegmentResourceBudget resource_budget =
+        segment_resource_budget(graph_label, runtime_policy_, require_single_segment_);
+    // Exact C4/40-layer/H5120 initial P192, planned in 32-row chunks, also
+    // produced timeout reports and a large first-logit discrepancy at 4096
+    // entries despite an SDK success return. Reducing
+    // only this ceiling to 1024 restored the matching CPU comparison and
+    // removed the observed timeouts. Keep the SDK snapshot and KD/instruction
+    // budgets unchanged. M1, continuation and other shapes/cores stay unchanged.
+    // FP16 here describes activations, not weights: identical W8/W4 signatures
+    // deliberately receive this budget too. Cuts still require joined streams.
+    if (causal_14b_c4_initial_prefill_needs_small_segments(
+            graph_signature, runtime_policy_)) {
+        resource_budget.entries = std::min<size_t>(resource_budget.entries, 1024);
+    }
     size_t seg_start = kNoOpenSeg;
     uint8_t seg_max_num_cores = 0;
     QueueLaunchState seg_queue_state;
@@ -1376,6 +1444,17 @@ void RpuKernelGraph::build_segments_from_nodes() {
         }
     };
 
+    // A forced cut (isolated kernel, queue-state change, data node) must not
+    // separate stream 0 from a channel it has not joined yet. Ordinary DMA
+    // wrappers close their fence before the next kernel; a deferred burst
+    // (rpu_join_deferred_dma) keeps it open across independent kernels.
+    auto check_fence_closed = [&](const char* boundary, size_t node) {
+        TORCH_CHECK(pending_streams.empty(), "Graph ",
+                    graph_label.empty() ? std::string("<unlabeled>") : graph_label,
+                    ": ", boundary, " at node ", node,
+                    " would split an unjoined cross-stream DMA fence");
+    };
+
     auto close_segment = [&](size_t end_exclusive) {
         if (seg_start == kNoOpenSeg) return;
         Segment seg;
@@ -1426,6 +1505,7 @@ void RpuKernelGraph::build_segments_from_nodes() {
                 siglip_should_isolate_patch_embed_kernel(
                     graph_label, kn,
                     runtime_policy_.siglip_isolate_patch_embed)) {
+                check_fence_closed("isolated kernel", i);
                 close_segment(i);
                 seg_start = i;
                 seg_max_num_cores = kn_num;
@@ -1449,6 +1529,7 @@ void RpuKernelGraph::build_segments_from_nodes() {
                 seg_max_num_cores = kn_num;
                 seg_queue_state = kn.queue_state;
             } else if (seg_queue_state != kn.queue_state) {
+                check_fence_closed("queue-state change", i);
                 close_segment(i);
                 seg_start = i;
                 seg_max_num_cores = kn_num;
@@ -1498,6 +1579,7 @@ void RpuKernelGraph::build_segments_from_nodes() {
         default:
             // 其它 data node (Memcpy / Memset / ChildGraph / Branch /
             // HostCallback / Tier3Oneshot) 按段边界处理,跟原 v3.0 语义一致。
+            check_fence_closed("data node", i);
             if (nodes_[i].kind == GraphNodeKind::ChildGraph) {
                 const auto& child = nodes_[i].as_child_graph().child;
                 TORCH_CHECK(child, "Graph BUILD contains a null child graph");
@@ -1509,6 +1591,15 @@ void RpuKernelGraph::build_segments_from_nodes() {
         }
     }
     close_segment(nodes_.size());
+    if (require_single_segment_) {
+        TORCH_CHECK(segments_.size() == 1,
+                    "Graph requires one physical segment: ", graph_label,
+                    "; got ", segments_.size(), " segments for ", nodes_.size(), " nodes");
+        TORCH_CHECK(peak_entries <= resource_budget.entries
+                    && peak_kd_bytes <= resource_budget.kd_bytes
+                    && peak_instr_bytes <= resource_budget.instr_bytes,
+                    "Single-segment Graph exceeds its SDK-half safety budget: ", graph_label);
+    }
 
     if (resource_split_count > 0 && log_at(3)) {
         std::cerr << "[INFO] [GRAPH-INSTR] AUTO-SPLIT "
@@ -1746,6 +1837,8 @@ void RpuKernelGraph::capture_segment_batch_snapshot(
 }
 
 void RpuKernelGraph::release_prepared_queues() noexcept {
+    // A queue may be the pending asynchronous submission.
+    rpu_graph_async_end_wait_for_graph(this, "release_prepared_queues");
     invalidate_batch_snapshots();
     batch_snapshot_admission_bound_ = false;
     batch_snapshot_available_ = false;
@@ -2104,8 +2197,16 @@ uint32_t RpuKernelGraph::prepare_segment_queue(
 
 ::rhino_lkn::Queue_t* RpuKernelGraph::launch_segment_for_replay(
         Segment& seg,
-        bool hw_perf_enabled) {
+        bool hw_perf_enabled,
+        bool async_end,
+        bool* async_end_submitted,
+        KernelTokenPrescan* token_prescan) {
     RECORD_FUNCTION("rpu_graph::segment_launch", {});
+    // The first launch of a replay consumes or drops the pre-wait scan.
+    KernelTokenPrescan* prescan =
+        token_prescan != nullptr && token_prescan->armed ? token_prescan
+                                                         : nullptr;
+    if (token_prescan != nullptr) token_prescan->armed = false;
 
     // segment fingerprint = (segments_ 中的指针位置,core_num)。后续判定 sync-only
     // 资格,以及为 fallback 路径写新值时用。指针算术安全:segments_ 在 BUILT 期
@@ -2117,6 +2218,7 @@ uint32_t RpuKernelGraph::prepare_segment_queue(
         RpuDmaSubmissionLease submission_lease;
     };
     const auto fixed_dmas_match = [&] {
+        RECORD_FUNCTION("rpu_graph::fixed_dma_preflight", {});
         if (!seg.fixed_dma_table) return FixedDmaPreflight{};
         const auto& bindings = seg.fixed_dma_table->bindings;
         bool addresses_match = true;
@@ -2169,8 +2271,6 @@ uint32_t RpuKernelGraph::prepare_segment_queue(
                 }
             }
         }
-        // Keep scanning after an address mismatch: a later unchanged numeric
-        // address can still carry a released/reused logical allocation.
         auto submission_lease = rpu_validate_live_dma_allocation_witnesses(
             witnesses.data(), witnesses.size());
         return FixedDmaPreflight{
@@ -2247,6 +2347,7 @@ uint32_t RpuKernelGraph::prepare_segment_queue(
         segment_idx, segment_fixed_dmas_match || already_retained);
     PreparedQueueSlot* slot = &private_queue_slots_[slot_idx];
     const auto discard_slot_batch = [&](PreparedQueueSlot& target) noexcept {
+        rpu_graph_async_end_wait_for_graph(this, "queue_discard");
         invalidate_batch_snapshots();
         target.queue.reset();
         target.core_num = 0;
@@ -2282,9 +2383,23 @@ uint32_t RpuKernelGraph::prepare_segment_queue(
             // set can never be reused by the fallback prepare path.
             discard_slot_batch(*slot);
         };
+        // Nothing between the pre-wait scan and here writes a Kernel_t
+        // register or this slot; still require the exact basis it compared.
+        const KernelTokenScan* prescanned = nullptr;
+        if (prescan != nullptr && prescan->seg == &seg &&
+            prescan->slot == slot &&
+            runtime_policy_.fast_replay_skip_sync &&
+            !kernel_params_dirty_this_replay_ &&
+            prescan->basis_tokens_valid == slot->kernel_register_tokens_valid &&
+            prescan->basis_token_count == slot->kernel_register_tokens.size()) {
+            slot->pending_kernel_register_tokens.swap(prescan->tokens);
+            prescanned = &prescan->scan;
+        }
         uint32_t rc = 0;
+        bool submitted_async = false;
         try {
-            rc = launch_segment_sync_only(seg, *slot);
+            rc = launch_segment_sync_only(seg, *slot, async_end,
+                                          &submitted_async, prescanned);
         } catch (...) {
             invalidate_failed_queue();
             throw;
@@ -2294,6 +2409,13 @@ uint32_t RpuKernelGraph::prepare_segment_queue(
                     "launch_segment_sync_only: SDK rc=", rc,
                     " on segment idx=", seg_idx,
                     " (mutable_dmas.size=", seg.mutable_dmas.size(), ")");
+        if (submitted_async) {
+            // The fixed-DMA preflight lease covers the in-flight submission
+            // too; the wait releases it after completion.
+            rpu_graph_async_end_attach_lease(
+                this, std::move(fixed_dma_preflight.submission_lease));
+            if (async_end_submitted != nullptr) *async_end_submitted = true;
+        }
         ++last_stats_.prepared_segment_hit_total;
         ++last_stats_.hw_batch_submit_total;
         return slot->queue.get();
@@ -2531,31 +2653,34 @@ uint32_t RpuKernelGraph::prepare_segment_queue(
 bool RpuKernelGraph::capture_segment_kernel_register_tokens(
         const Segment& seg,
         std::vector<std::pair<size_t, uint64_t>>& tokens) const {
+    RECORD_FUNCTION("rpu_graph::kernel_token_scan", {});
     tokens.clear();
-    for (size_t i = seg.start_idx; i < seg.end_idx; ++i) {
-        if (nodes_[i].kind != GraphNodeKind::Kernel) continue;
-        const auto& node = nodes_[i].as_kernel();
-        if (node.kernel_idx >= kernels_.size() || !kernels_[node.kernel_idx]) {
+    const auto append_current_token = [&](size_t kernel_idx) {
+        if (kernel_idx >= kernels_.size() || !kernels_[kernel_idx]) {
             tokens.clear();
             return false;
         }
         uint64_t token = 0;
-        if (kernels_[node.kernel_idx]->query_register_state_token(&token) !=
+        if (kernels_[kernel_idx]->query_register_state_token(&token) !=
             ::rhino_lkn::kKernelQueryOk) {
             tokens.clear();
             return false;
         }
-        tokens.emplace_back(node.kernel_idx, token);
+        tokens.emplace_back(kernel_idx, token);
+        return true;
+    };
+    for (size_t i = seg.start_idx; i < seg.end_idx; ++i) {
+        if (nodes_[i].kind != GraphNodeKind::Kernel) continue;
+        if (!append_current_token(nodes_[i].as_kernel().kernel_idx)) return false;
     }
     return true;
 }
 
-uint32_t RpuKernelGraph::launch_segment_sync_only(
-        Segment& seg,
-        PreparedQueueSlot& prepared_slot) {
-    TORCH_CHECK(prepared_slot.queue != nullptr,
-                "launch_segment_sync_only: prepared queue is missing");
-    auto& wq = *prepared_slot.queue;
+RpuKernelGraph::KernelTokenScan RpuKernelGraph::scan_kernel_register_tokens(
+        const Segment& seg,
+        const PreparedQueueSlot& prepared_slot,
+        std::vector<std::pair<size_t, uint64_t>>& pending) const {
+    RECORD_FUNCTION("rpu_graph::kernel_token_compare", {});
     // A dirty invocation or disabled skip policy already requires a full sync.
     // Avoid collecting tokens that cannot authorize a skip; successful submit
     // below invalidates the old snapshot so the next clean replay syncs once
@@ -2567,32 +2692,79 @@ uint32_t RpuKernelGraph::launch_segment_sync_only(
                             prepared_slot.kernel_register_tokens_valid;
     const bool current_tokens_valid = [&] {
         if (!may_skip_param_sync) {
-            prepared_slot.pending_kernel_register_tokens.clear();
+            pending.clear();
             return false;
         }
         if (!prepared_slot.kernel_register_tokens_valid) {
-            return capture_segment_kernel_register_tokens(
-                seg, prepared_slot.pending_kernel_register_tokens);
+            return capture_segment_kernel_register_tokens(seg, pending);
         }
-        auto& pending = prepared_slot.pending_kernel_register_tokens;
-        pending.clear();
-        pending.reserve(prepared_slot.kernel_register_tokens.size());
-        for (const auto& committed : prepared_slot.kernel_register_tokens) {
-            const size_t kernel_idx = committed.first;
-            uint64_t token = 0;
-            if (kernel_idx >= kernels_.size() || !kernels_[kernel_idx] ||
-                kernels_[kernel_idx]->query_register_state_token(&token) !=
-                    ::rhino_lkn::kKernelQueryOk) {
-                pending.clear();
-                return false;
+        const auto& committed_tokens = prepared_slot.kernel_register_tokens;
+        const size_t count = committed_tokens.size();
+        pending.assign(count, {});
+        // Each token sits behind three dependent heap loads; fetching the
+        // Kernel_t a few entries ahead takes the first one off the chain.
+        // A large segment also splits the loads across the private host pool;
+        // this thread scans too, and every chunk has finished on return.
+        constexpr size_t kTokenPrefetchDistance = 8;
+        constexpr size_t kTokenChunk = 512;
+        std::atomic<bool> failed{false}, changed{false};
+        const std::function<void(size_t)> scan = [&](size_t chunk) {
+            const size_t begin = chunk * kTokenChunk;
+            const size_t end = std::min(count, begin + kTokenChunk);
+            bool chunk_changed = false;
+            for (size_t j = begin; j < end; ++j) {
+                const auto& committed = committed_tokens[j];
+                if (j + kTokenPrefetchDistance < end) {
+                    const size_t ahead =
+                        committed_tokens[j + kTokenPrefetchDistance].first;
+                    if (ahead < kernels_.size()) {
+                        __builtin_prefetch(kernels_[ahead].get());
+                    }
+                }
+                const size_t kernel_idx = committed.first;
+                uint64_t token = 0;
+                if (kernel_idx >= kernels_.size() || !kernels_[kernel_idx] ||
+                    kernels_[kernel_idx]->query_register_state_token(&token) !=
+                        ::rhino_lkn::kKernelQueryOk) {
+                    failed.store(true, std::memory_order_relaxed);
+                    return;
+                }
+                pending[j] = {kernel_idx, token};
+                chunk_changed = chunk_changed || token != committed.second;
             }
-            pending.emplace_back(kernel_idx, token);
-            tokens_unchanged = tokens_unchanged && token == committed.second;
+            if (chunk_changed) changed.store(true, std::memory_order_relaxed);
+        };
+        const int threads = at::in_parallel_region()
+            ? 1 : std::max(1, std::min(4, at::get_num_threads()));
+        rpu_workers::parallel_steps(
+            (count + kTokenChunk - 1) / kTokenChunk, threads, scan);
+        if (failed.load(std::memory_order_relaxed)) {
+            pending.clear();
+            return false;
         }
+        tokens_unchanged = tokens_unchanged &&
+            !changed.load(std::memory_order_relaxed);
         return true;
     }();
+    return KernelTokenScan{current_tokens_valid, tokens_unchanged};
+}
+
+uint32_t RpuKernelGraph::launch_segment_sync_only(
+        Segment& seg,
+        PreparedQueueSlot& prepared_slot,
+        bool async_end,
+        bool* async_end_submitted,
+        const KernelTokenScan* prescanned) {
+    TORCH_CHECK(prepared_slot.queue != nullptr,
+                "launch_segment_sync_only: prepared queue is missing");
+    auto& wq = *prepared_slot.queue;
+    const KernelTokenScan token_scan = prescanned != nullptr
+        ? *prescanned
+        : scan_kernel_register_tokens(
+              seg, prepared_slot, prepared_slot.pending_kernel_register_tokens);
+    const bool current_tokens_valid = token_scan.current_tokens_valid;
     const bool kernel_register_tokens_match =
-        current_tokens_valid && tokens_unchanged;
+        current_tokens_valid && token_scan.tokens_unchanged;
     // 前提:caller 已确认 wq 的 kd_buf
     // 是本段刚 build 的状态;mutable_dmas 与 SDK 内部 dma_id 计数一致。
     //
@@ -2615,63 +2787,67 @@ uint32_t RpuKernelGraph::launch_segment_sync_only(
     std::vector<RpuDeviceDmaEndpointRequest> endpoint_requests;
     resolutions.reserve(seg.mutable_dmas.size());
     endpoint_requests.reserve(seg.mutable_dmas.size() * 2);
-    for (const auto& slot : seg.mutable_dmas) {
-        TORCH_CHECK(
-            slot.node_idx < nodes_.size() &&
-                nodes_[slot.node_idx].kind == GraphNodeKind::Dma,
-            "launch_segment_sync_only: mutable DMA node sidecar is stale at "
-            "node ", slot.node_idx);
-        const auto& dma = nodes_[slot.node_idx].as_dma();
-        validate_semantic_dma_owner_for_execution(
-            dma, slot.node_idx, "launch_segment_sync_only");
-        const auto expected_variant =
-            slot.kind == Segment::PreparedMutableDmaSlot::Kind::MutableSrc
-            ? DmaNodeData::Variant::MutableSrc
-            : DmaNodeData::Variant::MutableDst;
-        TORCH_CHECK(
-            dma.variant == expected_variant && dma.bytes == slot.bytes &&
-                dma.channel == slot.channel,
-            "launch_segment_sync_only: mutable DMA topology drift at node ",
-            slot.node_idx);
-        TORCH_CHECK(
-            dma.semantic_endpoint_id == 0 ||
-                (dma.live_base == slot.live_base &&
-                 dma.live_offset == slot.live_offset),
-            "launch_segment_sync_only: mutable DMA slot drift at node ",
-            slot.node_idx);
-        TORCH_CHECK(dma.live_base != nullptr,
-                    "launch_segment_sync_only: mutable DMA missing live_base "
-                    "at node ", slot.node_idx);
-        const uint64_t live = checked_dma_live_address(
-            *dma.live_base, dma.live_offset, slot.node_idx,
-            "launch_segment_sync_only");
-        const uint64_t fixed_addr =
-            slot.kind == Segment::PreparedMutableDmaSlot::Kind::MutableSrc
-            ? dma.dst_addr : dma.src_addr;
-        TORCH_CHECK(
-            dma.semantic_endpoint_id == 0 || fixed_addr == slot.fixed_addr,
-            "launch_segment_sync_only: semantic mutable DMA fixed endpoint "
-            "address drift at node ", slot.node_idx);
-        if (slot.kind == Segment::PreparedMutableDmaSlot::Kind::MutableSrc) {
-            endpoint_requests.push_back(RpuDeviceDmaEndpointRequest{
-                live, slot.bytes, "launch_segment_sync_only/MutableSrc/src"});
-            endpoint_requests.push_back(RpuDeviceDmaEndpointRequest{
-                fixed_addr, slot.bytes,
-                "launch_segment_sync_only/MutableSrc/dst"});
-        } else {
-            endpoint_requests.push_back(RpuDeviceDmaEndpointRequest{
-                fixed_addr, slot.bytes,
-                "launch_segment_sync_only/MutableDst/src"});
-            endpoint_requests.push_back(RpuDeviceDmaEndpointRequest{
-                live, slot.bytes, "launch_segment_sync_only/MutableDst/dst"});
+    {
+        RECORD_FUNCTION("rpu_graph::mutable_dma_validate", {});
+        for (const auto& slot : seg.mutable_dmas) {
+            TORCH_CHECK(
+                slot.node_idx < nodes_.size() &&
+                    nodes_[slot.node_idx].kind == GraphNodeKind::Dma,
+                "launch_segment_sync_only: mutable DMA node sidecar is stale at "
+                "node ", slot.node_idx);
+            const auto& dma = nodes_[slot.node_idx].as_dma();
+            validate_semantic_dma_owner_for_execution(
+                dma, slot.node_idx, "launch_segment_sync_only");
+            const auto expected_variant =
+                slot.kind == Segment::PreparedMutableDmaSlot::Kind::MutableSrc
+                ? DmaNodeData::Variant::MutableSrc
+                : DmaNodeData::Variant::MutableDst;
+            TORCH_CHECK(
+                dma.variant == expected_variant && dma.bytes == slot.bytes &&
+                    dma.channel == slot.channel,
+                "launch_segment_sync_only: mutable DMA topology drift at node ",
+                slot.node_idx);
+            TORCH_CHECK(
+                dma.semantic_endpoint_id == 0 ||
+                    (dma.live_base == slot.live_base &&
+                     dma.live_offset == slot.live_offset),
+                "launch_segment_sync_only: mutable DMA slot drift at node ",
+                slot.node_idx);
+            TORCH_CHECK(dma.live_base != nullptr,
+                        "launch_segment_sync_only: mutable DMA missing live_base "
+                        "at node ", slot.node_idx);
+            const uint64_t live = checked_dma_live_address(
+                *dma.live_base, dma.live_offset, slot.node_idx,
+                "launch_segment_sync_only");
+            const uint64_t fixed_addr =
+                slot.kind == Segment::PreparedMutableDmaSlot::Kind::MutableSrc
+                ? dma.dst_addr : dma.src_addr;
+            TORCH_CHECK(
+                dma.semantic_endpoint_id == 0 || fixed_addr == slot.fixed_addr,
+                "launch_segment_sync_only: semantic mutable DMA fixed endpoint "
+                "address drift at node ", slot.node_idx);
+            if (slot.kind == Segment::PreparedMutableDmaSlot::Kind::MutableSrc) {
+                endpoint_requests.push_back(RpuDeviceDmaEndpointRequest{
+                    live, slot.bytes, "launch_segment_sync_only/MutableSrc/src"});
+                endpoint_requests.push_back(RpuDeviceDmaEndpointRequest{
+                    fixed_addr, slot.bytes,
+                    "launch_segment_sync_only/MutableSrc/dst"});
+            } else {
+                endpoint_requests.push_back(RpuDeviceDmaEndpointRequest{
+                    fixed_addr, slot.bytes,
+                    "launch_segment_sync_only/MutableDst/src"});
+                endpoint_requests.push_back(RpuDeviceDmaEndpointRequest{
+                    live, slot.bytes, "launch_segment_sync_only/MutableDst/dst"});
+            }
+            resolutions.push_back(MutableDmaResolution{fixed_addr, {}, {}});
         }
-        resolutions.push_back(MutableDmaResolution{fixed_addr, {}, {}});
     }
-
     std::vector<RpuDmaEndpoint> endpoints(endpoint_requests.size());
-    [[maybe_unused]] auto mutable_submission_lease =
-        rpu_resolve_device_dma_endpoints(
-        endpoint_requests.data(), endpoint_requests.size(), endpoints.data());
+    auto mutable_submission_lease = [&] {
+        RECORD_FUNCTION("rpu_graph::mutable_dma_resolve", {});
+        return rpu_resolve_device_dma_endpoints(
+            endpoint_requests.data(), endpoint_requests.size(), endpoints.data());
+    }();
     auto& pending_packets = prepared_slot.pending_mutable_dma_packets;
     pending_packets.clear();
     pending_packets.reserve(seg.mutable_dmas.size());
@@ -2701,21 +2877,24 @@ uint32_t RpuKernelGraph::launch_segment_sync_only(
     // a historical owner, cache a lease, or compare device addresses alone.
     const bool packet_snapshot_matches_size =
         prepared_slot.mutable_dma_packets.size() == pending_packets.size();
-    for (size_t i = 0; i < seg.mutable_dmas.size(); ++i) {
-        if (packet_snapshot_matches_size &&
-            prepared_slot.mutable_dma_packets[i] == pending_packets[i]) {
-            continue;
-        }
-        const auto& slot = seg.mutable_dmas[i];
-        const auto& resolved = resolutions[i];
-        const uint32_t rc = wq.update_dma_kernel(
-            slot.dma_id,
-            *resolved.src_endpoint.owner, resolved.src_endpoint.offset,
-            *resolved.dst_endpoint.owner, resolved.dst_endpoint.offset,
-            /*size=*/0);
-        if (rc != 0) {
-            // 直接返回给 caller 让 TORCH_CHECK 给出 dma_id / segment idx 上下文。
-            return rc;
+    {
+        RECORD_FUNCTION("rpu_graph::mutable_dma_patch", {});
+        for (size_t i = 0; i < seg.mutable_dmas.size(); ++i) {
+            if (packet_snapshot_matches_size &&
+                prepared_slot.mutable_dma_packets[i] == pending_packets[i]) {
+                continue;
+            }
+            const auto& slot = seg.mutable_dmas[i];
+            const auto& resolved = resolutions[i];
+            const uint32_t rc = wq.update_dma_kernel(
+                slot.dma_id,
+                *resolved.src_endpoint.owner, resolved.src_endpoint.offset,
+                *resolved.dst_endpoint.owner, resolved.dst_endpoint.offset,
+                /*size=*/0);
+            if (rc != 0) {
+                // 直接返回给 caller 让 TORCH_CHECK 给出 dma_id / segment idx 上下文。
+                return rc;
+            }
         }
     }
     // Kernel_t's public register-state token is the authoritative fine-grained
@@ -2741,8 +2920,18 @@ uint32_t RpuKernelGraph::launch_segment_sync_only(
     // submission doorbell.  This is intentionally shape/model independent.
     __sync_synchronize();
     RECORD_FUNCTION("rpu_graph::segment_submit_wait", {});
-    const uint32_t rc_submit = wq.enqueu_batch(/*wait_finish=*/true);
+    // Async replay end: return after submission and let
+    // rpu_graph_async_end_wait() complete it and release the lease.
+    const uint32_t rc_submit = wq.enqueu_batch(/*wait_finish=*/!async_end);
     if (rc_submit != 0) return rc_submit;
+    if (async_end) {
+        if (rpu_graph_async_end_begin(&wq, this,
+                                      std::move(mutable_submission_lease))) {
+            if (async_end_submitted != nullptr) *async_end_submitted = true;
+        } else {
+            wq.finish();  // Bookkeeping failed: complete synchronously.
+        }
+    }
 
     prepared_slot.kernel_register_tokens.swap(
         prepared_slot.pending_kernel_register_tokens);
@@ -3199,6 +3388,13 @@ void RpuKernelGraph::execute_data_node(const GraphNode& node) {
 namespace {
 
 const char* kernel_id_short_name(KernelId id) {
+    const auto ordinal = static_cast<int64_t>(id) -
+        static_cast<int64_t>(KernelId::PL_AUTOTILE_BEGIN);
+    if (ordinal >= 0 &&
+        ordinal < static_cast<int64_t>(rpu_pl_tiling::kParallelCandidateCount)) {
+        return rpu_pl_tiling::detail::parallel_candidates[ordinal].acc32
+            ? "LINEAR_ACC32" : "LINEAR_ACC16";
+    }
     switch (id) {
     // RMSNorm family
     case KernelId::RMS_NORM_BF16:           return "RMSNORM";
@@ -3212,18 +3408,6 @@ const char* kernel_id_short_name(KernelId id) {
     case KernelId::MROPE:                   return "MROPE";
     case KernelId::ROPE_2D_DDR:             return "ROPE_2D_DDR";
     case KernelId::ROPE_2D_SPM:             return "ROPE_2D_SPM";
-    // Linear family
-    case KernelId::PL_AT_FP16_ACC32_M208N128:
-    case KernelId::PL_AT_FP16_ACC32_M240N112:
-    case KernelId::PL_AT_FP16_ACC32_M272N96:
-    case KernelId::PL_AT_FP16_ACC32_M304N80:
-    case KernelId::PL_AT_FP16_ACC32_M352N64:
-    case KernelId::PL_AT_FP16_ACC32_M416N48:
-    case KernelId::PL_AT_FP16_ACC32_M496N32:
-                                            return "LINEAR_ACC32";
-    case KernelId::PL_ACC32_OUT_BF16_M416N48:
-    case KernelId::PL_ACC32_OUT_BF16_M496N32:
-                                            return "LINEAR_ACC32_BF16";
     // SDPA family
     case KernelId::SDPA_FLASH_ATTN_SPM:     return "SDPA_SPM";
     case KernelId::SDPA_FLASH_ATTN_SPM_VCTXLEN:
@@ -3716,10 +3900,16 @@ void RpuKernelGraph::execute_graph_for_recording() {
 // Each segment reuses its prepared slot or rebuilds after a fingerprint miss;
 // interleaved data nodes consume the bindings updated during capture replay.
 
-void RpuKernelGraph::execute_graph_for_replaying() {
+void RpuKernelGraph::execute_graph_for_replaying(bool async_end,
+                                                 bool* async_end_submitted) {
+    // Reuse end()'s full marker scan; child replays and other callers scan.
+    const std::optional<bool> end_scanned_markers = std::exchange(
+        end_scanned_semantic_spm_producer_yield_markers_, std::nullopt);
     begin_execution_stats();
-    verify_semantic_spm_producer_yield_replay_arm(
-        "execute_graph_for_replaying");
+    if (end_scanned_markers.value_or(true)) {
+        verify_semantic_spm_producer_yield_replay_arm(
+            "execute_graph_for_replaying");
+    }
     RECORD_FUNCTION("rpu_graph::execute_replay", {});
     // P6 (debug-level): per-graph REPLAY visibility.
     //   INFO  (3): one-line "FIRST REPLAY" announcement on the transition
@@ -3759,6 +3949,44 @@ void RpuKernelGraph::execute_graph_for_replaying() {
     const std::string hw_perf_gid =
         built_signature_.op_id_str.empty() ? std::string("rpu_graph")
                                             : built_signature_.op_id_str;
+    // A previously ended Graph may still be running. The first segment's
+    // register-token scan reads only host Kernel_t state, so take it while
+    // that submission runs. Every leased step (fixed/mutable DMA preflight,
+    // resolve, patch) stays after the wait, whose deferred frees need zero
+    // active leases. Leading Branch markers execute nothing.
+    kernel_token_prescan_.armed = false;
+    if (rpu_graph_async_end_pending() && !hw_perf_cfg_replay.enabled &&
+        !segments_.empty() && runtime_policy_.fast_replay_skip_sync &&
+        !kernel_params_dirty_this_replay_) {
+        const Segment& first = segments_.front();
+        const PreparedQueueSlot& slot0 = private_queue_slots_[0];
+        bool leading_markers_only = true;
+        for (size_t i = 0; i < first.start_idx; ++i) {
+            leading_markers_only = leading_markers_only &&
+                nodes_[i].kind == GraphNodeKind::Branch;
+        }
+        // Segment 0 always replays from slot 0; mirror its sync-only test.
+        if (leading_markers_only && slot0.queue &&
+            slot0.built_segment_idx == 0 && slot0.fixed_dma_table &&
+            slot0.fixed_dma_table == first.fixed_dma_table &&
+            !slot0.hw_perf_enabled_at_build &&
+            slot0.core_num == static_cast<uint8_t>(first.core_ids.size())) {
+            auto& prescan = kernel_token_prescan_;
+            prescan.scan =
+                scan_kernel_register_tokens(first, slot0, prescan.tokens);
+            prescan.seg = &first;
+            prescan.slot = &slot0;
+            prescan.basis_tokens_valid = slot0.kernel_register_tokens_valid;
+            prescan.basis_token_count = slot0.kernel_register_tokens.size();
+            prescan.armed = true;
+        }
+    }
+    rpu_graph_async_end_wait("replay_submit");
+    // Only the final segment, only without trailing host data nodes, and
+    // never under HWPerf (its per-segment dump reads the completed queue).
+    const bool async_end_armed =
+        async_end && !hw_perf_cfg_replay.enabled && !segments_.empty() &&
+        segments_.back().end_idx == nodes_.size();
     {
         RECORD_FUNCTION("rpu_graph::replay_segment_loop", {});
         size_t next_node = 0;
@@ -3766,8 +3994,10 @@ void RpuKernelGraph::execute_graph_for_replaying() {
             for (size_t i = next_node; i < seg.start_idx; ++i) {
                 execute_data_node(nodes_[i]);
             }
-            ::rhino_lkn::Queue_t* executed_queue =
-                launch_segment_for_replay(seg, hw_perf_cfg_replay.enabled);
+            ::rhino_lkn::Queue_t* executed_queue = launch_segment_for_replay(
+                seg, hw_perf_cfg_replay.enabled,
+                async_end_armed && &seg == &segments_.back(),
+                async_end_submitted, &kernel_token_prescan_);
             ++seg.replay_count;
 
             record_segment_execution(

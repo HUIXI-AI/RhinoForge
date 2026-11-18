@@ -18,7 +18,10 @@ _FAMILY_ROWS = {
     "1.7b": (2048, 6144, 28, 16),
     "4b": (2560, 9728, 36, 32),
     "8b": (4096, 12288, 36, 32),
+    "14b": (5120, 17408, 40, 40),
+    "32b": (5120, 25600, 64, 64),
 }
+_FP16_ROWS = tuple(size for size in _FAMILY_ROWS if size != "32b")
 
 
 def _geometry(size="0.6b"):
@@ -213,16 +216,19 @@ def test_unknown_linear_late_in_tree_rejects_before_any_swizzle(monkeypatch):
     assert not hasattr(model.q_proj, "_rpu_linear_partition")
 
 
-@pytest.mark.parametrize("override", [{"model_type": "llama"}, {"num_hidden_layers": 27},
-    {"quant_config": {"method": "w8a16"}}, {"rope_parameters": {"rope_type": "linear"}}])
-def test_uninstalled_cache_rejects_unsupported_profile_before_allocation(monkeypatch, override):
+@pytest.mark.parametrize("override, message", [
+    ({"model_type": "llama"}, "exact Llama-3.2-1B"),
+    ({"model_type": "mistral"}, "plain FP16 Qwen3"), ({"num_hidden_layers": 27}, "plain FP16 Qwen3"),
+    ({"quant_config": {"method": "w8a16"}}, "plain FP16 Qwen3"),
+    ({"rope_parameters": {"rope_type": "linear"}}, "plain FP16 Qwen3")])
+def test_uninstalled_cache_rejects_unsupported_profile_before_allocation(monkeypatch, override, message):
     model = SimpleNamespace(config=_config(**override), _rpu_execution={"model": {"num_cores": 4}})
     monkeypatch.setattr(torch, "zeros", lambda *_a, **_k: pytest.fail("unsupported profile allocated KV"))
-    with pytest.raises(ValueError, match="plain FP16 Qwen3"):
+    with pytest.raises(ValueError, match=message):
         RPUCache.from_model(model, max_seq_len=16, device="cpu")
 
 
-@pytest.mark.parametrize("size", _FAMILY_ROWS)
+@pytest.mark.parametrize("size", _FP16_ROWS)
 @pytest.mark.parametrize("cores", [4, 6, 8])
 def test_public_loader_keeps_cold_request_through_real_qwen_adapter(monkeypatch, cores, size):
     from rpu_backend.api import causal_lm
@@ -297,17 +303,36 @@ def test_fused_head_uses_installed_inner_topology_before_transform(monkeypatch, 
 @pytest.mark.parametrize("scope", [{}, {"num_cores": 8}, {"num_cores": 4}])
 def test_public_loader_rejects_undeclared_owner_model_scope_before_weight_load(monkeypatch, scope):
     from rpu_backend.api import causal_lm
-    from rpu_backend.adapters.llama import LlamaAdapter
+
+    class PrefillOnlyAdapter:
+        """A CausalLM owner that declares no EXECUTION_SUPPORTED model scope."""
+        preflight = classmethod(lambda cls, config: pytest.fail("undeclared scope reached preflight"))
+
     monkeypatch.setattr(causal_lm.AutoConfig, "from_pretrained", lambda *_a, **_k: _config(model_type="llama"))
     monkeypatch.setattr(causal_lm, "resolve_config_architecture", lambda *_a, **_k: "LlamaForCausalLM")
-    monkeypatch.setattr(causal_lm, "get_adapter", lambda _arch: LlamaAdapter)
+    monkeypatch.setattr(causal_lm, "get_adapter", lambda _arch: PrefillOnlyAdapter)
     monkeypatch.setattr(causal_lm.AutoModelForCausalLM, "from_pretrained",
                         lambda *_a, **_k: pytest.fail("unsupported owner loaded model weights"))
     with pytest.raises(ValueError, match="unknown stage"):
         causal_lm.RPUModelForCausalLM.from_pretrained("unused", rpu_execution={"model": scope})
 
 
-@pytest.mark.parametrize("size", _FAMILY_ROWS)
+@pytest.mark.parametrize("cores", [4, 6])
+def test_llama_owner_rejects_non_llama_geometry_before_weight_load(monkeypatch, cores):
+    # Llama declares the model scope; a Qwen-shaped "llama" config still fails
+    # its exact profile before any checkpoint weight is loaded.
+    from rpu_backend.api import causal_lm
+    from rpu_backend.adapters.llama import LlamaAdapter
+    monkeypatch.setattr(causal_lm.AutoConfig, "from_pretrained", lambda *_a, **_k: _config(model_type="llama"))
+    monkeypatch.setattr(causal_lm, "resolve_config_architecture", lambda *_a, **_k: "LlamaForCausalLM")
+    monkeypatch.setattr(causal_lm, "get_adapter", lambda _arch: LlamaAdapter)
+    monkeypatch.setattr(causal_lm.AutoModelForCausalLM, "from_pretrained",
+                        lambda *_a, **_k: pytest.fail("unsupported owner loaded model weights"))
+    with pytest.raises(causal_lm.UnsupportedModelError):
+        causal_lm.RPUModelForCausalLM.from_pretrained("unused", rpu_execution={"model": {"num_cores": cores}})
+
+
+@pytest.mark.parametrize("size", _FP16_ROWS)
 @pytest.mark.parametrize("cores", [4, 6])
 @pytest.mark.parametrize("phase", ["constructor", "before_to_rpu"])
 @pytest.mark.parametrize("fault", ["layer_count", "head", "last_projection", "embedding", "norm", "extra_linear", "dtype", "bias"])
@@ -394,7 +419,7 @@ def test_larger_fused_head_checks_actual_rpu_weight_before_native_publication(mo
     elif fault == "dtype": weight.dtype = torch.float32
     elif fault == "layout": head._rpu_linear_num_cores = 8
     calls = []
-    monkeypatch.setattr(qwen3, "transform_linear_weight", lambda *_a, **_k: pytest.fail("device head was swizzled twice"))
+    monkeypatch.setattr(qwen3, "transform_linear_weight", lambda *_a, **_k: pytest.fail("RPU head was swizzled twice"))
     monkeypatch.setattr(torch.ops.rpu, "causal_decoder_set_lm_head", lambda *args: calls.append(args), raising=False)
     if fault:
         with pytest.raises(qwen3.RPUBackendError, match="FP16|layout differs"):

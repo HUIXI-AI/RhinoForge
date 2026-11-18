@@ -248,21 +248,25 @@ def test_generic_loaders_forward_explicit_model_code_policy(loader: str, value, 
         model_loader.from_pretrained("unused/checkpoint", trust_remote_code=value)
 
 
-def test_controlled_config_check_does_not_apply_environment(monkeypatch, capsys):
+def test_controlled_config_check_does_not_apply_environment(monkeypatch, capsys, tmp_path):
     from examples.common.cli import main
 
     variable = "RPU_RHINOVLA_EXPERT_W8A16"
     monkeypatch.setenv(variable, "0")
     config = ROOT / "examples/configs/rhinovla/v3/controlled/w8a16_action.toml"
+    assert main(["--config", str(config), "--check-config"]) == 0
+    assert "configuration OK" in capsys.readouterr().out
+    assert os.environ[variable] == "0"
+    legacy = tmp_path / "legacy_env.toml"
+    legacy.write_text(config.read_text(encoding="utf-8") + "\n[env]\nRPU_RHINOVLA_EXPERT_W8A16 = \"1\"\n", encoding="utf-8")
     with pytest.raises(SystemExit) as error:
-        main(["--config", str(config), "--check-config"])
+        main(["--config", str(legacy), "--check-config"])
     assert error.value.code == 2
-    assert "Run this RhinoVLA v3 configuration with" in capsys.readouterr().err
     assert os.environ[variable] == "0"
 
 
 @pytest.mark.parametrize("section, extra", [
-    ("env", 'LD_PRELOAD = "unexpected"'),
+    ("model.opt_in", 'LD_PRELOAD = "unexpected"'),
     ("rpu_execution.action", "unknown_option = true"),
 ])
 def test_controlled_config_check_rejects_unknown_options(tmp_path, section, extra):

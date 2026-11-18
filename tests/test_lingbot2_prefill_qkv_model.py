@@ -1,12 +1,79 @@
 """Exercise actual cold LingBot QKV selection and COMPLETE emission on CPU."""
 from pathlib import Path
+import ast
+from numbers import Integral
 import re
 
+import pytest
 import torch
 
 from test_siglip_attention_dry_live_contract import _function, _run_native
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.parametrize('precision', ['fp16', 'w8'])
+def test_native_prefill_qkv_fixture_uses_exact_public_shape(monkeypatch, precision):
+    """Exercise real packing/fixture code on CPU; only device placement is mocked."""
+    harness = ROOT / 'python/rpu_backend/tests/conformance/production_linear_launchers.py'
+    weights = ROOT / 'python/rpu_backend/runtime/weights.py'
+    namespace = dict(torch=torch, Integral=Integral, NUM_CORES=8)
+    weight_helpers = {'_positive_int', '_validate_swizzle_tensor',
+                      'tp_col_swizzle_mc_weight', 'tp_row_swizzle_mc_weight',
+                      'transform_linear_weight'}
+    nodes = [node for node in ast.parse(weights.read_text()).body
+             if isinstance(node, ast.FunctionDef) and node.name in weight_helpers]
+    exec(compile(ast.Module(nodes, []), str(weights), 'exec'), namespace)
+    nodes = [node for node in ast.parse(harness.read_text()).body
+             if (isinstance(node, ast.FunctionDef) and node.name in
+                 {'raw', 'activation', 'sparse_weight', 'qkv_fixture'}) or
+                (isinstance(node, ast.Assign) and any(
+                    isinstance(target, ast.Name) and target.id == 'CASES'
+                    for target in node.targets))]
+    exec(compile(ast.Module(nodes, []), str(harness), 'exec'), namespace)
+    original_to = torch.Tensor.to
+
+    def cpu_placement(tensor, *args, **kwargs):
+        if args and isinstance(args[0], str) and args[0] == 'rpu':
+            assert len(args) == 1 and not kwargs
+            return tensor
+        return original_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, 'to', cpu_placement)
+    case = f'lingbot_prefill_qkv_{precision}'
+    assert case in namespace['CASES']
+    profile, rows, cores, mode, owners, images, outputs, expected, linear = \
+        namespace['qkv_fixture'](case)
+    assert (profile, rows, cores, mode) == ('lingbot_prefill_qkv', 224, 8, 0)
+    assert outputs == [1, 2, 3] and linear and len(owners) == 6
+    dtype = torch.float16 if precision == 'fp16' else torch.int8
+    for projection, local_n in enumerate((512, 128, 128)):
+        weight, scale = owners[projection], owners[projection + 3]
+        assert weight.dtype == dtype and weight.shape == (cores * local_n, 2560)
+        assert weight.is_contiguous()
+        assert scale.numel() == (0 if precision == 'fp16' else cores * local_n)
+        # Undo the physical core-striped layout and independently evaluate the
+        # one nonzero coefficient per channel, including the final K2559 probe.
+        cell = 32 // weight.element_size()
+        logical = weight.view(local_n // 16, 2560 // cell, cores, 16, cell) \
+            .permute(2, 0, 3, 1, 4).reshape(cores, local_n, 2560)
+        nonzero = logical.ne(0)
+        assert torch.equal(nonzero.sum(-1), torch.ones(cores, local_n, dtype=torch.int64))
+        positions = nonzero.to(torch.int64).argmax(-1)
+        assert positions[-1, -1].item() == 2559
+        values = logical.gather(-1, positions.unsqueeze(-1)).squeeze(-1).float()
+        if precision == 'w8':
+            values = values * scale.reshape(cores, local_n).float()
+        for arm in range(2):
+            assert len(images[arm]) == 4  # input + three outputs, no bias owners
+            x = images[arm][0].view(torch.float16).reshape(cores, rows, 2560)
+            reference = (x.gather(2, positions[:, None, :].expand(-1, rows, -1)).float()
+                         * values[:, None, :]).half()
+            assert expected[arm][projection].shape == (cores, rows, local_n)
+            assert torch.equal(reference, expected[arm][projection])
+            assert images[arm][projection + 1].shape == (cores, rows * local_n * 2)
+            assert not images[arm][projection + 1].any()
+        assert not torch.equal(expected[0][projection], expected[1][projection])
 
 
 def test_actual_long_prefill_deepstack_alias_preserves_layout_and_consumption(tmp_path):
@@ -234,6 +301,9 @@ int main(){Model enabled,ordinary;ordinary.lingbot_prefill_kv_only_=false;
 
 def test_actual_lingbot_prefill_qkv_owner(tmp_path):
     source = (ROOT / 'src/fused/rpu_qwen3_model.h').read_text()
+    generated = (ROOT / 'src/ops/rpu_specialized_linear_contracts.h').read_text()
+    kernel_ids = sorted(set(re.findall(r'KernelId::(\w+)', generated)))
+    generated = generated[generated.index('namespace rpu_specialized_linear {'):]
     names = ('LINGBOT2_PREFILL_QKV_MULTIBASE_SITE', 'CAUSAL_DECODER_Q_SITE',
              'CAUSAL_DECODER_K_SITE', 'CAUSAL_DECODER_V_SITE')
     constants = '\n'.join(re.search(rf'inline constexpr int64_t {n}\s*=\s*[^;]+;', source).group() for n in names)
@@ -272,7 +342,8 @@ def test_actual_lingbot_prefill_qkv_owner(tmp_path):
 using namespace v3;
 __CONSTANTS__
 __ENUMS__
-enum class KernelId : uint16_t {LINGBOT2_PREFILL_QKV_MULTIBASE_W8_M224,LINGBOT2_PREFILL_QKV_MULTIBASE_FP16_M224,LINGBOT2_PREFILL_GATEUP_SHARED_A_W8_M224};
+enum class KernelId : uint16_t {__KERNEL_IDS__};
+__GENERATED__
 struct KernelCache{bool w8=true,fp16=true;static KernelCache&instance(){static KernelCache c;return c;}
  bool has_loaded(KernelId id)const{return id==KernelId::LINGBOT2_PREFILL_QKV_MULTIBASE_W8_M224?w8:fp16;}};
 struct RpuExecutionCoordinator {static bool quiet;static void require_graph_quiescent(const char*){TORCH_CHECK(quiet,"busy");}
@@ -362,10 +433,13 @@ int main(){at::set_num_threads(1);
  for(bool w8:{false,true}){
   CausalDecoderModel m;install(m,w8);m.set_lingbot_prefill_mode(true,true);
   assert(m.invalidations==1&&m.lingbot_prefill_qkv_mode_==(w8?1:2));
-  auto args=m.lingbot_prefill_qkv_arguments();assert(args==std::vector<int64_t>({1,w8?1:2,224,2560,4096,1024,1024,8,0,w8?320:384,w8?112:96,w8?512:480,w8?48:64,128,w8?11:10}));
+  const auto tile=rpu_specialized_linear::contract(w8?KernelId::LINGBOT2_PREFILL_QKV_MULTIBASE_W8_M224:KernelId::LINGBOT2_PREFILL_QKV_MULTIBASE_FP16_M224);
+  auto args=m.lingbot_prefill_qkv_arguments();assert(args==std::vector<int64_t>({2,w8?1:2,224,2560,4096,1024,1024,8,0,tile.m,tile.n,tile.k,tile.gx,tile.gy,2,32,40,20,34,42,4,36,44}));
   execute(m,true);auto desc=m.context.consumer.manifest();
   for(int layer=1;layer<35;++layer){expected=&m.layer_weights_[layer];m.emit(layer);}m.emit(35);assert(tails==(w8?2:1));
   for(size_t i=0;i<args.size();++i){auto bad=desc;++bad.routes[0].arguments[i];m.context.consumer.reset(bad);rejects([&]{m.emit();});}
+  auto legacy=desc;legacy.routes[0].arguments={1,w8?1:2,224,2560,4096,1024,1024,8,0,w8?320:384,w8?112:96,w8?512:480,w8?48:64,128,w8?11:10};
+  m.context.consumer.reset(legacy);rejects([&]{m.emit();});
   for(int field=0;field<4;++field){auto bad=desc;auto&r=bad.routes[0];if(field==0)r.selector++;if(field==1)r.flags++;if(field==2)r.invocation++;if(field==3)r.family=FmbRouteFamily::ATTENTION;
    m.context.consumer.reset(bad);rejects([&]{m.emit();});}
   // A pre-fusion descriptor cannot silently restore the old three launches.
@@ -415,7 +489,8 @@ int main(){at::set_num_threads(1);
  std::cout<<"actual cold selection, identities, COMPLETE consumers and 35 full-layer / terminal traversal PASS\n";
 }
 '''
-    substitutions = {'CONSTANTS': constants, 'ENUMS': '\n'.join(_function(source, 'enum class ' + n) + ';' for n in ('CausalDecoderPlanningMode', 'CausalDecoderLinearRoute')),
+    substitutions = {'KERNEL_IDS': ','.join(kernel_ids), 'GENERATED': generated,
+        'CONSTANTS': constants, 'ENUMS': '\n'.join(_function(source, 'enum class ' + n) + ';' for n in ('CausalDecoderPlanningMode', 'CausalDecoderLinearRoute')),
         'METHODS': methods, 'APPEND': append, 'FALLBACK_APPEND': fallback_append, 'TAIL': tail,
         'EMIT': emit, 'ORDINARY': ordinary, 'LAYOUT': layout.replace('detail::layout_mix', 'v3::detail::layout_mix'), 'COST': cost, 'GUARD': guard}
     for key, value in substitutions.items():
@@ -521,15 +596,18 @@ LayoutContext layout(){LayoutContext l;l.is_causal=true;l.batch_size=1;
  l.attention_policy=AttentionExecutionPolicy::DDR_KV;return l;}
 template<class F>void rejects(F f){bool failed=false;try{f();}catch(const c10::Error&){failed=true;}assert(failed);}
 int main(){at::set_num_threads(1);Model m;auto l=layout();
- // P288's true SDPA sync product is 12: preserving all tokens needs a legal
- // execution bucket, not removal of that operator safety check.
- assert(!sdpa_is_valid_chunk_size(m.config,288,288,0));
+ // The current tiler searches a legal divisor before rejecting the original
+ // product-12 tile. Check the resulting synchronization contract directly.
+ for(int64_t n:{288,320,352,384,400}){
+  assert(sdpa_is_valid_chunk_size(m.config,n,n,0));
+  const auto t=sdpa_compute_tiling(m.config,n);
+  const auto product=CeilDiv(n,t.tile_m)*4;
+  assert(product<=8||product%8==0);
+ }
  assert(sdpa_is_valid_chunk_size(m.config,144,288,0));
- assert(sdpa_is_valid_chunk_size(m.config,320,320,0));
- // Longer single chunks still require the real GQA/grid synchronization
- // boundary: 384 rows has product 12, while 400 rows has product 16.
- for(int64_t n:{352,368,384})assert(!sdpa_is_valid_chunk_size(m.config,n,n,0));
- assert(sdpa_is_valid_chunk_size(m.config,400,400,0));
+ assert(!sdpa_is_valid_chunk_size(m.config,368,368,0));
+ auto bounded=m.config;bounded.max_sync_product=8;
+ assert(!sdpa_is_valid_chunk_size(bounded,288,288,0));
  assert(sdpa_compute_tmp_v16_size(m.config,400)*32==262144);
  // Use the installed capability resolver: C400 is V16 for hidden/K norm,
  // while its four Q heads give 1600 rows and keep the V32 math grouping.
@@ -543,7 +621,7 @@ int main(){at::set_num_threads(1);Model m;auto l=layout();
    <<" tm="<<tile.tile_m<<" tn="<<tile.tile_n<<" tk="<<tile.tile_k
    <<" tmp="<<sdpa_compute_tmp_v16_size(m.config,n)*32<<"\n";
  }
- for(auto lengths:{std::pair<int64_t,int64_t>{224,217},{320,278},{400,342},{400,374}}){
+ for(auto lengths:{std::pair<int64_t,int64_t>{224,217},{288,278},{320,278},{384,374},{400,342},{400,374}}){
   const auto n=lengths.first;auto p=one(n);m.context.seq_len=n;m.context.stage_plan=p;
   auto domain=m.physical_manifest_domain_for_candidate(p,l,n,lengths.second,0);
   assert(domain.size()==1&&domain[0].routes.size()==1);
@@ -553,9 +631,9 @@ int main(){at::set_num_threads(1);Model m;auto l=layout();
   auto stale=domain[0];stale.routes[0].arguments[1]=n-16;m.context.consumer.reset(stale);
   rejects([&]{m.terminal(35,p.compute.chunks[0]);});
  }
- assert(m.forward_admissions==4);
- assert(m.physical_manifest_domain_for_candidate(one(288),l,288,278,0).empty());
- rejects([&]{m.forward_boundary(at::empty({1,288,2560},at::kHalf));});
+ assert(m.forward_admissions==6);
+ assert(m.physical_manifest_domain_for_candidate(one(368),l,368,358,0).empty());
+ rejects([&]{m.forward_boundary(at::empty({1,368,2560},at::kHalf));});
  // The C144x2 shape is legal for ordinary causal SDPA, but this terminal ABI
  // is still one chunk at offset zero. No invented multi-chunk tail is admitted.
  auto multi=compose_fmb_three_stage_chunk_plan(
@@ -576,7 +654,7 @@ int main(){at::set_num_threads(1);Model m;auto l=layout();
  m.config.num_q_heads=0;
  assert(m.physical_manifest_domain_for_candidate(one(320),l,320,278,0).empty());
  rejects([&]{m.forward_boundary(at::empty({1,320,2560},at::kHalf));});
- assert(m.forward_admissions==4);
+ assert(m.forward_admissions==6);
  std::cout<<"native single-chunk SDPA domain and COMPLETE KV-only terminal PASS\n";
 }
 '''

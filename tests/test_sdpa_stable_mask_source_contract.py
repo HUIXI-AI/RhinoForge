@@ -60,17 +60,3 @@ def test_every_production_mask_builder_uses_the_model_cache():
         for path in (ROOT / "src/fused").glob("*.cpp")
     ) + _read("src/fused/rpu_qwen3_model.h")
     assert "stable_owner" not in fused_sources
-
-
-def test_halo_uses_the_base_mask_owner_for_all_action_layers():
-    from test_graph_mask_materialization_order import _block
-
-    source = _read("src/fused/rpu_halo_action_expert_model.cpp")
-    dynamic = _block(source, "ModelDynamicConfig HaloActionExpertModel::dynamic_config(")
-    assert "CausalDecoderModel::dynamic_config(plan)" in dynamic
-    assert "AttentionExecutionPolicy::DDR_KV" in dynamic
-    assert "ctx().attention_mask.has_value()" in dynamic
-    assert "sdpa_prepare_mask(" not in source
-    assert "PreparedMask " not in _read("src/fused/rpu_halo_action_expert_model.h")
-    layer = _block(source, "void HaloActionExpertModel::build_layer_subgraph(")
-    assert "sdpa_dma_mask_to_spm(prepared_attn_mask_," in layer

@@ -1,5 +1,6 @@
 """Execute SigLIP's real planning/consumption code with host-only shape state."""
 from pathlib import Path
+from pi_wall_host_catalog import with_actual_linear_contracts
 import re
 import shutil
 import subprocess
@@ -28,11 +29,10 @@ def _run_native(tmp_path, source, torch, *, extra_sources=()):
     compiler = shutil.which("c++")
     assert compiler, "native SigLIP contract requires a C++ compiler"
     cpp, binary = tmp_path / "siglip_cold.cpp", tmp_path / "siglip_cold"
-    cpp.write_text(source)
+    cpp.write_text(with_actual_linear_contracts(source))
     torch_root = Path(torch.__file__).resolve().parent
     command = [compiler, "-std=c++17", "-O0", "-D_GLIBCXX_USE_CXX11_ABI=" +
-               str(int(torch.compiled_with_cxx11_abi())), "-I", str(ROOT / "src"),
-               "-I", str(runtime_identity_include(tmp_path)),
+               str(int(torch.compiled_with_cxx11_abi())), "-I", str(ROOT / "src"), "-I", str(runtime_identity_include(tmp_path)),
                "-I", str(torch_root / "include"), "-I", str(torch_root / "include/torch/csrc/api/include"),
                str(cpp), *map(str, extra_sources),
                "-L", str(torch_root / "lib"), "-Wl,-rpath," + str(torch_root / "lib"),
@@ -88,7 +88,7 @@ def test_actual_image_and_pi_loop_publication_preserves_dirty_live_ranges(tmp_pa
                   loop.index('    TORCH_CHECK(num_steps >= 1')]
     publication = loop[loop.index("    // A CPU x0 is copied in full"):
                        loop.index("    // ONE forward")]
-    # Replace only the device allocation/CPU-dirty-cache boundary. The real memcpy,
+    # Replace only the RPU allocation/CPU-dirty-cache boundary. The real memcpy,
     # sized publication, mutable bases and Graph keepalive execute unchanged.
     allocation = """at::empty(
             x0_rpu.sizes(), at::TensorOptions().dtype(at::kHalf).device(x_out.device()))"""
@@ -109,7 +109,7 @@ def test_actual_image_and_pi_loop_publication_preserves_dirty_live_ranges(tmp_pa
     # Substitute the device label only; real ATen owns dtype, storage, views,
     # shape/stride validation and ordinary/inference version behavior.
     # CPU ATen models both device allocations; substitute the device-label
-    # query explicitly so the original public device branch is still exercised.
+    # query explicitly so the original public RPU branch is still exercised.
     guards = guards.replace("const bool cpu_x0 = x0_rpu.device().is_cpu();",
                             "const bool cpu_x0 = input_cpu;")
     guards = guards.replace("x0_rpu.device().type() == at::kPrivateUse1",
@@ -574,7 +574,7 @@ int main(){int cases=0;
 def test_siglip_cold_and_stale_shapes_keep_exact_native_attention_routes(tmp_path, monkeypatch):
     # No owner policy is recreated here: compile its actual predicate, manifest
     # append and both DDR consume blocks, plus the real FMB planner/consumer.
-    # The owner fixture supplies geometry only; it cannot allocate device storage.
+    # The owner fixture supplies geometry only; it cannot allocate RPU storage.
     monkeypatch.setenv("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
     import torch
 
@@ -735,7 +735,6 @@ int main() {
             assert(rejects(owner)); // Wrong live physical extent never inherits a plan.
             owner.seq_len_=owner.state.seq_len;
             owner.state.seq_len+=16;
-            // A candidate must match the current inference context.
             assert(!owner.subclass_spm_kv_by_mha_eligible(owner.state.stage_plan,layout,0));
             owner.state.seq_len-=16;
             for (int kind : {0,1}) {
@@ -824,6 +823,7 @@ using namespace v3;
 struct Owner {
     int cores=8;
     int64_t image_batch_count_=1,configured_chunk_size_=0;
+    bool audio_mode_=false,has_patch_emb_=true;
     bool pi05_vision_fc_weight_outer_opt_in_=false,pi05_vision_kv_spm_only_opt_in_=false;
     int64_t orig_head_dim_=72,projection_dim_=2048;
     struct Weight { at::Tensor q_w; };
@@ -888,7 +888,7 @@ int main() {
     }
     for(int images:{2,3}) {
         Owner m; m.cores=4;
-        assert(rejects([&]{m.configure_chunk_for_shape(images*256,images);},"serial single-image"));
+        assert(rejects([&]{m.configure_chunk_for_shape(images*256,images);},"serial image or bounded audio"));
     }
     Owner too_small; too_small.configured_chunk_size_=256;
     assert(rejects([&]{too_small.configure_chunk_for_shape(768,3);},"full sequence"));
@@ -915,6 +915,11 @@ def test_siglip_projector_matrix_view_preserves_live_output_rows(tmp_path, monke
     w4_operands = _function(linear, "static void check_linear_w4a16_operands(")
     launcher = _function(linear, "void rpu_launch_linear_ddr_kernel(")
     gate = launcher[launcher.index("  TORCH_CHECK(input.dim()"):launcher.index("  const bool in_graph")]
+    # The gate also screens the conv-slab route. A projector never takes it, so
+    # the slab handle is null here; the struct comes from the real header so a
+    # changed layout reaches this contract instead of a stale copy of it.
+    slab = _function((ROOT / "src/core/rpu_kernel_decls.h").read_text(),
+                     "struct LinearConv1dSlab") + ";"
     row_offset, = re.findall(r"^      const int64_t row_dst_off = .+;$", launcher, re.M)
     source = r'''
 #include <ATen/ATen.h>
@@ -930,11 +935,12 @@ namespace graph_dma {
 bool captured=false;
 bool active() {return captured;}
 }
-''' + geometry + '\n' + w4_operands + r'''
+''' + slab + '\n' + geometry + '\n' + w4_operands + r'''
 bool validate(const at::Tensor& input,const at::Tensor& weight,at::Tensor& output,
               int partition,int num_cores,const at::Tensor& weight_scale=at::Tensor(),
               const at::Tensor& bias=at::Tensor(),bool has_bias=false,
-              c10::optional<bool> linear_acc32=c10::nullopt) {
+              c10::optional<bool> linear_acc32=c10::nullopt,
+              const LinearConv1dSlab* conv_slab=nullptr) {
 ''' + gate + r'''
     return use_acc32;
 }
@@ -942,7 +948,7 @@ struct Chunk {int64_t offset,len;};
 at::Tensor actual_view(at::Tensor& projector_output_,int64_t seq_len_,
                        int64_t projection_dim_,const Chunk& chunk) {
     const int64_t seq_len=chunk.len;
-    at::Tensor audio_proj2_w_; // Existing vision profiles have no audio tail.
+    at::Tensor audio_proj2_w_; // Vision profiles have no audio tail.
     std::map<int64_t, std::pair<at::Tensor, uint64_t>> audio_proj1_slots_;
     const auto projector_out_live_base_=reinterpret_cast<uintptr_t>(projector_output_.data_ptr());
     auto slot=at::empty({seq_len,projection_dim_},projector_output_.options());
@@ -983,10 +989,10 @@ int main() {
                    "eager col partition only"));
     graph_dma::captured=false;
     // Keep the shared launcher's real W4 helper, including its device gate;
-    // this CPU-only shape harness must not pretend to admit device W4 execution.
+    // this CPU-only shape harness must not pretend to admit RPU W4 execution.
     auto gate_w4=at::empty({2048,576},options.dtype(at::kByte));
     assert(rejects([&]{validate(gate_input,gate_w4,gate_output,1,8);},
-                   "input and weight must share a device"));
+                   "input and weight must share an RPU device"));
     // Serial Pi05, packed baseline, and a nonaligned final query chunk. These
     // are view/launcher geometry checks, not full model admission certificates.
     for(auto [cores,rows,capacity,width]:{
@@ -1219,7 +1225,7 @@ def test_siglip_actual_forward_allocates_retained_mutable_projector_outputs(tmp_
     output_dma = launcher[start:launcher.index(";", start) + 1]
     # This mutation is solely a negative producer control: retain one old
     # projector owner instead of the real per-forward allocation.
-    assignment, = re.findall(r"projector_output_ = allocate_tracked_output\(\s*\{1, seq_len_, audio_proj2_w_\.defined\(\) \? 1024 : projection_dim_\}\);", forward)
+    assignment, = re.findall(r"projector_output_ = allocate_tracked_output\([^;]+\);", forward)
     assert forward.count(assignment) == 1
     old_forward = forward.replace("forward_packed(", "old_forward_packed(", 1).replace(
         assignment, "if (!projector_output_.defined()) " + assignment)
@@ -1291,7 +1297,7 @@ struct Owner {
  bool pi05_vision_kv_spm_only_opt_in_=false;
  std::map<std::pair<int64_t,int64_t>,at::Tensor> q_ddr_slots_;
  at::Tensor projector_output_,proj_w_,proj_b_=at::zeros({2048},at::kHalf);
- at::Tensor audio_proj2_w_; // Existing vision profiles have no audio tail.
+ at::Tensor audio_proj2_w_; // Vision profiles have no audio tail.
  std::map<int64_t, std::pair<at::Tensor, uint64_t>> audio_proj1_slots_;
  uint64_t projector_out_live_base_=0;
  std::optional<bool> configured_linear_acc32_=false;
@@ -1430,6 +1436,10 @@ def test_hyvit2_projector_uses_matrix_metadata_without_copying_output(tmp_path, 
     w4_operands = _function(linear, "static void check_linear_w4a16_operands(")
     launcher = _function(linear, "void rpu_launch_linear_ddr_kernel(")
     gates = launcher[launcher.index("  TORCH_CHECK(input.dim()"):launcher.index("  const bool in_graph")]
+    # As in the cold-projector contract above: the projector passes no slab, and
+    # the struct is taken from the header rather than restated here.
+    slab = _function((ROOT / "src/core/rpu_kernel_decls.h").read_text(),
+                     "struct LinearConv1dSlab") + ";"
     rank_start = launcher.index("  TORCH_CHECK(input.dim()")
     rank_guard = launcher[rank_start:launcher.index(";", rank_start) + 1]
     source = r'''
@@ -1442,7 +1452,7 @@ def test_hyvit2_projector_uses_matrix_metadata_without_copying_output(tmp_path, 
 using at::Tensor;
 constexpr int NUM_CORES=8;
 namespace graph_dma { bool active() { return false; } }
-''' + geometry + '\n' + w4_operands + r'''
+''' + slab + '\n' + geometry + '\n' + w4_operands + r'''
 void rank_gate(const Tensor& input,const Tensor& weight,const Tensor& output) {
 ''' + rank_guard + r'''
 }
@@ -1455,6 +1465,7 @@ void rpu_launch_linear_ddr_kernel(const Tensor& input,const Tensor& weight,
     const int num_cores=8;
     const Tensor weight_scale;
     const c10::optional<bool> linear_acc32=c10::nullopt;
+    const LinearConv1dSlab* conv_slab=nullptr;
 ''' + gates + r'''
     assert(use_acc32 && has_bias && live_dst_base && live_bias_base);
     assert(reinterpret_cast<uintptr_t>(output.data_ptr())==*live_dst_base+dst_offset_bytes);

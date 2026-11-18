@@ -200,9 +200,10 @@ RpuGraphCache::RpuGraphCache(size_t max_entries)
 }
 
 RpuGraphCache::RpuGraphCache(
-        size_t max_entries, GraphRuntimePolicy runtime_policy)
+        size_t max_entries, GraphRuntimePolicy runtime_policy, bool require_single_segment)
     : max_entries_(max_entries),
-      runtime_policy_(std::move(runtime_policy)) {
+      runtime_policy_(std::move(runtime_policy)),
+      require_single_segment_(require_single_segment) {
     validate_graph_runtime_policy(runtime_policy_);
 }
 
@@ -217,7 +218,7 @@ RpuKernelGraph& RpuGraphCache::get_or_create(const GraphSignature& sig) {
                 "); manual evict() required (A3 will add LRU)");
 
     RpuGraphCacheEntry entry;
-    entry.graph = make_registered_rpu_kernel_graph(runtime_policy_);
+    entry.graph = make_registered_rpu_kernel_graph(runtime_policy_, require_single_segment_);
     entry.signature = sig;
     auto [ins_it, inserted] = entries_.emplace(sig, std::move(entry));
     if (inserted) {
@@ -632,6 +633,9 @@ namespace {
 const std::unordered_set<std::string>& rng_op_set() {
     static const std::unordered_set<std::string> s = {
         "aten::multinomial",
+        // Draws one uniform per row from the CPU generator, so it carries
+        // the same replay hazard as the aten spellings above.
+        "rpu::sample_topk_lastdim_host",
         "aten::multinomial.out",
         "aten::randperm",
         "aten::randperm.out",

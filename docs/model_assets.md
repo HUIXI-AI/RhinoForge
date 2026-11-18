@@ -86,8 +86,17 @@ python -m rpu_backend.quant.convert_qwen3 \
 TORCH_DEVICE_BACKEND_AUTOLOAD=0 python python/rpu_backend/quant/convert_qwen3_5_moe_fp8.py \
   --src SOURCE_DIR --dst OUTPUT_DIR --expert-chunk 1 --threads 8
 
-# Pi0.5 W8A16
+# Pi0.5 W8A16 (supports both `model.` and prefix-free `lerobot/pi05_base` keys)
 python -m rpu_backend.quant.convert_pi05 --src SOURCE_DIR --dst OUTPUT_DIR
+
+# Pi0.5 Kuavo action-dimension symlink views from `lerobot/pi05_base` (`22c30e5b`)
+for d in 8 16 20; do
+  python examples/runners/pi05/openpi_inputs.py checkpoint-view \
+    --src SOURCE_OR_W8_DIR --dst "${OUTPUT_DIR}_kuavo_a${d}" --action-dim "$d"
+done
+
+# Pi0.5 Kuavo raw camera frames + openpi norm_stats from public RoboCOIN dataset
+python scripts/prepare_pi05_kuavo_inputs.py --dataset DATASET_DIR --out KUAVO_INPUT_DIR
 
 # Pi0.5 mixed W4A16-KV8 evaluation profile (not pure W4)
 python -m rpu_backend.quant.convert_pi05 \
@@ -103,7 +112,7 @@ python -m rpu_backend.quant.convert_wall_oss \
 ```
 
 For MoE mixed E4M3, use the official unquantized `Qwen/Qwen3.5-35B-A3B`
-source and follow the [download, CPU conversion and run recipe](../examples/configs/qwen3_5/README.md#cmd-moe-mixed).
+source and follow the [download, CPU conversion and run recipe](../examples/configs/WEIGHTS.md#cmd-qwen35-moe).
 The script needs no calibration data; official block-FP8, GPTQ and RTN packages
 cannot replace the floating source or its per-output E4M3 output.
 

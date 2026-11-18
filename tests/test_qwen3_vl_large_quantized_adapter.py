@@ -70,31 +70,33 @@ def test_32b_fp16_remains_excluded_even_with_legacy_opt_in(monkeypatch, opt_in):
 
 
 @pytest.mark.parametrize("opt_in", [None, "true", "1"])
-def test_legacy_32b_config_requires_opt_in_and_bounded_execution_envelope(monkeypatch, opt_in):
+def test_legacy_32b_config_needs_no_opt_in_and_keeps_bounded_envelope(monkeypatch, opt_in):
     cfg = config(32, 8)
     cfg.quant_config = copy.deepcopy(load._QWEN3_VL_32B_W8A16_QUANT_CONFIG)
     if opt_in is None:
         monkeypatch.delenv("QWEN3_VL_32B_ALLOW_GRAPH_BLOCKED", raising=False)
     else:
         monkeypatch.setenv("QWEN3_VL_32B_ALLOW_GRAPH_BLOCKED", opt_in)
-    if opt_in != "1":
-        with pytest.raises(UnsupportedModelError, match="graph-blocked"):
-            qwen3_vl.Qwen3VLAdapter.preflight(cfg)
-    else:
-        qwen3_vl.Qwen3VLAdapter.preflight(cfg)
-        for enabled in (False, True):
+    qwen3_vl.Qwen3VLAdapter.preflight(cfg)
+    for enabled in (False, True):
+        qwen3_vl.Qwen3VLAdapter.preflight_execution(cfg, {
+            "prefill": {"linear_acc32": enabled, "chunk_size": 64}})
+        with pytest.raises(UnsupportedModelError, match="ceiling 64"):
             qwen3_vl.Qwen3VLAdapter.preflight_execution(cfg, {
-                "prefill": {"linear_acc32": enabled, "chunk_size": 64}})
-            with pytest.raises(UnsupportedModelError, match="ceiling 64"):
-                qwen3_vl.Qwen3VLAdapter.preflight_execution(cfg, {
-                    "prefill": {"linear_acc32": enabled, "chunk_size": 128}})
+                "prefill": {"linear_acc32": enabled, "chunk_size": 128}})
 
 
 @pytest.mark.parametrize("size,bits", PROFILES)
-def test_large_quantized_profiles_reject_reduced_cores(size, bits):
-    with pytest.raises((UnsupportedModelError, ValueError)):
-        qwen3_vl.Qwen3VLAdapter.preflight_execution(config(size, bits), {
-            "model": {"num_cores": 4}})
+@pytest.mark.parametrize("cores", [4, 6])
+def test_large_quantized_profiles_bind_component_topology(size, bits, cores):
+    cfg = config(size, bits)
+    execution = {"model": {"num_cores": cores}}
+    qwen3_vl.Qwen3VLAdapter.preflight_execution(cfg, execution)
+    topology = qwen3_vl._qwen3_vl_core_topology(cfg, execution)
+    assert topology.num_cores == cores
+    assert topology.attn_tp == topology.lm_head_tp == 4
+    assert topology.mlp_tp == cores  # packed W4 pads its MLP6 width instead of MLP4
+    assert topology.physical_kv_cores == 8
 
 
 @pytest.mark.parametrize("size,bits", PROFILES)
@@ -224,6 +226,7 @@ def test_large_runtime_to_rpu_uses_private_installers_and_generic_replay(
     assert text_args.get("_runtime_quantized_32b", False) is (size == 32)
     assert not text_args.get("runtime_align_w8a16", False)
     assert text_args["deepstack_lang_layers"] == [0, 1, 2]
+    assert text_args.get("logical_vocab_size") == (model.config.text_config.vocab_size if bits == 4 else None)
     for role, scales in zip(qwen3_vl._QWEN3_VL_TEXT_PROJECTIONS, text_args["scale_lists"], strict=True):
         assert len(scales) == 1
         assert scales[0] is model.model.language_model.layers[0].get_submodule(role).weight_scale

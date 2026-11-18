@@ -222,7 +222,7 @@ int main(){
  int proof_snapshot=replica_proofs,metadata_snapshot=metadata;m.prepare_action_qkv_gate();assert(replica_proofs==proof_snapshot&&metadata==metadata_snapshot);
  assert(!m.use_action_qkv_gate(32));m.plan();assert(m.routes.empty());launches.clear();m.phase2(23);assert(launches==std::vector<std::string>({"q","k","v","gate"}));
  m.loop();assert(m.routes.size()==1&&m.routes[0].site==2447844358394284528LL&&m.routes[0].selector==1&&m.routes[0].flags==0&&m.routes[0].invocation==2);
- assert(m.routes[0].args==std::vector<int64_t>({1,32,256,1024,8,32,192,128,128,2,6,2048,512,2,24,30,36,20,28,34,40,4,2,0,4,2,6,16384,1}));
+ assert(m.routes[0].args==std::vector<int64_t>({2,32,256,1024,8,32,96,48,512,6,18,2048,512,2,32,40,48,20,34,42,50,4,2,0,4,2,6,16384,1,4,36,44,52,1}));
  auto identity=m.kvinsert_cost_weight_identity();auto hash=m.subclass_layout_hash();auto queries=cache.queries;metadata_snapshot=metadata;
  for(int step=0;step<10;++step){for(int layer=0;layer<24;++layer){launches.clear();m.phase2(layer);assert(launches==std::vector<std::string>({"joint"})&&joint_owners.back()==4*layer+1);}}
  assert(cache.queries==queries&&replica_proofs==proof_snapshot&&metadata==metadata_snapshot);
@@ -236,7 +236,7 @@ int main(){
  cache.joint=false;auto old=m;old.install();old.plan();assert(!old.action_qkv_gate_available_&&old.routes.size()==2);assert(old.routes[0].site==QWEN35_ACTION_Q_GATE_W8_SITE&&old.routes[1].site==QWEN35_ACTION_KV_OWNER_W8_SITE);launches.clear();old.phase2(23);assert(launches==std::vector<std::string>({"qgate-w8","kv-w8"}));cache.joint=true;
  Model fp16(false);fp16.install();fp16.loop();assert(!fp16.action_qkv_gate_available_&&fp16.routes.size()==2);launches.clear();fp16.phase2(23);assert(launches==std::vector<std::string>({"qgate-fp16","kv-fp16"}));
  // ACC16 keeps the combined route and passes its actual mode to the native wrapper.
- {Model x;x.linear_acc32_=false;x.install();x.loop();assert(x.action_mod_body_w8_&&x.action_qkv_gate_available_&&x.routes.size()==1&&x.routes[0].args[5]==16&&x.routes[0].args[6]==288&&x.subclass_layout_hash()!=hash&&x.kvinsert_cost_weight_identity()!=identity);
+ {Model x;x.linear_acc32_=false;x.install();x.loop();assert(x.action_mod_body_w8_&&x.action_qkv_gate_available_&&x.routes.size()==1&&x.routes[0].args[5]==16&&x.routes[0].args[6]==48&&x.subclass_layout_hash()!=hash&&x.kvinsert_cost_weight_identity()!=identity);
   const auto valid=x.routes;x.routes=m.routes;reject([&]{x.phase2(0);});x.routes=valid;linear_modes.clear();launches.clear();x.phase2(23);assert(launches==std::vector<std::string>({"joint"})&&linear_modes==std::vector<bool>({false}));
   cache.joint=false;x.install();x.plan();assert(x.routes.size()==2);linear_modes.clear();launches.clear();x.phase2(23);assert(launches==std::vector<std::string>({"qgate-w8","kv-w8"})&&linear_modes==std::vector<bool>({false,false}));cache.joint=true;
   cache.acc16_available=false;x.install();x.plan();assert(x.action_mod_body_w8_&&!x.action_qkv_gate_available_&&x.routes.empty());linear_modes.clear();launches.clear();x.phase2(23);assert(launches==std::vector<std::string>({"q","k","v","gate"})&&linear_modes.empty());cache.acc16_available=true;

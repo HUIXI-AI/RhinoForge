@@ -1,5 +1,6 @@
 """Exercise the real shared-input W8 leaf and exact Prefill COMPLETE consumer."""
 from pathlib import Path
+from pi_wall_host_catalog import CATALOG_INCLUDE
 from test_wall_base_paired_kv import block, compile_run
 from test_wall_base_nvfp4_qkv_bias import META
 
@@ -14,9 +15,11 @@ def test_typed_leaf_ranges_and_packet(tmp_path):
         'void rpu_launch_wall_base_prefill_gate_up_shared_input_spm_kernel(',
         'void rpu_launch_wall_base_prefill_gate_up_shared_silu_spm_kernel(',
         'void rpu_launch_wall_base_prefill_gate_up_shared_silu_no_up_spm_kernel('))
-    source=META+r'''
+    source=CATALOG_INCLUDE+META+r'''
 #include "ops/rpu_linear_tiling.h"
-enum class KernelId{WALL_BASE_PREFILL_GATE_UP_SHARED_A_M384N48K128,WALL_BASE_PREFILL_GATE_UP_SHARED_SILU_M384N48K128,WALL_BASE_PREFILL_GATE_UP_SHARED_SILU_NOUP_M384N48K128};
+enum class KernelId:std::size_t{};
+KernelId pi_wall_kernel_id(std::size_t ordinal){return static_cast<KernelId>(ordinal);}
+KernelId chosen;
 enum class GraphDdrRegisterRole{Int8ModelWeight,PerChannelScale};
 enum class GraphDdrRegisterAccess{Read};
 enum class GraphDdrRegisterEncoding{DevAddrShift8LoHi};
@@ -28,11 +31,11 @@ int staged=0,queued=0;bool fused=false,no_up=false;
 struct Writer{std::vector<GraphDdrRegisterOperandSpec> operands;void write(Kernel& k){for(auto& o:operands){auto a=o.tensor.address>>8;k.set_regs(o.abi.lo,uint16_t(a));k.set_regs(o.abi.hi,uint16_t(a>>16));}}};
 struct RpuKernelGraph{static auto& active(){static RpuKernelGraph g;return g;}
  Writer stage_kernel_ddr_registers(KernelId id,std::vector<GraphDdrRegisterOperandSpec> v){
-  assert(id==(no_up?KernelId::WALL_BASE_PREFILL_GATE_UP_SHARED_SILU_NOUP_M384N48K128:fused?KernelId::WALL_BASE_PREFILL_GATE_UP_SHARED_SILU_M384N48K128:KernelId::WALL_BASE_PREFILL_GATE_UP_SHARED_A_M384N48K128));
-  assert(v.size()==4);++staged;const int lo[]={2,20,24,26};
+  chosen=id;
+  assert(v.size()==4);++staged;const int lo[]={2,20,32,34};
   for(int i=0;i<4;++i)assert(v[i].abi.lo==lo[i]&&v[i].abi.hi==lo[i]+1&&v[i].abi.access==GraphDdrRegisterAccess::Read&&v[i].abi.encoding==GraphDdrRegisterEncoding::DevAddrShift8LoHi&&v[i].abi.role==(i%2?GraphDdrRegisterRole::PerChannelScale:GraphDdrRegisterRole::Int8ModelWeight));return {v};}};
-struct Queue{bool broadcast=false;void set_broadcast_mode(bool b){broadcast=b;}
- void enqueu_kernel(Kernel&,std::vector<uint16_t> grid,std::vector<uint8_t> cores){assert(broadcast&&grid==std::vector<uint16_t>({29,1,1})&&cores==std::vector<uint8_t>({0,1,2,3,4,5,6,7}));++queued;}}queue;
+struct Queue{bool broadcast=false;std::vector<uint16_t> grid;void set_broadcast_mode(bool b){broadcast=b;}
+ void enqueu_kernel(Kernel&,std::vector<uint16_t> g,std::vector<uint8_t> cores){assert(broadcast&&cores==std::vector<uint8_t>({0,1,2,3,4,5,6,7}));grid=g;++queued;}}queue;
 #define GET_KERNEL(id) (&::kernel)
 #define GET_QUEUE(n) (&::queue)
 struct SpmAllocator{static constexpr uint32_t SPM_USABLE=8387584;bool ready=true;uint32_t base=0x20000000;
@@ -50,7 +53,18 @@ int main(){
  g.address=0x10000000;u.address=0x14000000;gs.address=0x18000000;us.address=0x18100000;
  std::array<uint32_t,3> sp{0x20000100,0x20200000,0x20400000};int64_t rows=336;
  auto run=[&]{auto launch=no_up?rpu_launch_wall_base_prefill_gate_up_shared_silu_no_up_spm_kernel:fused?rpu_launch_wall_base_prefill_gate_up_shared_silu_spm_kernel:rpu_launch_wall_base_prefill_gate_up_shared_input_spm_kernel;launch(sp[0],g,u,sp[1],sp[2],rows,gs,us);};
- for(auto m:{224,256,320,336,384}){rows=m;if(!no_up&&m<336){rejects(run);continue;}for(int repeat=0;repeat<2;++repeat){run();assert(word(0)==sp[0]&&word(4)==sp[1]&&word(28)==sp[2]);assert(word(2)==g.address>>8&&word(24)==u.address>>8&&word(20)==gs.address>>8&&word(26)==us.address>>8);assert(kernel.regs[8]==rows&&word(10)==1376&&kernel.regs[12]==2048&&kernel.regs[13]==128&&kernel.regs[14]==0&&kernel.regs[15]==8&&word(16)==4096&&word(18)==2752&&kernel.regs[22]==1&&kernel.regs[23]==1);}}
+ for(auto m:{224,256,320,336,384}){rows=m;if(!no_up&&m<336){rejects(run);continue;}
+  const auto operation=no_up?rpu_pi_wall::Operation::SharedSilu:fused?rpu_pi_wall::Operation::SharedSiluUp:rpu_pi_wall::Operation::SharedRaw;
+  const auto selected=rpu_pi_wall::select(operation,rpu_pl_tiling::WeightType::Int8,false,rows,1376,2048);
+  for(int repeat=0;repeat<2;++repeat){run();
+   assert(chosen==pi_wall_kernel_id(selected.ordinal)&&queue.grid==std::vector<uint16_t>({selected.grid_x,selected.grid_y,1}));
+   assert(word(0)==sp[0]&&word(4)==sp[1]&&word(36)==sp[2]);
+   assert(word(2)==g.address>>8&&word(32)==u.address>>8&&word(20)==gs.address>>8&&word(34)==us.address>>8);
+   assert(kernel.regs[8]==1&&kernel.regs[9]==rows&&word(10)==1376&&kernel.regs[12]==2048&&kernel.regs[13]==128);
+   assert(word(6)==0&&kernel.regs[14]==0&&kernel.regs[15]==8&&word(16)==4096&&word(18)==2752);
+   assert(word(22)==0&&word(24)==0&&kernel.regs[26]==2&&kernel.regs[27]==1&&word(28)==0);
+  }
+ }
  for(int m:{0,32,208,240,272,304,352,400,448,512,640}){rows=m;rejects(run);}rows=384;
  rejects([&]{launch_wall_base_prefill_gate_up_shared(sp[0],g,u,sp[1],sp[2],rows,gs,us,false,true);});
  for(int i=0;i<3;++i){auto old=sp[i];sp[i]=0;rejects(run);sp[i]=old+32;rejects(run);sp[i]=0x207fff00;rejects(run);sp[i]=old;}
@@ -59,7 +73,7 @@ int main(){
  auto old=u;u.address=g.address;rejects(run);u=old;u.where.index=1;rejects(run);u=old;
  KernelCache::instance().loaded=false;rejects(run);KernelCache::instance().loaded=true;
  spm.ready=false;rejects(run);spm.ready=true;
- for(int r:{28,29}){kernel.fail=r;int before=queued;bool failed=false;try{run();}catch(const std::exception&){failed=true;}assert(failed&&queued==before);kernel.fail=-1;}
+ for(int r:{36,37}){kernel.fail=r;int before=queued;bool failed=false;try{run();}catch(const std::exception&){failed=true;}assert(failed&&queued==before);kernel.fail=-1;}
  }
 }
 '''
@@ -81,12 +95,15 @@ def test_complete_profile_fallback_and_consumption(tmp_path):
     find=block(planner,'const FmbRouteManifestEntry& FmbPhysicalManifestConsumer::find_route(').replace('FmbPhysicalManifestConsumer::find_route','find_route')
     consume=block(planner,'const FmbRouteManifestEntry& FmbPhysicalManifestConsumer::consume_route(').replace('FmbPhysicalManifestConsumer::consume_route','consume_physical_route')
     constants='\n'.join(x for x in D.splitlines() if x.startswith('inline constexpr int64_t WALL_BASE_PREFILL_SHARED_'))
-    source=META+r'''
+    runtime=block((ROOT/'src/ops/rpu_pi_wall_runtime.h').read_text(),
+                  'inline bool rpu_pi_wall_operation_loaded(')
+    source=CATALOG_INCLUDE+META+r'''
 #include <tuple>
 enum class ChunkMode{SEQUENTIAL,KV_FIRST};
 enum class CausalDecoderPlanningMode{ORDINARY,WALL_Z1};
 enum class CausalDecoderLinearRoute:int64_t{AUTO_TILE=1};
-enum class KernelId{WALL_BASE_PREFILL_GATE_UP_SHARED_A_M384N48K128,WALL_BASE_PREFILL_GATE_UP_SHARED_SILU_M384N48K128,WALL_BASE_PREFILL_GATE_UP_SHARED_SILU_NOUP_M384N48K128,WALL_QKV_W8A16_MULTIBASE_M448N64};
+enum class KernelId:std::size_t{};
+KernelId pi_wall_kernel_id(std::size_t ordinal){return static_cast<KernelId>(ordinal);}
 enum class FmbRouteFamily{ATTENTION,LINEAR,ACTIVATION,ALL_REDUCE,COLLECTIVE};
 CONSTANTS
 constexpr int64_t FMB_SHARED_MLP_SILU_MUL_SITE=91;
@@ -99,7 +116,20 @@ struct Context{Manifest manifest_;mutable std::vector<int> consumed_;bool comple
  FIND
  CONSUME
 };
-struct KernelCache{bool loaded=true,fused_loaded=false,no_up_loaded=false;static auto& instance(){static KernelCache c;return c;}bool has_loaded(KernelId id){return id==KernelId::WALL_BASE_PREFILL_GATE_UP_SHARED_A_M384N48K128?loaded:id==KernelId::WALL_BASE_PREFILL_GATE_UP_SHARED_SILU_M384N48K128?fused_loaded:id==KernelId::WALL_BASE_PREFILL_GATE_UP_SHARED_SILU_NOUP_M384N48K128?no_up_loaded:true;}};
+struct KernelCache{
+ bool loaded=true,fused_loaded=false,no_up_loaded=false;
+ std::optional<std::size_t> missing;
+ static auto& instance(){static KernelCache c;return c;}
+ bool has_loaded(KernelId id)const{
+  if(missing&&*missing==static_cast<std::size_t>(id))return false;
+  for(const auto& p:rpu_pi_wall::profiles)if(p.ordinal==static_cast<std::size_t>(id)){
+   switch(p.operation){case rpu_pi_wall::Operation::SharedRaw:return loaded;
+    case rpu_pi_wall::Operation::SharedSiluUp:return fused_loaded;
+    case rpu_pi_wall::Operation::SharedSilu:return no_up_loaded;default:return true;}
+  }return false;
+ }
+};
+RUNTIME
 int calls=0,activation=0,down=0,ring=0,fused_calls=0,no_up_calls=0;
 bool admitted_rows(int64_t m){return m==224||m==256||m==320||m==336||m==384;}
 int64_t causal_ring_route(int64_t,int64_t){return 2;}
@@ -157,7 +187,7 @@ struct Model{
 };
 template<class F>void rejects(F f,int gates=0,int downs=0){int before=calls,old_down=down,old_ring=ring;bool fail=false;try{f();}catch(const std::exception&){fail=true;}assert(fail&&calls==before+gates&&down==old_down+downs&&ring==old_ring);}
 int main(){
- // Original three marker modes preserve P336/P384, while only no-Up admits long plans.
+ // Current catalog preserves three output modes; only no-Up admits long plans.
  for(int mode:{0,1,2})for(int64_t physical:{336,384,448,512,640}){
   bool fused=mode>0,no_up=mode==2,long_prefix=physical>384;
   KernelCache::instance().fused_loaded=fused;KernelCache::instance().no_up_loaded=no_up;
@@ -174,8 +204,10 @@ int main(){
   auto& routes=x.context.manifest_.routes;
   for(int c=0;c<chunks;++c){
    auto it=std::find_if(routes.begin(),routes.end(),[&](auto& r){return r.site_id==x.wall_base_prefill_shared_gateup_site()&&r.invocation==c;});assert(it!=routes.end());auto valid=*it;
-   std::vector<int64_t> expected{1,rows,11008,2048,1376,8,384,48,128,29,1,1,378,2};
-   if(fused){expected[0]=2;expected.push_back(1);}if(no_up){expected[0]=3;expected[13]=1;}
+   const auto operation=no_up?rpu_pi_wall::Operation::SharedSilu:fused?rpu_pi_wall::Operation::SharedSiluUp:rpu_pi_wall::Operation::SharedRaw;
+   const auto selected=rpu_pi_wall::select(operation,rpu_pl_tiling::WeightType::Int8,false,rows,1376,2048);
+   std::vector<int64_t> expected{4,rows,11008,2048,1376,8,selected.tile.m_tile,selected.tile.n_tile,
+    selected.tile.k_tile,selected.grid_x,selected.grid_y,1,fused?1:0,no_up?1:2,2,32,20,34,4,36,26,27};
    assert(valid.arguments==expected&&valid.invocation==c&&valid.site_id==(no_up?WALL_BASE_PREFILL_SHARED_NOUP_SITE:fused?WALL_BASE_PREFILL_SHARED_SILU_SITE:WALL_BASE_PREFILL_SHARED_GATEUP_SITE));
    for(size_t i=0;i<valid.arguments.size();++i){*it=valid;++it->arguments[i];rejects([&]{x.emit(c);});}
    for(int field:{0,1,2}){*it=valid;if(field==0)it->selector++;if(field==1)it->flags++;if(field==2)it->invocation=chunks;rejects([&]{x.emit(c);});}*it=valid;
@@ -190,7 +222,7 @@ int main(){
    }
   }
  }
- // Cold marker hierarchy: neither an old marker nor a no-Up marker alone widens admission.
+ // Cold operation availability is hierarchical; no-Up alone cannot widen admission.
  for(bool base:{false,true})for(bool fused:{false,true})for(bool no_up:{false,true}){
   auto& cache=KernelCache::instance();cache.loaded=base;cache.fused_loaded=fused;cache.no_up_loaded=no_up;
   Model x;x.set_rows(448);x.build();const bool eligible=base&&fused&&no_up;
@@ -243,6 +275,6 @@ int main(){
 }
 
 '''
-    for key,value in [('HELPERS',helpers),('COLD',cold),('ACTIVATION_PRODUCER',activation_producer),('PRODUCER',producer),('CONSTANTS',constants),('FIND',find),('CONSUME',consume)]:
+    for key,value in [('HELPERS',helpers),('COLD',cold),('ACTIVATION_PRODUCER',activation_producer),('PRODUCER',producer),('CONSTANTS',constants),('RUNTIME',runtime),('FIND',find),('CONSUME',consume)]:
         source=source.replace(key,value)
     compile_run(tmp_path,'prefill_shared_route',source)

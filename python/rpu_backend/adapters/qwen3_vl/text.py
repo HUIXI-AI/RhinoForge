@@ -86,15 +86,14 @@ _LINGBOT_KV_ONLY_ENVELOPE = ChunkEnvelope(0, 400)
 
 _RUNTIME_QUANTIZED_32B_ENVELOPE = ChunkEnvelope(0, 64)
 
-# Independent bounded candidate for the original Text7-only W8 recipe.
-# Public support remains controlled/uncertified; never relabel this as runtime W8.
-# Native planning/SPM checks remain authoritative. Hardware evidence is separate.
+# Separate envelope for the original Text7-only W8 recipe; never relabel this
+# recipe as runtime W8. Native planning/SPM checks remain authoritative.
 _LEGACY_32B_CONTROLLED_ENVELOPE = ChunkEnvelope(0, 64)
 
 
-
-def _validate_runtime_quantized_32b_text(text_model, cfg, scale_lists):
-    """Bind the exact 32B envelope to the live quantized projection owners."""
+def _validate_runtime_quantized_32b_text(text_model, cfg, scale_lists, topology=None):
+    """Bind the private 32B envelope to the live quantized projection owners."""
+    from rpu_backend.quant.int4_pgrp_pack import w4_storage_shape
     fields = ("num_hidden_layers", "hidden_size", "intermediate_size",
               "num_attention_heads", "num_key_value_heads", "head_dim")
     for config in (cfg, getattr(text_model, "config", None)):
@@ -109,13 +108,25 @@ def _validate_runtime_quantized_32b_text(text_model, cfg, scale_lists):
             or any(not isinstance(scales, (tuple, list)) or len(scales) != 64
                    for scales in scale_lists)):
         raise ValueError("runtime quantized 32B text requires seven complete scale lists")
+    from rpu_backend.runtime.topology import (
+        decoder_mlp_intermediate_size, decoder_packed_w4_mlp_intermediate_size,
+    )
+    try:
+        first = layers[0].get_submodule("self_attn.q_proj").weight
+    except (AttributeError, KeyError) as exc:
+        raise ValueError("runtime quantized 32B text requires all seven projections") from exc
+    packed_w4 = getattr(first, "dtype", None) == torch.uint8
+    # W8 and packed W4 both pad 25600 to 25728 for MLP6 (W4: 384-aligned).
+    width = decoder_packed_w4_mlp_intermediate_size if packed_w4 else decoder_mlp_intermediate_size
+    physical_intermediate = width(25600, topology.mlp_tp) if topology else 25600
     shapes = (("self_attn.q_proj", 8192, 5120),
               ("self_attn.k_proj", 1024, 5120),
               ("self_attn.v_proj", 1024, 5120),
               ("self_attn.o_proj", 5120, 8192),
-              ("mlp.gate_proj", 25600, 5120),
-              ("mlp.up_proj", 25600, 5120),
-              ("mlp.down_proj", 5120, 25600))
+              ("mlp.gate_proj", physical_intermediate, 5120),
+              ("mlp.up_proj", physical_intermediate, 5120),
+              ("mlp.down_proj", 5120, physical_intermediate))
+
     dtype = None
     for (role, n, k), scales in zip(shapes, scale_lists, strict=True):
         for layer, scale in zip(layers, scales, strict=True):
@@ -129,24 +140,28 @@ def _validate_runtime_quantized_32b_text(text_model, cfg, scale_lists):
             if dtype is None:
                 dtype = weight.dtype
             packed = dtype == torch.uint8
+            cores = ((topology.mlp_tp if role.startswith("mlp.") else topology.attn_tp)
+                     if topology else 8)
+            partition = int(not role.endswith(("o_proj", "down_proj")))
+            weight_shape = w4_storage_shape(n, k, partition, cores) if packed else (n, k)
+            local_n, local_g = ((n // cores, k // 32) if partition
+                                else (n, k // 32 // cores))
+            scale_elements = ((local_g + 3) // 4) * ((local_n + 63) // 64) * cores * 4 * 64
             if (weight.dtype != dtype or not weight.is_contiguous()
                     or (projection.out_features, projection.in_features) != (n, k)
-                    or tuple(weight.shape) != (n, k // 2 if packed else k)
+                    or tuple(weight.shape) != weight_shape
                     or getattr(projection, "bias", None) is not None
                     or not isinstance(scale, torch.Tensor)
                     or scale is not projection._buffers.get("weight_scale")
                     or scale.dtype != torch.float16 or not scale.is_contiguous()
                     or scale.device != weight.device
-                    or tuple(scale.shape) != ((32, n * k // 1024) if packed else (n,))):
+                    or tuple(scale.shape) != ((32, scale_elements // 32) if packed else (n,))):
                 raise ValueError("runtime quantized 32B text requires matching projection weights and actual scale buffers")
 
 
 
-def _validate_legacy_32b_text(text_model, cfg, scale_lists):
-    import os
-    if os.environ.get("QWEN3_VL_32B_ALLOW_GRAPH_BLOCKED") != "1":
-        raise ValueError("legacy 32B text requires the exact controlled opt-in")
-    _validate_runtime_quantized_32b_text(text_model, cfg, scale_lists)
+def _validate_legacy_32b_text(text_model, cfg, scale_lists, topology=None):
+    _validate_runtime_quantized_32b_text(text_model, cfg, scale_lists, topology)
     # Reuse only projection ABI validation, never the runtime-profile envelope.
     if any(layer.self_attn.q_proj.weight.dtype != torch.int8
            for layer in text_model.layers):
@@ -163,6 +178,7 @@ def install_qwen3_vl_text_for_rpu(
     execution_config=None, topology=None, runtime_align_w8a16=False,
     _runtime_quantized_32b=False, _legacy_32b_w8a16=False,
     _graph_cache_max_entries=None,
+    logical_vocab_size=None,
     folded_rmsnorm=False,
     prefill_kv_only=False,
     prefill_kv_pair=False,
@@ -173,12 +189,16 @@ def install_qwen3_vl_text_for_rpu(
         raise ValueError("_runtime_quantized_32b must be a bool")
     if type(_legacy_32b_w8a16) is not bool:
         raise ValueError("_legacy_32b_w8a16 must be a bool")
+    if topology is not None:
+        from rpu_backend.runtime.topology import DecoderTopology
+        if not isinstance(topology, DecoderTopology) or topology.num_cores not in (4, 6):
+            raise ValueError("runtime quantized 32B / dense VL text requires a resolved reduced topology")
     if _legacy_32b_w8a16:
-        if (_runtime_quantized_32b or runtime_align_w8a16 or topology is not None
-                or execution_core_count(execution_config) != 8):
-            raise ValueError("legacy 32B text requires its own TP8 profile")
+        if (_runtime_quantized_32b or runtime_align_w8a16 or
+                execution_core_count(execution_config) != (topology.num_cores if topology else 8)):
+            raise ValueError("legacy 32B text requires its own bound topology")
         cfg = text_config if text_config is not None else getattr(text_model, "config", None)
-        _validate_legacy_32b_text(text_model, cfg, scale_lists)
+        _validate_legacy_32b_text(text_model, cfg, scale_lists, topology)
     if type(folded_rmsnorm) is not bool or type(prefill_kv_only) is not bool:
         raise ValueError("folded_rmsnorm and prefill_kv_only must be bool")
     if type(prefill_kv_pair) is not bool or (prefill_kv_pair and
@@ -198,14 +218,14 @@ def install_qwen3_vl_text_for_rpu(
         if folded_rmsnorm and not getattr(text_model, "_lingbot_runtime_norm_folded", False):
             raise ValueError("folded language policy requires the cold FP32 weight transform")
     if _runtime_quantized_32b:
-        if (runtime_align_w8a16 or topology is not None
-                or execution_core_count(execution_config) != 8):
-            raise ValueError("runtime quantized 32B text requires TP8 without the legacy W8 flag")
+        if (runtime_align_w8a16 or
+                execution_core_count(execution_config) != (topology.num_cores if topology else 8)):
+            raise ValueError("runtime quantized 32B text requires its bound topology without the legacy W8 flag")
         cfg = text_config if text_config is not None else getattr(text_model, "config", None)
-        _validate_runtime_quantized_32b_text(text_model, cfg, scale_lists)
+        _validate_runtime_quantized_32b_text(text_model, cfg, scale_lists, topology)
     if runtime_align_w8a16:
         cfg = text_config if text_config is not None else text_model.config
-        if (topology is not None or scale_lists is None or
+        if (scale_lists is None or
                 (cfg.num_hidden_layers, cfg.hidden_size, cfg.intermediate_size,
                  cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim)
                 != (36, 2560, 9728, 32, 8, 128)):
@@ -228,6 +248,8 @@ def install_qwen3_vl_text_for_rpu(
         vision_config=vision_config, deepstack_lang_layers=deepstack_lang_layers,
         enable_deepstack=enable_deepstack, scale_lists=scale_lists,
         execution_config=execution_config, topology=topology,
+        **({"logical_vocab_size": logical_vocab_size}
+           if logical_vocab_size is not None else {}),
         folded_rmsnorm=folded_rmsnorm,
         prefill_kv_only=prefill_kv_only,
         prefill_kv_pair=prefill_kv_pair,

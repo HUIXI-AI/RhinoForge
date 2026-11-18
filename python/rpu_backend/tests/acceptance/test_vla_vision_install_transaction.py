@@ -24,6 +24,9 @@ class _FakeTensor:
     def to(self, *args, **kwargs):
         return self
 
+    def detach(self):
+        return torch.ones(1, dtype=self.dtype)
+
     def contiguous(self):
         return self
 
@@ -67,7 +70,8 @@ def _model():
         _rpu_o_b=tensor,
         _rpu_fc1_b=tensor,
         _rpu_fc2_b=tensor,
-        attn=SimpleNamespace(proj=SimpleNamespace(weight=tensor)),
+        attn=SimpleNamespace(qkv=SimpleNamespace(weight=torch.ones(1)),
+                             proj=SimpleNamespace(weight=tensor)),
         mlp=SimpleNamespace(
             linear_fc1=SimpleNamespace(weight=tensor),
             linear_fc2=SimpleNamespace(weight=tensor),

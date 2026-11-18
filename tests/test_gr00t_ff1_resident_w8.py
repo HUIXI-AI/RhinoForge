@@ -1,5 +1,6 @@
 """Execute native GR00T resident-FF1 policy, replay preload and physical ABI on host."""
 from pathlib import Path
+from pi_wall_host_catalog import with_actual_linear_contracts
 import re
 import shutil
 import subprocess
@@ -13,7 +14,7 @@ LINEAR = ROOT / "src/ops/rpu_linear.cpp"
 
 def _run(tmp_path, source):
     cpp, exe = tmp_path / "ff1.cpp", tmp_path / "ff1"
-    cpp.write_text(source)
+    cpp.write_text(with_actual_linear_contracts(source))
     result = subprocess.run([shutil.which("g++"), "-std=c++17", "-O1", "-I", str(ROOT),
                              str(cpp), "-o", str(exe)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
@@ -31,6 +32,7 @@ COMMON = r'''
 #include <functional>
 #include <initializer_list>
 #include <memory>
+#include <map>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -66,7 +68,12 @@ struct Tensor{
    int64_t input=((v[0]*shape[1]+v[1])*shape[2]+v[2])*shape[3]+v[3];(*x.bytes)[index]=(*bytes)[input];}return x;
  }
 };}
-namespace rhino_lkn{uint64_t RpuGetDevAddr(void*p){return reinterpret_cast<uint64_t>(p);}}
+// The device boundary maps CPU owners to stable aligned 40-bit RPU addresses.
+namespace rhino_lkn{uint64_t RpuGetDevAddr(void*p){
+ static std::map<void*,uint64_t> addresses;
+ auto [it,added]=addresses.emplace(p,UINT64_C(0x100000000)+addresses.size()*UINT64_C(0x1000000));
+ (void)added;return it->second;
+}}
 using rhino_lkn::RpuGetDevAddr;
 struct RpuExecutionCoordinator{
  inline static int token=0;inline static bool busy=false;
@@ -82,6 +89,9 @@ void rpu_ddr_flush_force(void*){}void rpu_ddr_flush(void*){}
 
 def test_ff1_resident_native_lifecycle_routes_and_replay(tmp_path):
     source = MODEL.read_text()
+    generated = (ROOT / "src/ops/rpu_specialized_linear_contracts.h").read_text()
+    kernel_ids = sorted(set(re.findall(r"KernelId::(\w+)", generated)))
+    generated = generated[generated.index("namespace rpu_specialized_linear {"):]
     methods = "\n".join(_definition(source, marker) for marker in (
         "void check_ff1_resident_setter_state(", "void clear_ff1_resident_weight(",
         "void install_ff1_resident_weight(", "void begin_ff1_resident_inference(",
@@ -97,7 +107,7 @@ def test_ff1_resident_native_lifecycle_routes_and_replay(tmp_path):
 #define NUM_CORES 8
 __CONSTANTS__
 __ENV__
-enum class KernelId{GR00T_FF1_RESIDENT_W8A16_M512N48K128};
+__CURRENT_CONTRACT__
 struct KernelCache{inline static bool loaded=true;static KernelCache&instance(){static KernelCache c;return c;}bool has_loaded(KernelId){return loaded;}};
 struct RpuKernelGraph{inline static bool active=false;static bool has_active(){return active;}};
 int pack_calls=0,preloads=0,resident_calls=0,ddr_calls=0,spm_value=-1,request_value=7;
@@ -164,6 +174,17 @@ int main(){
  setenv("RPU_GR00T_FF1_RESIDENT_W8","true",1);rejects([]{gr00t_ff1_resident_w8_opt_in();});
  setenv("RPU_GR00T_FF1_RESIDENT_W8","1",1);Model m;setenv("RPU_GR00T_FF1_RESIDENT_W8","0",1);assert(m.ff1_resident_w8_opt_in_);
  m.install_ff1_resident_weight();assert(pack_calls==1&&m.ff1_resident_generation_==1&&RpuExecutionCoordinator::token==0);m.record();
+ // COMPLETE arguments bind the actual generated tile/grid and current ABI.
+ const auto contract=rpu_specialized_linear::contract(KernelId::GR00T_FF1_RESIDENT_W8A16_M512N48K128);
+ assert(m.context.args.size()==27);
+ assert(std::vector<int64_t>(m.context.args.begin()+20,m.context.args.end())==
+        std::vector<int64_t>({contract.m,contract.n,contract.k,contract.gx,contract.gy,contract.gz,2}));
+ // Retired 23-word schedules and malformed lengths must fail before DMA/kernel.
+ for(size_t n:{size_t(0),size_t(1),size_t(23),size_t(26),size_t(28)}){
+  Model x=m;x.context.args.resize(n);const int loads=preloads,kernels=resident_calls;
+  rejects([&]{x.load_ff1_resident_weight();});rejects([&]{x.emit(0);});
+  assert(preloads==loads&&resident_calls==kernels);
+ }
  for(int request=0;request<3;++request){spm_value=-1;request_value=7+request;(*m.ff1_resident_weight_.bytes)[0]=request_value;m.begin_ff1_resident_inference();
   for(int body=0;body<4;++body){m.context.body_iter=body;m.load_ff1_resident_weight();for(int layer=0;layer<32;++layer)m.emit(layer);}}
  assert(preloads==3&&resident_calls==12&&ddr_calls==372);
@@ -237,7 +258,8 @@ int main(){
  Model fp=m;fp.clear_ff1_resident_weight();fp.layer_weights_[0].ff1_w.dtype=at::kHalf;fp.install_ff1_resident_weight();assert(!fp.ff1_resident_weight_.defined());
 }
 '''
-    cpp = (cpp.replace("__CONSTANTS__", constants)
+    cpp = (cpp.replace("__CURRENT_CONTRACT__", "enum class KernelId{" + ",".join(kernel_ids) + "};\n" + generated)
+           .replace("__CONSTANTS__", constants)
            .replace("__ENV__", _definition(source, "bool gr00t_ff1_resident_w8_opt_in("))
            .replace("__METHODS__", methods).replace("__FF1__", ff1))
     _run(tmp_path, cpp)
@@ -254,9 +276,9 @@ def test_ff1_resident_packing_preload_and_bias_register_abi(tmp_path):
 constexpr size_t kGr00tFf1ResidentW8PerCore=1179648;
 struct SpmAllocator{static constexpr size_t SPM_USABLE=8387584;bool init=true;bool is_initialized(){return init;}uint32_t addr(int,int){return 0x10000000;}}SPM_ALLOC;
 enum class KernelId{GR00T_FF1_RESIDENT_W8A16_M512N48K128};
-struct Kernel_t{std::array<uint16_t,24>r{};void reset_regs(){r.fill(0);}void set_regs(int i,uint16_t v){r.at(i)=v;}}kernel;
+struct Kernel_t{std::array<uint16_t,32>r{};void reset_regs(){r.fill(0);}void set_regs(int i,uint16_t v){r.at(i)=v;}}kernel;
 struct Queue{bool broadcast=false;int launches=0;void set_broadcast_mode(bool v){broadcast=v;}
- void enqueu_kernel(Kernel_t&,std::initializer_list<int>grid,std::initializer_list<int>cores){assert(broadcast&&std::vector<int>(grid)==std::vector<int>({16,1,1})&&cores.size()==8);++launches;}}queue;
+ void enqueu_kernel(Kernel_t&,std::vector<uint16_t>grid,std::initializer_list<int>cores){assert(broadcast&&grid==std::vector<uint16_t>({10,1,1})&&cores.size()==8);++launches;}}queue;
 #define GET_KERNEL(id) (&::kernel)
 #define GET_QUEUE(n) (&::queue)
 enum class GraphDdrRegisterRole{PerChannelScale};enum class GraphDdrRegisterAccess{Read};enum class GraphDdrRegisterEncoding{DevAddrShift8LoHi};
@@ -284,7 +306,7 @@ int main(){
  at::Tensor scale({6144},at::kHalf);uint32_t a=0x10000000,w=0x10200000,o=0x10020000,b=0x10700000;
  rpu_launch_gr00t_ff1_resident_w8_kernel(a,w,o,b,scale);assert(queue.launches==1);
  Kernel_t original;rpu_pl_tiling::set_parallel_linear_regs(original,{a,0,o,b,41,768,1536,1,8,3072,1536,RpuGetDevAddr(scale.data_ptr()),1,1});
- for(int i=0;i<24;++i)if(i!=2&&i!=3)assert(kernel.r[i]==original.r[i]);assert((uint32_t(kernel.r[3])<<16|kernel.r[2])==w);
+ for(int i=0;i<32;++i)if(i!=2&&i!=3)assert(kernel.r[i]==original.r[i]);assert((uint32_t(kernel.r[3])<<16|kernel.r[2])==w);
  auto good=scale;for(int bad=0;bad<4;++bad){scale=good;switch(bad){case 0:scale.dtype=at::kChar;break;case 1:scale.shape[0]=6143;break;case 2:scale.contiguous_=false;break;case 3:scale.dev.value=c10::DeviceType::CPU;break;}rejects([&]{rpu_launch_gr00t_ff1_resident_w8_kernel(a,w,o,b,scale);});}scale=good;
  for(auto wrong:{a-256,w+1,0x10000000u+uint32_t(SpmAllocator::SPM_USABLE)-1179648u+256u})rejects([&]{rpu_launch_gr00t_ff1_resident_w8_kernel(a,wrong,o,b,scale);});
  rejects([&]{rpu_launch_gr00t_ff1_resident_w8_kernel(a,w,a,b,scale);});rejects([&]{rpu_launch_gr00t_ff1_resident_w8_kernel(a,w,o,w,scale);});
@@ -320,7 +342,8 @@ def test_ff1_resident_is_declared_and_invalidated_by_real_callers():
     assert "append_linear(GR00T_DIT_FF1_LINEAR_SITE)" in manifest
     cache = (ROOT / "src/core/rpu_kernel_cache.h").read_text()
     assert cache.index("GR00T_FF1_RESIDENT_W8A16_M512N48K128") > cache.index("UNARY_GELU_TANH_HIGH_PRECISION")
-    assert '"gr00t_ff1_resident_w8a16_m512n48k128"' in (ROOT / "src/core/rpu_kernel_cache.inc").read_text()
+    assert '"gr00t_ff1_resident_w8a16_v2"' in cache
+    assert '"gr00t_ff1_resident_w8a16_v2"' in (ROOT / "src/core/rpu_kernel_cache.inc").read_text()
 
 
 def test_ff1_resident_actual_spm_declarations_fit_v6_and_do_not_alias(tmp_path):
@@ -364,7 +387,7 @@ namespace v3{class FusedModelBase{};
         "static int64_t available_temporary_spm_after_reset(",
         "static bool final_chunk_layout_fits(",
     ))
-    cpp = cpp.replace("class Gr00tDiTModel{public:", budget + "\nclass Gr00tDiTModel{public:")
+    cpp = cpp.replace("class Gr00tDiTModel{public:", budget + "\nclass Gr00tDiTModel{public:\nint64_t minimum_eager_spm_bytes()const{return 0;}")
     methods = _definition(source, "FmbForwardOperandResidency ff1_residency_for_candidate(")
     methods += "\n" + _definition(core, "bool FusedModelBase::declared_spm_layout_fits(").replace("FusedModelBase::", "")
     cpp = cpp.replace(" SdpaConfig make_sdpa_config(", r'''

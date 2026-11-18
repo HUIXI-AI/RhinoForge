@@ -1,3 +1,5 @@
+from pi_wall_host_catalog import assert_current_catalog, CATALOG_INCLUDE
+from test_siglip_attention_dry_live_contract import _function
 """Board-free contract for exact Wall Action core-local SPM weights."""
 
 import ast
@@ -139,15 +141,9 @@ def test_four_regular_layers_share_one_core_major_preload():
 
 
 def test_spm_weight_kernels_are_optional_expansion_cache_entries():
-    for kernel_id, kernel_name in (
-        (QKV_ID, QKV_NAME),
-        (GATE_UP_ID, GATE_UP_NAME),
-        (ROW_ID, ROW_NAME),
-    ):
-        assert kernel_id in CACHE_H
-        assert f'"{kernel_name}"' in CACHE_H
-        assert f'"{kernel_name}"' in CACHE_INC
-        assert f"KernelId::{kernel_id}" in CACHE_INC
+    assert_current_catalog("SharedRawSpmWeight", "ActionRingPostnormSpmWeight")
+    assert '"wall_action_qkv_w8_compact_partial_mrope_v2"' in CACHE_H
+    assert '"wall_action_qkv_w8_compact_partial_mrope_v2"' in CACHE_INC
 
 
 def test_m32_resident_launchers_keep_cold_and_unsupported_payload_guards(tmp_path):
@@ -234,59 +230,41 @@ int main() {
 
 
 def test_gate_up_spm_weights_are_raw_addresses_and_only_scales_use_ddr():
-    name = "rpu_launch_wall_action_gate_up_w8a16_multibase_spm_kernel("
-    assert name in DECLS
-    launcher = _section(
-        "void rpu_launch_wall_action_gate_up_w8a16_multibase_spm_kernel(",
-        "void rpu_launch_wall_action_linear_ring_postnorm_spm_kernel(",
-    )
+    launcher=_function(LINEAR,"void rpu_launch_wall_action_gate_up_w8a16_multibase_spm_kernel(")
     assert launcher.count("GraphDdrRegisterOperandSpec{") == 4
     assert launcher.count("GraphDdrRegisterRole::PerChannelScale") == 2
     assert launcher.count("GraphDdrRegisterRole::Int8ModelWeight") == 2
-    assert "if (!use_spm_weight)" in launcher
-    assert "set_u32_reg_pair(*kernel, 2, gate_weight_spm_addr);" in launcher
-    assert "set_u32_reg_pair(*kernel, 24, up_weight_spm_addr);" in launcher
-    assert "queue->set_broadcast_mode(true);" in launcher
-    assert "queue->enqueu_kernel(*kernel, {16, 1, 1}, cores);" in launcher
+    for contract in ("if (!use_spm_weight)", "set_u32_reg_pair(*kernel, 2, gate_weight_spm_addr);",
+     "set_u32_reg_pair(*kernel, 32, up_weight_spm_addr);", "Operation::SharedRawSpmWeight",
+     "Operation::SharedRaw", "set_regs(36", "{selected.grid_x, selected.grid_y, 1}"):
+        assert contract in launcher
 
 
 def test_qkv_spm_weights_preserve_partial_mrope_registers():
-    name = "rpu_launch_wall_action_qkv_w8a16_multibase_spm_kernel("
-    assert name in DECLS
-    launcher = _section(
-        "void rpu_launch_wall_action_qkv_w8a16_multibase_spm_kernel(",
-        "void rpu_launch_wall_vision_qkv_w8a16_multibase_spm_kernel(",
-    )
+    launcher=_function(LINEAR,"void rpu_launch_wall_action_qkv_w8a16_multibase_spm_kernel(")
     assert launcher.count("GraphDdrRegisterOperandSpec{") == 8
     assert launcher.count("GraphDdrRegisterRole::PerChannelScale") == 3
     assert launcher.count("GraphDdrRegisterRole::SemanticInput") == 2
     assert launcher.count("GraphDdrRegisterRole::Int8ModelWeight") == 3
     assert "if (!use_spm_weight)" in launcher
-    for register, value in (
-        (2, "q_weight_spm_addr"),
-        (24, "k_weight_spm_addr"),
-        (32, "v_weight_spm_addr"),
-    ):
+    for register,value in ((2,"q_weight_spm_addr"),(32,"k_weight_spm_addr"),(40,"v_weight_spm_addr")):
         assert f"set_u32({register}, {value});" in launcher
+    for slot in ("48, 49","50, 51"):
+        assert "DevAddrShift8LoHi, "+slot in launcher
     assert "supports only fused partial M-RoPE" in launcher
-    assert "kernel->set_regs(128, static_cast<uint16_t>(0));" in launcher
+    assert "reg = 128; reg <= 255" in launcher
     assert "queue->set_broadcast_mode(true);" in launcher
-    assert "fuse_partial_mrope ? 8 : 16" in launcher
+    assert "rpu_wall_action_qkv::grid(kernel_id)" in launcher
 
 
 def test_row_spm_weight_preserves_ring_abi_and_only_scale_uses_ddr():
-    name = "rpu_launch_wall_action_linear_ring_postnorm_spm_kernel("
-    assert name in DECLS
-    launcher = _section(
-        "void rpu_launch_wall_action_linear_ring_postnorm_spm_kernel(",
-        "void rpu_launch_qwen3vl_4b_prefill_gate_up_swiglu_w8a16_spm_kernel(",
-    )
+    launcher=_function(LINEAR,"void rpu_launch_wall_action_linear_ring_postnorm_spm_kernel(")
     assert launcher.count("GraphDdrRegisterOperandSpec{") == 2
     assert launcher.count("GraphDdrRegisterRole::PerChannelScale") == 1
     assert launcher.count("GraphDdrRegisterRole::Int8ModelWeight") == 1
-    assert "if (!use_spm_weight)" in launcher
-    assert "set_u32_reg_pair(*kernel, 2, weight_spm_addr);" in launcher
-    assert "static_cast<uint32_t>(kLocalK), 0, NUM_CORES" in launcher
-    assert "constexpr uint32_t kScm = 4096;" in launcher
-    assert "queue->set_broadcast_mode(true);" in launcher
-    assert "queue->enqueu_kernel(*kernel, {8, 1, 1}, cores);" in launcher
+    for contract in ("if (!use_spm_weight)", "set_u32_reg_pair(*kernel, 2, weight_spm_addr);",
+     "Operation::ActionRingPostnormSpmWeight", "constexpr uint32_t kScm = 4096;",
+     "queue->set_broadcast_mode(true);", "{selected.grid_x, selected.grid_y, 1}"):
+        assert contract in launcher
+    for slot in (32,33,34,36,38,40,42,44,45):
+        assert f"({slot}," in launcher or f", {slot}," in launcher

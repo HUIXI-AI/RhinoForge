@@ -1,4 +1,4 @@
-"""Wall-OSS-0.5 Qwen2.5-VL ViT vision tower → device (P3).
+"""Wall-OSS-0.5 Qwen2.5-VL ViT vision tower → RPU (P3).
 
 The VLM backbone's vision tower is a stock Qwen2.5-VL ViT (32 blocks, hidden
 1280, head_dim 80, RMSNorm, biased SwiGLU, 2D RoPE, window attention). This
@@ -20,9 +20,9 @@ Unquantized stock Qwen2.5-VL checkpoints may store separate `gate_proj` and
 P3a: full-attention only (MASK_NONE), no window reorder. P3b adds the window
 mask + CPU reorder/reverse.
 
-The default adapter runs patch_embed on device and folds the merger into the C++
+The default adapter runs patch_embed on RPU and folds the merger into the C++
 graph; diagnostic fallbacks retain the CPU implementations. With
-``w8a16=True``, the 32 device ViT blocks use int8 weights + fp16 per-row scales,
+``w8a16=True``, the 32 RPU ViT blocks use int8 weights + fp16 per-row scales,
 while patch_embed/merger values remain sourced from the fp16 checkpoint. RTC
 mixed precision keeps block 17's down projection in paired-source FP16 for the
 BF16 residual transition.
@@ -448,7 +448,7 @@ def _configure_qwen25vl_vision_handle(
 
 
 class WallOssVision:
-    """Qwen2.5-VL ViT vision tower on device.
+    """Qwen2.5-VL ViT vision tower on RPU.
 
     Construct via :func:`build_wall_oss_vision`. Call :meth:`forward` with CPU
     `pixel_values [num_patches, 1176]` + `grid_thw [1, 3]`; returns the merged
@@ -495,9 +495,9 @@ class WallOssVision:
             raise ValueError(
                 "RPU_WALL_OSS_BATCH_MAX_SEQ must be a positive integer"
             )
-        # Keep the merged vision tokens on the device device (merger RMSNorm on-device +
+        # Keep the merged vision tokens on the RPU device (merger RMSNorm on-device +
         # window reverse-reorder via the gather op) so the VLA's on-device embed
-        # composition needs no merged readback/upload. DEFAULT OFF: this legacy eager
+        # assembly needs no merged readback/upload. DEFAULT OFF: this legacy eager
         # path is superseded by the default fused-merger post_fn. Eager RMSNorm is
         # correctness-safe as of 2026-08-01 but uses a host fallback, so this switch
         # is diagnostic rather than a performance alternative.
@@ -516,6 +516,10 @@ class WallOssVision:
                 "Wall-OSS Vision mixed precision is incompatible with "
                 "RPU_WALL_OSS_VISION_LAYER_GROUP=32"
             )
+        # On-device patch_embed: run the folded Conv3d→Linear as an eager rpu linear
+        # instead of the ~5.6 ms/frame CPU fp32 GEMM (torch profile aten::mm). _patch_w_rpu
+        # (padded+col-swizzled weight) is set by build_wall_oss_vision; None disables.
+        # RPU_WALL_OSS_DEVICE_PATCH_EMBED=0 forces the CPU GEMM.
         self._device_patch_embed = rpu_env_bool(
             "RPU_WALL_OSS_DEVICE_PATCH_EMBED", default=True)
         self._patch_w_rpu = None
@@ -541,7 +545,7 @@ class WallOssVision:
         # allocating the next one. This prevents allocator address reuse from fooling
         # the C++ source-pointer memo into skipping an upload for changed contents.
         self._last_window_mask_ref = None
-        # Fused embed-composition: fold the window-REVERSE into the runtime's assemble op
+        # Fused embed-assembly: fold the window-REVERSE into the runtime's assemble op
         # (so the two gather_embedding — vision reverse + token gather — collapse and the
         # merged DDR round-trip is gone). When on, forward() returns the RAW window-order
         # merged for a single-subgroup forward and stashes `_pending_rev = (rev_idx_rpu,
@@ -605,7 +609,7 @@ class WallOssVision:
 
     @torch.no_grad()
     def _forward_parts(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor):
-        """Keep separate subgroup outputs for the device concatenation path."""
+        """Keep separate subgroup outputs for the internal device assembler."""
         return self._forward(pixel_values, grid_thw, return_parts=True)
 
     def _forward(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor, *,
@@ -720,7 +724,7 @@ class WallOssVision:
                 and not torch.rpu.get_debug_export()):
             if not batch_on or max_seq < 672:
                 raise ValueError("paired Vision requires batch mode and max_seq >= 672")
-            self._validate_execution_chunks((672,) if N == 2 else (672, 336))
+            self._validate_execution_chunks(tuple([672] if N == 2 else [672, 336]))
             pair = self._forward_pair_252(pixel_values[:648], grid_cpu[:2])
             if N == 2:
                 return pair
@@ -745,7 +749,7 @@ class WallOssVision:
         self._validate_execution_chunks(
             self._native_chunk_size(group) for _, group, _ in subgroups
         )
-        # Fused embed-composition needs a single window-order output (the runtime reverses
+        # Fused embed-assembly needs a single window-order output (the runtime reverses
         # via assemble_inputs_embeds_rev). Only when the whole forward is ONE subgroup
         # (1 cam, or N same-size cams ≤ cap) — the cat'd mixed-size case keeps the reverse.
         if (self._fused_assemble and len(subgroups) == 1
@@ -935,10 +939,11 @@ class WallOssVision:
         return boundaries
 
     def _window_layout(self, grid_cpu: torch.Tensor, seq: int):
-        """Cache CPU position indices, window order, reverse order and additive mask.
-
-        The key includes sequence length and complete image grid; merge and window
-        settings belong to this owner. Returned tensors are read-only for consumers."""
+        """Memoized CPU window/position layout `(pos_idx, window_index, reverse_index,
+        window_mask)`. Pure function of the grid + (instance-fixed) merge/window config,
+        so a fixed-camera rollout reuses one entry and skips the ~1 ms/frame recompute.
+        All four are CPU tensors (the pos_idx→keepalive copy checks content) and
+        are only read downstream, so sharing them across frames is safe."""
         key = (int(seq),) + tuple(grid_cpu.flatten().tolist())
         if self._host_cache:
             hit = self._layout_cache.get(key)
@@ -957,7 +962,7 @@ class WallOssVision:
                 grid_cpu, self._window_size, self._sms, self._patch_size)
             pos_idx = pos_idx.reshape(seq // smu, smu, 2)[window_index].reshape(seq, 2)
             # Dense block-diagonal additive mask (CPU fp16). Passing it CPU-side
-            # avoids the device→CPU readback staleness in sdpa_prepare_mask.
+            # avoids the RPU→CPU readback staleness in sdpa_prepare_mask.
             if not self._per_window_sdpa:
                 window_mask = _block_diag_mask(cu_window_seqlens, seq)
         out = (pos_idx, window_index, reverse_index, window_mask)
@@ -970,11 +975,13 @@ class WallOssVision:
         return out
 
     def _group_layout(self, grid_group: torch.Tensor, seq: int, smu: int):
-        """Cache CPU position/window layout for the complete multi-image grid.
-
-        Return position indices, combined window indices, reverse indices, window
-        mask and cumulative window lengths. Consumers must not mutate these shared
-        tensors. ``RPU_WALL_OSS_HOST_CACHE=0`` disables reuse."""
+        """Memoized batched (multi-image) window/position layout `(pos_idx,
+        window_index_multi, reverses, window_mask, cu_window_seqlens)` — the
+        group analog of _window_layout.
+        Pure function of grid_group + (instance-fixed) window/merge/patch config, so a
+        fixed-camera rollout reuses one entry and skips the ~2.6 ms/frame _pack_multi_pos
+        (~0.8) + _pack_multi_image (~1.8, incl the [n_i,n_i] block-diag mask). All CPU
+        tensors, read-only downstream → safe to share. RPU_WALL_OSS_HOST_CACHE=0 disables."""
         key = tuple(grid_group.flatten().tolist())
         if self._host_cache:
             hit = self._group_layout_cache.get(key)
@@ -1007,7 +1014,8 @@ class WallOssVision:
           W_fold[:, j] = W[:, j] * rescale/std[ch(j)]   (j in [0, K))
           W_fold[:, K] = -Σ_j W[:, j] * mean[ch(j)]/std[ch(j)]   (homogeneous bias column)
         normalize(u8)[j] = u8[j]*rescale/std[ch] - mean[ch]/std[ch], so the per-row dot
-        product implements the same normalized GEMM expression."""
+        product reproduces the normalized GEMM exactly (validated fp32-identity in the
+        bench; fp16 cos 1.0002)."""
         if self._patch_w is None or self._pe_k is None:
             return False
         W = self._patch_w.float()                                  # [hidden, K]
@@ -1049,14 +1057,14 @@ class WallOssVision:
         if (cached is not None and cached[0] is self._keepalive
                 and torch.equal(cached[1], pos_idx)):
             return
-        # copy_ publishes the CPU rows directly; a temporary device source would
-        # add another upload plus a device-to-host invalidation before this copy.
+        # copy_ publishes the CPU rows directly; a temporary RPU source would
+        # add another upload plus an RPU-to-host invalidation before this copy.
         self._keepalive.narrow(0, 0, pos_idx.size(0)).copy_(pos_idx)
         if self._host_cache:
             self._position_keepalive_snapshot = (self._keepalive, pos_idx.clone())
 
     def _patch_perm_ids(self, window_index: torch.Tensor, seq: int, smu: int) -> torch.Tensor:
-        """Per-row spatial→window gather indices [seq] int32 on device. window_index
+        """Per-row spatial→window gather indices [seq] int32 on RPU. window_index
         [seq/smu] permutes merge-units (out unit j = in unit window_index[j]); expand
         to per-row: perm[j*smu+r] = window_index[j]*smu + r. The CPU layout cache
         owns the source, and the device index cache checks every value before reuse."""
@@ -1085,11 +1093,13 @@ class WallOssVision:
 
     def _patch_embed(self, pixel_values: torch.Tensor, window_index, seq: int,
                      smu: int, prepared_pixels: torch.Tensor | None = None) -> torch.Tensor:
-        """Map raster-order ``[sequence, features]`` pixels to FP16 device embeddings.
-
-        UINT8 inputs use normalization-folded weights and gather output rows into
-        window order on device. FP32 processor inputs use plain weights and retain
-        the CPU input reorder before projection."""
+        """pixel_values [seq, K] (raster order) → embed [1, seq, hidden] fp16 on RPU.
+        uint8 → the normalize-folded weight (+ homogeneous bias column); fp32
+        (HF-processor fallback) → the plain weight. patch_embed is per-row, so the
+        window reorder commutes: GEMM in raster order, then gather the OUTPUT rows into
+        window order ON-DEVICE (llama_gather_embedding), replacing the ~2 ms/frame CPU
+        fancy-index gather on the [seq, K] pixels. The fp32 fallback keeps the CPU
+        pre-GEMM reorder (no device gather on that path)."""
         pv = pixel_values                                          # raster order
         folded = pv.dtype == torch.uint8
         w_rpu = self._patch_w_fold_rpu if folded else self._patch_w_rpu
@@ -1218,7 +1228,7 @@ class WallOssVision:
 
         if self._fused_merger:
             # C++ post_fn already ran the merger; `out` is [seq/4, out_hidden]
-            # window-order (device fp16) — NOT [1, seq, hidden]. Apply only the
+            # window-order (RPU fp16) — NOT [1, seq, hidden]. Apply only the
             # window reverse-gather (merge-unit granularity), on-device.
             merged = out
             if reverse_index is not None:
@@ -1230,13 +1240,13 @@ class WallOssVision:
                 merged = torch.ops.rpu.gather_embedding(merged, ri)
             return merged
 
-        hidden = out.squeeze(0)                                         # [seq, hidden] device fp16
+        hidden = out.squeeze(0)                                         # [seq, hidden] RPU fp16
         if self._device_merged:
-            merged = self._merger(hidden, device_out=True)              # [seq/4, out_hidden] device fp16
+            merged = self._merger(hidden, device_out=True)              # [seq/4, out_hidden] RPU fp16
             if reverse_index is not None:
                 # Undo the window permutation on-device (row gather via llama_gather_embedding).
                 ri = self._index_rpu("reverse", reverse_index)
-                merged = torch.ops.rpu.gather_embedding(merged, ri)     # [seq/4, out_hidden] device
+                merged = torch.ops.rpu.gather_embedding(merged, ri)     # [seq/4, out_hidden] RPU
             return merged
         merged = self._merger(hidden)                                   # [seq/4, out_hidden] CPU fp32
         if reverse_index is not None:
@@ -1334,6 +1344,8 @@ class WallOssVision:
         def _vm(n):
             if _vi:
                 x = time.perf_counter(); _vp[n] = (x - _vt[0]) * 1000; _vt[0] = x
+        # Memoized batched window/position layout (see _group_layout) — ~2.6 ms/frame of
+        # _pack_multi_pos + _pack_multi_image, frame-invariant for a fixed camera set.
         (pos_idx, window_index_multi, reverses, window_mask,
          cu_window_seqlens) = self._group_layout(grid_group, seq, smu)
         if pos_idx.size(0) != seq:
@@ -1355,7 +1367,7 @@ class WallOssVision:
         v_caches = [self.cache.v_caches[i] for i in range(self.num_layers)]
         _vm("c_keepalive+reset")
 
-        # _patch_embed may run eager device Linear + gather, both before capture.
+        # _patch_embed may run eager RPU Linear + gather, both before capture.
         # Re-establish the fused graph's deterministic temporary-SPM entry state.
         torch.ops.rpu.spm_alloc_reset_temporary()
         native_window_boundaries = self._select_native_window_boundaries(
@@ -1401,7 +1413,7 @@ class WallOssVision:
             # reverse via a COMPOSED global index (reverses[i] is
             # image-local 0..mu-1; +i*mu lifts it to the packed [seq/4] block) +
             # one on-device gather.
-            merged = out                                                # [seq/4, out_hidden] device fp16
+            merged = out                                                # [seq/4, out_hidden] RPU fp16
             if reverses is not None:
                 mu = n_i // smu                                         # merged tokens/image
                 global_rev = torch.cat(
@@ -1420,13 +1432,13 @@ class WallOssVision:
                 # safe (it is the same reset predict() does at the vision→prefill boundary,
                 # moved one step earlier; `out`/`merged` live in DDR and survive it).
                 torch.ops.rpu.spm_alloc_reset_temporary()
-                merged = torch.ops.rpu.gather_embedding(merged, gri)   # [seq/4, out_hidden] device
+                merged = torch.ops.rpu.gather_embedding(merged, gri)   # [seq/4, out_hidden] RPU
             _vm("e_merger+reverse")
             if _vi:
                 print("[INSTR vision] " + "  ".join(f"{k}={v:.2f}" for k, v in _vp.items()))
             return merged
 
-        hidden = out.squeeze(0)                                         # [seq, hidden] device fp16
+        hidden = out.squeeze(0)                                         # [seq, hidden] RPU fp16
         merged = self._merger(hidden)                                   # [seq/4, out_hidden] CPU fp32
         if reverses is not None:
             mu = n_i // smu                                             # merged tokens/image
@@ -1450,7 +1462,7 @@ def build_wall_oss_vision(
     rmsnorm_fixed32: bool = False,
     _owned_vision: WallOssVision | None = None,
 ) -> WallOssVision:
-    """Load `visual.*` weights and install the device Qwen2.5-VL ViT vision tower.
+    """Load `visual.*` weights and install the RPU Qwen2.5-VL ViT vision tower.
 
     window=False (P3a): every layer is full attention (MASK_NONE), no reorder.
     window=True  (P3b): block-diagonal window attention with fullatt_block_indexes
@@ -1733,6 +1745,12 @@ def build_wall_oss_vision(
     # patch_embed: fold Conv3d [HID,3,2,14,14] → Linear [HID, 1176], CPU fp32, no bias.
     patch_w = g_cpu("visual.patch_embed.proj.weight").reshape(HID, -1).contiguous()
 
+    # merger: RMSNorm (CPU fp32) → reshape(-1, 4*HID) → Linear → GELU → Linear.
+    # The two Linears dominate vision wall (~40ms CPU fp32: m0 5120x5120 + m2
+    # 2048x5120), so they run on RPU fp16. Weights are col-partition swizzled
+    # (8-core) to match rpu_linear's rpu_get_linear_partition choice (both shapes
+    # satisfy can_row && can_col → returns col). RMSNorm stays CPU fp32 (cheap,
+    # keeps the variance fp32 to match the golden); the [N,5120] hop to RPU is ~1MB.
     merge_hidden = HID * SMS * SMS    # 5120
     ln_q_w = g_cpu("visual.merger.ln_q.weight")
     ln_q_w_rpu = _to_rpu_half(ln_q_w)               # device weight for the on-device rms_norm
@@ -1758,15 +1776,15 @@ def build_wall_oss_vision(
         _owned_vision._keepalive += (merger_args,)
 
     def merger(x: torch.Tensor, device_out: bool = False) -> torch.Tensor:
-        # x [seq, HID] device fp16 → [seq/4, OUT_HID]. device_out=True keeps the result on
-        # the device (no x readback, no merged upload downstream): the RMSNorm runs via the
+        # x [seq, HID] RPU fp16 → [seq/4, OUT_HID]. device_out=True keeps the result on
+        # the RPU (no x readback, no merged upload downstream): the RMSNorm runs via the
         # public eager RMSNorm fallback (FP32 host math over zero-copy DDR views).
-        # The GEMMs run on device; eager exact-ERF GELU uses the registered CPU fallback.
+        # The GEMMs run on RPU; eager exact-ERF GELU uses the registered CPU fallback.
         if device_out:
             xr = torch.ops.rpu.rms_norm(x, [HID], ln_q_w_rpu, EPS).reshape(-1, merge_hidden)
         else:
             xr = _rmsnorm_cpu(x.cpu().float(), ln_q_w, EPS).reshape(-1, merge_hidden)
-            xr = _to_rpu_half(xr)                    # [N, 5120] device fp16
+            xr = _to_rpu_half(xr)                    # [N, 5120] RPU fp16
         xr = (torch.ops.rpu.linear_with_accumulation(
             xr, m0_w_rpu, m0_b_rpu, 1, _VISION_CORES, True)
             if linear_acc32 else F.linear(xr, m0_w_rpu, m0_b_rpu))
@@ -1777,7 +1795,7 @@ def build_wall_oss_vision(
         return xr if device_out else xr.float().cpu()   # device fp16 OR CPU fp32 (legacy)
 
     # On-device patch_embed weight: pad K (1176) to a multiple of 16, col-swizzle, upload
-    # once. F.linear on device then replaces the per-frame CPU fp32 GEMM.
+    # once. F.linear on rpu then replaces the per-frame CPU fp32 GEMM.
     _pe_k = ((patch_w.size(1) + 15) // 16) * 16
     patch_w_rpu = _to_rpu_half(tp_col_swizzle_mc_weight(
         F.pad(patch_w.to(torch.float16), (0, _pe_k - patch_w.size(1))), _VISION_CORES))

@@ -754,7 +754,7 @@ def _decode_native_stage_domain(
     values: Iterable[object], *, execution_len: int, logical_len: int,
     position: int, graph_mode: str,
 ) -> tuple[StageTuple, ...]:
-    """Decode domain-v1 framing with native candidate descriptor v1/v2/v3."""
+    """Decode domain-v1 framing with native candidate descriptor v1 through v4."""
     raw = tuple(values)
     # Native descriptors contain Python ints. Avoid an ABC lookup per word,
     # while retaining Integral subclasses and rejecting bool/float inputs.
@@ -784,10 +784,11 @@ def _decode_native_stage_domain(
         descriptor = words[cursor:cursor + record_words]
         cursor += record_words
         descriptor_version = descriptor[0]
-        if descriptor_version not in (1, 2, 3) or descriptor[1] != record_words:
+        if descriptor_version not in (1, 2, 3, 4) or descriptor[1] != record_words:
             raise ValueError(
-                "native stage-domain candidate has an invalid v1/v2/v3 header"
+                "native stage-domain candidate has an invalid v1/v2/v3/v4 header"
             )
+        physical_end = record_words - (2 if descriptor_version == 4 else 0)
 
         capacities = descriptor[2:5]
         if (
@@ -811,7 +812,7 @@ def _decode_native_stage_domain(
         stage_words = 15 + 4 * sum(counts) + 3 * span_count
         if (
             (descriptor_version == 1 and stage_words != record_words)
-            or (descriptor_version in (2, 3) and stage_words + 11 > record_words)
+            or (descriptor_version in (2, 3, 4) and stage_words + 11 > physical_end)
         ):
             raise ValueError(
                 "native stage-domain candidate payload size is inconsistent"
@@ -895,8 +896,8 @@ def _decode_native_stage_domain(
             ] = []
             previous_identity = (-1, -1, -1)
             for _ in range(route_count):
-                route_header_words = 6 if descriptor_version == 3 else 5
-                if item_cursor + route_header_words > record_words:
+                route_header_words = 6 if descriptor_version >= 3 else 5
+                if item_cursor + route_header_words > physical_end:
                     raise ValueError("native physical manifest route is truncated")
                 family = descriptor[item_cursor]
                 site_id = descriptor[item_cursor + 1]
@@ -905,11 +906,11 @@ def _decode_native_stage_domain(
                 argument_count = descriptor[item_cursor + 4]
                 invocation = (
                     descriptor[item_cursor + 5]
-                    if descriptor_version == 3
+                    if descriptor_version >= 3
                     else 0
                 )
                 item_cursor += route_header_words
-                if argument_count < 0 or item_cursor + argument_count > record_words:
+                if argument_count < 0 or item_cursor + argument_count > physical_end:
                     raise ValueError(
                         "native physical manifest route arguments are truncated"
                     )
@@ -934,7 +935,7 @@ def _decode_native_stage_domain(
                     family, site_id, selector, flags, arguments, invocation,
                 ))
                 previous_identity = identity
-            if item_cursor != record_words:
+            if item_cursor != physical_end:
                 raise ValueError(
                     "native physical manifest has trailing words"
                 )
@@ -1051,6 +1052,16 @@ def _decode_native_stage_domain(
                 ("selector_state", 1),  # CAPABILITY_RANKED, not HW-cost certified.
             ))
 
+        if descriptor_version == 4:
+            ranking_policy, mixer_calls = descriptor[physical_end:]
+            if (ranking_policy not in (1, 2) or manifest_state != 1
+                    or not counts[2] <= mixer_calls <= execution_len):
+                raise ValueError("native candidate has invalid ranking policy or mixer count")
+            physical_metadata.extend((
+                ("ranking_policy", ranking_policy),
+                ("ranking_mixer_calls", mixer_calls),
+            ))
+
         fingerprint = (descriptor[5] << 32) | descriptor[6]
         metadata = (
             ("chunk_mode", descriptor[7]),
@@ -1161,6 +1172,28 @@ def plan_a6(
         ),
     }
     domain_digest = _digest(domain_payload, "RPU-A6-DOMAIN-V1")
+    # A candidate cannot silently opt out to gain a different score shape.
+    # Owners declare one policy for the entire request, not per winning C.
+    ranking_policies: set[int] = set()
+    for _, domain in domain_rows:
+        for row in domain:
+            metadata = dict(row.physical_metadata)
+            policy = metadata.get("ranking_policy", 0)
+            mixer_calls = metadata.get("ranking_mixer_calls", 0)
+            descriptor = row.physical_descriptor
+            if policy == 0:
+                if mixer_calls != 0 or (descriptor and descriptor[0] == 4):
+                    raise ValueError("legacy ranking cannot override a bound native v4 descriptor")
+            elif policy in (1, 2):
+                if (metadata.get("manifest_state") != 1 or len(descriptor) < 2
+                        or descriptor[0] != 4 or descriptor[-2:] != (policy, mixer_calls)
+                        or not metadata["compute_num_chunks"] <= mixer_calls <= metadata["physical_length"]):
+                    raise ValueError("mixer ranking requires its bound native v4 descriptor")
+            else:
+                raise ValueError("unknown native candidate ranking policy")
+            ranking_policies.add(policy)
+    if len(ranking_policies) > 1:
+        raise ValueError("native candidate domain mixes ranking policies")
     candidates: list[A6Candidate] = []
     selected: A6Candidate | None = None
     feasible_count = 0
@@ -1217,6 +1250,10 @@ def plan_a6(
                 stage_tuple.input_chunk, stage_tuple.qkv_chunk,
                 stage_tuple.compute_chunk,
             )
+            if metadata.get("ranking_policy") in (1, 2):
+                score = (score[0], metadata["ranking_mixer_calls"], *score[1:])
+                if metadata["ranking_policy"] == 2:
+                    score = (*score[:3], -stage_tuple.compute_chunk, *score[3:])
             if metadata.get("manifest_state") == 1:
                 score = (*score,
                          metadata["capability_attention_ddr_site_count"],

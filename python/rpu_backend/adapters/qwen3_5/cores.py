@@ -12,6 +12,17 @@ _TEXT_PROFILES = {
     2048: (6144, 24, 8, 2, 16),
     2560: (9216, 32, 16, 4, 32),
     4096: (12288, 32, 16, 4, 32),
+    5120: (17408, 64, 24, 4, 48),
+}
+
+# Qwen3.5 uses one fixed component layout for each admitted execution budget.
+# In the six-core layout, MLP owns six cores while attention, the output head,
+# and the Vision bridge remain on the four-core domain. Keep this map explicit
+# so a future core-count change cannot silently inherit the reduced template.
+_COMPONENT_CORE_LAYOUT = {
+    4: (4, 4, 4),
+    6: (4, 6, 4),
+    8: (8, 8, 8),
 }
 
 
@@ -19,8 +30,19 @@ def core_topology(execution=None):
     from rpu_backend.runtime.topology import DecoderTopology, execution_core_count
 
     cores = execution_core_count(execution)
-    attention = 8 if cores == 8 else 4
-    return DecoderTopology(cores, attention, cores, attention)
+    attention, mlp, lm_head = _COMPONENT_CORE_LAYOUT[cores]
+    return DecoderTopology(cores, attention, mlp, lm_head)
+
+
+def component_core_counts(execution=None):
+    """Return the Qwen3.5 text/Vision component core domains."""
+    topology = core_topology(execution)
+    return {
+        "attention": topology.attn_tp,
+        "mlp": topology.mlp_tp,
+        "lm_head": topology.lm_head_tp,
+        "vision": topology.attn_tp,
+    }
 
 
 def topology_tuple(topology):
@@ -72,20 +94,14 @@ def validate_core_profile(config, execution=None):
     """
     topology = core_topology(execution)
     from .quant_scope import (
-        validate_modern_27b_profile, resolve_quant_specs, is_full_from_layer_types,
-        W4A16_PGRP, quanttrio_awq_config,
+        validate_modern_27b_profile, quanttrio_awq_config,
     )
-    if quanttrio_awq_config(config) is not None and topology.num_cores != 8:
-        raise ValueError("QuantTrio AWQ supports TP8 text only")
-    if validate_mlp_only_text_profile(config):
-        if topology.num_cores != 8:
-            raise ValueError("Qwen3.5 MLP-only W4 supports TP8 text only")
+    if quanttrio_awq_config(config) is not None:
+        _validate_dense_text_profile(config, uniform_quant=True)
         return topology
-    if validate_modern_27b_profile(config):
-        tc = getattr(config, "text_config", config)
-        spec = next(iter(resolve_quant_specs(is_full_from_layer_types(tc.layer_types), config.quant_config).values()))
-        if spec.method == W4A16_PGRP and topology.num_cores != 8:
-            raise ValueError("official Qwen3.5-27B W4 group32 requires num_cores=8")
+    if validate_mlp_only_text_profile(config):
+        return topology
+    if validate_modern_27b_profile(config, allow_fp16=True):
         return topology
     if topology.num_cores == 8:
         return topology
@@ -113,25 +129,73 @@ def validate_mlp_only_text_profile(config):
     return True
 
 
-def _reduced_w8_specs(config):
-    """Exact 2B W8 main/GDN projections with FP16 scalar b/a projections.
+def validate_official_27b_runtime_profile(config):
+    """Validate every official 27B recipe that shares the cold resource plan."""
+    tc = getattr(config, "text_config", config)
+    if getattr(tc, "hidden_size", None) != 5120:
+        return False
+    from .quant_scope import quanttrio_awq_config, validate_modern_27b_profile
+    if quanttrio_awq_config(config) is not None:
+        _validate_dense_text_profile(config, uniform_quant=True)
+        return True
+    if validate_mlp_only_text_profile(config):
+        return True
+    from .quant_scope import validate_named_27b_mixed_profile
+    if validate_named_27b_mixed_profile(config):
+        _validate_dense_text_profile(config)
+        return True
+    return validate_modern_27b_profile(config, allow_fp16=True)
 
-    Reuse the checkpoint QuantSpec resolver; a profile label alone never admits
-    different tensors or a different per-projection arithmetic contract.
-    """
+
+def _reduced_quant_specs(config):
+    """Resolve the reduced dense projection recipe before touching weights."""
     quant = getattr(config, "quant_config", None)
     if not quant:
         return None
-    from .quant_scope import FP16, W8A16, is_full_from_layer_types, resolve_quant_specs
+    from .quant_scope import FP16, W8A16, W4A16_PGRP, is_full_from_layer_types, resolve_quant_specs
     tc = getattr(config, "text_config", config)
-    if not _exact_integer(getattr(tc, "hidden_size", None), 2048):
-        raise ValueError("reduced Qwen3.5 quantization requires the exact 2B W8 main/GDN profile")
     specs = resolve_quant_specs(is_full_from_layer_types(getattr(tc, "layer_types", ())), quant)
-    scalar_roles = (".linear_attn.in_proj_b", ".linear_attn.in_proj_a")
-    if not specs or any(spec.method != (FP16 if name.endswith(scalar_roles) else W8A16)
-                        for name, spec in specs.items()):
-        raise ValueError("reduced Qwen3.5 2B requires W8 main/GDN projections and FP16 GDN b/a")
+    if not specs or any(spec.method not in (FP16, W8A16, W4A16_PGRP)
+                        or (spec.method == W4A16_PGRP and spec.group_size != 32)
+                        for spec in specs.values()):
+        raise ValueError("reduced Qwen3.5 supports FP16, W8 and signed W4 group32 projections")
+    families = {"mlp": set(), "attn": set(), "gdn": set(), "scalar": set()}
+    for name, spec in specs.items():
+        family = ("mlp" if ".mlp." in name else "attn" if ".self_attn." in name
+                  else "scalar" if name.endswith((".in_proj_b", ".in_proj_a")) else "gdn")
+        families[family].add(spec)
+    if any(len(values) != 1 for values in families.values()):
+        raise ValueError("reduced Qwen3.5 requires one quantization method per projection family")
+    scalar = next(iter(families["scalar"]))
+    if scalar.method != FP16 and scalar not in families["gdn"]:
+        raise ValueError("reduced Qwen3.5 GDN b/a must share GDN precision or remain FP16")
     return specs
+
+
+def text_mlp_intermediate_size(config, topology):
+    """Select a physical width compatible with each MLP's packed K stripe."""
+    from rpu_backend.runtime.topology import decoder_mlp_intermediate_size
+    from .quant_scope import (W4A16_AWQ, W4A16_PGRP, is_full_from_layer_types,
+                              quanttrio_awq_config, resolve_quant_specs)
+    tc = getattr(config, "text_config", config)
+    logical = tc.intermediate_size
+    quant = getattr(config, "quant_config", None)
+    if quant is None and getattr(config, "quantization_config", None) is not None:
+        # External AWQ metadata is converted to the canonical policy only after
+        # the caller has provided a complete conditional-generation config.
+        quant = quanttrio_awq_config(config)
+    if quant and topology.mlp_tp == 6:
+        specs = resolve_quant_specs(is_full_from_layer_types(tc.layer_types), quant)
+        mlp_methods = {spec.method for name, spec in specs.items() if ".mlp." in name}
+        if W4A16_AWQ in mlp_methods:
+            # QuantTrio AWQ uses G128 controller stripes; preserve its
+            # six-core physical width independently of signed W4 G32.
+            alignment = 128 * topology.mlp_tp
+            return ((logical + alignment - 1) // alignment) * alignment
+        if W4A16_PGRP in mlp_methods:
+            alignment = 32 * topology.mlp_tp
+            return ((logical + alignment - 1) // alignment) * alignment
+    return decoder_mlp_intermediate_size(logical, topology.mlp_tp)
 
 
 def _validate_dense_text_profile(config, *, uniform_quant=False, mlp_only_quant=False):
@@ -152,7 +216,7 @@ def _validate_dense_text_profile(config, *, uniform_quant=False, mlp_only_quant=
                 or (next(iter(specs)).method == W4A16_PGRP and next(iter(specs)).group_size != 32)):
             raise ValueError("retained 9B text requires uniform W8 or W4 group32 projections")
     else:
-        _reduced_w8_specs(config)
+        _reduced_quant_specs(config)
     tc = getattr(config, "text_config", config)
     hidden = getattr(tc, "hidden_size", None)
     row = _TEXT_PROFILES.get(hidden) if isinstance(hidden, Integral) and not isinstance(hidden, bool) else None
@@ -188,11 +252,11 @@ def _validate_dense_text_profile(config, *, uniform_quant=False, mlp_only_quant=
         expected = ["full_attention" if i % 4 == 3 else "linear_attention" for i in range(row[1])]
         valid = list(getattr(tc, "layer_types", ()) or ()) == expected
     if not valid:
-        raise ValueError("model.num_cores=4/6 requires exact dense Qwen3.5 FP16 0.8B/2B/4B/9B or 2B W8 main/GDN hybrid text with partial interleaved M-RoPE")
+        raise ValueError("model.num_cores=4/6 requires an exact dense Qwen3.5 profile or an admitted W8/W4 text recipe with partial interleaved M-RoPE")
     if hasattr(config, "text_config"):
         vc = getattr(config, "vision_config", None)
         if (getattr(config, "model_type", None) != "qwen3_5"
-                or getattr(config, "tie_word_embeddings", None) is not (hidden != 4096)
+                or getattr(config, "tie_word_embeddings", None) is not (hidden not in (4096, 5120))
                 or getattr(config, "image_token_id", None) != 248056):
             raise ValueError("reduced Qwen3.5 requires the exact conditional-generation config")
         _validate_dense_vision_profile(vc)
@@ -202,8 +266,7 @@ def _validate_dense_text_profile(config, *, uniform_quant=False, mlp_only_quant=
 
 def validate_text_weight_geometry(inner, config, topology):
     """Validate raw reduced-profile shapes before irreversible swizzling."""
-    from .quant_scope import validate_modern_27b_profile
-    if validate_modern_27b_profile(config):
+    if validate_official_27b_runtime_profile(config):
         from .weights import validate_modern_27b_cold_weights
         _validate_dense_text_weights(inner, config)
         validate_modern_27b_cold_weights(inner, config, cold_cpu=True)
@@ -214,39 +277,49 @@ def validate_text_weight_geometry(inner, config, topology):
     from .quant_scope import validate_legacy_text_profile
     if validate_legacy_text_profile(config):
         return  # The existing legacy-specific cold validator owns its W8/FP16 policy.
-    specs = _reduced_w8_specs(config)
+    from .quant_scope import quanttrio_awq_config, is_full_from_layer_types
+    awq = quanttrio_awq_config(config)
+    if awq is not None:
+        from .text import _validate_projection_specs
+        _validate_projection_specs(inner, is_full_from_layer_types(
+            getattr(config, "text_config", config).layer_types), awq)
+        return
+    specs = _reduced_quant_specs(config)
     if specs is not None:
-        _validate_reduced_w8_weights(inner, config, specs)
+        _validate_reduced_quant_weights(inner, config, specs)
 
 
-def _validate_reduced_w8_weights(inner, config, specs, *, cold_cpu=False):
+def _validate_reduced_quant_weights(inner, config, specs, *, cold_cpu=False):
     """Check raw projection storage; the cold VL owner also requires CPU scales."""
     import torch
-    from .quant_scope import W8A16, is_full_from_layer_types
+    from .quant_scope import FP16, W8A16, is_full_from_layer_types
     from .text import _iter_text_projections
     tc = getattr(config, "text_config", config)
     is_full = is_full_from_layer_types(tc.layer_types)
     for linear, name in _iter_text_projections(inner, is_full):
         weight = linear.weight
-        w8 = specs[name].method == W8A16
+        spec = specs[name]
+        quantized = spec.method != FP16
         allowed_float = ((torch.float16, torch.bfloat16, torch.float32)
                          if weight.device.type == "cpu" else (torch.float16,))
         devices = ("cpu",) if cold_cpu else ("cpu", "rpu", "privateuseone")
         if (weight.device.type not in devices
                 or not weight.is_contiguous()
                 or hasattr(linear, "_rpu_linear_partition")
-                or (weight.dtype != torch.int8 if w8 else weight.dtype not in allowed_float)
+                or (weight.dtype != torch.int8 if quantized else weight.dtype not in allowed_float)
                 or getattr(linear, "bias", None) is not None):
-            raise ValueError(f"Qwen3.5 reduced projection {name} has incompatible raw W8/FP16 storage")
+            raise ValueError(f"Qwen3.5 reduced projection {name} has incompatible raw quantized/FP16 storage")
         scale = getattr(linear, "weight_scale", None)
-        if w8:
+        if quantized:
+            expected_scale = ((weight.shape[0],) if spec.method == W8A16 else
+                              (weight.shape[1] // spec.group_size, weight.shape[0]))
             if (not isinstance(scale, torch.Tensor) or scale.dtype != torch.float16
                     or scale.device != weight.device or not scale.is_contiguous()
-                    or tuple(scale.shape) != (weight.shape[0],)):
-                raise ValueError(f"Qwen3.5 reduced W8 projection {name} requires contiguous FP16 scale [N]")
+                    or tuple(scale.shape) != expected_scale):
+                raise ValueError(f"Qwen3.5 reduced quantized projection {name} requires contiguous FP16 scale {expected_scale}")
             if cold_cpu and (not bool(torch.isfinite(scale).all())
                              or not bool((scale > 0).all())):
-                raise ValueError(f"Qwen3.5 cold W8 projection {name} requires finite positive scales")
+                raise ValueError(f"Qwen3.5 cold quantized projection {name} requires finite positive scales")
         elif isinstance(scale, torch.Tensor) and scale.numel():
             raise ValueError(f"Qwen3.5 reduced FP16 projection {name} must not carry a scale")
 
@@ -258,12 +331,10 @@ def validate_text_mlp_padding_storage(inner, config, topology, *, cold_cpu=False
     the text installer checks FP16 raw weights, which may already live on device.
     The installer pads CPU copies, leaving logical checkpoint metadata intact.
     """
-    from rpu_backend.runtime.topology import decoder_mlp_intermediate_size
     import torch
 
     from rpu_backend.adapters.qwen3_5.quant_scope import validate_legacy_text_profile
-    from .quant_scope import validate_modern_27b_profile
-    if validate_modern_27b_profile(config):
+    if validate_official_27b_runtime_profile(config):
         from .weights import validate_modern_27b_cold_weights
         validate_modern_27b_cold_weights(inner, config, cold_cpu=True)
         return
@@ -274,7 +345,17 @@ def validate_text_mlp_padding_storage(inner, config, topology, *, cold_cpu=False
         return
     tc = getattr(config, "text_config", config)
     logical = tc.intermediate_size
-    if decoder_mlp_intermediate_size(logical, topology.mlp_tp) == logical:
+    if text_mlp_intermediate_size(config, topology) == logical:
+        return
+    from .quant_scope import quanttrio_awq_config, is_full_from_layer_types
+    if quanttrio_awq_config(config) is not None:
+        from .text import _validate_projection_specs
+        _validate_projection_specs(inner, is_full_from_layer_types(tc.layer_types),
+                                   quanttrio_awq_config(config))
+        return
+    specs = _reduced_quant_specs(config)
+    if specs is not None:
+        _validate_reduced_quant_weights(inner, config, specs, cold_cpu=cold_cpu)
         return
     allowed_dtype = ((torch.float16, torch.bfloat16, torch.float32)
                      if cold_cpu else (torch.float16,))
@@ -434,8 +515,7 @@ def validate_cold_weight_dtype(model, *, fp16=False):
     import torch
 
     config = getattr(model, "config", None)
-    from .quant_scope import validate_modern_27b_profile
-    if validate_modern_27b_profile(config):
+    if validate_official_27b_runtime_profile(config):
         from .weights import validate_modern_27b_cold_weights
         validate_modern_27b_cold_weights(model.model.language_model, config, cold_cpu=True)
         for owner in (model.model.visual, model.get_output_embeddings()):
@@ -448,7 +528,7 @@ def validate_cold_weight_dtype(model, *, fp16=False):
              if is_dense_9b_vl_candidate(config) else None)
     quantized = set()
     if specs is not None:
-        _validate_reduced_w8_weights(
+        _validate_reduced_quant_weights(
             model.model.language_model, config, specs, cold_cpu=True)
         quantized = {f"model.language_model.{name}.weight" for name in specs}
     allowed = ((torch.float16,) if fp16 or specs is not None
@@ -468,8 +548,8 @@ def is_dense_large_vl_candidate(config):
 
 
 def validate_dense_large_vl_profile(config):
-    from .quant_scope import validate_modern_27b_profile
-    if is_dense_large_vl_candidate(config) and validate_modern_27b_profile(config):
+    if (is_dense_large_vl_candidate(config)
+            and validate_official_27b_runtime_profile(config)):
         return
     validate_dense_9b_vl_profile(config)
 
@@ -490,8 +570,7 @@ def validate_dense_large_vision_weights(visual, config):
 
 
 def validate_dense_large_vl_weights(model):
-    from .quant_scope import validate_modern_27b_profile
-    if not validate_modern_27b_profile(model.config):
+    if not validate_official_27b_runtime_profile(model.config):
         return validate_dense_9b_vl_weights(model)
     validate_dense_large_vl_profile(model.config)
     _validate_dense_text_weights(model.model.language_model, model.config)

@@ -37,13 +37,13 @@ def _full_program():
     # Qwen3-VL profile or packed weights, so its existing layout stays ordinary.
     routing = "\n".join(_definition(base, marker) for marker in (
         "bool qwen3vl_decode_gemv(", "bool qwen3vl_4b_packed_decode_qkv("))
+    # The planning-mode enum, `planning_mode_` and the real DeepStack predicate
+    # already come from `_program()`; do not declare them a second time.
     text = text.replace("class CausalDecoderModel {public:",
-        _definition(base, "enum class CausalDecoderPlanningMode") + ";\n" +
         "class CausalDecoderModel {public:\n" + routing + r'''
  bool qwen3vl_4b_w8_profile_=false,qwen3vl_4b_packed_qkv_weights_=false;
  bool qwen3vl_fp16_decode_profile_=false;
  bool linear_acc32_=false,decoder_mixed_precision_=false;
- CausalDecoderPlanningMode planning_mode_=CausalDecoderPlanningMode::ORDINARY;
  struct LayerWeights {at::Tensor q_bias_w,k_bias_w,v_bias_w;};
  bool adarms_mutable_=true,adarms_fused_bcast_enabled_=false,adarms_=true,nvfp4_=false;
  bool norm_slab_active()const{return false;} int64_t norm_slab_size_bytes()const{return 0;}
@@ -108,7 +108,7 @@ struct Context {
               arguments==route.arguments&&invocation==route.invocation);++consumed;
  }
 };
-static bool final_chunk_layout_fits(const std::vector<BufferDecl>&,bool);
+static bool final_chunk_layout_fits(const std::vector<BufferDecl>&,bool,int64_t);
 int dmas=0,source_value=1,spm_value=0;
 void sdpa_dma_mask_to_spm(int,uint32_t,int64_t,int64_t,int){++dmas;spm_value=source_value;}
 constexpr int64_t L2_MASK_SPM_SCHEDULE=2878184572497809152LL;
@@ -120,13 +120,13 @@ struct LayoutContext {
 class LingbotV2MoeExpertModel:public CausalDecoderModel {public:
  int64_t chunk_size_=51,num_steps_=10;uint64_t generation=1;
  bool persistent_allocated=false;mutable int budget_queries=0;
- int cores=8;int num_cores()const{return cores;}
+ int num_cores()const{return 8;}
  uint64_t installed_model_state_generation()const{return generation;}
  int validate_exact_suffix_profile(int64_t prefix)const{TORCH_CHECK(prefix==225);return 1;}
  uint64_t exact_suffix_profile_hash(int kind)const{return kind*123;}
  std::optional<ExactDescriptor> exact_suffix_mask_authority_;
  bool declared_spm_layout_fits(const std::vector<BufferDecl>& d)const {
-  ++budget_queries;return final_chunk_layout_fits(d,persistent_allocated);
+  ++budget_queries;return final_chunk_layout_fits(d,persistent_allocated,0);
  }
  FmbRouteManifestEntry mask_residency_route_for_layout(const LayoutContext&,bool=true)const;
  FmbForwardOperandResidency physical_forward_operand_residency(const FmbPhysicalExecutionManifest&)const;
@@ -163,7 +163,6 @@ def test_real_budget_capacity_bound_layout_and_typed_replay(tmp_path):
 template<class Fn>void reject(Fn f){bool threw=false;try{f();}catch(const std::runtime_error&){threw=true;}assert(threw);}
 int main(){
  LingbotV2MoeExpertModel m;LayoutContext l;l.planning_chunk_capacity=64;
- m.cores=4;assert(m.mask_residency_route_for_layout(l).arguments[3]==4);m.cores=8;
  for(bool grouped:{false,true})for(bool unroll:{false,true}){
   m.grouped_experts_=grouped;m.denoise_unroll_=unroll;
   test_allocator.held=774144;test_allocator.temporary=500000;

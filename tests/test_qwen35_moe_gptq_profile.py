@@ -86,23 +86,18 @@ def test_exact_rtn_marker_keeps_its_source_identity():
 
 
 @pytest.mark.parametrize("cores", [4, 6])
-def test_gptq_reduced_tp_rejected_before_cache_or_weight_allocation(monkeypatch, cores):
+def test_gptq_reduced_tp_preflight_and_cache_share_topology(cores):
     from transformers import Qwen3_5MoeConfig
+    from torch._subclasses.fake_tensor import FakeTensorMode
     from rpu_backend.adapters.qwen3_5_moe import Qwen3_5MoeAdapter
-    from rpu_backend.adapters.qwen3_5_moe.text import install_qwen3_5_moe_text_for_rpu
     from rpu_backend.api.qwen3_5_moe_cache import Qwen3_5MoeCache
 
     cfg = Qwen3_5MoeConfig.from_dict(official_config())
     execution = {"model": {"num_cores": cores}}
-    monkeypatch.setattr(torch, "zeros", lambda *a, **k: pytest.fail("unsupported TP allocated cache"))
-    with pytest.raises(UnsupportedModelError, match="TP8"):
-        Qwen3_5MoeAdapter.preflight_execution(cfg, execution)
-    with pytest.raises((UnsupportedModelError, ValueError), match="TP8"):
-        Qwen3_5MoeCache.from_config(cfg, 64, device="cpu", num_cores=cores)
-    model = SimpleNamespace()
-    with pytest.raises(UnsupportedModelError, match="TP8"):
-        install_qwen3_5_moe_text_for_rpu(model, cfg, max_seq_len=64, execution_config=execution)
-    assert not hasattr(model, "_rpu_qwen3_5_moe_text_install_started")
+    Qwen3_5MoeAdapter.preflight_execution(cfg, execution)
+    with FakeTensorMode():
+        cache = Qwen3_5MoeCache.from_config(cfg, 64, device="cpu", num_cores=cores)
+    assert cache.execution_topology == (cores, 4, cores, 4, 8)
 
 
 @pytest.mark.parametrize("profile", [RTN_PROFILE_ID, GPTQ_PROFILE_ID])
@@ -196,3 +191,32 @@ def test_missing_batch_axis_rejected_before_forward_mutation(monkeypatch, field,
     model = SimpleNamespace(_qwen3_5_moe_profile=GPTQ_PROFILE_ID)
     with pytest.raises(ValueError, match="input_ids.*batch, seq"):
         adapter._rpu_qwen3_5_moe_forward(model, **{field: torch.zeros(shape)})
+
+
+def test_resident_preflight_decouples_outer_window_from_sort_capacity():
+    from transformers import Qwen3_5MoeConfig
+    from rpu_backend.adapters.qwen3_5_moe import Qwen3_5MoeAdapter
+    from rpu_backend.adapters.qwen3_5_moe.text import _qwen3_5_moe_prefill_envelope
+    cfg = Qwen3_5MoeConfig.from_dict(official_config())
+    execution = {"prefill": {"chunk_size": 768, "moe_resident_prefill": True}}
+    Qwen3_5MoeAdapter.preflight_execution(cfg, execution)
+    assert _qwen3_5_moe_prefill_envelope(40, 2048, 8192, resident_prefill=True) == (8320, 8320)
+    execution["prefill"].update(moe_resident_prefill=False, chunk_size=768)
+    with pytest.raises(UnsupportedModelError, match="exceeds"):
+        Qwen3_5MoeAdapter.preflight_execution(cfg, execution)
+    # Native joint planning proves the actual SPM and SDPA schedule. Python
+    # must not reintroduce a 3x256 router-derived outer-window ceiling.
+    for rows in (832, 1024, 1536):
+        execution["prefill"].update(moe_resident_prefill=True, chunk_size=rows)
+        Qwen3_5MoeAdapter.preflight_execution(cfg, execution)
+    mixed = Qwen3_5MoeConfig.from_dict(_exact_config())
+    Qwen3_5MoeAdapter.preflight_execution(mixed, {"prefill": {"moe_resident_prefill": True}})
+
+
+def test_route_table_capacity_is_u16_domain_not_outer_512_cap():
+    from rpu_backend.adapters.qwen3_5_moe.weights import build_route_tables
+    expert, token = build_route_tables(768, 256, 8, device="cpu")
+    assert expert.shape == (768, 256) and token.shape == (768, 8)
+    assert torch.equal(token[:, 0], torch.arange(768, dtype=torch.int16))
+    with pytest.raises(ValueError, match="65536"):
+        build_route_tables(65537, 256, 8, device="cpu")

@@ -164,7 +164,14 @@ def test_qwen3_5_text_handle_and_graph_static_contract():
     assert "end_layer" not in source
     assert "qwen3_5_resolve_prefill_stage_domain" in source
     assert "st.handle, n, real_len" in source
-    assert "*decode_plan_result.graph_key_words()" in decode_graph
+    decode_signature = source.split("def _qwen3_5_decode_signature(", 1)[1]
+    decode_signature = decode_signature.split("\ndef ", 1)[0]
+    assert 'op_id="rpu_qwen3_5"' in decode_signature
+    assert "*plan.graph_key_words()" in decode_signature
+    assert (
+        "graph_cache.capture(_qwen3_5_decode_signature(st, decode_plan_result))"
+        in source
+    )
     install = source.split("def _install_qwen3_5_text_for_rpu_impl(", 1)[1]
     unit_norm = install.split("    for i, layer in enumerate(inner.layers):", 1)[0]
     assert "unit_norm = None" in unit_norm

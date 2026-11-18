@@ -1,32 +1,52 @@
-# TP8 HyVLA measurement template. Edit cameras/text_tokens directly.
-# Synthetic inputs use the checkpoint tokenizer; task quality is not evaluated.
-[hy_vla]
+# 未写出的执行参数（省略即按以下值运行）：
+#   [cpu].threads 省略时本入口使用 12。
+#   分块（chunk_size）模板未写出，按 auto 由入口选择；2026-10-19 模板默认输入实测：vision 400、prefill 160、action 64。可调范围见模型页。
+# HyVLA 8 核模板，直接修改 cameras 和 text_tokens。
+# 合成输入使用 checkpoint 自带的 tokenizer；任务质量未评估。
+[model]
+target = "hy_vla"
+# 本文件的权重/计算配方；切换精度须同时使用对应权重。
 precision = "w8a16"
+# 常驻核内存的 FP8 Gate/Up scale 层数：0（省略时）、4 或 8；非零只适用于 Action NVFP4，已测未采用，保持 0。
 resident_fp8_scale_layers = 0
+# RMSNorm 实现："auto"（省略时）按行数选 V32 / V16 / BASE；"16" 固定用 V16。
 rmsnorm_vwarp = "auto"
+# 替换为匹配本模型与量化配方的本地资产路径或既有权重别名。
+checkpoint = "hy-embodied-0.5-vla-umi"
 
 [input]
-checkpoint = "hy-embodied-0.5-vla-umi"
+# batch 使用保存输入；synthetic 按真实 processor 构造，不共用两种输入字段。
 source = "synthetic"
+# 可选 2 / 3；真实图像数量与输入 tensor 必须同步修改。
 cameras = 2
+# 有效文本 token 数 1–64；修改后同步输入与 prefix bucket。
 text_tokens = 32
+# auto 或 16 对齐的多模态 prefix bucket；必须覆盖真实有效行。
 prefix_len = "auto"
+# 当前模型路径的固定去噪步数，不作为任意可调范围。
 num_steps = 10
 # instruction = "A prompt with at least text_tokens real checkpoint tokens ..."
-# reference = "/path/to/same_input_run/reference.pt"
 
 [rpu_execution.model]
+# RPU 核数预算。本入口固定 8 核，不支持其他值。
 num_cores = 8
 
 [run]
+# 预热次数；不计入正式测量。
 warmup = 3
-runs = 6
+# 正式执行次数，正整数。
+runs = 5
+# 随机种子，非负整数。
 seed = 0
+# 结果输出目录；并发运行使用不同目录。
 output_dir = "./hyvla_results/2cam/w8a16"
 
-# Use the current native build and the two bundled REF aliases.
-# Runtime sources are pinned in release/runtime-dependencies.json.
-# Changing cameras/text_tokens does not require selecting another library.
+# 使用当前 native 构建和仓库自带的两个算子库 REF。
+# 源码与构建来源见 manifests/dependency_manifest.v1.json。
+# 修改 cameras 或 text_tokens 不需要更换算子库。
+# 三项须一起填写，main/expansion 的内容须与 manifests/dependency_manifest.v1.json 发布的 SHA-256 一致。
+# 删除整个 [libraries] 表时，改用环境变量 RPU_BACKEND_SO / RPU_KERNEL_LIB_PATH / RPU_KERNEL_LIB_PATH_EXPANSION，
+# 未设置时使用仓库 src/（或已安装 wheel）中的两个 REF 和已安装的 backend。--check-config 接受占位路径，运行时检查文件。
 [libraries]
 native = "/path/to/current-build/rpu_backend.so"
 main = "/path/to/rpu_backend/src/rhinoOpLib_current.ref"

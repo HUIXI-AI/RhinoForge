@@ -57,11 +57,13 @@ def test_private_32b_binds_actual_quantized_owners_and_bounded_envelope(dtype, s
     model, scales = model_and_scales(dtype)
     execution = {"model": {"num_cores": 8}, "prefill": {"chunk_size": "auto"}}
     assert text.install_qwen3_vl_text_for_rpu(model, scale_lists=scales,
-        execution_config=execution, _runtime_quantized_32b=True) == 73
+        execution_config=execution, _runtime_quantized_32b=True,
+        **({"logical_vocab_size": 151936} if dtype == torch.uint8 else {})) == 73
     bound_model, kwargs = shared_installer[0]
     assert bound_model is model and kwargs["scale_lists"] is scales
     assert kwargs["execution_config"] is execution and kwargs["topology"] is None
     assert kwargs["_kv_cache_layer_bank_size"] == 8
+    assert kwargs.get("logical_vocab_size") == (151936 if dtype == torch.uint8 else None)
     envelope = kwargs["chunk_envelope_for"]
     assert envelope("qwen3_vl_text", 64, 5120) == text.ChunkEnvelope(0, 64)
     with pytest.raises(RuntimeError, match="no certified chunk envelope"):

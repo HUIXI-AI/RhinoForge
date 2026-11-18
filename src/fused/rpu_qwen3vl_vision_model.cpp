@@ -62,7 +62,6 @@ using namespace ::rhino_lkn;
 constexpr int64_t RHINOVLA_VISION_HIGH_ACTIVATION_SITE = 108086773956923057LL;
 constexpr int64_t RHINOVLA_VISION_HIGH_ENCODER_ACTIVATION_SITE = 4642981117179055386LL;
 
-constexpr int64_t QWEN3VL_VISION_DEFAULT_CHUNK_SIZE = 144;
 constexpr int64_t QWEN3VL_VISION_LARGE_IMAGE_THRESHOLD = 1024;
 constexpr int64_t QWEN3VL_VISION_LARGE_IMAGE_CHUNK_CAP = 608;
 
@@ -107,6 +106,8 @@ constexpr int64_t QWEN3VL_ROPE_COS_PRELOAD_DIRECT_SITE =
     1089927205617401262LL;
 constexpr int64_t QWEN3VL_ROPE_SIN_PRELOAD_DIRECT_SITE =
     9144463814971908982LL;
+constexpr int64_t QWEN3VL_NVFP4_SCALE_PRELOAD_SITE =
+    2325782528529170216LL;
 constexpr int64_t QWEN3VL_DEEPSTACK_SNAPSHOT_SITE =
     559423039313734461LL;
 constexpr int64_t QWEN3VL_POOLER_MERGED_COPY_SITE =
@@ -120,7 +121,8 @@ constexpr int64_t QWEN3VL_CHUNKED_MERGER_OUTPUT_SITE =
 
 constexpr uint32_t QWEN3VL_KV_CAPABILITIES =
     KV_INSERT_CAP_V2 | KV_INSERT_CAP_V16 |
-    KV_INSERT_CAP_HYBRID2 | KV_INSERT_CAP_HYBRID3;
+    KV_INSERT_CAP_HYBRID2 | KV_INSERT_CAP_HYBRID3 |
+    KV_INSERT_CAP_NON8_TP_V16;
 constexpr int64_t QWEN3VL_KV_REASON_DDR_REQUIRED = 1;
 
 inline constexpr int64_t QWEN3VL_W8_RESIDENT_SCHEDULE_SITE = 293709511256992144LL;
@@ -151,6 +153,7 @@ enum class Qwen3VLVisionMutableDmaRoute : int64_t {
     ROPE_TABLE_DDR_TO_SPM = 1,
     SPM_COPY_TO_DDR = 2,
     MERGER_INPUT_DDR_TO_SPM = 3,
+    NVFP4_SCALE_DDR_TO_SPM = 4,
 };
 
 // First Qwen3-VL pooler-only physical handoff canary. Keep the envelope exact:
@@ -200,10 +203,70 @@ constexpr uint64_t QWEN3VL_MULTIVIEW_OCCURRENCE_POLICY =
 // per-channel multipliers, i.e. a silent numeric corruption rather than a crash.
 // The `else` leg is the reverse hole: an int8 weight with no scale list is read
 // back as fp16 by the kernel.
+//
+// W4A16 (qwen3vl_vision_set_weights_w4a16) declares packed mode: every block
+// projection is G32 pgrp-packed uint8 [N,K/2] with the controller-striped 2D
+// fp16 scale. `w4_partition` is the Linear partition the layer body launches
+// it with (1 column, 0 row). The launcher re-checks the same ABI on every
+// call; this check fails at installation instead of on the first forward.
+static void check_qwen3vl_vision_w4a16_projection(const at::Tensor& w, const at::Tensor& s,
+                                                  int w4_partition, int64_t cores,
+                                                  const char* name, int64_t i) {
+    const char* ctx = "qwen3vl_vision_set_weights_w4a16";
+    TORCH_CHECK(w.scalar_type() == at::kByte && w.device().type() == at::kPrivateUse1 &&
+                    w.is_contiguous(),
+                ctx, ": ", name, "[", i, "] must be contiguous packed uint8 W4 on RPU, got ",
+                w.scalar_type());
+    const int64_t n = w.size(0), k = w.size(1) * 2;
+    const bool col = w4_partition == 1;
+    TORCH_CHECK(cores > 0 && n % (col ? 16 * cores : 16) == 0 &&
+                    k % (col ? 64 : 64 * cores) == 0,
+                ctx, ": packed W4 ", name, "[", i, "] [", n, ",", k,
+                "] does not split into 16-aligned N and 64-aligned K over ", cores,
+                col ? " column" : " row", " lanes");
+    const int64_t local_g = (col ? k : k / cores) / 32;
+    const int64_t local_n = col ? n / cores : n;
+    const int64_t expected = cores * ((local_g + 3) / 4) * ((local_n + 63) / 64) * 256;
+    TORCH_CHECK(s.defined() && s.dim() == 2 && s.size(0) == 32 &&
+                    s.scalar_type() == at::kHalf && s.device().type() == at::kPrivateUse1 &&
+                    s.is_contiguous() && s.numel() == expected,
+                ctx, ": packed W4 ", name, "_scale[", i, "] must be the contiguous fp16 RPU "
+                "G32 pgrp payload of ", expected, " elements, got ", s.sizes());
+}
+
+// NVFP4 (qwen3vl_vision_set_weights_nvfp4) declares packed mode too: uint8
+// [N,K/2] E2M1 weight in the NVFP4 swizzle and the striped uint8 [K/16,N] E4M3
+// block scale, with the same lane rule as packed W4 (column N%(16c) and K%64,
+// row N%16 and K%(64c)). The per-projection FP32 tensor scale is a table.
+static void check_qwen3vl_vision_nvfp4_projection(const at::Tensor& w, const at::Tensor& s,
+                                                  int partition, int64_t cores,
+                                                  const char* name, int64_t i) {
+    const char* ctx = "qwen3vl_vision_set_weights_nvfp4";
+    TORCH_CHECK(w.scalar_type() == at::kByte && w.device().type() == at::kPrivateUse1 &&
+                    w.is_contiguous(),
+                ctx, ": ", name, "[", i, "] must be contiguous packed uint8 NVFP4 on RPU, got ",
+                w.scalar_type());
+    const int64_t n = w.size(0), k = w.size(1) * 2;
+    const bool col = partition == 1;
+    TORCH_CHECK(cores > 0 && n % (col ? 16 * cores : 16) == 0 &&
+                    k % (col ? 64 : 64 * cores) == 0,
+                ctx, ": NVFP4 ", name, "[", i, "] [", n, ",", k,
+                "] does not split into 16-aligned N and 64-aligned K over ", cores,
+                col ? " column" : " row", " lanes");
+    TORCH_CHECK(s.defined() && s.dim() == 2 && s.size(0) == k / 16 && s.size(1) == n &&
+                    s.scalar_type() == at::kByte && s.device().type() == at::kPrivateUse1 &&
+                    s.is_contiguous(),
+                ctx, ": NVFP4 ", name, "_scale[", i, "] must be the contiguous uint8 RPU "
+                "striped block scale [", k / 16, ",", n, "], got ", s.sizes());
+}
+
 static void check_qwen3vl_vision_w8a16_scale_list(int64_t n_layers,
                                                   const at::TensorList& weights,
                                                   const at::TensorList& scales,
-                                                  const char* name) {
+                                                  const char* name,
+                                                  int w4_partition = -1,
+                                                  int64_t cores = 0,
+                                                  bool nvfp4 = false) {
     const char* ctx = "qwen3vl_vision_set_weights";
     const bool quantized = !scales.empty();
     if (quantized) {
@@ -211,8 +274,19 @@ static void check_qwen3vl_vision_w8a16_scale_list(int64_t n_layers,
                     ctx, ": ", name, "_scale.size()=", scales.size(),
                     " != num_layers=", n_layers);
     }
+    TORCH_CHECK(w4_partition < 0 || quantized,
+                nvfp4 ? "qwen3vl_vision_set_weights_nvfp4: " : "qwen3vl_vision_set_weights_w4a16: ",
+                name, nvfp4 ? " requires its block scale list" : " requires its G32 scale list");
     for (int64_t i = 0; i < n_layers; ++i) {
         const at::Tensor& w = weights[i];
+        if (w4_partition >= 0 && nvfp4) {
+            check_qwen3vl_vision_nvfp4_projection(w, scales[i], w4_partition, cores, name, i);
+            continue;
+        }
+        if (w4_partition >= 0) {
+            check_qwen3vl_vision_w4a16_projection(w, scales[i], w4_partition, cores, name, i);
+            continue;
+        }
         if (quantized) {
             const at::Tensor& s = scales[i];
             TORCH_CHECK(w.scalar_type() == at::kChar,
@@ -228,8 +302,8 @@ static void check_qwen3vl_vision_w8a16_scale_list(int64_t n_layers,
                         ctx, ": ", name, "_scale[", i, "].numel()=", s.numel(),
                         " != output dim=", w.size(0));
         } else {
-            TORCH_CHECK(w.scalar_type() != at::kChar,
-                        ctx, ": int8 ", name, "[", i,
+            TORCH_CHECK(w.scalar_type() != at::kChar && w.scalar_type() != at::kByte,
+                        ctx, ": quantized ", name, "[", i,
                         "] requires a non-empty scale list for this projection");
         }
     }
@@ -322,9 +396,14 @@ public:
         double eps, at::IntArrayRef deepstack_visual_indexes = {},
         at::TensorList q_scale_list = {}, at::TensorList k_scale_list = {},
         at::TensorList v_scale_list = {}, at::TensorList o_scale_list = {},
-        at::TensorList fc1_scale_list = {}, at::TensorList fc2_scale_list = {})
+        at::TensorList fc1_scale_list = {}, at::TensorList fc2_scale_list = {},
+        bool packed_w4 = false, at::TensorList nvfp4_tensor_scales = {})
     {
         int64_t N = static_cast<int64_t>(q_w_list.size());
+        // NVFP4 is the packed mode with six per-projection tensor-scale tables.
+        const bool nvfp4 = !nvfp4_tensor_scales.empty();
+        TORCH_CHECK(!nvfp4 || packed_w4,
+                    "qwen3vl_vision_set_weights: NVFP4 tensor scales require packed weights");
         TORCH_CHECK(N > 0, "qwen3vl_vision_set_weights: empty weight lists");
         TORCH_CHECK(num_heads > 0 && head_dim > 0 && hidden_size > 0
                     && intermediate_size > 0,
@@ -393,10 +472,30 @@ public:
                     "qwen3vl_vision_set_weights: physical head_dim must be a "
                     "multiple of 16, got ", head_dim);
 
+        // Packed W4 and NVFP4 are admitted for the exact 2B/4B tower, whose six
+        // projections split into pgrp lanes at 4 and 8 cores without padding.
+        // Packed W4 also takes the padded 8B/32B tower at 4 cores: its o (K1280)
+        // and fc2 (K4352) rows split into 64-aligned lanes at 4 cores, not 8.
+        const bool packed_w4_2b_4b =
+            N == 24 && num_heads == 16 && head_dim == 64 &&
+            hidden_size == 1024 && intermediate_size == 4096 &&
+            eps == 1e-6 && (num_cores() == 4 || num_cores() == 8) &&
+            deepstack_visual_indexes == std::vector<int64_t>{5, 11, 17};
+        const bool packed_w4_padded =
+            !nvfp4 && padded_32b && eps == 1e-6 && num_cores() == 4 &&
+            deepstack_visual_indexes == std::vector<int64_t>{8, 16, 24};
+        TORCH_CHECK(!packed_w4 || packed_w4_2b_4b || packed_w4_padded,
+                    nvfp4 ? "qwen3vl_vision_set_weights_nvfp4: NVFP4 Vision requires the "
+                            "exact Qwen3-VL 2B/4B tower on 4 or 8 cores"
+                          : "qwen3vl_vision_set_weights_w4a16: packed W4 Vision requires the "
+                            "exact Qwen3-VL 2B/4B tower on 4 or 8 cores, or the padded "
+                            "8B/32B tower on 4 cores");
         const int64_t attention_width = num_heads * head_dim;
         auto check_matrix_shape = [&](const at::TensorList& list,
                                       const char* name,
                                       int64_t rows, int64_t cols) {
+            // Packed W4 and NVFP4 store two nibbles per byte: [N, K/2].
+            if (packed_w4) cols /= 2;
             for (int64_t i = 0; i < N; ++i) {
                 TORCH_CHECK(list[i].size(0) == rows && list[i].size(1) == cols,
                             "qwen3vl_vision_set_weights: ", name, "[", i,
@@ -437,12 +536,18 @@ public:
                 deepstack_visual_indexes == std::vector<int64_t>{8, 16, 24};
             TORCH_CHECK(num_cores() == 4 && (regular || padded) && eps == 1e-6,
                         "four-core Vision requires the exact dense Qwen3-VL 2B/4B/8B tower");
-            TORCH_CHECK(q_scale_list.empty() && k_scale_list.empty() &&
-                            v_scale_list.empty() && o_scale_list.empty() &&
-                            fc1_scale_list.empty() && fc2_scale_list.empty(),
-                        "four-core Vision requires FP16 weights without quantization scales");
+            const auto projection_dtype = q_scale_list.empty() ? at::kHalf
+                : (packed_w4 ? at::kByte : at::kChar);
             for (const auto* list : {&q_w_list, &k_w_list, &v_w_list, &o_w_list,
-                    &fc1_w_list, &fc2_w_list, &ln1_w_list, &ln1_b_list,
+                    &fc1_w_list, &fc2_w_list}) {
+                for (const auto& tensor : *list) {
+                    TORCH_CHECK(tensor.scalar_type() == projection_dtype &&
+                                    tensor.device().type() == at::kPrivateUse1 &&
+                                    tensor.is_contiguous(),
+                                "four-core Vision requires uniform contiguous FP16, INT8, packed W4 or NVFP4 projections");
+                }
+            }
+            for (const auto* list : {&ln1_w_list, &ln1_b_list,
                     &ln2_w_list, &ln2_b_list, &q_b_list, &k_b_list, &v_b_list,
                     &o_b_list, &fc1_b_list, &fc2_b_list}) {
                 for (const auto& tensor : *list) {
@@ -477,12 +582,20 @@ public:
         }
 
         // Validate all scale metadata before publishing model dimensions or owners.
-        check_qwen3vl_vision_w8a16_scale_list(N, q_w_list,   q_scale_list,   "q_w");
-        check_qwen3vl_vision_w8a16_scale_list(N, k_w_list,   k_scale_list,   "k_w");
-        check_qwen3vl_vision_w8a16_scale_list(N, v_w_list,   v_scale_list,   "v_w");
-        check_qwen3vl_vision_w8a16_scale_list(N, o_w_list,   o_scale_list,   "o_w");
-        check_qwen3vl_vision_w8a16_scale_list(N, fc1_w_list, fc1_scale_list, "fc1_w");
-        check_qwen3vl_vision_w8a16_scale_list(N, fc2_w_list, fc2_scale_list, "fc2_w");
+        // Packed W4 launches q/k/v/fc1 column-partitioned and o/fc2 row-partitioned.
+        const int64_t cores = num_cores();
+        check_qwen3vl_vision_w8a16_scale_list(N, q_w_list,   q_scale_list,   "q_w",
+                                              packed_w4 ? 1 : -1, cores, nvfp4);
+        check_qwen3vl_vision_w8a16_scale_list(N, k_w_list,   k_scale_list,   "k_w",
+                                              packed_w4 ? 1 : -1, cores, nvfp4);
+        check_qwen3vl_vision_w8a16_scale_list(N, v_w_list,   v_scale_list,   "v_w",
+                                              packed_w4 ? 1 : -1, cores, nvfp4);
+        check_qwen3vl_vision_w8a16_scale_list(N, o_w_list,   o_scale_list,   "o_w",
+                                              packed_w4 ? 0 : -1, cores, nvfp4);
+        check_qwen3vl_vision_w8a16_scale_list(N, fc1_w_list, fc1_scale_list, "fc1_w",
+                                              packed_w4 ? 1 : -1, cores, nvfp4);
+        check_qwen3vl_vision_w8a16_scale_list(N, fc2_w_list, fc2_scale_list, "fc2_w",
+                                              packed_w4 ? 0 : -1, cores, nvfp4);
         // W8A16: require a complete inventory for all 6 quantized GEMMs
         // (all empty = fp16).  Reject a partial inventory before indexing any
         // TensorList; the multiview profile validator checks tensor details.
@@ -490,8 +603,6 @@ public:
             !q_scale_list.empty() || !k_scale_list.empty() ||
             !v_scale_list.empty() || !o_scale_list.empty() ||
             !fc1_scale_list.empty() || !fc2_scale_list.empty();
-        TORCH_CHECK(!padded_32b || !any_scale || num_cores() == 8,
-                    "qwen3vl_vision_set_weights: padded W8A16 Vision requires TP8");
         if (any_scale) {
             check_list(q_scale_list, "q_scale_list");
             check_list(k_scale_list, "k_scale_list");
@@ -499,6 +610,32 @@ public:
             check_list(o_scale_list, "o_scale_list");
             check_list(fc1_scale_list, "fc1_scale_list");
             check_list(fc2_scale_list, "fc2_scale_list");
+        }
+
+        // One FP32 tensor scale per layer for each of q/k/v/o/fc1/fc2, padded to
+        // whole 32-byte loads. ACC16 retires the scale through FP16, so it must
+        // stay finite and positive there too.
+        if (nvfp4) {
+            TORCH_CHECK(nvfp4_tensor_scales.size() == kNvfp4TableNames.size(),
+                        "qwen3vl_vision_set_weights_nvfp4: requires six tensor-scale tables");
+            const int64_t padded = (N + 7) / 8 * 8;
+            for (const auto& table : nvfp4_tensor_scales) {
+                TORCH_CHECK(table.defined() && table.scalar_type() == at::kFloat &&
+                                table.device().type() == at::kPrivateUse1 &&
+                                table.is_contiguous() && table.dim() == 1 &&
+                                table.numel() == padded && padded * 4 <= 256,
+                            "qwen3vl_vision_set_weights_nvfp4: tensor scales must be "
+                            "contiguous FP32 RPU [", padded, "]");
+                const auto cpu = table.cpu();
+                const auto* p = cpu.data_ptr<float>();
+                for (int64_t layer = 0; layer < padded; ++layer) {
+                    const float retired = static_cast<float>(c10::Half(p[layer]));
+                    TORCH_CHECK(std::isfinite(p[layer]) && p[layer] > 0 &&
+                                    std::isfinite(retired) && retired > 0,
+                                "qwen3vl_vision_set_weights_nvfp4: tensor scale must remain "
+                                "finite and positive in ACC16");
+                }
+            }
         }
 
         // Vision encoder is MHA (no GQA): num_kv_heads == num_q_heads.
@@ -524,14 +661,17 @@ public:
         }
 
         // Publish the already validated scale inventory (all empty = fp16).
+        // Packed W4 scales are retained at the pgrp launcher's cores*512 B
+        // DDR alignment; W8 and NVFP4 scales pass through unchanged.
         if (any_scale) {
             for (int64_t i = 0; i < N; i++) {
-                layer_weights_[i].q_ws   = q_scale_list[i];
-                layer_weights_[i].k_ws   = k_scale_list[i];
-                layer_weights_[i].v_ws   = v_scale_list[i];
-                layer_weights_[i].o_ws   = o_scale_list[i];
-                layer_weights_[i].fc1_ws = fc1_scale_list[i];
-                layer_weights_[i].fc2_ws = fc2_scale_list[i];
+                auto& lw = layer_weights_[i];
+                lw.q_ws   = rpu_retain_linear_quant_scale(lw.q_w,   q_scale_list[i],   cores);
+                lw.k_ws   = rpu_retain_linear_quant_scale(lw.k_w,   k_scale_list[i],   cores);
+                lw.v_ws   = rpu_retain_linear_quant_scale(lw.v_w,   v_scale_list[i],   cores);
+                lw.o_ws   = rpu_retain_linear_quant_scale(lw.o_w,   o_scale_list[i],   cores);
+                lw.fc1_ws = rpu_retain_linear_quant_scale(lw.fc1_w, fc1_scale_list[i], cores);
+                lw.fc2_ws = rpu_retain_linear_quant_scale(lw.fc2_w, fc2_scale_list[i], cores);
             }
         }
 
@@ -545,6 +685,8 @@ public:
                 fc1_b_list[i], fc2_b_list[i],
             });
         }
+
+        nvfp4_tensor_scales_.assign(nvfp4_tensor_scales.begin(), nvfp4_tensor_scales.end());
 
         rhinovla_high_precision_ = false;
         rhinovla_precision_bound_ = false;
@@ -652,8 +794,8 @@ public:
         int64_t out_hidden, double ln_eps,
         const at::Tensor& m0_scale, const at::Tensor& m2_scale)
     {
-        TORCH_CHECK(num_cores() == 8,
-                    "fused Vision merger retains its eight-core profile");
+        TORCH_CHECK(num_cores() == 4 || num_cores() == 8,
+                    "fused Vision merger requires the four- or eight-core profile");
         TORCH_CHECK(ln_q_w.dim() == 1 && ln_q_w.size(0) == hidden_size(),
                     "merger ln_q_w must be [HID]");
         TORCH_CHECK(ln_q_b.dim() == 1 && ln_q_b.size(0) == hidden_size(),
@@ -796,13 +938,21 @@ public:
                     get_last_resolved_chunk_size() == 0 && !rhinovla_precision_bound_,
                     "RhinoVLA vision precision must be cold-bound once before forward");
         if (enabled) {
-            TORCH_CHECK(num_cores() == 8 && num_layers() == 24 &&
+            // Eight cores always fuse the four W8 mergers into this graph. The
+            // 4/6-core composite runs the tower on four cores and may either fuse
+            // the four W8 mergers in-graph or run them outside.
+            const bool fused_v3_mergers =
+                fused_merger_enabled_ && merger_out_hidden_ == 2048 &&
+                merge_hidden_ == 4096 &&
+                deepstack_visual_indexes_ == std::vector<int64_t>({5, 11, 17}) &&
+                ds_merger_m0_w_.size() == 3;
+            TORCH_CHECK(num_layers() == 24 &&
                         hidden_size() == 1024 && intermediate_size() == 4096 &&
                         num_q_heads() == 16 && head_dim() == 64 &&
-                        fused_merger_enabled_ && merger_out_hidden_ == 2048 &&
-                        merge_hidden_ == 4096 && deepstack_visual_indexes_ ==
-                            std::vector<int64_t>({5, 11, 17}) &&
-                        ds_merger_m0_w_.size() == 3,
+                        (num_cores() == 8
+                            ? fused_v3_mergers
+                            : num_cores() == 4 &&
+                                  (fused_v3_mergers || !fused_merger_enabled_)),
                         "RhinoVLA high precision requires the full v3 vision tower and mergers");
             for (const auto& layer : layer_weights_) {
                 for (const auto* w : {&layer.q_w, &layer.k_w, &layer.v_w,
@@ -811,14 +961,16 @@ public:
                                 "RhinoVLA high precision requires full W8 vision weights");
                 }
             }
-            for (const auto* w : {&merger_m0_w_, &merger_m2_w_}) {
-                TORCH_CHECK(w->defined() && w->scalar_type() == at::kChar,
-                            "RhinoVLA high precision requires W8 mergers");
-            }
-            for (size_t i = 0; i < ds_merger_m0_w_.size(); ++i) {
-                TORCH_CHECK(ds_merger_m0_w_[i].scalar_type() == at::kChar &&
-                            ds_merger_m2_w_[i].scalar_type() == at::kChar,
-                            "RhinoVLA high precision requires W8 deepstack mergers");
+            if (fused_merger_enabled_) {
+                for (const auto* w : {&merger_m0_w_, &merger_m2_w_}) {
+                    TORCH_CHECK(w->defined() && w->scalar_type() == at::kChar,
+                                "RhinoVLA high precision requires W8 mergers");
+                }
+                for (size_t i = 0; i < ds_merger_m0_w_.size(); ++i) {
+                    TORCH_CHECK(ds_merger_m0_w_[i].scalar_type() == at::kChar &&
+                                ds_merger_m2_w_[i].scalar_type() == at::kChar,
+                                "RhinoVLA high precision requires W8 deepstack mergers");
+                }
             }
             rpu_require_high_precision_math_kernels();
         }
@@ -947,9 +1099,9 @@ public:
         image_batch_count_ = image_batch_count;
         // The descriptor resolver must expose the real bounded native domain,
         // not turn the legacy default into a hidden exact override.  The
-        // subclass cap below retains C144 for legacy/small-image AUTO and
-        // exposes the cold ordinary large-image cap separately. Its validity
-        // predicate retains the existing packed-image/fused-merger restrictions.
+        // subclass cap below takes the whole image for AUTO and exposes the
+        // cold ordinary large-image cap separately. Its validity predicate
+        // retains the existing packed-image/fused-merger restrictions.
         set_chunk_size_override(0);
 
         const int64_t patches_per_image =
@@ -1056,8 +1208,9 @@ public:
                     " must match num_patches=", num_patches_in);
         if (num_cores() != 8) {
             TORCH_CHECK(input.scalar_type() == at::kHalf && input.size(2) == hidden_size() &&
-                            image_batch_count == 1 && !pipeline_dispatch,
-                        "four-core Vision requires one ordinary FP16 image per dispatch");
+                            image_batch_count >= 1 && image_batch_count <= 3 &&
+                            num_patches_in % image_batch_count == 0 && !pipeline_dispatch,
+                        "four-core Vision requires 1..3 equal-size ordinary FP16 images per dispatch");
             TORCH_CHECK(static_cast<int64_t>(k_caches.size()) == num_layers() &&
                             static_cast<int64_t>(v_caches.size()) == num_layers(),
                         "four-core Vision requires one paired cache per layer");
@@ -2277,7 +2430,8 @@ protected:
                (current_num_patches_ == 512 || current_num_patches_ == 1024)) &&
              !(image_batch_count_ == 3 && current_num_patches_ == 768) &&
              !ordinary_w8_split_raw_geometry()) ||
-            num_cores() != 8 || num_layers() != 24 || hidden_size() != 1024 ||
+            !(num_cores() == 8 || (num_cores() == 4 && current_num_patches_ <= 784)) ||
+            num_layers() != 24 || hidden_size() != 1024 ||
             intermediate_size() != 4096 || num_q_heads() != 16 ||
             head_dim() != 64 || orig_head_dim_ != 64 ||
             (merger_out_hidden_ != 2048 && merger_out_hidden_ != 2560) ||
@@ -2319,7 +2473,7 @@ protected:
     }
 
     bool ordinary_n1200_tm160_profile() const {
-        return ordinary_w8_resident_profile() && image_batch_count_ == 1 &&
+        return num_cores() == 8 && ordinary_w8_resident_profile() && image_batch_count_ == 1 &&
             !delivery_compatibility_ && !prefix_scatter_active_ &&
             !native_composite_prepare_active_ && z1_prepared_num_patches_ == 0 &&
             !z1_adopted_ && !z1_bound_ && !multiview_dry_prepared_ &&
@@ -2426,7 +2580,7 @@ protected:
 
     std::vector<int64_t> ordinary_resident_schedule_arguments() const {
         std::vector<int64_t> arguments{
-            current_num_patches_, image_batch_count_, 24, 1024, 4096, 16, 64, 8, merger_out_hidden_};
+            current_num_patches_, image_batch_count_, 24, 1024, 4096, 16, 64, num_cores(), merger_out_hidden_};
         // Preserve recorded W8 descriptors; the new FP16 route additionally
         // binds its weight and accumulator precision in the COMPLETE stream.
         if (layer_weights_.front().q_w.scalar_type() == at::kHalf)
@@ -2546,8 +2700,12 @@ protected:
                    {}, invocation);
         };
         if (rhinovla_high_precision_) {
-            append(FmbRouteFamily::GRAPH_SCHEDULE, RHINOVLA_VISION_HIGH_ACTIVATION_SITE,
-                   1, {2, 1024, 4096, 2048, 4, 8});
+            // The merger activation exists only with the fused merger; HIGH
+            // requires it at eight cores and the 4/6-core tower runs without it.
+            if (fused_merger_enabled_) {
+                append(FmbRouteFamily::GRAPH_SCHEDULE, RHINOVLA_VISION_HIGH_ACTIVATION_SITE,
+                       1, {2, 1024, 4096, 2048, 4, 8});
+            }
             append(FmbRouteFamily::GRAPH_SCHEDULE, RHINOVLA_VISION_HIGH_ENCODER_ACTIVATION_SITE,
                    1, {2, 1024, 4096, 2048, 4, 8});
         }
@@ -2600,6 +2758,16 @@ protected:
                          : QWEN3VL_ROPE_SIN_PRELOAD_DIRECT_SITE,
                 selector,
                 {rope_spm ? 1 : 0, max_hw_, orig_head_dim_});
+        }
+        // One record per NVFP4 tensor-scale table, consumed by its
+        // Persistent preload callback (invocation = projection role).
+        for (size_t role = 0; role < nvfp4_tensor_scales_.size(); ++role) {
+            const int64_t elements = nvfp4_tensor_scales_[role].numel();
+            append(FmbRouteFamily::MUTABLE_DMA, QWEN3VL_NVFP4_SCALE_PRELOAD_SITE,
+                   static_cast<int64_t>(
+                       Qwen3VLVisionMutableDmaRoute::NVFP4_SCALE_DDR_TO_SPM),
+                   {static_cast<int64_t>(role), elements, 2 * elements},
+                   static_cast<int64_t>(role));
         }
         for (const ChunkInfo& chunk : plan.qkv.chunks) {
             if (lingbot_qkv_joint_for_plan(plan)) {
@@ -2947,15 +3115,24 @@ protected:
         if (merger_active() || image_batch_count_ > 1) {
             return ((seq_len + 15) / 16) * 16;
         }
-        // This cold opt-in belongs to the ordinary 2B/4B adapter, not shared
-        // tower geometry alone. Preserve formal N784 and exact requests. The
-        // native planner still rejects candidates exceeding SPM/SDPA limits.
+        // This cold opt-in belongs to the ordinary eight-core 2B/4B ACC32
+        // adapter, not shared tower geometry alone. Preserve formal N784 and
+        // exact requests. The native planner still rejects candidates
+        // exceeding SPM/SDPA limits.
         if (large_image_auto_chunk_ &&
             seq_len > QWEN3VL_VISION_LARGE_IMAGE_THRESHOLD &&
             large_image_auto_chunk_profile()) {
             return QWEN3VL_VISION_LARGE_IMAGE_CHUNK_CAP;
         }
-        return QWEN3VL_VISION_DEFAULT_CHUNK_SIZE;
+        // Without a fused merger the owner encodes one image per forward.
+        // Legacy C144 split a 256-patch image into two chunks, each of which
+        // launches every layer's kernels and reads its weights from DDR again,
+        // so AUTO takes the whole image on four and eight cores; the planner
+        // still picks the fewest chunks that fit SPM. The Python forward
+        // releases this layout before its eager merger GEMMs, whose row passes
+        // are sized from free SPM and would otherwise re-read the weight many
+        // times after a large chunk.
+        return ((seq_len + 15) / 16) * 16;
     }
 
     bool subclass_chunk_size_valid(
@@ -3248,6 +3425,20 @@ protected:
                 decls.push_back({"merger_m2_bias", dma_safe(oh),       0, 0, StorageClass::Persistent, 0, nullptr});
             }
         }
+        // NVFP4 tensor-scale tables: one Persistent 256-byte slot per projection,
+        // broadcast to every core with the other preloads. Pipeline dispatch
+        // (z1 / multiview composite) keeps FP16/W8 weights only.
+        if (!nvfp4_tensor_scales_.empty()) {
+            TORCH_CHECK(!pipeline_dispatch_active(),
+                        "Qwen3-VL NVFP4 Vision does not admit pipeline dispatch");
+            for (size_t role = 0; role < nvfp4_tensor_scales_.size(); ++role) {
+                decls.push_back({kNvfp4TableNames[role], 256, 0, 0, StorageClass::Persistent,
+                    0, nullptr, ALL,
+                    [this, role](FusedModelBase&, int, uint32_t destination) {
+                        preload_nvfp4_table(role, destination);
+                    }});
+            }
+        }
         if (lingbot_spm_kv) {
             // The original 32b minibatch body keeps its K256 scratch. Vt is
             // independent and can reuse the later O-projection phase's space.
@@ -3457,7 +3648,7 @@ protected:
                 addr(0, "input_norm"), lw.q_w, addr(0, "q"),
                 seq_len, nq * hd, h, 1, num_cores(),
                 layer_addr(layer_idx, 0, "q_bias"), lw.q_ws,
-                /*nvfp4_tensor_scale_spm_addr=*/0, /*nvfp4_layer_id=*/0,
+                nvfp4_table_addr(0), nvfp4_layer_id(layer_idx),
                 /*force_acc32=*/linear_acc32_);
             consume_manifest_route(
                 FmbRouteFamily::LINEAR, QWEN3VL_K_LINEAR_SITE,
@@ -3467,7 +3658,7 @@ protected:
                 addr(0, "input_norm"), lw.k_w, addr(0, "k"),
                 seq_len, nq * hd, h, 1, num_cores(),
                 layer_addr(layer_idx, 0, "k_bias"), lw.k_ws,
-                /*nvfp4_tensor_scale_spm_addr=*/0, /*nvfp4_layer_id=*/0,
+                nvfp4_table_addr(1), nvfp4_layer_id(layer_idx),
                 /*force_acc32=*/linear_acc32_);
             consume_manifest_route(
                 FmbRouteFamily::LINEAR, QWEN3VL_V_LINEAR_SITE,
@@ -3477,7 +3668,7 @@ protected:
                 addr(0, "input_norm"), lw.v_w, addr(0, "v"),
                 seq_len, nq * hd, h, 1, num_cores(),
                 layer_addr(layer_idx, 0, "v_bias"), lw.v_ws,
-                /*nvfp4_tensor_scale_spm_addr=*/0, /*nvfp4_layer_id=*/0,
+                nvfp4_table_addr(2), nvfp4_layer_id(layer_idx),
                 /*force_acc32=*/linear_acc32_);
         }
 
@@ -3649,6 +3840,16 @@ protected:
                 /*num_cores=*/num_cores());
         }
         return;
+    }
+
+    // Packed W4 row Linear takes no in-kernel bias. The o/fc2 bias buffers hold
+    // the bias on core 0 and zeros elsewhere (emit_preload_weights), so adding
+    // them to every core's partial before the reduction is the same sum the
+    // fp16/int8 kernel makes.
+    void add_row_bias_partial(uint32_t bias_addr, int64_t seq_len, int64_t h) {
+        rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
+            bias_addr, addr(0, "oproj"), addr(0, "oproj"),
+            seq_len, h, c10::Half(1.0f), ValuOpType::ADD, /*is_bopa=*/false, num_cores());
     }
 
     void build_layer_subgraph(int layer_idx, const ChunkInfo& chunk) override {
@@ -3837,12 +4038,14 @@ protected:
             FmbRouteFamily::LINEAR, QWEN3VL_O_LINEAR_SITE,
             static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
             chunk.idx);
+        const bool w4_o = lw.o_w.scalar_type() == at::kByte;
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "sdpa_out"), lw.o_w, addr(0, "oproj"),
             seq_len, h, nq * hd, 0, num_cores(),
-            layer_addr(layer_idx, 0, "o_bias"), lw.o_ws,
-            /*nvfp4_tensor_scale_spm_addr=*/0, /*nvfp4_layer_id=*/0,
+            w4_o ? 0 : layer_addr(layer_idx, 0, "o_bias"), lw.o_ws,
+            nvfp4_table_addr(3), nvfp4_layer_id(layer_idx),
             /*force_acc32=*/linear_acc32_);
+        if (w4_o) add_row_bias_partial(layer_addr(layer_idx, 0, "o_bias"), seq_len, h);
         if (compact) {
             emit_fp16_compact_attention_ring();
             emit_fp16_compact_residual_copy(1);
@@ -3880,7 +4083,7 @@ protected:
                 addr(0, "oproj"), lw.fc1_w, addr(0, "fc1"),
                 seq_len, is_, h, 1, num_cores(),
                 layer_addr(layer_idx, 0, "fc1_bias"), lw.fc1_ws,
-                /*nvfp4_tensor_scale_spm_addr=*/0, /*nvfp4_layer_id=*/0,
+                nvfp4_table_addr(4), nvfp4_layer_id(layer_idx),
                 /*force_acc32=*/linear_acc32_);
             if (rhinovla_high_precision_) {
                 ctx().consume_physical_route(
@@ -3900,12 +4103,14 @@ protected:
             FmbRouteFamily::LINEAR, QWEN3VL_FC2_LINEAR_SITE,
             static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
             chunk.idx);
+        const bool w4_fc2 = lw.fc2_w.scalar_type() == at::kByte;
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "fc1"), lw.fc2_w, addr(0, "oproj"),
             seq_len, h, is_, 0, num_cores(),
-            layer_addr(layer_idx, 0, "fc2_bias"), lw.fc2_ws,
-            /*nvfp4_tensor_scale_spm_addr=*/0, /*nvfp4_layer_id=*/0,
+            w4_fc2 ? 0 : layer_addr(layer_idx, 0, "fc2_bias"), lw.fc2_ws,
+            nvfp4_table_addr(5), nvfp4_layer_id(layer_idx),
             /*force_acc32=*/linear_acc32_);
+        if (w4_fc2) add_row_bias_partial(layer_addr(layer_idx, 0, "fc2_bias"), seq_len, h);
         if (compact) {
             emit_fp16_compact_mlp_ring();
         } else {
@@ -5318,6 +5523,11 @@ private:
                 append_kvinsert_cost_tensor_identity(identity, *tensor);
             }
         }
+        if (!nvfp4_tensor_scales_.empty()) {
+            identity.push_back(static_cast<int64_t>(nvfp4_tensor_scales_.size()));
+            for (const auto& table : nvfp4_tensor_scales_)
+                append_kvinsert_cost_tensor_identity(identity, table);
+        }
         identity.push_back(static_cast<int64_t>(layer_bias_norm_.size()));
         for (const auto& weights : layer_bias_norm_) {
             for (const auto* tensor : {
@@ -5337,6 +5547,34 @@ private:
 
     std::vector<LayerWeights> layer_weights_;
     std::vector<LayerBiasNorm> layer_bias_norm_;
+    // NVFP4 only: FP32 RPU [24] tensor-scale tables for q/k/v/o/fc1/fc2.
+    std::vector<at::Tensor> nvfp4_tensor_scales_;
+    inline static constexpr std::array<const char*, 6> kNvfp4TableNames{
+        "nvfp4_q_ts", "nvfp4_k_ts", "nvfp4_v_ts",
+        "nvfp4_o_ts", "nvfp4_fc1_ts", "nvfp4_fc2_ts"};
+    // The block launches pass a projection's table and the layer index into
+    // it; FP16 / W8 / packed W4 keep both zero.
+    uint32_t nvfp4_table_addr(size_t role) const {
+        return nvfp4_tensor_scales_.empty() ? 0 : addr(0, kNvfp4TableNames[role]);
+    }
+    uint16_t nvfp4_layer_id(int64_t layer_idx) const {
+        return nvfp4_tensor_scales_.empty() ? 0 : static_cast<uint16_t>(layer_idx);
+    }
+    // Persistent preload of one table: its manifest record, then the broadcast.
+    void preload_nvfp4_table(size_t role, uint32_t destination) {
+        TORCH_CHECK(!pipeline_dispatch_active(),
+                    "Qwen3-VL NVFP4 Vision does not admit pipeline dispatch");
+        const at::Tensor& table = nvfp4_tensor_scales_.at(role);
+        const int64_t elements = table.numel();
+        consume_manifest_route(
+            FmbRouteFamily::MUTABLE_DMA, QWEN3VL_NVFP4_SCALE_PRELOAD_SITE,
+            static_cast<int64_t>(Qwen3VLVisionMutableDmaRoute::NVFP4_SCALE_DDR_TO_SPM),
+            static_cast<int64_t>(role),
+            {static_cast<int64_t>(role), elements, 2 * elements});
+        rpu_launch_ddr_broadcast_spm_dma(
+            reinterpret_cast<c10::Half*>(table.data_ptr<float>()),
+            elements * 2, destination, num_cores());
+    }
 
     // 2D RoPE state
     at::Tensor freq_cos_;
@@ -5864,6 +6102,9 @@ private:
     // image shape): a Qwen3-VL 2B handle has 3 deepstack layers, so 128 admits
     // ~42 distinct image resolutions on one handle.
     //
+    // Measured 2026-08-10 on the dev host (instrumented distinct-key high-water):
+    // qwen3_vl 2b single+dual image reaches 6 (3 layers x 2 shapes), gr00t
+    // 1img+2img also 6, with pooler_merged_ddr_slots_ at 2.
     static constexpr size_t kMaxSlotShapes = 128;
     rpu::BoundedShapeMap<std::pair<int64_t, int64_t>, at::Tensor, rpu::PairHash>
         deepstack_ddr_slots_{kMaxSlotShapes, rpu::ShapeMapPolicy::Reject,
@@ -6026,6 +6267,75 @@ void rpu_qwen3vl_vision_set_weights_w8a16(
         eps, deepstack_visual_indexes,
         q_scale_list, k_scale_list, v_scale_list, o_scale_list,
         fc1_scale_list, fc2_scale_list);
+}
+
+// Packed W4A16 variant: the six block projections are G32 pgrp-packed uint8 and
+// the scale lists carry their controller-striped 2D payloads. A separate op so the
+// mode is declared, never inferred from tensor dtypes.
+void rpu_qwen3vl_vision_set_weights_w4a16(
+    int64_t handle,
+    at::TensorList q_w_list, at::TensorList k_w_list,
+    at::TensorList v_w_list, at::TensorList o_w_list,
+    at::TensorList fc1_w_list, at::TensorList fc2_w_list,
+    at::TensorList ln1_w_list, at::TensorList ln1_b_list,
+    at::TensorList ln2_w_list, at::TensorList ln2_b_list,
+    at::TensorList q_b_list, at::TensorList k_b_list,
+    at::TensorList v_b_list, at::TensorList o_b_list,
+    at::TensorList fc1_b_list, at::TensorList fc2_b_list,
+    int64_t num_heads, int64_t head_dim,
+    int64_t hidden_size, int64_t intermediate_size,
+    double eps,
+    at::IntArrayRef deepstack_visual_indexes,
+    at::TensorList q_scale_list, at::TensorList k_scale_list,
+    at::TensorList v_scale_list, at::TensorList o_scale_list,
+    at::TensorList fc1_scale_list, at::TensorList fc2_scale_list)
+{
+    Qwen3VLVisionRegistry::get(handle, "rpu_qwen3vl_vision")->set_weights(
+        q_w_list, k_w_list, v_w_list, o_w_list,
+        fc1_w_list, fc2_w_list,
+        ln1_w_list, ln1_b_list, ln2_w_list, ln2_b_list,
+        q_b_list, k_b_list, v_b_list, o_b_list,
+        fc1_b_list, fc2_b_list,
+        num_heads, head_dim, hidden_size, intermediate_size,
+        eps, deepstack_visual_indexes,
+        q_scale_list, k_scale_list, v_scale_list, o_scale_list,
+        fc1_scale_list, fc2_scale_list, /*packed_w4=*/true);
+}
+
+// NVFP4 variant: the six block projections are NVFP4-swizzled uint8, the scale
+// lists carry their striped uint8 block scales, and `nvfp4_tensor_scales` the
+// six FP32 per-layer tensor-scale tables (q, k, v, o, fc1, fc2). Declared mode.
+void rpu_qwen3vl_vision_set_weights_nvfp4(
+    int64_t handle,
+    at::TensorList q_w_list, at::TensorList k_w_list,
+    at::TensorList v_w_list, at::TensorList o_w_list,
+    at::TensorList fc1_w_list, at::TensorList fc2_w_list,
+    at::TensorList ln1_w_list, at::TensorList ln1_b_list,
+    at::TensorList ln2_w_list, at::TensorList ln2_b_list,
+    at::TensorList q_b_list, at::TensorList k_b_list,
+    at::TensorList v_b_list, at::TensorList o_b_list,
+    at::TensorList fc1_b_list, at::TensorList fc2_b_list,
+    int64_t num_heads, int64_t head_dim,
+    int64_t hidden_size, int64_t intermediate_size,
+    double eps,
+    at::IntArrayRef deepstack_visual_indexes,
+    at::TensorList q_scale_list, at::TensorList k_scale_list,
+    at::TensorList v_scale_list, at::TensorList o_scale_list,
+    at::TensorList fc1_scale_list, at::TensorList fc2_scale_list,
+    at::TensorList nvfp4_tensor_scales)
+{
+    TORCH_CHECK(nvfp4_tensor_scales.size() == 6,
+                "qwen3vl_vision_set_weights_nvfp4: requires six tensor-scale tables");
+    Qwen3VLVisionRegistry::get(handle, "rpu_qwen3vl_vision")->set_weights(
+        q_w_list, k_w_list, v_w_list, o_w_list,
+        fc1_w_list, fc2_w_list,
+        ln1_w_list, ln1_b_list, ln2_w_list, ln2_b_list,
+        q_b_list, k_b_list, v_b_list, o_b_list,
+        fc1_b_list, fc2_b_list,
+        num_heads, head_dim, hidden_size, intermediate_size,
+        eps, deepstack_visual_indexes,
+        q_scale_list, k_scale_list, v_scale_list, o_scale_list,
+        fc1_scale_list, fc2_scale_list, /*packed_w4=*/true, nvfp4_tensor_scales);
 }
 
 void rpu_qwen3vl_vision_set_rope(

@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from test_qwen35_core_profiles import _config
+from test_qwen35_dense27_profiles import config27
 from rpu_backend.adapters.qwen3_5 import Qwen3_5Adapter, _rpu_qwen3_5_forward
 from rpu_backend.runtime import UnsupportedModelError
 from rpu_backend.adapters.qwen3_5.cores import validate_core_profile
@@ -16,7 +17,7 @@ from rpu_backend.quant.convert_qwen3_5 import _quant_config
 
 
 def _recipe(size=2):
-    config = _config(size)
+    config = config27() if size == 27 else _config(size)
     config.quant_config = _quant_config(
         is_full_from_layer_types(config.text_config.layer_types), None, 32,
         profile="w4_mlp_only")
@@ -32,6 +33,17 @@ def test_named_mlp_recipe_admits_exact_2b_metadata_and_runtime(monkeypatch):
     assert metadata == before
     assert validate_core_profile(config).num_cores == 8
     Qwen3_5Adapter.preflight_execution(config, {"model": {"num_cores": 8}})
+
+
+@pytest.mark.parametrize("cores", [4, 6, 8])
+def test_named_mlp_recipe_admits_official_27b_geometry(cores):
+    config = _recipe(27)
+    metadata = config.to_dict()
+    assert validate_mlp_only_text_profile(metadata)
+    from rpu_backend.adapters.qwen3_5.quant_scope import validate_modern_27b_profile
+    assert not validate_modern_27b_profile(config, allow_fp16=True)
+    topology = validate_core_profile(config, {"model": {"num_cores": cores}})
+    assert topology.num_cores == cores
 
 
 def test_mlp_w4_attention_gdn_w8_keeps_generic_v2_text_admission(monkeypatch):
@@ -59,9 +71,8 @@ def test_named_mlp_recipe_does_not_expand_converter_scope_into_other_sizes(size)
 
 
 @pytest.mark.parametrize("cores", [4, 6])
-def test_named_mlp_recipe_rejects_reduced_topology(cores):
-    with pytest.raises(ValueError, match="TP8"):
-        validate_core_profile(_recipe(), {"model": {"num_cores": cores}})
+def test_named_mlp_recipe_accepts_reduced_topology(cores):
+    assert validate_core_profile(_recipe(), {"model": {"num_cores": cores}}).num_cores == cores
 
 
 @pytest.mark.parametrize("mutation", ["scope", "group", "geometry", "semantics"])

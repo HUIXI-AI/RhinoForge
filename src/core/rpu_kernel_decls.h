@@ -158,35 +158,47 @@ at::Tensor rpu_linear_with_core_count(
     int64_t partition, int64_t num_cores);
 
 // Explicit cold accumulator for model-owned eager output projections.
+// `gelu_erf` applies exact-ERF GELU (BASE SPM kernel) to the col-partition
+// output on the cores, inside the same submission, before the write-back.
 at::Tensor rpu_linear_with_accumulation(
     const at::Tensor& input, const at::Tensor& weight,
     const c10::optional<at::Tensor>& bias_opt,
     int64_t partition, int64_t num_cores, bool linear_acc32,
-    const c10::optional<at::Tensor>& scale_opt);
+    const c10::optional<at::Tensor>& scale_opt,
+    int64_t logical_out_features = -1, bool gelu_erf = false);
+
+// Dilation-1 1-D convolution over a compact [L, C] activation, folding the
+// im2col into the GEMM kernel's row addressing. `weight` must be TAP-MAJOR
+// (`k = t*C + c`) col-swizzled FP16 — see LinearConv1dSlab below.
+at::Tensor rpu_conv1d_slab_with_accumulation(
+    const at::Tensor& input, const at::Tensor& weight,
+    const c10::optional<at::Tensor>& bias_opt,
+    int64_t taps, int64_t dilation, int64_t num_cores);
 
 at::Tensor rpu_tts_codec_conv_pair(
     const at::Tensor& input, const at::Tensor& first_weight, const at::Tensor& affine,
     const at::Tensor& second_weight, const at::Tensor& second_bias,
-    int64_t dilation, int64_t channels);
+    int64_t dilation, int64_t channels, int64_t num_cores);
 at::Tensor rpu_tts_codec_conv1d_spm(
     const at::Tensor& input, const at::Tensor& weight,
     const c10::optional<at::Tensor>& bias,
-    int64_t kernel, int64_t dilation, int64_t out_channels);
+    int64_t kernel, int64_t dilation, int64_t out_channels, int64_t num_cores);
 at::Tensor rpu_tts_codec_residual_unit(
     const at::Tensor& input, const at::Tensor& first_weight,
     const at::Tensor& affine, const at::Tensor& second_weight,
-    int64_t dilation, int64_t channels);
+    int64_t dilation, int64_t channels, int64_t num_cores);
 at::Tensor rpu_tts_codec_residual_unit_complete(
     const at::Tensor& input, const at::Tensor& first_weight,
     const at::Tensor& affine, const at::Tensor& second_weight,
-    int64_t dilation, int64_t channels);
+    int64_t dilation, int64_t channels, int64_t num_cores);
 at::Tensor rpu_tts_codec_residual_unit_padded_rows(
     const at::Tensor& input, const at::Tensor& first_weight, const at::Tensor& affine,
-    const at::Tensor& second_weight, int64_t dilation, int64_t channels);
+    const at::Tensor& second_weight, int64_t dilation, int64_t channels,
+    int64_t num_cores);
 at::Tensor rpu_tts_codec_residual_unit_rows(
     const at::Tensor& input, const at::Tensor& first_weight,
     const at::Tensor& affine, const at::Tensor& second_weight,
-    int64_t dilation, int64_t channels);
+    int64_t dilation, int64_t channels, int64_t num_cores);
 at::Tensor rpu_tts_codec_snake(
     const at::Tensor& input, const at::Tensor& affine, int64_t channels);
 at::Tensor rpu_tts_codec_convnext_block(
@@ -194,25 +206,82 @@ at::Tensor rpu_tts_codec_convnext_block(
     const at::Tensor& depthwise_bias, const at::Tensor& norm_weight,
     const at::Tensor& norm_bias, const at::Tensor& first_weight,
     const at::Tensor& first_bias, const at::Tensor& second_weight,
-    const at::Tensor& second_bias, const at::Tensor& gamma, double eps);
+    const at::Tensor& second_bias, const at::Tensor& gamma, double eps,
+    int64_t num_cores);
 at::Tensor rpu_tts_codec_conv1d(
     const at::Tensor& input, const at::Tensor& weight,
     const c10::optional<at::Tensor>& bias,
-    int64_t kernel, int64_t dilation, int64_t out_channels);
+    int64_t kernel, int64_t dilation, int64_t out_channels, int64_t num_cores);
 at::Tensor rpu_tts_codec_conv_transpose1d_device_post(
     const at::Tensor& input, const at::Tensor& weight, const c10::optional<at::Tensor>& bias,
-    int64_t channels, int64_t kernel, int64_t stride);
+    int64_t channels, int64_t kernel, int64_t stride, int64_t num_cores);
 at::Tensor rpu_tts_codec_transpose_overlap(
     const at::Tensor& projected, const c10::optional<at::Tensor>& bias,
     int64_t channels, int64_t kernel, int64_t stride);
 at::Tensor rpu_tts_codec_conv_transpose1d(
     const at::Tensor& input, const at::Tensor& weight,
     const c10::optional<at::Tensor>& bias,
-    int64_t out_channels, int64_t kernel, int64_t stride);
+    int64_t out_channels, int64_t kernel, int64_t stride, int64_t num_cores);
 
 void rpu_linear_into(const at::Tensor &input, const at::Tensor &weight,
                      const c10::optional<at::Tensor> &bias_opt,
                      at::Tensor &output, bool linear_acc32 = true);
+
+// Current W8A8 ABI only. Weights are already TP-swizzled signed INT8 [N,K]
+// with per-channel FP16 [N] scales; dimensions describe physical padded storage.
+// Eager entry quantizes FP16 activations on device and includes row reduction.
+at::Tensor rpu_linear_w8a8(const at::Tensor& input, const at::Tensor& weight,
+    const at::Tensor& scale, const c10::optional<at::Tensor>& bias,
+    int64_t partition = 1, int64_t num_cores = 8);
+void rpu_launch_linear_w8a8_spm_kernel(
+    uint32_t input_int8_spm, uint32_t row_scale_spm,
+    const at::Tensor& weight, const at::Tensor& scale, uint32_t output_spm,
+    int64_t m, int64_t n, int64_t k, int partition, int num_cores,
+    uint32_t bias_spm = 0);
+// Finite FP16 inputs only. Outputs compact signed INT8 and padded FP16 SX.
+void rpu_launch_dynamic_quantize_w8a8_spm_kernel(
+    uint32_t input_spm, uint32_t output_int8_spm, uint32_t row_scale_spm,
+    int64_t m, int64_t local_k, int num_cores);
+// Exact Qwen3 M256 (A16/A8) or M512 (A8)/H5120/I25600/TP8 Up. Gate is SiLU FP16 and
+// is read then overwritten by the rounded Up * Gate result. No full Up root.
+void rpu_launch_qwen3_up_mul_w8a16_spm_kernel(
+    uint32_t input_spm, const at::Tensor& weight, const at::Tensor& scale,
+    uint32_t gate_spm, int64_t rows);
+void rpu_launch_qwen3_up_mul_w8a8_spm_kernel(
+    uint32_t input_spm, uint32_t row_scale_spm,
+    const at::Tensor& weight, const at::Tensor& scale,
+    uint32_t gate_spm, int64_t rows);
+void rpu_launch_mul_quantize_w8a8_spm_kernel(
+    uint32_t gate_spm, uint32_t up_spm, uint32_t output_int8_spm,
+    uint32_t row_scale_spm, int64_t rows, int64_t local_k, int num_cores);
+// Exact M128/H5120/TP8, epsilon 1e-6. Original V32_GRID8 FP16 RMSNorm
+// retirement followed by compact A8. X/Q/SX/gamma are disjoint, aligned SPM
+// spans; finite FP16 X and gamma are preserved. No intermediate FP16 output.
+void rpu_launch_qwen3_c192_all_reduce_residual_inplace_kernel(
+    uint32_t partial_spm, uint32_t residual_output_spm, int64_t rows);
+void rpu_launch_qwen3_c512_all_reduce_residual_local_spm_kernel(
+    uint32_t partial_spm, uint32_t compact_residual_spm, uint32_t output_spm);
+
+void rpu_launch_rms_norm_quantize_w8a8_spm_kernel(
+    uint32_t input_spm, uint32_t output_int8_spm, uint32_t row_scale_spm,
+    uint32_t gamma_spm, int64_t m, double eps, int num_cores);
+// H1152 affine LayerNorm with the main FP16 arithmetic, followed by the same
+// quantization. All five operands are disjoint SPM ranges; M is 1..768.
+void rpu_launch_layer_norm_quantize_w8a8_spm_kernel(
+    uint32_t input_spm, uint32_t output_int8_spm, uint32_t row_scale_spm,
+    uint32_t gamma_spm, uint32_t beta_spm,
+    int64_t m, double eps, int num_cores);
+// H544 local rows: original TANH GELU FP16 retirement followed by compact A8.
+// Input, Q and padded SX must be disjoint; the producer input is preserved.
+void rpu_launch_gelu_tanh_quantize_w8a8_spm_kernel(
+    uint32_t input_spm, uint32_t output_int8_spm, uint32_t row_scale_spm,
+    int64_t m, int num_cores);
+// Original owner reduce/residual/LayerNorm followed by compact Q/SX gather.
+// Q may reuse the exact partial base after reduction; compact raw is preserved.
+void rpu_launch_pi05_vision_owner_layernorm_quantize_w8a8_spm_kernel(
+    uint32_t partial, uint32_t residual, uint32_t compact_raw,
+    uint32_t output_int8, uint32_t row_scale, uint32_t gamma, uint32_t beta,
+    double eps, int64_t rows);
 
 // Eager W8A16 projections: TP8 col-swizzled INT8 weight, natural FP16 [N] scale.
 // The returning form owns fresh output storage; neither form may be captured.
@@ -227,7 +296,17 @@ void rpu_linear_w8a16_into(const at::Tensor& input, const at::Tensor& weight,
 // Returns fresh output and rejects graph capture, matching the W8 DDR boundary.
 at::Tensor rpu_linear_w4a16(const at::Tensor& input, const at::Tensor& weight,
                           const at::Tensor& scale,
-                          const c10::optional<at::Tensor>& bias);
+                          const c10::optional<at::Tensor>& bias,
+                          int64_t logical_out_features = -1);
+
+// A 1-D convolution the DDR linear launcher performs over a compact activation.
+// See the `conv_slab` paragraph on rpu_launch_linear_ddr_kernel below for the
+// address identity that makes this a register change rather than a new kernel.
+struct LinearConv1dSlab {
+  int64_t channels;  // C: halves per compact row, and that row's pitch
+  int64_t taps;      // convolution width; only 7 is admitted today
+  int64_t dilation;  // only 1 is admitted (see the launcher's refusal)
+};
 
 // `live_dst_base` (optional): when non-null, the col-partition write-back DMAs
 // bind their DDR destination through the caller-owned live base instead of
@@ -245,6 +324,29 @@ at::Tensor rpu_linear_w4a16(const at::Tensor& input, const at::Tensor& weight,
 // travels by DMA, which sync-only does not rebind, so a `set_weights` that
 // swaps the bias tensor was silently ignored. Null = the historical fixed
 // behavior (only correct for a stable `bias`).
+// `conv_slab` (optional): run a 1-D convolution over a COMPACT activation
+// instead of a GEMM over a materialised im2col patch matrix. `input` is then
+// `[L, C]` (one row per position, channels contiguous) rather than `[M, K]`,
+// and `output` is `[M, N]` with `M = L - (taps-1)*dilation`:
+//
+//   out[m, n] = sum_t sum_c weight[n, t*C + c] * input[m + t*dilation, c]
+//
+// i.e. the weight's K axis must be TAP-MAJOR (`k = t*C + c`), which is the
+// transpose of PyTorch's `Conv1d.weight.flatten(1)` channel-major layout — see
+// `install_rpu_residual_convolutions` for the `permute(0, 2, 1)` that produces
+// it. The caller uploads L*C halves instead of M*taps*C: for the TTS codec
+// residual stack that is 49.6 MB per request instead of 347 MB.
+//
+// Why this needs no new kernel for dilation 1: parallel_linear reads its A
+// operand at `input_spm_addr + m*input_m_byte_step + k*a_dwidth`, and both
+// pitches are RUNTIME registers (16/17 and 18/19). Staging the compact slab and
+// setting `input_m_byte_step = C*a_dwidth` while `local_k` stays `taps*C` makes
+// that address
+//     m*C*2 + (t*C + c)*2 = (m + t)*C*2 + c*2
+// which is exactly slab row `m+t`, column `c` — the convolution's own gather,
+// performed by the address arithmetic the kernel already does. Dilation > 1
+// would need a per-tap stride of `t*(d-1)*C*2` that no register expresses, so
+// it is REFUSED here rather than silently computing a dilation-1 answer.
 void rpu_launch_linear_ddr_kernel(const at::Tensor &input, const at::Tensor &weight,
                                   at::Tensor &output, const at::Tensor &bias,
                                   bool has_bias, int partition,
@@ -253,7 +355,9 @@ void rpu_launch_linear_ddr_kernel(const at::Tensor &input, const at::Tensor &wei
                                   const uint64_t *live_bias_base = nullptr,
                                   int num_cores = 8,
                                   const at::Tensor& weight_scale = {},
-                                  c10::optional<bool> linear_acc32 = c10::nullopt);
+                                  c10::optional<bool> linear_acc32 = c10::nullopt,
+                                  const LinearConv1dSlab *conv_slab = nullptr,
+                                  GeluMode epilogue_gelu = GeluMode::NONE);
 
 // =============================================================================
 // SDPA (Scaled Dot Product Attention) Kernels
@@ -427,6 +531,21 @@ void rpu_launch_partial_mrope_spm_kernel(
     const at::Tensor& cos,
     const at::Tensor& sin,
     int64_t pos_offset,
+    int64_t seq_len,
+    int64_t local_heads,
+    int64_t head_dim,
+    int64_t rotary_dim,
+    int num_cores);
+
+// SPM-table variant (is_freq_in_ddr = 0): token t reads row t of the
+// [seq_len, rotary_dim/2] FP16 cos/sin rows at the local SPM byte addresses
+// cos_spm_addr/sin_spm_addr, which the caller staged from the tables' rows
+// [position, position + seq_len). No DDR operand.
+void rpu_launch_partial_mrope_spm_table_kernel(
+    uint32_t x_spm_addr,
+    uint32_t y_spm_addr,
+    uint32_t cos_spm_addr,
+    uint32_t sin_spm_addr,
     int64_t seq_len,
     int64_t local_heads,
     int64_t head_dim,
@@ -640,6 +759,35 @@ void rpu_launch_permute4d_0213_spm_kernel(
 void rpu_launch_fla_conv1d_spm_kernel(uint32_t cs_spm_addr, uint32_t x_spm_addr,
                                       c10::Half* weight_ddr, int64_t B,
                                       int64_t local_d, int64_t Kc, int num_cores);
+
+// The complete register image and grid of one launch. A launcher writes exactly
+// these registers after reset_regs, so a retained Graph can be moved to other
+// arguments by rewriting them, without a re-emission.
+struct KernelRegisterImage {
+    std::array<std::pair<uint32_t, uint16_t>, 24> regs{};
+    size_t count = 0;
+    std::array<uint16_t, 3> grid{};
+    void set(uint32_t reg, uint16_t value) { regs.at(count++) = {reg, value}; }
+};
+
+// Register image of rpu_launch_fla_conv1d_prefill_noinplace_spm_kernel for a
+// weight already resolved to its device address; checks its geometry the same way.
+KernelRegisterImage fla_conv1d_prefill_noinplace_registers(
+    uint32_t pad_spm_addr, uint32_t out_spm_addr, uint32_t cs_out_spm_addr,
+    uint64_t weight_dev_addr, int64_t B, int64_t local_d, int64_t Kc, int64_t L);
+
+// The same kernel over the leading `channels` columns of a pitched
+// pad=[cs_init(3);x(L)] [3+L,pitch]. d_v16 sets the input, y and cs_out row step
+// together while the DDR weight row step is its own register, so y[L,pitch] and
+// cs_out[3,pitch] keep the pitch and the columns past `channels` stay unwritten.
+// The weight is [core,Kc,channels]. This is a register change, not another kernel.
+KernelRegisterImage fla_conv1d_prefill_noinplace_pitched_registers(
+    uint32_t pad_spm_addr, uint32_t out_spm_addr, uint32_t cs_out_spm_addr,
+    uint64_t weight_dev_addr, int64_t pitch, int64_t channels, int64_t Kc, int64_t L);
+void rpu_launch_fla_conv1d_prefill_noinplace_pitched_spm_kernel(
+    uint32_t pad_spm_addr, uint32_t out_spm_addr, uint32_t cs_out_spm_addr,
+    c10::Half* weight_ddr, int64_t pitch, int64_t channels, int64_t Kc, int64_t L,
+    int num_cores);
 
 // Qwen3.5 GDN prefill: causal dwconv1d over a chunk. The input
 // pad=[cs_init(3);x(L)] [B,3+L,D] remains intact; y[B,L,D] and cs_out[B,3,D]
@@ -964,6 +1112,7 @@ void rpu_launch_grouped_parallel_linear_spm_kernel(
     int64_t group,
     bool is_col_parallel,
     int num_cores,
+    int64_t total_m,
     int64_t weight_dtype_mode = -1,
     bool linear_acc32 = false,
     bool expert_parallel_y4 = false);
@@ -1034,9 +1183,10 @@ at::Tensor rpu_grouped_parallel_linear_test(
     int64_t local_k, bool is_col_parallel, int64_t num_cores,
     int64_t weight_dtype_mode, bool linear_acc32);
 
-// Returns {N_TILE, M_TILE}, using total routed rows for generated selection.
-std::array<int64_t, 2> rpu_select_grouped_parallel_linear_uint4_tile(
-    int64_t m_total, int64_t num_experts, int64_t local_n, int64_t local_k);
+// Returns {N_TILE, M_TILE, K_TILE} from the current grouped candidate catalog.
+std::array<int64_t, 3> rpu_select_grouped_parallel_linear_uint4_tile(
+    int64_t m_total, int64_t num_experts, int64_t local_n, int64_t local_k,
+    int64_t group_size = 32, bool force_acc32 = false);
 
 void rpu_launch_grouped_parallel_linear_uint4_spm_kernel(
     uint32_t input_spm_addr,
@@ -1051,7 +1201,7 @@ void rpu_launch_grouped_parallel_linear_uint4_spm_kernel(
     bool is_col_parallel,
     int num_cores,
     int64_t group_size,
-    int64_t m_total);
+    int64_t m_total, bool force_acc32 = false);
 
 // Exact E32/T51/Tp64/K4 selector mask [E,Tp] -> raw U16 expert/token
 // IDs [204] and counts [32]. Absolute core-0 SPM byte addresses, disjoint
@@ -1100,6 +1250,25 @@ void rpu_launch_moe_topk_by_kvsort_fp16_spm_kernel(
     int64_t n,
     int64_t c,
     int64_t k,
+    bool descending,
+    int num_cores = 1);
+
+// Complete one-row KVSort using the existing main-library kvsort_dir_v1 ABI.
+// The returned pair is {input_elements, output_elements} for EACH key/value
+// buffer. Values are opaque raw 16-bit payloads; keys are finite FP16 values.
+// All four buffers must be distinct, 32-byte-aligned core-0 SPM intervals.
+// The launcher fills input padding with the sort-direction sentinel and zero
+// values; only the first c output elements are logical results. Internal VLM
+// padding does not increase single-warp SPM capacity (6144 -> {6144,6144}).
+// Multi-warp sort uses the larger output extent as merge workspace.
+std::pair<int64_t, int64_t> rpu_moe_kvsort_fp16_spm_sizes(int64_t c);
+
+void rpu_launch_moe_kvsort_fp16_spm_kernel(
+    uint32_t input_key_spm_addr,
+    uint32_t input_value_spm_addr,
+    uint32_t output_key_spm_addr,
+    uint32_t output_value_spm_addr,
+    int64_t c,
     bool descending,
     int num_cores = 1);
 
@@ -1160,9 +1329,13 @@ void rpu_launch_scatternd_add_u16_fp16_spm_kernel(
     int num_cores = 1);
 // Pi0.5 H1024 FP16 RMSNorm followed by separately-rounded FP16 shift.
 // All addresses are absolute per-core SPM; supports M1..64 and 1 or 8 cores.
+// `denoise_siblings` lets exact M50 use the optional row-strided warp8 payload
+// and M9..16 the optional row-pair payload when loaded (same output bytes);
+// the default keeps the original payload.
 void rpu_launch_pi05_adarms_norm_shift_spm_kernel(
     uint32_t input_spm, uint32_t output_spm, uint32_t scale_spm,
-    uint32_t shift_spm, int64_t rows, double eps, int cores = 8);
+    uint32_t shift_spm, int64_t rows, double eps, int cores = 8,
+    bool denoise_siblings = false);
 
 // Exact LingBot2 H768/M51/TP8/eps1e-6 norm-shift. The cold owner may select
 // the optional bit-diagonal shuffle; the default retains the original payload.
@@ -1246,27 +1419,97 @@ void rpu_launch_pi05_gate_up_geglu_w8a16_spm_kernel(
     const at::Tensor& gate_scale,
     const at::Tensor& up_scale);
 
-// Exact Pi Denoise M50/H1024/I4096, TP8 NVFP4 striped-v2. The historical
-// launcher retains the ACC32 producer; ACC16 has a separate payload identity.
+// Pi0.5 action horizon. H50 is M50 with a P64 physical KV insert, H10 is M10
+// with P16. Defined in rpu_pi05_denoise_step_model.cpp; the Action Linear
+// launchers below check the same set because each reads M from a register.
+bool pi05_action_rows_admitted(int64_t rows);
+int64_t pi05_kv_insert_rows(int64_t rows);
+// True when the ACC16 NVFP4 GeGLU at `rows` uses the double-buffered M <= 64
+// payload instead of the M320 one. Planning and dispatch both ask this.
+bool pi05_nvfp4_acc16_geglu_double_buffered(int64_t rows);
+// True when a Pi ACC16 NVFP4 v2 projection at `rows` that selects the M320N64
+// tile uses its double-buffered M <= 64 sibling instead.
+bool pi05_nvfp4_acc16_linear_double_buffered(int64_t rows);
+// True when the cold expansion REF also carries the tile-contiguous-scale
+// sibling, so installing the Q/O/Down tile-scale companions pays.
+bool pi05_nvfp4_acc16_linear_tile_scale();
+// The same for the double-buffered GeGLU and its Gate/Up companions. When it
+// holds, the double-buffered GeGLU always takes the tile-scale payload.
+bool pi05_nvfp4_acc16_geglu_tile_scale();
+// True when the W8A16 KV1 pair owner at `rows` uses its double-buffered
+// M <= 64 sibling. Planning and dispatch both ask this.
+bool pi05_kv1_pair_owner_w8_double_buffered(int64_t rows);
+// True when the KV1 direct cache at `rows` uses its load-overlapped sibling,
+// which serves both horizons. Planning and dispatch both ask this.
+bool pi05_kv1_direct_cache_overlapped(int64_t rows);
+// True when it uses the slot-rotated writer instead (pi05_split_kv_rotated(rows)),
+// the overlapped stream with a param25 skip mask. Planning and dispatch both
+// ask this before pi05_kv1_direct_cache_overlapped.
+bool pi05_kv1_direct_cache_rotated(int64_t rows);
+// True when the rotated writer at `rows` is the fused direct cache + query
+// RoPE pack payload, which also packs the split-KV query rows when the layer's
+// launch passes them (rpu_launch_pi05_kv1_direct_cache_m50d256p64_kernel's
+// `q_pack`). At most 16 rows it replaces the overlapped writer, with mask 0.
+// Planning and dispatch both ask this before pi05_kv1_direct_cache_rotated.
+bool pi05_kv1_direct_cache_q_rope_pack(int64_t rows);
+// True when the cold expansion REF has that payload's SPM-RoPE sibling, whose
+// writer reads its cos/sin rows from the pack's SPM rows instead of the DDR
+// tables. Only a launch that packs takes it; the route keeps the fused
+// payload's KernelId, and a launch without a pack keeps the fused payload.
+bool pi05_kv1_direct_cache_spm_rope();
+// True when the cold expansion REF runs the SPM-scale NVFP4 Q projection and
+// the double-buffered W8 KV1 pair owner at `rows` as one launch.
+bool pi05_q_kv1_pair_owner_fused(int64_t rows);
+// True when the cold expansion REF runs the H1024 AdaRMS norm + shift of
+// `rows` (9..16, where that norm runs as the row pair) and the SPM-scale NVFP4
+// Gate/Up/GeGLU that reads its output as one launch (Pi05AdaRmsNormOperands
+// below).
+bool pi05_adarms_geglu_fused(int64_t rows);
+// True when the cold expansion REF provides the Gate/Up split sibling (grid 16,
+// the same registers and bytes) of the SPM-scale NVFP4 GeGLU payload, or with
+// `norm` of the AdaRMS norm one; planning and dispatch both ask this.
+bool pi05_nvfp4_geglu_split(bool norm);
+
+// Exact Pi Denoise H1024/I4096, TP8 NVFP4 striped-v2, `rows` action rows. The
+// historical launcher retains the ACC32 producer; ACC16 has a separate payload
+// identity. `rows` is never defaulted: a defaulted row count lets the planned
+// and the dispatched route disagree (RPU_PLANNER_REJECT:EXACT_MISMATCH).
 void rpu_launch_pi05_denoise_gate_up_geglu_nvfp4_m50_kernel(
     uint32_t input, const at::Tensor& gate_weight, const at::Tensor& up_weight,
     uint32_t output, const at::Tensor& gate_scale, const at::Tensor& up_scale,
-    uint32_t gate_tensor_scale, uint32_t up_tensor_scale, uint16_t layer);
+    uint32_t gate_tensor_scale, uint32_t up_tensor_scale, uint16_t layer,
+    int64_t rows);
 
+// The AdaRMS norm + shift a GeGLU launch applies first: the rows at `input`
+// normalized (eps), times `scale`, plus `shift`, into the GeGLU's input rows;
+// the arithmetic of rpu_launch_pi05_adarms_norm_shift_spm_kernel.
+struct Pi05AdaRmsNormOperands {
+    uint32_t input = 0, scale = 0, shift = 0;
+    double eps = 0;
+};
+
+// `gate_tile_scale`/`up_tile_scale` are the layer's tile-layout companions
+// (rpu_pack_pi05_nvfp4_tile_scale), required when
+// pi05_nvfp4_acc16_geglu_tile_scale() selects that payload and ignored otherwise.
+// `norm` (SPM scales only, pi05_adarms_geglu_fused(rows)) folds the norm that
+// writes `input` into this launch.
 void rpu_launch_pi05_denoise_gate_up_geglu_nvfp4_acc16_m50_kernel(
     uint32_t input, const at::Tensor& gate_weight, const at::Tensor& up_weight,
     uint32_t output, const at::Tensor& gate_scale, const at::Tensor& up_scale,
-    uint32_t gate_tensor_scale, uint32_t up_tensor_scale, uint16_t layer);
+    uint32_t gate_tensor_scale, uint32_t up_tensor_scale, uint16_t layer,
+    int64_t rows, const at::Tensor& gate_tile_scale, const at::Tensor& up_tile_scale,
+    uint32_t gate_spm_scale = 0, uint32_t up_spm_scale = 0,
+    const Pi05AdaRmsNormOperands* norm = nullptr);
 
-void rpu_launch_pi05_denoise_gate_up_geglu_wint4a16_pgrp_m50n64_kernel(
+void rpu_launch_pi05_denoise_gate_up_geglu_w4a16_pgrp_m50n64_kernel(
     uint32_t input_spm_addr, const at::Tensor& gate_weight,
     const at::Tensor& up_weight, uint32_t output_spm_addr,
-    const at::Tensor& gate_scale, const at::Tensor& up_scale);
+    const at::Tensor& gate_scale, const at::Tensor& up_scale, int64_t rows);
 
-void rpu_launch_pi05_denoise_gate_up_geglu_wint4a16_pgrp_m50_kernel(
+void rpu_launch_pi05_denoise_gate_up_geglu_w4a16_pgrp_m50_kernel(
     uint32_t input_spm_addr, const at::Tensor& gate_weight,
     const at::Tensor& up_weight, uint32_t output_spm_addr,
-    const at::Tensor& gate_scale, const at::Tensor& up_scale);
+    const at::Tensor& gate_scale, const at::Tensor& up_scale, int64_t rows);
 
 void rpu_launch_pi05_denoise_gate_up_geglu_w8a16_m50_kernel(
     uint32_t input_spm_addr,
@@ -1274,7 +1517,8 @@ void rpu_launch_pi05_denoise_gate_up_geglu_w8a16_m50_kernel(
     const at::Tensor& up_weight,
     uint32_t output_spm_addr,
     const at::Tensor& gate_scale,
-    const at::Tensor& up_scale);
+    const at::Tensor& up_scale,
+    int64_t rows);
 
 // Exact Pi Prefill P800/C400x2 Gate+Up+GeGLU. One Gate and one Up weight
 // sweep serve two disjoint full SPM inputs; the outputs remain Down-ready.
@@ -1287,6 +1531,11 @@ void rpu_launch_pi05_prefill_gate_up_geglu_weight_outer_w8a16_c400x2_kernel(
     uint32_t output1_spm_addr,
     const at::Tensor& gate_scale,
     const at::Tensor& up_scale, int64_t rows = 400);
+
+// Generic W8A8 tile (no bias, column partition) on num_cores lanes.
+void rpu_launch_linear_w8a8_spm_to_spm_kernel(
+    uint32_t input_spm_addr, const at::Tensor& weight, uint32_t output_spm_addr,
+    const at::Tensor& scale, int64_t M, int64_t N, int64_t K, int num_cores);
 
 // Experimental P800 full-K INT8 GateUp; FP32 scales are exact promotions of
 // the installed FP16 W8 scales. Two independent C400 outputs feed original Down.
@@ -1301,7 +1550,8 @@ void rpu_launch_pi05_prefill_gate_up_geglu_w8a8_split_kernel(
     uint32_t a8, uint32_t row_scale, uint32_t stage,
     const at::Tensor& gate_weight, const at::Tensor& up_weight,
     uint32_t output0, uint32_t output1,
-    const at::Tensor& gate_scale, const at::Tensor& up_scale, int64_t rows = 400);
+    const at::Tensor& gate_scale, const at::Tensor& up_scale, int64_t rows = 400,
+    bool panel512 = false);
 
 // =============================================================================
 // LayerNorm SPM (direct address)
@@ -1563,6 +1813,107 @@ void rpu_launch_sdpa_spm_unified_kernel_v2(
     int64_t cache_batch_offset_elems = 0,
     bool use_16b = false,
     bool qwen3vl_tm160 = false);
+
+// Pi0.5 Action split-KV attention (8 Q heads, one KV head, D256, TP8, 2D mask;
+// rhino-ops rasm/pi05_split_kv_attn). Groups of `group` consecutive cores share
+// the key blocks of one head: pack copies the group's query rows into every
+// member, h*T + t; attention runs core k = core % group over key blocks
+// [k*b + min(k, r), +b + (k < r)) of (b, r) = divmod(blocks, group) and keeps
+// m and l per row; merge combines the group's partials of the core's own head.
+struct Pi05SplitKvPlan {
+    int64_t seq_q = 0, seq_k = 0, group = 0, rows = 0, blocks = 0, width = 0;
+    int64_t tile_m_v16 = 0, tile_k_v16 = 0, grid_x = 0, rows_pad = 0;
+    int64_t merge_rows = 0;
+    int64_t qp_bytes() const;    // packed rows [rows, 256]
+    int64_t part_bytes() const;  // partial output [rows, 256], then m and l
+    int64_t tmp_bytes() const;   // attention scratch
+    int64_t mask_bytes() const;  // one core's slice [rows_pad, 16 * width]
+    int64_t share_bytes() const; // one core's K/V share: width blocks of K, then of V
+};
+// Empty unless all three payloads are loaded and the shape is admitted. Layout
+// and launch both ask this with the same (seq_q, kv_seq_len). The KV cache holds
+// one copy per core of kv_source_heads checkpoint heads; only 1 is admitted.
+std::optional<Pi05SplitKvPlan> pi05_split_kv_attention_plan(
+    int64_t seq_q, int64_t kv_seq_len, int64_t num_q_heads,
+    int64_t kv_source_heads, int64_t head_dim, int num_cores);
+// Writes every core's mask slice into `slot` ([8, rows_pad, 16 * width] FP16
+// on the device): the columns of its key range, values below -30000 clamped
+// to -30000 so a row with no visible key in a range stays finite there and
+// gets merge weight 0, tiled over the group's heads, padding rows zero.
+void pi05_split_kv_prepare_mask(const at::Tensor& attn_mask,
+                                const Pi05SplitKvPlan& plan, at::Tensor& slot);
+// True when the split-KV pack of seq_q unrotated query rows can apply the
+// query RoPE itself (PI05_SPLIT_KV_PACK_Q_ROPE loaded, seq_q <= 127). Layer
+// emission and the launcher both ask this.
+bool pi05_split_kv_rope_pack(int64_t seq_q);
+// True when PI05_FLASH_ATTN_SPLIT_KV_SPM_DP is loaded: the attention can keep
+// each core's K/V blocks in a local SPM share across the denoise bodies.
+bool pi05_split_kv_spm_share();
+// True when seq_q > 16 and the cold expansion REF carries both slot-rotated
+// split-KV attention payloads (core c reads key block b from head slot
+// (c + b - S) mod 8, S the first block of its key range) and their
+// direct-cache writer. The attention over seq_q query rows then takes the
+// rotated payload, which gives the same bytes while every slot of a block
+// holds the same head, and the denoise direct cache of those rows (at most 64)
+// takes the writer. Shorter chunks keep all three published kernels.
+bool pi05_split_kv_rotated(int64_t seq_q);
+// The rotated writer's param25 for one write of cache blocks
+// [first_block, end_block) that `plan` reads back: bit (c - S) mod 8 is clear
+// for every core c whose key range [S, E) holds a written block, every other
+// bit set, so the writer skips only slots no reader of these blocks uses.
+uint16_t pi05_split_kv_rotated_skip_mask(const Pi05SplitKvPlan& plan,
+                                         int64_t first_block, int64_t end_block);
+// A split-KV merge the attention launcher left to the next launch: its plan,
+// its partials and output rows, and whether it is the overlapped rotated
+// sibling (PI05_SPLIT_KV_MERGE_ROT_OV) or the published merge.
+struct Pi05SplitKvMerge {
+    Pi05SplitKvPlan plan;
+    uint32_t part_off = 0, output_off = 0;
+    bool rot_ov = false;
+};
+// With `rope_cos` defined the query rows at q_off are unrotated and the pack
+// applies the partial_mrope RoPE (rotary = head_dim = 256) at logical positions
+// rope_position + t from the FP16 DDR tables rope_cos/rope_sin [rows, 128];
+// q_off keeps the unrotated rows. With rope_rows_off >= 0 instead (rope_cos
+// undefined) the pack reads row t of cos at rope_rows_off + 256 * t and of sin
+// 256 * seq_q bytes further, rows this core's SPM already holds.
+// With share_off >= 0 the attention keeps this core's K/V blocks in the local
+// share at share_off (plan.share_bytes(), 32-byte aligned): it copies blocks
+// [max(S, refetch_block), E) of its range [S, E) from the cache first, and
+// reads blocks [S, refetch_block) from the share, which must still hold them
+// from an earlier launch over the same cache prefix and plan.
+// With q_packed the qp_off rows are already packed (and rotated): the direct
+// cache's fused launch ran the pack, so the launcher skips it, and the RoPE
+// arguments must be absent.
+// With defer_merge the launcher may leave its last launch, the merge, to the
+// O linear that reads the merged rows: when the cold expansion REF carries the
+// merge + O sibling of the merge it would take, it fills *defer_merge, does
+// not enqueue the merge and returns true. The caller must then hand
+// *defer_merge to the next launch, rpu_launch_pi05_nvfp4_v2_kernel.
+bool rpu_launch_pi05_split_kv_attention(
+    const at::Tensor& key, const at::Tensor& value,
+    uint32_t q_off, uint32_t output_off, uint32_t qp_off, uint32_t part_off,
+    uint32_t tmp_off, uint32_t mask_off, const Pi05SplitKvPlan& plan,
+    const at::Tensor& rope_cos = at::Tensor(), const at::Tensor& rope_sin = at::Tensor(),
+    int64_t rope_position = 0, int64_t share_off = -1, int64_t refetch_block = 0,
+    int64_t rope_rows_off = -1, bool q_packed = false,
+    Pi05SplitKvMerge* defer_merge = nullptr);
+// Enqueues the merge as the attention launcher would have.
+void rpu_launch_pi05_split_kv_merge(const Pi05SplitKvMerge& merge);
+// Writes the merge's register image into a merge + O payload: params 0, 1, 2,
+// 3, 6, 8, 9 at 28..34, param35 = its grid, its SCM slots; returns the grid.
+uint16_t pi05_split_kv_write_merge_o_regs(::rhino_lkn::Kernel_t* kernel,
+                                          const Pi05SplitKvMerge& merge);
+// The split-KV query RoPE pack as another payload runs it, with the SPM
+// cos/sin rows at rope_rows_off: the check rejects what the attention
+// launcher's pack would, less its own row admission; the writer checks again, writes the pack's register
+// image (params 0..14) and SCM slot 0 into `kernel` and returns the pack's
+// block count 2 * ceil(T / 16). The fused payload hands its blocks to the
+// pack as (b & 1, b >> 1).
+void pi05_split_kv_check_rope_pack_spm(const Pi05SplitKvPlan& plan, int64_t rope_rows_off);
+uint16_t pi05_split_kv_write_rope_pack_spm_regs(
+    ::rhino_lkn::Kernel_t* kernel, int64_t rope_rows_off, uint32_t q_off, uint32_t qp_off,
+    const Pi05SplitKvPlan& plan);
 
 // Bounded T51 Action tail SDPA; optional payload and typed allocator offsets.
 bool rpu_lingbot2_sdpa_tail_t51_key_rows_supported(int64_t key_rows);
@@ -1921,11 +2272,11 @@ void rpu_launch_wall_base_prefill_o_owner_ring_norm_m224_kernel(
 // SPM-to-SPM Linear Kernels
 // =============================================================================
 
-// Retain a controller-striped W4 pgrp scale at the alignment required by all
-// 8 DDR controllers. W8 and NVFP4 scales are returned unchanged.
+// Retain a controller-striped W4 pgrp scale at the physical-controller and
+// selected execution-stripe alignment. W8 and NVFP4 scales are unchanged.
 at::Tensor rpu_retain_linear_quant_scale(
     const at::Tensor& weight,
-    const at::Tensor& scale);
+    const at::Tensor& scale, int64_t num_cores = 8);
 
 // Exact LingBot2 core-0 Router: FP16 packed [32,768], ACC32 -> FP16 logits,
 // BASE SIGMOID19 and thirteen FP16-one padding rows. Absolute disjoint SPM:
@@ -1935,6 +2286,10 @@ void rpu_launch_lingbot2_router_sigmoid_pad_spm_kernel(
     uint32_t input_spm_addr, const at::Tensor& weight,
     uint32_t logits_spm_addr, uint32_t scores_spm_addr);
 
+// input_m_byte_step overrides the A-operand row pitch, which a plain GEMM
+// leaves at local_k halves. The conv-slab route narrows it to one channel row
+// while local_k stays taps*channels, so window m reads slab row m+t; 0 keeps
+// the plain-GEMM pitch.
 void rpu_launch_linear_spm_to_spm_kernel(
     uint32_t input_spm_addr,
     const at::Tensor &weight,
@@ -1942,7 +2297,8 @@ void rpu_launch_linear_spm_to_spm_kernel(
     int64_t M, int64_t N, int64_t K,
     int partition,
     int num_cores = 8,
-    uint32_t bias_spm_addr = 0);
+    uint32_t bias_spm_addr = 0,
+    uint32_t input_m_byte_step = 0);
 
 // Fixed Wall-OSS Vision block-17 / RTC expert-0 layer-2 down projection: FP16
 // input/weight, FP32 accumulation and BF16 raw 16-bit output. Bias is FP16 and
@@ -2003,13 +2359,73 @@ void rpu_launch_wall_base_nvfp4_kv_parallel_bias_spm_kernel(
     int64_t scale_count, uint16_t layer);
 
 // Pi0.5 Action NVFP4 striped-v2 ABI, per-handle ACC16/ACC32 accumulation.
+// With `merge` (from rpu_launch_pi05_split_kv_attention) the input rows are
+// that merge's output: the SPM-scale payload with one row block runs as the
+// merge + O sibling in one launch; any other payload runs after the merge.
 void rpu_launch_pi05_nvfp4_v2_kernel(
     uint32_t input, const at::Tensor& weight, uint32_t output,
     int64_t rows, int64_t n, int64_t k, int partition, int cores,
     const at::Tensor& scale, uint32_t tensor_scale, uint16_t layer,
-    bool linear_acc32);
+    bool linear_acc32, const at::Tensor& tile_scale = at::Tensor(),
+    uint32_t spm_scale = 0, const Pi05SplitKvMerge* merge = nullptr);
+// Cold byte permutation of an installed striped FP8 scale [K/16, N] of the Pi
+// Q, O, Down, Gate or Up projection into the tile-contiguous layout read by
+// parallel_linear_wnvfp4a16_acc16_m64n64k128_db_tscale and
+// pi05_denoise_gate_up_geglu_nvfp4_acc16_m64n64k128_db_tscale, 4096-byte
+// aligned. Passing it as `tile_scale` makes the double-buffered Linear read it.
+at::Tensor rpu_pack_pi05_nvfp4_tile_scale(
+    const at::Tensor& scale, int64_t n, int64_t k, int partition);
+// Cold DDR source of a per-core SPM scale slab: row c of the FP16-typed
+// [cores, total / 2] result is the concatenation, in order, of core c's
+// 512-byte tiles of every tile-contiguous companion in `tile_scales`, which
+// is what parallel_linear_wnvfp4a16_acc16_m64n64k128_db_sspm and
+// pi05_denoise_gate_up_geglu_nvfp4_acc16_m64n64k128_db_sspm read from their
+// absolute SPM address (`spm_scale`). Only bytes move.
+at::Tensor rpu_pack_pi05_nvfp4_spm_scale(at::TensorList tile_scales, int64_t cores);
 
 // Exact G0.5 K1 Action, 24-layer striped-v2 NVFP4, per-handle ACC16/ACC32.
+// Explicit candidate probes only. Existing model routes retain their selection.
+// Tile-scale owners use [local_N/64, local_K/128,8,512] uint8 storage,
+// obtained once from repack_nvfp4_tile_scales; striped 2D owners are rejected.
+at::Tensor rpu_retain_nvfp4_tile_scale_candidate(const at::Tensor& scale);
+void rpu_launch_pi05_nvfp4_db_candidate_kernel(
+    uint32_t input, const at::Tensor& weight, uint32_t output,
+    int64_t rows, int64_t n, int64_t k, int partition, int cores,
+    const at::Tensor& scale, uint32_t tensor_scale, uint16_t layer,
+    bool tile_contiguous);
+void rpu_launch_pi05_nvfp4_geglu_db_candidate_kernel(
+    uint32_t input, const at::Tensor& gate_weight, const at::Tensor& up_weight,
+    uint32_t output, const at::Tensor& gate_scale, const at::Tensor& up_scale,
+    uint32_t gate_tensor_scale, uint32_t up_tensor_scale, uint16_t layer,
+    bool tile_contiguous);
+// Explicit SSPM candidates: scales are uint8 [8,local_N/64,local_K/128,512].
+// Each call validates all spans, retains the source, records fenced per-core
+// scale DMA, then computes. The caller retains independent SPM slabs through
+// the entire BUILD/REPLAY lifecycle. Only packed weights are DDR registers.
+void rpu_launch_pi05_nvfp4_sspm_candidate_kernel(
+    uint32_t input, const at::Tensor& weight, uint32_t output,
+    int64_t rows, int64_t n, int64_t k, int partition, int cores,
+    const at::Tensor& per_core_scale, uint32_t block_scale,
+    uint32_t tensor_scale, uint16_t layer);
+void rpu_launch_pi05_nvfp4_geglu_sspm_candidate_kernel(
+    uint32_t input, const at::Tensor& gate_weight, const at::Tensor& up_weight,
+    uint32_t output, const at::Tensor& gate_per_core_scale, const at::Tensor& up_per_core_scale,
+    uint32_t gate_block_scale, uint32_t up_block_scale,
+    uint32_t gate_tensor_scale, uint32_t up_tensor_scale, uint16_t layer);
+// Explicit current-ABI Q(NVFP4) + KV1(W8A16) fusion. TP8/M1..64 only.
+// Preloads per-core Q scales and records one grid(6,1,1) compute node.
+void rpu_launch_pi05_q_kv1_sspm_candidate_kernel(
+    uint32_t input, const at::Tensor& query_weight,
+    const at::Tensor& query_per_core_scale, uint32_t query_block_scale,
+    uint32_t query_tensor_scale, uint32_t query_output,
+    const at::Tensor& key_weight, const at::Tensor& key_scale, uint32_t key_output,
+    const at::Tensor& value_weight, const at::Tensor& value_scale, uint32_t value_output,
+    int64_t rows, uint16_t layer);
+void rpu_launch_pi05_kv_owner_db_candidate_kernel(
+    uint32_t input, const at::Tensor& k_weight, const at::Tensor& k_scale,
+    uint32_t k_output, const at::Tensor& v_weight, const at::Tensor& v_scale,
+    uint32_t v_output);
+
 void rpu_launch_g05_nvfp4_v2_kernel(
     uint32_t input, const at::Tensor& weight, uint32_t output,
     int64_t rows, int64_t n, int64_t k, int partition, int cores,
@@ -2313,9 +2729,33 @@ void rpu_launch_pi05_kv1_stripe_w8a16_m592n32_kernel(
     uint32_t output_spm_addr,
     const at::Tensor& compact_scale);
 
+// The layer's Q projection, run by the pair owner below in the same launch:
+// the arguments rpu_launch_pi05_nvfp4_v2_kernel would take for the SPM-scale
+// Linear, which reads the pair owner's input.
+struct Pi05Nvfp4QProjection {
+    uint32_t output;
+    const at::Tensor& weight;
+    const at::Tensor& scale;
+    const at::Tensor& tile_scale;
+    int64_t n;
+    int64_t k;
+    uint32_t tensor_scale;
+    uint16_t layer;
+    uint32_t spm_scale;
+    // Absolute core-0 SPM address of the layer's per-core Q weight run, or 0
+    // for the DDR weight.
+    uint32_t spm_weight = 0;
+};
+
 // Exact pair-owner projection boundary. The four tensors are the installed
 // full replicated TP8 W8A16 owners; both outputs are core-0 absolute SPM byte
-// addresses and receive each core's pair-mapped [50,2,16] compact result.
+// addresses and receive each core's pair-mapped [rows,2,16] compact result.
+// rows is 50, or 10 (H10) for FP16 owners; the kernel reads M from p8.
+// With `q`, the double-buffered W8 owner and that Q projection run as one
+// launch of pi05_denoise_q_kv1_pair_owner_m64_db_sspm (same bytes as the two
+// launches), or of its _wspm sibling when `q->spm_weight` names the layer's
+// SPM-resident Q weight run; pi05_q_kv1_pair_owner_fused() says when the REF
+// carries the sspm one.
 void rpu_launch_pi05_kv1_pair_owner_w8a16_m50n32x2k1024_kernel(
     uint32_t input_spm_addr,
     const at::Tensor& k_full_weight,
@@ -2323,7 +2763,9 @@ void rpu_launch_pi05_kv1_pair_owner_w8a16_m50n32x2k1024_kernel(
     uint32_t k_output_spm_addr,
     const at::Tensor& v_full_weight,
     const at::Tensor& v_full_scale,
-    uint32_t v_output_spm_addr);
+    uint32_t v_output_spm_addr,
+    int64_t rows = 50,
+    const Pi05Nvfp4QProjection* q = nullptr);
 
 // Exact Pi0.5 prefill pair-owner projection. The input and compact outputs are
 // core-0 absolute SPM byte addresses. The installed full K/V W8A16 owners are
@@ -2340,6 +2782,19 @@ void rpu_launch_pi05_prefill_kv1_pair_owner_w8a16_m400n32x2k2048_kernel(
 
 // Exact direct-cache boundary. k/v offsets are typed FMB addr_offset values;
 // the launcher converts each exactly once to a core-0 absolute SPM address.
+// `rotated_skip_mask` is the slot-rotated writer's param25
+// (pi05_split_kv_rotated_skip_mask); nonzero only when that writer runs.
+// With `q_pack` the fused payload (pi05_kv1_direct_cache_q_rope_pack) also
+// runs the split-KV query RoPE pack of the same rows, with SPM cos/sin rows;
+// the layer's split-KV attention then skips its pack (q_packed). The packed
+// rows must stay clear of the compact K/V rows, which the cache body reads
+// while the pack writes.
+struct Pi05SplitKvRopePack {
+    uint32_t q_off;
+    uint32_t qp_off;
+    int64_t rope_rows_off;
+    const Pi05SplitKvPlan& plan;
+};
 void rpu_launch_pi05_kv1_direct_cache_m50d256p64_kernel(
     uint32_t k_compact_spm_offset,
     uint32_t v_compact_spm_offset,
@@ -2348,7 +2803,9 @@ void rpu_launch_pi05_kv1_direct_cache_m50d256p64_kernel(
     const at::Tensor& cos,
     const at::Tensor& sin,
     int64_t logical_rope_position,
-    const KvInsertSegmentPlan& plan);
+    const KvInsertSegmentPlan& plan,
+    uint16_t rotated_skip_mask = 0,
+    const Pi05SplitKvRopePack* q_pack = nullptr);
 
 // Exact Pi0.5 prefill direct-cache boundary. The compact inputs stay typed as
 // FMB offsets across the call; this launcher alone converts each once to its
@@ -2699,20 +3156,22 @@ void rpu_launch_eltwise_binary_Bx1xC_BxNxC_spm_kernel(
     ValuOpType op_type,
     bool is_bopa,
     int num_cores = 8);
-// Convenience wrappers
+// Convenience wrappers. num_cores is the participating core prefix; the
+// default eight keeps every existing call site's launch unchanged.
 void rpu_launch_eltwise_mul_spm_kernel(
     uint32_t a_spm_addr, uint32_t b_spm_addr,
-    uint32_t output_spm_addr, int64_t num_elements);
+    uint32_t output_spm_addr, int64_t num_elements,
+    int num_cores = 8);
 
 void rpu_launch_eltwise_add_spm_kernel(
     uint32_t a_spm_addr, uint32_t b_spm_addr,
     uint32_t output_spm_addr, int64_t num_elements,
-    c10::Half alpha = c10::Half(1.0));
+    c10::Half alpha = c10::Half(1.0), int num_cores = 8);
 
 void rpu_launch_eltwise_sub_spm_kernel(
     uint32_t a_spm_addr, uint32_t b_spm_addr,
     uint32_t output_spm_addr, int64_t num_elements,
-    c10::Half alpha = c10::Half(1.0));
+    c10::Half alpha = c10::Half(1.0), int num_cores = 8);
 
 void rpu_launch_eltwise_div_spm_kernel(
     uint32_t a_spm_addr, uint32_t b_spm_addr,
@@ -3056,7 +3515,8 @@ int64_t rpu_qwen3vl_pooler_spm_z1_prepare(
     int64_t real_len,
     int64_t retained_deepstack_count,
     at::IntArrayRef vision_stage_descriptor,
-    at::IntArrayRef text_stage_descriptor);
+    at::IntArrayRef text_stage_descriptor,
+    bool partial_mrope);
 void rpu_qwen3vl_pooler_spm_z1_unprepare(
     int64_t vision_handle,
     int64_t text_handle,
@@ -3159,10 +3619,12 @@ void rpu_qwen3_5_set_chunk_envelope(int64_t handle, int64_t max_kv_len,
 void rpu_qwen3_5_set_linear_acc32(int64_t handle, bool enabled);
 void rpu_qwen3_5_set_high_precision(int64_t handle, bool enabled);
 void rpu_qwen3_5_set_fast_replay(int64_t handle, bool enabled);
+void rpu_qwen3_5_set_initial_prefill_state_flush_skip(int64_t handle, bool enabled);
 void rpu_qwen3_5_set_retained_prefill_graph(
     int64_t handle, bool enabled);
 void rpu_qwen3_5_enable_action_mode(int64_t handle);
 void rpu_qwen3_5_set_action_chunk_size(int64_t handle, int64_t chunk_size);
+void rpu_qwen3_5_set_action_valid_len(int64_t handle, int64_t valid_len);
 void rpu_qwen3_5_stage_action_chunk_size(
     int64_t handle, int64_t token, int64_t chunk_size);
 void rpu_qwen3_5_enable_execution_reconfigure(int64_t handle);
@@ -3251,6 +3713,9 @@ void rpu_qwen3_5_moe_set_prefill_rope(
 void rpu_qwen3_5_moe_set_valid_prefill_len(int64_t handle, int64_t n);
 void rpu_qwen3_5_moe_set_mrope_position_delta(int64_t handle, int64_t d);
 void rpu_qwen3_5_moe_set_chunk_size_cap(int64_t handle, int64_t cap);
+void rpu_qwen3_5_moe_set_resident_uint4_n32k32_weights(
+    int64_t handle, at::TensorList gate, at::TensorList up, at::TensorList down);
+void rpu_qwen3_5_moe_set_resident_prefill(int64_t handle, bool enabled);
 void rpu_qwen3_5_moe_set_prefill_chunk_size(
     int64_t handle, int64_t chunk_size);
 void rpu_qwen3_5_moe_set_linear_acc32(int64_t handle, bool enabled);
@@ -3341,12 +3806,26 @@ void rpu_causal_decoder_set_lm_head(
     const std::optional<at::Tensor>& lm_head_scale = std::nullopt,
     bool fuse_prefill_last = false,
     int64_t exact_candidates = 0);
-void rpu_causal_decoder_set_tts_predictor_heads(int64_t handle, at::TensorList heads);
-at::Tensor rpu_causal_decoder_tts_predictor_logits(int64_t handle);
+// set_lm_head_bank: install every head of a fixed multi-step sampling loop in
+//                   one transaction (one invalidate_model_state() for the whole
+//                   bank), then select_lm_head picks the step's head without
+//                   invalidating anything — a retained decode Graph stays valid
+//                   and the chosen weight/scale address reaches it as a register
+//                   patch. Every entry shares one [vocab, hidden] shape/dtype
+//                   and must own distinct storage.
+void rpu_causal_decoder_set_lm_head_bank(
+    int64_t handle,
+    at::TensorList lm_head_w,
+    at::TensorList lm_head_scale);
+void rpu_causal_decoder_select_lm_head(int64_t handle, int64_t index);
 void rpu_causal_decoder_clear_lm_head(int64_t handle);
 void rpu_causal_decoder_set_rhinovla_high_precision_fusions(int64_t handle, bool enabled);
 void rpu_causal_decoder_set_rhinovla_high_precision(int64_t handle, bool enabled);
 void rpu_causal_decoder_set_linear_acc32(int64_t handle, bool enabled);
+void rpu_causal_decoder_set_qwen3_c192(int64_t handle, bool enabled);
+void rpu_causal_decoder_set_qwen3_c256(int64_t handle, bool enabled);
+void rpu_causal_decoder_set_qwen3_c512(int64_t handle, bool enabled);
+void rpu_causal_decoder_set_prefill_w8a8(int64_t handle, bool enabled);
 // RhinoVLA text-prefill fast-replay opt-ins (per-model).
 void rpu_causal_decoder_set_lingbot_prefill_mode(int64_t handle, bool folded_rmsnorm, bool kv_only);
 void rpu_causal_decoder_set_lingbot_prefill_kv_pair(int64_t handle, bool enabled);
@@ -3685,6 +4164,9 @@ void rpu_causal_decoder_prepare_persistent_spm(
 // Lightweight owner-local cache identity; invalid/destroyed handles fail closed.
 std::vector<int64_t> rpu_causal_decoder_planner_cache_identity(int64_t handle);
 std::vector<int64_t> rpu_qwen3_5_planner_cache_identity(int64_t handle);
+std::vector<int64_t> rpu_qwen3_5_checked_decode_replay_counters(int64_t handle);
+void rpu_qwen3_5_set_decode_candidate_head(int64_t handle, const at::Tensor& weight,
+                                           const at::Tensor& output);
 std::vector<int64_t> rpu_qwen3_5_vision_planner_cache_identity(int64_t handle);
 std::vector<int64_t> rpu_gemma_planner_cache_identity(int64_t handle);
 std::vector<int64_t> rpu_gemma2_planner_cache_identity(int64_t handle);
@@ -3835,6 +4317,16 @@ at::Tensor rpu_gemma2_forward(
 int64_t rpu_gemma4_create();
 void rpu_gemma4_destroy(int64_t handle);
 void rpu_gemma4_set_chunk_envelope(int64_t handle, int64_t max_kv_len, int64_t chunk);
+// Cold compute budget 4/6/8 before set_weights; topology readback afterwards:
+// (schema, budget, attention, MLP, PLE, physical KV stripes, logical MLP, physical MLP).
+void rpu_gemma4_set_execution_core_count(int64_t handle, int64_t cores);
+std::vector<int64_t> rpu_gemma4_get_execution_topology(int64_t handle);
+// Exact E4B W8A16 / W4A16-G32 scales after set_weights, before the first forward.
+void rpu_gemma4_set_weight_scales(
+    int64_t handle,
+    at::TensorList q_scales, at::TensorList k_scales, at::TensorList v_scales,
+    at::TensorList o_scales, at::TensorList gate_scales, at::TensorList up_scales,
+    at::TensorList down_scales);
 
 void rpu_gemma4_set_weights(
     int64_t handle,
@@ -3915,6 +4407,11 @@ void rpu_adarms_set_weights(
 // Logical RoPE start for the action suffix (-1 = use the physical cache row).
 void rpu_adarms_set_rope_position(int64_t handle, int64_t position);
 
+// Internal composite-driver cold preparation; never executes model layers.
+void rpu_adarms_prepare_graph_mask(
+    int64_t handle, const std::optional<at::Tensor>& attention_mask,
+    int64_t seq_q, int64_t position, bool is_causal);
+
 at::Tensor rpu_adarms_forward(
     int64_t handle,
     const at::Tensor& hidden_states,
@@ -3932,6 +4429,8 @@ std::vector<int64_t> rpu_adarms_resolve_action_stage_domain(
 int64_t rpu_adarms_get_resolved_chunk_size(int64_t handle);
 
 int64_t rpu_gr00t_dit_create();
+void rpu_gr00t_dit_set_execution_core_count(int64_t handle, int64_t cores);
+std::vector<int64_t> rpu_gr00t_dit_get_execution_topology(int64_t handle);
 void rpu_gr00t_dit_prepare_persistent_spm(int64_t handle, int64_t execution_len);
 void rpu_gr00t_dit_prepare_adaln_table(int64_t handle);
 void rpu_gr00t_dit_prepare_time_tables(int64_t handle);
@@ -3941,7 +4440,7 @@ std::tuple<at::Tensor, at::Tensor> rpu_gr00t_precompute_time_glue(
     const at::Tensor& po1_weight, const at::Tensor& po1_bias, const at::Tensor& po1_scale);
 at::Tensor rpu_gr00t_precompute_adaln(
     const at::Tensor& cond, at::TensorList weights,
-    at::TensorList biases, at::TensorList scales);
+    at::TensorList biases, at::TensorList scales, int cores = 8);
 void rpu_gr00t_dit_set_chunk_envelope(int64_t handle, int64_t max_kv_len, int64_t chunk);
 void    rpu_gr00t_dit_destroy(int64_t handle);
 void    rpu_gr00t_dit_set_weights(
@@ -4047,6 +4546,9 @@ int64_t rpu_navdp_create(bool allow_numeric_blocked, bool spm_kv_by_mha);
 void rpu_navdp_set_chunk_envelope(int64_t handle, int64_t max_kv_len, int64_t chunk);
 void    rpu_navdp_destroy(int64_t handle);
 void    rpu_navdp_set_former_mode(int64_t handle, bool former);  // reuse as RGBD former_net (POST-LN/ReLU/non-causal)
+// Cold four-lane owner (NavDP or Former): set the core budget before weights.
+void    rpu_navdp_set_execution_core_count(int64_t handle, int64_t cores);
+std::vector<int64_t> rpu_navdp_get_execution_topology(int64_t handle);
 void    rpu_navdp_set_weights(
     int64_t handle,
     at::TensorList sq_w, at::TensorList sk_w, at::TensorList sv_w, at::TensorList so_w,
@@ -4175,6 +4677,8 @@ at::Tensor rpu_gr00t_spm_z2_pipeline_forward(
     int64_t plan_hash);
 
 int64_t rpu_gr00t_vl_encoder_create();
+void rpu_gr00t_vl_encoder_set_execution_core_count(int64_t handle, int64_t cores);
+std::vector<int64_t> rpu_gr00t_vl_encoder_get_execution_topology(int64_t handle);
 void rpu_gr00t_vl_encoder_prepare_persistent_spm(int64_t handle, int64_t execution_len);
 void rpu_gr00t_vl_encoder_set_chunk_envelope(int64_t handle, int64_t max_kv_len, int64_t chunk);
 void    rpu_gr00t_vl_encoder_destroy(int64_t handle);
@@ -4265,6 +4769,7 @@ at::Tensor rpu_pi05_forward(
 
 int64_t rpu_pi05_denoise_step_create(bool linear_acc32);
 void rpu_pi05_denoise_step_set_execution_core_count(int64_t handle, int64_t cores);
+void rpu_pi05_denoise_step_set_kv_source_heads(int64_t handle, int64_t heads);
 std::vector<int64_t> rpu_pi05_denoise_step_get_execution_topology(int64_t handle);
 void    rpu_pi05_denoise_step_destroy(int64_t handle);
 void rpu_pi05_denoise_step_set_chunk_envelope(int64_t handle, int64_t max_kv_len, int64_t chunk);
@@ -4339,7 +4844,8 @@ void rpu_pi05_denoise_loop_forward(
 // Spec: docs/architecture.md
 // =============================================================================
 
-int64_t rpu_wall_oss_action_step_create();
+int64_t rpu_wall_oss_action_step_create(int64_t num_cores);
+std::vector<int64_t> rpu_wall_oss_action_step_topology(int64_t handle);
 void rpu_wall_oss_action_step_set_linear_acc32(int64_t handle, bool enabled);
 void    rpu_wall_oss_action_step_destroy(int64_t handle);
 void rpu_wall_oss_action_step_set_weight_residency(
@@ -4453,8 +4959,11 @@ int64_t rpu_lingbot_v2_moe_create(
     bool bufonly = false, bool addr = false,
     int64_t schunk = 256 * 127, int64_t rchunk_requested = 0,
     bool dense_soft_router = false, bool fp16_top4 = true,
-    bool routed_only = false, bool down_acc16 = false);
+    bool routed_only = false, bool down_acc16 = false,
+    int64_t num_cores = 8);
 void    rpu_lingbot_v2_moe_destroy(int64_t handle);
+// {num_cores, attn_tp, mlp_tp, lm_head_tp, physical cores} after set_weights.
+std::vector<int64_t> rpu_lingbot_v2_moe_get_execution_topology(int64_t handle);
 
 void rpu_lingbot_v2_moe_set_weights(
     int64_t handle,
@@ -4616,6 +5125,9 @@ at::Tensor rpu_halo_action_expert_step_forward(
 int64_t rpu_hyvla_vlm_create();
 int64_t rpu_hyvla_vlm_create_kv_only();
 void    rpu_hyvla_vlm_destroy(int64_t handle);
+// Cold, before runtime config and weights: 8 (default) or the reduced 4/6 root.
+void rpu_hyvla_vlm_set_execution_core_count(int64_t handle, int64_t num_cores);
+std::vector<int64_t> rpu_hyvla_vlm_get_execution_topology(int64_t handle);
 void rpu_hyvla_vlm_set_runtime_config(
     int64_t handle,
     bool fast_replay, bool fast_replay_preload, bool mask_once,
@@ -4692,6 +5204,8 @@ at::Tensor rpu_hyvla_vlm_step_forward(
     const at::Tensor& cos, const at::Tensor& sin,
     const at::Tensor& attn_mask_4d, int64_t prefix_len,
     at::IntArrayRef planned_stage_descriptor = {}, bool inputs_published = false);
+void rpu_hyvla_vlm_prepare_persistent_spm(
+    int64_t handle, int64_t seq_len, int64_t prefix_len, int64_t mask_kv_len);
 std::vector<int64_t> rpu_hyvla_vlm_resolve_stage_domain(
     int64_t handle, int64_t seq_len, int64_t prefix_len,
     int64_t mask_kv_len);
@@ -4710,6 +5224,9 @@ void rpu_hyvla_vlm_stage_chunk_size_override(
 // =============================================================================
 int64_t rpu_hyvla_expert_create();
 void    rpu_hyvla_expert_destroy(int64_t handle);
+// Cold, before runtime config and weights: 8 (default) or the four-core child.
+void rpu_hyvla_expert_set_execution_core_count(int64_t handle, int64_t num_cores);
+std::vector<int64_t> rpu_hyvla_expert_get_execution_topology(int64_t handle);
 void rpu_hyvla_expert_set_runtime_config(
     int64_t handle,
     bool fast_replay, bool fast_replay_preload, bool mask_once,
@@ -4789,6 +5306,8 @@ void rpu_hyvla_expert_unroll_forward(
     double dt, int64_t prefix_len, int64_t num_steps,
     at::IntArrayRef planned_stage_descriptor = {}, bool inputs_published = false,
     const std::optional<at::Tensor>& noise_cpu = std::nullopt);
+void rpu_hyvla_expert_prepare_persistent_spm(
+    int64_t handle, int64_t seq_len, int64_t prefix_len, int64_t mask_kv_len);
 std::vector<int64_t> rpu_hyvla_expert_resolve_stage_domain(
     int64_t handle, int64_t seq_len, int64_t prefix_len,
     int64_t mask_kv_len);
@@ -4990,6 +5509,9 @@ void rpu_rhino_vla_set_runtime_config(
     bool packed_qkv = false,
     bool aligned_kv = false);
 
+// Cold reduced-core owner: core budget, then runtime config, then weights.
+void rpu_rhino_vla_set_execution_core_count(int64_t handle, int64_t cores);
+std::vector<int64_t> rpu_rhino_vla_get_execution_topology(int64_t handle);
 // Enable/disable replay-time skipping of RhinoVLA expert layer op emission.
 void rpu_rhino_vla_set_fast_replay(int64_t handle, bool enabled);
 void rpu_rhino_vla_set_rope_position(int64_t handle, int64_t position);
@@ -5163,7 +5685,7 @@ at::Tensor rpu_siglip_fused_encoder_forward_legacy(
 // SigLIPModel All-Layers-Once (Phase 5: FusedModelBase migration)
 // =============================================================================
 
-int64_t rpu_siglip_create(const std::optional<bool>& linear_acc32);
+int64_t rpu_siglip_create(const std::optional<bool>& linear_acc32, bool qkv_w8a8 = false, bool mlp_w8a8 = false);
 void rpu_siglip_set_audio_mode(int64_t handle);
 void rpu_siglip_set_audio_projection(int64_t handle, const at::Tensor& weight,
                                     const at::Tensor& bias);
@@ -5188,6 +5710,25 @@ void rpu_siglip_set_weights(
     int64_t projection_dim, double eps);
 
 void rpu_siglip_set_weights_w8a16(
+    int64_t handle,
+    at::TensorList q_w_list, at::TensorList k_w_list,
+    at::TensorList v_w_list, at::TensorList o_w_list,
+    at::TensorList fc1_w_list, at::TensorList fc2_w_list,
+    at::TensorList ln1_w_list, at::TensorList ln1_b_list,
+    at::TensorList ln2_w_list, at::TensorList ln2_b_list,
+    at::TensorList q_b_list, at::TensorList k_b_list,
+    at::TensorList v_b_list, at::TensorList o_b_list,
+    at::TensorList fc1_b_list, at::TensorList fc2_b_list,
+    const at::Tensor& post_ln_w, const at::Tensor& post_ln_b,
+    const at::Tensor& proj_w, const at::Tensor& proj_b,
+    int64_t num_heads, int64_t head_dim,
+    int64_t hidden_size, int64_t intermediate_size,
+    int64_t projection_dim, double eps,
+    at::TensorList q_ws_list, at::TensorList k_ws_list,
+    at::TensorList v_ws_list, at::TensorList o_ws_list,
+    at::TensorList fc1_ws_list, at::TensorList fc2_ws_list);
+
+void rpu_siglip_set_weights_w4a16(
     int64_t handle,
     at::TensorList q_w_list, at::TensorList k_w_list,
     at::TensorList v_w_list, at::TensorList o_w_list,
@@ -5264,6 +5805,8 @@ at::Tensor rpu_siglip_forward_multi(
 // =============================================================================
 int64_t rpu_hyvit2_create();
 int64_t rpu_hyvit2_create_kv_spm_only();
+void rpu_hyvit2_set_execution_core_count(int64_t handle, int64_t cores);
+std::vector<int64_t> rpu_hyvit2_get_execution_topology(int64_t handle);
 void rpu_hyvit2_destroy(int64_t handle);
 void rpu_hyvit2_set_runtime_config(
     int64_t handle,
@@ -5288,6 +5831,26 @@ void rpu_hyvit2_set_weights(
     int64_t patch_embed_cores);
 
 void rpu_hyvit2_set_weights_w8a16(
+    int64_t handle,
+    at::TensorList q_w_list, at::TensorList k_w_list,
+    at::TensorList v_w_list, at::TensorList o_w_list,
+    at::TensorList fc1_w_list, at::TensorList fc2_w_list,
+    at::TensorList ln1_w_list, at::TensorList ln1_b_list,
+    at::TensorList ln2_w_list, at::TensorList ln2_b_list,
+    at::TensorList q_b_list, at::TensorList k_b_list,
+    at::TensorList v_b_list, at::TensorList o_b_list,
+    at::TensorList fc1_b_list, at::TensorList fc2_b_list,
+    const at::Tensor& proj_w, const at::Tensor& proj_b,
+    int64_t num_heads, int64_t head_dim,
+    int64_t hidden_size, int64_t intermediate_size,
+    int64_t projection_dim, double eps,
+    bool fused_merger, bool proj1_in_merger,
+    int64_t patch_embed_cores,
+    at::TensorList q_ws_list, at::TensorList k_ws_list,
+    at::TensorList v_ws_list, at::TensorList o_ws_list,
+    at::TensorList fc1_ws_list, at::TensorList fc2_ws_list);
+
+void rpu_hyvit2_set_weights_w4a16(
     int64_t handle,
     at::TensorList q_w_list, at::TensorList k_w_list,
     at::TensorList v_w_list, at::TensorList o_w_list,
@@ -5342,7 +5905,8 @@ at::Tensor rpu_hyvla_merger_fused(
     const at::Tensor& w2,  const at::Tensor& b2,
     const at::Tensor& wp2, const at::Tensor& bp2,
     const c10::optional<at::Tensor>& wp1 = c10::nullopt,
-    const c10::optional<at::Tensor>& bp1 = c10::nullopt);
+    const c10::optional<at::Tensor>& bp1 = c10::nullopt,
+    int64_t num_cores = 8);
 
 at::Tensor rpu_hyvit2_forward(
     int64_t handle,
@@ -5370,6 +5934,9 @@ at::Tensor rpu_hyvit2_forward_multi(
     at::TensorList v_caches_list,
     at::IntArrayRef planned_stage_descriptor = {}, bool inputs_published = false);
 std::vector<int64_t> rpu_hyvit2_resolve_stage_domain(
+    int64_t handle, int64_t seq_len, int64_t image_batch_count,
+    bool external_patch_prologue);
+void rpu_hyvit2_prepare_persistent_spm(
     int64_t handle, int64_t seq_len, int64_t image_batch_count,
     bool external_patch_prologue);
 int64_t rpu_hyvit2_get_resolved_chunk_size(int64_t handle);
@@ -5442,6 +6009,41 @@ void rpu_qwen3vl_vision_set_weights_w8a16(
     at::TensorList q_scale_list, at::TensorList k_scale_list,
     at::TensorList v_scale_list, at::TensorList o_scale_list,
     at::TensorList fc1_scale_list, at::TensorList fc2_scale_list);
+void rpu_qwen3vl_vision_set_weights_w4a16(
+    int64_t handle,
+    at::TensorList q_w_list, at::TensorList k_w_list,
+    at::TensorList v_w_list, at::TensorList o_w_list,
+    at::TensorList fc1_w_list, at::TensorList fc2_w_list,
+    at::TensorList ln1_w_list, at::TensorList ln1_b_list,
+    at::TensorList ln2_w_list, at::TensorList ln2_b_list,
+    at::TensorList q_b_list, at::TensorList k_b_list,
+    at::TensorList v_b_list, at::TensorList o_b_list,
+    at::TensorList fc1_b_list, at::TensorList fc2_b_list,
+    int64_t num_heads, int64_t head_dim,
+    int64_t hidden_size, int64_t intermediate_size,
+    double eps,
+    at::IntArrayRef deepstack_visual_indexes,
+    at::TensorList q_scale_list, at::TensorList k_scale_list,
+    at::TensorList v_scale_list, at::TensorList o_scale_list,
+    at::TensorList fc1_scale_list, at::TensorList fc2_scale_list);
+void rpu_qwen3vl_vision_set_weights_nvfp4(
+    int64_t handle,
+    at::TensorList q_w_list, at::TensorList k_w_list,
+    at::TensorList v_w_list, at::TensorList o_w_list,
+    at::TensorList fc1_w_list, at::TensorList fc2_w_list,
+    at::TensorList ln1_w_list, at::TensorList ln1_b_list,
+    at::TensorList ln2_w_list, at::TensorList ln2_b_list,
+    at::TensorList q_b_list, at::TensorList k_b_list,
+    at::TensorList v_b_list, at::TensorList o_b_list,
+    at::TensorList fc1_b_list, at::TensorList fc2_b_list,
+    int64_t num_heads, int64_t head_dim,
+    int64_t hidden_size, int64_t intermediate_size,
+    double eps,
+    at::IntArrayRef deepstack_visual_indexes,
+    at::TensorList q_scale_list, at::TensorList k_scale_list,
+    at::TensorList v_scale_list, at::TensorList o_scale_list,
+    at::TensorList fc1_scale_list, at::TensorList fc2_scale_list,
+    at::TensorList nvfp4_tensor_scales);
 
 void rpu_qwen3vl_vision_set_rope(
     int64_t handle,
@@ -5537,6 +6139,7 @@ void rpu_qwen3_5_vision_set_high_precision(int64_t handle, bool enabled);
 void rpu_qwen3_5_vision_set_moe_precision(
     int64_t handle, bool linear_acc32, bool gelu_erf_ultra);
 void rpu_qwen3_5_vision_set_gelu_erf_ultra(int64_t handle, bool enabled);
+void rpu_qwen3_5_vision_set_fast_replay(int64_t handle, bool enabled);
 
 void rpu_qwen3_5_vision_set_weights(
     int64_t handle,
@@ -5646,6 +6249,9 @@ void rpu_qwen25vl_vision_destroy(int64_t handle);
 void rpu_qwen25vl_vision_set_per_window_sdpa(int64_t handle, bool enabled);
 void rpu_qwen25vl_vision_set_wall_sorting_routes(
     int64_t handle, int64_t mask, bool row, bool silu);
+// Cold four-lane owner (InternVLA): set the core budget before routes and weights.
+void    rpu_qwen25vl_vision_set_execution_core_count(int64_t handle, int64_t cores);
+std::vector<int64_t> rpu_qwen25vl_vision_get_execution_topology(int64_t handle);
 
 void rpu_qwen25vl_vision_set_execution_routes(
     int64_t handle, bool rope_spm, bool fused_merger, bool mixed_precision,
@@ -5736,6 +6342,8 @@ at::Tensor rpu_qwen25vl_vision_forward(
 
 int64_t rpu_dinov3_vision_create();
 void rpu_dinov3_vision_destroy(int64_t handle);
+void rpu_dinov3_vision_set_execution_core_count(int64_t handle, int64_t cores);
+std::vector<int64_t> rpu_dinov3_vision_get_execution_topology(int64_t handle);
 
 void rpu_dinov3_vision_set_weights(
     int64_t handle,
@@ -5750,6 +6358,11 @@ void rpu_dinov3_vision_set_weights(
     int64_t num_heads, int64_t head_dim,
     int64_t hidden_size, int64_t intermediate_size,
     double eps);
+
+void rpu_dinov3_vision_set_weight_scales(
+    int64_t handle,
+    at::TensorList q_scales, at::TensorList k_scales, at::TensorList v_scales,
+    at::TensorList o_scales, at::TensorList up_scales, at::TensorList down_scales);
 
 void rpu_dinov3_vision_set_rope(
     int64_t handle,
@@ -5836,6 +6449,21 @@ bool get_cross_layer_batch_prefill();
 //
 // See spec knowledge/concepts/ddr-dma-wrappers.md.
 
+// Allocated nonzero DMA channels that a deferred burst left running. Each burst fenced its
+// channels behind stream 0's earlier work, but stream 0 has not waited for
+// them: the caller may launch kernels that touch none of the burst's SPM
+// ranges, then must call rpu_join_deferred_dma before anything reads or
+// overwrites them. Bursts sharing one token rotate over the Graph's allocated
+// channels 1..execution_core_count-1 (seven at TP8). A one-core Graph copies
+// synchronously on channel 0 and leaves the token empty.
+struct DeferredDmaChannels {
+    uint8_t used = 0;   // bit c: channel c has a DMA stream 0 has not joined
+    uint8_t next = 0;   // rotation cursor over the allocated nonzero channels
+};
+
+// Stream 0 waits for every channel `deferred` used; a no-op when empty.
+void rpu_join_deferred_dma(DeferredDmaChannels& deferred);
+
 // DDR → per-core SPM. One DMA per core on channels 0..num_cores-1, with
 // 2·(num_cores-1) barriers framing the burst.
 void rpu_launch_ddr_broadcast_spm_dma(
@@ -5872,23 +6500,36 @@ void rpu_launch_ddr_broadcast_spm_dma(
 //
 // Captured mode re-dereferences the live source on replay; PASSTHROUGH
 // dereferences it once and executes an immediate one-shot batch.
+//
+// With `deferred`, only the first `sync_elements` elements are an ordinary
+// burst that completes before the next kernel; the rest run on allocated nonzero channels
+// and stream 0 waits for them at rpu_join_deferred_dma. PASSTHROUGH copies
+// everything at once and leaves the token empty.
 void rpu_launch_ddr_broadcast_spm_dma_mutable(
     const uint64_t* live_src_base,
     int64_t         src_offset_bytes,
     int64_t         num_elements,
     uint32_t        spm_addr_unified,
-    int             num_cores = 8);
+    int             num_cores = 8,
+    DeferredDmaChannels* deferred = nullptr,
+    int64_t         sync_elements = 0);
 
 // Tensor-owned mutable counterpart.  `owner_tensor` is the current invocation
 // owner of `live_src_base`; it is validated and retained independently of the
 // live address before schema-5 can skip the host op walk.
+//
+// With `deferred`, every core's copy, laid end to end, is cut into equal runs
+// on the allocated nonzero channels, each fenced behind stream 0's earlier work
+// and joined by rpu_join_deferred_dma. PASSTHROUGH copies at once and leaves
+// the token empty.
 void rpu_launch_ddr_broadcast_spm_dma_mutable(
     uint64_t&         live_src_base,
     const at::Tensor& owner_tensor,
     int64_t           src_offset_bytes,
     int64_t           num_elements,
     uint32_t          spm_addr_unified,
-    int               num_cores = 8);
+    int               num_cores = 8,
+    DeferredDmaChannels* deferred = nullptr);
 
 // core 0 SPM → DDR. Single DMA on channel 0 (stream 0) — same stream as
 // surrounding compute, no barriers needed.
@@ -5897,11 +6538,22 @@ void rpu_launch_spm_copy_ddr_dma(
     c10::Half* ddr_ptr,
     int64_t   num_elements);
 
+// Owned counterpart. With `deferred`, the copy is cut into equal runs on the
+// allocated nonzero channels, each fenced behind stream 0's earlier work and joined
+// by rpu_join_deferred_dma. PASSTHROUGH copies at once and leaves the token
+// empty.
+//
+// `source_replicated` (deferred only) promises that every core holds the same
+// bytes at `spm_addr_unified`, e.g. an all-gather output. Run k then reads core
+// k+1's copy, so the runs do not share core 0's SPM read port with the
+// kernels they overlap; the join must then also precede any core's writer.
 void rpu_launch_spm_copy_ddr_dma(
     uint32_t          spm_addr_unified,
     const at::Tensor& ddr_tensor,
     int64_t           dst_offset_elements,
-    int64_t           num_elements);
+    int64_t           num_elements,
+    DeferredDmaChannels* deferred = nullptr,
+    bool              source_replicated = false);
 
 // FMB-only schema-v12 canonical Graph wrappers.  Physical peers and byte
 // ranges are derived by FusedModelBase from a current-callback opaque member
@@ -5990,6 +6642,19 @@ void rpu_launch_spm_scatter_ddr_dma_immediate(
     int64_t   core_stride_bytes,
     int       num_cores);
 
+// Eager only: `rows` scatters in one synchronous batch. Row r of core c reads
+// spm_addr_unified + r*spm_row_stride_bytes and writes
+// ddr_base + r*ddr_row_stride_bytes + c*core_stride_bytes.
+void rpu_launch_spm_scatter_rows_ddr_dma_immediate(
+    uint32_t  spm_addr_unified,
+    c10::Half* ddr_base,
+    int64_t   rows,
+    int64_t   elements_per_core,
+    int64_t   spm_row_stride_bytes,
+    int64_t   ddr_row_stride_bytes,
+    int64_t   core_stride_bytes,
+    int       num_cores);
+
 // =============================================================================
 // DMA-based scatter primitives (graph-only). Replace the legacy kernel-based
 // `rpu_launch_ddr2spm_multicore_scatter_read_broadcast_write` and
@@ -6033,6 +6698,21 @@ void rpu_launch_spm_scatter_spm_dma(
     int64_t   core_stride_bytes,
     uint32_t  spm_dst_unified,
     int       num_cores);
+
+// Graph-only grouped SPM replication: destination core c reads source core
+// source_core_base + c / (num_cores / source_cores). Source and destination
+// local ranges must be disjoint, source_cores must divide the consumer core
+// prefix, and the source cores must lie inside it. With `deferred`, the DMAs
+// run on allocated nonzero channels and the closing barriers are left to
+// rpu_join_deferred_dma.
+void rpu_launch_spm_group_broadcast_dma(
+    uint32_t spm_src_unified,
+    int64_t elements_per_core,
+    uint32_t spm_dst_unified,
+    int source_cores,
+    int num_cores,
+    int source_core_base,
+    DeferredDmaChannels* deferred = nullptr);
 
 // Each core extracts its own contiguous shard from a replicated full tensor:
 // core c reads local src + c*stride and writes local dst. Unlike the scatter
@@ -6127,6 +6807,11 @@ void rpu_launch_memset_spm_multicore(
     uint32_t spm_addr,
     int64_t num_elements, int num_cores = 8);
 
+// Register image of rpu_launch_fill_spm_kernel; checks the write interval the
+// same way.
+KernelRegisterImage fill_spm_registers(uint32_t spm_addr, int64_t num_elements,
+                                       c10::Half value);
+
 // Fill `num_elements` halfs with `value` at the per-core SPM addr (multi-core
 // broadcast), via the oplib `fill` kernel. Replaces memset_spm_multicore where that
 // kernel (memset_spm_multi_core_v2) is absent from the oplib (e.g. be627ce5).
@@ -6197,7 +6882,10 @@ void rpu_launch_backend_moe_select_fp16_spm(
     uint32_t dense_weights_addr,
     int64_t token_rows,
     int64_t num_experts,
-    int64_t top_k);
+    int64_t top_k,
+    // The selection runs on core 0; the three broadcast eltwise steps cover
+    // the caller's owned cores (core 0's result is the one consumed).
+    int num_cores = 8);
 
 // =============================================================================
 // =============================================================================
@@ -6213,6 +6901,19 @@ at::Tensor rpu_argmax(const at::Tensor &self, c10::optional<int64_t> dim,
 at::Tensor rpu_argmin(const at::Tensor &self, c10::optional<int64_t> dim,
                       bool keepdim = false);
 at::Tensor rpu_argmax_lastdim_host(const at::Tensor &self);
+// Same first maximum (or first NaN) per row, plus that element as FP32. RPU
+// FP16 is read in place; a large multi-row input is split by rows over host
+// threads, each row scanned exactly as above.
+std::tuple<at::Tensor, at::Tensor> rpu_argmax_lastdim_host_values(const at::Tensor &self);
+// Temperature + top-k + softmax + draw over the last dim, in one op. Exists
+// because the same chain spelled in Python costs five dispatches per step, and
+// at a 2048-wide vocabulary that overhead dominates the arithmetic it carries.
+// Reproduces transformers' warper semantics, including keeping entries tied with
+// the k-th largest; the draw is an inverse CDF over one uniform, so it is
+// reproducible under torch.manual_seed but is not aten::multinomial's own draw.
+at::Tensor rpu_sample_topk_lastdim_host(const at::Tensor &self, double temperature,
+                                        int64_t top_k,
+                                        std::optional<at::Generator> generator);
 
 // =============================================================================
 // Conv2d Kernel Launchers

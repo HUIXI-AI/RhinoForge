@@ -15,6 +15,7 @@ def test_text_prefill_keeps_retained_owner_with_debug_disabled(monkeypatch):
     calls = []
     retained = SimpleNamespace(
         is_frozen=lambda: False,
+        max_entries=lambda: 1,
         capture=lambda sig: calls.append(("capture", sig.op_id)) or nullcontext(),
         evict=lambda sig: calls.append(("evict", sig)),
     )

@@ -13,6 +13,7 @@
 // Framework contract: src/core/fused_model_base.h.
 
 #include "fused_model_base.h"
+#include "gemma4_execution_topology.h"
 #include "model_handle_registry.h"
 #include "rpu_ops.h"
 #include "rpu_spm_buffers.h"
@@ -35,6 +36,8 @@
 using namespace at;
 using namespace ::rhino_lkn;
 
+// Physical DDR/KV stripes (SDPA virtual lanes). Compute launches use the cold
+// owner budget num_cores() and the attention/MLP/PLE lanes derived from it.
 #define NUM_CORES 8
 #define DWIDTH 2
 
@@ -72,6 +75,8 @@ constexpr int64_t GEMMA4_PLE_DMA_SITE = 6582489299560935010LL;
 constexpr int64_t GEMMA4_PLE_GATE_LINEAR_SITE = 7599842320145438531LL;
 constexpr int64_t GEMMA4_PLE_PROJ_LINEAR_SITE = 7972588270602457603LL;
 constexpr int64_t GEMMA4_PLE_ALL_REDUCE_SITE = 7105886685527167396LL;
+// Budget 6 only: four PLE producers feed a six-lane ring.
+constexpr int64_t GEMMA4_PLE_PREPARE_ALL_REDUCE_SITE = 5712097404687403303LL;
 constexpr int64_t GEMMA4_PLE_NORM_PRELOAD_SITE = 7312830814832177843LL;
 constexpr int64_t GEMMA4_WINDOW_MASK_SCHEDULE_SITE = 858194843690279753LL;
 
@@ -84,6 +89,11 @@ enum class Gemma4MutableDmaRoute : int64_t {
 
 int64_t gemma4_kv_invocation(int64_t chunk_idx, bool is_global) {
     return chunk_idx * 2 + (is_global ? 1 : 0);
+}
+
+// Per-lane K granule of the decoder projection storage (MLP6 padding).
+int64_t gemma4_projection_lane_granule(at::ScalarType type) {
+    return type == at::kByte ? 64 : type == at::kChar ? 32 : 16;
 }
 }  // namespace
 
@@ -102,6 +112,9 @@ public:
         at::Tensor input_norm_w, post_attn_norm_w;
         at::Tensor pre_ff_norm_w, post_ff_norm_w;
         at::Tensor gate_w, up_w, down_w;
+        // Exact E4B W8A16 / W4A16-G32: FP16 scales from set_weight_scales
+        // (INT8 [N] or controller-striped pgrp); undefined for FP16.
+        at::Tensor q_s, k_s, v_s, o_s, gate_s, up_s, down_s;
         // T6 PLE (E4B): per_layer_input_gate / per_layer_projection (both
         // row-swizzled, num_cores=8) + post_per_layer_input_norm. Defined only
         // when has_ple_ (ple_*_list non-empty); else default (unused).
@@ -121,6 +134,28 @@ public:
     };
 
     Gemma4Model() = default;
+
+    // Cold compute budget (4, 6 or 8). Must precede weight installation; the
+    // default eight keeps the original attention2/MLP8/PLE8 layout.
+    void set_execution_cores(int64_t cores) {
+        TORCH_CHECK(cores == 4 || cores == 6 || cores == 8,
+                    "Gemma4 execution cores must be 4, 6 or 8");
+        TORCH_CHECK(layer_weights_.empty(),
+                    "Gemma4 execution cores must precede weight installation");
+        set_execution_core_count(static_cast<int>(cores));
+    }
+
+    // (schema, budget, attention, MLP, PLE, physical KV stripes,
+    //  logical MLP width, physical MLP width) of the installed owner.
+    std::vector<int64_t> execution_topology() const {
+        TORCH_CHECK(num_layers() > 0 && !layer_weights_.empty(),
+                    "Gemma4 topology requires installed model weights");
+        return {1, num_cores(), attn_tp(), mlp_tp(), ple_tp(), NUM_CORES,
+                logical_intermediate_size_, intermediate_size()};
+    }
+
+    // PLE lanes: eight at budget 8, else four (256 does not split over six).
+    int ple_tp() const { return gemma4_ple_cores(num_cores()); }
 
     // ========================================================================
     // set_weights
@@ -153,6 +188,40 @@ public:
                     "gemma4_set_weights: model dim params must be positive");
         TORCH_CHECK(num_q_heads % num_kv_heads_max == 0,
                     "gemma4_set_weights: num_q_heads must be divisible by num_kv_heads");
+        // Decoder projections are uniformly FP16, INT8 W8A16 or packed-UINT4
+        // W4A16 (K/2 bytes per row). Quantized storage is admitted only for the
+        // exact E4B text decoder; its scales arrive through set_weight_scales.
+        const at::ScalarType projection_type =
+            q_w_list[0].defined() ? q_w_list[0].scalar_type() : at::kHalf;
+        const bool quantized =
+            projection_type == at::kChar || projection_type == at::kByte;
+        TORCH_CHECK(projection_type == at::kHalf ||
+                        (quantized && N == 42 && num_q_heads == 8 &&
+                         num_kv_heads_max == 2 && head_dim_max == 512 &&
+                         hidden_size == GEMMA4_E4B_HIDDEN &&
+                         intermediate_size == GEMMA4_E4B_INTERMEDIATE),
+                    "gemma4_set_weights: W8A16/W4A16 projections require the exact "
+                    "E4B text decoder");
+        const int64_t k_pack = projection_type == at::kByte ? 2 : 1;
+        auto check_projection = [&](const at::Tensor& weight, int64_t rows, int64_t cols,
+                                    const char* name, int64_t layer) {
+            TORCH_CHECK(weight.defined() && weight.dim() == 2 &&
+                            weight.scalar_type() == projection_type &&
+                            weight.size(0) == rows && weight.size(1) * k_pack == cols,
+                        "gemma4_set_weights: ", name, "[", layer, "] must be uniform "
+                        "projection storage [", rows, ", ", cols, "/", k_pack, "]");
+        };
+        // The cold budget fixes the MLP lanes and therefore the physical
+        // (zero-padded at MLP6) width every gate/up/down payload must carry.
+        const DecoderExecutionTopology cold_topology =
+            resolve_model_execution_topology(
+                num_q_heads, num_kv_heads_max, head_dim_max,
+                hidden_size, intermediate_size);
+        TORCH_CHECK(cold_topology.mlp_tp == num_cores(),
+                    "gemma4_set_weights: MLP lanes must equal the core budget");
+        const int64_t physical_intermediate = gemma4_mlp_physical_size(
+            intermediate_size, cold_topology.mlp_tp,
+            gemma4_projection_lane_granule(projection_type));
 
         auto check_len = [&](size_t sz, const char* name) {
             TORCH_CHECK(static_cast<int64_t>(sz) == N,
@@ -189,6 +258,9 @@ public:
             TORCH_CHECK(layer_scalar.defined() && layer_scalar.dim() == 1
                         && layer_scalar.size(0) == N,
                         "gemma4_set_weights: layer_scalar must be 1D [num_layers]");
+            TORCH_CHECK(num_cores() == 8 || ple_dim % (16 * ple_tp()) == 0,
+                        "gemma4_set_weights: ple_dim must split into 16-aligned "
+                        "PLE lanes, got ", ple_dim, " over ", ple_tp());
         }
         at::Tensor ls_cpu = has_ple
             ? layer_scalar.to(at::kCPU).to(at::kFloat).contiguous() : at::Tensor();
@@ -228,8 +300,12 @@ public:
                         " != num_q_heads*head_dim=", num_q_heads * hd);
             TORCH_CHECK(o_w_list[i].defined() && o_w_list[i].dim() == 2,
                         "gemma4_set_weights: o_w[", i, "] must be 2D");
-            TORCH_CHECK(o_w_list[i].size(1) == num_q_heads * hd,
+            TORCH_CHECK(o_w_list[i].size(1) * k_pack == num_q_heads * hd,
                         "gemma4_set_weights: o_w[", i, "].cols != num_q_heads*head_dim");
+            if (quantized) {
+                check_projection(q_w_list[i], num_q_heads * hd, hidden_size, "q_w", i);
+                check_projection(o_w_list[i], hidden_size, num_q_heads * hd, "o_w", i);
+            }
             TORCH_CHECK(q_norm_list[i].defined() && q_norm_list[i].dim() == 1
                         && q_norm_list[i].size(0) == hd,
                         "gemma4_set_weights: q_norm[", i, "] must be 1D [head_dim]");
@@ -241,6 +317,10 @@ public:
                             "gemma4_set_weights: v_w[", i, "] width mismatch");
                 TORCH_CHECK(k_norm_list[i].defined() && k_norm_list[i].size(0) == hd,
                             "gemma4_set_weights: k_norm[", i, "] must be [head_dim]");
+                if (quantized) {
+                    check_projection(k_w_list[i], nkv * hd, hidden_size, "k_w", i);
+                    check_projection(v_w_list[i], nkv * hd, hidden_size, "v_w", i);
+                }
             }
 
             geom_.push_back({hd, nkv, kv_source_layer[i], is_global, shared});
@@ -253,6 +333,24 @@ public:
             lw.post_attn_norm_w = post_attn_norm_list[i];
             lw.pre_ff_norm_w = pre_ff_norm_list[i];
             lw.post_ff_norm_w = post_ff_norm_list[i];
+            if (num_cores() != 8 || quantized) {
+                // Reduced budgets bind the physical MLP payload width exactly;
+                // an unpadded MLP4/8 payload cannot masquerade as MLP6.
+                TORCH_CHECK(gate_list[i].defined() && gate_list[i].dim() == 2
+                            && gate_list[i].scalar_type() == projection_type
+                            && gate_list[i].size(0) == physical_intermediate
+                            && gate_list[i].size(1) * k_pack == hidden_size
+                            && up_list[i].defined() && up_list[i].dim() == 2
+                            && up_list[i].scalar_type() == projection_type
+                            && up_list[i].size(0) == physical_intermediate
+                            && up_list[i].size(1) * k_pack == hidden_size
+                            && down_list[i].defined() && down_list[i].dim() == 2
+                            && down_list[i].scalar_type() == projection_type
+                            && down_list[i].size(0) == hidden_size
+                            && down_list[i].size(1) * k_pack == physical_intermediate,
+                            "gemma4_set_weights: MLP payload must carry the physical "
+                            "width ", physical_intermediate, " @", i);
+            }
             lw.gate_w = gate_list[i]; lw.up_w = up_list[i]; lw.down_w = down_list[i];
             if (has_ple) {
                 TORCH_CHECK(ple_gate_list[i].defined()
@@ -276,6 +374,11 @@ public:
         // head_dim()/num_kv_heads()) sizes attention buffers for the widest layer.
         set_model_params(num_q_heads, num_kv_heads_max, head_dim_max,
                          hidden_size, intermediate_size);
+        TORCH_CHECK(attn_tp() == cold_topology.attention_tp &&
+                        mlp_tp() == cold_topology.mlp_tp &&
+                        this->intermediate_size() == physical_intermediate,
+                    "gemma4_set_weights: installed topology drifted from its cold budget");
+        logical_intermediate_size_ = intermediate_size;
         set_num_layers(N);
         eps_ = eps;
         qk_scale_ = qk_scale;
@@ -292,6 +395,92 @@ public:
             at::TensorOptions().dtype(at::kHalf).device(at::kPrivateUse1));
 
         invalidate_model_state();  // D-503: last non-empty statement
+    }
+
+    // ========================================================================
+    // Uniform W8A16 / W4A16 scales for the installed quantized E4B decoder.
+    // Every launched weight/scale pair is checked before any scale is
+    // published. KV-shared layers never launch k/v; their scales stay dense
+    // placeholders like the weights.
+    void set_weight_scales(
+        at::TensorList q, at::TensorList k, at::TensorList v, at::TensorList o,
+        at::TensorList gate, at::TensorList up, at::TensorList down) {
+        const int64_t n_layers = static_cast<int64_t>(layer_weights_.size());
+        TORCH_CHECK(get_last_resolved_chunk_size() == 0 && n_layers == 42 &&
+                        static_cast<int64_t>(geom_.size()) == n_layers &&
+                        projection_type() != at::kHalf,
+                    "Gemma4 weight scales require the cold quantized E4B decoder");
+        for (const auto scales : {q, k, v, o, gate, up, down})
+            TORCH_CHECK(static_cast<int64_t>(scales.size()) == n_layers,
+                        "Gemma4 weight scales require one scale per layer and projection");
+        const bool packed_w4 = projection_type() == at::kByte;
+        const int64_t h = hidden_size(), inter = intermediate_size();
+        const int64_t attention_lanes = attn_tp(), mlp_lanes = mlp_tp();
+        auto ceil_div = [](int64_t a, int64_t b) { return (a + b - 1) / b; };
+        for (int64_t layer = 0; layer < n_layers; ++layer) {
+            const auto& g = geom_[layer];
+            const auto& w = layer_weights_[layer];
+            const int64_t attention = num_q_heads() * g.head_dim;
+            const int64_t kv = g.num_kv_heads * g.head_dim;
+            const at::Tensor* weights[] = {&w.q_w, &w.k_w, &w.v_w, &w.o_w,
+                                           &w.gate_w, &w.up_w, &w.down_w};
+            const at::Tensor* scales[] = {&q[layer], &k[layer], &v[layer], &o[layer],
+                                          &gate[layer], &up[layer], &down[layer]};
+            // {N, K, partition (1 = col), lanes} of q, k, v, o, gate, up, down.
+            const int64_t shapes[7][4] = {
+                {attention, h, 1, attention_lanes}, {kv, h, 1, attention_lanes},
+                {kv, h, 1, attention_lanes}, {h, attention, 0, attention_lanes},
+                {inter, h, 1, mlp_lanes}, {inter, h, 1, mlp_lanes},
+                {h, inter, 0, mlp_lanes}};
+            for (int projection = 0; projection < 7; ++projection) {
+                if (g.is_kv_shared && (projection == 1 || projection == 2)) continue;
+                const auto& weight = *weights[projection];
+                const auto& scale = *scales[projection];
+                const int64_t n = shapes[projection][0], kk = shapes[projection][1];
+                const bool col = shapes[projection][2] == 1;
+                const int64_t lanes = shapes[projection][3];
+                TORCH_CHECK(weight.dim() == 2 && weight.size(0) == n &&
+                                weight.size(1) == (packed_w4 ? kk / 2 : kk) &&
+                                scale.defined() && scale.scalar_type() == at::kHalf &&
+                                scale.device().type() == at::kPrivateUse1 &&
+                                scale.is_contiguous() &&
+                                !scale.is_same(weight),
+                            "Gemma4 W8A16/W4A16 requires the exact projection weight "
+                            "and an independent contiguous FP16 RPU scale");
+                if (packed_w4) {
+                    // Controller-striped G32 pgrp payload, as the launcher reads it.
+                    const int64_t local_n = col ? n / lanes : n;
+                    const int64_t local_k = col ? kk : kk / lanes;
+                    TORCH_CHECK(scale.dim() == 2 && scale.size(0) == 32 &&
+                                    scale.numel() == ceil_div(local_k / 32, 4) *
+                                        ceil_div(local_n, 64) * lanes * 256,
+                                "Gemma4 W4A16 requires the G32 controller-striped scale");
+                } else {
+                    TORCH_CHECK(scale.dim() == 1 && scale.size(0) == n,
+                                "Gemma4 W8A16 requires a per-channel FP16 scale [N]");
+                }
+            }
+        }
+        // Packed W4 scales are retained at the pgrp launcher's lanes*512 B DDR
+        // alignment for the projection's lanes; W8 scales and the unread k/v
+        // placeholders of KV-shared layers pass through unchanged.
+        for (int64_t layer = 0; layer < n_layers; ++layer) {
+            auto& w = layer_weights_[layer];
+            const bool shared = geom_[layer].is_kv_shared;
+            w.q_s = rpu_retain_linear_quant_scale(w.q_w, q[layer], attention_lanes);
+            w.k_s = shared ? k[layer] : rpu_retain_linear_quant_scale(w.k_w, k[layer], attention_lanes);
+            w.v_s = shared ? v[layer] : rpu_retain_linear_quant_scale(w.v_w, v[layer], attention_lanes);
+            w.o_s = rpu_retain_linear_quant_scale(w.o_w, o[layer], attention_lanes);
+            w.gate_s = rpu_retain_linear_quant_scale(w.gate_w, gate[layer], mlp_lanes);
+            w.up_s = rpu_retain_linear_quant_scale(w.up_w, up[layer], mlp_lanes);
+            w.down_s = rpu_retain_linear_quant_scale(w.down_w, down[layer], mlp_lanes);
+        }
+        invalidate_model_state();
+    }
+
+    at::ScalarType projection_type() const {
+        return layer_weights_.empty() ? at::kHalf
+                                      : layer_weights_.front().q_w.scalar_type();
     }
 
     std::vector<int64_t> resolve_stage_domain(
@@ -351,6 +540,9 @@ public:
         at::IntArrayRef planned_stage_descriptor)
     {
         TORCH_CHECK(num_layers() > 0, "Gemma4Model::forward before set_weights");
+        TORCH_CHECK(projection_type() == at::kHalf || layer_weights_.front().q_s.defined(),
+                    "Gemma4Model::forward: W8A16/W4A16 projections require "
+                    "gemma4_set_weight_scales");
         const bool cpu_inputs = hidden_states.device().is_cpu();
         TORCH_CHECK(hidden_states.device().type() == at::kPrivateUse1 || cpu_inputs,
                     "Gemma4Model::forward: hidden_states must be on CPU or device device");
@@ -586,7 +778,7 @@ protected:
             append(FmbRouteFamily::ALL_REDUCE,
                    GEMMA4_ATTENTION_ALL_REDUCE_SITE,
                    fmb_ring_all_reduce_route_selector(
-                       chunk.len, hidden_size()),
+                       chunk.len, hidden_size(), num_cores()),
                    0, {}, invocation);
             append_linear(GEMMA4_GATE_LINEAR_SITE, invocation);
             append_linear(GEMMA4_UP_LINEAR_SITE, invocation);
@@ -594,7 +786,7 @@ protected:
             append(FmbRouteFamily::ALL_REDUCE,
                    GEMMA4_MLP_ALL_REDUCE_SITE,
                    fmb_ring_all_reduce_route_selector(
-                       chunk.len, hidden_size()),
+                       chunk.len, hidden_size(), num_cores()),
                    0, {}, invocation);
             if (has_ple_) {
                 append(FmbRouteFamily::MUTABLE_DMA, GEMMA4_PLE_DMA_SITE,
@@ -602,11 +794,18 @@ protected:
                            Gemma4MutableDmaRoute::DDR_SCATTER_TO_SPM),
                        0, {}, invocation);
                 append_linear(GEMMA4_PLE_GATE_LINEAR_SITE, invocation);
+                if (ple_tp() != num_cores()) {
+                    append(FmbRouteFamily::ALL_REDUCE,
+                           GEMMA4_PLE_PREPARE_ALL_REDUCE_SITE,
+                           static_cast<int64_t>(
+                               Gemma4AllReduceRoute::PREPARE_RING_INPUT),
+                           0, {ple_tp(), num_cores()}, invocation);
+                }
                 append_linear(GEMMA4_PLE_PROJ_LINEAR_SITE, invocation);
                 append(FmbRouteFamily::ALL_REDUCE,
                        GEMMA4_PLE_ALL_REDUCE_SITE,
                        fmb_ring_all_reduce_route_selector(
-                           chunk.len, hidden_size()),
+                           chunk.len, hidden_size(), num_cores()),
                        0, {}, invocation);
             }
         }
@@ -623,7 +822,8 @@ protected:
             }
         }
         append_fmb_shared_runtime_routes(
-            manifest, plan, hidden_size(), FMB_SHARED_LAYER_INPUT_DMA);
+            manifest, plan, hidden_size(), FMB_SHARED_LAYER_INPUT_DMA,
+            1, num_cores(), mlp_tp());
         return manifest;
     }
 
@@ -709,7 +909,7 @@ protected:
         int64_t kv    = A(cs * local_kv * DWIDTH);
         int64_t out   = A(cs * local_q * hd * DWIDTH);
         int64_t oproj = A(cs * h * DWIDTH);
-        int64_t mlp   = A(cs * (is_ / NUM_CORES) * DWIDTH);
+        int64_t mlp   = A(cs * (is_ / mlp_tp()) * DWIDTH);
 
         // T4: a windowed build emits a MIX of SDPA modes (global hd512 LTM/NONE +
         // sliding hd256 MASK_2D/LTM), so sdpa_tmp must be the MAX over all of them.
@@ -766,7 +966,8 @@ protected:
                     const at::Tensor& w = layer_weights_[L].*member;
                     if (!w.defined()) return;   // shared-layer k_norm: nothing to load
                     rpu_launch_ddr_broadcast_spm_dma(
-                        w.data_ptr<c10::Half>(), w.numel(), core0_addr);
+                        w.data_ptr<c10::Half>(), w.numel(), core0_addr,
+                        num_cores());
                 };
             d.push_back(b);
         };
@@ -786,7 +987,7 @@ protected:
                 [this](FusedModelBase&, int, uint32_t core0_addr) {
                     rpu_launch_ddr_broadcast_spm_dma(
                         final_norm_w_.data_ptr<c10::Half>(),
-                        final_norm_w_.numel(), core0_addr);
+                        final_norm_w_.numel(), core0_addr, num_cores());
                 };
             d.push_back(b);
         }
@@ -802,7 +1003,7 @@ protected:
                 [this](FusedModelBase&, int, uint32_t core0_addr) {
                     rpu_launch_ddr_broadcast_spm_dma(
                         v_norm_ones_.data_ptr<c10::Half>(),
-                        v_norm_ones_.numel(), core0_addr);
+                        v_norm_ones_.numel(), core0_addr, num_cores());
                 };
             d.push_back(b);
         }
@@ -836,7 +1037,8 @@ protected:
                     /*resolved_flags=*/0,
                     {L, w.numel(), has_ple_ ? 1 : 0}, L);
                 rpu_launch_ddr_broadcast_spm_dma(
-                    w.data_ptr<c10::Half>(), w.numel(), core0_addr);
+                    w.data_ptr<c10::Half>(), w.numel(), core0_addr,
+                    num_cores());
             };
             d.push_back(bn);
         }
@@ -864,7 +1066,7 @@ protected:
                     [](const LayerGeom& g) { return !g.is_global; })),
                 plan.compute.plan.chunk_size,
                 static_cast<int64_t>(plan.compute.chunks.size()),
-                num_q_heads(), num_kv_heads(), head_dim(), attn_tp(), NUM_CORES};
+                num_q_heads(), num_kv_heads(), head_dim(), attn_tp(), num_cores()};
     }
 
     bool window_mask_dma_for_layer(int layer_idx, const ChunkInfo& chunk) const {
@@ -899,7 +1101,35 @@ protected:
         int64_t h = detail::layout_mix(0, has_ple_ ? 1 : 0);
         h = detail::layout_mix(h, ple_dim_);
         h = detail::layout_mix(h, max_sliding_hd_);
+        // Quantized projections own a distinct layout; FP16 keeps its hash.
+        if (projection_type() != at::kHalf)
+            h = detail::layout_mix(h, static_cast<int64_t>(projection_type()));
+        // Reduced budgets size MLP/PLE temps per lane; eight keeps its hash.
+        if (num_cores() != 8) {
+            for (const int64_t value : {int64_t{1}, int64_t{num_cores()},
+                                        int64_t{attn_tp()}, int64_t{mlp_tp()},
+                                        int64_t{ple_tp()}, int64_t{NUM_CORES},
+                                        logical_intermediate_size_, intermediate_size()})
+                h = detail::layout_mix(h, value);
+        }
         return h;
+    }
+
+    DecoderExecutionTopology resolve_model_execution_topology(
+            int64_t nq, int64_t nkv, int64_t hd, int64_t h,
+            int64_t intermediate) const override {
+        if (num_cores() == 8)
+            return FusedModelBase::resolve_model_execution_topology(
+                nq, nkv, hd, h, intermediate);
+        return resolve_gemma4_reduced_topology(
+            num_cores(), nq, nkv, hd, h, intermediate);
+    }
+
+    // Every SPM declaration, GEMM and plan hash consumes the physical width,
+    // which at MLP6 follows the installed projection storage.
+    int64_t resolve_model_mlp_intermediate_size(int64_t logical_size) const override {
+        return gemma4_mlp_physical_size(
+            logical_size, mlp_tp(), gemma4_projection_lane_granule(projection_type()));
     }
 
     // ========================================================================
@@ -916,6 +1146,8 @@ protected:
         int64_t hd = g.head_dim;            // PER-LAYER width (256 / 512)
         int64_t nkv = g.num_kv_heads;
         int tp = attn_tp();
+        // Replicated/elementwise work and ring consumers span the cold budget.
+        const int cores = num_cores();
         int64_t local_q_heads  = nq / tp;
         int64_t local_kv_heads = nkv / tp;
         bool is_last_layer = (layer_idx == num_layers() - 1);
@@ -928,7 +1160,7 @@ protected:
         rpu_launch_rmsnorm_spm_kernel(
             addr(0, "residual1"), addr(0, "input_norm"),
             layer_addr(layer_idx, 0, "input_norm_w"),
-            seq_len, h, eps_);
+            seq_len, h, eps_, RpuRmsNormSpmRoute::BASE, cores);
 
         // Phase 2: Q proj (+ K/V proj for non-shared layers).
         ctx().consume_physical_route(
@@ -937,7 +1169,8 @@ protected:
             /*resolved_flags=*/0, {}, chunk.idx);
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "input_norm"), lw.q_w, addr(0, "q"),
-            seq_len, nq * hd, h, /*partition=*/1, /*num_cores=*/tp);
+            seq_len, nq * hd, h, /*partition=*/1, /*num_cores=*/tp,
+            /*bias_spm_addr=*/0, lw.q_s);
         if (!g.is_kv_shared) {
             ctx().consume_physical_route(
                 FmbRouteFamily::LINEAR, GEMMA4_K_LINEAR_SITE,
@@ -945,14 +1178,16 @@ protected:
                 /*resolved_flags=*/0, {}, chunk.idx);
             rpu_launch_linear_spm_to_spm_acc16_kernel(
                 addr(0, "input_norm"), lw.k_w, addr(0, "k"),
-                seq_len, nkv * hd, h, /*partition=*/1, /*num_cores=*/tp);
+                seq_len, nkv * hd, h, /*partition=*/1, /*num_cores=*/tp,
+                /*bias_spm_addr=*/0, lw.k_s);
             ctx().consume_physical_route(
                 FmbRouteFamily::LINEAR, GEMMA4_V_LINEAR_SITE,
                 static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
                 /*resolved_flags=*/0, {}, chunk.idx);
             rpu_launch_linear_spm_to_spm_acc16_kernel(
                 addr(0, "input_norm"), lw.v_w, addr(0, "v"),
-                seq_len, nkv * hd, h, /*partition=*/1, /*num_cores=*/tp);
+                seq_len, nkv * hd, h, /*partition=*/1, /*num_cores=*/tp,
+                /*bias_spm_addr=*/0, lw.v_s);
         }
 
         // Phase 3: QK-RMSNorm (direct-weight) + RoPE. Dual cos/sin tables are
@@ -966,7 +1201,7 @@ protected:
         rpu_launch_rmsnorm_spm_kernel(
             addr(0, "q"), addr(0, "output"),
             layer_addr(layer_idx, 0, "q_norm_w"),
-            seq_len * local_q_heads, hd, eps_);
+            seq_len * local_q_heads, hd, eps_, RpuRmsNormSpmRoute::BASE, cores);
         ctx().consume_physical_route(
             FmbRouteFamily::ROPE, GEMMA4_Q_ROPE_SITE,
             static_cast<int64_t>(Gemma4RopeRoute::ROPE_SPM),
@@ -980,7 +1215,7 @@ protected:
             rpu_launch_rmsnorm_spm_kernel(
                 addr(0, "k"), addr(0, "input_norm"),
                 layer_addr(layer_idx, 0, "k_norm_w"),
-                seq_len * local_kv_heads, hd, eps_);
+                seq_len * local_kv_heads, hd, eps_, RpuRmsNormSpmRoute::BASE, cores);
             ctx().consume_physical_route(
                 FmbRouteFamily::ROPE, GEMMA4_K_ROPE_SITE,
                 static_cast<int64_t>(Gemma4RopeRoute::ROPE_SPM),
@@ -994,7 +1229,7 @@ protected:
             rpu_launch_rmsnorm_spm_kernel(
                 addr(0, "v"), addr(0, "v"),
                 addr(0, "v_norm_ones"),
-                seq_len * local_kv_heads, hd, eps_);
+                seq_len * local_kv_heads, hd, eps_, RpuRmsNormSpmRoute::BASE, cores);
 
             // KV-cache insert into THIS layer's own slot.
             auto& k_cache = (*ctx().k_caches)[layer_idx];
@@ -1097,14 +1332,15 @@ protected:
             static_cast<int64_t>(
                 Gemma4AllReduceRoute::PREPARE_RING_INPUT),
             /*resolved_flags=*/0, {}, chunk.idx);
-        rpu_prepare_ring_all_reduce_input(addr(0, "oproj"), seq_len, h, tp);
+        rpu_prepare_ring_all_reduce_input(addr(0, "oproj"), seq_len, h, tp, cores);
         ctx().consume_physical_route(
             FmbRouteFamily::LINEAR, GEMMA4_O_LINEAR_SITE,
             static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
             /*resolved_flags=*/0, {}, chunk.idx);
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "output"), lw.o_w, addr(0, "oproj"),
-            seq_len, h, nq * hd, /*partition=*/0, /*num_cores=*/tp);
+            seq_len, h, nq * hd, /*partition=*/0, /*num_cores=*/tp,
+            /*bias_spm_addr=*/0, lw.o_s);
 
         // Phase 5: Gemma2 4-norm attention block (post_attention_layernorm):
         //   residual2 = reduce(oproj) + residual1
@@ -1114,21 +1350,21 @@ protected:
         ctx().consume_physical_route(
             FmbRouteFamily::ALL_REDUCE,
             GEMMA4_ATTENTION_ALL_REDUCE_SITE,
-            fmb_ring_all_reduce_route_selector(seq_len, h),
+            fmb_ring_all_reduce_route_selector(seq_len, h, cores),
             /*resolved_flags=*/0, {}, chunk.idx);
         rpu_launch_all_reduce_sum_residual_kernel(
             addr(0, "oproj"), addr(0, "residual1"), addr(0, "residual2"),
-            seq_len, h, tp, NUM_CORES);
+            seq_len, h, tp, cores);
         rpu_launch_eltwise_sub_spm_kernel(
             addr(0, "residual2"), addr(0, "residual1"), addr(0, "residual2"),
-            seq_len * h);
+            seq_len * h, c10::Half(1.0), cores);
         rpu_launch_rmsnorm_spm_kernel(
             addr(0, "residual2"), addr(0, "input_norm"),
             layer_addr(layer_idx, 0, "post_attn_norm_w"),
-            seq_len, h, eps_);
+            seq_len, h, eps_, RpuRmsNormSpmRoute::BASE, cores);
         rpu_launch_eltwise_add_spm_kernel(
             addr(0, "residual1"), addr(0, "input_norm"), addr(0, "residual2"),
-            seq_len * h);
+            seq_len * h, c10::Half(1.0), cores);
 
         // Phase 6-8: Gemma2 4-norm MLP block (pre/post_feedforward_layernorm):
         //   residual1 = pre_ff_norm(residual2)
@@ -1140,53 +1376,55 @@ protected:
         rpu_launch_rmsnorm_spm_kernel(
             addr(0, "residual2"), addr(0, "residual1"),
             layer_addr(layer_idx, 0, "pre_ff_norm_w"),
-            seq_len, h, eps_);
-        int64_t mlp_elems = seq_len * (intermediate_size() / NUM_CORES);
+            seq_len, h, eps_, RpuRmsNormSpmRoute::BASE, cores);
+        // MLP lanes equal the budget (8/6/4); MLP6 runs the padded width.
+        const int mlp_cores = mlp_tp();
+        int64_t mlp_elems = seq_len * (intermediate_size() / mlp_cores);
         ctx().consume_physical_route(
             FmbRouteFamily::LINEAR, GEMMA4_GATE_LINEAR_SITE,
             static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
             /*resolved_flags=*/0, {}, chunk.idx);
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "residual1"), lw.gate_w, addr(0, "gate"),
-            seq_len, intermediate_size(), h, 1);
+            seq_len, intermediate_size(), h, 1, mlp_cores, /*bias_spm_addr=*/0, lw.gate_s);
         rpu_launch_eltwise_unary_spm_kernel(
             addr(0, "gate"), addr(0, "gate"),
-            mlp_elems, ValuOpType::ADD, GeluMode::TANH);   // gelu_pytorch_tanh
+            mlp_elems, ValuOpType::ADD, GeluMode::TANH, mlp_cores);   // gelu_pytorch_tanh
         ctx().consume_physical_route(
             FmbRouteFamily::LINEAR, GEMMA4_UP_LINEAR_SITE,
             static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
             /*resolved_flags=*/0, {}, chunk.idx);
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "residual1"), lw.up_w, addr(0, "up"),
-            seq_len, intermediate_size(), h, 1);
+            seq_len, intermediate_size(), h, 1, mlp_cores, /*bias_spm_addr=*/0, lw.up_s);
         rpu_launch_eltwise_binary_spm_kernel(
             addr(0, "gate"), addr(0, "up"), addr(0, "gate"),
-            mlp_elems, ValuOpType::MUL, c10::Half(1.0));
+            mlp_elems, ValuOpType::MUL, c10::Half(1.0), mlp_cores);
         ctx().consume_physical_route(
             FmbRouteFamily::LINEAR, GEMMA4_DOWN_LINEAR_SITE,
             static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
             /*resolved_flags=*/0, {}, chunk.idx);
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "gate"), lw.down_w, addr(0, "down"),
-            seq_len, h, intermediate_size(), 0);
+            seq_len, h, intermediate_size(), 0, mlp_cores, /*bias_spm_addr=*/0, lw.down_s);
         ctx().consume_physical_route(
             FmbRouteFamily::ALL_REDUCE,
             GEMMA4_MLP_ALL_REDUCE_SITE,
-            fmb_ring_all_reduce_route_selector(seq_len, h),
+            fmb_ring_all_reduce_route_selector(seq_len, h, cores),
             /*resolved_flags=*/0, {}, chunk.idx);
         rpu_launch_all_reduce_sum_residual_kernel(
             addr(0, "down"), addr(0, "residual2"), addr(0, "residual1"),
-            seq_len, h);
+            seq_len, h, mlp_cores, cores);
         rpu_launch_eltwise_sub_spm_kernel(
             addr(0, "residual1"), addr(0, "residual2"), addr(0, "residual1"),
-            seq_len * h);
+            seq_len * h, c10::Half(1.0), cores);
         rpu_launch_rmsnorm_spm_kernel(
             addr(0, "residual1"), addr(0, "input_norm"),
             layer_addr(layer_idx, 0, "post_ff_norm_w"),
-            seq_len, h, eps_);
+            seq_len, h, eps_, RpuRmsNormSpmRoute::BASE, cores);
         rpu_launch_eltwise_add_spm_kernel(
             addr(0, "residual2"), addr(0, "input_norm"), addr(0, "residual1"),
-            seq_len * h);
+            seq_len * h, c10::Half(1.0), cores);
 
         // T6 PLE: per-layer side-input injection (E4B) + layer_scalar. residual1
         // (replicated [seq,h]) holds the pre-PLE layer output. Both PLE linears
@@ -1194,12 +1432,14 @@ protected:
         // broadcasts (no scatter) and residual1 stays replicated across cores.
         if (has_ple_) {
             const int64_t pd = ple_dim_;
-            const int64_t pc = pd / NUM_CORES;   // per-core ple cols (gate col-partition)
+            // PLE lanes: eight at budget 8, four at budgets 4/6.
+            const int ple_cores = ple_tp();
+            const int64_t pc = pd / ple_cores;   // per-core ple cols (gate col-partition)
             // Mirror the MLP col->row pattern: gate is COL-partitioned (core c
             // owns ple cols [c*pc, (c+1)*pc)), so the side-input must be SCATTERED
             // the same way (core c <- side[L][:, c*pc:(c+1)*pc]); proj is then
             // row-partitioned (consumes the partitioned gate) + all-reduce ->
-            // replicated [seq,h]. side_input_ is [num_layers, NUM_CORES, seq, pc]
+            // replicated [seq,h]. side_input_ is [num_layers, ple_cores, seq, pc]
             // core-major; mutable since the src ptr drifts per forward.
             // chunk.offset selects rows within each core block, so this is also
             // correct for chunked prefill (core_stride spans the full core block).
@@ -1212,7 +1452,7 @@ protected:
                 /*resolved_flags=*/0, {}, chunk.idx);
             rpu_launch_ddr_scatter_spm_dma_mutable(
                 &side_live_base_, side_off_bytes, seq_len * pc,
-                seq_len_ * pc * DWIDTH, addr(0, "ple_side"), NUM_CORES);
+                seq_len_ * pc * DWIDTH, addr(0, "ple_side"), ple_cores);
 
             // gate = per_layer_input_gate(residual1)  [h -> pd], COL-partition.
             ctx().consume_physical_route(
@@ -1221,54 +1461,68 @@ protected:
                 /*resolved_flags=*/0, {}, chunk.idx);
             rpu_launch_linear_spm_to_spm_acc16_kernel(
                 addr(0, "residual1"), lw.ple_gate_w, addr(0, "ple_gate"),
-                seq_len, pd, h, /*partition=*/1, /*num_cores=*/NUM_CORES);
+                seq_len, pd, h, /*partition=*/1, /*num_cores=*/ple_cores);
             rpu_launch_eltwise_unary_spm_kernel(
                 addr(0, "ple_gate"), addr(0, "ple_gate"),
-                seq_len * pc, ValuOpType::ADD, GeluMode::TANH);   // gelu_pytorch_tanh
+                seq_len * pc, ValuOpType::ADD, GeluMode::TANH, ple_cores);   // gelu_pytorch_tanh
             rpu_launch_eltwise_mul_spm_kernel(
                 addr(0, "ple_gate"), addr(0, "ple_side"), addr(0, "ple_gate"),
-                seq_len * pc);
+                seq_len * pc, ple_cores);
 
             // proj = per_layer_projection(gate)  [pd -> h], ROW-part + all-reduce
             // (with a zeros residual), then post_per_layer_input_norm, then residual
             // add. Zero the residual buffer in-place via self-subtract (residual1 is
             // replicated [seq,h] here) so no Persistent chunk-sized buffer is needed.
+            // Budget 6 keeps four PLE producers: clear all six ring input shards
+            // before the partial producer overwrites its leading four.
+            if (ple_cores != cores) {
+                ctx().consume_physical_route(
+                    FmbRouteFamily::ALL_REDUCE,
+                    GEMMA4_PLE_PREPARE_ALL_REDUCE_SITE,
+                    static_cast<int64_t>(
+                        Gemma4AllReduceRoute::PREPARE_RING_INPUT),
+                    /*resolved_flags=*/0, {ple_cores, cores}, chunk.idx);
+                rpu_prepare_ring_all_reduce_input(
+                    addr(0, "down"), seq_len, h, ple_cores, cores);
+            }
             ctx().consume_physical_route(
                 FmbRouteFamily::LINEAR, GEMMA4_PLE_PROJ_LINEAR_SITE,
                 static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
                 /*resolved_flags=*/0, {}, chunk.idx);
             rpu_launch_linear_spm_to_spm_acc16_kernel(
                 addr(0, "ple_gate"), lw.ple_proj_w, addr(0, "down"),
-                seq_len, h, pd, /*partition=*/0, /*num_cores=*/NUM_CORES);
+                seq_len, h, pd, /*partition=*/0, /*num_cores=*/ple_cores);
             rpu_launch_eltwise_sub_spm_kernel(
                 addr(0, "residual1"), addr(0, "residual1"), addr(0, "ple_zero"),
-                seq_len * h);
+                seq_len * h, c10::Half(1.0), cores);
             ctx().consume_physical_route(
                 FmbRouteFamily::ALL_REDUCE,
                 GEMMA4_PLE_ALL_REDUCE_SITE,
-                fmb_ring_all_reduce_route_selector(seq_len, h),
+                fmb_ring_all_reduce_route_selector(seq_len, h, cores),
                 /*resolved_flags=*/0, {}, chunk.idx);
             rpu_launch_all_reduce_sum_residual_kernel(
                 addr(0, "down"), addr(0, "ple_zero"), addr(0, "residual2"),
-                seq_len, h);
+                seq_len, h, ple_cores, cores);
             rpu_launch_rmsnorm_spm_kernel(
                 addr(0, "residual2"), addr(0, "residual2"),
-                layer_addr(layer_idx, 0, "ple_post_norm_w"), seq_len, h, eps_);
+                layer_addr(layer_idx, 0, "ple_post_norm_w"), seq_len, h, eps_,
+                RpuRmsNormSpmRoute::BASE, cores);
             rpu_launch_eltwise_add_spm_kernel(
                 addr(0, "residual1"), addr(0, "residual2"), addr(0, "residual1"),
-                seq_len * h);
+                seq_len * h, c10::Half(1.0), cores);
 
             // layer output *= layer_scalar (audit §6; per-layer, != 1.0).
             rpu_launch_eltwise_binary_scalar_spm_kernel(
                 addr(0, "residual1"), c10::Half(lw.layer_scalar),
-                addr(0, "residual1"), seq_len * h, ValuOpType::MUL);
+                addr(0, "residual1"), seq_len * h, ValuOpType::MUL, cores);
         }
 
         // Last layer: final RMSNorm (Persistent slot).
         if (is_last_layer) {
             rpu_launch_rmsnorm_spm_kernel(
                 addr(0, "residual1"), addr(0, "residual1"),
-                addr(0, "final_norm_w"), seq_len, h, eps_);
+                addr(0, "final_norm_w"), seq_len, h, eps_,
+                RpuRmsNormSpmRoute::BASE, cores);
         }
 
         if (!ctx().output_to_spm) {
@@ -1291,6 +1545,11 @@ private:
                 static_cast<int64_t>(geometry.is_global),
                 static_cast<int64_t>(geometry.is_kv_shared)});
         }
+        if (num_cores() != 8) {
+            identity.insert(identity.end(), {
+                1, num_cores(), attn_tp(), mlp_tp(), ple_tp(), NUM_CORES,
+                logical_intermediate_size_, intermediate_size()});
+        }
         identity.push_back(static_cast<int64_t>(layer_weights_.size()));
         for (const auto& weights : layer_weights_) {
             append_kvinsert_cost_scalar_identity(identity, weights.layer_scalar);
@@ -1302,6 +1561,13 @@ private:
                     &weights.gate_w, &weights.up_w, &weights.down_w,
                     &weights.ple_gate_w, &weights.ple_proj_w, &weights.ple_post_norm_w}) {
                 append_kvinsert_cost_tensor_identity(identity, *tensor);
+            }
+            // FP16 keeps its identity; quantized owners also bind every scale.
+            if (projection_type() != at::kHalf) {
+                for (const auto* tensor : {
+                        &weights.q_s, &weights.k_s, &weights.v_s, &weights.o_s,
+                        &weights.gate_s, &weights.up_s, &weights.down_s})
+                    append_kvinsert_cost_tensor_identity(identity, *tensor);
             }
         }
         for (const auto* tensor : {
@@ -1434,6 +1700,7 @@ private:
     // T6 PLE state.
     bool has_ple_ = false;
     int64_t ple_dim_ = 0;
+    int64_t logical_intermediate_size_ = 0;  // checkpoint MLP width (physical may pad)
     at::Tensor side_input_;          // per-forward [num_layers, seq, ple_dim] (kept alive)
     uint64_t side_live_base_ = 0;    // mutable-DMA base (RpuGetDevAddr of side_input_)
     double eps_ = 1e-6;
@@ -1446,10 +1713,20 @@ private:
     bool    original_is_causal_ = true;  // true causal intent (ctx().is_causal clobbered on windowed path)
     bool preparing_forward_masks_ = false;
     std::vector<WindowedMask> windowed_masks_;
-    // Host mask memo by (qn, kv). The decode cursor advances every step, so this
-    // cache must be bounded. CPU entries are safe to evict: sdpa_prepare_mask copies
-    // their contents into separate stable device slots before DMA captures addresses.
-    // A cache miss rebuilds the host mask in O(qn * win_len).
+    // Host mask memo by (qn, kv). kv is the decode cursor — it advances every
+    // step — so this map used to gain an entry per generated token and never
+    // drop one. It is the one shape-keyed cache here that is SAFE to evict: the
+    // entry is a CPU tensor, no device address escapes (prepare_windowed_masks
+    // hands it to sdpa_prepare_mask, which copies the content into the separate
+    // shape-keyed STABLE RPU slot that the DMA actually bakes), and a miss costs
+    // only the O(qn*win_len) rebuild below.
+    //
+    // Measured 2026-08-10 on the dev host (instrumented distinct-key high-water): a
+    // 512-token prefill + 32-step windowed decode of E4B reaches exactly 32
+    // entries — one per decode step, forever, which is the unbounded growth this
+    // bound exists to stop. 256 keeps half a sliding window of decode steps
+    // resident (each decode entry is 1 x win_len fp16, i.e. <=1 KB) and the
+    // expensive entries — the wide prefill chunks — are few and stay MRU.
     static constexpr size_t kMaxWindowedMasks = 256;
     rpu::BoundedShapeMap<std::pair<int64_t, int64_t>, at::Tensor, rpu::PairHash>
         windowed_mask_cache_{kMaxWindowedMasks, rpu::ShapeMapPolicy::Evict,
@@ -1480,6 +1757,26 @@ void rpu_gemma4_destroy(int64_t handle) {
 void rpu_gemma4_set_chunk_envelope(int64_t handle, int64_t max_kv_len, int64_t chunk) {
     Gemma4Registry::get(handle, "rpu_gemma4_set_chunk_envelope")
         ->set_chunk_envelope(max_kv_len, chunk);
+}
+
+void rpu_gemma4_set_execution_core_count(int64_t handle, int64_t cores) {
+    Gemma4Registry::get(handle, "rpu_gemma4_set_execution_core_count")
+        ->set_execution_cores(cores);
+}
+
+std::vector<int64_t> rpu_gemma4_get_execution_topology(int64_t handle) {
+    return Gemma4Registry::get(handle, "rpu_gemma4_get_execution_topology")
+        ->execution_topology();
+}
+
+void rpu_gemma4_set_weight_scales(
+    int64_t handle,
+    at::TensorList q_scales, at::TensorList k_scales, at::TensorList v_scales,
+    at::TensorList o_scales, at::TensorList gate_scales, at::TensorList up_scales,
+    at::TensorList down_scales) {
+    Gemma4Registry::get(handle, "rpu_gemma4_set_weight_scales")
+        ->set_weight_scales(q_scales, k_scales, v_scales, o_scales,
+                            gate_scales, up_scales, down_scales);
 }
 
 void rpu_gemma4_set_weights(

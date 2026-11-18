@@ -73,11 +73,11 @@ using Launch=void(*)(uint32_t,const at::Tensor&,const at::Tensor&,const at::Tens
 int main(){
  auto&g=RpuKernelGraph::active();const uint32_t base=allocator.addr(0,0),in=base+0x10000,out=in+65536,out2=out+32768;
  const std::array<Launch,3>launches{rpu_launch_g05_kv_owner_linear_w8a16_acc32_kernel,rpu_launch_g05_q_gate_linear_w8a16_acc32_kernel,rpu_launch_g05_gate_up_linear_w8a16_acc32_kernel};
- for(int mode=0;mode<3;++mode){auto launch=[&](auto&&...args){launches[mode](args...,TEST_ACC32);};const int N=mode==2?4096:2048;const auto id=mode==0?KV:mode==1?QG:GU;const int grid=mode==0?2:mode==1?4:12;
+ for(int mode=0;mode<3;++mode){auto launch=[&](auto&&...args){launches[mode](args...,TEST_ACC32);};const int N=mode==2?4096:2048;const auto id=mode==0?KV:mode==1?QG:GU;const int grid=mode==0?6:mode==1?12:14;
   at::Tensor a{0x1234567800ULL},b{0x2345678900ULL},as{0x3456789a00ULL},bs{0x456789ab00ULL};a.rows=b.rows=N;as.rows=bs.rows=N;as.dtype=bs.dtype=at::kHalf;as.rank=bs.rank=1;
   for(int pass=0;pass<2;++pass){a.address+=256;b.address+=512;as.address+=768;bs.address+=1024;auto begin=g.submissions.size();launch(in,a,b,as,bs,out,out2);assert(g.submissions.size()==begin+(mode==0?2:1));const auto&s=g.submissions[begin];assert(s.id==id&&s.grid==std::vector<uint16_t>({uint16_t(grid),1,1}));
-   assert(pair(s,0)==in&&pair(s,2)==a.address>>8&&pair(s,4)==out&&pair(s,24)==b.address>>8&&pair(s,26)==out2&&pair(s,20)==as.address>>8&&pair(s,28)==bs.address>>8);
-   assert(pair(s,6)==0&&s.regs.at(8)==32&&pair(s,10)==uint32_t(N/8)&&s.regs.at(12)==1024&&s.regs.at(13)==64&&s.regs.at(15)==8&&pair(s,16)==2048&&pair(s,18)==uint32_t(N/4)&&s.regs.at(22)==1&&s.regs.at(23)==1);
+   assert(pair(s,0)==in&&pair(s,2)==a.address>>8&&pair(s,4)==out&&pair(s,32)==b.address>>8&&pair(s,36)==out2&&pair(s,20)==as.address>>8&&pair(s,34)==bs.address>>8);
+   assert(pair(s,6)==0&&s.regs.at(8)==1&&s.regs.at(9)==32&&pair(s,10)==uint32_t(N/8)&&s.regs.at(12)==1024&&s.regs.at(13)==64&&s.regs.at(15)==8&&pair(s,16)==2048&&pair(s,18)==uint32_t(N/4)&&pair(s,22)==0&&pair(s,24)==0&&s.regs.at(26)==2&&s.regs.at(27)==1);
    assert(s.operands[0].abi.role==GraphDdrRegisterRole::Int8ModelWeight&&s.operands[1].abi.role==GraphDdrRegisterRole::Int8ModelWeight&&s.operands[2].abi.role==GraphDdrRegisterRole::PerChannelScale&&s.operands[3].abi.role==GraphDdrRegisterRole::PerChannelScale);
    if(mode==0){const auto&f=g.submissions.back();assert(f.id==FAN&&f.operands.empty()&&f.grid==std::vector<uint16_t>({1,1,1})&&pair(f,0)==out-base&&pair(f,2)==out2-base);}
   }
@@ -86,7 +86,7 @@ int main(){
   for(auto offsets:{std::array<uint32_t,3>{in,in,out2},{in,out,out},{in,out,base+SpmAllocator::SPM_USABLE-256},{in+1,out,out2},{base-256,out,out2}})reject([&]{launch(offsets[0],a,b,as,bs,offsets[1],offsets[2]);});
  }
  at::Tensor scale{0x6789abcd00ULL};scale.dtype=at::kHalf;scale.rank=1;scale.rows=4096;const uint32_t weight=base+0x100000;
- rpu_launch_g05_gateup_resident_w8a16_kernel(in,weight,out,scale);const auto&r=g.submissions.back();assert(r.id==RES&&r.grid==std::vector<uint16_t>({6,1,1})&&r.operands.size()==1&&pair(r,2)==weight&&pair(r,20)==scale.address>>8&&pair(r,18)==1024&&r.regs.at(23)==1);
+ rpu_launch_g05_gateup_resident_w8a16_kernel(in,weight,out,scale);const auto&r=g.submissions.back();assert(r.id==RES&&r.grid==std::vector<uint16_t>({7,1,1})&&r.operands.size()==1&&pair(r,2)==weight&&pair(r,20)==scale.address>>8&&pair(r,18)==1024&&r.regs.at(26)==2&&r.regs.at(27)==1);
  reject([&]{rpu_launch_g05_gateup_resident_w8a16_kernel(in,in,out,scale);});KernelCache::instance().missing.insert(RES);reject([&]{rpu_launch_g05_gateup_resident_w8a16_kernel(in,weight,out,scale);});KernelCache::instance().missing.clear();auto invalid=scale;invalid.rows=512;reject([&]{rpu_launch_g05_gateup_resident_w8a16_kernel(in,weight,out,invalid);});
  at::Tensor packed{0x789abcde00ULL};packed.rows=8;packed.cols=1048576;rpu_launch_g05_gateup_resident_w8a16_preload(packed,weight);assert(dma_launches==1);auto bad=packed;bad.dtype=at::kHalf;reject([&]{rpu_launch_g05_gateup_resident_w8a16_preload(bad,weight);});bad=packed;bad.cols=524288;reject([&]{rpu_launch_g05_gateup_resident_w8a16_preload(bad,weight);});reject([&]{rpu_launch_g05_gateup_resident_w8a16_preload(packed,base+SpmAllocator::SPM_USABLE-524288);});
 }

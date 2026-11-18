@@ -285,6 +285,81 @@ int main() {
            "candidate descriptor v3 round-trips physical lengths, lifecycle, "
            "ACC policy, and the complete per-site route manifest");
 
+    // Opt-in ranking is wire authority and cache identity, while ordinary
+    // owners keep their byte-compatible V3 descriptors.
+    auto ranked_candidate = routed_wall_candidate;
+    ranked_candidate.ranking = {v3::FmbPrefillRankingPolicy::OUTER_THEN_MIXER_V1, 32};
+    const auto ranked_descriptor = v3::encode_fmb_prefill_stage_candidate(ranked_candidate);
+    const auto ranked_decoded = v3::decode_fmb_prefill_stage_candidate(ranked_descriptor);
+    EXPECT(ranked_descriptor[0] == 4 && routed_wall_descriptor[0] == 3 &&
+               ranked_descriptor.size() == routed_wall_descriptor.size() + 2 &&
+               ranked_decoded.ranking.mixer_calls == 32 &&
+               ranked_decoded.ranking.policy == v3::FmbPrefillRankingPolicy::OUTER_THEN_MIXER_V1,
+           "opt-in V4 round-trips ranking without changing legacy V3");
+    EXPECT(!v3::detail::fmb_prefill_stage_candidate_same_identity(
+               ranked_candidate, routed_wall_candidate),
+           "ranking policy participates in candidate identity");
+    v3::FmbPreparedStageCandidateCache ranking_cache;
+    auto prepared_ranked = ranking_cache.prepare(ranked_descriptor);
+    auto changed_ranked = ranked_descriptor;
+    changed_ranked.back() = 33;
+    EXPECT(prepared_ranked != ranking_cache.prepare(changed_ranked),
+           "same manifest with a different metric cannot reuse a prepared descriptor");
+    for (const int64_t policy : {0, 3}) {
+        auto bad = ranked_descriptor;
+        bad[bad.size() - 2] = policy;
+        EXPECT(throws_c10([&] { v3::decode_fmb_prefill_stage_candidate(bad); }),
+               "V4 rejects default or unknown policy tags");
+    }
+    for (const int64_t count : {0, 1729}) {
+        auto bad = ranked_descriptor;
+        bad.back() = count;
+        EXPECT(throws_c10([&] { v3::decode_fmb_prefill_stage_candidate(bad); }),
+               "V4 rejects missing or impossible mixer counts");
+    }
+    const auto make_ranked = [](int64_t capacity, int64_t calls,
+            int64_t execution = 4096, int64_t logical = 4096,
+            v3::FmbPrefillRankingPolicy policy = v3::FmbPrefillRankingPolicy::OUTER_THEN_MIXER_V1) {
+        v3::LayoutContext layout;
+        layout.chunk_size = capacity;
+        auto plan = v3::compose_fmb_default_three_stage_chunk_plan(
+            layout, execution, 0, v3::ChunkMode::SEQUENTIAL);
+        v3::FmbPrefillStageCandidate candidate{execution, capacity, capacity, plan, {}};
+        candidate.physical_manifest = {
+            v3::FmbPhysicalManifestState::COMPLETE, logical, execution,
+            execution-logical, logical, execution,
+            v3::FmbGraphLifecycle::BOUNDED_ONESHOT,
+            v3::FmbLinearAccumulationPolicy::ACC16,
+            {{1, v3::FmbRouteFamily::GRAPH_SCHEDULE, 1, 0, {}}}};
+        candidate.ranking = {policy, calls};
+        return candidate;
+    };
+    const auto c704 = make_ranked(704, 32), c768 = make_ranked(768, 11);
+    EXPECT(v3::detail::fmb_prefill_stage_candidate_score(c768) <
+               v3::detail::fmb_prefill_stage_candidate_score(c704),
+           "native AUTO rank agrees with Python: six outer calls then 11 vs 32 mixers");
+    const auto old640 = make_ranked(640, 5, 1600, 1539);
+    auto new640 = old640, new768 = make_ranked(768, 5, 1600, 1539);
+    EXPECT(v3::detail::fmb_prefill_stage_candidate_score(old640) <
+               v3::detail::fmb_prefill_stage_candidate_score(new768),
+           "V1 remains tail-deficit-first on equal outer and mixer counts");
+    new640.ranking.policy = new768.ranking.policy =
+        v3::FmbPrefillRankingPolicy::OUTER_THEN_MIXER_LARGER_WINDOW_V2;
+    EXPECT(v3::detail::fmb_prefill_stage_candidate_score(new768) <
+               v3::detail::fmb_prefill_stage_candidate_score(new640),
+           "V2 uses larger capacity before tail deficit, matching Python");
+    const auto v2_descriptor = v3::encode_fmb_prefill_stage_candidate(new640);
+    EXPECT(v3::decode_fmb_prefill_stage_candidate(v2_descriptor).ranking.policy ==
+               v3::FmbPrefillRankingPolicy::OUTER_THEN_MIXER_LARGER_WINDOW_V2 &&
+               ranking_cache.prepare(v2_descriptor) != ranking_cache.prepare(
+                   v3::encode_fmb_prefill_stage_candidate(old640)),
+           "V4 supports V1/V2 and separates policy versions in prepared cache");
+    const auto less_padding = make_ranked(640, 3, 800, 769, new640.ranking.policy);
+    const auto more_padding = make_ranked(768, 3, 832, 769, new640.ranking.policy);
+    EXPECT(v3::detail::fmb_prefill_stage_candidate_score(less_padding) <
+               v3::detail::fmb_prefill_stage_candidate_score(more_padding),
+           "V2 prefers less actual execution padding before larger C");
+
     auto collective_candidate = routed_wall_candidate;
     collective_candidate.physical_manifest.routes.back().family =
         v3::FmbRouteFamily::COLLECTIVE;
@@ -1033,6 +1108,24 @@ int main() {
                decoded_one_tail.qkv_chunk_size == 240 &&
                decoded_one_tail.stage_plan.compute.chunks.front().len == 225,
            "descriptor keeps v16 capacity distinct from a short physical tail");
+    for (const int64_t rows : {INT64_C(82), INT64_C(41)}) {
+        const int64_t capacity = ((rows + 15) / 16) * 16;
+        const auto plan = v3::compose_fmb_three_stage_chunk_plan(
+            {{0, 0, rows, rows}}, {{0, 0, rows, rows}},
+            {{0, 0, rows, rows}}, {{0, rows}}, v3::ChunkMode::SEQUENTIAL);
+        const auto encoded = v3::encode_fmb_prefill_stage_candidate(
+            {rows, capacity, capacity, plan});
+        const auto decoded = v3::decode_fmb_prefill_stage_candidate(encoded);
+        EXPECT(decoded.compute_chunk_size == capacity &&
+                   decoded.stage_plan.compute.chunks.front().len == rows &&
+                   decoded.stage_plan.qkv.chunks.front().len == rows,
+               "GR00T Z2 keeps logical rows and aligned capacity separate");
+        EXPECT(throws_c10_containing(
+                   [&] { (void)v3::encode_fmb_prefill_stage_candidate(
+                       {rows, rows, rows, plan}); },
+                   "16-aligned"),
+               "logical GR00T rows cannot be used as physical capacity");
+    }
 
     v3::detail::validate_fmb_exact_chunk_size(
         /*requested_chunk_size=*/256, /*execution_len=*/256,

@@ -1,29 +1,125 @@
 # RhinoVLA 配置
 
-RhinoVLA 分为公开 v1 和 v3。两者的模型权重、动作维度和输入各自配套，先按手中的资产选择入口。
+[配置总览](../README.md) · [全部配置](#configurations) · [核数支持矩阵](../../../docs/planner_core_topology.zh.md) · [权重准备](../WEIGHTS.md) · [参数说明](../PARAMETERS.md)
 
-<a id="路径迁移"></a>
-<a id="weight-sources"></a>
-<a id="weight-recipes"></a>
-<a id="weights"></a>
+先区分官方 v1、v3 调用者工厂和 v3 源码入口。三类配置都用 `examples/run.py` 运行，但需要的输入与权重资产不同。
 
-## 配置说明
+<a id="配置矩阵"></a>
 
-| 模型 | 配置 | 权重与配套资产 | 详细说明 |
-|---|---|---|---|
-| v1，72D 动作 | [官方 FP16](v1/fp16.toml) | 官方 `HuixiAI/RhinoVLA` checkpoint、固定源码和 LIBERO 输入；加载为 FP16 | [下载、输入准备与运行](v1/README.md) |
-| v3，96D 动作 | [FP16](v3/fp16.toml)、[专家 W8](v3/w8a16_action.toml)、[完整专家 W8](v3/w8a16_action_adarms.toml) | 同一套公开浮点 checkpoint、固定模型源码和准备工具生成的请求；W8 在加载时转换 | [基准与配置增量](v3/README.md#baseline) |
-| v3，RTC | [FP16](v3/rtc_fp16.toml)、[专家 W8](v3/rtc_w8a16_action.toml)、[完整专家 W8](v3/rtc_w8a16_action_adarms.toml)、[全流水线 W8](v3/rtc_w8a16_pipeline.toml)、[HIGH/vector QK](v3/rtc_w8a16_pipeline_high_fused_vector_qk.toml) | 与对应 non-RTC 配方共用固定源码和原始 checkpoint；请求增加已确定的动作前缀与 `delay=0..6` | [输入契约、运行与验证范围](v3/README.md#rtc) |
-| v3，全流水线量化 | [全流水线 W8](v3/w8a16_pipeline.toml)、[HIGH/vector QK](v3/w8a16_pipeline_high_fused_vector_qk.toml) | 与上述 v3 配置共用原始 checkpoint；量化范围扩至 Vision、Text、Action IO 和 AdaRMS | [量化范围与计算精度](v3/README.md#full-pipeline) |
+| 路径 | 配方 | 所需资产与入口 |
+|---|---|---|
+| v1 官方 non-RTC | FP16 | 固定版本源码、checkpoint 和 CPU fixture；[v1 指南](v1/README.md) |
+| v3 调用者工厂 | FP16、W8A16 Action、W8A16 pipeline | 调用者提供 runtime factory、request 与 factory config；[v3 指南](v3/README.md) |
+| v3 源码入口 | FP16、W8A16 Action、W8A16 pipeline 及融合变体 | v3 steps_150000 non-RTC 源码、checkpoint 和 CPU fixture；也可交给 `validate_v3.py` 校验；[controlled 指南](v3/controlled/README.md) |
 
-W8A16 表示所选线性投影使用 INT8 权重、FP16 激活和逐输出通道 FP16 scale。v3 的 non-RTC 和 RTC factory 配置共用一份原始权重，转换结果保存在运行进程中。
+<a id="运行"></a>
 
-<a id="quantization"></a>
-<a id="使用"></a>
+## 运行 v1 配置
 
-## 准备与运行
+按 [v1 指南](v1/README.md)准备完整资产目录，从仓库根目录执行：
 
-- **v1：** 按 [v1 说明](v1/README.md#quantization)下载固定版本、准备输入，再运行 `examples/run.py`。
-- **v3：** 按 [v3 说明](v3/README.md#quantization)下载固定源码与 checkpoint，生成输入和 factory JSON，再运行 `examples/run.py`。
+```bash
+python examples/run.py --config examples/configs/rhinovla/v1/fp16.toml --check-config
+python examples/run.py --config examples/configs/rhinovla/v1/fp16.toml
+```
 
-[九份独立配置](v3/controlled/README.md)提供输入缓存、HIGH、vector K/QK 与 partial RoPE 的单独选择，通过 `scripts/validate_rhinovla_v3.py` 运行；增加 `--rtc --delay 6` 可在原配方上启用 RTC，delay 可选 `0..6`。
+v3 工厂模板的执行范围由调用者实现决定。支持状态与 4/6/8 核见下方配置表；“支持”只表示运行时检查通过，数值误差见性能报告。`--check-config` 检查配置，输入资产在运行时校验。
+
+<!-- model-configurations-start -->
+
+<a id="configurations"></a>
+## 全部配置与输入范围
+
+每组先列各配置不同的项，再列本组配置相同的项；修改相机、文本长度、精度或核数时，同时满足联动限制。4/6/8 核列：● 已在板上运行通过（4/6 核写出各组件实际核数），○ 支持但未在板上运行，✕ 不支持（原因列在表下）。支持状态和 CPU 线程数的读法见配置表说明；实测耗时见性能报告：RhinoVLA。
+
+### 自定义factory
+
+| 配置 | 支持状态 | 精度 | 量化范围 | 4 核 | 6 核 | 8 核 | CPU线程数 |
+|---|---|---|---|---|---|---|---|
+| [v3/fp16.toml](v3/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | ✕ 不支持 | ✕ 不支持 | ● 已实测 | 未设置（沿用环境） |
+| [v3/w8a16_action.toml](v3/w8a16_action.toml) | 支持（`SUPPORTED`） | w8a16 | action | ✕ 不支持 | ✕ 不支持 | ● 已实测 | 未设置（沿用环境） |
+| [v3/w8a16_action_adarms.toml](v3/w8a16_action_adarms.toml) | 支持（`SUPPORTED`） | w8a16 | action | ✕ 不支持 | ✕ 不支持 | ● 已实测 | 未设置（沿用环境） |
+| [v3/w8a16_pipeline.toml](v3/w8a16_pipeline.toml) | 支持（`SUPPORTED`） | w8a16 | pipeline | ✕ 不支持 | ✕ 不支持 | ● 已实测 | 12 |
+| [v3/w8a16_pipeline_high_fused_vector_qk.toml](v3/w8a16_pipeline_high_fused_vector_qk.toml) | 支持（`SUPPORTED`） | w8a16 | pipeline | ✕ 不支持 | ✕ 不支持 | ● 已实测 | 12 |
+
+本组配置相同的项：
+
+| 项目 | 值 |
+|---|---|
+| 输入类型 | 调用者 request tensor mapping |
+| num_steps 默认值 | 10 |
+| 文本可调范围 | 由factory的request合同决定 |
+| 图像/音频可调范围 | 由factory的request合同决定 |
+| 生成可调范围 | num_steps=10 |
+| 其他输入形状 | checkpoint/runtime_factory/request由调用者提供 |
+| 联动限制 | trust_model_code=true；factory.predict(**request)校验具体shape，量化选择核对实际owner。 |
+| 默认核数 | 8 |
+| 权重 | `/path/to/rhinovla-v3/checkpoint`（profile 登记名 `rhinovla-controlled`）；准备方法见[权重准备](../WEIGHTS.md) |
+| 入口 | [run.py](../../run.py) |
+
+- ✕ 4/6 核不支持：原生实现只有 8 核：视觉 merger 融合 kernel 和动作专家 owner 按 8 核编写。
+
+输入校验来源：[runner.py](../../../examples/runners/rhinovla/runner.py)。
+
+### 官方固定fixture
+
+| 项目 | 值 |
+|---|---|
+| 配置 | [v1/fp16.toml](v1/fp16.toml) |
+| 支持状态 | 支持（`SUPPORTED`） |
+| 精度 | fp16 |
+| 量化范围 | — |
+| 输入类型 | 冻结non-RTC fixture |
+| num_steps 默认值 | 10 |
+| 文本可调范围 | 固定prefix171 |
+| 图像/音频可调范围 | 两路vision grid[1,16,16] |
+| 生成可调范围 | num_steps=10；rtc=false |
+| 其他输入形状 | B=1；action[30,72] |
+| 联动限制 | 源码提交、checkpoint SHA、fixture类型固定；此TOML不提供任意request替换。 |
+| 默认核数 | 8 |
+| 4 核 | ✕ 不支持 |
+| 6 核 | ✕ 不支持 |
+| 8 核 | ● 已实测 |
+| CPU线程数 | 未设置（沿用环境） |
+| 权重 | `rhinovla-controlled` |
+| 入口 | [run.py](../../run.py) |
+
+- ✕ 4/6 核不支持：原生实现只有 8 核：视觉 merger 融合 kernel 和动作专家 owner 按 8 核编写。
+
+输入校验来源：[runner.py](../../../examples/runners/rhinovla/runner.py)。
+
+### v3 源码入口
+
+| 配置 | 支持状态 | 精度 | 量化范围 | 4 核 | 6 核 | 8 核 |
+|---|---|---|---|---|---|---|
+| [v3/controlled/fp16.toml](v3/controlled/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | ✕ 不支持 | ✕ 不支持 | ● 已实测 |
+| [v3/controlled/w8a16_action.toml](v3/controlled/w8a16_action.toml) | 支持（`SUPPORTED`） | w8a16 | action | ✕ 不支持 | ✕ 不支持 | ● 已实测 |
+| [v3/controlled/w8a16_pipeline.toml](v3/controlled/w8a16_pipeline.toml) | 支持（`SUPPORTED`） | w8a16 | pipeline | ✕ 不支持 | ✕ 不支持 | ● 已实测 |
+| [v3/controlled/w8a16_pipeline_high.toml](v3/controlled/w8a16_pipeline_high.toml) | 支持（`SUPPORTED`） | w8a16 | pipeline | ✕ 不支持 | ✕ 不支持 | ● 已实测 |
+| [v3/controlled/w8a16_pipeline_high_fused.toml](v3/controlled/w8a16_pipeline_high_fused.toml) | 支持（`SUPPORTED`） | w8a16 | pipeline | ✕ 不支持 | ✕ 不支持 | ● 已实测 |
+| [v3/controlled/w8a16_pipeline_high_fused_vector_k.toml](v3/controlled/w8a16_pipeline_high_fused_vector_k.toml) | 支持（`SUPPORTED`） | w8a16 | pipeline | ✕ 不支持 | ✕ 不支持 | ● 已实测 |
+| [v3/controlled/w8a16_pipeline_high_fused_vector_qk.toml](v3/controlled/w8a16_pipeline_high_fused_vector_qk.toml) | 支持（`SUPPORTED`） | w8a16 | pipeline | ✕ 不支持 | ✕ 不支持 | ● 已实测 |
+| [v3/controlled/w8a16_pipeline_high_fused_vector_qk_partial_rope.toml](v3/controlled/w8a16_pipeline_high_fused_vector_qk_partial_rope.toml) | 支持（`SUPPORTED`） | w8a16 | pipeline | ✕ 不支持 | ✕ 不支持 | ● 已实测 |
+| [v3/controlled/w8a16_pipeline_input_cache.toml](v3/controlled/w8a16_pipeline_input_cache.toml) | 支持（`SUPPORTED`） | w8a16 | pipeline | ✕ 不支持 | ✕ 不支持 | ● 已实测 |
+
+本组配置相同的项：
+
+| 项目 | 值 |
+|---|---|
+| 输入类型 | validate_v3.py reference 生成的 CPU FP32 fixture（第 1 组输入） |
+| num_steps 默认值 | 10 |
+| 文本可调范围 | 固定（fixture 内的 input_ids） |
+| 图像/音频可调范围 | 固定（fixture 内的图像网格） |
+| 生成可调范围 | num_steps=10；rtc=false |
+| 其他输入形状 | source_dir/checkpoint/fixture 由用户提供；B=1；action[30,96] |
+| 联动限制 | 源码提交、checkpoint SHA256 和 fixture 元数据须匹配 v3 steps_150000 non-RTC；[model.opt_in] 须与登记 profile 一致；trust_model_code=true。 |
+| 默认核数 | 8 |
+| CPU线程数 | 未设置（沿用环境） |
+| 权重 | `/path/to/rhinovla-v3/source/models/rhinovla_v3/steps_150000/model.pt`；准备方法见[权重准备](../WEIGHTS.md) |
+| 入口 | [run.py](../../run.py) |
+
+- ✕ 4/6 核不支持：原生实现只有 8 核：视觉 merger 融合 kernel 和动作专家 owner 按 8 核编写。
+
+输入校验来源：[runner.py](../../../examples/runners/rhinovla/runner.py) · [validate_rhinovla_v3.py](../../../scripts/validate_rhinovla_v3.py)。
+
+<!-- model-configurations-end -->

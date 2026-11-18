@@ -146,6 +146,140 @@ void launch_moe_topk_by_kvsort_fp16_pass(
 
 }  // namespace
 
+namespace {
+
+struct FullKvsortParams {
+    int64_t input_elements;
+    int64_t output_elements;
+    uint16_t warps;
+    uint32_t c_per_warp;
+    uint32_t c_pad_per_warp;
+    uint16_t log_m;
+    uint16_t log_warps;
+};
+
+FullKvsortParams make_full_kvsort_params(int64_t c) {
+    constexpr int64_t kMaxPerWarp = 16384;
+    TORCH_CHECK(c > 0 && c <= 8 * kMaxPerWarp,
+                "moe_kvsort: require C in [1,131072], got ", c);
+    uint16_t warps = 1;
+    uint16_t log_warps = 0;
+    while (c > int64_t(warps) * kMaxPerWarp) {
+        warps *= 2;
+        ++log_warps;
+    }
+    // Every warp reads an integral number of v16 records. Pad only the
+    // logical input tail; larger power-of-two padding is generated in VLM.
+    const int64_t alignment = 16 * warps;
+    const int64_t input_elements = (c + alignment - 1) / alignment * alignment;
+    const uint32_t per_warp = static_cast<uint32_t>(input_elements / warps);
+    uint32_t padded = warps == 1 ? 4096 : kMaxPerWarp;
+    while (padded < per_warp) padded *= 2;
+    uint16_t log_m = 0;
+    for (uint32_t m = padded / 256; m > 1; m >>= 1) ++log_m;
+    return {input_elements, warps == 1 ? input_elements : kMaxPerWarp * warps,
+            warps, per_warp, padded, log_m, log_warps};
+}
+
+}  // namespace
+
+std::pair<int64_t, int64_t> rpu_moe_kvsort_fp16_spm_sizes(int64_t c) {
+    const auto p = make_full_kvsort_params(c);
+    return {p.input_elements, p.output_elements};
+}
+
+void rpu_launch_moe_kvsort_fp16_spm_kernel(
+    uint32_t input_key_spm_addr,
+    uint32_t input_value_spm_addr,
+    uint32_t output_key_spm_addr,
+    uint32_t output_value_spm_addr,
+    int64_t c,
+    bool descending,
+    int num_cores) {
+    const auto p = make_full_kvsort_params(c);
+    TORCH_CHECK(num_cores >= 1 && num_cores <= 8,
+                "moe_kvsort: num_cores must be in [1,8], got ", num_cores);
+    TORCH_CHECK(SPM_ALLOC.is_initialized(),
+                "moe_kvsort: SPM allocator is not initialized");
+    const uint64_t base = SPM_ALLOC.addr(0, 0);
+    const std::array<std::pair<uint64_t, uint64_t>, 4> spans{{
+        {input_key_spm_addr, uint64_t(p.input_elements) * sizeof(uint16_t)},
+        {input_value_spm_addr, uint64_t(p.input_elements) * sizeof(uint16_t)},
+        {output_key_spm_addr, uint64_t(p.output_elements) * sizeof(uint16_t)},
+        {output_value_spm_addr, uint64_t(p.output_elements) * sizeof(uint16_t)},
+    }};
+    for (size_t i = 0; i < spans.size(); ++i) {
+        const auto [address, bytes] = spans[i];
+        TORCH_CHECK(address % 32 == 0 && address >= base &&
+                        bytes <= SpmAllocator::SPM_USABLE &&
+                        address - base <= SpmAllocator::SPM_USABLE - bytes,
+                    "moe_kvsort: invalid complete core-0 SPM interval ", i);
+        for (size_t j = 0; j < i; ++j) {
+            TORCH_CHECK(address + bytes <= spans[j].first ||
+                            spans[j].first + spans[j].second <= address,
+                        "moe_kvsort: all four SPM buffers must be disjoint");
+        }
+    }
+    // Check availability before recording any padding writes. The pad kernels
+    // must precede fetching the graph-aware KVSort node, because a graph may
+    // have only one pending kernel registration at a time.
+    TORCH_CHECK(KernelCache::instance().has_loaded(KernelId::MOE_KVSORT_FP16),
+                "moe_kvsort: kvsort_dir_v1 is absent from the active oplib");
+    if (p.input_elements != c) {
+        c10::Half pad;
+        pad.x = descending ? NEG_INF_FP16 : POS_INF_FP16;
+        rpu_launch_fill_spm_kernel(input_key_spm_addr + c * sizeof(uint16_t),
+                                  p.input_elements - c, pad, num_cores);
+        rpu_launch_fill_spm_kernel(input_value_spm_addr + c * sizeof(uint16_t),
+                                  p.input_elements - c, c10::Half(0.0f), num_cores);
+    }
+    Kernel_t* kernel = GET_KERNEL(KernelId::MOE_KVSORT_FP16);
+    TORCH_CHECK(kernel != nullptr, "moe_kvsort: failed to fetch kvsort_dir_v1");
+    kernel->reset_regs();
+    set_reg_u32(kernel, 0, input_key_spm_addr / 32);
+    set_reg_u32(kernel, 2, input_value_spm_addr / 32);
+    set_reg_u32(kernel, 4, output_key_spm_addr / 32);
+    set_reg_u32(kernel, 6, output_value_spm_addr / 32);
+    set_reg_u32(kernel, 8, p.c_per_warp);
+    set_reg_u32(kernel, 10, p.c_pad_per_warp);
+    const uint16_t c_v16 = p.c_per_warp / 16;
+    const uint16_t padded_v16 = p.c_pad_per_warp / 16;
+    const uint16_t m = padded_v16 / 16;
+    kernel->set_regs(12, c_v16);
+    kernel->set_regs(13, static_cast<uint16_t>((c_v16 + 15) / 16));
+    kernel->set_regs(14, padded_v16);
+    kernel->set_regs(15, m);
+    kernel->set_regs(16, p.log_m);
+    kernel->set_regs(17, m);
+    kernel->set_regs(18, p.log_m);
+    kernel->set_regs(19, static_cast<uint16_t>(m / 2));
+    kernel->set_regs(20, static_cast<uint16_t>(m / 16));
+    kernel->set_regs(21, static_cast<uint16_t>(m * 2));
+    kernel->set_regs(22, p.warps);
+    kernel->set_regs(23, static_cast<uint16_t>(p.warps / 2));
+    kernel->set_regs(24, p.log_warps);
+    kernel->set_regs(25, static_cast<uint16_t>(
+        descending ? ALU_MIN_FP16_WMODE : ALU_MAX_FP16_WMODE));
+    kernel->set_regs(26, static_cast<uint16_t>(
+        descending ? ALU_MAX_FP16_WMODE : ALU_MIN_FP16_WMODE));
+    kernel->set_regs(27, static_cast<uint16_t>(
+        descending ? ALU_LT_IF16_OU8_WMODE : ALU_GT_IF16_OU8_WMODE));
+    kernel->set_regs(28, static_cast<uint16_t>(
+        descending ? ALU_GT_IF16_OU8_WMODE : ALU_LT_IF16_OU8_WMODE));
+    kernel->set_regs(29, static_cast<uint16_t>(
+        descending ? NEG_INF_FP16 : POS_INF_FP16));
+    kernel->set_regs(64, p.warps);
+    kernel->set_regs(65, static_cast<uint16_t>(1));
+    kernel->set_regs(66, static_cast<uint16_t>(1));
+
+    auto* queue = GET_QUEUE(num_cores);
+    queue->set_broadcast_mode(true);
+    std::vector<uint8_t> cores;
+    for (int core = 0; core < num_cores; ++core)
+        cores.push_back(static_cast<uint8_t>(core));
+    queue->enqueu_kernel(*kernel, {p.warps, 1, 1}, cores);
+}
+
 void rpu_launch_lingbot2_route_compact_e32_t51_tp64_spm_kernel(
     uint32_t mask_spm_addr, uint32_t expert_ids_spm_addr,
     uint32_t token_ids_spm_addr, uint32_t counts_spm_addr) {

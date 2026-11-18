@@ -1,35 +1,59 @@
-[example]
+# 未写出的执行参数（省略即按以下值运行）：
+#   [cpu].threads 省略时不设置线程：PyTorch 使用环境变量 OMP_NUM_THREADS，未设置时使用全部 CPU 核（参考板 24）；2026-10-19 测量环境预设为 16。
+#   rpu_execution.model.num_cores 固定 8 核（可显式写 8；4/6 核不支持，原因见模型页配置表）。
+[model]
 profile_id = "wall-oss-0.5.fp16.rtc-controlled"
 registry_alias = "wall-oss-0.5"
 target = "wall_oss_rtc"
-dtype = "fp16"
+precision = "fp16"
+# 替换为匹配本模型与量化配方的本地资产路径或既有权重别名。
+checkpoint = "/path/to/wrc_sf_v728"
 
-[example.opt_in]
-RPU_WALL_OSS_RTC_ALLOW_NUMERIC_BLOCKED = "1"
+[model.opt_in]
 
 [input]
-checkpoint = "/path/to/wrc_sf_v728"
+# 替换图像路径；相机数量、处理后尺寸和文本长度需满足本模型输入范围。
 images = ["/path/to/face.png", "/path/to/left_wrist.png", "/path/to/right_wrist.png"]
 instruction = "Move the object to the target."
 proprioception = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+# Graph 准备的真实 prefix 范围；固定 profile 不能任意扩大。
 prefix_length_range = [599, 640]
+# RTC 延迟；须与本 release 的前序动作输入匹配。
 inference_delay = 0
+# 固定随机种子；更改会改变输入噪声。
 seed = 0
 
 [run]
+# 预热次数；不计入正式测量。
 warmup = 2
-runs = 3
+# 正式执行次数，正整数。
+runs = 5
+# 按需开启硬件采样；保持 false 可减少测量干扰。
 hwperf = false
+# 按需开启 profiler；正式计时建议保持 false。
 profile = false
+# 随机种子，非负整数。
 seed = 0
 
 [rpu_execution]
 
 [rpu_execution.prefill]
+# prefill 分块行数。可选 "auto"（默认）或满足本组件形状限制的 16 的倍数整数。
+# auto：由原生 planner 按实际输入行数选择。
+# 2026-10-19 模板默认输入实测：8 核均为 320。
+# 实际值记录在结果 report.json 的执行计划中（compute_chunk）。
 chunk_size = "auto"
 
 [rpu_execution.vision]
+# Vision 分块行数。可选 "auto"（默认）或 16 的倍数整数；不补齐行。
+# auto：由原生 planner 按图像 patch 数与本模型的核数选择。
+# 2026-10-19 模板默认输入实测：8 核均为 576。
+# 实际值记录在结果 report.json 的执行计划中（compute_chunk）。
 chunk_size = "auto"
 
 [rpu_execution.action]
+# action 分块行数。可选 "auto"（默认）或满足本组件形状限制的 16 的倍数整数。
+# auto：由原生 planner 按实际输入行数选择。
+# 2026-10-19 模板默认输入实测：8 核均为 32。
+# 实际值记录在结果 report.json 的执行计划中（compute_chunk）。
 chunk_size = "auto"

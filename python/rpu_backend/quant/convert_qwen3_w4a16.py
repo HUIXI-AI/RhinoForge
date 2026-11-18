@@ -1,9 +1,9 @@
 """W4A16 (packed int4 weight / fp16 activation) for Qwen3.
 
 Qwen3 shipped with a W8A16 offline converter but no 4-bit path. This converter
-defaults to group-wise pgrp int4: `rpu_linear.cpp` routes a **packed uint8
-[N, K/2]** weight plus a controller-striped FP16 scale payload to the tiled
-wINT4a16 pgrp family. Weights are handed over through
+defaults to group-wise pgrp int4: `rpu_linear.cpp` routes N32K32-packed uint8
+[padded global N, global K/2] weights and controller-striped FP16 scales to
+the generated w4a16_pgrp family. Weights are handed over through
 `causal_decoder_set_weights_w8a16` — the same entry point as int8, because the
 launcher dispatches on the weight's dtype (kChar = int8, kByte = packed int4),
 not on the setter. This mirrors how the Wall-OSS adapter does w4a16.
@@ -19,8 +19,10 @@ Scope / limits
 * The default recipe quantizes seven decoder projections. The explicit
   quantize_lm_head option also packs the head; embedding and norms stay FP16.
 * Both quantization modes support M=1 through the generated pgrp tiled family.
-* Public admission validates the six exact dense Qwen3 source profiles. Every
-  projection must satisfy col N%128/K%64 or row N%16/K%512, without padding.
+* Public admission validates six exact dense Qwen3 source profiles. Every
+  projection must satisfy col N%(16*TP)/K%32 or row N%16/K%(32*TP).
+  A six-lane MLP whose width is not 192-aligned is quantized at its logical
+  width, then zero-padded to the physical width before the single pgrp pack.
 """
 
 from __future__ import annotations
@@ -31,16 +33,18 @@ import torch.nn as nn
 from rpu_backend.model_registry import model_path
 from rpu_backend.quant._common import quantize_linear_per_channel
 from rpu_backend.quant.int4_pgrp_pack import (
-    pack_int4_per_channel_as_pgrp,
+    pad_int4_mlp_stripe,
     quantize_pack_int4_pgrp_col_bounded,
     quantize_int4_group_wise,
     swizzle_int4_pgrp_scale,
     swizzle_pack_int4_pgrp,
+    w4_storage_shape,
 )
+from rpu_backend.runtime.topology import decoder_packed_w4_mlp_intermediate_size
 
 NUM_CORES = 8
 # Group-wise (pgrp / AWQ-style) group size along K. 32 matches the Wall-OSS
-# w4a16-pgrp checkpoint and the parallel_linear_wint4a16_pgrp_* kernel ABI.
+# w4a16-pgrp checkpoint and the parallel_linear_w4a16_pgrp_* kernel ABI.
 DEFAULT_GROUP_SIZE = 32
 
 # (attribute path on the decoder layer, partition) — partition must match what
@@ -64,49 +68,82 @@ def _get(module: nn.Module, dotted: str) -> nn.Module:
     return module
 
 
-def _check_int4_shape(name: str, n: int, k: int, partition: int) -> None:
+def _check_int4_shape(name: str, n: int, k: int, partition: int,
+                      num_cores: int = NUM_CORES) -> None:
+    if type(num_cores) is not int or not 1 <= num_cores <= NUM_CORES:
+        raise ValueError("W4 packing requires an integer core count in [1,8]")
+    if partition not in (0, 1):
+        raise ValueError("W4 packing partition must be 0(row) or 1(col)")
     if partition == 1:
-        ok = (n % (16 * NUM_CORES) == 0) and (k % 64 == 0)
-        rule = f"col: N%{16*NUM_CORES}==0 and K%64==0"
+        ok = (n % (16 * num_cores) == 0) and (k % 32 == 0)
+        rule = f"col: N%{16*num_cores}==0 and K%32==0"
     else:
-        ok = (n % 16 == 0) and (k % (64 * NUM_CORES) == 0)
-        rule = f"row: N%16==0 and K%{64*NUM_CORES}==0"
+        ok = (n % 16 == 0) and (k % (32 * num_cores) == 0)
+        rule = f"row: N%16==0 and K%{32*num_cores}==0"
     if not ok:
         raise ValueError(
             f"{name}: shape [N={n}, K={k}] violates the int4 swizzle rule ({rule}). "
-            "This projection would need padding, which this converter does not do."
+            "Only the admitted six-lane MLP width is padded by this converter."
         )
 
 
+def packed_mlp_padded_size(role: str, linear: nn.Linear, mlp_tp: int) -> int | None:
+    """Physical packed width of one Text7 MLP leaf, or None when unpadded."""
+    if not role.startswith("mlp."):
+        return None
+    logical = linear.in_features if role.endswith("down_proj") else linear.out_features
+    physical = decoder_packed_w4_mlp_intermediate_size(logical, mlp_tp)
+    return physical if physical != logical else None
+
+
 def pack_linear_int4_(linear: nn.Linear, partition: int, name: str = "",
-                      group_size: int | None = None) -> None:
-    """In-place: fp16 [N,K] Linear -> packed uint8 [N,K/2] + fp16 scale.
+                      group_size: int | None = None, *, num_cores: int = NUM_CORES,
+                      padded_size: int | None = None) -> None:
+    """Pack fp16 [N,K] into N32K32 uint8 with TP-aware N padding and FP16 scale.
 
     group_size None -> logical per-channel, repeated over K/32 groups.
     group_size  int -> group-wise pgrp, controller-striped 2D scale payload.
     Both produce the same controller-striped 2-D physical scale ABI.
+    padded_size widens an MLP stripe after logical quantization: col
+    partition pads N, row partition pads K, with zero values and unit scales.
+    Linear features become physical; model config stays logical.
     """
     w = linear.weight.detach()
     n, k = int(w.shape[0]), int(w.shape[1])
-    _check_int4_shape(name, n, k, partition)
+    if padded_size is not None:
+        if padded_size < (n if partition == 1 else k):
+            raise ValueError(f"{name}: padded width {padded_size} is smaller than its source")
+        if padded_size % DEFAULT_GROUP_SIZE:
+            raise ValueError(f"{name}: padded width {padded_size} must keep whole K/32 groups")
+    pn, pk = ((padded_size, k) if partition == 1 else (n, padded_size)
+              ) if padded_size is not None else (n, k)
+    _check_int4_shape(name, pn, pk, partition, num_cores)
 
     if group_size:
         if k % group_size != 0:
             raise ValueError(f"{name}: K={k} not divisible by group_size={group_size}")
         vals, logical_scale, _ = quantize_int4_group_wise(w, group_size)
-        packed = swizzle_pack_int4_pgrp(vals, partition, NUM_CORES).reshape(n, k // 2)
-        scale = swizzle_int4_pgrp_scale(
-            logical_scale, group_size, partition, NUM_CORES
-        )
+        scale_group = group_size
     else:
+        # Per-channel math is one scale repeated over every K/32 group, as in
+        # pack_int4_per_channel_as_pgrp; padding then follows the same path.
+        scale_group = DEFAULT_GROUP_SIZE
+        if k % scale_group:
+            raise ValueError(f"{name}: K={k} not divisible by group_size={scale_group}")
         vals, channel_scale = quantize_linear_per_channel(w, bits=4)
-        packed, scale = pack_int4_per_channel_as_pgrp(
-            vals, channel_scale.to(torch.float16), partition, NUM_CORES
-        )
-        packed = packed.reshape(n, k // 2)
+        logical_scale = (channel_scale.to(torch.float16).reshape(1, n)
+                         .expand(k // scale_group, n).contiguous())
+    if padded_size is not None:
+        vals, logical_scale = pad_int4_mlp_stripe(
+            vals, logical_scale, partition=partition, padded_size=padded_size,
+            group_size=scale_group)
+    packed = swizzle_pack_int4_pgrp(vals, partition, num_cores).reshape(
+        w4_storage_shape(pn, pk, partition, num_cores))
+    scale = swizzle_int4_pgrp_scale(logical_scale, scale_group, partition, num_cores)
 
     linear.weight = nn.Parameter(
         packed.to(torch.uint8).contiguous(), requires_grad=False)
+    linear.out_features, linear.in_features = pn, pk
     # register_buffer, NOT a plain attribute: `model.to('rpu')` only migrates
     # parameters and buffers. A plain attribute leaves the scale on the host,
     # and the C++ side then takes a device address of a CPU pointer — no error,
@@ -121,23 +158,43 @@ def pack_linear_int4_(linear: nn.Linear, partition: int, name: str = "",
 
 
 def convert_qwen3_to_w4a16_(model, group_size: int | None = None,
-                           *, quantize_lm_head: bool = False) -> None:
+                           *, quantize_lm_head: bool = False, topology=None) -> None:
     """Quantize every decoder projection of a loaded fp16 Qwen3 to packed int4."""
+    attn_tp = topology.attn_tp if topology is not None else NUM_CORES
+    mlp_tp = topology.mlp_tp if topology is not None else NUM_CORES
+    head_tp = topology.lm_head_tp if topology is not None else NUM_CORES
     for i, layer in enumerate(model.model.layers):
         for dotted, partition in _PROJECTIONS:
             mod = _get(layer, dotted)
+            n, k = mod.weight.shape
+            cores = mlp_tp if dotted.startswith("mlp.") else attn_tp
+            padded = packed_mlp_padded_size(dotted, mod, mlp_tp)
+            if padded is not None:
+                n, k = (padded, k) if partition == 1 else (n, padded)
+            _check_int4_shape(f"layer{i}.{dotted}", n, k, partition, cores)
             if mod.weight.dtype != torch.float16:
-                raise TypeError(
-                    f"layer{i}.{dotted}: expected fp16 weight, got {mod.weight.dtype}")
+                raise TypeError(f"layer{i}.{dotted}: expected fp16 weight, got {mod.weight.dtype}")
+    if quantize_lm_head:
+        if group_size != DEFAULT_GROUP_SIZE:
+            raise ValueError("W4 lm_head requires group_size=32")
+        if model.lm_head.weight.dtype != torch.float16:
+            raise TypeError("W4 lm_head requires original FP16 weights")
+        _check_int4_shape("lm_head", *model.lm_head.weight.shape, 1, head_tp)
+    for i, layer in enumerate(model.model.layers):
+        for dotted, partition in _PROJECTIONS:
+            mod = _get(layer, dotted)
+            cores = mlp_tp if dotted.startswith("mlp.") else attn_tp
             pack_linear_int4_(mod, partition, name=f"layer{i}.{dotted}",
-                              group_size=group_size)
+                              group_size=group_size, num_cores=cores,
+                              padded_size=packed_mlp_padded_size(dotted, mod, mlp_tp))
     if quantize_lm_head:
         if group_size != DEFAULT_GROUP_SIZE:
             raise ValueError("W4 lm_head requires group_size=32")
         head = model.lm_head
         if head.weight.dtype != torch.float16:
             raise TypeError("W4 lm_head requires original FP16 weights")
-        packed, scale = quantize_pack_int4_pgrp_col_bounded(head.weight, group_size)
+        packed, scale = quantize_pack_int4_pgrp_col_bounded(
+            head.weight, group_size, num_cores=head_tp)
         # Replace only the head Parameter. The 0.6/1.7/4B source ties it to
         # embed_tokens; the embedding must retain the original FP16 storage.
         head.weight = nn.Parameter(packed, requires_grad=False)

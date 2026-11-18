@@ -41,8 +41,7 @@ def _thread_value(runtime_env=None, qwen3vl_base=None):
     old_override = _pkg.__dict__.get("build_lingbot_vla_v2")
     _pkg.build_lingbot_vla_v2 = _fake_build
     try:
-        env = {"RPU_LINGBOT2_ALLOW_UNVALIDATED": "1"}
-        env.update(runtime_env or {})
+        env = dict(runtime_env or {})
         kw = {"dtype": "fp16", "runtime_env": env}
         if qwen3vl_base:
             kw["qwen3vl_base"] = qwen3vl_base
@@ -84,21 +83,13 @@ def test_explicit_arg_beats_runtime_env():
 def test_builder_error_reports_source_and_value():
     from rpu_backend.adapters.lingbot_vla_v2 import build_lingbot_vla_v2
     bad = "/tmp/does_not_exist_qwenbase"
-    old = os.environ.get("RPU_LINGBOT2_ALLOW_UNVALIDATED")
-    os.environ["RPU_LINGBOT2_ALLOW_UNVALIDATED"] = "1"
     try:
-        try:
-            build_lingbot_vla_v2("/tmp/nonexistent_ckpt", qwen3vl_base=bad)
-        except FileNotFoundError as e:
-            msg = str(e)
-            assert "explicit qwen3vl_base arg" in msg and bad in msg, msg
-        else:
-            raise AssertionError("expected FileNotFoundError for a bad qwen3vl_base dir")
-    finally:
-        if old is None:
-            os.environ.pop("RPU_LINGBOT2_ALLOW_UNVALIDATED", None)
-        else:
-            os.environ["RPU_LINGBOT2_ALLOW_UNVALIDATED"] = old
+        build_lingbot_vla_v2("/tmp/nonexistent_ckpt", qwen3vl_base=bad)
+    except FileNotFoundError as e:
+        msg = str(e)
+        assert "explicit qwen3vl_base arg" in msg and bad in msg, msg
+    else:
+        raise AssertionError("expected FileNotFoundError for a bad qwen3vl_base dir")
 
 
 if __name__ == "__main__":

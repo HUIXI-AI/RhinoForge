@@ -10,7 +10,7 @@ Per D-04: exports `swizzle_linear`, `swizzle_model_inplace`, `LinearPartition`,
 
 Pitfall P1 discipline: `SKIP_LINEAR_NAMES = {'dense'}` is the AdaRMS
 double-swizzle guard — do not modify without reading
-docs/pitfalls.md#p1--double-swizzle.
+the SDK queue contract.
 """
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ import torch
 import torch.nn as nn
 
 from rpu_backend.runtime.log import _LOG
-from rpu_backend.runtime.topology import PHYSICAL_CORE_COUNT
+from rpu_backend.runtime.topology import PHYSICAL_CORE_COUNT, decoder_mlp_intermediate_size
 
 
 NUM_CORES = PHYSICAL_CORE_COUNT
@@ -274,7 +274,7 @@ def _collect_embedding_data_ptrs(module: nn.Module) -> set:
 # when the partition ID matches, because the swizzle interleaves over a
 # different core count. A weight swizzled under A and then consumed under B is
 # read with the wrong layout: right L2 norm, wrong direction, no exception —
-# the P1 double-swizzle failure mode (docs/pitfalls.md#p1).
+# the P1 double-swizzle failure mode (the SDK queue contract).
 #
 # The fix is NOT to pick one of the two values — row is genuinely required by
 # the fused SPM decoders (they launch o_proj/down_proj with partition=0) and
@@ -395,7 +395,7 @@ def _guarded_linear_forward(
             f"num_cores={NUM_CORES} and the fp16 ACTIVATION width, gets a legal "
             "row/col answer here, and would launch a swizzled-layout kernel "
             "over row-major bytes: right L2 norm, wrong direction, no "
-            "exception (docs/pitfalls.md#p1). Run this module on CPU."
+            "exception (the SDK queue contract). Run this module on CPU."
         )
     if partition == SKIPPED_PARTITION:
         raise RuntimeError(
@@ -405,7 +405,7 @@ def _guarded_linear_forward(
             "re-swizzle, the Pi0.5 int4 packer). Eager aten::linear assumes a "
             "swizzled weight, so calling this module on an rpu tensor reads "
             "row-major bytes as swizzled ones: right L2 norm, wrong direction, "
-            "no exception (docs/pitfalls.md#p1). Run the fused forward that "
+            "no exception (the SDK queue contract). Run the fused forward that "
             "consumes the companion's copy, or run this module on CPU."
         )
     _check_linear_shapes(x, self.weight, self.bias)
@@ -454,12 +454,14 @@ def _record_linear_layout(
 
 def validate_decoder_weight_structure(model, *, num_layers, hidden_size,
         intermediate_size, num_q_heads, num_kv_heads, head_dim, vocab_size,
-        projection_dtype=torch.float16, lm_head_dtype=torch.float16):
+        projection_dtype=torch.float16, lm_head_dtype=torch.float16, qk_norm=True):
     """Validate the actual plain decoder before irreversible weight conversion.
 
     HF config describes intended geometry; modules may have been replaced after
     loading. Check every physical weight, including the last layer and the eager
     vocabulary projection, before claiming a device model or publishing markers.
+    ``qk_norm=False`` (Llama) requires the per-head Q/K norms to be absent,
+    because that installer passes no norm tensors to the native decoder.
     """
     if any(dtype not in (torch.float16, torch.int8)
            for dtype in (projection_dtype, lm_head_dtype)):
@@ -505,10 +507,12 @@ def validate_decoder_weight_structure(model, *, num_layers, hidden_size,
             if (projection.out_features, projection.in_features) != shape:
                 raise ValueError(f"decoder layer {index} {name} declared shape differs from {shape}")
             weight(projection, f"layer {index} {name}", shape, projection_dtype)
+        norms = ((attn, "q_norm", (head_dim,)), (attn, "k_norm", (head_dim,))) if qk_norm else ()
         for owner, name, shape in ((layer, "input_layernorm", (hidden_size,)),
-                (layer, "post_attention_layernorm", (hidden_size,)),
-                (attn, "q_norm", (head_dim,)), (attn, "k_norm", (head_dim,))):
+                (layer, "post_attention_layernorm", (hidden_size,)), *norms):
             weight(getattr(owner, name, None), f"layer {index} {name}", shape)
+        if not qk_norm and any(getattr(attn, name, None) is not None for name in ("q_norm", "k_norm")):
+            raise ValueError(f"decoder layer {index} has Q/K norms this profile does not install")
 
     known = {"lm_head"}
     for index in range(num_layers):
@@ -523,20 +527,21 @@ def validate_decoder_weight_structure(model, *, num_layers, hidden_size,
 
 def pad_decoder_mlp_projection(weight, *, projection_name: str,
                                logical_size: int, physical_size: int):
-    """Prepare one original CPU FP16 projection before its single swizzle.
+    """Prepare one original CPU FP16/INT8 projection before its single swizzle.
 
     Adapters validate all original leaves first. This returns a cold copy so
     fused adapters can retain logical HF metadata and discard each raw leaf.
     """
-    if (logical_size, physical_size) not in ((3584, 3648), (9728, 9792)):
+    if (logical_size, physical_size) not in (
+            (3584, 3648), (8192, 8256), (9728, 9792), (17408, 17472), (25600, 25728)):
         raise ValueError("no admitted decoder MLP padding geometry")
     if projection_name not in ("gate_proj", "up_proj", "down_proj"):
         raise ValueError("MLP padding requires a known projection role")
     axis = 1 if projection_name == "down_proj" else 0
-    if (weight.device.type != "cpu" or weight.dtype != torch.float16
+    if (weight.device.type != "cpu" or weight.dtype not in (torch.float16, torch.int8)
             or weight.ndim != 2 or not weight.is_contiguous()
             or weight.shape[axis] != logical_size):
-        raise ValueError("MLP padding requires original contiguous CPU FP16 weights")
+        raise ValueError("MLP padding requires original contiguous CPU FP16 or INT8 weights")
     shape = list(weight.shape)
     shape[axis] = physical_size
     with torch.no_grad():
@@ -549,7 +554,8 @@ def validate_decoder_mlp_padding(model, *, logical_size: int, physical_size: int
     """Check every affected original leaf before claiming or mutating a model."""
     if physical_size == logical_size:
         return
-    if (logical_size, physical_size) not in ((3584, 3648), (9728, 9792)):
+    if (logical_size, physical_size) not in (
+            (3584, 3648), (8192, 8256), (9728, 9792), (17408, 17472), (25600, 25728)):
         raise ValueError("no admitted decoder MLP padding geometry")
     layers = model.model.layers
     hidden = model.config.hidden_size
@@ -559,12 +565,18 @@ def validate_decoder_mlp_padding(model, *, logical_size: int, physical_size: int
                             ("down_proj", (hidden, logical_size))):
             projection = getattr(layer.mlp, name)
             w = projection.weight
-            if (w.device.type != "cpu" or w.dtype != torch.float16
+            if (w.device.type != "cpu" or w.dtype not in (torch.float16, torch.int8)
                     or not w.is_contiguous() or tuple(w.shape) != shape
                     or (projection.out_features, projection.in_features) != shape
                     or projection.bias is not None
                     or hasattr(projection, "_rpu_linear_partition")):
-                raise ValueError("MLP padding requires original contiguous CPU FP16 weights")
+                raise ValueError("MLP padding requires original contiguous CPU FP16 or INT8 weights")
+            if w.dtype == torch.int8:
+                scale = getattr(projection, "weight_scale", None)
+                if (not isinstance(scale, torch.Tensor) or scale.dtype != torch.float16
+                        or scale.device.type != "cpu" or not scale.is_contiguous()
+                        or tuple(scale.shape) != (shape[0],)):
+                    raise ValueError("MLP padding requires the original contiguous CPU FP16 channel scales")
 
 
 def pad_decoder_mlp_weights(model, *, logical_size: int, physical_size: int):
@@ -585,6 +597,11 @@ def pad_decoder_mlp_weights(model, *, logical_size: int, physical_size: int):
                 w = projection.weight
                 padded = pad_decoder_mlp_projection(w, projection_name=name,
                     logical_size=logical_size, physical_size=physical_size)
+                if w.dtype == torch.int8 and name != "down_proj":
+                    scale = projection.weight_scale
+                    padded_scale = scale.new_ones(physical_size)
+                    padded_scale[:logical_size].copy_(scale)
+                    projection.weight_scale = padded_scale
                 projection.weight = nn.Parameter(padded, requires_grad=w.requires_grad)
                 projection.out_features, projection.in_features = padded.shape
     _release_cpu_weight_pages()
@@ -603,7 +620,8 @@ def _linear_conversion_layout(linear, name, force_col_partition,
 
 
 def _validate_bounded_linear_move(module, force_col_partition, attn_num_cores,
-                                  mlp_num_cores, lm_head_num_cores, skip_names):
+                                  mlp_num_cores, lm_head_num_cores, skip_names,
+                                  *, pending_mlp_padding=False):
     # Validate the whole tree before the first move, including a bad last leaf.
     # Do not retain a Parameter/state_dict plan: Module.to may replace those
     # Parameters, and retaining them would keep the complete CPU model alive.
@@ -623,15 +641,31 @@ def _validate_bounded_linear_move(module, force_col_partition, attn_num_cores,
         if name not in roles or name in skip_names:
             raise ValueError(f"bounded weight migration has unknown or skipped Linear role: {path!r}")
         weight = child.weight
-        if (weight.device.type != "cpu" or weight.dtype != torch.float16
+        if (weight.device.type != "cpu" or weight.dtype not in (torch.float16, torch.int8)
                 or not weight.is_contiguous()
                 or tuple(weight.shape) != (child.out_features, child.in_features)):
-            raise ValueError(f"bounded weight migration requires a contiguous CPU FP16 Linear: {path!r}")
+            raise ValueError(f"bounded weight migration requires a contiguous CPU FP16 or INT8 Linear: {path!r}")
+        if weight.dtype == torch.int8:
+            scale = getattr(child, "weight_scale", None)
+            if (not isinstance(scale, torch.Tensor) or scale.dtype != torch.float16
+                    or scale.device.type != "cpu" or not scale.is_contiguous()
+                    or tuple(scale.shape) != (child.out_features,)):
+                raise ValueError(f"bounded weight migration requires a CPU FP16 channel scale: {path!r}")
         partition, cores = _linear_conversion_layout(child, name, force_col_partition,
             attn_num_cores, mlp_num_cores, lm_head_num_cores)
         n, k = weight.shape
-        if ((partition == 0 and (n % 16 or k % (16 * cores)))
-                or (partition == 1 and (n % (16 * cores) or k % 16))
+        elements_per_word = 32 // weight.element_size()
+        # Pre-padding validation uses the final cold width. The converter
+        # repeats this check on physical weights immediately before swizzle.
+        physical_k, physical_n = k, n
+        if pending_mlp_padding and name in {"gate_proj", "up_proj", "down_proj"}:
+            if name == "down_proj":
+                physical_k = decoder_mlp_intermediate_size(k, cores)
+            else:
+                physical_n = decoder_mlp_intermediate_size(n, cores)
+                partition = 1
+        if ((partition == 0 and (physical_n % 16 or physical_k % (elements_per_word * cores)))
+                or (partition == 1 and (physical_n % (16 * cores) or physical_k % elements_per_word))
                 or partition < 0):
             raise ValueError(f"bounded weight migration has no legal Linear layout: {path!r}")
         if child.bias is not None and (child.bias.device.type != "cpu"

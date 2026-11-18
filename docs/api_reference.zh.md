@@ -245,7 +245,7 @@ cache.reset()
 独立 mixed-E4M3 配方使用
 [`convert_qwen3_5_moe_fp8.py`](../python/rpu_backend/quant/convert_qwen3_5_moe_fp8.py)
 从官方未量化 `Qwen/Qwen3.5-35B-A3B` 在 CPU 离线生成，无需校准数据。
-按[下载、转换与运行命令](../examples/configs/qwen3_5/README.md#cmd-moe-mixed)
+按[下载、转换与运行命令](../examples/configs/WEIGHTS.md#cmd-qwen35-moe)
 写入 `$RPU_MODEL_CACHE/Qwen3.5-35B-A3B-rpu-fp8-mixed`，将输出目录传给
 `from_pretrained` 或示例的 `--model`。官方 block-FP8 包不能作为转换输入，
 也不能替代本配方的逐输出通道 E4M3 格式。选择匹配的 mixed-E4M3 Text/VL
@@ -257,7 +257,7 @@ cache.reset()
 
 | Class | 主要构造与推理方法 |
 |---|---|
-| `Pi05Policy` | `from_pretrained(...)` / `from_lerobot_policy(...)`；`to("rpu")`；`prepare_graphs(...)`；`predict_action_chunk(...)`；`select_action(...)` |
+| `Pi05Policy` | `from_pretrained(...)` / `from_lerobot_policy(...)`；`graph_arena_count(...)`；`to("rpu")`；`prepare_graphs(...)`；`predict_action_chunk(...)`；`select_action(...)` |
 | `RhinoVLAPolicy` | `from_runtime(...)` / `from_factory(...)` / `from_pretrained(..., runtime_factory=...)`；`prepare_graphs(...)`；`predict(...)`；`predict_action_chunk(...)` |
 | `WallOssPolicy` | `from_checkpoint(...)` / `from_pretrained(...)`；`to("rpu")`；`prepare_graphs(...)`；`infer(...)`；`predict_action_chunk(...)` |
 | `Lingbot2Policy` | `from_checkpoint(...)`；`to("rpu")`；`prepare_graphs(...)`；`infer(...)`；`predict_action_chunk(...)`；`close()` |
@@ -279,6 +279,14 @@ Pi0.5 `prepare_graphs()` 返回 Graph 就绪状态与重放诊断。shape、dtyp
 finite 和 Graph 不变量须通过检查。
 `replay_parity.numerical_status` 为 `DIAGNOSTIC`，`task_quality` 为
 `NOT_EVALUATED`。
+
+当在线请求在固定物理宽度 `text_tokens` 内改变有效语言 token 数（如 openpi 将离散
+state 写入 prompt）时，向 `Pi05Policy.prepare_graphs(..., language_token_counts=...)`
+传入可达的有效长度集合，以在启动期为每个有效长度预热对应的融合去噪 Graph 并锁定准入
+集合；超出集合的请求在进入设备前拒绝。加载前通过
+`GraphRuntimePolicy.from_environment(graph_arena_count=Pi05Policy.graph_arena_count(len(counts)))`
+配置冷态 Graph arena 数量，详见 [`serving.py`](../examples/runners/pi05/serving.py) 与
+[`kuavo_server` 适配器说明](../examples/configs/pi05/README.md#kuavo-server)。
 
 对于发布绑定的 Pi0.5 组件 profile，传入 `profile="pi0.5-base"` 或
 `profile="pi0.5-libero-v044"`，并同时传入首个预处理后的 `admission_batch`。
@@ -518,9 +526,8 @@ prompt 加生成上限须在 512 个位置内；达到上限仍无 EOS 时，在
 
 ASR 需要重编译的 native 提供 `siglip_set_audio_mode`、`siglip_set_audio_projection`
 和 `assemble_inputs_embeds`。TTS codec 显式调用 `causal_decoder_set_tts_codec_mode`；
-缺少 setter 时前段保留 CPU 路径。有该接口时，1–255 帧使用设备，超过 64 帧采用
-显式 72 帧因果滑窗，保持原注意力窗口；由规划器选择单块，仅保留当前图和 mask。
-其他执行错误直接报告。
+缺少 setter 时前段保留 CPU 路径。有该接口时，1–63 帧使用设备，64–255 帧使用
+原始 CPU FP32 前段及其 72 帧滑窗注意力；其他执行错误直接报告。
 
 `execution_stats()` 返回调用及缓存状态：
 
@@ -542,12 +549,9 @@ speaker embedding，每次请求仍读取和校验参考文件。输出存储独
 紧接着的输出头；请求 hidden states 时仍返回独立 CPU 存储。加载前通过
 `torch.set_num_threads` 设置 CPU 线程数，API 不修改此值。
 
-默认 `codec_backend="rpu"` 实验性卸载全部 31 层解码 Conv1d 和 4 层 ConvNeXt Linear；
-匹配 native 时，
+默认 `codec_backend="rpu"` 实验性卸载全部 31 层解码 Conv1d；匹配 native 时，
 12 组卷积还将中间 SnakeBeta 和首层 bias 留在 RPU 上，以 FP16 执行。
 显式设置 `codec_backend="cpu"` 恢复 CPU FP32 卷积和激活。
 `execution_stats().codec_convolutions` 返回 backend、已安装层数、累计卷积调用次数、
-`transport`（`shared_ddr` 或旧版 `staged`）、`residual_pairs`、成功的 `paired_calls`、
-`transposed_layers`、成功的 `transposed_calls`、`convnext_linears` 和成功的
-`convnext_linear_calls`。
+`transport`（`shared_ddr` 或旧版 `staged`）、`residual_pairs` 和成功的 `paired_calls`。
 每组成对执行也计入两次卷积调用。剩余 CPU 工作和精度边界见[语音指南](qwen3_audio.zh.md#实验性-rpu-声码器卷积)。

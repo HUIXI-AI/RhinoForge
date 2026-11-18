@@ -27,6 +27,7 @@ import types
 from typing import Any
 
 import torch
+from rpu_backend.runtime.vision_position import interpolate_vision_positions
 import torch.nn as nn
 
 import rpu_backend
@@ -1555,7 +1556,7 @@ def _rpu_vision_forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tenso
         ):
             pos_embeds = None
     if pos_embeds is None:
-        pos_embeds_cpu = type(self).fast_pos_embed_interpolate(self, grid_thw_cpu)  # [N_total, hidden] CPU fp16
+        pos_embeds_cpu = interpolate_vision_positions(self, grid_thw_cpu)  # [N_total, hidden] CPU fp16
         pos_embeds = pos_embeds_cpu.to(device=embed_packed.device, dtype=embed_packed.dtype).contiguous()
         if prep_cache_enabled:
             _bounded_cache_put(

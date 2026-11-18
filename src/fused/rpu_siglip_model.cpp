@@ -59,6 +59,7 @@
 #include "pi05_kernel_policy.h"
 #include "rpu_pi05_vision_fc.h"
 #include "rpu_pi05_owner_norm.h"
+#include "rpu_siglip_w8a8_contract.h"
 #include "rpu_kernel_cache.h"
 #include "model_handle_registry.h"
 #include "rpu_ops.h"
@@ -93,6 +94,14 @@ constexpr int64_t SIGLIP_CORE_PROFILE_SITE = 2831089885636848922LL;
 constexpr int64_t SIGLIP_Q_LINEAR_SITE = 50221634946316412LL;
 constexpr int64_t SIGLIP_K_LINEAR_SITE = 2185350348864592434LL;
 constexpr int64_t SIGLIP_V_LINEAR_SITE = 4454356738631095076LL;
+constexpr int64_t SIGLIP_LN1_QUANT_W8A8_SITE = 0x5349474c4e513038LL;
+// Owner-local selectors: ordinary AUTO_TILE remains unchanged when OFF.
+constexpr int64_t SIGLIP_QKV_W8A8_LINEAR_ROUTE = 101;
+constexpr int64_t SIGLIP_LN1_QUANT_W8A8_ROUTE = 1;
+constexpr int64_t SIGLIP_MLP_W8A8_LINEAR_ROUTE = 102;
+constexpr int64_t SIGLIP_OWNER_LN_QUANT_W8A8_ROUTE = 103;
+constexpr int64_t SIGLIP_GELU_QUANT_W8A8_SITE = 0x53494747454c5138LL;
+constexpr int64_t SIGLIP_GELU_QUANT_W8A8_ROUTE = 1;
 constexpr int64_t SIGLIP_KV_INSERT_SITE = 4340742943631646068LL;
 constexpr int64_t SIGLIP_MINIBATCH_ATTN_SITE = 3592870858110241415LL;
 constexpr int64_t SIGLIP_UNIFIED_ATTN_SITE = 871279723585541140LL;
@@ -103,7 +112,7 @@ constexpr int64_t SIGLIP_FC1_LINEAR_SITE = 628733187506223803LL;
 constexpr int64_t SIGLIP_FC2_LINEAR_SITE = 2130098820486441137LL;
 constexpr int64_t SIGLIP_MLP_ALL_REDUCE_SITE = 2323671932454929043LL;
 constexpr int64_t SIGLIP_PROJECTOR_LINEAR_SITE = 2282358810048681094LL;
-constexpr int64_t SIGLIP_AUDIO_OUTPUT_LINEAR_SITE = 2282358810048681095LL;
+constexpr int64_t SIGLIP_AUDIO_OUTPUT_LINEAR_SITE = 4936832518648847219LL;
 constexpr int64_t SIGLIP_PATCH_INPUT_DMA_SITE = 1143336462482724752LL;
 constexpr int64_t SIGLIP_PATCH_POSITION_DMA_SITE = 1099468962711310446LL;
 constexpr int64_t SIGLIP_PATCH_LINEAR_SITE = 6500914803307480014LL;
@@ -122,7 +131,8 @@ enum class SiglipPatchMutableDmaRoute : int64_t {
 
 constexpr uint32_t SIGLIP_KV_CAPABILITIES =
     KV_INSERT_CAP_V2 | KV_INSERT_CAP_V16 |
-    KV_INSERT_CAP_HYBRID2 | KV_INSERT_CAP_HYBRID3;
+    KV_INSERT_CAP_HYBRID2 | KV_INSERT_CAP_HYBRID3 |
+    KV_INSERT_CAP_NON8_TP_V16;
 constexpr int64_t SIGLIP_KV_FLAG_DDR_MIRROR = 1;
 constexpr int64_t SIGLIP_KV_FLAG_RAW_SPM_ONLY = 2;
 constexpr int64_t SIGLIP_ATTN_CAPABILITY_FALLBACK_DDR_REQUIRED = 1LL << 0;
@@ -192,7 +202,7 @@ static bool packed_image_acquire_span(
 // stable per-image live-base slot for the mutable input DMA: the SigLIP-batch
 // path packs N images through ONE captured graph, so a single shared live-base
 // would make every image read the LAST image's pixels on REPLAY (mutable-DMA
-// trap — docs/pitfalls.md). The output/pos_emb live-bases stay shared
+// trap — the SDK queue contract). The output/pos_emb live-bases stay shared
 // (same packed-tensor base / same registered pos_emb across all N images).
 //
 // `offsets` are the 6 SPM temp-buffer offsets, allocated ONCE by the caller and
@@ -417,6 +427,55 @@ static void check_siglip_w8a16_scale_lists(
     check_projection(fc2_w, fc2_ws, "fc2_w");
 }
 
+// Packed W4 (siglip_set_weights_w4a16) is a declared mode: every projection is
+// uint8 [N,K/2] in the pgrp layout with its controller-striped G32 fp16 scale.
+// Column q/k/v/fc1 need N%(16c) and K%64, row o/fc2 N%16 and K%(64c).
+static void check_siglip_w4a16_scale_lists(
+    int64_t n_layers, int64_t cores,
+    at::TensorList q_w, at::TensorList k_w, at::TensorList v_w,
+    at::TensorList o_w, at::TensorList fc1_w, at::TensorList fc2_w,
+    at::TensorList q_ws, at::TensorList k_ws, at::TensorList v_ws,
+    at::TensorList o_ws, at::TensorList fc1_ws, at::TensorList fc2_ws)
+{
+    const char* ctx = "siglip_set_weights_w4a16";
+    auto check_projection = [&](const at::TensorList& weights,
+                                const at::TensorList& scales,
+                                bool col, const char* name) {
+        TORCH_CHECK(static_cast<int64_t>(scales.size()) == n_layers,
+                    ctx, ": ", name, "_scale.size()=", scales.size(),
+                    " != num_layers=", n_layers);
+        for (int64_t i = 0; i < n_layers; ++i) {
+            const at::Tensor& w = weights[i];
+            const at::Tensor& s = scales[i];
+            TORCH_CHECK(w.scalar_type() == at::kByte && w.device().type() == at::kPrivateUse1 &&
+                            w.is_contiguous(),
+                        ctx, ": ", name, "[", i, "] must be contiguous packed uint8 W4 on RPU, got ",
+                        w.scalar_type());
+            const int64_t n = w.size(0), k = w.size(1) * 2;
+            TORCH_CHECK(n % (col ? 16 * cores : 16) == 0 &&
+                            k % (col ? 64 : 64 * cores) == 0,
+                        ctx, ": packed W4 ", name, "[", i, "] [", n, ",", k,
+                        "] does not split into 16-aligned N and 64-aligned K over ", cores,
+                        col ? " column" : " row", " lanes");
+            const int64_t local_g = (col ? k : k / cores) / 32;
+            const int64_t local_n = col ? n / cores : n;
+            const int64_t expected = cores * ((local_g + 3) / 4) * ((local_n + 63) / 64) * 256;
+            TORCH_CHECK(s.defined() && s.dim() == 2 && s.size(0) == 32 &&
+                            s.scalar_type() == at::kHalf && s.device().type() == at::kPrivateUse1 &&
+                            s.is_contiguous() && s.numel() == expected,
+                        ctx, ": packed W4 ", name, "_scale[", i, "] must be the contiguous fp16 RPU "
+                        "G32 pgrp payload of ", expected, " elements, got ", s.sizes());
+        }
+    };
+
+    check_projection(q_w,   q_ws,   true,  "q_w");
+    check_projection(k_w,   k_ws,   true,  "k_w");
+    check_projection(v_w,   v_ws,   true,  "v_w");
+    check_projection(o_w,   o_ws,   false, "o_w");
+    check_projection(fc1_w, fc1_ws, true,  "fc1_w");
+    check_projection(fc2_w, fc2_ws, false, "fc2_w");
+}
+
 }  // namespace
 
 namespace v3 {
@@ -445,12 +504,26 @@ public:
         at::Tensor fc1_b, fc2_b;                       // MLP biases
     };
 
-    explicit SigLIPModel(std::optional<bool> linear_acc32 = std::nullopt)
-        : configured_linear_acc32_(linear_acc32), linear_acc32_(linear_acc32.value_or(false)) {}
+    explicit SigLIPModel(std::optional<bool> linear_acc32 = std::nullopt,
+                        bool qkv_w8a8 = false, bool mlp_w8a8 = false)
+        : configured_linear_acc32_(linear_acc32),
+          linear_acc32_(linear_acc32.value_or(false)), qkv_w8a8_(qkv_w8a8),
+          mlp_w8a8_(mlp_w8a8) {
+        TORCH_CHECK(!(qkv_w8a8_ || mlp_w8a8_) || !linear_acc32_,
+                    "Pi Vision W8A8 requires effective ACC16");
+        TORCH_CHECK(!(qkv_w8a8_ || mlp_w8a8_) || !pi05_vision_ln_stream_opt_in_,
+                    "Pi Vision W8A8 requires resident LayerNorm weights; LN streaming is not admitted");
+        TORCH_CHECK(!mlp_w8a8_ || (pi05_vision_owner_ln_opt_in_ &&
+                        pi05_vision_kv_spm_only_opt_in_ && pi05_ring_xor3_opt_in_ &&
+                        !pi05_vision_fc_weight_outer_opt_in_),
+                    "Pi Vision MLP W8A8 requires owner-LN, XOR3, raw-SPM KV and no FC weight-outer route");
+    }
 
 private:
     const std::optional<bool> configured_linear_acc32_;
     const bool linear_acc32_;
+    const bool qkv_w8a8_;
+    const bool mlp_w8a8_;
     FmbLinearAccumulationPolicy linear_accumulation_policy() const {
         return linear_acc32_ ? FmbLinearAccumulationPolicy::ACC32
                              : FmbLinearAccumulationPolicy::ACC16;
@@ -458,11 +531,13 @@ private:
 public:
 
     void set_audio_mode() {
-        TORCH_CHECK(num_cores() == 8 && num_layers() == 18 && hidden_size() == 896 &&
+        const bool small = num_layers() == 18 && hidden_size() == 896 && intermediate_size() == 3584;
+        const bool large = num_layers() == 24 && hidden_size() == 1024 && intermediate_size() == 4096;
+        TORCH_CHECK((num_cores() == 4 || num_cores() == 8) && (small || large) &&
                         num_q_heads() == 16 && head_dim() == 64 &&
-                        intermediate_size() == 3584 && projection_dim_ == 896 && eps_ == 1e-5 &&
+                        projection_dim_ == hidden_size() && eps_ == 1e-5 &&
                         !has_patch_emb_,
-                    "audio mode requires the frozen Qwen3-ASR-0.6B encoder geometry");
+                    "audio mode requires the frozen Qwen3-ASR-0.6B or 1.7B encoder geometry");
         for (const auto& layer : layer_weights_) {
             TORCH_CHECK(layer.q_w.scalar_type() == at::kHalf &&
                             layer.k_w.scalar_type() == at::kHalf &&
@@ -473,7 +548,7 @@ public:
                         "audio mode requires FP16 weights");
         }
         audio_mode_ = true;
-        // Two zero heads pad the original fourteen; the head dimension stays 64.
+        // The smaller profile pads fourteen heads to sixteen; both retain D64.
         orig_head_dim_ = 64;
         invalidate_model_state();
     }
@@ -481,19 +556,22 @@ public:
     void set_audio_projection(const at::Tensor& weight, const at::Tensor& bias) {
         TORCH_CHECK(audio_mode_ && !audio_proj2_w_.defined(),
                     "audio projection requires an unconfigured ASR audio tail");
+        const int64_t output_width = hidden_size() == 896 ? 1024 : 2048;
         TORCH_CHECK(weight.device().type() == at::kPrivateUse1 &&
                         bias.device() == weight.device() &&
                         weight.scalar_type() == at::kHalf && bias.scalar_type() == at::kHalf &&
                         weight.is_contiguous() && bias.is_contiguous() &&
-                        weight.dim() == 2 && weight.size(0) == 1024 && weight.size(1) == 896 &&
-                        bias.dim() == 1 && bias.size(0) == 1024,
-                    "audio projection requires device FP16 swizzled [1024,896] weight and [1024] bias");
+                        weight.dim() == 2 && weight.size(0) == output_width && weight.size(1) == hidden_size() &&
+                        bias.dim() == 1 && bias.size(0) == output_width,
+                    "audio projection requires the matching device FP16 swizzled output weight and bias");
         audio_proj2_w_ = weight;
         audio_proj2_b_ = bias;
         invalidate_model_state();
     }
 
     void set_execution_cores(int64_t cores) {
+        TORCH_CHECK(!(qkv_w8a8_ || mlp_w8a8_) || cores == 8,
+                    "Pi Vision W8A8 requires eight cores");
         TORCH_CHECK(cores == 4 || cores == 8,
                     "SigLIP execution cores must be 4 or 8");
         TORCH_CHECK(layer_weights_.empty(),
@@ -520,9 +598,12 @@ public:
         if (num_cores() == 8)
             return FusedModelBase::resolve_model_execution_topology(
                 nq, nkv, hd, h, intermediate);
-        TORCH_CHECK(num_cores() == 4 && nq == 16 && nkv == 16 &&
-                        hd == 80 && h == 1152 && intermediate == 4352,
-                    "no admitted reduced-core Pi0.5 SigLIP profile");
+        const bool audio = hd == 64 &&
+            ((h == 896 && intermediate == 3584) ||
+             (h == 1024 && intermediate == 4096));
+        const bool vision = hd == 80 && h == 1152 && intermediate == 4352;
+        TORCH_CHECK(num_cores() == 4 && nq == 16 && nkv == 16 && (audio || vision),
+                    "no admitted reduced-core SigLIP component profile");
         return {4, 4, 4};
     }
 
@@ -530,6 +611,8 @@ public:
 
 
     void set_configured_chunk_size(int64_t chunk_size) {
+        TORCH_CHECK(!(qkv_w8a8_ || mlp_w8a8_) || chunk_size == 0 || chunk_size == 512 || chunk_size == 768,
+                    "Pi Vision W8A8 chunk must be auto, 512 or 768");
         clear_private_serial_cpu_slab();
         TORCH_CHECK(chunk_size == 0
                         || (chunk_size >= 16 && chunk_size % 16 == 0),
@@ -548,6 +631,11 @@ public:
         configure_chunk_for_shape(seq_len, packed_image_count);
         return resolve_chunk_size_for_shape(
             seq_len, /*position=*/0, std::nullopt, /*is_causal=*/false);
+    }
+
+    void prepare_siglip_persistent_spm(int64_t seq_len, int64_t packed_image_count) {
+        if (qkv_w8a8_ || mlp_w8a8_) configure_chunk_for_shape(seq_len, packed_image_count);
+        prepare_persistent_spm(seq_len, /*position=*/0, /*is_causal=*/false);
     }
 
     std::vector<int64_t> resolve_stage_domain(
@@ -616,7 +704,8 @@ public:
         int64_t projection_dim, double eps,
         at::TensorList q_ws_list, at::TensorList k_ws_list,
         at::TensorList v_ws_list, at::TensorList o_ws_list,
-        at::TensorList fc1_ws_list, at::TensorList fc2_ws_list)
+        at::TensorList fc1_ws_list, at::TensorList fc2_ws_list,
+        bool packed_w4 = false)
     {
         TORCH_CHECK(!audio_mode_, "audio weights are immutable after profile installation");
         clear_private_serial_cpu_slab();
@@ -625,6 +714,11 @@ public:
         TORCH_CHECK(num_heads > 0 && head_dim > 0 && hidden_size > 0
                     && intermediate_size > 0 && projection_dim > 0,
                     "siglip_set_weights: dim params must be positive");
+        TORCH_CHECK(!(qkv_w8a8_ || mlp_w8a8_) || (!linear_acc32_ && num_cores() == 8 &&
+                        N == 27 && num_heads == 16 && head_dim == 80 &&
+                        hidden_size == 1152 && intermediate_size == 4352 &&
+                        projection_dim == 2048 && eps == 1e-6),
+                    "Pi Vision W8A8 requires the exact TP8/H1152/L27/D80/I4352/P2048/epsilon1e-6 ACC16 profile");
 
         // All 16 per-layer lists must have the same length
         auto check_list = [&](const at::TensorList& l, const char* n) {
@@ -638,9 +732,16 @@ public:
         check_list(fc1_w_list, "fc1_w_list");
         check_list(fc2_w_list, "fc2_w_list");
         check_list(ln1_w_list, "ln1_w_list");
-        check_list(ln1_b_list, "ln1_b_list");
         check_list(ln2_w_list, "ln2_w_list");
-        check_list(ln2_b_list, "ln2_b_list");
+        // Packed W4 takes each LayerNorm beta already folded into the biases of
+        // the Linears it feeds (Q/K/V, fc1); see ln_beta_folded().
+        TORCH_CHECK(!packed_w4 || (ln1_b_list.empty() && ln2_b_list.empty()),
+                    "siglip_set_weights_w4a16 takes LayerNorm beta folded into the "
+                    "Q/K/V and fc1 biases; ln1_b_list and ln2_b_list must be empty");
+        if (!packed_w4) {
+            check_list(ln1_b_list, "ln1_b_list");
+            check_list(ln2_b_list, "ln2_b_list");
+        }
         check_list(q_b_list,   "q_b_list");
         check_list(k_b_list,   "k_b_list");
         check_list(v_b_list,   "v_b_list");
@@ -699,9 +800,11 @@ public:
         check_defined_rank(fc2_w_list, "fc2_w_list", 2);
         // Norm weights: 1D [hidden_size] — always fp16, DMA'd as Half.
         check_defined_rank(ln1_w_list, "ln1_w_list", 1, /*require_fp16_rpu=*/true);
-        check_defined_rank(ln1_b_list, "ln1_b_list", 1, /*require_fp16_rpu=*/true);
         check_defined_rank(ln2_w_list, "ln2_w_list", 1, /*require_fp16_rpu=*/true);
-        check_defined_rank(ln2_b_list, "ln2_b_list", 1, /*require_fp16_rpu=*/true);
+        if (!packed_w4) {
+            check_defined_rank(ln1_b_list, "ln1_b_list", 1, /*require_fp16_rpu=*/true);
+            check_defined_rank(ln2_b_list, "ln2_b_list", 1, /*require_fp16_rpu=*/true);
+        }
         // Biases: 1D — always fp16, DMA'd as Half.
         check_defined_rank(q_b_list,   "q_b_list",   1, /*require_fp16_rpu=*/true);
         check_defined_rank(k_b_list,   "k_b_list",   1, /*require_fp16_rpu=*/true);
@@ -709,51 +812,167 @@ public:
         check_defined_rank(o_b_list,   "o_b_list",   1, /*require_fp16_rpu=*/true);
         check_defined_rank(fc1_b_list, "fc1_b_list", 1, /*require_fp16_rpu=*/true);
         check_defined_rank(fc2_b_list, "fc2_b_list", 1, /*require_fp16_rpu=*/true);
-        check_siglip_w8a16_scale_lists(
-            N,
-            q_w_list, k_w_list, v_w_list, o_w_list, fc1_w_list, fc2_w_list,
-            q_ws_list, k_ws_list, v_ws_list, o_ws_list, fc1_ws_list, fc2_ws_list);
+        if (packed_w4) {
+            // Only the exact Pi SigLIP27 tower on four lanes: at eight, the
+            // padded o (K1280) and fc2 (K4352) rows split into 160 and 544
+            // per core, which the pgrp W4 kernels do not accept.
+            TORCH_CHECK(num_cores() == 4 && N == 27 && num_heads == 16 && head_dim == 80 &&
+                            hidden_size == 1152 && intermediate_size == 4352 &&
+                            projection_dim == 2048,
+                        "siglip_set_weights_w4a16 requires the exact Pi SigLIP27 tower on four cores; "
+                        "at eight the padded o (K1280) and fc2 (K4352) rows split into 160/544 per core");
+            check_siglip_w4a16_scale_lists(
+                N, num_cores(),
+                q_w_list, k_w_list, v_w_list, o_w_list, fc1_w_list, fc2_w_list,
+                q_ws_list, k_ws_list, v_ws_list, o_ws_list, fc1_ws_list, fc2_ws_list);
+        } else {
+            check_siglip_w8a16_scale_lists(
+                N,
+                q_w_list, k_w_list, v_w_list, o_w_list, fc1_w_list, fc2_w_list,
+                q_ws_list, k_ws_list, v_ws_list, o_ws_list, fc1_ws_list, fc2_ws_list);
+        }
+
+        if (qkv_w8a8_) {
+            auto exact = [](const at::Tensor& t, at::ScalarType dtype,
+                            at::IntArrayRef shape) {
+                return t.defined() && t.device().type() == at::kPrivateUse1 &&
+                    t.scalar_type() == dtype && t.is_contiguous() && t.sizes() == shape;
+            };
+            TORCH_CHECK(q_ws_list.size() == 27 && k_ws_list.size() == 27 &&
+                            v_ws_list.size() == 27,
+                        "Pi Vision QKV W8A8 requires all 27 Q/K/V scale owners");
+            for (int64_t i = 0; i < N; ++i) {
+                TORCH_CHECK(exact(ln1_w_list[i], at::kHalf, {1152}) &&
+                                exact(ln1_b_list[i], at::kHalf, {1152}) &&
+                                exact(q_b_list[i], at::kHalf, {1280}) &&
+                                exact(k_b_list[i], at::kHalf, {1280}) &&
+                                exact(v_b_list[i], at::kHalf, {1280}),
+                            "Pi Vision QKV W8A8 norm/bias shape mismatch at layer ", i);
+                for (const auto& pair : {
+                        std::make_pair(q_w_list[i], q_ws_list[i]),
+                        std::make_pair(k_w_list[i], k_ws_list[i]),
+                        std::make_pair(v_w_list[i], v_ws_list[i])}) {
+                    TORCH_CHECK(exact(pair.first, at::kChar, {1280, 1152}) &&
+                                    exact(pair.second, at::kHalf, {1280}) &&
+                                    pair.first.device() == pair.second.device(),
+                                "Pi Vision QKV W8A8 requires INT8 weights and FP16 scales at layer ", i);
+                    constexpr uint64_t limit = UINT64_C(1) << 40;
+                    for (const auto* tensor : {&pair.first, &pair.second}) {
+                        const auto address = RpuGetDevAddr(tensor->data_ptr());
+                        const auto offset = tensor->storage_offset();
+                        TORCH_CHECK(offset >= 0 && static_cast<bool>(tensor->storage()) &&
+                            uint64_t(offset) <= tensor->storage().nbytes() / tensor->element_size() &&
+                            tensor->nbytes() <= tensor->storage().nbytes() - uint64_t(offset) * tensor->element_size() &&
+                            address && address % 256 == 0 && address < limit && tensor->nbytes() <= limit - address,
+                            "Pi Vision QKV W8A8 requires complete aligned DDR owners at layer ", i);
+                    }
+                    const auto wa = RpuGetDevAddr(pair.first.data_ptr());
+                    const auto sa = RpuGetDevAddr(pair.second.data_ptr());
+                    TORCH_CHECK(wa + pair.first.nbytes() <= sa || sa + pair.second.nbytes() <= wa,
+                                "Pi Vision QKV W8A8 weight and scale owners overlap");
+                }
+            }
+            // Fail before changing the installed model or emitting preload DMA.
+            require_pi05_vision_qkv_w8a8_payloads(512);
+            require_pi05_vision_qkv_w8a8_payloads(768);
+        }
+
+        if (mlp_w8a8_) {
+            TORCH_CHECK(pi05_vision_owner_ln_opt_in_ && pi05_ring_xor3_opt_in_ &&
+                            pi05_vision_kv_spm_only_opt_in_ && !pi05_vision_fc_weight_outer_opt_in_,
+                        "Pi Vision MLP W8A8 requires the current owner-LN/XOR3/raw-SPM route");
+            auto exact = [](const at::Tensor& t, at::ScalarType dtype, at::IntArrayRef shape) {
+                return t.defined() && t.device().type() == at::kPrivateUse1 &&
+                    t.scalar_type() == dtype && t.is_contiguous() && t.sizes() == shape;
+            };
+            TORCH_CHECK(fc1_ws_list.size() == 27 && fc2_ws_list.size() == 27,
+                        "Pi Vision MLP W8A8 requires all 27 FC1/FC2 scale owners");
+            for (int64_t i = 0; i < N; ++i) {
+                TORCH_CHECK(exact(ln2_w_list[i], at::kHalf, {1152}) &&
+                                exact(ln2_b_list[i], at::kHalf, {1152}) &&
+                                exact(fc1_w_list[i], at::kChar, {4352, 1152}) &&
+                                exact(fc2_w_list[i], at::kChar, {1152, 4352}) &&
+                                exact(fc1_ws_list[i], at::kHalf, {4352}) &&
+                                exact(fc2_ws_list[i], at::kHalf, {1152}) &&
+                                exact(fc1_b_list[i], at::kHalf, {4352}) &&
+                                exact(fc2_b_list[i], at::kHalf, {1152}),
+                            "Pi Vision MLP W8A8 requires exact INT8/FP16 FC and norm owners at layer ", i);
+                for (const auto& pair : {std::make_pair(fc1_w_list[i], fc1_ws_list[i]),
+                                        std::make_pair(fc2_w_list[i], fc2_ws_list[i])}) {
+                    TORCH_CHECK(pair.first.device() == pair.second.device(),
+                                "Pi Vision MLP W8A8 weight/scale devices differ");
+                    constexpr uint64_t limit = UINT64_C(1) << 40;
+                    for (const auto* tensor : {&pair.first, &pair.second}) {
+                        const auto address = RpuGetDevAddr(tensor->data_ptr());
+                        const auto offset = tensor->storage_offset();
+                        TORCH_CHECK(offset >= 0 && static_cast<bool>(tensor->storage()) &&
+                            uint64_t(offset) <= tensor->storage().nbytes() / tensor->element_size() &&
+                            tensor->nbytes() <= tensor->storage().nbytes() - uint64_t(offset) * tensor->element_size() &&
+                            address && address % 256 == 0 && address < limit && tensor->nbytes() <= limit - address,
+                            "Pi Vision MLP W8A8 requires complete aligned DDR owners at layer ", i);
+                    }
+                    const auto wa = RpuGetDevAddr(pair.first.data_ptr());
+                    const auto sa = RpuGetDevAddr(pair.second.data_ptr());
+                    TORCH_CHECK(wa + pair.first.nbytes() <= sa || sa + pair.second.nbytes() <= wa,
+                                "Pi Vision MLP W8A8 weight and scale owners overlap");
+                }
+            }
+            require_pi05_vision_mlp_w8a8_payloads(512);
+            require_pi05_vision_mlp_w8a8_payloads(768);
+        }
 
         int64_t precision_mask = 0;
         if (num_cores() != 8) {
-            TORCH_CHECK(num_cores() == 4 && N == 27 && num_heads == 16 &&
-                            head_dim == 80 && hidden_size == 1152 &&
-                            intermediate_size == 4352 && projection_dim == 2048,
-                        "no admitted reduced-core Pi0.5 SigLIP geometry");
-            TORCH_CHECK(proj_w.sizes() == at::IntArrayRef({2048, 1152}) &&
-                            proj_b.numel() == 2048 &&
-                            post_ln_w.numel() == 1152 && post_ln_b.numel() == 1152,
-                        "Pi0.5 SigLIP global projection/norm shape mismatch");
+            const bool audio = num_heads == 16 && head_dim == 64 && eps == 1e-5 &&
+                projection_dim == hidden_size &&
+                ((N == 18 && hidden_size == 896 && intermediate_size == 3584) ||
+                 (N == 24 && hidden_size == 1024 && intermediate_size == 4096));
+            const bool vision = N == 27 && num_heads == 16 && head_dim == 80 &&
+                hidden_size == 1152 && intermediate_size == 4352 && projection_dim == 2048;
+            TORCH_CHECK(num_cores() == 4 && (audio || vision),
+                        "no admitted reduced-core SigLIP component geometry");
+            TORCH_CHECK(proj_w.sizes() == at::IntArrayRef({projection_dim, hidden_size}) &&
+                            proj_b.numel() == projection_dim &&
+                            post_ln_w.numel() == hidden_size && post_ln_b.numel() == hidden_size,
+                        "SigLIP component global projection/norm shape mismatch");
+            const int64_t attention_width = num_heads * head_dim;
             const std::array<std::array<int64_t, 2>, 6> expected{{
-                {1280, 1152}, {1280, 1152}, {1280, 1152},
-                {1152, 1280}, {4352, 1152}, {1152, 4352}}};
+                {attention_width, hidden_size}, {attention_width, hidden_size},
+                {attention_width, hidden_size}, {hidden_size, attention_width},
+                {intermediate_size, hidden_size}, {hidden_size, intermediate_size}}};
             for (int64_t i = 0; i < N; ++i) {
                 size_t j = 0;
                 int64_t layer_mask = 0;
                 for (const auto* tensor : {&q_w_list[i], &k_w_list[i],
                         &v_w_list[i], &o_w_list[i], &fc1_w_list[i],
                         &fc2_w_list[i]}) {
+                    // Packed W4 stores two K values per byte.
+                    const bool w4 = packed_w4 && tensor->scalar_type() == at::kByte;
                     TORCH_CHECK((tensor->scalar_type() == at::kHalf ||
-                                 tensor->scalar_type() == at::kChar) &&
+                                 (!audio && tensor->scalar_type() == at::kChar) || w4) &&
                                 tensor->size(0) == expected[j][0] &&
-                                tensor->size(1) == expected[j][1],
-                                "Pi0.5 SigLIP projection shape/precision mismatch");
+                                tensor->size(1) * (w4 ? 2 : 1) == expected[j][1],
+                                "SigLIP component projection shape/precision mismatch");
                     if (tensor->scalar_type() == at::kChar) layer_mask |= 1LL << j;
+                    if (w4) layer_mask |= 1LL << (6 + j);
                     ++j;
                 }
                 if (i == 0) precision_mask = layer_mask;
                 TORCH_CHECK(layer_mask == precision_mask,
-                            "Pi0.5 SigLIP precision scope must match across layers");
-                for (const auto* tensor : {&ln1_w_list[i], &ln1_b_list[i],
-                        &ln2_w_list[i], &ln2_b_list[i], &o_b_list[i],
-                        &fc2_b_list[i]})
-                    TORCH_CHECK(tensor->numel() == 1152,
-                                "Pi0.5 SigLIP norm/row-bias shape mismatch");
+                            "SigLIP component precision scope must match across layers");
+                for (const auto* tensor : {&ln1_w_list[i], &ln2_w_list[i],
+                        &o_b_list[i], &fc2_b_list[i]})
+                    TORCH_CHECK(tensor->numel() == hidden_size,
+                                "SigLIP component norm/row-bias shape mismatch");
+                if (!packed_w4)
+                    for (const auto* tensor : {&ln1_b_list[i], &ln2_b_list[i]})
+                        TORCH_CHECK(tensor->numel() == hidden_size,
+                                    "SigLIP component norm/row-bias shape mismatch");
                 for (const auto* tensor : {&q_b_list[i], &k_b_list[i], &v_b_list[i]})
-                    TORCH_CHECK(tensor->numel() == 1280,
-                                "Pi0.5 SigLIP QKV bias shape mismatch");
-                TORCH_CHECK(fc1_b_list[i].numel() == 4352,
-                            "Pi0.5 SigLIP FC1 bias shape mismatch");
+                    TORCH_CHECK(tensor->numel() == attention_width,
+                                "SigLIP component QKV bias shape mismatch");
+                TORCH_CHECK(fc1_b_list[i].numel() == intermediate_size,
+                            "SigLIP component FC1 bias shape mismatch");
             }
         }
         logical_intermediate_size_ =
@@ -778,7 +997,9 @@ public:
             }
         }
         if (pi05_vision_kv_spm_only_opt_in_ || pi05_vision_owner_ln_opt_in_) {
-            TORCH_CHECK(num_cores() == 8 && N == 27 && num_heads == 16 && head_dim == 80 &&
+            TORCH_CHECK((num_cores() == 8 ||
+                         (num_cores() == 4 && !pi05_vision_owner_ln_opt_in_)) &&
+                    N == 27 && num_heads == 16 && head_dim == 80 &&
                     hidden_size == 1152 && intermediate_size == 4352 &&
                     projection_dim == 2048 && hidden_size / num_heads == 72,
                 "Pi Vision residency requires the exact FP16/W8 Pi SigLIP profile");
@@ -867,17 +1088,55 @@ public:
                 !fc2_ws_list.empty() ? fc2_ws_list[i] : at::Tensor(),
             });
         }
+        // Packed W4 scales are retained at the pgrp launcher's cores*512 B DDR
+        // alignment; FP16 (undefined) and W8 scales pass through unchanged.
+        for (auto& lw : layer_weights_) {
+            lw.q_ws   = rpu_retain_linear_quant_scale(lw.q_w,   lw.q_ws,   num_cores());
+            lw.k_ws   = rpu_retain_linear_quant_scale(lw.k_w,   lw.k_ws,   num_cores());
+            lw.v_ws   = rpu_retain_linear_quant_scale(lw.v_w,   lw.v_ws,   num_cores());
+            lw.o_ws   = rpu_retain_linear_quant_scale(lw.o_w,   lw.o_ws,   num_cores());
+            lw.fc1_ws = rpu_retain_linear_quant_scale(lw.fc1_w, lw.fc1_ws, num_cores());
+            lw.fc2_ws = rpu_retain_linear_quant_scale(lw.fc2_w, lw.fc2_ws, num_cores());
+        }
 
         // Build bias/norm tensor storage (keeps DDR pointers alive for DMA)
         layer_bias_norm_.clear();
         layer_bias_norm_.reserve(N);
         for (int64_t i = 0; i < N; i++) {
             layer_bias_norm_.push_back({
-                ln1_w_list[i], ln1_b_list[i],
-                ln2_w_list[i], ln2_b_list[i],
+                ln1_w_list[i], packed_w4 ? at::Tensor() : ln1_b_list[i],
+                ln2_w_list[i], packed_w4 ? at::Tensor() : ln2_b_list[i],
                 q_b_list[i], k_b_list[i], v_b_list[i], o_b_list[i],
                 fc1_b_list[i], fc2_b_list[i],
             });
+        }
+
+        // LayerNorm streaming source: per layer LN1 gamma, LN1 beta, LN2 gamma,
+        // LN2 beta, each zero-padded to the DMA-safe slot width, so one
+        // broadcast DMA fills the whole Temp slot. Bytes only; cold.
+        ln_stream_ddr_ = at::Tensor();
+        if (pi05_vision_ln_stream_opt_in_) {
+            const int64_t width = ln_stream_elems();
+            auto packed = at::zeros({N, 4, width},
+                at::TensorOptions().dtype(at::kHalf).device(at::kCPU));
+            for (int64_t i = 0; i < N; ++i) {
+                const auto& bn = layer_bias_norm_[i];
+                int64_t slot = 0;
+                for (const at::Tensor* vec : {&bn.ln1_w, &bn.ln1_b, &bn.ln2_w, &bn.ln2_b}) {
+                    if (packed_w4 && (slot == 1 || slot == 3)) {
+                        ++slot;
+                        continue;
+                    }
+                    TORCH_CHECK(vec->defined() && vec->scalar_type() == at::kHalf &&
+                                    vec->is_contiguous() && vec->numel() >= hidden_size,
+                                "SigLIP LayerNorm streaming requires contiguous FP16 "
+                                "LN vectors of hidden_size elements");
+                    packed[i][slot++].narrow(0, 0, hidden_size)
+                        .copy_(vec->cpu().reshape({-1}).narrow(0, 0, hidden_size));
+                }
+            }
+            ln_stream_ddr_ = packed.view({N, 4 * width}).to(ln1_w_list[0].device());
+            rpu_ddr_flush_force(ln_stream_ddr_.data_ptr<c10::Half>());
         }
 
         // Global weights
@@ -954,7 +1213,7 @@ public:
                             num_layers() == 27 && intermediate_size() == 4352 &&
                             num_q_heads() == 16 && num_kv_heads() == 16 && head_dim() == 80 &&
                             orig_head_dim_ == 72 && projection_dim_ == 2048 &&
-                            pi05_vision_supported_owner(),
+                            (pi05_vision_supported_owner() || pi05_vision4_w4_owner()),
                         "SigLIP CPU single-image ingress requires the installed Pi Vision4 profile");
             TORCH_CHECK(input.scalar_type() == at::kHalf && input.is_contiguous() &&
                             input.sizes() == at::IntArrayRef({1, 3, 224, 224}) &&
@@ -1010,13 +1269,25 @@ public:
                 ((input.size(3) - pe_kw_) / pe_stridew_ + 1);
             TORCH_CHECK(num_cores() == 8 ||
                             (input.sizes() == at::IntArrayRef({1, 3, 224, 224}) &&
-                             input.scalar_type() == at::kHalf && patch_rows == 256),
-                        "Pi0.5 SigLIP4 requires serial single-image M256 execution");
+                             input.scalar_type() == at::kHalf && patch_rows == 256) ||
+                            (num_cores() == 4 &&
+                             (input.size(0) == 2 || input.size(0) == 3) &&
+                             input.sizes() == at::IntArrayRef({input.size(0), 3, 224, 224}) &&
+                             input.scalar_type() == at::kHalf &&
+                             patch_rows == input.size(0) * 256 &&
+                             pi05_vision_supported_owner() &&
+                             pi05_vision_kv_spm_only_opt_in_ &&
+                             pi05_vision_q_resident_opt_in_),
+                        "Pi0.5 SigLIP4 requires serial single-image M256 or admitted packed raw-SPM execution");
             // Validate the descriptor against this request's actual cameras,
             // even if a different admitted shape was the last planned/replayed one.
             image_batch_count_ = input.size(0);
+            require_pi05_vision_qkv_w8a8_profile(patch_rows, input.size(0));
+            require_pi05_vision_mlp_w8a8_profile(patch_rows, input.size(0));
             const auto prepared_planned = prepare_stage_candidate(planned_stage_descriptor);
             const auto& planned = prepared_planned->candidate();
+            validate_pi05_vision_qkv_w8a8_policy(planned, patch_rows, input.size(0));
+            validate_pi05_vision_mlp_w8a8_policy(planned, patch_rows, input.size(0));
             validate_pi05_vision_kv_spm_only_policy(
                 planned, patch_rows, input.size(0));
             validate_pi05_vision_owner_ln_policy(
@@ -1076,13 +1347,16 @@ public:
         const bool cpu_images = images.front().device().is_cpu();
         if (cpu_images) {
             TORCH_CHECK(
-                (images.size() == 2 || images.size() == 3) && num_cores() == 8 &&
+                (images.size() == 2 || images.size() == 3) &&
+                    (num_cores() == 8 ||
+                     (num_cores() == 4 && pi05_vision_kv_spm_only_opt_in_ &&
+                      pi05_vision_q_resident_opt_in_)) &&
                     pe_kh_ == 14 && pe_kw_ == 14 && pe_strideh_ == 14 && pe_stridew_ == 14 &&
                     pe_cin_orig_ == 3 && pe_cout_ == 1152 && hidden_size() == 1152 && num_layers() == 27 &&
                     intermediate_size() == 4352 && num_q_heads() == 16 &&
                     num_kv_heads() == 16 && head_dim() == 80 && orig_head_dim_ == 72 &&
                     projection_dim_ == 2048 && pi05_vision_supported_owner(),
-                "SigLIP CPU camera ingress requires the exact packed TP8 Pi profile");
+                "SigLIP CPU camera ingress requires the exact packed Pi profile");
             TORCH_CHECK(k_caches.size() == static_cast<size_t>(num_layers()) &&
                             v_caches.size() == k_caches.size(),
                         "SigLIP CPU camera ingress requires the installed device KV caches");
@@ -1132,11 +1406,23 @@ public:
         TORCH_CHECK(num_cores() == 8 ||
                         (images.size() == 1 && patch_rows == 256 &&
                          first_image.sizes() == at::IntArrayRef({1, 3, 224, 224}) &&
-                         first_image.scalar_type() == at::kHalf),
-                    "Pi0.5 SigLIP4 requires serial single-image M256 execution");
+                         first_image.scalar_type() == at::kHalf) ||
+                        (num_cores() == 4 &&
+                         (images.size() == 2 || images.size() == 3) &&
+                         patch_rows == static_cast<int64_t>(images.size()) * 256 &&
+                         first_image.sizes() == at::IntArrayRef({1, 3, 224, 224}) &&
+                         first_image.scalar_type() == at::kHalf &&
+                         pi05_vision_supported_owner() &&
+                         pi05_vision_kv_spm_only_opt_in_ &&
+                         pi05_vision_q_resident_opt_in_),
+                    "Pi0.5 SigLIP4 requires serial single-image M256 or admitted packed raw-SPM execution");
         image_batch_count_ = static_cast<int64_t>(images.size());
+        require_pi05_vision_qkv_w8a8_profile(patch_rows, image_batch_count_);
+        require_pi05_vision_mlp_w8a8_profile(patch_rows, image_batch_count_);
         const auto prepared_planned = prepare_stage_candidate(planned_stage_descriptor);
         const auto& planned = prepared_planned->candidate();
+        validate_pi05_vision_qkv_w8a8_policy(planned, patch_rows, image_batch_count_);
+        validate_pi05_vision_mlp_w8a8_policy(planned, patch_rows, image_batch_count_);
         validate_pi05_vision_kv_spm_only_policy(
             planned, patch_rows, static_cast<int64_t>(images.size()));
         validate_pi05_vision_owner_ln_policy(
@@ -1211,15 +1497,18 @@ public:
         image_batch_count_ = packed_image_count;
 
         int64_t seq_len = hidden_states.size(1);
+        TORCH_CHECK(!(qkv_w8a8_ || mlp_w8a8_) || (hidden_states.scalar_type() == at::kHalf &&
+                        hidden_states.size(0) == 1 && hidden_states.size(2) == 1152),
+                    "Pi Vision W8A8 requires packed FP16 [1,M,1152] input");
 
-        validate_pi05_vision_owner_ln_policy(
-            decode_fmb_prefill_stage_candidate(planned_stage_descriptor),
-            seq_len, packed_image_count);
+        const auto planned = decode_fmb_prefill_stage_candidate(planned_stage_descriptor);
+        validate_pi05_vision_qkv_w8a8_policy(planned, seq_len, packed_image_count);
+        validate_pi05_vision_mlp_w8a8_policy(planned, seq_len, packed_image_count);
+        validate_pi05_vision_owner_ln_policy(planned, seq_len, packed_image_count);
 
         if (pi05_vision_kv_spm_only_opt_in_) {
             validate_pi05_vision_kv_spm_only_policy(
-                decode_fmb_prefill_stage_candidate(planned_stage_descriptor),
-                seq_len, packed_image_count);
+                planned, seq_len, packed_image_count);
         }
 
         // Site5 (KV_FIRST): seq_len_ is this forward's full sequence length (the SDPA
@@ -1300,7 +1589,7 @@ public:
         // Otherwise a retained previous Vision return is overwritten by the
         // next request even though its Tensor/DDR owner is still alive.
         projector_output_ = allocate_tracked_output(
-            {1, seq_len_, audio_proj2_w_.defined() ? 1024 : projection_dim_});
+            {1, seq_len_, audio_proj2_w_.defined() ? audio_proj2_w_.size(0) : projection_dim_});
         projector_out_live_base_ =
             ::rhino_lkn::RpuGetDevAddr(projector_output_.data_ptr());
 
@@ -1426,6 +1715,16 @@ protected:
         manifest.kv_insert_physical_rows = physical_len;
         manifest.graph_lifecycle = FmbGraphLifecycle::COMPOSITE_CHILD;
         manifest.linear_accumulation = linear_accumulation_policy();
+        if (qkv_w8a8_ || mlp_w8a8_) {
+            require_pi05_vision_qkv_w8a8_profile(physical_len, image_batch_count_);
+            require_pi05_vision_mlp_w8a8_profile(physical_len, image_batch_count_);
+            require_pi05_vision_kv_spm_only_schedule(plan);
+            TORCH_CHECK(logical_len == physical_len && position == 0 &&
+                            layout.batch_size == 1 && !layout.is_causal &&
+                            !layout.use_attn_mask && layout.chunk_size == physical_len &&
+                            layout.effective_kv_cs() == physical_len,
+                        "Pi Vision W8A8 requires one full packed QKV/compute chunk");
+        }
         if(pi05_vision_fc_weight_outer_opt_in_) {
             require_pi05_vision_fc_profile(physical_len,image_batch_count_);
             TORCH_CHECK(logical_len==768 && position==0 && layout.batch_size==1 &&
@@ -1483,9 +1782,18 @@ protected:
                 append(FmbRouteFamily::GRAPH_SCHEDULE, SIGLIP_Q_RESIDENT_SITE,
                        carry_q ? 2 : 1, {}, chunk.idx);
             }
-            append_linear(SIGLIP_Q_LINEAR_SITE, chunk.idx);
-            append_linear(SIGLIP_K_LINEAR_SITE, chunk.idx);
-            append_linear(SIGLIP_V_LINEAR_SITE, chunk.idx);
+            if (qkv_w8a8_) {
+                append(FmbRouteFamily::NORMALIZATION, SIGLIP_LN1_QUANT_W8A8_SITE,
+                       SIGLIP_LN1_QUANT_W8A8_ROUTE,
+                       siglip_qkv_w8a8::norm_arguments(chunk.len), chunk.idx);
+                for (auto site : {SIGLIP_Q_LINEAR_SITE, SIGLIP_K_LINEAR_SITE, SIGLIP_V_LINEAR_SITE})
+                    append(FmbRouteFamily::LINEAR, site, SIGLIP_QKV_W8A8_LINEAR_ROUTE,
+                           siglip_qkv_w8a8::linear_arguments(chunk.len), chunk.idx);
+            } else {
+                append_linear(SIGLIP_Q_LINEAR_SITE, chunk.idx);
+                append_linear(SIGLIP_K_LINEAR_SITE, chunk.idx);
+                append_linear(SIGLIP_V_LINEAR_SITE, chunk.idx);
+            }
             const KvInsertSegmentPlan kv_plan =
                 resolve_kvinsert_plan_auto(
                     SIGLIP_KV_INSERT_SITE, manifest.graph_lifecycle,
@@ -1527,12 +1835,21 @@ protected:
             append(
                 FmbRouteFamily::ALL_REDUCE,
                 SIGLIP_ATTN_ALL_REDUCE_SITE,
-                pi05_vision_owner_ln_opt_in_ ? SIGLIP_OWNER_LN_ROUTE :
+                mlp_w8a8_ ? SIGLIP_OWNER_LN_QUANT_W8A8_ROUTE :
+                    pi05_vision_owner_ln_opt_in_ ? SIGLIP_OWNER_LN_ROUTE :
                     fmb_ring_all_reduce_route_selector(
                         chunk.len, hidden_size(), use_pi05_ring_xor3(chunk.len), num_cores()),
-                pi05_vision_owner_ln_opt_in_ ? pi05_vision_owner_ln_arguments(false, chunk.len) :
+                mlp_w8a8_ ? siglip_mlp_w8a8::owner_arguments(chunk.len) :
+                    pi05_vision_owner_ln_opt_in_ ? pi05_vision_owner_ln_arguments(false, chunk.len) :
                     std::vector<int64_t>{}, chunk.idx);
-            if(pi05_vision_fc_weight_outer_opt_in_) {
+            if (mlp_w8a8_) {
+                append(FmbRouteFamily::LINEAR, SIGLIP_FC1_LINEAR_SITE,
+                    SIGLIP_MLP_W8A8_LINEAR_ROUTE, siglip_mlp_w8a8::linear_arguments(chunk.len, false), chunk.idx);
+                append(FmbRouteFamily::ACTIVATION, SIGLIP_GELU_QUANT_W8A8_SITE,
+                    SIGLIP_GELU_QUANT_W8A8_ROUTE, siglip_mlp_w8a8::gelu_arguments(chunk.len), chunk.idx);
+                append(FmbRouteFamily::LINEAR, SIGLIP_FC2_LINEAR_SITE,
+                    SIGLIP_MLP_W8A8_LINEAR_ROUTE, siglip_mlp_w8a8::linear_arguments(chunk.len, true), chunk.idx);
+            } else if(pi05_vision_fc_weight_outer_opt_in_) {
                 append(FmbRouteFamily::GRAPH_SCHEDULE,SIGLIP_FC1_WEIGHT_OUTER_SITE,
                     2,pi05_vision_fc_arguments(false),chunk.idx);
                 append(FmbRouteFamily::GRAPH_SCHEDULE,SIGLIP_FC2_WEIGHT_OUTER_SITE,
@@ -1613,6 +1930,16 @@ protected:
         const LayoutContext& layout,
         int64_t physical_len, int64_t logical_len,
         int64_t position) const override {
+        // Reject an inadmissible candidate without aborting AUTO's enumeration.
+        // The direct manifest/forward paths retain strict diagnostics below.
+        if ((qkv_w8a8_ || mlp_w8a8_) &&
+            ((image_batch_count_ != 2 && image_batch_count_ != 3) ||
+             physical_len != image_batch_count_ * 256 || logical_len != physical_len ||
+             position != 0 || layout.batch_size != 1 || layout.is_causal ||
+             layout.use_attn_mask || layout.chunk_size != physical_len ||
+             layout.effective_kv_cs() != physical_len ||
+             plan.qkv.chunks.size() != 1 || plan.compute.chunks.size() != 1))
+            return {};
         if (pi05_vision_kv_spm_only_opt_in_ || pi05_vision_owner_ln_opt_in_) {
             LayoutContext spm_only_layout = layout;
             spm_only_layout.attention_policy =
@@ -1639,6 +1966,8 @@ protected:
     FmbPhysicalManifestForwardCapability
     physical_manifest_forward_capability(
         const FmbPhysicalExecutionManifest& manifest) const override {
+        validate_pi05_vision_qkv_w8a8_manifest(manifest);
+        validate_pi05_vision_mlp_w8a8_manifest(manifest);
         validate_pi05_vision_fc_manifest(manifest);
         validate_pi05_vision_kv_spm_only_manifest(manifest);
         validate_pi05_vision_owner_ln_manifest(manifest);
@@ -1741,6 +2070,8 @@ protected:
         int64_t q_comp = A(comp_cs * local_q_dim * DWIDTH);
         int64_t sdpa_out = A(comp_cs * local_q_dim * DWIDTH);
         int64_t fc1  = A(comp_cs * local_inter * DWIDTH);
+        if (mlp_w8a8_ && (comp_cs == 512 || comp_cs == 768))
+            siglip_mlp_w8a8::validate_root_extents(comp_cs, res, res, fc1, res);
 
         // SDPA tmp sizing (same formula as before, now sized at comp_cs — the
         // Phase-2 query-chunk length, NOT the full sequence).
@@ -1776,13 +2107,26 @@ protected:
         //     residual1/input_norm/oproj stay alive across both.
         std::vector<BufferDecl> decls;
 
+        const bool c4_packed_raw = num_cores() == 4 && raw_spm && carry_q;
+
         // Structural — alive across both phases (always-conflict with KVIN/COMP).
         decls.push_back({"residual1",  res, 1, 8, StorageClass::Temp, 0, nullptr, ALL});
         decls.push_back({"input_norm", res, 1, 8, StorageClass::Temp, 0, nullptr, ALL});
-        // oproj: Phase-2 o_proj out / LN2 out / fc2 partial scratch. Held in the
-        // LayerWide band per design (could be COMP-scoped at comp_cs as a future
-        // SPM optimization; kept LayerWide for the conservative first cut).
-        decls.push_back({"oproj",      res, 4, 8, StorageClass::Temp, 0, nullptr, ALL});
+        // LN1's INT8 Q reuses the first M*H bytes of input_norm. Keep its full
+        // FP16 extent: LN2 and owner-LN's compact residual still use it later.
+        // SX lives through all three projections, then aliases Compute space.
+        if (qkv_w8a8_)
+            decls.push_back({"qkv_sx", A(Align(kv_cs, int64_t{16}) * 2), 1, 3,
+                             StorageClass::Temp, 0, nullptr, KVIN});
+        // MLP W8A8 uses input_norm's compact-raw prefix and disjoint Q/SX tail.
+        // These subregions inherit this full root's LayerWide phase 1..8 lifetime;
+        // no smaller declaration may allow a producer to overwrite compact raw.
+        // oproj: Phase-2 o_proj out / LN2 out / fc2 partial scratch. On four-lane
+        // packed raw-SPM+carry_q, start at step 6 so step-5 QKV+SDPA frees room
+        // for fc1 (7..8) to share the ALL band within the 7.99 MB usable cap.
+        // On non-raw four-lane probes (mirroring HYViT2), start at step 1 so all
+        // LayerWide slots sit below KvInsert and avoid stranding a KVIN hole.
+        decls.push_back({"oproj", res, c4_packed_raw ? 6 : (num_cores() != 8 ? 1 : 4), 8, StorageClass::Temp, 0, nullptr, ALL});
 
         // KvInsert-only (Phase 1) — aliasable against Compute-only buffers.
         decls.push_back({"q_kv", qkv, 1, carry_q ? 5 : 3,
@@ -1800,15 +2144,33 @@ protected:
         decls.push_back({"q_comp", carry_q ? 0 : q_comp, 4, 5,
                          StorageClass::Temp, 0, carry_q ? "q_kv" : nullptr,
                          carry_q ? ALL : COMP});
-        decls.push_back({"sdpa_out",   sdpa_out, 5, 6, StorageClass::Temp, 0, nullptr, COMP});
-        decls.push_back({"sdpa_tmp",   sdpa_tmp, 5, 5, StorageClass::Temp, 0, nullptr, COMP});
-        decls.push_back({"fc1",        fc1,      7, 8, StorageClass::Temp, 0, nullptr, COMP});
+        if (c4_packed_raw) {
+            decls.push_back({"sdpa_tmp", sdpa_tmp, 5, 5, StorageClass::Temp, 0, nullptr, ALL});
+            decls.push_back({"sdpa_out", sdpa_out, 5, 6, StorageClass::Temp, 0, nullptr, ALL});
+            decls.push_back({"fc1",      fc1,      7, 8, StorageClass::Temp, 0, nullptr, ALL});
+        } else {
+            decls.push_back({"sdpa_out", sdpa_out, 5, 6, StorageClass::Temp, 0, nullptr, COMP});
+            decls.push_back({"sdpa_tmp", sdpa_tmp, 5, 5, StorageClass::Temp, 0, nullptr, COMP});
+            decls.push_back({"fc1",      fc1,      7, 8, StorageClass::Temp, 0, nullptr, COMP});
+        }
 
-        // Persistent per-layer: norm weights (gamma/beta for LN1, LN2)
-        decls.push_back({"ln1_gamma", norm_w_sz, 0, 0, StorageClass::PersistentPerLayer, nl, nullptr, ALL});
-        decls.push_back({"ln1_beta",  norm_w_sz, 0, 0, StorageClass::PersistentPerLayer, nl, nullptr, ALL});
-        decls.push_back({"ln2_gamma", norm_w_sz, 0, 0, StorageClass::PersistentPerLayer, nl, nullptr, ALL});
-        decls.push_back({"ln2_beta",  norm_w_sz, 0, 0, StorageClass::PersistentPerLayer, nl, nullptr, ALL});
+        // Norm weights (gamma/beta for LN1, LN2): one Temp slot refilled by
+        // every Phase-1 callback when streaming, otherwise persistent per layer
+        // (with folded betas sharing one zero vector on four-lane Pi W4).
+        if (pi05_vision_ln_stream_opt_in_) {
+            TORCH_CHECK(norm_w_sz == ln_stream_elems() * DWIDTH,
+                        "SigLIP LayerNorm streaming slot width mismatch");
+            decls.push_back({"ln_stream", 4 * norm_w_sz, 1, 8, StorageClass::Temp, 0, nullptr, ALL});
+        } else {
+            decls.push_back({"ln1_gamma", norm_w_sz, 0, 0, StorageClass::PersistentPerLayer, nl, nullptr, ALL});
+            decls.push_back({"ln2_gamma", norm_w_sz, 0, 0, StorageClass::PersistentPerLayer, nl, nullptr, ALL});
+            if (ln_beta_folded()) {
+                decls.push_back({"ln_beta_zero", norm_w_sz, 0, 0, StorageClass::Persistent, 0, nullptr, ALL});
+            } else {
+                decls.push_back({"ln1_beta", norm_w_sz, 0, 0, StorageClass::PersistentPerLayer, nl, nullptr, ALL});
+                decls.push_back({"ln2_beta", norm_w_sz, 0, 0, StorageClass::PersistentPerLayer, nl, nullptr, ALL});
+            }
+        }
         // Persistent per-layer: biases
         decls.push_back({"q_bias",    q_bias_sz,    0, 0, StorageClass::PersistentPerLayer, nl, nullptr, ALL});
         decls.push_back({"k_bias",    q_bias_sz,    0, 0, StorageClass::PersistentPerLayer, nl, nullptr, ALL});
@@ -1848,19 +2210,24 @@ protected:
             rpu_launch_memset_spm_multicore(layer_addr(L, 0, "o_bias"), h, num_cores());
             rpu_launch_memset_spm_multicore(layer_addr(L, 0, "fc2_bias"), h, num_cores());
 
-            // Broadcast LayerNorm gamma/beta to all cores (num_elements, NOT bytes)
-            rpu_launch_ddr_broadcast_spm_dma(
-                bn.ln1_w.data_ptr<c10::Half>(), h,
-                layer_addr(L, 0, "ln1_gamma"), num_cores());
-            rpu_launch_ddr_broadcast_spm_dma(
-                bn.ln1_b.data_ptr<c10::Half>(), h,
-                layer_addr(L, 0, "ln1_beta"), num_cores());
-            rpu_launch_ddr_broadcast_spm_dma(
-                bn.ln2_w.data_ptr<c10::Half>(), h,
-                layer_addr(L, 0, "ln2_gamma"), num_cores());
-            rpu_launch_ddr_broadcast_spm_dma(
-                bn.ln2_b.data_ptr<c10::Half>(), h,
-                layer_addr(L, 0, "ln2_beta"), num_cores());
+            // Broadcast LayerNorm gamma/beta to all cores (num_elements, NOT
+            // bytes). Streaming loads them per layer in the compute graph.
+            if (!pi05_vision_ln_stream_opt_in_) {
+                rpu_launch_ddr_broadcast_spm_dma(
+                    bn.ln1_w.data_ptr<c10::Half>(), h,
+                    layer_addr(L, 0, "ln1_gamma"), num_cores());
+                rpu_launch_ddr_broadcast_spm_dma(
+                    bn.ln2_w.data_ptr<c10::Half>(), h,
+                    layer_addr(L, 0, "ln2_gamma"), num_cores());
+                if (!ln_beta_folded()) {
+                    rpu_launch_ddr_broadcast_spm_dma(
+                        bn.ln1_b.data_ptr<c10::Half>(), h,
+                        layer_addr(L, 0, "ln1_beta"), num_cores());
+                    rpu_launch_ddr_broadcast_spm_dma(
+                        bn.ln2_b.data_ptr<c10::Half>(), h,
+                        layer_addr(L, 0, "ln2_beta"), num_cores());
+                }
+            }
 
             // Col-partition scatter: each core gets its own slice of the bias.
             // DMA path via rpu_launch_ddr_scatter_spm_dma — weights are static
@@ -1903,6 +2270,9 @@ protected:
                 layer_addr(L, 0, "fc2_bias"), /*num_cores=*/1);
         }
 
+        if (!pi05_vision_ln_stream_opt_in_ && ln_beta_folded())
+            rpu_launch_memset_spm_multicore(addr(0, "ln_beta_zero"), h, num_cores());
+
         // Global: post-LayerNorm weights (broadcast to all cores)
         rpu_launch_ddr_broadcast_spm_dma(
             post_ln_w_.data_ptr<c10::Half>(), h,
@@ -1938,6 +2308,8 @@ protected:
         int64_t nq = num_q_heads();
         int64_t hd = head_dim();
 
+        require_pi05_vision_qkv_w8a8_runtime(chunk);
+
         // Phase 1: DDR→SPM input DMA + LayerNorm1.
         // input_in_spm guard preserved (SigLIP-specific deviation from Gemma's
         // unconditional re-read): in single-chunk AUTO→SPM_RESIDENT mode the
@@ -1948,39 +2320,73 @@ protected:
         if (!ctx().input_in_spm) {
             emit_layer_input_dma(layer_idx, chunk);
         }
-        rpu_launch_layernorm_spm_kernel(
-            addr(0, "residual1"), addr(0, "input_norm"),
-            layer_addr(layer_idx, 0, "ln1_gamma"), layer_addr(layer_idx, 0, "ln1_beta"),
-            seq_len, h, eps_, false, 0, num_cores());
+        // KV_FIRST is layer-major (every Phase-1 callback of a layer precedes
+        // its Phase-2 callbacks and the next layer's), so refilling the slot
+        // here also serves this layer's LN2.
+        if (pi05_vision_ln_stream_opt_in_) {
+            TORCH_CHECK(ln_stream_ddr_.defined() && ln_stream_ddr_.size(0) == num_layers(),
+                        "SigLIP LayerNorm streaming requires installed weights");
+            rpu_launch_ddr_broadcast_spm_dma(
+                ln_stream_ddr_, layer_idx * ln_stream_ddr_.size(1),
+                ln_stream_ddr_.size(1), addr(0, "ln_stream"), num_cores());
+        }
+        if (qkv_w8a8_) {
+            ctx().consume_physical_route(
+                FmbRouteFamily::NORMALIZATION, SIGLIP_LN1_QUANT_W8A8_SITE,
+                SIGLIP_LN1_QUANT_W8A8_ROUTE, 0,
+                siglip_qkv_w8a8::norm_arguments(seq_len), chunk.idx);
+            rpu_launch_layer_norm_quantize_w8a8_spm_kernel(
+                addr(0, "residual1"), addr(0, "input_norm"), addr(0, "qkv_sx"),
+                ln_addr(layer_idx, 0), ln_addr(layer_idx, 1),
+                seq_len, eps_, num_cores());
+            auto project = [&](int64_t site, const at::Tensor& weight,
+                               const at::Tensor& scale, const char* output, const char* bias) {
+                ctx().consume_physical_route(FmbRouteFamily::LINEAR, site,
+                    SIGLIP_QKV_W8A8_LINEAR_ROUTE, 0,
+                    siglip_qkv_w8a8::linear_arguments(seq_len), chunk.idx);
+                rpu_launch_linear_w8a8_spm_kernel(
+                    addr(0, "input_norm"), addr(0, "qkv_sx"), weight, scale,
+                    addr(0, output), seq_len, nq * hd, h, 1, num_cores(),
+                    layer_addr(layer_idx, 0, bias));
+            };
+            project(SIGLIP_Q_LINEAR_SITE, lw.q_w, lw.q_ws, "q_kv", "q_bias");
+            project(SIGLIP_K_LINEAR_SITE, lw.k_w, lw.k_ws, "k", "k_bias");
+            project(SIGLIP_V_LINEAR_SITE, lw.v_w, lw.v_ws, "v", "v_bias");
+        } else {
+            rpu_launch_layernorm_spm_kernel(
+                addr(0, "residual1"), addr(0, "input_norm"),
+                ln_addr(layer_idx, 0), ln_addr(layer_idx, 1),
+                seq_len, h, eps_, false, 0, num_cores());
 
-        // QKV Linear with bias (SPM-to-SPM ACC16, col-partition). q → q_kv.
-        consume_manifest_route(
-            FmbRouteFamily::LINEAR, SIGLIP_Q_LINEAR_SITE,
-            static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
-            chunk.idx);
-        rpu_launch_linear_spm_to_spm_acc16_kernel(
-            addr(0, "input_norm"), lw.q_w, addr(0, "q_kv"),
-            seq_len, nq * hd, h, 1, num_cores(),
-            layer_addr(layer_idx, 0, "q_bias"), lw.q_ws, 0, 0,
-            /*force_acc32=*/linear_acc32_);
-        consume_manifest_route(
-            FmbRouteFamily::LINEAR, SIGLIP_K_LINEAR_SITE,
-            static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
-            chunk.idx);
-        rpu_launch_linear_spm_to_spm_acc16_kernel(
-            addr(0, "input_norm"), lw.k_w, addr(0, "k"),
-            seq_len, nq * hd, h, 1, num_cores(),
-            layer_addr(layer_idx, 0, "k_bias"), lw.k_ws, 0, 0,
-            /*force_acc32=*/linear_acc32_);
-        consume_manifest_route(
-            FmbRouteFamily::LINEAR, SIGLIP_V_LINEAR_SITE,
-            static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
-            chunk.idx);
-        rpu_launch_linear_spm_to_spm_acc16_kernel(
-            addr(0, "input_norm"), lw.v_w, addr(0, "v"),
-            seq_len, nq * hd, h, 1, num_cores(),
-            layer_addr(layer_idx, 0, "v_bias"), lw.v_ws, 0, 0,
-            /*force_acc32=*/linear_acc32_);
+            // QKV Linear with bias (SPM-to-SPM ACC16, col-partition). q → q_kv.
+            consume_manifest_route(
+                FmbRouteFamily::LINEAR, SIGLIP_Q_LINEAR_SITE,
+                static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+                chunk.idx);
+            rpu_launch_linear_spm_to_spm_acc16_kernel(
+                addr(0, "input_norm"), lw.q_w, addr(0, "q_kv"),
+                seq_len, nq * hd, h, 1, num_cores(),
+                layer_addr(layer_idx, 0, "q_bias"), lw.q_ws, 0, 0,
+                /*force_acc32=*/linear_acc32_);
+            consume_manifest_route(
+                FmbRouteFamily::LINEAR, SIGLIP_K_LINEAR_SITE,
+                static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+                chunk.idx);
+            rpu_launch_linear_spm_to_spm_acc16_kernel(
+                addr(0, "input_norm"), lw.k_w, addr(0, "k"),
+                seq_len, nq * hd, h, 1, num_cores(),
+                layer_addr(layer_idx, 0, "k_bias"), lw.k_ws, 0, 0,
+                /*force_acc32=*/linear_acc32_);
+            consume_manifest_route(
+                FmbRouteFamily::LINEAR, SIGLIP_V_LINEAR_SITE,
+                static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+                chunk.idx);
+            rpu_launch_linear_spm_to_spm_acc16_kernel(
+                addr(0, "input_norm"), lw.v_w, addr(0, "v"),
+                seq_len, nq * hd, h, 1, num_cores(),
+                layer_addr(layer_idx, 0, "v_bias"), lw.v_ws, 0, 0,
+                /*force_acc32=*/linear_acc32_);
+        }
 
         // No RoPE (SigLIP has none).
 
@@ -2068,8 +2474,19 @@ protected:
     // (typed SPM offset). Non-SDPA sites use absolute `addr(0, name)` /
     // `layer_addr(L, 0, name)`.
     // ========================================================================
+    // Packed W4 row Linear takes no in-kernel bias. The o/fc2 bias buffers hold
+    // the bias on core 0 and zeros elsewhere (emit_preload_weights), so adding
+    // them to every core's partial before the reduction is the same sum the
+    // fp16/int8 kernel makes.
+    void add_row_bias_partial(uint32_t bias_addr, int64_t seq_len, int64_t h) {
+        rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
+            bias_addr, addr(0, "oproj"), addr(0, "oproj"),
+            seq_len, h, c10::Half(1.0f), ValuOpType::ADD, /*is_bopa=*/false, num_cores());
+    }
+
     void build_layer_subgraph(int layer_idx, const ChunkInfo& chunk) override {
         require_pi05_vision_owner_ln_runtime(chunk, layer_idx);
+        require_pi05_vision_mlp_w8a8_runtime(chunk);
         if (num_cores() != 8 && layer_idx == 0 && chunk.idx == 0 &&
             ctx().has_complete_physical_manifest()) {
             ctx().consume_physical_route(FmbRouteFamily::GRAPH_SCHEDULE,
@@ -2220,19 +2637,29 @@ protected:
             FmbRouteFamily::LINEAR, SIGLIP_O_LINEAR_SITE,
             static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
             chunk.idx);
+        const bool w4_o = lw.o_w.scalar_type() == at::kByte;
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "sdpa_out"), lw.o_w, addr(0, "oproj"),
             seq_len, h, nq * hd, 0, num_cores(),
-            layer_addr(layer_idx, 0, "o_bias"), lw.o_ws, 0, 0,
+            w4_o ? 0 : layer_addr(layer_idx, 0, "o_bias"), lw.o_ws, 0, 0,
             /*force_acc32=*/linear_acc32_);
-        if (pi05_vision_owner_ln_opt_in_) {
+        if (w4_o) add_row_bias_partial(layer_addr(layer_idx, 0, "o_bias"), seq_len, h);
+        if (mlp_w8a8_) {
+            consume_pi05_vision_owner_ln_route(false, chunk);
+            const auto workspace = siglip_mlp_w8a8::workspace(seq_len);
+            rpu_launch_pi05_vision_owner_layernorm_quantize_w8a8_spm_kernel(
+                addr(0, "oproj"), addr(0, "residual1"), addr(0, "input_norm"),
+                addr(0, "oproj"), addr(0, "input_norm") + workspace.sx_offset,
+                ln_addr(layer_idx, 2), ln_addr(layer_idx, 3),
+                eps_, seq_len);
+        } else if (pi05_vision_owner_ln_opt_in_) {
             consume_pi05_vision_owner_ln_route(false, chunk);
             // Reduce first, retire compact FP16 raw, then original LN2 and
             // gather. The full normalized output reuses the dead O partial.
             rpu_launch_pi05_vision_owner_layernorm_spm_kernel(
                 addr(0, "oproj"), addr(0, "residual1"), addr(0, "input_norm"),
-                addr(0, "oproj"), layer_addr(layer_idx, 0, "ln2_gamma"),
-                layer_addr(layer_idx, 0, "ln2_beta"), eps_, seq_len);
+                addr(0, "oproj"), ln_addr(layer_idx, 2),
+                ln_addr(layer_idx, 3), eps_, seq_len);
         } else {
             consume_manifest_route(
                 FmbRouteFamily::ALL_REDUCE, SIGLIP_ATTN_ALL_REDUCE_SITE,
@@ -2242,12 +2669,22 @@ protected:
                 seq_len, h, num_cores(), num_cores(), use_pi05_ring_xor3(seq_len));
             rpu_launch_layernorm_spm_kernel(
                 addr(0, "input_norm"), addr(0, "oproj"),
-                layer_addr(layer_idx, 0, "ln2_gamma"), layer_addr(layer_idx, 0, "ln2_beta"),
+                ln_addr(layer_idx, 2), ln_addr(layer_idx, 3),
                 seq_len, h, eps_, false, 0, num_cores());
         }
 
-        // Phase 5: fc1+bias + GELU consumes the same full normalized root.
-        if(pi05_vision_fc_weight_outer_opt_in_) {
+        // Phase 5: FC1 consumes owner Q/SX before GELU reuses SX. The full
+        // oproj allocation remains live for the later FP16 FC2 partial.
+        if (mlp_w8a8_) {
+            const auto workspace = siglip_mlp_w8a8::workspace(seq_len);
+            ctx().consume_physical_route(FmbRouteFamily::LINEAR, SIGLIP_FC1_LINEAR_SITE,
+                SIGLIP_MLP_W8A8_LINEAR_ROUTE, 0,
+                siglip_mlp_w8a8::linear_arguments(seq_len, false), chunk.idx);
+            rpu_launch_linear_w8a8_spm_kernel(addr(0, "oproj"),
+                addr(0, "input_norm") + workspace.sx_offset,
+                lw.fc1_w, lw.fc1_ws, addr(0, "fc1"), seq_len, is_, h, 1, num_cores(),
+                layer_addr(layer_idx, 0, "fc1_bias"));
+        } else if(pi05_vision_fc_weight_outer_opt_in_) {
             consume_pi05_vision_fc_route(false,chunk);
             rpu_launch_pi05_vision_fc_weight_outer_spm_kernel(
                 Pi05VisionFcProjection::Fc1Column,
@@ -2264,10 +2701,19 @@ protected:
                 layer_addr(layer_idx, 0, "fc1_bias"), lw.fc1_ws, 0, 0,
             /*force_acc32=*/linear_acc32_);
         }
-        rpu_launch_eltwise_unary_spm_kernel(
-            addr(0, "fc1"), addr(0, "fc1"),
-            seq_len * local_inter, ValuOpType::ADD,
-            audio_mode_ ? GeluMode::ERF : GeluMode::TANH, num_cores());
+        if (mlp_w8a8_) {
+            const auto workspace = siglip_mlp_w8a8::workspace(seq_len);
+            ctx().consume_physical_route(FmbRouteFamily::ACTIVATION, SIGLIP_GELU_QUANT_W8A8_SITE,
+                SIGLIP_GELU_QUANT_W8A8_ROUTE, 0, siglip_mlp_w8a8::gelu_arguments(seq_len), chunk.idx);
+            rpu_launch_gelu_tanh_quantize_w8a8_spm_kernel(addr(0, "fc1"),
+                addr(0, "input_norm") + workspace.fc2_q_offset,
+                addr(0, "input_norm") + workspace.sx_offset, seq_len, num_cores());
+        } else {
+            rpu_launch_eltwise_unary_spm_kernel(
+                addr(0, "fc1"), addr(0, "fc1"),
+                seq_len * local_inter, ValuOpType::ADD,
+                audio_mode_ ? GeluMode::ERF : GeluMode::TANH, num_cores());
+        }
 
         // Phase 6: fc2 (row-partition, with bias) + AllReduce + Residual
         // Round 9: final output goes to "residual1" instead of "oproj" so the
@@ -2275,7 +2721,17 @@ protected:
         // without needing DDR ping-pong.
         // Phase 6 uses "oproj" as temporary storage for fc2 partial results,
         // then all_reduce(oproj + input_norm) lands back in "residual1".
-        if(pi05_vision_fc_weight_outer_opt_in_) {
+        if (mlp_w8a8_) {
+            const auto workspace = siglip_mlp_w8a8::workspace(seq_len);
+            ctx().consume_physical_route(FmbRouteFamily::LINEAR, SIGLIP_FC2_LINEAR_SITE,
+                SIGLIP_MLP_W8A8_LINEAR_ROUTE, 0,
+                siglip_mlp_w8a8::linear_arguments(seq_len, true), chunk.idx);
+            rpu_launch_linear_w8a8_spm_kernel(
+                addr(0, "input_norm") + workspace.fc2_q_offset,
+                addr(0, "input_norm") + workspace.sx_offset, lw.fc2_w, lw.fc2_ws,
+                addr(0, "oproj"), seq_len, h, is_, 0, num_cores(),
+                layer_addr(layer_idx, 0, "fc2_bias"));
+        } else if(pi05_vision_fc_weight_outer_opt_in_) {
             consume_pi05_vision_fc_route(true,chunk);
             rpu_launch_pi05_vision_fc_weight_outer_spm_kernel(
                 Pi05VisionFcProjection::Fc2Row,
@@ -2286,11 +2742,13 @@ protected:
                 FmbRouteFamily::LINEAR, SIGLIP_FC2_LINEAR_SITE,
                 static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
                 chunk.idx);
+            const bool w4_fc2 = lw.fc2_w.scalar_type() == at::kByte;
             rpu_launch_linear_spm_to_spm_acc16_kernel(
                 addr(0, "fc1"), lw.fc2_w, addr(0, "oproj"),
                 seq_len, h, is_, 0, num_cores(),
-                layer_addr(layer_idx, 0, "fc2_bias"), lw.fc2_ws, 0, 0,
+                w4_fc2 ? 0 : layer_addr(layer_idx, 0, "fc2_bias"), lw.fc2_ws, 0, 0,
             /*force_acc32=*/linear_acc32_);
+            if (w4_fc2) add_row_bias_partial(layer_addr(layer_idx, 0, "fc2_bias"), seq_len, h);
         }
         if (pi05_vision_owner_ln_opt_in_) {
             consume_pi05_vision_owner_ln_route(true, chunk);
@@ -2425,13 +2883,14 @@ protected:
                     ValuOpType::ADD, GeluMode::ERF, 1);
                 rpu_launch_spm_copy_ddr_dma(
                     addr(0, "input_norm"), slot.data_ptr<c10::Half>(), seq_len * h);
-                final_out_chunk = final_out_chunk.view({seq_len, 1024});
+                const int64_t output_width = audio_proj2_w_.size(0);
+                final_out_chunk = final_out_chunk.view({seq_len, output_width});
                 consume_manifest_route(
                     FmbRouteFamily::LINEAR, SIGLIP_AUDIO_OUTPUT_LINEAR_SITE,
                     static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE), chunk.idx);
                 rpu_launch_linear_ddr_kernel(
                     slot, audio_proj2_w_, final_out_chunk, audio_proj2_b_, true, 1,
-                    &projector_out_live_base_, chunk.offset * 1024 * sizeof(c10::Half),
+                    &projector_out_live_base_, chunk.offset * output_width * sizeof(c10::Half),
                     nullptr, num_cores(), {}, true);
             }
         }
@@ -2469,6 +2928,9 @@ protected:
     // ========================================================================
     bool subclass_chunk_size_valid(int64_t cs, int64_t seq_len,
                                    int64_t position) const override {
+        if ((qkv_w8a8_ || mlp_w8a8_) && (position != 0 || cs != seq_len ||
+            (image_batch_count_ != 2 && image_batch_count_ != 3) ||
+            seq_len != image_batch_count_ * 256)) return false;
         // Packed minibatch attention consumes one full physical window.
         // A6 enumerates all capacities under the legacy override, so express
         // this owner capability here as well as in forward's fixed override.
@@ -2527,11 +2989,20 @@ protected:
         const int64_t nkv_per_core = CeilDiv(nq, (int64_t)num_cores());
         const int64_t sdpa_tmp =
             Aln(t.tile_n_v16 * t.tile_k * nkv_per_core * CeilDiv(cs, t.tile_m) * 32);
+        const bool c4_packed_raw =
+            num_cores() == 4 && image_batch_count_ > 1 &&
+            pi05_vision_supported_owner() &&
+            pi05_vision_kv_spm_only_opt_in_ &&
+            pi05_vision_q_resident_opt_in_;
         const int64_t layer_wide = 3 * res;                       // alive both phases
-        const int64_t kv_insert  = 3 * qkv;                       // q_kv/k/v (Phase 1)
+        const int64_t kv_insert  = 3 * qkv +
+            (qkv_w8a8_ ? Aln(Align(cs, int64_t{16}) * 2) : 0); // q_kv/k/v/SX (Phase 1)
         const int64_t compute    = std::max(2 * qkv + sdpa_tmp,   // phase-5: q_comp+sdpa_out+tmp
                                             fc1);                 // phase-7/8: fc1
-        const int64_t stacked_peak = layer_wide + kv_insert + compute;
+        const int64_t stacked_peak = c4_packed_raw
+            ? (2 * res + std::max(3 * qkv + std::max(sdpa_tmp, qkv) + qkv,
+                                  res + fc1))
+            : (layer_wide + kv_insert + compute);
         const int64_t budget =
             static_cast<int64_t>(SpmAllocator::SPM_USABLE * 0.97);
         if (stacked_peak > budget) return false;
@@ -2659,6 +3130,18 @@ protected:
         std::vector<at::Tensor> images = input_images;
         int64_t N = static_cast<int64_t>(images.size());
         TORCH_CHECK(N > 0, "run_packed_patch_embed: empty image list");
+        if (qkv_w8a8_ || mlp_w8a8_) {
+            TORCH_CHECK((N == 2 || N == 3) && pe_kh_ == 14 && pe_kw_ == 14 &&
+                            pe_strideh_ == 14 && pe_stridew_ == 14,
+                        "Pi Vision W8A8 requires two or three 256-patch images");
+            for (const auto& image : images)
+                TORCH_CHECK(image.scalar_type() == at::kHalf && image.is_contiguous() &&
+                                image.dim() == 4 && image.size(0) == 1 &&
+                                image.size(1) == 3 && image.size(2) == 224 && image.size(3) == 224,
+                            "Pi Vision W8A8 rejects noncanonical patch input");
+            require_pi05_vision_qkv_w8a8_profile(N * 256, N);
+            require_pi05_vision_mlp_w8a8_profile(N * 256, N);
+        }
         const bool copied_cpu_input = images.front().device().is_cpu();
         bool private_serial_slab = false;
         if (!g_rpu_ddr_flush_force_enabled) private_serial_cpu_slab_published_ = false;
@@ -2732,7 +3215,7 @@ protected:
         // deferred DMA — fused_patch_embedding step (7) bakes
         // RpuGetDevAddr(out.data_ptr()) into patch_emb_output_live_base, which
         // the graph dereferences at end(), long after this frame returns
-        // (docs/pitfalls.md#c-1, write side). The helper keeps the graph's own
+        // (the SDK queue contract, write side). The helper keeps the graph's own
         // reference until after execution.
         at::Tensor hidden = allocate_tracked_output({1, N * npp, cout});
 
@@ -2742,7 +3225,8 @@ protected:
             graph_state == RpuKernelGraph::State::RECORDING ||
             graph_state == RpuKernelGraph::State::REPLAYING;
         const bool merge_patch_segment = pi05_vision_merge_segment_opt_in_ &&
-            (N == 2 || N == 3) && num_cores() == 8 && npp == 256 && cout == 1152 &&
+            (N == 2 || N == 3) && (num_cores() == 4 || num_cores() == 8) &&
+            npp == 256 && cout == 1152 &&
             num_layers() == 27 && intermediate_size() == 4352 &&
             num_q_heads() == 16 && num_kv_heads() == 16 && head_dim() == 80 &&
             orig_head_dim_ == 72 && pi05_vision_supported_owner();
@@ -2892,7 +3376,8 @@ private:
             const bool second = route.site_id == SIGLIP_MLP_ALL_REDUCE_SITE;
             const bool owner_selector = route.family == FmbRouteFamily::ALL_REDUCE &&
                 (route.selector == SIGLIP_OWNER_LN_ROUTE ||
-                 route.selector == SIGLIP_OWNER_LN_COMPACT_ROUTE);
+                 route.selector == SIGLIP_OWNER_LN_COMPACT_ROUTE ||
+                 route.selector == SIGLIP_OWNER_LN_QUANT_W8A8_ROUTE);
             if (!pi05_vision_owner_ln_opt_in_) {
                 TORCH_CHECK(!owner_selector && (!(first || second) || route.arguments.empty()),
                     "Pi Vision owner-LN OFF rejects ON descriptor");
@@ -2903,9 +3388,12 @@ private:
             if (first || second) {
                 first ? ++owner_routes : ++compact_routes;
                 TORCH_CHECK(route.family == FmbRouteFamily::ALL_REDUCE &&
-                    route.selector == (second ? SIGLIP_OWNER_LN_COMPACT_ROUTE : SIGLIP_OWNER_LN_ROUTE) &&
+                    route.selector == (second ? SIGLIP_OWNER_LN_COMPACT_ROUTE :
+                        mlp_w8a8_ ? SIGLIP_OWNER_LN_QUANT_W8A8_ROUTE : SIGLIP_OWNER_LN_ROUTE) &&
                     route.flags == 0 && route.invocation == 0 &&
-                    route.arguments == pi05_vision_owner_ln_arguments(second, manifest.physical_length),
+                    route.arguments == (!second && mlp_w8a8_
+                        ? siglip_mlp_w8a8::owner_arguments(manifest.physical_length)
+                        : pi05_vision_owner_ln_arguments(second, manifest.physical_length)),
                     "Pi Vision owner-LN route ABI mismatch");
             }
             if (route.family == FmbRouteFamily::ATTENTION) {
@@ -2965,16 +3453,287 @@ private:
             "Pi Vision owner-LN requires its COMPLETE manifest");
         ctx().consume_physical_route(FmbRouteFamily::ALL_REDUCE,
             compact ? SIGLIP_MLP_ALL_REDUCE_SITE : SIGLIP_ATTN_ALL_REDUCE_SITE,
-            compact ? SIGLIP_OWNER_LN_COMPACT_ROUTE : SIGLIP_OWNER_LN_ROUTE,
-            0, pi05_vision_owner_ln_arguments(compact, chunk.len), chunk.idx);
+            compact ? SIGLIP_OWNER_LN_COMPACT_ROUTE :
+                mlp_w8a8_ ? SIGLIP_OWNER_LN_QUANT_W8A8_ROUTE : SIGLIP_OWNER_LN_ROUTE,
+            0, !compact && mlp_w8a8_ ? siglip_mlp_w8a8::owner_arguments(chunk.len) :
+                pi05_vision_owner_ln_arguments(compact, chunk.len), chunk.idx);
+    }
+
+    KernelId pi05_vision_mlp_w8a8_owner_id(int64_t rows) const {
+        (void)siglip_mlp_w8a8::workspace(rows);
+        return rows == 512 ? KernelId::PI05_VISION_OWNER_LAYERNORM_QUANTIZE_W8A8_M512N1152
+                           : KernelId::PI05_VISION_OWNER_LAYERNORM_QUANTIZE_W8A8_M768N1152;
+    }
+
+    KernelId pi05_vision_mlp_w8a8_linear_id(int64_t rows, bool second) const {
+        static constexpr KernelId linear_ids[] = {
+#define RPU_W8A8_CANDIDATE(id, name, ordinal, m, n, k, lk, flags) KernelId::id,
+#include "../ops/rpu_linear_w8a8_candidates.inc"
+#undef RPU_W8A8_CANDIDATE
+        };
+        return linear_ids[siglip_mlp_w8a8::candidate(rows, second).ordinal];
+    }
+
+    void require_pi05_vision_mlp_w8a8_payloads(int64_t rows) const {
+        const auto& kernels = KernelCache::instance();
+        TORCH_CHECK(kernels.has_loaded(pi05_vision_mlp_w8a8_owner_id(rows)) &&
+                        kernels.has_loaded(KernelId::GELU_TANH_QUANTIZE_W8A8_H544) &&
+                        kernels.has_loaded(pi05_vision_mlp_w8a8_linear_id(rows, false)) &&
+                        kernels.has_loaded(pi05_vision_mlp_w8a8_linear_id(rows, true)),
+                    "Pi Vision MLP W8A8 requires complete owner-LNQuant/GELUQuant expansion and FC1/FC2 main payloads; no fallback");
+    }
+
+    std::vector<int64_t> pi05_vision_mlp_w8a8_identity() const {
+        const auto& kernels = KernelCache::instance();
+        std::vector<int64_t> identity{0x5349474d4c504138LL, 1,
+            SIGLIP_MLP_W8A8_LINEAR_ROUTE, SIGLIP_OWNER_LN_QUANT_W8A8_ROUTE,
+            SIGLIP_GELU_QUANT_W8A8_ROUTE, SIGLIP_OWNER_LN_COMPACT_ROUTE,
+            kernels.has_loaded(KernelId::GELU_TANH_QUANTIZE_W8A8_H544)};
+        for (int64_t rows : {512, 768}) {
+            const auto owner = siglip_mlp_w8a8::owner_arguments(rows);
+            const auto gelu = siglip_mlp_w8a8::gelu_arguments(rows);
+            identity.insert(identity.end(), owner.begin(), owner.end());
+            identity.insert(identity.end(), gelu.begin(), gelu.end());
+            identity.push_back(kernels.has_loaded(pi05_vision_mlp_w8a8_owner_id(rows)));
+            for (bool second : {false, true}) {
+                const auto linear = siglip_mlp_w8a8::linear_arguments(rows, second);
+                identity.insert(identity.end(), linear.begin(), linear.end());
+                identity.push_back(kernels.has_loaded(pi05_vision_mlp_w8a8_linear_id(rows, second)));
+            }
+        }
+        return identity;
+    }
+
+    void require_pi05_vision_mlp_w8a8_profile(int64_t rows, int64_t images) const {
+        if (!mlp_w8a8_) return;
+        siglip_qkv_w8a8::validate_rows(rows, images);
+        TORCH_CHECK(!linear_acc32_ && !audio_mode_ && num_cores() == 8 &&
+                        attn_tp() == 8 && mlp_tp() == 8 && num_layers() == 27 &&
+                        layer_weights_.size() == 27 && layer_bias_norm_.size() == 27 &&
+                        hidden_size() == 1152 && intermediate_size() == 4352 &&
+                        num_q_heads() == 16 && num_kv_heads() == 16 && head_dim() == 80 &&
+                        orig_head_dim_ == 72 && projection_dim_ == 2048 && eps_ == 1e-6 &&
+                        pi05_vision_owner_ln_opt_in_ && pi05_vision_kv_spm_only_opt_in_ &&
+                        pi05_ring_xor3_opt_in_ && !pi05_vision_fc_weight_outer_opt_in_,
+                    "Pi Vision MLP W8A8 requires exact TP8 ACC16 owner-LN/XOR3/raw-SPM Pi profile without FC weight-outer");
+        require_pi05_vision_owner_ln_profile(rows, images);
+        require_pi05_vision_mlp_w8a8_payloads(rows);
+    }
+
+    void validate_pi05_vision_mlp_w8a8_manifest(
+        const FmbPhysicalExecutionManifest& manifest) const {
+        std::array<int, 2> projections{};
+        int owners = 0, activations = 0;
+        for (const auto& route : manifest.routes) {
+            const bool first = route.site_id == SIGLIP_FC1_LINEAR_SITE;
+            const bool second = route.site_id == SIGLIP_FC2_LINEAR_SITE;
+            const bool owner = route.site_id == SIGLIP_ATTN_ALL_REDUCE_SITE;
+            const bool gelu = route.site_id == SIGLIP_GELU_QUANT_W8A8_SITE;
+            const bool a8 = route.family == FmbRouteFamily::LINEAR &&
+                            route.selector == SIGLIP_MLP_W8A8_LINEAR_ROUTE;
+            const bool owner_a8 = route.family == FmbRouteFamily::ALL_REDUCE &&
+                                  route.selector == SIGLIP_OWNER_LN_QUANT_W8A8_ROUTE;
+            if (!mlp_w8a8_) {
+                TORCH_CHECK(!gelu && !a8 && !owner_a8 && (!(first || second) ||
+                    (route.family == FmbRouteFamily::LINEAR && route.arguments.empty() &&
+                     route.selector == static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE))),
+                    "Pi Vision MLP W8A8 OFF rejects an ON descriptor");
+                continue;
+            }
+            TORCH_CHECK((!a8 || first || second) && (!owner_a8 || owner),
+                        "Pi Vision MLP W8A8 descriptor has a foreign route site");
+            if (owner) {
+                ++owners;
+                TORCH_CHECK(owner_a8 && route.flags == 0 && route.invocation == 0 &&
+                    route.arguments == siglip_mlp_w8a8::owner_arguments(manifest.physical_length),
+                    "Pi Vision MLP W8A8 owner-LNQuant ABI/workspace mismatch");
+            }
+            if (gelu) {
+                ++activations;
+                TORCH_CHECK(route.family == FmbRouteFamily::ACTIVATION &&
+                    route.selector == SIGLIP_GELU_QUANT_W8A8_ROUTE && route.flags == 0 &&
+                    route.invocation == 0 &&
+                    route.arguments == siglip_mlp_w8a8::gelu_arguments(manifest.physical_length),
+                    "Pi Vision MLP W8A8 GELUQuant ABI/workspace mismatch");
+            }
+            if (first || second) {
+                ++projections[second ? 1 : 0];
+                TORCH_CHECK(a8 && route.flags == 0 && route.invocation == 0 &&
+                    route.arguments == siglip_mlp_w8a8::linear_arguments(manifest.physical_length, second),
+                    "Pi Vision MLP W8A8 LINEAR ABI/tile mismatch");
+            }
+        }
+        if (!mlp_w8a8_) return;
+        require_pi05_vision_mlp_w8a8_profile(manifest.physical_length, image_batch_count_);
+        TORCH_CHECK(manifest.state == FmbPhysicalManifestState::COMPLETE &&
+                        manifest.logical_length == manifest.physical_length &&
+                        manifest.execution_padding_rows == 0 &&
+                        manifest.kv_logical_length == manifest.physical_length &&
+                        manifest.kv_insert_physical_rows == manifest.physical_length &&
+                        manifest.graph_lifecycle == FmbGraphLifecycle::COMPOSITE_CHILD &&
+                        manifest.linear_accumulation == FmbLinearAccumulationPolicy::ACC16 &&
+                        owners == 1 && activations == 1 && projections == (std::array<int, 2>{1, 1}),
+                    "Pi Vision MLP W8A8 requires COMPLETE owner-LNQuant, FC1, GELUQuant and FC2 routes");
+    }
+
+    void validate_pi05_vision_mlp_w8a8_policy(
+        const FmbPrefillStageCandidate& candidate, int64_t rows, int64_t images) const {
+        validate_pi05_vision_mlp_w8a8_manifest(candidate.physical_manifest);
+        if (!mlp_w8a8_) return;
+        require_pi05_vision_mlp_w8a8_profile(rows, images);
+        TORCH_CHECK(candidate.physical_manifest.physical_length == rows && images == image_batch_count_,
+                    "Pi Vision MLP W8A8 request and descriptor shape differ");
+        require_pi05_vision_kv_spm_only_schedule(candidate.stage_plan);
+    }
+
+    void require_pi05_vision_mlp_w8a8_runtime(const ChunkInfo& chunk) const {
+        if (!mlp_w8a8_) return;
+        require_pi05_vision_mlp_w8a8_profile(ctx().seq_len, image_batch_count_);
+        TORCH_CHECK(ctx().has_complete_physical_manifest() && chunk.idx == 0 &&
+                        chunk.offset == 0 && chunk.len == ctx().seq_len &&
+                        chunk.kv_seq_len == ctx().seq_len && SPM_ALLOC.is_initialized(),
+                    "Pi Vision MLP W8A8 lost its complete producer/consumer lifetime");
+        // declare_buffers keeps all four complete roots. Check the actual
+        // allocated addresses, not fictitious BufferDecl aliases with offsets.
+        siglip_mlp_w8a8::validate_roots(chunk.len, SPM_ALLOC.addr(0, 0),
+            SpmAllocator::SPM_USABLE, addr(0, "oproj"), addr(0, "input_norm"),
+            addr(0, "fc1"), addr(0, "residual1"));
+    }
+
+    KernelId pi05_vision_qkv_w8a8_linear_id(int64_t rows) const {
+        static constexpr KernelId linear_ids[] = {
+#define RPU_W8A8_CANDIDATE(id, name, ordinal, m, n, k, lk, flags) KernelId::id,
+#include "../ops/rpu_linear_w8a8_candidates.inc"
+#undef RPU_W8A8_CANDIDATE
+        };
+        const auto selected = siglip_qkv_w8a8::candidate(rows);
+        return linear_ids[selected.ordinal];
+    }
+
+    void require_pi05_vision_qkv_w8a8_payloads(int64_t rows) const {
+        const auto selected = siglip_qkv_w8a8::candidate(rows);
+        const auto& kernels = KernelCache::instance();
+        TORCH_CHECK(kernels.has_loaded(KernelId::LAYER_NORM_QUANTIZE_W8A8_H1152) &&
+                        kernels.has_loaded(pi05_vision_qkv_w8a8_linear_id(rows)),
+                    "Pi Vision QKV W8A8 requires complete LNQuant expansion and ", selected.name,
+                    " main payloads; no fallback");
+    }
+
+    std::vector<int64_t> pi05_vision_qkv_w8a8_identity() const {
+        const auto& kernels = KernelCache::instance();
+        std::vector<int64_t> identity{0x534947514b564138LL, 1,
+            kernels.has_loaded(KernelId::LAYER_NORM_QUANTIZE_W8A8_H1152)};
+        for (int64_t rows : {512, 768}) {
+            const auto norm = siglip_qkv_w8a8::norm_arguments(rows);
+            const auto linear = siglip_qkv_w8a8::linear_arguments(rows);
+            identity.insert(identity.end(), norm.begin(), norm.end());
+            identity.insert(identity.end(), linear.begin(), linear.end());
+            identity.push_back(kernels.has_loaded(pi05_vision_qkv_w8a8_linear_id(rows)));
+        }
+        return identity;
+    }
+
+    void require_pi05_vision_qkv_w8a8_profile(int64_t rows, int64_t images) const {
+        if (!qkv_w8a8_) return;
+        siglip_qkv_w8a8::validate_rows(rows, images);
+        TORCH_CHECK(!linear_acc32_ && !audio_mode_ && num_cores() == 8 &&
+                        attn_tp() == 8 && mlp_tp() == 8 && num_layers() == 27 &&
+                        layer_weights_.size() == 27 && layer_bias_norm_.size() == 27 &&
+                        hidden_size() == 1152 && intermediate_size() == 4352 &&
+                        num_q_heads() == 16 && num_kv_heads() == 16 && head_dim() == 80 &&
+                        orig_head_dim_ == 72 && projection_dim_ == 2048 && eps_ == 1e-6,
+                    "Pi Vision QKV W8A8 requires the installed exact TP8 Pi profile");
+        require_pi05_vision_qkv_w8a8_payloads(rows);
+    }
+
+    void validate_pi05_vision_qkv_w8a8_manifest(
+        const FmbPhysicalExecutionManifest& manifest) const {
+        std::array<int, 3> projections{};
+        int norms = 0;
+        const std::array<int64_t, 3> sites{
+            SIGLIP_Q_LINEAR_SITE, SIGLIP_K_LINEAR_SITE, SIGLIP_V_LINEAR_SITE};
+        for (const auto& route : manifest.routes) {
+            const bool norm = route.site_id == SIGLIP_LN1_QUANT_W8A8_SITE;
+            const auto projection = std::find(sites.begin(), sites.end(), route.site_id);
+            const bool qkv = projection != sites.end();
+            const bool a8 = route.family == FmbRouteFamily::LINEAR &&
+                            route.selector == SIGLIP_QKV_W8A8_LINEAR_ROUTE;
+            if (!qkv_w8a8_) {
+                TORCH_CHECK(!norm && !a8 && (!qkv ||
+                    (route.family == FmbRouteFamily::LINEAR && route.arguments.empty() &&
+                     route.selector == static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE))),
+                    "Pi Vision QKV W8A8 OFF rejects an ON descriptor");
+                continue;
+            }
+            TORCH_CHECK(!a8 || qkv, "Pi Vision QKV W8A8 descriptor has a foreign LINEAR site");
+            if (norm) {
+                ++norms;
+                TORCH_CHECK(route.family == FmbRouteFamily::NORMALIZATION &&
+                    route.selector == SIGLIP_LN1_QUANT_W8A8_ROUTE && route.flags == 0 &&
+                    route.invocation == 0 &&
+                    route.arguments == siglip_qkv_w8a8::norm_arguments(manifest.physical_length),
+                    "Pi Vision QKV W8A8 LayerNorm/quantization ABI mismatch");
+            }
+            if (qkv) {
+                ++projections[static_cast<size_t>(projection - sites.begin())];
+                TORCH_CHECK(a8 && route.flags == 0 && route.invocation == 0 &&
+                    route.arguments == siglip_qkv_w8a8::linear_arguments(manifest.physical_length),
+                    "Pi Vision QKV W8A8 LINEAR ABI/tile mismatch");
+            }
+        }
+        if (!qkv_w8a8_) return;
+        require_pi05_vision_qkv_w8a8_profile(manifest.physical_length, image_batch_count_);
+        TORCH_CHECK(manifest.state == FmbPhysicalManifestState::COMPLETE &&
+                        manifest.logical_length == manifest.physical_length &&
+                        manifest.execution_padding_rows == 0 &&
+                        manifest.kv_logical_length == manifest.physical_length &&
+                        manifest.kv_insert_physical_rows == manifest.physical_length &&
+                        manifest.graph_lifecycle == FmbGraphLifecycle::COMPOSITE_CHILD &&
+                        manifest.linear_accumulation == FmbLinearAccumulationPolicy::ACC16 &&
+                        norms == 1 && projections == (std::array<int, 3>{1, 1, 1}),
+                    "Pi Vision QKV W8A8 requires COMPLETE exact LNQuant and three independent projection routes");
+    }
+
+    void validate_pi05_vision_qkv_w8a8_policy(
+        const FmbPrefillStageCandidate& candidate, int64_t rows, int64_t images) const {
+        validate_pi05_vision_qkv_w8a8_manifest(candidate.physical_manifest);
+        if (!qkv_w8a8_) return;
+        require_pi05_vision_qkv_w8a8_profile(rows, images);
+        TORCH_CHECK(candidate.physical_manifest.physical_length == rows && images == image_batch_count_,
+                    "Pi Vision QKV W8A8 request and descriptor shape differ");
+        require_pi05_vision_kv_spm_only_schedule(candidate.stage_plan);
+    }
+
+    void require_pi05_vision_qkv_w8a8_runtime(const ChunkInfo& chunk) const {
+        if (!qkv_w8a8_) return;
+        require_pi05_vision_qkv_w8a8_profile(ctx().seq_len, image_batch_count_);
+        require_pi05_vision_kv_spm_only_schedule(ctx().stage_plan);
+        TORCH_CHECK(ctx().has_complete_physical_manifest() && ctx().position == 0 &&
+                        ctx().batch_size == 1 && !ctx().is_causal && !ctx().attention_mask.has_value() &&
+                        chunk.idx == 0 && chunk.offset == 0 && chunk.len == ctx().seq_len &&
+                        chunk.kv_seq_len == ctx().seq_len,
+                    "Pi Vision QKV W8A8 lost its complete shared Q/SX lifetime");
     }
 
     void configure_chunk_for_shape(
         int64_t seq_len, int64_t packed_image_count)
     {
-        TORCH_CHECK(num_cores() == 8 ||
-                        (seq_len == 256 && packed_image_count == 1),
-                    "Pi0.5 SigLIP4 requires serial single-image M256 execution");
+        require_pi05_vision_qkv_w8a8_profile(seq_len, packed_image_count);
+        require_pi05_vision_mlp_w8a8_profile(seq_len, packed_image_count);
+        TORCH_CHECK(!(qkv_w8a8_ || mlp_w8a8_) || configured_chunk_size_ == 0 || configured_chunk_size_ == seq_len,
+                    "Pi Vision W8A8 explicit chunk must equal the packed row count");
+        const bool audio_shape = audio_mode_ && !has_patch_emb_ &&
+            packed_image_count == 1 && seq_len >= 7 && seq_len <= 104;
+        const bool vision_shape = hidden_size() == 1152 && num_layers() == 27 &&
+            ((seq_len == 256 && packed_image_count == 1) ||
+             (num_cores() == 4 &&
+              (packed_image_count == 2 || packed_image_count == 3) &&
+              seq_len == packed_image_count * 256 &&
+              pi05_vision_supported_owner() &&
+              pi05_vision_kv_spm_only_opt_in_ &&
+              pi05_vision_q_resident_opt_in_));
+        TORCH_CHECK(num_cores() == 8 || audio_shape || vision_shape,
+                    "SigLIP4 requires its serial image or bounded audio input (or admitted packed raw-SPM image)");
         require_pi05_vision_owner_ln_profile(seq_len, packed_image_count);
         require_pi05_vision_fc_profile(seq_len,packed_image_count);
         require_pi05_vision_kv_spm_only_profile(
@@ -3022,11 +3781,39 @@ private:
         return true;
     }
 
+    // Packed W4 installs each LayerNorm beta folded into the Q/K/V and fc1
+    // biases: LN(x) = g*xhat + b feeds only those Linears, so
+    // W(g*xhat + b) + c = W(g*xhat) + (c + W b), with W the dequantized W4
+    // weight. The LayerNorms then read one shared zero beta. Bits 6-11 of the
+    // precision mask (already in the layout hash) mark the packed W4 install.
+    bool ln_beta_folded() const { return (reduced_w8_projection_mask_ >> 6) != 0; }
+    uint32_t ln_beta_addr(int layer_idx, bool second) const {
+        return ln_beta_folded() ? addr(0, "ln_beta_zero")
+                                : layer_addr(layer_idx, 0, second ? "ln2_beta" : "ln1_beta");
+    }
+
+    // Packed W4 is a four-lane Pi profile only; the eight-core opt-ins keep
+    // pi05_vision_supported_owner (FP16/W8).
+    bool pi05_vision4_w4_owner() const {
+        if (num_cores() != 4 || layer_weights_.size() != 27) return false;
+        for (const auto& weights : layer_weights_) {
+            for (const auto* tensor : {&weights.q_w, &weights.k_w, &weights.v_w,
+                                      &weights.o_w, &weights.fc1_w, &weights.fc2_w})
+                if (!tensor->defined() || tensor->scalar_type() != at::kByte) return false;
+            for (const auto* scale : {&weights.q_ws, &weights.k_ws, &weights.v_ws,
+                                     &weights.o_ws, &weights.fc1_ws, &weights.fc2_ws})
+                if (!scale->defined() || scale->scalar_type() != at::kHalf ||
+                    scale->dim() != 2 || scale->size(0) != 32) return false;
+        }
+        return true;
+    }
+
     void require_pi05_vision_kv_spm_only_profile(
         int64_t rows, int64_t images) const {
         if (!pi05_vision_kv_spm_only_opt_in_) return;
         TORCH_CHECK(
-            (images == 2 || images == 3) && rows == images * 256 && num_cores() == 8 && num_layers() == 27 &&
+            (images == 2 || images == 3) && rows == images * 256 &&
+                (num_cores() == 4 || num_cores() == 8) && num_layers() == 27 &&
                 hidden_size() == 1152 && intermediate_size() == 4352 &&
                 num_q_heads() == 16 && num_kv_heads() == 16 &&
                 head_dim() == 80 && orig_head_dim_ == 72 &&
@@ -3273,17 +4060,41 @@ private:
             2,0,pi05_vision_fc_arguments(second),chunk.idx);
     }
     int64_t subclass_layout_hash() const override {
-        if (audio_mode_) return detail::layout_mix(
-            detail::layout_mix(0x415352, linear_acc32_ ? 32 : 16), audio_proj2_w_.defined());
-        if (num_cores() != 8) {
+        const int64_t hash = subclass_layout_hash_without_ln_stream();
+        if (!pi05_vision_ln_stream_opt_in_) return hash;
+        return detail::layout_mix(detail::layout_mix(hash, 0x4c4e53545245414dLL),
+                                  ln_stream_elems());
+    }
+    int64_t subclass_layout_hash_without_ln_stream() const {
+        if (audio_mode_) {
+            int64_t hash = detail::layout_mix(
+                detail::layout_mix(0x415352, linear_acc32_ ? 32 : 16),
+                audio_proj2_w_.defined() ? audio_proj2_w_.size(0) : 0);
+            for (const auto value : core_profile_arguments())
+                hash = detail::layout_mix(hash, value);
+            return hash;
+        }
+        const bool any_vision_opt_in =
+            pi05_vision_fc_weight_outer_opt_in_ ||
+            pi05_vision_kv_spm_only_opt_in_ ||
+            pi05_vision_owner_ln_opt_in_ ||
+            pi05_vision_merge_segment_opt_in_ ||
+            pi05_vision_q_resident_opt_in_;
+        if (num_cores() != 8 && !any_vision_opt_in) {
             int64_t hash = 0;
             for (const auto value : core_profile_arguments()) hash = detail::layout_mix(hash, value);
             return configured_linear_acc32_.has_value()
                 ? detail::layout_mix(hash, linear_acc32_ ? 32 : 16) : hash;
         }
-        if(!pi05_vision_fc_weight_outer_opt_in_ &&
-           !pi05_vision_kv_spm_only_opt_in_ && !pi05_vision_owner_ln_opt_in_)return configured_linear_acc32_.has_value() ? (linear_acc32_ ? 32 : 16) : 0;
+        if (num_cores() == 8 &&
+            !pi05_vision_fc_weight_outer_opt_in_ &&
+            !pi05_vision_kv_spm_only_opt_in_ && !pi05_vision_owner_ln_opt_in_ &&
+            !qkv_w8a8_ && !mlp_w8a8_)
+            return configured_linear_acc32_.has_value() ? (linear_acc32_ ? 32 : 16) : 0;
         int64_t hash=0x5657464337363831LL;
+        if (num_cores() != 8) {
+            for (const auto value : core_profile_arguments()) hash = detail::layout_mix(hash, value);
+        }
         for(int64_t value:{int64_t(1),num_layers(),hidden_size(),intermediate_size(),
             num_q_heads(),num_kv_heads(),head_dim(),orig_head_dim_,projection_dim_,
             int64_t(pi05_ring_xor3_opt_in_),int64_t(pi05_vision_merge_segment_opt_in_),
@@ -3302,6 +4113,10 @@ private:
                     for (int64_t value : pi05_vision_owner_ln_arguments(compact, rows))
                         hash = detail::layout_mix(hash, value);
         }
+        if (qkv_w8a8_)
+            for (auto value : pi05_vision_qkv_w8a8_identity()) hash = detail::layout_mix(hash, value);
+        if (mlp_w8a8_)
+            for (auto value : pi05_vision_mlp_w8a8_identity()) hash = detail::layout_mix(hash, value);
         return configured_linear_acc32_.has_value()
                 ? detail::layout_mix(hash, linear_acc32_ ? 32 : 16) : hash;
     }
@@ -3351,6 +4166,17 @@ private:
                 }
             }
         }
+        if (qkv_w8a8_) {
+            const auto qkv_identity = pi05_vision_qkv_w8a8_identity();
+            identity.insert(identity.end(), qkv_identity.begin(), qkv_identity.end());
+        }
+
+        if (mlp_w8a8_) {
+            const auto mlp_identity = pi05_vision_mlp_w8a8_identity();
+            identity.insert(identity.end(), mlp_identity.begin(), mlp_identity.end());
+        }
+        if (pi05_vision_ln_stream_opt_in_)
+            identity.insert(identity.end(), {0x4c4e53545245414dLL, 1, ln_stream_elems()});
         append_kvinsert_cost_scalar_identity(identity, eps_);
         identity.insert(identity.end(), {
             static_cast<int64_t>(has_patch_emb_)});
@@ -3383,6 +4209,7 @@ private:
     }
 
     int64_t logical_intermediate_size_ = 0;
+    // Bits 0-5: INT8 q/k/v/o/fc1/fc2; bits 6-11: the same projections packed W4.
     int64_t reduced_w8_projection_mask_ = 0;
     std::vector<LayerWeights> layer_weights_;
     std::vector<LayerBiasNorm> layer_bias_norm_;
@@ -3420,12 +4247,34 @@ private:
         !linear_acc32_ && pi05_kernel_opt_in("RPU_PI05_VISION_KV_SPM_ONLY");
     const bool pi05_vision_owner_ln_opt_in_ =
         !linear_acc32_ && pi05_kernel_opt_in("RPU_PI05_VISION_OWNER_LN");
+    // LayerNorm streaming (three-camera T192, the C480 paired prefill): the
+    // four per-layer LN1/LN2 gamma/beta vectors leave the super-persistent SPM
+    // region (27 x 4 x 2,560 bytes on Pi) for one Temp slot that every Phase-1
+    // callback refills from a packed DDR copy before LN1. Same values and
+    // kernels; only where the vectors live changes. Post-LN stays persistent.
+    const bool pi05_vision_ln_stream_opt_in_ =
+        pi05_kernel_opt_in("RPU_PI05_VISION_LN_STREAM");
+    at::Tensor ln_stream_ddr_;  // [layers, 4 * ln_stream_elems()] FP16
+    int64_t ln_stream_elems() const { return (hidden_size() + 255) / 256 * 256; }
+    // which: 0 = LN1 gamma, 1 = LN1 beta, 2 = LN2 gamma, 3 = LN2 beta.
+    uint32_t ln_addr(int layer, int which) const {
+        static constexpr const char* kNames[] = {
+            "ln1_gamma", "ln1_beta", "ln2_gamma", "ln2_beta"};
+        TORCH_INTERNAL_ASSERT(which >= 0 && which < 4);
+        if (!pi05_vision_ln_stream_opt_in_) {
+            if (which == 1 || which == 3) return ln_beta_addr(layer, which == 3);
+            return layer_addr(layer, 0, kNames[which]);
+        }
+        return addr(0, "ln_stream") +
+            static_cast<uint32_t>(which * ln_stream_elems() * DWIDTH);
+    }
     bool use_pi05_vision_q_resident(
         int64_t rows, AttentionExecutionPolicy policy) const {
         return pi05_vision_q_resident_opt_in_ &&
             policy == AttentionExecutionPolicy::SPM_KV_BY_MHA &&
             (image_batch_count_ == 2 || image_batch_count_ == 3) &&
-            rows == image_batch_count_ * 256 && num_cores() == 8 && num_layers() == 27 &&
+            rows == image_batch_count_ * 256 &&
+            (num_cores() == 4 || num_cores() == 8) && num_layers() == 27 &&
             hidden_size() == 1152 && intermediate_size() == 4352 &&
             num_q_heads() == 16 && num_kv_heads() == 16 && head_dim() == 80 &&
             orig_head_dim_ == 72 && pi05_vision_supported_owner();
@@ -3551,8 +4400,8 @@ std::vector<int64_t> rpu_siglip_get_execution_topology(int64_t handle) {
         ->execution_topology();
 }
 
-int64_t rpu_siglip_create(const std::optional<bool>& linear_acc32) {
-    return SigLIPRegistry::create(linear_acc32);
+int64_t rpu_siglip_create(const std::optional<bool>& linear_acc32, bool qkv_w8a8, bool mlp_w8a8) {
+    return SigLIPRegistry::create(linear_acc32, qkv_w8a8, mlp_w8a8);
 }
 
 void rpu_siglip_set_audio_mode(int64_t handle) {
@@ -3631,6 +4480,39 @@ void rpu_siglip_set_weights_w8a16(
         fc1_ws_list, fc2_ws_list);
 }
 
+// Declared packed-W4 mode: the scale lists carry G32 pgrp payloads.
+void rpu_siglip_set_weights_w4a16(
+    int64_t handle,
+    at::TensorList q_w_list, at::TensorList k_w_list,
+    at::TensorList v_w_list, at::TensorList o_w_list,
+    at::TensorList fc1_w_list, at::TensorList fc2_w_list,
+    at::TensorList ln1_w_list, at::TensorList ln1_b_list,
+    at::TensorList ln2_w_list, at::TensorList ln2_b_list,
+    at::TensorList q_b_list, at::TensorList k_b_list,
+    at::TensorList v_b_list, at::TensorList o_b_list,
+    at::TensorList fc1_b_list, at::TensorList fc2_b_list,
+    const at::Tensor& post_ln_w, const at::Tensor& post_ln_b,
+    const at::Tensor& proj_w, const at::Tensor& proj_b,
+    int64_t num_heads, int64_t head_dim,
+    int64_t hidden_size, int64_t intermediate_size,
+    int64_t projection_dim, double eps,
+    at::TensorList q_ws_list, at::TensorList k_ws_list,
+    at::TensorList v_ws_list, at::TensorList o_ws_list,
+    at::TensorList fc1_ws_list, at::TensorList fc2_ws_list)
+{
+    SigLIPRegistry::get(handle, "rpu_siglip")->set_weights(
+        q_w_list, k_w_list, v_w_list, o_w_list,
+        fc1_w_list, fc2_w_list,
+        ln1_w_list, ln1_b_list, ln2_w_list, ln2_b_list,
+        q_b_list, k_b_list, v_b_list, o_b_list,
+        fc1_b_list, fc2_b_list,
+        post_ln_w, post_ln_b, proj_w, proj_b,
+        num_heads, head_dim, hidden_size, intermediate_size,
+        projection_dim, eps,
+        q_ws_list, k_ws_list, v_ws_list, o_ws_list,
+        fc1_ws_list, fc2_ws_list, /*packed_w4=*/true);
+}
+
 void rpu_siglip_model_set_patch_emb(
     int64_t handle,
     const at::Tensor& weight,
@@ -3672,8 +4554,7 @@ void rpu_siglip_prepare_persistent_spm(
                     (packed_image_count == 1 || seq_len % 16 == 0),
                 "siglip_prepare_persistent_spm: invalid packed image geometry");
     SigLIPRegistry::get(handle, "rpu_siglip_prepare_persistent_spm")
-        ->prepare_persistent_spm(
-            seq_len, /*position=*/0, /*is_causal=*/false);
+        ->prepare_siglip_persistent_spm(seq_len, packed_image_count);
 }
 
 std::vector<int64_t> rpu_siglip_resolve_stage_domain(

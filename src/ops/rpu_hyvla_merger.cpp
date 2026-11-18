@@ -197,7 +197,8 @@ at::Tensor rpu_hyvla_merger_fused(
     const at::Tensor& w2,  const at::Tensor& b2,
     const at::Tensor& wp2, const at::Tensor& bp2,
     const c10::optional<at::Tensor>& wp1,
-    const c10::optional<at::Tensor>& bp1) {
+    const c10::optional<at::Tensor>& bp1,
+    int64_t num_cores) {
     // proj1 进图 ⇒ nxc 是 proj1 **之前**的 [4,G,K]，输出维 D 由 wp1 决定。
     const bool proj1 = wp1.has_value() && wp1->defined();
     TORCH_CHECK(proj1 == (bp1.has_value() && bp1->defined()),
@@ -213,12 +214,23 @@ at::Tensor rpu_hyvla_merger_fused(
         TORCH_CHECK(K <= D, "hyvla_merger_fused: proj1 借 a_sc 暂存输入，"
                     "要求 K(", K, ") <= D(", D, ")");
     }
-    TORCH_CHECK(D % (16 * kCores) == 0,
-                "hyvla_merger_fused: D (", D, ") must be divisible by ", 16 * kCores);
-    const int64_t ln  = D / kCores;      // col-partition 的每核宽度
-    const int64_t NG  = G * D;           // 一个成员的元素数
-    const int64_t N4  = kMembers * NG;   // 全部 4 个成员
-    const int64_t M4  = kMembers * G;    // GEMM 的行数
+    TORCH_CHECK(num_cores == kCores || num_cores == 4,
+                "hyvla_merger_fused: num_cores must be 4 or 8, got ", num_cores);
+    const int cores = static_cast<int>(num_cores);
+    TORCH_CHECK(D % (16 * cores) == 0,
+                "hyvla_merger_fused: D (", D, ") must be divisible by ", 16 * cores);
+    // 4 核时 col-shard 宽一倍（a_cs/a_csb/a_cso 各翻倍），整帧 3 相机的峰值约
+    // 7.53 MB/核，放不进 ViT 回收后的余量 ⇒ 逐相机（49 组）分块跑同一条链。
+    // 组之间没有任何耦合（pool/softmax 只在组内 4 个成员间），分块是精确等价的。
+    // 8 核保持整帧一块，发射序列与原来逐条相同。
+    constexpr int64_t kGroupsPerCamera = 49;
+    TORCH_CHECK(cores == kCores || G % kGroupsPerCamera == 0,
+                "hyvla_merger_fused: four-core chunks need whole cameras (G=", G, ")");
+    const int64_t Gc  = cores == kCores ? G : kGroupsPerCamera;
+    const int64_t ln  = D / cores;       // col-partition 的每核宽度
+    const int64_t NG  = Gc * D;          // 一块里一个成员的元素数
+    const int64_t N4  = kMembers * NG;   // 一块里全部 4 个成员
+    const int64_t M4  = kMembers * Gc;   // GEMM 的行数
 
     if (!SPM_ALLOC.is_initialized()) SPM_ALLOC.init();
     const size_t B = sizeof(c10::Half);
@@ -233,8 +245,8 @@ at::Tensor rpu_hyvla_merger_fused(
     const uint32_t a_sum  = alloc(NG);      // 0.60 MB  Σe，之后复用为末次 gather 的 dst
     const uint32_t a_out  = alloc(NG);      // 0.60 MB  加权和
     const uint32_t a_cs   = alloc(M4 * ln); // 0.30 MB  col-shard（GEMM 输出）
-    const uint32_t a_csb  = alloc(G * ln);  // 0.075 MB pooled 那半的 col-shard
-    const uint32_t a_cso  = alloc(G * ln);  // 0.075 MB proj2 的 col-shard
+    const uint32_t a_csb  = alloc(Gc * ln);  // 0.075 MB pooled 那半的 col-shard
+    const uint32_t a_cso  = alloc(Gc * ln);  // 0.075 MB proj2 的 col-shard
     const uint32_t a_ba   = alloc(ln);
     const uint32_t a_b2   = alloc(ln);
     const uint32_t a_bp   = alloc(ln);
@@ -247,9 +259,13 @@ at::Tensor rpu_hyvla_merger_fused(
     merger_src_base = ::rhino_lkn::RpuGetDevAddr(nxc_p);
     // proj1 进图时广播的是 [4,G,K]（1.35 MB）而不是 [4,G,D]（2.41 MB），
     // 落在 a_sc（步 ③ 的 gather 之前它是空的）；否则照旧直接落 a_nxc。
-    rpu_launch_ddr_broadcast_spm_dma_mutable(
-        &merger_src_base, /*src_offset_bytes=*/0,
-        proj1 ? (kMembers * G * K) : N4, proj1 ? a_sc : a_nxc, kCores);
+    // 分块时每个成员是一段独立的连续行，在块循环里逐成员各发一次。
+    const int64_t width = proj1 ? K : D;
+    if (Gc == G) {
+        rpu_launch_ddr_broadcast_spm_dma_mutable(
+            &merger_src_base, /*src_offset_bytes=*/0,
+            proj1 ? (kMembers * G * K) : N4, proj1 ? a_sc : a_nxc, cores);
+    }
 
     // bias：col-partition ⇒ 核 c 要的是 bias[c*ln : (c+1)*ln]，正好是 scatter 的
     // 语义（连续块按核切）。权重是注册张量、地址稳定 ⇒ 用 fixed 变体。
@@ -258,20 +274,33 @@ at::Tensor rpu_hyvla_merger_fused(
                     " != D ", D);
         c10::Half* p = const_cast<c10::Half*>(b.data_ptr<c10::Half>());
         rpu_ddr_flush(p);
-        rpu_launch_ddr_scatter_spm_dma(p, ln, ln * (int64_t)B, dst, kCores);
+        rpu_launch_ddr_scatter_spm_dma(p, ln, ln * (int64_t)B, dst, cores);
     };
     stage_bias(b0, a_ba);
     stage_bias(b2, a_b2);
     stage_bias(bp2, a_bp);
+    if (proj1) stage_bias(*bp1, a_bp1);
+
+    at::Tensor out;
+    c10::Half* op = nullptr;
+    static thread_local uint64_t merger_dst_base = 0;
+    for (int64_t g0 = 0; g0 < G; g0 += Gc) {
+    if (Gc != G) {
+        for (int64_t m = 0; m < kMembers; ++m) {
+            rpu_launch_ddr_broadcast_spm_dma_mutable(
+                &merger_src_base, (m * G + g0) * width * (int64_t)B, Gc * width,
+                (proj1 ? a_sc : a_nxc) + (uint32_t)(m * Gc * width * (int64_t)B),
+                cores);
+        }
+    }
 
     // proj1 uses column-partitioned ACC32 GEMM (full input, column-sharded output)
     // followed by all_gather. Keep the merger's ACC32 accumulation policy.
     if (proj1) {
-        stage_bias(*bp1, a_bp1);
         rpu_launch_linear_spm_to_spm_kernel(a_sc, *wp1, a_cs, M4, D, K,
-                                            /*partition=*/1, kCores, a_bp1);
+                                            /*partition=*/1, cores, a_bp1);
         rpu_launch_all_gather_spm_kernel(
-            a_cs, a_nxc, M4, ln, (int64_t)B, kCores,
+            a_cs, a_nxc, M4, ln, (int64_t)B, cores,
             rpu_resolve_all_gather_schedule(ln, (int64_t)B));
     }
 
@@ -281,82 +310,84 @@ at::Tensor rpu_hyvla_merger_fused(
     };
     rpu_launch_eltwise_binary_spm_kernel(member(a_nxc, 0), member(a_nxc, 1),
                                          a_pool, NG, ValuOpType::ADD,
-                                         c10::Half(1.0), kCores);
+                                         c10::Half(1.0), cores);
     for (int64_t m = 2; m < kMembers; ++m)
         rpu_launch_eltwise_binary_spm_kernel(a_pool, member(a_nxc, m), a_pool, NG,
-                                             ValuOpType::ADD, c10::Half(1.0), kCores);
+                                             ValuOpType::ADD, c10::Half(1.0), cores);
 
     // ── ② predictor.0（K 拆两半）+ GELU ─────────────────────────────────
     rpu_launch_linear_spm_to_spm_kernel(a_nxc, wa, a_cs, M4, D, D,
-                                              /*partition=*/1, kCores, a_ba);
-    rpu_launch_linear_spm_to_spm_kernel(a_pool, wb, a_csb, G, D, D,
-                                              /*partition=*/1, kCores, /*bias=*/0);
+                                              /*partition=*/1, cores, a_ba);
+    rpu_launch_linear_spm_to_spm_kernel(a_pool, wb, a_csb, Gc, D, D,
+                                              /*partition=*/1, cores, /*bias=*/0);
     // pooled 那半对 4 个成员相同 ⇒ 广播加（host 版是算 4 遍，同值）。
     for (int64_t m = 0; m < kMembers; ++m) {
-        const uint32_t dst = (uint32_t)(a_cs + (uint32_t)(m * G * ln * (int64_t)B));
-        rpu_launch_eltwise_binary_spm_kernel(dst, a_csb, dst, G * ln,
-                                             ValuOpType::ADD, c10::Half(1.0), kCores);
+        const uint32_t dst = (uint32_t)(a_cs + (uint32_t)(m * Gc * ln * (int64_t)B));
+        rpu_launch_eltwise_binary_spm_kernel(dst, a_csb, dst, Gc * ln,
+                                             ValuOpType::ADD, c10::Half(1.0), cores);
     }
     rpu_launch_eltwise_unary_spm_kernel(a_cs, a_cs, M4 * ln, ValuOpType::ADD,
-                                        /*is_gelu=*/true, kCores);
+                                        /*is_gelu=*/true, cores);
 
     // ── ③ predictor.2 ────────────────────────────────────────────────────
     rpu_launch_all_gather_spm_kernel(
-        a_cs, a_sc, M4, ln, (int64_t)B, kCores,
+        a_cs, a_sc, M4, ln, (int64_t)B, cores,
         rpu_resolve_all_gather_schedule(ln, (int64_t)B));
     rpu_launch_linear_spm_to_spm_kernel(a_sc, w2, a_cs, M4, D, D,
-                                              /*partition=*/1, kCores, a_b2);
+                                              /*partition=*/1, cores, a_b2);
     rpu_launch_all_gather_spm_kernel(
-        a_cs, a_sc, M4, ln, (int64_t)B, kCores,
+        a_cs, a_sc, M4, ln, (int64_t)B, cores,
         rpu_resolve_all_gather_schedule(ln, (int64_t)B));
 
     // ── ④ 组内 softmax + 加权求和（算法与 merger_combine 逐行相同）──────
     //   e_m = exp(sc_m - max_m sc_m)；out = (Σ_m nxc_m·e_m) / (Σ_m e_m)
     const uint32_t mx = a_pool;   // pooled 已经用完，借它当 max / 乘积暂存
     rpu_launch_eltwise_binary_spm_kernel(member(a_sc, 0), member(a_sc, 1), mx, NG,
-                                         ValuOpType::MAX, c10::Half(1.0), kCores);
+                                         ValuOpType::MAX, c10::Half(1.0), cores);
     for (int64_t m = 2; m < kMembers; ++m)
         rpu_launch_eltwise_binary_spm_kernel(mx, member(a_sc, m), mx, NG,
-                                             ValuOpType::MAX, c10::Half(1.0), kCores);
+                                             ValuOpType::MAX, c10::Half(1.0), cores);
     for (int64_t m = 0; m < kMembers; ++m) {
         const uint32_t e = member(a_sc, m);
         rpu_launch_eltwise_binary_spm_kernel(e, mx, e, NG, ValuOpType::SUB,
-                                             c10::Half(1.0), kCores);
+                                             c10::Half(1.0), cores);
         rpu_launch_eltwise_unary_spm_kernel(e, e, NG, ValuOpType::EXP,
-                                            /*is_gelu=*/false, kCores);
+                                            /*is_gelu=*/false, cores);
     }
     rpu_launch_eltwise_binary_spm_kernel(member(a_sc, 0), member(a_sc, 1), a_sum, NG,
-                                         ValuOpType::ADD, c10::Half(1.0), kCores);
+                                         ValuOpType::ADD, c10::Half(1.0), cores);
     for (int64_t m = 2; m < kMembers; ++m)
         rpu_launch_eltwise_binary_spm_kernel(a_sum, member(a_sc, m), a_sum, NG,
-                                             ValuOpType::ADD, c10::Half(1.0), kCores);
+                                             ValuOpType::ADD, c10::Half(1.0), cores);
     rpu_launch_eltwise_binary_spm_kernel(member(a_nxc, 0), member(a_sc, 0), a_out, NG,
-                                         ValuOpType::MUL, c10::Half(1.0), kCores);
+                                         ValuOpType::MUL, c10::Half(1.0), cores);
     for (int64_t m = 1; m < kMembers; ++m) {
         rpu_launch_eltwise_binary_spm_kernel(member(a_nxc, m), member(a_sc, m), mx, NG,
-                                             ValuOpType::MUL, c10::Half(1.0), kCores);
+                                             ValuOpType::MUL, c10::Half(1.0), cores);
         rpu_launch_eltwise_binary_spm_kernel(a_out, mx, a_out, NG, ValuOpType::ADD,
-                                             c10::Half(1.0), kCores);
+                                             c10::Half(1.0), cores);
     }
     rpu_launch_eltwise_binary_spm_kernel(a_out, a_sum, a_out, NG, ValuOpType::DIV,
-                                         c10::Half(1.0), kCores);
+                                         c10::Half(1.0), cores);
 
     // ── ⑤ GELU + proj2 ──────────────────────────────────────────────────
     rpu_launch_eltwise_unary_spm_kernel(a_out, a_out, NG, ValuOpType::ADD,
-                                        /*is_gelu=*/true, kCores);
-    rpu_launch_linear_spm_to_spm_kernel(a_out, wp2, a_cso, G, D, D,
-                                              /*partition=*/1, kCores, a_bp);
+                                        /*is_gelu=*/true, cores);
+    rpu_launch_linear_spm_to_spm_kernel(a_out, wp2, a_cso, Gc, D, D,
+                                              /*partition=*/1, cores, a_bp);
     rpu_launch_all_gather_spm_kernel(
-        a_cso, a_sum, G, ln, (int64_t)B, kCores,
+        a_cso, a_sum, Gc, ln, (int64_t)B, cores,
         rpu_resolve_all_gather_schedule(ln, (int64_t)B));
 
-    at::Tensor out = at::empty({G, D},
-        at::TensorOptions().dtype(at::kHalf).device(at::kPrivateUse1));
-    c10::Half* op = out.data_ptr<c10::Half>();
-    static thread_local uint64_t merger_dst_base = 0;
-    merger_dst_base = ::rhino_lkn::RpuGetDevAddr(op);
+    if (g0 == 0) {
+        out = at::empty({G, D},
+            at::TensorOptions().dtype(at::kHalf).device(at::kPrivateUse1));
+        op = out.data_ptr<c10::Half>();
+        merger_dst_base = ::rhino_lkn::RpuGetDevAddr(op);
+    }
     rpu_launch_spm_copy_ddr_dma_mutable(a_sum, &merger_dst_base,
-                                        /*dst_offset_bytes=*/0, NG);
+                                        /*dst_offset_bytes=*/g0 * D * (int64_t)B, NG);
+    }
     rpu_ddr_flush(op);
     return out;
 }

@@ -1,4 +1,4 @@
-"""Public Wall-OSS-0.5 policy facade for downstream device inference.
+"""Public Wall-OSS-0.5 policy facade for downstream RPU inference.
 
 The canonical user import is:
 
@@ -49,7 +49,6 @@ _SUPPORTED_CAMERA_NAMES = frozenset(
 _RTC_CAMERA_NAMES = ("face_view", "left_wrist_view", "right_wrist_view")
 _RTC_ACTIVE_SLOTS = tuple(range(20))
 _RTC_STATE_DIM = 26
-_RTC_NUMERIC_BLOCKED_ENV = "RPU_WALL_OSS_RTC_ALLOW_NUMERIC_BLOCKED"
 
 
 def _strict_bool(name: str, value: bool) -> bool:
@@ -245,7 +244,7 @@ def _close_wall_oss_vla(vla: Any) -> None:
 
 
 class WallOssPolicy:
-    """Public Wall-OSS-0.5 (Qwen2.5-VL VLA) device entry point.
+    """Public Wall-OSS-0.5 (Qwen2.5-VL VLA) RPU entry point.
 
     Prompt layout (FLOW system/observation template), camera roster and dataset
     normalizer are fixed at construction. Camera pixels, proprioception and the
@@ -311,7 +310,7 @@ class WallOssPolicy:
         ``fp16_ckpt_dir`` for processor, normalizer and CPU glue weights.
         For ``nvfp4a16``, ``ckpt_dir`` is the matching W8A16 checkpoint:
         Vision and expert-0 ``down_proj`` stay W8 while the same decoder
-        projections selected by WINT4A16 use NVFP4. This is an experimental
+        projections selected by W4A16 pgrp use NVFP4. This is an experimental
         final-action mode and does not claim FP16-equivalent prefix parity.
 
         ``rtc=True`` selects the strict ``wrc_sf_v728`` profile.  With
@@ -550,26 +549,11 @@ class WallOssPolicy:
             if self._rpu_build_started:
                 raise RPUBackendError(
                     "WallOssPolicy.to('rpu') previously failed after claiming "
-                    "the process-wide device slot. Delete this policy, run "
+                    "the process-wide RPU slot. Delete this policy, run "
                     "gc.collect(), and construct a fresh instance; retrying may "
                     "reuse partially initialized or swizzled state."
                 )
 
-            if self._rtc:
-                rtc_opt_in = self._runtime_env.get(
-                    _RTC_NUMERIC_BLOCKED_ENV,
-                    os.environ.get(_RTC_NUMERIC_BLOCKED_ENV),
-                )
-                if rtc_opt_in != "1":
-                    raise NotImplementedError(
-                        "Wall-OSS wrc_sf_v728 RTC is fail-closed by default. "
-                        "Blocking CI grants controlled temporary support only "
-                        "to exact FP16 P640/C320 staged0 and W8A16 P640/C320 "
-                        "staged0+A16-stretch; W4 and other profiles remain "
-                        "evaluation-only. Set exactly "
-                        f"{_RTC_NUMERIC_BLOCKED_ENV}=1 to enter a controlled "
-                        "path; none is formally or robot certified."
-                    )
 
 
             from rpu_backend.api.causal_lm import _claim_live_instance

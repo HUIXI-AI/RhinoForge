@@ -58,13 +58,13 @@ int main(){
  const Regions regions{base,base+524288,base+589824,base+655360,base+720896,base+721408,base+721920};
  const Weights weights{{{0x1234567800ULL},{0x2345678900ULL},{0x3456789a00ULL}}};
  for(uint32_t pass=0;pass<2;++pass){auto r=regions;auto w=weights;for(auto&address:r)address+=pass*0x100000;for(auto&weight:w)weight.address+=pass*0x400000;run(r,w);const auto&s=g.submissions.back();
-  assert(pair(s,0)==r[0]&&pair(s,4)==r[1]&&pair(s,26)==r[2]&&pair(s,32)==r[3]);
-  assert(pair(s,6)==r[4]&&pair(s,28)==r[5]&&pair(s,34)==r[6]);
-  assert(s.regs.at(8)==256&&pair(s,10)==128&&s.regs.at(12)==1024&&s.regs.at(13)==64&&s.regs.at(14)==1&&s.regs.at(15)==8);
-  assert(pair(s,16)==2048&&pair(s,18)==256&&s.regs.at(22)==1&&s.regs.at(23)==1);
-  assert(s.operands.size()==6);const int regs[3]={2,24,30};for(int i=0;i<3;++i){assert(pair(s,regs[i])==w[i].address>>8&&s.operands[i].owner.address==w[i].address&&flushed[pass*6+i]==w[i].address);const auto&a=s.operands[i].abi;assert(a.role==GraphDdrRegisterRole::Int8ModelWeight&&a.access==GraphDdrRegisterAccess::Read&&a.encoding==GraphDdrRegisterEncoding::DevAddrShift8LoHi&&a.lo==regs[i]&&a.hi==regs[i]+1);}
+  assert(pair(s,0)==r[0]&&pair(s,4)==r[1]&&pair(s,36)==r[2]&&pair(s,44)==r[3]);
+  assert(pair(s,6)==r[4]&&pair(s,38)==r[5]&&pair(s,46)==r[6]);
+  assert(s.regs.at(8)==1&&s.regs.at(9)==256&&pair(s,10)==128&&s.regs.at(12)==1024&&s.regs.at(13)==64&&s.regs.at(14)==1&&s.regs.at(15)==8);
+  assert(pair(s,16)==2048&&pair(s,18)==256&&pair(s,22)==0&&pair(s,24)==0&&s.regs.at(26)==2&&s.regs.at(27)==1);
+  assert(s.operands.size()==6);const int regs[3]={2,32,40};for(int i=0;i<3;++i){assert(pair(s,regs[i])==w[i].address>>8&&s.operands[i].owner.address==w[i].address&&flushed[pass*6+i]==w[i].address);const auto&a=s.operands[i].abi;assert(a.role==GraphDdrRegisterRole::Int8ModelWeight&&a.access==GraphDdrRegisterAccess::Read&&a.encoding==GraphDdrRegisterEncoding::DevAddrShift8LoHi&&a.lo==regs[i]&&a.hi==regs[i]+1);}
  }
- for(int i=0;i<3;++i){const auto&s=g.submissions.back();const int regs[3]={20,36,38};assert(pair(s,regs[i])==scales[i].address>>8);const auto&a=s.operands[3+i].abi;assert(a.role==GraphDdrRegisterRole::PerChannelScale&&a.lo==regs[i]&&a.hi==regs[i]+1&&s.operands[3+i].owner.address==scales[i].address&&flushed[9+i]==scales[i].address);}
+ for(int i=0;i<3;++i){const auto&s=g.submissions.back();const int regs[3]={20,34,42};assert(pair(s,regs[i])==scales[i].address>>8);const auto&a=s.operands[3+i].abi;assert(a.role==GraphDdrRegisterRole::PerChannelScale&&a.lo==regs[i]&&a.hi==regs[i]+1&&s.operands[3+i].owner.address==scales[i].address&&flushed[9+i]==scales[i].address);}
  for(int which=0;which<3;++which)for(int fault=0;fault<6;++fault){auto saved=scales;auto&t=scales[which];if(fault==0)t.present=false;if(fault==1)t.dtype=at::kChar;if(fault==2)t.contiguous=false;if(fault==3)t.location=c10::DeviceType::CPU;if(fault==4)t.rank=2;if(fault==5)t.rows=1023;reject([&]{run(regions,weights);});scales=saved;}
  // Check each full interval, including the exact final legal bias/cache line.
  const uint32_t sizes[7]={524288,65536,65536,65536,256,256,256};

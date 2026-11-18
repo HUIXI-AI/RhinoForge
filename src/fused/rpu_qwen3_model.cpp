@@ -679,7 +679,8 @@ SpmPipelineComponentLayout
 CausalDecoderModel::prepare_qwen3vl_pooler_z1_layout(
     int64_t execution_len,
     int64_t real_len,
-    int64_t retained_deepstack_count, at::IntArrayRef selected_descriptor) {
+    int64_t retained_deepstack_count, at::IntArrayRef selected_descriptor,
+    bool partial_mrope) {
     TORCH_CHECK(!RpuKernelGraph::has_active(),
                     "Qwen3-VL pooler Z1 prepare must run outside Graph capture");
     TORCH_CHECK(!qwen3vl_multiview_text_dry_prepared_ &&
@@ -714,7 +715,10 @@ CausalDecoderModel::prepare_qwen3vl_pooler_z1_layout(
     validate_qwen3vl_pooler_z1_model_profile(
         retained_deepstack_count, real_len);
 
-    set_chunk_size_override(QWEN3VL_POOLER_Z1_CANARY_CHUNK_SIZE);
+    // C128 is selected by the prepared COMPLETE stage descriptor below.
+    // Do not write a legacy override: GR00T's AUTO-only envelope correctly
+    // rejects such overrides, and unprepare must leave the caller's policy
+    // unchanged. Existing explicit overrides still face the shared checks.
     LayoutContext layout;
     layout.chunk_size = QWEN3VL_POOLER_Z1_CANARY_CHUNK_SIZE;
     layout.max_kv_seq_len = QWEN3VL_POOLER_Z1_CANARY_EXECUTION_LEN;
@@ -723,17 +727,41 @@ CausalDecoderModel::prepare_qwen3vl_pooler_z1_layout(
     layout.is_causal = true;
     const auto stage_plan = compose_fmb_default_three_stage_chunk_plan(
         layout, execution_len, /*position=*/0, ChunkMode::SEQUENTIAL);
-    if (!selected_descriptor.empty()) {
+    TORCH_CHECK(!partial_mrope ||
+                    (real_len == QWEN3VL_POOLER_Z1_CANARY_REAL_LEN &&
+                     retained_deepstack_count == 3),
+                "partial M-RoPE preparation requires the S72 retained-DS3 profile");
+    std::vector<int64_t> prepared_descriptor(
+        selected_descriptor.begin(), selected_descriptor.end());
+    if (prepared_descriptor.empty()) {
+        // The default winner needs the same COMPLETE layout binding as an
+        // explicit selection. Forward must reuse this allocation under its
+        // physical lease, where resetting temporary SPM is forbidden.
+        prepared_descriptor = encode_causal_physical_stage_descriptor(
+            stage_plan, layout, stage_plan.input.plan.chunk_size,
+            QWEN3VL_POOLER_Z1_CANARY_CHUNK_SIZE,
+            QWEN3VL_POOLER_Z1_CANARY_CHUNK_SIZE,
+            execution_len, real_len, /*position=*/0, /*rope_mode=*/partial_mrope ? 1 : 0,
+            FmbGraphLifecycle::COMPOSITE_CHILD,
+            CausalDecoderPlanningMode::QWEN3VL_POOLER_Z1);
+        bind_kvinsert_cost_owner_prefix(prepared_descriptor,
+            {INT64_C(0x51565a3154434f53), real_len,
+             retained_deepstack_count, partial_mrope ? 1 : 0});
+    } else {
         (void)kvinsert_cost_domain("causal_decoder", selected_descriptor);
-        const auto prepared_candidate = prepare_stage_candidate(selected_descriptor);
+    }
+    {
+        const auto prepared_candidate = prepare_stage_candidate(prepared_descriptor);
         const auto& candidate = prepared_candidate->candidate();
         const auto& manifest = candidate.physical_manifest;
-        const bool partial_mrope = std::any_of(manifest.routes.begin(), manifest.routes.end(),
+        const bool descriptor_partial_mrope = std::any_of(manifest.routes.begin(), manifest.routes.end(),
             [](const auto& route) {
                 return route.family == FmbRouteFamily::ROPE &&
                     route.site_id == CAUSAL_DECODER_PARTIAL_MROPE_TENSOR_SITE;
             });
-        TORCH_CHECK(kvinsert_cost_owner_prefix(selected_descriptor) ==
+        TORCH_CHECK(descriptor_partial_mrope == partial_mrope,
+                    "Z1 Text selected descriptor RoPE differs from preparation");
+        TORCH_CHECK(kvinsert_cost_owner_prefix(prepared_descriptor) ==
                         (std::vector<int64_t>{INT64_C(0x51565a3154434f53),
                             real_len, retained_deepstack_count, partial_mrope ? 1 : 0}),
                     "Z1 Text selection was not produced by its exact native lifecycle");
@@ -771,6 +799,7 @@ CausalDecoderModel::prepare_qwen3vl_pooler_z1_layout(
     qwen3vl_pooler_z1_partial_mrope_ = false;
     qwen3vl_pooler_z1_inputs_primed_ = false;
     qwen3vl_pooler_z1_stage_descriptor_.clear();
+    qwen3vl_pooler_z1_layout_stage_descriptor_ = std::move(prepared_descriptor);
     qwen3vl_pooler_z1_selected_stage_descriptor_.assign(
         selected_descriptor.begin(), selected_descriptor.end());
     ka_last_position_ = -1;
@@ -903,6 +932,29 @@ void CausalDecoderModel::prime_qwen3vl_pooler_z1_inputs(
     }
     // Validate the prepared winner before mutable keepalive DMA or cache state.
     const auto stage_descriptor = qwen3vl_pooler_z1_stage_descriptor(partial_mrope);
+    if (stage_descriptor != qwen3vl_pooler_z1_layout_stage_descriptor_) {
+        // The default S72/DS3 entry chooses partial M-RoPE at input prime.
+        // Bind that final descriptor while still cold, before begin acquires
+        // the process-wide physical arena. Explicit selections remain fixed
+        // by the getter's owner-prefix check above.
+        RpuExecutionCoordinator::require_no_physical_claim(
+            "Qwen3-VL pooler Z1 input layout binding");
+        const auto prepared_candidate = prepare_stage_candidate(stage_descriptor);
+        const auto& candidate = prepared_candidate->candidate();
+        LayoutContext layout;
+        layout.chunk_size = QWEN3VL_POOLER_Z1_CANARY_CHUNK_SIZE;
+        layout.max_kv_seq_len = QWEN3VL_POOLER_Z1_CANARY_EXECUTION_LEN;
+        layout.num_layers = num_layers();
+        layout.use_attn_mask = false;
+        layout.is_causal = true;
+        layout.stage_plan_fingerprint = prepared_candidate->stage_fingerprint();
+        layout = bind_physical_layout_context(layout, candidate.physical_manifest);
+        const auto prepared = prepare_spm_pipeline_component(layout, candidate.stage_plan);
+        TORCH_CHECK(prepared.temporary_bytes ==
+                        QWEN3VL_POOLER_Z1_CANARY_TEMPORARY_BYTES,
+                    "Qwen3-VL pooler Z1 input layout exceeds its prepared scratch extent");
+        qwen3vl_pooler_z1_layout_stage_descriptor_ = stage_descriptor;
+    }
     const uint64_t position_ids_addr =
         RpuGetDevAddr(position_ids.data_ptr<int32_t>());
     TORCH_CHECK(position_ids_addr != 0,
@@ -1045,6 +1097,7 @@ void CausalDecoderModel::unprepare_qwen3vl_pooler_z1_layout() {
                 "lease");
     rollback_qwen3vl_pooler_z1_inputs();
     qwen3vl_pooler_z1_selected_stage_descriptor_.clear();
+    qwen3vl_pooler_z1_layout_stage_descriptor_.clear();
     qwen3vl_pooler_z1_prepared_execution_len_ = 0;
     qwen3vl_pooler_z1_prepared_real_len_ = 0;
     qwen3vl_pooler_z1_prepared_chunk_size_ = 0;
@@ -2425,31 +2478,34 @@ namespace v3::qwen3vl_pooler_z1_internal {
 SpmPipelineComponentLayout prepare_text(
     int64_t handle,
     int64_t execution_len,
-    int64_t real_len, at::IntArrayRef selected_descriptor) {
+    int64_t real_len, at::IntArrayRef selected_descriptor,
+    bool partial_mrope) {
     return CausalDecoderRegistry::get(
                handle, "qwen3vl_pooler_z1_prepare_text")
         ->prepare_qwen3vl_pooler_z1_layout(
-            execution_len, real_len, /*retained_deepstack_count=*/0, selected_descriptor);
+            execution_len, real_len, /*retained_deepstack_count=*/0, selected_descriptor, partial_mrope);
 }
 
 SpmPipelineComponentLayout prepare_text_deepstack1(
     int64_t handle,
     int64_t execution_len,
-    int64_t real_len, at::IntArrayRef selected_descriptor) {
+    int64_t real_len, at::IntArrayRef selected_descriptor,
+    bool partial_mrope) {
     return CausalDecoderRegistry::get(
                handle, "qwen3vl_pooler_z1_prepare_text_deepstack1")
         ->prepare_qwen3vl_pooler_z1_layout(
-            execution_len, real_len, /*retained_deepstack_count=*/1, selected_descriptor);
+            execution_len, real_len, /*retained_deepstack_count=*/1, selected_descriptor, partial_mrope);
 }
 
 SpmPipelineComponentLayout prepare_text_deepstack3(
     int64_t handle,
     int64_t execution_len,
-    int64_t real_len, at::IntArrayRef selected_descriptor) {
+    int64_t real_len, at::IntArrayRef selected_descriptor,
+    bool partial_mrope) {
     return CausalDecoderRegistry::get(
                handle, "qwen3vl_pooler_z1_prepare_text_deepstack3")
         ->prepare_qwen3vl_pooler_z1_layout(
-            execution_len, real_len, /*retained_deepstack_count=*/3, selected_descriptor);
+            execution_len, real_len, /*retained_deepstack_count=*/3, selected_descriptor, partial_mrope);
 }
 
 std::vector<int64_t> text_stage_descriptor(int64_t handle, bool partial_mrope) {
@@ -2897,12 +2953,17 @@ void rpu_causal_decoder_set_lm_head(
             lm_head_w, lm_head_scale, fuse_prefill_last, exact_candidates);
 }
 
-void rpu_causal_decoder_set_tts_predictor_heads(int64_t handle, at::TensorList heads) {
-    CausalDecoderRegistry::get(handle, "rpu_causal_decoder")->set_tts_predictor_heads(heads);
+void rpu_causal_decoder_set_lm_head_bank(
+    int64_t handle,
+    at::TensorList lm_head_w,
+    at::TensorList lm_head_scale) {
+    CausalDecoderRegistry::get(handle, "rpu_causal_decoder_set_lm_head_bank")
+        ->set_lm_head_bank(lm_head_w.vec(), lm_head_scale.vec());
 }
 
-at::Tensor rpu_causal_decoder_tts_predictor_logits(int64_t handle) {
-    return CausalDecoderRegistry::get(handle, "rpu_causal_decoder")->tts_predictor_logits();
+void rpu_causal_decoder_select_lm_head(int64_t handle, int64_t index) {
+    CausalDecoderRegistry::get(handle, "rpu_causal_decoder_select_lm_head")
+        ->select_lm_head(index);
 }
 
 void rpu_causal_decoder_clear_lm_head(int64_t handle) {
@@ -3031,6 +3092,23 @@ void rpu_causal_decoder_set_chunk_envelope(int64_t handle, int64_t max_kv_len,
 void rpu_causal_decoder_set_equal_two_prefill(int64_t handle, bool enabled) {
     CausalDecoderRegistry::get(handle, "rpu_causal_decoder_set_equal_two_prefill")
         ->set_equal_two_prefill(enabled);
+}
+
+void rpu_causal_decoder_set_qwen3_c512(int64_t handle, bool enabled) {
+    CausalDecoderRegistry::get(handle, "rpu_causal_decoder_set_qwen3_c512")->set_qwen3_c512(enabled);
+}
+
+void rpu_causal_decoder_set_qwen3_c256(int64_t handle, bool enabled) {
+    CausalDecoderRegistry::get(handle, "rpu_causal_decoder_set_qwen3_c256")->set_qwen3_c256(enabled);
+}
+
+void rpu_causal_decoder_set_qwen3_c192(int64_t handle, bool enabled) {
+    CausalDecoderRegistry::get(handle, "rpu_causal_decoder_set_qwen3_c192")->set_qwen3_c192(enabled);
+}
+
+void rpu_causal_decoder_set_prefill_w8a8(int64_t handle, bool enabled) {
+    CausalDecoderRegistry::get(handle, "rpu_causal_decoder_set_prefill_w8a8")
+        ->set_prefill_w8a8(enabled);
 }
 
 // AdaRMS FiLM step-update (LingBot-VLA action expert). Per Euler denoise step,

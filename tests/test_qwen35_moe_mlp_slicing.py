@@ -24,6 +24,7 @@ def source_probe():
         'void Qwen3_5MoeModel::append_mlp_manifest_routes(',
         'void Qwen3_5MoeModel::emit_mlp_and_output(',
         'void Qwen3_5MoeModel::emit_router_and_shuffle(',
+        'void Qwen3_5MoeModel::emit_router_topk(',
         'void Qwen3_5MoeModel::emit_shared_expert(',
         'void Qwen3_5MoeModel::emit_routed_experts(',
         'void Qwen3_5MoeModel::emit_moe_merge_and_residual(',
@@ -38,7 +39,8 @@ def source_probe():
         'enum class FmbLinearRouteSelector', 'struct FmbRouteManifestEntry',
     ))
     constants = '\n'.join(re.findall(
-        r'constexpr int64_t (?:QWEN35_MOE_\w+_SITE|kMoeChunkSize|kRoutedUint4\w*)\s*=\s*\d+(?:LL)?;', native))
+        r'constexpr int64_t (?:QWEN35_MOE_\w+_SITE|kMoeChunkSize|kResident\w*|kRoutedUint4\w*)\s*=\s*\d+(?:LL)?;', native))
+    constants += '\n' + definition(native, 'std::vector<int64_t> shared_alpha_local_arguments(')
     enums = '\n'.join(definition(native, marker) + ';' for marker in (
         'enum class Qwen35MoeMutableDmaRoute', 'enum class Qwen35MoeActivationRoute'))
     code = r'''
@@ -48,6 +50,7 @@ def source_probe():
 #include <cstdint>
 #include <initializer_list>
 #include <map>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -90,6 +93,7 @@ using RouteKey=std::tuple<int64_t,int64_t,int64_t>;
 RouteKey key(const FmbRouteManifestEntry& r) {
     return {static_cast<int64_t>(r.family),r.site_id,r.invocation};
 }
+std::array<int64_t,5> consumed_fp8_dispatch{};
 struct Context {
     bool output_to_spm=false;
     std::map<RouteKey,FmbRouteManifestEntry> expected;
@@ -100,11 +104,15 @@ struct Context {
         RouteKey k{static_cast<int64_t>(family),site,invocation};
         const auto& r=expected.at(k);
         TORCH_CHECK(r.selector==selector && r.flags==flags && r.arguments==args);
+        if(site==QWEN35_MOE_GROUPED_FP8_SITE) {
+            TORCH_CHECK(args.size()==17);
+            std::copy_n(args.begin()+6,5,consumed_fp8_dispatch.begin());
+        }
         consumed.insert(k);
     }
 };
 struct Record {int64_t rows; uint32_t residual,output;};
-int owner=8, outer_rows=0, norm_calls=0, output_dmas=0;
+int owner=8, routed_owner=8, outer_rows=0, norm_calls=0, output_dmas=0;
 int uint4_calls=0;
 int64_t active_row=0, active_t=0;
 bool expected_acc32=false;
@@ -141,11 +149,11 @@ void rpu_launch_ddr_broadcast_spm_dma(const at::Tensor&,int64_t offset,
 void rpu_launch_gather_fp16_spm_kernel(uint32_t input,uint32_t,uint32_t,
         int64_t rows,int64_t h,int axis,int64_t routed,int nc) {
     assert(input==input_base+active_row*2048*2);
-    assert(rows==active_t && routed==rows*8 && h==2048 && axis==0 && nc==owner);
+    assert(rows==active_t && routed==rows*8 && h==2048 && axis==0 && nc==routed_owner);
 }
 void rpu_launch_scatternd_add_u16_fp16_spm_kernel(uint32_t,uint32_t,uint32_t,
         int64_t rows,int64_t routed,int64_t h,int nc) {
-    assert(rows==active_t && routed==rows*8 && h==2048 && nc==owner);
+    assert(rows==active_t && routed==rows*8 && h==2048 && nc==routed_owner);
 }
 void rpu_launch_all_reduce_sum_residual_kernel(uint32_t,uint32_t residual,
         uint32_t output,int64_t rows,int64_t h,int producers,int consumers) {
@@ -154,35 +162,52 @@ void rpu_launch_all_reduce_sum_residual_kernel(uint32_t,uint32_t residual,
     assert(output==input_base+active_row*h*2);
     reductions.push_back({rows,residual,output});active_row+=rows;
 }
-void rpu_launch_slice_spm_kernel(uint32_t,uint32_t,std::initializer_list<int64_t> shape,
-        std::initializer_list<int64_t>,std::initializer_list<int64_t>,int) {
-    assert(*shape.begin()==active_t);
+void rpu_launch_slice_spm_kernel(uint32_t input,uint32_t output,std::initializer_list<int64_t> shape,
+        std::initializer_list<int64_t> out,std::initializer_list<int64_t> begin,int nc,bool local) {
+    assert(nc==owner && local && input==scratch_base && output==scratch_base);
+    assert(std::vector<int64_t>(shape)==std::vector<int64_t>({active_t,16}));
+    assert(std::vector<int64_t>(out)==std::vector<int64_t>({active_t,1}));
+    assert(std::vector<int64_t>(begin)==std::vector<int64_t>({0,0}));
 }
-std::array<int64_t,2> rpu_select_grouped_parallel_linear_uint4_tile(
-        int64_t m_total,int64_t experts,int64_t n,int64_t k) {
+std::array<int64_t,3> rpu_select_grouped_parallel_linear_uint4_tile(
+        int64_t m_total,int64_t experts,int64_t n,int64_t k,int64_t group_size,bool acc32) {
     assert(m_total>0 && m_total<=1024 && experts==256);
-    assert((n==64 && k==2048) || (n==2048 && k==64));
-    // A facade for tile availability; the generated selector has its own tests.
-    // This test checks that producer and consumer bind the same tile and M.
-    return {64,16};
+    assert((n==512/routed_owner && k==2048) || (n==2048 && k==512/routed_owner));
+    const auto tile=rpu_grouped_tiling::select_uint4(m_total,experts,n,k,group_size,acc32);
+    return {tile.n,tile.m,tile.k};
 }
+__GROUPED_ROUTE_ARGUMENTS__
 void rpu_launch_grouped_parallel_linear_uint4_spm_kernel(
         uint32_t,const at::Tensor&,uint32_t,const at::Tensor&,
         const at::Tensor&,uint32_t,int64_t n,int64_t k,int64_t experts,
-        bool col,int nc,int64_t group_size,int64_t m_total) {
-    assert(nc==8 && owner==8 && experts==256 && m_total==active_t*8);
-    assert(n==(col?64:2048) && k==(col?2048:64));
+        bool col,int nc,int64_t group_size,int64_t m_total,bool acc32) {
+    assert(nc==routed_owner && experts==256 && m_total==active_t*8);
+    assert(n==(col?512/routed_owner:2048) && k==(col?2048:512/routed_owner));
     assert(group_size==(col?128:64));
+    assert(acc32==expected_acc32);
     ++uint4_calls;
 }
 void rpu_launch_grouped_parallel_linear_spm_kernel(
         uint32_t,const at::Tensor&,uint32_t,const at::Tensor&,uint32_t,uint32_t,
-        int64_t n,int64_t k,int64_t experts,bool col,int nc,int64_t mode,
+        int64_t n,int64_t k,int64_t experts,bool col,int nc,int64_t m_total,int64_t mode,
         bool acc32) {
     assert(mode==5 && nc==owner && experts==256);
+    assert(m_total==active_t*8);
     assert(acc32==expected_acc32);
     assert(n==(col?(owner==6?96:512/owner):2048));
     assert(k==(col?2048:(owner==6?96:512/owner)));
+    const auto dispatch=rpu_grouped_tiling::select_dispatch(
+        m_total,n,k,static_cast<int>(mode),acc32,2,0,0,experts);
+    if((owner==6 || owner==8) && !acc32) {
+        assert(m_total==8 || m_total==512 || m_total==1024);
+        assert(dispatch.tile.n_tile==(col && owner==6?48:64));
+        assert(dispatch.tile.m_tile==(col?(owner==6?256:224):448));
+        assert(dispatch.tile.k_tile==(col?256:128));
+        assert(dispatch.kind==rpu_grouped_tiling::DispatchKind::Static);
+    }
+    assert((consumed_fp8_dispatch==std::array<int64_t,5>{
+        m_total,dispatch.tile.m_tile,dispatch.tile.n_tile,
+        dispatch.tile.k_tile,static_cast<int64_t>(dispatch.kind)}));
 }
 __NOOPS__
 struct Qwen3_5MoeModel {
@@ -193,10 +218,22 @@ struct Qwen3_5MoeModel {
         int64_t routed_group_size=0,routed_down_group_size=0;
         int64_t routed_weight_mode=5;
     };
-    struct Moe {int64_t num_experts=256,top_k=8;} moe_;
+    struct Moe {int64_t num_experts=256,top_k=8,routed_intermediate=512;} moe_;
     std::vector<Weight> moe_layer_weights_{Weight{}};
     at::Tensor expert_ids_,token_ids_,router_bridge_;
-    bool linear_acc32_=false;
+    bool linear_acc32_=false, resident_prefill_=false;
+    bool resident_planning_active_=false;
+    struct UnusedResidentPlan {
+        struct Request {int64_t outer_capacity=0,execution_rows=0,position=0;} request;
+    };
+    std::optional<UnusedResidentPlan> resident_execution_plan_;
+    bool plan_resident_candidate(int64_t,int64_t,int64_t) const {
+        throw std::runtime_error("unexpected resident planning in legacy fixture");
+    }
+    bool resident_route_capacity_valid(int64_t) const {
+        throw std::runtime_error("unexpected resident capacity query in legacy fixture");
+    }
+    void append_resident_mlp_manifest_routes(FmbPhysicalExecutionManifest&,const ChunkInfo&) const {throw std::runtime_error("resident outside legacy fixture");}
     bool has_gdn_=true;
     double eps_=1e-6;
     Context context;
@@ -204,11 +241,11 @@ struct Qwen3_5MoeModel {
     int num_cores() const {return owner;}
     int router_tp() const {return owner==6?4:owner;}
     int routing_tp() const {return owner;}
-    int routed_expert_tp() const {return owner;}
+    __ROUTED_TP__
     int shared_expert_tp() const {return owner;}
     int64_t num_layers() const {return 1;}
     int64_t hidden_size() const {return 2048;}
-    int64_t physical_routed_intermediate() const {return owner==6?576:512;}
+    __ROUTED_WIDTH__
     int64_t physical_shared_intermediate() const {return owner==6?576:512;}
     int64_t text_ring_route(int64_t rows,int64_t) const {return rows==1?1:2;}
     int make_sdpa_config() const {return 0;}
@@ -226,7 +263,7 @@ __DECLARATIONS__
 __METHODS__
 void run_case(int cores, int rows, bool acc32=false, bool mixed_weights=false,
         int tail=0,bool uint4=false) {
-    owner=cores;outer_rows=rows;active_row=0;active_t=0;
+    owner=cores;routed_owner=uint4 && cores==6?4:cores;outer_rows=rows;active_row=0;active_t=0;
     norm_calls=0;output_dmas=0;reductions.clear();bridge_rows.clear();expected_acc32=acc32;
     uint4_calls=0;
     Qwen3_5MoeModel model;model.linear_acc32_=acc32;
@@ -257,13 +294,50 @@ void run_case(int cores, int rows, bool acc32=false, bool mixed_weights=false,
                                                  : QWEN35_MOE_GROUPED_UINT4_SITE;
         assert(route.site_id!=other_grouped_site);
         if(route.site_id==grouped_site) {
-            assert(route.arguments.size()==(uint4?13:6));
+            assert(route.arguments.size()==(uint4?20:17));
+            const auto start=uint4?14:11;
+            assert(route.arguments[start]==2); // sole register ABI
+            assert(route.arguments[start+4]==(uint4?2:1));
+            assert(route.arguments[start+5]%256==0);
+            if(uint4) {
+                assert(route.arguments[start+1]==route.arguments[8]); // M
+                assert(route.arguments[start+2]==route.arguments[7]); // N
+                assert(route.arguments[start+3]==route.arguments[9]); // K
+                assert(route.arguments[start+5]==route.arguments[13]);
+            } else {
+                assert(route.arguments[start+1]==route.arguments[7]);
+                assert(route.arguments[start+2]==route.arguments[8]);
+                assert(route.arguments[start+3]==route.arguments[9]);
+                const auto width=route.arguments[0]*(route.arguments[3]?route.arguments[4]:1);
+                assert(route.arguments[start+5]==(width*2+255)/256*256);
+            }
+
             assert(route.arguments[5]==(acc32?1:0));
+            if(!uint4 && cores==6 && !acc32) {
+                const bool col=route.arguments[3]!=0;
+                assert(route.arguments[0]==(col?96:2048));
+                assert(route.arguments[1]==(col?2048:96));
+                assert(route.arguments[2]==256 && route.arguments[4]==6);
+                assert(route.arguments[7]==(col?256:448));
+                assert(route.arguments[8]==(col?48:64));
+                assert(route.arguments[9]==(col?256:128) && route.arguments[10]==0);
+            }
             if(uint4) {
                 const bool col=route.arguments[3]!=0;
-                assert(route.arguments[10]==1); // Q4/N64 metadata ABI
-                assert(route.arguments[11]==(col?4096:131072));
-                assert(route.arguments[12]==(col?16384:131072));
+                assert(route.arguments[11]==1); // Q4/N64 metadata ABI
+                const auto metadata=rpu_grouped_tiling::uint4_metadata_layout(
+                    col?512/routed_owner:2048,col?2048:512/routed_owner,
+                    col?128:64,routed_owner);
+                assert(route.arguments[4]==routed_owner);
+                assert(route.arguments[12]==metadata.group_block_bytes);
+                assert(route.arguments[13]==metadata.expert_bytes);
+                if(routed_owner==8 && !acc32) {
+                    const int64_t packed_m=route.arguments[10];
+                    assert(packed_m==8 || packed_m==512 || packed_m==1024);
+                    assert(route.arguments[7]==(col?32:128));
+                    assert(route.arguments[8]==(col?64:(packed_m==1024?288:128)));
+                    assert(route.arguments[9]==(col?768:(packed_m==1024?128:256)));
+                }
             }
         }
         if(route.site_id==QWEN35_MOE_LINEAR_SITE) {
@@ -285,17 +359,32 @@ void run_case(int cores, int rows, bool acc32=false, bool mixed_weights=false,
     assert(uint4_calls==(uint4?3*reductions.size():0));
     int64_t sum=0;for(auto r:reductions)sum+=r.rows;assert(sum==rows+tail);
     if(uint4) {
-        // Group-size and metadata-layout drift must fail before the first UINT4 launch.
+        // Tile, group-size and metadata drift must fail before the first UINT4 launch.
         auto it=std::find_if(model.context.expected.begin(),model.context.expected.end(),
             [](const auto& pair){return pair.second.site_id==QWEN35_MOE_GROUPED_UINT4_SITE;});
-        assert(it!=model.context.expected.end() && it->second.arguments.size()==13);
-        for(int field:{6,10,11,12}) {
+        assert(it!=model.context.expected.end() && it->second.arguments.size()==20);
+        for(int field:{6,7,8,9,10,11,12,13,14,15,16,17,18,19}) {
+
             ++it->second.arguments[field];
             const int launches=uint4_calls;
             outer_rows=rows;active_row=0;norm_calls=0;bool rejected=false;
             try {model.emit_mlp_and_output(0,chunks.front());}
             catch(const std::runtime_error&) {rejected=true;}
             assert(rejected && uint4_calls==launches && active_row==0);
+            --it->second.arguments[field];
+        }
+    } else {
+        // Packed assignment count and the resolved tile/dispatch are part of
+        // the actual producer/consumer identity, not inferred from raw tokens.
+        auto it=std::find_if(model.context.expected.begin(),model.context.expected.end(),
+            [](const auto& pair){return pair.second.site_id==QWEN35_MOE_GROUPED_FP8_SITE;});
+        assert(it!=model.context.expected.end() && it->second.arguments.size()==17);
+        for(int field:{6,7,8,9,10,11,12,13,14,15,16}) {
+            ++it->second.arguments[field];
+            outer_rows=rows;active_row=0;norm_calls=0;bool rejected=false;
+            try {model.emit_mlp_and_output(0,chunks.front());}
+            catch(const std::runtime_error&) {rejected=true;}
+            assert(rejected && active_row==0);
             --it->second.arguments[field];
         }
     }
@@ -318,7 +407,7 @@ int main() {
         v3::run_case(cores,192,true,false,128);
         v3::run_case(cores,1,false,true);
     }
-    for(int rows:{1,64,128,192,512})v3::run_case(8,rows,false,false,0,true);
+    for(int cores:{4,6,8})for(int rows:{1,64,128,192,512})v3::run_case(cores,rows,false,false,0,true);
 }
 '''
     noops = set(re.findall(r'\b(rpu_launch_\w+)\(', methods))
@@ -331,6 +420,7 @@ int main() {
             'void Qwen3_5MoeModel::append_mlp_manifest_routes(',
             'void Qwen3_5MoeModel::emit_mlp_and_output(',
             'void Qwen3_5MoeModel::emit_router_and_shuffle(',
+            'void Qwen3_5MoeModel::emit_router_topk(',
             'void Qwen3_5MoeModel::emit_shared_expert(',
             'void Qwen3_5MoeModel::emit_routed_experts(',
             'void Qwen3_5MoeModel::emit_moe_merge_and_residual(',
@@ -342,11 +432,14 @@ int main() {
         ))
     # Consume-manifest helper calls always explicitly identify their slice.
     for marker, value in {
+        '__ROUTED_TP__': definition(header, '    int routed_expert_tp() const'),
+        '__ROUTED_WIDTH__': definition(header, '    int64_t physical_routed_intermediate() const'),
         '__TYPES__': types, '__CONSTANTS__': constants, '__ENUMS__': enums,
         '__DMA_ROUTE__': definition(native, 'constexpr int64_t qwen35_moe_dma_route('),
         '__SLICES__': definition(native, 'void for_each_moe_slice('),
         '__NOOPS__': noops, '__DECLARATIONS__': declarations, '__METHODS__': methods,
         '__LINEAR_INVOCATION__': definition(header, '    static int64_t linear_invocation('),
+        '__GROUPED_ROUTE_ARGUMENTS__': 'template<class T> T Align(T value,T unit) { return (value+unit-1)/unit*unit; }\n' + definition(native, 'std::vector<int64_t> qwen35_grouped_route_arguments('),
         '__GROUPED_LAYOUT__': (ROOT / 'src/core/rpu_grouped_linear_tiling.h').read_text(),
     }.items():
         code = code.replace(marker, value)
@@ -359,7 +452,8 @@ def test_real_mlp_slices_match_manifest_and_launcher_arguments(tmp_path):
         pytest.skip('C++ compiler unavailable')
     cpp, exe = tmp_path/'mlp.cpp', tmp_path/'mlp'
     cpp.write_text(source_probe())
-    built = subprocess.run([compiler, '-std=c++17', '-O0', str(cpp), '-o', str(exe)],
+    built = subprocess.run([compiler, '-std=c++17', '-O0', '-I', str(ROOT/'src/ops'), '-I', str(ROOT/'src/core'), str(cpp), '-o', str(exe)],
+
                            text=True, capture_output=True)
     assert built.returncode == 0, built.stderr
     run = subprocess.run([str(exe)], text=True, capture_output=True)

@@ -37,7 +37,17 @@ def _load_runtime_without_rpu():
     )
     checkpoint_validation.validate_rtc_w4_checkpoint_pair = None
     checkpoint_validation.validate_w8_nvfp4_checkpoint_pair = None
-    # runtime.py's line 41 is `from rpu_backend.runtime import rpu_env_bool`.
+    sorting = ModuleType("rpu_backend.adapters.wall_oss._sorting")
+    sorting.sorting_config_from_env = None
+    api_execution = ModuleType("rpu_backend.api._execution")
+    api_execution.bind_execution_session = None
+    api_execution.execution_serialized = lambda fn: fn
+    api_execution.native_execution_reconfigure = None
+    api_execution.normalize_rpu_execution = None
+    api_execution.resolve_component_rpu_execution = None
+    execution_planner = ModuleType("rpu_backend.runtime.execution_planner")
+    execution_planner.GRAPH_COMPOSITE_CHILD = "composite_child"
+    # runtime.py's line 42 is `from rpu_backend.runtime import rpu_env_bool`.
     # A bare ModuleType("rpu_backend") has no __path__, so without this entry
     # that import can only resolve when some EARLIER test in the same process
     # already put the real `rpu_backend.runtime` in sys.modules — i.e. the file
@@ -49,11 +59,21 @@ def _load_runtime_without_rpu():
         name: ModuleType(name)
         for name in (
             "rpu_backend",
+            "rpu_backend.api",
             "rpu_backend.adapters",
             "rpu_backend.adapters.wall_oss",
         )
     }
-    for stub in (vision, action, llm, checkpoint_validation, runtime_pkg):
+    for stub in (
+        vision,
+        action,
+        llm,
+        checkpoint_validation,
+        sorting,
+        api_execution,
+        execution_planner,
+        runtime_pkg,
+    ):
         stubs[stub.__name__] = stub
     return _exec_source(
         "wall_oss_runtime_cpu",

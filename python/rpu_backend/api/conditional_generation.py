@@ -45,6 +45,11 @@ class RPUModelForConditionalGeneration:
       - Video inputs have a controlled implementation path but are outside the
         certified Qwen3-VL 8B envelope. Batch > 1 is rejected. The only MoE
         admission is the exact Qwen3.5-35B-A3B TP8 checkpoint profiles.
+      - Qwen3-VL `image_grid_thw` (optional, the processor's `[N, 3]` grid)
+        sizes the cold Vision install: omitted, or grids within patch-grid
+        H/W <= 48 and <= 2048 patches per image, keep the default 48-row RoPE
+        table and 2048-patch KV cache; larger grids grow them to the largest
+        image, up to the native 4096 patches per image.
     """
 
     _RESERVED_HF_KWARGS = frozenset({
@@ -70,6 +75,7 @@ class RPUModelForConditionalGeneration:
         device: str | torch.device | None = None,
         rpu_execution=None,
         max_seq_len: int | None = None,
+        image_grid_thw=None,
         **hf_kwargs,
     ):
         if max_seq_len is not None:
@@ -89,7 +95,7 @@ class RPUModelForConditionalGeneration:
                     "model": ("num_cores",),
                     "prefill": (
                         "chunk_size", "padding_rows", "padding_budget", "linear_acc32",
-                        "fast_replay",
+                        "fast_replay", "moe_resident_prefill",
                     ),
                     # Structure/types only; after resolving the actual model
                     # adapter, tighten this to its declared fields below.
@@ -169,6 +175,16 @@ class RPUModelForConditionalGeneration:
             adapter_cls.preflight(config)
         if hasattr(adapter_cls, "preflight_execution"):
             adapter_cls.preflight_execution(config, execution_config)
+        vision_capacity = None
+        if image_grid_thw is not None:
+            # Cold install sizing from the caller's actual image grids; reject
+            # before any checkpoint weight is loaded.
+            if not hasattr(adapter_cls, "vision_capacity"):
+                raise ValueError(
+                    "RPUModelForConditionalGeneration.from_pretrained: "
+                    f"image_grid_thw sizes the Qwen3-VL Vision install; {arch} "
+                    "does not accept it")
+            vision_capacity = adapter_cls.vision_capacity(image_grid_thw)
 
         # Model-specific checkpoint formats get first refusal. In particular,
         # the Qwen3.5 loader preserves per-projection int8 tensors and scales;
@@ -200,6 +216,9 @@ class RPUModelForConditionalGeneration:
                         f"config/checkpoint location kwargs; unsupported {unsupported}."
                     )
                 runtime_load_kwargs = dict(cfg_kwargs)
+                if execution_config.get("model", {}).get("num_cores", 8) != 8:
+                    from rpu_backend.adapters.qwen3_vl import _qwen3_vl_core_topology
+                    runtime_load_kwargs["topology"] = _qwen3_vl_core_topology(config, execution_config)
                 if (move_to_rpu and config.text_config.hidden_size == 5120
                         and config.quant_config["method"] == "w8a16"):
                     runtime_load_kwargs["_mmap_w8_weights"] = True
@@ -213,8 +232,12 @@ class RPUModelForConditionalGeneration:
                         "AWQ loader accepts only config/checkpoint location "
                         f"kwargs; unsupported {unsupported}."
                     )
+                awq_load_kwargs = dict(cfg_kwargs)
+                if execution_config.get("model", {}).get("num_cores", 8) != 8:
+                    from rpu_backend.adapters.qwen3_vl import _qwen3_vl_core_topology
+                    awq_load_kwargs["topology"] = _qwen3_vl_core_topology(config, execution_config)
                 model = load_qwen3_vl_awq_imagetext(
-                    config, hf_repo_or_path, dtype=dtype, **cfg_kwargs)
+                    config, hf_repo_or_path, dtype=dtype, **awq_load_kwargs)
             elif is_w8a16_config(config):
                 if not is_qwen3_vl_w8a16_config(config):
                     raise UnsupportedModelError(
@@ -254,6 +277,8 @@ class RPUModelForConditionalGeneration:
 
         adapter = adapter_cls(model)
         adapter._rpu_execution = execution_config
+        if vision_capacity is not None:
+            adapter._rpu_vision_capacity = vision_capacity
 
         if move_to_rpu:
             return adapter.to_rpu()

@@ -1,6 +1,12 @@
 """Finite Pi0.5 core profiles; weights are prepared once before installation."""
 from numbers import Integral
 
+# The action horizon is the checkpoint's `chunk_size`; the finite admitted set is
+# the same one `pi05_action_rows_admitted` holds in
+# src/fused/rpu_pi05_denoise_step_model.cpp and `_ACTION_HORIZONS` in
+# examples/runners/pi05/optimized.py.
+ACTION_HORIZONS = (10, 50)
+
 
 def core_topology(execution=None):
     from rpu_backend.runtime.topology import DecoderTopology, execution_core_count
@@ -83,9 +89,11 @@ def validate_reduced_policy(policy, topology):
             != (27, 1152, 4304, 16) or len(vision.encoder.layers) != 27):
         raise ValueError("Pi0.5 reduced cores require the exact SigLIP27 tower")
     if (policy.model.config.max_action_dim != 32
-            or policy.model.config.chunk_size != 50
+            or policy.model.config.chunk_size not in ACTION_HORIZONS
             or policy.model.action_in_proj.out_features != 1024):
-        raise ValueError("Pi0.5 reduced cores require the full 50x32 action profile")
+        raise ValueError(
+            "Pi0.5 reduced cores require action horizon "
+            f"{' or '.join(str(h) for h in sorted(ACTION_HORIZONS))} and width 32")
 
 
 def pad_decoder_mlp_inplace(model, topology):

@@ -61,16 +61,18 @@ def _meta_assemble_inputs_embeds_parts(vocab, ids, merged_parts, runs, prefix_is
 
 
 @torch.library.impl("rpu::linear_w4a16", "Python")
-def _meta_linear_w4a16(input, weight, scale, bias=None):
+def _meta_linear_w4a16(input, weight, scale, bias=None, logical_out_features=-1):
     _require_fake(input, weight, scale, bias)
     if input.ndim < 1 or weight.ndim != 2:
         raise RuntimeError("linear_w4a16 requires input rank >= 1 and weight rank 2")
     if input.dtype != torch.float16 or weight.dtype != torch.uint8:
         raise RuntimeError("linear_w4a16 requires FP16 input and packed UINT8 weight")
-    k, n = input.shape[-1], weight.shape[0]
-    if (k <= 0 or k % 64 or n <= 0 or n % 128 or input.numel() == 0
-            or weight.shape[1] != k // 2):
-        raise RuntimeError("linear_w4a16 requires positive logical K%64=0, N%128=0 and packed [N,K/2]")
+    k = input.shape[-1]
+    n = weight.shape[0] if logical_out_features == -1 else logical_out_features
+    physical_n = ((n // 8 + 31) // 32) * 32 * 8
+    if (k <= 0 or k % 32 or n <= 0 or n % 128 or input.numel() == 0
+            or weight.shape != (physical_n, k // 2)):
+        raise RuntimeError("linear_w4a16 requires positive logical K%32=0, N%128=0 and complete N32K32 storage")
     scale_elements = ((k // 32 + 3) // 4) * ((n // 8 + 63) // 64) * 8 * 4 * 64
     if (scale.dtype != torch.float16 or scale.ndim != 2 or scale.shape[0] != 32
             or scale.numel() != scale_elements or not scale.is_contiguous()
@@ -199,6 +201,16 @@ def _meta_argmax_lastdim_host(logits):
     )
 
 
+@torch.library.impl("rpu::sample_topk_lastdim_host", "Python")
+def _meta_sample_topk_lastdim_host(logits, temperature, top_k, generator=None):
+    _require_fake(logits)
+    return torch.empty(
+        tuple(logits.shape[:-1]),
+        dtype=torch.long,
+        device="cpu",
+    )
+
+
 @torch.library.impl("rpu::zero_contiguous_tensor_blocks_sized", "Python")
 def _meta_zero_contiguous_tensor_blocks_sized(tensors, block_index):
     _require_fake(tensors)
@@ -283,7 +295,7 @@ def _meta_internvla_nextdit_forward(
         euler_steps,
         cross_context,
         self_k_caches, self_v_caches, cross_k_caches, cross_v_caches,
-        layer_outputs, collect_layer_outputs):
+        layer_outputs, collect_layer_outputs=False, planned_stage_descriptor=()):
     _require_fake(x)
     if use_action_encoder:
         return torch.empty(

@@ -41,8 +41,7 @@ void rpu_launch_pi05_vision_fc_weight_outer_spm_kernel(
         scale.sizes()==at::IntArrayRef({global_n}) && scale.nbytes()==size_t(global_n*2),
         "Pi Vision FC requires the original FP16 per-output-channel scale");
     const auto tile=rpu_pl_tiling::select_tile_acc16(M,N,K,false);
-    TORCH_CHECK(tile.m_tile==400 && tile.n_tile==80,"Pi Vision FC original tile identity drift");
-    constexpr auto id=KernelId::PI05_VISION_FC_WEIGHT_OUTER_W8A16_M768N80K128;
+    const auto id=parallel_linear_kernel_id(rpu_pl_tiling::WeightType::Int8,false,tile);
     auto writer=RpuKernelGraph::active().stage_kernel_ddr_registers(id,
         std::vector<GraphDdrRegisterOperandSpec>{
             {GraphDdrRegisterAbi{GraphDdrRegisterRole::Int8ModelWeight,
@@ -56,11 +55,14 @@ void rpu_launch_pi05_vision_fc_weight_outer_spm_kernel(
         rpu_ddr_flush(t->data_ptr());
     }
     auto* kernel=GET_KERNEL(id);
-    TORCH_CHECK(kernel,"Pi Vision FC experimental expansion symbol is missing");
+    TORCH_CHECK(kernel,"Pi Vision FC selected current Linear payload is missing");
     kernel->reset_regs();
     rpu_pl_tiling::set_parallel_linear_regs(*kernel,rpu_pl_tiling::ParallelLinearRegisterArgs{
         input,0,output,bias,M,N,K,1,8,K*2,N*2,0,uint16_t(column?1:0),1});
     writer.write(*kernel);
     auto* queue=GET_QUEUE(8);queue->set_broadcast_mode(true);
-    queue->enqueu_kernel(*kernel,{uint16_t(column?7:15),1,1},{0,1,2,3,4,5,6,7});
+    queue->enqueu_kernel(*kernel,
+        {uint16_t((N+tile.n_tile-1)/tile.n_tile),
+         uint16_t((M+tile.m_tile-1)/tile.m_tile),1},
+        {0,1,2,3,4,5,6,7});
 }

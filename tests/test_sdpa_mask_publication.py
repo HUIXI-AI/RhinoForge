@@ -13,7 +13,9 @@ def test_mask_goes_directly_to_its_stable_slot_with_padding_and_ordinals(tmp_pat
     if compiler is None:
         pytest.skip("host C++ compiler unavailable")
     source = (Path(__file__).parents[1] / "src/ops/rpu_sdpa.cpp").read_text()
-    method = _definition(source, "PreparedMask sdpa_prepare_mask(")
+    # The CPU reduce/pad helper and the publication that calls it.
+    method = (_definition(source, "static at::Tensor sdpa_mask_padded_cpu(") + "\n"
+              + _definition(source, "PreparedMask sdpa_prepare_mask("))
     program = r'''
 #include <cassert>
 #include <cmath>

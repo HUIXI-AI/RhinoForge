@@ -100,15 +100,18 @@ void check_vision_destroy_allowed(int64_t handle);
 SpmPipelineComponentLayout prepare_text(int64_t handle,
                                         int64_t execution_len,
                                         int64_t real_len,
-                                        at::IntArrayRef selected_descriptor = {});
+                                        at::IntArrayRef selected_descriptor = {},
+    bool partial_mrope = false);
 SpmPipelineComponentLayout prepare_text_deepstack1(
     int64_t handle,
     int64_t execution_len,
-    int64_t real_len, at::IntArrayRef selected_descriptor = {});
+    int64_t real_len, at::IntArrayRef selected_descriptor = {},
+    bool partial_mrope = false);
 SpmPipelineComponentLayout prepare_text_deepstack3(
     int64_t handle,
     int64_t execution_len,
-    int64_t real_len, at::IntArrayRef selected_descriptor = {});
+    int64_t real_len, at::IntArrayRef selected_descriptor = {},
+    bool partial_mrope = false);
 SpmPipelineCausalPrefillDryLayout prepare_multiview_text_dry(
     int64_t handle,
     int64_t execution_len);
@@ -222,7 +225,8 @@ int64_t rpu_qwen3vl_pooler_spm_z1_prepare(
     int64_t real_len,
     int64_t retained_deepstack_count = 0,
     at::IntArrayRef vision_stage_descriptor = {},
-    at::IntArrayRef text_stage_descriptor = {});
+    at::IntArrayRef text_stage_descriptor = {},
+    bool partial_mrope = false);
 void rpu_qwen3vl_pooler_spm_z1_unprepare(
     int64_t vision_handle,
     int64_t text_handle,

@@ -21,6 +21,7 @@
 
 #include "fused_model_base.h"
 #include "g05_nvfp4.h"
+#include "qwen35_text_nvfp4.h"
 #include "rpu_helpers.h"          // SdpaConfig, SdpaKernelType, sdpa_is_valid_chunk_size
 #include "rpu_math_precision.h"
 
@@ -156,6 +157,11 @@ public:
     // G05 opt-in, bound once before weights. Linear accumulation is separate.
     void set_high_precision(bool enabled);
     void set_fast_replay(bool enabled);
+    // Opt-in: a fast-replay multi-token prefill from position 0 skips the forced
+    // CPU flush of the recurrent/conv states. Its first chunk zero-fills them in
+    // SPM and never reads DDR, and every backend CPU writer (zero_, fill_, uploads)
+    // publishes its own range, so no dirty CPU line can land on the device's state.
+    void set_initial_prefill_state_flush_skip(bool enabled);
     // G0.5 action expert: all-full-attention Qwen3.5 with host-precomputed
     // AdaLN modulation and sparse per-layer read-only prefix KV.
     void enable_action_mode();
@@ -221,11 +227,17 @@ public:
         int64_t requested_chunk_size, bool include_action_io,
         int64_t action_route_flags, int64_t graph_lifecycle, int64_t num_steps);
     void set_action_chunk_size(int64_t chunk_size);
+    // Valid action rows inside the physical (multiple-of-16) horizon. Padded
+    // rows are computed but never attended: attention keys end at prefix + valid.
+    void set_action_valid_len(int64_t valid_len);
     void stage_action_chunk_size(uint64_t token, int64_t chunk_size);
     void enable_execution_reconfigure();
     void set_retained_prefill_graph(bool enabled);
 
 protected:
+    int64_t resolve_model_mlp_intermediate_size(int64_t logical_size) const override;
+    bool mlp_packed_w4_ = false;
+    bool mlp_awq_g128_ = false;
     DecoderExecutionTopology resolve_model_execution_topology(
         int64_t num_q_heads, int64_t num_kv_heads, int64_t head_dim,
         int64_t hidden_size, int64_t intermediate_size) const override;
@@ -273,10 +285,20 @@ private:
         const LayoutContext& layout) const;
     std::vector<int64_t> gdn_mask_schedule_arguments(
         const FmbThreeStageChunkPlan& plan) const;
+    static constexpr int64_t kTextGdnInputWorkspaceSite = 7200073926787961303LL;
+    static constexpr int64_t kTextNvfp4TablesSite = 3184997657402357068LL;
+    bool use_text_gdn_input_workspace() const;
+    static int gdn_input_workspace_slot(const char* name);
+    std::vector<int64_t> gdn_input_workspace_arguments(int64_t rows) const;
+    int64_t gdn_input_workspace_offset(const char* name, int64_t rows) const;
+    bool has_text_gdn_glast_local_capability() const;
+    std::vector<int64_t> text_gdn_glast_local_identity() const;
+    bool use_text_gdn_glast_local(int64_t rows) const;
+    std::vector<int64_t> text_gdn_glast_local_arguments(int64_t rows) const;
     bool use_g05_gdn_local_slice(int64_t rows) const;
     std::vector<int64_t> g05_gdn_local_slice_arguments(int64_t rows) const;
     int gdn_tp() const { return num_cores() == 8 ? 8 : 4; }
-    int lm_head_tp() const { return num_cores() == 8 ? 8 : 4; }
+    int lm_head_tp() const { return num_cores(); }
     int64_t text_ring_route(int64_t rows, int64_t cols) const;
     std::vector<int64_t> cold_topology_arguments() const;
     static int64_t linear_invocation(
@@ -517,8 +539,27 @@ public:
     // 于是事后读基类那份永远是 16。这份只在 prefill forward 里更新,拿得到真实值。
     // 0 = 本 handle 还没跑过 prefill。与 cold per-handle cap 配套用于对账。
     int64_t last_prefill_chunk_size() const { return last_prefill_chunk_size_; }
+    // Diagnostic: recipes bound, bodies skipped, ordinary bodies in scope, last rejection.
+    std::vector<int64_t> checked_decode_replay_counters() const;
+    // Runs [N, 1024] candidate rows inside every captured decode step and writes
+    // the row to `output`. Cold: call it before the first decode Graph is captured.
+    void set_decode_candidate_head(const at::Tensor& weight, const at::Tensor& output);
 
 private:
+    // Exact 0.8B ordinary decode body replay (rpu_qwen3_5_decode_replay.cpp).
+    struct CheckedDecodeReplayState;
+    bool begin_checked_decode_replay(
+        const at::Tensor& hidden, at::TensorList k, at::TensorList v,
+        const std::optional<at::Tensor>& mask, int64_t position, bool is_causal,
+        at::IntArrayRef descriptor);
+    bool try_checked_layer_body_replay();
+    void finish_checked_decode_replay();
+    void cancel_checked_decode_replay() noexcept;
+    bool checked_decode_replay_skipped() const;
+    void emit_decode_candidate_head(const at::Tensor& hidden);
+    at::Tensor decode_head_w_, decode_head_out_;
+    std::shared_ptr<CheckedDecodeReplayState> checked_decode_replay_state_;
+    bool checked_decode_replay_scope_active_ = false;
 
     SdpaConfig make_sdpa_config(int mask = 1) const {
         // The adapter expands effective full-attention KV heads to NUM_CORES;
@@ -553,6 +594,11 @@ private:
     std::vector<int64_t> kvinsert_cost_weight_identity() const override {
         if (layer_weights_.empty()) return {};
         std::vector<int64_t> identity{1};
+        if (use_text_gdn_input_workspace()) {
+            identity.push_back(kTextGdnInputWorkspaceSite);
+            const auto schedule = gdn_input_workspace_arguments(640);
+            identity.insert(identity.end(), schedule.begin(), schedule.end());
+        }
         if (high_precision_) {
             identity.push_back(high_precision_site());
             const auto math = high_precision_arguments();
@@ -566,6 +612,11 @@ private:
         identity.push_back(static_cast<int64_t>(action_nvfp4_.enabled()));
         for (const auto& table : action_nvfp4_.values)
             append_kvinsert_cost_tensor_identity(identity, table);
+        if (text_nvfp4_.enabled()) {
+            identity.push_back(kTextNvfp4TablesSite);
+            for (const auto& table : text_nvfp4_.values)
+                append_kvinsert_cost_tensor_identity(identity, table);
+        }
         identity.insert(identity.end(), {
             static_cast<int64_t>(linear_acc32_),
             static_cast<int64_t>(has_gdn_),
@@ -593,6 +644,10 @@ private:
         if (!action_mode_ && text_gdn_owner_rms_available_) {
             const auto args = text_gdn_owner_rms_arguments();
             identity.insert(identity.end(), args.begin(), args.end());
+        }
+        if (has_text_gdn_glast_local_capability()) {
+            const auto schedule = text_gdn_glast_local_identity();
+            identity.insert(identity.end(), schedule.begin(), schedule.end());
         }
         if (use_g05_gdn_local_slice(256)) {
             // Same weights, different BASE slice launch/address schedule.
@@ -737,6 +792,7 @@ private:
     }
 
     G05Nvfp4Tables             action_nvfp4_;
+    Qwen35TextNvfp4Tables      text_nvfp4_;
     bool                       action_nvfp4_o_resident_available_ = false;
     std::pair<at::Tensor, at::Tensor> action_nvfp4_o_resident_;
     bool                       action_nvfp4_down_resident_available_ = false;
@@ -818,6 +874,7 @@ private:
     FmbGraphLifecycle          action_descriptor_graph_lifecycle_ =
         FmbGraphLifecycle::COMPOSITE_CHILD;
     bool                       fast_replay_enabled_ = false;
+    bool                       initial_prefill_state_flush_skip_ = false;
     bool                       fast_replay_active_ = false;
     bool                       retained_prefill_graph_ = false;
     at::Tensor                 adaptive_mod_ref_;
@@ -847,6 +904,7 @@ private:
     int64_t                    action_dim_ = 0;
     int64_t                    action_dim_pad_ = 0;
     int64_t                    action_len_ = 0;
+    int64_t                    action_valid_len_ = 0;
     c10::Half                  action_euler_scale_ = c10::Half(0.0f);
     bool                       action_euler_scale_pinned_ = false;
     bool                       action_step_active_ = false;

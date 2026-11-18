@@ -65,6 +65,7 @@ def test_actual_launcher_bounds_typed_operands_and_live_registers(tmp_path):
     declaration = header[start:header.index(";",start)+1]
     harness = r'''
 #include "rpu_linear_tiling.h"
+#include "rpu_pi_wall_tiling.h"
 #include <cassert>
 #include <functional>
 #include <stdexcept>
@@ -103,6 +104,7 @@ struct SpmAllocator {
 } spm;
 #define SPM_ALLOC spm
 enum class KernelId {WALL_PREFILL_GATE_UP_SWIGLU_W8A16_M320N112};
+KernelId pi_wall_kernel_id(size_t) { return KernelId::WALL_PREFILL_GATE_UP_SWIGLU_W8A16_M320N112; }
 enum class GraphDdrRegisterRole {Int8ModelWeight,PerChannelScale};
 enum class GraphDdrRegisterAccess {Read};
 enum class GraphDdrRegisterEncoding {DevAddrShift8LoHi};
@@ -112,7 +114,7 @@ struct GraphDdrRegisterAbi {
 };
 struct GraphDdrRegisterOperandSpec {GraphDdrRegisterAbi abi;at::Tensor tensor;};
 struct Kernel_t {
-  std::array<uint16_t,32> regs{};
+  std::array<uint16_t,64> regs{};
   void reset_regs(){regs.fill(0);}
   void set_regs(int slot,uint16_t value){regs.at(slot)=value;}
   uint32_t pair(int lo) const{return regs[lo]|uint32_t(regs[lo+1])<<16;}
@@ -138,7 +140,7 @@ struct RpuKernelGraph {
     ++stages;check(!deny);
     assert(id==KernelId::WALL_PREFILL_GATE_UP_SWIGLU_W8A16_M320N112);
     assert(operands.size()==4);
-    const int slots[]={2,20,24,26};
+    const int slots[]={2,20,32,34};
     for(int i=0;i<4;++i) {
       assert(operands[i].abi.lo==slots[i] && operands[i].abi.hi==slots[i]+1);
       assert(operands[i].abi.role==(i%2==0?GraphDdrRegisterRole::Int8ModelWeight:GraphDdrRegisterRole::PerChannelScale));
@@ -154,7 +156,7 @@ struct Queue {
   void set_broadcast_mode(bool value){broadcast=value;}
   void enqueu_kernel(Kernel_t&,std::vector<int> grid,std::vector<uint8_t> cores) {
     assert(broadcast && writes>submits);
-    assert(grid==std::vector<int>({11,1,1}));
+    assert((grid[0]==10 || grid[0]==13 || grid[0]==16 || grid[0]==26) && grid[1]==1 && grid[2]==1);
     assert(cores==std::vector<uint8_t>({0,1,2,3,4,5,6,7}));++submits;
   }
 } queue;
@@ -188,11 +190,13 @@ int main() {
     launch(v,m,input,output);
     assert(writes==old_writes+1 && graph.retained.size()==size_t(old_retained+4));
     assert(kernel.pair(0)==input && kernel.pair(4)==output && kernel.pair(6)==0);
-    assert(kernel.regs[8]==m && kernel.regs[9]==0 && kernel.pair(10)==1216);
+    assert(kernel.regs[8]==1 && kernel.regs[9]==m && kernel.pair(10)==1216);
     assert(kernel.regs[12]==2560 && kernel.regs[13]==160 && kernel.regs[14]==0 && kernel.regs[15]==8);
-    assert(kernel.pair(16)==5120 && kernel.pair(18)==2432 && kernel.regs[22]==1 && kernel.regs[23]==1);
+    assert(kernel.pair(16)==5120 && kernel.pair(18)==2432 && kernel.pair(22)==0 && kernel.pair(24)==0);
+    assert(kernel.regs[26]==2 && kernel.regs[27]==1);
     for(int i=28;i<32;++i)assert(kernel.regs[i]==0);
-    for(auto pair:std::vector<std::pair<int,int>>{{0,2},{2,20},{1,24},{3,26}}) {
+    for(int i=36;i<64;++i)assert(kernel.regs[i]==0);
+    for(auto pair:std::vector<std::pair<int,int>>{{0,2},{2,20},{1,32},{3,34}}) {
       assert(kernel.pair(pair.second)==uint32_t(v[pair.first].address>>8));
     }
     assert(graph.last[0].tensor.address==v[0].address && graph.last[1].tensor.address==v[2].address);

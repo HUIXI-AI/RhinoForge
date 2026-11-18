@@ -1,4 +1,4 @@
-"""Offline W8A16/W4A16 quantization for Qwen3.5 HF checkpoints.
+"""Offline FP16 export and W8A16/W4A16 quantization for Qwen3.5 checkpoints.
 
 Quantizes the text-backbone projections listed by
 ``adapters.qwen3_5.quant_scope`` with per-output-channel W8 or group-wise W4
@@ -18,6 +18,7 @@ from their source to benefit from this correction.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -56,7 +57,7 @@ except ImportError:  # standalone: bypass any unrelated editable package install
 
 ARCHITECTURE = "Qwen3_5ForConditionalGeneration"
 FORMAT_VERSION = 1
-METHODS = ("w8a16", "w4a16_pgrp")
+METHODS = ("fp16", "w8a16", "w4a16_pgrp")
 PROFILES = ("w4_main_w8_gdn", "w8_main_w8_gdn", "w4_mlp_only",
             "w4_mlp_w8_attn_gdn", LEGACY_W8A16_PROFILE)
 DEFAULT_GROUP_SIZE = 32
@@ -66,6 +67,23 @@ SKIP_MODULES = ["lm_head", "embed_tokens", "visual", "mtp", "conv1d"]
 def _as_fp16(tensor: torch.Tensor) -> torch.Tensor:
     """Use the tensor's stored precision, without a lossy BF16 intermediate."""
     return tensor.to(torch.float16)
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(8 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _checked_fp16(tensor: torch.Tensor, name: str) -> torch.Tensor:
+    converted = _as_fp16(tensor)
+    flat = converted.view(-1)
+    for start in range(0, flat.numel(), 1 << 20):
+        if not bool(torch.isfinite(flat[start:start + (1 << 20)]).all()):
+            raise ValueError(f"nonfinite value or FP16 overflow in {name!r}")
+    return converted
 
 
 def _layer_types(config: dict) -> list[str]:
@@ -97,13 +115,19 @@ def _checkpoint_layout(src: Path) -> tuple[bool, list[str], dict[str, str], dict
         f"no model.safetensors or model.safetensors.index.json in {src}")
 
 
-def _copy_sidecar_files(src: Path, dst: Path, shards: set[str]) -> None:
+def _copy_sidecar_files(src: Path, dst: Path, shards: set[str]) -> list[str]:
     skip = set(shards)
-    skip.update({"model.safetensors", "model.safetensors.index.json", "config.json"})
+    skip.update({"model.safetensors", "model.safetensors.index.json", "config.json",
+                 "SHA256SUMS"})
+    copied = []
     for path in sorted(src.iterdir()):
-        if path.name in skip or not path.is_file():
+        if (path.name in skip or not path.is_file()
+                or path.name.endswith((".bin", ".pt", ".pth", ".safetensors",
+                                       ".bin.index.json", ".safetensors.index.json"))):
             continue
         shutil.copy2(path, dst / path.name)
+        copied.append(path.name)
+    return copied
 
 
 def _quant_config(is_full, method: str | None, group_size: int,
@@ -219,9 +243,15 @@ def convert_checkpoint(src: str | Path, dst: str | Path, *,
             f"expected architectures[0]=={ARCHITECTURE!r}, got {architectures[0]!r}")
     if "quant_config" in config:
         raise ValueError(f"{src} already declares a quant_config; nothing to do")
+    if any(owner.get("quantization_config") is not None
+           or (owner is not config and owner.get("quant_config") is not None)
+           for owner in (config, config.get("text_config", {}),
+                         config.get("vision_config", {}))):
+        raise ValueError("conversion requires original weights without quantization metadata")
 
     is_full = is_full_from_layer_types(_layer_types(config))
-    quant_config = _quant_config(is_full, method, group_size, profile)
+    fp16_export = method == FP16
+    quant_config = None if fp16_export else _quant_config(is_full, method, group_size, profile)
     if profile == LEGACY_W8A16_PROFILE:
         validate_legacy_text_profile(dict(config, quant_config=quant_config))
     specs = resolve_quant_specs(is_full, quant_config)
@@ -231,6 +261,11 @@ def convert_checkpoint(src: str | Path, dst: str | Path, *,
     }
 
     is_sharded, shards, weight_map, index = _checkpoint_layout(src)
+    if fp16_export and any(not isinstance(name, str) or Path(name).name != name
+                           or not name.endswith(".safetensors") for name in shards):
+        raise ValueError("source shards must be adjacent safetensors files")
+    if fp16_export and is_sharded and (src / "model.safetensors").exists():
+        raise ValueError("ambiguous source checkpoint layout")
     tmp = dst.with_name(f".{dst.name}.tmp-{os.getpid()}")
     if tmp.exists():
         raise FileExistsError(f"temporary output already exists: {tmp}")
@@ -245,12 +280,21 @@ def convert_checkpoint(src: str | Path, dst: str | Path, *,
     }
     new_weight_map = dict(weight_map) if is_sharded else {}
     seen_projections: set[str] = set()
+    source_files = {}
+    source_locations = {}
+    if fp16_export:
+        source_files["config.json"] = _sha256(src / "config.json")
+        if is_sharded:
+            source_files["model.safetensors.index.json"] = _sha256(src / "model.safetensors.index.json")
 
     try:
         tmp.mkdir(parents=True)
         for shard_idx, shard in enumerate(shards, start=1):
             print(f"[convert_qwen3_5] shard {shard_idx}/{len(shards)}: {shard}",
                   flush=True)
+            if fp16_export:
+                before = (src / shard).stat()
+                source_files[shard] = _sha256(src / shard)
             tensors = load_file(src / shard)
             out: dict[str, torch.Tensor] = {}
 
@@ -259,6 +303,22 @@ def convert_checkpoint(src: str | Path, dst: str | Path, *,
                 stats["bytes_in"] += tensor.numel() * tensor.element_size()
 
                 spec = expected.get(name)
+                if fp16_export:
+                    if name in source_locations:
+                        raise ValueError(f"duplicate source tensor {name!r}")
+                    source_locations[name] = shard
+                    if name.endswith((".qweight", ".qzeros", ".scales", ".weight_scale", ".weight_zero")):
+                        raise ValueError(f"source contains quantized tensor {name!r}")
+                    if tensor.is_complex() or (name.endswith(".weight") and not tensor.is_floating_point()):
+                        raise TypeError(f"FP16 export requires floating weights: {name!r}")
+                    if spec is not None:
+                        seen_projections.add(name)
+                        stats["projection_counts"][FP16] += 1
+                    converted = _checked_fp16(tensor, name) if tensor.is_floating_point() else tensor
+                    out[name] = converted
+                    stats["n_copied"] += 1
+                    stats["bytes_out"] += converted.numel() * converted.element_size()
+                    continue
                 if spec is not None:
                     if not tensor.is_floating_point():
                         raise TypeError(
@@ -300,6 +360,10 @@ def convert_checkpoint(src: str | Path, dst: str | Path, *,
             save_file(out, tmp / shard, metadata={"format": "pt"})
             del tensors
             del out
+            if fp16_export:
+                after = (src / shard).stat()
+                if (before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
+                    raise ValueError(f"source shard changed during conversion: {shard}")
 
         missing = sorted(set(expected) - seen_projections)
         if missing:
@@ -307,6 +371,8 @@ def convert_checkpoint(src: str | Path, dst: str | Path, *,
                 f"checkpoint is missing {len(missing)} projection weight(s) the "
                 f"Qwen3.5 quantization scope requires: {missing[:8]}"
                 f"{' ...' if len(missing) > 8 else ''}")
+        if fp16_export and is_sharded and source_locations != weight_map:
+            raise ValueError("source shard contents disagree with weight map")
 
         if is_sharded:
             new_index = dict(index)
@@ -319,11 +385,33 @@ def convert_checkpoint(src: str | Path, dst: str | Path, *,
 
         config["torch_dtype"] = "float16"
         config["dtype"] = "float16"
-        config["quant_config"] = quant_config
+        if fp16_export:
+            for name in ("text_config", "vision_config"):
+                if isinstance(config.get(name), dict):
+                    config[name]["dtype"] = "float16"
+                    config[name]["torch_dtype"] = "float16"
+            copied = _copy_sidecar_files(src, tmp, set(shards))
+            source_files.update({name: _sha256(tmp / name) for name in copied})
+            for name in ("config.json", "model.safetensors.index.json"):
+                if name in source_files and _sha256(src / name) != source_files[name]:
+                    raise ValueError(f"source metadata changed during conversion: {name}")
+            config["weight_conversion"] = {
+                "method": FP16,
+                "producer": "rpu_backend.quant.convert_qwen3_5",
+                "producer_sha256": _sha256(Path(__file__)),
+                "torch_version": torch.__version__,
+                "source_files_sha256": dict(sorted(source_files.items())),
+                "source_sha256": hashlib.sha256(json.dumps(source_files, sort_keys=True,
+                                                          separators=(",", ":")).encode()).hexdigest(),
+                "casting": "stored floating dtype directly to float16; integer buffers unchanged",
+            }
+        else:
+            config["quant_config"] = quant_config
         with (tmp / "config.json").open("w") as f:
             json.dump(config, f, indent=2)
 
-        _copy_sidecar_files(src, tmp, set(shards))
+        if not fp16_export:
+            _copy_sidecar_files(src, tmp, set(shards))
         tmp.rename(dst)
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -335,10 +423,11 @@ def convert_checkpoint(src: str | Path, dst: str | Path, *,
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--src", required=True, help="source HF checkpoint directory")
-    parser.add_argument("--dst", required=True, help="output quantized checkpoint directory")
+    parser.add_argument("--dst", required=True, help="output checkpoint directory")
     precision = parser.add_mutually_exclusive_group()
     precision.add_argument("--method", choices=METHODS,
-                           help="w8a16 = per-output-channel int8; "
+                           help="fp16 = floating-point export without quantization; "
+                                "w8a16 = per-output-channel int8; "
                                 "w4a16_pgrp = group-wise int4 along K "
                                 "(default: w8a16)")
     precision.add_argument("--profile", choices=PROFILES,

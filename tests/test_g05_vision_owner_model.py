@@ -152,7 +152,8 @@ struct Norms{at::Tensor ln1_w,ln1_b,ln2_w,ln2_b,q_b,k_b,v_b,o_b,fc1_b,fc2_b;};
 void append_kvinsert_cost_scalar_identity(std::vector<int64_t>& out,double value){int64_t bits;std::memcpy(&bits,&value,8);out.push_back(bits);}
 void append_kvinsert_cost_tensor_identity(std::vector<int64_t>& out,const at::Tensor& tensor){out.push_back(tensor.owner);}
 namespace detail {int64_t layout_mix(int64_t a,int64_t b){return uint64_t(a)*131+uint64_t(b);}}
-enum class KernelId {G05_VISION_FC2_WEIGHT_OUTER_W8A16_ACC16_M768N1024K512,G05_VISION_OWNER_REDUCE_LAYERNORM_M256N1024,G05_VISION_XOR3_COMPACT_RESIDUAL_RAW_FULL_M256N1024,G05_VISION_QKV_FP16_ACC32_M256N128K1024,G05_VISION_QKV_W8A16_ACC32_M256N128K1024,G05_VISION_QKV_W8A16_ACC16_M256N128K1024,PL_AT_W8A16_M512N48,PL_AT_W8A16_ACC32_M288N80};
+enum class KernelId {G05_VISION_FC2_WEIGHT_OUTER_W8A16_ACC16_M768N1024K512,G05_VISION_OWNER_REDUCE_LAYERNORM_M256N1024,G05_VISION_XOR3_COMPACT_RESIDUAL_RAW_FULL_M256N1024,G05_VISION_QKV_FP16_ACC32_M256N128K1024,G05_VISION_QKV_W8A16_ACC32_M256N128K1024,G05_VISION_QKV_W8A16_ACC16_M256N128K1024,PL_AUTOTILE_BEGIN=1000};
+inline KernelId parallel_linear_kernel_id(rpu_pl_tiling::WeightType type,bool acc32,const rpu_pl_tiling::TilePick&tile){return static_cast<KernelId>(static_cast<size_t>(KernelId::PL_AUTOTILE_BEGIN)+rpu_pl_tiling::parallel_kernel_ordinal(type,acc32,tile));}
 struct KernelCache{ bool is_initialized()const{return true;} void* get(KernelId id){return has_loaded(id)?this:nullptr;}
     bool owner=true,companion=true; int queries=0;
     static KernelCache& instance(){static KernelCache cache;return cache;}
@@ -302,7 +303,7 @@ int main(){
     cpp = chr(10).join(('#include <array>', '#include "' + str(ROOT / "src/ops/rpu_linear_tiling.h") + '"', cpp))
     path, exe = tmp_path / "owner.cpp", tmp_path / "owner"
     path.write_text(cpp)
-    compiled = subprocess.run(["c++", "-std=c++17", "-Wall", "-Wextra", "-Werror", str(path), "-o", str(exe)], capture_output=True, text=True)
+    compiled = subprocess.run(["c++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-I", str(ROOT / "src/ops"), "-I", str(ROOT / "src/core"), str(path), "-o", str(exe)], capture_output=True, text=True)
     assert compiled.returncode == 0, compiled.stderr
     run = subprocess.run([str(exe)], capture_output=True, text=True)
     assert run.returncode == 0, run.stderr

@@ -128,6 +128,41 @@ class RPUCache(HFCache):
 
     # Mark this as a valid cache type for HuggingFace
     is_sliding_window = False
+    # Native graphs own these buffers. HF compilation and speculative rollback
+    # must not infer support from the empty HF layer container.
+    is_compileable = False
+    is_croppable = False
+
+    @property
+    def batch_size(self) -> int:
+        return self._batch_size
+
+    @batch_size.setter
+    def batch_size(self, value):
+        # Keep the existing mutable metadata contract, including derived caches
+        # that allocate their own backing instead of calling this constructor.
+        self._batch_size = value
+
+    @property
+    def max_batch_size(self) -> int:
+        return self.batch_size
+
+    @property
+    def max_cache_len(self) -> int:
+        return self.max_seq_len
+
+    @property
+    def is_initialized(self) -> bool:
+        return len(self.k_caches) == len(self.v_caches) == self.num_layers
+
+    @property
+    def is_sliding(self) -> list[bool]:
+        # Visibility, including model-specific windows, belongs to fused masks.
+        return [False] * self.num_layers
+
+    @property
+    def is_linear(self) -> list[bool]:
+        return [False] * self.num_layers
 
     def __init__(
         self,
@@ -297,9 +332,16 @@ class RPUCache(HFCache):
         """Get the current sequence length (total tokens cached)."""
         return self.position
 
-    def get_max_length(self) -> int:
+    def get_max_length(self, layer_idx: int | None = None) -> int:
         """Get the maximum cache length."""
         return self.max_seq_len
+
+    def get_max_cache_shape(self, layer_idx: int = 0) -> int:
+        """Compatibility alias for Transformers versions before 5.19."""
+        return self.get_max_length(layer_idx)
+
+    def get_query_offset(self, layer_idx: int = 0) -> int:
+        return self.get_seq_length(layer_idx)
 
     def get_usable_length(self, new_seq_length: int, layer_idx: int = 0) -> int:
         """Get the usable length considering the new sequence."""
@@ -356,32 +398,74 @@ class RPUCache(HFCache):
     # Transformers Cache Interface Methods
     # =========================================================================
 
-    def get_mask_sizes(self, cache_position, layer_idx: int = 0):
-        """
-        Get mask sizes for attention mask creation.
-        Required by transformers masking_utils.py.
+    def get_mask_sizes(self, query_length=None, layer_idx: int = 0, *, cache_position=None):
+        """Logical visible rows before forward, for both HF mask interfaces.
 
-        Returns:
-            Tuple of (kv_length, kv_offset)
-            - kv_length: Total length of KV cache
-            - kv_offset: Offset for the current position
+        Transformers 5.3 passes a position tensor; 5.19 passes query length.
+        Neither interface changes the native cache layout or writes its state.
         """
-        kv_length = self.position
-        kv_offset = 0
-        return kv_length, kv_offset
+        if cache_position is not None:
+            if query_length is not None:
+                raise ValueError("pass query_length or cache_position, not both")
+            query_length = cache_position
+        if isinstance(query_length, torch.Tensor):
+            if query_length.ndim != 1:
+                raise ValueError("cache_position must be a one-dimensional tensor")
+            query_length = query_length.shape[0]
+        if (isinstance(query_length, bool) or not isinstance(query_length, Integral)
+                or query_length < 0):
+            raise ValueError("query_length must be a non-negative integer")
+        length = self.position + int(query_length)
+        if length > self.max_seq_len:
+            raise ValueError("attention query exceeds cache capacity")
+        return length, 0
 
-    def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
-        """
-        Update cache with new key/value states.
-        This is a no-op for RPUCache since fused attention handles cache update internally.
+    def _unsupported_hf_operation(self, operation):
+        raise NotImplementedError(
+            f"{type(self).__name__}.{operation} is not supported by the native cache; "
+            "use the installed fused model and reset() to start a new sequence"
+        )
 
-        For compatibility, returns the input key/value states unchanged.
-        """
-        # Note: In fused attention mode, the cache update is handled by
-        # rpu_launch_insert_kcache_spm_unified and rpu_launch_insert_vcache_spm_unified
-        # within torch.ops.rpu.fused_qkv_attention.
-        # This method is only for fallback compatibility.
-        return key_states, value_states
+    def update(self, key_states, value_states, layer_idx, *args, **kwargs):
+        """HF attention cannot update native swizzled buffers."""
+        self._unsupported_hf_operation("update")
+
+    def update_conv_state(self, *args, **kwargs):
+        self._unsupported_hf_operation("update_conv_state")
+
+    def update_recurrent_state(self, *args, **kwargs):
+        self._unsupported_hf_operation("update_recurrent_state")
+
+    def has_previous_state(self, *args, **kwargs):
+        self._unsupported_hf_operation("has_previous_state")
+
+    def update_indexer(self, *args, **kwargs):
+        self._unsupported_hf_operation("update_indexer")
+
+    def reorder_cache(self, beam_idx):
+        self._unsupported_hf_operation("reorder_cache")
+
+    def batch_repeat_interleave(self, repeats):
+        self._unsupported_hf_operation("batch_repeat_interleave")
+
+    def batch_select_indices(self, indices):
+        self._unsupported_hf_operation("batch_select_indices")
+
+    def crop(self, *args, **kwargs):
+        # In particular, hybrid recurrent states cannot be rewound with KV.
+        self._unsupported_hf_operation("crop")
+
+    def activate_past_recording(self):
+        self._unsupported_hf_operation("activate_past_recording")
+
+    def early_initialization(self, *args, **kwargs):
+        self._unsupported_hf_operation("early_initialization")
+
+    def prefetch(self, *args, **kwargs):
+        self._unsupported_hf_operation("prefetch")
+
+    def offload(self, *args, **kwargs):
+        self._unsupported_hf_operation("offload")
 
     def __len__(self) -> int:
         """Return number of layers in cache."""
@@ -524,12 +608,14 @@ class RPUCache(HFCache):
         if topology is None:
             from rpu_backend.runtime.topology import execution_core_count, resolve_decoder_topology
             from rpu_backend.api._execution import (
-                validate_qwen3_core_profile, qwen3_vl_text_core_profile,
+                llama_core_profile, validate_qwen3_core_profile, qwen3_vl_text_core_profile,
             )
             cores = execution_core_count(getattr(model, "_rpu_execution", None))
             if cores != NUM_CORES:
                 if getattr(config, "model_type", None) == "qwen3_vl_text":
                     qwen3_vl_text_core_profile(config, cores)
+                elif getattr(config, "model_type", None) == "llama":
+                    llama_core_profile(config, cores)
                 else:
                     validate_qwen3_core_profile(config, cores)
                 topology = resolve_decoder_topology(

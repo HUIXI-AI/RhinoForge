@@ -1,5 +1,6 @@
 #pragma once
 #include "rpu_linear_tiling.h"
+#include "rpu_specialized_linear_contracts.h"
 
 // Same exact M51 bounds for the legacy pair and private fused producer.
 // Grid8 fusion resets its core phase counter in every launch/replay packet.
@@ -30,20 +31,19 @@ inline void launch_hyvla_gateup_resident_spm(
                   "HyVLA resident Gate/Up requires disjoint SPM operands");
     }
   }
-  auto* kernel = fused_swiglu
-      ? RpuKernelGraph::active().get_kernel_reset("hyvla_resident_swiglu_s51")
-      : GET_KERNEL(KernelId::WALL_ACTION_GATE_UP_FP16_SPM_WEIGHT_M592N32K128);
+  const auto id = fused_swiglu ? KernelId::HYVLA_RESIDENT_SWIGLU_FP16_V2
+                                : KernelId::HYVLA_GATEUP_RESIDENT_PAIR_FP16_V2;
+  auto* kernel = GET_KERNEL(id);
   TORCH_CHECK(kernel != nullptr, "HyVLA resident Gate/Up FP16 payload unavailable");
   kernel->reset_regs();
   rpu_pl_tiling::set_parallel_linear_regs(*kernel,
       rpu_pl_tiling::ParallelLinearRegisterArgs{
           input_spm, 0, gate_output_spm, 0, 51, 256, 1024, 0, 8,
-          1024 * sizeof(c10::Half), 256 * sizeof(c10::Half), 0, 1, 1});
+          1024 * sizeof(c10::Half), 256 * sizeof(c10::Half), 0, 1, 2});
   rpu_pl_tiling::set_u32_reg_pair(*kernel, 2, gate_weight_spm);
-  rpu_pl_tiling::set_u32_reg_pair(*kernel, 24, up_weight_spm);
-  rpu_pl_tiling::set_u32_reg_pair(*kernel, 30, up_output_spm);
-  if (fused_swiglu) kernel->set_regs(128, uint32_t{0});
+  rpu_pl_tiling::set_u32_reg_pair(*kernel, 32, up_weight_spm);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel, 36, up_output_spm);
   auto* queue = GET_QUEUE(8);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel, {uint16_t(fused_swiglu ? 8 : 16), 1, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
+  queue->enqueu_kernel(*kernel, rpu_specialized_linear::grid(id), {0, 1, 2, 3, 4, 5, 6, 7});
 }

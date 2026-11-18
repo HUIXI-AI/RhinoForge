@@ -91,9 +91,14 @@ def _rotary_buffer(module, name):
         return None
 
     config = getattr(module, "config", None)
-    if config is not None and hasattr(module, "compute_default_rope_parameters"):
+    if config is not None and (
+        hasattr(module, "compute_default_rope_parameters")
+        or hasattr(module, "compute_axial_rope_parameters")
+    ):
         rope_type = getattr(module, "rope_type", None) or "default"
-        if rope_type == "default":
+        if rope_type == "axial":
+            rope_init_fn = module.compute_axial_rope_parameters
+        elif rope_type == "default":
             rope_init_fn = module.compute_default_rope_parameters
         else:
             from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS

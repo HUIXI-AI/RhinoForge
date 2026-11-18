@@ -41,7 +41,7 @@ def test_actual_launcher_ranges_aliases_scales_and_typed_registers(tmp_path):
     launch = block((ROOT/'src/fused/hyvla_w8_o_resident.h').read_text(), 'inline void launch_hyvla_w8_o_resident_spm(')
     source = COMMON + r'''
 #include "ops/rpu_linear_tiling.h"
-enum class KernelId {HYVLA_EXPERT_O_RESIDENT_W8_S51};
+enum class KernelId : uint16_t {HYVLA_EXPERT_O_RESIDENT_W8_S51};
 enum class GraphDdrRegisterRole {PerChannelScale};
 enum class GraphDdrRegisterAccess {Read};
 enum class GraphDdrRegisterEncoding {DevAddrShift8LoHi};
@@ -75,7 +75,7 @@ namespace rhino_lkn {uint64_t RpuGetDevAddr(void* p){return reinterpret_cast<uin
 struct Queue {bool broadcast=false;
  void set_broadcast_mode(bool b){broadcast=b;}
  void enqueu_kernel(Kernel&,std::vector<uint16_t> grid,std::vector<uint8_t> cores){
-  assert(broadcast && grid==std::vector<uint16_t>({16,1,1}));
+  assert(broadcast && grid==std::vector<uint16_t>({8,1,1}));
   assert(cores==std::vector<uint8_t>({0,1,2,3,4,5,6,7}));++queued;}
 } queue;
 #define GET_QUEUE(n) (&::queue)
@@ -94,8 +94,8 @@ int main(){
  run(good,true);
  auto pair=[&](int i){return uint32_t(kernel.regs[i])|(uint32_t(kernel.regs[i+1])<<16);};
  assert(pair(0)==good[0] && pair(4)==good[1] && pair(2)==good[2]);
- assert(pair(8)==51 && pair(10)==1024 && kernel.regs[12]==256 && kernel.regs[13]==16);
- assert(pair(16)==512 && pair(18)==2048 && kernel.regs[22]==0 && kernel.regs[23]==1);
+ assert(kernel.regs[8]==0 && kernel.regs[9]==51 && pair(10)==1024 && kernel.regs[12]==256 && kernel.regs[13]==16);
+ assert(pair(16)==512 && pair(18)==2048 && pair(22)==0 && pair(24)==0 && kernel.regs[26]==2 && kernel.regs[27]==1);
  assert(pair(20)==scale.address>>8);
  const std::array<uint32_t,3> bytes{51*256*2,51*1024*2,262144};
  for(int i=0;i<3;++i){

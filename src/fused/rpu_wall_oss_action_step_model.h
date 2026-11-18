@@ -43,12 +43,12 @@ public:
         bool velocity_blend);
     void stage_execution_chunk_size(uint64_t token, int64_t chunk_size);
 
-    // Bind the action preprocessor/proj_back weights (fp16; w3 is TP8 col-swizzled,
-    // the remaining projections are single-core col-swizzled)
+    // Bind the action preprocessor/proj_back weights (fp16; w3 is col-swizzled
+    // over the execution cores, the remaining projections are single-core)
     // plus the padded dims. Must be called AFTER CausalDecoderModel::set_weights.
     void set_action_weights(
         const at::Tensor& w_comb,      // [hidden, k_comb_pad]   single-core col-swizzled fp16
-        const at::Tensor& w3,          // [hidden, hidden]       TP8 col-swizzled fp16
+        const at::Tensor& w3,          // [hidden, hidden]       execution-core col-swizzled fp16
         const at::Tensor& proj_back,   // [action_dim_pad, hidden] single-core col-swizzled fp16
         const at::Tensor& w2_t,        // [hidden, hidden] single-core col-swizzled fp16 — the
                                        // preprocessor time-projection (w2[:,AH:]); enables the
@@ -134,6 +134,10 @@ protected:
     physical_manifest_forward_capability(
         const FmbPhysicalExecutionManifest& manifest) const override;
     // build_layer_subgraph / forward: INHERITED from CausalDecoderModel.
+
+    // The base reduced-core admission still binds the exact Wall action
+    // geometry, precision and masked non-causal forward.
+    bool reduced_wall_action_owner() const override { return true; }
 
     // The two action widths size the appended Temp "x_t_spm" / "v_t_core0_spm",
     // and NO Persistent decl here depends on them, so nothing in the framework

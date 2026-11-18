@@ -69,6 +69,7 @@ def ordinary_linear_reuse_executable(tmp_path_factory):
 #include <utility>
 #include <vector>
 #include "src/ops/rpu_linear_tiling.h"
+#include "src/ops/rpu_pi_wall_tiling.h"
 #define TORCH_INTERNAL_ASSERT(condition) assert(condition)
 #define TORCH_CHECK(condition, ...) do { if (!(condition)) throw std::runtime_error("route rejected"); } while (0)
 constexpr int NUM_CORES = 8;
@@ -89,7 +90,8 @@ struct IntArrayRef : std::vector<int64_t> {
 }
 enum class ChunkMode { SEQUENTIAL, KV_FIRST };
 enum class FmbRouteFamily { LINEAR, ALL_REDUCE, MUTABLE_DMA, ACTIVATION };
-enum class KernelId { W8A16_ROW_WEIGHT_REUSE_M352N80K256 };
+enum class KernelId : uint16_t {};
+KernelId pi_wall_kernel_id(uint16_t ordinal) { return static_cast<KernelId>(ordinal); }
 struct KernelCache {
     bool available = true;
     static KernelCache& instance() { static KernelCache value; return value; }
@@ -201,7 +203,12 @@ void routes() {
             assert(route.site_id == CAUSAL_DECODER_O_SITE && route.family == FmbRouteFamily::LINEAR);
             assert(route.selector == (reuse ? 5 : 1) && route.flags == 0 && route.invocation == chunk.idx);
             std::vector<int64_t> expected{chunk.len, 1024, 2048, 0, 8};
-            if (reuse) expected.insert(expected.end(), {352, 80, 256, 128});
+            if (reuse) {
+                const auto tile = rpu_pi_wall::select(rpu_pi_wall::Operation::RowWeightReuse,
+                    rpu_pl_tiling::WeightType::Int8, false, 512, 1024, 256);
+                expected.insert(expected.end(), {2, tile.tile.m_tile, tile.tile.n_tile,
+                    tile.tile.k_tile, tile.grid_x, tile.grid_y});
+            }
             assert(route.arguments == expected);
             launched.clear();
             model.dispatch(chunk);

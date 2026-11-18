@@ -23,6 +23,7 @@ _COLD_BOOL_FIELDS = (
     "preload_replay_skip", "bake_merger", "fused_merger", "prefix_prep_cache",
     "prefix_prep_rpu", "prefix_no_clone", "partial_mrope", "merger_scatter",
     "shared_cache", "prefix_alias", "denoise_unroll", "linear_acc32", "gelu_erf_ultra",
+    "moe_resident_prefill",
 )
 _FIELDS = ("chunk_size", "padding_rows", "padding_budget", *_COLD_BOOL_FIELDS)
 _COMPONENTS = "components"
@@ -454,6 +455,11 @@ _QWEN3_EXECUTION_SUPPORTED = {
     "prefill": ("chunk_size", "padding_rows", "padding_budget", "linear_acc32"),
     "model": ("num_cores",),
 }
+# Llama keeps its prefill fields (no linear_acc32) and adds the cold budget.
+_LLAMA_EXECUTION_SUPPORTED = {
+    **_CAUSAL_DECODER_EXECUTION_SUPPORTED,
+    "model": ("num_cores",),
+}
 _QWEN3_5_EXECUTION_SUPPORTED = {
     "model": ("num_cores",),
     "prefill": ("chunk_size", "padding_rows", "padding_budget", "linear_acc32"),
@@ -463,21 +469,31 @@ _QWEN3_5_EXECUTION_SUPPORTED = {
 QWEN3_REDUCED_CORE_ASSET_ALIASES = frozenset({
     "qwen3-0.6b", "qwen3-0.6b-instruct", "qwen3-1.7b",
     "qwen3-4b", "qwen3-4b-instruct", "qwen3-8b",
+    "qwen3-14b", "qwen3-32b",
 })
 QWEN3_VL_REDUCED_CORE_ASSET_ALIASES = frozenset({
     "qwen3-vl-2b", "qwen3-vl-4b", "qwen3-vl-8b",
 })
+LLAMA_REDUCED_CORE_ASSET_ALIASES = frozenset({"llama-3.2-1b"})
 
 
 
-def is_qwen3_17b_w8a16_core_config(config):
-    """The exact 1.7B W8 decoder/head format; no other reduced W8 profile."""
+def is_qwen3_w8a16_core_config(config):
+    """Exact per-channel W8 decoder/head formats admitted at 4/6 cores."""
+    geometry = tuple(getattr(config, key, None) for key in (
+        "model_type", "hidden_size", "intermediate_size", "num_hidden_layers",
+        "num_attention_heads", "num_key_value_heads", "head_dim", "vocab_size"))
+    allowed = {
+        ("qwen3", 1024, 3072, 28, 16, 8, 128, 151936),
+        ("qwen3", 2048, 6144, 28, 16, 8, 128, 151936),
+        ("qwen3", 2560, 9728, 36, 32, 8, 128, 151936),
+        ("qwen3", 4096, 12288, 36, 32, 8, 128, 151936),
+        ("qwen3", 5120, 17408, 40, 40, 8, 128, 151936),
+        ("qwen3", 5120, 25600, 64, 64, 8, 128, 151936),
+    }
     return (
-        tuple(getattr(config, "architectures", ()) or ()) == ("Qwen3ForCausalLM",)
-        and tuple(getattr(config, key, None) for key in (
-            "model_type", "hidden_size", "intermediate_size", "num_hidden_layers",
-            "num_attention_heads", "num_key_value_heads", "head_dim", "vocab_size"))
-            == ("qwen3", 2048, 6144, 28, 16, 8, 128, 151936)
+        geometry in allowed
+        and tuple(getattr(config, "architectures", ()) or ()) == ("Qwen3ForCausalLM",)
         and getattr(config, "tie_word_embeddings", None) is False
         and getattr(config, "rms_norm_eps", None) == 1e-6
         and getattr(config, "quantization_config", None) is None
@@ -506,11 +522,12 @@ def qwen3_core_profile(config, num_cores):
         head_dim=getattr(config, "head_dim", None),
         vocab_size=getattr(config, "vocab_size", None))
     layers = getattr(config, "num_hidden_layers", None)
-    plain = (profile is not None and getattr(config, "model_type", None) == "qwen3"
+    plain = (profile is not None and profile.qk_norm
+             and getattr(config, "model_type", None) == "qwen3"
              and not isinstance(layers, bool) and isinstance(layers, Integral)
              and layers == profile.num_layers)
-    quantized_17b = num_cores in (4, 6) and is_qwen3_17b_w8a16_core_config(config)
-    plain = plain and (quantized_17b or not (getattr(config, "quant_config", None)
+    quantized_w8 = num_cores in (4, 6) and is_qwen3_w8a16_core_config(config)
+    plain = plain and (quantized_w8 or not (getattr(config, "quant_config", None)
                            or getattr(config, "quantization_config", None)))
     plain = plain and not (getattr(config, "attention_bias", False)
                            or getattr(config, "mlp_bias", False)
@@ -525,13 +542,57 @@ def qwen3_core_profile(config, num_cores):
     if not plain and num_cores != 8:
         raise ValueError(
             "model.num_cores=4/6 requires an exact plain FP16 Qwen3 "
-            "0.6B/1.7B/4B/8B or 1.7B W8A16 decoder/head profile with full attention and default RoPE")
+            "0.6B/1.7B/4B/8B/14B/32B FP16 or W8A16 decoder/head profile with full attention and default RoPE")
     return profile if plain else None
 
 
 def validate_qwen3_core_profile(config, num_cores):
     """Config-only reduced-core admission, shared by loader and cache callers."""
     return qwen3_core_profile(config, num_cores) is not None
+
+
+def llama_core_profile(config, num_cores):
+    """Exact Llama-3.2-1B FP16 decoder admission for the shared 4/6 template.
+
+    Geometry is the topology row (H2048/I8192, Q32/KV8/D64, vocab 128256);
+    the checks here bind it to plain Llama semantics: 16 full-attention layers,
+    no QK-norm/bias, SiLU and a host-precomputed default or llama3 RoPE table.
+    Keep the import lazy for the board-free example checks.
+    """
+    from rpu_backend.runtime.topology import decoder_geometry_profile
+
+    profile = decoder_geometry_profile(
+        hidden_size=getattr(config, "hidden_size", None),
+        intermediate_size=getattr(config, "intermediate_size", None),
+        num_q_heads=getattr(config, "num_attention_heads", None),
+        num_kv_heads=getattr(config, "num_key_value_heads", None),
+        head_dim=getattr(config, "head_dim", None),
+        vocab_size=getattr(config, "vocab_size", None))
+    rope = (getattr(config, "rope_parameters", None)
+            or getattr(config, "rope_scaling", None) or {})
+    layers = getattr(config, "num_hidden_layers", None)
+    layer_types = getattr(config, "layer_types", None)
+    valid = (
+        profile is not None and not profile.qk_norm
+        and getattr(config, "model_type", None) == "llama"
+        and isinstance(layers, Integral) and not isinstance(layers, bool)
+        and layers == profile.num_layers
+        and getattr(config, "hidden_act", None) == "silu"
+        and getattr(config, "attention_bias", None) is False
+        and getattr(config, "mlp_bias", None) is False
+        and getattr(config, "partial_rotary_factor", 1.0) == 1.0
+        and (layer_types is None or (
+            len(layer_types) == layers and all(t == "full_attention" for t in layer_types)))
+        and all(getattr(config, k, None) is None for k in ("quant_config", "quantization_config"))
+        and isinstance(rope, Mapping)
+        and rope.get("rope_type", rope.get("type", "default")) in ("default", "llama3")
+    )
+    if not valid and num_cores != 8:
+        raise ValueError(
+            "model.num_cores=4/6 requires the exact Llama-3.2-1B FP16 decoder "
+            "(16 layers, H2048/I8192, Q32/KV8/D64, vocab 128256, no attention/MLP "
+            "bias, SiLU, default or llama3 RoPE)")
+    return profile if valid else None
 
 
 def qwen3_vl_text_core_profile(config, num_cores):
@@ -550,7 +611,9 @@ def qwen3_vl_text_core_profile(config, num_cores):
     layers = getattr(config, "num_hidden_layers", None)
     layer_types = getattr(config, "layer_types", None)
     valid = (
-        profile is not None and profile.hidden_size in (2048, 2560, 4096)
+        profile is not None and profile.qk_norm
+        and profile.hidden_size in (2048, 2560, 4096, 5120)
+        and (profile.hidden_size != 5120 or profile.num_layers == 64)
         and getattr(config, "model_type", None) == "qwen3_vl_text"
         and isinstance(layers, Integral) and not isinstance(layers, bool)
         and layers == profile.num_layers
@@ -572,9 +635,25 @@ def qwen3_vl_text_core_profile(config, num_cores):
         and tuple(rope["mrope_section"]) == (24, 20, 20)
     )
     if not valid and num_cores != 8:
-        raise ValueError("model.num_cores=4/6 requires exact dense FP16 Qwen3-VL "
-                         "2B/4B/8B text semantics with interleaved M-RoPE")
+        raise ValueError("model.num_cores=4/6 requires exact dense Qwen3-VL "
+                         "2B/4B/8B/32B text semantics with interleaved M-RoPE")
     return profile if valid else None
+
+
+def qwen3_vl_text_topology(config, num_cores, *, packed_w4=False):
+    """Resolve the admitted text template, shared by FP16, W8 and packed W4.
+
+    Packed W4 keeps the six-lane MLP; its installer pads the physical width
+    with the shared 32xTP physical MLP alignment rather than using MLP4.
+    """
+    from rpu_backend.runtime.topology import resolve_decoder_topology
+
+    if type(packed_w4) is not bool:
+        raise TypeError("packed_w4 must be a boolean")
+    profile = qwen3_vl_text_core_profile(config, num_cores)
+    if profile is None:
+        raise ValueError("Qwen3-VL topology requires its exact text profile")
+    return resolve_decoder_topology(num_cores=num_cores, **profile.geometry())
 
 
 # Extra plain-text rows may buy a better chunk plan. Translate the legacy

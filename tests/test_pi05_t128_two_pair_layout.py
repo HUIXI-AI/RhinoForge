@@ -97,6 +97,8 @@ struct Owner {
 };
 void verify(int64_t rows,bool a8,bool fp16=false) {
     Owner owner;owner.pi05_pair_rows_=rows;owner.pi05_prefill_a8_=a8;owner.fp16=fp16;
+    const auto gate_tile=rpu_pi_wall::select(a8?rpu_pi_wall::Operation::A8PairedGelu:rpu_pi_wall::Operation::PairedGelu,fp16?rpu_pl_tiling::WeightType::Fp16:rpu_pl_tiling::WeightType::Int8,a8,rows,2048,2048);
+    const auto tile=rpu_pi_wall::select(rpu_pi_wall::Operation::PairedLinear,fp16?rpu_pl_tiling::WeightType::Fp16:rpu_pl_tiling::WeightType::Int8,false,rows,2048,2048);
     LayoutContext ctx;ctx.chunk_size=ctx.kv_insert_chunk_size=rows;
     ctx.max_kv_seq_len=2*rows;ctx.num_layers=18;ctx.use_attn_mask=true;ctx.is_causal=false;
     const auto decls=owner.declare_buffers(ctx);
@@ -154,17 +156,17 @@ void verify(int64_t rows,bool a8,bool fp16=false) {
         assert(total<=SpmAllocator::SPM_PLANNING_BUDGET);
         assert(owner.pi05_pair_tile_rows()==160 && !owner.pi05_pair_scratch_mask() && !owner.pi05_pair_single_compact());
         assert(owner.pi05_pair_mask_bytes()==369664 && owner.pi05_pair_compact_root_bytes()==311296);
-        assert((owner.pi05_down_pair_arguments()==std::vector<int64_t>{4,304,2048,2048,8,80,26,4,1,1,2,2,3,0,1,160}));
+        assert((owner.pi05_down_pair_arguments()==std::vector<int64_t>{24,304,2048,2048,8,tile.tile.n_tile,tile.grid_x,4,1,1,2,2,3,0,1,tile.tile.m_tile,tile.tile.m_tile,tile.tile.k_tile,tile.grid_y,48,50,52,26,27}));
         assert((owner.pi05_owner_norm_arguments()==std::vector<int64_t>{2,304,2048,8,38,155648,1245184,1,17,1,2,1}));
-        assert(owner.pi05_o_pair_arguments().at(0)==2);
+        assert(owner.pi05_o_pair_arguments().at(0)==22);
         const auto gate=owner.pi05_prefill_gateup_pair_arguments();
         if(a8) {
-            assert(gate.at(0)==3 && gate.at(6)==48 && gate.at(20)==256);
+            assert(gate.at(0)==7 && gate.at(6)==gate_tile.tile.m_tile && gate.at(20)==256);
             assert(owner.pi05_a8_bytes()==1264640 && owner.pi05_a8_root_bytes()==1265920);
             const auto norm=owner.pi05_o_pair_norm_arguments(1);
             assert(norm.at(13)==1265248 && norm.at(13)+608+32<=packed);
             assert(256*2048*2<=f);
-        } else assert(gate.at(0)==(fp16?4:2) && gate.at(6)==160);
+        } else assert(gate.at(0)==(fp16?6:5) && gate.at(6)==gate_tile.tile.m_tile);
         assert(std::count_if(routes.begin(),routes.end(),[](const auto& route){return route.site_id==PI05_O_PAIR_ROTATE_SITE;})==1);
         std::cout<<"C304 "<<(a8?"A8":"A16")<<" temp="<<plan.required_extent<<" gemma_persistent="<<persistent
                  <<" composite_persistent=656640 total="<<total<<" headroom="<<(SpmAllocator::SPM_PLANNING_BUDGET/256*256-total)<<"\n";
@@ -176,17 +178,17 @@ void verify(int64_t rows,bool a8,bool fp16=false) {
         assert(total<=SpmAllocator::SPM_PLANNING_BUDGET);
         assert(owner.pi05_pair_tile_rows()==112 && !owner.pi05_pair_single_compact());
         assert(owner.pi05_pair_mask_bytes()==746496 && owner.pi05_pair_compact_root_bytes()==442368);
-        assert((owner.pi05_down_pair_arguments()==std::vector<int64_t>{7,432,2048,2048,8,80,26,4,0,1,2,2,3,0,1,112,3,3}));
+        assert((owner.pi05_down_pair_arguments()==std::vector<int64_t>{27,432,2048,2048,8,tile.tile.n_tile,tile.grid_x,4,0,1,2,2,3,0,1,tile.tile.m_tile,3,3,tile.tile.m_tile,tile.tile.k_tile,tile.grid_y,48,50,52,26,27}));
         assert((owner.pi05_owner_norm_arguments()==std::vector<int64_t>{2,432,2048,8,54,221184,1769472,1,17,1,2,1}));
-        assert(owner.pi05_o_pair_arguments().at(0)==2);
+        assert(owner.pi05_o_pair_arguments().at(0)==22);
         const auto gate=owner.pi05_prefill_gateup_pair_arguments();
         if(a8) {
-            assert(gate.at(0)==3 && gate.at(6)==48 && gate.at(20)==384);
+            assert(gate.at(0)==7 && gate.at(6)==gate_tile.tile.m_tile && gate.at(20)==384);
             assert(owner.pi05_a8_bytes()==1797120 && owner.pi05_a8_root_bytes()==1798912);
             const auto norm=owner.pi05_o_pair_norm_arguments(1);
             assert(norm.at(13)==1797984 && norm.at(13)+864+32<=packed);
             assert(384*2048*2<=f);
-        } else assert(gate.at(0)==(fp16?4:2) && gate.at(6)==112);
+        } else assert(gate.at(0)==(fp16?6:5) && gate.at(6)==gate_tile.tile.m_tile);
         assert(std::count_if(routes.begin(),routes.end(),[](const auto& route){return route.site_id==PI05_O_PAIR_ROTATE_SITE;})==1);
         std::cout<<"C432 "<<(a8?"A8":"A16")<<" temp="<<plan.required_extent<<" gemma_persistent="<<persistent
                  <<" composite_persistent=656640 total="<<total<<" headroom="<<(SpmAllocator::SPM_PLANNING_BUDGET/256*256-total)<<"\n";
@@ -219,17 +221,17 @@ void verify(int64_t rows,bool a8,bool fp16=false) {
         assert(total==(a8?6658816:6636800));
         assert(total<=SpmAllocator::SPM_PLANNING_BUDGET);
         assert(owner.pi05_pair_tile_rows()==160 && !owner.pi05_pair_single_compact());
-        assert((owner.pi05_down_pair_arguments()==std::vector<int64_t>{4,320,2048,2048,8,80,26,4,1,1,2,2,3,0,1,160}));
+        assert((owner.pi05_down_pair_arguments()==std::vector<int64_t>{24,320,2048,2048,8,tile.tile.n_tile,tile.grid_x,4,1,1,2,2,3,0,1,tile.tile.m_tile,tile.tile.m_tile,tile.tile.k_tile,tile.grid_y,48,50,52,26,27}));
         assert((owner.pi05_owner_norm_arguments()==std::vector<int64_t>{2,320,2048,8,40,163840,1310720,1,17,1,2,1}));
         const auto gate=owner.pi05_prefill_gateup_pair_arguments();
-        if(a8) {assert(gate.at(0)==3 && gate.at(6)==48 && gate.at(20)==256);
+        if(a8) {assert(gate.at(0)==7 && gate.at(6)==gate_tile.tile.m_tile && gate.at(20)==256);
             assert(owner.pi05_a8_bytes()==1331200 && owner.pi05_a8_root_bytes()==1332736);
             // Actual norm ABI gives SX1 start; every split tile may load
             // 16 FP16 scales, including the explicitly initialized tail.
             const auto norm=owner.pi05_o_pair_norm_arguments(1);
             assert(norm.at(13)==1331840 && norm.at(13)+640+32<=packed);
-        } else assert(gate.at(0)==2 && gate.at(6)==160);
-        assert(owner.pi05_o_pair_arguments().at(0)==2);
+        } else assert(gate.at(0)==5 && gate.at(6)==gate_tile.tile.m_tile);
+        assert(owner.pi05_o_pair_arguments().at(0)==22);
         std::cout<<"C320 "<<(a8?"A8":"A16")<<" temp="<<plan.required_extent<<" gemma_persistent="<<persistent
                  <<" composite_persistent=656640 total="<<total<<" headroom="<<(SpmAllocator::SPM_PLANNING_BUDGET/256*256-total)<<"\n";
     }

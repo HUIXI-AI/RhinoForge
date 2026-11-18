@@ -8,7 +8,6 @@ from typing import Any, Mapping
 from rpu_backend.api._execution import (
     bind_execution_session,
     bind_rpu_execution,
-    native_execution_reconfigure,
     normalize_rpu_execution,
     resolve_component_rpu_execution,
 )
@@ -409,7 +408,7 @@ def gc_close_internvla_runtime(owner):
 
 
 class InternVLAExecutionController:
-    """One serialized session for independently planned device children.
+    """One serialized session for independently planned RPU children.
 
     CPU-only goal/scheduler glue is intentionally absent: it has no native
     chunk, SPM, KV, or Graph authority and is therefore NOT_APPLICABLE.
@@ -427,7 +426,7 @@ class InternVLAExecutionController:
                 f"InternVLA execution has unknown child IDs {sorted(unknown)}"
             )
         if not children:
-            raise ValueError("InternVLA execution requires at least one device child")
+            raise ValueError("InternVLA execution requires at least one RPU child")
         if vars(owner).get("_internvla_execution_controller") is not None:
             raise ValueError("InternVLA owner already has its execution controller")
         for component, child in children.items():
@@ -556,16 +555,15 @@ class InternVLAExecutionController:
         for component in changed:
             generations[component] += 1
         self._journal = (old_resolved, dict(self._component_generations), changed)
-        # Even descriptor-only changes participate in the native stop-the-world
-        # transaction so publication cannot race a live device graph.
-        with native_execution_reconfigure():
-            for component in changed:
-                _clear_graphs(self.children[component])
-            self._publish(
-                new_resolved,
-                generation=next_generation,
-                component_generations=generations,
-            )
+        # Descriptor-only changes have no native controls to stage. Graph cleanup
+        # takes its own native claim while the shared Session serializes children.
+        for component in changed:
+            _clear_graphs(self.children[component])
+        self._publish(
+            new_resolved,
+            generation=next_generation,
+            component_generations=generations,
+        )
         # ponytail: one bounded undo snapshot survives shared facade publication;
         # the next apply replaces it after the previous transaction completes.
 
@@ -573,14 +571,13 @@ class InternVLAExecutionController:
         if self._journal is None:
             return
         old_resolved, generations, changed = self._journal
-        with native_execution_reconfigure():
-            for component in changed:
-                _clear_graphs(self.children[component])
-            self._publish(
-                old_resolved,
-                generation=old_generation,
-                component_generations=generations,
-            )
+        for component in changed:
+            _clear_graphs(self.children[component])
+        self._publish(
+            old_resolved,
+            generation=old_generation,
+            component_generations=generations,
+        )
         self._journal = None
 
     @contextmanager

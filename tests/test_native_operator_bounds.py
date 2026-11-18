@@ -48,17 +48,19 @@ def test_native_operator_admission(tmp_path):
 constexpr int ROPE_NUM_CORES=8, MAX_CORES=8, NUM_CORES=8, UNIFIED_NUM_CORES=8, RPU_RMSNORM_MAX_COLS=32752;
 namespace c10 { using Half=uint16_t; template<class T> using optional=std::optional<T>; }
 namespace at {
-constexpr int kHalf=0, kByte=1;
+constexpr int kHalf=0, kByte=1, kChar=2;
 struct Tensor {
     std::vector<int64_t> shape;
     int scalar_type() const { return kHalf; }
     size_t dim() const { return shape.size(); }
     int64_t size(size_t i) const { return shape.at(i); }
+    bool is_contiguous() const { return true; }
 };
 }
 using at::Tensor;
+struct LinearConv1dSlab { int64_t taps = 0, dilation = 0, channels = 0; };
 struct SdpaTiling { int tile_m_v16=0, tile_m=0, tile_k_v16=0, tile_k=0, tile_n_v16=0, tile_n=0; };
-void check_linear_w4a16_operands(const Tensor&, const Tensor&, const Tensor&, c10::optional<Tensor>) {
+void check_linear_w4a16_operands(const Tensor&, const Tensor&, const Tensor&, c10::optional<Tensor>, int = 8, int64_t = 0) {
     throw std::runtime_error("FP16 admission fixture must not enter W4");
 }
 enum class RpuRmsNormSpmRoute { BASE, V16, V32, QWEN3VL_V64 };
@@ -115,7 +117,7 @@ int main() {
     rejects([] { validate_parallel_linear_grid(65536,128,1,16); });
     rejects([] { validate_parallel_linear_grid(128,128,0,16); });
     auto linear = [](at::Tensor x, at::Tensor w, at::Tensor y) {
-        rpu_launch_linear_ddr_kernel(x,w,y,{},false,1,nullptr,0,nullptr,8,{},{});
+        rpu_launch_linear_ddr_kernel(x,w,y,{},false,1,nullptr,0,nullptr,8,{},{},nullptr);
     };
     linear({{16,1024}},{{2048,1024}},{{16,2048}});
     rejects([&] { linear({{16,1024}},{{2048,1024}},{{16,1024}}); });

@@ -5,19 +5,22 @@ from pathlib import Path
 import subprocess
 import sys
 import tomllib
+from types import SimpleNamespace
 
 import pytest
 import torch
+from _example_toml import load_example_toml
 
 
 ROOT = Path(__file__).resolve().parents[1]
 CFG = importlib.import_module("examples.runners.gr00t.config")
 
 
-def config(precision="fp16", size=224, text=32):
+def config(precision="fp16", size=224, text=32, cameras=3):
     path = ROOT / f"examples/configs/gr00t/n1_7_droid/{size}/{precision}.toml"
-    result = tomllib.loads(path.read_text())
+    result = load_example_toml(path)
     result["input"]["text_tokens"] = text
+    result["input"]["cameras"] = cameras
     return result
 
 
@@ -34,15 +37,15 @@ class Tokenizer:
         return 151655
 
 
-def observation(size=224, text=32):
+def observation(size=224, text=32, cameras=3):
     edge = size // 16
     image = [151652] + [151655] * (edge // 2) ** 2 + [151653]
-    ids = torch.tensor([[151644, 872, 198] + image * 3 + [1234] * text
+    ids = torch.tensor([[151644, 872, 198] + image * cameras + [1234] * text
                         + [151645, 198, 151644, 77091, 198]])
     return dict(input_ids=ids, attention_mask=torch.ones_like(ids),
                 mm_token_type_ids=(ids == 151655).long(),
-                image_grid_thw=torch.tensor([[1, edge, edge]] * 3),
-                pixel_values=torch.zeros(3 * edge * edge, 1536),
+                image_grid_thw=torch.tensor([[1, edge, edge]] * cameras),
+                pixel_values=torch.zeros(cameras * edge * edge, 1536),
                 state=torch.zeros(1, 1, 132), embodiment_id=torch.tensor([20]))
 
 
@@ -55,6 +58,86 @@ def test_actual_input_geometry_and_instruction_length(size, text):
     cfg["input"]["text_tokens"] = 64 if text == 32 else 32
     with pytest.raises(ValueError, match="instruction tokens"):
         CFG.validate_observation(cfg, value, Tokenizer())
+
+
+@pytest.mark.parametrize("precision", ["fp16", "w8a16"])
+@pytest.mark.parametrize("size", [224, 256])
+@pytest.mark.parametrize("cameras", [2, 3])
+@pytest.mark.parametrize("text", [32, 64, 128, 160, 192, 224, 256])
+def test_camera_and_long_instruction_profiles(precision, size, cameras, text):
+    cfg = config(precision, size=size, text=text, cameras=cameras)
+    assert CFG.validate_config(cfg)
+    value = observation(size, text, cameras)
+    CFG.validate_observation(cfg, value, Tokenizer())
+    # Only camera/text geometry changes: retain the existing cold optimization
+    # policy for both public precisions.
+    assert CFG.runtime_environment(cfg) == CFG.runtime_environment(config(precision, size=256))
+
+
+def test_single_camera_256_compatibility():
+    cfg = config(size=256, text=32, cameras=1)
+    assert CFG.validate_config(cfg)
+    CFG.validate_observation(cfg, observation(256, 32, 1), Tokenizer())
+
+
+@pytest.mark.parametrize("size,cameras,text", [
+    (256, 2, 129), (256, 2, 288), (256, 2, True),
+    (256, 4, 128), (256, True, 128), (224, 1, 128), (224, 1, 256),
+    (224, 2, 129), (224, 3, 288), (224, True, 128),
+])
+def test_geometry_outside_requested_profiles_is_rejected(size, cameras, text):
+    with pytest.raises(ValueError, match="GR00T input"):
+        CFG.validate_config(config(size=size, cameras=cameras, text=text))
+
+
+@pytest.mark.parametrize("field", ["image_grid_thw", "pixel_values", "input_ids"])
+@pytest.mark.parametrize("size", [224, 256])
+def test_camera_count_is_checked_against_each_observation_field(field, size):
+    cfg = config(size=size, text=256, cameras=2)
+    value = observation(size, 256, 2)
+    value[field] = observation(size, 256, 3)[field]
+    if field == "input_ids":
+        value["attention_mask"] = torch.ones_like(value[field])
+    with pytest.raises(ValueError, match="GR00T observation"):
+        CFG.validate_observation(cfg, value, Tokenizer())
+
+
+@pytest.mark.parametrize("size,cameras,text,capacity", [
+    (224, 2, 128, 256), (224, 2, 256, 368), (224, 3, 256, 432),
+    (256, 2, 256, 400), (256, 3, 256, 464),
+])
+def test_runner_sizes_capacity_from_real_multimodal_prefix(monkeypatch, size, cameras, text, capacity):
+    from examples.runners.gr00t import runner as public_runner
+
+    cfg = config(size=size, cameras=cameras, text=text)
+    value = observation(size, text, cameras)
+    installs = []
+    runtime = SimpleNamespace(get_action=lambda *args, **kwargs: None)
+
+    def build(*args, **kwargs):
+        installs.append(kwargs)
+        return runtime
+
+    monkeypatch.setitem(sys.modules, "rpu_backend.adapters.gr00t",
+                        SimpleNamespace(build_gr00t_vla=build))
+    monkeypatch.setitem(sys.modules, "rpu_backend.graph", SimpleNamespace(
+        GraphRuntimePolicy=SimpleNamespace(from_environment=lambda **kwargs:
+            SimpleNamespace(prepare_arenas=lambda: True))))
+    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(
+        AutoTokenizer=SimpleNamespace(from_pretrained=lambda path: Tokenizer())))
+    monkeypatch.setattr(torch, "rpu", SimpleNamespace(
+        set_ddr_flush=lambda value: None, set_ddr_flush_force=lambda value: None), raising=False)
+    monkeypatch.setattr(public_runner, "_load_mapping", lambda *args: value)
+    monkeypatch.setattr(public_runner, "_model_path", lambda *args, **kwargs: Path("/qwen"))
+    monkeypatch.setattr(public_runner, "_checkpoint", lambda *args: Path("/gr00t"))
+    caller = SimpleNamespace(source_config=cfg)
+    assert callable(public_runner.prepare(caller))
+    assert caller.owner is runtime
+    assert installs[0]["max_prefix_len"] == capacity
+    cfg["input"]["max_prefix_len"] = (value["input_ids"].shape[-1] - 1) // 16 * 16
+    with pytest.raises(ValueError, match="must cover the observation"):
+        public_runner.prepare(caller)
+    assert len(installs) == 1
 
 
 @pytest.mark.parametrize("field,change", [
@@ -142,7 +225,7 @@ def test_model_specific_ref_selector_is_rejected_before_backend_import(tmp_path,
     from examples.common.config import load_config, ConfigError
     source = ROOT / "examples/configs/gr00t/n1_7_droid/224/fp16.toml"
     legacy = tmp_path / "legacy.toml"
-    legacy.write_text(source.read_text().replace("[example]", '[example]\nexpansion_ref = "/old/gr00t.ref"'))
+    legacy.write_text(source.read_text().replace("[model]", '[model]\nexpansion_ref = "/old/gr00t.ref"'))
     with pytest.raises(ConfigError, match="expansion_ref is retired"):
         load_config(legacy)
     cfg = config()

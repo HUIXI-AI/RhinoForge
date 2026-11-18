@@ -27,10 +27,10 @@ PREPARED_HASHES = {
     "core/__init__.py": "1b380d9de843b6d585d938c339d066136567ca7125412674234204af4386679e",
     "core/models/__init__.py": "917d38d8fd7ed84de73703fd2394d535ca416e15694d1e50324e4a06d4022c82",
     "core/models/configuration_qwen3_tts.py": "f52867f14fde06a416dd14864d503ce6d13d0a08d5f5da30191e1c80c13f5d18",
-    "core/models/modeling_qwen3_tts.py": "6bf140f558462a86c8a39ba44e1253247054923e2d510f0d87ff1a2706bf681e",
+    "core/models/modeling_qwen3_tts.py": "9d30973e6827f1d377d1d1c4e22081c75fa4c9ba9009cd3c159735b653979f2d",
     "core/models/processing_qwen3_tts.py": "61472203188e46eda68d740c25f0f228ece24a61ecf942e57d6e49e78b4d6bcd",
     "core/tokenizer_12hz/configuration_qwen3_tts_tokenizer_v2.py": "9e30c24394b00cb0366d7da3482b7436468acc1cd3da1a6fe614a1d34653a5e3",
-    "core/tokenizer_12hz/modeling_qwen3_tts_tokenizer_v2.py": "7405700e8c4610d437d8591e29785d226038c2a420104074d3e770646b363bdf",
+    "core/tokenizer_12hz/modeling_qwen3_tts_tokenizer_v2.py": "458ccbe535e8cc748872abe3f773d27631ba3de099b5994699e448d80a679614",
     "core/tokenizer_25hz/configuration_qwen3_tts_tokenizer_v1.py": "28f94f715df7d96d365c9cea0021d9cca8c63d2f48f48423c43a3d3cae28ef02",
     "core/tokenizer_25hz/modeling_qwen3_tts_tokenizer_v1.py": "8c6d5b7cfb133967f04286e069138ef7fe0cfca30e9acf3326106f6117135a7f",
     "core/tokenizer_25hz/vq/core_vq.py": "d35fa9f00ef4863361493e102f4e28f092488497117df580819e93b5dff3b8de",
@@ -51,4 +51,21 @@ CHECKPOINT_HASHES = {
     "speech_tokenizer/preprocessor_config.json": "fcb3805e597e786d4067706e602f6688524640f8d3396790e2e09b5942fcbdfb",
     "model.safetensors": "180b3b10eb1c9f1b4db7806d5475bae3071c0243c299d49926bab1da3b6946f6",
     "speech_tokenizer/model.safetensors": "836b7b357f5ea43e889936a3709af68dfe3751881acefe4ecf0dbd30ba571258"
+}
+
+CHECKPOINT_PROFILES = {
+    "0.6b": {
+        "revision": CHECKPOINT_REVISION,
+        "hashes": CHECKPOINT_HASHES,
+        "predictor_mlp_up_divisors": {2: 8},
+    },
+    "1.7b": {
+        "revision": "fd4b254389122332181a7c3db7f27e918eec64e3",
+        "predictor_mlp_up_divisors": {},
+        "hashes": {
+            **CHECKPOINT_HASHES,
+            "config.json": "b4f01752d15a488abde3e1ab44723ae4f4b9e68a4037257b098b3737893cc1f9",
+            "model.safetensors": "38fc7fc51c5e776e840414b6fd443962e9411b9654888fd7913e4da643cb857c",
+        },
+    },
 }

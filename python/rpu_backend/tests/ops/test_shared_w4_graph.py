@@ -1,4 +1,4 @@
-"""Production Dense W4: retained I4 G32 / shared U4 G128, BUILD + three REPLAYs.
+"""Production Dense W4: unified I4 G32 / U4 G128, BUILD + three REPLAYs.
 
 Uses normal librpu_backend bindings; BUILD_CONFORMANCE is not required.
 Run only under the ordinary exclusive-device supervisor with RPU_HW_AVAILABLE=1.
@@ -23,7 +23,7 @@ def test_shared_w4_production_graph(unsigned, group_size, partition, m, acc32):
     import rpu_backend  # noqa: F401
     from rpu_backend.graph import GraphCache, GraphSignature
     from rpu_backend.quant.int4_pgrp_pack import (
-        swizzle_pack_int4_pgrp, swizzle_int4_pgrp_scale)
+        swizzle_pack_int4_pgrp, swizzle_int4_pgrp_scale, w4_storage_shape)
     from rpu_backend.quant.awq_gemm import swizzle_pack_uint4_pgrp
     from rpu_backend.runtime import control
 
@@ -44,11 +44,11 @@ def test_shared_w4_production_graph(unsigned, group_size, partition, m, acc32):
         assert (zero != 8).any(), "the probe must exercise asymmetric zeros"
     else:
         zero.zero_()
-    # Exercise the actual public UINT4 packer as well as the retained signed
+    # Exercise the actual public UINT4 packer as well as the signed
     # packer. Neither path re-quantizes or clips q-z.
     packed = (swizzle_pack_uint4_pgrp(q.to(torch.uint8), partition, cores)
               if unsigned else swizzle_pack_int4_pgrp(q, partition, cores))
-    weight = packed.reshape(n, k // 2).to("rpu")
+    weight = packed.reshape(w4_storage_shape(n, k, partition, cores)).to("rpu")
     packed_scale = swizzle_int4_pgrp_scale(scale, group_size, partition, cores).to("rpu")
     packed_scale = torch.ops.rpu.w4_pgrp_prepare_metadata(weight, packed_scale)
     packed_zero = None

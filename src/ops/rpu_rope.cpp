@@ -447,8 +447,9 @@ void rpu_launch_rhinovla_rope_spm_kernel(
   TORCH_CHECK(num_cores >= 1 && num_cores <= 8,
               "RhinoVLA RoPE requires 1..8 cores");
   if (partial) {
+    // Q/K heads per lane: 2/1 at eight cores, 4/2 at four attention lanes.
     TORCH_CHECK(rows == 31 && head_dim == 128 &&
-                    (local_heads == 1 || local_heads == 2),
+                    (local_heads == 1 || local_heads == 2 || local_heads == 4),
                 "RhinoVLA partial RoPE requires exact v3 Q/K geometry");
     // Rotate the entire head, retaining the original table and logical offset.
     // The owned launcher checks the table range and binds both DDR operands.

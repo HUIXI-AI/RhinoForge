@@ -21,13 +21,13 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_wall_and_mixed_precision_ids_have_expansion_preload_routes() -> None:
     header = (ROOT / "src/core/rpu_kernel_cache.h").read_text()
     cache = (ROOT / "src/core/rpu_kernel_cache.inc").read_text()
-    enum = header.split("enum class KernelId : uint16_t {", 1)[1].split("};", 1)[0]
+    enum = header.split("enum class KernelId : uint16_t {", 1)[1].split("};", 1)[0].split("PL_AUTOTILE_BEGIN")[0]
     enum = re.sub(r"//[^\n]*|/\*.*?\*/", "", enum, flags=re.DOTALL)
     ids = [item.split("=", 1)[0].strip() for item in enum.split(",")
            if item.strip() and item.strip() != "_COUNT"]
     names = re.findall(
         r'"([^"\n]+)"',
-        header.split("KERNEL_ID_NAMES[] = {", 1)[1].split("};", 1)[0],
+        header.split("KERNEL_ID_NAMES[] = {", 1)[1].split("};", 1)[0].split("#define")[0],
     )
     assert len(ids) == len(names)
     wall = {name for kernel_id, name in zip(ids, names)
@@ -43,6 +43,7 @@ def test_wall_and_mixed_precision_ids_have_expansion_preload_routes() -> None:
     # These paths select fixed IDs, including names shared with projection
     # helpers. Every declared route must reach its designated preload source.
     assert wall
+    assert "rpu_pi_wall::candidate_names" in cache
     assert {name: routes.get(name) for name in wall} == {
         name: "RHINO_EXPANSION_OP_LIB_PATH" for name in wall
     }
@@ -204,7 +205,7 @@ def test_qwen3_5_vision_numeric_gate_fails_before_mutation(
         ),
     )
 
-    with pytest.raises(NotImplementedError, match="numeric-blocked"):
+    with pytest.raises(NotImplementedError, match="Qwen3.5 Vision was not requested|QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED"):
         qwen3_5_vision.install_qwen3_5_vision_for_rpu(model)
 
     assert not any(name.startswith("_rpu_") for name in vars(model))
@@ -213,7 +214,7 @@ def test_qwen3_5_vision_numeric_gate_fails_before_mutation(
 def test_qwen3_5_vision_gate_precedes_handle_and_weight_mutation() -> None:
     source = Path(qwen3_5_vision.__file__).read_text(encoding="utf-8")
     install = source.split("def _install_qwen3_5_vision_for_rpu_impl", 1)[1]
-    gate = install.index('QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED") != "1"')
+    gate = install.index("qwen35_vision_requested(execution_config)")
     assert gate < install.index("vision_model._rpu_vision_installing = True")
     assert gate < install.index("torch.ops.rpu.qwen3_5_vision_create()")
     assert gate < install.index("_convert_vision_block_weights_for_rpu(")
@@ -227,8 +228,7 @@ def test_qwen3_14b_admits_w8a16_and_validates_int8_head_scale() -> None:
         "num_hidden_layers": 40,
         "num_key_value_heads": 8,
     }
-    with pytest.raises(UnsupportedModelError, match="no certified device execution"):
-        qwen3._check_profile(SimpleNamespace(**profile))
+    qwen3._check_profile(SimpleNamespace(**profile))
     quantized = SimpleNamespace(**profile, quant_config={"method": "w8a16"})
     qwen3._check_profile(quantized)
 
@@ -257,7 +257,7 @@ def test_qwen3_32b_requires_exact_quantized_metadata_before_admission() -> None:
     )
     before = vars(config).copy()
 
-    with pytest.raises(UnsupportedModelError, match="no certified device execution"):
+    with pytest.raises(UnsupportedModelError, match="exceeds the supported device memory capacity"):
         qwen3.Qwen3Adapter.preflight(config)
 
     assert vars(config) == before
@@ -275,10 +275,12 @@ def test_qwen3_32b_requires_exact_quantized_metadata_before_admission() -> None:
     }
     qwen3.Qwen3Adapter.preflight(config)
     qwen3.Qwen3Adapter.preflight_execution(config, {"prefill": {"chunk_size": 32}})
-    with pytest.raises(UnsupportedModelError, match="num_cores=8"):
-        qwen3.Qwen3Adapter.preflight_execution(config, {"model": {"num_cores": 4}})
+    qwen3.Qwen3Adapter.preflight_execution(config, {"model": {"num_cores": 4}})
+    qwen3.Qwen3Adapter.preflight_execution(config, {"model": {"num_cores": 6}})
+    with pytest.raises(UnsupportedModelError):
+        qwen3.Qwen3Adapter.preflight_execution(config, {"model": {"num_cores": 2}})
     config.quant_config["qaxis"] = False
-    with pytest.raises(UnsupportedModelError, match="no certified device execution"):
+    with pytest.raises(UnsupportedModelError, match="exceeds the supported device memory capacity"):
         qwen3.Qwen3Adapter.preflight(config)
 
 

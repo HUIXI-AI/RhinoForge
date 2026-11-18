@@ -79,7 +79,8 @@ namespace at {using Tensor=::Tensor;}
         'enum class FmbLinearAccumulationPolicy', 'enum class FmbRouteFamily',
         'enum class FmbLinearRouteSelector', 'struct FmbRouteManifestEntry',
         'enum class FmbSharedAllReduceRouteSelector',
-        'struct FmbPhysicalExecutionManifest', 'struct FmbPrefillStageCandidate',
+        'struct FmbPhysicalExecutionManifest', 'enum class FmbPrefillRankingPolicy',
+        'struct FmbPrefillRanking', 'struct FmbPrefillStageCandidate',
     ):
         out += _definition(header, prefix) + ';\n'
     # Full pure tiling prefix includes the production raw capability and VLM

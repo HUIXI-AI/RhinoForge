@@ -84,7 +84,7 @@ def _load_pi05_rpu_quant_config(model_path: str) -> dict:
             )
         _LOG.info(
             "Pi0.5 real-W4 checkpoint detected: method=w4a16, storage=int8, "
-            "value_bits=4, kernel=wINT4a16 (runtime packs to uint8 [N,K/2])"
+            "value_bits=4, kernel=w4a16_pgrp (runtime packs to uint8 [N,K/2])"
         )
     if method == "nvfp4a16":
         if (cfg.get("storage") != "uint8_codes" or cfg.get("nvfp4_abi") != "striped_v2"
@@ -212,6 +212,16 @@ def _pi05_consumed_keys(consumed) -> set[str]:
     return keys
 
 
+def _align_siglip_checkpoint_keys(policy, state_dict: dict[str, torch.Tensor]) -> None:
+    from .checkpoint import align_siglip_checkpoint_keys
+    align_siglip_checkpoint_keys(policy, state_dict, error_type=RPUBackendError)
+
+
+def _materialize_gemma_rope(module) -> bool:
+    from .checkpoint import materialize_gemma_rope
+    return materialize_gemma_rope(module)
+
+
 # =============================================================================
 # CR-R5 BLOCKER 10 (F16 real fix) — strengthened stale-cache check.
 # =============================================================================
@@ -271,7 +281,7 @@ def _load_and_fp16_cast(model_path: str, dtype: "torch.dtype", **lerobot_kwargs:
     except ImportError as e:
         raise ImportError(
             "Pi0.5 requires lerobot. Install with: pip install lerobot\n"
-            "See docs/api_reference.md#Migration for Pi0.5 setup."
+            "See examples/configs/pi05/README.md for Pi0.5 dependency setup."
         ) from e
 
     _LOG.info("Loading Pi0.5 model from: %s (dtype=fp16)", model_path)
@@ -323,6 +333,9 @@ def _load_and_fp16_cast(model_path: str, dtype: "torch.dtype", **lerobot_kwargs:
         finally:
             LeRobotPI05.__init__ = _orig_init
 
+    from .checkpoint import restore_pi_embedding_semantics
+    restore_pi_embedding_semantics(policy)
+
     # Load weights via safetensors.
     state_dict = load_file(remapped_path)
     for module_name in (
@@ -332,6 +345,7 @@ def _load_and_fp16_cast(model_path: str, dtype: "torch.dtype", **lerobot_kwargs:
         # LeRobot's Pi0.5 forward bypasses both causal-LM heads; tied checkpoints omit them.
         if f"{module_name}.lm_head.weight" not in state_dict:
             policy.get_submodule(module_name).lm_head = None
+    _align_siglip_checkpoint_keys(policy, state_dict)
     w8a16_consumed = _pop_pi05_w8a16_tensors(policy, state_dict, quant_config)
     _consumed_method = quant_config.get("method")
     if _consumed_method in ("w4a16_fake_int8", "w4a16", "nvfp4a16") and not w8a16_consumed:
@@ -353,6 +367,8 @@ def _load_and_fp16_cast(model_path: str, dtype: "torch.dtype", **lerobot_kwargs:
         for p in parts[:-1]:
             mod = getattr(mod, p)
         buf_name = parts[-1]
+        if buf_name in ('inv_freq', 'original_inv_freq') and _materialize_gemma_rope(mod):
+            continue
         if buf_name == 'inv_freq':
             dim = buf.shape[0]
             base = 10000.0
@@ -415,7 +431,7 @@ def _load_and_fp16_cast(model_path: str, dtype: "torch.dtype", **lerobot_kwargs:
     policy = policy.eval()
     _method = quant_config.get("method")
     if w8a16_consumed and _method in ("w4a16_fake_int8", "w4a16"):
-        _k = "kernel=w8a16" if _method == "w4a16_fake_int8" else "runtime-packed kernel=wINT4a16"
+        _k = "kernel=w8a16" if _method == "w4a16_fake_int8" else "runtime-packed kernel=w4a16_pgrp"
         suffix = f" + W4-values-in-int8 {_method} {len(w8a16_consumed)} linears ({_k})"
     elif w8a16_consumed:
         suffix = f" + W8A16 {len(w8a16_consumed)} linears"

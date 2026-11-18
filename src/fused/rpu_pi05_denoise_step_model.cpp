@@ -1,3 +1,4 @@
+#include "rpu_geglu_linear_contracts.h"
 #include "pi05_kernel_policy.h"
 // src/fused/rpu_pi05_denoise_step_model.cpp
 //
@@ -32,6 +33,125 @@ using namespace at;
 using namespace ::rhino_lkn;
 
 #define DWIDTH 2
+
+// H50 is M50 with a P64 physical KV insert; H10 is M10 with P16. Both horizons
+// use the same payloads: every Action GeGLU/pair-owner kernel reads M from a
+// register, so the horizon is a launch argument rather than a kernel identity.
+// Declared in rpu_kernel_decls.h because the Linear launchers check it too.
+bool pi05_action_rows_admitted(int64_t rows) {
+    return rows == 50 || rows == 10;
+}
+
+int64_t pi05_kv_insert_rows(int64_t rows) {
+    return rows == 10 ? 16 : 64;
+}
+
+// The double-buffered payload keeps the M320 payload's register ABI and output
+// bytes; an expansion REF without it keeps the M320 payload.
+bool pi05_nvfp4_acc16_geglu_double_buffered(int64_t rows) {
+    return rows <= 64 && KernelCache::instance().has_loaded(
+        KernelId::PI05_NVFP4_GEGLU_DB);
+}
+
+// The same for the ACC16 M320N64 Linear tile of the Q/O/Down projections.
+bool pi05_nvfp4_acc16_linear_double_buffered(int64_t rows) {
+    return rows <= 64 && KernelCache::instance().has_loaded(
+        KernelId::PI05_NVFP4_LINEAR_DB);
+}
+
+// Its tile-contiguous-scale sibling; the scale companions are installed only
+// when both are loaded.
+bool pi05_nvfp4_acc16_linear_tile_scale() {
+    const auto& cache = KernelCache::instance();
+    return cache.has_loaded(KernelId::PI05_NVFP4_LINEAR_DB) &&
+        cache.has_loaded(KernelId::PI05_NVFP4_LINEAR_DB_TSCALE);
+}
+
+// The same for the GeGLU; set_weights installs its Gate/Up companions whenever
+// this holds, so planning and dispatch take the tile-scale payload together.
+bool pi05_nvfp4_acc16_geglu_tile_scale() {
+    const auto& cache = KernelCache::instance();
+    return cache.has_loaded(KernelId::PI05_NVFP4_GEGLU_DB) &&
+        cache.has_loaded(KernelId::PI05_NVFP4_GEGLU_DB_TSCALE);
+}
+
+// Their SPM-scale siblings; set_weights packs the slab source whenever this holds.
+bool pi05_nvfp4_acc16_spm_scale() {
+    const auto& cache = KernelCache::instance();
+    return pi05_nvfp4_acc16_linear_tile_scale() && pi05_nvfp4_acc16_geglu_tile_scale() &&
+        cache.has_loaded(KernelId::PI05_NVFP4_LINEAR_DB_SSPM) &&
+        cache.has_loaded(KernelId::PI05_NVFP4_GEGLU_DB_SSPM);
+}
+
+// The double-buffered W8A16 KV1 pair owner keeps the published payload's
+// register ABI, grid and output bytes; FP16 and a REF without it keep theirs.
+bool pi05_kv1_pair_owner_w8_double_buffered(int64_t rows) {
+    return rows <= 64 && KernelCache::instance().has_loaded(
+        KernelId::PI05_KV_OWNER_W8_DB);
+}
+
+// The SPM-scale Q Linear and the double-buffered W8 pair owner in one launch:
+// the Q body on blocks [0, 4), K and V on 4 and 5, both reading the same input.
+bool pi05_q_kv1_pair_owner_fused(int64_t rows) {
+    return pi05_kv1_pair_owner_w8_double_buffered(rows) && pi05_nvfp4_acc16_spm_scale() &&
+        KernelCache::instance().has_loaded(KernelId::PI05_Q_KV1_PAIR_DB_SSPM);
+}
+
+// The row-pair AdaRMS norm and the SPM-scale GeGLU in one launch at the rows
+// where the norm runs as the row pair (9..16): the GeGLU's first weight tile
+// loads while the norm writes its input rows.
+bool pi05_adarms_geglu_fused(int64_t rows) {
+    return rows > 8 && rows <= 16 && pi05_nvfp4_acc16_spm_scale() &&
+        KernelCache::instance().has_loaded(
+            KernelId::PI05_DENOISE_ADARMS_GATE_UP_GEGLU_NVFP4_ACC16_M16N64K128_DB_SSPM);
+}
+
+// Eight Gate blocks and eight Up blocks instead of eight blocks running both:
+// on the board two waves of eight K tiles stream faster than one wave of 16
+// (H50 -3,960, H10 fused -1,596 cycles per launch).
+bool pi05_nvfp4_geglu_split(bool norm) {
+    return KernelCache::instance().has_loaded(norm
+        ? KernelId::PI05_DENOISE_ADARMS_GATE_UP_GEGLU_NVFP4_ACC16_M16N64K128_DB_SSPM_SPLIT
+        : KernelId::PI05_DENOISE_GATE_UP_GEGLU_NVFP4_ACC16_M64N64K128_DB_SSPM_SPLIT);
+}
+
+// The load-overlapped KV1 direct cache is the M10/M50 instruction stream
+// rescheduled: same register ABI, grids and cache bytes; a REF without it keeps
+// the published pair.
+bool pi05_kv1_direct_cache_overlapped(int64_t rows) {
+    return rows <= 64 && KernelCache::instance().has_loaded(
+        KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_M64D256_OVERLAP);
+}
+
+// The slot-rotated sibling stores the overlap writer's bytes, minus the head
+// slots that its param25 marks as unread by the rotated split-KV readers; with
+// a zero mask it stores every slot. It comes with the rotated readers.
+bool pi05_kv1_direct_cache_rotated(int64_t rows) {
+    return rows <= 64 && pi05_split_kv_rotated(rows);
+}
+
+// The rotated writer's blocks and then the split-KV query RoPE pack's in one
+// launch: the writer stores DDR, the pack reads other cores' SPM, and the
+// pack's warps no longer wait for the writer's. The writer alone when a layer
+// passes no pack. A chunk of at most 16 rows has no rotated reader: its
+// writer runs with mask 0, which stores every slot (the overlap writer's
+// bytes), and the pack's two warps run next to its one block in place of the
+// separate query RoPE and pack launches.
+bool pi05_kv1_direct_cache_q_rope_pack(int64_t rows) {
+    const bool admitted = rows <= 16
+        ? rows > 0
+        : pi05_kv1_direct_cache_rotated(rows) && pi05_split_kv_rope_pack(rows);
+    return admitted && KernelCache::instance().has_loaded(
+        KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_ROT_Q_ROPE_PACK_M64);
+}
+
+// The pack half of that launch reads the chunk's cos/sin rows from SPM; the
+// writer can read them there too instead of waiting on the DDR tables at the
+// fence that also covers its K/V loads (T10 -1,236, T50 -317 cycles per call).
+bool pi05_kv1_direct_cache_spm_rope() {
+    return KernelCache::instance().has_loaded(
+        KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_ROT_Q_ROPE_PACK_SPM_ROPE_M64);
+}
 
 namespace v3 {
 
@@ -127,7 +247,7 @@ namespace {
 // These two camera profiles share the same M50 Action math and storage ABI.
 // Keep the real prefix in every descriptor; never pad P544 into P800.
 bool pi05_action_prefix_admitted(int64_t prefix) {
-    return prefix == 544 || prefix == 576 || prefix == 608 || prefix == 640 || prefix == 672 || prefix == 800 || prefix == 832 || prefix == 864 || prefix == 896 || prefix == 928;
+    return prefix == 544 || prefix == 576 || prefix == 608 || prefix == 640 || prefix == 672 || prefix == 800 || prefix == 832 || prefix == 864 || prefix == 896 || prefix == 928 || prefix == 960;
 }
 
 // Bounded schedule extension. Per-body kernels are unchanged; the
@@ -136,6 +256,11 @@ bool pi05_action_prefix_admitted(int64_t prefix) {
 bool pi05_action_steps_admitted(int64_t steps) {
     return steps == 4 || steps == 10;
 }
+
+// The K-RoPE insert, Q-RoPE epilogue, stripe gather, DMA elision and SPM
+// staging routes stay M50: their payloads bake the row count or the P64
+// physical insert. `pi05_action_rows_admitted` (file scope above) is the
+// horizon set every other route shares.
 
 template <typename Layers>
 bool pi05_is_fp16_action(const Layers& layers) {
@@ -216,55 +341,83 @@ std::vector<int64_t> pi05_kv1_policy_arguments(bool enabled, int64_t prefix) {
     return {1, enabled ? 1 : 0, 10, prefix, 50, 256, 32, 1024, 8};
 }
 std::vector<int64_t> pi05_kv1_linear_arguments(int64_t prefix) {
-    // ABI, steps, P, M, logical D, local D, K, TP, tile M/N/K, grid.
-    return {1, 10, prefix, 50, 256, 32, 1024, 8, 592, 32, 128, 1, 1, 1};
+    const auto c = rpu_pi_kv_linear::stripe_tile();
+    return {3, 10, prefix, 50, 256, 32, 1024, 8, c.m_tile, c.n_tile, c.k_tile,
+            (32 + c.n_tile - 1) / c.n_tile, (50 + c.m_tile - 1) / c.m_tile, 1};
 }
 std::vector<int64_t> pi05_kv1_gather_arguments(int64_t prefix) {
     // ABI, steps, P, rows, local D, logical D, dwidth, cores, schedule.
     return {1, 10, prefix, 50, 32, 256, 2, 8,
             static_cast<int64_t>(RpuAllGatherSchedule::LITTLE_CHUNK)};
 }
+// `rows` carries no default for the same reason as the pair-owner policy
+// below: planning and dispatch must agree on it exactly.
 std::vector<int64_t> pi05_kv1_direct_policy_arguments(
-    bool enabled, int64_t logical_position, int64_t prefix) {
+    bool enabled, int64_t logical_position, int64_t prefix, int64_t rows) {
     // ABI, cold flag, exact denoise/cache geometry, pair-map, fixed producer,
     // direct consumer, payload ABI, explicit register count and grid.
+    const auto c = rpu_pi_kv_linear::stripe_tile();
     return {
-        1, enabled ? 1 : 0, 10, prefix, 50, 64, prefix + 50, 256, 8, 32, 16,
+        5, enabled ? 1 : 0, 10, prefix, rows, pi05_kv_insert_rows(rows),
+        prefix + rows, 256, 8, 32, 16,
         1024, 1024, 18, 8, 2048, 0, 8,
-        static_cast<int64_t>(KernelId::PI05_KV1_STRIPE_W8A16_M592N32),
-        static_cast<int64_t>(
-            KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_M50D256P64),
-        592, 32, 128, 1, 68, 4, 1, 1, 0, logical_position};
+        static_cast<int64_t>(rpu_pi_kv_linear::stripe_id()),
+        static_cast<int64_t>(pi05_kv1_direct_cache_q_rope_pack(rows)
+            ? KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_ROT_Q_ROPE_PACK_M64
+            : pi05_kv1_direct_cache_rotated(rows)
+            ? KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_M64D256_ROT
+            : pi05_kv1_direct_cache_overlapped(rows)
+            ? KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_M64D256_OVERLAP
+            : rows == 10 ? KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_M10D256P16
+                         : KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_M50D256P64),
+        c.m_tile, c.n_tile, c.k_tile, (32 + c.n_tile - 1) / c.n_tile,
+        68, rows == 10 ? 1 : 4, 1, 1, 0, logical_position, (50 + c.m_tile - 1) / c.m_tile};
 }
+// `rows` carries no default: the planning and dispatch sites must agree on it
+// exactly or the physical manifest rejects the route, and a default would let
+// one of them fall back to M50 silently.
 std::vector<int64_t> pi05_kv1_pair_owner_policy_arguments(
     bool enabled, int64_t logical_position, int64_t prefix, bool fp16,
-    int64_t steps = 10) {
+    int64_t steps, int64_t rows) {
     // ABI2, cold flag, exact denoise/cache geometry, pair-map, full owner
     // shapes, pair producer/direct consumer IDs, register ABI and grids,
     // batch offsets, logical position and zero compact-companion bytes.
+    // H10 keeps the pair producer at M10 and uses the M10/P16 consumer.
+    const auto c = rpu_pi_kv_linear::pair(fp16);
     return {
-        fp16 ? 3 : 2, enabled ? 1 : 0, steps, prefix, 50, 64, prefix + 50, 256, 8, 32, 16,
+        fp16 ? 7 : 6, enabled ? 1 : 0, steps, prefix, rows, pi05_kv_insert_rows(rows),
+        prefix + rows, 256, 8, 32, 16,
         1024, 1024, 18, 8, 2048, 0, 8,
         static_cast<int64_t>(
-            fp16 ? KernelId::PI05_DENOISE_KV1_PAIR_OWNER_FP16_M50N32X2K1024
-                 : KernelId::PI05_DENOISE_KV1_PAIR_OWNER_W8A16_M50N32X2K1024),
-        static_cast<int64_t>(
-            KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_M50D256P64),
-        2048, 1024, fp16 ? 0 : 2048, 68, 2, 1, 1, 0, 68, 4, 1, 1, 0,
-        logical_position, 0};
+            !fp16 && pi05_kv1_pair_owner_w8_double_buffered(rows)
+                ? KernelId::PI05_KV_OWNER_W8_DB
+                : pi_wall_kernel_id(c.ordinal)),
+        static_cast<int64_t>(pi05_kv1_direct_cache_q_rope_pack(rows)
+            ? KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_ROT_Q_ROPE_PACK_M64
+            : pi05_kv1_direct_cache_rotated(rows)
+            ? KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_M64D256_ROT
+            : pi05_kv1_direct_cache_overlapped(rows)
+            ? KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_M64D256_OVERLAP
+            : rows == 10 ? KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_M10D256P16
+                         : KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_M50D256P64),
+        2048, 1024, fp16 ? 0 : 2048, 68, c.grid_x, c.grid_y, 1, 0, 68, rows == 10 ? 1 : 4, 1, 1, 0,
+        logical_position, 0, c.tile.m_tile, c.tile.n_tile, c.tile.k_tile,
+        2, 32, 20, 34, 4, 36, 26, 27};
 }
 std::vector<int64_t> pi05_kv1_direct_linear_arguments(int64_t prefix) {
-    // ABI2 differentiates the pair-map owner from stripe-gather's logical-D
-    // owner although both use the same exact generated M592/N32 program.
-    return {2, 10, prefix, 50, 256, 32, 16, 1024, 8,
-            0, 8, 592, 32, 128, 1, 1, 1};
+    const auto c = rpu_pi_kv_linear::stripe_tile();
+    return {4, 10, prefix, 50, 256, 32, 16, 1024, 8,
+            0, 8, c.m_tile, c.n_tile, c.k_tile,
+            (32 + c.n_tile - 1) / c.n_tile, (50 + c.m_tile - 1) / c.m_tile, 1};
 }
 std::vector<int64_t> pi05_kv1_pair_owner_linear_arguments(
-    int64_t prefix, bool fp16, int64_t steps = 10) {
+    int64_t prefix, bool fp16, int64_t steps, int64_t rows) {
     // ABI, steps, P, M, logical D, local D, D16, K, TP, pair db{c,c+8},
     // full weight/scale owner shapes, register count and grid.
-    return {fp16 ? 2 : 1, steps, prefix, 50, 256, 32, 16, 1024, 8,
-            0, 8, 2048, 1024, fp16 ? 0 : 2048, 68, 2, 1, 1, 0};
+    const auto c = rpu_pi_kv_linear::pair(fp16);
+    return {fp16 ? 6 : 5, steps, prefix, rows, 256, 32, 16, 1024, 8,
+            0, 8, 2048, 1024, fp16 ? 0 : 2048, 68, c.grid_x, c.grid_y, 1, 0,
+            c.tile.m_tile, c.tile.n_tile, c.tile.k_tile, 2, 32, 20, 34, 4, 36, 26, 27};
 }
 constexpr int64_t PI05_DENOISE_Q_ROPE_SITE = 1426665372740531219LL;
 constexpr int64_t PI05_DENOISE_K_ROPE_SITE = 1167105004526897534LL;
@@ -306,6 +459,22 @@ constexpr int64_t PI05_DENOISE_RESIDENT_W8_BYTES = 524288;
 constexpr int64_t PI05_DENOISE_BUNDLE_LINEAR_SITE = 0x5049303542554c30LL;
 constexpr int64_t PI05_DENOISE_BUNDLE_PRELOAD_SITE = 0x504930354255444dLL;
 constexpr int64_t PI05_DENOISE_ADARMS_BODY_BYTES = 227328;
+// One row of the [rows, 128] FP16 RoPE cos or sin table.
+constexpr int64_t PI05_DENOISE_ROPE_ROW_BYTES = 128 * 2;
+// What the split-KV K/V share leaves of the planning budget: the 64 KiB
+// out-of-band reserve and the super-persistent SPM that the other owners of a
+// Pi0.5 process keep (SigLIP and Gemma norms and biases, 655,616 to 659,200 B
+// on the board), which the actual-budget check subtracts from SPM_USABLE and
+// this owner's declarations do not see. SPM_USABLE is 83,876 B above the
+// planning budget, so this needs at most 640,860 B.
+constexpr int64_t PI05_DENOISE_SPLIT_KV_SHARE_HEADROOM = 640 << 10;
+// One layer's run of the per-core FP8 scale slab, in this order (each core's
+// share of q_wts, o_wts, down_wts, gate_wts and up_wts).
+constexpr int64_t PI05_DENOISE_NVFP4_SPM_SCALE_Q = 0, PI05_DENOISE_NVFP4_SPM_SCALE_O = 16384,
+    PI05_DENOISE_NVFP4_SPM_SCALE_DOWN = 32768, PI05_DENOISE_NVFP4_SPM_SCALE_GATE = 65536,
+    PI05_DENOISE_NVFP4_SPM_SCALE_UP = 98304, PI05_DENOISE_NVFP4_SPM_SCALE_LAYER = 131072;
+// One layer's per-core Q weight run: K1024 x N256 NVFP4.
+constexpr int64_t PI05_DENOISE_Q_SPM_WEIGHT_LAYER = 131072;
 std::vector<int64_t> pi05_adarms_body_arguments(int64_t body) {
     TORCH_CHECK(body >= 0 && body < 10, "Pi0.5 AdaRMS body DMA index out of range");
     // version, steps, layers, H, rows/body, row width, TP, bytes/body, DDR offset.
@@ -315,8 +484,11 @@ std::vector<int64_t> pi05_gateup_bundle_arguments(int64_t layers) {
     TORCH_CHECK(layers == 1 || layers == 5, "Pi0.5 Gate/Up bundle layer count drift");
     // version, first layer, count, projections, steps, P, M, N, K, TP,
     // matrix bytes, core stride, tile M/N/K, body-table bytes, core-major codec.
-    return {1, 0, layers, 2, 10, 800, 50, 4096, 1024, 8, 524288,
-            layers * 2 * 524288, 512, 48, 128, 227328, 1};
+    const auto c = rpu_pi_wall::select(rpu_pi_wall::Operation::ResidentLinear,
+        rpu_pl_tiling::WeightType::Int8, false, 50, 512, 1024);
+    return {2, 0, layers, 2, 10, 800, 50, 4096, 1024, 8, 524288,
+            layers * 2 * 524288, c.tile.m_tile, c.tile.n_tile, c.tile.k_tile,
+            227328, 1, c.grid_x, c.grid_y, 2, 20};
 }
 std::vector<int64_t> pi05_gateup_bundle_linear_arguments(
     int64_t layers, int64_t layer, int64_t projection) {
@@ -327,10 +499,13 @@ std::vector<int64_t> pi05_gateup_bundle_linear_arguments(
     return args;
 }
 // Owner-local physical launcher, deliberately distinct from shared AUTO_TILE.
-constexpr int64_t PI05_DENOISE_SPM_WEIGHT_M512N48K128 = 5;
+constexpr int64_t PI05_DENOISE_SPM_WEIGHT_CURRENT = 5;
 std::vector<int64_t> pi05_gateup_resident_arguments() {
     // version, layer, steps, P, M, N, K, TP, local bytes, tile M/N/K.
-    return {1, 0, 10, 800, 50, 4096, 1024, 8, 524288, 512, 48, 128};
+    const auto c = rpu_pi_wall::select(rpu_pi_wall::Operation::ResidentLinear,
+        rpu_pl_tiling::WeightType::Int8, false, 50, 512, 1024);
+    return {2, 0, 10, 800, 50, 4096, 1024, 8, 524288,
+            c.tile.m_tile, c.tile.n_tile, c.tile.k_tile, c.grid_x, c.grid_y, 2, 20};
 }
 
 constexpr int64_t PI05_DENOISE_UNUSED_OUTPUT_SITE = 0x50493035444d4101LL;
@@ -348,15 +523,16 @@ bool pi05_graph_dma_shape_admitted(
     const FmbThreeStageChunkPlan& plan, int64_t physical_len,
     int64_t logical_len, int64_t position, int64_t batch_size,
     bool use_attn_mask, bool is_causal, AttentionExecutionPolicy attention) {
-    if (physical_len != 50 || logical_len != 50 || !pi05_action_prefix_admitted(position) ||
+    if (!pi05_action_rows_admitted(physical_len) || logical_len != physical_len ||
+        !pi05_action_prefix_admitted(position) ||
         batch_size != 1 || !use_attn_mask || is_causal ||
         attention != AttentionExecutionPolicy::DDR_KV ||
         plan.chunk_mode != ChunkMode::SEQUENTIAL || plan.spans.size() != 1 ||
-        plan.spans.front().offset != 0 || plan.spans.front().len != 50) return false;
-    const auto one = [position](const auto& chunks) {
+        plan.spans.front().offset != 0 || plan.spans.front().len != physical_len) return false;
+    const auto one = [position, physical_len](const auto& chunks) {
         return chunks.size() == 1 && chunks.front().idx == 0 &&
-            chunks.front().offset == 0 && chunks.front().len == 50 &&
-            chunks.front().kv_seq_len == position + 50;
+            chunks.front().offset == 0 && chunks.front().len == physical_len &&
+            chunks.front().kv_seq_len == position + physical_len;
     };
     return one(plan.input.chunks) && one(plan.qkv.chunks) && one(plan.compute.chunks);
 }
@@ -418,6 +594,7 @@ enum class Pi05DenoiseResidualRoute : int64_t {
     ZERO_WITH_SEPARATE_GATE = 2,
     ZERO_WITH_FUSED_GATE_H1024 = 3,
     ZERO_WITH_XOR3_GATED_ATTN_H1024 = 4,
+    ZERO_WITH_XOR3_GATED_ADARMS_CHAIN_H1024 = 5,
 };
 
 enum class Pi05DenoiseMutableDmaRoute : int64_t {
@@ -558,14 +735,20 @@ std::vector<int64_t> pi05_q_rope_policy_arguments(
 } // namespace
 
 std::vector<int64_t> Pi05DenoiseStepModel::pi05_q_rope_arguments(int64_t logical_position) const {
-
-    return {logical_position,1,10,planned_prefix_len_,50,256,1024,256,8,1,0,592,32,128,16,8,
-            cos_.defined() && cos_.dim()==2 ? cos_.size(0) : 0,256};
+    const auto c = rpu_pi_wall::select(rpu_pi_wall::Operation::QPairRope,
+        rpu_pl_tiling::WeightType::Int8, false, 50, 256, 1024);
+    return {logical_position, 3, 10, planned_prefix_len_, 50, 256, 1024, 256,
+            8, 1, 0, c.tile.m_tile, c.tile.n_tile, c.tile.k_tile, 16,
+            c.grid_x, c.grid_y,
+            cos_.defined() && cos_.dim()==2 ? cos_.size(0) : 0, 256,
+            // Two launches: new-ABI projection, then owned partial_mrope.
+            // RoPE table/position GP bases, grid, heads, D and rotary D.
+            2, 0, 2, 8, 2, 1, 1, 256, 256};
 }
 
 bool Pi05DenoiseStepModel::use_pi05_q_rope_epilogue(int64_t rows,int64_t logical_position) const {
     if (!pi05_q_rope_epilogue_opt_in_ || planned_num_steps_ != 10 ||
-        !pi05_q_rope_tables_owned_ ||
+        !pi05_q_rope_tables_owned_ || rows != 50 ||
         !use_pi05_graph_dma_profile(rows) || layer_weights_.size()!=18 ||
         !pi05_q_rope_tables_admitted(cos_,sin_) || logical_position<0 ||
         logical_position>cos_.size(0) || 50>cos_.size(0)-logical_position) return false;
@@ -798,26 +981,37 @@ bool Pi05DenoiseStepModel::use_pi05_kv1_direct_cache(int64_t rows) const {
         (planned_num_steps_ != 10 &&
          (!pi05_kv1_pair_owner_opt_in_ || !use_spm_adarms_table())) ||
         !pi05_action_prefix_admitted(planned_prefix_len_) ||
-        rows != 50 || chunk_size_ != 50 || hidden_size() != 1024 ||
+        !pi05_action_rows_admitted(rows) || chunk_size_ != rows || hidden_size() != 1024 ||
         intermediate_size() != 4096 || max_action_dim_ != 32 ||
         num_layers() != 18 || num_q_heads() != 8 || num_kv_heads() != 8 ||
         head_dim() != 256 || attn_tp() != 8 ||
-        !pi05_projection_fastpath_admitted() || planned_kv_physical_rows_ != 64 ||
+        !pi05_projection_fastpath_admitted() ||
+        planned_kv_physical_rows_ != pi05_kv_insert_rows(rows) ||
         planned_k_rope_cache_capacity_ != 2048 ||
         layer_weights_.size() != 18 ||
         !pi05_q_rope_tables_admitted(cos_, sin_) ||
         cos_.storage_offset() != 0 || sin_.storage_offset() != 0 ||
         logical_position < 0 || logical_position > cos_.size(0) ||
-        50 > cos_.size(0) - logical_position) {
+        rows > cos_.size(0) - logical_position) {
         return false;
     }
     const bool fp16 = pi05_fp16_projection_owners_admitted(layer_weights_);
     if (fp16) {
         // The compact companion producer remains W8-only. FP16 uses its
         // independent full-owner program with no fabricated quantization scales.
+        // H10 also needs the optional M10/P16 direct-cache consumer.
         return pi05_kv1_pair_owner_opt_in_ &&
             KernelCache::instance().has_loaded(
-                KernelId::PI05_DENOISE_KV1_PAIR_OWNER_FP16_M50N32X2K1024);
+                KernelId::PI_WALL_PI_KV_OWNER_W16A16_ACC16_M608N32K128) &&
+            (rows == 50 || KernelCache::instance().has_loaded(
+                KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_M10D256P16));
+    }
+    // The W8A16 pair owner reads M from the same row register as the FP16 one,
+    // so H10 needs only the M10/P16 direct-cache consumer.
+    if (rows != 50 && !(rows == 10 && chunk_size_ == 10 &&
+                        KernelCache::instance().has_loaded(
+                            KernelId::PI05_DENOISE_KV1_DIRECT_CACHE_M10D256P16))) {
+        return false;
     }
     return std::all_of(
         layer_weights_.begin(), layer_weights_.end(),
@@ -856,6 +1050,22 @@ bool Pi05DenoiseStepModel::use_pi05_kv1_pair_owner(int64_t rows) const {
         use_pi05_kv1_direct_cache(rows);
 }
 
+bool Pi05DenoiseStepModel::pi05_q_in_kv1_pair_owner() const {
+    // nvfp4_spm_scale_ exists only for ACC16 TP8 NVFP4 with the SPM-scale payloads.
+    return pi05_kv1_pair_owner_opt_in_ && !pi05_q_rope_epilogue_opt_in_ &&
+        nvfp4_spm_scale_.defined() && !pi05_is_fp16_action(layer_weights_) &&
+        pi05_q_kv1_pair_owner_fused(chunk_size_);
+}
+
+std::vector<int64_t> Pi05DenoiseStepModel::pi05_kv1_pair_owner_route_arguments() const {
+    auto args = pi05_kv1_pair_owner_linear_arguments(
+        planned_prefix_len_, pi05_is_fp16_action(layer_weights_), planned_num_steps_, chunk_size_);
+    if (pi05_q_in_kv1_pair_owner()) {
+        args.push_back(static_cast<int64_t>(KernelId::PI05_Q_KV1_PAIR_DB_SSPM));
+    }
+    return args;
+}
+
 int64_t Pi05DenoiseStepModel::pi05_w4_geglu_m50_selector() const {
     return pi05_w4_geglu_n64_opt_in_ ? PI05_DENOISE_W4_GEGLU_M50_M464N64K128
                                    : PI05_DENOISE_W4_GEGLU_M50_M512N48K128;
@@ -864,40 +1074,27 @@ int64_t Pi05DenoiseStepModel::pi05_w4_geglu_m50_selector() const {
 std::vector<int64_t> Pi05DenoiseStepModel::pi05_w4_geglu_m50_arguments() const {
     const int64_t gs = !layer_weights_.empty() && layer_weights_[0].q_ws.defined() &&
             layer_weights_[0].q_ws.dim() == 2 ? layer_weights_[0].q_ws.size(0) : 0;
-    const int64_t local_groups = gs > 0 ? 1024 / gs : 0;
+    TORCH_CHECK(gs == 32 || gs == 64 || gs == 128, "Pi W4 GeGLU requires a bound group size");
+    const auto id = rpu_geglu_linear::select(rpu_pl_tiling::WeightType::Int4, false, gs);
+    const auto tile = rpu_geglu_linear::tile(id);
+    const auto grid = rpu_geglu_linear::grid(id);
+    const int64_t local_groups = 1024 / gs;
     const int64_t scale_elements = ((local_groups + 3) / 4) * 8 * 8 * 4 * 64;
-    // Independent W4 ABI: packed nibble weights, FP16 activation/scales,
-    // original ACC16 Gate/GELU/Up/MUL retirement, and the complete owner profile.
-    // Bind tile/grid/register count, four shift8 DDR pairs, GS registers,
-    // both physical packed owner layouts, scale block stride/alignment,
-    // and absolute SPM roles (residual1 input / gate output), with no extra slab.
     std::vector<int64_t> arguments{
-        1, pi05_w4_geglu_m50_opt_in_ ? 1 : 0,
-        static_cast<int64_t>(KernelId::PI05_DENOISE_GATE_UP_GEGLU_WINT4A16_PGRP_M512N48K128),
+        3, pi05_w4_geglu_m50_opt_in_ ? 1 : 0, static_cast<int64_t>(id),
         4, 16, 16, 1, 1, 1, 1,
-        512, 48, 128, 68, 11, 1, 1,
+        tile.m_tile, tile.n_tile, tile.k_tile, 68, grid[0], grid[1], grid[2],
         2, 3, 20, 21, 32, 33, 34, 35, 8,
-        24, gs, 25, local_groups, 26, 27, 32768,
+        28, gs, 29, local_groups, 24, 25, 32768,
         4096, 512, 2097152, 4096, 512, 2097152,
-        gs, gs > 0 ? scale_elements / gs : 0, scale_elements, scale_elements * 2,
+        gs, scale_elements / gs, scale_elements, scale_elements * 2,
         256, 4096, 256,
-        1, 102400, 2, 51200, 0, 0, 2048, 1024, 1, 1, 0,
+        1, chunk_size_ * 2048, 2, chunk_size_ * 1024, 0, 0, 2048, 1024, 1, 9, 0,
         static_cast<int64_t>(FmbLinearAccumulationPolicy::ACC16),
-        static_cast<int64_t>(FmbGraphLifecycle::COMPOSITE_CHILD)};
+        static_cast<int64_t>(FmbGraphLifecycle::COMPOSITE_CHILD),
+        pi05_w4_geglu_n64_opt_in_ ? 1 : 0};
     const auto profile = pi05_w4_fastpath_arguments();
     arguments.insert(arguments.end(), profile.begin(), profile.end());
-    if (pi05_w4_geglu_n64_opt_in_) {
-        // ABI2 is the separately admitted GS128 M464/N64 producer. Keep the
-        // complete ABI1 payload byte-for-byte when the N64 cold flag is off.
-        arguments[0] = 2;
-        arguments[2] = static_cast<int64_t>(
-            KernelId::PI05_DENOISE_GATE_UP_GEGLU_WINT4A16_PGRP_M464N64K128);
-        arguments[10] = 464;  // tile M
-        arguments[11] = 64;   // tile N
-        arguments[14] = 8;    // grid X
-        arguments.insert(arguments.end(), {
-            pi05_w4_geglu_n64_opt_in_ ? 1 : 0, 128});
-    }
     return arguments;
 }
 
@@ -916,10 +1113,11 @@ void Pi05DenoiseStepModel::validate_pi05_w4_geglu_m50_manifest(
     if (pi05_w4_geglu_m50_opt_in_) {
         TORCH_CHECK(
             enabled && manifest.state == FmbPhysicalManifestState::COMPLETE &&
-                manifest.logical_length == 50 && manifest.physical_length == 50 &&
+                manifest.logical_length == chunk_size_ &&
+                manifest.physical_length == chunk_size_ &&
                 manifest.execution_padding_rows == 0 &&
-                manifest.kv_logical_length == planned_prefix_len_ + 50 &&
-                manifest.kv_insert_physical_rows == 64 &&
+                manifest.kv_logical_length == planned_prefix_len_ + chunk_size_ &&
+                manifest.kv_insert_physical_rows == pi05_kv_insert_rows(chunk_size_) &&
                 manifest.graph_lifecycle == FmbGraphLifecycle::COMPOSITE_CHILD &&
                 manifest.linear_accumulation == linear_accumulation_policy(),
             "Pi W4 M50 GeGLU requires exact COMPLETE ten-step W4 pgrp owners");
@@ -991,13 +1189,33 @@ void Pi05DenoiseStepModel::validate_pi05_w4_geglu_m50_policy(
 
 std::vector<int64_t> Pi05DenoiseStepModel::pi05_nvfp4_geglu_m50_arguments() const {
     // ABI2 binds the separate ACC16 producer and its FP16 K128 retirement.
-    // Register/storage geometry is unchanged from the historical ACC32 ABI1.
+    // Register/storage geometry is unchanged from the historical ACC32 ABI1;
+    // the payload and its tile M follow the double-buffered and tile-scale selection.
+    const bool double_buffered = pi05_nvfp4_acc16_geglu_double_buffered(chunk_size_);
+    const bool tile_scaled = double_buffered && pi05_nvfp4_acc16_geglu_tile_scale();
     std::vector<int64_t> args{2, pi05_nvfp4_geglu_m50_opt_in_ ? 1 : 0,
-        static_cast<int64_t>(KernelId::PI05_DENOISE_GATE_UP_GEGLU_NVFP4_ACC16_M320N64K128),
-        50, 4096, 1024, 512, 8, 320, 64, 128, 68, 8, 1, 1,
+        static_cast<int64_t>(tile_scaled
+            ? KernelId::PI05_NVFP4_GEGLU_DB_TSCALE
+            : double_buffered ? KernelId::PI05_NVFP4_GEGLU_DB
+                              : KernelId::PI05_DENOISE_GATE_UP_GEGLU_NVFP4_ACC16_M320N64K128),
+        chunk_size_, 4096, 1024, 512, 8, double_buffered ? 64 : 320, 64, 128, 68, 8, 1, 1,
         2, 3, 20, 21, 32, 33, 34, 35, 24, 25, 36, 37, 27,
         16, 8, 32, 24, 18, 2, 16, 16, 16, 16,
-        102400, 51200, 0, 8192, 2048, 1024};
+        chunk_size_ * 2048, chunk_size_ * 1024, 0, 8192, 2048, 1024};
+    // Layers under nvfp4_spm_scale_layers() take the SPM-scale sibling, which
+    // has the same registers except that 20/21 and 34/35 hold SPM addresses.
+    // Installed weights decide this: the cost identity binds it outside any plan.
+    if (nvfp4_spm_scale_.defined()) {
+        args.push_back(static_cast<int64_t>(pi05_nvfp4_geglu_split(false)
+            ? KernelId::PI05_DENOISE_GATE_UP_GEGLU_NVFP4_ACC16_M64N64K128_DB_SSPM_SPLIT
+            : KernelId::PI05_NVFP4_GEGLU_DB_SSPM));
+        // Those layers also fold the MLP-side AdaRMS norm in at M <= 16.
+        if (pi05_adarms_geglu_fused(chunk_size_)) {
+            args.push_back(static_cast<int64_t>(pi05_nvfp4_geglu_split(true)
+                ? KernelId::PI05_DENOISE_ADARMS_GATE_UP_GEGLU_NVFP4_ACC16_M16N64K128_DB_SSPM_SPLIT
+                : KernelId::PI05_DENOISE_ADARMS_GATE_UP_GEGLU_NVFP4_ACC16_M16N64K128_DB_SSPM));
+        }
+    }
     const auto profile = pi05_w4_fastpath_arguments();
     args.insert(args.end(), profile.begin(), profile.end());
     return args;
@@ -1005,13 +1223,15 @@ std::vector<int64_t> Pi05DenoiseStepModel::pi05_nvfp4_geglu_m50_arguments() cons
 
 bool Pi05DenoiseStepModel::use_pi05_nvfp4_geglu_m50(int64_t rows) const {
     return !linear_acc32_ && pi05_nvfp4_geglu_m50_opt_in_ && nvfp4_.enabled() &&
-        num_cores() == 8 && attn_tp() == 8 && mlp_tp() == 8 && rows == 50 &&
+        num_cores() == 8 && attn_tp() == 8 && mlp_tp() == 8 &&
+        pi05_action_rows_admitted(rows) && rows == chunk_size_ &&
         planned_num_steps_ == 10 &&
         (planned_prefix_len_ == 544 || planned_prefix_len_ == 672 ||
          planned_prefix_len_ == 800 || planned_prefix_len_ == 928) &&
         pi05_nvfp4_weight_profile_admitted() && use_pi05_xor3_gated_mlp(rows) &&
-        KernelCache::instance().has_loaded(
-            KernelId::PI05_DENOISE_GATE_UP_GEGLU_NVFP4_ACC16_M320N64K128);
+        (pi05_nvfp4_acc16_geglu_double_buffered(rows) ||
+         KernelCache::instance().has_loaded(
+             KernelId::PI05_DENOISE_GATE_UP_GEGLU_NVFP4_ACC16_M320N64K128));
 }
 
 void Pi05DenoiseStepModel::validate_pi05_nvfp4_geglu_m50_manifest(
@@ -1019,9 +1239,11 @@ void Pi05DenoiseStepModel::validate_pi05_nvfp4_geglu_m50_manifest(
     const bool enabled = use_pi05_nvfp4_geglu_m50(manifest.physical_length);
     if (pi05_nvfp4_geglu_m50_opt_in_) {
         TORCH_CHECK(enabled && manifest.state == FmbPhysicalManifestState::COMPLETE &&
-            manifest.logical_length == 50 && manifest.physical_length == 50 &&
-            manifest.execution_padding_rows == 0 && manifest.kv_logical_length == planned_prefix_len_ + 50 &&
-            manifest.kv_insert_physical_rows == 64 &&
+            manifest.logical_length == chunk_size_ &&
+            manifest.physical_length == chunk_size_ &&
+            manifest.execution_padding_rows == 0 &&
+            manifest.kv_logical_length == planned_prefix_len_ + chunk_size_ &&
+            manifest.kv_insert_physical_rows == pi05_kv_insert_rows(chunk_size_) &&
             manifest.graph_lifecycle == FmbGraphLifecycle::COMPOSITE_CHILD &&
             manifest.linear_accumulation == linear_accumulation_policy(),
             "Pi NVFP4 GeGLU requires exact COMPLETE striped-v2 Action owners");
@@ -1069,7 +1291,8 @@ void Pi05DenoiseStepModel::validate_pi05_nvfp4_geglu_m50_policy(
     }
     validate_pi05_nvfp4_geglu_m50_manifest(candidate->physical_manifest);
     if (pi05_nvfp4_geglu_m50_opt_in_) {
-        TORCH_CHECK(pi05_graph_dma_shape_admitted(candidate->stage_plan, 50, 50,
+        TORCH_CHECK(pi05_graph_dma_shape_admitted(candidate->stage_plan,
+            chunk_size_, chunk_size_,
             planned_prefix_len_, 1, true, false, AttentionExecutionPolicy::DDR_KV),
             "Pi NVFP4 GeGLU chunk schedule drifted");
         pi05_require_stable_graph_dma_capture();
@@ -1078,26 +1301,26 @@ void Pi05DenoiseStepModel::validate_pi05_nvfp4_geglu_m50_policy(
 
 std::vector<int64_t> Pi05DenoiseStepModel::pi05_geglu_m50_arguments() const {
     // ABI, real cold flag, exact denoise profile, kernel/tile/register/grid
-    // ABI, four DDR register pairs, byte strides, partition/dtype/bias and
+    // ABI, DDR register pairs, byte strides, partition/dtype/bias and
     // input/output/extra SPM bytes. Shared by descriptor and cost identity.
-    if (pi05_is_fp16_action(layer_weights_)) {
-        // ABI2: two FP16 weight owners, no scale operands, canonical FP16
-        // M608/N32 auto-tile family and its original ACC16 retirement.
-        return {2, pi05_geglu_m50_opt_in_ ? 1 : 0,
-            planned_num_steps_, planned_prefix_len_, 50, 64, planned_prefix_len_ + 50,
-            1024, 4096, 512, 18, 8, 8, 256, 8, 2048,
-            static_cast<int64_t>(KernelId::PI05_DENOISE_GATE_UP_GEGLU_FP16_M608N32K128),
-            608, 32, 128, 68, 16, 1, 1, 0, 2, 3, 24, 25,
-            2048, 1024, 1, 0, 0, 102400, 51200, 0, 16, 0};
-    }
-    return {
-        1, pi05_geglu_m50_opt_in_ ? 1 : 0,
-        planned_num_steps_, planned_prefix_len_, 50, 64, planned_prefix_len_ + 50, 1024, 4096, 512, 18, 8, 8, 256, 8, 2048,
-        static_cast<int64_t>(
-            KernelId::PI05_DENOISE_GATE_UP_GEGLU_W8A16_M512N48K128),
-        512, 48, 128, 68, 11, 1, 1, 0,
-        2, 3, 20, 21, 24, 25, 26, 27,
-        2048, 1024, 1, 1, 0, 102400, 51200, 0};
+    // Both payloads read M from p8, so H10 differs only in the row count and
+    // the SPM byte counts derived from it.
+    const bool fp16 = pi05_is_fp16_action(layer_weights_);
+    const int64_t rows = chunk_size_;
+    const auto id = rpu_geglu_linear::select(fp16 ? rpu_pl_tiling::WeightType::Fp16
+                                                 : rpu_pl_tiling::WeightType::Int8, false);
+    const auto tile = rpu_geglu_linear::tile(id);
+    const auto grid = rpu_geglu_linear::grid(id);
+    std::vector<int64_t> arguments{
+        4, pi05_geglu_m50_opt_in_ ? 1 : 0,
+        planned_num_steps_, planned_prefix_len_, rows, pi05_kv_insert_rows(rows),
+        planned_prefix_len_ + rows,
+        1024, 4096, 512, 18, 8, 8, 256, 8, 2048,
+        static_cast<int64_t>(id), tile.m_tile, tile.n_tile, tile.k_tile,
+        68, grid[0], grid[1], grid[2], 0,
+        2, 3, 32, 33, 2048, 1024, 1, fp16 ? 2 : 1, 0, rows * 2048, rows * 1024, 0};
+    if (!fp16) arguments.insert(arguments.end(), {20, 21, 34, 35});
+    return arguments;
 }
 
 bool Pi05DenoiseStepModel::use_pi05_geglu_m50(int64_t rows) const {
@@ -1108,8 +1331,10 @@ bool Pi05DenoiseStepModel::use_pi05_geglu_m50(int64_t rows) const {
     if (pi05_is_fp16_action(layer_weights_)) {
         return pi05_fp16_projection_owners_admitted(layer_weights_) &&
             KernelCache::instance().has_loaded(
-                KernelId::PI05_DENOISE_GATE_UP_GEGLU_FP16_M608N32K128);
+                KernelId::FUSED_GEGLU_W16A16_ACC16_M80N96K512);
     }
+    // The W8A16 M512 payload reads M from the row register, like the FP16 one.
+    if (!pi05_action_rows_admitted(rows) || rows != chunk_size_) return false;
     return std::all_of(
         layer_weights_.begin(), layer_weights_.end(),
         [](const LayerWeights& weights) {
@@ -1141,10 +1366,11 @@ void Pi05DenoiseStepModel::validate_pi05_geglu_m50_manifest(
     if (pi05_geglu_m50_opt_in_) {
         TORCH_CHECK(
             enabled && manifest.state == FmbPhysicalManifestState::COMPLETE &&
-                manifest.logical_length == 50 && manifest.physical_length == 50 &&
+                manifest.logical_length == chunk_size_ &&
+                manifest.physical_length == chunk_size_ &&
                 manifest.execution_padding_rows == 0 &&
-                manifest.kv_logical_length == planned_prefix_len_ + 50 &&
-                manifest.kv_insert_physical_rows == 64 &&
+                manifest.kv_logical_length == planned_prefix_len_ + chunk_size_ &&
+                manifest.kv_insert_physical_rows == pi05_kv_insert_rows(chunk_size_) &&
                 manifest.graph_lifecycle == FmbGraphLifecycle::COMPOSITE_CHILD &&
                 manifest.linear_accumulation == linear_accumulation_policy(),
             "Pi M50 GeGLU requires exact COMPLETE four/ten-step FP16/W8A16 owners");
@@ -1209,13 +1435,21 @@ std::vector<int64_t> Pi05DenoiseStepModel::pi05_xor3_gated_mlp_arguments() const
     // semantic SPM roles (down/zero/skip/gate/output) and byte extents;
     // alignment, extra SPM/DDR bytes, rounds/shards; SCU/SCM locations;
     // separate FP16 multiply/add retirement and the prepared-zero contract.
+    // H10 binds the M10 continuation and its M10 extents and shards; the
+    // whole-row chain binds its own M50 continuation.
+    const int64_t rows = chunk_size_;
+    const int64_t full_bytes = rows * 1024 * 2;
+    const KernelId kernel = rows == 10 ? KernelId::PI05_XOR3_GATED_RESIDUAL_M10N1024
+        : use_pi05_xor3_gated_adarms_chain(rows) ? KernelId::PI05_XOR3_GATED_ROWS_M50N1024
+                                                 : KernelId::PI05_XOR3_GATED_RESIDUAL_M50N1024;
     std::vector<int64_t> arguments{
         1, pi05_xor3_gated_mlp_opt_in_ ? 1 : 0,
-        planned_num_steps_, planned_prefix_len_, 50, 64, planned_prefix_len_ + 50, 1024, 4096, 18, 8, 8, 256, 2048,
-        static_cast<int64_t>(KernelId::PI05_XOR3_GATED_RESIDUAL_M50N1024),
+        planned_num_steps_, planned_prefix_len_, rows, pi05_kv_insert_rows(rows),
+        planned_prefix_len_ + rows, 1024, 4096, 18, 8, 8, 256, 2048,
+        static_cast<int64_t>(kernel),
         1, 8, 1, 1, 2,
-        1, 102400, 2, 102400, 3, 102400, 4, 2048, 5, 102400,
-        256, 0, 0, 1, 6400, 63488,
+        1, full_bytes, 2, full_bytes, 3, full_bytes, 4, 2048, 5, full_bytes,
+        256, 0, 0, 1, rows * 1024 / 8, 63488,
         4096, 4, 8, 10, 4112, 4128, 4144, 1, 1, 1};
     if (pi05_w4_fastpath_opt_in_) {
         // Version 2 is the same FP16 continuation after ordinary W4 GeLU
@@ -1240,8 +1474,9 @@ bool Pi05DenoiseStepModel::use_pi05_xor3_gated_mlp(int64_t rows) const {
     if (pi05_is_fp16_action(layer_weights_)) {
         return pi05_fp16_projection_owners_admitted(layer_weights_);
     }
-    // GeGLU binds the exact ten-step/M50/H1024/I4096/18-layer/TP8
-    // KV1 pair-owner/XOR3-attention stack. Also pin every Down W8A16 owner.
+    if (!pi05_action_rows_admitted(rows) || rows != chunk_size_) return false;
+    // GeGLU binds the exact ten-step/H1024/I4096/18-layer/TP8 KV1 pair-owner
+    // and XOR3-attention stack. Also pin every Down W8A16 owner.
     return std::all_of(
         layer_weights_.begin(), layer_weights_.end(),
         [](const LayerWeights& weights) {
@@ -1267,10 +1502,11 @@ void Pi05DenoiseStepModel::validate_pi05_xor3_gated_mlp_manifest(
     if (pi05_xor3_gated_mlp_opt_in_) {
         TORCH_CHECK(
             enabled && manifest.state == FmbPhysicalManifestState::COMPLETE &&
-                manifest.logical_length == 50 && manifest.physical_length == 50 &&
+                manifest.logical_length == chunk_size_ &&
+                manifest.physical_length == chunk_size_ &&
                 manifest.execution_padding_rows == 0 &&
-                manifest.kv_logical_length == planned_prefix_len_ + 50 &&
-                manifest.kv_insert_physical_rows == 64 &&
+                manifest.kv_logical_length == planned_prefix_len_ + chunk_size_ &&
+                manifest.kv_insert_physical_rows == pi05_kv_insert_rows(chunk_size_) &&
                 manifest.graph_lifecycle == FmbGraphLifecycle::COMPOSITE_CHILD &&
                 manifest.linear_accumulation == linear_accumulation_policy(),
             "Pi MLP XOR3+gated requires exact COMPLETE W8-GeGLU or W4-fastpath owners");
@@ -1341,10 +1577,11 @@ void Pi05DenoiseStepModel::validate_pi05_kv1_direct_cache_manifest(
     if (pi05_kv1_direct_cache_opt_in_) {
         TORCH_CHECK(
             enabled && manifest.state == FmbPhysicalManifestState::COMPLETE &&
-                manifest.logical_length == 50 && manifest.physical_length == 50 &&
+                manifest.logical_length == chunk_size_ &&
+                manifest.physical_length == chunk_size_ &&
                 manifest.execution_padding_rows == 0 &&
-                manifest.kv_logical_length == planned_prefix_len_ + 50 &&
-                manifest.kv_insert_physical_rows == 64 &&
+                manifest.kv_logical_length == planned_prefix_len_ + chunk_size_ &&
+                manifest.kv_insert_physical_rows == pi05_kv_insert_rows(chunk_size_) &&
                 manifest.graph_lifecycle == FmbGraphLifecycle::COMPOSITE_CHILD &&
                 manifest.linear_accumulation == linear_accumulation_policy(),
             "Pi KV1 direct-cache requires exact W8A16 ten-step "
@@ -1374,9 +1611,11 @@ void Pi05DenoiseStepModel::validate_pi05_kv1_direct_cache_manifest(
             const auto expected_policy = pi05_kv1_pair_owner_opt_in_
                 ? pi05_kv1_pair_owner_policy_arguments(
                       pi05_kv1_pair_owner_opt_in_, descriptor_position,
-                      planned_prefix_len_, pi05_is_fp16_action(layer_weights_), planned_num_steps_)
+                      planned_prefix_len_, pi05_is_fp16_action(layer_weights_), planned_num_steps_,
+                      chunk_size_)
                 : pi05_kv1_direct_policy_arguments(
-                      pi05_kv1_direct_cache_opt_in_, descriptor_position, planned_prefix_len_);
+                      pi05_kv1_direct_cache_opt_in_, descriptor_position,
+                      planned_prefix_len_, chunk_size_);
             TORCH_CHECK(
                 route.family == FmbRouteFamily::GRAPH_SCHEDULE &&
                     route.selector == 1 && route.flags == 0 &&
@@ -1391,7 +1630,7 @@ void Pi05DenoiseStepModel::validate_pi05_kv1_direct_cache_manifest(
                         pi05_kv1_pair_owner_selector(pi05_is_fp16_action(layer_weights_)) &&
                     route.flags == 0 && route.invocation == 0 &&
                     route.arguments ==
-                        pi05_kv1_pair_owner_linear_arguments(planned_prefix_len_, pi05_is_fp16_action(layer_weights_), planned_num_steps_),
+                        pi05_kv1_pair_owner_route_arguments(),
                 "Pi KV1 pair-owner producer route drifted or escaped its "
                 "cold owner");
         } else if (route.site_id == PI05_DENOISE_K_LINEAR_SITE &&
@@ -1444,13 +1683,13 @@ void Pi05DenoiseStepModel::validate_pi05_kv1_direct_cache_manifest(
                                 KvInsertRoute::PAD16_V16) &&
                             route.invocation == 0 &&
                             frozen.route() == KvInsertRoute::PAD16_V16 &&
-                            frozen.logical_rows() == 50 &&
-                            frozen.physical_rows() == 64 &&
+                            frozen.logical_rows() == chunk_size_ &&
+                            frozen.physical_rows() == pi05_kv_insert_rows(chunk_size_) &&
                             frozen.segment_count() == 1 &&
                             frozen.segment(0).kernel == KvInsertKernel::V16 &&
                             frozen.segment(0).position == planned_prefix_len_ &&
                             frozen.segment(0).token_offset == 0 &&
-                            frozen.segment(0).rows == 64 &&
+                            frozen.segment(0).rows == pi05_kv_insert_rows(chunk_size_) &&
                             route.arguments == std::vector<int64_t>(
                                 canonical.begin(), canonical.end()),
                         "Pi KV1 direct-cache KV semantic route drifted");
@@ -1515,6 +1754,7 @@ bool Pi05DenoiseStepModel::use_pi05_rope_register_patch() const {
     return loop_mode_ && num_steps_ == 10 &&
         rope_position_ >= 0 && rope_position_ <= UINT32_MAX &&
         !pi05_q_rope_epilogue_opt_in_ &&
+        split_kv_layouts_.empty() &&
         use_pi05_kv1_direct_cache(chunk_size_);
 }
 
@@ -1903,11 +2143,13 @@ void Pi05DenoiseStepModel::set_weights(
         (down_w[0].scalar_type() == at::kByte) ? down_w[0].size(1) * 2
                                                : down_w[0].size(1);
     if (num_cores() != 8) {
+        // NVFP4 keeps K/V W8; the scale-list check above fixed its scope.
+        const bool nvfp4 = nvfp4_tables.enabled();
         const auto dtype = q_w[0].scalar_type();
-        TORCH_CHECK(dtype == at::kHalf || dtype == at::kChar,
-                    "reduced Pi0.5 supports FP16 or W8A16 projections");
-        TORCH_CHECK(max_action_dim == 32 && chunk_size == 50,
-                    "reduced Pi0.5 requires action horizon 50 and width 32");
+        TORCH_CHECK(nvfp4 || dtype == at::kHalf || dtype == at::kChar,
+                    "reduced Pi0.5 supports FP16, W8A16 or Action NVFP4 projections");
+        TORCH_CHECK(max_action_dim == 32 && pi05_action_rows_admitted(chunk_size),
+                    "reduced Pi0.5 requires action horizon 50 or 10 and width 32");
         for (const auto* tensor : {&action_in_proj_w, &action_in_proj_b,
                                    &action_out_proj_w, &action_out_proj_b})
             TORCH_CHECK(tensor->defined() && tensor->scalar_type() == at::kHalf &&
@@ -1921,7 +2163,10 @@ void Pi05DenoiseStepModel::set_weights(
                     "Pi0.5 reduced single-core action projection shape mismatch");
         const int64_t expected_physical = validate_pi05_reduced_geometry(
             num_cores(), num_q_heads, num_kv_heads, head_dim,
-            hidden_size, 4096, num_layers, true, dtype == at::kChar);
+            hidden_size, 4096, num_layers, true,
+            nvfp4 ? Pi05ReducedPrecision::NVFP4
+                  : dtype == at::kChar ? Pi05ReducedPrecision::W8A16
+                                       : Pi05ReducedPrecision::FP16);
         TORCH_CHECK(intermediate_size == expected_physical,
                     "Pi0.5 denoise physical MLP width/precision mismatch");
         for (int64_t i = 0; i < num_layers; ++i) {
@@ -1929,9 +2174,12 @@ void Pi05DenoiseStepModel::set_weights(
             size_t j = 0;
             for (const auto* tensor : {&q_w[i], &k_w[i], &v_w[i],
                     &o_w[i], &gate_w[i], &up_w[i], &down_w[i]}) {
-                TORCH_CHECK(tensor->scalar_type() == dtype && tensor->dim() == 2,
+                const bool kv = j == 1 || j == 2;
+                const auto expected = nvfp4 ? (kv ? at::kChar : at::kByte) : dtype;
+                TORCH_CHECK(tensor->scalar_type() == expected && tensor->dim() == 2,
                             "Pi0.5 reduced projection precision/rank mismatch");
-                shapes[j++] = {tensor->size(0), tensor->size(1)};
+                shapes[j++] = {tensor->size(0),
+                               tensor->size(1) * (expected == at::kByte ? 2 : 1)};
             }
             validate_pi05_reduced_projection_shapes(
                 shapes, hidden_size, expected_physical);
@@ -1939,6 +2187,7 @@ void Pi05DenoiseStepModel::set_weights(
     }
     logical_intermediate_size_ = num_cores() == 8 ? intermediate_size : 4096;
     reduced_w8a16_ = q_w[0].scalar_type() == at::kChar;
+    reduced_nvfp4_ = nvfp4_tables.enabled();
     set_model_params(num_q_heads, num_kv_heads, head_dim,
                      hidden_size, intermediate_size);
     set_num_layers(num_layers);
@@ -1977,6 +2226,48 @@ void Pi05DenoiseStepModel::set_weights(
             pi05_k_rope_insert_w8a16_ &= weight->scalar_type() == at::kChar;
         }
     }
+    // The ACC16 Q/O/Down double-buffered Linear reads each tile's scales in
+    // one load from these companions (~512 KiB per layer); the striped owners
+    // stay for every other route.
+    if (nvfp4_.enabled() && !linear_acc32_ && attn_tp() == 8 &&
+        pi05_nvfp4_acc16_linear_tile_scale()) {
+        const int64_t nq = num_q_heads * head_dim;
+        for (auto& lw : layer_weights_) {
+            lw.q_wts = rpu_pack_pi05_nvfp4_tile_scale(lw.q_ws, nq, hidden_size, 1);
+            lw.o_wts = rpu_pack_pi05_nvfp4_tile_scale(lw.o_ws, hidden_size, nq, 0);
+            lw.down_wts = rpu_pack_pi05_nvfp4_tile_scale(lw.down_ws, hidden_size, intermediate_size, 0);
+        }
+    }
+    // The same for the double-buffered GeGLU's Gate and Up (~512 KiB per layer).
+    if (nvfp4_.enabled() && !linear_acc32_ && mlp_tp() == 8 &&
+        pi05_nvfp4_acc16_geglu_tile_scale()) {
+        for (auto& lw : layer_weights_) {
+            lw.gate_wts = rpu_pack_pi05_nvfp4_tile_scale(lw.gate_ws, intermediate_size, hidden_size, 1);
+            lw.up_wts = rpu_pack_pi05_nvfp4_tile_scale(lw.up_ws, intermediate_size, hidden_size, 1);
+        }
+    }
+    // The cold source of the per-core slab that the SPM-scale siblings read.
+    nvfp4_spm_scale_ = at::Tensor();
+    if (nvfp4_.enabled() && !linear_acc32_ && attn_tp() == 8 && mlp_tp() == 8 &&
+        pi05_nvfp4_acc16_spm_scale()) {
+        std::vector<at::Tensor> scales;
+        for (const auto& lw : layer_weights_) {
+            scales.insert(scales.end(), {lw.q_wts, lw.o_wts, lw.down_wts, lw.gate_wts, lw.up_wts});
+        }
+        nvfp4_spm_scale_ = rpu_pack_pi05_nvfp4_spm_scale(scales, 8);
+        TORCH_CHECK(nvfp4_spm_scale_.size(1) * DWIDTH ==
+                        num_layers * PI05_DENOISE_NVFP4_SPM_SCALE_LAYER,
+                    "Pi0.5 NVFP4 SPM scale slab does not match its layer run");
+    }
+    // The cold source of the per-core Q weight runs: the same plane split.
+    q_spm_weight_ = at::Tensor();
+    if (nvfp4_spm_scale_.defined()) {
+        std::vector<at::Tensor> weights;
+        for (const auto& lw : layer_weights_) weights.push_back(lw.q_w);
+        q_spm_weight_ = rpu_pack_pi05_nvfp4_spm_scale(weights, 8);
+        TORCH_CHECK(q_spm_weight_.size(1) * DWIDTH == num_layers * PI05_DENOISE_Q_SPM_WEIGHT_LAYER,
+                    "Pi0.5 SPM Q weight runs do not match their layer run");
+    }
     pi05_w4_fastpath_profile_ = pi05_w4_fastpath_opt_in_ &&
         (nvfp4_.enabled() ? pi05_nvfp4_weight_profile_admitted() : pi05_w4_weight_profile_admitted());
     TORCH_CHECK(!pi05_w4_fastpath_opt_in_ || pi05_w4_fastpath_profile_,
@@ -1989,7 +2280,8 @@ void Pi05DenoiseStepModel::set_weights(
                 pi05_projection_fastpath_admitted() &&
                 hidden_size == 1024 && intermediate_size == 4096 &&
                 num_q_heads == 8 && num_kv_heads == 8 && head_dim == 256 &&
-                num_layers == 18 && chunk_size == 50 &&
+                num_layers == 18 &&
+                pi05_action_rows_admitted(chunk_size) &&
                 (!pi05_kv1_direct_cache_opt_in_ || max_action_dim == 32) &&
                 attn_tp() == 8,
             "Pi KV1 optimized routes require exact installed Action owners");
@@ -2284,6 +2576,18 @@ void Pi05DenoiseStepModel::prepare_sdpa_mask_cached(
                      : std::nullopt,
             prep_is_causal, prep_seq_q, prep_seq_k,
             sdpa_stable_mask_cache());
+        if (const auto plan = has_mask ? split_kv_plan(prep_seq_q, prep_seq_k)
+                                       : std::nullopt) {
+            auto [it, inserted] = split_kv_mask_slots_.try_emplace(
+                std::make_pair(prep_seq_q, prep_seq_k));
+            if (inserted) {
+                it->second = at::empty(
+                    {static_cast<int64_t>(num_cores()), plan->rows_pad,
+                     16 * plan->width},
+                    next_prepared_mask.ddr_tensor.options());
+            }
+            pi05_split_kv_prepare_mask(attention_mask_4d, *plan, it->second);
+        }
         TORCH_CHECK(
             !version_enabled ||
                 attention_mask_4d.unsafeGetTensorImpl()->version_counter()
@@ -2297,6 +2601,16 @@ void Pi05DenoiseStepModel::prepare_sdpa_mask_cached(
         prepared_mask_seq_k_      = prep_seq_k;
         prepared_mask_is_causal_  = prep_is_causal;
     }
+}
+
+std::optional<Pi05SplitKvPlan> Pi05DenoiseStepModel::split_kv_plan(
+    int64_t seq_q, int64_t kv_seq_len) const
+{
+    // The kernels read core c's cache head, so the cache needs one copy per
+    // core of the single source head.
+    if (num_cores() != 8 || attn_tp() != 8 || num_kv_heads() != 8) return std::nullopt;
+    return pi05_split_kv_attention_plan(seq_q, kv_seq_len, num_q_heads(),
+                                        kv_source_heads_, head_dim(), num_cores());
 }
 
 // ============================================================================
@@ -2355,15 +2669,18 @@ void Pi05DenoiseStepModel::denoise_loop_forward(
     // Reject cold/descriptor/position drift before mode mutation or launch.
     TORCH_CHECK(!pi05_w4_geglu_m50_opt_in_ ||
         (num_steps == 10 && pi05_action_prefix_admitted(prefix_len) &&
-         attention_mask_4d.sizes() == at::IntArrayRef({1, 1, 50, prefix_len + 50})),
+         pi05_action_rows_admitted(cs) &&
+         attention_mask_4d.sizes() == at::IntArrayRef({1, 1, cs, prefix_len + cs})),
         "Pi W4 GeGLU loop arguments changed the exact ten-step profile");
     TORCH_CHECK(!pi05_xor3_gated_mlp_opt_in_ ||
         (pi05_action_steps_admitted(num_steps) && pi05_action_prefix_admitted(prefix_len) &&
-         attention_mask_4d.sizes() == at::IntArrayRef({1, 1, 50, prefix_len + 50})),
+         pi05_action_rows_admitted(cs) &&
+         attention_mask_4d.sizes() == at::IntArrayRef({1, 1, cs, prefix_len + cs})),
         "Pi MLP XOR3+gated loop arguments changed the exact four/ten-step profile");
     TORCH_CHECK(!pi05_geglu_m50_opt_in_ ||
         (pi05_action_steps_admitted(num_steps) && pi05_action_prefix_admitted(prefix_len) &&
-         attention_mask_4d.sizes() == at::IntArrayRef({1, 1, 50, prefix_len + 50})),
+         pi05_action_rows_admitted(cs) &&
+         attention_mask_4d.sizes() == at::IntArrayRef({1, 1, cs, prefix_len + cs})),
         "Pi M50 GeGLU loop arguments changed the exact four/ten-step profile");
     TORCH_CHECK(!pi05_q_rope_epilogue_opt_in_ ||
         (num_steps==10 && pi05_action_prefix_admitted(prefix_len) &&
@@ -2610,10 +2927,6 @@ Pi05DenoiseStepModel::physical_manifest_for_candidate(
         append(FmbRouteFamily::GRAPH_SCHEDULE, PI05_DENOISE_CORE_PROFILE_SITE,
                1, core_profile_arguments());
     }
-    if (condition_tp() != num_cores()) {
-        append(FmbRouteFamily::ALL_REDUCE, PI05_DENOISE_COND_PREPARE_SITE,
-               3, {condition_tp(), num_cores(), 1});
-    }
     if (pi05_w4_fastpath_opt_in_) {
         append(FmbRouteFamily::GRAPH_SCHEDULE, PI05_DENOISE_W4_FASTPATH_POLICY_SITE,
                1, pi05_w4_fastpath_arguments());
@@ -2688,9 +3001,12 @@ Pi05DenoiseStepModel::physical_manifest_for_candidate(
                 ? pi05_kv1_pair_owner_policy_arguments(
                       /*enabled=*/pi05_kv1_pair_owner_opt_in_,
                       position,
-                      planned_prefix_len_, pi05_is_fp16_action(layer_weights_), planned_num_steps_)
+                      planned_prefix_len_, pi05_is_fp16_action(layer_weights_), planned_num_steps_,
+                      chunk_size_)
                 : pi05_kv1_direct_policy_arguments(
-                      /*enabled=*/true, position, planned_prefix_len_));
+                      /*enabled=*/true,
+                      position,
+                      planned_prefix_len_, chunk_size_));
     }
     TORCH_CHECK(!pi05_q_rope_epilogue_opt_in_ ||
         (use_pi05_q_rope_epilogue(physical_len,rope_position_>=0?rope_position_:position) &&
@@ -2703,7 +3019,7 @@ Pi05DenoiseStepModel::physical_manifest_for_candidate(
     if (use_pi05_gateup_resident(physical_len) && logical_len == 50) {
         for (int64_t projection = 0; projection < 2; ++projection) {
             append(FmbRouteFamily::LINEAR, PI05_DENOISE_GATEUP_RESIDENT_SITE,
-                   PI05_DENOISE_SPM_WEIGHT_M512N48K128,
+                   PI05_DENOISE_SPM_WEIGHT_CURRENT,
                    pi05_gateup_resident_arguments(), projection);
             append(FmbRouteFamily::MUTABLE_DMA, PI05_DENOISE_GATEUP_PRELOAD_SITE,
                    /*raw W8 scatter once per graph=*/5,
@@ -2716,7 +3032,7 @@ Pi05DenoiseStepModel::physical_manifest_for_candidate(
         for (int64_t layer = 0; layer < pi05_gateup_resident_layers_; ++layer) {
             for (int64_t projection = 0; projection < 2; ++projection) {
                 append(FmbRouteFamily::LINEAR, PI05_DENOISE_BUNDLE_LINEAR_SITE,
-                       PI05_DENOISE_SPM_WEIGHT_M512N48K128,
+                       PI05_DENOISE_SPM_WEIGHT_CURRENT,
                        pi05_gateup_bundle_linear_arguments(
                            pi05_gateup_resident_layers_, layer, projection),
                        2 * layer + projection);
@@ -2741,7 +3057,8 @@ Pi05DenoiseStepModel::physical_manifest_for_candidate(
         pi05_graph_dma_shape_admitted(plan, physical_len, logical_len, position,
             layout.batch_size, layout.use_attn_mask, layout.is_causal,
             layout.attention_policy);
-    const bool elide_unused = graph_dma_profile && pi05_elide_unused_dma_opt_in_;
+    const bool elide_unused = graph_dma_profile && physical_len == 50 &&
+        pi05_elide_unused_dma_opt_in_;
     if (elide_unused) {
         append(FmbRouteFamily::GRAPH_SCHEDULE, PI05_DENOISE_UNUSED_OUTPUT_SITE,
                /*last-layer SPM consumer, no DDR materialization=*/1,
@@ -2755,7 +3072,8 @@ Pi05DenoiseStepModel::physical_manifest_for_candidate(
                                : PI05_DENOISE_POST_STEP_DMA_SITE,
             Pi05DenoiseMutableDmaRoute::SPM_COPY_TO_DDR);
     }
-    const bool spm_staging = graph_dma_profile && pi05_spm_action_staging_opt_in_;
+    const bool spm_staging = graph_dma_profile && physical_len == 50 &&
+        pi05_spm_action_staging_opt_in_;
     if (spm_staging) {
         append(FmbRouteFamily::GRAPH_SCHEDULE, PI05_DENOISE_ACTION_SPM_PRODUCER_SITE,
                /*core0 action GEMM output stays in SPM=*/1, pi05_graph_dma_arguments(planned_prefix_len_));
@@ -2775,6 +3093,10 @@ Pi05DenoiseStepModel::physical_manifest_for_candidate(
                    : Pi05DenoiseMutableDmaRoute::DDR_BROADCAST_TO_SPM),
                {adarms_table_.size(0), num_layers()});
     } else {
+        if (condition_tp() != num_cores()) {
+            append(FmbRouteFamily::ALL_REDUCE, PI05_DENOISE_COND_PREPARE_SITE,
+                   3, {condition_tp(), num_cores(), 1});
+        }
         append_linear(PI05_DENOISE_GEMV_LINEAR_SITE);
         append(
             FmbRouteFamily::ALL_REDUCE,
@@ -2785,7 +3107,7 @@ Pi05DenoiseStepModel::physical_manifest_for_candidate(
     constexpr uint32_t kv_capabilities =
         KV_INSERT_CAP_V2 | KV_INSERT_CAP_V16 |
         KV_INSERT_CAP_PAD16 | KV_INSERT_CAP_HYBRID2 |
-        KV_INSERT_CAP_HYBRID3;
+        KV_INSERT_CAP_HYBRID3 | KV_INSERT_CAP_NON8_TP_V16;
     append(FmbRouteFamily::GRAPH_SCHEDULE,
            PI05_DENOISE_ZERO_GATED_RESIDUAL_SITE,
            pi05_denoise_residual_route(physical_len), {hidden_size()});
@@ -2809,7 +3131,7 @@ Pi05DenoiseStepModel::physical_manifest_for_candidate(
             append(FmbRouteFamily::LINEAR,
                    PI05_DENOISE_KV1_PAIR_OWNER_SITE,
                    pi05_kv1_pair_owner_selector(pi05_is_fp16_action(layer_weights_)),
-                   pi05_kv1_pair_owner_linear_arguments(planned_prefix_len_, pi05_is_fp16_action(layer_weights_), planned_num_steps_), invocation);
+                   pi05_kv1_pair_owner_route_arguments(), invocation);
         } else if (kv1_direct) {
             append(FmbRouteFamily::LINEAR, PI05_DENOISE_K_LINEAR_SITE,
                    PI05_DENOISE_KV1_DIRECT_M592N32,
@@ -2904,7 +3226,7 @@ Pi05DenoiseStepModel::physical_manifest_for_candidate(
         (spm_staging ? 0 : FMB_SHARED_LAYER_INPUT_DMA) |
             FMB_SHARED_MLP_AUTO_TILE |
             (pi05_xor3_gated_mlp_opt_in_ ? 0 : FMB_SHARED_MLP_RING_REDUCE),
-        1, use_pi05_ring_xor3(50), num_cores(), mlp_tp());
+        1, use_pi05_ring_xor3(physical_len), num_cores(), mlp_tp());
     std::sort(
         manifest.routes.begin(), manifest.routes.end(),
         [](const FmbRouteManifestEntry& lhs,
@@ -2950,16 +3272,45 @@ bool Pi05DenoiseStepModel::use_spm_adarms_table() const {
     return planned_route_profile_valid_ && planned_loop_mode_
         && pi05_action_steps_admitted(planned_num_steps_)
         && pi05_action_prefix_admitted(planned_prefix_len_)
-        && chunk_size_ == 50 && hidden_size() == 1024 && num_layers() == 18
-        && num_cores() == 8 && attn_tp() == 8 && adarms_table_.defined()
+        && pi05_action_rows_admitted(chunk_size_) && hidden_size() == 1024 && num_layers() == 18
+        && (num_cores() == 4 || num_cores() == 6 || num_cores() == 8)
+        && (attn_tp() == 4 || attn_tp() == 8) && adarms_table_.defined()
         && adarms_table_.size(0) == planned_num_steps_;
 }
 
 bool Pi05DenoiseStepModel::use_pi05_adarms_body_stream() const {
     // Keep use_spm_adarms_table true: norm/shift and gated-residual fusion
     // consume the same bytes whether the slot holds ten bodies or one body.
-    return planned_num_steps_ == 10 && pi05_adarms_body_stream_opt_in_ &&
-        planned_prefix_len_ == 800 && use_spm_adarms_table();
+    // step_boundary_dma_ rotates over the seven non-stream-0 DMA channels.
+    if (num_cores() != 8 || attn_tp() != 8 || planned_num_steps_ != 10 ||
+        !use_spm_adarms_table()) return false;
+    // The retained P800 experiment opts in. Otherwise a loop streams when the
+    // ten-body table keeps its split-KV share from holding every layer, so the
+    // share gets the nine bodies' rows it no longer keeps: one 227 KB DMA per
+    // body against about 2 MB of SPM. That is always so next to the NVFP4
+    // scale slab; without it, only at the longer prefixes (three cameras at
+    // H50). A share that already holds every layer gains nothing from it.
+    if (pi05_adarms_body_stream_opt_in_) return planned_prefix_len_ == 800;
+    return split_kv_share_admitted() &&
+        (nvfp4_spm_scale_admitted() || adarms_table_limits_split_kv_share());
+}
+
+bool Pi05DenoiseStepModel::adarms_table_limits_split_kv_share() const {
+    if (!split_kv_share_admitted()) return false;
+    // The launch asks split_kv_share_layers at the forward's prefix plus its
+    // action rows; the probe sizes the table for all ten bodies, so it does not
+    // ask the body-stream decision again.
+    // The installed generation covers the weights' own SPM tables.
+    const std::array<int64_t, 5> key{planned_prefix_len_, chunk_size_, max_action_dim_,
+                                     kv_source_heads_,
+                                     static_cast<int64_t>(installed_model_state_generation())};
+    if (adarms_table_share_key_ != key) {
+        adarms_table_limits_share_ =
+            split_kv_share_layers(planned_prefix_len_ + chunk_size_, chunk_size_, true).first <
+            num_layers();
+        adarms_table_share_key_ = key;
+    }
+    return adarms_table_limits_share_;
 }
 
 bool Pi05DenoiseStepModel::use_pi05_gateup_bundle(int64_t rows) const {
@@ -2974,7 +3325,7 @@ bool Pi05DenoiseStepModel::use_pi05_gateup_bundle(int64_t rows) const {
 void Pi05DenoiseStepModel::validate_pi05_storage_policy(at::IntArrayRef descriptor) const {
     const bool stream = use_pi05_adarms_body_stream();
     const bool bundle = use_pi05_gateup_bundle(chunk_size_);
-    TORCH_CHECK(stream == pi05_adarms_body_stream_opt_in_ &&
+    TORCH_CHECK((stream || !pi05_adarms_body_stream_opt_in_) &&
                     bundle == (pi05_gateup_resident_layers_ != 0),
                 "Pi0.5 storage route no longer matches its cold profile");
     if (descriptor.empty()) {
@@ -2983,7 +3334,9 @@ void Pi05DenoiseStepModel::validate_pi05_storage_policy(at::IntArrayRef descript
     }
     const auto candidate = decode_fmb_prefill_stage_candidate(descriptor);
     const auto& manifest = candidate.physical_manifest;
-    if (stream || bundle) {
+    // The P800 geometry belongs to the opted-in experiment; a streaming
+    // NVFP4 loop has its own COMPLETE profile checks.
+    if (pi05_adarms_body_stream_opt_in_ || bundle) {
         TORCH_CHECK(manifest.state == FmbPhysicalManifestState::COMPLETE &&
                         manifest.graph_lifecycle == FmbGraphLifecycle::COMPOSITE_CHILD &&
                         manifest.linear_accumulation == linear_accumulation_policy() &&
@@ -3015,7 +3368,7 @@ void Pi05DenoiseStepModel::validate_pi05_storage_policy(at::IntArrayRef descript
             ++preload_routes;
         } else if (route.site_id == PI05_DENOISE_BUNDLE_LINEAR_SITE) {
             TORCH_CHECK(bundle && route.family == FmbRouteFamily::LINEAR &&
-                            route.selector == PI05_DENOISE_SPM_WEIGHT_M512N48K128 && route.flags == 0 &&
+                            route.selector == PI05_DENOISE_SPM_WEIGHT_CURRENT && route.flags == 0 &&
                             route.arguments == pi05_gateup_bundle_linear_arguments(
                                 pi05_gateup_resident_layers_, route.invocation / 2, route.invocation % 2),
                         "Pi0.5 bundle linear descriptor does not match its layer/projection");
@@ -3031,7 +3384,8 @@ void Pi05DenoiseStepModel::validate_pi05_storage_policy(at::IntArrayRef descript
 
 bool Pi05DenoiseStepModel::pi05_w4_weight_profile_admitted() const {
     if (layer_weights_.size() != 18 || hidden_size() != 1024 ||
-        intermediate_size() != 4096 || max_action_dim_ != 32 || chunk_size_ != 50 ||
+        intermediate_size() != 4096 || max_action_dim_ != 32 ||
+        !pi05_action_rows_admitted(chunk_size_) ||
         num_q_heads() != 8 || num_kv_heads() != 8 || head_dim() != 256 || attn_tp() != 8) return false;
     const auto& first_scale = layer_weights_.front().q_ws;
     if (!first_scale.defined() || first_scale.dim() != 2) return false;
@@ -3064,7 +3418,8 @@ bool Pi05DenoiseStepModel::pi05_w4_weight_profile_admitted() const {
 bool Pi05DenoiseStepModel::pi05_nvfp4_weight_profile_admitted() const {
     if (!nvfp4_.enabled() || nvfp4_.values.size() != 5 ||
         layer_weights_.size() != 18 || hidden_size() != 1024 ||
-        intermediate_size() != 4096 || max_action_dim_ != 32 || chunk_size_ != 50 ||
+        intermediate_size() != 4096 || max_action_dim_ != 32 ||
+        !pi05_action_rows_admitted(chunk_size_) ||
         num_q_heads() != 8 || num_kv_heads() != 8 || head_dim() != 256 || attn_tp() != 8)
         return false;
     const auto tensor_ok = [](const at::Tensor& t, at::ScalarType dtype) {
@@ -3100,7 +3455,9 @@ std::vector<int64_t> Pi05DenoiseStepModel::pi05_w4_fastpath_arguments() const {
         // ABI2 binds striped-v2 E2M1/FP8 K16 scales, five FP32[24] tables,
         // the selected accumulation and the unchanged W8 K/V owner layout.
         return {2, pi05_w4_fastpath_opt_in_ ? 1 : 0, pi05_w4_fastpath_profile_ ? 1 : 0,
-                planned_num_steps_, planned_prefix_len_, 50, 64, planned_prefix_len_ + 50, 2048, 1024, 4096, 18, 8, 8, 256, 32,
+                planned_num_steps_, planned_prefix_len_, chunk_size_,
+                pi05_kv_insert_rows(chunk_size_), planned_prefix_len_ + chunk_size_,
+                2048, 1024, 4096, 18, 8, 8, 256, 32,
                 4, 8, 8, 4, 4, 4, 4, 16, 8, 32, 2, 5, 24,
                 static_cast<int64_t>(linear_accumulation_policy()),
                 static_cast<int64_t>((linear_acc32_ ? FmbLinearRouteSelector::PI05_NVFP4_V2_ACC32
@@ -3111,7 +3468,9 @@ std::vector<int64_t> Pi05DenoiseStepModel::pi05_w4_fastpath_arguments() const {
     // ABI, immutable opt-in, proven storage, exact profile and projection precisions.
     // The existing per-tensor cost identity also binds every layer's physical layout.
     return {1, pi05_w4_fastpath_opt_in_ ? 1 : 0, pi05_w4_fastpath_profile_ ? 1 : 0,
-            planned_num_steps_, planned_prefix_len_, 50, 64, planned_prefix_len_ + 50, 2048, 1024, 4096, 18, 8, 8, 256, 32,
+            planned_num_steps_, planned_prefix_len_, chunk_size_,
+            pi05_kv_insert_rows(chunk_size_), planned_prefix_len_ + chunk_size_,
+            2048, 1024, 4096, 18, 8, 8, 256, 32,
             4, 8, 8, 4, 4, 4, 4, gs, 8, 8, 1};
 }
 
@@ -3119,9 +3478,11 @@ void Pi05DenoiseStepModel::validate_pi05_w4_fastpath_manifest(const FmbPhysicalE
     if (pi05_w4_fastpath_opt_in_) {
         TORCH_CHECK(pi05_w4_fastpath_profile_ && use_pi05_graph_dma_profile(m.physical_length) &&
             use_pi05_kv1_pair_owner(m.physical_length) && use_pi05_xor3_gated_attn(m.physical_length) &&
-            m.state == FmbPhysicalManifestState::COMPLETE && m.logical_length == 50 &&
-            m.physical_length == 50 && m.execution_padding_rows == 0 &&
-            m.kv_logical_length == planned_prefix_len_ + 50 && m.kv_insert_physical_rows == 64 &&
+            m.state == FmbPhysicalManifestState::COMPLETE &&
+            m.logical_length == chunk_size_ && m.physical_length == chunk_size_ &&
+            m.execution_padding_rows == 0 &&
+            m.kv_logical_length == planned_prefix_len_ + chunk_size_ &&
+            m.kv_insert_physical_rows == pi05_kv_insert_rows(chunk_size_) &&
             m.graph_lifecycle == FmbGraphLifecycle::COMPOSITE_CHILD &&
             m.linear_accumulation == linear_accumulation_policy(),
             "Pi W4 fastpath requires an exact COMPLETE mixed-precision profile");
@@ -3144,7 +3505,8 @@ void Pi05DenoiseStepModel::validate_pi05_w4_fastpath_policy(const FmbPrefillStag
     }
     validate_pi05_w4_fastpath_manifest(candidate->physical_manifest);
     if (pi05_w4_fastpath_opt_in_) {
-        TORCH_CHECK(pi05_graph_dma_shape_admitted(candidate->stage_plan, 50, 50,
+        TORCH_CHECK(pi05_graph_dma_shape_admitted(candidate->stage_plan,
+            chunk_size_, chunk_size_,
             planned_prefix_len_, 1, true, false, AttentionExecutionPolicy::DDR_KV),
             "Pi W4 fastpath chunk schedule drifted");
         pi05_require_stable_graph_dma_capture();
@@ -3156,8 +3518,8 @@ bool Pi05DenoiseStepModel::use_pi05_graph_dma_profile(int64_t rows) const {
         (planned_num_steps_ == 10 ||
          (!pi05_elide_unused_dma_opt_in_ && !pi05_spm_action_staging_opt_in_ &&
           (!pi05_w4_fastpath_opt_in_ || nvfp4_.enabled()))) &&
-        pi05_projection_fastpath_admitted() && rows == 50 &&
-        intermediate_size() == 4096 && num_q_heads() == 8 &&
+        pi05_projection_fastpath_admitted() && pi05_action_rows_admitted(rows) &&
+        rows == chunk_size_ && intermediate_size() == 4096 && num_q_heads() == 8 &&
         num_kv_heads() == 8 && head_dim() == 256 && max_action_dim_ == 32 &&
         planned_k_rope_cache_capacity_ == 2048;
 }
@@ -3185,13 +3547,20 @@ int64_t Pi05DenoiseStepModel::prepare_pi05_graph_dma_policy(
     const bool exact = manifest.state == FmbPhysicalManifestState::COMPLETE &&
         manifest.graph_lifecycle == FmbGraphLifecycle::COMPOSITE_CHILD &&
         manifest.linear_accumulation == linear_accumulation_policy() &&
-        manifest.execution_padding_rows == 0 && manifest.kv_logical_length == planned_prefix_len_ + 50 &&
+        manifest.execution_padding_rows == 0 &&
+        manifest.kv_logical_length == planned_prefix_len_ + chunk_size_ &&
+        manifest.physical_length == chunk_size_ &&
         use_pi05_graph_dma_profile(manifest.physical_length) &&
         pi05_graph_dma_shape_admitted(candidate.stage_plan, manifest.physical_length,
             manifest.logical_length, planned_prefix_len_, 1, true, false,
             AttentionExecutionPolicy::DDR_KV);
-    const bool elide_unused = exact && pi05_elide_unused_dma_opt_in_;
-    const bool spm_staging = exact && pi05_spm_action_staging_opt_in_;
+    // Both opt-ins carry M50 geometry of their own (pi05_graph_dma_arguments
+    // and the 50x1024-half SPM copy), so they stay M50 even though the profile
+    // around them admits both horizons. The planner applies the same gate.
+    const bool elide_unused =
+        exact && manifest.physical_length == 50 && pi05_elide_unused_dma_opt_in_;
+    const bool spm_staging =
+        exact && manifest.physical_length == 50 && pi05_spm_action_staging_opt_in_;
     const auto* producer = find(FmbRouteFamily::GRAPH_SCHEDULE, PI05_DENOISE_ACTION_SPM_PRODUCER_SITE);
     const auto* input = find(FmbRouteFamily::GRAPH_SCHEDULE, PI05_DENOISE_ACTION_SPM_INPUT_SITE);
     const auto* ddr_input = find(FmbRouteFamily::MUTABLE_DMA, FMB_SHARED_LAYER_INPUT_DMA_SITE);
@@ -3237,7 +3606,8 @@ void Pi05DenoiseStepModel::validate_pi05_graph_dma_runtime() const {
                     use_pi05_graph_dma_profile(ctx().seq_len) &&
                     ctx().attention_mask.has_value() && ctx().attention_mask->dim() == 4 &&
                     ctx().attention_mask->size(0) == 1 && ctx().attention_mask->size(1) == 1 &&
-                    ctx().attention_mask->size(2) == 50 && ctx().attention_mask->size(3) == planned_prefix_len_ + 50 &&
+                    ctx().attention_mask->size(2) == chunk_size_ &&
+                    ctx().attention_mask->size(3) == planned_prefix_len_ + chunk_size_ &&
                     pi05_graph_dma_shape_admitted(ctx().stage_plan, ctx().seq_len,
                         ctx().physical_manifest().logical_length, ctx().position,
                         ctx().batch_size, true, ctx().is_causal, ctx().attention_policy),
@@ -3357,8 +3727,11 @@ void Pi05DenoiseStepModel::rebind_kvinsert_exact_candidate(
 }
 
 bool Pi05DenoiseStepModel::use_pi05_ring_xor3(int64_t rows) const {
-    return pi05_ring_xor3_opt_in_ && rows == 50 && use_spm_adarms_table() &&
-        pi05_projection_fastpath_admitted();
+    return pi05_ring_xor3_opt_in_ && use_spm_adarms_table() &&
+        pi05_projection_fastpath_admitted() &&
+        (rows == 50 ||
+         (rows == 10 && chunk_size_ == 10 &&
+          KernelCache::instance().has_loaded(KernelId::PI05_RING_XOR3_M10N1024)));
 }
 
 bool Pi05DenoiseStepModel::use_pi05_xor3_gated_attn(int64_t rows) const {
@@ -3367,10 +3740,67 @@ bool Pi05DenoiseStepModel::use_pi05_xor3_gated_attn(int64_t rows) const {
         !pi05_gateup_resident_opt_in_ && !pi05_adarms_body_stream_opt_in_ &&
         pi05_gateup_resident_layers_ == 0 &&
         !pi05_elide_unused_dma_opt_in_ && !pi05_spm_action_staging_opt_in_ &&
-        !pi05_q_rope_epilogue_opt_in_;
+        !pi05_q_rope_epilogue_opt_in_ &&
+        (rows == 50 || KernelCache::instance().has_loaded(
+            KernelId::PI05_XOR3_GATED_RESIDUAL_M10N1024));
+}
+
+// The attention continuation with the MLP-side AdaRMS norm fused in, and the
+// MLP continuation over the same whole-row shards. The fused kernel stores the
+// raw residual (residual2) only for each core's own shard rows, which only the
+// whole-row MLP continuation reads; that one gathers every row of residual1
+// for the next layer's norm, the output DMA and the final norm, bit-identical
+// to the published kernel. The normalized rows go to input_norm, dead once
+// Q/K/V have read it: they double as the reduce staging area, so they cannot
+// go to residual1, the skip. The MLP Gate/Up then read input_norm, so only the
+// MLP owners that take an explicit input address are admitted.
+bool Pi05DenoiseStepModel::use_pi05_xor3_gated_adarms_chain(int64_t rows) const {
+    if (rows != 50 || !use_spm_adarms_table() || !use_pi05_xor3_gated_attn(rows) ||
+        !use_pi05_xor3_gated_mlp(rows)) {
+        return false;
+    }
+    const bool explicit_mlp_input = pi05_geglu_m50_opt_in_ ||
+        (pi05_w4_fastpath_opt_in_ &&
+         (pi05_nvfp4_geglu_m50_opt_in_ || pi05_w4_geglu_m50_opt_in_));
+    const auto& cache = KernelCache::instance();
+    return explicit_mlp_input &&
+        cache.has_loaded(KernelId::PI05_XOR3_GATED_ADARMS_M50N1024) &&
+        cache.has_loaded(KernelId::PI05_XOR3_GATED_ROWS_M50N1024);
+}
+
+// The MLP-side AdaRMS norm runs in the GeGLU's launch on every layer whose
+// NVFP4 GeGLU reads SPM scales, from 9 to 16 rows (pi05_adarms_geglu_fused):
+// residual2 -> residual1, the rows the GeGLU then reads, with the row-pair
+// norm's arithmetic and bytes. Its route stays consumed; the GeGLU route
+// arguments name the fused payload.
+bool Pi05DenoiseStepModel::pi05_adarms_in_geglu(int64_t rows, int layer) const {
+    return pi05_adarms_geglu_fused(rows) && nvfp4_spm_scale_.defined() && use_spm_adarms_table() &&
+        !pi05_geglu_m50_opt_in_ && pi05_w4_fastpath_opt_in_ && pi05_nvfp4_geglu_m50_opt_in_ &&
+        use_pi05_xor3_gated_mlp(rows) && use_pi05_nvfp4_geglu_m50(rows) &&
+        !use_pi05_xor3_gated_adarms_chain(rows) &&
+        nvfp4_spm_scale_addr(layer, PI05_DENOISE_NVFP4_SPM_SCALE_GATE) != 0;
+}
+
+uint32_t Pi05DenoiseStepModel::pi05_mlp_input(int64_t rows) {
+    return addr(0, use_pi05_xor3_gated_adarms_chain(rows) ? "input_norm" : "residual1");
+}
+
+// The planner keeps residual1 in SPM from a layer to the next one of its group
+// exactly when that layer's output_to_spm and the next one's input_in_spm are
+// set. Only then does the next layer read no residual1 row but its own shard's.
+bool Pi05DenoiseStepModel::pi05_adarms_to_next_layer(int64_t rows) {
+    return use_pi05_xor3_gated_adarms_chain(rows) && ctx().output_to_spm;
+}
+
+bool Pi05DenoiseStepModel::pi05_adarms_from_previous_layer(int64_t rows) {
+    return use_pi05_xor3_gated_adarms_chain(rows) && ctx().input_in_spm;
 }
 
 int64_t Pi05DenoiseStepModel::pi05_denoise_residual_route(int64_t rows) const {
+    if (use_pi05_xor3_gated_adarms_chain(rows)) {
+        return static_cast<int64_t>(
+            Pi05DenoiseResidualRoute::ZERO_WITH_XOR3_GATED_ADARMS_CHAIN_H1024);
+    }
     if (use_pi05_xor3_gated_attn(rows)) {
         return static_cast<int64_t>(
             Pi05DenoiseResidualRoute::ZERO_WITH_XOR3_GATED_ATTN_H1024);
@@ -3385,10 +3815,10 @@ void Pi05DenoiseStepModel::validate_pi05_xor3_gated_attn_manifest(
     if (pi05_xor3_gated_attn_opt_in_) {
         TORCH_CHECK(use_pi05_xor3_gated_attn(manifest.physical_length) &&
                         manifest.state == FmbPhysicalManifestState::COMPLETE &&
-                        manifest.physical_length == 50 &&
-                        manifest.logical_length == 50 &&
+                        manifest.physical_length == chunk_size_ &&
+                        manifest.logical_length == chunk_size_ &&
                         manifest.execution_padding_rows == 0 &&
-                        manifest.kv_logical_length == planned_prefix_len_ + 50 &&
+                        manifest.kv_logical_length == planned_prefix_len_ + chunk_size_ &&
                         manifest.graph_lifecycle == FmbGraphLifecycle::COMPOSITE_CHILD &&
                         manifest.linear_accumulation == linear_accumulation_policy(),
                     "Pi attention XOR3+gated continuation requires exact "
@@ -3461,7 +3891,8 @@ void Pi05DenoiseStepModel::emit_gated_residual(
 
 void Pi05DenoiseStepModel::emit_adarms_norm_shift(
     uint32_t input_spm, uint32_t output_spm, uint32_t scale_spm,
-    uint32_t shift_spm, int64_t rows, int64_t site_id, int64_t invocation) {
+    uint32_t shift_spm, int64_t rows, int64_t site_id, int64_t invocation,
+    bool launch) {
     // Share the verified resident-table profile's cold predicate. The kernel
     // keeps the old FP16 intermediate rounding and uses no additional SPM.
     const bool fused = use_spm_adarms_table();
@@ -3472,9 +3903,15 @@ void Pi05DenoiseStepModel::emit_adarms_norm_shift(
                                      : Pi05DenoiseNormRoute::RMS_THEN_SHIFT),
             /*resolved_flags=*/0, {rows, hidden_size()}, invocation);
     }
+    if (!launch) {
+        // The caller's launch already applied this route's fused arithmetic.
+        TORCH_CHECK(fused, "Pi AdaRMS norm folded into a launch without the fused H1024 route");
+        return;
+    }
     if (fused) {
         rpu_launch_pi05_adarms_norm_shift_spm_kernel(
-            input_spm, output_spm, scale_spm, shift_spm, rows, eps_, num_cores());
+            input_spm, output_spm, scale_spm, shift_spm, rows, eps_, num_cores(),
+            /*denoise_siblings=*/true);
     } else {
         rpu_launch_rmsnorm_spm_kernel(
             input_spm, output_spm, scale_spm, rows, hidden_size(), eps_, RpuRmsNormSpmRoute::BASE, num_cores());
@@ -3484,7 +3921,214 @@ void Pi05DenoiseStepModel::emit_adarms_norm_shift(
     }
 }
 
+bool Pi05DenoiseStepModel::use_pi05_spm_rope_rows_layout() const {
+    // The D256 query RoPE (partial_mrope or the split-KV RoPE pack) reads
+    // the tables' rows from SPM with is_freq_in_ddr = 0.
+    return head_dim() == 256 && !pi05_q_rope_epilogue_opt_in_;
+}
+
+int64_t Pi05DenoiseStepModel::pi05_spm_rope_rows_start() const {
+    // A forward of one split-KV chunk: every layer and body rotates the same
+    // rows, so the first body stages them once in each core's SPM.
+    const int64_t rows = ctx().seq_len, kv_seq_len = ctx().position + rows;
+    const int64_t start = rope_position_ >= 0 ? rope_position_ : ctx().position;
+    const bool split_kv_layout = std::any_of(
+        split_kv_layouts_.begin(), split_kv_layouts_.end(), [&](const auto& layout) {
+            return layout.first >= rows && layout.second == kv_seq_len;
+        });
+    if (!use_pi05_spm_rope_rows_layout() || !split_kv_layout ||
+        prepared_mask_.mask_type != 4 || ctx().batch_size != 1 ||
+        !split_kv_plan(rows, kv_seq_len) || !pi05_q_rope_tables_admitted(cos_, sin_) ||
+        start < 0 || start > cos_.size(0) || rows > cos_.size(0) - start) {
+        return -1;
+    }
+    return start;
+}
+
+void Pi05DenoiseStepModel::emit_pi05_spm_rope_rows_fill(int64_t start) {
+    const int64_t rows = ctx().seq_len, halves = rows * cos_.size(1);
+    const uint32_t cos_rows = addr(0, "rope_rows");
+    if (graph_dma::active()) {
+        RpuKernelGraph::active().keep_alive(cos_);
+        RpuKernelGraph::active().keep_alive(sin_);
+    }
+    rpu_launch_ddr_broadcast_spm_dma(cos_, start * cos_.size(1), halves, cos_rows, num_cores());
+    rpu_launch_ddr_broadcast_spm_dma(sin_, start * sin_.size(1), halves,
+                                     cos_rows + rows * PI05_DENOISE_ROPE_ROW_BYTES, num_cores());
+}
+
+bool Pi05DenoiseStepModel::split_kv_share_admitted() const {
+    // Only the eight-core split-KV attention has a share; only the later bodies
+    // of a loop reuse it.
+    return num_cores() == 8 && attn_tp() == 8 && num_kv_heads() == 8 &&
+        planned_route_profile_valid_ && planned_loop_mode_ && planned_num_steps_ > 1 &&
+        pi05_split_kv_spm_share();
+}
+
+std::vector<BufferDecl> Pi05DenoiseStepModel::capacity_buffer_declarations(
+    int64_t max_kv_seq_len, int64_t chunk, bool resident_table) const {
+    // The other buffers at the planner's capacity chunk, the widest of the
+    // profile, so its probe and exact layouts get the same layer count.
+    LayoutContext capacity;
+    capacity.chunk_size = std::max(chunk, Align(chunk_size_, (int64_t)16));
+    capacity.max_kv_seq_len = max_kv_seq_len;
+    capacity.use_attn_mask = true;
+    return base_buffer_declarations(capacity, resident_table);
+}
+
+int64_t Pi05DenoiseStepModel::spm_room_above(const std::vector<BufferDecl>& decls) {
+    int64_t fixed = 0;
+    for (const auto& d : decls) {
+        const int64_t size = Align(d.size, (int64_t)SpmAllocator::ALIGN);
+        if (d.alias_of || d.storage == StorageClass::Temp) continue;
+        fixed += d.storage == StorageClass::Persistent ? size : size * d.per_layer;
+    }
+    return static_cast<int64_t>(SpmAllocator::SPM_PLANNING_BUDGET) -
+        PI05_DENOISE_SPLIT_KV_SHARE_HEADROOM - fixed;
+}
+
+bool Pi05DenoiseStepModel::nvfp4_spm_scale_admitted() const {
+    // Only the later bodies of a loop repay the first body's fill.
+    return planned_route_profile_valid_ && planned_loop_mode_ && planned_num_steps_ > 1 &&
+        nvfp4_spm_scale_.defined() && use_pi05_nvfp4_geglu_m50(chunk_size_);
+}
+
+int64_t Pi05DenoiseStepModel::nvfp4_spm_scale_layers(int64_t max_kv_seq_len, int64_t chunk) const {
+    if (!nvfp4_spm_scale_admitted()) return 0;
+    auto decls = capacity_buffer_declarations(max_kv_seq_len, chunk);
+    const int64_t room = spm_room_above(decls);
+    decls.push_back({"nvfp4_spm_scale", 0, 0, 0, StorageClass::Temp, 0, nullptr, BufferScope::LayerWide});
+    int64_t layers = num_layers();
+    for (; layers > 0; --layers) {
+        decls.back().size = layers * PI05_DENOISE_NVFP4_SPM_SCALE_LAYER;
+        if (detail::estimate_temporary_total(decls) <= room) break;
+    }
+    return layers;
+}
+
+uint32_t Pi05DenoiseStepModel::nvfp4_spm_scale_addr(int layer, int64_t offset) const {
+    const int64_t kv_seq_len = ctx().position + ctx().seq_len;
+    return layer < nvfp4_spm_scale_layers(kv_seq_len, ctx().seq_len)
+        ? addr(0, "nvfp4_spm_scale") + layer * PI05_DENOISE_NVFP4_SPM_SCALE_LAYER + offset
+        : 0;
+}
+
+bool Pi05DenoiseStepModel::q_spm_weight_admitted() const {
+    return nvfp4_spm_scale_admitted() && q_spm_weight_.defined() && pi05_q_in_kv1_pair_owner() &&
+        KernelCache::instance().has_loaded(KernelId::PI05_Q_KV1_PAIR_DB_WSPM);
+}
+
+int64_t Pi05DenoiseStepModel::q_spm_weight_layers(int64_t max_kv_seq_len, int64_t chunk) const {
+    if (!q_spm_weight_admitted()) return 0;
+    return q_spm_weight_layers(max_kv_seq_len, chunk, nvfp4_spm_scale_layers(max_kv_seq_len, chunk),
+                               split_kv_share_layers(max_kv_seq_len, chunk));
+}
+
+int64_t Pi05DenoiseStepModel::q_spm_weight_layers(int64_t max_kv_seq_len, int64_t chunk,
+                                                  int64_t scale_layers,
+                                                  std::pair<int64_t, int64_t> share) const {
+    // After the scale slab and the share: per byte both save more.
+    auto decls = capacity_buffer_declarations(max_kv_seq_len, chunk);
+    if (scale_layers) {
+        decls.push_back({"nvfp4_spm_scale", scale_layers * PI05_DENOISE_NVFP4_SPM_SCALE_LAYER,
+                         0, 0, StorageClass::Temp, 0, nullptr, BufferScope::LayerWide});
+    }
+    if (share.first) {
+        decls.push_back({"skv_share", share.first * share.second, 0, 0, StorageClass::Temp, 0,
+                         nullptr, BufferScope::LayerWide});
+    }
+    const int64_t room = spm_room_above(decls);
+    // declare_buffers asks this on every forward, replays included: start from
+    // what the room holds rather than scanning down from scale_layers.
+    int64_t layers = std::clamp<int64_t>(
+        (room - detail::estimate_temporary_total(decls)) / PI05_DENOISE_Q_SPM_WEIGHT_LAYER, 0,
+        scale_layers);
+    decls.push_back({"q_spm_weight", 0, 0, 0, StorageClass::Temp, 0, nullptr, BufferScope::LayerWide});
+    const auto fits = [&](int64_t n) {
+        decls.back().size = n * PI05_DENOISE_Q_SPM_WEIGHT_LAYER;
+        return detail::estimate_temporary_total(decls) <= room;
+    };
+    while (layers > 0 && !fits(layers)) --layers;
+    while (layers < scale_layers && fits(layers + 1)) ++layers;
+    return layers;
+}
+
+uint32_t Pi05DenoiseStepModel::q_spm_weight_addr(int layer) const {
+    const int64_t kv_seq_len = ctx().position + ctx().seq_len;
+    return layer < q_spm_weight_layers(kv_seq_len, ctx().seq_len)
+        ? addr(0, "q_spm_weight") + layer * PI05_DENOISE_Q_SPM_WEIGHT_LAYER
+        : 0;
+}
+
+std::pair<int64_t, int64_t> Pi05DenoiseStepModel::split_kv_share_layers(
+    int64_t max_kv_seq_len, int64_t chunk, bool resident_table) const {
+    if (!split_kv_share_admitted()) return {0, 0};
+    auto decls = capacity_buffer_declarations(max_kv_seq_len, chunk, resident_table);
+    // The scale slab goes first: each byte of it saves about three times what
+    // a byte of the share does.
+    if (const int64_t scale_layers = nvfp4_spm_scale_layers(max_kv_seq_len, chunk)) {
+        decls.push_back({"nvfp4_spm_scale", scale_layers * PI05_DENOISE_NVFP4_SPM_SCALE_LAYER,
+                         0, 0, StorageClass::Temp, 0, nullptr, BufferScope::LayerWide});
+    }
+    int64_t bytes = 0;
+    const int64_t capacity_chunk = std::max(chunk, Align(chunk_size_, (int64_t)16));
+    for (int64_t rows = 1; rows <= capacity_chunk; ++rows) {
+        if (const auto plan = split_kv_plan(rows, max_kv_seq_len)) {
+            bytes = std::max(bytes, plan->share_bytes());
+        }
+    }
+    if (bytes == 0) return {0, 0};
+    bytes = Align(bytes, (int64_t)SpmAllocator::ALIGN);
+    const int64_t room = spm_room_above(decls);
+    int64_t layers = std::clamp<int64_t>(
+        (room - detail::estimate_temporary_total(decls)) / bytes, 0, num_layers());
+    decls.push_back({"skv_share", 0, 0, 0, StorageClass::Temp, 0, nullptr, BufferScope::LayerWide});
+    for (; layers > 0; --layers) {
+        decls.back().size = layers * bytes;
+        if (detail::estimate_temporary_total(decls) <= room) break;
+    }
+    return {layers, bytes};
+}
+
 std::vector<BufferDecl> Pi05DenoiseStepModel::declare_buffers(const LayoutContext& ctx) {
+    auto decls = base_buffer_declarations(ctx);
+    // Layers [0, N) read their FP8 scales from this slab, which the first body
+    // fills; LayerWide, non-aliased like the other temps, so it lasts the forward.
+    const int64_t scale_layers = nvfp4_spm_scale_layers(ctx.max_kv_seq_len, ctx.chunk_size);
+    if (scale_layers) {
+        decls.push_back({"nvfp4_spm_scale", scale_layers * PI05_DENOISE_NVFP4_SPM_SCALE_LAYER,
+                         0, 0, StorageClass::Temp, 0, nullptr, BufferScope::LayerWide});
+    }
+    const bool split_kv = std::any_of(decls.begin(), decls.end(), [](const BufferDecl& d) {
+        return std::strcmp(d.name, "skv_q") == 0;
+    });
+    const bool q_spm_weight = q_spm_weight_admitted();
+    const auto share = split_kv || q_spm_weight
+        ? split_kv_share_layers(ctx.max_kv_seq_len, ctx.chunk_size)
+        : std::pair<int64_t, int64_t>{0, 0};
+    if (split_kv) {
+        split_kv_layouts_.insert({ctx.chunk_size, ctx.max_kv_seq_len});
+        // Layers [0, N) keep this core's K/V blocks in SPM through every body.
+        // LayerWide, non-aliased like the other temps: no body hook touches it.
+        const auto [layers, bytes] = share;
+        if (layers > 0) {
+            decls.push_back({"skv_share", layers * bytes, 0, 0, StorageClass::Temp, 0, nullptr,
+                             BufferScope::LayerWide});
+        }
+    }
+    // Layers [0, N) read their Q weights from each core's own run, which the
+    // first body fills.
+    if (const int64_t layers = q_spm_weight ? q_spm_weight_layers(ctx.max_kv_seq_len,
+                                                                  ctx.chunk_size, scale_layers, share)
+                                            : 0) {
+        decls.push_back({"q_spm_weight", layers * PI05_DENOISE_Q_SPM_WEIGHT_LAYER, 0, 0,
+                         StorageClass::Temp, 0, nullptr, BufferScope::LayerWide});
+    }
+    return decls;
+}
+
+std::vector<BufferDecl> Pi05DenoiseStepModel::base_buffer_declarations(
+    const LayoutContext& ctx, bool resident_table) const {
     int64_t cs = ctx.chunk_size;
     int64_t h  = hidden_size();
     int64_t nq = num_q_heads();
@@ -3509,6 +4153,19 @@ std::vector<BufferDecl> Pi05DenoiseStepModel::declare_buffers(const LayoutContex
     int64_t mask_sz = ctx.use_attn_mask
         ? A(cs * CeilDiv(ctx.max_kv_seq_len, (int64_t)16) * 32)
         : 0;
+    // Split-KV attention reuses sdpa_tmp and sdpa_mask (one core's mask slice)
+    // and adds the packed query rows and the partial results. The chunk is
+    // wider than the action rows (ceil16), so size them for every row count
+    // the chunk can carry.
+    int64_t skv_q_sz = 0, skv_part_sz = 0;
+    for (int64_t rows = 1; ctx.use_attn_mask && rows <= cs; ++rows) {
+        if (const auto plan = split_kv_plan(rows, ctx.max_kv_seq_len)) {
+            tmp = std::max(tmp, A(plan->tmp_bytes()));
+            mask_sz = std::max(mask_sz, A(plan->mask_bytes()));
+            skv_q_sz = std::max(skv_q_sz, A(plan->qp_bytes()));
+            skv_part_sz = std::max(skv_part_sz, A(plan->part_bytes()));
+        }
+    }
 
     int64_t cond_sz     = A(h * DWIDTH);
     int64_t gemv_out_sz = A(3 * h * DWIDTH);
@@ -3577,9 +4234,20 @@ std::vector<BufferDecl> Pi05DenoiseStepModel::declare_buffers(const LayoutContex
         {"action_out_proj_b_spm", out_bias_sz, 0, 0, SC::Persistent, 0, nullptr, ALL,
             out_bias_preload},
     };
+    if (skv_q_sz != 0) {
+        decls.push_back({"skv_q", skv_q_sz, 0, 0, SC::Temp, 0, nullptr, ALL});
+        decls.push_back({"skv_part", skv_part_sz, 0, 0, SC::Temp, 0, nullptr, ALL});
+    }
+    if (skv_q_sz != 0 && use_pi05_spm_rope_rows_layout()) {
+        // cos then sin rows [p, p + cs) of the RoPE tables, staged by the
+        // first body for every layer (pi05_spm_rope_rows_start). LayerWide,
+        // non-aliased like the other temps, so it lasts the forward.
+        decls.push_back({"rope_rows", A(2 * cs * PI05_DENOISE_ROPE_ROW_BYTES),
+                        0, 0, SC::Temp, 0, nullptr, ALL});
+    }
     if (use_spm_adarms_table()) {
         // No alias: each body consumes all37 rows before the next body DMA.
-        const int64_t table_bytes = use_pi05_adarms_body_stream()
+        const int64_t table_bytes = !resident_table && use_pi05_adarms_body_stream()
             ? PI05_DENOISE_ADARMS_BODY_BYTES : adarms_table_.numel() * DWIDTH;
         decls.push_back({"adarms_table", A(table_bytes),
                         0, 0, SC::Temp, 0, nullptr, ALL});
@@ -3673,14 +4341,26 @@ void Pi05DenoiseStepModel::build_layer_subgraph(int layer_idx, const ChunkInfo& 
     // Phase 2: AdaRMSNorm (attn side): residual1 -> input_norm
     // (1+scale) was applied during GEMV, so RMSNorm uses attn_scale directly.
     // The exact ten-step table profile fuses the shift after FP16 rounding.
+    // Under the whole-row chain, a layer entered from SPM was normalized by
+    // the previous layer's MLP continuation; its route stays consumed.
     // --------------------------------------------------------------------
+    const bool adarms_from_previous = pi05_adarms_from_previous_layer(seq_len);
+    TORCH_CHECK(!adarms_from_previous || layer_idx > 0,
+                "Pi0.5 whole-row chain: the first layer has no previous MLP continuation");
     emit_adarms_norm_shift(
         addr(0, "residual1"), addr(0, "input_norm"),
-        attn_scale, attn_shift, seq_len, PI05_DENOISE_ATTN_NORM_SITE, chunk.idx);
+        attn_scale, attn_shift, seq_len, PI05_DENOISE_ATTN_NORM_SITE, chunk.idx,
+        /*launch=*/!adarms_from_previous);
 
     // --------------------------------------------------------------------
     // Phase 3: QKV Linear (attn_tp cores, col partition)
+    // A layer with an SPM scale slab runs the Q projection inside the KV1 pair
+    // owner's launch below; its route is still consumed here.
     // --------------------------------------------------------------------
+    const uint32_t q_spm_scale = nvfp4_.enabled()
+        ? nvfp4_spm_scale_addr(layer_idx, PI05_DENOISE_NVFP4_SPM_SCALE_Q) : 0;
+    const bool q_in_pair_owner = q_spm_scale != 0 && pi05_q_in_kv1_pair_owner() &&
+        use_pi05_kv1_pair_owner(seq_len);
     if (pi05_q_rope_epilogue_opt_in_) {
         emit_pi05_q_rope_epilogue(lw,chunk);
     } else {
@@ -3691,10 +4371,13 @@ void Pi05DenoiseStepModel::build_layer_subgraph(int layer_idx, const ChunkInfo& 
                                                    : FmbLinearRouteSelector::PI05_NVFP4_V2_ACC16) : FmbLinearRouteSelector::AUTO_TILE),
                 /*resolved_flags=*/0, {}, chunk.idx);
         }
-        if (nvfp4_.enabled()) {
+        if (q_in_pair_owner) {
+            // Launched with the KV1 pair owner.
+        } else if (nvfp4_.enabled()) {
             rpu_launch_pi05_nvfp4_v2_kernel(addr(0, "input_norm"), lw.q_w, addr(0, "q"),
                 seq_len, nq * hd, h, 1, tp, lw.q_ws,
-                addr(0, Pi05Nvfp4Tables::names[0]), layer_idx, linear_acc32_);
+                addr(0, Pi05Nvfp4Tables::names[0]), layer_idx, linear_acc32_, lw.q_wts,
+                q_spm_scale);
         } else {
             rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "input_norm"), lw.q_w, addr(0, "q"),
@@ -3718,11 +4401,19 @@ void Pi05DenoiseStepModel::build_layer_subgraph(int layer_idx, const ChunkInfo& 
             FmbRouteFamily::LINEAR, PI05_DENOISE_KV1_PAIR_OWNER_SITE,
             pi05_kv1_pair_owner_selector(pi05_is_fp16_action(layer_weights_)),
             /*resolved_flags=*/0,
-            pi05_kv1_pair_owner_linear_arguments(planned_prefix_len_, pi05_is_fp16_action(layer_weights_), planned_num_steps_), chunk.idx);
+            pi05_kv1_pair_owner_route_arguments(), chunk.idx);
+        std::optional<Pi05Nvfp4QProjection> q_projection;
+        if (q_in_pair_owner) {
+            q_projection.emplace(Pi05Nvfp4QProjection{
+                addr(0, "q"), lw.q_w, lw.q_ws, lw.q_wts, nq * hd, h,
+                addr(0, Pi05Nvfp4Tables::names[0]), static_cast<uint16_t>(layer_idx),
+                q_spm_scale, q_spm_weight_addr(layer_idx)});
+        }
         rpu_launch_pi05_kv1_pair_owner_w8a16_m50n32x2k1024_kernel(
             addr(0, "input_norm"),
             lw.k_w, lw.k_ws, addr(0, "k"),
-            lw.v_w, lw.v_ws, addr(0, "v"));
+            lw.v_w, lw.v_ws, addr(0, "v"), seq_len,
+            q_projection ? &*q_projection : nullptr);
     } else if (kv1_direct) {
         TORCH_CHECK(
             ctx().has_complete_physical_manifest() && loop_mode_ &&
@@ -3799,6 +4490,28 @@ void Pi05DenoiseStepModel::build_layer_subgraph(int layer_idx, const ChunkInfo& 
     const int64_t rope_start = (rope_position_ >= 0)
         ? rope_position_ + chunk.offset : cos_sin_start;
     const int64_t descriptor_rope_start = ctx().position + chunk.offset;
+    // Split-KV attention (Phase 6) when the payloads are loaded and the layout
+    // declared its buffers: a chunk of at least seq_len rows at max_kv_seq_len,
+    // which is kv_seq_len for the explicit mask, sized them for every row count.
+    const int64_t kv_seq_len = ctx().position + ctx().seq_len;
+    const bool split_kv_layout = std::any_of(
+        split_kv_layouts_.begin(), split_kv_layouts_.end(),
+        [&](const auto& layout) {
+            return layout.first >= seq_len && layout.second == kv_seq_len;
+        });
+    const auto split_kv = prepared_mask_.mask_type == 4 && ctx().batch_size == 1 &&
+            split_kv_layout
+        ? split_kv_plan(seq_len, kv_seq_len) : std::nullopt;
+    // Either reads the rows the first body staged in SPM (same bytes).
+    const bool spm_rope_rows = split_kv && chunk.offset == 0 && seq_len == ctx().seq_len &&
+        pi05_spm_rope_rows_start() == rope_start;
+    // Its pack then applies the query RoPE: the same route and packed bytes,
+    // one launch fewer. Only the split-KV attention reads q, which stays
+    // unrotated. At most 16 rows only the direct cache's fused launch packs
+    // (below): the pack alone would leave cores idle.
+    const bool q_rope_in_pack = split_kv && hd == 256 && !pi05_q_rope_epilogue_opt_in_ &&
+        (pi05_split_kv_rope_pack(seq_len) ||
+         (kv1_direct && spm_rope_rows && pi05_kv1_direct_cache_q_rope_pack(seq_len)));
     if (!pi05_q_rope_epilogue_opt_in_) {
         if (ctx().has_complete_physical_manifest()) {
             ctx().consume_physical_route(
@@ -3807,7 +4520,15 @@ void Pi05DenoiseStepModel::build_layer_subgraph(int layer_idx, const ChunkInfo& 
                     ? Pi05DenoiseRopeRoute::FULL_ROPE_TILED : Pi05DenoiseRopeRoute::ROPE_1D),
                 /*resolved_flags=*/0, {descriptor_rope_start}, chunk.idx);
         }
-        if (hd == 256) {
+        if (q_rope_in_pack) {
+            // Rotated by the split-KV pack in Phase 6.
+        } else if (spm_rope_rows) {
+            const uint32_t cos_rows = addr(0, "rope_rows");
+            rpu_launch_partial_mrope_spm_table_kernel(
+                addr(0, "q"), addr(0, "q"), cos_rows,
+                cos_rows + seq_len * PI05_DENOISE_ROPE_ROW_BYTES,
+                seq_len, local_q_heads_, hd, hd, tp);
+        } else if (hd == 256) {
             rpu_launch_partial_mrope_spm_kernel(
                 addr(0, "q"), addr(0, "q"), cos_, sin_,
                 rope_start, seq_len, local_q_heads_, hd, hd, tp);
@@ -3825,7 +4546,8 @@ void Pi05DenoiseStepModel::build_layer_subgraph(int layer_idx, const ChunkInfo& 
             return rpu_resolve_kvinsert_segment_plan_auto(
                 cos_sin_start, seq_len, seq_len, tp, nkv, hd,
                 KV_INSERT_CAP_V2 | KV_INSERT_CAP_V16 |
-                    KV_INSERT_CAP_HYBRID2 | KV_INSERT_CAP_HYBRID3);
+                    KV_INSERT_CAP_HYBRID2 | KV_INSERT_CAP_HYBRID3 |
+                    KV_INSERT_CAP_NON8_TP_V16);
         }
         const auto& route = ctx().find_physical_route(
             FmbRouteFamily::KV_INSERT, PI05_DENOISE_KV_INSERT_SITE,
@@ -3955,10 +4677,35 @@ void Pi05DenoiseStepModel::build_layer_subgraph(int layer_idx, const ChunkInfo& 
             rpu_launch_memset_spm_multicore(addr(0, "v") + offset, pad_elems, tp);
         }
     }
+    // Set when the direct cache's fused launch packs this layer's split-KV
+    // query rows; the attention then skips its pack.
+    bool q_packed = false;
     if (kv1_direct) {
+        // The rotated writer skips the head slots no reader of this layer's
+        // single-chunk split-KV attention reads: that attention follows in the
+        // same body, and every body rewrites the action rows before reading
+        // them. Any other reader of the cache gets every slot.
+        uint16_t rotated_skip_mask = 0;
+        if (split_kv && chunk.offset == 0 && seq_len == ctx().seq_len &&
+            pi05_kv1_direct_cache_rotated(seq_len)) {
+            const int64_t position = kv_plan.segment(0).position;
+            rotated_skip_mask = pi05_split_kv_rotated_skip_mask(
+                *split_kv, position / 16, (position + kv_plan.physical_rows()) / 16);
+        }
+        // The fused writer runs the RoPE pack too when the pack reads the
+        // staged SPM cos/sin rows: q is complete here and only the pack reads
+        // it, and the pack's skv_q stays clear of the k/v rows the writer reads.
+        q_packed = q_rope_in_pack && spm_rope_rows && pi05_kv1_direct_cache_q_rope_pack(seq_len);
+        std::optional<Pi05SplitKvRopePack> q_pack;
+        if (q_packed) {
+            q_pack.emplace(Pi05SplitKvRopePack{
+                addr_offset("q").value, addr_offset("skv_q").value,
+                static_cast<int64_t>(addr_offset("rope_rows").value), *split_kv});
+        }
         rpu_launch_pi05_kv1_direct_cache_m50d256p64_kernel(
             addr_offset("k").value, addr_offset("v").value,
-            k_cache, v_cache, cos_, sin_, rope_start, kv_plan);
+            k_cache, v_cache, cos_, sin_, rope_start, kv_plan, rotated_skip_mask,
+            q_pack ? &*q_pack : nullptr);
     } else {
         rpu_launch_insert_vcache_spm_unified_with_plan(
             v_cache, addr_offset("v").value, nkv, hd, tp,
@@ -3971,7 +4718,6 @@ void Pi05DenoiseStepModel::build_layer_subgraph(int layer_idx, const ChunkInfo& 
     // Pitfall 3 structural fix: SDPA args (q / output / sdpa_tmp /
     // sdpa_mask) take SPM offsets via addr_offset(...).value.
     // --------------------------------------------------------------------
-    int64_t kv_seq_len = ctx().position + ctx().seq_len;
     // One masked action chunk, invariant across layers and denoise bodies.
     // declare_buffers owns a disjoint all-body slot, so pre/post hooks cannot
     // overwrite it. The recorded first upload still executes every REPLAY;
@@ -3986,9 +4732,20 @@ void Pi05DenoiseStepModel::build_layer_subgraph(int layer_idx, const ChunkInfo& 
                 {seq_len, kv_seq_len, tp, num_cores(), loop_mode_ ? 1 : 0,
                  loop_mode_ ? num_steps_ : 1, num_layers()}, chunk.idx);
         }
-        sdpa_dma_mask_to_spm(prepared_mask_,
-                             addr_offset("sdpa_mask").value,
-                             seq_len, kv_seq_len, tp);
+        if (split_kv) {
+            const auto slot = split_kv_mask_slots_.find({seq_len, kv_seq_len});
+            TORCH_CHECK(slot != split_kv_mask_slots_.end(),
+                        "Pi0.5 split-KV mask slot was not prepared");
+            const int64_t per_core = slot->second.numel() / num_cores();
+            rpu_launch_ddr_scatter_spm_dma(
+                slot->second, /*src_offset_elements=*/0, per_core,
+                per_core * DWIDTH, SPM_ALLOC.addr(0, addr_offset("sdpa_mask").value),
+                num_cores());
+        } else {
+            sdpa_dma_mask_to_spm(prepared_mask_,
+                                 addr_offset("sdpa_mask").value,
+                                 seq_len, kv_seq_len, tp);
+        }
     }
     int mask_type = prepared_mask_.mask_type;
     if (ctx().has_complete_physical_manifest()) {
@@ -3996,14 +4753,47 @@ void Pi05DenoiseStepModel::build_layer_subgraph(int layer_idx, const ChunkInfo& 
             PI05_DENOISE_ATTENTION_SITE,
             AttentionExecutionPolicy::DDR_KV, chunk.idx);
     }
-    rpu_launch_sdpa_spm_unified_kernel_v2(
-        k_cache, v_cache, mask_type, c10::nullopt,
-        addr_offset("q").value,
-        addr_offset("output").value,
-        addr_offset("sdpa_tmp").value,
-        addr_offset("sdpa_mask").value,
-        seq_len, nq, nkv, hd,
-        kv_seq_len, tp, /*physical_kv_cores=*/8);
+    // The split-KV merge may run inside the O launch (its merge + O sibling)
+    // when nothing launches between them: the NVFP4 O linear on all cores.
+    Pi05SplitKvMerge deferred_merge;
+    bool merge_deferred = false;
+    if (split_kv) {
+        // Layers [0, N) read this core's K/V blocks from their SPM share. The
+        // first body copies the whole range; the later ones only the blocks
+        // from the first action row on, which the direct cache rewrote, the
+        // prefix keys being unchanged within one denoise forward.
+        const auto [share_layers, share_bytes] = split_kv_share_layers(kv_seq_len, seq_len);
+        const bool share = layer_idx < share_layers && chunk.offset == 0 &&
+            seq_len == ctx().seq_len;
+        TORCH_CHECK(!share || split_kv->share_bytes() <= share_bytes,
+                    "Pi0.5 split-KV share is smaller than its plan");
+        merge_deferred = rpu_launch_pi05_split_kv_attention(
+            k_cache, v_cache,
+            addr_offset("q").value,
+            addr_offset("output").value,
+            addr_offset("skv_q").value,
+            addr_offset("skv_part").value,
+            addr_offset("sdpa_tmp").value,
+            addr_offset("sdpa_mask").value,
+            *split_kv,
+            q_rope_in_pack && !spm_rope_rows ? cos_ : at::Tensor(),
+            q_rope_in_pack && !spm_rope_rows ? sin_ : at::Tensor(), rope_start,
+            share ? addr_offset("skv_share").value + layer_idx * share_bytes : -1,
+            ctx().body_iter == 0 ? 0 : ctx().position / 16,
+            // int64_t: a uint32_t arm would turn -1 into 2^32 - 1.
+            q_rope_in_pack && spm_rope_rows && !q_packed
+                ? static_cast<int64_t>(addr_offset("rope_rows").value) : int64_t{-1},
+            q_packed, nvfp4_.enabled() && tp == num_cores() ? &deferred_merge : nullptr);
+    } else {
+        rpu_launch_sdpa_spm_unified_kernel_v2(
+            k_cache, v_cache, mask_type, c10::nullopt,
+            addr_offset("q").value,
+            addr_offset("output").value,
+            addr_offset("sdpa_tmp").value,
+            addr_offset("sdpa_mask").value,
+            seq_len, nq, nkv, hd,
+            kv_seq_len, tp, /*physical_kv_cores=*/8);
+    }
 
     // --------------------------------------------------------------------
     // Phase 7: O_proj (row partition, attn_tp cores)
@@ -4028,8 +4818,11 @@ void Pi05DenoiseStepModel::build_layer_subgraph(int layer_idx, const ChunkInfo& 
     if (nvfp4_.enabled()) {
             rpu_launch_pi05_nvfp4_v2_kernel(addr(0, "output"), lw.o_w, addr(0, "oproj"),
                 seq_len, h, nq * hd, 0, tp, lw.o_ws,
-                addr(0, Pi05Nvfp4Tables::names[1]), layer_idx, linear_acc32_);
+                addr(0, Pi05Nvfp4Tables::names[1]), layer_idx, linear_acc32_, lw.o_wts,
+                nvfp4_spm_scale_addr(layer_idx, PI05_DENOISE_NVFP4_SPM_SCALE_O),
+                merge_deferred ? &deferred_merge : nullptr);
         } else {
+            TORCH_CHECK(!merge_deferred, "Pi0.5 split-KV merge deferred to a non-NVFP4 O linear");
             rpu_launch_linear_spm_to_spm_acc16_kernel(
         addr(0, "output"), lw.o_w, addr(0, "oproj"),
         seq_len, h, nq * hd,
@@ -4050,11 +4843,20 @@ void Pi05DenoiseStepModel::build_layer_subgraph(int layer_idx, const ChunkInfo& 
             /*resolved_flags=*/0, {}, chunk.idx);
     }
     const bool xor3_gated_attn = use_pi05_xor3_gated_attn(seq_len);
-    if (xor3_gated_attn) {
+    const bool xor3_gated_adarms = use_pi05_xor3_gated_adarms_chain(seq_len);
+    if (xor3_gated_adarms) {
+        // Phases 8 to 10 in one launch: the raw residual into this core's
+        // shard rows of residual2, the normalized rows into input_norm.
+        pi05_require_stable_graph_dma_capture();
+        rpu_launch_pi05_xor3_gated_adarms_spm_kernel(
+            addr(0, "oproj"), addr(0, "final_out_spm"),
+            addr(0, "residual1"), attn_gate, addr(0, "residual2"),
+            addr(0, "input_norm"), mlp_scale, mlp_shift, seq_len, eps_);
+    } else if (xor3_gated_attn) {
         pi05_require_stable_graph_dma_capture();
         rpu_launch_pi05_xor3_gated_residual_spm_kernel(
             addr(0, "oproj"), addr(0, "final_out_spm"),
-            addr(0, "residual1"), attn_gate, addr(0, "residual2"));
+            addr(0, "residual1"), attn_gate, addr(0, "residual2"), seq_len);
     } else {
         rpu_launch_all_reduce_sum_residual_kernel(
             addr(0, "oproj"), addr(0, "final_out_spm"), addr(0, "residual2"),
@@ -4074,10 +4876,16 @@ void Pi05DenoiseStepModel::build_layer_subgraph(int layer_idx, const ChunkInfo& 
     // --------------------------------------------------------------------
     // Phase 10: Post-attention AdaRMSNorm (MLP side): residual2 -> residual1
     // (1+scale_mlp) baked into mlp_scale; then add shift_mlp.
+    // The whole-row chain already normalized into input_norm in Phase 8, with
+    // the same norm arithmetic; its route stays consumed. A layer whose GeGLU
+    // reads SPM scales at M <= 16 runs the norm in the GeGLU's launch instead.
     // --------------------------------------------------------------------
+    const bool mlp_norm_in_geglu = !xor3_gated_adarms && pi05_adarms_in_geglu(seq_len, layer_idx);
     emit_adarms_norm_shift(
         addr(0, "residual2"), addr(0, "residual1"),
-        mlp_scale, mlp_shift, seq_len, PI05_DENOISE_MLP_NORM_SITE, chunk.idx);
+        mlp_scale, mlp_shift, seq_len, PI05_DENOISE_MLP_NORM_SITE, chunk.idx,
+        /*launch=*/!xor3_gated_adarms && !mlp_norm_in_geglu);
+    const Pi05AdaRmsNormOperands mlp_norm{addr(0, "residual2"), mlp_scale, mlp_shift, eps_};
 
     // --------------------------------------------------------------------
     // Phase 11: MLP pipeline
@@ -4086,9 +4894,9 @@ void Pi05DenoiseStepModel::build_layer_subgraph(int layer_idx, const ChunkInfo& 
     TORCH_CHECK(!pi05_xor3_gated_mlp_opt_in_ || xor3_gated_mlp,
                 "Pi MLP XOR3+gated runtime owner/profile drifted");
     if (pi05_geglu_m50_opt_in_) {
-        emit_pi05_geglu_m50_mlp(lw, chunk, mlp_gate);
+        emit_pi05_geglu_m50_mlp(lw, chunk, mlp_gate, layer_idx);
     } else if (pi05_w4_fastpath_opt_in_ && xor3_gated_mlp) {
-        emit_pi05_w4_xor3_mlp(lw, chunk, mlp_gate, layer_idx);
+        emit_pi05_w4_xor3_mlp(lw, chunk, mlp_gate, layer_idx, mlp_norm_in_geglu ? &mlp_norm : nullptr);
     } else if ((layer_idx == 0 && use_pi05_gateup_resident(seq_len)) ||
             (layer_idx < pi05_gateup_resident_layers_ && use_pi05_gateup_bundle(seq_len))) {
         TORCH_CHECK(chunk.idx == 0 && chunk.offset == 0,
@@ -4126,10 +4934,24 @@ void Pi05DenoiseStepModel::build_layer_subgraph(int layer_idx, const ChunkInfo& 
                         "Pi0.5 unused-output DMA elision reached a non-final group boundary");
             // The immediate post-body norm reads residual1 directly. This
             // Graph caller discards FMB's returned DDR output tensor.
+        } else if (pi05_step_boundary_output(layer_idx, chunk)) {
+            // The final norm reads residual1 in SPM; this copy only fills the
+            // FMB output the Graph caller discards. It runs under the final
+            // norm and is joined in the next body's pre-layers.
+            rpu_launch_spm_copy_ddr_dma(
+                addr(0, "residual1"), output_tensor(),
+                chunk_row_offset_(chunk) * hidden_size(),
+                chunk_rows_(chunk) * hidden_size(), &step_boundary_dma_);
         } else {
             emit_layer_output_dma(layer_idx, chunk);  // from "residual1"
         }
     }
+}
+
+bool Pi05DenoiseStepModel::pi05_step_boundary_output(int layer_idx, const ChunkInfo& chunk) const {
+    return use_pi05_adarms_body_stream() && layer_idx == num_layers() - 1 &&
+        chunk.idx == 0 && chunk.offset == 0 && chunk.len == chunk_size_ &&
+        ctx().body_iter + 1 < num_steps_;
 }
 
 void Pi05DenoiseStepModel::emit_pi05_action_spm_input(const ChunkInfo& chunk) {
@@ -4148,7 +4970,7 @@ void Pi05DenoiseStepModel::emit_pi05_action_spm_input(const ChunkInfo& chunk) {
 }
 
 void Pi05DenoiseStepModel::emit_pi05_geglu_m50_mlp(
-    const LayerWeights& weights, const ChunkInfo& chunk, uint32_t mlp_gate) {
+    const LayerWeights& weights, const ChunkInfo& chunk, uint32_t mlp_gate, int layer_idx) {
     TORCH_CHECK(
         use_pi05_geglu_m50(chunk.len) && loop_mode_ &&
             pi05_action_steps_admitted(num_steps_) && num_steps_ == planned_num_steps_ &&
@@ -4163,13 +4985,16 @@ void Pi05DenoiseStepModel::emit_pi05_geglu_m50_mlp(
         pi05_geglu_m50_selector(pi05_is_fp16_action(layer_weights_)), 0,
         pi05_geglu_m50_arguments(), chunk.idx);
     rpu_launch_pi05_denoise_gate_up_geglu_w8a16_m50_kernel(
-        addr(0, "residual1"), weights.gate_proj_w, weights.up_proj_w,
-        addr(0, "gate"), weights.gate_ws, weights.up_ws);
-    emit_pi05_down_and_mlp_residual(weights, chunk, mlp_gate);
+        pi05_mlp_input(chunk.len), weights.gate_proj_w, weights.up_proj_w,
+        addr(0, "gate"), weights.gate_ws, weights.up_ws, chunk.len);
+    emit_pi05_down_and_mlp_residual(weights, chunk, mlp_gate, layer_idx);
 }
 
 void Pi05DenoiseStepModel::emit_pi05_w4_xor3_mlp(
-    const LayerWeights& weights, const ChunkInfo& chunk, uint32_t mlp_gate, int layer_idx) {
+    const LayerWeights& weights, const ChunkInfo& chunk, uint32_t mlp_gate, int layer_idx,
+    const Pi05AdaRmsNormOperands* norm) {
+    TORCH_CHECK(!norm || pi05_adarms_in_geglu(chunk.len, layer_idx),
+                "Pi AdaRMS norm folded into a GeGLU launch that cannot apply it");
     TORCH_CHECK(
         pi05_w4_fastpath_opt_in_ && !pi05_geglu_m50_opt_in_ &&
             use_pi05_xor3_gated_mlp(chunk.len) && loop_mode_ &&
@@ -4185,9 +5010,12 @@ void Pi05DenoiseStepModel::emit_pi05_w4_xor3_mlp(
         ctx().consume_physical_route(FmbRouteFamily::LINEAR, PI05_DENOISE_NVFP4_GEGLU_LINEAR_SITE,
             PI05_DENOISE_NVFP4_GEGLU_ACC16_M320N64K128, 0, pi05_nvfp4_geglu_m50_arguments(), chunk.idx);
         rpu_launch_pi05_denoise_gate_up_geglu_nvfp4_acc16_m50_kernel(
-            addr(0, "residual1"), weights.gate_proj_w, weights.up_proj_w,
+            pi05_mlp_input(chunk.len), weights.gate_proj_w, weights.up_proj_w,
             addr(0, "gate"), weights.gate_ws, weights.up_ws,
-            addr(0, "nvfp4_gate_ts"), addr(0, "nvfp4_up_ts"), layer_idx);
+            addr(0, "nvfp4_gate_ts"), addr(0, "nvfp4_up_ts"), layer_idx,
+            chunk.len, weights.gate_wts, weights.up_wts,
+            nvfp4_spm_scale_addr(layer_idx, PI05_DENOISE_NVFP4_SPM_SCALE_GATE),
+            nvfp4_spm_scale_addr(layer_idx, PI05_DENOISE_NVFP4_SPM_SCALE_UP), norm);
     } else if (pi05_w4_geglu_m50_opt_in_) {
         TORCH_CHECK(use_pi05_w4_geglu_m50(chunk.len),
                     "Pi W4 GeGLU runtime owner/profile drifted");
@@ -4196,17 +5024,20 @@ void Pi05DenoiseStepModel::emit_pi05_w4_xor3_mlp(
             pi05_w4_geglu_m50_selector(), 0,
             pi05_w4_geglu_m50_arguments(), chunk.idx);
         if (pi05_w4_geglu_n64_opt_in_) {
-            rpu_launch_pi05_denoise_gate_up_geglu_wint4a16_pgrp_m50n64_kernel(
-                addr(0, "residual1"), weights.gate_proj_w, weights.up_proj_w,
-                addr(0, "gate"), weights.gate_ws, weights.up_ws);
+            rpu_launch_pi05_denoise_gate_up_geglu_w4a16_pgrp_m50n64_kernel(
+                pi05_mlp_input(chunk.len), weights.gate_proj_w, weights.up_proj_w,
+                addr(0, "gate"), weights.gate_ws, weights.up_ws, chunk.len);
         } else {
-            rpu_launch_pi05_denoise_gate_up_geglu_wint4a16_pgrp_m50_kernel(
-                addr(0, "residual1"), weights.gate_proj_w, weights.up_proj_w,
-                addr(0, "gate"), weights.gate_ws, weights.up_ws);
+            rpu_launch_pi05_denoise_gate_up_geglu_w4a16_pgrp_m50_kernel(
+                pi05_mlp_input(chunk.len), weights.gate_proj_w, weights.up_proj_w,
+                addr(0, "gate"), weights.gate_ws, weights.up_ws, chunk.len);
         }
     } else {
         // Keep the original generated W4 Gate/GELU/Up/MUL and FP16 retirement.
         // Shared FMB returns after MUL; only Down and its continuation move here.
+        // It reads residual1, so the whole-row chain never reaches it.
+        TORCH_CHECK(!use_pi05_xor3_gated_adarms_chain(chunk.len),
+                    "Pi XOR3+gated+AdaRMS chain reached the generic MLP pipeline");
         emit_mlp_pipeline(weights.gate_proj_w, weights.up_proj_w, weights.down_proj_w,
             chunk.len, ActivationKind::GELU,
             weights.gate_ws, weights.up_ws, weights.down_ws,
@@ -4237,7 +5068,8 @@ void Pi05DenoiseStepModel::emit_pi05_down_and_mlp_residual(
     if (nvfp4_.enabled()) {
         rpu_launch_pi05_nvfp4_v2_kernel(addr(0, "gate"), weights.down_proj_w,
             addr(0, "down"), rows, 1024, 4096, 0, 8, weights.down_ws,
-            addr(0, "nvfp4_down_ts"), layer_idx, linear_acc32_);
+            addr(0, "nvfp4_down_ts"), layer_idx, linear_acc32_, weights.down_wts,
+            nvfp4_spm_scale_addr(layer_idx, PI05_DENOISE_NVFP4_SPM_SCALE_DOWN));
     } else {
     rpu_launch_linear_spm_to_spm_acc16_kernel(
         addr(0, "gate"), weights.down_proj_w, addr(0, "down"),
@@ -4251,9 +5083,34 @@ void Pi05DenoiseStepModel::emit_pi05_down_and_mlp_residual(
             pi05_xor3_gated_mlp_arguments(), chunk.idx);
         // The launcher checks all five absolute SPM ranges are disjoint.
         // reduce(down) -> FP16 gate multiply -> FP16 residual2 addition.
+        if (use_pi05_xor3_gated_adarms_chain(rows)) {
+            // Whole-row shards: the skip is the attention continuation's
+            // compact residual2. When the output stays in SPM, the next layer
+            // reads only this core's shard rows of residual1 (its attention
+            // skip), so this launch also applies that layer's attention-side
+            // AdaRMS into input_norm, dead once Gate/Up have read it.
+            if (pi05_adarms_to_next_layer(rows)) {
+                TORCH_CHECK(layer_idx >= 0 && layer_idx + 1 < num_layers(),
+                            "Pi0.5 whole-row chain: the last layer has no next norm");
+                const uint32_t next_scale = pi05_adarms_table_row(2 * (layer_idx + 1));
+                pi05_require_stable_graph_dma_capture();
+                rpu_launch_pi05_xor3_gated_adarms_spm_kernel(
+                    addr(0, "down"), addr(0, "final_out_spm"),
+                    addr(0, "residual2"), mlp_gate, addr(0, "residual1"),
+                    addr(0, "input_norm"), next_scale,
+                    next_scale + static_cast<uint32_t>(hidden_size() * DWIDTH), rows, eps_);
+                return;
+            }
+            // Otherwise every row of residual1 is gathered for the output DMA
+            // or the final norm.
+            rpu_launch_pi05_xor3_gated_rows_spm_kernel(
+                addr(0, "down"), addr(0, "final_out_spm"),
+                addr(0, "residual2"), mlp_gate, addr(0, "residual1"), rows);
+            return;
+        }
         rpu_launch_pi05_xor3_gated_residual_spm_kernel(
             addr(0, "down"), addr(0, "final_out_spm"),
-            addr(0, "residual2"), mlp_gate, addr(0, "residual1"));
+            addr(0, "residual2"), mlp_gate, addr(0, "residual1"), rows);
         return;
     }
     if (ctx().has_complete_physical_manifest()) {
@@ -4279,7 +5136,7 @@ void Pi05DenoiseStepModel::emit_resident_gateup_mlp(
             ctx().consume_physical_route(
                 FmbRouteFamily::LINEAR,
                 bundle ? PI05_DENOISE_BUNDLE_LINEAR_SITE : PI05_DENOISE_GATEUP_RESIDENT_SITE,
-                PI05_DENOISE_SPM_WEIGHT_M512N48K128, 0,
+                PI05_DENOISE_SPM_WEIGHT_CURRENT, 0,
                 bundle ? pi05_gateup_bundle_linear_arguments(
                              pi05_gateup_resident_layers_, layer_idx, projection)
                        : pi05_gateup_resident_arguments(), invocation);
@@ -4353,6 +5210,22 @@ void Pi05DenoiseStepModel::emit_pi05_gateup_bundle_preload() {
         &resident_gateup_bundle_src_base_, 0, bytes / DWIDTH, bytes, destination, 8);
 }
 
+void Pi05DenoiseStepModel::emit_pi05_nvfp4_spm_scale_fill(int64_t layers) {
+    if (graph_dma::active()) RpuKernelGraph::active().keep_alive(nvfp4_spm_scale_);
+    rpu_launch_ddr_scatter_spm_dma(
+        nvfp4_spm_scale_, /*src_offset_elements=*/0,
+        layers * PI05_DENOISE_NVFP4_SPM_SCALE_LAYER / DWIDTH, nvfp4_spm_scale_.size(1) * DWIDTH,
+        addr(0, "nvfp4_spm_scale"), num_cores());
+}
+
+void Pi05DenoiseStepModel::emit_pi05_q_spm_weight_fill(int64_t layers) {
+    if (graph_dma::active()) RpuKernelGraph::active().keep_alive(q_spm_weight_);
+    rpu_launch_ddr_scatter_spm_dma(
+        q_spm_weight_, /*src_offset_elements=*/0,
+        layers * PI05_DENOISE_Q_SPM_WEIGHT_LAYER / DWIDTH, q_spm_weight_.size(1) * DWIDTH,
+        addr(0, "q_spm_weight"), num_cores());
+}
+
 void Pi05DenoiseStepModel::emit_pre_layers_body() {
     if (ctx().body_iter==0 && ctx().has_complete_physical_manifest()) {
         if (pi05_w4_fastpath_opt_in_) {
@@ -4398,10 +5271,12 @@ void Pi05DenoiseStepModel::emit_pre_layers_body() {
                     ? pi05_kv1_pair_owner_policy_arguments(
                           /*enabled=*/pi05_kv1_pair_owner_opt_in_,
                           ctx().position,
-                          planned_prefix_len_, pi05_is_fp16_action(layer_weights_), planned_num_steps_)
+                          planned_prefix_len_, pi05_is_fp16_action(layer_weights_), planned_num_steps_,
+                          chunk_size_)
                     : pi05_kv1_direct_policy_arguments(
                           /*enabled=*/true,
-                          ctx().position, planned_prefix_len_));
+                          ctx().position,
+                          planned_prefix_len_, chunk_size_));
         }
     }
     validate_pi05_graph_dma_runtime();
@@ -4435,6 +5310,16 @@ void Pi05DenoiseStepModel::emit_pre_layers_body() {
                 addr(0, projection == 0 ? "resident_gate_w8" : "resident_up_w8"));
         }
     }
+    if (ctx().body_iter == 0) {
+        const int64_t scale_layers =
+            nvfp4_spm_scale_layers(ctx().position + ctx().seq_len, ctx().seq_len);
+        if (scale_layers > 0) emit_pi05_nvfp4_spm_scale_fill(scale_layers);
+        const int64_t q_layers =
+            q_spm_weight_layers(ctx().position + ctx().seq_len, ctx().seq_len);
+        if (q_layers > 0) emit_pi05_q_spm_weight_fill(q_layers);
+        const int64_t rope_rows = pi05_spm_rope_rows_start();
+        if (rope_rows >= 0) emit_pi05_spm_rope_rows_fill(rope_rows);
+    }
 
     // final_out_spm is declared ALL-phase and first written by the final
     // norm after all layers. Re-zero it each body: the preceding Euler step
@@ -4457,9 +5342,15 @@ void Pi05DenoiseStepModel::emit_pre_layers_body() {
             FmbRouteFamily::MUTABLE_DMA, PI05_DENOISE_ADARMS_TABLE_DMA_SITE,
             static_cast<int64_t>(Pi05DenoiseMutableDmaRoute::DDR_BROADCAST_TABLE_BODY),
             0, pi05_adarms_body_arguments(body), body);
-        rpu_launch_ddr_broadcast_spm_dma_mutable(
-            adarms_table_src_base_, adarms_table_, body * PI05_DENOISE_ADARMS_BODY_BYTES,
-            PI05_DENOISE_ADARMS_BODY_BYTES / DWIDTH, addr(0, "adarms_table"), num_cores());
+        // Body 0 issues its rows here; every later body's rows were issued
+        // after the previous body's final norm. Both are joined after [A4].
+        if (body == 0) {
+            step_boundary_dma_ = DeferredDmaChannels{};
+            adarms_prefetch_body_ = -1;
+            emit_pi05_adarms_body_dma(0);
+        }
+        TORCH_CHECK(adarms_prefetch_body_ == body,
+                    "Pi0.5 AdaRMS body ", body, " table DMA was not issued");
     } else if (use_spm_adarms_table() && ctx().body_iter == 0) {
         TORCH_CHECK(loop_mode_ && num_steps_ == adarms_table_.size(0),
                     "Pi0.5 resident AdaRMS table/loop profile drift");
@@ -4556,6 +5447,9 @@ void Pi05DenoiseStepModel::emit_pre_layers_body() {
             /*ddr_ptr=*/action_emb_stage_.data_ptr<c10::Half>(),
             /*num_elements=*/cs * h);
     }
+    // Layer 0's norm is the body's first table reader, and layer 0's input
+    // DMA rewrites the residual1 the previous body's output copy reads.
+    if (use_pi05_adarms_body_stream()) rpu_join_deferred_dma(step_boundary_dma_);
 }
 
 void Pi05DenoiseStepModel::emit_post_layers_body() {
@@ -4580,6 +5474,11 @@ void Pi05DenoiseStepModel::emit_post_layers_body() {
     emit_adarms_norm_shift(
         addr(0, "residual1"), addr(0, "final_out_spm"),
         final_scale, final_shift, cs, PI05_DENOISE_FINAL_NORM_SITE);
+    // The final norm is this body's last table reader: the next body's rows
+    // load under the step boundary ([Z2], Euler, the next [A1..A4]).
+    if (use_pi05_adarms_body_stream() && ctx().body_iter + 1 < num_steps_) {
+        emit_pi05_adarms_body_dma(ctx().body_iter + 1);
+    }
 
     // [Z2] action_out_proj uses the action owner's cold accumulation policy.
     // Explicit ACC32 retains the previous FP32 accumulation at this boundary.
@@ -4668,9 +5567,7 @@ uint32_t Pi05DenoiseStepModel::adarms_gemv_to_spm(uint32_t cond_spm_addr,
         const int64_t offset =
             (ctx().body_iter * (2 * num_layers() + 1) + table_row) * out_features * DWIDTH;
         if (use_spm_adarms_table()) {
-            const int64_t local_offset = use_pi05_adarms_body_stream()
-                ? table_row * out_features * DWIDTH : offset;
-            return addr(0, "adarms_table") + static_cast<uint32_t>(local_offset);
+            return pi05_adarms_table_row(table_row);
         }
         if (ctx().has_complete_physical_manifest()) {
             ctx().consume_physical_route(
@@ -4733,6 +5630,29 @@ uint32_t Pi05DenoiseStepModel::adarms_gemv_to_spm(uint32_t cond_spm_addr,
     return gemv_out_spm_addr;
 }
 
+uint32_t Pi05DenoiseStepModel::pi05_adarms_table_row(int64_t table_row) {
+    TORCH_CHECK(loop_mode_ && use_spm_adarms_table() &&
+                    table_row >= 0 && table_row < 2 * num_layers() + 1 &&
+                    ctx().body_iter >= 0 && ctx().body_iter < adarms_table_.size(0),
+                "Pi0.5 SPM AdaRMS table row/body out of range");
+    // A body-streamed table holds only this body's rows.
+    const int64_t row = use_pi05_adarms_body_stream()
+        ? table_row : ctx().body_iter * (2 * num_layers() + 1) + table_row;
+    return addr(0, "adarms_table") +
+        static_cast<uint32_t>(row * 3 * hidden_size() * DWIDTH);
+}
+
+void Pi05DenoiseStepModel::emit_pi05_adarms_body_dma(int64_t body) {
+    TORCH_CHECK(use_pi05_adarms_body_stream() && body < num_steps_ &&
+                    body == adarms_prefetch_body_ + 1,
+                "Pi0.5 AdaRMS body ", body, " table DMA out of order");
+    adarms_prefetch_body_ = body;
+    rpu_launch_ddr_broadcast_spm_dma_mutable(
+        adarms_table_src_base_, adarms_table_, body * PI05_DENOISE_ADARMS_BODY_BYTES,
+        PI05_DENOISE_ADARMS_BODY_BYTES / DWIDTH, addr(0, "adarms_table"), num_cores(),
+        &step_boundary_dma_);
+}
+
 }  // namespace v3
 
 // ============================================================================
@@ -4780,6 +5700,11 @@ std::string rpu_pi05_denoise_step_kvinsert_cost_catalog_sha256(int64_t handle) {
 void rpu_pi05_denoise_step_set_execution_core_count(int64_t handle, int64_t cores) {
     Pi05DenoiseStepRegistry::get(handle, "rpu_pi05_denoise_step_set_execution_core_count")
         ->set_execution_cores(cores);
+}
+
+void rpu_pi05_denoise_step_set_kv_source_heads(int64_t handle, int64_t heads) {
+    Pi05DenoiseStepRegistry::get(handle, "rpu_pi05_denoise_step_set_kv_source_heads")
+        ->set_kv_source_heads(heads);
 }
 
 std::vector<int64_t> rpu_pi05_denoise_step_get_execution_topology(int64_t handle) {

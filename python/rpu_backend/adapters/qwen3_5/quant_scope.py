@@ -10,6 +10,7 @@ Deliberately stdlib-only: the converter computes the scope from a raw
 """
 from __future__ import annotations
 
+from copy import copy
 from dataclasses import dataclass
 from typing import Mapping
 
@@ -25,6 +26,10 @@ W8A16 = "w8a16"
 W4A16_PGRP = "w4a16_pgrp"
 W4A16_AWQ = "w4a16_awq"
 QUANTTRIO_AWQ_PROFILE = "quanttrio_awq_g128"
+ACTIVATION_AWQ_PROFILE = "activation_awq_g128_v1"
+AWQ_PROFILES = (QUANTTRIO_AWQ_PROFILE, ACTIVATION_AWQ_PROFILE)
+NAMED_MIXED_PROFILES = ("w4_mlp_only", "w4_mlp_w8_attn_gdn",
+                        "w4_main_w8_gdn", "w8_main_w8_gdn")
 SUPPORTED_QUANT_METHODS = (FP16, W8A16, W4A16_PGRP, W4A16_AWQ)
 PGRP_SUPPORTED_GROUP_SIZES = (32, 64, 128)
 DECLARED_DTYPES = (FP16, W8A16, "w4a16")
@@ -135,11 +140,11 @@ def _spec(value, name):
     return QuantSpec(value["method"], value.get("group_size"))
 
 
-def _quanttrio_policy(is_full):
+def _quanttrio_policy(is_full, profile=QUANTTRIO_AWQ_PROFILE):
     """Versioned per-module declaration; v2 role semantics remain unchanged."""
     return {
         "format_version": 3, "architecture": "qwen3_5",
-        "profile": QUANTTRIO_AWQ_PROFILE, "activation_dtype": "float16",
+        "profile": profile, "activation_dtype": "float16",
         "storage": "uint8", "scale_dtype": "float16",
         "default": {"method": FP16},
         "module_overrides": {
@@ -158,7 +163,10 @@ def quanttrio_awq_config(config):
     get = _config_value
     quant = get(config, "quant_config")
     source = get(config, "quantization_config")
-    declared = isinstance(quant, Mapping) and quant.get("profile") == QUANTTRIO_AWQ_PROFILE
+    declared = isinstance(quant, Mapping) and quant.get("profile") in AWQ_PROFILES
+    profile = quant["profile"] if declared else QUANTTRIO_AWQ_PROFILE
+    if profile == ACTIVATION_AWQ_PROFILE and source is not None:
+        raise ValueError("locally calibrated AWQ must not claim an external AWQ source declaration")
     if source is None and not declared:
         return None
     if source is not None:
@@ -178,11 +186,15 @@ def quanttrio_awq_config(config):
     if tc is None or get(config, "model_type") != "qwen3_5":
         raise ValueError("QuantTrio AWQ requires a Qwen3.5 conditional-generation config")
     h = get(tc, "hidden_size")
+    # Keep the accepted geometries explicit.  A matching 27B AWQ checkpoint
+    # uses the same GEMM metadata and packed projection layout as the smaller
+    # dense checkpoints, but must not be admitted by a loose hidden-size test.
     shapes = {2048: (6144, 24, 8, 2, 16), 2560: (9216, 32, 16, 4, 32),
-              4096: (12288, 32, 16, 4, 32)}
+              4096: (12288, 32, 16, 4, 32),
+              5120: (17408, 64, 24, 4, 48)}
     row = shapes.get(h) if type(h) is int else None
     if row is None:
-        raise ValueError("QuantTrio AWQ supports exact dense 2B/4B/9B geometry")
+        raise ValueError("QuantTrio AWQ supports exact dense 2B/4B/9B/27B geometry")
     fields = dict(zip(("intermediate_size", "num_hidden_layers", "num_attention_heads",
                        "num_key_value_heads", "linear_num_value_heads"), row))
     fields.update(head_dim=256, linear_num_key_heads=16, linear_key_head_dim=128,
@@ -194,7 +206,7 @@ def quanttrio_awq_config(config):
                  "full_attention_interval": 4}
     if (any(get(tc, k) != v or (type(v) is bool and type(get(tc, k)) is not bool)
             for k, v in semantics.items())
-            or get(config, "tie_word_embeddings") is not (h != 4096)
+            or get(config, "tie_word_embeddings") is not (h not in (4096, 5120))
             or get(config, "image_token_id") != 248056
             or any(get(owner, key) for owner in (config, tc) for key in
                    ("num_experts", "adaptive_mode", "mlp_only_layers"))
@@ -209,7 +221,7 @@ def quanttrio_awq_config(config):
                      "mrope_section": [11, 11, 10]}
     if not isinstance(rope, Mapping) or any(rope.get(k) != v for k, v in expected_rope.items()):
         raise ValueError("QuantTrio AWQ requires the original partial interleaved M-RoPE")
-    canonical = _quanttrio_policy(is_full_from_layer_types(layers))
+    canonical = _quanttrio_policy(is_full_from_layer_types(layers), profile)
     if quant is not None and quant != canonical:
         raise ValueError("QuantTrio AWQ quant_config conflicts with its exact per-module scope")
     return canonical
@@ -318,7 +330,7 @@ def is_mlp_only_text_profile(config):
 
 
 def validate_mlp_only_text_profile(config):
-    """Check named 2B recipe geometry and scope for source-only consumers.
+    """Check named recipe geometry and scope for source-only consumers.
 
     Runtime admission additionally checks dense text semantics in cores.py.
     Other v2 profiles and generic converter scopes retain their prior behavior.
@@ -329,17 +341,25 @@ def validate_mlp_only_text_profile(config):
     if "layer_overrides" in quant:
         raise ValueError("Qwen3.5 MLP-only W4 does not support layer_overrides; every layer must use the same MLP scope")
     tc = _config_value(config, "text_config", config)
-    expected = dict(hidden_size=2048, intermediate_size=6144, num_hidden_layers=24,
-                    num_attention_heads=8, num_key_value_heads=2, head_dim=256,
-                    linear_num_key_heads=16, linear_num_value_heads=16,
+    geometries = {
+        2048: (6144, 24, 8, 2, 16),
+        5120: (17408, 64, 24, 4, 48),
+    }
+    hidden = _config_value(tc, "hidden_size")
+    row = geometries.get(hidden)
+    if row is None:
+        raise ValueError("Qwen3.5 MLP-only W4 requires exact 2B geometry or official 27B geometry")
+    expected = dict(hidden_size=hidden, intermediate_size=row[0], num_hidden_layers=row[1],
+                    num_attention_heads=row[2], num_key_value_heads=row[3], head_dim=256,
+                    linear_num_key_heads=16, linear_num_value_heads=row[4],
                     linear_key_head_dim=128, linear_value_head_dim=128,
                     linear_conv_kernel_dim=4, vocab_size=248320)
     if any(type(_config_value(tc, name)) is not int or _config_value(tc, name) != value
            for name, value in expected.items()):
-        raise ValueError("Qwen3.5 MLP-only W4 requires exact 2B geometry")
-    layers = [FULL_ATTENTION if i % 4 == 3 else LINEAR_ATTENTION for i in range(24)]
+        raise ValueError("Qwen3.5 MLP-only W4 requires exact 2B geometry or official 27B geometry")
+    layers = [FULL_ATTENTION if i % 4 == 3 else LINEAR_ATTENTION for i in range(row[1])]
     if list(_config_value(tc, "layer_types", ())) != layers:
-        raise ValueError("Qwen3.5 MLP-only W4 requires the exact 2B hybrid schedule")
+        raise ValueError("Qwen3.5 MLP-only W4 requires the exact hybrid schedule")
     specs = resolve_quant_specs(is_full_from_layer_types(layers),
                                 _config_value(config, "quant_config"))
     if any(spec.method != (W4A16_PGRP if ".mlp." in name else FP16)
@@ -429,13 +449,26 @@ def validate_legacy_text_profile(config) -> bool:
 def validate_modern_27b_profile(config, *, allow_fp16=False) -> bool:
     """Validate official 27B semantics and uniform quantization, without torch.
 
-    Other sizes and the independently validated legacy policy return False.
+    Other sizes, named mixed-precision recipes and the independently validated
+    legacy policy return False.
     An apparent modern 27B with conflicting metadata raises before allocation.
-    ``allow_fp16`` is for source conversion/capacity inspection only; public
-    runtime admission currently requires uniform W8 or W4 group32.
+    ``allow_fp16`` enables the dense FP16 runtime path.  Callers that only
+    inspect quantized assets can leave it disabled to retain the stricter
+    admission policy.
     """
     tc = _config_value(config, "text_config", config)
     if _config_value(tc, "hidden_size") != 5120:
+        return False
+    # Named MLP-only and QuantTrio AWQ recipes use their own loader and core
+    # contracts.  Do not route a valid 27B mixed-precision declaration through
+    # the uniform dense-27B graph policy below.
+    quant = _config_value(config, "quant_config")
+    named_mixed = isinstance(quant, Mapping) and quant.get("profile") in (
+        "w4_mlp_only", "w4_mlp_w8_attn_gdn", "w4_main_w8_gdn", "w8_main_w8_gdn")
+    if named_mixed:
+        validate_named_27b_mixed_profile(config)
+        return False
+    if quanttrio_awq_config(config) is not None:
         return False
     if validate_legacy_text_profile(config):
         return False
@@ -503,14 +536,50 @@ def validate_modern_27b_profile(config, *, allow_fp16=False) -> bool:
     if quant is None:
         if allow_fp16:
             return True
-        raise ValueError("official Qwen3.5-27B FP16 is not admitted: long-VL capacity validation "
-                         "exceeds the supported board memory; use uniform W8 or W4 group32")
+        raise ValueError("official Qwen3.5-27B FP16 requires an explicit runtime admission")
     specs = set(resolve_quant_specs(is_full_from_layer_types(expected_layers), quant).values())
     if (len(specs) != 1 or next(iter(specs)) not in
             (QuantSpec(W8A16), QuantSpec(W4A16_PGRP, 32))):
         raise ValueError("official Qwen3.5-27B requires uniform W8 or W4 group32 text projections")
     if quant.get("storage", "int8") != "int8" or quant.get("scale_dtype", "float16") != "float16":
         raise ValueError("official Qwen3.5-27B requires int8 raw storage and FP16 scales")
+    return True
+
+
+
+def validate_named_27b_mixed_profile(config):
+    """Bind each named official 27B mixed recipe to its exact role policy."""
+    quant = _config_value(config, "quant_config")
+    profile = quant.get("profile") if isinstance(quant, Mapping) else None
+    tc = _config_value(config, "text_config", config)
+    if profile not in NAMED_MIXED_PROFILES or _config_value(tc, "hidden_size") != 5120:
+        return False
+    source = dict(config) if isinstance(config, Mapping) else copy(config)
+    if isinstance(source, dict):
+        source["quant_config"] = None
+    else:
+        source.quant_config = None
+    validate_modern_27b_profile(source, allow_fp16=True)
+    if (quant.get("format_version") != 2 or "layer_overrides" in quant
+            or quant.get("storage", "int8") != "int8"
+            or quant.get("scale_dtype", "float16") != "float16"):
+        raise ValueError("named official 27B mixed recipes require version 2 raw INT8/FP16 storage")
+    is_full = is_full_from_layer_types(_config_value(tc, "layer_types"))
+    specs = resolve_quant_specs(is_full, quant)
+    for name, spec in specs.items():
+        mlp = ".mlp." in name
+        if profile == "w4_mlp_only":
+            expected = QuantSpec(W4A16_PGRP, 32) if mlp else QuantSpec(FP16)
+        elif profile == "w4_mlp_w8_attn_gdn":
+            expected = QuantSpec(W4A16_PGRP, 32) if mlp else QuantSpec(W8A16)
+        elif name.endswith(("linear_attn.in_proj_b", "linear_attn.in_proj_a")):
+            expected = QuantSpec(FP16)
+        elif profile == "w8_main_w8_gdn" or ".linear_attn." in name:
+            expected = QuantSpec(W8A16)
+        else:
+            expected = QuantSpec(W4A16_PGRP, 32)
+        if spec != expected:
+            raise ValueError("named official 27B mixed recipe conflicts with its exact role policy")
     return True
 
 
@@ -556,7 +625,7 @@ def resolve_quant_specs(is_full, quant_config=None):
             f"{version!r}"
         )
     if version == 3:
-        if quant_config != _quanttrio_policy(is_full):
+        if quant_config.get("profile") not in AWQ_PROFILES or quant_config != _quanttrio_policy(is_full, quant_config.get("profile")):
             raise ValueError("Qwen3.5 v3 requires the exact QuantTrio AWQ per-module scope")
         return {name: _spec(quant_config["module_overrides"].get(name, quant_config["default"]), name)
                 for name in relpaths}

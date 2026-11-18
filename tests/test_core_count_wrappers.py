@@ -5,6 +5,7 @@ replace numerical tests of the generated kernels on the board.
 """
 
 from pathlib import Path
+from pi_wall_host_catalog import with_actual_linear_contracts
 import shutil
 import subprocess
 
@@ -132,9 +133,9 @@ int main() {
                           ("__WRAPPER__", wrapper), ("__CALL__", call)):
         harness = harness.replace(marker, value)
     source = tmp_path / "qwen_rope_cores.cpp"
-    source.write_text(harness)
+    source.write_text(with_actual_linear_contracts(harness))
     binary = tmp_path / "qwen_rope_cores"
-    subprocess.run([compiler, "-std=c++17", "-O0", str(source), "-o", str(binary)],
+    subprocess.run([compiler, "-std=c++17", "-O0", "-I", str(ROOT / "src/core"), str(source), "-o", str(binary)],
                    check=True, capture_output=True, text=True)
     subprocess.run([str(binary)], check=True, capture_output=True, text=True)
 
@@ -182,7 +183,8 @@ def test_pi05_gemma_calls_keep_compute_budget_and_physical_cache_separate(tmp_pa
         start = shared_header.index(signature, shared_header.index(signature) + 1)
         route_declarations.append(shared_header[start:shared_header.index(";", start) + 1])
     start = decls.index("void " + dma_name)
-    route_declarations.append(decls[start:decls.index(";", start) + 1])
+    route_declarations.append("struct DeferredDmaChannels;\n" +
+                              decls[start:decls.index(";", start) + 1])
     denoise_calls = []
     adarms = _function("src/fused/rpu_pi05_denoise_step_model.cpp",
                        "uint32_t Pi05DenoiseStepModel::adarms_gemv_to_spm(")
@@ -275,7 +277,9 @@ int64_t fmb_ring_all_reduce_route_selector(int64_t rows, int64_t cols, bool xor3
     return cores;
 }
 void rpu_launch_ddr_broadcast_spm_dma_mutable(
-        const uint64_t* live_src, int64_t offset, int64_t elements, uint32_t address, int cores) {
+        const uint64_t* live_src, int64_t offset, int64_t elements, uint32_t address, int cores,
+        DeferredDmaChannels* deferred, int64_t sync_elements) {
+    assert(deferred == nullptr && sync_elements == 0);
     validated_kernel_core_extent(policy, core_ids(cores));
     assert(*live_src == 0x700000 && offset == 128 && elements == 3 * 1024 && address == 0x10000);
     table_dma_cores = cores;
@@ -313,6 +317,7 @@ struct Model {
         FmbPhysicalExecutionManifest manifest;
         FmbThreeStageChunkPlan plan;
         const bool spm_staging = false, pi05_xor3_gated_mlp_opt_in_ = false;
+        const int64_t physical_len = 50;
         uint64_t adarms_table_src_base_ = 0x700000;
         const int64_t offset = 128, out_features = 3 * hidden_size();
         const uint32_t gemv_out_spm_addr = 0x10000;
@@ -361,9 +366,9 @@ int main() {
                           ("__DENOISE_CALLS__", "\n".join(denoise_calls))):
         harness = harness.replace(marker, value)
     source = tmp_path / "pi05_gemma_core_calls.cpp"
-    source.write_text(harness)
+    source.write_text(with_actual_linear_contracts(harness))
     binary = tmp_path / "pi05_gemma_core_calls"
-    built = subprocess.run([compiler, "-std=c++17", "-O0", str(source), "-o", str(binary)],
+    built = subprocess.run([compiler, "-std=c++17", "-O0", "-I", str(ROOT / "src/core"), str(source), "-o", str(binary)],
                            capture_output=True, text=True)
     assert built.returncode == 0, built.stderr
     subprocess.run([str(binary)], check=True, capture_output=True, text=True)
@@ -623,12 +628,12 @@ int main() {
 '''
     source = tmp_path / "core_count_wrappers.cpp"
     binary = tmp_path / "core_count_wrappers"
-    source.write_text(harness.replace("__RMS_CONTRACT__", rms_contract)
+    source.write_text(with_actual_linear_contracts(harness.replace("__RMS_CONTRACT__", rms_contract)
                       .replace("__KERNEL_IDS__", kernel_ids)
                       .replace("__RING_CONTRACT__", ring_contract)
                       .replace("__RING_SELECTORS__", ring_selectors)
-                      + "\n".join(functions) + main)
-    subprocess.run([compiler, "-std=c++17", "-O0", str(source), "-o", str(binary)], check=True)
+                      + "\n".join(functions) + main))
+    subprocess.run([compiler, "-std=c++17", "-O0", "-I", str(ROOT / "src/core"), str(source), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
 
 
@@ -637,7 +642,7 @@ def test_explicit_ddr_linear_threads_core_count_through_transport():
     # A forgotten TP8 DMA/gather would corrupt otherwise-valid TP4 lm_head output.
     assert "NUM_CORES" not in body
     assert "{0, 1, 2, 3, 4, 5, 6, 7}" not in body
-    assert "static_cast<uint16_t>(num_cores)" in body
+    assert "cur_m, n, k, partition, num_cores" in body
     assert "validate_parallel_linear_geometry(" in body
     legacy = _function("src/ops/rpu_linear.cpp", "Tensor rpu_linear_with_core_count(")
     assert "rpu_linear_with_accumulation(" in legacy
@@ -684,7 +689,7 @@ struct Pool {
 } SPM_ALLOC;
 std::vector<std::vector<Half>> shard;
 std::vector<Half> gathered;
-int gathers=0,scatters=0,mutable_writes=0,copies=0;
+int gathers=0,scatters=0,mutable_writes=0,copies=0,row_batches=0;
 void rpu_ddr_flush(Half*) {}
 int rpu_resolve_all_gather_schedule(size_t,size_t) { return 0; }
 void rpu_launch_all_gather_spm_kernel(uint32_t,uint32_t,size_t rows,size_t cols,size_t width,int cores,int) {
@@ -714,9 +719,21 @@ void rpu_launch_spm_scatter_ddr_dma_mutable(uint32_t src,const uint64_t* base,in
     ++mutable_writes;
     rpu_launch_spm_scatter_ddr_dma(src,reinterpret_cast<Half*>(*base+offset),count,stride,cores);
 }
+void rpu_launch_spm_scatter_rows_ddr_dma_immediate(uint32_t,Half* dst,int64_t rows,int64_t count,
+        int64_t spm_row_stride,int64_t ddr_row_stride,int64_t core_stride,int cores) {
+    ++row_batches; assert(rows>0 && count>0 && spm_row_stride==count*2);
+    assert(shard.size()==static_cast<size_t>(cores));
+    for(int core=0;core<cores;++core) {
+        assert(shard[core].size()==static_cast<size_t>(rows*count));
+        for(int64_t row=0;row<rows;++row) {
+            auto* target=reinterpret_cast<Half*>(reinterpret_cast<uint8_t*>(dst)+row*ddr_row_stride+core*core_stride);
+            std::copy_n(shard[core].begin()+row*count,count,target);
+        }
+    }
+}
 Half value(size_t row,size_t column,bool bias) { return 10+row*1000+column+(bias?10000:0); }
 void run(size_t m,int num_cores,bool in_graph,bool has_bias,bool pressure,bool use_mutable,
-         int partition=1,int precision=16,size_t used=0) {
+         int partition=1,int precision=16,size_t used=0,int64_t halo=0,bool expect_rows=false) {
     const bool w8a16=precision==8,w4a16=precision==4;
     const size_t n=32*num_cores,k=16*num_cores,a_dwidth=sizeof(Half);
     const size_t local_n=partition==0?n:n/num_cores;
@@ -727,15 +744,23 @@ void run(size_t m,int num_cores,bool in_graph,bool has_bias,bool pressure,bool u
         ? (local_k+local_n+n)*a_dwidth+3*SpmAllocator::ALIGN+(kernel_applies_bias?Align(local_n*a_dwidth,SpmAllocator::ALIGN):0)
         : 1024*1024;
     SPM_ALLOC.used=used;
-    __SELECTION__
-    if(partition==0) { assert(!col_scatter); return; }
-    gathers=scatters=mutable_writes=copies=0;
+    // A plain GEMM row occupies the whole local K; only the conv-slab route
+    // narrows the pitch to one channel row and adds halo rows that end a chunk
+    // without starting a window of their own. `halo` stays 0 for every case
+    // below that checks the writeback, which the slab route does not change.
+    const size_t in_pitch=local_k;
+    // The launcher's conv-slab pointer is non-null exactly when it has a halo.
+    const int64_t* conv_slab=halo?&halo:nullptr;
     constexpr Half sentinel=0xffff;
     constexpr size_t prefix=16,suffix=16;
     std::vector<Half> storage(prefix+m*n+suffix,sentinel);
     Half* yp=storage.data()+prefix;
     const uint64_t base=reinterpret_cast<uint64_t>(storage.data());
     const uint64_t* live_dst_base=use_mutable?&base:nullptr;
+    __SELECTION__
+    if(partition==0) { assert(!col_scatter && !col_scatter_rows); return; }
+    assert(col_scatter_rows==expect_rows);
+    gathers=scatters=mutable_writes=copies=row_batches=0;
     const int64_t dst_offset_bytes=prefix*a_dwidth;
     const uint32_t y_addr=0x10000,g_addr=0x20000;
     for(size_t row0=0;row0<m;row0+=m_chunk) {
@@ -750,10 +775,15 @@ void run(size_t m,int num_cores,bool in_graph,bool has_bias,bool pressure,bool u
         assert(yp[row*n+column]==value(row,column,has_bias));
     assert(std::all_of(storage.begin(),storage.begin()+prefix,[](Half v){return v==sentinel;}));
     assert(std::all_of(storage.end()-suffix,storage.end(),[](Half v){return v==sentinel;}));
-    if(pressure || (m==1 && !in_graph)) {
-        assert(scatters==static_cast<int>(m) && gathers==0 && copies==0);
+    const int chunks=static_cast<int>((m+m_chunk-1)/m_chunk);
+    if(expect_rows) {
+        // One per-row batch per chunk, and fewer chunks than the gather allows.
+        assert(chunks==1 && row_batches==1);
+        assert(scatters==0 && gathers==0 && copies==0);
+    } else if(pressure || (m==1 && !in_graph)) {
+        assert(scatters==static_cast<int>(m) && gathers==0 && copies==0 && row_batches==0);
     } else {
-        assert(gathers==1 && copies==1 && scatters==0);
+        assert(gathers==chunks && copies==chunks && scatters==0 && row_batches==0);
     }
     assert(mutable_writes==(use_mutable?scatters+copies:0));
 }
@@ -779,11 +809,28 @@ int main() {
         } catch(const std::runtime_error&) { rejected=true; }
         assert(rejected); // physical free space cannot bypass the aligned budget
     }
+    // The slab's halo rows are a fixed surcharge on the chunk, not a per-row
+    // cost, so they have to be charged to the SPM budget and not only to the
+    // staging DMA. Six halo rows at a 128-half pitch outweigh the all-gather
+    // landing zone that the pressure budget just affords, so the geometry that
+    // is admitted without a halo must be refused with one.
+    run(3,8,false,false,false,false,1,16,0,6);
+    // Eager multi-row GEMM whose gather landing zone would split M into two
+    // chunks: per-row scatter batches write it in one, row-major. Captured and
+    // live-destination calls keep the gather.
+    for(bool bias:{false,true}) {
+        run(2000,8,false,bias,false,false,1,16,0,0,true);
+        run(2000,8,true,bias,false,true); // two gathered chunks
+    }
+    bool halo_rejected=false;
+    try { run(3,8,false,false,true,false,1,16,0,6); }
+    catch(const std::runtime_error&) { halo_rejected=true; }
+    assert(halo_rejected);
 }
 '''
     cpp, binary = tmp_path / "linear_writeback.cpp", tmp_path / "linear_writeback"
-    cpp.write_text(harness.replace("__SELECTION__", selection).replace("__WRITEBACK__", writeback))
-    built = subprocess.run([compiler, "-std=c++17", "-O0", str(cpp), "-o", str(binary)],
+    cpp.write_text(with_actual_linear_contracts(harness.replace("__SELECTION__", selection).replace("__WRITEBACK__", writeback)))
+    built = subprocess.run([compiler, "-std=c++17", "-O0", "-I", str(ROOT / "src/core"), str(cpp), "-o", str(binary)],
                            capture_output=True, text=True, timeout=60)
     assert built.returncode == 0, built.stdout + built.stderr
     result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10)
@@ -860,9 +907,9 @@ int main() {
 '''.replace("__ADMISSION__", prefix).replace("__WRAPPER__", wrapper).replace(
         "__KERNEL_IDS__", kernel_ids).replace("__SDPA_CONTRACT__", sdpa_contract)
     source = tmp_path / "sdpa_admission.cpp"
-    source.write_text(harness)
+    source.write_text(with_actual_linear_contracts(harness))
     binary = source.with_suffix("")
-    subprocess.run([compiler, "-std=c++17", "-O0", str(source), "-o", str(binary)], check=True)
+    subprocess.run([compiler, "-std=c++17", "-O0", "-I", str(ROOT / "src/core"), str(source), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
 
 
@@ -876,6 +923,9 @@ def test_explicit_linear_public_caller_validates_before_allocating_and_returns_f
         _function("src/ops/rpu_linear.cpp", "Tensor rpu_linear_with_accumulation("),
         _function("src/ops/rpu_linear.cpp", "Tensor rpu_linear_with_core_count("),
     ))
+    declarations = (ROOT / "src/core/rpu_kernel_decls.h").read_text()
+    begin = declarations.index("at::Tensor rpu_linear_with_accumulation(")
+    functions = declarations[begin:declarations.index(";", begin) + 1] + "\n" + functions
     # As in test_qwen3vl_transport_contract, use a small tensor double while
     # compiling the production body. The kernel recorder checks dispatch and
     # output ownership; it does not pretend to compute GEMM or swizzled weights.
@@ -893,13 +943,10 @@ def test_explicit_linear_public_caller_validates_before_allocating_and_returns_f
 namespace c10 {
 template<class T> using optional = std::optional<T>;
 using std::nullopt;
-using Half = uint16_t;
 }
 namespace graph_dma { bool capturing = false; bool active() { return capturing; } }
 int allocations = 0, copies = 0, launches = 0, last_cores = 0, last_partition = -1;
 int retained_scales = 0;
-int batches = 0, aborts = 0;
-bool fail_launch = false;
 bool last_acc32 = false;
 std::shared_ptr<int> last_scale;
 namespace at {
@@ -933,7 +980,6 @@ struct Tensor {
     Options options() const { return opts; }
     Tensor contiguous() const { ++copies; auto result = *this; result.dense = true; return result; }
     Tensor view(std::initializer_list<int64_t> dims) const { auto result = *this; result.shape = dims; return result; }
-    template<class T> T* data_ptr() const { return reinterpret_cast<T*>(storage.get()); }
 };
 Tensor empty(const std::vector<int64_t>& dims, Options opts) {
     ++allocations;
@@ -942,18 +988,9 @@ Tensor empty(const std::vector<int64_t>& dims, Options opts) {
 }
 }
 using Tensor = at::Tensor;
-uint64_t RpuGetDevAddr(c10::Half* pointer) { return reinterpret_cast<uint64_t>(pointer); }
-struct RpuKernelGraph {
-    std::vector<Tensor> owners;
-    static bool has_active() { return graph_dma::capturing; }
-    void begin() { assert(!has_active()); graph_dma::capturing = true; }
-    void keep_alive(const Tensor& tensor) { owners.push_back(tensor); }
-    void end() { assert(has_active() && owners.size() == 3); ++batches; graph_dma::capturing = false; }
-    void abort() { ++aborts; graph_dma::capturing = false; }
-    ~RpuKernelGraph() { assert(!has_active()); }
-};
-Tensor rpu_retain_linear_quant_scale(const Tensor& weight, const Tensor& scale) {
+Tensor rpu_retain_linear_quant_scale(const Tensor& weight, const Tensor& scale, int cores = 8) {
     assert(weight.scalar_type() == at::kByte && scale.defined());
+    assert(cores == 4 || cores == 6 || cores == 8);
     ++retained_scales;
     return scale;
 }
@@ -961,13 +998,7 @@ void rpu_launch_linear_ddr_kernel(const Tensor& input, const Tensor& weight,
         Tensor& output, const Tensor& bias, bool has_bias, int partition,
         const uint64_t* live_dst, int64_t offset, const uint64_t* live_bias, int cores,
         const Tensor& scale, c10::optional<bool> linear_acc32) {
-    assert(!live_bias && offset == 0);
-    if (live_dst) {
-        assert(graph_dma::active() && *live_dst == RpuGetDevAddr(output.data_ptr<c10::Half>()));
-        assert(input.size(0) == 1 && weight.size(1) == 1024 && weight.size(0) == 2048);
-        assert(cores == 8 && partition == 1 && !has_bias && !*linear_acc32);
-    } else assert(!graph_dma::active());
-    if (fail_launch) throw std::runtime_error("launch failed");
+    assert(!live_dst && !live_bias && offset == 0);
     assert(input.dim() == 2 && output.dim() == 2 && input.dense);
     const bool packed = weight.scalar_type() == at::kByte;
     assert(input.size(0) == output.size(0));
@@ -983,23 +1014,6 @@ void rpu_launch_linear_ddr_kernel(const Tensor& input, const Tensor& weight,
 }
 __FUNCTIONS__
 int main() {
-    Tensor head_input({1,1024}), head_weight({2048,1024});
-    auto held = rpu_linear_with_accumulation(head_input, head_weight, {}, 1, 8, false, {});
-    const int held_value = *held.storage;
-    auto fresh = rpu_linear_with_accumulation(head_input, head_weight, {}, 1, 8, false, {});
-    assert(batches == 2 && held.storage != fresh.storage && *held.storage == held_value);
-    rpu_linear_with_accumulation(head_input, head_weight, {}, 1, 8, true, {});
-    rpu_linear_with_accumulation(head_input, head_weight, {}, 1, 4, false, {});
-    rpu_linear_with_accumulation(head_input, head_weight, Tensor({2048}), 1, 8, false, {});
-    assert(batches == 2);
-    fail_launch = true;
-    bool failed = false;
-    try { rpu_linear_with_accumulation(head_input, head_weight, {}, 1, 8, false, {}); }
-    catch (const std::runtime_error&) { failed = true; }
-    assert(failed && aborts == 1 && !RpuKernelGraph::has_active());
-    fail_launch = false;
-    rpu_linear_with_accumulation(head_input, head_weight, {}, 1, 8, false, {});
-    assert(batches == 3);
     Tensor input({2,16,1024}), weight({3072,1024}), bias({3072});
     input.dense = false;
     for (int64_t cores : {4,6,8}) {
@@ -1070,7 +1084,7 @@ int main() {
 }
 '''.replace("__FUNCTIONS__", functions)
     source = tmp_path / "linear_public.cpp"
-    source.write_text(harness)
+    source.write_text(with_actual_linear_contracts(harness))
     binary = source.with_suffix("")
-    subprocess.run([compiler, "-std=c++17", "-O0", str(source), "-o", str(binary)], check=True)
+    subprocess.run([compiler, "-std=c++17", "-O0", "-I", str(ROOT / "src/core"), str(source), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True)

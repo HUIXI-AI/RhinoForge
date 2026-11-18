@@ -1,38 +1,67 @@
-# Runtime scope: Text7 + lm_head w8a16; Vision W8A16; activations FP16.
-# W4 uses preserved AWQ/G32 at 2B/4B/8B and RTN/G32 at 32B.
-# 31 decode calls + the prefill token = 32 output tokens.
-[example]
+# 未写出的执行参数（省略即按以下值运行）：
+#   [cpu].threads 省略时不设置线程：PyTorch 使用环境变量 OMP_NUM_THREADS，未设置时使用全部 CPU 核（参考板 24）；2026-10-19 测量环境预设为 16。
+# 量化范围：Text 七投影与输出头 W8A16，Vision W8A16，激活 FP16。
+# W4：2B/4B/8B 沿用 AWQ/G32 权重，32B 为 RTN/G32。
+# 31 次 decode 加 prefill 产生的首 token，共输出 32 个 token。
+[model]
 profile_id = "qwen3-vl-8b-runtime-w8a16.w8a16.text"
 registry_alias = "qwen3-vl-8b-runtime-w8a16"
 target = "qwen3_vl"
-dtype = "w8a16"
+precision = "w8a16"
 architecture = "Qwen3VLForConditionalGeneration"
 
-[example.opt_in]
+[model.opt_in]
 
 [input]
 component = "text"
+# 可替换文本；自然输入长度由 tokenizer 决定。
 prompt = "Explain what a compiler does."
+# 固定 prefill token 数，整数 ≥1；图文不能截断 processor 生成的完整输入。
 prefill_tokens = 512
+# 首 token 之后的 decode 调用数，整数 ≥0；P 与 D 受 cache 和模型输入范围共同约束。
 decode_steps = 31
+# true 在 EOS 提前结束；false 使用固定 decode_steps。
 stop_on_eos = false
 
 [run]
+# 预热次数；不计入正式测量。
 warmup = 2
+# 正式执行次数，正整数。
 runs = 5
+# 是否启用 inference_mode；复现已有测量时保持原值。
 inference_mode = false
+# 按需开启硬件采样；保持 false 可减少测量干扰。
 hwperf = false
+# 按需开启 profiler；正式计时建议保持 false。
 profile = false
+# 随机种子，非负整数。
 seed = 0
 
 [rpu_execution.model]
+# RPU 核数预算。可选 4 / 6 / 8，默认 8；修改后需重新加载模型。
+# 6 核时文本组件分配为 Attention 4、MLP 6、输出头 4。
+# Vision 在 4/6 核下用 4 核。实际分配见模型页配置表的“4 核 / 6 核”列。
 num_cores = 8
 
 [rpu_execution.prefill]
+# Prefill 分块行数。可选 "auto"（默认），或不超过 128 的 16 的倍数。
+# auto：实际行数 P 向上取整对齐后，在不超过上限的候选中选分块最少、补齐最少的一种；
+# P 不超过上限时通常只分一块（例：P=78 → 80），超过上限时按上限分块。
+# 2026-10-19 模板默认输入实测：8/6/4 核均为 128。
+# 实际值记录在结果 report.json 的执行计划中（compute_chunk）。
 chunk_size = "auto"
+# Linear 累加精度。false 为 ACC16，true 为 ACC32；不改变权重位宽。
+# 省略时默认 false（ACC16）。修改后需重新加载模型。
 linear_acc32 = false
+# prefill Graph 快速回放，冷启动时选定，与累加精度设置无关。true 开启（模板默认），false 关闭。
+# 省略时为 false。修改后需重新加载模型。
 fast_replay = true
 
 [rpu_execution.vision]
+# Vision 分块行数。可选 "auto"（默认）或 16 的倍数整数；不补齐行。
+# auto：由原生 planner 按图像 patch 数与本模型的核数选择。
+# 实际值记录在结果 report.json 的执行计划中（compute_chunk）。
 chunk_size = "auto"
+# Linear 累加精度。false 为 ACC16，true 为 ACC32；不改变权重位宽。
+# 省略时默认 false（ACC16）。修改后需重新加载模型。
 linear_acc32 = false

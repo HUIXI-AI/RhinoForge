@@ -5,6 +5,7 @@ state machine: begin, hook, finish, ownership, grammar and all patches are the
 production C++ source. Full SDK/Torch translation-unit syntax is a separate gate.
 """
 from pathlib import Path
+from pi_wall_host_catalog import with_actual_linear_contracts
 import subprocess
 import re
 import torch
@@ -89,6 +90,11 @@ public:
  bool qwen3vl_decode_gemv(int rows)const{return (qwen3vl_fp16_decode_profile_||qwen3vl_4b_w8_profile_)&&!linear_acc32_&&rows==1;}
  bool admit=true,partial_mrope_active_=false,qwen3vl_4b_decode_gateup_fused_=true,qwen3vl_4b_packed_qkv_weights_=true;
  bool fuse_lm_head_=true,reuse_lm_head_output_=false,use_silu_=true,nvfp4_=false,has_qkv_bias_=false;
+ bool fuse_prefill_last_lm_head_=false;
+ // The fused Predictor head bank: -1 is "no bank", which is what every
+ // Qwen3-VL decode owner here must present to the replay gate.
+ std::vector<Tensor> lm_head_bank_w_,lm_head_bank_scale_;
+ int64_t lm_head_bank_index_=-1;
  bool qwen3_spm_kv_by_mha_enabled_=true,equal_two_prefill_=false,adarms_mutable_=false,adarms_unroll_=false;
  bool adarms_schedule_select_=false,adarms_fused_bcast_enabled_=false;
  bool fast_replay_skip_layer_loop_=false,preload_replay_skip_=false;
@@ -172,6 +178,16 @@ struct Fixture{
   k[l]=metadata(at::kHalf,{1,rows/16,1,8,8,16,16});
   v[l]=metadata(at::kHalf,{1,rows/16,1,8,8,16,16});}}
 };
+std::string selected_projection_name(at::ScalarType dtype,bool acc32,int n,int k,bool row,bool gemv=false){
+ if(gemv)return dtype==at::kHalf?"llama_gemv":"llama_gemv_wint8";
+ const int local_n=row?n:n/8,local_k=row?k/8:k;
+ using namespace rpu_pl_tiling;
+ const auto type=dtype==at::kHalf?WeightType::Fp16:(dtype==at::kChar?WeightType::Int8:WeightType::Int4);
+ // The production pgrp launcher selects using N32-padded physical weight N.
+ const int physical_n=dtype==at::kByte?(local_n+31)/32*32:local_n;
+ const auto tile=select_tile(1,physical_n,local_k,type,acc32);
+ return parallel_kernel_name(type,acc32,tile);
+}
 void populate(RpuKernelGraph&g){
  auto add=[&](const char*n){Node node;node.kind=GraphNodeKind::Kernel;node.kernel.kernel_idx=19+g.nodes.size()*7;node.kernel.kernel_name=n;g.nodes.push_back(node);};
  for(int l=0;l<36;++l){
@@ -181,13 +197,13 @@ void populate(RpuKernelGraph&g){
   if(combined_route)add("qwen3vl_qk_norm_mrope_kv_insert_d128");
   else {add("qwen3vl_qk_norm_mrope_d128");add("llama_insert_kcache_multiwarp");add("llama_insert_vcache_multiwarp");}
   add("llm_fp16_32b_prefill_flash_attn_univ_dp");
-  if(combined_o)add("qwen3vl_o_ring_norm_m1_h2560_w8");
+  if(combined_o)add("qwen3vl_o_ring_norm_w8_m1_h2560_v2");
   else {add(fp16_route?"llama_gemv":"llama_gemv_wint8");add("llm_all_reduce_residual_nopace");add("llama_rms_norm");}
   if(fp16_route)for(const char*n:{"llama_gemv","unary","llama_gemv","binary_sameshape","llama_gemv","llm_all_reduce_residual_nopace"})add(n);
-  else for(const char*n:{"qwen3vl_gateup_swiglu_gemv","llama_gemv_wint8","llm_all_reduce_residual_nopace"})add(n);
+  else for(const char*n:{"qwen3vl_gateup_swiglu_w8_m1_v2","llama_gemv_wint8","llm_all_reduce_residual_nopace"})add(n);
   if(l<3)add("binary_sameshape");
  }
- add("llama_rms_norm");add(fp16_route?"parallel_linear_m480n64k128":"parallel_linear_w8a16_m288n128k128");
+ add("llama_rms_norm");add(selected_projection_name(fp16_route?at::kHalf:at::kChar,false,151936,2560,false).c_str());
 }
 constexpr size_t prefix=5;
 void preload(RpuKernelGraph&g){if(g.mode==RpuKernelGraph::State::RECORDING)g.nodes.resize(prefix);else g.cursor=prefix;}
@@ -226,6 +242,11 @@ Tensor quant_scale(at::ScalarType dtype,int n,int k,bool row){
  const int count=((lk/32+3)/4)*((ln+63)/64)*8*4*64;
  return metadata(at::kHalf,{32,count/32});
 }
+Tensor projection_weight(at::ScalarType dtype,int n,int k,bool row){
+ if(dtype!=at::kByte)return metadata(dtype,{n,k});
+ const int local_n=row?n:n/8;
+ return metadata(dtype,{((local_n+31)/32)*32*(row?1:8),k/2});
+}
 void ordinary_fixture(Fixture& f,int layers,at::ScalarType dtype,bool acc32,bool large=false){
  auto&m=f.m;m.layers=layers;m.h=layers==28?2048:2560;m.intermediate=layers==28?6144:9728;m.qheads=layers==28?16:32;
  m.envelope.chunk=layers==28?320:256;
@@ -236,7 +257,7 @@ void ordinary_fixture(Fixture& f,int layers,at::ScalarType dtype,bool acc32,bool
  m.layer_weights_.resize(layers);f.k.resize(layers);f.v.resize(layers);
  if(layers==28||large)m.position_ids_keepalive_=at::zeros({8192+8,3},at::TensorOptions().dtype(at::kInt)).narrow(0,0,8192);
  f.hidden=metadata(at::kHalf,{1,1,m.h});
- auto projection=[&](Tensor&w,Tensor&scale,int n,int k,bool row){w=metadata(dtype,{n,dtype==at::kByte?k/2:k});scale=quant_scale(dtype,n,k,row);};
+ auto projection=[&](Tensor&w,Tensor&scale,int n,int k,bool row){w=projection_weight(dtype,n,k,row);scale=quant_scale(dtype,n,k,row);};
  for(auto&w:m.layer_weights_){
   projection(w.q_w,w.q_ws,m.qheads*128,m.h,false);projection(w.k_w,w.k_ws,1024,m.h,false);projection(w.v_w,w.v_ws,1024,m.h,false);
   projection(w.o_w,w.o_ws,m.h,m.qheads*128,true);projection(w.gate_w,w.gate_ws,m.intermediate,m.h,false);
@@ -249,23 +270,23 @@ void ordinary_fixture(Fixture& f,int layers,at::ScalarType dtype,bool acc32,bool
 }
 void populate_ordinary(RpuKernelGraph&g,const Model&m,bool fused){
  const auto p=v3::CausalDecoderModel::Qwen3VlDecodeReplayState::profile(m);
- const auto names=rpu_pl_tiling::autotile_kernel_names();std::string lin,head;
- for(const auto&n:names)if(v3::linear_name(n,p,true)){head=n;break;}
- for(const auto&n:names)if(v3::linear_name(n,p,false)){lin=n;break;}
- if(p.gemv)lin="llama_gemv";assert(!head.empty()&&!lin.empty());
+ const auto projection=[&](int n,int k,bool row,bool head=false){return selected_projection_name(head?p.head_dtype:p.dtype,p.acc32,n,k,row,p.gemv&&!head);};
+ const auto q=projection(m.qheads*128,m.h,false),kv=projection(1024,m.h,false);
+ const auto o=projection(m.h,m.qheads*128,true),gateup=projection(m.intermediate,m.h,false);
+ const auto down=projection(m.h,m.intermediate,true),head=projection(m.vocab_size_,m.h,false,true);
  auto add=[&](const std::string&n){Node node;node.kind=GraphNodeKind::Kernel;node.kernel.kernel_idx=19+g.nodes.size()*7;node.kernel.kernel_name=n;g.nodes.push_back(node);};
  for(int l=0;l<m.layers;++l){
-  add("llama_rms_norm");add(lin);add(lin);add(lin);
+  add("llama_rms_norm");add(q);add(kv);add(kv);
   if(fused)add("qwen3vl_qk_norm_mrope_kv_insert_d128");
   else{add("llama_rms_norm");add("llama_rms_norm");add(m.has_mrope_?"llama_mrope_interleave":"llama_rope");add(m.has_mrope_?"llama_mrope_interleave":"llama_rope");add("llama_insert_kcache_multiwarp");add("llama_insert_vcache_multiwarp");}
-  add("llm_fp16_32b_prefill_flash_attn_univ_dp");add(lin);add("llm_all_reduce_residual_nopace");add("llama_rms_norm");
-  if(p.tts_predictor&&!p.acc32){add(lin);add(lin);add("llama_silu_mul");}
-  else{add(lin);add("unary");add(lin);add("binary_sameshape");}
-  add(lin);add("llm_all_reduce_residual_nopace");if(l<3&&!m.deepstack_lang_layers_.empty())add("binary_sameshape");
- }add("llama_rms_norm");if(m.fuse_lm_head_||p.tts_head)add(head);
+  add("llm_fp16_32b_prefill_flash_attn_univ_dp");add(o);add("llm_all_reduce_residual_nopace");add("llama_rms_norm");
+  if(p.tts_predictor&&p.dtype==at::kHalf&&!p.acc32){add(gateup);add(gateup);add("llama_silu_mul");}
+  else{add(gateup);add("unary");add(gateup);add("binary_sameshape");}
+  add(down);add("llm_all_reduce_residual_nopace");if(l<3&&!m.deepstack_lang_layers_.empty())add("binary_sameshape");
+ }add("llama_rms_norm");if(m.fuse_lm_head_)add(head);
 }
-void tts_fixture(Fixture&f,bool acc32=false){
- ordinary_fixture(f,5,at::kHalf,acc32);auto&m=f.m;
+void tts_fixture(Fixture&f,at::ScalarType dtype=at::kHalf,bool acc32=false){
+ ordinary_fixture(f,5,dtype,acc32);auto&m=f.m;
  m.h=1024;m.intermediate=3072;m.qheads=16;m.has_mrope_=false;
  m.fuse_lm_head_=false;m.lm_head_w_=m.lm_head_w_scale_=m.position_ids_keepalive_=Tensor{};
  m.deepstack_lang_layers_.clear();m.mrope_section_.clear();m.fast_replay_skip_layer_loop_=true;
@@ -273,15 +294,18 @@ void tts_fixture(Fixture&f,bool acc32=false){
  m.cos_=metadata(at::kHalf,{32,64});m.sin_=metadata(at::kHalf,{32,64});m.final_norm_w_=metadata(at::kHalf,{1024});
  f.hidden=metadata(at::kHalf,{1,1,1024});
  for(int l=0;l<5;++l){auto&w=m.layer_weights_[l];
-  w.q_w=metadata(at::kHalf,{2048,1024});w.k_w=w.v_w=metadata(at::kHalf,{1024,1024});
-  w.o_w=metadata(at::kHalf,{1024,2048});w.gate_w=w.up_w=metadata(at::kHalf,{3072,1024});w.down_w=metadata(at::kHalf,{1024,3072});
+  auto projection=[&](Tensor&weight,Tensor&scale,int n,int k,bool row){
+   weight=projection_weight(dtype,n,k,row);scale=quant_scale(dtype,n,k,row);};
+  projection(w.q_w,w.q_ws,2048,1024,false);projection(w.k_w,w.k_ws,1024,1024,false);
+  projection(w.v_w,w.v_ws,1024,1024,false);projection(w.o_w,w.o_ws,1024,2048,true);
+  projection(w.gate_w,w.gate_ws,3072,1024,false);projection(w.up_w,w.up_ws,3072,1024,false);
+  projection(w.down_w,w.down_ws,1024,3072,true);
   w.input_norm_w=w.post_norm_w=metadata(at::kHalf,{1024});
   f.k[l]=metadata(at::kHalf,{1,2,1,8,8,16,16});f.v[l]=metadata(at::kHalf,{1,2,1,8,8,16,16});
  }
 }
 void tts_cases(){
- for(bool acc32:{false,true}){
- Fixture f;tts_fixture(f,acc32);RpuKernelGraph g;
+ Fixture f;tts_fixture(f);RpuKernelGraph g;
  auto run=[&](int p){assert(f.begin(g,p));
   if(!f.m.try_checked_layer_body_replay()){preload(g);++g.ordinary;if(g.mode==RpuKernelGraph::State::RECORDING)populate_ordinary(g,f.m,false);else g.cursor=g.nodes.size();}
   f.m.finish_qwen3vl_decode_replay();f.m.cancel_qwen3vl_decode_replay();g.mode=RpuKernelGraph::State::REPLAYING;g.topology=9001;
@@ -295,64 +319,131 @@ void tts_cases(){
  f.k[2]=metadata(at::kHalf,{1,2,1,8,8,16,16});run(1);assert(g.ordinary==2);run(2);assert(g.ordinary==2);
  f.m.layer_weights_[3].gate_w.unsafeGetTensorImpl()->bump_version();run(3);assert(g.ordinary==3);run(4);assert(g.ordinary==3);
  rejects([&]{f.begin(g,32);});
- for(int fault=0;fault<8;++fault){Fixture bad;tts_fixture(bad,acc32);RpuKernelGraph other;
+ for(int fault=0;fault<8;++fault){Fixture bad;tts_fixture(bad);RpuKernelGraph other;
   if(fault==0)bad.m.fast_replay_skip_layer_loop_=false;
   if(fault==1)bad.m.fuse_lm_head_=true;
   if(fault==2)bad.m.has_mrope_=true;
   if(fault==3)bad.m.deepstack_lang_layers_={0};
   if(fault==4)bad.m.rope_position_base_=1;
-  if(fault==5)bad.m.layer_weights_[0].q_w=metadata(at::kChar,{2048,1024});
+  if(fault==5)bad.m.nvfp4_=true;
   if(fault==6)bad.k[0]=metadata(at::kHalf,{1,3,1,8,8,16,16});
   if(fault==7)bad.m.cos_=metadata(at::kHalf,{16,64});
   assert(!bad.begin(other,0));
  }
  // A weight without mutation tracking cannot authorize a skipped body.
- {Fixture bad;tts_fixture(bad,acc32);RpuKernelGraph other;
+ {Fixture bad;tts_fixture(bad);RpuKernelGraph other;
   {c10::InferenceMode inference;bad.m.final_norm_w_=metadata(at::kHalf,{1024});}
   assert(bad.begin(other,0));assert(!bad.m.try_checked_layer_body_replay());preload(other);populate_ordinary(other,bad.m,false);
   bad.m.finish_qwen3vl_decode_replay();assert(!bad.m.qwen3vl_decode_replay_state_->recipe);
  }
- // A stream from the other accumulation mode cannot authorize replay.
- {Fixture bad;tts_fixture(bad,acc32);RpuKernelGraph other;
-  assert(bad.begin(other,0));assert(!bad.m.try_checked_layer_body_replay());preload(other);
-  bad.m.linear_acc32_=!acc32;populate_ordinary(other,bad.m,false);bad.m.linear_acc32_=acc32;
-  bad.m.finish_qwen3vl_decode_replay();assert(!bad.m.qwen3vl_decode_replay_state_->recipe);
+}
+void tts_head_bank_cases(){
+ // These are distinct metadata owners/addresses, just like metadata() above;
+ // the fixture does not read a weight or fabricate a numerical kernel result.
+ alignas(256) static std::array<char,15*256> weights{},scales{};
+ auto install=[&](Fixture& f){
+  tts_fixture(f);auto&m=f.m;m.vocab_size_=1024;m.fuse_lm_head_=true;
+  for(int i=0;i<15;++i){
+   m.lm_head_bank_w_.push_back(at::from_blob(weights.data()+i*256,{1024,1024},at::TensorOptions().dtype(at::kChar)));
+   m.lm_head_bank_scale_.push_back(at::from_blob(scales.data()+i*256,{1024},at::TensorOptions().dtype(at::kHalf)));
+  }
+  m.lm_head_bank_index_=0;m.lm_head_w_=m.lm_head_bank_w_[0];m.lm_head_w_scale_=m.lm_head_bank_scale_[0];
+ };
+ Fixture f;install(f);auto&m=f.m;RpuKernelGraph g;
+ const auto profile=Model::Qwen3VlDecodeReplayState::profile(m);
+ assert(profile.dtype==at::kHalf&&profile.head_dtype==at::kChar&&profile.head_bank);
+ std::string wrong_head;
+ for(const auto&c:rpu_pl_tiling::detail::parallel_candidates)
+  if(c.weight==rpu_pl_tiling::WeightType::Fp16&&!c.acc32){wrong_head=c.name;break;}
+ assert(!wrong_head.empty()&&v3::linear_name(wrong_head,profile,false));
+ assert(!v3::linear_name(wrong_head,profile,true));
+ auto run=[&](int position){assert(f.begin(g,position));
+  if(!m.try_checked_layer_body_replay()){
+   preload(g);++g.ordinary;
+   if(g.mode==RpuKernelGraph::State::RECORDING)populate_ordinary(g,m,false);else g.cursor=g.nodes.size();
+  }
+  m.finish_qwen3vl_decode_replay();m.cancel_qwen3vl_decode_replay();
+  g.mode=RpuKernelGraph::State::REPLAYING;g.topology=9001;
+ };
+ run(0);assert(m.qwen3vl_decode_replay_state_->recipe);
+ assert(m.qwen3vl_decode_replay_state_->recipe->patches.size()==80);
+ assert(m.qwen3vl_decode_replay_state_->recipe->head_patches.size()==4);
+ const auto generation=m.model_generation;
+ std::vector<RegisterPatch> prior;
+ for(int index:{1,14,0,7}){
+  m.lm_head_bank_index_=index;m.lm_head_w_=m.lm_head_bank_w_[index];m.lm_head_w_scale_=m.lm_head_bank_scale_[index];
+  run(1);assert(g.applied.size()==84&&g.ordinary==1&&m.model_generation==generation);
+  const uint64_t w=RpuGetDevAddr(m.lm_head_w_.data_ptr())>>8,s=RpuGetDevAddr(m.lm_head_w_scale_.data_ptr())>>8;
+  const std::array<uint32_t,4> registers{2,3,20,21};
+  const std::array<uint16_t,4> values{uint16_t(w),uint16_t(w>>16),uint16_t(s),uint16_t(s>>16)};
+  for(int j=0;j<4;++j){const auto&patch=g.applied[80+j];
+   assert(patch.reg_idx==registers[j]&&patch.value==values[j]&&patch.width==2);
+   assert(patch.kernel_idx==g.nodes.back().kernel.kernel_idx);
+  }
+  if(!prior.empty())for(int j=0;j<80;++j)
+   assert(prior[j].reg_idx==g.applied[j].reg_idx&&prior[j].value==g.applied[j].value&&prior[j].kernel_idx==g.applied[j].kernel_idx);
+  prior=g.applied;
  }
+ assert(g.skips==4);
+ // All bank owners are retained, even an unselected entry. Mutation forces
+ // ordinary re-emission; selecting an unchanged entry above does not.
+ m.lm_head_bank_w_[9].unsafeGetTensorImpl()->bump_version();run(2);assert(g.ordinary==2);
+ run(3);assert(g.ordinary==2&&g.skips==5);
+ {Fixture bad;install(bad);RpuKernelGraph other;assert(bad.begin(other,0));
+  assert(!bad.m.try_checked_layer_body_replay());preload(other);populate_ordinary(other,bad.m,false);
+  other.nodes.back().kernel.kernel_name=wrong_head;
+  bad.m.finish_qwen3vl_decode_replay();assert(!bad.m.qwen3vl_decode_replay_state_->recipe);bad.m.cancel_qwen3vl_decode_replay();
+ }
+ {Fixture bad;install(bad);RpuKernelGraph other;bad.m.lm_head_w_=metadata(at::kHalf,{1024,1024});
+  assert(!bad.begin(other,0));
  }
 }
-void tts_fused_head_cases(){
- Fixture f;tts_fixture(f,true);auto&m=f.m;RpuKernelGraph g;
- alignas(256) std::array<std::array<char,256>,15> storage{};
- for(auto& bytes:storage)m.tts_predictor_heads_.push_back(at::from_blob(bytes.data(),{2048,1024},at::TensorOptions().dtype(at::kHalf)));
- m.vocab_size_=2048;
- for(int rows:{2,16,32}){m.validate_tts_step(metadata(at::kHalf,{1,rows,1024}),0,true,{});assert(m.tts_predictor_head_index_==0);}
- for(int rows:{1,3,48})rejects([&]{m.validate_tts_step(metadata(at::kHalf,{1,rows,1024}),0,true,{});});
- for(int pos:{0,1,16})rejects([&]{m.validate_tts_step(f.hidden,pos,true,{});});
- rejects([&]{m.validate_tts_step(f.hidden,2,false,{});});
- auto run=[&](int p){m.validate_tts_step(f.hidden,p,true,{});assert(f.begin(g,p));
-  if(!m.try_checked_layer_body_replay()){preload(g);++g.ordinary;if(g.mode==RpuKernelGraph::State::RECORDING)populate_ordinary(g,m,false);else g.cursor=g.nodes.size();}
-  m.finish_qwen3vl_decode_replay();m.cancel_qwen3vl_decode_replay();g.mode=RpuKernelGraph::State::REPLAYING;g.topology=9001;
- };
- run(2);assert(m.qwen3vl_decode_replay_state_->recipe);
- for(int p:{3,14,15,2}){run(p);assert(g.applied.size()==82);
-  const auto address=RpuGetDevAddr(m.tts_predictor_heads_[p-1].data_ptr())>>8;
-  assert(g.applied[80].reg_idx==2&&g.applied[81].reg_idx==3);
-  assert(g.applied[80].value==uint16_t(address)&&g.applied[81].value==uint16_t(address>>16));
-  assert(g.applied[80].kernel_idx==g.nodes.back().kernel.kernel_idx);
- }assert(g.ordinary==1&&g.skips==4);
- m.tts_predictor_heads_[14].unsafeGetTensorImpl()->bump_version();run(3);assert(g.ordinary==2);run(4);assert(g.ordinary==2);
- assert(f.begin(g,5));m.tts_predictor_head_index_=3;
- rejects([&]{m.try_checked_layer_body_replay();});m.cancel_qwen3vl_decode_replay();
- // The head must be ACC16 even when the body uses ACC32.
- RpuKernelGraph wrong;assert(f.begin(wrong,2));assert(!m.try_checked_layer_body_replay());preload(wrong);populate_ordinary(wrong,m,false);
- wrong.nodes.back().kernel.kernel_name=wrong.nodes[prefix+1].kernel.kernel_name;
- m.finish_qwen3vl_decode_replay();assert(!m.qwen3vl_decode_replay_state_->recipe);
- m.tts_predictor_heads_[0]=metadata(at::kHalf,{1024,1024});
- assert(!Model::Qwen3VlDecodeReplayState::owner_shapes(m));
+void tts_precision_cases(){
+ for(auto dtype:{at::kHalf,at::kChar,at::kByte})for(bool acc32:{false,true}){
+  Fixture f;tts_fixture(f,dtype,acc32);RpuKernelGraph g;
+  auto run=[&](int position){assert(f.begin(g,position));
+   if(!f.m.try_checked_layer_body_replay()){
+    preload(g);++g.ordinary;
+    if(g.mode==RpuKernelGraph::State::RECORDING)populate_ordinary(g,f.m,false);
+    else g.cursor=g.nodes.size();
+   }
+   f.m.finish_qwen3vl_decode_replay();f.m.cancel_qwen3vl_decode_replay();
+   g.mode=RpuKernelGraph::State::REPLAYING;g.topology=9001;
+  };
+  run(0);assert(f.m.qwen3vl_decode_replay_state_->recipe);
+  for(int position:{1,16,31}){run(position);assert(g.applied.size()==80);}
+  assert(g.ordinary==1&&g.skips==3);
+  if(dtype!=at::kHalf){
+   f.m.layer_weights_[4].down_ws.unsafeGetTensorImpl()->bump_version();
+   run(2);assert(g.ordinary==2);run(3);assert(g.ordinary==2);
+  }
+  // The same dimensions do not permit another precision/accumulation kernel
+  // or replacing the actual activation stream with the opposite route.
+  for(int fault=0;fault<3;++fault){
+   Fixture bad;tts_fixture(bad,dtype,acc32);RpuKernelGraph graph;
+   assert(bad.begin(graph,0));assert(!bad.m.try_checked_layer_body_replay());
+   preload(graph);populate_ordinary(graph,bad.m,false);
+   if(fault==0)graph.nodes[prefix+1].kernel.kernel_name="llama_gemv_wint8";
+   if(fault==1){
+    auto it=std::find_if(graph.nodes.begin(),graph.nodes.end(),[](const Node&n){
+     return n.kernel.kernel_name=="llama_silu_mul"||n.kernel.kernel_name=="unary";});
+    assert(it!=graph.nodes.end());it->kernel.kernel_name=it->kernel.kernel_name=="unary"?"llama_silu_mul":"unary";
+   }
+   if(fault==2){
+    // Invert ACC with the same payload precision; names come from the real
+    // registered kernel generator, independently of the replay matcher.
+    const auto wrong=selected_projection_name(dtype,!acc32,bad.m.qheads*128,bad.m.h,false);
+    graph.nodes[prefix+1].kernel.kernel_name=wrong;
+   }
+   bad.m.finish_qwen3vl_decode_replay();assert(!bad.m.qwen3vl_decode_replay_state_->recipe);
+   bad.m.cancel_qwen3vl_decode_replay();
+  }
+ }
 }
 void cross_profile_cases(){
  for(int layers:{28,36})for(auto dtype:{at::kHalf,at::kChar,at::kByte})for(bool acc32:{false,true}){
   Fixture f;ordinary_fixture(f,layers,dtype,acc32);RpuKernelGraph g;
+  if(dtype==at::kByte){assert(f.m.lm_head_w_.size(0)==152064);assert(f.m.vocab_size_==151936);}
   if(acc32&&dtype!=at::kHalf){assert(!f.begin(g,511));continue;}
   auto run=[&](int p){assert(f.begin(g,p));
    if(!f.m.try_checked_layer_body_replay()){preload(g);++g.ordinary;if(g.mode==RpuKernelGraph::State::RECORDING)populate_ordinary(g,f.m,layers==36);else g.cursor=g.nodes.size();}
@@ -376,6 +467,37 @@ void cross_profile_cases(){
   // A malformed packed group scale cannot install a replacement recipe.
   if(dtype==at::kByte){f.m.layer_weights_[0].down_ws=metadata(at::kHalf,{32,1});run(519);run(520);assert(g.ordinary==ordinary+3);}
  }
+}
+void w4_storage_boundary_cases(){
+ using State=v3::CausalDecoderModel::Qwen3VlDecodeReplayState;
+ // TP-column and TP-row padding are per local N32 shard; scales retain N64.
+ for(bool row:{false,true})for(int local_n:{16,48,80,18992}){
+  const int n=row?local_n:local_n*8,k=row?256:2048;
+  auto w=projection_weight(at::kByte,n,k,row),s=quant_scale(at::kByte,n,k,row);
+  assert(State::projection_shape(w,s,at::kByte,n,k,row));
+  assert(!State::projection_shape(metadata(at::kByte,{n,k/2}),s,at::kByte,n,k,row));
+  assert(!State::projection_shape(metadata(at::kByte,{w.size(0)+32*(row?1:8),k/2}),s,at::kByte,n,k,row));
+ }
+ // Real 2B/4B heads have logical N151936 but physical N152064. Reject the
+ // old ABI shape, extra padding, wrong K and malformed scales before activation.
+ for(int layers:{28,36})for(int fault=0;fault<6;++fault){
+  Fixture f;ordinary_fixture(f,layers,at::kByte,false);RpuKernelGraph g;
+  auto&m=f.m;auto&s=m.lm_head_w_scale_;
+  if(fault==0)m.lm_head_w_=metadata(at::kByte,{151936,m.h/2});
+  if(fault==1)m.lm_head_w_=metadata(at::kByte,{152320,m.h/2});
+  if(fault==2)m.lm_head_w_=metadata(at::kByte,{152064,m.h/2+16});
+  if(fault==3)s=metadata(at::kHalf,{32,1});
+  if(fault==4)s=metadata(at::kFloat,{32,s.numel()/32});
+  if(fault==5)s=metadata(at::kHalf,{16,s.numel()/16});
+  assert(!f.begin(g,511)&&g.skips==0&&m.vocab_size_==151936);
+ }
+ // The shape matcher must not silently truncate invalid TP or K32 geometry.
+ auto w=metadata(at::kByte,{256,1024}),s=quant_scale(at::kByte,128,2048,false);
+ assert(!State::projection_shape(w,s,at::kByte,129,2048,false));
+ assert(!State::projection_shape(w,s,at::kByte,136,2048,false));
+ assert(!State::projection_shape(w,s,at::kByte,128,2049,false));
+ assert(!State::projection_shape(w,s,at::kByte,128,2049,true));
+ assert(!State::projection_shape(w,s,at::kByte,128,2080,true));
 }
 void exact_8b_cases(){
  for(int64_t envelope:{320,4176}){
@@ -407,8 +529,37 @@ void exact_8b_cases(){
   assert(!bad.begin(other,213));}
  }
 }
+void formal_base_grammar_cases(){
+ for(auto dtype:{at::kHalf,at::kChar})for(bool acc32:{false,true}){
+  // An ordinary owner's head carries the layer precision, which is what the
+  // production profile derives from the installed head tensor; only the TTS
+  // Predictor's int8 head departs from it, and tts_cases() covers that.
+  v3::DecodeProfile p;p.dtype=dtype;p.head_dtype=dtype;p.acc32=acc32;p.gemv=false;
+  // Concrete opposite-family/ACC, Grouped and UINT4 programs must not
+  // authorize the ordinary owner recipe. Positive streams below use each
+  // projection's actual full-shape selector, independently of this matcher.
+  assert(v3::linear_name(selected_projection_name(dtype,acc32,151936,2560,false),p,true));
+  assert(!v3::linear_name(selected_projection_name(dtype,!acc32,151936,2560,false),p,true));
+  assert(!v3::linear_name(selected_projection_name(dtype==at::kHalf?at::kChar:at::kHalf,acc32,151936,2560,false),p,true));
+  const auto grouped=rpu_pl_tiling::select_tile(6,48,96,rpu_pl_tiling::WeightType::Fp16,false,rpu_pl_tiling::Family::Grouped);
+  assert(!v3::linear_name(rpu_pl_tiling::grouped_kernel_name(rpu_pl_tiling::WeightType::Fp16,false,grouped),p,true));
+  const auto uint4=rpu_pl_tiling::select_tile(17,96,384,rpu_pl_tiling::WeightType::Uint4,false,rpu_pl_tiling::Family::Parallel,32);
+  assert(!v3::linear_name(rpu_pl_tiling::parallel_kernel_name(rpu_pl_tiling::WeightType::Uint4,false,uint4),p,true));
+  assert(!v3::linear_name("parallel_linear_unregistered_m64n64k64",p,true));
+  assert(!v3::linear_name("parallel_linear_m320n128k128",p,true));
+  assert(!v3::linear_name("parallel_linear_w8a16_m352n96k128",p,true));
+  assert(!v3::linear_name("parallel_linear_w8a16_m448n64k128_qkv_planar",p,true));
+  assert(!v3::linear_name("parallel_linear_wnvfp4a16_acc16_m176n128k128",p,true));
+  p.gemv=true;
+  assert(v3::linear_name(dtype==at::kHalf?"llama_gemv":"llama_gemv_wint8",p,false));
+  assert(!v3::linear_name(selected_projection_name(dtype,acc32,151936,2560,false),p,false));
+ }
+}
 int main(){
- tts_cases();tts_fused_head_cases();
+ formal_base_grammar_cases();
+ tts_cases();
+ tts_head_bank_cases();
+ tts_precision_cases();
  for(auto flag:{&Model::decoder_mixed_precision_,&Model::wall_prefill_staged_mlp_,
                  &Model::wall_prefill_mixed_requested_,&Model::wall_prefill_staged_requested_}){
   Fixture f;RpuKernelGraph g;assert(f.begin(g,0));f.m.cancel_qwen3vl_decode_replay();
@@ -416,6 +567,7 @@ int main(){
  }
 
  cross_profile_cases();
+ w4_storage_boundary_cases();
  exact_8b_cases();
  for(int64_t cap:{2048,4176}){cold_envelope=cap;
  for(bool o_route:{false,true})for(bool route:{false,true}){combined_route=route;combined_o=o_route;
@@ -567,7 +719,10 @@ int main(){
  // Complete grammar is authoritative: remove/reorder/duplicate/tail extras fail.
  {RpuKernelGraph g;populate(g);std::vector<v3::DecodeKernelSlot> k;
   for(size_t i=0;i<g.nodes.size();++i)k.push_back({g.nodes[i].kernel.kernel_idx,i,g.nodes[i].kernel.kernel_name});
-  std::vector<RegisterPatch> p;assert(v3::bind_decode_patches(k,p,v3::DecodeProfile{})&&p.size()==size_t(combined_route?360:504));
+  std::vector<RegisterPatch> p,hp;assert(v3::bind_decode_patches(k,p,hp,v3::DecodeProfile{})&&p.size()==size_t(combined_route?360:504));
+  // This profile installs no head bank, so the separate head recipe that the
+  // fused Predictor head would fill must come back empty, not stale.
+  assert(hp.empty());
   // An individually valid alternate layer must not create a mixed recipe.
   for(int changed=0;changed<2;++changed){
    const int layer_end=(combined_route?11:13)-(combined_o?2:0);
@@ -580,19 +735,19 @@ int main(){
    for(int i=0;i<alt_end;++i)first.push_back({0,0,alternate.nodes[i].kernel.kernel_name});
    mixed.insert(mixed.begin(),first.begin(),first.end());
    for(size_t i=0;i<mixed.size();++i){mixed[i].kernel=i;mixed[i].node=i;}
-   assert(!v3::bind_decode_patches(mixed,p,v3::DecodeProfile{}));
+   assert(!v3::bind_decode_patches(mixed,p,hp,v3::DecodeProfile{}));
   }
-  auto bad=k;bad.erase(bad.begin()+7);assert(!v3::bind_decode_patches(bad,p,v3::DecodeProfile{}));
-  bad=k;std::swap(bad[3].name,bad[4].name);assert(!v3::bind_decode_patches(bad,p,v3::DecodeProfile{}));
-  bad=k;bad[2].kernel=bad[1].kernel;assert(!v3::bind_decode_patches(bad,p,v3::DecodeProfile{}));
-  bad=k;bad.push_back({99999,99999,"llama_rms_norm"});assert(!v3::bind_decode_patches(bad,p,v3::DecodeProfile{}));
+  auto bad=k;bad.erase(bad.begin()+7);assert(!v3::bind_decode_patches(bad,p,hp,v3::DecodeProfile{}));
+  bad=k;std::swap(bad[3].name,bad[4].name);assert(!v3::bind_decode_patches(bad,p,hp,v3::DecodeProfile{}));
+  bad=k;bad[2].kernel=bad[1].kernel;assert(!v3::bind_decode_patches(bad,p,hp,v3::DecodeProfile{}));
+  bad=k;bad.push_back({99999,99999,"llama_rms_norm"});assert(!v3::bind_decode_patches(bad,p,hp,v3::DecodeProfile{}));
  }
  }
  }
  // Old REF: separate Gate/Up GEMVs plus the existing fused silu_mul.
  {combined_route=true;combined_o=false;Fixture f;f.m.qwen3vl_4b_decode_gateup_fused_=false;
   RpuKernelGraph g;assert(f.begin(g,511));assert(!f.m.try_checked_layer_body_replay());preload(g);populate(g);
-  for(size_t n=0;n<g.nodes.size();++n)if(g.nodes[n].kernel.kernel_name=="qwen3vl_gateup_swiglu_gemv"){
+  for(size_t n=0;n<g.nodes.size();++n)if(g.nodes[n].kernel.kernel_name=="qwen3vl_gateup_swiglu_w8_m1_v2"){
    Node a=g.nodes[n],b=a,c=a;a.kernel.kernel_name=b.kernel.kernel_name="llama_gemv_wint8";c.kernel.kernel_name="silu_mul";
    g.nodes[n]=a;g.nodes.insert(g.nodes.begin()+n+1,{b,c});n+=2;
   }
@@ -642,14 +797,12 @@ int main(){
 def test_actual_decode_owner_recipe_and_invalidation(tmp_path):
     source = (ROOT / "src/fused/rpu_qwen3vl_decode_replay.cpp").read_text()
     source = source.replace('#include "rpu_qwen3_model.h"', '')
-    source = source.replace('#include "../ops/rpu_linear_tiling.h"', '#include "' + str(ROOT / 'src/ops/rpu_linear_tiling.h') + '"')
+    common = (ROOT / "src/fused/rpu_decode_replay_common.h").read_text()
+    source = source.replace('#include "rpu_decode_replay_common.h"', common)
     assert source.count('t.device().type() != at::kPrivateUse1') == 2
     source = source.replace('t.device().type() != at::kPrivateUse1', 't.device().type() != at::kCPU')
     cpp = tmp_path / "checked_replay.cpp"
-    header = (ROOT / "src/fused/rpu_qwen3_model.h").read_text()
-    admission = re.search(r"        const int64_t seq_len_in = hidden_states.size\(1\);.*?(?=        detail::validate_fmb_planning_shape)", header, re.S)
-    assert admission is not None
-    cpp.write_text(HARNESS.replace("/* TTS_FORWARD_ADMISSION */", admission.group()) + source + CASES)
+    cpp.write_text(with_actual_linear_contracts(HARNESS + source + CASES))
     torch_root = Path(torch.__file__).resolve().parent
     exe = tmp_path / "checked_replay"
     subprocess.run([

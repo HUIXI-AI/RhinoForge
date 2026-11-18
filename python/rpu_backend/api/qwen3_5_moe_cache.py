@@ -38,12 +38,12 @@ class Qwen3_5MoeCache(Qwen3_5Cache):
             validate_exact_profile(config, require_quant=True)
         except (TypeError, ValueError) as exc:
             raise ValueError(str(exc)) from exc
-        from rpu_backend.adapters.qwen3_5_moe.cores import core_topology
+        from rpu_backend.adapters.qwen3_5_moe.cores import core_topology, full_topology_tuple
         topology = core_topology({"model": {"num_cores": num_cores}}, config=config)
         text_config = getattr(config, "text_config", config)
         # Dense Qwen3.5's reduced-profile factory deliberately rejects MoE.
         # Reuse its cache implementation with this already validated geometry.
-        return cls(
+        cache = cls(
             num_layers=text_config.num_hidden_layers, batch_size=1,
             max_seq_len=max_seq_len, num_kv_heads=topology.attn_tp,
             head_dim=text_config.head_dim, layer_types=text_config.layer_types,
@@ -55,6 +55,8 @@ class Qwen3_5MoeCache(Qwen3_5Cache):
             conv_kernel_dim=text_config.linear_conv_kernel_dim,
             attn_tp=topology.attn_tp, num_cores=topology.num_cores, device=device, dtype=dtype,
         )
+        cache.moe_execution_topology = full_topology_tuple(topology)
+        return cache
 
     @classmethod
     def from_model(
@@ -62,7 +64,7 @@ class Qwen3_5MoeCache(Qwen3_5Cache):
     ):
         from rpu_backend.adapters.qwen3_5.cores import topology_tuple
         from rpu_backend.adapters.qwen3_5_moe.cores import (
-            core_topology, validate_native_topology,
+            core_topology, full_topology_tuple, validate_native_topology,
         )
 
         fusion = getattr(model, "model", model)
@@ -80,7 +82,8 @@ class Qwen3_5MoeCache(Qwen3_5Cache):
                 "35B-A3B model"
             )
         expected = core_topology(getattr(model, "_rpu_execution", None), config=model.config)
-        if topology_tuple(topology) != topology_tuple(expected):
+        if (topology_tuple(topology) != topology_tuple(expected)
+                or full_topology_tuple(topology) != full_topology_tuple(expected)):
             raise ValueError("Qwen3.5-MoE config no longer matches its installed core layout")
         validate_native_topology(state.handle, topology)
         return cls.from_config(

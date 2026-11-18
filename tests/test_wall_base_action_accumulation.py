@@ -33,7 +33,7 @@ def test_actual_action_hooks_manifest_and_cold_setter(tmp_path):
         'const FmbRouteManifestEntry& FmbPhysicalManifestConsumer::consume_route(',
     ))
     constants = '\n'.join(re.findall(r'constexpr int64_t WALL_ACTION_\w+\s*=\s*\d+LL;', action))
-    accumulation = _statement(decoder, 'manifest.linear_accumulation = (decoder_mixed_precision_')
+    accumulation = _statement(decoder, 'manifest.linear_accumulation = decoder_mixed_precision_')
     stubs = '\n'.join(f'#define {name}(...) ((void)0)' for name in sorted(
         set(re.findall(r'\b(rpu_launch_\w+)\(', hooks)) - {'rpu_launch_linear_spm_to_spm_acc16_kernel'}))
     source = META + r'''

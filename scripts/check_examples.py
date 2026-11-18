@@ -4,10 +4,13 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import importlib.util
+import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -77,6 +80,145 @@ def load_configs() -> dict[Path, dict]:
     return configs
 
 
+DEFAULT_PROFILE_VARIANTS: dict[str, dict] = {
+    "pi05-libero-finetuned.fp16.vla-tp4": {
+        "config": "pi05/3cam/h50/fp16.toml",
+        "set": {
+            "rpu_execution.model.num_cores": 4
+        },
+        "remove": []
+    },
+    "pi05-libero-finetuned.fp16.vla-tp6": {
+        "config": "pi05/3cam/h50/fp16.toml",
+        "set": {
+            "rpu_execution.model.num_cores": 6
+        },
+        "remove": []
+    },
+    "pi05-libero-finetuned-w8a16-vlm-expert.w8a16.vla-tp4": {
+        "config": "pi05/3cam/h50/w8a16.toml",
+        "set": {
+            "rpu_execution.model.num_cores": 4
+        },
+        "remove": []
+    },
+    "pi05-libero-finetuned-w8a16-vlm-expert.w8a16.vla-tp6": {
+        "config": "pi05/3cam/h50/w8a16.toml",
+        "set": {
+            "rpu_execution.model.num_cores": 6
+        },
+        "remove": []
+    },
+    "pi05-libero-finetuned.fp16.vla-2cam-tp4": {
+        "config": "pi05/2cam/h50/fp16.toml",
+        "set": {
+            "rpu_execution.model.num_cores": 4
+        },
+        "remove": []
+    },
+    "pi05-libero-finetuned.fp16.vla-2cam-tp6": {
+        "config": "pi05/2cam/h50/fp16.toml",
+        "set": {
+            "rpu_execution.model.num_cores": 6
+        },
+        "remove": []
+    },
+    "pi05-libero-finetuned-w8a16-vlm-expert.w8a16.vla-2cam-tp4": {
+        "config": "pi05/2cam/h50/w8a16.toml",
+        "set": {
+            "rpu_execution.model.num_cores": 4
+        },
+        "remove": []
+    },
+    "pi05-libero-finetuned-w8a16-vlm-expert.w8a16.vla-2cam-tp6": {
+        "config": "pi05/2cam/h50/w8a16.toml",
+        "set": {
+            "rpu_execution.model.num_cores": 6
+        },
+        "remove": []
+    },
+    "qwen3_5-0.8b.fp16.text-long-prefill": {
+        "config": "qwen3_5/text/0_8b/fp16.toml",
+        "set": {
+            "example.profile_id": "qwen3_5-0.8b.fp16.text-long-prefill",
+            "input.prefill_tokens": 4096
+        },
+        "remove": []
+    },
+    "qwen3_5-2b.fp16.text-long-prefill": {
+        "config": "qwen3_5/text/2b/fp16.toml",
+        "set": {
+            "example.profile_id": "qwen3_5-2b.fp16.text-long-prefill",
+            "input.prefill_tokens": 4096,
+            "rpu_execution.prefill.chunk_size": 640
+        },
+        "remove": []
+    },
+    "qwen3_5-4b.fp16.text-long-prefill": {
+        "config": "qwen3_5/text/4b/fp16.toml",
+        "set": {
+            "example.profile_id": "qwen3_5-4b.fp16.text-long-prefill",
+            "input.prefill_tokens": 4096
+        },
+        "remove": []
+    },
+    "qwen3_5-9b.fp16.text-long-prefill": {
+        "config": "qwen3_5/text/9b/fp16.toml",
+        "set": {
+            "example.profile_id": "qwen3_5-9b.fp16.text-long-prefill",
+            "input.prefill_tokens": 4096
+        },
+        "remove": []
+    }
+}
+
+
+def _active_profile_variants() -> dict[str, dict]:
+    source = CONFIGS / "profile_variants.json"
+    if not source.is_file():
+        return DEFAULT_PROFILE_VARIANTS
+    data = json.loads(source.read_text(encoding="utf-8"))
+    if data.get("schema_version") != 1 or not isinstance(data.get("profiles"), dict):
+        raise RuntimeError("invalid profile_variants.json schema")
+    return data["profiles"]
+
+
+def profile_variant_configs(configs: dict[Path, dict]) -> dict[str, tuple[Path, dict]]:
+    """Validate explicit parameter changes for profiles sharing a canonical TOML."""
+    profiles_map = _active_profile_variants()
+    scripts = str(Path(__file__).resolve().parent)
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    from run_zoo_example import toml_text
+    result = {}
+    with tempfile.TemporaryDirectory(prefix="example-profile-variants-") as temporary:
+        for profile_id, variant in profiles_map.items():
+            path = CONFIGS / variant["config"]
+            if path not in configs:
+                raise RuntimeError(f"profile variant requires canonical config: {variant['config']}")
+            config = deepcopy(configs[path])
+            for key in variant.get("remove", []):
+                owner = config
+                *parents, leaf = key.split(".")
+                for parent in parents:
+                    owner = owner[parent]
+                del owner[leaf]
+            for key, value in variant.get("set", {}).items():
+                owner = config
+                *parents, leaf = key.split(".")
+                for parent in parents:
+                    owner = owner.setdefault(parent, {})
+                owner[leaf] = value
+            rendered = Path(temporary) / "config.toml"
+            rendered.write_text(toml_text(config), encoding="utf-8")
+            validated = COMMON.load_config(rendered)
+            metadata = COMMON.example_metadata(validated)
+            if metadata is None or metadata["profile_id"] != profile_id:
+                raise RuntimeError(f"profile variant does not resolve to {profile_id}")
+            result[profile_id] = (path, validated)
+    return result
+
+
 def catalog(configs: dict[Path, dict] | None = None) -> Catalog:
     profiles = COMMON.example_profiles()
     api_entries: dict[str, list[CatalogEntry]] = {}
@@ -106,6 +248,16 @@ def catalog(configs: dict[Path, dict] | None = None) -> Catalog:
         architecture = example.get("architecture")
         destination = api_entries if architecture is not None else vla_entries
         destination.setdefault(profile_id, []).append(entry)
+
+    for profile_id, (config_path, config) in profile_variant_configs(configs).items():
+        if profile_id in api_entries or profile_id in vla_entries:
+            raise RuntimeError(f"profile variant duplicates a default configuration: {profile_id}")
+        profile = profiles[profile_id]
+        target = COMMON.profile_runner_target(profile)
+        if COMMON.config_target(config) != target:
+            raise RuntimeError(f"profile variant {profile_id} config/runner target mismatch")
+        destination = api_entries if COMMON.example_metadata(config).get("architecture") else vla_entries
+        destination[profile_id] = [(entry_path, config_path, config, profile)]
 
     documented = set(COMMON.ARCH_FAMILIES)
     represented = {
@@ -233,10 +385,17 @@ def render(
 
 def _config_links(entries: list[CatalogEntry]) -> str:
     links = []
-    for _entry_path, config_path, config, _profile in entries:
+    variants = _active_profile_variants()
+    for _entry_path, config_path, config, profile in entries:
         relative = config_path.relative_to(ROOT).as_posix()
         alias = COMMON.example_metadata(config)["registry_alias"]
-        links.append(f"[`{relative}`](../{relative}) / `{alias}`")
+        label = f"[`{relative}`](../{relative}) / `{alias}`"
+        if profile["id"] in variants:
+            changes = variants[profile["id"]]["set"]
+            label += "；覆盖参数：" + "; ".join(
+                f"`{'model.' + key[len('example.'):] if key.startswith('example.') else key}="
+                f"{json.dumps(value, ensure_ascii=False)}`" for key, value in changes.items())
+        links.append(label)
     return "<br>".join(links)
 
 
@@ -261,7 +420,7 @@ def render_config_index(configs: dict[Path, dict]) -> str:
                 lines.append("")
             family = relative.parts[0]
             lines += [f"## {family}", "",
-                      f"[配置说明]({family}/README.md) · [权重准备]({family}/README.md#quantization)", "",
+                      f"[配置说明]({family}/README.md) · [权重准备](WEIGHTS.md)", "",
                       "| 配置 | 入口 / 用途 | 精度 / 输入默认 | CPU 请求 | 登记支持 |",
                       "|---|---|---|---|---|"]
         metadata = COMMON.example_metadata(config)
@@ -300,8 +459,9 @@ def render_config_index(configs: dict[Path, dict]) -> str:
         section = config.get(custom, {}) if custom else config.get("example", {})
         precision = section.get("precision", section.get("weight_dtype", section.get("dtype", "—")))
         dimensions = []
-        for key, label in (("cameras", "相机"), ("image_size", "图像"),
-                           ("text_tokens", "T"), ("expected_language_tokens", "有效T"), ("text_lengths", "T列表"),
+        for key, label in (("cameras", "相机"), ("image_size", "图像"), ("frame_size", "原帧"),
+                           ("text_tokens", "T"), ("action_dim", "动作维"),
+                           ("expected_language_tokens", "有效T"), ("text_lengths", "T列表"),
                            ("prefill_tokens", "P"), ("decode_steps", "D")):
             if key in inputs:
                 dimensions.append(f"{label}={inputs[key]}")

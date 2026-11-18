@@ -72,11 +72,28 @@ def test_chunk_size_rejects_broken_accumulated_product_6():
     assert not h.is_valid_chunk_size(**CFG, cs=288, seq_len=576, position=0)
     assert h.is_valid_chunk_size(**CFG, cs=384, seq_len=576, position=0)
 
-def test_chunk_size_sync_reject_above_8():
-    assert not h.is_valid_chunk_size(**CFG, cs=640, seq_len=4096, position=0)
-
-def test_chunk_size_sync_reject_modulo_break():
-    assert not h.is_valid_chunk_size(**CFG, cs=768, seq_len=4096, position=0)
+@pytest.mark.parametrize("cs,tm,tk", [(640,80,80),(768,96,96)])
+def test_chunk_size_sync_repair_retains_launch_constraints(cs,tm,tk):
+    # The original 128-row tile has product 10/12 and remains illegal.
+    # Policy3 selects a divisor with eight blocks and product16. The native
+    # host probe checks the planner's actual selection for this exact CFG.
+    with pytest.raises(RuntimeError, match="sync"):
+        h.validate_kernel_call(seq_q=cs,seq_k=cs,tile_m_v16=8,tile_n_v16=8,
+            tile_k_v16=16,tile_m=128,grid_dim_x=cs//128,gqa_group_size=2,
+            hd_q_v16=8,hd_k_v16=8,hd_v_v16=8,attn_mask_type=1)
+    assert h.choose_tile_k(tm//16,8,1,8)==tk//16
+    for offset in range(0,4096,cs):
+        rows=min(cs,4096-offset)
+        m,k=(tm,tk) if rows==cs else (128,256)
+        assert rows%m==0 and offset%m==0
+        h.validate_kernel_call(seq_q=rows,seq_k=offset+rows,
+            tile_m_v16=m//16,tile_n_v16=8,tile_k_v16=k//16,tile_m=m,
+            grid_dim_x=rows//m,gqa_group_size=2,
+            hd_q_v16=8,hd_k_v16=8,hd_v_v16=8,attn_mask_type=1)
+    assert h.is_valid_chunk_size(**CFG,cs=cs,seq_len=4096,position=0)
+    assert not h.is_valid_chunk_size(**CFG,cs=cs,seq_len=4096,position=0,max_sync_product=8)
+    assert not h.is_valid_chunk_size(**CFG,cs=cs,seq_len=4095,position=0)
+    assert not h.is_valid_chunk_size(**CFG,cs=cs,seq_len=4096,position=16)
 
 def test_chunk_size_sync_accepts_multiple_of_8():
     assert h.is_valid_chunk_size(**CFG, cs=1024, seq_len=4096, position=0)

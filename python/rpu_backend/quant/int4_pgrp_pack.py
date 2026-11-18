@@ -1,40 +1,28 @@
-"""INT4 group-wise (pgrp / AWQ-style) weight pack for the
-parallel_linear_wint4a16_pgrp_m{m}n{n}k128 kernel ABI.
+"""N32K32 weight packing for the unified parallel_linear W4 ABI.
 
-Group-wise symmetric int4 along K (group_size, default 32), per output channel.
-Weight packing steps:
-  per-core 16N x 64K swizzle (tp_col/row_swizzle_mc_weight)
-  -> *deinterleaved* int4 packing inside each 64-value K-group (_int4_pack_perm)
-  -> two's-complement nibble pack.
+Signed and unsigned codes share the physical order
+``[Nblock32,Kblock32,core,thread16,Nhalf2,byte16]``. Each byte pairs K=j
+and K=j+16; each aligned 32-byte thread load pairs N=t and N=t+16.
+Output-channel tails are zero padded within each TP shard.
 Logical scale is (G=K/group_size, N) fp16 row-major.  The kernel consumes a
 controller-striped [ceil(localG/4), ceil(localN/64), cores, 4, 64] payload;
 swizzle_int4_pgrp_scale builds that payload and reshapes it to a 2-D tensor
 whose first dimension carries group_size metadata for the C++ dispatcher.
 
-Legacy per-channel quantization remains numerically representable: repeat its
+Per-channel quantization remains numerically representable: repeat its
 one scale per output channel across all K groups, then use the same pgrp weight
 and scale packing.  There is only one physical INT4 ABI.
 
-The C++ dispatcher (rpu_launch_linear_spm_to_spm_acc16_kernel, kByte + 2D-scale
-branch) requires the 2-D scale and selects the tiled kernel via
-select_tile_int4.
+The packed byte count can exceed N*K/2 when localN is not a multiple of 32.
+Callers must retain the complete physical owner and keep logical dimensions
+separate from its storage dimensions.
 """
 from __future__ import annotations
 
-import numpy as np
 import torch
 
-_NUM_ELE_32B_INT4 = 64  # 32 bytes / 0.5 byte-per-int4
 _FP16_TINY = torch.finfo(torch.float16).tiny
-
-
-def _pack_int4_signed(flat: np.ndarray) -> np.ndarray:
-    """Pack signed int4 values into two's-complement nibbles."""
-    values = np.asarray(flat, dtype=np.int8)
-    if values.size % 2:
-        values = np.append(values, np.int8(0))
-    nibbles = np.where(values < 0, values + 16, values).astype(np.uint8) & 0x0F
-    return ((nibbles[1::2] << 4) | nibbles[0::2]).astype(np.uint8)
+W4_WEIGHT_LAYOUT = "n32k32"
 
 
 def quantize_int4_group_wise(
@@ -133,44 +121,96 @@ def swizzle_int4_pgrp_scale(
     return physical.reshape(group_size, -1)
 
 
-def _int4_pack_perm() -> np.ndarray:
-    """Deinterleave perm within each 64-value K-group:
-    [0,16, 1,17, ..., 15,31, 32,48, ..., 47,63]."""
-    perm = np.empty(64, dtype=np.int64)
-    for blk in range(2):
-        for i in range(16):
-            perm[blk * 32 + 2 * i] = blk * 32 + i
-            perm[blk * 32 + 2 * i + 1] = blk * 32 + 16 + i
-    return perm
+def pad_int4_mlp_stripe(
+    int4_vals: torch.Tensor, scale_gn: torch.Tensor, *, partition: int,
+    padded_size: int, group_size: int = 32,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Zero-pad logical INT4 values along the MLP width before the pgrp pack.
+
+    Col partition (Gate/Up) appends output rows N; row partition (Down)
+    appends whole K groups. New values are exact zero and their logical
+    scales are one, so padded Gate/Up rows produce zero and padded Down
+    columns multiply those zero activations: the physical MLP equals the
+    logical one. Existing values and scales are copied unchanged.
+    """
+    if int4_vals.dim() != 2 or scale_gn.dim() != 2:
+        raise ValueError("MLP INT4 padding requires values [N,K] and scale [G,N]")
+    n, k = (int(dim) for dim in int4_vals.shape)
+    if partition not in (0, 1) or type(padded_size) is not int:
+        raise ValueError("MLP INT4 padding requires partition 0/1 and an integer width")
+    if group_size <= 0 or k % group_size or tuple(scale_gn.shape) != (k // group_size, n):
+        raise ValueError(f"MLP INT4 padding requires scale [K/{group_size},N] for {(n, k)}")
+    logical = n if partition == 1 else k
+    if padded_size < logical or (partition == 0 and padded_size % group_size):
+        raise ValueError(f"MLP INT4 padding cannot shrink or split groups: {logical}->{padded_size}")
+    if padded_size == logical:
+        return int4_vals, scale_gn
+    shape = (padded_size, k) if partition == 1 else (n, padded_size)
+    values = int4_vals.new_zeros(shape)
+    values[:n, :k] = int4_vals
+    groups = k // group_size if partition == 1 else padded_size // group_size
+    scales = scale_gn.new_ones((groups, padded_size if partition == 1 else n))
+    scales[:k // group_size, :n] = scale_gn
+    return values, scales
 
 
-def _pgrp_swizzle_perm(vals: torch.Tensor, partition: int, num_cores: int) -> torch.Tensor:
-    """int4 vals [N,K] -> per-core 16Nx64K swizzle + deinterleave perm -> flat int tensor."""
-    N, K = vals.shape
-    e = _NUM_ELE_32B_INT4
-    v = vals.to(torch.int64)
-    if partition == 1:  # col
-        if N % (16 * num_cores) != 0 or K % e != 0:
-            raise ValueError(
-                f"pgrp col swizzle needs N%(16*cores)==0 and K%64==0, got N={N},K={K},cores={num_cores}")
-        v = v.view(num_cores, N // 16 // num_cores, 16, K // e, e).permute(1, 3, 0, 2, 4).contiguous()
-    elif partition == 0:  # row
-        if N % 16 != 0 or K % (e * num_cores) != 0:
-            raise ValueError(
-                f"pgrp row swizzle needs N%16==0 and K%(64*cores)==0, got N={N},K={K},cores={num_cores}")
-        v = v.view(N // 16, 16, num_cores, K // e // num_cores, e).permute(0, 3, 2, 1, 4).contiguous()
+def w4_storage_shape(n: int, k: int, partition: int, num_cores: int) -> tuple[int, int]:
+    """Return physical ``[padded global N, global K/2]`` storage dimensions.
+
+    Padding follows TP partitioning. K is never silently padded: a row shard's
+    input and its scale groups must already describe the same K32 geometry.
+    """
+    if type(num_cores) is not int or not 1 <= num_cores <= 8:
+        raise ValueError("W4 packing requires an integer core count in [1,8]")
+    if any(type(v) is not int or v <= 0 for v in (n, k)):
+        raise ValueError("W4 dimensions must be positive integers")
+    if partition == 1:
+        if n % num_cores:
+            raise ValueError("W4 col packing requires N%cores==0")
+        local_n, local_k = n // num_cores, k
+    elif partition == 0:
+        if k % num_cores:
+            raise ValueError("W4 row packing requires K%cores==0")
+        local_n, local_k = n, k // num_cores
     else:
-        raise ValueError(f"partition must be 0(row) or 1(col), got {partition}")
-    perm = torch.as_tensor(_int4_pack_perm())
-    v = v[..., perm].contiguous()       # deinterleave the innermost 64-value K-group
-    return v.reshape(-1)
+        raise ValueError("partition must be 0(row) or 1(col)")
+    if local_n % 16 or local_k % 32:
+        raise ValueError("N32K32 packing requires localN%16==0 and localK%32==0")
+    physical_n = ((local_n + 31) // 32) * 32
+    return physical_n * (num_cores if partition == 1 else 1), k // 2
+
+
+def swizzle_pack_w4_n32k32(
+    values: torch.Tensor, partition: int, num_cores: int,
+) -> torch.Tensor:
+    """Pack signed INT8 or unsigned UINT8 logical codes into flat N32K32 bytes."""
+    if (not isinstance(values, torch.Tensor) or values.dim() != 2
+            or values.dtype not in (torch.int8, torch.uint8) or values.numel() == 0):
+        raise ValueError("W4 codes require a nonempty INT8 or UINT8 [N,K] tensor")
+    n, k = values.shape
+    physical_n, _ = w4_storage_shape(n, k, partition, num_cores)
+    low, high = (-8, 7) if values.dtype == torch.int8 else (0, 15)
+    if int(values.min()) < low or int(values.max()) > high:
+        raise ValueError(f"W4 {values.dtype} codes must lie in [{low},{high}]")
+    local_n, local_k = (n // num_cores, k) if partition == 1 else (n, k // num_cores)
+    padded_n = physical_n // num_cores if partition == 1 else physical_n
+    codes = values.detach().to(device="cpu", dtype=torch.uint8) & 15
+    local = (codes.reshape(num_cores, local_n, local_k) if partition == 1 else
+             codes.reshape(local_n, num_cores, local_k).permute(1, 0, 2))
+    if padded_n != local_n:
+        padded = codes.new_zeros((num_cores, padded_n, local_k))
+        padded[:, :local_n].copy_(local)
+        local = padded
+    groups = local.reshape(num_cores, padded_n // 32, 2, 16, local_k // 32, 2, 16)
+    packed = groups[..., 0, :] | (groups[..., 1, :] << 4)
+    return packed.permute(1, 4, 0, 3, 2, 5).contiguous().reshape(-1)
 
 
 def swizzle_pack_int4_pgrp(int4_vals: torch.Tensor, partition: int, num_cores: int) -> torch.Tensor:
-    """int4 vals [N,K] (int8 container) -> packed uint8 torch tensor [N*K/2]."""
-    flat = _pgrp_swizzle_perm(int4_vals, partition, num_cores)
-    packed = _pack_int4_signed(flat.cpu().numpy())
-    return torch.from_numpy(packed).contiguous()
+    """Signed logical INT4 [N,K] -> the complete flat N32K32 UINT8 owner."""
+    if not isinstance(int4_vals, torch.Tensor) or int4_vals.dtype != torch.int8:
+        raise ValueError("signed INT4 codes require an INT8 tensor")
+    return swizzle_pack_w4_n32k32(int4_vals, partition, num_cores)
 
 
 def pack_int4_per_channel_as_pgrp(
@@ -196,6 +236,8 @@ def pack_int4_per_channel_as_pgrp(
             f"per-channel scale must be fp16 [N]=[{n}], got "
             f"dtype={scale_n.dtype}, shape={tuple(scale_n.shape)}"
         )
+    if type(group_size) is not int or group_size not in (32, 64, 128):
+        raise ValueError("group_size must be 32, 64, or 128")
     if k % group_size != 0:
         raise ValueError(f"K={k} not divisible by group_size={group_size}")
     logical_scale = (
@@ -210,7 +252,7 @@ def pack_int4_per_channel_as_pgrp(
 
 
 def quantize_pack_int4_pgrp_col_bounded(
-    weight: torch.Tensor, group_size: int = 32,
+    weight: torch.Tensor, group_size: int = 32, *, num_cores: int = 8,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pack a col-partitioned lm_head for the current pgrp W4 kernel ABI."""
     if weight.dim() != 2:
@@ -223,30 +265,29 @@ def quantize_pack_int4_pgrp_col_bounded(
             "W4 col packing is validated only for group_size=32, "
             f"got {group_size}"
         )
-    if vocab % (16 * 8) != 0 or hidden % 64 != 0:
-        raise ValueError(
-            "W4 col packing requires vocab%128==0 and hidden%64==0, "
-            f"got {(vocab, hidden)}"
-        )
-    # Bound the quantizer's fp32 and packer's int64 temporaries. A block
+    if type(num_cores) is not int or not 1 <= num_cores <= 8:
+        raise ValueError("W4 col packing requires an integer core count in [1,8]")
+    storage_shape = w4_storage_shape(vocab, hidden, 1, num_cores)
+    # Bound the quantizer's fp32 and packer's uint8 temporaries. A block
     # contains the same local output rows from every core, so its packed
     # bytes occupy one contiguous interval of the original physical layout.
-    local_rows = vocab // 8
-    packed = torch.empty(vocab * hidden // 2, dtype=torch.uint8)
+    local_rows = vocab // num_cores
+    packed = torch.empty(storage_shape[0] * storage_shape[1], dtype=torch.uint8)
     logical_scale = torch.empty(hidden // group_size, vocab, dtype=torch.float16)
-    core_weight = weight.detach().reshape(8, local_rows, hidden)
+    core_weight = weight.detach().reshape(num_cores, local_rows, hidden)
     for start in range(0, local_rows, 256):
         stop = min(start + 256, local_rows)
         block = core_weight[:, start:stop].reshape(-1, hidden).to(torch.float16)
         values, block_scale, _ = quantize_int4_group_wise(block, group_size)
-        packed[start * hidden * 4:stop * hidden * 4] = swizzle_pack_int4_pgrp(
-            values, partition=1, num_cores=8,
+        physical_stop = (stop + 31) // 32 * 32
+        packed[start * hidden * num_cores // 2:physical_stop * hidden * num_cores // 2] = swizzle_pack_int4_pgrp(
+            values, partition=1, num_cores=num_cores,
         )
-        logical_scale.reshape(hidden // group_size, 8, local_rows)[:, :, start:stop] = (
-            block_scale.reshape(hidden // group_size, 8, stop - start)
+        logical_scale.reshape(hidden // group_size, num_cores, local_rows)[:, :, start:stop] = (
+            block_scale.reshape(hidden // group_size, num_cores, stop - start)
         )
-    packed = packed.reshape(vocab, hidden // 2)
+    packed = packed.reshape(storage_shape)
     scale = swizzle_int4_pgrp_scale(
-        logical_scale, group_size, partition=1, num_cores=8,
+        logical_scale, group_size, partition=1, num_cores=num_cores,
     )
     return packed.contiguous(), scale.contiguous()

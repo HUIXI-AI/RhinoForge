@@ -147,6 +147,7 @@ def test_owner_capabilities_fail_closed_on_their_real_physical_abis():
     for contract in (
         "z2_bound_ || z2_prepared_seq_len_ != 0",
         "seq <= 0 || chunk.offset != 0",
+        "chunk.kv_seq_len != seq",
         "num_layers() == 4",
         "/*MASK_NONE=*/0",
     ):

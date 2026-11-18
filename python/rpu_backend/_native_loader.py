@@ -65,7 +65,10 @@ def _check_device_nodes(
                 close_fn(fd)
             except OSError as exc:
                 if open_error is not None:
-                    open_error.add_note(f"Device preflight cleanup also failed: {exc}")
+                    # BaseException.add_note was introduced in Python 3.11.
+                    add_note = getattr(open_error, "add_note", None)
+                    if callable(add_note):
+                        add_note(f"Device preflight cleanup also failed: {exc}")
                 elif close_error is None:
                     close_error = exc
         if close_error is not None:

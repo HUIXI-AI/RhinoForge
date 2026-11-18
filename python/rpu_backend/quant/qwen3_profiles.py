@@ -1,11 +1,10 @@
-"""Exact dense Qwen3 geometry for the TP8 quantized loader.
-
-This geometry table does not expand FP16 or reduced-core admission.
-"""
+"""Exact dense Qwen3 quantization recipes and packed execution topology."""
 from collections.abc import Mapping
 from numbers import Integral
 
-from rpu_backend.runtime.topology import DecoderGeometryProfile
+from rpu_backend.runtime.topology import (
+    DecoderGeometryProfile, resolve_decoder_topology,
+)
 
 
 _PROFILES = tuple(DecoderGeometryProfile(h, i, layers, heads, 8, 128, 151936, 8)
@@ -61,6 +60,17 @@ def qwen3_dense_quant_profile(config):
             or getattr(config, "tie_word_embeddings", None) is not (profile.hidden_size < 4096)):
         raise ValueError("Qwen3 W4 requires the official dense source, not a pre-quantized checkpoint")
     return profile
+
+
+def qwen3_w4_topology(config, num_cores):
+    """Resolve the packed G32 topology; it uses the same template as FP16/W8.
+
+    Packed row projections need K/TP divisible by 32. A six-lane MLP whose
+    source width is not 192-aligned is zero-padded once at installation
+    (``decoder_packed_w4_mlp_intermediate_size``) instead of using four lanes.
+    """
+    profile = qwen3_dense_quant_profile(config)
+    return resolve_decoder_topology(num_cores=num_cores, **profile.geometry())
 
 
 def is_qwen3_32b_w8a16_config(config):

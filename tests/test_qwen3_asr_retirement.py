@@ -70,10 +70,11 @@ def test_partial_audio_install_is_owned_before_weight_conversion(monkeypatch):
         self_attn=SimpleNamespace(**{name: torch.nn.Linear(1, 1) for name in (
             "q_proj", "k_proj", "v_proj", "out_proj")}),
         fc1=torch.nn.Linear(1, 1), fc2=torch.nn.Linear(1, 1))
+    layer.self_attn.q_proj = torch.nn.Linear(896, 896)
     audio = SimpleNamespace(config=SimpleNamespace(
         d_model=896, encoder_layers=18, encoder_attention_heads=14,
         encoder_ffn_dim=3584, activation_function="gelu", n_window=50,
-        n_window_infer=800, output_dim=1024), layers=[layer],
+        n_window_infer=800, output_dim=1024), layers=[layer] * 18,
         ln_post=SimpleNamespace(eps=1e-5))
     graph = SimpleNamespace(clear=lambda: events.append("clear"),
                             cache_invariant_ok=lambda: True)

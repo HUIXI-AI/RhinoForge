@@ -1,6 +1,7 @@
 """Board-free native contracts for Qwen3.5-35B-A3B TP4/TP6/TP8 ownership."""
 
 from pathlib import Path
+from pi_wall_host_catalog import with_actual_linear_contracts
 import re
 import shutil
 import subprocess
@@ -72,9 +73,9 @@ def _run_cpp(tmp_path: Path, source: str) -> None:
         pytest.skip("C++ compiler unavailable")
     cpp = tmp_path / "probe.cpp"
     exe = tmp_path / "probe"
-    cpp.write_text(source, encoding="utf-8")
+    cpp.write_text(with_actual_linear_contracts(source), encoding="utf-8")
     subprocess.run(
-        [compiler, "-std=c++17", "-O0", "-I", str(INCLUDE_ROOT),
+        [compiler, "-std=c++17", "-O0", "-I", str(INCLUDE_ROOT), "-I", str(ROOT / "src/ops"),
          str(cpp), "-o", str(exe)],
         check=True,
         capture_output=True,
@@ -92,6 +93,7 @@ def test_real_cold_topology_methods_admit_fixed_tp4_tp6_tp8(tmp_path):
             "std::vector<int64_t> Qwen3_5MoeModel::execution_topology() const",
             "std::vector<int64_t> Qwen3_5MoeModel::execution_topology_v2() const",
             "DecoderExecutionTopology Qwen3_5MoeModel::resolve_model_execution_topology(",
+            "int64_t Qwen3_5MoeModel::minimum_eager_spm_bytes() const",
             "std::vector<int64_t> Qwen3_5MoeModel::cold_topology_arguments() const",
         )
     )
@@ -102,6 +104,9 @@ def test_real_cold_topology_methods_admit_fixed_tp4_tp6_tp8(tmp_path):
 #include <stdexcept>
 #include <vector>
 #include "core/execution_topology.h"
+#include "core/rpu_spm_allocator.h"
+namespace c10 {struct Half {uint16_t storage;};}
+#define Align(x,a) (((x)+(a)-1)/(a)*(a))
 #define NUM_CORES 8
 #define TORCH_CHECK(ok, ...) do { if (!(ok)) throw std::runtime_error(#ok); } while (false)
 namespace at {
@@ -122,12 +127,14 @@ struct FusedModelBase {
     int64_t num_layers() const { return layers; }
 };
 struct Qwen3_5MoeModel : FusedModelBase {
-    std::vector<int> layer_weights_, moe_layer_weights_;
+    std::vector<int> layer_weights_;
+    struct MoeWeight {int routed_weight_mode=5;};
+    std::vector<MoeWeight> moe_layer_weights_;
     at::Tensor expert_ids_, token_ids_, router_bridge_;
     int gdn_tp() const { return num_cores() == 6 ? 4 : num_cores(); }
     int router_tp() const { return num_cores() == 6 ? 4 : num_cores(); }
     int routing_tp() const { return num_cores(); }
-    int routed_expert_tp() const { return num_cores(); }
+    __ROUTED_HELPER__
     int shared_expert_tp() const { return num_cores(); }
     int lm_head_tp() const { return num_cores() == 6 ? 4 : num_cores(); }
     void set_execution_cores(int64_t);
@@ -135,6 +142,7 @@ struct Qwen3_5MoeModel : FusedModelBase {
     std::vector<int64_t> execution_topology_v2() const;
     DecoderExecutionTopology resolve_model_execution_topology(
         int64_t, int64_t, int64_t, int64_t, int64_t) const override;
+    int64_t minimum_eager_spm_bytes() const;
     std::vector<int64_t> cold_topology_arguments() const;
 };
 __METHODS__
@@ -150,7 +158,7 @@ int run_probe() {
         rejects([&] { model.set_execution_cores(bad); });
         assert(model.num_cores() == 8);
     }
-    for (int owner : {4,6,8}) {
+    for (int owner : {4,6,8}) for (int mode : {5,6}) {
         Qwen3_5MoeModel model;
         model.set_execution_cores(owner);
         const int effective_kv = owner == 8 ? 8 : 4;
@@ -165,13 +173,22 @@ int run_probe() {
         model.mlp=resolved.mlp_tp;
         model.layers=40;
         model.layer_weights_.resize(40);
+        model.moe_layer_weights_.resize(40);
+        for(auto& weight:model.moe_layer_weights_)weight.routed_weight_mode=mode;
+        const int routed=owner==6 && mode==6?4:owner;
         const auto topology=model.execution_topology();
         assert((topology == std::vector<int64_t>{owner,narrow,owner,narrow,8}));
         const auto topology_v2=model.execution_topology_v2();
         assert((topology_v2 == std::vector<int64_t>{
-            2,owner,narrow,narrow,narrow,owner,owner,owner,narrow,8}));
+            2,owner,narrow,narrow,narrow,owner,routed,owner,narrow,8}));
         const auto cold=model.cold_topology_arguments();
-        if (owner == 6) assert(cold == topology_v2);
+        assert(model.minimum_eager_spm_bytes() == (owner == 6 ? 129280 : 0));
+        if (owner == 6) {
+            auto expected = topology_v2;
+            expected.push_back(129280);
+            assert(cold == expected);
+            assert(topology_v2.size() == 10);
+        }
         else assert((cold == std::vector<int64_t>{
             1,owner,owner,owner,owner,owner,8}));
         rejects([&] { model.set_execution_cores(owner); });
@@ -194,7 +211,9 @@ int run_probe() {
 }
 } // namespace v3
 int main() { return v3::run_probe(); }
-'''.replace("__METHODS__", methods)
+'''.replace("__METHODS__", methods).replace("__ROUTED_HELPER__", _definition(
+        (ROOT / 'src/fused/rpu_qwen3_5_moe_model.h').read_text(),
+        '    int routed_expert_tp() const'))
     _run_cpp(tmp_path, probe)
 
 
@@ -206,11 +225,12 @@ def test_exact_install_binds_logical_and_physical_dimensions_to_cold_owner():
     assert "num_cores() == 4 || num_cores() == 6 || num_cores() == 8" in admission
     assert "num_kv_heads == effective_kv_heads" in admission
     assert "routed_intermediate == 512 && shared_intermediate == 512" in admission
-    assert "num_cores() == 6 ? 576 : routed_intermediate" in admission
+    assert "num_cores() == 6 && routed_uint4 ? 4 : num_cores()" in admission
+    assert "routed_nc == 6 ? 576 : routed_intermediate" in admission
     assert "num_cores() == 6 ? 576 : shared_intermediate" in admission
     assert "tensor_parallel == num_cores()" in admission
     assert "routed_weight_mode == 5" in admission
-    assert "routed_uint4 && num_cores() == 8" in admission
+    assert "(routed_weight_mode == 5 || routed_uint4)" in admission
     assert re.search(
         r"\{num_experts, hidden_size \* physical_routed_intermediate\s*/\s*"
         r"\(routed_uint4 \? 2 : 1\)\}", install
@@ -230,6 +250,97 @@ def test_exact_install_binds_logical_and_physical_dimensions_to_cold_owner():
     )
 
 
+def test_real_fp8_scale_install_accepts_packer_stride_and_rejects_compact_tp6(tmp_path):
+    import torch
+    from rpu_backend.quant.fp8 import pack_grouped_scale
+
+    source = NATIVE.read_text(encoding="utf-8")
+    install = _scope(source, "void Qwen3_5MoeModel::set_weights(")
+    scales = install[install.index("const std::array<int64_t, 3> scale_"):]
+    row_layout = scales[:scales.index("for (size_t j")]
+    non_uint4 = _definition(scales, "} else {")
+    checks = non_uint4[non_uint4.index("{") + 1:-1]
+    tensor_checks = "\n".join(
+        _definition(install, marker) + ";"
+        for marker in ("const auto check_bytes =", "const auto check_shape =")
+    )
+    cases = []
+    for cores in (4, 6, 8):
+        width = 576 if cores == 6 else 512
+        packed = [pack_grouped_scale(torch.ones(256, n, dtype=torch.float16))
+                  for n in (width, width, 2048)]
+        tensors = ",".join(
+            f"at::Tensor{{{tensor.shape[0]},{tensor.shape[1]}}}"
+            for tensor in packed
+        )
+        cases.append("Case{" + str(width) + ", {{" + tensors + "}}}")
+    probe = r'''
+#include <array>
+#include <cassert>
+#include <cstdint>
+#include <limits>
+#include <stdexcept>
+#include <utility>
+#include <vector>
+namespace c10 { struct Half {uint16_t storage;}; }
+namespace at {
+using IntArrayRef = std::vector<int64_t>;
+struct Tensor {
+    int64_t rows, columns;
+    int64_t nbytes() const { return rows * columns * sizeof(c10::Half); }
+    IntArrayRef sizes() const { return {rows, columns}; }
+};
+}
+#define Align(x,a) (((x)+(a)-1)/(a)*(a))
+#define TORCH_CHECK(ok, ...) do { if (!(ok)) throw std::runtime_error(#ok); } while (false)
+__ALIGNED_BYTES__
+struct Case {int64_t width; std::array<at::Tensor,3> tensors;};
+void check(const Case& value) {
+    const int64_t num_experts=256, hidden_size=2048;
+    const int64_t physical_routed_intermediate=value.width, i=0;
+    const std::array<std::pair<const at::Tensor*,const char*>,3> routed_scales{{
+        {&value.tensors[0],"gate"}, {&value.tensors[1],"up"},
+        {&value.tensors[2],"down"}}};
+    __TENSOR_CHECKS__
+    __ROW_LAYOUT__
+    for (size_t j=0;j<routed_scales.size();++j) {
+        const auto& tensor=*routed_scales[j].first;
+        __CHECKS__
+    }
+}
+void rejects(const Case& value) {
+    bool rejected=false;
+    try {check(value);} catch(const std::runtime_error&) {rejected=true;}
+    assert(rejected);
+}
+int main() {
+    const std::vector<Case> cases{__CASES__};
+    for (const auto& value:cases) {
+        check(value);
+        for (size_t j=0;j<3;++j) {
+            auto extra=value; extra.tensors[j].columns+=128; rejects(extra);
+            auto short_row=value; short_row.tensors[j].columns-=128; rejects(short_row);
+            // Same total bytes must not bypass the per-expert row shape.
+            auto reshaped=value;
+            reshaped.tensors[j].rows/=2; reshaped.tensors[j].columns*=2;
+            rejects(reshaped);
+        }
+        if (value.width==576) {
+            for (size_t j=0;j<2;++j) {
+                auto old=value; old.tensors[j].columns=576; rejects(old);
+            }
+        }
+    }
+}
+'''.replace("__ALIGNED_BYTES__", _definition(source, "int64_t aligned_bytes("))
+    for marker, content in (("__TENSOR_CHECKS__", tensor_checks),
+                            ("__ROW_LAYOUT__", row_layout),
+                            ("__CHECKS__", checks),
+                            ("__CASES__", ",".join(cases))):
+        probe = probe.replace(marker, content)
+    _run_cpp(tmp_path, probe)
+
+
 def test_owner_sensitive_launches_bind_the_mixed_domains_explicitly():
     source = NATIVE.read_text(encoding="utf-8")
     scopes = {
@@ -238,6 +349,7 @@ def test_owner_sensitive_launches_bind_the_mixed_domains_explicitly():
         "gdn": _scope(source, "void Qwen3_5MoeModel::build_gdn("),
         "tail": _scope(source, "void Qwen3_5MoeModel::emit_mlp_and_output("),
         "router": _scope(source, "void Qwen3_5MoeModel::emit_router_and_shuffle("),
+        "router_topk": _scope(source, "void Qwen3_5MoeModel::emit_router_topk("),
         "shared": _scope(source, "void Qwen3_5MoeModel::emit_shared_expert("),
         "routed": _scope(source, "void Qwen3_5MoeModel::emit_routed_experts("),
         "merge": _scope(source, "void Qwen3_5MoeModel::emit_moe_merge_and_residual("),
@@ -277,11 +389,16 @@ def test_owner_sensitive_launches_bind_the_mixed_domains_explicitly():
     assert len(gdn_prepare) == 1
     assert gdn_prepare[0][-2:] == ["nc", "num_cores()"]
 
-    assert "const int router_nc = router_tp();" in scopes["router"]
+    assert "const int router_nc = router_tp();" in scopes["router_topk"]
+    assert "const int route_nc = routing_tp();" in scopes["router_topk"]
     assert "const int route_nc = routing_tp();" in scopes["router"]
-    assert "rpu_launch_spm_copy_ddr_dma(" in scopes["router"]
-    assert "rpu_launch_ddr_broadcast_spm_dma(" in scopes["router"]
-    assert 'addr(0, "moe_route_logits")' in scopes["router"]
+    assert _call_arguments(scopes["router"], "emit_router_topk") == [[
+        "layer_idx", "invocation", "t", "input_spm_addr",
+        'addr(0, "moe_route_expert_ids")',
+    ]]
+    assert "rpu_launch_spm_copy_ddr_dma(" in scopes["router_topk"]
+    assert "rpu_launch_ddr_broadcast_spm_dma(" in scopes["router_topk"]
+    assert 'addr(0, "moe_route_logits")' in scopes["router_topk"]
     assert "const int64_t si = physical_shared_intermediate();" in scopes["shared"]
     assert "const int nc = shared_expert_tp();" in scopes["shared"]
     assert "physical_routed_intermediate() / routed_expert_tp()" in scopes["routed"]

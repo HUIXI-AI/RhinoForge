@@ -1,4 +1,4 @@
-"""Public fixed-length configs must select the MLP-only asset and reject the old uniform W4 asset."""
+"""Public configs must select the MLP-only asset and reject the old uniform W4 asset."""
 from __future__ import annotations
 
 import importlib.util
@@ -27,7 +27,6 @@ def metadata(profile='w4_mlp_only'):
 
 
 def test_public_configs_select_mlp_only_asset_and_real_prefix(monkeypatch, tmp_path):
-    configs = [common.load_config(CONFIGS / f'w4a16_mlp_rtn_g32_p{p}_d4096.toml') for p in (64, 4096)]
     alias = 'qwen3_5-2b-w4-mlp-only-g32'
     spec = importlib.util.spec_from_file_location('registry_mlp_only', ROOT / 'python/rpu_backend/model_registry.py')
     registry = importlib.util.module_from_spec(spec)
@@ -40,22 +39,13 @@ def test_public_configs_select_mlp_only_asset_and_real_prefix(monkeypatch, tmp_p
     common.validate_checkpoint_profile(base, str(tmp_path))
     assert base['example']['registry_alias'] == alias
     assert base['input']['prompt'] and base['input']['decode_steps'] == 4
-    for prefill, config in zip((64, 4096), configs):
-        assert config['example']['registry_alias'] == alias
-        assert len(config['input']['prompt_token_ids']) == prefill
-        assert len(set(config['input']['prompt_token_ids'])) > 20
-        assert not ({248044, 248046} & set(config['input']['prompt_token_ids']))
-        assert 'prefill_fill_token_id' not in config['input']
-        assert config['run']['warmup'] == 2 and config['run']['runs'] == 5
-        assert config['input']['decode_steps'] == 4096 and config['input']['stop_on_eos'] is False
-        assert config['rpu_execution']['prefill']['linear_acc32'] is False
-        common.validate_checkpoint_profile(config, str(tmp_path))
-    assert configs[0]['input']['prompt_token_ids'] == configs[1]['input']['prompt_token_ids'][:64]
+    assert base['run']['warmup'] == 2 and base['run']['runs'] == 5
+    assert base['rpu_execution']['prefill']['linear_acc32'] is False
 
 
 @pytest.mark.parametrize('change', ['uniform', 'g128', 'first_layer_fp16', 'wrong_size', 'wrong_architecture', 'wrong_profile'])
 def test_mlp_only_profile_rejects_wrong_scope_before_weight_load(tmp_path, change):
-    config = common.load_config(CONFIGS / 'w4a16_mlp_rtn_g32_p64_d4096.toml')
+    config = common.load_config(CONFIGS / 'w4a16_mlp_rtn_g32.toml')
     value = metadata()
     quant = value['quant_config']
     if change == 'uniform':
@@ -84,22 +74,21 @@ def test_public_mixed_configs_bind_recipe_and_same_real_prefix(monkeypatch, tmp_
     assert registry.model_path(alias) == tmp_path / 'qwen3_5-2b-w4a16-g32-mlp-w8-attn-gdn'
     assert registry.model_path(alias) != registry.model_path('qwen3_5-2b-w4-mlp-only-g32')
     (tmp_path / 'config.json').write_text(json.dumps(metadata('w4_mlp_w8_attn_gdn')))
-    for suffix in ('', '_p64_d4096', '_p4096_d4096'):
-        config = common.load_config(CONFIGS / f'w4a16_mlp_rtn_g32_attn_gdn_w8a16{suffix}.toml')
-        baseline = common.load_config(CONFIGS / f'w4a16_mlp_rtn_g32{suffix}.toml')
-        common.validate_checkpoint_profile(config, str(tmp_path))
-        assert config['example']['registry_alias'] == alias
-        assert config['example']['dtype'] == 'w4a16'
-        assert config['example']['opt_in']['QWEN3_5_QUANT_ALLOW_UNCERTIFIED'] == '1'
-        assert config['input'] == baseline['input']
-        assert config['run']['warmup'] == 2 and config['run']['runs'] == 5
-        assert config['run']['timing_mode'] == 'per_call'
-        assert config['cpu']['threads'] == 4
-        assert config['rpu_execution']['model']['num_cores'] == 8
-        assert config['rpu_execution']['prefill']['linear_acc32'] is False
-        # The MLP-only entry must not silently accept this new mixed checkpoint.
-        with pytest.raises(common.ConfigError, match='MLP-only G32'):
-            common.validate_checkpoint_profile(baseline, str(tmp_path))
+    config = common.load_config(CONFIGS / 'w4a16_mlp_rtn_g32_attn_gdn_w8a16.toml')
+    baseline = common.load_config(CONFIGS / 'w4a16_mlp_rtn_g32.toml')
+    common.validate_checkpoint_profile(config, str(tmp_path))
+    assert config['example']['registry_alias'] == alias
+    assert config['example']['dtype'] == 'w4a16'
+    assert config['example']['opt_in'] == {}
+    assert config['input'] == baseline['input']
+    assert config['run']['warmup'] == 2 and config['run']['runs'] == 5
+    assert config['run']['timing_mode'] == 'per_call'
+    assert config['cpu']['threads'] == 4
+    assert config['rpu_execution']['model']['num_cores'] == 8
+    assert config['rpu_execution']['prefill']['linear_acc32'] is False
+    # The MLP-only entry must not silently accept this new mixed checkpoint.
+    with pytest.raises(common.ConfigError, match='MLP-only G32'):
+        common.validate_checkpoint_profile(baseline, str(tmp_path))
 
 
 @pytest.mark.parametrize('change', [
@@ -109,7 +98,7 @@ def test_public_mixed_configs_bind_recipe_and_same_real_prefix(monkeypatch, tmp_
     'wrong_storage', 'wrong_scale_dtype',
 ])
 def test_mixed_profile_rejects_wrong_scope_before_weight_load(tmp_path, change):
-    config = common.load_config(CONFIGS / 'w4a16_mlp_rtn_g32_attn_gdn_w8a16_p64_d4096.toml')
+    config = common.load_config(CONFIGS / 'w4a16_mlp_rtn_g32_attn_gdn_w8a16.toml')
     value = metadata('w4_mlp_w8_attn_gdn')
     quant = value['quant_config']
     if change == 'mlp_only':
@@ -119,28 +108,30 @@ def test_mixed_profile_rejects_wrong_scope_before_weight_load(tmp_path, change):
     elif change == 'uniform_w8':
         quant['projection_overrides'] = {}
     elif change == 'g128':
-        quant['projection_overrides']['mlp.down_proj']['group_size'] = 128
+        quant['projection_overrides']['mlp.gate_proj']['group_size'] = 128
     elif change == 'first_layer_fp16':
         quant['layer_overrides'] = {'0': {'default': {'method': 'fp16'}}}
-    elif change in ('gdn_a_fp16', 'gdn_b_fp16', 'full_attn_fp16'):
-        role = {'gdn_a_fp16': 'linear_attn.in_proj_a',
-                'gdn_b_fp16': 'linear_attn.in_proj_b',
-                'full_attn_fp16': 'self_attn.q_proj'}[change]
-        quant['projection_overrides'][role] = {'method': 'fp16'}
+    elif change == 'gdn_a_fp16':
+        quant['projection_overrides']['linear_attn.in_proj_a'] = {'method': 'fp16'}
+    elif change == 'gdn_b_fp16':
+        quant['projection_overrides']['linear_attn.in_proj_b'] = {'method': 'fp16'}
+    elif change == 'full_attn_fp16':
+        quant['projection_overrides']['self_attn.q_proj'] = {'method': 'fp16'}
     elif change == 'wrong_size':
         value['text_config']['hidden_size'] = 2560
     elif change == 'wrong_schedule':
-        value['text_config']['layer_types'][0] = 'full_attention'
+        value['text_config']['layer_types'][3] = 'linear_attention'
     elif change == 'wrong_architecture':
         value['architectures'] = ['Qwen3ForCausalLM']
-    elif change == 'nested_conflict':
-        value['text_config']['quant_config'] = metadata()['quant_config']
-    elif change == 'wrong_storage':
-        quant['storage'] = 'uint8'
-    elif change == 'wrong_scale_dtype':
-        quant['scale_dtype'] = 'bfloat16'
-    else:
+    elif change == 'wrong_profile':
         quant['profile'] = 'w4_mlp_only'
+    elif change == 'nested_conflict':
+        value['text_config']['quant_config'] = dict(quant)
+    elif change == 'wrong_storage':
+        quant['projection_overrides']['linear_attn.in_proj_qkv'] = {
+            'method': 'w8a16', 'storage_dtype': 'uint8'}
+    else:
+        quant['default']['scale_dtype'] = 'float32'
     (tmp_path / 'config.json').write_text(json.dumps(value))
     with pytest.raises(common.ConfigError, match=r'MLP W4/G32 \+ Attention/GDN W8'):
         common.validate_checkpoint_profile(config, str(tmp_path))

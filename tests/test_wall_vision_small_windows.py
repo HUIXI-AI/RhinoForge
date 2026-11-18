@@ -75,18 +75,25 @@ def test_small_window_reorder_matches_real_transformers_layout(cameras):
         pytest.skip("transformers is needed for the actual HF layout comparison")
     source = Path(spec.origin).parent / "models/qwen2_5_vl/modeling_qwen2_5_vl.py"
     tree = ast.parse(source.read_text())
-    method = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
-                  and node.name == "get_window_index")
-    namespace = {"torch": torch, "F": F}
-    exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"), namespace)
-    owner = SimpleNamespace(window_size=112, spatial_merge_size=2, patch_size=14,
-                            spatial_merge_unit=4)
+    method = next((node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+                   and node.name == "get_window_index"), None)
     grid = torch.tensor([[1, 16, 16]] * cameras)
-    hf_window, hf_cu = namespace["get_window_index"](owner, grid)
+    if method is None:
+        from transformers.vision_utils import get_vision_window_index
+
+        hf_window, hf_cu = get_vision_window_index(
+            grid, window_size=112, spatial_merge_size=2, patch_size=14,
+        )
+    else:
+        namespace = {"torch": torch, "F": F}
+        exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"), namespace)
+        owner = SimpleNamespace(window_size=112, spatial_merge_size=2, patch_size=14,
+                                spatial_merge_unit=4)
+        hf_window, hf_cu = namespace["get_window_index"](owner, grid)
     window, reverse, mask, cu = _helpers()["_pack_multi_image"](grid, 112, 2, 14)
     assert torch.equal(window, hf_window)
     assert cu.tolist() == [0, 64, 128, 192, 256]
-    assert torch.unique_consecutive(torch.tensor(hf_cu)).tolist() == list(range(0, 256 * cameras + 1, 64))
+    assert torch.unique_consecutive(torch.as_tensor(hf_cu)).tolist() == list(range(0, 256 * cameras + 1, 64))
     assert torch.equal(window.sort().values, torch.arange(64 * cameras))
     for image in range(cameras):
         assert torch.equal(window[image * 64:(image + 1) * 64][reverse[image]],

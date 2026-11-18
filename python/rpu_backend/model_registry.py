@@ -23,8 +23,12 @@ MODELS: Dict[str, str] = {
     # Qwen3.5 hybrid-attention text profiles.
     "qwen3_5-0.8b": "qwen3_5-0.8b",
     "qwen3_5-27b": "Qwen3.5-27B",
-    "qwen3_5-27b-w8a16": 'qwen3_5_quant_ckpts/qwen3_5-27b-w8a16',
-    "qwen3_5-27b-w4a16": 'qwen3_5_quant_ckpts/qwen3_5-27b-w4a16',
+    "qwen3_5-27b-fp16": "Qwen3.5-27B-FP16",
+    "qwen3_5-27b-w8a16": "qwen3_5_quant_ckpts/qwen3_5-27b-w8a16",
+    "qwen3_5-27b-w4a16": "qwen3_5_quant_ckpts/qwen3_5-27b-w4a16",
+    "qwen3_5-27b-w4-mlp-only-g32": "qwen3_5_quant_ckpts/qwen3_5-27b-w4a16-g32-mlp-only",
+    "qwen3_5-27b-w4-mlp-w8-attn-gdn-g32": "qwen3_5_quant_ckpts/qwen3_5-27b-w4a16-g32-mlp-w8-attn-gdn",
+    "qwen3_5-27b-activation-awq-g128": "qwen3_5_quant_ckpts/qwen3_5-27b-activation-awq-g128",
     "qwen3_5-2b": "Qwen3.5-2B",      # symmetric GDN 16/16
     "qwen3_5-4b": "Qwen3.5-4B",      # GQA-GDN 16/32 (key-replicated)
     "qwen3_5-9b": "Qwen3.5-9B",      # GQA-GDN 16/32 + untied lm_head
@@ -36,8 +40,6 @@ MODELS: Dict[str, str] = {
     "qwen3_5-35b-a3b-rtn-w4a16": "Qwen3.5-35B-A3B-RTN-W4A16-G128",
     # Official routed-only GPTQ G128, with the same explicit-path override.
     "qwen3_5-35b-a3b-gptq-w4a16": "Qwen3.5-35B-A3B-GPTQ-Int4",
-    # Exact legacy W8 checkpoint using the Qwen3.5 text adapter; controlled only.
-    "qwen3_8-27b-w8a16": "Qwen3.8-27B-w8a16",
     # Galaxea G0.5 VLA (Qwen3.5-2B VLM + action expert).
     "g05-base": "G05/g05-base",
     # Pi0.5 VLA (LeRobot)
@@ -48,6 +50,10 @@ MODELS: Dict[str, str] = {
     "pi05-libero-finetuned-w8a16-vlm-expert": "pi05_libero_finetuned-w8a16-vlm-expert",
     # Per-channel INT4 projections with KV8; the legacy alias is retained.
     "pi05-libero-finetuned-w4real-kvint8": "pi05_libero_finetuned-w4real-kvint8",
+    # Action horizon 10: lerobot/pi05_libero_base (openpi pi05_libero, trained
+    # with action_horizon=10) with config.json chunk_size/n_action_steps = 10.
+    "pi05-libero-h10": "pi05_libero_h10",
+    "pi05-libero-h10-w8a16-vlm-expert": "pi05_libero_h10-w8a16-vlm-expert",
     # Wall-OSS-0.5 VLA (Qwen2.5-VL-3B)
     "wall-oss-0.5": "wall-oss-0.5",
     "wall-oss-0.5-w8a16": "wall-oss-0.5-w8a16",
@@ -117,13 +123,19 @@ MODELS: Dict[str, str] = {
     "qwen3_5-4b-w8a16": "qwen3_5_quant_ckpts/qwen3_5-4b-w8a16",
     "qwen3_5-9b-w4a16": "qwen3_5_quant_ckpts/qwen3_5-9b-w4a16",
     "qwen3_5-9b-w8a16": "qwen3_5_quant_ckpts/qwen3_5-9b-w8a16",
-    "qwen3_8-27b-w8a16": "Qwen3.8-27B-w8a16",
     "rhinovla-controlled": "rhinovla-controlled",
     # Gemma 4 E4B source-only adapter. Registry resolution is not a support
     # claim; the first release does not provide a compatible runnable profile.
     "gemma4-e4b": "gemma-4-e4b-it",
     'gr00t-n1d7-3b': 'GR00T-N1.7-3B',
     'internvla-n1-controlled': 'internvla_n1-controlled',
+}
+
+# Historical aliases are kept outside the active registry so archive tooling can
+# resolve an explicitly requested rollback bundle without exposing it as a
+# current model choice.
+ARCHIVED_MODELS: Dict[str, str] = {
+    "qwen3_8-27b-w8a16": "Qwen3.8-27B-w8a16",
 }
 
 
@@ -134,6 +146,14 @@ def cache_root() -> Path:
     """
     override = os.environ.get("RPU_MODEL_CACHE")
     return Path(override) if override else DEFAULT_CACHE_ROOT
+
+
+def archived_model_path(name: str) -> Path:
+    """Resolve a historical model alias for explicit archive workflows."""
+    if name not in ARCHIVED_MODELS:
+        known = ", ".join(sorted(ARCHIVED_MODELS))
+        raise KeyError(f"Unknown archived model {name!r}. Known: {known}")
+    return cache_root() / ARCHIVED_MODELS[name]
 
 
 def model_path(name: str) -> Path:

@@ -244,6 +244,7 @@ _CAUSAL_DECODER_INSTALL_ATTRS = (
     "_rpu_decoder_hidden_size",
     "_rpu_decoder_deepstack_hash",
     "_rpu_decoder_topology",
+    "_rpu_audio_component",
     "_rpu_decode_stage_descriptor",
     "_decoder_decode_plan",
     "_rpu_decoder_handle",
@@ -660,16 +661,7 @@ def plan_bounded_prefill_execution(
     else:
         if execution_native is None:
             raise ValueError("cached production planning requires its actual native owner")
-        if graph_cache is not None and (cost_observer is not None or calibration is not None):
-            if graph_cache.is_frozen():
-                raise RuntimeError("cost observation/calibration requires graph warmup, not READY execution")
-        if cost_observer is not None or calibration is not None:
-            # Collection must query the current native oracle, even when the
-            # same descriptor already has a prepared production Graph.
-            result = prepare()
-        else:
-            from rpu_backend.api._execution import prepared_execution_plan_cache
-
+        def prepared_key():
             prefix, handle = execution_native
             identity_op = getattr(torch.ops.rpu, f"{prefix}_planner_cache_identity", None)
             if identity_op is None:
@@ -677,7 +669,7 @@ def plan_bounded_prefill_execution(
             native_identity = tuple(identity_op(handle))
             if not native_identity:
                 raise RuntimeError("native planner cache identity must not be empty")
-            key = (
+            return (
                 execution_native, native_identity, execution_component, execution_stage,
                 real_len, physical_limit, padding_budget, position, alignment,
                 padding_rows, exact_chunk_size, max_stage_chunk_size,
@@ -690,6 +682,33 @@ def plan_bounded_prefill_execution(
                     cost_scope.profile_identity, cost_scope.dependency_identity,
                     cost_scope.runtime_identity),
             )
+
+        if graph_cache is not None and cost_observer is not None and graph_cache.is_frozen():
+            raise RuntimeError("cost observation requires graph warmup, not READY execution")
+        if cost_observer is not None or calibration is not None:
+            # Collection must query the current native oracle, even when the
+            # same descriptor already has a prepared production Graph.
+            if cost_observer is None and graph_cache is not None:
+                # WARMING binds the queried calibration plan to the Graph it
+                # builds; READY replays that plan lookup-only and never
+                # queries the oracle. A miss fails closed.
+                key = prepared_key() + ((
+                    "calibration", calibration.scope.profile_identity,
+                    calibration.scope.dependency_identity, calibration.scope.runtime_identity,
+                    calibration.domain_digest, calibration.candidate_digest,
+                    calibration.native_route, calibration.domain_scoped),)
+                if graph_cache.is_frozen():
+                    result = graph_cache.prepare_plan(key, prepare)
+                else:
+                    result = prepare()
+                    graph_cache.prepare_plan(key, lambda: result)
+            else:
+                result = prepare()
+        else:
+            from rpu_backend.api._execution import prepared_execution_plan_cache
+
+            prefix, _handle = execution_native
+            key = prepared_key()
             if graph_cache is not None:
                 result = graph_cache.prepare_plan(key, prepare)
             else:
@@ -1665,17 +1684,32 @@ def _validate_decoder_w8_scale_lists(model, scale_lists):
                 raise ValueError(f"reduced-core W8A16 layer {index} {role} requires its actual INT8 weight / FP16 per-channel scale")
 
 
-def _validate_decoder_w4_scale_lists(model, scale_lists, topology):
-    """Check the exact dense/G32/TP8 packed install before native creation."""
-    from rpu_backend.quant.qwen3_profiles import qwen3_dense_quant_profile
+def _validate_decoder_w4_scale_lists(model, scale_lists, topology, *, audio_component=None):
+    """Check the exact dense G32 layout before native creation."""
+    from rpu_backend.quant.qwen3_profiles import qwen3_dense_quant_profile, qwen3_w4_topology
+    from rpu_backend.quant.int4_pgrp_pack import w4_storage_shape
 
-    profile = qwen3_dense_quant_profile(model.config)
-    if topology.num_cores != 8 or len(model.layers) != profile.num_layers:
-        raise ValueError("packed Qwen3 topology requires the exact dense/G32/TP8 recipe")
+    if audio_component == "asr":
+        from rpu_backend.api._qwen3_audio_precision import asr_decoder_profile
+        profile = asr_decoder_profile(model.config)
+        expected_topology = resolve_decoder_topology(num_cores=topology.num_cores, **profile.geometry())
+    elif audio_component is None and getattr(model.config, "model_type", None) == "qwen3_vl_text":
+        from rpu_backend.api._execution import qwen3_vl_text_core_profile, qwen3_vl_text_topology
+        profile = qwen3_vl_text_core_profile(model.config, topology.num_cores)
+        expected_topology = qwen3_vl_text_topology(model.config, topology.num_cores, packed_w4=True)
+    elif audio_component is None:
+        profile = qwen3_dense_quant_profile(model.config)
+        expected_topology = qwen3_w4_topology(model.config, topology.num_cores)
+    else:
+        raise ValueError("unknown speech decoder component")
+    if topology != expected_topology or len(model.layers) != profile.num_layers:
+        raise ValueError("packed Qwen3 topology requires the exact dense G32 recipe")
     if (scale_lists is None or len(scale_lists) != 7
             or any(len(scales) != len(model.layers) for scales in scale_lists)):
         raise ValueError("packed Qwen3 requires seven complete G32 scale lists")
-    h, i = profile.hidden_size, profile.intermediate_size
+    # Config stays logical; a six-lane packed MLP carries its zero-padded width.
+    h = profile.hidden_size
+    i = decoder_mlp_intermediate_size(profile.intermediate_size, topology.mlp_tp)
     q, kv = profile.num_q_heads * profile.head_dim, profile.num_kv_heads * profile.head_dim
     roles = (("self_attn.q_proj", q, h, 1),
              ("self_attn.k_proj", kv, h, 1),
@@ -1685,13 +1719,15 @@ def _validate_decoder_w4_scale_lists(model, scale_lists, topology):
              ("mlp.up_proj", i, h, 1),
              ("mlp.down_proj", h, i, 0))
     for (role, n, k, partition), scales in zip(roles, scale_lists, strict=True):
-        local_g, local_n = (k // 32, n // 8) if partition else (k // 32 // 8, n)
-        physical_scales = 8 * ((local_g + 3) // 4 * 4) * ((local_n + 63) // 64 * 64)
+        cores = topology.mlp_tp if role.startswith("mlp.") else topology.attn_tp
+        local_g, local_n = (k // 32, n // cores) if partition else (k // 32 // cores, n)
+        physical_scales = cores * ((local_g + 3) // 4 * 4) * ((local_n + 63) // 64 * 64)
         for index, (layer, scale) in enumerate(zip(model.layers, scales, strict=True)):
             projection = layer.get_submodule(role)
             weight = projection.weight
             if ((projection.out_features, projection.in_features) != (n, k)
-                    or weight.dtype != torch.uint8 or tuple(weight.shape) != (n, k // 2)
+                    or weight.dtype != torch.uint8
+                    or tuple(weight.shape) != w4_storage_shape(n, k, partition, cores)
                     or not weight.is_contiguous()
                     or not isinstance(scale, torch.Tensor)
                     or scale is not getattr(projection, "weight_scale", None)
@@ -1699,6 +1735,39 @@ def _validate_decoder_w4_scale_lists(model, scale_lists, topology):
                     or scale.device != weight.device
                     or tuple(scale.shape) != (32, physical_scales // 32)):
                 raise ValueError(f"packed Qwen3 layer {index} {role} requires its actual UINT8/G32 payload")
+
+
+def _validate_asr_nvfp4_payload(model, scale_lists, tensor_scales, topology):
+    from rpu_backend.api._qwen3_audio_precision import asr_decoder_profile
+
+    profile = asr_decoder_profile(model.config)
+    if (topology != resolve_decoder_topology(num_cores=topology.num_cores, **profile.geometry())
+            or len(model.layers) != profile.num_layers
+            or scale_lists is None or len(scale_lists) != 7
+            or len(tensor_scales) != 7):
+        raise ValueError("ASR NVFP4 requires seven complete component scale families")
+    h, i = profile.hidden_size, profile.intermediate_size
+    roles = (("self_attn.q_proj", 2048, h), ("self_attn.k_proj", 1024, h),
+             ("self_attn.v_proj", 1024, h), ("self_attn.o_proj", h, 2048),
+             ("mlp.gate_proj", i, h), ("mlp.up_proj", i, h), ("mlp.down_proj", h, i))
+    for (role, n, k), scales, tensor_scale in zip(roles, scale_lists, tensor_scales, strict=True):
+        if len(scales) != profile.num_layers:
+            raise ValueError("ASR NVFP4 requires one block scale per decoder layer")
+        for layer, scale in zip(model.layers, scales, strict=True):
+            projection = layer.get_submodule(role)
+            weight = projection.weight
+            if ((projection.out_features, projection.in_features) != (n, k)
+                    or weight.dtype != torch.uint8 or tuple(weight.shape) != (n, k // 2)
+                    or not weight.is_contiguous()
+                    or not isinstance(scale, torch.Tensor)
+                    or scale is not getattr(projection, "weight_scale", None)
+                    or scale.dtype != torch.uint8 or tuple(scale.shape) != (k // 16, n)
+                    or scale.device != weight.device or not scale.is_contiguous()):
+                raise ValueError(f"ASR NVFP4 {role} requires its actual packed weight and FP8 scales")
+        if (not isinstance(tensor_scale, torch.Tensor) or tensor_scale.dtype != torch.float32
+                or tuple(tensor_scale.shape) != (32,) or not tensor_scale.is_contiguous()
+                or tensor_scale.device != weight.device):
+            raise ValueError("ASR NVFP4 requires a padded FP32 tensor-scale owner per projection")
 
 
 def _validate_mrope_decoder_topology(
@@ -1711,19 +1780,22 @@ def _validate_mrope_decoder_topology(
     if topology is None or topology.num_cores == 8:
         return
     from numbers import Integral
-    from rpu_backend.api._execution import qwen3_vl_text_core_profile
+    from rpu_backend.api._execution import qwen3_vl_text_core_profile, qwen3_vl_text_topology
 
     if arch != "qwen3_vl_text":
         raise ValueError("reduced-core M-RoPE requires the exact Qwen3-VL text profile")
     profile = qwen3_vl_text_core_profile(config, topology.num_cores)
     bound_profile = qwen3_vl_text_core_profile(model.config, topology.num_cores)
-    w8a16 = scale_lists is not None
-    if (profile != bound_profile or len(model.layers) != profile.num_layers
-            or (w8a16 and profile.hidden_size != 2048)):
-        raise ValueError("reduced-core M-RoPE requires exact FP16 text or 2B per-channel W8A16 layers")
+    packed_w4 = (bool(model.layers)
+                 and model.layers[0].self_attn.q_proj.weight.dtype == torch.uint8)
+    w8a16 = scale_lists is not None and not packed_w4
+    if profile != bound_profile or len(model.layers) != profile.num_layers:
+        raise ValueError("reduced-core M-RoPE requires all layers of its exact dense profile")
+    if packed_w4:
+        _validate_decoder_w4_scale_lists(model, scale_lists, topology)
     if w8a16:
         _validate_decoder_w8_scale_lists(model, scale_lists)
-    if resolve_decoder_topology(num_cores=topology.num_cores, **profile.geometry()) != topology:
+    if qwen3_vl_text_topology(config, topology.num_cores, packed_w4=packed_w4) != topology:
         raise ValueError("decoder geometry differs from the bound cold topology")
     validate_qwen3_vl_text_semantics(model)
     for value, expected, label in (
@@ -1744,7 +1816,7 @@ def _validate_mrope_decoder_topology(
         "gate_proj": (intermediate, hidden), "up_proj": (intermediate, hidden),
         "down_proj": (hidden, intermediate),
     }
-    projection_dtype = torch.int8 if w8a16 else torch.float16
+    projection_dtype = torch.uint8 if packed_w4 else torch.int8 if w8a16 else torch.float16
     for index, layer in enumerate(model.layers):
         for owner, names in (
             (layer.self_attn, ("q_proj", "k_proj", "v_proj", "o_proj")),
@@ -1752,8 +1824,16 @@ def _validate_mrope_decoder_topology(
         ):
             for name in names:
                 projection = getattr(owner, name)
+                n, k = shapes[name]
+                if packed_w4:
+                    from rpu_backend.quant.int4_pgrp_pack import w4_storage_shape
+                    cores = topology.mlp_tp if name in ("gate_proj", "up_proj", "down_proj") else topology.attn_tp
+                    partition = int(name not in ("o_proj", "down_proj"))
+                    storage_shape = w4_storage_shape(n, k, partition, cores)
+                else:
+                    storage_shape = (n, k)
                 if (projection.weight.dtype != projection_dtype
-                        or tuple(projection.weight.shape) != shapes[name]
+                        or tuple(projection.weight.shape) != storage_shape
                         or (projection.out_features, projection.in_features) != shapes[name]
                         or getattr(projection, "bias", None) is not None):
                     raise ValueError(f"reduced-core Qwen3-VL layer {index} {name} requires exact {projection_dtype} weights")
@@ -1780,6 +1860,7 @@ def install_mrope_text_decoder_for_rpu(
     scale_lists=None,
     execution_config=None,
     topology=None,
+    logical_vocab_size=None,
     _kv_cache_layer_bank_size=1,
     _graph_cache_max_entries=None,
     folded_rmsnorm=False,
@@ -1932,6 +2013,8 @@ def install_mrope_text_decoder_for_rpu(
             chunk_envelope_for=chunk_envelope_for,
             execution_config=execution_config,
             topology=topology,
+            **({"logical_vocab_size": logical_vocab_size}
+               if logical_vocab_size is not None else {}),
             folded_rmsnorm=folded_rmsnorm,
             prefill_kv_only=prefill_kv_only,
             prefill_kv_pair=prefill_kv_pair,
@@ -2030,11 +2113,14 @@ def _install_causal_decoder_forward(
     chunk_envelope_for,
     execution_config=None,
     topology=None,
+    logical_vocab_size=None,
     _graph_cache_max_entries=None,
     folded_rmsnorm=False,
     prefill_kv_only=False,
     prefill_kv_pair=False,
     prefill_qk_norm_rope=False,
+    _audio_component=None,
+    nvfp4_tensor_scales=None,
 ) -> int:
     """Generic CausalLM all-layers-once installer (D-06: single shared body for Qwen3 + Llama).
 
@@ -2079,6 +2165,13 @@ def _install_causal_decoder_forward(
         type(_graph_cache_max_entries) is not int or _graph_cache_max_entries < 1
     ):
         raise ValueError("_graph_cache_max_entries must be a positive integer or None")
+    # Packed vocabulary rows include per-TP N32 padding. The head owner must
+    # bind the logical extent before native weights and descriptors are built.
+    if logical_vocab_size is not None and (
+        type(logical_vocab_size) is not int or logical_vocab_size <= 0
+        or logical_vocab_size != getattr(model.config, "vocab_size", None)
+    ):
+        raise ValueError("logical_vocab_size must match the positive configured vocabulary")
     # R-Phase 1 (Qwen3-VL GAP-A1): 'qwen3_vl_text' is the M-RoPE-enabled variant.
     if arch not in ("qwen3", "llama", "qwen3_vl_text"):
         raise ValueError(
@@ -2102,10 +2195,20 @@ def _install_causal_decoder_forward(
     if execution_config is None and arch != "qwen3_vl_text":
         execution_config = getattr(model, "_rpu_execution", None)
     execution_config = dict(execution_config or {})
+    if nvfp4_tensor_scales is not None and _audio_component != "asr":
+        raise ValueError("explicit NVFP4 installer payload is restricted to the reviewed ASR component")
+    if _audio_component is not None:
+        from rpu_backend.api._qwen3_audio_precision import asr_decoder_profile
+        if (_audio_component != "asr" or arch != "qwen3" or topology is None
+                or len(model.layers) != 28):
+            raise ValueError("ASR decoder requires its exact speech component")
+        profile = asr_decoder_profile(model.config)
+        if topology != resolve_decoder_topology(num_cores=topology.num_cores, **profile.geometry()):
+            raise ValueError("ASR decoder topology differs from its component geometry")
     if execution_core_count(execution_config) != (topology.num_cores if topology else 8):
         raise ValueError("decoder install requires the resolved cold model topology")
-    if topology is not None and arch not in ("qwen3", "qwen3_vl_text"):
-        raise ValueError("reduced-core decoder topology is admitted only by Qwen3 and Qwen3-VL")
+    if topology is not None and arch not in ("qwen3", "qwen3_vl_text", "llama"):
+        raise ValueError("reduced-core decoder topology is admitted only by Qwen3, Qwen3-VL and Llama")
     if topology is not None and topology.num_cores != 8:
         if arch == "qwen3_vl_text":
             _validate_mrope_decoder_topology(
@@ -2113,10 +2216,25 @@ def _install_causal_decoder_forward(
                 topology=topology, mrope_section=mrope_section,
                 deepstack_lang_layers=deepstack_lang_layers, scale_lists=scale_lists,
             )
+        elif arch == "llama":
+            # Exact FP16 Llama-3.2-1B: no scales and no Q/K norm tensors.
+            from rpu_backend.api._execution import llama_core_profile
+            profile = llama_core_profile(model.config, topology.num_cores)
+            if (len(model.layers) != profile.num_layers or scale_lists is not None
+                    or qk_norm_lists is not None):
+                raise ValueError(f"reduced-core Llama install requires all {profile.num_layers} FP16 layers without Q/K norms")
+            if resolve_decoder_topology(num_cores=topology.num_cores,
+                                        **profile.geometry()) != topology:
+                raise ValueError("decoder geometry differs from the bound cold topology")
+        elif _audio_component == "asr":
+            # Speech precision payloads are validated below before native creation.
+            pass
+        elif (model.layers and getattr(model.layers[0].self_attn.q_proj.weight, "dtype", None) == torch.uint8):
+            _validate_decoder_w4_scale_lists(model, scale_lists, topology)
         else:
-            from rpu_backend.api._execution import qwen3_core_profile, is_qwen3_17b_w8a16_core_config
+            from rpu_backend.api._execution import qwen3_core_profile, is_qwen3_w8a16_core_config
             profile = qwen3_core_profile(model.config, topology.num_cores)
-            w8a16 = is_qwen3_17b_w8a16_core_config(model.config)
+            w8a16 = is_qwen3_w8a16_core_config(model.config)
             if len(model.layers) != profile.num_layers or (scale_lists is not None) != w8a16:
                 raise ValueError(f"reduced-core decoder install requires all {profile.num_layers} admitted FP16 or W8A16 layers")
             if w8a16:
@@ -2227,20 +2345,49 @@ def _install_causal_decoder_forward(
     intermediate_size = model.layers[0].mlp.gate_proj.out_features
     eps = model.layers[0].input_layernorm.variance_epsilon
     if topology is not None:
-        if arch == "qwen3" and any(getattr(weight, "dtype", None) == torch.uint8
+        if nvfp4_tensor_scales is not None:
+            _validate_asr_nvfp4_payload(model, scale_lists, nvfp4_tensor_scales, topology)
+        elif arch == "qwen3" and any(getattr(weight, "dtype", None) == torch.uint8
                 for group in (q_w_list, k_w_list, v_w_list, o_w_list, gate_list, up_list, down_list)
                 for weight in group):
-            _validate_decoder_w4_scale_lists(model, scale_lists, topology)
+            _validate_decoder_w4_scale_lists(model, scale_lists, topology,
+                                             audio_component=_audio_component)
+        elif _audio_component == "asr" and scale_lists is not None:
+            _validate_decoder_w8_scale_lists(model, scale_lists)
+        elif _audio_component == "asr":
+            for layer in model.layers:
+                for role in ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+                             "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"):
+                    projection = layer.get_submodule(role)
+                    if (projection.weight.dtype != torch.float16
+                            or tuple(projection.weight.shape) != (projection.out_features, projection.in_features)
+                            or not projection.weight.is_contiguous()
+                            or getattr(projection, "weight_scale", None) is not None):
+                        raise ValueError("ASR decoder without scales requires complete FP16 projections")
         # Model config remains logical after one-time CPU weight padding.
         # Native admission takes logical geometry, while weight/SPM execution
-        # uses the physical width selected by the same cold template.
+        # uses the physical width selected by the same cold template. Packed
+        # signed W4 (not NVFP4) mirrors the native 192-aligned six-lane width.
         intermediate_size = model.config.intermediate_size
+        packed_w4 = (nvfp4_tensor_scales is None
+                     and getattr(q_w_list[0], "dtype", None) == torch.uint8)
         physical_intermediate = decoder_mlp_intermediate_size(intermediate_size, topology.mlp_tp)
-        actual = resolve_decoder_topology(
-            num_cores=topology.num_cores, hidden_size=hidden_size,
-            intermediate_size=intermediate_size, num_q_heads=num_q_heads,
-            num_kv_heads=num_kv_heads, head_dim=head_dim,
-            vocab_size=model.config.vocab_size)
+        if arch == "qwen3_vl_text":
+            from rpu_backend.api._execution import qwen3_vl_text_topology
+            actual = qwen3_vl_text_topology(
+                model.config, topology.num_cores, packed_w4=q_w_list[0].dtype == torch.uint8)
+        elif (arch == "qwen3" and _audio_component is None
+                and getattr(q_w_list[0], "dtype", None) == torch.uint8):
+            # The packed validator above binds every projection to config,
+            # including the zero-padded six-lane physical MLP width.
+            from rpu_backend.quant.qwen3_profiles import qwen3_w4_topology
+            actual = qwen3_w4_topology(model.config, topology.num_cores)
+        else:
+            actual = resolve_decoder_topology(
+                num_cores=topology.num_cores, hidden_size=hidden_size,
+                intermediate_size=intermediate_size, num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads, head_dim=head_dim,
+                vocab_size=model.config.vocab_size)
         if actual != topology:
             raise ValueError("decoder layer geometry does not match the bound topology")
         for index, layer in enumerate(model.layers):
@@ -2249,9 +2396,18 @@ def _install_causal_decoder_forward(
                                     ("up_proj", (physical_intermediate, hidden_size)),
                                     ("down_proj", (hidden_size, physical_intermediate))):
                     projection = getattr(layer.mlp, name)
+                    if packed_w4:
+                        from rpu_backend.quant.int4_pgrp_pack import w4_storage_shape
+                        storage = w4_storage_shape(
+                            *shape, int(name != "down_proj"), topology.mlp_tp)
+                    else:
+                        storage = shape
                     if ((projection.out_features, projection.in_features) != shape
-                            or tuple(projection.weight.shape) != shape
-                            or projection.weight.dtype != torch.float16):
+                            or tuple(projection.weight.shape) != storage
+                            or projection.weight.dtype != (
+                                torch.uint8 if packed_w4 else
+                                torch.int8 if scale_lists is not None and
+                                q_w_list[0].dtype == torch.int8 else torch.float16)):
                         raise ValueError(f"decoder layer {index} {name} physical MLP shape differs from cold padding")
             for container, names, cores in (
                 (layer.self_attn, ("q_proj", "k_proj", "v_proj", "o_proj"), topology.attn_tp),
@@ -2330,7 +2486,8 @@ def _install_causal_decoder_forward(
         q_ws, k_ws, v_ws, o_ws, gate_ws, up_ws, down_ws = scale_lists
     else:
         q_ws, k_ws, v_ws, o_ws, gate_ws, up_ws, down_ws = [], [], [], [], [], [], []
-    set_weights_op = (
+    set_weights_op = (torch.ops.rpu.causal_decoder_set_weights_nvfp4
+        if nvfp4_tensor_scales is not None else
         torch.ops.rpu.causal_decoder_set_weights_w8a16
         if has_w8a16_scales
         else torch.ops.rpu.causal_decoder_set_weights
@@ -2352,6 +2509,8 @@ def _install_causal_decoder_forward(
         set_weights_args.extend([
             q_ws, k_ws, v_ws, o_ws, gate_ws, up_ws, down_ws,
         ])
+    if nvfp4_tensor_scales is not None:
+        set_weights_args.extend(nvfp4_tensor_scales)
 
     # Own a GraphCache for the patched Qwen3 / Llama / Qwen3-VL text-only
     # forward. Capture groups the decoder dispatches into a reusable batch
@@ -2368,7 +2527,7 @@ def _install_causal_decoder_forward(
         topology, max_entries=_graph_cache_max_entries)
     decoder_batch_decode_enabled = (
         arch == "qwen3" and (topology is None or topology.num_cores == 8)
-        and not any(weight.dtype == torch.uint8 for weight in q_w_list)
+        and not any(getattr(weight, "dtype", None) == torch.uint8 for weight in q_w_list)
         and not (num_layers == 64 and hidden_size == 5120))
     decoder_num_layers = int(num_layers)
     decoder_hidden_size = int(hidden_size)
@@ -2587,7 +2746,8 @@ def _install_causal_decoder_forward(
         rpu_env_bool("RPU_QWEN3_SPM_KV_BY_MHA", default=True),
         rpu_env_bool("RPU_ADARMS_FUSED_BCAST"),
         **({"num_cores": topology.num_cores, "vocab_size": model.config.vocab_size}
-           if topology is not None else {}),
+           if topology is not None else
+           {"vocab_size": logical_vocab_size} if logical_vocab_size is not None else {}),
     )
     resource = _InstalledNativeResource(
         model, handle, torch.ops.rpu.causal_decoder_destroy,
@@ -2637,7 +2797,9 @@ def _install_causal_decoder_forward(
         model._rpu_prefill_kv_only = (
             types.MethodType(rpu_decoder_prefill_kv_only, model)
             if prefill_kv_only else None)
-        model._rpu_batch_decode_enabled = decoder_batch_decode_enabled
+        model._rpu_batch_decode_enabled = decoder_batch_decode_enabled and _audio_component is None
+        if _audio_component is not None:
+            model._rpu_audio_component = _audio_component
         model._rpu_decoder_graph_cache = decoder_graph_cache
         model._rpu_decoder_num_layers = decoder_num_layers
         model._rpu_decoder_hidden_size = decoder_hidden_size

@@ -88,6 +88,8 @@ def test_kernel_ids_keep_their_name_table_and_relative_order():
         "qwen3_5_rank1_fma",
         "qwen3_5_mul_reduce_rows",
     )
+    enum_body = enum_body.split("PL_AUTOTILE_BEGIN")[0]
+    names_body = names_body.split("#define")[0]
     uncommented = re.sub(r"//[^\n]*|/\*.*?\*/", "", enum_body, flags=re.S)
     enum_ids = re.findall(r"\b[A-Z][A-Z0-9_]*\b", uncommented)
     kernel_names = re.findall(r'"([^"]+)"', names_body)

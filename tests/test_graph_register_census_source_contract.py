@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import re
 
 
@@ -625,128 +626,24 @@ def test_host_fixture_freezes_fnv_node_kinds_and_producer_dma_bursts():
     assert len(producer_dma_nodes) == 800
     assert len(producer_dma_nodes) + 66 == 866
 
-    policy = _squash(
-        _function_body_raw(
-            "src/fused/rpu_gr00t_spm_z2.cpp",
-            "gr00t_z2_register_policy",
-        )
-    )
-    assert "already-passing captured BUILD traces" in policy
-    assert ("/" + "-".join(("nfs3", "sh")) + "/") not in policy
-    assert "Barrier×7,Dma×8,Barrier×7" in policy
-    assert "Kernel=0,Dma=8,Barrier=9" in policy
-    assert "866, 296, 504, 66" in policy
-    assert "UINT64_C(0xb07b80c16deb5555)" in policy
+    policy = _function_body_raw("src/fused/rpu_gr00t_spm_z2.cpp", "gr00t_z2_register_policy")
+    assert 'rpu_pl_census::policy("gr00t_z2_register_policy")' in policy
 
 
 def test_gr00t_z2_policy_freezes_every_rule_count_hash_and_phase():
-    policy = _squash(
-        _function_body_raw(
-            "src/fused/rpu_gr00t_spm_z2.cpp",
-            "gr00t_z2_register_policy",
-        )
-    )
-
-    assert 'value.fingerprint = UINT64_C(0x475230305a325634);' in policy
-    assert 'value.name = "gr00t_z2_register_census_v4";' in policy
-
-    abi_specs = (
-        "const auto weight = ddr_abi( "
-        "GraphDdrRegisterRole::ModelWeight, "
-        "GraphDdrRegisterAccess::Read, 2, 3);",
-        "const auto key_write = ddr_abi( "
-        "GraphDdrRegisterRole::KeyCache, "
-        "GraphDdrRegisterAccess::Write, 8, 9);",
-        "const auto value_write = ddr_abi( "
-        "GraphDdrRegisterRole::ValueCache, "
-        "GraphDdrRegisterAccess::Write, 8, 9);",
-        "const auto key_read = ddr_abi( "
-        "GraphDdrRegisterRole::KeyCache, "
-        "GraphDdrRegisterAccess::Read, 50, 51);",
-        "const auto value_read = ddr_abi( "
-        "GraphDdrRegisterRole::ValueCache, "
-        "GraphDdrRegisterAccess::Read, 52, 53);",
-    )
-    for abi in abi_specs:
-        assert abi in policy
-
-    exact_rules = (
-        "typed_rule(KernelId::PL_AT_FP16_M384N96, 942, {weight})",
-        "typed_rule(KernelId::PL_AT_FP16_M320N128, 12, {weight})",
-        "typed_rule(KernelId::LLAMA_INSERT_KCACHE_V16, 128, {key_write})",
-        "typed_rule(KernelId::LLAMA_INSERT_VCACHE_V16, 128, {value_write})",
-        "typed_rule(KernelId::LLAMA_INSERT_KCACHE, 4, {key_write})",
-        "typed_rule(KernelId::LLAMA_INSERT_VCACHE, 4, {value_write})",
-        "typed_rule(KernelId::SDPA_FLASH_ATTN_SPM, 132, "
-        "{key_read, value_read})",
-        "explicit_no_ddr_rule( "
-        "KernelId::LLM_ALL_REDUCE_RESIDUAL_RING_PACED, 264, "
-        "GraphKernelNoDdrProof::RingAllReduceSpmResidual)",
-        "explicit_no_ddr_rule( "
-        "KernelId::LLM_ALL_REDUCE_RESIDUAL_RING_NOPACE, 128, "
-        "GraphKernelNoDdrProof::RingAllReduceSpmResidual)",
-        "intrinsic_no_ddr_rule(KernelId::MEMSET_SPM_MULTI_CORE_V2, 328)",
-        "intrinsic_no_ddr_rule(KernelId::LAYER_NORM, 269)",
-        "intrinsic_no_ddr_rule(KernelId::BINARY_SCALAR, 137)",
-        "intrinsic_no_ddr_rule(KernelId::UNARY_GELU_TANH_SPM, 132)",
-        "intrinsic_no_ddr_rule(KernelId::BINARY_SAMESHAPE, 12)",
-        "intrinsic_no_ddr_rule(KernelId::UNARY_SPM, 4)",
-    )
-    rule_positions = [policy.index(rule) for rule in exact_rules]
-    assert rule_positions == sorted(rule_positions)
-    assert policy.count("typed_rule(") == 7
-    assert policy.count("explicit_no_ddr_rule(") == 2
-    assert policy.count("intrinsic_no_ddr_rule(") == 6
-
-    dynamic_rule = (
-        'GraphKernelRegisterRule dynamic_binary; '
-        'dynamic_binary.kernel_name = "binary_1xC_NxC_tileC"; '
-        "dynamic_binary.kind = "
-        "GraphKernelRegisterRuleKind::IntrinsicNoDdr; "
-        "dynamic_binary.expected_count = 1; "
-        "value.rules.push_back(std::move(dynamic_binary));"
-    )
-    assert dynamic_rule in policy
-    assert rule_positions[-1] < policy.index(dynamic_rule)
-    assert policy.count("value.rules.push_back(") == 1
-    assert "LLAMA_GEMV" not in policy
-    assert "gemv_weight" not in policy
-
-    exact_totals = {
-        "expected_node_count": "10782",
-        "expected_dma_count": "3033",
-        "expected_barrier_count": "5124",
-        "expected_kernel_count": "2625",
-        "expected_typed_kernel_count": "1350",
-        "expected_no_ddr_kernel_count": "1275",
-        "expected_operand_count": "1482",
-        "expected_weight_operand_count": "954",
-        "expected_key_cache_operand_count": "264",
-        "expected_value_cache_operand_count": "264",
-        "expected_semantic_input_operand_count": "0",
-        "expected_ordered_node_kind_hash": (
-            "UINT64_C(0x1cfe991b4c0a51a5)"
-        ),
-        "expected_ordered_kernel_hash": (
-            "UINT64_C(0x02a89226f052e980)"
-        ),
-    }
-    for field, value in exact_totals.items():
-        assert policy.count(f"value.{field} = {value};") == 1
-
-    exact_phases = (
-        "GraphKernelRegisterPhaseExpectation{ \"vl_encoder\", "
-        "phase_stats( 866, 296, 504, 66, 36, 30, 40, 24, 8, 8, "
-        "UINT64_C(0xb07b80c16deb5555), "
-        "UINT64_C(0x728c2112d7fcf9b9))}",
-        "GraphKernelRegisterPhaseExpectation{ \"denoise\", "
-        "phase_stats( 9916, 2737, 4620, 2559, 1314, 1245, "
-        "1442, 930, 256, 256, UINT64_C(0x72c4af3f08d45a75), "
-        "UINT64_C(0xee5248a5e490c4e4))}",
-    )
-    phase_positions = [policy.index(phase) for phase in exact_phases]
-    assert phase_positions == sorted(phase_positions)
-    assert len(re.findall(r"GraphKernelRegisterPhaseExpectation\s*\{", policy)) == 2
+    data = json.loads(_read("tests/fixtures/parallel_linear_register_census.v1.json"))
+    profile = data["profiles"]["gr00t_z2_register_policy"]
+    assert [p["phase"] for p in profile["phases"]] == ["vl_encoder", "denoise"]
+    assert set(profile["capture_sha256"]) == {".stats.jsonl", ".nodes.jsonl", ".args.jsonl", ".rules.jsonl"}
+    assert all(len(v) == 64 for v in profile["capture_sha256"].values())
+    assert sum(r["count"] for r in profile["rules"]) == profile["total"]["kernel_count"]
+    linears = [r for r in profile["rules"] if r["kernel"].startswith("parallel_linear_")]
+    assert linears and all(r["operands"] == [[1, 1, 1, 2, 3]] for r in linears)
+    header = _read("src/fused/rpu_parallel_linear_register_policies.h")
+    assert "gr00t_z2_register_policy_n32k32_v1" in header
+    assert "recensus-required" not in header
+    for field in ("ordered_node_kind_hash", "ordered_kernel_hash"):
+        assert f"UINT64_C(0x{profile['total'][field]:016x})" in header
 
 
 def test_runtime_rejects_forced_oneshot_before_mutation_and_matches_policy_deeply():
@@ -2077,7 +1974,7 @@ def test_gr00t_mask_publication_is_fail_closed_and_graph_success_consumed():
     assert len(force_pre) == 2
     assert len(force_post) == 2
     build_execute = end.index("execute_graph_for_recording()")
-    replay_execute = end.index("execute_graph_for_replaying()")
+    replay_execute = end.index("execute_graph_for_replaying(")
     assert force_pre[0] < build_execute < force_post[0] < marks[0]
     assert force_pre[1] < replay_execute < force_post[1] < marks[1]
 
@@ -2144,7 +2041,9 @@ def test_outer_fast_visibility_reuses_only_completed_same_pass_flushes(tmp_path)
 #include <cstdint>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <set>
+#include <string>
 #include <vector>
 #define RECORD_FUNCTION(...) do {} while (0)
 bool g_rpu_ddr_flush_enabled = false;
@@ -2184,6 +2083,9 @@ struct RpuKernelGraph {
     std::vector<OuterFastTensorSnapshot> kernel_register_outer_fast_force_visibility_owners_;
     std::vector<OuterFastTensorSnapshot> kernel_register_outer_fast_force_post_visibility_owners_;
     struct { size_t boundary_flush_count = 0; } last_stats_;
+    // REPLAYING hands end()'s earlier marker scan to the replay; stand-ins.
+    std::optional<bool> end_scanned_semantic_spm_producer_yield_markers_;
+    bool semantic_spm_producer_yield_markers = false;
     std::vector<int> segments_;
     std::set<void*> expected_pre, expected_post;
     int executions = 0, marks = 0, preflights = 0;
@@ -2195,7 +2097,18 @@ struct RpuKernelGraph {
     bool force_oneshot_on_replay_enabled() { return oneshot; }
     void build_segments_from_nodes() {}
     void execute_graph_for_recording() { execute(); }
-    void execute_graph_for_replaying() { execute(); }
+    // Async replay end stand-ins (graph/graph_async_end.h): a staged
+    // outer-fast Graph always replays synchronously.
+    struct { bool async_replay_end = true; } runtime_policy_;
+    std::vector<int> active_stack_{0};
+    bool async_end_submitted = false;
+    struct { std::string op_id_str; } built_signature_;
+    std::vector<int> tensor_refs_;
+    std::vector<void*> post_execution_flush_ptrs() { assert(false); return {}; }
+    void execute_graph_for_replaying(bool async_end, bool* submitted) {
+        assert(async_end == !kernel_register_outer_fast_build_state_.staged && !*submitted);
+        execute();
+    }
     void execute_graph_oneshot() { execute(); }
     void execute() {
         assert(phase == 0 && preflights == 1 && executions++ == 0);
@@ -2214,6 +2127,12 @@ struct RpuKernelGraph {
     void build();
     void replay();
 };
+void rpu_graph_async_end_wait_for_graph(const RpuKernelGraph*, const char*) noexcept {}
+bool rpu_graph_async_end_seal(const RpuKernelGraph*, const char*,
+                              std::vector<void*>&, std::vector<int>&) noexcept {
+    assert(false);
+    return false;
+}
 '''
     main = r'''
 int main() {
@@ -2336,6 +2255,7 @@ def test_outer_fast_source_ranges_preserve_dirty_replay_and_owner_boundaries(tmp
 #include <cstdint>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -2394,6 +2314,9 @@ struct RpuKernelGraph {
     std::vector<OuterFastTensorSnapshot> kernel_register_outer_fast_force_visibility_owners_;
     std::vector<OuterFastTensorSnapshot> kernel_register_outer_fast_force_post_visibility_owners_;
     struct {size_t boundary_flush_count=0;} last_stats_;
+    // REPLAYING hands end()'s earlier marker scan to the replay; stand-ins.
+    std::optional<bool> end_scanned_semantic_spm_producer_yield_markers_;
+    bool semantic_spm_producer_yield_markers=false;
     std::vector<int> segments_;
     Memory *input=nullptr,*output=nullptr;
     uint8_t expected_input=0;
@@ -2407,7 +2330,17 @@ struct RpuKernelGraph {
     bool force_oneshot_on_replay_enabled() {return false;}
     void build_segments_from_nodes() {}
     void execute_graph_for_recording() {execute();}
-    void execute_graph_for_replaying() {execute();}
+    // Async replay end stand-ins (graph/graph_async_end.h): a staged
+    // outer-fast Graph always replays synchronously.
+    struct {bool async_replay_end=true;} runtime_policy_;
+    std::vector<int> active_stack_{0};
+    bool async_end_submitted=false;
+    struct {std::string op_id_str;} built_signature_;
+    std::vector<int> tensor_refs_;
+    std::vector<void*> post_execution_flush_ptrs() {assert(false);return {};}
+    void execute_graph_for_replaying(bool async_end,bool* submitted) {
+        assert(!async_end && !*submitted);execute();
+    }
     void execute_graph_oneshot() {assert(false);}
     void execute() {
         assert(phase==0 && preflights==1 && executions++==0);
@@ -2423,6 +2356,9 @@ struct RpuKernelGraph {
     }
     void build();void replay();
 };
+void rpu_graph_async_end_wait_for_graph(const RpuKernelGraph*,const char*) noexcept {}
+bool rpu_graph_async_end_seal(const RpuKernelGraph*,const char*,
+                              std::vector<void*>&,std::vector<int>&) noexcept {assert(false);return false;}
 using Snapshot=RpuKernelGraph::OuterFastTensorSnapshot;
 Snapshot owner(Memory& memory,size_t begin,size_t bytes) {
     Snapshot s;
@@ -2961,19 +2897,27 @@ def test_dynamic_explicit_no_ddr_requires_staged_name_and_proof():
 
 
 def test_fill_and_slice_spm_stage_only_after_fail_closed_range_proofs():
+    # The range proofs live in the register image, which the launcher (and a
+    # retained Graph's register patch) computes before anything is staged.
+    image = _squash(
+        _function_body_raw("src/ops/rpu_memcpy.cpp", "fill_spm_registers")
+    )
+    fill_range = image.index("candidate - spm_base <=")
+    fill_mode = image.index("constexpr uint16_t mem_flag = 0")
+    fill_reg = image.index("image.set(5, mem_flag)")
+    assert fill_range < fill_mode < fill_reg
+    assert "SPM_ALLOC.is_initialized()" in image[:fill_reg]
+    assert "SpmAllocator::SPM_USABLE - byte_count" in image[:fill_reg]
     fill = _squash(
         _function_body_raw("src/ops/rpu_memcpy.cpp", "rpu_launch_fill_spm_kernel")
     )
-    fill_range = fill.index("candidate - spm_base <=")
-    fill_mode = fill.index("constexpr uint16_t mem_flag = 0")
+    fill_image = fill.index("fill_spm_registers(spm_addr, num_elements, value)")
     fill_stage = fill.index(
         'stage_kernel_no_ddr("fill", GraphKernelNoDdrProof::FillSpm)'
     )
     fill_get = fill.index('get_kernel_reset("fill")')
-    fill_reg = fill.index("set_regs(5, mem_flag)")
-    assert fill_range < fill_mode < fill_stage < fill_get < fill_reg
-    assert "SPM_ALLOC.is_initialized()" in fill[:fill_stage]
-    assert "SpmAllocator::SPM_USABLE - byte_count" in fill[:fill_stage]
+    fill_set = fill.index("set_regs(image.regs[i].first, image.regs[i].second)")
+    assert fill_image < fill_stage < fill_get < fill_set
 
     slice_spm = _squash(
         _function_body_raw(

@@ -49,7 +49,8 @@ def _cases():
     yield "qwenpi05.fused", "_plan_qwenpi05_action_execution", owner, (), dict(
         common, prefix_len=80), owner, "action_expert", "action", "qwenpi05"
     owner = NS(_text_execution={}, _vl_execution={}, _action_execution={},
-               _text=NS(_rpu_decoder_handle=77), _a_handle=77, _d_handle=77,
+               _text=NS(_rpu_decoder_handle=77, _rpu_text_graph_cache=object()),
+               _a_handle=77, _d_handle=77, _a_gc=object(), _d_gc=object(),
                _bb_cache=NS(max_seq_len=512), _component_generations={
                    "text_backbone": 0, "vl_encoder": 0, "action_dit": 0})
     for method, component, stage, prefix, actual in (
@@ -59,7 +60,8 @@ def _cases():
     ):
         yield "gr00t.runtime", "Gr00tN1d7VLA." + method, owner, (80,), {}, actual, component, stage, prefix
     owner = NS(_prefill_chunk_size=0, _max_seq=512, _vlm=77, _exp=77,
-               _du_handle=77, _denoise_unroll=False)
+               _du_handle=77, _denoise_unroll=False, _vlm_replay=True,
+               _expert_replay=True, _vgc=object(), _egc=object(), _dgc=object())
     yield "lingbot_vla.runtime", "LingbotVlaPolicy._plan_prefill_execution", owner, (80,), {}, owner, "language_model", "prefill", "causal_decoder"
     for unroll in (False, True):
         current = NS(**(vars(owner) | {"_denoise_unroll": unroll}))
@@ -67,6 +69,8 @@ def _cases():
     owner = NS(_multiview_spm_z2=False, _prepared_graph_profile=None,
                _text_execution={}, _action_execution={}, _chunk_size=0,
                _max_seq=8192, _text=NS(_rpu_decoder_handle=77), _exp=77,
+               _vlm_replay=True, _expert_replay=True, _denoise_unroll=False,
+               _vgc=object(), _egc=object(), _dgc=object(),
                _component_generations={
                    "vision_encoder": 0, "language_model": 0, "action_expert": 0})
     yield "lingbot_vla_v2.runtime", "LingbotVlaV2Policy._prefix_execution_plan", owner, (80,), {}, owner._text, "language_model", "prefill", "causal_decoder"
@@ -83,7 +87,8 @@ def _cases():
             sub=NS(gc=object(), handle=77), resolve_stage_domain=lambda _: (),
             envelope={}, spans=(), kv_route="DDR_REQUIRED", route_reason="test",
         ), owner, component, stage, prefix
-    owner = NS(_rpu_execution={}, _handle=77, _fmb_execution_generation=0)
+    owner = NS(_rpu_execution={}, _handle=77, _fmb_execution_generation=0,
+               _graph_cache=object())
     yield "internvla_n1.nextdit", "NextDiTRPURuntime._execution_plan", owner, (), dict(
         action_rows=32, cross_seq=80, use_action_encoder=False,
         populate_cross_cache=False, action_batch=1,

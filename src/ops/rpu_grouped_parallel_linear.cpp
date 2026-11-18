@@ -78,6 +78,7 @@ static void launch_grouped_parallel_linear_spm(
     int64_t group,
     bool is_col_parallel,
     int num_cores,
+    int64_t total_m,
     int64_t weight_dtype_mode,
     bool linear_acc32,
     bool expert_parallel_y4,
@@ -90,22 +91,22 @@ static void launch_grouped_parallel_linear_spm(
     TORCH_CHECK(num_cores >= 1 && num_cores <= 8,
                 "grouped_parallel_linear: num_cores must be in [1,8], got ",
                 num_cores);
-    TORCH_CHECK(group > 0 && group <= std::numeric_limits<uint16_t>::max(),
-                "grouped_parallel_linear: group must fit u16, got ", group);
-    TORCH_CHECK(local_n > 0 && local_n <= std::numeric_limits<uint16_t>::max() &&
+    TORCH_CHECK(group > 0 && group <= rpu_grouped_device_m::kMaxGroups,
+                "grouped_parallel_linear: group must be in [1,32768] for m_sizes byte offsets, got ", group);
+    TORCH_CHECK(local_n > 0 && local_n <= std::numeric_limits<uint32_t>::max() / 2 &&
                     local_n % 16 == 0,
-                "grouped_parallel_linear: local_n must be positive, fit u16, "
-                "and be divisible by 16; got ", local_n);
+                "grouped_parallel_linear: local_n must be positive, 16-aligned, "
+                "and its FP16 row stride must fit u32; got ", local_n);
     TORCH_CHECK(local_k > 0 && local_k <= std::numeric_limits<uint16_t>::max() &&
                     local_k % 16 == 0,
                 "grouped_parallel_linear: local_k must be positive, fit u16, "
                 "and be divisible by 16; got ", local_k);
     TORCH_CHECK(local_k * static_cast<int64_t>(sizeof(c10::Half)) <=
-                    std::numeric_limits<uint16_t>::max(),
-                "grouped_parallel_linear: fp16 input row stride exceeds u16");
+                    std::numeric_limits<uint32_t>::max(),
+                "grouped_parallel_linear: fp16 input row stride exceeds u32");
     TORCH_CHECK(local_n * static_cast<int64_t>(sizeof(c10::Half)) <=
-                    std::numeric_limits<uint16_t>::max(),
-                "grouped_parallel_linear: fp16 output row stride exceeds u16");
+                    std::numeric_limits<uint32_t>::max(),
+                "grouped_parallel_linear: fp16 output row stride exceeds u32");
 
     TORCH_CHECK(packed_weight.defined() &&
                     packed_weight.device().type() == at::kPrivateUse1 &&
@@ -139,6 +140,12 @@ static void launch_grouped_parallel_linear_spm(
     const uint64_t weight_group_bytes =
         static_cast<uint64_t>(local_n) * static_cast<uint64_t>(local_k) *
         static_cast<uint64_t>(num_cores) * weight_dwidth;
+    // GP34/35 carries the expert stride in 256-byte units. Check before
+    // multiplying by group or staging DDR ownership, so large u32-N shapes
+    // cannot wrap the total byte extent or reach a truncated address pair.
+    TORCH_CHECK(weight_group_bytes % 256 == 0 &&
+                    weight_group_bytes / 256 <= std::numeric_limits<uint32_t>::max(),
+                "grouped_parallel_linear: weight expert stride exceeds shift8 u32");
     const uint64_t expected_weight_bytes =
         static_cast<uint64_t>(group) * weight_group_bytes;
     TORCH_CHECK(static_cast<uint64_t>(packed_weight.nbytes()) == expected_weight_bytes,
@@ -158,18 +165,27 @@ static void launch_grouped_parallel_linear_spm(
         const uint64_t global_n = static_cast<uint64_t>(local_n) *
                                   (is_col_parallel ? num_cores : 1);
         const uint64_t expected_scale_bytes =
-            static_cast<uint64_t>(group) * global_n * sizeof(c10::Half);
+            static_cast<uint64_t>(group) * ((global_n + 127) / 128 * 128) * sizeof(c10::Half);
         TORCH_CHECK(static_cast<uint64_t>(scale.nbytes()) == expected_scale_bytes,
                     "grouped_parallel_linear: scale has ", scale.nbytes(),
                     " bytes, expected ", expected_scale_bytes,
                     " ([group, global_n] fp16)");
-        scale_group_bytes = checked_u32(global_n * sizeof(c10::Half),
+        scale_group_bytes = checked_u32(((global_n + 127) / 128 * 128) * sizeof(c10::Half),
                                         "scale group byte step");
     } else {
         TORCH_CHECK(!scale_opt.has_value() || !scale_opt->defined(),
                     "grouped_parallel_linear: fp16 mode does not consume scale");
     }
 
+    const auto wtype = mode == kModeFp16 ? rpu_pl_tiling::WeightType::Fp16
+        : mode == kModeFp8E4M3 ? rpu_pl_tiling::WeightType::Fp8E4M3
+                              : rpu_pl_tiling::WeightType::Int8;
+    const auto dispatch = rpu_grouped_tiling::select_dispatch(
+        total_m, local_n, local_k, static_cast<int>(mode), linear_acc32,
+        2, 0, 0, group);
+    const auto& tile = dispatch.tile;
+    const bool specialized = ordered_combine_offsets || scale_shuffle ||
+        fused_swiglu_route || routed_gate_up || expert_parallel_y4;
     const KernelId kernel_id =
         ordered_combine_offsets
             ? (mode == kModeFp16
@@ -189,11 +205,19 @@ static void launch_grouped_parallel_linear_spm(
             ? (mode == kModeFp16
                 ? KernelId::LINGBOT2_GROUPED_GATEUP_EXPERT_Y4_ACC16
                 : KernelId::LINGBOT2_GROUPED_GATEUP_W8A16_EXPERT_Y4_ACC16)
-            : mode == kModeFp16
-            ? (linear_acc32 ? KernelId::GROUPED_PARALLEL_LINEAR_ACC32
-                            : KernelId::GROUPED_PARALLEL_LINEAR_ACC16)
-            : (linear_acc32 ? KernelId::GROUPED_PARALLEL_LINEAR_8BIT_ACC32
-                            : KernelId::GROUPED_PARALLEL_LINEAR_8BIT_ACC16);
+            : dispatch.kind == rpu_grouped_tiling::DispatchKind::Fp16Acc16DeviceM
+            ? KernelId::GROUPED_PL_FP16_ACC16_DEVICE_M
+            : dispatch.kind == rpu_grouped_tiling::DispatchKind::W8Acc32DeviceM
+            ? KernelId::GROUPED_PL_W8_ACC32_DEVICE_M
+            : dispatch.kind == rpu_grouped_tiling::DispatchKind::Fp16Acc32N80DeviceM
+            ? KernelId::GROUPED_PL_FP16_ACC32_N80_DEVICE_M
+            : dispatch.kind == rpu_grouped_tiling::DispatchKind::Fp16Acc32N32DeviceM
+            ? KernelId::GROUPED_PL_FP16_ACC32_N32_DEVICE_M
+            : dispatch.kind == rpu_grouped_tiling::DispatchKind::W8Acc16N48DeviceM
+            ? KernelId::GROUPED_PL_W8_ACC16_N48_DEVICE_M
+            : dispatch.kind == rpu_grouped_tiling::DispatchKind::W8Acc32N48DeviceM
+            ? KernelId::GROUPED_PL_W8_ACC32_N48_DEVICE_M
+            : grouped_parallel_linear_kernel_id(wtype, linear_acc32, tile);
     Kernel_t* kernel = nullptr;
     if (routed_gate_up || scale_shuffle || ordered_combine_offsets) {
         kernel = GET_KERNEL(kernel_id);
@@ -235,36 +259,32 @@ static void launch_grouped_parallel_linear_spm(
     TORCH_CHECK(kernel != nullptr,
                 "grouped_parallel_linear: required kernel missing from rhino op lib");
     kernel->reset_regs();
-    set_reg_u32(kernel, 0, input_spm_addr);
-    set_reg_u32(kernel, 4, m_sizes_spm_addr);
-    set_reg_u32(kernel, 6, output_spm_addr);
-    set_reg_u32(kernel, 8, bias_spm_addr);
-    kernel->set_regs(10, static_cast<uint16_t>(group));
-    kernel->set_regs(11, static_cast<uint16_t>(local_n));
-    kernel->set_regs(12, static_cast<uint16_t>(local_k));
-    kernel->set_regs(13, static_cast<uint16_t>(local_k / 16));
-    kernel->set_regs(14, static_cast<uint16_t>(bias_spm_addr != 0));
-    kernel->set_regs(15, static_cast<uint16_t>(num_cores));
-    kernel->set_regs(16, static_cast<uint16_t>(local_k * sizeof(c10::Half)));
-    kernel->set_regs(17, static_cast<uint16_t>(
-        (fused_swiglu_route ? 64 : local_n) * sizeof(c10::Half)));
-    set_reg_u32(kernel, 18,
-                checked_u32(weight_group_bytes, "weight group byte step"));
-    if (mode == kModeFp16) {
-        set_reg_u32(kernel, 20, 0);
-    }
-    set_reg_u32(kernel, 22, scale_group_bytes);
-    kernel->set_regs(24, static_cast<uint16_t>(is_col_parallel));
-    kernel->set_regs(25, static_cast<uint16_t>(mode));
-    if (routed_gate_up) set_reg_u32(kernel, 26, tokens_spm_addr);
-    if (fused_swiglu_route) set_reg_u32(kernel, 28, routes_spm_addr);
+    // GP9 is unused by both static and device-M grouped programs. total_m is
+    // host selection/descriptor metadata; runtime expert M comes from m_sizes.
+    rpu_pl_tiling::set_parallel_linear_regs(*kernel, {
+        input_spm_addr, 0, output_spm_addr, bias_spm_addr,
+        0, static_cast<uint32_t>(local_n), static_cast<uint32_t>(local_k),
+        static_cast<uint16_t>(bias_spm_addr != 0), static_cast<uint16_t>(num_cores),
+        static_cast<uint32_t>(local_k * sizeof(c10::Half)),
+        static_cast<uint32_t>((fused_swiglu_route ? 64 : local_n) * sizeof(c10::Half)),
+        0, static_cast<uint16_t>(is_col_parallel), static_cast<uint16_t>(mode)});
+    TORCH_CHECK(weight_group_bytes % 256 == 0 && scale_group_bytes % 256 == 0,
+                "grouped_parallel_linear: expert strides must be 256-byte aligned");
+    kernel->set_regs(30, static_cast<uint16_t>(group));
+    set_reg_u32(kernel, 32, m_sizes_spm_addr);
+    set_reg_u32(kernel, 34, checked_u32(weight_group_bytes / 256, "weight expert stride"));
+    set_reg_u32(kernel, 36, scale_group_bytes / 256);
+    set_reg_u32(kernel, 38, 0);
+    if (routed_gate_up) set_reg_u32(kernel, 48, tokens_spm_addr);
+    if (fused_swiglu_route) set_reg_u32(kernel, 50, routes_spm_addr);
     if (ordered_combine_offsets) {
         for (size_t i = 0; i < ordered_combine_offsets->size(); ++i)
-            set_reg_u32(kernel, 26 + 2 * static_cast<int>(i), (*ordered_combine_offsets)[i]);
+            set_reg_u32(kernel, 48 + 2 * static_cast<int>(i), (*ordered_combine_offsets)[i]);
     }
 
     const uint64_t grid_x64 = fused_swiglu_route
-        ? 1 : (static_cast<uint64_t>(local_n) + 63) / 64;
+        ? 1 : (static_cast<uint64_t>(local_n) + (specialized ? 64 : tile.n_tile) - 1) /
+                  (specialized ? 64 : tile.n_tile);
     TORCH_CHECK(grid_x64 <= std::numeric_limits<uint16_t>::max(),
                 "grouped_parallel_linear: grid.x exceeds u16");
     const uint16_t grid_x = static_cast<uint16_t>(grid_x64);
@@ -286,12 +306,12 @@ void rpu_launch_grouped_parallel_linear_spm_kernel(
     uint32_t m_sizes_spm_addr, const c10::optional<at::Tensor>& scale_opt,
     uint32_t output_spm_addr, uint32_t bias_spm_addr,
     int64_t local_n, int64_t local_k, int64_t group, bool is_col_parallel,
-    int num_cores, int64_t weight_dtype_mode, bool linear_acc32,
+    int num_cores, int64_t total_m, int64_t weight_dtype_mode, bool linear_acc32,
     bool expert_parallel_y4) {
     launch_grouped_parallel_linear_spm(
         input_spm_addr, packed_weight, m_sizes_spm_addr, scale_opt,
         output_spm_addr, bias_spm_addr, local_n, local_k, group,
-        is_col_parallel, num_cores, weight_dtype_mode, linear_acc32,
+        is_col_parallel, num_cores, total_m, weight_dtype_mode, linear_acc32,
         expert_parallel_y4, false, 0);
 }
 
@@ -327,7 +347,7 @@ void rpu_launch_lingbot2_grouped_gateup_routed_spm_kernel(
     launch_grouped_parallel_linear_spm(
         input_spm_addr, packed_weight, m_sizes_spm_addr, scale_opt,
         output_spm_addr, 0, 128, 768, 32, true, 8,
-        weight_dtype_mode, false, true, true, tokens_spm_addr);
+        204, weight_dtype_mode, false, true, true, tokens_spm_addr);
 }
 
 void rpu_launch_lingbot2_grouped_gateup_routed_swiglu_route_spm_kernel(
@@ -359,7 +379,7 @@ void rpu_launch_lingbot2_grouped_gateup_routed_swiglu_route_spm_kernel(
     launch_grouped_parallel_linear_spm(
         input_spm_addr, packed_weight, m_sizes_spm_addr, scale_opt,
         output_spm_addr, 0, 128, 768, 32, true, 8,
-        weight_dtype_mode, false, true, true, tokens_spm_addr,
+        204, weight_dtype_mode, false, true, true, tokens_spm_addr,
         true, routes_spm_addr);
 }
 
@@ -386,7 +406,7 @@ void rpu_launch_lingbot2_grouped_down_w8_scale_shuffle_spm_kernel(
     }
     launch_grouped_parallel_linear_spm(
         input_spm_addr, packed_weight, m_sizes_spm_addr, scale,
-        output_spm_addr, 0, 768, 64, 32, false, 8, kModeInt8,
+        output_spm_addr, 0, 768, 64, 32, false, 8, 204, kModeInt8,
         false, false, false, 0, false, 0, true);
 }
 
@@ -463,19 +483,23 @@ void rpu_launch_lingbot2_grouped_down_ordered_combine_spm_kernel(
         static_cast<uint32_t>(acc_spm_addr - base),
         static_cast<uint32_t>(taskout_spm_addr - base)}};
     // Reuse the original typed weight/scale lease and Down register setup.
-    // p6 remains absolute; p32 is its checked core-local alias for the epilogue.
+    // GP4 is the absolute output; GP54 is its checked core-local epilogue alias.
+    // GP32 carries m_sizes independently of the four GP48..55 epilogue offsets.
     launch_grouped_parallel_linear_spm(
         input_spm_addr, packed_weight, m_sizes_spm_addr, scale_opt,
-        taskout_spm_addr, 0, 768, 64, 32, false, 8, weight_dtype_mode,
+        taskout_spm_addr, 0, 768, 64, 32, false, 8, 204, weight_dtype_mode,
         false, false, false, 0, false, 0, weight_dtype_mode == kModeInt8,
         &local_offsets);
 }
 
-std::array<int64_t, 2> rpu_select_grouped_parallel_linear_uint4_tile(
-    int64_t m_total, int64_t num_experts, int64_t local_n, int64_t local_k) {
-    const auto tile = rpu_grouped_tiling::select_uint4_acc16(
-        m_total, num_experts, local_n, local_k);
-    return {tile.n, tile.m};
+std::array<int64_t, 3> rpu_select_grouped_parallel_linear_uint4_tile(
+    int64_t m_total, int64_t num_experts, int64_t local_n, int64_t local_k,
+    int64_t group_size, bool force_acc32) {
+    if (group_size != 32 && group_size != 64 && group_size != 128)
+        throw std::invalid_argument("Grouped UINT4 requires group_size 32, 64, or 128");
+    const auto tile = rpu_grouped_tiling::select_uint4(
+        m_total, num_experts, local_n, local_k, static_cast<int>(group_size), force_acc32);
+    return {tile.n, tile.m, tile.k};
 }
 
 void rpu_launch_grouped_parallel_linear_uint4_spm_kernel(
@@ -491,20 +515,21 @@ void rpu_launch_grouped_parallel_linear_uint4_spm_kernel(
     bool is_col_parallel,
     int num_cores,
     int64_t group_size,
-    int64_t m_total) {
-    // This ABI is generated by GroupedParallelLinearUint4PgrpGenerator; its
-    // 135b93fc uses controller-striped Q4/N64 S/Z, distinct from FP8/dense W4
-    // and the old ca2d1c84 plain [E,K/G,N] metadata ABI.
+    int64_t m_total, bool force_acc32) {
+    // Grouped UINT4 uses the unified ParallelLinear registers and N32K32
+    // weight storage, followed by the grouped expert descriptor. S/Z metadata
+    // is controller-striped Q4/N64, matching the generated per-group payload.
     TORCH_CHECK(num_cores >= 1 && num_cores <= 8,
                 "grouped UINT4: num_cores must be in [1,8]");
-    TORCH_CHECK(num_experts > 0 && num_experts <= UINT16_MAX,
-                "grouped UINT4: num_experts must be positive and fit u16");
-    TORCH_CHECK(m_total > 0, "grouped UINT4: m_total must be positive");
+    TORCH_CHECK(num_experts > 0 && num_experts <= rpu_grouped_device_m::kMaxGroups,
+                "grouped UINT4: num_experts must be in [1,32768] for m_sizes byte offsets");
+    TORCH_CHECK(m_total > 0 && m_total <= UINT16_MAX,
+                "grouped UINT4: packed assignment rows must be in [1,65535]");
     TORCH_CHECK(local_n > 0 && local_n <= UINT32_MAX / 2 && local_n % 16 == 0,
                 "grouped UINT4: local_n must be positive, 16-aligned and its "
                 "FP16 row stride must fit u32");
-    TORCH_CHECK(local_k > 0 && local_k <= UINT16_MAX && local_k % 64 == 0,
-                "grouped UINT4: local_k must be positive, 64-aligned and fit u16");
+    TORCH_CHECK(local_k > 0 && local_k <= UINT16_MAX && local_k % 32 == 0,
+                "grouped UINT4: local_k must be positive, 32-aligned and fit u16");
     TORCH_CHECK((group_size == 32 || group_size == 64 || group_size == 128) &&
                     local_k % group_size == 0,
                 "grouped UINT4: group_size must be 32/64/128 and divide local_k");
@@ -514,7 +539,8 @@ void rpu_launch_grouped_parallel_linear_uint4_spm_kernel(
     const uint64_t global_k = static_cast<uint64_t>(local_k) *
                               (is_col_parallel ? 1 : num_cores);
     const uint32_t weight_expert_bytes = checked_u32(
-        global_n * global_k / 2, "UINT4 weight expert byte step");
+        static_cast<uint64_t>((local_n + 31) / 32 * 32) * local_k * num_cores / 2,
+        "UINT4 N32K32 weight expert byte step");
     const auto metadata = rpu_grouped_tiling::uint4_metadata_layout(
         local_n, local_k, group_size, num_cores);
     const uint32_t scale_group_block_bytes = checked_u32(
@@ -545,18 +571,11 @@ void rpu_launch_grouped_parallel_linear_uint4_spm_kernel(
     check_scale_owner(scale, "scale");
     check_scale_owner(negative_zero, "negative_zero");
     const auto tile = rpu_select_grouped_parallel_linear_uint4_tile(
-        m_total, num_experts, local_n, local_k);
-    KernelId kernel_id;
-    switch (tile[0]) {
-        case 32: kernel_id = KernelId::GROUPED_UINT4_ACC16_M288N32; break;
-        case 48: kernel_id = KernelId::GROUPED_UINT4_ACC16_M256N48; break;
-        case 64: kernel_id = KernelId::GROUPED_UINT4_ACC16_M224N64; break;
-        case 80: kernel_id = KernelId::GROUPED_UINT4_ACC16_M192N80; break;
-        case 96: kernel_id = KernelId::GROUPED_UINT4_ACC16_M160N96; break;
-        case 112: kernel_id = KernelId::GROUPED_UINT4_ACC16_M144N112; break;
-        case 128: kernel_id = KernelId::GROUPED_UINT4_ACC16_M128N128; break;
-        default: TORCH_CHECK(false, "grouped UINT4: invalid generated tile");
-    }
+        m_total, num_experts, local_n, local_k, group_size, force_acc32);
+    const KernelId kernel_id = grouped_parallel_linear_kernel_id(
+        rpu_pl_tiling::WeightType::Uint4, force_acc32,
+        rpu_pl_tiling::TilePick{static_cast<int>(tile[0]), static_cast<int>(tile[1]),
+                               static_cast<int>(tile[2])});
     const uint64_t grid_x64 = (static_cast<uint64_t>(local_n) + tile[0] - 1) / tile[0];
     TORCH_CHECK(grid_x64 <= UINT16_MAX, "grouped UINT4: grid.x must fit u16");
     const uint16_t grid_x = static_cast<uint16_t>(grid_x64);
@@ -567,9 +586,9 @@ void rpu_launch_grouped_parallel_linear_uint4_spm_kernel(
             {{GraphDdrRegisterRole::PackedUint4ModelWeight, GraphDdrRegisterAccess::Read,
               GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3}, packed_weight},
             {{GraphDdrRegisterRole::PerGroupScale, GraphDdrRegisterAccess::Read,
-              GraphDdrRegisterEncoding::DevAddrShift8LoHi, 24, 25}, scale},
+              GraphDdrRegisterEncoding::DevAddrShift8LoHi, 20, 21}, scale},
             {{GraphDdrRegisterRole::NegativeZeroPoint, GraphDdrRegisterAccess::Read,
-              GraphDdrRegisterEncoding::DevAddrShift8LoHi, 26, 27}, negative_zero},
+              GraphDdrRegisterEncoding::DevAddrShift8LoHi, 22, 23}, negative_zero},
         });
     rpu_ddr_flush(packed_weight.data_ptr());
     rpu_ddr_flush(scale.data_ptr());
@@ -577,25 +596,19 @@ void rpu_launch_grouped_parallel_linear_uint4_spm_kernel(
     Kernel_t* kernel = GET_KERNEL(kernel_id);
     TORCH_CHECK(kernel != nullptr, "grouped UINT4: required generated kernel is missing");
     kernel->reset_regs();
-    set_reg_u32(kernel, 0, input_spm_addr);
-    set_reg_u32(kernel, 4, m_sizes_spm_addr);
-    set_reg_u32(kernel, 6, output_spm_addr);
-    set_reg_u32(kernel, 8, 0);  // Qwen3.5 routed experts have no bias.
-    kernel->set_regs(10, static_cast<uint16_t>(num_experts));
-    kernel->set_regs(11, static_cast<uint16_t>(0));
-    set_reg_u32(kernel, 12, static_cast<uint32_t>(local_n));
-    kernel->set_regs(14, static_cast<uint16_t>(local_k));
-    kernel->set_regs(15, static_cast<uint16_t>(local_k / 64));
-    kernel->set_regs(16, static_cast<uint16_t>(0));
-    kernel->set_regs(17, static_cast<uint16_t>(num_cores));
-    set_reg_u32(kernel, 18, static_cast<uint32_t>(local_k * sizeof(c10::Half)));
-    set_reg_u32(kernel, 20, static_cast<uint32_t>(local_n * sizeof(c10::Half)));
-    set_reg_u32(kernel, 22, weight_expert_bytes);
-    set_reg_u32(kernel, 28, scale_group_block_bytes);
-    set_reg_u32(kernel, 30, scale_expert_bytes);
-    kernel->set_regs(32, static_cast<uint16_t>(group_size));
-    kernel->set_regs(33, static_cast<uint16_t>(local_k / group_size));
-    kernel->set_regs(34, static_cast<uint16_t>(is_col_parallel));
+    rpu_pl_tiling::set_parallel_linear_w4_group_regs(*kernel, {
+        {input_spm_addr, 0, output_spm_addr, 0,
+         static_cast<uint32_t>(m_total), static_cast<uint32_t>(local_n),
+         static_cast<uint32_t>(local_k), 0, static_cast<uint16_t>(num_cores),
+         static_cast<uint32_t>(local_k * 2), static_cast<uint32_t>(local_n * 2),
+         0, static_cast<uint16_t>(is_col_parallel), 8},
+        static_cast<uint16_t>(group_size), static_cast<uint16_t>(local_k / group_size),
+        scale_group_block_bytes, 0, true});
+    kernel->set_regs(30, static_cast<uint16_t>(num_experts));
+    set_reg_u32(kernel, 32, m_sizes_spm_addr);
+    set_reg_u32(kernel, 34, weight_expert_bytes / 256);
+    set_reg_u32(kernel, 36, scale_expert_bytes / 256);
+    set_reg_u32(kernel, 38, scale_expert_bytes / 256);
     kernel->set_regs(64, grid_x);
     kernel->set_regs(65, static_cast<uint16_t>(1));
     kernel->set_regs(66, static_cast<uint16_t>(1));
@@ -641,8 +654,19 @@ at::Tensor rpu_grouped_parallel_linear_test(
                 "grouped_parallel_linear_test: m_sizes must be contiguous int16 "
                 "device [group]");
     const int64_t group = m_sizes.numel();
+    TORCH_CHECK(group > 0 && group <= rpu_grouped_device_m::kMaxGroups,
+                "grouped_parallel_linear_test: experts must be in [1,32768]");
     const int64_t m = input_per_core.size(1);
-    TORCH_CHECK(m > 0, "grouped_parallel_linear_test: M must be positive");
+    TORCH_CHECK(m > 0 && m <= UINT16_MAX,
+                "grouped_parallel_linear_test: packed assignment rows must be in [1,65535]");
+    const auto counts_cpu = m_sizes.cpu();
+    int64_t count_sum = 0;
+    for (int64_t i = 0; i < group; ++i) {
+        const int16_t count = counts_cpu.data_ptr<int16_t>()[i];
+        TORCH_CHECK(count >= 0, "grouped_parallel_linear_test: negative expert row count");
+        count_sum += count;
+    }
+    TORCH_CHECK(count_sum == m, "grouped_parallel_linear_test: sum(m_sizes) must equal M");
 
     if (bias_per_core.has_value() && bias_per_core->defined()) {
         TORCH_CHECK(bias_per_core->device().type() == at::kPrivateUse1 &&
@@ -655,11 +679,30 @@ at::Tensor rpu_grouped_parallel_linear_test(
                     "fp16 device [num_cores,local_n]");
     }
 
+    // Conformance setup mirrors cold installation. The allocator guarantees
+    // 32-byte alignment, but shifted DDR operands need a 256-byte base.
+    const auto aligned_test_owner = [](const at::Tensor& source) {
+        const uint64_t address = RpuGetDevAddr(source.data_ptr());
+        TORCH_CHECK(address != 0, "grouped_parallel_linear_test: missing device address");
+        if (address % 256 == 0) return source;
+        const int64_t element_bytes = source.element_size();
+        auto backing = at::empty({source.numel() + 256 / element_bytes}, source.options());
+        const uint64_t base = RpuGetDevAddr(backing.data_ptr());
+        TORCH_CHECK(base != 0, "grouped_parallel_linear_test: missing aligned backing");
+        const int64_t offset = (256 - base % 256) % 256;
+        auto owner = backing.narrow(0, offset / element_bytes, source.numel()).view(source.sizes());
+        owner.copy_(source);
+        return owner;
+    };
+    const auto weight_run = aligned_test_owner(packed_weight);
+    c10::optional<at::Tensor> scale_run = scale;
+    if (scale && scale->defined()) scale_run = aligned_test_owner(*scale);
+
     if (!SPM_ALLOC.is_initialized()) SPM_ALLOC.init();
     const int64_t input_bytes = m * local_k * sizeof(c10::Half);
-    // The immediate DDR->SPM DMA accepts 16-byte multiples only.  Kernels
-    // still consume exactly `group` entries; the padded tail is transport-only.
-    const int64_t m_sizes_dma_elements = ((group + 7) / 8) * 8;
+    // Grouped kernels read expert counts in vectors of 16. Initialize its masked tail
+    // as well as satisfying the immediate DMA's 16-byte granularity.
+    const int64_t m_sizes_dma_elements = ((group + 15) / 16) * 16;
     const int64_t m_sizes_bytes = m_sizes_dma_elements * sizeof(int16_t);
     const int64_t output_bytes = m * local_n * sizeof(c10::Half);
     const int64_t bias_bytes = local_n * sizeof(c10::Half);
@@ -699,9 +742,9 @@ at::Tensor rpu_grouped_parallel_linear_test(
         }
 
         rpu_launch_grouped_parallel_linear_spm_kernel(
-            input_addr, packed_weight, m_sizes_addr, scale, output_addr,
+            input_addr, weight_run, m_sizes_addr, scale_run, output_addr,
             launch_bias_addr, local_n, local_k, group, is_col_parallel,
-            static_cast<int>(num_cores), weight_dtype_mode, linear_acc32);
+            static_cast<int>(num_cores), m, weight_dtype_mode, linear_acc32);
 
         auto output = at::empty({num_cores, m, local_n}, input_per_core.options());
         rpu_launch_spm_scatter_ddr_dma_immediate(
@@ -716,14 +759,9 @@ at::Tensor rpu_grouped_parallel_linear_test(
 }
 
 bool rpu_lingbot2_routed_col_available(bool w8) {
-    // This bounded wrapper uses the same standard N32/K128 MAC tiling as the
-    // original dense projection. Do not pin a stale tile if that table changes.
-    const auto routed = rpu_pl_tiling::select_tile_acc16(51, 64, 768, !w8);
-    const auto dense = rpu_pl_tiling::select_tile_acc16(51, 2048, 768, !w8);
-    const int expected_m_tile = w8 ? 592 : 608;
-    return routed.n_tile == 32 && routed.m_tile == expected_m_tile &&
-        dense.n_tile == 32 && dense.m_tile == expected_m_tile &&
-        KernelCache::instance().has_loaded(w8
+    // These current-ABI specializations own a complete N64 expert stripe;
+    // their per-precision schedules do not use the ordinary dense selector.
+    return KernelCache::instance().has_loaded(w8
             ? KernelId::LINGBOT2_ROUTED_COL_W8_M592N32
             : KernelId::LINGBOT2_ROUTED_COL_FP16_M608N32);
 }
@@ -761,8 +799,7 @@ void rpu_launch_lingbot2_routed_col_spm_kernel(
                     "lingbot2_routed_col: FP16 does not consume scales");
     }
     TORCH_CHECK(rpu_lingbot2_routed_col_available(w8),
-                "lingbot2_routed_col: selected optional MAIN payload or "
-                "standard N32 tile is unavailable; select dense at cold binding");
+                "lingbot2_routed_col: current precision payload is unavailable");
     TORCH_CHECK(SPM_ALLOC.is_initialized(),
                 "lingbot2_routed_col: SPM allocator is not initialized");
     const uint32_t base = SPM_ALLOC.addr(0, 0);
@@ -805,7 +842,7 @@ void rpu_launch_lingbot2_routed_col_spm_kernel(
             GraphDdrRegisterAbi{
                 GraphDdrRegisterRole::PerChannelScale,
                 GraphDdrRegisterAccess::Read,
-                GraphDdrRegisterEncoding::DevAddrShift8LoHi, 22, 23}, scale});
+                GraphDdrRegisterEncoding::DevAddrShift8LoHi, 20, 21}, scale});
     }
     auto register_writer = RpuKernelGraph::active().stage_kernel_ddr_registers(
         kernel_id, std::move(ddr_operands));
@@ -815,27 +852,31 @@ void rpu_launch_lingbot2_routed_col_spm_kernel(
     TORCH_CHECK(kernel != nullptr, "lingbot2_routed_col: loaded payload is missing");
     kernel->reset_regs();
     set_reg_u32(kernel, 0, input_spm_addr);
-    set_reg_u32(kernel, 4, counts_spm_addr);
-    set_reg_u32(kernel, 6, output_spm_addr);
-    set_reg_u32(kernel, 8, 0);
-    kernel->set_regs(10, static_cast<uint16_t>(experts));
-    kernel->set_regs(11, static_cast<uint16_t>(rows));
-    set_reg_u32(kernel, 12, static_cast<uint32_t>(local_n));
-    kernel->set_regs(14, static_cast<uint16_t>(local_k));
-    kernel->set_regs(15, static_cast<uint16_t>(local_k / 16));
-    kernel->set_regs(16, static_cast<uint16_t>(0));
-    kernel->set_regs(17, static_cast<uint16_t>(num_cores));
-    set_reg_u32(kernel, 18, static_cast<uint32_t>(local_k * 2));
-    set_reg_u32(kernel, 20, static_cast<uint32_t>(output_n * 2));
-    if (!w8) set_reg_u32(kernel, 22, 0);
-    kernel->set_regs(24, static_cast<uint16_t>(1));
-    kernel->set_regs(25, static_cast<uint16_t>(w8 ? 1 : 0));
-    kernel->set_regs(64, static_cast<uint16_t>(2));
+    set_reg_u32(kernel, 4, output_spm_addr);
+    set_reg_u32(kernel, 6, 0);
+  kernel->set_regs(8, uint16_t{1});
+    kernel->set_regs(9, static_cast<uint16_t>(rows));
+    set_reg_u32(kernel, 10, static_cast<uint32_t>(output_n));
+    kernel->set_regs(12, static_cast<uint16_t>(local_k));
+    kernel->set_regs(13, static_cast<uint16_t>(local_k / 16));
+  kernel->set_regs(14, uint16_t{0});
+    kernel->set_regs(15, static_cast<uint16_t>(num_cores));
+    set_reg_u32(kernel, 16, static_cast<uint32_t>(local_k * 2));
+    set_reg_u32(kernel, 18, static_cast<uint32_t>(output_n * 2));
+    if (!w8) set_reg_u32(kernel, 20, 0);
+    set_reg_u32(kernel, 22, 0);
+    set_reg_u32(kernel, 24, 0);
+  kernel->set_regs(26, uint16_t{2});
+    kernel->set_regs(27, static_cast<uint16_t>(w8 ? 1 : 2));
+    set_reg_u32(kernel, 28, 0);
+    set_reg_u32(kernel, 48, counts_spm_addr);
+    const uint16_t grid_x = w8 ? 2 : 1;
+    kernel->set_regs(64, grid_x);
     kernel->set_regs(65, static_cast<uint16_t>(1));
     kernel->set_regs(66, static_cast<uint16_t>(experts));
     register_writer.write(*kernel);
     auto* queue = GET_QUEUE(num_cores);
     queue->set_broadcast_mode(true);
-    queue->enqueu_kernel(*kernel, {2, 1, static_cast<uint16_t>(experts)},
+    queue->enqueu_kernel(*kernel, {grid_x, 1, static_cast<uint16_t>(experts)},
                         {0, 1, 2, 3, 4, 5, 6, 7});
 }

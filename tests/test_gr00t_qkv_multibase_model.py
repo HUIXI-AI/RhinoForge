@@ -1,5 +1,6 @@
 """Run GR00T's actual cold self-QKV admission, descriptor and emitter on host."""
 from pathlib import Path
+from pi_wall_host_catalog import with_actual_linear_contracts
 import re
 import shutil
 import subprocess
@@ -160,7 +161,7 @@ int main(){
            .replace("__METHODS__", methods).replace("__REGISTER__", registration)
            .replace("__PROJECTIONS__", projections))
     path, exe = tmp_path / "qkv.cpp", tmp_path / "qkv"
-    path.write_text(cpp)
+    path.write_text(with_actual_linear_contracts(cpp))
     result = subprocess.run([shutil.which("g++"), "-std=c++17", "-O1", str(path), "-o", str(exe)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     result = subprocess.run([str(exe)], capture_output=True, text=True)

@@ -81,20 +81,20 @@ int main(){
  std::array<at::Tensor,8>tensors{};
  for(size_t i=0;i<tensors.size();++i){tensors[i].address=0x1234567800ULL+i*0x200000;
   if(i>=4){tensors[i].dtype=at::kHalf;tensors[i].rank=1;tensors[i].rows=2048;}}
- const std::array<int,8>registers{2,24,30,36,20,28,34,40};
+ const std::array<int,8>registers{2,32,40,48,20,34,42,50};
  // A second call changes every address, preventing cached first-call bindings.
  for(int pass=0;pass<2;++pass){for(size_t i=0;i<8;++i)tensors[i].address+=(i+1)*256;
   auto begin=g.submissions.size();auto flush_start=flushed.size();launch(tensors,spm);
   assert(g.submissions.size()==begin+2&&flushed.size()==flush_start+8&&!g.pending&&!g.staged);
-  const auto&s=g.submissions[begin];assert(s.id==COMBINED&&s.grid==std::vector<uint16_t>({6,1,1})&&s.operands.size()==8);
+  const auto&s=g.submissions[begin];assert(s.id==COMBINED&&s.grid==std::vector<uint16_t>({18,1,1})&&s.operands.size()==8);
   for(size_t i=0;i<8;++i){assert(pair(s,registers[i])==tensors[i].address>>8);
    assert(s.operands[i].owner.address==tensors[i].address&&s.operands[i].abi.lo==registers[i]&&s.operands[i].abi.hi==registers[i]+1);
    assert(s.operands[i].abi.role==(i<4?GraphDdrRegisterRole::Int8ModelWeight:GraphDdrRegisterRole::PerChannelScale));
    assert(s.operands[i].abi.access==GraphDdrRegisterAccess::Read&&s.operands[i].abi.encoding==GraphDdrRegisterEncoding::DevAddrShift8LoHi);
    assert(flushed[flush_start+i]==tensors[i].address);}
-  assert(pair(s,0)==spm[0]&&pair(s,4)==spm[1]&&pair(s,26)==spm[2]&&pair(s,32)==spm[3]&&pair(s,38)==spm[4]);
-  assert(pair(s,6)==0&&s.regs.at(8)==32&&pair(s,10)==256&&s.regs.at(12)==1024&&s.regs.at(13)==64&&s.regs.at(14)==0&&s.regs.at(15)==8);
-  assert(pair(s,16)==2048&&pair(s,18)==512&&s.regs.at(22)==1&&s.regs.at(23)==1);
+  assert(pair(s,0)==spm[0]&&pair(s,4)==spm[1]&&pair(s,36)==spm[2]&&pair(s,44)==spm[3]&&pair(s,52)==spm[4]);
+  assert(pair(s,6)==0&&s.regs.at(8)==1&&s.regs.at(9)==32&&pair(s,10)==256&&s.regs.at(12)==1024&&s.regs.at(13)==64&&s.regs.at(14)==0&&s.regs.at(15)==8);
+  assert(pair(s,16)==2048&&pair(s,18)==512&&pair(s,22)==0&&pair(s,24)==0&&s.regs.at(26)==2&&s.regs.at(27)==1);
   const auto&fan=g.submissions[begin+1];assert(fan.id==FAN&&fan.grid==std::vector<uint16_t>({1,1,1})&&fan.operands.empty());
   assert(pair(fan,0)==spm[3]-base&&pair(fan,2)==spm[4]-base);
  }

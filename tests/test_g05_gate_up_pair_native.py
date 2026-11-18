@@ -195,11 +195,11 @@ int main(){
  Model m;m.prepare_action_gateup_pair();const int cold_proofs=tensor_proofs;assert(m.action_gateup_pair_available_&&cold_proofs>=48);
  m.plan();assert(m.routes.empty()&&!m.use_action_gateup_pair(32));m.mlp(1);assert(launches==std::vector<std::string>({"gate","silu","up","mul","down"}));
  m.action_step_active_=m.action_loop_active_=true;m.action_num_steps_=10;m.plan();const auto paired_hash=m.subclass_layout_hash();
- assert(m.routes.size()==1&&m.routes[0].args==std::vector<int64_t>({1,32,512,1024,8,32,304,80,128,7,14,2048,1024,2,24,3}));
+ assert(m.routes.size()==1&&m.routes[0].args==std::vector<int64_t>({4,32,512,1024,8,32,160,96,256,6,12,2048,1024,2,32,3,20,34,2,4,36,1}));
  for(int layer=0;layer<24;++layer){launches.clear();m.mlp(layer);if(layer>=1&&layer<=3){assert(launches==std::vector<std::string>({"resident-gate","silu","resident-up","mul","down"}));reject([&]{m.launch_action_gateup_pair(layer,{});});}else{assert(launches==std::vector<std::string>({"pair","silu","mul","down"}));assert(weights_seen.back()==std::make_pair(uint64_t(2*layer+1),uint64_t(2*layer+2)));}}
  assert(tensor_proofs==cold_proofs);m.complete=false;reject([&]{m.mlp(0);});m.complete=true;m.routes[0].args[12]=512;reject([&]{m.mlp(0);});m.plan();
  // Stale resident count rejects before a pair or downstream SiLU/MUL runs.
- m.resident=false;reject([&]{m.mlp(0);});m.plan();assert(m.routes[0].args.back()==0);launches.clear();m.mlp(1);assert(launches==std::vector<std::string>({"pair","silu","mul","down"}));m.resident=true;reject([&]{m.mlp(0);});m.plan();
+ m.resident=false;reject([&]{m.mlp(0);});m.plan();assert(m.routes[0].args[15]==0);launches.clear();m.mlp(1);assert(launches==std::vector<std::string>({"pair","silu","mul","down"}));m.resident=true;reject([&]{m.mlp(0);});m.plan();
  reject([&]{m.launch_action_gateup_pair(24,{});});reject([&]{m.launch_action_gateup_pair(-1,{});});reject([&]{m.launch_action_gateup_pair(0,{31,2});});reject([&]{m.launch_action_gateup_pair(0,{32,3});});
  KernelCache::instance().available=false;m.prepare_action_gateup_pair();assert(!m.action_gateup_pair_available_);assert(m.subclass_layout_hash()!=paired_hash);m.plan();assert(m.routes.empty());launches.clear();m.mlp(0);assert(launches==std::vector<std::string>({"gate","silu","up","mul","down"}));launches.clear();m.mlp(2);assert(launches==std::vector<std::string>({"resident-gate","silu","resident-up","mul","down"}));
  KernelCache::instance().available=true;m.prepare_action_gateup_pair();assert(m.action_gateup_pair_available_&&m.subclass_layout_hash()==paired_hash);
@@ -212,7 +212,7 @@ int main(){
  // A genuine optional FP16 ACC16 parent has a distinct mode/tile receipt.
  {auto x=m;x.linear_acc32_=false;x.action_mod_body_fp16_=true;x.resident=false;
   for(auto&w:x.layer_weights_)w.gate_ws.present=w.up_ws.present=false;
-  x.prepare_action_gateup_pair();x.plan();assert(x.use_action_gateup_pair(32)&&x.routes[0].args==std::vector<int64_t>({1,32,512,1024,8,16,432,80,128,7,14,2048,1024,2,24,0})&&x.subclass_layout_hash()!=paired_hash);
+  x.prepare_action_gateup_pair();x.plan();assert(x.use_action_gateup_pair(32)&&x.routes[0].args==std::vector<int64_t>({4,32,512,1024,8,16,208,96,256,6,12,2048,1024,2,32,0,20,34,2,4,36,1})&&x.subclass_layout_hash()!=paired_hash);
   auto alias=x;alias.routes[0].site=5257909631264440265LL;reject([&]{alias.mlp(0);});auto valid=x.routes;x.routes=m.routes;reject([&]{x.mlp(0);});x.routes=valid;
   for(int layer=0;layer<24;++layer){launches.clear();x.mlp(layer);assert(launches==std::vector<std::string>({"pair-fp16-acc16","silu","mul","down"}));}
   for(int layer=0;layer<24;++layer)for(int side=0;side<2;++side){auto y=x;(side?y.layer_weights_[layer].up_w:y.layer_weights_[layer].gate_w).storage_offset_=256;y.prepare_action_gateup_pair();assert(!y.action_gateup_pair_available_);auto z=x;(side?z.layer_weights_[layer].up_ws:z.layer_weights_[layer].gate_ws).present=true;z.prepare_action_gateup_pair();assert(!z.action_gateup_pair_available_);}
@@ -220,11 +220,11 @@ int main(){
  }
  for(auto&w:m.layer_weights_){w.gate_w.dtype=w.up_w.dtype=w.down_w.dtype=at::kChar;w.gate_ws.rank=w.up_ws.rank=w.down_ws.rank=1;w.gate_ws.owner=w.gate_w.owner+100;w.up_ws.owner=w.up_w.owner+200;w.down_ws.owner=301;}
  m.action_gateup_resident_w8_=true;m.prepare_action_gateup_pair();assert(m.action_gateup_pair_available_&&m.action_gateup_pair_w8_&&m.action_gateup_resident_layers()==6);m.plan();
- assert(m.routes[0].site==QWEN35_ACTION_GATEUP_PAIR_W8_SITE&&m.routes[0].args==std::vector<int64_t>({1,32,512,1024,8,32,240,96,128,6,12,2048,1024,2,24,6,20,28,1}));
+ assert(m.routes[0].site==QWEN35_ACTION_GATEUP_PAIR_W8_SITE&&m.routes[0].args==std::vector<int64_t>({4,32,512,1024,8,32,48,80,512,7,14,2048,1024,2,32,6,20,34,1,4,36,1}));
  const int w8proofs=tensor_proofs;launches.clear();m.mlp(0);assert(launches==std::vector<std::string>({"pair-w8","silu","mul","down"}));
  for(int layer:{4,5,6}){launches.clear();m.mlp(layer);assert(launches==std::vector<std::string>({"resident-gate","silu","resident-up","mul","down"}));reject([&]{m.launch_action_gateup_pair(layer,{});});}
  launches.clear();m.mlp(7);assert(launches==std::vector<std::string>({"pair-w8","silu","mul","down"}));assert(tensor_proofs==w8proofs);
- {auto x=m;x.linear_acc32_=false;x.action_mod_body_w8_=true;x.prepare_action_gateup_pair();x.plan();assert(x.use_action_gateup_pair(32)&&x.routes[0].args[5]==16&&x.routes[0].args[6]==352&&x.subclass_layout_hash()!=m.subclass_layout_hash());auto valid=x.routes;x.routes=m.routes;reject([&]{x.mlp(7);});x.routes=valid;linear_modes.clear();launches.clear();x.mlp(7);assert(linear_modes==std::vector<bool>({false})&&launches==std::vector<std::string>({"pair-w8","silu","mul","down"}));for(int layer:{4,5,6}){launches.clear();x.mlp(layer);assert(launches==std::vector<std::string>({"resident-gate","silu","resident-up","mul","down"}));}}
+ {auto x=m;x.linear_acc32_=false;x.action_mod_body_w8_=true;x.prepare_action_gateup_pair();x.plan();assert(x.use_action_gateup_pair(32)&&x.routes[0].args[5]==16&&x.routes[0].args[6]==64&&x.subclass_layout_hash()!=m.subclass_layout_hash());auto valid=x.routes;x.routes=m.routes;reject([&]{x.mlp(7);});x.routes=valid;linear_modes.clear();launches.clear();x.mlp(7);assert(linear_modes==std::vector<bool>({false})&&launches==std::vector<std::string>({"pair-w8","silu","mul","down"}));for(int layer:{4,5,6}){launches.clear();x.mlp(layer);assert(launches==std::vector<std::string>({"resident-gate","silu","resident-up","mul","down"}));}}
  m.routes[0].args[15]=3;launches.clear();reject([&]{m.mlp(7);});assert(launches.empty());m.plan();m.layer_weights_.back().up_ws.rank=2;m.prepare_action_gateup_pair();assert(!m.action_gateup_pair_available_);m.layer_weights_.back().up_ws.rank=1;
  KernelCache::instance().available=false;m.prepare_action_gateup_pair();m.plan();launches.clear();m.mlp(0);assert(launches==std::vector<std::string>({"gate","silu","up","mul","down"}));
 
@@ -271,7 +271,7 @@ struct RpuKernelGraph{bool staged=false,pending=false,written=false;int stages=0
 void Writer::write(Kernel&kernel){auto&g=RpuKernelGraph::active();assert(g.staged&&g.pending&&!g.written);for(auto&operand:g.operands){uint64_t v=operand.owner.address>>8;kernel.set_regs(operand.abi.lo,static_cast<uint16_t>(v));kernel.set_regs(operand.abi.hi,static_cast<uint16_t>(v>>16));}g.written=true;}
 #define GET_KERNEL(id) RpuKernelGraph::active().get(id)
 std::vector<uint64_t>flushed;void rpu_ddr_flush(c10::Half*p){flushed.push_back(reinterpret_cast<uint64_t>(p));}
-struct Queue{bool broadcast=false;void set_broadcast_mode(bool v){broadcast=v;}void enqueu_kernel(Kernel&k,std::vector<uint16_t>grid,std::vector<uint8_t>cores){auto&g=RpuKernelGraph::active();assert(broadcast&&g.staged&&g.pending&&g.written);assert(grid==std::vector<uint16_t>({14,1,1})&&cores==std::vector<uint8_t>({0,1,2,3,4,5,6,7}));g.submissions.push_back({k.regs,g.operands});g.operands.clear();g.staged=g.pending=g.written=false;}}queue;
+struct Queue{bool broadcast=false;void set_broadcast_mode(bool v){broadcast=v;}void enqueu_kernel(Kernel&k,std::vector<uint16_t>grid,std::vector<uint8_t>cores){auto&g=RpuKernelGraph::active();assert(broadcast&&g.staged&&g.pending&&g.written);assert(grid==std::vector<uint16_t>({12,1,1})&&cores==std::vector<uint8_t>({0,1,2,3,4,5,6,7}));g.submissions.push_back({k.regs,g.operands});g.operands.clear();g.staged=g.pending=g.written=false;}}queue;
 Queue*get_queue(int cores){assert(cores==8);return &queue;}
 #define GET_QUEUE(cores) get_queue(cores)
 void launch(uint32_t input,const at::Tensor&gate_weight,const at::Tensor&up_weight,uint32_t gate_output,uint32_t up_output)__BODY__
@@ -280,17 +280,17 @@ template<class F>void reject(F f){auto&g=RpuKernelGraph::active();auto before=g.
 int main(){
  auto&g=RpuKernelGraph::active();const uint32_t base=allocator.addr(0,0);
  for(uint32_t pass=0;pass<2;++pass){const uint32_t in=base+0x20000+pass*0x40000,q=in+65536,gate=q+32768;at::Tensor qw{0x1234567800ULL+pass*0x400000},gw{0x2345678900ULL+pass*0x800000};launch(in,qw,gw,q,gate);const auto&s=g.submissions.back();
-  assert(pair(s,0)==in&&pair(s,4)==q&&pair(s,26)==gate);assert(pair(s,2)==qw.address>>8&&pair(s,24)==gw.address>>8);
-  assert(pair(s,6)==0&&s.regs.at(8)==32&&pair(s,10)==512&&s.regs.at(12)==1024&&s.regs.at(13)==64&&s.regs.at(14)==0&&s.regs.at(15)==8);
-  assert(pair(s,16)==2048&&pair(s,18)==1024&&pair(s,20)==0&&s.regs.at(22)==1&&s.regs.at(23)==2);
+  assert(pair(s,0)==in&&pair(s,4)==q&&pair(s,36)==gate);assert(pair(s,2)==qw.address>>8&&pair(s,32)==gw.address>>8);
+  assert(pair(s,6)==0&&s.regs.at(8)==1&&s.regs.at(9)==32&&pair(s,10)==512&&s.regs.at(12)==1024&&s.regs.at(13)==64&&s.regs.at(14)==0&&s.regs.at(15)==8);
+  assert(pair(s,16)==2048&&pair(s,18)==1024&&pair(s,20)==0&&pair(s,22)==0&&pair(s,24)==0&&s.regs.at(26)==2&&s.regs.at(27)==2);
   assert(s.operands.size()==2&&s.operands[0].owner.address==qw.address&&s.operands[1].owner.address==gw.address);
-  for(int i=0;i<2;++i){auto&abi=s.operands[i].abi;assert(abi.role==GraphDdrRegisterRole::ModelWeight&&abi.access==GraphDdrRegisterAccess::Read&&abi.encoding==GraphDdrRegisterEncoding::DevAddrShift8LoHi&&abi.lo==(i?24:2)&&abi.hi==(i?25:3));}
+  for(int i=0;i<2;++i){auto&abi=s.operands[i].abi;assert(abi.role==GraphDdrRegisterRole::ModelWeight&&abi.access==GraphDdrRegisterAccess::Read&&abi.encoding==GraphDdrRegisterEncoding::DevAddrShift8LoHi&&abi.lo==(i?32:2)&&abi.hi==(i?33:3));}
   assert(flushed[pass*2]==qw.address&&flushed[pass*2+1]==gw.address);
  }
  const at::Tensor qw{0x1234567800ULL},gw{0x2345678900ULL};const uint32_t in=base+0x20000,q=in+65536,gate=q+32768;
  launch(base,qw,gw,base+65536,base+98304);
  const uint32_t end=base+SpmAllocator::SPM_USABLE;launch(end-131072,qw,gw,end-65536,end-32768);
- assert(pair(g.submissions.back(),26)==end-32768);
+ assert(pair(g.submissions.back(),36)==end-32768);
  for(auto regions:{std::array<uint32_t,3>{in,in,gate},{in,q,q},{in,q,in+256},{in,q-256,gate},{in,q,gate-256},{in+1,q,gate},{base-256,q,gate},{in,q,base+SpmAllocator::SPM_USABLE-8192}})reject([&]{launch(regions[0],qw,gw,regions[1],regions[2]);});
  allocator.initialized=false;reject([&]{launch(in,qw,gw,q,gate);});allocator.initialized=true;KernelCache::instance().available=false;reject([&]{launch(in,qw,gw,q,gate);});KernelCache::instance().available=true;
  for(int which:{0,1})for(int fault=0;fault<7;++fault){auto first=qw,second=gw;auto&w=which?second:first;if(fault==0){w.present=false;}if(fault==1){w.dtype=2;}if(fault==2){w.contiguous=false;}if(fault==3){w.location=c10::DeviceType::CPU;}if(fault==4){w.rank=1;}if(fault==5){w.rows=1024;}if(fault==6){w.cols=512;}reject([&]{launch(in,first,second,q,gate);});}

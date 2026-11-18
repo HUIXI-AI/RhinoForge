@@ -50,14 +50,11 @@ def test_exact_w8_profile_uses_existing_role_topology_and_rejects_neighbours(cor
     topology = validate_core_profile(config, execution)
     assert (topology.num_cores, topology.attn_tp, topology.mlp_tp) == (cores, 4, cores)
     for size in (0.8, 4, 9):
-        with pytest.raises(ValueError, match="exact 2B"):
-            validate_core_profile(_w8_config(size), execution)
-    for fault in ("uniform_w8", "w4", "fp16_gdn", "width", "nested_quant"):
+        assert validate_core_profile(_w8_config(size), execution).num_cores == cores
+    for fault in ("w4_group64", "fp16_gdn", "width", "nested_quant"):
         bad = copy.deepcopy(config)
-        if fault == "uniform_w8":
-            bad.quant_config = {"method": "w8a16"}
-        elif fault == "w4":
-            bad.quant_config["default"] = {"method": "w4a16_pgrp", "group_size": 32}
+        if fault == "w4_group64":
+            bad.quant_config["default"] = {"method": "w4a16_pgrp", "group_size": 64}
         elif fault == "fp16_gdn":
             bad.quant_config["projection_overrides"]["linear_attn.in_proj_z"] = {"method": "fp16"}
         elif fault == "width":
@@ -71,7 +68,6 @@ def test_exact_w8_profile_uses_existing_role_topology_and_rejects_neighbours(cor
 @pytest.mark.parametrize("cores", [4, 6])
 @pytest.mark.parametrize("acc32", [False, True])
 def test_public_w8_install_preserves_actual_dtype_scale_and_role_partition(native_boundary, monkeypatch, cores, acc32):
-    monkeypatch.setenv("QWEN3_5_QUANT_ALLOW_UNCERTIFIED", "1")
     model = _w8_model()
     inner = model.model.language_model
     adapter = qwen3_5.Qwen3_5Adapter(model, rpu_execution={
@@ -111,7 +107,6 @@ def test_public_w8_install_preserves_actual_dtype_scale_and_role_partition(nativ
 
 @pytest.mark.parametrize("fault", ["missing_scale", "short_scale", "fp16_weight", "int8_scalar", "noncontiguous", "already_packed"])
 def test_bad_w8_storage_rejects_before_claim_and_irreversible_transform(native_boundary, monkeypatch, fault):
-    monkeypatch.setenv("QWEN3_5_QUANT_ALLOW_UNCERTIFIED", "1")
     model = _w8_model()
     inner = model.model.language_model
     with inner.norm.weight.fake_mode:
@@ -130,6 +125,6 @@ def test_bad_w8_storage_rejects_before_claim_and_irreversible_transform(native_b
         else:
             last.weight = torch.nn.Parameter(torch.empty(6144, 2048, dtype=torch.int8).t(), requires_grad=False)
         adapter = qwen3_5.Qwen3_5Adapter(model, rpu_execution={"model": {"num_cores": 6}})
-        with pytest.raises(ValueError, match="raw W8/FP16 storage|FP16 scale"):
+        with pytest.raises(ValueError, match="raw quantized/FP16 storage|FP16 scale"):
             adapter.to_rpu(max_seq_len=64)
     assert native_boundary.events == native_boundary.packed == []

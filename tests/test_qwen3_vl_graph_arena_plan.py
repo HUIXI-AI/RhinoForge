@@ -1,7 +1,7 @@
 """Host contracts for the exact 32B runtime-W8 cold instruction arena plan.
 
 Real adapter/installer/cache decisions run with native and tensor-transfer
-boundaries doubled. These tests do not establish SDK capacity or device numerics.
+boundaries doubled. These tests do not establish SDK capacity or RPU numerics.
 """
 from __future__ import annotations
 
@@ -245,7 +245,7 @@ def test_native_cache_capacity_rejects_ninth_signature_before_graph_construction
 using GraphSignature = int;
 struct RpuKernelGraph {};
 int constructions = 0;
-std::shared_ptr<RpuKernelGraph> make_registered_rpu_kernel_graph(int) {
+std::shared_ptr<RpuKernelGraph> make_registered_rpu_kernel_graph(int, bool) {
     ++constructions;
     return std::make_shared<RpuKernelGraph>();
 }
@@ -253,6 +253,7 @@ struct RpuGraphCacheEntry { std::shared_ptr<RpuKernelGraph> graph; GraphSignatur
 struct RpuGraphCache {
     size_t max_entries_ = 8;
     int runtime_policy_ = 0;
+    bool require_single_segment_ = false;
     std::map<GraphSignature, RpuGraphCacheEntry> entries_;
     void add_to_layered_index(const GraphSignature&) {}
     RpuKernelGraph& get_or_create(const GraphSignature& sig);

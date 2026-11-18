@@ -20,23 +20,24 @@ def gemma_host_executable(tmp_path_factory):
     method = source[source.index("    FmbPhysicalExecutionManifest physical_manifest_for_candidate("):]
     method = method.split("\n    FmbPhysicalManifestForwardCapability", 1)[0]
     method = method.replace(") const override {", ") const {")
+    qkv_arguments = source[source.index("    std::vector<int64_t> pi05_qkv_pair_arguments() const {"):]
+    qkv_arguments = qkv_arguments.split("    bool pi05_qkv_pair_owner()", 1)[0]
     helpers = source[source.index("    RpuRmsNormSpmRoute consume_rmsnorm_route("):]
     helpers = helpers.split("    std::vector<int64_t> kvinsert_cost_weight_identity()", 1)[0]
     declarations = (ROOT / "src/core/rpu_kernel_decls.h").read_text()
     resolver = declarations[declarations.index("enum RpuRmsNormCapability"):
-                            declarations.index("RpuRmsNormSpmContract rpu_snapshot_rmsnorm_spm_contract")]
+                            declarations.index("inline RpuMixedRmsNormSpmRoute rpu_resolve_mixed_rmsnorm_spm_route")]
     consumer_source = (ROOT / "src/core/fmb_three_stage_chunk_plan.cpp").read_text()
     consume = consumer_source[consumer_source.index("const FmbRouteManifestEntry& FmbPhysicalManifestConsumer::consume_route("):]
     consume = consume.split("\nAttentionExecutionPolicy", 1)[0]
     consume = consume.replace("FmbPhysicalManifestConsumer::consume_route", "consume_physical_route")
-    # Execute all three production launch expressions, including the resolver
-    # and the real physical-consumer mismatch check, against a native sink.
-    # The ordinary KV_FIRST body has three RMS sites. Optimized Pi pair
-    # emitters have their own calls outside this body.
-    ordinary = source[source.index("    void emit_kv_first_body("):]
-    ordinary = ordinary.split("\nprivate:", 1)[0]
-    launches = re.findall(r"rpu_launch_rmsnorm_spm_kernel\([\s\S]*?\);", ordinary)
-    assert len(launches) == 3
+    # Exercise the ordinary input/post/final normalization launches. Paired
+    # Pi callbacks have separate owners and do not use this Gemma fixture.
+    launches = [call for call in re.findall(r"rpu_launch_rmsnorm_spm_kernel\([\s\S]*?\);", source)
+                if "seq_len, h, eps_" in call]
+    assert {re.search(r"consume_rmsnorm_route\((GEMMA_\w+)", call).group(1)
+            for call in launches} == {"GEMMA_INPUT_RMSNORM_SITE", "GEMMA_POST_RMSNORM_SITE",
+                                      "GEMMA_FINAL_RMSNORM_SITE"}
     dispatch = "\n".join(
         "if (site == " + re.search(r"consume_rmsnorm_route\((GEMMA_\w+)", call).group(1)
         + ") { " + call + " return; }" for call in launches
@@ -45,21 +46,6 @@ def gemma_host_executable(tmp_path_factory):
     # builder; the test does not need the native ABI or a device allocation.
     names = sorted(set(re.findall(r"\b(?:GEMMA_|FMB_SHARED_|PI05_)[A-Z0-9_]+\b", method)))
     constants = "\n".join(f"constexpr int64_t {name} = {index + 1};" for index, name in enumerate(names))
-    # This host double selects the ordinary Gemma path. Pi-only policies stay
-    # OFF while the production builder and RMS route consumer execute below.
-    cold_flags = sorted(set(re.findall(r"\b(pi05_\w+_)\b", method)))
-    cold_helpers = sorted(set(re.findall(r"\b((?:use_)?pi05_\w+)\(", method)))
-    cold_state = "\n".join(f"bool {name}=false;" for name in cold_flags)
-    for name in cold_helpers:
-        if name.endswith("arguments"):
-            result, value = "std::vector<int64_t>", "{}"
-        elif name.endswith("routes"):
-            result, value = "std::vector<Entry>", "{}"
-        elif name.endswith("accumulation"):
-            result, value = "FmbLinearAccumulationPolicy", "FmbLinearAccumulationPolicy::ACC16"
-        else:
-            result, value = "int64_t", "400" if name == "pi05_pair_rows" else "0"
-        cold_state += f"\ntemplate<class... T> {result} {name}(T...) const {{ return {value}; }}"
     program = r'''
 #include <algorithm>
 #include <cassert>
@@ -68,6 +54,7 @@ def gemma_host_executable(tmp_path_factory):
 #include <stdexcept>
 #include <utility>
 #include <vector>
+#include "src/ops/rpu_pi_wall_tiling.h"
 #define TORCH_INTERNAL_ASSERT(condition) assert(condition)
 #define TORCH_CHECK(condition, ...) do { if (!(condition)) throw std::runtime_error("invalid plan"); } while (0)
 enum class ChunkMode { KV_FIRST };
@@ -95,12 +82,12 @@ struct FmbPhysicalExecutionManifest {
 struct KvInsertSegmentPlan { int64_t route() const { return 2; } };
 constexpr int64_t KV_INSERT_CAP_V2 = 2, KV_INSERT_CAP_V16 = 4;
 enum class KvInsertRoute { ALIGNED_V16 };
-template<class... T> KvInsertSegmentPlan rpu_resolve_kvinsert_segment_plan(T...) { return {}; }
+KvInsertSegmentPlan rpu_resolve_kvinsert_segment_plan(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, KvInsertRoute) { return {}; }
 using KvInsertRouteArguments = std::vector<int64_t>;
 KvInsertSegmentPlan rpu_resolve_kvinsert_segment_plan_auto(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t) { return {}; }
 KvInsertRouteArguments rpu_kvinsert_route_arguments(const KvInsertSegmentPlan&, int64_t, int64_t, int64_t) { return {}; }
-int64_t fmb_ring_all_reduce_route_selector(int64_t, int64_t, bool, int=8) { return 1; }
-void append_fmb_shared_runtime_routes(FmbPhysicalExecutionManifest&, const FmbThreeStageChunkPlan&, int64_t, int64_t, int64_t, bool, int, int) {}
+int64_t fmb_ring_all_reduce_route_selector(int64_t, int64_t, int64_t, int64_t = 8) { return 1; }
+void append_fmb_shared_runtime_routes(FmbPhysicalExecutionManifest&, const FmbThreeStageChunkPlan&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t) {}
 ''' + constants + resolver + r'''
 using FmbRouteManifestEntry = Entry;
 namespace at { using IntArrayRef = std::vector<int64_t>; }
@@ -116,16 +103,52 @@ struct Context {
     }
 ''' + consume + r'''
 };
-struct Launch { int64_t rows, width; double eps; RpuRmsNormSpmRoute route; };
+struct Launch { int64_t rows, width; double eps; RpuRmsNormSpmRoute route; int cores; };
 std::vector<Launch> launched;
 void rpu_launch_rmsnorm_spm_kernel(uint32_t, uint32_t, uint32_t, int64_t rows, int64_t width, double eps, RpuRmsNormSpmRoute route, int cores) {
-    assert(cores == 8);
-    launched.push_back({rows, width, eps, route});
+    launched.push_back({rows, width, eps, route, cores});
 }
 class GemmaGeometry {
 public:
     bool subclass_spm_kv_by_mha_eligible(const FmbThreeStageChunkPlan&, const LayoutContext&, int64_t) const { return false; }
     int64_t q = 8, kv = 1, hd = 256, tp = 1, h = 2048, layers = 18;
+    bool pi05_prefill_kv1_pair_direct_ = false;
+    bool pi05_prefill_o_pair_ = false, pi05_prefill_gateup_pair_ = false;
+    bool pi05_prefill_kv_only_ = false, pi05_prefill_qkv_pair_ = false;
+    bool pi05_prefill_owner_norm_ = false, pi05_prefill_down_pair_ = false;
+    FmbLinearAccumulationPolicy pi05_prefill_linear_accumulation() const { return FmbLinearAccumulationPolicy::ACC16; }
+    int pi05_prefill_dma_policy() const { return 0; }
+    int64_t pair_rows = 400;
+    bool fp16 = false;
+    int cores = 8;
+    int64_t pi05_pair_rows() const { return pair_rows; }
+    int64_t pi05_prefix_rows() const { return 2 * pair_rows; }
+    bool pi05_pair_fp16() const { return fp16; }
+    bool use_pi05_ring_xor3(int64_t) const { return false; }
+    std::vector<Entry> pi05_o_pair_routes() const { return {}; }
+    template<class... T> bool pi05_prefill_a8_short(T...) const { return false; }
+    template<class... T> bool pi05_prefill_a8_short_domain(T...) const { return false; }
+    template<class... T> bool pi05_prefill_kv1_pair_direct_domain(T...) const { return false; }
+    template<class... T> bool pi05_prefill_gateup_pair_domain(T...) const { return false; }
+    template<class... T> bool pi05_prefill_kv_only_owner(T...) const { return false; }
+    template<class... T> bool pi05_o_pair_domain(T...) const { return false; }
+    template<class... T> bool pi05_qkv_pair_domain(T...) const { return false; }
+    template<class... T> bool pi05_down_pair_layout(T...) const { return false; }
+    template<class... T> bool pi05_owner_norm_layout(T...) const { return false; }
+    template<class... T> bool pi05_geglu_eligible(T...) const { return false; }
+    std::vector<int64_t> pi05_prefill_kv1_pair_direct_policy_arguments() const { return {}; }
+    std::vector<int64_t> pi05_o_pair_arguments() const { return {}; }
+    std::vector<int64_t> pi05_prefill_gateup_pair_arguments() const { return {}; }
+    std::vector<int64_t> pi05_prefill_a8_short_arguments() const { return {}; }
+    std::vector<int64_t> pi05_prefill_kv_only_arguments() const { return {}; }
+''' + qkv_arguments + r'''
+    std::vector<int64_t> pi05_owner_norm_arguments() const { return {}; }
+    std::vector<int64_t> pi05_down_pair_arguments() const { return {}; }
+    std::vector<int64_t> pi05_prefill_kv1_pair_owner_linear_arguments() const { return {}; }
+    template<class... T> int64_t pi05_pair_mask_selector(T...) const { throw std::runtime_error("unexpected Pi paired route"); }
+    template<class... T> int64_t pi05_pair_mask_bytes(T...) const { throw std::runtime_error("unexpected Pi paired route"); }
+    template<class... T> int64_t pi05_pair_owner_elements(T...) const { throw std::runtime_error("unexpected Pi paired route"); }
+    template<class... T> int64_t pi05_pair_owner_bytes(T...) const { throw std::runtime_error("unexpected Pi paired route"); }
     double eps_ = 1e-6;
     RpuRmsNormSpmContract rmsnorm_spm_contract_{
         RPU_RMSNORM_CAP_GENERIC_DIRECT_SPM};
@@ -134,20 +157,20 @@ public:
     int64_t num_kv_heads() const { return kv; }
     int64_t head_dim() const { return hd; }
     int64_t attn_tp() const { return tp; }
+    int64_t mlp_tp() const { return 8; }
+    int num_cores() const { return cores; }
+    std::vector<int64_t> core_profile_arguments() const { return {}; }
     int64_t hidden_size() const { return h; }
     int64_t num_layers() const { return layers; }
-    int64_t num_cores() const { return 8; }
-    int64_t mlp_tp() const { return 8; }
-    std::vector<int64_t> core_profile_arguments() const { return {}; }
     const Context& ctx() const { return context; }
     uint32_t addr(int, const char*) const { return 0; }
     uint32_t layer_addr(int, int, const char*) const { return 0; }
-''' + cold_state + helpers + r'''
+''' + helpers + r'''
     void emit_for_test(int64_t site, const ChunkInfo& chunk) {
         const int64_t seq_len = chunk.len;
         const int layer_idx = 0;
         const char* kv_norm = "input_norm";
-        const char* mlp_input = "residual2";
+        const char* mlp_input = "input_norm";
 ''' + dispatch + r'''
         throw std::runtime_error("unknown RMS site");
     }
@@ -254,7 +277,8 @@ void test_rms_routes() {
                 model.emit_for_test(entry.site, chunk);
                 assert(launched.size() == 1);
                 assert(launched[0].route == expected && launched[0].rows == chunk.len &&
-                       launched[0].width == model.h && launched[0].eps == model.eps_);
+                       launched[0].width == model.h && launched[0].eps == model.eps_ &&
+                       launched[0].cores == model.num_cores());
                 ++normalization_count;
                 // A self-consistent legacy selector is still the wrong exact
                 // route for a newly resolved plan and must fail before launch.
@@ -274,17 +298,68 @@ void test_rms_routes() {
         }
     }
 }
+void test_inactive_qkv_policy() {
+    LayoutContext layout;
+    for (bool fp16 : {false, true}) for (int cores : {4, 6, 8})
+    for (int rows : {272, 288, 304, 320, 336, 400, 416, 432, 448, 464}) {
+        GemmaGeometry model;
+        model.fp16 = fp16; model.cores = cores; model.pair_rows = rows;
+        FmbThreeStageChunkPlan plan;
+        plan.qkv.chunks = {{0, 0, rows, rows}, {1, rows, rows, 2 * rows}};
+        plan.compute.chunks = plan.qkv.chunks;
+        const auto manifest = model.physical_manifest_for_candidate(
+            plan, layout, 2 * rows, 2 * rows, 0);
+        const auto args = model.pi05_qkv_pair_arguments();
+        const bool supported_pair = !fp16 && rows == 400;
+        assert(args.empty() != supported_pair);
+        int policies = 0;
+        for (const auto& entry : manifest.routes) {
+            if (entry.site == PI05_QKV_PAIR_POLICY_SITE) {
+                ++policies;
+                assert(entry.family == FmbRouteFamily::GRAPH_SCHEDULE &&
+                       entry.flags == 0 && entry.arguments == args);
+            }
+            assert(entry.site != PI05_QKV_PAIR_Q_SITE &&
+                   entry.site != PI05_QKV_PAIR_K_SITE &&
+                   entry.site != PI05_QKV_PAIR_V_SITE &&
+                   entry.site != PI05_QKV_PAIR_SCHEDULE_SITE);
+        }
+        assert(policies == 1);
+        model.bind(manifest);
+        model.ctx().consume_physical_route(FmbRouteFamily::GRAPH_SCHEDULE,
+            PI05_QKV_PAIR_POLICY_SITE, 1, 0, model.pi05_qkv_pair_arguments(), 0);
+        // A descriptor from an enabled handle must still fail before dispatch.
+        model.bind(manifest);
+        for (auto& entry : model.context.manifest_.routes)
+            if (entry.site == PI05_QKV_PAIR_POLICY_SITE) entry.flags = 1;
+        bool rejected = false;
+        try { model.ctx().consume_physical_route(FmbRouteFamily::GRAPH_SCHEDULE,
+            PI05_QKV_PAIR_POLICY_SITE, 1, 0, model.pi05_qkv_pair_arguments(), 0); }
+        catch (const std::runtime_error&) { rejected = true; }
+        assert(rejected);
+        model.pi05_prefill_qkv_pair_ = true;
+        if (supported_pair) {
+            assert(model.pi05_qkv_pair_arguments() == args && args.size() == 19);
+        } else {
+            rejected = false;
+            try { (void)model.pi05_qkv_pair_arguments(); }
+            catch (const std::invalid_argument&) { rejected = true; }
+            assert(rejected);
+        }
+    }
+}
 int main(int argc, char** argv) {
     assert(argc == 2);
     if (std::string(argv[1]) == "kv") test_kv_length();
     else if (std::string(argv[1]) == "rms") test_rms_routes();
+    else if (std::string(argv[1]) == "qkv_off") test_inactive_qkv_policy();
     else return 1;
 }
 '''
     path = tmp_path / "gemma_manifest.cpp"
     path.write_text(program)
     executable = tmp_path / "gemma_manifest"
-    subprocess.run([compiler, "-std=c++17", str(path), "-o", str(executable)], check=True)
+    subprocess.run([compiler, "-std=c++17", "-I", str(ROOT), str(path), "-o", str(executable)], check=True)
     return executable
 
 
@@ -294,6 +369,10 @@ def test_kv_first_manifest_uses_full_prefix_for_every_compute_chunk(gemma_host_e
 
 def test_gemma_rms_routes_use_operator_shape_and_reject_stale_plan(gemma_host_executable):
     subprocess.run([str(gemma_host_executable), "rms"], check=True)
+
+
+def test_inactive_qkv_policy_keeps_strict_descriptor_consumption(gemma_host_executable):
+    subprocess.run([str(gemma_host_executable), "qkv_off"], check=True)
 
 
 def test_rms_vector_routes_preserve_legacy_abi_and_use_canonical_schedule():
@@ -316,7 +395,6 @@ def test_rms_vector_routes_preserve_legacy_abi_and_use_canonical_schedule():
         (canonical_v16, "RMS_NORM_SPM_V16"),
         (canonical_v32, "RMS_NORM_SPM_V32"),
     ):
-        assert f"KernelId::{kernel}" in route
-        assert "GET_KERNEL(" in route
+        assert f"KernelId::{kernel}" in route and "GET_KERNEL(" in route
         assert re.search(r"grid_x\s*=\s*8\s*;", route)
         assert re.search(r"reg3\s*=\s*static_cast<uint16_t>\(M / 8\)\s*;", route)

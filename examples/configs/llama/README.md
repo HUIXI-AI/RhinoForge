@@ -1,74 +1,54 @@
 # Llama 配置
 
-[配置索引](../CONFIGURATIONS.md) · [准备与运行](#使用)
+[配置总览](../README.md) · [全部配置](#configurations) · [权重准备](../WEIGHTS.md) · [参数说明](../PARAMETERS.md)
 
-本目录提供 Llama 3.2 1B base 的 FP16 文本生成配置。
+<a id="配置矩阵"></a>
 
-## 配置说明
+[Llama 3.2 1B FP16](3_2_1b/fp16.toml) 用于文本生成。先准备 `llama-3.2-1b` 对应权重，再在 TOML 中设置提示词和解码步数。
 
-<a id="weight-recipes"></a>
-<a id="配置与权重对应关系"></a>
+## 运行
 
-| 配置 | 计算范围 | 权重获取 |
-|---|---|---|
-| [3_2_1b/fp16.toml](3_2_1b/fp16.toml) | Llama 3.2 1B base 文本生成，FP16 | [官方 BF16 权重](#weights)，加载时转 FP16 |
-
-<a id="fp16-基准做了什么"></a>
-
-### 精度与执行
-
-Attention、MLP、embedding、norm 和输出 head 的模型权重加载为 FP16，主路径使用 FP16 激活。公共入口通过 `RPUModelForCausalLM` 安装模型，按实际 prompt 与 decode 长度创建 KV cache；prefill 写入整段提示词，之后逐 token decode 并复用已有 K/V。
-
-模板设置 `rpu_execution.prefill.chunk_size="auto"`，由执行规划器选择分块。分块大小改变执行安排，`input.prompt` 和 `input.decode_steps` 决定实际输入与生成工作量。加载器见 [runner](../../runners/llama/runner.py)，生成和 cache 调用见[公共文本入口](../../common/text.py)。
-
-## 准备与运行
-
-<a id="weight-sources"></a>
-<a id="weights"></a>
-<a id="quantization"></a>
-<a id="权重准备"></a>
-
-### 获取权重
-
-`example.registry_alias="llama-3.2-1b"` 固定读取 `$RPU_MODEL_CACHE/Llama-3.2-1B`。权重与 tokenizer 来自同一套 base 1B 资产。
-
-在 [meta-llama/Llama-3.2-1B](https://huggingface.co/meta-llama/Llama-3.2-1B) 取得访问权限后，在仓库根目录下载完整 checkpoint：
+从仓库根目录先检查配置，再运行：
 
 ```bash
-export RPU_MODEL_CACHE=/path/to/model-cache
-hf download meta-llama/Llama-3.2-1B \
-  --local-dir "$RPU_MODEL_CACHE/Llama-3.2-1B"
+python examples/run.py --config examples/configs/llama/3_2_1b/fp16.toml --check-config
+python examples/run.py --config examples/configs/llama/3_2_1b/fp16.toml
 ```
 
-官方文件存储为 BF16，运行时由加载器转换，无需另存 FP16 文件。仓库登记记录还使用过 BF16 的 [unsloth 镜像](https://huggingface.co/unsloth/Llama-3.2-1B)；单个缓存目录只放一套完整权重。
+输入长度、解码长度和核心范围见[全部配置](#configurations)。调整这些参数后，在新进程中重新加载配置；输出字段见[结果说明](../../RESULTS.md)。
 
-<a id="使用"></a>
+<!-- model-configurations-start -->
 
-### 输入与运行
+<a id="configurations"></a>
+## 全部配置与输入范围
 
-在已安装项目依赖的设备环境中，复制模板并填写文本和输出目录：
+每组先列各配置不同的项，再列本组配置相同的项；修改相机、文本长度、精度或核数时，同时满足联动限制。4/6/8 核列：● 已在板上运行通过（4/6 核写出各组件实际核数），○ 支持但未在板上运行，✕ 不支持（原因列在表下）。支持状态和 CPU 线程数的读法见配置表说明；实测耗时见性能报告：Llama。
 
-```bash
-cp examples/configs/llama/3_2_1b/fp16.toml /tmp/llama_fp16.toml
-# 修改 input.prompt，并在 [run] 中添加 output_dir。
-vi /tmp/llama_fp16.toml
-python examples/run.py --config /tmp/llama_fp16.toml --check-config
-python examples/run.py --config /tmp/llama_fp16.toml
-```
+P 为处理后的输入 token 数，D 为 decode 调用数；生成首 token 来自 prefill。
 
-<a id="输入与执行参数"></a>
+### Llama 文本
 
-### 常用参数
+| 项目 | 值 |
+|---|---|
+| 配置 | [3_2_1b/fp16.toml](3_2_1b/fp16.toml) |
+| 支持状态 | 支持（`SUPPORTED`） |
+| 精度 | fp16 |
+| 量化范围 | — |
+| 输入类型 | 文本 / token IDs |
+| prompt 默认示例 | Explain what a compiler does. |
+| decode_steps 默认值 | 4 |
+| 文本可调范围 | 非空文本或非负 token IDs；P≥1 |
+| 生成可调范围 | D≥0；EOS可提前结束 |
+| 其他输入形状 | B=1 |
+| 联动限制 | Llama3.2-1B 当前物理 prefill 位置+执行长度≤64，chunk≤64；P+D 另受逻辑 cache 与 checkpoint 位置范围约束。 |
+| 默认核数 | 8 |
+| 4 核 | ● 已实测（注意力 4 · MLP 4 · 输出头 4） |
+| 6 核 | ● 已实测（注意力 4 · MLP 6 · 输出头 4） |
+| 8 核 | ● 已实测 |
+| CPU线程数 | 未设置（沿用环境） |
+| 权重 | `llama-3.2-1b` |
+| 入口 | [run.py](../../run.py) |
 
-| 字段 | 模板值 | 省略时 | 范围与关联 |
-|---|---|---|---|
-| `input.prompt` | `Explain what a compiler does.` | 未提供 `prompt_token_ids` 时必填 | 用 checkpoint tokenizer 分词 |
-| `input.decode_steps` | 4 | 4 | 非负整数；prefill 先产生一个 token，再执行最多指定次数的 decode |
-| `input.stop_on_eos` | 未配置 | `true` | 遇 EOS 提前结束 |
-| `rpu_execution.prefill.chunk_size` | `"auto"` | `"auto"` | 选择 prefill 分块，显式值由执行规划器检查 |
+输入校验来源：[runner.py](../../../examples/runners/llama/runner.py) · [llama.py](../../../python/rpu_backend/adapters/llama.py) · [decoder.py](../../../python/rpu_backend/runtime/decoder.py) · [fused_model_base.cpp](../../../src/core/fused_model_base.cpp)。
 
-模板的 `run.warmup/runs/seed` 为 2 / 3 / 0，`cpu.threads` 未配置。通用字段的默认值、输出目录、计时与诊断选项见[公共参数说明](../PARAMETERS.md)。
-
-## 输出
-
-输出生成 token 与运行摘要，产物保存在 `run.output_dir`。
+<!-- model-configurations-end -->

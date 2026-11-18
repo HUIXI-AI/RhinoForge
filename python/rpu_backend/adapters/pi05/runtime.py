@@ -406,6 +406,25 @@ def _validate_prepared_graph_profile(self, num_steps: int) -> None:
         )
 
 
+def _validate_prepared_language_count(self, masks) -> None:
+    """Refuse an unprepared valid language count before any Graph runs.
+
+    Only a policy prepared with ``language_token_counts`` records its counts;
+    any other count would miss its denoise Graph after Vision and prefill.
+    """
+    prepared = _PI05_PREPARED_GRAPH_PROFILES.get(self) or {}
+    counts = prepared.get("language_token_counts")
+    if not counts or not torch.is_tensor(masks):
+        return
+    for row in masks:
+        count = int(row.sum())
+        if count not in counts:
+            raise RuntimeError(
+                f"Pi0.5 request has {count} valid language tokens; the READY "
+                f"policy was prepared for {counts}. Online graph BUILD is "
+                "disabled.")
+
+
 # CR-R5 BLOCKER 9: allowlist of permitted `**kwargs` to the device-path sample_actions
 # (from _adapter.py:480). Unknown kwargs raise instead of being silently dropped.
 _RPU_ALLOWED_SAMPLE_ACTIONS_KWARGS = {"num_steps"}
@@ -1639,6 +1658,9 @@ def install_sample_actions_patch() -> None:
                 final_fused,
                 final_baseline,
                 where="[Pi05Fused] output boundary mismatch",
+                # The boundary follows the configured action horizon (M50 or M10).
+                expected_shape=(bsize, int(self.config.chunk_size),
+                                int(self.config.max_action_dim)),
             )
         except RuntimeError as exc:
             raise RuntimeError(
@@ -1683,6 +1705,7 @@ def install_sample_actions_patch() -> None:
         if num_steps is None:
             num_steps = self.config.num_inference_steps
         _validate_prepared_graph_profile(self, num_steps)
+        _validate_prepared_language_count(self, masks)
 
         # The fused denoise loop is the previous prediction's final subsystem
         # and intentionally keeps its graph-owned SPM plan alive. Reset the

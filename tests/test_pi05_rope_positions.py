@@ -29,6 +29,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from _example_toml import load_example_toml
 
 _ROOT = Path(__file__).resolve().parents[1]
 _PI05 = _ROOT / "python" / "rpu_backend" / "adapters" / "pi05"
@@ -152,8 +153,8 @@ def test_prefill_rope_preparation_preserves_cpu_and_rpu_routes(
     if route != "cached":
         engine = runpy.run_path(str(_ROOT / "examples/runners/pi05/optimized.py"))
         for cameras in (2, 3):
-            config = tomllib.loads((_ROOT / "examples/configs/pi05" /
-                                  f"{cameras}cam/{route}.toml").read_text())
+            config = load_example_toml(_ROOT / "examples/configs/pi05" /
+                                       f"{cameras}cam/h50/{route}.toml")
             for text_tokens in (32, 64, 128, 160):
                 config["input"]["text_tokens"] = text_tokens
                 args = engine["_example_arguments"](config)
@@ -307,6 +308,10 @@ def test_native_rope_cpu_dispatch_refreshes_stable_owners_and_rejects_bad_inputs
 #include <memory>
 #include <vector>
 bool g_rpu_ddr_flush_enabled=true,g_rpu_ddr_flush_force_enabled=true;
+// No Graph submission is pending in this harness (graph/graph_async_end.h).
+bool rpu_graph_async_end_pending() noexcept{return false;}
+void rpu_graph_async_end_wait(const char*) noexcept{}
+template<class S> bool rpu_graph_async_end_independent_write(const void*,size_t,const S&) noexcept{return false;}
 struct Store{at::Tensor value;std::vector<uint8_t> ddr;bool rpu,device_dirty=false;};
 std::vector<std::weak_ptr<Store>> stores;
 std::vector<std::pair<void*,size_t>> flushes;

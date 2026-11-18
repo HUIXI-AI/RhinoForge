@@ -137,6 +137,138 @@ def _native_domain_v3(execution_len, chunks, *, position=0):
     return [1, 1, len(descriptor), *descriptor]
 
 
+def _ranked_domain(execution_len, rows, *, logical_len=None, policy=1):
+    descriptors = []
+    for chunk, mixer_calls in rows:
+        descriptor = _native_candidate_v2(
+            execution_len, (chunk,) * 3, logical_len=logical_len,
+            descriptor_version=3)
+        descriptor[0] = 4
+        descriptor.extend((policy, mixer_calls))
+        descriptor[1] = len(descriptor)
+        descriptors.append(descriptor)
+    return [1, len(descriptors), *(word for descriptor in descriptors
+                                  for word in (len(descriptor), *descriptor))]
+
+
+def test_outer_then_mixer_opt_in_fixes_equal_outer_count_ranking():
+    # The observed P4096 candidates: same six outer calls, but very different
+    # absolute-start SDPA schedules. Old tail-deficit scoring preferred C704.
+    legacy = _MODULE.plan_prefill(4096, 4096, 0,
+        resolve_stage_domain=lambda e: _native_domain(e, (704,) * 3, (768,) * 3))
+    ranked = _MODULE.plan_prefill(4096, 4096, 0,
+        resolve_stage_domain=lambda e: _ranked_domain(e, ((704, 32), (768, 11))))
+    assert legacy.selected.stage_tuple.compute_chunk == 704
+    assert ranked.selected.stage_tuple.compute_chunk == 768
+    assert ranked.selected.score[:4] == (6, 11, 0, 512)
+    assert dict(ranked.selected.stage_tuple.physical_metadata)["ranking_policy"] == 1
+
+
+@pytest.mark.parametrize("policy", [1, 2])
+def test_outer_then_mixer_keeps_outer_priority_exact_and_cost_priority(policy):
+    raw = _ranked_domain(4096, ((704, 32), (768, 11), (1024, 100)), policy=policy)
+    decoded = _MODULE._decode_native_stage_domain(
+        raw, execution_len=4096, logical_len=4096, position=0,
+        graph_mode=_MODULE.GRAPH_RETAINED_CACHE)
+    outer = _MODULE.plan_a6(4096, tuple_domain={4096: decoded})
+    assert outer.selected.stage_tuple.compute_chunk == 1024
+    exact = _MODULE.plan_a6(4096, request={"mode": "EXACT", "chunk_size": 704},
+        tuple_domain={4096: decoded})
+    assert exact.selected.stage_tuple.compute_chunk == 704
+    measured = tuple(replace(row, physical_metadata=(
+        *row.physical_metadata, ("hardware_cost_score", 1 if row.compute_chunk == 704 else 2)))
+        for row in decoded)
+    cost = _MODULE.plan_a6(4096, tuple_domain={4096: measured})
+    assert cost.selected.stage_tuple.compute_chunk == 704
+    assert cost.selected.score[0] == 1
+
+
+@pytest.mark.parametrize("trailer", [(0, 11), (3, 11), (1, 0), (1, 5), (1, 4097)])
+def test_outer_then_mixer_rejects_unknown_or_invalid_native_metric(trailer):
+    raw = _ranked_domain(4096, ((768, 11),))
+    raw[-2:] = trailer
+    with pytest.raises(ValueError, match="ranking policy or mixer count"):
+        _MODULE._decode_native_stage_domain(raw, execution_len=4096,
+            logical_len=4096, position=0, graph_mode=_MODULE.GRAPH_RETAINED_CACHE)
+
+
+@pytest.mark.parametrize("policy", [1, 2])
+def test_outer_then_mixer_metric_is_bound_and_domain_cannot_mix_policies(policy):
+    raw = _ranked_domain(4096, ((768, 11),), policy=policy)
+    decode = lambda words: _MODULE._decode_native_stage_domain(words,
+        execution_len=4096, logical_len=4096, position=0,
+        graph_mode=_MODULE.GRAPH_RETAINED_CACHE)
+    ranked = decode(raw)
+    stale = replace(ranked[0], physical_metadata=tuple(
+        (key, 12 if key == "ranking_mixer_calls" else value)
+        for key, value in ranked[0].physical_metadata))
+    with pytest.raises(ValueError, match="bound native v4 descriptor"):
+        _MODULE.plan_a6(4096, tuple_domain={4096: (stale,)})
+    dropped = replace(ranked[0], physical_metadata=tuple(
+        pair for pair in ranked[0].physical_metadata if not pair[0].startswith("ranking_")))
+    with pytest.raises(ValueError, match="bound native v4 descriptor"):
+        _MODULE.plan_a6(4096, tuple_domain={4096: (dropped,)})
+    legacy = _MODULE.StageTuple(704, 704, 704)
+    with pytest.raises(ValueError, match="mixes ranking policies"):
+        _MODULE.plan_a6(4096, tuple_domain={4096: (legacy, *ranked)})
+    other = decode(_ranked_domain(4096, ((704, 32),), policy=3-policy))
+    with pytest.raises(ValueError, match="mixes ranking policies"):
+        _MODULE.plan_a6(4096, tuple_domain={4096: (*other, *ranked)})
+    first = _MODULE.plan_a6(4096, tuple_domain={4096: ranked})
+    raw[-1] = 12
+    second = _MODULE.plan_a6(4096, tuple_domain={4096: decode(raw)})
+    assert first.domain_digest != second.domain_digest
+
+
+@pytest.mark.parametrize("policy", [1, 2])
+def test_hw_evidence_accepts_ranked_descriptor_and_keeps_metric(policy):
+    import runpy
+    evidence = runpy.run_path(str(
+        _ROOT / "python/rpu_backend/tests/_hw_closure_evidence.py"))
+    descriptor = _ranked_domain(4096, ((768, 11),), policy=policy)[3:]
+    record = evidence["complete_descriptor_evidence"](descriptor,
+        expected_lifecycle="RETAINED_CACHE", component_path="fixture", stage="prefill")
+    assert record["descriptor_version"] == 4
+    assert record["ranking_policy"] == policy and record["ranking_mixer_calls"] == 11
+    descriptor[-1] = 0
+    with pytest.raises(AssertionError, match="ranking policy or mixer count"):
+        evidence["complete_descriptor_evidence"](descriptor,
+            expected_lifecycle="RETAINED_CACHE", component_path="fixture", stage="prefill")
+
+
+def test_rank_v2_larger_capacity_tie_preserves_v1_and_exact():
+    choices = ((640, 5), (704, 16), (768, 5))
+    def resolve(policy):
+        return lambda e: _ranked_domain(e, choices, logical_len=1539, policy=policy)
+    v1 = _MODULE.plan_prefill(1539, 1600, 0, alignment=64, resolve_stage_domain=resolve(1))
+    v2 = _MODULE.plan_prefill(1539, 1600, 0, alignment=64, resolve_stage_domain=resolve(2))
+    assert v1.selected.stage_tuple.compute_chunk == 640
+    assert v2.selected.stage_tuple.compute_chunk == 768
+    assert v1.selected.score[:4] == (3, 5, 61, 320)
+    assert v2.selected.score[:5] == (3, 5, 61, -768, 704)
+    assert v1.domain_digest != v2.domain_digest
+    exact = _MODULE.plan_prefill(1539, 1600, 0, alignment=64,
+        exact_chunk_size=640, resolve_stage_domain=resolve(2))
+    assert exact.selected.stage_tuple.compute_chunk == 640
+
+
+def test_rank_v2_real_padding_precedes_larger_capacity_across_execution_lengths():
+    # Both requests execute in two outer windows and three internal calls.
+    # C768 would win the capacity tie, but its E832 candidate executes more
+    # padding. Real extra rows must win over capacity preference.
+    def rows(e, c):
+        return _MODULE._decode_native_stage_domain(
+            _ranked_domain(e, ((c, 3),), logical_len=769, policy=2),
+            execution_len=e, logical_len=769, position=0,
+            graph_mode=_MODULE.GRAPH_RETAINED_CACHE)
+    domain = {800: rows(800, 640), 832: rows(832, 768)}
+    result = _MODULE.plan_a6(769, alignment=16,
+        request={"padding_budget": 63}, tuple_domain=domain)
+    assert result.selected.execution_len == 800
+    assert result.selected.stage_tuple.compute_chunk == 640
+    assert result.selected.score[:4] == (2, 3, 31, -640)
+
+
 def test_a6_enumerates_full_domain_and_uses_fixed_score():
     seen = []
 
@@ -726,12 +858,12 @@ def test_request_validation(value, match):
 def test_lingbot_three_camera_t128_budget_bounds_layout_search(precision):
     import tomllib
 
-    template = _ROOT / f"examples/configs/lingbot/v2/3cam_t128/{precision}.toml"
+    template = _ROOT / f"examples/configs/lingbot/v2/3cam/{precision}.toml"
     config = tomllib.loads(template.read_text())
     assert config["input"]["cameras"] == 3
-    assert config["input"]["expected_language_tokens"] == 128
+    assert config["input"]["expected_language_tokens"] == 32
     budget = config["rpu_execution"]["prefill"]["padding_budget"]
-    assert budget == 63
+    assert budget == 64
     logical_len = 326
     queried = []
 
@@ -743,14 +875,14 @@ def test_lingbot_three_camera_t128_budget_bounds_layout_search(precision):
 
     with pytest.raises(_MODULE.PlannerRejectError, match="NO_FEASIBLE"):
         _MODULE.plan_prefill(
-            logical_len, 973, budget, alignment=16,
+            logical_len, 973, budget - 1, alignment=16,
             resolve_stage_domain=resolve,
         )
     assert queried == [336, 352, 368, 384]
 
     queried.clear()
     result = _MODULE.plan_prefill(
-        logical_len, 973, budget + 1,
+        logical_len, 973, budget,
         alignment=16, resolve_stage_domain=resolve,
     )
     assert set(queried) == {336, 352, 368, 384, 400}

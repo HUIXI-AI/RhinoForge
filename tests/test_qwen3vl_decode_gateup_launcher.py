@@ -1,10 +1,11 @@
 """Execute the exact decode launcher with host register/queue recorders.
 
 This gates ABI, backing storage, dynamic addresses and rejected submissions;
-the unchanged payload's arithmetic and async behavior require the board gate.
+current-source arithmetic is covered separately by strict CModel fixtures.
 """
 from pathlib import Path
 import shutil
+import re
 import subprocess
 
 import pytest
@@ -20,11 +21,22 @@ def _run(tmp_path, source, name, *, expect_overload_failure=False):
     compiler = shutil.which("g++")
     if not compiler:
         pytest.skip("native launcher checks require g++")
+    if "rpu_qwen3vl_linear::" in source:
+        contract = (ROOT / "src/ops/rpu_qwen3vl_linear_contracts.h").read_text()
+        contract = contract.replace('#include "rpu_kernel_cache.h"', '').replace('#pragma once', '')
+        enum = re.search(r'enum class KernelId\s*\{([^}]*)\};', source)
+        assert enum is not None
+        present = set(re.findall(r'\b[A-Z][A-Z0-9_]*\b', enum[1]))
+        ids = set(re.findall(r'KernelId::(\w+)', contract))
+        declaration = 'enum class KernelId {' + enum[1].rstrip().rstrip(',') + ',' + ','.join(sorted(ids - present)) + '};'
+        source = source[:enum.start()] + declaration + '\n' + contract + source[enum.end():]
+        source = '#include "ops/rpu_linear_tiling.h"\n' + source
     cpp, executable = tmp_path / f"{name}.cpp", tmp_path / name
     cpp.write_text(source)
-    subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
-                    str(cpp), "-o", str(executable)],
-                   check=True, capture_output=True, text=True)
+    compiled = subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
+                    "-I" + str(ROOT / "src"), "-I" + str(ROOT / "src/core"), "-I" + str(ROOT / "src/ops"), str(cpp), "-o", str(executable)],
+                   check=False, capture_output=True, text=True)
+    assert compiled.returncode == 0, compiled.stdout + compiled.stderr
     result = subprocess.run([str(executable)], check=False, capture_output=True, text=True)
     if expect_overload_failure:
         assert result.returncode != 0
@@ -141,7 +153,7 @@ struct RpuKernelGraph {
     ++stages;check(!deny);
     assert(id==KernelId::QWEN3VL_GATEUP_SWIGLU_GEMV);
     assert(operands.size()==4);
-    const int slots[]={6,8,24,26};
+    const int slots[]={2,20,32,34};
     for(int i=0;i<4;++i) {
       assert(operands[i].abi.lo==slots[i] && operands[i].abi.hi==slots[i]+1);
       assert(operands[i].abi.role==(i%2==0?GraphDdrRegisterRole::Int8ModelWeight:GraphDdrRegisterRole::PerChannelScale));
@@ -159,10 +171,12 @@ struct RpuKernelGraph {
 struct Queue {
   bool broadcast=false;
   void set_broadcast_mode(bool value){broadcast=value;}
-  void enqueu_kernel(Kernel_t&,std::vector<int> grid,std::vector<uint8_t> cores) {
+  void enqueu_kernel(Kernel_t&,std::vector<uint16_t> grid,std::vector<uint8_t> cores) {
     assert(broadcast && writes>submits);
     assert(kernel.rejected_writes==0 && kernel.wide_writes==0);
-    assert(grid==std::vector<int>({8,1,1}));
+    assert(grid==std::vector<uint16_t>({8,1,1}));
+    const auto c=rpu_qwen3vl_linear::contract(KernelId::QWEN3VL_GATEUP_SWIGLU_GEMV);
+    assert(c.m==1 && c.n==160 && c.k==1024);
     assert(cores==std::vector<uint8_t>({0,1,2,3,4,5,6,7}));++submits;
   }
 } queue;
@@ -176,7 +190,7 @@ Operands good() {
   for(int i=0;i<4;++i)v[i].address+=uint64_t(i)*0x1000000;
   for(int i=2;i<4;++i) {
     v[i].shape={9728};v[i].dtype=at::kHalf;
-    v[i].backing.bytes=(9728+160)*2;
+    v[i].backing.bytes=9728*2;
   }
   return v;
 }
@@ -212,14 +226,14 @@ int main() {
     const uint32_t input=0x40000100+step*256,output=0x40200000+step*256;
     launch(v,input,output);
     assert(writes==old_writes+1 && graph.retained.size()==size_t(old_retained+4));
-    assert(kernel.regs[0]==2560 && kernel.regs[1]==1216 && kernel.regs[2]==1);
-    assert(kernel.pair(4)==input>>8 && kernel.pair(10)==output>>8);
-    assert(kernel.pair(12)==65536 && kernel.pair(14)==65536);
-    assert(kernel.regs[16]==12800 && kernel.regs[17]==0);
-    assert(kernel.regs[18]==160 && kernel.regs[19]==96 && kernel.regs[21]==8);
+    assert(kernel.pair(0)==input && kernel.pair(4)==output && kernel.pair(6)==0);
+    assert(kernel.regs[8]==1 && kernel.regs[9]==1 && kernel.pair(10)==1216);
+    assert(kernel.regs[12]==2560 && kernel.regs[13]==160 && kernel.regs[14]==0 && kernel.regs[15]==8);
+    assert(kernel.pair(16)==5120 && kernel.pair(18)==2432);
+    assert(kernel.pair(22)==0 && kernel.pair(24)==0 && kernel.regs[26]==2 && kernel.regs[27]==1);
+    assert(kernel.regs[28]==0 && kernel.regs[29]==0);
     assert(kernel.regs[64]==8 && kernel.regs[65]==1 && kernel.regs[66]==1);
-    for(int i:{3,20,22,23,28,29,30,31})assert(kernel.regs[i]==0);
-    for(auto pair:std::vector<std::pair<int,int>>{{0,6},{2,8},{1,24},{3,26}})
+    for(auto pair:std::vector<std::pair<int,int>>{{0,2},{2,20},{1,32},{3,34}})
       assert(kernel.pair(pair.second)==uint32_t(v[pair.first].address>>8));
     assert(graph.last[0].tensor.address==v[0].address && graph.last[1].tensor.address==v[2].address);
     assert(graph.last[2].tensor.address==v[1].address && graph.last[3].tensor.address==v[3].address);
@@ -245,7 +259,7 @@ int main() {
     }
   }
   auto wrong=good();wrong[0].shape[1]=2048;rejects([&]{launch(wrong);});
-  wrong=good();wrong[2].backing.bytes=9728*2;rejects([&]{launch(wrong);});
+  wrong=good();wrong[2].backing.bytes=9728*2;launch(wrong);--wrong[2].backing.bytes;rejects([&]{launch(wrong);});
   for(uint32_t input:{0u,0x100u,0x40000101u,0x40200000u,0x401fff00u,0x407fff00u,0xffffff00u})
     rejects([&]{launch(good(),input);});
   for(uint32_t output:{0u,0x100u,0x40200001u,0x40000100u,0x40000200u,0x407fff00u,0xffffff00u})
@@ -263,14 +277,14 @@ int main() {
     _run(tmp_path, harness, "decode_gateup")
     # Negative control for build17's real failure: the old plain-int constant
     # must compile, select int32_t, and be rejected at the odd register.
-    legacy = wrapper.replace("kernel->set_regs(13, static_cast<uint16_t>(1));",
-                             "kernel->set_regs(13, 1);")
+    legacy = wrapper.replace("  register_writer.write(*kernel);",
+                             "  kernel->set_regs(13, 1);\n  register_writer.write(*kernel);")
     assert legacy != wrapper
     _run(tmp_path, harness.replace(wrapper, legacy), "decode_gateup_legacy_overload",
          expect_overload_failure=True)
 
 
-def test_optional_expansion_symbols_keep_existing_ids_and_names(tmp_path):
+def test_optional_expansion_symbols_keep_ids_and_use_current_names(tmp_path):
     header = (ROOT / "src/core/rpu_kernel_cache.h").read_text()
     source = (ROOT / "src/core/rpu_kernel_cache.inc").read_text()
     enum = definition(header, "enum class KernelId") + ";"
@@ -279,10 +293,10 @@ def test_optional_expansion_symbols_keep_existing_ids_and_names(tmp_path):
     names = header[names_open:header.index("};", names_open) + 2]
     optional = definition(source, "static bool is_optional_kernel(")
     for name in (
-        "qwen3vl_gateup_swiglu_gemv",
+        "qwen3vl_gateup_swiglu_w8_m1_v2",
         "qwen3vl_qk_norm_mrope_d128",
         "qwen3vl_qk_norm_mrope_kv_insert_d128",
-        "qwen3vl_o_ring_norm_m1_h2560_w8",
+        "qwen3vl_o_ring_norm_w8_m1_h2560_v2",
         "rhinovla_newton_norm_shift_h1024",
         "rhinovla_silu_high_mul",
     ):
@@ -290,6 +304,8 @@ def test_optional_expansion_symbols_keep_existing_ids_and_names(tmp_path):
     assert "KernelId::QWEN3VL_GATEUP_SWIGLU_GEMV)] != nullptr" in source
     assert "KernelId::QWEN3VL_O_RING_NORM_M1_H2560_W8)] != nullptr" in source
     _run(tmp_path, r'''
+#include "ops/rpu_linear_tiling.h"
+#include "ops/rpu_pi_wall_tiling.h"
 #include <cassert>
 #include <cstdint>
 #include <string>
@@ -297,7 +313,6 @@ def test_optional_expansion_symbols_keep_existing_ids_and_names(tmp_path):
 ''' + enum + "\nconst char* names[] = " + names + "\n" + optional + r'''
 int main() {
   constexpr auto id=static_cast<unsigned>(KernelId::QWEN3VL_GATEUP_SWIGLU_GEMV);
-  static_assert(id==static_cast<unsigned>(KernelId::W8A16_ROW_WEIGHT_REUSE_M352N80K256)+1);
   constexpr auto qk=static_cast<unsigned>(KernelId::QWEN3VL_QK_NORM_MROPE_D128);
   static_assert(id+1==qk);
   constexpr auto qkv=static_cast<unsigned>(KernelId::QWEN3VL_QK_NORM_MROPE_KV_INSERT_D128);
@@ -306,13 +321,13 @@ int main() {
   static_assert(qkv+1==orn);
   static_assert(orn<static_cast<unsigned>(KernelId::_COUNT));
   static_assert(sizeof(names)/sizeof(*names)==static_cast<unsigned>(KernelId::_COUNT));
-  assert(std::string(names[id])=="qwen3vl_gateup_swiglu_gemv");
+  assert(std::string(names[id])=="qwen3vl_gateup_swiglu_w8_m1_v2");
   assert(is_optional_kernel(names[id]));
   assert(std::string(names[qk])=="qwen3vl_qk_norm_mrope_d128");
   assert(is_optional_kernel(names[qk]));
   assert(std::string(names[qkv])=="qwen3vl_qk_norm_mrope_kv_insert_d128");
   assert(is_optional_kernel(names[qkv]));
-  assert(std::string(names[orn])=="qwen3vl_o_ring_norm_m1_h2560_w8");
+  assert(std::string(names[orn])=="qwen3vl_o_ring_norm_w8_m1_h2560_v2");
   assert(is_optional_kernel(names[orn]));
   assert(is_optional_kernel("rhinovla_newton_norm_shift_h1024"));
   assert(is_optional_kernel("rhinovla_silu_high_mul"));

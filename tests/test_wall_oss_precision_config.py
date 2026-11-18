@@ -223,7 +223,6 @@ def test_public_rtc_w8a16_maps_to_hybrid_runtime(monkeypatch):
         num_steps=6,
         w8a16=True,
         fp16_ckpt_dir="/models/v728-fp16",
-        runtime_env={"RPU_WALL_OSS_RTC_ALLOW_NUMERIC_BLOCKED": "1"},
     ).to("rpu")
 
     assert policy.precision == "w8a16-hybrid"

@@ -170,7 +170,7 @@ def _patch_adarms_norm_for_rpu():
     dtype/device before the projection.
 
     The unpatched forward feeds `adarms_cond` (float32 from time_emb) directly
-    into `self.cond`, which on device has fp16 weights → `rpu_linear: only half
+    into `self.cond`, which on RPU has fp16 weights → `rpu_linear: only half
     supported`. This wrapper casts/transfers `cond` as needed while leaving
     CPU/CUDA behavior identical (the `.to()` is a no-op when already matching).
 
@@ -179,7 +179,7 @@ def _patch_adarms_norm_for_rpu():
     try:
         from vla.model.modules.action_model.qwen3_pi05_expert import AdaRMSNorm
     except ImportError:
-        print("[QwenPI05-device] Warning: AdaRMSNorm import failed, skipping patch")
+        print("[QwenPI05-RPU] Warning: AdaRMSNorm import failed, skipping patch")
         return
     if getattr(AdaRMSNorm, '_rpu_patched', False):
         return
@@ -190,7 +190,7 @@ def _patch_adarms_norm_for_rpu():
         hidden_states = self.norm(hidden_states)
         if self.cond is None or cond is None:
             return hidden_states, None
-        # Cast cond to match self.cond weight (fixes fp32 time_emb vs fp16 device
+        # Cast cond to match self.cond weight (fixes fp32 time_emb vs fp16 RPU
         # Linear weight). No-op for matching dtype/device.
         cond = cond.to(device=self.cond.weight.device, dtype=self.cond.weight.dtype)
         scale, shift, gate = self.cond(cond).chunk(3, dim=-1)
@@ -199,16 +199,16 @@ def _patch_adarms_norm_for_rpu():
 
     AdaRMSNorm.forward = patched_forward
     AdaRMSNorm._rpu_patched = True
-    print("[QwenPI05-device] Patched AdaRMSNorm.forward for dtype/device matching")
+    print("[QwenPI05-RPU] Patched AdaRMSNorm.forward for dtype/device matching")
 
 
 def _patch_action_io_decode_actions_for_rpu():
     """Monkey-patch QwenPI05ActionIO.decode_actions to avoid fp32 → fp16
-    Linear on device.
+    Linear on RPU.
 
     The unpatched decode_actions does
         self.action_out_proj(action_hidden.to(torch.float32))
-    which forces fp32 input into a potentially fp16 device Linear. The patched
+    which forces fp32 input into a potentially fp16 RPU Linear. The patched
     version matches the Linear weight's dtype/device, runs the projection,
     then casts the final output to fp32 for downstream DDIM math.
 
@@ -217,7 +217,7 @@ def _patch_action_io_decode_actions_for_rpu():
     try:
         from vla.model.modules.action_model.qwen3_pi05_expert import QwenPI05ActionIO
     except ImportError:
-        print("[QwenPI05-device] Warning: QwenPI05ActionIO import failed, skipping patch")
+        print("[QwenPI05-RPU] Warning: QwenPI05ActionIO import failed, skipping patch")
         return
     if getattr(QwenPI05ActionIO, '_rpu_patched', False):
         return
@@ -231,7 +231,7 @@ def _patch_action_io_decode_actions_for_rpu():
 
     QwenPI05ActionIO.decode_actions = patched_decode_actions
     QwenPI05ActionIO._rpu_patched = True
-    print("[QwenPI05-device] Patched QwenPI05ActionIO.decode_actions for device fp16")
+    print("[QwenPI05-RPU] Patched QwenPI05ActionIO.decode_actions for RPU fp16")
 
 
 def _qwenpi05_destroy_handle(h):
@@ -293,7 +293,7 @@ _QWENPI05_RUNTIME_INSTALL_ATTRS = (
 
 
 def _prepare_cond_dense_weights(expert):
-    """Swizzle per-layer AdaRMS cond weights for device row-partition GEMV.
+    """Swizzle per-layer AdaRMS cond weights for RPU row-partition GEMV.
 
     For each layer x each of {input_layernorm, post_attention_layernorm}:
       norm.cond.weight [3*width, width] (γ-folded on scale block)
@@ -427,7 +427,7 @@ def _prepare_cond_dense_weights(expert):
             b_out.append(folded_b_rpu)
             gamma_fold_sites += 1
 
-    print(f"[device] QwenPI05 fused converter: γ folded into cond weights at {gamma_fold_sites} sites")
+    print(f"[RPU] QwenPI05 fused converter: γ folded into cond weights at {gamma_fold_sites} sites")
     return attn_w, attn_b, mlp_w, mlp_b
 
 
@@ -483,7 +483,7 @@ def _precompute_mrope_cos_sin(rotary_emb, prefix_len, suffix_len):
 
     The Qwen3-VL rotary returns cos/sin in concat format [seq, head_dim]
     where the first and second halves are identical duplicates
-    (cos[..., :D/2] == cos[..., D/2:]). The device SPM rope kernel expects
+    (cos[..., :D/2] == cos[..., D/2:]). The RPU SPM rope kernel expects
     the HALF-dim format [seq, head_dim/2] — slicing off the duplicate
     second half is mathematically lossless and required for the kernel
     to compute the correct per-position cos/sin addresses.
@@ -492,17 +492,17 @@ def _precompute_mrope_cos_sin(rotary_emb, prefix_len, suffix_len):
     (position * head_dim/2) stride in units of fp16. Passing full
     head_dim format to it causes every other position to read from
     the "wrong" half of the previous position's row, effectively
-    halving the position index.
+    halving the position index and producing cos_sim ~0.85 per head.
 
     Returns:
-        (cos, sin): each [suffix_len, head_dim/2] fp16 on device
+        (cos, sin): each [suffix_len, head_dim/2] fp16 on RPU
     """
     suffix_positions = torch.arange(
         prefix_len, prefix_len + suffix_len, device="cpu"
     ).unsqueeze(0)  # [1, S]
     position_ids_3d = suffix_positions.unsqueeze(0).expand(3, -1, -1)  # [3, 1, S]
 
-    # Use CPU for M-RoPE computation (autocast issues on device)
+    # Use CPU for M-RoPE computation (autocast issues on RPU)
     dummy_x = torch.zeros(1, dtype=torch.float32, device="cpu")
     cos, sin = rotary_emb(dummy_x, position_ids_3d)
     # Output: [1, suffix_len, head_dim] after interleaved M-RoPE + cat
@@ -520,7 +520,7 @@ def _precompute_mrope_cos_sin(rotary_emb, prefix_len, suffix_len):
 def _create_kv_cache(config, max_seq_len):
     """Create RPUCache for KV storage in 7D swizzled format.
 
-    Uses RPUCache for allocation: RPUCache produces
+    Uses RPUCache for allocation per CONTEXT.md decision: RPUCache produces
     the 7D swizzled layout required by C++ insert_kcache/insert_vcache and
     SDPA kernels. Position management and prefix pre-fill are manual.
     """
@@ -638,7 +638,7 @@ def _prefill_kv_cache_python_swizzle(cache, prefix_key_values, prefix_layer_offs
 
 
 def _prefill_kv_cache(cache, prefix_key_values, prefix_layer_offset, num_layers):
-    """Pre-fill prefix KV into RPUCache using the device insert_kcache/vcache kernels.
+    """Pre-fill prefix KV into RPUCache using the RPU insert_kcache/vcache kernels.
 
     The insert kernels are THE source of truth for the 7D swizzled DDR cache
     layout that SDPA reads. Using them (instead of a Python-side transcription
@@ -766,7 +766,7 @@ def _install_qwenpi05_for_rpu_fused(
       - expert.half() must be called before swizzling weights
       - convert_linear_weights_inplace(expert, skip_names={'cond'}) must have been called
         on the fp16 model; swizzling fp32 then casting to fp16 corrupts the
-        layout consumed by the fp16 device linear kernels.
+        layout consumed by the fp16 RPU linear kernels.
       - expert.to('rpu') must have been called after swizzling
 
     Args:
@@ -779,9 +779,9 @@ def _install_qwenpi05_for_rpu_fused(
         int: handle for this model. Also stored as expert._rpu_qwenpi05_handle.
     """
     # ------------------------------------------------------------------ #
-    # Step 0: class-level monkey patches for device compatibility
+    # Step 0: class-level monkey patches for RPU compatibility
     #   - AdaRMSNorm.forward: cast cond to Linear weight dtype/device
-    #   - QwenPI05ActionIO.decode_actions: avoid fp32→fp16 Linear on device
+    #   - QwenPI05ActionIO.decode_actions: avoid fp32→fp16 Linear on RPU
     # Both patches are idempotent and leave CPU behavior unchanged.
     # ------------------------------------------------------------------ #
     old_session = getattr(expert, "_execution_session", None)
@@ -863,7 +863,7 @@ def _install_qwenpi05_for_rpu_fused(
     _dtlog("after  _create_kv_cache")
 
     print(
-        f"[device] QwenPI05 M-RoPE pre-computed: cos/sin [{suffix_len}, {cos_cached.shape[-1]}], "
+        f"[RPU] QwenPI05 M-RoPE pre-computed: cos/sin [{suffix_len}, {cos_cached.shape[-1]}], "
         f"KV cache max_seq={max_seq_len}"
     )
 
@@ -887,8 +887,8 @@ def _install_qwenpi05_for_rpu_fused(
     #   the fused C++ layer stack. Its `cond` Linear is a normal nn.Linear
     #   with un-swizzled weights (we pass `skip_names={'cond'}` to
     #   convert_linear_weights_inplace). When `.to('rpu')` is applied to the
-    #   whole expert, the norm's Linear goes to device in a layout that the
-    #   device `rpu_linear` op cannot consume (no column/row partition swizzle),
+    #   whole expert, the norm's Linear goes to RPU in a layout that the
+    #   RPU `rpu_linear` op cannot consume (no column/row partition swizzle),
     #   producing garbage output.
     #
     #   Fix: keep final norm on CPU for Python-side computation. The
@@ -932,14 +932,14 @@ def _install_qwenpi05_for_rpu_fused(
         # -- Device capture for restoration --
         orig_device = suffix_embeds.device
 
-        # -- Route hidden_states to device fp16 --
+        # -- Route hidden_states to RPU fp16 --
         hidden_states = suffix_embeds
         if hidden_states.device.type != 'rpu':
             hidden_states = hidden_states.to(dtype=torch.float16, device='rpu')
         if hidden_states.dtype != torch.float16:
             hidden_states = hidden_states.to(torch.float16)
 
-        # -- Pad suffix to target suffix_len for device SDPA alignment --
+        # -- Pad suffix to target suffix_len for RPU SDPA alignment --
         if actual_suffix_len < target_suffix_len:
             pad_len = target_suffix_len - actual_suffix_len
             hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, pad_len))
@@ -955,7 +955,7 @@ def _install_qwenpi05_for_rpu_fused(
                 f"QwenPI05 fused: batch_size must be 1, got {hidden_states.shape[0]}"
             )
 
-        # -- Normalize cond to [hidden_size] fp16 device contiguous --
+        # -- Normalize cond to [hidden_size] fp16 RPU contiguous --
         hidden_size = self.config.width
         if adarms_cond is None:
             raise AssertionError("QwenPI05 fused: adarms_cond is required")
@@ -1057,6 +1057,10 @@ def _install_qwenpi05_for_rpu_fused(
             norm_dtype = norm_w.dtype if norm_w is not None else torch.float32
             output_for_norm = output.to(device=norm_device, dtype=norm_dtype)
             output, _ = self.norm(output_for_norm, adarms_cond)
+        else:
+            # Native replay reuses its output storage. Publish a caller-owned
+            # tensor after capture so later forwards cannot overwrite it.
+            output = output.clone()
 
         # -- Restore device if caller expected non-cpu device --
         if orig_device.type != output.device.type:
@@ -1136,7 +1140,7 @@ def _install_qwenpi05_for_rpu_fused(
     if old_finalizer is not None and getattr(old_finalizer, "alive", False):
         old_finalizer.detach()
     print(
-        f"[device] Patched QwenPI05ActionExpert with fused forward, "
+        f"[RPU] Patched QwenPI05ActionExpert with fused forward, "
         f"handle={handle}, layers={len(expert.layers)}"
     )
 

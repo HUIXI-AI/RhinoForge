@@ -94,18 +94,22 @@ def test_pi05_reduced_example_derives_profile_from_core_geometry(tmp_path):
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[1]
-    for precision in ("fp16", "w8a16"):
-        for cores in (4, 6):
-            path = root / f"examples/configs/pi05/generic/3cam/{precision}_tp{cores}.toml"
-            config = load_config(path)
-            assert config["rpu_execution"]["model"]["num_cores"] == cores
-            assert example_metadata(config)["profile_id"].endswith(f".vla-tp{cores}")
-            changed = tmp_path / f"{precision}-{cores}.toml"
-            changed.write_text(path.read_text().replace(f"num_cores = {cores}", f"num_cores = {10-cores}"))
-            assert example_metadata(load_config(changed))["profile_id"].endswith(f".vla-tp{10-cores}")
-            changed.write_text(path.read_text().replace(f"num_cores = {cores}", "num_cores = 5"))
-            with pytest.raises(ConfigError, match="num_cores"):
-                load_config(changed)
+    for cameras, scope in ((3, ""), (2, "-2cam")):
+        for precision in ("fp16", "w8a16"):
+            template = root / f"examples/configs/pi05/{cameras}cam/h50/{precision}.toml"
+            assert load_config(template)["rpu_execution"]["model"]["num_cores"] == 8
+            for cores in (4, 6):
+                path = tmp_path / f"{cameras}-{precision}-selected-{cores}.toml"
+                path.write_text(template.read_text().replace("num_cores = 8", f"num_cores = {cores}", 1))
+                config = load_config(path)
+                assert config["rpu_execution"]["model"]["num_cores"] == cores
+                assert example_metadata(config)["profile_id"].endswith(f".vla{scope}-tp{cores}")
+                changed = tmp_path / f"{cameras}-{precision}-{cores}.toml"
+                changed.write_text(path.read_text().replace(f"num_cores = {cores}", f"num_cores = {10-cores}"))
+                assert example_metadata(load_config(changed))["profile_id"].endswith(f".vla{scope}-tp{10-cores}")
+                changed.write_text(path.read_text().replace(f"num_cores = {cores}", "num_cores = 5"))
+                with pytest.raises(ConfigError, match="num_cores"):
+                    load_config(changed)
 
 
 def test_pi05_hot_core_change_fails_before_mutating_or_native_calls():

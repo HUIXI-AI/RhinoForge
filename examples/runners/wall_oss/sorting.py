@@ -205,7 +205,10 @@ def run_example_config(config: dict) -> int:
               "evaluation_only": True, "formal_certification": False}
     with _RESULTS["record_result"](report, output_dir,
         timing=lambda: _RESULTS["latency_timing"](report.get("e2e", {}).get("samples_ms", []),
-            report.get("timing_scope", "predict(debug=False) including CPU actions")),
+            report.get("timing_scope", "predict(debug=False) including CPU actions"))
+            + _RESULTS["stage_phase_timings"](report.get("stage_runs", []),
+                "host wall time of the Vision, Prefill and Denoise calls inside each measured predict; "
+                "glue between stages is not attributed"),
         runtime_checks=("finite action output shape [1,20,26]", "fixed-input replay",
                         "Graph READY/REPLAY/no recapture") +
                        (("supplied RTC prefix preserved",) if common["inference_delay"] else ()),
@@ -231,26 +234,34 @@ def run_example_config(config: dict) -> int:
             if prepared.get("phase") != "READY" or not prepared.get("ready_replay_validated"):
                 raise RuntimeError("sorting graphs did not reach validated READY")
             before = helpers.cache_snapshot(vla)
-            samples, reference = [], None
+            samples, stage_rows, reference = [], [], None
             report["e2e"] = {"samples_ms": samples}
-            for index in range(run.get("warmup", 2) + run.get("runs", 6)):
-                started = time.perf_counter()
-                output = vla.predict(**common, debug=False)
-                action = output["action"].detach().cpu()
-                elapsed = (time.perf_counter() - started) * 1000
-                if tuple(action.shape) != (1, 20, 26) or not bool(torch.isfinite(action).all()):
-                    raise RuntimeError("expected finite actions [1,20,26]")
-                if output["prefix_len"] != 640 or not 599 <= output["real_prefix_len"] <= 640:
-                    raise RuntimeError("observation does not use the P640 sorting profile")
-                if reference is None:
-                    reference = action.clone()
-                elif not torch.equal(action, reference):
-                    raise RuntimeError("fixed-input sorting replay changed actions")
-                delay = common["inference_delay"]
-                if delay and not torch.equal(action[0, :delay], common["rtc_prefix_actions"][:delay]):
-                    raise RuntimeError("RTC replay did not preserve the supplied action prefix")
-                if index >= run.get("warmup", 2):
-                    samples.append(elapsed)
+            report["stage_runs"] = stage_rows
+            from examples.runners.wall_oss.runner import wall_stage_boundaries
+            boundaries, report["stage_boundaries_missing"] = _RESULTS["available_stage_boundaries"](
+                wall_stage_boundaries(vla))
+            with _RESULTS["stage_timings"](boundaries) as phases:
+                for index in range(run.get("warmup", 2) + run.get("runs", 6)):
+                    phases.clear()
+                    started = time.perf_counter()
+                    output = vla.predict(**common, debug=False)
+                    action = output["action"].detach().cpu()
+                    elapsed = (time.perf_counter() - started) * 1000
+                    stage = dict(phases)
+                    if tuple(action.shape) != (1, 20, 26) or not bool(torch.isfinite(action).all()):
+                        raise RuntimeError("expected finite actions [1,20,26]")
+                    if output["prefix_len"] != 640 or not 599 <= output["real_prefix_len"] <= 640:
+                        raise RuntimeError("observation does not use the P640 sorting profile")
+                    if reference is None:
+                        reference = action.clone()
+                    elif not torch.equal(action, reference):
+                        raise RuntimeError("fixed-input sorting replay changed actions")
+                    delay = common["inference_delay"]
+                    if delay and not torch.equal(action[0, :delay], common["rtc_prefix_actions"][:delay]):
+                        raise RuntimeError("RTC replay did not preserve the supplied action prefix")
+                    if index >= run.get("warmup", 2):
+                        samples.append(elapsed)
+                        stage_rows.append(stage)
             final = helpers.cache_snapshot(vla)
             if not helpers.graph_gate(final, before, prepared["graph_counts"]):
                 raise RuntimeError("sorting Graph READY/replay invariant failed")

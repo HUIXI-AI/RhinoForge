@@ -31,6 +31,7 @@
 #include <cmath>
 #include <cstdint>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -644,7 +645,7 @@ protected:
         // Norms, gates, final biases/position and zero_full are read-only after
         // their first population. Subsequent graph signatures share the same
         // live model/SPM generation and do not need to bake those DMAs again.
-        cfg.clean_recording_skip_preload_callbacks = true;
+        cfg.clean_recording_skip_preload_callbacks = !prepare_modulation_on_rpu_;
         return cfg;
     }
 
@@ -880,7 +881,9 @@ protected:
                 {physical_len, NEXTDIT_ACTION_PAD});
         }
         append_fmb_shared_runtime_routes(
-            manifest, plan, hidden_size(), FMB_SHARED_LAYER_INPUT_DMA);
+            manifest, plan, hidden_size(),
+            use_action_encoder_ ? 0U : FMB_SHARED_LAYER_INPUT_DMA,
+        /*compute_row_multiplier=*/1, num_cores(), mlp_tp());
         std::sort(
             manifest.routes.begin(), manifest.routes.end(),
             [](const FmbRouteManifestEntry& lhs,
@@ -929,6 +932,17 @@ protected:
                 route.flags = 0;
             }
         }
+        std::sort(
+            raw.routes.begin(), raw.routes.end(),
+            [](const FmbRouteManifestEntry& lhs,
+               const FmbRouteManifestEntry& rhs) {
+                return std::make_tuple(
+                           static_cast<int64_t>(lhs.family), lhs.site_id,
+                           lhs.invocation) <
+                    std::make_tuple(
+                           static_cast<int64_t>(rhs.family), rhs.site_id,
+                           rhs.invocation);
+            });
         domain.push_back(std::move(raw));
         return domain;
     }

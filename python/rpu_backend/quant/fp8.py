@@ -5,6 +5,13 @@ import torch
 
 
 FP8_E4M3_MAX = 448.0
+# Shared grouped count ABI: smul.u16(expert_batch_start, 2) addresses m_sizes.
+MAX_GROUPED_EXPERTS = 32768
+
+
+def _validate_grouped_experts(experts: int) -> None:
+    if not 1 <= experts <= MAX_GROUPED_EXPERTS:
+        raise ValueError("grouped experts must be in [1,32768] for m_sizes byte offsets")
 
 
 def quantize_fp8_e4m3_per_output(
@@ -57,6 +64,7 @@ def pack_grouped_weight(
     if partition not in {"col", "row"}:
         raise ValueError(f"partition must be 'col' or 'row', got {partition!r}")
     group, n, k = map(int, weight.shape)
+    _validate_grouped_experts(group)
     if group < 1 or num_cores < 1:
         raise ValueError("group and num_cores must be positive")
     dwidth = weight.element_size()
@@ -85,9 +93,30 @@ def pack_grouped_weight(
     return packed.contiguous().view(group, -1)
 
 
+def pack_grouped_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Retain FP16 per-expert scales with the unified ABI's 256-byte stride.
+
+    N remains the logical output width in the launcher. Padding is only at
+    the end of each expert's scale row, including for column TP layouts.
+    """
+    if (not isinstance(scale, torch.Tensor) or scale.dim() != 2
+            or scale.dtype != torch.float16 or scale.numel() == 0):
+        raise ValueError("grouped scale requires nonempty FP16 [experts,N]")
+    experts, n = scale.shape
+    _validate_grouped_experts(experts)
+    source = scale.detach().to("cpu")
+    physical_n = (n + 127) // 128 * 128
+    if physical_n == n:
+        return source.contiguous()
+    padded = source.new_zeros((experts, physical_n))
+    padded[:, :n].copy_(source)
+    return padded
+
+
 __all__ = [
     "FP8_E4M3_MAX",
     "dequantize_fp8_e4m3_per_output",
     "pack_grouped_weight",
+    "pack_grouped_scale",
     "quantize_fp8_e4m3_per_output",
 ]

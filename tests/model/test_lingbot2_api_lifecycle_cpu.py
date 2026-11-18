@@ -291,7 +291,6 @@ def _policy(api, dtype):
     return api.Lingbot2Policy.from_checkpoint(
         "/unused",
         dtype=dtype,
-        runtime_env={"RPU_LINGBOT2_ALLOW_UNVALIDATED": "1"},
     )
 
 
@@ -310,7 +309,6 @@ def test_rpu_execution_is_cold_normalized_and_forwarded(monkeypatch):
     api = _load_module(monkeypatch, builder)
     policy = api.Lingbot2Policy.from_checkpoint(
         "/unused",
-        runtime_env={"RPU_LINGBOT2_ALLOW_UNVALIDATED": "1"},
         rpu_execution={
             "prefill": {"chunk_size": 240, "padding_budget": 10},
             "vision": {"chunk_size": 256},
@@ -621,7 +619,6 @@ def test_runtime_env_can_opt_out_of_fp16_perf_default(monkeypatch):
         "/unused",
         dtype="fp16",
         runtime_env={
-            "RPU_LINGBOT2_ALLOW_UNVALIDATED": "1",
             "RPU_WALL_OSS_FAST_REPLAY": "0",
             "RPU_LINGBOT2_GROUPED_EXPERTS": "0",
             "RPU_L2_RCHUNK": "0",
@@ -665,7 +662,6 @@ def test_denoise_unroll_scopes_queue_defaults_and_forces_indexed_schedule(
     policy = api.Lingbot2Policy.from_checkpoint(
         "/unused",
         runtime_env={
-            "RPU_LINGBOT2_ALLOW_UNVALIDATED": "1",
             "RPU_LINGBOT2_DENOISE_UNROLL": "1",
             # The unrolled path must use its indexed schedule even if a
             # controlled caller also requested the old direct-DMA experiment.
@@ -704,7 +700,6 @@ def test_dense_fp16_opt_out_uses_larger_unroll_capacity(monkeypatch):
         "/unused",
         dtype="fp16",
         runtime_env={
-            "RPU_LINGBOT2_ALLOW_UNVALIDATED": "1",
             "RPU_LINGBOT2_GROUPED_EXPERTS": "0",
         },
     ).to("rpu")
@@ -731,7 +726,6 @@ def test_multiview_z2_scopes_the_dense_fp16_bundle(monkeypatch):
         n_cameras=3,
         image_size=256,
         runtime_env={
-            "RPU_LINGBOT2_ALLOW_UNVALIDATED": "1",
             "RPU_LINGBOT2_DENOISE_UNROLL": "1",
             "RPU_LINGBOT2_MULTIVIEW_SPM_Z2": "1",
         },
@@ -759,7 +753,6 @@ def test_multiview_z2_scopes_the_grouped_w8a16_bundle(monkeypatch):
         n_cameras=3,
         image_size=256,
         runtime_env={
-            "RPU_LINGBOT2_ALLOW_UNVALIDATED": "1",
             "RPU_LINGBOT2_DENOISE_UNROLL": "1",
             "RPU_LINGBOT2_MULTIVIEW_SPM_Z2": "1",
         },
@@ -787,7 +780,6 @@ def test_multiview_z2_scopes_the_grouped_w4a16_bundle(monkeypatch):
         n_cameras=3,
         image_size=256,
         runtime_env={
-            "RPU_LINGBOT2_ALLOW_UNVALIDATED": "1",
             "RPU_LINGBOT2_DENOISE_UNROLL": "1",
             "RPU_LINGBOT2_MULTIVIEW_SPM_Z2": "1",
         },
@@ -829,7 +821,6 @@ def test_multiview_z2_rejects_partial_or_w4_w8_bundle(
         n_cameras=3,
         image_size=256,
         runtime_env={
-            "RPU_LINGBOT2_ALLOW_UNVALIDATED": "1",
             "RPU_LINGBOT2_DENOISE_UNROLL": "1",
             "RPU_LINGBOT2_MULTIVIEW_SPM_Z2": "1",
             name: value,
@@ -870,7 +861,6 @@ def test_multiview_z2_rejects_partial_w4_bundle(monkeypatch, name, value):
         n_cameras=3,
         image_size=256,
         runtime_env={
-            "RPU_LINGBOT2_ALLOW_UNVALIDATED": "1",
             "RPU_LINGBOT2_DENOISE_UNROLL": "1",
             "RPU_LINGBOT2_MULTIVIEW_SPM_Z2": "1",
             name: value,
@@ -908,7 +898,6 @@ def test_multiview_z2_rejects_stage2_switches(monkeypatch, name):
         n_cameras=3,
         image_size=256,
         runtime_env={
-            "RPU_LINGBOT2_ALLOW_UNVALIDATED": "1",
             "RPU_LINGBOT2_DENOISE_UNROLL": "1",
             "RPU_LINGBOT2_MULTIVIEW_SPM_Z2": "1",
             name: "1",
@@ -934,7 +923,6 @@ def test_multiview_z2_rejects_the_obsolete_131072_entry_override(monkeypatch):
         n_cameras=3,
         image_size=256,
         runtime_env={
-            "RPU_LINGBOT2_ALLOW_UNVALIDATED": "1",
             "RPU_LINGBOT2_DENOISE_UNROLL": "1",
             "RPU_LINGBOT2_MULTIVIEW_SPM_Z2": "1",
             "LKN_MAX_BATCH_ENTRIES": "131072",
@@ -969,7 +957,6 @@ def test_denoise_unroll_preserves_explicit_queue_limits_and_restores_on_failure(
     policy = api.Lingbot2Policy.from_checkpoint(
         "/unused",
         runtime_env={
-            "RPU_LINGBOT2_ALLOW_UNVALIDATED": "1",
             "RPU_LINGBOT2_DENOISE_UNROLL": "1",
             "LKN_MAX_BATCH_ENTRIES": "262144",
         },
@@ -983,9 +970,12 @@ def test_denoise_unroll_preserves_explicit_queue_limits_and_restores_on_failure(
     assert policy._env_snapshot is None
 
 
-def test_denoise_unroll_does_not_bypass_controlled_path_gate(monkeypatch):
+def test_denoise_unroll_builds_without_the_retired_controlled_path_opt_in(monkeypatch):
+    # RPU_LINGBOT2_ALLOW_UNVALIDATED was retired (2026-10-19): .to("rpu") needs
+    # no opt-in, and the unroll selector alone still reaches the real builder.
     for key in (
         "RPU_LINGBOT2_DENOISE_UNROLL",
+        "RPU_LINGBOT2_ALLOW_UNVALIDATED",
         "LKN_MAX_BATCH_ENTRIES",
         "LKN_KD_BUF_MB",
         "LKN_INSTR_BUF_MB",
@@ -1002,13 +992,11 @@ def test_denoise_unroll_does_not_bypass_controlled_path_gate(monkeypatch):
         "/unused",
         runtime_env={"RPU_LINGBOT2_DENOISE_UNROLL": "1"},
     )
-    with pytest.raises(RuntimeError, match="fail-closed by default"):
-        policy.to("rpu")
+    policy.to("rpu")
 
-    assert calls == []
-    assert policy._env_snapshot is None
-    for key in api._DENOISE_UNROLL_CAPACITY_DEFAULTS:
-        assert key not in os.environ
+    assert calls == [True]
+    policy.close()
+    assert "RPU_LINGBOT2_DENOISE_UNROLL" not in os.environ
 
 
 def test_denoise_unroll_requires_exact_runtime_env_one(monkeypatch):
@@ -1037,7 +1025,6 @@ def test_denoise_unroll_requires_exact_runtime_env_one(monkeypatch):
     policy = api.Lingbot2Policy.from_checkpoint(
         "/unused",
         runtime_env={
-            "RPU_LINGBOT2_ALLOW_UNVALIDATED": "1",
             "RPU_LINGBOT2_DENOISE_UNROLL": "true",
         },
     ).to("rpu")
@@ -1224,7 +1211,6 @@ def test_robot_norm_without_ordered_contract_fails_before_runtime_build(monkeypa
     policy = api.Lingbot2Policy.from_checkpoint(
         "/unused",
         robot_norm_path="/unused/norm.json",
-        runtime_env={"RPU_LINGBOT2_ALLOW_UNVALIDATED": "1"},
     )
     with pytest.raises(ValueError, match="matching training_config_path"):
         policy.to("rpu")

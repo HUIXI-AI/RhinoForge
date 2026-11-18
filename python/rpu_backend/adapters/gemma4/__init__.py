@@ -22,6 +22,12 @@ from rpu_backend.api.errors import RPUBackendError, UnsupportedModelError
 from rpu_backend.runtime.registry import register_adapter
 
 from . import geometry
+from .topology import (
+    Gemma4Topology,
+    execution_num_cores,
+    require_same_core_budget,
+    resolve_gemma4_topology,
+)
 from .geometry import (
     LayerGeom,
     layer_geometry,
@@ -57,11 +63,14 @@ _SUPPORTED_LAYER_TYPES = tuple(
     for i in range(42)
 )
 _BUILD_LOCK = threading.Lock()
+# model.num_cores (4/6/8, default 8) is a cold budget; see topology.py.
+_EXECUTION_SUPPORTED = {"prefill": ("chunk_size",), "model": ("num_cores",)}
 _INSTALL_ATTRS = (
     "_rpu_gemma4_handle",
     "_rpu_gemma4_handle_finalizer",
     "_rpu_gemma4_retirement_state",
     "_rpu_gemma4_geom",
+    "_rpu_gemma4_topology",
     "_rpu_gemma4_graph_cache",
     "_rpu_gemma4_ready",
     "_execution_session",
@@ -77,14 +86,22 @@ def _check_profile(config) -> None:
     """Accept only the hardware-certified Gemma4-E4B text profile."""
     tc = _text_config(config)
     try:
+        per_layer_fields = set(getattr(tc, "per_layer_attributes", None) or ())
+        if per_layer_fields - {"head_dim", "num_key_value_heads"}:
+            raise ValueError("unsupported per-layer config overrides")
+        geom = layer_geometry(tc)
+        # Validate every layer before deriving the legacy profile fields.
+        if any((g.num_q_heads, g.num_kv_heads, g.head_dim) !=
+               (8, 2, 512 if g.is_global else 256) for g in geom):
+            raise ValueError("unsupported per-layer attention geometry")
         profile = (
             int(tc.hidden_size),
             int(tc.intermediate_size),
             int(tc.num_hidden_layers),
             int(tc.num_attention_heads),
-            int(tc.num_key_value_heads),
-            int(tc.head_dim),
-            int(tc.global_head_dim),
+            max_num_kv_heads(geom),
+            next(g.head_dim for g in geom if not g.is_global),
+            next(g.head_dim for g in geom if g.is_global),
             int(tc.hidden_size_per_layer_input),
             int(tc.num_kv_shared_layers),
             int(tc.vocab_size),
@@ -92,7 +109,7 @@ def _check_profile(config) -> None:
             int(tc.max_position_embeddings),
         )
         layer_types = tuple(tc.layer_types)
-    except (AttributeError, TypeError, ValueError) as exc:
+    except (AttributeError, TypeError, ValueError, StopIteration) as exc:
         raise UnsupportedModelError(
             "Gemma4 device adapter requires the complete E4B text config."
         ) from exc
@@ -160,7 +177,7 @@ class Gemma4Adapter:
             is_rpu_device_target,
         )
 
-        supported_execution = {"prefill": ("chunk_size",)}
+        supported_execution = _EXECUTION_SUPPORTED
         if rpu_execution is not None:
             normalize_rpu_execution(
                 rpu_execution,
@@ -276,16 +293,19 @@ class Gemma4Adapter:
         return self.model._execution_session.reconfigure(value)
 
 
-def _gemma4_graph_runtime_policy():
+def _gemma4_graph_runtime_policy(num_cores=8):
     from rpu_backend.graph import GraphRuntimePolicy
 
     policy = GraphRuntimePolicy.from_environment()
     # Gemma4 still refreshes position-dependent RoPE/KV kernel parameters in
     # the layer body. Keep normal Graph REPLAY (and its skip-sync policy), but
     # do not let a process-wide FMB fast flag bypass those mutable updates.
+    # A reduced cold budget narrows the native queue/kernel/DMA prefix.
     return replace(
         policy, fmb_fast_replay=False, fmb_deep_fast_replay=False,
-        provenance=policy.provenance + ("owner:gemma4-replay-position-updates",),
+        execution_core_count=policy.execution_core_count if num_cores == 8 else num_cores,
+        provenance=policy.provenance + ("owner:gemma4-replay-position-updates",)
+        + (() if num_cores == 8 else (f"owner:gemma4:execution_core_count={num_cores}",)),
     )
 
 def _execution_plan(model, handle, seq_len, position, horizon, graph_cache=None):
@@ -356,6 +376,11 @@ def _build_rpu_model(model, *, max_seq=None, _install_state=None):
     _check_profile(model.config)
     tc = _text_config(model.config)
     geom = layer_geometry(tc)
+    topology = resolve_gemma4_topology(
+        execution_num_cores(getattr(model, "_rpu_execution", None)),
+        intermediate_size=int(tc.intermediate_size),
+        ple_dim=int(tc.hidden_size_per_layer_input),
+        num_kv_heads=max_num_kv_heads(geom))
     H = int(tc.hidden_size)
     NQ = int(tc.num_attention_heads)
     IS = int(tc.intermediate_size)
@@ -374,8 +399,8 @@ def _build_rpu_model(model, *, max_seq=None, _install_state=None):
     sd = model.state_dict()
     raw = lambda nm: sd[nm].float()
 
-    # Decoder + PLE weights -> swizzled fp16 on device.
-    lists, ple = rt.swizzle_decoder_and_ple(raw, geom)
+    # Decoder + PLE weights -> swizzled fp16 on device (MLP6 zero-padded first).
+    lists, ple = rt.swizzle_decoder_and_ple(raw, geom, topology=topology)
     rope_tables = make_rope_tables(tc, max_seq, device="rpu", dtype=torch.float16)
     final_norm_w = raw(rt.PFX + "norm.weight").to(torch.float16).to("rpu")
 
@@ -385,7 +410,7 @@ def _build_rpu_model(model, *, max_seq=None, _install_state=None):
     plmp_w = sd[rt.PFX + "per_layer_model_projection.weight"]
     pln_w = sd[rt.PFX + "per_layer_projection_norm.weight"]
 
-    gc = rpu_backend.graph.GraphCache(runtime_policy=_gemma4_graph_runtime_policy())
+    gc = rpu_backend.graph.GraphCache(runtime_policy=_gemma4_graph_runtime_policy(topology.num_cores))
     dyn = geometry_dyn_dims(geom)
     GraphSignature = rpu_backend.graph.GraphSignature
 
@@ -502,7 +527,8 @@ def _build_rpu_model(model, *, max_seq=None, _install_state=None):
         side = rt.compute_side_input(
             ids, embed_weight=embed_w, embed_per_layer_weight=eptl_w,
             model_projection_weight=plmp_w, projection_norm_weight=pln_w,
-            num_layers=L, hidden_size=H, ple_dim=PD, eps=eps)
+            num_layers=L, hidden_size=H, ple_dim=PD, eps=eps,
+            num_cores=topology.ple_tp)
 
         # T4: when the total context exceeds the sliding window, the fused decoder
         # routes sliding(hd256) layers through a windowed MASK_2D over an offset KV
@@ -564,12 +590,21 @@ def _build_rpu_model(model, *, max_seq=None, _install_state=None):
     try:
         resource.handle = handle = int(torch.ops.rpu.gemma4_create())
         install_state["native_created"] = True
+        if topology.num_cores != 8:
+            # Cold budget precedes weights; eight keeps the original call stream.
+            torch.ops.rpu.gemma4_set_execution_core_count(handle, topology.num_cores)
         set_gemma4_weights(
             handle, geom, lists, rope_tables, final_norm_w,
             num_q_heads=NQ, num_kv_heads_max=max_num_kv_heads(geom),
             head_dim_max=max_head_dim(geom), hidden_size=H, intermediate_size=IS,
             eps=eps, qk_scale=1.0, ple=ple, ple_dim=PD,
             sliding_window=sliding_window)
+        if topology.num_cores != 8:
+            actual = tuple(torch.ops.rpu.gemma4_get_execution_topology(handle))
+            if actual != topology.native_readback():
+                raise RuntimeError(
+                    f"Gemma4 native topology mismatch: {actual} != "
+                    f"{topology.native_readback()}")
         torch.ops.rpu.gemma4_set_chunk_envelope(handle, max_seq, 0)
 
         def invalidate_execution_graphs(_old, _new, _generation, *, force_rebuild=False):
@@ -579,11 +614,16 @@ def _build_rpu_model(model, *, max_seq=None, _install_state=None):
             gc.clear()
             vars(model).pop("_rpu_last_execution_plan", None)
 
+        def validate_execution(config):
+            # Swizzle, padding and Graph policy were bound to the cold budget.
+            require_same_core_budget({"model": {"num_cores": topology.num_cores}}, config)
+
         session = bind_execution_session(
             model,
             getattr(model, "_rpu_execution", None),
             entry_point="Gemma4Adapter",
-            supported={"prefill": ("chunk_size",)},
+            supported=_EXECUTION_SUPPORTED,
+            validate=validate_execution,
             apply=invalidate_execution_graphs,
             rollback=invalidate_execution_graphs,
             graph_mode="RETAINED_CACHE",
@@ -593,6 +633,7 @@ def _build_rpu_model(model, *, max_seq=None, _install_state=None):
         model._rpu_gemma4_retirement_state = resource
         model._rpu_gemma4_handle_finalizer = resource.finalizer
         model._rpu_gemma4_geom = geom
+        model._rpu_gemma4_topology = topology
         model._rpu_gemma4_graph_cache = gc
         model._execution_session = session
         model.build_rpu_cache = make_cache
@@ -622,6 +663,7 @@ register_adapter(HF_ARCH, Gemma4Adapter)
 
 __all__ = [
     "Gemma4Adapter",
+    "Gemma4Topology",
     "HF_ARCH",
     "DEFAULT_MAX_SEQ",
     "geometry",
@@ -632,4 +674,5 @@ __all__ = [
     "geometry_hash",
     "max_head_dim",
     "max_num_kv_heads",
+    "resolve_gemma4_topology",
 ]

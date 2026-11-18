@@ -1,3 +1,5 @@
+from pi_wall_host_catalog import assert_current_catalog, CATALOG_INCLUDE
+from test_siglip_attention_dry_live_contract import _function
 """Board-free contract for exact Wall Vision W8A16 fused QKV."""
 
 from pathlib import Path
@@ -13,50 +15,20 @@ KERNEL_NAME = "qkv_parallel_w8a16_multibase_m192x3n96k128"
 
 
 def test_exact_vision_launcher_is_strict_graph_aware_and_multicore():
-    assert "WALL_VISION_QKV_W8A16_MULTIBASE_M192X3N96" in CACHE_H
-    assert f'"{KERNEL_NAME}"' in CACHE_H
-    preload = CACHE_INC[
-        CACHE_INC.index("static constexpr const char* kMixedNames[]") :
-        CACHE_INC.index("if (access(mixed_lib.c_str()", CACHE_INC.index(KERNEL_NAME))
-    ]
-    assert f'"{KERNEL_NAME}"' in preload
-    assert "rpu_launch_wall_vision_qkv_w8a16_multibase_spm_kernel(" in DECLS
-
-    start = LINEAR.index(
-        "void rpu_launch_wall_vision_qkv_w8a16_multibase_spm_kernel("
-    )
-    launcher = LINEAR[
-        start : LINEAR.index(
-            "void rpu_launch_wall_prefill_down_w8a16_c320x2_spm_kernel(",
-            start,
-        )
-    ]
-    for exact_dim in (
-        "constexpr int64_t kImageM = 576;",
-        "constexpr int64_t kK = 1280;",
-        "constexpr int64_t kN = 1280;",
-        "constexpr int64_t kNPerCore = 160;",
-    ):
-        assert exact_dim in launcher
+    assert_current_catalog("Qkv")
+    launcher=_function(LINEAR,"void rpu_launch_wall_vision_qkv_w8a16_multibase_spm_kernel(")
+    for geometry in ("kImageM = 576", "kK = 1280", "kNPerCore = 160", "Operation::Qkv"):
+        assert geometry in launcher
     assert launcher.count("GraphDdrRegisterOperandSpec{") == 6
     assert launcher.count("GraphDdrRegisterRole::Int8ModelWeight") == 3
     assert launcher.count("GraphDdrRegisterRole::PerChannelScale") == 3
-    assert "GET_KERNEL(kernel_id)" in launcher
-    assert "KernelId::WALL_VISION_QKV_W8A16_MULTIBASE_M192X3N96" in launcher
+    for pair in ("2, 3","20, 21","32, 33","34, 35","40, 41","42, 43"):
+        assert "DevAddrShift8LoHi, "+pair in launcher
+    for slot,base in ((36,"k_output_spm_addr"),(44,"v_output_spm_addr"),(38,"k_bias_spm_addr"),(46,"v_bias_spm_addr")):
+        assert f"set_u32({slot}, {base});" in launcher
     assert "register_writer.write(*kernel);" in launcher
     assert "queue->set_broadcast_mode(true);" in launcher
-    for write in (
-        "set_u32(40, input_spm_addr + kInputImageBytes);",
-        "set_u32(42, input_spm_addr + 2 * kInputImageBytes);",
-        "set_u32(44, q_output_spm_addr + kOutputImageBytes);",
-        "set_u32(46, q_output_spm_addr + 2 * kOutputImageBytes);",
-        "set_u32(48, k_output_spm_addr + kOutputImageBytes);",
-        "set_u32(50, k_output_spm_addr + 2 * kOutputImageBytes);",
-        "set_u32(52, v_output_spm_addr + kOutputImageBytes);",
-        "set_u32(54, v_output_spm_addr + 2 * kOutputImageBytes);",
-    ):
-        assert write in launcher
-    assert "queue->enqueu_kernel(*kernel, {6, 3, 1}, cores);" in launcher
+    assert "{selected.grid_x, selected.grid_y, 1}" in launcher
 
 
 def test_only_exact_mixed_w8_uses_fused_qkv_without_an_spm_buffer():

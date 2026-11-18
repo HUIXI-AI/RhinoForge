@@ -12,10 +12,12 @@ package's distribution terms and integrity instructions.
 
 This `1.3.0.dev0` development line depends on archived Rhino Launch **1.2.0**,
 commit `3dd1b410f5f46373997fef3dfbf9b67eecec6a84`, with CMake version `1.2.0` and
-ABI version `1`. Obtain the stable `RhinoForge-runtime-v1.2.0.tar.gz` and its
-`.tar.gz.sha256` from the provider. Its Launch package directory is
-`rhino-launch-kernel-v1.2.0-linux-aarch64`; its main and DDR-expansion assets match
-[runtime-dependencies.json](../release/runtime-dependencies.json).
+ABI version `1`, and advances `op_abi_epoch` to **`2`**. Obtain the matching
+`RhinoForge-runtime-v1.3.0.dev0.tar.gz` and its `.tar.gz.sha256` from the provider.
+Its nested Launch package directory remains `rhino-launch-kernel-v1.2.0-linux-aarch64`;
+its main and DDR-expansion assets match `op_abi_epoch = 2` in
+[runtime-dependencies.json](../release/runtime-dependencies.json) (`RhinoForge-runtime-v1.2.0.tar.gz`
+remains fixed for `v1.2.0` / `op_abi_epoch = 1`).
 Each operator asset requires its adjacent `.ref.kernels` file.
 Historical candidates can have the same bundle filename: verify the checksum,
 `RELEASE.txt` and Launch commit. A directory named `v1.1.0-2-gbdc0dae` contains
@@ -53,7 +55,7 @@ Do not mix an old operator payload with a new sidecar or merge payloads locally.
 
 ## Configure paths
 
-Download `RhinoForge-runtime-v1.2.0.tar.gz` and its `.sha256` from the provider's
+Download `RhinoForge-runtime-v1.3.0.dev0.tar.gz` and its `.sha256` from the provider's
 delivery location into the same download directory. The following
 commands verify both layers and unpack the nested Launch archive; the outer
 archive alone does not create an installed Launch prefix. Use new directories
@@ -63,10 +65,10 @@ outside the source checkout and Python environment, and stop if any check fails:
 export RHINOFORGE_DOWNLOADS="/absolute/path/to/runtime-downloads"
 export RHINOFORGE_RUNTIME="/absolute/path/to/new/runtime"
 cd "$RHINOFORGE_DOWNLOADS"
-sha256sum -c RhinoForge-runtime-v1.2.0.tar.gz.sha256
+sha256sum -c RhinoForge-runtime-v1.3.0.dev0.tar.gz.sha256
 mkdir -p "$RHINOFORGE_RUNTIME"
-tar -xzf RhinoForge-runtime-v1.2.0.tar.gz -C "$RHINOFORGE_RUNTIME"
-export RHINOFORGE_BUNDLE="$RHINOFORGE_RUNTIME/RhinoForge-runtime-v1.2.0"
+tar -xzf RhinoForge-runtime-v1.3.0.dev0.tar.gz -C "$RHINOFORGE_RUNTIME"
+export RHINOFORGE_BUNDLE="$RHINOFORGE_RUNTIME/RhinoForge-runtime-v1.3.0.dev0"
 cd "$RHINOFORGE_BUNDLE"
 sha256sum -c SHA256SUMS
 cat RELEASE.txt
@@ -90,7 +92,7 @@ The resulting directories are:
 
 ```text
 runtime/
-  RhinoForge-runtime-v1.2.0/
+  RhinoForge-runtime-v1.3.0.dev0/
     RELEASE.txt, SHA256SUMS
     rhino-launch-kernel-v1.2.0-linux-aarch64.tar.gz
     rhinoOpLib_current.ref, rhinoOpLib_current.ref.kernels

@@ -375,7 +375,24 @@ def _language_weight_identity(model):
     return id(weight), int(weight._version)
 
 
-def _assemble_packed_prefix_ondevice(self, packed_emb, tokens):
+def _embed_language_rows(self, tokens, masks):
+    """Scaled language rows, with rows that `masks` excludes set to zero.
+
+    No row reads a masked row, but prefill still runs it through all 18 layers
+    with zero attention output, so only the MLP residuals accumulate. A pad
+    token's embedding can leave FP16 range at deep layers (|down| > 65504) and
+    turn into NaN K/V after RMSNorm, which the attention mask cannot remove
+    (NaN + -inf is NaN). Zero rows stay zero through these bias-free layers,
+    the same as `_pad_prefix_rows`.
+    """
+    lang_emb = self.paligemma_with_expert.embed_language_tokens(tokens)
+    lang_emb = lang_emb * math.sqrt(lang_emb.shape[-1])
+    if not masks.all():
+        lang_emb = lang_emb.masked_fill(~masks[:, :, None], 0)
+    return lang_emb
+
+
+def _assemble_packed_prefix_ondevice(self, packed_emb, tokens, masks):
     """Assemble image + language prefix on device with an LRU-1 text cache.
 
     `assemble_inputs_embeds` normally gathers from a full vocabulary. Here the
@@ -397,9 +414,7 @@ def _assemble_packed_prefix_ondevice(self, packed_emb, tokens):
         or tokens.ndim != 2
         or tokens.shape[0] != 1
     ):
-        lang_emb = self.paligemma_with_expert.embed_language_tokens(tokens)
-        lang_emb = lang_emb * math.sqrt(lang_emb.shape[-1])
-        return None, lang_emb
+        return None, _embed_language_rows(self, tokens, masks)
 
     image_rows = int(packed_emb.shape[1])
     weight_identity = _language_weight_identity(self)
@@ -412,14 +427,15 @@ def _assemble_packed_prefix_ondevice(self, packed_emb, tokens):
         and cache["tokens"].shape == tokens.shape
         and cache["tokens"].dtype == tokens.dtype
         and torch.equal(cache["tokens"], tokens)
+        and cache["masks"].shape == masks.shape
+        and torch.equal(cache["masks"], masks)
     )
     if cache_hit:
         lang_emb = cache["lang_cpu"]
         lang_rpu = cache["lang_rpu"]
         ids_rpu = cache["ids_rpu"]
     else:
-        lang_emb = self.paligemma_with_expert.embed_language_tokens(tokens)
-        lang_emb = lang_emb * math.sqrt(lang_emb.shape[-1])
+        lang_emb = _embed_language_rows(self, tokens, masks)
         if (
             lang_emb.device.type != "cpu"
             or lang_emb.dtype != torch.float16
@@ -447,6 +463,7 @@ def _assemble_packed_prefix_ondevice(self, packed_emb, tokens):
             "image_rows": image_rows,
             "weight_identity": weight_identity,
             "tokens": tokens.detach().clone(),
+            "masks": masks.detach().clone(),
             "lang_cpu": lang_emb,
             "lang_rpu": lang_rpu,
             "ids_rpu": ids_rpu,
@@ -550,7 +567,7 @@ def _patched_embed_prefix(self, images, img_masks, tokens, masks):
     if assembly_enabled:
         try:
             assembled_embs, lang_emb = _assemble_packed_prefix_ondevice(
-                self, packed_emb, tokens
+                self, packed_emb, tokens, masks
             )
         except Exception as exc:
             self._pi05_prefix_assembly_ok = False
@@ -563,8 +580,7 @@ def _patched_embed_prefix(self, images, img_masks, tokens, masks):
             )
 
     if lang_emb is None:
-        lang_emb = self.paligemma_with_expert.embed_language_tokens(tokens)
-        lang_emb = lang_emb * math.sqrt(lang_emb.shape[-1])
+        lang_emb = _embed_language_rows(self, tokens, masks)
 
     if assembled_embs is not None:
         if getattr(self, "_pi05_prefix_assembly_ok", None) is None:

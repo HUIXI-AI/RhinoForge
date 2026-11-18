@@ -213,6 +213,38 @@ def _finalize(model):
         finalizer()
 
 
+@pytest.mark.parametrize("fail_weights", [False, True])
+def test_explicit_head_vocabulary_is_bound_before_weights(native_install, fail_weights):
+    model = _model()
+    model.config.vocab_size = 151936
+    table = _FakeTensor()
+    if fail_weights:
+        native_install["fail_set"].add(1)
+    call = lambda: decoder._install_causal_decoder_forward(
+        model, arch="llama", cos_sin=(table, table),
+        chunk_envelope_for=lookup_causal_decoder, logical_vocab_size=151936)
+    if fail_weights:
+        with pytest.raises(RuntimeError, match="synthetic set_weights failure"):
+            call()
+        assert not native_install["alive"] and not hasattr(model, "_rpu_decoder_handle")
+    else:
+        assert call() == 1
+        _finalize(model)
+    assert native_install["create_topologies"] == [{"vocab_size": 151936}]
+    assert native_install["events"][:2] == [("create", 1), ("set_weights", 1)]
+
+
+@pytest.mark.parametrize("logical_vocab_size", [0, True, 151968])
+def test_explicit_head_vocabulary_rejects_before_native_create(native_install, logical_vocab_size):
+    model = _model()
+    model.config.vocab_size = 151936
+    with pytest.raises(ValueError, match="logical_vocab_size"):
+        decoder._install_causal_decoder_forward(
+            model, arch="llama", chunk_envelope_for=lookup_causal_decoder,
+            logical_vocab_size=logical_vocab_size)
+    assert native_install["events"] == [] and not native_install["alive"]
+
+
 @pytest.mark.parametrize("fail_destroy", (False, True))
 def test_outer_cleanup_retires_receipt_only_after_native_success(native_install, fail_destroy):
     model = _model()

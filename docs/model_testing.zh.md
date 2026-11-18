@@ -9,7 +9,7 @@
 ```sh
 python -m examples.run --config examples/configs/qwen3/text/0_6b/fp16.toml --check-config
 python -m examples.run --config examples/configs/qwen3_vl/vl/4b/w8a16_text_head_vision.toml
-python -m examples.run --config examples/configs/pi05/2cam/w8a16_action_nvfp4.toml
+python -m examples.run --config examples/configs/pi05/2cam/h50/w8a16_action_nvfp4.toml
 ```
 
 按模型指南填写 checkpoint 和输入，替换占位路径。`input.prompt_file` 和 `input.prepared_input_safetensors` 的相对路径按配置文件所在目录解析；其他资产路径按模型指南填写。`--check-config` 检查配置，不加载权重或访问设备。量化权重须携带加载器要求的元数据，见[量化](quantization.zh.md)。
@@ -57,7 +57,7 @@ shape。详见[运行时配置](runtime_config.zh.md#profiling-机制)和[模型
 安装 `audio` 可选依赖，调用 `Qwen3ASRModel` 或 `Qwen3TTSModel`。
 下载权重、准备 TTS 源码及完整 Python 用法见[语音指南](qwen3_audio.zh.md)。
 
-语音也可通过 `python -m examples.run --config examples/configs/qwen3_tts/0_6b/base.toml --check-config` 检查，填写本地路径后执行。[ASR](../examples/configs/qwen3_asr/README.md) / [TTS](../examples/configs/qwen3_tts/README.md) 入口记录常驻推理耗时、累计 CPU 时间和 RTF。
+语音也可通过 `python -m examples.run --config examples/configs/qwen3_tts/0_6b/fp16.toml --check-config` 检查，填写本地路径后执行。[ASR](../examples/configs/qwen3_asr/README.md) / [TTS](../examples/configs/qwen3_tts/README.md) 入口记录常驻推理耗时、累计 CPU 时间和 RTF。
 
 ## 仓库检查
 

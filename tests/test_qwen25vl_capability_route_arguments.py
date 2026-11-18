@@ -41,9 +41,14 @@ def test_qwen25vl_route_arguments_digest_all_four_physical_controls() -> None:
     assert "static_cast<int64_t>(schedule_)" in generic_attention
     assert attention_window in generic_attention
     assert rope_arg in generic
-    assert manifest.count(mixed_arg) >= 2
-    assert mixed_arg in exact
-    assert mixed_arg in generic
+    vision_row = _between(
+        "std::vector<int64_t> vision_row_arguments(",
+        "std::vector<int64_t> small_image_gate_up_arguments(",
+    )
+    assert manifest.count("vision_row_arguments(") == 4
+    assert vision_row.count("mixed_precision_ ? 1 : 0") >= 2
+    assert exact.count("vision_row_arguments(") == 2
+    assert generic.count("vision_row_arguments(") == 2
     assert manifest.count(preload_arg) == 2
     assert preload.count(preload_arg) == 2
     assert "FMB_ROUTE_FLAG_ROPE_TABLE_SPM" in manifest

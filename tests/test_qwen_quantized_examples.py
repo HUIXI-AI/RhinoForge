@@ -11,6 +11,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from _support_status import expected_support_status
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -49,7 +50,7 @@ def test_runtime_quant_config_binds_asset_recipe_and_cold_accumulation(common, s
     expected = profile['input_envelope']['limits']['checkpoint_quant_profile']
     suffix = '_awq' if bits == 4 and size != 32 else ''
     assert expected == f'qwen3_vl_{size}b_w{bits}a16{suffix}_runtime_align_v1'
-    assert profile['support']['status'] == 'CONTROLLED_EVALUATION'
+    assert profile["support"]["status"] == expected_support_status(profile, "CONTROLLED_EVALUATION")
     assert config['input']['decode_steps'] == 31  # 32 generated tokens including prefill
     assert config['rpu_execution']['prefill']['fast_replay'] is True
     assert config['rpu_execution']['prefill']['linear_acc32'] is False
@@ -64,9 +65,13 @@ def test_runtime_quant_config_binds_asset_recipe_and_cold_accumulation(common, s
         'vision_encoder': {'vision': {'linear_acc32': True}},
     }
     common._validate_execution(request, profile=profile)
-    request['model']['num_cores'] = 4
-    with pytest.raises((common.ConfigError, ValueError), match='4/6|eight|8|FP16'):
+    for cores in (4, 6, 8):
+        request['model']['num_cores'] = cores
         common._validate_execution(request, profile=profile)
+    for cores in (True, 3, 5, 7, 9):
+        request['model']['num_cores'] = cores
+        with pytest.raises((common.ConfigError, ValueError)):
+            common._validate_execution(request, profile=profile)
 
 
 @pytest.mark.parametrize('quant', [
@@ -160,7 +165,7 @@ def test_public_quantized_prepare_uses_existing_loader_and_preserves_config(comm
     ids = torch.ones((1, 16), dtype=torch.long)
     processor.return_value.apply_chat_template.return_value = {'input_ids': ids}
     monkeypatch.setattr(importlib.import_module('examples.common.generation'), '_text_input_ids', lambda *_: ids)
-    monkeypatch.setattr(importlib.import_module('examples.common.generation'), '_image_inputs', lambda *_: [object()])
+    monkeypatch.setattr(importlib.import_module('examples.common.generation'), '_image_inputs', lambda *_: [SimpleNamespace(size=(320, 240))])
     monkeypatch.setattr(importlib.import_module('examples.common.generation'), '_extend_multimodal_input', lambda encoded, *_: encoded)
     generate = Mock(return_value={'token_ids': ids})
     monkeypatch.setattr(importlib.import_module('examples.common.generation'), '_generate', generate)
@@ -169,6 +174,7 @@ def test_public_quantized_prepare_uses_existing_loader_and_preserves_config(comm
     loader.assert_called_once_with(str(tmp_path), dtype=torch.float16, device='rpu',
         rpu_execution=config['rpu_execution'], local_files_only=True, trust_remote_code=False)
     assert owner is state.owner
+    assert state.input_geometry['source_image_sizes_wh'] == ([[320, 240]] if mode == 'vl' else [])
     infer()
     assert generate.call_args.args[3] == 31
     assert generate.call_args.kwargs['stop_on_eos'] is False

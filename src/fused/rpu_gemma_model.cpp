@@ -51,15 +51,18 @@
 //   - cfg.cross_layer_batch_size = num_layers() (force single group).
 //
 // Framework contract: src/core/fused_model_base.h
-// Pitfall 2 structural fix reference: docs/pitfalls.md
+// Pitfall 2 structural fix reference: the SDK queue contract
 
 #include "fused_model_base.h"
 #include "pi05_execution_topology.h"
+#include "rpu_linear_tiling.h"
 #include "pi05_kernel_policy.h"
-#include "rpu_pi05_producer_chain.h"
 #include "model_handle_registry.h"
 #include "rpu_ops.h"
+#include "rpu_pi_wall_runtime.h"
+#include "rpu_pi_wall_tiling.h"
 #include "rpu_pi05_down_pair.h"
+#include "rpu_linear_w8a8_contract.h"
 #include "rpu_pi05_owner_norm.h"
 #include "rpu_pi05_prefill_pair.h"
 #include "rpu_spm_buffers.h"
@@ -274,14 +277,13 @@ constexpr int64_t GEMMA_FINAL_RMSNORM_SITE = 5951605176520797451LL;
 
 constexpr int64_t GEMMA_PREFILL_DMA_POLICY_SITE = 6214253228834910321LL;
 constexpr int64_t PI05_GEGLU_LINEAR_SITE = 0x5049303547454c49LL;
-constexpr int64_t PI05_O_CHAIN_LINEAR_SITE = 0x504930354f43484eLL;
-constexpr int64_t PI05_O_CHAIN_POLICY_SITE = 0x504930354f504f4cLL;
 
 
 // Study-only exact paired Down schedule. No shared FMB traversal changes.
 constexpr int64_t PI05_DOWN_PAIR_POLICY_SITE = 0x5049354450504f4cLL;
 constexpr int64_t PI05_DOWN_PAIR_SCHEDULE_SITE = 0x5049354450534348LL;
 constexpr int64_t PI05_DOWN_PAIR_LINEAR_SITE = 0x50493544504c494eLL;
+constexpr int64_t PI05_DOWN_A8_QUANT_SITE = 0x5049354441514e54LL;
 constexpr int64_t PI05_DOWN_PAIR_COPY_SITE = 0x5049354450435059LL;
 constexpr int64_t PI05_DOWN_PAIR_GATHER_SITE = 0x5049354450474154LL;
 constexpr int64_t PI05_DOWN_PAIR_RING_SITE = 0x504935445052494eLL;
@@ -311,6 +313,7 @@ constexpr int64_t PI05_GATEUP_PAIR_POLICY_SITE = 0x504935475550504fLL;
 constexpr int64_t PI05_GATEUP_PAIR_LINEAR_SITE = 0x5049354755504c4eLL;
 constexpr int64_t PI05_GATEUP_A8_C272_POLICY_SITE = 0x5049354138504f4cLL;
 constexpr int64_t PI05_GATEUP_A8_C272_LINEAR_SITE = 0x50493541384c494eLL;
+constexpr int64_t PI05_GATEUP_A8_REDUCED_LINEAR_SITE = 0x5049354138524544LL;
 constexpr int64_t PI05_PREFILL_KV_ONLY_POLICY_SITE = 0x5049354b4f504f4cLL;
 constexpr int64_t PI05_PREFILL_KV_ONLY_TAIL_SITE = 0x5049354b4f544149LL;
 
@@ -348,7 +351,11 @@ public:
         at::Tensor input_norm_w, post_attn_norm_w;
     };
 
-    explicit GemmaModel(bool linear_acc32 = false) : linear_acc32_(linear_acc32) {}
+    explicit GemmaModel(bool linear_acc32 = false) : linear_acc32_(linear_acc32) {
+        TORCH_CHECK(!pi05_prefill_a8_panel512_ ||
+                        (pi05_prefill_a8_ && pi05_prefill_gateup_pair_),
+                    "Pi Prefill A8 panel512 requires cold ACC16 paired A8");
+    }
 
 private:
     const bool linear_acc32_;
@@ -359,6 +366,8 @@ public:
                     "Gemma execution cores must be 4, 6 or 8");
         TORCH_CHECK(layer_weights_.empty(),
                     "Gemma execution cores must precede weight installation");
+        TORCH_CHECK(!pi05_prefill_a8_panel512_ || cores == 8,
+                    "Pi Prefill A8 panel512 requires eight cores");
         set_execution_core_count(static_cast<int>(cores));
     }
 
@@ -378,12 +387,14 @@ public:
     }
 
     void set_prefill_pair_rows(int64_t rows) {
-        TORCH_CHECK(rows == 272 || rows == 288 || rows == 304 || rows == 320 || rows == 336 || rows == 400 || rows == 416 || rows == 432 || rows == 448 || rows == 464,
-                    "Gemma paired prefill supports only exact C272/C288/C304/C320/C336/C400/C416/C432/C448/C464 profiles");
+        TORCH_CHECK(rows == 272 || rows == 288 || rows == 304 || rows == 320 || rows == 336 || rows == 400 || rows == 416 || rows == 432 || rows == 448 || rows == 464 || rows == 480,
+                    "Gemma paired prefill supports only exact C272/C288/C304/C320/C336/C400/C416/C432/C448/C464/C480 profiles");
         TORCH_CHECK(layer_weights_.empty(),
                     "Gemma paired prefill rows must be bound before set_weights");
         TORCH_CHECK(!pi05_pair_rows_bound_ || pi05_pair_rows_ == rows,
                     "Gemma paired prefill rows cannot be rebound");
+        TORCH_CHECK(!pi05_prefill_a8_panel512_ || rows == 272,
+                    "Pi Prefill A8 panel512 requires exact C272 paired rows");
         pi05_pair_rows_ = rows;
         pi05_pair_rows_bound_ = true;
     }
@@ -420,6 +431,7 @@ public:
         at::TensorList gate_scale_list, at::TensorList up_scale_list,
         at::TensorList down_scale_list)
     {
+        validate_pi05_a8_panel512_cold();
         // A failed reinstall must never leave a stale proof/readiness bit from
         // an earlier owner.  The cold policy itself is immutable per handle.
         pi05_prefill_kv1_replica_proof_ = false;
@@ -507,7 +519,8 @@ public:
             physical_intermediate = validate_pi05_reduced_geometry(
                 num_cores(), num_q_heads, num_kv_heads, head_dim,
                 hidden_size, intermediate_size, N, false,
-                dtype == at::kChar);
+                dtype == at::kChar ? Pi05ReducedPrecision::W8A16
+                                   : Pi05ReducedPrecision::FP16);
             for (int64_t i = 0; i < N; ++i) {
                 std::array<std::array<int64_t, 2>, 7> shapes;
                 size_t j = 0;
@@ -594,13 +607,16 @@ public:
                     "KV1 direct/O/OwnerNorm/Down W8A16 owner stack");
 
         if (pi05_prefill_a8_) {
-            TORCH_CHECK(!RpuKernelGraph::has_active() &&
-                N == 18 && num_cores() == 8 &&
-                (pi05_prefill_a8_short()
-                    ? pi05_prefill_a8_short_owner()
-                    : (pi05_prefill_gateup_pair_ && pi05_prefill_o_pair_ &&
-                       pi05_prefill_gateup_pair_owner())),
-                "Pi Prefill A8 requires the exact P800 owner stack or P544/C272 W8 profile");
+            TORCH_CHECK(!RpuKernelGraph::has_active() && N == 18 &&
+                (pi05_prefill_a8_reduced()
+                    ? pi05_prefill_a8_reduced_owner()
+                    : num_cores() == 8 &&
+                      (pi05_prefill_a8_short()
+                        ? pi05_prefill_a8_short_owner()
+                        : (pi05_prefill_gateup_pair_ && pi05_prefill_o_pair_ &&
+                           pi05_prefill_gateup_pair_owner()))),
+                "Pi Prefill A8 requires the exact P800 owner stack, P544/C272 W8 profile "
+                "or the reduced W8 topology with the generic W8A8 tiles");
             for (const auto& weights : layer_weights_) {
                 // FP16->FP32 is exact. Conversion/transfer occurs once per install.
                 pi05_a8_scales_.push_back({
@@ -825,6 +841,7 @@ public:
         at::IntArrayRef planned_stage_descriptor = {},
         bool kv_only_entry = false)
     {
+        validate_pi05_a8_panel512_cold();
         // The public hidden-producing op always uses the default false.  Only
         // the explicit void entry below may execute this cold cache-only graph.
         // Reject before validating inputs, changing state, allocating or DMA.
@@ -1063,6 +1080,12 @@ protected:
         int64_t position) const override {
         LayoutContext ddr_layout = layout;
         ddr_layout.attention_policy = AttentionExecutionPolicy::DDR_KV;
+        if (pi05_full_chunk_) {
+            if (!pi05_full_chunk_domain(plan, ddr_layout, physical_len,
+                                       logical_len, position)) return {};
+            return {pi05_full_chunk_manifest(plan, ddr_layout, physical_len,
+                                            logical_len, position)};
+        }
         // MASK_RESIDENT already requires this physical plan at forward. Prune
         // its impossible candidates before manifest/KV-oracle construction for
         // both ordinary and paired Down; keep the complete forward gate below.
@@ -1103,6 +1126,14 @@ protected:
         const LayoutContext& layout,
         int64_t physical_len, int64_t logical_len,
         int64_t position) const override {
+        if (pi05_full_chunk_) {
+            TORCH_CHECK(pi05_full_chunk_domain(plan, layout, physical_len,
+                                               logical_len, position),
+                        "RPU_PLANNER_REJECT:CAPABILITY: Pi full chunk requires "
+                        "exact P544/C544 or P800/C800, DDR KV and its cold W8A8 owner");
+            return pi05_full_chunk_manifest(plan, layout, physical_len,
+                                            logical_len, position);
+        }
         TORCH_CHECK(
             plan.chunk_mode == ChunkMode::KV_FIRST,
             "RPU_PLANNER_REJECT:CAPABILITY: Gemma descriptor requires "
@@ -1110,6 +1141,8 @@ protected:
         TORCH_CHECK(!pi05_prefill_a8_short() ||
                     pi05_prefill_a8_short_domain(plan, layout, physical_len, logical_len, position),
                     "RPU_PLANNER_REJECT:CAPABILITY: Pi online A8 requires no-padding P544/C272x2");
+        TORCH_CHECK(!pi05_prefill_a8_reduced() || pi05_prefill_a8_reduced_owner(),
+                    "RPU_PLANNER_REJECT:CAPABILITY: Pi reduced A8 requires its cold W8 owner");
         TORCH_CHECK(
             !pi05_prefill_kv1_pair_direct_ ||
                 pi05_prefill_kv1_pair_direct_domain(
@@ -1172,8 +1205,6 @@ protected:
         // rejects a descriptor from a handle constructed with different flags.
         append(FmbRouteFamily::GRAPH_SCHEDULE, GEMMA_PREFILL_DMA_POLICY_SITE,
                1, pi05_prefill_dma_policy(), {1, pi05_pair_rows(), pi05_prefix_rows()});
-        append(FmbRouteFamily::GRAPH_SCHEDULE, PI05_O_CHAIN_POLICY_SITE,
-               1, pi05_prefill_o_chain_ ? 1 : 0, {400, 2048, 256, 80, 8});
         if (pi05_prefill_kv1_pair_direct_) {
             append(FmbRouteFamily::GRAPH_SCHEDULE,
                    PI05_PREFILL_KV1_PAIR_DIRECT_POLICY_SITE,
@@ -1193,6 +1224,11 @@ protected:
             for (const auto& chunk : plan.compute.chunks)
                 append(FmbRouteFamily::LINEAR, PI05_GATEUP_A8_C272_LINEAR_SITE,
                        1, 0, pi05_prefill_a8_short_arguments(), chunk.idx);
+        }
+        if (pi05_prefill_a8_reduced()) {
+            for (const auto& chunk : plan.compute.chunks)
+                append(FmbRouteFamily::LINEAR, PI05_GATEUP_A8_REDUCED_LINEAR_SITE,
+                       1, 0, pi05_prefill_a8_reduced_arguments(chunk.len), chunk.idx);
         }
         if (pi05_prefill_kv_only_) {
             // Ordinary routes still execute unchanged in layers 0..16.  This
@@ -1229,7 +1265,11 @@ protected:
                1, pi05_prefill_down_pair_ ? 1 : 0, pi05_down_pair_arguments());
         if (paired_down) {
             append(FmbRouteFamily::LINEAR, PI05_DOWN_PAIR_LINEAR_SITE,
-                   1, 0, pi05_down_pair_arguments(), 0);
+                   pi05_down_pair_linear_selector(), 0, pi05_down_pair_arguments(), 0);
+            if (pi05_down_a8_enabled())
+                for (int half = 0; half != 2; ++half)
+                    append(FmbRouteFamily::ACTIVATION, PI05_DOWN_A8_QUANT_SITE,
+                           1, 0, pi05_down_a8_quant_arguments(half), half);
             for (int half = 0; half != 2; ++half) {
                 if (!o_pair)
                     append(FmbRouteFamily::GRAPH_SCHEDULE, PI05_DOWN_PAIR_SCHEDULE_SITE,
@@ -1259,8 +1299,6 @@ protected:
             append(FmbRouteFamily::LINEAR, PI05_GATEUP_PAIR_LINEAR_SITE,
                    1, 0, pi05_prefill_gateup_pair_arguments());
         }
-        const bool fused_o_chain = pi05_prefill_o_chain_layout(
-            plan, layout, physical_len, position);
         for (const ChunkInfo& chunk : plan.qkv.chunks) {
             append(FmbRouteFamily::NORMALIZATION, GEMMA_INPUT_RMSNORM_SITE,
                    static_cast<int64_t>(
@@ -1328,7 +1366,7 @@ protected:
         for (const ChunkInfo& chunk : plan.compute.chunks) {
             for (const int64_t site : {
                      GEMMA_POST_RMSNORM_SITE, GEMMA_FINAL_RMSNORM_SITE}) {
-                if ((site == GEMMA_POST_RMSNORM_SITE && (o_pair || owner_norm || fused_o_chain)) ||
+                if ((site == GEMMA_POST_RMSNORM_SITE && (o_pair || owner_norm)) ||
                     (site == GEMMA_FINAL_RMSNORM_SITE && pi05_prefill_kv_only_)) continue;
                 append(FmbRouteFamily::NORMALIZATION, site,
                        static_cast<int64_t>(
@@ -1358,31 +1396,24 @@ protected:
                  /*MASK_2D=*/4},
                 chunk.idx);
             if (o_pair) continue;  // O and both compact norm chains run in COMP1.
-            if (fused_o_chain) {
-                // One actual fused physical launch: no AUTO_TILE or standalone
-                // attention ring routes remain in the admitted descriptor.
-                append(FmbRouteFamily::LINEAR, PI05_O_CHAIN_LINEAR_SITE,
-                       1, 0, pi05_o_chain_arguments(), chunk.idx);
+            append(FmbRouteFamily::ALL_REDUCE,
+                   GEMMA_PREPARE_ALL_REDUCE_SITE,
+                   static_cast<int64_t>(
+                       GemmaAllReduceRoute::PREPARE_RING_INPUT),
+                   0, {}, chunk.idx);
+            append(FmbRouteFamily::LINEAR, GEMMA_O_LINEAR_SITE,
+                   static_cast<int64_t>(
+                       FmbLinearRouteSelector::AUTO_TILE),
+                   0, {}, chunk.idx);
+            if (owner_norm) {
+                append(FmbRouteFamily::ALL_REDUCE, PI05_OWNER_NORM_ATTENTION_SITE,
+                       1, 0, pi05_owner_norm_arguments(), chunk.idx);
             } else {
                 append(FmbRouteFamily::ALL_REDUCE,
-                       GEMMA_PREPARE_ALL_REDUCE_SITE,
-                       static_cast<int64_t>(
-                           GemmaAllReduceRoute::PREPARE_RING_INPUT),
+                       GEMMA_ATTENTION_ALL_REDUCE_SITE,
+                       fmb_ring_all_reduce_route_selector(
+                           chunk.len, hidden_size(), use_pi05_ring_xor3(chunk.len), num_cores()),
                        0, {}, chunk.idx);
-                append(FmbRouteFamily::LINEAR, GEMMA_O_LINEAR_SITE,
-                       static_cast<int64_t>(
-                           FmbLinearRouteSelector::AUTO_TILE),
-                       0, {}, chunk.idx);
-                if (owner_norm) {
-                    append(FmbRouteFamily::ALL_REDUCE, PI05_OWNER_NORM_ATTENTION_SITE,
-                           1, 0, pi05_owner_norm_arguments(), chunk.idx);
-                } else {
-                    append(FmbRouteFamily::ALL_REDUCE,
-                           GEMMA_ATTENTION_ALL_REDUCE_SITE,
-                           fmb_ring_all_reduce_route_selector(
-                               chunk.len, hidden_size(), use_pi05_ring_xor3(chunk.len), num_cores()),
-                           0, {}, chunk.idx);
-                }
             }
         }
         append_fmb_shared_runtime_routes(
@@ -1396,10 +1427,16 @@ protected:
     FmbPhysicalManifestForwardCapability
     physical_manifest_forward_capability(
         const FmbPhysicalExecutionManifest& manifest) const override {
+        if (pi05_full_chunk_) {
+            pi05_full_chunk_validate_manifest(manifest);
+            return {true, FmbGraphLifecycle::COMPOSITE_CHILD};
+        }
+        validate_pi05_a8_panel512_cold();
         pi05_prefill_kv_only_validate_manifest(manifest);
         validate_pi05_prefill_kv1_pair_direct_manifest(manifest);
         pi05_prefill_gateup_pair_validate_manifest(manifest);
         pi05_prefill_a8_short_validate_manifest(manifest);
+        pi05_prefill_a8_reduced_validate_manifest(manifest);
         pi05_o_pair_validate_manifest(manifest);
         pi05_qkv_pair_validate_manifest(manifest);
         int owner_policy_sites = 0;
@@ -1436,16 +1473,8 @@ protected:
                 manifest.linear_accumulation == pi05_prefill_linear_accumulation(),
                 "Pi paired Down requires its exact COMPLETE P800/ACC16 profile");
         }
-        int policy_sites = 0, chain_policy_sites = 0;
+        int policy_sites = 0;
         for (const auto& route : manifest.routes) {
-            if (route.site_id == PI05_O_CHAIN_POLICY_SITE) {
-                ++chain_policy_sites;
-                TORCH_CHECK(route.family == FmbRouteFamily::GRAPH_SCHEDULE &&
-                    route.selector == 1 && route.invocation == 0 &&
-                    route.flags == (pi05_prefill_o_chain_ ? 1 : 0) &&
-                    route.arguments == std::vector<int64_t>({400, 2048, 256, 80, 8}),
-                    "RPU_PLANNER_REJECT:CAPABILITY: Gemma O-chain cold policy mismatch");
-            }
             if (route.site_id != GEMMA_PREFILL_DMA_POLICY_SITE) continue;
             ++policy_sites;
             TORCH_CHECK(
@@ -1456,8 +1485,6 @@ protected:
                 "RPU_PLANNER_REJECT:CAPABILITY: Gemma prefill DMA cold "
                 "policy does not match the owning handle");
         }
-        TORCH_CHECK(chain_policy_sites == 1,
-                    "RPU_PLANNER_REJECT:CAPABILITY: Gemma O-chain policy site missing/duplicate");
         TORCH_CHECK(policy_sites == 1,
                     "RPU_PLANNER_REJECT:CAPABILITY: Gemma prefill DMA "
                     "policy requires exactly one native schedule site");
@@ -1494,7 +1521,7 @@ protected:
                 &GemmaModel::plan_kv_first_chunks);
 
         cfg.post_fn = nullptr;
-        if (pi05_prefill_carry_requested() && pi05_prefill_dma_geometry()) {
+        if (!pi05_full_chunk_ && pi05_prefill_carry_requested() && pi05_prefill_dma_geometry()) {
             cfg.kv_first_pair_carry_rows = pi05_pair_rows();
             cfg.kv_first_pair_carry_across_layers = pi05_prefill_carry_ab_;
         }
@@ -1515,7 +1542,8 @@ protected:
         }
 
         cfg.inter_layer_io = InterLayerIO::AUTO;
-        cfg.attention_policy = AttentionExecutionPolicy::AUTO;
+        cfg.attention_policy = pi05_full_chunk_ ? AttentionExecutionPolicy::DDR_KV
+                                               : AttentionExecutionPolicy::AUTO;
         return cfg;
     }
 
@@ -1524,7 +1552,8 @@ protected:
         ModelDynamicConfig cfg;
         cfg.chunk_mode = ChunkMode::KV_FIRST;
         cfg.inter_layer_io = InterLayerIO::AUTO;
-        cfg.attention_policy = AttentionExecutionPolicy::AUTO;
+        cfg.attention_policy = pi05_full_chunk_ ? AttentionExecutionPolicy::DDR_KV
+                                               : AttentionExecutionPolicy::AUTO;
         return cfg;
     }
 
@@ -1757,6 +1786,8 @@ protected:
             decls.push_back(final_norm);
         }
 
+        if (pi05_full_chunk_)
+            return pi05_full_chunk_decls(ctx, std::move(decls));
         if (pi05_qkv_pair_layout(ctx)) {
             std::vector<BufferDecl> paired;
             for (const char* name : {"residual1", "pi05_qkv_s1", "pi05_qkv_s2"})
@@ -1784,7 +1815,8 @@ protected:
             std::vector<BufferDecl> paired;
             for (const char* name : {"residual1", "pi05_pair_s1", "pi05_pair_s2", "pi05_pair_s3"}) {
                 const int64_t bytes = pi05_prefill_a8_ && std::string(name)=="pi05_pair_s1"
-                    ? pi05_a8_root_bytes() : pi05_pair_slab_bytes();
+                    ? pi05_a8_root_bytes() : std::string(name)=="residual1"
+                    ? pi05_a8_s0_bytes() : pi05_pair_slab_bytes();
                 paired.push_back({name, bytes, 0, 30, StorageClass::Temp, 0, nullptr, ALL});
             }
             if (!pi05_pair_scratch_mask())
@@ -1794,7 +1826,7 @@ protected:
             const auto alias = [&](const char* name, const char* root) {
                 paired.push_back({name, 0, 0, 30, StorageClass::Temp, 0, root, ALL});
             };
-            // C416/C432/C448/C464 paired-O consumes both masks before any post-attention
+            // C416/C432/C448/C464/C480 paired-O consumes both masks before any post-attention
             // normalization writes S1. Reuse this declared root and upload
             // both halves in every layer; no mask contents survive the MLP.
             if (pi05_pair_scratch_mask()) alias("sdpa_mask", "pi05_pair_s1");
@@ -1833,6 +1865,10 @@ protected:
     // addr(core, name) at compile time.
     // ========================================================================
     void emit_kv_first_body(int layer_idx, const ChunkInfo& chunk) {
+        if (pi05_full_chunk_) {
+            emit_pi05_full_chunk_kv(layer_idx, chunk);
+            return;
+        }
         const auto& lw = layer_weights_[layer_idx];
         int64_t seq_len = chunk.len;
         int64_t cos_sin_start = ctx().position + chunk.offset;
@@ -1847,6 +1883,24 @@ protected:
         if (paired_down) pi05_down_pair_require_graph();
         const uint32_t pair_k_offset = paired_down ? pi05_pair_owner_bytes() : 0;
         const uint32_t pair_v_offset = paired_down ? (2 * pi05_pair_owner_bytes()) : 0;
+        if (pi05_prefill_o_pair_) {
+            if (layer_idx == 0 && chunk.idx == (carry ? 1 : 0)) {
+                pi05_o_pair_output_dma_ = DeferredDmaChannels{};
+                pi05_o_pair_carried_layer_ = -1;
+            } else if (pi05_o_pair_carried_layer_ >= 0) {
+                // The previous layer left half 1 only in S0, and its half-0
+                // copy (S1 for Down A8, otherwise S2 -> DDR rows [0,R))
+                // may still be running on DMA channels 1..7. This KV1 body
+                // must read S0. Join before reusing either source and before this
+                // layer's KV0 input DMA reads those DDR rows.
+                TORCH_CHECK(pi05_o_pair_carried_layer_ + 1 == layer_idx &&
+                                chunk.idx == 1 && ctx().input_in_spm,
+                            "Pi paired O carried output reached layer ", layer_idx,
+                            " chunk ", chunk.idx, " without the SPM carry");
+                rpu_join_deferred_dma(pi05_o_pair_output_dma_);
+                pi05_o_pair_carried_layer_ = -1;
+            }
+        }
         if (layer_idx == 0 && chunk.idx == (carry ? 1 : 0)) {
             ctx().consume_physical_route(FmbRouteFamily::GRAPH_SCHEDULE,
                 PI05_O_PAIR_POLICY_SITE, 1, pi05_prefill_o_pair_ ? 1 : 0,
@@ -1878,9 +1932,6 @@ protected:
             ctx().consume_physical_route(
                 FmbRouteFamily::GRAPH_SCHEDULE, GEMMA_PREFILL_DMA_POLICY_SITE,
                 1, pi05_prefill_dma_policy(), {1, pi05_pair_rows(), pi05_prefix_rows()}, 0);
-            ctx().consume_physical_route(
-                FmbRouteFamily::GRAPH_SCHEDULE, PI05_O_CHAIN_POLICY_SITE,
-                1, pi05_prefill_o_chain_ ? 1 : 0, {400, 2048, 256, 80, 8}, 0);
             if (pi05_prefill_kv1_pair_direct_) {
                 ctx().consume_physical_route(
                     FmbRouteFamily::GRAPH_SCHEDULE,
@@ -1924,7 +1975,7 @@ protected:
             rpu_launch_spm_local_shard_copy_dma(addr(0, "residual1"), pi05_pair_owner_elements(), pi05_pair_owner_bytes(),
                 pi05_pair_input_compact_address(chunk.idx), 8);
         }
-        const char* kv_norm = pi05_pair_kv_norm_name(use_pi05_prefill_mask_mlp_reuse(seq_len));
+        const char* kv_norm = pi05_pair_kv_norm_name(use_pi05_prefill_mask_mlp_reuse(seq_len), paired_down);
         // RMSNorm using pre-loaded (1+w) norm from per-layer SPM
         // (preload_callback DMA'd layer_weights_[L].input_norm_w here on first
         // persistent allocation / on preload_callbacks_dirty_).
@@ -2133,6 +2184,10 @@ protected:
     // Pitfall 3 structural fix: SDPA + KV-insert offsets via addr_offset(name).value.
     // ========================================================================
     void build_layer_subgraph(int layer_idx, const ChunkInfo& chunk) override {
+        if (pi05_full_chunk_) {
+            emit_pi05_full_chunk_compute(layer_idx, chunk);
+            return;
+        }
         if (num_cores() != 8 && layer_idx == 0 && chunk.idx == 0 &&
             ctx().has_complete_physical_manifest()) {
             ctx().consume_physical_route(FmbRouteFamily::GRAPH_SCHEDULE,
@@ -2286,75 +2341,61 @@ protected:
         }
         const char* mlp_input = use_pi05_prefill_mask_mlp_reuse(seq_len)
             ? "input_norm" : "residual1";
-        if (pi05_o_chain_geometry() && seq_len == pi05_pair_rows() &&
-            pi05_prefill_dma_runtime_geometry() && !ctx().is_causal &&
-            ctx().attention_mask.has_value() && ctx().attention_mask->defined() &&
-            ctx().attention_mask->size(-1) == pi05_prefix_rows()) {
-            ctx().consume_physical_route(
-                FmbRouteFamily::LINEAR, PI05_O_CHAIN_LINEAR_SITE,
-                1, 0, pi05_o_chain_arguments(), chunk.idx);
-            rpu_launch_pi05_prefill_o_chain_spm_kernel(
-                addr(0, "output"), lw.o_w, addr(0, "oproj"),
-                addr(0, "residual1"), addr(0, "residual2"),
+        // O_proj (row partition)
+        ctx().consume_physical_route(
+            FmbRouteFamily::ALL_REDUCE,
+            GEMMA_PREPARE_ALL_REDUCE_SITE,
+            static_cast<int64_t>(
+                GemmaAllReduceRoute::PREPARE_RING_INPUT),
+            /*resolved_flags=*/0, {}, chunk.idx);
+        // Clear only the owner's consumers (TP6 has four attention producers).
+        rpu_prepare_ring_all_reduce_input(
+            addr(0, "oproj"), seq_len, h, tp, num_cores());
+        ctx().consume_physical_route(
+            FmbRouteFamily::LINEAR, GEMMA_O_LINEAR_SITE,
+            static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+            /*resolved_flags=*/0, {}, chunk.idx);
+        rpu_launch_linear_spm_to_spm_acc16_kernel(
+            addr(0, "output"), lw.o_w, addr(0, "oproj"),
+            seq_len, h, nq * hd, 0, tp,
+            /*bias_spm_addr=*/0, lw.o_ws, 0, 0,
+        /*force_acc32=*/linear_acc32_);
+
+        if (pi05_prefill_owner_norm_) {
+            TORCH_CHECK(paired_down && pi05_owner_norm_owner(),
+                        "Pi owner norm callback owner drift");
+            ctx().consume_physical_route(FmbRouteFamily::ALL_REDUCE,
+                PI05_OWNER_NORM_ATTENTION_SITE, 1, 0,
+                pi05_owner_norm_arguments(), chunk.idx);
+            // O(S2) and full residual(S0/S1) are read before GeGLU reuses
+            // residual. The old SDPA output in S3 is dead after O.
+            rpu_launch_pi05_owner_norm_spm_kernel(
+                addr(0, "oproj"), addr(0, residual_input),
+                addr(0, "pi05_pair_residual") + chunk.idx * pi05_pair_owner_bytes(),
                 addr(0, mlp_input), layer_addr(layer_idx, 0, "post_attn_norm_w"),
-                lw.o_ws, eps_);
+                Pi05OwnerNormResidual::Full, eps_, pi05_pair_rows());
         } else {
-            // O_proj (row partition)
+            // Reduce + residual (oproj + residual1 -> residual2)
             ctx().consume_physical_route(
                 FmbRouteFamily::ALL_REDUCE,
-                GEMMA_PREPARE_ALL_REDUCE_SITE,
-                static_cast<int64_t>(
-                    GemmaAllReduceRoute::PREPARE_RING_INPUT),
+                GEMMA_ATTENTION_ALL_REDUCE_SITE,
+                fmb_ring_all_reduce_route_selector(seq_len, h, use_pi05_ring_xor3(seq_len), num_cores()),
                 /*resolved_flags=*/0, {}, chunk.idx);
-            // Clear only the owner's consumers (TP6 has four attention producers).
-            rpu_prepare_ring_all_reduce_input(
-                addr(0, "oproj"), seq_len, h, tp, num_cores());
-            ctx().consume_physical_route(
-                FmbRouteFamily::LINEAR, GEMMA_O_LINEAR_SITE,
-                static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
-                /*resolved_flags=*/0, {}, chunk.idx);
-            rpu_launch_linear_spm_to_spm_acc16_kernel(
-                addr(0, "output"), lw.o_w, addr(0, "oproj"),
-                seq_len, h, nq * hd, 0, tp,
-                /*bias_spm_addr=*/0, lw.o_ws, 0, 0,
-            /*force_acc32=*/linear_acc32_);
+            rpu_launch_all_reduce_sum_residual_kernel(
+                addr(0, "oproj"), addr(0, residual_input), addr(0, "residual2"),
+                seq_len, h, tp, num_cores(), use_pi05_ring_xor3(seq_len));
 
-            if (pi05_prefill_owner_norm_) {
-                TORCH_CHECK(paired_down && pi05_owner_norm_owner(),
-                            "Pi owner norm callback owner drift");
-                ctx().consume_physical_route(FmbRouteFamily::ALL_REDUCE,
-                    PI05_OWNER_NORM_ATTENTION_SITE, 1, 0,
-                    pi05_owner_norm_arguments(), chunk.idx);
-                // O(S2) and full residual(S0/S1) are read before GeGLU reuses
-                // residual. The old SDPA output in S3 is dead after O.
-                rpu_launch_pi05_owner_norm_spm_kernel(
-                    addr(0, "oproj"), addr(0, residual_input),
-                    addr(0, "pi05_pair_residual") + chunk.idx * pi05_pair_owner_bytes(),
-                    addr(0, mlp_input), layer_addr(layer_idx, 0, "post_attn_norm_w"),
-                    Pi05OwnerNormResidual::Full, eps_, pi05_pair_rows());
-            } else {
-                // Reduce + residual (oproj + residual1 -> residual2)
-                ctx().consume_physical_route(
-                    FmbRouteFamily::ALL_REDUCE,
-                    GEMMA_ATTENTION_ALL_REDUCE_SITE,
-                    fmb_ring_all_reduce_route_selector(seq_len, h, use_pi05_ring_xor3(seq_len), num_cores()),
-                    /*resolved_flags=*/0, {}, chunk.idx);
-                rpu_launch_all_reduce_sum_residual_kernel(
-                    addr(0, "oproj"), addr(0, residual_input), addr(0, "residual2"),
-                    seq_len, h, tp, num_cores(), use_pi05_ring_xor3(seq_len));
-
-                if (paired_down) {
-                    ctx().consume_physical_route(FmbRouteFamily::COLLECTIVE,
-                        PI05_DOWN_PAIR_COPY_SITE, 1, 0, {pi05_pair_owner_elements(), pi05_pair_owner_bytes(), 8}, chunk.idx);
-                    rpu_launch_spm_local_shard_copy_dma(addr(0, "residual2"), pi05_pair_owner_elements(), pi05_pair_owner_bytes(),
-                        addr(0, "pi05_pair_residual") + chunk.idx * pi05_pair_owner_bytes(), 8);
-                }
-                // Post-attention RMSNorm using pre-loaded (1+w) norm from per-layer SPM.
-                rpu_launch_rmsnorm_spm_kernel(
-                    addr(0, "residual2"), addr(0, mlp_input),
-                    layer_addr(layer_idx, 0, "post_attn_norm_w"),
-                    seq_len, h, eps_, consume_rmsnorm_route(GEMMA_POST_RMSNORM_SITE, chunk), num_cores());
+            if (paired_down) {
+                ctx().consume_physical_route(FmbRouteFamily::COLLECTIVE,
+                    PI05_DOWN_PAIR_COPY_SITE, 1, 0, {pi05_pair_owner_elements(), pi05_pair_owner_bytes(), 8}, chunk.idx);
+                rpu_launch_spm_local_shard_copy_dma(addr(0, "residual2"), pi05_pair_owner_elements(), pi05_pair_owner_bytes(),
+                    addr(0, "pi05_pair_residual") + chunk.idx * pi05_pair_owner_bytes(), 8);
             }
+            // Post-attention RMSNorm using pre-loaded (1+w) norm from per-layer SPM.
+            rpu_launch_rmsnorm_spm_kernel(
+                addr(0, "residual2"), addr(0, mlp_input),
+                layer_addr(layer_idx, 0, "post_attn_norm_w"),
+                seq_len, h, eps_, consume_rmsnorm_route(GEMMA_POST_RMSNORM_SITE, chunk), num_cores());
         }
 
         if (pi05_prefill_a8_short() && !is_last_layer) {
@@ -2384,6 +2425,8 @@ protected:
             rpu_launch_all_reduce_sum_residual_kernel(
                 addr(0, "down"), addr(0, "residual2"), addr(0, "residual1"),
                 seq_len, h, num_cores(), num_cores(), false);
+        } else if (pi05_prefill_a8_reduced() && !is_last_layer) {
+            emit_pi05_prefill_a8_reduced_mlp(layer_idx, chunk, mlp_input);
         } else if (pi05_geglu_eligible(seq_len)) {
             ctx().consume_physical_route(FmbRouteFamily::LINEAR,
                 PI05_GEGLU_LINEAR_SITE, 1, 0, {pi05_pair_rows(), 16384, 2048, 80, 8}, chunk.idx);
@@ -2435,7 +2478,9 @@ private:
     // A cold execution profile, bound before planner enumeration. Keep the
     // legacy C400 default; actual two-camera T32 binds C272, while T64 binds
     // C288 for two cameras and C416 for three cameras; T96 binds C304/C432,
-    // T128 binds C320/C448, and T160 binds C336/C464.
+    // T128 binds C320/C448, T160 binds C336/C464, and three-camera T192 binds
+    // C480 (the C464 layout at 480 rows; it fits only with the SigLIP
+    // LayerNorm streaming the adapter binds for it).
     // Planner trials never mutate this geometry or infer it from a candidate.
     int64_t pi05_pair_rows_ = 400;
     bool pi05_pair_rows_bound_ = false;
@@ -2449,8 +2494,10 @@ private:
         return pi05_pair_rows() == 464 ? 80 : pi05_pair_rows() == 448 ? 96 :
             (pi05_pair_rows() == 432 ? 112 : (pi05_pair_rows() == 416 ? 128 : 160));
     }
-    bool pi05_pair_single_compact() const { return pi05_pair_rows() == 448 || pi05_pair_rows() == 464; }
-    bool pi05_pair_slab_compact() const { return pi05_pair_rows() == 464; }
+    bool pi05_pair_single_compact() const {
+        return pi05_pair_rows() == 448 || pi05_pair_rows() == 464 || pi05_pair_rows() == 480;
+    }
+    bool pi05_pair_slab_compact() const { return pi05_pair_rows() == 464 || pi05_pair_rows() == 480; }
     int64_t pi05_pair_spill_elements() const {
         return (pi05_pair_slab_compact() ? 2 : 1) * pi05_pair_owner_elements();
     }
@@ -2458,19 +2505,23 @@ private:
         if (pi05_pair_slab_compact()) return 0;
         return (pi05_pair_single_compact() ? 1 : 2) * pi05_pair_owner_bytes();
     }
-    const char* pi05_pair_kv_norm_name(bool legacy_reuse) const {
-        // C448/C464 keeps input C1 in S3+4D across both KVIN callbacks.
+    const char* pi05_pair_kv_norm_name(bool legacy_reuse, bool paired_layout) const {
+        // C448/C464/C480 keep input C1 in S3+4D across both KVIN callbacks.
         // The legacy non-C400 fallback normalizes into S3 and would erase it.
-        return pi05_pair_single_compact() || legacy_reuse ? "input_norm_kv" : "input_norm";
+        // Only the paired-Down layout declares that alias; non-paired chunk
+        // plans and 4/6-core layouts declare input_norm_kv only for MLP-slot reuse.
+        return (paired_layout && pi05_pair_single_compact() && use_pi05_down_pair()) || legacy_reuse
+            ? "input_norm_kv" : "input_norm";
     }
     bool pi05_pair_scratch_mask() const {
         // Without paired-O, COMP1 still owns its input/gate in S1.
-        return (pi05_pair_rows() == 416 || pi05_pair_rows() == 432 || pi05_pair_rows() == 448 || pi05_pair_rows() == 464) && pi05_prefill_o_pair_;
+        return (pi05_pair_rows() == 416 || pi05_pair_rows() == 432 || pi05_pair_rows() == 448 ||
+                pi05_pair_rows() == 464 || pi05_pair_rows() == 480) && pi05_prefill_o_pair_;
     }
     int64_t pi05_pair_mask_selector(int half) const {
         TORCH_CHECK(half == 0 || half == 1, "Pi paired mask requires half 0/1");
         // 1: S1 each layer; 2: independent root once per request;
-        // 3: S1 scratch each layer under the exact C416/C432/C448/C464 paired-O owner.
+        // 3: S1 scratch each layer under the exact C416/C432/C448/C464/C480 paired-O owner.
         return pi05_pair_scratch_mask() ? 3 : (half == 0 ? 1 : 2);
     }
     bool pi05_pair_mask_upload(int layer_idx, int half) const {
@@ -2480,7 +2531,7 @@ private:
         TORCH_CHECK(half == 0 || half == 1, "Pi paired compact input requires half 0/1");
         if (!pi05_pair_single_compact())
             return {pi05_pair_owner_elements(),pi05_pair_owner_bytes(),8,half};
-        // C464 owns both input stripes in S3, beyond both SDPA outputs.
+        // C464/C480 own both input stripes in S3, beyond both SDPA outputs.
         if (pi05_pair_slab_compact())
             return {3,pi05_pair_owner_elements(),pi05_pair_owner_bytes(),8,half,
                     3,(half == 0 ? 5 : 4)*pi05_pair_owner_bytes(),
@@ -2542,114 +2593,32 @@ private:
     }
 
     KernelId pi05_prefill_kv1_pair_kernel() const {
-        if (pi05_pair_rows() == 304) return pi05_pair_fp16()
-            ? KernelId::PI05_PREFILL_KV1_PAIR_OWNER_FP16_M304N32X2K2048
-            : KernelId::PI05_PREFILL_KV1_PAIR_OWNER_W8A16_M304N32X2K2048;
-        if (pi05_pair_rows() == 432) return pi05_pair_fp16()
-            ? KernelId::PI05_PREFILL_KV1_PAIR_OWNER_FP16_M432N32X2K2048
-            : KernelId::PI05_PREFILL_KV1_PAIR_OWNER_W8A16_M432N32X2K2048;
-        if (pi05_pair_rows() == 288) return pi05_pair_fp16()
-            ? KernelId::PI05_PREFILL_KV1_PAIR_OWNER_FP16_M288N32X2K2048
-            : KernelId::PI05_PREFILL_KV1_PAIR_OWNER_W8A16_M288N32X2K2048;
-        if (pi05_pair_rows() == 336) return pi05_pair_fp16()
-            ? KernelId::PI05_PREFILL_KV1_PAIR_OWNER_FP16_M336N32X2K2048
-            : KernelId::PI05_PREFILL_KV1_PAIR_OWNER_W8A16_M336N32X2K2048;
-        if (pi05_pair_rows() == 320) return pi05_pair_fp16()
-            ? KernelId::PI05_PREFILL_KV1_PAIR_OWNER_FP16_M320N32X2K2048
-            : KernelId::PI05_PREFILL_KV1_PAIR_OWNER_W8A16_M320N32X2K2048;
-        if (pi05_pair_rows() == 464) return pi05_pair_fp16()
-            ? KernelId::PI05_PREFILL_KV1_PAIR_OWNER_FP16_M464N32X2K2048
-            : KernelId::PI05_PREFILL_KV1_PAIR_OWNER_W8A16_M464N32X2K2048;
-        if (pi05_pair_rows() == 448) return pi05_pair_fp16()
-            ? KernelId::PI05_PREFILL_KV1_PAIR_OWNER_FP16_M448N32X2K2048
-            : KernelId::PI05_PREFILL_KV1_PAIR_OWNER_W8A16_M448N32X2K2048;
-        if (pi05_pair_rows() == 416) return pi05_pair_fp16()
-            ? KernelId::PI05_PREFILL_KV1_PAIR_OWNER_FP16_M416N32X2K2048
-            : KernelId::PI05_PREFILL_KV1_PAIR_OWNER_W8A16_M416N32X2K2048;
-        if (pi05_pair_fp16()) return pi05_pair_rows() == 400
-            ? KernelId::PI05_PREFILL_KV1_PAIR_OWNER_FP16_M400N32X2K2048
-            : KernelId::PI05_PREFILL_KV1_PAIR_OWNER_FP16_M272N32X2K2048;
-        return pi05_pair_rows() == 400
-            ? KernelId::PI05_PREFILL_KV1_PAIR_OWNER_W8A16_M400N32X2K2048
-            : KernelId::PI05_PREFILL_KV1_PAIR_OWNER_W8A16_M272N32X2K2048;
+        const auto c = rpu_pi_wall::select(rpu_pi_wall::Operation::KvOwner,
+            pi05_pair_fp16() ? rpu_pl_tiling::WeightType::Fp16 : rpu_pl_tiling::WeightType::Int8,
+            false, pi05_pair_rows(), 32, 2048);
+        return pi_wall_kernel_id(c.ordinal);
     }
     KernelId pi05_prefill_gateup_pair_kernel() const {
-        if (pi05_pair_rows() == 304) {
-            if (pi05_prefill_a8_)
-                return KernelId::PI05_PREFILL_GATE_UP_GEGLU_W8A8_SPLIT_C304_M48N32K2048;
-            return pi05_pair_fp16()
-                ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_FP16_C304X2_M160N80K128
-                : KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_W8A16_C304X2_M160N80K128;
-        }
-        if (pi05_pair_rows() == 432) {
-            if (pi05_prefill_a8_)
-                return KernelId::PI05_PREFILL_GATE_UP_GEGLU_W8A8_SPLIT_C432_M48N32K2048;
-            return pi05_pair_fp16()
-                ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_FP16_C432X2_M112N80K128
-                : KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_W8A16_C432X2_M112N80K128;
-        }
-        if (pi05_pair_rows() == 288) {
-            if (pi05_prefill_a8_)
-                return KernelId::PI05_PREFILL_GATE_UP_GEGLU_W8A8_SPLIT_C288_M48N32K2048;
-            return pi05_pair_fp16()
-                ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_FP16_C288X2_M160N80K128
-                : KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_W8A16_C288X2_M160N80K128;
-        }
-        if (pi05_pair_rows() == 336) {
-            if (pi05_prefill_a8_)
-                return KernelId::PI05_PREFILL_GATE_UP_GEGLU_W8A8_SPLIT_C336_M48N32K2048;
-            return pi05_pair_fp16()
-                ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_FP16_C336X2_M160N80K128
-                : KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_W8A16_C336X2_M160N80K128;
-        }
-        if (pi05_pair_rows() == 320) {
-            if (pi05_prefill_a8_)
-                return KernelId::PI05_PREFILL_GATE_UP_GEGLU_W8A8_SPLIT_C320_M48N32K2048;
-            return pi05_pair_fp16()
-                ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_FP16_C320X2_M160N80K128
-                : KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_W8A16_C320X2_M160N80K128;
-        }
-        if (pi05_pair_rows() == 464) {
-            if (pi05_prefill_a8_)
-                return KernelId::PI05_PREFILL_GATE_UP_GEGLU_W8A8_SPLIT_C464_M48N32K2048;
-            return pi05_pair_fp16()
-                ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_FP16_C464X2_M80N80K128
-                : KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_W8A16_C464X2_M80N80K128;
-        }
-        if (pi05_pair_rows() == 448) {
-            if (pi05_prefill_a8_)
-                return KernelId::PI05_PREFILL_GATE_UP_GEGLU_W8A8_SPLIT_C448_M48N32K2048;
-            return pi05_pair_fp16()
-                ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_FP16_C448X2_M96N80K128
-                : KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_W8A16_C448X2_M96N80K128;
-        }
-        if (pi05_pair_rows() == 416) {
-            if (pi05_prefill_a8_)
-                return KernelId::PI05_PREFILL_GATE_UP_GEGLU_W8A8_SPLIT_C416_M48N32K2048;
-            return pi05_pair_fp16()
-                ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_FP16_C416X2_M128N80K128
-                : KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_W8A16_C416X2_M128N80K128;
-        }
-        if (pi05_prefill_a8_) return pi05_pair_rows() == 400
-            ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_W8A8_SPLIT_M48N32K2048
-            : KernelId::PI05_PREFILL_GATE_UP_GEGLU_W8A8_SPLIT_C272_M48N32K2048;
-        if (pi05_pair_fp16()) return pi05_pair_rows() == 400
-            ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_FP16_C400X2_M160N80K128
-            : KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_FP16_C272X2_M160N80K128;
-        return pi05_pair_rows() == 400
-            ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_W8A16_C400X2_M160N80K128
-            : KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_W8A16_C272X2_M160N80K128;
+        const auto c = rpu_pi_wall::select(
+            pi05_prefill_a8_panel512_ ? rpu_pi_wall::Operation::A8PairedGeluPanel512 :
+            pi05_prefill_a8_ ? rpu_pi_wall::Operation::A8PairedGelu : rpu_pi_wall::Operation::PairedGelu,
+            pi05_pair_fp16() ? rpu_pl_tiling::WeightType::Fp16 : rpu_pl_tiling::WeightType::Int8,
+            pi05_prefill_a8_, pi05_pair_rows(), 2048, 2048);
+        return pi_wall_kernel_id(c.ordinal);
     }
+
     bool pi05_prefill_extended_payloads_loaded() const {
-        if (pi05_pair_rows() == 400 && !pi05_pair_fp16()) return true;
         const auto loaded = [](KernelId id) { return KernelCache::instance().has_loaded(id); };
+        if (pi05_down_a8_enabled() &&
+            (!loaded(KernelId::DYNAMIC_QUANTIZE_W8A8) ||
+             !loaded(KernelId::PARALLEL_LINEAR_W8A8_ACC32_RESIDENT_M64N80K256_LK2048_SW_SXFUSED_HOIST))) return false;
+        const auto paired = [this](int k) {
+            return pi_wall_kernel_id(rpu_pi_wall::select(rpu_pi_wall::Operation::PairedLinear,
+                pi05_pair_fp16() ? rpu_pl_tiling::WeightType::Fp16 : rpu_pl_tiling::WeightType::Int8,
+                false, pi05_pair_rows(), 2048, k).ordinal);
+        };
+        const auto o = paired(256), down = paired(2048);
         if (pi05_pair_rows() == 304) {
-            const auto o = pi05_pair_fp16()
-                ? KernelId::PI05_PREFILL_O_WEIGHT_OUTER_FP16_C304X2_M128N80K128
-                : KernelId::PI05_PREFILL_O_WEIGHT_OUTER_W8A16_C304X2_M128N80K128;
-            const auto down = pi05_pair_fp16()
-                ? KernelId::PI05_DOWN_WEIGHT_OUTER_FP16_C304X2_M160N80K128
-                : KernelId::PI05_DOWN_WEIGHT_OUTER_W8A16_C304X2_M160N80K128;
             return loaded(o) && loaded(down) && loaded(pi05_prefill_gateup_pair_kernel()) &&
                 loaded(pi05_prefill_kv1_pair_kernel()) &&
                 loaded(KernelId::PI05_RING_XOR3_M304N2048) &&
@@ -2660,12 +2629,6 @@ private:
                 (!pi05_prefill_a8_ || loaded(KernelId::PI05_OWNER_NORM_COMPACT_A8_M304N2048));
         }
         if (pi05_pair_rows() == 432) {
-            const auto o = pi05_pair_fp16()
-                ? KernelId::PI05_PREFILL_O_WEIGHT_OUTER_FP16_C432X2_M112N80K128
-                : KernelId::PI05_PREFILL_O_WEIGHT_OUTER_W8A16_C432X2_M112N80K128;
-            const auto down = pi05_pair_fp16()
-                ? KernelId::PI05_DOWN_WEIGHT_OUTER_FP16_C432X2_M112N80K128
-                : KernelId::PI05_DOWN_WEIGHT_OUTER_W8A16_C432X2_M112N80K128;
             return loaded(o) && loaded(down) && loaded(pi05_prefill_gateup_pair_kernel()) &&
                 loaded(pi05_prefill_kv1_pair_kernel()) &&
                 loaded(KernelId::PI05_RING_XOR3_M432N2048) &&
@@ -2676,12 +2639,6 @@ private:
                 (!pi05_prefill_a8_ || loaded(KernelId::PI05_OWNER_NORM_COMPACT_A8_M432N2048));
         }
         if (pi05_pair_rows() == 288) {
-            const auto o = pi05_pair_fp16()
-                ? KernelId::PI05_PREFILL_O_WEIGHT_OUTER_FP16_C288X2_M128N80K128
-                : KernelId::PI05_PREFILL_O_WEIGHT_OUTER_W8A16_C288X2_M128N80K128;
-            const auto down = pi05_pair_fp16()
-                ? KernelId::PI05_DOWN_WEIGHT_OUTER_FP16_C288X2_M160N80K128
-                : KernelId::PI05_DOWN_WEIGHT_OUTER_W8A16_C288X2_M160N80K128;
             return loaded(o) && loaded(down) && loaded(pi05_prefill_gateup_pair_kernel()) &&
                 loaded(pi05_prefill_kv1_pair_kernel()) &&
                 loaded(KernelId::PI05_RING_XOR3_M288N2048) &&
@@ -2692,12 +2649,6 @@ private:
                 (!pi05_prefill_a8_ || loaded(KernelId::PI05_OWNER_NORM_COMPACT_A8_M288N2048));
         }
         if (pi05_pair_rows() == 336) {
-            const auto o = pi05_pair_fp16()
-                ? KernelId::PI05_PREFILL_O_WEIGHT_OUTER_FP16_C336X2_M128N80K128
-                : KernelId::PI05_PREFILL_O_WEIGHT_OUTER_W8A16_C336X2_M128N80K128;
-            const auto down = pi05_pair_fp16()
-                ? KernelId::PI05_DOWN_WEIGHT_OUTER_FP16_C336X2_M160N80K128
-                : KernelId::PI05_DOWN_WEIGHT_OUTER_W8A16_C336X2_M160N80K128;
             return loaded(o) && loaded(down) && loaded(pi05_prefill_gateup_pair_kernel()) &&
                 loaded(pi05_prefill_kv1_pair_kernel()) &&
                 loaded(KernelId::PI05_RING_XOR3_M336N2048) &&
@@ -2708,12 +2659,6 @@ private:
                 (!pi05_prefill_a8_ || loaded(KernelId::PI05_OWNER_NORM_COMPACT_A8_M336N2048));
         }
         if (pi05_pair_rows() == 320) {
-            const auto o = pi05_pair_fp16()
-                ? KernelId::PI05_PREFILL_O_WEIGHT_OUTER_FP16_C320X2_M128N80K128
-                : KernelId::PI05_PREFILL_O_WEIGHT_OUTER_W8A16_C320X2_M128N80K128;
-            const auto down = pi05_pair_fp16()
-                ? KernelId::PI05_DOWN_WEIGHT_OUTER_FP16_C320X2_M160N80K128
-                : KernelId::PI05_DOWN_WEIGHT_OUTER_W8A16_C320X2_M160N80K128;
             return loaded(o) && loaded(down) && loaded(pi05_prefill_gateup_pair_kernel()) &&
                 loaded(pi05_prefill_kv1_pair_kernel()) &&
                 loaded(KernelId::PI05_RING_XOR3_M320N2048) &&
@@ -2724,12 +2669,6 @@ private:
                 (!pi05_prefill_a8_ || loaded(KernelId::PI05_OWNER_NORM_COMPACT_A8_M320N2048));
         }
         if (pi05_pair_rows() == 464) {
-            const auto o = pi05_pair_fp16()
-                ? KernelId::PI05_PREFILL_O_WEIGHT_OUTER_FP16_C464X2_M80N80K128
-                : KernelId::PI05_PREFILL_O_WEIGHT_OUTER_W8A16_C464X2_M80N80K128;
-            const auto down = pi05_pair_fp16()
-                ? KernelId::PI05_DOWN_WEIGHT_OUTER_FP16_C464X2_M80N80K128
-                : KernelId::PI05_DOWN_WEIGHT_OUTER_W8A16_C464X2_M80N80K128;
             return loaded(o) && loaded(down) && loaded(pi05_prefill_gateup_pair_kernel()) &&
                 loaded(pi05_prefill_kv1_pair_kernel()) &&
                 loaded(KernelId::PI05_RING_XOR3_M464N2048) &&
@@ -2739,13 +2678,18 @@ private:
                 loaded(KernelId::PI05_PREFILL_KV1_DIRECT_CACHE_M464D256P464) &&
                 (!pi05_prefill_a8_ || loaded(KernelId::PI05_OWNER_NORM_COMPACT_A8_M464N2048));
         }
+        if (pi05_pair_rows() == 480) {
+            // No C480 A8 normalization exists; pi05_prefill_dma_geometry() rejects A8.
+            return !pi05_prefill_a8_ &&
+                loaded(o) && loaded(down) && loaded(pi05_prefill_gateup_pair_kernel()) &&
+                loaded(pi05_prefill_kv1_pair_kernel()) &&
+                loaded(KernelId::PI05_RING_XOR3_M480N2048) &&
+                loaded(KernelId::PI05_OWNER_NORM_FULL_RESIDUAL_M480N2048) &&
+                loaded(KernelId::PI05_OWNER_NORM_COMPACT_RESIDUAL_M480N2048) &&
+                loaded(KernelId::PI05_XOR3_COMPACT_RESIDUAL_RAW_FULL_M480N2048) &&
+                loaded(KernelId::PI05_PREFILL_KV1_DIRECT_CACHE_M480D256P480);
+        }
         if (pi05_pair_rows() == 448) {
-            const auto o = pi05_pair_fp16()
-                ? KernelId::PI05_PREFILL_O_WEIGHT_OUTER_FP16_C448X2_M96N80K128
-                : KernelId::PI05_PREFILL_O_WEIGHT_OUTER_W8A16_C448X2_M96N80K128;
-            const auto down = pi05_pair_fp16()
-                ? KernelId::PI05_DOWN_WEIGHT_OUTER_FP16_C448X2_M96N80K128
-                : KernelId::PI05_DOWN_WEIGHT_OUTER_W8A16_C448X2_M96N80K128;
             return loaded(o) && loaded(down) && loaded(pi05_prefill_gateup_pair_kernel()) &&
                 loaded(pi05_prefill_kv1_pair_kernel()) &&
                 loaded(KernelId::PI05_RING_XOR3_M448N2048) &&
@@ -2756,12 +2700,6 @@ private:
                 (!pi05_prefill_a8_ || loaded(KernelId::PI05_OWNER_NORM_COMPACT_A8_M448N2048));
         }
         if (pi05_pair_rows() == 416) {
-            const auto o = pi05_pair_fp16()
-                ? KernelId::PI05_PREFILL_O_WEIGHT_OUTER_FP16_C416X2_M128N80K128
-                : KernelId::PI05_PREFILL_O_WEIGHT_OUTER_W8A16_C416X2_M128N80K128;
-            const auto down = pi05_pair_fp16()
-                ? KernelId::PI05_DOWN_WEIGHT_OUTER_FP16_C416X2_M128N80K128
-                : KernelId::PI05_DOWN_WEIGHT_OUTER_W8A16_C416X2_M128N80K128;
             return loaded(o) && loaded(down) && loaded(pi05_prefill_gateup_pair_kernel()) &&
                 loaded(pi05_prefill_kv1_pair_kernel()) &&
                 loaded(KernelId::PI05_RING_XOR3_M416N2048) &&
@@ -2771,14 +2709,6 @@ private:
                 loaded(KernelId::PI05_PREFILL_KV1_DIRECT_CACHE_M416D256P416) &&
                 (!pi05_prefill_a8_ || loaded(KernelId::PI05_OWNER_NORM_COMPACT_A8_M416N2048));
         }
-        const auto o = pi05_pair_fp16()
-            ? (pi05_pair_rows() == 400 ? KernelId::PI05_PREFILL_O_WEIGHT_OUTER_FP16_C400X2_M128N80K128
-                                      : KernelId::PI05_PREFILL_O_WEIGHT_OUTER_FP16_C272X2_M128N80K128)
-            : KernelId::PI05_PREFILL_O_WEIGHT_OUTER_W8A16_C272X2_M128N80K128;
-        const auto down = pi05_pair_fp16()
-            ? (pi05_pair_rows() == 400 ? KernelId::PI05_DOWN_WEIGHT_OUTER_FP16_C400X2_M160N80K128
-                                      : KernelId::PI05_DOWN_WEIGHT_OUTER_FP16_C272X2_M160N80K128)
-            : KernelId::PI05_DOWN_WEIGHT_OUTER_W8A16_C272X2_M160N80K128;
         if (!loaded(o) || !loaded(down) || !loaded(pi05_prefill_gateup_pair_kernel()) ||
             !loaded(pi05_prefill_kv1_pair_kernel())) return false;
         if (pi05_pair_rows() == 400) return true;
@@ -2790,17 +2720,26 @@ private:
             (!pi05_prefill_a8_ || loaded(KernelId::PI05_OWNER_NORM_COMPACT_A8_M272N2048));
     }
     std::vector<int64_t> pi05_prefill_kv1_pair_owner_linear_arguments() const {
-        return {pi05_pair_fp16() ? 2 : 1, pi05_prefix_rows(), pi05_pair_rows(),
+        const auto c = rpu_pi_wall::select(rpu_pi_wall::Operation::KvOwner,
+            pi05_pair_fp16() ? rpu_pl_tiling::WeightType::Fp16 : rpu_pl_tiling::WeightType::Int8,
+            false, pi05_pair_rows(), 32, 2048);
+        return {pi05_pair_fp16() ? 4 : 3, pi05_prefix_rows(), pi05_pair_rows(),
                 256, 32, 16, 2048, 8, 0, 8, 2048, 2048,
-                pi05_pair_fp16() ? 0 : 2048, 68, 2, 1, 1, 0};
+                pi05_pair_fp16() ? 0 : 2048, 68, c.grid_x, c.grid_y, 1, 0,
+                c.tile.m_tile, c.tile.n_tile, c.tile.k_tile, 2, 32, 20, 34, 4, 36, 26, 27};
     }
     std::vector<int64_t> pi05_prefill_kv1_pair_direct_policy_arguments() const {
+        const auto c = rpu_pi_wall::select(rpu_pi_wall::Operation::KvOwner,
+            pi05_pair_fp16() ? rpu_pl_tiling::WeightType::Fp16 : rpu_pl_tiling::WeightType::Int8,
+            false, pi05_pair_rows(), 32, 2048);
         return {
-            pi05_pair_fp16() ? 2 : 1, pi05_prefix_rows(), pi05_prefix_rows(), 0, 0, 2, pi05_pair_rows(), 1, 0,
+            pi05_pair_fp16() ? 4 : 3, pi05_prefix_rows(), pi05_prefix_rows(), 0, 0, 2, pi05_pair_rows(), 1, 0,
             18, 2048, 16384, 8, 8, 256, 8, 2048,
             0, 1, 1, 1, 1, 1, 0, 0, 0, 1,
             static_cast<int64_t>(pi05_prefill_kv1_pair_kernel()),
-            static_cast<int64_t>(pi05_pair_rows() == 304
+            static_cast<int64_t>(pi05_pair_rows() == 480
+                ? KernelId::PI05_PREFILL_KV1_DIRECT_CACHE_M480D256P480
+                : pi05_pair_rows() == 304
                 ? KernelId::PI05_PREFILL_KV1_DIRECT_CACHE_M304D256P304
                 : pi05_pair_rows() == 432
                 ? KernelId::PI05_PREFILL_KV1_DIRECT_CACHE_M432D256P432
@@ -2819,7 +2758,8 @@ private:
                 : pi05_pair_rows() == 400
                 ? KernelId::PI05_PREFILL_KV1_DIRECT_CACHE_M400D256P400
                 : KernelId::PI05_PREFILL_KV1_DIRECT_CACHE_M272D256P272),
-            68, 2, pi05_pair_rows() / 16,
+            68, c.grid_x, pi05_pair_rows() / 16,
+            c.grid_y, c.tile.m_tile, c.tile.n_tile, c.tile.k_tile,
             pi05_pair_owner_bytes(), 2 * pi05_pair_owner_bytes()};
     }
 
@@ -2909,7 +2849,7 @@ private:
             pi05_prefill_carry_a_ || !pi05_prefill_carry_ab_ ||
             !pi05_prefill_mask_resident_ || !pi05_prefill_o_pair_ ||
             !pi05_prefill_owner_norm_ || !pi05_prefill_down_pair_ ||
-            pi05_prefill_o_chain_ || pi05_prefill_qkv_pair_ ||
+            pi05_prefill_qkv_pair_ ||
             pi05_prefill_down_pair_rope_cache_ ||
             !pi05_ring_xor3_opt_in_ || !pi05_o_pair_owner() ||
             num_layers() != 18 || hidden_size() != 2048 ||
@@ -3172,26 +3112,79 @@ private:
             "foreign, or belongs to another cold owner");
     }
 
+    const bool pi05_full_chunk_ = !linear_acc32_ &&
+        pi05_kernel_opt_in("RPU_PI05_PREFILL_FULL_CHUNK_W8A8");
     const bool pi05_prefill_a8_ = !linear_acc32_ && pi05_kernel_opt_in("RPU_PI05_PREFILL_GATEUP_W8A8");
+    const bool pi05_prefill_a8_panel512_ = pi05_kernel_opt_in("RPU_PI05_PREFILL_GATEUP_W8A8_PANEL512");
+    void validate_pi05_a8_panel512_cold() const {
+        TORCH_CHECK(pi05_prefill_a8_panel512_ ==
+                        pi05_kernel_opt_in("RPU_PI05_PREFILL_GATEUP_W8A8_PANEL512"),
+                    "Pi Prefill A8 panel512 is cold; recreate the model to change it");
+        TORCH_CHECK(!pi05_prefill_a8_panel512_ ||
+                        (pi05_prefill_a8_ && pi05_prefill_gateup_pair_ &&
+                         pi05_pair_rows() == 272 && num_cores() == 8),
+                    "Pi Prefill A8 panel512 requires exact C272 paired A8 on eight cores");
+    }
+    int64_t pi05_a8_s0_bytes() const {
+        return pi05_prefill_a8_panel512_ ? 2 * 512 * 2048 : pi05_pair_slab_bytes();
+    }
     int64_t pi05_a8_bytes() const { return pi05_prefix_rows() * 2080; }
     int64_t pi05_a8_root_bytes() const { return Align(pi05_a8_bytes() + pi05_prefix_rows() * 2 + 30, int64_t(256)); }
     bool pi05_prefill_a8_short() const {
-        return pi05_prefill_a8_ && !pi05_prefill_gateup_pair_;
+        return pi05_prefill_a8_ && !pi05_prefill_gateup_pair_ && num_cores() == 8;
+    }
+    bool pi05_prefill_a8_reduced() const {
+        return pi05_prefill_a8_ && !pi05_prefill_gateup_pair_ && num_cores() != 8;
+    }
+
+    std::vector<int64_t> pi05_prefill_a8_reduced_arguments(int64_t rows) const {
+        // ABI1: column partition, no bias, generic W8A8 tile picked per chunk.
+        // Only layers 0..16 use A8. Layer17 keeps its original W8 MLP.
+        const auto c = rpu_pi_wall::select(
+            rpu_pi_wall::Operation::A8Online, rpu_pl_tiling::WeightType::Int8,
+            /*acc32=*/true, rows, intermediate_size() / num_cores(), hidden_size());
+        return {1, rows, intermediate_size(), hidden_size(), num_cores(),
+                c.tile.m_tile, c.tile.n_tile, c.tile.k_tile, 17};
+    }
+
+    bool pi05_prefill_a8_reduced_owner() const {
+        if (!pi05_prefill_a8_reduced() || (num_cores() != 4 && num_cores() != 6) ||
+            attn_tp() != 4 || mlp_tp() != num_cores() ||
+            num_layers() != 18 || layer_weights_.size() != 18 || hidden_size() != 2048 ||
+            logical_intermediate_size_ != 16384 || num_q_heads() != 8 || num_kv_heads() != 4 ||
+            head_dim() != 256 || pi05_prefill_dma_policy() != 0 || pi05_prefill_o_pair_ ||
+            pi05_prefill_qkv_pair_ || pi05_prefill_down_pair_ || pi05_prefill_owner_norm_ ||
+            pi05_prefill_kv1_pair_direct_ || pi05_prefill_kv_only_ || pi05_ring_xor3_opt_in_) return false;
+        const int64_t n = intermediate_size();
+        if (n % (16 * num_cores()) != 0) return false;
+        for (const auto& weights : layer_weights_) {
+            for (const auto* weight : {&weights.gate_proj_w, &weights.up_proj_w})
+                if (!weight->defined() || weight->device().type() != at::kPrivateUse1 ||
+                    weight->scalar_type() != at::kChar || !weight->is_contiguous() ||
+                    weight->storage_offset() != 0 || weight->sizes() != at::IntArrayRef({n, 2048})) return false;
+            for (const auto* scale : {&weights.gate_ws, &weights.up_ws})
+                if (!scale->defined() || scale->device().type() != at::kPrivateUse1 ||
+                    scale->scalar_type() != at::kHalf || !scale->is_contiguous() ||
+                    scale->storage_offset() != 0 || scale->sizes() != at::IntArrayRef({n})) return false;
+        }
+        return rpu_pi_wall_operation_loaded(
+            rpu_pi_wall::Operation::A8Online, rpu_pl_tiling::WeightType::Int8);
     }
 
     std::vector<int64_t> pi05_prefill_a8_short_arguments() const {
-        // ABI1: P544/C272x2; TP8 full-K M48/N32 with panel256.
-        // X=stage=residual1; packed A8+768B scales=up; Y=gate.
-        // Only layers 0..16 use A8. Layer17 keeps its original W8 MLP.
-        return {1,544,272,2,2048,16384,2048,8,48,32,2048,256,
-                565760,768,1114112,1048576,17,18,1,0};
+        const auto c = rpu_pi_wall::select(rpu_pi_wall::Operation::A8OnlineGelu,
+            rpu_pl_tiling::WeightType::Int8, true, 272, 2048, 2048);
+        return {2,544,272,2,2048,16384,2048,8,c.tile.m_tile,c.tile.n_tile,
+                c.tile.k_tile,256,565760,768,1114112,1048576,17,18,1,0,
+                c.grid_x,c.grid_y,1,32,34,48,52,54,128};
+
     }
 
     bool pi05_prefill_a8_short_owner() const {
         if (!pi05_prefill_a8_short() || num_cores() != 8 || attn_tp() != 8 || mlp_tp() != 8 ||
             num_layers() != 18 || layer_weights_.size() != 18 || hidden_size() != 2048 ||
             intermediate_size() != 16384 || num_q_heads() != 8 || num_kv_heads() != 8 || head_dim() != 256 ||
-            pi05_prefill_dma_policy() != 0 || pi05_prefill_o_chain_ || pi05_prefill_o_pair_ ||
+            pi05_prefill_dma_policy() != 0 || pi05_prefill_o_pair_ ||
             pi05_prefill_qkv_pair_ || pi05_prefill_down_pair_ || pi05_prefill_owner_norm_ ||
             pi05_prefill_kv1_pair_direct_ || pi05_prefill_kv_only_ || pi05_ring_xor3_opt_in_) return false;
         for (const auto& weights : layer_weights_) {
@@ -3205,7 +3198,8 @@ private:
                     scale->storage_offset() != 0 || scale->sizes() != at::IntArrayRef({16384})) return false;
         }
         return KernelCache::instance().has_loaded(
-            KernelId::PI05_PREFILL_GATE_UP_GEGLU_ONLINE_W8A8_P544_C272);
+            pi_wall_kernel_id(rpu_pi_wall::select(rpu_pi_wall::Operation::A8OnlineGelu,
+                rpu_pl_tiling::WeightType::Int8, true, 272, 2048, 2048).ordinal));
     }
 
     bool pi05_prefill_a8_short_domain(
@@ -3251,6 +3245,22 @@ private:
                 manifest.linear_accumulation == FmbLinearAccumulationPolicy::MIXED_BY_SITE,
                 "Pi C272 A8 requires its exact COMPLETE mixed-accumulation manifest");
     }
+    void pi05_prefill_a8_reduced_validate_manifest(const FmbPhysicalExecutionManifest& manifest) const {
+        size_t linears = 0;
+        for (const auto& route : manifest.routes) {
+            if (route.site_id != PI05_GATEUP_A8_REDUCED_LINEAR_SITE) continue;
+            ++linears;
+            TORCH_CHECK(pi05_prefill_a8_reduced_owner() &&
+                        route.family == FmbRouteFamily::LINEAR && route.selector == 1 &&
+                        route.flags == 0 && route.invocation >= 0 && route.arguments.size() == 9 &&
+                        route.arguments == pi05_prefill_a8_reduced_arguments(route.arguments[1]),
+                        "Pi reduced A8 descriptor foreign owner/ABI");
+        }
+        TORCH_CHECK(!pi05_prefill_a8_reduced() ||
+                    (linears != 0 && manifest.state == FmbPhysicalManifestState::COMPLETE &&
+                     manifest.linear_accumulation == FmbLinearAccumulationPolicy::MIXED_BY_SITE),
+                    "Pi reduced A8 requires its COMPLETE mixed-accumulation manifest");
+    }
     FmbLinearAccumulationPolicy pi05_prefill_linear_accumulation() const {
         if (linear_acc32_) return FmbLinearAccumulationPolicy::ACC32;
         return pi05_prefill_a8_ ? FmbLinearAccumulationPolicy::MIXED_BY_SITE
@@ -3261,19 +3271,24 @@ private:
         !linear_acc32_ && pi05_kernel_opt_in("RPU_PI05_PREFILL_GATEUP_PAIR");
 
     std::vector<int64_t> pi05_prefill_gateup_pair_arguments() const {
-        if (pi05_prefill_a8_)
-            return {3,pi05_pair_rows(),2048,16384,2048,8,48,32,2048,8,4,
-                    1,0,2,3,0,14,22,18,2080,(pi05_pair_rows() == 464 ? 448 : pi05_pair_rows() == 336 ? 320 :
+        if (pi05_prefill_a8_) {
+            const auto c = rpu_pi_wall::select(pi05_prefill_a8_panel512_
+                ? rpu_pi_wall::Operation::A8PairedGeluPanel512 : rpu_pi_wall::Operation::A8PairedGelu,
+                rpu_pl_tiling::WeightType::Int8, true, pi05_pair_rows(), 2048, 2048);
+            std::vector<int64_t> arguments{pi05_prefill_a8_panel512_ ? 8 : 7,pi05_pair_rows(),2048,16384,2048,8,c.tile.m_tile,
+                    c.tile.n_tile,c.tile.k_tile,c.grid_x,4,1,0,2,3,0,4,50,52,
+                    2080,(pi05_prefill_a8_panel512_ ? 512 : pi05_pair_rows() == 464 ? 448 : pi05_pair_rows() == 336 ? 320 :
                         (pi05_pair_rows() < 400 ? 256 : 384)),pi05_a8_root_bytes(),
-                    pi05_a8_bytes(),1,1,1};
-        // ABI2, two exact-profile halves, K2048, global/local N16384/2048, TP8,
-        // M160/N80/K128 weight-outer for T32/two-camera profiles, M128 for
-        // C416, M112 for C432 (396/400 VLM slots), M96 for C448, M80 for C464; grid26 and
-        // four disjoint full slabs.
-        // SPM roots X0/X1=S1/S0 and Y0/Y1=S2/S3; register low halves are
-        // p0/p4 and p28/p30. Column partition, FP16, production GeGLU v1.
-        return {pi05_pair_fp16() ? 4 : 2,pi05_pair_rows(),2048,16384,2048,8,pi05_pair_tile_rows(),80,128,26,4,
-                1,0,2,3,0,4,28,30,1,1,1};
+                    pi05_a8_bytes(),1,1,1,c.grid_y,32,20,34,48,128};
+            if (pi05_prefill_a8_panel512_) arguments.push_back(pi05_a8_s0_bytes());
+            return arguments;
+        }
+        const auto c = rpu_pi_wall::select(rpu_pi_wall::Operation::PairedGelu,
+            pi05_pair_fp16() ? rpu_pl_tiling::WeightType::Fp16 : rpu_pl_tiling::WeightType::Int8,
+            false, pi05_pair_rows(), 2048, 2048);
+        return {pi05_pair_fp16() ? 6 : 5,pi05_pair_rows(),2048,16384,2048,8,
+                c.tile.m_tile,c.tile.n_tile,c.tile.k_tile,c.grid_x,4,
+                1,0,2,3,0,4,48,50,1,1,1,c.grid_y,52,2,32,20,34,26,27};
     }
 
     bool pi05_prefill_gateup_pair_owner() const {
@@ -3357,6 +3372,10 @@ private:
 
     const bool pi05_prefill_o_pair_ = !linear_acc32_ && pi05_kernel_opt_in("RPU_PI05_PREFILL_O_PAIR");
     std::vector<int64_t> pi05_o_pair_arguments() const {
+        const auto c = rpu_pi_wall::select(rpu_pi_wall::Operation::PairedLinear,
+            pi05_pair_fp16() ? rpu_pl_tiling::WeightType::Fp16 : rpu_pl_tiling::WeightType::Int8,
+            false, pi05_pair_rows(), 2048, 256);
+        auto args = [&]() -> std::vector<int64_t> {
         if (pi05_pair_slab_compact()) {
             // ABI4: input stripes S3+5D/S3+4D, postraw S3[0,2D),
             // both spilled together to retained Q DDR across GateUp/Down.
@@ -3377,6 +3396,18 @@ private:
             return {2,pi05_pair_rows(),256,2048,8,80,26,4,1,2,3,0,pi05_pair_owner_bytes(),
                     0,2,2,3,0,1,1,0,2,0};
         return {1,pi05_pair_rows(),256,2048,8,80,26,4,1,2,3,0,pi05_pair_owner_bytes(),0,2,0,2,1,3,1,0,2,0};
+
+        }();
+        args[0] += 20;
+        args[5] = c.tile.n_tile;
+        args[6] = c.grid_x;
+        args.insert(args.end(), {c.tile.m_tile, c.tile.k_tile, c.grid_y, 48, 50, 52, 26, 27});
+        if (pi05_down_a8_enabled()) {
+            args[0] = 30;
+            const auto down = pi05_down_a8_arguments();
+            args.insert(args.end(), down.begin(), down.end());
+        }
+        return args;
     }
     std::vector<int64_t> pi05_o_pair_norm_arguments(int half) const {
         if (pi05_pair_slab_compact()) {
@@ -3411,6 +3442,11 @@ private:
                 static_cast<int64_t>(c10::Half(1e-6).x)};
     }
     std::vector<int64_t> pi05_o_pair_companion_arguments(int half) const {
+        if (pi05_down_a8_enabled()) {
+            TORCH_CHECK(half == 0 || half == 1, "Pi Down A8 companion requires half 0/1");
+            return {5,pi05_pair_rows(),2048,8,half,half == 0 ? 2 : 3,
+                    half == 0 ? 5 : 4,half == 0 ? 1 : 0};
+        }
         if (pi05_pair_slab_compact()) {
             TORCH_CHECK(half == 0 || half == 1, "Pi slab-compact companion requires half 0/1");
             return {4,pi05_pair_rows(),2048,8,half,half,3,half*pi05_pair_owner_bytes(),half == 0 ? 2 : 0};
@@ -3495,12 +3531,13 @@ private:
                     PI05_PREFILL_KV1_PAIR_DIRECT_POLICY_SITE,
                     PI05_GATEUP_PAIR_POLICY_SITE,PI05_GATEUP_PAIR_LINEAR_SITE,
                     PI05_QKV_PAIR_POLICY_SITE,PI05_OWNER_NORM_POLICY_SITE,PI05_DOWN_PAIR_POLICY_SITE,
-                    GEMMA_PREFILL_DMA_POLICY_SITE,PI05_O_CHAIN_POLICY_SITE,
+                    GEMMA_PREFILL_DMA_POLICY_SITE,
                     GEMMA_INPUT_RMSNORM_SITE,GEMMA_POST_RMSNORM_SITE,GEMMA_FINAL_RMSNORM_SITE,
                     GEMMA_Q_LINEAR_SITE,GEMMA_K_LINEAR_SITE,GEMMA_V_LINEAR_SITE,
                     GEMMA_Q_ROPE_SITE,GEMMA_K_ROPE_SITE,GEMMA_KV_INSERT_SITE,
                     GEMMA_ATTENTION_SITE,PI05_GEGLU_LINEAR_SITE,FMB_SHARED_LAYER_INPUT_DMA_SITE,
-                    PI05_DOWN_PAIR_LINEAR_SITE,PI05_DOWN_PAIR_MASK_SITE,PI05_DOWN_PAIR_OUTPUT_SITE};
+                    PI05_DOWN_PAIR_LINEAR_SITE,PI05_DOWN_A8_QUANT_SITE,
+                    PI05_DOWN_PAIR_MASK_SITE,PI05_DOWN_PAIR_OUTPUT_SITE};
                 TORCH_CHECK(std::find(allowed.begin(),allowed.end(),r.site_id) != allowed.end(),
                     "Pi paired O stale/foreign native route: ", r.site_id);
             }
@@ -3516,6 +3553,9 @@ private:
     }
     void emit_pi05_o_pair_finish(int layer_idx) {
         TORCH_CHECK(pi05_prefill_o_pair_ && pi05_o_pair_owner(),"Pi paired O finish owner drift");
+        TORCH_CHECK(pi05_o_pair_output_dma_.used == 0 && pi05_o_pair_carried_layer_ < 0,
+                    "Pi paired O output copy of an earlier layer was never joined");
+        const bool carried=pi05_o_pair_output_carried(layer_idx);
         pi05_down_pair_require_graph();
         const bool gateup_pair = use_pi05_prefill_gateup_pair();
         TORCH_CHECK(!pi05_prefill_gateup_pair_ || gateup_pair,
@@ -3575,18 +3615,22 @@ private:
                 const auto& scales=pi05_a8_scales_.at(layer_idx);
                 rpu_launch_pi05_prefill_gate_up_geglu_w8a8_split_kernel(
                     s1,s1+pi05_a8_bytes(),s0,lw.gate_proj_w,lw.up_proj_w,
-                    s2,s3,scales[0],scales[1],pi05_pair_rows());
+                    s2,s3,scales[0],scales[1],pi05_pair_rows(),pi05_prefill_a8_panel512_);
             } else
                 rpu_launch_pi05_prefill_gate_up_geglu_weight_outer_w8a16_c400x2_kernel(
                     s1,s0,lw.gate_proj_w,lw.up_proj_w,s2,s3,
                     lw.gate_ws,lw.up_ws,pi05_pair_rows());
         }
-        ctx().consume_physical_route(FmbRouteFamily::LINEAR,PI05_DOWN_PAIR_LINEAR_SITE,
-            1,0,pi05_down_pair_arguments());
-        rpu_launch_pi05_down_pair_spm_kernel(
-            gateup_pair ? s2 : s0,gateup_pair ? s3 : s2,
-            lw.down_proj_w,gateup_pair ? s0 : s1,
-            gateup_pair ? s1 : s3,lw.down_ws,pi05_pair_rows());
+        if (pi05_down_a8_enabled()) {
+            emit_pi05_down_a8_linear(layer_idx);
+        } else {
+            ctx().consume_physical_route(FmbRouteFamily::LINEAR,PI05_DOWN_PAIR_LINEAR_SITE,
+                1,0,pi05_down_pair_arguments());
+            rpu_launch_pi05_down_pair_spm_kernel(
+                gateup_pair ? s2 : s0,gateup_pair ? s3 : s2,
+                lw.down_proj_w,gateup_pair ? s0 : s1,
+                gateup_pair ? s1 : s3,lw.down_ws,pi05_pair_rows());
+        }
         if (pi05_pair_single_compact()) {
             // Down has consumed S3's GateUp input; restore raw0 before its
             // companion (C464 restores both). Next-layer Q waits for both.
@@ -3596,12 +3640,13 @@ private:
                 pi05_pair_spill_stride(),s3,8);
         }
         for(int half=0;half!=2;++half) {
-            const uint32_t partial=gateup_pair
-                ? (half == 0 ? s0 : s1)
-                : (half == 0 ? s1 : s3);
+            const uint32_t partial=pi05_down_a8_enabled()
+                ? (half == 0 ? s2 : s3)
+                : gateup_pair ? (half == 0 ? s0 : s1) : (half == 0 ? s1 : s3);
             const uint32_t residual=pi05_pair_slab_compact() ? s3+half*pi05_pair_owner_bytes() :
                 (half == 0 ? (pi05_pair_single_compact()?s3:c1) : c0);
-            const char* output=half == 0 ? "pi05_pair_s2" : "residual1";
+            const char* output=half == 0
+                ? (pi05_down_a8_enabled() ? "pi05_pair_s1" : "pi05_pair_s2") : "residual1";
             ctx().consume_physical_route(FmbRouteFamily::ALL_REDUCE,PI05_O_PAIR_COMPANION_SITE,
                 1,0,pi05_o_pair_companion_arguments(half),half);
             rpu_launch_pi05_compact_residual_spm_kernel(partial,residual,addr(0,output),pi05_pair_rows());
@@ -3612,23 +3657,62 @@ private:
                         ChunkInfo{half,half*pi05_pair_rows(),pi05_pair_rows(),(half+1)*pi05_pair_rows()}), num_cores());
             ctx().consume_physical_route(FmbRouteFamily::GRAPH_SCHEDULE,PI05_DOWN_PAIR_OUTPUT_SITE,
                 1,0,{half*pi05_pair_rows(),pi05_pair_rows(),2048},half);
-            emit_layer_output_dma(layer_idx,ChunkInfo{half,half*pi05_pair_rows(),pi05_pair_rows(),(half+1)*pi05_pair_rows()},output);
+            const ChunkInfo rows{half,half*pi05_pair_rows(),pi05_pair_rows(),(half+1)*pi05_pair_rows()};
+            if(!carried)
+                emit_layer_output_dma(layer_idx,rows,output);
+            else if(half == 0)
+                // Half 0 is replicated in S1 for Down A8, otherwise S2.
+                // Half 1's companion leaves that source intact while copying
+                // to S0. Read cores 1..7 during the companion to leave core 0's
+                // SPM port available; the next KV1 joins before source reuse.
+                emit_layer_output_dma(layer_idx,rows,output,0,&pi05_o_pair_output_dma_,
+                                      /*source_replicated=*/true);
+            // A carried half 1 has no DDR reader: the next KV1 body takes S0.
         }
+        if(carried) pi05_o_pair_carried_layer_=layer_idx;
         // C0 is half1 postraw; half0 used C1 (legacy) or restored S3 (C448).
         // S0 owns full output1/AB on every admitted profile.
     }
 
+    // Paired O with the AB carry: the next layer's KV1 body reads half 1 from
+    // S0 and only its KV0 body reads DDR (half 0). The last layer still writes
+    // both halves to FMB's output tensor.
+    bool pi05_o_pair_output_carried(int layer_idx) const {
+        return pi05_prefill_o_pair_ && pi05_prefill_carry_ab_ &&
+            use_pi05_prefill_carry() && layer_idx + 1 < num_layers();
+    }
+    // Half 0's DDR copy of a carried layer runs on DMA channels 1..7 and is
+    // joined at the start of the next layer's first KV body.
+    DeferredDmaChannels pi05_o_pair_output_dma_;
+    int pi05_o_pair_carried_layer_ = -1;
+
     const bool pi05_prefill_qkv_pair_ = !linear_acc32_ && pi05_kernel_opt_in("RPU_PI05_PREFILL_QKV_PAIR");
     std::vector<int64_t> pi05_qkv_pair_arguments() const {
+        // The manifest binds and consumes OFF policies too. An inactive
+        // profile outside the W8 C400 owner has no paired kernel identity.
+        // Keep enabled policies strict and retain the existing W8 C400 ABI.
+        if (!pi05_prefill_qkv_pair_ &&
+            (pi05_pair_fp16() || pi05_pair_rows() != 400)) return {};
+        const auto c = rpu_pi_wall::select(rpu_pi_wall::Operation::PairedLinear,
+            pi05_pair_fp16() ? rpu_pl_tiling::WeightType::Fp16 : rpu_pl_tiling::WeightType::Int8,
+            false, pi05_pair_rows(), 256, 2048);
+        auto args = [&]() -> std::vector<int64_t> {
         // ABI1,C400,K2048,Nlocal256,TP8,Ntile64,grid4,column,3full,6strip,2mask.
         return {1,400,2048,256,8,64,4,1,3,6,2};
+
+        }();
+        args[0] += 20;
+        args[5] = c.tile.n_tile;
+        args[6] = c.grid_x;
+        args.insert(args.end(), {c.tile.m_tile, c.tile.k_tile, c.grid_y, 48, 50, 52, 26, 27});
+        return args;
     }
     bool pi05_qkv_pair_owner() const {
         if (pi05_pair_rows() != 400 || pi05_pair_fp16() ||
             !pi05_prefill_carry_ab_ || !pi05_prefill_mask_resident_ ||
             !pi05_ring_xor3_opt_in_ || pi05_prefill_o_pair_ ||
             pi05_prefill_down_pair_ || pi05_prefill_owner_norm_ ||
-            pi05_prefill_o_chain_ || pi05_prefill_down_pair_rope_cache_ ||
+            pi05_prefill_down_pair_rope_cache_ ||
             !pi05_prefill_dma_geometry()) return false;
         return std::all_of(layer_weights_.begin(), layer_weights_.end(),
             [](const LayerWeights& w) {
@@ -3705,7 +3789,7 @@ private:
                     PI05_GATEUP_PAIR_POLICY_SITE,PI05_GATEUP_PAIR_LINEAR_SITE,
                     GEMMA_PREFILL_DMA_POLICY_SITE,PI05_DOWN_PAIR_POLICY_SITE,PI05_OWNER_NORM_POLICY_SITE,
                     GEMMA_INPUT_RMSNORM_SITE,GEMMA_POST_RMSNORM_SITE,GEMMA_FINAL_RMSNORM_SITE,
-                    PI05_O_CHAIN_POLICY_SITE,GEMMA_Q_ROPE_SITE,GEMMA_K_ROPE_SITE,GEMMA_KV_INSERT_SITE,
+                    GEMMA_Q_ROPE_SITE,GEMMA_K_ROPE_SITE,GEMMA_KV_INSERT_SITE,
                     PI05_GEGLU_LINEAR_SITE,GEMMA_ATTENTION_SITE,GEMMA_PREPARE_ALL_REDUCE_SITE,
                     GEMMA_O_LINEAR_SITE,GEMMA_ATTENTION_ALL_REDUCE_SITE,FMB_SHARED_LAYER_INPUT_DMA_SITE,
                     FMB_SHARED_MLP_AUTO_TILE_SITE,FMB_SHARED_MLP_RING_REDUCE_SITE};
@@ -3895,32 +3979,108 @@ private:
         return pi05_prefill_owner_norm_ && pi05_owner_norm_owner() &&
             pi05_prefill_mask_domain_eligible(plan, layout, physical_len, position);
     }
+    bool pi05_down_a8_enabled() const {
+        return pi05_prefill_a8_ && pi05_prefill_gateup_pair_ &&
+            (pi05_pair_rows() == 272 || pi05_pair_rows() == 400);
+    }
+    int64_t pi05_down_pair_linear_selector() const { return pi05_down_a8_enabled() ? 2 : 1; }
+    std::vector<int64_t> pi05_down_a8_arguments() const {
+        // Full-M row PL27: Q/SX in retired S0/S1, contiguous Y in retired
+        // GateUp S2/S3; companion0 -> S1, companion1 -> original S0 carry.
+        return {1,pi05_prefix_rows(),2048,16384,0,8,2048,27,64,80,256,26,1,
+                8,8,32,16,16,0,1,pi05_pair_slab_bytes(),2,3,1,0,
+                pi05_a8_s0_bytes(),pi05_a8_root_bytes(),pi05_prefix_rows()*2};
+    }
+    std::vector<int64_t> pi05_down_a8_quant_arguments(int half) const {
+        TORCH_CHECK(half == 0 || half == 1, "Pi Down A8 quant requires half 0/1");
+        return {1,pi05_pair_rows(),2048,8,half,2+half,0,half*pi05_pair_rows()*2048,
+                1,pi05_pair_slab_bytes()+half*pi05_pair_rows()*2,16,32};
+    }
+    std::array<uint32_t, 4> pi05_down_a8_workspace() {
+        TORCH_CHECK(pi05_down_a8_enabled() && pi05_prefill_o_pair_ &&
+                        pi05_prefill_owner_norm_ && num_cores() == 8,
+                    "Pi Down A8 requires its exact paired owner");
+        const uint64_t bytes = pi05_pair_slab_bytes();
+        const uint32_t s0=addr(0,"residual1"),s1=addr(0,"pi05_pair_s1");
+        const uint32_t s2=addr(0,"pi05_pair_s2"),s3=addr(0,"pi05_pair_s3");
+        const uint32_t compact=addr(0,"pi05_pair_residual");
+        const uint64_t base=SPM_ALLOC.addr(0,0), capacity=SpmAllocator::SPM_USABLE;
+        const std::array<uint64_t,5> starts{s0,s1,s2,s3,compact};
+        const std::array<uint64_t,5> sizes{uint64_t(pi05_a8_s0_bytes()),
+            uint64_t(pi05_a8_root_bytes()),bytes,bytes,uint64_t(pi05_pair_compact_root_bytes())};
+        for(size_t i=0;i<starts.size();++i) {
+            TORCH_CHECK(starts[i]%256==0 && starts[i]>=base && sizes[i]<=capacity &&
+                            starts[i]-base<=capacity-sizes[i] &&
+                            starts[i]+sizes[i]<=uint64_t(UINT32_MAX)+1,
+                        "Pi Down A8 owner exceeds its complete aligned SPM root");
+            for(size_t j=0;j<i;++j)
+                TORCH_CHECK(starts[i]+sizes[i]<=starts[j] || starts[j]+sizes[j]<=starts[i],
+                            "Pi Down A8 live owners overlap");
+        }
+        TORCH_CHECK(uint64_t(s3)==uint64_t(s2)+bytes && sizes[0]>=bytes &&
+                        sizes[1]>=bytes+pi05_prefix_rows()*2,
+                    "Pi Down A8 requires adjacent full Y owners and retained Q/SX extents");
+        return {s0,static_cast<uint32_t>(s1+bytes),s2,s3};
+    }
+    void emit_pi05_down_a8_linear(int layer_idx) {
+        TORCH_CHECK(layer_idx>=0 && layer_idx<num_layers(), "Pi Down A8 layer out of range");
+        const auto workspace=pi05_down_a8_workspace();
+        const auto shape=rpu_pl_w8a8::physical_shape(pi05_prefix_rows(),2048,16384,
+            rpu_pl_w8a8::Partition::Row,8,false);
+        const auto tile=rpu_pl_w8a8::installed_candidate(rpu_pl_w8a8::select_tile(shape),2048);
+        TORCH_CHECK(tile.ordinal==27, "Pi Down A8 requires its measured resident tile27");
+        const auto& weights=layer_weights_[layer_idx];
+        for(int half=0;half!=2;++half) {
+            ctx().consume_physical_route(FmbRouteFamily::ACTIVATION,PI05_DOWN_A8_QUANT_SITE,
+                1,0,pi05_down_a8_quant_arguments(half),half);
+            rpu_launch_dynamic_quantize_w8a8_spm_kernel(workspace[2+half],
+                workspace[0]+half*pi05_pair_rows()*2048,
+                workspace[1]+half*pi05_pair_rows()*2,pi05_pair_rows(),2048,8);
+        }
+        ctx().consume_physical_route(FmbRouteFamily::LINEAR,PI05_DOWN_PAIR_LINEAR_SITE,
+            pi05_down_pair_linear_selector(),0,pi05_down_pair_arguments());
+        rpu_launch_linear_w8a8_spm_kernel(workspace[0],workspace[1],
+            weights.down_proj_w,weights.down_ws,workspace[2],pi05_prefix_rows(),2048,16384,0,8);
+    }
+
     const bool pi05_prefill_down_pair_ = !linear_acc32_ && pi05_kernel_opt_in("RPU_PI05_PREFILL_DOWN_PAIR");
     const bool pi05_prefill_down_pair_rope_cache_ = !linear_acc32_ && pi05_kernel_opt_in("RPU_PI05_PREFILL_ROPE_CACHE");
     std::vector<int64_t> pi05_down_pair_arguments() const {
+        if (pi05_down_a8_enabled()) return pi05_down_a8_arguments();
+        const auto c = rpu_pi_wall::select(rpu_pi_wall::Operation::PairedLinear,
+            pi05_pair_fp16() ? rpu_pl_tiling::WeightType::Fp16 : rpu_pl_tiling::WeightType::Int8,
+            false, pi05_pair_rows(), 2048, 2048);
+        auto args = [&]() -> std::vector<int64_t> {
         if (pi05_pair_slab_compact())
-            return {9,pi05_pair_rows(),2048,2048,8,80,26,4,0,0,2,3,0,1,pi05_pair_tile_rows(),
+            return {9,pi05_pair_rows(),2048,2048,8,80,26,4,0,0,2,3,0,1,c.tile.m_tile,
                     3,5*pi05_pair_owner_bytes(),4*pi05_pair_owner_bytes(),0,pi05_pair_owner_bytes(),
                     pi05_pair_spill_elements()*2};
         if (pi05_pair_single_compact()) {
             // ABI8: C448/M96; four full roots, no mask root, one compact,
             // raw0 retained in Q DDR; C1 input at S3+4D; KVIN norm in S1.
-            return {8,pi05_pair_rows(),2048,2048,8,80,26,4,0,1,1,2,3,0,1,pi05_pair_tile_rows(),3,3,
+            return {8,pi05_pair_rows(),2048,2048,8,80,26,4,0,1,1,2,3,0,1,c.tile.m_tile,3,3,
                     1,4*pi05_pair_owner_bytes(),1};
         }
         if (pi05_pair_scratch_mask()) {
             // ABI7: C416 M128 / C432 M112 paired O/GateUp, four full roots,
             // zero independent mask roots, scratch root S1, two compact
             // carriers; Down X=S2/S3 -> Y=S0/S1; both mask selectors are3.
-            return {7,pi05_pair_rows(),2048,2048,8,80,26,4,0,1,2,2,3,0,1,pi05_pair_tile_rows(),3,3};
+            return {7,pi05_pair_rows(),2048,2048,8,80,26,4,0,1,2,2,3,0,1,c.tile.m_tile,3,3};
         }
         if (pi05_prefill_o_pair_ && pi05_prefill_gateup_pair_)
-            return {4,pi05_pair_rows(),2048,2048,8,80,26,4,1,1,2,2,3,0,1,160};
+            return {4,pi05_pair_rows(),2048,2048,8,80,26,4,1,1,2,2,3,0,1,c.tile.m_tile};
         if (pi05_prefill_o_pair_)
-            return {5,pi05_pair_rows(),2048,2048,8,80,26,4,1,1,2,0,2,1,3,160};
+            return {5,pi05_pair_rows(),2048,2048,8,80,26,4,1,1,2,0,2,1,3,c.tile.m_tile};
         // Versions4/5/6 bind M160 bands; rows/half, Klocal, N, cores, Ntile, Nblocks, strict four slabs,
         // mask0 per-layer / mask1 per-request, two owner-row residual carriers.
-        return {6, pi05_pair_rows(), 2048, 2048, 8, 80, 26, 4, 1, 1, 2, 160};
+        return {6, pi05_pair_rows(), 2048, 2048, 8, 80, 26, 4, 1, 1, 2, c.tile.m_tile};
+
+        }();
+        args[0] += 20;
+        args[5] = c.tile.n_tile;
+        args[6] = c.grid_x;
+        args.insert(args.end(), {c.tile.m_tile, c.tile.k_tile, c.grid_y, 48, 50, 52, 26, 27});
+        return args;
     }
     void pi05_down_pair_validate_routes(const FmbPhysicalExecutionManifest& manifest) const {
         std::vector<FmbRouteManifestEntry> expected;
@@ -3929,7 +4089,12 @@ private:
             expected.push_back({site, family, selector, 0, std::move(args), half});
         };
         if (pi05_prefill_down_pair_) {
-            add(PI05_DOWN_PAIR_LINEAR_SITE, FmbRouteFamily::LINEAR, 1, pi05_down_pair_arguments(), 0);
+            add(PI05_DOWN_PAIR_LINEAR_SITE, FmbRouteFamily::LINEAR,
+                pi05_down_pair_linear_selector(), pi05_down_pair_arguments(), 0);
+            if (pi05_down_a8_enabled())
+                for (int half=0;half!=2;++half)
+                    add(PI05_DOWN_A8_QUANT_SITE,FmbRouteFamily::ACTIVATION,1,
+                        pi05_down_a8_quant_arguments(half),half);
             for (int half = 0; half != 2; ++half) {
                 if (!pi05_prefill_o_pair_)
                     add(PI05_DOWN_PAIR_SCHEDULE_SITE, FmbRouteFamily::GRAPH_SCHEDULE, 1, pi05_down_pair_arguments(), half);
@@ -3951,7 +4116,8 @@ private:
             }
         }
         const auto is_pair_site = [](int64_t site) {
-            return site == PI05_DOWN_PAIR_LINEAR_SITE || site == PI05_DOWN_PAIR_SCHEDULE_SITE ||
+            return site == PI05_DOWN_PAIR_LINEAR_SITE || site == PI05_DOWN_A8_QUANT_SITE ||
+                site == PI05_DOWN_PAIR_SCHEDULE_SITE ||
                 site == PI05_DOWN_PAIR_MASK_SITE || site == PI05_DOWN_PAIR_COPY_SITE ||
                 site == PI05_DOWN_PAIR_GATHER_SITE || site == PI05_DOWN_PAIR_RING_SITE ||
                 site == PI05_DOWN_PAIR_OUTPUT_SITE ||
@@ -3976,7 +4142,7 @@ private:
                         PI05_DOWN_PAIR_POLICY_SITE, GEMMA_PREFILL_DMA_POLICY_SITE,
                         GEMMA_INPUT_RMSNORM_SITE, GEMMA_POST_RMSNORM_SITE,
                         GEMMA_FINAL_RMSNORM_SITE,
-                        PI05_O_CHAIN_POLICY_SITE, GEMMA_Q_LINEAR_SITE, GEMMA_K_LINEAR_SITE,
+                        GEMMA_Q_LINEAR_SITE, GEMMA_K_LINEAR_SITE,
                         GEMMA_V_LINEAR_SITE, GEMMA_Q_ROPE_SITE, GEMMA_K_ROPE_SITE,
                         GEMMA_KV_INSERT_SITE, PI05_GEGLU_LINEAR_SITE, GEMMA_ATTENTION_SITE,
                         GEMMA_PREPARE_ALL_REDUCE_SITE, GEMMA_O_LINEAR_SITE,
@@ -4007,7 +4173,7 @@ private:
     }
     bool pi05_down_pair_owner() const {
         return pi05_prefill_carry_ab_ && pi05_prefill_mask_resident_ &&
-            !pi05_prefill_o_chain_ && !pi05_prefill_down_pair_rope_cache_ && pi05_ring_xor3_opt_in_ &&
+            !pi05_prefill_down_pair_rope_cache_ && pi05_ring_xor3_opt_in_ &&
             pi05_prefill_dma_geometry();
     }
     bool pi05_down_pair_layout(const LayoutContext& layout) const {
@@ -4019,6 +4185,12 @@ private:
             pi05_prefill_dma_runtime_geometry();
     }
     int64_t subclass_layout_hash() const override {
+        if (pi05_full_chunk_) {
+            int64_t hash = 0;
+            for (const auto value : pi05_full_chunk_arguments())
+                hash = detail::layout_mix(hash, value);
+            return hash;
+        }
         if (num_cores() != 8) {
             int64_t hash = 0;
             for (const auto value : core_profile_arguments()) hash = detail::layout_mix(hash, value);
@@ -4036,9 +4208,13 @@ private:
         const auto kv_only = pi05_prefill_kv_only_
             ? detail::layout_mix(gateup_pair, 6) : gateup_pair;
         const auto a8 = pi05_prefill_a8_ ? detail::layout_mix(kv_only, 7) : kv_only;
-        const auto mask = pi05_pair_scratch_mask() ? detail::layout_mix(a8, 8) : a8;
+        const auto a8_panel = pi05_prefill_a8_panel512_ ? detail::layout_mix(a8, 512) : a8;
+        const auto mask = pi05_pair_scratch_mask() ? detail::layout_mix(a8_panel, 8) : a8_panel;
         const auto compact = pi05_pair_single_compact() ? detail::layout_mix(mask, 9) : mask;
-        return linear_acc32_ ? detail::layout_mix(compact, 32) : compact;
+        auto result=compact;
+        if(pi05_down_a8_enabled())
+            for(const auto value:pi05_down_a8_arguments()) result=detail::layout_mix(result,value);
+        return linear_acc32_ ? detail::layout_mix(result, 32) : result;
     }
     void pi05_down_pair_require_graph() const {
         TORCH_CHECK(RpuKernelGraph::has_active(), "Pi paired Down requires a signed Graph");
@@ -4053,6 +4229,52 @@ private:
                     spm_fmb_layer_producer_yield_capability() == SpmFmbLayerProducerYieldCapability::Unsealed,
                     "Pi paired Down has no canonical per-callback DDR/yield capability");
     }
+    void emit_pi05_prefill_a8_reduced_mlp(int layer_idx, const ChunkInfo& chunk, const char* mlp_input) {
+        const auto& lw = layer_weights_[layer_idx];
+        const int64_t seq_len = chunk.len;
+        const int64_t h = hidden_size();
+        // No fused owner at this budget: the generic tile quantizes X per
+        // row for Gate and Up, then the generic pipeline's order follows.
+        TORCH_CHECK(pi05_prefill_a8_reduced_owner() &&
+                    pi05_a8_scales_.size() == layer_weights_.size() &&
+                    std::string(mlp_input) == "residual1",
+                    "Pi reduced A8 runtime owner or source drift");
+        const auto& scales = pi05_a8_scales_.at(layer_idx);
+        const int64_t n = intermediate_size();
+        const int64_t elems = seq_len * (n / num_cores());
+        ctx().consume_physical_route(FmbRouteFamily::LINEAR,
+            PI05_GATEUP_A8_REDUCED_LINEAR_SITE, 1, 0,
+            pi05_prefill_a8_reduced_arguments(seq_len), chunk.idx);
+        rpu_launch_linear_w8a8_spm_to_spm_kernel(
+            addr(0, "residual1"), lw.gate_proj_w, addr(0, "gate"), scales[0],
+            seq_len, n, h, num_cores());
+        rpu_launch_eltwise_unary_spm_kernel(
+            addr(0, "gate"), addr(0, "gate"), elems,
+            ValuOpType::ADD, GeluMode::TANH, num_cores());
+        rpu_launch_linear_w8a8_spm_to_spm_kernel(
+            addr(0, "residual1"), lw.up_proj_w, addr(0, "up"), scales[1],
+            seq_len, n, h, num_cores());
+        rpu_launch_eltwise_binary_spm_kernel(
+            addr(0, "gate"), addr(0, "up"), addr(0, "gate"), elems,
+            ValuOpType::MUL, c10::Half(1.0), num_cores());
+        // The shared routes carry the reduced topology as their arguments.
+        const std::array<int64_t, 3> topology{2, num_cores(), mlp_tp()};
+        ctx().consume_physical_route(FmbRouteFamily::LINEAR,
+            FMB_SHARED_MLP_AUTO_TILE_SITE,
+            static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE), 0, topology);
+        rpu_launch_linear_spm_to_spm_acc16_kernel(
+            addr(0, "gate"), lw.down_proj_w, addr(0, "down"),
+            seq_len, h, n, 0, num_cores(), 0, lw.down_ws, 0, 0,
+            /*force_acc32=*/linear_acc32_);
+        ctx().consume_physical_route(FmbRouteFamily::ALL_REDUCE,
+            FMB_SHARED_MLP_RING_REDUCE_SITE,
+            fmb_ring_all_reduce_route_selector(seq_len, h, false, num_cores()),
+            0, topology, chunk.idx);
+        rpu_launch_all_reduce_sum_residual_kernel(
+            addr(0, "down"), addr(0, "residual2"), addr(0, "residual1"),
+            seq_len, h, num_cores(), num_cores(), false);
+    }
+
     void emit_pi05_down_pair_finish(int layer_idx) {
         const auto& lw = layer_weights_[layer_idx];
         ctx().consume_physical_route(FmbRouteFamily::LINEAR,
@@ -4099,38 +4321,6 @@ private:
         // S0 == residual1 now holds chunk1's final output: next layer KVIN1 uses AB carry.
     }
 
-    const bool pi05_prefill_o_chain_ =
-        !linear_acc32_ && pi05_kernel_opt_in("RPU_PI05_PREFILL_O_CHAIN");
-    std::vector<int64_t> pi05_o_chain_arguments() const {
-        // The mask-v2 output slot differs; include that physical ABI choice.
-        return {400, 2048, 256, 80, 8,
-                static_cast<int64_t>(RpuRmsNormSpmRoute::BASE),
-                pi05_prefill_mask_resident_ ? 1 : 0};
-    }
-    bool pi05_o_chain_geometry() const {
-        if (!pi05_prefill_o_chain_ || eps_ != 1e-6 ||
-            !use_pi05_ring_xor3(400) || !pi05_prefill_dma_geometry()) return false;
-        // Preserve exact row-partitioned W8, DDR FP16 scales and BASE norm.
-        // The original O caller uses BASE explicitly through its default arg;
-        // no V16/V32 route or altered FP16 reduction is admitted here.
-        return std::all_of(layer_weights_.begin(), layer_weights_.end(),
-            [](const LayerWeights& w) {
-                return w.o_w.defined() && w.o_w.is_contiguous() &&
-                    w.o_w.scalar_type() == at::kChar &&
-                    w.o_w.sizes() == at::IntArrayRef({2048, 2048}) &&
-                    w.o_ws.defined() && w.o_ws.is_contiguous() &&
-                    w.o_ws.scalar_type() == at::kHalf &&
-                    w.o_ws.sizes() == at::IntArrayRef({2048});
-            });
-    }
-    bool pi05_prefill_o_chain_layout(const FmbThreeStageChunkPlan& plan,
-        const LayoutContext& layout, int64_t physical_len, int64_t position) const {
-        return pi05_o_chain_geometry() && physical_len == 800 && position == 0 &&
-            pi05_prefill_dma_layout(layout) && layout.max_kv_seq_len == 800 &&
-            plan.chunk_mode == ChunkMode::KV_FIRST &&
-            detail::fmb_kv_first_pair_carry_eligible(
-                plan.compute.chunks, plan.qkv.chunks, 400);
-    }
     const bool pi05_prefill_carry_a_ =
         !linear_acc32_ && pi05_kernel_opt_in("RPU_PI05_PREFILL_CARRY_A");
     const bool pi05_prefill_carry_ab_ =
@@ -4146,6 +4336,10 @@ private:
         return pi05_prefill_carry_a_ || pi05_prefill_carry_ab_;
     }
     bool pi05_prefill_dma_geometry() const {
+        // C480 (three-camera T192) has no A8 normalization payload.
+        if (pi05_pair_rows() == 480 && pi05_prefill_a8_) return false;
+        if (pi05_prefill_a8_panel512_ &&
+            (!pi05_prefill_a8_ || !pi05_prefill_gateup_pair_ || pi05_pair_rows() != 272)) return false;
         if (num_cores() != 8 || num_layers() != 18 || hidden_size() != 2048 ||
             intermediate_size() != 16384 || num_q_heads() != 8 ||
             num_kv_heads() != 8 || head_dim() != 256 || attn_tp() != 8 ||
@@ -4160,8 +4354,7 @@ private:
         if ((pi05_pair_rows() != 400 || pi05_pair_fp16()) &&
             (!pi05_prefill_o_pair_ || !pi05_prefill_gateup_pair_ ||
              !pi05_prefill_down_pair_ || !pi05_prefill_owner_norm_ ||
-             !pi05_prefill_kv1_pair_direct_ || pi05_prefill_qkv_pair_ ||
-             pi05_prefill_o_chain_)) return false;
+             !pi05_prefill_kv1_pair_direct_ || pi05_prefill_qkv_pair_)) return false;
         if (!pi05_prefill_extended_payloads_loaded()) return false;
         return std::all_of(layer_weights_.begin(), layer_weights_.end(),
             [this](const LayerWeights& w) {
@@ -4203,6 +4396,22 @@ private:
         int64_t batch, int64_t rows, int64_t position,
         bool is_causal, bool explicit_mask, int64_t mask_rows, int64_t mask_cols,
         const FmbPrefillStageCandidate& candidate) const {
+        if (pi05_full_chunk_) {
+            if (!(pi05_full_chunk_owner() && batch == 1 &&
+                  rows == pi05_prefix_rows() && position == 0 && !is_causal &&
+                  explicit_mask && mask_rows == rows && mask_cols == rows &&
+                  candidate.compute_chunk_size == rows &&
+                  candidate.qkv_chunk_size == rows &&
+                  candidate.stage_plan.chunk_mode == ChunkMode::KV_FIRST &&
+                  candidate.stage_plan.compute.chunks.size() == 1 &&
+                  candidate.stage_plan.qkv.chunks.size() == 1)) return false;
+            const auto& compute = candidate.stage_plan.compute.chunks.front();
+            const auto& qkv = candidate.stage_plan.qkv.chunks.front();
+            if (compute.idx != 0 || compute.offset != 0 || compute.len != rows ||
+                qkv.idx != 0 || qkv.offset != 0 || qkv.len != rows) return false;
+            pi05_full_chunk_validate_manifest(candidate.physical_manifest);
+            return true;
+        }
         return pi05_prefill_dma_geometry() && batch == 1 && rows == pi05_prefix_rows() &&
             position == 0 && !is_causal && explicit_mask &&
             mask_rows == pi05_prefix_rows() && mask_cols == pi05_prefix_rows() &&
@@ -4252,6 +4461,7 @@ private:
     }
 
     std::vector<int64_t> kvinsert_cost_weight_identity() const override {
+        validate_pi05_a8_panel512_cold();
         if (layer_weights_.empty()) return {};
         // Cold kernel policy is part of native cost/profile identity even
         // when this particular descriptor does not admit the specialized route.
@@ -4261,7 +4471,7 @@ private:
             // COMPLETE manifest, including both matched controls.
             0x50493035434f5354LL, 9,
             pi05_ring_xor3_opt_in_ ? 1 : 0,
-            pi05_prefill_dma_policy(), pi05_prefill_o_chain_ ? 1 : 0,
+            pi05_prefill_dma_policy(),
             pi05_prefill_down_pair_ ? 1 : 0, pi05_prefill_owner_norm_ ? 1 : 0,
             pi05_prefill_qkv_pair_ ? 1 : 0, pi05_prefill_o_pair_ ? 1 : 0};
         if (pi05_prefill_kv1_pair_direct_) {
@@ -4295,9 +4505,16 @@ private:
             }
         }
         if (pi05_prefill_a8_) {
-            identity[3] = pi05_prefill_a8_short() ? 14 : 13;
-            if (pi05_prefill_a8_short()) {
-                identity.push_back(static_cast<int64_t>(KernelId::PI05_PREFILL_GATE_UP_GEGLU_ONLINE_W8A8_P544_C272));
+            identity[3] = pi05_prefill_a8_reduced() ? 17 : pi05_prefill_a8_short() ? 14 : 13;
+            if (pi05_prefill_a8_reduced()) {
+                // The manifest binds each chunk's tile; this binds the family.
+                identity.push_back(static_cast<int64_t>(pi_wall_kernel_id(
+                    rpu_pi_wall::select(rpu_pi_wall::Operation::A8Online,
+                        rpu_pl_tiling::WeightType::Int8, true, 64,
+                        intermediate_size() / num_cores(), hidden_size()).ordinal)));
+            } else if (pi05_prefill_a8_short()) {
+                identity.push_back(static_cast<int64_t>(pi_wall_kernel_id(rpu_pi_wall::select(rpu_pi_wall::Operation::A8OnlineGelu,
+                rpu_pl_tiling::WeightType::Int8, true, 272, 2048, 2048).ordinal)));
                 const auto arguments = pi05_prefill_a8_short_arguments();
                 identity.insert(identity.end(), arguments.begin(), arguments.end());
             } else {
@@ -4341,6 +4558,17 @@ private:
             identity.insert(identity.end(), spill.begin(), spill.end());
             const auto o_policy = pi05_o_pair_arguments();
             identity.insert(identity.end(), o_policy.begin(), o_policy.end());
+        }
+        if(pi05_down_a8_enabled()) {
+            identity[3]=17;
+            identity.push_back(PI05_DOWN_A8_QUANT_SITE);
+            const auto down=pi05_down_a8_arguments();
+            identity.insert(identity.end(),down.begin(),down.end());
+        }
+        if (pi05_full_chunk_) {
+            identity[3] = 18;
+            const auto full = pi05_full_chunk_arguments();
+            identity.insert(identity.end(), full.begin(), full.end());
         }
         identity.push_back(static_cast<int64_t>(rmsnorm_spm_contract_.capability));
         append_kvinsert_cost_scalar_identity(identity, eps_);
@@ -4624,6 +4852,7 @@ private:
 
     SdpaKernelType sdpa_kernel_ = SdpaKernelType::FLASH_ATTN_SPM;
     RpuRmsNormSpmContract rmsnorm_spm_contract_;
+#include "rpu_gemma_pi05_full_chunk.inc"
 };
 
 }  // namespace v3

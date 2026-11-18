@@ -15,6 +15,8 @@ from dataclasses import dataclass
 TEXT_PREFIX = "model.language_model.layers."
 FULL_ATTENTION = "full_attention"
 LINEAR_ATTENTION = "linear_attention"
+# Transformers 5.19 gives the same Vision configuration its own model type.
+VISION_MODEL_TYPES = frozenset({"qwen3_5_moe", "qwen3_5_moe_vision"})
 
 ROUTED_EXPERT_ROLES = (
     "mlp.experts.gate_up_proj",
@@ -56,7 +58,7 @@ class RuntimeCapabilities:
 
 # Routed quantization does not change the ordinary FP16 Vision tower.  Both
 # INT4 sources use the existing exact TP8 Vision/text bridge and owner policy.
-_ROUTED_INT4_RUNTIME = RuntimeCapabilities(6, "float16", (8,), False)
+_ROUTED_INT4_RUNTIME = RuntimeCapabilities(6, "float16", (4, 6, 8), False)
 _MIXED_FP8_RUNTIME = RuntimeCapabilities(5, "fp8_e4m3", (4, 6, 8), False)
 
 
@@ -144,6 +146,15 @@ def _declares(owner, name):
     return name in owner if isinstance(owner, Mapping) else hasattr(owner, name)
 
 
+def has_default_vision_rope(config) -> bool:
+    """Admit the legacy fixed axial RoPE and its explicit HF representation."""
+    rope = _value(config, "rope_parameters")
+    return rope is None or (
+        isinstance(rope, Mapping)
+        and dict(rope) == {"rope_type": "axial", "rope_theta": 10000.0}
+    )
+
+
 def validate_exact_profile(config, *, require_quant: bool = True) -> dict:
     """Validate exact geometry and one supported checkpoint profile before allocation.
 
@@ -190,8 +201,12 @@ def validate_exact_profile(config, *, require_quant: bool = True) -> dict:
     else:
         for name, expected in _EXACT_VISION_FIELDS.items():
             value = _value(vision, name)
-            if value != expected:
+            matches = (isinstance(value, str) and value in VISION_MODEL_TYPES
+                       if name == "model_type" else value == expected)
+            if not matches:
                 mismatches[f"vision_config.{name}"] = value
+        if not has_default_vision_rope(vision):
+            mismatches["vision_config.rope_parameters"] = _value(vision, "rope_parameters")
         if _value(vision, "deepstack_visual_indexes", []) not in ([], ()):
             mismatches["vision_config.deepstack_visual_indexes"] = _value(
                 vision, "deepstack_visual_indexes"

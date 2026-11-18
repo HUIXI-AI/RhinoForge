@@ -105,13 +105,19 @@ def test_qwen35_moe_text_example_uses_exact_public_core_profile(
     generate = Mock()
     monkeypatch.setattr(generation, "_generate", generate)
     execution = load(monkeypatch, "example_moe_text_execution", "python/rpu_backend/api/_execution.py")
-    suffix = {4: "_tp4", 6: "_tp6", 8: ""}[cores]
-    config = common.load_config(ROOT / f"examples/configs/qwen3_5/text/35b_a3b/fp8_e4m3_experts_attn_gdn{suffix}.toml")
+    config = common.load_config(ROOT / "examples/configs/qwen3_5/text/35b_a3b/fp8_e4m3_experts_attn_gdn.toml")
+    config["rpu_execution"]["model"]["num_cores"] = cores
+    common._validate_execution(config["rpu_execution"],
+        profile=common.planner_profiles()[config["example"]["profile_id"]])
     config["input"]["decode_steps"] = decode_steps
     request = config["rpu_execution"]
     model = SimpleNamespace(config=SimpleNamespace(
         architectures=["Qwen3_5MoeForConditionalGeneration"]), close=Mock())
-    supported = {"model": ("num_cores",), "prefill": ("chunk_size",)}
+    # Mirrors Qwen3_5MoeAdapter._EXECUTION_SUPPORTED: the adapter needs torch,
+    # so this host test cannot import the declaration it stands in for.
+    supported = {"model": ("num_cores",),
+                 "prefill": ("chunk_size", "padding_rows", "padding_budget",
+                             "linear_acc32", "moe_resident_prefill")}
     ids = Mock(shape=(1, prefill_length))
     tokenizer = Mock(return_value=SimpleNamespace(input_ids=ids))
     install = Mock(return_value=model)
@@ -181,9 +187,9 @@ def test_qwen35_moe_text_example_rejects_substituted_profile(monkeypatch, field,
     from copy import deepcopy
 
     common = load(monkeypatch, "example_moe_profile_rejection", "examples/common/config.py")
-    profile = deepcopy(common.planner_profiles()["qwen3_5-35b-a3b.mixed-e4m3.text-tp6"])
+    profile = deepcopy(common.planner_profiles()["qwen3_5-35b-a3b.mixed-e4m3.text"])
     profile[field] = value
-    with pytest.raises(common.ConfigError, match="exact fixed TP4/TP6/TP8"):
+    with pytest.raises(common.ConfigError, match="registered profile"):
         common._validate_execution({"model": {"num_cores": 6}}, profile=profile)
 
 
@@ -231,12 +237,15 @@ def test_qwen3vl_32b_example_reuses_public_quantized_loader_binding(monkeypatch)
     registry = load(monkeypatch, "example_32b_registry", "python/rpu_backend/model_registry.py")
     config = common.load_config(ROOT / "examples/configs/qwen3_vl/vl/32b/w8a16_text.toml")
     checkpoint = str(registry.model_path(config["example"]["registry_alias"]))
-    ids = Mock()
+    # The runner records the request geometry before the first forward, so the
+    # processor output and the configured images carry their real sizes here.
+    ids = SimpleNamespace(shape=(1, 7))
     processor = SimpleNamespace(apply_chat_template=Mock(return_value={"input_ids": ids}),
                                 tokenizer=Mock())
     model = SimpleNamespace(model=SimpleNamespace(language_model=object()))
     public_load = Mock(return_value=model)
-    monkeypatch.setattr(generation, "_image_inputs", lambda _inputs: [object()])
+    monkeypatch.setattr(generation, "_image_inputs",
+                        lambda _inputs: [SimpleNamespace(size=(64, 48))])
     for name, attributes in {
         "torch": {"float16": "fp16"},
         "transformers": {"AutoTokenizer": Mock(), "AutoProcessor": SimpleNamespace(

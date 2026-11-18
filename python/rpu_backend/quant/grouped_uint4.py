@@ -1,14 +1,16 @@
 """Source-neutral UINT4 codecs for expert-major grouped linear kernels.
 
 Logical codes are [N,K], packed checkpoints [K/8,N] INT32 and runtime
-weights [E,N*K/2] UINT8. Canonical FP16 metadata is [E,Q,N]; the current
+weights [E,physical_expert_bytes] UINT8 in N32K32 order. Canonical FP16 metadata is [E,Q,N]; the current
 runtime ABI is q4_n64_controller_v1: [E,Q4,N64,core,4,64], zero padded.
-The unsigned weight nibble codec remains distinct from dense signed INT4.
+Signed and unsigned codes use the same physical nibble layout.
 """
 from __future__ import annotations
 
 import numpy as np
 import torch
+
+from .fp8 import _validate_grouped_experts
 
 
 def pack_uint4_qweight(codes: torch.Tensor) -> torch.Tensor:
@@ -79,32 +81,17 @@ def _check_codes(codes: torch.Tensor) -> None:
 def pack_grouped_uint4(
     codes: torch.Tensor, *, partition: str, num_cores: int = 8,
 ) -> torch.Tensor:
-    """[E,N,K] UINT4 -> packed U8[E,N*K/2], matching grouped generator."""
-    if (codes.device.type != "cpu" or codes.dim() != 3
-            or codes.dtype != torch.uint8 or codes.numel() == 0):
+    """[E,N,K] UINT4 -> current BASE N32K32 expert-major bytes.
+
+    Each core's N extent is padded independently to 32 by the shared codec.
+    Checkpoint words and controller-striped S/Z metadata remain unchanged.
+    """
+    from .grouped_uint4_n32k32 import pack_grouped_uint4_n32k32
+
+    if (not isinstance(codes, torch.Tensor) or codes.dim() != 3):
         raise ValueError("grouped UINT4 requires nonempty CPU uint8 [E,N,K]")
-    if type(num_cores) is not int or not 1 <= num_cores <= 8:
-        raise ValueError("grouped UINT4 requires an integer num_cores in [1,8]")
-    if int(codes.max()) > 15:
-        raise ValueError("UINT4 codes must lie in [0,15]")
-    e, n, k = codes.shape
-    source = codes.contiguous()
-    if partition == "col":
-        if n % (16 * num_cores) or k % 64:
-            raise ValueError("UINT4 col requires N%(16*cores)==0 and K%64==0")
-        physical = source.view(e, num_cores, n // (16 * num_cores), 16, k // 64, 64)
-        physical = physical.permute(0, 2, 4, 1, 3, 5)
-    elif partition == "row":
-        if n % 16 or k % (64 * num_cores):
-            raise ValueError("UINT4 row requires N%16==0 and K%(64*cores)==0")
-        physical = source.view(e, n // 16, 16, num_cores, k // (64 * num_cores), 64)
-        physical = physical.permute(0, 1, 4, 3, 2, 5)
-    else:
-        raise ValueError("partition must be col or row")
-    # Deinterleave then nibble-pack: (k0,k16),...,(k15,k31), (k32,k48),...
-    physical = physical.contiguous().view(-1, 2, 32)
-    packed = physical[..., :16] | (physical[..., 16:] << 4)
-    return packed.contiguous().view(e, n * k // 2)
+    _validate_grouped_experts(codes.shape[0])
+    return pack_grouped_uint4_n32k32(codes, partition=partition, num_cores=num_cores)
 
 
 def runtime_group_scales(
@@ -136,8 +123,7 @@ def pack_grouped_uint4_metadata(
 ) -> torch.Tensor:
     """Canonical FP16 [E,Qglobal,Nglobal] -> q4_n64_controller_v1.
 
-    Match GroupedParallelLinearUint4PgrpGenerator._swizzle_metadata in
-    rhino-ops 135b93fc, whose input is the transposed [E,N,Q] convention.
+    Match the unified GroupedParallelLinearGenerator metadata convention.
     TP col partitions N; TP row partitions Q after any logical group-size
     refinement. Each core contributes [4,64] FP16 values (512 bytes) per
     controller stripe. Local Q and N tails are padded with positive zero.
@@ -153,6 +139,7 @@ def pack_grouped_uint4_metadata(
     if type(num_cores) is not int or not 1 <= num_cores <= 8:
         raise ValueError("grouped UINT4 metadata requires integer num_cores in [1,8]")
     experts, global_q, global_n = metadata.shape
+    _validate_grouped_experts(experts)
     if partition == "col":
         if global_n % (16 * num_cores):
             raise ValueError("UINT4 col metadata requires N%(16*cores)==0")

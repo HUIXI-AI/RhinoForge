@@ -134,6 +134,38 @@ def _extend_multimodal_input(encoded, inputs, tokenizer):
     return encoded
 
 
+def qwen3_vl_messages(images, inputs):
+    return [{"role": "user", "content": [
+        *({"type": "image", "image": image} for image in images),
+        {"type": "text", "text": inputs["prompt"]},
+    ]}]
+
+
+def qwen3_vl_encode(processor, images, inputs):
+    """Qwen3-VL chat-template processor input on CPU."""
+    encoded = processor.apply_chat_template(
+        qwen3_vl_messages(images, inputs), tokenize=True, add_generation_prompt=True,
+        return_dict=True, return_tensors="pt")
+    return _extend_multimodal_input(encoded, inputs, processor.tokenizer)
+
+
+def qwen3_5_vision_messages(images, inputs):
+    return [{"role": "user", "content": [
+        *({"type": "image"} for _ in images),
+        {"type": "text", "text": inputs.get("prompt", "Describe the image.")}
+    ]}]
+
+
+def qwen3_5_vision_encode(processor, images, inputs, *, require_mm_token_type_ids=True):
+    """Qwen3.5 image-text processor input on CPU."""
+    text = processor.apply_chat_template(qwen3_5_vision_messages(images, inputs), tokenize=False,
+                                         add_generation_prompt=True)
+    encoded = processor(text=[text], images=images, return_tensors="pt")
+    if require_mm_token_type_ids and "mm_token_type_ids" not in encoded:
+        raise ValueError("Qwen3.5 processor must return mm_token_type_ids for image inference")
+    return _extend_multimodal_input(encoded, inputs, processor.tokenizer)
+
+
 def _cpu_fp32_argmax_token(logits):
     """Select from the public Dense model's unchanged CPU FP32 output."""
     import torch

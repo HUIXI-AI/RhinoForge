@@ -8,6 +8,8 @@
 //
 #include "rpu_hyvla_expert_model.h"
 #include "hyvla_linear_precision.h"
+#include "hyvla_retained_schedule.h"
+#include "ops/rpu_specialized_linear_contracts.h"
 #include "ops/rpu_hyvla_gateup_w8.h"
 #include "model_handle_registry.h"
 #include "rpu_kernel_decls.h"
@@ -45,6 +47,118 @@
 #include <cstring>
 #include <vector>
 
+// ─────────────────────────────────────────────────────────────────────────────
+// RPU_HY_VLA_FAST_REPLAY —— **逐座 opt-in** 的 fast-replay，默认 OFF。
+//
+// 打开后 REPLAY 期不再重走该座的 op stream（`fused_model_base.cpp:1126` 的
+// `fast_skip`），省掉每帧把 ~700 节点/层 重新 emit 一遍的 host 开销
+// （实测 ViT 4.48 / VLM 4.69 / expert(unroll ×10 body) 9.37 ms）。
+//
+// ⚠️ 契约（`fused_model_base.cpp:1105-1130`）：**body 不得有 kernel 会读的
+// per-call host 副作用**。合法出口只有：position_ids 的稳定 keepalive、
+// dynamic_config 拷进稳定 DDR 槽的显式 2D mask、`hidden_in_src_base_` 与
+// op 序言里 `*_mutable(&member)` 的可变基址。
+//
+// ⚠️ 之所以做成**逐座**：上一次是三座 + deep + skip_sync 一起开，cos 掉到
+// 0.98797891 / 套件 6 failed，无法定位是谁破的契约（账本 §11）。
+// 取值：逗号分隔的座名（vit / vlm / expert），或 1/on/true 表示三座全开。
+// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// RPU_HY_VLA_FAST_REPLAY_PRELOAD —— 同样**逐座 opt-in**，默认 OFF。
+// 打开后在 REPLAY（且权重 clean）跳过 D-502 preload 回调与 `preload_fn` 的
+// host 重走 —— 已建好的 preload DMA 节点仍由 segment launch 重放到同一块
+// persistent SPM，逐位不变（框架里这条是 RhinoVLA vision 验过的，见
+// `fused_model_base.cpp` 的 `fast_replay_skip_preload` 注释）。
+// 依赖 `fast_replay_skip_layer_loop` 一起开（框架内部与它 AND）。
+// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// RPU_HY_VLA_ACTION_MLP_MC —— unroll 的 `action_time_mlp_out`（步 A6）走几个核。
+// 默认 **8**；取 0/off/false 回到单核（逐字节复现改动前的行为）。
+//
+// 为什么值得单独开一个开关：A6 是 `[hidden, hidden]` 的 fp16 GEMM，本模型
+// hidden=1024 ⇒ 权重 **2 MB**，而它和 A4/Z2 一样被写成了 `num_cores=1`。
+// R44 实测（`hwdist.py`，推荐档 `hw_r44_qv`）：这 30 枪 fp16 linear 是完美的
+// 三峰周期 —— **A4 4.1 µs / A6 85.5 µs / Z2 6.6 µs**，每个 Euler 步一组。
+//   A6：2 MB ÷ 85.5 µs = **24.5 GB/s**，已到**单核** DDR 读上限（R1 DDR benchmark：
+//   单核 RPU 读 ~23.9、8 核 DMA ~142）⇒ 它把一个核打满了，另外 7 个核在这 0.855 ms 里全程闲着。
+//   A4/Z2 权重各只有 64 KB，摊到 8 核反而被 all-reduce 吃掉 ⇒ **只动 A6**。
+//
+// 做法：K 方向切 8 核（`partition=0`）+ 自动调度的 fused ring all-reduce。
+//   ⚠️ bias **不能**进 GEMM —— partition=0 时每核都会加一遍，all-reduce 后变 8 倍。
+//      改成 all-reduce 之后用 `1xC_NxC` 按列广播加一次。
+//   ⚠️ 零残差复用 `enc_h_spm`：它是 A6 的输入，A6 发完就死，就地清零当残差用，
+//      省掉一个 104 KB/核 的槽（`all_reduce_sum_residual` 要求三个地址互不相同）。
+//   ⚠️ **Python 侧的 swizzle 必须同源**。weights.py 解析一次并把核数随
+//      set_weights 显式传入，native 不再独立读取进程环境。
+//
+// ⚠️ **不是逐位等价**：K 被切成 8 段分别累加再跨核求和 = 求和重排。
+//    验收看 cos 分布，不能只看 wall。
+// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// RPU_HY_VLA_MASK_ONCE —— 同样**逐座 opt-in**，默认 OFF。
+//
+// 显式 2D mask 在整个 forward 里逐层恒定（形状 `(seq_q, kv_seq_len)` 由
+// dynamic_config 固定，单 chunk），但 `sdpa_mask` 槽默认是**相位混叠**的 Temp
+// （基类 `rpu_qwen3_model.h:1215` 的 `[3,5]`），别的 Temp 会压在同一段 SPM 上
+// ⇒ 每层 SDPA 之前都得把它从 DDR 重新广播进 SPM 一次。基类那里的注释
+// （`rpu_qwen3_model.h:2025`）把这条记成了前提，其实它是**槽的相位窗口**带来的，
+// 不是 mask 本身要变。
+//
+// 实测代价（hwperf `hw_r32/`，按 `size_bytes` 分档 —— 结论 “DMA 归因必须按字节量”）：
+//   | 座 | 每层-核 | 次数 | 字节/帧 | 占该座 DMA |
+//   |---|---|---|---|---|
+//   | ViT | 696 KB | 27×8 | 150.4 MB | 55.3% |
+//   | VLM | 113 KB | 32×8 |  29.5 MB | 62.2% |
+//   | expert | 30 KB | 320×8 | **79.4 MB** | **87.4%** |
+// 合计 **259 MB/帧**，DMA 时长之和 24.4 ms（多数与 kernel 重叠，segwall 口径下
+// 暴露 4.9 ms）。
+//
+// 原路径把 mask 延长到层体 [1,8]，每个 body 的层 0 重载；pre-hook [0,0]
+// 可以复用该地址。现在在追加所有 hooks 后用真实 allocator 尝试全 forward
+// 存活（包括 phase 0）。精确 S51 profile 冷规划时检查完整 fixed/temp/held
+// 预算，允许有界增长；其他 profile 保留不增加峰值的原规则。typed schedule
+// 冻结整图一次或每 body 一次，运行时不按余量重选。MASK_ONCE 关闭时仍逐层加载。
+// 每次 Graph invocation 都重新加载一次当前请求的稳定 DDR mask；这不把 SPM
+// 当作跨 Graph/请求的缓存，也不跳过动态 mask 的 prepare/update。
+// ─────────────────────────────────────────────────────────────────────────────
+// RPU_HY_VLA_SILU_MUL —— 逐座 opt-in，默认 OFF。
+//
+// SwiGLU 的 `unary(SILU)` + `binary(MUL)` 两枪合成 op-lib 里**已有**的
+// `llama_silu_mul` 一枪（`KernelId::LLAMA_SILU_MUL`，默认 ref 里就有，launcher
+// `rpu_launch_silu_mul_spm_kernel` 也早就写好了 —— 此前只有 RhinoVLA 在用，
+// 见 `rpu_rhino_vla_model.cpp::rhino_vla_fused_silu_mul_enabled`）。
+// **不是新算子**，是把一个已存在但没接线到本模型的核接上。
+//
+// 靶子：hwperf（R37 分账 `hw_r37/`）expert 段 `unary` 0.83 ms/n=330 +
+// `binary_sameshape` 0.67 ms/n=330 —— 单价 2.5 / 2.0 µs，**几乎全是 launch 开销**。
+// 合并后实测（`hw_r38/`）：两者归零，新增 `llama_silu_mul` **0.50 ms/n=320
+// @1.6 µs**，即 eltwise 侧净 **−1.00 ms**；两枪路径要 3 读 2 写，融合核只要
+// 2 读 1 写，所以省的不止是 launch。
+//
+// ⚠️ 顺序变化：合并后必须先发 up 的 GEMM 再做 silu_mul（原路径是 gate GEMM →
+// silu → up GEMM → mul）。两者无数据依赖，交换合法。
+//
+// ⚠️ **不保证逐位等价**：融合核内部先 silu 后乘，中间量是否落 fp16 由核决定，
+// 与两枪路径可能差一次舍入 ⇒ 验收必须跑 cos 分布 A/B，不能只看逐位。
+// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// RPU_HY_VLA_KVPAD16 —— 逐座 opt-in，默认 OFF。
+//
+// `RPU_KVINSERT_HYBRID_V16`（R22/R23）在 `seq % 16 != 0` 时发两枪：v16 主体 +
+// v2 尾巴。本座 `suffix_len = 51 = 3×16 + 3` ⇒ 尾巴只有 **3 行**，却几乎和主体
+// 一样贵（hwperf `hw_r32/`，320 层-步）：
+//   k: v16(48 行) 1.03 ms + v2(3 行) 0.86 ms   v: v16 1.01 + v2 0.99
+//   ⇒ 6% 的行占掉 **1.85 ms**（该座 kernel 时间的 1.9%）。
+// ViT 同理（588 = 36×16 + 12，尾巴 0.34 ms）。
+//
+// 打开后把 k/v 的 SPM 槽行数补齐到 16 的倍数（expert 51→64、ViT 588→592，
+// 每核各多 3.3 KB / 1.3 KB），并把这个**行容量**告诉 launcher，让它一次 v16 打完。
+// 多写进 cache 的 `[position+seq, position+pad)` 那几行是 SPM 里的既有字节，
+// **不会被读** —— SDPA 收到的 `kv_seq_len` 恒等于 `position + seq`
+// （expert 291、ViT 588）。而且那一段本来就装着上一帧的陈旧数据、一直靠
+// `kv_seq_len` 挡着 ⇒ **逐位等价**，不是"新引入了脏数据"。
+// ─────────────────────────────────────────────────────────────────────────────
+// 把 k/v 槽撑到 `rows` 行（只增不减）。返回实际保证的行容量。
 static int64_t hyvla_grow_kv_slots(std::vector<v3::BufferDecl>& decls,
                                    int64_t rows, int64_t local_kv_elems) {
     const int64_t need = Align(rows * local_kv_elems * 2, 256);
@@ -199,6 +313,17 @@ enum class HyVlaExpertAllReduceRoute : int64_t {
 HyVlaExpertModel::HyVlaExpertModel() = default;
 HyVlaExpertModel::~HyVlaExpertModel() = default;
 
+void HyVlaExpertModel::set_execution_cores(int64_t num_cores) {
+    TORCH_CHECK(num_cores == 8 || num_cores == 4,
+                "HyVLA action expert admits eight cores or the reduced four-core child");
+    TORCH_CHECK(!cold_config_bound_ && !production_config_bound_ && layers_.empty(),
+                "HyVLA action expert core count must be bound before runtime config and weights");
+    if (num_cores != 8) {
+        configure_cold_routes(/*qwen3_spm_kv_by_mha=*/true, /*adarms_fused_bcast=*/false,
+                              static_cast<int>(num_cores), /*vocab_size=*/0);
+    }
+}
+
 void HyVlaExpertModel::set_runtime_config(
     bool fast_replay, bool fast_replay_preload, bool mask_once,
     bool silu_mul, bool kvpad16, bool partial_rope,
@@ -207,6 +332,9 @@ void HyVlaExpertModel::set_runtime_config(
         !cold_config_bound_ && !production_config_bound_,
         "hyvla_expert_set_runtime_config must run exactly once before "
         "set_weights");
+    // The V16 RMSNorm payloads launch an eight-core grid.
+    TORCH_CHECK(num_cores() == 8 || !rmsnorm_pad16,
+                "reduced-core HyVLA action expert requires the BASE RMSNorm route");
     // PAD16 is the existing opt-in. The generic launcher's default is BASE;
     // padding alone does not select a vector kernel. Bind availability before
     // committing the one-shot configuration. Older V16 payloads corrupt BF16
@@ -218,16 +346,14 @@ void HyVlaExpertModel::set_runtime_config(
         RPU_RMSNORM_CAP_BASE | (vector_available ? RPU_RMSNORM_CAP_V16 : 0u));
     rmsnorm_contract.v16_bitcopy = vector_available;
     const bool gateup_swiglu_available =
-        KernelCache::instance().get_kernel("hyvla_expert_gateup_swiglu_s51") != nullptr &&
-        KernelCache::instance().get_program("wall_prefill_gate_up_swiglu_fp16_m320n112k128") != nullptr;
+        KernelCache::instance().get_kernel("hyvla_expert_gateup_swiglu_fp16_v2") != nullptr;
     const bool resident_swiglu_available =
-        KernelCache::instance().get_kernel("hyvla_resident_swiglu_s51") != nullptr;
+        KernelCache::instance().get_kernel("hyvla_resident_swiglu_fp16_v2") != nullptr;
     const bool w8_optimizations_available =
-        KernelCache::instance().get_kernel("hyvla_w8a16_optimizations_s240_s51") != nullptr &&
-        KernelCache::instance().get_program("gate_up_parallel_w8a16_multibase_spm_weight_m592n32k128") != nullptr &&
-        KernelCache::instance().get_program("fused_gate_up_swiglu_w8a16_m320n112k128") != nullptr;
+        KernelCache::instance().get_kernel("hyvla_gateup_resident_pair_w8_v2") != nullptr &&
+        KernelCache::instance().get_kernel("hyvla_expert_gateup_swiglu_w8_v2") != nullptr;
     const bool w8_gateup_n48_available =
-        KernelCache::instance().get_kernel("hyvla_expert_gateup_w8_s51_m512n48k128") != nullptr;
+        KernelCache::instance().get_kernel("hyvla_expert_gateup_swiglu_w8_v2") != nullptr;
     invalidate_model_state();
     cold_rmsnorm_spm_contract_ = rmsnorm_contract;
     cold_gateup_swiglu_available_ = gateup_swiglu_available;
@@ -235,28 +361,28 @@ void HyVlaExpertModel::set_runtime_config(
     cold_nvfp4_gateup_available_ =
         KernelCache::instance().get_kernel("hyvla_nvfp4_gateup_swiglu_s51") != nullptr &&
         KernelCache::instance().get_kernel("hyvla_nvfp4_gateup_resident_s51") != nullptr;
-    cold_nvfp4_gateup_input_reuse_available_ =
+    cold_nvfp4_gateup_input_reuse_available_ = hyvla_retained_schedule::gateup_input_reuse &&
         KernelCache::instance().get_kernel("hyvla_nvfp4_gateup_swiglu_input_reuse_s51") != nullptr;
     cold_nvfp4_o_ring_postnorm_available_ =
         KernelCache::instance().get_kernel("hyvla_expert_o_ring_postnorm_nvfp4_s51") != nullptr;
     cold_nvfp4_o_n128_available_ =
         KernelCache::instance().get_kernel("hyvla_expert_o_ring_postnorm_nvfp4_s51_n128") != nullptr;
-    cold_nvfp4_down_nextnorm_n128_available_ =
+    cold_nvfp4_down_nextnorm_n128_available_ = hyvla_retained_schedule::down_n128 &&
         KernelCache::instance().get_kernel("hyvla_expert_down_nextnorm_nvfp4_s51_n128") != nullptr;
     cold_nvfp4_down_nextnorm_available_ =
         KernelCache::instance().get_kernel("hyvla_expert_down_nextnorm_nvfp4_s51") != nullptr;
-    cold_nvfp4_down_n128_available_ =
+    cold_nvfp4_down_n128_available_ = hyvla_retained_schedule::down_n128 &&
         KernelCache::instance().get_kernel("hyvla_expert_down_nvfp4_s51_n128") != nullptr;
     cold_w8_gateup_n48_available_ = w8_gateup_n48_available;
     cold_resident_swiglu_available_ = resident_swiglu_available;
     cold_w8_o_resident_available_ =
-        KernelCache::instance().get_kernel("hyvla_expert_o_resident_w8_s51") != nullptr;
+        KernelCache::instance().get_kernel("hyvla_expert_o_resident_w8_v2") != nullptr;
     cold_w8_o_ring_postnorm_available_ =
-        KernelCache::instance().get_kernel("hyvla_expert_o_ring_postnorm_w8_s51") != nullptr;
+        KernelCache::instance().get_kernel("hyvla_expert_o_ring_postnorm_w8_s51_v2") != nullptr;
     cold_xor3_norm_available_ =
         KernelCache::instance().get_kernel("hyvla_expert_xor3_norm_s51") != nullptr;
     cold_w8_resident_swiglu_available_ =
-        KernelCache::instance().get_kernel("hyvla_w8_resident_swiglu_s51") != nullptr;
+        KernelCache::instance().get_kernel("hyvla_resident_swiglu_w8_v2") != nullptr;
     cold_nvfp4_resident_swiglu_available_ =
         KernelCache::instance().get_kernel("hyvla_nvfp4_resident_swiglu_s51") != nullptr;
     cold_nvfp4_resident_scales_available_ =
@@ -268,26 +394,26 @@ void HyVlaExpertModel::set_runtime_config(
     cold_nvfp4_kv_available_ =
         KernelCache::instance().get_kernel("hyvla_expert_kv_nvfp4_s51") != nullptr;
     cold_fp16_kv_grouped_available_ =
-        KernelCache::instance().get_kernel("hyvla_expert_kv_fp16_s51") != nullptr;
+        KernelCache::instance().get_kernel("hyvla_expert_kv_fp16_s51_v2") != nullptr;
     cold_w8_kv_grouped_available_ =
-        KernelCache::instance().get_kernel("hyvla_expert_kv_w8_s51") != nullptr;
+        KernelCache::instance().get_kernel("hyvla_expert_kv_w8_s51_v2") != nullptr;
     cold_nvfp4_qkv_available_ =
         KernelCache::instance().get_kernel("hyvla_expert_qkv_nvfp4_s51") != nullptr;
-    cold_nvfp4_q_n32_available_ =
+    cold_nvfp4_q_n32_available_ = hyvla_retained_schedule::q_n32 &&
         KernelCache::instance().get_kernel("hyvla_expert_q_nvfp4_s51_n32") != nullptr;
-    cold_nvfp4_qkv_overlap_available_ =
+    cold_nvfp4_qkv_overlap_available_ = hyvla_retained_schedule::qkv_overlap &&
         KernelCache::instance().get_kernel("hyvla_expert_qkv_nvfp4_s51_overlap") != nullptr;
-    cold_nvfp4_o_overlap_available_ =
+    cold_nvfp4_o_overlap_available_ = hyvla_retained_schedule::o_overlap &&
         KernelCache::instance().get_kernel("hyvla_expert_o_ring_postnorm_nvfp4_s51_n128_overlap") != nullptr;
-    cold_nvfp4_down_overlap_available_ =
+    cold_nvfp4_down_overlap_available_ = hyvla_retained_schedule::down_overlap &&
         KernelCache::instance().get_kernel("hyvla_expert_down_nextnorm_nvfp4_s51_overlap") != nullptr;
-    cold_nvfp4_gateup_overlap_available_ =
+    cold_nvfp4_gateup_overlap_available_ = hyvla_retained_schedule::gateup_overlap &&
         KernelCache::instance().get_kernel("hyvla_nvfp4_gateup_swiglu_s51_overlap") != nullptr;
-    cold_nvfp4_resident_overlap_available_ =
+    cold_nvfp4_resident_overlap_available_ = hyvla_retained_schedule::resident_overlap &&
         KernelCache::instance().get_kernel("hyvla_nvfp4_resident_swiglu_s51_overlap") != nullptr;
-    cold_sdpa_k128_available_ =
+    cold_sdpa_k128_available_ = hyvla_retained_schedule::sdpa_k128 &&
         KernelCache::instance().get_kernel("hyvla_expert_sdpa_k128_s51") != nullptr;
-    cold_sdpa_m16_available_ =
+    cold_sdpa_m16_available_ = hyvla_retained_schedule::sdpa_m16 &&
         KernelCache::instance().get_kernel("hyvla_expert_sdpa_m16_s51") != nullptr;
     cold_qk_rope_norm_available_ =
         KernelCache::instance().get_kernel("hyvla_expert_qk_rope_norm_s51") != nullptr;
@@ -296,7 +422,7 @@ void HyVlaExpertModel::set_runtime_config(
     cold_qk_rope_available_ =
         KernelCache::instance().get_kernel("hyvla_expert_qk_rope_s51") != nullptr;
     cold_o_ring_postnorm_available_ =
-        KernelCache::instance().get_kernel("hyvla_expert_o_ring_postnorm_s51") != nullptr;
+        KernelCache::instance().get_kernel("hyvla_expert_o_ring_postnorm_fp16_s51_v2") != nullptr;
     cold_ring_postnorm_available_ =
         KernelCache::instance().get_kernel("hyvla_expert_ring_postnorm_s51") != nullptr;
     // Task-private expansion opts in; ordinary REFs retain separate K/V writes.
@@ -345,9 +471,9 @@ void HyVlaExpertModel::set_weights_expert(
     TORCH_CHECK(chunk_size == 51,
                 "hyvla_expert set_weights: the certified Hy-VLA suffix has "
                 "exactly 51 rows, got ", chunk_size);
-    TORCH_CHECK(action_mlp_cores == 1 || action_mlp_cores == NUM_CORES,
+    TORCH_CHECK(action_mlp_cores == 1 || action_mlp_cores == num_cores(),
                 "hyvla_expert set_weights: action_mlp_cores must be 1 or ",
-                NUM_CORES, ", got ", action_mlp_cores);
+                num_cores(), ", got ", action_mlp_cores);
     if (production_config_bound_) {
         TORCH_CHECK(action_mlp_cores_ == action_mlp_cores,
                     "hyvla_expert set_weights: action MLP core count is "
@@ -379,7 +505,7 @@ void HyVlaExpertModel::set_weights_expert(
                 "张量是死权重 (P0 hook calls=0)。");
 
     // 影子副本 — build_layer_subgraph 要逐层权重, 而基类 layer_weights_ 是 private。
-    // W4 scale 必须单独 retain 基类相同的 4096B-aligned view。
+    // W4 scale 必须按实际 attn_tp()/action_mlp_cores retain 对齐视图。
     const int64_t N = static_cast<int64_t>(q_w_list.size());
     const bool quantized = !q_ws_list.empty();
     layers_.clear();
@@ -387,13 +513,13 @@ void HyVlaExpertModel::set_weights_expert(
     for (int64_t i = 0; i < N; ++i) {
         layers_.push_back({q_w_list[i], k_w_list[i], v_w_list[i], o_w_list[i],
                            gate_list[i], up_list[i], down_list[i],
-                           quantized ? rpu_retain_linear_quant_scale(q_w_list[i], q_ws_list[i]) : at::Tensor(),
-                           quantized ? rpu_retain_linear_quant_scale(k_w_list[i], k_ws_list[i]) : at::Tensor(),
-                           quantized ? rpu_retain_linear_quant_scale(v_w_list[i], v_ws_list[i]) : at::Tensor(),
-                           quantized ? rpu_retain_linear_quant_scale(o_w_list[i], o_ws_list[i]) : at::Tensor(),
-                           quantized ? rpu_retain_linear_quant_scale(gate_list[i], gate_ws_list[i]) : at::Tensor(),
-                           quantized ? rpu_retain_linear_quant_scale(up_list[i], up_ws_list[i]) : at::Tensor(),
-                           quantized ? rpu_retain_linear_quant_scale(down_list[i], down_ws_list[i]) : at::Tensor()});
+                           quantized ? rpu_retain_linear_quant_scale(q_w_list[i], q_ws_list[i], attn_tp()) : at::Tensor(),
+                           quantized ? rpu_retain_linear_quant_scale(k_w_list[i], k_ws_list[i], attn_tp()) : at::Tensor(),
+                           quantized ? rpu_retain_linear_quant_scale(v_w_list[i], v_ws_list[i], attn_tp()) : at::Tensor(),
+                           quantized ? rpu_retain_linear_quant_scale(o_w_list[i], o_ws_list[i], attn_tp()) : at::Tensor(),
+                           quantized ? rpu_retain_linear_quant_scale(gate_list[i], gate_ws_list[i], action_mlp_cores) : at::Tensor(),
+                           quantized ? rpu_retain_linear_quant_scale(up_list[i], up_ws_list[i], action_mlp_cores) : at::Tensor(),
+                           quantized ? rpu_retain_linear_quant_scale(down_list[i], down_ws_list[i], action_mlp_cores) : at::Tensor()});
     }
     cos_ref_ = cos;
     sin_ref_ = sin;
@@ -472,6 +598,13 @@ std::vector<int64_t> HyVlaExpertModel::gateup_resident_arguments() const {
             hidden_size(), intermediate_size(), NUM_CORES, num_steps_,
             gateup_layer_bytes(), gateup_bundle_bytes()};
     if (nvfp4_) args.insert(args.end(), {320, 64, 128, 8, 24, 27, 32});
+    else {
+        const auto c = rpu_specialized_linear::contract(gateup_weight_bytes() == 262144
+            ? KernelId::HYVLA_GATEUP_RESIDENT_PAIR_W8_V2
+            : KernelId::HYVLA_GATEUP_RESIDENT_PAIR_FP16_V2);
+        args[0] += 3;
+        args.insert(args.end(), {c.m, c.n, c.k, c.gx, 2, 32, 20, 34, 4, 36});
+    }
     return args;
 }
 
@@ -506,11 +639,13 @@ std::vector<int64_t> HyVlaExpertModel::gateup_swiglu_arguments(int64_t position)
         }
         return args;
     }
-    if (cold_w8_gateup_n48_available_ && gateup_weight_bytes() == 262144)
-        return {3, 32, gateup_resident_layers(), 32 - gateup_resident_layers(),
-                51, position, 1024, 2048, 256, NUM_CORES, 10, 512, 48, 128, 6};
-    return {gateup_weight_bytes() == 262144 ? 2 : 1, 32, gateup_resident_layers(), 32 - gateup_resident_layers(),
-            51, position, 1024, 2048, 256, NUM_CORES, 10, 320, 112, 128, 3};
+    const bool w8 = gateup_weight_bytes() == 262144;
+    const auto c = rpu_specialized_linear::contract(w8
+        ? KernelId::HYVLA_EXPERT_GATEUP_W8_S51_N48
+        : KernelId::HYVLA_EXPERT_GATEUP_SWIGLU_FP16_V2);
+    return {w8 ? 5 : 4, 32, gateup_resident_layers(), 32 - gateup_resident_layers(),
+            51, position, 1024, 2048, 256, NUM_CORES, 10, c.m, c.n, c.k, c.gx,
+            2, 32, 20, 34, 26, 27, 28, 29};
 }
 
 bool HyVlaExpertModel::resident_swiglu_enabled(int64_t rows, int64_t position) const {
@@ -540,8 +675,13 @@ std::vector<int64_t> HyVlaExpertModel::resident_swiglu_arguments(int64_t positio
         }
         return args;
     }
-    return {gateup_weight_bytes() == 262144 ? 2 : 1, 32, 0, gateup_resident_layers(),
-            51, position, 1024, 2048, 256, 8, 10, 592, 32, 128, 8, 0, 1};
+    const bool w8 = gateup_weight_bytes() == 262144;
+    const auto c = rpu_specialized_linear::contract(w8
+        ? KernelId::HYVLA_W8_RESIDENT_SWIGLU_S51
+        : KernelId::HYVLA_RESIDENT_SWIGLU_FP16_V2);
+    return {w8 ? 5 : 4, 32, 0, gateup_resident_layers(),
+            51, position, 1024, 2048, 256, 8, 10, c.m, c.n, c.k, c.gx, 0, 1,
+            2, 32, 20, 34, 26, 27, 28, 29};
 }
 
 bool HyVlaExpertModel::resident_fp8_scales_enabled(int64_t rows, int64_t position) const {
@@ -641,10 +781,10 @@ bool HyVlaExpertModel::kv_grouped_enabled(int64_t rows, int64_t position) const 
 
 std::vector<int64_t> HyVlaExpertModel::kv_grouped_arguments(int64_t position) const {
     const bool w8 = gateup_weight_bytes() == 262144;
-    // ABI/precision/L/M/P/globalN/localN/K/TP/steps/projections/tile/grid;
-    // independent typed weight/scale pairs, output pairs and original rounding.
-    return {1, w8 ? 8 : 16, 32, 51, position, 1024, 128, 1024, 8, 10, 2,
-            w8 ? 512 : 432, w8 ? 48 : 80, 128, w8 ? 6 : 4, w8 ? 3 : 2,
+    const auto c = rpu_specialized_linear::contract(w8
+        ? KernelId::HYVLA_EXPERT_KV_W8_S51 : KernelId::HYVLA_EXPERT_KV_FP16_S51);
+    return {2, w8 ? 8 : 16, 32, 51, position, 1024, 128, 1024, 8, 10, 2,
+            c.m, c.n, c.k, c.gx, (128 + c.n - 1) / c.n,
             2, 3, 32, 33, w8 ? 20 : 0, w8 ? 21 : 0,
             w8 ? 34 : 0, w8 ? 35 : 0, 4, 5, 36, 37, 1, w8 ? 1 : 2};
 }
@@ -760,9 +900,9 @@ bool HyVlaExpertModel::o_resident_enabled(int64_t rows, int64_t position) const 
 }
 
 std::vector<int64_t> HyVlaExpertModel::o_resident_arguments(int64_t position) const {
-    // ABI/L/M/P/H/globalK/TP/steps/first/count/GUbytes/Obytes/tileM/N/K/grid/scale regs.
-    return {1, 32, 51, position, 1024, 2048, 8, 10, 0, 12, 3145728, 3145728,
-            448, 64, 128, 16, 20, 21};
+    const auto c = rpu_specialized_linear::contract(KernelId::HYVLA_EXPERT_O_RESIDENT_W8_S51);
+    return {2, 32, 51, position, 1024, 2048, 8, 10, 0, 12, 3145728, 3145728,
+            c.m, c.n, c.k, c.gx, 20, 21};
 }
 
 bool HyVlaExpertModel::o_ring_postnorm_enabled(int64_t rows, int64_t position) const {
@@ -787,10 +927,15 @@ std::vector<int64_t> HyVlaExpertModel::o_ring_postnorm_arguments(int64_t positio
             args[0] = 5;
             args.insert(args.end(), {106, 105, 0, 1, 1});
         }
-    } else if (gateup_weight_bytes() == 262144) {
-        args[0] = 2;
-        args.insert(args.end(), {448, 64, 128, 2, 16, 256, 2048, 2, 3, 20, 21});
-    } else args.insert(args.end(), {608, 32, 128, 4, 32, 256, 2048, 2, 3});
+    } else {
+        const bool w8 = gateup_weight_bytes() == 262144;
+        const auto c = rpu_specialized_linear::contract(w8
+            ? KernelId::HYVLA_EXPERT_O_RING_POSTNORM_W8_S51
+            : KernelId::HYVLA_EXPERT_O_RING_POSTNORM_S51);
+        args[0] = w8 ? 7 : 6;
+        args.insert(args.end(), {c.m, c.n, c.k, 1, c.gx, 256, 2048, 2, 3,
+                                w8 ? 20 : 0, w8 ? 21 : 0, 32, 38, 40, 50});
+    }
     return args;
 }
 
@@ -813,8 +958,8 @@ void HyVlaExpertModel::set_gateup_resident_weights(const at::Tensor& bundle, int
     TORCH_CHECK(KernelCache::instance().get_program(
                     nvfp4_ ? "hyvla_nvfp4_gateup_resident_s51" :
                     (gateup_weight_bytes() == 262144
-                        ? "gate_up_parallel_w8a16_multibase_spm_weight_m592n32k128"
-                        : "wall_action_gate_up_fp16_spm_weight_m592n32k128")) != nullptr,
+                        ? "hyvla_gateup_resident_pair_w8_v2"
+                        : "hyvla_gateup_resident_pair_fp16_v2")) != nullptr,
                 "HyVLA Gate/Up resident payload unavailable");
     TORCH_CHECK(o_layers == 0 || o_layers == 12, "HyVLA resident O count must be zero or twelve");
     TORCH_CHECK(o_layers == 0 || (gateup_weight_bytes() == 262144 &&
@@ -922,18 +1067,56 @@ std::vector<BufferDecl> HyVlaExpertModel::baseline_buffer_declarations(
         d.push_back({"gateup_resident_weights", resident_storage_bytes(),
                      0, 9, SC::Temp, 0, nullptr, ALL});
     }
+    if (resident_fp8_scale_layers_ == 8) {
+        // GU8 keeps 256 KiB/core of FP8 scales alongside the 6 MiB Gate/Up
+        // bundle. SDPA finishes using its scratch before the following ring
+        // preparation/O projection writes oproj, on the same ordered queue.
+        // Share only those two phase-5 slots; Q, attention output, residuals
+        // and all eight scale layers remain separate live owners.
+        TORCH_CHECK(nvfp4_ && gateup_resident_profile() &&
+                        gateup_resident_layers() == 24 && o_resident_layers_ == 0,
+                    "HyVLA GU8 scratch reuse requires its exact resident profile");
+        auto find_slot = [&](const char* name) {
+            return std::find_if(d.begin(), d.end(), [&](const BufferDecl& slot) {
+                return slot.name && std::strcmp(slot.name, name) == 0;
+            });
+        };
+        auto scratch = find_slot("sdpa_tmp");
+        auto projection = find_slot("oproj");
+        TORCH_CHECK(scratch != d.end() && projection != d.end() &&
+                        !scratch->alias_of && !projection->alias_of &&
+                        scratch->size > 0 && projection->size > 0 &&
+                        scratch->size % SpmAllocator::ALIGN == 0 &&
+                        projection->size % SpmAllocator::ALIGN == 0 &&
+                        scratch->storage == SC::Temp && projection->storage == SC::Temp &&
+                        scratch->scope == ALL && projection->scope == ALL &&
+                        scratch->phase_start == 5 && scratch->phase_end == 5 &&
+                        projection->phase_start == 5 && projection->phase_end == 5,
+                    "HyVLA GU8 scratch/O lifetime contract drift");
+        projection->size = std::max(projection->size, scratch->size);
+        scratch->size = 0;
+        scratch->alias_of = "oproj";
+    }
     return d;
 }
 
 std::vector<BufferDecl> HyVlaExpertModel::planned_buffer_declarations(
     const LayoutContext& layout, bool* retained) const {
     auto declarations = baseline_buffer_declarations(layout);
+    // The first action can run after cold constants retire the vision/text
+    // owners. Its free space is not the later three-owner steady-state budget.
+    // GU8 therefore fixes the existing once-per-body mask route, rather than
+    // admitting a once-per-forward mask which may not fit on warm REPLAY.
+    TORCH_CHECK(resident_fp8_scale_layers_ != 8 ||
+                    layout.forward_operand_residency != FmbForwardOperandResidency::FORWARD,
+                "HyVLA GU8 requires the fixed per-body mask residency");
     bool keep = false;
     switch (layout.forward_operand_residency) {
         case FmbForwardOperandResidency::UNSPECIFIED:
             // Legacy/unbound layout probes keep their original no-growth
             // behavior. Only cold manifest selection may spend extra capacity.
-            keep = cold_mask_once_ && layout.use_attn_mask &&
+            keep = resident_fp8_scale_layers_ != 8 &&
+                cold_mask_once_ && layout.use_attn_mask &&
                 detail::plan_forward_spm_residency(declarations, {"sdpa_mask"}).retained;
             break;
         case FmbForwardOperandResidency::PER_LAYER:
@@ -959,6 +1142,12 @@ FmbForwardOperandResidency HyVlaExpertModel::mask_residency_for_candidate(
     const LayoutContext& layout) const {
     // Reconstruction/BUILD/REPLAY consumes the descriptor's frozen choice.
     // Live free space is only consulted by the cold unbound planning oracle.
+    if (resident_fp8_scale_layers_ == 8) {
+        TORCH_CHECK(layout.forward_operand_residency == FmbForwardOperandResidency::UNSPECIFIED ||
+                        layout.forward_operand_residency == FmbForwardOperandResidency::PER_LAYER,
+                    "HyVLA GU8 requires the fixed per-body mask residency");
+        return FmbForwardOperandResidency::PER_LAYER;
+    }
     if (layout.forward_operand_residency != FmbForwardOperandResidency::UNSPECIFIED) {
         TORCH_CHECK(layout.forward_operand_residency == FmbForwardOperandResidency::PER_LAYER ||
                         layout.forward_operand_residency == FmbForwardOperandResidency::FORWARD,
@@ -1076,12 +1265,18 @@ void HyVlaExpertModel::emit_pre_layers_body() {
                 static_cast<int64_t>(
                     HyVlaExpertDmaRoute::DDR_BROADCAST_TO_SPM_MUTABLE),
                 /*resolved_flags=*/0,
-                {unroll_mode_ ? 1 : 0, cs * np, NUM_CORES});
+                {unroll_mode_ ? 1 : 0, cs * np, num_cores()});
         }
         rpu_launch_ddr_broadcast_spm_dma_mutable(
             &x_t_src_base_, /*src_offset_bytes=*/0, /*num_elements=*/cs * np,
-            addr(0, "x_t_spm"), /*num_cores=*/NUM_CORES);
+            addr(0, "x_t_spm"), /*num_cores=*/num_cores());
     } else if (action_mlp_cores_ > 1) {
+        // 多核档：A4 是列并行 ⇒ **每个核都要完整的 x_t**。但图内 Euler [Z3] 只在
+        // 核 0 更新 x_t_spm（v_t 只有核 0 有），第 1 步起核 1..7 就是陈旧值
+        // —— 这是第二次接错的地方（cos 0.487）。
+        // 修法用本图**已经存在**的模式：[Z4] 每步都把 x_t 写进 x_traj[bit]，
+        // 这里从 x_traj[bit-1] 广播回全部核（3.3 KB，~1 µs）。
+        // 与 A7→emb_stage_→层 0 那条 DDR 往返同型，不引入新的存活假设。
         if (ctx().has_complete_physical_manifest()) {
             ctx().consume_physical_route(
                 FmbRouteFamily::MUTABLE_DMA,
@@ -1089,11 +1284,11 @@ void HyVlaExpertModel::emit_pre_layers_body() {
                 static_cast<int64_t>(
                     HyVlaExpertDmaRoute::DDR_BROADCAST_TO_SPM_MUTABLE),
                 /*resolved_flags=*/0,
-                {action_mlp_cores_, num_steps_, cs * np, NUM_CORES});
+                {action_mlp_cores_, num_steps_, cs * np, num_cores()});
         }
         rpu_launch_ddr_broadcast_spm_dma_mutable(
             &x_traj_dst_base_, /*src_offset_bytes=*/(bit - 1) * cs * np * DWIDTH,
-            /*num_elements=*/cs * np, addr(0, "x_t_spm"), /*num_cores=*/NUM_CORES);
+            /*num_elements=*/cs * np, addr(0, "x_t_spm"), /*num_cores=*/num_cores());
     }
     const int amc = action_mlp_cores_;
     // [A2] time_all[bit] → time_spm, 作为 encoder 第一个 GEMM (A4) 的 bias。
@@ -1132,8 +1327,8 @@ void HyVlaExpertModel::emit_pre_layers_body() {
             addr(0, "time_spm"), /*num_cores=*/amc);
     }
     // [A3] mo_bias → mo_b_spm (内容恒定, FIXED src)。
-    //      单核档只有核 0 用得到；多核档 all-reduce 后每核都要按列加一次 bias
-    //      （`1xC_NxC` 没有 num_cores 参数，8 核齐发），所以要广播满 8 核。
+    //      单核档只有核 0 用得到；多核档 all-reduce 后 amc 个核都要按列加一次
+    //      bias（A6-4 在这 amc 个核上齐发），所以要广播满 amc 个核。
     if (ctx().has_complete_physical_manifest()) {
         ctx().consume_physical_route(
             FmbRouteFamily::MUTABLE_DMA,
@@ -1225,7 +1420,7 @@ void HyVlaExpertModel::emit_pre_layers_body() {
         rpu_launch_all_reduce_sum_residual_kernel(
             addr(0, "mo_part_spm"), addr(0, "enc_h_spm"), addr(0, "emb_core0_spm"),
             /*M=*/cs, /*N=*/h, /*input_num_cores=*/amc, /*output_num_cores=*/amc);
-        // A6-4 bias 按列广播加一次（8 核齐发，各核结果一致；A7 只读核 0）。
+        // A6-4 bias 按列广播加一次（amc 核齐发，各核结果一致；A7 只读核 0）。
         if (ctx().has_complete_physical_manifest()) {
             ctx().consume_physical_route(
                 FmbRouteFamily::GRAPH_SCHEDULE,
@@ -1237,7 +1432,8 @@ void HyVlaExpertModel::emit_pre_layers_body() {
         }
         rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
             addr(0, "mo_b_spm"), addr(0, "emb_core0_spm"), addr(0, "emb_core0_spm"),
-            /*n=*/cs, /*c=*/h, c10::Half(1.0f), ValuOpType::ADD, /*is_bopa=*/false);
+            /*n=*/cs, /*c=*/h, c10::Half(1.0f), ValuOpType::ADD, /*is_bopa=*/false,
+            /*num_cores=*/amc);
     }
     // [A7] emb_core0_spm[1:cs] → emb_stage_[1:cs] (src/dst 都偏一行)。行 0 保持
     //      unroll_forward 写进去的 state token 不动 —— encoder 的行 0 是 x_t 行 0
@@ -1546,7 +1742,7 @@ FmbPhysicalExecutionManifest HyVlaExpertModel::physical_manifest_for_candidate(
                 FmbRouteFamily::ALL_REDUCE,
                 HYVLA_EXPERT_ATTN_ALL_REDUCE_SITE,
                 fmb_ring_all_reduce_route_selector(chunk.len, h),
-                {chunk.len, h, tp, NUM_CORES});
+                {chunk.len, h, tp, num_cores()});
             append_norm(HYVLA_EXPERT_POST_NORM_SITE, norm_rows, h);
         }
     }
@@ -1567,10 +1763,10 @@ FmbPhysicalExecutionManifest HyVlaExpertModel::physical_manifest_for_candidate(
     } else {
         append_linear(
             HYVLA_EXPERT_GATE_LINEAR_SITE,
-            {chunk.len, intermediate_size(), h, 1, NUM_CORES});
+            {chunk.len, intermediate_size(), h, 1, mlp_tp()});
         append_linear(
             HYVLA_EXPERT_UP_LINEAR_SITE,
-            {chunk.len, intermediate_size(), h, 1, NUM_CORES});
+            {chunk.len, intermediate_size(), h, 1, mlp_tp()});
     }
     if (resident_fp8_scale_layers_) {
         TORCH_CHECK(resident_fp8_scales_enabled(chunk.len, position + chunk.offset),
@@ -1579,7 +1775,7 @@ FmbPhysicalExecutionManifest HyVlaExpertModel::physical_manifest_for_candidate(
                1, resident_fp8_scales_arguments(position + chunk.offset));
     }
     // Resident producer fusion consumes activation for its installed layer interval.
-    const int64_t elems_mlp = chunk.len * (intermediate_size() / NUM_CORES);
+    const int64_t elems_mlp = chunk.len * (intermediate_size() / mlp_tp());
     if (resident_swiglu_enabled(chunk.len, position + chunk.offset)) {
         append(FmbRouteFamily::GRAPH_SCHEDULE,
                nvfp4_ ? HYVLA_EXPERT_NVFP4_RESIDENT_SWIGLU_SITE : HYVLA_EXPERT_RESIDENT_SWIGLU_SITE,
@@ -1590,17 +1786,17 @@ FmbPhysicalExecutionManifest HyVlaExpertModel::physical_manifest_for_candidate(
             HYVLA_EXPERT_MLP_SILU_MUL_SITE,
             static_cast<int64_t>(
                 HyVlaExpertActivationRoute::SILU_MUL_FUSED),
-            {cold_silu_mul_ ? 1 : 0, elems_mlp, NUM_CORES});
+            {cold_silu_mul_ ? 1 : 0, elems_mlp, mlp_tp()});
     } else {
         append(
             FmbRouteFamily::ACTIVATION, HYVLA_EXPERT_MLP_SILU_SITE,
             static_cast<int64_t>(
                 HyVlaExpertActivationRoute::SILU_UNARY),
-            {cold_silu_mul_ ? 1 : 0, elems_mlp, NUM_CORES});
+            {cold_silu_mul_ ? 1 : 0, elems_mlp, mlp_tp()});
         append(
             FmbRouteFamily::ACTIVATION, HYVLA_EXPERT_MLP_MUL_SITE,
             static_cast<int64_t>(HyVlaExpertActivationRoute::MUL),
-            {cold_silu_mul_ ? 1 : 0, elems_mlp, NUM_CORES});
+            {cold_silu_mul_ ? 1 : 0, elems_mlp, mlp_tp()});
     }
     const bool fused_nvfp4_down = down_nvfp4_nextnorm_enabled(chunk.len, position + chunk.offset);
     if (fused_nvfp4_down)
@@ -1612,7 +1808,7 @@ FmbPhysicalExecutionManifest HyVlaExpertModel::physical_manifest_for_candidate(
     else
         append_linear(
             HYVLA_EXPERT_DOWN_LINEAR_SITE,
-            {chunk.len, h, intermediate_size(), 0, NUM_CORES});
+            {chunk.len, h, intermediate_size(), 0, mlp_tp()});
     if (fused_nvfp4_down) {
         // The single producer/tail recipe above owns the complete Down schedule.
     } else if (down_nextnorm_enabled(chunk.len, position + chunk.offset)) {
@@ -1623,14 +1819,14 @@ FmbPhysicalExecutionManifest HyVlaExpertModel::physical_manifest_for_candidate(
             FmbRouteFamily::ALL_REDUCE,
             HYVLA_EXPERT_MLP_ALL_REDUCE_SITE,
             fmb_ring_all_reduce_route_selector(chunk.len, h),
-            {chunk.len, h, NUM_CORES, NUM_CORES});
+            {chunk.len, h, mlp_tp(), num_cores()});
         append_norm(HYVLA_EXPERT_FINAL_NORM_SITE, norm_rows, h);
     }
 
     if (unroll_mode_) {
         TORCH_CHECK(
             action_dim_pad_ > 0 && num_steps_ > 0 &&
-                (action_mlp_cores_ == 1 || action_mlp_cores_ == NUM_CORES),
+                (action_mlp_cores_ == 1 || action_mlp_cores_ == num_cores()),
             "HyVlaExpertModel COMPLETE unroll descriptor requires bound "
             "action weights and a supported core count");
         const int64_t amc = action_mlp_cores_;
@@ -1640,14 +1836,14 @@ FmbPhysicalExecutionManifest HyVlaExpertModel::physical_manifest_for_candidate(
             FmbRouteFamily::MUTABLE_DMA, HYVLA_EXPERT_PRE_X0_DMA_SITE,
             static_cast<int64_t>(
                 HyVlaExpertDmaRoute::DDR_BROADCAST_TO_SPM_MUTABLE),
-            {unroll_mode_ ? 1 : 0, cs * np, NUM_CORES});
+            {unroll_mode_ ? 1 : 0, cs * np, num_cores()});
         if (amc > 1 && num_steps_ > 1) {
             append(
                 FmbRouteFamily::MUTABLE_DMA,
                 HYVLA_EXPERT_PRE_X_FEEDBACK_DMA_SITE,
                 static_cast<int64_t>(
                     HyVlaExpertDmaRoute::DDR_BROADCAST_TO_SPM_MUTABLE),
-                {amc, num_steps_, cs * np, NUM_CORES});
+                {amc, num_steps_, cs * np, num_cores()});
         }
         append(
             FmbRouteFamily::MUTABLE_DMA,
@@ -1707,7 +1903,8 @@ FmbPhysicalExecutionManifest HyVlaExpertModel::physical_manifest_for_candidate(
     }
     append_causal_decoder_preload_manifest_routes(manifest);
     append_fmb_shared_runtime_routes(
-        manifest, plan, hidden_size(), FMB_SHARED_LAYER_INPUT_DMA);
+        manifest, plan, hidden_size(), FMB_SHARED_LAYER_INPUT_DMA,
+        /*compute_row_multiplier=*/1, num_cores(), mlp_tp());
     return manifest;
 }
 
@@ -2061,6 +2258,17 @@ bool HyVlaExpertModel::subclass_chunk_size_valid(
     return cs >= seq_len && chunk_within_envelope(cs);
 }
 
+void HyVlaExpertModel::prepare_persistent_spm_for_shape(
+    int64_t seq_len, int64_t prefix_len, int64_t mask_kv_len) {
+    TORCH_CHECK(seq_len == expert_chunk_size_,
+                "hyvla_expert_prepare_persistent_spm: seq_len must match the "
+                "fixed action suffix geometry");
+    TORCH_CHECK(prefix_len >= 0 && mask_kv_len == prefix_len + seq_len,
+                "hyvla_expert_prepare_persistent_spm: mask width must equal "
+                "prefix_len + seq_len");
+    prepare_persistent_spm(seq_len, prefix_len, /*is_causal=*/false, mask_kv_len);
+}
+
 std::vector<int64_t> HyVlaExpertModel::resolve_stage_domain(
     int64_t seq_len, int64_t prefix_len, int64_t mask_kv_len) {
     TORCH_CHECK(seq_len == expert_chunk_size_,
@@ -2101,7 +2309,7 @@ void HyVlaExpertModel::build_layer_subgraph(int layer_idx, const ChunkInfo& chun
     const int64_t hd  = head_dim();
     const int tp = attn_tp();
     const int64_t local_q  = nq / tp;
-    const int64_t elems_mlp = seq_len * (intermediate_size() / NUM_CORES);
+    const int64_t elems_mlp = seq_len * (intermediate_size() / mlp_tp());
     const int64_t allocation_rows = ctx().stage_plan.compute.chunks.front().len;
     const int64_t kv_pad_rows_ = cold_kvpad16_
         ? Align(allocation_rows, int64_t{16}) : 0;
@@ -2175,7 +2383,7 @@ void HyVlaExpertModel::build_layer_subgraph(int layer_idx, const ChunkInfo& chun
         }
         rpu_launch_rmsnorm_spm_kernel(
             addr(0, "residual1"), addr(0, "input_norm"),
-            layer_addr(layer_idx, 0, "norm_w"), nrows, h, eps_expert_, full_norm_route);
+            layer_addr(layer_idx, 0, "norm_w"), nrows, h, eps_expert_, full_norm_route, num_cores());
     }
 
     // ── 步 2: QKV (无 bias — Hy-VLA attention_bias=false) ──
@@ -2356,7 +2564,7 @@ void HyVlaExpertModel::build_layer_subgraph(int layer_idx, const ChunkInfo& chun
         rpu_launch_rmsnorm_spm_kernel(
             addr(0, "output"), addr(0, "q"),
             layer_addr(layer_idx, 0, "q_norm_w"),
-            q_norm_rows, hd, eps_expert_, q_head_norm_route);
+            q_norm_rows, hd, eps_expert_, q_head_norm_route, num_cores());
 
         if (!fused_qk) {
             if (prope) {
@@ -2402,7 +2610,7 @@ void HyVlaExpertModel::build_layer_subgraph(int layer_idx, const ChunkInfo& chun
         rpu_launch_rmsnorm_spm_kernel(
             addr(0, "input_norm"), addr(0, "k"),
             layer_addr(layer_idx, 0, "k_norm_w"),
-            k_norm_rows, hd, eps_expert_, k_head_norm_route);
+            k_norm_rows, hd, eps_expert_, k_head_norm_route, num_cores());
 
     }
 
@@ -2501,7 +2709,7 @@ void HyVlaExpertModel::build_layer_subgraph(int layer_idx, const ChunkInfo& chun
                 HyVlaExpertAllReduceRoute::PREPARE_RING_INPUT),
             /*resolved_flags=*/0, {seq_len, h, tp}, chunk.idx);
     }
-    rpu_prepare_ring_all_reduce_input(addr(0, "oproj"), seq_len, h, tp);
+    rpu_prepare_ring_all_reduce_input(addr(0, "oproj"), seq_len, h, tp, num_cores());
     if (o_ring_postnorm_enabled(seq_len, cos_sin_start)) {
         TORCH_CHECK(ctx().has_complete_physical_manifest(),
                     "HyVLA O ring postnorm requires a COMPLETE descriptor");
@@ -2563,11 +2771,11 @@ void HyVlaExpertModel::build_layer_subgraph(int layer_idx, const ChunkInfo& chun
                     HYVLA_EXPERT_ATTN_ALL_REDUCE_SITE,
                     fmb_ring_all_reduce_route_selector(seq_len, h),
                     /*resolved_flags=*/0,
-                    {seq_len, h, tp, NUM_CORES}, chunk.idx);
+                    {seq_len, h, tp, num_cores()}, chunk.idx);
             }
             rpu_launch_all_reduce_sum_residual_kernel(
                 addr(0, "oproj"), addr(0, "residual1"), addr(0, "residual2"),
-                seq_len, h, tp, NUM_CORES);
+                seq_len, h, tp, num_cores());
 
             // ── 步 5: post-attention RMSNorm ──
             if (ctx().has_complete_physical_manifest()) {
@@ -2583,7 +2791,7 @@ void HyVlaExpertModel::build_layer_subgraph(int layer_idx, const ChunkInfo& chun
             }
             rpu_launch_rmsnorm_spm_kernel(
                 addr(0, "residual2"), addr(0, "residual1"),
-                layer_addr(layer_idx, 0, "post_norm_w"), nrows, h, eps_expert_, full_norm_route);
+                layer_addr(layer_idx, 0, "post_norm_w"), nrows, h, eps_expert_, full_norm_route, num_cores());
         }
     }
 
@@ -2676,11 +2884,11 @@ void HyVlaExpertModel::build_layer_subgraph(int layer_idx, const ChunkInfo& chun
                 FmbRouteFamily::LINEAR, HYVLA_EXPERT_GATE_LINEAR_SITE,
                 static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
                 /*resolved_flags=*/0,
-                {seq_len, intermediate_size(), h, 1, NUM_CORES}, chunk.idx);
+                {seq_len, intermediate_size(), h, 1, mlp_tp()}, chunk.idx);
         }
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "residual1"), lw.gate_w, addr(0, "gate"),
-            seq_len, intermediate_size(), h, /*partition=*/1, NUM_CORES,
+            seq_len, intermediate_size(), h, /*partition=*/1, mlp_tp(),
             /*bias_spm_addr=*/0u, /*scale=*/lw.gate_ws,
             nvfp4_scale_addr("nvfp4_gate_ts"), uint16_t(layer_idx));
         if (!cold_silu_mul_) {
@@ -2691,22 +2899,22 @@ void HyVlaExpertModel::build_layer_subgraph(int layer_idx, const ChunkInfo& chun
                     static_cast<int64_t>(
                         HyVlaExpertActivationRoute::SILU_UNARY),
                     /*resolved_flags=*/0,
-                    {cold_silu_mul_ ? 1 : 0, elems_mlp, NUM_CORES}, chunk.idx);
+                    {cold_silu_mul_ ? 1 : 0, elems_mlp, mlp_tp()}, chunk.idx);
             }
             rpu_launch_eltwise_unary_spm_kernel(
                 addr(0, "gate"), addr(0, "gate"), elems_mlp, ValuOpType::SILU,
-                /*is_gelu=*/false, NUM_CORES);
+                /*is_gelu=*/false, mlp_tp());
         }
         if (ctx().has_complete_physical_manifest()) {
             ctx().consume_physical_route(
                 FmbRouteFamily::LINEAR, HYVLA_EXPERT_UP_LINEAR_SITE,
                 static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
                 /*resolved_flags=*/0,
-                {seq_len, intermediate_size(), h, 1, NUM_CORES}, chunk.idx);
+                {seq_len, intermediate_size(), h, 1, mlp_tp()}, chunk.idx);
         }
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "residual1"), lw.up_w, addr(0, "up"),
-            seq_len, intermediate_size(), h, /*partition=*/1, NUM_CORES,
+            seq_len, intermediate_size(), h, /*partition=*/1, mlp_tp(),
             /*bias_spm_addr=*/0u, /*scale=*/lw.up_ws,
             nvfp4_scale_addr("nvfp4_up_ts"), uint16_t(layer_idx));
     }
@@ -2718,11 +2926,11 @@ void HyVlaExpertModel::build_layer_subgraph(int layer_idx, const ChunkInfo& chun
                 static_cast<int64_t>(
                     HyVlaExpertActivationRoute::SILU_MUL_FUSED),
                 /*resolved_flags=*/0,
-                {cold_silu_mul_ ? 1 : 0, elems_mlp, NUM_CORES}, chunk.idx);
+                {cold_silu_mul_ ? 1 : 0, elems_mlp, mlp_tp()}, chunk.idx);
         }
         rpu_launch_silu_mul_spm_kernel(
             addr(0, "gate"), addr(0, "up"), addr(0, "gate"),
-            elems_mlp, NUM_CORES);
+            elems_mlp, mlp_tp());
     } else if (!fused_gateup && !fused_resident) {
         if (ctx().has_complete_physical_manifest()) {
             ctx().consume_physical_route(
@@ -2730,11 +2938,11 @@ void HyVlaExpertModel::build_layer_subgraph(int layer_idx, const ChunkInfo& chun
                 HYVLA_EXPERT_MLP_MUL_SITE,
                 static_cast<int64_t>(HyVlaExpertActivationRoute::MUL),
                 /*resolved_flags=*/0,
-                {cold_silu_mul_ ? 1 : 0, elems_mlp, NUM_CORES}, chunk.idx);
+                {cold_silu_mul_ ? 1 : 0, elems_mlp, mlp_tp()}, chunk.idx);
         }
         rpu_launch_eltwise_binary_spm_kernel(
             addr(0, "gate"), addr(0, "up"), addr(0, "gate"),
-            elems_mlp, ValuOpType::MUL, c10::Half(1.0f), NUM_CORES);
+            elems_mlp, ValuOpType::MUL, c10::Half(1.0f), mlp_tp());
     }
     const bool fused_nvfp4_down = down_nvfp4_nextnorm_enabled(seq_len, cos_sin_start);
     if (fused_nvfp4_down) {
@@ -2754,11 +2962,11 @@ void HyVlaExpertModel::build_layer_subgraph(int layer_idx, const ChunkInfo& chun
                 FmbRouteFamily::LINEAR, HYVLA_EXPERT_DOWN_LINEAR_SITE,
                 static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
                 /*resolved_flags=*/0,
-                {seq_len, h, intermediate_size(), 0, NUM_CORES}, chunk.idx);
+                {seq_len, h, intermediate_size(), 0, mlp_tp()}, chunk.idx);
         }
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "gate"), lw.down_w, addr(0, "down"),
-            seq_len, h, intermediate_size(), /*partition=*/0, NUM_CORES,
+            seq_len, h, intermediate_size(), /*partition=*/0, mlp_tp(),
             /*bias_spm_addr=*/0u, /*scale=*/lw.down_ws,
                 nvfp4_scale_addr("nvfp4_down_ts"), uint16_t(layer_idx));
     }
@@ -2795,11 +3003,11 @@ void HyVlaExpertModel::build_layer_subgraph(int layer_idx, const ChunkInfo& chun
                 HYVLA_EXPERT_MLP_ALL_REDUCE_SITE,
                 fmb_ring_all_reduce_route_selector(seq_len, h),
                 /*resolved_flags=*/0,
-                {seq_len, h, NUM_CORES, NUM_CORES}, chunk.idx);
+                {seq_len, h, mlp_tp(), num_cores()}, chunk.idx);
         }
         rpu_launch_all_reduce_sum_residual_kernel(
             addr(0, "down"), addr(0, "residual2"), addr(0, "residual1"),
-            seq_len, h, NUM_CORES, NUM_CORES);
+            seq_len, h, mlp_tp(), num_cores());
 
         // ── 步 7 (末层): final RMSNorm (原地, 单份 γ) ──
         if (is_last_layer) {
@@ -2816,7 +3024,7 @@ void HyVlaExpertModel::build_layer_subgraph(int layer_idx, const ChunkInfo& chun
             }
             rpu_launch_rmsnorm_spm_kernel(
                 addr(0, "residual1"), addr(0, "residual1"),
-                addr(0, "final_norm_w"), nrows, h, eps_expert_, full_norm_route);
+                addr(0, "final_norm_w"), nrows, h, eps_expert_, full_norm_route, num_cores());
         }
 
     }
@@ -3062,6 +3270,16 @@ int64_t rpu_hyvla_expert_create() {
     return HyVlaExpertRegistry::create();
 }
 
+void rpu_hyvla_expert_set_execution_core_count(int64_t handle, int64_t num_cores) {
+    HyVlaExpertRegistry::get(handle, "rpu_hyvla_expert_set_execution_core_count")
+        ->set_execution_cores(num_cores);
+}
+
+std::vector<int64_t> rpu_hyvla_expert_get_execution_topology(int64_t handle) {
+    return HyVlaExpertRegistry::get(handle, "rpu_hyvla_expert_get_execution_topology")
+        ->execution_topology();
+}
+
 void rpu_hyvla_expert_set_runtime_config(
     int64_t handle,
     bool fast_replay, bool fast_replay_preload, bool mask_once,
@@ -3145,10 +3363,13 @@ void rpu_hyvla_expert_set_weights_nvfp4(
                     table->device().type() == at::kPrivateUse1,
                     "HyVLA NVFP4 requires seven owned contiguous FP32[32] device tensor-scale tables");
     TORCH_CHECK(q_w.size() == 32 && q_ws.size() == 32 && q_w[0].scalar_type() == at::kByte &&
-                q_ws[0].scalar_type() == at::kByte && action_mlp_cores == v3::NUM_CORES &&
-                num_q_heads == 16 && num_kv_heads == 8 && head_dim == 128 &&
+                q_ws[0].scalar_type() == at::kByte &&
+                ((action_mlp_cores == v3::NUM_CORES && num_kv_heads == 8) ||
+                 (action_mlp_cores == 4 && num_kv_heads == 4)) &&
+                num_q_heads == 16 && head_dim == 128 &&
                 hidden_size == 1024 && intermediate_size == 2048 && chunk_size == 51 && eps == 1e-5,
-                "HyVLA NVFP4 requires the exact TP8 32-layer packed-Byte/FP8-scale Action profile");
+                "HyVLA NVFP4 requires the exact TP8 (or reduced four-core KV4) 32-layer "
+                "packed-Byte/FP8-scale Action profile");
     HyVlaExpertRegistry::get(handle, "rpu_hyvla_expert_set_weights_nvfp4")
         ->set_weights_expert(
             q_w, k_w, v_w, o_w, q_norm, k_norm, input_norm, post_norm,
@@ -3200,6 +3421,13 @@ void rpu_hyvla_expert_unroll_forward(
         ->unroll_forward(x0_rpu, k_caches, v_caches, state_emb, cos, sin,
                          attn_mask_4d, x_traj, dt, prefix_len, num_steps,
                          planned_stage_descriptor, inputs_published, noise_cpu);
+}
+
+void rpu_hyvla_expert_prepare_persistent_spm(
+    int64_t handle, int64_t seq_len, int64_t prefix_len,
+    int64_t mask_kv_len) {
+    HyVlaExpertRegistry::get(handle, "rpu_hyvla_expert_prepare_persistent_spm")
+        ->prepare_persistent_spm_for_shape(seq_len, prefix_len, mask_kv_len);
 }
 
 std::vector<int64_t> rpu_hyvla_expert_resolve_stage_domain(

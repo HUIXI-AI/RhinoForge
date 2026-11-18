@@ -282,7 +282,7 @@ def install_runtime(monkeypatch):
     monkeypatch.setattr(
         runtime,
         "swizzle_decoder_and_ple",
-        lambda raw, geom: ({"q": []}, {}),
+        lambda raw, geom, **kwargs: ({"q": []}, {}),
     )
     monkeypatch.setattr(runtime, "compute_side_input", lambda *a, **k: _FakeTensor())
     monkeypatch.setattr(

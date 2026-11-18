@@ -512,7 +512,9 @@ def patch_gemma2_model_for_rpu_all_layers_once(model: Any) -> int:
                 "Gemma2 device path requires exactly one of input_ids or inputs_embeds"
             )
         if input_ids is not None:
-            inputs_embeds = self.embed_tokens(input_ids.cpu())
+            # HF 5.19 embeds the Gemma scale in an Embedding subclass; this
+            # adapter applies it below for both token and embedding inputs.
+            inputs_embeds = torch.nn.Embedding.forward(self.embed_tokens, input_ids.cpu())
             inputs_embeds = inputs_embeds.to(dtype=torch.float16, device="rpu")
 
         hidden_states = inputs_embeds.to(dtype=torch.float16, device="rpu").contiguous()

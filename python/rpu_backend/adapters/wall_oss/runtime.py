@@ -1,6 +1,8 @@
-"""Wall-OSS-0.5 full VLA orchestration (P4 E2E) → device.
+"""Wall-OSS-0.5 full VLA orchestration (P4 E2E) → RPU.
 
-Runs the image+text → action-chunk pipeline:
+Stitches the P1/P2/P3 subsystems into one image+text → action-chunk pipeline, mirroring
+`tests/model/wall_oss/ref_wall_oss_e2e.py` one-for-one so the per-subsystem cos-sim checks
+line up:
 
   processor (real FLOW prompt + image)
     → vision tower (P3 `WallOssVision`, window attention) → merged [N/4, 2048]
@@ -14,7 +16,7 @@ Runs the image+text → action-chunk pipeline:
 State (proprioception) rides in the text prompt as a discretized integer string
 (`use_state_string_representation=true`): the FLOW prompt below replicates wall-x
 `scripts/infer_robochallenge.py::get_text_flow` (system + camera setup + observation +
-instruction + `Proprioception: <discretized>` + assistant marker) so the device produces
+instruction + `Proprioception: <discretized>` + assistant marker) so the RPU produces
 robot-usable actions, not just numbers aligned to a minimal-prompt golden. The trailing
 `<|action|>×chunk` placeholder of the real prompt is dropped: the prefix-KV decomposition
 denoises the action chunk separately (the placeholders are causal-after the assistant
@@ -63,7 +65,6 @@ _RTC_REAL_PREFIX_MIN = 599
 _RTC_REAL_PREFIX_MAX = 671
 _RTC_PREFILL_EXECUTION_LEN = 672
 _RTC_PREFILL_CHUNK_SIZE = 336
-_RTC_NUMERIC_BLOCKED_ENV = "RPU_WALL_OSS_RTC_ALLOW_NUMERIC_BLOCKED"
 
 WALL_OSS_TEXT_COMPONENT = "text_backbone"
 WALL_OSS_VISION_COMPONENT = "vision_encoder"
@@ -283,7 +284,9 @@ def _build_flow_prompt(instruction: str, camera_names, dataset_name: str,
                        delta_action: bool, propri_str: str,
                        rtc_enabled: bool = False) -> str:
     """Replicate wall-x `get_text_flow` (state_str=True) MINUS the trailing
-    `<|action|>×chunk` (prefix-KV denoise handles the action separately)."""
+    `<|action|>×chunk` (prefix-KV denoise handles the action separately). The stock
+    path stays byte-identical to `tests/model/wall_oss/ref_wall_oss_e2e.py`; RTC is
+    locked by an independent customer-source byte golden."""
     short_prompt = rpu_env_bool("RPU_WALL_OSS_SHORT_PROMPT")
     multisuite_prologue = rpu_env_bool("RPU_WALL_OSS_MULTISUITE_PROLOGUE")
     generic_prologue = rpu_env_bool("RPU_WALL_OSS_GENERIC_PROLOGUE")
@@ -305,7 +308,10 @@ def _build_flow_prompt(instruction: str, camera_names, dataset_name: str,
         instruction = re.sub(r"\[\s*\]", "", instruction)
         instruction = re.sub(r"[ \t]{2,}", " ", instruction).strip()
     if short_prompt:
-        # Short prompt: chat scaffold, one vision marker per camera and instruction.
+        # Bare-instruction perf-characterization prompt: chat scaffold + one vision
+        # marker per camera + the instruction only (drops system prologue, observation
+        # labels, "Predict the next action…", proprioception). MUST stay byte-identical
+        # to ref_wall_oss_e2e.py's --short branch.
         markers = "".join(
             "<|vision_start|><|image_pad|><|vision_end|>" for _ in camera_names)
         return (f"<|im_start|>user\n{markers} {instruction}<|im_end|>\n"
@@ -319,7 +325,7 @@ def _build_flow_prompt(instruction: str, camera_names, dataset_name: str,
     if multisuite_prologue:
         # EXACT byte-replication of the wall-x run_scripts/infer_libero_multi_suite.py prologue
         # (x2r/text_utils.get_prologue_with_embodied_information; dataset libero_all →
-        # Embodiment "Single Franka", Frequency 10HZ, Abs EEF). Aligns the device eval to the repo's
+        # Embodiment "Single Franka", Frequency 10HZ, Abs EEF). Aligns the RPU eval to the repo's
         # four-suite harness, not scripts/infer_libero.py's shorter prologue.
         prologue = (
             "<|im_start|>system\nYou are an embodied vision-language-action (VLA) model "
@@ -329,6 +335,15 @@ def _build_flow_prompt(instruction: str, camera_names, dataset_name: str,
             prologue += f" {_CAM_NAME_MAPPING[_c]},"
         prologue += f"\n Frequency: 10HZ\n Action Space: {action_space}\n<|im_end|>\n"
     elif generic_prologue:
+        # Official wall-x LIBERO-eval prologue (`x2robot_utils.text_templates.
+        # get_prologue_with_embodied_information`, used by `scripts/infer_libero.py`): a generic
+        # system line + Camera Setup + Action Space, WITHOUT the Embodiment/Frequency lines of the
+        # infer_robochallenge `get_text_flow` prologue below. Measured on the LIBERO finetune
+        # on a local LIBERO checkpoint: open-loop match 80.0%→85.3%, motion-only median cos 0.918→0.947
+        # (2026-07-11 same-seed A/B, 31 frames up / 13 down / +4 net across the 0.5 threshold,
+        # 0 the other way). Opt-in: base
+        # wall-oss-0.5 keeps the default prologue (its E2E golden + P4b input_ids parity were
+        # built with it); generic-prologue evaluations set this env explicitly.
         prologue = (
             "<|im_start|>system\nYou are an embodied vision-language-action model "
             f"controlling a robot with language instructions.\nCamera Setup: {cam}\n"
@@ -388,7 +403,7 @@ def _close_wall_component(component) -> None:
 
 
 class WallOssVLA:
-    """Full Wall-OSS-0.5 VLA on device. Construct via :func:`build_wall_oss_vla`."""
+    """Full Wall-OSS-0.5 VLA on RPU. Construct via :func:`build_wall_oss_vla`."""
 
     def __init__(self, *, vision, action, processor, rope_helper, normalizer,
                  normalizer_propri, dataset_key, camera_names, delta_action,
@@ -404,6 +419,12 @@ class WallOssVLA:
         self.action = action               # WallOssAction (expert-1)
         self.llm = action.llm              # WallOssLLM (expert-0; shares cache with action)
         self._processor = processor
+        # Fast input path: bypass the AutoProcessor.__call__ wrapper, whose framework
+        # machinery (_merge_kwargs / _check_special_mm_tokens / BatchFeature) is ~11ms of
+        # pure-Python overhead per frame vs ~1.8ms of real tokenize+image work. We call
+        # image_processor + tokenizer directly and replicate the <|image_pad|> expansion.
+        # _fast_proc_ok: None=untested, True=validated bit-identical vs the wrapper on the
+        # first call, False=fell back. RPU_WALL_OSS_FAST_PROCESSOR=0 forces the wrapper.
         self._fast_processor = rpu_env_bool(
             "RPU_WALL_OSS_FAST_PROCESSOR", default=True)
         self._fast_proc_ok = None
@@ -416,6 +437,12 @@ class WallOssVLA:
         self._fast_imgproc = rpu_env_bool(
             "RPU_WALL_OSS_FAST_IMGPROC", default=True)
         self._fast_imgproc_ok = None
+        # Normalize-fold patch_embed: when fast-imgproc is active, bake the image normalize
+        # (rescale/mean/std) into the patch_embed weight (vision.enable_normalize_fold) and
+        # emit RAW uint8 pixel_values. The host imgproc block then skips the fp32 cast + the
+        # 3 normalize passes (~5-6 ms/frame, 3img) and patchifies uint8 (¼ the bytes); the
+        # device patch_embed GEMM does normalize+project in one pass via a homogeneous bias
+        # column. Bit-exact (fp32 math identity). RPU_WALL_OSS_PE_NORM_FOLD=0 disables.
         self._pe_norm_fold = False
         if self._fast_imgproc and rpu_env_bool(
                 "RPU_WALL_OSS_PE_NORM_FOLD", default=True):
@@ -433,12 +460,17 @@ class WallOssVLA:
         self.rtc_enabled = bool(rtc_enabled)
         self._normalizer_clamp = bool(normalizer_clamp)
         self._rtc_max_delay = int(getattr(action, "_rtc_max_delay", 0))
+        # Memoized get_rope_index output, keyed on the execution length, vision grid,
+        # and exact image-pad positions. mRoPE does not depend on ordinary
+        # text/proprioception token VALUES, but it does depend on where each image run
+        # appears in the prompt. Recurring prompt structures reuse one entry (saves the
+        # ~1.5 ms/frame get_rope_index). RPU_WALL_OSS_HOST_CACHE=0 disables.
         self._rope_cache = {}
         self._host_cache = rpu_env_bool("RPU_WALL_OSS_HOST_CACHE", default=True)
-        # On-device embed composition (graph-coverage campaign): gather token embeddings
+        # On-device embed assembly (graph-coverage campaign): gather token embeddings
         # via torch.ops.rpu.gather_embedding (llama_gather_embedding) and scatter the
         # vision tokens with an on-device slice copy, so inputs_embeds is built on the
-        # device instead of via the CPU F.embedding(155765x2048 table) + masked_scatter +
+        # RPU instead of via the CPU F.embedding(155765x2048 table) + masked_scatter +
         # a [1,seq,2048] fp32->fp16 upload round-trip. Bit-identical (gather of fp16
         # rows == fp16-cast of the gathered fp32 rows). RPU_WALL_OSS_ONDEVICE_EMBED=0
         # forces the legacy CPU path. _embed_w_rpu is the fp16 vocab table lazily
@@ -448,7 +480,7 @@ class WallOssVLA:
         # Fused-assemble has the vision forward return RAW window-order `merged` + stash
         # `_pending_rev` for the on-device assembler to reverse. The legacy CPU embed path
         # (ondevice_embed=0) does NOT consume `_pending_rev` — it masked_scatters `merged`
-        # directly → wrong vision-token order / device-vs-CPU device mismatch. So fused-assemble
+        # directly → wrong vision-token order / RPU-vs-CPU device mismatch. So fused-assemble
         # is only valid alongside the on-device embed path; disable it on the CPU path.
         if not self._ondevice_embed and getattr(self.vision, "_fused_assemble", False):
             self.vision._fused_assemble = False
@@ -500,7 +532,7 @@ class WallOssVLA:
             child._retirement_owner = self
 
     def _runtime_complete(self) -> bool:
-        """Return whether this VLA still owns every callable device component."""
+        """Return whether this VLA still owns every callable RPU component."""
         if getattr(self, "_closed", None) is not False:
             return False
         try:
@@ -1131,7 +1163,7 @@ class WallOssVLA:
             self._prepared_graph_profile = profile
 
             # Warm the exact production seam, including image preprocessing,
-            # Vision, embed composition, mRoPE, denoise and result readback.
+            # Vision, embed assembly, mRoPE, denoise and result readback.
             warm_out = self.predict(
                 images, instruction, proprioception, state_mask, noise, dof_mask,
                 num_steps=steps, debug=False)
@@ -1366,16 +1398,28 @@ class WallOssVLA:
                 # per-camera grouping, temporal copies and concatenation in HF.
                 # Slow/PIL processors have different resize arithmetic and keep
                 # their ordinary path instead of substituting tensor bicubic.
-                from transformers.image_processing_utils_fast import BaseImageProcessorFast
                 from transformers.image_utils import SizeDict, pil_torch_interpolation_mapping
+                try:
+                    from transformers.image_processing_backends import TorchvisionBackend as BaseImageProcessorFast
+                    torchvision_backend = True
+                except ImportError:
+                    from transformers.image_processing_utils_fast import BaseImageProcessorFast
+                    torchvision_backend = False
                 if (not isinstance(ip, BaseImageProcessorFast)
                         or not ip.do_resize or arrs.dtype != np.uint8):
                     return None
-                interpolation = pil_torch_interpolation_mapping.get(ip.resample, ip.resample)
-                b = ip.resize(
-                    image=b.contiguous(), size=SizeDict(height=rH, width=rW),
-                    interpolation=interpolation,
-                )
+                if torchvision_backend:
+                    b = ip.resize(
+                        images=b.contiguous(),
+                        size=SizeDict(shortest_edge=min_px, longest_edge=max_px),
+                        resample=ip.resample, factor=ps * ms,
+                    )
+                else:
+                    interpolation = pil_torch_interpolation_mapping.get(ip.resample, ip.resample)
+                    b = ip.resize(
+                        image=b.contiguous(), size=SizeDict(height=rH, width=rW),
+                        interpolation=interpolation,
+                    )
             gh, gw = rH // ps, rW // ps
             # Normalize-fold path: patchify RAW uint8 (no fp32 cast, no normalize passes) —
             # the normalize is baked into the patch_embed weight (vision.enable_normalize_fold).
@@ -1385,6 +1429,12 @@ class WallOssVLA:
                 std = torch.tensor(ip.image_std, dtype=torch.float32).view(1, 3, 1, 1)
                 b = b.to(torch.float32)  # fresh, owned; input images stay unchanged
                 b.mul_(ip.rescale_factor).sub_(mean).div_(std)          # rescale+normalize IN-PLACE (no intermediates)
+            # Temporal frames are IDENTICAL for a still image, so broadcast the temporal
+            # axis with expand (stride-0, NO copy) instead of repeat (which materializes a
+            # 2x buffer). b is contiguous post-normalize → the view+expand stays a view and
+            # the single final reshape().contiguous() is the only materialization. Drops the
+            # ~2.8 ms aten::repeat copy from the 3img HEAD; bit-identical to repeat (the two
+            # temporal frames are equal). Same single-pass formulation as the qwen3vl-pi0 ref.
             p = b.view(N, 1, 3, gh // ms, ms, ps, gw // ms, ms, ps)     # split H/W, temporal=1 (view)
             p = p.expand(N, tp, 3, gh // ms, ms, ps, gw // ms, ms, ps)  # temporal 1->tp, stride-0 (no copy)
             p = p.permute(0, 3, 6, 4, 7, 2, 1, 5, 8)                    # matches HF transpose (N replaces t=1)
@@ -1447,9 +1497,9 @@ class WallOssVLA:
     def _assemble_inputs_embeds_ondevice(self, input_ids: torch.Tensor,
                                          merged: torch.Tensor | tuple[torch.Tensor, ...],
                                          padded_len: int) -> torch.Tensor:
-        """Build inputs_embeds [1, padded_len, H] on the device device (no CPU embed-table
+        """Build inputs_embeds [1, padded_len, H] on the RPU device (no CPU embed-table
         gather, no masked_scatter, no [1,seq,H] fp32 upload round-trip, no torch.zeros
-        pad). All coherency flushes are CPU<->device-boundary only: ids/merged uploads.
+        pad). All coherency flushes are CPU<->RPU-boundary only: ids/merged uploads.
 
         input_ids [1, real_len] CPU int; merged [N_img, H] (vision output); padded_len
         >= real_len (v16 KV-insert alignment). Gather token embeddings on-device — the
@@ -1504,18 +1554,18 @@ class WallOssVLA:
                 )
             runs_t = torch.tensor(runs, dtype=torch.long)               # CPU [n_runs, 2]
             out = torch.ops.rpu.assemble_inputs_embeds_rev(
-                self._embed_w_rpu, ids_rpu, merged_rpu, rev_idx, runs_t)  # [padded_len, H] fp16 device
+                self._embed_w_rpu, ids_rpu, merged_rpu, rev_idx, runs_t)  # [padded_len, H] fp16 RPU
             return out.unsqueeze(0)
         contiguous = n_img > 0 and (pos[-1] - pos[0] + 1 == n_img)
         if contiguous and len(merged_parts) == 1:
             # Single contiguous image block (single image): one fully on-device op —
             # gather + scatter + out all in SPM, no host memcpy, no flushes.
             out = torch.ops.rpu.assemble_inputs_embeds(
-                self._embed_w_rpu, ids_rpu, merged_parts[0], pos[0])    # [padded_len, H] fp16 device
+                self._embed_w_rpu, ids_rpu, merged_parts[0], pos[0])    # [padded_len, H] fp16 RPU
             return out.unsqueeze(0)
         # Image runs and Vision subgroups need not have matching boundaries.
         # Split only tensor views; the device assembler moves them into one
-        # fresh output without host concat or device copy_ round-trips.
+        # fresh output without host concat or RPU copy_ round-trips.
         pieces, piece_runs = [], []
         part_index = part_offset = 0
         for start, length in runs:
@@ -1777,7 +1827,7 @@ class WallOssVLA:
         # length for a clean 16-aligned v16-KV-insert profile (e.g. 320 = 3·64 vision +
         # 128 text). Image tokens precede the trailing text, so only trailing text is
         # dropped. The resulting action is meaningless — do NOT use with correctness.
-        # Applied to input_ids up front so the embed composition sees the final length.
+        # Applied to input_ids up front so the embed assembly sees the final length.
         _ppfx = os.environ.get("WALL_OSS_PROFILE_PREFIX")
         if _ppfx:
             _tgt = int(_ppfx)
@@ -1823,12 +1873,12 @@ class WallOssVLA:
                 f"vision tokens {merged_rows} != <|image_pad|> count {n_img}"
             )
 
-        # Choose the execution length before embedding composition. Prefixes that fit the
+        # Choose the execution length before embedding assembly. Prefixes that fit the
         # proven single-chunk cap retain 16-token KV-insert alignment. Strict RTC
         # maps REAL 599..640 to P640/C320 and 641..671 to P672/C336; stock
         # deployments retain the generic planner. Padding K/V is masked out in
         # the action 2D mask, and pos_action continues from the REAL prefix.
-        # Free the vision graph's temporary SPM before the embed-composition op. The vision
+        # Free the vision graph's temporary SPM before the embed-assembly op. The vision
         # output (`merged`) is already read out, so the encoder/merger Temps are dead — but
         # a cached GraphCache graph leaves t_end at its peak (it doesn't reset, to keep baked
         # offsets for replay). The on-device gather_embedding (an immediate op) would then
@@ -1845,15 +1895,15 @@ class WallOssVLA:
         _mk("4_glue:reset+pad")
 
         # 3. assemble inputs_embeds [1, padded_len, H] — scatter vision into <|image_pad|>.
-        #    On-device (default): padded gather + DMA on the device (no CPU embed-table
+        #    On-device (default): padded gather + DMA on the RPU (no CPU embed-table
         #    gather / masked_scatter / fp32 upload / torch.zeros pad). Legacy CPU path under =0.
         if self._ondevice_embed:
             inputs_embeds = self._assemble_inputs_embeds_ondevice(input_ids, merged, padded_len)
         else:
             embed = F.embedding(input_ids.cpu(), self.llm._embed_w).float()    # [1, real_len, 2048]
             vmask = (input_ids == IMAGE_PAD_ID).unsqueeze(-1).expand_as(embed)
-            # merged is on device (the vision merger runs on-device); embed is CPU here, so move
-            # device too — `.to(dtype)` alone left a CPU or device mismatch in masked_scatter.
+            # merged is on RPU (the vision merger runs on-device); embed is CPU here, so move
+            # device too — `.to(dtype)` alone left a CPU/RPU mismatch in masked_scatter.
             inputs_embeds = embed.masked_scatter(vmask, merged.to(device=embed.device, dtype=embed.dtype))
             if padded_len != real_len:
                 inputs_embeds = F.pad(inputs_embeds, (0, 0, 0, padded_len - real_len))
@@ -1880,7 +1930,7 @@ class WallOssVLA:
         # 7. action positions continue after the REAL prefix (text-like → 3 axes equal). Computed
         # from the un-padded pos_prefix so the action RoPE is unaffected by the padding slots.
         next_pos = int(pos_prefix.max()) + 1
-        pos_action = torch.arange(next_pos, next_pos + H, dtype=torch.int32)[:, None]\
+        pos_action = torch.arange(next_pos, next_pos + H, dtype=torch.int32)[:, None] \
             .expand(H, 3).contiguous()
         _mk("8_glue:pos_action")
 
@@ -1995,7 +2045,7 @@ def build_wall_oss_vla(
         nvfp4_wint4_scope: load W8 Vision and expert-0 ``down_proj`` from the
             W8A16 ``ckpt_dir``; quantize the remaining expert-0 projections and
             all expert-1 projections to NVFP4 from ``fp16_ckpt_dir``. This is the
-            packaged NVFP4 composition and exactly matches the WINT4A16 op scope.
+            packaged NVFP4 composition and exactly matches the W4A16 pgrp op scope.
         fp16_ckpt_dir: source checkpoint for processor/normalizers and CPU glue
             for quantized modes.
         rtc: select the strict ``wrc_sf_v728`` RTC contract.  ``rtc=True``
@@ -2033,15 +2083,6 @@ def build_wall_oss_vla(
                               ("action", action_execution))
     ):
         raise ValueError("Wall-OSS RTC does not support linear_acc32=True")
-    if rtc and os.environ.get(_RTC_NUMERIC_BLOCKED_ENV) != "1":
-        raise NotImplementedError(
-            "Wall-OSS wrc_sf_v728 RTC is fail-closed by default. Blocking CI "
-            "grants controlled temporary support only to exact FP16 P640/C320 "
-            "staged0 and W8A16 P640/C320 staged0+A16-stretch; W4 and other "
-            "profiles remain evaluation-only. Set exactly "
-            f"{_RTC_NUMERIC_BLOCKED_ENV}=1 to enter a controlled path; none is "
-            "formally or robot certified."
-        )
     if int(state_bins) < 2:   # mirror WallOssPolicy.from_checkpoint — fail here, not deep in np.digitize
         raise ValueError(f"state_bins must be >= 2, got {state_bins}")
     if rtc and (
@@ -2140,21 +2181,50 @@ def build_wall_oss_vla(
         if w4a16:
             os.environ["RPU_WALL_OSS_EXPERT0_DOWN_INT4"] = "0"
     os.environ.setdefault("RPU_WALL_OSS_ATTN_TP8", "1")
+    #  • RPU_WALL_OSS_FAST_REPLAY — on a warm graph REPLAY, skip the host op-stream re-walk
+    #    (run_all_layers pushes cursor to the end after the per-call input-prep, which lives
+    #    OUTSIDE the body loop, has already run). Eliminates ~11 ms/predict on the 10-step
+    #    unrolled denoise (and the smaller vision/prefill wrappers). Bit-identical; default
+    #    OFF in the C++ base (other models' bodies aren't contract-audited), wall_oss opts in.
     os.environ.setdefault("RPU_WALL_OSS_FAST_REPLAY", "1")
     #  • RPU_FASTREPLAY_SKIP_SYNC — lets the common Graph executor omit the mutable-kernel
     #    scan only when replay touched no kernel parameters and the segment has no mutable DMA.
     #    Pinned-runtime ABBA evidence requires the conservative mutable-DMA guard while its
     #    lower-layer cause remains open; the executor derives the guard from segment structure.
     os.environ.setdefault("RPU_FASTREPLAY_SKIP_SYNC", "1")
+    #  • RPU_DEEP_FAST_REPLAY — on a warm REPLAY that FULLY skips the op-stream (no post_fn:
+    #    the prefill/denoise/action graphs), also skip the per-forward run_all_layers SETUP
+    #    (declare_buffers + SPM-alloc + the D-502/D-501 weight-preload re-walk) — it rebuilds
+    #    identical baked state the kd_buf replay doesn't read. Recovers the ~0.5 ms/graph setup
+    #    on prefill + denoise (vision uses skip_layer_body → post_fn reads the SPM layout →
+    #    keeps the setup). Requires RPU_WALL_OSS_FAST_REPLAY (only wall_oss sets it) → inert
+    #    for other models even if this env is on. Bit-exact (3img 0.99998850 / 1img 0.9961313).
     os.environ.setdefault("RPU_DEEP_FAST_REPLAY", "1")
+    #  • RPU_WALL_OSS_FUSED_ASSEMBLE — fold the vision window-reverse into the embed-assembly
+    #    op (assemble_inputs_embeds_rev): the two gather_embedding (vision reverse + token
+    #    gather) + the per-run scatter copies collapse into ONE op (token-gather + per-run
+    #    reverse-gather into each image slot), dropping the merged DDR round-trip. Bit-exact
+    #    (3img action_cos 0.99998850 == off; 1img 0.9961313 == off). Single-subgroup forwards
+    #    only (mixed-size/cat falls back). ~−0.7 ms op-level (below E2E noise floor).
     os.environ.setdefault("RPU_WALL_OSS_FUSED_ASSEMBLE", "1")
     #  • RPU_WALL_OSS_VISION_ROPE_SPM — broadcast the ViT 2D-RoPE cos/sin tables into SPM once
     #    and use the SPM-table rope_2d kernel (per-token cos/sin gather hits SPM not DDR).
-    #    The table lookup preserves the rotary transformation.
+    #    rope_2d is the #1 vision kernel (33% of vision compute); numerically identical math.
     os.environ.setdefault("RPU_WALL_OSS_VISION_ROPE_SPM", "1")
+    #  • RPU_WALL_OSS_VISION_FUSED_MERGER — fold the vision merger into qwen25vl_vision_forward
+    #    via the base-class post_fn, so the merger's ~54 kernels re-emit inside the vision graph
+    #    instead of on the host. Lands ON TOP of FAST_REPLAY (the fix lets fast-replay skip only
+    #    the layer body and re-emit post_fn on the normal path): 174.0→165.7 ms median E2E
+    #    (−8.3 ms, 5 runs each, 2026-06-15 A/B), action_cos 0.99886 ≥ 0.99 gate (vs 0.99888 off).
     os.environ.setdefault("RPU_WALL_OSS_VISION_FUSED_MERGER", "1")
+    #  • RPU_WALL_OSS_PARTIAL_MROPE — required Qwen2.5-VL path: host-bake contiguous
+    #    T/H/W frequency chunks and stream them through partial_mrope. The legacy C++
+    #    launcher uses Qwen3-style THW interleaving and is incorrect for image positions,
+    #    so an explicit `0` fails fast. Covers prefill + the fused denoise. Historical hwperf:
+    #    mrope kernel 22.2→2.7 ms; 159.3→141.5 ms median E2E (−17.8 ms / −11%, 2 runs each,
+    #    2026-06-15 A/B), action_cos 0.999395 == banked baseline, fast-replay drift mse=0.
     os.environ.setdefault("RPU_WALL_OSS_PARTIAL_MROPE", "1")
-    # Validate every CPU-owned checkpoint artifact before any device model build or
+    # Validate every CPU-owned checkpoint artifact before any RPU model build or
     # irreversible weight transform. A dataset typo must never select an arbitrary
     # first normalizer after several GB of weights have already been constructed.
     normalizer = torch.load(

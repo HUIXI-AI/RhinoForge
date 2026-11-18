@@ -1,0 +1,34 @@
+# 未写出的执行参数（省略即按以下值运行）：
+#   [cpu].threads 省略时本入口使用 8。
+#   rpu_execution.model.num_cores 固定 8 核（可显式写 8；4/6 核不支持，原因见模型页配置表）。
+#   分块（chunk_size）模板未写出，按 auto 由入口选择；2026-10-31 模板默认输入 8 核实测：prefill 400。可调范围见模型页。
+# Pi0.5 统一入口：按精度、输入和核数自动选择执行路径。
+[model]
+target = "pi05"
+# 本文件的权重/计算配方；切换精度须同时使用对应权重。
+precision = "w8a16_action_nvfp4"
+# 替换为匹配本模型与量化配方的本地资产路径或既有权重别名。
+checkpoint = "/path/to/pi05_h10_action_nvfp4"
+
+[input]
+# 替换为匹配下列输入形状的文件；固定 fixture 须保留其身份与格式。
+batch = "/path/to/pi05_3cam_t32_batch.pt"
+# 可选 2 / 3；真实图像数量与输入 tensor 必须同步修改。
+cameras = 3
+# 语言存储宽度可选 32 / 64 / 96 / 128 / 160；4/6 核仅 FP16/W8、T32（2 或 3 相机）。
+text_tokens = 32
+# 当前模型路径的固定去噪步数，不作为任意可调范围。
+num_steps = 10
+# 动作序列长度（action horizon）可选 10 / 50；由权重决定，须与 checkpoint 的 chunk_size 一致。
+action_horizon = 10
+# noise = "/path/to/fixed_cpu_noise.pt"
+
+[run]
+# 预热次数；不计入正式测量。
+warmup = 2
+# 正式执行次数，正整数。
+runs = 5
+# 随机种子，非负整数。
+seed = 0
+# 结果输出目录；并发运行使用不同目录。
+output_dir = "./pi05_results/3cam/h10/w8a16_action_nvfp4"

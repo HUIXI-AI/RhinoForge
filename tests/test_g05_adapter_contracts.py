@@ -1130,8 +1130,10 @@ def test_qwen35_shared_vision_validates_profile_before_mutation():
         "_QWEN3_5_VISION_PROFILES | _QWEN3_5_VISION_CANDIDATE_PROFILES"
         in install
     )
+    # Since 2026-10-20 the cold execution config (or the legacy variable)
+    # requests Vision through one shared predicate.
     numeric_gate = install.index(
-        'os.environ.get("QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED")'
+        "and not qwen35_vision_requested(execution_config)"
     )
     marker = install.index("vision_model._rpu_vision_installing = True")
     handle = install.index("torch.ops.rpu.qwen3_5_vision_create()")

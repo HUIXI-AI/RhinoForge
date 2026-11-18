@@ -73,8 +73,9 @@ int64_t estimate_temporary_total(const std::vector<BufferDecl>&) { return 16; }
 bool prefer_balanced_chunk(int64_t, int64_t candidate, int64_t current) { return candidate > current; }
 __SHAPE_CHECKS__
 }
-int64_t available_temporary_spm_after_reset(const std::vector<BufferDecl>&, bool) { return 8 << 20; }
-bool final_chunk_layout_fits(const std::vector<BufferDecl>&, bool) { return true; }
+int64_t probe_budget = 8 << 20;
+int64_t available_temporary_spm_after_reset(const std::vector<BufferDecl>&, bool, int64_t) { return probe_budget; }
+bool final_chunk_layout_fits(const std::vector<BufferDecl>&, bool, int64_t) { return true; }
 __FUNCTIONS__
 struct Stage { std::vector<ChunkInfo> chunks; };
 struct FmbPrefillStageCandidate {
@@ -95,7 +96,9 @@ int64_t descriptor_admission(FusedModelBase::Impl& state,
         const FmbPrefillStageCandidate* planned_stage_candidate,
         int64_t seq_len, int64_t position) {
     auto* pimpl_ = &state;
-    const bool prepared_candidate = false;
+    // This harness passes raw legacy candidates, never cached prepared plans.
+    // Keep the full request-local schedule checks on this path.
+    constexpr bool prepared_candidate = false;
     __SCHEDULE__
     __ADMISSION__
     return candidate.compute_chunk_size;
@@ -114,8 +117,69 @@ template<class F> void rejects(F&& function) {
     try { function(); } catch (const std::runtime_error&) { failed = true; }
     assert(failed);
 }
+void fixed_suffix_domain(int64_t physical_rows, int64_t capacity) {
+    // HALO M18 and LingBot2 M51 declarations require the complete suffix.
+    // The real enumerator must call the validity hook before decl_fn; using
+    // exceptions here also catches accidental future speculative declarations.
+    FusedModelBase::Impl state;
+    state.chunk_size_override_ = 0;
+    LayoutContext layout;
+    layout.is_causal = false;
+    int declarations = 0, validity_checks = 0;
+    auto valid = [&](int64_t candidate) {
+        ++validity_checks;
+        return candidate >= physical_rows;
+    };
+    auto declare = [&](const LayoutContext& ctx) {
+        ++declarations;
+        TORCH_CHECK(ctx.chunk_size >= physical_rows);
+        return std::vector<BufferDecl>{};
+    };
+    const auto probes = enumerate_chunk_size_domain_impl(
+        state, declare, valid, capacity, physical_rows, layout, true);
+    assert(probes.size() == static_cast<size_t>(capacity / 16));
+    assert(validity_checks == capacity / 16 && declarations == 1);
+    for (const auto& row : probes) {
+        if (row.chunk_size < physical_rows) {
+            assert(!row.valid && !row.fits);
+            assert(row.temporary_bytes == 0 && row.available_bytes == 0);
+        } else {
+            assert(row.chunk_size == capacity && row.valid && row.fits);
+            assert(row.temporary_bytes == 16 && row.available_bytes == probe_budget);
+        }
+    }
+    // Both auto and scalar EXACT find the legal padded capacity; their
+    // executed chunk still contains exactly M real rows, never C padded rows.
+    for (int64_t exact : {int64_t{0}, capacity}) {
+        declarations = validity_checks = 0;
+        int64_t resolved = 0;
+        const auto chunks = compute_chunks_impl(
+            state, declare, valid, capacity, physical_rows, 0, layout,
+            &resolved, exact);
+        assert(resolved == capacity && chunks.size() == 1);
+        assert(chunks.front().len == physical_rows);
+        assert(declarations == 1 && validity_checks == capacity / 16);
+    }
+    // Deferring declarations does not turn a valid but oversized candidate
+    // into a fit. No invalid candidate is measured even on the failure path.
+    probe_budget = 8;
+    declarations = 0;
+    int64_t resolved = 0;
+    rejects([&] { compute_chunks_impl(
+        state, declare, valid, capacity, physical_rows, 0, layout, &resolved); });
+    assert(declarations == 1);
+    probe_budget = 8 << 20;
+}
 int main(int argc, char** argv) {
     assert(argc == 2);
+    if (std::string(argv[1]) == "halo") {
+        fixed_suffix_domain(18, 32);
+        return 0;
+    }
+    if (std::string(argv[1]) == "v2") {
+        fixed_suffix_domain(51, 64);
+        return 0;
+    }
     const bool descriptor = std::string(argv[1]) == "descriptor";
     FusedModelBase::Impl state;
     auto request = [&](int64_t seq_len, int64_t position, int64_t capacity, bool causal) {
@@ -199,6 +263,14 @@ int main(int argc, char** argv) {
 
 @pytest.mark.parametrize("entry", ["scalar", "descriptor"])
 def test_decode_exact_resolves_legacy_policy_without_clamping_descriptor(native_exact_probe, entry):
+    env = dict(os.environ)
+    env.pop("RPU_CHUNK_FORCE_UNSAFE", None)
+    subprocess.run([str(native_exact_probe), entry], env=env,
+                   check=True, capture_output=True, text=True)
+
+
+@pytest.mark.parametrize("entry", ["halo", "v2"])
+def test_fixed_suffix_rejects_invalid_capacity_before_declarations(native_exact_probe, entry):
     env = dict(os.environ)
     env.pop("RPU_CHUNK_FORCE_UNSAFE", None)
     subprocess.run([str(native_exact_probe), entry], env=env,

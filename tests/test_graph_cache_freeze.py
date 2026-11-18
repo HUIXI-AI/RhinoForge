@@ -213,6 +213,29 @@ def test_ready_rejects_invalidated_or_nonreplayable_entry():
         cache.freeze()
 
 
+@pytest.mark.parametrize("admission", ["get_or_create", "capture"])
+def test_ready_rejects_rebuilt_signature_before_mutating_graph(admission):
+    cache, sig = _cache(), _sig("profile-a")
+    with cache.capture(sig):
+        pass
+    cache.freeze()
+    graph = cache.lookup(sig)
+    # The public borrowed Graph can be rebuilt under a different signature
+    # while its cache key stays unchanged. READY must reject before begin()
+    # discards that build, and before a caller refreshes mutable model state.
+    graph.begin("profile-b")
+    graph.end()
+    before = list(cache._impl.touches)
+    with pytest.raises(RuntimeError, match="matching built signature"):
+        if admission == "get_or_create":
+            cache.get_or_create(sig)
+        else:
+            with cache.capture(sig):
+                pytest.fail("READY signature mismatch reached capture body")
+    assert graph.state() == 2 and graph.built_signature() == "profile-b"
+    assert cache._impl.touches == before
+
+
 def test_clear_does_not_unfreeze_and_begin_warmup_explicitly_unfreezes():
     cache, sig = _cache(), _sig("profile-a")
     with cache.capture(sig):

@@ -1585,7 +1585,7 @@ class Gr00tN1d7VLA:
                   int(stats.segment_count))
         if (any(value <= 0 for value in values[:3]) or values[4] != 0
                 or values[5] <= 0 or values[6] <= 0
-                or stats.non_replayable_reason):
+                or entries[0].non_replayable_reason):
             raise RuntimeError("GR00T Z1 Graph execution identity is incomplete")
         return values
 
@@ -1631,7 +1631,10 @@ class Gr00tN1d7VLA:
         for phase, row in enumerate(rows[2:], 1):
             if (len(row) < 9 or row[0] != phase or row[1] != len(kinds)
                     or row[2] <= row[1] or len(row[8:]) != row[2] - row[1]
-                    or row[4] == 0 or any(kind not in (0, 8, 9) for kind in row[8:])
+                    or row[4] == 0 or any(kind not in (0, 5, 8, 9) for kind in row[8:])
+                    or tuple(index for index, kind in enumerate(row[8:]) if kind == 5)
+                        != ((0,) if phase in (1, 3) else ())
+                    or len(row[8:]) <= (1 if phase in (1, 3) else 0)
                     or row[3] != sum(1 << kind for kind in set(row[8:]))
                     or row[5:8] != tuple(row[8:].count(kind) for kind in (0, 8, 9))):
                 raise RuntimeError("GR00T Z1 recorded component range is malformed")
@@ -1640,19 +1643,23 @@ class Gr00tN1d7VLA:
         if (len(kinds) != context[8] or tuple(kinds.count(kind) for kind in (0, 8, 9))
                 != (stats.kernel_count, stats.dma_count, stats.barrier_count)):
             raise RuntimeError("GR00T Z1 ranges do not cover the actual Graph")
-        # SDK perf_batch_idx advances for Kernel/Dma, not Barrier. Keep the
+        # Native BUILD authenticated exactly the two descriptor-owned prefixes.
+        # SDK perf_batch_idx advances for Kernel/Dma, not metadata/Barrier. Keep the
         # actual node sequence and segment boundaries; node index is not a
         # packet index, and no historical kernel window assigns ownership.
         segments = tuple(stats.segment_census)
         cursor = 0
         for index, segment in enumerate(segments):
-            if (segment.segment_id != index or segment.start_idx != cursor
-                    or not cursor < segment.end_idx <= len(kinds)
-                    or tuple(kinds[cursor:segment.end_idx].count(kind) for kind in (0, 8, 9))
-                    != (segment.kernel_count, segment.dma_count, segment.barrier_count)):
+            start, end = segment.start_idx, segment.end_idx
+            if (segment.segment_id != index or not cursor <= start < end <= len(kinds)
+                    or any(kind != 5 for kind in kinds[cursor:start])
+                    or tuple(kinds[start:end].count(kind) for kind in (0, 8, 9))
+                    != (segment.kernel_count, segment.dma_count, segment.barrier_count)
+                    or kinds[start:end].count(5) != segment.manifest_metadata_count):
                 raise RuntimeError("GR00T Z1 ranges disagree with actual Graph segments")
-            cursor = segment.end_idx
-        if len(segments) != stats.segment_count or cursor != len(kinds):
+            cursor = end
+        if (len(segments) != stats.segment_count
+                or any(kind != 5 for kind in kinds[cursor:])):
             raise RuntimeError("GR00T Z1 ranges lack complete Graph segment coverage")
         return rows
 

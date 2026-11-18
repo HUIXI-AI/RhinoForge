@@ -1,4 +1,6 @@
-// rpu_gr00t_dit_model.cpp — GR00T-N1.7 flow-matching DiT action head.
+#include "rpu_specialized_linear_contracts.h"
+// rpu_gr00t_dit_model.cpp — GR00T-N1.7 flow-matching DiT action head
+//                            (v3 FusedModelBase subsystem, "New fused subsystem")
 //
 // 32-layer AlternateVLDiT with explicit block_is_cross per-layer flags:
 // self-attention operates on state/action tokens; cross-attention projects
@@ -37,7 +39,6 @@
 using namespace at;
 using namespace ::rhino_lkn;
 
-#define NUM_CORES 8
 #define DWIDTH 2
 
 static inline int64_t gr00t_pad16(int64_t n) { return ((n + 15) / 16) * 16; }
@@ -50,10 +51,37 @@ static inline int64_t gr00t_pad16(int64_t n) { return ((n + 15) / 16) * 16; }
 // per-channel multipliers, i.e. a silent numeric corruption rather than a crash.
 // The `else` leg is the reverse hole: an int8 weight with no scale list is read
 // back as fp16 by the kernel.
+//
+// W4A16 (RPU_GR00T_W4A16) block projections arrive as G32 pgrp-packed uint8
+// [N,K/2] with the controller-striped 2D fp16 scale. `w4_partition` is the
+// Linear partition the forward launches them with (1 column, 0 row); -1 means
+// the projection has no W4 route. The launcher re-checks the same ABI on every
+// call; this check fails at installation instead of on the first forward.
+static void check_gr00t_w4a16_projection(const at::Tensor& w, const at::Tensor& s,
+                                         int w4_partition, int64_t cores,
+                                         const char* ctx, const char* name, int64_t i) {
+    const int64_t n = w.size(0), k = w.size(1) * 2;
+    const bool col = w4_partition == 1;
+    TORCH_CHECK(cores > 0 && n % (col ? 16 * cores : 16) == 0 &&
+                    k % (col ? 64 : 64 * cores) == 0,
+                ctx, ": packed W4 ", name, "[", i, "] [", n, ",", k,
+                "] does not split into 16-aligned N and 64-aligned K over ", cores,
+                col ? " column" : " row", " lanes");
+    const int64_t local_g = (col ? k : k / cores) / 32;
+    const int64_t local_n = col ? n / cores : n;
+    const int64_t expected = cores * ((local_g + 3) / 4) * ((local_n + 63) / 64) * 256;
+    TORCH_CHECK(s.defined() && s.dim() == 2 && s.size(0) == 32 &&
+                    s.scalar_type() == at::kHalf && s.device().type() == at::kPrivateUse1 &&
+                    s.is_contiguous() && s.numel() == expected,
+                ctx, ": packed W4 ", name, "_scale[", i, "] must be the contiguous fp16 RPU "
+                "G32 pgrp payload of ", expected, " elements, got ", s.sizes());
+}
+
 static void check_gr00t_w8a16_scale_list(int64_t n_layers,
                                          const at::TensorList& weights,
                                          const at::TensorList& scales,
-                                         const char* ctx, const char* name) {
+                                         const char* ctx, const char* name,
+                                         int w4_partition = -1, int64_t cores = 0) {
     const bool quantized = !scales.empty();
     if (quantized) {
         TORCH_CHECK(static_cast<int64_t>(scales.size()) == n_layers,
@@ -64,9 +92,14 @@ static void check_gr00t_w8a16_scale_list(int64_t n_layers,
         const at::Tensor& w = weights[i];
         if (quantized) {
             const at::Tensor& s = scales[i];
+            if (w4_partition >= 0 && w.scalar_type() == at::kByte) {
+                check_gr00t_w4a16_projection(w, s, w4_partition, cores, ctx, name, i);
+                continue;
+            }
             TORCH_CHECK(w.scalar_type() == at::kChar,
-                        ctx, ": W8A16 mode requires int8 ", name, "[", i,
-                        "], got ", w.scalar_type());
+                        ctx, ": quantized ", name, "[", i, "] must be int8",
+                        w4_partition >= 0 ? " or packed uint8 W4" : "",
+                        ", got ", w.scalar_type());
             TORCH_CHECK(s.defined() && s.dim() == 1
                         && s.scalar_type() == at::kHalf
                         && s.device().type() == at::kPrivateUse1
@@ -77,8 +110,8 @@ static void check_gr00t_w8a16_scale_list(int64_t n_layers,
                         ctx, ": ", name, "_scale[", i, "].numel()=", s.numel(),
                         " != output dim=", w.size(0));
         } else {
-            TORCH_CHECK(w.scalar_type() != at::kChar,
-                        ctx, ": int8 ", name, "[", i,
+            TORCH_CHECK(w.scalar_type() != at::kChar && w.scalar_type() != at::kByte,
+                        ctx, ": quantized ", name, "[", i,
                         "] requires a non-empty scale list for this projection");
         }
     }
@@ -89,8 +122,8 @@ namespace v3 {
 namespace {
 
 // Stable descriptor identities. GR00T_DIT_FIXED_KERNEL_BASIS: every other
-// launch is fixed checkpoint math (normalization, activation, residual/Euler),
-// unconditional parameter preload or graph output transfer.
+// launch is fixed checkpoint math (normalization, activation, W4 row bias,
+// residual/Euler), unconditional parameter preload or graph output transfer.
 // Denoise-conditioned table/bias preloads and the other named sites are routes.
 constexpr int64_t GR00T_DIT_MASK_SCHEDULE_SITE = 4273136855374514935LL;
 constexpr int64_t GR00T_DIT_ADALN_TABLE_SCHEDULE_SITE = 4251372394969008273LL;
@@ -190,7 +223,8 @@ constexpr int64_t GR00T_DIT_DENOISE_BIAS_PRELOAD_SITE =
     941780559855581702LL;
 
 constexpr uint32_t GR00T_DIT_KV_CAPABILITIES =
-    KV_INSERT_CAP_V2 | KV_INSERT_CAP_V16 | KV_INSERT_CAP_PAD16;
+    KV_INSERT_CAP_V2 | KV_INSERT_CAP_V16 | KV_INSERT_CAP_PAD16 |
+    KV_INSERT_CAP_NON8_TP_V16;
 // Raw attention retains its DDR mirror unless the exact cold policy selects
 // descriptor-owned SPM-only K/V for this invocation.
 constexpr int64_t GR00T_DIT_KV_FLAG_DDR_MIRROR = 1;
@@ -231,6 +265,43 @@ public:
           ff1_resident_w8_opt_in_(gr00t_ff1_resident_w8_opt_in()),
           self_qkv_multibase_opt_in_(gr00t_self_qkv_multibase_opt_in()),
           ring_xor3_opt_in_(gr00t_ring_xor3_opt_in()) {}
+
+    // Cold execution topology. Must precede set_weights: the Python adapter
+    // swizzles every DiT Linear for this count. Eight keeps the historical
+    // layout and every TP8 fast path. Four admits only the exact GR00T N1.7
+    // DiT (32 blocks, 32 heads x D48, H1536, FF6144, cross 2048): 8 heads and
+    // 1536 FF channels per core, DDR KV with eight physical stripes. Raw-SPM
+    // attention, cross-KV reuse, the time/AdaLN tables, resident FF1, packed
+    // QKV, the XOR3 ring, SPM-only KV and Z2 stay eight-core only.
+    void set_execution_cores(int64_t cores) {
+        TORCH_CHECK(cores == 4 || cores == 8,
+                    "GR00T DiT execution cores must be 4 or 8");
+        TORCH_CHECK(layer_weights_.empty() && !denoise_ready_ && !z2_bound_ &&
+                        z2_prepared_seq_len_ == 0,
+                    "GR00T DiT execution cores must precede weights");
+        set_execution_core_count(static_cast<int>(cores));
+    }
+
+    std::vector<int64_t> execution_topology() const {
+        TORCH_CHECK(!layer_weights_.empty(),
+                    "GR00T DiT topology requires installed weights");
+        return {num_cores(), attn_tp(), mlp_tp(),
+                DecoderExecutionTopology::physical_kv_cores,
+                num_q_heads(), intermediate_size()};
+    }
+
+    DecoderExecutionTopology resolve_model_execution_topology(
+            int64_t nq, int64_t nkv, int64_t hd, int64_t h,
+            int64_t intermediate) const override {
+        if (num_cores() == 8)
+            return FusedModelBase::resolve_model_execution_topology(
+                nq, nkv, hd, h, intermediate);
+        TORCH_CHECK(num_cores() == 4 && nq == 32 && nkv == 32 && hd == 48 &&
+                        h == 1536 && intermediate == 6144,
+                    "no admitted reduced-core GR00T DiT profile: 4 cores "
+                    "require 32 heads, D48, H1536 and FF6144");
+        return {4, 4, 4};
+    }
 
     // ------------------------------------------------------------------ //
     // set_weights — per-layer DiT block weights + per-layer block type + global dims.
@@ -294,6 +365,8 @@ public:
         check_list(ff1_b_list,    "ff1_b",    1);
         check_list(ff2_b_list,    "ff2_b",    1);
 
+        TORCH_CHECK(num_cores() == 8 || (N == 32 && cross_dim == 2048),
+                    "reduced-core GR00T DiT requires 32 blocks and cross_dim 2048");
         // DiT: no GQA (num_kv_heads == num_q_heads), no separate intermediate for
         // the attention path; reuse the base param slots (intermediate_size = ff_inter).
         set_model_params(num_heads, num_heads, head_dim, hidden_size, ff_inter);
@@ -320,16 +393,29 @@ public:
         }
 
         // W8A16: attach per-output-channel scales for the 6 quantized GEMMs (q/k/v/out/ff1/ff2).
+        // W4A16 carries G32 pgrp-packed weights and striped scales through the same lists.
         // When the scale lists are empty the GEMMs stay fp16 (the rpu_linear kernel keys on the
-        // weight dtype + a defined scale). The per-embodiment encoders / AdaLN GEMV / glue stay fp16.
+        // weight dtype + a defined scale). The AdaLN GEMV has its own int8-only scale list.
         {
             const char* c = "gr00t_dit_set_weights";
-            check_gr00t_w8a16_scale_list(N, to_q_list,   to_q_scale_list,   c, "to_q");
-            check_gr00t_w8a16_scale_list(N, to_k_list,   to_k_scale_list,   c, "to_k");
-            check_gr00t_w8a16_scale_list(N, to_v_list,   to_v_scale_list,   c, "to_v");
-            check_gr00t_w8a16_scale_list(N, to_out_list, to_out_scale_list, c, "to_out");
-            check_gr00t_w8a16_scale_list(N, ff1_list,    ff1_scale_list,    c, "ff1");
-            check_gr00t_w8a16_scale_list(N, ff2_list,    ff2_scale_list,    c, "ff2");
+            const int64_t cores = num_cores();
+            // One precision for the six block projections of every layer: the scale
+            // fan-out below and the W8-only fused admissions read it from one tensor.
+            for (const at::TensorList* list : {&to_q_list, &to_k_list, &to_v_list,
+                                               &to_out_list, &ff1_list, &ff2_list}) {
+                for (int64_t i = 0; i < N; ++i) {
+                    TORCH_CHECK((*list)[i].scalar_type() == to_q_list[0].scalar_type(),
+                                "gr00t_dit_set_weights: block projections must share one precision, got ",
+                                (*list)[i].scalar_type(), " in layer ", i, " and ",
+                                to_q_list[0].scalar_type(), " for to_q[0]");
+                }
+            }
+            check_gr00t_w8a16_scale_list(N, to_q_list,   to_q_scale_list,   c, "to_q",   1, cores);
+            check_gr00t_w8a16_scale_list(N, to_k_list,   to_k_scale_list,   c, "to_k",   1, cores);
+            check_gr00t_w8a16_scale_list(N, to_v_list,   to_v_scale_list,   c, "to_v",   1, cores);
+            check_gr00t_w8a16_scale_list(N, to_out_list, to_out_scale_list, c, "to_out", 0, cores);
+            check_gr00t_w8a16_scale_list(N, ff1_list,    ff1_scale_list,    c, "ff1",    1, cores);
+            check_gr00t_w8a16_scale_list(N, ff2_list,    ff2_scale_list,    c, "ff2",    0, cores);
             check_gr00t_w8a16_scale_list(N, adaln_w_list, adaln_scale_list, c, "adaln_w");
         }
         if (!to_q_scale_list.empty()) {
@@ -438,7 +524,7 @@ public:
         // Own the schedule bytes as well as its derived table. Later callers
         // cannot mutate the original cond tensor behind the cold table.
         auto cond = cond_table_t_.clone();
-        auto table = rpu_gr00t_precompute_adaln(cond, weights, biases, scales);
+        auto table = rpu_gr00t_precompute_adaln(cond, weights, biases, scales, attn_tp());
         cond_table_t_ = std::move(cond);
         adaln_table_ = std::move(table);
         adaln_table_src_base_ = ::rhino_lkn::RpuGetDevAddr(adaln_table_.data_ptr());
@@ -747,23 +833,47 @@ public:
                     "gr00t denoise Z2: seq_len must be positive");
         TORCH_CHECK(!z2_bound_,
                     "gr00t denoise Z2: cannot prepare while a lease is active");
+        TORCH_CHECK(num_cores() == 8,
+                    "gr00t denoise Z2 is the eight-core profile only");
         if (!denoise_mode_ || !loop_mode_) {
             denoise_mode_ = true;
             loop_mode_ = true;
             invalidate_model_state();
         }
         vl_seq_ = seq_len;
+        // Freeze ordinary-versus-Z2 route eligibility before creating the
+        // COMPLETE child descriptor. Failed preparation restores the old state.
+        const int64_t previous_seq_len = z2_prepared_seq_len_;
+        z2_prepared_seq_len_ = seq_len;
+        bool prepared_committed = false;
+        auto rollback_prepared = c10::make_scope_exit([&] {
+            if (!prepared_committed) z2_prepared_seq_len_ = previous_seq_len;
+        });
         LayoutContext layout;
         layout.chunk_size = action_horizon_ + 1;
         layout.max_kv_seq_len = action_horizon_ + 1;
         layout.num_layers = num_layers();
         layout.use_attn_mask = false;
         layout.is_causal = false;
-        auto prepared = prepare_spm_pipeline_component(
-            layout, compose_fmb_default_three_stage_chunk_plan(
-                        layout, action_horizon_ + 1, /*position=*/0,
-                        ChunkMode::SEQUENTIAL));
-        z2_prepared_seq_len_ = seq_len;
+        const auto stage_plan = compose_fmb_default_three_stage_chunk_plan(
+            layout, action_horizon_ + 1, /*position=*/0, ChunkMode::SEQUENTIAL);
+        const auto manifest = physical_manifest_for_candidate(
+            stage_plan, layout, action_horizon_ + 1, action_horizon_ + 1, /*position=*/0);
+        const int64_t chunk_capacity = ((layout.chunk_size + 15) / 16) * 16;
+        auto descriptor = encode_fmb_prefill_stage_candidate({
+            stage_plan.input.plan.chunk_size, chunk_capacity,
+            chunk_capacity, stage_plan, manifest});
+        const auto candidate = prepare_stage_candidate(descriptor);
+        TORCH_CHECK(candidate->candidate().physical_manifest.state ==
+                        FmbPhysicalManifestState::COMPLETE &&
+                        candidate->candidate().physical_manifest.graph_lifecycle ==
+                            FmbGraphLifecycle::COMPOSITE_CHILD,
+                    "GR00T denoise Z2 requires COMPLETE child preparation");
+        layout.stage_plan_fingerprint = candidate->stage_fingerprint();
+        layout = bind_physical_layout_context(layout, manifest);
+        auto prepared = prepare_spm_pipeline_component(layout, stage_plan);
+        z2_stage_descriptor_ = std::move(descriptor);
+        prepared_committed = true;
         return prepared;
     }
 
@@ -868,6 +978,7 @@ public:
         // Retire only the Z2 authority.  The FMB cached layout, persistent SPM
         // allocations, model weights, and stable mask slots remain reusable.
         z2_prepared_seq_len_ = 0;
+        z2_stage_descriptor_.clear();
         z2_masks_prepared_ = false;
         z2_masks_plan_hash_ = 0;
         z2_masks_prepared_generation_ = 0;
@@ -961,7 +1072,8 @@ public:
         }
 
         run_all_layers(emb_stage_, k_caches, v_caches, std::nullopt,
-                       /*position=*/0, /*is_causal=*/false);
+                       /*position=*/0, /*is_causal=*/false,
+                       /*planned_chunk_size=*/0, z2_stage_descriptor_);
         rpu_ddr_flush(out.data_ptr<c10::Half>());
         return out;
     }
@@ -1262,7 +1374,7 @@ protected:
                    static_cast<int64_t>(
                        Gr00tDiTMutableDmaRoute::DDR_SCATTER_TO_SPM));
         }
-        if (vl_seq_ > 0 && !z2_bound_) {
+        if (vl_seq_ > 0 && !z2_bound_ && z2_prepared_seq_len_ == 0) {
             append(FmbRouteFamily::MUTABLE_DMA, GR00T_DIT_VL_DMA_SITE,
                    static_cast<int64_t>(
                        Gr00tDiTMutableDmaRoute::DDR_BROADCAST_TO_SPM));
@@ -1297,7 +1409,8 @@ protected:
                    static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
                    adaln_route_arguments(denoise_mode_, loop_mode_, vl_seq_, step_idx_));
             append(FmbRouteFamily::ALL_REDUCE, GR00T_DIT_ADALN_ALL_REDUCE_SITE,
-                   fmb_ring_all_reduce_route_selector(/*rows=*/1, /*cols=*/2 * hidden_size()));
+                   fmb_ring_all_reduce_route_selector(/*rows=*/1, /*cols=*/2 * hidden_size(),
+                                                      num_cores()));
         }
         if (has_self) {
             if (self_qkv_multibase_profile(chunk.len, layout.batch_size)) {
@@ -1351,7 +1464,7 @@ protected:
         } else {
             append(FmbRouteFamily::ALL_REDUCE,
                    GR00T_DIT_ATTN_ALL_REDUCE_SITE,
-                   fmb_ring_all_reduce_route_selector(chunk.len, hidden_size()));
+                   fmb_ring_all_reduce_route_selector(chunk.len, hidden_size(), num_cores()));
         }
         append_linear(GR00T_DIT_FF1_LINEAR_SITE);
         if (ff1_resident_w8_opt_in_ && denoise_mode_) {
@@ -1376,7 +1489,7 @@ protected:
         } else {
             append(FmbRouteFamily::ALL_REDUCE,
                    GR00T_DIT_FF_ALL_REDUCE_SITE,
-                   fmb_ring_all_reduce_route_selector(chunk.len, hidden_size()));
+                   fmb_ring_all_reduce_route_selector(chunk.len, hidden_size(), num_cores()));
         }
         if (denoise_ready_) {
             const int64_t action_horizon = action_horizon_;
@@ -1421,11 +1534,12 @@ protected:
                    static_cast<int64_t>(
                        Gr00tDiTMutableDmaRoute::SPM_TO_DDR));
         }
-        if (!z2_bound_) {
-            append_fmb_shared_runtime_routes(
-                manifest, plan, hidden_size(),
-                FMB_SHARED_LAYER_INPUT_DMA);
-        }
+        // The cross-attention bridge is SPM-resident, while each body's
+        // generated embeddings still enter layer zero through its input DMA.
+        append_fmb_shared_runtime_routes(
+            manifest, plan, hidden_size(),
+            FMB_SHARED_LAYER_INPUT_DMA, /*compute_row_multiplier=*/1,
+            num_cores(), mlp_tp());
         std::sort(
             manifest.routes.begin(), manifest.routes.end(),
             [](const FmbRouteManifestEntry& lhs,
@@ -1485,8 +1599,8 @@ protected:
         const FmbThreeStageChunkPlan& plan,
         const LayoutContext& layout,
         int64_t position) const {
-        if (z2_bound_ || z2_prepared_seq_len_ != 0 || position != 0 ||
-            layout.is_causal || layout.use_attn_mask ||
+        if ((num_cores() != 4 && num_cores() != 8) || z2_bound_ || z2_prepared_seq_len_ != 0 ||
+            position != 0 || layout.is_causal || layout.use_attn_mask ||
             layout.batch_size != 1 ||
             layout.attention_policy !=
                 AttentionExecutionPolicy::SPM_KV_BY_MHA ||
@@ -1526,7 +1640,7 @@ protected:
         const int64_t seq = plan.compute.chunks.front().len;
         return has_self && sdpa_by_mha_spm_is_valid(
             /*batch=*/1, seq, seq,
-            num_q_heads(), num_kv_heads(), head_dim(), NUM_CORES,
+            num_q_heads(), num_kv_heads(), head_dim(), num_cores(),
             /*MASK_NONE=*/0);
     }
 
@@ -1541,9 +1655,13 @@ protected:
             layer_weights_.begin(), layer_weights_.end(),
             [](const LayerWeights& layer) { return layer.is_cross; });
         const int64_t seq = plan.compute.chunks.front().len;
+        if (num_cores() == 4 && cross_kv_reuse_profile(seq, layout.batch_size) &&
+            2 * cross_kv_bank_bytes() > (num_steps_ <= 4 ? 4718592 : 3932160)) {
+            return false;
+        }
         return has_cross && vl_seq_ >= seq && sdpa_by_mha_spm_is_valid(
             /*batch=*/1, seq, vl_seq_,
-            num_q_heads(), num_kv_heads(), head_dim(), NUM_CORES,
+            num_q_heads(), num_kv_heads(), head_dim(), num_cores(),
             /*MASK_2D=*/4);
     }
 
@@ -1566,8 +1684,8 @@ protected:
         // cross KV; reserve that exact physical source geometry.
         const int64_t kv_seq = gr00t_pad16(std::max<int64_t>(cs, vl_seq_));
 
-        const int64_t local_qhd   = (nq * hd) / NUM_CORES;   // per-core attn width (192)
-        const int64_t local_inter = FF / NUM_CORES;          // per-core FFN width (768)
+        const int64_t local_qhd   = (nq * hd) / num_cores();  // per-core attn width (192 at TP8)
+        const int64_t local_inter = FF / num_cores();         // per-core FFN width (768 at TP8)
         auto A = [](int64_t bytes) -> int64_t { return Align(bytes, 256); };
 
         const int64_t res     = A(cs * h * DWIDTH);
@@ -1634,7 +1752,7 @@ protected:
             d.preload_callback = [this, field](FusedModelBase&, int, uint32_t core0_addr) {
                 rpu_launch_ddr_broadcast_spm_dma(
                     this->*field, /*src_offset_elements=*/0,
-                    hidden_size(), core0_addr);
+                    hidden_size(), core0_addr, num_cores());
             };
             v.push_back(d);
         };
@@ -1650,7 +1768,7 @@ protected:
             d.preload_callback = [this, per_core, field](FusedModelBase&, int L, uint32_t core0_addr) {
                 rpu_launch_ddr_scatter_spm_dma(
                     layer_weights_[L].*field, /*src_offset_elements=*/0,
-                    per_core, per_core * DWIDTH, core0_addr, NUM_CORES);
+                    per_core, per_core * DWIDTH, core0_addr, num_cores());
             };
             v.push_back(d);
         };
@@ -1658,7 +1776,7 @@ protected:
             BufferDecl d; d.name = name; d.size = A(h * DWIDTH);
             d.storage = StorageClass::PersistentPerLayer; d.per_layer = nl; d.scope = ALL;
             d.preload_callback = [this, field](FusedModelBase&, int L, uint32_t core0_addr) {
-                rpu_launch_memset_spm_multicore(core0_addr, hidden_size());
+                rpu_launch_memset_spm_multicore(core0_addr, hidden_size(), num_cores());
                 rpu_launch_ddr_broadcast_spm_dma(
                     layer_weights_[L].*field, /*src_offset_elements=*/0,
                     hidden_size(), core0_addr, /*num_cores=*/1);
@@ -1770,13 +1888,14 @@ protected:
         if (retained) *retained = false;
         // Prepared AdaLN table paths never read legacy AdaLN scratch.
         // Its extra 6144-byte phase-1 slot, together with bias/partial, can
-        // cover a second mask without increasing the peak. Larger masks retain
-        // the original upload schedule if the actual no-growth proof fails.
+        // cover a second mask without increasing the peak. Longer prefixes can
+        // also share disjoint pre/post glue scratch below. The original upload
+        // schedule remains the fallback if the actual no-growth proof fails.
         const bool long_mask_profile = vl_seq_ > 96 &&
             adaln_table_profile(layout.chunk_size, layout.batch_size);
         // Ordinary COMPLETE single-chunk public DiT geometry only. Z2 has an
-        // independently sealed lease/register contract: its prepare has no
-        // COMPLETE fingerprint and its prepared/bound executions stay baseline.
+        // independently sealed lease/register contract: its preparation and
+        // prepared/bound executions retain the baseline scratch schedule.
         if (!complete || z2_bound_ || z2_prepared_seq_len_ != 0 ||
             layout.chunk_size != 41 || layout.batch_size != 1 ||
             layout.is_causal || layout.use_attn_mask ||
@@ -1786,12 +1905,14 @@ protected:
             first_cross_mask_layer(false) < 0 || first_cross_mask_layer(true) < 0)
             return baseline;
 
-        // All other scratch stays conservatively live through hooks and every
+        // Root scratch stays conservatively live through hooks and every
         // layer. Only AdaLN's input temporaries and the later Q/K operands have
         // disjoint proven windows: AdaLN consumes bias/partial before Q/K
         // projection; Q/K are dead after SDPA and absent from FFN/pre/post hooks.
         auto candidate = baseline;
         BufferDecl image_mask;
+        BufferDecl* encoder_scratch = nullptr;
+        BufferDecl* output_norm_scratch = nullptr;
         int found = 0;
         for (auto& decl : candidate) {
             if (decl.storage != StorageClass::Temp || decl.alias_of) continue;
@@ -1801,6 +1922,8 @@ protected:
             decl.phase_start = 0;
             decl.phase_end = 8;
             const std::string name = decl.name ? decl.name : "";
+            if (name == "enc0") encoder_scratch = &decl;
+            if (name == "normed") output_norm_scratch = &decl;
             if (name == "bias_temp" || name == "gemv_partial" ||
                 (long_mask_profile && name == "adaln")) {
                 decl.phase_start = decl.phase_end = 1;
@@ -1816,6 +1939,19 @@ protected:
             }
         }
         if (found != (long_mask_profile ? 6 : 5)) return baseline;
+        if (long_mask_profile && (vl_seq_ > 224 || (num_cores() == 4 && vl_seq_ > 96))) {
+            // enc0's last pre-hook use copies the action embeddings to DDR
+            // emb_stage_. normed is first written by the post-hook LayerNorm,
+            // after every DiT layer, and consumed there by po2. Neither value
+            // crosses a body boundary. Keep their shared root live through all
+            // hooks/layers so both retained masks and cross-KV/FF1 stay disjoint.
+            // Short profiles and independently sealed Z2 layouts stay unchanged.
+            if (!encoder_scratch || !output_norm_scratch ||
+                encoder_scratch->size <= 0 ||
+                encoder_scratch->size > output_norm_scratch->size)
+                return baseline;
+            encoder_scratch->alias_of = "normed";
+        }
         candidate.push_back(std::move(image_mask));
         const auto plan = detail::plan_forward_spm_residency(
             candidate, {"sdpa_mask", "sdpa_mask_image"});
@@ -1852,7 +1988,7 @@ protected:
             (num_steps_ == 4 || num_steps_ == 10) && action_horizon_ == 40 && rows == 41 && batch == 1 &&
             num_layers() == 32 && hidden_size() == 1536 && intermediate_size() == 6144 &&
             num_q_heads() == 32 && num_kv_heads() == 32 && head_dim() == 48 &&
-            cross_dim_ == 2048 && attn_tp() == 8 && !z2_bound_ && z2_prepared_seq_len_ == 0;
+            cross_dim_ == 2048 && (attn_tp() == 4 || attn_tp() == 8) && !z2_bound_ && z2_prepared_seq_len_ == 0;
     }
 
     int64_t kv_insert_flags(int64_t site_id, int64_t invocation) {
@@ -1926,11 +2062,13 @@ protected:
     }
 
     std::vector<int64_t> self_qkv_multibase_arguments(int64_t rows, int64_t batch) const {
+        const auto c = rpu_specialized_linear::contract(KernelId::GR00T_QKV_MULTIBASE_W8A16_M592N32K128);
         std::vector<int64_t> args{rows, batch, vl_seq_, num_steps_, num_layers(), hidden_size(),
             intermediate_size(), num_q_heads(), num_kv_heads(), head_dim(), attn_tp(), cross_dim_,
             action_horizon_, denoise_mode_ ? 1 : 0, loop_mode_ ? 1 : 0,
             self_qkv_multibase_opt_in_ ? 1 : 0, self_qkv_multibase_ready_ ? 1 : 0,
-            /*local_N=*/192, /*bias=*/1, /*tile=*/592, 32, 128, /*grid=*/18, 1, 1};
+            /*local_N=*/192, /*bias=*/1, /*tile=*/c.m, c.n, c.k, /*grid=*/c.gx, c.gy, c.gz, /*ABI=*/2,
+            2, 3, 20, 21, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47};
         for (const auto& layer : layer_weights_) args.push_back(layer.is_cross ? 1 : 0);
         return args;
     }
@@ -2117,11 +2255,12 @@ protected:
     }
 
     std::vector<int64_t> ff1_resident_arguments(int64_t rows, int64_t batch) const {
+        const auto c = rpu_specialized_linear::contract(KernelId::GR00T_FF1_RESIDENT_W8A16_M512N48K128);
         return {rows, batch, vl_seq_, num_steps_, num_layers(), hidden_size(), intermediate_size(),
                 num_q_heads(), num_kv_heads(), head_dim(), attn_tp(), action_horizon_,
                 denoise_mode_ ? 1 : 0, loop_mode_ ? 1 : 0, ff1_resident_w8_opt_in_ ? 1 : 0,
                 ff1_resident_weight_.defined() ? 1 : 0, ff1_resident_generation_,
-                /*layer=*/0, GR00T_DIT_FF1_RESIDENT_BYTES, /*bias=*/1, 512, 48, 128};
+                /*layer=*/0, GR00T_DIT_FF1_RESIDENT_BYTES, /*bias=*/1, c.m, c.n, c.k, c.gx, c.gy, c.gz, /*ABI=*/2};
     }
 
     FmbForwardOperandResidency ff1_residency_for_candidate(
@@ -2168,7 +2307,9 @@ protected:
                         (route->selector == 1 || route->selector == 2),
                     "GR00T requires one valid resident FF1 schedule");
         const auto& args = route->arguments;
-        TORCH_CHECK(args.size() == 23 && args[0] == manifest.physical_length && args[1] > 0 &&
+        // Guard the two indexed fields; full equality below binds the current
+        // generated tile/grid/ABI and rejects truncated or retired schedules.
+        TORCH_CHECK(args.size() >= 2 && args[0] == manifest.physical_length && args[1] > 0 &&
                         args == ff1_resident_arguments(args[0], args[1]) &&
                         (route->selector == 1 || ff1_resident_profile(args[0], args[1])),
                     "GR00T resident FF1 schedule differs from its installed owner");
@@ -2209,8 +2350,8 @@ protected:
         TORCH_CHECK(denoise_ready_ && (num_steps_ == 4 || num_steps_ == 10) && num_layers() == 32 &&
                         hidden_size() == 1536 && intermediate_size() == 6144 &&
                         num_q_heads() == 32 && num_kv_heads() == 32 && head_dim() == 48 &&
-                        attn_tp() == 8 && action_horizon_ == 40 && cross_dim_ == 2048,
-                    "GR00T time tables require the installed four- or ten-step TP8 public DiT profile");
+                        (attn_tp() == 4 || attn_tp() == 8) && action_horizon_ == 40 && cross_dim_ == 2048,
+                    "GR00T time tables require the installed four- or ten-step TP4/TP8 public DiT profile");
         for (const auto* source : {&ae2t_w_, &ae2t_ws_, &po1_w_, &po1_b_, &po1_ws_}) {
             TORCH_CHECK(!source->defined() || source->unsafeGetTensorImpl()->version_counter().enabled(),
                         "GR00T time preparation requires versioned weight/bias/scale owners");
@@ -2239,7 +2380,7 @@ protected:
             (num_steps_ == 4 || num_steps_ == 10) && num_layers() == 32 && rows == 41 && batch == 1 &&
             hidden_size() == 1536 && intermediate_size() == 6144 &&
             num_q_heads() == 32 && num_kv_heads() == 32 && head_dim() == 48 &&
-            cross_dim_ == 2048 && attn_tp() == 8 && !z2_bound_ && z2_prepared_seq_len_ == 0;
+            cross_dim_ == 2048 && (attn_tp() == 4 || attn_tp() == 8) && !z2_bound_ && z2_prepared_seq_len_ == 0;
     }
 
     std::vector<int64_t> time_table_arguments(int64_t rows, int64_t batch) const {
@@ -2268,8 +2409,8 @@ protected:
         TORCH_CHECK(denoise_ready_ && (num_steps_ == 4 || num_steps_ == 10) && num_layers() == 32 &&
                         hidden_size() == 1536 && intermediate_size() == 6144 &&
                         num_q_heads() == 32 && num_kv_heads() == 32 && head_dim() == 48 &&
-                        attn_tp() == 8 && action_horizon_ == 40 && cross_dim_ == 2048,
-                    "GR00T AdaLN table requires the installed four- or ten-step TP8 public DiT profile");
+                        (attn_tp() == 4 || attn_tp() == 8) && action_horizon_ == 40 && cross_dim_ == 2048,
+                    "GR00T AdaLN table requires the installed four- or ten-step TP4/TP8 public DiT profile");
         for (const auto& layer : layer_weights_) {
             for (const auto* source : {&layer.adaln_w, &layer.adaln_b, &layer.adaln_ws}) {
                 TORCH_CHECK(!source->defined() || source->unsafeGetTensorImpl()->version_counter().enabled(),
@@ -2300,7 +2441,7 @@ protected:
             (num_steps_ == 4 || num_steps_ == 10) && num_layers() == 32 && rows == 41 && batch == 1 &&
             hidden_size() == 1536 && intermediate_size() == 6144 &&
             num_q_heads() == 32 && num_kv_heads() == 32 && head_dim() == 48 &&
-            cross_dim_ == 2048 && attn_tp() == 8 &&
+            cross_dim_ == 2048 && (attn_tp() == 4 || attn_tp() == 8) &&
             !z2_bound_ && z2_prepared_seq_len_ == 0;
     }
 
@@ -2339,7 +2480,7 @@ protected:
     }
 
     bool cross_kv_reuse_profile(int64_t rows, int64_t batch) const {
-        return cross_kv_reuse_opt_in_ && denoise_ready_ &&
+        return cross_kv_reuse_opt_in_ && (num_cores() == 4 || num_cores() == 8) && denoise_ready_ &&
             denoise_mode_ && loop_mode_ && (num_steps_ == 4 || num_steps_ == 10) &&
             !z2_bound_ && z2_prepared_seq_len_ == 0 &&
             batch == 1 && rows == 41 && num_layers() == 32 &&
@@ -2358,7 +2499,7 @@ protected:
 
     int64_t cross_kv_bank_stride() const {
         return Align(gr00t_pad16(vl_seq_) *
-            (num_kv_heads() * head_dim() / NUM_CORES) * DWIDTH, int64_t{256});
+            (num_kv_heads() * head_dim() / attn_tp()) * DWIDTH, int64_t{256});
     }
 
     int64_t cross_kv_bank_bytes() const {
@@ -2384,7 +2525,8 @@ protected:
         if (!cross_kv_reuse_profile(layout.chunk_size, layout.batch_size) ||
             layout.attention_policy != AttentionExecutionPolicy::SPM_KV_BY_MHA) return;
         const int64_t bytes = cross_kv_bank_bytes();
-        if (bytes == 0) return;
+        if (bytes == 0 || (num_cores() == 4 &&
+                           2 * bytes > (num_steps_ <= 4 ? 4718592 : 3932160))) return;
         // Overall raw layout includes mixed self-raw/cross-DDR candidates.
         // Budget both banks there too; all layers/bodies and hooks must preserve them.
         // The mask residency planner extends these conservative 0..0 lifetimes
@@ -2406,7 +2548,7 @@ protected:
 
     bool cross_v_transpose_profile(int64_t rows, int64_t batch, bool cross_raw) const {
         return cross_v_transpose_reuse_opt_in_ && cross_raw &&
-            cross_kv_reuse_profile(rows, batch) && attn_tp() == NUM_CORES;
+            cross_kv_reuse_profile(rows, batch) && (attn_tp() == 4 || attn_tp() == 8);
     }
 
     std::vector<int64_t> cross_v_transpose_arguments(int64_t rows, int64_t batch, bool cross_raw) const {
@@ -2544,11 +2686,11 @@ protected:
                 static_cast<int64_t>(
                     Gr00tDiTMutableDmaRoute::DDR_SCATTER_TO_SPM),
                 /*resolved_flags=*/0, {}, chunk.idx);
-            const int64_t local_k = h / NUM_CORES;
+            const int64_t local_k = h / num_cores();
             rpu_launch_ddr_scatter_spm_dma_mutable(
                 cond_src_base_, cond_ref_, /*src_offset_bytes=*/0,
                 /*elements_per_core=*/local_k, /*core_stride_bytes=*/local_k * DWIDTH,
-                addr(0, "cond"), NUM_CORES);
+                addr(0, "cond"), num_cores());
             cond_loaded_this_forward_ = true;
         }
         if (is_first && vl_seq_ > 0 && !vl_loaded_this_forward_ && !z2_bound_) {
@@ -2560,7 +2702,7 @@ protected:
                 /*resolved_flags=*/0, {}, chunk.idx);
             rpu_launch_ddr_broadcast_spm_dma_mutable(
                 vl_src_base_, vl_ref_, /*src_offset_bytes=*/0,
-                vl_seq_ * cross_dim_, addr(0, "vl_embeds"), NUM_CORES);
+                vl_seq_ * cross_dim_, addr(0, "vl_embeds"), num_cores());
             vl_loaded_this_forward_ = true;
         }
 
@@ -2586,12 +2728,12 @@ protected:
             kv_insert_flags(site_id, invocation),
             route.arguments, invocation);
         if (plan.physical_rows() == true_seq) return plan;
-        const int64_t local_qhd = (num_q_heads() * head_dim()) / NUM_CORES;
+        const int64_t local_qhd = (num_q_heads() * head_dim()) / num_cores();
         const int64_t pad_elems =
             (plan.physical_rows() - true_seq) * local_qhd;
         const uint32_t off = static_cast<uint32_t>(true_seq * local_qhd * DWIDTH);
-        rpu_launch_memset_spm_multicore((k_spm ? k_spm : addr(0, "k")) + off, pad_elems);
-        rpu_launch_memset_spm_multicore((v_spm ? v_spm : addr(0, "v")) + off, pad_elems);
+        rpu_launch_memset_spm_multicore((k_spm ? k_spm : addr(0, "k")) + off, pad_elems, num_cores());
+        rpu_launch_memset_spm_multicore((v_spm ? v_spm : addr(0, "v")) + off, pad_elems, num_cores());
         return plan;
     }
 
@@ -2603,7 +2745,7 @@ protected:
         const int64_t nq          = num_q_heads();
         const int64_t hd          = head_dim();
         const int64_t FF          = intermediate_size();
-        const int64_t local_inter = FF / NUM_CORES;
+        const int64_t local_inter = FF / num_cores();
 
         const uint32_t scale = adaln_layer_scale(layer_idx, chunk);
         const uint32_t shift = scale + static_cast<uint32_t>(h * DWIDTH);
@@ -2613,7 +2755,7 @@ protected:
         // AdaLayerNorm(norm1) = (1+scale)*LN(x)+shift -> norm_hidden (one LN call)
         rpu_launch_layernorm_spm_kernel(
             addr(0, "residual1"), addr(0, "norm_hidden"),
-            scale, shift, seq_len, h, eps_, false, 0, NUM_CORES);
+            scale, shift, seq_len, h, eps_, false, 0, num_cores());
 
         // QKV (col-partition) + bias
         if (!emit_self_qkv_multibase(layer_idx, chunk, lw)) {
@@ -2623,21 +2765,21 @@ protected:
             /*resolved_flags=*/0, {}, chunk.idx);
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "norm_hidden"), lw.to_q_w, addr(0, "q"),
-            seq_len, nq * hd, h, 1, NUM_CORES, layer_addr(layer_idx, 0, "q_bias"), lw.to_q_ws);
+            seq_len, nq * hd, h, 1, num_cores(), layer_addr(layer_idx, 0, "q_bias"), lw.to_q_ws);
         ctx().consume_physical_route(
             FmbRouteFamily::LINEAR, GR00T_DIT_SELF_K_LINEAR_SITE,
             static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
             /*resolved_flags=*/0, {}, chunk.idx);
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "norm_hidden"), lw.to_k_w, addr(0, "k"),
-            seq_len, nq * hd, h, 1, NUM_CORES, layer_addr(layer_idx, 0, "k_bias"), lw.to_k_ws);
+            seq_len, nq * hd, h, 1, num_cores(), layer_addr(layer_idx, 0, "k_bias"), lw.to_k_ws);
         ctx().consume_physical_route(
             FmbRouteFamily::LINEAR, GR00T_DIT_SELF_V_LINEAR_SITE,
             static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
             /*resolved_flags=*/0, {}, chunk.idx);
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "norm_hidden"), lw.to_v_w, addr(0, "v"),
-            seq_len, nq * hd, h, 1, NUM_CORES, layer_addr(layer_idx, 0, "v_bias"), lw.to_v_ws);
+            seq_len, nq * hd, h, 1, num_cores(), layer_addr(layer_idx, 0, "v_bias"), lw.to_v_ws);
         }
 
         // KV-insert(pos 0) + self-SDPA (non-causal, MASK_NONE). v16-pad: insert pad16(seq_len)
@@ -2650,7 +2792,7 @@ protected:
             rpu_launch_insert_kvcache_spm_unified_with_plan(
                 k_cache, v_cache,
                 addr_offset("k").value, addr_offset("v").value,
-                nq, hd, NUM_CORES,
+                nq, hd, num_cores(),
                 /*k_cache_batch_offset_elems=*/0,
                 /*v_cache_batch_offset_elems=*/0,
                 /*spm_rows=*/kv_plan.physical_rows(), kv_plan);
@@ -2679,12 +2821,12 @@ protected:
                 /*resolved_flags=*/0, {}, chunk.idx);
             rpu_launch_v_transpose_spm(
                 addr(0, "v"), addr(0, "sdpa_tmp"),
-                /*batch=*/1, seq_len, nq, hd, NUM_CORES);
+                /*batch=*/1, seq_len, nq, hd, num_cores());
             rpu_launch_sdpa_by_mha_spm(
                 addr(0, "q"), addr(0, "k"), addr(0, "sdpa_tmp"),
                 addr(0, "sdpa_out"), /*mask_spm=*/0,
                 /*MASK_NONE=*/0, attn_scale, /*batch=*/1,
-                seq_len, seq_len, nq, nq, hd, NUM_CORES);
+                seq_len, seq_len, nq, nq, hd, num_cores());
         } else {
             LayoutContext spm_layout;
             spm_layout.attention_policy =
@@ -2707,7 +2849,7 @@ protected:
                 addr_offset("q").value, addr_offset("sdpa_out").value,
                 addr_offset("sdpa_tmp").value, /*sdpa_mask_off=*/0,
                 seq_len, nq, nq, hd, /*kv_seq_len=*/seq_len,
-                NUM_CORES, NUM_CORES);
+                num_cores(), DecoderExecutionTopology::physical_kv_cores);
         }
 
         finish_attn_and_ffn(layer_idx, chunk, lw, seq_len, h, FF, local_inter);
@@ -2722,7 +2864,7 @@ protected:
         const int64_t nq          = num_q_heads();
         const int64_t hd          = head_dim();
         const int64_t FF          = intermediate_size();
-        const int64_t local_inter = FF / NUM_CORES;
+        const int64_t local_inter = FF / num_cores();
         TORCH_CHECK(S > 0, "gr00t_dit cross-attn block needs vl_embeds (vl_seq_>0)");
 
         // Layout policy is a union: self raw-SPM can coexist with cross DDR.
@@ -2764,7 +2906,7 @@ protected:
         // AdaLayerNorm(norm1) -> norm_hidden (over the seq_len query tokens)
         rpu_launch_layernorm_spm_kernel(
             addr(0, "residual1"), addr(0, "norm_hidden"),
-            scale, shift, seq_len, h, eps_, false, 0, NUM_CORES);
+            scale, shift, seq_len, h, eps_, false, 0, num_cores());
 
         // Q from norm_hidden (col-partition) + bias
         ctx().consume_physical_route(
@@ -2773,7 +2915,7 @@ protected:
             /*resolved_flags=*/0, {}, chunk.idx);
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "norm_hidden"), lw.to_q_w, addr(0, "q"),
-            seq_len, nq * hd, h, 1, NUM_CORES, layer_addr(layer_idx, 0, "q_bias"), lw.to_q_ws);
+            seq_len, nq * hd, h, 1, num_cores(), layer_addr(layer_idx, 0, "q_bias"), lw.to_q_ws);
 
         // K/V from vl_embeds: linear([S,cross_dim], to_k/to_v[hidden,cross_dim]) -> [S,hidden]
         if (cross_kv_projection_needed(chunk, attention_policy)) {
@@ -2785,14 +2927,14 @@ protected:
                 /*resolved_flags=*/0, {}, chunk.idx);
             rpu_launch_linear_spm_to_spm_acc16_kernel(
                 vl_input_addr, lw.to_k_w, k_spm,
-                S, nq * hd, cross_dim_, 1, NUM_CORES, layer_addr(layer_idx, 0, "k_bias"), lw.to_k_ws);
+                S, nq * hd, cross_dim_, 1, num_cores(), layer_addr(layer_idx, 0, "k_bias"), lw.to_k_ws);
             ctx().consume_physical_route(
                 FmbRouteFamily::LINEAR, GR00T_DIT_CROSS_V_LINEAR_SITE,
                 static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
                 /*resolved_flags=*/0, {}, chunk.idx);
             rpu_launch_linear_spm_to_spm_acc16_kernel(
                 vl_input_addr, lw.to_v_w, v_spm,
-                S, nq * hd, cross_dim_, 1, NUM_CORES, layer_addr(layer_idx, 0, "v_bias"), lw.to_v_ws);
+                S, nq * hd, cross_dim_, 1, num_cores(), layer_addr(layer_idx, 0, "v_bias"), lw.to_v_ws);
 
             // Insert S external K/V at pos 0, then cross-SDPA (seq_q=41, kv=S, MASK_2D). v16-pad:
             // insert pad16(S) (zeroed tail) for the v16 insert; SDPA below still reads kv_seq_len=S.
@@ -2802,7 +2944,7 @@ protected:
                 rpu_launch_insert_kvcache_spm_unified_with_plan(
                     k_cache, v_cache,
                     addr_offset(k_slot).value + bank_offset, addr_offset(v_slot).value + v_offset,
-                    nq, hd, NUM_CORES,
+                    nq, hd, num_cores(),
                     /*k_cache_batch_offset_elems=*/0,
                     /*v_cache_batch_offset_elems=*/0,
                     /*spm_rows=*/kv_plan.physical_rows(), kv_plan);
@@ -2825,7 +2967,7 @@ protected:
         // layers and denoise bodies use the separately retained SPM operands.
         if (!retain_masks || (ctx().body_iter == 0 &&
                               layer_idx == first_cross_mask_layer(image_mask))) {
-            sdpa_dma_mask_to_spm(pm, addr_offset(mask_slot).value, seq_len, S, NUM_CORES);
+            sdpa_dma_mask_to_spm(pm, addr_offset(mask_slot).value, seq_len, S, num_cores());
         }
         const double attn_scale = 1.0 / std::sqrt(static_cast<double>(hd));
         if (attention_policy == AttentionExecutionPolicy::SPM_KV_BY_MHA) {
@@ -2844,13 +2986,13 @@ protected:
             // Fixed body0 refreshes the bank on EVERY inference/Graph replay.
             if (!transposed_bank || ctx().body_iter == 0) {
                 rpu_launch_v_transpose_spm(
-                    v_spm, transposed_v, /*batch=*/1, S, nq, hd, NUM_CORES);
+                    v_spm, transposed_v, /*batch=*/1, S, nq, hd, num_cores());
             }
             rpu_launch_sdpa_by_mha_spm(
                 addr(0, "q"), k_spm, transposed_v,
                 addr(0, "sdpa_out"), addr(0, mask_slot), pm.mask_type,
                 attn_scale, /*batch=*/1, seq_len, S,
-                nq, nq, hd, NUM_CORES);
+                nq, nq, hd, num_cores());
         } else {
             LayoutContext spm_layout;
             spm_layout.attention_policy =
@@ -2874,10 +3016,19 @@ protected:
                 addr_offset("sdpa_tmp").value,
                 addr_offset(mask_slot).value,
                 seq_len, nq, nq, hd, /*kv_seq_len=*/S,
-                NUM_CORES, NUM_CORES);
+                num_cores(), DecoderExecutionTopology::physical_kv_cores);
         }
 
         finish_attn_and_ffn(layer_idx, chunk, lw, seq_len, h, FF, local_inter);
+    }
+
+    // Packed W4 row Linear takes no in-kernel bias. The row bias buffer holds the
+    // bias on core 0 and zeros elsewhere, so adding it to every core's partial
+    // before the reduction is the same sum the int8/fp16 kernel makes.
+    void add_row_bias_partial(uint32_t bias_addr, int64_t seq_len, int64_t h) {
+        rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
+            bias_addr, addr(0, "oproj"), addr(0, "oproj"),
+            seq_len, h, c10::Half(1.0f), ValuOpType::ADD, /*is_bopa=*/false, num_cores());
     }
 
     // ---- shared tail: o-proj + plain residual + norm3 + GELU-FFN + plain residual ----
@@ -2891,25 +3042,28 @@ protected:
             FmbRouteFamily::LINEAR, GR00T_DIT_O_LINEAR_SITE,
             static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
             /*resolved_flags=*/0, {}, chunk.idx);
+        const bool w4_o = lw.to_out_w.scalar_type() == at::kByte;
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "sdpa_out"), lw.to_out_w, addr(0, "oproj"),
-            seq_len, h, nq * hd, 0, NUM_CORES, layer_addr(layer_idx, 0, "out_bias"), lw.to_out_ws);
+            seq_len, h, nq * hd, 0, num_cores(),
+            w4_o ? 0 : layer_addr(layer_idx, 0, "out_bias"), lw.to_out_ws);
+        if (w4_o) add_row_bias_partial(layer_addr(layer_idx, 0, "out_bias"), seq_len, h);
         if (!emit_attn_ring_xor3(chunk)) {
             ctx().consume_physical_route(
                 FmbRouteFamily::ALL_REDUCE,
                 GR00T_DIT_ATTN_ALL_REDUCE_SITE,
-                fmb_ring_all_reduce_route_selector(seq_len, h),
+                fmb_ring_all_reduce_route_selector(seq_len, h, num_cores()),
                 /*resolved_flags=*/0, {}, chunk.idx);
             rpu_launch_all_reduce_sum_residual_kernel(
                 addr(0, "oproj"), addr(0, "residual1"), addr(0, "residual2"),
-                seq_len, h, NUM_CORES, NUM_CORES);
+                seq_len, h, num_cores(), num_cores());
         }
 
         // norm3 = LayerNorm(affine=False) -> norm_hidden
         rpu_launch_layernorm_spm_kernel(
             addr(0, "residual2"), addr(0, "norm_hidden"),
             addr(0, "ln_ones"), addr(0, "ln_zeros"),
-            seq_len, h, 1e-5, false, 0, NUM_CORES);
+            seq_len, h, 1e-5, false, 0, num_cores());
 
         // FFN: ff1(col)+bias -> GELU(tanh-approx) -> ff2(row)+bias + PLAIN residual
         if (layer_idx == 0 && ctx().has_complete_physical_manifest() &&
@@ -2927,27 +3081,30 @@ protected:
             /*resolved_flags=*/0, {}, chunk.idx);
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "norm_hidden"), lw.ff1_w, addr(0, "ff_mid"),
-            seq_len, FF, h, 1, NUM_CORES, layer_addr(layer_idx, 0, "ff1_bias"), lw.ff1_ws);
+            seq_len, FF, h, 1, num_cores(), layer_addr(layer_idx, 0, "ff1_bias"), lw.ff1_ws);
         }
         rpu_launch_eltwise_unary_spm_kernel(
             addr(0, "ff_mid"), addr(0, "ff_mid"),
             seq_len * local_inter, ValuOpType::ADD,
-            GeluMode::TANH, NUM_CORES);
+            GeluMode::TANH, num_cores());
         ctx().consume_physical_route(
             FmbRouteFamily::LINEAR, GR00T_DIT_FF2_LINEAR_SITE,
             static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
             /*resolved_flags=*/0, {}, chunk.idx);
+        const bool w4_ff2 = lw.ff2_w.scalar_type() == at::kByte;
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "ff_mid"), lw.ff2_w, addr(0, "oproj"),
-            seq_len, h, FF, 0, NUM_CORES, layer_addr(layer_idx, 0, "ff2_bias"), lw.ff2_ws);
+            seq_len, h, FF, 0, num_cores(),
+            w4_ff2 ? 0 : layer_addr(layer_idx, 0, "ff2_bias"), lw.ff2_ws);
+        if (w4_ff2) add_row_bias_partial(layer_addr(layer_idx, 0, "ff2_bias"), seq_len, h);
         if (!emit_ff_ring_xor3(chunk)) {
             ctx().consume_physical_route(
                 FmbRouteFamily::ALL_REDUCE, GR00T_DIT_FF_ALL_REDUCE_SITE,
-                fmb_ring_all_reduce_route_selector(seq_len, h),
+                fmb_ring_all_reduce_route_selector(seq_len, h, num_cores()),
                 /*resolved_flags=*/0, {}, chunk.idx);
             rpu_launch_all_reduce_sum_residual_kernel(
                 addr(0, "oproj"), addr(0, "residual2"), addr(0, "residual1"),
-                seq_len, h, NUM_CORES, NUM_CORES);
+                seq_len, h, num_cores(), num_cores());
         }
 
         if (!ctx().output_to_spm) emit_layer_output_dma(layer_idx, chunk);
@@ -2965,7 +3122,7 @@ protected:
         const int64_t out_features = 2 * h;
         rpu_launch_ddr_broadcast_spm_dma(
             dense_b, /*src_offset_elements=*/0,
-            out_features, bias_temp_spm_addr);
+            out_features, bias_temp_spm_addr, num_cores());
         ctx().consume_physical_route(
             FmbRouteFamily::LINEAR, GR00T_DIT_ADALN_LINEAR_SITE,
             static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
@@ -2974,18 +3131,19 @@ protected:
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             cond_spm_addr, dense_w, partial_spm_addr,
             /*M=*/1, /*N=*/out_features, /*K=*/h,
-            /*partition=*/0, NUM_CORES, /*bias_spm_addr=*/0, scale);
+            /*partition=*/0, num_cores(), /*bias_spm_addr=*/0, scale);
         ctx().consume_physical_route(
             FmbRouteFamily::ALL_REDUCE,
             GR00T_DIT_ADALN_ALL_REDUCE_SITE,
             fmb_ring_all_reduce_route_selector(
-                /*rows=*/1, /*cols=*/out_features),
+                /*rows=*/1, /*cols=*/out_features, num_cores()),
             /*resolved_flags=*/0);
         rpu_launch_all_reduce_sum_residual_kernel(
             partial_spm_addr, bias_temp_spm_addr, gemv_out_spm_addr,
-            /*M=*/1, /*N=*/out_features, NUM_CORES, NUM_CORES);
+            /*M=*/1, /*N=*/out_features, num_cores(), num_cores());
         rpu_launch_eltwise_binary_scalar_spm_kernel(
-            gemv_out_spm_addr, c10::Half(1.0), gemv_out_spm_addr, h, ValuOpType::ADD);
+            gemv_out_spm_addr, c10::Half(1.0), gemv_out_spm_addr, h, ValuOpType::ADD,
+            num_cores());
     }
 
     bool load_adaln_body_table() {
@@ -2999,7 +3157,7 @@ protected:
             adaln_table_arguments(ctx().seq_len, ctx().batch_size), body);
         rpu_launch_ddr_broadcast_spm_dma_mutable(
             adaln_table_src_base_, adaln_table_, body * adaln_table_body_bytes(),
-            adaln_table_body_bytes() / DWIDTH, addr(0, "adaln_body_table"), NUM_CORES);
+            adaln_table_body_bytes() / DWIDTH, addr(0, "adaln_body_table"), num_cores());
         return true;
     }
 
@@ -3031,14 +3189,14 @@ protected:
         const int64_t step = loop_mode_ ? bit : step_idx_;
         const int64_t cond_off = step * h;
         const uint32_t tau_step = addr(0, "tau_table") + static_cast<uint32_t>(step * AH * h * DWIDTH);
-        const int64_t local_k = h / NUM_CORES;
+        const int64_t local_k = h / num_cores();
         const bool time_tables = time_tables_active();
 
         // cond[step]: 8-core scatter -> "cond" (DiT adaln) + core0 broadcast -> "cond_full" (norm_out)
         if (!load_adaln_body_table()) {
             rpu_launch_ddr_scatter_spm_dma(
                 cond_table_t_, cond_off, local_k, local_k * DWIDTH,
-                addr(0, "cond"), NUM_CORES);
+                addr(0, "cond"), num_cores());
         }
         if (!time_tables) {
             rpu_launch_ddr_broadcast_spm_dma(
@@ -3069,7 +3227,8 @@ protected:
                 state_src_base_, state_ref_, 0, NP, addr(0, "enc0"), 1);
             sc_lin(addr(0, "enc0"), se1_w_, addr(0, "se_mid"), 1, EM, NP, addr(0, "se1_bias"));
             rpu_launch_eltwise_binary_scalar_spm_kernel(addr(0, "se_mid"), c10::Half(0.0),
-                                                        addr(0, "se_mid"), EM, ValuOpType::MAX);
+                                                        addr(0, "se_mid"), EM, ValuOpType::MAX,
+                                                        num_cores());
             sc_lin(addr(0, "se_mid"), se2_w_, addr(0, "state_feat"), 1, h, EM, addr(0, "se2_bias"), se2_ws_);
         }
 
@@ -3107,7 +3266,8 @@ protected:
         const uint32_t scale_a = addr(0, "so") + static_cast<uint32_t>(h * DWIDTH);
         if (!load_time_table(/*tau=*/false)) {
             sc_lin(addr(0, "cond_full"), po1_w_, addr(0, "so"), 1, 2 * h, h, addr(0, "po1_bias"), po1_ws_);
-            rpu_launch_eltwise_binary_scalar_spm_kernel(scale_a, c10::Half(1.0), scale_a, h, ValuOpType::ADD);
+            rpu_launch_eltwise_binary_scalar_spm_kernel(scale_a, c10::Half(1.0), scale_a, h, ValuOpType::ADD,
+                                                        num_cores());
         }
         rpu_launch_layernorm_spm_kernel(addr(0, "residual1"), addr(0, "normed"),
                                         scale_a, shift_a, SQ, h, 1e-6, false, 0, /*num_cores=*/1);
@@ -3116,7 +3276,8 @@ protected:
         // action_decoder: d1 = relu(model_out @ dec1 + b1) ; pred = d1 @ dec2 + b2 (N-pad 144)
         sc_lin(addr(0, "model_out"), dec1_w_, addr(0, "dec_mid"), SQ, DM, MO, addr(0, "dec1_bias"), dec1_ws_);
         rpu_launch_eltwise_binary_scalar_spm_kernel(addr(0, "dec_mid"), c10::Half(0.0),
-                                                    addr(0, "dec_mid"), SQ * DM, ValuOpType::MAX);
+                                                    addr(0, "dec_mid"), SQ * DM, ValuOpType::MAX,
+                                                    num_cores());
         sc_lin(addr(0, "dec_mid"), dec2_w_, addr(0, "pred"), SQ, NP, DM, addr(0, "dec2_bias"), dec2_ws_);
 
         // in-graph Euler: x_t_spm[AH,NP] += dt · pred[1:SQ] (skip row0 = state token; pad cols stay 0)
@@ -3423,6 +3584,7 @@ private:
     uint64_t   actions_src_base_ = 0, state_src_base_ = 0, x_out_dst_base_ = 0;
     bool z2_bound_ = false;
     int64_t z2_prepared_seq_len_ = 0;
+    std::vector<int64_t> z2_stage_descriptor_;
     uint32_t z2_port_addr_ = 0;
     uint64_t z2_epoch_ = 0;
     uint64_t z2_plan_hash_ = 0;
@@ -3494,6 +3656,16 @@ void rpu_gr00t_dit_prepare_time_tables(int64_t handle) {
 
 void rpu_gr00t_dit_prepare_adaln_table(int64_t handle) {
     Gr00tDiTRegistry::get(handle, "rpu_gr00t_dit_prepare_adaln_table")->prepare_adaln_table();
+}
+
+void rpu_gr00t_dit_set_execution_core_count(int64_t handle, int64_t cores) {
+    Gr00tDiTRegistry::get(handle, "rpu_gr00t_dit_set_execution_core_count")
+        ->set_execution_cores(cores);
+}
+
+std::vector<int64_t> rpu_gr00t_dit_get_execution_topology(int64_t handle) {
+    return Gr00tDiTRegistry::get(handle, "rpu_gr00t_dit_get_execution_topology")
+        ->execution_topology();
 }
 
 void rpu_gr00t_dit_destroy(int64_t handle) {

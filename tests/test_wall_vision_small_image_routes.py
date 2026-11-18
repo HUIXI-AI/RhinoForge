@@ -479,7 +479,7 @@ int main() {
 """
     )
     binary = tmp_path / "small_vision"
-    subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
+    subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-I", str(ROOT / "src/ops"), "-I", str(ROOT / "src/core"),
                     str(cpp), "-o", str(binary)], check=True, capture_output=True, text=True)
     subprocess.run([str(binary)], check=True, capture_output=True, text=True)
 
@@ -587,9 +587,11 @@ def test_single_base_gate_up_admits_exact_rows_and_dispatches_complete_tiles(tmp
     guard_start = launcher.index("  const bool small_image =")
     guard_end = launcher.index("  TORCH_CHECK(input_spm_addr", guard_start)
     guard = launcher[guard_start:guard_end]
-    dispatch = launcher[launcher.rindex("  if (multibase) {"):launcher.rindex("}")]
+    select_stmt = launcher[launcher.index("  const auto selected = rpu_pi_wall::select("):launcher.index("  const auto kernel_id =")]
+    enqueue_stmt = launcher[launcher.rindex("  const std::vector<uint8_t> cores"):launcher.rindex("}")]
     cpp = tmp_path / "gate_up_rows.cpp"
     cpp.write_text("""
+#include "rpu_pi_wall_tiling.h"
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -605,18 +607,18 @@ bool admitted(int64_t rows, bool fp16, bool multibase, Sorting sorting) {
         return true;
     } catch (const std::runtime_error&) { return false; }
 }
-int64_t CeilDiv(int64_t n, int64_t d) { return (n + d - 1) / d; }
 struct Queue {
-    int64_t y = 0;
-    void enqueu_kernel(int&, std::array<uint16_t, 3> grid, const std::vector<int>&) {
-        assert(grid[0] == 5 && grid[2] == 1); y = grid[1];
+    int64_t x = 0, y = 0;
+    void enqueu_kernel(int&, std::array<uint16_t, 3> grid, const std::vector<uint8_t>&) {
+        assert(grid[2] == 1); x = grid[0]; y = grid[1];
     }
 };
-int64_t grid_y(int64_t rows, bool multibase) {
+int64_t grid_y(int64_t rows, bool multibase, bool fp16 = false) {
+    constexpr int64_t kK = 1280, kNPerCore = 3584 / 8;
     Queue recorded; auto* queue = &recorded;
     int dummy_kernel = 0; auto* kernel = &dummy_kernel;
-    std::vector<int> cores;
-""" + dispatch + """
+""" + select_stmt + enqueue_stmt + """
+    assert(recorded.x == (multibase ? 5 : 7));
     return recorded.y;
 }
 int main() {
@@ -645,25 +647,24 @@ int main() {
         assert(grid == (rows == 324 ? 1 : 2));
         int64_t covered = 0, tail = 0;
         for (int64_t block = 0; block < grid; ++block) {
-            assert(block * 352 < rows);
-            tail = std::min(int64_t{352}, rows - block * 352);
+            assert(block * 336 < rows);
+            tail = std::min(int64_t{336}, rows - block * 336);
             covered += tail;
         }
         assert(covered == rows);
-        assert(tail == (rows == 324 ? 324 : rows == 672 ? 320 : 224));
+        assert(tail == (rows == 324 ? 324 : rows == 672 ? 336 : 240));
     }
 }
 """)
     binary = tmp_path / "gate_up_rows"
-    subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
+    subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-I", str(ROOT / "src/ops"), "-I", str(ROOT / "src/core"),
                     str(cpp), "-o", str(binary)], check=True, capture_output=True, text=True)
     subprocess.run([str(binary)], check=True, capture_output=True, text=True)
 
     compact = " ".join(launcher.split())
     assert "const int64_t kM = rows;" in compact
-    assert "static_cast<uint32_t>(kM), static_cast<uint32_t>(kNPerCore)" in compact
-    assert "{5, static_cast<uint16_t>(CeilDiv(rows, int64_t{352})), 1}" in compact
-    assert "queue->enqueu_kernel(*kernel, {5, 3, 1}, cores)" in compact
+    assert "static_cast<uint32_t>(multibase ? 3 * rows : rows), static_cast<uint32_t>(kNPerCore)" in compact
+    assert "{selected.grid_x, selected.grid_y, 1}" in compact
     assert "check_range(input_spm_addr, input_bytes)" in compact
     assert "check_range(gate_output_spm_addr, output_bytes)" in compact
     assert "input_spm_addr + input_bytes <= gate_output_spm_addr" in compact

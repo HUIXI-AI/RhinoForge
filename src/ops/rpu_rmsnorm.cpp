@@ -447,9 +447,10 @@ void rpu_launch_rmsnorm_nogamma_spm_kernel(
 
 void rpu_launch_pi05_adarms_norm_shift_spm_kernel(
     uint32_t input_spm, uint32_t output_spm, uint32_t scale_spm,
-    uint32_t shift_spm, int64_t rows, double eps, int cores) {
-  TORCH_CHECK(rows >= 1 && rows <= 64 && (cores == 1 || cores == 8),
-              "Pi0.5 norm-shift requires H1024, M1..64 and 1 or 8 cores");
+    uint32_t shift_spm, int64_t rows, double eps, int cores, bool denoise_siblings) {
+  TORCH_CHECK(rows >= 1 && rows <= 64 &&
+                  (cores == 1 || cores == 4 || cores == 6 || cores == 8),
+              "Pi0.5 norm-shift requires H1024, M1..64 and 1, 4, 6 or 8 cores");
   TORCH_CHECK(std::isfinite(eps) && eps > 0 && eps <= 1.0,
               "Pi0.5 norm-shift requires finite eps in (0,1]");
   TORCH_CHECK(SPM_ALLOC.is_initialized(), "Pi0.5 norm-shift requires live SPM");
@@ -473,7 +474,20 @@ void rpu_launch_pi05_adarms_norm_shift_spm_kernel(
                   disjoint(output_spm, matrix_bytes, scale_spm, row_bytes) &&
                   disjoint(output_spm, matrix_bytes, shift_spm, row_bytes),
               "Pi0.5 norm-shift rejects partial output alias or parameter overwrite");
-  auto* kernel = GET_KERNEL(KernelId::PI05_ADARMS_NORM_SHIFT_H1024);
+  // An owner that admits them takes a sibling when the expansion REF provides
+  // it, with the same register image and the same output bytes. At exact M50
+  // the warp8 payload's eight blocks cover row = block + 8k with scale/shift
+  // loaded once. From 9 to 16 rows the row-pair payload's block b normalizes
+  // rows 2b and 2b + 1 (register 14 = rows), so one wave of at most eight
+  // blocks replaces the second wave of single-row blocks.
+  const auto& cache = KernelCache::instance();
+  const bool warp8 = denoise_siblings && rows == 50 &&
+      cache.has_loaded(KernelId::PI05_ADARMS_NORM_SHIFT_H1024_M50_WARP8);
+  const bool row_pair = denoise_siblings && rows > 8 && rows <= 16 &&
+      cache.has_loaded(KernelId::PI05_ADARMS_NORM_SHIFT_H1024_ROW_PAIR);
+  auto* kernel = GET_KERNEL(warp8 ? KernelId::PI05_ADARMS_NORM_SHIFT_H1024_M50_WARP8
+      : row_pair ? KernelId::PI05_ADARMS_NORM_SHIFT_H1024_ROW_PAIR
+                 : KernelId::PI05_ADARMS_NORM_SHIFT_H1024);
   TORCH_CHECK(kernel, "Pi0.5 norm-shift expansion kernel is unavailable");
   kernel->reset_regs();
   kernel->set_regs(0, uint16_t(1024));
@@ -486,11 +500,13 @@ void rpu_launch_pi05_adarms_norm_shift_spm_kernel(
     kernel->set_regs(entry.first + 1, uint16_t(entry.second >> 16));
   }
   kernel->set_regs(10, half_to_u16(c10::Half(eps)));
+  if (row_pair) kernel->set_regs(14, uint16_t(rows));
+  const uint16_t grid = warp8 ? 8 : row_pair ? uint16_t((rows + 1) / 2) : uint16_t(rows);
   auto* queue = GET_QUEUE(cores);
   queue->set_broadcast_mode(true);
   std::vector<uint8_t> core_ids;
   for (int core = 0; core < cores; ++core) core_ids.push_back(core);
-  queue->enqueu_kernel(*kernel, {uint16_t(rows), 1, 1}, core_ids);
+  queue->enqueu_kernel(*kernel, {grid, 1, 1}, core_ids);
 }
 
 // One M32 parent launch, with per-row clean/noisy parameter selection only.
@@ -608,8 +624,10 @@ void rpu_launch_lingbot2_adarms_norm_shift_h768_spm_kernel(
 void rpu_launch_rhinovla_newton_norm_shift_spm_kernel(
     uint32_t input_spm, uint32_t output_spm, uint32_t scale_spm,
     uint32_t shift_spm, int64_t rows, double eps, int cores) {
-  TORCH_CHECK(rows >= 1 && rows <= 64 && (cores == 1 || cores == 8),
-              "RhinoVLA Newton norm-shift requires H1024, M1..64 and 1 or 8 cores");
+  // Broadcast: every listed core normalizes all rows of its own replica, so
+  // the 4/6-core expert residual uses the same payload on its budget.
+  TORCH_CHECK(rows >= 1 && rows <= 64 && cores >= 1 && cores <= 8,
+              "RhinoVLA Newton norm-shift requires H1024, M1..64 and 1..8 cores");
   TORCH_CHECK(std::isfinite(eps) && eps > 0 && eps <= 1.0,
               "RhinoVLA Newton norm-shift requires finite eps in (0,1]");
   TORCH_CHECK(SPM_ALLOC.is_initialized(), "RhinoVLA Newton norm-shift requires live SPM");

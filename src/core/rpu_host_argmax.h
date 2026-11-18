@@ -6,9 +6,13 @@
 #include <ATen/Parallel.h>
 #include <c10/util/Half.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <thread>
+#include <tuple>
+#include <vector>
 
 #if defined(__aarch64__)
 #include <arm_neon.h>
@@ -112,7 +116,56 @@ inline at::Tensor reduce_cpu_rows(const at::Tensor& logits) {
   return out.reshape(sizes);
 }
 
-// Only this CPU compatibility entry admits FP32. The device top1 path stays FP16.
+// Row blocks over host threads for a large multi-row scan. at::parallel_for is
+// serial in this extension build (no OpenMP), so it cannot split the rows. Each
+// row is still scanned whole by argmax_row, so no result depends on the split.
+template <typename F>
+inline void for_each_row_block(int64_t rows, int64_t cols, const F& block) {
+  constexpr int64_t kMinParallelElements = int64_t{1} << 20;
+  constexpr int64_t kMaxThreads = 8;
+  const int64_t hardware =
+      std::max<int64_t>(1, static_cast<int64_t>(std::thread::hardware_concurrency()));
+  const int64_t workers = rows > 1 && rows * cols >= kMinParallelElements
+      ? std::min({rows, hardware, kMaxThreads}) : 1;
+  const int64_t per = (rows + workers - 1) / workers;
+  std::vector<std::thread> threads;
+  threads.reserve(static_cast<size_t>(workers));
+  for (int64_t begin = per; begin < rows; begin += per) {
+    threads.emplace_back(block, begin, std::min(rows, begin + per));
+  }
+  block(int64_t{0}, std::min(rows, per));
+  for (auto& thread : threads) thread.join();
+}
+
+// Index and FP32 value of each row's first maximum, or of its first NaN.
+inline std::tuple<at::Tensor, at::Tensor> reduce_cpu_rows_with_values(
+    const at::Tensor& logits) {
+  const int64_t vocab = logits.size(-1);
+  const int64_t rows = logits.numel() / vocab;
+  const auto options = at::TensorOptions().device(at::kCPU);
+  at::Tensor indices = at::empty({rows}, options.dtype(at::kLong));
+  at::Tensor values = at::empty({rows}, options.dtype(at::kFloat));
+  int64_t* index_out = indices.data_ptr<int64_t>();
+  float* value_out = values.data_ptr<float>();
+  const auto scan = [&](const auto* data) {
+    for_each_row_block(rows, vocab, [=](int64_t begin, int64_t end) {
+      for (int64_t row = begin; row < end; ++row) {
+        const auto* values_row = data + row * vocab;
+        const int64_t index = argmax_row(values_row, vocab);
+        index_out[row] = index;
+        value_out[row] = static_cast<float>(values_row[index]);
+      }
+    });
+  };
+  if (logits.scalar_type() == at::kHalf) {
+    scan(logits.data_ptr<c10::Half>());
+  } else {
+    scan(logits.data_ptr<float>());
+  }
+  return {indices, values};
+}
+
+// Only this CPU compatibility entry admits FP32. The RPU top1 path stays FP16.
 inline at::Tensor argmax_lastdim_cpu(const at::Tensor& logits) {
   TORCH_CHECK(logits.device().is_cpu(), "host argmax: logits must be on CPU");
   TORCH_CHECK(logits.dim() == 2,

@@ -43,7 +43,6 @@
 using namespace at;
 using namespace ::rhino_lkn;
 
-#define NUM_CORES 8
 #define DWIDTH 2
 
 // W8A16 per-projection scale validation. Same four checks as the already-strong
@@ -54,10 +53,37 @@ using namespace ::rhino_lkn;
 // per-channel multipliers, i.e. a silent numeric corruption rather than a crash.
 // The `else` leg is the reverse hole: an int8 weight with no scale list is read
 // back as fp16 by the kernel.
+//
+// W4A16 (RPU_GR00T_W4A16) block projections arrive as G32 pgrp-packed uint8
+// [N,K/2] with the controller-striped 2D fp16 scale. `w4_partition` is the
+// Linear partition the forward launches them with (1 column, 0 row); -1 means
+// the projection has no W4 route. The launcher re-checks the same ABI on every
+// call; this check fails at installation instead of on the first forward.
+static void check_gr00t_w4a16_projection(const at::Tensor& w, const at::Tensor& s,
+                                         int w4_partition, int64_t cores,
+                                         const char* ctx, const char* name, int64_t i) {
+    const int64_t n = w.size(0), k = w.size(1) * 2;
+    const bool col = w4_partition == 1;
+    TORCH_CHECK(cores > 0 && n % (col ? 16 * cores : 16) == 0 &&
+                    k % (col ? 64 : 64 * cores) == 0,
+                ctx, ": packed W4 ", name, "[", i, "] [", n, ",", k,
+                "] does not split into 16-aligned N and 64-aligned K over ", cores,
+                col ? " column" : " row", " lanes");
+    const int64_t local_g = (col ? k : k / cores) / 32;
+    const int64_t local_n = col ? n / cores : n;
+    const int64_t expected = cores * ((local_g + 3) / 4) * ((local_n + 63) / 64) * 256;
+    TORCH_CHECK(s.defined() && s.dim() == 2 && s.size(0) == 32 &&
+                    s.scalar_type() == at::kHalf && s.device().type() == at::kPrivateUse1 &&
+                    s.is_contiguous() && s.numel() == expected,
+                ctx, ": packed W4 ", name, "_scale[", i, "] must be the contiguous fp16 RPU "
+                "G32 pgrp payload of ", expected, " elements, got ", s.sizes());
+}
+
 static void check_gr00t_vl_w8a16_scale_list(int64_t n_layers,
                                             const at::TensorList& weights,
                                             const at::TensorList& scales,
-                                            const char* name) {
+                                            const char* name, int w4_partition,
+                                            int64_t cores) {
     const char* ctx = "gr00t_vl_encoder_set_weights";
     const bool quantized = !scales.empty();
     if (quantized) {
@@ -69,9 +95,14 @@ static void check_gr00t_vl_w8a16_scale_list(int64_t n_layers,
         const at::Tensor& w = weights[i];
         if (quantized) {
             const at::Tensor& s = scales[i];
+            if (w4_partition >= 0 && w.scalar_type() == at::kByte) {
+                check_gr00t_w4a16_projection(w, s, w4_partition, cores, ctx, name, i);
+                continue;
+            }
             TORCH_CHECK(w.scalar_type() == at::kChar,
-                        ctx, ": W8A16 mode requires int8 ", name, "[", i,
-                        "], got ", w.scalar_type());
+                        ctx, ": quantized ", name, "[", i, "] must be int8",
+                        w4_partition >= 0 ? " or packed uint8 W4" : "",
+                        ", got ", w.scalar_type());
             TORCH_CHECK(s.defined() && s.dim() == 1
                         && s.scalar_type() == at::kHalf
                         && s.device().type() == at::kPrivateUse1
@@ -82,8 +113,8 @@ static void check_gr00t_vl_w8a16_scale_list(int64_t n_layers,
                         ctx, ": ", name, "_scale[", i, "].numel()=", s.numel(),
                         " != output dim=", w.size(0));
         } else {
-            TORCH_CHECK(w.scalar_type() != at::kChar,
-                        ctx, ": int8 ", name, "[", i,
+            TORCH_CHECK(w.scalar_type() != at::kChar && w.scalar_type() != at::kByte,
+                        ctx, ": quantized ", name, "[", i,
                         "] requires a non-empty scale list for this projection");
         }
     }
@@ -101,7 +132,7 @@ bool gr00t_vl_kv_spm_only_opt_in() {
 }
 
 // Stable descriptor identities. GR00T_VL_ENCODER_FIXED_KERNEL_BASIS: the
-// remaining launches are the model's fixed LayerNorm/GELU/residual math,
+// remaining launches are the model's fixed LayerNorm/GELU/W4 row-bias/residual math,
 // persistent-weight preload, or final result DMA. None has a selectable
 // physical implementation in this owner.
 constexpr int64_t GR00T_VL_Q_LINEAR_SITE = 1303880572584289854LL;
@@ -117,7 +148,7 @@ constexpr int64_t GR00T_VL_FF2_LINEAR_SITE = 3126403930706634445LL;
 constexpr int64_t GR00T_VL_FF_ALL_REDUCE_SITE = 4133575514160129194LL;
 
 constexpr uint32_t GR00T_VL_KV_CAPABILITIES =
-    KV_INSERT_CAP_V2 | KV_INSERT_CAP_V16;
+    KV_INSERT_CAP_V2 | KV_INSERT_CAP_V16 | KV_INSERT_CAP_NON8_TP_V16;
 // Raw attention reads the just-produced SPM K/V. Keep the public DDR mirror
 // unless the cold, exact ordinary-encoder opt-in explicitly omits its writes.
 constexpr int64_t GR00T_VL_KV_FLAG_DDR_MIRROR = 1;
@@ -146,6 +177,41 @@ public:
 
     Gr00tVlEncoderModel()
         : kv_spm_only_opt_in_(gr00t_vl_kv_spm_only_opt_in()) {}
+
+    // Cold execution topology. Must precede set_weights: the Python adapter
+    // swizzles every Linear for this count. Eight keeps the historical layout.
+    // Four admits only the exact GR00T N1.7 encoder (4 layers, 32 heads x D64,
+    // H2048, FF8192): 8 heads and 2048 FF channels per core, the DDR KV route
+    // and eight physical KV stripes. Raw-SPM attention stays eight-core only.
+    void set_execution_cores(int64_t cores) {
+        TORCH_CHECK(cores == 4 || cores == 8,
+                    "GR00T VL encoder execution cores must be 4 or 8");
+        TORCH_CHECK(layer_weights_.empty() && !z2_bound_ &&
+                        z2_prepared_seq_len_ == 0,
+                    "GR00T VL encoder execution cores must precede weights");
+        set_execution_core_count(static_cast<int>(cores));
+    }
+
+    std::vector<int64_t> execution_topology() const {
+        TORCH_CHECK(!layer_weights_.empty(),
+                    "GR00T VL encoder topology requires installed weights");
+        return {num_cores(), attn_tp(), mlp_tp(),
+                DecoderExecutionTopology::physical_kv_cores,
+                num_q_heads(), intermediate_size()};
+    }
+
+    DecoderExecutionTopology resolve_model_execution_topology(
+            int64_t nq, int64_t nkv, int64_t hd, int64_t h,
+            int64_t intermediate) const override {
+        if (num_cores() == 8)
+            return FusedModelBase::resolve_model_execution_topology(
+                nq, nkv, hd, h, intermediate);
+        TORCH_CHECK(num_cores() == 4 && nq == 32 && nkv == 32 && hd == 64 &&
+                        h == 2048 && intermediate == 8192,
+                    "no admitted reduced-core GR00T VL encoder profile: 4 cores "
+                    "require 32 heads, D64, H2048 and FF8192");
+        return {4, 4, 4};
+    }
 
     void set_weights(
         at::TensorList norm1_w_list, at::TensorList norm1_b_list,
@@ -198,6 +264,8 @@ public:
         };
         check_vec(vlln_w, "vlln_w"); check_vec(vlln_b, "vlln_b"); check_vec(inv_w_rms, "inv_w_rms");
 
+        TORCH_CHECK(num_cores() == 8 || N == 4,
+                    "reduced-core GR00T VL encoder requires exactly four layers");
         // No GQA; reuse base slots (intermediate_size = ff_inter).
         set_model_params(num_heads, num_heads, head_dim, hidden_size, ff_inter);
         set_num_layers(N);
@@ -217,20 +285,36 @@ public:
         vlln_w_ = vlln_w; vlln_b_ = vlln_b; inv_w_rms_ = inv_w_rms;
 
         // W8A16: attach per-output-channel scales for the 6 quantized GEMMs (empty = fp16).
-        check_gr00t_vl_w8a16_scale_list(N, to_q_list,   to_q_scale_list,   "to_q");
-        check_gr00t_vl_w8a16_scale_list(N, to_k_list,   to_k_scale_list,   "to_k");
-        check_gr00t_vl_w8a16_scale_list(N, to_v_list,   to_v_scale_list,   "to_v");
-        check_gr00t_vl_w8a16_scale_list(N, to_out_list, to_out_scale_list, "to_out");
-        check_gr00t_vl_w8a16_scale_list(N, ff0_list,    ff0_scale_list,    "ff0");
-        check_gr00t_vl_w8a16_scale_list(N, ff2_list,    ff2_scale_list,    "ff2");
-        if (!to_q_scale_list.empty()) {
+        // W4A16 carries G32 pgrp-packed weights and striped scales through the same lists.
+        // One precision for the six block projections of every layer: the scale
+        // fan-out below and the W8-only fused admissions read it from one tensor.
+        for (const at::TensorList* list : {&to_q_list, &to_k_list, &to_v_list,
+                                           &to_out_list, &ff0_list, &ff2_list}) {
             for (int64_t i = 0; i < N; ++i) {
-                layer_weights_[i].to_q_ws   = to_q_scale_list[i];
-                layer_weights_[i].to_k_ws   = to_k_scale_list[i];
-                layer_weights_[i].to_v_ws   = to_v_scale_list[i];
-                layer_weights_[i].to_out_ws = to_out_scale_list[i];
-                layer_weights_[i].ff0_ws    = ff0_scale_list[i];
-                layer_weights_[i].ff2_ws    = ff2_scale_list[i];
+                TORCH_CHECK((*list)[i].scalar_type() == to_q_list[0].scalar_type(),
+                            "gr00t_vl_encoder_set_weights: block projections must share one precision, got ",
+                            (*list)[i].scalar_type(), " in layer ", i, " and ",
+                            to_q_list[0].scalar_type(), " for to_q[0]");
+            }
+        }
+        const int64_t cores = num_cores();
+        check_gr00t_vl_w8a16_scale_list(N, to_q_list,   to_q_scale_list,   "to_q",   1, cores);
+        check_gr00t_vl_w8a16_scale_list(N, to_k_list,   to_k_scale_list,   "to_k",   1, cores);
+        check_gr00t_vl_w8a16_scale_list(N, to_v_list,   to_v_scale_list,   "to_v",   1, cores);
+        check_gr00t_vl_w8a16_scale_list(N, to_out_list, to_out_scale_list, "to_out", 0, cores);
+        check_gr00t_vl_w8a16_scale_list(N, ff0_list,    ff0_scale_list,    "ff0",    1, cores);
+        check_gr00t_vl_w8a16_scale_list(N, ff2_list,    ff2_scale_list,    "ff2",    0, cores);
+        if (!to_q_scale_list.empty()) {
+            // Packed W4 scales are retained at the pgrp launcher's cores*512 B
+            // DDR alignment; W8 scales pass through unchanged.
+            for (int64_t i = 0; i < N; ++i) {
+                auto& lw = layer_weights_[i];
+                lw.to_q_ws   = rpu_retain_linear_quant_scale(lw.to_q_w,   to_q_scale_list[i],   cores);
+                lw.to_k_ws   = rpu_retain_linear_quant_scale(lw.to_k_w,   to_k_scale_list[i],   cores);
+                lw.to_v_ws   = rpu_retain_linear_quant_scale(lw.to_v_w,   to_v_scale_list[i],   cores);
+                lw.to_out_ws = rpu_retain_linear_quant_scale(lw.to_out_w, to_out_scale_list[i], cores);
+                lw.ff0_ws    = rpu_retain_linear_quant_scale(lw.ff0_w,    ff0_scale_list[i],    cores);
+                lw.ff2_ws    = rpu_retain_linear_quant_scale(lw.ff2_w,    ff2_scale_list[i],    cores);
             }
         }
 
@@ -287,23 +371,45 @@ public:
                     "gr00t_vl_encoder Z2: seq_len must be positive");
         TORCH_CHECK(!z2_bound_,
                     "gr00t_vl_encoder Z2: cannot prepare while a lease is active");
-        // Preparation asks for declarations before z2_prepared_seq_len_ is
-        // published. Keep its original disjoint scratch even on failure.
+        TORCH_CHECK(num_cores() == 8,
+                    "gr00t_vl_encoder Z2 is the eight-core profile only");
+        // Use the Z2 eligibility and disjoint scratch during the complete
+        // preparation transaction, restoring the previous state on failure.
         const bool was_preparing = z2_layout_preparing_;
         z2_layout_preparing_ = true;
         auto restore_preparing = c10::make_scope_exit(
             [&] { z2_layout_preparing_ = was_preparing; });
+        const int64_t previous_seq_len = z2_prepared_seq_len_;
+        z2_prepared_seq_len_ = seq_len;
+        bool prepared_committed = false;
+        auto rollback_prepared = c10::make_scope_exit([&] {
+            if (!prepared_committed) z2_prepared_seq_len_ = previous_seq_len;
+        });
         LayoutContext layout;
         layout.chunk_size = seq_len;
         layout.max_kv_seq_len = seq_len;
         layout.num_layers = num_layers();
         layout.use_attn_mask = false;
         layout.is_causal = false;
-        auto prepared = prepare_spm_pipeline_component(
-            layout, compose_fmb_default_three_stage_chunk_plan(
-                        layout, seq_len, /*position=*/0,
-                        ChunkMode::SEQUENTIAL));
-        z2_prepared_seq_len_ = seq_len;
+        const auto stage_plan = compose_fmb_default_three_stage_chunk_plan(
+            layout, seq_len, /*position=*/0, ChunkMode::SEQUENTIAL);
+        const auto manifest = physical_manifest_for_candidate(
+            stage_plan, layout, seq_len, seq_len, /*position=*/0);
+        const int64_t chunk_capacity = ((layout.chunk_size + 15) / 16) * 16;
+        auto descriptor = encode_fmb_prefill_stage_candidate({
+            stage_plan.input.plan.chunk_size, chunk_capacity,
+            chunk_capacity, stage_plan, manifest});
+        const auto candidate = prepare_stage_candidate(descriptor);
+        TORCH_CHECK(candidate->candidate().physical_manifest.state ==
+                        FmbPhysicalManifestState::COMPLETE &&
+                        candidate->candidate().physical_manifest.graph_lifecycle ==
+                            FmbGraphLifecycle::COMPOSITE_CHILD,
+                    "GR00T VL Z2 requires COMPLETE child preparation");
+        layout.stage_plan_fingerprint = candidate->stage_fingerprint();
+        layout = bind_physical_layout_context(layout, manifest);
+        auto prepared = prepare_spm_pipeline_component(layout, stage_plan);
+        z2_stage_descriptor_ = std::move(descriptor);
+        prepared_committed = true;
         return prepared;
     }
 
@@ -370,6 +476,7 @@ public:
         // Keep the FMB cached layout, persistent allocations, and weights.
         // Only the coordinator-owned authority is being retired.
         z2_prepared_seq_len_ = 0;
+        z2_stage_descriptor_.clear();
     }
 
     void check_z2_destroy_allowed() const {
@@ -403,7 +510,8 @@ public:
         set_chunk_size_override(0);
         (void)run_all_layers(
             raw, k_caches, v_caches, /*mask=*/std::nullopt,
-            /*position=*/0, /*is_causal=*/false);
+            /*position=*/0, /*is_causal=*/false,
+            /*planned_chunk_size=*/0, z2_stage_descriptor_);
     }
 
     void stage_z2_outer_fast_component(
@@ -545,15 +653,15 @@ protected:
         append_linear(GR00T_VL_O_LINEAR_SITE);
         append(FmbRouteFamily::ALL_REDUCE,
                GR00T_VL_ATTN_ALL_REDUCE_SITE,
-               fmb_ring_all_reduce_route_selector(chunk.len, hidden_size()));
+               fmb_ring_all_reduce_route_selector(chunk.len, hidden_size(), num_cores()));
         append_linear(GR00T_VL_FF0_LINEAR_SITE);
         append_linear(GR00T_VL_FF2_LINEAR_SITE);
         append(FmbRouteFamily::ALL_REDUCE, GR00T_VL_FF_ALL_REDUCE_SITE,
-               fmb_ring_all_reduce_route_selector(chunk.len, hidden_size()));
-        if (!z2_bound_) {
-            append_fmb_shared_runtime_routes(
-                manifest, plan, hidden_size(), FMB_SHARED_LAYER_INPUT_DMA);
-        }
+               fmb_ring_all_reduce_route_selector(chunk.len, hidden_size(), num_cores()));
+        // Z2's output bridge does not remove the producer's raw-input DMA.
+        append_fmb_shared_runtime_routes(
+            manifest, plan, hidden_size(), FMB_SHARED_LAYER_INPUT_DMA,
+            /*compute_row_multiplier=*/1, num_cores(), mlp_tp());
         std::sort(
             manifest.routes.begin(), manifest.routes.end(),
             [](const FmbRouteManifestEntry& lhs,
@@ -622,19 +730,20 @@ protected:
             plan.spans.front().offset != 0 || plan.spans.front().len != seq) {
             return false;
         }
-        return num_layers() == 4 && layer_weights_.size() == 4 &&
+        return (num_cores() == 4 || num_cores() == 8) &&
+            num_layers() == 4 && layer_weights_.size() == 4 &&
             hidden_size() == 2048 && intermediate_size() == 8192 &&
             num_q_heads() == 32 && num_kv_heads() == 32 &&
             head_dim() == 64 &&
             sdpa_by_mha_spm_is_valid(
                 /*batch=*/1, seq, seq, num_q_heads(), num_kv_heads(),
-                head_dim(), NUM_CORES, /*MASK_NONE=*/0);
+                head_dim(), num_cores(), /*MASK_NONE=*/0);
     }
 
     bool kv_spm_only_profile(
         const FmbThreeStageChunkPlan& plan,
         const LayoutContext& layout, int64_t position) const {
-        return kv_spm_only_opt_in_ && attn_tp() == NUM_CORES &&
+        return kv_spm_only_opt_in_ && attn_tp() == num_cores() &&
             plan.compute.chunks.size() == 1 &&
             subclass_spm_kv_by_mha_eligible(plan, layout, position);
     }
@@ -687,8 +796,8 @@ protected:
         const int64_t nq = num_q_heads();          // 32
         const int64_t hd = head_dim();             // 64
         const int64_t FF = intermediate_size();    // 8192
-        const int64_t local_qhd   = (nq * hd) / NUM_CORES;   // 256
-        const int64_t local_inter = FF / NUM_CORES;          // 1024
+        const int64_t local_qhd   = (nq * hd) / num_cores();   // 256
+        const int64_t local_inter = FF / num_cores();          // 1024
         auto A = [](int64_t bytes) -> int64_t { return Align(bytes, 256); };
 
         const int64_t res    = A(cs * h * DWIDTH);
@@ -720,19 +829,35 @@ protected:
             {"ff_mid",      mlp,    0, 0, StorageClass::Temp, 0, nullptr, ALL},
         };
 
-        // Norm output is dead after Q/K/V and after FF0. The two oproj
-        // writes occur later, after SDPA and FF2 respectively, and each ring
-        // consumes oproj before the next norm writes. Reuse their equal-size
-        // slot only for the ordinary long-prefix layout; all three ring
-        // operands and every attention operand remain mutually disjoint.
+        // Ordinary long-prefix storage follows the unchanged layer stream:
+        //   phase 0..1: norm, Q/K/V, SDPA, O projection;
+        //   phase 2..3: attention residual, norm, FF0/GELU/FF2, FF residual.
+        // residual2 is first written by the attention ring, after every
+        // attention operand is dead, so its root can reuse that earlier
+        // scratch. residual1 stays live through that ring, then is dead until
+        // the FF ring writes it: FF0/GELU/FF2 may use its prefix as ff_mid.
+        // Norm output is dead before each O/FF2 projection writes oproj.
+        // Keep those equal-size slots aliased as before. Both residual rings
+        // still have three disjoint operands; each Linear and SDPA keeps
+        // disjoint input/output storage. No arithmetic or launch order changes.
         if (cs > 256 && !z2_layout_preparing_ && !z2_bound_ &&
             z2_prepared_seq_len_ == 0 && ctx.batch_size == 1 &&
             !ctx.is_causal && !ctx.use_attn_mask && num_layers() == 4 &&
             h == 2048 && FF == 8192 && nq == 32 && num_kv_heads() == 32 &&
-            hd == 64 && attn_tp() == NUM_CORES) {
+            hd == 64 && attn_tp() == num_cores()) {
             for (auto& decl : v) {
-                if (std::string(decl.name) == "oproj")
+                const std::string name = decl.name;
+                decl.phase_start = 0;
+                decl.phase_end = 3;
+                if (name == "oproj")
                     decl.alias_of = "norm_hidden";
+                else if (name == "ff_mid")
+                    decl.alias_of = "residual1";
+                else if (name == "residual2")
+                    decl.phase_start = 2;
+                else if (name == "q" || name == "k" || name == "v" ||
+                         name == "sdpa_tmp" || name == "sdpa_out")
+                    decl.phase_end = 1;
             }
         }
 
@@ -743,7 +868,7 @@ protected:
             d.preload_callback = [this, field](FusedModelBase&, int, uint32_t core0_addr) {
                 rpu_launch_ddr_broadcast_spm_dma(
                     this->*field, /*src_offset_elements=*/0,
-                    hidden_size(), core0_addr);
+                    hidden_size(), core0_addr, num_cores());
             };
             v.push_back(d);
         };
@@ -759,7 +884,7 @@ protected:
             d.preload_callback = [this, field](FusedModelBase&, int L, uint32_t core0_addr) {
                 rpu_launch_ddr_broadcast_spm_dma(
                     layer_weights_[L].*field, /*src_offset_elements=*/0,
-                    hidden_size(), core0_addr);
+                    hidden_size(), core0_addr, num_cores());
             };
             v.push_back(d);
         };
@@ -775,7 +900,7 @@ protected:
             d.preload_callback = [this, per_core, field](FusedModelBase&, int L, uint32_t core0_addr) {
                 rpu_launch_ddr_scatter_spm_dma(
                     layer_weights_[L].*field, /*src_offset_elements=*/0,
-                    per_core, per_core * DWIDTH, core0_addr, NUM_CORES);
+                    per_core, per_core * DWIDTH, core0_addr, num_cores());
             };
             v.push_back(d);
         };
@@ -783,7 +908,7 @@ protected:
             BufferDecl d; d.name = name; d.size = A(h * DWIDTH);
             d.storage = StorageClass::PersistentPerLayer; d.per_layer = nl; d.scope = ALL;
             d.preload_callback = [this, field](FusedModelBase&, int L, uint32_t core0_addr) {
-                rpu_launch_memset_spm_multicore(core0_addr, hidden_size());
+                rpu_launch_memset_spm_multicore(core0_addr, hidden_size(), num_cores());
                 rpu_launch_ddr_broadcast_spm_dma(
                     layer_weights_[L].*field, /*src_offset_elements=*/0,
                     hidden_size(), core0_addr, /*num_cores=*/1);
@@ -799,6 +924,15 @@ protected:
         return v;
     }
 
+    // Packed W4 row Linear takes no in-kernel bias. The row bias buffer holds the
+    // bias on core 0 and zeros elsewhere, so adding it to every core's partial
+    // before the reduction is the same sum the int8/fp16 kernel makes.
+    void add_row_bias_partial(uint32_t bias_addr, int64_t seq_len, int64_t h) {
+        rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
+            bias_addr, addr(0, "oproj"), addr(0, "oproj"),
+            seq_len, h, c10::Half(1.0f), ValuOpType::ADD, /*is_bopa=*/false, num_cores());
+    }
+
     void build_layer_subgraph(int layer_idx, const ChunkInfo& chunk) override {
         const auto& lw = layer_weights_[layer_idx];
         const int64_t seq_len     = chunk.len;
@@ -806,7 +940,7 @@ protected:
         const int64_t nq          = num_q_heads();
         const int64_t hd          = head_dim();
         const int64_t FF          = intermediate_size();
-        const int64_t local_inter = FF / NUM_CORES;
+        const int64_t local_inter = FF / num_cores();
 
         if (!ctx().input_in_spm) emit_layer_input_dma(layer_idx, chunk);
 
@@ -814,18 +948,19 @@ protected:
         if (layer_idx == 0 && chunk.idx == 0) {
             rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
                 addr(0, "inv_w_rms"), addr(0, "residual1"), addr(0, "norm_hidden"),
-                seq_len, h, c10::Half(1.0), ValuOpType::MUL, /*is_bopa=*/false);
+                seq_len, h, c10::Half(1.0), ValuOpType::MUL, /*is_bopa=*/false,
+                num_cores());
             rpu_launch_layernorm_spm_kernel(
                 addr(0, "norm_hidden"), addr(0, "residual1"),
                 addr(0, "vlln_w"), addr(0, "vlln_b"),
-                seq_len, h, eps_, false, 0, NUM_CORES);
+                seq_len, h, eps_, false, 0, num_cores());
         }
 
         // ---- n1 = LN(x, norm1) -> norm_hidden ----
         rpu_launch_layernorm_spm_kernel(
             addr(0, "residual1"), addr(0, "norm_hidden"),
             layer_addr(layer_idx, 0, "norm1_w"), layer_addr(layer_idx, 0, "norm1_b"),
-            seq_len, h, eps_, false, 0, NUM_CORES);
+            seq_len, h, eps_, false, 0, num_cores());
 
         // ---- q/k/v (col-partition) + bias ----
         ctx().consume_physical_route(
@@ -834,21 +969,21 @@ protected:
             /*resolved_flags=*/0, {}, chunk.idx);
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "norm_hidden"), lw.to_q_w, addr(0, "q"),
-            seq_len, nq * hd, h, 1, NUM_CORES, layer_addr(layer_idx, 0, "q_bias"), lw.to_q_ws);
+            seq_len, nq * hd, h, 1, num_cores(), layer_addr(layer_idx, 0, "q_bias"), lw.to_q_ws);
         ctx().consume_physical_route(
             FmbRouteFamily::LINEAR, GR00T_VL_K_LINEAR_SITE,
             static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
             /*resolved_flags=*/0, {}, chunk.idx);
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "norm_hidden"), lw.to_k_w, addr(0, "k"),
-            seq_len, nq * hd, h, 1, NUM_CORES, layer_addr(layer_idx, 0, "k_bias"), lw.to_k_ws);
+            seq_len, nq * hd, h, 1, num_cores(), layer_addr(layer_idx, 0, "k_bias"), lw.to_k_ws);
         ctx().consume_physical_route(
             FmbRouteFamily::LINEAR, GR00T_VL_V_LINEAR_SITE,
             static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
             /*resolved_flags=*/0, {}, chunk.idx);
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "norm_hidden"), lw.to_v_w, addr(0, "v"),
-            seq_len, nq * hd, h, 1, NUM_CORES, layer_addr(layer_idx, 0, "v_bias"), lw.to_v_ws);
+            seq_len, nq * hd, h, 1, num_cores(), layer_addr(layer_idx, 0, "v_bias"), lw.to_v_ws);
 
         // ---- KV-insert@0 + bidirectional SDPA (MASK_NONE, scale 1/√64) ----
         // Resolve the consumed ATTENTION site, not the union layout policy,
@@ -861,7 +996,7 @@ protected:
             chunk.idx);
         const KvInsertSegmentPlan kv_plan =
             restore_kvinsert_plan(
-                GR00T_VL_KV_INSERT_SITE, kv_route.arguments, NUM_CORES, nq, hd);
+                GR00T_VL_KV_INSERT_SITE, kv_route.arguments, num_cores(), nq, hd);
         TORCH_CHECK(kv_plan.segment(0).position == 0 &&
                         kv_plan.logical_rows() == seq_len &&
                         kv_plan.physical_rows() == seq_len,
@@ -876,7 +1011,7 @@ protected:
             rpu_launch_insert_kvcache_spm_unified_with_plan(
                 k_cache, v_cache,
                 addr_offset("k").value, addr_offset("v").value,
-                nq, hd, NUM_CORES,
+                nq, hd, num_cores(),
                 /*k_cache_batch_offset_elems=*/0,
                 /*v_cache_batch_offset_elems=*/0,
                 /*spm_rows=*/0, kv_plan);
@@ -895,12 +1030,12 @@ protected:
                 /*resolved_flags=*/0, {}, chunk.idx);
             rpu_launch_v_transpose_spm(
                 addr(0, "v"), addr(0, "sdpa_tmp"),
-                /*batch=*/1, seq_len, nq, hd, NUM_CORES);
+                /*batch=*/1, seq_len, nq, hd, num_cores());
             rpu_launch_sdpa_by_mha_spm(
                 addr(0, "q"), addr(0, "k"), addr(0, "sdpa_tmp"),
                 addr(0, "sdpa_out"), /*mask_spm=*/0,
                 /*MASK_NONE=*/0, attn_scale, /*batch=*/1,
-                seq_len, seq_len, nq, nq, hd, NUM_CORES);
+                seq_len, seq_len, nq, nq, hd, num_cores());
         } else {
             LayoutContext spm_layout;
             spm_layout.attention_policy =
@@ -922,7 +1057,7 @@ protected:
                 addr_offset("q").value, addr_offset("sdpa_out").value,
                 addr_offset("sdpa_tmp").value, /*sdpa_mask_off=*/0,
                 seq_len, nq, nq, hd, /*kv_seq_len=*/seq_len,
-                NUM_CORES, NUM_CORES);
+                num_cores(), DecoderExecutionTopology::physical_kv_cores);
         }
 
         // ---- o-proj (row) + bias + PLAIN residual -> residual2 = x + attn ----
@@ -930,22 +1065,25 @@ protected:
             FmbRouteFamily::LINEAR, GR00T_VL_O_LINEAR_SITE,
             static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
             /*resolved_flags=*/0, {}, chunk.idx);
+        const bool w4_o = lw.to_out_w.scalar_type() == at::kByte;
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "sdpa_out"), lw.to_out_w, addr(0, "oproj"),
-            seq_len, h, nq * hd, 0, NUM_CORES, layer_addr(layer_idx, 0, "out_bias"), lw.to_out_ws);
+            seq_len, h, nq * hd, 0, num_cores(),
+            w4_o ? 0 : layer_addr(layer_idx, 0, "out_bias"), lw.to_out_ws);
+        if (w4_o) add_row_bias_partial(layer_addr(layer_idx, 0, "out_bias"), seq_len, h);
         ctx().consume_physical_route(
             FmbRouteFamily::ALL_REDUCE, GR00T_VL_ATTN_ALL_REDUCE_SITE,
-            fmb_ring_all_reduce_route_selector(seq_len, h),
+            fmb_ring_all_reduce_route_selector(seq_len, h, num_cores()),
             /*resolved_flags=*/0, {}, chunk.idx);
         rpu_launch_all_reduce_sum_residual_kernel(
             addr(0, "oproj"), addr(0, "residual1"), addr(0, "residual2"),
-            seq_len, h, NUM_CORES, NUM_CORES);
+            seq_len, h, num_cores(), num_cores());
 
         // ---- n3 = LN(x, norm3) -> norm_hidden ----
         rpu_launch_layernorm_spm_kernel(
             addr(0, "residual2"), addr(0, "norm_hidden"),
             layer_addr(layer_idx, 0, "norm3_w"), layer_addr(layer_idx, 0, "norm3_b"),
-            seq_len, h, eps_, false, 0, NUM_CORES);
+            seq_len, h, eps_, false, 0, num_cores());
 
         // ---- FFN: ff0(col)+bias -> GELU(tanh-approx) -> ff2(row)+bias + PLAIN residual -> residual1 ----
         ctx().consume_physical_route(
@@ -954,18 +1092,21 @@ protected:
             /*resolved_flags=*/0, {}, chunk.idx);
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "norm_hidden"), lw.ff0_w, addr(0, "ff_mid"),
-            seq_len, FF, h, 1, NUM_CORES, layer_addr(layer_idx, 0, "ff0_bias"), lw.ff0_ws);
+            seq_len, FF, h, 1, num_cores(), layer_addr(layer_idx, 0, "ff0_bias"), lw.ff0_ws);
         rpu_launch_eltwise_unary_spm_kernel(
             addr(0, "ff_mid"), addr(0, "ff_mid"),
             seq_len * local_inter, ValuOpType::ADD,
-            GeluMode::TANH, NUM_CORES);
+            GeluMode::TANH, num_cores());
         ctx().consume_physical_route(
             FmbRouteFamily::LINEAR, GR00T_VL_FF2_LINEAR_SITE,
             static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
             /*resolved_flags=*/0, {}, chunk.idx);
+        const bool w4_ff2 = lw.ff2_w.scalar_type() == at::kByte;
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "ff_mid"), lw.ff2_w, addr(0, "oproj"),
-            seq_len, h, FF, 0, NUM_CORES, layer_addr(layer_idx, 0, "ff2_bias"), lw.ff2_ws);
+            seq_len, h, FF, 0, num_cores(),
+            w4_ff2 ? 0 : layer_addr(layer_idx, 0, "ff2_bias"), lw.ff2_ws);
+        if (w4_ff2) add_row_bias_partial(layer_addr(layer_idx, 0, "ff2_bias"), seq_len, h);
         const bool z2_final = z2_bound_ &&
                               layer_idx == num_layers() - 1 &&
                               !ctx().output_to_spm;
@@ -976,12 +1117,12 @@ protected:
         }
         ctx().consume_physical_route(
             FmbRouteFamily::ALL_REDUCE, GR00T_VL_FF_ALL_REDUCE_SITE,
-            fmb_ring_all_reduce_route_selector(seq_len, h),
+            fmb_ring_all_reduce_route_selector(seq_len, h, num_cores()),
             /*resolved_flags=*/0, {}, chunk.idx);
         rpu_launch_all_reduce_sum_residual_kernel(
             addr(0, "oproj"), addr(0, "residual2"),
             z2_final ? z2_port_addr_ : addr(0, "residual1"),
-            seq_len, h, NUM_CORES, NUM_CORES);
+            seq_len, h, num_cores(), num_cores());
 
         // ---- output: framework writes residual1 -> output_tensor_ on the last layer
         // (output_to_spm=false there); intermediate layers keep residual1 SPM-resident.
@@ -1030,6 +1171,7 @@ private:
     bool z2_bound_ = false;
     bool z2_layout_preparing_ = false;
     int64_t z2_prepared_seq_len_ = 0;
+    std::vector<int64_t> z2_stage_descriptor_;
     uint32_t z2_port_addr_ = 0;
     uint64_t z2_epoch_ = 0;
     uint64_t z2_plan_hash_ = 0;
@@ -1081,6 +1223,16 @@ std::string rpu_gr00t_vl_encoder_kvinsert_cost_catalog_sha256(int64_t handle) {
 
 int64_t rpu_gr00t_vl_encoder_create() {
     return Gr00tVlEncoderRegistry::create();
+}
+
+void rpu_gr00t_vl_encoder_set_execution_core_count(int64_t handle, int64_t cores) {
+    Gr00tVlEncoderRegistry::get(handle, "rpu_gr00t_vl_encoder_set_execution_core_count")
+        ->set_execution_cores(cores);
+}
+
+std::vector<int64_t> rpu_gr00t_vl_encoder_get_execution_topology(int64_t handle) {
+    return Gr00tVlEncoderRegistry::get(handle, "rpu_gr00t_vl_encoder_get_execution_topology")
+        ->execution_topology();
 }
 
 void rpu_gr00t_vl_encoder_destroy(int64_t handle) {

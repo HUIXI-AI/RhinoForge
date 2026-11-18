@@ -27,13 +27,14 @@ from test_grouped_uint4_metadata import inverse_metadata
 def _inverse_grouped(packed, *, n, k, partition, cores=8):
     """Decode bytes and undo TP placement independently in NumPy."""
     e = packed.shape[0]
-    shape = ((e, n // (16 * cores), k // 64, cores, 16, 2, 16)
-             if partition == "col" else
-             (e, n // 16, k // (64 * cores), cores, 16, 2, 16))
-    pairs = packed.numpy().reshape(shape)
-    blocks = np.concatenate((pairs & 15, pairs >> 4), axis=-1).reshape(*shape[:-2], 64)
-    axes = (0, 3, 1, 4, 2, 5) if partition == "col" else (0, 1, 4, 3, 2, 5)
-    return torch.from_numpy(blocks.transpose(axes).copy().reshape(e, n, k))
+    nc, kc = (n // cores, k) if partition == "col" else (n, k // cores)
+    ee, nn, kk = np.indices((e, n, k), dtype=np.int64)
+    core = nn // nc if partition == "col" else kk // kc
+    nl, kl = nn % nc, kk % kc
+    offset = (((((ee * ((nc + 31) // 32) + nl // 32) * (kc // 32) + kl // 32)
+                * cores + core) * 16 + nl % 16) * 2 + nl % 32 // 16) * 16 + kl % 16
+    codes = (packed.numpy().reshape(-1)[offset] >> (kl % 32 // 16 * 4)) & 15
+    return torch.from_numpy(codes.astype(np.uint8))
 
 
 @pytest.mark.parametrize("partition,n,k", [("col", 512, 2048), ("row", 2048, 512)])
@@ -182,24 +183,34 @@ def _reader(path, profile="rtn"):
 
 
 @pytest.mark.parametrize("profile", ["rtn", "gptq"])
-def test_sharded_quartets_preserve_zero_scales_and_per_expert_layout(tmp_path, profile):
+@pytest.mark.parametrize("cores", [4, 6, 8])
+def test_sharded_quartets_preserve_zero_scales_and_per_expert_layout(tmp_path, profile, cores):
     expected = _checkpoint(tmp_path, profile=profile)
     source = _reader(tmp_path, profile).layer_source(0)
     assert source.profile_id == (RTN_PROFILE_ID if profile == "rtn" else GPTQ_PROFILE_ID)
-    gate, up, down, gs, us, ds, mode = source.prepare()
+    gate, up, down, gs, us, ds, mode = source.prepare(num_cores=cores)
     assert mode == 6
     for role, packed, scales, partition, n, k in (
         ("gate_proj", gate, gs, "col", 512, 128),
         ("up_proj", up, us, "col", 512, 128),
         ("down_proj", down, ds, "row", 128, 512),
     ):
-        assert torch.equal(_inverse_grouped(packed, n=n, k=k, partition=partition),
-                           torch.stack([value[0] for value in expected[role]]))
+        physical_n = 768 if cores == 6 and partition == "col" else n
+        physical_k = 768 if cores == 6 and partition == "row" else k
+        decoded = _inverse_grouped(packed, n=physical_n, k=physical_k, partition=partition, cores=cores)
+        assert torch.equal(decoded[:, :n, :k], torch.stack([value[0] for value in expected[role]]))
+        if cores == 6:
+            tail = decoded[:, n:] if partition == "col" else decoded[:, :, k:]
+            assert torch.all(tail == 8)
         reference = torch.stack([value[1] for value in expected[role]])
+        if cores == 6:
+            padded = torch.ones(reference.shape[0], physical_k // 128, physical_n, dtype=torch.float16)
+            padded[:, :k // 128, :n] = reference
+            reference = padded
         if partition == "row":
             reference = reference.repeat_interleave(2, dim=1)
         restored = inverse_metadata(scales, global_q=reference.shape[1],
-                                    global_n=n, partition=partition)
+                                    global_n=physical_n, partition=partition, cores=cores)
         assert torch.equal(restored.view(torch.int16), reference.view(torch.int16))
     source.release()
     with pytest.raises(ValueError, match="already consumed"):
@@ -324,7 +335,7 @@ def _rtn_config():
     return config
 
 
-def test_rtn_profile_admission_excludes_gptq_and_reduced_tp():
+def test_rtn_profile_admission_keeps_source_identity_at_each_core_count():
     from rpu_backend.adapters.qwen3_5_moe.cores import core_topology
     from rpu_backend.runtime import UnsupportedModelError
 
@@ -332,8 +343,7 @@ def test_rtn_profile_admission_excludes_gptq_and_reduced_tp():
     assert validate_exact_profile(config)["profile"] == RTN_PROFILE_ID
     assert core_topology(config=config).num_cores == 8
     for cores in (4, 6):
-        with pytest.raises(UnsupportedModelError, match="TP8"):
-            core_topology({"model": {"num_cores": cores}}, config=config)
+        assert core_topology({"model": {"num_cores": cores}}, config=config).num_cores == cores
     config.pop("rtn_metadata")
     with pytest.raises(ValueError):
         validate_exact_profile(config)
@@ -442,3 +452,86 @@ def test_layer_packing_releases_source_only_after_success(tmp_path, monkeypatch,
     assert packed.routed_down_scale.shape == (2, 1, 2, 8, 4, 64)
     for name in ("router", "shared_gate", "shared_up", "shared_down", "shared_scalar_gate"):
         assert getattr(packed, name).dtype == torch.float16
+
+
+@pytest.mark.parametrize("profile,cores,acc32,message", [
+    ("fp8", 8, True, "resident prefill requires Text ACC16"),
+    *[(profile, cores, False, "resident prefill requires model.num_cores=8")
+      for profile in ("fp8", "rtn", "gptq") for cores in (4, 6)],
+])
+def test_resident_invalid_cold_mode_rejects_before_public_load_or_install(
+        monkeypatch, profile, cores, acc32, message):
+    import rpu_backend
+    from rpu_backend.api import conditional_generation as public
+    from rpu_backend.api.errors import UnsupportedModelError
+    from rpu_backend.adapters import qwen3_5_moe as moe
+    from rpu_backend.runtime import weights
+
+    config = _accumulation_config(profile)
+    execution = {"model": {"num_cores": cores},
+                 "prefill": {"moe_resident_prefill": True, "linear_acc32": acc32}}
+    monkeypatch.setattr(public.AutoConfig, "from_pretrained", lambda *a, **k: config)
+    for owner, name in ((moe.Qwen3_5MoeAdapter, "load_pretrained"),
+                        (rpu_backend.graph, "GraphCache"),
+                        (rpu_backend.graph, "Graph"),
+                        (weights, "convert_linear_weights_inplace")):
+        monkeypatch.setattr(owner, name,
+            lambda *a, **k: pytest.fail("invalid resident request reached loading/arena/swizzle"))
+    with pytest.raises(UnsupportedModelError, match=message):
+        moe.Qwen3_5MoeAdapter.preflight_execution(config, execution)
+    with pytest.raises(UnsupportedModelError, match=message):
+        public.RPUModelForConditionalGeneration.from_pretrained(
+            f"/mock-{profile}", rpu_execution=execution)
+    inner = SimpleNamespace()
+    with pytest.raises(UnsupportedModelError, match=message):
+        moe.install_qwen3_5_moe_text_for_rpu(
+            inner, config, max_seq_len=64, execution_config=execution)
+    assert vars(inner) == {}
+
+
+@pytest.mark.parametrize("profile,cores,resident,acc32", [
+    *[(profile, 8, True, False) for profile in ("fp8", "rtn", "gptq")],
+    *[("fp8", cores, False, acc32) for cores in (4, 6, 8) for acc32 in (False, True)],
+    *[(profile, cores, False, False) for profile in ("rtn", "gptq") for cores in (4, 6, 8)],
+])
+def test_resident_cold_admission_keeps_legal_tp8_and_ordinary_modes(
+        monkeypatch, profile, cores, resident, acc32):
+    from rpu_backend.adapters import qwen3_5_moe as moe
+    from rpu_backend.adapters.qwen3_5_moe import text
+
+    config = _accumulation_config(profile)
+    execution = {"model": {"num_cores": cores},
+        "prefill": {"moe_resident_prefill": resident, "linear_acc32": acc32},
+        "vision": {"linear_acc32": True}}
+    moe.Qwen3_5MoeAdapter.preflight_execution(config, execution)
+    assert text._validate_qwen3_5_moe_linear_accumulation(
+        validate_exact_profile(config)["profile"], execution) is acc32
+    # The actual direct installer must pass admission and reach option resolution.
+    # Stop there: no graph allocation, transform, upload or native invocation.
+    class ReachedOptions(Exception):
+        pass
+    def accepted(*args, **kwargs):
+        raise ReachedOptions()
+    monkeypatch.setattr(text, "_resolve_text_install_options", accepted)
+    for name in ("qwen3_5_moe_set_execution_cores", "qwen3_5_moe_get_execution_topology",
+                 "qwen3_5_moe_get_execution_topology_v2"):
+        monkeypatch.setattr(torch.ops.rpu, name,
+            lambda *a, **k: pytest.fail("cold admission invoked native"), raising=False)
+    inner = SimpleNamespace()
+    with pytest.raises(ReachedOptions):
+        moe.install_qwen3_5_moe_text_for_rpu(
+            inner, config, max_seq_len=64, execution_config=execution)
+    assert vars(inner) == {} and execution["vision"]["linear_acc32"] is True
+
+
+@pytest.mark.parametrize("partition,cores,n,k", [
+    ("col", 8, 128, 128), ("col", 4, 192, 96), ("row", 6, 48, 576),
+])
+def test_grouped_w4_physical_tail_roundtrip_preserves_expert_offsets(partition, cores, n, k):
+    from rpu_backend.quant.int4_pgrp_pack import w4_storage_shape
+
+    codes = torch.randint(0, 16, (3, n, k), generator=torch.Generator().manual_seed(1021), dtype=torch.uint8)
+    packed = pack_grouped_uint4(codes, partition=partition, num_cores=cores)
+    physical_n, physical_k = w4_storage_shape(n, k, int(partition == "col"), cores)
+    assert packed.shape == (3, physical_n * physical_k)
+    assert torch.equal(_inverse_grouped(packed, n=n, k=k, partition=partition, cores=cores), codes)

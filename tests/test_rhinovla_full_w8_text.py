@@ -284,6 +284,7 @@ public:
     uint32_t nvfp4_scale_addr(const char*) const {return 0;}
     bool use_planned_silu_mul() const {return false;}
     bool qwen3vl_decode_gemv(int64_t) const {return false;}
+    bool wall_action_fused_rows_supported(int64_t,const WallSortingConfig&) const {return false;}
 ''' + declaration + setter + consume + r'''
     void bind_expected_policy() {
         struct {int64_t len=240,idx=3;} chunk;
@@ -304,6 +305,8 @@ public:
         const bool rtc_prefill_mixed=false,wall_action_fuse_silu_mul_=false;
         const bool wall_action_linear_ring_postnorm=false,wall_action_resident_layer=false;
         const bool wall_action_fp16_transfer=false;
+        const bool wall_small_prefill_fused=false,wall_fp16_long_prefill_fused=false;
+        const bool wall_base_nvfp4_down_ring_norm=false,is_last_layer=false;
         const uint32_t wall_action_weight_base=0,WALL_ACTION_GATE_OFFSET=0,WALL_ACTION_UP_OFFSET=0;
 ''' + caller + r'''
     }
@@ -363,6 +366,8 @@ int main() {
 '''
     source, executable = tmp_path / "text_high_fusion.cpp", tmp_path / "text_high_fusion"
     source.write_text(program)
-    subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", str(source), "-o", str(executable)],
-                   check=True, capture_output=True, text=True)
-    subprocess.run([str(executable)], check=True, capture_output=True, text=True)
+    built = subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", str(source), "-o", str(executable)],
+                           capture_output=True, text=True)
+    assert built.returncode == 0, built.stdout + built.stderr
+    ran = subprocess.run([str(executable)], capture_output=True, text=True)
+    assert ran.returncode == 0, ran.stdout + ran.stderr

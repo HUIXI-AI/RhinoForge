@@ -5,7 +5,7 @@ from examples.common.text import text_context
 
 def prepare(config, runner):
     import torch
-    from examples.common.generation import _image_inputs, _text_input_ids, _extend_multimodal_input, _generate
+    from examples.common.generation import _image_inputs, _text_input_ids, _generate, qwen3_vl_encode
     prepared = None
     if "prepared_input_safetensors" in config["input"]:
         from examples.common.config import validate_generation_options
@@ -31,22 +31,31 @@ def prepare(config, runner):
     images = _image_inputs(inputs) if prepared is None and component != "text" else []
     processor = AutoProcessor.from_pretrained(checkpoint, local_files_only=True)
     if images:
-        messages = [{"role": "user", "content": [
-            *({"type": "image", "image": image} for image in images),
-            {"type": "text", "text": inputs["prompt"]},
-        ]}]
-        encoded = processor.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True,
-            return_dict=True, return_tensors="pt")
-        encoded = _extend_multimodal_input(encoded, inputs, processor.tokenizer)
+        encoded = qwen3_vl_encode(processor, images, inputs)
     elif prepared is None:
         encoded = {"input_ids": _text_input_ids(processor.tokenizer, inputs)}
     from rpu_backend.api import RPUCache, RPUModelForConditionalGeneration
 
+    # The configured images are known before the cold install: size the
+    # Vision RoPE table and KV cache from their grids (defaults when they fit).
+    vision_grids = ({"image_grid_thw": encoded["image_grid_thw"]}
+                    if "image_grid_thw" in encoded else {})
     model = RPUModelForConditionalGeneration.from_pretrained(
         checkpoint, dtype=torch.float16, device="rpu", rpu_execution=execution,
-        local_files_only=True, trust_remote_code=False)
+        local_files_only=True, trust_remote_code=False, **vision_grids)
     runner.owner = model
+    runner.input_geometry = {"input_ids_shape": list(encoded["input_ids"].shape)}
+    for _k in ("pixel_values", "pixel_values_videos", "attention_mask", "mm_token_type_ids"):
+        _v = encoded.get(_k)
+        if _v is not None and hasattr(_v, "shape"):
+            runner.input_geometry[_k + "_shape"] = list(_v.shape)
+    for _k in ("image_grid_thw", "video_grid_thw"):
+        if _k in encoded and encoded[_k] is not None:
+            runner.input_geometry[_k] = encoded[_k]
+    runner.input_geometry["source_image_sizes_wh"] = [list(image.size) for image in images]
+    runner.input_geometry["component"] = component
+    if component == "vision":
+        runner.input_geometry.pop("input_ids_shape", None)
     if component == "vision":
         return lambda: model.model.visual(
             encoded["pixel_values"].to("rpu", dtype=torch.float16),

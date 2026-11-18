@@ -82,7 +82,12 @@ def test_pi05_per_channel_w4_kv8_contract_and_runtime_pack(tmp_path) -> None:
     raw, n_quantized, _, _ = convert_pi05_tensor(
         raw_q_name, torch.ones(128, 64), bits=8
     )
-    assert n_quantized == 0 and raw_q_name in raw
+    assert n_quantized == 1 and raw_q_name in raw and f"{raw_q_name[:-7]}.weight_scale" in raw
+    vision_q_name = q_name.replace(".language_model.", ".vision_tower.vision_model.encoder.")
+    skipped, n_skipped_quantized, n_kept, _ = convert_pi05_tensor(
+        vision_q_name, torch.ones(128, 64), bits=8
+    )
+    assert n_skipped_quantized == 0 and n_kept == 1 and vision_q_name in skipped
 
     config = pi05_quant_config(bits=4, real_w4=True)
     assert config["method"] == "w4a16"
@@ -136,19 +141,16 @@ def test_pi05_per_channel_w4_kv8_contract_and_runtime_pack(tmp_path) -> None:
     assert pack_int4_projections_inplace(
         decoder, {"q_proj", "down_proj"}, attn_num_cores=8
     ) == 2
+    from rpu_backend.adapters.pi05.w4pack import pack_int4_per_channel_as_pgrp, w4_storage_shape
+    expected_q_w, expected_q_s = pack_int4_per_channel_as_pgrp(q_values, q_scale, 1, 8)
+    expected_d_w, expected_d_s = pack_int4_per_channel_as_pgrp(down_values, down_scale, 0, 8)
     assert torch.equal(
         layer.self_attn.q_proj.weight.cpu(),
-        swizzle_pack_int4_pgrp(q_values, 1, 8).reshape(128, 32),
+        expected_q_w.reshape(w4_storage_shape(128, 64, 1, 8)),
     )
-    assert torch.equal(
-        layer.self_attn.q_proj.weight_scale.cpu(),
-        swizzle_int4_pgrp_scale(q_scale.unsqueeze(0).repeat(2, 1), 32, 1, 8),
-    )
+    assert torch.equal(layer.self_attn.q_proj.weight_scale.cpu(), expected_q_s)
     assert torch.equal(
         layer.mlp.down_proj.weight.cpu(),
-        swizzle_pack_int4_pgrp(down_values, 0, 8).reshape(16, 256),
+        expected_d_w.reshape(w4_storage_shape(16, 512, 0, 8)),
     )
-    assert torch.equal(
-        layer.mlp.down_proj.weight_scale.cpu(),
-        swizzle_int4_pgrp_scale(down_scale.unsqueeze(0).repeat(16, 1), 32, 0, 8),
-    )
+    assert torch.equal(layer.mlp.down_proj.weight_scale.cpu(), expected_d_s)

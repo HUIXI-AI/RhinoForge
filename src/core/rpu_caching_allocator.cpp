@@ -6,6 +6,7 @@
 #include "rpu_ops.h"
 #include "rpu_dma_endpoint.h"
 #include "rpu_spm_allocator.h"
+#include "graph/graph_async_end.h"
 
 #include <algorithm>
 #include <cassert>
@@ -433,8 +434,61 @@ void rpu_unregister_ddr_dma_allocation(void* cpu_base) {
     rpu_unregister_ddr_dma_segment(cpu_base);
 }
 
+// Async replay end (graph/graph_async_end.h): an RPU free issued while a Graph
+// submission is in flight keeps its memory until the wait drains it, so no
+// address the device may still read or write is reused.
+namespace {
+
+std::mutex g_async_end_deferred_free_mutex;
+std::vector<std::pair<void*, bool>> g_async_end_deferred_frees;  // (ptr, caching)
+
+}  // namespace
+
+bool rpu_graph_async_end_defer_free(void* ptr, bool caching) noexcept {
+    if (!rpu_graph_async_end_pending()) return false;
+    try {
+        std::lock_guard<std::mutex> lock(g_async_end_deferred_free_mutex);
+        // Recheck under the list lock: the wait clears the pending flag before
+        // it takes this lock to drain, so a free queued here is never lost.
+        if (!rpu_graph_async_end_pending()) return false;
+        g_async_end_deferred_frees.emplace_back(ptr, caching);
+        return true;
+    } catch (...) {
+        // Same quarantine as an unregister failure: leak, never reuse early.
+        std::cerr << "[RPU] async replay end: deferred free bookkeeping failed; "
+                  << "quarantining " << ptr << "\n";
+        return true;
+    }
+}
+
+void rpu_graph_async_end_drain_deferred_frees() noexcept {
+    std::vector<std::pair<void*, bool>> frees;
+    {
+        std::lock_guard<std::mutex> lock(g_async_end_deferred_free_mutex);
+        frees.swap(g_async_end_deferred_frees);
+    }
+    for (const auto& [ptr, caching] : frees) {
+        if (caching) {
+            try {
+                rpu::RPUCachingAllocator::get().free(ptr);
+            } catch (...) {
+                std::cerr << "[RPU] async replay end: deferred caching free "
+                          << "failed for " << ptr << "\n";
+            }
+        } else {
+            rpu_free_registered_ddr(ptr);
+        }
+    }
+}
+
+void rpu_graph_async_end_quarantine_deferred_frees() noexcept {
+    std::lock_guard<std::mutex> lock(g_async_end_deferred_free_mutex);
+    g_async_end_deferred_frees.clear();
+}
+
 void rpu_free_registered_ddr(void* cpu_base) noexcept {
     if (cpu_base == nullptr) return;
+    if (rpu_graph_async_end_defer_free(cpu_base, /*caching=*/false)) return;
     try {
         // Registry identity is local process state and remains valid after the
         // SDK manager has shut down, so retire it for every late deleter.
@@ -1040,6 +1094,9 @@ void* RPUCachingAllocator::malloc(size_t orig_size) {
 
 void RPUCachingAllocator::free(void* ptr) {
     if (!ptr) {
+        return;
+    }
+    if (rpu_graph_async_end_defer_free(ptr, /*caching=*/true)) {
         return;
     }
 

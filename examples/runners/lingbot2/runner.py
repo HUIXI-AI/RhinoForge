@@ -20,6 +20,10 @@ def _lingbot2(runner):
         rpu_execution=config.get("rpu_execution"),
     ).to("rpu")
     runner.owner = policy
+    runner.stage_boundaries = tuple((stage, getattr(policy, "_policy", None), name) for stage, name in (
+        ("vision", "_build_prefix"), ("prefill", "_vlm_fill"),
+        ("vl", "_fill_prefix_multiview_spm_z2"), ("action", "_denoise_unroll_run"),
+        ("action", "_exp_run")))
     policy.prepare_graphs(
         **request, prefix_length_range=inputs.get("prefix_length_range", [215, 225]))
     return lambda: policy.infer(**request).actions_full

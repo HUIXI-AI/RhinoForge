@@ -5,8 +5,17 @@
 #include "rpu_ops.h"
 #include "rpu_spm_allocator.h"  // eager linear stages through the SPM arena
 #include "rpu_linear_tiling.h"  // host-side generated-tile selection
+#include "rpu_g05_linear_contracts.h"
+#include "rpu_qwen3vl_linear_contracts.h"
+#include "rpu_pi_wall_action_qkv_contracts.h"
+#include "rpu_specialized_linear_contracts.h"
+#include "rpu_geglu_linear_contracts.h"
+#include "rpu_pi_kv_linear_contract.h"
+#include "rpu_pi05_q_kv1_abi.h"
+#include "rpu_pi_wall_fp16_retained_contracts.h"
 #include "rpu_hyvla_gateup_resident.h"
 #include "execution_coordinator.h"
+#include "pi05_execution_topology.h"  // Action MLP width per lane count
 #include <ATen/MemoryOverlap.h>
 #include <c10/util/Half.h>
 #include <algorithm>
@@ -14,6 +23,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdint>
+#include <numeric>
 #include <utility>
 #include <vector>   // for vector
 
@@ -54,7 +64,7 @@ static GraphKernelRegisterWriter wall_precision_registers(
 
 at::Tensor rpu_retain_linear_quant_scale(
     const at::Tensor& weight,
-    const at::Tensor& scale) {
+    const at::Tensor& scale, int64_t num_cores) {
   if (!scale.defined() || weight.scalar_type() != at::kByte ||
       scale.scalar_type() != at::kHalf) {
     return scale;
@@ -65,12 +75,15 @@ at::Tensor rpu_retain_linear_quant_scale(
           scale.is_contiguous(),
       "W4 pgrp scale must be a contiguous 2D device tensor");
 
-  constexpr int64_t kAlignmentBytes = NUM_CORES * 512;
+  TORCH_CHECK(num_cores >= 1 && num_cores <= NUM_CORES,
+              "W4 pgrp scale core count must be in [1,8]");
+  const int64_t kAlignmentBytes =
+      std::lcm(int64_t{NUM_CORES * 512}, int64_t{num_cores * 512});
   const uint64_t source_addr =
       RpuGetDevAddr(scale.data_ptr<c10::Half>());
   if (source_addr % kAlignmentBytes == 0) return scale;
 
-  constexpr int64_t kAlignmentElements =
+  const int64_t kAlignmentElements =
       kAlignmentBytes / static_cast<int64_t>(sizeof(c10::Half));
   auto storage = at::empty(
       {scale.numel() + kAlignmentElements}, scale.options());
@@ -87,6 +100,24 @@ at::Tensor rpu_retain_linear_quant_scale(
   aligned.copy_(scale);
   TORCH_INTERNAL_ASSERT(
       RpuGetDevAddr(aligned.data_ptr<c10::Half>()) % kAlignmentBytes == 0);
+  return aligned;
+}
+
+at::Tensor rpu_retain_nvfp4_tile_scale_candidate(const at::Tensor& scale) {
+  TORCH_CHECK(!RpuKernelGraph::has_active(), "Tile scales must be retained before Graph recording");
+  TORCH_CHECK(scale.defined() && scale.scalar_type() == at::kByte &&
+                  scale.device().type() == c10::DeviceType::PrivateUse1 &&
+                  scale.dim() == 4 && scale.size(0) > 0 && scale.size(1) > 0 &&
+                  scale.size(2) == 8 && scale.size(3) == 512 && scale.is_contiguous(),
+              "Tile scales require the explicit [N64,K128,8,512] byte layout");
+  constexpr uint64_t alignment = 4096;
+  if (RpuGetDevAddr(scale.data_ptr()) % alignment == 0) return scale;
+  auto storage = at::empty({scale.numel() + int64_t(alignment)}, scale.options());
+  const uint64_t address = RpuGetDevAddr(storage.data_ptr());
+  const int64_t offset = (alignment - address % alignment) % alignment;
+  auto aligned = storage.narrow(0, offset, scale.numel()).view(scale.sizes());
+  aligned.copy_(scale);
+  TORCH_INTERNAL_ASSERT(RpuGetDevAddr(aligned.data_ptr()) % alignment == 0);
   return aligned;
 }
 
@@ -118,6 +149,60 @@ at::Tensor rpu_pack_pi05_gateup_resident_w8(const at::Tensor& weight) {
       .permute({2, 0, 1, 3}).contiguous().view({8, 524288});
   auto packed = packed_cpu.to(weight.device());
   rpu_ddr_flush_force(packed.data_ptr<int8_t>());
+  return packed;
+}
+
+at::Tensor rpu_pack_pi05_nvfp4_tile_scale(
+    const at::Tensor& scale, int64_t n, int64_t k, int partition) {
+  TORCH_CHECK(!RpuKernelGraph::has_active(), "Pi0.5 NVFP4 tile-scale packing is cold-only");
+  constexpr int64_t cores = 8, kAlignment = 4096;
+  const bool col = partition == 1;
+  TORCH_CHECK((col && k == 1024 && (n == 2048 || n == 4096)) ||
+                  (partition == 0 && n == 1024 && (k == 2048 || k == 4096)),
+              "Pi0.5 NVFP4 tile scale requires the Q, O, Down, Gate or Up projection geometry");
+  TORCH_CHECK(scale.defined() && scale.scalar_type() == at::kByte &&
+                  scale.device().type() == c10::DeviceType::PrivateUse1 &&
+                  scale.is_contiguous() && scale.sizes() == at::IntArrayRef({k / 16, n}),
+              "Pi0.5 NVFP4 tile scale requires an installed striped FP8 scale [K/16, N]");
+  const int64_t ln = col ? n / cores : n, lk = col ? k : k / cores;
+  // Striped: [K32 row][core][N64 block][c][K16 % 2][t] for scale[K16][16c + t].
+  // Tile-contiguous: [block][K128 tile][core][4 * (K16 % 4) + c][K16 % 8 / 4][t],
+  // so each core's K128 x N64 tile is one 512-byte run. Only bytes move.
+  auto packed_cpu = scale.cpu().view({lk / 128, 2, 2, cores, ln / 64, 4, 2, 16})
+      .permute({4, 0, 3, 2, 6, 5, 1, 7}).contiguous().view({k / 16, n});
+  // A 4096-byte aligned owner keeps every tile of core c on DDR controller c.
+  auto storage = at::empty({packed_cpu.numel() + kAlignment}, scale.options());
+  const uint64_t storage_addr = RpuGetDevAddr(storage.data_ptr<uint8_t>());
+  auto packed = storage
+      .narrow(0, (kAlignment - storage_addr % kAlignment) % kAlignment, packed_cpu.numel())
+      .view({k / 16, n});
+  packed.copy_(packed_cpu.to(scale.device()));
+  TORCH_INTERNAL_ASSERT(RpuGetDevAddr(packed.data_ptr<uint8_t>()) % kAlignment == 0);
+  rpu_ddr_flush_force(packed.data_ptr<uint8_t>());
+  return packed;
+}
+
+at::Tensor rpu_pack_pi05_nvfp4_spm_scale(at::TensorList tile_scales, int64_t cores) {
+  TORCH_CHECK(!RpuKernelGraph::has_active(), "Pi0.5 NVFP4 SPM-scale packing is cold-only");
+  constexpr int64_t kTile = 512;
+  TORCH_CHECK(cores == 8 && !tile_scales.empty(), "Pi0.5 NVFP4 SPM scale requires TP8 companions");
+  std::vector<at::Tensor> runs;
+  runs.reserve(tile_scales.size());
+  for (const auto& scale : tile_scales) {
+    TORCH_CHECK(scale.defined() && scale.scalar_type() == at::kByte &&
+                    scale.device() == tile_scales[0].device() &&
+                    scale.device().type() == c10::DeviceType::PrivateUse1 &&
+                    scale.is_contiguous() && scale.numel() % (cores * kTile) == 0,
+                "Pi0.5 NVFP4 SPM scale requires installed tile-contiguous companions");
+    runs.push_back(scale.cpu().view({-1, cores, kTile}).permute({1, 0, 2}).contiguous().view({cores, -1}));
+  }
+  auto packed_cpu = at::cat(runs, 1);
+  // The scatter DMA moves FP16-typed owners; these remain raw FP8 bytes.
+  auto packed = at::empty({cores, packed_cpu.size(1) / 2},
+                          tile_scales[0].options().dtype(at::kHalf));
+  packed.copy_(at::from_blob(packed_cpu.data_ptr<uint8_t>(), packed.sizes(),
+                             at::TensorOptions().dtype(at::kHalf)));
+  rpu_ddr_flush_force(packed.data_ptr<c10::Half>());
   return packed;
 }
 
@@ -168,10 +253,9 @@ void rpu_launch_pi05_gateup_resident_w8_kernel(
                   scale.dim() == 1 && scale.size(0) == 4096 &&
                   scale.is_contiguous() && scale.nbytes() == 8192,
               "Pi0.5 resident W8 requires original per-channel fp16 scale [4096]");
-  const auto tile = rpu_pl_tiling::select_tile_acc16(50, 512, 1024, false);
-  TORCH_CHECK(tile.m_tile == 512 && tile.n_tile == 48,
-              "Pi0.5 resident W8 original auto-tile identity drift");
-  constexpr KernelId id = KernelId::PI05_DENOISE_GATEUP_RESIDENT_W8A16_M512N48K128;
+  const auto selected = rpu_pi_wall::select(rpu_pi_wall::Operation::ResidentLinear,
+      rpu_pl_tiling::WeightType::Int8, false, 50, 512, 1024);
+  const auto id = pi_wall_kernel_id(selected.ordinal);
   auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(
       id, std::vector<GraphDdrRegisterOperandSpec>{
           GraphDdrRegisterOperandSpec{
@@ -187,13 +271,13 @@ void rpu_launch_pi05_gateup_resident_w8_kernel(
       rpu_pl_tiling::ParallelLinearRegisterArgs{
           input_spm_addr, 0, output_spm_addr, 0,
           50, 512, 1024, 0, 8, 2048, 1024, 0, 1, 1});
-  // The standard helper encodes DDR weight >>8. This fixed symbol instead
+  // The standard helper encodes DDR weight >>8. The compact-weight program instead
   // accepts absolute local SPM bytes in 2/3; override only that register pair.
   rpu_pl_tiling::set_u32_reg_pair(*kernel, 2, weight_spm_addr);
   writer.write(*kernel);
   auto* queue = GET_QUEUE(8);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel, {11, 1, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
+  queue->enqueu_kernel(*kernel, {selected.grid_x, selected.grid_y, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
 }
 
 namespace {
@@ -276,9 +360,6 @@ void rpu_launch_gr00t_ff1_resident_w8_kernel(
                   scale.dim() == 1 && scale.size(0) == 6144 &&
                   scale.is_contiguous() && scale.nbytes() == 12288,
               "GR00T resident FF1 requires original per-channel fp16 scale [6144]");
-  const auto tile = rpu_pl_tiling::select_tile_acc16(41, 768, 1536, false);
-  TORCH_CHECK(tile.m_tile == 512 && tile.n_tile == 48,
-              "GR00T resident FF1 original auto-tile identity drift");
   constexpr KernelId id = KernelId::GR00T_FF1_RESIDENT_W8A16_M512N48K128;
   auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(
       id, std::vector<GraphDdrRegisterOperandSpec>{
@@ -299,7 +380,7 @@ void rpu_launch_gr00t_ff1_resident_w8_kernel(
   writer.write(*kernel);
   auto* queue = GET_QUEUE(8);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel, {16, 1, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
+  queue->enqueu_kernel(*kernel, rpu_specialized_linear::grid(id), {0, 1, 2, 3, 4, 5, 6, 7});
 }
 
 namespace {
@@ -361,9 +442,6 @@ void rpu_launch_gr00t_qkv_multibase_w8_kernel(
                   "GR00T QKV multibase input/output/bias intervals overlap");
     }
   }
-  const auto tile = rpu_pl_tiling::select_tile_acc16(41, 192, 1536, false);
-  TORCH_CHECK(tile.m_tile == 592 && tile.n_tile == 32,
-              "GR00T QKV multibase original auto-tile identity drift");
   for (const at::Tensor* tensor :
        {&q_weight, &k_weight, &v_weight, &q_scale, &k_scale, &v_scale}) {
     TORCH_CHECK(RpuGetDevAddr(tensor->data_ptr()) % 256 == 0,
@@ -383,19 +461,19 @@ void rpu_launch_gr00t_qkv_multibase_w8_kernel(
           GraphDdrRegisterOperandSpec{
               GraphDdrRegisterAbi{GraphDdrRegisterRole::Int8ModelWeight,
                   GraphDdrRegisterAccess::Read,
-                  GraphDdrRegisterEncoding::DevAddrShift8LoHi, 24, 25}, k_weight},
+                  GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33}, k_weight},
           GraphDdrRegisterOperandSpec{
               GraphDdrRegisterAbi{GraphDdrRegisterRole::PerChannelScale,
                   GraphDdrRegisterAccess::Read,
-                  GraphDdrRegisterEncoding::DevAddrShift8LoHi, 26, 27}, k_scale},
+                  GraphDdrRegisterEncoding::DevAddrShift8LoHi, 34, 35}, k_scale},
           GraphDdrRegisterOperandSpec{
               GraphDdrRegisterAbi{GraphDdrRegisterRole::Int8ModelWeight,
                   GraphDdrRegisterAccess::Read,
-                  GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33}, v_weight},
+                  GraphDdrRegisterEncoding::DevAddrShift8LoHi, 40, 41}, v_weight},
           GraphDdrRegisterOperandSpec{
               GraphDdrRegisterAbi{GraphDdrRegisterRole::PerChannelScale,
                   GraphDdrRegisterAccess::Read,
-                  GraphDdrRegisterEncoding::DevAddrShift8LoHi, 34, 35}, v_scale}});
+                  GraphDdrRegisterEncoding::DevAddrShift8LoHi, 42, 43}, v_scale}});
   for (const at::Tensor* tensor :
        {&q_weight, &k_weight, &v_weight, &q_scale, &k_scale, &v_scale}) {
     rpu_ddr_flush(tensor->data_ptr());
@@ -407,14 +485,14 @@ void rpu_launch_gr00t_qkv_multibase_w8_kernel(
       rpu_pl_tiling::ParallelLinearRegisterArgs{
           input_spm_addr, 0, q_output_spm_addr, q_bias_spm_addr,
           41, 192, 1536, 1, 8, 3072, 384, 0, 1, 1});
-  rpu_pl_tiling::set_u32_reg_pair(*kernel, 28, k_bias_spm_addr);
-  rpu_pl_tiling::set_u32_reg_pair(*kernel, 30, k_output_spm_addr);
-  rpu_pl_tiling::set_u32_reg_pair(*kernel, 36, v_bias_spm_addr);
-  rpu_pl_tiling::set_u32_reg_pair(*kernel, 38, v_output_spm_addr);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel, 38, k_bias_spm_addr);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel, 36, k_output_spm_addr);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel, 46, v_bias_spm_addr);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel, 44, v_output_spm_addr);
   writer.write(*kernel);
   auto* queue = GET_QUEUE(8);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel, {18, 1, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
+  queue->enqueu_kernel(*kernel, rpu_specialized_linear::grid(id), {0, 1, 2, 3, 4, 5, 6, 7});
 }
 
 bool rpu_g05_kv_weight_is_replicated_fp16(const at::Tensor& weight) {
@@ -461,9 +539,6 @@ void rpu_launch_g05_kv_owner_linear_fp16_acc32_kernel(
                     weight->size(0) == 2048 && weight->size(1) == 1024,
                 "G05 KV owner requires installed device FP16 [2048,1024]");
   }
-  const auto tile = rpu_pl_tiling::select_tile_acc32(32,256,1024,true);
-  TORCH_CHECK(tile.m_tile == 240 && tile.n_tile == 112,
-              "G05 KV owner original ACC32 auto-tile identity drift");
   constexpr auto id = KernelId::G05_KV_OWNER_FP16_ACC32_M32N256K1024;
   TORCH_CHECK(KernelCache::instance().has_loaded(id) &&
                   KernelCache::instance().has_loaded(KernelId::G05_KV_OWNER_FANOUT_M32D256),
@@ -471,9 +546,9 @@ void rpu_launch_g05_kv_owner_linear_fp16_acc32_kernel(
   auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(
       id, std::vector<GraphDdrRegisterOperandSpec>{
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::ModelWeight,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,2,3},key_weight},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3},key_weight},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::ModelWeight,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,24,25},value_weight}});
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33},value_weight}});
   rpu_ddr_flush(key_weight.data_ptr<c10::Half>());
   rpu_ddr_flush(value_weight.data_ptr<c10::Half>());
   auto* kernel = GET_KERNEL(id);
@@ -482,11 +557,11 @@ void rpu_launch_g05_kv_owner_linear_fp16_acc32_kernel(
   rpu_pl_tiling::set_parallel_linear_regs(*kernel,
       rpu_pl_tiling::ParallelLinearRegisterArgs{
           input,0,key_output,0,32,256,1024,0,8,2048,512,0,1,2});
-  rpu_pl_tiling::set_u32_reg_pair(*kernel,26,value_output);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel,36,value_output);
   writer.write(*kernel);
   auto* queue = GET_QUEUE(8);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel,{3,1,1},{0,1,2,3,4,5,6,7});
+  queue->enqueu_kernel(*kernel,rpu_g05_linear::grid(id),{0,1,2,3,4,5,6,7});
   // The preceding launch completes all owner writes. No per-core counters or
   // cross-replay synchronization state; fanout preserves the original KV ABI.
   auto* fanout = GET_KERNEL(KernelId::G05_KV_OWNER_FANOUT_M32D256);
@@ -524,18 +599,15 @@ void rpu_launch_g05_q_gate_linear_fp16_acc32_kernel(
                     weight->size(0) == 2048 && weight->size(1) == 1024,
                 "G05 Q/gate requires installed device FP16 [2048,1024]");
   }
-  const auto tile = rpu_pl_tiling::select_tile_acc32(32,256,1024,true);
-  TORCH_CHECK(tile.m_tile == 240 && tile.n_tile == 112,
-              "G05 Q/gate original ACC32 auto-tile identity drift");
   constexpr auto id = KernelId::G05_Q_GATE_FP16_ACC32_M32N256K1024;
   TORCH_CHECK(KernelCache::instance().has_loaded(id),
               "G05 Q/gate requires its expansion payload");
   auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(
       id, std::vector<GraphDdrRegisterOperandSpec>{
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::ModelWeight,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,2,3},query_weight},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3},query_weight},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::ModelWeight,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,24,25},gate_weight}});
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33},gate_weight}});
   rpu_ddr_flush(query_weight.data_ptr<c10::Half>());
   rpu_ddr_flush(gate_weight.data_ptr<c10::Half>());
   auto* kernel = GET_KERNEL(id);
@@ -544,11 +616,11 @@ void rpu_launch_g05_q_gate_linear_fp16_acc32_kernel(
   rpu_pl_tiling::set_parallel_linear_regs(*kernel,
       rpu_pl_tiling::ParallelLinearRegisterArgs{
           input,0,query_output,0,32,256,1024,0,8,2048,512,0,1,2});
-  rpu_pl_tiling::set_u32_reg_pair(*kernel,26,gate_output);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel,36,gate_output);
   writer.write(*kernel);
   auto* queue = GET_QUEUE(8);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel,{6,1,1},{0,1,2,3,4,5,6,7});
+  queue->enqueu_kernel(*kernel,rpu_g05_linear::grid(id),{0,1,2,3,4,5,6,7});
 }
 
 void rpu_launch_g05_vision_qkv_linear_fp16_acc32_kernel(
@@ -586,20 +658,17 @@ void rpu_launch_g05_vision_qkv_linear_fp16_acc32_kernel(
                     weight->size(0) == 1024 && weight->size(1) == 1024,
                 "G05 Vision QKV requires installed device FP16 [1024,1024]");
   }
-  const auto tile = rpu_pl_tiling::select_tile_acc32(256,128,1024,true);
-  TORCH_CHECK(tile.m_tile == 352 && tile.n_tile == 64,
-              "G05 Vision QKV original ACC32 auto-tile identity drift");
   constexpr auto id = KernelId::G05_VISION_QKV_FP16_ACC32_M256N128K1024;
   TORCH_CHECK(KernelCache::instance().has_loaded(id),
               "G05 Vision QKV requires its expansion payload");
   auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(
       id, std::vector<GraphDdrRegisterOperandSpec>{
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::ModelWeight,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,2,3},query_weight},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3},query_weight},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::ModelWeight,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,24,25},key_weight},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33},key_weight},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::ModelWeight,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,30,31},value_weight}});
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 40, 41},value_weight}});
   for (const auto* weight : {&query_weight,&key_weight,&value_weight})
     rpu_ddr_flush(weight->data_ptr<c10::Half>());
   auto* kernel = GET_KERNEL(id);
@@ -608,13 +677,13 @@ void rpu_launch_g05_vision_qkv_linear_fp16_acc32_kernel(
   rpu_pl_tiling::set_parallel_linear_regs(*kernel,
       rpu_pl_tiling::ParallelLinearRegisterArgs{
           input,0,query_output,query_bias,256,128,1024,1,8,2048,256,0,1,2});
-  for (const auto& field : {std::pair<uint32_t,uint32_t>{26,key_output},
-                            {28,key_bias},{32,value_output},{34,value_bias}})
+  for (const auto& field : {std::pair<uint32_t,uint32_t>{36,key_output},
+                            {38,key_bias},{44,value_output},{46,value_bias}})
     rpu_pl_tiling::set_u32_reg_pair(*kernel,field.first,field.second);
   writer.write(*kernel);
   auto* queue = GET_QUEUE(8);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel,{6,1,1},{0,1,2,3,4,5,6,7});
+  queue->enqueu_kernel(*kernel,rpu_g05_linear::grid(id),{0,1,2,3,4,5,6,7});
 }
 
 void rpu_launch_g05_vision_qkv_linear_w8a16_acc32_kernel(
@@ -660,11 +729,6 @@ void rpu_launch_g05_vision_qkv_linear_w8a16_acc32_kernel(
                 "G05 Vision QKV W8 requires FP16 per-channel device scales [1024]");
   }
   // ACC16 retains this specialization's N scheduling with its generated parent.
-  if (linear_acc32) {
-    const auto tile = rpu_pl_tiling::select_tile_acc32(256,128,1024,false);
-    TORCH_CHECK(tile.m_tile == 400 && tile.n_tile == 48,
-                "G05 Vision QKV original ACC32 auto-tile identity drift");
-  }
   const auto id = linear_acc32 ? KernelId::G05_VISION_QKV_W8A16_ACC32_M256N128K1024
       : KernelId::G05_VISION_QKV_W8A16_ACC16_M256N128K1024;
   TORCH_CHECK(KernelCache::instance().has_loaded(id),
@@ -672,17 +736,17 @@ void rpu_launch_g05_vision_qkv_linear_w8a16_acc32_kernel(
   auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(
       id, std::vector<GraphDdrRegisterOperandSpec>{
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::Int8ModelWeight,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,2,3},query_weight},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3},query_weight},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::Int8ModelWeight,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,24,25},key_weight},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33},key_weight},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::Int8ModelWeight,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,30,31},value_weight},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 40, 41},value_weight},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::PerChannelScale,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,20,21},query_scale},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 20, 21},query_scale},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::PerChannelScale,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,36,37},key_scale},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 34, 35},key_scale},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::PerChannelScale,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,38,39},value_scale}});
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 42, 43},value_scale}});
   for (const auto* weight : {&query_weight,&key_weight,&value_weight})
     rpu_ddr_flush(weight->data_ptr<int8_t>());
   for (const auto* scale : {&query_scale,&key_scale,&value_scale})
@@ -693,13 +757,13 @@ void rpu_launch_g05_vision_qkv_linear_w8a16_acc32_kernel(
   rpu_pl_tiling::set_parallel_linear_regs(*kernel,
       rpu_pl_tiling::ParallelLinearRegisterArgs{
           input,0,query_output,query_bias,256,128,1024,1,8,2048,256,0,1,1});
-  for (const auto& field : {std::pair<uint32_t,uint32_t>{26,key_output},
-                            {28,key_bias},{32,value_output},{34,value_bias}})
+  for (const auto& field : {std::pair<uint32_t,uint32_t>{36,key_output},
+                            {38,key_bias},{44,value_output},{46,value_bias}})
     rpu_pl_tiling::set_u32_reg_pair(*kernel,field.first,field.second);
   writer.write(*kernel);
   auto* queue = GET_QUEUE(8);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel,{9,1,1},{0,1,2,3,4,5,6,7});
+  queue->enqueu_kernel(*kernel,rpu_g05_linear::grid(id),{0,1,2,3,4,5,6,7});
 }
 
 
@@ -730,18 +794,15 @@ void rpu_launch_g05_gate_up_linear_fp16_acc32_kernel(
                     weight->size(0) == 4096 && weight->size(1) == 1024,
                 "G05 Gate/Up requires installed device FP16 [4096,1024]");
   }
-  const auto tile = rpu_pl_tiling::select_tile_acc32(32,512,1024,true);
-  TORCH_CHECK(tile.m_tile == 304 && tile.n_tile == 80,
-              "G05 Gate/Up original ACC32 auto-tile identity drift");
   constexpr auto id = KernelId::G05_GATE_UP_FP16_ACC32_M32N512K1024;
   TORCH_CHECK(KernelCache::instance().has_loaded(id),
               "G05 Gate/Up requires its expansion payload");
   auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(
       id, std::vector<GraphDdrRegisterOperandSpec>{
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::ModelWeight,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,2,3},gate_weight},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3},gate_weight},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::ModelWeight,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,24,25},up_weight}});
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33},up_weight}});
   rpu_ddr_flush(gate_weight.data_ptr<c10::Half>());
   rpu_ddr_flush(up_weight.data_ptr<c10::Half>());
   auto* kernel = GET_KERNEL(id);
@@ -750,11 +811,11 @@ void rpu_launch_g05_gate_up_linear_fp16_acc32_kernel(
   rpu_pl_tiling::set_parallel_linear_regs(*kernel,
       rpu_pl_tiling::ParallelLinearRegisterArgs{
           input,0,gate_output,0,32,512,1024,0,8,2048,1024,0,1,2});
-  rpu_pl_tiling::set_u32_reg_pair(*kernel,26,up_output);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel,36,up_output);
   writer.write(*kernel);
   auto* queue = GET_QUEUE(8);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel,{14,1,1},{0,1,2,3,4,5,6,7});
+  queue->enqueu_kernel(*kernel,rpu_g05_linear::grid(id),{0,1,2,3,4,5,6,7});
 }
 
 void rpu_launch_g05_text_gate_up_linear_fp16_acc32_kernel(
@@ -784,18 +845,15 @@ void rpu_launch_g05_text_gate_up_linear_fp16_acc32_kernel(
                     weight->size(0) == 6144 && weight->size(1) == 2048,
                 "G05 Text Gate/Up requires installed device FP16 [6144,2048]");
   }
-  const auto tile = rpu_pl_tiling::select_tile_acc32(256,768,2048,true);
-  TORCH_CHECK(tile.m_tile == 352 && tile.n_tile == 64,
-              "G05 Text Gate/Up original ACC32 auto-tile identity drift");
   constexpr auto id = KernelId::G05_TEXT_GATE_UP_FP16_ACC32_M256N768K2048;
   TORCH_CHECK(KernelCache::instance().has_loaded(id),
               "G05 Text Gate/Up requires its expansion payload");
   auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(
       id, std::vector<GraphDdrRegisterOperandSpec>{
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::ModelWeight,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,2,3},gate_weight},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3},gate_weight},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::ModelWeight,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,24,25},up_weight}});
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33},up_weight}});
   rpu_ddr_flush(gate_weight.data_ptr<c10::Half>());
   rpu_ddr_flush(up_weight.data_ptr<c10::Half>());
   auto* kernel = GET_KERNEL(id);
@@ -804,11 +862,11 @@ void rpu_launch_g05_text_gate_up_linear_fp16_acc32_kernel(
   rpu_pl_tiling::set_parallel_linear_regs(*kernel,
       rpu_pl_tiling::ParallelLinearRegisterArgs{
           input,0,gate_output,0,256,768,2048,0,8,4096,1536,0,1,2});
-  rpu_pl_tiling::set_u32_reg_pair(*kernel,26,up_output);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel,36,up_output);
   writer.write(*kernel);
   auto* queue = GET_QUEUE(8);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel,{24,1,1},{0,1,2,3,4,5,6,7});
+  queue->enqueu_kernel(*kernel,rpu_g05_linear::grid(id),{0,1,2,3,4,5,6,7});
 }
 
 // Optional genuine generated ACC16 pairs; the ACC32 ABI remains independent.
@@ -844,18 +902,15 @@ void rpu_launch_g05_gate_up_linear_fp16_acc16_kernel(
                     weight->nbytes() <= ddr_limit - address,
                 "G05 FP16 ACC16 Gate/Up DDR range is not encodable");
   }
-  const auto tile = rpu_pl_tiling::select_tile_acc16(32,512,1024,true);
-  TORCH_CHECK(tile.m_tile == 432 && tile.n_tile == 80,
-              "G05 Gate/Up original ACC16 auto-tile identity drift");
   constexpr auto id = KernelId::G05_GATE_UP_FP16_ACC16_M32N512K1024;
   TORCH_CHECK(KernelCache::instance().has_loaded(id),
               "G05 Gate/Up requires its expansion payload");
   auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(
       id, std::vector<GraphDdrRegisterOperandSpec>{
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::ModelWeight,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,2,3},gate_weight},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3},gate_weight},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::ModelWeight,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,24,25},up_weight}});
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33},up_weight}});
   rpu_ddr_flush(gate_weight.data_ptr<c10::Half>());
   rpu_ddr_flush(up_weight.data_ptr<c10::Half>());
   auto* kernel = GET_KERNEL(id);
@@ -864,11 +919,11 @@ void rpu_launch_g05_gate_up_linear_fp16_acc16_kernel(
   rpu_pl_tiling::set_parallel_linear_regs(*kernel,
       rpu_pl_tiling::ParallelLinearRegisterArgs{
           input,0,gate_output,0,32,512,1024,0,8,2048,1024,0,1,2});
-  rpu_pl_tiling::set_u32_reg_pair(*kernel,26,up_output);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel,36,up_output);
   writer.write(*kernel);
   auto* queue = GET_QUEUE(8);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel,{14,1,1},{0,1,2,3,4,5,6,7});
+  queue->enqueu_kernel(*kernel,rpu_g05_linear::grid(id),{0,1,2,3,4,5,6,7});
 }
 
 void rpu_launch_g05_text_gate_up_linear_fp16_acc16_kernel(
@@ -903,18 +958,15 @@ void rpu_launch_g05_text_gate_up_linear_fp16_acc16_kernel(
                     weight->nbytes() <= ddr_limit - address,
                 "G05 FP16 ACC16 Gate/Up DDR range is not encodable");
   }
-  const auto tile = rpu_pl_tiling::select_tile_acc16(256,768,2048,true);
-  TORCH_CHECK(tile.m_tile == 432 && tile.n_tile == 80,
-              "G05 Text Gate/Up original ACC16 auto-tile identity drift");
   constexpr auto id = KernelId::G05_TEXT_GATE_UP_FP16_ACC16_M256N768K2048;
   TORCH_CHECK(KernelCache::instance().has_loaded(id),
               "G05 Text Gate/Up requires its expansion payload");
   auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(
       id, std::vector<GraphDdrRegisterOperandSpec>{
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::ModelWeight,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,2,3},gate_weight},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3},gate_weight},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::ModelWeight,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,24,25},up_weight}});
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33},up_weight}});
   rpu_ddr_flush(gate_weight.data_ptr<c10::Half>());
   rpu_ddr_flush(up_weight.data_ptr<c10::Half>());
   auto* kernel = GET_KERNEL(id);
@@ -923,11 +975,11 @@ void rpu_launch_g05_text_gate_up_linear_fp16_acc16_kernel(
   rpu_pl_tiling::set_parallel_linear_regs(*kernel,
       rpu_pl_tiling::ParallelLinearRegisterArgs{
           input,0,gate_output,0,256,768,2048,0,8,4096,1536,0,1,2});
-  rpu_pl_tiling::set_u32_reg_pair(*kernel,26,up_output);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel,36,up_output);
   writer.write(*kernel);
   auto* queue = GET_QUEUE(8);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel,{20,1,1},{0,1,2,3,4,5,6,7});
+  queue->enqueu_kernel(*kernel,rpu_g05_linear::grid(id),{0,1,2,3,4,5,6,7});
 }
 
 void rpu_launch_g05_text_gate_up_linear_w8a16_acc32_kernel(
@@ -966,11 +1018,6 @@ void rpu_launch_g05_text_gate_up_linear_w8a16_acc32_kernel(
                 "G05 Text Gate/Up W8 requires independent FP16 device scales [6144]");
   }
   // ACC16 retains this specialization's N scheduling with its generated parent.
-  if (linear_acc32) {
-    const auto tile = rpu_pl_tiling::select_tile_acc32(256,768,2048,false);
-    TORCH_CHECK(tile.m_tile == 288 && tile.n_tile == 80,
-                "G05 Text Gate/Up original ACC32 auto-tile identity drift");
-  }
   const auto id = linear_acc32 ? KernelId::G05_TEXT_GATE_UP_W8A16_ACC32_M256N768K2048
       : KernelId::G05_TEXT_GATE_UP_W8A16_ACC16_M256N768K2048;
   TORCH_CHECK(KernelCache::instance().has_loaded(id),
@@ -978,13 +1025,13 @@ void rpu_launch_g05_text_gate_up_linear_w8a16_acc32_kernel(
   auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(
       id, std::vector<GraphDdrRegisterOperandSpec>{
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::Int8ModelWeight,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,2,3},gate_weight},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3},gate_weight},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::Int8ModelWeight,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,24,25},up_weight},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33},up_weight},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::PerChannelScale,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,20,21},gate_scale},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 20, 21},gate_scale},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::PerChannelScale,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,28,29},up_scale}});
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 34, 35},up_scale}});
   rpu_ddr_flush(gate_weight.data_ptr<int8_t>());
   rpu_ddr_flush(up_weight.data_ptr<int8_t>());
   rpu_ddr_flush(gate_scale.data_ptr<c10::Half>());
@@ -995,11 +1042,11 @@ void rpu_launch_g05_text_gate_up_linear_w8a16_acc32_kernel(
   rpu_pl_tiling::set_parallel_linear_regs(*kernel,
       rpu_pl_tiling::ParallelLinearRegisterArgs{
           input,0,gate_output,0,256,768,2048,0,8,4096,1536,0,1,1});
-  rpu_pl_tiling::set_u32_reg_pair(*kernel,26,up_output);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel,36,up_output);
   writer.write(*kernel);
   auto* queue = GET_QUEUE(8);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel,{20,1,1},{0,1,2,3,4,5,6,7});
+  queue->enqueu_kernel(*kernel,rpu_g05_linear::grid(id),{0,1,2,3,4,5,6,7});
 }
 
 at::Tensor rpu_pack_g05_gateup_resident_fp16(
@@ -1044,10 +1091,8 @@ void rpu_launch_g05_gateup_resident_fp16_kernel(
                   disjoint(output_spm_addr, output_bytes, weight_spm_addr, weight_bytes) &&
                   disjoint(input_spm_addr, input_bytes, output_spm_addr, output_bytes),
               "G05 resident Gate/Up SPM intervals overlap");
-  const auto tile = rpu_pl_tiling::select_tile_acc32(32, 512, 1024, true);
-  TORCH_CHECK(tile.m_tile == 304 && tile.n_tile == 80,
-              "G05 resident Gate/Up original ACC32 auto-tile identity drift");
-  auto* kernel = GET_KERNEL(KernelId::G05_GATEUP_RESIDENT_FP16_ACC32_M304N80K128);
+  constexpr auto id = KernelId::G05_GATEUP_RESIDENT_FP16_ACC32_M304N80K128;
+  auto* kernel = GET_KERNEL(id);
   TORCH_CHECK(kernel, "G05 resident Gate/Up expansion payload is absent");
   rpu_pl_tiling::set_parallel_linear_regs(*kernel,
       rpu_pl_tiling::ParallelLinearRegisterArgs{
@@ -1056,7 +1101,7 @@ void rpu_launch_g05_gateup_resident_fp16_kernel(
   rpu_pl_tiling::set_u32_reg_pair(*kernel, 2, weight_spm_addr);
   auto* queue = GET_QUEUE(8);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel, {7, 1, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
+  queue->enqueu_kernel(*kernel, rpu_g05_linear::grid(id), {0, 1, 2, 3, 4, 5, 6, 7});
 }
 
 // G05 W8A16 Action variants retain the generic W8 ACC32 arithmetic.
@@ -1139,27 +1184,27 @@ void rpu_launch_g05_gate_kv_owner_only_w8a16_acc16_kernel(
   auto writer=RpuKernelGraph::active().stage_kernel_ddr_registers(
       id,std::vector<GraphDdrRegisterOperandSpec>{
           {{GraphDdrRegisterRole::Int8ModelWeight,GraphDdrRegisterAccess::Read,
-            GraphDdrRegisterEncoding::DevAddrShift8LoHi,2,3},gate_weight},
+            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3},gate_weight},
           {{GraphDdrRegisterRole::Int8ModelWeight,GraphDdrRegisterAccess::Read,
-            GraphDdrRegisterEncoding::DevAddrShift8LoHi,24,25},key_weight},
+            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33},key_weight},
           {{GraphDdrRegisterRole::Int8ModelWeight,GraphDdrRegisterAccess::Read,
-            GraphDdrRegisterEncoding::DevAddrShift8LoHi,30,31},value_weight},
+            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 40, 41},value_weight},
           {{GraphDdrRegisterRole::PerChannelScale,GraphDdrRegisterAccess::Read,
-            GraphDdrRegisterEncoding::DevAddrShift8LoHi,20,21},gate_scale},
+            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 20, 21},gate_scale},
           {{GraphDdrRegisterRole::PerChannelScale,GraphDdrRegisterAccess::Read,
-            GraphDdrRegisterEncoding::DevAddrShift8LoHi,28,29},key_scale},
+            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 34, 35},key_scale},
           {{GraphDdrRegisterRole::PerChannelScale,GraphDdrRegisterAccess::Read,
-            GraphDdrRegisterEncoding::DevAddrShift8LoHi,34,35},value_scale}});
+            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 42, 43},value_scale}});
   for (const auto* owner:owners) rpu_ddr_flush(owner->data_ptr());
   auto* kernel=GET_KERNEL(id);TORCH_CHECK(kernel,"G05 gate/KV owner payload disappeared");
   kernel->reset_regs();
   rpu_pl_tiling::set_parallel_linear_regs(*kernel,rpu_pl_tiling::ParallelLinearRegisterArgs{
       input,0,gate_output,0,32,256,1024,0,8,2048,512,0,1,1});
-  rpu_pl_tiling::set_u32_reg_pair(*kernel,26,key_output);
-  rpu_pl_tiling::set_u32_reg_pair(*kernel,32,value_output);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel,36,key_output);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel,44,value_output);
   writer.write(*kernel);
   auto* queue=GET_QUEUE(8);queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel,{4,1,1},{0,1,2,3,4,5,6,7});
+  queue->enqueu_kernel(*kernel,rpu_g05_linear::grid(id),{0,1,2,3,4,5,6,7});
   // K exists only on cores 0/4 and V only on 2/6. The caller must consume the
   // checked owner-only norm/RoPE/cache schedule; no nonowner SPM replica exists.
 }
@@ -1199,11 +1244,6 @@ void rpu_launch_g05_kv_owner_linear_w8a16_acc32_kernel(
                 "G05 Action W8 requires an original device FP16 per-channel scale [2048]");
   }
   // ACC16 retains this specialization's N scheduling with its generated parent.
-  if (linear_acc32) {
-    const auto tile = rpu_pl_tiling::select_tile_acc32(32,256,1024,false);
-    TORCH_CHECK(tile.m_tile == 192 && tile.n_tile == 128,
-                "G05 KV owner original ACC32 auto-tile identity drift");
-  }
   const auto id = linear_acc32 ? KernelId::G05_KV_OWNER_W8A16_ACC32_M32N256K1024
       : KernelId::G05_KV_OWNER_W8A16_ACC16_M32N256K1024;
   TORCH_CHECK(KernelCache::instance().has_loaded(id) &&
@@ -1212,13 +1252,13 @@ void rpu_launch_g05_kv_owner_linear_w8a16_acc32_kernel(
   auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(
       id, std::vector<GraphDdrRegisterOperandSpec>{
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::Int8ModelWeight,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,2,3},key_weight},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3},key_weight},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::Int8ModelWeight,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,24,25},value_weight},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33},value_weight},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::PerChannelScale,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,20,21},key_scale},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 20, 21},key_scale},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::PerChannelScale,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,28,29},value_scale}});
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 34, 35},value_scale}});
   rpu_ddr_flush(key_weight.data_ptr<int8_t>());
   rpu_ddr_flush(key_scale.data_ptr<c10::Half>());
   rpu_ddr_flush(value_weight.data_ptr<int8_t>());
@@ -1229,11 +1269,11 @@ void rpu_launch_g05_kv_owner_linear_w8a16_acc32_kernel(
   rpu_pl_tiling::set_parallel_linear_regs(*kernel,
       rpu_pl_tiling::ParallelLinearRegisterArgs{
           input,0,key_output,0,32,256,1024,0,8,2048,512,0,1,1});
-  rpu_pl_tiling::set_u32_reg_pair(*kernel,26,value_output);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel,36,value_output);
   writer.write(*kernel);
   auto* queue = GET_QUEUE(8);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel,{2,1,1},{0,1,2,3,4,5,6,7});
+  queue->enqueu_kernel(*kernel,rpu_g05_linear::grid(id),{0,1,2,3,4,5,6,7});
   // The preceding launch completes all owner writes. No per-core counters or
   // cross-replay synchronization state; fanout preserves the original KV ABI.
   auto* fanout = GET_KERNEL(KernelId::G05_KV_OWNER_FANOUT_M32D256);
@@ -1295,11 +1335,6 @@ static void launch_g05_qkv_gate_owner_linear_w8a16_acc32(
                 "G05 QKV/gate DDR owner interval/alignment is invalid");
   }
   // ACC16 retains this specialization's N scheduling with its generated parent.
-  if (linear_acc32) {
-    const auto tile = rpu_pl_tiling::select_tile_acc32(32, 256, 1024, false);
-    TORCH_CHECK(tile.m_tile == 192 && tile.n_tile == 128,
-                "G05 QKV/gate original ACC32 auto-tile identity drift");
-  }
   const auto id = linear_acc32 ? KernelId::G05_QKV_GATE_OWNER_W8A16_ACC32_M32N256K1024
       : KernelId::G05_QKV_GATE_OWNER_W8A16_ACC16_M32N256K1024;
   TORCH_CHECK(KernelCache::instance().has_loaded(id) &&
@@ -1308,21 +1343,21 @@ static void launch_g05_qkv_gate_owner_linear_w8a16_acc32(
   auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(
       id, std::vector<GraphDdrRegisterOperandSpec>{
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::Int8ModelWeight,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,2,3},query_weight},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3},query_weight},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::Int8ModelWeight,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,24,25},gate_weight},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33},gate_weight},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::Int8ModelWeight,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,30,31},key_weight},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 40, 41},key_weight},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::Int8ModelWeight,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,36,37},value_weight},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 48, 49},value_weight},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::PerChannelScale,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,20,21},query_scale},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 20, 21},query_scale},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::PerChannelScale,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,28,29},gate_scale},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 34, 35},gate_scale},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::PerChannelScale,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,34,35},key_scale},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 42, 43},key_scale},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::PerChannelScale,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,40,41},value_scale}});
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 50, 51},value_scale}});
   for (const auto* weight : {&query_weight, &gate_weight, &key_weight, &value_weight})
     rpu_ddr_flush(weight->data_ptr<int8_t>());
   for (const auto* scale : {&query_scale, &gate_scale, &key_scale, &value_scale})
@@ -1333,13 +1368,13 @@ static void launch_g05_qkv_gate_owner_linear_w8a16_acc32(
   rpu_pl_tiling::set_parallel_linear_regs(*kernel,
       rpu_pl_tiling::ParallelLinearRegisterArgs{
           input,0,query_output,0,32,256,1024,0,8,2048,512,0,1,1});
-  rpu_pl_tiling::set_u32_reg_pair(*kernel,26,gate_output);
-  rpu_pl_tiling::set_u32_reg_pair(*kernel,32,key_output);
-  rpu_pl_tiling::set_u32_reg_pair(*kernel,38,value_output);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel,36,gate_output);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel,44,key_output);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel,52,value_output);
   writer.write(*kernel);
   auto* queue = GET_QUEUE(8);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel,{6,1,1},{0,1,2,3,4,5,6,7});
+  queue->enqueu_kernel(*kernel,rpu_g05_linear::grid(id),{0,1,2,3,4,5,6,7});
   if (!restore_fanout) return;
   // The launch boundary completes K/V owners before restoring the original
   // replicated KV layout. Fetch fanout only after consuming the pending kernel.
@@ -1412,11 +1447,6 @@ void rpu_launch_g05_q_gate_linear_w8a16_acc32_kernel(
                 "G05 Action W8 requires an original device FP16 per-channel scale [2048]");
   }
   // ACC16 retains this specialization's N scheduling with its generated parent.
-  if (linear_acc32) {
-    const auto tile = rpu_pl_tiling::select_tile_acc32(32,256,1024,false);
-    TORCH_CHECK(tile.m_tile == 192 && tile.n_tile == 128,
-                "G05 Q/gate original ACC32 auto-tile identity drift");
-  }
   const auto id = linear_acc32 ? KernelId::G05_Q_GATE_W8A16_ACC32_M32N256K1024
       : KernelId::G05_Q_GATE_W8A16_ACC16_M32N256K1024;
   TORCH_CHECK(KernelCache::instance().has_loaded(id),
@@ -1424,13 +1454,13 @@ void rpu_launch_g05_q_gate_linear_w8a16_acc32_kernel(
   auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(
       id, std::vector<GraphDdrRegisterOperandSpec>{
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::Int8ModelWeight,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,2,3},query_weight},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3},query_weight},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::Int8ModelWeight,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,24,25},gate_weight},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33},gate_weight},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::PerChannelScale,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,20,21},query_scale},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 20, 21},query_scale},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::PerChannelScale,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,28,29},gate_scale}});
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 34, 35},gate_scale}});
   rpu_ddr_flush(query_weight.data_ptr<int8_t>());
   rpu_ddr_flush(query_scale.data_ptr<c10::Half>());
   rpu_ddr_flush(gate_weight.data_ptr<int8_t>());
@@ -1441,11 +1471,11 @@ void rpu_launch_g05_q_gate_linear_w8a16_acc32_kernel(
   rpu_pl_tiling::set_parallel_linear_regs(*kernel,
       rpu_pl_tiling::ParallelLinearRegisterArgs{
           input,0,query_output,0,32,256,1024,0,8,2048,512,0,1,1});
-  rpu_pl_tiling::set_u32_reg_pair(*kernel,26,gate_output);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel,36,gate_output);
   writer.write(*kernel);
   auto* queue = GET_QUEUE(8);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel,{4,1,1},{0,1,2,3,4,5,6,7});
+  queue->enqueu_kernel(*kernel,rpu_g05_linear::grid(id),{0,1,2,3,4,5,6,7});
 }
 
 void rpu_launch_g05_gate_up_linear_w8a16_acc32_kernel(
@@ -1483,11 +1513,6 @@ void rpu_launch_g05_gate_up_linear_w8a16_acc32_kernel(
                 "G05 Action W8 requires an original device FP16 per-channel scale [4096]");
   }
   // ACC16 retains this specialization's N scheduling with its generated parent.
-  if (linear_acc32) {
-    const auto tile = rpu_pl_tiling::select_tile_acc32(32,512,1024,false);
-    TORCH_CHECK(tile.m_tile == 240 && tile.n_tile == 96,
-                "G05 Gate/Up original ACC32 auto-tile identity drift");
-  }
   const auto id = linear_acc32 ? KernelId::G05_GATE_UP_W8A16_ACC32_M32N512K1024
       : KernelId::G05_GATE_UP_W8A16_ACC16_M32N512K1024;
   TORCH_CHECK(KernelCache::instance().has_loaded(id),
@@ -1495,13 +1520,13 @@ void rpu_launch_g05_gate_up_linear_w8a16_acc32_kernel(
   auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(
       id, std::vector<GraphDdrRegisterOperandSpec>{
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::Int8ModelWeight,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,2,3},gate_weight},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3},gate_weight},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::Int8ModelWeight,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,24,25},up_weight},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33},up_weight},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::PerChannelScale,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,20,21},gate_scale},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 20, 21},gate_scale},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::PerChannelScale,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,28,29},up_scale}});
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 34, 35},up_scale}});
   rpu_ddr_flush(gate_weight.data_ptr<int8_t>());
   rpu_ddr_flush(gate_scale.data_ptr<c10::Half>());
   rpu_ddr_flush(up_weight.data_ptr<int8_t>());
@@ -1512,11 +1537,11 @@ void rpu_launch_g05_gate_up_linear_w8a16_acc32_kernel(
   rpu_pl_tiling::set_parallel_linear_regs(*kernel,
       rpu_pl_tiling::ParallelLinearRegisterArgs{
           input,0,gate_output,0,32,512,1024,0,8,2048,1024,0,1,1});
-  rpu_pl_tiling::set_u32_reg_pair(*kernel,26,up_output);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel,36,up_output);
   writer.write(*kernel);
   auto* queue = GET_QUEUE(8);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel,{12,1,1},{0,1,2,3,4,5,6,7});
+  queue->enqueu_kernel(*kernel,rpu_g05_linear::grid(id),{0,1,2,3,4,5,6,7});
 }
 
 std::pair<at::Tensor, at::Tensor> rpu_pack_g05_o_resident_nvfp4(
@@ -1837,18 +1862,13 @@ void rpu_launch_g05_o_resident_w8a16_acc16_kernel(
   TORCH_CHECK(scale_address != 0 && scale_address % 256 == 0 &&
                   scale_address < address_limit && scale.nbytes() <= address_limit - scale_address,
               "G05 resident O scale DDR interval/alignment is invalid");
-  if (!n128) {
-    const auto tile = rpu_pl_tiling::select_tile_acc16(32, 1024, 256, false);
-    TORCH_CHECK(tile.m_tile == 448 && tile.n_tile == 64,
-                "G05 resident O original ACC16 auto-tile identity drift");
-  }
-  const auto id = n128 ? KernelId::G05_O_RESIDENT_W8A16_ACC16_M32N1024K256_N128
-                       : KernelId::G05_O_RESIDENT_W8A16_ACC16_M32N1024K256;
+  const auto id = KernelId::G05_O_RESIDENT_W8A16_ACC16_M32N1024K256;
+  (void)n128;  // All resident-O profiles use the current measured tile.
   TORCH_CHECK(KernelCache::instance().has_loaded(id), "G05 resident O optional payload is absent");
   auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(
       id, std::vector<GraphDdrRegisterOperandSpec>{
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::PerChannelScale,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,20,21},scale}});
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 20, 21},scale}});
   rpu_ddr_flush(scale.data_ptr<c10::Half>());
   auto* kernel = GET_KERNEL(id);
   TORCH_CHECK(kernel, "G05 resident O payload disappeared");
@@ -1861,7 +1881,7 @@ void rpu_launch_g05_o_resident_w8a16_acc16_kernel(
   writer.write(*kernel);
   auto* queue = GET_QUEUE(8);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel, {uint16_t(n128 ? 8 : 16), 1, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
+  queue->enqueu_kernel(*kernel, rpu_g05_linear::grid(id), {0, 1, 2, 3, 4, 5, 6, 7});
 }
 
 at::Tensor rpu_pack_g05_down_partial_w8a16(const at::Tensor& weight) {
@@ -1959,17 +1979,14 @@ void rpu_launch_g05_down_partial_w8a16_acc16_kernel(
   TORCH_CHECK(weight_address + weight.nbytes() <= scale_address ||
                   scale_address + scale.nbytes() <= weight_address,
               "G05 partial Down weight and scale owners overlap");
-  const auto tile = rpu_pl_tiling::select_tile_acc16(32, 1024, 512, false);
-  TORCH_CHECK(tile.m_tile == 512 && tile.n_tile == 48,
-              "G05 partial Down original ACC16 auto-tile identity drift");
   constexpr auto id = KernelId::G05_DOWN_PARTIAL672_W8A16_ACC16_M32N1024K512;
   TORCH_CHECK(KernelCache::instance().has_loaded(id), "G05 partial Down optional payload is absent");
   auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(
       id, std::vector<GraphDdrRegisterOperandSpec>{
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::Int8ModelWeight,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,2,3},weight},
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3},weight},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::PerChannelScale,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,20,21},scale}});
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 20, 21},scale}});
   rpu_ddr_flush(weight.data_ptr<int8_t>());
   rpu_ddr_flush(scale.data_ptr<c10::Half>());
   auto* kernel = GET_KERNEL(id);
@@ -1979,11 +1996,11 @@ void rpu_launch_g05_down_partial_w8a16_acc16_kernel(
       rpu_pl_tiling::ParallelLinearRegisterArgs{
           input_spm_addr, 0, output_spm_addr, 0,
           32, 1024, 512, 0, 8, 1024, 2048, 0, 0, 1});
-  rpu_pl_tiling::set_u32_reg_pair(*kernel, 24, weight_spm_addr);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel, 32, weight_spm_addr);
   writer.write(*kernel);
   auto* queue = GET_QUEUE(8);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel, {22, 1, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
+  queue->enqueu_kernel(*kernel, rpu_g05_linear::grid(id), {0, 1, 2, 3, 4, 5, 6, 7});
 }
 
 at::Tensor rpu_pack_g05_gateup_resident_w8a16(
@@ -2029,11 +2046,6 @@ void rpu_launch_g05_gateup_resident_w8a16_kernel(
                   disjoint(input_spm_addr, input_bytes, output_spm_addr, output_bytes),
               "G05 resident Gate/Up SPM intervals overlap");
   // ACC16 retains this specialization's N scheduling with its generated parent.
-  if (linear_acc32) {
-    const auto tile = rpu_pl_tiling::select_tile_acc32(32, 512, 1024, false);
-    TORCH_CHECK(tile.m_tile == 240 && tile.n_tile == 96,
-                "G05 resident Gate/Up original ACC32 auto-tile identity drift");
-  }
   TORCH_CHECK(scale.defined() && scale.scalar_type() == at::kHalf &&
                   scale.device().type() == c10::DeviceType::PrivateUse1 &&
                   scale.dim() == 1 && scale.size(0) == 4096 && scale.is_contiguous(),
@@ -2044,7 +2056,7 @@ void rpu_launch_g05_gateup_resident_w8a16_kernel(
   auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(
       id, std::vector<GraphDdrRegisterOperandSpec>{
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::PerChannelScale,
-             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi,20,21},scale}});
+             GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 20, 21},scale}});
   rpu_ddr_flush(scale.data_ptr<c10::Half>());
   auto* kernel = GET_KERNEL(id);
   TORCH_CHECK(kernel, "G05 resident Gate/Up expansion payload is absent");
@@ -2057,7 +2069,7 @@ void rpu_launch_g05_gateup_resident_w8a16_kernel(
   writer.write(*kernel);
   auto* queue = GET_QUEUE(8);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel, {6, 1, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
+  queue->enqueu_kernel(*kernel, rpu_g05_linear::grid(id), {0, 1, 2, 3, 4, 5, 6, 7});
 }
 
 void rpu_launch_g05_gateup_resident_w8a16_preload(
@@ -2723,8 +2735,8 @@ void rpu_launch_pi05_kv1_stripe_w8a16_m592n32_kernel(
       kRows * kK * sizeof(c10::Half);
   constexpr size_t kOutputBytes =
       kRows * kLocalN * sizeof(c10::Half);
-  constexpr KernelId kKernelId =
-      KernelId::PI05_KV1_STRIPE_W8A16_M592N32;
+  const auto tile = rpu_pi_kv_linear::stripe_tile();
+  const auto kKernelId = rpu_pi_kv_linear::stripe_id();
 
   TORCH_CHECK(
       RpuKernelGraph::has_active(),
@@ -2822,30 +2834,56 @@ void rpu_launch_pi05_kv1_stripe_w8a16_m592n32_kernel(
   TORCH_CHECK(queue != nullptr,
               "Pi0.5 KV1 fixed M592N32 8-core queue is absent");
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel, {1, 1, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
+  queue->enqueu_kernel(*kernel,
+      {static_cast<uint16_t>(CeilDiv(kLocalN, static_cast<uint32_t>(tile.n_tile))),
+       static_cast<uint16_t>(CeilDiv(kRows, static_cast<uint32_t>(tile.m_tile))), 1},
+      {0, 1, 2, 3, 4, 5, 6, 7});
 }
 
-void rpu_launch_pi05_kv1_pair_owner_w8a16_m50n32x2k1024_kernel(
+// The payload, scale operand, local shape and grid of one Action NVFP4 v2
+// projection, defined with its launcher below; the fused Q + KV1 pair owner
+// checks the Q projection against the same plan.
+struct ActionNvfp4V2Plan {
+  KernelId id;
+  bool spm_scaled;
+  const at::Tensor* block_scale;
+  int64_t ln, lk;
+  uint16_t gx, gy;
+};
+static ActionNvfp4V2Plan plan_action_nvfp4_v2(
+    const at::Tensor& weight, const at::Tensor& scale, int64_t rows, int64_t n,
+    int64_t k, int partition, int cores, bool linear_acc32, bool pi05,
+    const at::Tensor& tile_scale, uint32_t spm_scale, int db_candidate = 0);
+
+static void launch_pi05_kv1_pair_owner_m50(
     uint32_t input_spm_addr,
     const at::Tensor& k_full_weight,
     const at::Tensor& k_full_scale,
     uint32_t k_output_spm_addr,
     const at::Tensor& v_full_weight,
     const at::Tensor& v_full_scale,
-    uint32_t v_output_spm_addr) {
-  constexpr uint32_t kRows = 50;
+    uint32_t v_output_spm_addr, int64_t rows, bool double_buffer,
+    const Pi05Nvfp4QProjection* q) {
+  const bool fp16 = k_full_weight.defined() && k_full_weight.scalar_type() == at::kHalf;
+  // Both payloads read M from p8 and rows are independent, so H10 reuses the
+  // M50 selection at M10.
+  TORCH_CHECK(pi05_action_rows_admitted(rows),
+              "Pi0.5 KV1 pair-owner admits action horizon 50 or 10");
+  const uint32_t kRows = static_cast<uint32_t>(rows);
   constexpr uint32_t kLocalN = 32;
   constexpr uint32_t kK = 1024;
   constexpr uint32_t kPhysicalN = 2048;
   constexpr uint16_t kCores = 8;
-  constexpr size_t kInputBytes = kRows * kK * sizeof(c10::Half);
-  constexpr size_t kOutputBytes = kRows * kLocalN * sizeof(c10::Half);
-  const bool fp16 = k_full_weight.defined() && k_full_weight.scalar_type() == at::kHalf;
+  const size_t kInputBytes = kRows * kK * sizeof(c10::Half);
+  const size_t kOutputBytes = kRows * kLocalN * sizeof(c10::Half);
   const size_t kWeightBytes = kPhysicalN * kK * (fp16 ? sizeof(c10::Half) : 1);
   constexpr size_t kScaleBytes = kPhysicalN * sizeof(c10::Half);
-  const KernelId kKernelId = fp16
-      ? KernelId::PI05_DENOISE_KV1_PAIR_OWNER_FP16_M50N32X2K1024
-      : KernelId::PI05_DENOISE_KV1_PAIR_OWNER_W8A16_M50N32X2K1024;
+  const auto selected = rpu_pi_kv_linear::pair(fp16);
+  TORCH_CHECK(!double_buffer || !fp16, "Pi KV double buffer requires W8 owners");
+  TORCH_CHECK(!q || double_buffer,
+              "Pi0.5 Q + KV1 pair owner requires the double-buffered W8 owner");
+  const auto kKernelId = double_buffer ? KernelId::PI05_KV_OWNER_W8_DB
+                                      : pi_wall_kernel_id(selected.ordinal);
 
   TORCH_CHECK(
       RpuKernelGraph::has_active(),
@@ -2914,6 +2952,47 @@ void rpu_launch_pi05_kv1_pair_owner_w8a16_m50n32x2k1024_kernel(
                    v_output_spm_addr, kOutputBytes),
       "Pi0.5 KV1 pair-owner input/K-output/V-output SPM intervals overlap");
 
+  // The layer's Q projection may run in this launch: the SPM-scale Q Linear
+  // on blocks [0, 4), K and V on blocks 4 and 5. The two only share the input,
+  // so the Q output and scale slab must stay clear of the pair's SPM.
+  ActionNvfp4V2Plan q_plan{};
+  // With `q->spm_weight` each core reads its own run of the Q weight from SPM.
+  const bool q_wspm = q && q->spm_weight != 0;
+  const KernelId q_id = q_wspm ? KernelId::PI05_Q_KV1_PAIR_DB_WSPM
+                               : KernelId::PI05_Q_KV1_PAIR_DB_SSPM;
+  if (q) {
+    TORCH_CHECK(
+        KernelCache::instance().has_loaded(q_id),
+        "Pi0.5 Q + KV1 pair owner requires its fused payload");
+    q_plan = plan_action_nvfp4_v2(q->weight, q->scale, rows, q->n, q->k, /*partition=*/1,
+                                  kCores, /*linear_acc32=*/false, /*pi05=*/true,
+                                  q->tile_scale, q->spm_scale);
+    TORCH_CHECK(
+        q_plan.id == KernelId::PI05_NVFP4_LINEAR_DB_SSPM && q_plan.gy == 1 &&
+            q_plan.gx == 4 && q_plan.ln == 256 && q_plan.lk == kK,
+        "Pi0.5 Q + KV1 pair owner requires the one-row-block SPM-scale Q Linear");
+    const size_t q_bytes = kRows * q_plan.ln * sizeof(c10::Half);
+    const size_t slab_bytes = q->k / 16 * q_plan.ln;
+    check_spm_interval(q->output, q_bytes, "Q output");
+    TORCH_CHECK(
+        disjoint(q->output, q_bytes, input_spm_addr, kInputBytes) &&
+            disjoint(q->output, q_bytes, k_output_spm_addr, kOutputBytes) &&
+            disjoint(q->output, q_bytes, v_output_spm_addr, kOutputBytes) &&
+            disjoint(q->spm_scale, slab_bytes, k_output_spm_addr, kOutputBytes) &&
+            disjoint(q->spm_scale, slab_bytes, v_output_spm_addr, kOutputBytes),
+        "Pi0.5 Q + KV1 pair owner Q output or scale slab overlaps the pair's SPM intervals");
+    if (q_wspm) {
+      const size_t run_bytes = static_cast<size_t>(q->n * q->k / 2 / kCores);
+      check_spm_interval(q->spm_weight, run_bytes, "Q weight run");
+      TORCH_CHECK(
+          disjoint(q->spm_weight, run_bytes, q->output, q_bytes) &&
+              disjoint(q->spm_weight, run_bytes, k_output_spm_addr, kOutputBytes) &&
+              disjoint(q->spm_weight, run_bytes, v_output_spm_addr, kOutputBytes),
+          "Pi0.5 Q + KV1 pair owner Q weight run overlaps an output");
+    }
+  }
+  const KernelId launch_id = q ? q_id : kKernelId;
+
   std::vector<std::pair<uint64_t, size_t>> owner_intervals{
       {RpuGetDevAddr(k_full_weight.data_ptr()), kWeightBytes},
       {RpuGetDevAddr(v_full_weight.data_ptr()), kWeightBytes}};
@@ -2938,18 +3017,26 @@ void rpu_launch_pi05_kv1_pair_owner_w8a16_m50n32x2k1024_kernel(
     }
   }
 
+  // The fused payload keeps the Q Linear's registers 0..28 and maps the
+  // pair's live slots above them (rpu_pi05_q_kv1_abi.h).
+  const uint16_t k_weight_reg = q ? 34 : 2;
+  const uint16_t v_weight_reg = q ? 54 : 32;
+  const uint16_t k_scale_reg = q ? 52 : 20;
+  const uint16_t v_scale_reg = q ? 56 : 34;
   std::vector<GraphDdrRegisterOperandSpec> operands{
           GraphDdrRegisterOperandSpec{
               GraphDdrRegisterAbi{
                   fp16 ? GraphDdrRegisterRole::ModelWeight : GraphDdrRegisterRole::Int8ModelWeight,
                   GraphDdrRegisterAccess::Read,
-                  GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3},
+                  GraphDdrRegisterEncoding::DevAddrShift8LoHi,
+                  k_weight_reg, static_cast<uint16_t>(k_weight_reg + 1)},
               k_full_weight},
           GraphDdrRegisterOperandSpec{
               GraphDdrRegisterAbi{
                   fp16 ? GraphDdrRegisterRole::ModelWeight : GraphDdrRegisterRole::Int8ModelWeight,
                   GraphDdrRegisterAccess::Read,
-                  GraphDdrRegisterEncoding::DevAddrShift8LoHi, 24, 25},
+                  GraphDdrRegisterEncoding::DevAddrShift8LoHi,
+                  v_weight_reg, static_cast<uint16_t>(v_weight_reg + 1)},
               v_full_weight}};
   if (!fp16) {
     operands.push_back(
@@ -2957,44 +3044,92 @@ void rpu_launch_pi05_kv1_pair_owner_w8a16_m50n32x2k1024_kernel(
               GraphDdrRegisterAbi{
                   GraphDdrRegisterRole::PerChannelScale,
                   GraphDdrRegisterAccess::Read,
-                  GraphDdrRegisterEncoding::DevAddrShift8LoHi, 20, 21},
+                  GraphDdrRegisterEncoding::DevAddrShift8LoHi,
+                  k_scale_reg, static_cast<uint16_t>(k_scale_reg + 1)},
               k_full_scale});
     operands.push_back(
           GraphDdrRegisterOperandSpec{
               GraphDdrRegisterAbi{
                   GraphDdrRegisterRole::PerChannelScale,
                   GraphDdrRegisterAccess::Read,
-                  GraphDdrRegisterEncoding::DevAddrShift8LoHi, 26, 27},
+                  GraphDdrRegisterEncoding::DevAddrShift8LoHi,
+                  v_scale_reg, static_cast<uint16_t>(v_scale_reg + 1)},
               v_full_scale});
   }
-  auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(kKernelId, operands);
+  if (q && !q_wspm) {
+    operands.insert(
+        operands.begin(),
+        GraphDdrRegisterOperandSpec{
+            GraphDdrRegisterAbi{
+                GraphDdrRegisterRole::PackedFp4ModelWeight,
+                GraphDdrRegisterAccess::Read,
+                GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3},
+            q->weight});
+  }
+  auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(launch_id, operands);
   rpu_ddr_flush(k_full_weight.data_ptr());
   rpu_ddr_flush(v_full_weight.data_ptr());
   if (!fp16) {
     rpu_ddr_flush(k_full_scale.data_ptr());
     rpu_ddr_flush(v_full_scale.data_ptr());
   }
+  if (q) {
+    if (!q_wspm) rpu_ddr_flush(q->weight.data_ptr());
+    rpu_ddr_flush(q_plan.block_scale->data_ptr());
+  }
 
-  Kernel_t* kernel = GET_KERNEL(kKernelId);
+  Kernel_t* kernel = GET_KERNEL(launch_id);
   TORCH_CHECK(
       kernel != nullptr,
       "Pi0.5 KV1 pair-owner kernel for the installed weight dtype is absent from the expansion ref");
   kernel->reset_regs();
-  rpu_pl_tiling::set_parallel_linear_regs(
-      *kernel,
-      rpu_pl_tiling::ParallelLinearRegisterArgs{
-          input_spm_addr, 0, k_output_spm_addr, 0,
-          kRows, kLocalN, kK, 0, kCores,
-          kK * sizeof(c10::Half), kLocalN * sizeof(c10::Half),
-          0, 1, static_cast<uint16_t>(fp16 ? 0 : 1)});
-  rpu_pl_tiling::set_u32_reg_pair(*kernel, 30, v_output_spm_addr);
+  if (q) {
+    const auto regs = rpu_pi05_q_kv1::registers({input_spm_addr, q->output,
+        k_output_spm_addr, v_output_spm_addr, q->spm_scale, q->tensor_scale,
+        static_cast<uint16_t>(rows), q->layer});
+    for (size_t index = 0; index < regs.size(); ++index)
+      kernel->set_regs(static_cast<int>(index), regs[index]);
+    // The wspm sibling takes the run's absolute SPM address in 2/3, where the
+    // sspm one's typed DDR weight owner goes.
+    if (q_wspm) rpu_pl_tiling::set_u32_reg_pair(*kernel, 2, q->spm_weight);
+  } else {
+    rpu_pl_tiling::set_parallel_linear_regs(
+        *kernel,
+        rpu_pl_tiling::ParallelLinearRegisterArgs{
+            input_spm_addr, 0, k_output_spm_addr, 0,
+            kRows, kLocalN, kK, 0, kCores,
+            kK * sizeof(c10::Half), kLocalN * sizeof(c10::Half),
+            0, 1, static_cast<uint16_t>(fp16 ? 2 : 1)});
+    rpu_pl_tiling::set_u32_reg_pair(*kernel, 36, v_output_spm_addr);
+  }
   writer.write(*kernel);
 
   auto* queue = GET_QUEUE(kCores);
   TORCH_CHECK(queue != nullptr,
               "Pi0.5 KV1 pair-owner 8-core queue is absent");
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel, {2, 1, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
+  // DB uses two projection warps and its retained M592 address calculation;
+  // the exact M50 entry guarantees the required single row block. The fused
+  // payload adds the Q Linear's four blocks in front of them.
+  const uint16_t gx = q ? uint16_t{6}
+      : double_buffer ? uint16_t{2} : selected.grid_x;
+  const uint16_t gy = double_buffer ? uint16_t{1} : selected.grid_y;
+  queue->enqueu_kernel(*kernel, {gx, gy, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
+}
+
+void rpu_launch_pi05_kv1_pair_owner_w8a16_m50n32x2k1024_kernel(
+    uint32_t input, const at::Tensor& kw, const at::Tensor& ks, uint32_t ko,
+    const at::Tensor& vw, const at::Tensor& vs, uint32_t vo, int64_t rows,
+    const Pi05Nvfp4QProjection* q) {
+  const bool fp16 = kw.defined() && kw.scalar_type() == at::kHalf;
+  launch_pi05_kv1_pair_owner_m50(input, kw, ks, ko, vw, vs, vo, rows,
+      !fp16 && pi05_kv1_pair_owner_w8_double_buffered(rows), q);
+}
+
+void rpu_launch_pi05_kv_owner_db_candidate_kernel(
+    uint32_t input, const at::Tensor& kw, const at::Tensor& ks, uint32_t ko,
+    const at::Tensor& vw, const at::Tensor& vs, uint32_t vo) {
+  launch_pi05_kv1_pair_owner_m50(input, kw, ks, ko, vw, vs, vo, 50, true, nullptr);
 }
 
 void rpu_launch_pi05_prefill_kv1_pair_owner_w8a16_m400n32x2k2048_kernel(
@@ -3005,8 +3140,8 @@ void rpu_launch_pi05_prefill_kv1_pair_owner_w8a16_m400n32x2k2048_kernel(
     const at::Tensor& v_full_weight,
     const at::Tensor& v_full_scale,
     uint32_t v_output_spm_addr, int64_t rows) {
-  TORCH_CHECK(rows == 272 || rows == 288 || rows == 304 || rows == 320 || rows == 336 || rows == 400 || rows == 416 || rows == 432 || rows == 448 || rows == 464,
-              "Pi Prefill KV1 requires C272/C288/C304/C320/C336/C400/C416/C432/C448/C464");
+  TORCH_CHECK(rows == 272 || rows == 288 || rows == 304 || rows == 320 || rows == 336 || rows == 400 || rows == 416 || rows == 432 || rows == 448 || rows == 464 || rows == 480,
+              "Pi Prefill KV1 requires C272/C288/C304/C320/C336/C400/C416/C432/C448/C464/C480");
   const bool fp16 = k_full_weight.defined() && k_full_weight.scalar_type() == at::kHalf;
   const uint32_t kRows = rows;
   constexpr uint32_t kLocalN = 32;
@@ -3017,35 +3152,8 @@ void rpu_launch_pi05_prefill_kv1_pair_owner_w8a16_m400n32x2k2048_kernel(
   const size_t kOutputBytes = kRows * kLocalN * sizeof(c10::Half);
   const size_t kWeightBytes = size_t{kPhysicalN} * kK * (fp16 ? 2 : 1);
   constexpr size_t kScaleBytes = kPhysicalN * sizeof(c10::Half);
-  const KernelId kKernelId = rows == 432
-      ? (fp16 ? KernelId::PI05_PREFILL_KV1_PAIR_OWNER_FP16_M432N32X2K2048
-              : KernelId::PI05_PREFILL_KV1_PAIR_OWNER_W8A16_M432N32X2K2048) :
-        rows == 464
-      ? (fp16 ? KernelId::PI05_PREFILL_KV1_PAIR_OWNER_FP16_M464N32X2K2048
-              : KernelId::PI05_PREFILL_KV1_PAIR_OWNER_W8A16_M464N32X2K2048) :
-        rows == 336
-      ? (fp16 ? KernelId::PI05_PREFILL_KV1_PAIR_OWNER_FP16_M336N32X2K2048
-              : KernelId::PI05_PREFILL_KV1_PAIR_OWNER_W8A16_M336N32X2K2048) :
-        rows == 448
-      ? (fp16 ? KernelId::PI05_PREFILL_KV1_PAIR_OWNER_FP16_M448N32X2K2048
-              : KernelId::PI05_PREFILL_KV1_PAIR_OWNER_W8A16_M448N32X2K2048) :
-        rows == 416
-      ? (fp16 ? KernelId::PI05_PREFILL_KV1_PAIR_OWNER_FP16_M416N32X2K2048
-              : KernelId::PI05_PREFILL_KV1_PAIR_OWNER_W8A16_M416N32X2K2048)
-      : rows == 288
-      ? (fp16 ? KernelId::PI05_PREFILL_KV1_PAIR_OWNER_FP16_M288N32X2K2048
-              : KernelId::PI05_PREFILL_KV1_PAIR_OWNER_W8A16_M288N32X2K2048)
-      : rows == 304
-      ? (fp16 ? KernelId::PI05_PREFILL_KV1_PAIR_OWNER_FP16_M304N32X2K2048
-              : KernelId::PI05_PREFILL_KV1_PAIR_OWNER_W8A16_M304N32X2K2048) :
-        rows == 320
-      ? (fp16 ? KernelId::PI05_PREFILL_KV1_PAIR_OWNER_FP16_M320N32X2K2048
-              : KernelId::PI05_PREFILL_KV1_PAIR_OWNER_W8A16_M320N32X2K2048)
-      : fp16 ?
-      (rows == 400 ? KernelId::PI05_PREFILL_KV1_PAIR_OWNER_FP16_M400N32X2K2048 :
-                     KernelId::PI05_PREFILL_KV1_PAIR_OWNER_FP16_M272N32X2K2048) :
-      (rows == 400 ? KernelId::PI05_PREFILL_KV1_PAIR_OWNER_W8A16_M400N32X2K2048 :
-                     KernelId::PI05_PREFILL_KV1_PAIR_OWNER_W8A16_M272N32X2K2048);
+  const auto selected = rpu_pi_wall::select(rpu_pi_wall::Operation::KvOwner, (fp16 ? rpu_pl_tiling::WeightType::Fp16 : rpu_pl_tiling::WeightType::Int8), false, kRows, kLocalN, kK);
+  const auto kKernelId = pi_wall_kernel_id(selected.ordinal);
 
   TORCH_CHECK(
       RpuKernelGraph::has_active(),
@@ -3136,13 +3244,13 @@ void rpu_launch_pi05_prefill_kv1_pair_owner_w8a16_m400n32x2k2048_kernel(
 
   const auto weight_role=fp16 ? GraphDdrRegisterRole::ModelWeight : GraphDdrRegisterRole::Int8ModelWeight;
   std::vector<GraphDdrRegisterOperandSpec> operands{
-      {{weight_role,GraphDdrRegisterAccess::Read,GraphDdrRegisterEncoding::DevAddrShift8LoHi,2,3},k_full_weight},
-      {{weight_role,GraphDdrRegisterAccess::Read,GraphDdrRegisterEncoding::DevAddrShift8LoHi,24,25},v_full_weight}};
+      {{weight_role,GraphDdrRegisterAccess::Read,GraphDdrRegisterEncoding::DevAddrShift8LoHi,2, 3},k_full_weight},
+      {{weight_role,GraphDdrRegisterAccess::Read,GraphDdrRegisterEncoding::DevAddrShift8LoHi,32, 33},v_full_weight}};
   if (!fp16) {
     operands.push_back({{GraphDdrRegisterRole::PerChannelScale,GraphDdrRegisterAccess::Read,
-                        GraphDdrRegisterEncoding::DevAddrShift8LoHi,20,21},k_full_scale});
+                        GraphDdrRegisterEncoding::DevAddrShift8LoHi,20, 21},k_full_scale});
     operands.push_back({{GraphDdrRegisterRole::PerChannelScale,GraphDdrRegisterAccess::Read,
-                        GraphDdrRegisterEncoding::DevAddrShift8LoHi,26,27},v_full_scale});
+                        GraphDdrRegisterEncoding::DevAddrShift8LoHi,34, 35},v_full_scale});
   }
   auto writer=RpuKernelGraph::active().stage_kernel_ddr_registers(kKernelId,operands);
   for(const auto* tensor:{&k_full_weight,&k_full_scale,&v_full_weight,&v_full_scale}) {
@@ -3162,32 +3270,18 @@ void rpu_launch_pi05_prefill_kv1_pair_owner_w8a16_m400n32x2k2048_kernel(
           input_spm_addr, 0, k_output_spm_addr, 0,
           kRows, kLocalN, kK, 0, kCores,
           kK * sizeof(c10::Half), kLocalN * sizeof(c10::Half),
-          0, 1, uint16_t(fp16 ? 0 : 1)});
-  const auto set_reg = [kernel](uint32_t index, uint16_t value) {
-    TORCH_CHECK(
-        kernel->set_regs(index, value) == kKernelRegOk,
-        "Pi0.5 prefill KV1 pair-owner rejected parameter ", index);
-  };
-  const auto set_pair = [&set_reg](uint32_t index, uint32_t value) {
-    set_reg(index, static_cast<uint16_t>(value & 0xffffu));
-    set_reg(index + 1, static_cast<uint16_t>(value >> 16));
-  };
-  // p24..27 are typed DDR slots written below; all remaining extension
-  // parameters are explicitly initialized so all cores receive one exact
-  // 68-halfword broadcast image.
-  for (uint32_t index = 24; index < 68; ++index) set_reg(index, 0);
-  set_pair(30, v_output_spm_addr);
-  set_reg(64, 2);
-  set_reg(65, 1);
-  set_reg(66, 1);
-  set_reg(67, 0);
+          0, 1, uint16_t(fp16 ? 2 : 1)});
+  // Standard p26/p27 retain X dtype and weight dtype mode. The current
+  // multibase ABI adds only the second projection at p32..39; reset_regs()
+  // already clears unused fields, including the absent V bias at p38/39.
+  rpu_pl_tiling::set_u32_reg_pair(*kernel, 36, v_output_spm_addr);
   writer.write(*kernel);
 
   auto* queue = GET_QUEUE(kCores);
   TORCH_CHECK(queue != nullptr,
               "Pi0.5 prefill KV1 pair-owner 8-core queue is absent");
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel, {2, 1, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
+  queue->enqueu_kernel(*kernel, {selected.grid_x, selected.grid_y, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
 }
 
 Tensor cpu_fallback_linear(const Tensor &input, const Tensor &weight,
@@ -3259,7 +3353,7 @@ Tensor cpu_fallback_linear(const Tensor &input, const Tensor &weight,
 // NOTE: weight must be pre-transformed using rpu_transform_linear_weight() or
 //       Python-side convert_model_for_rpu() before calling this function
 namespace {
-KernelId autotile_linear_acc32_kernel_id(bool is_fp16, int n_tile);
+KernelId autotile_linear_acc32_kernel_id(bool is_fp16, const rpu_pl_tiling::TilePick& tile);
 
 void validate_parallel_linear_geometry(
     int64_t M, int64_t N, int64_t K, int64_t partition, int64_t num_cores) {
@@ -3284,6 +3378,69 @@ void validate_parallel_linear_grid(size_t rows, size_t cols,
                   (cols - 1) / tile_n < UINT16_MAX,
               "parallel Linear grid exceeds the uint16 launch ABI");
 }
+
+// An eager col-partition DDR Linear is a short fixed sequence of device steps:
+// bias scatter, then per row chunk an input broadcast, the GEMM, the
+// all-gather and the write-back. Issued one by one, every step is its own
+// synchronous SDK submission. On R1 a small step's round trip costs ~0.3 ms,
+// so a small eager Linear cost ~1.5 ms at any core count, M or weight size
+// (lane H, 2026-11-10). Recording the steps in a private, signature-less
+// Graph scope runs them as one non-replayable one-shot batch on the
+// QueueCache queues, the path the runtime contract reserves for one-shot
+// work, so the call pays one round trip instead of one per step.
+//
+// Only used when no Graph is on the active stack: inside a capture, a replay
+// or a PASSTHROUGH suffix the launcher keeps its existing per-step behaviour.
+// The scope is per core count so a reduced-core call gets the reduced-core
+// SDK entry ceiling (segment_resource_budget).
+class EagerLinearBatch {
+ public:
+  EagerLinearBatch(bool enabled, int num_cores) {
+    if (!enabled) return;
+    graph_ = &graph_for(num_cores);
+    graph_->begin();
+  }
+  EagerLinearBatch(const EagerLinearBatch&) = delete;
+  EagerLinearBatch& operator=(const EagerLinearBatch&) = delete;
+  // An exception between begin() and submit() leaves recorded, unexecuted
+  // nodes; abort() drops them and pops the scope so later eager work is not
+  // recorded into a dead Graph. It is idempotent after a failed end().
+  ~EagerLinearBatch() {
+    if (graph_ == nullptr) return;
+    try {
+      graph_->abort();
+    } catch (...) {
+    }
+  }
+  bool active() const { return graph_ != nullptr; }
+  void submit() {
+    RpuKernelGraph* graph = graph_;
+    graph_ = nullptr;
+    try {
+      graph->end();
+    } catch (...) {
+      // Report the end() failure, not a secondary abort() failure.
+      try {
+        graph->abort();
+      } catch (...) {
+      }
+      throw;
+    }
+  }
+
+ private:
+  static RpuKernelGraph& graph_for(int num_cores) {
+    thread_local std::array<std::unique_ptr<RpuKernelGraph>, NUM_CORES> graphs;
+    auto& graph = graphs.at(static_cast<size_t>(num_cores - 1));
+    if (!graph) {
+      GraphRuntimePolicy policy;
+      policy.execution_core_count = num_cores;
+      graph = std::make_unique<RpuKernelGraph>(policy);
+    }
+    return *graph;
+  }
+  RpuKernelGraph* graph_ = nullptr;
+};
 }
 
 // Public W4 DDR projection uses the same pgrp ABI as fused decoder projections.
@@ -3291,7 +3448,8 @@ void validate_parallel_linear_grid(size_t rows, size_t cols,
 // a half-width activation DMA or launch with an undersized scale payload.
 static void check_linear_w4a16_operands(
     const Tensor& input, const Tensor& weight, const Tensor& scale,
-    const c10::optional<Tensor>& bias_opt) {
+    const c10::optional<Tensor>& bias_opt, int64_t num_cores = NUM_CORES,
+    int64_t logical_out_features = -1) {
   TORCH_CHECK(!graph_dma::active(),
               "linear_w4a16: fresh DDR operands require eager execution");
   TORCH_CHECK(input.dim() >= 1 && weight.dim() == 2,
@@ -3300,19 +3458,24 @@ static void check_linear_w4a16_operands(
               "linear_w4a16: input must be FP16 and packed weight UINT8");
   TORCH_CHECK(input.device().type() == at::kPrivateUse1 &&
                   weight.device() == input.device(),
-              "linear_w4a16: input and weight must share a device");
-  const int64_t k = input.size(-1), n = weight.size(0);
-  TORCH_CHECK(k > 0 && k % 64 == 0 && weight.size(1) == k / 2,
-              "linear_w4a16: packed weight must be [N,K/2] with logical K divisible by 64");
+              "linear_w4a16: input and weight must share an RPU device");
+  const int64_t k = input.size(-1);
+  const int64_t n = logical_out_features < 0 ? weight.size(0) : logical_out_features;
+  TORCH_CHECK(k > 0 && k % 32 == 0 && weight.size(1) == k / 2,
+              "linear_w4a16: packed weight requires logical K divisible by 32");
   TORCH_CHECK(weight.is_contiguous(),
               "linear_w4a16: pgrp packed weight must be contiguous");
-  validate_parallel_linear_geometry(input.numel() / k, n, k, 1, 8);
+  validate_parallel_linear_geometry(input.numel() / k, n, k, 1, num_cores);
+  const int64_t physical_n = ((n / num_cores + 31) / 32 * 32) * num_cores;
+  TORCH_CHECK(weight.size(0) == physical_n,
+              "linear_w4a16: weight rows must include per-core N32 padding, expected ",
+              physical_n, ", got ", weight.size(0));
   TORCH_CHECK(scale.defined() && scale.device() == input.device() &&
                   scale.scalar_type() == at::kHalf && scale.dim() == 2 &&
                   scale.size(0) == 32 && scale.is_contiguous(),
               "linear_w4a16: scale must be contiguous device FP16 pgrp G32 payload");
   const int64_t scale_elements = ((k / 32 + 3) / 4) *
-      ((n / 8 + 63) / 64) * 8 * 4 * 64;
+      ((n / num_cores + 63) / 64) * num_cores * 4 * 64;
   TORCH_CHECK(scale.numel() == scale_elements,
               "linear_w4a16: controller-striped scale payload has ", scale.numel(),
               " elements, expected ", scale_elements);
@@ -3333,26 +3496,64 @@ void rpu_launch_linear_ddr_kernel(const at::Tensor &input, const at::Tensor &wei
                                   const uint64_t *live_bias_base,
                                   int num_cores,
                                   const at::Tensor& weight_scale,
-                                  c10::optional<bool> linear_acc32) {
+                                  c10::optional<bool> linear_acc32,
+                                  const LinearConv1dSlab *conv_slab,
+                                  GeluMode epilogue_gelu) {
   TORCH_CHECK(input.dim() == 2 && weight.dim() == 2 && output.dim() == 2,
               "rpu_linear DDR launcher requires rank-2 input/weight/output");
   const bool w4a16 = weight.scalar_type() == at::kByte;
+  const bool w8a16 = weight.scalar_type() == at::kChar;
   if (w4a16) {
-    TORCH_CHECK(partition == 1 && num_cores == 8,
-                "rpu_linear W4A16 DDR supports eager TP8 col partition only");
+    TORCH_CHECK(partition == 1,
+                "rpu_linear W4A16 DDR supports eager col partition only");
     check_linear_w4a16_operands(input, weight, weight_scale,
-        has_bias ? c10::optional<Tensor>(bias) : c10::optional<Tensor>{});
+        has_bias ? c10::optional<Tensor>(bias) : c10::optional<Tensor>{},
+        num_cores, output.size(1));
   }
   const int64_t logical_k = w4a16 ? input.size(1) : weight.size(1);
+  // Rows of `output`: one per input row for a GEMM, one per convolution window
+  // for the slab. The slab's `input` is [L, C], so it is NOT the M axis.
+  const int64_t halo =
+      conv_slab ? (conv_slab->taps - 1) * conv_slab->dilation : 0;
+  const int64_t logical_m = conv_slab ? output.size(0) : input.size(0);
   validate_parallel_linear_geometry(
-      input.size(0), weight.size(0), logical_k, partition, num_cores);
-  TORCH_CHECK(input.size(1) == logical_k &&
-                  output.size(0) == input.size(0) &&
-                  output.size(1) == weight.size(0),
-              "rpu_linear DDR input/weight/output geometry mismatch");
+      logical_m, output.size(1), logical_k, partition, num_cores);
+  if (conv_slab) {
+    // Everything the slab route cannot express, refused here. A dilation the
+    // registers cannot encode must not fall through to a dilation-1 answer.
+    TORCH_CHECK(conv_slab->taps == 7 && conv_slab->dilation == 1,
+                "rpu_linear conv slab: only taps=7 dilation=1 is implemented "
+                "(the kernel's A-operand pitch is a single per-row stride, so a "
+                "dilated tap's extra t*(d-1)*C offset has nowhere to live); got "
+                "taps=", conv_slab->taps, " dilation=", conv_slab->dilation);
+    TORCH_CHECK(conv_slab->channels > 0 && conv_slab->channels % 16 == 0,
+                "rpu_linear conv slab: channels must be positive and "
+                "16-aligned, got ", conv_slab->channels);
+    TORCH_CHECK(logical_k == conv_slab->taps * conv_slab->channels,
+                "rpu_linear conv slab: weight K (", logical_k, ") must be "
+                "taps*channels (", conv_slab->taps * conv_slab->channels, ")");
+    TORCH_CHECK(input.size(1) == conv_slab->channels,
+                "rpu_linear conv slab: input must be the compact [L, C] "
+                "activation, got row width ", input.size(1), " for C=",
+                conv_slab->channels);
+    TORCH_CHECK(input.size(0) == logical_m + halo,
+                "rpu_linear conv slab: input length (", input.size(0), ") must "
+                "be M + (taps-1)*dilation (", logical_m + halo, ")");
+    TORCH_CHECK(input.is_contiguous(),
+                "rpu_linear conv slab: the compact activation must be "
+                "contiguous — the staging DMA moves whole rows");
+    TORCH_CHECK(partition == 1 && !w8a16 && !w4a16,
+                "rpu_linear conv slab: FP16 col partition only");
+    TORCH_CHECK(output.size(1) == weight.size(0),
+                "rpu_linear conv slab: output width must be weight N");
+  } else {
+    TORCH_CHECK(input.size(1) == logical_k &&
+                    output.size(0) == input.size(0) &&
+                    (w4a16 || output.size(1) == weight.size(0)),
+                "rpu_linear DDR input/weight/output geometry mismatch");
+  }
   TORCH_CHECK(input.scalar_type() == at::kHalf,
               "rpu_linear: input must be Half, got ", input.scalar_type());
-  const bool w8a16 = weight.scalar_type() == at::kChar;
   TORCH_CHECK(weight.scalar_type() == at::kHalf || w8a16 || w4a16,
               "rpu_linear: weight must be Half, scaled Int8 or packed W4, got ", weight.scalar_type());
   if (w8a16) {
@@ -3376,12 +3577,32 @@ void rpu_launch_linear_ddr_kernel(const at::Tensor &input, const at::Tensor &wei
 
   const bool use_acc32 = linear_acc32.value_or(!w8a16 && !w4a16);
   const bool in_graph = graph_dma::active();
+  if (conv_slab) {
+    // The acc16 SPM->SPM kernel takes no input pitch (it derives the A address
+    // from local_k alone), so it cannot read a compact slab.
+    TORCH_CHECK(use_acc32,
+                "rpu_linear conv slab: requires the ACC32 tiled kernel — the "
+                "ACC16 path derives its A address from local_k and has no "
+                "runtime input pitch to point at a compact row");
+    // The staging DMA's source address is baked at BUILD on this path, and the
+    // caller's compact activation is produced fresh per forward.
+    TORCH_CHECK(!in_graph,
+                "rpu_linear conv slab: eager only (the input staging DMA is "
+                "fixed, so REPLAY would gather from the previous forward's "
+                "activation)");
+  }
   TORCH_CHECK(partition != 0 || !in_graph,
               "rpu_linear: row partition is eager-only — its per-core input "
               "slice is strided (DMA moves contiguous blocks only) and its "
               "cross-core reduce runs on the host, neither of which replays. "
               "Use a valid col-partition shape for the selected cores or the fused "
               "rpu_launch_linear_spm_to_spm_acc16_kernel.");
+  // The epilogue runs on each core's own output block before the gather. A
+  // row-partition core holds partial sums there, so GELU would be wrong.
+  TORCH_CHECK(epilogue_gelu == GeluMode::NONE ||
+                  (epilogue_gelu == GeluMode::ERF && partition != 0),
+              "rpu_linear: only the exact-ERF GELU epilogue on a col partition "
+              "is implemented");
   // The row path's write-back is a host reduce, not a DMA — there is no DMA
   // destination to rebind, so a live base there would silently do nothing.
   TORCH_CHECK(live_dst_base == nullptr || partition != 0,
@@ -3406,7 +3627,7 @@ void rpu_launch_linear_ddr_kernel(const at::Tensor &input, const at::Tensor &wei
   // (`rpu_linear` for aten::linear, and `linear_with_partition`) allocate their
   // output with a fresh `at::empty` per call, so a src parameter alone could not
   // make either correct — the dst would still be baked, and C-1
-  // (docs/pitfalls.md) additionally requires keep_alive on any operand a graph
+  // (the SDK queue contract) additionally requires keep_alive on any operand a graph
   // dereferences after the caller returned. Refuse the case loudly instead of
   // shipping a parameter nothing routes.
   //
@@ -3424,11 +3645,16 @@ void rpu_launch_linear_ddr_kernel(const at::Tensor &input, const at::Tensor &wei
               "the capture scope.");
 
   const size_t a_dwidth = input.element_size();  // fp16 = 2 bytes
-  const size_t m = input.size(0);
-  const size_t k = input.size(1);
-  const size_t n = weight.size(0);
+  const size_t m = static_cast<size_t>(logical_m);
+  const size_t k = static_cast<size_t>(logical_k);
+  const size_t n = output.size(1);
   const size_t local_n = (partition == 0) ? n : n / num_cores;
   const size_t local_k = (partition == 0) ? k / num_cores : k;
+  // Halves between consecutive A rows. For the slab this is C, so tap t of row
+  // m reads row m+t of the same staged block (the conv identity); for a GEMM it
+  // is the full K the row occupies.
+  const size_t in_pitch = conv_slab ? static_cast<size_t>(conv_slab->channels)
+                                    : local_k;
 
   c10::Half *xp = input.data_ptr<c10::Half>();
   c10::Half *yp = output.data_ptr<c10::Half>();
@@ -3449,10 +3675,14 @@ void rpu_launch_linear_ddr_kernel(const at::Tensor &input, const at::Tensor &wei
   // Per core, per row: x + the GEMM's own y, plus (col) the all-gathered
   // full-width row every core ends up holding.
   size_t row_bytes =
-      (local_k + local_n + (partition == 0 ? 0 : n)) * a_dwidth;
+      (in_pitch + local_n + (partition == 0 ? 0 : n)) * a_dwidth;
   const size_t bias_bytes =
       kernel_applies_bias ? Align(local_n * a_dwidth, SpmAllocator::ALIGN) : 0;
-  const size_t slack = bias_bytes + 3 * SpmAllocator::ALIGN;  // per-alloc round-up
+  // The slab's halo rows are read by the last window of a chunk but start no
+  // window of their own, so they are a fixed surcharge, not a per-row cost.
+  const size_t halo_bytes = static_cast<size_t>(halo) * in_pitch * a_dwidth;
+  const size_t slack =
+      bias_bytes + halo_bytes + 3 * SpmAllocator::ALIGN;  // per-alloc round-up
   size_t free_bytes = SPM_ALLOC.free_space();
   if (w8a16 || w4a16) {
     constexpr size_t budget = SpmAllocator::SPM_PLANNING_BUDGET &
@@ -3482,7 +3712,25 @@ void rpu_launch_linear_ddr_kernel(const at::Tensor &input, const at::Tensor &wei
   if (partition != 0 &&
       ((!in_graph && m == 1) || free_bytes <= slack + row_bytes)) {
     col_scatter = true;
-    row_bytes = (local_k + local_n) * a_dwidth;
+    row_bytes = (in_pitch + local_n) * a_dwidth;
+  }
+  // Eager multi-row col GEMM whose landing zone splits M into more chunks than
+  // the rows alone would need: each chunk re-reads the whole weight, so write
+  // the chunk back with one per-row scatter batch instead of gathering it. Each
+  // row's values come from the same kernel either way; only the DMA route moves.
+  bool col_scatter_rows = false;
+  if (partition != 0 && !col_scatter && !in_graph && !conv_slab &&
+      live_dst_base == nullptr) {
+    const size_t scatter_row_bytes = (in_pitch + local_n) * a_dwidth;
+    const size_t usable = free_bytes - slack;
+    const size_t gather_chunk = usable / row_bytes;
+    const size_t scatter_chunk =
+        std::min<size_t>(usable / scatter_row_bytes, 65535);
+    const auto passes = [m](size_t chunk) { return (m + chunk - 1) / chunk; };
+    if (gather_chunk > 0 && gather_chunk < m && passes(scatter_chunk) < passes(gather_chunk)) {
+      col_scatter_rows = true;
+      row_bytes = scatter_row_bytes;
+    }
   }
   TORCH_CHECK(free_bytes > slack + row_bytes,
               "rpu_linear: free SPM (", free_bytes, " B) cannot hold one row of "
@@ -3490,16 +3738,24 @@ void rpu_launch_linear_ddr_kernel(const at::Tensor &input, const at::Tensor &wei
               col_scatter ? ", already without the all-gather landing zone)" : ")");
   size_t m_chunk = col_scatter ? 1 : (free_bytes - slack) / row_bytes;
   if (m_chunk > m) m_chunk = m;
-  if (m_chunk > 65535) m_chunk = 65535;  // reg8 (local_m) / all_gather reg1 are uint16
+  if (m_chunk > 65535) m_chunk = 65535;  // reg9 (local_m) / all_gather reg1 are uint16
 
-  const uint32_t x_addr =
-      SPM_ALLOC.addr(0, SPM_ALLOC.alloc_temporary(m_chunk * local_k * a_dwidth));
+  const uint32_t x_addr = SPM_ALLOC.addr(
+      0, SPM_ALLOC.alloc_temporary((m_chunk + halo) * in_pitch * a_dwidth));
   const uint32_t y_addr =
       SPM_ALLOC.addr(0, SPM_ALLOC.alloc_temporary(m_chunk * local_n * a_dwidth));
   const uint32_t g_addr =
-      (partition == 0 || col_scatter)
+      (partition == 0 || col_scatter || col_scatter_rows)
           ? 0
           : SPM_ALLOC.addr(0, SPM_ALLOC.alloc_temporary(m_chunk * n * a_dwidth));
+  // Eager col partition: the whole call is one SDK submission (see
+  // EagerLinearBatch) unless col_scatter_rows dispatches its own immediate
+  // QueueCache row-scatter batch. Declared after spm_scope, so every SPM
+  // temporary of this call outlives the batch, and after col_scatter /
+  // col_scatter_rows were chosen from the eager state.
+  EagerLinearBatch eager_batch(
+      partition != 0 && !col_scatter_rows && !RpuKernelGraph::has_active(),
+      num_cores);
   uint32_t b_addr = 0;
   if (kernel_applies_bias) {
     b_addr = SPM_ALLOC.addr(0, SPM_ALLOC.alloc_temporary(local_n * a_dwidth));
@@ -3546,10 +3802,6 @@ void rpu_launch_linear_ddr_kernel(const at::Tensor &input, const at::Tensor &wei
   rpu_ddr_flush(wp);
   if (has_bias && partition == 0) rpu_ddr_flush(bp);
 
-  auto* wq = GET_QUEUE(num_cores);
-  std::vector<uint8_t> core_list;
-  for (int core = 0; core < num_cores; ++core) core_list.push_back(core);
-
   for (size_t row0 = 0; row0 < m; row0 += m_chunk) {
     const size_t cur_m = (m - row0 < m_chunk) ? (m - row0) : m_chunk;
 
@@ -3568,7 +3820,12 @@ void rpu_launch_linear_ddr_kernel(const at::Tensor &input, const at::Tensor &wei
                                      x_addr, num_cores);
     } else {
       // every core needs the whole rows, already contiguous in the input
-      rpu_launch_ddr_broadcast_spm_dma(xp + row0 * k, cur_m * k,
+      //
+      // Slab: the rows this chunk's windows reach are [row0, row0+cur_m+halo),
+      // still one contiguous run, so the same flat broadcast stages them — it
+      // just moves (cur_m+halo)*C halves instead of cur_m*taps*C.
+      rpu_launch_ddr_broadcast_spm_dma(xp + row0 * in_pitch,
+                                       (cur_m + halo) * in_pitch,
                                        x_addr, num_cores);
     }
 
@@ -3577,53 +3834,21 @@ void rpu_launch_linear_ddr_kernel(const at::Tensor &input, const at::Tensor &wei
           x_addr, weight, y_addr, cur_m, n, k, partition, num_cores,
           b_addr, weight_scale, 0, 0, use_acc32);
     } else {
-      const auto tile = rpu_pl_tiling::select_tile_acc32(
-          static_cast<int>(cur_m), static_cast<int>(local_n),
-          static_cast<int>(local_k), /*is_fp16=*/true);
-      const size_t n_per_wrp = static_cast<size_t>(tile.n_tile);
-      const size_t m_per_wrp = static_cast<size_t>(tile.m_tile);
-      validate_parallel_linear_grid(cur_m, local_n, m_per_wrp, n_per_wrp);
-      const KernelId kernel_id =
-          autotile_linear_acc32_kernel_id(/*is_fp16=*/true, tile.n_tile);
+      // The conv-slab route narrows the A-operand row pitch to one channel row
+      // while local_k stays taps*channels. Each recorded chunk still obtains
+      // its own kernel and typed DDR writer through the shared launcher.
+      rpu_launch_linear_spm_to_spm_kernel(
+          x_addr, weight, y_addr, cur_m, n, k, partition, num_cores, b_addr,
+          static_cast<uint32_t>(in_pitch * a_dwidth));
+    }
 
-      auto register_writer =
-          RpuKernelGraph::active().stage_kernel_ddr_registers(
-              kernel_id,
-              std::vector<GraphDdrRegisterOperandSpec>{
-                  GraphDdrRegisterOperandSpec{
-                      GraphDdrRegisterAbi{
-                          GraphDdrRegisterRole::ModelWeight,
-                          GraphDdrRegisterAccess::Read,
-                          GraphDdrRegisterEncoding::DevAddrShift8LoHi,
-                          2, 3},
-                      weight}});
-
-      // GET_KERNEL stays INSIDE the loop: it sets pending_kernel_id_ for every
-      // graph node, and the recorder needs a distinct Kernel_t instance per chunk
-      // so REPLAY does not reuse the tail chunk's registers for every node.
-      Kernel_t* kernel = GET_KERNEL(kernel_id);
-      TORCH_CHECK(kernel != nullptr,
-                  "Failed to get FP16 ACC32 parallel_linear tile m", m_per_wrp,
-                  "n", n_per_wrp);
-      kernel->reset_regs();
-      rpu_pl_tiling::set_parallel_linear_regs(
-          *kernel,
-          rpu_pl_tiling::ParallelLinearRegisterArgs{
-              x_addr, 0, y_addr, b_addr,
-              static_cast<uint32_t>(cur_m), static_cast<uint32_t>(local_n),
-              static_cast<uint32_t>(local_k),
-              static_cast<uint16_t>(kernel_applies_bias),
-              static_cast<uint16_t>(num_cores),
-              static_cast<uint32_t>(local_k * a_dwidth),
-              static_cast<uint32_t>(local_n * a_dwidth),
-              0, static_cast<uint16_t>(partition), 2});
-      register_writer.write(*kernel);
-
-      wq->set_broadcast_mode(true);
-      wq->enqueu_kernel(*kernel,
-                        {(uint16_t)CeilDiv(local_n, n_per_wrp),
-                         (uint16_t)CeilDiv(cur_m, m_per_wrp), (uint16_t)1},
-                        core_list);
+    if (epilogue_gelu != GeluMode::NONE) {
+      // Core c holds columns [c*local_n, (c+1)*local_n) of these rows. GELU is
+      // elementwise, so it runs there in place, in the same submission, before
+      // the all-gather or scatter write-back.
+      rpu_launch_eltwise_unary_spm_kernel(y_addr, y_addr, cur_m * local_n,
+                                          ValuOpType::ADD, epilogue_gelu,
+                                          num_cores);
     }
 
     if (partition != 0) {
@@ -3644,6 +3869,17 @@ void rpu_launch_linear_ddr_kernel(const at::Tensor &input, const at::Tensor &wei
           rpu_launch_spm_scatter_ddr_dma(y_addr, yp + row0 * n, local_n,
                                          local_n * a_dwidth, num_cores);
         }
+        continue;
+      }
+      if (col_scatter_rows) {
+        // Core c holds row r's columns [c*local_n, (c+1)*local_n) at
+        // y_addr + r*local_n; every row is the m == 1 scatter above.
+        rpu_launch_spm_scatter_rows_ddr_dma_immediate(
+            y_addr, yp + row0 * n, static_cast<int64_t>(cur_m),
+            static_cast<int64_t>(local_n),
+            static_cast<int64_t>(local_n * a_dwidth),
+            static_cast<int64_t>(n * a_dwidth),
+            static_cast<int64_t>(local_n * a_dwidth), num_cores);
         continue;
       }
       // per-core outputs are different COLUMN blocks of one answer -> concat.
@@ -3685,6 +3921,17 @@ void rpu_launch_linear_ddr_kernel(const at::Tensor &input, const at::Tensor &wei
       }
     }
     rpu_ddr_flush_force(out);  // host wrote it; publish before the next chunk
+  }
+
+  if (eager_batch.active()) {
+    eager_batch.submit();
+    // The immediate fixed write-backs flush their destination again after the
+    // DMA; recorded ones flush only before it. Keep the eager post-flush.
+    // Mutable destinations stay the caller's to publish, as before.
+    if (live_dst_base == nullptr) {
+      for (size_t row0 = 0; row0 < m; row0 += m_chunk)
+        rpu_ddr_flush(yp + row0 * n);
+    }
   }
 }
 
@@ -3852,12 +4099,18 @@ Tensor rpu_linear_with_accumulation(
     const Tensor& input, const Tensor& weight,
     const c10::optional<Tensor>& bias_opt,
     int64_t partition, int64_t num_cores, bool linear_acc32,
-    const c10::optional<Tensor>& scale_opt) {
+    const c10::optional<Tensor>& scale_opt,
+    int64_t logical_out_features, bool gelu_erf) {
   RECORD_FUNCTION("rpu::linear_with_accumulation", {});
+  TORCH_CHECK(!gelu_erf || partition == 1,
+              "linear_with_accumulation: gelu_erf requires the col partition");
   const bool packed = weight.scalar_type() == at::kByte;
   if (packed) {
+    TORCH_CHECK(partition == 1,
+                "rpu_linear W4A16 DDR supports eager col partition only");
     TORCH_CHECK(scale_opt.has_value(), "packed W4 Linear requires scales");
-    check_linear_w4a16_operands(input, weight, *scale_opt, bias_opt);
+    check_linear_w4a16_operands(input, weight, *scale_opt, bias_opt, num_cores,
+                                logical_out_features);
   } else {
     check_linear_shapes(input, weight, bias_opt);
   }
@@ -3874,7 +4127,9 @@ Tensor rpu_linear_with_accumulation(
               "linear_with_core_count: fresh DDR operands require execution outside graph capture");
 
   const int64_t k = packed ? input.size(-1) : weight.size(1);
-  const int64_t n = weight.size(0);
+  const int64_t n = logical_out_features < 0 ? weight.size(0) : logical_out_features;
+  TORCH_CHECK(packed || n == weight.size(0),
+              "linear_with_accumulation: logical output override is only for padded W4");
   TORCH_CHECK(k > 0, "linear_with_core_count: in_features must be positive");
   const int64_t rows = input.numel() / k;
   validate_parallel_linear_geometry(rows, n, k, partition, num_cores);
@@ -3894,33 +4149,13 @@ Tensor rpu_linear_with_accumulation(
   Tensor output = at::empty(output_shape, input.options());
   Tensor output_2d = output.view({rows, n});
   const Tensor scale = scale_opt.has_value()
-      ? (packed ? rpu_retain_linear_quant_scale(weight, *scale_opt) : *scale_opt)
+      ? (packed ? rpu_retain_linear_quant_scale(weight, *scale_opt,
+                                               num_cores) : *scale_opt)
       : Tensor{};
-  // shortcut: the measured TTS Predictor head geometry; benchmark before expanding.
-  // A one-shot Graph joins upload/compute/write-back without retaining fresh operands.
-  if (!RpuKernelGraph::has_active() && rows == 1 && k == 1024 && n == 2048 && partition == 1 &&
-      num_cores == 8 && !linear_acc32 && !has_bias &&
-      weight.scalar_type() == at::kHalf && !scale.defined()) {
-    const uint64_t dst = RpuGetDevAddr(output_2d.data_ptr<c10::Half>());
-    RpuKernelGraph graph;
-    graph.begin();
-    try {
-      graph.keep_alive(input_2d);
-      graph.keep_alive(weight);
-      graph.keep_alive(output_2d);
-      rpu_launch_linear_ddr_kernel(
-          input_2d, weight, output_2d, bias, false, 1,
-          &dst, 0, nullptr, 8, {}, false);
-      graph.end();
-    } catch (...) {
-      graph.abort();
-      throw;
-    }
-  } else {
-    rpu_launch_linear_ddr_kernel(
-        input_2d, weight, output_2d, bias, has_bias, static_cast<int>(partition),
-        nullptr, 0, nullptr, static_cast<int>(num_cores), scale, linear_acc32);
-  }
+  rpu_launch_linear_ddr_kernel(
+      input_2d, weight, output_2d, bias, has_bias, static_cast<int>(partition),
+      nullptr, 0, nullptr, static_cast<int>(num_cores), scale, linear_acc32,
+      nullptr, gelu_erf ? GeluMode::ERF : GeluMode::NONE);
   return output;
 }
 
@@ -4075,9 +4310,17 @@ void check_tts_codec_device_half(const Tensor& tensor,
 Tensor rpu_tts_codec_conv1d_spm(
     const Tensor& input, const Tensor& weight,
     const c10::optional<Tensor>& bias,
-    int64_t kernel, int64_t dilation, int64_t out_channels) {
+    int64_t kernel, int64_t dilation, int64_t out_channels,
+    int64_t num_cores = 8) {
   TORCH_CHECK(!RpuKernelGraph::has_active(),
               "tts_codec_conv1d_spm: eager tiled execution required");
+  TORCH_CHECK(num_cores == 4 || num_cores == 6 || num_cores == 8,
+              "tts_codec_conv1d_spm: num_cores must be 4, 6, or 8");
+#ifdef NUM_CORES
+  const int64_t codec_cores = (num_cores >= 8 && NUM_CORES >= 8) ? 8 : 4;
+#else
+  const int64_t codec_cores = (num_cores >= 8) ? 8 : 4;
+#endif
   TORCH_CHECK(input.device().is_cpu() && input.scalar_type() == at::kFloat &&
                   input.dim() == 3 && input.size(0) == 1,
               "tts_codec_conv1d_spm: expected CPU FP32 input");
@@ -4112,7 +4355,7 @@ Tensor rpu_tts_codec_conv1d_spm(
   auto rows = tts_codec_cpu_nct_to_device_rows(input, weight);
   auto patches = tts_codec_im2col_rows(rows, kernel, dilation, 0);
   auto projected = rpu_linear_with_accumulation(
-      patches, weight, device_bias ? bias : c10::nullopt, 1, 8, true, c10::nullopt)
+      patches, weight, device_bias ? bias : c10::nullopt, 1, codec_cores, true, c10::nullopt)
                        .narrow(1, 0, out_channels);
   auto output = tts_codec_device_rows_to_cpu_nct(projected);
   if (bias.has_value() && !device_bias) output.add_(bias->view({1, out_channels, 1}));
@@ -4122,9 +4365,16 @@ Tensor rpu_tts_codec_conv1d_spm(
 static Tensor tts_codec_residual_unit_impl(
     const Tensor& input, const Tensor& first_weight, const Tensor& affine,
     const Tensor& second_weight, int64_t dilation, int64_t channels, bool complete,
-    bool resident = false, bool padded_rows = false) {
+    bool resident = false, bool padded_rows = false, int64_t num_cores = 8) {
   TORCH_CHECK(!RpuKernelGraph::has_active(),
               "tts_codec_residual_unit: eager tiled execution required");
+  TORCH_CHECK(num_cores == 4 || num_cores == 6 || num_cores == 8,
+              "tts_codec_residual_unit: num_cores must be 4, 6, or 8");
+#ifdef NUM_CORES
+  const int64_t codec_cores = (num_cores >= 8 && NUM_CORES >= 8) ? 8 : 4;
+#else
+  const int64_t codec_cores = (num_cores >= 8) ? 8 : 4;
+#endif
   const int64_t row_channels = padded_rows ? (channels == 96 ? 128 : 256) : channels;
   const bool valid_input = resident
       ? complete && (padded_rows ? (channels == 96 || channels == 192)
@@ -4163,12 +4413,12 @@ static Tensor tts_codec_residual_unit_impl(
   }
   auto patches = tts_codec_im2col_rows(hidden, 7, dilation, 6 * dilation);
   hidden = rpu_linear_with_accumulation(
-      patches, first_weight, c10::nullopt, 1, 8, true, c10::nullopt);
+      patches, first_weight, c10::nullopt, 1, codec_cores, true, c10::nullopt);
   hidden = at::add(hidden, channel(0));
   hidden = tts_codec_snake_rows(
       hidden, channel(1), channel(2));
   hidden = rpu_linear_with_accumulation(
-      hidden, second_weight, c10::nullopt, 1, 8, true, c10::nullopt);
+      hidden, second_weight, c10::nullopt, 1, codec_cores, true, c10::nullopt);
   hidden = at::add(hidden, channel(3));
   if (complete) {
     hidden = at::add(hidden, residual);
@@ -4178,30 +4428,34 @@ static Tensor tts_codec_residual_unit_impl(
 
 Tensor rpu_tts_codec_residual_unit(
     const Tensor& input, const Tensor& first_weight, const Tensor& affine,
-    const Tensor& second_weight, int64_t dilation, int64_t channels) {
+    const Tensor& second_weight, int64_t dilation, int64_t channels,
+    int64_t num_cores = 8) {
   return tts_codec_residual_unit_impl(
-      input, first_weight, affine, second_weight, dilation, channels, false);
+      input, first_weight, affine, second_weight, dilation, channels, false, false, false, num_cores);
 }
 
 Tensor rpu_tts_codec_residual_unit_complete(
     const Tensor& input, const Tensor& first_weight, const Tensor& affine,
-    const Tensor& second_weight, int64_t dilation, int64_t channels) {
+    const Tensor& second_weight, int64_t dilation, int64_t channels,
+    int64_t num_cores = 8) {
   return tts_codec_residual_unit_impl(
-      input, first_weight, affine, second_weight, dilation, channels, true);
+      input, first_weight, affine, second_weight, dilation, channels, true, false, false, num_cores);
 }
 
 Tensor rpu_tts_codec_residual_unit_rows(
     const Tensor& input, const Tensor& first_weight, const Tensor& affine,
-    const Tensor& second_weight, int64_t dilation, int64_t channels) {
+    const Tensor& second_weight, int64_t dilation, int64_t channels,
+    int64_t num_cores = 8) {
   return tts_codec_residual_unit_impl(
-      input, first_weight, affine, second_weight, dilation, channels, true, true);
+      input, first_weight, affine, second_weight, dilation, channels, true, true, false, num_cores);
 }
 
 Tensor rpu_tts_codec_residual_unit_padded_rows(
     const Tensor& input, const Tensor& first_weight, const Tensor& affine,
-    const Tensor& second_weight, int64_t dilation, int64_t channels) {
+    const Tensor& second_weight, int64_t dilation, int64_t channels,
+    int64_t num_cores = 8) {
   return tts_codec_residual_unit_impl(
-      input, first_weight, affine, second_weight, dilation, channels, true, true, true);
+      input, first_weight, affine, second_weight, dilation, channels, true, true, true, num_cores);
 }
 
 Tensor rpu_tts_codec_snake(
@@ -4230,10 +4484,18 @@ Tensor rpu_tts_codec_convnext_block(
     const Tensor& depthwise_bias, const Tensor& norm_weight,
     const Tensor& norm_bias, const Tensor& first_weight,
     const Tensor& first_bias, const Tensor& second_weight,
-    const Tensor& second_bias, const Tensor& gamma, double eps) {
+    const Tensor& second_bias, const Tensor& gamma, double eps,
+    int64_t num_cores = 8) {
   constexpr int64_t channels = 1024;
   TORCH_CHECK(!RpuKernelGraph::has_active(),
               "tts_codec_convnext_block: eager tiled execution required");
+  TORCH_CHECK(num_cores == 4 || num_cores == 6 || num_cores == 8,
+              "tts_codec_convnext_block: num_cores must be 4, 6, or 8");
+#ifdef NUM_CORES
+  const int64_t codec_cores = (num_cores >= 8 && NUM_CORES >= 8) ? 8 : 4;
+#else
+  const int64_t codec_cores = (num_cores >= 8) ? 8 : 4;
+#endif
   TORCH_CHECK(input.device().is_cpu() && input.scalar_type() == at::kFloat &&
                   input.dim() == 3 && input.size(0) == 1 &&
                   input.size(1) == channels && input.size(2) > 0 &&
@@ -4263,14 +4525,14 @@ Tensor rpu_tts_codec_convnext_block(
   auto residual = tts_codec_cpu_nct_to_device_rows(input, depthwise_weight);
   auto patches = tts_codec_im2col_rows(residual, 7, 1, 6);
   auto hidden = rpu_linear_with_accumulation(
-      patches, depthwise_weight, depthwise_bias, 1, 8, true, c10::nullopt);
+      patches, depthwise_weight, depthwise_bias, 1, codec_cores, true, c10::nullopt);
   auto normalized = tts_codec_layernorm_rows(
       hidden, norm_weight, norm_bias, eps);
   hidden = rpu_linear_with_accumulation(
-      normalized, first_weight, first_bias, 1, 8, true, c10::nullopt);
+      normalized, first_weight, first_bias, 1, codec_cores, true, c10::nullopt);
   hidden = rpu_gelu_erf(hidden);
   hidden = rpu_linear_with_accumulation(
-      hidden, second_weight, second_bias, 1, 8, true, c10::nullopt);
+      hidden, second_weight, second_bias, 1, codec_cores, true, c10::nullopt);
   hidden = at::mul(hidden, gamma);
   return tts_codec_device_rows_to_cpu_nct(at::add(hidden, residual));
 }
@@ -4278,9 +4540,17 @@ Tensor rpu_tts_codec_convnext_block(
 Tensor rpu_tts_codec_conv1d(
     const Tensor& input, const Tensor& weight,
     const c10::optional<Tensor>& bias,
-    int64_t kernel, int64_t dilation, int64_t out_channels) {
+    int64_t kernel, int64_t dilation, int64_t out_channels,
+    int64_t num_cores = 8) {
   TORCH_CHECK(!RpuKernelGraph::has_active(),
               "tts_codec_conv1d: shared-DDR staging requires eager execution");
+  TORCH_CHECK(num_cores == 4 || num_cores == 6 || num_cores == 8,
+              "tts_codec_conv1d: num_cores must be 4, 6, or 8");
+#ifdef NUM_CORES
+  const int64_t codec_cores = (num_cores >= 8 && NUM_CORES >= 8) ? 8 : 4;
+#else
+  const int64_t codec_cores = (num_cores >= 8) ? 8 : 4;
+#endif
   TORCH_CHECK(input.device().is_cpu() && input.scalar_type() == at::kFloat &&
                   input.layout() == at::kStrided && input.dim() == 3 && input.size(0) == 1,
               "tts_codec_conv1d: expected CPU FP32 [1, channels, samples]");
@@ -4318,7 +4588,7 @@ Tensor rpu_tts_codec_conv1d(
       input.unfold(2, width, 1).slice(3, 0, width, dilation).permute({0, 2, 1, 3}));
   rpu_ddr_flush_force_sized(patches.data_ptr(), patches.nbytes());
   auto projected = rpu_linear_with_accumulation(
-      patches, weight, c10::nullopt, 1, 8, true, c10::nullopt);
+      patches, weight, c10::nullopt, 1, codec_cores, true, c10::nullopt);
   auto readable = rpu_to_cpu_zerocopy(projected);
   auto output = at::empty({1, out_channels, count}, input.options());
   // Crop before conversion; copy directly into the final NCT FP32 layout.
@@ -4330,9 +4600,16 @@ Tensor rpu_tts_codec_conv1d(
 Tensor rpu_tts_codec_conv_pair(
     const Tensor& input, const Tensor& first_weight, const Tensor& affine,
     const Tensor& second_weight, const Tensor& second_bias,
-    int64_t dilation, int64_t channels) {
+    int64_t dilation, int64_t channels, int64_t num_cores = 8) {
   TORCH_CHECK(!RpuKernelGraph::has_active(),
               "tts_codec_conv_pair: shared-DDR staging requires eager execution");
+  TORCH_CHECK(num_cores == 4 || num_cores == 6 || num_cores == 8,
+              "tts_codec_conv_pair: num_cores must be 4, 6, or 8");
+#ifdef NUM_CORES
+  const int64_t codec_cores = (num_cores >= 8 && NUM_CORES >= 8) ? 8 : 4;
+#else
+  const int64_t codec_cores = (num_cores >= 8) ? 8 : 4;
+#endif
   TORCH_CHECK((channels == 768 || channels == 384 || channels == 192 || channels == 96) &&
                   (dilation == 1 || dilation == 3 || dilation == 9),
               "tts_codec_conv_pair: outside the frozen residual profile");
@@ -4365,12 +4642,12 @@ Tensor rpu_tts_codec_conv_pair(
       input.unfold(2, width, 1).slice(3, 0, width, dilation).permute({0, 2, 1, 3}));
   rpu_ddr_flush_force_sized(patches.data_ptr(), patches.nbytes());
   auto projected = rpu_linear_with_accumulation(
-      patches, first_weight, c10::nullopt, 1, 8, true, c10::nullopt);
+      patches, first_weight, c10::nullopt, 1, codec_cores, true, c10::nullopt);
   auto hidden = projected + affine.select(0, 0);
   auto sine = at::sin(hidden * affine.select(0, 1));
   auto activated = hidden + (sine * sine) * affine.select(0, 2);
   auto second = rpu_linear_with_accumulation(
-      activated, second_weight, c10::nullopt, 1, 8, true, c10::nullopt);
+      activated, second_weight, c10::nullopt, 1, codec_cores, true, c10::nullopt);
   auto readable = rpu_to_cpu_zerocopy(second);
   auto output = at::empty({1, channels, count}, input.options());
   output.copy_(readable.narrow(1, 0, channels).transpose(0, 1).unsqueeze(0));
@@ -4381,9 +4658,17 @@ Tensor rpu_tts_codec_conv_pair(
 Tensor rpu_tts_codec_conv_transpose1d(
     const Tensor& input, const Tensor& weight,
     const c10::optional<Tensor>& bias,
-    int64_t out_channels, int64_t kernel, int64_t stride) {
+    int64_t out_channels, int64_t kernel, int64_t stride,
+    int64_t num_cores = 8) {
   TORCH_CHECK(!RpuKernelGraph::has_active(),
               "tts_codec_conv_transpose1d: shared-DDR staging requires eager execution");
+  TORCH_CHECK(num_cores == 4 || num_cores == 6 || num_cores == 8,
+              "tts_codec_conv_transpose1d: num_cores must be 4, 6, or 8");
+#ifdef NUM_CORES
+  const int64_t codec_cores = (num_cores >= 8 && NUM_CORES >= 8) ? 8 : 4;
+#else
+  const int64_t codec_cores = (num_cores >= 8) ? 8 : 4;
+#endif
   TORCH_CHECK(input.device().is_cpu() && input.scalar_type() == at::kFloat &&
                   input.layout() == at::kStrided && input.dim() == 3 && input.size(0) == 1,
               "tts_codec_conv_transpose1d: expected CPU FP32 [1, channels, samples]");
@@ -4414,7 +4699,7 @@ Tensor rpu_tts_codec_conv_transpose1d(
   writable.copy_(input.transpose(1, 2).reshape({count, channels}));
   rpu_ddr_flush_force_sized(rows.data_ptr(), rows.nbytes());
   auto projected = rpu_linear_with_accumulation(
-      rows, weight, c10::nullopt, 1, 8, true, c10::nullopt);
+      rows, weight, c10::nullopt, 1, codec_cores, true, c10::nullopt);
   auto readable = rpu_to_cpu_zerocopy(projected).narrow(1, 0, out_channels * kernel);
   Tensor output;
   if (kernel == stride) {
@@ -4442,13 +4727,80 @@ Tensor rpu_linear_with_core_count(
   TORCH_CHECK(weight.scalar_type() == at::kHalf,
               "linear_with_core_count: weight must be FP16");
   return rpu_linear_with_accumulation(
-      input, weight, bias_opt, partition, num_cores, true, c10::nullopt);
+      input, weight, bias_opt, partition, num_cores, true, c10::nullopt, -1, false);
+}
+
+// Dilation-1 1-D convolution over a COMPACT [L, C] activation: the im2col the
+// host used to materialise is done by the GEMM kernel's own row addressing (see
+// LinearConv1dSlab). The caller uploads L*C halves instead of M*taps*C, which
+// for the TTS codec residual stack is 7x less H2D and 7x less device DDR read.
+//
+// `weight` is the TAP-MAJOR col-swizzled FP16 weight: logical row n holds
+// `[t*C + c]`, i.e. Conv1d.weight.permute(0, 2, 1).flatten(1), NOT the
+// channel-major `flatten(1)`. Feeding a channel-major weight here is silently
+// wrong (both layouts have the same shape), so the TAP-MAJOR requirement is the
+// caller's contract — `install_rpu_residual_convolutions` is the one producer.
+Tensor rpu_conv1d_slab_with_accumulation(
+    const Tensor& input, const Tensor& weight,
+    const c10::optional<Tensor>& bias_opt,
+    int64_t taps, int64_t dilation, int64_t num_cores) {
+  RECORD_FUNCTION("rpu::conv1d_slab_with_accumulation", {});
+  TORCH_CHECK(input.device().type() == at::kPrivateUse1 &&
+                  weight.device() == input.device(),
+              "conv1d_slab: input and weight must be on the same RPU");
+  TORCH_CHECK(input.dim() == 2 && weight.dim() == 2,
+              "conv1d_slab: input must be [L, C] and weight [N, taps*C]");
+  TORCH_CHECK(input.scalar_type() == at::kHalf &&
+                  weight.scalar_type() == at::kHalf,
+              "conv1d_slab: FP16 input and FP16 weight required");
+  TORCH_CHECK(input.is_contiguous() && weight.is_contiguous(),
+              "conv1d_slab: input and swizzled weight must be contiguous");
+  TORCH_CHECK(!graph_dma::active(),
+              "conv1d_slab: fresh DDR operands require execution outside graph capture");
+  TORCH_CHECK(taps > 0 && dilation > 0,
+              "conv1d_slab: taps and dilation must be positive");
+
+  const int64_t channels = input.size(1);
+  const int64_t n = weight.size(0);
+  TORCH_CHECK(weight.size(1) == taps * channels,
+              "conv1d_slab: weight K (", weight.size(1), ") must be taps*C (",
+              taps * channels, ") for the tap-major layout");
+  const int64_t rows = input.size(0) - (taps - 1) * dilation;
+  TORCH_CHECK(rows > 0,
+              "conv1d_slab: activation length ", input.size(0),
+              " is shorter than the ", (taps - 1) * dilation + 1,
+              "-wide dilated kernel");
+  validate_parallel_linear_geometry(rows, n, taps * channels, 1, num_cores);
+
+  Tensor bias;
+  const bool has_bias = bias_opt.has_value();
+  if (has_bias) {
+    bias = *bias_opt;
+    TORCH_CHECK(bias.device() == input.device() &&
+                    bias.scalar_type() == at::kHalf &&
+                    bias.dim() == 1 && bias.numel() == n && bias.is_contiguous(),
+                "conv1d_slab: bias must be a contiguous FP16 [N] tensor on the input RPU");
+  }
+  Tensor output = at::empty({rows, n}, input.options());
+  const LinearConv1dSlab slab{channels, taps, dilation};
+  rpu_launch_linear_ddr_kernel(
+      input, weight, output, bias, has_bias, /*partition=*/1,
+      nullptr, 0, nullptr, static_cast<int>(num_cores), Tensor{},
+      /*linear_acc32=*/true, &slab);
+  return output;
 }
 
 Tensor rpu_tts_codec_conv_transpose1d_device_post(
     const Tensor& input, const Tensor& weight, const c10::optional<Tensor>& bias,
-    int64_t channels, int64_t kernel, int64_t stride) {
+    int64_t channels, int64_t kernel, int64_t stride, int64_t num_cores = 8) {
   TORCH_CHECK(!RpuKernelGraph::has_active(), "tts_codec_conv_transpose1d_device_post requires eager execution");
+  TORCH_CHECK(num_cores == 4 || num_cores == 6 || num_cores == 8,
+              "tts_codec_conv_transpose1d_device_post: num_cores must be 4, 6, or 8");
+#ifdef NUM_CORES
+  const int64_t codec_cores = (num_cores >= 8 && NUM_CORES >= 8) ? 8 : 4;
+#else
+  const int64_t codec_cores = (num_cores >= 8) ? 8 : 4;
+#endif
   TORCH_CHECK(input.device().is_cpu() && input.scalar_type() == at::kFloat &&
                   input.layout() == at::kStrided && input.dim() == 3 && input.size(0) == 1 &&
                   input.size(2) > 0 && input.size(2) <= 255 * 640,
@@ -4467,7 +4819,7 @@ Tensor rpu_tts_codec_conv_transpose1d_device_post(
                    bias->is_contiguous() && bias->sizes().equals({padded})),
               "tts_codec_conv_transpose1d_device_post expects padded FP16 device bias");
   auto rows = tts_codec_cpu_nct_to_device_rows(input, weight);
-  auto projected = rpu_linear_with_accumulation(rows, weight, c10::nullopt, 1, 8, true, c10::nullopt);
+  auto projected = rpu_linear_with_accumulation(rows, weight, c10::nullopt, 1, codec_cores, true, c10::nullopt);
   auto output = rpu_tts_codec_transpose_overlap(projected, bias, channels, kernel, stride);
   return tts_codec_device_rows_to_cpu_nct(output.narrow(1, 0, channels));
 }
@@ -4685,11 +5037,12 @@ Tensor rpu_linear_w8a16(const Tensor& input, const Tensor& weight,
 
 Tensor rpu_linear_w4a16(const Tensor& input, const Tensor& weight,
                        const Tensor& scale,
-                       const c10::optional<Tensor>& bias) {
+                       const c10::optional<Tensor>& bias, int64_t logical_out_features) {
   RECORD_FUNCTION("rpu::linear_w4a16", {});
-  check_linear_w4a16_operands(input, weight, scale, bias);
+  check_linear_w4a16_operands(input, weight, scale, bias, NUM_CORES, logical_out_features);
   auto shape = input.sizes().vec();
-  const int64_t k = input.size(-1), n = weight.size(0);
+  const int64_t k = input.size(-1);
+  const int64_t n = logical_out_features < 0 ? weight.size(0) : logical_out_features;
   const int64_t rows = input.numel() / k;
   shape.back() = n;
   auto aligned_scale = rpu_retain_linear_quant_scale(weight, scale);
@@ -4727,40 +5080,16 @@ int autotile_n_index(int n_tile) {
   }
 }
 
-KernelId autotile_linear_kernel_id(bool is_fp16, int n_tile) {
-  return static_cast<KernelId>(
-      static_cast<int>(KernelId::PL_AT_W8A16_M288N128) +
-      (is_fp16 ? 7 : 0) + autotile_n_index(n_tile));
+KernelId autotile_linear_kernel_id(bool is_fp16, const rpu_pl_tiling::TilePick& tile) {
+  return parallel_linear_kernel_id(is_fp16 ? rpu_pl_tiling::WeightType::Fp16
+                                           : rpu_pl_tiling::WeightType::Int8,
+                                   false, tile);
 }
 
-KernelId autotile_linear_acc32_kernel_id(bool is_fp16, int n_tile) {
-  return static_cast<KernelId>(
-      static_cast<int>(KernelId::PL_AT_W8A16_ACC32_M192N128) +
-      (is_fp16 ? 7 : 0) + autotile_n_index(n_tile));
-}
-
-KernelId autotile_pgrp_kernel_id(int n_tile) {
-  return static_cast<KernelId>(
-      static_cast<int>(KernelId::PL_AT_INT4_PGRP_M304N128) +
-      autotile_n_index(n_tile));
-}
-
-KernelId autotile_pgrp_acc32_kernel_id(int n_tile) {
-  return static_cast<KernelId>(
-      static_cast<int>(KernelId::PL_AT_INT4_PGRP_ACC32_M208N128) +
-      autotile_n_index(n_tile));
-}
-
-KernelId autotile_uint4_pgrp_kernel_id(int n_tile) {
-  return static_cast<KernelId>(
-      static_cast<int>(KernelId::PL_AT_UINT4_PGRP_M304N128) +
-      autotile_n_index(n_tile));
-}
-
-KernelId autotile_uint4_pgrp_acc32_kernel_id(int n_tile) {
-  return static_cast<KernelId>(
-      static_cast<int>(KernelId::PL_AT_UINT4_PGRP_ACC32_M208N128) +
-      autotile_n_index(n_tile));
+KernelId autotile_linear_acc32_kernel_id(bool is_fp16, const rpu_pl_tiling::TilePick& tile) {
+  return parallel_linear_kernel_id(is_fp16 ? rpu_pl_tiling::WeightType::Fp16
+                                           : rpu_pl_tiling::WeightType::Int8,
+                                   true, tile);
 }
 
 KernelId autotile_nvfp4_acc16_kernel_id(int n_tile) {
@@ -4804,7 +5133,8 @@ void rpu_launch_linear_spm_to_spm_kernel(
     int64_t K,                         // in_features
     int partition,                     // 0=row, 1=col
     int num_cores,                     // number of cores for partition (attn_tp or tp)
-    uint32_t bias_spm_addr)
+    uint32_t bias_spm_addr,
+    uint32_t input_m_byte_step)        // 0 = plain-GEMM pitch of local_k halves
 {
   validate_parallel_linear_geometry(M, N, K, partition, num_cores);
 
@@ -4831,7 +5161,7 @@ void rpu_launch_linear_spm_to_spm_kernel(
   const size_t m_per_wrp = static_cast<size_t>(tile.m_tile);
   validate_parallel_linear_grid(local_m, local_n, m_per_wrp, n_per_wrp);
   const KernelId kernel_id =
-      autotile_linear_acc32_kernel_id(/*is_fp16=*/true, tile.n_tile);
+      autotile_linear_acc32_kernel_id(/*is_fp16=*/true, tile);
 
   // Weight in DDR
   c10::Half *wp = weight.data_ptr<c10::Half>();
@@ -4867,7 +5197,8 @@ void rpu_launch_linear_spm_to_spm_kernel(
           static_cast<uint32_t>(local_k),
           static_cast<uint16_t>(bias_spm_addr != 0),
           static_cast<uint16_t>(num_cores),
-          static_cast<uint32_t>(local_k * dwidth),
+          input_m_byte_step ? input_m_byte_step
+                            : static_cast<uint32_t>(local_k * dwidth),
           static_cast<uint32_t>(local_n * dwidth),
           0, static_cast<uint16_t>(partition), 2});
   register_writer.write(*kernel);
@@ -4939,7 +5270,7 @@ void rpu_launch_lingbot2_router_sigmoid_pad_spm_kernel(
   rpu_pl_tiling::set_parallel_linear_regs(*kernel,
       rpu_pl_tiling::ParallelLinearRegisterArgs{
           input_spm_addr, 0, logits_spm_addr, 0, 51, 32, 768, 0, 1, 1536, 64, 0, 1, 2});
-  rpu_pl_tiling::set_u32_reg_pair(*kernel, 26, scores_spm_addr);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel, 48, scores_spm_addr);
   writer.write(*kernel);
   queue->set_broadcast_mode(true);
   queue->enqueu_kernel(*kernel, {1, 1, 1}, {0});
@@ -4987,15 +5318,12 @@ void rpu_launch_linear_spm_to_spm_acc32_out_bf16_kernel(
       "Wall-OSS mixed Linear local K must be 16-aligned; got K=", K,
       " num_cores=", num_cores);
 
-  const KernelId kernel_id = vision_profile
-      ? KernelId::PL_ACC32_OUT_BF16_M416N48
-      : KernelId::PL_ACC32_OUT_BF16_M496N32;
-  const uint16_t tile_m = vision_profile ? 416 : 496;
-  const uint16_t tile_n = vision_profile ? 48 : 32;
-  const uint16_t grid_x =
-      static_cast<uint16_t>(CeilDiv(local_n, static_cast<int64_t>(tile_n)));
-  const uint16_t grid_y =
-      static_cast<uint16_t>(CeilDiv(local_m, static_cast<int64_t>(tile_m)));
+  const auto selected = rpu_pi_wall::select(
+      rpu_pi_wall::Operation::Bf16Output, rpu_pl_tiling::WeightType::Fp16,
+      true, local_m, local_n, local_k);
+  const KernelId kernel_id = pi_wall_kernel_id(selected.ordinal);
+  const uint16_t grid_x = selected.grid_x;
+  const uint16_t grid_y = selected.grid_y;
 
   auto register_writer =
       RpuKernelGraph::active().stage_kernel_ddr_registers(
@@ -5016,6 +5344,7 @@ void rpu_launch_linear_spm_to_spm_acc32_out_bf16_kernel(
       "Wall-OSS mixed Linear kernel is unavailable for ",
       vision_profile ? "Vision" : "RTC",
       "; install the combined expansion op library");
+  kernel->reset_regs();
   rpu_pl_tiling::set_parallel_linear_regs(
       *kernel,
       rpu_pl_tiling::ParallelLinearRegisterArgs{
@@ -5074,16 +5403,16 @@ void rpu_launch_g05_vision_fc2_weight_outer_linear_w8a16_acc16_kernel(
   auto writer=RpuKernelGraph::active().stage_kernel_ddr_registers(id,
       std::vector<GraphDdrRegisterOperandSpec>{
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::Int8ModelWeight,GraphDdrRegisterAccess::Read,
-              GraphDdrRegisterEncoding::DevAddrShift8LoHi,2,3},weight},
+              GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3},weight},
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::PerChannelScale,GraphDdrRegisterAccess::Read,
-              GraphDdrRegisterEncoding::DevAddrShift8LoHi,20,21},scale}});
+              GraphDdrRegisterEncoding::DevAddrShift8LoHi, 20, 21},scale}});
   rpu_ddr_flush(weight.data_ptr());rpu_ddr_flush(scale.data_ptr());
   auto* kernel=GET_KERNEL(id);TORCH_CHECK(kernel,"G05 K1 B3 FC2 payload disappeared");
   kernel->reset_regs();
   rpu_pl_tiling::set_parallel_linear_regs(*kernel,rpu_pl_tiling::ParallelLinearRegisterArgs{
       input_spm_addr,0,output_spm_addr,bias_spm_addr,768,1024,512,1,8,1024,2048,0,0,1});
   writer.write(*kernel);auto*queue=GET_QUEUE(8);queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel,{13,1,1},{0,1,2,3,4,5,6,7});
+  queue->enqueu_kernel(*kernel,rpu_g05_linear::grid(id),{0,1,2,3,4,5,6,7});
 }
 
 void rpu_launch_wall_vision_row_weight_outer_w8a16_spm_kernel(
@@ -5131,12 +5460,10 @@ void rpu_launch_wall_vision_row_weight_outer_w8a16_spm_kernel(
                   output_spm_addr + output_bytes <= input_spm_addr,
               "Wall Vision row weight-outer input/output SPM must not overlap");
 
-  const KernelId kernel_id = fp16
-      ? (K == 1280 ? KernelId::WALL_VISION_ROW_WEIGHT_OUTER_FP16_M352N80K160
-                   : KernelId::WALL_VISION_ROW_WEIGHT_OUTER_FP16_M256N80K448)
-      : K == 1280
-      ? KernelId::WALL_VISION_ROW_WEIGHT_OUTER_W8A16_M352N80K160
-      : KernelId::WALL_VISION_ROW_WEIGHT_OUTER_W8A16_M256N80K448;
+  const auto selected = rpu_pi_wall::select(rpu_pi_wall::Operation::RowWeightReuse,
+      fp16 ? rpu_pl_tiling::WeightType::Fp16 : rpu_pl_tiling::WeightType::Int8,
+      false, M, N, local_k);
+  const KernelId kernel_id = pi_wall_kernel_id(selected.ordinal);
   auto register_writer = wall_precision_registers(
       kernel_id, fp16, std::vector<GraphDdrRegisterOperandSpec>{
           {GraphDdrRegisterAbi{GraphDdrRegisterRole::Int8ModelWeight,
@@ -5159,11 +5486,11 @@ void rpu_launch_wall_vision_row_weight_outer_w8a16_spm_kernel(
       *kernel, rpu_pl_tiling::ParallelLinearRegisterArgs{
           input_spm_addr, 0, output_spm_addr, bias_spm_addr,
           static_cast<uint32_t>(M), static_cast<uint32_t>(N), local_k,
-          1, NUM_CORES, local_k * 2, static_cast<uint32_t>(N * 2), 0, 0, 1});
+          1, NUM_CORES, local_k * 2, static_cast<uint32_t>(N * 2), 0, 0, static_cast<uint16_t>(fp16 ? 2 : 1)});
   register_writer.write(*kernel);
   auto* queue = GET_QUEUE(NUM_CORES);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel, {16, 1, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
+  queue->enqueu_kernel(*kernel, {selected.grid_x, selected.grid_y, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
 }
 
 // Direct Address SPM-to-SPM Linear Kernel (ACC16 - FP16 accumulation)
@@ -5194,7 +5521,7 @@ void rpu_launch_linear_spm_to_spm_acc16_kernel(
   validate_parallel_linear_geometry(M, N, K, partition, num_cores);
   const bool is_uint4 = negative_zero.defined() && negative_zero.numel() != 0;
   const bool packed_w4 = weight.scalar_type() == at::kByte &&
-      weight.dim() == 2 && weight.size(0) == N && weight.size(1) == K / 2 &&
+      weight.dim() == 2 && weight.size(1) == K / 2 &&
       scale.defined() && scale.scalar_type() == at::kHalf;
   TORCH_CHECK(!is_uint4 || packed_w4,
               "negative_zero is only valid for packed W4 with FP16 scale");
@@ -5233,7 +5560,8 @@ void rpu_launch_linear_spm_to_spm_acc16_kernel(
         "W8A16 row weight reuse input/output SPM ranges must not overlap");
     TORCH_CHECK(
         KernelCache::instance().has_loaded(
-            KernelId::W8A16_ROW_WEIGHT_REUSE_M352N80K256),
+            pi_wall_kernel_id(rpu_pi_wall::select(rpu_pi_wall::Operation::RowWeightReuse,
+                rpu_pl_tiling::WeightType::Int8, false, M, N, K / num_cores).ordinal)),
         "Selected W8A16 row weight reuse payload is not loaded");
   }
   const bool register_census_active =
@@ -5249,9 +5577,9 @@ void rpu_launch_linear_spm_to_spm_acc16_kernel(
   if (register_census_active) {
     TORCH_CHECK(weight.scalar_type() == at::kHalf ||
                     weight.scalar_type() == at::kChar ||
-                    fp8_e4m3_weight || is_uint4,
+                    fp8_e4m3_weight || packed_w4,
                 "typed DDR-register census admits FP16 Linear, signed-int8 "
-                "W8A16, full-byte E4M3 or packed UINT4 weights");
+                "W8A16, full-byte E4M3 or packed I4/U4 weights");
   }
 
   if (force_acc32) {
@@ -5358,30 +5686,29 @@ void rpu_launch_linear_spm_to_spm_acc16_kernel(
 
     // Kernel + grid m/n-tiling come from the accumulator-specific rhino-ops
     // table. Fixed base kernels were retired; the current ref requires auto-tile.
-    const auto tp8 = use_acc32
-        ? rpu_pl_tiling::select_tile_acc32(
-              static_cast<int>(local_m), static_cast<int>(local_n),
-              static_cast<int>(local_k), /*is_fp16=*/false)
-        : rpu_pl_tiling::select_tile_acc16(
-              static_cast<int>(local_m), static_cast<int>(local_n),
-              static_cast<int>(local_k), /*is_fp16=*/false);
+    const auto w8_type = is_fp8_e4m3 ? rpu_pl_tiling::WeightType::Fp8E4M3
+                                       : rpu_pl_tiling::WeightType::Int8;
+    const auto tp8 = rpu_pl_tiling::select_tile(
+        static_cast<int>(local_m), static_cast<int>(local_n),
+        static_cast<int>(local_k), w8_type, use_acc32);
+    const auto reuse = prefer_row_weight_reuse
+        ? rpu_pi_wall::select(rpu_pi_wall::Operation::RowWeightReuse,
+            rpu_pl_tiling::WeightType::Int8, false, local_m, local_n, local_k)
+        : rpu_pi_wall::Selection{};
     const KernelId kernel_id8 = prefer_row_weight_reuse
-        ? KernelId::W8A16_ROW_WEIGHT_REUSE_M352N80K256
+        ? pi_wall_kernel_id(reuse.ordinal)
         : (qkv_planar_direct
             ? KernelId::QWEN3VL_PREFILL_QKV_PLANAR_DIRECT
-            : (use_acc32
-                ? autotile_linear_acc32_kernel_id(/*is_fp16=*/false, tp8.n_tile)
-                : autotile_linear_kernel_id(
-                      /*is_fp16=*/false, tp8.n_tile)));
+            : parallel_linear_kernel_id(w8_type, use_acc32, tp8));
     const uint16_t gx8 = static_cast<uint16_t>(CeilDiv(
-        local_n, prefer_row_weight_reuse ? size_t{80}
-            : (qkv_planar_direct ? size_t{64}
+        local_n, prefer_row_weight_reuse ? static_cast<size_t>(reuse.tile.n_tile)
+            : (qkv_planar_direct ? static_cast<size_t>(rpu_qwen3vl_linear::contract(KernelId::QWEN3VL_PREFILL_QKV_PLANAR_DIRECT).n)
                                 : static_cast<size_t>(tp8.n_tile))));
-    // The reuse payload walks every M352 block internally while retaining W.
+    // The reuse payload walks its selected M blocks internally while retaining W.
     // An ordinary grid.y would repeat that work and overwrite the same output.
     const uint16_t gy8 = prefer_row_weight_reuse ? uint16_t{1}
         : static_cast<uint16_t>(CeilDiv(
-            local_m, qkv_planar_direct ? size_t{448}
+            local_m, qkv_planar_direct ? static_cast<size_t>(rpu_qwen3vl_linear::contract(KernelId::QWEN3VL_PREFILL_QKV_PLANAR_DIRECT).m)
                                        : static_cast<size_t>(tp8.m_tile)));
 
     GraphDdrRegisterAbi scale_abi8{
@@ -5389,10 +5716,6 @@ void rpu_launch_linear_spm_to_spm_acc16_kernel(
         GraphDdrRegisterAccess::Read,
         GraphDdrRegisterEncoding::DevAddrShift8LoHi,
         20, 21};
-    if (qkv_planar_direct) {
-      scale_abi8.reg_lo = 16;
-      scale_abi8.reg_hi = 17;
-    }
     auto register_writer8 =
         RpuKernelGraph::active().stage_kernel_ddr_registers(
             kernel_id8,
@@ -5418,24 +5741,8 @@ void rpu_launch_linear_spm_to_spm_acc16_kernel(
                 "autotile: failed to get ",
                 is_fp8_e4m3 ? "E4M3 " : "W8A16 ",
                 use_acc32 ? "ACC32" : "ACC16", " tile m", tp8.m_tile,
-                "n", tp8.n_tile, "k128");
+                "n", tp8.n_tile, "k", tp8.k_tile);
     kernel8->reset_regs();
-    if (qkv_planar_direct) {
-      // The specialized planar-output expansion kernel retains its
-      // generated 0..19 register ABI; ordinary Linear continues with the
-      // current widened set_parallel_linear_regs() ABI.
-      rpu_pl_tiling::set_u32_reg_pair(*kernel8, 0, x_addr8);
-      rpu_pl_tiling::set_u32_reg_pair(*kernel8, 4, y_addr8);
-      rpu_pl_tiling::set_u32_reg_pair(*kernel8, 6, b_addr8);
-      kernel8->set_regs(8, static_cast<uint16_t>(local_m));
-      kernel8->set_regs(9, static_cast<uint16_t>(local_n));
-      kernel8->set_regs(11, static_cast<uint16_t>(local_k / 16));
-      kernel8->set_regs(12, has_bias8);
-      kernel8->set_regs(13, static_cast<uint16_t>(num_cores));
-      kernel8->set_regs(14, static_cast<uint16_t>(local_k * dwidth));
-      kernel8->set_regs(18, static_cast<uint16_t>(partition));
-      kernel8->set_regs(19, static_cast<uint16_t>(1));
-    } else {
       rpu_pl_tiling::set_parallel_linear_regs(
           *kernel8,
           rpu_pl_tiling::ParallelLinearRegisterArgs{
@@ -5447,7 +5754,6 @@ void rpu_launch_linear_spm_to_spm_acc16_kernel(
               static_cast<uint32_t>(local_n * dwidth),
               0, static_cast<uint16_t>(partition),
               static_cast<uint16_t>(is_fp8_e4m3 ? 5 : 1)});
-    }
     register_writer8.write(*kernel8);
 
     auto* wq8 = GET_QUEUE(num_cores);
@@ -5549,12 +5855,9 @@ void rpu_launch_linear_spm_to_spm_acc16_kernel(
                 scale.scalar_type());
     // The physical scale payload is controller-striped
     // [ceil(localG/4),ceil(localN/64),cores,4,64]; its 2D view carries group_size
-    // in dim 0 for this dispatcher. The 63b68ace ABI extends common regs 0..23
-    // with {24:groupSize,25:localG,26-27:SGBlockByteStep}.
-    //
-    // Registers, weight packing, scale layout and fallback tiles match
-    // ParallelLinearInt4PgrpGenerator at 63b68ace. The conformance matrix
-    // includes 8-core col/row and Wall TP2 col/row projections.
+    // in dim 0 for this dispatcher; GP24..29 describe the scale groups.
+    // I4/U4 share N32K32 storage and the unified main ABI. They retain
+    // separate measured selectors and runtime weight dtype values.
     {
       TORCH_CHECK(scale.dim() == 2,
                   "pgrp int4 requires a controller-striped 2D scale payload; got ",
@@ -5581,18 +5884,20 @@ void rpu_launch_linear_spm_to_spm_acc16_kernel(
                   scale.numel(), " elements, expected ", expected_scale_elements,
                   " for localG=", local_g, " localN=", local_n,
                   " cores=", num_cores);
-      TORCH_CHECK(weight.numel() == N * K / 2, "pgrp int4: packed weight numel ",
-                  weight.numel(), " != N*K/2=", N * K / 2);
+      const size_t physical_n = CeilDiv(local_n, size_t{32}) * 32;
+      const size_t expected_weight_bytes = physical_n * local_k * num_cores / 2;
+      TORCH_CHECK(static_cast<size_t>(weight.numel()) == expected_weight_bytes,
+                  "pgrp W4: expected N32K32 packed bytes ", expected_weight_bytes,
+                  ", got ", weight.numel());
 
-      // UINT4 alone uses the shared main payload and its typed metadata ABI.
-      if (is_uint4) {
+      {
         TORCH_CHECK(weight.device().type() == c10::DeviceType::PrivateUse1 &&
                         weight.is_contiguous() && scale.device() == weight.device(),
                     "pgrp W4 requires contiguous device weight and scale");
         TORCH_CHECK(local_m <= UINT16_MAX && local_k <= UINT16_MAX &&
-                        local_k % 64 == 0 && local_n % 16 == 0,
-                    "pgrp W4 requires uint16 localM/localK, K%64 and N%16");
-        {
+                        local_k % 32 == 0 && local_n % 16 == 0,
+                    "pgrp W4 requires uint16 localM/localK, K%32 and N%16");
+        if (is_uint4) {
           TORCH_CHECK(negative_zero.device() == weight.device() &&
                           negative_zero.scalar_type() == at::kHalf &&
                           negative_zero.is_contiguous() &&
@@ -5602,23 +5907,21 @@ void rpu_launch_linear_spm_to_spm_acc16_kernel(
         const size_t scale_alignment =
             static_cast<size_t>(num_cores) * kScaleStripeBytes;
 
-        const auto tp = use_acc32
-            ? rpu_pl_tiling::select_tile_int4_acc32(
-                  static_cast<int>(local_m), static_cast<int>(local_n),
-                  static_cast<int>(local_k))
-            : rpu_pl_tiling::select_tile_int4(
-                  static_cast<int>(local_m), static_cast<int>(local_n),
-                  static_cast<int>(local_k));
-        const KernelId pgrp_kernel_id = use_acc32
-            ? autotile_uint4_pgrp_acc32_kernel_id(tp.n_tile)
-            : autotile_uint4_pgrp_kernel_id(tp.n_tile);
+        const auto wtype = is_uint4 ? rpu_pl_tiling::WeightType::Uint4
+                                   : rpu_pl_tiling::WeightType::Int4;
+        const auto tp = rpu_pl_tiling::select_tile(
+            static_cast<int>(local_m), static_cast<int>(physical_n),
+            static_cast<int>(local_k), wtype, use_acc32,
+            rpu_pl_tiling::Family::Parallel, static_cast<int>(k_bs));
+        const KernelId pgrp_kernel_id = parallel_linear_kernel_id(wtype, use_acc32, tp);
         std::vector<GraphDdrRegisterOperandSpec> operands{
-            {{GraphDdrRegisterRole::PackedUint4ModelWeight,
+            {{is_uint4 ? GraphDdrRegisterRole::PackedUint4ModelWeight
+                        : GraphDdrRegisterRole::PackedInt4ModelWeight,
               GraphDdrRegisterAccess::Read,
               GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3}, weight},
             {{GraphDdrRegisterRole::PerGroupScale, GraphDdrRegisterAccess::Read,
               GraphDdrRegisterEncoding::DevAddrShift8LoHi, 20, 21}, scale}};
-        {
+        if (is_uint4) {
           operands.push_back({
               {GraphDdrRegisterRole::NegativeZeroPoint, GraphDdrRegisterAccess::Read,
                GraphDdrRegisterEncoding::DevAddrShift8LoHi, 22, 23}, negative_zero});
@@ -5645,7 +5948,14 @@ void rpu_launch_linear_spm_to_spm_acc16_kernel(
         Kernel_t *kpg = GET_KERNEL(pgrp_kernel_id);
         TORCH_CHECK(kpg != nullptr, "pgrp int4: failed to get ",
                     use_acc32 ? "ACC32" : "ACC16", " tile m", tp.m_tile,
-                    "n", tp.n_tile, "k128");
+                    "n", tp.n_tile, "k", tp.k_tile);
+        // IN-KERNEL bias (rhino-ops 3187afe1 / rhinoOpLib c33d2bc8 fixed the pgrp
+        // bias-broadcast loop: `loop 0,N_V16,1,1` — the old wr10/stride-16 form was
+        // the col+bias cos ~0.72 bug). reg6/7 = bias SPM addr lo/hi as a RAW per-core
+        // SPM byte address (same space as in/out regs 0/1,4/5 — NOT >>8-shifted).
+        // Scale uses regs 20/21 and bias uses reg14. Only col-partition +bias is
+        // exercised by Wall-OSS int4 qkv/gate/up; o/down are bias-free.
+        // Row+bias stays out-of-envelope (needs core-0-only bias staging, unvalidated).
         kpg->reset_regs();
         rpu_pl_tiling::set_parallel_linear_w4_group_regs(
             *kpg,
@@ -5662,7 +5972,7 @@ void rpu_launch_linear_spm_to_spm_acc16_kernel(
                     static_cast<uint16_t>(partition), 1},
                 static_cast<uint16_t>(k_bs),
                 static_cast<uint16_t>(local_g),
-                sgblock_byte_step, 0, true});
+                sgblock_byte_step, 0, is_uint4});
         uint16_t gxg = (uint16_t)CeilDiv(local_n, (size_t)tp.n_tile);
         uint16_t gyg = (uint16_t)CeilDiv(local_m, (size_t)tp.m_tile);
         kpg->set_regs(64, gxg);
@@ -5678,88 +5988,37 @@ void rpu_launch_linear_spm_to_spm_acc16_kernel(
         return;
       }
 
-      uint8_t *wpg = weight.data_ptr<uint8_t>();
-      c10::Half *spg = scale.data_ptr<c10::Half>();
-      rpu_ddr_flush(wpg);
-      rpu_ddr_flush(spg);
-      uint64_t w_addr_g = RpuGetDevAddr(wpg);
-      uint64_t s_addr_g = RpuGetDevAddr(spg);
-      TORCH_CHECK(w_addr_g % 256 == 0, "pgrp int4: weight DDR not 256-byte aligned");
-      const size_t scale_alignment =
-          static_cast<size_t>(num_cores) * kScaleStripeBytes;
-      TORCH_CHECK(s_addr_g % scale_alignment == 0,
-                  "pgrp int4: scale DDR address must be aligned to cores*512=",
-                  scale_alignment, " bytes, got 0x", std::hex, s_addr_g,
-                  std::dec);
 
-      const auto tp = use_acc32
-          ? rpu_pl_tiling::select_tile_int4_acc32(
-                static_cast<int>(local_m), static_cast<int>(local_n),
-                static_cast<int>(local_k))
-          : rpu_pl_tiling::select_tile_int4(
-                static_cast<int>(local_m), static_cast<int>(local_n),
-                static_cast<int>(local_k));
-      // GET_KERNEL(id) routes through the graph-aware get_kernel_reset(id) so the pgrp
-      // variant is GRAPH-RECORDABLE (sets pending_kernel_id_); the by-name get_kernel()
-      // keep the graph-aware lookup for replay recording.
-      // Same fix as the acc16 variants.
-      const KernelId pgrp_kernel_id = use_acc32
-          ? autotile_pgrp_acc32_kernel_id(tp.n_tile)
-          : autotile_pgrp_kernel_id(tp.n_tile);
-      Kernel_t *kpg = GET_KERNEL(pgrp_kernel_id);
-      TORCH_CHECK(kpg != nullptr, "pgrp int4: failed to get ",
-                  use_acc32 ? "ACC32" : "ACC16", " tile m", tp.m_tile,
-                  "n", tp.n_tile, "k128");
-
-      const size_t sgblock_byte_step_size =
-          scale_n_blocks * static_cast<size_t>(num_cores) * kScaleStripeBytes;
-      TORCH_CHECK(sgblock_byte_step_size <= UINT32_MAX,
-                  "pgrp int4: SGBlockByteStep exceeds uint32: ",
-                  sgblock_byte_step_size);
-      const uint32_t sgblock_byte_step =
-          static_cast<uint32_t>(sgblock_byte_step_size);
-      // Bias uses per-core SPM byte addresses in regs 6/7,
-       // in the same address space as input/output regs 0/1 and 4/5.
-       // Scale uses regs 20/21 and bias uses reg14. Only col-partition +bias is
-      // used by the int4 qkv/gate/up path; o/down are bias-free.
-      // Row+bias stays out-of-envelope (needs core-0-only bias staging, unvalidated).
-      kpg->reset_regs();
-      rpu_pl_tiling::set_parallel_linear_int4_group_regs(
-          *kpg,
-          rpu_pl_tiling::ParallelLinearInt4GroupRegisterArgs{
-              rpu_pl_tiling::ParallelLinearRegisterArgs{
-                  input_spm_addr, w_addr_g, output_spm_addr, bias_spm_addr,
-                  static_cast<uint32_t>(local_m),
-                  static_cast<uint32_t>(local_n),
-                  static_cast<uint32_t>(local_k),
-                  static_cast<uint16_t>(bias_spm_addr != 0),
-                  static_cast<uint16_t>(num_cores),
-                  static_cast<uint32_t>(local_k * dwidth),
-                  static_cast<uint32_t>(local_n * dwidth), s_addr_g,
-                  static_cast<uint16_t>(partition), 1},
-              static_cast<uint16_t>(k_bs),
-              static_cast<uint16_t>(local_g),
-              sgblock_byte_step});
-      uint16_t gxg = (uint16_t)CeilDiv(local_n, (size_t)tp.n_tile);
-      uint16_t gyg = (uint16_t)CeilDiv(local_m, (size_t)tp.m_tile);
-      kpg->set_regs(64, gxg);
-      kpg->set_regs(65, gyg);
-      kpg->set_regs(66, (uint16_t)1);
-
-      auto *wqg = GET_QUEUE(num_cores);
-      wqg->set_broadcast_mode(true);
-      std::vector<uint8_t> core_list_g;
-      for (int i = 0; i < num_cores; ++i) core_list_g.push_back(i);
-      wqg->enqueu_kernel(*kpg, {gxg, gyg, (uint16_t)1}, core_list_g);
-      return;
     }
   }
 
   // Weight in DDR
   c10::Half *wp = weight.data_ptr<c10::Half>();
-  const auto tp = rpu_pl_tiling::select_tile_acc16(
-      static_cast<int>(local_m), static_cast<int>(local_n),
-      static_cast<int>(local_k), /*is_fp16=*/true);
+  const auto tp = [&] {
+    // Measured FP16 ACC16 geometry refinements. Use actual rows and TP;
+    // allocation capacity and other model/component shapes keep auto ranking.
+    int measured_n_tile = 0;
+    if (M == 201 && num_cores == 4 && weight.scalar_type() == at::kHalf &&
+        !use_acc32 && bias_spm_addr != 0 && !prefer_gemv &&
+        !qkv_planar_direct && !prefer_row_weight_reuse) {
+      if (N == 768 && K == 768) {
+        measured_n_tile = partition == 1 ? 112 : 48;
+      } else if ((N == 3072 && K == 768 && partition == 1) ||
+                 (N == 768 && K == 3072 && partition == 0)) {
+        measured_n_tile = 80;
+      }
+    }
+    if (measured_n_tile != 0) {
+      return rpu_pl_tiling::select_tile(
+          static_cast<int>(local_m), static_cast<int>(local_n),
+          static_cast<int>(local_k), rpu_pl_tiling::WeightType::Fp16,
+          false, rpu_pl_tiling::Family::Parallel, 0, 2,
+          measured_n_tile, 128);
+    }
+    return rpu_pl_tiling::select_tile_acc16(
+        static_cast<int>(local_m), static_cast<int>(local_n),
+        static_cast<int>(local_k), /*is_fp16=*/true);
+  }();
   const size_t at_n = static_cast<size_t>(tp.n_tile);
   const size_t at_m = static_cast<size_t>(tp.m_tile);
   validate_parallel_linear_grid(local_m, local_n, at_m, at_n);
@@ -5770,7 +6029,7 @@ void rpu_launch_linear_spm_to_spm_acc16_kernel(
   };
 
   const KernelId kernel_id =
-      autotile_linear_kernel_id(/*is_fp16=*/true, tp.n_tile);
+      autotile_linear_kernel_id(/*is_fp16=*/true, tp);
 
   auto register_writer =
       RpuKernelGraph::active().stage_kernel_ddr_registers(
@@ -5787,7 +6046,7 @@ void rpu_launch_linear_spm_to_spm_acc16_kernel(
 
   Kernel_t* kernel = GET_KERNEL(kernel_id);
   TORCH_CHECK(kernel != nullptr, "autotile: failed to get FP16 ACC16 tile m",
-              at_m, "n", at_n, "k128");
+              at_m, "n", at_n, "k", tp.k_tile);
   kernel->reset_regs();
   rpu_pl_tiling::set_parallel_linear_regs(
       *kernel,
@@ -5905,7 +6164,7 @@ void rpu_launch_lingbot2_vision_fc1_gelu_spm_kernel(
   writer.write(*kernel);
   queue->set_broadcast_mode(true);
   queue->enqueu_kernel(*kernel,
-      {static_cast<uint16_t>(fp16 ? 6 : 7), 2, 1},
+      rpu_specialized_linear::grid(id),
       {0, 1, 2, 3, 4, 5, 6, 7});
 }
 
@@ -5993,8 +6252,8 @@ void rpu_launch_lingbot2_qkv_multibase_t51_spm_kernel(
                            : KernelId::LINGBOT2_QKV_MULTIBASE_W8_T51;
   TORCH_CHECK(KernelCache::instance().has_loaded(id),
               "Lingbot2 QKV optional precision payload is absent");
-  constexpr std::array<uint16_t, 3> weight_regs{{2, 24, 32}};
-  constexpr std::array<uint16_t, 3> scale_regs{{20, 26, 34}};
+  constexpr std::array<uint16_t, 3> weight_regs{{2, 32, 40}};
+  constexpr std::array<uint16_t, 3> scale_regs{{20, 34, 42}};
   std::vector<GraphDdrRegisterOperandSpec> operands;
   for (size_t i = 0; i < weights.size(); ++i) {
     operands.push_back({{fp16 ? GraphDdrRegisterRole::ModelWeight
@@ -6024,14 +6283,14 @@ void rpu_launch_lingbot2_qkv_multibase_t51_spm_kernel(
           input_spm_addr, 0, q_output_spm_addr, q_bias_spm_addr,
           51, 512, 768, 1, 8, 1536, 1024, 0, 1,
           static_cast<uint16_t>(fp16 ? 2 : 1)});
-  rpu_pl_tiling::set_u32_reg_pair(*kernel, 28, k_bias_spm_addr);
-  rpu_pl_tiling::set_u32_reg_pair(*kernel, 30, k_output_spm_addr);
-  rpu_pl_tiling::set_u32_reg_pair(*kernel, 36, v_bias_spm_addr);
-  rpu_pl_tiling::set_u32_reg_pair(*kernel, 38, v_output_spm_addr);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel, 38, k_bias_spm_addr);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel, 36, k_output_spm_addr);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel, 46, v_bias_spm_addr);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel, 44, v_output_spm_addr);
   writer.write(*kernel);
   queue->set_broadcast_mode(true);
   queue->enqueu_kernel(*kernel,
-      {static_cast<uint16_t>(fp16 ? 10 : 17), 1, 1}, {0,1,2,3,4,5,6,7});
+      rpu_specialized_linear::grid(id), {0,1,2,3,4,5,6,7});
 }
 
 // Exact no-bias M224/H2560/Q4096/KV1024/TP8 language prefill.
@@ -6114,8 +6373,8 @@ void rpu_launch_lingbot2_prefill_qkv_m224_spm_kernel(
                            : KernelId::LINGBOT2_PREFILL_QKV_MULTIBASE_W8_M224;
   TORCH_CHECK(KernelCache::instance().has_loaded(id),
               "Lingbot2 prefill QKV optional precision payload is absent");
-  constexpr std::array<uint16_t, 3> weight_regs{{2, 24, 32}};
-  constexpr std::array<uint16_t, 3> scale_regs{{20, 26, 34}};
+  constexpr std::array<uint16_t, 3> weight_regs{{2, 32, 40}};
+  constexpr std::array<uint16_t, 3> scale_regs{{20, 34, 42}};
   std::vector<GraphDdrRegisterOperandSpec> operands;
   for (size_t i = 0; i < weights.size(); ++i) {
     operands.push_back({{fp16 ? GraphDdrRegisterRole::ModelWeight
@@ -6145,12 +6404,12 @@ void rpu_launch_lingbot2_prefill_qkv_m224_spm_kernel(
           input_spm_addr, 0, q_output_spm_addr, 0,
           224, 512, 2560, 0, 8, 5120, 1024, 0, 1,
           static_cast<uint16_t>(fp16 ? 2 : 1)});
-  rpu_pl_tiling::set_u32_reg_pair(*kernel, 30, k_output_spm_addr);
-  rpu_pl_tiling::set_u32_reg_pair(*kernel, 38, v_output_spm_addr);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel, 36, k_output_spm_addr);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel, 44, v_output_spm_addr);
   writer.write(*kernel);
   queue->set_broadcast_mode(true);
   queue->enqueu_kernel(*kernel,
-      {static_cast<uint16_t>(fp16 ? 10 : 11), 1, 1}, {0,1,2,3,4,5,6,7});
+      rpu_specialized_linear::grid(id), {0,1,2,3,4,5,6,7});
 }
 
 // Exact biased Vision M768/H1024/QKV1024/TP8 ACC16 dispatch.
@@ -6238,8 +6497,8 @@ void rpu_launch_lingbot2_vision_qkv_joint_spm_kernel(
                            : KernelId::LINGBOT2_VISION_QKV_JOINT_W8_M768;
   TORCH_CHECK(KernelCache::instance().has_loaded(id),
               "Lingbot2 Vision QKV optional precision payload is absent");
-  constexpr std::array<uint16_t, 3> weight_regs{{2, 24, 32}};
-  constexpr std::array<uint16_t, 3> scale_regs{{20, 26, 34}};
+  constexpr std::array<uint16_t, 3> weight_regs{{2, 32, 40}};
+  constexpr std::array<uint16_t, 3> scale_regs{{20, 34, 42}};
   std::vector<GraphDdrRegisterOperandSpec> operands;
   for (size_t i = 0; i < weights.size(); ++i) {
     operands.push_back({{fp16 ? GraphDdrRegisterRole::ModelWeight
@@ -6269,15 +6528,14 @@ void rpu_launch_lingbot2_vision_qkv_joint_spm_kernel(
           input_spm_addr, 0, q_output_spm_addr, q_bias_spm_addr,
           768, 128, 1024, 1, 8, 2048, 256, 0, 1,
           static_cast<uint16_t>(fp16 ? 2 : 1)});
-  rpu_pl_tiling::set_u32_reg_pair(*kernel, 28, k_bias_spm_addr);
-  rpu_pl_tiling::set_u32_reg_pair(*kernel, 30, k_output_spm_addr);
-  rpu_pl_tiling::set_u32_reg_pair(*kernel, 36, v_bias_spm_addr);
-  rpu_pl_tiling::set_u32_reg_pair(*kernel, 38, v_output_spm_addr);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel, 38, k_bias_spm_addr);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel, 36, k_output_spm_addr);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel, 46, v_bias_spm_addr);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel, 44, v_output_spm_addr);
   writer.write(*kernel);
   queue->set_broadcast_mode(true);
   queue->enqueu_kernel(*kernel,
-      {static_cast<uint16_t>(fp16 ? 6 : 3),
-       static_cast<uint16_t>(fp16 ? 2 : 3), 1}, {0,1,2,3,4,5,6,7});
+      rpu_specialized_linear::grid(id), {0,1,2,3,4,5,6,7});
 }
 
 static void check_wall_action_spm_weight_range(
@@ -6373,19 +6631,8 @@ void rpu_launch_wall_action_gate_up_w8a16_multibase_spm_kernel(
               "Wall Action gate+up multibase requires non-zero distinct "
               "gate/up SPM outputs");
 
-  const bool w16_reuse = use_spm_weight && sorting.action_activation_reuse;
-  const KernelId legacy_kernel_id = use_spm_weight
-      ? KernelId::WALL_ACTION_GATE_UP_W8A16_MULTIBASE_M592N32_SPM_WEIGHT
-      : KernelId::WALL_ACTION_GATE_UP_W8A16_MULTIBASE_M592N32;
-  TORCH_CHECK(!fp16 || !w16_reuse || use_spm_weight, "FP16 activation reuse requires resident weights");
-  const KernelId kernel_id = fp16
-      ? (use_spm_weight
-          ? (w16_reuse ? KernelId::WALL_ACTION_GATE_UP_FP16_A16RESIDENT_SPM_WEIGHT_M20N32K1024
-                       : KernelId::WALL_ACTION_GATE_UP_FP16_SPM_WEIGHT_M592N32K128)
-          : KernelId::WALL_ACTION_GATE_UP_FP16_M592N32K128)
-      : w16_reuse
-          ? KernelId::WALL_ACTION_GATE_UP_W8A16_A16RESIDENT_SPM_WEIGHT_M20N32K1024
-          : legacy_kernel_id;
+  const auto selected = rpu_pi_wall::select((use_spm_weight ? rpu_pi_wall::Operation::SharedRawSpmWeight : rpu_pi_wall::Operation::SharedRaw), (fp16 ? rpu_pl_tiling::WeightType::Fp16 : rpu_pl_tiling::WeightType::Int8), false, rows, kNPerCore, kK);
+  const auto kernel_id = pi_wall_kernel_id(selected.ordinal);
   std::vector<GraphDdrRegisterOperandSpec> operands;
   if (!use_spm_weight) {
     operands.push_back(GraphDdrRegisterOperandSpec{
@@ -6406,14 +6653,14 @@ void rpu_launch_wall_action_gate_up_w8a16_multibase_spm_kernel(
         GraphDdrRegisterAbi{
             GraphDdrRegisterRole::Int8ModelWeight,
             GraphDdrRegisterAccess::Read,
-            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 24, 25},
+            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33},
         up_weight});
   }
   operands.push_back(GraphDdrRegisterOperandSpec{
       GraphDdrRegisterAbi{
           GraphDdrRegisterRole::PerChannelScale,
           GraphDdrRegisterAccess::Read,
-          GraphDdrRegisterEncoding::DevAddrShift8LoHi, 26, 27},
+          GraphDdrRegisterEncoding::DevAddrShift8LoHi, 34, 35},
       up_scale});
   auto register_writer =
       wall_precision_registers(
@@ -6437,13 +6684,7 @@ void rpu_launch_wall_action_gate_up_w8a16_multibase_spm_kernel(
   }
 
   Kernel_t* kernel = GET_KERNEL(kernel_id);
-  TORCH_CHECK(
-      kernel != nullptr,
-      w16_reuse ? KERNEL_ID_NAMES[static_cast<size_t>(kernel_id)] : use_spm_weight
-          ? "gate_up_parallel_w8a16_multibase_spm_weight_m592n32k128 missing "
-            "from expansion ref"
-          : "gate_up_parallel_w8a16_multibase_m592n32k128 missing from "
-            "expansion ref");
+  TORCH_CHECK(kernel != nullptr, "Current shared-input Action kernel is absent");
   kernel->reset_regs();
   rpu_pl_tiling::set_parallel_linear_regs(
       *kernel,
@@ -6452,23 +6693,19 @@ void rpu_launch_wall_action_gate_up_w8a16_multibase_spm_kernel(
           static_cast<uint32_t>(kM), static_cast<uint32_t>(kNPerCore),
           static_cast<uint32_t>(kK), 0, NUM_CORES,
           static_cast<uint32_t>(kK * sizeof(c10::Half)),
-          static_cast<uint32_t>(kNPerCore * sizeof(c10::Half)), 0, 1, 1});
+          static_cast<uint32_t>(kNPerCore * sizeof(c10::Half)), 0, 1, static_cast<uint16_t>(fp16 ? 2 : 1)});
   if (use_spm_weight) {
     rpu_pl_tiling::set_u32_reg_pair(*kernel, 2, gate_weight_spm_addr);
-    rpu_pl_tiling::set_u32_reg_pair(*kernel, 24, up_weight_spm_addr);
+    rpu_pl_tiling::set_u32_reg_pair(*kernel, 32, up_weight_spm_addr);
   }
-  kernel->set_regs(30, static_cast<uint16_t>(up_output_spm_addr));
-  kernel->set_regs(31, static_cast<uint16_t>(up_output_spm_addr >> 16));
+  kernel->set_regs(36, static_cast<uint16_t>(up_output_spm_addr));
+  kernel->set_regs(37, static_cast<uint16_t>(up_output_spm_addr >> 16));
   register_writer.write(*kernel);
 
   auto* queue = GET_QUEUE(NUM_CORES);
   queue->set_broadcast_mode(true);
   const std::vector<uint8_t> cores{0, 1, 2, 3, 4, 5, 6, 7};
-  if (w16_reuse) {
-    queue->enqueu_kernel(*kernel, {8, 1, 1}, cores);
-  } else {
-    queue->enqueu_kernel(*kernel, {16, 1, 1}, cores);
-  }
+  queue->enqueu_kernel(*kernel, {selected.grid_x, selected.grid_y, 1}, cores);
 }
 
 void rpu_launch_wall_action_linear_ring_postnorm_spm_kernel(
@@ -6585,13 +6822,12 @@ void rpu_launch_wall_action_linear_ring_postnorm_spm_kernel(
       "Wall Action linear-ring-postnorm requires distinct input/partial/"
       "normalized/gamma ranges and an in-place compact residual carry");
 
-  const KernelId legacy_kernel_id = use_spm_weight
-      ? KernelId::WALL_ACTION_LINEAR_RING_POSTNORM_W8A16_M20N1024K256_SPM_WEIGHT
-      : KernelId::WALL_ACTION_LINEAR_RING_POSTNORM_W8A16_M20N1024K256;
-  const KernelId kernel_id = fp16
-      ? (use_spm_weight ? KernelId::WALL_ACTION_FP16_LINEAR_RING_POSTNORM_SPM_WEIGHT_M20N1024K256
-                        : KernelId::WALL_ACTION_FP16_LINEAR_RING_POSTNORM_M20N1024K256)
-      : legacy_kernel_id;
+  const auto selected = rpu_pi_wall::select(
+      use_spm_weight ? rpu_pi_wall::Operation::ActionRingPostnormSpmWeight
+                     : rpu_pi_wall::Operation::ActionRingPostnorm,
+      fp16 ? rpu_pl_tiling::WeightType::Fp16 : rpu_pl_tiling::WeightType::Int8,
+      false, rows, kN, kLocalK);
+  const KernelId kernel_id = pi_wall_kernel_id(selected.ordinal);
   std::vector<GraphDdrRegisterOperandSpec> operands;
   if (!use_spm_weight) {
     operands.push_back(GraphDdrRegisterOperandSpec{
@@ -6634,27 +6870,28 @@ void rpu_launch_wall_action_linear_ring_postnorm_spm_kernel(
           static_cast<uint32_t>(kM), static_cast<uint32_t>(kN),
           static_cast<uint32_t>(kLocalK), 0, NUM_CORES,
           static_cast<uint32_t>(kLocalK * sizeof(c10::Half)),
-          static_cast<uint32_t>(kN * sizeof(c10::Half)), 0, 0, 1});
+          static_cast<uint32_t>(kN * sizeof(c10::Half)), 0, 0, static_cast<uint16_t>(fp16 ? 2 : 1)});
   if (use_spm_weight) {
     rpu_pl_tiling::set_u32_reg_pair(*kernel, 2, weight_spm_addr);
   }
 
   const uint32_t partial_off = partial_spm_addr - spm_base0;
   const uint32_t normalized_off = normalized_spm_addr - spm_base0;
-  kernel->set_regs(24, static_cast<uint16_t>(1));
-  rpu_pl_tiling::set_u32_reg_pair(*kernel, 25, kRoundElemMax);
-  kernel->set_regs(29, static_cast<uint16_t>(residual_local_shard ? 2 : 0));
-  rpu_pl_tiling::set_u32_reg_pair(
-      *kernel, 30, raw_residual_local_spm_addr - spm_base0);
-  rpu_pl_tiling::set_u32_reg_pair(*kernel, 32, gamma_spm_addr - spm_base0);
-  kernel->set_regs(
-      34, static_cast<c10::Half>(1.0f / static_cast<float>(kN)).x);
-  kernel->set_regs(35, static_cast<c10::Half>(eps).x);
-  rpu_pl_tiling::set_u32_reg_pair(
-      *kernel, 36, residual_spm_addr - spm_base0);
-  kernel->set_regs(64, static_cast<uint16_t>(8));
-  kernel->set_regs(65, static_cast<uint16_t>(1));
-  kernel->set_regs(66, static_cast<uint16_t>(1));
+  kernel->set_regs(32, static_cast<uint16_t>(NUM_CORES));
+  kernel->set_regs(33, uint16_t{1});
+  rpu_pl_tiling::set_u32_reg_pair(*kernel, 34, kRoundElemMax);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel, 36, residual_spm_addr - spm_base0);
+  kernel->set_regs(38, static_cast<uint16_t>(residual_local_shard ? 2 : 0));
+  rpu_pl_tiling::set_u32_reg_pair(*kernel, 40, raw_residual_local_spm_addr - spm_base0);
+  rpu_pl_tiling::set_u32_reg_pair(*kernel, 42, gamma_spm_addr - spm_base0);
+  kernel->set_regs(44, static_cast<c10::Half>(1.0f / static_cast<float>(kN)).x);
+  kernel->set_regs(45, static_cast<c10::Half>(eps).x);
+  kernel->set_regs(64, selected.grid_x);
+  kernel->set_regs(65, selected.grid_y);
+  kernel->set_regs(66, uint16_t{1});
+  for (uint32_t index = 128; index <= 255; ++index)
+    TORCH_CHECK(kernel->set_regs(index, uint16_t{0}) == kKernelRegOk,
+                "Wall Action ring rejected atomic halfword ", index);
 
   constexpr uint32_t kScm = 4096;
   for (uint32_t core = 0; core < NUM_CORES; ++core) {
@@ -6696,7 +6933,7 @@ void rpu_launch_wall_action_linear_ring_postnorm_spm_kernel(
   auto* queue = GET_QUEUE(NUM_CORES);
   queue->set_broadcast_mode(true);
   const std::vector<uint8_t> cores{0, 1, 2, 3, 4, 5, 6, 7};
-  queue->enqueu_kernel(*kernel, {8, 1, 1}, cores);
+  queue->enqueu_kernel(*kernel, {selected.grid_x, selected.grid_y, 1}, cores);
 }
 
 void rpu_launch_qwen3vl_4b_prefill_gate_up_swiglu_w8a16_spm_kernel(
@@ -6753,8 +6990,9 @@ void rpu_launch_qwen3vl_4b_prefill_gate_up_swiglu_w8a16_spm_kernel(
               "Qwen3-VL 4B Prefill fused gate+up requires disjoint, "
               "256-byte-aligned in-range absolute SPM operands");
 
-  const KernelId kernel_id =
-      KernelId::WALL_PREFILL_GATE_UP_SWIGLU_W8A16_M320N112;
+  const auto selected = rpu_pi_wall::select(rpu_pi_wall::Operation::SharedSilu,
+      rpu_pl_tiling::WeightType::Int8, false, rows, kNPerCore, kK);
+  const KernelId kernel_id = pi_wall_kernel_id(selected.ordinal);
   auto register_writer =
       RpuKernelGraph::active().stage_kernel_ddr_registers(
           kernel_id,
@@ -6772,12 +7010,12 @@ void rpu_launch_qwen3vl_4b_prefill_gate_up_swiglu_w8a16_spm_kernel(
               {GraphDdrRegisterAbi{
                    GraphDdrRegisterRole::Int8ModelWeight,
                    GraphDdrRegisterAccess::Read,
-                   GraphDdrRegisterEncoding::DevAddrShift8LoHi, 24, 25},
+                   GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33},
                up_weight},
               {GraphDdrRegisterAbi{
                    GraphDdrRegisterRole::PerChannelScale,
                    GraphDdrRegisterAccess::Read,
-                   GraphDdrRegisterEncoding::DevAddrShift8LoHi, 26, 27},
+                   GraphDdrRegisterEncoding::DevAddrShift8LoHi, 34, 35},
                up_scale}});
   for (const at::Tensor* tensor :
        {&gate_weight, &up_weight, &gate_scale, &up_scale}) {
@@ -6789,7 +7027,7 @@ void rpu_launch_qwen3vl_4b_prefill_gate_up_swiglu_w8a16_spm_kernel(
   }
   Kernel_t* kernel = GET_KERNEL(kernel_id);
   TORCH_CHECK(kernel != nullptr,
-              "fused_gate_up_swiglu_w8a16_m320n112k128 missing from expansion ref");
+              "Current Qwen3-VL prefill SwiGLU kernel missing from expansion ref");
   kernel->reset_regs();
   rpu_pl_tiling::set_parallel_linear_regs(
       *kernel, rpu_pl_tiling::ParallelLinearRegisterArgs{
@@ -6798,13 +7036,11 @@ void rpu_launch_qwen3vl_4b_prefill_gate_up_swiglu_w8a16_spm_kernel(
           static_cast<uint32_t>(kK), 0, NUM_CORES,
           static_cast<uint32_t>(kK * sizeof(c10::Half)),
           static_cast<uint32_t>(kNPerCore * sizeof(c10::Half)), 0, 1, 1});
-  // This existing direct-store payload ignores the legacy scratch p28..31.
-  // The COMPLETE owner keeps input/gate lifetimes; no out-of-band SPM is used.
   register_writer.write(*kernel);
   auto* queue = GET_QUEUE(NUM_CORES);
   queue->set_broadcast_mode(true);
   const std::vector<uint8_t> cores{0, 1, 2, 3, 4, 5, 6, 7};
-  queue->enqueu_kernel(*kernel, {11, 1, 1}, cores);
+  queue->enqueu_kernel(*kernel, {selected.grid_x, selected.grid_y, 1}, cores);
 }
 
 // The FP16 payload uses runtime M/N/K and retires each N tile independently.
@@ -6845,12 +7081,13 @@ static void launch_hyvla_gateup_swiglu_fp16(
   TORCH_CHECK(uint64_t(input_spm) + regions[0].second <= output_spm ||
                   uint64_t(output_spm) + regions[1].second <= input_spm,
               "HyVLA fused SwiGLU requires disjoint input/output SPM");
-  constexpr KernelId id = KernelId::WALL_PREFILL_GATE_UP_SWIGLU_FP16_M320N112K128;
+  constexpr KernelId id = Rows == 51 ? KernelId::HYVLA_EXPERT_GATEUP_SWIGLU_FP16_V2
+                                        : KernelId::HYVLA_VLM_GATEUP_SWIGLU_FP16_V2;
   auto register_writer = RpuKernelGraph::active().stage_kernel_ddr_registers(id, {
       {GraphDdrRegisterAbi{GraphDdrRegisterRole::ModelWeight,
           GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3}, gate_weight},
       {GraphDdrRegisterAbi{GraphDdrRegisterRole::ModelWeight,
-          GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 24, 25}, up_weight}});
+          GraphDdrRegisterAccess::Read, GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33}, up_weight}});
   rpu_ddr_flush(gate_weight.data_ptr());
   rpu_ddr_flush(up_weight.data_ptr());
   auto* kernel = GET_KERNEL(id);
@@ -6859,11 +7096,11 @@ static void launch_hyvla_gateup_swiglu_fp16(
   rpu_pl_tiling::set_parallel_linear_regs(*kernel,
       rpu_pl_tiling::ParallelLinearRegisterArgs{
           input_spm, 0, output_spm, 0, Rows, LocalN, Hidden, 0, NUM_CORES,
-          Hidden * sizeof(c10::Half), LocalN * sizeof(c10::Half), 0, 1, 1});
+          Hidden * sizeof(c10::Half), LocalN * sizeof(c10::Half), 0, 1, 2});
   register_writer.write(*kernel);
   auto* queue = GET_QUEUE(NUM_CORES);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel, {uint16_t((LocalN + 111) / 112), 1, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
+  queue->enqueu_kernel(*kernel, rpu_specialized_linear::grid(id), {0, 1, 2, 3, 4, 5, 6, 7});
 }
 
 void rpu_launch_hyvla_vlm_gateup_swiglu_fp16_spm_kernel(
@@ -6929,9 +7166,8 @@ static void launch_wall_base_prefill_gate_up_shared(
                       addresses[j] + tensors[j]->nbytes() <= addresses[i],
                   "Wall shared-input Prefill DDR operands must not overlap");
   }
-  const auto id = omit_up ? KernelId::WALL_BASE_PREFILL_GATE_UP_SHARED_SILU_NOUP_M384N48K128
-      : fuse_silu ? KernelId::WALL_BASE_PREFILL_GATE_UP_SHARED_SILU_M384N48K128
-                  : KernelId::WALL_BASE_PREFILL_GATE_UP_SHARED_A_M384N48K128;
+  const auto selected = rpu_pi_wall::select((omit_up ? rpu_pi_wall::Operation::SharedSilu : fuse_silu ? rpu_pi_wall::Operation::SharedSiluUp : rpu_pi_wall::Operation::SharedRaw), rpu_pl_tiling::WeightType::Int8, false, rows, kLocalN, kK);
+  const auto id = pi_wall_kernel_id(selected.ordinal);
   TORCH_CHECK(KernelCache::instance().has_loaded(id), "Wall shared-input Prefill payload unavailable");
   auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(id,
       std::vector<GraphDdrRegisterOperandSpec>{
@@ -6940,9 +7176,9 @@ static void launch_wall_base_prefill_gate_up_shared(
           {{GraphDdrRegisterRole::PerChannelScale, GraphDdrRegisterAccess::Read,
             GraphDdrRegisterEncoding::DevAddrShift8LoHi, 20, 21}, gate_scale},
           {{GraphDdrRegisterRole::Int8ModelWeight, GraphDdrRegisterAccess::Read,
-            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 24, 25}, up_weight},
+            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33}, up_weight},
           {{GraphDdrRegisterRole::PerChannelScale, GraphDdrRegisterAccess::Read,
-            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 26, 27}, up_scale}});
+            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 34, 35}, up_scale}});
   for (const auto* t : tensors) rpu_ddr_flush(t->data_ptr());
   auto* kernel = GET_KERNEL(id);
   TORCH_CHECK(kernel, "Wall shared-input Prefill kernel missing");
@@ -6950,13 +7186,13 @@ static void launch_wall_base_prefill_gate_up_shared(
   rpu_pl_tiling::set_parallel_linear_regs(*kernel, {
       input, 0, gate, 0, static_cast<uint32_t>(rows), kLocalN, kK, 0, kCores,
       kK * 2, kLocalN * 2, 0, 1, 1});
-  TORCH_CHECK(kernel->set_regs(28, static_cast<uint16_t>(up)) == 0 &&
-                  kernel->set_regs(29, static_cast<uint16_t>(up >> 16)) == 0,
+  TORCH_CHECK(kernel->set_regs(36, static_cast<uint16_t>(up)) == 0 &&
+                  kernel->set_regs(37, static_cast<uint16_t>(up >> 16)) == 0,
               "Wall shared-input Prefill Up address write failed");
   writer.write(*kernel);
   auto* queue = GET_QUEUE(kCores);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel, {29, 1, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
+  queue->enqueu_kernel(*kernel, {selected.grid_x, selected.grid_y, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
 }
 
 void rpu_launch_wall_base_prefill_gate_up_shared_input_spm_kernel(
@@ -7028,25 +7264,26 @@ void rpu_launch_wall_base_prefill_gate_up_shared_fp16_spm_kernel(
                       addresses[j] + tensors[j]->nbytes() <= addresses[i],
                   "Wall FP16 Prefill DDR weights must not overlap");
   }
-  const auto id = KernelId::WALL_BASE_PREFILL_GATE_UP_SHARED_SILU_FP16_M320N80K128;
+  const auto selected = rpu_pi_wall::select(rpu_pi_wall::Operation::SharedSilu, rpu_pl_tiling::WeightType::Fp16, false, rows, kLocalN, kK);
+  const auto id = pi_wall_kernel_id(selected.ordinal);
   TORCH_CHECK(KernelCache::instance().has_loaded(id), "Wall FP16 shared-input payload unavailable");
   auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(id,
       std::vector<GraphDdrRegisterOperandSpec>{
           {{GraphDdrRegisterRole::ModelWeight, GraphDdrRegisterAccess::Read,
             GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3}, gate_weight},
           {{GraphDdrRegisterRole::ModelWeight, GraphDdrRegisterAccess::Read,
-            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 24, 25}, up_weight}});
+            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33}, up_weight}});
   for (const auto* t : tensors) rpu_ddr_flush(t->data_ptr());
   auto* kernel = GET_KERNEL(id);
   TORCH_CHECK(kernel, "Wall FP16 shared-input kernel missing");
   kernel->reset_regs();
   rpu_pl_tiling::set_parallel_linear_regs(*kernel, {
       input, 0, gate, 0, static_cast<uint32_t>(rows), kLocalN, kK, 0, kCores,
-      kK * 2, kLocalN * 2, 0, 1, 1});
+      kK * 2, kLocalN * 2, 0, 1, 2});
   writer.write(*kernel);
   auto* queue = GET_QUEUE(kCores);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel, {18, 1, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
+  queue->enqueu_kernel(*kernel, {selected.grid_x, selected.grid_y, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
 }
 
 void rpu_launch_lingbot2_prefill_gate_up_shared_a_w8_m224_spm_kernel(
@@ -7116,9 +7353,9 @@ void rpu_launch_lingbot2_prefill_gate_up_shared_a_w8_m224_spm_kernel(
           {{GraphDdrRegisterRole::PerChannelScale, GraphDdrRegisterAccess::Read,
             GraphDdrRegisterEncoding::DevAddrShift8LoHi, 20, 21}, gate_scale},
           {{GraphDdrRegisterRole::Int8ModelWeight, GraphDdrRegisterAccess::Read,
-            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 24, 25}, up_weight},
+            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33}, up_weight},
           {{GraphDdrRegisterRole::PerChannelScale, GraphDdrRegisterAccess::Read,
-            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 26, 27}, up_scale}});
+            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 34, 35}, up_scale}});
   auto* kernel = GET_KERNEL(id);
   TORCH_CHECK(kernel != nullptr, "Lingbot2 shared-A Prefill optional kernel is absent");
   for (const auto* tensor : owners) {
@@ -7132,7 +7369,7 @@ void rpu_launch_lingbot2_prefill_gate_up_shared_a_w8_m224_spm_kernel(
           0, 8, kK * sizeof(c10::Half), kNPerCore * sizeof(c10::Half), 0, 1, 1});
   writer.write(*kernel);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel, {13, 1, 1}, {0,1,2,3,4,5,6,7});
+  queue->enqueu_kernel(*kernel, rpu_specialized_linear::grid(id), {0,1,2,3,4,5,6,7});
 }
 
 void rpu_launch_lingbot2_shared_gateup_resident_silu_w8_spm_kernel(
@@ -7207,11 +7444,11 @@ void rpu_launch_lingbot2_shared_gateup_resident_silu_w8_spm_kernel(
   kernel->reset_regs();
   rpu_pl_tiling::set_parallel_linear_regs(*kernel,
       rpu_pl_tiling::ParallelLinearRegisterArgs{
-          input_spm_addr, 0, output_spm_addr, 0, kM, kNPerCore, kK,
+          input_spm_addr, 0, output_spm_addr, 0, kM, kI, kK,
           0, 8, kK * sizeof(c10::Half), kI * sizeof(c10::Half), 0, 1, 1});
   writer.write(*kernel);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel, {3, 1, 1}, {0,1,2,3,4,5,6,7});
+  queue->enqueu_kernel(*kernel, rpu_specialized_linear::grid(id), {0,1,2,3,4,5,6,7});
 }
 
 void rpu_launch_lingbot2_shared_gateup_resident_silu_fp16_spm_kernel(
@@ -7275,11 +7512,11 @@ void rpu_launch_lingbot2_shared_gateup_resident_silu_fp16_spm_kernel(
   kernel->reset_regs();
   rpu_pl_tiling::set_parallel_linear_regs(*kernel,
       rpu_pl_tiling::ParallelLinearRegisterArgs{
-          input_spm_addr, 0, output_spm_addr, 0, kM, kNPerCore, kK,
+          input_spm_addr, 0, output_spm_addr, 0, kM, kI, kK,
           0, 8, kK * sizeof(c10::Half), kI * sizeof(c10::Half), 0, 1, 2});
   writer.write(*kernel);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel, {2, 1, 1}, {0,1,2,3,4,5,6,7});
+  queue->enqueu_kernel(*kernel, rpu_specialized_linear::grid(id), {0,1,2,3,4,5,6,7});
 }
 
 void rpu_launch_wall_prefill_gate_up_swiglu_w8a16_spm_kernel(
@@ -7335,22 +7572,20 @@ void rpu_launch_wall_prefill_gate_up_swiglu_w8a16_spm_kernel(
               "Wall Prefill fused gate+up+SwiGLU requires distinct non-zero "
               "input/gate/scratch SPM buffers");
 
-  const bool p640_weight_outer = rows == 640;
-  // Exact no-bias M640/N11008/K2048 path: same grid15, scratch and K128 retirement.
-  const bool mlp_retile = p640_weight_outer &&
-      (fp16 || sorting.prefill_mlp_retile);
-  const KernelId legacy_kernel_id = mlp_retile
-      ? KernelId::WALL_PREFILL_GATE_UP_SWIGLU_W8A16_M160X4N96K128
-      : p640_weight_outer
-          ? KernelId::WALL_PREFILL_GATE_UP_SWIGLU_W8A16_M128X5N96K128
-          : KernelId::WALL_PREFILL_GATE_UP_SWIGLU_W8A16_M320N112;
-  const KernelId kernel_id = fp16
-      ? (p640_weight_outer
-          ? (sorting.fp16_mlp_m224
-                 ? KernelId::WALL_PREFILL_GATE_UP_SWIGLU_FP16_M224X3N96K128
-                 : KernelId::WALL_PREFILL_GATE_UP_SWIGLU_FP16_M160X4N96K128)
-          : KernelId::WALL_PREFILL_GATE_UP_SWIGLU_FP16_M320N112K128)
-      : legacy_kernel_id;
+  const rpu_pl_tiling::ParallelLinearRegisterArgs linear_args{
+      input_spm_addr, 0, gate_output_spm_addr, 0,
+      static_cast<uint32_t>(rows), static_cast<uint32_t>(kNPerCore),
+      static_cast<uint32_t>(kK), 0, NUM_CORES,
+      static_cast<uint32_t>(kK * sizeof(c10::Half)),
+      static_cast<uint32_t>(kNPerCore * sizeof(c10::Half)), 0, 1,
+      static_cast<uint16_t>(fp16 ? 2 : 1)};
+  const rpu_wall_fp16_retained::SharedSiluArgs retained_args{linear_args};
+  const bool retained_fp16 = fp16 && rows == 640;
+  const auto selected = retained_fp16 ? rpu_wall_fp16_retained::select(retained_args) :
+      rpu_pi_wall::select(rpu_pi_wall::Operation::SharedSilu,
+          fp16 ? rpu_pl_tiling::WeightType::Fp16 : rpu_pl_tiling::WeightType::Int8,
+          false, rows, kNPerCore, kK);
+  const auto kernel_id = pi_wall_kernel_id(selected.ordinal);
   auto register_writer =
       wall_precision_registers(
           kernel_id, fp16,
@@ -7371,13 +7606,13 @@ void rpu_launch_wall_prefill_gate_up_swiglu_w8a16_spm_kernel(
                   GraphDdrRegisterAbi{
                       GraphDdrRegisterRole::Int8ModelWeight,
                       GraphDdrRegisterAccess::Read,
-                      GraphDdrRegisterEncoding::DevAddrShift8LoHi, 24, 25},
+                      GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33},
                   up_weight},
               GraphDdrRegisterOperandSpec{
                   GraphDdrRegisterAbi{
                       GraphDdrRegisterRole::PerChannelScale,
                       GraphDdrRegisterAccess::Read,
-                      GraphDdrRegisterEncoding::DevAddrShift8LoHi, 26, 27},
+                      GraphDdrRegisterEncoding::DevAddrShift8LoHi, 34, 35},
                   up_scale}});
 
   for (const at::Tensor* tensor :
@@ -7390,34 +7625,16 @@ void rpu_launch_wall_prefill_gate_up_swiglu_w8a16_spm_kernel(
   }
 
   Kernel_t* kernel = GET_KERNEL(kernel_id);
-  TORCH_CHECK(
-      kernel != nullptr,
-      mlp_retile ? KERNEL_ID_NAMES[static_cast<size_t>(kernel_id)] : p640_weight_outer
-          ? "fused_gate_up_swiglu_w8a16_m128x5n96k128 missing from expansion ref"
-          : "fused_gate_up_swiglu_w8a16_m320n112k128 missing from expansion ref");
+  TORCH_CHECK(kernel != nullptr, "Current shared-input Prefill kernel is absent");
   kernel->reset_regs();
-  rpu_pl_tiling::set_parallel_linear_regs(
-      *kernel,
-      rpu_pl_tiling::ParallelLinearRegisterArgs{
-          input_spm_addr, 0, gate_output_spm_addr, 0,
-          static_cast<uint32_t>(rows), static_cast<uint32_t>(kNPerCore),
-          static_cast<uint32_t>(kK), 0, NUM_CORES,
-          static_cast<uint32_t>(kK * sizeof(c10::Half)),
-          static_cast<uint32_t>(kNPerCore * sizeof(c10::Half)), 0, 1, 1});
-  kernel->set_regs(28, static_cast<uint16_t>(scratch_spm_addr));
-  kernel->set_regs(29, static_cast<uint16_t>(scratch_spm_addr >> 16));
-  kernel->set_regs(30, static_cast<uint16_t>(224));
-  kernel->set_regs(31, static_cast<uint16_t>(0));
+  if (retained_fp16) rpu_wall_fp16_retained::write(*kernel, retained_args);
+  else rpu_pl_tiling::set_parallel_linear_regs(*kernel, linear_args);
   register_writer.write(*kernel);
 
   auto* queue = GET_QUEUE(NUM_CORES);
   queue->set_broadcast_mode(true);
   const std::vector<uint8_t> cores{0, 1, 2, 3, 4, 5, 6, 7};
-  if (p640_weight_outer) {
-    queue->enqueu_kernel(*kernel, {15, 1, 1}, cores);
-  } else {
-    queue->enqueu_kernel(*kernel, {13, 1, 1}, cores);
-  }
+  queue->enqueu_kernel(*kernel, {selected.grid_x, selected.grid_y, 1}, cores);
 }
 
 void rpu_launch_pi05_gate_up_geglu_w8a16_spm_kernel(
@@ -7452,7 +7669,8 @@ void rpu_launch_pi05_gate_up_geglu_w8a16_spm_kernel(
                   (uint64_t(input_spm_addr) + kBufferBytes <= output_spm_addr ||
                    uint64_t(output_spm_addr) + kBufferBytes <= input_spm_addr),
               "Pi GeGLU requires disjoint aligned input/output SPM slabs");
-  constexpr auto id = KernelId::PI05_GATE_UP_GEGLU_W8A16_M400N80;
+  const auto selected = rpu_pi_wall::select(rpu_pi_wall::Operation::SharedGelu, rpu_pl_tiling::WeightType::Int8, false, kM, kN / NUM_CORES, kK);
+  const auto id = pi_wall_kernel_id(selected.ordinal);
   auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(
       id, std::vector<GraphDdrRegisterOperandSpec>{
           {{GraphDdrRegisterRole::Int8ModelWeight, GraphDdrRegisterAccess::Read,
@@ -7460,9 +7678,9 @@ void rpu_launch_pi05_gate_up_geglu_w8a16_spm_kernel(
           {{GraphDdrRegisterRole::PerChannelScale, GraphDdrRegisterAccess::Read,
             GraphDdrRegisterEncoding::DevAddrShift8LoHi, 20, 21}, gate_scale},
           {{GraphDdrRegisterRole::Int8ModelWeight, GraphDdrRegisterAccess::Read,
-            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 24, 25}, up_weight},
+            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33}, up_weight},
           {{GraphDdrRegisterRole::PerChannelScale, GraphDdrRegisterAccess::Read,
-            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 26, 27}, up_scale}});
+            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 34, 35}, up_scale}});
   for (const auto* tensor : {&gate_weight, &up_weight, &gate_scale, &up_scale}) {
     rpu_ddr_flush(tensor->data_ptr());
     TORCH_CHECK(RpuGetDevAddr(tensor->data_ptr()) % 256 == 0,
@@ -7480,15 +7698,18 @@ void rpu_launch_pi05_gate_up_geglu_w8a16_spm_kernel(
   writer.write(*kernel);
   auto* queue = GET_QUEUE(NUM_CORES);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel, {26, 1, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
+  queue->enqueu_kernel(*kernel, {selected.grid_x, selected.grid_y, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
 }
 
-void rpu_launch_pi05_denoise_gate_up_geglu_wint4a16_pgrp_m50_kernel(
+void rpu_launch_pi05_denoise_gate_up_geglu_w4a16_pgrp_m50_kernel(
     uint32_t input_spm_addr, const at::Tensor& gate_weight,
     const at::Tensor& up_weight, uint32_t output_spm_addr,
-    const at::Tensor& gate_scale, const at::Tensor& up_scale) {
-  constexpr int64_t kM = 50, kN = 4096, kK = 1024;
+    const at::Tensor& gate_scale, const at::Tensor& up_scale, int64_t rows) {
+  constexpr int64_t kN = 4096, kK = 1024;
   static_assert(NUM_CORES == 8, "Pi W4 GeGLU is the exact TP8 profile");
+  TORCH_CHECK(pi05_action_rows_admitted(rows),
+              "Pi W4 GeGLU admits action horizon 50 or 10");
+  const int64_t kM = rows;
   for (const auto* weight : {&gate_weight, &up_weight}) {
     TORCH_CHECK(weight->defined() &&
                     weight->device().type() == c10::DeviceType::PrivateUse1 &&
@@ -7517,8 +7738,8 @@ void rpu_launch_pi05_denoise_gate_up_geglu_wint4a16_pgrp_m50_kernel(
                   gate_scale.numel() == expected_scale_elements &&
                   gate_scale.nbytes() == expected_scale_elements * sizeof(c10::Half),
               "Pi W4 GeGLU pgrp scale layout/GS differs from the fixed TP8 ABI");
-  constexpr uint64_t kInputBytes = kM * kK * sizeof(c10::Half);
-  constexpr uint64_t kOutputBytes = kM * kLocalN * sizeof(c10::Half);
+  const uint64_t kInputBytes = kM * kK * sizeof(c10::Half);
+  const uint64_t kOutputBytes = kM * kLocalN * sizeof(c10::Half);
   TORCH_CHECK(SPM_ALLOC.is_initialized(), "Pi W4 GeGLU requires initialized SPM");
   const uint64_t spm_base = SPM_ALLOC.addr(0, 0);
   TORCH_CHECK(input_spm_addr >= spm_base && output_spm_addr >= spm_base &&
@@ -7536,7 +7757,7 @@ void rpu_launch_pi05_denoise_gate_up_geglu_wint4a16_pgrp_m50_kernel(
                     (address >> 8) <= UINT32_MAX,
                 "Pi W4 GeGLU requires shift8 DDR, weight alignment256 and scale alignment4096");
   }
-  constexpr auto id = KernelId::PI05_DENOISE_GATE_UP_GEGLU_WINT4A16_PGRP_M512N48K128;
+  const auto id = rpu_geglu_linear::select(rpu_pl_tiling::WeightType::Int4, false, gs);
   auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(
       id, std::vector<GraphDdrRegisterOperandSpec>{
           {{GraphDdrRegisterRole::PackedInt4ModelWeight, GraphDdrRegisterAccess::Read,
@@ -7560,21 +7781,21 @@ void rpu_launch_pi05_denoise_gate_up_geglu_wint4a16_pgrp_m50_kernel(
           static_cast<uint16_t>(gs), static_cast<uint16_t>(local_g),
           static_cast<uint32_t>(kScaleNBlocks * NUM_CORES * 512)});
   writer.write(*kernel);
-  kernel->set_regs(64, static_cast<uint16_t>(11));
-  kernel->set_regs(65, static_cast<uint16_t>(1));
-  kernel->set_regs(66, static_cast<uint16_t>(1));
   auto* queue = GET_QUEUE(NUM_CORES);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel, {11, 1, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
+  queue->enqueu_kernel(*kernel, rpu_geglu_linear::grid(id), {0, 1, 2, 3, 4, 5, 6, 7});
 }
 
 
-void rpu_launch_pi05_denoise_gate_up_geglu_wint4a16_pgrp_m50n64_kernel(
+void rpu_launch_pi05_denoise_gate_up_geglu_w4a16_pgrp_m50n64_kernel(
     uint32_t input_spm_addr, const at::Tensor& gate_weight,
     const at::Tensor& up_weight, uint32_t output_spm_addr,
-    const at::Tensor& gate_scale, const at::Tensor& up_scale) {
-  constexpr int64_t kM = 50, kN = 4096, kK = 1024;
+    const at::Tensor& gate_scale, const at::Tensor& up_scale, int64_t rows) {
+  constexpr int64_t kN = 4096, kK = 1024;
   static_assert(NUM_CORES == 8, "Pi W4 GeGLU is the exact TP8 profile");
+  TORCH_CHECK(pi05_action_rows_admitted(rows),
+              "Pi W4 GeGLU admits action horizon 50 or 10");
+  const int64_t kM = rows;
   for (const auto* weight : {&gate_weight, &up_weight}) {
     TORCH_CHECK(weight->defined() &&
                     weight->device().type() == c10::DeviceType::PrivateUse1 &&
@@ -7603,8 +7824,8 @@ void rpu_launch_pi05_denoise_gate_up_geglu_wint4a16_pgrp_m50n64_kernel(
                   gate_scale.numel() == expected_scale_elements &&
                   gate_scale.nbytes() == expected_scale_elements * sizeof(c10::Half),
               "Pi W4 GeGLU pgrp scale layout/GS differs from the fixed TP8 ABI");
-  constexpr uint64_t kInputBytes = kM * kK * sizeof(c10::Half);
-  constexpr uint64_t kOutputBytes = kM * kLocalN * sizeof(c10::Half);
+  const uint64_t kInputBytes = kM * kK * sizeof(c10::Half);
+  const uint64_t kOutputBytes = kM * kLocalN * sizeof(c10::Half);
   TORCH_CHECK(SPM_ALLOC.is_initialized(), "Pi W4 GeGLU requires initialized SPM");
   const uint64_t spm_base = SPM_ALLOC.addr(0, 0);
   TORCH_CHECK(input_spm_addr >= spm_base && output_spm_addr >= spm_base &&
@@ -7622,7 +7843,7 @@ void rpu_launch_pi05_denoise_gate_up_geglu_wint4a16_pgrp_m50n64_kernel(
                     (address >> 8) <= UINT32_MAX,
                 "Pi W4 GeGLU requires shift8 DDR, weight alignment256 and scale alignment4096");
   }
-  constexpr auto id = KernelId::PI05_DENOISE_GATE_UP_GEGLU_WINT4A16_PGRP_M464N64K128;
+  const auto id = rpu_geglu_linear::select(rpu_pl_tiling::WeightType::Int4, false, gs);
   auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(
       id, std::vector<GraphDdrRegisterOperandSpec>{
           {{GraphDdrRegisterRole::PackedInt4ModelWeight, GraphDdrRegisterAccess::Read,
@@ -7646,12 +7867,9 @@ void rpu_launch_pi05_denoise_gate_up_geglu_wint4a16_pgrp_m50n64_kernel(
           static_cast<uint16_t>(gs), static_cast<uint16_t>(local_g),
           static_cast<uint32_t>(kScaleNBlocks * NUM_CORES * 512)});
   writer.write(*kernel);
-  kernel->set_regs(64, static_cast<uint16_t>(8));
-  kernel->set_regs(65, static_cast<uint16_t>(1));
-  kernel->set_regs(66, static_cast<uint16_t>(1));
   auto* queue = GET_QUEUE(NUM_CORES);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel, {8, 1, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
+  queue->enqueu_kernel(*kernel, rpu_geglu_linear::grid(id), {0, 1, 2, 3, 4, 5, 6, 7});
 }
 
 
@@ -7661,11 +7879,17 @@ void rpu_launch_pi05_denoise_gate_up_geglu_w8a16_m50_kernel(
     const at::Tensor& up_weight,
     uint32_t output_spm_addr,
     const at::Tensor& gate_scale,
-    const at::Tensor& up_scale) {
-  constexpr int64_t kM = 50, kN = 4096, kK = 1024;
+    const at::Tensor& up_scale,
+    int64_t rows) {
+  constexpr int64_t kN = 4096, kK = 1024;
   TORCH_CHECK(RpuKernelGraph::has_active(),
               "Pi M50 GeGLU requires an active retained graph");
   const bool fp16 = gate_weight.defined() && gate_weight.scalar_type() == at::kHalf;
+  // Both the FP16 M608 and the W8A16 M512 payloads read M from the parallel
+  // linear row register, so each action horizon is a launch argument.
+  TORCH_CHECK(pi05_action_rows_admitted(rows),
+              "Pi GeGLU admits action horizon 50 or 10");
+  const int64_t kM = rows;
   const size_t weight_bytes = kN * kK * (fp16 ? sizeof(c10::Half) : 1);
   for (const auto* weight : {&gate_weight, &up_weight}) {
     TORCH_CHECK(weight->defined() &&
@@ -7690,8 +7914,8 @@ void rpu_launch_pi05_denoise_gate_up_geglu_w8a16_m50_kernel(
                     scale->size(0) == kN && scale->nbytes() == kN * sizeof(c10::Half),
                 "Pi M50 GeGLU requires contiguous device FP16 [4096] scales");
   }
-  constexpr uint64_t kInputBytes = kM * kK * sizeof(c10::Half);
-  constexpr uint64_t kOutputBytes = kM * (kN / NUM_CORES) * sizeof(c10::Half);
+  const uint64_t kInputBytes = kM * kK * sizeof(c10::Half);
+  const uint64_t kOutputBytes = kM * (kN / NUM_CORES) * sizeof(c10::Half);
   TORCH_CHECK(SPM_ALLOC.is_initialized(), "Pi M50 GeGLU requires initialized SPM");
   const uint64_t spm_base = SPM_ALLOC.addr(0, 0);
   TORCH_CHECK(input_spm_addr >= spm_base && output_spm_addr >= spm_base &&
@@ -7701,20 +7925,19 @@ void rpu_launch_pi05_denoise_gate_up_geglu_w8a16_m50_kernel(
                   (uint64_t(input_spm_addr) + kInputBytes <= output_spm_addr ||
                    uint64_t(output_spm_addr) + kOutputBytes <= input_spm_addr),
               "Pi M50 GeGLU requires disjoint aligned input/output SPM slabs");
-  const auto id = fp16 ? KernelId::PI05_DENOISE_GATE_UP_GEGLU_FP16_M608N32K128
-                      : KernelId::PI05_DENOISE_GATE_UP_GEGLU_W8A16_M512N48K128;
+  const auto id = rpu_geglu_linear::select(fp16 ? rpu_pl_tiling::WeightType::Fp16 : rpu_pl_tiling::WeightType::Int8, false);
   const auto weight_role = fp16 ? GraphDdrRegisterRole::ModelWeight
                                 : GraphDdrRegisterRole::Int8ModelWeight;
   std::vector<GraphDdrRegisterOperandSpec> operands{
           {{weight_role, GraphDdrRegisterAccess::Read,
             GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3}, gate_weight},
           {{weight_role, GraphDdrRegisterAccess::Read,
-            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 24, 25}, up_weight}};
+            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33}, up_weight}};
   if (!fp16) {
     operands.push_back({{GraphDdrRegisterRole::PerChannelScale, GraphDdrRegisterAccess::Read,
             GraphDdrRegisterEncoding::DevAddrShift8LoHi, 20, 21}, gate_scale});
     operands.push_back({{GraphDdrRegisterRole::PerChannelScale, GraphDdrRegisterAccess::Read,
-            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 26, 27}, up_scale});
+            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 34, 35}, up_scale});
   }
   auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(
       id, operands);
@@ -7739,14 +7962,14 @@ void rpu_launch_pi05_denoise_gate_up_geglu_w8a16_m50_kernel(
   rpu_pl_tiling::set_parallel_linear_regs(
       *kernel, rpu_pl_tiling::ParallelLinearRegisterArgs{
           input_spm_addr, 0, output_spm_addr, 0,
-          kM, kN / NUM_CORES, kK, 0, NUM_CORES,
+          static_cast<uint32_t>(kM), kN / NUM_CORES, kK, 0, NUM_CORES,
           kK * sizeof(c10::Half), kN / NUM_CORES * sizeof(c10::Half),
-          0, /*partition=*/1, /*dtype_mode=*/static_cast<uint16_t>(fp16 ? 0 : 1)});
+          0, /*partition=*/1, /*dtype_mode=*/static_cast<uint16_t>(fp16 ? 2 : 1)});
   writer.write(*kernel);
   auto* queue = GET_QUEUE(NUM_CORES);
   TORCH_CHECK(queue, "Pi M50 GeGLU 8-core queue is absent");
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel, {fp16 ? 16u : 11u, 1, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
+  queue->enqueu_kernel(*kernel, rpu_geglu_linear::grid(id), {0, 1, 2, 3, 4, 5, 6, 7});
 }
 
 void rpu_launch_pi05_prefill_gate_up_geglu_weight_outer_w8a16_c400x2_kernel(
@@ -7758,8 +7981,8 @@ void rpu_launch_pi05_prefill_gate_up_geglu_weight_outer_w8a16_c400x2_kernel(
     uint32_t output1_spm_addr,
     const at::Tensor& gate_scale,
     const at::Tensor& up_scale, int64_t rows) {
-  TORCH_CHECK(rows == 272 || rows == 288 || rows == 304 || rows == 320 || rows == 336 || rows == 400 || rows == 416 || rows == 432 || rows == 448 || rows == 464,
-              "Pi Prefill GateUp pair requires C272/C288/C304/C320/C336/C400/C416/C432/C448/C464");
+  TORCH_CHECK(rows == 272 || rows == 288 || rows == 304 || rows == 320 || rows == 336 || rows == 400 || rows == 416 || rows == 432 || rows == 448 || rows == 464 || rows == 480,
+              "Pi Prefill GateUp pair requires C272/C288/C304/C320/C336/C400/C416/C432/C448/C464/C480");
   const bool fp16 = gate_weight.defined() && gate_weight.scalar_type() == at::kHalf;
   const uint32_t kRows = rows;
   constexpr uint32_t kLocalN = 2048;
@@ -7811,44 +8034,17 @@ void rpu_launch_pi05_prefill_gate_up_geglu_weight_outer_w8a16_c400x2_kernel(
         "Gate/Up scales [16384]");
   }
 
-  const KernelId kernel_id = rows == 432
-      ? (fp16 ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_FP16_C432X2_M112N80K128
-              : KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_W8A16_C432X2_M112N80K128) :
-        rows == 464
-      ? (fp16 ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_FP16_C464X2_M80N80K128
-              : KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_W8A16_C464X2_M80N80K128) :
-        rows == 336
-      ? (fp16 ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_FP16_C336X2_M160N80K128
-              : KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_W8A16_C336X2_M160N80K128) :
-        rows == 448
-      ? (fp16 ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_FP16_C448X2_M96N80K128
-              : KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_W8A16_C448X2_M96N80K128) :
-        rows == 416
-      ? (fp16 ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_FP16_C416X2_M128N80K128
-              : KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_W8A16_C416X2_M128N80K128)
-      : rows == 288
-      ? (fp16 ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_FP16_C288X2_M160N80K128
-              : KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_W8A16_C288X2_M160N80K128)
-      : rows == 304
-      ? (fp16 ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_FP16_C304X2_M160N80K128
-              : KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_W8A16_C304X2_M160N80K128) :
-        rows == 320
-      ? (fp16 ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_FP16_C320X2_M160N80K128
-              : KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_W8A16_C320X2_M160N80K128)
-      : fp16 ?
-      (rows == 400 ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_FP16_C400X2_M160N80K128 :
-                     KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_FP16_C272X2_M160N80K128) :
-      (rows == 400 ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_W8A16_C400X2_M160N80K128 :
-                     KernelId::PI05_PREFILL_GATE_UP_GEGLU_WEIGHT_OUTER_W8A16_C272X2_M160N80K128);
+  const auto selected = rpu_pi_wall::select(rpu_pi_wall::Operation::PairedGelu, (fp16 ? rpu_pl_tiling::WeightType::Fp16 : rpu_pl_tiling::WeightType::Int8), false, rows, kLocalN, kK);
+  const auto kernel_id = pi_wall_kernel_id(selected.ordinal);
   const auto role = fp16 ? GraphDdrRegisterRole::ModelWeight : GraphDdrRegisterRole::Int8ModelWeight;
   std::vector<GraphDdrRegisterOperandSpec> operands{
-      {{role,GraphDdrRegisterAccess::Read,GraphDdrRegisterEncoding::DevAddrShift8LoHi,2,3},gate_weight},
-      {{role,GraphDdrRegisterAccess::Read,GraphDdrRegisterEncoding::DevAddrShift8LoHi,24,25},up_weight}};
+      {{role,GraphDdrRegisterAccess::Read,GraphDdrRegisterEncoding::DevAddrShift8LoHi,2, 3},gate_weight},
+      {{role,GraphDdrRegisterAccess::Read,GraphDdrRegisterEncoding::DevAddrShift8LoHi,32, 33},up_weight}};
   if (!fp16) {
     operands.push_back({{GraphDdrRegisterRole::PerChannelScale,GraphDdrRegisterAccess::Read,
-                        GraphDdrRegisterEncoding::DevAddrShift8LoHi,20,21},gate_scale});
+                        GraphDdrRegisterEncoding::DevAddrShift8LoHi,20, 21},gate_scale});
     operands.push_back({{GraphDdrRegisterRole::PerChannelScale,GraphDdrRegisterAccess::Read,
-                        GraphDdrRegisterEncoding::DevAddrShift8LoHi,26,27},up_scale});
+                        GraphDdrRegisterEncoding::DevAddrShift8LoHi,34, 35},up_scale});
   }
   auto register_writer = RpuKernelGraph::active().stage_kernel_ddr_registers(kernel_id,operands);
   for (const auto* tensor : {
@@ -7869,10 +8065,10 @@ void rpu_launch_pi05_prefill_gate_up_geglu_weight_outer_w8a16_c400x2_kernel(
   rpu_pl_tiling::set_parallel_linear_regs(
       *kernel, rpu_pl_tiling::ParallelLinearRegisterArgs{
                    input0_spm_addr, 0, output0_spm_addr, 0,
-                   kRows, kLocalN, kK, 0, kCores,
+                   2 * kRows, kLocalN, kK, 0, kCores,
                    kK * sizeof(c10::Half),
                    kLocalN * sizeof(c10::Half),
-                   0, /*partition=*/1, /*dtype_mode=*/uint16_t(fp16 ? 0 : 1)});
+                   0, /*partition=*/1, /*dtype_mode=*/uint16_t(fp16 ? 2 : 1)});
   const auto set_spm_pair = [kernel](uint32_t reg, uint32_t address) {
     TORCH_CHECK(
         kernel->set_regs(reg, static_cast<uint16_t>(address)) == kKernelRegOk &&
@@ -7881,14 +8077,15 @@ void rpu_launch_pi05_prefill_gate_up_geglu_weight_outer_w8a16_c400x2_kernel(
                 kKernelRegOk,
         "Pi Prefill GateUp pair rejected an extra SPM register pair");
   };
-  set_spm_pair(28, input1_spm_addr);
-  set_spm_pair(30, output1_spm_addr);
+  set_spm_pair(48, input1_spm_addr);
+  set_spm_pair(50, output1_spm_addr);
+  kernel->set_regs(52, static_cast<uint16_t>(kRows));
   register_writer.write(*kernel);
 
   auto* queue = GET_QUEUE(kCores);
   queue->set_broadcast_mode(true);
   queue->enqueu_kernel(
-      *kernel, {26, 1, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
+      *kernel, {selected.grid_x, selected.grid_y, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
 }
 
 void rpu_launch_pi05_prefill_gate_up_geglu_online_w8a8_c272_kernel(
@@ -7923,18 +8120,20 @@ void rpu_launch_pi05_prefill_gate_up_geglu_online_w8a8_c272_kernel(
     TORCH_CHECK(scale->defined() && scale->device().type() == at::kPrivateUse1 &&
         scale->scalar_type() == at::kFloat && scale->is_contiguous() &&
         scale->storage_offset() == 0 && scale->sizes() == at::IntArrayRef({16384}),
-        "Pi C272 A8 requires cold promoted device FP32 scales [16384]");
-  constexpr auto id = KernelId::PI05_PREFILL_GATE_UP_GEGLU_ONLINE_W8A8_P544_C272;
+        "Pi C272 A8 requires cold promoted RPU FP32 scales [16384]");
+  const auto selected = rpu_pi_wall::select(rpu_pi_wall::Operation::A8OnlineGelu,
+      rpu_pl_tiling::WeightType::Int8, true, 272, 2048, 2048);
+  const auto id = pi_wall_kernel_id(selected.ordinal);
   auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(id,
       std::vector<GraphDdrRegisterOperandSpec>{
         {{GraphDdrRegisterRole::Int8ModelWeight, GraphDdrRegisterAccess::Read,
           GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3}, gate_weight},
         {{GraphDdrRegisterRole::Int8ModelWeight, GraphDdrRegisterAccess::Read,
-          GraphDdrRegisterEncoding::DevAddrShift8LoHi, 4, 5}, up_weight},
+          GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33}, up_weight},
         {{GraphDdrRegisterRole::Fp32PerChannelScale, GraphDdrRegisterAccess::Read,
-          GraphDdrRegisterEncoding::DevAddrShift8LoHi, 6, 7}, gate_scale},
+          GraphDdrRegisterEncoding::DevAddrShift8LoHi, 20, 21}, gate_scale},
         {{GraphDdrRegisterRole::Fp32PerChannelScale, GraphDdrRegisterAccess::Read,
-          GraphDdrRegisterEncoding::DevAddrShift8LoHi, 8, 9}, up_scale}});
+          GraphDdrRegisterEncoding::DevAddrShift8LoHi, 34, 35}, up_scale}});
   for (const auto* tensor : {&gate_weight, &up_weight, &gate_scale, &up_scale}) {
     const uint64_t address = RpuGetDevAddr(tensor->data_ptr());
     TORCH_CHECK(address && address % 256 == 0 && (address >> 8) <= UINT32_MAX,
@@ -7948,34 +8147,37 @@ void rpu_launch_pi05_prefill_gate_up_geglu_online_w8a8_c272_kernel(
     TORCH_CHECK(kernel->set_regs(index, value) == kKernelRegOk,
                 "Pi C272 A8 rejected register ", index);
   };
-  for (const auto& item : std::array<std::pair<uint32_t, uint32_t>, 4>{{
-      {0, a8}, {14, output}, {16, a8 + kA8Bytes}, {18, x_stage}}}) {
+  rpu_pl_tiling::set_parallel_linear_regs(*kernel,
+      rpu_pl_tiling::ParallelLinearRegisterArgs{x_stage, 0, output, 0, 272, 2048, 2048, 0, 8, 4096, 4096, 0, 1, 1});
+  // A8 is a distinct signed-byte activation contract with INT32 accumulation.
+  set(26, 2);
+  for (const auto& item : std::array<std::pair<uint32_t, uint32_t>, 3>{{
+      {48, a8 + kA8Bytes}, {52, x_stage}, {54, a8}}}) {
     set(item.first, uint16_t(item.second));
     set(item.first + 1, uint16_t(item.second >> 16));
   }
-  constexpr std::array<uint16_t, 18> quant_params{{
-      272, 1, 1, 2048, 0x57f0, 0xd7f0, 0, 0, 4096, 0, 2, 0, 2080, 0, 1, 0, 0, 0}};
-  for (size_t i = 0; i != quant_params.size(); ++i) set(24 + i, quant_params[i]);
-  set(64, 8); set(65, 1); set(66, 1);
-  for (uint32_t i = 128; i <= 255; ++i) set(i, 0);
+  for (uint32_t reg = 128; reg <= 255; ++reg) set(reg, 0);
   writer.write(*kernel);
   auto* queue = GET_QUEUE(8);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel, {8, 1, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
+  queue->enqueu_kernel(*kernel, {selected.grid_x, selected.grid_y, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
 }
 
 void rpu_launch_pi05_prefill_gate_up_geglu_w8a8_split_kernel(
     uint32_t a8,uint32_t row_scale,uint32_t stage,
     const at::Tensor& gate_weight,const at::Tensor& up_weight,
     uint32_t output0,uint32_t output1,
-    const at::Tensor& gate_scale,const at::Tensor& up_scale, int64_t rows) {
+    const at::Tensor& gate_scale,const at::Tensor& up_scale, int64_t rows,
+    bool panel512) {
   TORCH_CHECK(rows == 272 || rows == 288 || rows == 304 || rows == 320 || rows == 336 || rows == 400 || rows == 416 || rows == 432 || rows == 448 || rows == 464,
               "Pi Prefill A8 requires exact C272/C288/C304/C320/C336/C400/C416/C432/C448/C464");
-  const uint32_t m=rows, panel=rows==464 ? 448 : rows==336 ? 320 : (rows>=400 ? 384 : 256);
+  TORCH_CHECK(!panel512 || rows == 272,
+              "Pi Prefill A8 panel512 requires exact C272 paired rows");
+  const uint32_t m=rows, panel=panel512 ? 512 : rows==464 ? 448 : rows==336 ? 320 : (rows>=400 ? 384 : 256);
   TORCH_CHECK(SPM_ALLOC.is_initialized(),"Pi Prefill A8 requires initialized SPM");
   const uint32_t base=SPM_ALLOC.addr(0,0);
   const std::array<std::pair<uint32_t,uint32_t>,5> ranges{{
-      {a8,2*m*2080},{row_scale,2*m*2+(rows==272 || rows==288 || rows==304 || rows==320 || rows==336 || rows==416 || rows==432 || rows==448 || rows==464 ? 32u : 0u)},{stage,2*panel*2048},
+      {a8,2*m*2080},{row_scale,2*m*2+30u},{stage,2*panel*2048},
       {output0,m*2048*2},{output1,m*2048*2}}};
   for(size_t i=0;i<ranges.size();++i) {
     const auto& range=ranges[i];
@@ -7996,27 +8198,21 @@ void rpu_launch_pi05_prefill_gate_up_geglu_w8a8_split_kernel(
     TORCH_CHECK(scale->defined() && scale->device().type()==at::kPrivateUse1 &&
         scale->scalar_type()==at::kFloat && scale->is_contiguous() &&
         scale->storage_offset()==0 && scale->sizes()==at::IntArrayRef({16384}),
-        "Pi Prefill A8 requires cold promoted device FP32 scales [16384]");
-  const auto id=rows==432 ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_W8A8_SPLIT_C432_M48N32K2048 :
-               rows==464 ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_W8A8_SPLIT_C464_M48N32K2048 :
-               rows==336 ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_W8A8_SPLIT_C336_M48N32K2048 :
-               rows==448 ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_W8A8_SPLIT_C448_M48N32K2048 :
-               rows==416 ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_W8A8_SPLIT_C416_M48N32K2048 :
-               rows==288 ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_W8A8_SPLIT_C288_M48N32K2048 :
-               rows==304 ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_W8A8_SPLIT_C304_M48N32K2048
-         : rows==320 ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_W8A8_SPLIT_C320_M48N32K2048 :
-               rows==400 ? KernelId::PI05_PREFILL_GATE_UP_GEGLU_W8A8_SPLIT_M48N32K2048 :
-                           KernelId::PI05_PREFILL_GATE_UP_GEGLU_W8A8_SPLIT_C272_M48N32K2048;
+        "Pi Prefill A8 requires cold promoted RPU FP32 scales [16384]");
+  const auto selected = rpu_pi_wall::select(panel512
+      ? rpu_pi_wall::Operation::A8PairedGeluPanel512 : rpu_pi_wall::Operation::A8PairedGelu,
+      rpu_pl_tiling::WeightType::Int8, true, rows, 2048, 2048);
+  const auto id = pi_wall_kernel_id(selected.ordinal);
   auto writer=RpuKernelGraph::active().stage_kernel_ddr_registers(id,
       std::vector<GraphDdrRegisterOperandSpec>{
         {{GraphDdrRegisterRole::Int8ModelWeight,GraphDdrRegisterAccess::Read,
-          GraphDdrRegisterEncoding::DevAddrShift8LoHi,2,3},gate_weight},
+          GraphDdrRegisterEncoding::DevAddrShift8LoHi,2, 3},gate_weight},
         {{GraphDdrRegisterRole::Int8ModelWeight,GraphDdrRegisterAccess::Read,
-          GraphDdrRegisterEncoding::DevAddrShift8LoHi,4,5},up_weight},
+          GraphDdrRegisterEncoding::DevAddrShift8LoHi,32, 33},up_weight},
         {{GraphDdrRegisterRole::Fp32PerChannelScale,GraphDdrRegisterAccess::Read,
-          GraphDdrRegisterEncoding::DevAddrShift8LoHi,6,7},gate_scale},
+          GraphDdrRegisterEncoding::DevAddrShift8LoHi,20, 21},gate_scale},
         {{GraphDdrRegisterRole::Fp32PerChannelScale,GraphDdrRegisterAccess::Read,
-          GraphDdrRegisterEncoding::DevAddrShift8LoHi,8,9},up_scale}});
+          GraphDdrRegisterEncoding::DevAddrShift8LoHi,34, 35},up_scale}});
   for(const auto* tensor:{&gate_weight,&up_weight,&gate_scale,&up_scale}) {
     const uint64_t address=RpuGetDevAddr(tensor->data_ptr());
     TORCH_CHECK(address && address%256==0 && (address>>8)<=UINT32_MAX,
@@ -8030,16 +8226,100 @@ void rpu_launch_pi05_prefill_gate_up_geglu_w8a8_split_kernel(
     TORCH_CHECK(kernel->set_regs(index,value)==kKernelRegOk,
                 "Pi Prefill A8 rejected register ",index);
   };
-  for(const auto& item:std::array<std::pair<uint32_t,uint32_t>,5>{{
-      {0,a8},{14,output0},{16,row_scale},{18,stage},{22,output1}}}) {
-    set(item.first,uint16_t(item.second));set(item.first+1,uint16_t(item.second>>16));
+  rpu_pl_tiling::set_parallel_linear_regs(*kernel,
+      rpu_pl_tiling::ParallelLinearRegisterArgs{a8, 0, output0, 0, 2 * m, 2048, 2048, 0, 8, 2080, 4096, 0, 1, 1});
+  // A8 is a distinct signed-byte activation contract with INT32 accumulation.
+  set(26, 1);
+  for (const auto& item : std::array<std::pair<uint32_t, uint32_t>, 3>{{
+      {48, row_scale}, {50, output1}, {52, stage}}}) {
+    set(item.first, uint16_t(item.second));
+    set(item.first + 1, uint16_t(item.second >> 16));
   }
-  set(64,8);set(65,1);set(66,1);
-  for(uint32_t i=128;i<=255;++i)set(i,0);
+  for (uint32_t reg = 128; reg <= 255; ++reg) set(reg, 0);
   writer.write(*kernel);
   auto* queue=GET_QUEUE(8);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel,{8,1,1},{0,1,2,3,4,5,6,7});
+  queue->enqueu_kernel(*kernel,{selected.grid_x,selected.grid_y,1},{0,1,2,3,4,5,6,7});
+}
+
+// Generic W8A8 tile, column partition without bias: FP16 X is replicated at
+// full K on every lane, the kernel quantizes it per row, and the FP32 scale is
+// [N] in channel order. M/N/K come from the caller's owner; the tile from the
+// selector.
+void rpu_launch_linear_w8a8_spm_to_spm_kernel(
+    uint32_t input_spm_addr, const at::Tensor& weight, uint32_t output_spm_addr,
+    const at::Tensor& scale, int64_t M, int64_t N, int64_t K, int num_cores) {
+  validate_parallel_linear_geometry(M, N, K, /*partition=*/1, num_cores);
+  TORCH_CHECK(weight.defined() && weight.device().type() == at::kPrivateUse1 &&
+                  weight.scalar_type() == at::kChar && weight.is_contiguous() &&
+                  weight.storage_offset() == 0 &&
+                  weight.sizes() == at::IntArrayRef({N, K}),
+              "W8A8 Linear requires installed RPU int8 weight [N,K]");
+  TORCH_CHECK(scale.defined() && scale.device().type() == at::kPrivateUse1 &&
+                  scale.scalar_type() == at::kFloat && scale.is_contiguous() &&
+                  scale.storage_offset() == 0 &&
+                  scale.sizes() == at::IntArrayRef({N}),
+              "W8A8 Linear requires cold promoted RPU FP32 scale [N]");
+  TORCH_CHECK(SPM_ALLOC.is_initialized(), "W8A8 Linear requires initialized SPM");
+  const int64_t local_n = N / num_cores;
+  const uint64_t input_bytes = static_cast<uint64_t>(M) * K * 2;
+  const uint64_t output_bytes = static_cast<uint64_t>(M) * local_n * 2;
+  const uint32_t spm_base = SPM_ALLOC.addr(0, 0);
+  for (const auto& range : std::array<std::pair<uint32_t, uint64_t>, 2>{{
+           {input_spm_addr, input_bytes}, {output_spm_addr, output_bytes}}}) {
+    TORCH_CHECK(range.first >= spm_base && range.first % 256 == 0 &&
+                    range.second <= SpmAllocator::SPM_USABLE &&
+                    static_cast<uint64_t>(range.first - spm_base) <=
+                        SpmAllocator::SPM_USABLE - range.second,
+                "W8A8 Linear requires aligned bounded local SPM ranges");
+  }
+  TORCH_CHECK(input_spm_addr + input_bytes <= output_spm_addr ||
+                  output_spm_addr + output_bytes <= input_spm_addr,
+              "W8A8 Linear input and output must be disjoint");
+  const auto selected = rpu_pi_wall::select(
+      rpu_pi_wall::Operation::A8Online, rpu_pl_tiling::WeightType::Int8,
+      /*acc32=*/true, static_cast<int>(M), static_cast<int>(local_n),
+      static_cast<int>(K));
+  const KernelId id = pi_wall_kernel_id(selected.ordinal);
+  auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(id,
+      std::vector<GraphDdrRegisterOperandSpec>{
+        {{GraphDdrRegisterRole::Int8ModelWeight, GraphDdrRegisterAccess::Read,
+          GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3}, weight},
+        {{GraphDdrRegisterRole::Fp32PerChannelScale, GraphDdrRegisterAccess::Read,
+          GraphDdrRegisterEncoding::DevAddrShift8LoHi, 20, 21}, scale}});
+  for (const auto* tensor : {&weight, &scale}) {
+    const uint64_t address = RpuGetDevAddr(tensor->data_ptr());
+    TORCH_CHECK(address && address % 256 == 0 && (address >> 8) <= UINT32_MAX,
+                "W8A8 Linear DDR operand exceeds the aligned shift8 ABI");
+    rpu_ddr_flush(tensor->data_ptr());
+  }
+  auto* kernel = GET_KERNEL(id);
+  TORCH_CHECK(kernel != nullptr,
+              rpu_pi_wall::candidate_names[selected.ordinal],
+              " missing from the selected operator ref");
+  kernel->reset_regs();
+  rpu_pl_tiling::set_parallel_linear_regs(
+      *kernel, rpu_pl_tiling::ParallelLinearRegisterArgs{
+                   input_spm_addr, RpuGetDevAddr(weight.data_ptr()),
+                   output_spm_addr, 0,
+                   static_cast<uint32_t>(M), static_cast<uint32_t>(local_n),
+                   static_cast<uint32_t>(K), 0,
+                   static_cast<uint16_t>(num_cores),
+                   static_cast<uint32_t>(K * 2),
+                   static_cast<uint32_t>(local_n * 2),
+                   RpuGetDevAddr(scale.data_ptr()),
+                   /*partition=*/1, /*dtype_mode=*/1, /*x_dtype=*/2});
+  kernel->set_regs(50, static_cast<uint16_t>(0x57f0));
+  kernel->set_regs(51, static_cast<uint16_t>(0xd7f0));
+  kernel->set_regs(64, selected.grid_x);
+  kernel->set_regs(65, selected.grid_y);
+  kernel->set_regs(66, static_cast<uint16_t>(1));
+  writer.write(*kernel);
+  auto* queue = GET_QUEUE(num_cores);
+  queue->set_broadcast_mode(true);
+  std::vector<uint8_t> core_list;
+  for (int i = 0; i < num_cores; ++i) core_list.push_back(static_cast<uint8_t>(i));
+  queue->enqueu_kernel(*kernel, {selected.grid_x, selected.grid_y, static_cast<uint16_t>(1)}, core_list);
 }
 
 void rpu_launch_wall_vision_gate_up_swiglu_w8a16_spm_kernel(
@@ -8094,8 +8374,8 @@ void rpu_launch_wall_vision_gate_up_swiglu_w8a16_spm_kernel(
                     output1_spm_addr == 0 && output2_spm_addr == 0),
       "Wall Vision fused gate+up+SwiGLU multibase addresses must be all "
       "present or all absent");
-  // The three-base payload resets its store extent to 192 rows; only the
-  // single-base M352 payload preserves the runtime row bound through SwiGLU.
+  // Admit M576 for either base form, plus cold single-base W8 M324/M672.
+  // Generated per-profile contracts determine each tile and slab mapping.
   const bool small_image = !fp16 && !multibase &&
       sorting.vision_row_reuse && sorting.silu_mul &&
       (rows == 324 || rows == 672);
@@ -8130,13 +8410,11 @@ void rpu_launch_wall_vision_gate_up_swiglu_w8a16_spm_kernel(
                 "Wall small-image Gate/Up input/output SPM must not overlap");
   }
 
-  const KernelId legacy_kernel_id = multibase
-      ? KernelId::WALL_VISION_GATE_UP_SWIGLU_W8A16_MULTIBASE_M192X3N96
-      : KernelId::WALL_VISION_GATE_UP_SWIGLU_W8A16_M352N96;
   TORCH_CHECK(!fp16 || multibase, "FP16 requires three-base tile reuse");
-  const KernelId kernel_id = fp16
-      ? KernelId::WALL_VISION_GATE_UP_SWIGLU_FP16_MULTIBASE_M192X3N96K128
-      : legacy_kernel_id;
+  const auto selected = rpu_pi_wall::select((multibase ? rpu_pi_wall::Operation::TripletSharedSiluBias : rpu_pi_wall::Operation::SharedSiluBias),
+      fp16 ? rpu_pl_tiling::WeightType::Fp16 : rpu_pl_tiling::WeightType::Int8,
+      false, rows, kNPerCore, kK);
+  const auto kernel_id = pi_wall_kernel_id(selected.ordinal);
   auto register_writer =
       wall_precision_registers(
           kernel_id, fp16,
@@ -8157,13 +8435,13 @@ void rpu_launch_wall_vision_gate_up_swiglu_w8a16_spm_kernel(
                   GraphDdrRegisterAbi{
                       GraphDdrRegisterRole::Int8ModelWeight,
                       GraphDdrRegisterAccess::Read,
-                      GraphDdrRegisterEncoding::DevAddrShift8LoHi, 24, 25},
+                      GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33},
                   up_weight},
               GraphDdrRegisterOperandSpec{
                   GraphDdrRegisterAbi{
                       GraphDdrRegisterRole::PerChannelScale,
                       GraphDdrRegisterAccess::Read,
-                      GraphDdrRegisterEncoding::DevAddrShift8LoHi, 26, 27},
+                      GraphDdrRegisterEncoding::DevAddrShift8LoHi, 34, 35},
                   up_scale}});
 
   for (const at::Tensor* tensor :
@@ -8176,41 +8454,30 @@ void rpu_launch_wall_vision_gate_up_swiglu_w8a16_spm_kernel(
   }
 
   Kernel_t* kernel = GET_KERNEL(kernel_id);
-  TORCH_CHECK(
-      kernel != nullptr,
-      multibase
-          ? "fused_gate_up_swiglu_w8a16_multibase_m192x3n96k128 missing "
-            "from expansion ref"
-          : "fused_gate_up_swiglu_w8a16_m352n96k128 missing from expansion "
-            "ref");
+  TORCH_CHECK(kernel != nullptr, "Current Vision shared-input payload is absent");
   kernel->reset_regs();
   rpu_pl_tiling::set_parallel_linear_regs(
       *kernel,
       rpu_pl_tiling::ParallelLinearRegisterArgs{
           input_spm_addr, 0, gate_output_spm_addr, gate_bias_spm_addr,
-          static_cast<uint32_t>(kM), static_cast<uint32_t>(kNPerCore),
+          static_cast<uint32_t>(multibase ? 3 * rows : rows), static_cast<uint32_t>(kNPerCore),
           static_cast<uint32_t>(kK), 1, NUM_CORES,
           static_cast<uint32_t>(kK * sizeof(c10::Half)),
-          static_cast<uint32_t>(kNPerCore * sizeof(c10::Half)), 0, 1, 1});
-  kernel->set_regs(28, static_cast<uint16_t>(up_bias_spm_addr));
-  kernel->set_regs(29, static_cast<uint16_t>(up_bias_spm_addr >> 16));
+          static_cast<uint32_t>(kNPerCore * sizeof(c10::Half)), 0, 1, static_cast<uint16_t>(fp16 ? 2 : 1)});
+  rpu_pl_tiling::set_u32_reg_pair(*kernel, 38, up_bias_spm_addr);
   if (multibase) {
-    rpu_pl_tiling::set_u32_reg_pair(*kernel, 30, input1_spm_addr);
-    rpu_pl_tiling::set_u32_reg_pair(*kernel, 32, input2_spm_addr);
-    rpu_pl_tiling::set_u32_reg_pair(*kernel, 34, output1_spm_addr);
-    rpu_pl_tiling::set_u32_reg_pair(*kernel, 36, output2_spm_addr);
+    rpu_pl_tiling::set_u32_reg_pair(*kernel, 48, input1_spm_addr);
+    rpu_pl_tiling::set_u32_reg_pair(*kernel, 50, output1_spm_addr);
+    kernel->set_regs(52, static_cast<uint16_t>(rows));
+    rpu_pl_tiling::set_u32_reg_pair(*kernel, 54, input2_spm_addr);
+    rpu_pl_tiling::set_u32_reg_pair(*kernel, 56, output2_spm_addr);
   }
   register_writer.write(*kernel);
 
   auto* queue = GET_QUEUE(NUM_CORES);
   queue->set_broadcast_mode(true);
   const std::vector<uint8_t> cores{0, 1, 2, 3, 4, 5, 6, 7};
-  if (multibase) {
-    queue->enqueu_kernel(*kernel, {5, 3, 1}, cores);
-  } else {
-    queue->enqueu_kernel(
-        *kernel, {5, static_cast<uint16_t>(CeilDiv(rows, int64_t{352})), 1}, cores);
-  }
+  queue->enqueu_kernel(*kernel, {selected.grid_x, selected.grid_y, 1}, cores);
 }
 
 void rpu_launch_wall_qkv_w8a16_multibase_spm_kernel(
@@ -8277,14 +8544,10 @@ void rpu_launch_wall_qkv_w8a16_multibase_spm_kernel(
                   v_bias_spm_addr != 0,
               "Wall QKV multibase requires all three persistent SPM biases");
 
-  const KernelId kernel_id = fp16
-      ? (kv_tile_owner ? KernelId::WALL_PREFILL_QKV_FP16_TILE_OWNER_M320X2N64K128
-          : rows == 640 ? KernelId::WALL_PREFILL_QKV_FP16_M320X2N64K128
-                        : KernelId::WALL_PREFILL_QKV_FP16_M448N64K128)
-      : kv_tile_owner
-      ? KernelId::WALL_QKV_W8A16_MULTIBASE_TILE_OWNER_M320X2N64
-      : rows == 640 ? KernelId::WALL_QKV_W8A16_MULTIBASE_M320X2N64
-                    : KernelId::WALL_QKV_W8A16_MULTIBASE_M448N64;
+  const auto selected = rpu_pi_wall::select((kv_tile_owner ? rpu_pi_wall::Operation::QkvTileOwner : rpu_pi_wall::Operation::Qkv),
+      fp16 ? rpu_pl_tiling::WeightType::Fp16 : rpu_pl_tiling::WeightType::Int8,
+      false, rows, kQPerCore, kK);
+  const auto kernel_id = pi_wall_kernel_id(selected.ordinal);
   auto register_writer =
       wall_precision_registers(
           kernel_id, fp16,
@@ -8305,25 +8568,25 @@ void rpu_launch_wall_qkv_w8a16_multibase_spm_kernel(
                   GraphDdrRegisterAbi{
                       GraphDdrRegisterRole::Int8ModelWeight,
                       GraphDdrRegisterAccess::Read,
-                      GraphDdrRegisterEncoding::DevAddrShift8LoHi, 24, 25},
+                      GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33},
                   k_weight},
               GraphDdrRegisterOperandSpec{
                   GraphDdrRegisterAbi{
                       GraphDdrRegisterRole::PerChannelScale,
                       GraphDdrRegisterAccess::Read,
-                      GraphDdrRegisterEncoding::DevAddrShift8LoHi, 26, 27},
+                      GraphDdrRegisterEncoding::DevAddrShift8LoHi, 34, 35},
                   k_scale},
               GraphDdrRegisterOperandSpec{
                   GraphDdrRegisterAbi{
                       GraphDdrRegisterRole::Int8ModelWeight,
                       GraphDdrRegisterAccess::Read,
-                      GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33},
+                      GraphDdrRegisterEncoding::DevAddrShift8LoHi, 40, 41},
                   v_weight},
               GraphDdrRegisterOperandSpec{
                   GraphDdrRegisterAbi{
                       GraphDdrRegisterRole::PerChannelScale,
                       GraphDdrRegisterAccess::Read,
-                      GraphDdrRegisterEncoding::DevAddrShift8LoHi, 34, 35},
+                      GraphDdrRegisterEncoding::DevAddrShift8LoHi, 42, 43},
                   v_scale}});
 
   for (const at::Tensor* tensor :
@@ -8335,14 +8598,7 @@ void rpu_launch_wall_qkv_w8a16_multibase_spm_kernel(
   }
 
   Kernel_t* kernel = GET_KERNEL(kernel_id);
-  TORCH_CHECK(
-      kernel != nullptr,
-      kv_tile_owner
-          ? "qkv_parallel_w8a16_multibase_tile_owner_m320x2n64k128 "
-            "missing from expansion ref"
-          : rows == 640
-          ? "qkv_parallel_w8a16_multibase_m320x2n64k128 missing from expansion ref"
-          : "qkv_parallel_w8a16_multibase_m448n64k128 missing from expansion ref");
+  TORCH_CHECK(kernel != nullptr, "Current QKV payload is absent");
   kernel->reset_regs();
   rpu_pl_tiling::set_parallel_linear_regs(
       *kernel,
@@ -8351,22 +8607,22 @@ void rpu_launch_wall_qkv_w8a16_multibase_spm_kernel(
           static_cast<uint32_t>(rows), static_cast<uint32_t>(kQPerCore),
           static_cast<uint32_t>(kK), 1, NUM_CORES,
           static_cast<uint32_t>(kK * sizeof(c10::Half)),
-          static_cast<uint32_t>(kQPerCore * sizeof(c10::Half)), 0, 1, 1});
+          static_cast<uint32_t>(kQPerCore * sizeof(c10::Half)), 0, 1, static_cast<uint16_t>(fp16 ? 2 : 1)});
 
   auto set_u32 = [&](int reg, uint32_t value) {
     kernel->set_regs(reg, static_cast<uint16_t>(value));
     kernel->set_regs(reg + 1, static_cast<uint16_t>(value >> 16));
   };
-  set_u32(28, k_bias_spm_addr);
-  set_u32(30, k_output_spm_addr);
-  set_u32(36, v_bias_spm_addr);
-  set_u32(38, v_output_spm_addr);
+  set_u32(38, k_bias_spm_addr);
+  set_u32(36, k_output_spm_addr);
+  set_u32(46, v_bias_spm_addr);
+  set_u32(44, v_output_spm_addr);
   register_writer.write(*kernel);
 
   auto* queue = GET_QUEUE(NUM_CORES);
   queue->set_broadcast_mode(true);
   const std::vector<uint8_t> cores{0, 1, 2, 3, 4, 5, 6, 7};
-  queue->enqueu_kernel(*kernel, {8, 1, 1}, cores);
+  queue->enqueu_kernel(*kernel, {selected.grid_x, selected.grid_y, 1}, cores);
 }
 
 void rpu_launch_wall_action_qkv_w8a16_multibase_spm_kernel(
@@ -8455,6 +8711,43 @@ void rpu_launch_wall_action_qkv_w8a16_multibase_spm_kernel(
               "Wall Action QKV multibase requires all three persistent SPM "
               "biases");
 
+  // Check the complete packet before submitting either QKV or owner fanout.
+  // Every output remains live while the other projections read X and biases.
+  const std::array<std::pair<uint32_t, uint64_t>, 7> spm_ranges{{
+      {input_spm_addr, uint64_t(kM * kK * 2)},
+      {q_output_spm_addr, uint64_t(kM * kQPerCore * 2)},
+      {k_output_spm_addr, uint64_t(kM * kKvPerCore * 2)},
+      {v_output_spm_addr, uint64_t(kM * kKvPerCore * 2)},
+      {q_bias_spm_addr, uint64_t(kQPerCore * 2)},
+      {k_bias_spm_addr, uint64_t(kKvPerCore * 2)},
+      {v_bias_spm_addr, uint64_t(kKvPerCore * 2)}}};
+  TORCH_CHECK(SPM_ALLOC.is_initialized(), "Wall Action QKV requires initialized SPM");
+  const uint64_t spm_base = SPM_ALLOC.addr(0, 0);
+  for (size_t i = 0; i < spm_ranges.size(); ++i) {
+    const auto [address, bytes] = spm_ranges[i];
+    TORCH_CHECK(address >= spm_base && address % 256 == 0 &&
+                    bytes <= SpmAllocator::SPM_USABLE &&
+                    address - spm_base <= SpmAllocator::SPM_USABLE - bytes,
+                "Wall Action QKV SPM operand outside its aligned local range");
+    // Read-only ranges may alias each other; outputs must be disjoint from
+    // every other live operand.
+    for (size_t j = 0; j < i; ++j) {
+      if ((i >= 1 && i <= 3) || (j >= 1 && j <= 3))
+        TORCH_CHECK(address + bytes <= spm_ranges[j].first ||
+                        uint64_t(spm_ranges[j].first) + spm_ranges[j].second <= address,
+                    "Wall Action QKV output aliases a live operand");
+    }
+    if (use_spm_weight && i >= 1 && i <= 3) {
+      for (const auto& [weight, extent] :
+           std::array<std::pair<uint32_t, uint64_t>, 3>{{
+               {q_weight_spm_addr, uint64_t(kQPerCore * kK * (fp16 ? 2 : 1))},
+               {k_weight_spm_addr, uint64_t(kKvPerCore * kK * (fp16 ? 2 : 1))},
+               {v_weight_spm_addr, uint64_t(kKvPerCore * kK * (fp16 ? 2 : 1))}}})
+        TORCH_CHECK(address + bytes <= weight || uint64_t(weight) + extent <= address,
+                    "Wall Action QKV output aliases resident weights");
+    }
+  }
+
   const bool fuse_partial_mrope = cos != nullptr || sin != nullptr;
   TORCH_CHECK(rows == 20 || fuse_partial_mrope,
               "Wall Action M32 QKV requires fused partial M-RoPE");
@@ -8475,26 +8768,26 @@ void rpu_launch_wall_action_qkv_w8a16_multibase_spm_kernel(
     TORCH_CHECK(
         is_fp16_table(*cos) && is_fp16_table(*sin) &&
             cos->sizes() == sin->sizes() && cos->size(1) == 64 &&
-            position >= 0 && position <= cos->size(0) &&
+            position >= 0 && uint64_t(position) <= UINT32_MAX &&
+            position <= cos->size(0) &&
             kM <= cos->size(0) - position,
         "Wall Action QKV partial M-RoPE cos/sin must be matching contiguous "
         "device fp16 [rows,64] tables covering [", position, ",",
         position + kM, ")");
   }
 
-  const KernelId legacy_kernel_id = use_spm_weight
-      ? KernelId::WALL_ACTION_QKV_PARTIAL_MROPE_W8A16_M20N64_SPM_WEIGHT
-      : kv_owner_fanout
-          ? KernelId::WALL_ACTION_QKV_OWNER_PARTIAL_MROPE_W8A16_M20N64
-          : fuse_partial_mrope
-          ? KernelId::WALL_ACTION_QKV_PARTIAL_MROPE_W8A16_M20N64
-          : KernelId::WALL_ACTION_QKV_W8A16_MULTIBASE_M592N32;
   TORCH_CHECK(!fp16 || fuse_partial_mrope, "FP16 QKV requires fused partial MRoPE");
-  const KernelId kernel_id = fp16
-      ? (use_spm_weight ? KernelId::WALL_ACTION_QKV_FP16_PARTIAL_MROPE_SPM_WEIGHT_M20N64K128
+  const auto plain = fuse_partial_mrope ? rpu_pi_wall::Selection{} :
+      rpu_pi_wall::select(rpu_pi_wall::Operation::Qkv,
+          rpu_pl_tiling::WeightType::Int8, false, rows, kQPerCore, kK);
+  const KernelId kernel_id = !fuse_partial_mrope ? pi_wall_kernel_id(plain.ordinal)
+      : fp16
+        ? (use_spm_weight ? KernelId::WALL_ACTION_QKV_FP16_PARTIAL_MROPE_SPM_WEIGHT_M20N64K128
            : kv_owner_fanout ? KernelId::WALL_ACTION_QKV_FP16_OWNER_PARTIAL_MROPE_M20N64K128
-                             : KernelId::WALL_ACTION_QKV_FP16_PARTIAL_MROPE_M20N64K128)
-      : legacy_kernel_id;
+                            : KernelId::WALL_ACTION_QKV_FP16_PARTIAL_MROPE_M20N64K128)
+        : (use_spm_weight ? KernelId::WALL_ACTION_QKV_PARTIAL_MROPE_W8A16_M20N64_SPM_WEIGHT
+           : kv_owner_fanout ? KernelId::WALL_ACTION_QKV_OWNER_PARTIAL_MROPE_W8A16_M20N64
+                            : KernelId::WALL_ACTION_QKV_PARTIAL_MROPE_W8A16_M20N64);
   std::vector<GraphDdrRegisterOperandSpec> operands;
   if (!use_spm_weight) {
     operands.push_back(GraphDdrRegisterOperandSpec{
@@ -8515,41 +8808,41 @@ void rpu_launch_wall_action_qkv_w8a16_multibase_spm_kernel(
         GraphDdrRegisterAbi{
             GraphDdrRegisterRole::Int8ModelWeight,
             GraphDdrRegisterAccess::Read,
-            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 24, 25},
+            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33},
         k_weight});
   }
   operands.push_back(GraphDdrRegisterOperandSpec{
       GraphDdrRegisterAbi{
           GraphDdrRegisterRole::PerChannelScale,
           GraphDdrRegisterAccess::Read,
-          GraphDdrRegisterEncoding::DevAddrShift8LoHi, 26, 27},
+          GraphDdrRegisterEncoding::DevAddrShift8LoHi, 34, 35},
       k_scale});
   if (!use_spm_weight) {
     operands.push_back(GraphDdrRegisterOperandSpec{
         GraphDdrRegisterAbi{
             GraphDdrRegisterRole::Int8ModelWeight,
             GraphDdrRegisterAccess::Read,
-            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33},
+            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 40, 41},
         v_weight});
   }
   operands.push_back(GraphDdrRegisterOperandSpec{
       GraphDdrRegisterAbi{
           GraphDdrRegisterRole::PerChannelScale,
           GraphDdrRegisterAccess::Read,
-          GraphDdrRegisterEncoding::DevAddrShift8LoHi, 34, 35},
+          GraphDdrRegisterEncoding::DevAddrShift8LoHi, 42, 43},
       v_scale});
   if (fuse_partial_mrope) {
     operands.push_back(GraphDdrRegisterOperandSpec{
         GraphDdrRegisterAbi{
             GraphDdrRegisterRole::SemanticInput,
             GraphDdrRegisterAccess::Read,
-            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 10, 11},
+            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 48, 49},
         *cos});
     operands.push_back(GraphDdrRegisterOperandSpec{
         GraphDdrRegisterAbi{
             GraphDdrRegisterRole::SemanticInput,
             GraphDdrRegisterAccess::Read,
-            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 18, 19},
+            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 50, 51},
         *sin});
   }
   auto register_writer =
@@ -8582,18 +8875,7 @@ void rpu_launch_wall_action_qkv_w8a16_multibase_spm_kernel(
   }
 
   Kernel_t* kernel = GET_KERNEL(kernel_id);
-  TORCH_CHECK(kernel != nullptr,
-              use_spm_weight
-                  ? "qkv_parallel_w8a16_multibase_partial_mrope_"
-                    "m20n64k128_spm_weight missing from expansion ref"
-                  : kv_owner_fanout
-                  ? "qkv_parallel_w8a16_multibase_owner_partial_mrope_"
-                    "m20n64k128 missing from expansion ref"
-                  : fuse_partial_mrope
-                  ? "qkv_parallel_w8a16_multibase_partial_mrope_m20n64k128 "
-                    "missing from expansion ref"
-                  : "qkv_parallel_w8a16_multibase_m592n32k128 missing from "
-                    "expansion ref");
+  TORCH_CHECK(kernel != nullptr, "Current Action QKV payload is absent");
   kernel->reset_regs();
   rpu_pl_tiling::set_parallel_linear_regs(
       *kernel,
@@ -8602,7 +8884,7 @@ void rpu_launch_wall_action_qkv_w8a16_multibase_spm_kernel(
           static_cast<uint32_t>(kM), static_cast<uint32_t>(kQPerCore),
           static_cast<uint32_t>(kK), 1, NUM_CORES,
           static_cast<uint32_t>(kK * sizeof(c10::Half)),
-          static_cast<uint32_t>(kQPerCore * sizeof(c10::Half)), 0, 1, 1});
+          static_cast<uint32_t>(kQPerCore * sizeof(c10::Half)), 0, 1, static_cast<uint16_t>(fp16 ? 2 : 1)});
 
   auto set_u32 = [&](int reg, uint32_t value) {
     kernel->set_regs(reg, static_cast<uint16_t>(value));
@@ -8610,18 +8892,17 @@ void rpu_launch_wall_action_qkv_w8a16_multibase_spm_kernel(
   };
   if (use_spm_weight) {
     set_u32(2, q_weight_spm_addr);
-    set_u32(24, k_weight_spm_addr);
-    set_u32(32, v_weight_spm_addr);
+    set_u32(32, k_weight_spm_addr);
+    set_u32(40, v_weight_spm_addr);
   }
-  set_u32(28, k_bias_spm_addr);
-  set_u32(30, k_output_spm_addr);
-  set_u32(36, v_bias_spm_addr);
-  set_u32(38, v_output_spm_addr);
+  set_u32(38, k_bias_spm_addr);
+  set_u32(36, k_output_spm_addr);
+  set_u32(46, v_bias_spm_addr);
+  set_u32(44, v_output_spm_addr);
   if (fuse_partial_mrope) {
-    const uint32_t position_u32 = static_cast<uint32_t>(position);
-    kernel->set_regs(9, static_cast<uint16_t>(position_u32));
-    kernel->set_regs(12, static_cast<uint16_t>(position_u32 >> 16));
-    kernel->set_regs(128, static_cast<uint16_t>(0));
+    set_u32(52, static_cast<uint32_t>(position));
+    for (uint32_t reg = 128; reg <= 255; ++reg)
+      kernel->set_regs(reg, static_cast<uint16_t>(0));
   }
   register_writer.write(*kernel);
 
@@ -8630,7 +8911,8 @@ void rpu_launch_wall_action_qkv_w8a16_multibase_spm_kernel(
   const std::vector<uint8_t> cores{0, 1, 2, 3, 4, 5, 6, 7};
   queue->enqueu_kernel(
       *kernel,
-      {static_cast<uint16_t>(fuse_partial_mrope ? 8 : 16), 1, 1}, cores);
+      (fuse_partial_mrope ? rpu_wall_action_qkv::grid(kernel_id) :
+       std::vector<uint16_t>{plain.grid_x, plain.grid_y, 1}), cores);
 
   if (kv_owner_fanout) {
     const uint64_t kKvOutputBytes = kM * kKvPerCore * sizeof(c10::Half);
@@ -8725,9 +9007,10 @@ void rpu_launch_wall_vision_qkv_w8a16_multibase_spm_kernel(
               "Wall Vision QKV multibase requires all three persistent SPM "
               "biases");
 
-  const KernelId kernel_id = fp16
-      ? KernelId::WALL_VISION_QKV_FP16_MULTIBASE_M192X3N96K128
-      : KernelId::WALL_VISION_QKV_W8A16_MULTIBASE_M192X3N96;
+  const auto selected = rpu_pi_wall::select(rpu_pi_wall::Operation::Qkv,
+      fp16 ? rpu_pl_tiling::WeightType::Fp16 : rpu_pl_tiling::WeightType::Int8,
+      false, 3 * kImageM, kNPerCore, kK);
+  const auto kernel_id = pi_wall_kernel_id(selected.ordinal);
   auto register_writer =
       wall_precision_registers(
           kernel_id, fp16,
@@ -8748,25 +9031,25 @@ void rpu_launch_wall_vision_qkv_w8a16_multibase_spm_kernel(
                   GraphDdrRegisterAbi{
                       GraphDdrRegisterRole::Int8ModelWeight,
                       GraphDdrRegisterAccess::Read,
-                      GraphDdrRegisterEncoding::DevAddrShift8LoHi, 24, 25},
+                      GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33},
                   k_weight},
               GraphDdrRegisterOperandSpec{
                   GraphDdrRegisterAbi{
                       GraphDdrRegisterRole::PerChannelScale,
                       GraphDdrRegisterAccess::Read,
-                      GraphDdrRegisterEncoding::DevAddrShift8LoHi, 26, 27},
+                      GraphDdrRegisterEncoding::DevAddrShift8LoHi, 34, 35},
                   k_scale},
               GraphDdrRegisterOperandSpec{
                   GraphDdrRegisterAbi{
                       GraphDdrRegisterRole::Int8ModelWeight,
                       GraphDdrRegisterAccess::Read,
-                      GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33},
+                      GraphDdrRegisterEncoding::DevAddrShift8LoHi, 40, 41},
                   v_weight},
               GraphDdrRegisterOperandSpec{
                   GraphDdrRegisterAbi{
                       GraphDdrRegisterRole::PerChannelScale,
                       GraphDdrRegisterAccess::Read,
-                      GraphDdrRegisterEncoding::DevAddrShift8LoHi, 34, 35},
+                      GraphDdrRegisterEncoding::DevAddrShift8LoHi, 42, 43},
                   v_scale}});
 
   for (const at::Tensor* tensor :
@@ -8779,46 +9062,31 @@ void rpu_launch_wall_vision_qkv_w8a16_multibase_spm_kernel(
   }
 
   Kernel_t* kernel = GET_KERNEL(kernel_id);
-  TORCH_CHECK(
-      kernel != nullptr,
-      "qkv_parallel_w8a16_multibase_m192x3n96k128 missing from expansion "
-      "ref");
+  TORCH_CHECK(kernel != nullptr, "Current QKV payload is absent");
   kernel->reset_regs();
   rpu_pl_tiling::set_parallel_linear_regs(
       *kernel,
       rpu_pl_tiling::ParallelLinearRegisterArgs{
           input_spm_addr, 0, q_output_spm_addr, q_bias_spm_addr,
-          static_cast<uint32_t>(kImageM), static_cast<uint32_t>(kNPerCore),
+          static_cast<uint32_t>(3 * kImageM), static_cast<uint32_t>(kNPerCore),
           static_cast<uint32_t>(kK), 1, NUM_CORES,
           static_cast<uint32_t>(kK * sizeof(c10::Half)),
-          static_cast<uint32_t>(kNPerCore * sizeof(c10::Half)), 0, 1, 1});
+          static_cast<uint32_t>(kNPerCore * sizeof(c10::Half)), 0, 1, static_cast<uint16_t>(fp16 ? 2 : 1)});
 
   auto set_u32 = [&](int reg, uint32_t value) {
     kernel->set_regs(reg, static_cast<uint16_t>(value));
     kernel->set_regs(reg + 1, static_cast<uint16_t>(value >> 16));
   };
-  set_u32(28, k_bias_spm_addr);
-  set_u32(30, k_output_spm_addr);
-  set_u32(36, v_bias_spm_addr);
-  set_u32(38, v_output_spm_addr);
-  constexpr uint32_t kInputImageBytes =
-      kImageM * kK * sizeof(c10::Half);
-  constexpr uint32_t kOutputImageBytes =
-      kImageM * kNPerCore * sizeof(c10::Half);
-  set_u32(40, input_spm_addr + kInputImageBytes);
-  set_u32(42, input_spm_addr + 2 * kInputImageBytes);
-  set_u32(44, q_output_spm_addr + kOutputImageBytes);
-  set_u32(46, q_output_spm_addr + 2 * kOutputImageBytes);
-  set_u32(48, k_output_spm_addr + kOutputImageBytes);
-  set_u32(50, k_output_spm_addr + 2 * kOutputImageBytes);
-  set_u32(52, v_output_spm_addr + kOutputImageBytes);
-  set_u32(54, v_output_spm_addr + 2 * kOutputImageBytes);
+  set_u32(38, k_bias_spm_addr);
+  set_u32(36, k_output_spm_addr);
+  set_u32(46, v_bias_spm_addr);
+  set_u32(44, v_output_spm_addr);
   register_writer.write(*kernel);
 
   auto* queue = GET_QUEUE(NUM_CORES);
   queue->set_broadcast_mode(true);
   const std::vector<uint8_t> cores{0, 1, 2, 3, 4, 5, 6, 7};
-  queue->enqueu_kernel(*kernel, {6, 3, 1}, cores);
+  queue->enqueu_kernel(*kernel, {selected.grid_x, selected.grid_y, 1}, cores);
 }
 
 void rpu_launch_wall_prefill_down_w8a16_c320x2_spm_kernel(
@@ -8858,9 +9126,20 @@ void rpu_launch_wall_prefill_down_w8a16_c320x2_spm_kernel(
               "Wall Prefill Down C320x2 requires distinct non-zero input and "
               "output SPM buffers");
 
-  const KernelId kernel_id = fp16
-      ? KernelId::WALL_PREFILL_DOWN_FP16_C320X2_N64K128
-      : KernelId::WALL_DOWN_WEIGHT_OUTER_W8A16_C320X2_N64;
+  const rpu_pl_tiling::ParallelLinearRegisterArgs linear_args{
+      input_spm_addr, 0, output0_spm_addr, 0,
+      static_cast<uint32_t>(kM), static_cast<uint32_t>(kN),
+      static_cast<uint32_t>(kLocalK), 0, NUM_CORES,
+      static_cast<uint32_t>(kLocalK * sizeof(c10::Half)),
+      static_cast<uint32_t>(kN * sizeof(c10::Half)), 0,
+      /*partition=*/0, /*dtype_mode=*/static_cast<uint16_t>(fp16 ? 2 : 1)};
+  const rpu_wall_fp16_retained::PairedDownArgs retained_args{
+      linear_args, uint64_t{input_spm_addr} + (kM / 2) * kLocalK * sizeof(c10::Half),
+      output1_spm_addr, static_cast<uint32_t>(kM / 2)};
+  const auto selected = fp16 ? rpu_wall_fp16_retained::select(retained_args) :
+      rpu_pi_wall::select(rpu_pi_wall::Operation::PairedLinear,
+          rpu_pl_tiling::WeightType::Int8, false, kM / 2, kN, kLocalK);
+  const auto kernel_id = pi_wall_kernel_id(selected.ordinal);
   auto register_writer =
       wall_precision_registers(
           kernel_id, fp16,
@@ -8891,23 +9170,20 @@ void rpu_launch_wall_prefill_down_w8a16_c320x2_spm_kernel(
       KERNEL_ID_NAMES[static_cast<size_t>(kernel_id)],
       " missing from expansion ref");
   kernel->reset_regs();
-  rpu_pl_tiling::set_parallel_linear_regs(
-      *kernel,
-      rpu_pl_tiling::ParallelLinearRegisterArgs{
-          input_spm_addr, 0, output0_spm_addr, 0,
-          static_cast<uint32_t>(kM), static_cast<uint32_t>(kN),
-          static_cast<uint32_t>(kLocalK), 0, NUM_CORES,
-          static_cast<uint32_t>(kLocalK * sizeof(c10::Half)),
-          static_cast<uint32_t>(kN * sizeof(c10::Half)), 0,
-          /*partition=*/0, /*dtype_mode=*/1});
-  kernel->set_regs(24, static_cast<uint16_t>(output1_spm_addr));
-  kernel->set_regs(25, static_cast<uint16_t>(output1_spm_addr >> 16));
+  if (fp16) {
+    rpu_wall_fp16_retained::write(*kernel, retained_args);
+  } else {
+    rpu_pl_tiling::set_parallel_linear_regs(*kernel, linear_args);
+    rpu_pl_tiling::set_u32_reg_pair(*kernel, 48, retained_args.second_input);
+    rpu_pl_tiling::set_u32_reg_pair(*kernel, 50, output1_spm_addr);
+    kernel->set_regs(52, static_cast<uint16_t>(kM / 2));
+  }
   register_writer.write(*kernel);
 
   auto* queue = GET_QUEUE(NUM_CORES);
   queue->set_broadcast_mode(true);
   const std::vector<uint8_t> cores{0, 1, 2, 3, 4, 5, 6, 7};
-  queue->enqueu_kernel(*kernel, {32, 1, 1}, cores);
+  queue->enqueu_kernel(*kernel, {selected.grid_x, selected.grid_y, 1}, cores);
 }
 
 void rpu_launch_wall_prefill_oproj_w8a16_c320x2_spm_kernel(
@@ -8947,13 +9223,10 @@ void rpu_launch_wall_prefill_oproj_w8a16_c320x2_spm_kernel(
               "Wall Prefill O-proj C320x2 requires distinct non-zero input "
               "and output SPM buffers");
 
-  const bool activation_reuse = sorting.prefill_row_reuse;
-  const KernelId kernel_id = fp16
-      ? (activation_reuse ? KernelId::WALL_PREFILL_ROW_FP16_M160X4N96K128
-                          : KernelId::WALL_PREFILL_OPROJ_FP16_C320X2_N64K128)
-      : activation_reuse
-      ? KernelId::WALL_PREFILL_ROW_W8A16_M160X4N96K128
-      : KernelId::WALL_OPROJ_WEIGHT_OUTER_W8A16_C320X2_N64;
+  const auto selected = rpu_pi_wall::select(rpu_pi_wall::Operation::PairedLinear,
+      fp16 ? rpu_pl_tiling::WeightType::Fp16 : rpu_pl_tiling::WeightType::Int8,
+      false, kM / 2, kN, kLocalK);
+  const auto kernel_id = pi_wall_kernel_id(selected.ordinal);
   auto register_writer =
       wall_precision_registers(
           kernel_id, fp16,
@@ -8993,19 +9266,16 @@ void rpu_launch_wall_prefill_oproj_w8a16_c320x2_spm_kernel(
           static_cast<uint32_t>(kLocalK), 0, NUM_CORES,
           static_cast<uint32_t>(kLocalK * sizeof(c10::Half)),
           static_cast<uint32_t>(kN * sizeof(c10::Half)), 0,
-          /*partition=*/0, /*dtype_mode=*/1});
-  kernel->set_regs(24, static_cast<uint16_t>(output1_spm_addr));
-  kernel->set_regs(25, static_cast<uint16_t>(output1_spm_addr >> 16));
+          /*partition=*/0, /*dtype_mode=*/static_cast<uint16_t>(fp16 ? 2 : 1)});
+  rpu_pl_tiling::set_u32_reg_pair(*kernel, 48, input0_spm_addr + (kM / 2) * kLocalK * sizeof(c10::Half));
+  rpu_pl_tiling::set_u32_reg_pair(*kernel, 50, output1_spm_addr);
+  kernel->set_regs(52, static_cast<uint16_t>(kM / 2));
   register_writer.write(*kernel);
 
   auto* queue = GET_QUEUE(NUM_CORES);
   queue->set_broadcast_mode(true);
   const std::vector<uint8_t> cores{0, 1, 2, 3, 4, 5, 6, 7};
-  if (activation_reuse) {
-    queue->enqueu_kernel(*kernel, {22, 1, 1}, cores);
-  } else {
-    queue->enqueu_kernel(*kernel, {32, 1, 1}, cores);
-  }
+  queue->enqueu_kernel(*kernel, {selected.grid_x, selected.grid_y, 1}, cores);
 }
 
 
@@ -9014,10 +9284,21 @@ static void launch_pi05_denoise_gate_up_geglu_nvfp4_m50(
     const at::Tensor& up_weight, uint32_t output,
     const at::Tensor& gate_scale, const at::Tensor& up_scale,
     uint32_t gate_tensor_scale, uint32_t up_tensor_scale, uint16_t layer,
-    KernelId id) {
-  constexpr int64_t kM = 50, kN = 4096, kK = 1024, kLocalN = 512;
+    KernelId id, int64_t rows, uint32_t gate_spm_scale = 0, uint32_t up_spm_scale = 0,
+    const Pi05AdaRmsNormOperands* norm = nullptr) {
+  constexpr int64_t kN = 4096, kK = 1024, kLocalN = 512;
   static_assert(NUM_CORES == 8, "Pi NVFP4 GeGLU requires TP8");
   TORCH_CHECK(layer < 18, "Pi NVFP4 GeGLU requires layer<18");
+  TORCH_CHECK(pi05_action_rows_admitted(rows),
+              "Pi NVFP4 GeGLU admits action horizon 50 or 10");
+  // The fused payload's norm blocks are the first ceil(rows / 2) of its 8.
+  const bool norm_fused =
+      id == KernelId::PI05_DENOISE_ADARMS_GATE_UP_GEGLU_NVFP4_ACC16_M16N64K128_DB_SSPM;
+  TORCH_CHECK(norm_fused == (norm != nullptr) && (!norm_fused || rows <= 16),
+              "Pi NVFP4 GeGLU folds an AdaRMS norm only into its M<=16 norm payload");
+  TORCH_CHECK(!norm_fused || (std::isfinite(norm->eps) && norm->eps > 0 && norm->eps <= 1.0),
+              "Pi NVFP4 GeGLU AdaRMS norm requires finite eps in (0,1]");
+  const int64_t kM = rows;
   for (const auto* weight : {&gate_weight, &up_weight}) {
     TORCH_CHECK(weight->defined() && weight->device().type() == at::kPrivateUse1 &&
                     weight->scalar_type() == at::kByte && weight->is_contiguous() &&
@@ -9026,11 +9307,18 @@ static void launch_pi05_denoise_gate_up_geglu_nvfp4_m50(
                     weight->nbytes() == kN * kK / 2,
                 "Pi NVFP4 GeGLU requires packed device uint8 [4096,512] weights");
   }
+  // A tile-layout companion is a 4096-byte aligned view into a larger owner.
+  const bool spm_scaled = norm_fused ||
+      id == KernelId::PI05_NVFP4_GEGLU_DB_SSPM;
+  const bool tile_scaled =
+      spm_scaled || id == KernelId::PI05_NVFP4_GEGLU_DB_TSCALE;
   for (const auto* scale : {&gate_scale, &up_scale}) {
     TORCH_CHECK(scale->defined() && scale->device().type() == at::kPrivateUse1 &&
                     scale->scalar_type() == at::kByte && scale->is_contiguous() &&
-                    scale->storage_offset() == 0 &&
-                    scale->sizes() == at::IntArrayRef({kK / 16, kN}) &&
+                    (tile_scaled || scale->storage_offset() == 0) &&
+                    (scale->sizes() == at::IntArrayRef({kK / 16, kN}) ||
+                     (tile_scaled &&
+                      scale->sizes() == at::IntArrayRef({kLocalN / 64, kK / 128, 8, 512}))) &&
                     scale->nbytes() == kK / 16 * kN,
                 "Pi NVFP4 GeGLU requires striped-v2 FP8 device uint8 [64,4096] scales");
   }
@@ -9040,8 +9328,14 @@ static void launch_pi05_denoise_gate_up_geglu_nvfp4_m50(
       {input, kM * kK * sizeof(c10::Half)},
       {output, kM * kLocalN * sizeof(c10::Half)},
       {gate_tensor_scale, 24 * sizeof(float)},
-      {up_tensor_scale, 24 * sizeof(float)}};
-  for (size_t i = 0; i < 4; ++i) {
+      {up_tensor_scale, 24 * sizeof(float)},
+      {gate_spm_scale, kK / 16 * kN / NUM_CORES},
+      {up_spm_scale, kK / 16 * kN / NUM_CORES},
+      // The norm reads these and writes `input`, which the GeGLU then reads.
+      {norm ? norm->input : 0, kM * kK * sizeof(c10::Half)},
+      {norm ? norm->scale : 0, kK * sizeof(c10::Half)},
+      {norm ? norm->shift : 0, kK * sizeof(c10::Half)}};
+  for (size_t i = 0; i < (norm_fused ? 9u : spm_scaled ? 6u : 4u); ++i) {
     const auto [address, bytes] = slabs[i];
     TORCH_CHECK(address != 0 && address >= spm_base && address % 256 == 0 &&
                     address - spm_base + bytes <= SpmAllocator::SPM_USABLE,
@@ -9049,7 +9343,7 @@ static void launch_pi05_denoise_gate_up_geglu_nvfp4_m50(
     for (size_t j = 0; j < i; ++j) {
       TORCH_CHECK(address + bytes <= slabs[j].first ||
                       slabs[j].first + slabs[j].second <= address,
-                  "Pi NVFP4 GeGLU requires disjoint input/output/tensor-scale slabs");
+                  "Pi NVFP4 GeGLU requires disjoint input/output/tensor-scale/scale/norm slabs");
     }
   }
   for (const auto* tensor : {&gate_weight, &up_weight, &gate_scale, &up_scale}) {
@@ -9058,16 +9352,35 @@ static void launch_pi05_denoise_gate_up_geglu_nvfp4_m50(
     TORCH_CHECK(address != 0 && address % 256 == 0 && (address >> 8) <= UINT32_MAX,
                 "Pi NVFP4 GeGLU requires aligned shift8 DDR operands");
   }
-  auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(id,
-      std::vector<GraphDdrRegisterOperandSpec>{
-          {{GraphDdrRegisterRole::PackedFp4ModelWeight, GraphDdrRegisterAccess::Read,
-            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3}, gate_weight},
-          {{GraphDdrRegisterRole::Fp8BlockScale, GraphDdrRegisterAccess::Read,
-            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 20, 21}, gate_scale},
-          {{GraphDdrRegisterRole::PackedFp4ModelWeight, GraphDdrRegisterAccess::Read,
-            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33}, up_weight},
-          {{GraphDdrRegisterRole::Fp8BlockScale, GraphDdrRegisterAccess::Read,
-            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 34, 35}, up_scale}});
+  if (id == KernelId::PI05_NVFP4_GEGLU_DB_TSCALE) {
+    TORCH_CHECK(RpuGetDevAddr(gate_scale.data_ptr()) % 4096 == 0 &&
+                    RpuGetDevAddr(up_scale.data_ptr()) % 4096 == 0,
+                "Pi tile-contiguous scales require 4096-byte aligned DDR owners");
+  }
+  std::vector<GraphDdrRegisterOperandSpec> ddr_operands{
+      {{GraphDdrRegisterRole::PackedFp4ModelWeight, GraphDdrRegisterAccess::Read,
+        GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3}, gate_weight},
+      {{GraphDdrRegisterRole::Fp8BlockScale, GraphDdrRegisterAccess::Read,
+        GraphDdrRegisterEncoding::DevAddrShift8LoHi, 20, 21}, gate_scale},
+      {{GraphDdrRegisterRole::PackedFp4ModelWeight, GraphDdrRegisterAccess::Read,
+        GraphDdrRegisterEncoding::DevAddrShift8LoHi, 32, 33}, up_weight},
+      {{GraphDdrRegisterRole::Fp8BlockScale, GraphDdrRegisterAccess::Read,
+        GraphDdrRegisterEncoding::DevAddrShift8LoHi, 34, 35}, up_scale}};
+  // The SPM-scale payload holds SPM addresses in 20/21 and 34/35 instead.
+  if (spm_scaled) {
+    ddr_operands.erase(ddr_operands.begin() + 3);
+    ddr_operands.erase(ddr_operands.begin() + 1);
+  }
+  // The split siblings run the Gate slices on blocks 0..7 and the Up slices on
+  // 8..15: the same registers but param64, the same counters and bytes.
+  const bool split = spm_scaled && pi05_nvfp4_geglu_split(norm_fused);
+  const uint16_t grid = split ? 16 : 8;
+  if (split) {
+    id = norm_fused
+        ? KernelId::PI05_DENOISE_ADARMS_GATE_UP_GEGLU_NVFP4_ACC16_M16N64K128_DB_SSPM_SPLIT
+        : KernelId::PI05_DENOISE_GATE_UP_GEGLU_NVFP4_ACC16_M64N64K128_DB_SSPM_SPLIT;
+  }
+  auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(id, std::move(ddr_operands));
   auto* kernel = GET_KERNEL(id);
   TORCH_CHECK(kernel, "Pi NVFP4 GeGLU kernel missing from expansion REF");
   kernel->reset_regs();
@@ -9078,8 +9391,16 @@ static void launch_pi05_denoise_gate_up_geglu_nvfp4_m50(
   u16(14, 0); u16(15, NUM_CORES); u32(16, kK * 2); u32(18, kLocalN * 2);
   u32(22, NUM_CORES * kLocalN * 2); u32(24, gate_tensor_scale);
   u16(26, 1); u16(27, layer); u32(36, up_tensor_scale);
-  u16(64, 8); u16(65, 1); u16(66, 1);
-  if (id == KernelId::PI05_DENOISE_GATE_UP_GEGLU_NVFP4_ACC16_M320N64K128) {
+  u16(64, grid); u16(65, 1); u16(66, 1);
+  if (spm_scaled) { u32(20, gate_spm_scale); u32(34, up_spm_scale); }
+  if (norm_fused) {
+    // The row-pair norm's register image, moved up by 40; its output is `input`.
+    u16(40, kK); u16(41, c10::Half(1.0f / kK).x); u16(42, kK * 2); u16(43, 0);
+    u32(44, norm->input); u32(46, input); u32(48, norm->scale);
+    u16(50, c10::Half(norm->eps).x); u32(52, norm->shift); u16(54, kM);
+  }
+  if (id == KernelId::PI05_DENOISE_GATE_UP_GEGLU_NVFP4_ACC16_M320N64K128 ||
+      id == KernelId::PI05_NVFP4_GEGLU_DB || tile_scaled) {
     // The Up-to-GeGLU warp barrier owns core counters 0/1 for this launch.
     // Atomic counters are 32-bit pairs of halfword registers, not SCM slots.
     kernel->set_regs(128, uint32_t{0});
@@ -9088,29 +9409,65 @@ static void launch_pi05_denoise_gate_up_geglu_nvfp4_m50(
   writer.write(*kernel);
   auto* queue = GET_QUEUE(NUM_CORES);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel, {8, 1, 1}, {0,1,2,3,4,5,6,7});
+  queue->enqueu_kernel(*kernel, {grid, 1, 1}, {0,1,2,3,4,5,6,7});
 }
 
 void rpu_launch_pi05_denoise_gate_up_geglu_nvfp4_m50_kernel(
     uint32_t input, const at::Tensor& gate_weight,
     const at::Tensor& up_weight, uint32_t output,
     const at::Tensor& gate_scale, const at::Tensor& up_scale,
-    uint32_t gate_tensor_scale, uint32_t up_tensor_scale, uint16_t layer) {
+    uint32_t gate_tensor_scale, uint32_t up_tensor_scale, uint16_t layer,
+    int64_t rows) {
   launch_pi05_denoise_gate_up_geglu_nvfp4_m50(
       input, gate_weight, up_weight, output, gate_scale, up_scale,
       gate_tensor_scale, up_tensor_scale, layer,
-      KernelId::PI05_DENOISE_GATE_UP_GEGLU_NVFP4_M320N64K128);
+      KernelId::PI05_DENOISE_GATE_UP_GEGLU_NVFP4_M320N64K128, rows);
 }
 
 void rpu_launch_pi05_denoise_gate_up_geglu_nvfp4_acc16_m50_kernel(
     uint32_t input, const at::Tensor& gate_weight,
     const at::Tensor& up_weight, uint32_t output,
     const at::Tensor& gate_scale, const at::Tensor& up_scale,
-    uint32_t gate_tensor_scale, uint32_t up_tensor_scale, uint16_t layer) {
+    uint32_t gate_tensor_scale, uint32_t up_tensor_scale, uint16_t layer,
+    int64_t rows, const at::Tensor& gate_tile_scale, const at::Tensor& up_tile_scale,
+    uint32_t gate_spm_scale, uint32_t up_spm_scale, const Pi05AdaRmsNormOperands* norm) {
+  const bool double_buffered = pi05_nvfp4_acc16_geglu_double_buffered(rows);
+  // The tile-scale sibling reads both scales from the layer's companions;
+  // planning names the same payload (pi05_nvfp4_geglu_m50_arguments).
+  const bool tile_scaled = double_buffered && pi05_nvfp4_acc16_geglu_tile_scale();
+  TORCH_CHECK(!tile_scaled ||
+                  (gate_tile_scale.defined() && up_tile_scale.defined() &&
+                   gate_tile_scale.device() == gate_scale.device() &&
+                   up_tile_scale.device() == up_scale.device()),
+              "Pi NVFP4 GeGLU tile-scale payload requires the Gate/Up tile-scale companions");
+  const bool spm_scaled = gate_spm_scale != 0;
+  TORCH_CHECK((gate_spm_scale != 0) == (up_spm_scale != 0) && (!spm_scaled || tile_scaled),
+              "Pi NVFP4 GeGLU SPM scales require both slabs on the tile-scale payload");
+  TORCH_CHECK(!norm || (spm_scaled && pi05_adarms_geglu_fused(rows)),
+              "Pi NVFP4 GeGLU folds the AdaRMS norm only into its loaded SPM-scale norm payload");
+  launch_pi05_denoise_gate_up_geglu_nvfp4_m50(
+      input, gate_weight, up_weight, output,
+      tile_scaled ? gate_tile_scale : gate_scale, tile_scaled ? up_tile_scale : up_scale,
+      gate_tensor_scale, up_tensor_scale, layer,
+      norm ? KernelId::PI05_DENOISE_ADARMS_GATE_UP_GEGLU_NVFP4_ACC16_M16N64K128_DB_SSPM
+      : spm_scaled ? KernelId::PI05_NVFP4_GEGLU_DB_SSPM
+      : tile_scaled ? KernelId::PI05_NVFP4_GEGLU_DB_TSCALE
+      : double_buffered ? KernelId::PI05_NVFP4_GEGLU_DB
+                        : KernelId::PI05_DENOISE_GATE_UP_GEGLU_NVFP4_ACC16_M320N64K128,
+      rows, gate_spm_scale, up_spm_scale, norm);
+}
+
+void rpu_launch_pi05_nvfp4_geglu_db_candidate_kernel(
+    uint32_t input, const at::Tensor& gate_weight,
+    const at::Tensor& up_weight, uint32_t output,
+    const at::Tensor& gate_scale, const at::Tensor& up_scale,
+    uint32_t gate_tensor_scale, uint32_t up_tensor_scale, uint16_t layer,
+    bool tile_contiguous) {
   launch_pi05_denoise_gate_up_geglu_nvfp4_m50(
       input, gate_weight, up_weight, output, gate_scale, up_scale,
       gate_tensor_scale, up_tensor_scale, layer,
-      KernelId::PI05_DENOISE_GATE_UP_GEGLU_NVFP4_ACC16_M320N64K128);
+      tile_contiguous ? KernelId::PI05_NVFP4_GEGLU_DB_TSCALE
+                      : KernelId::PI05_NVFP4_GEGLU_DB, /*rows=*/50);
 }
 
 static void launch_wall_base_nvfp4_gate_up_parallel(
@@ -9767,54 +10124,146 @@ void rpu_launch_wall_base_nvfp4_qkv_bias_spm_kernel(
   queue->enqueu_kernel(*kernel, {4, 1, 1}, {0, 1, 2, 3, 4, 5, 6, 7});
 }
 
-static void launch_action_nvfp4_v2_kernel(
-    uint32_t input, const at::Tensor& weight, uint32_t output,
-    int64_t rows, int64_t n, int64_t k, int partition, int cores,
-    const at::Tensor& scale, uint32_t tensor_scale, uint16_t layer,
-    bool linear_acc32) {
+static ActionNvfp4V2Plan plan_action_nvfp4_v2(
+    const at::Tensor& weight, const at::Tensor& scale, int64_t rows, int64_t n,
+    int64_t k, int partition, int cores, bool linear_acc32, bool pi05,
+    const at::Tensor& tile_scale, uint32_t spm_scale, int db_candidate) {
   const bool col = partition == 1;
-  TORCH_CHECK((col && k == 1024 && (n == 2048 || n == 4096)) ||
-                  (partition == 0 && n == 1024 && (k == 2048 || k == 4096)),
+  TORCH_CHECK(cores == 4 || cores == 6 || cores == 8,
+              "Action NVFP4 v2 requires 4, 6 or 8 lanes");
+  // Q/O keep 2048; the MLP is 4096, or its zero-padded six-lane width.
+  const int64_t mlp = v3::pi05_mlp_physical_size(
+      4096, cores, v3::Pi05ReducedPrecision::NVFP4);
+  const int64_t ln = col ? n / cores : n, lk = col ? k : k / cores;
+  // An explicit DB candidate (1, or 2 for a full tile-contiguous scale owner)
+  // names its payload instead of the Pi routing below.
+  const bool candidate_tscale = db_candidate == 2;
+  TORCH_CHECK(db_candidate >= 0 && db_candidate <= 2 &&
+                  (db_candidate == 0 || (!linear_acc32 && cores == 8 &&
+                   rows > 0 && rows <= 64 && ln % 64 == 0 && lk % 128 == 0)),
+              "Pi DB candidate requires ACC16/TP8/M<=64 and full N64/K128 tiles");
+  TORCH_CHECK((col && k == 1024 && (n == 2048 || n == mlp) && n % (cores * 16) == 0) ||
+                  (partition == 0 && n == 1024 && (k == 2048 || k == mlp) &&
+                   k % (cores * 64) == 0),
               "Action NVFP4 v2 requires admitted projection geometry");
   TORCH_CHECK(weight.scalar_type() == at::kByte && scale.scalar_type() == at::kByte &&
                   weight.device().type() == at::kPrivateUse1 && scale.device() == weight.device() &&
                   weight.is_contiguous() && scale.is_contiguous() &&
                   weight.sizes() == at::IntArrayRef({n, k / 2}) &&
-                  scale.sizes() == at::IntArrayRef({k / 16, n}),
+                  (candidate_tscale
+                      ? scale.sizes() == at::IntArrayRef({ln / 64, lk / 128, 8, 512})
+                      : scale.sizes() == at::IntArrayRef({k / 16, n})),
               "Action NVFP4 v2 packed weight/FP8 scale shape, dtype or device mismatch");
-  const int64_t ln = col ? n / cores : n, lk = col ? k : k / cores;
-  const bool gate_up = col && n == 4096;
-  const auto tile = linear_acc32
+  if (candidate_tscale) {
+    TORCH_CHECK(RpuGetDevAddr(scale.data_ptr()) % 4096 == 0,
+                "Pi tile-contiguous scale requires a 4096-byte aligned full owner");
+  }
+  const bool gate_up = col && n == mlp;
+  const auto tile = db_candidate ? rpu_pl_tiling::TilePick{64, 64, 128} : linear_acc32
       ? rpu_pl_tiling::TilePick{gate_up ? 48 : 64, gate_up ? 384 : 320}
       : rpu_pl_tiling::select_tile_nvfp4_acc16(rows, ln, lk);
-  const uint16_t nt = tile.n_tile, mt = tile.m_tile;
-  const auto id = linear_acc32
+  // Pi rows <= 64 on the M320N64 tile may take its double-buffered sibling,
+  // which has the same register ABI and output bytes.
+  const bool double_buffered = !db_candidate && pi05 && !linear_acc32 && cores == 8 &&
+      ln % 64 == 0 && lk % 128 == 0 && tile.n_tile == 64 && tile.m_tile == 320 &&
+      pi05_nvfp4_acc16_linear_double_buffered(rows);
+  // That sibling reads the same scales from a tile-contiguous companion when
+  // the caller installed one (rpu_pack_pi05_nvfp4_tile_scale).
+  const bool tile_scaled = double_buffered && tile_scale.defined();
+  TORCH_CHECK(!tile_scaled ||
+                  (tile_scale.scalar_type() == at::kByte && tile_scale.device() == scale.device() &&
+                   tile_scale.is_contiguous() && tile_scale.sizes() == scale.sizes() &&
+                   lk % 128 == 0 && ln % 64 == 0),
+              "Action NVFP4 v2 tile-scale companion shape, dtype or device mismatch");
+  // Its SPM-scale sibling reads this core's tiles of the same companion from
+  // the slab at spm_scale, which the caller filled.
+  const bool spm_scaled = spm_scale != 0;
+  TORCH_CHECK(!spm_scaled ||
+                  (tile_scaled && SPM_ALLOC.is_initialized() &&
+                   spm_scale >= SPM_ALLOC.addr(0, 0) && spm_scale % 256 == 0 &&
+                   uint64_t{spm_scale - SPM_ALLOC.addr(0, 0)} + k / 16 * n / cores <= SpmAllocator::SPM_USABLE),
+              "Action NVFP4 v2 SPM scale requires the tile-scale payload and an in-range slab");
+  const uint16_t nt = tile.n_tile, mt = double_buffered ? 64 : tile.m_tile;
+  const auto id = db_candidate
+      ? (candidate_tscale ? KernelId::PI05_NVFP4_LINEAR_DB_TSCALE : KernelId::PI05_NVFP4_LINEAR_DB)
+      : linear_acc32
       ? (gate_up ? KernelId::PARALLEL_LINEAR_NVFP4_V2_M384N48
                  : KernelId::PARALLEL_LINEAR_NVFP4_V2_M320N64)
-      : autotile_nvfp4_acc16_kernel_id(tile.n_tile);
-  auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(id,
-      std::vector<GraphDdrRegisterOperandSpec>{
-          {{GraphDdrRegisterRole::PackedFp4ModelWeight, GraphDdrRegisterAccess::Read,
-            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3}, weight},
-          {{GraphDdrRegisterRole::Fp8BlockScale, GraphDdrRegisterAccess::Read,
-            GraphDdrRegisterEncoding::DevAddrShift8LoHi, 20, 21}, scale}});
-  rpu_ddr_flush(weight.data_ptr());
-  rpu_ddr_flush(scale.data_ptr());
-  auto* kernel = GET_KERNEL(id);
-  TORCH_CHECK(kernel, "Action NVFP4 v2 kernel missing: install the striped-v2 expansion REF");
-  kernel->reset_regs();
-  const auto u16 = [&](int reg, uint16_t value) { kernel->set_regs(reg, value); };
+      : spm_scaled ? KernelId::PI05_NVFP4_LINEAR_DB_SSPM
+      : tile_scaled ? KernelId::PI05_NVFP4_LINEAR_DB_TSCALE
+      : double_buffered ? KernelId::PI05_NVFP4_LINEAR_DB
+                        : autotile_nvfp4_acc16_kernel_id(tile.n_tile);
+  return {id, spm_scaled, tile_scaled ? &tile_scale : &scale, ln, lk,
+          static_cast<uint16_t>((ln + nt - 1) / nt), static_cast<uint16_t>((rows + mt - 1) / mt)};
+}
+
+// Registers 0..27 of the plan's payload; the DDR writer fills 2/3 (and 20/21
+// unless the scales are in SPM).
+template <typename Kernel>
+static void write_action_nvfp4_v2_regs(
+    Kernel& kernel, const ActionNvfp4V2Plan& plan, uint32_t input, uint32_t output,
+    int64_t rows, int partition, int cores, uint32_t tensor_scale, uint16_t layer,
+    uint32_t spm_scale) {
+  const auto u16 = [&](int reg, uint16_t value) { kernel.set_regs(reg, value); };
   const auto u32 = [&](int reg, uint32_t value) { u16(reg, value & 0xffff); u16(reg + 1, value >> 16); };
+  const int64_t ln = plan.ln, lk = plan.lk;
   u32(0, input); u32(4, output); u32(6, 0);
   u16(8, rows); u32(10, ln); u16(12, lk); u16(13, lk / 64);
   u16(14, 0); u16(15, cores); u32(16, lk * 2); u32(18, ln * 2);
-  u32(22, cores * ln * 2); u32(24, tensor_scale); u16(26, col); u16(27, layer);
-  const uint16_t gx = (ln + nt - 1) / nt, gy = (rows + mt - 1) / mt;
-  u16(64, gx); u16(65, gy); u16(66, 1);
+  u32(22, cores * ln * 2); u32(24, tensor_scale); u16(26, partition == 1); u16(27, layer);
+  if (plan.spm_scaled) u32(20, spm_scale);
+}
+
+static void launch_action_nvfp4_v2_kernel(
+    uint32_t input, const at::Tensor& weight, uint32_t output,
+    int64_t rows, int64_t n, int64_t k, int partition, int cores,
+    const at::Tensor& scale, uint32_t tensor_scale, uint16_t layer,
+    bool linear_acc32, bool pi05 = false, const at::Tensor& tile_scale = at::Tensor(),
+    uint32_t spm_scale = 0, const Pi05SplitKvMerge* merge = nullptr, int db_candidate = 0) {
+  const auto plan = plan_action_nvfp4_v2(weight, scale, rows, n, k, partition, cores,
+                                         linear_acc32, pi05, tile_scale, spm_scale,
+                                         db_candidate);
+  const at::Tensor& block_scale = *plan.block_scale;
+  // A merge left by the split-KV attention writes this launch's input rows.
+  // The one-row-block SPM-scale payload has a merge + O sibling, which runs
+  // the merge on blocks [0, merge grid) and this Linear's N64 blocks after
+  // them; any other payload runs after the merge.
+  const bool merge_o = merge != nullptr && plan.id == KernelId::PI05_NVFP4_LINEAR_DB_SSPM &&
+                       plan.gy == 1 && partition == 0;
+  if (merge != nullptr && !merge_o) rpu_launch_pi05_split_kv_merge(*merge);
+  const KernelId id = !merge_o ? plan.id
+      : merge->rot_ov ? KernelId::PI05_SPLIT_KV_MERGE_ROT_OV_O_NVFP4_ACC16_M64N64K128_DB_SSPM
+                      : KernelId::PI05_SPLIT_KV_MERGE_O_NVFP4_ACC16_M64N64K128_DB_SSPM;
+  std::vector<GraphDdrRegisterOperandSpec> ddr_operands{
+      {{GraphDdrRegisterRole::PackedFp4ModelWeight, GraphDdrRegisterAccess::Read,
+        GraphDdrRegisterEncoding::DevAddrShift8LoHi, 2, 3}, weight}};
+  if (!plan.spm_scaled) {
+    ddr_operands.push_back(
+        {{GraphDdrRegisterRole::Fp8BlockScale, GraphDdrRegisterAccess::Read,
+          GraphDdrRegisterEncoding::DevAddrShift8LoHi, 20, 21}, block_scale});
+  }
+  auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(id, std::move(ddr_operands));
+  rpu_ddr_flush(weight.data_ptr());
+  rpu_ddr_flush(block_scale.data_ptr());
+  auto* kernel = GET_KERNEL(id);
+  TORCH_CHECK(kernel, "Action NVFP4 v2 kernel missing: install the striped-v2 expansion REF");
+  kernel->reset_regs();
+  write_action_nvfp4_v2_regs(*kernel, plan, input, output, rows, partition, cores,
+                             tensor_scale, layer, spm_scale);
+  uint16_t gx = plan.gx;
+  if (merge_o) {
+    // The Linear's blocks wait at core counter 0 for every merge block.
+    gx += pi05_split_kv_write_merge_o_regs(kernel, *merge);
+    kernel->set_regs(128, uint32_t{0});
+    kernel->set_regs(130, uint32_t{0});
+  }
+  kernel->set_regs(64, gx); kernel->set_regs(65, plan.gy); kernel->set_regs(66, uint16_t{1});
   writer.write(*kernel);
   auto* queue = GET_QUEUE(cores);
   queue->set_broadcast_mode(true);
-  queue->enqueu_kernel(*kernel, {gx, gy, uint16_t{1}}, {0,1,2,3,4,5,6,7});
+  std::vector<uint8_t> core_list;
+  for (int core = 0; core < cores; ++core) core_list.push_back(core);
+  queue->enqueu_kernel(*kernel, {gx, plan.gy, uint16_t{1}}, core_list);
 }
 
 
@@ -9822,11 +10271,48 @@ void rpu_launch_pi05_nvfp4_v2_kernel(
     uint32_t input, const at::Tensor& weight, uint32_t output,
     int64_t rows, int64_t n, int64_t k, int partition, int cores,
     const at::Tensor& scale, uint32_t tensor_scale, uint16_t layer,
-    bool linear_acc32) {
-  TORCH_CHECK(cores == 8 && rows > 0 && rows <= 64 && layer < 18 && tensor_scale != 0,
-              "Pi05 NVFP4 v2 requires TP8, <=64 action rows, layer<18 and tensor-scale SPM");
+    bool linear_acc32, const at::Tensor& tile_scale, uint32_t spm_scale,
+    const Pi05SplitKvMerge* merge) {
+  TORCH_CHECK((cores == 4 || cores == 6 || cores == 8) && rows > 0 && rows <= 64 &&
+                  layer < 18 && tensor_scale != 0 &&
+                  (cores == 8 || (!tile_scale.defined() && spm_scale == 0 && merge == nullptr)),
+              "Pi05 NVFP4 v2 requires 4, 6 or 8 lanes, <=64 action rows, layer<18 and tensor-scale SPM");
+  TORCH_CHECK(merge == nullptr ||
+                  (cores == 8 && merge->plan.seq_q == rows && SPM_ALLOC.addr(0, merge->output_off) == input),
+              "Pi05 NVFP4 v2 input rows differ from the deferred merge's output");
   launch_action_nvfp4_v2_kernel(input, weight, output, rows, n, k, partition,
-                               cores, scale, tensor_scale, layer, linear_acc32);
+                               cores, scale, tensor_scale, layer, linear_acc32,
+                               /*pi05=*/true, tile_scale, spm_scale, merge);
+}
+
+void rpu_launch_pi05_nvfp4_db_candidate_kernel(
+    uint32_t input, const at::Tensor& weight, uint32_t output,
+    int64_t rows, int64_t n, int64_t k, int partition, int cores,
+    const at::Tensor& scale, uint32_t tensor_scale, uint16_t layer,
+    bool tile_contiguous) {
+  TORCH_CHECK(cores == 8 && rows > 0 && rows <= 64 && layer < 18 &&
+                  tensor_scale != 0 && (partition == 0 || partition == 1),
+              "Pi DB candidate requires bounded Action projection geometry");
+  const bool col = partition == 1;
+  TORCH_CHECK((col && k == 1024 && (n == 2048 || n == 4096)) ||
+                  (!col && n == 1024 && (k == 2048 || k == 4096)),
+              "Pi DB candidate requires admitted Q/O/Down projection geometry");
+  const size_t input_bytes = rows * (col ? k : k / cores) * sizeof(c10::Half);
+  const size_t output_bytes = rows * (col ? n / cores : n) * sizeof(c10::Half);
+  constexpr size_t table_bytes = 24 * sizeof(float);
+  check_pi05_resident_spm(input, input_bytes);
+  check_pi05_resident_spm(output, output_bytes);
+  check_pi05_resident_spm(tensor_scale, table_bytes);
+  const auto disjoint = [](uint32_t a, size_t a_bytes, uint32_t b, size_t b_bytes) {
+    return uint64_t(a) + a_bytes <= b || uint64_t(b) + b_bytes <= a;
+  };
+  TORCH_CHECK(disjoint(input, input_bytes, output, output_bytes) &&
+                  disjoint(input, input_bytes, tensor_scale, table_bytes) &&
+                  disjoint(output, output_bytes, tensor_scale, table_bytes),
+              "Pi DB candidate input/output/tensor-scale SPM intervals overlap");
+  launch_action_nvfp4_v2_kernel(input, weight, output, rows, n, k, partition,
+      cores, scale, tensor_scale, layer, false, /*pi05=*/false, at::Tensor(), 0,
+      nullptr, tile_contiguous ? 2 : 1);
 }
 
 void rpu_launch_g05_nvfp4_v2_kernel(
@@ -9834,9 +10320,11 @@ void rpu_launch_g05_nvfp4_v2_kernel(
     int64_t rows, int64_t n, int64_t k, int partition, int cores,
     const at::Tensor& scale, uint32_t tensor_scale, uint16_t layer,
     bool linear_acc32) {
-  TORCH_CHECK(cores == 8 && rows == 32 && layer < 24 &&
+  // Eight lanes, or the four-lane reduced G05 action; the shared launcher
+  // splits N or K by the same lane count.
+  TORCH_CHECK((cores == 4 || cores == 8) && rows == 32 && layer < 24 &&
                   tensor_scale != 0 && tensor_scale % 32 == 0,
-              "G05 NVFP4 v2 requires exact TP8/M32, layer<24 and aligned tensor-scale SPM");
+              "G05 NVFP4 v2 requires TP4/TP8 M32, layer<24 and aligned tensor-scale SPM");
   const bool col = partition == 1;
   TORCH_CHECK((col && k == 1024 && (n == 2048 || n == 4096)) ||
                   (partition == 0 && n == 1024 && (k == 2048 || k == 4096)),

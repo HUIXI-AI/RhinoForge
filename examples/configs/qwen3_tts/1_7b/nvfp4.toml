@@ -1,0 +1,44 @@
+[model]
+target = "qwen3_tts"
+# 本文件的权重/计算配方；切换精度须同时使用对应权重。
+precision = "nvfp4"
+checkpoint = "/path/to/Qwen3-TTS-12Hz-1.7B-Base"
+source = "/path/to/qwen3-tts-prepared/qwen_tts"
+# 可选 rpu / cpu；保持与所选 codec 执行路径一致。
+codec_backend = "rpu"
+
+[rpu_execution.model]
+# RPU 核数预算。可选 4 / 6 / 8，默认 8；修改后需重新加载模型。
+# 6 核时文本组件分配为 Attention 4、MLP 6、输出头 4。
+# codec Transformer 在 4/6 核下用 4 核。实际分配见模型页配置表的“4 核 / 6 核”列。
+num_cores = 8
+
+[rpu_execution.prefill]
+# Linear 累加精度。false 为 ACC16，true 为 ACC32；不改变权重位宽。
+# 省略时默认 false（ACC16）。修改后需重新加载模型。
+linear_acc32 = false
+
+[input]
+# 非空文本，最多 1024 字符；长文本由运行器分段。
+text = "你好，欢迎使用语音助手。"
+# 单声道 24 kHz，0.5–20 秒；有限且非静音。
+reference_audio = "/path/to/mono-24k.wav"
+# 可选 Chinese / English。
+language = "Chinese"
+# 每段生成上限 2–256；达到上限仍无 EOS 会报错。
+max_new_tokens = 256
+
+[cpu]
+# CPU intra-op 线程数，正整数；与 RPU 核数无关。
+# 省略时本入口使用 16。
+threads = 16
+
+[run]
+# 预热次数；不计入正式测量。
+warmup = 2
+# 正式执行次数，正整数。
+runs = 5
+# 随机种子，非负整数。
+seed = 0
+# 结果输出目录；并发运行使用不同目录。
+output_dir = "/tmp/qwen3-tts-1_7b-nvfp4-result"

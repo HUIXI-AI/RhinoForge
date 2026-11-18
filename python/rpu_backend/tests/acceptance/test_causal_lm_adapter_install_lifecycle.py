@@ -130,7 +130,7 @@ class _NativeReconfigureOps:
 def _prepare_case(monkeypatch, module, model, *, postinstall_error=None):
     events = model._events
     if module in (qwen3, llama):
-        monkeypatch.setattr(module, 'require_native_backend', lambda: None)
+        monkeypatch.setattr(module, "require_native_backend", lambda: None)
     if module is minimal_causal_lm:
         monkeypatch.setattr(module, 'HF_ARCH', 'FixtureForCausalLM')
         monkeypatch.setattr(module, 'DECODER_ARCH', 'llama')

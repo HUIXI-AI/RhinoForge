@@ -4,6 +4,97 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_conv_slab_uses_compact_dma_and_new_abi_row_pitch(tmp_path):
+    """Execute the merged geometry, DMA call and register writer on the host."""
+    import subprocess
+    from test_fmb_standalone_layout_rebuild import _definition
+
+    source = (ROOT / "src/ops/rpu_linear.cpp").read_text()
+    body = _definition(source, "void rpu_launch_linear_ddr_kernel(")
+    geometry = body[body.index("  const size_t a_dwidth ="):body.index("  c10::Half *xp =")]
+    start = body.index("      rpu_launch_ddr_broadcast_spm_dma(xp + row0 * in_pitch,")
+    upload = body[start:body.index(";", start) + 1]
+    start = body.index("      rpu_launch_linear_spm_to_spm_kernel(")
+    launch = body[start:body.index(";", start) + 1]
+    shared = _definition(source, "void rpu_launch_linear_spm_to_spm_kernel(")
+    shared_geometry = shared[shared.index("  size_t dwidth ="):shared.index("  auto tile =")]
+    start = shared.index("  rpu_pl_tiling::set_parallel_linear_regs(")
+    registers = shared[start:shared.index("  register_writer.write(*kernel);", start)]
+    program = r'''
+#include <cassert>
+#include <cstdint>
+#include <map>
+#include <vector>
+#include "TILING_HEADER"
+namespace c10 { using Half = uint16_t; }
+struct Tensor {
+ size_t rows,columns;
+ size_t size(int axis)const{return axis?columns:rows;}
+ size_t element_size()const{return 2;}
+};
+struct LinearConv1dSlab {int64_t channels,taps,dilation;};
+struct Kernel {
+ std::map<int,uint16_t> regs;
+ void set_regs(int slot,uint16_t value){regs[slot]=value;}
+ uint32_t u32(int slot)const{return uint32_t(regs.at(slot))|(uint32_t(regs.at(slot+1))<<16);}
+};
+const uint16_t* uploaded=nullptr;size_t uploaded_elements=0;
+void rpu_launch_ddr_broadcast_spm_dma(const uint16_t* src,size_t count,uint32_t addr,int cores){
+ assert(addr==4096&&cores==8);uploaded=src;uploaded_elements=count;
+}
+Kernel actual;
+void rpu_launch_linear_spm_to_spm_kernel(uint32_t input_spm_addr,const Tensor& weight,
+ uint32_t output_spm_addr,int64_t M,int64_t N,int64_t K,int partition,int num_cores,
+ uint32_t bias_spm_addr,uint32_t input_m_byte_step=0){
+ SHARED_GEOMETRY
+ actual=Kernel{};auto* kernel=&actual;
+ REGISTERS
+}
+void run(bool slab,size_t channels,size_t rows,size_t row0,size_t cur_m){
+ const int partition=1,num_cores=8;
+ const int64_t logical_m=rows,logical_k=slab?7*channels:channels,halo=slab?6:0;
+ Tensor input{rows+size_t(halo),channels},output{rows,1024};
+ const LinearConv1dSlab description{int64_t(channels),7,1};
+ const LinearConv1dSlab* conv_slab=slab?&description:nullptr;
+ GEOMETRY
+ assert(m==rows&&k==size_t(logical_k)&&n==1024&&in_pitch==channels);
+ assert(row0+cur_m<=rows);
+ std::vector<uint16_t> storage(input.rows*input.columns);
+ auto* xp=storage.data();const uint32_t x_addr=4096,y_addr=8192,b_addr=0;
+ UPLOAD
+ assert(uploaded==storage.data()+row0*channels);
+ assert(uploaded_elements==(cur_m+(slab?6:0))*channels);
+ assert(uploaded+uploaded_elements<=storage.data()+storage.size());
+ Tensor weight{n,k};
+ LAUNCH
+ assert(actual.u32(16)==channels*2&&actual.u32(18)==256);
+ assert(actual.regs.at(8)==1&&actual.regs.at(9)==cur_m);
+ assert(actual.regs.at(12)==logical_k&&actual.regs.at(13)==logical_k/16);
+ assert(actual.regs.at(26)==2&&actual.regs.at(27)==2);
+ // The same public helper still supplies the full local-K pitch to ordinary
+ // callers that omit the optional conv pitch.
+ rpu_launch_linear_spm_to_spm_kernel(x_addr,weight,y_addr,cur_m,n,k,
+                                    partition,num_cores,b_addr);
+ assert(actual.u32(16)==logical_k*2);
+}
+int main(){
+ for(bool slab:{false,true})for(size_t channels:{16u,64u,768u}){
+  run(slab,channels,1,0,1);
+  run(slab,channels,17,0,5);
+  run(slab,channels,17,16,1);
+ }
+}
+'''
+    program = program.replace("TILING_HEADER", str(ROOT / "src/ops/rpu_linear_tiling.h"))
+    program = program.replace("SHARED_GEOMETRY", shared_geometry)
+    program = program.replace("GEOMETRY", geometry).replace("UPLOAD", upload)
+    program = program.replace("LAUNCH", launch).replace("REGISTERS", registers)
+    cpp, binary = tmp_path / "conv_slab.cpp", tmp_path / "conv_slab"
+    cpp.write_text(program)
+    subprocess.run(["g++", "-std=c++17", "-O0", str(cpp), "-o", str(binary)], check=True)
+    subprocess.run([str(binary)], check=True)
+
+
 def test_public_linear_into_validates_every_raw_ddr_operand():
     source = (ROOT / "src/ops/rpu_linear.cpp").read_text(encoding="utf-8")
     body = source[
@@ -48,7 +139,7 @@ def test_ddr_linear_publications_cover_dirty_inputs_before_dma(tmp_path):
     source = (ROOT / "src/ops/rpu_linear.cpp").read_text()
     launcher = _definition(source, "void rpu_launch_linear_ddr_kernel(")
     publication = launcher[launcher.index("  uint32_t b_addr = 0;"):
-                           launcher.index("  auto* wq = GET_QUEUE(num_cores);")]
+        launcher.index("  for (size_t row0 = 0;")]
     loop = launcher.index("  for (size_t row0 = 0;")
     upload = launcher[launcher.index("    if (partition == 0) {", loop):
                       launcher.index("    if (w8a16 || w4a16 || !use_acc32)", loop)]
@@ -220,6 +311,11 @@ void transport(const at::Tensor& input,const at::Tensor& weight,const at::Tensor
                size_t m,size_t m_chunk) {
     const size_t k=32,n=32,num_cores=2,a_dwidth=sizeof(c10::Half);
     const size_t local_k=partition==0?k/num_cores:k;
+    // Plain-GEMM geometry: a row spans the whole local K and no halo rows are
+    // staged. Only the conv-slab route narrows the pitch to one channel row and
+    // uploads the extra rows the chunk's last windows reach into.
+    const size_t in_pitch=local_k;
+    const int64_t halo=0;
     const size_t local_n=partition==0?n:n/num_cores;
     const bool kernel_applies_bias=has_bias && partition!=0;
     auto xp=input.data_ptr<c10::Half>();

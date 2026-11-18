@@ -44,7 +44,7 @@ RhinoForge's version. Library SONAME and Python `API_VERSION` track
 compatibility independently of distribution versions.
 
 Runtime contains exactly the main and DDR-expansion operator assets pinned by
-commit and checksum, governed by `op_abi_epoch` (currently `1`, incremented only
+commit and checksum, governed by `op_abi_epoch` (currently `2`, incremented only
 on an incompatible operator payload ABI break). Their component source versions
 need not match the bundle version. Keep each payload and its `.kernels` manifest
 together.
@@ -86,7 +86,7 @@ Launch 自身的开发分支为 `develop`；采用新 Launch 提交时，单独�
 CMake 数值版本不含开发后缀。Launch 的数值版本、完整发行版本和 ABI 按依赖清单
 精确核对，并保留能力检查；它们不要求与 RhinoForge 同号。Launch ABI 和 Python
 API 兼容版本独立维护。依赖清单同时通过 `op_abi_epoch` 标记算子载荷 ABI 纪元（当前为
-`1`，仅在不兼容算子 ABI 变更时递增）；算子资产固定来自 main 与 DDR-expansion 两个分支，
+`2`，仅在不兼容算子 ABI 变更时递增）；算子资产固定来自 main 与 DDR-expansion 两个分支，
 并记录准确 commit 和校验和。发布前检查版本、包装和受影响的构建或运行路径；
 模型评测记录不进入发行资产。
 

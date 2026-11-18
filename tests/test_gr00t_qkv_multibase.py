@@ -1,5 +1,6 @@
 """Execute the exact GR00T QKV launcher's native owner and register ABI on host."""
 from pathlib import Path
+import re
 
 from test_fmb_standalone_layout_rebuild import _definition
 from test_gr00t_ff1_resident_w8 import COMMON, _run
@@ -10,6 +11,9 @@ LINEAR = ROOT / "src/ops/rpu_linear.cpp"
 
 def test_qkv_multibase_native_registers_owners_and_rejections(tmp_path):
     source = LINEAR.read_text()
+    generated = (ROOT / "src/ops/rpu_specialized_linear_contracts.h").read_text()
+    kernel_ids = sorted(set(re.findall(r"KernelId::(\w+)", generated)))
+    generated = generated[generated.index("namespace rpu_specialized_linear {"):]
     functions = "\n".join(_definition(source, marker) for marker in (
         "void check_gr00t_qkv_multibase_spm(",
         "void rpu_launch_gr00t_qkv_multibase_w8_kernel(",
@@ -17,8 +21,10 @@ def test_qkv_multibase_native_registers_owners_and_rejections(tmp_path):
     address_check = _definition(
         (ROOT / "src/graph/graph_register_census.cpp").read_text(),
         "void validate_ddr_register_device_address(")
+    device_boundary = _definition(COMMON, "namespace rhino_lkn{")
+    assert COMMON.count(device_boundary) == 1
     common = COMMON.replace(
-        "namespace rhino_lkn{uint64_t RpuGetDevAddr(void*p){return reinterpret_cast<uint64_t>(p);}}",
+        device_boundary,
         "std::vector<std::pair<void*,uint64_t>> dev_addrs;\n"
         "namespace rhino_lkn{uint64_t RpuGetDevAddr(void*p){"
         "for(auto entry:dev_addrs)if(entry.first==p)return entry.second;"
@@ -33,15 +39,16 @@ def test_qkv_multibase_native_registers_owners_and_rejections(tmp_path):
 __ADDRESS_CHECK__
 struct SpmAllocator{static constexpr size_t SPM_USABLE=8387584;bool init=true;
  bool is_initialized(){return init;}uint32_t addr(int,int){return 0x10000000;}}SPM_ALLOC;
-enum class KernelId{GR00T_QKV_MULTIBASE_W8A16_M592N32K128};
+__CURRENT_CONTRACT__
 constexpr KernelId expected_id=KernelId::GR00T_QKV_MULTIBASE_W8A16_M592N32K128;
-struct Kernel_t{std::array<uint16_t,40>r{};void reset_regs(){r.fill(0);}
+struct Kernel_t{std::array<uint16_t,64>r{};void reset_regs(){r.fill(0);}
  void set_regs(int i,uint16_t v){r.at(i)=v;}}kernel;
 bool payload_present=true;
 Kernel_t*get_kernel(KernelId id){assert(id==expected_id);return payload_present?&kernel:nullptr;}
 struct Queue{bool broadcast=false;int launches=0;void set_broadcast_mode(bool b){broadcast=b;}
- void enqueu_kernel(Kernel_t&k,std::initializer_list<int>grid,std::initializer_list<int>cores){
-  assert(&k==&kernel&&broadcast&&std::vector<int>(grid)==std::vector<int>({18,1,1}));
+ void enqueu_kernel(Kernel_t&k,const std::vector<uint16_t>&grid,std::initializer_list<int>cores){
+  assert(&k==&kernel&&broadcast&&grid==rpu_specialized_linear::grid(expected_id));
+  assert(grid==std::vector<uint16_t>({18,1,1}));
   assert(std::vector<int>(cores)==std::vector<int>({0,1,2,3,4,5,6,7}));++launches;}}queue;
 Queue*get_queue(int cores){assert(cores==8);return &queue;}
 #define GET_KERNEL(id) get_kernel(id)
@@ -57,7 +64,7 @@ struct Writer{std::vector<GraphDdrRegisterOperandSpec>ops;
 struct RpuKernelGraph{int staged=0;std::vector<GraphDdrRegisterOperandSpec>last_ops;
  static RpuKernelGraph&active(){static RpuKernelGraph graph;return graph;}
  Writer stage_kernel_ddr_registers(KernelId id,const std::vector<GraphDdrRegisterOperandSpec>&ops){
-  assert(id==expected_id&&ops.size()==6);const int regs[]={2,20,24,26,32,34};
+  assert(id==expected_id&&ops.size()==6);const int regs[]={2,20,32,34,40,42};
   for(int i=0;i<6;++i){const auto&a=ops[i].abi;
    assert(a.lo==regs[i]&&a.hi==regs[i]+1&&a.access==GraphDdrRegisterAccess::Read);
    assert(a.encoding==GraphDdrRegisterEncoding::DevAddrShift8LoHi);
@@ -67,6 +74,9 @@ struct RpuKernelGraph{int staged=0;std::vector<GraphDdrRegisterOperandSpec>last_
 __FUNCTIONS__
 uint32_t pair_at(int reg){return uint32_t(kernel.r.at(reg))|(uint32_t(kernel.r.at(reg+1))<<16);}
 int main(){
+ const auto contract=rpu_specialized_linear::contract(expected_id);
+ assert(contract.m==592&&contract.n==32&&contract.k==128);
+ assert(contract.gx==18&&contract.gy==1&&contract.gz==1);
  std::array<at::Tensor,6>owners;
  // Independent owners deliberately use unrelated aligned DDR addresses above 4 GiB.
  const std::array<uint64_t,6>devices{0x1256789000ULL,0x2389001200ULL,0x34abcdef00ULL,
@@ -78,7 +88,7 @@ int main(){
                  spm[1],spm[2],spm[3],spm[4],spm[5],spm[6],owners[1],owners[3],owners[5]);};
  auto check=[&]{
   const auto&ops=RpuKernelGraph::active().last_ops;
-  const int regs[]={2,20,24,26,32,34};
+  const int regs[]={2,20,32,34,40,42};
   for(int i=0;i<6;++i){assert(ops[i].tensor.unsafeGetTensorImpl()==owners[i].unsafeGetTensorImpl());
    assert(ops[i].tensor.data_ptr()==owners[i].data_ptr());
    assert(pair_at(regs[i])==RpuGetDevAddr(owners[i].data_ptr())>>8);
@@ -87,12 +97,13 @@ int main(){
   Kernel_t ordinary;rpu_pl_tiling::set_parallel_linear_regs(ordinary,
    {spm[0],RpuGetDevAddr(owners[0].data_ptr()),spm[1],spm[4],41,192,1536,1,8,3072,384,
     RpuGetDevAddr(owners[1].data_ptr()),1,1});
-  for(int i=0;i<24;++i)assert(kernel.r[i]==ordinary.r[i]);
+  for(int i=0;i<32;++i)assert(kernel.r[i]==ordinary.r[i]);
   assert(pair_at(0)==spm[0]&&pair_at(4)==spm[1]&&pair_at(6)==spm[4]);
-  assert(pair_at(28)==spm[5]&&pair_at(30)==spm[2]&&pair_at(36)==spm[6]&&pair_at(38)==spm[3]);
-  assert(kernel.r[8]==41&&pair_at(10)==192&&kernel.r[12]==1536&&kernel.r[13]==96);
+  assert(pair_at(38)==spm[5]&&pair_at(36)==spm[2]&&pair_at(46)==spm[6]&&pair_at(44)==spm[3]);
+  assert(kernel.r[8]==1&&kernel.r[9]==41&&pair_at(10)==192&&kernel.r[12]==1536&&kernel.r[13]==96);
   assert(kernel.r[14]==1&&kernel.r[15]==8&&pair_at(16)==3072&&pair_at(18)==384);
-  assert(kernel.r[22]==1&&kernel.r[23]==1);
+  assert(pair_at(22)==0&&pair_at(24)==0&&kernel.r[26]==2&&kernel.r[27]==1);
+  assert(pair_at(28)==0&&pair_at(30)==0);
  };
  launch();check();assert(queue.launches==1);
  // Address and owner changes must reach the packet; unrelated Q/K/V bases cannot be inferred.
@@ -133,19 +144,32 @@ int main(){
  flushed.clear();launch();check();assert(queue.launches==3);
 }
 '''.replace("__FUNCTIONS__", functions).replace("__ADDRESS_CHECK__", address_check)
+    cpp = cpp.replace("__CURRENT_CONTRACT__",
+                      "enum class KernelId{" + ",".join(kernel_ids) + "};\n" + generated)
     _run(tmp_path, cpp)
 
 
-def test_qkv_multibase_append_only_optional_payload():
+def test_qkv_multibase_append_only_current_payload():
     cache = (ROOT / "src/core/rpu_kernel_cache.h").read_text()
     implementation = (ROOT / "src/core/rpu_kernel_cache.inc").read_text()
     declarations = (ROOT / "src/core/rpu_kernel_decls.h").read_text()
     kernel = "GR00T_QKV_MULTIBASE_W8A16_M592N32K128"
-    symbol = '"gr00t_qkv_multibase_w8a16_m592n32k128"'
+    symbol = '"gr00t_qkv_multibase_w8a16_v2"'
+    retired = '"gr00t_qkv_multibase_w8a16_m592n32k128"'
     assert cache.index(kernel) > cache.index("GR00T_FF1_RESIDENT_W8A16_M512N48K128")
     assert symbol in cache
+    assert retired not in cache
     optional_expansion = implementation.split("kMixedNames[] = {", 1)[1].split("};", 1)[0]
     assert symbol in optional_expansion
-    optional_ids = implementation.split("bool optional_id =", 1)[1].split(";", 1)[0]
-    assert f"KernelId::{kernel}" in optional_ids
+    assert retired not in optional_expansion
+    # Mixed preload may skip the payload; the exact launcher must reject absence.
+    required = implementation.split("KERNEL_LIST = {", 1)[1].split("};", 1)[0]
+    assert symbol not in required
+    loader = _definition(implementation, "for (const char* name : kMixedNames)")
+    absent = _definition(loader, "if (mixed_symbols.count(kname) == 0)")
+    assert "continue;" in absent
+    assert "load_kernel_from_oplib(" not in absent
+    assert loader.index(absent) < loader.index("load_kernel_from_oplib(")
+    launcher = _definition(LINEAR.read_text(), "void rpu_launch_gr00t_qkv_multibase_w8_kernel(")
+    assert "TORCH_CHECK(kernel != nullptr," in launcher
     assert "void rpu_launch_gr00t_qkv_multibase_w8_kernel(" in declarations

@@ -41,6 +41,9 @@ public:
         bool fast_replay, bool fast_replay_preload, bool mask_once,
         bool silu_mul, bool kvpad16, bool partial_rope,
         bool rmsnorm_pad16);
+    // Cold, before the runtime config and weights. Eight cores keep the
+    // existing owner; four binds the reduced child {4, 4, 4}.
+    void set_execution_cores(int64_t num_cores);
 
     // 权重入口。全部取 expert 的 `_v` 半边, **除了**:
     //   q_norm_list / k_norm_list —— 必须是 **VLM** 层的 query/key_layernorm
@@ -133,8 +136,13 @@ public:
 
     std::vector<int64_t> resolve_stage_domain(
         int64_t seq_len, int64_t prefix_len, int64_t mask_kv_len);
+    // Cold composite barrier: reserve this owner's Persistent slots under the
+    // same geometry before any persistent Hy-VLA sibling searches its domain.
+    void prepare_persistent_spm_for_shape(
+        int64_t seq_len, int64_t prefix_len, int64_t mask_kv_len);
 
 protected:
+    int reduced_hyvla_owner() const override { return REDUCED_HYVLA_EXPERT_OWNER; }
     // 单塔层体用的槽 (residual1/2, input_norm, q/k/v, output, oproj, gate/up/down,
     // sdpa_mask/tmp) 基类已全部声明; override 只为 unroll 追加 encoder/Euler 的槽,
     // 仅 unroll_mode_ 追加 hooks；mask 保留决策在完整声明后进行。

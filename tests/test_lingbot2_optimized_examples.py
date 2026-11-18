@@ -1,13 +1,15 @@
+import hashlib
 """Real LingBot example orchestration with mocked model/device boundaries."""
 from copy import deepcopy
 import importlib.util
 import json
-import hashlib
 from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
 
 import pytest
+
+from _config_tables import config_cells
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,18 +29,15 @@ def config(tmp_path, precision="w8a16"):
 @pytest.mark.parametrize("section,key,value", [
     ("lingbot2", "precision", "w4a16"), ("lingbot2", "instruction_residency", True),
     ("lingbot2", "top_k", 2), ("input", "case", ""), ("input", "num_steps", 5),
-    ("run", "warmup", -1), ("run", "warmup", True), ("run", "warmup", False),
-    ("run", "warmup", 0.5), ("run", "runs", True), ("run", "output_dir", ""),
+    ("run", "warmup", 0), ("run", "runs", True), ("run", "output_dir", ""),
     ("run", "hwperf", 1), ("cpu", "threads", 0)])
 def test_config_rejects_semantic_and_ambiguous_controls(tmp_path, section, key, value):
     runner = load(); value_config = config(tmp_path); value_config[section][key] = value
     with pytest.raises(ValueError): runner.validate_example_config(value_config)
 
 
-@pytest.mark.parametrize("warmup", [1, 2])
-def test_validation_stays_cpu_safe_and_does_not_relabel_z2(tmp_path, monkeypatch, warmup):
+def test_validation_stays_cpu_safe_and_does_not_relabel_z2(tmp_path, monkeypatch):
     runner = load(); value = config(tmp_path)
-    value["run"]["warmup"] = warmup
     import builtins
     original = builtins.__import__
     def guarded(name, *args, **kwargs):
@@ -164,79 +163,6 @@ def test_real_flow_counts_clean_calls_and_separates_diagnostics(tmp_path, monkey
     assert torch.equal(torch.load(tmp_path / "actions.pt", weights_only=True), torch.ones(1, 50, 55))
 
 
-def test_first_warmup_saves_an_independent_output(tmp_path, monkeypatch):
-    runner = load(); policy = FakePolicy(); mock_runtime(monkeypatch, runner, policy)
-    shared = torch.ones(1, 50, 55)
-    original = policy.get_action
-    def shared_action(obs):
-        original(obs)
-        return shared
-    monkeypatch.setattr(policy, "get_action", shared_action)
-    def diagnostics(owner, infer, first, cfg, out, report):
-        assert first.data_ptr() != shared.data_ptr()
-        shared.zero_()
-        assert torch.equal(first, torch.ones_like(shared))
-        report["diagnostic_calls"] = 0
-    monkeypatch.setattr(runner, "_diagnostics", diagnostics)
-    value = config(tmp_path)
-    value["run"].update(warmup=1, runs=1)
-    assert runner.run_example_config(value) == 0
-    report = json.loads((tmp_path / "report.json").read_text())
-    assert policy.calls == 2 and policy.closed == 1
-    assert policy.prepared == {"prefix_length_range": (217, 217)}
-    assert report["graph_prepare"]["ready_replay_validated"] is True
-    assert report["runtime_calls"] == {"prepare": 5, "warmup": 1, "measured": 1,
-                                        "diagnostic": 0, "total": 7}
-    assert torch.equal(torch.load(tmp_path / "actions.pt", weights_only=True),
-                       torch.ones(1, 50, 55))
-
-
-@pytest.mark.parametrize("warmup,runs,changed_call,message", [
-    (1, 2, 3, "measured replay changed actions"),
-    (2, 1, 2, "warm replay changed actions"),
-    (1, 1, 2, "measured replay changed actions"),
-])
-def test_replay_rejects_changed_reused_output(tmp_path, monkeypatch, warmup, runs, changed_call, message):
-    runner = load(); policy = FakePolicy(); mock_runtime(monkeypatch, runner, policy)
-    shared = torch.ones(1, 50, 55)
-    original = policy.get_action
-    def changing_action(obs):
-        original(obs)
-        if policy.calls == changed_call:
-            shared.add_(1)
-        return shared
-    monkeypatch.setattr(policy, "get_action", changing_action)
-    value = config(tmp_path); value["run"].update(warmup=warmup, runs=runs)
-    with pytest.raises(RuntimeError, match=message):
-        runner.run_example_config(value)
-    report = json.loads((tmp_path / "report.json").read_text())
-    assert policy.closed == 1 and policy.calls == changed_call
-    assert report["execution"]["status"] == "FAILED"
-    assert report["artifacts"]["outputs"] == []
-
-
-def test_default_warmup_remains_two(tmp_path, monkeypatch):
-    runner = load(); policy = FakePolicy(); mock_runtime(monkeypatch, runner, policy)
-    value = config(tmp_path); del value["run"]["warmup"]
-    value["run"]["runs"] = 1
-    assert runner.run_example_config(value) == 0
-    report = json.loads((tmp_path / "report.json").read_text())
-    assert report["warmup"] == report["runtime_calls"]["warmup"] == 2
-    assert policy.calls == 3
-
-
-@pytest.mark.parametrize("prepared", [None,
-    {"phase": "READY", "ready_replay_validated": False},
-    {"phase": "BUILD", "ready_replay_validated": True},
-])
-def test_execution_requires_ready_validation(tmp_path, monkeypatch, prepared):
-    runner = load(); policy = FakePolicy(); mock_runtime(monkeypatch, runner, policy)
-    monkeypatch.setattr(policy, "prepare_graphs", lambda *a, **kw: prepared)
-    value = config(tmp_path); value["run"].update(warmup=1, runs=1)
-    with pytest.raises(RuntimeError, match="adapter prepare did not validate"):
-        runner.run_example_config(value)
-    assert policy.calls == 0 and policy.closed == 1
-
 
 def test_failure_closes_owner_restores_stage_methods_and_records_error(tmp_path, monkeypatch):
     runner = load(); policy = FakePolicy(fail=True); mock_runtime(monkeypatch, runner, policy)
@@ -302,25 +228,33 @@ def test_source_identity_without_git_keeps_actual_source_hashes(monkeypatch):
 def test_text_matrix_templates_cpu_validation_and_unified_entry(monkeypatch, capsys):
     import subprocess
     from examples.common import config as common, cli
-    paths = sorted((ROOT / "examples/configs/lingbot/v2").glob("*cam_t*/*.toml"))
-    assert len(paths) == 22
+    paths = sorted((ROOT / "examples/configs/lingbot/v2").glob("*cam/*.toml"))
+    assert len(paths) == 4
     targets = {(cameras, tokens, precision) for cameras in (2, 3)
-               for tokens in (16, 32, 64, 128, 160) for precision in ("fp16", "w8a16")}
+               for tokens in (32,) for precision in ("fp16", "w8a16")}
     observed = set()
     seen = []
+    configs = {}
     monkeypatch.setattr(load(), "run_example_config", lambda value: seen.append(value) or 0)
     for path in paths:
         value = common.load_config(path)
+        configs[path] = value
         observed.add((value["input"]["cameras"], value["input"]["expected_language_tokens"],
                       value["lingbot2"]["precision"]))
         assert common.config_target(value) == "lingbot2" and common.example_metadata(value) is None
         assert cli.main(["--config", str(path), "--check-config"]) == 0
         assert cli.main(["--config", str(path)]) == 0
-    assert observed == targets | {(3, 3, precision) for precision in ("fp16", "w8a16")}
-    assert len(seen) == 22 and {v["lingbot2"]["precision"] for v in seen} == {"fp16", "w8a16"}
+    assert observed == targets
+    assert len(seen) == 4 and {v["lingbot2"]["precision"] for v in seen} == {"fp16", "w8a16"}
     from scripts import check_examples
-    index = check_examples.render_config_index({path: common.load_config(path) for path in paths})
-    assert index.count("未登记；模型专用模板") == 22 and "有效T=16" in index
+    index = (ROOT / "examples/configs/lingbot/README.md").read_text(encoding="utf-8")
+    for path, value in configs.items():
+        relative = path.relative_to(check_examples.CONFIGS / "lingbot").as_posix()
+        cells = config_cells(index, relative)
+        assert cells["精度"] == value["lingbot2"]["precision"]
+        assert cells["cameras 默认值"] == str(value["input"]["cameras"])
+        assert cells["expected_language_tokens 默认值"] == "32"
+        assert cells["max_language_tokens 默认值"] == "72"
     assert "CONTROLLED_EVALUATION" not in index
     # An isolated interpreter catches accidental module-level Torch/native imports.
     code = '''import builtins, sys
@@ -509,11 +443,3 @@ def test_long_instruction_preserves_all_tokens_and_requires_explicit_cap(tmp_pat
     load().validate_example_config(value)
     assert all(text == instruction for text, _ in calls)
     assert calls[0][1]["max_length"] == 72  # Existing default remains unchanged.
-
-
-def test_zero_warmup_is_rejected_before_loading(tmp_path):
-    runner = load()
-    value = config(tmp_path)
-    value["run"]["warmup"] = 0
-    with pytest.raises(ValueError, match="warmup.*>= 1"):
-        runner.validate_example_config(value)

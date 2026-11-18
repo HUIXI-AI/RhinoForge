@@ -17,7 +17,38 @@ def _define_schema(lib, schema):
 def _load_fake_dispatch_with_test_schemas():
     lib = torch.library.Library('rpu', 'FRAGMENT')
     _RPU_TEST_LIBRARIES.append(lib)
-    for schema in ('linear_w4a16(Tensor input, Tensor weight, Tensor scale, Tensor? bias=None) -> Tensor', 'rms_norm(Tensor input, int[] normalized_shape, Tensor weight, float eps=1e-5) -> Tensor', 'apply_rotary_pos_emb(Tensor query, Tensor key, Tensor cos, Tensor sin, Tensor position_ids) -> (Tensor, Tensor)', 'scaled_dot_product_attention_unified(Tensor query, Tensor key, Tensor value, Tensor? attn_mask=None, float dropout_p=0., bool is_causal=False, float? scale=None, bool enable_gqa=False) -> Tensor', 'causal_decoder_forward(int handle, Tensor hidden_states, Tensor[] k_caches, Tensor[] v_caches, Tensor? attention_mask, int position, bool is_causal, Tensor? position_ids=None, Tensor[]? deepstack_dense_visual_embeds=None, Tensor? rope_cos_il=None, Tensor? rope_sin_il=None, int cos_sin_offset=-1, int batch_slot=0, bool allow_batch_decode=False, int planned_chunk_size=0, int[] planned_stage_descriptor=[]) -> Tensor', 'lm_head_logits_top1(Tensor logits) -> Tensor', 'argmax_lastdim_host(Tensor logits) -> Tensor', 'gemma_forward(int handle, Tensor hidden_states, Tensor[] k_caches, Tensor[] v_caches, Tensor attention_mask, int position, bool is_causal, int chunk_size=0, int[] planned_stage_descriptor=[]) -> Tensor', 'gemma2_forward(int handle, Tensor hidden_states, Tensor[] k_caches, Tensor[] v_caches, Tensor attention_mask, int position, bool is_causal, int chunk_size=0) -> Tensor', 'adarms_forward(int handle, Tensor hidden_states, Tensor cond, Tensor[] k_caches, Tensor[] v_caches, Tensor attention_mask, int position, bool is_causal, int[] planned_stage_descriptor=[]) -> Tensor', 'siglip_forward(int handle, Tensor input, Tensor[] k_caches, Tensor[] v_caches, int[] planned_stage_descriptor=[]) -> Tensor', 'siglip_patch_embed(int handle, Tensor input) -> Tensor', 'siglip_patch_embed_multi(int handle, Tensor[] images) -> Tensor', 'siglip_forward_packed(int handle, Tensor hidden, int image_batch_count, Tensor[] k_caches, Tensor[] v_caches, int[] planned_stage_descriptor=[]) -> Tensor', 'siglip_forward_multi(int handle, Tensor[] images, Tensor[] k_caches, Tensor[] v_caches, int[] planned_stage_descriptor=[]) -> Tensor', 'conv2d_mc_nhwc(Tensor input, Tensor weight, int[] stride=[], int[] padding=[], int[] dilation=[], int groups=1) -> Tensor', 'halo_action_expert_step_forward(int handle, Tensor x_emb, Tensor[] k_caches, Tensor[] v_caches, Tensor cos, Tensor sin, Tensor attn_mask_4d, int prefix_len, int[] planned_stage_descriptor=[]) -> Tensor', 'halo_image_flow_step_forward(int handle, Tensor x_emb, Tensor[] k_caches, Tensor[] v_caches, Tensor cos, Tensor sin, int prefix_len, int[] planned_stage_descriptor=[]) -> Tensor', 'hyvit2_patch_embed(int handle, Tensor input) -> Tensor', 'hyvit2_patch_embed_multi(int handle, Tensor[] images) -> Tensor', 'hyvit2_forward(int handle, Tensor input, Tensor[] k_caches, Tensor[] v_caches) -> Tensor', 'hyvit2_forward_packed(int handle, Tensor hidden, int image_batch_count, Tensor[] k_caches, Tensor[] v_caches) -> Tensor', 'hyvit2_forward_multi(int handle, Tensor[] images, Tensor[] k_caches, Tensor[] v_caches) -> Tensor', 'hyvla_merger_pool(Tensor nxc) -> Tensor', 'hyvla_merger_combine(Tensor nxc, Tensor sc) -> Tensor', 'hyvla_merger_fused(Tensor nxc, Tensor wa, Tensor b0, Tensor wb, Tensor w2, Tensor b2, Tensor wp2, Tensor bp2, Tensor? wp1=None, Tensor? bp1=None) -> Tensor', 'hyvla_vlm_step_forward(int handle, Tensor x_emb, Tensor[] k_caches, Tensor[] v_caches, Tensor cos, Tensor sin, Tensor attn_mask_4d, int prefix_len) -> Tensor', 'hyvla_vlm_prefill_kv_only(int handle, Tensor x_emb, Tensor[] k_caches, Tensor[] v_caches, Tensor cos, Tensor sin, Tensor attn_mask_4d, int prefix_len, int[] planned_stage_descriptor=[]) -> ()', 'hyvla_expert_step_forward(int handle, Tensor x_emb, Tensor[] k_caches, Tensor[] v_caches, Tensor cos, Tensor sin, Tensor attn_mask_4d, int prefix_len) -> Tensor', 'hyvla_expert_unroll_forward(int handle, Tensor x0_rpu, Tensor[] k_caches, Tensor[] v_caches, Tensor state_emb, Tensor cos, Tensor sin, Tensor attn_mask_4d, Tensor x_traj, float dt, int prefix_len, int num_steps) -> ()'):
+    for schema in (
+        "linear_w4a16(Tensor input, Tensor weight, Tensor scale, Tensor? bias=None, int logical_out_features=-1) -> Tensor",
+        "rms_norm(Tensor input, int[] normalized_shape, Tensor weight, float eps=1e-5) -> Tensor",
+        "apply_rotary_pos_emb(Tensor query, Tensor key, Tensor cos, Tensor sin, Tensor position_ids) -> (Tensor, Tensor)",
+        "scaled_dot_product_attention_unified(Tensor query, Tensor key, Tensor value, Tensor? attn_mask=None, float dropout_p=0., bool is_causal=False, float? scale=None, bool enable_gqa=False) -> Tensor",
+        "causal_decoder_forward(int handle, Tensor hidden_states, Tensor[] k_caches, Tensor[] v_caches, Tensor? attention_mask, int position, bool is_causal, Tensor? position_ids=None, Tensor[]? deepstack_dense_visual_embeds=None, Tensor? rope_cos_il=None, Tensor? rope_sin_il=None, int cos_sin_offset=-1, int batch_slot=0, bool allow_batch_decode=False, int planned_chunk_size=0, int[] planned_stage_descriptor=[]) -> Tensor",
+        "lm_head_logits_top1(Tensor logits) -> Tensor",
+        "argmax_lastdim_host(Tensor logits) -> Tensor",
+        "gemma_forward(int handle, Tensor hidden_states, Tensor[] k_caches, Tensor[] v_caches, Tensor attention_mask, int position, bool is_causal, int chunk_size=0, int[] planned_stage_descriptor=[]) -> Tensor",
+        "gemma2_forward(int handle, Tensor hidden_states, Tensor[] k_caches, Tensor[] v_caches, Tensor attention_mask, int position, bool is_causal, int chunk_size=0) -> Tensor",
+        "adarms_forward(int handle, Tensor hidden_states, Tensor cond, Tensor[] k_caches, Tensor[] v_caches, Tensor attention_mask, int position, bool is_causal, int[] planned_stage_descriptor=[]) -> Tensor",
+        "siglip_forward(int handle, Tensor input, Tensor[] k_caches, Tensor[] v_caches, int[] planned_stage_descriptor=[]) -> Tensor",
+        "siglip_patch_embed(int handle, Tensor input) -> Tensor",
+        "siglip_patch_embed_multi(int handle, Tensor[] images) -> Tensor",
+        "siglip_forward_packed(int handle, Tensor hidden, int image_batch_count, Tensor[] k_caches, Tensor[] v_caches, int[] planned_stage_descriptor=[]) -> Tensor",
+        "siglip_forward_multi(int handle, Tensor[] images, Tensor[] k_caches, Tensor[] v_caches, int[] planned_stage_descriptor=[]) -> Tensor",
+        "conv2d_mc_nhwc(Tensor input, Tensor weight, int[] stride=[], int[] padding=[], int[] dilation=[], int groups=1) -> Tensor",
+        "halo_action_expert_step_forward(int handle, Tensor x_emb, Tensor[] k_caches, Tensor[] v_caches, Tensor cos, Tensor sin, Tensor attn_mask_4d, int prefix_len, int[] planned_stage_descriptor=[]) -> Tensor",
+        "halo_image_flow_step_forward(int handle, Tensor x_emb, Tensor[] k_caches, Tensor[] v_caches, Tensor cos, Tensor sin, int prefix_len, int[] planned_stage_descriptor=[]) -> Tensor",
+        "hyvit2_patch_embed(int handle, Tensor input) -> Tensor",
+        "hyvit2_patch_embed_multi(int handle, Tensor[] images) -> Tensor",
+        "hyvit2_forward(int handle, Tensor input, Tensor[] k_caches, Tensor[] v_caches) -> Tensor",
+        "hyvit2_forward_packed(int handle, Tensor hidden, int image_batch_count, Tensor[] k_caches, Tensor[] v_caches) -> Tensor",
+        "hyvit2_forward_multi(int handle, Tensor[] images, Tensor[] k_caches, Tensor[] v_caches) -> Tensor",
+        "hyvla_merger_pool(Tensor nxc) -> Tensor",
+        "hyvla_merger_combine(Tensor nxc, Tensor sc) -> Tensor",
+        "hyvla_merger_fused(Tensor nxc, Tensor wa, Tensor b0, Tensor wb, Tensor w2, Tensor b2, Tensor wp2, Tensor bp2, Tensor? wp1=None, Tensor? bp1=None) -> Tensor",
+        "hyvla_vlm_step_forward(int handle, Tensor x_emb, Tensor[] k_caches, Tensor[] v_caches, Tensor cos, Tensor sin, Tensor attn_mask_4d, int prefix_len) -> Tensor",
+        "hyvla_vlm_prefill_kv_only(int handle, Tensor x_emb, Tensor[] k_caches, Tensor[] v_caches, Tensor cos, Tensor sin, Tensor attn_mask_4d, int prefix_len, int[] planned_stage_descriptor=[]) -> ()",
+        "hyvla_expert_step_forward(int handle, Tensor x_emb, Tensor[] k_caches, Tensor[] v_caches, Tensor cos, Tensor sin, Tensor attn_mask_4d, int prefix_len) -> Tensor",
+        "hyvla_expert_unroll_forward(int handle, Tensor x0_rpu, Tensor[] k_caches, Tensor[] v_caches, Tensor state_emb, Tensor cos, Tensor sin, Tensor attn_mask_4d, Tensor x_traj, float dt, int prefix_len, int num_steps) -> ()",
+    ):
         _define_schema(lib, schema)
     if 'rpu_backend.graph.fake_dispatch' in sys.modules:
         return
@@ -34,15 +65,16 @@ def _assert_fake_shape(tensor, shape):
 
 def test_linear_w4a16_fake_dispatch_preserves_rows_and_scale_contract():
     with FakeTensorMode():
-        hidden = torch.empty((1, 17, 256), dtype=torch.float16)
-        packed = torch.empty((128, 128), dtype=torch.uint8)
-        scale = torch.empty((32, 128), dtype=torch.float16)
-        actual = torch.ops.rpu.linear_w4a16(hidden, packed, scale)
-        _assert_fake_shape(actual, (1, 17, 128))
-        selected = torch.ops.rpu.linear_w4a16(hidden[:, -1:, :], packed, scale)
-        _assert_fake_shape(selected, (1, 1, 128))
-        with pytest.raises(RuntimeError, match='scale'):
-            torch.ops.rpu.linear_w4a16(hidden, packed, scale[:, :-1].contiguous())
+        hidden = torch.empty((1,17,256),dtype=torch.float16)
+        packed = torch.empty((256,128),dtype=torch.uint8)
+        scale = torch.empty((32,128),dtype=torch.float16)
+        actual = torch.ops.rpu.linear_w4a16(hidden,packed,scale,logical_out_features=128)
+        _assert_fake_shape(actual,(1,17,128))
+        selected = torch.ops.rpu.linear_w4a16(hidden[:,-1:,:],packed,scale,logical_out_features=128)
+        _assert_fake_shape(selected,(1,1,128))
+        with pytest.raises(RuntimeError,match="scale"):
+            torch.ops.rpu.linear_w4a16(hidden,packed,scale[:,:-1].contiguous(),logical_out_features=128)
+
 
 def test_siglip_fake_dispatch_for_split_and_packed_paths():
     with FakeTensorMode():

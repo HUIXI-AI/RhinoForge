@@ -1,4 +1,4 @@
-"""Host checks for the exact 9B TP8 W8 VL cold admission; no model execution."""
+"""Host checks for the exact 9B W8 VL cold admission; no model execution."""
 from types import SimpleNamespace as NS
 
 import pytest
@@ -79,9 +79,12 @@ def test_uniform_w8_vl_preflight_preserves_nonretained_four_arena_scope(monkeypa
 
 
 @pytest.mark.parametrize("num_cores", [4, 6])
-def test_quantized_9b_reduced_cores_still_rejected(num_cores):
-    with pytest.raises(ValueError, match="exact 2B"):
-        Qwen3_5Adapter.preflight_execution(_config(), {"model": {"num_cores": num_cores}})
+def test_quantized_9b_reduced_cores_preserve_four_core_vision(num_cores, monkeypatch):
+    monkeypatch.setenv("QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED", "1")
+    execution = {"model": {"num_cores": num_cores}}
+    Qwen3_5Adapter.preflight_execution(_config(), execution)
+    assert cores.vision_core_count(execution) == 4
+    assert not text._public_retained_prefill(_config(), execution, public_owner=True)
 
 
 @pytest.mark.parametrize("quant", [
@@ -185,5 +188,4 @@ def test_fp16_cold_weights_and_quant_gate_are_unchanged(monkeypatch):
     with pytest.raises(ValueError, match="FP16"):
         cores.validate_cold_weight_dtype(model, fp16=True)
     monkeypatch.delenv("QWEN3_5_QUANT_ALLOW_UNCERTIFIED", raising=False)
-    with pytest.raises(UnsupportedModelError, match="QWEN3_5_QUANT_ALLOW_UNCERTIFIED=1"):
-        _check_quant_policy(_config())
+    assert _check_quant_policy(_config()) is None

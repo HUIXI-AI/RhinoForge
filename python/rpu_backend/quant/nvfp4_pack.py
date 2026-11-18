@@ -209,3 +209,45 @@ def swizzle_pack_nvfp4_v2(codes: torch.Tensor, scale_gn: torch.Tensor,
     else:
         physical = logical.reshape(n // 16, 16, num_cores, k // num_cores // 32, 2).permute(3, 2, 0, 4, 1)
     return packed, physical.contiguous().reshape(k // 16, n)
+
+
+def repack_nvfp4_tile_scales(
+    striped: torch.Tensor, partition: int, num_cores: int = 8
+) -> torch.Tensor:
+    """Install-time scale permutation for the explicit Pi DB/tscale candidate.
+
+    Input is the already packed striped-v2 FP8 byte owner, not logical scales.
+    The distinct four-dimensional result records the physical layout:
+    [local_N/64, local_K/128, core, 512 bytes]. No weight or scale values change.
+    Upload once to a full DDR owner aligned to 4096 bytes; the launcher checks
+    this alignment and rejects the ordinary two-dimensional striped owner.
+    """
+    if (striped.device.type != "cpu" or striped.dtype != torch.uint8 or
+            striped.dim() != 2 or not striped.is_contiguous() or
+            striped.storage_offset() != 0 or num_cores != 8 or
+            partition not in (0, 1)):
+        raise ValueError("tile scales require a CPU contiguous TP8 striped-v2 uint8 owner")
+    groups, n = striped.shape
+    k = groups * 16
+    if n <= 0 or k <= 0 or (n if partition else k) % num_cores:
+        raise ValueError("tile scales require positive divisible projection dimensions")
+    local_n = n // num_cores if partition else n
+    local_k = k if partition else k // num_cores
+    if local_n % 64 or local_k % 128:
+        raise ValueError("tile scales require full local N64/K128 tiles")
+    blocks, tiles = local_n // 64, local_k // 128
+    return (striped.reshape(tiles, 2, 2, num_cores, blocks, 4, 2, 16)
+            .permute(4, 0, 3, 2, 6, 5, 1, 7).contiguous()
+            .reshape(blocks, tiles, num_cores, 512))
+
+
+def repack_nvfp4_spm_scales(
+    striped: torch.Tensor, partition: int, num_cores: int = 8
+) -> torch.Tensor:
+    """Cold pack for explicit SSPM candidates: [core,N64,K128,512 bytes].
+
+    Each core receives its own contiguous slab through a retained graph DMA.
+    The input contract and tile permutation are identical to DDR tile scales;
+    this only removes the interleaving between cores. No quantization changes.
+    """
+    return repack_nvfp4_tile_scales(striped, partition, num_cores).permute(2, 0, 1, 3).contiguous()

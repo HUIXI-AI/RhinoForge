@@ -15,7 +15,7 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 MAX_TRACKED_BYTES = 1_000_000
 
 # Runtime packages and generated reports are distributed outside Git.
-ALLOWED: set[str] = set()
+ALLOWED: set[str] = {"src/ops/rpu_linear_tiling_data.h"}
 
 
 def oversized(entries: "list[tuple[str, int]]") -> "list[tuple[str, int]]":

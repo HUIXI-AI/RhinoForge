@@ -20,10 +20,13 @@ from safetensors import safe_open
 from transformers import AutoModelForImageTextToText
 
 from .convert_qwen3_vl import _get, matches_runtime_geometry, runtime_quant_config
-from .int4_pgrp_pack import swizzle_int4_pgrp_scale, swizzle_pack_int4_pgrp
+from .int4_pgrp_pack import (
+    pad_int4_mlp_stripe, swizzle_int4_pgrp_scale, swizzle_pack_int4_pgrp,
+    w4_storage_shape,
+)
 from .load_qwen3_vl_awq import (
     _ROLES, _config_signature, _inventory, _projection_inventory,
-    _allocate_awq_scale_views,
+    _allocate_awq_scale_views, packed_projection_geometry,
 )
 
 _PLAN_ATTR = "_rpu_qwen3_vl_runtime_load_plan"
@@ -64,8 +67,10 @@ def _quantized_modules(model):
     return [*modules, ("lm_head", head, 1)]
 
 
-def _pack_w4_projection(weight, scale, *, n, k, partition):
-    """Logical signed nibbles -> the existing sole pgrp physical ABI, once."""
+def _pack_w4_projection(weight, scale, *, n, k, partition, num_cores=8, padded_size=None):
+    """Logical signed nibbles -> the existing sole pgrp physical ABI, once.
+
+    ``padded_size`` zero-pads a six-lane MLP stripe (values 0, scales 1)."""
     if (weight.device.type != "cpu" or weight.dtype != torch.uint8
             or tuple(weight.shape) != (n, k // 2) or not weight.is_contiguous()
             or k % 32 or n <= 0 or k <= 0):
@@ -76,8 +81,13 @@ def _pack_w4_projection(weight, scale, *, n, k, partition):
         raise ValueError("runtime W4 scale requires finite positive contiguous CPU FP16[G,N]")
     nibbles = torch.stack((weight & 15, weight >> 4), dim=-1).reshape(n, k).to(torch.int8)
     values = torch.where(nibbles >= 8, nibbles - 16, nibbles)
-    return (swizzle_pack_int4_pgrp(values, partition, 8).reshape(n, k // 2),
-            swizzle_int4_pgrp_scale(scale, 32, partition, 8))
+    if padded_size is not None:
+        values, scale = pad_int4_mlp_stripe(
+            values, scale, partition=partition, padded_size=padded_size)
+    pn, pk = values.shape
+    return (swizzle_pack_int4_pgrp(values, partition, num_cores).reshape(
+                w4_storage_shape(pn, pk, partition, num_cores)),
+            swizzle_int4_pgrp_scale(scale, 32, partition, num_cores))
 
 
 def _copy_w8_projection(weight, scale, *, n, k, copy_weight=True):
@@ -134,7 +144,8 @@ def _validate_qwen3_vl_runtime_model(model) -> bool:
 
 @torch.inference_mode(False)
 def load_qwen3_vl_runtime_imagetext(
-    config, ckpt_dir: str, *, dtype=torch.float16, _mmap_w8_weights=False, **resolve_kwargs,
+    config, ckpt_dir: str, *, dtype=torch.float16, _mmap_w8_weights=False,
+    topology=None, **resolve_kwargs,
 ):
     """Strict CPU loading; W8 stays raw and W4 is packed exactly once.
 
@@ -151,6 +162,17 @@ def load_qwen3_vl_runtime_imagetext(
         raise TypeError("Qwen3-VL runtime quantization requires torch.float16 activations")
     if not is_qwen3_vl_runtime_quant_config(config):
         raise ValueError("runtime loader requires an exact registered runtime quant profile")
+    if topology is not None:
+        from rpu_backend.api._execution import qwen3_vl_text_topology
+        if topology != qwen3_vl_text_topology(config.text_config, topology.num_cores,
+                packed_w4=config.quant_config["method"] == "w4a16"):
+            raise ValueError("runtime loader topology differs from the selected text geometry")
+    def projection_cores(name):
+        if topology is None:
+            return 8
+        return topology.lm_head_tp if name == "lm_head" else (
+            topology.mlp_tp if ".mlp." in name else topology.attn_tp)
+    mlp_tp = topology.mlp_tp if topology is not None else 8
     if _mmap_w8_weights and not (
         config.text_config.hidden_size == 5120 and config.quant_config["method"] == "w8a16"
     ):
@@ -174,9 +196,11 @@ def load_qwen3_vl_runtime_imagetext(
     expected = {name: (shape, "F16") for name, shape in shapes.items()}
     for name, module, partition in projections:
         n, k = module.out_features, module.in_features
-        if bits == 4 and ((partition == 1 and (n % 128 or k % 64))
-                         or (partition == 0 and (n % 16 or k % 512))):
-            raise ValueError(f"runtime W4 projection is outside TP8 pgrp geometry: {name}")
+        cores = projection_cores(name)
+        pn, pk = packed_projection_geometry(name, n, k, partition, mlp_tp)
+        if bits == 4 and ((partition == 1 and (pn % (16 * cores) or pk % 32))
+                         or (partition == 0 and (pn % 16 or pk % (32 * cores)))):
+            raise ValueError(f"runtime W4 projection is outside its selected pgrp geometry: {name}")
         expected[name + ".weight"] = ((n, k if bits == 8 else k // 2), "I8" if bits == 8 else "U8")
         expected[name + ".weight_scale"] = ((n,) if bits == 8 else (k // 32, n), "F16")
     tensor_shards = {}
@@ -204,10 +228,15 @@ def load_qwen3_vl_runtime_imagetext(
         for name, module, partition in projections:
             weight, scale = tensor(name + ".weight"), tensor(name + ".weight_scale")
             if bits == 4:
+                n, k = module.out_features, module.in_features
+                pn, pk = packed_projection_geometry(name, n, k, partition, mlp_tp)
                 weight, scale = _pack_w4_projection(weight, scale,
-                    n=module.out_features, k=module.in_features, partition=partition)
+                    n=n, k=k, partition=partition, num_cores=projection_cores(name),
+                    padded_size=None if (pn, pk) == (n, k) else (pn if partition == 1 else pk))
+                # Text config stays logical; the Linear records its physical width.
+                module.out_features, module.in_features = pn, pk
                 module._rpu_linear_partition = partition
-                module._rpu_linear_num_cores = 8
+                module._rpu_linear_num_cores = projection_cores(name)
             else:
                 weight, scale = _copy_w8_projection(
                     weight, scale, n=module.out_features, k=module.in_features,
@@ -230,7 +259,7 @@ def load_qwen3_vl_runtime_imagetext(
 
 
 @torch.inference_mode(False)
-def _move_materialized_runtime_decoder_for_rpu(model) -> None:
+def _move_materialized_runtime_decoder_for_rpu(model, *, topology=None) -> None:
     """Use existing banks; packed W4 copies without another swizzle. Head stays CPU."""
     from .load import _allocate_decoder_projection_views, _move_materialized_decoder_for_rpu
     if vars(model).get("_rpu_swizzle_started") is not True:
@@ -239,6 +268,10 @@ def _move_materialized_runtime_decoder_for_rpu(model) -> None:
         raise ValueError("runtime decoder migration requires the exact loaded model")
     per_layer = model.config.text_config.hidden_size in (4096, 5120)
     if model.config.quant_config["method"] == "w8a16":
+        if topology is not None:
+            _move_materialized_decoder_for_rpu(model, dtype=torch.int8,
+                                              per_layer=True, topology=topology)
+            return
         if per_layer:
             _move_materialized_decoder_for_rpu(model, dtype=torch.int8, per_layer=True)
         else:

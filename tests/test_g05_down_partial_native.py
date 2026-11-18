@@ -76,7 +76,7 @@ int main(){
  at::Tensor scale;scale.dtype=at::kHalf;scale.rank=1;scale.rows=1024;scale.address=0x3456789a00ULL;
  auto launch=[&](uint32_t a,uint32_t b,uint32_t c,const at::Tensor&weight,const at::Tensor&s){rpu_launch_g05_down_partial_w8a16_acc16_kernel(a,weight,b,c,s);};
  auto&g=RpuKernelGraph::active();
- for(int pass=0;pass<2;++pass){scale.address+=256;w.address+=256;launch(x,sw,y,w,scale);auto&s=g.submissions.back();assert(pair(s,0)==x&&pair(s,2)==w.address>>8&&pair(s,4)==y&&pair(s,6)==0&&pair(s,20)==scale.address>>8&&pair(s,24)==sw);assert(s.regs.at(8)==32&&pair(s,10)==1024&&s.regs.at(12)==512&&s.regs.at(13)==32&&s.regs.at(14)==0&&s.regs.at(15)==8&&pair(s,16)==1024&&pair(s,18)==2048&&s.regs.at(22)==0&&s.regs.at(23)==1);}
+ for(int pass=0;pass<2;++pass){scale.address+=256;w.address+=256;launch(x,sw,y,w,scale);auto&s=g.submissions.back();assert(pair(s,0)==x&&pair(s,2)==w.address>>8&&pair(s,4)==y&&pair(s,6)==0&&pair(s,20)==scale.address>>8&&pair(s,32)==sw);assert(s.regs.at(8)==0&&s.regs.at(9)==32&&pair(s,10)==1024&&s.regs.at(12)==512&&s.regs.at(13)==32&&s.regs.at(14)==0&&s.regs.at(15)==8&&pair(s,16)==1024&&pair(s,18)==2048&&pair(s,22)==0&&pair(s,24)==0&&s.regs.at(26)==2&&s.regs.at(27)==1&&s.regs.at(28)==0&&s.regs.at(29)==0);}
  for(int f=0;f<11;++f){auto bad=fault(w,f);reject([&]{launch(x,sw,y,bad,scale);});bad=fault(scale,f);reject([&]{launch(x,sw,y,w,bad);});}
  {auto bad=scale;bad.dev.index=1;reject([&]{launch(x,sw,y,w,bad);});bad=scale;bad.address=w.address+256;reject([&]{launch(x,sw,y,w,bad);});}
  for(int index=0;index<3;++index)for(auto bad:{base-256,base+SpmAllocator::SPM_USABLE-256,0xffffff00u,x+1}){std::array<uint32_t,3>p{x,sw,y};p[index]=bad;reject([&]{launch(p[0],p[1],p[2],w,scale);});}

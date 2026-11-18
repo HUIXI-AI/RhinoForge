@@ -4,6 +4,7 @@
 #include "core/rpu_ops.h"
 #include "core/rpu_spm_allocator.h"
 #include "graph/graph_runtime.h"
+#include "rpu_parallel_linear_register_policies.h"
 
 #include <c10/util/Exception.h>
 
@@ -388,6 +389,74 @@ void reset_prepared_state_locked(Qwen3VlPoolerZ1State& s) {
     s.recorded_ranges = {};
 }
 
+// GR00T's COMPLETE Vision/Text descriptors each mint one authenticated FMB
+// metadata prefix. Preserve its Graph coordinate, but never count it as work.
+void validate_groot_component_window_kinds(
+    const GraphOpStreamWindowDigest& window, size_t phase) {
+    TORCH_CHECK(phase < 3, "GR00T Z1 recorded component phase is invalid");
+    const bool has_manifest = phase != 1;
+    TORCH_CHECK(window.end > window.begin &&
+                    window.end - window.begin == window.node_count &&
+                    window.node_kinds.size() == window.node_count &&
+                    window.node_count > static_cast<size_t>(has_manifest),
+                "GR00T Z1 recorded component window is malformed");
+    GraphNodeKindMask mask = 0;
+    for (size_t index = 0; index < window.node_kinds.size(); ++index) {
+        const auto kind = window.node_kinds[index];
+        mask |= graph_node_kind_bit(kind);
+        if (has_manifest && index == 0) {
+            TORCH_CHECK(kind == GraphNodeKind::Branch,
+                        "GR00T Z1 component needs its COMPLETE metadata prefix");
+        } else {
+            TORCH_CHECK(kind == GraphNodeKind::Kernel ||
+                            kind == GraphNodeKind::Dma ||
+                            kind == GraphNodeKind::Barrier,
+                        "GR00T Z1 component contains a foreign control-flow node");
+        }
+    }
+    TORCH_CHECK(mask == window.kind_mask,
+                "GR00T Z1 recorded component kind mask changed");
+}
+
+void validate_groot_component_window(
+    const GraphOpStreamWindowDigest& window,
+    const std::vector<GraphNode>& nodes, size_t phase,
+    uint64_t manifest_fingerprint) {
+    validate_groot_component_window_kinds(window, phase);
+    TORCH_CHECK(window.end <= nodes.size() &&
+                    ((phase == 1) == (manifest_fingerprint == 0)),
+                "GR00T Z1 recorded component manifest authority is invalid");
+    for (size_t offset = 0; offset < window.node_count; ++offset) {
+        const auto& node = nodes[window.begin + offset];
+        TORCH_CHECK(node.kind == window.node_kinds[offset],
+                    "GR00T Z1 recorded component node kind changed");
+        if (node.kind == GraphNodeKind::Branch) {
+            const auto& branch = node.as_branch();
+            TORCH_CHECK(branch.is_physical_manifest_metadata() &&
+                            branch.branch_key == manifest_fingerprint,
+                        "GR00T Z1 component has a foreign COMPLETE manifest");
+        }
+    }
+}
+
+uint64_t groot_component_manifest_fingerprint(
+    const Qwen3VlPoolerZ1State& s, size_t phase) {
+    TORCH_INTERNAL_ASSERT(phase < 3);
+    if (phase == 1) return 0;
+    const auto& descriptor = phase == 0
+        ? s.vision_stage_descriptor : s.text_stage_descriptor;
+    const auto prepared = (phase == 0
+        ? v3::qwen3vl_pooler_z1_internal::multiview_vision_owner(s.vision_handle)
+        : v3::qwen3vl_pooler_z1_internal::multiview_text_owner(s.text_handle))
+        .prepare_stage_candidate(descriptor);
+    TORCH_CHECK(prepared->candidate().physical_manifest.state ==
+                    v3::FmbPhysicalManifestState::COMPLETE &&
+                    prepared->candidate().physical_manifest.graph_lifecycle ==
+                        v3::FmbGraphLifecycle::COMPOSITE_CHILD,
+                "GR00T Z1 recorded component requires COMPLETE child authority");
+    return prepared->manifest_fingerprint();
+}
+
 void validate_recorded_ranges_locked(const Qwen3VlPoolerZ1State& s,
                                     RpuKernelGraph& graph) {
     const auto& ranges = s.recorded_ranges;
@@ -401,6 +470,41 @@ void validate_recorded_ranges_locked(const Qwen3VlPoolerZ1State& s,
         TORCH_CHECK(graph.is_op_stream_stamp_current(stamp),
                     "GR00T Z1 recorded range has a stale Graph BUILD/signature");
     }
+    const auto plan = graph.replay_plan();
+    TORCH_CHECK(plan.steps != nullptr,
+                "GR00T Z1 recorded ranges have no actual Graph nodes");
+    for (size_t phase = 0; phase < ranges.windows.size(); ++phase) {
+        validate_groot_component_window(
+            ranges.windows[phase], *plan.steps, phase,
+            groot_component_manifest_fingerprint(s, phase));
+    }
+}
+
+// Census completion seals outer-fast DMA ownership into the Graph topology.
+// Keep the original authenticated phase windows; only the full-Graph identity
+// must use the same sealed state that Graph::end will commit before execution.
+void seal_recorded_ranges_topology_locked(Qwen3VlPoolerZ1State& s,
+                                         RpuKernelGraph& graph) {
+    const auto current = graph.op_stream_stamp();
+    if (current.state != RpuKernelGraph::State::RECORDING) {
+        validate_recorded_ranges_locked(s, graph);
+        return;
+    }
+    auto& ranges = s.recorded_ranges;
+    TORCH_CHECK(ranges.whole.topology_hash != 0 &&
+                    ranges.boundaries.front().position == 0 &&
+                    current.position == ranges.boundaries.back().position &&
+                    current.position == ranges.whole.end,
+                "GR00T Z1 sealed topology has an incomplete recorded window");
+    const auto sealed = graph.digest_op_stream_window(
+        ranges.boundaries.front(), ranges.boundaries.back());
+    TORCH_CHECK(sealed.begin == ranges.whole.begin &&
+                    sealed.end == ranges.whole.end &&
+                    sealed.node_count == ranges.whole.node_count &&
+                    sealed.kind_mask == ranges.whole.kind_mask &&
+                    sealed.node_kinds == ranges.whole.node_kinds,
+                "GR00T Z1 node stream changed while sealing topology");
+    ranges.whole.topology_hash = sealed.topology_hash;
 }
 
 void begin_recorded_ranges_locked(Qwen3VlPoolerZ1State& s,
@@ -430,12 +534,12 @@ void checkpoint_recorded_range_locked(Qwen3VlPoolerZ1State& s,
                     "GR00T Z1 native component recorded an empty node range");
         ranges.boundaries[boundary] = current;
         auto window = graph.digest_op_stream_window(begin, current);
-        const auto allowed = graph_node_kind_bit(GraphNodeKind::Kernel) |
-            graph_node_kind_bit(GraphNodeKind::Dma) |
-            graph_node_kind_bit(GraphNodeKind::Barrier);
-        TORCH_CHECK((window.kind_mask & ~allowed) == 0 &&
-                        window.node_kinds.size() == window.node_count,
-                    "GR00T Z1 native component contains non-batch nodes");
+        const auto plan = graph.replay_plan();
+        TORCH_CHECK(plan.steps != nullptr,
+                    "GR00T Z1 native component has no actual Graph nodes");
+        validate_groot_component_window(
+            window, *plan.steps, boundary - 1,
+            groot_component_manifest_fingerprint(s, boundary - 1));
         ranges.windows[boundary - 1] = std::move(window);
         if (boundary == 3) {
             ranges.whole = graph.digest_op_stream_window(ranges.boundaries[0], current);
@@ -581,561 +685,26 @@ uint64_t physical_binding_digest(const Qwen3VlPoolerZ1State& s) {
     return hash == 0 ? UINT64_C(1) : hash;
 }
 
-GraphDdrRegisterAbi ddr_abi(GraphDdrRegisterRole role,
-                            GraphDdrRegisterAccess access,
-                            uint16_t reg_lo,
-                            uint16_t reg_hi) {
-    return GraphDdrRegisterAbi{
-        role, access, GraphDdrRegisterEncoding::DevAddrShift8LoHi,
-        reg_lo, reg_hi};
-}
-
-GraphKernelRegisterRule typed_rule(
-        KernelId id,
-        size_t count,
-        std::vector<GraphDdrRegisterAbi> operands) {
-    GraphKernelRegisterRule rule;
-    rule.kernel_id = id;
-    rule.kind = GraphKernelRegisterRuleKind::TypedDdr;
-    rule.operands = std::move(operands);
-    rule.expected_count = count;
-    return rule;
-}
-
-GraphKernelRegisterRule intrinsic_no_ddr_rule(KernelId id, size_t count) {
-    GraphKernelRegisterRule rule;
-    rule.kernel_id = id;
-    rule.kind = GraphKernelRegisterRuleKind::IntrinsicNoDdr;
-    rule.expected_count = count;
-    return rule;
-}
-
-GraphKernelRegisterRule explicit_no_ddr_rule(
-        KernelId id, size_t count, GraphKernelNoDdrProof proof) {
-    GraphKernelRegisterRule rule;
-    rule.kernel_id = id;
-    rule.kind = GraphKernelRegisterRuleKind::ExplicitNoDdr;
-    rule.no_ddr_proof = proof;
-    rule.expected_count = count;
-    return rule;
-}
-
-GraphKernelRegisterRule explicit_dynamic_no_ddr_rule(
-        const char* name, size_t count, GraphKernelNoDdrProof proof) {
-    GraphKernelRegisterRule rule;
-    rule.kernel_name = name;
-    rule.kind = GraphKernelRegisterRuleKind::ExplicitNoDdr;
-    rule.no_ddr_proof = proof;
-    rule.expected_count = count;
-    return rule;
-}
-
-GraphKernelRegisterCensusStats phase_stats(
-        size_t nodes, size_t dmas, size_t barriers,
-        size_t kernels, size_t typed, size_t no_ddr,
-        size_t operands, size_t weights, size_t keys, size_t values,
-        size_t semantic_inputs,
-        uint64_t node_hash, uint64_t kernel_hash) {
-    GraphKernelRegisterCensusStats stats;
-    stats.node_count = nodes;
-    stats.dma_count = dmas;
-    stats.barrier_count = barriers;
-    stats.kernel_count = kernels;
-    stats.typed_kernel_count = typed;
-    stats.no_ddr_kernel_count = no_ddr;
-    stats.operand_count = operands;
-    stats.weight_operand_count = weights;
-    stats.key_cache_operand_count = keys;
-    stats.value_cache_operand_count = values;
-    stats.semantic_input_operand_count = semantic_inputs;
-    stats.ordered_node_kind_hash = node_hash;
-    stats.ordered_kernel_hash = kernel_hash;
-    return stats;
-}
-
-// The formula-specific GELU v2 hashes below are deterministic substitutions
-// over the frozen v1 streams.  The first guarded native BUILD remains the
-// authoritative recensus for every profile.
+// Shared generated policies bind the current new-ABI kernel catalogue and
+// preserve the exact typed register roles and guarded BUILD stream.
 const GraphKernelRegisterPolicy& qwen3vl_pooler_z1_register_policy() {
-    // Frozen from an address-independent captured BUILD stream.
-    // The raw dump predates policy installation; exact typed roles below come
-    // from the owner-bound production launchers and are revalidated on the
-    // first guarded BUILD rather than learned online.
-    static const GraphKernelRegisterPolicy policy = [] {
-        GraphKernelRegisterPolicy value;
-        value.fingerprint = UINT64_C(0x5133564c5a315633);  // Q3VLZ1V3
-        value.name = "qwen3vl_pooler_z1_register_census_v3";
-
-        const auto weight = ddr_abi(
-            GraphDdrRegisterRole::ModelWeight,
-            GraphDdrRegisterAccess::Read, 2, 3);
-        const auto key_write = ddr_abi(
-            GraphDdrRegisterRole::KeyCache,
-            GraphDdrRegisterAccess::Write, 8, 9);
-        const auto value_write = ddr_abi(
-            GraphDdrRegisterRole::ValueCache,
-            GraphDdrRegisterAccess::Write, 8, 9);
-        const auto key_read = ddr_abi(
-            GraphDdrRegisterRole::KeyCache,
-            GraphDdrRegisterAccess::Read, 50, 51);
-        const auto value_read = ddr_abi(
-            GraphDdrRegisterRole::ValueCache,
-            GraphDdrRegisterAccess::Read, 52, 53);
-        const auto rope_position = ddr_abi(
-            GraphDdrRegisterRole::SemanticInput,
-            GraphDdrRegisterAccess::Read, 0, 1);
-        const auto mrope_cos = ddr_abi(
-            GraphDdrRegisterRole::ModelWeight,
-            GraphDdrRegisterAccess::Read, 6, 7);
-        const auto mrope_sin = ddr_abi(
-            GraphDdrRegisterRole::ModelWeight,
-            GraphDdrRegisterAccess::Read, 8, 9);
-        const auto mrope_position = ddr_abi(
-            GraphDdrRegisterRole::SemanticInput,
-            GraphDdrRegisterAccess::Read, 12, 13);
-
-        value.rules = {
-            typed_rule(KernelId::PL_AT_FP16_M320N128, 52, {weight}),
-            typed_rule(KernelId::PL_AT_FP16_M384N96, 162, {weight}),
-            typed_rule(KernelId::PL_AT_FP16_M480N64, 128, {weight}),
-            typed_rule(KernelId::ROPE_2D_SPM, 48, {rope_position}),
-            typed_rule(KernelId::MROPE, 56,
-                       {mrope_cos, mrope_sin, mrope_position}),
-            typed_rule(KernelId::LLAMA_INSERT_KCACHE_V16, 52,
-                       {key_write}),
-            typed_rule(KernelId::LLAMA_INSERT_VCACHE_V16, 52,
-                       {value_write}),
-            typed_rule(KernelId::SDPA_FLASH_ATTN_SPM, 52,
-                       {key_read, value_read}),
-            explicit_no_ddr_rule(
-                KernelId::LLM_ALL_REDUCE_RESIDUAL_RING_PACED, 105,
-                GraphKernelNoDdrProof::RingAllReduceSpmResidual),
-            intrinsic_no_ddr_rule(KernelId::MEMSET_SPM_MULTI_CORE_V2, 50),
-            intrinsic_no_ddr_rule(KernelId::LAYER_NORM, 49),
-            intrinsic_no_ddr_rule(KernelId::RMS_NORM_BF16_SPM, 113),
-            intrinsic_no_ddr_rule(KernelId::BINARY_SAMESHAPE, 28),
-            intrinsic_no_ddr_rule(KernelId::UNARY_SPM, 28),
-            intrinsic_no_ddr_rule(KernelId::UNARY_GELU_TANH_SPM, 24),
-            intrinsic_no_ddr_rule(KernelId::UNARY_GELU_ERF_SPM, 1),
-            explicit_dynamic_no_ddr_rule(
-                "fill", 1, GraphKernelNoDdrProof::FillSpm),
-            explicit_dynamic_no_ddr_rule(
-                "slice_single_axis", 2,
-                GraphKernelNoDdrProof::SliceSpm),
-        };
-
-        value.expected_node_count = 10052;
-        value.expected_dma_count = 3337;
-        value.expected_barrier_count = 5712;
-        value.expected_kernel_count = 1003;
-        value.expected_typed_kernel_count = 602;
-        value.expected_no_ddr_kernel_count = 401;
-        value.expected_operand_count = 766;
-        value.expected_weight_operand_count = 454;
-        value.expected_key_cache_operand_count = 104;
-        value.expected_value_cache_operand_count = 104;
-        value.expected_semantic_input_operand_count = 104;
-        value.expected_ordered_node_kind_hash =
-            UINT64_C(0xa3d08d6dc871e859);
-        value.expected_ordered_kernel_hash =
-            UINT64_C(0xef7fcd5d46561585);
-        value.phases = {
-            GraphKernelRegisterPhaseExpectation{
-                "vision",
-                phase_stats(
-                    6957, 2416, 4102, 439, 266, 173,
-                    290, 146, 48, 48, 48,
-                    UINT64_C(0xdcc64c17aa5e7f45),
-                    UINT64_C(0xeb9c5bbe550fd821))},
-            GraphKernelRegisterPhaseExpectation{
-                "handoff",
-                phase_stats(
-                    47, 16, 28, 3, 0, 3,
-                    0, 0, 0, 0, 0,
-                    UINT64_C(0xa21f233d7817267b),
-                    UINT64_C(0x88028aeb1847a09c))},
-            GraphKernelRegisterPhaseExpectation{
-                "text",
-                phase_stats(
-                    3048, 905, 1582, 561, 336, 225,
-                    476, 308, 56, 56, 56,
-                    UINT64_C(0xa3cf00264ef1eb03),
-                    UINT64_C(0x40a4fb74c129a684))},
-        };
-        return value;
-    }();
-    return policy;
+    return rpu_pl_census::policy("qwen3vl_pooler_z1_register_policy");
 }
 
 const GraphKernelRegisterPolicy& qwen3vl_pooler_ds1_register_policy() {
-    // Frozen from the pooler policy plus the existing Vision merger emitted
-    // immediately at tap 5 and one existing Text layer-0 SPM add.  The first
-    // guarded BUILD validates the exact address-independent stream.
-    static const GraphKernelRegisterPolicy policy = [] {
-        GraphKernelRegisterPolicy value;
-        value.fingerprint = UINT64_C(0x5133564c44533133);  // Q3VLDS13
-        value.name = "qwen3vl_pooler_ds1_register_census_v3";
-
-        const auto weight = ddr_abi(
-            GraphDdrRegisterRole::ModelWeight,
-            GraphDdrRegisterAccess::Read, 2, 3);
-        const auto key_write = ddr_abi(
-            GraphDdrRegisterRole::KeyCache,
-            GraphDdrRegisterAccess::Write, 8, 9);
-        const auto value_write = ddr_abi(
-            GraphDdrRegisterRole::ValueCache,
-            GraphDdrRegisterAccess::Write, 8, 9);
-        const auto key_read = ddr_abi(
-            GraphDdrRegisterRole::KeyCache,
-            GraphDdrRegisterAccess::Read, 50, 51);
-        const auto value_read = ddr_abi(
-            GraphDdrRegisterRole::ValueCache,
-            GraphDdrRegisterAccess::Read, 52, 53);
-        const auto rope_position = ddr_abi(
-            GraphDdrRegisterRole::SemanticInput,
-            GraphDdrRegisterAccess::Read, 0, 1);
-        const auto mrope_cos = ddr_abi(
-            GraphDdrRegisterRole::ModelWeight,
-            GraphDdrRegisterAccess::Read, 6, 7);
-        const auto mrope_sin = ddr_abi(
-            GraphDdrRegisterRole::ModelWeight,
-            GraphDdrRegisterAccess::Read, 8, 9);
-        const auto mrope_position = ddr_abi(
-            GraphDdrRegisterRole::SemanticInput,
-            GraphDdrRegisterAccess::Read, 12, 13);
-
-        value.rules = {
-            typed_rule(KernelId::PL_AT_FP16_M320N128, 52, {weight}),
-            typed_rule(KernelId::PL_AT_FP16_M384N96, 164, {weight}),
-            typed_rule(KernelId::PL_AT_FP16_M480N64, 128, {weight}),
-            typed_rule(KernelId::ROPE_2D_SPM, 48, {rope_position}),
-            typed_rule(KernelId::MROPE, 56,
-                       {mrope_cos, mrope_sin, mrope_position}),
-            typed_rule(KernelId::LLAMA_INSERT_KCACHE_V16, 52,
-                       {key_write}),
-            typed_rule(KernelId::LLAMA_INSERT_VCACHE_V16, 52,
-                       {value_write}),
-            typed_rule(KernelId::SDPA_FLASH_ATTN_SPM, 52,
-                       {key_read, value_read}),
-            explicit_no_ddr_rule(
-                KernelId::LLM_ALL_REDUCE_RESIDUAL_RING_PACED, 106,
-                GraphKernelNoDdrProof::RingAllReduceSpmResidual),
-            intrinsic_no_ddr_rule(KernelId::MEMSET_SPM_MULTI_CORE_V2, 52),
-            intrinsic_no_ddr_rule(KernelId::LAYER_NORM, 50),
-            intrinsic_no_ddr_rule(KernelId::RMS_NORM_BF16_SPM, 113),
-            intrinsic_no_ddr_rule(KernelId::BINARY_SAMESHAPE, 29),
-            intrinsic_no_ddr_rule(KernelId::UNARY_SPM, 28),
-            intrinsic_no_ddr_rule(KernelId::UNARY_GELU_TANH_SPM, 24),
-            intrinsic_no_ddr_rule(KernelId::UNARY_GELU_ERF_SPM, 2),
-            explicit_dynamic_no_ddr_rule(
-                "fill", 1, GraphKernelNoDdrProof::FillSpm),
-            explicit_dynamic_no_ddr_rule(
-                "slice_single_axis", 2,
-                GraphKernelNoDdrProof::SliceSpm),
-        };
-
-        value.expected_node_count = 10127;
-        value.expected_dma_count = 3362;
-        value.expected_barrier_count = 5754;
-        value.expected_kernel_count = 1011;
-        value.expected_typed_kernel_count = 604;
-        value.expected_no_ddr_kernel_count = 407;
-        value.expected_operand_count = 768;
-        value.expected_weight_operand_count = 456;
-        value.expected_key_cache_operand_count = 104;
-        value.expected_value_cache_operand_count = 104;
-        value.expected_semantic_input_operand_count = 104;
-        value.expected_ordered_node_kind_hash =
-            UINT64_C(0xbd88d2887877515d);
-        value.expected_ordered_kernel_hash =
-            UINT64_C(0xc0f97cf612a17608);
-        value.phases = {
-            GraphKernelRegisterPhaseExpectation{
-                "vision",
-                phase_stats(
-                    7031, 2441, 4144, 446, 268, 178,
-                    292, 148, 48, 48, 48,
-                    UINT64_C(0x94c72c177a2770b7),
-                    UINT64_C(0x564531093ab6d335))},
-            GraphKernelRegisterPhaseExpectation{
-                "handoff",
-                phase_stats(
-                    47, 16, 28, 3, 0, 3,
-                    0, 0, 0, 0, 0,
-                    UINT64_C(0xa21f233d7817267b),
-                    UINT64_C(0x88028aeb1847a09c))},
-            GraphKernelRegisterPhaseExpectation{
-                "text",
-                phase_stats(
-                    3049, 905, 1582, 562, 336, 226,
-                    476, 308, 56, 56, 56,
-                    UINT64_C(0x4ac36c18252961c9),
-                    UINT64_C(0x426d67efee2c461d))},
-        };
-        return value;
-    }();
-    return policy;
+    return rpu_pl_census::policy("qwen3vl_pooler_ds1_register_policy");
 }
 
 const GraphKernelRegisterPolicy& qwen3vl_pooler_ds3_register_policy() {
-    static const GraphKernelRegisterPolicy policy = [] {
-        GraphKernelRegisterPolicy value;
-        value.fingerprint = UINT64_C(0x5133564c44533333);  // Q3VLDS33
-        value.name = "qwen3vl_pooler_ds3_register_census_v3";
-
-        const auto weight = ddr_abi(
-            GraphDdrRegisterRole::ModelWeight,
-            GraphDdrRegisterAccess::Read, 2, 3);
-        const auto key_write = ddr_abi(
-            GraphDdrRegisterRole::KeyCache,
-            GraphDdrRegisterAccess::Write, 8, 9);
-        const auto value_write = ddr_abi(
-            GraphDdrRegisterRole::ValueCache,
-            GraphDdrRegisterAccess::Write, 8, 9);
-        const auto key_read = ddr_abi(
-            GraphDdrRegisterRole::KeyCache,
-            GraphDdrRegisterAccess::Read, 50, 51);
-        const auto value_read = ddr_abi(
-            GraphDdrRegisterRole::ValueCache,
-            GraphDdrRegisterAccess::Read, 52, 53);
-        const auto rope_position = ddr_abi(
-            GraphDdrRegisterRole::SemanticInput,
-            GraphDdrRegisterAccess::Read, 0, 1);
-        const auto mrope_cos = ddr_abi(
-            GraphDdrRegisterRole::ModelWeight,
-            GraphDdrRegisterAccess::Read, 6, 7);
-        const auto mrope_sin = ddr_abi(
-            GraphDdrRegisterRole::ModelWeight,
-            GraphDdrRegisterAccess::Read, 8, 9);
-        const auto mrope_position = ddr_abi(
-            GraphDdrRegisterRole::SemanticInput,
-            GraphDdrRegisterAccess::Read, 12, 13);
-
-        value.rules = {
-            typed_rule(KernelId::PL_AT_FP16_M320N128, 52, {weight}),
-            typed_rule(KernelId::PL_AT_FP16_M384N96, 168, {weight}),
-            typed_rule(KernelId::PL_AT_FP16_M480N64, 128, {weight}),
-            typed_rule(KernelId::ROPE_2D_SPM, 48, {rope_position}),
-            typed_rule(KernelId::MROPE, 56,
-                       {mrope_cos, mrope_sin, mrope_position}),
-            typed_rule(KernelId::LLAMA_INSERT_KCACHE_V16, 52,
-                       {key_write}),
-            typed_rule(KernelId::LLAMA_INSERT_VCACHE_V16, 52,
-                       {value_write}),
-            typed_rule(KernelId::SDPA_FLASH_ATTN_SPM, 52,
-                       {key_read, value_read}),
-            explicit_no_ddr_rule(
-                KernelId::LLM_ALL_REDUCE_RESIDUAL_RING_PACED, 108,
-                GraphKernelNoDdrProof::RingAllReduceSpmResidual),
-            intrinsic_no_ddr_rule(KernelId::MEMSET_SPM_MULTI_CORE_V2, 56),
-            intrinsic_no_ddr_rule(KernelId::LAYER_NORM, 52),
-            intrinsic_no_ddr_rule(KernelId::RMS_NORM_BF16_SPM, 113),
-            intrinsic_no_ddr_rule(KernelId::BINARY_SAMESHAPE, 31),
-            intrinsic_no_ddr_rule(KernelId::UNARY_SPM, 28),
-            intrinsic_no_ddr_rule(KernelId::UNARY_GELU_TANH_SPM, 24),
-            intrinsic_no_ddr_rule(KernelId::UNARY_GELU_ERF_SPM, 4),
-            explicit_dynamic_no_ddr_rule(
-                "fill", 1, GraphKernelNoDdrProof::FillSpm),
-            explicit_dynamic_no_ddr_rule(
-                "slice_single_axis", 2,
-                GraphKernelNoDdrProof::SliceSpm),
-        };
-
-        value.expected_node_count = 10277;
-        value.expected_dma_count = 3412;
-        value.expected_barrier_count = 5838;
-        value.expected_kernel_count = 1027;
-        value.expected_typed_kernel_count = 608;
-        value.expected_no_ddr_kernel_count = 419;
-        value.expected_operand_count = 772;
-        value.expected_weight_operand_count = 460;
-        value.expected_key_cache_operand_count = 104;
-        value.expected_value_cache_operand_count = 104;
-        value.expected_semantic_input_operand_count = 104;
-        value.expected_ordered_node_kind_hash =
-            UINT64_C(0xacaca5524c817c49);
-        value.expected_ordered_kernel_hash =
-            UINT64_C(0x2432d00094747250);
-        value.phases = {
-            GraphKernelRegisterPhaseExpectation{
-                "vision",
-                phase_stats(
-                    7179, 2491, 4228, 460, 272, 188,
-                    296, 152, 48, 48, 48,
-                    UINT64_C(0x9279f1545ffacb9b),
-                    UINT64_C(0xcf5fef9e2fa1b385))},
-            GraphKernelRegisterPhaseExpectation{
-                "handoff",
-                phase_stats(
-                    47, 16, 28, 3, 0, 3,
-                    0, 0, 0, 0, 0,
-                    UINT64_C(0xa21f233d7817267b),
-                    UINT64_C(0x88028aeb1847a09c))},
-            GraphKernelRegisterPhaseExpectation{
-                "text",
-                phase_stats(
-                    3051, 905, 1582, 564, 336, 228,
-                    476, 308, 56, 56, 56,
-                    UINT64_C(0x01f2f9249027e721),
-                    UINT64_C(0xd030a24b4f411df5))},
-        };
-        return value;
-    }();
-    return policy;
+    return rpu_pl_census::policy("qwen3vl_pooler_ds3_register_policy");
 }
 
-const GraphKernelRegisterPolicy&
-qwen3vl_pooler_ds3_partial_mrope_register_policy() {
-    // The node stream is identical to the legacy DS3 policy except that the
-    // 56 Text Q/K RoPE nodes use partial_mrope.  The kernel-name hashes are a
-    // deterministic substitution over the latest-oplib DS3 BUILD dump; the
-    // two model-owned cos/sin keepalives replace MROPE's three DDR operands.
-    static const GraphKernelRegisterPolicy policy = [] {
-        GraphKernelRegisterPolicy value =
-            qwen3vl_pooler_ds3_register_policy();
-        value.fingerprint = UINT64_C(0x5133564c44535034);  // Q3VLDSP4
-        value.name =
-            "qwen3vl_pooler_ds3_partial_mrope_register_census_v4";
-
-        bool replaced = false;
-        for (auto& rule : value.rules) {
-            if (rule.kernel_id == KernelId::MROPE) {
-                rule.kernel_id = KernelId::PARTIAL_MROPE;
-                rule.operands = {
-                    ddr_abi(
-                        GraphDdrRegisterRole::SemanticInput,
-                        GraphDdrRegisterAccess::Read, 0, 1),
-                    ddr_abi(
-                        GraphDdrRegisterRole::SemanticInput,
-                        GraphDdrRegisterAccess::Read, 2, 3),
-                };
-                replaced = true;
-            }
-        }
-        TORCH_INTERNAL_ASSERT(replaced);
-
-        value.expected_operand_count = 716;
-        value.expected_weight_operand_count = 348;
-        value.expected_semantic_input_operand_count = 160;
-        value.expected_ordered_kernel_hash =
-            UINT64_C(0x96f763aafa93dc70);
-        TORCH_INTERNAL_ASSERT(value.phases.size() == 3 &&
-                              value.phases[2].name == "text");
-        value.phases[2].stats.operand_count = 420;
-        value.phases[2].stats.weight_operand_count = 196;
-        value.phases[2].stats.semantic_input_operand_count = 112;
-        value.phases[2].stats.ordered_kernel_hash =
-            UINT64_C(0x63af0dcc2969bed5);
-        return value;
-    }();
-    return policy;
+const GraphKernelRegisterPolicy& qwen3vl_pooler_ds3_partial_mrope_register_policy() {
+    return rpu_pl_census::policy("qwen3vl_pooler_ds3_partial_mrope_register_policy");
 }
 
 const GraphKernelRegisterPolicy& groot_n17_pooler_ds3_register_policy() {
-    static const GraphKernelRegisterPolicy policy = [] {
-        GraphKernelRegisterPolicy value;
-        value.fingerprint = UINT64_C(0x4752544453335633);  // GRTDS3V3
-        value.name = "groot_n17_pooler_ds3_register_census_v3";
-
-        const auto weight = ddr_abi(
-            GraphDdrRegisterRole::ModelWeight,
-            GraphDdrRegisterAccess::Read, 2, 3);
-        const auto key_write = ddr_abi(
-            GraphDdrRegisterRole::KeyCache,
-            GraphDdrRegisterAccess::Write, 8, 9);
-        const auto value_write = ddr_abi(
-            GraphDdrRegisterRole::ValueCache,
-            GraphDdrRegisterAccess::Write, 8, 9);
-        const auto key_read = ddr_abi(
-            GraphDdrRegisterRole::KeyCache,
-            GraphDdrRegisterAccess::Read, 50, 51);
-        const auto value_read = ddr_abi(
-            GraphDdrRegisterRole::ValueCache,
-            GraphDdrRegisterAccess::Read, 52, 53);
-        const auto rope_position = ddr_abi(
-            GraphDdrRegisterRole::SemanticInput,
-            GraphDdrRegisterAccess::Read, 0, 1);
-        const auto mrope_cos = ddr_abi(
-            GraphDdrRegisterRole::ModelWeight,
-            GraphDdrRegisterAccess::Read, 6, 7);
-        const auto mrope_sin = ddr_abi(
-            GraphDdrRegisterRole::ModelWeight,
-            GraphDdrRegisterAccess::Read, 8, 9);
-        const auto mrope_position = ddr_abi(
-            GraphDdrRegisterRole::SemanticInput,
-            GraphDdrRegisterAccess::Read, 12, 13);
-
-        value.rules = {
-            typed_rule(KernelId::PL_AT_FP16_M320N128, 40, {weight}),
-            typed_rule(KernelId::PL_AT_FP16_M384N96, 120, {weight}),
-            typed_rule(KernelId::PL_AT_FP16_M480N64, 104, {weight}),
-            typed_rule(KernelId::ROPE_2D_SPM, 48, {rope_position}),
-            typed_rule(KernelId::MROPE, 32,
-                       {mrope_cos, mrope_sin, mrope_position}),
-            typed_rule(KernelId::LLAMA_INSERT_KCACHE_V16, 40,
-                       {key_write}),
-            typed_rule(KernelId::LLAMA_INSERT_VCACHE_V16, 40,
-                       {value_write}),
-            typed_rule(KernelId::SDPA_FLASH_ATTN_SPM, 40,
-                       {key_read, value_read}),
-            explicit_no_ddr_rule(
-                KernelId::LLM_ALL_REDUCE_RESIDUAL_RING_PACED, 84,
-                GraphKernelNoDdrProof::RingAllReduceSpmResidual),
-            intrinsic_no_ddr_rule(KernelId::MEMSET_SPM_MULTI_CORE_V2, 56),
-            intrinsic_no_ddr_rule(KernelId::LAYER_NORM, 52),
-            intrinsic_no_ddr_rule(KernelId::RMS_NORM_BF16_SPM, 65),
-            intrinsic_no_ddr_rule(KernelId::BINARY_SAMESHAPE, 19),
-            intrinsic_no_ddr_rule(KernelId::UNARY_SPM, 16),
-            intrinsic_no_ddr_rule(KernelId::UNARY_GELU_TANH_SPM, 24),
-            intrinsic_no_ddr_rule(KernelId::UNARY_GELU_ERF_SPM, 4),
-            explicit_dynamic_no_ddr_rule(
-                "fill", 1, GraphKernelNoDdrProof::FillSpm),
-            explicit_dynamic_no_ddr_rule(
-                "slice_single_axis", 2,
-                GraphKernelNoDdrProof::SliceSpm),
-        };
-
-        value.expected_node_count = 8981;
-        value.expected_dma_count = 3028;
-        value.expected_barrier_count = 5166;
-        value.expected_kernel_count = 787;
-        value.expected_typed_kernel_count = 464;
-        value.expected_no_ddr_kernel_count = 323;
-        value.expected_operand_count = 568;
-        value.expected_weight_operand_count = 328;
-        value.expected_key_cache_operand_count = 80;
-        value.expected_value_cache_operand_count = 80;
-        value.expected_semantic_input_operand_count = 80;
-        value.expected_ordered_node_kind_hash =
-            UINT64_C(0xf94c8ed7da98d029);
-        value.expected_ordered_kernel_hash =
-            UINT64_C(0x50ab7f6c7f63c5f0);
-        value.phases = {
-            GraphKernelRegisterPhaseExpectation{
-                "vision",
-                phase_stats(
-                    7179, 2491, 4228, 460, 272, 188,
-                    296, 152, 48, 48, 48,
-                    UINT64_C(0x9279f1545ffacb9b),
-                    UINT64_C(0xcf5fef9e2fa1b385))},
-            GraphKernelRegisterPhaseExpectation{
-                "handoff",
-                phase_stats(
-                    47, 16, 28, 3, 0, 3,
-                    0, 0, 0, 0, 0,
-                    UINT64_C(0xa21f233d7817267b),
-                    UINT64_C(0x88028aeb1847a09c))},
-            GraphKernelRegisterPhaseExpectation{
-                "text",
-                phase_stats(
-                    1755, 521, 910, 324, 192, 132,
-                    272, 176, 32, 32, 32,
-                    UINT64_C(0x4323d1115effb901),
-                    UINT64_C(0x0556eab27b7313c5))},
-        };
-        return value;
-    }();
-    return policy;
+    return rpu_pl_census::policy("groot_n17_pooler_ds3_register_policy");
 }
 
 void validate_text_hidden(const at::Tensor& hidden, const char* op) {
@@ -1430,7 +999,8 @@ int64_t rpu_qwen3vl_pooler_spm_z1_prepare(
     int64_t real_len,
     int64_t retained_deepstack_count,
     at::IntArrayRef vision_stage_descriptor,
-    at::IntArrayRef text_stage_descriptor) {
+    at::IntArrayRef text_stage_descriptor,
+    bool partial_mrope) {
     TORCH_CHECK(!RpuKernelGraph::has_active(),
                 "qwen3vl_pooler_spm_z1_prepare must run outside Graph capture");
     TORCH_CHECK(vision_handle > 0 && text_handle > 0,
@@ -1470,6 +1040,8 @@ int64_t rpu_qwen3vl_pooler_spm_z1_prepare(
             (void)v3::qwen3vl_pooler_z1_internal::multiview_text_owner(text_handle)
                 .kvinsert_cost_domain("causal_decoder", text_stage_descriptor);
         }
+        (void)v3::qwen3vl_pooler_z1_internal::text_stage_descriptor(
+            text_handle, partial_mrope);
         return encode_u64(s.plan_hash);
     }
 
@@ -1483,12 +1055,12 @@ int64_t rpu_qwen3vl_pooler_spm_z1_prepare(
         text_prepare_attempted = true;
         const auto text_layout = retained_deepstack_count == 3
             ? v3::qwen3vl_pooler_z1_internal::prepare_text_deepstack3(
-                  text_handle, execution_len, real_len, text_stage_descriptor)
+                  text_handle, execution_len, real_len, text_stage_descriptor, partial_mrope)
             : (retained_deepstack_count == 1
                    ? v3::qwen3vl_pooler_z1_internal::prepare_text_deepstack1(
-                         text_handle, execution_len, real_len, text_stage_descriptor)
+                         text_handle, execution_len, real_len, text_stage_descriptor, partial_mrope)
                    : v3::qwen3vl_pooler_z1_internal::prepare_text(
-                         text_handle, execution_len, real_len, text_stage_descriptor));
+                         text_handle, execution_len, real_len, text_stage_descriptor, partial_mrope));
         TORCH_CHECK(vision_layout.temporary_bytes ==
                         kComponentTemporaryBytes &&
                         text_layout.temporary_bytes ==
@@ -1548,9 +1120,8 @@ int64_t rpu_qwen3vl_pooler_spm_z1_prepare(
         s.route_hash = route.hash();
         s.plan_hash = plan.hash();
         s.vision_stage_descriptor = v3::qwen3vl_pooler_z1_internal::vision_stage_descriptor(vision_handle);
-        s.text_stage_descriptor = text_stage_descriptor.empty()
-            ? v3::qwen3vl_pooler_z1_internal::text_stage_descriptor(text_handle, false)
-            : text_stage_descriptor.vec();
+        s.text_stage_descriptor = v3::qwen3vl_pooler_z1_internal::text_stage_descriptor(
+            text_handle, partial_mrope);
         s.retained_deepstack_count = retained_deepstack_count;
         s.plan = std::move(plan);
         validate_prepared_locked(s, "qwen3vl_pooler_spm_z1_prepare");
@@ -1734,6 +1305,9 @@ std::vector<std::vector<int64_t>> rpu_qwen3vl_pooler_spm_z1_recorded_ranges(
          static_cast<int64_t>(ranges.whole.node_count)}};
     for (size_t phase = 0; phase < ranges.windows.size(); ++phase) {
         const auto& window = ranges.windows[phase];
+        // Private BUILD windows were authenticated against the exact prepared
+        // descriptor above. Keep the metadata in exported node coordinates.
+        validate_groot_component_window_kinds(window, phase);
         std::vector<int64_t> row{
             static_cast<int64_t>(phase + 1), static_cast<int64_t>(window.begin),
             static_cast<int64_t>(window.end), static_cast<int64_t>(window.kind_mask),
@@ -1742,7 +1316,8 @@ std::vector<std::vector<int64_t>> rpu_qwen3vl_pooler_spm_z1_recorded_ranges(
             if (kind == GraphNodeKind::Kernel) ++row[5];
             else if (kind == GraphNodeKind::Dma) ++row[6];
             else if (kind == GraphNodeKind::Barrier) ++row[7];
-            else TORCH_CHECK(false, "GR00T Z1 recorded range contains a non-batch node");
+            else TORCH_CHECK(kind == GraphNodeKind::Branch,
+                             "GR00T Z1 recorded range contains a non-batch node");
             row.push_back(static_cast<int64_t>(kind));
         }
         rows.push_back(std::move(row));
@@ -2355,6 +1930,7 @@ at::Tensor rpu_qwen3vl_pooler_spm_z1_pipeline_forward(
     if (groot_profile) {
         auto& s = state();
         std::lock_guard<std::mutex> lock(s.mutex);
+        seal_recorded_ranges_topology_locked(s, RpuKernelGraph::active());
         s.recorded_ranges.observed_invocation = invocation_generation;
     }
     return result;

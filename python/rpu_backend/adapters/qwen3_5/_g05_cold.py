@@ -62,7 +62,7 @@ def _check_g05_vlm_profile(config) -> None:
     )
     if profile != _G05_VLM_PROFILE:
         raise UnsupportedModelError(
-            "G0.5 device bring-up supports only the canonical Qwen3.5-2B VLM "
+            "G0.5 RPU bring-up supports only the canonical Qwen3.5-2B VLM "
             f"profile; got {profile}."
         )
 
@@ -97,7 +97,7 @@ def _check_g05_action_profile(config) -> None:
     )
     if profile != _ACTION_PROFILE:
         raise UnsupportedModelError(
-            "G0.5 device action bring-up supports only the canonical "
+            "G0.5 RPU action bring-up supports only the canonical "
             f"Qwen3.5 action-expert profile; got {profile}."
         )
 

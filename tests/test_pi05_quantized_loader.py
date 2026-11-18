@@ -22,6 +22,7 @@ def test_loader_passes_loaded_group_config_and_preserves_mixed_weights(tmp_path,
             pawe.paligemma.lm_head = torch.nn.Linear(64, 128, bias=False)
             pawe.paligemma.model = torch.nn.Module()
             pawe.paligemma.model.language_model = torch.nn.Module()
+            pawe.paligemma.model.language_model.embed_tokens = None
             pawe.gemma_expert = torch.nn.Module()
             pawe.gemma_expert.lm_head = torch.nn.Linear(64, 128, bias=False)
             layer = torch.nn.Module()

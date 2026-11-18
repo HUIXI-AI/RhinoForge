@@ -18,7 +18,7 @@ from torch import nn
 from safetensors import safe_open
 from transformers import AutoConfig, AutoModelForCausalLM
 
-from .convert_qwen3_w4a16 import _PROJECTIONS, pack_linear_int4_
+from .convert_qwen3_w4a16 import _PROJECTIONS, pack_linear_int4_, packed_mlp_padded_size
 from .int4_pgrp_pack import quantize_pack_int4_pgrp_col_bounded
 from .load import (
     _allocate_decoder_projection_views, _install_parameter,
@@ -26,7 +26,7 @@ from .load import (
     _resolve_checkpoint_dir, _safetensor_shards,
 )
 from .qwen3_profiles import (
-    is_qwen3_32b_w8a16_config, qwen3_dense_quant_profile,
+    is_qwen3_32b_w8a16_config, qwen3_dense_quant_profile, qwen3_w4_topology,
 )
 
 
@@ -200,7 +200,8 @@ def _move_packed_layer(model, index):
 
 
 @torch.inference_mode(False)
-def materialize_staged_qwen3_w4a16_for_rpu(model, *, quantization: str) -> None:
+def materialize_staged_qwen3_w4a16_for_rpu(model, *, quantization: str,
+                                         topology=None) -> None:
     """Consume the plan into final device layouts after adapter claim and poison."""
     from rpu_backend.runtime.weights import (
         _release_cpu_weight_pages, transform_linear_weight,
@@ -208,6 +209,10 @@ def materialize_staged_qwen3_w4a16_for_rpu(model, *, quantization: str) -> None:
     if vars(model).get("_rpu_swizzle_started") is not True:
         raise RuntimeError("Qwen3 staged W4 migration requires adapter ownership/poison first")
     validate_staged_qwen3_w4a16(model, quantization=quantization)
+    if topology is None:
+        topology = qwen3_w4_topology(model.config, 8)
+    if topology != qwen3_w4_topology(model.config, topology.num_cores):
+        raise ValueError("Qwen3 staged W4 topology differs from the packed source geometry")
     plan = vars(model)[_PLAN_ATTR]
     locations = dict(plan.tensor_shards)
     with ExitStack() as stack:
@@ -226,9 +231,14 @@ def materialize_staged_qwen3_w4a16_for_rpu(model, *, quantization: str) -> None:
             layer = model.model.layers[index]
             for role, partition in _PROJECTIONS:
                 projection = layer.get_submodule(role)
-                pack_linear_int4_(projection, partition, name=f"{index}.{role}", group_size=32)
+                cores = topology.mlp_tp if role.startswith("mlp.") else topology.attn_tp
+                # Six-lane MLP: zero-pad after logical quantization, pack once.
+                pack_linear_int4_(projection, partition, name=f"{index}.{role}",
+                                  group_size=32, num_cores=cores,
+                                  padded_size=packed_mlp_padded_size(
+                                      role, projection, topology.mlp_tp))
                 projection._rpu_linear_partition = partition
-                projection._rpu_linear_num_cores = 8
+                projection._rpu_linear_num_cores = cores
             _move_packed_layer(model, index)
             _release_cpu_weight_pages()
         for name in plan.nondecoder_tensor_names:
@@ -236,15 +246,18 @@ def materialize_staged_qwen3_w4a16_for_rpu(model, *, quantization: str) -> None:
             if name == "lm_head.weight":
                 head = model.lm_head
                 if quantization == "w4a16_lm_head":
-                    weight, scale = quantize_pack_int4_pgrp_col_bounded(head.weight.detach())
+                    weight, scale = quantize_pack_int4_pgrp_col_bounded(
+                        head.weight.detach(), num_cores=topology.lm_head_tp)
                     head.weight = nn.Parameter(weight, requires_grad=False)
                     head.register_buffer("weight_scale", scale, persistent=False)
                     del weight, scale
                 else:
                     head.weight = nn.Parameter(
-                        transform_linear_weight(head.weight.detach(), 1), requires_grad=False)
+                        transform_linear_weight(head.weight.detach(), 1,
+                                                num_cores=topology.lm_head_tp),
+                        requires_grad=False)
                 head._rpu_linear_partition = 1
-                head._rpu_linear_num_cores = 8
+                head._rpu_linear_num_cores = topology.lm_head_tp
                 head.to("rpu")
             else:
                 module_name, parameter_name = name.rsplit(".", 1)

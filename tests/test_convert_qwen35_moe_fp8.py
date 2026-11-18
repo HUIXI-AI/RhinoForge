@@ -226,13 +226,18 @@ def test_interrupt_does_not_publish_partial_checkpoint(tmp_path, monkeypatch):
 def test_standalone_cli_runs_on_cpu_and_rejects_wrong_profile(tmp_path):
     src, _ = source(tmp_path)
     script = Path(converter.__file__).resolve()
+    repo_root = script.parents[3].resolve()
+    excluded = {repo_root, (repo_root / "python").resolve()}
+    dep_paths = [
+        p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep)
+        if p and Path(p).resolve() not in excluded
+    ]
     env = dict(os.environ, TORCH_DEVICE_BACKEND_AUTOLOAD="0", PYTHONNOUSERSITE="1")
-    # The CI venv gets dependencies through PYTHONPATH. Keep only that directory,
-    # excluding the repository paths, while testing the standalone CPU script.
-    env.pop("PYTHONPATH", None)
-    if dependencies := os.environ.get("RPU_HOST_SITE_PACKAGES"):
-        env["PYTHONPATH"] = dependencies
-    result = subprocess.run([sys.executable, "-P", "-s", str(script), "--src", str(src),
+    if dep_paths:
+        env["PYTHONPATH"] = os.pathsep.join(dep_paths)
+    else:
+        env.pop("PYTHONPATH", None)
+    result = subprocess.run([sys.executable, "-s", "-P", str(script), "--src", str(src),
                              "--dst", str(tmp_path / "output"), "--threads", "1"],
                             cwd=tmp_path, env=env, capture_output=True, text=True, timeout=45)
     assert result.returncode != 0

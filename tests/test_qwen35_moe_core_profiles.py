@@ -199,14 +199,16 @@ def test_public_example_core_choice_matches_its_registered_profile(monkeypatch, 
     spec = importlib.util.spec_from_file_location("moe_core_example", root / "examples/common/config.py")
     common = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(common)
-    suffix = f"_tp{cores}" if cores != 8 else ""
-    path = root / f"examples/configs/qwen3_5/vl/35b_a3b/fp8_e4m3_experts_attn_gdn{suffix}.toml"
-    assert common.load_config(path)["rpu_execution"]["model"]["num_cores"] == cores
-    bad = tmp_path / "mismatch.toml"
-    for wrong in (value for value in (4, 6, 8) if value != cores):
-        bad.write_text(path.read_text().replace(f"num_cores = {cores}", f"num_cores = {wrong}"))
-        with pytest.raises(common.ConfigError, match="fixed TP4/TP6/TP8 profile"):
-            common.load_config(bad)
+    path = root / "examples/configs/qwen3_5/vl/35b_a3b/fp8_e4m3_experts_attn_gdn.toml"
+    baseline = common.load_config(path)
+    selected = tmp_path / "selected.toml"
+    selected.write_text(path.read_text().replace("num_cores = 8", f"num_cores = {cores}"))
+    config = common.load_config(selected)
+    assert config["rpu_execution"]["model"]["num_cores"] == cores
+    assert config["example"]["profile_id"] == baseline["example"]["profile_id"]
+    selected.write_text(path.read_text().replace("num_cores = 8", "num_cores = 5"))
+    with pytest.raises(common.ConfigError, match="model.num_cores"):
+        common.load_config(selected)
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -222,5 +224,5 @@ def test_moe_text_accumulation_is_public_cold_and_immutable(monkeypatch, enabled
     instance = SimpleNamespace(model=SimpleNamespace(config=config()),
         preflight_execution=moe.Qwen3_5MoeAdapter.preflight_execution)
     monkeypatch.setattr(moe, "_qwen3_5_moe_cold_config_only", lambda _: False)
-    with pytest.raises(ValueError, match="immutable after device installation"):
+    with pytest.raises(ValueError, match="immutable after (RPU|device) installation"):
         moe._validate_qwen3_5_moe_execution_reconfigure(instance, selected)

@@ -1,4 +1,4 @@
-"""Compile actual Vision admission paths without opening an device device."""
+"""Compile actual Vision admission paths without opening an RPU device."""
 from pathlib import Path
 import shutil
 import subprocess
@@ -96,6 +96,13 @@ struct Vision : FusedModelBase {
         k_caches.assign(N,at::Tensor{1,128,4,hd/16,8,16,16});
         v_caches=k_caches;
     }
+    void quantize() {
+        std::vector<at::TensorList*> weights{&q_w_list,&k_w_list,&v_w_list,&o_w_list,&fc1_w_list,&fc2_w_list};
+        std::vector<at::TensorList*> scales{&q_scale_list,&k_scale_list,&v_scale_list,&o_scale_list,&fc1_scale_list,&fc2_scale_list};
+        for(size_t j=0;j<weights.size();++j)for(auto& w:*weights[j]) {
+            scales[j]->push_back(at::Tensor{w.size(0)});w.dtype=at::kChar;
+        }
+    }
     void weights() {
         const int64_t hidden_size=h, intermediate_size=intermediate, num_heads=heads, head_dim=hd;
         __LIST_GATE__
@@ -148,6 +155,16 @@ int main() {
         for (auto corrupt : bad_caches) {
             Vision bad;bad.configure(padded);corrupt(bad);bool rejected=false;
             try {bad.forward();} catch(const std::runtime_error&){rejected=true;}
+            assert(rejected && bad.commits==0);
+        }
+        Vision quant;quant.configure(padded);quant.quantize();quant.weights();quant.forward();assert(quant.commits==2);
+        for(int fault=0;fault<5;++fault){Vision bad;bad.configure(padded);bad.quantize();
+            if(fault==0)bad.q_scale_list.back().shape[0]-=16;
+            if(fault==1)bad.fc2_scale_list.clear();
+            if(fault==2)bad.v_w_list.back().dtype=at::kHalf;
+            if(fault==3)bad.o_scale_list.back().dtype=at::kFloat;
+            if(fault==4)bad.k_scale_list.back().where.kind=0;
+            bool rejected=false;try{bad.weights();}catch(const std::runtime_error&){rejected=true;}
             assert(rejected && bad.commits==0);
         }
         Vision legacy;legacy.configure(padded);legacy.cores=8;legacy.weights();assert(legacy.commits==1);

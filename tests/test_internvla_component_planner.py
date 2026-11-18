@@ -1,4 +1,3 @@
-from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -91,21 +90,19 @@ def test_controller_uses_one_session_and_selective_child_invalidation(
     monkeypatch, force_rebuild,
 ):
     owner = SimpleNamespace()
-    backbone = _child("_graph_cache")
-    navdp = _child("_gc")
-    controller = execution.InternVLAExecutionController(
-        owner,
-        {
-            execution.BACKBONE_COMPONENT: backbone,
-            execution.NAVDP_COMPONENT: navdp,
-        },
-    )
-    assert backbone._execution_session is controller.session
-    assert navdp._execution_session is controller.session
+    cache_names = {
+        execution.BACKBONE_COMPONENT: "_graph_cache",
+        execution.VISION_COMPONENT: "_graph_cache",
+        execution.RGB_COMPONENT: "_gc",
+        execution.DEPTH_COMPONENT: "_gc",
+        execution.FORMER_COMPONENT: "gc",
+        execution.NAVDP_COMPONENT: "_gc",
+        execution.NEXTDIT_COMPONENT: "_gc",
+    }
+    children = {component: _child(name) for component, name in cache_names.items()}
+    controller = execution.InternVLAExecutionController(owner, children)
+    assert all(child._execution_session is controller.session for child in children.values())
 
-    monkeypatch.setattr(
-        execution, "native_execution_reconfigure", lambda: nullcontext()
-    )
     patch = {
         "components": {
             execution.NAVDP_COMPONENT: {
@@ -117,10 +114,11 @@ def test_controller_uses_one_session_and_selective_child_invalidation(
         controller.session._reconfigure({}, force_rebuild=True)
     else:
         controller.reconfigure_rpu_execution(patch)
-    assert navdp._gc.clears == 1
-    assert backbone._graph_cache.clears == int(force_rebuild)
-    assert navdp._fmb_execution_generation == 1
-    assert backbone._fmb_execution_generation == int(force_rebuild)
+    for component, child in children.items():
+        changed = int(force_rebuild or component == execution.NAVDP_COMPONENT)
+        assert getattr(child, cache_names[component]).clears == changed
+        assert getattr(child, cache_names[component]).warmups == changed
+        assert child._fmb_execution_generation == changed
     assert controller.stats()["generation"] == 1
 
     with controller.execute():
@@ -155,6 +153,72 @@ def test_controller_rejects_config_for_absent_children():
         )
 
 
+@pytest.mark.parametrize("fault", ["partial_clear", "publish", "rollback_clear"])
+def test_shared_reconfigure_compensates_graph_and_publication_failures(monkeypatch, fault):
+    children = {
+        execution.NAVDP_COMPONENT: _child("_gc"),
+        execution.FORMER_COMPONENT: _child("_gc"),
+        execution.BACKBONE_COMPONENT: _child("_gc"),
+    }
+    controller = execution.InternVLAExecutionController(SimpleNamespace(), children)
+    old_config = controller.session.config
+    changed = {execution.NAVDP_COMPONENT, execution.FORMER_COMPONENT}
+    for component, child in children.items():
+        child._rpu_last_execution_plan = {"old": component}
+        child._rpu_last_execution_plans = {component: "old", "foreign": "keep"}
+        child._rpu_last_execution_receipts = {component: "old", "foreign": "keep"}
+    count, enabled = [0], [True]
+    for component in changed:
+        cache = children[component]._gc
+        original = cache.clear
+        def clear(original=original):
+            assert controller.session._lock._is_owned()
+            original()
+            count[0] += 1
+            if enabled[0] and ((fault == "partial_clear" and count[0] == 2)
+                               or fault == "rollback_clear"):
+                raise RuntimeError("graph cleanup interrupted")
+        monkeypatch.setattr(cache, "clear", clear)
+    publish = controller._publish
+    def interrupted_publish(*args, **kwargs):
+        assert controller.session._lock._is_owned()
+        publish(*args, **kwargs)
+        if enabled[0] and fault == "publish" and kwargs["generation"] == 1:
+            raise RuntimeError("configuration publication interrupted")
+    monkeypatch.setattr(controller, "_publish", interrupted_publish)
+    patch = {"components": {
+        execution.NAVDP_COMPONENT: {"action": {"chunk_size": 32}},
+        execution.FORMER_COMPONENT: {"vision": {"chunk_size": 32}},
+    }}
+    with pytest.raises(RuntimeError, match="interrupted") as caught:
+        controller.reconfigure_rpu_execution(patch)
+    assert controller.session.config == old_config
+    assert controller.session.generation == 0
+    assert all(child._fmb_execution_generation == 0 for child in children.values())
+    untouched = children[execution.BACKBONE_COMPONENT]
+    assert untouched._gc.clears == 0
+    assert untouched._rpu_last_execution_plan == {"old": execution.BACKBONE_COMPONENT}
+    if fault == "rollback_clear":
+        assert controller.session.stats()["state"] == "POISONED"
+        assert any("rollback failed" in note for note in caught.value.__notes__)
+        with pytest.raises(RuntimeError, match="poisoned"):
+            controller.reconfigure_rpu_execution(patch)
+    else:
+        assert controller.session.stats()["state"] == "QUIESCENT"
+        assert controller._component_generations == dict.fromkeys(children, 0)
+        for component in changed:
+            child = children[component]
+            assert child._gc.clears == 2
+            assert not hasattr(child, "_rpu_last_execution_plan")
+            assert child._rpu_last_execution_plans == {"foreign": "keep"}
+            assert child._rpu_last_execution_receipts == {"foreign": "keep"}
+        enabled[0] = False
+        controller.reconfigure_rpu_execution(patch)
+        assert controller.session.generation == 1
+        assert all(children[component]._fmb_execution_generation == 1 for component in changed)
+    enabled[0] = False
+
+
 @pytest.mark.parametrize("legacy", ("auto", 16))
 def test_shared_vision_reads_parent_canonical_chunk_cold_hot_and_restored(monkeypatch, legacy):
     from rpu_backend.adapters.wall_oss import vision
@@ -170,7 +234,6 @@ def test_shared_vision_reads_parent_canonical_chunk_cold_hot_and_restored(monkey
         return 784, 784
     monkeypatch.setattr(vision, "plan_bounded_prefill_execution", plan)
     monkeypatch.setattr(vision, "_destroy_qwen25vl_vision_handle", lambda handle: None)
-    monkeypatch.setattr(execution, "native_execution_reconfigure", lambda: nullcontext())
     parent = SimpleNamespace()
     controller = execution.InternVLAExecutionController(parent, {execution.VISION_COMPONENT: child},
         {"components": {execution.VISION_COMPONENT: {"vision": {"chunk_size": 784}}}})

@@ -27,7 +27,6 @@ def test_public_from_pretrained_passes_arithmetic_to_real_adapter(
     if quantized:
         from test_qwen35_w8_core_profiles import _w8_config
         config = _w8_config()
-        monkeypatch.setenv("QWEN3_5_QUANT_ALLOW_UNCERTIFIED", "1")
     model = torch.nn.Module()
     model.config = config
     model.model = torch.nn.Module()

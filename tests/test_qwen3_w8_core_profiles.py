@@ -11,10 +11,16 @@ from rpu_backend.api import _execution
 from rpu_backend.runtime.decoder import _validate_decoder_w8_scale_lists
 
 
-def _config():
+SHAPES = ((1024, 3072, 28, 16), (2048, 6144, 28, 16),
+          (2560, 9728, 36, 32), (4096, 12288, 36, 32),
+          (5120, 17408, 40, 40), (5120, 25600, 64, 64))
+
+
+def _config(shape=SHAPES[1]):
+    hidden, intermediate, layers, heads = shape
     return Qwen3Config(
-        architectures=["Qwen3ForCausalLM"], hidden_size=2048, intermediate_size=6144,
-        num_hidden_layers=28, num_attention_heads=16, num_key_value_heads=8,
+        architectures=["Qwen3ForCausalLM"], hidden_size=hidden, intermediate_size=intermediate,
+        num_hidden_layers=layers, num_attention_heads=heads, num_key_value_heads=8,
         head_dim=128, vocab_size=151936, tie_word_embeddings=False, rms_norm_eps=1e-6,
         quant_config={"method": "w8a16", "mode": "per_channel_symmetric", "qaxis": 0,
             "skip_modules": [], "quantized_lm_head": True,
@@ -22,9 +28,9 @@ def _config():
             "embed_tokens_untied": False})
 
 
-def _model(cores):
+def _model(cores, shape=SHAPES[1]):
     with FakeTensorMode():
-        model = Qwen3ForCausalLM._from_config(_config(), dtype=torch.float16)
+        model = Qwen3ForCausalLM._from_config(_config(shape), dtype=torch.float16)
         for module in model.modules():
             if isinstance(module, torch.nn.Linear):
                 module.weight = torch.nn.Parameter(module.weight.to(torch.int8), requires_grad=False)
@@ -39,8 +45,9 @@ def safe_process(monkeypatch):
 
 
 @pytest.mark.parametrize("cores", (4, 6))
-def test_exact_w8_decoder_and_head_reach_claim_with_actual_cold_topology(monkeypatch, cores):
-    model = _model(cores)
+@pytest.mark.parametrize("shape", SHAPES)
+def test_exact_w8_decoder_and_head_reach_claim_with_actual_cold_topology(monkeypatch, cores, shape):
+    model = _model(cores, shape)
     adapter = qwen3.Qwen3Adapter(model)
     assert adapter._topology.identity() == (2, cores, 4, cores, 4, 8)
     assert model.lm_head.weight.dtype == torch.int8
@@ -90,7 +97,7 @@ def test_reduced_w8_rejects_changed_actual_inventory_before_claim(monkeypatch, f
 def test_reduced_w8_does_not_admit_nearby_profiles(fault):
     config = _config()
     if fault == "other_size":
-        config.hidden_size, config.intermediate_size = 1024, 3072
+        config.hidden_size, config.intermediate_size = 1024, 6144
     elif fault == "head_fp16_config":
         config.quant_config["quantized_lm_head"] = False
     elif fault == "quant_embedding":

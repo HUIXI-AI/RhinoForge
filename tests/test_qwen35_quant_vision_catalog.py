@@ -29,24 +29,26 @@ def test_quant_vision_example_binds_both_existing_contracts(common, size, bits, 
     assert profile["precision"] == config["example"]["dtype"] == f"w{bits}a16"
     assert profile["authority"] == profile["owner"] == vision["authority"]
     assert profile["controlled_gates"] == text["controlled_gates"] + vision["controlled_gates"]
-    assert profile["support"]["status"] == "CONTROLLED_EVALUATION"
+    assert profile["support"]["status"] == "SUPPORTED"
     assert profile["hw_status"] == "IMPLEMENTED_UNVERIFIED_HW"
-    assert profile["input_envelope"]["kind"] == "UNDECLARED"
-    assert profile["input_envelope"]["limits"] == {}
+    assert profile["input_envelope"]["kind"] == "BOUNDED"
+    assert profile["input_envelope"]["limits"] == {"allowed_num_cores": [4, 6, 8]}
     assert config["rpu_execution"]["model"]["num_cores"] == 8
-    # An undeclared input envelope does not widen the runtime core admission.
-    for cores in (4, 6):
+    # Core choice shares one recipe; its controlled gates remain mandatory.
+    for cores in (4, 6, 8):
         bad = tmp_path / f"reduced_cores_{cores}.toml"
         bad.write_text(path.read_text().replace("num_cores = 8", f"num_cores = {cores}"))
-        with pytest.raises(common.ConfigError, match=r"model\.num_cores"):
-            common.load_config(bad)
-    # Exact opt-in equality rejects either missing authorization before assets load.
-    for gate in ("QWEN3_5_QUANT_ALLOW_UNCERTIFIED", "QWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED"):
-        bad = tmp_path / f"{gate}.toml"
-        bad.write_text(path.read_text().replace(f'{gate} = "1"\n', ""))
-        with pytest.raises(common.ConfigError, match="exact opt_in"):
-            common.load_config(bad)
+        selected = common.load_config(bad)
+        assert selected["example"]["profile_id"] == config["example"]["profile_id"]
+        assert selected["rpu_execution"]["model"]["num_cores"] == cores
+    # No opt-in is required, and a stale one is rejected by exact opt-in equality.
+    assert not config["example"].get("opt_in")
+    bad = tmp_path / "stale_opt_in.toml"
+    bad.write_text(path.read_text().replace(
+        "[model.opt_in]\n", '[model.opt_in]\nQWEN3_5_VISION_ALLOW_NUMERIC_BLOCKED = "1"\n'))
+    with pytest.raises(common.ConfigError, match="exact opt_in"):
+        common.load_config(bad)
     bad = tmp_path / "mismatched_precision.toml"
-    bad.write_text(path.read_text().replace(f'dtype = "w{bits}a16"', 'dtype = "fp16"'))
+    bad.write_text(path.read_text().replace(f'precision = "w{bits}a16"', 'precision = "fp16"'))
     with pytest.raises(common.ConfigError, match="requires dtype"):
         common.load_config(bad)

@@ -59,25 +59,28 @@ def test_prepared_package_rejects_unreviewed_import_code(tmp_path, package, revi
         package.preflight(tmp_path / "checkpoint", prepared)
 
 
-def test_bad_metadata_fails_before_weight_read_or_source_import(tmp_path, package, reviewed_source, monkeypatch):
+@pytest.mark.parametrize("version", ["5.3.0", "5.19.0"])
+def test_bad_metadata_fails_before_weight_read_or_source_import(tmp_path, package, reviewed_source, monkeypatch, version):
     upstream, _, _ = reviewed_source
     prepared = package.prepare_source(upstream, tmp_path / "prepared")
     loader = sys.modules[package.__name__ + ".loader"]
-    monkeypatch.setattr(loader.importlib.metadata, "version", lambda _: "5.3.0")
+    monkeypatch.setattr(loader.importlib.metadata, "version", lambda _: version)
     checkpoint = tmp_path / "checkpoint"
     checkpoint.mkdir()
     (checkpoint / "config.json").write_text("{}")
-    monkeypatch.setattr(loader, "CHECKPOINT_HASHES", {"config.json": "invalid", "model.safetensors": "never read"})
+    monkeypatch.setattr(loader, "CHECKPOINT_PROFILES", {"0.6b": {"revision": "frozen",
+        "hashes": {"config.json": "invalid", "model.safetensors": "never read"}}})
     with pytest.raises(ValueError, match="config.json"):
         package.load_cpu_model(checkpoint, prepared)
     assert not any(key.startswith("_rhinoforge_reviewed_qwen3_tts_") for key in sys.modules)
 
 
-def test_wrong_transformers_rejected_before_loading(tmp_path, package, reviewed_source, monkeypatch):
+@pytest.mark.parametrize("version", ["4.57.3", "5.18.0", "5.19.1"])
+def test_wrong_transformers_rejected_before_loading(tmp_path, package, reviewed_source, monkeypatch, version):
     upstream, _, _ = reviewed_source
     prepared = package.prepare_source(upstream, tmp_path / "prepared")
     loader = sys.modules[package.__name__ + ".loader"]
-    monkeypatch.setattr(loader.importlib.metadata, "version", lambda _: "4.57.3")
+    monkeypatch.setattr(loader.importlib.metadata, "version", lambda _: version)
     with pytest.raises(ValueError, match="transformers==5.3.0"):
         package.load_cpu_model(tmp_path / "absent", prepared)
 
@@ -88,3 +91,36 @@ def test_prepared_source_hash_is_checked_without_import(tmp_path, package, revie
     (prepared / "__init__.py").write_text("raise RuntimeError('unreviewed')")
     with pytest.raises(ValueError, match="prepared source identity mismatch"):
         package.load_cpu_model(tmp_path / "absent", prepared)
+
+
+@pytest.mark.parametrize("profile", ["0.6b", "1.7b"])
+def test_preflight_selects_whole_checkpoint_and_checks_metadata_before_weights(
+        tmp_path, package, reviewed_source, monkeypatch, profile):
+    upstream, _, _ = reviewed_source
+    prepared = package.prepare_source(upstream, tmp_path / "prepared")
+    loader = sys.modules[package.__name__ + ".loader"]
+    monkeypatch.setattr(loader.importlib.metadata, "version", lambda _: "5.3.0")
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    profiles = {name: {"revision": name + "-revision", "hashes": {
+        "model.safetensors": name + "-weight", "config.json": name + "-config",
+        "speech_tokenizer/model.safetensors": "codec-weight", "tokenizer_config.json": "metadata"}}
+        for name in ("0.6b", "1.7b")}
+    monkeypatch.setattr(loader, "CHECKPOINT_PROFILES", profiles)
+    reads = []
+    def sha256(path):
+        name = str(path.relative_to(checkpoint))
+        reads.append(name)
+        return profiles[profile]["hashes"][name]
+    monkeypatch.setattr(loader, "sha256", sha256)
+    result = package.preflight(checkpoint, prepared)
+    assert result["profile"] == profile and result["checkpoint_revision"] == profile + "-revision"
+    assert max(reads.index(name) for name in ("config.json", "tokenizer_config.json")) < min(
+        reads.index(name) for name in ("model.safetensors", "speech_tokenizer/model.safetensors"))
+    # A selected 1.7B config cannot silently consume the other checkpoint's weights.
+    def mismatched(path):
+        name = str(path.relative_to(checkpoint))
+        return "wrong-weight" if name == "model.safetensors" else profiles[profile]["hashes"][name]
+    monkeypatch.setattr(loader, "sha256", mismatched)
+    with pytest.raises(ValueError, match="model.safetensors"):
+        package.preflight(checkpoint, prepared)

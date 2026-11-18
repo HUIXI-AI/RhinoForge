@@ -64,25 +64,42 @@ _FUSED_DENOISE_INSTALL_ATTRS = (
 from rpu_backend.api._execution import PI05_EXECUTION_SUPPORTED
 
 
+# One denoise Graph per valid language count: a count is at most the widest
+# text storage (T192), so this capacity admits every count of any profile.
+_PI05_DENOISE_GRAPH_ENTRIES = 192
+
+
 def _fused_denoise_enabled() -> bool:
     return rpu_env_bool(_FUSED_ENV_VAR, default=True)
+
+
+def graph_arena_count(language_token_counts: int = 1) -> int:
+    """SDK Graph arenas one live Pi0.5 policy reserves cold, before weights.
+
+    Vision, prefill, the first-call AdaRMS safety graph and one denoise graph
+    per prepared valid language count stay resident; device prefix assembly
+    also needs one transient queue. ``prepare_graphs(language_token_counts=...)``
+    with more than one count needs a policy loaded with this many arenas
+    (``GraphRuntimePolicy.from_environment(graph_arena_count=...)``).
+    """
+    if type(language_token_counts) is not int or not 1 <= language_token_counts <= _PI05_DENOISE_GRAPH_ENTRIES:
+        raise ValueError(f"language_token_counts must be an int in [1, {_PI05_DENOISE_GRAPH_ENTRIES}]")
+    return 4 + language_token_counts
 
 
 def _pi05_graph_runtime_policy(runtime_policy=None):
     """Freeze Pi's Graph choices without mutating process-wide defaults."""
     from rpu_backend.graph import GraphRuntimePolicy
 
-    # Vision, prefill, denoise and the first-call AdaRMS safety graph stay
-    # resident; device prefix assembly also needs one transient queue.
     if runtime_policy is not None and not isinstance(runtime_policy, GraphRuntimePolicy):
         raise TypeError("graph_runtime_policy must be GraphRuntimePolicy or None")
-    inherited = (GraphRuntimePolicy.from_environment(graph_arena_count=5)
+    inherited = (GraphRuntimePolicy.from_environment(graph_arena_count=graph_arena_count())
                  if runtime_policy is None else runtime_policy)
     fast_replay = rpu_env_bool("RPU_WALL_OSS_FAST_REPLAY", default=True)
     deep_replay = rpu_env_bool("RPU_DEEP_FAST_REPLAY", default=True)
     return replace(
         inherited,
-        graph_arena_count=max(5, inherited.graph_arena_count),
+        graph_arena_count=max(graph_arena_count(), inherited.graph_arena_count),
         fmb_fast_replay=fast_replay,
         fmb_deep_fast_replay=deep_replay,
         provenance=inherited.provenance + (
@@ -506,8 +523,8 @@ def _sync_adapter_runtime_state(adapter: Any, state: dict[str, Any]) -> None:
 def _selected_prefill_pair_rows(adapter) -> int:
     """Resolve only the explicitly selected cold text bucket, never tokenizer defaults."""
     text_tokens = getattr(adapter, "_rpu_prefill_text_tokens", 32)
-    if type(text_tokens) is not int or text_tokens not in (32, 64, 96, 128, 160):
-        raise ValueError("Pi0.5 cold text bucket must be 32, 64, 96, 128, or 160")
+    if type(text_tokens) is not int or text_tokens not in (32, 64, 96, 128, 160, 192):
+        raise ValueError("Pi0.5 cold text bucket must be 32, 64, 96, 128, 160, or 192")
     config = getattr(adapter._lerobot_policy, "config", None)
     if config is None:
         config = adapter._lerobot_policy.model.config
@@ -515,10 +532,71 @@ def _selected_prefill_pair_rows(adapter) -> int:
     if text_tokens != 32:
         if cameras not in (2, 3):
             raise ValueError(f"Pi0.5 T{text_tokens} requires exactly two or three cameras")
+        if text_tokens == 192 and cameras != 3:
+            # P960 pairs as C480: the C464 layout at 480 rows, three cameras only.
+            raise ValueError("Pi0.5 T192 requires exactly three cameras")
         if getattr(adapter, "_rpu_execution", {}).get("model", {}).get("num_cores", 8) != 8:
             raise ValueError(f"Pi0.5 T{text_tokens} currently requires exactly eight cores")
         return (256 * cameras + text_tokens) // 2
     return 272 if cameras == 2 else 400
+
+
+def _language_count_probes(batch: dict, language_token_counts):
+    """Validate ``prepare_graphs(language_token_counts=...)`` and build its probes.
+
+    Returns the sorted counts and one probe batch per count other than the
+    representative's: the same images and state, with the first ``count``
+    language positions valid. Probe tokens repeat the representative's valid
+    tokens; only the count selects the Graph.
+    """
+    if language_token_counts is None:
+        return (), ()
+    # The lerobot OBS_LANGUAGE_TOKENS / OBS_LANGUAGE_ATTENTION_MASK keys.
+    tokens_key = "observation.language.tokens"
+    mask_key = "observation.language.attention_mask"
+    if isinstance(language_token_counts, (str, bytes)) or not hasattr(
+            language_token_counts, "__iter__"):
+        raise TypeError("language_token_counts must be an iterable of ints")
+    values = list(language_token_counts)
+    if not values or any(type(value) is not int for value in values):
+        raise TypeError("language_token_counts must be a nonempty iterable of ints")
+    tokens = batch.get(tokens_key)
+    mask = batch.get(mask_key)
+    if (not torch.is_tensor(tokens) or not torch.is_tensor(mask)
+            or tokens.dim() != 2 or tokens.shape[0] != 1
+            or mask.shape != tokens.shape or mask.dtype != torch.bool):
+        raise ValueError(
+            "language_token_counts needs a batch-1 language token tensor and a "
+            "matching bool attention mask")
+    width = int(mask.shape[1])
+    represented = int(mask[0].sum())
+    if represented < 1 or not bool(mask[0, :represented].all()):
+        raise ValueError(
+            "language_token_counts needs right-padded language tokens "
+            "(valid tokens first)")
+    counts = tuple(sorted(set(values)))
+    if counts[0] < 1 or counts[-1] > width:
+        raise ValueError(
+            f"language_token_counts must lie in [1, {width}], got {list(counts)}")
+    if represented not in counts:
+        raise ValueError(
+            f"language_token_counts must contain the representative batch's "
+            f"count {represented}")
+    valid = tokens[0, :represented]
+    probes = []
+    for count in counts:
+        if count == represented:
+            continue
+        probe_tokens = torch.zeros_like(tokens)
+        repeats = -(-count // represented)
+        probe_tokens[0, :count] = valid.repeat(repeats)[:count]
+        probe_mask = torch.zeros_like(mask)
+        probe_mask[0, :count] = True
+        probe = dict(batch)
+        probe[tokens_key] = probe_tokens
+        probe[mask_key] = probe_mask
+        probes.append((count, probe))
+    return counts, tuple(probes)
 
 
 class Pi05Adapter:
@@ -1193,8 +1271,19 @@ class Pi05Adapter:
         num_steps: "int | None" = None,
         precompute_adarms: bool = False,
         noise: torch.Tensor | None = None,
+        language_token_counts=None,
     ) -> dict:
-        """Prebuild the finite Pi0.5 production signature and enter READY."""
+        """Prebuild the finite Pi0.5 production signature and enter READY.
+
+        ``language_token_counts`` lists every valid language-token count the
+        READY policy must serve; it must contain the representative batch's
+        count. The fused denoise bakes the suffix RoPE start (valid image plus
+        language rows) at BUILD, so each count is its own denoise entry. Vision
+        and prefill keep one entry: the prefill reads its mask and RoPE rows as
+        data. Each extra count is built from a probe of the representative batch
+        with that many leading language tokens. None keeps the representative's
+        count only.
+        """
         if not self._rpu_is_ready:
             raise RPUBackendError(
                 "Pi05Adapter.prepare_graphs requires Pi05Policy.to('rpu') first."
@@ -1268,6 +1357,24 @@ class Pi05Adapter:
             ("prefill", vlm._rpu_gemma_graph_cache),
             ("denoise", pi05_pytorch._rpu_fused_denoise_graph_cache),
         ]
+        counts, count_probes = _language_count_probes(
+            batch, language_token_counts)
+        denoise_capacity = int(caches[2][1].max_entries()) if counts else 0
+        if counts and len(counts) > denoise_capacity:
+            raise ValueError(
+                f"language_token_counts needs {len(counts)} denoise graphs; "
+                f"the denoise GraphCache holds {denoise_capacity}")
+        # The arena pool is frozen at to('rpu'); an undersized plan would fail
+        # mid-RECORD with the SDK pool exhausted, so refuse it before any work.
+        arenas = int(getattr(getattr(caches[2][1], "runtime_policy", None),
+                             "graph_arena_count", 0) or 0) if counts else 0
+        if arenas and arenas < graph_arena_count(len(counts)):
+            raise ValueError(
+                f"language_token_counts needs {graph_arena_count(len(counts))} "
+                f"Graph arenas for {len(counts)} denoise graphs; this policy "
+                f"reserved {arenas}. Load it with graph_runtime_policy="
+                f"GraphRuntimePolicy.from_environment(graph_arena_count="
+                f"{graph_arena_count(len(counts))})")
 
         # The first fused call also runs the legacy AdaRMS path once as a
         # correctness safety net. If that safety net still needs to run, make
@@ -1308,6 +1415,11 @@ class Pi05Adapter:
                 "recaptures": sum(
                     int(getattr(entry, "recapture_count", 0))
                     for entry in snapshots
+                ),
+                "min_entry_replays": min(
+                    (int(getattr(entry, "replay_count", 0))
+                     for entry in snapshots),
+                    default=0,
                 ),
                 "invariant_ok": bool(cache.cache_invariant_ok()),
                 "instruction_snapshots": [
@@ -1359,6 +1471,57 @@ class Pi05Adapter:
                 for name, cache in caches
                 if cache.size() > 0
             ]
+            denoise_cache = caches[2][1]
+
+            def _predict(request):
+                return self._lerobot_policy.predict_action_chunk(
+                    request, num_steps=steps,
+                    **({"noise": noise} if noise is not None else {}),
+                ).detach().cpu().clone()
+
+            # Each extra count RECORDs one denoise entry while Vision and
+            # prefill replay, then replays once; both results must agree.
+            count_actions = {}
+            for count, probe in count_probes:
+                before = {name: _stats(cache) for name, cache in frozen_caches}
+                recorded = _predict(probe)
+                after_record = {
+                    name: _stats(cache) for name, cache in frozen_caches}
+                grown = {
+                    name: (before[name]["entries"], stats["entries"])
+                    for name, stats in after_record.items()
+                    if stats["entries"] != before[name]["entries"]
+                }
+                if (grown != {"denoise": (before["denoise"]["entries"],
+                                          before["denoise"]["entries"] + 1)}
+                        or any(stats["recaptures"] for stats
+                               in after_record.values())):
+                    raise RuntimeError(
+                        f"Pi0.5 language count {count} RECORD changed "
+                        f"{grown}; expected one new denoise graph and no "
+                        f"recapture: {after_record}")
+                replayed = _predict(probe)
+                after_replay = {
+                    name: _stats(cache) for name, cache in frozen_caches}
+                if any((stats["entries"], stats["recaptures"])
+                       != (after_record[name]["entries"],
+                           after_record[name]["recaptures"])
+                       for name, stats in after_replay.items()):
+                    raise RuntimeError(
+                        f"Pi0.5 language count {count} WARMING replay grew "
+                        f"or recaptured a graph: {after_replay}")
+                if not torch.equal(recorded, replayed):
+                    max_abs = float(
+                        (recorded.float() - replayed.float()).abs().max())
+                    raise RuntimeError(
+                        f"Pi0.5 language count {count} WARMING replay differs "
+                        f"from its RECORDING action (max_abs={max_abs:.7g})")
+                count_actions[count] = replayed
+            if counts and denoise_cache.size() != len(counts):
+                raise RuntimeError(
+                    f"Pi0.5 prewarm holds {denoise_cache.size()} denoise "
+                    f"graphs for language counts {list(counts)}")
+
             # Discard the RECORDING result and exercise one WARMING replay
             # before freezing. This primes every mutable DMA base under the
             # exact production call without admitting a new signature.
@@ -1408,6 +1571,16 @@ class Pi05Adapter:
                 **({"noise": noise} if noise is not None else {}),
             )
             ready_action = ready_value.detach().cpu().clone()
+            # Every extra count replays once in READY: lookup-only, and the
+            # action must equal its WARMING replay.
+            for count, probe in count_probes:
+                ready_count = _predict(probe)
+                if not torch.equal(count_actions[count], ready_count):
+                    max_abs = float((count_actions[count].float()
+                                     - ready_count.float()).abs().max())
+                    raise RuntimeError(
+                        f"Pi0.5 language count {count} READY replay differs "
+                        f"from its WARMING action (max_abs={max_abs:.7g})")
             after_ready = {
                 name: _stats(cache) for name, cache in frozen_caches
             }
@@ -1430,17 +1603,19 @@ class Pi05Adapter:
             }
             if not all(
                 int(stats.get("replays", 0)) >= 2
+                and int(stats.get("min_entry_replays", 0)) >= 2
                 for stats in mandatory_ready.values()
             ):
                 raise RuntimeError(
                     "Pi0.5 READY mandatory graph did not complete two "
                     f"replays: {mandatory_ready}"
                 )
+            expected_entries = {"denoise": max(len(counts), 1)}
             if not all(
-                int(stats.get("entries", 0)) == 1
+                int(stats.get("entries", 0)) == expected_entries.get(name, 1)
                 and int(stats.get("recaptures", -1)) == 0
                 and stats.get("invariant_ok") is True
-                for stats in after_ready.values()
+                for name, stats in after_ready.items()
             ):
                 raise RuntimeError(
                     "Pi0.5 READY graph cache invariant failed: "
@@ -1464,7 +1639,8 @@ class Pi05Adapter:
             "phase": "READY",
             "num_steps": steps,
             "adarms_table": table_metadata,
-            "graph_counts": graph_counts,
+            "graph_counts": {
+                name: int(stats["entries"]) for name, stats in after_ready.items()},
             "runtime": dict(runtime_profile),
             "ready_replay_validated": True,
             "numerical_status": "DIAGNOSTIC",
@@ -1473,6 +1649,7 @@ class Pi05Adapter:
             "build_replay_bit_equal": build_replay_bit_equal,
             "build_replay_max_abs": build_replay_max_abs,
             "ready_stats": after_ready,
+            "language_token_counts": list(counts) if counts else None,
         }
         _PI05_PREPARED_GRAPH_PROFILES[pi05_pytorch] = result
         return dict(result)
@@ -1652,9 +1829,13 @@ class Pi05Adapter:
         # failure must not orphan a native entry or overwrite a live install.
         import rpu_backend
         denoise_graph_cache = (
-            rpu_backend.graph.GraphCache(**graph_cache_options(topology.num_cores))
+            rpu_backend.graph.GraphCache(
+                max_entries=_PI05_DENOISE_GRAPH_ENTRIES,
+                **graph_cache_options(topology.num_cores))
             if runtime_policy is None
-            else rpu_backend.graph.GraphCache(runtime_policy=runtime_policy)
+            else rpu_backend.graph.GraphCache(
+                max_entries=_PI05_DENOISE_GRAPH_ENTRIES,
+                runtime_policy=runtime_policy)
         )
 
         set_weights_args = (
@@ -1686,6 +1867,12 @@ class Pi05Adapter:
                 bool(_action_execution.get("action", {}).get("linear_acc32", False)))
             if topology.num_cores != 8:
                 torch.ops.rpu.pi05_denoise_step_set_execution_core_count(handle, topology.num_cores)
+            # The shared cache replicates the checkpoint KV heads of the VLM
+            # (prefix rows) and the expert (action rows); native routes that
+            # read one core's copy for several query heads need this count.
+            torch.ops.rpu.pi05_denoise_step_set_kv_source_heads(handle, max(
+                int(pawe.paligemma.model.language_model.config.num_key_value_heads),
+                int(ec.num_key_value_heads)))
             torch.ops.rpu.pi05_denoise_step_set_weights(handle, *set_weights_args)
             validate_native_topology("pi05_denoise_step", handle, topology, ec.intermediate_size, gate[0].dtype)
             torch.ops.rpu.pi05_denoise_step_set_chunk_envelope(

@@ -100,6 +100,15 @@ struct KernelCache {
     CachedKernel load_kernel_from_oplib(const std::string&, const std::string&);
     std::vector<std::string> loaded_oplib_paths() const;
     std::vector<std::pair<std::string, std::string>> loaded_oplib_bytes() const;
+    enum class KernelIntent { kRequired, kOptional, kPending, kRejected };
+    struct KernelResolution {
+        std::string name;
+        std::string role;
+        KernelIntent intent;
+        bool resolved;
+    };
+    std::vector<KernelResolution> kernel_resolution_;
+    std::vector<KernelResolution> kernel_resolution() const;
 };
 ''' + actual_bodies + r'''
 int main(int argc, char** argv) {

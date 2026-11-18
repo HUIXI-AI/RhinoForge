@@ -1,3 +1,4 @@
+from pi_wall_host_catalog import assert_current_catalog
 """Board-free contract for Wall's exact staged SwiGLU activation fusion."""
 
 from pathlib import Path
@@ -31,7 +32,8 @@ def test_staged_p640_uses_fused_gate_up_swiglu_for_both_mlp_paths():
     assert 'addr(0, "up")' not in staged
 
 
-def test_staged_p640_gate_up_kernel_borrows_down_for_bounded_tile_scratch():
+def test_staged_p640_gate_up_kernel_uses_current_shared_a_without_scratch_writes():
+    assert_current_catalog("SharedSilu")
     cache_h = (ROOT / "src/core/rpu_kernel_cache.h").read_text()
     cache_inc = ((ROOT / "src/core/rpu_kernel_cache.inc").read_text() + (ROOT / "src/core/rpu_kernel_cache.h").read_text())
     decls = (ROOT / "src/core/rpu_kernel_decls.h").read_text()
@@ -40,16 +42,6 @@ def test_staged_p640_gate_up_kernel_borrows_down_for_bounded_tile_scratch():
     name = "fused_gate_up_swiglu_w8a16_m320n112k128"
     p640_name = "fused_gate_up_swiglu_w8a16_m128x5n96k128"
 
-    assert "WALL_PREFILL_GATE_UP_SWIGLU_W8A16_M320N112" in cache_h
-    assert "WALL_PREFILL_GATE_UP_SWIGLU_W8A16_M128X5N96K128" in cache_h
-    assert f'"{name}"' in cache_h
-    assert f'"{name}"' in cache_inc
-    assert f'"{p640_name}"' in cache_h
-    assert f'"{p640_name}"' in cache_inc
-    assert (
-        "KernelId::WALL_PREFILL_GATE_UP_SWIGLU_W8A16_M128X5N96K128"
-        in cache_inc
-    )
     launcher_name = (
         "rpu_launch_wall_prefill_gate_up_swiglu_w8a16_spm_kernel("
     )
@@ -59,7 +51,7 @@ def test_staged_p640_gate_up_kernel_borrows_down_for_bounded_tile_scratch():
     assert launcher.count("GraphDdrRegisterOperandSpec{") == 4
     assert launcher.count("GraphDdrRegisterRole::Int8ModelWeight") == 2
     assert launcher.count("GraphDdrRegisterRole::PerChannelScale") == 2
-    for register_pair in ("2, 3", "20, 21", "24, 25", "26, 27"):
+    for register_pair in ("2, 3", "20, 21", "32, 33", "34, 35"):
         assert f"DevAddrShift8LoHi, {register_pair}" in launcher
     for guard in (
         "rows == 320 || rows == 640",
@@ -68,24 +60,9 @@ def test_staged_p640_gate_up_kernel_borrows_down_for_bounded_tile_scratch():
         "constexpr uint32_t kScratchBytes = 573440;",
         "static_cast<uint32_t>(kK * sizeof(c10::Half))",
         "static_cast<uint32_t>(kNPerCore * sizeof(c10::Half))",
-        "kernel->set_regs(30, static_cast<uint16_t>(224));",
-        "kernel->set_regs(31, static_cast<uint16_t>(0));",
         "queue->set_broadcast_mode(true);",
-        "KernelId::WALL_PREFILL_GATE_UP_SWIGLU_W8A16_M128X5N96K128",
     ):
         assert guard in launcher
-    assert "const bool p640_weight_outer = rows == 640;" in launcher
-    assert (
-        "p640_weight_outer ? "
-        "KernelId::WALL_PREFILL_GATE_UP_SWIGLU_W8A16_M128X5N96K128 : "
-        "KernelId::WALL_PREFILL_GATE_UP_SWIGLU_W8A16_M320N112"
-        in launcher_flat
-    )
-    assert (
-        "if (p640_weight_outer) { queue->enqueu_kernel(*kernel, {15, 1, 1}, cores); "
-        "} else { queue->enqueu_kernel(*kernel, {13, 1, 1}, cores); }"
-        in launcher_flat
-    )
 
     layout_start = decoder.index("const bool wall_p640_staged_layout")
     layout = decoder[layout_start : decoder.index("// \u2605 Phase 2.5", layout_start)]
@@ -192,11 +169,8 @@ def test_exact_w8_action_fuses_gate_up_without_new_spm_buffers():
     decls = (ROOT / "src/core/rpu_kernel_decls.h").read_text()
     linear = (ROOT / "src/ops/rpu_linear.cpp").read_text()
     base = (ROOT / "src/core/fused_model_base.cpp").read_text()
-    name = "gate_up_parallel_w8a16_multibase_m592n32k128"
+    assert_current_catalog("SharedRaw", "SharedRawSpmWeight")
 
-    assert "WALL_ACTION_GATE_UP_W8A16_MULTIBASE_M592N32" in cache_h
-    assert f'"{name}"' in cache_h
-    assert f'"{name}"' in cache_inc
     assert "rpu_launch_wall_action_gate_up_w8a16_multibase_spm_kernel(" in decls
     start = linear.index(
         "void rpu_launch_wall_action_gate_up_w8a16_multibase_spm_kernel("
@@ -213,7 +187,7 @@ def test_exact_w8_action_fuses_gate_up_without_new_spm_buffers():
     assert "constexpr int64_t kK = 1024;" in launcher
     assert "constexpr int64_t kN = 2048;" in launcher
     assert "queue->set_broadcast_mode(true);" in launcher
-    assert "queue->enqueu_kernel(*kernel, {16, 1, 1}, cores);" in launcher
+    assert "{selected.grid_x, selected.grid_y, 1}" in launcher
 
     mlp = base[base.index("void FusedModelBase::emit_mlp_pipeline(") :]
     selector = mlp[
@@ -276,13 +250,10 @@ def test_exact_mimc_w8_vision_fuses_gate_up_silu_with_acc32_fallback():
     cache_inc = ((ROOT / "src/core/rpu_kernel_cache.inc").read_text() + (ROOT / "src/core/rpu_kernel_cache.h").read_text())
     decls = (ROOT / "src/core/rpu_kernel_decls.h").read_text()
     linear = (ROOT / "src/ops/rpu_linear.cpp").read_text()
-    symbol = "fused_gate_up_swiglu_w8a16_m352n96k128"
+    assert_current_catalog("SharedSiluBias")
     launcher_name = (
         "rpu_launch_wall_vision_gate_up_swiglu_w8a16_spm_kernel("
     )
-    assert "WALL_VISION_GATE_UP_SWIGLU_W8A16_M352N96" in cache_h
-    assert f'"{symbol}"' in cache_h
-    assert f'"{symbol}"' in cache_inc
     assert launcher_name in decls
     start = linear.index(f"void {launcher_name}")
     launcher = linear[
@@ -293,17 +264,16 @@ def test_exact_mimc_w8_vision_fuses_gate_up_silu_with_acc32_fallback():
     assert launcher.count("GraphDdrRegisterOperandSpec{") == 4
     assert launcher.count("GraphDdrRegisterRole::Int8ModelWeight") == 2
     assert launcher.count("GraphDdrRegisterRole::PerChannelScale") == 2
-    for register_pair in ("2, 3", "20, 21", "24, 25", "26, 27"):
+    for register_pair in ("2, 3", "20, 21", "32, 33", "34, 35"):
         assert f"DevAddrShift8LoHi, {register_pair}" in launcher
     for guard in (
         "const int64_t kM = rows;",
         "constexpr int64_t kK = 1280;",
         "constexpr int64_t kN = 3584;",
         "gate_bias_spm_addr != 0 && up_bias_spm_addr != 0",
-        "kernel->set_regs(28, static_cast<uint16_t>(up_bias_spm_addr));",
-        "kernel->set_regs(29, static_cast<uint16_t>(up_bias_spm_addr >> 16));",
+        "set_u32_reg_pair(*kernel, 38, up_bias_spm_addr);",
         "queue->set_broadcast_mode(true);",
-        "{5, static_cast<uint16_t>(CeilDiv(rows, int64_t{352})), 1}",
+        "{selected.grid_x, selected.grid_y, 1}",
     ):
         assert guard in launcher
 
@@ -371,11 +341,7 @@ def test_exact_mimc_compact_vision_uses_three_image_gate_up_multibase():
     kernel_id = (
         "WALL_VISION_GATE_UP_SWIGLU_W8A16_MULTIBASE_M192X3N96"
     )
-    symbol = "fused_gate_up_swiglu_w8a16_multibase_m192x3n96k128"
-    assert kernel_id in cache_h
-    assert kernel_id in cache_inc
-    assert f'"{symbol}"' in cache_h
-    assert f'"{symbol}"' in cache_inc
+    assert_current_catalog("TripletSharedSiluBias")
     assert "uint32_t input1_spm_addr = 0" in decls
     assert "uint32_t output2_spm_addr = 0" in decls
 
@@ -386,16 +352,16 @@ def test_exact_mimc_compact_vision_uses_three_image_gate_up_multibase():
             launcher_start,
         )
     ]
-    assert f"KernelId::{kernel_id}" in launcher
     for register, address in (
-        (30, "input1_spm_addr"),
-        (32, "input2_spm_addr"),
-        (34, "output1_spm_addr"),
-        (36, "output2_spm_addr"),
+        (48, "input1_spm_addr"),
+        (54, "input2_spm_addr"),
+        (50, "output1_spm_addr"),
+        (56, "output2_spm_addr"),
     ):
         assert (
             f"rpu_pl_tiling::set_u32_reg_pair(*kernel, {register}, {address});"
             in launcher
         )
     assert "queue->set_broadcast_mode(true);" in launcher
-    assert "queue->enqueu_kernel(*kernel, {5, 3, 1}, cores);" in launcher
+    assert "{selected.grid_x, selected.grid_y, 1}" in launcher
+    assert "set_regs(52, static_cast<uint16_t>(rows))" in launcher

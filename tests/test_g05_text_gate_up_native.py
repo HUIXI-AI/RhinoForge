@@ -210,7 +210,7 @@ int main(){
  m.set_fast_replay(true);assert(m.text_gateup_pair_available_&&m.invalidations==3&&!m.use_text_gateup_pair(256));
  m.set_retained_prefill_graph(true);assert(m.use_text_gateup_pair(256)&&m.invalidations==4);
  m.plan();assert(m.routes.size()==1);assert(m.routes[0].site==(W8?267678052960427182LL:751944759910871833LL)&&m.routes[0].selector==1&&m.routes[0].flags==0&&m.routes[0].invocation==2);
- assert(m.routes[0].args==(W8?std::vector<int64_t>({2,256,768,2048,8,32,288,80,128,10,20,4096,1536,4,24,8,6144}):std::vector<int64_t>({1,256,768,2048,8,32,352,64,128,12,24,4096,1536,2,24})));
+ assert(m.routes[0].args==(W8?std::vector<int64_t>({3,256,768,2048,8,32,288,80,128,10,20,4096,1536,4,24,8,6144,2,32,20,34,4,36,1}):std::vector<int64_t>({3,256,768,2048,8,32,368,64,128,12,24,4096,1536,2,24,8,6144,2,32,20,34,4,36,1})));
  assert(m.text_gateup_pair_w8_==W8&&cache.last==(W8?KernelId::G05_TEXT_GATE_UP_W8A16_ACC32_M256N768K2048:KernelId::G05_TEXT_GATE_UP_FP16_ACC32_M256N768K2048));
  const auto hash=m.subclass_layout_hash();const auto identity=m.kvinsert_cost_weight_identity();
  const int proofs=at::Tensor::proofs,queries=cache.queries;
@@ -242,7 +242,7 @@ int main(){
   auto valid=x.routes;x.routes=m.routes;reject([&]{x.mlp(0);});x.routes=valid;linear_modes.clear();launches.clear();x.mlp(23);assert(launches==std::vector<std::string>({"pair_w8","silu","mul","down"})&&linear_modes==std::vector<bool>({false}));
   cache.acc16_available=false;x.installed();x.plan();assert(!x.text_gateup_pair_available_&&x.routes.empty());linear_modes.clear();launches.clear();x.mlp(23);assert(launches==std::vector<std::string>({"gate","silu","up","mul","down"})&&linear_modes.empty());cache.acc16_available=true;
  }
- if(!W8){auto x=m;x.set_linear_acc32(false);x.plan();assert(x.text_gateup_pair_available_&&cache.last==KernelId::G05_TEXT_GATE_UP_FP16_ACC16_M256N768K2048&&x.routes[0].args==std::vector<int64_t>({1,256,768,2048,8,16,432,80,128,10,20,4096,1536,2,24})&&x.subclass_layout_hash()!=hash&&x.kvinsert_cost_weight_identity()!=identity);
+ if(!W8){auto x=m;x.set_linear_acc32(false);x.plan();assert(x.text_gateup_pair_available_&&cache.last==KernelId::G05_TEXT_GATE_UP_FP16_ACC16_M256N768K2048&&x.routes[0].args==std::vector<int64_t>({3,256,768,2048,8,16,432,80,128,10,20,4096,1536,2,24,8,6144,2,32,20,34,4,36,1})&&x.subclass_layout_hash()!=hash&&x.kvinsert_cost_weight_identity()!=identity);
   auto alias=x;alias.routes[0].site=751944759910871833LL;reject([&]{alias.mlp(0);});
   auto valid=x.routes;x.routes=m.routes;reject([&]{x.mlp(0);});x.routes=valid;
   for(int layer=0;layer<24;++layer){launches.clear();x.mlp(layer);assert(launches==std::vector<std::string>({"pair_fp16_acc16","silu","mul","down"}));}

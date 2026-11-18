@@ -87,7 +87,7 @@ struct RpuKernelGraph {
  Writer stage_kernel_ddr_registers(KernelId id,std::vector<GraphDdrRegisterOperandSpec> ops){
   ++stages;check(!deny);assert(!typed_pending);assert(id==KernelId::QWEN3VL_O_RING_NORM_M1_H2560_W8&&ops.size()==2);
   for(int i=0;i<2;++i){const auto& a=ops[i].abi;
-   assert(a.lo==6+i*2&&a.hi==7+i*2&&a.access==GraphDdrRegisterAccess::Read);
+   assert(a.lo==(i?20:2)&&a.hi==(i?21:3)&&a.access==GraphDdrRegisterAccess::Read);
    assert(a.encoding==GraphDdrRegisterEncoding::DevAddrShift8LoHi);
    assert(a.role==(i?GraphDdrRegisterRole::PerChannelScale:GraphDdrRegisterRole::Int8ModelWeight));
    check(ops[i].tensor.address&&ops[i].tensor.address%256==0&&ops[i].tensor.address<(1ULL<<40));
@@ -99,9 +99,9 @@ std::vector<uint64_t> flushed;
 void rpu_ddr_flush(void* p){++flushes;flushed.push_back(reinterpret_cast<uint64_t>(p));}
 struct Queue {
  bool broadcast=false;void set_broadcast_mode(bool v){broadcast=v;}
- void enqueu_kernel(Kernel_t& k,std::vector<int> grid,std::vector<int> cores){
+ void enqueu_kernel(Kernel_t& k,std::vector<uint16_t> grid,std::vector<int> cores){
   assert(broadcast&&writes>submits&&k.wide==0&&k.scm_writes==64);
-  assert(grid==std::vector<int>({8,1,1})&&cores==std::vector<int>({0,1,2,3,4,5,6,7}));
+  assert(grid==std::vector<uint16_t>({8,1,1})&&cores==std::vector<int>({0,1,2,3,4,5,6,7}));
   for(auto x:k.atomic)assert(x==0);
   k.atomic.fill(17);++submits;
  }
@@ -113,7 +113,7 @@ __BODY__
 using Inputs=std::array<at::Tensor,2>;
 using Spm=std::array<uint32_t,5>;
 const Spm initial{0x40001000,0x40002000,0x40004000,0x40006000,0x40008000};
-Inputs good(){Inputs in;in[1].type=at::kHalf;in[1].shape={2560};in[1].backing.bytes=(2560+256)*2;in[1].address+=0x2000000;return in;}
+Inputs good(){Inputs in;in[1].type=at::kHalf;in[1].shape={2560};in[1].backing.bytes=2560*2;in[1].address+=0x2000000;return in;}
 void launch(const Inputs& in,Spm p=initial,double eps=1e-6){__NAME__(p[0],in[0],in[1],p[1],p[2],p[3],p[4],eps);}
 void reject(std::function<void()> f,bool before_stage=true){
  const int old=submits,st=stages,fl=flushes,rs=kernel.resets;const auto keeps=RpuKernelGraph::active().owners.size();
@@ -129,12 +129,14 @@ int main(){
   assert(flushes==fl+2&&kernel.resets==rs+1&&graph.owners.size()==keeps+2);
   assert(graph.owners[keeps]==in[0].address&&graph.owners[keeps+1]==in[1].address);
   assert(flushed[fl]==in[0].address&&flushed[fl+1]==in[1].address);
-  assert(kernel.r[0]==512&&kernel.r[1]==2560&&kernel.r[2]==0);
-  assert(kernel.pair(4)==spm[0]>>8&&kernel.pair(6)==in[0].address>>8&&kernel.pair(8)==in[1].address>>8);
-  assert(kernel.pair(10)==spm[1]>>8&&kernel.pair(12)==0x10000&&kernel.pair(14)==0x10000&&kernel.pair(16)==5120);
-  assert(kernel.r[18]==320&&kernel.r[19]==320&&kernel.r[21]==8&&kernel.r[22]==1&&kernel.pair(24)==63488);
-  assert(kernel.pair(26)==spm[2]-SPM_ALLOC.base&&kernel.r[28]==0&&kernel.r[29]==0xe66&&kernel.r[30]==5120);
-  assert(kernel.pair(32)==spm[3]&&kernel.pair(34)==spm[2]&&kernel.pair(36)==spm[4]&&kernel.r[38]==0x11);
+  assert(kernel.pair(0)==spm[0]&&kernel.pair(2)==in[0].address>>8&&kernel.pair(4)==spm[1]);
+  assert(kernel.pair(6)==0&&kernel.r[8]==0&&kernel.r[9]==1&&kernel.pair(10)==2560);
+  assert(kernel.r[12]==512&&kernel.r[13]==32&&kernel.r[14]==0&&kernel.r[15]==8);
+  assert(kernel.pair(16)==1024&&kernel.pair(18)==5120&&kernel.pair(20)==in[1].address>>8);
+  assert(kernel.pair(22)==0&&kernel.pair(24)==0&&kernel.r[26]==2&&kernel.r[27]==1&&kernel.r[28]==0&&kernel.r[29]==0);
+  assert(kernel.r[32]==8&&kernel.r[33]==1&&kernel.pair(34)==63488);
+  assert(kernel.pair(36)==spm[2]-SPM_ALLOC.base&&kernel.r[38]==0&&kernel.r[40]==2560&&kernel.r[41]==0xe66&&kernel.r[42]==5120);
+  assert(kernel.pair(44)==spm[3]&&kernel.pair(46)==spm[2]&&kernel.pair(48)==spm[4]&&kernel.r[50]==0x11);
   assert(kernel.r[64]==8&&kernel.r[65]==1&&kernel.r[66]==1);
   for(int c=0;c<8;++c){assert(kernel.scm_pair(c)==spm[1]-SPM_ALLOC.base+c*0x1000000);
    assert(kernel.scm_pair(16+c)==spm[3]-SPM_ALLOC.base+c*0x1000000);
@@ -155,7 +157,7 @@ int main(){
   for(uint64_t a:{0ULL,0x1200000001ULL,1ULL<<40,(1ULL<<40)-256}){in=good();in[i].address=a;reject([&]{launch(in);});}
  }
  {auto in=good();in[0].shape[1]--;reject([&]{launch(in);});}
- {auto in=good();in[1].backing.bytes=(2560+192)*2;reject([&]{launch(in);});}
+ {auto in=good();in[1].backing.bytes=2560*2;launch(in);--in[1].backing.bytes;reject([&]{launch(in);});}
  {auto in=good();in[1].offset=128;in[1].backing.bytes+=256;in[1].address+=256;launch(in);}
  for(uint64_t delta:{0ULL,256ULL,10485504ULL}){auto in=good();in[1].address=in[0].address+delta;reject([&]{launch(in);});}
  {auto in=good();in[0].address=in[1].address+256;reject([&]{launch(in);});}

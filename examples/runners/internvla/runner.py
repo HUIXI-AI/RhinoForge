@@ -57,16 +57,6 @@ def _load_internvla_frontend(path):
 
 def _internvla_n1(runner):
     config, inputs = runner.source_config, runner.source_config["input"]
-    opt_in = {"RPU_INTERNVLA_N1_ALLOW_NUMERIC_BLOCKED": "1"}
-    if config["example"].get("opt_in") != opt_in:
-        raise ValueError(
-            "InternVLA-N1 requires its exact registered controlled opt-in"
-        )
-    for name, value in opt_in.items():
-        inherited = os.environ.get(name)
-        if inherited is not None and inherited != value:
-            raise ValueError(f"inherited {name} conflicts with the controlled profile")
-        os.environ[name] = value
     if os.environ.get("RPU_S2_SDPA_BF16") not in (None, "", "0"):
         raise ValueError("InternVLA-N1 controlled profile requires RPU_S2_SDPA_BF16=0")
 
@@ -172,6 +162,10 @@ def _internvla_n1(runner):
     owner.own(rgb_tower)
     owner.own(depth_tower)
     owner.own(owner.rgbd._rpu_former)
+    # System 2 (Vision, backbone prefill) and System 1 (RGB-D encoder plus NavDP head).
+    runner.stage_boundaries = tuple((stage, getattr(owner, part, None), name) for stage, part, name in (
+        ("vision", "vision", "forward"), ("prefill", "backbone", "forward_embeds"),
+        ("navdp", "rgbd", "forward"), ("navdp", "navdp", "predict_action")))
     owner._internvla_execution_controller = bind_internvla_execution_runtime(
         owner,
         backbone=owner.backbone,

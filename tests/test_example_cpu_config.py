@@ -12,6 +12,8 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from _example_toml import load_example_toml
+
 
 ROOT = Path(__file__).resolve().parents[1]
 CPU = vars(importlib.import_module("examples.common.cpu"))
@@ -64,8 +66,8 @@ def test_logging_is_validated_by_public_and_optimized_entries_without_runtime(tm
     # One fixture per strict top-level schema, plus Rhino's factory fragment.
     fixtures = [
         ("qwen3/text/0_6b/fp16.toml", None),
-        ("pi05/3cam/fp16.toml", "pi05.optimized"),
-        ("lingbot/v2/3cam_t32/fp16.toml", "lingbot2.optimized"),
+        ("pi05/3cam/h50/fp16.toml", "pi05.optimized"),
+        ("lingbot/v2/3cam/fp16.toml", "lingbot2.optimized"),
         ("g05/2cam/fp16.toml", "g05.optimized"),
         ("hy_vla/3cam/fp16.toml", "hy_vla.optimized"),
         ("wall_oss/base/3cam/224/fp16.toml", "wall_oss.base"),
@@ -141,7 +143,7 @@ def test_aliases_preserve_defaults_and_reject_conflicts_without_mutation():
 
 
 @pytest.mark.parametrize("relative", [
-        "qwen3/text/0_6b/fp16.toml", "pi05/3cam/fp16.toml",
+        "qwen3/text/0_6b/fp16.toml", "pi05/3cam/h50/fp16.toml",
         "wall_oss/sorting/fp16.toml", "wall_oss/base/3cam/224/fp16.toml", "hy_vla/3cam/fp16.toml",
         "g05/2cam/fp16.toml", "g05/3cam/w8a16_action_nvfp4.toml",
 ])
@@ -228,7 +230,7 @@ def test_shared_runner_applies_threads_before_prepare_and_reports_effective_valu
 def test_wall_base_passes_public_threads_and_rejects_conflicts_before_engine(monkeypatch):
     import tomllib
     runner = load("cpu_wall_base", "examples/runners/wall_oss/base.py")
-    config = tomllib.loads((ROOT / "examples/configs/wall_oss/base/3cam/224/fp16.toml").read_text())
+    config = load_example_toml(ROOT / "examples/configs/wall_oss/base/3cam/224/fp16.toml")
     config["run"].pop("cpu_threads", None)
     config["cpu"] = {"threads": 3}
     argv = runner.example_argv(config)
@@ -269,7 +271,7 @@ def test_wall_engine_uses_shared_cpu_settings_before_backend(monkeypatch, tmp_pa
 def test_g05_aliases_reject_conflicts_before_cold_library_binding(monkeypatch):
     import tomllib
     runner = load("cpu_g05_validation", "examples/runners/g05/optimized.py")
-    config = tomllib.loads((ROOT / "examples/configs/g05/2cam/fp16.toml").read_text())
+    config = load_example_toml(ROOT / "examples/configs/g05/2cam/fp16.toml")
     config["cpu"] = {"threads": 3}
     config["run"].update(cpu_threads=3, torch_num_threads=3)
     runner.validate_example_config(config)
@@ -319,11 +321,13 @@ runner.library_helpers = lambda: dict(
     bind_cold_environment=bind)
 """
 exec(bootstrap)
-config = tomllib.loads((root / 'examples/configs/g05/2cam/fp16.toml').read_text())
+from examples.common.config import normalize_config
+config = normalize_config(tomllib.loads((root / 'examples/configs/g05/2cam/fp16.toml').read_text()))
 config['cpu']['threads'] = 3
 config['run']['output_dir'] = str(out)
 multiple = sys.argv[3] == 'True'
 if multiple:
+    config['input'].pop('text_tokens')
     config['input']['text_lengths'] = [32, 64]
     # Install the same import observer in the real fresh child. Parent-local
     # monkeypatches do not survive exec; keep the production stdin/config,
@@ -338,7 +342,6 @@ if multiple:
         return original_run([*command[:3], prefix + bootstrap + '\n' + command[3]], **kwargs)
     runner.subprocess.run = observed_child
 else:
-    config['input'].pop('text_lengths')
     config['input']['text_tokens'] = 32
 try:
     runner.run_example_config(config)

@@ -48,6 +48,7 @@ def logical_registry_host_binary(tmp_path_factory):
 #include <cstdlib>
 #include <condition_variable>
 #include <functional>
+#include <iostream>
 #include <iterator>
 #include <limits>
 #include <map>
@@ -123,6 +124,16 @@ void RpuDdrFree(void*) {}
 }  // namespace rhino_lkn
 
 ENDPOINT_TYPES
+
+// Async replay end (graph/graph_async_end.h): no Graph submission is pending in
+// this harness, so frees are never deferred and the deferred list never drains.
+bool rpu_graph_async_end_pending() noexcept { return false; }
+namespace rpu {
+struct RPUCachingAllocator {
+    static RPUCachingAllocator& get() { std::abort(); }
+    void free(void*) { std::abort(); }
+};
+}  // namespace rpu
 
 struct SpmAllocator { static constexpr int NUM_CORES = 8; };
 struct FakeSpmAllocator {

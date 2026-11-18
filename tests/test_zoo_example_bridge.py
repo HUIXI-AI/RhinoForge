@@ -28,7 +28,7 @@ def test_all_templates_roundtrip_to_actual_validator(catalog, tmp_path):
         path = tmp_path / 'config.toml'
         path.write_text(text)
         export_examples.COMMON.load_config(path)
-    assert catalog['duplicates'] == [['qwen3_tts/0_6b/base', 'qwen3_tts/0_6b/base_rpu_codec']]
+    assert not catalog['duplicates']
 
 
 def test_catalog_rejects_runtime_release_identity_drift(catalog, monkeypatch):
@@ -229,7 +229,8 @@ def test_public_cold_choices_and_input_dependent_padding_use_actual_validator(ca
             run_zoo_example.execution_overrides(copy.deepcopy(row['config']), override)
     wall = next(r for r in catalog['entries'] if r['id'] == 'wall_oss/base/2cam/256/fp16')
     changed = copy.deepcopy(wall['config'])
-    assert 'padding_rows' in changed['rpu_execution']['prefill']
+    assert 'padding_rows' not in changed['rpu_execution']['prefill']
+    changed['rpu_execution']['prefill']['padding_rows'] = 26
     changed['input']['text_tokens'] = 64
     run_zoo_example.execution_overrides(changed, {'prefill': {'padding_rows': None}})
     path.write_text(run_zoo_example.toml_text(changed))
@@ -550,8 +551,8 @@ def test_controlled_quantized_profiles_keep_recipe_identity(catalog, profile_id,
     rows = [row for row in catalog['entries'] if row['profile_id'] == profile_id]
     assert rows
     for row in rows:
-        assert row['support']['reason_code'] == 'QWEN35_QUANT_IMPLEMENTED_UNVERIFIED_HW'
-        assert row['support']['status'] == 'CONTROLLED_EVALUATION'
+        assert row['support']['reason_code'] == 'BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED'
+        assert row['support']['status'] == 'SUPPORTED'
         bundle = {'schema': 'rpu-model-zoo/example-run-bundle/v1',
                   'source': catalog['source'], 'configs': [copy.deepcopy(row)],
                   'registry_paths': catalog['registry_paths']}

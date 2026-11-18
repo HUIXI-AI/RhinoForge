@@ -2,6 +2,7 @@
 from pathlib import Path
 import re
 
+from pi_wall_host_catalog import CATALOG_INCLUDE, absolute_candidate_includes
 from test_wall_base_nvfp4_qkv_bias import META
 from test_wall_base_paired_kv import block, compile_run
 
@@ -14,6 +15,7 @@ def test_actual_fp16_long_cold_plan_complete_and_activation(tmp_path):
     base = (ROOT / 'src/core/fused_model_base.cpp').read_text()
     base_header = (ROOT / 'src/core/fused_model_base.h').read_text()
     cache = (ROOT / 'src/core/rpu_kernel_cache.h').read_text()
+    runtime = (ROOT / 'src/ops/rpu_pi_wall_runtime.h').read_text()
     start = decoder.index('        wall_base_fp16_long_prefill_ =')
     end = decoder.index(');', decoder.index('        wall_base_fp16_shared_gateup_ =', start)) + 2
     cold = decoder[start:end]
@@ -53,7 +55,7 @@ def test_actual_fp16_long_cold_plan_complete_and_activation(tmp_path):
         'static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE)', '1').replace(
         'static_cast<int64_t>(FmbLinearRouteSelector::GEMV)', '2').replace(
         'static_cast<int64_t>(FmbLinearRouteSelector::ROW_WEIGHT_REUSE)', '5') + ';'
-    source = META + r'''
+    source = CATALOG_INCLUDE + META + r'''
 #include <atomic>
 #include <bitset>
 #include <memory>
@@ -62,12 +64,19 @@ def test_actual_fp16_long_cold_plan_complete_and_activation(tmp_path):
 #define TORCH_INTERNAL_ASSERT(x) TORCH_CHECK(x)
 KERNEL_IDS
 AVAILABILITY
+PI_WALL_ID
 struct KernelCache {KernelPayloadAvailability availability;
  static auto& instance(){static KernelCache k;return k;}
  bool has_loaded(KernelId id)const{return availability.has_loaded(id);}};
+PI_WALL_RUNTIME
 void publish(bool candidate=true,bool gateup=false){KernelPayloadAvailability::ExtendedPayloads bits;
- bits.set(size_t(KernelId::WALL_PREFILL_QKV_FP16_M448N64K128)-KernelPayloadAvailability::kExtendedBegin,candidate);
- bits.set(size_t(KernelId::WALL_BASE_PREFILL_GATE_UP_SHARED_SILU_FP16_M320N80K128)-KernelPayloadAvailability::kExtendedBegin,gateup);
+ for(const auto& p:rpu_pi_wall::profiles){
+  if(p.weight!=rpu_pl_tiling::WeightType::Fp16)continue;
+  if(p.operation==rpu_pi_wall::Operation::Qkv)
+   bits.set(size_t(pi_wall_kernel_id(p.ordinal))-KernelPayloadAvailability::kExtendedBegin,candidate);
+  if(p.operation==rpu_pi_wall::Operation::SharedSilu)
+   bits.set(size_t(pi_wall_kernel_id(p.ordinal))-KernelPayloadAvailability::kExtendedBegin,gateup);
+ }
  KernelCache::instance().availability.publish(false,false,false,false,false,false,bits);}
 enum class ChunkMode {SEQUENTIAL,KV_FIRST};
 enum class CausalDecoderPlanningMode {ORDINARY,WALL_Z1};
@@ -141,14 +150,16 @@ struct Model {
  uint32_t addr(int,std::string s){return s=="input_norm"?0x100000:s=="q"?0x300000:s=="k"?0x340000:s=="v"?0x360000:s=="gate"?0x400000:s=="residual1"?0x800000:s=="residual2"?0xa00000:s=="down"?0x600000:0x500000;}
  uint32_t qkv_fused_bias_addr(int l,std::string s){return (s=="q_bias"?0x700000:s=="k_bias"?0x710000:0x720000)+l*1024;}
  HELPERS
+ template<class...T>bool lingbot_prefill_gateup_for_plan(T...)const{return false;}
+ std::vector<int64_t>lingbot_prefill_gateup_arguments()const{TORCH_CHECK(false,"unbound Lingbot GateUp");return {};}
  bool ordinary_silu_mul_route_enabled()const{return false;}bool use_planned_silu_mul()const{return false;}
  bool wall_base_prefill_shared_input_enabled(const FmbThreeStageChunkPlan&,int64_t,int64_t,bool,bool,int64_t)const{return false;}
  int64_t wall_base_prefill_shared_gateup_site()const{return 0;}
  std::vector<int64_t>wall_base_prefill_shared_input_arguments(int64_t)const{return {};}
- template<class...T>bool lingbot_prefill_gateup_for_plan(T...)const{return false;}
- std::vector<int64_t> lingbot_prefill_gateup_arguments()const{throw std::runtime_error("unexpected LingBot route");}
  template<class...T>bool qwen3vl_4b_prefill_swiglu(T...)const{return false;}
  template<class...T>bool qwen3vl_decode_mlp(T...)const{return false;}
+ std::vector<int64_t> qwen3vl_prefill_gateup_contract_arguments(int64_t)const{TORCH_CHECK(false,"unbound Qwen prefill GateUp");return {};}
+ std::vector<int64_t> qwen3vl_decode_gateup_contract_arguments()const{TORCH_CHECK(false,"unbound Qwen decode GateUp");return {};}
  bool qwen3vl_decode_gemv(int64_t)const{return false;}
  void bind(){const int64_t N=num_layers(),hidden_size=hidden,intermediate_size=intermediate,num_q_heads=nq,num_kv_heads=nkv,head_dim=hd;
   const bool has_scale=scale,has_nvfp4=nvfp4_,use_silu=use_silu_;
@@ -165,7 +176,7 @@ struct Model {
   plan.qkv.plan=plan.compute.plan={p/2,2};plan.qkv.chunks=plan.compute.chunks={{0,0,p/2,p/2},{1,p/2,p/2,p}};}
  bool enabled()const{return wall_base_fp16_long_prefill_fusion(context.stage_plan,seq_len_,context.position,context.is_causal,context.attention_mask.has_value(),context.batch_size);}
  void build(){const auto& plan=context.stage_plan;const int64_t physical_len=seq_len_,position=context.position;
-  struct{bool is_causal,use_attn_mask;int64_t batch_size;int attention_policy=0;}layout{context.is_causal,context.attention_mask.has_value(),context.batch_size};
+  struct{bool is_causal,use_attn_mask;int64_t batch_size;int attention_policy;}layout{context.is_causal,context.attention_mask.has_value(),context.batch_size,0};
   const bool wall_long_prefill_qkv=false,wall_small_prefill_fused=false;
   PRODUCER_ADMISSION
   context.value.routes.clear();
@@ -206,9 +217,11 @@ int main(){
  publish();
  for(int64_t p:{448,512,640}){Model m;m.set_rows(p);assert(m.enabled());m.build();const auto valid=m.context.value.routes;const int64_t rows=p/2;
   assert(valid.size()==4);
+  const auto selected=rpu_pi_wall::select(rpu_pi_wall::Operation::Qkv,rpu_pl_tiling::WeightType::Fp16,false,rows,256,2048);
   for(int c=0;c<2;++c){const auto&q=valid[c];const auto&a=valid[c+2];
    assert(q.family==FmbRouteFamily::LINEAR&&q.site_id==CAUSAL_DECODER_Q_SITE&&q.selector==8&&q.flags==0&&q.invocation==c);
-   assert(q.arguments==std::vector<int64_t>({rows,2048,2048,1024,8,448,64,128,16}));
+   assert(q.arguments==std::vector<int64_t>({rows,2048,2048,1024,8,selected.tile.m_tile,selected.tile.n_tile,
+    selected.tile.k_tile,16,selected.grid_x,selected.grid_y,2,32,40,20,34,42,4,36,44,6,38,46}));
    assert(a.family==FmbRouteFamily::ACTIVATION&&a.site_id==FMB_SHARED_MLP_SILU_MUL_SITE&&a.selector==1&&a.flags==0&&a.invocation==c);
    assert(a.arguments==std::vector<int64_t>({rows,1376,8}));}
   launches.clear();activations.clear();
@@ -275,7 +288,11 @@ int main(){
   assert(m.cost_identity()==std::vector<int64_t>({CAUSAL_DECODER_Q_SITE,16,FMB_SHARED_MLP_SILU_MUL_SITE,1}));
   m.wall_base_fp16_shared_gateup_=true;
   for(size_t r=0;r<valid.size();++r){const auto&v=valid[r];if(v.site_id==CAUSAL_DECODER_Q_SITE)continue;
-   if(v.site_id==WALL_BASE_FP16_PREFILL_SHARED_GATEUP_SITE)assert(v.arguments==std::vector<int64_t>({1,rows,11008,2048,1376,8,320,80,128,18,1,1,16,400,1}));
+   if(v.site_id==WALL_BASE_FP16_PREFILL_SHARED_GATEUP_SITE){
+    const auto selected=rpu_pi_wall::select(rpu_pi_wall::Operation::SharedSilu,rpu_pl_tiling::WeightType::Fp16,false,rows,1376,2048);
+    assert(v.arguments==std::vector<int64_t>({2,rows,11008,2048,1376,8,selected.tile.m_tile,selected.tile.n_tile,
+     selected.tile.k_tile,selected.grid_x,selected.grid_y,1,16,1,2,32,26,27}));
+   }
    else if(v.site_id==WALL_BASE_PREFILL_SHARED_DOWN_SITE)assert(v.arguments==std::vector<int64_t>({rows,2048,11008,0,8}));
    else assert(v.site_id==WALL_BASE_PREFILL_SHARED_REDUCE_SITE&&v.arguments.empty());
    auto fail=[&]{auto g=gates.size(),d=downs.size(),a=activations.size(),reduce=rings.size();rejects([&]{m.emit_mlp(v.invocation,35);});
@@ -308,8 +325,10 @@ int main(){
     source = source.replace('struct Model {', '''namespace detail {int64_t layout_mix(int64_t h,int64_t v){return (uint64_t(h)^uint64_t(v))*1099511628211ULL;}}
 struct Model {''')
     for name, value in (
-        ('KERNEL_IDS', block(cache, 'enum class KernelId') + ';'),
+        ('KERNEL_IDS', absolute_candidate_includes(block(cache, 'enum class KernelId') + ';')),
         ('AVAILABILITY', block(cache, 'class KernelPayloadAvailability final') + ';'),
+        ('PI_WALL_ID', block(cache, 'inline KernelId pi_wall_kernel_id(')),
+        ('PI_WALL_RUNTIME', block(runtime, 'inline bool rpu_pi_wall_operation_loaded(')),
         ('HELPERS', helpers), ('COLD', cold), ('CONSUME', consume),
         ('SHARED_CONSUMER', shared_consumer),
         ('ROUTE_ENUM', route_enum), ('Q_SITE', q_site),
@@ -332,11 +351,13 @@ def test_actual_fp16_shared_leaf_ranges_typed_packet_and_fallback(tmp_path):
     leaf = block(linear, 'void rpu_launch_wall_base_prefill_gate_up_shared_fp16_spm_kernel(')
     optional = block((ROOT / 'src/core/rpu_kernel_cache.inc').read_text(),
                      'static bool is_optional_kernel(')
-    source = META + r'''
+    source = CATALOG_INCLUDE + META + r'''
 #include "ops/rpu_linear_tiling.h"
 #include <unordered_set>
 OPTIONAL
-enum class KernelId {WALL_BASE_PREFILL_GATE_UP_SHARED_SILU_FP16_M320N80K128};
+enum class KernelId:std::size_t {};
+KernelId pi_wall_kernel_id(std::size_t ordinal){return static_cast<KernelId>(ordinal);}
+KernelId chosen;
 enum class GraphDdrRegisterRole {ModelWeight};
 enum class GraphDdrRegisterAccess {Read};
 enum class GraphDdrRegisterEncoding {DevAddrShift8LoHi};
@@ -351,12 +372,12 @@ struct Writer {std::vector<GraphDdrRegisterOperandSpec> operands;void write(Kern
  TORCH_CHECK(k.set_regs(o.abi.lo,uint16_t(a))==0);TORCH_CHECK(k.set_regs(o.abi.hi,uint16_t(a>>16))==0);}}};
 struct RpuKernelGraph {static auto& active(){static RpuKernelGraph g;return g;}
  Writer stage_kernel_ddr_registers(KernelId id,std::vector<GraphDdrRegisterOperandSpec> v){
-  TORCH_CHECK(!deny_stage);assert(id==KernelId::WALL_BASE_PREFILL_GATE_UP_SHARED_SILU_FP16_M320N80K128&&v.size()==2);
-  const int pairs[]={2,24};for(int i=0;i<2;++i){const auto&o=v[i];assert(o.abi.role==GraphDdrRegisterRole::ModelWeight&&o.abi.access==GraphDdrRegisterAccess::Read&&o.abi.encoding==GraphDdrRegisterEncoding::DevAddrShift8LoHi&&o.abi.lo==pairs[i]&&o.abi.hi==pairs[i]+1&&o.tensor.dtype==at::kHalf);}
+  TORCH_CHECK(!deny_stage);chosen=id;assert(v.size()==2);
+  const int pairs[]={2,32};for(int i=0;i<2;++i){const auto&o=v[i];assert(o.abi.role==GraphDdrRegisterRole::ModelWeight&&o.abi.access==GraphDdrRegisterAccess::Read&&o.abi.encoding==GraphDdrRegisterEncoding::DevAddrShift8LoHi&&o.abi.lo==pairs[i]&&o.abi.hi==pairs[i]+1&&o.tensor.dtype==at::kHalf);}
   ++staged;return {v};}};
-struct Queue {bool broadcast=false;void set_broadcast_mode(bool b){broadcast=b;}
- void enqueu_kernel(Kernel&,std::vector<uint16_t> grid,std::vector<uint8_t> cores){
- assert(broadcast&&grid==std::vector<uint16_t>({18,1,1})&&cores==std::vector<uint8_t>({0,1,2,3,4,5,6,7}));++queued;}}queue;
+struct Queue {bool broadcast=false;std::vector<uint16_t> grid;void set_broadcast_mode(bool b){broadcast=b;}
+ void enqueu_kernel(Kernel&,std::vector<uint16_t> g,std::vector<uint8_t> cores){
+ assert(broadcast&&cores==std::vector<uint8_t>({0,1,2,3,4,5,6,7}));grid=g;++queued;}}queue;
 #define GET_KERNEL(id) (kernel_present?&::kernel:nullptr)
 #define GET_QUEUE(n) (&::queue)
 struct SpmAllocator {static constexpr uint32_t SPM_USABLE=8387584;bool ready=true;uint32_t base=0x20000000;
@@ -368,16 +389,19 @@ LEAF
 uint32_t word(int r){return kernel.regs[r]|uint32_t(kernel.regs[r+1])<<16;}
 template<class F>void rejects(F f,bool preflight=true){auto s=staged,q=queued;bool failed=false;try{f();}catch(const std::exception&){failed=true;}assert(failed&&queued==q&&(!preflight||staged==s));}
 int main(){
- assert(is_optional_kernel("wall_base_prefill_gate_up_shared_silu_fp16_m320n80k128"));
  assert(!is_optional_kernel("llama_insert_kv_cache_multiwarp_v16"));
  at::Tensor g,u;g.shape=u.shape={11008,2048};g.dtype=u.dtype=at::kHalf;g.address=0x10000000;u.address=0x14000000;
  uint32_t input=0x20000100,output=0x20200000;int64_t rows=224;
  auto run=[&]{rpu_launch_wall_base_prefill_gate_up_shared_fp16_spm_kernel(input,g,u,output,rows);};
- for(int64_t m:{224,256,320}){rows=m;for(int repeat=0;repeat<2;++repeat){kernel.regs.fill(0xffff);auto old=kernel.resets;run();assert(kernel.resets==old+1);
-  assert(word(0)==input&&word(2)==g.address>>8&&word(4)==output&&word(6)==0&&kernel.regs[8]==rows);
+ for(int64_t m:{224,256,320}){rows=m;
+  const auto selected=rpu_pi_wall::select(rpu_pi_wall::Operation::SharedSilu,rpu_pl_tiling::WeightType::Fp16,false,rows,1376,2048);
+  assert(!is_optional_kernel(rpu_pi_wall::candidate_names[selected.ordinal]));
+  for(int repeat=0;repeat<2;++repeat){kernel.regs.fill(0xffff);auto old=kernel.resets;run();assert(kernel.resets==old+1);
+  assert(chosen==pi_wall_kernel_id(selected.ordinal)&&queue.grid==std::vector<uint16_t>({selected.grid_x,selected.grid_y,1}));
+  assert(word(0)==input&&word(2)==g.address>>8&&word(4)==output&&word(6)==0&&kernel.regs[8]==1&&kernel.regs[9]==rows);
   assert(word(10)==1376&&kernel.regs[12]==2048&&kernel.regs[13]==128&&kernel.regs[14]==0&&kernel.regs[15]==8);
-  assert(word(16)==4096&&word(18)==2752&&word(20)==0&&kernel.regs[22]==1&&kernel.regs[23]==1&&word(24)==u.address>>8);
-  assert(word(26)==0&&word(28)==0&&word(30)==0);}}
+  assert(word(16)==4096&&word(18)==2752&&word(20)==0&&word(22)==0&&word(24)==0&&word(32)==u.address>>8);
+  assert(kernel.regs[26]==2&&kernel.regs[27]==2&&word(28)==0&&word(30)==0);}}
  for(int m:{0,32,208,223,225,240,255,257,272,304,319,321,336,384,448,512,640}){rows=m;rejects(run);}rows=320;
  const auto input_old=input,output_old=output;
  for(auto* address:{&input,&output}){auto old=*address;*address=0;rejects(run);*address=old+32;rejects(run);*address=spm.base-256;rejects(run);*address=spm.base+SpmAllocator::SPM_USABLE-256;rejects(run);*address=old;}
@@ -403,7 +427,7 @@ int main(){
  deny_stage=true;rejects(run);deny_stage=false;
  deny_write=true;rejects(run,false);deny_write=false;
  kernel_present=false;rejects(run,false);kernel_present=true;
- for(int r:{2,3,24,25}){kernel.fail=r;rejects(run,false);kernel.fail=-1;}
+ for(int r:{2,3,32,33}){kernel.fail=r;rejects(run,false);kernel.fail=-1;}
 }
 '''
     compile_run(tmp_path, 'wall_fp16_shared_leaf', source.replace('LEAF', leaf).replace('OPTIONAL', optional))

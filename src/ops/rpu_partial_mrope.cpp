@@ -20,7 +20,8 @@
 //   reg[11]         heads_num (per-core local heads)
 //   reg[12]         num_tokens (seq_len of this chunk)
 //   reg[13]         rotary_dim (e.g. 64 = head_dim * 0.25)
-//   reg[14]         is_freq_in_ddr (1 = DDR tables)
+//   reg[14]         is_freq_in_ddr (1 = DDR tables, 0 = SPM byte addresses in
+//                   reg[0..3], rows read from position_offset on)
 // Grid: x = ceil(rotary_dim/2 / 64), y = ceil(num_tokens / 64), z = 1.
 
 #include <ATen/ATen.h>
@@ -36,6 +37,59 @@
 #include "rpu_spm_allocator.h"
 
 using namespace ::rhino_lkn;
+
+static void check_partial_mrope_shape(int64_t seq_len, int64_t local_heads,
+                                      int64_t head_dim, int64_t rotary_dim)
+{
+    TORCH_CHECK(seq_len > 0 && local_heads > 0 && head_dim > 0 && rotary_dim > 0,
+                "rpu_launch_partial_mrope_spm_kernel: seq_len/local_heads/head_dim/"
+                "rotary_dim must be positive (got ", seq_len, "/", local_heads, "/",
+                head_dim, "/", rotary_dim, ")");
+    TORCH_CHECK(rotary_dim <= head_dim && (rotary_dim % 2) == 0,
+                "rpu_launch_partial_mrope_spm_kernel: rotary_dim=", rotary_dim,
+                " must be even and <= head_dim=", head_dim);
+}
+
+// reg[4..14]; the caller sets reg[0..3] before or after.
+static void set_partial_mrope_regs(Kernel_t* kernel,
+                                   uint32_t x_spm_addr,
+                                   uint32_t y_spm_addr,
+                                   uint64_t pos_off_u,
+                                   int64_t seq_len,
+                                   int64_t local_heads,
+                                   int64_t head_dim,
+                                   int64_t rotary_dim,
+                                   bool freq_in_ddr)
+{
+    // reg[4]/reg[5]: input SPM addr
+    kernel->set_regs(4, (uint16_t)(x_spm_addr & 0xFFFF));
+    kernel->set_regs(5, (uint16_t)(x_spm_addr >> 16));
+    // reg[6]/reg[7]: output SPM addr
+    kernel->set_regs(6, (uint16_t)(y_spm_addr & 0xFFFF));
+    kernel->set_regs(7, (uint16_t)(y_spm_addr >> 16));
+    // reg[8]/reg[9]: position_offset (uint32 split)
+    kernel->set_regs(8, (uint16_t)(pos_off_u & 0xFFFF));
+    kernel->set_regs(9, (uint16_t)((pos_off_u >> 16) & 0xFFFF));
+    // reg[10..14]: scalars
+    kernel->set_regs(10, (uint16_t)head_dim);
+    kernel->set_regs(11, (uint16_t)local_heads);
+    kernel->set_regs(12, (uint16_t)seq_len);     // num_tokens
+    kernel->set_regs(13, (uint16_t)rotary_dim);
+    kernel->set_regs(14, (uint16_t)(freq_in_ddr ? 1 : 0));  // is_freq_in_ddr
+}
+
+static void enqueue_partial_mrope(Kernel_t* kernel, int64_t seq_len,
+                                  int64_t rotary_dim, int num_cores)
+{
+    const uint16_t grid_x = (uint16_t)((rotary_dim / 2 + 63) / 64);
+    const uint16_t grid_y = (uint16_t)((seq_len + 63) / 64);
+
+    auto* wq = GET_QUEUE(num_cores);
+    wq->set_broadcast_mode(true);
+    std::vector<uint8_t> core_list;
+    for (int i = 0; i < num_cores; ++i) core_list.push_back((uint8_t)i);
+    wq->enqueu_kernel(*kernel, {grid_x, grid_y, (uint16_t)1}, core_list);
+}
 
 static void launch_partial_mrope_spm_kernel(
     uint32_t x_spm_addr,
@@ -55,13 +109,7 @@ static void launch_partial_mrope_spm_kernel(
     TORCH_CHECK(pos_offset >= 0,
                 "rpu_launch_partial_mrope_spm_kernel: pos_offset must be >= 0, got ",
                 pos_offset);
-    TORCH_CHECK(seq_len > 0 && local_heads > 0 && head_dim > 0 && rotary_dim > 0,
-                "rpu_launch_partial_mrope_spm_kernel: seq_len/local_heads/head_dim/"
-                "rotary_dim must be positive (got ", seq_len, "/", local_heads, "/",
-                head_dim, "/", rotary_dim, ")");
-    TORCH_CHECK(rotary_dim <= head_dim && (rotary_dim % 2) == 0,
-                "rpu_launch_partial_mrope_spm_kernel: rotary_dim=", rotary_dim,
-                " must be even and <= head_dim=", head_dim);
+    check_partial_mrope_shape(seq_len, local_heads, head_dim, rotary_dim);
 
     // cos/sin retain the static-DDR-table contract (caller-owned tables).
     rpu_ddr_flush(cos_ptr);
@@ -80,21 +128,8 @@ static void launch_partial_mrope_spm_kernel(
     Kernel_t* kernel = GET_KERNEL(KernelId::PARTIAL_MROPE);
     TORCH_CHECK(kernel != nullptr, "Failed to get partial_mrope kernel");
 
-    // reg[4]/reg[5]: input SPM addr
-    kernel->set_regs(4, (uint16_t)(x_spm_addr & 0xFFFF));
-    kernel->set_regs(5, (uint16_t)(x_spm_addr >> 16));
-    // reg[6]/reg[7]: output SPM addr
-    kernel->set_regs(6, (uint16_t)(y_spm_addr & 0xFFFF));
-    kernel->set_regs(7, (uint16_t)(y_spm_addr >> 16));
-    // reg[8]/reg[9]: position_offset (uint32 split)
-    kernel->set_regs(8, (uint16_t)(pos_off_u & 0xFFFF));
-    kernel->set_regs(9, (uint16_t)((pos_off_u >> 16) & 0xFFFF));
-    // reg[10..14]: scalars
-    kernel->set_regs(10, (uint16_t)head_dim);
-    kernel->set_regs(11, (uint16_t)local_heads);
-    kernel->set_regs(12, (uint16_t)seq_len);     // num_tokens
-    kernel->set_regs(13, (uint16_t)rotary_dim);
-    kernel->set_regs(14, (uint16_t)1);           // is_freq_in_ddr
+    set_partial_mrope_regs(kernel, x_spm_addr, y_spm_addr, pos_off_u, seq_len,
+                           local_heads, head_dim, rotary_dim, /*freq_in_ddr=*/true);
 
     // reg[0..3] are the DDR operands. Under typed census the move-only writer
     // is their sole register-write authority and snapshots the final state.
@@ -106,15 +141,7 @@ static void launch_partial_mrope_spm_kernel(
         kernel->set_regs(2, (uint16_t)(sin_addr & 0xFFFF));
         kernel->set_regs(3, (uint16_t)(sin_addr >> 16));
     }
-
-    const uint16_t grid_x = (uint16_t)((rotary_dim / 2 + 63) / 64);
-    const uint16_t grid_y = (uint16_t)((seq_len + 63) / 64);
-
-    auto* wq = GET_QUEUE(num_cores);
-    wq->set_broadcast_mode(true);
-    std::vector<uint8_t> core_list;
-    for (int i = 0; i < num_cores; ++i) core_list.push_back((uint8_t)i);
-    wq->enqueu_kernel(*kernel, {grid_x, grid_y, (uint16_t)1}, core_list);
+    enqueue_partial_mrope(kernel, seq_len, rotary_dim, num_cores);
 }
 
 void rpu_launch_partial_mrope_spm_kernel(
@@ -191,6 +218,30 @@ void rpu_launch_partial_mrope_spm_kernel(
         x_spm_addr, y_spm_addr, cos.data_ptr<c10::Half>(),
         sin.data_ptr<c10::Half>(), pos_offset, seq_len, local_heads,
         head_dim, rotary_dim, num_cores, &register_writer);
+}
+
+void rpu_launch_partial_mrope_spm_table_kernel(
+    uint32_t x_spm_addr,
+    uint32_t y_spm_addr,
+    uint32_t cos_spm_addr,
+    uint32_t sin_spm_addr,
+    int64_t seq_len,
+    int64_t local_heads,
+    int64_t head_dim,
+    int64_t rotary_dim,
+    int num_cores)
+{
+    check_partial_mrope_shape(seq_len, local_heads, head_dim, rotary_dim);
+    Kernel_t* kernel = GET_KERNEL(KernelId::PARTIAL_MROPE);
+    TORCH_CHECK(kernel != nullptr, "Failed to get partial_mrope kernel");
+    // reg[0..3]: SPM byte addresses of the staged rows (no DDR operand).
+    kernel->set_regs(0, (uint16_t)(cos_spm_addr & 0xFFFF));
+    kernel->set_regs(1, (uint16_t)(cos_spm_addr >> 16));
+    kernel->set_regs(2, (uint16_t)(sin_spm_addr & 0xFFFF));
+    kernel->set_regs(3, (uint16_t)(sin_spm_addr >> 16));
+    set_partial_mrope_regs(kernel, x_spm_addr, y_spm_addr, /*pos_off_u=*/0, seq_len,
+                           local_heads, head_dim, rotary_dim, /*freq_in_ddr=*/false);
+    enqueue_partial_mrope(kernel, seq_len, rotary_dim, num_cores);
 }
 
 static void launch_partial_mrope_qk_spm_kernel(
@@ -670,10 +721,11 @@ void rpu_launch_pi05_k_rope_insert_spm_kernel(
                     (plan.segment(0).position == 544 || plan.segment(0).position == 800 ||
                      plan.segment(0).position == 832 || plan.segment(0).position == 576 ||
                      plan.segment(0).position == 864 || plan.segment(0).position == 896 || plan.segment(0).position == 608 || plan.segment(0).position == 640 ||
-                     plan.segment(0).position == 672 || plan.segment(0).position == 928) &&
+                     plan.segment(0).position == 672 || plan.segment(0).position == 928 ||
+                     plan.segment(0).position == 960) &&
                     plan.segment(0).token_offset == 0 &&
                     plan.segment(0).rows == 64 && spm_rows == 64,
-                "Pi0.5 K-RoPE insert requires the complete M50/P544/P576/P608/P640/P672/P800/P832/P864/P896/P928/PAD16 V16 plan");
+                "Pi0.5 K-RoPE insert requires the complete M50/P544/P576/P608/P640/P672/P800/P832/P864/P896/P928/P960/PAD16 V16 plan");
     constexpr uint32_t kBytes = 64 * 256 * sizeof(c10::Half);
     TORCH_CHECK((k_off & 255) == 0 &&
                     k_off <= SpmAllocator::SPM_USABLE - kBytes,

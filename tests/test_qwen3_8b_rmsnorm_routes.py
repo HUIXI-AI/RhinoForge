@@ -30,7 +30,7 @@ def qwen_rms_executable(tmp_path_factory):
     source = (ROOT / "src/fused/rpu_qwen3_model.h").read_text()
     declarations = (ROOT / "src/core/rpu_kernel_decls.h").read_text()
     resolver = declarations[declarations.index("enum RpuRmsNormCapability"):
-                            declarations.index("RpuRmsNormSpmContract rpu_snapshot_rmsnorm_spm_contract(")]
+                            declarations.index("inline RpuMixedRmsNormSpmRoute rpu_resolve_mixed_rmsnorm_spm_route")]
     planner = _block(source, "        if (ordinary_rmsnorm_route_enabled() && layout.is_causal &&")
     helpers = "\n".join(_block(source, marker) for marker in (
         "    bool ordinary_rmsnorm_route_enabled() const",
@@ -43,12 +43,12 @@ def qwen_rms_executable(tmp_path_factory):
     consumer = consumer.replace("FmbPhysicalManifestConsumer::consume_route", "consume_physical_route")
     constants = "\n".join(re.search(rf"inline constexpr int64_t {name}\s*=\s*\d+LL;", source).group(0)
                           for name in ("CAUSAL_DECODER_ORDINARY_RMSNORM_SITE",
+                                       "kCausalDecoderRmsNormRowsSite",
+                                       "QWEN3VL_DELIVERY_RMS_SITE",
                                        "RHINOVLA_TEXT_HIGH_RMSNORM_SITE",
-                                       "RHINOVLA_TEXT_HIGH_ACTIVATION_SITE",
-                                       "QWEN3VL_DELIVERY_RMS_SITE", "kCausalDecoderRmsNormRowsSite"))
-    # The LingBot terminal-layer specialization has its own route tests.
-    ordinary_source = source.replace(_block(source, "    void emit_lingbot_prefill_kv_tail("), "")
-    calls = re.findall(r"rpu_launch_rmsnorm_spm_kernel\([\s\S]*?\);", ordinary_source)
+                                       "RHINOVLA_TEXT_HIGH_ACTIVATION_SITE"))
+    layer = _block(source, "void build_layer_subgraph(int layer_idx, const ChunkInfo& chunk)")
+    calls = re.findall(r"rpu_launch_rmsnorm_spm_kernel\([\s\S]*?\);", layer)
     calls = [call for call in calls if "consume_ordinary_rmsnorm_route(" in call or
              re.search(r"consume_wall_rmsnorm_route\(rows,\s*h,\s*chunk.idx\)", call)]
     assert len(calls) == 5  # input, Q, K, post, final; execute actual launch arguments.
@@ -79,8 +79,8 @@ struct Context {
     int64_t batch_size = 1;
     FmbThreeStageChunkPlan stage_plan;
     Manifest manifest_;
+    const auto& manifest() const { return manifest_; }
     mutable std::vector<int> consumed_;
-    const Manifest& manifest() const { return manifest_; }
     bool has_complete_physical_manifest() const { return complete; }
     const FmbRouteManifestEntry& find_route(FmbRouteFamily family, int64_t site, int64_t invocation) const {
         for (const auto& entry : manifest_.routes)
@@ -99,19 +99,18 @@ void rpu_launch_rmsnorm_spm_kernel(uint32_t input, uint32_t output, uint32_t gam
 }
 class CausalDecoderModel {
 public:
-    uint32_t wall_rmsnorm_capability_=RPU_RMSNORM_CAP_BASE;
-    bool decoder_mixed_precision_=false;
-    bool lingbot_folded_rmsnorm_=false;
+    bool lingbot_folded_rmsnorm_ = false;
     virtual ~CausalDecoderModel() = default;
     int64_t h = 4096, intermediate = 12288, layers = 36, q = 32, kv = 8, hd = 128, tp = 8;
     bool has_qk_norm_ = true, has_qkv_bias_ = false, use_silu_ = true, nvfp4_ = false;
-    bool adarms_ = false, qwen3vl_2b_w8_profile_ = false;
-    bool rhinovla_high_precision_ = false, rhinovla_high_precision_fusions_ = false;
-    bool qwen3vl4b_fused_qk = false;
+    bool adarms_ = false, decoder_mixed_precision_ = false, qwen3vl_2b_w8_profile_ = false;
     bool has_mrope_ = false;
+    bool rhinovla_high_precision_ = false;
+    bool rhinovla_high_precision_fusions_ = false;
     std::vector<int> deepstack_lang_layers_;
     RpuRmsNormSpmContract ordinary_rmsnorm_spm_contract_{
         RPU_RMSNORM_CAP_GENERIC_DIRECT_SPM};
+    uint32_t wall_rmsnorm_capability_ = RPU_RMSNORM_CAP_BASE;
     double eps_ = 1e-6;
     Context context;
     int64_t hidden_size() const { return h; }
@@ -121,8 +120,8 @@ public:
     int64_t num_kv_heads() const { return kv; }
     int64_t head_dim() const { return hd; }
     int64_t attn_tp() const { return tp; }
-    int64_t num_cores() const { return 8; }
-    int64_t mlp_tp() const { return 8; }
+    int64_t mlp_tp() const { return tp; }
+    int num_cores() const { return 8; }
     const Context& ctx() const { return context; }
     uint32_t addr(int, const char* name) const { return static_cast<uint32_t>(std::string(name).back()); }
     uint32_t norm_input_addr(int, int) const { return 10; }
@@ -133,6 +132,7 @@ public:
 ''' + helpers + r'''
     Manifest plan_for_test(const FmbThreeStageChunkPlan& plan, const LayoutContext& layout) const {
         Manifest result;
+        const bool qwen3vl4b_fused_qk = false;
         auto append = [&](FmbRouteFamily family, int64_t site, int64_t selector, int64_t flags,
                           std::vector<int64_t> args, int64_t invocation) {
             result.routes.push_back({family, site, selector, flags, std::move(args), invocation});
@@ -340,7 +340,7 @@ void isolation() {
         CausalDecoderModel model;
         LayoutContext layout;
         if (mode == 0) model.adarms_ = true;
-        if (mode == 1) model.qwen3vl_2b_w8_profile_ = true;
+        if (mode == 1) model.decoder_mixed_precision_ = true;
         if (mode == 2) layout.is_causal = false;
         if (mode == 3) layout.batch_size = 2;
         assert(model.plan_for_test(plan, layout).routes.empty());

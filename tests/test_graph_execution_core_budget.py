@@ -6,6 +6,7 @@ are needed. Numerical BUILD/REPLAY remains a separate hardware gate.
 """
 
 from pathlib import Path
+import ast
 import re
 import shutil
 import subprocess
@@ -37,6 +38,16 @@ def native_budget_probe(tmp_path_factory):
     child = (ROOT / "src/graph/graph_runtime_child.cpp").read_text()
     internal = (ROOT / "src/graph/graph_runtime_internal.h").read_text()
     capture = (ROOT / "src/graph/graph_runtime_capture.cpp").read_text()
+    # Use the public Python signature's real stable op-id conversion, without
+    # importing Torch or loading a backend, for the native scope checks.
+    signature_source = (ROOT / "python/rpu_backend/graph/_runtime.py").read_text()
+    signature_fn = next(node for node in ast.parse(signature_source).body
+                        if isinstance(node, ast.FunctionDef)
+                        and node.name == "_graph_fnv1a_64")
+    signature_namespace = {}
+    exec(compile(ast.Module(body=[signature_fn], type_ignores=[]),
+                 "graph/_runtime.py", "exec"), signature_namespace)
+    causal_decoder_op_id = signature_namespace["_graph_fnv1a_64"]("rpu_causal_decoder")
     policy = infra[infra.index("struct GraphRuntimePolicy {"):]
     policy = policy[:policy.index("\n};") + 3]
     functions = "\n\n".join([
@@ -45,11 +56,17 @@ def native_budget_probe(tmp_path_factory):
         _function(execute, "uint8_t validated_kernel_core_extent("),
         _function(execute, "static size_t segment_new_completion_bytes("),
         _function(execute, "static bool segment_would_exceed("),
+        _function(execute, "static bool causal_14b_c4_initial_prefill_needs_small_segments("),
         _function(execute, "void RpuKernelGraph::build_segments_from_nodes("),
         _function(execute, "::rhino_lkn::Queue_t* RpuKernelGraph::ensure_private_queue("),
         _function(execute, "void RpuKernelGraph::execute_ddr_copy("),
         "template <typename ND>\n" + _function(capture, "void RpuKernelGraph::capture_data("),
     ])
+    def first_guard(body):
+        start = body.index("TORCH_CHECK(")
+        return body[start:body.index(";", start) + 1]
+    sync_guard = first_guard(_function(execute, "void RpuKernelGraph::sync_point("))
+    downgrade_guard = first_guard(_function(runtime, "void RpuKernelGraph::mark_non_replayable("))
     prepare = _function(execute, "uint32_t RpuKernelGraph::prepare_segment_queue(")
     prepare_preflight = prepare[prepare.index("{") + 1:prepare.index("// P2 改造:")]
     # Exercise the actual admission statement at each child attachment entry.
@@ -92,6 +109,7 @@ def native_budget_probe(tmp_path_factory):
 #define TORCH_CHECK(condition, ...) do { if (!(condition)) throw std::runtime_error("rejected"); } while (0)
 #define RECORD_FUNCTION(...) do {} while (0)
 namespace at {
+constexpr uint8_t kHalf = 5;
 enum class RecordScope { FUNCTION };
 struct RecordFunction {
     explicit RecordFunction(RecordScope) {}
@@ -267,7 +285,10 @@ struct Segment {
 struct SegmentResourceUse { size_t entries = 0, kd_bytes = 0, instr_bytes = 0; uint16_t active_streams = 0; };
 using SegmentResourceBudget = SegmentResourceUse;
 size_t test_entry_budget = 1000;
-SegmentResourceBudget segment_resource_budget(const std::string&, const GraphRuntimePolicy&) {
+bool test_native_budget = false;
+__NATIVE_BUDGET__
+SegmentResourceBudget segment_resource_budget(const std::string& label, const GraphRuntimePolicy& policy, bool require_single_segment) {
+    if (test_native_budget) return native_segment_resource_budget(label, policy, require_single_segment);
     return {test_entry_budget, 1000, 1000};
 }
 SegmentResourceUse segment_node_resources(const GraphNode& node, const std::vector<int>&) {
@@ -294,7 +315,8 @@ struct RpuKernelGraph {
     std::string batch_snapshot_fallback_reason_;
     void bind_batch_snapshot_admission() {}
     void invalidate_batch_snapshots() {}
-    explicit RpuKernelGraph(GraphRuntimePolicy policy = {}) : runtime_policy_(policy) {}
+    bool require_single_segment_ = false;
+    explicit RpuKernelGraph(GraphRuntimePolicy policy = {}, bool single = false) : runtime_policy_(policy), require_single_segment_(single) {}
     std::vector<GraphNode> nodes_;
     std::vector<Segment> segments_;
     std::vector<int> kernels_;
@@ -325,6 +347,9 @@ struct RpuKernelGraph {
     } last_stats_;
     void execute_ddr_copy(const MemcpyNodeData&);
     template <typename ND> void capture_data(ND);
+    bool replayable_ = true;
+    void sync_admission() { __SYNC_GUARD__ }
+    void downgrade_admission() { __DOWNGRADE_GUARD__ replayable_ = false; }
     bool capture_replay_child_skip_data(const MemcpyNodeData&) { return false; }
     void resolve_recording_input_deps(int, const std::vector<uint64_t>&) {}
     void track_recording_writer_dev_addr(uint64_t, int) {}
@@ -356,6 +381,17 @@ GraphNode branch(bool metadata = true) {
     node.branch.label=metadata ? BranchNodeData::physical_manifest_label() : "ordinary";
     return node;
 }
+GraphSignature causal_prefill_signature() {
+    GraphSignature sig;
+    sig.op_id = __CAUSAL_OP_ID__;
+    sig.op_id_str = "rpu_causal_decoder";
+    sig.shapes = {1,192,192,5120};
+    sig.dyn_dims = {40,0,2,4,4,4,4,8,0,0,32,0,
+                   759653830,991875516,3022072701,1526521971,
+                   2372142790,3680631350,1668011494,1603273980};
+    sig.dtypes = {at::kHalf};
+    return sig;
+}
 template<class F> void rejects(F&& f) {
     bool failed = false;
     try { f(); } catch (const std::runtime_error&) { failed = true; }
@@ -374,7 +410,92 @@ int main(int argc, char** argv) {
     assert(argc == 2);
     const std::string mode = argv[1];
     GraphRuntimePolicy policy; policy.execution_core_count = 6;
-    if (mode == "segments") {
+    if (mode == "profile_scope") {
+        test_native_budget = true;
+        policy.execution_core_count = 4;
+        const auto sig = causal_prefill_signature();
+        const auto check = [&](std::optional<GraphSignature> key,
+                               GraphRuntimePolicy owner, size_t pieces) {
+            RpuKernelGraph graph(owner);
+            graph.pending_signature_ = key;
+            graph.nodes_.assign(1025, kernel({0,1,2,3}));
+            graph.build_segments_from_nodes();
+            assert(graph.segments_.size() == pieces);
+            if (pieces == 2) assert(graph.segments_[0].end_idx == 1024);
+            assert(graph.runtime_policy_.lkn_max_batch_entries == owner.lkn_max_batch_entries);
+            assert(graph.runtime_policy_.lkn_kd_buf_mb == owner.lkn_kd_buf_mb);
+            assert(graph.runtime_policy_.lkn_instr_buf_mb == owner.lkn_instr_buf_mb);
+        };
+        check(sig, policy, 2);
+        check(std::nullopt, policy, 1);
+        // Debug labels do not change native policy selection.
+        for (const std::string label : {"", "not a causal decoder"}) {
+            auto changed=sig; changed.op_id_str=label; check(changed,policy,2);
+        }
+        auto changed=sig; ++changed.op_id; check(changed,policy,1);
+        for (size_t i=0; i<sig.shapes.size(); ++i) {
+            changed=sig; ++changed.shapes[i]; check(changed,policy,1);
+        }
+        for (size_t i=0; i<12; ++i) {
+            changed=sig; ++changed.dyn_dims[i]; check(changed,policy,1);
+        }
+        // Plan hashes are not weight-precision tags. Same-shape W8/W4 plan
+        // identities get the small budget too; hardware numerics are separate.
+        for (size_t i=12; i<20; ++i) {
+            changed=sig; ++changed.dyn_dims[i]; check(changed,policy,2);
+        }
+        changed=sig; changed.dyn_dims.pop_back(); check(changed,policy,1);
+        changed=sig; changed.dyn_dims.push_back(0); check(changed,policy,1);
+        changed=sig; changed.dtypes={6}; check(changed,policy,1);
+        changed=sig; changed.flags=1; check(changed,policy,1);
+        changed=sig; changed.branch_key=1; check(changed,policy,1);
+        changed=sig; changed.segment_key=1; check(changed,policy,1);
+        changed=sig; changed.shapes={1,1,1,5120};
+        changed.dyn_dims[10]=0; changed.dyn_dims[11]=-1; check(changed,policy,1);
+        for (int cores : {6,8}) {
+            auto other=policy; other.execution_core_count=cores; check(sig,other,1);
+        }
+        RpuKernelGraph built(policy);
+        built.has_built_signature_=true; built.built_signature_=sig;
+        built.nodes_.assign(1025,kernel({0,1,2,3}));
+        built.build_segments_from_nodes(); assert(built.segments_.size()==2);
+        built.pending_signature_=GraphSignature{};
+        built.build_segments_from_nodes(); assert(built.segments_.size()==1);
+        const auto baseline=native_segment_resource_budget("rpu_causal_decoder",policy,false);
+        assert(baseline.entries==4096 && baseline.kd_bytes==(size_t{4}<<20));
+        assert(baseline.instr_bytes==(size_t{32}<<20));
+        assert(policy.lkn_max_batch_entries==65536 && policy.lkn_kd_buf_mb==8
+               && policy.lkn_instr_buf_mb==64);
+        // The new ceiling cannot enlarge a smaller caller/SDK resource limit.
+        auto lower=policy; lower.lkn_max_batch_entries=1024;
+        lower.lkn_kd_buf_mb=2; lower.lkn_instr_buf_mb=8;
+        RpuKernelGraph small(lower); small.pending_signature_=sig;
+        small.nodes_.assign(1025,kernel({0,1,2,3}));
+        small.build_segments_from_nodes(); assert(small.segments_.size()==3);
+        assert(small.segments_[0].end_idx==512 && small.segments_[1].end_idx==1024);
+        const auto lower_budget=native_segment_resource_budget("rpu_causal_decoder",lower,false);
+        assert(lower_budget.kd_bytes==(size_t{1}<<20)
+               && lower_budget.instr_bytes==(size_t{4}<<20));
+    } else if (mode == "profile_fence") {
+        test_native_budget=true; policy.execution_core_count=4;
+        RpuKernelGraph graph(policy); graph.pending_signature_=causal_prefill_signature();
+        graph.nodes_.assign(1023,kernel({0,1,2,3}));
+        auto begin=barrier(); begin.self_stream=2; begin.target_stream=0;
+        auto joined=barrier(); joined.self_stream=0; joined.target_stream=2;
+        graph.nodes_.push_back(begin); graph.nodes_.push_back(dma(1));
+        graph.nodes_.push_back(branch()); graph.nodes_.push_back(kernel({0,1,2,3}));
+        graph.nodes_.push_back(joined); graph.nodes_.push_back(kernel({0,1,2,3}));
+        graph.build_segments_from_nodes();
+        assert(graph.segments_.size()==2);
+        // The indivisible burst crosses 1024; cut only after its join. The
+        // metadata marker consumes no entry and cannot prematurely split it.
+        assert(graph.segments_[0].end_idx==1028 && graph.segments_[1].start_idx==1028);
+        assert(graph.segments_[0].census.kernel_count==1024);
+        assert(graph.segments_[0].census.dma_count==1
+               && graph.segments_[0].census.barrier_count==2);
+        assert(graph.segments_[0].core_ids==std::vector<uint8_t>({0,1,2,3}));
+        assert(graph.ensure_private_queue(4)->count==4);
+    } else if (mode == "segments") {
         for (int count : {8, 6, 4, 6, 1, 8}) {
             policy.execution_core_count = count;
             RpuKernelGraph graph(policy);
@@ -410,6 +531,67 @@ int main(int argc, char** argv) {
         graph.build_segments_from_nodes();
         assert(graph.segments_.size() == 2);
         assert(graph.segments_[0].core_ids.size() == 4 && graph.segments_[1].core_ids.size() == 6);
+    } else if (mode == "open_fence") {
+        policy.execution_core_count = 8;
+        RpuKernelGraph graph(policy);
+        auto fence = [](uint8_t self, uint8_t target) {
+            auto node = barrier(); node.self_stream = self; node.target_stream = target; return node;
+        };
+        auto other = kernel({0}); other.queue_state.flush_icache = true;
+        // A deferred burst stays open across an independent kernel and is
+        // joined before the queue-state cut.
+        graph.nodes_ = {kernel({0}), fence(2, 0), dma(1), kernel({0}), fence(0, 2), other};
+        graph.build_segments_from_nodes();
+        assert(graph.segments_.size() == 2 && graph.segments_[0].end_idx == 5);
+        // No forced cut may separate the burst from its join.
+        graph.nodes_ = {kernel({0}), fence(2, 0), dma(1), other, fence(0, 2)};
+        rejects([&] { graph.build_segments_from_nodes(); });
+        graph.nodes_ = {fence(2, 0), dma(1), kernel({0}, true), fence(0, 2)};
+        rejects([&] { graph.build_segments_from_nodes(); });
+        graph.nodes_ = {fence(4, 0), kernel({0}), GraphNode(GraphNodeKind::Memcpy, MemcpyNodeData{}), fence(0, 4)};
+        rejects([&] { graph.build_segments_from_nodes(); });
+        // Channel 0 is stream 0 itself and never opens a fence.
+        graph.nodes_ = {dma(0), other, GraphNode(GraphNodeKind::Memcpy, MemcpyNodeData{})};
+        graph.build_segments_from_nodes(); assert(graph.segments_.size() == 2);
+    } else if (mode == "single_segment") {
+        policy.execution_core_count = 8;
+        RpuKernelGraph graph(policy);
+        graph.require_single_segment_ = true;
+        graph.nodes_ = {branch(), kernel({0}), branch(), kernel({0}), branch()};
+        check_segment(graph, 1);
+        graph.nodes_ = {kernel({0}), branch(false), kernel({0})};
+        rejects([&] { graph.build_segments_from_nodes(); });
+        assert(graph.segments_.empty());
+        test_entry_budget = 1;
+        graph.nodes_ = {kernel({0}), kernel({0})};
+        rejects([&] { graph.build_segments_from_nodes(); });
+        test_entry_budget = 1000;
+        auto other = kernel({0}); other.queue_state.flush_icache = true;
+        graph.nodes_ = {kernel({0}), other};
+        rejects([&] { graph.build_segments_from_nodes(); });
+        graph.nodes_ = {branch()};
+        rejects([&] { graph.build_segments_from_nodes(); });
+        // The graph-aware CPU dispatcher executes immediately after capture or
+        // sync. Even an empty prefix must reject before that CPU side effect.
+        graph.nodes_.clear();
+        const int creations = rhino_lkn::Queue_t::creations;
+        int cpu_effects = 0;
+        for (auto state : {RpuKernelGraph::State::RECORDING,
+                           RpuKernelGraph::State::REPLAYING}) {
+            graph.state_ = state;
+            rejects([&] { graph.sync_admission(); ++cpu_effects; });
+            rejects([&] { graph.capture_data(MemcpyNodeData{}); ++cpu_effects; });
+            rejects([&] { graph.downgrade_admission(); ++cpu_effects; });
+            assert(graph.replayable_ && graph.nodes_.empty() && cpu_effects == 0);
+        }
+        assert(rhino_lkn::Queue_t::creations == creations);
+        // Existing owners keep admission and downgrade behavior.
+        graph.require_single_segment_ = false;
+        graph.state_ = RpuKernelGraph::State::RECORDING;
+        graph.sync_admission(); graph.capture_data(MemcpyNodeData{});
+        graph.downgrade_admission();
+        assert(!graph.replayable_ && graph.nodes_.size() == 1);
+
     } else if (mode == "metadata") {
         RpuKernelGraph graph(policy);
         graph.nodes_={kernel({0}),branch(),kernel({0})};
@@ -487,10 +669,13 @@ int main(int argc, char** argv) {
         policy.force_oneshot_on_replay = true;
         policy.lkn_kd_buf_mb = 3;
         RpuKernelGraph parent(policy);
+        parent.require_single_segment_ = true;
         auto inherited = parent.clone_policy();
+        assert(inherited->require_single_segment_);
         assert(inherited->runtime_policy_.execution_core_count == 6);
         assert(inherited->runtime_policy_.force_oneshot_on_replay);
         assert(inherited->runtime_policy_.lkn_kd_buf_mb == 3);
+        parent.require_single_segment_ = false;
         for (int count : {4, 6, 8}) {
             auto child_policy = policy; child_policy.execution_core_count = count;
             auto child = std::make_shared<RpuKernelGraph>(child_policy);
@@ -625,6 +810,13 @@ int main(int argc, char** argv) {
 '''
     for marker, text in (
         ("__POLICY__", policy), ("__FUNCTIONS__", functions),
+        ("__CAUSAL_OP_ID__", str(causal_decoder_op_id) + "LL"),
+        ("__NATIVE_BUDGET__", "\n".join([
+            _function(execute, "static bool lingbot2_exact_graph_owns_sdk_budget("),
+            _function(execute, "static SegmentResourceBudget segment_resource_budget(")
+                .replace("segment_resource_budget(", "native_segment_resource_budget(", 1),
+        ])),
+        ("__SYNC_GUARD__", sync_guard), ("__DOWNGRADE_GUARD__", downgrade_guard),
         ("__SIGNATURE__", _function(infra, "struct GraphSignature {") + ";"),
         ("__BRANCH__", _function(graph_header, "struct BranchNodeData {") + ";"),
         ("__REGISTER_GUARD__", child_guards[0]),
@@ -647,7 +839,7 @@ int main(int argc, char** argv) {
     return binary
 
 
-@pytest.mark.parametrize("mode", ["segments", "metadata", "admission", "children", "replay", "queue_bounds", "ddr_copy"])
+@pytest.mark.parametrize("mode", ["segments", "open_fence", "single_segment", "metadata", "admission", "children", "replay", "queue_bounds", "ddr_copy", "profile_scope", "profile_fence"])
 def test_native_graph_execution_budget(native_budget_probe, mode):
     subprocess.run([str(native_budget_probe), mode], check=True, capture_output=True, text=True)
 

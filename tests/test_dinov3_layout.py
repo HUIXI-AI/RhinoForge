@@ -31,5 +31,8 @@ def test_dinov3_direct_encoder_padding_preserves_existing_weights():
 def test_dinov3_requires_the_direct_encoder_layer_layout():
     direct = _direct_model()
     wrapped = SimpleNamespace(config=direct.config, model=direct)
-    with pytest.raises(AttributeError, match="layer"):
-        _pad_attn_heads_to_multiple_of_cores(wrapped)
+    _pad_attn_heads_to_multiple_of_cores(wrapped)
+    assert tuple(direct.layer[0].attention.q_proj.weight.shape) == (64, 24)
+    from rpu_backend.runtime import UnsupportedModelError
+    with pytest.raises(UnsupportedModelError, match="encoder layer container"):
+        _pad_attn_heads_to_multiple_of_cores(SimpleNamespace(config=direct.config))

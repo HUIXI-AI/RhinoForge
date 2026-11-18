@@ -152,7 +152,7 @@ def test_actual_launcher_spm_boundaries_and_typed_registers(tmp_path, fused):
                    "inline void launch_hyvla_gateup_resident_spm(")
     source = COMMON + r'''
 #include "ops/rpu_linear_tiling.h"
-enum class KernelId {WALL_ACTION_GATE_UP_FP16_SPM_WEIGHT_M592N32K128};
+enum class KernelId : uint16_t {WALL_ACTION_GATE_UP_FP16_SPM_WEIGHT_M592N32K128};
 struct Kernel {std::array<uint16_t,132> regs{};int counter_writes=0;
  void reset_regs(){regs.fill(0);}
  uint32_t set_regs(uint32_t i,uint16_t v){regs.at(i)=v;return 0;}
@@ -163,10 +163,10 @@ int lookups=0,queued=0;bool available=true;
 Kernel* get_kernel(){++lookups;return available?&kernel:nullptr;}
 #define GET_KERNEL(id) get_kernel()
 struct RpuKernelGraph {static RpuKernelGraph& active(){static RpuKernelGraph g;return g;}
- Kernel* get_kernel_reset(const std::string& name){assert(name=="hyvla_resident_swiglu_s51");return get_kernel();}};
+ Kernel* get_kernel_reset(const std::string& name){assert(name=="hyvla_resident_swiglu_fp16_v2");return get_kernel();}};
 struct Queue {bool broadcast=false;void set_broadcast_mode(bool b){broadcast=b;}
  void enqueu_kernel(Kernel&,std::vector<uint16_t> grid,std::vector<uint8_t> cores){
-  assert(broadcast && grid==std::vector<uint16_t>({16,1,1}));
+  assert(broadcast && grid==std::vector<uint16_t>({6,1,1}));
   assert(cores==std::vector<uint8_t>({0,1,2,3,4,5,6,7}));++queued;}
 } queue;
 #define GET_QUEUE(n) (&::queue)
@@ -183,16 +183,16 @@ int main(){
   try{launch_hyvla_gateup_resident_spm(a[0],a[1],a[2],a[3],a[4],rows,FUSED);}
   catch(const std::exception&){accepted=false;}
   assert(accepted==expected && queued==old+int(expected));
-  assert(kernel.counter_writes == queued*int(FUSED));
+  assert(kernel.counter_writes == 0);
   if(available)assert(lookups==before+int(expected));
  };
  run(good,true);
  auto pair=[&](int lo){return uint32_t(kernel.regs[lo])|(uint32_t(kernel.regs[lo+1])<<16);};
  assert(pair(0)==good[0] && pair(2)==good[3] && pair(4)==good[1]);
- assert(pair(24)==good[4] && pair(30)==good[2]);
- assert(pair(8)==51 && pair(10)==256 && kernel.regs[12]==1024 && kernel.regs[13]==64);
+ assert(pair(32)==good[4] && pair(36)==good[2]);
+ assert(kernel.regs[8]==1 && kernel.regs[9]==51 && pair(10)==256 && kernel.regs[12]==1024 && kernel.regs[13]==64);
  assert(kernel.regs[14]==0 && kernel.regs[15]==8 && pair(16)==2048 && pair(18)==512);
- assert(pair(20)==0 && kernel.regs[22]==1 && kernel.regs[23]==1);
+ assert(pair(20)==0 && pair(22)==0 && pair(24)==0 && kernel.regs[26]==2 && kernel.regs[27]==2);
  for(int rows:{0,20,50,64})run(good,false,rows);
  for(int i=0;i<5;++i){auto a=good;++a[i];run(a,false);a=good;a[i]=0x1fffff00;run(a,false);
   a=good;a[i]=0x207fff00;run(a,false);}
@@ -205,7 +205,7 @@ int main(){
 }
 '''
     source = source.replace("FUSED", "true" if fused else "false")
-    if fused: source = source.replace("({16,1,1})", "({8,1,1})")
+    if fused: source = source.replace("({6,1,1})", "({3,1,1})")
     compile_run(tmp_path, "resident_launch", source.replace("LAUNCH", launch))
 
 
@@ -263,9 +263,9 @@ def test_actual_owner_cold_install_and_profile(tmp_path):
 namespace at {constexpr auto kPrivateUse1=c10::DeviceType::PrivateUse1;}
 int64_t Align(int64_t n,int64_t a){return ((n+a-1)/a)*a;}
 enum class RpuRmsNormSpmRoute {BASE,V16_GRID8,HYVLA_V16_BITCOPY_GRID8};
-struct RpuRmsNormSpmContract {bool vector=true,v16_bitcopy=true;int capability=1;bool q_vector=true,k_vector=true;
+struct RpuRmsNormSpmContract {bool v16_bitcopy=true;bool vector=true;int capability=1;bool q_vector=true,k_vector=true;
  RpuRmsNormSpmRoute resolve(int r,int c)const{assert((r==64 && c==1024)||((r==112||r==64)&&c==128));
-  return vector && (c!=128 || (r==112?q_vector:k_vector))?(v16_bitcopy?RpuRmsNormSpmRoute::HYVLA_V16_BITCOPY_GRID8:RpuRmsNormSpmRoute::V16_GRID8):RpuRmsNormSpmRoute::BASE;}};
+  return vector && (c!=128 || (r==112?q_vector:k_vector))?RpuRmsNormSpmRoute::HYVLA_V16_BITCOPY_GRID8:RpuRmsNormSpmRoute::BASE;}};
 struct KernelCache {bool available=true;
  static KernelCache& instance(){static KernelCache c;return c;}
  void* get_program(const char*){return available?this:nullptr;}
@@ -323,7 +323,7 @@ int main(){
   try{m.set_gateup_resident_weights(b,o_layers);}catch(const std::exception&){accepted=false;}
   assert(accepted==expected && m.invalidated==old+int(expected));};
  assert(!base.gateup_swiglu_enabled(51,240));
- assert(base.gateup_resident_arguments()==std::vector<int64_t>({1,6,32,51,1024,2048,8,10,1048576,6291456}));
+ assert(base.gateup_resident_arguments()==std::vector<int64_t>({4,6,32,51,1024,2048,8,10,1048576,6291456,112,112,384,6,2,32,20,34,4,36}));
  for(int* p:{&base.l,&base.h,&base.i,&base.q,&base.kv,&base.d,&base.tp}){
   ++*p;install(base,bundle,false);--*p;}
  for(int64_t* p:{&base.num_steps_,&base.expert_chunk_size_,&base.action_mlp_cores_}){
@@ -365,7 +365,7 @@ int main(){
  assert(!base.resident_swiglu_enabled(50,240) && !base.resident_swiglu_enabled(51,112));
  base.cold_gateup_swiglu_available_=false;assert(!base.resident_swiglu_enabled(51,240));
  base.cold_gateup_swiglu_available_=true;
- assert(base.gateup_swiglu_arguments(240)==std::vector<int64_t>({1,32,6,26,51,240,1024,2048,256,8,10,320,112,128,3}));
+ assert(base.gateup_swiglu_arguments(240)==std::vector<int64_t>({4,32,6,26,51,240,1024,2048,256,8,10,96,112,384,3,2,32,20,34,26,27,28,29}));
  assert(!base.gateup_swiglu_enabled(50,240) && !base.gateup_swiglu_enabled(51,112));
  base.cold_gateup_swiglu_available_=false;assert(!base.gateup_swiglu_enabled(51,240));
  base.cold_gateup_swiglu_available_=true;
@@ -379,7 +379,7 @@ int main(){
  }
  install(quant,qb,false);quant.cold_w8_optimizations_available_=true;
  {auto bad=qb;bad.shape[1]=7*262144;install(quant,bad,false);}
- assert(quant.gateup_resident_arguments()[0]==2);
+ assert(quant.gateup_resident_arguments()[0]==5);
  Model mixed=quant;
  install(mixed,bundle,false,12);mixed.cold_w8_o_resident_available_=true;
  install(mixed,qb,false,12);install(mixed,bundle,false,1);install(base,bundle,false,12);
@@ -388,7 +388,7 @@ int main(){
  assert(mixed.o_resident_enabled(51,240) && !mixed.o_resident_enabled(50,240) && !mixed.o_resident_enabled(51,112));
  mixed.cold_ring_postnorm_available_=true;mixed.cold_w8_o_ring_postnorm_available_=true;
  assert(!mixed.o_ring_postnorm_enabled(51,240));
- assert(mixed.o_resident_arguments(240)==std::vector<int64_t>({1,32,51,240,1024,2048,8,10,0,12,3145728,3145728,448,64,128,16,20,21}));
+ assert(mixed.o_resident_arguments(240)==std::vector<int64_t>({2,32,51,240,1024,2048,8,10,0,12,3145728,3145728,288,128,128,8,20,21}));
  install(mixed,bundle,false,12);
  // nvfp4_ models the base setter having validated packed tensors and seven tables.
  Model nv;nv.nvfp4_=true;at::Tensor nv_bundle;nv_bundle.shape={8,1572864};
@@ -733,8 +733,8 @@ int main(){
  }
  Model quant12=quant;install(quant12,bundle,true);
  assert(quant12.gateup_resident_layers()==12 && quant12.gateup_bundle_bytes()==6291456);
- assert(quant12.gateup_resident_arguments()==std::vector<int64_t>({2,12,32,51,1024,2048,8,10,524288,6291456}));
- assert(quant12.gateup_swiglu_arguments(240)==std::vector<int64_t>({2,32,12,20,51,240,1024,2048,256,8,10,320,112,128,3}));
+ assert(quant12.gateup_resident_arguments()==std::vector<int64_t>({5,12,32,51,1024,2048,8,10,524288,6291456,288,128,128,4,2,32,20,34,4,36}));
+ assert(quant12.gateup_swiglu_arguments(240)==std::vector<int64_t>({5,32,12,20,51,240,1024,2048,256,8,10,192,128,128,2,2,32,20,34,26,27,28,29}));
  install(quant12,qb,false);
  Model fp16;auto oversized=bundle;oversized.shape[1]*=2;install(fp16,oversized,false);install(quant,oversized,false);
  quant.layers_.back().down_ws.present=false;install(quant,qb,false);quant.layers_.back().down_ws.present=true;
@@ -757,25 +757,25 @@ int main(){
  assert(!quant.resident_swiglu_enabled(51,240) && !quant.o_ring_postnorm_enabled(51,240));
  assert(quant.down_nextnorm_enabled(51,240));
  quant.cold_w8_o_ring_postnorm_available_=true;assert(quant.o_ring_postnorm_enabled(51,240));
- assert(quant.o_ring_postnorm_arguments(240)[0]==2 && quant.o_ring_postnorm_arguments(240).back()==21);
+ assert(quant.o_ring_postnorm_arguments(240)[0]==7 && quant.o_ring_postnorm_arguments(240).back()==50);
  quant.cold_xor3_norm_available_=true;
  assert(quant.xor3_norm_enabled() && !quant.o_ring_postnorm_enabled(51,240));
  assert(quant.ring_postnorm_arguments(240)[0]==2 && quant.ring_postnorm_arguments(240).back()==3);
  base.cold_xor3_norm_available_=true;assert(!base.xor3_norm_enabled());
  quant.cold_xor3_norm_available_=false;
  quant.cold_w8_resident_swiglu_available_=true;assert(quant.resident_swiglu_enabled(51,240));
- assert(quant.resident_swiglu_arguments(240)[0]==2);
+ assert(quant.resident_swiglu_arguments(240)[0]==5);
  const auto fp16_resident=base.resident_swiglu_arguments(240),w8_resident=quant.resident_swiglu_arguments(240);
  const bool fp16_resident_enabled=base.resident_swiglu_enabled(51,240),w8_resident_enabled=quant.resident_swiglu_enabled(51,240);
  base.cold_nvfp4_resident_swiglu_available_=true;quant.cold_nvfp4_resident_swiglu_available_=true;
  assert(base.resident_swiglu_enabled(51,240)==fp16_resident_enabled && quant.resident_swiglu_enabled(51,240)==w8_resident_enabled);
  assert(base.resident_swiglu_arguments(240)==fp16_resident && quant.resident_swiglu_arguments(240)==w8_resident);
  quant12.cold_w8_resident_swiglu_available_=true;assert(quant12.resident_swiglu_arguments(240)[3]==12);
- assert(quant.gateup_swiglu_arguments(240)[0]==2);
+ assert(quant.gateup_swiglu_arguments(240)[0]==5);
  quant.cold_w8_gateup_n48_available_=true;
- assert(quant.gateup_swiglu_arguments(240)==std::vector<int64_t>({3,32,6,26,51,240,1024,2048,256,8,10,512,48,128,6}));
+ assert(quant.gateup_swiglu_arguments(240)==std::vector<int64_t>({5,32,6,26,51,240,1024,2048,256,8,10,192,128,128,2,2,32,20,34,26,27,28,29}));
  base.cold_w8_gateup_n48_available_=true;
- assert(base.gateup_swiglu_arguments(240)[0]==1);
+ assert(base.gateup_swiglu_arguments(240)[0]==4);
  auto fp16_gu=base.gateup_swiglu_arguments(240),w8_gu=quant.gateup_swiglu_arguments(240);
  base.cold_nvfp4_gateup_input_reuse_available_=true;quant.cold_nvfp4_gateup_input_reuse_available_=true;
  assert(base.gateup_swiglu_arguments(240)==fp16_gu && quant.gateup_swiglu_arguments(240)==w8_gu);
@@ -873,9 +873,9 @@ def test_actual_manifest_rejects_partial_stale_or_forged_residency(tmp_path):
     source = COMMON + r'''
 int64_t Align(int64_t n,int64_t a){return ((n+a-1)/a)*a;}
 enum class RpuRmsNormSpmRoute {BASE,V16_GRID8,HYVLA_V16_BITCOPY_GRID8};
-struct RpuRmsNormSpmContract {bool vector=true,v16_bitcopy=true,q_vector=true,k_vector=true;
+struct RpuRmsNormSpmContract {bool v16_bitcopy=true;bool vector=true,q_vector=true,k_vector=true;
  RpuRmsNormSpmRoute resolve(int r,int c)const{assert((r==64 && c==1024)||((r==112||r==64)&&c==128));
-  return vector && (c!=128 || (r==112?q_vector:k_vector))?(v16_bitcopy?RpuRmsNormSpmRoute::HYVLA_V16_BITCOPY_GRID8:RpuRmsNormSpmRoute::V16_GRID8):RpuRmsNormSpmRoute::BASE;}};
+  return vector && (c!=128 || (r==112?q_vector:k_vector))?RpuRmsNormSpmRoute::HYVLA_V16_BITCOPY_GRID8:RpuRmsNormSpmRoute::BASE;}};
 enum class FmbRouteFamily {GRAPH_SCHEDULE,MUTABLE_DMA,KV_INSERT,LINEAR,ACTIVATION,ATTENTION};
 enum class AttentionExecutionPolicy {DDR_KV=1,SPM_KV_BY_MHA=2};
 enum class FmbLinearRouteSelector {AUTO_TILE=1};
@@ -988,7 +988,7 @@ int main(){
   valid.routes.push_back({FmbRouteFamily::GRAPH_SCHEDULE,HYVLA_EXPERT_GATEUP_SWIGLU_SITE,1,0,0,grouped.gateup_swiglu_arguments(240)});
   valid.routes.push_back({FmbRouteFamily::LINEAR,HYVLA_EXPERT_QKV_LINEAR_SITE,1,0,0,{}});
   const auto recipe=grouped.kv_grouped_arguments(240);
-  assert(recipe.size()==30 && recipe[1]==(w8?8:16) && recipe[11]==(w8?512:432) && recipe[14]==(w8?6:4));
+  assert(recipe.size()==30 && recipe[1]==(w8?8:16) && recipe[11]==(w8?352:208) && recipe[14]==(w8?6:4));
   auto accepts=[&](const FmbPhysicalExecutionManifest& v){return grouped.physical_manifest_forward_capability(v).supported;};
   assert(!accepts(valid));
   valid.routes.push_back({FmbRouteFamily::GRAPH_SCHEDULE,HYVLA_EXPERT_KV_GROUPED_SITE,1,0,0,recipe});
@@ -1635,8 +1635,8 @@ struct KernelCache {
   if(name=="hyvla_expert_down_nextnorm_nvfp4_s51_overlap")return down_overlap?this:nullptr;
   if(name=="hyvla_nvfp4_gateup_swiglu_s51_overlap")return gateup_overlap?this:nullptr;
   if(name=="hyvla_nvfp4_resident_swiglu_s51_overlap")return resident_overlap?this:nullptr;
-  if(name=="hyvla_expert_kv_fp16_s51")return marker?this:nullptr;
-  if(name=="hyvla_expert_kv_w8_s51")return payload?this:nullptr;
+  if(name=="hyvla_expert_kv_fp16_s51_v2")return marker?this:nullptr;
+  if(name=="hyvla_expert_kv_w8_s51_v2")return payload?this:nullptr;
   if(name=="hyvla_expert_kv_nvfp4_s51")return payload?this:nullptr;
   if(name=="hyvla_nvfp4_resident_swiglu_s51")return nv4_resident?this:nullptr;
   if(name=="hyvla_nvfp4_resident_scales_s51")return marker?this:nullptr;
@@ -1653,11 +1653,11 @@ struct KernelCache {
   if(name=="hyvla_expert_down_nvfp4_s51_n128")return nv4_down?this:nullptr;
   if(name=="hyvla_expert_down_nextnorm_nvfp4_s51")return nv4_down_norm?this:nullptr;
   if(name=="hyvla_expert_down_nextnorm_nvfp4_s51_n128")return nv4_down_norm_n128?this:nullptr;
-  if(name=="hyvla_nvfp4_gateup_swiglu_s51" || name=="hyvla_nvfp4_gateup_resident_s51" || name=="hyvla_expert_o_ring_postnorm_nvfp4_s51" || name=="hyvla_expert_o_resident_w8_s51" || name=="hyvla_expert_o_ring_postnorm_w8_s51" || name=="hyvla_expert_xor3_norm_s51" || name=="hyvla_w8_resident_swiglu_s51" || name=="hyvla_w8a16_optimizations_s240_s51" || name=="hyvla_expert_gateup_w8_s51_m512n48k128")return nullptr;
-  if(name=="hyvla_resident_swiglu_s51" || name=="hyvla_expert_ring_postnorm_s51" || name=="hyvla_expert_o_ring_postnorm_s51" || name=="hyvla_expert_qk_rope_s51" || name=="hyvla_expert_down_nextnorm_s51")return payload?this:nullptr;
-  assert(name=="hyvla_expert_gateup_swiglu_s51");++calls;loaded=marker;return loaded?this:nullptr;}
+  if(name=="hyvla_nvfp4_gateup_swiglu_s51" || name=="hyvla_nvfp4_gateup_resident_s51" || name=="hyvla_expert_o_ring_postnorm_nvfp4_s51" || name=="hyvla_expert_o_resident_w8_v2" || name=="hyvla_expert_o_ring_postnorm_w8_s51_v2" || name=="hyvla_expert_xor3_norm_s51" || name=="hyvla_resident_swiglu_w8_v2" || name=="hyvla_gateup_resident_pair_w8_v2" || name=="hyvla_expert_gateup_swiglu_w8_v2")return nullptr;
+  if(name=="hyvla_resident_swiglu_fp16_v2" || name=="hyvla_expert_ring_postnorm_s51" || name=="hyvla_expert_o_ring_postnorm_fp16_s51_v2" || name=="hyvla_expert_qk_rope_s51" || name=="hyvla_expert_down_nextnorm_s51")return payload?this:nullptr;
+  assert(name=="hyvla_expert_gateup_swiglu_fp16_v2");++calls;loaded=marker&&payload;return loaded?this:nullptr;}
  void* get_program(const std::string& name){
-  if(name=="hyvla_expert_gateup_swiglu_s51")return loaded?this:nullptr;
+  if(name=="hyvla_expert_gateup_swiglu_fp16_v2")return loaded?this:nullptr;
   assert(name=="wall_prefill_gate_up_swiglu_fp16_m320n112k128");return payload?this:nullptr;}
 };
 struct Model {
@@ -1690,48 +1690,48 @@ struct Model {
 int main(){
  for(bool marker:{false,true})for(bool payload:{false,true})for(bool n128:{false,true}){
   auto& c=KernelCache::instance();c={marker,payload,false,n128,!n128,marker!=n128,payload!=n128,marker!=payload,n128!=marker,n128!=payload,(n128!=marker)!=payload,0};c.q_n32=marker!=n128;c.qkv_overlap=payload!=n128;c.sdpa_m16=marker!=payload;c.sdpa_k128=payload!=n128;c.o_overlap=marker;c.down_overlap=payload;c.gateup_overlap=n128;c.resident_overlap=marker!=payload;Model m;
-  assert(!c.get_program("hyvla_expert_gateup_swiglu_s51"));
+  assert(!c.get_program("hyvla_expert_gateup_swiglu_fp16_v2"));
   m.set_runtime_config(true,true,true,true,false,true,false);
   assert(m.cold_gateup_swiglu_available_==(marker&&payload) && c.calls==1);
   assert(m.cold_nvfp4_o_n128_available_==n128);
-  assert(m.cold_nvfp4_gateup_input_reuse_available_==!n128);
-  assert(m.cold_nvfp4_down_n128_available_==(marker!=n128));
+  assert(m.cold_nvfp4_gateup_input_reuse_available_==false);
+  assert(m.cold_nvfp4_down_n128_available_==false);
   assert(m.cold_nvfp4_down_nextnorm_available_==(payload!=n128));
-  assert(m.cold_nvfp4_down_nextnorm_n128_available_==(marker!=payload));
+  assert(m.cold_nvfp4_down_nextnorm_n128_available_==false);
   assert(m.cold_qk_rope_norm_available_==(n128!=marker));
   assert(m.cold_qk_rope_norm_kv_available_==(n128!=payload));
   assert(m.cold_nvfp4_resident_swiglu_available_==((n128!=marker)!=payload));
   assert(m.cold_fp16_kv_grouped_available_==marker && m.cold_w8_kv_grouped_available_==payload);
   assert(m.cold_nvfp4_kv_available_==payload && m.cold_nvfp4_qkv_available_==marker);
   assert(m.cold_nvfp4_resident_scales_available_==marker && m.cold_nvfp4_resident_scales_swiglu_available_==payload);
-  assert(m.cold_nvfp4_q_n32_available_==(marker!=n128));
+  assert(m.cold_nvfp4_q_n32_available_==false);
   assert(m.cold_nvfp4_qkv_overlap_available_==(payload!=n128));
-  assert(m.cold_sdpa_m16_available_==(marker!=payload));
-  assert(m.cold_sdpa_k128_available_==(payload!=n128));
-  assert(m.cold_nvfp4_o_overlap_available_==marker && m.cold_nvfp4_down_overlap_available_==payload);
-  assert(m.cold_nvfp4_gateup_overlap_available_==n128 && m.cold_nvfp4_resident_overlap_available_==(marker!=payload));
+  assert(m.cold_sdpa_m16_available_==false);
+  assert(m.cold_sdpa_k128_available_==false);
+  assert(m.cold_nvfp4_o_overlap_available_==false && m.cold_nvfp4_down_overlap_available_==false);
+  assert(m.cold_nvfp4_gateup_overlap_available_==false && m.cold_nvfp4_resident_overlap_available_==false);
   assert(!m.cold_nvfp4_gateup_available_);
   assert(m.cold_config_bound_ && m.invalidations==1 && m.cold_resident_swiglu_available_==payload);
   c.marker=!marker;c.payload=!payload;c.nv4_n128=!n128;c.nv4_input_reuse=n128;c.nv4_down=marker==n128;c.nv4_down_norm=payload==n128;c.nv4_down_norm_n128=marker==payload;c.qk_norm=n128==marker;c.qk_norm_kv=n128==payload;c.nv4_resident=(n128!=marker)==payload;c.q_n32=marker==n128;c.qkv_overlap=payload==n128;c.sdpa_m16=marker==payload;c.sdpa_k128=payload==n128;c.o_overlap=!marker;c.down_overlap=!payload;c.gateup_overlap=!n128;c.resident_overlap=marker==payload;bool rejected=false;
   try{m.set_runtime_config(true,true,true,true,false,true,false);}catch(const std::exception&){rejected=true;}
   assert(rejected && c.calls==1 && m.cold_gateup_swiglu_available_==(marker&&payload));
   assert(m.cold_nvfp4_o_n128_available_==n128);
-  assert(m.cold_nvfp4_gateup_input_reuse_available_==!n128);
-  assert(m.cold_nvfp4_down_n128_available_==(marker!=n128));
+  assert(m.cold_nvfp4_gateup_input_reuse_available_==false);
+  assert(m.cold_nvfp4_down_n128_available_==false);
   assert(m.cold_nvfp4_down_nextnorm_available_==(payload!=n128));
-  assert(m.cold_nvfp4_down_nextnorm_n128_available_==(marker!=payload));
+  assert(m.cold_nvfp4_down_nextnorm_n128_available_==false);
   assert(m.cold_qk_rope_norm_available_==(n128!=marker));
   assert(m.cold_qk_rope_norm_kv_available_==(n128!=payload));
   assert(m.cold_nvfp4_resident_swiglu_available_==((n128!=marker)!=payload));
   assert(m.cold_fp16_kv_grouped_available_==marker && m.cold_w8_kv_grouped_available_==payload);
   assert(m.cold_nvfp4_kv_available_==payload && m.cold_nvfp4_qkv_available_==marker);
   assert(m.cold_nvfp4_resident_scales_available_==marker && m.cold_nvfp4_resident_scales_swiglu_available_==payload);
-  assert(m.cold_nvfp4_q_n32_available_==(marker!=n128));
+  assert(m.cold_nvfp4_q_n32_available_==false);
   assert(m.cold_nvfp4_qkv_overlap_available_==(payload!=n128));
-  assert(m.cold_sdpa_m16_available_==(marker!=payload));
-  assert(m.cold_sdpa_k128_available_==(payload!=n128));
-  assert(m.cold_nvfp4_o_overlap_available_==marker && m.cold_nvfp4_down_overlap_available_==payload);
-  assert(m.cold_nvfp4_gateup_overlap_available_==n128 && m.cold_nvfp4_resident_overlap_available_==(marker!=payload));
+  assert(m.cold_sdpa_m16_available_==false);
+  assert(m.cold_sdpa_k128_available_==false);
+  assert(m.cold_nvfp4_o_overlap_available_==false && m.cold_nvfp4_down_overlap_available_==false);
+  assert(m.cold_nvfp4_gateup_overlap_available_==false && m.cold_nvfp4_resident_overlap_available_==false);
   assert(m.cold_resident_swiglu_available_==payload && m.cold_ring_postnorm_available_==payload && m.cold_o_ring_postnorm_available_==payload && m.cold_qk_rope_available_==payload && m.cold_down_nextnorm_available_==payload);
  }
 }
@@ -1845,37 +1845,38 @@ constexpr int64_t HYVLA_S51_M16_SDPA_TMP_BYTES=262144,HYVLA_S51_K128_SDPA_TMP_BY
 GROW
 void hyvla_widen_sdpa_mask_slot(std::vector<BufferDecl>&){assert(false);}
 void hyvla_grow_kv_slots(std::vector<BufferDecl>&,int64_t,int64_t){assert(false);}
+struct SpmAllocator {static constexpr int ALIGN=256;};
 struct Model {
  bool nvfp4_=true,cold_sdpa_m16_available_=false,cold_sdpa_k128_available_=false,profile=true;
  bool cold_mask_once_=false,cold_kvpad16_=false,cold_rmsnorm_pad16_=false,unroll_mode_=true;
- int64_t action_dim_pad_=32,action_mlp_cores_=8,resident_layers=24;
- at::Tensor gateup_resident_bundle_;bool missing_tmp=false;int64_t original_tmp=65536,scale_layers=0;
+ int64_t action_dim_pad_=32,action_mlp_cores_=8,resident_layers=24,o_resident_layers_=0;
+ at::Tensor gateup_resident_bundle_;bool missing_tmp=false;int64_t original_tmp=65536,resident_fp8_scale_layers_=0;
  int hidden_size()const{return 1024;}int head_dim()const{return 128;}
  int num_kv_heads()const{return 8;}int num_q_heads()const{return 16;}int attn_tp()const{return 8;}
  bool gateup_resident_profile()const{return profile;}
  bool gateup_swiglu_enabled(int64_t r,int64_t p)const{return profile && gateup_resident_bundle_.defined() && r==51 && (p>=128 && p<=240 && p%16==0);}
  int64_t gateup_resident_layers()const{return resident_layers;}
- int64_t resident_storage_bytes()const{return resident_layers*262144+scale_layers*32768;}
+ int64_t resident_storage_bytes()const{return resident_layers*262144+resident_fp8_scale_layers_*32768;}
  std::vector<BufferDecl> causal_baseline_buffer_declarations(const LayoutContext&){
-  std::vector<BufferDecl> d{{"q",28672,2,5},{"output",28672,2,5},{"sdpa_mask",31232,2,5}};
-  if(!missing_tmp)d.push_back({"sdpa_tmp",original_tmp,2,5});return d;}
+  std::vector<BufferDecl> d{{"q",28672,2,5},{"output",28672,2,5},{"sdpa_mask",31232,2,5},{"oproj",104448,5,5}};
+  if(!missing_tmp)d.push_back({"sdpa_tmp",original_tmp,5,5});return d;}
  METHODS
 };
 int main(){
  Model m;LayoutContext c;
- const auto size=[](const std::vector<BufferDecl>& d,const char* name){for(const auto& b:d)if(std::strcmp(b.name,name)==0)return b.size;return int64_t(-1);};
+ const auto size=[](const std::vector<BufferDecl>& d,const char* name){for(const auto& b:d)if(std::strcmp(b.name,name)==0){if(!b.alias_of)return b.size;for(const auto& owner:d)if(std::strcmp(owner.name,b.alias_of)==0)return owner.size;}return int64_t(-1);};
  assert(size(m.baseline_buffer_declarations(c),"sdpa_tmp")==65536);
  m.cold_sdpa_m16_available_=true;
  auto d=m.baseline_buffer_declarations(c);
  assert(size(d,"sdpa_tmp")==262144 && size(d,"gateup_resident_weights")==6291456);
- for(int scale_count:{4,8}){m.scale_layers=scale_count;auto ds=m.baseline_buffer_declarations(c);
+ for(int scale_count:{4,8}){m.resident_fp8_scale_layers_=scale_count;auto ds=m.baseline_buffer_declarations(c);
  assert(size(ds,"gateup_resident_weights")==6291456+scale_count*32768 && size(ds,"sdpa_tmp")==262144 && m.resident_layers==24);
  for(const auto& b:ds)if(std::strcmp(b.name,"gateup_resident_weights")==0)assert(b.phase_start==0 && b.phase_end==9 && !b.alias_of);}
- m.scale_layers=0;
+ m.resident_fp8_scale_layers_=0;
  for(int position:{128,144,160,176,192,208,224,240}){auto short_layout=c;short_layout.max_kv_seq_len=position+51;
   assert(size(m.baseline_buffer_declarations(short_layout),"sdpa_tmp")==262144);}
  assert(size(d,"q")==28672 && size(d,"output")==28672 && size(d,"sdpa_mask")==31232);
- for(const auto& b:d)if(std::strcmp(b.name,"sdpa_tmp")==0)assert(b.phase_start==2 && b.phase_end==5 && !b.alias_of);
+ for(const auto& b:d)if(std::strcmp(b.name,"sdpa_tmp")==0)assert(b.phase_start==5 && b.phase_end==5 && !b.alias_of);
  m.original_tmp=524288;assert(size(m.baseline_buffer_declarations(c),"sdpa_tmp")==524288);m.original_tmp=65536;
  for(int field=0;field<3;++field){auto bad=c;if(field==0)bad.use_attn_mask=false;
   if(field==1)bad.batch_size=2;if(field==2)bad.attention_policy=AttentionExecutionPolicy::SPM_KV_BY_MHA;
@@ -1886,12 +1887,12 @@ int main(){
   assert(size(m.baseline_buffer_declarations(other),"sdpa_tmp")==65536);m.nvfp4_=true;m.resident_layers=24;}
  m.cold_sdpa_m16_available_=false;m.cold_sdpa_k128_available_=true;
  for(int position:{128,144,160,176,192,208,224,240})for(int scale_count:{0,4,8}){
-  auto short_layout=c;short_layout.max_kv_seq_len=position+51;m.scale_layers=scale_count;
+  auto short_layout=c;short_layout.max_kv_seq_len=position+51;m.resident_fp8_scale_layers_=scale_count;
   const auto dk=m.baseline_buffer_declarations(short_layout);
-  assert(size(dk,"sdpa_tmp")==32768 && size(dk,"gateup_resident_weights")==6291456+scale_count*32768);
-  for(const auto& b:dk)if(std::strcmp(b.name,"sdpa_tmp")==0)assert(b.phase_start==2 && b.phase_end==5 && !b.alias_of);
+  assert(size(dk,"sdpa_tmp")== (scale_count==8?104448:32768) && size(dk,"gateup_resident_weights")==6291456+scale_count*32768);
+  for(const auto& b:dk)if(std::strcmp(b.name,"sdpa_tmp")==0)assert(b.phase_start==5 && b.phase_end==5 && (scale_count==8?(b.alias_of&&std::strcmp(b.alias_of,"oproj")==0):!b.alias_of));
  }
- m.scale_layers=0;
+ m.resident_fp8_scale_layers_=0;
  for(int field=0;field<3;++field){auto bad=c;if(field==0)bad.use_attn_mask=false;
   if(field==1)bad.batch_size=2;if(field==2)bad.attention_policy=AttentionExecutionPolicy::SPM_KV_BY_MHA;
   bool rejected=false;try{m.baseline_buffer_declarations(bad);}catch(const std::exception&){rejected=true;}assert(rejected);}

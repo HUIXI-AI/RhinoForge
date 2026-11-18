@@ -205,23 +205,32 @@ def test_graph_diagnostic_categories_cover_mixed_operators(tmp_path):
     function = source[start:end]
     expected = {
         "RMS_NORM_BF16IN_FP16OUT_V32": "RMSNORM_BF16IN",
-        "PL_ACC32_OUT_BF16_M416N48": "LINEAR_ACC32_BF16",
-        "PL_ACC32_OUT_BF16_M496N32": "LINEAR_ACC32_BF16",
         "LLM_ALL_REDUCE_BF16_PARTIAL_FP16_RESIDUAL": "ALLREDUCE_MIXED_PACED",
         "LLM_ALL_REDUCE_FP16_PARTIAL_BF16_RESIDUAL": "ALLREDUCE_MIXED_PACED",
         "LLM_ALL_REDUCE_BF16_PARTIAL_FP16_RESIDUAL_NOPACE": "ALLREDUCE_MIXED_NOPACE",
         "LLM_ALL_REDUCE_FP16_PARTIAL_BF16_RESIDUAL_NOPACE": "ALLREDUCE_MIXED_NOPACE",
         "LLM_ALL_REDUCE_FP16_PARTIAL_BF16_RESIDUAL_LOCAL_SPM": "ALLREDUCE_MIXED_LOCAL_SPM",
     }
-    names = sorted(set(re.findall(r"KernelId::(\w+)", function)) | expected.keys())
-    code = "#include <iostream>\nenum class KernelId {" + ",".join(names) + "};\n" + function
-    code += "\nint main() {\n" + "\n".join(
-        f'std::cout << kernel_id_short_name(KernelId::{name}) << "\\n";'
-        for name in expected) + "\n}\n"
+    names = sorted((set(re.findall(r"KernelId::(\w+)", function)) | expected.keys()) - {"PL_AUTOTILE_BEGIN"})
+    code = (
+        '#include "rpu_linear_tiling.h"\n#include <iostream>\n'
+        "enum class KernelId {" + ",".join(names) + ",PL_AUTOTILE_BEGIN=1000};\n" + function
+    )
+    code += (
+        "\nint main() {\n"
+        + "\n".join(
+            f'std::cout << kernel_id_short_name(KernelId::{name}) << "\\n";'
+            for name in expected
+        )
+        + "\nfor (size_t i = 0; i < rpu_pl_tiling::kParallelCandidateCount; ++i) {"
+        + "\n  const std::string want = rpu_pl_tiling::detail::parallel_candidates[i].acc32 ? \"LINEAR_ACC32\" : \"LINEAR_ACC16\";"
+        + "\n  if (want != kernel_id_short_name(static_cast<KernelId>(1000 + i))) return 1;"
+        + "\n}\n}\n"
+    )
     path = tmp_path / "categories.cpp"
     path.write_text(code)
     binary = tmp_path / "categories"
-    subprocess.run([compiler, "-std=c++17", str(path), "-o", str(binary)],
+    subprocess.run([compiler, "-std=c++17", "-I", str(ROOT / "src/ops"), str(path), "-o", str(binary)],
                    check=True, capture_output=True, text=True)
     result = subprocess.run([str(binary)], check=True, capture_output=True, text=True)
     assert result.stdout.splitlines() == list(expected.values())

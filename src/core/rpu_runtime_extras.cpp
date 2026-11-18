@@ -137,16 +137,25 @@ bool ring_all_reduce_sum_residual_admitted(
     int core_num,
     bool residual_local_shard = false,
     bool cpu_dry = false,
-    bool allow_exact_m576_inplace = false) {
+    bool allow_exact_m576_inplace = false,
+    bool allow_exact_qwen_residual_alias = false,
+    bool allow_exact_qwen_local_shard = false) {
     if (core_num < 1 || core_num > kRingCoreNum ||
         (allow_exact_m576_inplace && core_num != kRingCoreNum) ||
         M <= 0 || N <= 0 || !SPM_ALLOC.is_initialized() ||
         (cpu_dry && residual_ddr != nullptr)) {
         return false;
     }
+    const bool exact_qwen_local_shard = allow_exact_qwen_local_shard &&
+        residual_local_shard && !cpu_dry && residual_ddr == nullptr &&
+        !allow_exact_m576_inplace && !allow_exact_qwen_residual_alias &&
+        M == 128 && N == 5120 && core_num == kRingCoreNum &&
+        (input_spm & 255U) == 0 && (residual_spm & 255U) == 0 &&
+        (output_spm & 255U) == 0;
+    if (allow_exact_qwen_local_shard != exact_qwen_local_shard) return false;
     const bool admitted_local_shape =
         (M == 576 && N == 1280) || (M == 320 && N == 2048) ||
-        (M == 1200 && N == 1024);
+        (M == 1200 && N == 1024) || exact_qwen_local_shard;
     if (residual_local_shard &&
         (residual_ddr != nullptr || core_num != kRingCoreNum ||
          !admitted_local_shape)) {
@@ -195,7 +204,19 @@ bool ring_all_reduce_sum_residual_admitted(
     const bool exact_m576_inplace =
         allow_exact_m576_inplace && M == 576 && N == 1280 &&
         residual_ddr == nullptr && input_spm == output_spm;
+    // The C192/C256 owners also use this path for a final C128 chunk. Their
+    // original paced ring consumes each residual shard before publishing the
+    // same shard, as verified for these three complete FP16 geometries only.
+    const bool exact_qwen_residual_alias =
+        allow_exact_qwen_residual_alias && !allow_exact_m576_inplace &&
+        !residual_local_shard && !cpu_dry && residual_ddr == nullptr &&
+        (M == 256 || M == 192 || M == 128) && N == 5120 && core_num == kRingCoreNum &&
+        residual_spm == output_spm &&
+        (input_spm & 255U) == 0 && (residual_spm & 255U) == 0 &&
+        uint64_t(input_spm) + tensor_bytes <= (UINT64_C(1) << 32) &&
+        uint64_t(residual_spm) + tensor_bytes <= (UINT64_C(1) << 32);
     if (allow_exact_m576_inplace != exact_m576_inplace ||
+        allow_exact_qwen_residual_alias != exact_qwen_residual_alias ||
         (!exact_m576_inplace &&
          !ranges_are_disjoint(
              input_spm, tensor_bytes, output_spm, tensor_bytes))) {
@@ -204,8 +225,8 @@ bool ring_all_reduce_sum_residual_admitted(
     return residual_ddr != nullptr ||
         (ranges_are_disjoint(
              input_spm, tensor_bytes, residual_spm, residual_bytes) &&
-         ranges_are_disjoint(
-             residual_spm, residual_bytes, output_spm, tensor_bytes));
+         (exact_qwen_residual_alias || ranges_are_disjoint(
+             residual_spm, residual_bytes, output_spm, tensor_bytes)));
 }
 
 struct G05RingRtcEpilogue {
@@ -232,15 +253,21 @@ void launch_ring_all_reduce_sum_residual(
     bool pi05_xor3 = false,
     const G05RingRtcEpilogue* g05_rtc = nullptr,
     const G05ActionTailNorm* g05_norm = nullptr,
-    const RingAdaRmsOperands* attn_adarms = nullptr) {
+    const RingAdaRmsOperands* attn_adarms = nullptr,
+    bool allow_exact_qwen_residual_alias = false,
+    bool allow_exact_qwen_local_shard = false) {
+    TORCH_CHECK(!(allow_exact_qwen_residual_alias || allow_exact_qwen_local_shard) ||
+        (!pi05_xor3 && g05_rtc == nullptr && g05_norm == nullptr && attn_adarms == nullptr),
+        "Qwen bounded residual alias requires the original ordinary paced ring");
     TORCH_CHECK(
         ring_all_reduce_sum_residual_admitted(
             input_spm, residual_spm, residual_ddr, output_spm,
             M, N, core_num, residual_local_shard,
-            /*cpu_dry=*/false, allow_exact_m576_inplace),
+            /*cpu_dry=*/false, allow_exact_m576_inplace, allow_exact_qwen_residual_alias,
+            allow_exact_qwen_local_shard),
         "ring all-reduce requires 1..8 cores, positive FP16 geometry, "
         "complete SPM operands, and either disjoint input/output or the "
-        "validated exact M576N1280 in-place layout");
+        "validated exact M576N1280 or Qwen C256/C192/C128 residual in-place layout");
 
     TORCH_CHECK(!pi05_xor3 ||
         (residual_ddr == nullptr && !residual_local_shard && !allow_exact_m576_inplace &&
@@ -304,6 +331,7 @@ void launch_ring_all_reduce_sum_residual(
            : M == 272 ? KernelId::PI05_RING_XOR3_M272N2048
            : M == 432 ? KernelId::PI05_RING_XOR3_M432N2048
            : M == 464 ? KernelId::PI05_RING_XOR3_M464N2048
+           : M == 480 ? KernelId::PI05_RING_XOR3_M480N2048
            : M == 448 ? KernelId::PI05_RING_XOR3_M448N2048
            : M == 416 ? KernelId::PI05_RING_XOR3_M416N2048
            : M == 288 ? KernelId::PI05_RING_XOR3_M288N2048
@@ -311,7 +339,8 @@ void launch_ring_all_reduce_sum_residual(
            : M == 336 ? KernelId::PI05_RING_XOR3_M336N2048
            : M == 320 ? KernelId::PI05_RING_XOR3_M320N2048
            : M == 768 ? KernelId::PI05_RING_XOR3_M768N1152
-           : M == 400 ? KernelId::PI05_RING_XOR3_M400N2048 : KernelId::PI05_RING_XOR3_M50N1024)
+           : M == 400 ? KernelId::PI05_RING_XOR3_M400N2048
+           : M == 10 ? KernelId::PI05_RING_XOR3_M10N1024 : KernelId::PI05_RING_XOR3_M50N1024)
         : residual_local_shard
         ? KernelId::LLM_ALL_REDUCE_RESIDUAL_RING_LOCAL_SPM
         : (use_nopace
@@ -672,6 +701,21 @@ void rpu_launch_g05_ring_rtc_residual_spm_kernel(
         false, false, false, &epilogue);
 }
 
+void rpu_launch_qwen3_c512_all_reduce_residual_local_spm_kernel(
+    uint32_t partial_spm, uint32_t compact_residual_spm, uint32_t output_spm)
+{
+    // One M128 segment, with only the owning M16 row stripe on each core.
+    // All three operands remain disjoint; no generic alias rule is relaxed.
+    launch_ring_all_reduce_sum_residual(
+        partial_spm, compact_residual_spm, nullptr, output_spm,
+        /*M=*/128, /*N=*/5120, /*core_num=*/8,
+        /*residual_local_shard=*/true, /*allow_exact_m576_inplace=*/false,
+        /*pi05_xor3=*/false, /*g05_rtc=*/nullptr, /*g05_norm=*/nullptr,
+        /*attn_adarms=*/nullptr,
+        /*allow_exact_qwen_residual_alias=*/false,
+        /*allow_exact_qwen_local_shard=*/true);
+}
+
 void rpu_launch_all_reduce_sum_residual_kernel(
     uint32_t input_spm,
     uint32_t residual_spm,
@@ -807,6 +851,18 @@ void rpu_launch_wall_vision_all_reduce_sum_residual_m576_inplace_kernel(
         /*M=*/576, /*N=*/1280, /*core_num=*/8,
         /*residual_local_shard=*/false,
         /*allow_exact_m576_inplace=*/true);
+}
+
+void rpu_launch_qwen3_c192_all_reduce_residual_inplace_kernel(
+    uint32_t partial_spm, uint32_t residual_output_spm, int64_t rows)
+{
+    launch_ring_all_reduce_sum_residual(
+        partial_spm, residual_output_spm, nullptr, residual_output_spm,
+        rows, /*N=*/5120, /*core_num=*/8,
+        /*residual_local_shard=*/false, /*allow_exact_m576_inplace=*/false,
+        /*pi05_xor3=*/false, /*g05_rtc=*/nullptr, /*g05_norm=*/nullptr,
+        /*attn_adarms=*/nullptr,
+        /*allow_exact_qwen_residual_alias=*/true);
 }
 
 void rpu_launch_all_reduce_sum_residual_kernel(

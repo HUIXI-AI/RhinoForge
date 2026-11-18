@@ -69,12 +69,23 @@ def layer_geometry(text_config: Any) -> list[LayerGeom]:
     num_shared = int(_cfg(text_config, "num_kv_shared_layers", 0) or 0)
     first_shared = L - num_shared
 
-    head_dim = int(_cfg(text_config, "head_dim"))
-    global_head_dim = int(_cfg(text_config, "global_head_dim") or head_dim)
-    nq = int(_cfg(text_config, "num_attention_heads"))
-    nkv = int(_cfg(text_config, "num_key_value_heads"))
-    nkv_global = _cfg(text_config, "num_global_key_value_heads")
-    k_eq_v = bool(_cfg(text_config, "attention_k_eq_v", False))
+    per_layer = _cfg(text_config, "per_layer_config")
+    if isinstance(text_config, dict) and per_layer is not None:
+        # Serialized HF per-layer overrides contain only changed fields.
+        overrides = {int(i): fields for i, fields in per_layer.items()}
+        if any(i < 0 or i >= L for i in overrides):
+            raise ValueError("per_layer_config index exceeds num_hidden_layers")
+        per_layer = [dict(text_config, **overrides.get(i, {}))
+                     for i in range(L)]
+    if per_layer is None:
+        head_dim = int(_cfg(text_config, "head_dim"))
+        global_head_dim = int(_cfg(text_config, "global_head_dim") or head_dim)
+        nq = int(_cfg(text_config, "num_attention_heads"))
+        nkv = int(_cfg(text_config, "num_key_value_heads"))
+        nkv_global = _cfg(text_config, "num_global_key_value_heads")
+        k_eq_v = bool(_cfg(text_config, "attention_k_eq_v", False))
+    elif len(per_layer) != L:
+        raise ValueError("per_layer_config length must match num_hidden_layers")
     sliding_window = _cfg(text_config, "sliding_window")
 
     # Source layer per type = LAST non-shared layer of that type (audit §4).
@@ -86,9 +97,17 @@ def layer_geometry(text_config: Any) -> list[LayerGeom]:
     for i in range(L):
         lt = layer_types[i]
         is_global = lt == GLOBAL_LAYER_TYPE
-        hd = global_head_dim if is_global else head_dim
-        use_alt_kv = k_eq_v and is_global
-        this_nkv = int(nkv_global if (use_alt_kv and nkv_global) else nkv)
+        if per_layer is None:
+            hd = global_head_dim if is_global else head_dim
+            use_alt_kv = k_eq_v and is_global
+            this_nkv = int(nkv_global if (use_alt_kv and nkv_global) else nkv)
+            this_nq = nq
+        else:
+            # Transformers resolves mixed attention widths on each layer.
+            layer_config = per_layer[i]
+            hd = int(_cfg(layer_config, "head_dim"))
+            this_nkv = int(_cfg(layer_config, "num_key_value_heads"))
+            this_nq = int(_cfg(layer_config, "num_attention_heads"))
         is_shared = i >= first_shared
         if is_shared:
             if lt not in last_nonshared:
@@ -103,7 +122,7 @@ def layer_geometry(text_config: Any) -> list[LayerGeom]:
             layer_type=lt,
             is_global=is_global,
             head_dim=hd,
-            num_q_heads=nq,
+            num_q_heads=this_nq,
             num_kv_heads=this_nkv,
             rope_type="proportional" if is_global else "default",
             sliding_window=None if is_global else (

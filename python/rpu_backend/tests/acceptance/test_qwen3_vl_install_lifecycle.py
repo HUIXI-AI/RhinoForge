@@ -1144,7 +1144,6 @@ def test_staged_32b_streams_after_claim_without_second_swizzle(
     model.model.language_model.layers = [object()]
     plan = object()
     vars(model)[w8a16_load._W8A16_IMAGETEXT_STAGE_ATTR] = plan
-    monkeypatch.setenv("QWEN3_VL_32B_ALLOW_GRAPH_BLOCKED", "1")
     monkeypatch.setattr(
         qwen3_vl, "_is_qwen3_vl_32b_w8a16_config", lambda _config: True
     )

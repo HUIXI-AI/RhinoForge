@@ -1,5 +1,6 @@
 """Bounded speech examples; configuration checks do not import Torch."""
 from dataclasses import asdict
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -7,7 +8,19 @@ import statistics
 import time
 
 from examples.common.cpu import configure_cpu_threads, resolve_cpu_threads
+from examples.common.libraries import file_sha256
 from examples.common.results import close_with_report, latency_timing, record_result
+
+
+def audio_identity(filename):
+    import soundfile as sf
+    path = Path(filename)
+    if not path.is_file():
+        return {"status": "UNAVAILABLE", "path": str(path)}
+    info = sf.info(path)
+    digest = file_sha256(path)
+    return {"path": str(path), "sha256": digest, "sample_rate": info.samplerate,
+            "channels": info.channels, "frames": info.frames, "seconds": info.duration}
 
 
 def validate_example_config(config):
@@ -17,10 +30,10 @@ def validate_example_config(config):
     target = next(iter(targets))
     tts = target == "qwen3_tts"
     if not {target, "input", "run"} <= set(config) or set(config) - {
-            target, "input", "run", "cpu", "logging"}:
-        raise ValueError("speech requires model, input and run tables, optional cpu/logging")
+            target, "input", "run", "cpu", "logging", "rpu_execution"}:
+        raise ValueError("speech requires model, input and run tables, optional cpu/logging/rpu_execution")
     model, inputs, run = config[target], config["input"], config["run"]
-    allowed = {"checkpoint", "source", "codec_backend"} if tts else {"checkpoint"}
+    allowed = {"checkpoint", "source", "codec_backend", "precision"} if tts else {"checkpoint", "precision"}
     for table, keys, label in ((model, allowed, target),
             (inputs, {"text", "reference_audio", "language", "max_new_tokens"} if tts else
              {"audio", "max_new_tokens"}, "input"),
@@ -36,6 +49,9 @@ def validate_example_config(config):
         raise ValueError("TTS requires 1–1024 characters and Chinese or English")
     if tts and model.get("codec_backend", "rpu") not in ("cpu", "rpu"):
         raise ValueError("codec_backend must be cpu or rpu")
+    from examples.common.config import _backend_leaf
+    _backend_leaf("api/_qwen3_audio_precision.py").normalize_audio_precision(
+        model.get("precision", "fp16"), config.get("rpu_execution"), not tts)
     for value, label, low, high in (
             (inputs.get("max_new_tokens", 256 if tts else 64), "max_new_tokens", 2 if tts else 1, 256 if tts else 64),
             (run.get("warmup", 2), "warmup", 0, None),
@@ -93,21 +109,28 @@ def run_example_config(config):
                 raise ValueError("ASR input must be mono 16 kHz audio, 0.5–8 seconds")
             audio, rate = sf.read(inputs["audio"], dtype="float32")
             _validate_audio(audio, rate, limit)
+        report["input_identity"] = audio_identity(inputs["reference_audio" if tts else "audio"])
+        if tts:
+            report["input_identity"]["text_sha256"] = hashlib.sha256(inputs["text"].encode()).hexdigest()
+            report["input_identity"]["text_characters"] = len(inputs["text"])
         owner = None
         try:
             start = time.perf_counter()
             if tts:
                 owner = Qwen3TTSModel.from_pretrained(options["checkpoint"], source=options["source"],
-                    codec_backend=options.get("codec_backend", "rpu"))
+                    codec_backend=options.get("codec_backend", "rpu"),
+                    precision=options.get("precision", "fp16"), rpu_execution=config.get("rpu_execution"))
                 def infer():
                     return owner.synthesize(inputs["text"], reference_audio=inputs["reference_audio"],
                         language=inputs.get("language", "Chinese"), max_new_tokens=limit)
             else:
-                owner = Qwen3ASRModel.from_pretrained(options["checkpoint"])
+                owner = Qwen3ASRModel.from_pretrained(options["checkpoint"],
+                    precision=options.get("precision", "fp16"), rpu_execution=config.get("rpu_execution"))
                 def infer():
                     return owner.transcribe(audio, sample_rate=rate, max_new_tokens=limit)
             report["load_seconds"] = time.perf_counter() - start
             warmup, runs = run.get("warmup", 2), run.get("runs", 5)
+            report.update(warmup=warmup, runs=runs)
             for index in range(warmup + runs):
                 torch.manual_seed(run.get("seed", 0))
                 start, cpu_start = time.perf_counter(), time.process_time()
@@ -126,6 +149,8 @@ def run_example_config(config):
                 report["cpu_ms_runs"].append(cpu_elapsed * 1000)
                 report["rtf_runs"].append(elapsed / duration)
                 report.setdefault("audio_seconds_runs", []).append(duration)
+                if isinstance(stats.get("stage_ms"), dict):
+                    report.setdefault("stage_ms_runs", []).append(stats["stage_ms"])
                 report["execution_stats"].append(stats)
             if tts:
                 wave, sample_rate = output

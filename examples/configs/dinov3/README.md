@@ -1,78 +1,57 @@
 # DINOv3 配置
 
-[配置索引](../CONFIGURATIONS.md) · [准备与运行](#使用)
+[配置总览](../README.md) · [全部配置](#configurations) · [权重准备](../WEIGHTS.md) · [参数说明](../PARAMETERS.md)
 
-本目录提供 DINOv3 ViT-B/16 的 FP16 视觉编码器配置。输入一张图片，输出全部视觉特征和 CLS 池化特征。
+<a id="配置矩阵"></a>
 
-## 配置说明
+[ViT-B FP16](vit_b/fp16.toml) 接收单张图像，返回视觉特征 `last_hidden_state` 和池化特征 `pooler_output`。这一路径用于特征提取。
 
-<a id="weight-recipes"></a>
-<a id="配置与权重对应关系"></a>
-
-| 配置 | 计算范围 | 权重获取 |
-|---|---|---|
-| [vit_b/fp16.toml](vit_b/fp16.toml) | ViT-B/16 视觉编码，FP16 | [官方 FP32 权重](#weights)，加载时转 FP16 |
-
-<a id="fp16-基准做了什么"></a>
-
-### 精度与执行
-
-| 阶段 | 精度与执行方式 |
-|---|---|
-| 图片与 patch embedding | CPU 预处理；将 patch Conv2d 折叠为 CPU FP16 Linear |
-| Vision encoder | FP16 权重与激活；12 个 Attention head 补零至 16 个，适配 TP8；12 层在一个保留的 Graph 中执行并重放 |
-| 输出 | 公共入口在 CPU 完成末 LayerNorm，保存 `last_hidden_state`，并取第一个 token 作为 `pooler_output` |
-
-每张 224×224 图片产生 196 个 patch，加上 CLS 和 4 个 register token，共 201 个有效 token。执行时按 16 行对齐至 208，补齐不增加有效特征。模板的 `rpu_execution.vision.chunk_size="auto"` 选择这个单块容量。
-
-加载和执行分别见 [runner](../../runners/dinov3/runner.py) 与 [DINOv3 adapter](../../../python/rpu_backend/adapters/dinov3.py)。
+<a id="运行"></a>
 
 ## 准备与运行
 
-<a id="weight-sources"></a>
-<a id="weights"></a>
-<a id="quantization"></a>
-<a id="权重准备"></a>
+按权重准备页配置 `dinov3-vit-b` 目录，将 TOML 的 `input.images` 替换为实际图片路径。图像预处理器从同一权重目录加载；输入处理和输出形状受该模型配置约束。
 
-### 获取权重
-
-`example.registry_alias="dinov3-vit-b"` 固定读取 `$RPU_MODEL_CACHE/dinov3-vitb16-pretrain-lvd1689m`。权重、`config.json` 和 `preprocessor_config.json` 使用同一下载版本。
-
-源权重为 [facebook/dinov3-vitb16-pretrain-lvd1689m](https://huggingface.co/facebook/dinov3-vitb16-pretrain-lvd1689m)，官方 safetensors 存储为 FP32。先在模型页面取得访问权限，再下载完整目录。在已安装项目依赖的环境、仓库根目录执行：
+从仓库根目录先检查配置，再运行：
 
 ```bash
-export RPU_MODEL_CACHE=/path/to/model-cache
-hf download facebook/dinov3-vitb16-pretrain-lvd1689m \
-  --local-dir "$RPU_MODEL_CACHE/dinov3-vitb16-pretrain-lvd1689m"
+python examples/run.py --config examples/configs/dinov3/vit_b/fp16.toml --check-config
+python examples/run.py --config examples/configs/dinov3/vit_b/fp16.toml
 ```
 
-FP16 转换在加载时完成，仍使用上面的原始目录。
+配置检查通过会输出 `configuration OK`，只说明语法和 profile 匹配。运行输出及文件位置见[结果说明](../../RESULTS.md)。
 
-<a id="使用"></a>
+核数默认 8。需要 4 或 6 核时，在 TOML 中加入 `[rpu_execution.model]` 并写 `num_cores = 4` 或 `6`：注意力和 MLP 都用所选核数（每核 3 或 2 个头，不补头），需要包含 DINOv3 核数接口的重编译 native 扩展。各核数的实测见下表。
 
-### 输入与运行
+<!-- model-configurations-start -->
 
-复制模板，填写一张真实图片和输出目录，然后在设备环境运行：
+<a id="configurations"></a>
+## 全部配置与输入范围
 
-```bash
-cp examples/configs/dinov3/vit_b/fp16.toml /tmp/dinov3_fp16.toml
-# 修改 input.images，并在 [run] 中添加 output_dir。
-vi /tmp/dinov3_fp16.toml
-python examples/run.py --config /tmp/dinov3_fp16.toml --check-config
-python examples/run.py --config /tmp/dinov3_fp16.toml
-```
+每组先列各配置不同的项，再列本组配置相同的项；修改相机、文本长度、精度或核数时，同时满足联动限制。4/6/8 核列：● 已在板上运行通过（4/6 核写出各组件实际核数），○ 支持但未在板上运行，✕ 不支持（原因列在表下）。支持状态和 CPU 线程数的读法见配置表说明；实测耗时见性能报告：DINOv3。
 
-<a id="输入与执行参数"></a>
+### 视觉特征
 
-### 常用参数
+| 项目 | 值 |
+|---|---|
+| 配置 | [vit_b/fp16.toml](vit_b/fp16.toml) |
+| 支持状态 | 支持（`SUPPORTED`） |
+| 精度 | fp16 |
+| 量化范围 | — |
+| 输入类型 | 单张RGB图片 |
+| 文本可调范围 | 不使用 |
+| 图像/音频可调范围 | 一次1图；processor后H/W整除16，默认224×224 |
+| 生成可调范围 | 不生成 |
+| 其他输入形状 | tensor[1,3,H,W] |
+| 联动限制 | 处理后patch grid不得超过安装max_hw和KV容量；默认ViT-B max_hw=14。原始文件尺寸经processor调整，不等同模型tensor尺寸。 |
+| 默认核数 | 8 |
+| 4 核 | ● 已实测 |
+| 6 核 | ● 已实测 |
+| 8 核 | ● 已实测 |
+| CPU线程数 | 未设置（沿用环境） |
+| 权重 | `dinov3-vit-b` |
+| 入口 | [run.py](../../run.py) |
 
-| 字段 | 模板值 | 省略时 | 范围与关联 |
-|---|---|---|---|
-| `input.images` | 一张图片的占位路径 | 必填 | 一张真实图片；processor 生成 B1、224×224 输入 |
-| `rpu_execution.vision.chunk_size` | `"auto"` | `"auto"` | 按 201 个有效 token 选择 208 行单块容量；显式值填 208 |
+输入校验来源：[runner.py](../../../examples/runners/dinov3/runner.py) · [dinov3.py](../../../python/rpu_backend/adapters/dinov3.py)。
 
-模板的 `run.warmup/runs/seed` 为 2 / 3 / 0，`cpu.threads` 未配置。通用字段的默认值、输出目录、计时与诊断选项见[公共参数说明](../PARAMETERS.md)。
-
-## 输出
-
-输出图像特征与运行摘要，产物保存在 `run.output_dir`。
+<!-- model-configurations-end -->

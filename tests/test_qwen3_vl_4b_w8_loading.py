@@ -41,6 +41,10 @@ def test_exact_admission_without_32b_optin(monkeypatch):
     assert load.is_qwen3_vl_4b_w8a16_config(cfg)
     assert not load.is_qwen3_vl_32b_w8a16_config(cfg)
     adapter.Qwen3VLAdapter.preflight(cfg)
+    for cores in (4, 6):
+        topology = adapter._qwen3_vl_core_topology(cfg, {"model":{"num_cores":cores}})
+        assert topology.attn_tp == topology.lm_head_tp == 4
+        assert topology.mlp_tp == cores
 
 
 @pytest.mark.parametrize("fault", ["scope", "head", "tied", "rope", "geometry", "nested"])
@@ -332,19 +336,10 @@ def test_exact_4b_projection_bank_offsets_beyond_two_gib(monkeypatch):
 
 
 def test_staged_32b_uses_layer_local_storage_without_4b_bank(monkeypatch,tmp_path):
-    cfg = config()
-    cfg.quant_config = dict(load._QWEN3_VL_32B_W8A16_QUANT_CONFIG)
-    vars(cfg.text_config).update(hidden_size=5120, intermediate_size=25600,
-        num_hidden_layers=64, num_attention_heads=64)
-    vars(cfg.vision_config).update(hidden_size=1152, intermediate_size=4304,
-        depth=27, out_hidden_size=5120, deepstack_visual_indexes=[8, 16, 24])
-    assert load.is_qwen3_vl_32b_w8a16_config(cfg)
-    monkeypatch.setattr(load.AutoModelForImageTextToText, "from_config", Tiny)
-    data = tensors()
-    data["lm_head.weight"] = data["lm_head.weight"].half()
-    del data["lm_head.weight_scale"]
-    save_file(data, tmp_path / "model.safetensors")
-    model = load.stage_w8a16_imagetext_for_rpu(cfg, str(tmp_path))
+    from rpu_backend.tests import _w8a16_staged_handoff as handoff
+    model,_,_=handoff.metadata_fixture(tmp_path,"self_attn.q_proj",
+        torch.ones(16,32,dtype=torch.int8),torch.ones(16,dtype=torch.float16))
+    model.config=handoff._qwen3_vl_32b_w8_config()
     def forbidden(*args,**kwargs):
         raise AssertionError("32B must not allocate the controlled 4B projection bank")
     monkeypatch.setattr(load,"_allocate_w8a16_decoder_projection_views",forbidden)
@@ -360,18 +355,17 @@ def test_staged_32b_uses_layer_local_storage_without_4b_bank(monkeypatch,tmp_pat
     def move(layer, *, projection_views):
         assert set(projection_views) == {"self_attn.q_proj"}
         view = projection_views["self_attn.q_proj"]
-        assert view.shape == layer.self_attn.q_proj.weight.shape
-        assert view.dtype == torch.int8 and view.is_contiguous()
+        assert view.shape == (16, 32) and view.dtype == torch.int8
+        assert view.is_contiguous()
         assert torch.equal(layer.self_attn.q_proj.weight,
-                           data["model.language_model.layers.0.self_attn.q_proj.weight"])
+                           torch.ones(16, 32, dtype=torch.int8))
         calls.append(layer)
     monkeypatch.setattr(load, "_swizzle_and_move_w8a16_decoder_layer", move)
     vars(model)["_rpu_swizzle_started"]=True
     load._materialize_staged_w8a16_imagetext_for_rpu(model)
     assert calls==list(model.model.language_model.layers)
-    assert allocations == [(6, torch.int8)]
-    assert torch.equal(model.lm_head.weight, data["lm_head.weight"])
-    assert model.lm_head.weight.dtype == torch.float16
+    assert allocations == [(16 * 32, torch.int8)]
+    assert torch.equal(model.model.visual.sentinel, torch.tensor([0.125, -0.25]))
 
 
 @pytest.mark.parametrize("selection", [slice(None), slice(-1, None), torch.tensor([0, 2])])
@@ -385,13 +379,13 @@ def test_prefill_packed_w4_head_keeps_requested_rows_and_physical_owners(monkeyp
     values, logical_scale, _ = quantize_int4_group_wise(raw, 32)
     head = torch.nn.Linear(64, 128, bias=False)
     head.weight = torch.nn.Parameter(
-        swizzle_pack_int4_pgrp(values, 1, 8).reshape(128, 32), requires_grad=False)
+        swizzle_pack_int4_pgrp(values, 1, 8).reshape(256, 32), requires_grad=False)
     head.register_buffer("weight_scale", swizzle_int4_pgrp_scale(logical_scale, 32, 1, 8))
     hidden = torch.randn(1, 4, 64, generator=generator).half()
     dequantized = dequantize_int4_group_wise(values, logical_scale)
     calls = []
-    def native(x, weight, bias, partition, cores, acc32, scale):
-        assert (partition, cores, acc32) == (1, 8, False)
+    def native(x, weight, bias, partition, cores, acc32, scale, *, logical_out_features=None):
+        assert (partition, cores, acc32, logical_out_features) == (1, 8, False, 128)
         calls.append((x, weight, scale))
         return torch.nn.functional.linear(x, dequantized, bias)
     monkeypatch.setattr(torch.ops.rpu, "linear_with_accumulation", native, raising=False)
@@ -401,3 +395,60 @@ def test_prefill_packed_w4_head_keeps_requested_rows_and_physical_owners(monkeyp
     assert torch.equal(output, torch.nn.functional.linear(hidden[:, selection, :], dequantized))
     assert len(calls) == 1 and calls[0][0].is_contiguous()
     assert calls[0][1] is head.weight and calls[0][2] is head.weight_scale
+
+
+@pytest.mark.parametrize("budget", [4,6])
+def test_reduced_layer_banks_include_physical_padding_before_allocation(monkeypatch,budget):
+    """Run real padding, per-layer allocation and INT8 swizzle on bounded widths."""
+    from rpu_backend.runtime.topology import DecoderTopology
+    from rpu_backend.runtime import weights
+
+    model=torch.nn.Module();model.model=torch.nn.Module()
+    decoder=model.model.language_model=torch.nn.Module()
+    decoder.config=NS(hidden_size=256,intermediate_size=9728)
+    decoder.layers=torch.nn.ModuleList()
+    originals={}
+    roles={"self_attn.q_proj":(256,256),"self_attn.k_proj":(256,256),
+        "self_attn.v_proj":(256,256),"self_attn.o_proj":(256,256),
+        "mlp.gate_proj":(9728,256),"mlp.up_proj":(9728,256),"mlp.down_proj":(256,9728)}
+    for index in range(2):
+        layer=torch.nn.Module();layer.self_attn=torch.nn.Module();layer.mlp=torch.nn.Module()
+        for name,(n,k) in roles.items():
+            owner,leaf=name.split(".");module=torch.nn.Linear(k,n,bias=False)
+            raw=((torch.arange(n*k).reshape(n,k)+index)%251-125).to(torch.int8)
+            module.weight=torch.nn.Parameter(raw,requires_grad=False)
+            module.register_buffer("weight_scale",torch.full((n,),.125,dtype=torch.float16))
+            getattr(layer,owner).add_module(leaf,module);originals[index,name]=raw.clone()
+        decoder.layers.append(layer)
+    topology=DecoderTopology(budget,4,budget,4)
+    vars(model)["_rpu_swizzle_started"]=True
+    original_empty=torch.empty;allocations=[]
+    def host_empty(*args,**kwargs):
+        if kwargs.get("device")=="rpu":
+            allocations.append(args[0]);kwargs["device"]="cpu"
+        return original_empty(*args,**kwargs)
+    monkeypatch.setattr(torch,"empty",host_empty)
+    moved=[]
+    monkeypatch.setattr(torch.nn.Module,"to",lambda layer,device:moved.append(layer) or layer)
+    load._move_materialized_decoder_for_rpu(model,dtype=torch.int8,topology=topology)
+    physical=9792 if budget==6 else 9728
+    assert allocations==[4*256*256+3*physical*256]*2
+    assert moved==list(decoder.layers)
+    layer_storages=[]
+    for index,layer in enumerate(decoder.layers):
+        storages=set()
+        for name in roles:
+            module=layer.get_submodule(name);source=originals[index,name]
+            mlp=name.startswith("mlp.");cores=budget if mlp else 4
+            partition=0 if name.endswith(("o_proj","down_proj")) else 1
+            if mlp and budget==6:
+                source=weights.pad_decoder_mlp_projection(source,projection_name=name.split(".")[1],
+                    logical_size=9728,physical_size=physical)
+            expected=weights.transform_linear_weight(source,partition,num_cores=cores)
+            assert torch.equal(module.weight,expected)
+            assert (module._rpu_linear_partition,module._rpu_linear_num_cores)==(partition,cores)
+            storages.add(module.weight.untyped_storage().data_ptr())
+            if name in ("mlp.gate_proj","mlp.up_proj") and budget==6:
+                assert torch.equal(module.weight_scale[9728:],torch.ones(64,dtype=torch.float16))
+        assert len(storages)==1;layer_storages.extend(storages)
+    assert len(set(layer_storages))==2

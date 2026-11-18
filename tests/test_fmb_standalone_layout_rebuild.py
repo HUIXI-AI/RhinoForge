@@ -53,7 +53,7 @@ def _host_program(core_source):
 #include <unordered_map>
 #include <utility>
 #include <vector>
-#define TORCH_CHECK(c, ...) do { if (!(c)) throw std::runtime_error("native contract rejected"); } while (0)
+#define TORCH_CHECK(c, ...) do { if (!(c)) throw std::runtime_error("native contract rejected: " #c); } while (0)
 enum class AttentionExecutionPolicy {DDR_KV, SPM_KV_BY_MHA};
 enum class FmbRopeTableResidency {UNSPECIFIED};
 class FusedModelBase;
@@ -200,39 +200,38 @@ int alternating_owners() {
 }
 void protected_scopes() {
     const auto decls=buffers();const auto ctx=geometry(624);
-    // COMPLETE standalone owners retain placement even without an explicit hash.
-    // Non-COMPLETE and active lease/composite owners keep their existing scopes.
-    for(int excluded=0;excluded<3;++excluded) {
-        arena=SpmAllocator{};FusedModelBase::Impl s;
-        const auto expected=planned(s,decls,ctx);
-        production_allocation(s,decls,ctx,expected.layout_hash);
-        const auto old_offset=s.offsets_.at("q");
-        arena.reset_temporary();arena.alloc_temporary(8192);
-        if(excluded==1)s.ctx_.complete=false;
-        if(excluded==2)s.pipeline_lease_epoch_=9;
-        const auto before=arena.generation();
-        production_allocation(s,decls,ctx,excluded==0?0:expected.layout_hash);
-        if (excluded==0) {
-            assert(arena.generation()>before && s.offsets_.at("q")==old_offset);
-            assert(actual(s,decls).layout_hash==expected.layout_hash);
-        } else {
-            assert(arena.generation()==before && s.offsets_.at("q")==old_offset+8192);
-        }
+    // Non-COMPLETE owners retain append placement after a sibling allocation.
+    // An omitted optional hash does not remove a COMPLETE owner's authority.
+    arena=SpmAllocator{};FusedModelBase::Impl s;
+    const auto expected=planned(s,decls,ctx);
+    production_allocation(s,decls,ctx,expected.layout_hash);
+    const auto old_offset=s.offsets_.at("q");
+    arena.reset_temporary();arena.alloc_temporary(8192);
+    s.ctx_.complete=false;
+    const auto before=arena.generation();
+    production_allocation(s,decls,ctx,0);
+    assert(arena.generation()==before && s.offsets_.at("q")==old_offset+8192);
+    // A live component lease owns its existing allocation even when the arena
+    // lock flag is not set. A stale generation must reject before any mutation;
+    // unchanged leased Path3 must reuse exactly the reserved placement.
+    for(bool locked:{false,true}) {
+        arena=SpmAllocator{};FusedModelBase::Impl leased;
+        production_allocation(leased,decls,ctx,expected.layout_hash);
+        leased.pipeline_lease_epoch_=12;arena.pipeline_arena_locked_=locked;
+        const auto gen=arena.generation();const auto waterline=arena.t_end_;
+        const auto offsets=leased.offsets_;
+        const auto layer_offsets=leased.per_layer_offsets_;
+        const auto manifest_gen=leased.manifest_generation;
+        production_allocation(leased,decls,ctx,expected.layout_hash);
+        assert(arena.generation()==gen && arena.t_end_==waterline);
+        ++arena.generation_;
+        bool rejected=false;
+        try{production_allocation(leased,decls,ctx,expected.layout_hash);}
+        catch(const std::runtime_error&){rejected=true;}
+        assert(rejected && arena.generation()==gen+1 && arena.t_end_==waterline);
+        assert(leased.offsets_==offsets && leased.per_layer_offsets_==layer_offsets);
+        assert(leased.manifest_generation==manifest_gen);
     }
-    // With a physical lease locked, a stale generation must fail closed;
-    // valid leased Path3 may reuse exactly the already reserved placement.
-    arena=SpmAllocator{};FusedModelBase::Impl leased;
-    const auto expected=planned(leased,decls,ctx);
-    production_allocation(leased,decls,ctx,expected.layout_hash);
-    leased.pipeline_lease_epoch_=12;arena.pipeline_arena_locked_=true;
-    const auto gen=arena.generation();const auto waterline=arena.t_end_;
-    production_allocation(leased,decls,ctx,expected.layout_hash);
-    assert(arena.generation()==gen && arena.t_end_==waterline);
-    ++arena.generation_;
-    bool rejected=false;
-    try{production_allocation(leased,decls,ctx,expected.layout_hash);}
-    catch(const std::runtime_error&){rejected=true;}
-    assert(rejected && arena.generation()==gen+1 && arena.t_end_==waterline);
     // Ordinary warm Path3 must not reset or advance allocation identity either.
     arena=SpmAllocator{};FusedModelBase::Impl warm;
     production_allocation(warm,decls,ctx,expected.layout_hash);

@@ -1,15 +1,15 @@
-"""LingBot-VLA V2 (robbyant/lingbot-vla-v2-6b) — checkpoint loader / device converter.
+"""LingBot-VLA V2 (robbyant/lingbot-vla-v2-6b) — checkpoint loader / RPU converter.
 
-Reads the OFFICIAL stacked-expert safetensors layout directly and produces the fp16 device
+Reads the OFFICIAL stacked-expert safetensors layout directly and produces the fp16 RPU
 weight set consumed by the `lingbot_v2_moe_*` op family.
 
-⚠️  IMPORT CONTRACT (deliverable 5): this module MUST stay importable on a host with NO device.
+⚠️  IMPORT CONTRACT (deliverable 5): this module MUST stay importable on a host with NO RPU.
     There is NO module-level `import rpu_backend` (importing the package loads the built .so,
     whose module init touches /dev/rpu). Every rpu_backend symbol is imported INSIDE the
-    function that needs it, and only the device-building functions do so. The CPU-only surface
+    function that needs it, and only the RPU-building functions do so. The CPU-only surface
     (`ckpt_reader`, `load_moe_layer_weights`, `expert_slice`, `load_host_weights`, `SWIZZLE_PLAN`)
     is pure torch + safetensors, so `tests/model/test_lingbot_vla_v2_moe_cpu.py` can exec this
-    file standalone (spec_from_file_location) with no device present. Keep it that way: do NOT add
+    file standalone (spec_from_file_location) with no RPU present. Keep it that way: do NOT add
     a module-level rpu_backend import and do NOT add relative (`from .x import`) imports.
 
 Stacked expert layout (bare nn.Parameter — NO `.weight` suffix; Qwen2FusedExperts):
@@ -21,7 +21,8 @@ Stacked expert layout (bare nn.Parameter — NO `.weight` suffix; Qwen2FusedExpe
     mlp.shared_expert.{gate,up}_proj.weight [704, 768]
     mlp.shared_expert.down_proj.weight      [768, 704]
 
-Convert dtype before changing layout: half -> (pad) -> swizzle -> .to('rpu').
+Pitfall P1 (docs/pitfalls.md:304-330) — `.half()` BEFORE swizzle, never after. Swizzle-before-half
+gives e2e cos -0.19. Every builder below is written half -> (pad) -> swizzle -> .to('rpu').
 Pitfall B-1 — never `torch.ones/zeros(device='rpu')`; build on CPU then `.to('rpu')`.
 """
 from __future__ import annotations
@@ -102,8 +103,8 @@ def _default_geom() -> dict:
 # Explicit per-tensor classification (P1 / RC-3).
 #
 # EVERY Linear-like tensor in the action expert is classified here as either
-# swizzled-and-fused (-> device, with an exact swizzle + core count) or KEPT OUT
-# (-> host fp32, never uploaded). A module left on the device un-swizzled corrupts
+# swizzled-and-fused (-> RPU, with an exact swizzle + core count) or KEPT OUT
+# (-> host fp32, never uploaded). A module left on the RPU un-swizzled corrupts
 # SILENTLY, so "unclassified" is not an allowed state.
 #
 #   swizzle: "col" = output-partitioned (N split over cores) -> tp_col_swizzle_mc_weight
@@ -126,7 +127,7 @@ SWIZZLE_PLAN: dict[str, dict] = {
     "input_layernorm.weight":            dict(shape=(EXP_HID,), swizzle=None, cores=0, dest="input_norm"),
     "post_attention_layernorm.weight":   dict(shape=(EXP_HID,), swizzle=None, cores=0, dest="post_norm"),
     # gamma/beta are [768,768] LINEARS (not norm scales). They consume ada_cond on the HOST and
-    # never touch the device — folding them per (step, layer, slot) is what set_adarms_step_mutable eats.
+    # never touch the RPU — folding them per (step, layer, slot) is what set_adarms_step_mutable eats.
     "input_layernorm.gamma.weight":          dict(shape=(EXP_HID, EXP_HID), swizzle="HOST", cores=0, dest="host:norm_W"),
     "input_layernorm.gamma.bias":            dict(shape=(EXP_HID,),         swizzle="HOST", cores=0, dest="host:norm_W"),
     "input_layernorm.beta.weight":           dict(shape=(EXP_HID, EXP_HID), swizzle="HOST", cores=0, dest="host:norm_W"),
@@ -140,12 +141,12 @@ SWIZZLE_PLAN: dict[str, dict] = {
     # The brief said "router gate.weight must stay FP32 and must NOT be swizzled". The as-built
     # kernel disagrees on BOTH counts and would throw / silently misread if we obeyed the brief:
     #   * rpu_lingbot_v2_moe_model.cpp:110-119 TORCH_CHECKs router_gate_w AND router_bias are
-    #     `fp16 device` (at::kHalf + kPrivateUse1). An fp32 tensor raises at set_weights.
+    #     `fp16 RPU` (at::kHalf + kPrivateUse1). An fp32 tensor raises at set_weights.
     #   * rpu_lingbot_v2_moe_model.cpp:275-280 feeds router_gate_[L] straight into
     #     rpu_launch_linear_spm_to_spm_kernel(..., partition=1, num_cores=1), i.e. it expects a
     #     SINGLE-CORE COL-SWIZZLED operand. An un-swizzled matrix is read in the wrong order
     #     (silent corruption — exactly the RC-3 failure the brief warns about).
-    #   * rpu_lingbot_v2_moe_model.h:73 documents the intent: "single-core col-swizzled fp16 device".
+    #   * rpu_lingbot_v2_moe_model.h:73 documents the intent: "single-core col-swizzled fp16 RPU".
     # The kernel does use the acc32 (not acc16) linear for the router — "highest-precision router
     # available" per its [D1] comment — but the OPERANDS are fp16. The CPU reference deliberately
     # runs this GEMM in TRUE fp32 (lb2_moe_reference.py:146, autocast disabled) because bf16/fp16
@@ -170,7 +171,7 @@ SWIZZLE_PLAN: dict[str, dict] = {
     # ---------------- expert final norm (model-level, not per layer) ----------------
     # final_norm_adanorm: false (YAML:45) => plain RMSNorm; the checkpoint has no norm.gamma/beta.
     "norm.weight": dict(shape=(EXP_HID,), swizzle=None, cores=0, dest="final_norm_w", model_level=True),
-    # ---------------- host-only heads (KEPT OUT of the device entirely) ----------------
+    # ---------------- host-only heads (KEPT OUT of the RPU entirely) ----------------
     # The mandated default Euler loop is the HOST loop (V1's proven default), so the suffix
     # encoders + the action head run as CPU fp32 F.linear and are never swizzled/uploaded.
     "model.state_proj":         dict(shape=(EXP_HID, STATE_DIM),      swizzle="HOST", cores=0, dest="host:head_W"),
@@ -254,7 +255,7 @@ def expert_slice(stacked: torch.Tensor, e: int) -> torch.Tensor:
     """THE stacked-expert contract: expert e's Linear.weight is `stacked[e]`.
 
     `stacked` is [E, out, in] (gate/up: [32,512,768]; down: [32,768,512]). This is the single
-    place that defines the mapping; the device builder and the CPU golden test both go through it,
+    place that defines the mapping; the RPU builder and the CPU golden test both go through it,
     so the test genuinely validates what the converter uploads.
     """
     if stacked.dim() != 3:
@@ -304,7 +305,7 @@ def load_moe_layer_weights(ckpt_path_or_gw, layer: int, geom=None) -> dict[str, 
 
 
 def load_router_correction_biases(ckpt_path_or_gw, geom=None) -> list[torch.Tensor]:
-    """Preflight every router correction bias before any device upload.
+    """Preflight every router correction bias before any RPU upload.
 
     Nonzero values are supported: the device adds them to the FP16 sigmoid
     scores for strict top-k selection and gathers final weights from the
@@ -485,13 +486,13 @@ def head_pad_width(dim: int, multiple: int = 16) -> int:
 
 
 def verify_head_partition() -> tuple[int, int]:
-    """Check the action head's padded width is a LEGAL device linear shape BEFORE committing to it.
+    """Check the action head's padded width is a LEGAL RPU linear shape BEFORE committing to it.
 
     action_dim 55 fails the native-width check, so an on-device head would pad 55 -> 64
     (roundup16). This asserts `get_linear_partition(768, 64, fp16) != -1`. Returns (pad, partition).
 
     NOTE: importing `rpu_backend.runtime.weights` pulls the rpu_backend package (and its .so), so
-    this is NOT callable on a device-less host and is NOT called by the CPU golden test. The DEFAULT
+    this is NOT callable on an RPU-less host and is NOT called by the CPU golden test. The DEFAULT
     runtime keeps the action head on the HOST in fp32 (V1's proven default Euler loop), so 55->64
     is currently an unexercised contract kept here for a future on-device head.
     """
@@ -500,22 +501,22 @@ def verify_head_partition() -> tuple[int, int]:
     part = get_linear_partition(EXP_HID, pad, 2)     # in=768, out=64, dwidth=2 (fp16)
     if part == -1:
         raise ValueError(
-            f"lingbot2: action head pad {ACTION_DIM}->{pad} is not a legal device linear "
+            f"lingbot2: action head pad {ACTION_DIM}->{pad} is not a legal RPU linear "
             f"(get_linear_partition(768, {pad}, fp16) == -1). Pick another pad width."
         )
     return pad, part
 
 
 # =============================================================================
-# device-touching surface (rpu_backend imported lazily, inside the functions)
+# RPU-touching surface (rpu_backend imported lazily, inside the functions)
 # =============================================================================
 def _h(t: torch.Tensor) -> torch.Tensor:
-    """fp32/any -> fp16 device contiguous. P1: callers must have swizzled AFTER .half() already."""
+    """fp32/any -> fp16 RPU contiguous. P1: callers must have swizzled AFTER .half() already."""
     return t.detach().to(torch.float16).to("rpu").contiguous()
 
 
 def _h_256b(t: torch.Tensor) -> torch.Tensor:
-    """fp32/any -> retained contiguous fp16 device view with a 256-byte data pointer."""
+    """fp32/any -> retained contiguous fp16 RPU view with a 256-byte data pointer."""
     source = t.detach().to(torch.float16).contiguous()
     element_size = source.element_size()
     alignment = 256
@@ -527,19 +528,19 @@ def _h_256b(t: torch.Tensor) -> torch.Tensor:
     offset_bytes = (-storage.data_ptr()) % alignment
     if offset_bytes % element_size:
         raise RuntimeError(
-            f"cannot form a {alignment}-byte aligned fp16 device view"
+            f"cannot form a {alignment}-byte aligned fp16 RPU view"
         )
     result = storage.narrow(
         0, offset_bytes // element_size, source.numel()
     ).view(source.shape)
     result.copy_(source)
     if not result.is_contiguous() or result.data_ptr() % alignment:
-        raise RuntimeError("failed to retain a contiguous 256-byte aligned device view")
+        raise RuntimeError("failed to retain a contiguous 256-byte aligned RPU view")
     return result
 
 
 def _q(t: torch.Tensor) -> torch.Tensor:
-    """dtype-PRESERVING device upload, for W8A16 int8 packed weights.
+    """dtype-PRESERVING RPU upload, for W8A16 int8 packed weights.
 
     _h() force-casts to fp16, which silently turns an int8 weight back into fp16 and makes the
     W8A16 path a no-op (the C++ then rejects the scales with "packed weights are fp16, not int8").
@@ -548,20 +549,21 @@ def _q(t: torch.Tensor) -> torch.Tensor:
 
 
 def _build_rope_tables(head_dim: int, theta: float, max_seq: int):
-    """1-D RoPE cos/sin tables, fp16 device, shape [max_seq, head_dim/2]... (kernel format [max_seq, half*?]).
+    """1-D RoPE cos/sin tables, fp16 RPU, shape [max_seq, head_dim/2]... (kernel format [max_seq, half*?]).
 
     ⚠️ theta is the VLM's rope_theta (5e6 for Qwen3-VL-4B), NOT V1's 10000. The action expert does
     NOT own its RoPE: modeling_lingbot_vla_v2.py:275-277 `apply_mrope` rotates the expert's q/k with
     `self.qwenvl.model.language_model.rotary_emb`. Inheriting V1's ROPE_BASE=10000 here would be
     silently wrong. Plain 1-D is nonetheless EXACT for the suffix: _build_full_position_ids
     (:741-747) gives the suffix identical position values on all three M-RoPE axes, and all-equal
-    axes reduce interleaved M-RoPE (section [24,20,20]) to plain 1-D RoPE.
+    axes reduce interleaved M-RoPE (section [24,20,20]) to plain 1-D RoPE — verified numerically on
+    CPU against HF Qwen3VLTextRotaryEmbedding: max|diff| cos 2.2e-6 / sin 1.3e-6.
     """
     inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.float64) / head_dim))
     pos = torch.arange(max_seq, dtype=torch.float64)
     freqs = pos[:, None] * inv_freq[None, :]
     # partial_mrope encodes the table DDR addresses in 256-byte units.  Retain
-    # aligned views instead of relying on the device allocator's weaker base
+    # aligned views instead of relying on the RPU allocator's weaker base
     # alignment; the Tensor view keeps its padded storage owner alive.
     return _h_256b(freqs.cos().float()), _h_256b(freqs.sin().float())
 
@@ -576,7 +578,7 @@ def pack_sparse_expert_projection(
     per expert/output row; Down shares each output scale across all experts.
     The runtime sparse ABI stores that Down scale as repeated [E,N] rows.
     """
-    from rpu_backend.quant.fp8 import pack_grouped_weight
+    from rpu_backend.quant.fp8 import pack_grouped_weight, pack_grouped_scale
 
     if weight.dim() != 3 or not weight.is_floating_point():
         raise ValueError("sparse expert weight must be floating [E,N,K]")
@@ -604,7 +606,7 @@ def pack_sparse_expert_projection(
             scale = scale.unsqueeze(0).expand(experts, -1).contiguous()
     return pack_grouped_weight(
         source, partition=partition, num_cores=num_cores
-    ), scale
+    ), None if scale is None else pack_grouped_scale(scale)
 
 
 def pack_sparse_expert_gate_up(
@@ -705,8 +707,8 @@ def build_expert_moe(
     router_bias_cpu = load_router_correction_biases(gw, geom=_g)
 
     # RPU_LINGBOT2_BASE_W8A16=1 — int8 the action expert's attention q/k/v/o and the SHARED
-    # expert gate/up/down. The router retains its original precision.
-    # Disabled by default; the default path remains fp16.
+    # expert gate/up/down. The ROUTER is deliberately excluded (its N=32 GEMM is ~0.4% of the
+    # step and its precision is already the open blocker). Default OFF => fp16, unchanged.
     BASE_W8A16 = os.environ.get("RPU_LINGBOT2_BASE_W8A16") == "1"
     if BASE_W8A16:
         from rpu_backend.quant._common import quantize_linear_per_channel
@@ -908,6 +910,7 @@ def build_expert_moe(
                 quantize_int4_group_wise,
                 swizzle_int4_pgrp_scale,
                 swizzle_pack_int4_pgrp,
+                w4_storage_shape,
             )
         for L in range(EXP_LAYERS):
             p = f"{EXP_P}layers.{L}."
@@ -930,9 +933,9 @@ def build_expert_moe(
                 gqv, gs, _ = quantize_int4_group_wise(g_pk, group_size=32)
                 uqv, us, _ = quantize_int4_group_wise(u_pk, group_size=32)
                 dqv, ds, _ = quantize_int4_group_wise(d_pk, group_size=32)
-                gp = swizzle_pack_int4_pgrp(gqv, partition=1, num_cores=NC).view(NUM_EXPERTS * ROUTED_INTER, EXP_HID // 2)
-                up = swizzle_pack_int4_pgrp(uqv, partition=1, num_cores=NC).view(NUM_EXPERTS * ROUTED_INTER, EXP_HID // 2)
-                dp = swizzle_pack_int4_pgrp(dqv, partition=0, num_cores=NC).view(EXP_HID, NUM_EXPERTS * ROUTED_INTER // 2)
+                gp = swizzle_pack_int4_pgrp(gqv, partition=1, num_cores=NC).view(w4_storage_shape(NUM_EXPERTS * ROUTED_INTER, EXP_HID, 1, NC))
+                up = swizzle_pack_int4_pgrp(uqv, partition=1, num_cores=NC).view(w4_storage_shape(NUM_EXPERTS * ROUTED_INTER, EXP_HID, 1, NC))
+                dp = swizzle_pack_int4_pgrp(dqv, partition=0, num_cores=NC).view(w4_storage_shape(EXP_HID, NUM_EXPERTS * ROUTED_INTER, 0, NC))
                 gate_packed.append(gp.to("rpu").contiguous())
                 up_packed.append(up.to("rpu").contiguous())
                 down_packed.append(dp.to("rpu").contiguous())

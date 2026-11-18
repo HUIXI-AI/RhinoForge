@@ -42,12 +42,6 @@ For model assessment or implementation, use the
 [`rhinoforge-port` skill](../.agents/skills/rhinoforge-port/SKILL.md) with
 [model porting](../docs/model_porting.md).
 
-For TTS codec migration, check the installed native capabilities and the
-[speech guide](../docs/qwen3_audio.md#experimental-rpu-vocoder-convolutions).
-Compare fixed codec tokens, not just equal generation lengths. Keep padded
-residual rows through device addition and crop through the owned CPU output;
-validate repeated outputs when changing a device layout or FP16 boundary.
-
 ## Add or update knowledge
 
 1. Confirm the statement in public source or documentation.
@@ -169,20 +163,8 @@ Start with the [Qwen3 speech guide](../docs/qwen3_audio.md) and retain these con
   its default-off state preserves other decoders' RoPE parameters and layout hash.
   Keep original CPU FP32 codec weights; fold LayerScale into new frontend copies
   before FP16 conversion and preserve FP32 rotary frequencies. Use the device
-  frontend for 1–255 codec frames; above 64, plan MASK_2D single-chunk execution
-  with the original 72-position causal window and a versioned owned CPU mask.
-  Declare RoPE/KV/envelope 256 before first planning. Evict the old Graph and
-  clear its signature before replacing the mask, including failed length switches.
-  Missing setter selects CPU; report the route and propagate errors.
-  New transpose postprocessing uses kernel-major weights and bounded single-core
-  SPM last-axis slices, not DDR transpose. Keep 768/384-channel residual chains
-  in device rows. With `tts_codec_residual_unit_padded_rows`, keep 192/96-channel
-  chains in zero-padded 256/128-channel rows too: pad each kernel position's input
-  columns before transforming the first convolution weight, and crop only at stage
-  exit. Preserve the original per-unit weights for older-extension CPU boundaries.
-  The optional `tts_codec_conv_transpose1d_device_post` boundary reuses shared-DDR
-  conversion helpers and the existing projection/overlap math. Validate the full
-  geometry before upload, and return independently owned CPU FP32 NCT storage.
+  frontend for 1–63 codec frames and the original CPU FP32 sliding attention for
+  64–255 frames. Missing setter selects CPU; report the route and propagate errors.
 - Reset logical KV position per sequence. Talker keeps EOS and repetition penalties;
   Predictor uses a fixed 15-step sampling loop and resets KV per frame. Both use
   top-k 50, temperature 0.9 and top-p 1.0. Require EOS before waveform decoding;

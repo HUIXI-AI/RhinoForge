@@ -22,6 +22,45 @@ static uint32_t float_to_u32_le(float x) {
   return u;               // On little-endian systems this matches Python "<I"
 }
 
+namespace {
+
+// CPU mappings of SPM require aligned accesses. libc memcpy may use an
+// unaligned wide tail access for a logical FP16 byte count such as C=513.
+// Keep the kernel's packed row stride, but transfer complete 32-byte banks.
+// The LocalSPM buffers below already reserve this rounded extent. Normal DDR
+// can safely receive the logical tail; never round a user tensor's extent.
+constexpr size_t kLayerNormSpmCopyAlignment = 32;
+
+void layernorm_copy_ddr_to_spm(void* spm, const void* ddr, size_t bytes) {
+  constexpr size_t mask = kLayerNormSpmCopyAlignment - 1;
+  if ((bytes & mask) == 0 && (reinterpret_cast<uintptr_t>(ddr) & mask) == 0) {
+    ddr_to_spm(spm, ddr, bytes);
+    return;
+  }
+  const size_t copy_bytes = (bytes + mask) & ~mask;
+  std::vector<uint8_t> storage(copy_bytes + mask, 0);
+  auto* aligned = storage.data() +
+      ((-reinterpret_cast<uintptr_t>(storage.data())) & mask);
+  std::memcpy(aligned, ddr, bytes);
+  ddr_to_spm(spm, aligned, copy_bytes);
+}
+
+void layernorm_copy_spm_to_ddr(void* ddr, const void* spm, size_t bytes) {
+  constexpr size_t mask = kLayerNormSpmCopyAlignment - 1;
+  if ((bytes & mask) == 0 && (reinterpret_cast<uintptr_t>(ddr) & mask) == 0) {
+    spm_to_ddr(ddr, spm, bytes);
+    return;
+  }
+  const size_t copy_bytes = (bytes + mask) & ~mask;
+  std::vector<uint8_t> storage(copy_bytes + mask, 0);
+  auto* aligned = storage.data() +
+      ((-reinterpret_cast<uintptr_t>(storage.data())) & mask);
+  spm_to_ddr(aligned, spm, copy_bytes);
+  std::memcpy(ddr, aligned, bytes);
+}
+
+}  // namespace
+
 void rpu_launch_layernorm_kernel(const at::Tensor &input, at::Tensor &output,
                                  c10::IntArrayRef normalized_shape,
                                  const at::Tensor &weight,
@@ -34,12 +73,8 @@ void rpu_launch_layernorm_kernel(const at::Tensor &input, at::Tensor &output,
   for (auto s : input.sizes())
     n *= s;
   n /= lc;
-  size_t lc_v16 = CeilDiv(lc, 16);
-
-  size_t dwidth = sizeof(input.options().dtype());
-  size_t lc_tail = lc;
-  size_t bank_width = SPM_BANK_SIZE / dwidth;
-  size_t input_n_byte_step = lc_tail * dwidth;
+  constexpr size_t dwidth = sizeof(c10::Half);
+  size_t input_n_byte_step = lc * dwidth;
 
   size_t input_bytes = n * input_n_byte_step;
   size_t gamma_bytes = lc * sizeof(c10::Half);
@@ -94,9 +129,9 @@ void rpu_launch_layernorm_kernel(const at::Tensor &input, at::Tensor &output,
   c10::Half *betap = bias.data_ptr<c10::Half>();
   c10::Half *outputp = output.data_ptr<c10::Half>();
 
-  ddr_to_spm(spm_core0_input.get_cpu_ptr(), inputp, input_bytes);
-  ddr_to_spm(spm_core0_gamma.get_cpu_ptr(), gammap, gamma_bytes);
-  ddr_to_spm(spm_core0_beta.get_cpu_ptr(), betap, beta_bytes);
+  layernorm_copy_ddr_to_spm(spm_core0_input.get_cpu_ptr(), inputp, input_bytes);
+  layernorm_copy_ddr_to_spm(spm_core0_gamma.get_cpu_ptr(), gammap, gamma_bytes);
+  layernorm_copy_ddr_to_spm(spm_core0_beta.get_cpu_ptr(), betap, beta_bytes);
 
   uint32_t one_lcth_u32 = float_to_u32_le(one_lcth);
 
@@ -126,7 +161,7 @@ void rpu_launch_layernorm_kernel(const at::Tensor &input, at::Tensor &output,
   wq->enqueu_kernel(
       *kernel, {(uint16_t)CeilDiv(n, n_per_wrp), (uint16_t)1, (uint16_t)1}, {0});
 
-  spm_to_ddr(outputp, spm_core0_output.get_cpu_ptr(), output_bytes);
+  layernorm_copy_spm_to_ddr(outputp, spm_core0_output.get_cpu_ptr(), output_bytes);
 }
 
 // ============================================================================

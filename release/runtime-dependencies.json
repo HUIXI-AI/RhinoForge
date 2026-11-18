@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "op_abi_epoch": 1,
+  "op_abi_epoch": 2,
   "launch_kernel": {
     "commit": "3dd1b410f5f46373997fef3dfbf9b67eecec6a84",
     "version": "1.2.0",
@@ -11,13 +11,13 @@
   "artifacts": {
     "rhino_ops_main": {
       "path": "rhinoOpLib_current.ref",
-      "sha256": "306bd54a56bcf4106ca029adceabebb7446592c333805daf67528b77bcb46417",
-      "commit": "63ff35f902e3f34d7bac00afc04970b3115cd50b"
+      "sha256": "131626eead36cbeb7c51eb5a82846ebf387a5e6ae66c335ff32c874ff6e84068",
+      "commit": "90ad135160abd35b36390a31502cf0637a4ca745"
     },
     "rhino_ops_expansion": {
       "path": "rhinoExpansionOpLib_current.ref",
-      "sha256": "192cf67ccd8ebf88f38c1bbc295a961bad21068afce77de3fcd236b3361e84e8",
-      "commit": "f8d6b94b67d1be9416e35e79b5f8f94b03e7fab2"
+      "sha256": "6504f91511e0703189f80bd90d262134522ec1e888e459cdc10fffec730c59b8",
+      "commit": "70b460ed884a312d3e069770e1cca1694b6b346d"
     }
   }
 }

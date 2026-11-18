@@ -6,6 +6,7 @@ import subprocess
 
 import pytest
 
+from pi_wall_host_catalog import with_actual_linear_contracts
 from test_qwen3vl_prefill_gateup_launcher import definition
 
 
@@ -39,6 +40,8 @@ def test_prefill_manifest_and_dispatch(tmp_path):
                          ("ChunkInfo","FmbRouteManifestEntry","FmbPhysicalExecutionManifest"))
     predicate = definition(source,"bool qwen3vl_4b_prefill_swiglu(")
     predicate += "\n" + definition(source,"std::vector<int64_t> lingbot_prefill_gateup_arguments(")
+    predicate += "\n" + definition(source,"static std::vector<int64_t> qwen3vl_prefill_gateup_contract_arguments(")
+    predicate += "\n" + definition(source,"static std::vector<int64_t> qwen3vl_decode_gateup_contract_arguments(")
     emitter = definition(source,"void emit_qwen3vl_4b_prefill_mlp(")
     ring = definition(planner,"int64_t fmb_ring_all_reduce_route_selector(")
     member_ring = definition(source,"int64_t causal_ring_route(int64_t rows, int64_t cols) const")
@@ -80,10 +83,10 @@ struct Layout {bool is_causal=true,use_attn_mask=false;int64_t batch_size=1;
   AttentionExecutionPolicy attention_policy=AttentionExecutionPolicy::DDR_KV;};
 struct Context {
   FmbPhysicalExecutionManifest manifest_;mutable std::vector<uint8_t> consumed_;
+  const FmbPhysicalExecutionManifest& manifest()const{return manifest_;}
   Plan stage_plan;int64_t position=0,batch_size=1,seq_len=560;bool is_causal=true;
   AttentionExecutionPolicy attention_policy=AttentionExecutionPolicy::DDR_KV;
   std::optional<int> attention_mask;
-  const FmbPhysicalExecutionManifest& manifest() const {return manifest_;}
   __CONSUMER__
   void bind(FmbPhysicalExecutionManifest manifest) {
     std::sort(manifest.routes.begin(),manifest.routes.end(),[](const auto& a,const auto& b) {
@@ -137,17 +140,12 @@ struct Model {
   }
   // Ordinary Qwen prefill has no cold LingBot shared-A capability.
   bool lingbot_prefill_gateup_for_plan(const Plan&,int64_t,int64_t,bool,bool,int64_t,AttentionExecutionPolicy)const{return false;}
-  template<typename... Args> bool wall_base_fp16_shared_gateup_enabled(Args...) const {return false;}
-  template<typename... Args> bool wall_base_prefill_shared_input_enabled(Args...) const {return false;}
-  std::vector<int64_t> wall_base_fp16_shared_gateup_arguments(int64_t) const {
-    throw std::runtime_error("unexpected Wall route");
-  }
-  std::vector<int64_t> wall_base_prefill_shared_input_arguments(int64_t) const {
-    throw std::runtime_error("unexpected Wall route");
-  }
-  int64_t wall_base_prefill_shared_gateup_site() const {
-    throw std::runtime_error("unexpected Wall route");
-  }
+  // Wall-only capabilities cannot enter the ordinary Qwen profile.
+  template<class...A>bool wall_base_fp16_shared_gateup_enabled(A...)const{return false;}
+  template<class...A>bool wall_base_prefill_shared_input_enabled(A...)const{return false;}
+  std::vector<int64_t> wall_base_fp16_shared_gateup_arguments(int64_t)const{throw std::runtime_error("unexpected Wall route");}
+  std::vector<int64_t> wall_base_prefill_shared_input_arguments(int64_t)const{throw std::runtime_error("unexpected Wall route");}
+  int64_t wall_base_prefill_shared_gateup_site()const{throw std::runtime_error("unexpected Wall route");}
   __PREDICATE__
   // This harness isolates prefill; the decode sibling is executed with its
   // real predicate/manifest/emitter in test_qwen3vl_4b_decode_mlp.py.
@@ -179,7 +177,7 @@ void rejected(const std::function<void()>& operation,int emitted_count) {
 }
 int main() {
   LayerWeights weights;Layout layout;
-  // Real tail-bearing P560/C224, repeated C256 and single-chunk shapes.
+  // Real tail-bearing P560/C224, repeated C256 and all measured single shapes.
   for(const auto& lengths:std::vector<std::vector<int64_t>>{{224,224,112},{256,256},{16},{96},{112},{128},{224},{256}}) {
     Model m;Plan p=plan_for(lengths);m.context.stage_plan=p;
     int64_t total=0;for(auto n:lengths)total+=n;m.seq_len_=total;
@@ -189,7 +187,7 @@ int main() {
       emitted.clear();expected_rows=c.len;m.dispatch(weights,c);
       assert(emitted==std::vector<int>({1,2,3}));
       const auto& fusion=m.context.find_route(FmbRouteFamily::LINEAR,QWEN3VL_4B_PREFILL_GATEUP_SITE,c.idx);
-      assert(fusion.arguments==std::vector<int64_t>({c.len,9728,2560,8,320,112}));
+      assert(fusion.arguments==Model::qwen3vl_prefill_gateup_contract_arguments(c.len) && fusion.arguments.size()==12 && fusion.arguments[0]==2 && fusion.arguments[1]==c.len && fusion.arguments[2]==9728 && fusion.arguments[3]==2560 && fusion.arguments[4]==8);
       const auto& ring=m.context.find_route(FmbRouteFamily::ALL_REDUCE,QWEN3VL_4B_PREFILL_MLP_REDUCE_SITE,c.idx);
       assert(ring.selector==(c.len==16?1:2));
     }
@@ -250,8 +248,7 @@ int main() {
                        "EMITTER":emitter,"DISPATCH":dispatch}.items():
         program=program.replace(f"__{token}__",text)
     cpp,exe=tmp_path/"prefill_manifest.cpp",tmp_path/"prefill_manifest"
-    cpp.write_text(program)
-    compiled = subprocess.run([compiler,"-std=c++17","-Wall","-Wextra","-Werror",str(cpp),"-o",str(exe)],
-                              capture_output=True,text=True)
-    assert compiled.returncode == 0, compiled.stderr
+    cpp.write_text(with_actual_linear_contracts(program))
+    subprocess.run([compiler,"-std=c++17","-Wall","-Wextra","-Werror",str(cpp),"-o",str(exe)],
+                   check=True,capture_output=True,text=True)
     subprocess.run([str(exe)],check=True,capture_output=True,text=True)

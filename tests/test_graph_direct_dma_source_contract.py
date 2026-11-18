@@ -41,6 +41,7 @@ QUEUE_CACHE_GET_OWNERS = (
     ("src/ops/rpu_memcpy.cpp", "rpu_launch_ddr_spm_bytes_immediate"),
     ("src/ops/rpu_memcpy.cpp", "rpu_launch_ddr_scatter_spm_dma_immediate"),
     ("src/ops/rpu_memcpy.cpp", "rpu_launch_spm_scatter_ddr_dma_immediate"),
+    ("src/ops/rpu_memcpy.cpp", "rpu_launch_spm_scatter_rows_ddr_dma_immediate"),
     ("src/ops/rpu_memcpy.cpp", "rpu_launch_assembled_prefix_parts_dma_immediate"),
 )
 
@@ -89,6 +90,7 @@ ADD_BARRIER_OWNERS: dict[tuple[str, str], int] = {
     ("src/ops/rpu_memcpy.cpp", "rpu_launch_ddr_broadcast_spm_dma_immediate"): 2,
     ("src/ops/rpu_memcpy.cpp", "rpu_launch_ddr_scatter_spm_dma_immediate"): 2,
     ("src/ops/rpu_memcpy.cpp", "rpu_launch_spm_scatter_ddr_dma_immediate"): 2,
+    ("src/ops/rpu_memcpy.cpp", "rpu_launch_spm_scatter_rows_ddr_dma_immediate"): 2,
 }
 
 RAW_QUEUE_SDK_TOKEN_INVENTORY: dict[str, Counter[str]] = {
@@ -124,7 +126,7 @@ RAW_QUEUE_SDK_TOKEN_INVENTORY: dict[str, Counter[str]] = {
     "add_barrier": Counter(
         {
             "src/graph/graph_runtime_execute.cpp": 1,
-            "src/ops/rpu_memcpy.cpp": 18,
+            "src/ops/rpu_memcpy.cpp": 20,
         }
     ),
 }
@@ -287,7 +289,7 @@ def _c(**counts: int) -> Counter[str]:
     return Counter({aliases[name]: value for name, value in counts.items()})
 
 
-# Exact source-level inventory of public immediate DMA call sites.
+# Exact source-level inventory, including the explicit GELU-ERF operator.
 IMMEDIATE_CALLERS: dict[tuple[str, str], Counter[str]] = {
     ("src/ops/rpu_all_gather.cpp", "rpu_all_gather_test"): _c(
         ddr_scatter=1, spm_copy=1
@@ -311,6 +313,9 @@ IMMEDIATE_CALLERS: dict[tuple[str, str], Counter[str]] = {
         broadcast=1, spm_copy=1
     ),
     ("src/ops/rpu_eltwise_unary.cpp", "rpu_launch_eltwise_unary_kernel"): _c(
+        broadcast=1, spm_copy=1
+    ),
+    ("src/ops/rpu_eltwise_unary.cpp", "rpu_gelu_erf"): _c(
         broadcast=1, spm_copy=1
     ),
     ("src/ops/rpu_embedding.cpp", "rpu_gather_embedding"): _c(spm_copy=1),
@@ -347,12 +352,6 @@ IMMEDIATE_CALLERS: dict[tuple[str, str], Counter[str]] = {
     ),
     ("src/ops/rpu_l2norm.cpp", "rpu_l2norm_test"): _c(
         broadcast=1, spm_copy=1
-    ),
-    ("src/ops/rpu_linear.cpp", "tts_codec_im2col_rows"): _c(
-        broadcast=1, spm_copy=1
-    ),
-    ("src/ops/rpu_linear.cpp", "tts_codec_layernorm_rows"): _c(
-        broadcast=3, spm_copy=1
     ),
     ("src/ops/rpu_partial_mrope.cpp", "rpu_partial_mrope_test"): _c(
         broadcast=1, spm_copy=1, ddr_scatter=1, spm_scatter=1
@@ -475,8 +474,8 @@ def test_raw_queue_and_sdk_dma_surface_is_allowlisted() -> None:
         {
             "src/core/rpu_backend.cpp": 1,
             "src/core/rpu_kernel_cache.h": 1,
-            "src/ops/rpu_memcpy.cpp": 14,  # one new get plus failure-only clear
-            "src/graph/graph_runtime_execute.cpp": 2,  # one-shot get and failure eviction
+            "src/graph/graph_runtime_execute.cpp": 2,  # acquisition plus owned-queue eviction
+            "src/ops/rpu_memcpy.cpp": 15,  # one get per owner plus failure-only clear
         }
     )
     # Freeze the singleton expression itself, not only `.get` / `.clear`, so
@@ -491,8 +490,8 @@ def test_raw_queue_and_sdk_dma_surface_is_allowlisted() -> None:
     assert _count_by_file(sources, queue_cache_get.pattern) == Counter(
         {
             "src/core/rpu_kernel_cache.h": 1,
-            "src/ops/rpu_memcpy.cpp": 13,
             "src/graph/graph_runtime_execute.cpp": 1,
+            "src/ops/rpu_memcpy.cpp": 14,
         }
     )
     assert _count_by_file(
@@ -671,6 +670,7 @@ def test_direct_dma_guards_precede_every_side_effect() -> None:
         "rpu_launch_spm_local_shard_copy_dma",
         "rpu_launch_spm_gather_spm_dma",
         *IMMEDIATE_APIS,
+        "rpu_launch_spm_scatter_rows_ddr_dma_immediate",
         "rpu_launch_assembled_prefix_parts_dma_immediate",
     )
     sensitive = re.compile(
@@ -938,8 +938,8 @@ def test_immediate_dma_call_inventory_is_exact() -> None:
             +expected_bare
         ), api
 
-    assert sum(actual.values()) == 84
-    assert len(IMMEDIATE_CALLERS) == 39
+    assert sum(actual.values()) == 78
+    assert len(IMMEDIATE_CALLERS) == 37
     assert Counter(
         {
             api: sum(
@@ -951,8 +951,8 @@ def test_immediate_dma_call_inventory_is_exact() -> None:
         }
         ) == Counter(
         {
-            BROADCAST: 35,
-            SPM_COPY: 32,
+            BROADCAST: 31,
+            SPM_COPY: 30,
             BYTE_COPY: 2,
             DDR_SCATTER: 9,
             SPM_SCATTER: 6,
@@ -975,3 +975,21 @@ def test_assembled_prefix_batch_is_internal_and_failure_cleanup_is_bounded():
     assert body.count("submit_immediate_batch(") == 1
     assert body.index("catch (...)") < body.index("QueueCache::instance().clear()") < body.index("throw;")
     assert not re.search(r"\b(?:rpu_ddr_flush_force|set_ddr_flush|set_ddr_flush_force)\b", body)
+
+
+def test_row_scatter_is_internal_to_the_eager_m1_column_writeback():
+    sources = _sources()
+    helper = "rpu_launch_spm_scatter_rows_ddr_dma_immediate"
+    assert _count_by_file(sources, rf"\b{helper}\b") == Counter(
+        {
+            "src/core/rpu_kernel_decls.h": 1,
+            "src/ops/rpu_linear.cpp": 1,
+            "src/ops/rpu_memcpy.cpp": 1,
+        }
+    )
+    _, begin, end = _function_span(sources["src/ops/rpu_linear.cpp"], "rpu_launch_linear_ddr_kernel")
+    assert helper in sources["src/ops/rpu_linear.cpp"][begin:end]
+    _, begin, end = _function_span(sources["src/ops/rpu_memcpy.cpp"], helper)
+    body = sources["src/ops/rpu_memcpy.cpp"][begin:end]
+    assert "TORCH_CHECK(!graph_dma::active()" in body
+    assert body.count("submit_immediate_batch(") == 1

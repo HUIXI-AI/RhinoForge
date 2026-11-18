@@ -1,22 +1,34 @@
-[example]
+# 未写出的执行参数（省略即按以下值运行）：
+#   [cpu].threads 省略时本入口使用 8。
+#   rpu_execution.model.num_cores 固定 8 核（可显式写 8；4/6 核不支持，原因见模型页配置表）。
+[model]
 profile_id = "g05-base.fp16.k1-rtc-fm"
 registry_alias = "g05-base"
 target = "g05"
-dtype = "fp16"
+precision = "fp16"
+# 替换为匹配本模型与量化配方的本地资产路径或既有权重别名。
+checkpoint = "/path/to/vla_rtc_release/checkpoint"
+# 替换为匹配本模型与量化配方的本地资产路径或既有权重别名。
+release_root = "/path/to/vla_rtc_release"
 
-[example.opt_in]
+[model.opt_in]
 
 [input]
-checkpoint = "/path/to/vla_rtc_release/checkpoint"
-release_root = "/path/to/vla_rtc_release"
+# 替换为匹配下列输入形状的文件；固定 fixture 须保留其身份与格式。
 batch = "/path/to/g05_k1_rtc_batch.pt"
+# 固定随机种子；更改会改变输入噪声。
 seed = 7
 
 [run]
+# 预热次数；不计入正式测量。
 warmup = 2
-runs = 3
+# 正式执行次数，正整数。
+runs = 5
+# 按需开启硬件采样；保持 false 可减少测量干扰。
 hwperf = false
+# 按需开启 profiler；正式计时建议保持 false。
 profile = false
+# 随机种子，非负整数。
 seed = 7
 
 [rpu_execution]
@@ -26,14 +38,26 @@ seed = 7
 [rpu_execution.components.vision_encoder]
 
 [rpu_execution.components.vision_encoder.vision]
+# Vision 分块行数。可选 "auto"（默认）或 16 的倍数整数；不补齐行。
+# auto：由原生 planner 按图像 patch 数与本模型的核数选择。
+# 2026-10-19 模板默认输入实测：8 核均为 256。
+# 实际值记录在结果 report.json 的执行计划中（compute_chunk）。
 chunk_size = "auto"
 
 [rpu_execution.components.language_model]
 
 [rpu_execution.components.language_model.prefill]
+# prefill 分块行数。可选 "auto"（默认）或满足本组件形状限制的 16 的倍数整数。
+# auto：由原生 planner 按实际输入行数选择。
+# 2026-10-19 模板默认输入实测：8 核均为 256。
+# 实际值记录在结果 report.json 的执行计划中（compute_chunk）。
 chunk_size = "auto"
 
 [rpu_execution.components.action_expert]
 
 [rpu_execution.components.action_expert.action]
+# action 分块行数。可选 "auto"（默认）或满足本组件形状限制的 16 的倍数整数。
+# auto：由原生 planner 按实际输入行数选择。
+# 2026-10-19 模板默认输入实测：8 核均为 32。
+# 实际值记录在结果 report.json 的执行计划中（compute_chunk）。
 chunk_size = "auto"

@@ -35,7 +35,6 @@
 using namespace at;
 using namespace ::rhino_lkn;
 
-#define NUM_CORES 8
 #define DWIDTH 2
 
 namespace v3 {
@@ -122,6 +121,11 @@ private:
                     " tensors, got ", k_caches.size(), " and ", v_caches.size());
         const int64_t min_blocks =
             (std::max(memory_len_, predict_size_) + 15) / 16;
+        // RPUCache keeps eight physical KV stripes; four lanes fold two
+        // heads per stripe group into the third dimension.
+        const int64_t kv_head_vx =
+            num_kv_heads() * DecoderExecutionTopology::physical_kv_cores /
+            attn_tp() / DecoderExecutionTopology::physical_kv_cores;
         for (int64_t i = 0; i < num_layers(); ++i) {
             const auto& kc = k_caches[i];
             const auto& vc = v_caches[i];
@@ -130,11 +134,12 @@ private:
             TORCH_CHECK(kc.dim() == 7 && vc.dim() == 7 &&
                         kc.sizes() == vc.sizes() &&
                         kc.size(0) == batch && kc.size(1) >= min_blocks &&
-                        kc.size(2) == 1 && kc.size(3) == 3 &&
+                        kc.size(2) == kv_head_vx && kc.size(3) == 3 &&
                         kc.size(4) == 8 && kc.size(5) == 16 && kc.size(6) == 16,
                         "navdp: cache[", i,
                         "] must use 7D RPUCache topology [", batch,
-                        ", >=", min_blocks, ", 1, 3, 8, 16, 16], got k=",
+                        ", >=", min_blocks, ", ", kv_head_vx,
+                        ", 3, 8, 16, 16], got k=",
                         kc.sizes(), " v=", vc.sizes());
             TORCH_CHECK(kc.scalar_type() == at::kHalf &&
                         vc.scalar_type() == at::kHalf &&
@@ -552,11 +557,11 @@ protected:
         const KvInsertSegmentPlan self_kv_plan =
             resolve_kvinsert_plan_auto(
                 kNavdpSelfKvSite, manifest.graph_lifecycle,
-                /*position=*/0, predict_size_, predict_size_, NUM_CORES,
+                /*position=*/0, predict_size_, predict_size_, num_cores(),
                 num_kv_heads(), head_dim(), kNavdpKvCapabilities);
         const KvInsertRouteArguments self_kv_arguments =
             rpu_kvinsert_route_arguments(
-                self_kv_plan, NUM_CORES, num_kv_heads(), head_dim());
+                self_kv_plan, num_cores(), num_kv_heads(), head_dim());
         append(
             FmbRouteFamily::KV_INSERT, kNavdpSelfKvSite,
             static_cast<int64_t>(self_kv_plan.route()), /*flags=*/0,
@@ -565,11 +570,11 @@ protected:
         const KvInsertSegmentPlan cross_kv_plan =
             resolve_kvinsert_plan_auto(
                 kNavdpCrossKvSite, manifest.graph_lifecycle,
-                /*position=*/0, memory_len_, memory_len_, NUM_CORES,
+                /*position=*/0, memory_len_, memory_len_, num_cores(),
                 num_kv_heads(), head_dim(), kNavdpKvCapabilities);
         const KvInsertRouteArguments cross_kv_arguments =
             rpu_kvinsert_route_arguments(
-                cross_kv_plan, NUM_CORES, num_kv_heads(), head_dim());
+                cross_kv_plan, num_cores(), num_kv_heads(), head_dim());
         append(
             FmbRouteFamily::KV_INSERT, kNavdpCrossKvSite,
             static_cast<int64_t>(cross_kv_plan.route()), /*flags=*/0,
@@ -579,17 +584,17 @@ protected:
         append_linear(kNavdpProjectionLinearSite);
         append(
             FmbRouteFamily::ALL_REDUCE, kNavdpSelfAllReduceSite,
-            fmb_ring_all_reduce_route_selector(physical_len, hidden_size()));
+            fmb_ring_all_reduce_route_selector(physical_len, hidden_size(), num_cores()));
         append(
             FmbRouteFamily::ALL_REDUCE,
             former_mode_ ? kNavdpFormerCrossAllReduceSite
                          : kNavdpCrossAllReduceSite,
-            fmb_ring_all_reduce_route_selector(physical_len, hidden_size()));
+            fmb_ring_all_reduce_route_selector(physical_len, hidden_size(), num_cores()));
         append(
             FmbRouteFamily::ALL_REDUCE,
             former_mode_ ? kNavdpFormerFfAllReduceSite
                          : kNavdpFfAllReduceSite,
-            fmb_ring_all_reduce_route_selector(physical_len, hidden_size()));
+            fmb_ring_all_reduce_route_selector(physical_len, hidden_size(), num_cores()));
 
         if (loop_mode_) {
             const int64_t action_dim_padded =
@@ -626,7 +631,8 @@ protected:
             }
         }
         append_fmb_shared_runtime_routes(
-            manifest, plan, hidden_size(), FMB_SHARED_LAYER_INPUT_DMA);
+            manifest, plan, hidden_size(), FMB_SHARED_LAYER_INPUT_DMA,
+            /*compute_row_multiplier=*/1, num_cores(), mlp_tp());
         return manifest;
     }
 
@@ -674,7 +680,8 @@ protected:
         const FmbThreeStageChunkPlan& plan,
         const LayoutContext& layout,
         int64_t position) const override {
-        if (!spm_kv_by_mha_enabled_ || former_mode_ || position != 0 ||
+        if (!spm_kv_by_mha_enabled_ || num_cores() != 8 || former_mode_ ||
+            position != 0 ||
             !layout.is_causal || layout.use_attn_mask ||
             layout.batch_size != 1 ||
             layout.attention_policy !=
@@ -710,7 +717,7 @@ protected:
             action_dim_ == kActionDim &&
             sdpa_by_mha_spm_is_valid(
                 batch_, predict_size_, predict_size_,
-                num_q_heads(), num_kv_heads(), head_dim(), NUM_CORES,
+                num_q_heads(), num_kv_heads(), head_dim(), num_cores(),
                 /*MASK_LTM=*/1);
     }
 
@@ -721,8 +728,8 @@ protected:
         const int64_t hd = head_dim();
         const int64_t FF = intermediate_size();
         const int64_t S  = memory_len_;
-        const int64_t local_qhd   = (nq * hd) / NUM_CORES;
-        const int64_t local_inter = FF / NUM_CORES;
+        const int64_t local_qhd   = (nq * hd) / num_cores();
+        const int64_t local_inter = FF / num_cores();
         const int64_t kv_seq = std::max<int64_t>(cs, S);
         auto A = [](int64_t bytes) -> int64_t { return Align(bytes, 256); };
 
@@ -767,7 +774,8 @@ protected:
             d.storage = StorageClass::PersistentPerLayer; d.per_layer = nl; d.scope = ALL;
             d.preload_callback = [this, field](FusedModelBase&, int L, uint32_t a0) {
                 rpu_launch_ddr_broadcast_spm_dma(
-                    (layer_weights_[L].*field).data_ptr<c10::Half>(), hidden_size(), a0);
+                    (layer_weights_[L].*field).data_ptr<c10::Half>(), hidden_size(), a0,
+                    num_cores());
             };
             v.push_back(d);
         };
@@ -782,7 +790,7 @@ protected:
             d.preload_callback = [this, per_core, field](FusedModelBase&, int L, uint32_t a0) {
                 rpu_launch_ddr_scatter_spm_dma(
                     (layer_weights_[L].*field).data_ptr<c10::Half>(),
-                    per_core, per_core * DWIDTH, a0, NUM_CORES);
+                    per_core, per_core * DWIDTH, a0, num_cores());
             };
             v.push_back(d);
         };
@@ -790,7 +798,7 @@ protected:
             BufferDecl d; d.name = name; d.size = A(h * DWIDTH);
             d.storage = StorageClass::PersistentPerLayer; d.per_layer = nl; d.scope = ALL;
             d.preload_callback = [this, field](FusedModelBase&, int L, uint32_t a0) {
-                rpu_launch_memset_spm_multicore(a0, hidden_size());
+                rpu_launch_memset_spm_multicore(a0, hidden_size(), num_cores());
                 rpu_launch_ddr_broadcast_spm_dma(
                     (layer_weights_[L].*field).data_ptr<c10::Half>(), hidden_size(), a0, /*num_cores=*/1);
             };
@@ -831,7 +839,7 @@ protected:
                         static_cast<int64_t>(NavdpDmaRoute::DDR_TO_SPM),
                         /*resolved_flags=*/0, {num_steps_, nelem},
                         route_invocation);
-                    rpu_launch_ddr_broadcast_spm_dma((this->*f).data_ptr<c10::Half>(), nelem, a0, NUM_CORES);
+                    rpu_launch_ddr_broadcast_spm_dma((this->*f).data_ptr<c10::Half>(), nelem, a0, num_cores());
                 };
                 v.push_back(d);
             };
@@ -857,7 +865,7 @@ protected:
                 kNavdpLoopInitialStateDmaSite,
                 static_cast<int64_t>(NavdpDmaRoute::DDR_TO_SPM),
                 /*resolved_flags=*/0, {batch_, predict_size_, AD});
-            rpu_launch_ddr_broadcast_spm_dma_mutable(&x0_src_base_, 0, PS*AD, addr(0,"na_spm"), NUM_CORES);
+            rpu_launch_ddr_broadcast_spm_dma_mutable(&x0_src_base_, 0, PS*AD, addr(0,"na_spm"), num_cores());
         }
         // [A2] input_embed: na_spm[PS,AD] → ae_spm[PS,H] (single-core, K=AD) + bias; add out_pos.
         ctx().consume_physical_route(
@@ -869,14 +877,14 @@ protected:
         for (int64_t b = 0; b < batch_; ++b) {   // out_pos [PSc,h] added to each trajectory's ae block
             const uint32_t ob = static_cast<uint32_t>(b * PSc * h * DWIDTH);
             rpu_launch_eltwise_binary_spm_kernel(addr(0,"ae_spm")+ob, addr(0,"outpos_spm"), addr(0,"ae_spm")+ob,
-                PSc*h, ValuOpType::ADD, c10::Half(1.0), NUM_CORES);
+                PSc*h, ValuOpType::ADD, c10::Half(1.0), num_cores());
         }
         // [A3] memory row i → "memory" SPM (mutable, per-iter offset).
         ctx().consume_physical_route(
             FmbRouteFamily::MUTABLE_DMA, kNavdpLoopMemoryDmaSite,
             static_cast<int64_t>(NavdpDmaRoute::DDR_TO_SPM),
             /*resolved_flags=*/0, {num_steps_, memory_len_, h});
-        rpu_launch_ddr_broadcast_spm_dma_mutable(&mem_all_src_base_, i*S*h*DWIDTH, S*h, addr(0,"memory"), NUM_CORES);
+        rpu_launch_ddr_broadcast_spm_dma_mutable(&mem_all_src_base_, i*S*h*DWIDTH, S*h, addr(0,"memory"), num_cores());
         mem_loaded_this_forward_ = true;   // suppress the body's own memory broadcast
         // [A4] ae_spm → na_stage_ DDR (layer-0 reads it via FMB hidden_in_src_base_).
         rpu_launch_spm_copy_ddr_dma(addr(0,"ae_spm"), na_stage_.data_ptr<c10::Half>(), PS*h);
@@ -901,27 +909,27 @@ protected:
         // [Z3] DDPM affine: x0 = clip(A*na + B*eps, -1,1);  na = C*x0 + D*na;  na += sig*z (i<N-1).
         //   x0 = na + (B/A)*eps ; x0 *= A ; x0 = clip(x0, 1.0)
         rpu_launch_eltwise_binary_spm_kernel(addr(0,"na_spm"), addr(0,"eps_spm"), addr(0,"x0_spm"),
-            PS*AD, ValuOpType::ADD, c10::Half(B_/A_), NUM_CORES);
+            PS*AD, ValuOpType::ADD, c10::Half(B_/A_), num_cores());
         rpu_launch_eltwise_binary_scalar_spm_kernel(addr(0,"x0_spm"), c10::Half(A_), addr(0,"x0_spm"),
-            PS*AD, ValuOpType::MUL);
+            PS*AD, ValuOpType::MUL, num_cores());
         rpu_launch_eltwise_binary_scalar_spm_kernel(addr(0,"x0_spm"), c10::Half(1.0), addr(0,"x0_spm"),
-            PS*AD, ValuOpType::MIN);   // clamp upper +1
+            PS*AD, ValuOpType::MIN, num_cores());   // clamp upper +1
         rpu_launch_eltwise_binary_scalar_spm_kernel(addr(0,"x0_spm"), c10::Half(-1.0), addr(0,"x0_spm"),
-            PS*AD, ValuOpType::MAX);   // clamp lower -1  (CLIP scalar is one-sided → need both)
+            PS*AD, ValuOpType::MAX, num_cores());   // clamp lower -1  (CLIP scalar is one-sided → need both)
         //   na = x0 + (D/C)*na ; na *= C
         rpu_launch_eltwise_binary_spm_kernel(addr(0,"x0_spm"), addr(0,"na_spm"), addr(0,"na_spm"),
-            PS*AD, ValuOpType::ADD, c10::Half(D_/C_), NUM_CORES);
+            PS*AD, ValuOpType::ADD, c10::Half(D_/C_), num_cores());
         rpu_launch_eltwise_binary_scalar_spm_kernel(addr(0,"na_spm"), c10::Half(C_), addr(0,"na_spm"),
-            PS*AD, ValuOpType::MUL);
+            PS*AD, ValuOpType::MUL, num_cores());
         if (i < num_steps_ - 1) {
             ctx().consume_physical_route(
                 FmbRouteFamily::MUTABLE_DMA, kNavdpLoopNoiseDmaSite,
                 static_cast<int64_t>(NavdpDmaRoute::DDR_TO_SPM),
                 /*resolved_flags=*/0,
                 {num_steps_, batch_, predict_size_, AD});
-            rpu_launch_ddr_broadcast_spm_dma_mutable(&sigz_src_base_, i*PS*AD*DWIDTH, PS*AD, addr(0,"sigz_spm"), NUM_CORES);
+            rpu_launch_ddr_broadcast_spm_dma_mutable(&sigz_src_base_, i*PS*AD*DWIDTH, PS*AD, addr(0,"sigz_spm"), num_cores());
             rpu_launch_eltwise_binary_spm_kernel(addr(0,"na_spm"), addr(0,"sigz_spm"), addr(0,"na_spm"),
-                PS*AD, ValuOpType::ADD, c10::Half(1.0), NUM_CORES);
+                PS*AD, ValuOpType::ADD, c10::Half(1.0), num_cores());
         }
         // [Z4] last iter: na_spm → out DDR.
         if (i == num_steps_ - 1) {
@@ -941,13 +949,13 @@ protected:
         const int64_t hd  = head_dim();
         const int64_t FF  = intermediate_size();
         const int64_t S   = memory_len_;
-        const int64_t li  = FF / NUM_CORES;
+        const int64_t li  = FF / num_cores();
         const double scale = 1.0 / std::sqrt(static_cast<double>(hd));
         // Trajectory batching: batch folded into seq (M=seq for all row-wise ops), but the two
         // attentions run per-trajectory (block-diagonal) over PSb-row slices + own KV-cache batch-slice.
         // B==1 (serial: seq==predict_size_, or seq not a multiple) → single narrow(0,0,1) iter,
         // byte-identical to the unbatched path. local_qhd = per-core q/k/v width.
-        const int64_t local_qhd = (nq * hd) / NUM_CORES;
+        const int64_t local_qhd = (nq * hd) / num_cores();
         const int64_t B    = (predict_size_ > 0 && seq > predict_size_ && seq % predict_size_ == 0)
                              ? seq / predict_size_ : 1;
         const int64_t PSb  = seq / B;
@@ -983,7 +991,7 @@ protected:
                 /*resolved_flags=*/0, {memory_len_, hidden_size()},
                 chunk.idx);
             rpu_launch_ddr_broadcast_spm_dma_mutable(
-                &mem_src_base_, /*src_offset_bytes=*/0, S * h, addr(0, "memory"), NUM_CORES);
+                &mem_src_base_, /*src_offset_bytes=*/0, S * h, addr(0, "memory"), num_cores());
             mem_loaded_this_forward_ = true;
         }
         if (!ctx().input_in_spm) emit_layer_input_dma(layer_idx, chunk, "residual");
@@ -1011,7 +1019,7 @@ protected:
             const uint32_t o = static_cast<uint32_t>(b) * qrow;
             rpu_launch_insert_kvcache_spm_unified_with_plan(
                 kcb, vcb, addr_offset("k").value + o,
-                addr_offset("v").value + o, nq, hd, NUM_CORES,
+                addr_offset("v").value + o, nq, hd, num_cores(),
                 /*k_cache_batch_offset_elems=*/0,
                 /*v_cache_batch_offset_elems=*/0, /*spm_rows=*/0,
                 self_kv_plan);
@@ -1026,7 +1034,8 @@ protected:
                 rpu_launch_sdpa_spm_unified_kernel_v2(
                     kcb, vcb, self_mask, scale,
                     addr_offset("q").value + o, addr_offset("sdpa_out").value + o, addr_offset("sdpa_tmp").value, 0,
-                    PSb, nq, nq, hd, /*kv_seq_len=*/PSb, NUM_CORES, NUM_CORES);
+                    PSb, nq, nq, hd, /*kv_seq_len=*/PSb, num_cores(),
+                    DecoderExecutionTopology::physical_kv_cores);
             }
         }
         if (ctx().attention_policy ==
@@ -1044,19 +1053,19 @@ protected:
                 {batch_, predict_size_, seq}, chunk.idx);
             rpu_launch_v_transpose_spm(
                 addr(0, "v"), addr(0, "sdpa_tmp"), B, PSb, nq, hd,
-                NUM_CORES);
+                num_cores());
             rpu_launch_sdpa_by_mha_spm(
                 addr(0, "q"), addr(0, "k"), addr(0, "sdpa_tmp"),
                 addr(0, "sdpa_out"), /*mask_spm=*/0, self_mask, scale,
-                B, PSb, PSb, nq, nq, hd, NUM_CORES);
+                B, PSb, PSb, nq, nq, hd, num_cores());
         }
         proj(addr(0, "sdpa_out"), lw.so_w, addr(0, "oproj"), seq, h, nq * hd, 0, layer_addr(layer_idx, 0, "so_bias"));
         ctx().consume_physical_route(
             FmbRouteFamily::ALL_REDUCE, kNavdpSelfAllReduceSite,
-            fmb_ring_all_reduce_route_selector(seq, h),
+            fmb_ring_all_reduce_route_selector(seq, h, num_cores()),
             /*resolved_flags=*/0, {}, chunk.idx);
         rpu_launch_all_reduce_sum_residual_kernel(
-            addr(0, "oproj"), addr(0, "residual"), addr(0, "acc"), seq, h, NUM_CORES, NUM_CORES);  // acc = reduce+x
+            addr(0, "oproj"), addr(0, "residual"), addr(0, "acc"), seq, h, num_cores(), num_cores());  // acc = reduce+x
         if (former_mode_)    // POST-LN: x = norm1(x + self_attn) → into "residual"
             layernorm(addr(0, "acc"), addr(0, "residual"),
                       layer_addr(layer_idx, 0, "n1w"), layer_addr(layer_idx, 0, "n1b"), seq, h);
@@ -1078,7 +1087,7 @@ protected:
             kNavdpCrossKvSite, /*position=*/0, S);
         rpu_launch_insert_kvcache_spm_unified_with_plan(
             kc_x, vc_x, addr_offset("k").value,
-            addr_offset("v").value, nq, hd, NUM_CORES,
+            addr_offset("v").value, nq, hd, num_cores(),
             /*k_cache_batch_offset_elems=*/0,
             /*v_cache_batch_offset_elems=*/0, /*spm_rows=*/0,
             cross_kv_plan);
@@ -1093,26 +1102,27 @@ protected:
             rpu_launch_sdpa_spm_unified_kernel_v2(
                 kc_x, vc_x, /*mask_type=*/0 /*none — attend all memory*/, scale,
                 addr_offset("q").value + o, addr_offset("sdpa_out").value + o, addr_offset("sdpa_tmp").value, 0,
-                PSb, nq, nq, hd, /*kv_seq_len=*/S, NUM_CORES, NUM_CORES);
+                PSb, nq, nq, hd, /*kv_seq_len=*/S, num_cores(),
+                DecoderExecutionTopology::physical_kv_cores);
         }
         proj(addr(0, "sdpa_out"), lw.co_w, addr(0, "oproj"), seq, h, nq * hd, 0, layer_addr(layer_idx, 0, "co_bias"));
         if (former_mode_) {   // POST-LN: x = norm2(x + cross_attn) → "residual"
             ctx().consume_physical_route(
                 FmbRouteFamily::ALL_REDUCE,
                 kNavdpFormerCrossAllReduceSite,
-                fmb_ring_all_reduce_route_selector(seq, h),
+                fmb_ring_all_reduce_route_selector(seq, h, num_cores()),
                 /*resolved_flags=*/0, {}, chunk.idx);
             rpu_launch_all_reduce_sum_residual_kernel(
-                addr(0, "oproj"), x2, addr(0, "acc"), seq, h, NUM_CORES, NUM_CORES);
+                addr(0, "oproj"), x2, addr(0, "acc"), seq, h, num_cores(), num_cores());
             layernorm(addr(0, "acc"), addr(0, "residual"),
                       layer_addr(layer_idx, 0, "n2w"), layer_addr(layer_idx, 0, "n2b"), seq, h);
         } else {
             ctx().consume_physical_route(
                 FmbRouteFamily::ALL_REDUCE, kNavdpCrossAllReduceSite,
-                fmb_ring_all_reduce_route_selector(seq, h),
+                fmb_ring_all_reduce_route_selector(seq, h, num_cores()),
                 /*resolved_flags=*/0, {}, chunk.idx);
             rpu_launch_all_reduce_sum_residual_kernel(
-                addr(0, "oproj"), addr(0, "acc"), addr(0, "residual"), seq, h, NUM_CORES, NUM_CORES);
+                addr(0, "oproj"), addr(0, "acc"), addr(0, "residual"), seq, h, num_cores(), num_cores());
         }
         // ---- sub-block 3: FFN (GELU/navdp | ReLU/former) ----  (both x now in "residual")
         if (!former_mode_)
@@ -1122,33 +1132,34 @@ protected:
         proj(ff_in, lw.ff1_w, addr(0, "ff_mid"), seq, FF, h, 1, layer_addr(layer_idx, 0, "ff1_bias"));
         if (former_mode_)   // ReLU = max(x, 0)
             rpu_launch_eltwise_binary_scalar_spm_kernel(
-                addr(0, "ff_mid"), c10::Half(0.0), addr(0, "ff_mid"), seq * li, ValuOpType::MAX);
+                addr(0, "ff_mid"), c10::Half(0.0), addr(0, "ff_mid"), seq * li, ValuOpType::MAX,
+                num_cores());
         else
             rpu_launch_eltwise_unary_spm_kernel(
                 addr(0, "ff_mid"), addr(0, "ff_mid"), seq * li,
-                ValuOpType::ADD, GeluMode::ERF, NUM_CORES);
+                ValuOpType::ADD, GeluMode::ERF, num_cores());
         proj(addr(0, "ff_mid"), lw.ff2_w, addr(0, "oproj"), seq, h, FF, 0, layer_addr(layer_idx, 0, "ff2_bias"));
         if (former_mode_) {   // POST-LN: x = norm3(x + ff) → "residual"
             ctx().consume_physical_route(
                 FmbRouteFamily::ALL_REDUCE,
                 kNavdpFormerFfAllReduceSite,
-                fmb_ring_all_reduce_route_selector(seq, h),
+                fmb_ring_all_reduce_route_selector(seq, h, num_cores()),
                 /*resolved_flags=*/0, {}, chunk.idx);
             rpu_launch_all_reduce_sum_residual_kernel(
-                addr(0, "oproj"), addr(0, "residual"), addr(0, "acc"), seq, h, NUM_CORES, NUM_CORES);
+                addr(0, "oproj"), addr(0, "residual"), addr(0, "acc"), seq, h, num_cores(), num_cores());
             layernorm(addr(0, "acc"), addr(0, "residual"),
                       layer_addr(layer_idx, 0, "n3w"), layer_addr(layer_idx, 0, "n3b"), seq, h);
         } else {
             ctx().consume_physical_route(
                 FmbRouteFamily::ALL_REDUCE, kNavdpFfAllReduceSite,
-                fmb_ring_all_reduce_route_selector(seq, h),
+                fmb_ring_all_reduce_route_selector(seq, h, num_cores()),
                 /*resolved_flags=*/0, {}, chunk.idx);
             rpu_launch_all_reduce_sum_residual_kernel(
                 addr(0, "oproj"), addr(0, "residual"), addr(0, "acc"),
-                seq, h, NUM_CORES, NUM_CORES);
+                seq, h, num_cores(), num_cores());
             rpu_launch_eltwise_binary_scalar_spm_kernel(
                 addr(0, "acc"), c10::Half(0.0), addr(0, "residual"),
-                seq * h, ValuOpType::ADD);
+                seq * h, ValuOpType::ADD, num_cores());
         }
 
         if (!ctx().output_to_spm && (loop_mode_ || former_mode_))
@@ -1176,14 +1187,14 @@ private:
         const FmbRouteManifestEntry& route = ctx().find_physical_route(
             FmbRouteFamily::KV_INSERT, site_id, invocation);
         const KvInsertSegmentPlan plan = restore_kvinsert_plan(
-            site_id, route.arguments, NUM_CORES, num_kv_heads(), head_dim());
+            site_id, route.arguments, num_cores(), num_kv_heads(), head_dim());
         const KvInsertSegmentPlan shape_plan = rpu_resolve_kvinsert_segment_plan(
-            position, logical_rows, logical_rows, NUM_CORES,
+            position, logical_rows, logical_rows, num_cores(),
             num_kv_heads(), head_dim(), kNavdpKvCapabilities,
             plan.route());
         const KvInsertRouteArguments canonical =
             rpu_kvinsert_route_arguments(
-                shape_plan, NUM_CORES, num_kv_heads(), head_dim());
+                shape_plan, num_cores(), num_kv_heads(), head_dim());
         TORCH_CHECK(
             plan.logical_rows() == logical_rows &&
                 plan.physical_rows() == logical_rows &&
@@ -1204,7 +1215,7 @@ private:
 
     // affine LayerNorm: (x-mean)/std * gamma + beta.
     void layernorm(uint32_t src, uint32_t dst, uint32_t gamma, uint32_t beta, int64_t seq, int64_t h) {
-        rpu_launch_layernorm_spm_kernel(src, dst, gamma, beta, seq, h, eps_, false, 0, NUM_CORES);
+        rpu_launch_layernorm_spm_kernel(src, dst, gamma, beta, seq, h, eps_, false, 0, num_cores());
     }
     // linear (partition 1=col, 0=row) + bias.
     void proj(uint32_t in, const at::Tensor& w, uint32_t out, int64_t M, int64_t Nout, int64_t K,
@@ -1214,7 +1225,7 @@ private:
             static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
             /*resolved_flags=*/0, {}, ctx().physical_route_invocation);
         rpu_launch_linear_spm_to_spm_acc16_kernel(
-            in, w, out, M, Nout, K, partition, NUM_CORES, bias_addr, at::Tensor());
+            in, w, out, M, Nout, K, partition, num_cores(), bias_addr, at::Tensor());
     }
 
     std::vector<int64_t> kvinsert_cost_weight_identity() const override {
@@ -1269,6 +1280,46 @@ private:
     bool    glue_ready_ = false;
     ExecutionMode execution_mode_ = ExecutionMode::Unset;
 public:
+    // ========================================================================
+    // Cold execution topology. Must precede set_weights: the Python adapter
+    // swizzles every Linear for this count before installation. Eight keeps
+    // the historical layout. Four admits only the exact NavDP and Former
+    // profiles (8 heads x D48, H384): attention, FFN and every replicated
+    // norm/eltwise kernel run on the same four cores (2 heads, 96 q/k/v
+    // channels and 384 or 512 FFN channels per core). Raw-SPM self attention
+    // stays eight-core only, so four cores use the DDR KV route. KV storage
+    // keeps eight stripes.
+    // ========================================================================
+    void set_execution_cores(int64_t cores) {
+        TORCH_CHECK(cores == 4 || cores == 8,
+                    "NavDP execution cores must be 4 or 8");
+        TORCH_CHECK(!weights_set_ && execution_mode_ == ExecutionMode::Unset,
+                    "NavDP execution cores must precede weights or dispatch");
+        set_execution_core_count(static_cast<int>(cores));
+    }
+
+    std::vector<int64_t> execution_topology() const {
+        TORCH_CHECK(weights_set_,
+                    "NavDP topology requires installed model weights");
+        return {num_cores(), attn_tp(), mlp_tp(),
+                DecoderExecutionTopology::physical_kv_cores,
+                num_q_heads(), intermediate_size()};
+    }
+
+    DecoderExecutionTopology resolve_model_execution_topology(
+            int64_t nq, int64_t nkv, int64_t hd, int64_t h,
+            int64_t intermediate) const override {
+        if (num_cores() == 8)
+            return FusedModelBase::resolve_model_execution_topology(
+                nq, nkv, hd, h, intermediate);
+        const int64_t ff = former_mode_ ? kFormerFf : kNavdpFf;
+        TORCH_CHECK(num_cores() == 4 && nq == kNumHeads && nkv == kNumHeads &&
+                        hd == kHeadDim && h == kHidden && intermediate == ff,
+                    "no admitted reduced-core NavDP profile: 4 cores require "
+                    "8 heads, D48, H384 and FF1536 (NavDP) or FF2048 (Former)");
+        return {4, 4, 4};
+    }
+
     void configure_cold_routes(bool spm_kv_by_mha) {
         TORCH_CHECK(!weights_set_ && execution_mode_ == ExecutionMode::Unset,
                     "navdp cold routes must be configured before weights or dispatch");
@@ -1472,6 +1523,16 @@ int64_t rpu_navdp_create(bool allow_numeric_blocked, bool spm_kv_by_mha) {
 void    rpu_navdp_destroy(int64_t handle) { NavdpRegistry::destroy(handle, "rpu_navdp_destroy"); }
 void    rpu_navdp_set_former_mode(int64_t handle, bool former) {
     NavdpRegistry::get(handle, "rpu_navdp")->set_former_mode(former);
+}
+
+void rpu_navdp_set_execution_core_count(int64_t handle, int64_t cores) {
+    NavdpRegistry::get(handle, "rpu_navdp_set_execution_core_count")
+        ->set_execution_cores(cores);
+}
+
+std::vector<int64_t> rpu_navdp_get_execution_topology(int64_t handle) {
+    return NavdpRegistry::get(handle, "rpu_navdp_get_execution_topology")
+        ->execution_topology();
 }
 
 void rpu_navdp_set_weights(

@@ -1,4 +1,4 @@
-"""CPU FP32 strict loading for the frozen Base checkpoint; never opens an device."""
+"""Strict CPU FP32 loading for the reviewed Base checkpoints."""
 from __future__ import annotations
 
 import hashlib
@@ -9,26 +9,36 @@ import json
 from pathlib import Path
 import sys
 
-from ._manifest import CHECKPOINT_HASHES, CHECKPOINT_REVISION, SOURCE_REVISION
+from ._manifest import CHECKPOINT_PROFILES, SOURCE_REVISION
 from .source import sha256, verify_source
 
 
 def preflight(checkpoint: str | Path, source: str | Path) -> dict:
     """Validate source, dependency and all checkpoint identities before model import."""
     source = verify_source(source)
-    if importlib.metadata.version("transformers") != "5.3.0":
-        raise ValueError("Qwen3-TTS requires transformers==5.3.0")
+    if importlib.metadata.version("transformers") not in ("5.3.0", "5.19.0"):
+        raise ValueError("Qwen3-TTS requires transformers==5.3.0 or ==5.19.0")
     checkpoint = Path(checkpoint).resolve()
     # These optional HF files override the pinned tokenizer metadata.
     for name in ("tokenizer.json", "added_tokens.json", "special_tokens_map.json", "chat_template.jinja", "chat_templates"):
         if (checkpoint / name).exists():
             raise ValueError(f"Qwen3-TTS unreviewed tokenizer override: {name}")
-    # Metadata is checked before either large weight file is read.
-    for name, expected in CHECKPOINT_HASHES.items():
+    config_hash = sha256(checkpoint / "config.json")
+    profile_name = next((name for name, profile in CHECKPOINT_PROFILES.items()
+                         if profile["hashes"]["config.json"] == config_hash), None)
+    if profile_name is None:
+        raise ValueError("Qwen3-TTS checkpoint identity mismatch: config.json")
+    profile = CHECKPOINT_PROFILES[profile_name]
+    hashes = profile["hashes"]
+    # Check all metadata before either large weight file is read.
+    names = sorted(hashes, key=lambda name: name.endswith(".safetensors"))
+    for name in names:
+        expected = hashes[name]
         if sha256(checkpoint / name) != expected:
             raise ValueError(f"Qwen3-TTS checkpoint identity mismatch: {name}")
     return {"checkpoint": str(checkpoint), "source": str(source),
-            "checkpoint_revision": CHECKPOINT_REVISION, "source_revision": SOURCE_REVISION}
+            "profile": profile_name, "checkpoint_revision": profile["revision"],
+            "source_revision": SOURCE_REVISION}
 
 
 def _import_source(source: Path):
@@ -94,4 +104,6 @@ def load_cpu_model(checkpoint: str | Path, source: str | Path):
     tokenizer._patch_mistral_regex(tokenizer, str(checkpoint), fix_mistral_regex=True,
                                   local_files_only=True, is_local=True)
     processor = processor_module.Qwen3TTSProcessor(tokenizer=tokenizer)
-    return package.Qwen3TTSModel(model=model, processor=processor, generate_defaults=defaults)
+    wrapper = package.Qwen3TTSModel(model=model, processor=processor, generate_defaults=defaults)
+    wrapper._rpu_checkpoint_identity = identity
+    return wrapper

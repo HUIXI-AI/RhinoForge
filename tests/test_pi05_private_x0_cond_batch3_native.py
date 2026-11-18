@@ -221,6 +221,7 @@ struct Pi05DenoiseStepModel {
  int num_cores(){return cores;}
  bool pi05_action_prefix_admitted(int64_t){return true;}
  bool pi05_action_steps_admitted(int64_t){return true;}
+ bool pi05_action_rows_admitted(int64_t rows){return rows==50||rows==10;}
  void restore_planned_route_profile(at::IntArrayRef,bool,int64_t,int64_t,int64_t){}
  void invalidate_model_state(bool){++invalidations;}
  void validate_planned_route_profile(bool,int64_t){}

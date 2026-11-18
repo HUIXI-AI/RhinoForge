@@ -77,13 +77,11 @@ uint64_t fmb_three_stage_chunk_plan_fingerprint(const Plan& p) {return p.fingerp
 uint64_t fmb_physical_manifest_fingerprint(const Manifest& m) {return m.fingerprint;}
 int fmb_rope_table_residency(const Manifest&) {return 3;}
 struct FmbPhysicalManifestConsumer {FmbPhysicalManifestConsumer(const Manifest&) {} std::optional<int> attention_layout_policy(){return 4;}};
-struct LayoutContext {uint64_t stage_plan_fingerprint=0,physical_manifest_fingerprint=0;int rope_table_residency=0,attention_policy=0;};
-LayoutContext bind_physical_layout_context(LayoutContext layout, const Manifest& manifest) {
- layout.physical_manifest_fingerprint=fmb_physical_manifest_fingerprint(manifest);
- layout.rope_table_residency=fmb_rope_table_residency(manifest);
- layout.attention_policy=4;return layout;
-}
+enum class FmbForwardOperandResidency {UNSPECIFIED,PER_LAYER,FORWARD};
+struct LayoutContext {uint64_t stage_plan_fingerprint=0,physical_manifest_fingerprint=0;int rope_table_residency=0,attention_policy=0;FmbForwardOperandResidency forward_operand_residency=FmbForwardOperandResidency::UNSPECIFIED;};
 struct CausalDecoderModel {
+ FmbForwardOperandResidency physical_forward_operand_residency(const Manifest&)const{return FmbForwardOperandResidency::UNSPECIFIED;}
+ LayoutContext bind_physical_layout_context(LayoutContext layout,const Manifest& manifest)const __BIND_LAYOUT__
  int encodes=0;bool current=true;std::map<int64_t,std::vector<int64_t>> prefixes;
  std::vector<int64_t> encode_causal_physical_stage_descriptor(const Plan&,const LayoutContext&,
      int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t rope,FmbGraphLifecycle,CausalDecoderPlanningMode) {
@@ -124,7 +122,9 @@ int main() {
  LayoutContext canary;assert(model.bind_multiview_text_stage_descriptor(plan,canary,false)==original);
  assert(model.encodes==2 && candidates[101].physical_manifest.routes[0].site_id==12);
 }
-'''.replace("__BODY__", body)
+'''.replace("__BODY__", body).replace("__BIND_LAYOUT__", _body(
+        (ROOT / "src/core/fused_model_base.cpp").read_text(),
+        "FusedModelBase::bind_physical_layout_context"))
     source = tmp_path / "text_binding.cpp"
     source.write_text(cpp)
     binary = tmp_path / "text_binding"

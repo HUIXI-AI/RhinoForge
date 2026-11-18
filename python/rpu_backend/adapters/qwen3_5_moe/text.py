@@ -330,6 +330,18 @@ def _validate_qwen3_5_moe_linear_accumulation(profile_id, execution_config):
             "Qwen3.5-MoE routed UINT4 currently supports Text ACC16 only; "
             "prefill.linear_acc32 must be false. Vision linear_acc32 is independent."
         )
+    if execution_config.get("prefill", {}).get("moe_resident_prefill", False):
+        from .cores import core_topology
+
+        if linear_acc32:
+            raise UnsupportedModelError(
+                "Qwen3.5-MoE resident prefill requires Text ACC16; "
+                "prefill.linear_acc32 must be false"
+            )
+        if core_topology(execution_config).num_cores != 8:
+            raise UnsupportedModelError(
+                "Qwen3.5-MoE resident prefill requires model.num_cores=8"
+            )
     return linear_acc32
 
 
@@ -393,7 +405,7 @@ PREFILL_CHUNK_CEILING: dict[tuple[int, int], int] = {
 
 
 def _qwen3_5_moe_prefill_envelope(
-    num_layers, hidden_size, max_seq_len
+    num_layers, hidden_size, max_seq_len, *, resident_prefill=False
 ) -> tuple[int, int]:
     key = (int(num_layers), int(hidden_size))
     max_chunk = PREFILL_CHUNK_CEILING.get(key)
@@ -405,7 +417,10 @@ def _qwen3_5_moe_prefill_envelope(
             f"and WEDGING the board. Measure it on a resettable board first."
         )
     physical_capacity = ((max_seq_len + QWEN3_5_TOTAL_PADDING_CAP + 15) // 16) * 16
-    return physical_capacity, max_chunk
+    # Resident planning admits each candidate through the full-sort/index
+    # capabilities and the complete model SPM layout. The request/KV extent is
+    # the search bound; there is no separate resident-window policy ceiling.
+    return (physical_capacity, physical_capacity) if resident_prefill else (physical_capacity, max_chunk)
 
 
 def _validate_layer_types(config) -> None:
@@ -661,7 +676,7 @@ def install_qwen3_5_moe_text_for_rpu(
     linear_acc32 = _validate_qwen3_5_moe_linear_accumulation(
         profile["profile"], execution_config
     )
-    topology = core_topology(execution_config)
+    topology = core_topology(execution_config, config=config)
     if topology.num_cores not in runtime_capabilities(profile["profile"]).allowed_cores:
         raise UnsupportedModelError("Qwen3.5-MoE routed W4A16 requires TP8")
     for name in ("qwen3_5_moe_set_execution_cores", "qwen3_5_moe_get_execution_topology",
@@ -702,6 +717,13 @@ def install_qwen3_5_moe_text_for_rpu(
         resolved_options=_resolved_options,
     )
     prefill_config = execution_config.get("prefill", {})
+    resident_prefill = prefill_config.get("moe_resident_prefill", False)
+    resident_ops = ["qwen3_5_moe_set_resident_prefill"]
+    if runtime_capabilities(profile["profile"]).routed_weight_mode == 6:
+        resident_ops.append("qwen3_5_moe_set_resident_uint4_n32k32_weights")
+    if resident_prefill and any(not callable(getattr(torch.ops.rpu, name, None))
+            for name in resident_ops):
+        raise RuntimeError("Qwen3.5-MoE binary lacks the requested resident prefill; rebuild before installing")
     requested_chunk = prefill_config.get("chunk_size", "auto")
     exact_chunk_size = 0 if requested_chunk == "auto" else int(requested_chunk)
     if exact_chunk_size and exact_chunk_size % 64:
@@ -712,6 +734,7 @@ def install_qwen3_5_moe_text_for_rpu(
     envelope = _qwen3_5_moe_prefill_envelope(
         _text_config(config).num_hidden_layers, _text_config(config).hidden_size,
         max_seq_len,
+        resident_prefill=resident_prefill,
     )
     if exact_chunk_size and exact_chunk_size > envelope[1]:
         raise UnsupportedModelError(
@@ -796,6 +819,11 @@ def _install_qwen3_5_moe_text_for_rpu_impl(
     inner = text_model
     profile = validate_exact_profile(config, require_quant=True)
     capabilities = runtime_capabilities(profile["profile"])
+    resident_prefill = execution_config.get("prefill", {}).get("moe_resident_prefill", False)
+    if resident_prefill and (capabilities.routed_weight_mode not in (5, 6) or
+                             pending_state.execution_topology.num_cores != 8):
+        raise UnsupportedModelError("resident prefill requires a UINT4 or E4M3 TP8 profile")
+    resident_uint4 = resident_prefill and capabilities.routed_weight_mode == 6
     # device kernels are fp16-only. Like every rpu_backend adapter, the swizzle
     # (convert_linear_weights_inplace / transform_linear_weight) PRESERVES weight
     # dtype (so int8/w8a16 quant paths stay intact) and relies on the CALLER having
@@ -952,6 +980,7 @@ def _install_qwen3_5_moe_text_for_rpu_impl(
     q_s, k_s, v_s, o_s, ag_s = ([] for _ in range(5))
     router, routed_g, routed_u, routed_d = ([] for _ in range(4))
     routed_gs, routed_us, routed_ds = ([] for _ in range(3))
+    resident_g, resident_u, resident_d = ([] for _ in range(3))
     shared_g, shared_u, shared_d, shared_scalar = ([] for _ in range(4))
     # GDN mixer weight lists (parallel to num_layers; full slots = empty).
     g_z, g_out, g_alog, g_dt, g_nrm = ([] for _ in range(5))
@@ -963,7 +992,10 @@ def _install_qwen3_5_moe_text_for_rpu_impl(
     routed_weight_mode = None
     for i, layer in enumerate(inner.layers):
         packed_moe = prepare_moe_layer_weights(
-            layer.mlp, num_cores=topology.num_cores, device="rpu"
+            layer.mlp, num_cores=topology.num_cores,
+            routed_num_cores=topology.routed_tp, device="rpu",
+            grouped_acc32=pending_state.linear_acc32,
+            resident_uint4_n32k32=resident_uint4,
         )
         if routed_weight_mode is None:
             routed_weight_mode = packed_moe.routed_weight_mode
@@ -980,6 +1012,14 @@ def _install_qwen3_5_moe_text_for_rpu_impl(
         routed_gs.append(packed_moe.routed_gate_scale)
         routed_us.append(packed_moe.routed_up_scale)
         routed_ds.append(packed_moe.routed_down_scale)
+        if resident_uint4:
+            from rpu_backend.quant.grouped_uint4_n32k32 import WEIGHT_LAYOUT
+
+            if packed_moe.resident_weight_layout != WEIGHT_LAYOUT:
+                raise RuntimeError("resident expert owner has the wrong weight format")
+            resident_g.append(packed_moe.resident_gate)
+            resident_u.append(packed_moe.resident_up)
+            resident_d.append(packed_moe.resident_down)
         shared_g.append(packed_moe.shared_gate)
         shared_u.append(packed_moe.shared_up)
         shared_d.append(packed_moe.shared_down)
@@ -1138,6 +1178,7 @@ def _install_qwen3_5_moe_text_for_rpu_impl(
             keepalive=(
                 q, k, v, o, qn, kn, ag, inrm, postrm,
                 router, routed_g, routed_u, routed_d,
+                resident_g, resident_u, resident_d,
                 shared_g, shared_u, shared_d, shared_scalar,
                 cos, sin, final_norm,
                 g_z, g_out, g_alog, g_dt, g_nrm,
@@ -1153,11 +1194,15 @@ def _install_qwen3_5_moe_text_for_rpu_impl(
             ).contiguous().to("rpu")
             pending_state.retirement.keepalive += (final_norm,)
         max_admitted_kv, max_chunk = _qwen3_5_moe_prefill_envelope(
-            tc.num_hidden_layers, tc.hidden_size, max_seq_len
+            tc.num_hidden_layers, tc.hidden_size, max_seq_len,
+            resident_prefill=execution_config.get("prefill", {}).get("moe_resident_prefill", False),
         )
-        route_table_chunk = _KV_SORT_MAX_ROWS // int(tc.num_experts_per_tok)
-        if route_table_chunk != max_chunk or route_table_chunk != 512:
-            raise RuntimeError("Qwen3.5-MoE route-table and planner ceilings diverged")
+        route_table_chunk = min(
+            max_admitted_kv, _KV_SORT_MAX_ROWS // int(tc.num_experts_per_tok)
+        )
+        # Static local-router capacity is independent of the resident window.
+        if route_table_chunk < min(max_chunk, 256):
+            raise RuntimeError("Qwen3.5-MoE local router table capacity is insufficient")
         expert_ids, token_ids = build_route_tables(
             route_table_chunk,
             int(tc.num_experts),
@@ -1175,6 +1220,9 @@ def _install_qwen3_5_moe_text_for_rpu_impl(
         ]
         pending_state.retirement.keepalive += (expert_ids, token_ids, packed_scales)
         torch.ops.rpu.qwen3_5_moe_set_execution_cores(handle, topology.num_cores)
+        # Native scale-stride validation must see the same precision used by
+        # prepare_moe_layer_weights, including TP6's 576-channel EXP owner.
+        torch.ops.rpu.qwen3_5_moe_set_linear_acc32(handle, pending_state.linear_acc32)
         torch.ops.rpu.qwen3_5_moe_set_weights(
             handle, q, k, v, o, qn, kn, ag,
             packed_scales, inrm, postrm,
@@ -1196,8 +1244,13 @@ def _install_qwen3_5_moe_text_for_rpu_impl(
         validate_native_topology(handle, topology)
         torch.ops.rpu.qwen3_5_moe_set_chunk_size_cap(handle, chunk_size_cap)
         torch.ops.rpu.qwen3_5_moe_set_prefill_chunk_size(handle, exact_chunk_size)
-        torch.ops.rpu.qwen3_5_moe_set_linear_acc32(handle, pending_state.linear_acc32)
         torch.ops.rpu.qwen3_5_moe_set_retained_prefill_graph(handle, False)
+        resident_prefill = execution_config.get("prefill", {}).get("moe_resident_prefill", False)
+        if resident_prefill:
+            if routed_weight_mode == 6:
+                torch.ops.rpu.qwen3_5_moe_set_resident_uint4_n32k32_weights(
+                    handle, resident_g, resident_u, resident_d)
+            torch.ops.rpu.qwen3_5_moe_set_resident_prefill(handle, True)
         vars(pending_state).update(
             handle=handle,
             handle_finalizer=handle_finalizer,
@@ -1215,6 +1268,11 @@ def _install_qwen3_5_moe_text_for_rpu_impl(
             control_snapshot=control_snapshot,
             exact_chunk_size=exact_chunk_size or None,
             chunk_envelope=(max_admitted_kv, max_chunk),
+            resident_prefill=resident_prefill,
+            resident_weight_layout=(
+                ("grouped_uint4_n32k32_v1" if routed_weight_mode == 6
+                 else "grouped_e4m3_n16k32b_v1") if resident_prefill else None
+            ),
             adaptive_mode=None,
             routed_weight_mode=int(routed_weight_mode),
             route_tables=(expert_ids, token_ids),
@@ -1239,12 +1297,15 @@ def _preflight_qwen3_5_moe_text(
     import torch
 
     from rpu_backend.adapters.qwen3_5.cores import topology_tuple
+    from .cores import full_topology_tuple
 
     st = text_model._rpu_qwen3_5_moe
     if not _qwen35_moe_retirement_ready(st):
         raise RuntimeError("Qwen3.5-MoE text resource is not live and parent-owned")
     expected_topology = topology_tuple(st.execution_topology)
-    if tuple(getattr(cache, "execution_topology", ())) != expected_topology:
+    if (tuple(getattr(cache, "execution_topology", ())) != expected_topology
+            or tuple(getattr(cache, "moe_execution_topology", ()))
+            != full_topology_tuple(st.execution_topology)):
         raise ValueError(
             "Qwen3.5-MoE cache core layout does not match the installed model; "
             "use Qwen3_5MoeCache.from_model(model, ...)"

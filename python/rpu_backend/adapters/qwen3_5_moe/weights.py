@@ -17,6 +17,7 @@ from rpu_backend.runtime.weights import transform_linear_weight
 from rpu_backend.quant.fp8 import (
     dequantize_fp8_e4m3_per_output,
     pack_grouped_weight,
+    pack_grouped_scale,
     quantize_fp8_e4m3_per_output,
 )
 
@@ -45,6 +46,12 @@ class PackedMoeLayerWeights:
     shared_down: torch.Tensor
     shared_scalar_gate: torch.Tensor
     routed_weight_mode: int
+    # Resident references alias the corresponding ordinary grouped N32K32 W.
+    # A projection is uploaded once and both call paths retain its owner.
+    resident_gate: torch.Tensor | None = None
+    resident_up: torch.Tensor | None = None
+    resident_down: torch.Tensor | None = None
+    resident_weight_layout: str | None = None
 
 
 def _cpu_contiguous(tensor: torch.Tensor) -> torch.Tensor:
@@ -65,7 +72,7 @@ def _source_scale(experts, name: str) -> torch.Tensor:
     return scale
 
 
-def _prepare_routed(experts, num_cores: int):
+def _int4_source(experts):
     source = getattr(experts, "_qwen3_5_moe_int4_source", None)
     if source is not None:
         from .quant_scope import runtime_capabilities
@@ -76,6 +83,12 @@ def _prepare_routed(experts, num_cores: int):
                 or getattr(experts, "rpu_quant_profile", None) != source.profile_id
                 or runtime_capabilities(source.profile_id).routed_weight_mode != MODE_UINT4):
             raise ValueError("INT4 experts require matching typed source and profile markers")
+    return source
+
+
+def _prepare_routed(experts, num_cores: int):
+    source = _int4_source(experts)
+    if source is not None:
         return source.prepare(num_cores=num_cores)
     if type(num_cores) is not int or num_cores not in (4, 6, 8):
         raise ValueError(
@@ -148,19 +161,49 @@ def _prepare_routed(experts, num_cores: int):
         pack_grouped_weight(gate, partition="col", num_cores=num_cores),
         pack_grouped_weight(up, partition="col", num_cores=num_cores),
         pack_grouped_weight(down, partition="row", num_cores=num_cores),
-        gate_scale, up_scale, down_scale, mode,
+        pack_grouped_scale(gate_scale), pack_grouped_scale(up_scale),
+        pack_grouped_scale(down_scale), mode,
     )
 
 
 def prepare_moe_layer_weights(
-    mlp, *, num_cores: int = TP, device: str = "rpu"
+    mlp, *, num_cores: int = TP, routed_num_cores: int | None = None,
+    device: str = "rpu", grouped_acc32: bool = False,
+    resident_uint4_n32k32: bool = False,
 ) -> PackedMoeLayerWeights:
     """Prepare one official HF ``Qwen3_5MoeSparseMoeBlock`` for C++ binding."""
     if type(num_cores) is not int or num_cores not in (4, 6, 8):
         raise ValueError(f"Qwen3.5-35B-A3B requires TP4, TP6 or TP8, got {num_cores}")
+    if type(resident_uint4_n32k32) is not bool:
+        raise TypeError("resident_uint4_n32k32 must be bool")
+    resident_source = _int4_source(mlp.experts) if resident_uint4_n32k32 else None
+    if resident_uint4_n32k32 and (num_cores != 8 or resident_source is None):
+        raise ValueError("resident N32K32 owners require a typed UINT4 TP8 source")
     router_cores = 4 if num_cores == 6 else num_cores
-    routed = _prepare_routed(mlp.experts, num_cores)
-    routed_gate, routed_up, routed_down, gate_s, up_s, down_s, mode = routed
+    expected_routed_cores = (
+        4 if num_cores == 6 and getattr(mlp.experts, "rpu_weight_mode", None) == MODE_UINT4
+        else num_cores
+    )
+    if routed_num_cores is None:
+        routed_num_cores = expected_routed_cores
+    if type(routed_num_cores) is not int or routed_num_cores != expected_routed_cores:
+        raise ValueError("routed expert core layout does not match its cold profile")
+    if resident_uint4_n32k32:
+        mode = MODE_UINT4
+    else:
+        routed = _prepare_routed(mlp.experts, routed_num_cores)
+        routed_gate, routed_up, routed_down, gate_s, up_s, down_s, mode = routed
+    if type(grouped_acc32) is not bool:
+        raise TypeError("grouped_acc32 must be bool")
+    if mode == MODE_UINT4 and grouped_acc32:
+        raise ValueError("grouped UINT4 supports ACC16 only")
+    if mode == MODE_FP8_E4M3 and not grouped_acc32:
+        # Published BASE advances per-expert scale addresses in 256-byte units.
+        # Pad each expert independently at cold installation. EXP ACC32 keeps
+        # its original logical-width stride, so its owner must remain unpadded.
+        def base_scale_owner(scale: torch.Tensor) -> torch.Tensor:
+            return F.pad(scale, (0, (-scale.shape[1]) % 128)).contiguous()
+        gate_s, up_s, down_s = map(base_scale_owner, (gate_s, up_s, down_s))
 
     fp16_weights = {
         "router": mlp.gate.weight,
@@ -222,19 +265,45 @@ def prepare_moe_layer_weights(
             return tensor
         return tensor.contiguous().to(device)
 
+    resident_owners = (None, None, None)
+    resident_layout = None
+    if resident_uint4_n32k32:
+        from rpu_backend.quant.grouped_uint4_n32k32 import WEIGHT_LAYOUT
+
+        owners, metadata_owners = [], []
+        # Both ordinary grouped decode and indexed resident prefill consume
+        # the published N32K32 format. Stream each verified projection once,
+        # upload it once, and retain the same typed owner in both call paths.
+        for _role, packed, metadata in resident_source.iter_prepared_projections(
+                num_cores=routed_num_cores):
+            owners.append(upload(packed))
+            metadata_owners.append(upload(metadata))
+            del packed, metadata
+        routed_gate, routed_up, routed_down = owners
+        gate_s, up_s, down_s = metadata_owners
+        resident_owners = tuple(owners)
+        resident_layout = WEIGHT_LAYOUT
+
+    def uploaded_routed(tensor):
+        return tensor if resident_uint4_n32k32 else upload(tensor)
+
     prepared = PackedMoeLayerWeights(
         router=upload(router),
-        routed_gate=upload(routed_gate),
-        routed_up=upload(routed_up),
-        routed_down=upload(routed_down),
-        routed_gate_scale=upload(gate_s),
-        routed_up_scale=upload(up_s),
-        routed_down_scale=upload(down_s),
+        routed_gate=uploaded_routed(routed_gate),
+        routed_up=uploaded_routed(routed_up),
+        routed_down=uploaded_routed(routed_down),
+        routed_gate_scale=uploaded_routed(gate_s),
+        routed_up_scale=uploaded_routed(up_s),
+        routed_down_scale=uploaded_routed(down_s),
         shared_gate=upload(shared_gate),
         shared_up=upload(shared_up),
         shared_down=upload(shared_down),
         shared_scalar_gate=upload(shared_scalar),
         routed_weight_mode=mode,
+        resident_gate=resident_owners[0],
+        resident_up=resident_owners[1],
+        resident_down=resident_owners[2],
+        resident_weight_layout=resident_layout,
     )
     if mode == MODE_UINT4:
         mlp.experts._qwen3_5_moe_int4_source.release()
@@ -245,9 +314,9 @@ def build_route_tables(
     max_chunk: int, num_experts: int, top_k: int, *, device: str = "rpu"
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build the static tables consumed by the runtime-compatible shuffle."""
-    if not (0 < max_chunk <= 512 and num_experts == 256 and top_k == 8):
+    if not (0 < max_chunk <= 65536 and num_experts == 256 and top_k == 8):
         raise ValueError(
-            "Qwen3.5-35B-A3B route tables require max_chunk in [1,512], "
+            "Qwen3.5-35B-A3B route tables require max_chunk in [1,65536], "
             f"num_experts=256 and top_k=8; got {(max_chunk, num_experts, top_k)}"
         )
     expert_ids = torch.arange(num_experts, dtype=torch.float16).view(1, -1)

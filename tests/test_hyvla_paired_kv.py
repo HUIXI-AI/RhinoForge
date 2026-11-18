@@ -1,10 +1,10 @@
 """Execute the HyVLA S51/S64 paired-KV admission and COMPLETE route with host metadata."""
 from pathlib import Path
+import re
 import shutil
 import subprocess
 
 import pytest
-
 from _native_runtime_identity import runtime_identity_include
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +28,23 @@ def compile_run(tmp_path, name, source):
     if not compiler:
         pytest.skip('C++ compiler unavailable')
     torch_root = Path(torch.__file__).resolve().parent
+    if "rpu_specialized_linear::" in source:
+        # Execute the production tile/grid contract alongside the actual
+        # launcher. The host fixture supplies only the KernelId type; it does
+        # not replace the contract with a hand-written fake.
+        contract = (ROOT / "src/ops/rpu_specialized_linear_contracts.h").read_text()
+        contract = re.sub(r"^#(?:pragma once|include .*)\n", "", contract, flags=re.M)
+        ids = set(re.findall(r"\bKernelId::(\w+)", contract + source))
+        match = re.search(r"enum class KernelId(?:\s*:\s*uint16_t)?\s*\{([^}]*)\};", source)
+        if match:
+            existing = set(re.findall(r"\b[A-Z][A-Z0-9_]*\b", match[1]))
+            body = match[1].rstrip().rstrip(",")
+            declaration = "enum class KernelId : uint16_t {" + body + "," + ",".join(sorted(ids - existing)) + "};"
+            source = source[:match.start()] + declaration + "\n" + contract + source[match.end():]
+        else:
+            assert source.startswith(COMMON), "Locate a real namespace-level contract insertion point"
+            source = (COMMON + "\nenum class KernelId : uint16_t {" + ",".join(sorted(ids)) + "};\n"
+                      + contract + source[len(COMMON):])
     cpp = tmp_path / (name + '.cpp')
     cpp.write_text(source)
     binary = tmp_path / name
@@ -39,7 +56,8 @@ def compile_run(tmp_path, name, source):
                '-lc10', '-o', str(binary)]
     result = subprocess.run(command, capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
-    subprocess.run([str(binary)], check=True, capture_output=True, text=True)
+    result = subprocess.run([str(binary)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 COMMON = r'''
@@ -79,6 +97,7 @@ struct Tensor {
 using IntArrayRef=c10::ArrayRef<int64_t>;
 }
 #include "fused/hyvla_linear_precision.h"
+#include "fused/hyvla_retained_schedule.h"
 auto exact_plan(int64_t p=240,int64_t rows=51,KvInsertRoute route=KvInsertRoute::PAD16_V16,int64_t physical=64) {
  return rpu_resolve_kvinsert_segment_plan(p,rows,physical,8,8,128,
   KV_INSERT_CAP_V2|KV_INSERT_CAP_V16|KV_INSERT_CAP_PAD16,route);
@@ -132,7 +151,7 @@ struct SpmAllocator {static constexpr uint32_t SPM_USABLE=8387584;bool ready=tru
 #define SPM_ALLOC spm
 LAUNCH
 void qwen_admit(at::Tensor k_cache,at::Tensor v_cache,int64_t position,int64_t seq_len,
- int64_t num_kv_heads=8,int64_t head_dim=128,int num_cores=8,bool decode=false,bool lingbot_m224=false) { QWEN_GUARD }
+ int64_t num_kv_heads=8,int64_t head_dim=128,int num_cores=8,bool decode=false) { const bool lingbot_m224=false; QWEN_GUARD }
 int main(){
  at::Tensor k,v;v.address=0x18000000;
  auto run=[&](at::Tensor key,at::Tensor value,uint32_t ko,uint32_t vo,const KvInsertSegmentPlan& plan,

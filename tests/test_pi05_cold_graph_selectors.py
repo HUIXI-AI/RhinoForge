@@ -116,4 +116,5 @@ def test_pi05_fast_replay_policy_is_explicit_per_cache():
         "    def to_rpu(",
     )
     assert "*, runtime_policy=None" in denoise_install
-    assert "GraphCache(runtime_policy=runtime_policy)" in denoise_install
+    # The denoise cache also sizes one entry per valid language count.
+    assert "max_entries=_PI05_DENOISE_GRAPH_ENTRIES,\n                runtime_policy=runtime_policy)" in denoise_install

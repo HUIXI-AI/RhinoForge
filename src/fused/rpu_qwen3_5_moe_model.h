@@ -22,11 +22,13 @@
 
 #include "fused_model_base.h"
 #include "rpu_helpers.h"          // SdpaConfig, SdpaKernelType, sdpa_is_valid_chunk_size
+#include "qwen35_moe_mixer_plan.h"
 
 #include <ATen/ATen.h>
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <vector>
 
@@ -48,6 +50,10 @@ public:
     struct MoeLayerWeights {
         at::Tensor router_w;
         at::Tensor routed_gate_w, routed_up_w, routed_down_w;
+        // Typed resident references share the ordinary grouped N32K32 owners
+        // above. Retained Graphs hold the same MoeLayerWeights lifetime;
+        // enabling resident prefill does not duplicate DDR weight storage.
+        at::Tensor resident_gate_w, resident_up_w, resident_down_w;
         at::Tensor routed_gate_scale, routed_up_scale, routed_down_scale;
         // UINT4 consumes plain [E,K/group_size,N] scales and negative zeros.
         // The constant zero=8 tables are shared across all layers, owned here
@@ -159,6 +165,9 @@ public:
     void set_linear_acc32(bool enabled);
     void set_fast_replay(bool enabled);
     void set_retained_prefill_graph(bool enabled);
+    void set_resident_prefill(bool enabled);
+    void set_resident_uint4_n32k32_weights(
+        at::TensorList gate, at::TensorList up, at::TensorList down);
     int64_t resolve_prefill_chunk_size(int64_t execution_len);
     std::vector<int64_t> resolve_prefill_stage_domain(
         int64_t execution_len, int64_t logical_len,
@@ -200,23 +209,71 @@ protected:
     physical_manifest_forward_capability(
         const FmbPhysicalExecutionManifest& manifest) const override;
     std::vector<int64_t> kvinsert_cost_weight_identity() const override;
+    FmbPrefillRanking prefill_candidate_ranking(
+        const FmbPrefillStageCandidate& candidate,
+        const LayoutContext& layout) const override;
+    KvCostLayoutScope capture_kvinsert_cost_layout_scope() override {
+        return capture_kvinsert_cost_layout_fields(
+            resident_detached_plan_, resident_detached_fingerprint_);
+    }
+    void rebind_kvinsert_exact_candidate(
+        FmbPrefillStageCandidate& candidate, const LayoutContext& layout,
+        int64_t site_id, int64_t invocation,
+        const KvInsertSegmentPlan& plan) const override;
 
 private:
-    std::vector<BufferDecl> declare_legacy_buffers(const LayoutContext& ctx) const;
+    bool resident_prefill_ = false;
+    bool resident_uint4_n32k32_installed_ = false;
+    uint32_t mixer_residual_offset_ = 0;
+    using ResidentMixerPlan = qwen35_moe_planning::Plan;
+    // Scoped to one cold oracle. The map keeps each C independent; execution
+    // restores its immutable winner from the descriptor, never from this map.
+    mutable bool resident_planning_active_ = false;
+    mutable int64_t resident_planning_rows_ = 0;
+    mutable int64_t resident_planning_logical_rows_ = 0;
+    mutable std::map<int64_t, std::optional<ResidentMixerPlan>> resident_plans_;
+    std::optional<ResidentMixerPlan> resident_execution_plan_;
+    uint64_t resident_execution_fingerprint_ = 0;
+    mutable std::optional<ResidentMixerPlan> resident_detached_plan_;
+    mutable uint64_t resident_detached_fingerprint_ = 0;
+    const ResidentMixerPlan* resident_plan_for_layout(const LayoutContext& layout) const;
+    const ResidentMixerPlan& resident_plan_for_outer(const ChunkInfo& chunk) const;
+    bool plan_resident_candidate(int64_t capacity, int64_t rows, int64_t position) const;
+    ResidentMixerPlan decode_resident_plan(
+        const FmbPrefillStageCandidate& candidate) const;
+    void restore_resident_plan(const FmbPrefillStageCandidate& candidate);
+    std::vector<ChunkInfo> planned_resident_mixer_chunks(const ChunkInfo& outer) const;
+    std::vector<int64_t> resident_schedule_arguments(const ChunkInfo& outer) const;
+    int64_t resident_router_capacity() const;
+    bool resident_route_capacity_valid(int64_t tokens) const;
+    std::vector<BufferDecl> declare_active_buffers(const LayoutContext& ctx) const;
+    std::vector<BufferDecl> declare_resident_buffers(const LayoutContext& ctx) const;
+    std::vector<BufferDecl> declare_resident_plan_buffers(
+        const LayoutContext& ctx, int64_t mixer_rows, int64_t workspace_bytes) const;
+    void build_resident_layer(int layer_idx, const ChunkInfo& chunk);
+    void emit_resident_mlp(int layer_idx, const ChunkInfo& chunk);
+    void append_resident_mlp_manifest_routes(
+        FmbPhysicalExecutionManifest& manifest, const ChunkInfo& chunk) const;
+    std::vector<BufferDecl> declare_legacy_buffers(
+        const LayoutContext& ctx, int64_t sdpa_workspace_bytes = -1) const;
+    int64_t minimum_eager_spm_bytes() const override;
     std::vector<int64_t> gdn_mask_schedule_arguments(
         const FmbThreeStageChunkPlan& plan) const;
     FmbForwardOperandResidency gdn_mask_residency_for_candidate(
         const LayoutContext& layout) const;
 
-    // The admitted TP6 profile is deliberately mixed: residual/routing/expert
-    // ownership is six-wide while attention, GDN, router projection and the
-    // untied head remain four-wide. Physical KV stripes remain eight.
+    // Residual/routing/shared ownership follows the budget. Under budget six,
+    // UINT4 routed experts use four cores without padding I512; E4M3 uses six.
+    // Attention, GDN, router projection and the untied head stay four-wide.
     int gdn_tp() const { return num_cores() == 6 ? 4 : num_cores(); }
     int router_tp() const { return num_cores() == 6 ? 4 : num_cores(); }
     int routing_tp() const { return num_cores(); }
-    int routed_expert_tp() const { return num_cores(); }
+    int routed_expert_tp() const {
+        return num_cores() == 6 && !moe_layer_weights_.empty() &&
+            moe_layer_weights_.front().routed_weight_mode == 6 ? 4 : num_cores();
+    }
     int shared_expert_tp() const { return num_cores(); }
-    int lm_head_tp() const { return num_cores() == 6 ? 4 : num_cores(); }
+    int lm_head_tp() const { return num_cores(); }
     int64_t physical_routed_intermediate() const {
         return routed_expert_tp() == 6 ? 576 : moe_.routed_intermediate;
     }
@@ -225,6 +282,10 @@ private:
     }
     int64_t text_ring_route(int64_t rows, int64_t cols) const;
     std::vector<int64_t> cold_topology_arguments() const;
+    bool has_gdn_glast_local_capability() const;
+    std::vector<int64_t> gdn_glast_local_identity() const;
+    bool use_gdn_glast_local(int64_t rows) const;
+    std::vector<int64_t> gdn_glast_local_arguments(int64_t rows) const;
     std::vector<int64_t> exact_profile_arguments() const;
 
     at::Tensor prepare_decode_cpu_input(const at::Tensor& hidden_states);
@@ -276,6 +337,9 @@ private:
         FmbPhysicalExecutionManifest& manifest, const ChunkInfo& chunk) const;
     void emit_router_and_shuffle(
         int layer_idx, int64_t invocation, int64_t t, uint32_t input_spm_addr);
+    void emit_router_topk(
+        int layer_idx, int64_t invocation, int64_t t, uint32_t input_spm_addr,
+        uint32_t output_expert_ids);
     void emit_shared_expert(
         int layer_idx, int64_t invocation, int64_t t, uint32_t input_spm_addr);
     void emit_routed_experts(
@@ -329,6 +393,10 @@ private:
     Qwen3_5MoeStaticConfig       moe_;
     std::vector<MoeLayerWeights> moe_layer_weights_;
     at::Tensor                   expert_ids_, token_ids_;
+    // Raw U16 ordinal/token bits in FP16-typed owned DDR carriers. Load only
+    // the active route prefix into temporary SPM; do not enlarge Persistent
+    // expert/token tables used by the legacy route.
+    at::Tensor                   resident_route_ordinals_, resident_route_tokens_;
     // TP6 only: fixed Tensor-owned DDR bridge from router4 full logits on
     // core0 to the route6 SPM domain. Capacity matches the route tables and
     // its address is stable for Graph capture/replay.

@@ -22,6 +22,7 @@
 #include "model_handle_registry.h"
 #include "rpu_ops.h"
 #include "rpu_grouped_linear_tiling.h"
+#include "../ops/rpu_grouped_indexed_linear.h"
 #include "rpu_spm_buffers.h"
 #include "rpu_spm_residency.h"
 #include "rpu_helpers.h"
@@ -37,6 +38,7 @@
 
 using namespace at;
 using namespace ::rhino_lkn;
+namespace gil = rpu_grouped_indexed_linear;
 
 #define NUM_CORES 8
 #define DWIDTH 2
@@ -47,12 +49,116 @@ constexpr int kNumCores = NUM_CORES;
 // Backend profile tag; the UINT4 generator has its own register ABI and is
 // never dispatched through the byte-oriented FP8 weight-mode register.
 constexpr int64_t kRoutedUint4Mode = 6;
+// Routed-only signed INT8 per-output-channel experts; grouped kernel mode 1.
+constexpr int64_t kRoutedInt8Mode = 1;
 constexpr int64_t kRoutedUint4GroupSize = 128;
 constexpr int64_t kRoutedUint4DownGroupSize = 64;
+
+// The cold COMPLETE descriptor and actual emission bind the same dispatch and
+// metadata. The final six fields describe the new ABI for both accumulations.
+std::vector<int64_t> qwen35_grouped_route_arguments(
+    int64_t m_total, int64_t n, int64_t k, int64_t num_experts,
+    bool is_col_parallel, int num_cores, int64_t weight_mode,
+    int64_t group_size, bool acc32) {
+    std::vector<int64_t> arguments{
+        n, k, num_experts, is_col_parallel ? 1 : 0, num_cores, acc32 ? 1 : 0};
+    int64_t m_tile, n_tile, k_tile, weight_layout, scale_expert_bytes;
+    if (weight_mode == kRoutedUint4Mode) {
+        const auto tile = rpu_select_grouped_parallel_linear_uint4_tile(
+            m_total, num_experts, n, k, group_size, acc32);
+        const auto metadata = rpu_grouped_tiling::uint4_metadata_layout(
+            n, k, group_size, num_cores);
+        arguments.insert(arguments.end(),
+            {group_size, tile[0], tile[1], tile[2], m_total,
+             metadata.version, metadata.group_block_bytes, metadata.expert_bytes});
+        // The public UINT4 selector returns {N, M, K}; the ABI tail is M/N/K.
+        m_tile = tile[1]; n_tile = tile[0]; k_tile = tile[2];
+        weight_layout = rpu_grouped_tiling::uint4_weight_layout_version;
+        scale_expert_bytes = metadata.expert_bytes;
+    } else {
+        const auto dispatch = rpu_grouped_tiling::dispatch_identity(
+            m_total, n, k, weight_mode, acc32, num_experts);
+        arguments.insert(arguments.end(), dispatch.begin(), dispatch.end());
+        m_tile = dispatch[1]; n_tile = dispatch[2]; k_tile = dispatch[3];
+        weight_layout = 1;
+        scale_expert_bytes = Align(n * (is_col_parallel ? num_cores : 1) * 2,
+                                   int64_t{256});
+    }
+    arguments.insert(arguments.end(),
+        {2, m_tile, n_tile, k_tile, weight_layout, scale_expert_bytes});
+    return arguments;
+}
 // Only the post-mixer MLP is sliced; Attention/GDN keep the outer chunk.
 constexpr int64_t kMoeChunkSize = 128;
 // FLASH_ATTN_SPM's key-length register counts groups of 16 rows.
 constexpr int64_t kSdpaMaxKvRows = int64_t{UINT16_MAX} * 16;
+constexpr int64_t kResidentMixerChunk = 384;
+// The compute kernels use signed-16 route counters. This is an ABI extent,
+// not an outer-window policy cap; the actual C is chosen by the planner.
+constexpr int64_t kResidentMaxRoutes = 32767;
+constexpr int64_t kResidentRouteBatch = 2048;
+constexpr int64_t kResidentRingChunk = 192;
+
+// Projection descriptor version 3 binds main N32K32 W and ABI-v2 parameters.
+constexpr int64_t kResidentProjectionLayoutVersion = 3;
+gil::Shape qwen35_resident_projection_shape(bool indexed, int64_t tokens, int64_t rows,
+                                           int64_t weight_mode = kRoutedUint4Mode) {
+    TORCH_CHECK(weight_mode == kRoutedUint4Mode || weight_mode == 5,
+                "resident projection requires UINT4 or FP8 E4M3 weights");
+    TORCH_CHECK(tokens > 0 && tokens <= kResidentMaxRoutes / 8 &&
+                    (indexed ? (rows > 0 && rows <= kResidentRouteBatch && rows <= tokens * 8)
+                             : rows == tokens * 8),
+                "Qwen3.5 resident projection exceeds route batch/window ABI");
+    const bool uint4 = weight_mode == kRoutedUint4Mode;
+    gil::Shape shape{indexed, tokens, rows, 256, indexed ? 64 : 2048,
+                     indexed ? 2048 : 64, uint4 ? (indexed ? 128 : 64) : 0, 8,
+                     uint4 ? gil::WeightType::Uint4 : gil::WeightType::Float8E4M3, indexed};
+    gil::validate_shape(shape);
+    return shape;
+}
+
+std::vector<v3::ChunkInfo> resident_mixer_chunks(const v3::ChunkInfo& outer) {
+    std::vector<v3::ChunkInfo> chunks;
+    for (int64_t row = 0; row < outer.len; row += kResidentMixerChunk) {
+        const int64_t len = std::min(kResidentMixerChunk, outer.len - row);
+        chunks.push_back({static_cast<int>((outer.offset + row) / 64),
+            outer.offset + row, len,
+            outer.kv_seq_len - outer.len + row + len});
+    }
+    return chunks;
+}
+
+// A resident window can end with any C64-aligned mixer tail. SDPA temporary
+// need is not monotone in query rows (e.g. C256 needs more than C384).
+int64_t resident_mixer_sdpa_tmp_bytes(const SdpaConfig& cfg, int64_t capacity) {
+    int64_t bytes = 0;
+    for (int64_t rows = 64; rows <= capacity; rows += 64)
+        bytes = std::max(bytes, Align(sdpa_compute_tmp_v16_size(cfg, rows) * 32,
+                                      int64_t{256}));
+    return bytes;
+}
+
+bool resident_mixer_calls_valid(const SdpaConfig& cfg, int64_t cs,
+                                int64_t seq_len, int64_t position) {
+    if (cs <= 0 || cs % 64 != 0 || seq_len <= 1 || seq_len % 64 != 0 ||
+            position < 0 || position > std::numeric_limits<int64_t>::max() - seq_len)
+        return false;
+    const int64_t tmp_bytes = resident_mixer_sdpa_tmp_bytes(
+        cfg, std::min(cs, kResidentMixerChunk));
+    for (int64_t offset = 0; offset < seq_len;) {
+        const int64_t rows = std::min(cs, seq_len - offset);
+        const v3::ChunkInfo outer{static_cast<int>(offset / cs), offset, rows,
+                                  position + offset + rows};
+        for (const auto& sub : resident_mixer_chunks(outer)) {
+            if (!sdpa_call_valid(cfg, sub.len, position + sub.offset) ||
+                    sdpa_compute_tmp_v16_size(cfg, sub.len) * 32 > tmp_bytes)
+                return false;
+        }
+        offset += rows;
+    }
+    return true;
+}
+
 
 template <class Fn>
 void for_each_moe_slice(const v3::ChunkInfo& chunk, Fn&& emit) {
@@ -69,8 +175,30 @@ constexpr int64_t QWEN35_MOE_KV_REASON_DDR_REQUIRED = 1;
 constexpr int64_t QWEN35_MOE_ATTN_DDR_REQUIRED = 1;
 
 constexpr int64_t QWEN35_MOE_GDN_MASK_RESIDENCY_SITE = 4606644302213524820LL;
+constexpr int64_t QWEN35_MOE_GDN_GLAST_LOCAL_SITE = 8383641522579396593LL;
+constexpr int64_t QWEN35_MOE_SHARED_ALPHA_LOCAL_SITE = 747295028579987285LL;
+constexpr int64_t QWEN35_MOE_RESIDENT_SHARED_ALPHA_LOCAL_SITE = 5138059893624073615LL;
+
+// Cold keys bind the scalar lane and address mode before any forward. These
+// helpers are TU-local so this scheduling repair changes no class ABI.
+std::vector<int64_t> shared_alpha_local_identity(int nc) {
+    return {QWEN35_MOE_SHARED_ALPHA_LOCAL_SITE,
+            QWEN35_MOE_RESIDENT_SHARED_ALPHA_LOCAL_SITE, 1, nc,
+            16, 1, 2, 32, 2, 0, 1};
+}
+
+std::vector<int64_t> shared_alpha_local_arguments(int64_t rows, int nc) {
+    TORCH_CHECK(rows > 0 && (nc == 4 || nc == 6 || nc == 8),
+                "Qwen3.5 MoE scalar slice geometry is unsupported");
+    // Version, rows, source/destination columns, logical cores, element bytes,
+    // source/destination row bytes, first column and per-core-local mode.
+    return {1, rows, 16, 1, nc, 2, 32, 2, 0, 1};
+}
+
 constexpr int64_t QWEN35_MOE_ATTENTION_SITE = 4947544041507852223LL;
 constexpr int64_t QWEN35_MOE_LINEAR_SITE = 2506358524225803894LL;
+// One byte-grouped site for both 8-bit routed modes; the route selector is
+// the weight mode (5 = E4M3, 1 = INT8).
 constexpr int64_t QWEN35_MOE_GROUPED_FP8_SITE = 1444084512072972229LL;
 constexpr int64_t QWEN35_MOE_GROUPED_UINT4_SITE = 1370207785648096751LL;
 constexpr int64_t QWEN35_MOE_FULL_PREPARE_ALL_REDUCE_SITE =
@@ -107,6 +235,13 @@ constexpr int64_t QWEN35_MOE_ROUTED_SILU_SITE = 4050586624170153493LL;
 constexpr int64_t QWEN35_MOE_EXACT_PROFILE_SITE = 2504589813057384578LL;
 constexpr int64_t QWEN35_MOE_ROUTER_SCHEDULE_SITE = 586450017484669802LL;
 constexpr int64_t QWEN35_MOE_ROUTER_ALL_GATHER_SITE = 845855607644119815LL;
+constexpr int64_t QWEN35_MOE_RESIDENT_SCHEDULE_SITE = 9174281901090711785LL;
+constexpr int64_t QWEN35_MOE_RESIDENT_PROJECTION_SITE = 200185456530509264LL;
+constexpr int64_t QWEN35_MOE_RESIDENT_ROUTE_SITE = 4205075302885270377LL;
+constexpr int64_t QWEN35_MOE_RESIDENT_ROUTED_SILU_SITE = 8908877394267543753LL;
+constexpr int64_t QWEN35_MOE_RESIDENT_SHARED_SILU_SITE = 6032476324669831402LL;
+constexpr int64_t QWEN35_MOE_RESIDENT_SHARED_SIGMOID_SITE = 7498251640360753838LL;
+constexpr int64_t QWEN35_MOE_RESIDENT_ALL_REDUCE_SITE = 793694423292330288LL;
 constexpr int64_t QWEN35_MOE_CORE_TOPOLOGY_SITE = 8975316895652603198LL;
 constexpr int64_t QWEN35_MOE_ROUTER_BRIDGE_STORE_SITE =
     3225143782393096355LL;
@@ -288,6 +423,20 @@ DecoderExecutionTopology Qwen3_5MoeModel::resolve_model_execution_topology(
     return {num_cores(), 4, num_cores()};
 }
 
+int64_t Qwen3_5MoeModel::minimum_eager_spm_bytes() const {
+    if (num_cores() != 6) return 0;
+    // The exact public profile runs the untied FP16 [248320,2048] head (+32
+    // zero-padded rows -> 248352) on six cores. Eager col-scatter needs one
+    // input/local-output row and the launcher's three alignment slots; its
+    // guard is strictly greater-than. Reserve the next aligned extent without
+    // changing the decoder chunk rule.
+    const int64_t padded_vocab =
+        Align(int64_t{248320}, int64_t{16} * lm_head_tp());
+    const int64_t one_row =
+        (int64_t{2048} + padded_vocab / lm_head_tp()) * sizeof(c10::Half);
+    return Align(one_row + 3 * SpmAllocator::ALIGN + 1, SpmAllocator::ALIGN);
+}
+
 std::vector<int64_t> Qwen3_5MoeModel::cold_topology_arguments() const {
     if (num_cores() != 6) {
         // Preserve the existing TP4 identity and the TP8 default.
@@ -297,7 +446,8 @@ std::vector<int64_t> Qwen3_5MoeModel::cold_topology_arguments() const {
     // Internal cold identity construction is also safe before public topology
     // attestation becomes legal; do not couple it to the installed-weight gate.
     return {2, num_cores(), attn_tp(), gdn_tp(), router_tp(), routing_tp(),
-            routed_expert_tp(), shared_expert_tp(), lm_head_tp(), NUM_CORES};
+            routed_expert_tp(), shared_expert_tp(), lm_head_tp(), NUM_CORES,
+            minimum_eager_spm_bytes()};
 }
 
 std::vector<int64_t> Qwen3_5MoeModel::exact_profile_arguments() const {
@@ -316,6 +466,30 @@ std::vector<int64_t> Qwen3_5MoeModel::exact_profile_arguments() const {
             gdn_conv_dim_, gdn_kc_, has_qk_norm_ ? 1 : 0,
             router_bridge_.defined() ? 1 : 0,
             router_bridge_.defined() ? router_bridge_.size(0) : 0};
+}
+
+bool Qwen3_5MoeModel::has_gdn_glast_local_capability() const {
+    const int nc = gdn_tp();
+    return has_gdn_ && (nc == 4 || nc == 8) &&
+           gdn_nvh_ > 0 && gdn_nvh_ % nc == 0;
+}
+
+std::vector<int64_t> Qwen3_5MoeModel::gdn_glast_local_identity() const {
+    // Cold identity binds the address mode and topology independently of the
+    // last forward or resident outer-window size.
+    return {QWEN35_MOE_GDN_GLAST_LOCAL_SITE, 1, gdn_nvh_, gdn_tp(),
+            64, 2, 128, 2, 63, 1};
+}
+
+bool Qwen3_5MoeModel::use_gdn_glast_local(int64_t rows) const {
+    return has_gdn_glast_local_capability() && rows >= 64 && rows % 64 == 0;
+}
+
+std::vector<int64_t> Qwen3_5MoeModel::gdn_glast_local_arguments(int64_t rows) const {
+    // Version, actual mixer rows, C64, heads/core, GDN cores, element bytes,
+    // input/output row bytes, final column, local mode, two calls/subchunk.
+    return {1, rows, 64, gdn_nvh_ / gdn_tp(), gdn_tp(),
+            2, 128, 2, 63, 1, 2 * (rows / 64)};
 }
 
 int64_t Qwen3_5MoeModel::text_ring_route(
@@ -346,13 +520,163 @@ void Qwen3_5MoeModel::set_prefill_chunk_size(int64_t chunk_size) {
 }
 
 void Qwen3_5MoeModel::set_linear_acc32(bool enabled) {
+    TORCH_CHECK(!enabled || !resident_prefill_,
+                "Qwen3.5 resident prefill requires ACC16");
     TORCH_CHECK(get_last_resolved_chunk_size() == 0,
                 "Qwen3.5 linear accumulation mode must be set before the first forward");
     TORCH_CHECK(!enabled || moe_layer_weights_.empty() ||
-                    moe_layer_weights_.front().routed_weight_mode != kRoutedUint4Mode,
-                "Qwen3.5-MoE routed UINT4 W4A16 currently requires ACC16");
+                    moe_layer_weights_.front().routed_weight_mode != kRoutedInt8Mode,
+                "Qwen3.5-MoE routed INT8 W8A16 currently requires ACC16");
+    const auto scale_matches = [&](const at::Tensor& scale, int64_t logical_width) {
+        const int64_t physical_width = Align(logical_width, int64_t{128});
+        return scale.defined() && scale.is_contiguous() && scale.dim() == 2 &&
+            scale.size(0) == moe_.num_experts && scale.size(1) == physical_width;
+    };
+    // Both accumulation modes use the new ABI's padded expert stride.
+    // Validate installed owners before reusing them under the new mode.
+    for (const auto& weights : moe_layer_weights_) {
+        if (weights.routed_weight_mode != 5) continue;
+        TORCH_CHECK(
+            scale_matches(weights.routed_gate_scale, physical_routed_intermediate()) &&
+                scale_matches(weights.routed_up_scale, physical_routed_intermediate()) &&
+                scale_matches(weights.routed_down_scale, hidden_size()),
+            "Qwen3.5-MoE installed FP8 scale owners do not match the requested "
+            "accumulation stride; reinstall weights for the requested mode");
+    }
     linear_acc32_ = enabled;
     invalidate_model_state();
+}
+
+void Qwen3_5MoeModel::set_resident_uint4_n32k32_weights(
+    at::TensorList gate, at::TensorList up, at::TensorList down) {
+    TORCH_CHECK(get_last_resolved_chunk_size() == 0 && !resident_prefill_ &&
+                    !resident_uint4_n32k32_installed_,
+                "resident N32K32 owners must be installed once before planning/forward");
+    TORCH_CHECK(num_cores() == 8 && num_layers() == 40 && hidden_size() == 2048 &&
+                    moe_.num_experts == 256 && moe_.routed_intermediate == 512 &&
+                    moe_layer_weights_.size() == 40 && gate.size() == 40 &&
+                    up.size() == 40 && down.size() == 40,
+                "resident N32K32 owners require the installed exact UINT4 TP8 model");
+    constexpr uint64_t bytes = UINT64_C(256) * 512 * 2048 / 2;
+    std::vector<std::pair<uint64_t, uint64_t>> next_ranges;
+    for (const auto& layer : moe_layer_weights_)
+        TORCH_CHECK(layer.routed_weight_mode == kRoutedUint4Mode,
+                    "resident N32K32 owners require UINT4 on every layer");
+    // Validate the complete update before retaining even one new owner. The
+    // ABI name binds its format; byte count alone cannot identify nibble order.
+    for (size_t layer = 0; layer < gate.size(); ++layer) {
+        const auto& installed = moe_layer_weights_[layer];
+        const at::Tensor* ordinary[] = {
+            &installed.routed_gate_w, &installed.routed_up_w, &installed.routed_down_w};
+        size_t projection = 0;
+        for (const auto* owner : {&gate[layer], &up[layer], &down[layer]}) {
+            TORCH_CHECK(owner->defined() && owner->device().type() == at::kPrivateUse1 &&
+                            owner->device() == moe_layer_weights_[layer].routed_gate_w.device() &&
+                            owner->scalar_type() == at::kByte && owner->is_contiguous() &&
+                            owner->dim() == 2 && owner->size(0) == 256 &&
+                            uint64_t(owner->nbytes()) == bytes,
+                        "resident N32K32 requires contiguous U8 [256,524288] owners");
+            const auto address = RpuGetDevAddr(owner->data_ptr());
+            TORCH_CHECK(address != 0 && address % 256 == 0 &&
+                            address < (UINT64_C(1) << 40) && bytes <= (UINT64_C(1) << 40) - address,
+                        "resident N32K32 weight address exceeds the typed DDR ABI");
+            // Published ordinary Grouped and resident indexed share N32K32.
+            // Require the matching installed projection so prefill/decode
+            // cannot accidentally bind different mathematical weights.
+            const auto* expected = ordinary[projection++];
+            TORCH_CHECK(address == RpuGetDevAddr(expected->data_ptr()) &&
+                            owner->nbytes() == expected->nbytes(),
+                        "resident N32K32 must share its corresponding ordinary grouped owner");
+            for (const auto& range : next_ranges)
+                TORCH_CHECK(address + bytes <= range.first || range.second <= address,
+                            "resident N32K32 projection owners must not overlap");
+            next_ranges.emplace_back(address, address + bytes);
+        }
+    }
+    for (size_t layer = 0; layer < gate.size(); ++layer) {
+        auto& weights = moe_layer_weights_[layer];
+        weights.resident_gate_w = gate[layer];
+        weights.resident_up_w = up[layer];
+        weights.resident_down_w = down[layer];
+    }
+    resident_uint4_n32k32_installed_ = true;
+    invalidate_model_state();
+}
+
+void Qwen3_5MoeModel::set_resident_prefill(bool enabled) {
+    TORCH_CHECK(get_last_resolved_chunk_size() == 0,
+                "Qwen3.5 MoE resident schedule must be selected before planning/forward");
+    if (enabled) {
+        const int64_t weight_mode = moe_layer_weights_.empty() ? -1
+            : moe_layer_weights_.front().routed_weight_mode;
+        TORCH_CHECK(num_cores() == 8 && hidden_size() == 2048 && num_layers() == 40 &&
+                        moe_.num_experts == 256 && moe_.top_k == 8 &&
+                        moe_.routed_intermediate == 512 && moe_.shared_intermediate == 512 &&
+                        !linear_acc32_ && !retained_prefill_graph_ &&
+                        !moe_layer_weights_.empty() &&
+                        ((weight_mode == kRoutedUint4Mode && resident_uint4_n32k32_installed_) ||
+                         weight_mode == 5),
+                    "Qwen3.5 resident prefill requires exact TP8 UINT4/E4M3 ACC16 bounded-one-shot profile");
+        for (const auto& layer : moe_layer_weights_)
+            TORCH_CHECK(layer.routed_weight_mode == weight_mode,
+                        "resident prefill requires one routed dtype across all layers");
+        for (const auto id : {weight_mode == 5 ? KernelId::GPL_INDEXED_W8_M256N32K256
+                                             : KernelId::GPL_INDEXED_W4_M256N32K256,
+                              weight_mode == 5 ? KernelId::GPL_SCATTER_W8_M256N128K64
+                                               : KernelId::GPL_SCATTER_W4_M256N128K64,
+                              KernelId::MOE_KVSORT_FP16,
+                              KernelId::MOE_BINCOUNT_SCALAR,
+                              KernelId::MOE_TOPK_PROB_NORM_FP16,
+                              KernelId::CAST_UINT16_INT32,
+                              KernelId::GATHER_FP16}) {
+            // Installation runs with the initialized runtime and requires the
+            // actual cached payloads, independently of capability snapshots.
+            TORCH_CHECK(KernelCache::instance().get(id) != nullptr,
+                        "Qwen3.5 resident prefill requires two compute families "
+                        "and the existing full-sort/normalization/index payloads");
+        }
+        TORCH_CHECK(expert_ids_.defined() && expert_ids_.size(0) >= 64,
+                    "Qwen3.5 resident router table is too small");
+        const int64_t extent = Align(kResidentMaxRoutes, int64_t{128});
+        resident_route_ordinals_ = at::empty({extent}, expert_ids_.options());
+        resident_route_tokens_ = at::empty({extent}, expert_ids_.options());
+        auto* ordinal = reinterpret_cast<uint16_t*>(
+            resident_route_ordinals_.data_ptr<c10::Half>());
+        auto* token = reinterpret_cast<uint16_t*>(
+            resident_route_tokens_.data_ptr<c10::Half>());
+        for (int64_t route = 0; route < extent; ++route) {
+            ordinal[route] = static_cast<uint16_t>(route);
+            token[route] = static_cast<uint16_t>(route / moe_.top_k);
+        }
+        rpu_ddr_flush_force_sized(ordinal, extent * sizeof(uint16_t));
+        rpu_ddr_flush_force_sized(token, extent * sizeof(uint16_t));
+    } else {
+        resident_route_ordinals_ = at::Tensor();
+        resident_route_tokens_ = at::Tensor();
+    }
+    resident_prefill_ = enabled;
+    // Keep the request's existing max-KV profile; per-C operator and SPM
+    // admission determine the window, without a separate 768 ceiling.
+    set_chunk_envelope(8192, enabled ? 8192
+                                    : std::min<int64_t>(4096 / moe_.top_k, expert_ids_.size(0)));
+    invalidate_model_state();
+}
+
+int64_t Qwen3_5MoeModel::resident_router_capacity() const {
+    return expert_ids_.defined() ? expert_ids_.size(0) : 0;
+}
+
+bool Qwen3_5MoeModel::resident_route_capacity_valid(int64_t tokens) const {
+    if (tokens <= 0 || moe_.top_k <= 0 ||
+            tokens > kResidentMaxRoutes / moe_.top_k ||
+            resident_router_capacity() < 64) return false;
+    const int64_t routes = tokens * moe_.top_k;
+    if (!resident_route_ordinals_.defined() || !resident_route_tokens_.defined() ||
+            resident_route_ordinals_.numel() < routes ||
+            resident_route_tokens_.numel() < routes) return false;
+    // The sort currently has a wider domain than signed-16 Down counts. Keep
+    // its actual capacity query in the path rather than hard-coding 4096.
+    return rpu_moe_kvsort_fp16_spm_sizes(routes).first >= routes;
 }
 
 void Qwen3_5MoeModel::set_fast_replay(bool enabled) {
@@ -363,6 +687,8 @@ void Qwen3_5MoeModel::set_fast_replay(bool enabled) {
 }
 
 void Qwen3_5MoeModel::set_retained_prefill_graph(bool enabled) {
+    TORCH_CHECK(!enabled || !resident_prefill_,
+                "Qwen3.5 resident prefill uses bounded-one-shot execution");
     TORCH_CHECK(
         get_last_resolved_chunk_size() == 0,
         "Qwen3.5 MoE prefill Graph lifecycle must be fixed before the first "
@@ -376,8 +702,34 @@ int64_t Qwen3_5MoeModel::resolve_prefill_chunk_size(int64_t execution_len) {
                 "RPU_PLANNER_REJECT:CAPABILITY: Qwen3.5 MoE prefill execution "
                 "length must be a positive multiple of 64, got ",
                 execution_len);
-    return resolve_chunk_size_for_shape(
-        execution_len, /*position=*/0, std::nullopt, /*is_causal=*/true);
+    resident_planning_active_ = resident_prefill_;
+    resident_planning_rows_ = resident_planning_logical_rows_ = execution_len;
+    resident_plans_.clear();
+    try {
+        int64_t result;
+        if (resident_prefill_ && get_chunk_size_override() == 0) {
+            const auto candidates = resolve_prefill_stage_domain_for_shape(
+                execution_len, /*position=*/0, std::nullopt, /*is_causal=*/true,
+                /*requested_chunk_size=*/0, /*logical_len=*/execution_len);
+            const auto selected = std::min_element(candidates.begin(), candidates.end(),
+                [](const auto& lhs, const auto& rhs) {
+                    return detail::fmb_prefill_stage_candidate_score(lhs) <
+                        detail::fmb_prefill_stage_candidate_score(rhs);
+                });
+            TORCH_CHECK(selected != candidates.end(), "Resident prefill has no candidate");
+            result = selected->compute_chunk_size;
+        } else {
+            result = resolve_chunk_size_for_shape(
+                execution_len, /*position=*/0, std::nullopt, /*is_causal=*/true);
+        }
+        resident_planning_active_ = false;
+        resident_plans_.clear();
+        return result;
+    } catch (...) {
+        resident_planning_active_ = false;
+        resident_plans_.clear();
+        throw;
+    }
 }
 
 std::vector<int64_t> Qwen3_5MoeModel::resolve_prefill_stage_domain(
@@ -394,11 +746,24 @@ std::vector<int64_t> Qwen3_5MoeModel::resolve_prefill_stage_domain(
                 "RPU_PLANNER_REJECT:CAPABILITY: Qwen3.5 MoE prefill logical "
                 "length must be in [2, execution length], got ", logical_len,
                 " for execution length ", execution_len);
-    return encode_fmb_prefill_stage_domain(
-        resolve_prefill_stage_domain_for_shape(
-            execution_len, /*position=*/0, std::nullopt,
-            /*is_causal=*/true, /*requested_chunk_size=*/0, logical_len,
-            planning_chunk_size_override));
+    resident_planning_active_ = resident_prefill_;
+    resident_planning_rows_ = execution_len;
+    resident_planning_logical_rows_ = logical_len;
+    resident_plans_.clear();
+    try {
+        auto result = encode_fmb_prefill_stage_domain(
+            resolve_prefill_stage_domain_for_shape(
+                execution_len, /*position=*/0, std::nullopt,
+                /*is_causal=*/true, /*requested_chunk_size=*/0, logical_len,
+                planning_chunk_size_override));
+        resident_planning_active_ = false;
+        resident_plans_.clear();
+        return result;
+    } catch (...) {
+        resident_planning_active_ = false;
+        resident_plans_.clear();
+        throw;
+    }
 }
 
 std::vector<int64_t> Qwen3_5MoeModel::resolve_decode_stage_descriptor() {
@@ -539,6 +904,28 @@ at::Tensor Qwen3_5MoeModel::forward_impl(
             (mrope_pos_delta_ >= -position &&
              mrope_pos_delta_ <= rope_cos.size(0) - seq_len - position),
         "Qwen3.5 MoE rotary position delta exceeds the installed table capacity");
+    if (resident_prefill_ && seq_len > 1) {
+        TORCH_CHECK(position == 0 && !attention_mask.has_value(),
+                    "Resident mixer plans require the admitted position-zero causal profile");
+        auto prepared = prepare_stage_candidate(planned_stage_descriptor);
+        prepared->validate_request(seq_len, position);
+        TORCH_CHECK(prepared->candidate().ranking.policy ==
+                        FmbPrefillRankingPolicy::OUTER_THEN_MIXER_V1 ||
+                        prepared->candidate().ranking.policy ==
+                        FmbPrefillRankingPolicy::OUTER_THEN_MIXER_LARGER_WINDOW_V2,
+                    "Resident prefill requires its declared ranking policy");
+        if (!resident_execution_plan_ ||
+                resident_execution_fingerprint_ != prepared->manifest_fingerprint()) {
+            restore_resident_plan(prepared->candidate());
+            resident_execution_fingerprint_ = prepared->manifest_fingerprint();
+        }
+        TORCH_CHECK(prepared->candidate().ranking.mixer_calls ==
+                        resident_execution_plan_->total_calls,
+                    "Resident prefill ranking differs from its actual mixer schedule");
+        TORCH_CHECK(resident_execution_plan_->request.logical_rows ==
+                        (valid_prefill_len_ > 0 ? valid_prefill_len_ : seq_len),
+                    "Resident mixer descriptor logical length differs from this request");
+    }
     gdn_states_  = &gdn_states;
     conv_states_ = &conv_states;
     fast_replay_active_ = fast_replay_enabled_ && seq_len > 1;
@@ -652,6 +1039,10 @@ void Qwen3_5MoeModel::build_layer_subgraph(int layer_idx, const ChunkInfo& chunk
             /*selector=*/num_cores() == 6 ? 2 : 1,
             /*resolved_flags=*/0, exact_profile_arguments(), chunk.idx);
     }
+    if (resident_prefill_ && chunk.len > 1) {
+        build_resident_layer(layer_idx, chunk);
+        return;
+    }
     const uint32_t input_residual = addr(0, "residual1");
 
     // A layer = input DMA → input_layernorm → token mixer → post_norm + MLP + output.
@@ -713,18 +1104,9 @@ void Qwen3_5MoeModel::launch_grouped_linear(
     int num_cores, int64_t weight_mode,
     const at::Tensor& negative_zero, int64_t group_size, int64_t m_total) {
     const int64_t invocation = chunk_idx * 2 + (is_col_parallel ? 0 : 1);
-    std::vector<int64_t> arguments{
-        n, k, num_experts, is_col_parallel ? 1 : 0, num_cores,
-        linear_acc32_ ? 1 : 0};
-    if (weight_mode == kRoutedUint4Mode) {
-        const auto tile = rpu_select_grouped_parallel_linear_uint4_tile(
-            m_total, num_experts, n, k);
-        arguments.insert(arguments.end(), {group_size, tile[0], tile[1], m_total});
-        const auto metadata = rpu_grouped_tiling::uint4_metadata_layout(
-            n, k, group_size, num_cores);
-        arguments.insert(arguments.end(), {metadata.version,
-            metadata.group_block_bytes, metadata.expert_bytes});
-    }
+    const auto arguments = qwen35_grouped_route_arguments(
+        m_total, n, k, num_experts, is_col_parallel, num_cores,
+        weight_mode, group_size, linear_acc32_);
     if (weight_mode == kRoutedUint4Mode) {
         if (ctx().has_complete_physical_manifest()) {
             ctx().consume_physical_route(
@@ -733,7 +1115,7 @@ void Qwen3_5MoeModel::launch_grouped_linear(
         }
         rpu_launch_grouped_parallel_linear_uint4_spm_kernel(
             input, weight, m_sizes, scale, negative_zero, output,
-            n, k, num_experts, is_col_parallel, num_cores, group_size, m_total);
+            n, k, num_experts, is_col_parallel, num_cores, group_size, m_total, linear_acc32_);
         return;
     }
     if (ctx().has_complete_physical_manifest()) {
@@ -743,7 +1125,7 @@ void Qwen3_5MoeModel::launch_grouped_linear(
     }
     rpu_launch_grouped_parallel_linear_spm_kernel(
         input, weight, m_sizes, optional_scale(scale), output, /*bias=*/0,
-        n, k, num_experts, is_col_parallel, num_cores, weight_mode, linear_acc32_);
+        n, k, num_experts, is_col_parallel, num_cores, m_total, weight_mode, linear_acc32_);
 }
 
 void Qwen3_5MoeModel::consume_manifest_route(
@@ -945,7 +1327,7 @@ void Qwen3_5MoeModel::build_full_attention(int layer_idx, const ChunkInfo& chunk
         FmbRouteFamily::ALL_REDUCE, QWEN35_MOE_FULL_ALL_REDUCE_SITE,
         text_ring_route(seq_len, h), chunk.idx);
     rpu_launch_all_reduce_sum_residual_kernel(
-        addr(0, "oproj"), addr(0, "residual1"),
+        addr(0, "oproj"), addr(0, "residual1") + mixer_residual_offset_,
         addr(0, "residual2"), seq_len, h,
         tp, num_cores());
 
@@ -1271,6 +1653,26 @@ void Qwen3_5MoeModel::build_gdn(int layer_idx, const ChunkInfo& chunk, bool deco
     rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel(D("gdn_c_gexp"), D("gdn_c_kbeta"), D("gdn_c_kbeta"), HL, Dk, c10::Half(1.0f), ValuOpType::MUL, false, nc);
     rpu_launch_bmm_spm_kernel(D("gdn_c_attn"), D("gdn_c_kbeta"), D("gdn_c_kcd"), C, Dk, C, HN, nc);
 
+    // Only glast changes address mode. Beta/g keep their existing per-core
+    // global copies; routed/shared expert scheduling is independent.
+    const bool glast_local = use_gdn_glast_local(L);
+    if (glast_local) {
+        TORCH_CHECK(ctx().has_complete_physical_manifest(),
+                    "MoE local GDN glast slices require a COMPLETE physical schedule");
+        ctx().consume_physical_route(
+            FmbRouteFamily::GRAPH_SCHEDULE, QWEN35_MOE_GDN_GLAST_LOCAL_SITE,
+            1, 0, gdn_glast_local_arguments(L), chunk.idx);
+    }
+    auto slice_glast = [&](uint32_t s, uint32_t d,
+                           const std::vector<int64_t>& is,
+                           const std::vector<int64_t>& os,
+                           const std::vector<int64_t>& b) {
+        if (glast_local)
+            rpu_launch_slice_spm_kernel(s, d, is, os, b, nc, true);
+        else
+            slice_pc(s, d, is, os, b);
+    };
+
     // ===== Phase 16: per-chunk recurrent loop. gdn_state [Hc,Dk,Dv] carried across i. =====
     // The state is consumed only by this loop, so load or initialize it after
     // the earlier phase scratch is dead.
@@ -1311,9 +1713,9 @@ void Qwen3_5MoeModel::build_gdn(int layer_idx, const ChunkInfo& chunk, bool deco
         rpu_launch_bmm_spm_kernel(a_qc, D("gdn_state"), a_outc, C, Dv, Dk, Hc, nc);
         rpu_launch_bmm_spm_kernel(D("gdn_c_attnc"), a_vc, D("gdn_c_loop_b"), C, Dv, C, Hc, nc);
         rpu_launch_eltwise_binary_spm_kernel(a_outc, D("gdn_c_loop_b"), a_outc, Hc * C * Dv, ValuOpType::ADD, c10::Half(1.0f), nc);
-        slice_pc(a_gexpc, D("gdn_c_glast"), sh_gl, sl_gl, bC);
+        slice_glast(a_gexpc, D("gdn_c_glast"), sh_gl, sl_gl, bC);
         rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel(D("gdn_c_glast"), D("gdn_state"), D("gdn_state"), Hc, Dk * Dv, c10::Half(1.0f), ValuOpType::MUL, false, nc);
-        slice_pc(a_gc, D("gdn_c_glast"), sh_gl, sl_gl, bC);
+        slice_glast(a_gc, D("gdn_c_glast"), sh_gl, sl_gl, bC);
         rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel(D("gdn_c_glast"), a_gc, a_gexpc, Hc, C, c10::Half(1.0f), ValuOpType::SUB, false, nc);
         rpu_launch_eltwise_unary_spm_kernel(a_gexpc, a_gexpc, Hc * C, ValuOpType::EXP, false, nc);
         rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel(a_gexpc, a_kc, a_kc, Hc * C, Dk, c10::Half(1.0f), ValuOpType::MUL, false, nc);
@@ -1393,7 +1795,7 @@ void Qwen3_5MoeModel::build_gdn(int layer_idx, const ChunkInfo& chunk, bool deco
         FmbRouteFamily::ALL_REDUCE, QWEN35_MOE_GDN_ALL_REDUCE_SITE,
         text_ring_route(L, hidden), chunk.idx);
     rpu_launch_all_reduce_sum_residual_kernel(
-        m_buf, addr(0, "residual1"),
+        m_buf, addr(0, "residual1") + mixer_residual_offset_,
         D("residual2"), L, hidden, nc, num_cores());
     return;
 }
@@ -1462,10 +1864,215 @@ void Qwen3_5MoeModel::emit_mlp_and_output(
     }
 }
 
+void Qwen3_5MoeModel::build_resident_layer(int layer_idx, const ChunkInfo& chunk) {
+    const int64_t h = hidden_size();
+    struct ResetOffset {
+        uint32_t& value;
+        ~ResetOffset() { value = 0; }
+    } reset_offset{mixer_residual_offset_};
+    if (!ctx().input_in_spm) emit_layer_input_dma(layer_idx, chunk);
+    for (const auto& sub : planned_resident_mixer_chunks(chunk)) {
+        mixer_residual_offset_ = static_cast<uint32_t>((sub.offset - chunk.offset) * h * DWIDTH);
+        rpu_launch_rmsnorm_spm_kernel(
+            addr(0, "residual1") + mixer_residual_offset_, addr(0, "input_norm"),
+            layer_addr(layer_idx, 0, "norm_w"), sub.len, h, eps_,
+            RpuRmsNormSpmRoute::BASE, num_cores());
+        if (layer_is_full_[layer_idx]) build_full_attention(layer_idx, sub);
+        else build_gdn(layer_idx, sub, /*decode=*/false);
+        // The ring has completed its read of this residual slice. Copy its
+        // disjoint short output back before advancing to the next mixer slice.
+        rpu_launch_spm_local_copy_dma(addr(0, "input_norm"), sub.len * h,
+            addr(0, "residual1") + mixer_residual_offset_, num_cores());
+    }
+    mixer_residual_offset_ = 0;
+    emit_resident_mlp(layer_idx, chunk);
+}
+
+void Qwen3_5MoeModel::emit_resident_mlp(int layer_idx, const ChunkInfo& chunk) {
+    const auto& lw = moe_layer_weights_.at(layer_idx);
+    const int64_t w = chunk.len, r = w * moe_.top_k, h = hidden_size();
+    const int nc = num_cores();
+    const uint32_t x = addr(0, "moe_resident_input");
+    const uint32_t partial = addr(0, "moe_partial");
+    const int64_t router_capacity = resident_router_capacity();
+    const int64_t runs = CeilDiv(w, router_capacity);
+    const auto sort_sizes = rpu_moe_kvsort_fp16_spm_sizes(r);
+    TORCH_CHECK(resident_route_capacity_valid(w),
+                "resident MoE route capacity changed after planning");
+    if (ctx().has_complete_physical_manifest() && layer_idx == 0) {
+        ctx().consume_physical_route(FmbRouteFamily::GRAPH_SCHEDULE,
+            QWEN35_MOE_RESIDENT_SCHEDULE_SITE, 1, 0,
+            resident_schedule_arguments(chunk), chunk.idx);
+    }
+    rpu_launch_rmsnorm_spm_kernel(addr(0, "residual1"), x,
+        layer_addr(layer_idx, 0, "post_norm_w"), w, h, eps_,
+        RpuRmsNormSpmRoute::BASE, nc);
+    for (int64_t run = 0; run < runs; ++run) {
+        const int64_t row = run * router_capacity;
+        const int64_t u = std::min(router_capacity, w - row);
+        const uint32_t route_offset = static_cast<uint32_t>(row * moe_.top_k * 2);
+        emit_router_topk(layer_idx, chunk.offset + row, u,
+                        x + static_cast<uint32_t>(row * h * 2),
+                        addr(0, "moe_resident_route_keys") + route_offset);
+        if (ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(FmbRouteFamily::GRAPH_SCHEDULE,
+                QWEN35_MOE_RESIDENT_ROUTE_SITE, 1, 0,
+                {u, row, u * moe_.top_k, moe_.num_experts, 3},
+                chunk.offset * 8192 + row);
+        }
+        // Normalize only the selected K scores. The same existing kernel and
+        // K reduction are used as in the dense [U,E] normalization, with a
+        // compact [U,K] numerator/output (no FP multiply used as a copy).
+        rpu_launch_moe_topk_prob_norm_fp16_spm_kernel(
+            addr(0, "moe_route_scores"), addr(0, "moe_route_scores"),
+            addr(0, "moe_resident_route_scores") + route_offset,
+            u, moe_.top_k, moe_.top_k, nc);
+    }
+    if (ctx().has_complete_physical_manifest()) {
+        ctx().consume_physical_route(FmbRouteFamily::GRAPH_SCHEDULE,
+            QWEN35_MOE_RESIDENT_ROUTE_SITE, 2, 0,
+            {runs, r, kResidentRouteBatch, moe_.num_experts, 3,
+             sort_sizes.first, sort_sizes.second}, chunk.offset * 8192 + w);
+    }
+    // Carry route ordinal through the full sort. Both the coefficient and
+    // token ID then use this single permutation, including repeated keys.
+    rpu_launch_ddr_broadcast_spm_dma(resident_route_ordinals_, 0, r,
+        addr(0, "moe_resident_sort_values"), nc);
+    rpu_launch_moe_kvsort_fp16_spm_kernel(
+        addr(0, "moe_resident_route_keys"), addr(0, "moe_resident_sort_values"),
+        addr(0, "moe_resident_sorted_experts"), addr(0, "moe_resident_sorted_ordinals"),
+        r, /*descending=*/false, nc);
+    rpu_launch_cast_uint16_int32_spm_kernel(
+        addr(0, "moe_resident_sorted_ordinals"), addr(0, "moe_resident_indices_i32"), r, nc);
+    rpu_launch_gather_fp16_spm_kernel(
+        addr(0, "moe_resident_route_scores"), addr(0, "moe_resident_indices_i32"),
+        addr(0, "moe_resident_coefficients"), 1, r, 1, r, nc);
+    // Full sort has released its input values. Reuse that temporary interval
+    // for the raw-U16 token table; Gather moves bits without FP arithmetic.
+    rpu_launch_ddr_broadcast_spm_dma(resident_route_tokens_, 0, r,
+        addr(0, "moe_resident_sort_values"), nc);
+    rpu_launch_gather_fp16_spm_kernel(
+        addr(0, "moe_resident_sort_values"), addr(0, "moe_resident_indices_i32"),
+        addr(0, "moe_resident_ids"), 1, r, 1, r, nc);
+    // Convert expert keys once for the complete route; subsequent GU slice
+    // counts consume U16 and must not apply FP16->U16 a second time.
+    rpu_launch_moe_bincount_scalar_spm_kernel(
+        addr(0, "moe_resident_sorted_experts"), addr(0, "moe_resident_sorted_experts"),
+        addr(0, "moe_resident_counts"), r, moe_.num_experts,
+        /*cvt_key=*/true, /*output_cvt_key=*/true, nc);
+    for (int64_t first = 0, batch = 0; first < r; first += kResidentRouteBatch, ++batch) {
+        const int64_t rows = std::min(kResidentRouteBatch, r - first);
+        const uint32_t experts = addr(0, "moe_resident_sorted_experts") +
+            static_cast<uint32_t>(first * 2);
+        rpu_launch_moe_bincount_scalar_spm_kernel(experts, experts,
+            addr(0, "moe_resident_batch_counts") +
+                static_cast<uint32_t>(batch * moe_.num_experts * 2),
+            rows, moe_.num_experts, /*cvt_key=*/false, /*output_cvt_key=*/false, nc);
+    }
+
+    for (int64_t first = 0, batch = 0; first < r; first += kResidentRouteBatch, ++batch) {
+        const int64_t rows = std::min(kResidentRouteBatch, r - first);
+        const auto shape = qwen35_resident_projection_shape(true, w, rows,
+            moe_layer_weights_.front().routed_weight_mode);
+        const auto selection = gil::resolve(shape);
+        const uint32_t act = addr(0, "moe_routed_act") + static_cast<uint32_t>(first * 64 * 2);
+        const uint32_t ids = addr(0, "moe_resident_ids") + static_cast<uint32_t>(first * 2);
+        const uint32_t counts = addr(0, "moe_resident_batch_counts") + static_cast<uint32_t>(batch * 256 * 2);
+        for (int64_t role = 0; role < 2; ++role) {
+            if (ctx().has_complete_physical_manifest()) {
+                ctx().consume_physical_route(FmbRouteFamily::LINEAR,
+                    QWEN35_MOE_RESIDENT_PROJECTION_SITE, 1, 0,
+                    {w, rows, first, 64, 2048, 256, shape.Q,
+                     kResidentProjectionLayoutVersion + (shape.weight_type == gil::WeightType::Float8E4M3),
+                     selection.m, selection.n, selection.k,
+                     selection.expert_partitions, shape.TP},
+                    chunk.offset * 64 + batch * 2 + role);
+            }
+            rpu_launch_grouped_indexed_linear_selected(shape, selection, x,
+                lw.routed_weight_mode == kRoutedUint4Mode
+                    ? (role == 0 ? lw.resident_gate_w : lw.resident_up_w)
+                    : (role == 0 ? lw.routed_gate_w : lw.routed_up_w), counts,
+                role == 0 ? lw.routed_gate_scale : lw.routed_up_scale,
+                lw.routed_weight_mode == kRoutedUint4Mode
+                    ? c10::optional<at::Tensor>(lw.routed_gate_negative_zero) : c10::nullopt, ids, 0,
+                role == 0 ? act : addr(0, "moe_routed_up"));
+        }
+        consume_manifest_route(FmbRouteFamily::ACTIVATION, QWEN35_MOE_RESIDENT_ROUTED_SILU_SITE,
+            static_cast<int64_t>(Qwen35MoeActivationRoute::SILU_MUL),
+            (chunk.offset * 8 + first) * 4 + 1);
+        rpu_launch_silu_mul_spm_kernel(act, addr(0, "moe_routed_up"), act, rows * 64, nc);
+    }
+
+    const int64_t shared_inv = chunk.offset + 8192;
+    launch_linear(shared_inv, x, lw.shared_gate_w, addr(0, "moe_shared_gate"),
+                  w, 512, h, 1, nc, 0, {}, true);
+    launch_linear(shared_inv, x, lw.shared_up_w, addr(0, "moe_shared_up"),
+                  w, 512, h, 1, nc, 0, {}, true);
+    consume_manifest_route(FmbRouteFamily::ACTIVATION, QWEN35_MOE_RESIDENT_SHARED_SILU_SITE,
+        static_cast<int64_t>(Qwen35MoeActivationRoute::SILU_MUL), shared_inv * 4 + 1);
+    rpu_launch_silu_mul_spm_kernel(addr(0, "moe_shared_gate"), addr(0, "moe_shared_up"),
+                                 addr(0, "moe_shared_act"), w * 64, nc);
+    // Scalar-gate projection is the final X consumer. It must precede Down,
+    // whose output aliases X and initializes every partial element.
+    launch_linear(shared_inv, x, lw.shared_scalar_gate_w, addr(0, "moe_shared_alpha_pad"),
+                  w, 16 * nc, h, 1, nc, 0, {}, true);
+    TORCH_CHECK(ctx().has_complete_physical_manifest(),
+                "Qwen3.5 MoE scalar slice requires a complete physical manifest");
+    ctx().consume_physical_route(FmbRouteFamily::GRAPH_SCHEDULE,
+        QWEN35_MOE_RESIDENT_SHARED_ALPHA_LOCAL_SITE, 1, 0,
+        shared_alpha_local_arguments(w, nc), shared_inv);
+    rpu_launch_slice_spm_kernel(addr(0, "moe_shared_alpha_pad"),
+        addr(0, "moe_shared_alpha"), {w, 16}, {w, 1}, {0, 0},
+        nc, /*per_core_local=*/true);
+    consume_manifest_route(FmbRouteFamily::ACTIVATION, QWEN35_MOE_RESIDENT_SHARED_SIGMOID_SITE,
+        static_cast<int64_t>(Qwen35MoeActivationRoute::SIGMOID), shared_inv * 4 + 2);
+    rpu_launch_eltwise_unary_spm_kernel(addr(0, "moe_shared_alpha"), addr(0, "moe_shared_alpha"),
+                                      w, ValuOpType::SIGMOID, GeluMode::NONE, nc);
+    launch_linear(shared_inv, addr(0, "moe_shared_act"), lw.shared_down_w, partial,
+                  w, h, 512, 0, nc, 0, {}, true);
+    rpu_launch_eltwise_binary_Nx1_NxC_spm_kernel(addr(0, "moe_shared_alpha"), partial,
+        partial, w, h, c10::Half(1.0), ValuOpType::MUL, false, nc);
+    const auto down_shape = qwen35_resident_projection_shape(false, w, r,
+        moe_layer_weights_.front().routed_weight_mode);
+    const auto down_selection = gil::resolve(down_shape);
+    if (ctx().has_complete_physical_manifest()) {
+        ctx().consume_physical_route(FmbRouteFamily::LINEAR,
+            QWEN35_MOE_RESIDENT_PROJECTION_SITE, 2, 0,
+            {w, r, 0, 2048, 64, 256, down_shape.Q,
+             kResidentProjectionLayoutVersion + (down_shape.weight_type == gil::WeightType::Float8E4M3),
+             down_selection.m, down_selection.n, down_selection.k,
+             down_selection.expert_partitions, down_shape.TP}, chunk.offset * 64 + 63);
+    }
+    rpu_launch_grouped_indexed_linear_selected(down_shape, down_selection,
+        addr(0, "moe_routed_act"),
+        lw.routed_weight_mode == kRoutedUint4Mode ? lw.resident_down_w : lw.routed_down_w,
+        addr(0, "moe_resident_counts"), lw.routed_down_scale,
+        lw.routed_weight_mode == kRoutedUint4Mode
+            ? c10::optional<at::Tensor>(lw.routed_down_negative_zero) : c10::nullopt,
+        addr(0, "moe_resident_ids"), addr(0, "moe_resident_coefficients"), partial);
+
+    for (int64_t row = 0; row < w; row += kResidentRingChunk) {
+        const int64_t t = std::min(kResidentRingChunk, w - row);
+        const uint32_t off = static_cast<uint32_t>(row * h * 2);
+        consume_manifest_route(FmbRouteFamily::ALL_REDUCE, QWEN35_MOE_RESIDENT_ALL_REDUCE_SITE,
+                               text_ring_route(t, h), chunk.offset + row);
+        rpu_launch_all_reduce_sum_residual_kernel(partial + off,
+            addr(0, "residual1") + off, addr(0, "moe_ring_output"), t, h, nc, nc);
+        if (layer_idx == num_layers() - 1) {
+            rpu_launch_rmsnorm_spm_kernel(addr(0, "moe_ring_output"), addr(0, "moe_ring_output"),
+                addr(0, "final_norm_w"), t, h, eps_, RpuRmsNormSpmRoute::BASE, nc);
+        }
+        rpu_launch_spm_local_copy_dma(addr(0, "moe_ring_output"), t * h,
+                                     addr(0, "residual1") + off, nc);
+    }
+    if (!ctx().output_to_spm) emit_layer_output_dma(layer_idx, chunk);
+}
+
 // ── declare_buffers: union of full-attention and GDN buffer sets; per-layer
 //    norm preloads are guarded so empty attention slots on GDN layers are not
 //    read. ───────────────────────────────────────────────────────────────────
-std::vector<BufferDecl> Qwen3_5MoeModel::declare_legacy_buffers(const LayoutContext& ctx) const {
+std::vector<BufferDecl> Qwen3_5MoeModel::declare_legacy_buffers(
+    const LayoutContext& ctx, int64_t sdpa_workspace_bytes) const {
     int64_t cs = ctx.chunk_size;
     int64_t h  = hidden_size();
     int64_t nq = num_q_heads();
@@ -1483,10 +2090,13 @@ std::vector<BufferDecl> Qwen3_5MoeModel::declare_legacy_buffers(const LayoutCont
     const int64_t local_si =
         physical_shared_intermediate() / shared_expert_tp();
     TORCH_CHECK(
-        moe_.tensor_parallel == routed_expert_tp() &&
-            routing_tp() == routed_expert_tp() &&
-            shared_expert_tp() == routed_expert_tp() &&
-            routed_expert_tp() == mlp_tp() &&
+        moe_.tensor_parallel == routing_tp() &&
+            routing_tp() == shared_expert_tp() &&
+            shared_expert_tp() == mlp_tp() &&
+            (routed_expert_tp() == routing_tp() ||
+             (routing_tp() == 6 && routed_expert_tp() == 4 &&
+              !moe_layer_weights_.empty() &&
+              moe_layer_weights_.front().routed_weight_mode == kRoutedUint4Mode)) &&
             e % router_tp() == 0 &&
             physical_routed_intermediate() % routed_expert_tp() == 0 &&
             physical_shared_intermediate() % shared_expert_tp() == 0,
@@ -1506,7 +2116,8 @@ std::vector<BufferDecl> Qwen3_5MoeModel::declare_legacy_buffers(const LayoutCont
     int64_t kv  = A(cs * local_kv * DWIDTH);
     int64_t nw  = A(h * DWIDTH);
     int64_t hnw = A(hd * DWIDTH);
-    int64_t tmp = A(sdpa_compute_tmp_v16_size(make_sdpa_config(), cs) * 32);
+    int64_t tmp = sdpa_workspace_bytes >= 0 ? A(sdpa_workspace_bytes)
+        : A(sdpa_compute_tmp_v16_size(make_sdpa_config(), cs) * 32);
 
     const char* narrow_input_alias = "input_norm";
 
@@ -1827,8 +2438,313 @@ std::vector<BufferDecl> Qwen3_5MoeModel::declare_legacy_buffers(const LayoutCont
 }
 
 
+std::vector<BufferDecl> Qwen3_5MoeModel::declare_active_buffers(
+    const LayoutContext& layout) const {
+    // Prefill has C64 granularity; decode uses the generic C16 capacity.
+    return resident_prefill_ && layout.chunk_size >= 64
+        ? declare_resident_buffers(layout) : declare_legacy_buffers(layout);
+}
+
+const Qwen3_5MoeModel::ResidentMixerPlan*
+Qwen3_5MoeModel::resident_plan_for_layout(const LayoutContext& layout) const {
+    if (layout.physical_manifest_fingerprint != 0 && resident_detached_plan_ &&
+        resident_detached_fingerprint_ == layout.physical_manifest_fingerprint) {
+        TORCH_CHECK(resident_detached_plan_->request.outer_capacity == layout.chunk_size,
+                    "Resident detached descriptor differs from its layout");
+        return &*resident_detached_plan_;
+    }
+    if (resident_planning_active_) {
+        const auto it = resident_plans_.find(layout.chunk_size);
+        TORCH_CHECK(it != resident_plans_.end() && it->second,
+                    "Resident buffer declaration requires its admitted cold candidate");
+        return &*it->second;
+    }
+    if (layout.physical_manifest_fingerprint != 0) {
+        TORCH_CHECK(resident_execution_plan_ &&
+                        resident_execution_fingerprint_ == layout.physical_manifest_fingerprint &&
+                        resident_execution_plan_->request.outer_capacity == layout.chunk_size,
+                    "Resident buffer declaration differs from the restored descriptor");
+        return &*resident_execution_plan_;
+    }
+    // Unbound weight/preload declarations precede the cold oracle. They retain
+    // the existing persistent declarations; no such fallback is used to admit
+    // a candidate or execute a COMPLETE descriptor.
+    return nullptr;
+}
+
+bool Qwen3_5MoeModel::plan_resident_candidate(
+    int64_t capacity, int64_t rows, int64_t position) const {
+    TORCH_CHECK(resident_planning_active_ && rows == resident_planning_rows_ &&
+                    position == 0,
+                "Resident mixer search requires its scoped cold request");
+    const auto found = resident_plans_.find(capacity);
+    if (found != resident_plans_.end()) return found->second.has_value();
+    const auto cfg = make_sdpa_config();
+    LayoutContext layout;
+    layout.chunk_size = capacity;
+    layout.max_kv_seq_len = rows;
+    layout.num_layers = num_layers();
+    layout.is_causal = true;
+    // These independent roots are simultaneously live during Gate/Up (phase
+    // 40), irrespective of the mixer split. Their sum is a necessary lower
+    // bound, not a heuristic layout or an artificial outer-window cap.
+    // Collapse their lifetimes to one phase to avoid allocator fragmentation
+    // making this bound larger than the required simultaneous storage.
+    std::vector<BufferDecl> necessary;
+    for (auto d : declare_resident_plan_buffers(layout, 64, 0)) {
+        if (d.storage != StorageClass::Temp) {
+            necessary.push_back(d);
+        } else if (std::string(d.name) == "residual1" ||
+                   std::string(d.name) == "moe_resident_input" ||
+                   std::string(d.name) == "moe_routed_gate" ||
+                   std::string(d.name) == "moe_routed_up") {
+            TORCH_CHECK(d.alias_of == nullptr,
+                        "Resident necessary SPM roots must have independent storage");
+            d.phase_start = d.phase_end = 0;
+            necessary.push_back(d);
+        }
+    }
+    if (!declared_spm_layout_fits(necessary)) {
+        resident_plans_.emplace(capacity, std::nullopt);
+        return false;
+    }
+    const auto result = qwen35_moe_planning::select_mixer_plan(
+        {capacity, rows, resident_planning_logical_rows_, position, 64},
+        [&](const qwen35_moe_planning::Call& call) -> std::optional<int64_t> {
+            if ((has_gdn_ && call.valid_rows == 0) ||
+                !sdpa_call_valid(cfg, call.rows, call.absolute_start))
+                return std::nullopt;
+            return Align(sdpa_compute_tmp_v16_size(cfg, call.rows) * 32,
+                         int64_t{256});
+        },
+        [&](int64_t mixer_rows, int64_t workspace) {
+            const auto declarations = declare_resident_plan_buffers(
+                layout, mixer_rows, workspace);
+            return qwen35_moe_planning::LayoutResult{
+                declared_spm_layout_fits(declarations),
+                static_cast<uint64_t>(detail::estimate_temporary_total(declarations))};
+        });
+    resident_plans_.emplace(capacity, result.plan);
+    return result.plan.has_value();
+}
+
+const Qwen3_5MoeModel::ResidentMixerPlan&
+Qwen3_5MoeModel::resident_plan_for_outer(const ChunkInfo& outer) const {
+    const int64_t capacity = outer.idx == 0 ? outer.len : outer.offset / outer.idx;
+    const ResidentMixerPlan* plan = nullptr;
+    if (resident_planning_active_) {
+        const auto it = resident_plans_.find(capacity);
+        TORCH_CHECK(it != resident_plans_.end() && it->second,
+                    "Resident manifest requires its own admitted candidate");
+        plan = &*it->second;
+    } else if (resident_execution_plan_) {
+        plan = &*resident_execution_plan_;
+    }
+    TORCH_CHECK(plan && plan->request.outer_capacity == capacity &&
+                    outer.idx >= 0 && static_cast<size_t>(outer.idx) < plan->windows.size(),
+                "Resident outer window has no bound mixer plan");
+    const auto& window = plan->windows[outer.idx];
+    TORCH_CHECK(window.offset == outer.offset && window.rows == outer.len &&
+                    outer.kv_seq_len == plan->request.position + outer.offset + outer.len,
+                "Resident mixer plan differs from the outer stage geometry");
+    return *plan;
+}
+
+std::vector<ChunkInfo> Qwen3_5MoeModel::planned_resident_mixer_chunks(
+    const ChunkInfo& outer) const {
+    const auto& plan = resident_plan_for_outer(outer);
+    std::vector<ChunkInfo> chunks;
+    for (const auto& call : plan.windows[outer.idx].calls) {
+        chunks.push_back({static_cast<int>(call.offset / 64), call.offset,
+                          call.rows, call.absolute_start + call.rows});
+    }
+    return chunks;
+}
+
+std::vector<int64_t> Qwen3_5MoeModel::resident_schedule_arguments(
+    const ChunkInfo& outer) const {
+    const auto& plan = resident_plan_for_outer(outer);
+    return {3, outer.len, plan.mixer_capacity, resident_router_capacity(),
+            kResidentRouteBatch, kResidentRingChunk, outer.len * moe_.top_k,
+            CeilDiv(outer.len, resident_router_capacity()), outer.offset, num_cores(),
+            plan.workspace_bytes, plan.windows[outer.idx].uniform_rows,
+            plan.request.execution_rows, plan.request.logical_rows};
+}
+
+Qwen3_5MoeModel::ResidentMixerPlan Qwen3_5MoeModel::decode_resident_plan(
+    const FmbPrefillStageCandidate& candidate) const {
+    const auto& manifest = candidate.physical_manifest;
+    ResidentMixerPlan plan;
+    plan.request = {candidate.compute_chunk_size, manifest.physical_length,
+                    manifest.logical_length, 0, 64};
+    const auto cfg = make_sdpa_config();
+    int64_t actual_workspace = 0;
+    size_t schedule_rows = 0;
+    for (const auto& route : manifest.routes)
+        schedule_rows += route.site_id == QWEN35_MOE_RESIDENT_SCHEDULE_SITE &&
+            route.family == FmbRouteFamily::GRAPH_SCHEDULE;
+    TORCH_CHECK(schedule_rows == candidate.stage_plan.compute.chunks.size(),
+                "Resident descriptor must contain one schedule per outer window");
+    for (const auto& outer : candidate.stage_plan.compute.chunks) {
+        const auto route = std::find_if(manifest.routes.begin(), manifest.routes.end(),
+            [&](const FmbRouteManifestEntry& row) {
+                return row.family == FmbRouteFamily::GRAPH_SCHEDULE &&
+                    row.site_id == QWEN35_MOE_RESIDENT_SCHEDULE_SITE &&
+                    row.invocation == outer.idx;
+            });
+        TORCH_CHECK(route != manifest.routes.end() && route->selector == 1 &&
+                        route->flags == 0 && route->arguments.size() == 14,
+                    "Resident execution requires a versioned mixer schedule");
+        const auto& a = route->arguments;
+        TORCH_CHECK(a[0] == 3 && a[1] == outer.len && a[2] >= 64 &&
+                        a[2] <= plan.request.outer_capacity && a[2] % 64 == 0 &&
+                        a[3] == resident_router_capacity() && a[4] == kResidentRouteBatch &&
+                        a[5] == kResidentRingChunk && a[6] == outer.len * moe_.top_k &&
+                        a[7] == CeilDiv(outer.len, resident_router_capacity()) &&
+                        a[8] == outer.offset && a[9] == num_cores() &&
+                        a[10] >= 0 && a[10] % 256 == 0 &&
+                        a[11] >= 64 && a[11] <= std::min(a[2], outer.len) &&
+                        a[11] % 64 == 0 && a[12] == manifest.physical_length &&
+                        a[13] == manifest.logical_length &&
+                        outer.kv_seq_len == outer.offset + outer.len,
+                    "Resident mixer descriptor geometry differs from its owner");
+        if (plan.windows.empty()) {
+            plan.mixer_capacity = a[2];
+            plan.workspace_bytes = a[10];
+        }
+        TORCH_CHECK(a[2] == plan.mixer_capacity && a[10] == plan.workspace_bytes,
+                    "Resident windows must share one allocated resource capacity");
+        qwen35_moe_planning::Window window{outer.offset, outer.len, a[11], {}};
+        for (int64_t row = 0; row < outer.len; row += a[11]) {
+            const int64_t length = std::min(a[11], outer.len - row);
+            const int64_t offset = outer.offset + row;
+            const int64_t valid_rows =
+                std::min(length, std::max(int64_t{0}, manifest.logical_length - offset));
+            TORCH_CHECK((!has_gdn_ || valid_rows > 0) &&
+                            sdpa_call_valid(cfg, length, offset),
+                        "Resident descriptor includes an unsupported actual SDPA call");
+            const int64_t workspace = Align(
+                sdpa_compute_tmp_v16_size(cfg, length) * 32, int64_t{256});
+            actual_workspace = std::max(actual_workspace, workspace);
+            window.calls.push_back({offset, length, offset, valid_rows, workspace});
+            ++plan.total_calls;
+        }
+        plan.windows.push_back(std::move(window));
+    }
+    TORCH_CHECK((candidate.ranking.policy == FmbPrefillRankingPolicy::OUTER_THEN_MIXER_V1 ||
+                    candidate.ranking.policy == FmbPrefillRankingPolicy::OUTER_THEN_MIXER_LARGER_WINDOW_V2) &&
+                    candidate.ranking.mixer_calls == plan.total_calls,
+                "Resident descriptor ranking differs from its actual mixer schedule");
+    TORCH_CHECK(!plan.windows.empty() && actual_workspace == plan.workspace_bytes,
+                "Resident SDPA allocation must match the maximum actual call requirement");
+    return plan;
+}
+
+FmbPrefillRanking Qwen3_5MoeModel::prefill_candidate_ranking(
+    const FmbPrefillStageCandidate& candidate, const LayoutContext& layout) const {
+    if (!resident_prefill_ || candidate.physical_manifest.physical_length <= 1)
+        return {};
+    const auto* plan = resident_plan_for_layout(layout);
+    TORCH_CHECK(plan && plan->windows.size() == candidate.stage_plan.compute.chunks.size() &&
+                    plan->request.execution_rows == candidate.physical_manifest.physical_length &&
+                    plan->request.logical_rows == candidate.physical_manifest.logical_length,
+                "Resident candidate ranking requires its already planned mixer schedule");
+    return {FmbPrefillRankingPolicy::OUTER_THEN_MIXER_LARGER_WINDOW_V2, plan->total_calls};
+}
+
+void Qwen3_5MoeModel::restore_resident_plan(const FmbPrefillStageCandidate& candidate) {
+    resident_execution_plan_ = decode_resident_plan(candidate);
+}
+
+void Qwen3_5MoeModel::rebind_kvinsert_exact_candidate(
+    FmbPrefillStageCandidate& candidate, const LayoutContext&,
+    int64_t, int64_t, const KvInsertSegmentPlan&) const {
+    if (!resident_prefill_ || candidate.compute_chunk_size < 64) return;
+    // KV exact-mint changes the manifest identity while retaining the model's
+    // immutable mixer schedule. The base's owner scope restores these fields
+    // after both successful and failed detached queries.
+    resident_detached_plan_ = decode_resident_plan(candidate);
+    resident_detached_fingerprint_ =
+        fmb_physical_manifest_fingerprint(candidate.physical_manifest);
+}
+
+std::vector<BufferDecl> Qwen3_5MoeModel::declare_resident_buffers(
+    const LayoutContext& layout) const {
+    const auto* plan = resident_plan_for_layout(layout);
+    const int64_t mixer_rows = plan ? plan->mixer_capacity
+        : std::min(layout.chunk_size, kResidentMixerChunk);
+    const int64_t workspace = plan ? plan->workspace_bytes
+        : resident_mixer_sdpa_tmp_bytes(make_sdpa_config(), mixer_rows);
+    return declare_resident_plan_buffers(layout, mixer_rows, workspace);
+}
+
+std::vector<BufferDecl> Qwen3_5MoeModel::declare_resident_plan_buffers(
+    const LayoutContext& layout, int64_t mixer_rows, int64_t workspace_bytes) const {
+    const int64_t w = layout.chunk_size;
+    TORCH_CHECK(num_cores() == 8 && w > 1 && w % 64 == 0 &&
+                    resident_route_capacity_valid(w),
+                "resident MoE layout exceeds the sort/count/projection ABI");
+    auto mixer = layout;
+    mixer.chunk_size = mixer_rows;
+    mixer.kv_insert_chunk_size = mixer.chunk_size;
+    auto base = declare_legacy_buffers(mixer, workspace_bytes);
+    std::vector<BufferDecl> declarations;
+    // Keep the full stream first. A short first root would fragment the later X arena.
+    for (auto d : base) {
+        const std::string name(d.name);
+        if (d.storage == StorageClass::Temp && name.rfind("moe_", 0) == 0)
+            continue;
+        if (name == "residual1") { d.size = aligned_bytes(w * hidden_size()); d.phase_end = 72; }
+        if (name == "input_norm") d.phase_end = 29;
+        if (name == "sdpa_tmp") d.size = Align(workspace_bytes, int64_t{256});
+        if (name == "gdn_c_tril" || name == "gdn_c_strict") {
+            d.phase_start = 0; d.phase_end = 72;
+        }
+        declarations.push_back(d);
+    }
+    const int64_t r = w * moe_.top_k;
+    const int64_t u = std::min(w, resident_router_capacity());
+    const int64_t e = moe_.num_experts;
+    const auto sort_sizes = rpu_moe_kvsort_fp16_spm_sizes(r);
+    auto add = [&](const char* name, int64_t elems, int first, int last,
+                   const char* alias = nullptr) {
+        declarations.push_back({name, alias ? 0 : aligned_bytes(elems),
+            first, last, StorageClass::Temp, 0, alias});
+    };
+    add("moe_resident_input", w * hidden_size(), 30, 72);
+    add("moe_partial", 0, 0, 0, "moe_resident_input");
+    // All router microbatches finish before full sort starts. Keep compact
+    // keys/scores for the complete window; the wide [U,E] router scratch is
+    // released at phase34, independently of GU's route batch capacity.
+    add("moe_resident_route_keys", sort_sizes.first, 31, 35);
+    add("moe_resident_route_scores", r, 31, 37);
+    add("moe_router_local", u * e / router_tp(), 31, 34);
+    add("moe_router_logits", u * e, 31, 34);
+    add("moe_router_probs", u * e, 31, 34);
+    add("moe_route_scores", u * moe_.top_k, 31, 34);
+    add("moe_resident_sort_values", sort_sizes.first, 35, 38);
+    add("moe_resident_sorted_experts", sort_sizes.second, 35, 39);
+    add("moe_resident_sorted_ordinals", sort_sizes.second, 35, 36);
+    // add() counts two-byte elements; I32 indices need twice that extent.
+    add("moe_resident_indices_i32", 2 * r, 36, 38);
+    add("moe_resident_coefficients", r, 37, 60);
+    add("moe_resident_ids", r, 38, 60);
+    add("moe_resident_counts", e, 39, 60);
+    add("moe_resident_batch_counts", CeilDiv(r, kResidentRouteBatch) * e, 39, 44);
+    add("moe_routed_gate", r * 64, 40, 60);
+    add("moe_routed_act", 0, 0, 0, "moe_routed_gate");
+    add("moe_routed_up", std::min(r, kResidentRouteBatch) * 64, 40, 44);
+    add("moe_shared_gate", w * 64, 45, 50);
+    add("moe_shared_act", 0, 0, 0, "moe_shared_gate");
+    add("moe_shared_up", w * 64, 45, 46);
+    add("moe_shared_alpha_pad", w * 16, 47, 48);
+    add("moe_shared_alpha", w, 48, 51);
+    add("moe_ring_output", std::min(w, kResidentRingChunk) * hidden_size(), 70, 72);
+    return declarations;
+}
+
 std::vector<BufferDecl> Qwen3_5MoeModel::declare_buffers(const LayoutContext& layout) {
-    auto declarations = declare_legacy_buffers(layout);
+    auto declarations = declare_active_buffers(layout);
     switch (layout.forward_operand_residency) {
         case FmbForwardOperandResidency::UNSPECIFIED:
         case FmbForwardOperandResidency::PER_LAYER:
@@ -1861,7 +2777,7 @@ FmbForwardOperandResidency Qwen3_5MoeModel::gdn_mask_residency_for_candidate(
     }
     const auto fits = [&](const LayoutContext& candidate_layout) {
         const auto trial = detail::make_forward_spm_residency_candidate(
-            declare_legacy_buffers(candidate_layout),
+            declare_active_buffers(candidate_layout),
             {"gdn_c_tril", "gdn_c_strict"});
         return trial.valid && declared_spm_layout_fits(trial.declarations);
     };
@@ -1918,6 +2834,12 @@ FmbForwardOperandResidency Qwen3_5MoeModel::physical_forward_operand_residency(
 
 int64_t Qwen3_5MoeModel::subclass_layout_hash() const {
     int64_t hash = 0;
+    for (const auto value : shared_alpha_local_identity(shared_expert_tp()))
+        hash = detail::layout_mix(hash, value);
+    if (has_gdn_glast_local_capability()) {
+        for (const auto value : gdn_glast_local_identity())
+            hash = detail::layout_mix(hash, value);
+    }
     if (num_cores() != 8) {
         for (const int64_t value : cold_topology_arguments())
             hash = detail::layout_mix(hash, value);
@@ -1927,7 +2849,8 @@ int64_t Qwen3_5MoeModel::subclass_layout_hash() const {
              moe_.shared_intermediate, moe_.tensor_parallel,
              gdn_nvh_, gdn_dk_, gdn_dv_, gdn_conv_dim_, gdn_kc_,
              static_cast<int64_t>(linear_acc32_),
-             static_cast<int64_t>(retained_prefill_graph_)}) {
+             static_cast<int64_t>(retained_prefill_graph_),
+             static_cast<int64_t>(resident_prefill_)}) {
         hash = detail::layout_mix(hash, value);
     }
     if (num_cores() == 6) {
@@ -1938,19 +2861,26 @@ int64_t Qwen3_5MoeModel::subclass_layout_hash() const {
     }
     for (const uint8_t full : layer_is_full_)
         hash = detail::layout_mix(hash, full);
-    if (!moe_layer_weights_.empty() &&
-            moe_layer_weights_.front().routed_weight_mode == kRoutedUint4Mode) {
+    if (!moe_layer_weights_.empty()) {
         const auto& mw = moe_layer_weights_.front();
         hash = detail::layout_mix(hash, mw.routed_weight_mode);
         hash = detail::layout_mix(hash, mw.routed_group_size);
         hash = detail::layout_mix(hash, mw.routed_down_group_size);
     }
+    if (resident_uint4_n32k32_installed_)
+        hash = detail::layout_mix(hash, kResidentProjectionLayoutVersion);
     return hash;
 }
 
 std::vector<int64_t> Qwen3_5MoeModel::kvinsert_cost_weight_identity() const {
     if (layer_weights_.empty()) return {};
     std::vector<int64_t> identity{1};
+    const auto alpha_schedule = shared_alpha_local_identity(shared_expert_tp());
+    identity.insert(identity.end(), alpha_schedule.begin(), alpha_schedule.end());
+    if (has_gdn_glast_local_capability()) {
+        const auto schedule = gdn_glast_local_identity();
+        identity.insert(identity.end(), schedule.begin(), schedule.end());
+    }
     if (num_cores() != 8) {
         const auto topology = cold_topology_arguments();
         identity.insert(identity.end(), topology.begin(), topology.end());
@@ -1959,7 +2889,8 @@ std::vector<int64_t> Qwen3_5MoeModel::kvinsert_cost_weight_identity() const {
         moe_.num_experts, moe_.top_k, moe_.routed_intermediate,
         moe_.shared_intermediate, moe_.tensor_parallel,
         static_cast<int64_t>(linear_acc32_),
-        static_cast<int64_t>(retained_prefill_graph_)});
+        static_cast<int64_t>(retained_prefill_graph_),
+        static_cast<int64_t>(resident_prefill_)});
     if (num_cores() == 6) {
         identity.push_back(physical_routed_intermediate());
         identity.push_back(physical_shared_intermediate());
@@ -1982,6 +2913,11 @@ std::vector<int64_t> Qwen3_5MoeModel::kvinsert_cost_weight_identity() const {
             append_kvinsert_cost_tensor_identity(identity, *tensor);
         }
         const auto& mw = moe_layer_weights_[i];
+        if (resident_uint4_n32k32_installed_) {
+            identity.push_back(kResidentProjectionLayoutVersion);
+            for (const auto* owner : {&mw.resident_gate_w, &mw.resident_up_w, &mw.resident_down_w})
+                append_kvinsert_cost_tensor_identity(identity, *owner);
+        }
         identity.push_back(mw.routed_weight_mode);
         if (mw.routed_weight_mode == kRoutedUint4Mode) {
             identity.push_back(rpu_grouped_tiling::Uint4MetadataLayout::version);
@@ -2005,6 +2941,10 @@ std::vector<int64_t> Qwen3_5MoeModel::kvinsert_cost_weight_identity() const {
     }
     if (router_bridge_.defined())
         append_kvinsert_cost_tensor_identity(identity, router_bridge_);
+    if (resident_prefill_) {
+        append_kvinsert_cost_tensor_identity(identity, resident_route_ordinals_);
+        append_kvinsert_cost_tensor_identity(identity, resident_route_tokens_);
+    }
     return identity;
 }
 
@@ -2026,6 +2966,16 @@ ModelDynamicConfig Qwen3_5MoeModel::dynamic_config(const ChunkPlan& /*plan*/) {
 
 bool Qwen3_5MoeModel::subclass_chunk_size_valid(int64_t cs, int64_t seq_len,
                                              int64_t position) const {
+    if (resident_prefill_ && seq_len > 1) {
+        if (cs <= 0 || cs % 64 != 0 || !resident_route_capacity_valid(cs))
+            return false;
+        if (!chunk_within_envelope(cs)) return false;
+        if (resident_planning_active_) return plan_resident_candidate(cs, seq_len, position);
+        return resident_execution_plan_ &&
+            resident_execution_plan_->request.outer_capacity == cs &&
+            resident_execution_plan_->request.execution_rows == seq_len &&
+            resident_execution_plan_->request.position == position;
+    }
     if (!sdpa_is_valid_chunk_size(make_sdpa_config(), cs, seq_len, position))
         return false;
     const int64_t moe_cs = std::min(cs, kMoeChunkSize);
@@ -2156,12 +3106,27 @@ Qwen3_5MoeModel::physical_manifest_for_candidate(
         layer_is_full_.begin(), layer_is_full_.end(),
         [](uint8_t value) { return value != 0; });
     const int64_t gdn_layers = num_layers() - full_layers;
-    for (const ChunkInfo& chunk : plan.compute.chunks) {
-        const bool decode = chunk.len == 1;
+    std::vector<ChunkInfo> mixer_chunks;
+    for (const ChunkInfo& outer : plan.compute.chunks) {
         manifest.routes.push_back({
             QWEN35_MOE_EXACT_PROFILE_SITE, FmbRouteFamily::GRAPH_SCHEDULE,
             /*selector=*/num_cores() == 6 ? 2 : 1,
-            /*flags=*/0, exact_profile_arguments(), chunk.idx});
+            /*flags=*/0, exact_profile_arguments(), outer.idx});
+        append_mlp_manifest_routes(manifest, outer);
+        if (resident_prefill_ && physical_len > 1) {
+            const auto subs = planned_resident_mixer_chunks(outer);
+            mixer_chunks.insert(mixer_chunks.end(), subs.begin(), subs.end());
+        } else mixer_chunks.push_back(outer);
+    }
+    for (const ChunkInfo& chunk : mixer_chunks) {
+        const bool decode = chunk.len == 1;
+        // Resident prefill emits these mixer subchunks, not the outer MLP
+        // windows. Bind their actual length and invocation to build_gdn.
+        if (use_gdn_glast_local(chunk.len)) {
+            manifest.routes.push_back({
+                QWEN35_MOE_GDN_GLAST_LOCAL_SITE, FmbRouteFamily::GRAPH_SCHEDULE,
+                1, 0, gdn_glast_local_arguments(chunk.len), chunk.idx});
+        }
 
         bool needs_auto_tile = false;
         bool needs_gemv = false;
@@ -2193,8 +3158,6 @@ Qwen3_5MoeModel::physical_manifest_for_candidate(
             append_linear(FmbLinearRouteSelector::AUTO_TILE, chunk.idx);
         if (needs_gemv)
             append_linear(FmbLinearRouteSelector::GEMV, chunk.idx);
-
-        append_mlp_manifest_routes(manifest, chunk);
 
         if (full_layers > 0) {
             manifest.routes.push_back({
@@ -2286,7 +3249,9 @@ Qwen3_5MoeModel::physical_manifest_for_candidate(
     }
 
     if (full_layers > 0) {
-        for (const ChunkInfo& chunk : plan.qkv.chunks) {
+        const auto& insert_chunks = resident_prefill_ && physical_len > 1
+            ? mixer_chunks : plan.qkv.chunks;
+        for (const ChunkInfo& chunk : insert_chunks) {
             const bool dynamic_decode_position = physical_len == 1;
             const int64_t insert_position = dynamic_decode_position
                 ? 0 : position + chunk.offset;
@@ -2331,6 +3296,10 @@ Qwen3_5MoeModel::physical_manifest_for_candidate(
 
 void Qwen3_5MoeModel::append_mlp_manifest_routes(
     FmbPhysicalExecutionManifest& manifest, const ChunkInfo& chunk) const {
+    if (resident_prefill_ && chunk.len > 1) {
+        append_resident_mlp_manifest_routes(manifest, chunk);
+        return;
+    }
     const int64_t grouped_mode = moe_layer_weights_.empty()
         ? 5 : moe_layer_weights_.front().routed_weight_mode;
     const int64_t local_i =
@@ -2374,31 +3343,12 @@ void Qwen3_5MoeModel::append_mlp_manifest_routes(
                     linear_invocation(invocation, selector, /*mlp_slice=*/true));
             }
         }
-        std::vector<int64_t> gate_arguments{
-            local_i, hidden_size(), moe_.num_experts, 1, nc,
-            linear_acc32_ ? 1 : 0};
-        std::vector<int64_t> down_arguments{
-            hidden_size(), local_i, moe_.num_experts, 0, nc,
-            linear_acc32_ ? 1 : 0};
-        if (grouped_mode == kRoutedUint4Mode) {
-            const int64_t m_total = t * moe_.top_k;
-            const auto gate_tile = rpu_select_grouped_parallel_linear_uint4_tile(
-                m_total, moe_.num_experts, local_i, hidden_size());
-            const auto down_tile = rpu_select_grouped_parallel_linear_uint4_tile(
-                m_total, moe_.num_experts, hidden_size(), local_i);
-            gate_arguments.insert(gate_arguments.end(),
-                {kRoutedUint4GroupSize, gate_tile[0], gate_tile[1], m_total});
-            down_arguments.insert(down_arguments.end(),
-                {kRoutedUint4DownGroupSize, down_tile[0], down_tile[1], m_total});
-            const auto gate_metadata = rpu_grouped_tiling::uint4_metadata_layout(
-                local_i, hidden_size(), kRoutedUint4GroupSize, nc);
-            const auto down_metadata = rpu_grouped_tiling::uint4_metadata_layout(
-                hidden_size(), local_i, kRoutedUint4DownGroupSize, nc);
-            gate_arguments.insert(gate_arguments.end(), {gate_metadata.version,
-                gate_metadata.group_block_bytes, gate_metadata.expert_bytes});
-            down_arguments.insert(down_arguments.end(), {down_metadata.version,
-                down_metadata.group_block_bytes, down_metadata.expert_bytes});
-        }
+        auto gate_arguments = qwen35_grouped_route_arguments(
+            t * moe_.top_k, local_i, hidden_size(), moe_.num_experts,
+            true, nc, grouped_mode, kRoutedUint4GroupSize, linear_acc32_);
+        auto down_arguments = qwen35_grouped_route_arguments(
+            t * moe_.top_k, hidden_size(), local_i, moe_.num_experts,
+            false, nc, grouped_mode, kRoutedUint4DownGroupSize, linear_acc32_);
         const int64_t grouped_site = grouped_mode == kRoutedUint4Mode
             ? QWEN35_MOE_GROUPED_UINT4_SITE : QWEN35_MOE_GROUPED_FP8_SITE;
         manifest.routes.push_back({
@@ -2444,6 +3394,9 @@ void Qwen3_5MoeModel::append_mlp_manifest_routes(
             FmbRouteFamily::ACTIVATION, QWEN35_MOE_SHARED_SILU_SITE,
             static_cast<int64_t>(Qwen35MoeActivationRoute::SILU_MUL),
             invocation * 4 + 1);
+        manifest.routes.push_back({
+            QWEN35_MOE_SHARED_ALPHA_LOCAL_SITE, FmbRouteFamily::GRAPH_SCHEDULE,
+            1, 0, shared_alpha_local_arguments(t, shared_expert_tp()), invocation});
         append_route(
             FmbRouteFamily::ACTIVATION, QWEN35_MOE_SHARED_SIGMOID_SITE,
             static_cast<int64_t>(Qwen35MoeActivationRoute::SIGMOID),
@@ -2457,6 +3410,77 @@ void Qwen3_5MoeModel::append_mlp_manifest_routes(
             FmbRouteFamily::ALL_REDUCE, QWEN35_MOE_ALL_REDUCE_SITE,
             text_ring_route(t, hidden_size()), invocation);
     });
+}
+
+void Qwen3_5MoeModel::append_resident_mlp_manifest_routes(
+    FmbPhysicalExecutionManifest& manifest, const ChunkInfo& chunk) const {
+    const int64_t w = chunk.len, r = w * moe_.top_k;
+    const int64_t router_capacity = resident_router_capacity();
+    const int64_t runs = CeilDiv(w, router_capacity);
+    const auto sort_sizes = rpu_moe_kvsort_fp16_spm_sizes(r);
+    auto append = [&](FmbRouteFamily family, int64_t site, int64_t selector,
+                      std::vector<int64_t> args, int64_t invocation) {
+        manifest.routes.push_back({site, family, selector, 0, std::move(args), invocation});
+    };
+    append(FmbRouteFamily::GRAPH_SCHEDULE, QWEN35_MOE_RESIDENT_SCHEDULE_SITE, 1,
+        resident_schedule_arguments(chunk), chunk.idx);
+    const auto gather = rpu_resolve_all_gather_schedule(32, sizeof(c10::Half));
+    for (int64_t run = 0; run < runs; ++run) {
+        const int64_t row = run * router_capacity;
+        const int64_t u = std::min(router_capacity, w - row);
+        const int64_t invocation = chunk.offset + row;
+        append(FmbRouteFamily::LINEAR, QWEN35_MOE_LINEAR_SITE,
+            static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE), {},
+            linear_invocation(invocation, FmbLinearRouteSelector::AUTO_TILE, true));
+        append(FmbRouteFamily::COLLECTIVE, QWEN35_MOE_ROUTER_ALL_GATHER_SITE,
+            static_cast<int64_t>(gather), {u, 32, 2, 8}, invocation);
+        append(FmbRouteFamily::GRAPH_SCHEDULE, QWEN35_MOE_RESIDENT_ROUTE_SITE, 1,
+            {u, row, u * moe_.top_k, moe_.num_experts, 3},
+            chunk.offset * 8192 + row);
+    }
+    append(FmbRouteFamily::GRAPH_SCHEDULE, QWEN35_MOE_RESIDENT_ROUTE_SITE, 2,
+        {runs, r, kResidentRouteBatch, moe_.num_experts, 3,
+         sort_sizes.first, sort_sizes.second}, chunk.offset * 8192 + w);
+    for (int64_t first = 0, batch = 0; first < r; first += kResidentRouteBatch, ++batch) {
+        const int64_t rows = std::min(kResidentRouteBatch, r - first);
+        const auto shape = qwen35_resident_projection_shape(true, w, rows,
+            moe_layer_weights_.front().routed_weight_mode);
+        const auto selection = gil::resolve(shape);
+        for (int64_t role = 0; role < 2; ++role) {
+            append(FmbRouteFamily::LINEAR, QWEN35_MOE_RESIDENT_PROJECTION_SITE, 1,
+                {w, rows, first, 64, 2048, 256, shape.Q,
+                     kResidentProjectionLayoutVersion + (shape.weight_type == gil::WeightType::Float8E4M3),
+                 selection.m, selection.n, selection.k,
+                 selection.expert_partitions, shape.TP}, chunk.offset * 64 + batch * 2 + role);
+        }
+        append(FmbRouteFamily::ACTIVATION, QWEN35_MOE_RESIDENT_ROUTED_SILU_SITE,
+            static_cast<int64_t>(Qwen35MoeActivationRoute::SILU_MUL), {},
+            (chunk.offset * 8 + first) * 4 + 1);
+    }
+    const int64_t shared_inv = chunk.offset + 8192;
+    append(FmbRouteFamily::LINEAR, QWEN35_MOE_LINEAR_SITE,
+        static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE), {},
+        linear_invocation(shared_inv, FmbLinearRouteSelector::AUTO_TILE, true));
+    append(FmbRouteFamily::ACTIVATION, QWEN35_MOE_RESIDENT_SHARED_SILU_SITE,
+        static_cast<int64_t>(Qwen35MoeActivationRoute::SILU_MUL), {}, shared_inv * 4 + 1);
+    append(FmbRouteFamily::GRAPH_SCHEDULE,
+        QWEN35_MOE_RESIDENT_SHARED_ALPHA_LOCAL_SITE, 1,
+        shared_alpha_local_arguments(w, shared_expert_tp()), shared_inv);
+    append(FmbRouteFamily::ACTIVATION, QWEN35_MOE_RESIDENT_SHARED_SIGMOID_SITE,
+        static_cast<int64_t>(Qwen35MoeActivationRoute::SIGMOID), {}, shared_inv * 4 + 2);
+    const auto down_shape = qwen35_resident_projection_shape(false, w, r,
+        moe_layer_weights_.front().routed_weight_mode);
+    const auto down_selection = gil::resolve(down_shape);
+    append(FmbRouteFamily::LINEAR, QWEN35_MOE_RESIDENT_PROJECTION_SITE, 2,
+        {w, r, 0, 2048, 64, 256, down_shape.Q,
+             kResidentProjectionLayoutVersion + (down_shape.weight_type == gil::WeightType::Float8E4M3),
+         down_selection.m, down_selection.n, down_selection.k,
+         down_selection.expert_partitions, down_shape.TP}, chunk.offset * 64 + 63);
+    for (int64_t row = 0; row < w; row += kResidentRingChunk) {
+        const int64_t t = std::min(kResidentRingChunk, w - row);
+        append(FmbRouteFamily::ALL_REDUCE, QWEN35_MOE_RESIDENT_ALL_REDUCE_SITE,
+            text_ring_route(t, hidden_size()), {}, chunk.offset + row);
+    }
 }
 
 FmbPhysicalManifestForwardCapability
@@ -2683,11 +3707,17 @@ void Qwen3_5MoeModel::set_weights(
     at::TensorList gdn_cq_list, at::TensorList gdn_ck_list, at::TensorList gdn_cv_list,
     at::TensorList gdn_b_bg_list, at::TensorList gdn_a_bg_list) {
     prefill_rope_cpu_published_ = false;
+    TORCH_CHECK(!resident_uint4_n32k32_installed_,
+                "replacing resident dual-format weights requires a fresh native handle");
     const int64_t N = static_cast<int64_t>(layer_is_full.size());
     const bool routed_uint4 = routed_weight_mode == kRoutedUint4Mode;
+    const bool routed_int8 = routed_weight_mode == kRoutedInt8Mode;
+    // Routed-only profiles keep attention/GDN projections FP16.
+    const bool mixers_fp16 = routed_uint4 || routed_int8;
+    const int routed_nc = num_cores() == 6 && routed_uint4 ? 4 : num_cores();
     const int64_t effective_kv_heads = num_cores() == 8 ? 8 : 4;
     const int64_t physical_routed_intermediate =
-        num_cores() == 6 ? 576 : routed_intermediate;
+        routed_nc == 6 ? 576 : routed_intermediate;
     const int64_t physical_shared_intermediate =
         num_cores() == 6 ? 576 : shared_intermediate;
     TORCH_CHECK(
@@ -2698,17 +3728,18 @@ void Qwen3_5MoeModel::set_weights(
             num_experts == 256 && top_k == 8 &&
             routed_intermediate == 512 && shared_intermediate == 512 &&
             tensor_parallel == num_cores() &&
-            (routed_weight_mode == 5 || (routed_uint4 && num_cores() == 8)) &&
+            (routed_weight_mode == 5 || routed_uint4 || routed_int8) &&
             gdn_num_v_heads == 32 && gdn_key_head_dim == 128 &&
             gdn_value_head_dim == 128 && gdn_conv_dim == 8192 &&
             gdn_conv_kernel == 4,
         "RPU_MODEL_REJECT:EXACT_PROFILE: qwen3_5_moe supports only the "
-        "Qwen3.5-35B-A3B TP4/mixed-TP6/TP8 mixed-E4M3 or TP8 routed-UINT4 profiles "
+        "Qwen3.5-35B-A3B TP4/mixed-TP6/TP8 mixed-E4M3, routed-UINT4 or "
+        "routed-INT8 profiles "
         "(L40/H2048/Q16/effective-KV=4 for reduced profiles/HD256/"
         "E256/top8/logical-I512/logical-shared512, "
         "GDN V32/Dk128/Dv128/conv8192/K4)");
-    TORCH_CHECK(!routed_uint4 || !linear_acc32_,
-                "Qwen3.5-MoE routed UINT4 W4A16 currently requires ACC16");
+    TORCH_CHECK(!routed_int8 || !linear_acc32_,
+                "Qwen3.5-MoE routed INT8 W8A16 currently requires ACC16");
     TORCH_CHECK(
         mrope_section.size() == 3 && mrope_section[0] == 11 &&
             mrope_section[1] == 11 && mrope_section[2] == 10,
@@ -2825,14 +3856,14 @@ void Qwen3_5MoeModel::set_weights(
                     "qwen3_5_moe set_weights: ", name, "[", layer,
                     "] must be contiguous device [", out_features, ",",
                     in_features, "], got ", weight.sizes());
-        TORCH_CHECK(weight.scalar_type() == (routed_uint4 ? at::kHalf : at::kByte),
+        TORCH_CHECK(weight.scalar_type() == (mixers_fp16 ? at::kHalf : at::kByte),
                     "qwen3_5_moe set_weights: ", name, "[", layer,
                     "] must use the profile's ",
-                    routed_uint4 ? "FP16 mixer storage" : "full-byte uint8 E4M3 storage");
+                    mixers_fp16 ? "FP16 mixer storage" : "full-byte uint8 E4M3 storage");
         check_weight_alignment(weight, name, layer);
-        if (routed_uint4) {
+        if (mixers_fp16) {
             TORCH_CHECK(!scale.defined() || scale.numel() == 0,
-                        "qwen3_5_moe set_weights: routed UINT4 profile FP16 mixers "
+                        "qwen3_5_moe set_weights: routed UINT4 / INT8 profile FP16 mixers "
                         "must carry an empty quantization scale");
             check_bytes(weight, name, layer, out_features * in_features * 2);
             return;
@@ -2847,10 +3878,11 @@ void Qwen3_5MoeModel::set_weights(
     };
 
     const int64_t resolved_weight_mode = routed_weight_mode;
-    TORCH_CHECK(resolved_weight_mode == 5 || routed_uint4,
+    TORCH_CHECK(resolved_weight_mode == 5 || routed_uint4 || routed_int8,
                 "qwen3_5_moe set_weights: routed_weight_mode must be "
-                "5 (full-byte FP8 E4M3) or 6 (grouped UINT4 RTN)");
-    const auto routed_dtype = at::kByte;
+                "5 (full-byte FP8 E4M3), 6 (grouped UINT4 RTN) or "
+                "1 (per-output INT8)");
+    const auto routed_dtype = routed_int8 ? at::kChar : at::kByte;
     const int64_t routed_weight_bytes =
         num_experts * hidden_size * physical_routed_intermediate /
         (routed_uint4 ? 2 : 1);
@@ -2929,30 +3961,33 @@ void Qwen3_5MoeModel::set_weights(
                 {&routed_gate_scale_list[i], "routed_gate_scale_list"},
                 {&routed_up_scale_list[i], "routed_up_scale_list"},
                 {&routed_down_scale_list[i], "routed_down_scale_list"}}};
-        const std::array<int64_t, 3> scale_bytes{{
-            num_experts * physical_routed_intermediate * 2,
-            num_experts * physical_routed_intermediate * 2,
-            num_experts * hidden_size * 2}};
+        // GroupedPL encodes each expert's scale stride in 256-byte units.
+        // TP6 Gate/Up has 576 output channels but a 640-half scale row;
+        // the padding belongs to each expert, not to each TP shard.
+        const std::array<int64_t, 3> scale_row_bytes{{
+            aligned_bytes(physical_routed_intermediate),
+            aligned_bytes(physical_routed_intermediate),
+            aligned_bytes(hidden_size)}};
         for (size_t j = 0; j < routed_scales.size(); ++j) {
             const auto& tensor = *routed_scales[j].first;
             check_tensor(tensor, routed_scales[j].second, i, routed_uint4 ? 6 : 2);
             if (routed_uint4) {
                 const auto metadata = rpu_grouped_tiling::uint4_metadata_layout(
-                    j == 2 ? hidden_size : physical_routed_intermediate / num_cores(),
-                    j == 2 ? physical_routed_intermediate / num_cores() : hidden_size,
+                    j == 2 ? hidden_size : physical_routed_intermediate / routed_nc,
+                    j == 2 ? physical_routed_intermediate / routed_nc : hidden_size,
                     j == 2 ? kRoutedUint4DownGroupSize : kRoutedUint4GroupSize,
-                    num_cores());
+                    routed_nc);
                 check_shape(tensor, {num_experts, metadata.q_blocks,
-                            metadata.n_blocks, num_cores(), 4, 64},
+                            metadata.n_blocks, routed_nc, 4, 64},
                             routed_scales[j].second, i);
                 check_bytes(tensor, routed_scales[j].second, i,
                             num_experts * metadata.expert_bytes);
             } else {
-                check_bytes(tensor, routed_scales[j].second, i, scale_bytes[j]);
+                check_bytes(tensor, routed_scales[j].second, i,
+                            num_experts * scale_row_bytes[j]);
                 check_shape(
                     tensor,
-                    {num_experts,
-                     j == 2 ? hidden_size : physical_routed_intermediate},
+                    {num_experts, scale_row_bytes[j] / int64_t(sizeof(c10::Half))},
                     routed_scales[j].second, i);
             }
             // UINT4 metadata receives its stronger controller alignment in
@@ -3043,7 +4078,7 @@ void Qwen3_5MoeModel::set_weights(
     at::Tensor next_gate_negative_zero, next_down_negative_zero;
     std::vector<std::array<at::Tensor, 3>> next_uint4_scales;
     if (routed_uint4) {
-        const int64_t metadata_alignment = num_cores() * 512;
+        const int64_t metadata_alignment = routed_nc * 512;
         // The exact symmetric profile uses zero=8. Share immutable physical
         // Q4/N64 tables across L40; padded slots match the generator's zero fill.
         const auto make_negative_zero = [&](const at::Tensor& scale,
@@ -3059,9 +4094,9 @@ void Qwen3_5MoeModel::set_weights(
         };
         next_gate_negative_zero = make_negative_zero(routed_gate_scale_list[0],
             hidden_size / kRoutedUint4GroupSize,
-            physical_routed_intermediate / num_cores());
+            physical_routed_intermediate / routed_nc);
         next_down_negative_zero = make_negative_zero(routed_down_scale_list[0],
-            physical_routed_intermediate / num_cores() / kRoutedUint4DownGroupSize,
+            physical_routed_intermediate / routed_nc / kRoutedUint4DownGroupSize,
             hidden_size);
         next_uint4_scales.resize(N);
         for (int64_t i = 0; i < N; ++i) {
@@ -3237,12 +4272,12 @@ c10::optional<at::Tensor> Qwen3_5MoeModel::optional_scale(
     return scale;
 }
 
-void Qwen3_5MoeModel::emit_router_and_shuffle(
-    int layer_idx, int64_t invocation, int64_t t, uint32_t input_spm_addr) {
+void Qwen3_5MoeModel::emit_router_topk(
+    int layer_idx, int64_t invocation, int64_t t, uint32_t input_spm_addr,
+    uint32_t output_expert_ids) {
     const auto& lw = moe_layer_weights_.at(layer_idx);
     const int64_t e = moe_.num_experts;
     const int64_t k = moe_.top_k;
-    const int64_t r = t * k;
     const int router_nc = router_tp();
     const int route_nc = routing_tp();
 
@@ -3310,9 +4345,18 @@ void Qwen3_5MoeModel::emit_router_and_shuffle(
     // expert IDs.  cvt_key=false matches runtime's no_cvt_key=false call.
     rpu_launch_moe_topk_scalar_fp16_spm_kernel(
         addr(0, "moe_router_probs"), addr(0, "moe_expert_ids"),
-        addr(0, "moe_route_scores"), addr(0, "moe_route_expert_ids"),
+        addr(0, "moe_route_scores"), output_expert_ids,
         t, e, k, /*descending=*/true, /*cvt_key=*/false, route_nc);
+}
 
+void Qwen3_5MoeModel::emit_router_and_shuffle(
+    int layer_idx, int64_t invocation, int64_t t, uint32_t input_spm_addr) {
+    const int64_t e = moe_.num_experts;
+    const int64_t k = moe_.top_k;
+    const int64_t r = t * k;
+    const int route_nc = routing_tp();
+    emit_router_topk(layer_idx, invocation, t, input_spm_addr,
+                     addr(0, "moe_route_expert_ids"));
     if (t == 1) {
         // Runtime decode step 2: sort all K selected expert keys ascending,
         // carrying scores in-place.  token IDs remain the persistent zeros.
@@ -3392,12 +4436,14 @@ void Qwen3_5MoeModel::emit_shared_expert(
         addr(0, "moe_shared_alpha_pad"), t, 16 * nc, h,
         /*partition=col=*/1, nc,
         /*bias_spm_addr=*/0, {}, /*mlp_slice=*/true);
-    for (int core = 0; core < nc; ++core) {
-        rpu_launch_slice_spm_kernel(
-            addr(core, "moe_shared_alpha_pad"),
-            addr(core, "moe_shared_alpha"),
-            {t, 16}, {t, 1}, {0, 0}, /*num_cores=*/1);
-    }
+    TORCH_CHECK(ctx().has_complete_physical_manifest(),
+                "Qwen3.5 MoE scalar slice requires a complete physical manifest");
+    ctx().consume_physical_route(FmbRouteFamily::GRAPH_SCHEDULE,
+        QWEN35_MOE_SHARED_ALPHA_LOCAL_SITE, 1, 0,
+        shared_alpha_local_arguments(t, nc), invocation);
+    rpu_launch_slice_spm_kernel(
+        addr(0, "moe_shared_alpha_pad"), addr(0, "moe_shared_alpha"),
+        {t, 16}, {t, 1}, {0, 0}, nc, /*per_core_local=*/true);
     consume_manifest_route(
         FmbRouteFamily::ACTIVATION, QWEN35_MOE_SHARED_SIGMOID_SITE,
         static_cast<int64_t>(Qwen35MoeActivationRoute::SIGMOID),
@@ -3472,10 +4518,11 @@ void Qwen3_5MoeModel::emit_moe_merge_and_residual(
     const int64_t r = t * moe_.top_k;
     const int nc = routing_tp();
 
-    // moe_partial already contains the gated shared-expert partial.
+    // All shared cores initialized moe_partial. Only routed cores produced
+    // moe_routed_output; the other shared partials must reach reduction intact.
     rpu_launch_scatternd_add_u16_fp16_spm_kernel(
         addr(0, "moe_partial"), addr(0, "moe_route_token_ids"),
-        addr(0, "moe_routed_output"), t, r, h, nc);
+        addr(0, "moe_routed_output"), t, r, h, routed_expert_tp());
     consume_manifest_route(
         FmbRouteFamily::ALL_REDUCE, QWEN35_MOE_ALL_REDUCE_SITE,
         text_ring_route(t, h), invocation);
@@ -3571,6 +4618,17 @@ int64_t rpu_qwen3_5_moe_get_resolved_chunk_size(int64_t handle) {
 void rpu_qwen3_5_moe_set_chunk_size_cap(int64_t handle, int64_t cap) {
     Qwen3_5MoeRegistry::get(handle, "rpu_qwen3_5_moe_set_chunk_size_cap")
         ->set_chunk_size_cap(cap);
+}
+
+void rpu_qwen3_5_moe_set_resident_uint4_n32k32_weights(
+    int64_t handle, at::TensorList gate, at::TensorList up, at::TensorList down) {
+    Qwen3_5MoeRegistry::get(handle, "rpu_qwen3_5_moe_set_resident_uint4_n32k32_weights")
+        ->set_resident_uint4_n32k32_weights(gate, up, down);
+}
+
+void rpu_qwen3_5_moe_set_resident_prefill(int64_t handle, bool enabled) {
+    Qwen3_5MoeRegistry::get(handle, "rpu_qwen3_5_moe_set_resident_prefill")
+        ->set_resident_prefill(enabled);
 }
 
 void rpu_qwen3_5_moe_set_prefill_chunk_size(int64_t handle, int64_t chunk_size) {

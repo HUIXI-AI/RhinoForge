@@ -1,89 +1,61 @@
-# Hy-Embodied UMI 配置
+# HY Embodied UMI 配置
 
-[配置索引](../CONFIGURATIONS.md) · [使用](#使用)
+<a id="hy-embodied-配置"></a>
 
-本目录通过 `HyEmbodiedPolicy` 运行三相机 UMI FP16 配方：输入图片、指令和状态，输出 50 步、20 维归一化动作。两相机、不同文本长度和 W8/NVFP4 配方见 [HyVLA 配置](../hy_vla/README.md)。
+<a id="配置矩阵"></a>
 
-## 配置说明
+[配置总览](../README.md) · [全部配置](#configurations) · [权重准备](../WEIGHTS.md) · [参数说明](../PARAMETERS.md)
 
-<a id="weight-recipes"></a>
-<a id="配置与权重对应关系"></a>
+[UMI FP16](umi/fp16.toml) 使用三路相机图像、文本指令和机器人状态，返回归一化动作。需要两路相机或量化配置时，查看 [HyVLA 模板](../hy_vla/README.md)，按各自输入要求准备资产。
 
-| 配置 | 计算范围 | 权重获取 |
-|---|---|---|
-| [umi/fp16.toml](umi/fp16.toml) | 三相机、P240、UMI FP16，十步去噪 | [腾讯官方 BF16 权重](#weights)，与 HyVLA 配方共用父资产 |
-
-<a id="fp16-基准做了什么"></a>
-
-### 精度与执行
-
-Vision、Language 和 Action 的主投影使用 FP16 权重与激活，patch/merger/norm/bias 为浮点；CPU embedding、状态和时间输入边界采用 FP32。模型内部动作网格为 `[50,32]`，公共入口返回有效的前 20 维 `[50,20]`。
-
-模板的 `[example.opt_in]` 为空，运行时仍会应用以下默认优化：
-
-| 阶段 | 已开启的执行方式 |
-|---|---|
-| Vision | 多视角打包；多核 patch embedding 与融合 merger 放入 Graph；Q 就地计算，K/V 按 16 行对齐 |
-| Language | 保留模型与 Graph，使用 fast replay；partial RoPE 复用准备好的位置数据 |
-| Action | 十步 Euler 去噪展开在图内；Attention 使用 TP8；缓存 mask、融合 SiLU×Mul；partial RoPE 和 fast replay |
-
-这些设置由 [HyVLA 运行时默认项](../../../python/rpu_backend/adapters/hy_vla/runtime.py)提供。加载接口见 [HyEmbodiedPolicy](../../../python/rpu_backend/api/hy_embodied.py)，模板调用见 [runner](../../runners/hy_vla/runner.py)。
+<a id="运行"></a>
 
 ## 准备与运行
 
-<a id="weight-sources"></a>
-<a id="weights"></a>
-<a id="quantization"></a>
-<a id="权重准备"></a>
+准备 `hy-embodied-0.5-vla-umi` 权重，并在 TOML 中填写 `input.images`、`input.instruction` 和 `input.state`。此入口要求恰好三张图像；模板将 `prefix_len` 设为 240。
 
-### 获取权重
-
-`example.registry_alias="hy-embodied-0.5-vla-umi"` 读取 `$RPU_MODEL_CACHE/Hy-Embodied-0.5-VLA-UMI`。目录保留模型和 tokenizer；归一化文件用于需要物理动作解码的调用方，本模板输出归一化动作。
-
-源权重为 [tencent/Hy-Embodied-0.5-VLA-UMI](https://huggingface.co/tencent/Hy-Embodied-0.5-VLA-UMI/tree/3f53d1f8d2bc587c523cfdc9f1041ceee42c2524)，固定 revision 为 `3f53d1f8d2bc587c523cfdc9f1041ceee42c2524`。在仓库根目录下载：
+从仓库根目录执行：
 
 ```bash
-export RPU_MODEL_CACHE=/path/to/model-cache
-hf download tencent/Hy-Embodied-0.5-VLA-UMI \
-  --revision 3f53d1f8d2bc587c523cfdc9f1041ceee42c2524 \
-  --local-dir "$RPU_MODEL_CACHE/Hy-Embodied-0.5-VLA-UMI"
+python examples/run.py --config examples/configs/hy_embodied/umi/fp16.toml --check-config
+python examples/run.py --config examples/configs/hy_embodied/umi/fp16.toml
 ```
 
-FP16 模板直接消费这个目录，加载时转换，不产生新的权重文件。
+配置检查只校验语法和 profile，图像数量等内容由运行入口检查。输出文件见[结果说明](../../RESULTS.md)。
 
-<a id="使用"></a>
-<a id="run-fp16"></a>
+此入口不需要预先准备 tensor 文件：`input.images` 填三张普通图片路径，`instruction` 填文本，`state` 直接在 TOML 中写最多 32 个已归一化的状态值。图片数量不是 3 时运行时报错。
 
-### 输入与运行
+<!-- model-configurations-start -->
 
-在已安装项目依赖的设备环境中，按 head、left wrist、right wrist 的顺序提供三张图片，填写配对指令和状态：
+<a id="configurations"></a>
+## 全部配置与输入范围
 
-```bash
-cp examples/configs/hy_embodied/umi/fp16.toml /tmp/hy_umi_fp16.toml
-# 修改 input.images、input.instruction、input.state。
-# 在 [run] 中添加 output_dir，保留 prefix_len=240。
-vi /tmp/hy_umi_fp16.toml
-python examples/run.py --config /tmp/hy_umi_fp16.toml --check-config
-python examples/run.py --config /tmp/hy_umi_fp16.toml
-```
+每组先列各配置不同的项，再列本组配置相同的项；修改相机、文本长度、精度或核数时，同时满足联动限制。4/6/8 核列：● 已在板上运行通过（4/6 核写出各组件实际核数），○ 支持但未在板上运行，✕ 不支持（原因列在表下）。支持状态和 CPU 线程数的读法见配置表说明；实测耗时见性能报告：Hy-Embodied。
 
-<a id="输入与执行参数"></a>
+### Hy-Embodied 图文
 
-### 常用参数
+| 项目 | 值 |
+|---|---|
+| 配置 | [umi/fp16.toml](umi/fp16.toml) |
+| 支持状态 | 支持（`SUPPORTED`） |
+| 精度 | fp16 |
+| 量化范围 | — |
+| 输入类型 | 原始图片 + instruction + state |
+| 文本可调范围 | 有效prefix由processor计算 |
+| 图像/音频可调范围 | 当前runner固定3图 |
+| 生成可调范围 | 按模型动作入口 |
+| 其他输入形状 | prefix_len为16的倍数，三相机上限240 |
+| 联动限制 | 实际prefix向上16对齐后不得超过安装prefix_len；API另有2图功能不属于此runner。 |
+| 默认核数 | 8 |
+| 4 核 | ✕ 不支持 |
+| 6 核 | ✕ 不支持 |
+| 8 核 | ● 已实测 |
+| CPU线程数 | 12（入口默认） |
+| 权重 | `hy-embodied-0.5-vla-umi` |
+| 入口 | [run.py](../../run.py) |
 
-| 字段 | 模板值 | 省略时 | 范围与关联 |
-|---|---|---|---|
-| `input.images` | 三张图片占位路径 | 必填 | 按 head / left wrist / right wrist 排序 |
-| `input.instruction` | `Move the object to the target.` | 必填 | 完整指令，由模型 tokenizer 处理 |
-| `input.state` | 32 维零向量 | Policy 使用零状态 | 已归一化状态，最多 32 维，右侧补零；与图片和指令配对 |
-| `input.noise_seed` | 0 | 0 | 初始去噪噪声的种子 |
-| `input.prefix_len` | 240 | 240 | 前缀容量；16 的倍数，范围 16–240，并覆盖真实前缀 |
-| `cpu.threads` | 未配置 | Policy 构建使用 12 | 此 runner 未向 Policy 传入线程数；构建时使用 API 默认 12，覆盖公共入口加载前设置 |
+- ✕ 4/6 核不支持：原生实现只有 8 核：HyVLA 专用融合 kernel 要求 8 核，视觉塔 16 个注意力头也不能分到 6 核。
 
-模板的 `run.warmup/runs/seed` 为 2 / 3 / 0。通用字段的默认值、输出目录、计时与诊断选项见[公共参数说明](../PARAMETERS.md)。
+输入校验来源：[runner.py](../../../examples/runners/hy_vla/runner.py) · [hy_embodied.py](../../../python/rpu_backend/api/hy_embodied.py)。
 
-十步去噪固定在图中。切换相机数或精度时，选择 [HyVLA 对应模板](../hy_vla/README.md)。
-
-## 输出
-
-`run.output_dir` 保存 `report.json` 与 `[50,20]` 归一化动作快照。机器人坐标变换和动作执行由下游处理。
+<!-- model-configurations-end -->

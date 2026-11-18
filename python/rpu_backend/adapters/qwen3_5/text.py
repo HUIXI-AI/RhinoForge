@@ -437,6 +437,7 @@ PREFILL_CHUNK_CEILING: dict[tuple[int, int], int] = {
 # allocation remains independent of this execution-only register constraint.
 _SDPA_MAX_KV_ROWS = 65535 * 16
 
+
 def _qwen3_5_prefill_envelope(state) -> tuple[int, int]:
     """Return this Language owner's declared native envelope, not a Vision gate.
 
@@ -909,7 +910,8 @@ def install_qwen3_5_text_for_rpu(
             raise UnsupportedModelError(
                 "Qwen3.8-27B must use the public text-only adapter with its "
                 "prepared cold graph policy")
-    modern_27b = validate_modern_27b_profile(config)
+    from .cores import validate_official_27b_runtime_profile
+    modern_27b = validate_official_27b_runtime_profile(config)
     if modern_27b:
         if (_graph_runtime_policy is None or _cpu_stage_weights
                 or not _graph_runtime_policy.qwen35_dense_27b_sdk_budget
@@ -1151,10 +1153,11 @@ def _install_qwen3_5_text_for_rpu_impl(
     topology = validate_core_profile(config, execution_config)
     NUM_CORES = topology.attn_tp
     mlp_cores = topology.mlp_tp
-    from rpu_backend.runtime.topology import decoder_mlp_intermediate_size
-    mlp_physical_size = decoder_mlp_intermediate_size(tc.intermediate_size, mlp_cores)
+    from .cores import text_mlp_intermediate_size
+    mlp_physical_size = text_mlp_intermediate_size(config, topology)
     legacy_text = validate_legacy_text_profile(config)
-    modern_27b = validate_modern_27b_profile(config)
+    from .cores import validate_official_27b_runtime_profile
+    modern_27b = validate_official_27b_runtime_profile(config)
     finalized_only = legacy_text or modern_27b or has_awq
     if finalized_only and any(parameter.device.type != "cpu" for parameter in inner.parameters()):
         raise UnsupportedModelError(
@@ -1216,23 +1219,28 @@ def _install_qwen3_5_text_for_rpu_impl(
         wc = w.detach().to("cpu").contiguous()
         if spec.method == W4A16_AWQ:
             from rpu_backend.quant.awq_gemm import swizzle_pack_uint4_pgrp
+            from rpu_backend.quant.int4_pgrp_pack import w4_storage_shape
             n, k = wc.shape
-            out = swizzle_pack_uint4_pgrp(wc, partition, num_cores).reshape(n, k // 2)
+            out = swizzle_pack_uint4_pgrp(wc, partition, num_cores).reshape(
+                w4_storage_shape(n, k, partition, num_cores))
         elif spec.method != W4A16_PGRP:
             out = transform_linear_weight(wc, partition, num_cores)
         else:
-            from rpu_backend.quant.int4_pgrp_pack import swizzle_pack_int4_pgrp
+            from rpu_backend.quant.int4_pgrp_pack import swizzle_pack_int4_pgrp, w4_storage_shape
 
             n, k = wc.shape
             out = (swizzle_pack_int4_pgrp(wc, partition, num_cores)
-                   .reshape(n, k // 2).to(dtype=torch.uint8).contiguous())
+                   .reshape(w4_storage_shape(n, k, partition, num_cores)).to(dtype=torch.uint8).contiguous())
         return out if cpu_stage_weights else out.to("rpu")
 
     def _dense_weight(linear, name, partition):
         weight = linear.weight.data
         if ".mlp." in name and mlp_physical_size != tc.intermediate_size:
             pad = pad_decoder_mlp_projection
-            if legacy_text:
+            if projection_specs[name].method in (W8A16, W4A16_PGRP, W4A16_AWQ):
+                from .weights import pad_quant_mlp_projection
+                pad = pad_quant_mlp_projection
+            elif legacy_text:
                 from rpu_backend.adapters.qwen3_5.weights import pad_legacy_mlp_projection
 
                 pad = pad_legacy_mlp_projection
@@ -1287,12 +1295,12 @@ def _install_qwen3_5_text_for_rpu_impl(
         if scale.numel() == 0:
             return empty
         spec = projection_specs[name]
-        if (legacy_text or modern_27b) and ".mlp." in name and mlp_physical_size != tc.intermediate_size:
-            from rpu_backend.adapters.qwen3_5.weights import (
-                pad_legacy_mlp_scale, pad_dense_27b_mlp_scale)
-
-            pad_scale = pad_dense_27b_mlp_scale if modern_27b else pad_legacy_mlp_scale
-            scale = pad_scale(scale, projection_name=name.rsplit(".", 1)[-1])
+        if ".mlp." in name and mlp_physical_size != tc.intermediate_size:
+            from .weights import pad_quant_mlp_scale
+            scale = pad_quant_mlp_scale(
+                scale, projection_name=name.rsplit(".", 1)[-1],
+                logical_size=tc.intermediate_size, physical_size=mlp_physical_size,
+                group_size=spec.group_size or 0)
         return _scale_to_rpu(
             scale, partition, mlp_cores if ".mlp." in name else NUM_CORES,
             spec.group_size or 0)
@@ -1302,6 +1310,16 @@ def _install_qwen3_5_text_for_rpu_impl(
             return empty
         from rpu_backend.quant.awq_gemm import swizzle_awq_negative_zero
         zero = linear.weight_zero.detach().to("cpu").contiguous()
+        if ".mlp." in name and mlp_physical_size != tc.intermediate_size:
+            role = name.rsplit(".", 1)[-1]
+            groups = mlp_physical_size // 128
+            if role in ("gate_proj", "up_proj"):
+                padded = torch.zeros((zero.shape[0], mlp_physical_size), dtype=zero.dtype)
+                padded[:, :zero.shape[1]].copy_(zero)
+            else:
+                padded = torch.zeros((groups, zero.shape[1]), dtype=zero.dtype)
+                padded[:zero.shape[0]].copy_(zero)
+            zero = padded
         return swizzle_awq_negative_zero(zero, partition, mlp_cores).to("rpu")
 
     def _qkv_scale_path(scale, lo, hi, spec):
@@ -1691,6 +1709,18 @@ def _qwen35_debug_prefill_cache(st):
     return debug_cache
 
 
+def _bound_retained_prefill_lengths(st, cache, sig):
+    """Evict the least recently used length: native BUILD refuses a full cache."""
+    recent = getattr(st, "prefill_graph_recent", [])
+    if sig in recent:
+        recent.remove(sig)
+    else:
+        while recent and cache.size() >= cache.max_entries():
+            cache.evict(recent.pop(0))
+    recent.append(sig)
+    st.prefill_graph_recent = recent
+
+
 def _prepare_qwen35_prefill_capture(st, *, seq_len, real_len, planned_chunk_size, plan):
     """Validate READY and retire stale RoPE users before any native mutation.
 
@@ -1729,10 +1759,20 @@ def _prepare_qwen35_prefill_capture(st, *, seq_len, real_len, planned_chunk_size
         for cache, attr in siblings:
             old_sig = getattr(st, attr, None)
             if cache is not None and old_sig is not None:
-                cache.evict(old_sig)
+                if cache.max_entries() > 1:
+                    # Every retained length bakes the RoPE backing being replaced.
+                    for entry in cache.snapshot():
+                        cache._impl.evict(entry.signature)
+                    st.prefill_graph_recent = []
+                else:
+                    cache.evict(old_sig)
                 setattr(st, attr, None)
     old_sig = getattr(st, sig_attr, None)
-    if old_sig is not None and old_sig != sig:
+    if active.max_entries() > 1:
+        # One graph per real length, all on the same RoPE backing.
+        if not active.is_frozen():
+            _bound_retained_prefill_lengths(st, active, sig)
+    elif old_sig is not None and old_sig != sig:
         active.evict(old_sig)
     setattr(st, sig_attr, sig)
     return active.capture(sig)
@@ -1909,6 +1949,55 @@ def _plan_qwen3_5_decode(text_model):
     return result
 
 
+def _qwen3_5_decode_signature(st, plan):
+    import torch
+    import rpu_backend as _rb
+
+    return _rb.graph.GraphSignature(
+        op_id="rpu_qwen3_5",
+        shapes=[1, st.hidden_size],
+        dyn_dims=[
+            st.num_layers, int(getattr(st, "execution_generation", 0)),
+            *plan.graph_key_words(),
+        ],
+        dtypes=[torch.float16],
+    )
+
+
+def _qwen3_5_decode_step(text_model, cache):
+    """Return ``step(hidden)``: later q1 decodes after ``run_qwen3_5_text`` ran one.
+
+    The plan, signature and descriptor depend on the installed model and its
+    execution generation, never on the position, so a caller that holds the cache
+    and changes neither between steps can reuse them. ``hidden`` is the CPU or RPU
+    FP16 ``[1, 1, H]`` input. The output and ``_rpu_last_execution_plan`` follow
+    ``run_qwen3_5_text``, except that the plan keeps the first step's position.
+    """
+    import torch
+
+    st = text_model._rpu_qwen3_5
+    plan = st.decode_plan[1]
+    signature = _qwen3_5_decode_signature(st, plan)
+    descriptor = plan.selected.stage_tuple.physical_descriptor
+    capture = st.graph_cache.capture
+    forward = torch.ops.rpu.qwen3_5_forward
+    handle = st.handle
+
+    def step(hidden):
+        if cache.position >= cache.max_seq_len:
+            raise ValueError(
+                f"Qwen3.5 cache capacity exceeded: position={cache.position}, "
+                f"input=1, max_seq_len={cache.max_seq_len}.")
+        device_hidden = hidden.to("rpu")
+        with capture(signature):
+            out = forward(handle, device_hidden, cache.k_caches, cache.v_caches,
+                          cache.gdn_states, cache.conv_states, None, cache.position,
+                          True, 0, descriptor)
+        cache.update_position(1)
+        return out
+    return step
+
+
 def run_qwen3_5_text(text_model, hidden, cache, *, attention_mask=None,
                      position_ids=None, multimodal_prefill=False,
                      preflight_plan=None, _private_cpu_prefill=False):
@@ -2006,15 +2095,7 @@ def run_qwen3_5_text(text_model, hidden, cache, *, attention_mask=None,
         #  rpu_llama_kvcache.cpp:467 / rpu_mrope.cpp:86)。
         # Decode always has real_len == 1. Prefill signatures above retain
         # real_len because GDN valid-tail fills are baked into their graphs.
-        ctx = graph_cache.capture(_rb.graph.GraphSignature(
-            op_id="rpu_qwen3_5",
-            shapes=[seq_len, hidden_size],
-            dyn_dims=[
-                num_layers, int(getattr(st, "execution_generation", 0)),
-                *decode_plan_result.graph_key_words(),
-            ],
-            dtypes=[torch.float16],
-        ))
+        ctx = graph_cache.capture(_qwen3_5_decode_signature(st, decode_plan_result))
     with ctx:
         out = torch.ops.rpu.qwen3_5_forward(
             handle, hidden, cache.k_caches, cache.v_caches,

@@ -15,6 +15,8 @@ def prepare(config, runner):
     DINOv3Adapter.preflight(hf_config)
     processor = AutoImageProcessor.from_pretrained(checkpoint, local_files_only=True)
     pixels = processor(images=images, return_tensors="pt").pixel_values
+    runner.input_geometry = {"source_image_sizes_wh": [list(image.size) for image in images],
+                             "pixel_values_shape": list(pixels.shape), "cameras": len(images)}
     model = DINOv3ViTModel.from_pretrained(
         checkpoint, config=hf_config, dtype=torch.float16,
         local_files_only=True).eval()

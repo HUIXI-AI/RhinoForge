@@ -216,6 +216,7 @@ struct DinoModel {
     int64_t head_dim()const{return 64;}
     int64_t intermediate_size()const{return 1536;}
     int64_t num_layers()const{return 12;}
+    int num_cores()const{return 8;}
 """ + declarations + r"""
 };
 struct Layout {
@@ -242,8 +243,9 @@ struct Layout {
 std::vector<uint16_t> zero_storage;
 int memset_calls=0;
 uint32_t addr(int core,const char* name){assert(core==0&&std::string(name)=="zero_residual");return 0;}
-void rpu_launch_memset_spm_multicore(uint32_t offset,int64_t elements){
-    assert(offset==0&&elements==257*384);std::fill(zero_storage.begin(),zero_storage.end(),0);++memset_calls;
+int num_cores(){return 8;}
+void rpu_launch_memset_spm_multicore(uint32_t offset,int64_t elements,int cores){
+    assert(offset==0&&elements==257*384&&cores==8);std::fill(zero_storage.begin(),zero_storage.end(),0);++memset_calls;
 }
 void actual_layer_zero_init(int layer_idx,int64_t seq_len,int64_t h){
 """ + zero_init + r"""

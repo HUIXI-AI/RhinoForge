@@ -1,24 +1,42 @@
-[example]
+# 未写出的执行参数（省略即按以下值运行）：
+#   [cpu].threads 省略时不设置线程：PyTorch 使用环境变量 OMP_NUM_THREADS，未设置时使用全部 CPU 核（参考板 24）；2026-10-19 测量环境预设为 16。
+#   rpu_execution.model.num_cores 省略时为 8 核。可选 4 / 6 / 8（在 [rpu_execution.model] 中写 num_cores = 4 或 6）；冷启动设定，修改后需重新加载模型。
+#     组件分配固定，不能单独配置：8 核 = 注意力 2、MLP 8、逐层嵌入(PLE) 8；6 核 = 注意力 2、MLP 6（宽度 10240 在 swizzle 前补零到 10272）、PLE 4；4 核 = 注意力 2、MLP 4、PLE 4。
+#     各核数的支持状态与板上实测见核数支持矩阵（examples/configs/CORE_COVERAGE.md）；实际分配记录在 report.json 的 execution_conditions（gemma4 native_topology）。
+[model]
 profile_id = "gemma4-e4b.fp16.text"
 registry_alias = "gemma4-e4b"
 target = "gemma4"
-dtype = "fp16"
+precision = "fp16"
 architecture = "Gemma4ForConditionalGeneration"
 
-[example.opt_in]
+[model.opt_in]
 
 [input]
+# 不填时使用自然输入长度；固定 P 可设置正整数，P/D 联动范围见模型说明。
+# prefill_tokens = 128
+# 可替换文本；自然输入长度由 tokenizer 决定。
 prompt = "Explain what a compiler does."
+# 首 token 之后的 decode 调用数，整数 ≥0；P 与 D 受 cache 和模型输入范围共同约束。
 decode_steps = 4
 
 [run]
+# 预热次数；不计入正式测量。
 warmup = 2
-runs = 3
+# 正式执行次数，正整数。
+runs = 5
+# 按需开启硬件采样；保持 false 可减少测量干扰。
 hwperf = false
+# 按需开启 profiler；正式计时建议保持 false。
 profile = false
+# 随机种子，非负整数。
 seed = 0
 
 [rpu_execution]
 
 [rpu_execution.prefill]
+# prefill 分块行数。可选 "auto"（默认）或满足本组件形状限制的 16 的倍数整数。
+# auto：由原生 planner 按实际输入行数选择。
+# 2026-10-21 模板默认输入实测：4/6/8 核均为 16。
+# 实际值记录在结果 report.json 的执行计划中（compute_chunk）。
 chunk_size = "auto"

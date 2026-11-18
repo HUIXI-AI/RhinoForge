@@ -18,6 +18,15 @@ import time
 from examples.common import results
 _RESULTS = vars(results)
 
+def _materialize_geometry(value):
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    if isinstance(value, dict):
+        return {str(k): _materialize_geometry(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_materialize_geometry(v) for v in value]
+    return value
+
 
 ALL_TARGETS = ("qwen3", "llama", "qwen3_5", "qwen3_vl", "dinov3", "gemma4",
                "wall_oss", "gr00t", "hy_vla", "lingbot",
@@ -166,6 +175,9 @@ def _result_timings(report, options):
             timings.append({"metric": phase + "_throughput", "unit": "tokens/s", "boundary": boundary,
                 "statistic": "aggregate_tokens_over_total_time" if statistic == "mean" else "median_per_run_rate",
                 "value": summary[field], "samples": [row[field] for row in samples], "sample_count": len(samples)})
+    timings += _RESULTS["stage_phase_timings"](report.get("stage_runs", []),
+        "host wall time of the runner-declared stage calls inside each measured public inference call; "
+        "glue between stages is not attributed")
     return timings
 
 
@@ -231,6 +243,9 @@ def run(config):
             # Keep persistent weights and mutable Graph inputs versioned.
             with torch.inference_mode(False), torch.no_grad():
                 infer, owner = _prepare(config)
+            input_geometry = vars(infer).get("input_geometry") if hasattr(infer, "__dict__") else None
+            if isinstance(input_geometry, dict):
+                report["input_geometry"] = _materialize_geometry(input_geometry)
             # device PASSTHROUGH and Graph BUILD/REPLAY/one-shot launches wait for
             # completion before returning (enqueu_batch(wait_finish=true)).
             # The actual torch.rpu namespace has no CUDA-style synchronize().
@@ -246,17 +261,32 @@ def run(config):
                 report["warmup_wall_ms_runs"].append((time.perf_counter() - start) * 1000)
                 del value
             output = None
-            for _ in range(runs):
-                torch.manual_seed(seed)
-                start = time.perf_counter()
-                value = infer()
-                report["wall_ms_runs"].append((time.perf_counter() - start) * 1000)
-                output = _cpu_output(value)
-                # The caller-owned CPU snapshot survives. Retire the original
-                # output now, not at `value = infer()` inside the next timer.
-                del value
-                if isinstance(output, dict) and "generation" in output:
-                    report.setdefault("generation_runs", []).append(output["generation"])
+            declared = vars(infer).get("stage_boundaries", ()) if hasattr(infer, "__dict__") else ()
+            boundaries, missing = _RESULTS["available_stage_boundaries"](declared)
+            if declared:
+                report["stage_boundaries"] = [f"{stage}: {type(target).__name__}.{name}"
+                                              for stage, target, name in boundaries]
+                report["stage_boundaries_missing"] = missing
+            if boundaries:
+                report["stage_runs"] = []
+            with _RESULTS["stage_timings"](boundaries) as phases:
+                for _ in range(runs):
+                    torch.manual_seed(seed)
+                    phases.clear()
+                    start = time.perf_counter()
+                    value = infer()
+                    report["wall_ms_runs"].append((time.perf_counter() - start) * 1000)
+                    if boundaries:
+                        report["stage_runs"].append(dict(phases))
+                    output = _cpu_output(value)
+                    # The caller-owned CPU snapshot survives. Retire the original
+                    # output now, not at `value = infer()` inside the next timer.
+                    del value
+                    if isinstance(output, dict) and "generation" in output:
+                        if "input_geometry" in output["generation"]:
+                            output["generation"]["input_geometry"] = _materialize_geometry(
+                                output["generation"]["input_geometry"])
+                        report.setdefault("generation_runs", []).append(output["generation"])
             torch.save(output, directory / "output.pt")
             if options.get("profile", False):
                 # Separate diagnostic invocation: profiler overhead never enters timings.

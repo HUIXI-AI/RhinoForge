@@ -20,17 +20,16 @@ def test_o_resident_cold_owners_complete_fallback_and_lifetime(tmp_path):
     cpp = cpp.replace('DeviceType type()const{return value;}',
                       'DeviceType type()const{return value;}bool operator!=(const Device&b)const{return value!=b.value;}')
     cpp = cpp.replace('struct Weights ', 'uint64_t RpuGetDevAddr(void*p){return reinterpret_cast<uint64_t>(p);}\nstruct Weights ', 1)
-    ids = ['G05_O_RESIDENT_W8A16_ACC16_M32N1024K256_N128', 'G05_O_RESIDENT_W8A16_ACC16_M32N1024K256', 'G05_GATE_UP_W8A16_ACC32_M32N512K1024',
+    ids = ['G05_O_RESIDENT_W8A16_ACC16_M32N1024K256', 'G05_GATE_UP_W8A16_ACC32_M32N512K1024',
            'G05_GATE_UP_W8A16_ACC16_M32N512K1024', 'G05_GATE_UP_FP16_ACC32_M32N512K1024',
            'G05_GATE_UP_FP16_ACC16_M32N512K1024', 'G05_GATE_UP_PAIRED_NVFP4_ACC32_M32N512K1024_N128',
            'G05_SILU_ROUND_MUL_M32N512', 'G05_GATEUP_RESIDENT_W8A16_ACC16_M352N96K128',
            'G05_GATEUP_RESIDENT_W8A16_ACC32_M240N96K128', 'G05_GATEUP_RESIDENT_FP16_ACC32_M304N80K128']
     cpp = cpp.replace('enum class KernelId{', 'enum class KernelId{' + ','.join(ids) + ',')
     cpp = cpp.replace('bool q=true,kv=true,fanout=true,joint=true;',
-                      'bool o=true,n128=false,pair=true,silu=true;bool q=true,kv=true,fanout=true,joint=true;')
+                      'bool o=true,pair=true,silu=true;bool q=true,kv=true,fanout=true,joint=true;')
     cpp = cpp.replace('++queries;if(!acc16_available',
                       '++queries;if(id==KernelId::G05_O_RESIDENT_W8A16_ACC16_M32N1024K256)return o;'
-                      'if(id==KernelId::G05_O_RESIDENT_W8A16_ACC16_M32N1024K256_N128)return n128;'
                       'if(id==KernelId::G05_SILU_ROUND_MUL_M32N512)return silu;'
                       'if(id==KernelId::G05_GATE_UP_W8A16_ACC16_M32N512K1024)return pair;'
                       'if(!acc16_available')
@@ -39,7 +38,7 @@ def test_o_resident_cold_owners_complete_fallback_and_lifetime(tmp_path):
 int opacks=0,gpacks=0,owner_generation=0;
 std::vector<std::vector<int64_t>> packed_layers;
 std::vector<std::pair<int64_t,uint32_t>> dma_calls;
-std::vector<int64_t> o_scales;bool expected_n128=false;
+std::vector<int64_t> o_scales;bool expected_n128=true;
 at::Tensor rpu_pack_g05_o_resident_w8a16(const std::vector<at::Tensor>&ws){
  assert(ws.size()==4);std::vector<int64_t>ids;for(int i=0;i<4;++i){assert(ws[i].dtype==at::kChar&&ws[i].rows==1024&&ws[i].cols==2048&&ws[i].owner==ws[0].owner+i);ids.push_back(ws[i].owner);}
  packed_layers.push_back(ids);++opacks;auto t=ws[0];t.owner=500000+1000*owner_generation+ws[0].owner-200;t.rows=8;t.cols=1048576;return t;
@@ -113,7 +112,7 @@ int main(){
  assert(!m.use_action_o_resident(32)&&m.o_buffers().empty());m.loop();m.o_plan();assert(m.routes.size()==30&&m.use_action_o_resident(32));
  auto buffers=m.o_buffers();assert(buffers.size()==1&&buffers[0].size==6291456&&buffers[0].first==0&&buffers[0].last==31&&buffers[0].scope==BufferScope::LayerWide);
  assert(m.action_gateup_pair_arguments()[15]==0&&m.action_silu_round_mul_arguments().back()==0);
- assert(m.routes[23].args==std::vector<int64_t>({1,23,24,4,6,10,32,1024,2048,256,8,16,262144,1048576,6291456,448,64,128,16,0,6029312,20,15,8,22,0}));
+ assert(m.routes[23].args==std::vector<int64_t>({2,23,24,4,6,10,32,1024,2048,256,8,16,262144,1048576,6291456,64,80,512,13,0,6029312,20,15,8,8,0,1}));
  auto identity=m.kvinsert_cost_weight_identity();auto hash=m.subclass_layout_hash();int q=cache.queries;
  cache.o=false;for(int body=0;body<10;++body){m.body_iter=body;m.preload_action_o_resident();for(int layer=0;layer<24;++layer){launches.clear();m.o_stage(layer);assert(launches==std::vector<std::string>({"prepare-ring","resident-o","ring","adaptive"}));}}
  assert(cache.queries==q&&dma_calls.size()==6&&o_scales.size()==240&&opacks==6&&gpacks==0);cache.o=true;
@@ -138,16 +137,12 @@ int main(){
  for(int layer=0;layer<24;++layer)for(int fault=0;fault<9;++fault){auto x=m;auto&w=x.layer_weights_[layer];if(fault==0)w.o_ws.rows=512;if(fault==1)w.o_ws.storage_offset_=128;if(fault==2)w.o_w.storage_offset_=256;if(fault==3)w.o_ws.address=0;if(fault==4)w.o_w.address+=1;if(fault==5)w.o_ws.address=(UINT64_C(1)<<40)-256;if(fault==6)w.o_w.contiguous=false;if(fault==7)w.o_ws.location=c10::DeviceType::CPU;if(fault==8)w.o_w.cols=1024;int before=opacks;x.install();assert(!x.action_o_resident_available_&&x.action_o_resident_.empty()&&opacks==before&&x.use_action_gateup_resident(32));}
  {auto x=m;x.linear_acc32_=true;int before=opacks;x.install();assert(!x.action_o_resident_available_&&x.use_action_gateup_resident(32)&&opacks==before);}
  {auto x=m;x.layer_weights_[23].down_w.dtype=at::kHalf;int before=opacks;x.install();assert(!x.action_o_resident_available_&&!x.action_mod_body_w8_&&opacks==before);}
- // N128 capability is frozen cold, consumes tile/grid in every COMPLETE route,
- // and cannot reuse an N64 descriptor even though owners/capacity are identical.
- cache.n128=true;auto fast=m;fast.install();fast.o_plan();assert(fast.action_o_resident_n128_);
- assert(fast.subclass_layout_hash()!=hash&&fast.kvinsert_cost_weight_identity()!=identity);
- for(const auto&r:fast.routes){assert(r.args[15]==288&&r.args[16]==128&&r.args[17]==128&&r.args[18]==8);}
- expected_n128=true;cache.n128=false;q=cache.queries;
+ // Unified resident-O capability is frozen cold and consumes tile/grid in every COMPLETE route.
+ auto fast=m;fast.install();fast.o_plan();assert(fast.action_o_resident_n128_);
+ for(const auto&r:fast.routes){assert(r.args[15]==64&&r.args[16]==80&&r.args[17]==512&&r.args[18]==13);}
+ q=cache.queries;
  fast.body_iter=0;fast.preload_action_o_resident();for(int l=0;l<24;++l)fast.o_stage(l);assert(cache.queries==q);
- {auto stale=fast;stale.routes=m.routes;auto count=o_scales.size();reject([&]{stale.launch_action_o_resident(0,{});});assert(o_scales.size()==count);auto dm=dma_calls.size();reject([&]{stale.preload_action_o_resident();});assert(dma_calls.size()==dm);}
  for(size_t a=0;a<fast.routes[23].args.size();++a){auto bad=fast;++bad.routes[23].args[a];auto count=o_scales.size();reject([&]{bad.launch_action_o_resident(23,{});});assert(o_scales.size()==count);}
- auto back=fast;back.install();back.o_plan();assert(!back.action_o_resident_n128_&&back.action_o_resident_available_);expected_n128=false;back.o_stage(0);assert(back.routes[23].args==m.routes[23].args);
  fast.reset();assert(!fast.action_o_resident_n128_&&!fast.action_o_resident_available_);
  ++owner_generation;m.install();m.o_plan();assert(m.action_o_resident_.back().owner==501020&&m.kvinsert_cost_weight_identity()!=identity);
  m.reset();assert(!m.action_o_resident_available_&&m.action_o_resident_.empty()&&!m.action_mod_body_w8_&&!m.use_action_o_resident(32));

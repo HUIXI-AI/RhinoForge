@@ -34,7 +34,7 @@ from rpu_backend.api.errors import (
     RPUBackendError, RPUUnsupportedDtypeError, UnsupportedModelError,
 )
 from rpu_backend.adapters.qwen3_5.quant_scope import (
-    FP16, W4A16_PGRP, W4A16_AWQ, QUANTTRIO_AWQ_PROFILE,
+    FP16, W4A16_PGRP, W4A16_AWQ, QUANTTRIO_AWQ_PROFILE, AWQ_PROFILES,
     LEGACY_W8A16_PROFILE, is_full_from_layer_types,
     normalize_quant_config, resolve_quant_specs, scale_key,
     validate_legacy_text_profile, validate_modern_27b_profile,
@@ -72,7 +72,7 @@ def parse_quant_config(config):
 
     storage = quant.get("storage", "int8")
     scale_dtype = quant.get("scale_dtype", "float16")
-    expected_storage = "uint8" if quant.get("profile") == QUANTTRIO_AWQ_PROFILE else "int8"
+    expected_storage = "uint8" if quant.get("profile") in AWQ_PROFILES else "int8"
     if storage != expected_storage or scale_dtype != "float16":
         raise UnsupportedModelError(
             f"Qwen3.5 quantized checkpoints require storage={expected_storage!r} and "
@@ -121,18 +121,19 @@ def _shard_paths(ckpt_dir: Path) -> list[Path]:
 def _rotary_buffer(module, name):
     """Rebuild a non-persistent rotary buffer that meta construction left empty.
 
-    Two recipes exist in modeling_qwen3_5: the text rotary is config-driven
-    (partial rotary / rope_parameters), while the vision rotary only keeps
-    ``dim``/``theta``. The Qwen3 helper in ``quant/load.py`` covers the first
-    shape only, which is why this is not shared.
+    Text and newer Vision use config-driven recipes; older Vision keeps
+    ``dim``/``theta`` directly.
     """
     if name not in ("inv_freq", "original_inv_freq"):
         return None
 
     config = getattr(module, "config", None)
-    if config is not None and hasattr(module, "compute_default_rope_parameters"):
+    if config is not None and (hasattr(module, "compute_default_rope_parameters")
+                               or hasattr(module, "compute_axial_rope_parameters")):
         rope_type = getattr(module, "rope_type", None) or "default"
-        if rope_type == "default":
+        if rope_type == "axial":
+            rope_init_fn = module.compute_axial_rope_parameters
+        elif rope_type == "default":
             rope_init_fn = module.compute_default_rope_parameters
         else:
             from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
@@ -447,7 +448,7 @@ def _load_quanttrio_awq(ckpt_dir, config, quant):
         model.config.quantization_config = source_quant
     model._qwen3_5_quant_config = copy.deepcopy(quant)
     model._qwen3_5_awq_import = {
-        "source": str(ckpt_dir), "profile": QUANTTRIO_AWQ_PROFILE,
+        "source": str(ckpt_dir), "profile": quant["profile"],
         "completed": True, "triplet_roundtrip_count": len(imported),
         "quantized_modules": sorted(imported), "zero_convention": "direct; no +1",
         "logical_weight_dtype": "uint8", "logical_zero_dtype": "uint8",
@@ -549,11 +550,8 @@ def load_qwen3_5_model(
     local converter directory or an original QuantTrio AWQ GEMM directory.
     Returns an eval-mode CPU model ready for ``Qwen3_5Adapter(...).to_rpu()``.
 
-    The FP16 branch is byte-for-byte the call every existing caller already
-    makes. That matters: this checkpoint stores the 24 GDN ``linear_attn.norm``
-    tensors as fp32 while everything else is bf16, so `text_config.dtype`
-    pinning the load to bf16 is observable in the final fp16 weights. Any other
-    load route silently shifts them by one bf16 ulp and moves the parity hash.
+    Older HF versions may honor a nested checkpoint dtype during loading.
+    Compare loaded weights with the checkpoint metadata and HF version recorded.
     """
     if dtype is not torch.float16:
         raise RPUUnsupportedDtypeError(
@@ -575,8 +573,7 @@ def load_qwen3_5_model(
         load_kwargs.setdefault("low_cpu_mem_usage", True)
         model = AutoModelForImageTextToText.from_pretrained(
             pretrained_name_or_path, torch_dtype=dtype, **load_kwargs)
-        # text_config.dtype=bfloat16 overrides from_pretrained(dtype=fp16); the
-        # device install path requires fp16.
+        # Normalize parameters left in another dtype by older HF loaders.
         return model.half().eval()
 
     ckpt_dir = Path(pretrained_name_or_path).expanduser()
@@ -587,7 +584,7 @@ def load_qwen3_5_model(
 
     if quant.get("profile") == LEGACY_W8A16_PROFILE:
         return _load_legacy_qwen38_text_model(ckpt_dir, config, quant)
-    if quant.get("profile") == QUANTTRIO_AWQ_PROFILE:
+    if quant.get("profile") in AWQ_PROFILES:
         unsupported = set(hf_kwargs) - _CONFIG_KWARGS - {"device_map", "low_cpu_mem_usage"}
         if (unsupported or hf_kwargs.get("device_map", "cpu") not in (None, "cpu")
                 or hf_kwargs.get("low_cpu_mem_usage", True) is not True):

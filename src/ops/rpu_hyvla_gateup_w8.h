@@ -3,6 +3,7 @@
 #include "rpu_kernel_decls.h"
 #include "rpu_spm_allocator.h"
 #include "rpu_linear_tiling.h"
+#include "rpu_specialized_linear_contracts.h"
 
 // Exact HyVLA M51/H1024/I2048/TP8 adapter for Wall W8 and the private N48 trial.
 // Resident pair: independent Gate/Up outputs, then the owner's original SiLU*Up.
@@ -51,9 +52,8 @@ inline void launch_hyvla_gateup_w8(
     }
     const KernelId id = resident
         ? (fused_resident ? KernelId::HYVLA_W8_RESIDENT_SWIGLU_S51
-                          : KernelId::WALL_ACTION_GATE_UP_W8A16_MULTIBASE_M592N32_SPM_WEIGHT)
-        : narrow ? KernelId::HYVLA_EXPERT_GATEUP_W8_S51_N48
-                 : KernelId::WALL_PREFILL_GATE_UP_SWIGLU_W8A16_M320N112;
+                          : KernelId::HYVLA_GATEUP_RESIDENT_PAIR_W8_V2)
+        : KernelId::HYVLA_EXPERT_GATEUP_W8_S51_N48;
     std::vector<GraphDdrRegisterOperandSpec> operands;
     auto add = [&](const at::Tensor& t, GraphDdrRegisterRole role, int lo) {
         TORCH_CHECK(rhino_lkn::RpuGetDevAddr(t.data_ptr()) % 256 == 0, "HyVLA W8 DDR alignment");
@@ -62,8 +62,8 @@ inline void launch_hyvla_gateup_w8(
     };
     if (!resident) add(gate_weight, GraphDdrRegisterRole::Int8ModelWeight, 2);
     add(gate_scale, GraphDdrRegisterRole::PerChannelScale, 20);
-    if (!resident) add(up_weight, GraphDdrRegisterRole::Int8ModelWeight, 24);
-    add(up_scale, GraphDdrRegisterRole::PerChannelScale, 26);
+    if (!resident) add(up_weight, GraphDdrRegisterRole::Int8ModelWeight, 32);
+    add(up_scale, GraphDdrRegisterRole::PerChannelScale, 34);
     auto writer = RpuKernelGraph::active().stage_kernel_ddr_registers(id, operands);
     for (auto* t : {&gate_weight, &up_weight, &gate_scale, &up_scale}) {
         rpu_ddr_flush(t->data_ptr());
@@ -77,12 +77,11 @@ inline void launch_hyvla_gateup_w8(
             input, 0, gate, 0, 51, 256, 1024, 0, 8, 2048, 512, 0, 1, 1});
     if (resident) {
         rpu_pl_tiling::set_u32_reg_pair(*kernel, 2, gate_spm);
-        rpu_pl_tiling::set_u32_reg_pair(*kernel, 24, up_spm);
-        rpu_pl_tiling::set_u32_reg_pair(*kernel, 30, up);
+        rpu_pl_tiling::set_u32_reg_pair(*kernel, 32, up_spm);
+        rpu_pl_tiling::set_u32_reg_pair(*kernel, 36, up);
     }
     writer.write(*kernel);
-    if (fused_resident) kernel->set_regs(uint32_t(128), uint32_t(0));
     auto* queue = GET_QUEUE(8);
     queue->set_broadcast_mode(true);
-    queue->enqueu_kernel(*kernel, {uint16_t(resident ? (fused_resident ? 8 : 16) : narrow ? 6 : 3), 1, 1}, {0,1,2,3,4,5,6,7});
+    queue->enqueu_kernel(*kernel, rpu_specialized_linear::grid(id), {0,1,2,3,4,5,6,7});
 }

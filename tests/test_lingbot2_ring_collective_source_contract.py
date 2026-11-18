@@ -3,7 +3,6 @@
 from pathlib import Path
 import subprocess
 
-
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME = ROOT / "src/core/rpu_runtime_extras.cpp"
 PRIVATE_HEADER = ROOT / "src/core/rpu_lingbot2_ring_collective.h"
@@ -112,11 +111,17 @@ def test_all_model_routes_use_the_public_admission_wrapper():
         assert private_call not in body
         assert "rpu_launch_all_reduce_sum_residual_kernel(" in body
 
-    policy = _read(OUTER)
-    assert "KernelId::LLM_ALL_REDUCE_RESIDUAL_RING_PACED, 228" in policy
-    assert "KernelId::LLM_ALL_REDUCE_SUM_RESIDUAL, 12" not in policy
-    assert "KernelId::LLM_REDUCE_SUM_SCATTER_RESIDUAL_V2, 288" not in policy
-    assert "KernelId::ALL_GATHER_MULTI_CORE, 288" not in policy
+    outer_src = _read(OUTER)
+    start = outer_src.index('const GraphKernelRegisterPolicy& lingbot2_multiview_w8_register_policy()')
+    end = outer_src.index('\nGraphSignature graph_signature(', start)
+    assert 'return rpu_pl_census::policy("lingbot2_multiview_w8_register_policy")' in outer_src[start:end]
+    policies_src = _read(ROOT / 'src/fused/rpu_parallel_linear_register_policies.h')
+    p_start = policies_src.index('inline const GraphKernelRegisterPolicy& lingbot2_multiview_w8_register_policy()')
+    p_end = policies_src.index('return value;', p_start)
+    p_body = policies_src[p_start:p_end]
+    assert 'rule("llm_all_reduce_residual", 228, GraphKernelRegisterRuleKind::ExplicitNoDdr, GraphKernelNoDdrProof::RingAllReduceSpmResidual, {}, false)' in p_body
+    for retired in ("llm_all_reduce_sum_residual", "llm_reduce_sum_scatter_residual_v2", "all_gather_multi_core"):
+        assert f'"{retired}"' not in p_body
 
 
 def test_actual_attn_ring_adarms_cold_admission_covers_both_expert_precisions(tmp_path):

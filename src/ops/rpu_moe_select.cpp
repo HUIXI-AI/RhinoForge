@@ -352,7 +352,8 @@ void rpu_launch_backend_moe_select_fp16_spm(
     uint32_t dense_weights_addr,
     int64_t token_rows,
     int64_t num_experts,
-    int64_t top_k) {
+    int64_t top_k,
+    int num_cores) {
     TORCH_CHECK(SPM_ALLOC.is_initialized(),
                 "backend_moe_select: SPM allocator is not initialized");
     TORCH_CHECK(token_rows > 0 && token_rows % 16 == 0 && token_rows <= 128,
@@ -376,7 +377,7 @@ void rpu_launch_backend_moe_select_fp16_spm(
         correction_bias_addr, scores_token_major_addr,
         choice_token_major_addr,
         /*n=*/token_rows, /*c=*/num_experts, c10::Half(1.0f),
-        ValuOpType::ADD, /*is_bopa=*/false);
+        ValuOpType::ADD, /*is_bopa=*/false, num_cores);
 
     launch_topk_by_select_fp16(
         choice_token_major_addr, scatter_ids_u16_addr,
@@ -425,9 +426,9 @@ void rpu_launch_backend_moe_select_fp16_spm(
     rpu_launch_eltwise_binary_scalar_spm_kernel(
         reduce_scratch_addr,
         c10::Half(0x0001, c10::Half::from_bits()),
-        reduce_scratch_addr, token_rows, ValuOpType::ADD);
+        reduce_scratch_addr, token_rows, ValuOpType::ADD, num_cores);
     rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
         reduce_scratch_addr, dense_weights_addr, dense_weights_addr,
         /*n=*/num_experts, /*c=*/token_rows, c10::Half(1.0f),
-        ValuOpType::DIV, /*is_bopa=*/true);
+        ValuOpType::DIV, /*is_bopa=*/true, num_cores);
 }

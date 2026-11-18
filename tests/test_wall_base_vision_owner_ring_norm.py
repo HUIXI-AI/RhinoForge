@@ -285,6 +285,7 @@ def test_actual_fp16_w8_owner_routes_and_full_layer_handoffs(tmp_path):
         '    std::vector<int64_t> small_image_down_owner_norm_arguments(',
         '    void consume_small_image_down_owner_norm(',
         '    std::vector<int64_t> small_image_gate_up_arguments(',
+        '    std::vector<int64_t> vision_row_arguments(',
     ))
     cold = []
     for name in ('small_owner_ring_norm_available_', 'small_down_owner_norm_available_'):
@@ -429,11 +430,9 @@ TAIL
  m.merger_ln_q_w_.present=true;
  for(auto& bn:m.layer_bias_norm_){bn.norm1_w.present=bn.norm2_w.present=true;}
  m.context.stage_plan=plan_for(rows);m.bind();return m;''')
-    for marker, body in (
-        ('PRODUCER', producer), ('HEAD', head), ('TAIL', tail),
-        ('SORT_OWNER', sort_routes),
-    ):
-        source = source.replace(f'\n{marker}\n', f'\n{body}\n')
+    source = source.replace('\nPRODUCER\n', '\n' + producer + '\n')
+    source = source.replace('\nHEAD\n', '\n' + head + '\n').replace('\nTAIL\n', '\n' + tail + '\n')
+    source = source.replace('SORT_OWNER', sort_routes)
     source += r'''
 int main(){
  publish();auto& cache=KernelCache::instance();

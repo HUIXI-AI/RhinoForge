@@ -135,7 +135,9 @@ def test_runtime_admission_rejects_unregistered_scope_and_geometry(fault):
     elif fault=='tie': cfg.tie_word_embeddings=True
     elif fault=='nested': cfg.text_config.quant_config={}
     elif fault=='geometry': cfg.text_config.intermediate_size+=512
-    elif fault=='float_geometry': cfg.text_config.num_hidden_layers=28.0
+    elif fault=='float_geometry':
+        # Reach our admission guard even when HF validates assignment first.
+        object.__setattr__(cfg.text_config, 'num_hidden_layers', 28.0)
     elif fault=='rope': cfg.text_config.rope_parameters['mrope_section']=[20,20,24]
     else: cfg.vision_config.out_hidden_size=2560
     assert not runtime.is_qwen3_vl_runtime_quant_config(cfg)

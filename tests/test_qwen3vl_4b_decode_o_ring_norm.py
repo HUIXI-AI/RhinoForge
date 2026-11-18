@@ -5,6 +5,7 @@ import shutil
 import subprocess
 
 import pytest
+from pi_wall_host_catalog import with_actual_linear_contracts
 from test_qwen3vl_prefill_gateup_launcher import definition
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,7 +32,7 @@ def test_o_manifest_and_dispatch(tmp_path):
     select = source[start:source.index('        const bool qwen3vl4b_fused_qk_kv =', start)]
     start = source.index('            if (qwen3vl4b_fused_o)', manifest)
     routes = source[start:source.index('            if (!deepstack_lang_layers_', start)]
-    ring = definition(source[source.index('if (!wall_action_linear_ring && !qwen3vl4b_fused_o &&', manifest):],
+    ring = definition(source[manifest:],
                       'if (!wall_action_linear_ring && !qwen3vl4b_fused_o &&')
     start = source.index('        auto append =', manifest)
     append = source[start:source.index('        auto append_attention =', start)]
@@ -67,7 +68,6 @@ __CONSTANTS__
 struct Stage{std::vector<ChunkInfo> chunks;};
 struct Plan{ChunkMode chunk_mode=ChunkMode::SEQUENTIAL;Stage compute;};
 using FmbThreeStageChunkPlan=Plan;
-enum class KernelId{W8A16_ROW_WEIGHT_REUSE_M352N80K256};
 struct KernelCache{static KernelCache& instance(){static KernelCache cache;return cache;}bool has_loaded(KernelId)const{return false;}};
 struct Layout{bool is_causal=true,use_attn_mask=false;int64_t batch_size=1;AttentionExecutionPolicy attention_policy=AttentionExecutionPolicy::AUTO;};
 struct Context{
@@ -101,13 +101,12 @@ struct CausalDecoderModel{
  uint32_t addr(int core,const char* name)const{assert(core==0);std::string n=name;return live_base+(n=="output"?0x1000:n=="oproj"?0x3000:n=="residual1"?0x5000:0x7000);}
  uint32_t norm_post_addr(int layer,int core)const{assert(core==0);return live_base+0x9000+layer*5120;}
  std::vector<int64_t> bind_cold_topology_arguments(std::vector<int64_t> v)const{return v;}
- std::vector<int64_t> wall_base_nvfp4_o_ring_norm_arguments(int64_t)const{throw std::runtime_error("unexpected Wall route");}
  int64_t causal_ring_route(int64_t,int64_t)const{return 1;}
+ std::vector<int64_t> wall_base_nvfp4_o_ring_norm_arguments(int64_t)const{throw std::runtime_error("unexpected Wall route");}
  __PREDICATES__
  FmbPhysicalExecutionManifest selected(const Plan& plan,const Layout& layout,int64_t physical_len,bool partial_mrope){
-  const int64_t position=0;
-  FmbPhysicalExecutionManifest manifest;manifest.state=FmbPhysicalManifestState::COMPLETE;bool wall_base_nvfp4_o_ring_norm = false;
-    bool wall_action_linear_ring=false;
+  FmbPhysicalExecutionManifest manifest;manifest.state=FmbPhysicalManifestState::COMPLETE;bool wall_action_linear_ring=false;
+  const bool wall_base_nvfp4_o_ring_norm=false;const int64_t position=0;
   __APPEND__
   __HELPERS__
   __SELECT__
@@ -165,6 +164,7 @@ int main(){
 '''
     values = dict(ENUMS=enums, STRUCTS=structs, CONSTANTS=constants, CONSUMER=consumer,
                   PREDICATES='\n'.join(definition(source, name) for name in (
+                      'static std::vector<int64_t> qwen3vl_decode_o_contract_arguments()',
                       'bool qwen3vl_decode_gemv(', 'bool qwen3vl_decode_mlp(',
                       'bool qwen3vl_4b_decode_o_ring_norm(', 'CausalDecoderLinearRoute decoder_projection_route(',
                       'bool ordinary_row_weight_reuse_plan_enabled(', 'std::vector<int64_t> ordinary_o_route_arguments(')),
@@ -172,7 +172,7 @@ int main(){
                   EMITTER=definition(source, 'void emit_qwen3vl_4b_decode_o_ring_norm('), DISPATCH=dispatch)
     for key, value in values.items(): program = program.replace(f'__{key}__', value)
     cpp, exe = tmp_path/'o_route.cpp', tmp_path/'o_route'
-    cpp.write_text(program)
+    cpp.write_text(with_actual_linear_contracts(program))
     result = subprocess.run([compiler, '-std=c++17', '-Wall', '-Wextra', '-Werror', '-Wno-misleading-indentation', '-I', str(ROOT), str(cpp), '-o', str(exe)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     subprocess.run([str(exe)], check=True, capture_output=True, text=True)
@@ -205,7 +205,7 @@ int main(){
  }
 }
 '''.replace('__METHOD__', method).replace('__INSTALL__', install)
-    cpp, exe = tmp_path/'o_scale.cpp', tmp_path/'o_scale'; cpp.write_text(program)
+    cpp, exe = tmp_path/'o_scale.cpp', tmp_path/'o_scale'; cpp.write_text(with_actual_linear_contracts(program))
     torch_root = Path(torch.__file__).resolve().parent
     subprocess.run(['g++', '-std=c++17', '-O0', f'-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}',
                     '-I', str(torch_root/'include'), str(cpp), '-L', str(torch_root/'lib'), '-ltorch_cpu', '-lc10',

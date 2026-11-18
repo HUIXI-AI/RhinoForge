@@ -77,6 +77,7 @@ def _tp4_owner(policy=None):
             num_cores=4,
             attn_tp=4,
             mlp_tp=4,
+            routed_tp=4,
             lm_head_tp=4,
             physical_kv_cores=8,
         ),

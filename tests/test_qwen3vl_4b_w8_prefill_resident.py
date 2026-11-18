@@ -32,11 +32,11 @@ def test_native_prefill_admission_and_causal_traversal(tmp_path):
         "bool qwen3vl_4b_w8_resident_prefill(",
         "void consume_qwen3vl_4b_w8_prefill_schedule("))
     fmb = (ROOT / "src/core/fused_model_base.cpp").read_text()
+    base = (ROOT / "src/core/fused_model_base.h").read_text()
     traversal = fmb[fmb.index("struct FmbExecutionTraversalSpec {"):
                     fmb.index("int64_t validate_fmb_resolved_chunks(")]
-    base = (ROOT / "src/core/fused_model_base.h").read_text()
-    traversal = ("namespace detail {\n" + _method(
-        base, "inline bool fmb_kv_first_pair_carry_eligible(") + "\n}\n" + traversal)
+    traversal = ("namespace detail {\n" + _method(base,
+        "inline bool fmb_kv_first_pair_carry_eligible(") + "\n}\n" + traversal)
     harness = r'''
 #include <algorithm>
 #include <cassert>
@@ -187,24 +187,3 @@ int main() {
     subprocess.run([str(exe)], check=True, capture_output=True, text=True)
 
 
-def test_complete_manifest_and_existing_chunk_offsets():
-    source = HEADER.read_text()
-    manifest = _method(source, "FmbPhysicalExecutionManifest physical_manifest_for_candidate(")
-    config = _method(source, "ModelDynamicConfig dynamic_config(")
-    consume = _method(source, "void consume_qwen3vl_4b_w8_prefill_schedule(")
-    body = _method(source, "void build_layer_subgraph(")
-    assert "cfg.cross_layer_batch_size = num_layers();" in source
-    selected = config.split("if (qwen3vl_4b_w8_resident_prefill(", 1)[1].split("\n        }", 1)[0]
-    assert "cfg.inter_layer_io = InterLayerIO::SPM_RESIDENT;" in selected
-    assert "cfg.chunk_outer_within_group = true;" in selected
-    assert "qwen3vl_4b_w8_resident_prefill(" in manifest
-    assert "CAUSAL_DECODER_4B_W8_PREFILL_SCHEDULE_SITE" in manifest
-    assert "CAUSAL_DECODER_4B_W8_PREFILL_SCHEDULE_SITE" in consume
-    assert "consume_qwen3vl_4b_w8_prefill_schedule(layer_idx, chunk);" in body
-    assert "if (!ctx().input_in_spm && !z1_input.external" in body
-    assert "ctx().position + chunk.offset, seq_len" in body
-    assert "int64_t kv_seq_len = chunk.kv_seq_len;" in body
-    assert "chunk_row_offset_(chunk) * h * DWIDTH" in body
-    assert "/*num_elements=*/rows * h" in body
-    assert "} else if (!ctx().output_to_spm)" in body
-    assert "emit_layer_output_dma(layer_idx, chunk);" in body

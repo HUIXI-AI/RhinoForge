@@ -72,10 +72,11 @@
 using namespace at;
 using namespace ::rhino_lkn;
 
-#define NUM_CORES 8
 #define DWIDTH 2
 
 constexpr int64_t HYVIT2_PATCH_INPUT_DMA_SITE = 6327224917790673981LL;
+// Reduced-core profile receipt (4 lanes only; eight cores emit no entry).
+constexpr int64_t HYVIT2_CORE_PROFILE_SITE = 4423875840607322045LL;
 constexpr int64_t HYVIT2_PATCH_LINEAR_SITE = 5594838142388648123LL;
 constexpr int64_t HYVIT2_PATCH_ALL_GATHER_SITE = 2358476529501646058LL;
 constexpr int64_t HYVIT2_PATCH_POSITION_DMA_SITE = 2702679098023419389LL;
@@ -388,6 +389,55 @@ static void check_hyvit2_w8a16_scale_lists(
     check_projection(fc2_w, fc2_ws, "fc2_w");
 }
 
+// Packed W4 (hyvit2_set_weights_w4a16) is a declared mode: every projection is
+// uint8 [N,K/2] in the pgrp layout with its controller-striped G32 fp16 scale.
+// Column q/k/v/fc1 need N%(16c) and K%64, row o/fc2 N%16 and K%(64c).
+static void check_hyvit2_w4a16_scale_lists(
+    int64_t n_layers, int64_t cores,
+    at::TensorList q_w, at::TensorList k_w, at::TensorList v_w,
+    at::TensorList o_w, at::TensorList fc1_w, at::TensorList fc2_w,
+    at::TensorList q_ws, at::TensorList k_ws, at::TensorList v_ws,
+    at::TensorList o_ws, at::TensorList fc1_ws, at::TensorList fc2_ws)
+{
+    const char* ctx = "hyvit2_set_weights_w4a16";
+    auto check_projection = [&](const at::TensorList& weights,
+                                const at::TensorList& scales,
+                                bool col, const char* name) {
+        TORCH_CHECK(static_cast<int64_t>(scales.size()) == n_layers,
+                    ctx, ": ", name, "_scale.size()=", scales.size(),
+                    " != num_layers=", n_layers);
+        for (int64_t i = 0; i < n_layers; ++i) {
+            const at::Tensor& w = weights[i];
+            const at::Tensor& s = scales[i];
+            TORCH_CHECK(w.scalar_type() == at::kByte && w.device().type() == at::kPrivateUse1 &&
+                            w.is_contiguous(),
+                        ctx, ": ", name, "[", i, "] must be contiguous packed uint8 W4 on RPU, got ",
+                        w.scalar_type());
+            const int64_t n = w.size(0), k = w.size(1) * 2;
+            TORCH_CHECK(n % (col ? 16 * cores : 16) == 0 &&
+                            k % (col ? 64 : 64 * cores) == 0,
+                        ctx, ": packed W4 ", name, "[", i, "] [", n, ",", k,
+                        "] does not split into 16-aligned N and 64-aligned K over ", cores,
+                        col ? " column" : " row", " lanes");
+            const int64_t local_g = (col ? k : k / cores) / 32;
+            const int64_t local_n = col ? n / cores : n;
+            const int64_t expected = cores * ((local_g + 3) / 4) * ((local_n + 63) / 64) * 256;
+            TORCH_CHECK(s.defined() && s.dim() == 2 && s.size(0) == 32 &&
+                            s.scalar_type() == at::kHalf && s.device().type() == at::kPrivateUse1 &&
+                            s.is_contiguous() && s.numel() == expected,
+                        ctx, ": packed W4 ", name, "_scale[", i, "] must be the contiguous fp16 RPU "
+                        "G32 pgrp payload of ", expected, " elements, got ", s.sizes());
+        }
+    };
+
+    check_projection(q_w,   q_ws,   true,  "q_w");
+    check_projection(k_w,   k_ws,   true,  "k_w");
+    check_projection(v_w,   v_ws,   true,  "v_w");
+    check_projection(o_w,   o_ws,   false, "o_w");
+    check_projection(fc1_w, fc1_ws, true,  "fc1_w");
+    check_projection(fc2_w, fc2_ws, false, "fc2_w");
+}
+
 }  // namespace
 
 namespace v3 {
@@ -479,6 +529,44 @@ public:
     explicit HYViT2VisionModel(bool kv_spm_only = false)
         : cold_kv_spm_only_(kv_spm_only) {}
 
+    // Cold lane count: 8 (default) or 4. Four lanes run the packed 3x196
+    // DDR-KV schedule only; the raw-SPM owners stay eight-core.
+    void set_execution_cores(int64_t cores) {
+        TORCH_CHECK(cores == 4 || cores == 8,
+                    "HYViT2 execution cores must be 4 or 8");
+        TORCH_CHECK(!cold_config_bound_ && layer_weights_.empty(),
+                    "HYViT2 execution cores must precede the runtime config "
+                    "and weight installation");
+        TORCH_CHECK(cores == 8 || !cold_kv_spm_only_,
+                    "HYViT2 KV-SPM-only owner requires eight cores");
+        set_execution_core_count(static_cast<int>(cores));
+    }
+
+    std::vector<int64_t> execution_topology() const {
+        TORCH_CHECK(num_layers() > 0 && !layer_weights_.empty(),
+                    "HYViT2 topology requires installed model weights");
+        return {1, num_cores(), attn_tp(), mlp_tp(), 1, 8,
+                logical_intermediate_size_, intermediate_size()};
+    }
+
+    std::vector<int64_t> core_profile_arguments() const {
+        auto args = execution_topology();
+        args.push_back(reduced_w8_projection_mask_);
+        return args;
+    }
+
+    DecoderExecutionTopology resolve_model_execution_topology(
+            int64_t nq, int64_t nkv, int64_t hd, int64_t h,
+            int64_t intermediate) const override {
+        if (num_cores() == 8)
+            return FusedModelBase::resolve_model_execution_topology(
+                nq, nkv, hd, h, intermediate);
+        TORCH_CHECK(num_cores() == 4 && nq == 16 && nkv == 16 && hd == 80 &&
+                        h == 1152 && intermediate == 4352,
+                    "no admitted reduced-core HYViT2 profile");
+        return {4, 4, 4};
+    }
+
     void set_runtime_config(
         bool fast_replay, bool fast_replay_preload, bool mask_once,
         bool kvpad16, bool q_inplace) {
@@ -488,7 +576,7 @@ public:
             "set_weights");
         cold_config_ = {
             fast_replay, fast_replay_preload, mask_once, kvpad16, q_inplace};
-        cold_per_image_attention_ = cold_kv_spm_only_ &&
+        cold_per_image_attention_ = num_cores() == 8 && cold_kv_spm_only_ &&
             KernelCache::instance().get_kernel("hyvit2_per_image_raw_spm_s196") != nullptr;
         TORCH_CHECK(!cold_per_image_attention_ ||
                         (KernelCache::instance().get_program(
@@ -498,7 +586,7 @@ public:
                     "HYViT2 per-image attention requires both raw-SPM payloads");
         // A private REF is the cold opt-in. Both phases must exist together;
         // old or partial REFs retain the full residual and ordinary LayerNorm.
-        cold_owner_layernorm_ = cold_kv_spm_only_ &&
+        cold_owner_layernorm_ = num_cores() == 8 && cold_kv_spm_only_ &&
             KernelCache::instance().get_kernel("hyvit2_vision_owner_reduce_layernorm_m392n1152") != nullptr &&
             KernelCache::instance().get_kernel("hyvit2_vision_xor3_compact_residual_raw_full_m392n1152") != nullptr;
         cold_config_bound_ = true;
@@ -525,7 +613,8 @@ public:
         int64_t patch_embed_cores,
         at::TensorList q_ws_list, at::TensorList k_ws_list,
         at::TensorList v_ws_list, at::TensorList o_ws_list,
-        at::TensorList fc1_ws_list, at::TensorList fc2_ws_list)
+        at::TensorList fc1_ws_list, at::TensorList fc2_ws_list,
+        bool packed_w4 = false)
     {
         TORCH_CHECK(
             cold_config_bound_,
@@ -536,9 +625,9 @@ public:
         TORCH_CHECK(num_heads > 0 && head_dim > 0 && hidden_size > 0
                     && intermediate_size > 0 && projection_dim > 0,
                     "hyvit2_set_weights: dim params must be positive");
-        TORCH_CHECK(patch_embed_cores == 1 || patch_embed_cores == NUM_CORES,
+        TORCH_CHECK(patch_embed_cores == 1 || patch_embed_cores == num_cores(),
                     "hyvit2_set_weights: patch_embed_cores must be 1 or ",
-                    NUM_CORES, ", got ", patch_embed_cores);
+                    num_cores(), ", got ", patch_embed_cores);
         if (production_config_bound_) {
             TORCH_CHECK(
                 merger_member_major_ == fused_merger &&
@@ -629,10 +718,81 @@ public:
         check_defined_rank(o_b_list,   "o_b_list",   1, /*require_fp16_rpu=*/true);
         check_defined_rank(fc1_b_list, "fc1_b_list", 1, /*require_fp16_rpu=*/true);
         check_defined_rank(fc2_b_list, "fc2_b_list", 1, /*require_fp16_rpu=*/true);
-        check_hyvit2_w8a16_scale_lists(
-            N,
-            q_w_list, k_w_list, v_w_list, o_w_list, fc1_w_list, fc2_w_list,
-            q_ws_list, k_ws_list, v_ws_list, o_ws_list, fc1_ws_list, fc2_ws_list);
+        if (packed_w4) {
+            // Only the exact HyVLA tower on four lanes: at eight, the padded
+            // o (K1280) and fc2 (K4352) rows split into 160 and 544 per core,
+            // which the pgrp W4 kernels do not accept.
+            TORCH_CHECK(num_cores() == 4 && N == 27 && num_heads == 16 && head_dim == 80 &&
+                            hidden_size == 1152 && intermediate_size == 4352 &&
+                            projection_dim == 2048,
+                        "hyvit2_set_weights_w4a16 requires the exact HyVLA tower on four cores; "
+                        "at eight the padded o (K1280) and fc2 (K4352) rows split into 160/544 per core");
+            check_hyvit2_w4a16_scale_lists(
+                N, num_cores(),
+                q_w_list, k_w_list, v_w_list, o_w_list, fc1_w_list, fc2_w_list,
+                q_ws_list, k_ws_list, v_ws_list, o_ws_list, fc1_ws_list, fc2_ws_list);
+        } else {
+            check_hyvit2_w8a16_scale_lists(
+                N,
+                q_w_list, k_w_list, v_w_list, o_w_list, fc1_w_list, fc2_w_list,
+                q_ws_list, k_ws_list, v_ws_list, o_ws_list, fc1_ws_list, fc2_ws_list);
+        }
+
+        // Four lanes admit exactly the HyVLA tower: 27 layers, 16 x 80 padded
+        // heads, I4352 padded, fused member-major merger with proj1 in the
+        // merger, and one projection precision (FP16, W8 or packed W4) for
+        // every layer.
+        int64_t precision_mask = 0;
+        if (num_cores() != 8) {
+            TORCH_CHECK(num_cores() == 4 && N == 27 && num_heads == 16 &&
+                            head_dim == 80 && hidden_size == 1152 &&
+                            intermediate_size == 4352 && projection_dim == 2048,
+                        "no admitted reduced-core HYViT2 geometry");
+            TORCH_CHECK(fused_merger && proj1_in_merger,
+                        "reduced-core HYViT2 requires the fused merger with "
+                        "proj1 in the merger");
+            const int64_t attention_width = num_heads * head_dim;
+            const std::array<std::array<int64_t, 2>, 6> expected{{
+                {attention_width, hidden_size}, {attention_width, hidden_size},
+                {attention_width, hidden_size}, {hidden_size, attention_width},
+                {intermediate_size, hidden_size}, {hidden_size, intermediate_size}}};
+            for (int64_t i = 0; i < N; ++i) {
+                size_t j = 0;
+                int64_t layer_mask = 0;
+                for (const auto* tensor : {&q_w_list[i], &k_w_list[i],
+                        &v_w_list[i], &o_w_list[i], &fc1_w_list[i],
+                        &fc2_w_list[i]}) {
+                    // Packed W4 stores two K values per byte.
+                    const bool w4 = packed_w4 && tensor->scalar_type() == at::kByte;
+                    TORCH_CHECK((tensor->scalar_type() == at::kHalf ||
+                                 tensor->scalar_type() == at::kChar || w4) &&
+                                    tensor->size(0) == expected[j][0] &&
+                                    tensor->size(1) * (w4 ? 2 : 1) == expected[j][1],
+                                "HYViT2 component projection shape/precision mismatch");
+                    if (tensor->scalar_type() == at::kChar) layer_mask |= 1LL << j;
+                    if (w4) layer_mask |= 1LL << (6 + j);
+                    ++j;
+                }
+                if (i == 0) precision_mask = layer_mask;
+                TORCH_CHECK(layer_mask == precision_mask &&
+                                (precision_mask == 0 || precision_mask == 0x3f ||
+                                 precision_mask == 0xfc0),
+                            "HYViT2 component precision scope must be uniform");
+                for (const auto* tensor : {&ln1_w_list[i], &ln1_b_list[i],
+                        &ln2_w_list[i], &ln2_b_list[i], &o_b_list[i],
+                        &fc2_b_list[i]})
+                    TORCH_CHECK(tensor->numel() == hidden_size,
+                                "HYViT2 component norm/row-bias shape mismatch");
+                for (const auto* tensor : {&q_b_list[i], &k_b_list[i], &v_b_list[i]})
+                    TORCH_CHECK(tensor->numel() == attention_width,
+                                "HYViT2 component QKV bias shape mismatch");
+                TORCH_CHECK(fc1_b_list[i].numel() == intermediate_size,
+                            "HYViT2 component FC1 bias shape mismatch");
+            }
+        }
+        logical_intermediate_size_ =
+            hidden_size == 1152 && intermediate_size == 4352 ? 4304 : intermediate_size;
+        reduced_w8_projection_mask_ = precision_mask;
 
         // SigLIP uses MHA: num_kv_heads == num_q_heads
         set_model_params(num_heads, num_heads, head_dim,
@@ -648,8 +808,8 @@ public:
 
         // Site9 (KV_FIRST): per-core local Q head count for q_ddr_buf_ staging
         // and the Phase1 Q→DDR / Phase2 DDR→Q scatter/gather (mirror Gemma's
-        // local_q_heads_ = num_q_heads / attn_tp()). SigLIP fixes tp = NUM_CORES.
-        local_q_heads_ = num_q_heads() / NUM_CORES;
+        // local_q_heads_ = num_q_heads / attn_tp()); every lane owns 16/num_cores heads.
+        local_q_heads_ = num_q_heads() / num_cores();
 
         // Build layer weights
         layer_weights_.clear();
@@ -665,6 +825,16 @@ public:
                 !fc1_ws_list.empty() ? fc1_ws_list[i] : at::Tensor(),
                 !fc2_ws_list.empty() ? fc2_ws_list[i] : at::Tensor(),
             });
+        }
+        // Packed W4 scales are retained at the pgrp launcher's cores*512 B DDR
+        // alignment; FP16 (undefined) and W8 scales pass through unchanged.
+        for (auto& lw : layer_weights_) {
+            lw.q_ws   = rpu_retain_linear_quant_scale(lw.q_w,   lw.q_ws,   num_cores());
+            lw.k_ws   = rpu_retain_linear_quant_scale(lw.k_w,   lw.k_ws,   num_cores());
+            lw.v_ws   = rpu_retain_linear_quant_scale(lw.v_w,   lw.v_ws,   num_cores());
+            lw.o_ws   = rpu_retain_linear_quant_scale(lw.o_w,   lw.o_ws,   num_cores());
+            lw.fc1_ws = rpu_retain_linear_quant_scale(lw.fc1_w, lw.fc1_ws, num_cores());
+            lw.fc2_ws = rpu_retain_linear_quant_scale(lw.fc2_w, lw.fc2_ws, num_cores());
         }
 
         // Build bias/norm tensor storage (keeps DDR pointers alive for DMA)
@@ -913,6 +1083,11 @@ public:
         // 仍然要求能被 image_batch_count_ 整除: minibatch SDPA 的
         // per_image_ctx = seq_len / N 必须是整数。
         TORCH_CHECK(
+            num_cores() == 8 ||
+                (image_batch_count_ <= 3 && seq_len == image_batch_count_ * 196),
+            "reduced-core HYViT2 admits one to three packed 196-row images, got "
+            "seq_len=", seq_len, " images=", image_batch_count_);
+        TORCH_CHECK(
             image_batch_count_ == 1 || (seq_len % image_batch_count_ == 0),
             "HYViT2 packed forward: seq_len (", seq_len,
             ") must be divisible by image_batch_count (", image_batch_count_,
@@ -955,7 +1130,7 @@ public:
                         "shapes on one handle — likely a runaway shape loop (per-shape Q "
                         "staging is never freed for replay-address stability)");
             q_ddr_slots_.emplace(q_key, at::empty(
-                {(int64_t)NUM_CORES, seq_len, q_width},
+                {int64_t{8}, seq_len, q_width},
                 at::TensorOptions().dtype(at::kHalf).device(at::kPrivateUse1)));
         }
 
@@ -1090,6 +1265,32 @@ public:
             resolve_prefill_stage_domain_for_shape(
                 seq_len, /*position=*/0, /*attention_mask=*/std::nullopt,
                 /*is_causal=*/false, input_chunks, spans, boundary_policies));
+    }
+
+    // Cold composite barrier for Hy-VLA's persistent children: reserve the
+    // Persistent norms/biases under the geometry resolve_stage_domain plans,
+    // so no sibling's domain is searched above a floor that moves later.
+    void prepare_persistent_spm_for_shape(
+        int64_t seq_len, int64_t image_batch_count,
+        bool external_patch_prologue) {
+        TORCH_CHECK(seq_len > 0 && image_batch_count > 0 &&
+                        seq_len % image_batch_count == 0,
+                    "hyvit2_prepare_persistent_spm: seq_len must be positive "
+                    "and divisible by image_batch_count");
+        const int64_t saved_seq_len = seq_len_;
+        const int64_t saved_image_batch_count = image_batch_count_;
+        const bool saved_external_patch_prologue =
+            planning_external_patch_prologue_;
+        auto restore = c10::make_scope_exit([&] {
+            seq_len_ = saved_seq_len;
+            image_batch_count_ = saved_image_batch_count;
+            planning_external_patch_prologue_ =
+                saved_external_patch_prologue;
+        });
+        seq_len_ = seq_len;
+        image_batch_count_ = image_batch_count;
+        planning_external_patch_prologue_ = external_patch_prologue;
+        prepare_persistent_spm(seq_len, /*position=*/0, /*is_causal=*/false);
     }
 
 protected:
@@ -1304,7 +1505,7 @@ protected:
         const int64_t h = hidden_size();
         const int64_t nq = num_q_heads();
         const int64_t hd = head_dim();
-        const int64_t tp = NUM_CORES;
+        const int64_t tp = num_cores();
         const int64_t local_q_dim = (nq / tp) * hd;
         const int64_t inter = intermediate_size();
         const int64_t local_inter = inter / tp;
@@ -1333,6 +1534,10 @@ protected:
                    std::move(arguments), /*flags=*/0, invocation);
         };
 
+        if (num_cores() != 8) {
+            append(FmbRouteFamily::GRAPH_SCHEDULE, HYVIT2_CORE_PROFILE_SITE,
+                   1, core_profile_arguments());
+        }
         append(
             FmbRouteFamily::GRAPH_SCHEDULE, HYVIT2_GRAPH_SCHEDULE_SITE,
             static_cast<int64_t>(
@@ -1456,8 +1661,8 @@ protected:
             append(
                 FmbRouteFamily::ALL_REDUCE,
                 HYVIT2_ATTN_ALL_REDUCE_SITE,
-                fmb_ring_all_reduce_route_selector(chunk.len, h),
-                {chunk.len, h, tp, NUM_CORES},
+                fmb_ring_all_reduce_route_selector(chunk.len, h, num_cores()),
+                {chunk.len, h, tp, num_cores()},
                 /*flags=*/0, invocation);
             }
             append_linear(
@@ -1476,8 +1681,8 @@ protected:
             append(
                 FmbRouteFamily::ALL_REDUCE,
                 HYVIT2_MLP_ALL_REDUCE_SITE,
-                fmb_ring_all_reduce_route_selector(chunk.len, h),
-                {chunk.len, h, tp, NUM_CORES},
+                fmb_ring_all_reduce_route_selector(chunk.len, h, num_cores()),
+                {chunk.len, h, tp, num_cores()},
                 /*flags=*/0, invocation);
             }
 
@@ -1577,7 +1782,8 @@ protected:
             }
         }
         append_fmb_shared_runtime_routes(
-            manifest, plan, hidden_size(), FMB_SHARED_LAYER_INPUT_DMA);
+            manifest, plan, hidden_size(), FMB_SHARED_LAYER_INPUT_DMA,
+            /*compute_row_multiplier=*/1, num_cores(), mlp_tp());
         return manifest;
     }
 
@@ -1641,6 +1847,7 @@ protected:
         const FmbThreeStageChunkPlan& plan,
         const LayoutContext& layout,
         int64_t position) const override {
+        if (num_cores() != 8) return false;
         if (position != 0 || layout.is_causal || layout.use_attn_mask ||
             layout.batch_size != 1 ||
             layout.attention_policy !=
@@ -1688,10 +1895,10 @@ protected:
         const int mask_type = image_batch_count_ > 1 ? 4 : 0;
         const bool attention_valid = cold_per_image_attention_
             ? sdpa_by_mha_spm_is_valid(1, 196, 196, num_q_heads(),
-                num_kv_heads(), head_dim(), NUM_CORES, 0)
+                num_kv_heads(), head_dim(), num_cores(), 0)
             : sdpa_by_mha_spm_is_valid(
                 /*batch=*/1, seq, seq, num_q_heads(), num_kv_heads(),
-                head_dim(), NUM_CORES, mask_type);
+                head_dim(), num_cores(), mask_type);
         return num_layers() == 27 && layer_weights_.size() == 27 &&
             hidden_size() == 1152 && intermediate_size() == 4352 &&
             num_q_heads() == 16 && num_kv_heads() == 16 &&
@@ -1727,8 +1934,8 @@ protected:
         int64_t hd = head_dim();
         int64_t is_ = intermediate_size();
 
-        int64_t local_q_dim = (nq / NUM_CORES) * hd;
-        int64_t local_inter = is_ / NUM_CORES;
+        int64_t local_q_dim = (nq / num_cores()) * hd;
+        int64_t local_inter = is_ / num_cores();
         auto A = [](int64_t bytes) -> int64_t { return Align(bytes, 256); };
         const bool raw_spm = ctx.attention_policy ==
             AttentionExecutionPolicy::SPM_KV_BY_MHA;
@@ -1756,10 +1963,10 @@ protected:
         // Phase-2 query-chunk length, NOT the full sequence).
         SdpaConfig sdpa_cfg{SdpaKernelType::FLASH_ATTN_SPM,
                             hd, /*nq*/nq, /*nkv*/nq,
-                            /*cores*/NUM_CORES,
+                            /*cores*/num_cores(),
                             /*mask*/image_batch_count_ > 1 ? 4 : 0};
         SdpaTiling t = sdpa_compute_tiling(sdpa_cfg, comp_cs);
-        int64_t nkv_per_core = CeilDiv(nq, (int64_t)NUM_CORES);
+        int64_t nkv_per_core = CeilDiv(nq, (int64_t)num_cores());
         int64_t sdpa_tmp = A(t.tile_n_v16 * t.tile_k * nkv_per_core * CeilDiv(comp_cs, t.tile_m) * 32);
         if (raw_spm) sdpa_tmp = std::max(sdpa_tmp, raw_kv);
 
@@ -1787,13 +1994,23 @@ protected:
         //     residual1/input_norm/oproj stay alive across both.
         std::vector<BufferDecl> decls;
 
+        // 4 lane：所有 LayerWide 槽排在 KvInsert 的 k/v 之前。分配器按首相位
+        // 稳定排序后首次适配（`plan_temporary_aliased`），原顺序下 oproj（相 4..8）
+        // 和 MASK_ONCE 的 mask 落在 k/v 之后，k/v 让出的 757,760 B 空洞
+        // fc1/sdpa_tmp 都放不进：cs 592 时峰值 7,217,664 B，可用 7,043,584 B；
+        // 改后 6,459,904 B。oproj 本来就与每个 LayerWide 槽相位重叠，起相改成 1
+        // 不改变任何冲突关系；4 lane 只走 DDR-KV（SDPA 读 k_cache/v_cache），
+        // k/v 在相 3 后已死。8 lane 保持已实测的布局。
+        const bool layer_wide_first = num_cores() != 8;
+
         // Structural — alive across both phases (always-conflict with KVIN/COMP).
         decls.push_back({"residual1",  res, 1, 8, StorageClass::Temp, 0, nullptr, ALL});
         decls.push_back({"input_norm", res, 1, 8, StorageClass::Temp, 0, nullptr, ALL});
         // oproj: Phase-2 o_proj out / LN2 out / fc2 partial scratch. Held in the
         // LayerWide band per design (could be COMP-scoped at comp_cs as a future
         // SPM optimization; kept LayerWide for the conservative first cut).
-        decls.push_back({"oproj",      res, 4, 8, StorageClass::Temp, 0, nullptr, ALL});
+        decls.push_back({"oproj", res, layer_wide_first ? 1 : 4, 8,
+                         StorageClass::Temp, 0, nullptr, ALL});
 
         // Q_INPLACE（见文件头）：只在**单 chunk**（两相同一个 chunk 且覆盖整段
         // 序列）下成立 —— 否则 Phase 1/Phase 2 之间隔着别的 chunk，q 必须过 DDR。
@@ -1804,6 +2021,22 @@ protected:
         // Q_INPLACE 下 q_kv 提到 LayerWide 且活到 SDPA 消费完（相 1..6）。
         decls.push_back({"q_kv",       qkv, 1, q_inplace_ ? 6 : 3, StorageClass::Temp, 0,
                          nullptr, q_inplace_ ? ALL : KVIN});
+        // packed 路径的显式 2D mask 槽（相位窗口贴着 SDPA 的消费窗，不与
+        // sdpa_tmp 混叠）。尺寸公式同基类 rpu_qwen3_model.h:1177。
+        // MASK_ONCE 打开时改成 LayerWide + 撑满相位（见文件头），这样它才既不被
+        // Phase-2 的 fc1 压、也不被下一层 Phase-1 的 q_kv/k/v 压。
+        const auto declare_mask = [&] {
+            if (image_batch_count_ > 1 && !cold_per_image_attention_) {
+                const bool once = cold_config_.mask_once;
+                decls.push_back({"sdpa_mask",
+                                 A(comp_cs * CeilDiv(seq_len_, (int64_t)16) * 32),
+                                 once ? 1 : 4, once ? 8 : 5, StorageClass::Temp, 0, nullptr,
+                                 once ? ALL : COMP});
+            }
+        };
+        // 只有 MASK_ONCE 的 mask 是 LayerWide，才随其他 LayerWide 槽前移。
+        const bool mask_first = layer_wide_first && cold_config_.mask_once;
+        if (mask_first) declare_mask();
         // KVPAD16（见文件头）：k/v 槽补到 16 的倍数行，KV-insert 一次 v16 打完。
         kv_pad_rows_ = cold_config_.kvpad16 ? Align(kv_cs, (int64_t)16) : 0;
         const int64_t kv_sz = raw_spm
@@ -1826,17 +2059,7 @@ protected:
             decls.push_back({"q_comp", q_comp, 4, 5, StorageClass::Temp, 0, nullptr, COMP});
         decls.push_back({"sdpa_out",   sdpa_out, 5, 6, StorageClass::Temp, 0, nullptr, COMP});
         decls.push_back({"sdpa_tmp",   sdpa_tmp, 5, 5, StorageClass::Temp, 0, nullptr, COMP});
-        // packed 路径的显式 2D mask 槽（相位窗口贴着 SDPA 的消费窗，不与
-        // sdpa_tmp 混叠）。尺寸公式同基类 rpu_qwen3_model.h:1177。
-        // MASK_ONCE 打开时改成 LayerWide + 撑满相位（见文件头），这样它才既不被
-        // Phase-2 的 fc1 压、也不被下一层 Phase-1 的 q_kv/k/v 压。
-        if (image_batch_count_ > 1 && !cold_per_image_attention_) {
-            const bool once = cold_config_.mask_once;
-            decls.push_back({"sdpa_mask",
-                             A(comp_cs * CeilDiv(seq_len_, (int64_t)16) * 32),
-                             once ? 1 : 4, once ? 8 : 5, StorageClass::Temp, 0, nullptr,
-                             once ? ALL : COMP});
-        }
+        if (!mask_first) declare_mask();
         decls.push_back({"fc1",        fc1,      7, 8, StorageClass::Temp, 0, nullptr, COMP});
 
         // Persistent per-layer: norm weights (gamma/beta for LN1, LN2)
@@ -1869,31 +2092,31 @@ protected:
     // ========================================================================
     void emit_preload_weights() {
         int64_t h = hidden_size();
-        int64_t local_q_dim = (num_q_heads() / NUM_CORES) * head_dim();
-        int64_t local_inter = intermediate_size() / NUM_CORES;
+        int64_t local_q_dim = (num_q_heads() / num_cores()) * head_dim();
+        int64_t local_inter = intermediate_size() / num_cores();
 
-        // Loop 1: 8-core DMAs for all layers (memset + norm + col-partition bias)
+        // Loop 1: all-lane DMAs for all layers (memset + norm + col-partition bias)
         // Matches v2 ordering at rpu_hyvit2_fused_encoder_layer.cpp:316-333.
         for (int64_t L = 0; L < num_layers(); ++L) {
             auto& bn = layer_bias_norm_[L];
 
-            // Zero row-partition biases (these accumulate partial sums from 8 cores)
-            rpu_launch_memset_spm_multicore(layer_addr(L, 0, "o_bias"), h);
-            rpu_launch_memset_spm_multicore(layer_addr(L, 0, "fc2_bias"), h);
+            // Zero row-partition biases (these accumulate partial sums from every lane)
+            rpu_launch_memset_spm_multicore(layer_addr(L, 0, "o_bias"), h, num_cores());
+            rpu_launch_memset_spm_multicore(layer_addr(L, 0, "fc2_bias"), h, num_cores());
 
             // Broadcast LayerNorm gamma/beta to all cores (num_elements, NOT bytes)
             rpu_launch_ddr_broadcast_spm_dma(
                 bn.ln1_w.data_ptr<c10::Half>(), h,
-                layer_addr(L, 0, "ln1_gamma"));
+                layer_addr(L, 0, "ln1_gamma"), num_cores());
             rpu_launch_ddr_broadcast_spm_dma(
                 bn.ln1_b.data_ptr<c10::Half>(), h,
-                layer_addr(L, 0, "ln1_beta"));
+                layer_addr(L, 0, "ln1_beta"), num_cores());
             rpu_launch_ddr_broadcast_spm_dma(
                 bn.ln2_w.data_ptr<c10::Half>(), h,
-                layer_addr(L, 0, "ln2_gamma"));
+                layer_addr(L, 0, "ln2_gamma"), num_cores());
             rpu_launch_ddr_broadcast_spm_dma(
                 bn.ln2_b.data_ptr<c10::Half>(), h,
-                layer_addr(L, 0, "ln2_beta"));
+                layer_addr(L, 0, "ln2_beta"), num_cores());
 
             // Col-partition scatter: each core gets its own slice of the bias.
             // DMA path via rpu_launch_ddr_scatter_spm_dma — weights are static
@@ -1903,22 +2126,22 @@ protected:
                 /*elements_per_core=*/local_q_dim,
                 /*core_stride_bytes=*/local_q_dim * DWIDTH,
                 layer_addr(L, 0, "q_bias"),
-                /*num_cores=*/NUM_CORES);
+                /*num_cores=*/num_cores());
             rpu_launch_ddr_scatter_spm_dma(
                 bn.k_b.data_ptr<c10::Half>(),
                 local_q_dim, local_q_dim * DWIDTH,
                 layer_addr(L, 0, "k_bias"),
-                /*num_cores=*/NUM_CORES);
+                /*num_cores=*/num_cores());
             rpu_launch_ddr_scatter_spm_dma(
                 bn.v_b.data_ptr<c10::Half>(),
                 local_q_dim, local_q_dim * DWIDTH,
                 layer_addr(L, 0, "v_bias"),
-                /*num_cores=*/NUM_CORES);
+                /*num_cores=*/num_cores());
             rpu_launch_ddr_scatter_spm_dma(
                 bn.fc1_b.data_ptr<c10::Half>(),
                 local_inter, local_inter * DWIDTH,
                 layer_addr(L, 0, "fc1_bias"),
-                /*num_cores=*/NUM_CORES);
+                /*num_cores=*/num_cores());
         }
 
         // Loop 2: 1-core DMAs for all layers (row-partition biases).
@@ -1985,7 +2208,7 @@ protected:
         rpu_launch_layernorm_spm_kernel(
             addr(0, "residual1"), addr(0, "input_norm"),
             layer_addr(layer_idx, 0, "ln1_gamma"), layer_addr(layer_idx, 0, "ln1_beta"),
-            seq_len, h, eps_, false, 0, NUM_CORES);
+            seq_len, h, eps_, false, 0, num_cores());
 
         // QKV Linear with bias (SPM-to-SPM ACC16, col-partition). q → q_kv.
         if (ctx().has_complete_physical_manifest()) {
@@ -2004,33 +2227,33 @@ protected:
                 FmbRouteFamily::LINEAR, HYVIT2_KV_Q_LINEAR_SITE,
                 static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
                 /*resolved_flags=*/0,
-                {seq_len, nq * hd, h, 1, NUM_CORES}, chunk.idx);
+                {seq_len, nq * hd, h, 1, num_cores()}, chunk.idx);
         }
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "input_norm"), lw.q_w, addr(0, "q_kv"),
-            seq_len, nq * hd, h, 1, NUM_CORES,
+            seq_len, nq * hd, h, 1, num_cores(),
             layer_addr(layer_idx, 0, "q_bias"), lw.q_ws);
         if (ctx().has_complete_physical_manifest()) {
             ctx().consume_physical_route(
                 FmbRouteFamily::LINEAR, HYVIT2_KV_K_LINEAR_SITE,
                 static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
                 /*resolved_flags=*/0,
-                {seq_len, nq * hd, h, 1, NUM_CORES}, chunk.idx);
+                {seq_len, nq * hd, h, 1, num_cores()}, chunk.idx);
         }
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "input_norm"), lw.k_w, addr(0, "k"),
-            seq_len, nq * hd, h, 1, NUM_CORES,
+            seq_len, nq * hd, h, 1, num_cores(),
             layer_addr(layer_idx, 0, "k_bias"), lw.k_ws);
         if (ctx().has_complete_physical_manifest()) {
             ctx().consume_physical_route(
                 FmbRouteFamily::LINEAR, HYVIT2_KV_V_LINEAR_SITE,
                 static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
                 /*resolved_flags=*/0,
-                {seq_len, nq * hd, h, 1, NUM_CORES}, chunk.idx);
+                {seq_len, nq * hd, h, 1, num_cores()}, chunk.idx);
         }
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "input_norm"), lw.v_w, addr(0, "v"),
-            seq_len, nq * hd, h, 1, NUM_CORES,
+            seq_len, nq * hd, h, 1, num_cores(),
             layer_addr(layer_idx, 0, "v_bias"), lw.v_ws);
 
         // No RoPE (SigLIP has none).
@@ -2047,13 +2270,13 @@ protected:
                     : HyViT2KvPaddingRoute::LOGICAL_ROWS),
             /*resolved_flags=*/0,
             {cold_config_.kvpad16 ? 1 : 0, seq_len,
-             kv_pad_rows_, kv_physical_rows, NUM_CORES, nq, hd},
+             kv_pad_rows_, kv_physical_rows, num_cores(), nq, hd},
             chunk.idx);
         const FmbRouteManifestEntry& route = ctx().find_physical_route(
             FmbRouteFamily::KV_INSERT, HYVIT2_KV_SITE, chunk.idx);
         const KvInsertSegmentPlan kv_plan =
             restore_kvinsert_plan(
-                HYVIT2_KV_SITE, route.arguments, NUM_CORES, nq, hd);
+                HYVIT2_KV_SITE, route.arguments, num_cores(), nq, hd);
         TORCH_CHECK(
             kv_plan.logical_rows() == seq_len &&
                 kv_plan.physical_rows() == kv_physical_rows &&
@@ -2072,7 +2295,7 @@ protected:
             rpu_launch_insert_kvcache_spm_unified_with_plan(
                 k_cache, v_cache,
                 addr_offset("k").value, addr_offset("v").value,
-                nq, hd, NUM_CORES,
+                nq, hd, num_cores(),
                 /*k_cache_batch_offset_elems=*/0,
                 /*v_cache_batch_offset_elems=*/0,
                 kv_pad_rows_, kv_plan);
@@ -2096,7 +2319,7 @@ protected:
                 /*resolved_flags=*/0,
                 {cold_config_.q_inplace ? 1 : 0, q_inplace_ ? 1 : 0,
                  chunk.offset, seq_len, q_local_elems,
-                 q_core_stride_bytes, NUM_CORES}, chunk.idx);
+                 q_core_stride_bytes, num_cores()}, chunk.idx);
         }
         if (q_inplace_) {
             TORCH_CHECK(chunk.len == seq_len_ && chunk.offset == 0,
@@ -2117,7 +2340,7 @@ protected:
         rpu_launch_spm_scatter_ddr_dma(
             addr(0, "q_kv"), q_ddr_base + q_elem_offset,
             q_local_elems, q_core_stride_bytes,
-            /*num_cores=*/NUM_CORES);
+            /*num_cores=*/num_cores());
 
         // No residual output DMA — Phase 2 re-reads the original input (matching
         // Gemma); the SPM_RESIDENT single-chunk case keeps residual1 live.
@@ -2140,14 +2363,29 @@ protected:
     // (typed SPM offset). Non-SDPA sites use absolute `addr(0, name)` /
     // `layer_addr(L, 0, name)`.
     // ========================================================================
+    // Packed W4 row Linear takes no in-kernel bias. The o/fc2 bias buffers hold
+    // the bias on core 0 and zeros elsewhere (emit_preload_weights), so adding
+    // them to every core's partial before the reduction is the same sum the
+    // fp16/int8 kernel makes.
+    void add_row_bias_partial(uint32_t bias_addr, int64_t seq_len, int64_t h) {
+        rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(
+            bias_addr, addr(0, "oproj"), addr(0, "oproj"),
+            seq_len, h, c10::Half(1.0f), ValuOpType::ADD, /*is_bopa=*/false, num_cores());
+    }
+
     void build_layer_subgraph(int layer_idx, const ChunkInfo& chunk) override {
+        if (num_cores() != 8 && layer_idx == 0 && chunk.idx == 0 &&
+            ctx().has_complete_physical_manifest()) {
+            ctx().consume_physical_route(FmbRouteFamily::GRAPH_SCHEDULE,
+                HYVIT2_CORE_PROFILE_SITE, 1, 0, core_profile_arguments());
+        }
         const auto& lw = layer_weights_[layer_idx];
         int64_t seq_len = chunk.len;        // this query-chunk length
         int64_t h = hidden_size();
         int64_t nq = num_q_heads();
         int64_t hd = head_dim();
         int64_t is_ = intermediate_size();
-        int64_t local_inter = is_ / NUM_CORES;
+        int64_t local_inter = is_ / num_cores();
 
         // Re-read original input into residual1 (Phase 2 reads the same source
         // as Phase 1). Guarded by input_in_spm (see emit_kv_first_body note):
@@ -2175,7 +2413,7 @@ protected:
                 /*resolved_flags=*/0,
                 {cold_config_.q_inplace ? 1 : 0, q_inplace_ ? 1 : 0,
                  chunk.offset, seq_len, q_local_elems,
-                 q_core_stride_bytes, NUM_CORES}, chunk.idx);
+                 q_core_stride_bytes, num_cores()}, chunk.idx);
         }
         if (!q_inplace_) {
             const at::Tensor& q_slot = q_ddr_slot();
@@ -2191,7 +2429,7 @@ protected:
                 /*elements_per_core=*/q_local_elems,
                 /*core_stride_bytes=*/q_core_stride,
                 addr(0, "q_comp"),
-                /*num_cores=*/NUM_CORES);
+                /*num_cores=*/num_cores());
         } else {
             TORCH_CHECK(chunk.len == seq_len_ && chunk.offset == 0,
                         "HYViT2VisionModel: Q_INPLACE 只在单 chunk 下成立");
@@ -2221,19 +2459,19 @@ protected:
                 FmbRouteFamily::ATTENTION, HYVIT2_PER_IMAGE_RAW_SPM_ATTN_SITE,
                 static_cast<int64_t>(AttentionExecutionPolicy::SPM_KV_BY_MHA), 0,
                 {image_batch_count_, 196, seq_len, seq_len_, nq, hd,
-                 orig_head_dim_, NUM_CORES, 208}, chunk.idx);
+                 orig_head_dim_, num_cores(), 208}, chunk.idx);
             // Linear weights are still reused across the full packed input.
             // Slice only attention: each image sees exactly its own 196 keys.
             // Reuse the disjoint V-transpose scratch sequentially in this graph.
             for (int64_t image = 0; image < image_batch_count_; ++image) {
-                const uint32_t offset = image * 196 * (nq / NUM_CORES) * hd * DWIDTH;
+                const uint32_t offset = image * 196 * (nq / num_cores()) * hd * DWIDTH;
                 rpu_launch_v_transpose_spm(
                     addr(0, "v") + offset, addr(0, "sdpa_tmp"),
-                    1, 196, nq, hd, NUM_CORES);
+                    1, 196, nq, hd, num_cores());
                 rpu_launch_sdpa_by_mha_spm(
                     addr(0, "q_comp") + offset, addr(0, "k") + offset,
                     addr(0, "sdpa_tmp"), addr(0, "sdpa_out") + offset,
-                    0, 0, attn_scale, 1, 196, 196, nq, nq, hd, NUM_CORES);
+                    0, 0, attn_scale, 1, 196, 196, nq, nq, hd, num_cores());
             }
         } else if (image_batch_count_ > 1) {
             // SigLIP-batch: N images packed into seq_len_. Per-image attention
@@ -2258,13 +2496,13 @@ protected:
                             : HyViT2GraphScheduleRoute::MASK_EACH_LAYER),
                     /*resolved_flags=*/0,
                     {cold_config_.mask_once ? 1 : 0, image_batch_count_,
-                     seq_len, seq_len_, num_layers(), NUM_CORES},
+                     seq_len, seq_len_, num_layers(), num_cores()},
                     chunk.idx);
             }
             // 块对角 mask 逐层恒定（且此路径已断言单 chunk）⇒ 槽撑满相位后
             // 只需在层 0 灌一次（见文件头 MASK_ONCE）。
             if (!cold_config_.mask_once || layer_idx == 0)
-                sdpa_dma_mask_to_spm(pm, mask_off, seq_len_, seq_len_, NUM_CORES);
+                sdpa_dma_mask_to_spm(pm, mask_off, seq_len_, seq_len_, num_cores());
             if (ctx().attention_policy ==
                 AttentionExecutionPolicy::SPM_KV_BY_MHA) {
                 TORCH_CHECK(
@@ -2274,7 +2512,7 @@ protected:
                     "packed chunk and MASK_2D");
                 rpu_launch_v_transpose_spm(
                     addr(0, "v"), addr(0, "sdpa_tmp"),
-                    /*batch=*/1, seq_len_, nq, hd, NUM_CORES);
+                    /*batch=*/1, seq_len_, nq, hd, num_cores());
                 ctx().consume_physical_route(
                     FmbRouteFamily::ATTENTION,
                     HYVIT2_PACKED_RAW_SPM_ATTN_SITE,
@@ -2282,13 +2520,13 @@ protected:
                         AttentionExecutionPolicy::SPM_KV_BY_MHA),
                     /*resolved_flags=*/0,
                     {image_batch_count_, seq_len, seq_len_, nq, hd,
-                     orig_head_dim_, NUM_CORES}, chunk.idx);
+                     orig_head_dim_, num_cores()}, chunk.idx);
                 rpu_launch_sdpa_by_mha_spm(
                     addr(0, "q_comp"), addr(0, "k"),
                     addr(0, "sdpa_tmp"), addr(0, "sdpa_out"),
                     addr(0, "sdpa_mask"), pm.mask_type, attn_scale,
                     /*batch=*/1, seq_len, seq_len_, nq, nq, hd,
-                    NUM_CORES);
+                    num_cores());
             } else {
                 if (ctx().has_complete_physical_manifest()) {
                     LayoutContext spm_layout;
@@ -2309,7 +2547,7 @@ protected:
                             ? 0
                             : HYVIT2_ATTN_CAPABILITY_FALLBACK_DDR_REQUIRED,
                         {image_batch_count_, seq_len, seq_len_, nq, hd,
-                         orig_head_dim_, NUM_CORES}, chunk.idx);
+                         orig_head_dim_, num_cores()}, chunk.idx);
                 }
                 rpu_launch_sdpa_spm_unified_kernel_v2(
                     k_cache, v_cache,
@@ -2318,7 +2556,7 @@ protected:
                     addr_offset("sdpa_out").value,
                     addr_offset("sdpa_tmp").value, mask_off,
                     /*seq_q=*/seq_len, nq, nq, hd,
-                    /*kv_seq_len=*/seq_len_, NUM_CORES, NUM_CORES);
+                    /*kv_seq_len=*/seq_len_, num_cores(), /*physical_kv_cores=*/8);
             }
         } else {
             if (ctx().attention_policy ==
@@ -2327,7 +2565,7 @@ protected:
                             "HYViT2 raw-SPM attention requires one full chunk");
                 rpu_launch_v_transpose_spm(
                     addr(0, "v"), addr(0, "sdpa_tmp"),
-                    /*batch=*/1, seq_len_, nq, hd, NUM_CORES);
+                    /*batch=*/1, seq_len_, nq, hd, num_cores());
                 ctx().consume_physical_route(
                     FmbRouteFamily::ATTENTION,
                     HYVIT2_SINGLE_RAW_SPM_ATTN_SITE,
@@ -2335,13 +2573,13 @@ protected:
                         AttentionExecutionPolicy::SPM_KV_BY_MHA),
                     /*resolved_flags=*/0,
                     {image_batch_count_, seq_len, seq_len_, nq, hd,
-                     orig_head_dim_, NUM_CORES}, chunk.idx);
+                     orig_head_dim_, num_cores()}, chunk.idx);
                 rpu_launch_sdpa_by_mha_spm(
                     addr(0, "q_comp"), addr(0, "k"),
                     addr(0, "sdpa_tmp"), addr(0, "sdpa_out"),
                     /*mask_spm=*/0, /*MASK_NONE=*/0, attn_scale,
                     /*batch=*/1, seq_len, seq_len_, nq, nq, hd,
-                    NUM_CORES);
+                    num_cores());
             } else {
                 if (ctx().has_complete_physical_manifest()) {
                     LayoutContext spm_layout;
@@ -2362,7 +2600,7 @@ protected:
                             ? 0
                             : HYVIT2_ATTN_CAPABILITY_FALLBACK_DDR_REQUIRED,
                         {image_batch_count_, seq_len, seq_len_, nq, hd,
-                         orig_head_dim_, NUM_CORES}, chunk.idx);
+                         orig_head_dim_, num_cores()}, chunk.idx);
                 }
                 rpu_launch_sdpa_spm_unified_kernel_v2(
                     k_cache, v_cache,
@@ -2371,7 +2609,7 @@ protected:
                     addr_offset("sdpa_out").value,
                     addr_offset("sdpa_tmp").value, 0,
                     /*seq_q=*/seq_len, nq, nq, hd,
-                    /*kv_seq_len=*/seq_len_, NUM_CORES, NUM_CORES);
+                    /*kv_seq_len=*/seq_len_, num_cores(), /*physical_kv_cores=*/8);
             }
         }
 
@@ -2381,12 +2619,14 @@ protected:
                 FmbRouteFamily::LINEAR, HYVIT2_O_LINEAR_SITE,
                 static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
                 /*resolved_flags=*/0,
-                {seq_len, h, nq * hd, 0, NUM_CORES}, chunk.idx);
+                {seq_len, h, nq * hd, 0, num_cores()}, chunk.idx);
         }
+        const bool w4_o = lw.o_w.scalar_type() == at::kByte;
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "sdpa_out"), lw.o_w, addr(0, "oproj"),
-            seq_len, h, nq * hd, 0, NUM_CORES,
-            layer_addr(layer_idx, 0, "o_bias"), lw.o_ws);
+            seq_len, h, nq * hd, 0, num_cores(),
+            w4_o ? 0 : layer_addr(layer_idx, 0, "o_bias"), lw.o_ws);
+        if (w4_o) add_row_bias_partial(layer_addr(layer_idx, 0, "o_bias"), seq_len, h);
         if (owner_layernorm_enabled(seq_len)) {
             consume_owner_layernorm_route(false, chunk, layer_idx);
             launch_hyvit2_vision_owner_layernorm_spm(
@@ -2398,34 +2638,34 @@ protected:
             ctx().consume_physical_route(
                 FmbRouteFamily::ALL_REDUCE,
                 HYVIT2_ATTN_ALL_REDUCE_SITE,
-                fmb_ring_all_reduce_route_selector(seq_len, h),
+                fmb_ring_all_reduce_route_selector(seq_len, h, num_cores()),
                 /*resolved_flags=*/0,
-                {seq_len, h, NUM_CORES, NUM_CORES}, chunk.idx);
+                {seq_len, h, num_cores(), num_cores()}, chunk.idx);
         }
         rpu_launch_all_reduce_sum_residual_kernel(
             addr(0, "oproj"), addr(0, "residual1"), addr(0, "input_norm"),
-            seq_len, h, NUM_CORES, NUM_CORES);
+            seq_len, h, num_cores(), num_cores());
 
         // Phase 5: LayerNorm2 + fc1+bias + GELU
         rpu_launch_layernorm_spm_kernel(
             addr(0, "input_norm"), addr(0, "oproj"),
             layer_addr(layer_idx, 0, "ln2_gamma"), layer_addr(layer_idx, 0, "ln2_beta"),
-            seq_len, h, eps_, false, 0, NUM_CORES);
+            seq_len, h, eps_, false, 0, num_cores());
         }
         if (ctx().has_complete_physical_manifest()) {
             ctx().consume_physical_route(
                 FmbRouteFamily::LINEAR, HYVIT2_FC1_LINEAR_SITE,
                 static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
                 /*resolved_flags=*/0,
-                {seq_len, is_, h, 1, NUM_CORES}, chunk.idx);
+                {seq_len, is_, h, 1, num_cores()}, chunk.idx);
         }
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "oproj"), lw.fc1_w, addr(0, "fc1"),
-            seq_len, is_, h, 1, NUM_CORES,
+            seq_len, is_, h, 1, num_cores(),
             layer_addr(layer_idx, 0, "fc1_bias"), lw.fc1_ws);
         rpu_launch_eltwise_unary_spm_kernel(
             addr(0, "fc1"), addr(0, "fc1"),
-            seq_len * local_inter, ValuOpType::ADD, /*is_gelu=*/true, NUM_CORES);
+            seq_len * local_inter, ValuOpType::ADD, /*is_gelu=*/true, num_cores());
 
         // Phase 6: fc2 (row-partition, with bias) + AllReduce + Residual
         // Round 9: final output goes to "residual1" instead of "oproj" so the
@@ -2438,12 +2678,14 @@ protected:
                 FmbRouteFamily::LINEAR, HYVIT2_FC2_LINEAR_SITE,
                 static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
                 /*resolved_flags=*/0,
-                {seq_len, h, is_, 0, NUM_CORES}, chunk.idx);
+                {seq_len, h, is_, 0, num_cores()}, chunk.idx);
         }
+        const bool w4_fc2 = lw.fc2_w.scalar_type() == at::kByte;
         rpu_launch_linear_spm_to_spm_acc16_kernel(
             addr(0, "fc1"), lw.fc2_w, addr(0, "oproj"),
-            seq_len, h, is_, 0, NUM_CORES,
-            layer_addr(layer_idx, 0, "fc2_bias"), lw.fc2_ws);
+            seq_len, h, is_, 0, num_cores(),
+            w4_fc2 ? 0 : layer_addr(layer_idx, 0, "fc2_bias"), lw.fc2_ws);
+        if (w4_fc2) add_row_bias_partial(layer_addr(layer_idx, 0, "fc2_bias"), seq_len, h);
         if (owner_layernorm_enabled(seq_len)) {
             consume_owner_layernorm_route(true, chunk, layer_idx);
             launch_hyvit2_vision_compact_residual_spm(
@@ -2453,13 +2695,13 @@ protected:
             ctx().consume_physical_route(
                 FmbRouteFamily::ALL_REDUCE,
                 HYVIT2_MLP_ALL_REDUCE_SITE,
-                fmb_ring_all_reduce_route_selector(seq_len, h),
+                fmb_ring_all_reduce_route_selector(seq_len, h, num_cores()),
                 /*resolved_flags=*/0,
-                {seq_len, h, NUM_CORES, NUM_CORES}, chunk.idx);
+                {seq_len, h, num_cores(), num_cores()}, chunk.idx);
         }
         rpu_launch_all_reduce_sum_residual_kernel(
             addr(0, "oproj"), addr(0, "input_norm"), addr(0, "residual1"),
-            seq_len, h, NUM_CORES, NUM_CORES);
+            seq_len, h, num_cores(), num_cores());
         }
 
         // ----------------------------------------------------------------
@@ -2704,7 +2946,7 @@ protected:
     // EVERY cs, 80%16==0 passes. This matches declare_buffers' sdpa_compute_tiling
     // (which also uses head_dim()). mask=0 (MASK_NONE) skips the LTM-only
     // sQryAcc%16 constraints that don't apply to SigLIP's bidirectional attention.
-    // nkv = nq (MHA), num_cores = NUM_CORES.
+    // nkv = nq (MHA), num_cores = num_cores().
     // ========================================================================
     bool subclass_chunk_size_valid(int64_t cs, int64_t seq_len,
                                    int64_t position) const override {
@@ -2712,7 +2954,7 @@ protected:
         // planner 的 cfg 必须跟着走 mask=4，否则与实际发射不一致。
         SdpaConfig cfg{SdpaKernelType::FLASH_ATTN_SPM,
                        head_dim(), num_q_heads(), num_q_heads(),
-                       NUM_CORES, image_batch_count_ > 1 ? 4 : 0};
+                       num_cores(), image_batch_count_ > 1 ? 4 : 0};
         if (!sdpa_is_valid_chunk_size(cfg, cs, seq_len, position)) return false;
         // Packed images use one block-diagonal attention matrix and therefore
         // require a single compute chunk.  Publish that constraint in the
@@ -2756,21 +2998,36 @@ protected:
         const int64_t nq  = num_q_heads();
         const int64_t hd  = head_dim();
         const int64_t is_ = intermediate_size();
-        const int64_t local_q_dim = (nq / NUM_CORES) * hd;
-        const int64_t local_inter = is_ / NUM_CORES;
+        const int64_t local_q_dim = (nq / num_cores()) * hd;
+        const int64_t local_inter = is_ / num_cores();
         auto Aln = [](int64_t b) -> int64_t { return Align(b, 256); };
         const int64_t res = Aln(cs * h * DWIDTH);            // residual1/input_norm/oproj
         const int64_t qkv = Aln(cs * local_q_dim * DWIDTH);  // q_kv/k/v/q_comp/sdpa_out
         const int64_t fc1 = Aln(cs * local_inter * DWIDTH);
         SdpaTiling t = sdpa_compute_tiling(cfg, cs);
-        const int64_t nkv_per_core = CeilDiv(nq, (int64_t)NUM_CORES);
+        const int64_t nkv_per_core = CeilDiv(nq, (int64_t)num_cores());
         const int64_t sdpa_tmp =
             Aln(t.tile_n_v16 * t.tile_k * nkv_per_core * CeilDiv(cs, t.tile_m) * 32);
         const int64_t layer_wide = 3 * res;                       // alive both phases
         const int64_t kv_insert  = 3 * qkv;                       // q_kv/k/v (Phase 1)
         const int64_t compute    = std::max(2 * qkv + sdpa_tmp,   // phase-5: q_comp+sdpa_out+tmp
                                             fc1);                 // phase-7/8: fc1
-        const int64_t stacked_peak = layer_wide + kv_insert + compute;
+        int64_t stacked_peak = layer_wide + kv_insert + compute;
+        if (num_cores() != 8) {
+            // Four lanes double the per-lane widths, so the packed 3x196 chunk
+            // lands within a few hundred KB of the block. Count the 2D mask
+            // slot and the per-layer persistent norms/biases as well; an SPM
+            // OOM wedges the board instead of failing the forward.
+            const auto dma_safe = [&](int64_t elems) {
+                return Aln(Align(elems, int64_t{256}) * DWIDTH);
+            };
+            const int64_t mask = image_batch_count_ > 1
+                ? Aln(cs * CeilDiv(seq_len, int64_t{16}) * 32) : 0;
+            const int64_t persistent = num_layers() *
+                (4 * dma_safe(h) + 3 * dma_safe(local_q_dim) +
+                 dma_safe(local_inter) + 2 * dma_safe(h));
+            stacked_peak += mask + persistent;
+        }
         const int64_t budget =
             static_cast<int64_t>(SpmAllocator::SPM_USABLE * 0.97);
         if (stacked_peak > budget) return false;
@@ -2921,7 +3178,7 @@ protected:
         if (!ctx().has_complete_physical_manifest() ||
             (image_count != 2 && image_count != 3) ||
             height != 224 || width != 224 || patches_per_image != 196 ||
-            !has_patch_emb_ || patch_embed_cores_ != NUM_CORES ||
+            !has_patch_emb_ || patch_embed_cores_ != 8 || num_cores() != 8 ||
             pe_cin_orig_ != 3 || pe_cin_padded_ != 16 || pe_cout_ != 1152 ||
             pe_kh_ != 16 || pe_kw_ != 16 ||
             pe_strideh_ != 16 || pe_stridew_ != 16 ||
@@ -2961,7 +3218,7 @@ protected:
                 // Subsequent multichannel transfers keep their existing
                 // pre/post barriers. These real device fences stay within the
                 // queue; allocator generation and resource budgets are unchanged.
-                for (uint8_t channel = 0; channel < NUM_CORES; ++channel) {
+                for (uint8_t channel = 0; channel < 8; ++channel) {
                     graph.record_barrier(/*self_stream=*/0,
                                          /*target_stream=*/channel * 2);
                 }
@@ -3043,6 +3300,13 @@ private:
     bool cold_owner_layernorm_ = false;
     HYViT2ColdConfig cold_config_;
     bool cold_config_bound_ = false;
+    int64_t subclass_layout_hash() const override {
+        if (num_cores() == 8) return 0;
+        int64_t hash = 0;
+        for (const auto value : core_profile_arguments())
+            hash = detail::layout_mix(hash, value);
+        return hash;
+    }
     std::vector<int64_t> kvinsert_cost_weight_identity() const override {
         if (layer_weights_.empty()) return {};
         std::vector<int64_t> identity{1};
@@ -3092,7 +3356,10 @@ private:
     // 项 A：proj1 之前把行序换成 member-major，供 tower 外 merger 的组轴算子用。
     bool merger_member_major_ = false;
     bool proj1_in_merger_ = true;
-    int patch_embed_cores_ = NUM_CORES;
+    int patch_embed_cores_ = 8;
+    int64_t logical_intermediate_size_ = 0;
+    // Bits 0-5: INT8 q/k/v/o/fc1/fc2; bits 6-11: the same projections packed W4.
+    int64_t reduced_w8_projection_mask_ = 0;
     bool production_config_bound_ = false;
 
     // Intermediate DDR staging buffer (post-LN → DDR → projector). Shape-gated
@@ -3118,7 +3385,7 @@ private:
 
     // Site5 (KV_FIRST state) — mirror GemmaModel. Stages Q across the two phases
     // (Phase 1 scatters Q→DDR, Phase 2 gathers DDR→SPM "q_comp"). local_q_heads_ =
-    // num_q_heads()/NUM_CORES (set in set_weights). seq_len_ = this forward's
+    // num_q_heads()/num_cores() (set in set_weights). seq_len_ = this forward's
     // full sequence length (the SDPA kv_seq_len, decoupled from per-chunk seq_q).
     //
     // keyed by seq_len so each shape keeps its OWN
@@ -3135,7 +3402,7 @@ private:
     // re-review): set_weights can change local_q_heads_/head_dim on a REUSED handle,
     // and invalidate_model_state() is base-class — it does NOT clear these SigLIP
     // slots (same blind spot the old single q_ddr_buf_ had: its realloc guard only
-    // checked size(0)=NUM_CORES + size(1)=seq_len, never the width). Without q_width
+    // checked size(0)=8 + size(1)=seq_len, never the width). Without q_width
     // in the key, a later forward at the SAME seq_len after a width change would reuse
     // the old undersized slot while the fixed DMA stride uses the NEW width → OOB
     // write. q_width in the key forces a fresh slot per (seq_len, width).
@@ -3221,6 +3488,16 @@ int64_t rpu_hyvit2_create_kv_spm_only() {
     return HYViT2Registry::create(true);
 }
 
+void rpu_hyvit2_set_execution_core_count(int64_t handle, int64_t cores) {
+    HYViT2Registry::get(handle, "rpu_hyvit2_set_execution_core_count")
+        ->set_execution_cores(cores);
+}
+
+std::vector<int64_t> rpu_hyvit2_get_execution_topology(int64_t handle) {
+    return HYViT2Registry::get(handle, "rpu_hyvit2_get_execution_topology")
+        ->execution_topology();
+}
+
 void rpu_hyvit2_set_runtime_config(
     int64_t handle,
     bool fast_replay, bool fast_replay_preload, bool mask_once,
@@ -3303,6 +3580,41 @@ void rpu_hyvit2_set_weights_w8a16(
         fc1_ws_list, fc2_ws_list);
 }
 
+// Declared packed-W4 mode: the scale lists carry G32 pgrp payloads.
+void rpu_hyvit2_set_weights_w4a16(
+    int64_t handle,
+    at::TensorList q_w_list, at::TensorList k_w_list,
+    at::TensorList v_w_list, at::TensorList o_w_list,
+    at::TensorList fc1_w_list, at::TensorList fc2_w_list,
+    at::TensorList ln1_w_list, at::TensorList ln1_b_list,
+    at::TensorList ln2_w_list, at::TensorList ln2_b_list,
+    at::TensorList q_b_list, at::TensorList k_b_list,
+    at::TensorList v_b_list, at::TensorList o_b_list,
+    at::TensorList fc1_b_list, at::TensorList fc2_b_list,
+    const at::Tensor& proj_w, const at::Tensor& proj_b,
+    int64_t num_heads, int64_t head_dim,
+    int64_t hidden_size, int64_t intermediate_size,
+    int64_t projection_dim, double eps,
+    bool fused_merger, bool proj1_in_merger,
+    int64_t patch_embed_cores,
+    at::TensorList q_ws_list, at::TensorList k_ws_list,
+    at::TensorList v_ws_list, at::TensorList o_ws_list,
+    at::TensorList fc1_ws_list, at::TensorList fc2_ws_list)
+{
+    HYViT2Registry::get(handle, "rpu_hyvit2")->set_weights(
+        q_w_list, k_w_list, v_w_list, o_w_list,
+        fc1_w_list, fc2_w_list,
+        ln1_w_list, ln1_b_list, ln2_w_list, ln2_b_list,
+        q_b_list, k_b_list, v_b_list, o_b_list,
+        fc1_b_list, fc2_b_list,
+        proj_w, proj_b,
+        num_heads, head_dim, hidden_size, intermediate_size,
+        projection_dim, eps, fused_merger, proj1_in_merger,
+        patch_embed_cores,
+        q_ws_list, k_ws_list, v_ws_list, o_ws_list,
+        fc1_ws_list, fc2_ws_list, /*packed_w4=*/true);
+}
+
 void rpu_hyvit2_model_set_patch_emb(
     int64_t handle,
     const at::Tensor& weight,
@@ -3374,6 +3686,14 @@ std::vector<int64_t> rpu_hyvit2_resolve_stage_domain(
     bool external_patch_prologue) {
     return HYViT2Registry::get(handle, "rpu_hyvit2_resolve_stage_domain")
         ->resolve_stage_domain(
+            seq_len, image_batch_count, external_patch_prologue);
+}
+
+void rpu_hyvit2_prepare_persistent_spm(
+    int64_t handle, int64_t seq_len, int64_t image_batch_count,
+    bool external_patch_prologue) {
+    HYViT2Registry::get(handle, "rpu_hyvit2_prepare_persistent_spm")
+        ->prepare_persistent_spm_for_shape(
             seq_len, image_batch_count, external_patch_prologue);
 }
 

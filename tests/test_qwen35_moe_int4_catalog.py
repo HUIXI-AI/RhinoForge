@@ -8,6 +8,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from _support_status import expected_support_status
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "examples/configs/qwen3_5/text/35b_a3b/w4a16_experts_rtn_g128.toml"
@@ -60,10 +61,11 @@ def test_rtn_public_profile_keeps_bounded_uncertified_identity(common, monkeypat
     config = common.load_config(CONFIG)
     profile = common.planner_profiles()[config["example"]["profile_id"]]
     limits = profile["input_envelope"]["limits"]
-    assert profile["support"]["status"] == "IMPLEMENTED_UNVERIFIED_HW"
+    assert profile["support"]["status"] == expected_support_status(profile, "IMPLEMENTED_UNVERIFIED_HW")
     assert profile["hw_status"] == "IMPLEMENTED_UNVERIFIED_HW"
-    assert profile["component"] == "text"
-    assert (limits["num_cores"], limits["batch_size"], limits["group_size"]) == (8, 1, 128)
+    assert profile["component"] == "text" and "formal_certification" not in limits
+    assert limits["allowed_num_cores"] == [4, 6, 8]
+    assert (limits["batch_size"], limits["group_size"]) == (1, 128)
     assert config["rpu_execution"]["prefill"]["linear_acc32"] is False
     registry = load("rtn_model_registry", "python/rpu_backend/model_registry.py", monkeypatch)
     monkeypatch.setenv("RPU_MODEL_CACHE", str(tmp_path))
@@ -74,10 +76,11 @@ def test_gptq_public_profile_keeps_bounded_uncertified_identity(common, monkeypa
     config = common.load_config(GPTQ_CONFIG)
     profile = common.planner_profiles()[config["example"]["profile_id"]]
     limits = profile["input_envelope"]["limits"]
-    assert profile["support"]["status"] == "IMPLEMENTED_UNVERIFIED_HW"
+    assert profile["support"]["status"] == expected_support_status(profile, "IMPLEMENTED_UNVERIFIED_HW")
     assert profile["hw_status"] == "IMPLEMENTED_UNVERIFIED_HW"
-    assert profile["component"] == "text"
-    assert (limits["num_cores"], limits["batch_size"], limits["group_size"]) == (8, 1, 128)
+    assert profile["component"] == "text" and "formal_certification" not in limits
+    assert limits["allowed_num_cores"] == [4, 6, 8]
+    assert (limits["batch_size"], limits["group_size"]) == (1, 128)
     assert config["rpu_execution"]["prefill"]["linear_acc32"] is False
     assert "padding_rows" not in config["rpu_execution"]["prefill"]
     registry = load("gptq_model_registry", "python/rpu_backend/model_registry.py", monkeypatch)
@@ -86,7 +89,7 @@ def test_gptq_public_profile_keeps_bounded_uncertified_identity(common, monkeypa
 
 
 @pytest.mark.parametrize("config_path", [CONFIG, GPTQ_CONFIG], ids=["rtn", "gptq"])
-@pytest.mark.parametrize("field,value", [("cores", 4), ("cores", 6), ("acc32", True),
+@pytest.mark.parametrize("field,value", [("cores", 5), ("cores", 7), ("acc32", True),
                                         ("alias", "qwen3_5-35b-a3b-mixed"),
                                         ("component", "multimodal")])
 def test_int4_config_rejects_wrong_core_precision_or_profile(common, field, value, config_path):
@@ -98,7 +101,7 @@ def test_int4_config_rejects_wrong_core_precision_or_profile(common, field, valu
         config["rpu_execution"]["prefill"]["linear_acc32"] = value
     else:
         profile[{"alias": "asset_alias", "component": "component"}[field]] = value
-    with pytest.raises(common.ConfigError, match="INT4"):
+    with pytest.raises(ValueError, match="model.num_cores" if field == "cores" else "INT4"):
         common._validate_execution(config["rpu_execution"], profile=profile)
 
 
@@ -211,7 +214,9 @@ def test_int4_override_reaches_moe_loader_and_cache(common, monkeypatch, tmp_pat
 
 
 def test_model_cli_override_is_recorded_without_changing_registered_identity(common, monkeypatch, tmp_path):
-    from examples.common import cli, measurement
+    from contextlib import nullcontext
+    from examples.common import cli, measurement, logging
+    monkeypatch.setattr(logging, "logging_session", lambda *_a, **_kw: nullcontext())
     captured = {}
     monkeypatch.setattr(measurement, "run", lambda config: captured.update(config) or 0)
     for path, alias in ((CONFIG, "qwen3_5-35b-a3b-rtn-w4a16"),
@@ -233,9 +238,11 @@ def test_int4_image_profiles_keep_bounded_uncertified_identity(common, source):
     profile = common.planner_profiles()[config["example"]["profile_id"]]
     limits = profile["input_envelope"]["limits"]
     assert profile["owner"] == profile["authority"] == "composite-qwen35-moe"
-    assert profile["support"]["status"] == profile["hw_status"] == "IMPLEMENTED_UNVERIFIED_HW"
-    assert profile["component"] == "multimodal"
-    assert (limits["num_cores"], limits["batch_size"], limits["group_size"]) == (8, 1, 128)
+    assert profile["hw_status"] == "IMPLEMENTED_UNVERIFIED_HW"
+    assert profile["support"]["status"] == expected_support_status(profile, "IMPLEMENTED_UNVERIFIED_HW")
+    assert profile["component"] == "multimodal" and "formal_certification" not in limits
+    assert limits["allowed_num_cores"] == [4, 6, 8]
+    assert (limits["batch_size"], limits["group_size"]) == (1, 128)
     assert limits["video_supported"] is False
     assert limits["component_paths"] == ["language_model", "vision_encoder"]
     assert config["rpu_execution"]["prefill"]["linear_acc32"] is False
@@ -246,8 +253,8 @@ def test_int4_image_profiles_keep_bounded_uncertified_identity(common, source):
     with pytest.raises(common.ConfigError, match="ACC16"):
         common._validate_execution(config["rpu_execution"], profile=profile)
     config["rpu_execution"]["prefill"]["linear_acc32"] = False
-    config["rpu_execution"]["model"]["num_cores"] = 4
-    with pytest.raises(common.ConfigError, match="TP8"):
+    for count in (4, 6, 8):
+        config["rpu_execution"]["model"]["num_cores"] = count
         common._validate_execution(config["rpu_execution"], profile=profile)
     config["input"]["videos"] = ["clip.mp4"]
     with pytest.raises(common.ConfigError, match="video"):
@@ -311,25 +318,47 @@ def test_int4_image_override_binds_source_before_processor_and_weights(
     assert generate.call_args.args[4]["mm_token_type_ids"] is encoded["mm_token_type_ids"]
 
 
-def test_moe_performance_configs_share_prose_and_reject_synthetic_input(common):
+def _prose_config(common, stem, length):
+    config = common.load_config(CONFIG.with_name(f"{stem}.toml"))
+    config["input"] = {
+        "prompt_file": str(CONFIG.with_name("prefill_realtext.txt")),
+        "prompt_sha256": "1592273bd09459f92433dd66fc4c6bb49854f922c78ce1cf9cd785f730fd567b",
+        "input_ids_sha256": {
+            64: "84480760da4e674d12a5fd4bf70355a3155f1ef0811de627f866833b44673a8a",
+            4096: "8628855580e3c9e42423ef9500cd85c2b94fe95f83a3de991caebe93affe0ad1",
+        }[length],
+        "prefill_tokens": length, "decode_steps": 4096, "stop_on_eos": False,
+    }
+    config["run"].update(inference_mode=False, timing_mode="forward_argmax")
+    config["cpu"] = {"threads": 24}
+    # The published prose numbers were measured on the ordinary dataflow, so pin
+    # resident off here instead of inheriting whatever the template now defaults to.
+    config["rpu_execution"]["prefill"].update(padding_rows=0, linear_acc32=False,
+                                              moe_resident_prefill=False)
+    common.validate_generation_options(config)
+    return config
+
+
+def test_moe_performance_parameters_share_prose_and_reject_synthetic_input(common):
     seen = {64: set(), 4096: set()}
     prose = set()
     for stem in ("fp8_e4m3_experts_attn_gdn", "w4a16_experts_rtn_g128", "w4a16_experts_gptq_g128"):
         for length in (64, 4096):
-            config = common.load_config(CONFIG.with_name(f"{stem}_p{length}_d4096.toml"))
+            config = _prose_config(common, stem, length)
             seen[length].add(config["input"]["input_ids_sha256"])
             prose.add((config["input"]["prompt_file"], config["input"]["prompt_sha256"]))
             assert config["input"]["prefill_tokens"] == length
             assert config["input"]["decode_steps"] == 4096
             assert config["input"]["stop_on_eos"] is False
-            assert config["run"]["warmup"] == 2 and config["run"]["runs"] == 3
+            assert config["run"]["warmup"] == 2 and config["run"]["runs"] == 5
             assert config["run"].get("warmup_decode_steps", config["input"]["decode_steps"]) == 4096
             assert config["cpu"]["threads"] == 24
             assert config["run"]["inference_mode"] is False
             assert config["run"]["timing_mode"] == "forward_argmax"
             assert config["rpu_execution"]["model"]["num_cores"] == 8
             assert config["rpu_execution"]["prefill"] == {
-                "chunk_size": "auto", "padding_rows": 0, "linear_acc32": False}
+                "chunk_size": "auto", "padding_rows": 0, "linear_acc32": False,
+                "moe_resident_prefill": False}
     assert len(prose) == 1 and all(len(hashes) == 1 for hashes in seen.values())
     # The previous EOS-fill contract cannot be restored under the same MoE label.
     config["input"]["prefill_fill_token_id"] = 248046
@@ -345,7 +374,7 @@ def test_moe_performance_configs_share_prose_and_reject_synthetic_input(common):
 def test_short_moe_prose_fails_before_loading_weights(common, monkeypatch, tmp_path):
     import torch
 
-    config = common.load_config(CONFIG.with_name("w4a16_experts_rtn_g128_p64_d4096.toml"))
+    config = _prose_config(common, "w4a16_experts_rtn_g128", 64)
     (tmp_path / "config.json").write_text(json.dumps(metadata(common)))
     config["_model_override"] = str(tmp_path)
     runner = load("short_moe_prose_runner", "examples/runners/qwen3_5/runner.py", monkeypatch)

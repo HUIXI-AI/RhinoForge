@@ -2,6 +2,7 @@
 from pathlib import Path
 import subprocess
 
+from pi_wall_host_catalog import with_actual_linear_contracts
 from test_siglip_cold_profile import _body
 from test_g05_vision_owner_model import _block
 
@@ -76,7 +77,7 @@ int main(){
     assert(!m.use_action_kv_owner(32)); // cold prime uses original K/V
     m.action_step_active_=m.action_loop_active_=true;m.action_num_steps_=10;
     m.plan();assert(m.routes.size()==1&&m.use_action_kv_owner(32)&&!m.use_action_kv_owner(31));
-    assert(m.routes[0].args==std::vector<int64_t>({1,32,1024,2,8,256,8,240,112,128,0,4,2,6,16384}));
+    assert(m.routes[0].args==std::vector<int64_t>({2,32,1024,2,8,256,8,80,80,512,0,4,2,6,16384,20,34,2,2,32,4,36,4,1}));
     for(int layer=0;layer<24;++layer)m.launch_action_kv_owner(layer,{});
     assert(launches==24&&proofs==48); // no weight scans in BUILD/REPLAY
     reject([&]{m.launch_action_kv_owner(24,{});});
@@ -95,12 +96,12 @@ int main(){
     m.heads=8;m.prepare_action_kv_owner();assert(m.action_kv_owner_available_);
  for(auto&w:m.layer_weights_)w.k_w.dtype=w.v_w.dtype=at::kChar;
  m.prepare_action_kv_owner();assert(m.action_kv_owner_available_&&m.action_kv_owner_w8_);m.plan();
- assert(m.routes[0].site==QWEN35_ACTION_KV_OWNER_W8_SITE&&m.routes[0].args==std::vector<int64_t>({1,32,1024,2,8,256,8,192,128,128,0,4,2,6,16384,20,28,1}));
+ assert(m.routes[0].site==QWEN35_ACTION_KV_OWNER_W8_SITE&&m.routes[0].args==std::vector<int64_t>({2,32,1024,2,8,256,8,96,48,512,0,4,2,6,16384,20,34,1,2,32,4,36,6,1}));
  const int w8proofs=proofs;
  for(int layer=0;layer<24;++layer)m.launch_action_kv_owner(layer,{});
  assert(proofs==w8proofs);m.routes[0].args[16]=20;reject([&]{m.launch_action_kv_owner(0,{});});
  m.plan();
- {auto x=m;x.linear_acc32_=false;x.action_mod_body_w8_=true;x.prepare_action_kv_owner();x.plan();assert(x.use_action_kv_owner(32)&&x.routes[0].args[7]==288);auto valid=x.routes;x.routes=m.routes;reject([&]{x.launch_action_kv_owner(0,{});});x.routes=valid;linear_modes.clear();x.launch_action_kv_owner(23,{});assert(linear_modes==std::vector<bool>({false}));}
+ {auto x=m;x.linear_acc32_=false;x.action_mod_body_w8_=true;x.prepare_action_kv_owner();x.plan();assert(x.use_action_kv_owner(32)&&x.routes[0].args[7]==48);auto valid=x.routes;x.routes=m.routes;reject([&]{x.launch_action_kv_owner(0,{});});x.routes=valid;linear_modes.clear();x.launch_action_kv_owner(23,{});assert(linear_modes==std::vector<bool>({false}));}
  m.layer_weights_.back().v_ws.replicated=false;m.prepare_action_kv_owner();assert(!m.action_kv_owner_available_&&!m.action_kv_owner_w8_);m.plan();assert(m.routes.empty());
  m.layer_weights_.back().v_ws.replicated=true;m.layer_weights_.back().k_w.dtype=1;m.prepare_action_kv_owner();assert(!m.action_kv_owner_available_);
 
@@ -109,9 +110,9 @@ int main(){
     cpp = cpp.replace("__METHODS__", "\n".join(decl + _body(source, marker) for decl, marker in methods))
     cpp = cpp.replace("__MANIFEST__", _block(source, "if (use_action_kv_owner(chunk.len))"))
     path = tmp_path / "owner.cpp"
-    path.write_text(cpp)
+    path.write_text(with_actual_linear_contracts(cpp))
     exe = tmp_path / "owner"
-    subprocess.run(["c++", "-std=c++17", "-O0", str(path), "-o", str(exe)], check=True)
+    subprocess.run(["c++", "-std=c++17", "-O0", "-I", str(root / "src/ops"), "-I", str(root / "src/core"), str(path), "-o", str(exe)], check=True)
     subprocess.run([str(exe)], check=True)
 
 
@@ -249,14 +250,14 @@ int main(){
         launch(input,kw,vw,k,v);
         assert(g.submissions.size()==(pass+1)*2&&!g.pending&&!g.staged);
         const auto& owner=g.submissions[pass*2];const auto& fanout=g.submissions[pass*2+1];
-        assert(owner.id==OWNER&&owner.grid==std::vector<uint16_t>({3,1,1}));
+        assert(owner.id==OWNER&&owner.grid==std::vector<uint16_t>({4,1,1}));
         assert(fanout.id==FANOUT&&fanout.grid==std::vector<uint16_t>({1,1,1}));
-        assert(pair(owner,0)==input&&pair(owner,4)==k&&pair(owner,26)==v);
-        assert(pair(owner,2)==kw.address>>8&&pair(owner,24)==vw.address>>8);
-        assert(pair(owner,6)==0&&owner.regs.at(8)==32&&pair(owner,10)==256);
+        assert(pair(owner,0)==input&&pair(owner,4)==k&&pair(owner,36)==v);
+        assert(pair(owner,2)==kw.address>>8&&pair(owner,32)==vw.address>>8);
+        assert(pair(owner,6)==0&&owner.regs.at(8)==1&&owner.regs.at(9)==32&&pair(owner,10)==256);
         assert(owner.regs.at(12)==1024&&owner.regs.at(13)==64&&owner.regs.at(14)==0);
         assert(owner.regs.at(15)==8&&pair(owner,16)==2048&&pair(owner,18)==512);
-        assert(pair(owner,20)==0&&owner.regs.at(22)==1&&owner.regs.at(23)==2);
+        assert(pair(owner,20)==0&&pair(owner,22)==0&&pair(owner,24)==0&&owner.regs.at(26)==2&&owner.regs.at(27)==2);
         assert(pair(fanout,0)==k-allocator.addr(0,0)&&pair(fanout,2)==v-allocator.addr(0,0));
         assert(owner.operands.size()==2&&fanout.operands.empty());
         for(int i=0;i<2;++i){
@@ -264,7 +265,7 @@ int main(){
             assert(operand.abi.role==GraphDdrRegisterRole::ModelWeight);
             assert(operand.abi.access==GraphDdrRegisterAccess::Read);
             assert(operand.abi.encoding==GraphDdrRegisterEncoding::DevAddrShift8LoHi);
-            assert(operand.abi.lo==(i?24:2)&&operand.abi.hi==(i?25:3));
+            assert(operand.abi.lo==(i?32:2)&&operand.abi.hi==(i?33:3));
             assert(operand.owner.address==(i?vw.address:kw.address));
         }
         assert(flushed[pass*2]==kw.address&&flushed[pass*2+1]==vw.address);
@@ -282,10 +283,10 @@ int main(){
 }
 '''.replace("__BODY__", body)
     path = tmp_path / "launcher.cpp"
-    path.write_text(cpp)
+    path.write_text(with_actual_linear_contracts(cpp))
     exe = tmp_path / "launcher"
     subprocess.run([
-        "c++", "-std=c++17", "-O0", "-I", str(root / "src/ops"),
+        "c++", "-std=c++17", "-O0", "-I", str(root / "src/ops"), "-I", str(root / "src/core"),
         str(path), "-o", str(exe),
     ], check=True)
     subprocess.run([str(exe)], check=True)

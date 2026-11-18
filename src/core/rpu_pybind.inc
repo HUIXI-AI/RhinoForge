@@ -61,6 +61,26 @@ PYBIND11_MODULE(rpu_backend, m) {
     return result;
   }, "Return loaded library paths and immutable loaded op-library identities");
 
+  // Op-library identity answers "is this the payload I expect"; it cannot answer
+  // "does it carry the symbol this route needs". A fused route gated on an
+  // absent payload runs its unfused fallback and reports real numbers, so
+  // without this surface nothing distinguishes a fast path that fired from one
+  // that was never there.
+  m.def("get_kernel_resolution", [] {
+    static constexpr const char* kIntentNames[] = {
+        "required", "optional", "pending", "rejected"};
+    py::list rows;
+    for (const auto& row : KernelCache::instance().kernel_resolution()) {
+      py::dict entry;
+      entry["name"] = row.name;
+      entry["role"] = row.role;
+      entry["intent"] = kIntentNames[static_cast<size_t>(row.intent)];
+      entry["resolved"] = row.resolved;
+      rows.append(std::move(entry));
+    }
+    return rows;
+  }, "Per-declaration kernel resolution against the active op-library pair");
+
   // Debug and profile switches
   m.def("rpu_set_debug_level", &rpu_set_debug_level,
         "Set 6-level debug verbosity (0 SILENT, 1 ERROR, 2 WARN, 3 INFO, 4 DEBUG, 5 TRACE)");

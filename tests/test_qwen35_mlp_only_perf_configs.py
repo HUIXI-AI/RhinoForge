@@ -53,6 +53,21 @@ def test_public_configs_select_mlp_only_asset_with_adjustable_prefill(monkeypatc
     assert configs[0]['input']['prompt'] == configs[1]['input']['prompt']
 
 
+def test_a_recorded_conversion_must_be_the_one_the_entry_recipe_loads(tmp_path):
+    config = common.load_config(CONFIGS / 'w4a16_mlp_rtn_g32.toml')
+    (tmp_path / 'config.json').write_text(json.dumps(metadata()))
+    record = tmp_path / 'rpu_precision_recipe.json'
+    for recipe in ('w4a16_mlp_rtn_g32', 'w4a16_mlp_rtn_g32_attn_gdn_w8a16'):
+        record.write_text(json.dumps({'schema': 'rpu.precision_recipe_record.v1',
+                                      'family': 'qwen3_5', 'recipe': recipe}))
+        if recipe == 'w4a16_mlp_rtn_g32':
+            common.validate_checkpoint_profile(config, str(tmp_path))
+            continue
+        with pytest.raises(common.ConfigError, match=f'converted for precision recipe qwen3_5/{recipe}; '
+                                                     'qwen3_5/w4a16_mlp_rtn_g32 loads'):
+            common.validate_checkpoint_profile(config, str(tmp_path))
+
+
 @pytest.mark.parametrize('change', ['uniform', 'g128', 'first_layer_fp16', 'wrong_size', 'wrong_architecture', 'wrong_profile'])
 def test_mlp_only_profile_rejects_wrong_scope_before_weight_load(tmp_path, change):
     config = common.load_config(CONFIGS / 'w4a16_mlp_rtn_g32.toml')

@@ -190,6 +190,11 @@ int fused_calls=0;
 void rpu_launch_wall_base_nvfp4_o_ring_norm_spm_kernel(uint32_t input,const at::Tensor&,uint32_t partial,uint32_t residual,
  uint32_t raw,uint32_t norm,uint32_t gamma,const at::Tensor&,uint32_t ts,int64_t count,uint16_t layer,double eps){
  assert(input==1&&partial==2&&residual==4&&raw==3&&norm==4&&gamma==5&&ts==6&&count==40&&layer==35&&eps==1e-6);++fused_calls;}
+#include "fused/rpu_qwen3_w8a8_contract.h"
+#include "fused/rpu_qwen3_c192_contract.h"
+namespace qwen3_w8a8 = v3::qwen3_w8a8;
+namespace qwen3_c192 = v3::qwen3_c192;
+namespace qwen3_c512 = v3::qwen3_c512;
 struct Model{
  struct LayerWeights{at::Tensor q_w,k_w,v_w,o_w,gate_w,up_w,down_w,input_norm_w,post_norm_w;
   at::Tensor q_ws,k_ws,v_ws,o_ws,gate_ws,up_ws,down_ws;};
@@ -225,6 +230,9 @@ struct Model{
   auto& plan=context.stage_plan;int64_t physical_len=seq_len_,position=context.position;
   struct Layout{bool is_causal,use_attn_mask;int64_t batch_size;}layout{context.is_causal,context.attention_mask.has_value(),context.batch_size};
   const bool wall_base_nvfp4_o_ring_norm=enabled(),wall_action_linear_ring=false,qwen3vl4b_fused_o=false,p640_staged=false,needs_shared_mlp=true;
+  const bool qwen_a8=false,qwen_inplace=false,qwen_c512=false;
+  auto append_a8_quant=[&](const ChunkInfo&,int64_t){};
+  auto append_a8_linear=[&](const ChunkInfo&,qwen3_w8a8::Projection){};
   context.manifest_.routes.clear();
   auto append=[&](FmbRouteFamily f,int64_t site,int64_t selector,int64_t flags=0,std::vector<int64_t> args={},int64_t invocation=0){context.manifest_.routes.push_back({site,f,selector,flags,args,invocation});};
   auto append_linear=[&](int64_t site,CausalDecoderLinearRoute route){append(FmbRouteFamily::LINEAR,site,int64_t(route));};

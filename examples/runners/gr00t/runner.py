@@ -7,12 +7,11 @@ from examples.common.inputs import _load_mapping, _policy_checkpoint as _checkpo
 
 def _gr00t(runner):
     from rpu_backend.adapters.gr00t import build_gr00t_vla
-    from examples.runners.gr00t.config import validate_config, validate_observation
+    from examples.runners.gr00t.config import (
+        precision_environment, precision_mode, validate_config, validate_observation)
 
     config, inputs = runner.source_config, runner.source_config["input"]
-    dtype = config["example"].get("dtype")
-    if dtype not in {"fp16", "w8a16"}:
-        raise ValueError("GR00T example requires explicit fp16 or w8a16 dtype")
+    selectors = precision_environment(precision_mode(config["example"]))
     geometry_config = validate_config(config)
     observation = _load_mapping(inputs, "observation")
     # Existing benchmark archives wrap the same tensor mapping in inputs/meta.
@@ -42,10 +41,10 @@ def _gr00t(runner):
             raise RuntimeError("GR00T could not prepare five Graph arenas")
         torch.rpu.set_ddr_flush(False)
         torch.rpu.set_ddr_flush_force(True)
-    # This selector is read only while installing/swizzling weights. Keep the
-    # explicit profile authoritative without changing the caller's environment.
-    previous = os.environ.get("RPU_GR00T_W8A16")
-    os.environ["RPU_GR00T_W8A16"] = "1" if dtype == "w8a16" else "0"
+    # These selectors are read only while installing/swizzling weights. Keep
+    # the explicit profile authoritative without changing the caller's environment.
+    previous = {name: os.environ.get(name) for name in selectors}
+    os.environ.update(selectors)
     try:
         runtime = build_gr00t_vla(
             str(_checkpoint(config)),
@@ -56,10 +55,11 @@ def _gr00t(runner):
             rpu_execution=config.get("rpu_execution"),
         )
     finally:
-        if previous is None:
-            os.environ.pop("RPU_GR00T_W8A16", None)
-        else:
-            os.environ["RPU_GR00T_W8A16"] = previous
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
     runner.owner = runtime
     runner.stage_boundaries = (("backbone", runtime, "_backbone"), ("vl", runtime, "_vl_encode"),
                                ("denoise", runtime, "_denoise"))

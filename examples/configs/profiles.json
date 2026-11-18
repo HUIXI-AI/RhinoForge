@@ -2133,7 +2133,12 @@
           ],
           "real_prefix_max": 640,
           "real_prefix_min": 599,
-          "staged": 0
+          "staged": 0,
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ]
         },
         "reason_code": "WALL_OSS_RTC_FP16_EXACT_ENVELOPE"
       },
@@ -2386,7 +2391,12 @@
           ],
           "real_prefix_max": 640,
           "real_prefix_min": 599,
-          "staged": 0
+          "staged": 0,
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ]
         },
         "reason_code": "WALL_OSS_RTC_W8A16_EXACT_ENVELOPE"
       },
@@ -2544,7 +2554,12 @@
             2,
             3
           ],
-          "max_prefill_rows": 512
+          "max_prefill_rows": 512,
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ]
         },
         "reason_code": "GR00T_AUTO_ONLY_PREFILL_ENVELOPE"
       },
@@ -2607,7 +2622,12 @@
             2,
             3
           ],
-          "max_prefill_rows": 512
+          "max_prefill_rows": 512,
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ]
         },
         "reason_code": "GR00T_AUTO_ONLY_PREFILL_ENVELOPE"
       },
@@ -2627,6 +2647,159 @@
         "status": "SUPPORTED"
       },
       "variant": "default-w8a16"
+    },
+    {
+      "asset_alias": "gr00t-n1d7-3b",
+      "authority": "composite-gr00t",
+      "component": "vla",
+      "controlled_gates": [],
+      "evidence": [
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/adapters/gr00t/runtime.py",
+          "symbol": "def build_gr00t_vla("
+        },
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/adapters/gr00t/runtime.py",
+          "symbol": "def _pack_gr00t_w4("
+        },
+        {
+          "kind": "contract_test",
+          "path": "tests/test_gr00t_quant.py",
+          "symbol": "def test_quant_profiles_bind_exact_recipe_and_cores("
+        }
+      ],
+      "example": {
+        "eligible": true,
+        "reason_code": "PUBLIC_PROFILE_EXAMPLE",
+        "runner_target": "gr00t"
+      },
+      "family": "gr00t",
+      "hw_status": "IMPLEMENTED_UNVERIFIED_HW",
+      "id": "gr00t-n1d7-3b.w4a16-g32.vla",
+      "input_envelope": {
+        "evidence": [
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/gr00t/runtime.py",
+            "symbol": "def _validate_gr00t_max_prefix_len("
+          }
+        ],
+        "kind": "BOUNDED",
+        "limits": {
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ],
+          "chunk_mode": "auto-only",
+          "denoise_steps": 4,
+          "image_cases": [
+            1,
+            2,
+            3
+          ],
+          "max_prefill_rows": 512,
+          "group_size": 32
+        },
+        "reason_code": "GR00T_AUTO_ONLY_PREFILL_ENVELOPE"
+      },
+      "owner": "composite-gr00t",
+      "precision": "w4a16",
+      "reason_code": "UNIFIED_CONTROL_AUTHORITY",
+      "state": "MIGRATED",
+      "support": {
+        "evidence": [
+          {
+            "kind": "support_contract",
+            "path": "tests/test_gr00t_quant.py",
+            "symbol": "def test_quant_profiles_bind_exact_recipe_and_cores("
+          }
+        ],
+        "reason_code": "GR00T_W4_BOARD_RUN_PENDING",
+        "status": "IMPLEMENTED_UNVERIFIED_HW"
+      },
+      "variant": "default-w4a16-g32"
+    },
+    {
+      "asset_alias": "gr00t-n1d7-3b",
+      "authority": "composite-gr00t",
+      "component": "vla",
+      "controlled_gates": [],
+      "evidence": [
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/adapters/gr00t/runtime.py",
+          "symbol": "def build_gr00t_vla("
+        },
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/adapters/gr00t/runtime.py",
+          "symbol": "def _gr00t_vision_precision("
+        },
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/adapters/qwen3_vl/vision.py",
+          "symbol": "def _is_qwen3_vl_w4_vision_tower("
+        },
+        {
+          "kind": "contract_test",
+          "path": "tests/test_gr00t_quant.py",
+          "symbol": "def test_quant_profiles_bind_exact_recipe_and_cores("
+        }
+      ],
+      "example": {
+        "eligible": true,
+        "reason_code": "PUBLIC_PROFILE_EXAMPLE",
+        "runner_target": "gr00t"
+      },
+      "family": "gr00t",
+      "hw_status": "IMPLEMENTED_UNVERIFIED_HW",
+      "id": "gr00t-n1d7-3b.w4a16-g32-vision.vla",
+      "input_envelope": {
+        "evidence": [
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/gr00t/runtime.py",
+            "symbol": "def _validate_gr00t_max_prefix_len("
+          }
+        ],
+        "kind": "BOUNDED",
+        "limits": {
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ],
+          "chunk_mode": "auto-only",
+          "denoise_steps": 4,
+          "image_cases": [
+            1,
+            2,
+            3
+          ],
+          "max_prefill_rows": 512,
+          "group_size": 32
+        },
+        "reason_code": "GR00T_AUTO_ONLY_PREFILL_ENVELOPE"
+      },
+      "owner": "composite-gr00t",
+      "precision": "w4a16",
+      "reason_code": "UNIFIED_CONTROL_AUTHORITY",
+      "state": "MIGRATED",
+      "support": {
+        "evidence": [
+          {
+            "kind": "support_contract",
+            "path": "tests/test_gr00t_quant.py",
+            "symbol": "def test_quant_profiles_bind_exact_recipe_and_cores("
+          }
+        ],
+        "reason_code": "GR00T_VISION_W4_BOARD_RUN_PENDING",
+        "status": "IMPLEMENTED_UNVERIFIED_HW"
+      },
+      "variant": "default-w4a16-g32-vision"
     },
     {
       "asset_alias": "lingbot-vla-4b",
@@ -3014,6 +3187,11 @@
             "goal-glue",
             "rgbd",
             "navdp"
+          ],
+          "allowed_num_cores": [
+            4,
+            6,
+            8
           ]
         },
         "reason_code": "INTERNVLA_N1_EXACT_PRIVATE_SCOPE"
@@ -3074,7 +3252,12 @@
           "expert_chunk_size": 64,
           "expert_rows": 291,
           "expert_suffix_rows": 51,
-          "vlm_rows": 240
+          "vlm_rows": 240,
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ]
         },
         "reason_code": "HY_VLA_IMMUTABLE_V2_S240_ENVELOPE"
       },
@@ -3094,6 +3277,157 @@
         "status": "SUPPORTED"
       },
       "variant": "default"
+    },
+    {
+      "asset_alias": "hy-embodied-0.5-vla-umi",
+      "authority": "composite-hy-vla",
+      "component": "vla",
+      "controlled_gates": [],
+      "evidence": [
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/adapters/hy_vla/runtime.py",
+          "symbol": "def build_hy_vla("
+        },
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/adapters/hy_vla/weights.py",
+          "symbol": "def _q8("
+        },
+        {
+          "kind": "contract_test",
+          "path": "tests/test_hyvla_quant.py",
+          "symbol": "def test_quant_profiles_bind_exact_recipe_and_cores("
+        }
+      ],
+      "example": {
+        "eligible": true,
+        "reason_code": "PUBLIC_PROFILE_EXAMPLE",
+        "runner_target": "hy_vla"
+      },
+      "family": "hy-vla",
+      "hw_status": "IMPLEMENTED_UNVERIFIED_HW",
+      "id": "hy-embodied-0.5-vla-umi.w8a16.vla",
+      "input_envelope": {
+        "evidence": [
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/hy_vla/runtime.py",
+            "symbol": "def _validate_hy_vla_execution_geometry("
+          },
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/hy_vla/weights.py",
+            "symbol": "def from_environment("
+          }
+        ],
+        "kind": "EXACT",
+        "limits": {
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ],
+          "cameras": 3,
+          "expert_chunk_size": 64,
+          "expert_rows": 291,
+          "expert_suffix_rows": 51,
+          "vlm_rows": 240
+        },
+        "reason_code": "HY_VLA_IMMUTABLE_V2_S240_ENVELOPE"
+      },
+      "owner": "composite-hy-vla",
+      "precision": "w8a16",
+      "reason_code": "UNIFIED_CONTROL_AUTHORITY",
+      "state": "MIGRATED",
+      "support": {
+        "evidence": [
+          {
+            "kind": "support_contract",
+            "path": "tests/test_hyvla_quant.py",
+            "symbol": "def test_quant_profiles_bind_exact_recipe_and_cores("
+          }
+        ],
+        "reason_code": "HY_VLA_UMI_QUANT_BOARD_RUN_PENDING",
+        "status": "IMPLEMENTED_UNVERIFIED_HW"
+      },
+      "variant": "w8a16"
+    },
+    {
+      "asset_alias": "hy-embodied-0.5-vla-umi",
+      "authority": "composite-hy-vla",
+      "component": "vla",
+      "controlled_gates": [],
+      "evidence": [
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/adapters/hy_vla/runtime.py",
+          "symbol": "def build_hy_vla("
+        },
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/adapters/hy_vla/weights.py",
+          "symbol": "def _q4("
+        },
+        {
+          "kind": "contract_test",
+          "path": "tests/test_hyvla_quant.py",
+          "symbol": "def test_quant_profiles_bind_exact_recipe_and_cores("
+        }
+      ],
+      "example": {
+        "eligible": true,
+        "reason_code": "PUBLIC_PROFILE_EXAMPLE",
+        "runner_target": "hy_vla"
+      },
+      "family": "hy-vla",
+      "hw_status": "IMPLEMENTED_UNVERIFIED_HW",
+      "id": "hy-embodied-0.5-vla-umi.w4a16-g32.vla",
+      "input_envelope": {
+        "evidence": [
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/hy_vla/runtime.py",
+            "symbol": "def _validate_hy_vla_execution_geometry("
+          },
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/hy_vla/weights.py",
+            "symbol": "def from_environment("
+          }
+        ],
+        "kind": "EXACT",
+        "limits": {
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ],
+          "cameras": 3,
+          "expert_chunk_size": 64,
+          "expert_rows": 291,
+          "expert_suffix_rows": 51,
+          "group_size": 32,
+          "vlm_rows": 240
+        },
+        "reason_code": "HY_VLA_IMMUTABLE_V2_S240_ENVELOPE"
+      },
+      "owner": "composite-hy-vla",
+      "precision": "w4a16",
+      "reason_code": "UNIFIED_CONTROL_AUTHORITY",
+      "state": "MIGRATED",
+      "support": {
+        "evidence": [
+          {
+            "kind": "support_contract",
+            "path": "tests/test_hyvla_quant.py",
+            "symbol": "def test_quant_profiles_bind_exact_recipe_and_cores("
+          }
+        ],
+        "reason_code": "HY_VLA_UMI_QUANT_BOARD_RUN_PENDING",
+        "status": "IMPLEMENTED_UNVERIFIED_HW"
+      },
+      "variant": "w4a16-g32"
     },
     {
       "asset_alias": "dinov3-vit-s",
@@ -3220,6 +3554,219 @@
         "status": "SUPPORTED"
       },
       "variant": "default"
+    },
+    {
+      "asset_alias": "dinov3-vit-b",
+      "authority": "fmb-dinov3-vision",
+      "component": "vision",
+      "controlled_gates": [
+        {
+          "evidence": [
+            {
+              "kind": "controlled_gate",
+              "path": "python/rpu_backend/adapters/dinov3.py",
+              "symbol": "def preflight_quantization("
+            }
+          ],
+          "kind": "preflight",
+          "name": "dinov3_vit_b_w8a16",
+          "value": "w8a16"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "authority",
+          "path": "src/fused/rpu_dinov3_vision_model.cpp",
+          "symbol": "void set_weight_scales("
+        },
+        {
+          "kind": "contract_test",
+          "path": "tests/test_dinov3_quant.py",
+          "symbol": "def test_quant_profiles_bind_exact_recipe_and_cores("
+        }
+      ],
+      "example": {
+        "eligible": true,
+        "reason_code": "PUBLIC_PROFILE_EXAMPLE",
+        "runner_target": "dinov3"
+      },
+      "family": "dinov3",
+      "hw_status": "IMPLEMENTED_UNVERIFIED_HW",
+      "id": "dinov3-vit-b.w8a16.vision",
+      "input_envelope": {
+        "evidence": [
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/dinov3.py",
+            "symbol": "_SUPPORTED_PROFILES"
+          },
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/dinov3.py",
+            "symbol": "def _check_execution_cores("
+          },
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/dinov3.py",
+            "symbol": "def preflight_quantization("
+          }
+        ],
+        "kind": "EXACT",
+        "limits": {
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ],
+          "formal_certification": false,
+          "hardware_validation": "PENDING_PROFILE_VALIDATION",
+          "head_dim": 64,
+          "hidden_size": 768,
+          "image_hw": [
+            224,
+            224
+          ],
+          "intermediate_size": 3072,
+          "linear_accumulation": "ACC16",
+          "num_attention_heads": 12,
+          "num_hidden_layers": 12,
+          "on_install_quantization": "w8a16",
+          "patch_size": 16,
+          "profile": "vit-b",
+          "quantization": {
+            "activation": "FP16",
+            "biases_layerscale_norms": "FP16",
+            "patch_embedding": "FP16 (CPU)",
+            "source": "dense FP16 checkpoint",
+            "vision_six_projections": "symmetric per-channel signed INT8 on install"
+          },
+          "register_tokens": 4
+        },
+        "reason_code": "DINOV3_VIT_B_ON_INSTALL_QUANT_EXACT_PROFILE"
+      },
+      "owner": "fmb-dinov3-vision",
+      "precision": "w8a16",
+      "reason_code": "UNIFIED_CONTROL_AUTHORITY",
+      "state": "MIGRATED",
+      "support": {
+        "evidence": [
+          {
+            "kind": "support_contract",
+            "path": "python/rpu_backend/adapters/dinov3.py",
+            "symbol": "def preflight_quantization("
+          }
+        ],
+        "reason_code": "DINOV3_VIT_B_QUANT_BOARD_RUN_PENDING",
+        "status": "IMPLEMENTED_UNVERIFIED_HW"
+      },
+      "variant": "w8a16"
+    },
+    {
+      "asset_alias": "dinov3-vit-b",
+      "authority": "fmb-dinov3-vision",
+      "component": "vision",
+      "controlled_gates": [
+        {
+          "evidence": [
+            {
+              "kind": "controlled_gate",
+              "path": "python/rpu_backend/adapters/dinov3.py",
+              "symbol": "def preflight_quantization("
+            }
+          ],
+          "kind": "preflight",
+          "name": "dinov3_vit_b_w4a16_group32",
+          "value": "w4a16"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "authority",
+          "path": "src/fused/rpu_dinov3_vision_model.cpp",
+          "symbol": "void set_weight_scales("
+        },
+        {
+          "kind": "contract_test",
+          "path": "tests/test_dinov3_quant.py",
+          "symbol": "def test_quant_profiles_bind_exact_recipe_and_cores("
+        }
+      ],
+      "example": {
+        "eligible": true,
+        "reason_code": "PUBLIC_PROFILE_EXAMPLE",
+        "runner_target": "dinov3"
+      },
+      "family": "dinov3",
+      "hw_status": "IMPLEMENTED_UNVERIFIED_HW",
+      "id": "dinov3-vit-b.w4a16-g32.vision",
+      "input_envelope": {
+        "evidence": [
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/dinov3.py",
+            "symbol": "_SUPPORTED_PROFILES"
+          },
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/dinov3.py",
+            "symbol": "def _check_execution_cores("
+          },
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/dinov3.py",
+            "symbol": "def preflight_quantization("
+          }
+        ],
+        "kind": "EXACT",
+        "limits": {
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ],
+          "formal_certification": false,
+          "group_size": 32,
+          "hardware_validation": "PENDING_PROFILE_VALIDATION",
+          "head_dim": 64,
+          "hidden_size": 768,
+          "image_hw": [
+            224,
+            224
+          ],
+          "intermediate_size": 3072,
+          "linear_accumulation": "ACC16",
+          "num_attention_heads": 12,
+          "num_hidden_layers": 12,
+          "on_install_quantization": "w4a16",
+          "patch_size": 16,
+          "profile": "vit-b",
+          "quantization": {
+            "activation": "FP16",
+            "biases_layerscale_norms": "FP16",
+            "patch_embedding": "FP16 (CPU)",
+            "source": "dense FP16 checkpoint",
+            "vision_six_projections": "symmetric RTN signed W4/G32 on install"
+          },
+          "register_tokens": 4
+        },
+        "reason_code": "DINOV3_VIT_B_ON_INSTALL_QUANT_EXACT_PROFILE"
+      },
+      "owner": "fmb-dinov3-vision",
+      "precision": "w4a16",
+      "reason_code": "UNIFIED_CONTROL_AUTHORITY",
+      "state": "MIGRATED",
+      "support": {
+        "evidence": [
+          {
+            "kind": "support_contract",
+            "path": "python/rpu_backend/adapters/dinov3.py",
+            "symbol": "def preflight_quantization("
+          }
+        ],
+        "reason_code": "DINOV3_VIT_B_QUANT_BOARD_RUN_PENDING",
+        "status": "IMPLEMENTED_UNVERIFIED_HW"
+      },
+      "variant": "w4a16-g32"
     },
     {
       "asset_alias": "dinov3-vit-l",
@@ -4254,6 +4801,307 @@
       "variant": "default"
     },
     {
+      "asset_alias": "llama-3.2-1b",
+      "authority": "fmb-causal-decoder",
+      "component": "text",
+      "controlled_gates": [
+        {
+          "evidence": [
+            {
+              "kind": "controlled_gate",
+              "path": "python/rpu_backend/adapters/llama.py",
+              "symbol": "def preflight_quantization("
+            }
+          ],
+          "kind": "preflight",
+          "name": "llama_3_2_1b_w8a16",
+          "value": "w8a16"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/adapters/llama.py",
+          "symbol": "def _quantize_decoder_for_rpu("
+        },
+        {
+          "kind": "contract_test",
+          "path": "tests/test_llama_quant.py",
+          "symbol": "def test_quant_profiles_bind_exact_recipe_geometry_and_cores("
+        }
+      ],
+      "example": {
+        "eligible": true,
+        "reason_code": "PUBLIC_PROFILE_EXAMPLE",
+        "runner_target": "llama"
+      },
+      "family": "llama",
+      "hw_status": "IMPLEMENTED_UNVERIFIED_HW",
+      "id": "llama-3.2-1b.w8a16.text",
+      "input_envelope": {
+        "evidence": [
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/llama.py",
+            "symbol": "(\"llama\", 16, 2048): ChunkEnvelope(64, 64)"
+          },
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/llama.py",
+            "symbol": "def preflight_quantization("
+          }
+        ],
+        "kind": "EXACT",
+        "limits": {
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ],
+          "batch_size": 1,
+          "chunk_alignment": 16,
+          "formal_certification": false,
+          "hardware_validation": "PENDING_PROFILE_VALIDATION",
+          "head_dim": 64,
+          "hidden_size": 2048,
+          "intermediate_size": 8192,
+          "max_chunk_size": 64,
+          "num_attention_heads": 32,
+          "num_hidden_layers": 16,
+          "num_key_value_heads": 8,
+          "on_install_quantization": "w8a16",
+          "quantization": {
+            "activation": "FP16",
+            "embedding": "FP16",
+            "lm_head": "FP16 (tied to the embedding)",
+            "norms": "FP16",
+            "source": "dense FP16 checkpoint",
+            "text_seven_projections": "symmetric per-channel INT8 on install, one FP16 scale per output channel"
+          },
+          "vocab_size": 128256,
+          "kv_capacity": "requested-at-install; allocation must succeed"
+        },
+        "reason_code": "LLAMA_1B_ON_INSTALL_QUANT_EXACT_GEOMETRY"
+      },
+      "owner": "fmb-causal-decoder",
+      "precision": "w8a16",
+      "reason_code": "UNIFIED_CONTROL_AUTHORITY",
+      "state": "MIGRATED",
+      "support": {
+        "evidence": [
+          {
+            "kind": "support_contract",
+            "path": "python/rpu_backend/adapters/llama.py",
+            "symbol": "def preflight_quantization("
+          }
+        ],
+        "reason_code": "LLAMA_1B_QUANT_BOARD_RUN_PENDING",
+        "status": "IMPLEMENTED_UNVERIFIED_HW"
+      },
+      "variant": "w8a16"
+    },
+    {
+      "asset_alias": "llama-3.2-1b",
+      "authority": "fmb-causal-decoder",
+      "component": "text",
+      "controlled_gates": [
+        {
+          "evidence": [
+            {
+              "kind": "controlled_gate",
+              "path": "python/rpu_backend/adapters/llama.py",
+              "symbol": "def preflight_quantization("
+            }
+          ],
+          "kind": "preflight",
+          "name": "llama_3_2_1b_w4a16_group32",
+          "value": "w4a16"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/adapters/llama.py",
+          "symbol": "def _quantize_decoder_for_rpu("
+        },
+        {
+          "kind": "contract_test",
+          "path": "tests/test_llama_quant.py",
+          "symbol": "def test_quant_profiles_bind_exact_recipe_geometry_and_cores("
+        }
+      ],
+      "example": {
+        "eligible": true,
+        "reason_code": "PUBLIC_PROFILE_EXAMPLE",
+        "runner_target": "llama"
+      },
+      "family": "llama",
+      "hw_status": "IMPLEMENTED_UNVERIFIED_HW",
+      "id": "llama-3.2-1b.w4a16-g32.text",
+      "input_envelope": {
+        "evidence": [
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/llama.py",
+            "symbol": "(\"llama\", 16, 2048): ChunkEnvelope(64, 64)"
+          },
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/llama.py",
+            "symbol": "def preflight_quantization("
+          }
+        ],
+        "kind": "EXACT",
+        "limits": {
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ],
+          "batch_size": 1,
+          "chunk_alignment": 16,
+          "formal_certification": false,
+          "group_size": 32,
+          "hardware_validation": "PENDING_PROFILE_VALIDATION",
+          "head_dim": 64,
+          "hidden_size": 2048,
+          "intermediate_size": 8192,
+          "max_chunk_size": 64,
+          "num_attention_heads": 32,
+          "num_hidden_layers": 16,
+          "num_key_value_heads": 8,
+          "on_install_quantization": "w4a16",
+          "quantization": {
+            "activation": "FP16",
+            "embedding": "FP16",
+            "lm_head": "FP16 (tied to the embedding)",
+            "norms": "FP16",
+            "source": "dense FP16 checkpoint",
+            "text_seven_projections": "symmetric RTN signed W4/G32 on install"
+          },
+          "vocab_size": 128256,
+          "kv_capacity": "requested-at-install; allocation must succeed"
+        },
+        "reason_code": "LLAMA_1B_ON_INSTALL_QUANT_EXACT_GEOMETRY"
+      },
+      "owner": "fmb-causal-decoder",
+      "precision": "w4a16",
+      "reason_code": "UNIFIED_CONTROL_AUTHORITY",
+      "state": "MIGRATED",
+      "support": {
+        "evidence": [
+          {
+            "kind": "support_contract",
+            "path": "python/rpu_backend/adapters/llama.py",
+            "symbol": "def preflight_quantization("
+          }
+        ],
+        "reason_code": "LLAMA_1B_QUANT_BOARD_RUN_PENDING",
+        "status": "IMPLEMENTED_UNVERIFIED_HW"
+      },
+      "variant": "w4a16-g32"
+    },
+    {
+      "asset_alias": "llama-3.2-1b",
+      "authority": "fmb-causal-decoder",
+      "component": "text",
+      "controlled_gates": [
+        {
+          "evidence": [
+            {
+              "kind": "controlled_gate",
+              "path": "python/rpu_backend/adapters/llama.py",
+              "symbol": "def preflight_quantization("
+            }
+          ],
+          "kind": "preflight",
+          "name": "llama_3_2_1b_nvfp4",
+          "value": "nvfp4"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/adapters/llama.py",
+          "symbol": "def _quantize_decoder_for_rpu("
+        },
+        {
+          "kind": "contract_test",
+          "path": "tests/test_llama_quant.py",
+          "symbol": "def test_quant_profiles_bind_exact_recipe_geometry_and_cores("
+        }
+      ],
+      "example": {
+        "eligible": true,
+        "reason_code": "PUBLIC_PROFILE_EXAMPLE",
+        "runner_target": "llama"
+      },
+      "family": "llama",
+      "hw_status": "IMPLEMENTED_UNVERIFIED_HW",
+      "id": "llama-3.2-1b.nvfp4.text",
+      "input_envelope": {
+        "evidence": [
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/llama.py",
+            "symbol": "(\"llama\", 16, 2048): ChunkEnvelope(64, 64)"
+          },
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/llama.py",
+            "symbol": "def preflight_quantization("
+          }
+        ],
+        "kind": "EXACT",
+        "limits": {
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ],
+          "batch_size": 1,
+          "chunk_alignment": 16,
+          "formal_certification": false,
+          "hardware_validation": "PENDING_PROFILE_VALIDATION",
+          "head_dim": 64,
+          "hidden_size": 2048,
+          "intermediate_size": 8192,
+          "max_chunk_size": 64,
+          "num_attention_heads": 32,
+          "num_hidden_layers": 16,
+          "num_key_value_heads": 8,
+          "on_install_quantization": "nvfp4",
+          "quantization": {
+            "activation": "FP16",
+            "embedding": "FP16",
+            "lm_head": "FP16 (tied to the embedding)",
+            "norms": "FP16",
+            "source": "dense FP16 checkpoint",
+            "text_seven_projections": "NVFP4 on install: E2M1 weight, E4M3 scale per 16 K values, one FP32 tensor scale per projection and layer"
+          },
+          "vocab_size": 128256,
+          "kv_capacity": "requested-at-install; allocation must succeed"
+        },
+        "reason_code": "LLAMA_1B_ON_INSTALL_QUANT_EXACT_GEOMETRY"
+      },
+      "owner": "fmb-causal-decoder",
+      "precision": "nvfp4",
+      "reason_code": "UNIFIED_CONTROL_AUTHORITY",
+      "state": "MIGRATED",
+      "support": {
+        "evidence": [
+          {
+            "kind": "support_contract",
+            "path": "python/rpu_backend/adapters/llama.py",
+            "symbol": "def preflight_quantization("
+          }
+        ],
+        "reason_code": "LLAMA_1B_QUANT_BOARD_RUN_PENDING",
+        "status": "IMPLEMENTED_UNVERIFIED_HW"
+      },
+      "variant": "nvfp4"
+    },
+    {
       "asset_alias": "paligemma2-3b-pt-224",
       "authority": "composite-paligemma",
       "component": "multimodal",
@@ -4428,6 +5276,201 @@
         "status": "SUPPORTED"
       },
       "variant": "default"
+    },
+    {
+      "asset_alias": "gemma4-e4b",
+      "authority": "fmb-gemma4",
+      "component": "text",
+      "controlled_gates": [
+        {
+          "evidence": [
+            {
+              "kind": "controlled_gate",
+              "path": "python/rpu_backend/adapters/gemma4/__init__.py",
+              "symbol": "def preflight_quantization("
+            }
+          ],
+          "kind": "preflight",
+          "name": "gemma4_e4b_w8a16",
+          "value": "w8a16"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "authority",
+          "path": "src/fused/rpu_gemma4_model.cpp",
+          "symbol": "void set_weight_scales("
+        },
+        {
+          "kind": "contract_test",
+          "path": "tests/test_gemma4_quant.py",
+          "symbol": "def test_quant_profiles_bind_exact_recipe_and_cores("
+        }
+      ],
+      "example": {
+        "eligible": true,
+        "reason_code": "PUBLIC_PROFILE_EXAMPLE",
+        "runner_target": "gemma4"
+      },
+      "family": "gemma4",
+      "hw_status": "IMPLEMENTED_UNVERIFIED_HW",
+      "id": "gemma4-e4b.w8a16.text",
+      "input_envelope": {
+        "evidence": [
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/gemma4/__init__.py",
+            "symbol": "def _execution_plan("
+          },
+          {
+            "kind": "contract_test",
+            "path": "tests/test_gemma4_owner_controls.py",
+            "symbol": "def test_step_logits_require_complete_same_input_frozen_rows("
+          },
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/gemma4/__init__.py",
+            "symbol": "def preflight_quantization("
+          }
+        ],
+        "kind": "EXACT",
+        "limits": {
+          "decode_steps": 16,
+          "prefill_tokens": 256,
+          "profile": "e4b",
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ],
+          "formal_certification": false,
+          "hardware_validation": "PENDING_PROFILE_VALIDATION",
+          "linear_accumulation": "ACC16",
+          "on_install_quantization": "w8a16",
+          "quantization": {
+            "activation": "FP16",
+            "decoder_seven_projections": "symmetric per-channel signed INT8 on install",
+            "ple_norms_embeddings": "FP16",
+            "lm_head": "tied FP32 (CPU)",
+            "source": "official float checkpoint (BF16, FP16 values on install)"
+          }
+        },
+        "reason_code": "GEMMA4_E4B_ON_INSTALL_QUANT_EXACT_PROFILE"
+      },
+      "owner": "fmb-gemma4",
+      "precision": "w8a16",
+      "reason_code": "UNIFIED_CONTROL_AUTHORITY",
+      "state": "MIGRATED",
+      "support": {
+        "evidence": [
+          {
+            "kind": "support_contract",
+            "path": "python/rpu_backend/adapters/gemma4/__init__.py",
+            "symbol": "def preflight_quantization("
+          }
+        ],
+        "reason_code": "GEMMA4_E4B_QUANT_BOARD_RUN_PENDING",
+        "status": "IMPLEMENTED_UNVERIFIED_HW"
+      },
+      "variant": "w8a16"
+    },
+    {
+      "asset_alias": "gemma4-e4b",
+      "authority": "fmb-gemma4",
+      "component": "text",
+      "controlled_gates": [
+        {
+          "evidence": [
+            {
+              "kind": "controlled_gate",
+              "path": "python/rpu_backend/adapters/gemma4/__init__.py",
+              "symbol": "def preflight_quantization("
+            }
+          ],
+          "kind": "preflight",
+          "name": "gemma4_e4b_w4a16_group32",
+          "value": "w4a16"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "authority",
+          "path": "src/fused/rpu_gemma4_model.cpp",
+          "symbol": "void set_weight_scales("
+        },
+        {
+          "kind": "contract_test",
+          "path": "tests/test_gemma4_quant.py",
+          "symbol": "def test_quant_profiles_bind_exact_recipe_and_cores("
+        }
+      ],
+      "example": {
+        "eligible": true,
+        "reason_code": "PUBLIC_PROFILE_EXAMPLE",
+        "runner_target": "gemma4"
+      },
+      "family": "gemma4",
+      "hw_status": "IMPLEMENTED_UNVERIFIED_HW",
+      "id": "gemma4-e4b.w4a16-g32.text",
+      "input_envelope": {
+        "evidence": [
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/gemma4/__init__.py",
+            "symbol": "def _execution_plan("
+          },
+          {
+            "kind": "contract_test",
+            "path": "tests/test_gemma4_owner_controls.py",
+            "symbol": "def test_step_logits_require_complete_same_input_frozen_rows("
+          },
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/gemma4/__init__.py",
+            "symbol": "def preflight_quantization("
+          }
+        ],
+        "kind": "EXACT",
+        "limits": {
+          "decode_steps": 16,
+          "prefill_tokens": 256,
+          "profile": "e4b",
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ],
+          "formal_certification": false,
+          "group_size": 32,
+          "hardware_validation": "PENDING_PROFILE_VALIDATION",
+          "linear_accumulation": "ACC16",
+          "on_install_quantization": "w4a16",
+          "quantization": {
+            "activation": "FP16",
+            "decoder_seven_projections": "symmetric RTN signed W4/G32 on install",
+            "ple_norms_embeddings": "FP16",
+            "lm_head": "tied FP32 (CPU)",
+            "source": "official float checkpoint (BF16, FP16 values on install)"
+          }
+        },
+        "reason_code": "GEMMA4_E4B_ON_INSTALL_QUANT_EXACT_PROFILE"
+      },
+      "owner": "fmb-gemma4",
+      "precision": "w4a16",
+      "reason_code": "UNIFIED_CONTROL_AUTHORITY",
+      "state": "MIGRATED",
+      "support": {
+        "evidence": [
+          {
+            "kind": "support_contract",
+            "path": "python/rpu_backend/adapters/gemma4/__init__.py",
+            "symbol": "def preflight_quantization("
+          }
+        ],
+        "reason_code": "GEMMA4_E4B_QUANT_BOARD_RUN_PENDING",
+        "status": "IMPLEMENTED_UNVERIFIED_HW"
+      },
+      "variant": "w4a16-g32"
     },
     {
       "asset_alias": "halo_action_expert",
@@ -7193,6 +8236,201 @@
       "variant": "rtn-g128"
     },
     {
+      "asset_alias": "qwen3_5-35b-a3b-rtn-w8a16",
+      "authority": "fmb-qwen35-moe-text",
+      "component": "text",
+      "controlled_gates": [],
+      "evidence": [
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/adapters/qwen3_5_moe/__init__.py",
+          "symbol": "class Qwen3_5MoeAdapter"
+        },
+        {
+          "kind": "admission_contract",
+          "path": "python/rpu_backend/adapters/qwen3_5_moe/quant_scope.py",
+          "symbol": "INT8_PROFILE_ID"
+        },
+        {
+          "kind": "contract_test",
+          "path": "tests/test_qwen35_moe_int8.py",
+          "symbol": "def test_int8_public_profiles_bind_exact_recipe_and_cores("
+        }
+      ],
+      "example": {
+        "eligible": true,
+        "reason_code": "CONTROLLED_PUBLIC_EXAMPLE",
+        "runner_target": "qwen3_5"
+      },
+      "family": "qwen3-5-moe",
+      "hw_status": "IMPLEMENTED_UNVERIFIED_HW",
+      "id": "qwen3_5-35b-a3b.rtn-w8a16.text",
+      "input_envelope": {
+        "evidence": [
+          {
+            "kind": "admission_contract",
+            "path": "python/rpu_backend/adapters/qwen3_5_moe/quant_scope.py",
+            "symbol": "INT8_PROFILE_ID"
+          },
+          {
+            "kind": "contract_test",
+            "path": "tests/test_qwen35_moe_int8.py",
+            "symbol": "def test_int8_public_profiles_bind_exact_recipe_and_cores("
+          }
+        ],
+        "kind": "BOUNDED",
+        "limits": {
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ],
+          "batch_size": 1,
+          "checkpoint_profile": "qwen3_5_moe_35b_a3b_tp8_routed_rtn_w8a16",
+          "chunk_alignment": 64,
+          "experts_per_token": 8,
+          "formal_certification": false,
+          "max_chunk_size": 512,
+          "moe_resident_prefill": false,
+          "num_experts": 256,
+          "quantization": "routed experts only: symmetric per-output-channel INT8 (grouped mode 1, FP16 scales); FP16 mixers/router/shared/embed/head; Vision not admitted",
+          "routed_intermediate_size": 512,
+          "shared_expert_intermediate_size": 512,
+          "text_effective_kv_heads_by_num_cores": {
+            "4": 4,
+            "6": 4,
+            "8": 8
+          },
+          "text_head_dim": 256,
+          "text_hidden_size": 2048,
+          "text_linear_acc32": false,
+          "text_num_attention_heads": 16,
+          "text_num_hidden_layers": 40,
+          "kv_capacity": "requested-at-install; allocation must succeed"
+        },
+        "reason_code": "QWEN35_MOE_ROUTED_INT8_TEXT_TP8_ENVELOPE"
+      },
+      "owner": "fmb-qwen35-moe-text",
+      "precision": "w8a16",
+      "reason_code": "UNIFIED_CONTROL_AUTHORITY",
+      "state": "MIGRATED",
+      "support": {
+        "evidence": [
+          {
+            "kind": "support_contract",
+            "path": "python/rpu_backend/adapters/qwen3_5_moe/quant_scope.py",
+            "symbol": "def validate_int8_config("
+          }
+        ],
+        "reason_code": "QWEN35_MOE_INT8_BOARD_RUN_PENDING",
+        "status": "IMPLEMENTED_UNVERIFIED_HW"
+      },
+      "variant": "rtn-w8a16"
+    },
+    {
+      "asset_alias": "qwen3_5-35b-a3b-rtn-w8a16",
+      "authority": "composite-qwen35-moe",
+      "component": "multimodal",
+      "controlled_gates": [],
+      "evidence": [
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/adapters/qwen3_5_moe/__init__.py",
+          "symbol": "class Qwen3_5MoeAdapter"
+        },
+        {
+          "kind": "admission_contract",
+          "path": "python/rpu_backend/adapters/qwen3_5_moe/quant_scope.py",
+          "symbol": "INT8_PROFILE_ID"
+        },
+        {
+          "kind": "contract_test",
+          "path": "tests/test_qwen35_moe_int8.py",
+          "symbol": "def test_int8_public_profiles_bind_exact_recipe_and_cores("
+        }
+      ],
+      "example": {
+        "eligible": true,
+        "reason_code": "CONTROLLED_PUBLIC_EXAMPLE",
+        "runner_target": "qwen3_5_vision"
+      },
+      "family": "qwen3-5-moe",
+      "hw_status": "IMPLEMENTED_UNVERIFIED_HW",
+      "id": "qwen3_5-35b-a3b.rtn-w8a16.multimodal",
+      "input_envelope": {
+        "evidence": [
+          {
+            "kind": "admission_contract",
+            "path": "python/rpu_backend/adapters/qwen3_5_moe/quant_scope.py",
+            "symbol": "INT8_PROFILE_ID"
+          },
+          {
+            "kind": "contract_test",
+            "path": "tests/test_qwen35_moe_int8.py",
+            "symbol": "def test_int8_public_profiles_bind_exact_recipe_and_cores("
+          }
+        ],
+        "kind": "BOUNDED",
+        "limits": {
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ],
+          "batch_size": 1,
+          "checkpoint_profile": "qwen3_5_moe_35b_a3b_tp8_routed_rtn_w8a16",
+          "chunk_alignment": 64,
+          "component_paths": [
+            "language_model",
+            "vision_encoder"
+          ],
+          "experts_per_token": 8,
+          "formal_certification": false,
+          "max_chunk_size": 512,
+          "moe_resident_prefill": false,
+          "num_experts": 256,
+          "quantization": "routed experts only: symmetric per-output-channel INT8 (grouped mode 1, FP16 scales); FP16 mixers/router/shared/embed/head/vision; images only, video unsupported",
+          "routed_intermediate_size": 512,
+          "shared_expert_intermediate_size": 512,
+          "text_effective_kv_heads_by_num_cores": {
+            "4": 4,
+            "6": 4,
+            "8": 8
+          },
+          "text_head_dim": 256,
+          "text_hidden_size": 2048,
+          "text_linear_acc32": false,
+          "text_num_attention_heads": 16,
+          "text_num_hidden_layers": 40,
+          "video_supported": false,
+          "vision_depth": 27,
+          "vision_hidden_size": 1152,
+          "vision_intermediate_size": 4304,
+          "vision_num_attention_heads": 16,
+          "vision_out_hidden_size": 2048,
+          "vision_padding_rows": 0,
+          "kv_capacity": "requested-at-install; allocation must succeed"
+        },
+        "reason_code": "QWEN35_MOE_ROUTED_INT8_MULTIMODAL_TP8_ENVELOPE"
+      },
+      "owner": "composite-qwen35-moe",
+      "precision": "w8a16",
+      "reason_code": "UNIFIED_CONTROL_AUTHORITY",
+      "state": "MIGRATED",
+      "support": {
+        "evidence": [
+          {
+            "kind": "support_contract",
+            "path": "python/rpu_backend/adapters/qwen3_5_moe/quant_scope.py",
+            "symbol": "def validate_int8_config("
+          }
+        ],
+        "reason_code": "QWEN35_MOE_INT8_BOARD_RUN_PENDING",
+        "status": "IMPLEMENTED_UNVERIFIED_HW"
+      },
+      "variant": "rtn-w8a16"
+    },
+    {
       "asset_alias": "qwen3_5-35b-a3b-gptq-w4a16",
       "authority": "composite-qwen35-moe",
       "component": "multimodal",
@@ -9033,6 +10271,150 @@
       "variant": "runtime-align-v1"
     },
     {
+      "asset_alias": "qwen3-vl-2b-runtime-w4a16",
+      "authority": "composite-qwen3-vl",
+      "component": "multimodal",
+      "controlled_gates": [
+        {
+          "evidence": [
+            {
+              "kind": "controlled_gate",
+              "path": "python/rpu_backend/quant/load_qwen3_vl_runtime.py",
+              "symbol": "def is_qwen3_vl_runtime_quant_config("
+            }
+          ],
+          "kind": "preflight",
+          "name": "checkpoint_quant_profile",
+          "value": "qwen3_vl_2b_w4a16_awq_runtime_align_v1"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/quant/load_qwen3_vl_runtime.py",
+          "symbol": "def is_qwen3_vl_runtime_quant_config("
+        },
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/adapters/qwen3_vl/__init__.py",
+          "symbol": "class Qwen3VLAdapter"
+        },
+        {
+          "kind": "contract_test",
+          "path": "tests/test_qwen3_vl_runtime_catalog.py",
+          "symbol": "def test_runtime_catalog_metadata_matches_loader_and_declared_scope("
+        },
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/adapters/qwen3_vl/vision.py",
+          "symbol": "def _is_qwen3_vl_w4_vision_tower("
+        }
+      ],
+      "example": {
+        "eligible": true,
+        "reason_code": "PUBLIC_PROFILE_EXAMPLE",
+        "runner_target": "qwen3_vl"
+      },
+      "family": "qwen3-vl",
+      "hw_status": "IMPLEMENTED_UNVERIFIED_HW",
+      "id": "qwen3-vl-2b-runtime-w4a16.w4a16-vision-g32.multimodal",
+      "input_envelope": {
+        "evidence": [
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/qwen3_vl/__init__.py",
+            "symbol": "def _qwen3_vl_prefill_plan("
+          },
+          {
+            "kind": "contract_test",
+            "path": "tests/test_qwen3_vl_runtime_catalog.py",
+            "symbol": "def test_runtime_catalog_metadata_matches_loader_and_declared_scope("
+          }
+        ],
+        "kind": "EXACT",
+        "limits": {
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ],
+          "batch_size": 1,
+          "cases": [
+            {
+              "case_count": 4,
+              "images": 1,
+              "logical_prefill_rows": [
+                430,
+                1326
+              ],
+              "name": "single-image",
+              "output_tokens": [
+                32,
+                64
+              ],
+              "prompt_body_tokens": [
+                128,
+                1024
+              ]
+            },
+            {
+              "case_count": 4,
+              "images": 8,
+              "logical_prefill_rows": [
+                2544,
+                3440
+              ],
+              "name": "eight-repeated-images",
+              "output_tokens": [
+                32,
+                64
+              ],
+              "prompt_body_tokens": [
+                128,
+                1024
+              ]
+            }
+          ],
+          "checkpoint_quant_profile": "qwen3_vl_2b_w4a16_awq_runtime_align_v1",
+          "image_content": "same mascot repeated; no different-content or video coverage",
+          "image_grid_thw": [
+            1,
+            30,
+            40
+          ],
+          "image_size_wh": [
+            640,
+            480
+          ],
+          "quantization": {
+            "embedding_norm_activation": "FP16",
+            "group_size": 32,
+            "lm_head": "symmetric RTN W4/G32",
+            "text_seven_projections": "preserved AWQ signed W4/G32",
+            "vision": "blocks q/k/v/o/fc1/fc2 symmetric RTN W4/G32 on install; patch embedding and mergers W8 per-channel; FP16 checkpoint source"
+          },
+          "vision_on_install_quantization": "w4a16"
+        },
+        "reason_code": "QWEN3_VL_2B_RUNTIME_W4_DECLARED_GEOMETRY"
+      },
+      "owner": "composite-qwen3-vl",
+      "precision": "w4a16",
+      "reason_code": "UNIFIED_CONTROL_AUTHORITY",
+      "state": "MIGRATED",
+      "support": {
+        "evidence": [
+          {
+            "kind": "support_contract",
+            "path": "tests/test_qwen3_vl_vision_w4.py",
+            "symbol": "def test_vision_w4_profiles_bind_recipe_and_cores("
+          }
+        ],
+        "reason_code": "QWEN3_VL_VISION_W4_BOARD_RUN_PENDING",
+        "status": "IMPLEMENTED_UNVERIFIED_HW"
+      },
+      "variant": "runtime-align-v1-vision-w4"
+    },
+    {
       "asset_alias": "qwen3-vl-4b-runtime-w8a16",
       "authority": "fmb-causal-decoder",
       "component": "text",
@@ -9525,6 +10907,150 @@
         "status": "SUPPORTED"
       },
       "variant": "runtime-align-v1"
+    },
+    {
+      "asset_alias": "qwen3-vl-4b-runtime-w4a16",
+      "authority": "composite-qwen3-vl",
+      "component": "multimodal",
+      "controlled_gates": [
+        {
+          "evidence": [
+            {
+              "kind": "controlled_gate",
+              "path": "python/rpu_backend/quant/load_qwen3_vl_runtime.py",
+              "symbol": "def is_qwen3_vl_runtime_quant_config("
+            }
+          ],
+          "kind": "preflight",
+          "name": "checkpoint_quant_profile",
+          "value": "qwen3_vl_4b_w4a16_awq_runtime_align_v1"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/quant/load_qwen3_vl_runtime.py",
+          "symbol": "def is_qwen3_vl_runtime_quant_config("
+        },
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/adapters/qwen3_vl/__init__.py",
+          "symbol": "class Qwen3VLAdapter"
+        },
+        {
+          "kind": "contract_test",
+          "path": "tests/test_qwen3_vl_runtime_catalog.py",
+          "symbol": "def test_runtime_catalog_metadata_matches_loader_and_declared_scope("
+        },
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/adapters/qwen3_vl/vision.py",
+          "symbol": "def _is_qwen3_vl_w4_vision_tower("
+        }
+      ],
+      "example": {
+        "eligible": true,
+        "reason_code": "PUBLIC_PROFILE_EXAMPLE",
+        "runner_target": "qwen3_vl"
+      },
+      "family": "qwen3-vl",
+      "hw_status": "IMPLEMENTED_UNVERIFIED_HW",
+      "id": "qwen3-vl-4b-runtime-w4a16.w4a16-vision-g32.multimodal",
+      "input_envelope": {
+        "evidence": [
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/qwen3_vl/__init__.py",
+            "symbol": "def _qwen3_vl_prefill_plan("
+          },
+          {
+            "kind": "contract_test",
+            "path": "tests/test_qwen3_vl_runtime_catalog.py",
+            "symbol": "def test_runtime_catalog_metadata_matches_loader_and_declared_scope("
+          }
+        ],
+        "kind": "EXACT",
+        "limits": {
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ],
+          "batch_size": 1,
+          "cases": [
+            {
+              "case_count": 4,
+              "images": 1,
+              "logical_prefill_rows": [
+                430,
+                1326
+              ],
+              "name": "single-image",
+              "output_tokens": [
+                32,
+                64
+              ],
+              "prompt_body_tokens": [
+                128,
+                1024
+              ]
+            },
+            {
+              "case_count": 4,
+              "images": 8,
+              "logical_prefill_rows": [
+                2544,
+                3440
+              ],
+              "name": "eight-repeated-images",
+              "output_tokens": [
+                32,
+                64
+              ],
+              "prompt_body_tokens": [
+                128,
+                1024
+              ]
+            }
+          ],
+          "checkpoint_quant_profile": "qwen3_vl_4b_w4a16_awq_runtime_align_v1",
+          "image_content": "same mascot repeated; no different-content or video coverage",
+          "image_grid_thw": [
+            1,
+            30,
+            40
+          ],
+          "image_size_wh": [
+            640,
+            480
+          ],
+          "quantization": {
+            "embedding_norm_activation": "FP16",
+            "group_size": 32,
+            "lm_head": "symmetric RTN W4/G32",
+            "text_seven_projections": "preserved AWQ signed W4/G32",
+            "vision": "blocks q/k/v/o/fc1/fc2 symmetric RTN W4/G32 on install; patch embedding and mergers W8 per-channel; FP16 checkpoint source"
+          },
+          "vision_on_install_quantization": "w4a16"
+        },
+        "reason_code": "QWEN3_VL_4B_RUNTIME_W4_DECLARED_GEOMETRY"
+      },
+      "owner": "composite-qwen3-vl",
+      "precision": "w4a16",
+      "reason_code": "UNIFIED_CONTROL_AUTHORITY",
+      "state": "MIGRATED",
+      "support": {
+        "evidence": [
+          {
+            "kind": "support_contract",
+            "path": "tests/test_qwen3_vl_vision_w4.py",
+            "symbol": "def test_vision_w4_profiles_bind_recipe_and_cores("
+          }
+        ],
+        "reason_code": "QWEN3_VL_VISION_W4_BOARD_RUN_PENDING",
+        "status": "IMPLEMENTED_UNVERIFIED_HW"
+      },
+      "variant": "runtime-align-v1-vision-w4"
     },
     {
       "asset_alias": "qwen3-vl-8b-runtime-w8a16",
@@ -10021,6 +11547,150 @@
       "variant": "runtime-align-v1"
     },
     {
+      "asset_alias": "qwen3-vl-8b-runtime-w4a16",
+      "authority": "composite-qwen3-vl",
+      "component": "multimodal",
+      "controlled_gates": [
+        {
+          "evidence": [
+            {
+              "kind": "controlled_gate",
+              "path": "python/rpu_backend/quant/load_qwen3_vl_runtime.py",
+              "symbol": "def is_qwen3_vl_runtime_quant_config("
+            }
+          ],
+          "kind": "preflight",
+          "name": "checkpoint_quant_profile",
+          "value": "qwen3_vl_8b_w4a16_awq_runtime_align_v1"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/quant/load_qwen3_vl_runtime.py",
+          "symbol": "def is_qwen3_vl_runtime_quant_config("
+        },
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/adapters/qwen3_vl/__init__.py",
+          "symbol": "class Qwen3VLAdapter"
+        },
+        {
+          "kind": "contract_test",
+          "path": "tests/test_qwen3_vl_runtime_catalog.py",
+          "symbol": "def test_runtime_catalog_metadata_matches_loader_and_declared_scope("
+        },
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/adapters/qwen3_vl/vision.py",
+          "symbol": "def _is_qwen3_vl_8b_vision_config("
+        }
+      ],
+      "example": {
+        "eligible": true,
+        "reason_code": "PUBLIC_PROFILE_EXAMPLE",
+        "runner_target": "qwen3_vl"
+      },
+      "family": "qwen3-vl",
+      "hw_status": "IMPLEMENTED_UNVERIFIED_HW",
+      "id": "qwen3-vl-8b-runtime-w4a16.w4a16-vision-g32.multimodal",
+      "input_envelope": {
+        "evidence": [
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/qwen3_vl/__init__.py",
+            "symbol": "def _qwen3_vl_prefill_plan("
+          },
+          {
+            "kind": "contract_test",
+            "path": "tests/test_qwen3_vl_runtime_catalog.py",
+            "symbol": "def test_runtime_catalog_metadata_matches_loader_and_declared_scope("
+          }
+        ],
+        "kind": "EXACT",
+        "limits": {
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ],
+          "batch_size": 1,
+          "cases": [
+            {
+              "case_count": 4,
+              "images": 1,
+              "logical_prefill_rows": [
+                430,
+                1326
+              ],
+              "name": "single-image",
+              "output_tokens": [
+                32,
+                64
+              ],
+              "prompt_body_tokens": [
+                128,
+                1024
+              ]
+            },
+            {
+              "case_count": 4,
+              "images": 8,
+              "logical_prefill_rows": [
+                2544,
+                3440
+              ],
+              "name": "eight-repeated-images",
+              "output_tokens": [
+                32,
+                64
+              ],
+              "prompt_body_tokens": [
+                128,
+                1024
+              ]
+            }
+          ],
+          "checkpoint_quant_profile": "qwen3_vl_8b_w4a16_awq_runtime_align_v1",
+          "image_content": "same mascot repeated; no different-content or video coverage",
+          "image_grid_thw": [
+            1,
+            30,
+            40
+          ],
+          "image_size_wh": [
+            640,
+            480
+          ],
+          "quantization": {
+            "embedding_norm_activation": "FP16",
+            "group_size": 32,
+            "lm_head": "symmetric RTN W4/G32",
+            "text_seven_projections": "preserved AWQ signed W4/G32",
+            "vision": "blocks q/k/v/o/fc1/fc2 symmetric RTN W4/G32 on install; patch embedding and mergers W8 per-channel; FP16 checkpoint source; padded tower (head 72->80, MLP 4304->4352); Vision runs on 4 cores at every budget because the padded o/fc2 rows do not split into eight 64-aligned pgrp lanes"
+          },
+          "vision_on_install_quantization": "w4a16"
+        },
+        "reason_code": "QWEN3_VL_8B_RUNTIME_W4_DECLARED_GEOMETRY"
+      },
+      "owner": "composite-qwen3-vl",
+      "precision": "w4a16",
+      "reason_code": "UNIFIED_CONTROL_AUTHORITY",
+      "state": "MIGRATED",
+      "support": {
+        "evidence": [
+          {
+            "kind": "support_contract",
+            "path": "tests/test_qwen3_vl_vision_w4.py",
+            "symbol": "def test_vision_w4_profiles_bind_recipe_and_cores("
+          }
+        ],
+        "reason_code": "QWEN3_VL_VISION_W4_BOARD_RUN_PENDING",
+        "status": "IMPLEMENTED_UNVERIFIED_HW"
+      },
+      "variant": "runtime-align-v1-vision-w4"
+    },
+    {
       "asset_alias": "qwen3-vl-32b-runtime-w8a16",
       "authority": "fmb-causal-decoder",
       "component": "text",
@@ -10513,6 +12183,150 @@
         "status": "SUPPORTED"
       },
       "variant": "runtime-align-v1"
+    },
+    {
+      "asset_alias": "qwen3-vl-32b-runtime-w4a16",
+      "authority": "composite-qwen3-vl",
+      "component": "multimodal",
+      "controlled_gates": [
+        {
+          "evidence": [
+            {
+              "kind": "controlled_gate",
+              "path": "python/rpu_backend/quant/load_qwen3_vl_runtime.py",
+              "symbol": "def is_qwen3_vl_runtime_quant_config("
+            }
+          ],
+          "kind": "preflight",
+          "name": "checkpoint_quant_profile",
+          "value": "qwen3_vl_32b_w4a16_runtime_align_v1"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/quant/load_qwen3_vl_runtime.py",
+          "symbol": "def is_qwen3_vl_runtime_quant_config("
+        },
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/adapters/qwen3_vl/__init__.py",
+          "symbol": "class Qwen3VLAdapter"
+        },
+        {
+          "kind": "contract_test",
+          "path": "tests/test_qwen3_vl_runtime_catalog.py",
+          "symbol": "def test_runtime_catalog_metadata_matches_loader_and_declared_scope("
+        },
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/adapters/qwen3_vl/vision.py",
+          "symbol": "def _is_qwen3_vl_32b_vision_config("
+        }
+      ],
+      "example": {
+        "eligible": true,
+        "reason_code": "PUBLIC_PROFILE_EXAMPLE",
+        "runner_target": "qwen3_vl"
+      },
+      "family": "qwen3-vl",
+      "hw_status": "IMPLEMENTED_UNVERIFIED_HW",
+      "id": "qwen3-vl-32b-runtime-w4a16.w4a16-vision-g32.multimodal",
+      "input_envelope": {
+        "evidence": [
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/qwen3_vl/__init__.py",
+            "symbol": "def _qwen3_vl_prefill_plan("
+          },
+          {
+            "kind": "contract_test",
+            "path": "tests/test_qwen3_vl_runtime_catalog.py",
+            "symbol": "def test_runtime_catalog_metadata_matches_loader_and_declared_scope("
+          }
+        ],
+        "kind": "EXACT",
+        "limits": {
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ],
+          "batch_size": 1,
+          "cases": [
+            {
+              "case_count": 4,
+              "images": 1,
+              "logical_prefill_rows": [
+                430,
+                1326
+              ],
+              "name": "single-image",
+              "output_tokens": [
+                32,
+                64
+              ],
+              "prompt_body_tokens": [
+                128,
+                1024
+              ]
+            },
+            {
+              "case_count": 4,
+              "images": 8,
+              "logical_prefill_rows": [
+                2544,
+                3440
+              ],
+              "name": "eight-repeated-images",
+              "output_tokens": [
+                32,
+                64
+              ],
+              "prompt_body_tokens": [
+                128,
+                1024
+              ]
+            }
+          ],
+          "checkpoint_quant_profile": "qwen3_vl_32b_w4a16_runtime_align_v1",
+          "image_content": "same mascot repeated; no different-content or video coverage",
+          "image_grid_thw": [
+            1,
+            30,
+            40
+          ],
+          "image_size_wh": [
+            640,
+            480
+          ],
+          "quantization": {
+            "embedding_norm_activation": "FP16",
+            "group_size": 32,
+            "lm_head": "symmetric RTN W4/G32",
+            "text_seven_projections": "symmetric RTN W4/G32",
+            "vision": "blocks q/k/v/o/fc1/fc2 symmetric RTN W4/G32 on install; patch embedding and mergers W8 per-channel; FP16 checkpoint source; padded tower (head 72->80, MLP 4304->4352); Vision runs on 4 cores at every budget because the padded o/fc2 rows do not split into eight 64-aligned pgrp lanes"
+          },
+          "vision_on_install_quantization": "w4a16"
+        },
+        "reason_code": "QWEN3_VL_32B_RUNTIME_W4_DECLARED_GEOMETRY"
+      },
+      "owner": "composite-qwen3-vl",
+      "precision": "w4a16",
+      "reason_code": "UNIFIED_CONTROL_AUTHORITY",
+      "state": "MIGRATED",
+      "support": {
+        "evidence": [
+          {
+            "kind": "support_contract",
+            "path": "tests/test_qwen3_vl_vision_w4.py",
+            "symbol": "def test_vision_w4_profiles_bind_recipe_and_cores("
+          }
+        ],
+        "reason_code": "QWEN3_VL_VISION_W4_BOARD_RUN_PENDING",
+        "status": "IMPLEMENTED_UNVERIFIED_HW"
+      },
+      "variant": "runtime-align-v1-vision-w4"
     },
     {
       "asset_alias": "qwen3-0.6b",
@@ -11277,6 +13091,570 @@
         "status": "SUPPORTED"
       },
       "variant": "text-awq-g32-fp16-head-vision"
+    },
+    {
+      "asset_alias": "qwen3-vl-2b",
+      "authority": "fmb-causal-decoder",
+      "component": "text",
+      "controlled_gates": [
+        {
+          "evidence": [
+            {
+              "kind": "controlled_gate",
+              "path": "python/rpu_backend/adapters/qwen3_vl/__init__.py",
+              "symbol": "def preflight_quantization("
+            }
+          ],
+          "kind": "preflight",
+          "name": "qwen3_vl_dense_nvfp4",
+          "value": "nvfp4"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/quant/convert_qwen3_nvfp4.py",
+          "symbol": "def convert_qwen3_to_nvfp4_("
+        },
+        {
+          "kind": "contract_test",
+          "path": "tests/test_qwen3_vl_text_nvfp4.py",
+          "symbol": "def test_vl_nvfp4_profiles_bind_exact_recipe_geometry_and_cores("
+        }
+      ],
+      "example": {
+        "eligible": true,
+        "reason_code": "PUBLIC_PROFILE_EXAMPLE",
+        "runner_target": "qwen3_vl"
+      },
+      "family": "qwen3-vl",
+      "hw_status": "IMPLEMENTED_UNVERIFIED_HW",
+      "id": "qwen3-vl-2b.nvfp4.text",
+      "input_envelope": {
+        "evidence": [
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/qwen3_vl/__init__.py",
+            "symbol": "def preflight_quantization("
+          },
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/runtime/decoder.py",
+            "symbol": "def _validate_nvfp4_payload("
+          }
+        ],
+        "kind": "EXACT",
+        "limits": {
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ],
+          "batch_size": 1,
+          "example_geometry": {
+            "batch_size": 1,
+            "decode_calls": 31,
+            "logical_prefill_rows": 512,
+            "new_hardware_validation": false
+          },
+          "formal_certification": false,
+          "hardware_validation": "PENDING_PROFILE_VALIDATION",
+          "head_dim": 128,
+          "hidden_size": 2048,
+          "intermediate_size": 6144,
+          "num_attention_heads": 16,
+          "num_hidden_layers": 28,
+          "num_key_value_heads": 8,
+          "on_install_quantization": "nvfp4",
+          "quantization": {
+            "activation": "FP16",
+            "embedding": "FP16",
+            "lm_head": "FP16",
+            "norms": "FP16",
+            "source": "dense FP16 checkpoint",
+            "text_seven_projections": "NVFP4 on install: E2M1 weight, E4M3 scale per 16 K values, one FP32 tensor scale per projection and layer",
+            "vision": "FP16"
+          },
+          "vocab_size": 151936
+        },
+        "reason_code": "QWEN3_VL_DENSE_NVFP4_EXACT_GEOMETRY"
+      },
+      "owner": "fmb-causal-decoder",
+      "precision": "nvfp4",
+      "reason_code": "UNIFIED_CONTROL_AUTHORITY",
+      "state": "MIGRATED",
+      "support": {
+        "evidence": [
+          {
+            "kind": "support_contract",
+            "path": "python/rpu_backend/quant/convert_qwen3_nvfp4.py",
+            "symbol": "def convert_qwen3_to_nvfp4_("
+          }
+        ],
+        "reason_code": "QWEN3_VL_TEXT_NVFP4_BOARD_RUN_PENDING",
+        "status": "IMPLEMENTED_UNVERIFIED_HW"
+      },
+      "variant": "nvfp4"
+    },
+    {
+      "asset_alias": "qwen3-vl-4b",
+      "authority": "fmb-causal-decoder",
+      "component": "text",
+      "controlled_gates": [
+        {
+          "evidence": [
+            {
+              "kind": "controlled_gate",
+              "path": "python/rpu_backend/adapters/qwen3_vl/__init__.py",
+              "symbol": "def preflight_quantization("
+            }
+          ],
+          "kind": "preflight",
+          "name": "qwen3_vl_dense_nvfp4",
+          "value": "nvfp4"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/quant/convert_qwen3_nvfp4.py",
+          "symbol": "def convert_qwen3_to_nvfp4_("
+        },
+        {
+          "kind": "contract_test",
+          "path": "tests/test_qwen3_vl_text_nvfp4.py",
+          "symbol": "def test_vl_nvfp4_profiles_bind_exact_recipe_geometry_and_cores("
+        }
+      ],
+      "example": {
+        "eligible": true,
+        "reason_code": "PUBLIC_PROFILE_EXAMPLE",
+        "runner_target": "qwen3_vl"
+      },
+      "family": "qwen3-vl",
+      "hw_status": "IMPLEMENTED_UNVERIFIED_HW",
+      "id": "qwen3-vl-4b.nvfp4.text",
+      "input_envelope": {
+        "evidence": [
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/qwen3_vl/__init__.py",
+            "symbol": "def preflight_quantization("
+          },
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/runtime/decoder.py",
+            "symbol": "def _validate_nvfp4_payload("
+          }
+        ],
+        "kind": "EXACT",
+        "limits": {
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ],
+          "batch_size": 1,
+          "example_geometry": {
+            "batch_size": 1,
+            "decode_calls": 31,
+            "logical_prefill_rows": 512,
+            "new_hardware_validation": false
+          },
+          "formal_certification": false,
+          "hardware_validation": "PENDING_PROFILE_VALIDATION",
+          "head_dim": 128,
+          "hidden_size": 2560,
+          "intermediate_size": 9728,
+          "num_attention_heads": 32,
+          "num_hidden_layers": 36,
+          "num_key_value_heads": 8,
+          "on_install_quantization": "nvfp4",
+          "quantization": {
+            "activation": "FP16",
+            "embedding": "FP16",
+            "lm_head": "FP16",
+            "norms": "FP16",
+            "source": "dense FP16 checkpoint",
+            "text_seven_projections": "NVFP4 on install: E2M1 weight, E4M3 scale per 16 K values, one FP32 tensor scale per projection and layer",
+            "vision": "FP16"
+          },
+          "vocab_size": 151936
+        },
+        "reason_code": "QWEN3_VL_DENSE_NVFP4_EXACT_GEOMETRY"
+      },
+      "owner": "fmb-causal-decoder",
+      "precision": "nvfp4",
+      "reason_code": "UNIFIED_CONTROL_AUTHORITY",
+      "state": "MIGRATED",
+      "support": {
+        "evidence": [
+          {
+            "kind": "support_contract",
+            "path": "python/rpu_backend/quant/convert_qwen3_nvfp4.py",
+            "symbol": "def convert_qwen3_to_nvfp4_("
+          }
+        ],
+        "reason_code": "QWEN3_VL_TEXT_NVFP4_BOARD_RUN_PENDING",
+        "status": "IMPLEMENTED_UNVERIFIED_HW"
+      },
+      "variant": "nvfp4"
+    },
+    {
+      "asset_alias": "qwen3-vl-2b",
+      "authority": "composite-qwen3-vl",
+      "component": "multimodal",
+      "controlled_gates": [
+        {
+          "evidence": [
+            {
+              "kind": "controlled_gate",
+              "path": "python/rpu_backend/adapters/qwen3_vl/__init__.py",
+              "symbol": "def preflight_quantization("
+            }
+          ],
+          "kind": "preflight",
+          "name": "qwen3_vl_dense_nvfp4",
+          "value": "nvfp4"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/quant/convert_qwen3_nvfp4.py",
+          "symbol": "def convert_qwen3_to_nvfp4_("
+        },
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/adapters/qwen3_vl/__init__.py",
+          "symbol": "class Qwen3VLAdapter"
+        },
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/adapters/qwen3_vl/vision.py",
+          "symbol": "def _is_qwen3_vl_w4_vision_tower("
+        },
+        {
+          "kind": "contract_test",
+          "path": "tests/test_qwen3_vl_vision_nvfp4.py",
+          "symbol": "def test_vision_nvfp4_profiles_bind_recipe_and_cores("
+        }
+      ],
+      "example": {
+        "eligible": true,
+        "reason_code": "PUBLIC_PROFILE_EXAMPLE",
+        "runner_target": "qwen3_vl"
+      },
+      "family": "qwen3-vl",
+      "hw_status": "IMPLEMENTED_UNVERIFIED_HW",
+      "id": "qwen3-vl-2b.nvfp4-vision.multimodal",
+      "input_envelope": {
+        "evidence": [
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/qwen3_vl/__init__.py",
+            "symbol": "def preflight_quantization("
+          },
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/qwen3_vl/vision.py",
+            "symbol": "def _is_qwen3_vl_w4_vision_tower("
+          }
+        ],
+        "kind": "EXACT",
+        "limits": {
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ],
+          "batch_size": 1,
+          "example_geometry": {
+            "batch_size": 1,
+            "decode_calls": 31,
+            "images": 1,
+            "logical_prefill_rows": 430,
+            "new_hardware_validation": false
+          },
+          "formal_certification": false,
+          "hardware_validation": "PENDING_PROFILE_VALIDATION",
+          "head_dim": 128,
+          "hidden_size": 2048,
+          "image_content": "one image; no multi-image, different-content or video coverage",
+          "image_grid_thw": [
+            1,
+            30,
+            40
+          ],
+          "image_size_wh": [
+            640,
+            480
+          ],
+          "intermediate_size": 6144,
+          "num_attention_heads": 16,
+          "num_hidden_layers": 28,
+          "num_key_value_heads": 8,
+          "on_install_quantization": "nvfp4",
+          "quantization": {
+            "activation": "FP16",
+            "embedding": "FP16",
+            "lm_head": "FP16",
+            "norms": "FP16",
+            "source": "dense FP16 checkpoint",
+            "text_seven_projections": "NVFP4 on install: E2M1 weight, E4M3 scale per 16 K values, one FP32 tensor scale per projection and layer",
+            "vision": "blocks q/k/v/o/fc1/fc2 NVFP4 on install: E2M1 weight, E4M3 scale per 16 K values, one FP32 tensor scale per projection and layer; patch embedding and mergers FP16"
+          },
+          "vision_on_install_quantization": "nvfp4",
+          "vocab_size": 151936
+        },
+        "reason_code": "QWEN3_VL_DENSE_NVFP4_VISION_EXACT_GEOMETRY"
+      },
+      "owner": "composite-qwen3-vl",
+      "precision": "nvfp4",
+      "reason_code": "UNIFIED_CONTROL_AUTHORITY",
+      "state": "MIGRATED",
+      "support": {
+        "evidence": [
+          {
+            "kind": "support_contract",
+            "path": "tests/test_qwen3_vl_vision_nvfp4.py",
+            "symbol": "def test_vision_nvfp4_profiles_bind_recipe_and_cores("
+          }
+        ],
+        "reason_code": "QWEN3_VL_VISION_NVFP4_BOARD_RUN_PENDING",
+        "status": "IMPLEMENTED_UNVERIFIED_HW"
+      },
+      "variant": "nvfp4-vision"
+    },
+    {
+      "asset_alias": "qwen3-vl-4b",
+      "authority": "composite-qwen3-vl",
+      "component": "multimodal",
+      "controlled_gates": [
+        {
+          "evidence": [
+            {
+              "kind": "controlled_gate",
+              "path": "python/rpu_backend/adapters/qwen3_vl/__init__.py",
+              "symbol": "def preflight_quantization("
+            }
+          ],
+          "kind": "preflight",
+          "name": "qwen3_vl_dense_nvfp4",
+          "value": "nvfp4"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/quant/convert_qwen3_nvfp4.py",
+          "symbol": "def convert_qwen3_to_nvfp4_("
+        },
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/adapters/qwen3_vl/__init__.py",
+          "symbol": "class Qwen3VLAdapter"
+        },
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/adapters/qwen3_vl/vision.py",
+          "symbol": "def _is_qwen3_vl_w4_vision_tower("
+        },
+        {
+          "kind": "contract_test",
+          "path": "tests/test_qwen3_vl_vision_nvfp4.py",
+          "symbol": "def test_vision_nvfp4_profiles_bind_recipe_and_cores("
+        }
+      ],
+      "example": {
+        "eligible": true,
+        "reason_code": "PUBLIC_PROFILE_EXAMPLE",
+        "runner_target": "qwen3_vl"
+      },
+      "family": "qwen3-vl",
+      "hw_status": "IMPLEMENTED_UNVERIFIED_HW",
+      "id": "qwen3-vl-4b.nvfp4-vision.multimodal",
+      "input_envelope": {
+        "evidence": [
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/qwen3_vl/__init__.py",
+            "symbol": "def preflight_quantization("
+          },
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/qwen3_vl/vision.py",
+            "symbol": "def _is_qwen3_vl_w4_vision_tower("
+          }
+        ],
+        "kind": "EXACT",
+        "limits": {
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ],
+          "batch_size": 1,
+          "example_geometry": {
+            "batch_size": 1,
+            "decode_calls": 31,
+            "images": 1,
+            "logical_prefill_rows": 430,
+            "new_hardware_validation": false
+          },
+          "formal_certification": false,
+          "hardware_validation": "PENDING_PROFILE_VALIDATION",
+          "head_dim": 128,
+          "hidden_size": 2560,
+          "image_content": "one image; no multi-image, different-content or video coverage",
+          "image_grid_thw": [
+            1,
+            30,
+            40
+          ],
+          "image_size_wh": [
+            640,
+            480
+          ],
+          "intermediate_size": 9728,
+          "num_attention_heads": 32,
+          "num_hidden_layers": 36,
+          "num_key_value_heads": 8,
+          "on_install_quantization": "nvfp4",
+          "quantization": {
+            "activation": "FP16",
+            "embedding": "FP16",
+            "lm_head": "FP16",
+            "norms": "FP16",
+            "source": "dense FP16 checkpoint",
+            "text_seven_projections": "NVFP4 on install: E2M1 weight, E4M3 scale per 16 K values, one FP32 tensor scale per projection and layer",
+            "vision": "blocks q/k/v/o/fc1/fc2 NVFP4 on install: E2M1 weight, E4M3 scale per 16 K values, one FP32 tensor scale per projection and layer; patch embedding and mergers FP16"
+          },
+          "vision_on_install_quantization": "nvfp4",
+          "vocab_size": 151936
+        },
+        "reason_code": "QWEN3_VL_DENSE_NVFP4_VISION_EXACT_GEOMETRY"
+      },
+      "owner": "composite-qwen3-vl",
+      "precision": "nvfp4",
+      "reason_code": "UNIFIED_CONTROL_AUTHORITY",
+      "state": "MIGRATED",
+      "support": {
+        "evidence": [
+          {
+            "kind": "support_contract",
+            "path": "tests/test_qwen3_vl_vision_nvfp4.py",
+            "symbol": "def test_vision_nvfp4_profiles_bind_recipe_and_cores("
+          }
+        ],
+        "reason_code": "QWEN3_VL_VISION_NVFP4_BOARD_RUN_PENDING",
+        "status": "IMPLEMENTED_UNVERIFIED_HW"
+      },
+      "variant": "nvfp4-vision"
+    },
+    {
+      "asset_alias": "qwen3-vl-8b",
+      "authority": "fmb-causal-decoder",
+      "component": "text",
+      "controlled_gates": [
+        {
+          "evidence": [
+            {
+              "kind": "controlled_gate",
+              "path": "python/rpu_backend/adapters/qwen3_vl/__init__.py",
+              "symbol": "def preflight_quantization("
+            }
+          ],
+          "kind": "preflight",
+          "name": "qwen3_vl_dense_nvfp4",
+          "value": "nvfp4"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/quant/convert_qwen3_nvfp4.py",
+          "symbol": "def convert_qwen3_to_nvfp4_("
+        },
+        {
+          "kind": "contract_test",
+          "path": "tests/test_qwen3_vl_text_nvfp4.py",
+          "symbol": "def test_vl_nvfp4_profiles_bind_exact_recipe_geometry_and_cores("
+        }
+      ],
+      "example": {
+        "eligible": true,
+        "reason_code": "PUBLIC_PROFILE_EXAMPLE",
+        "runner_target": "qwen3_vl"
+      },
+      "family": "qwen3-vl",
+      "hw_status": "IMPLEMENTED_UNVERIFIED_HW",
+      "id": "qwen3-vl-8b.nvfp4.text",
+      "input_envelope": {
+        "evidence": [
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/qwen3_vl/__init__.py",
+            "symbol": "def preflight_quantization("
+          },
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/runtime/decoder.py",
+            "symbol": "def _validate_nvfp4_payload("
+          }
+        ],
+        "kind": "EXACT",
+        "limits": {
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ],
+          "batch_size": 1,
+          "example_geometry": {
+            "batch_size": 1,
+            "decode_calls": 31,
+            "logical_prefill_rows": 512,
+            "new_hardware_validation": false
+          },
+          "formal_certification": false,
+          "hardware_validation": "PENDING_PROFILE_VALIDATION",
+          "head_dim": 128,
+          "hidden_size": 4096,
+          "intermediate_size": 12288,
+          "num_attention_heads": 32,
+          "num_hidden_layers": 36,
+          "num_key_value_heads": 8,
+          "on_install_quantization": "nvfp4",
+          "quantization": {
+            "activation": "FP16",
+            "embedding": "FP16",
+            "lm_head": "FP16",
+            "norms": "FP16",
+            "source": "dense FP16 checkpoint",
+            "text_seven_projections": "NVFP4 on install: E2M1 weight, E4M3 scale per 16 K values, one FP32 tensor scale per projection and layer",
+            "vision": "FP16"
+          },
+          "vocab_size": 151936
+        },
+        "reason_code": "QWEN3_VL_DENSE_NVFP4_EXACT_GEOMETRY"
+      },
+      "owner": "fmb-causal-decoder",
+      "precision": "nvfp4",
+      "reason_code": "UNIFIED_CONTROL_AUTHORITY",
+      "state": "MIGRATED",
+      "support": {
+        "evidence": [
+          {
+            "kind": "support_contract",
+            "path": "python/rpu_backend/quant/convert_qwen3_nvfp4.py",
+            "symbol": "def convert_qwen3_to_nvfp4_("
+          }
+        ],
+        "reason_code": "QWEN3_VL_TEXT_NVFP4_BOARD_RUN_PENDING",
+        "status": "IMPLEMENTED_UNVERIFIED_HW"
+      },
+      "variant": "nvfp4"
     },
     {
       "asset_alias": "qwen3-0.6b",
@@ -12422,6 +14800,521 @@
         "status": "SUPPORTED"
       },
       "variant": "w4a16-g32-lm-head"
+    },
+    {
+      "asset_alias": "qwen3-0.6b",
+      "authority": "fmb-causal-decoder",
+      "component": "text",
+      "controlled_gates": [
+        {
+          "evidence": [
+            {
+              "kind": "controlled_gate",
+              "path": "python/rpu_backend/adapters/qwen3.py",
+              "symbol": "def preflight_quantization("
+            }
+          ],
+          "kind": "preflight",
+          "name": "qwen3_dense_nvfp4",
+          "value": "nvfp4"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/quant/convert_qwen3_nvfp4.py",
+          "symbol": "def convert_qwen3_to_nvfp4_("
+        },
+        {
+          "kind": "contract_test",
+          "path": "tests/test_qwen3_text_nvfp4.py",
+          "symbol": "def test_nvfp4_profiles_bind_exact_recipe_geometry_and_cores("
+        }
+      ],
+      "example": {
+        "eligible": true,
+        "reason_code": "PUBLIC_PROFILE_EXAMPLE",
+        "runner_target": "qwen3"
+      },
+      "family": "qwen3",
+      "hw_status": "IMPLEMENTED_UNVERIFIED_HW",
+      "id": "qwen3-0.6b.nvfp4.text",
+      "input_envelope": {
+        "evidence": [
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/qwen3.py",
+            "symbol": "def preflight_quantization("
+          },
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/runtime/decoder.py",
+            "symbol": "def _validate_nvfp4_payload("
+          }
+        ],
+        "kind": "EXACT",
+        "limits": {
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ],
+          "batch_size": 1,
+          "example_geometry": {
+            "batch_size": 1,
+            "decode_calls": 7,
+            "logical_prefill_rows": 128,
+            "new_hardware_validation": false
+          },
+          "formal_certification": false,
+          "hardware_validation": "PENDING_PROFILE_VALIDATION",
+          "head_dim": 128,
+          "hidden_size": 1024,
+          "intermediate_size": 3072,
+          "num_attention_heads": 16,
+          "num_hidden_layers": 28,
+          "num_key_value_heads": 8,
+          "on_install_quantization": "nvfp4",
+          "quantization": {
+            "activation": "FP16",
+            "embedding": "FP16",
+            "lm_head": "FP16",
+            "norms": "FP16",
+            "source": "dense FP16 checkpoint",
+            "text_seven_projections": "NVFP4 on install: E2M1 weight, E4M3 scale per 16 K values, one FP32 tensor scale per projection and layer"
+          },
+          "vocab_size": 151936
+        },
+        "reason_code": "QWEN3_DENSE_NVFP4_EXACT_GEOMETRY"
+      },
+      "owner": "fmb-causal-decoder",
+      "precision": "nvfp4",
+      "reason_code": "UNIFIED_CONTROL_AUTHORITY",
+      "state": "MIGRATED",
+      "support": {
+        "evidence": [
+          {
+            "kind": "hardware_measurement",
+            "path": "docs/model_performance/data/coverage_20261102_qwen3-nvfp4.json",
+            "symbol": "\"canonical_config\":\"qwen3/text/0_6b/nvfp4_text.toml\""
+          }
+        ],
+        "reason_code": "BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED",
+        "status": "SUPPORTED"
+      },
+      "variant": "nvfp4"
+    },
+    {
+      "asset_alias": "qwen3-1.7b",
+      "authority": "fmb-causal-decoder",
+      "component": "text",
+      "controlled_gates": [
+        {
+          "evidence": [
+            {
+              "kind": "controlled_gate",
+              "path": "python/rpu_backend/adapters/qwen3.py",
+              "symbol": "def preflight_quantization("
+            }
+          ],
+          "kind": "preflight",
+          "name": "qwen3_dense_nvfp4",
+          "value": "nvfp4"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/quant/convert_qwen3_nvfp4.py",
+          "symbol": "def convert_qwen3_to_nvfp4_("
+        },
+        {
+          "kind": "contract_test",
+          "path": "tests/test_qwen3_text_nvfp4.py",
+          "symbol": "def test_nvfp4_profiles_bind_exact_recipe_geometry_and_cores("
+        }
+      ],
+      "example": {
+        "eligible": true,
+        "reason_code": "PUBLIC_PROFILE_EXAMPLE",
+        "runner_target": "qwen3"
+      },
+      "family": "qwen3",
+      "hw_status": "IMPLEMENTED_UNVERIFIED_HW",
+      "id": "qwen3-1.7b.nvfp4.text",
+      "input_envelope": {
+        "evidence": [
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/qwen3.py",
+            "symbol": "def preflight_quantization("
+          },
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/runtime/decoder.py",
+            "symbol": "def _validate_nvfp4_payload("
+          }
+        ],
+        "kind": "EXACT",
+        "limits": {
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ],
+          "batch_size": 1,
+          "example_geometry": {
+            "batch_size": 1,
+            "decode_calls": 7,
+            "logical_prefill_rows": 128,
+            "new_hardware_validation": false
+          },
+          "formal_certification": false,
+          "hardware_validation": "PENDING_PROFILE_VALIDATION",
+          "head_dim": 128,
+          "hidden_size": 2048,
+          "intermediate_size": 6144,
+          "num_attention_heads": 16,
+          "num_hidden_layers": 28,
+          "num_key_value_heads": 8,
+          "on_install_quantization": "nvfp4",
+          "quantization": {
+            "activation": "FP16",
+            "embedding": "FP16",
+            "lm_head": "FP16",
+            "norms": "FP16",
+            "source": "dense FP16 checkpoint",
+            "text_seven_projections": "NVFP4 on install: E2M1 weight, E4M3 scale per 16 K values, one FP32 tensor scale per projection and layer"
+          },
+          "vocab_size": 151936
+        },
+        "reason_code": "QWEN3_DENSE_NVFP4_EXACT_GEOMETRY"
+      },
+      "owner": "fmb-causal-decoder",
+      "precision": "nvfp4",
+      "reason_code": "UNIFIED_CONTROL_AUTHORITY",
+      "state": "MIGRATED",
+      "support": {
+        "evidence": [
+          {
+            "kind": "support_contract",
+            "path": "python/rpu_backend/quant/convert_qwen3_nvfp4.py",
+            "symbol": "def convert_qwen3_to_nvfp4_("
+          }
+        ],
+        "reason_code": "QWEN3_TEXT_NVFP4_BOARD_RUN_PENDING",
+        "status": "IMPLEMENTED_UNVERIFIED_HW"
+      },
+      "variant": "nvfp4"
+    },
+    {
+      "asset_alias": "qwen3-4b",
+      "authority": "fmb-causal-decoder",
+      "component": "text",
+      "controlled_gates": [
+        {
+          "evidence": [
+            {
+              "kind": "controlled_gate",
+              "path": "python/rpu_backend/adapters/qwen3.py",
+              "symbol": "def preflight_quantization("
+            }
+          ],
+          "kind": "preflight",
+          "name": "qwen3_dense_nvfp4",
+          "value": "nvfp4"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/quant/convert_qwen3_nvfp4.py",
+          "symbol": "def convert_qwen3_to_nvfp4_("
+        },
+        {
+          "kind": "contract_test",
+          "path": "tests/test_qwen3_text_nvfp4.py",
+          "symbol": "def test_nvfp4_profiles_bind_exact_recipe_geometry_and_cores("
+        }
+      ],
+      "example": {
+        "eligible": true,
+        "reason_code": "PUBLIC_PROFILE_EXAMPLE",
+        "runner_target": "qwen3"
+      },
+      "family": "qwen3",
+      "hw_status": "IMPLEMENTED_UNVERIFIED_HW",
+      "id": "qwen3-4b.nvfp4.text",
+      "input_envelope": {
+        "evidence": [
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/qwen3.py",
+            "symbol": "def preflight_quantization("
+          },
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/runtime/decoder.py",
+            "symbol": "def _validate_nvfp4_payload("
+          }
+        ],
+        "kind": "EXACT",
+        "limits": {
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ],
+          "batch_size": 1,
+          "example_geometry": {
+            "batch_size": 1,
+            "decode_calls": 7,
+            "logical_prefill_rows": 128,
+            "new_hardware_validation": false
+          },
+          "formal_certification": false,
+          "hardware_validation": "PENDING_PROFILE_VALIDATION",
+          "head_dim": 128,
+          "hidden_size": 2560,
+          "intermediate_size": 9728,
+          "num_attention_heads": 32,
+          "num_hidden_layers": 36,
+          "num_key_value_heads": 8,
+          "on_install_quantization": "nvfp4",
+          "quantization": {
+            "activation": "FP16",
+            "embedding": "FP16",
+            "lm_head": "FP16",
+            "norms": "FP16",
+            "source": "dense FP16 checkpoint",
+            "text_seven_projections": "NVFP4 on install: E2M1 weight, E4M3 scale per 16 K values, one FP32 tensor scale per projection and layer"
+          },
+          "vocab_size": 151936
+        },
+        "reason_code": "QWEN3_DENSE_NVFP4_EXACT_GEOMETRY"
+      },
+      "owner": "fmb-causal-decoder",
+      "precision": "nvfp4",
+      "reason_code": "UNIFIED_CONTROL_AUTHORITY",
+      "state": "MIGRATED",
+      "support": {
+        "evidence": [
+          {
+            "kind": "support_contract",
+            "path": "python/rpu_backend/quant/convert_qwen3_nvfp4.py",
+            "symbol": "def convert_qwen3_to_nvfp4_("
+          }
+        ],
+        "reason_code": "QWEN3_TEXT_NVFP4_BOARD_RUN_PENDING",
+        "status": "IMPLEMENTED_UNVERIFIED_HW"
+      },
+      "variant": "nvfp4"
+    },
+    {
+      "asset_alias": "qwen3-8b",
+      "authority": "fmb-causal-decoder",
+      "component": "text",
+      "controlled_gates": [
+        {
+          "evidence": [
+            {
+              "kind": "controlled_gate",
+              "path": "python/rpu_backend/adapters/qwen3.py",
+              "symbol": "def preflight_quantization("
+            }
+          ],
+          "kind": "preflight",
+          "name": "qwen3_dense_nvfp4",
+          "value": "nvfp4"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/quant/convert_qwen3_nvfp4.py",
+          "symbol": "def convert_qwen3_to_nvfp4_("
+        },
+        {
+          "kind": "contract_test",
+          "path": "tests/test_qwen3_text_nvfp4.py",
+          "symbol": "def test_nvfp4_profiles_bind_exact_recipe_geometry_and_cores("
+        }
+      ],
+      "example": {
+        "eligible": true,
+        "reason_code": "PUBLIC_PROFILE_EXAMPLE",
+        "runner_target": "qwen3"
+      },
+      "family": "qwen3",
+      "hw_status": "IMPLEMENTED_UNVERIFIED_HW",
+      "id": "qwen3-8b.nvfp4.text",
+      "input_envelope": {
+        "evidence": [
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/qwen3.py",
+            "symbol": "def preflight_quantization("
+          },
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/runtime/decoder.py",
+            "symbol": "def _validate_nvfp4_payload("
+          }
+        ],
+        "kind": "EXACT",
+        "limits": {
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ],
+          "batch_size": 1,
+          "example_geometry": {
+            "batch_size": 1,
+            "decode_calls": 7,
+            "logical_prefill_rows": 128,
+            "new_hardware_validation": false
+          },
+          "formal_certification": false,
+          "hardware_validation": "PENDING_PROFILE_VALIDATION",
+          "head_dim": 128,
+          "hidden_size": 4096,
+          "intermediate_size": 12288,
+          "num_attention_heads": 32,
+          "num_hidden_layers": 36,
+          "num_key_value_heads": 8,
+          "on_install_quantization": "nvfp4",
+          "quantization": {
+            "activation": "FP16",
+            "embedding": "FP16",
+            "lm_head": "FP16",
+            "norms": "FP16",
+            "source": "dense FP16 checkpoint",
+            "text_seven_projections": "NVFP4 on install: E2M1 weight, E4M3 scale per 16 K values, one FP32 tensor scale per projection and layer"
+          },
+          "vocab_size": 151936
+        },
+        "reason_code": "QWEN3_DENSE_NVFP4_EXACT_GEOMETRY"
+      },
+      "owner": "fmb-causal-decoder",
+      "precision": "nvfp4",
+      "reason_code": "UNIFIED_CONTROL_AUTHORITY",
+      "state": "MIGRATED",
+      "support": {
+        "evidence": [
+          {
+            "kind": "hardware_measurement",
+            "path": "docs/model_performance/data/coverage_20261102_qwen3-nvfp4.json",
+            "symbol": "\"canonical_config\":\"qwen3/text/8b/nvfp4_text.toml\""
+          }
+        ],
+        "reason_code": "BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED",
+        "status": "SUPPORTED"
+      },
+      "variant": "nvfp4"
+    },
+    {
+      "asset_alias": "qwen3-14b",
+      "authority": "fmb-causal-decoder",
+      "component": "text",
+      "controlled_gates": [
+        {
+          "evidence": [
+            {
+              "kind": "controlled_gate",
+              "path": "python/rpu_backend/adapters/qwen3.py",
+              "symbol": "def preflight_quantization("
+            }
+          ],
+          "kind": "preflight",
+          "name": "qwen3_dense_nvfp4",
+          "value": "nvfp4"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/quant/convert_qwen3_nvfp4.py",
+          "symbol": "def convert_qwen3_to_nvfp4_("
+        },
+        {
+          "kind": "contract_test",
+          "path": "tests/test_qwen3_text_nvfp4.py",
+          "symbol": "def test_nvfp4_profiles_bind_exact_recipe_geometry_and_cores("
+        }
+      ],
+      "example": {
+        "eligible": true,
+        "reason_code": "PUBLIC_PROFILE_EXAMPLE",
+        "runner_target": "qwen3"
+      },
+      "family": "qwen3",
+      "hw_status": "IMPLEMENTED_UNVERIFIED_HW",
+      "id": "qwen3-14b.nvfp4.text",
+      "input_envelope": {
+        "evidence": [
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/qwen3.py",
+            "symbol": "def preflight_quantization("
+          },
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/runtime/decoder.py",
+            "symbol": "def _validate_nvfp4_payload("
+          }
+        ],
+        "kind": "EXACT",
+        "limits": {
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ],
+          "batch_size": 1,
+          "example_geometry": {
+            "batch_size": 1,
+            "decode_calls": 7,
+            "logical_prefill_rows": 128,
+            "new_hardware_validation": false
+          },
+          "formal_certification": false,
+          "hardware_validation": "PENDING_PROFILE_VALIDATION",
+          "head_dim": 128,
+          "hidden_size": 5120,
+          "intermediate_size": 17408,
+          "num_attention_heads": 40,
+          "num_hidden_layers": 40,
+          "num_key_value_heads": 8,
+          "on_install_quantization": "nvfp4",
+          "quantization": {
+            "activation": "FP16",
+            "embedding": "FP16",
+            "lm_head": "FP16",
+            "norms": "FP16",
+            "source": "dense FP16 checkpoint",
+            "text_seven_projections": "NVFP4 on install: E2M1 weight, E4M3 scale per 16 K values, one FP32 tensor scale per projection and layer"
+          },
+          "vocab_size": 151936
+        },
+        "reason_code": "QWEN3_DENSE_NVFP4_EXACT_GEOMETRY"
+      },
+      "owner": "fmb-causal-decoder",
+      "precision": "nvfp4",
+      "reason_code": "UNIFIED_CONTROL_AUTHORITY",
+      "state": "MIGRATED",
+      "support": {
+        "evidence": [
+          {
+            "kind": "support_contract",
+            "path": "python/rpu_backend/quant/convert_qwen3_nvfp4.py",
+            "symbol": "def convert_qwen3_to_nvfp4_("
+          }
+        ],
+        "reason_code": "QWEN3_TEXT_NVFP4_BOARD_RUN_PENDING",
+        "status": "IMPLEMENTED_UNVERIFIED_HW"
+      },
+      "variant": "nvfp4"
     },
     {
       "asset_alias": "qwen3-32b-w8a16-lmhead-int8",
@@ -13996,6 +16889,511 @@
         "status": "SUPPORTED"
       },
       "variant": "activation_awq_g128_v1"
+    },
+    {
+      "asset_alias": "qwen3_5-0.8b",
+      "authority": "fmb-qwen35-text",
+      "component": "text",
+      "controlled_gates": [
+        {
+          "evidence": [
+            {
+              "kind": "controlled_gate",
+              "path": "python/rpu_backend/adapters/qwen3_5/__init__.py",
+              "symbol": "def preflight_quantization("
+            }
+          ],
+          "kind": "preflight",
+          "name": "qwen3_5_dense_text_nvfp4",
+          "value": "nvfp4"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/adapters/qwen3_5/quant_scope.py",
+          "symbol": "def nvfp4_text_quant_config("
+        },
+        {
+          "kind": "contract_test",
+          "path": "tests/test_qwen35_text_nvfp4.py",
+          "symbol": "def test_nvfp4_profiles_bind_exact_recipe_geometry_and_cores("
+        }
+      ],
+      "example": {
+        "eligible": true,
+        "reason_code": "CONTROLLED_PUBLIC_EXAMPLE",
+        "runner_target": "qwen3_5"
+      },
+      "family": "qwen3-5",
+      "hw_status": "IMPLEMENTED_UNVERIFIED_HW",
+      "id": "qwen3_5-0.8b.nvfp4.text-controlled",
+      "input_envelope": {
+        "evidence": [
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/qwen3_5/__init__.py",
+            "symbol": "def preflight_quantization("
+          },
+          {
+            "kind": "envelope_contract",
+            "path": "src/fused/qwen35_text_nvfp4.h",
+            "symbol": "struct Qwen35TextNvfp4Tables"
+          }
+        ],
+        "kind": "EXACT",
+        "limits": {
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ],
+          "batch_size": 1,
+          "chunk_alignment": 64,
+          "chunk_policy": "native-exact-spm-and-kernel-oracle",
+          "formal_certification": false,
+          "hardware_validation": "PENDING_PROFILE_VALIDATION",
+          "head_dim": 256,
+          "hidden_size": 1024,
+          "intermediate_size": 3584,
+          "num_attention_heads": 8,
+          "num_hidden_layers": 24,
+          "num_key_value_heads": 2,
+          "on_install_quantization": "nvfp4",
+          "quantization": {
+            "activation": "FP16",
+            "embedding": "FP16",
+            "gdn_in_proj_a_b": "FP16",
+            "lm_head": "FP16",
+            "norms": "FP16",
+            "source": "dense FP16 checkpoint",
+            "text_projections": "NVFP4 on install: Attention Q/gate/K/V/O, GDN QKV/Z/out and MLP gate/up/down; E2M1 weight, E4M3 scale per 16 K values, one FP32 tensor scale per projection family and layer"
+          },
+          "vocab_size": 248320,
+          "kv_capacity": "requested-at-install; allocation must succeed"
+        },
+        "reason_code": "QWEN35_DENSE_TEXT_NVFP4_EXACT_GEOMETRY"
+      },
+      "owner": "fmb-qwen35-text",
+      "precision": "nvfp4",
+      "reason_code": "UNIFIED_CONTROL_AUTHORITY",
+      "state": "MIGRATED",
+      "support": {
+        "evidence": [
+          {
+            "kind": "support_contract",
+            "path": "python/rpu_backend/adapters/qwen3_5/__init__.py",
+            "symbol": "def preflight_quantization("
+          }
+        ],
+        "reason_code": "QWEN35_TEXT_NVFP4_BOARD_RUN_PENDING",
+        "status": "IMPLEMENTED_UNVERIFIED_HW"
+      },
+      "variant": "nvfp4"
+    },
+    {
+      "asset_alias": "qwen3_5-2b",
+      "authority": "fmb-qwen35-text",
+      "component": "text",
+      "controlled_gates": [
+        {
+          "evidence": [
+            {
+              "kind": "controlled_gate",
+              "path": "python/rpu_backend/adapters/qwen3_5/__init__.py",
+              "symbol": "def preflight_quantization("
+            }
+          ],
+          "kind": "preflight",
+          "name": "qwen3_5_dense_text_nvfp4",
+          "value": "nvfp4"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/adapters/qwen3_5/quant_scope.py",
+          "symbol": "def nvfp4_text_quant_config("
+        },
+        {
+          "kind": "contract_test",
+          "path": "tests/test_qwen35_text_nvfp4.py",
+          "symbol": "def test_nvfp4_profiles_bind_exact_recipe_geometry_and_cores("
+        }
+      ],
+      "example": {
+        "eligible": true,
+        "reason_code": "CONTROLLED_PUBLIC_EXAMPLE",
+        "runner_target": "qwen3_5"
+      },
+      "family": "qwen3-5",
+      "hw_status": "IMPLEMENTED_UNVERIFIED_HW",
+      "id": "qwen3_5-2b.nvfp4.text-controlled",
+      "input_envelope": {
+        "evidence": [
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/qwen3_5/__init__.py",
+            "symbol": "def preflight_quantization("
+          },
+          {
+            "kind": "envelope_contract",
+            "path": "src/fused/qwen35_text_nvfp4.h",
+            "symbol": "struct Qwen35TextNvfp4Tables"
+          }
+        ],
+        "kind": "EXACT",
+        "limits": {
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ],
+          "batch_size": 1,
+          "chunk_alignment": 64,
+          "chunk_policy": "native-exact-spm-and-kernel-oracle",
+          "formal_certification": false,
+          "hardware_validation": "PENDING_PROFILE_VALIDATION",
+          "head_dim": 256,
+          "hidden_size": 2048,
+          "intermediate_size": 6144,
+          "num_attention_heads": 8,
+          "num_hidden_layers": 24,
+          "num_key_value_heads": 2,
+          "on_install_quantization": "nvfp4",
+          "quantization": {
+            "activation": "FP16",
+            "embedding": "FP16",
+            "gdn_in_proj_a_b": "FP16",
+            "lm_head": "FP16",
+            "norms": "FP16",
+            "source": "dense FP16 checkpoint",
+            "text_projections": "NVFP4 on install: Attention Q/gate/K/V/O, GDN QKV/Z/out and MLP gate/up/down; E2M1 weight, E4M3 scale per 16 K values, one FP32 tensor scale per projection family and layer"
+          },
+          "vocab_size": 248320,
+          "kv_capacity": "requested-at-install; allocation must succeed"
+        },
+        "reason_code": "QWEN35_DENSE_TEXT_NVFP4_EXACT_GEOMETRY"
+      },
+      "owner": "fmb-qwen35-text",
+      "precision": "nvfp4",
+      "reason_code": "UNIFIED_CONTROL_AUTHORITY",
+      "state": "MIGRATED",
+      "support": {
+        "evidence": [
+          {
+            "kind": "support_contract",
+            "path": "python/rpu_backend/adapters/qwen3_5/__init__.py",
+            "symbol": "def preflight_quantization("
+          }
+        ],
+        "reason_code": "QWEN35_TEXT_NVFP4_BOARD_RUN_PENDING",
+        "status": "IMPLEMENTED_UNVERIFIED_HW"
+      },
+      "variant": "nvfp4"
+    },
+    {
+      "asset_alias": "qwen3_5-4b",
+      "authority": "fmb-qwen35-text",
+      "component": "text",
+      "controlled_gates": [
+        {
+          "evidence": [
+            {
+              "kind": "controlled_gate",
+              "path": "python/rpu_backend/adapters/qwen3_5/__init__.py",
+              "symbol": "def preflight_quantization("
+            }
+          ],
+          "kind": "preflight",
+          "name": "qwen3_5_dense_text_nvfp4",
+          "value": "nvfp4"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/adapters/qwen3_5/quant_scope.py",
+          "symbol": "def nvfp4_text_quant_config("
+        },
+        {
+          "kind": "contract_test",
+          "path": "tests/test_qwen35_text_nvfp4.py",
+          "symbol": "def test_nvfp4_profiles_bind_exact_recipe_geometry_and_cores("
+        }
+      ],
+      "example": {
+        "eligible": true,
+        "reason_code": "CONTROLLED_PUBLIC_EXAMPLE",
+        "runner_target": "qwen3_5"
+      },
+      "family": "qwen3-5",
+      "hw_status": "IMPLEMENTED_UNVERIFIED_HW",
+      "id": "qwen3_5-4b.nvfp4.text-controlled",
+      "input_envelope": {
+        "evidence": [
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/qwen3_5/__init__.py",
+            "symbol": "def preflight_quantization("
+          },
+          {
+            "kind": "envelope_contract",
+            "path": "src/fused/qwen35_text_nvfp4.h",
+            "symbol": "struct Qwen35TextNvfp4Tables"
+          }
+        ],
+        "kind": "EXACT",
+        "limits": {
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ],
+          "batch_size": 1,
+          "chunk_alignment": 64,
+          "chunk_policy": "native-exact-spm-and-kernel-oracle",
+          "formal_certification": false,
+          "hardware_validation": "PENDING_PROFILE_VALIDATION",
+          "head_dim": 256,
+          "hidden_size": 2560,
+          "intermediate_size": 9216,
+          "num_attention_heads": 16,
+          "num_hidden_layers": 32,
+          "num_key_value_heads": 4,
+          "on_install_quantization": "nvfp4",
+          "quantization": {
+            "activation": "FP16",
+            "embedding": "FP16",
+            "gdn_in_proj_a_b": "FP16",
+            "lm_head": "FP16",
+            "norms": "FP16",
+            "source": "dense FP16 checkpoint",
+            "text_projections": "NVFP4 on install: Attention Q/gate/K/V/O, GDN QKV/Z/out and MLP gate/up/down; E2M1 weight, E4M3 scale per 16 K values, one FP32 tensor scale per projection family and layer"
+          },
+          "vocab_size": 248320,
+          "kv_capacity": "requested-at-install; allocation must succeed"
+        },
+        "reason_code": "QWEN35_DENSE_TEXT_NVFP4_EXACT_GEOMETRY"
+      },
+      "owner": "fmb-qwen35-text",
+      "precision": "nvfp4",
+      "reason_code": "UNIFIED_CONTROL_AUTHORITY",
+      "state": "MIGRATED",
+      "support": {
+        "evidence": [
+          {
+            "kind": "support_contract",
+            "path": "python/rpu_backend/adapters/qwen3_5/__init__.py",
+            "symbol": "def preflight_quantization("
+          }
+        ],
+        "reason_code": "QWEN35_TEXT_NVFP4_BOARD_RUN_PENDING",
+        "status": "IMPLEMENTED_UNVERIFIED_HW"
+      },
+      "variant": "nvfp4"
+    },
+    {
+      "asset_alias": "qwen3_5-9b",
+      "authority": "fmb-qwen35-text",
+      "component": "text",
+      "controlled_gates": [
+        {
+          "evidence": [
+            {
+              "kind": "controlled_gate",
+              "path": "python/rpu_backend/adapters/qwen3_5/__init__.py",
+              "symbol": "def preflight_quantization("
+            }
+          ],
+          "kind": "preflight",
+          "name": "qwen3_5_dense_text_nvfp4",
+          "value": "nvfp4"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/adapters/qwen3_5/quant_scope.py",
+          "symbol": "def nvfp4_text_quant_config("
+        },
+        {
+          "kind": "contract_test",
+          "path": "tests/test_qwen35_text_nvfp4.py",
+          "symbol": "def test_nvfp4_profiles_bind_exact_recipe_geometry_and_cores("
+        }
+      ],
+      "example": {
+        "eligible": true,
+        "reason_code": "CONTROLLED_PUBLIC_EXAMPLE",
+        "runner_target": "qwen3_5"
+      },
+      "family": "qwen3-5",
+      "hw_status": "IMPLEMENTED_UNVERIFIED_HW",
+      "id": "qwen3_5-9b.nvfp4.text-controlled",
+      "input_envelope": {
+        "evidence": [
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/qwen3_5/__init__.py",
+            "symbol": "def preflight_quantization("
+          },
+          {
+            "kind": "envelope_contract",
+            "path": "src/fused/qwen35_text_nvfp4.h",
+            "symbol": "struct Qwen35TextNvfp4Tables"
+          }
+        ],
+        "kind": "EXACT",
+        "limits": {
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ],
+          "batch_size": 1,
+          "chunk_alignment": 64,
+          "chunk_policy": "native-exact-spm-and-kernel-oracle",
+          "formal_certification": false,
+          "hardware_validation": "PENDING_PROFILE_VALIDATION",
+          "head_dim": 256,
+          "hidden_size": 4096,
+          "intermediate_size": 12288,
+          "num_attention_heads": 16,
+          "num_hidden_layers": 32,
+          "num_key_value_heads": 4,
+          "on_install_quantization": "nvfp4",
+          "quantization": {
+            "activation": "FP16",
+            "embedding": "FP16",
+            "gdn_in_proj_a_b": "FP16",
+            "lm_head": "FP16",
+            "norms": "FP16",
+            "source": "dense FP16 checkpoint",
+            "text_projections": "NVFP4 on install: Attention Q/gate/K/V/O, GDN QKV/Z/out and MLP gate/up/down; E2M1 weight, E4M3 scale per 16 K values, one FP32 tensor scale per projection family and layer"
+          },
+          "vocab_size": 248320,
+          "kv_capacity": "requested-at-install; allocation must succeed"
+        },
+        "reason_code": "QWEN35_DENSE_TEXT_NVFP4_EXACT_GEOMETRY"
+      },
+      "owner": "fmb-qwen35-text",
+      "precision": "nvfp4",
+      "reason_code": "UNIFIED_CONTROL_AUTHORITY",
+      "state": "MIGRATED",
+      "support": {
+        "evidence": [
+          {
+            "kind": "support_contract",
+            "path": "python/rpu_backend/adapters/qwen3_5/__init__.py",
+            "symbol": "def preflight_quantization("
+          }
+        ],
+        "reason_code": "QWEN35_TEXT_NVFP4_BOARD_RUN_PENDING",
+        "status": "IMPLEMENTED_UNVERIFIED_HW"
+      },
+      "variant": "nvfp4"
+    },
+    {
+      "asset_alias": "qwen3_5-27b-fp16",
+      "authority": "fmb-qwen35-text",
+      "component": "text",
+      "controlled_gates": [
+        {
+          "evidence": [
+            {
+              "kind": "controlled_gate",
+              "path": "python/rpu_backend/adapters/qwen3_5/__init__.py",
+              "symbol": "def preflight_quantization("
+            }
+          ],
+          "kind": "preflight",
+          "name": "qwen3_5_dense_text_nvfp4",
+          "value": "nvfp4"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "authority",
+          "path": "python/rpu_backend/adapters/qwen3_5/quant_scope.py",
+          "symbol": "def nvfp4_text_quant_config("
+        },
+        {
+          "kind": "contract_test",
+          "path": "tests/test_qwen35_text_nvfp4.py",
+          "symbol": "def test_nvfp4_profiles_bind_exact_recipe_geometry_and_cores("
+        }
+      ],
+      "example": {
+        "eligible": true,
+        "reason_code": "CONTROLLED_PUBLIC_EXAMPLE",
+        "runner_target": "qwen3_5"
+      },
+      "family": "qwen3-5",
+      "hw_status": "IMPLEMENTED_UNVERIFIED_HW",
+      "id": "qwen3_5-27b.nvfp4.text-controlled",
+      "input_envelope": {
+        "evidence": [
+          {
+            "kind": "envelope_contract",
+            "path": "python/rpu_backend/adapters/qwen3_5/__init__.py",
+            "symbol": "def preflight_quantization("
+          },
+          {
+            "kind": "envelope_contract",
+            "path": "src/fused/qwen35_text_nvfp4.h",
+            "symbol": "struct Qwen35TextNvfp4Tables"
+          }
+        ],
+        "kind": "EXACT",
+        "limits": {
+          "allowed_num_cores": [
+            4,
+            6,
+            8
+          ],
+          "batch_size": 1,
+          "chunk_alignment": 64,
+          "chunk_policy": "native-exact-spm-and-kernel-oracle",
+          "formal_certification": false,
+          "hardware_validation": "PENDING_PROFILE_VALIDATION",
+          "head_dim": 256,
+          "hidden_size": 5120,
+          "intermediate_size": 17408,
+          "num_attention_heads": 24,
+          "num_hidden_layers": 64,
+          "num_key_value_heads": 4,
+          "on_install_quantization": "nvfp4",
+          "quantization": {
+            "activation": "FP16",
+            "embedding": "FP16",
+            "gdn_in_proj_a_b": "FP16",
+            "lm_head": "FP16",
+            "norms": "FP16",
+            "source": "dense FP16 checkpoint",
+            "text_projections": "NVFP4 on install: Attention Q/gate/K/V/O, GDN QKV/Z/out and MLP gate/up/down; E2M1 weight, E4M3 scale per 16 K values, one FP32 tensor scale per projection family and layer"
+          },
+          "vocab_size": 248320,
+          "kv_capacity": "requested-at-install; allocation must succeed"
+        },
+        "reason_code": "QWEN35_DENSE_TEXT_NVFP4_EXACT_GEOMETRY"
+      },
+      "owner": "fmb-qwen35-text",
+      "precision": "nvfp4",
+      "reason_code": "UNIFIED_CONTROL_AUTHORITY",
+      "state": "MIGRATED",
+      "support": {
+        "evidence": [
+          {
+            "kind": "support_contract",
+            "path": "python/rpu_backend/adapters/qwen3_5/__init__.py",
+            "symbol": "def preflight_quantization("
+          }
+        ],
+        "reason_code": "QWEN35_TEXT_NVFP4_BOARD_RUN_PENDING",
+        "status": "IMPLEMENTED_UNVERIFIED_HW"
+      },
+      "variant": "nvfp4"
     },
     {
       "id": "rhinovla.v3.fp16.trusted-factory",

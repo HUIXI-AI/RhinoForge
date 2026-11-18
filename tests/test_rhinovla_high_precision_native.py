@@ -97,6 +97,9 @@ struct NormCall { uint32_t input, output, weight; int64_t rows, cols; RpuRmsNorm
 std::vector<NormCall> norms;
 std::vector<std::string> events;
 bool k_tail_zero = false, q_tail_zero = false;
+// Attention lanes and the Q/K tail geometry they imply (eight cores by default).
+int lanes = 8;
+int64_t q_logical = 62, q_padded = 64, kv_width = 128;
 struct RpuExecutionCoordinator {
     static void require_graph_quiescent(const char*) { TORCH_CHECK(!graph_active); }
     static void check_current_thread_execution_allowed(const char*) { TORCH_CHECK(!transaction_active); }
@@ -114,23 +117,25 @@ void rpu_launch_pi05_adarms_norm_shift_spm_kernel(uint32_t, uint32_t, uint32_t, 
     ++fused_calls;
 }
 void rpu_launch_rmsnorm_spm_kernel(uint32_t input, uint32_t output, uint32_t weight,
-                                  int64_t rows, int64_t cols, double, RpuRmsNormSpmRoute route) {
+                                  int64_t rows, int64_t cols, double, RpuRmsNormSpmRoute route, int cores = 8) {
+    assert(cores == lanes);
     ++norm_calls; last_norm = route;
     norms.push_back({input, output, weight, rows, cols, route});
     events.push_back(input == 0x1000 ? "q_norm" : input == 0x2000 ? "k_norm" : "norm");
-    if (input == 0x2000 && rows == 32) assert(k_tail_zero);
-    if (input == 0x1000 && rows == 64) assert(q_tail_zero);
+    if (input == 0x2000 && rows % 32 == 0) assert(k_tail_zero);
+    if (input == 0x1000 && rows == q_padded) assert(q_tail_zero);
 }
 void rpu_launch_memset_spm_multicore(uint32_t output, int64_t count, int cores) {
-    assert(cores == 8);
-    if (output == 0x1000 + 62 * 128 * 2) {
-        assert(count == 256); q_tail_zero = true; events.push_back("zero_q"); return;
+    assert(cores == lanes);
+    if (output == 0x1000 + q_logical * 128 * 2) {
+        assert(count == (q_padded - q_logical) * 128);
+        q_tail_zero = true; events.push_back("zero_q"); return;
     }
-    assert(count == 128);
-    if (output == 0x2000 + 31 * 128 * 2) { k_tail_zero = true; events.push_back("zero_k"); }
-    else { assert(output == 0x4000 + 31 * 128 * 2); events.push_back("zero_v"); }
+    assert(count == kv_width);
+    if (output == 0x2000 + 31 * kv_width * 2) { k_tail_zero = true; events.push_back("zero_k"); }
+    else { assert(output == 0x4000 + 31 * kv_width * 2); events.push_back("zero_v"); }
 }
-void rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(uint32_t, uint32_t, uint32_t, int64_t, int64_t, c10::Half, ValuOpType, bool) {
+void rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(uint32_t, uint32_t, uint32_t, int64_t, int64_t, c10::Half, ValuOpType, bool, int = 8) {
     ++add_calls;
 }
 struct Context {
@@ -141,6 +146,7 @@ struct Context {
     }
 };
 constexpr int64_t RHINO_HIGH_PRECISION_SITE = __SITE_VALUE__;
+constexpr int RHINO_TP8 = 8;
 struct Model {
     bool rtc_mode_ = false;
     struct Config { bool precompute_adarms = true, skip_adarms_gemv = false,
@@ -155,7 +161,7 @@ struct Model {
     bool expert_w8a16_ = true, expert_cond_w8a16_ = true, full_action_w8a16_ = true, gates_tanh_precomputed_ = false;
     int64_t suffix_len_ = 31, num_steps_ = 10, layers = 18, h = 1024, is = 3072;
     int64_t nq = 16, nkv = 8, hd = 128, tp = 8, last_chunk = 0, generation = 5;
-    int64_t local_q_heads_ = 2;
+    int64_t local_q_heads_ = 2, cores = 8;
     double eps_ = 1e-6;
     Context context;
     int64_t num_layers() const { return layers; }
@@ -165,6 +171,7 @@ struct Model {
     int64_t num_kv_heads() const { return nkv; }
     int64_t head_dim() const { return hd; }
     int64_t attn_tp() const { return tp; }
+    int64_t num_cores() const { return cores; }
     int64_t get_last_resolved_chunk_size() const { return last_chunk; }
     int64_t installed_model_state_generation() const { return generation; }
     void invalidate_model_state() { ++generation; }
@@ -438,6 +445,65 @@ int main() {
     vector.set_partial_rope(true);
     vector.consume_high_precision_route();
     assert(vector.context.flags == 31 && vector.rope_route_selector() == 2);
+
+    // 4/6-core budgets: attention on four lanes (four Q and two K heads each).
+    // Vector K norm pads its own K buffer; there is no aligned KV insert.
+    lanes = 4; q_logical = 124; q_padded = 128; kv_width = 256;
+    auto reduced = [](int64_t cores) {
+        Model model;
+        model.cores = cores; model.tp = 4; model.local_q_heads_ = 4;
+        model.cold_config_.expert_fusions = false;
+        return model;
+    };
+    for (int64_t cores : {4, 6}) {
+        Model high = reduced(cores);
+        high.set_high_precision(true);
+        assert(high.high_precision_ && high.generation == 6);
+    }
+    Model other_split = reduced(6);
+    other_split.tp = 6;
+    reject_unchanged(other_split, [&] { other_split.set_high_precision(true); });
+    Model eight_lanes4;
+    eight_lanes4.tp = 4;
+    reject_unchanged(eight_lanes4, [&] { eight_lanes4.set_high_precision(true); });
+    Model scalar4 = reduced(4);
+    scalar4.set_high_precision(true);
+    events.clear(); norms.clear();
+    scalar4.emit_qk_norm(31,2,128,7);
+    assert(events == std::vector<std::string>({"q_norm","k_norm"}));
+    assert(norms[0].rows == 124 && norms[1].rows == 62 &&
+           norms[0].route == RpuRmsNormSpmRoute::NEWTON && norms[1].route == RpuRmsNormSpmRoute::NEWTON);
+    Model lanes4 = reduced(6);
+    lanes4.set_high_precision(true);
+    lanes4.set_vector_k_norm(true);
+    lanes4.set_vector_q_norm(true);
+    assert(!lanes4.cold_config_.aligned_kv && lanes4.k_norm_rows(31,2,128) == 64 &&
+           lanes4.q_norm_rows(31,4,128) == 128);
+    events.clear(); norms.clear(); k_tail_zero = q_tail_zero = false;
+    lanes4.emit_qk_norm(31,2,128,7);
+    assert(events == std::vector<std::string>({"zero_k","zero_v","zero_q","q_norm","k_norm"}));
+    assert(norms.size() == 2 && norms[0].rows == 128 && norms[1].rows == 64 &&
+           norms[0].route == RpuRmsNormSpmRoute::NEWTON_V32_GRID8 &&
+           norms[1].route == RpuRmsNormSpmRoute::NEWTON_V32_GRID8);
+    for (int damage = 0; damage < 3; ++damage) {
+        Model bad = lanes4;
+        if (damage == 1) bad.local_q_heads_ = 2;
+        // Eight cores keep one K head per lane and the aligned KV pad row.
+        if (damage == 2) { bad.cores = 8; bad.local_q_heads_ = 2; }
+        events.clear(); norms.clear();
+        reject_unchanged(bad, [&] { bad.emit_qk_norm(31, damage == 0 ? 1 : 2, 128, 7); });
+        assert(events.empty() && norms.empty());
+    }
+    for (int64_t heads : {2, 4}) {
+        ropes.clear();
+        rpu_launch_rhinovla_rope_spm_kernel(0x8000,0x1000,partial.cos_ref_,partial.sin_ref_,
+            31,heads,128,45,true,4);
+        assert(ropes.size() == 1 && ropes[0].partial && ropes[0].heads == heads && ropes[0].cores == 4);
+    }
+    ropes.clear();
+    reject_unchanged(partial, [&] { rpu_launch_rhinovla_rope_spm_kernel(0x8000,0x1000,
+        partial.cos_ref_,partial.sin_ref_,31,3,128,45,true,4); });
+    assert(ropes.empty());
 }
 '''.replace("__SITE_VALUE__", site).replace("ROPE_ENUM", rope_enum).replace("ROPE_WRAPPER", rope_wrapper).replace("METHODS", methods).replace("TABLE_GUARD", table_guard)
     cpp, executable = tmp_path / "precision.cpp", tmp_path / "precision"
@@ -447,3 +513,13 @@ int main() {
     assert build.returncode == 0, build.stderr
     run = subprocess.run([str(executable)], capture_output=True, text=True)
     assert run.returncode == 0, run.stderr
+
+
+def test_qwen3_reduced_core_legacy_silu_mul_excludes_rhinovla_high_precision():
+    qwen3 = (ROOT / "src/fused/rpu_qwen3_model.h").read_text()
+    assert (
+        "(num_cores() != 8 && use_silu_ && !linear_acc32_ &&\n"
+        "                     !rhinovla_high_precision_ &&\n"
+        "                     (rows * (intermediate_size() / mlp_tp())) % 256 == 0)"
+    ) in qwen3
+

@@ -108,11 +108,13 @@ def _generic_spm_cpp():
     declarations = declarations.replace(_body("        if (is_exact_mimc()) {", declarations), "")
     declarations = declarations.replace(" override", "")
     allocator = (ROOT / "src/core/rpu_spm_allocator.cpp").read_text()
+    base = (ROOT / "src/core/fused_model_base.cpp").read_text()
     return r"""
 #include <algorithm>
 #include <array>
 #include <cassert>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <optional>
 #include <stdexcept>
@@ -135,6 +137,9 @@ enum class FmbRopeTableResidency {UNSPECIFIED,SPM,DDR};
 enum class AttentionExecutionPolicy {SPM_KV_BY_MHA,DDR_KV};
 enum class VisionSchedule {MISC,SISC};
 struct BufferDecl {const char* name; int64_t size; int phase_start,phase_end; StorageClass storage; int per_layer; const char* alias_of; BufferScope scope=BufferScope::LayerWide;};
+namespace detail { int64_t estimate_temporary_total(const std::vector<BufferDecl>& decls); }
+""" + _body("int64_t detail::estimate_temporary_total(", base) + r"""
+""" + _body("static std::vector<BufferDecl> host_sdpa_out_in_gate(") + r"""
 struct LayoutContext {
     int64_t chunk_size=672;
     FmbRopeTableResidency rope_table_residency=FmbRopeTableResidency::SPM;
@@ -154,7 +159,10 @@ struct Model {
     bool merger_active() const{return merger;}
     bool small_image_native_window_enabled() const{return false;}
     bool small_image_resident_mask_enabled() const{return resident_mask;}
+    bool reduced_core_sisc_resident_mask_enabled() const{return false;}
     bool padded_pair_enabled() const{return pair;}
+    int cores=8;
+    int num_cores() const{return cores;}
 """ + declarations + r"""
 };
 """
@@ -268,6 +276,29 @@ int main() {
     assert(after_v!=old.end());old.insert(after_v+1,original_output);
     const Layout historical(old);
     assert(historical.plan.peak_bytes==7024640);
+
+    // Four Vision lanes (4- and 6-core budgets). Hosting sdpa_out in Gate plus
+    // two-strip MLP (400+384 rows -> 691,200 B Gate) fits inside the full
+    // 6-model InternVLA composite's 6,841,856 B live temporary budget.
+    Model four=vision;four.cores=4;
+    const auto lanes4=four.declare_buffers(vctx);
+    const Layout hosted(lanes4);
+    assert(hosted.plan.peak_bytes==3*2007040+691200&&hosted.persistent==557056);
+    assert(hosted.plan.peak_bytes<=6841856);
+    const auto named=[](auto& decls,const char* name){
+        return std::find_if(decls.begin(),decls.end(),[name](const auto& d){return std::string(d.name)==name;});};
+    assert(named(lanes4,"sdpa_out")->alias_of&&std::string(named(lanes4,"sdpa_out")->alias_of)=="gate");
+    assert(named(lanes4,"gate")->phase_start==2&&named(lanes4,"gate")->phase_end==6);
+    auto unhosted=lanes4;
+    auto gate=*named(unhosted,"gate");gate.phase_start=5;unhosted.erase(named(unhosted,"gate"));
+    named(unhosted,"sdpa_out")->alias_of=nullptr;
+    unhosted.insert(named(unhosted,"sdpa_tmp")+1,gate);
+    assert(Layout(unhosted).plan.peak_bytes==7214080);
+    // Dense-mask window attention and small images keep the original order.
+    Model masked=four;masked.window_mask_present_=true;
+    LayoutContext small=vctx;small.chunk_size=64;
+    for(const auto& kept:{masked.declare_buffers(vctx),four.declare_buffers(small)})
+        assert(!named(kept,"sdpa_out")->alias_of&&named(kept,"gate")->phase_start==5);
 
     DinoModel tower;LayoutContext dctx;dctx.chunk_size=272;
     const auto ddecls=tower.declare_buffers(dctx);

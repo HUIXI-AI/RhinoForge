@@ -1,0 +1,68 @@
+# VLA 的输入预设：python examples/run.py --config <TOML> --input <预设名>
+# --input canonical 取本文件的 canonical；--set input.<键> 的同名字段优先于预设。
+#
+# 预设只写相机数 cameras 和指令 token 数 text_tokens，图像尺寸、动作长度、去噪步数和权重
+# 仍取所选 TOML。各族模板默认 3 相机；原来只差这些输入字段的 2 相机模板已并入同名模板，
+# 2 相机输入改用 2cam_* 预设（对照见 examples/configs/config_names.json 的 merged）。
+# canonical 2cam_t32 是各 VLA 族共用的参考输入；GR00T 原 2 相机模板写的是 text_tokens = 128，
+# 即 2cam_t128。
+#
+# 各族范围，超出时配置检查或加载会报出原因：
+#   Pi0.5：cameras 2 / 3；text_tokens 32 / 64 / 96 / 128 / 160，T32 以外只支持
+#     FP16 / W8A16 / Action NVFP4（含 Prefill W8A8 组合），4/6/8 核相同。1cam_* 被拒：
+#     单相机的 prefill 要 144–208 行一组的配对投影 payload，算子库只有 272–336 和
+#     400–464 行。
+#   HyVLA：cameras 1 / 2 / 3；text_tokens 1–64（checkpoint 的 tokenizer_max_length=64，
+#     语言槽位固定 64 个），t128 预设超出。单相机 prefix 固定 128 行。source = "synthetic" 时由真实
+#     processor 构造该形状的输入，prefix_len = "auto" 取覆盖真实行数的 16 行 bucket。
+#   GR00T：cameras 1 / 2 / 3（image_size 224 / 256）；text_tokens 32 / 64 / 128 /
+#     160 / 192 / 224 / 256。
+#   Wall-OSS Base：cameras 1 / 2 / 3；真实 prefix（模板注释给出的图像行数 + T）不超过 640 行。
+#     batch_template 按 cameras、image_size、text_tokens 展开成对应文件名。Wall-OSS 的
+#     --check-config 只检查语法，长度在加载时检查。
+#
+# requires：模板 [input] 须已写这些字段。HY-Embodied 和 Wall-OSS legacy 的输入布局是固定的，
+#   没有这些字段，配置检查会拒绝预设。
+# fixtures：这些族的输入文件已经固定了相机数和文本长度（Wall-OSS 指直接写的 batch，
+#   batch_template 不受此限）。预设改变了形状时，须同时用 --set input.<键>=<路径> 给出
+#   该形状的文件，否则配置检查拒绝；加载时还会核对文件内容与 cameras、text_tokens 是否一致。
+applies_to = ["pi05", "hy_vla", "gr00t", "wall_oss"]
+canonical = "2cam_t32"
+requires = ["cameras", "text_tokens"]
+fixtures = { pi05 = "batch", gr00t = "observation", wall_oss = "batch" }
+
+[preset.1cam_t32]
+cameras = 1
+text_tokens = 32
+
+[preset.1cam_t64]
+cameras = 1
+text_tokens = 64
+
+[preset.1cam_t128]
+cameras = 1
+text_tokens = 128
+
+[preset.2cam_t32]
+cameras = 2
+text_tokens = 32
+
+[preset.2cam_t64]
+cameras = 2
+text_tokens = 64
+
+[preset.2cam_t128]
+cameras = 2
+text_tokens = 128
+
+[preset.3cam_t32]
+cameras = 3
+text_tokens = 32
+
+[preset.3cam_t64]
+cameras = 3
+text_tokens = 64
+
+[preset.3cam_t128]
+cameras = 3
+text_tokens = 128

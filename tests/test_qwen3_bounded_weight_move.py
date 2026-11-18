@@ -142,9 +142,9 @@ def _meta_hf(size, cores):
             "4b": (2560, 9728, 36, 32), "8b": (4096, 12288, 36, 32)}
     hidden, intermediate, layers, heads = dims[size]
     from torch._subclasses.fake_tensor import FakeTensorMode
-    # Exact8B preflight checks CPU residency before claiming a device model.
+    # Exact8B and 6-core padded profiles check CPU residency before claiming.
     # FakeTensor uses that real metadata without allocating multi-GB storage.
-    with (FakeTensorMode() if size == "8b" or (size == "4b" and cores == 6) else torch.device("meta")):
+    with (FakeTensorMode() if size == "8b" or cores == 6 else torch.device("meta")):
         model = Qwen3ForCausalLM._from_config(Qwen3Config(hidden_size=hidden,
             intermediate_size=intermediate, num_hidden_layers=layers,
             num_attention_heads=heads, num_key_value_heads=8, head_dim=128,

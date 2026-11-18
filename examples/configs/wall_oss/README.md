@@ -38,18 +38,18 @@ python examples/run.py --config examples/configs/wall_oss/base/2cam/224/fp16.tom
 
 | 配置 | 支持状态 | 精度 | 量化范围 | cameras 默认值 | image_size 默认值 | 4 核 | 6 核 | 8 核 | CPU线程数 | 权重 |
 |---|---|---|---|---|---|---|---|---|---|---|
-| [base/2cam/224/fp16.toml](base/2cam/224/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 2 | [224,224] | ✕ 不支持 | ✕ 不支持 | ● 已实测 | 4 | `/path/to/wall-oss-0.5`；准备方法见[权重准备](../WEIGHTS.md) |
-| [base/2cam/224/w8a16.toml](base/2cam/224/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision、decoder 与 action_preprocessor 的二维 Linear W8（embed_tokens 除外） | 2 | [224,224] | ✕ 不支持 | ✕ 不支持 | ● 已实测 | 8 | fp16_checkpoint `/path/to/wall-oss-0.5`、w8_checkpoint `/path/to/wall-oss-0.5-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
-| [base/2cam/224/w8a16_action_nvfp4.toml](base/2cam/224/w8a16_action_nvfp4.toml) | 支持（`SUPPORTED`） | w8a16_action_nvfp4 | Vision / Prefill W8；Action NVFP4 | 2 | [224,224] | ✕ 不支持 | ✕ 不支持 | ● 已实测 | 4 | fp16_checkpoint `/path/to/wall-oss-0.5`、w8_checkpoint `/path/to/wall-oss-0.5-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
-| [base/2cam/256/fp16.toml](base/2cam/256/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 2 | [256,256] | ✕ 不支持 | ✕ 不支持 | ● 已实测 | 4 | `/path/to/wall-oss-0.5`；准备方法见[权重准备](../WEIGHTS.md) |
-| [base/2cam/256/w8a16.toml](base/2cam/256/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision、decoder 与 action_preprocessor 的二维 Linear W8（embed_tokens 除外） | 2 | [256,256] | ✕ 不支持 | ✕ 不支持 | ● 已实测 | 8 | fp16_checkpoint `/path/to/wall-oss-0.5`、w8_checkpoint `/path/to/wall-oss-0.5-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
-| [base/2cam/256/w8a16_action_nvfp4.toml](base/2cam/256/w8a16_action_nvfp4.toml) | 支持（`SUPPORTED`） | w8a16_action_nvfp4 | Vision / Prefill W8；Action NVFP4 | 2 | [256,256] | ✕ 不支持 | ✕ 不支持 | ● 已实测 | 8 | fp16_checkpoint `/path/to/wall-oss-0.5`、w8_checkpoint `/path/to/wall-oss-0.5-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
-| [base/3cam/224/fp16.toml](base/3cam/224/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 3 | [224,224] | ✕ 不支持 | ✕ 不支持 | ● 已实测 | 4 | `/path/to/wall-oss-0.5`；准备方法见[权重准备](../WEIGHTS.md) |
-| [base/3cam/224/w8a16.toml](base/3cam/224/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision、decoder 与 action_preprocessor 的二维 Linear W8（embed_tokens 除外） | 3 | [224,224] | ✕ 不支持 | ✕ 不支持 | ● 已实测 | 12 | fp16_checkpoint `/path/to/wall-oss-0.5`、w8_checkpoint `/path/to/wall-oss-0.5-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
-| [base/3cam/224/w8a16_action_nvfp4.toml](base/3cam/224/w8a16_action_nvfp4.toml) | 支持（`SUPPORTED`） | w8a16_action_nvfp4 | Vision / Prefill W8；Action NVFP4 | 3 | [224,224] | ✕ 不支持 | ✕ 不支持 | ● 已实测 | 8 | fp16_checkpoint `/path/to/wall-oss-0.5`、w8_checkpoint `/path/to/wall-oss-0.5-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
-| [base/3cam/256/fp16.toml](base/3cam/256/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 3 | [256,256] | ✕ 不支持 | ✕ 不支持 | ● 已实测 | 8 | `/path/to/wall-oss-0.5`；准备方法见[权重准备](../WEIGHTS.md) |
-| [base/3cam/256/w8a16.toml](base/3cam/256/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision、decoder 与 action_preprocessor 的二维 Linear W8（embed_tokens 除外） | 3 | [256,256] | ✕ 不支持 | ✕ 不支持 | ● 已实测 | 12 | fp16_checkpoint `/path/to/wall-oss-0.5`、w8_checkpoint `/path/to/wall-oss-0.5-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
-| [base/3cam/256/w8a16_action_nvfp4.toml](base/3cam/256/w8a16_action_nvfp4.toml) | 支持（`SUPPORTED`） | w8a16_action_nvfp4 | Vision / Prefill W8；Action NVFP4 | 3 | [256,256] | ✕ 不支持 | ✕ 不支持 | ● 已实测 | 12 | fp16_checkpoint `/path/to/wall-oss-0.5`、w8_checkpoint `/path/to/wall-oss-0.5-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
+| [base/2cam/224/fp16.toml](base/2cam/224/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 2 | [224,224] | ● 已实测 | ● 已实测 | ● 已实测 | 4 | `/path/to/wall-oss-0.5`；准备方法见[权重准备](../WEIGHTS.md) |
+| [base/2cam/224/w8a16.toml](base/2cam/224/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill（expert0） / Action（expert1） / action_preprocessor W8A16 | 2 | [224,224] | ● 已实测 | ● 已实测 | ● 已实测 | 8 | fp16_checkpoint `/path/to/wall-oss-0.5`、w8_checkpoint `/path/to/wall-oss-0.5-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
+| [base/2cam/224/w8a16_action_nvfp4.toml](base/2cam/224/w8a16_action_nvfp4.toml) | 支持（`SUPPORTED`） | w8a16_action_nvfp4 | Vision / Prefill（expert0） W8A16；Action（expert1） NVFP4 | 2 | [224,224] | ● 已实测 | ● 已实测 | ● 已实测 | 4 | fp16_checkpoint `/path/to/wall-oss-0.5`、w8_checkpoint `/path/to/wall-oss-0.5-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
+| [base/2cam/256/fp16.toml](base/2cam/256/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 2 | [256,256] | ● 已实测 | ● 已实测 | ● 已实测 | 4 | `/path/to/wall-oss-0.5`；准备方法见[权重准备](../WEIGHTS.md) |
+| [base/2cam/256/w8a16.toml](base/2cam/256/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill（expert0） / Action（expert1） / action_preprocessor W8A16 | 2 | [256,256] | ● 已实测 | ● 已实测 | ● 已实测 | 8 | fp16_checkpoint `/path/to/wall-oss-0.5`、w8_checkpoint `/path/to/wall-oss-0.5-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
+| [base/2cam/256/w8a16_action_nvfp4.toml](base/2cam/256/w8a16_action_nvfp4.toml) | 支持（`SUPPORTED`） | w8a16_action_nvfp4 | Vision / Prefill（expert0） W8A16；Action（expert1） NVFP4 | 2 | [256,256] | ● 已实测 | ● 已实测 | ● 已实测 | 8 | fp16_checkpoint `/path/to/wall-oss-0.5`、w8_checkpoint `/path/to/wall-oss-0.5-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
+| [base/3cam/224/fp16.toml](base/3cam/224/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 3 | [224,224] | ● 已实测 | ● 已实测 | ● 已实测 | 4 | `/path/to/wall-oss-0.5`；准备方法见[权重准备](../WEIGHTS.md) |
+| [base/3cam/224/w8a16.toml](base/3cam/224/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill（expert0） / Action（expert1） / action_preprocessor W8A16 | 3 | [224,224] | ● 已实测 | ● 已实测 | ● 已实测 | 12 | fp16_checkpoint `/path/to/wall-oss-0.5`、w8_checkpoint `/path/to/wall-oss-0.5-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
+| [base/3cam/224/w8a16_action_nvfp4.toml](base/3cam/224/w8a16_action_nvfp4.toml) | 支持（`SUPPORTED`） | w8a16_action_nvfp4 | Vision / Prefill（expert0） W8A16；Action（expert1） NVFP4 | 3 | [224,224] | ● 已实测 | ● 已实测 | ● 已实测 | 8 | fp16_checkpoint `/path/to/wall-oss-0.5`、w8_checkpoint `/path/to/wall-oss-0.5-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
+| [base/3cam/256/fp16.toml](base/3cam/256/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 3 | [256,256] | ● 已实测 | ● 已实测 | ● 已实测 | 8 | `/path/to/wall-oss-0.5`；准备方法见[权重准备](../WEIGHTS.md) |
+| [base/3cam/256/w8a16.toml](base/3cam/256/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill（expert0） / Action（expert1） / action_preprocessor W8A16 | 3 | [256,256] | ● 已实测 | ● 已实测 | ● 已实测 | 12 | fp16_checkpoint `/path/to/wall-oss-0.5`、w8_checkpoint `/path/to/wall-oss-0.5-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
+| [base/3cam/256/w8a16_action_nvfp4.toml](base/3cam/256/w8a16_action_nvfp4.toml) | 支持（`SUPPORTED`） | w8a16_action_nvfp4 | Vision / Prefill（expert0） W8A16；Action（expert1） NVFP4 | 3 | [256,256] | ● 已实测 | ● 已实测 | ● 已实测 | 12 | fp16_checkpoint `/path/to/wall-oss-0.5`、w8_checkpoint `/path/to/wall-oss-0.5-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
 
 本组配置相同的项：
 
@@ -59,15 +59,13 @@ python examples/run.py --config examples/configs/wall_oss/base/2cam/224/fp16.tom
 | text_tokens 默认值 | 32 |
 | num_steps 默认值 | 10 |
 | action_horizon 默认值 | 32 |
-| 文本可调范围 | text_tokens正整数，需匹配实际instruction或non_image计数；instruction范围下真实prefix为2cam224 244+T、2cam256 278+T、3cam224 319+T、3cam256 370+T行，须≤640，即T≤396、362、321、270 |
-| 图像/音频可调范围 | 2/3相机；image_size=[224,224]或[256,256] |
+| 文本可调范围 | text_tokens正整数，需匹配实际instruction或non_image计数；instruction范围下真实prefix为2cam224 244+T、2cam256 278+T、3cam224 319+T、3cam256 370+T行，须≤640，即T≤396、362、321、270；1cam224为169+T、1cam256为186+T（T32 板上实测 201 / 218 行） |
+| 图像/音频可调范围 | 1/2/3相机（1相机 FP16 6/8 核已在板上通过）；image_size=[224,224]或[256,256] |
 | 生成可调范围 | num_steps=10；horizon=32 |
 | 其他输入形状 | batch含对应state与noise |
 | 联动限制 | batch/template二选一；template只允许cameras/image_size/text_tokens占位符。vision_window仅224，vision_pair仅256；指令不截断/填充。prefill执行行数：真实prefix≤384行补到16的倍数（单chunk），385–448、449–512、513–640行执行448、512、640行（等分两chunk），超过640行报错。 |
 | 默认核数 | 8 |
 | 入口 | [run.py](../../run.py) |
-
-- ✕ 4/6 核不支持：原生实现只有 8 核：语言模型的注意力和 MLP 固定 8 核，动作专家和 Qwen2.5-VL 视觉 owner 也按 8 核编写。
 
 输入校验来源：[base.py](../../../examples/runners/wall_oss/base.py) · [base_engine.py](../../../examples/runners/wall_oss/base_engine.py)。
 
@@ -76,9 +74,9 @@ python examples/run.py --config examples/configs/wall_oss/base/2cam/224/fp16.tom
 | 配置 | 支持状态 | 精度 | 量化范围 | 4 核 | 6 核 | 8 核 | 权重 |
 |---|---|---|---|---|---|---|---|
 | [legacy/fp16.toml](legacy/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `wall-oss-0.5` |
-| [legacy/w4a16_channel.toml](legacy/w4a16_channel.toml) | 支持（`SUPPORTED`） | w4a16 | decoder 专家投影逐通道 W4 | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `wall-oss-0.5-w4a16` |
-| [legacy/w4a16_g32.toml](legacy/w4a16_g32.toml) | 支持（`SUPPORTED`） | w4a16-pgrp | decoder 专家投影 W4 G32（expert-0 down 保持 INT8） | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `wall-oss-0.5-w4a16-pgrp` |
-| [legacy/w8a16.toml](legacy/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision、decoder 与 action_preprocessor 的二维 Linear W8（embed_tokens 除外） | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `wall-oss-0.5-w8a16` |
+| [legacy/w4a16_channel.toml](legacy/w4a16_channel.toml) | 支持（`SUPPORTED`） | w4a16 | Vision W8A16；Prefill（expert0） / Action（expert1） W4A16 逐通道 | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `wall-oss-0.5-w4a16` |
+| [legacy/w4a16_g32.toml](legacy/w4a16_g32.toml) | 支持（`SUPPORTED`） | w4a16 | Vision W8A16；Prefill（expert0） / Action（expert1） W4A16 G32（Prefill（expert0） Down W8A16） | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `wall-oss-0.5-w4a16-pgrp` |
+| [legacy/w8a16.toml](legacy/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill（expert0） / Action（expert1） / action_preprocessor W8A16 | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `wall-oss-0.5-w8a16` |
 
 本组配置相同的项：
 
@@ -94,7 +92,7 @@ python examples/run.py --config examples/configs/wall_oss/base/2cam/224/fp16.tom
 | CPU线程数 | 未设置（沿用环境） |
 | 入口 | [run.py](../../run.py) |
 
-- ✕ 4/6 核不支持：原生实现只有 8 核：语言模型的注意力和 MLP 固定 8 核，动作专家和 Qwen2.5-VL 视觉 owner 也按 8 核编写。
+- ✕ 4/6 核不支持：旧版档案绑定 rc9 的 8 核包络（448x252 三相机、prefill 640 行等分两块 320）；4/6 核的 prefill 分块上限是 256，不在该包络内，4/6 核请用 base 配置。
 
 输入校验来源：[runner.py](../../../examples/runners/wall_oss/runner.py) · [runtime.py](../../../python/rpu_backend/adapters/wall_oss/runtime.py)。
 
@@ -102,8 +100,8 @@ python examples/run.py --config examples/configs/wall_oss/base/2cam/224/fp16.tom
 
 | 配置 | 支持状态 | 精度 | 量化范围 | 4 核 | 6 核 | 8 核 | 权重 |
 |---|---|---|---|---|---|---|---|
-| [rtc/fp16.toml](rtc/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `/path/to/wrc_sf_v728`（profile 登记名 `wall-oss-0.5`）；准备方法见[权重准备](../WEIGHTS.md) |
-| [rtc/w8a16.toml](rtc/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill / Action W8（配套 W8 checkpoint） | ✕ 不支持 | ✕ 不支持 | ● 已实测 | checkpoint `/path/to/wrc_sf_v728-w8a16`、fp16_checkpoint `/path/to/wrc_sf_v728`（profile 登记名 `wall-oss-0.5-w8a16`）；准备方法见[权重准备](../WEIGHTS.md) |
+| [rtc/fp16.toml](rtc/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | ● 已实测 | ● 已实测 | ● 已实测 | `/path/to/wrc_sf_v728`（profile 登记名 `wall-oss-0.5`）；准备方法见[权重准备](../WEIGHTS.md) |
+| [rtc/w8a16.toml](rtc/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill / Action W8A16 | ● 已实测 | ● 已实测 | ● 已实测 | checkpoint `/path/to/wrc_sf_v728-w8a16`、fp16_checkpoint `/path/to/wrc_sf_v728`（profile 登记名 `wall-oss-0.5-w8a16`）；准备方法见[权重准备](../WEIGHTS.md) |
 
 本组配置相同的项：
 
@@ -120,17 +118,15 @@ python examples/run.py --config examples/configs/wall_oss/base/2cam/224/fp16.tom
 | CPU线程数 | 未设置（沿用环境） |
 | 入口 | [run.py](../../run.py) |
 
-- ✕ 4/6 核不支持：原生实现只有 8 核：语言模型的注意力和 MLP 固定 8 核，动作专家和 Qwen2.5-VL 视觉 owner 也按 8 核编写。
-
 输入校验来源：[rtc.py](../../../examples/runners/wall_oss/rtc.py) · [runtime.py](../../../python/rpu_backend/adapters/wall_oss/runtime.py)。
 
 ### 分拣动作
 
 | 配置 | 支持状态 | 精度 | 量化范围 | 4 核 | 6 核 | 8 核 | 权重 |
 |---|---|---|---|---|---|---|---|
-| [sorting/fp16.toml](sorting/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `/path/to/wrc_sf_v728_0_15000`；准备方法见[权重准备](../WEIGHTS.md) |
-| [sorting/w8a16.toml](sorting/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill / Action W8（配套 W8 checkpoint） | ✕ 不支持 | ✕ 不支持 | ● 已实测 | fp16_checkpoint `/path/to/wrc_sf_v728_0_15000`、w8_checkpoint `/path/to/wrc_v728_w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
-| [sorting/w8a16_action_w4a16_g32.toml](sorting/w8a16_action_w4a16_g32.toml) | 支持（`SUPPORTED`） | w8a16_action_w4a16 | Vision / Prefill（expert0，含共享 KV）W8；Action（expert1）W4A16 G32 | ✕ 不支持 | ✕ 不支持 | ● 已实测 | fp16_checkpoint `/path/to/wrc_sf_v728_0_15000`、w8_checkpoint `/path/to/wrc_v728_w8a16`、action_w4_checkpoint `/path/to/wrc_v728_action_w4a16_pgrp`；准备方法见[权重准备](../WEIGHTS.md) |
+| [sorting/fp16.toml](sorting/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | ● 已实测 | ● 已实测 | ● 已实测 | `/path/to/wrc_sf_v728_0_15000`；准备方法见[权重准备](../WEIGHTS.md) |
+| [sorting/w8a16.toml](sorting/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill（expert0，含共享 KV） / Action（expert1） W8A16 | ● 已实测 | ● 已实测 | ● 已实测 | fp16_checkpoint `/path/to/wrc_sf_v728_0_15000`、w8_checkpoint `/path/to/wrc_v728_w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
+| [sorting/w8a16_action_w4a16_g32.toml](sorting/w8a16_action_w4a16_g32.toml) | 支持（`SUPPORTED`） | w8a16_action_w4a16 | Vision / Prefill（expert0，含共享 KV） W8A16；Action（expert1） W4A16 G32 | ✕ 不支持 | ✕ 不支持 | ● 已实测 | fp16_checkpoint `/path/to/wrc_sf_v728_0_15000`、w8_checkpoint `/path/to/wrc_v728_w8a16`、action_w4_checkpoint `/path/to/wrc_v728_action_w4a16_pgrp`；准备方法见[权重准备](../WEIGHTS.md) |
 
 本组配置相同的项：
 
@@ -147,7 +143,7 @@ python examples/run.py --config examples/configs/wall_oss/base/2cam/224/fp16.tom
 | CPU线程数 | 未设置（沿用环境） |
 | 入口 | [run.py](../../run.py) |
 
-- ✕ 4/6 核不支持：原生实现只有 8 核：语言模型的注意力和 MLP 固定 8 核，动作专家和 Qwen2.5-VL 视觉 owner 也按 8 核编写。
+- ✕ 4/6 核不支持（`sorting/w8a16_action_w4a16_g32.toml`）：原生实现只有 8 核：Action W4A16 专家只有 8 核 owner；4/6 核的分拣请用 fp16 或 w8a16。
 
 输入校验来源：[sorting.py](../../../examples/runners/wall_oss/sorting.py)。
 

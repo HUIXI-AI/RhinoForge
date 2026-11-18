@@ -64,6 +64,7 @@ RPUModelForCausalLM.from_pretrained(
     dtype=torch.float16,
     device=None,
     rpu_execution=None,
+    quantization=None,  # 显式安装量化配方（如 w8a16、w4a16、nvfp4）
     max_seq_len=None,
     **hf_kwargs,
 )
@@ -219,7 +220,7 @@ model = RPUModelForConditionalGeneration.from_pretrained(
 
 ### Qwen3.5 MoE
 
-35B-A3B 的 RTN/GPTQ 路径使用 conditional loader、MoE adapter 和混合 cache。[配置与权重](../examples/configs/qwen3_5/README.md)须匹配，RTN 与 GPTQ 元数据不能互换。
+35B-A3B 的 RTN W4/W8 与 GPTQ 路径使用 conditional loader、MoE adapter 和混合 cache。[配置与权重](../examples/configs/qwen3_5/README.md)须匹配，RTN 与 GPTQ 元数据不能互换。
 
 ```python
 import torch

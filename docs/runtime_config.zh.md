@@ -585,7 +585,9 @@ heading 之后。
 | `RPU_GR00T_QWEN3VL_SPM_Z1` | 0 | `1` 或 `true` 开启 | 选择固定 FP16 单图像 Vision→Text SPM 路径；不接受 W8、部分旋转和主机 FP32 patch 计算。 |
 | `RPU_GR00T_RING_XOR3` | 0 | `0`/`1`；空值关闭，拒绝其他值 | 为支持的普通 B1/Q41、TP8、FP16 或 W8 O/FF2 投影选择可选残差规约路径；保留 FP32 累加及最终 FP16 舍入。 |
 | `RPU_GR00T_SELF_QKV_MULTIBASE` | 0 | `0`/`1`；空值关闭，拒绝其他值 | 模型形状和扩展算子匹配时合并普通 W8、TP8 自注意力 Q/K/V 投影；交叉注意力仍分别投影。 |
+| `RPU_GR00T_VISION_W4A16` | 0 | `0`/`1`、`false`/`true`、`off`/`on`，忽略大小写 | 在 `RPU_GR00T_W4A16=1` 基础上将 24 层 Qwen3-VL-2B Vision 块的 qkv/proj/fc1/fc2 冷安装量化为 G32 RTN W4A16；patch embedding 与 merger 保持 FP16。 |
 | `RPU_GR00T_VL_KV_SPM_ONLY` | 0 | `0`/`1`；空值关闭，拒绝其他值 | 支持的普通 B1、TP8 VL 注意力采用 SPM 路径时省略无用 DDR K/V 镜像；DDR 和已准备的 Z2 路径保留镜像。 |
+| `RPU_GR00T_W4A16` | 0 | `0`/`1`、`false`/`true`、`off`/`on`，忽略大小写 | 将 16 层 Qwen3-VL 文本前缀、4 层 VL 编码器与 32 层 DiT 投影冷安装量化为 G32 RTN W4A16，glue 与 AdaLN 保持 INT8（要求 `RPU_GR00T_W8A16=1`）；与驻留 FF1、合并 QKV 及 XOR3 开关互斥。 |
 | `RPU_GRAPH_HCB_CHECKSUM` | 0 | 未设置、空值或首字符 `0` 关闭；其他值开启 | 在 aten::_to_copy 回调前后记录形状、类型、求和及小张量值；首次执行回调时读取，不输出地址。 |
 | `RPU_GRAPH_TO_COPY_LOG` | 0 | 未设置、空值或首字符 `0` 关闭；其他值开启 | 记录稳定输出登记和接收返回值的字节数；登记路径首次读取，捕获路径每次读取。 |
 | `RPU_INTERNVLA_NEXTDIT_FOLD_NORM_MOD` | 0 | `0`/`1`、`false`/`true`、`off`/`on`，忽略大小写 | 在融合展开循环中将逐步 AdaRMS 调制与固定归一化权重预合并；逐步诊断执行保持原计算。 |
@@ -611,6 +613,9 @@ heading 之后。
 | `RPU_PI05_PREFILL_MASK_FP16` | 0 | `0`/`1`、`false`/`true`、`off`/`on`，忽略大小写 | 在 CPU 上以 FP16 准备并缓存前缀加性 mask，类型纳入缓存键；部分配对 TP8 模板显式开启。 |
 | `RPU_PI05_PREFILL_ROPE_CACHE` | 0 | `0`/`1`；空值关闭，拒绝其他值 | 按源张量身份、版本和位置缓存一次 RoPE 上传；原生稳定槽仍刷新，配对 Down、KV-direct 和 KV-only 配置要求关闭。 |
 | `RPU_PI05_PROBE_DIR` | 未设置 | 目录路径 | 将具名 Pi0.5 中间张量和 K/V 快照写入指定目录；每次导出读取，未设置则不写文件。 |
+| `RPU_PI05_SIGLIP_W4A16` | 0 | `0`/`1`、`false`/`true`、`off`/`on`，忽略大小写 | 冷安装时将 SigLIP 27 层全部六个编码投影量化为四通道 G32 RTN W4A16（4/6/8 核均用 4 核串行 Vision）；要求 `RPU_PI05_SIGLIP_W8A16=1`（`scope=all`），8 核时要求 `RPU_PI05_SIGLIP_BATCH=0`。 |
+| `RPU_PI05_VISION_KV_SPM_ONLY` | 1 | `0`/`1`、`false`/`true`、`off`/`on`，忽略大小写 | 在支持的批量 SigLIP 视觉路径中将 K/V 留在 SPM 并省略无用 DDR 镜像；串行 W4 视觉路径关闭。 |
+| `RPU_PI05_VISION_Q_RESIDENT` | 1 | `0`/`1`、`false`/`true`、`off`/`on`，忽略大小写 | 在支持的批量 SigLIP 视觉路径中将 Q 分块驻留 SPM；串行 W4 视觉路径关闭。 |
 | `RPU_RHINOVLA_ADARMS_RESIDENT` | 0 | `0`/`1`、`false`/`true`、`off`/`on`，忽略大小写 | 将固定 v3 专家的预计算 AdaRMS 表装入 SPM：non-RTC 驻留十步表；RTC 逐步驻留 state/prefix/suffix 三组表并在该步 18 层复用。要求预计算表，并拒绝 SKIP_ADARMS_GEMV。 |
 | `RPU_RHINOVLA_ALIGNED_KV` | 0 | `0`/`1`、`false`/`true`、`off`/`on`，忽略大小写 | 补齐固定 v3 专家的物理前缀与 K/V 写入，保留逻辑 mask 和 RoPE 位置；检查容量并清零补齐部分。 |
 | `RPU_RHINOVLA_EXPERT_DEPTH_LIMIT` | 未设置 | 不超过权重层数的正整数 | 诊断用专家层数，范围为 1 到权重层数，并调整前缀层选择；官方及固定 W8 配置拒绝缩减层数。 |

@@ -15,6 +15,7 @@ def _runner():
     tokens = torch.linspace(-2.01, 2.03, 64 * 2048).reshape(64, 2048)
     runner.w = NS(cfg=cfg, tok_emb=tokens)
     runner.prefix_len = 208
+    runner._persist = frozenset()  # Children are doubles; no cold SPM barrier.
     runner._prefix_template = False
     runner._prefix_key = runner._prefix_val = None
     runner._device_prefix_key = runner._device_prefix_val = None
@@ -132,7 +133,7 @@ def test_fused_vision_private_output_preserves_fresh_merger_without_cpu_readback
     owner = NS(w=NS(cfg=NS(vit_seq=4, vit_layers=1, vit_head_dim_padded=16, vit_heads=1)),
                _vit_cache=cache, _vit_packed=True, _pe_in_graph=True,
                _fused_merger=True, _merger_in_graph=True, _prefix_template=True,
-               _prepare_vit=lambda count: sub, _vit_out_dim=lambda: 3,
+               _vision_lanes=8, _prepare_vit=lambda count: sub, _vit_out_dim=lambda: 3,
                _plan_vision_execution=lambda *args: (NS(graph_key_words=lambda: ()), (), 16, {}),
                _component_generation=lambda component: 0,
                _record_execution_receipt=lambda **kwargs: None,

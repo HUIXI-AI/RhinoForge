@@ -45,8 +45,9 @@ struct Owner{
  bool ordinary=true,delivery_compatibility_=false,prefix_scatter_active_=false;
  bool native_composite_prepare_active_=false,z1_adopted_=false,z1_bound_=false;
  bool multiview_dry_prepared_=false,multiview_composite_prepared_=false,n1200_tm160_enabled_=false;
- int64_t image_batch_count_=1,z1_prepared_num_patches_=0,resolved=0,invalidations=0;
+ int64_t cores=8,image_batch_count_=1,z1_prepared_num_patches_=0,resolved=0,invalidations=0;
  std::vector<int64_t>deepstack_visual_indexes_{5,11,17};
+ int64_t num_cores()const{return cores;}
  bool ordinary_w8_resident_profile()const{return ordinary;}
  int64_t get_last_resolved_chunk_size()const{return resolved;}
  void invalidate_model_state(){++invalidations;}

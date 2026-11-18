@@ -36,7 +36,8 @@ def test_w4_topology_respects_budget_and_packed_row_alignment(geometry, cores):
     topology = qwen3_w4_topology(config(geometry), cores)
     h, intermediate, _, q = geometry
     assert topology.num_cores == cores
-    assert topology.attn_tp == topology.lm_head_tp == (8 if cores == 8 else 4)
+    assert topology.attn_tp == (8 if cores == 8 else 4)
+    assert topology.lm_head_tp == cores
     # Packed W4 shares the FP16/W8 template: MLP6 at budget 6, never MLP4.
     assert topology.mlp_tp == cores
     assert topology == resolve_decoder_topology(
@@ -118,15 +119,17 @@ def test_installed_b1_profile_rejects_cache_batch_before_allocation():
 @pytest.mark.parametrize('cores', [4, 6, 8])
 def test_packed_head_handoff_uses_cold_head_partition(monkeypatch, geometry, cores):
     from rpu_backend.adapters import qwen3
+    from rpu_backend.runtime.topology import decoder_lm_head_vocab_size
     c = config(geometry)
     topology = qwen3_w4_topology(c, cores)
-    head = torch.nn.Linear(c.hidden_size, c.vocab_size, bias=False, device='meta')
+    tp = topology.lm_head_tp
+    padded_vocab = decoder_lm_head_vocab_size(c.vocab_size, tp)
+    head = torch.nn.Linear(c.hidden_size, padded_vocab, bias=False, device='meta')
     from rpu_backend.quant.int4_pgrp_pack import w4_storage_shape
     head.weight = torch.nn.Parameter(torch.empty(
-        *w4_storage_shape(c.vocab_size, c.hidden_size, 1, topology.lm_head_tp),
+        *w4_storage_shape(padded_vocab, c.hidden_size, 1, tp),
         dtype=torch.uint8, device='meta'), requires_grad=False)
-    tp = topology.lm_head_tp
-    count = tp * ((c.hidden_size // 32 + 3) // 4) * ((c.vocab_size // tp + 63) // 64) * 256
+    count = tp * ((c.hidden_size // 32 + 3) // 4) * ((padded_vocab // tp + 63) // 64) * 256
     head.register_buffer('weight_scale', torch.empty(32, count // 32,
         dtype=torch.float16, device='meta'))
     head._rpu_linear_partition, head._rpu_linear_num_cores = 1, tp

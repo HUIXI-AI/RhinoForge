@@ -863,7 +863,9 @@ def test_g05_reuses_decoder_only_qwen35_install_contract():
     assert "self.proprio_embedder(proprio)" not in adapter
     assert "hidden = hidden.clone()" in adapter
     assert "_rpu_g05_vlm_handle" not in adapter
-    assert "prefill_graph_cache = _rb.graph.GraphCache(max_entries=1)" in adapter
+    assert ("prefill_graph_cache = _rb.graph.GraphCache(\n"
+            "            max_entries=1, runtime_policy=vlm._rpu_qwen3_5.graph_cache.runtime_policy)"
+            in adapter)
     assert "prefill_rope_cache = None" in adapter
     assert "if inputs_embeds.shape[1] == 1:" in adapter
     assert 'op_id=f"rpu_{family}_prefill"' in qwen_text
@@ -1631,6 +1633,8 @@ def _g05_vlm_installer_fixture(monkeypatch, module, events, request, *, linear_a
             return self
 
     class Cache:
+        runtime_policy = None
+
         def clear(self):
             events.append("clear")
 
@@ -1692,7 +1696,7 @@ def _g05_vlm_installer_fixture(monkeypatch, module, events, request, *, linear_a
         __import__("rpu_backend"),
         "graph",
         types.SimpleNamespace(
-            GraphCache=lambda *, max_entries: events.append(
+            GraphCache=lambda *, max_entries, runtime_policy=None: events.append(
                 ("graph_cache", max_entries)
             )
             or Cache()
@@ -2220,6 +2224,136 @@ def test_g05_rtc_action_op_keeps_prefix_mutable_and_modulation_segmented():
     assert "ctx().body_iter" not in rtc_reload
     # Allocation and row offsets are exercised by the actual-native body-table
     # test, including the larger ten-step route and the one-row fallback.
+
+
+def test_g05_rtc_trace_is_a_separate_zero_spm_diagnostic_graph():
+    action = _ACTION_ADAPTER.read_text()
+    qwen_cpp = _QWEN_CPP.read_text()
+    qwen_header = (
+        _ROOT / "src" / "fused" / "rpu_qwen3_5_model.h"
+    ).read_text()
+    backend = _RPU_DISPATCH.read_text()
+    declarations = _RPU_KERNEL_DECLS.read_text()
+    op = "qwen3_5_action_rtc_trace_forward"
+
+    schema = next(line for line in backend.splitlines() if f'm.def("{op}' in line)
+    for argument in (
+        "Tensor(b!) trace_pre_action",
+        "Tensor(c!) trace_action_embed",
+        "Tensor(d!) trace_final_hidden",
+        "Tensor(e!) trace_velocity",
+        "Tensor(f!) trace_post_action",
+    ):
+        assert argument in schema
+    assert f'TORCH_FN(rpu_{op})' in backend
+    assert f'm.impl("{op}", torch::CppFunction::makeFallthrough())' in backend
+    assert f"at::Tensor rpu_{op}(" in declarations
+    assert f"at::Tensor rpu_{op}(" in qwen_cpp
+    assert "forward_action_rtc_trace(" in qwen_header
+
+    trace_forward = qwen_cpp.split(
+        "at::Tensor Qwen3_5Model::forward_action_rtc_trace", 1
+    )[1].split(
+        "at::Tensor Qwen3_5Model::forward_action_step_impl", 1
+    )[0]
+    assert "forward_action_step_impl(" in trace_forward
+    assert "/*num_steps=*/10" in trace_forward
+    assert "run_all_layers(" not in trace_forward
+    production_forward = qwen_cpp.split(
+        "at::Tensor Qwen3_5Model::forward_action_rtc_step", 1
+    )[1].split(
+        "at::Tensor Qwen3_5Model::forward_action_rtc_trace", 1
+    )[0]
+    assert "/*trace=*/nullptr" in production_forward
+    production_schema = next(
+        line
+        for line in backend.splitlines()
+        if 'm.def("qwen3_5_action_rtc_step_forward' in line
+    )
+    assert "trace_" not in production_schema
+    step_impl = qwen_cpp.split(
+        "at::Tensor Qwen3_5Model::forward_action_step_impl", 1
+    )[1].split("// ── forward:", 1)[0]
+    assert "action_trace_active_ != trace_active" in step_impl
+    assert step_impl.index("action_trace_active_ = trace_active;") < step_impl.index(
+        "invalidate_model_state(/*planning_domain_changed=*/false);"
+    )
+
+    for live_base in (
+        "action_trace_pre_action_live_base_",
+        "action_trace_action_embed_live_base_",
+        "action_trace_final_hidden_live_base_",
+        "action_trace_velocity_live_base_",
+        "action_trace_post_action_live_base_",
+    ):
+        assert f"&{live_base}" in qwen_cpp
+    assert qwen_cpp.count("if (action_trace_active_) {") == 5
+    assert qwen_cpp.count(
+        "ctx().body_iter * action_len_ * action_dim_pad_ * DWIDTH"
+    ) == 3
+    assert qwen_cpp.count(
+        "ctx().body_iter * action_len_ * hidden_size() * DWIDTH"
+    ) == 2
+
+    spm_manifest = qwen_cpp.split(
+        "std::vector<BufferDecl> Qwen3_5Model::declare_buffers", 1
+    )[1].split("ModelStaticConfig Qwen3_5Model::static_config", 1)[0]
+    assert "action_trace" not in spm_manifest
+
+    production_loop = action.split("def _rpu_g05_action_loop(", 1)[1].split(
+        "def _rpu_g05_action_rtc_trace(", 1
+    )[0]
+    assert "action_trace_graph_cache" not in production_loop
+    assert "qwen3_5_action_rtc_trace_forward" not in production_loop
+
+    trace_helper = action.split("def _rpu_g05_action_rtc_trace(", 1)[1].split(
+        "def _rpu_g05_action_step_velocity(", 1
+    )[0]
+    assert 'op_id="rpu_g05_action_rtc_trace_loop"' in trace_helper
+    assert "cache = state.action_trace_graph_cache" in trace_helper
+    assert "torch.empty(" in trace_helper
+    assert f"torch.ops.rpu.{op}(" in trace_helper
+    assert "tensor.to(\"cpu\").float().clone()" in trace_helper
+    assert ("state.action_trace_graph_cache = _rb.graph.GraphCache(\n"
+            "            max_entries=1, runtime_policy=policy)" in action)
+
+    if not _RTC_RELEASE_GATE.is_file():
+        return
+    gate = _RTC_RELEASE_GATE.read_text()
+    assert "PRODUCTION_KERNEL_COUNT" not in gate
+    assert "PRODUCTION_DATA_NODE_COUNT" not in gate
+    assert "RTC_TRACE_DATA_NODE_DELTA = 5 * 10" in gate
+    gate_body = gate.split("def _run_rtc_action_trace_gate(", 1)[1].split(
+        "def _changed_prev_action(", 1
+    )[0]
+    trace_call = gate_body.index("traces = _rpu_g05_action_rtc_trace(")
+    restore_clear = gate_body.index("state.action_graph_cache.clear()", trace_call)
+    restored_call = gate_body.index("restored = run_production()", restore_clear)
+    restored_numeric_gate = gate_body.index(
+        'if not torch.equal(baseline, restored):',
+        restored_call,
+    )
+    assert trace_call < restore_clear < restored_call < restored_numeric_gate
+    assert '"RTC internal trace REPLAY"' in gate_body
+    assert "expected_replays=1" in gate_body
+    assert 'baseline_entry["data_node_count"] + RTC_TRACE_DATA_NODE_DELTA' in gate_body
+    assert 'if not torch.equal(traces[name], replay_traces[name]):' in gate_body
+    assert 'if not torch.equal(baseline, restored):' in gate_body
+    assert 'if not torch.equal(baseline, replayed):' in gate_body
+    run_body = gate.split("def run_rpu(", 1)[1]
+    assert "_run_rtc_action_trace_gate(" in run_body
+    fresh_rtc = run_body.index(
+        "rtc_phase_capture = _run_with_prev(runner, obs1, 1, teacher_prev)"
+    )
+    trace_gate = run_body.index("_run_rtc_action_trace_gate(", fresh_rtc)
+    trace_state = run_body.index('rtc_phase_capture["prefill_live"]', trace_gate)
+    fresh_no_rtc = run_body.index(
+        "phase_capture = _run_with_prev(runner, obs0, 0, None)", trace_state
+    )
+    no_rtc_gate = run_body.index("_run_no_rtc_action_phase_gate(", fresh_no_rtc)
+    assert fresh_rtc < trace_gate < trace_state < fresh_no_rtc < no_rtc_gate
+    diagnostic_tail = run_body[fresh_rtc:no_rtc_gate]
+    assert 'rtc_a["prefill_live"]' not in diagnostic_tail
 
 
 def test_g05_policy_perf_defaults_are_scoped_to_policy_patch():
@@ -3555,8 +3689,8 @@ def test_g05_reuses_one_rpu_cache_across_turns(monkeypatch):
             self.__class__.created.append(self)
 
         @classmethod
-        def from_config(cls, config, max_seq_len):
-            del config, max_seq_len
+        def from_config(cls, config, max_seq_len, num_cores=8):
+            del config, max_seq_len, num_cores
             return cls()
 
         @staticmethod

@@ -39,11 +39,31 @@ def _images(inputs):
             result.append(image.convert("RGB"))
     return result
 
+def leading_audio(waveform, inputs):
+    """The first [input].audio_seconds of a 16 kHz WAVEFORM (all of it when omitted); never padded."""
+    if "audio_seconds" not in inputs:
+        return waveform
+    frames = round(inputs["audio_seconds"] * 16000)
+    if len(waveform) < frames:
+        raise ValueError(f"[input].audio_seconds = {inputs['audio_seconds']} needs {frames} samples; "
+                         f"the audio has {len(waveform)}, and a short recording is not padded")
+    return waveform[:frames]
+
+def _recorded_checkpoint(config, path):
+    """PATH after its recorded precision recipe, if any, matched the entry's recipe."""
+    from examples.common.config import check_checkpoint_recipe
+
+    example = config["example"]
+    check_checkpoint_recipe(example.get("target"), path, selector=example.get("dtype"),
+                            profile_id=example.get("profile_id"))
+    return path
+
 def _policy_checkpoint(config):
     from rpu_backend.model_registry import model_path
 
     checkpoint = config["input"].get("checkpoint")
-    return Path(checkpoint).expanduser() if checkpoint else Path(model_path(config["example"]["registry_alias"]))
+    return _recorded_checkpoint(config, Path(checkpoint).expanduser() if checkpoint
+                                else Path(model_path(config["example"]["registry_alias"])))
 
 def _model_path(alias, *, label):
     if not isinstance(alias, str) or not alias:
@@ -88,7 +108,7 @@ def _controlled_checkpoint(config):
         path = Path(override).expanduser()
         if not path.is_dir():
             raise FileNotFoundError(f"[input].checkpoint: {path}")
-        return path
+        return _recorded_checkpoint(config, path)
     from rpu_backend.model_registry import model_path
 
-    return Path(model_path(config["example"]["registry_alias"]))
+    return _recorded_checkpoint(config, Path(model_path(config["example"]["registry_alias"])))

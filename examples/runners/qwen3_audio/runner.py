@@ -8,6 +8,7 @@ import statistics
 import time
 
 from examples.common.cpu import configure_cpu_threads, resolve_cpu_threads
+from examples.common.inputs import leading_audio
 from examples.common.libraries import file_sha256
 from examples.common.results import close_with_report, latency_timing, record_result
 
@@ -23,6 +24,21 @@ def audio_identity(filename):
             "channels": info.channels, "frames": info.frames, "seconds": info.duration}
 
 
+# API precision by the resolved per-module specs of the entry's recipe, per target.
+ROUTE_PROBES = {"qwen3_asr": (("decoder",), ("lm_head",), ("audio_encoder",)),
+                "qwen3_tts": (("talker",), ("predictor",), ("lm_head",))}
+ROUTES = {"qwen3_asr": {("fp16",) * 3: "fp16", ("w8a16", "w8a16", "fp16"): "w8a16",
+                        ("w4a16-g32", "w4a16-g32", "fp16"): "w4a16_g32", ("nvfp4", "fp16", "fp16"): "nvfp4"},
+          "qwen3_tts": {("fp16",) * 3: "fp16", ("w8a16",) * 3: "w8a16",
+                        ("w4a16-g32",) * 3: "w4a16_g32", ("nvfp4", "nvfp4", "fp16"): "nvfp4"}}
+
+
+def precision_route(target, precision):
+    from examples.common.config import owner_route
+    return owner_route({"qwen3_asr": "Qwen3-ASR", "qwen3_tts": "Qwen3-TTS"}[target], target,
+                       ROUTE_PROBES[target], ROUTES[target], selector=precision)
+
+
 def validate_example_config(config):
     targets = set(config) & {"qwen3_asr", "qwen3_tts"}
     if len(targets) != 1:
@@ -36,7 +52,7 @@ def validate_example_config(config):
     allowed = {"checkpoint", "source", "codec_backend", "precision"} if tts else {"checkpoint", "precision"}
     for table, keys, label in ((model, allowed, target),
             (inputs, {"text", "reference_audio", "language", "max_new_tokens"} if tts else
-             {"audio", "max_new_tokens"}, "input"),
+             {"audio", "audio_seconds", "max_new_tokens", "reference_text"}, "input"),
             (run, {"warmup", "runs", "seed", "output_dir", "profile", "hwperf"}, "run")):
         if not isinstance(table, dict) or set(table) - keys:
             raise ValueError(f"[{label}] contains unsupported fields or is not a table")
@@ -45,13 +61,19 @@ def validate_example_config(config):
     for table, key in required:
         if not isinstance(table.get(key), str) or not table[key].strip():
             raise ValueError(f"{key} requires non-empty text")
+    if not tts and "reference_text" in inputs and (
+            not isinstance(inputs["reference_text"], str) or not inputs["reference_text"].strip()):
+        raise ValueError("reference_text requires non-empty text")
+    if not tts and "audio_seconds" in inputs and (
+            type(inputs["audio_seconds"]) not in (int, float) or not 0.5 <= inputs["audio_seconds"] <= 8):
+        raise ValueError("audio_seconds takes the first 0.5–8 seconds of the audio")
     if tts and (len(inputs["text"]) > 1024 or inputs.get("language", "Chinese") not in ("Chinese", "English")):
         raise ValueError("TTS requires 1–1024 characters and Chinese or English")
     if tts and model.get("codec_backend", "rpu") not in ("cpu", "rpu"):
         raise ValueError("codec_backend must be cpu or rpu")
     from examples.common.config import _backend_leaf
     _backend_leaf("api/_qwen3_audio_precision.py").normalize_audio_precision(
-        model.get("precision", "fp16"), config.get("rpu_execution"), not tts)
+        precision_route(target, model.get("precision", "fp16")), config.get("rpu_execution"), not tts)
     for value, label, low, high in (
             (inputs.get("max_new_tokens", 256 if tts else 64), "max_new_tokens", 2 if tts else 1, 256 if tts else 64),
             (run.get("warmup", 2), "warmup", 0, None),
@@ -105,11 +127,18 @@ def run_example_config(config):
         else:
             from rpu_backend.api.qwen3_asr import _validate_audio
             info = sf.info(inputs["audio"])
-            if info.channels != 1 or info.samplerate != 16000 or not 8000 <= info.frames <= 128000:
+            if info.channels != 1 or info.samplerate != 16000 or not (
+                    "audio_seconds" in inputs or 8000 <= info.frames <= 128000):
                 raise ValueError("ASR input must be mono 16 kHz audio, 0.5–8 seconds")
             audio, rate = sf.read(inputs["audio"], dtype="float32")
+            audio = leading_audio(audio, inputs)
+            if len(audio) < info.frames and "reference_text" in inputs:
+                raise ValueError("reference_text transcribes the whole recording; "
+                                 "audio_seconds keeps only its start")
             _validate_audio(audio, rate, limit)
         report["input_identity"] = audio_identity(inputs["reference_audio" if tts else "audio"])
+        if not tts:
+            report["input_identity"]["used_frames"] = len(audio)
         if tts:
             report["input_identity"]["text_sha256"] = hashlib.sha256(inputs["text"].encode()).hexdigest()
             report["input_identity"]["text_characters"] = len(inputs["text"])
@@ -119,13 +148,15 @@ def run_example_config(config):
             if tts:
                 owner = Qwen3TTSModel.from_pretrained(options["checkpoint"], source=options["source"],
                     codec_backend=options.get("codec_backend", "rpu"),
-                    precision=options.get("precision", "fp16"), rpu_execution=config.get("rpu_execution"))
+                    precision=precision_route("qwen3_tts", options.get("precision", "fp16")),
+                    rpu_execution=config.get("rpu_execution"))
                 def infer():
                     return owner.synthesize(inputs["text"], reference_audio=inputs["reference_audio"],
                         language=inputs.get("language", "Chinese"), max_new_tokens=limit)
             else:
                 owner = Qwen3ASRModel.from_pretrained(options["checkpoint"],
-                    precision=options.get("precision", "fp16"), rpu_execution=config.get("rpu_execution"))
+                    precision=precision_route("qwen3_asr", options.get("precision", "fp16")),
+                    rpu_execution=config.get("rpu_execution"))
                 def infer():
                     return owner.transcribe(audio, sample_rate=rate, max_new_tokens=limit)
             report["load_seconds"] = time.perf_counter() - start

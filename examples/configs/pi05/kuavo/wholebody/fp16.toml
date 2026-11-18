@@ -1,7 +1,7 @@
 # 未写出的执行参数（省略即按以下值运行）：
 #   [cpu].threads 省略时本入口使用 8。
-#   分块（chunk_size）模板未写出，按 auto 由入口选择：T192 为配对 prefill C480（P960 = 2×480），
-#   视觉与去噪用 8 核融合路径。可调范围见模型页。
+#   分块（chunk_size）模板未写出，按 auto 由入口选择：8 核 T192 为配对 prefill C480（P960 = 2×480），
+#   4/6 核按预算自动选择通用分块（4 核 4×240，6 核 3×320）。可调范围见模型页。
 # Pi0.5 统一入口：openpi pi05 Kuavo 全身（双臂 16 + 下肢 4），输入为相机原尺寸帧、指令和物理 state。
 [model]
 target = "pi05"
@@ -50,5 +50,5 @@ seed = 0
 output_dir = "./pi05_results/kuavo/wholebody/fp16"
 
 [rpu_execution.model]
-# RPU 核数预算；T≠32 仅支持 8 核。
+# RPU 核数预算。可选 4 / 6 / 8，默认 8；修改后需重新加载模型。
 num_cores = 8

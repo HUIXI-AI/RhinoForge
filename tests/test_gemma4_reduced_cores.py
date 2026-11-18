@@ -273,7 +273,9 @@ namespace at { struct Tensor {
   template <class T> T* data_ptr() const { return nullptr; }
   int64_t size(int) const { return blocks; }
   Tensor slice(int, int64_t start) const { Tensor t = *this; t.offset += start; return t; }
-}; }
+};
+enum class ScalarType : int { Half, Char, Byte };
+constexpr ScalarType kHalf = ScalarType::Half, kChar = ScalarType::Char, kByte = ScalarType::Byte; }
 enum class RpuRmsNormSpmRoute : int { BASE = 0 };
 enum class ValuOpType : int { ADD = 1, SUB = 2, MUL = 3 };
 enum class GeluMode : int { NONE = 0, TANH = 1 };
@@ -333,6 +335,7 @@ struct Context {
 struct LayerWeights {
   at::Tensor q_w, k_w, v_w, o_w, q_norm_w, k_norm_w, input_norm_w, post_attn_norm_w,
       pre_ff_norm_w, post_ff_norm_w, gate_w, up_w, down_w, ple_gate_w, ple_proj_w, ple_post_norm_w;
+  at::Tensor q_s, k_s, v_s, o_s, gate_s, up_s, down_s;
   double layer_scalar = 0.5;
 };
 struct LayerGeom { int64_t head_dim; int64_t num_kv_heads; int64_t kv_source_layer; bool is_global; bool is_kv_shared; };
@@ -555,6 +558,100 @@ def test_adapter_binds_reduced_budget_before_weights(install_runtime, monkeypatc
         assert model._rpu_execution["model"] == {"num_cores": cores}
     finally:
         installed._finalize(model)
+
+
+@pytest.mark.parametrize("cores,lanes", ((8, 8), (6, 6), (4, 4)))
+def test_forward_projects_the_last_rows_through_the_rpu_tied_head(install_runtime, monkeypatch, cores, lanes):
+    expected = g4_topology.resolve_gemma4_topology(cores)
+    assert expected.head_tp == lanes
+    head, uploads, projections = object(), [], []
+    monkeypatch.setattr(runtime, "upload_lm_head", lambda weight, n: uploads.append(n) or head)
+    monkeypatch.setattr(runtime, "device_lm_logits", lambda hidden, weight, n, cap: (
+        projections.append((tuple(hidden.shape), weight, n, cap)) or torch.zeros(1, hidden.shape[1], 8)))
+    if cores != 8:
+        _patch_topology_ops(monkeypatch, install_runtime, lambda handle: expected.native_readback())
+    model = installed._adapter(rpu_execution={"model": {"num_cores": cores}}).to_rpu()
+    try:
+        monkeypatch.setattr(torch.nn.functional, "embedding", lambda *a, **k: installed._FakeActivation())
+        install_runtime["forward_output_seq_len"] = 3
+        model.forward(input_ids=torch.arange(3).reshape(1, 3), past_key_values=model.build_rpu_cache(),
+                      logits_to_keep=1)
+        assert uploads == [lanes]
+        assert projections == [((1, 1, 2560), head, lanes, 30.0)]
+    finally:
+        installed._finalize(model)
+
+
+def test_rpu_tied_head_matches_the_cpu_softcap_reference(monkeypatch):
+    """FP32-accumulated projection of the col-swizzled tied head, softcapped on the CPU."""
+    torch.manual_seed(0)
+    hidden, weight = torch.randn(1, 3, 32).half(), torch.randn(256, 32)
+    calls = []
+
+    def linear(rows, packed, bias, partition, lanes, acc32):
+        calls.append((tuple(rows.shape), bias, partition, lanes, acc32))
+        logical = torch.cat(_lanes(packed, 1, lanes))
+        return (rows.float() @ logical.float().t()).half()
+
+    monkeypatch.setattr(torch.ops.rpu, "linear_with_accumulation", linear, raising=False)
+    monkeypatch.setattr(runtime, "_to_rpu", lambda tensor: tensor.contiguous())
+    logits = runtime.device_lm_logits(hidden, runtime.upload_lm_head(weight, 8), 8, 30.0)
+    assert calls == [((3, 32), None, 1, 8, True)]
+    assert logits.dtype == torch.float32 and logits.shape == (1, 3, 256)
+    reference = runtime.softcap_lm_logits(hidden, weight.half(), 30.0)
+    assert torch.allclose(logits, reference, atol=0.05)
+
+
+@pytest.mark.parametrize("lanes", (4, 6, 8))
+def test_rpu_padded_tied_head_and_model_projection_match_cpu_reference(monkeypatch, lanes):
+    """6-lane zero-padded tied head (e.g. 256 -> 288) and RPU PLE model projection match CPU."""
+    torch.manual_seed(7)
+    vocab, h, layers, ple = 256, 32, 2, 16
+    hidden = torch.randn(1, 3, h).half()
+    embed = torch.randn(vocab, h) * 0.05
+    eptl = torch.randn(vocab, layers * ple) * 0.05
+    proj = torch.randn(layers * ple, h) * 0.05
+    pnorm = torch.ones(ple)
+    ids = torch.tensor([[1, 5, 11]], dtype=torch.long)
+
+    def linear(rows, packed, bias, partition, n_lanes, acc32):
+        assert bias is None and partition == 1 and n_lanes == lanes and acc32 is True
+        logical = torch.cat(_lanes(packed, 1, n_lanes))
+        return (rows.float() @ logical.float().t()).half()
+
+    monkeypatch.setattr(torch.ops.rpu, "linear_with_accumulation", linear, raising=False)
+    monkeypatch.setattr(runtime, "_to_rpu", lambda tensor: tensor.contiguous())
+    orig_to = torch.Tensor.to
+    monkeypatch.setattr(
+        torch.Tensor,
+        "to",
+        lambda self, *a, **kw: orig_to(
+            self,
+            *tuple("cpu" if x == "rpu" else x for x in a),
+            **{k: ("cpu" if v == "rpu" else v) for k, v in kw.items()},
+        ),
+    )
+
+    logits = runtime.device_lm_logits(
+        hidden, runtime.upload_lm_head(embed, lanes), lanes, 30.0, vocab_size=vocab
+    )
+    assert logits.shape == (1, 3, vocab)
+    assert torch.allclose(logits, runtime.softcap_lm_logits(hidden, embed.half(), 30.0), atol=0.05)
+
+    cpu_side = runtime.compute_side_input(
+        ids, embed_weight=embed, embed_per_layer_weight=eptl,
+        model_projection_weight=proj, projection_norm_weight=pnorm,
+        num_layers=layers, hidden_size=h, ple_dim=ple, eps=1e-6, num_cores=4,
+    )
+    rpu_side = runtime.compute_side_input(
+        ids, embed_weight=embed, embed_per_layer_weight=eptl,
+        model_projection_weight=proj, projection_norm_weight=pnorm,
+        num_layers=layers, hidden_size=h, ple_dim=ple, eps=1e-6, num_cores=4,
+        model_projection_rpu=runtime.upload_model_projection(proj, lanes),
+        model_projection_lanes=lanes,
+    )
+    assert rpu_side.shape == cpu_side.shape
+    assert torch.allclose(rpu_side.float(), cpu_side.float(), atol=0.02)
 
 
 def test_adapter_eight_core_install_keeps_the_original_native_calls(install_runtime, monkeypatch):

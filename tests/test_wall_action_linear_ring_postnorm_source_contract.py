@@ -125,6 +125,9 @@ def test_manifest_covers_actual_first_and_later_action_layers(tmp_path):
 #include <vector>
 #include "src/core/rpu_wall_sorting_config.h"
 #include "src/ops/rpu_linear_tiling.h"
+#include "src/fused/rpu_qwen3_w8a8_contract.h"
+namespace qwen3_w8a8 = v3::qwen3_w8a8;
+namespace qwen3_c192 = v3::qwen3_c192;
 #define TORCH_CHECK(condition, ...) do { if (!(condition)) throw std::runtime_error("route rejected"); } while (0)
 #define TORCH_INTERNAL_ASSERT(condition) assert(condition)
 constexpr int NUM_CORES=8;
@@ -185,6 +188,11 @@ struct Model {
     bool qwen3vl_4b_w8_profile_=false,qwen3vl_fp16_decode_profile_=false;
     bool decoder_mixed_precision_=false,lingbot_folded_rmsnorm_=false;
     void emit_lingbot_nogamma_norm(uint32_t,uint32_t,int64_t,int64_t)const{assert(false);}
+    template<class... Args> void emit_qwen3_prefill_w8a8_quant(Args...) const { assert(false); }
+    template<class... Args> void emit_qwen3_prefill_w8a8_linear(Args...) const { assert(false); }
+    template<class... Args> void emit_qwen3_prefill_w8a8_rms_quant(Args...) const { assert(false); }
+    template<class... Args> void emit_qwen3_c512_reduce(Args...) const { assert(false); }
+    uint32_t norm_post_addr(int,int) const { assert(false); return 0; }
     int64_t seq_len_=20;
     CausalDecoderPlanningMode planning_mode_=CausalDecoderPlanningMode::ORDINARY;
     bool has_mrope_=true,has_qk_norm_=false,linear_acc32_=false,adarms_=false;
@@ -256,6 +264,9 @@ struct Model {
         const int rows=seq_len_,h=1024,nq=16,nkv=8,hd=128,tp=8,bs=1;
         const uint32_t input_residual=4096;
         const bool residual_is_bf16=false,transition_to_bf16=false,is_last_layer=layer_idx==35;
+        // Wall Action never admits the independent plain-Qwen cold routes.
+        const bool qwen_a8=false,qwen_c512=false,qwen_inplace=false,qwen_a8_rms_quant=false;
+        bool qwen_a8_postnorm_ready=false;
         CONSUMER_GUARD
         CONSUMER_O
         CONSUMER_DOWN

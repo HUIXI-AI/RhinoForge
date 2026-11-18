@@ -76,7 +76,7 @@ struct Model{
  Model(){for(int l=0;l<32;++l)layer_weights_[l].is_cross=l%2==0;}
  Context context;Context&ctx(){return context;}const Context&ctx()const{return context;}
  int64_t num_layers()const{return layers;}int64_t hidden_size()const{return h;}int64_t intermediate_size()const{return ff;}
- int64_t num_q_heads()const{return q;}int64_t num_kv_heads()const{return kv;}int64_t head_dim()const{return hd;}int64_t attn_tp()const{return tp;}
+ int64_t num_q_heads()const{return q;}int64_t num_kv_heads()const{return kv;}int64_t head_dim()const{return hd;}int64_t attn_tp()const{return tp;}int num_cores()const{return NUM_CORES;}
  uint32_t addr(int,const char*n)const{const std::string name=n;return name=="cross_k_bank"?0x10200000:name=="cross_v_bank"?0x10400000:name=="k"?0x10020000:name=="v"?0x10040000:0x10060000;}
  struct Offset{uint32_t value;};Offset addr_offset(const char*n)const{return {addr(0,n)-0x10000000};}
  __METHODS__
@@ -139,10 +139,11 @@ int main(){
  setenv("RPU_GR00T_CROSS_KV_REUSE","0",1);Model unbanked;unbanked.record(chunk);transposes=projections=0;
  for(int body=0;body<4;++body){unbanked.context.body_iter=body;unbanked.run(chunk,0,raw,10);}assert(transposes==4&&projections==4);
  setenv("RPU_GR00T_CROSS_KV_REUSE","1",1);Model m;m.record(chunk);
- for(int bad=0;bad<11;++bad){Model x=m;switch(bad){case 0:x.vl_seq_=148;break;case 1:x.num_steps_=3;break;case 2:x.layers=31;break;case 3:x.tp=4;break;case 4:x.context.batch_size=2;break;case 5:x.layer_weights_[0].is_cross=false;break;case 6:x.context.routes[1].selector=1;break;case 7:x.context.routes[1].invocation=1;break;case 8:x.num_steps_=10;break;case 9:x.vl_seq_=214;break;case 10:x.num_steps_=10;x.vl_seq_=214;break;}
+ {Model m4=m;m4.tp=4;m4.record(chunk);assert(m4.cross_v_transpose_reused(chunk,raw));}
+ for(int bad=0;bad<11;++bad){Model x=m;switch(bad){case 0:x.vl_seq_=148;break;case 1:x.num_steps_=3;break;case 2:x.layers=31;break;case 3:x.tp=2;break;case 4:x.context.batch_size=2;break;case 5:x.layer_weights_[0].is_cross=false;break;case 6:x.context.routes[1].selector=1;break;case 7:x.context.routes[1].invocation=1;break;case 8:x.num_steps_=10;break;case 9:x.vl_seq_=214;break;case 10:x.num_steps_=10;x.vl_seq_=214;break;}
   const int before=transposes;try{x.cross_v_transpose_reused(chunk,raw);assert(false);}catch(const std::runtime_error&){}assert(transposes==before);
  }
- for(int bad=0;bad<12;++bad){Model x=m;switch(bad){case 0:x.loop_mode_=false;break;case 1:x.denoise_mode_=false;break;case 2:x.z2_bound_=true;break;case 3:x.z2_prepared_seq_len_=82;break;case 4:x.context.batch_size=2;break;case 5:x.tp=4;break;case 6:x.vl_seq_=0;break;case 7:x.context.complete=false;break;case 8:x.num_steps_=3;break;case 9:x.num_steps_=10;x.vl_seq_=0;break;case 10:x.num_steps_=10;x.vl_seq_=-1;break;case 11:x.num_steps_=5;break;}x.record(chunk);assert(!x.cross_v_transpose_reused(chunk,raw));}
+ for(int bad=0;bad<12;++bad){Model x=m;switch(bad){case 0:x.loop_mode_=false;break;case 1:x.denoise_mode_=false;break;case 2:x.z2_bound_=true;break;case 3:x.z2_prepared_seq_len_=82;break;case 4:x.context.batch_size=2;break;case 5:x.tp=2;break;case 6:x.vl_seq_=0;break;case 7:x.context.complete=false;break;case 8:x.num_steps_=3;break;case 9:x.num_steps_=10;x.vl_seq_=0;break;case 10:x.num_steps_=10;x.vl_seq_=-1;break;case 11:x.num_steps_=5;break;}x.record(chunk);assert(!x.cross_v_transpose_reused(chunk,raw));}
  for(int body:{-1,4}){m.context.body_iter=body;const int before=transposes;try{m.run(chunk,0,raw,0);assert(false);}catch(const std::runtime_error&){}assert(transposes==before);}
 }
 '''.replace("__CONSTANTS__", constants).replace("__READERS__", readers).replace("__METHODS__", methods).replace("__OPERANDS__", operands).replace("__TRANSPOSE__", transpose).replace("__MIRROR__", mirror)

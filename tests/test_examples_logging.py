@@ -236,7 +236,7 @@ def test_cli_preserves_wall_run_schema(tmp_path, family, relative):
             actual.validate_example_config(value)
             assert "hwperf" not in value["run"] and "profile" not in value["run"]
             return 0
-        cli.load_config = lambda _: config
+        cli.load_config = lambda _, **__: config
         setattr(cli, "_wall_base_runner" if family == "wall_oss" else "_wall_sorting_runner",
                 lambda: SimpleNamespace(run_example_config=run))
         assert cli.main(["--config", path]) == 0
@@ -276,7 +276,7 @@ def test_wall_cli_reaches_engine_with_only_current_session_logs(tmp_path, family
         # Keep the real CLI, config validation and output-directory preflight.
         base_engine.main = reached
         sorting.cold_environment = reached
-        cli.load_config = lambda _: config
+        cli.load_config = lambda _, **__: config
         try:
             cli.main(["--config", str(path)])
         except EngineReached:

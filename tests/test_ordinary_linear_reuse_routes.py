@@ -38,7 +38,7 @@ def ordinary_linear_reuse_executable(tmp_path_factory):
         "    bool qwen3vl_decode_gemv(",
         "    CausalDecoderLinearRoute decoder_projection_route(",
     ))
-    planner_if = _block(decoder, "                if (ordinary_row_weight_reuse_plan_enabled(")
+    planner_if = _block(decoder, "if (ordinary_row_weight_reuse_plan_enabled(")
     after_if = decoder[decoder.index(planner_if) + len(planner_if):]
     planner = planner_if + " " + _block(after_if, "else {")
     manifest_start = decoder.index("    FmbPhysicalExecutionManifest physical_manifest_for_candidate(")

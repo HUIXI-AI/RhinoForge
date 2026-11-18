@@ -172,7 +172,8 @@ def _host_install(monkeypatch, model, *, error=None):
 @pytest.mark.parametrize("cores", [4, 6, 8])
 def test_real_install_keeps_scales_head_accumulation_and_reconfigure_recipe(monkeypatch, acc32, cores):
     model = _model(acc32, cores=cores)
-    head_cores = 8 if cores == 8 else 4
+    attn_cores = 8 if cores == 8 else 4
+    head_cores = cores
     packed, converted, installs = _host_install(monkeypatch, model)
     adapter = qwen3.Qwen3Adapter(model, quantization="w4a16")
     with model.lm_head.weight.fake_mode:
@@ -187,7 +188,7 @@ def test_real_install_keeps_scales_head_accumulation_and_reconfigure_recipe(monk
     assert model.lm_head.weight is not model.model.embed_tokens.weight  # tied source is safely detached
     assert model.lm_head._rpu_linear_num_cores == head_cores
     assert installs[0]["execution_config"]["prefill"]["linear_acc32"] is acc32
-    assert installs[0]["topology"].identity() == (2, cores, head_cores,
+    assert installs[0]["topology"].identity() == (2, cores, attn_cores,
         adapter._topology.mlp_tp, head_cores, 8)
     for (role, _), scales in zip(w4._PROJECTIONS, installs[0]["scale_lists"], strict=True):
         for layer, scale in zip(model.model.layers, scales, strict=True):
@@ -338,7 +339,7 @@ def test_32b_w4_requires_staging_before_hf_weight_load(monkeypatch, recipe):
 @pytest.mark.parametrize("cores", [4, 6, 8])
 def test_dense_g32_installs_all_layers_without_repacking_head(monkeypatch, shape, acc32, cores):
     model = _model(acc32, cores=cores, **_dense_config(shape))
-    head_cores = 8 if cores == 8 else 4
+    attn_cores = 8 if cores == 8 else 4
     packed, converted, installs = _host_install(monkeypatch, model)
     adapter = qwen3.Qwen3Adapter(model, quantization="w4a16")
     with model.lm_head.weight.fake_mode:
@@ -349,8 +350,8 @@ def test_dense_g32_installs_all_layers_without_repacking_head(monkeypatch, shape
         "mlp_num_cores": adapter._topology.mlp_tp,
         "lm_head_num_cores": adapter._topology.lm_head_tp,
         "execution_core_count": cores}]
-    assert installs[0]["topology"].identity() == (2, cores, head_cores,
-        adapter._topology.mlp_tp, head_cores, 8)
+    assert installs[0]["topology"].identity() == (2, cores, attn_cores,
+        adapter._topology.mlp_tp, cores, 8)
     assert installs[0]["execution_config"]["prefill"]["linear_acc32"] is acc32
     assert model.lm_head.weight.dtype == model.model.embed_tokens.weight.dtype == torch.float16
     assert adapter.to_rpu() is model
@@ -379,7 +380,8 @@ def test_bounded_head_pack_breaks_tie_without_mutating_embedding():
 @pytest.mark.parametrize("cores", [4, 6, 8])
 def test_w4_head_real_install_pushes_packed_payload_and_cold_acc(monkeypatch, acc32, cores):
     model = _model(acc32, cores=cores)
-    head_cores = 8 if cores == 8 else 4
+    attn_cores = 8 if cores == 8 else 4
+    head_cores = cores
     packed, converted, installs = _host_install(monkeypatch, model)
     def packed_head(weight, group_size, *, num_cores):
         assert num_cores == head_cores
@@ -398,9 +400,10 @@ def test_w4_head_real_install_pushes_packed_payload_and_cold_acc(monkeypatch, ac
                         lambda *a: head_calls.append(a), raising=False)
     monkeypatch.setattr(qwen3, "_text_decode_execution_plan", lambda *a: None)
     def linear(x, weight, bias, partition, cores, accumulation, scale, *, logical_out_features):
-        assert logical_out_features == model.config.vocab_size
+        expected_out = 151968 if cores == 6 else model.config.vocab_size
+        assert logical_out_features == expected_out
         linear_calls.append((weight, partition, cores, accumulation, scale))
-        return torch.empty(x.shape[0], model.config.vocab_size, dtype=torch.float16)
+        return torch.empty(x.shape[0], expected_out, dtype=torch.float16)
     monkeypatch.setattr(torch.ops.rpu, "linear_with_accumulation", linear, raising=False)
     adapter = qwen3.Qwen3Adapter(model, quantization="w4a16_lm_head")
     with model.lm_head.weight.fake_mode:
@@ -409,7 +412,7 @@ def test_w4_head_real_install_pushes_packed_payload_and_cold_acc(monkeypatch, ac
         result = qwen3._int8_lm_head_prefill_logits(model, hidden)
     assert len(packed) == 196 and len(head_calls) == 1
     assert converted == [{"skip_names": set(w4.SKIP_LINEAR_NAMES) | {"lm_head"},
-        "attn_num_cores": head_cores, "mlp_num_cores": cores,
+        "attn_num_cores": attn_cores, "mlp_num_cores": cores,
         "lm_head_num_cores": head_cores, "execution_core_count": cores}]
     assert head_calls[0][1].dtype == torch.uint8
     assert head_calls[0][2] is model._rpu_lm_head_scale_keepalive
@@ -454,9 +457,9 @@ def test_32b_public_staging_claim_arena_banks_and_cache_capacity(monkeypatch, co
         assert kwargs == {"graph_arena_count": 9, "execution_core_count": cores}
         return SimpleNamespace(prepare_arenas=prepare)
     def materialize(owner, *, quantization, topology):
-        # 32B packed W4 keeps MLP6 at budget 6 (25600 is padded to 25728).
+        # 32B packed W4 keeps MLP6 and lm_head_tp=6 at budget 6 (25600 -> 25728, 151936 -> 151968).
         assert topology.identity() == (2, cores, 8 if cores == 8 else 4,
-            cores, 8 if cores == 8 else 4, 8)
+            cores, cores, 8)
         assert owner is model and quantization == "w4a16"
         assert owner._rpu_swizzle_started and "arena9" in events
         events.append("materialize")

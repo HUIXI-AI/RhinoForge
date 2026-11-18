@@ -43,7 +43,7 @@ def test_exact_admission_without_32b_optin(monkeypatch):
     adapter.Qwen3VLAdapter.preflight(cfg)
     for cores in (4, 6):
         topology = adapter._qwen3_vl_core_topology(cfg, {"model":{"num_cores":cores}})
-        assert topology.attn_tp == topology.lm_head_tp == 4
+        assert topology.attn_tp == 4 and topology.lm_head_tp == cores
         assert topology.mlp_tp == cores
 
 

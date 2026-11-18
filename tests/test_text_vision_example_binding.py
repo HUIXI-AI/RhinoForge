@@ -79,7 +79,8 @@ def test_qwen35_first_loader_and_adapter_use_the_same_real_cold_binding(monkeypa
         monkeypatch.setitem(sys.modules, name, stub)
 
     infer, owner = runner.prepare({
-        "example": {"target": "qwen3_5", "registry_alias": "qwen3_5-2b"},
+        "example": {"target": "qwen3_5", "registry_alias": "qwen3_5-2b",
+                    "profile_id": "qwen3_5-2b.fp16.text"},
         "input": {"prompt": "Hello", "decode_steps": 4}, "rpu_execution": request,
     })
     assert owner is model and callable(infer)
@@ -220,7 +221,8 @@ def test_post_install_cache_failure_retires_owner_and_preserves_primary(monkeypa
         monkeypatch.setitem(sys.modules, name, stub)
     with pytest.raises(RuntimeError, match="cache setup failed") as caught:
         runner.prepare({
-            "example": {"registry_alias": "qwen3-vl-2b", "target": "qwen3_vl"},
+            "example": {"registry_alias": "qwen3-vl-2b", "target": "qwen3_vl",
+                        "profile_id": "qwen3-vl-2b.fp16.text"},
             "input": {"component": "text", "prompt": "hello"}})
     assert caught.value is error
     metadata_check.assert_called_once()

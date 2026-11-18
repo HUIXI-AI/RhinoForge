@@ -379,3 +379,53 @@ def test_rhinovla_uses_pinned_factory_and_public_predict(monkeypatch, tmp_path):
     with pytest.raises(PermissionError, match="trust_model_code"):
         preparation.prepare(value)
     constructor.assert_not_called()
+
+
+def test_rhinovla_v3_source_raw_images_use_the_source_processor(monkeypatch, tmp_path):
+    import torch
+    from PIL import Image
+    from examples.common import preparation
+    from examples.runners.rhinovla import runner
+
+    paths = []
+    for index, size in enumerate(((640, 480), (320, 240))):
+        paths.append(str(tmp_path / f"{index}.png"))
+        Image.new("RGB", size, (index, 0, 0)).save(paths[-1])
+    value = config("rhinovla")
+    value["example"]["dtype"] = "fp16"
+    value["example"]["opt_in"] = {"RPU_RHINOVLA_EXPERT_W8A16": "0", "RPU_RHINOVLA_FULL_W8A16": "0"}
+    value["input"] = {"source_dir": "/source", "checkpoint": "/source/model.pt", "trust_model_code": True,
+                      "images": paths, "instruction": "pick up the object", "state": [0.5, -0.5, 0.25]}
+    value["run"] = {"seed": 0}
+    qin = {"input_ids": torch.ones(1, 140, dtype=torch.long), "attention_mask": torch.ones(1, 140),
+           "pixel_values": torch.zeros(512, 1536), "image_grid_thw": torch.tensor([[1, 16, 16]] * 2)}
+    policy = Mock()
+    policy.runtime = SimpleNamespace(qin=qin)
+    constructor = Mock(return_value=policy)
+    module(monkeypatch, "rpu_backend.api", RhinoVLAPolicy=SimpleNamespace(from_factory=constructor))
+    module(monkeypatch, "rpu_backend.adapters.rhinovla.factory",
+           V3_SOURCE_SHA="source-sha", V3_CHECKPOINT_SHA256="checkpoint-sha")
+    monkeypatch.setattr(runner, "_confirm_v3_source_quantization", lambda *_: None)
+
+    infer, owner = preparation.prepare(value)
+    infer()
+
+    name, params = constructor.call_args.args
+    assert owner is policy and name == "rpu_backend.adapters.rhinovla.factory:v3_runtime_factory"
+    raw = params["raw_inputs"]
+    assert "qin" not in params and raw["view_roles"] == ["top_head", "hand_left"]
+    assert [image.size for image in raw["images"]] == [(256, 256)] * 2
+    assert {image.mode for image in raw["images"]} == {"RGB"}
+    request = policy.predict.call_args.kwargs
+    mask = torch.zeros(1, 96)
+    mask[:, :3] = 1
+    assert torch.equal(request["state_mask"], mask) and torch.equal(request["action_mask"], mask)
+    assert request["state"][0, :4].tolist() == [0.5, -0.5, 0.25, 0.0]
+    x0 = torch.randn(1, 30, 96, generator=torch.Generator().manual_seed(0))
+    assert torch.equal(request["x0"], x0 * mask[:, None])
+    assert infer.input_geometry["prefix_tokens"] == 140 and infer.input_geometry["cameras"] == 2
+    # measurement.run() materializes the geometry into the report right after prepare.
+    assert infer.input_geometry["image_grid_thw"].tolist() == [[1, 16, 16]] * 2
+    value["input"]["fixture"] = "/fixture.pt"
+    with pytest.raises(ValueError, match="exactly one of"):
+        preparation.prepare(value)

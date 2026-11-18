@@ -13,7 +13,7 @@ from rpu_backend.api.qwen3_5_cache import Qwen3_5Cache
 
 @pytest.mark.parametrize("cores, expected", [
     (4, {"attention": 4, "mlp": 4, "lm_head": 4, "vision": 4}),
-    (6, {"attention": 4, "mlp": 6, "lm_head": 4, "vision": 4}),
+    (6, {"attention": 4, "mlp": 6, "lm_head": 6, "vision": 4}),
     (8, {"attention": 8, "mlp": 8, "lm_head": 8, "vision": 8}),
 ])
 def test_component_core_layout_is_explicit(cores, expected):
@@ -83,7 +83,7 @@ def _config(size=2):
 
 @pytest.mark.parametrize("size", [0.8, 2, 4, 9])
 @pytest.mark.parametrize("cores, expected", [(4, (4, 4, 4, 4, 8)),
-    (6, (6, 4, 6, 4, 8)), (8, (8, 8, 8, 8, 8))])
+    (6, (6, 4, 6, 6, 8)), (8, (8, 8, 8, 8, 8))])
 def test_official_shapes_resolve_one_cold_role_template(size, cores, expected):
     config = _config(size)
     # The real checkpoints carry BF16 metadata even when loaded as FP16.

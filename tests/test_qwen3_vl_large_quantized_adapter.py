@@ -94,7 +94,8 @@ def test_large_quantized_profiles_bind_component_topology(size, bits, cores):
     qwen3_vl.Qwen3VLAdapter.preflight_execution(cfg, execution)
     topology = qwen3_vl._qwen3_vl_core_topology(cfg, execution)
     assert topology.num_cores == cores
-    assert topology.attn_tp == topology.lm_head_tp == 4
+    assert topology.attn_tp == 4
+    assert topology.lm_head_tp == cores  # 151936 pads +32 rows to 151968 for lm_head_tp=6
     assert topology.mlp_tp == cores  # packed W4 pads its MLP6 width instead of MLP4
     assert topology.physical_kv_cores == 8
 
@@ -162,9 +163,10 @@ def quantized_install(monkeypatch, install_runtime):
 
     monkeypatch.setattr(torch.ops.rpu, "causal_decoder_set_lm_head", set_head)
 
-    def merger(model, *, w8a16=False):
+    def merger(model, cores=8, *, w8a16=False):
         assert w8a16
         state["events"].append(("enable_w8_vision_mergers", model._rpu_vision_handle))
+        state["merger_cores"] = cores
         model._rpu_vision_merger_on_device = True
         model._rpu_patch_embed_on_device = True
 
@@ -242,6 +244,13 @@ def test_large_runtime_to_rpu_uses_private_installers_and_generic_replay(
     assert ("set_vision_linear_acc32", 11, False) in events
     assert owner._linear_acc32_policy == {"prefill": False, "vision": False}
     assert ("enable_w8_vision_mergers", 11) in events
+    # W8 Vision keeps the full budget's 8 lanes and runs the eager mergers, so
+    # its AUTO chunk is sized from live SPM too: Text Persistent is reserved
+    # cold, after the last Text setter and before the first forward.
+    assert "num_cores" not in vision_args and state["merger_cores"] == 8
+    barrier = ("prepare_text_persistent", 22, 16, 0, True)
+    assert events.count(barrier) == 1
+    assert events.index(("set_lm_head", 22)) < events.index(barrier)
     for name in ("qwen3vl_vision_set_fast_replay", "qwen3vl_vision_set_preload_replay_skip"):
         assert (name, 11, True) in events
     for name in ("causal_decoder_set_fast_replay", "causal_decoder_set_preload_replay_skip"):
@@ -256,6 +265,47 @@ def test_large_runtime_to_rpu_uses_private_installers_and_generic_replay(
     assert owner.to_rpu() is model
     assert events.count(("move_runtime_decoder",)) == 1
     owner.close()
+
+
+@pytest.mark.parametrize("size", [8, 32])
+def test_large_vision_w4_runs_vision_on_four_cores_at_budget_eight(quantized_install, size):
+    # The padded o/fc2 rows split into 64-aligned pgrp lanes at 4 cores only, so
+    # the 8-core budget keeps text and head on 8 cores and installs Vision on 4.
+    state = quantized_install
+    model = small_quantized_model(size, 4)
+    owner = qwen3_vl.Qwen3VLAdapter(model, quantization="vision_w4a16")
+    assert owner._topology is None
+    assert owner.to_rpu() is model
+    vision_args = state["vision_kwargs"]
+    assert (vision_args["num_cores"], vision_args["w4a16"]) == (4, True)
+    assert vision_args["_allow_runtime_quantized_large"] is True
+    assert not vision_args.get("w8a16", False) and not vision_args.get("_pack_fp16_block_weights", False)
+    assert state["text_kwargs"].get("topology") is None
+    assert ("enable_w8_vision_mergers", 11) in state["events"] and state["merger_cores"] == 4
+    # Four-core Vision AUTO sizes its chunk from live SPM: Text's fixed
+    # Persistent slots are reserved cold, after the last Text setter and
+    # before the first forward plans Vision.
+    events = state["events"]
+    barrier = ("prepare_text_persistent", 22, 16, 0, True)
+    assert events.count(barrier) == 1
+    assert events.index(("set_lm_head", 22)) < events.index(barrier)
+    assert events.index(("resolve_decode", False, True)) < events.index(barrier)
+    owner.close()
+
+
+def test_four_core_vision_refuses_video_at_budget_eight():
+    from types import SimpleNamespace as NS
+
+    from rpu_backend.api.cache import RPUCache
+
+    model = NS(model=NS(language_model=NS(), visual=NS(_rpu_vision_num_cores=4)),
+               config=NS(text_config=NS()))
+    with pytest.raises(NotImplementedError, match="four-core Qwen3-VL Vision admits still images"):
+        qwen3_vl._rpu_qwen3vl_forward(
+            model, input_ids=torch.ones((1, 4), dtype=torch.int64),
+            past_key_values=object.__new__(RPUCache),
+            pixel_values_videos=torch.zeros((16, 1536)),
+            video_grid_thw=torch.tensor([[2, 2, 4]]))
 
 
 @pytest.mark.parametrize("size,bits", PROFILES)

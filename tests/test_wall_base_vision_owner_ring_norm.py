@@ -321,16 +321,17 @@ def test_actual_fp16_w8_owner_routes_and_full_layer_handoffs(tmp_path):
         'enum class Qwen25VisionAllReduceRoute', 'enum class Qwen25VisionLinearRoute')) + r'''
 constexpr int QWEN25VL_VISION_MIXED_BOUNDARY_LAYER=17;
 int64_t qwen25_vision_linear_route(){return 0;}
-int64_t qwen25_vision_ring_route(int64_t m,int64_t n){assert(m==672&&n==1280);return 7;}
+int64_t qwen25_vision_ring_route(int64_t m,int64_t n,int cores=8){assert(m==672&&n==1280&&cores==8);return 7;}
 enum class ValuOpType {SILU,MUL};
+enum class GeluMode {NONE};
 constexpr uint32_t RES=0x1000,INPUT=0x2000,PARTIAL=0x3000,SDPA=0x4000,GATE=0x5000,UP=0x6000;
 enum Content {EMPTY,FULL_RAW,OWNER_RAW,FULL_NORM,PARTIALS,ACTIVATION};
 std::array<Content,7> contents;
 int o_calls=0,down_calls=0,ring_calls=0,norm_calls=0,linear_calls=0,mlp_calls=0;
 Content& content(uint32_t a){assert(a%4096==0&&a/4096<contents.size());return contents[a/4096];}
 void rpu_launch_rmsnorm_spm_kernel(uint32_t in,uint32_t out,uint32_t gamma,
- int64_t m,int64_t n,double eps,RpuRmsNormSpmRoute route){
- assert(m==672&&n==1280&&eps==1e-6&&gamma>=0x100000&&route==RpuRmsNormSpmRoute::V32_GRID8);
+ int64_t m,int64_t n,double eps,RpuRmsNormSpmRoute route,int cores=8){
+ assert(m==672&&n==1280&&eps==1e-6&&gamma>=0x100000&&route==RpuRmsNormSpmRoute::V32_GRID8&&cores==8);
  assert(content(in)==FULL_RAW);content(out)=FULL_NORM;++norm_calls;
 }
 void rpu_launch_wall_base_vision_owner_ring_norm_m672_kernel(
@@ -405,7 +406,7 @@ template<class... A>void rpu_launch_eltwise_binary_spm_kernel(A...){assert(false
                   std::vector<int64_t> args={},int64_t flags=0){
    manifest.routes.push_back({site,f,selector,flags,std::move(args),invocation});};
   auto append_ring=[&](int64_t site,int64_t rows,int64_t cols,int64_t invocation){
-   append(FmbRouteFamily::ALL_REDUCE,site,qwen25_vision_ring_route(rows,cols),invocation);};
+   append(FmbRouteFamily::ALL_REDUCE,site,qwen25_vision_ring_route(rows,cols,num_cores()),invocation);};
   const bool has_pre_boundary_layer=true;
   for(const auto& chunk:plan.compute.chunks){
 PRODUCER
@@ -421,6 +422,8 @@ SORT_OWNER
 HEAD
 TAIL
  }
+ // The ordinary emitters read the cold core budget; these fixtures are eight-core.
+ int num_cores()const{return 8;}
  Context context;''')
     old_addr = block(source, ' uint32_t addr(int core,const std::string& name)')
     source = source.replace(old_addr, r''' uint32_t addr(int core,const std::string& name){assert(core==0);

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HyVLA TOML execution behind the shared examples entry (two/three cameras, TP8)."""
+"""HyVLA TOML execution behind the shared examples entry (one to three cameras, 4/6/8 cores)."""
 from __future__ import annotations
 
 from examples.common import cpu as _cpu_helpers
@@ -24,8 +24,12 @@ _LOG = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[3]
 _CPU = vars(_cpu_helpers)
 _LIBRARIES = vars(_cold_libraries)
-PRECISIONS = ("fp16", "w8a16", "w8a16_nvfp4")
+PRECISIONS = ("fp16", "w8a16", "w8a16_nvfp4", "w4a16", "w4a16_vision")
 PRECISION_ALIASES = {"w8a16_action_nvfp4": "w8a16_nvfp4"}
+# Admission by the resolved per-module specs of the entry's precision recipe.
+ROUTE_PROBES = (("vision",), ("vlm",), ("action",))
+ROUTES = {("fp16",) * 3: "fp16", ("w8a16",) * 3: "w8a16", ("w8a16", "w8a16", "nvfp4"): "w8a16_nvfp4",
+          ("w8a16", "w4a16-g32-rtn", "w4a16-g32-rtn"): "w4a16", ("w4a16-g32-rtn",) * 3: "w4a16_vision"}
 DEFAULT_INSTRUCTION = (
     "Pick up the bottle from the table with the right gripper, keep it upright, and move it toward "
     "the empty target area. Avoid the cup and the other objects near the bottle. Use the left "
@@ -40,8 +44,26 @@ def canonical_precision(precision):
     return PRECISION_ALIASES.get(precision, precision)
 
 
+def precision_route(precision):
+    """The PRECISIONS mode the recipe behind PRECISION (a selector or alias) resolves to."""
+    from examples.common.config import owner_route
+    return owner_route("HY-VLA", "hy_vla", ROUTE_PROBES, ROUTES, selector=canonical_precision(precision))
+
+
+# The action expert admits its resident and fused routes for prefix rows 128-240
+# (optimized_prefix_supported in rpu_hyvla_expert_model.cpp). Two or three cameras
+# always need at least 128 rows; one camera (at most 124 real rows) runs at that floor.
+EXPERT_MIN_PREFIX = 128
+
+
 def prefix_rows(cameras, text_tokens):
-    return ((2 + cameras * 58 + text_tokens + 15) // 16) * 16
+    return max(EXPERT_MIN_PREFIX, ((2 + cameras * 58 + text_tokens + 15) // 16) * 16)
+
+
+def core_budget(config):
+    """The cold rpu_execution.model.num_cores (8 when omitted)."""
+    model = (config.get("rpu_execution") or {}).get("model", {})
+    return model.get("num_cores", 8) if isinstance(model, dict) else 8
 
 
 def validate_example_config(config):
@@ -62,17 +84,29 @@ def validate_example_config(config):
         if not isinstance(table, dict) or set(table) - keys:
             raise ValueError(f"[{section}] has unsupported fields")
     _CPU["resolve_cpu_threads"](config)
-    precision = canonical_precision(config["hy_vla"].get("precision"))
-    if precision not in PRECISIONS:
-        raise ValueError(f"[hy_vla].precision must be one of {PRECISIONS}")
+    precision = precision_route(config["hy_vla"].get("precision"))
     if config["hy_vla"].get("rmsnorm_vwarp", "auto") not in ("auto", "16"):
         raise ValueError('[hy_vla].rmsnorm_vwarp must be "auto" or "16"')
+    execution = config.get("rpu_execution", {})
+    if not isinstance(execution, dict) or set(execution) - {"model"}:
+        raise ValueError("this HyVLA entry admits automatic component planning; only rpu_execution.model.num_cores")
+    model = execution.get("model", {})
+    if (not isinstance(model, dict) or set(model) - {"num_cores"}
+            or type(model.get("num_cores", 8)) is not int or model.get("num_cores", 8) not in (4, 6, 8)):
+        raise ValueError("[rpu_execution.model] accepts only num_cores = 4, 6 or 8")
+    cores = core_budget(config)
+    # At 4/6 cores the VLM runs on the whole budget and Vision/Action on four
+    # cores; "auto" resolves to the BASE RMSNorm there because the vector
+    # payloads and the resident FP8-scale layout are eight-core only.
+    if cores != 8 and config["hy_vla"].get("rmsnorm_vwarp", "auto") != "auto":
+        raise ValueError(f'[hy_vla].rmsnorm_vwarp = "16" is eight-core only; use "auto" at model.num_cores={cores}')
     inputs, run = config["input"], config["run"]
-    if type(inputs.get("cameras")) is not int or inputs["cameras"] not in (2, 3):
-        raise ValueError("HyVLA requires cameras=2 or 3")
+    if type(inputs.get("cameras")) is not int or inputs["cameras"] not in (1, 2, 3):
+        raise ValueError("HyVLA requires cameras=1, 2 or 3")
     text = inputs.get("text_tokens")
     if type(text) is not int or not 1 <= text <= 64:
-        raise ValueError("text_tokens must be an integer from 1 to 64")
+        raise ValueError("text_tokens must be an integer from 1 to 64: the checkpoint's tokenizer_max_length "
+                         "is 64, and its preprocessing truncates the instruction to 64 language slots")
     minimum = prefix_rows(inputs["cameras"], text)
     maximum = prefix_rows(inputs["cameras"], 64)
     prefix = inputs.get("prefix_len", "auto")
@@ -83,6 +117,8 @@ def validate_example_config(config):
         raise ValueError("[hy_vla].resident_fp8_scale_layers must be integer 0, 4 or 8")
     if scale_layers and precision != "w8a16_nvfp4":
         raise ValueError(f"resident_fp8_scale_layers={scale_layers} requires Action NVFP4")
+    if scale_layers and cores != 8:
+        raise ValueError(f"resident_fp8_scale_layers is eight-core only; got model.num_cores={cores}")
     if type(inputs.get("num_steps", 10)) is not int or inputs.get("num_steps", 10) != 10:
         raise ValueError("HyVLA requires ten denoise steps")
     if not isinstance(inputs.get("checkpoint"), str) or not inputs["checkpoint"].strip():
@@ -114,21 +150,19 @@ def validate_example_config(config):
     if libraries is not None and (set(libraries) != allowed["libraries"] or
             any(not isinstance(v, str) or not v.strip() for v in libraries.values())):
         raise ValueError("[libraries] must explicitly name native, main, and expansion together")
-    execution = config.get("rpu_execution", {})
-    if not isinstance(execution, dict) or set(execution) - {"model"}:
-        raise ValueError("this HyVLA entry admits automatic component planning; only rpu_execution.model.num_cores=8")
-    model = execution.get("model", {})
-    if not isinstance(model, dict) or set(model) - {"num_cores"} or type(model.get("num_cores", 8)) is not int or model.get("num_cores", 8) != 8:
-        raise ValueError("HyVLA requires rpu_execution.model.num_cores=8")
 
 
 def example_arguments(config):
     validate_example_config(config)
     inputs, run = config["input"], config["run"]
     prefix = inputs.get("prefix_len", "auto")
-    return SimpleNamespace(precision=canonical_precision(config["hy_vla"]["precision"]), checkpoint=inputs["checkpoint"],
+    cores = core_budget(config)
+    return SimpleNamespace(precision=precision_route(config["hy_vla"]["precision"]), checkpoint=inputs["checkpoint"],
+        num_cores=cores,
         resident_fp8_scale_layers=config["hy_vla"].get("resident_fp8_scale_layers", 0),
-        rmsnorm_vwarp=config["hy_vla"].get("rmsnorm_vwarp", "auto"),
+        # "auto" (also when omitted) picks V16/V32 by geometry at eight cores and
+        # the BASE route ("0") at 4/6, where the vector payloads have no owner.
+        rmsnorm_vwarp=config["hy_vla"].get("rmsnorm_vwarp", "auto") if cores == 8 else "0",
         source=inputs.get("source", "batch" if "batch" in inputs else "synthetic"),
         batch=Path(inputs["batch"]).expanduser() if "batch" in inputs else None,
         instruction=inputs.get("instruction", DEFAULT_INSTRUCTION),
@@ -139,9 +173,9 @@ def example_arguments(config):
         output_dir=Path(run["output_dir"]).expanduser(), profile=run.get("profile", False),
         hwperf=run.get("hwperf", False), libraries=config.get("libraries"),
         reference=Path(inputs["reference"]).expanduser() if "reference" in inputs else None,
-        # The shared TOML exposes a fixed eight-core profile. HyVLA's public
-        # API accepts stage scopes only; the cold profile binds TP8 separately.
-        rpu_execution={stage: {"chunk_size": "auto"} for stage in ("vision", "prefill", "action")})
+        # Stage scopes stay automatic; the cold core budget is the only model scope.
+        rpu_execution={**{stage: {"chunk_size": "auto"} for stage in ("vision", "prefill", "action")},
+                       **({} if cores == 8 else {"model": {"num_cores": cores}})})
 
 
 def registered_example(config):
@@ -153,9 +187,12 @@ def registered_example(config):
 
 def profile_environment(args):
     nv4 = canonical_precision(args.precision) == "w8a16_nvfp4"
-    return {
-        "RPU_HY_VLA_W8A16": "vit,vlm" if nv4 else ("all" if args.precision == "w8a16" else "0"),
-        "RPU_HY_VLA_W4A16": "0", "RPU_HY_VLA_EXPERT_NVFP4": str(int(nv4)),
+    w4 = args.precision == "w4a16"
+    w4v = args.precision == "w4a16_vision"
+    env = {
+        "RPU_HY_VLA_W8A16": "vit,vlm" if nv4 else "vit" if w4 else ("all" if args.precision == "w8a16" else "0"),
+        "RPU_HY_VLA_W4A16": "vit,vlm,expert" if w4v else "vlm,expert" if w4 else "0",
+        "RPU_HY_VLA_EXPERT_NVFP4": str(int(nv4)),
         "RPU_HY_VLA_ATTN_TP8": "1", "RPU_HY_VLA_ACTION_MLP_MC": "1",
         "RPU_HY_VLA_RMSNORM_PAD16": "expert", "RPU_HY_VLA_PREFILL_KV_ONLY": "1",
         "RPU_HY_VLA_VISION_KV_SPM_ONLY": "1", "RPU_HY_VLA_EXPERT_GATEUP_RESIDENT": "1",
@@ -164,6 +201,24 @@ def profile_environment(args):
         "RPU_HY_VLA_EXPERT_RESIDENT_FP8_SCALE_LAYERS": str(args.resident_fp8_scale_layers),
         "RPU_RMSNORM_VWARP": args.rmsnorm_vwarp,
     }
+    if w4 or w4v:
+        # SPM-resident Gate/Up has FP16/W8/NVFP4 layouts only; packed W4 keeps
+        # the generated auto-tile DDR Linear at every core count.
+        env.update({"RPU_HY_VLA_EXPERT_GATEUP_RESIDENT": "0",
+                    "RPU_HY_VLA_EXPERT_GATEUP_RESIDENT_LAYERS": "6"})
+    if w4v:
+        # Packed W4 Vision runs on four lanes under every budget (padded o/fc2
+        # rows do not split into eight W4 cores), so its KV stays in DDR.
+        env["RPU_HY_VLA_VISION_KV_SPM_ONLY"] = "0"
+    if getattr(args, "num_cores", 8) != 8:
+        # 4/6 cores: native KV4 attention, DDR Vision KV and no SPM-resident
+        # expert weights (eight-core layouts); the Action MLP takes four cores.
+        env.update({
+            "RPU_HY_VLA_ATTN_TP8": "0", "RPU_HY_VLA_RMSNORM_PAD16": "0",
+            "RPU_HY_VLA_VISION_KV_SPM_ONLY": "0", "RPU_HY_VLA_EXPERT_GATEUP_RESIDENT": "0",
+            "RPU_HY_VLA_EXPERT_GATEUP_RESIDENT_LAYERS": "6",
+        })
+    return env
 
 
 def digest(path):
@@ -488,7 +543,8 @@ def run_example_config(config):
         with torch.inference_mode(), trace:
             try:
                 policy = HyEmbodiedPolicy.from_checkpoint(checkpoint,
-                    dtype="fp16" if args.precision == "fp16" else "w8a16", prefix_len=args.prefix_len,
+                    dtype={"w4a16_vision": "w4a16-vision"}.get(args.precision, args.precision)
+                          if args.precision in ("fp16", "w4a16", "w4a16_vision") else "w8a16", prefix_len=args.prefix_len,
                     n_cameras=args.cameras, threads=args.cpu_threads, runtime_env=profile_environment(args), rpu_execution=args.rpu_execution)
                 tokenizer = policy._tokenizer()
                 if batch is None:

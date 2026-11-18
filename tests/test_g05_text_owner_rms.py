@@ -152,6 +152,8 @@ struct Model{
  std::array<uint64_t,24>gdn_state_live_addr_{},conv_state_live_addr_{};
  int64_t seq_len=256,position=0,batch_size=1;double eps_=1e-6;int invalidations=0;
  struct{bool enabled()const{return false;}}action_nvfp4_;
+ // The dense-text NVFP4 owner is uninstalled in this probe (enabled() false).
+ struct{bool enabled()const{return false;}}text_nvfp4_;
  std::vector<Weights>layer_weights_{24};std::vector<uint8_t>layer_is_full_=std::vector<uint8_t>(24);FmbThreeStageChunkPlan stage_plan;Manifest manifest;
  Model(){for(int i=0;i<24;++i){layer_is_full_[i]=(i+1)%4==0;auto&n=layer_weights_[i].post_norm_w;n.dtype=at::kHalf;n.rank=1;n.owner=i+1;
   auto&w=layer_weights_[i];w.gate_w.rows=w.up_w.rows=6144;w.down_w.cols=6144;

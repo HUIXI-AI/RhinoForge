@@ -858,8 +858,13 @@ def test_request_validation(value, match):
 def test_lingbot_three_camera_t128_budget_bounds_layout_search(precision):
     import tomllib
 
-    template = _ROOT / f"examples/configs/lingbot/v2/3cam/{precision}.toml"
-    config = tomllib.loads(template.read_text())
+    from examples.common import config as example_config, overrides as example_overrides
+
+    template = _ROOT / f"examples/configs/lingbot/v2/{precision}.toml"
+    config = example_config.load_config(template)
+    example_overrides.apply_overrides(
+        config, {"input": example_overrides.preset_input(
+            config, "3cam_t32", {"observation": "obs_3cam_t32.pt"})})
     assert config["input"]["cameras"] == 3
     assert config["input"]["expected_language_tokens"] == 32
     budget = config["rpu_execution"]["prefill"]["padding_budget"]

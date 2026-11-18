@@ -30,7 +30,7 @@ def test_decode_mlp_manifest_and_dispatch(tmp_path, size, fused):
         (source,"CausalDecoderPlanningMode")))
     structs = "\n".join(definition(base,f"struct {name}")+";" for name in
                          ("ChunkInfo","FmbRouteManifestEntry","FmbPhysicalExecutionManifest"))
-    constants = "\n".join(re.findall(r"inline constexpr int64_t (?:QWEN3VL_4B_(?:PREFILL|DECODE)_\w+|WALL_BASE_(?:FP16_)?PREFILL_\w+)_SITE\s*=\s*[^;]+;",source))
+    constants = "\n".join(re.findall(r"inline constexpr int64_t (?:QWEN3VL_4B_(?:PREFILL|DECODE)_\w+|WALL_BASE_(?:FP16_)?PREFILL_\w+|CAUSAL_DECODER_REDUCE)_SITE\s*=\s*[^;]+;",source))
     constants += "\n" + re.search(r"inline constexpr int64_t LINGBOT2_PREFILL_GATEUP_SHARED_A_SITE\s*=\s*[^;]+;",source).group(0)
     predicates = "\n".join(definition(source,marker) for marker in
                            ("static std::vector<int64_t> qwen3vl_prefill_gateup_contract_arguments(int64_t rows)",
@@ -43,7 +43,7 @@ def test_decode_mlp_manifest_and_dispatch(tmp_path, size, fused):
     ring = source.index("        auto append_ring =",start)
     ring_text = source[ring:source.index("        auto append_kv =",ring)]
     selected = source.index("        bool needs_shared_mlp = false;",start)
-    selected_text = source[selected:source.index("        uint32_t shared_routes = 0;",selected)]
+    selected_text = source[selected:source.index("        uint32_t shared_routes =",selected)]
     # Execute the actual decode branch rather than a separately spelled policy.
     dispatch_start = source.index("        } else if (ctx().stage_plan.chunk_mode == ChunkMode::SEQUENTIAL &&\n            qwen3vl_decode_mlp(")
     dispatch = definition(source[dispatch_start:],"if (ctx().stage_plan.chunk_mode == ChunkMode::SEQUENTIAL &&")
@@ -63,6 +63,7 @@ def test_decode_mlp_manifest_and_dispatch(tmp_path, size, fused):
 #include <string>
 #include <tuple>
 #include <vector>
+__QWEN_CONTRACTS__
 #define TORCH_CHECK(condition,...) do {if(!(condition))throw std::runtime_error(#condition);}while(false)
 #define TORCH_INTERNAL_ASSERT(condition) assert(condition)
 namespace c10 {using Half=uint16_t;}
@@ -118,6 +119,7 @@ void rpu_launch_all_reduce_sum_residual_kernel(uint32_t partial,uint32_t residua
   assert(rows==1&&cols==__H__&&producer_cores==8&&cores==8);emitted.push_back(5);
 }
 struct Model {
+ bool qwen3_c256_=false;
  bool qwen3vl_fp16_decode_profile_=false;
  bool qwen3vl_4b_w8_profile_=__IS_4B__,linear_acc32_=false,decoder_mixed_precision_=false,adarms_=false;
   bool qwen3vl_4b_decode_gateup_fused_=__FUSED__;
@@ -148,6 +150,10 @@ struct Model {
   __MEMBER_RING__
   FmbPhysicalExecutionManifest mlp_manifest(const Plan& plan,const Layout& layout,int64_t physical_len,int64_t position) {
     FmbPhysicalExecutionManifest manifest;manifest.state=FmbPhysicalManifestState::COMPLETE;
+    // These exact 2B/4B owners never bind the plain 32B prefill capabilities.
+    const bool qwen_a8=false,qwen_inplace=false,qwen_c512=false;
+    auto append_a8_quant=[](const ChunkInfo&,size_t){throw std::runtime_error("unbound Qwen32 A8 quant route");};
+    auto append_a8_linear=[](const ChunkInfo&,qwen3_w8a8::Projection){throw std::runtime_error("unbound Qwen32 A8 linear route");};
     __APPEND__
     __APPEND_RING__
     __SELECTED__
@@ -244,6 +250,10 @@ int main(){
 }
 '''
     replacements = {"ENUMS":enums,"STRUCTS":structs,"CONSTANTS":constants,"PREDICATES":predicates,
+        "QWEN_CONTRACTS":f'#include "{ROOT / "src/fused/rpu_qwen3_w8a8_contract.h"}"\n'
+            'namespace qwen3_w8a8=v3::qwen3_w8a8;\n'
+            'namespace qwen3_c192=v3::qwen3_c192;\n'
+            'namespace qwen3_c512=v3::qwen3_c512;',
         "RING":definition(planner,"int64_t fmb_ring_all_reduce_route_selector("),
         "MEMBER_RING":definition(source,"int64_t causal_ring_route(int64_t rows, int64_t cols) const"),
         "CONSUMER":consumer,"APPEND":append_text,"APPEND_RING":ring_text,"SELECTED":selected_text,

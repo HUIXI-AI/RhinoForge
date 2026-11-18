@@ -41,7 +41,7 @@ def _config(size="0.6b", **overrides):
 
 def test_six_core_budget_keeps_physical_kv_controllers_and_legal_site_divisors():
     topology = resolve_decoder_topology(num_cores=6, **_geometry())
-    assert topology.identity() == (2, 6, 4, 6, 4, 8)
+    assert topology.identity() == (2, 6, 4, 6, 6, 8)
     with pytest.raises(FrozenInstanceError):
         topology.attn_tp = 6
     assert resolve_decoder_topology(num_cores=8, **_geometry()).identity() == (2, 8, 8, 8, 8, 8)
@@ -183,7 +183,7 @@ def test_reduced_core_batch_is_rejected_before_allocation_and_forward(monkeypatc
 
 @pytest.mark.parametrize("size", _FAMILY_ROWS)
 @pytest.mark.parametrize("cores, expected", [(4, (2, 4, 4, 4, 4, 8)),
-    (6, (2, 6, 4, 6, 4, 8)), (8, (2, 8, 8, 8, 8, 8))])
+    (6, (2, 6, 4, 6, 6, 8)), (8, (2, 8, 8, 8, 8, 8))])
 def test_fixed_templates_are_shared_by_real_adapter_preflight_and_cache(cores, expected, size):
     from rpu_backend.adapters.qwen3 import _execution_topology, Qwen3Adapter
     config = _config(size)
@@ -287,7 +287,7 @@ def test_fused_head_uses_installed_inner_topology_before_transform(monkeypatch, 
     topology = resolve_decoder_topology(num_cores=6, **_geometry(size))
     model = SimpleNamespace(model=SimpleNamespace(_rpu_decoder_handle=7,
         _rpu_decoder_topology=topology), config=_config(size),
-        lm_head=torch.nn.Linear(_config(size).hidden_size, 151936, bias=False, device="meta", dtype=torch.float16))
+        lm_head=torch.nn.Linear(_config(size).hidden_size, 151968, bias=False, device="meta", dtype=torch.float16))
     calls = []
     sentinel = object()
     def transform(weight, *, partition, num_cores):
@@ -297,7 +297,7 @@ def test_fused_head_uses_installed_inner_topology_before_transform(monkeypatch, 
     monkeypatch.setattr(torch.ops.rpu, "causal_decoder_set_lm_head",
                         lambda handle, weight: calls.append((handle, weight)), raising=False)
     qwen3._push_lm_head_weight(model, 7)
-    assert calls == [(1, 4), (7, sentinel)]
+    assert calls == [(1, 6), (7, sentinel)]
 
 
 @pytest.mark.parametrize("scope", [{}, {"num_cores": 8}, {"num_cores": 4}])
@@ -390,7 +390,7 @@ def test_six_core_family_change_rejects_before_claim_or_swizzle(monkeypatch, rep
         replacement = Qwen3ForCausalLM(Qwen3Config(**vars(_config(replacement_size)))).half()
     model._rpu_execution = {"model": {"num_cores": 6}}
     adapter = qwen3.Qwen3Adapter(model)
-    assert adapter._topology.identity() == (2, 6, 4, 6, 4, 8)
+    assert adapter._topology.identity() == (2, 6, 4, 6, 6, 8)
     # The role tuple can now match across models. Logical geometry must still
     # remain bound, including the newly padded 4B path.
     model.config, model.model, model.lm_head = replacement.config, replacement.model, replacement.lm_head
@@ -407,17 +407,17 @@ def test_larger_fused_head_checks_actual_rpu_weight_before_native_publication(mo
     from rpu_backend.adapters import qwen3
     topology = resolve_decoder_topology(num_cores=6, **_geometry(size))
     config = _config(size)
-    weight = SimpleNamespace(shape=(151936, config.hidden_size), dtype=torch.float16,
+    weight = SimpleNamespace(shape=(151968, config.hidden_size), dtype=torch.float16,
         device=SimpleNamespace(type="rpu"))
     weight.detach = lambda: weight
     weight.to = lambda *_: weight
     weight.contiguous = lambda: weight
-    head = SimpleNamespace(weight=weight, _rpu_linear_num_cores=4, _rpu_linear_partition=1)
+    head = SimpleNamespace(weight=weight, _rpu_linear_num_cores=6, _rpu_linear_partition=1)
     model = SimpleNamespace(config=config, lm_head=head,
         model=SimpleNamespace(_rpu_decoder_handle=7, _rpu_decoder_topology=topology))
-    if fault == "shape": weight.shape = (151808, config.hidden_size)
+    if fault == "shape": weight.shape = (151936, config.hidden_size)
     elif fault == "dtype": weight.dtype = torch.float32
-    elif fault == "layout": head._rpu_linear_num_cores = 8
+    elif fault == "layout": head._rpu_linear_num_cores = 4
     calls = []
     monkeypatch.setattr(qwen3, "transform_linear_weight", lambda *_a, **_k: pytest.fail("RPU head was swizzled twice"))
     monkeypatch.setattr(torch.ops.rpu, "causal_decoder_set_lm_head", lambda *args: calls.append(args), raising=False)
@@ -428,3 +428,54 @@ def test_larger_fused_head_checks_actual_rpu_weight_before_native_publication(mo
     else:
         qwen3._push_lm_head_weight(model, 7)
         assert calls == [(7, weight)]
+
+
+def test_six_core_lm_head_padding_unties_fp16_and_unit_pads_int8_scales():
+    from rpu_backend.runtime.topology import decoder_lm_head_vocab_size
+
+    assert decoder_lm_head_vocab_size(151936, 6) == 151968
+    assert decoder_lm_head_vocab_size(151936, 4) == 151936
+    assert decoder_lm_head_vocab_size(151936, 8) == 151936
+    assert decoder_lm_head_vocab_size(128256, 6) == 128256
+
+    # FP16 tied head: unties without mutating embed_tokens and appends 32 zero rows.
+    fp16_model = torch.nn.Module()
+    fp16_model.model = torch.nn.Module()
+    fp16_model.model.embed_tokens = torch.nn.Embedding(151936, 64, dtype=torch.float16)
+    fp16_model.lm_head = torch.nn.Linear(64, 151936, bias=False, dtype=torch.float16)
+    fp16_model.lm_head.weight = fp16_model.model.embed_tokens.weight
+    embed_before = fp16_model.model.embed_tokens.weight.detach().clone()
+    weights.pad_decoder_lm_head_weight(fp16_model, logical_size=151936, physical_size=151968)
+    assert fp16_model.lm_head.out_features == 151968
+    assert fp16_model.lm_head.weight.shape == (151968, 64)
+    assert fp16_model.lm_head.weight is not fp16_model.model.embed_tokens.weight
+    assert torch.equal(fp16_model.model.embed_tokens.weight, embed_before)
+    assert torch.equal(fp16_model.lm_head.weight[:151936], embed_before)
+    assert torch.count_nonzero(fp16_model.lm_head.weight[151936:]) == 0
+
+    # INT8 untied head: appends 32 zero rows and pads weight_scale with 1.0.
+    int8_model = torch.nn.Module()
+    int8_model.lm_head = torch.nn.Linear(64, 151936, bias=False, dtype=torch.float16)
+    raw_int8 = torch.randint(-100, 100, (151936, 64), dtype=torch.int8)
+    raw_scale = torch.full((151936,), 0.25, dtype=torch.float16)
+    int8_model.lm_head.weight = torch.nn.Parameter(raw_int8.clone(), requires_grad=False)
+    int8_model.lm_head.register_buffer("weight_scale", raw_scale.clone())
+    weights.pad_decoder_lm_head_weight(int8_model, logical_size=151936, physical_size=151968)
+    assert int8_model.lm_head.out_features == 151968
+    assert int8_model.lm_head.weight.shape == (151968, 64)
+    assert torch.equal(int8_model.lm_head.weight[:151936], raw_int8)
+    assert torch.count_nonzero(int8_model.lm_head.weight[151936:]) == 0
+    assert int8_model.lm_head.weight_scale.shape == (151968,)
+    assert torch.equal(int8_model.lm_head.weight_scale[:151936], raw_scale)
+    assert torch.equal(int8_model.lm_head.weight_scale[151936:], torch.ones(32, dtype=torch.float16))
+
+
+def test_align_w4_pgrp_scale_for_rpu_skips_cpu_and_fake_tensors():
+    weight = torch.zeros((64, 32), dtype=torch.uint8)
+    scale = torch.ones((32, 64), dtype=torch.float16)
+    assert weights.align_w4_pgrp_scale_for_rpu(weight, scale) is scale
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    with FakeTensorMode():
+        fw = torch.zeros((64, 32), dtype=torch.uint8)
+        fs = torch.ones((32, 64), dtype=torch.float16)
+    assert weights.align_w4_pgrp_scale_for_rpu(fw, fs) is fs

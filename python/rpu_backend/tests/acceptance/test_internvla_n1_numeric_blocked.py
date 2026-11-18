@@ -596,6 +596,7 @@ def test_controlled_context_and_vision_builder_are_exact(monkeypatch, tmp_path):
     )
     build_internvla_vision(tmp_path, asset_manifest=manifest)
     assert captured["kwargs"] == {
+        "num_cores": 8,
         "window": True,
         "max_hw": 32,
         "max_seq_len": 1024,

@@ -22,8 +22,16 @@ from types import SimpleNamespace
 
 _RESULTS = vars(_result_helpers)
 
-_PRECISIONS = ("fp16", "fp16_acc16", "w8a16_acc32", "w8a16",
-               "w8a16_nvfp4", "w8a16_nvfp4_acc32")
+# Each spelling is a registered recipe selector plus its legacy default accumulation.
+_SPELLINGS = {"fp16": ("fp16", "acc32"), "fp16_acc16": ("fp16", "acc16"),
+              "w8a16_acc32": ("w8a16", "acc32"), "w8a16": ("w8a16", "acc16"),
+              "w8a16_nvfp4": ("w8a16_nvfp4", "acc16"), "w8a16_nvfp4_acc32": ("w8a16_nvfp4", "acc32")}
+_PRECISIONS = tuple(_SPELLINGS)
+# Weight dtypes (backbone, Action) by the resolved per-module specs of the selector's recipe.
+_ROUTE_PROBES = (("vision",), ("text",), ("text", "in_proj_a"), ("text", "in_proj_b"), ("action",))
+_ROUTES = {("fp16",) * 5: ("fp16", None),
+           ("w8a16", "w8a16", "fp16", "fp16", "w8a16"): ("w8a16", None),
+           ("w8a16", "w8a16", "fp16", "fp16", "nvfp4"): ("w8a16", "nvfp4a16")}
 PRECISION_ALIASES = {
     "fp16_acc32": "fp16", "w8a16_acc16": "w8a16",
     "w8a16_nvfp4_acc16": "w8a16_nvfp4",
@@ -52,16 +60,14 @@ def precision_options(precision, linear_accumulation=None, math_precision="base"
     precision = canonical_precision(precision)
     if precision not in _PRECISIONS:
         raise ValueError(f"[g05].precision must be one of {_PRECISIONS}")
-    result = {
-        "math_precision": math_precision,
-        "weight_dtype": "fp16" if precision.startswith("fp16") else "w8a16",
-        "linear_accumulation": "acc32" if precision in
-            ("fp16", "w8a16_acc32", "w8a16_nvfp4_acc32") else "acc16",
-    }
+    from examples.common.config import owner_route
+    selector, accumulation = _SPELLINGS[precision]
+    weight, action = owner_route("G0.5", "g05", _ROUTE_PROBES, _ROUTES, selector=selector)
+    result = {"math_precision": math_precision, "weight_dtype": weight, "linear_accumulation": accumulation}
     if math_precision not in ("base", "high"):
         raise ValueError("[g05].math_precision must be base or high")
-    if precision in ("w8a16_nvfp4", "w8a16_nvfp4_acc32"):
-        result["action_weight_dtype"] = "nvfp4a16"
+    if action is not None:
+        result["action_weight_dtype"] = action
     if linear_accumulation is not None:
         if linear_accumulation not in ("acc16", "acc32"):
             raise ValueError("[g05].linear_accumulation must be acc16 or acc32")
@@ -77,6 +83,12 @@ def input_camera_names(inputs):
             or not isinstance(names, (list, tuple)) or tuple(names) != canonical[:cameras]):
         raise ValueError("[input].camera_names must be head_rgb/left_wrist_rgb with optional right_wrist_rgb, matching cameras=2 or 3")
     return tuple(names)
+
+
+def core_budget(config):
+    """The cold rpu_execution.model.num_cores (8 when omitted)."""
+    model = config.get("rpu_execution", {}).get("model", {})
+    return model.get("num_cores", 8) if isinstance(model, dict) else 8
 
 
 def resolve_row_config(config, catalog_path=None):
@@ -96,7 +108,12 @@ def resolve_row_config(config, catalog_path=None):
                  "schedule_source_math_precision": "base",
                  "applied_parameters": {}, "libraries": "explicit process binding; never replaced by catalog"}
     candidate = None
-    if path.is_file():
+    if core_budget(config) != 8:
+        # Every catalog row was measured on eight cores; a reduced budget keeps
+        # its own auto choices (one camera per Vision forward, planner chunk).
+        selection["reason"] = (f"selected_profiles.json rows are eight-core measurements; "
+                               f"model.num_cores={core_budget(config)} uses auto")
+    elif path.is_file():
         catalog = json.loads(path.read_text())
         if catalog.get("schema_version") == 2:
             rows = [row for row in catalog.get("profiles", [])
@@ -208,6 +225,21 @@ def validate_example_config(config):
         raise ValueError("[run].output_dir must be a nonempty path")
     if "rpu_execution" in config and not isinstance(config["rpu_execution"], dict):
         raise ValueError("[rpu_execution] must be a table")
+    model = config.get("rpu_execution", {}).get("model", {})
+    if (not isinstance(model, dict) or set(model) - {"num_cores"}
+            or model.get("num_cores", 8) not in (4, 6, 8)
+            or type(model.get("num_cores", 8)) is not int):
+        raise ValueError("[rpu_execution.model] accepts only num_cores = 4, 6 or 8")
+    cores = core_budget(config)
+    if cores != 8:
+        # Vision and the action expert run on four cores; HIGH math and camera
+        # grouping have eight-core kernels only.
+        if precision["math_precision"] == "high":
+            raise ValueError(f"math_precision = 'high' is eight-core only; got model.num_cores={cores}")
+        if camera_batch not in ("auto", 1):
+            raise ValueError(
+                f"vision_camera_batch = {camera_batch} groups cameras into one Vision dispatch, "
+                f"which is eight-core only; use auto or 1 at model.num_cores={cores}")
     cpu_helpers()["resolve_cpu_threads"](config, default=8)
     library_helpers()["validate_libraries"](config.get("libraries"))
 

@@ -104,7 +104,7 @@ def test_hy_packed_images_publish_only_owned_cpu_uploads(monkeypatch, device_ima
     cache = SimpleNamespace(k_caches=[None], v_caches=[None],
                             reset_to_position=lambda pos: None)
     owner = SimpleNamespace(
-        w=SimpleNamespace(cfg=cfg), _vit_cache=cache, _vit_packed=True,
+        w=SimpleNamespace(cfg=cfg), _vit_cache=cache, _vit_packed=True, _vision_lanes=8,
         _pe_in_graph=True, _merger_in_graph=False, _prefix_template=True,
         _prepare_vit=lambda n: sub, _vit_out_dim=lambda: 3,
         _plan_vision_execution=lambda *args: (

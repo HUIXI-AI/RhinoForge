@@ -22,7 +22,10 @@ def test_gemma_kv_first_routes_use_complete_physical_window(tmp_path, monkeypatc
     manifest = function(src, '    FmbPhysicalExecutionManifest physical_manifest_for_candidate(')
     # Keep the real traversal guard and generic attention state; Pi-specific
     # cold owner guards are exercised by the optimized-profile tests.
-    guard = manifest[manifest.index('        TORCH_CHECK('):manifest.index('        TORCH_CHECK(', manifest.index('        TORCH_CHECK(') + 1)]
+    # The full-chunk owner now has an earlier, separate cold guard. Select the
+    # actual generic traversal check rather than the first TORCH_CHECK token.
+    guard_start = manifest.index('        TORCH_CHECK(\n            plan.chunk_mode == ChunkMode::KV_FIRST,')
+    guard = manifest[guard_start:manifest.index(';', guard_start) + 1] + '\n'
     prefix = guard + manifest[manifest.index('        FmbPhysicalExecutionManifest manifest;'):manifest.index('        if (num_cores() != 8)')]
     start = manifest.index('            append(\n                FmbRouteFamily::ATTENTION,')
     append = manifest[start:manifest.index(';', start) + 1]

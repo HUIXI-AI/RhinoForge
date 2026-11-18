@@ -158,6 +158,8 @@ native forward。
 一次、返回 passthrough 状态，并保持 retained-cache size 不变。这是显式模型契约例外，
 不是默认 porting pattern。
 
+在 Graph 捕获之外，多 tile 列分片 DDR Linear 也会在单次 `QueueCache` 提交中合并发射各 tile；`linear_with_accumulation(..., gelu_erf=True)` 在 SPM 内融合精确 GELU-erf，用于设备侧视觉 merger。
+
 Batch 把 kernel、DMA 和同步 node 组合成 launch segment。一核和八核 operation 可以共存
 于一个 batch，每个 node 保留自己的 core-count 契约。Immediate 多核 launch 必须打开
 broadcast mode，使所有参与 core 收到 host 参数；batch/Graph 路径统一处理。

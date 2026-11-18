@@ -58,6 +58,11 @@ def test_o_manifest_and_dispatch(tmp_path):
 #include <typeinfo>
 #include <vector>
 #include "src/ops/rpu_linear_tiling.h"
+#include "src/fused/rpu_qwen3_w8a8_contract.h"
+#include "src/fused/rpu_qwen3_c192_contract.h"
+namespace qwen3_w8a8 = v3::qwen3_w8a8;
+namespace qwen3_c192 = v3::qwen3_c192;
+namespace qwen3_c512 = v3::qwen3_c512;
 #define TORCH_CHECK(c,...) do{if(!(c))throw std::runtime_error(#c);}while(false)
 #define TORCH_INTERNAL_ASSERT(c) assert(c)
 namespace at {using IntArrayRef=std::vector<int64_t>;enum ScalarType{kChar,kHalf};
@@ -105,6 +110,9 @@ struct CausalDecoderModel{
  std::vector<int64_t> wall_base_nvfp4_o_ring_norm_arguments(int64_t)const{throw std::runtime_error("unexpected Wall route");}
  __PREDICATES__
  FmbPhysicalExecutionManifest selected(const Plan& plan,const Layout& layout,int64_t physical_len,bool partial_mrope){
+  const bool qwen_inplace=false,qwen_c512=false,qwen_a8=false;
+  auto append_a8_quant=[&](const ChunkInfo&,int64_t){};
+  auto append_a8_linear=[&](const ChunkInfo&,qwen3_w8a8::Projection){};
   FmbPhysicalExecutionManifest manifest;manifest.state=FmbPhysicalManifestState::COMPLETE;bool wall_action_linear_ring=false;
   const bool wall_base_nvfp4_o_ring_norm=false;const int64_t position=0;
   __APPEND__

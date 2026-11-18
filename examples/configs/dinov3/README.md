@@ -6,6 +6,8 @@
 
 [ViT-B FP16](vit_b/fp16.toml) 接收单张图像，返回视觉特征 `last_hidden_state` 和池化特征 `pooler_output`。这一路径用于特征提取。
 
+[W8A16](vit_b/w8a16_vision.toml) 和 [W4A16 G32](vit_b/w4a16_vision_rtn_g32.toml) 读取同一个浮点权重目录，在加载时量化编码器每层的六个投影，其余保持 FP16；两者都还没上板，细节见[量化指南](../../../docs/quantization.zh.md)。
+
 <a id="运行"></a>
 
 ## 准备与运行
@@ -32,12 +34,16 @@ python examples/run.py --config examples/configs/dinov3/vit_b/fp16.toml
 
 ### 视觉特征
 
+| 配置 | 支持状态 | 精度 | 量化范围 | 4 核 | 6 核 | 8 核 |
+|---|---|---|---|---|---|---|
+| [vit_b/fp16.toml](vit_b/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | ● 已实测 | ● 已实测 | ● 已实测 |
+| [vit_b/w4a16_vision_rtn_g32.toml](vit_b/w4a16_vision_rtn_g32.toml) | 已实现，未认证（`IMPLEMENTED_UNVERIFIED_HW`） | w4a16 | Vision W4A16 G32 RTN | ● 已实测 | ● 已实测 | ● 已实测 |
+| [vit_b/w8a16_vision.toml](vit_b/w8a16_vision.toml) | 已实现，未认证（`IMPLEMENTED_UNVERIFIED_HW`） | w8a16 | Vision W8A16 | ● 已实测 | ● 已实测 | ● 已实测 |
+
+本组配置相同的项：
+
 | 项目 | 值 |
 |---|---|
-| 配置 | [vit_b/fp16.toml](vit_b/fp16.toml) |
-| 支持状态 | 支持（`SUPPORTED`） |
-| 精度 | fp16 |
-| 量化范围 | — |
 | 输入类型 | 单张RGB图片 |
 | 文本可调范围 | 不使用 |
 | 图像/音频可调范围 | 一次1图；processor后H/W整除16，默认224×224 |
@@ -45,9 +51,6 @@ python examples/run.py --config examples/configs/dinov3/vit_b/fp16.toml
 | 其他输入形状 | tensor[1,3,H,W] |
 | 联动限制 | 处理后patch grid不得超过安装max_hw和KV容量；默认ViT-B max_hw=14。原始文件尺寸经processor调整，不等同模型tensor尺寸。 |
 | 默认核数 | 8 |
-| 4 核 | ● 已实测 |
-| 6 核 | ● 已实测 |
-| 8 核 | ● 已实测 |
 | CPU线程数 | 未设置（沿用环境） |
 | 权重 | `dinov3-vit-b` |
 | 入口 | [run.py](../../run.py) |

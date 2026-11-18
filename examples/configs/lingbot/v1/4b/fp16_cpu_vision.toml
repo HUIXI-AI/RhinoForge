@@ -5,7 +5,7 @@
 profile_id = "lingbot-vla-4b.mixed.vla"
 registry_alias = "lingbot-vla-4b"
 target = "lingbot"
-precision = "cpu-fp32+rpu-fp16"
+precision = "fp16_cpu_vision"
 
 [model.opt_in]
 

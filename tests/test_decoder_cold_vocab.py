@@ -82,6 +82,7 @@ struct CausalDecoderModel {
     int64_t lm_head_bank_index_ = -1;
     bool fuse_lm_head_ = false, fuse_prefill_last_lm_head_ = false;
     bool qwen3vl_2b_w8_profile_ = false, has_mrope_ = false, reuse_lm_head_output_ = false;
+    const bool qwen3_c512_ = false;  // This ordinary head probe never enables the exact A8 schedule.
     bool reduced_qwen3_w4_profile_ = false;
     bool reduced_qwen3vl_profile_ = false;
     int64_t logical_intermediate_size_ = 3072;
@@ -124,29 +125,35 @@ int main(int argc, char** argv) {
     const at::Tensor real_weight{{151936, 1024}};
     if (mode == "cold_head_lifecycle4" || mode == "cold_head_lifecycle6") {
         const int budget = mode.back() - '0';
+        const int head_tp = budget == 6 ? 6 : 4;
+        const int64_t padded_vocab = budget == 6 ? 151968 : 151936;
+        const at::Tensor head_weight{{padded_vocab, 1024}};
         const auto handle = rpu_causal_decoder_create(true, false, budget, 151936);
         auto& model = *CausalDecoderRegistry::get(handle, "probe");
         model.layers = 28;
-        const std::vector<int64_t> expected{budget, 4, budget, 4, 8};
+        const std::vector<int64_t> expected{budget, 4, budget, head_tp, 8};
         assert(model.execution_topology() == expected);
         assert(model.vocab_size_ == 0 && !model.fuse_lm_head_);
         const auto cold_bytes = model.reserved_bytes(1);
-        assert(cold_bytes == model.A(200000 / 4 * 2));
+        assert(cold_bytes == model.A((200000 + head_tp - 1) / head_tp * 2));
         for (int cycle = 0; cycle < 2; ++cycle) {
-            model.set_lm_head(real_weight);
-            assert(model.vocab_size_ == 151936 && model.fuse_lm_head_);
+            if (budget == 6) {
+                rejects([&] { model.set_lm_head(real_weight); });
+            }
+            model.set_lm_head(head_weight);
+            assert(model.vocab_size_ == padded_vocab && model.fuse_lm_head_);
             assert(model.execution_topology() == expected);
             assert(model.reserved_bytes(1) == cold_bytes);
-            assert(model.reserved_bytes(1) >= real_weight.size(0) / 4 * 2);
+            assert(model.reserved_bytes(1) >= head_weight.size(0) / head_tp * 2);
             const int before_invalid = model.invalidations;
             rejects([&] { model.set_lm_head(at::Tensor{{152000, 1024}}); });
             for (auto dtype : {at::kChar, at::kByte}) {
-                rejects([&] { model.set_lm_head(at::Tensor{{151936, 1024}, dtype}, at::Tensor{{151936}}); });
+                rejects([&] { model.set_lm_head(at::Tensor{{padded_vocab, 1024}, dtype}, at::Tensor{{padded_vocab}}); });
             }
-            rejects([&] { model.set_lm_head(real_weight, at::Tensor{{151936}}); });
-            rejects([&] { model.set_lm_head(real_weight, std::nullopt, true, 2); });
+            rejects([&] { model.set_lm_head(head_weight, at::Tensor{{padded_vocab}}); });
+            rejects([&] { model.set_lm_head(head_weight, std::nullopt, true, 2); });
             assert(model.invalidations == before_invalid);
-            assert(model.lm_head_w_.size(0) == 151936 && model.execution_topology() == expected);
+            assert(model.lm_head_w_.size(0) == padded_vocab && model.execution_topology() == expected);
             model.clear_lm_head();
             assert(model.vocab_size_ == 0 && !model.fuse_lm_head_);
             assert(model.execution_topology() == expected);
@@ -155,6 +162,9 @@ int main(int argc, char** argv) {
         assert(model.invalidations == 4);
     } else if (mode == "quantized_heads4" || mode == "quantized_heads6") {
         const int budget = mode.back() - '0';
+        const int head_tp = budget == 6 ? 6 : 4;
+        const int64_t padded_vocab = budget == 6 ? 151968 : 151936;
+        const int64_t physical_w4_vocab = ((padded_vocab / head_tp + 31) / 32 * 32) * head_tp;
         for (const auto& dims : std::vector<std::vector<int64_t>>{
                 {1024,3072,16,28}, {2048,6144,16,28}, {2560,9728,32,36},
                 {4096,12288,32,36}, {5120,17408,40,40}, {5120,25600,64,64}}) {
@@ -163,42 +173,57 @@ int main(int argc, char** argv) {
             model.hidden = dims[0]; model.logical_intermediate_size_ = dims[1];
             model.q_heads = dims[2]; model.layers = dims[3];
             model.layer_weights_.push_back({at::Tensor{{1,1},at::kChar}});
-            model.set_lm_head(at::Tensor{{151936,model.hidden},at::kChar}, at::Tensor{{151936}});
+            if (budget == 6) {
+                rejects([&] { model.set_lm_head(at::Tensor{{151936,model.hidden},at::kChar}, at::Tensor{{151936}}); });
+            }
+            model.set_lm_head(at::Tensor{{padded_vocab,model.hidden},at::kChar}, at::Tensor{{padded_vocab}});
             assert(model.lm_head_w_.scalar_type() == at::kChar);
             model.clear_lm_head();
             model.reduced_qwen3_w4_profile_ = true;
             model.layer_weights_[0].q_w.dtype = at::kByte;
-            const int64_t scale_elements = 4 * ((model.hidden / 32 + 3) / 4) *
-                ((151936 / 4 + 63) / 64) * 256;
-            model.set_lm_head(at::Tensor{{151936,model.hidden / 2},at::kByte},
+            const int64_t scale_elements = head_tp * ((model.hidden / 32 + 3) / 4) *
+                ((padded_vocab / head_tp + 63) / 64) * 256;
+            if (budget == 6) {
+                rejects([&] {model.set_lm_head(at::Tensor{{151936,model.hidden / 2},at::kByte},
+                                              at::Tensor{{32,scale_elements / 32}});});
+            }
+            model.set_lm_head(at::Tensor{{physical_w4_vocab,model.hidden / 2},at::kByte},
                               at::Tensor{{32,scale_elements / 32}});
             assert(model.lm_head_w_.scalar_type() == at::kByte);
-            rejects([&] {model.set_lm_head(at::Tensor{{151936,model.hidden / 2},at::kByte},
+            assert(model.vocab_size_ == padded_vocab && model.lm_head_w_.size(0) == physical_w4_vocab);
+            rejects([&] {model.set_lm_head(at::Tensor{{physical_w4_vocab,model.hidden / 2},at::kByte},
                                          at::Tensor{{32,scale_elements / 32 - 1}});});
         }
     } else if (mode == "admission") {
-        for (int64_t vocab : {0, -1, 151938, 152000, 200000}) {
+        for (int64_t vocab : {-1, 151938, 152000, 200000}) {
             rejects([&] { rpu_causal_decoder_create(true, false, 6, vocab); });
             assert(CausalDecoderRegistry::creates == 0);
+        }
+        // Headless decoders (TTS codec at four, InternVLA text at four or six)
+        // reserve no head here; set_weights admits only their exact profiles.
+        for (int budget : {4, 6}) {
+            v3::CausalDecoderModel headless;
+            headless.configure_cold_routes(true, false, budget, 0);
+            assert(headless.num_cores() == budget && headless.lm_head_tp() == 4);
         }
         rejects([&] { rpu_causal_decoder_create(true, false, (int64_t{1} << 32) + 6, 151936); });
         assert(CausalDecoderRegistry::creates == 0);
         v3::CausalDecoderModel model;
         model.configure_cold_routes(true, false, 6, 151936);
         rejects([&] { model.configure_cold_routes(true, false, 8, 0); });
-        assert(model.num_cores() == 6 && model.lm_head_tp() == 4);
+        assert(model.num_cores() == 6 && model.lm_head_tp() == 6);
         v3::CausalDecoderModel after_weights;
         after_weights.layers = 28;
         rejects([&] { after_weights.configure_cold_routes(true, false, 6, 151936); });
         v3::CausalDecoderModel after_planning;
         after_planning.resolved_chunk = 16;
         rejects([&] { after_planning.configure_cold_routes(true, false, 6, 151936); });
-        // Exact Llama-3.2-1B vocabulary: the cold head reserve covers 128256/4.
+        // Exact Llama-3.2-1B vocabulary: 4 lanes at budget 4, 6 lanes at budget 6.
         for (int budget : {4, 6}) {
             v3::CausalDecoderModel llama;
             llama.configure_cold_routes(true, false, budget, 128256);
-            assert(llama.num_cores() == budget && llama.lm_head_tp() == 4);
-            assert(llama.reserved_bytes(1) >= 128256 / 4 * 2);
+            assert(llama.num_cores() == budget && llama.lm_head_tp() == (budget == 6 ? 6 : 4));
+            assert(llama.reserved_bytes(1) >= 128256 / llama.lm_head_tp() * 2);
         }
     } else if (mode == "legacy_eight") {
         v3::CausalDecoderModel legacy;

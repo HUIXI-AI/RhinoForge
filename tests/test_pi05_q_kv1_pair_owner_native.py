@@ -87,6 +87,7 @@ struct Queue{bool broadcast=false;int launches=0;std::vector<uint16_t> grid;
  void enqueu_kernel(Kernel_t&,std::vector<uint16_t> gr,std::vector<uint8_t> cores){assert(broadcast&&cores.size()==8);grid=gr;++launches;}}queue;
 Queue*get_queue(int n){assert(n==8);return &queue;}
 #define GET_QUEUE(n) get_queue(n)
+#include "pi05_execution_topology.h"
 __FUNCTIONS__
 at::Tensor tensor(int dtype,at::IntArrayRef shape,uintptr_t address,size_t elem){
  at::Tensor t;t.dtype=dtype;t.present=true;t.shape=shape;t.address=address;t.elem=elem;return t;}

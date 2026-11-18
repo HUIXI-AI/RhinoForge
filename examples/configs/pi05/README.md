@@ -2,7 +2,7 @@
 
 [配置总览](../README.md) · [全部配置](#configurations) · [权重准备](../WEIGHTS.md) · [参数说明](../PARAMETERS.md)
 
-按 batch 的相机槽数量选择 `2cam/` 或 `3cam/`，按 action horizon 选择其下的 `h50/` 或 `h10/`（两档使用不同权重），再选择 FP16、W8A16、Action NVFP4 或 Prefill W8A8 + Action NVFP4 配方。两档的配方一一对应，例如 `2cam/h50/fp16.toml` 与 `2cam/h10/fp16.toml`。Leju Kuavo 的 openpi pi05 原始观测（三路相机原尺寸帧 + 指令 + 物理 state）使用 `kuavo/`（真机 848×480）或 `kuavo/sim/`（仿真 640×480），见 [Kuavo 原始观测](#kuavo)。
+按 action horizon 选择 `h50/` 或 `h10/`（两档使用不同权重），再按配方选择 FP16、W8A16、Action NVFP4、Prefill W8A8 + Action NVFP4 或（H50）Vision W4 + Action NVFP4 模板。模板默认 3 个相机槽；2 个相机槽在命令行加 `--input 2cam_t32`，并用 `--set input.batch=<路径>` 给出 2 相机 batch（预设见 [vla.toml](../../inputs/vla.toml)）。Leju Kuavo 的 openpi pi05 原始观测（三路相机原尺寸帧 + 指令 + 物理 state）使用 `kuavo/`（真机 848×480）或 `kuavo/sim/`（仿真 640×480），见 [Kuavo 原始观测](#kuavo)。
 
 <a id="配置矩阵"></a>
 
@@ -10,11 +10,24 @@
 
 `input.text_tokens` 是 token tensor 的存储宽度，可选 **32、64、96、128、160、192**，默认 **32**；192 只用于 3 相机的 FP16 / W8A16。实际有效 token 数由 mask 决定，两者分别核对；mask 为 False 的 pad 行在 prefill 前置零，不会在 FP16 中溢出（见[常见坑](../../../docs/pitfalls.md#other-high-value-checks)）。batch 的相机输入为每路 `[1,3,256,256]`，token 和 mask 为 `[1,T]`；修改相机数或 T 后，batch 也要匹配。`kuavo/` 的输入是相机原尺寸帧（真机 848×480、仿真 640×480），每次推理在 host 端按 openpi 缩放到 `[1,3,224,224]`，与 pi05_base 声明的图像特征一致。
 
-默认 8 核。2/3 相机的四种精度配方都允许 T32–T160；4/6 核只用于 **FP16 或 W8A16、T=32**（2 或 3 相机），直接修改相应配置中的 `rpu_execution.model.num_cores`。T64–T160 或 Prefill W8A8 使用 paired prefill，chunk 必须为 `(256 × cameras + T) / 2`；默认 `auto` 按输入计算。4/6 核使用通用串行 Vision 路径。
+默认 8 核。2/3 相机的四种精度配方（FP16、W8A16、Action NVFP4、Prefill W8A8 + Action NVFP4）都允许 T32–T160；LIBERO 模板下 4/6 核同样接受这四种配方和 T32–T160（2 或 3 相机；Prefill W8A8 在这里按每块行数选通用 W8A8 tile，不是 8 核的融合路径），`kuavo/` 原始观测模板（FP16 / W8A16，T64–T192）也同样支持 4 / 6 / 8 核，直接修改相应配置中的 `rpu_execution.model.num_cores` 或传 `--cores 4|6`。8 核的长 T 或 Prefill W8A8 使用 paired prefill，默认 chunk 为 `(256 × cameras + T) / 2`（以下 T32/W8A16 Action 完整前缀选项除外）；默认 `auto` 按输入计算。4/6 核使用 4 核 raw-SPM 合批（或 W4/ACC32 串行）Vision 路径、通用 Gemma prefill 与少核融合去噪。
 
-T192（3 相机）用配对 prefill C480（P960 = 2 × 480，2026-11-10 起）：只接受 3 相机、8 核、FP16 / W8A16（没有 C480 的 Prefill W8A8 与 Action NVFP4）。C480 的四块 slab 比 Gemma 的 SPM 预算多 196,608 B，所以入口在 T192 时打开 `RPU_PI05_VISION_LN_STREAM`：SigLIP 27 层的 LayerNorm 权重不再常驻 SPM，每层随输入广播一次，腾出 276,480 B。报告中 `execution_route = "paired_tp8"`，`prefill_chunk_size = 480`。显式写入其他 Vision / Action chunk 或 prefill padding 时不走配对布局，prefill `auto` 为 320 行通用分块（P960 = 3 × 320）。
+本地 W8A8 集成增加完整前缀选项：在 `h10/w8a16.toml` 或 `h50/w8a16.toml`
+的 `[model]` 表显式设置 `prefill_w8a8 = true`，并添加
+`[rpu_execution.prefill]` 的 `chunk_size = 544`（两相机）或 `800`（三相机）。
+它要求 **8 核、T32、W8A16 Action、Prefill ACC16、无额外 padding**；Action NVFP4
+和其他 T 不接受完整前缀。默认配置仍运行 272/400。该选项改变 Prefill Q、GateUp、Down
+的激活精度与调度，不能只改 chunk 而省略精度选择。Vision 的 `qkv_w8a8`、`mlp_w8a8`
+仍是独立配置。组件级 `language_model.prefill.chunk_size` 也可指定完整前缀；若同时写
+root/component，显式整数须一致，`auto` 会绑定到同一个实际 chunk。
+需要匹配的本地 W8A8 native 与完整 main/expansion REF；未改变本页已发布配置的默认值
+或验证状态，使用方式和限制见[运行配置](../../../docs/runtime_config.zh.md)。
 
-`[pi05].precision` 另接受 `w4a16_kvint8`：旧的 VLM＋expert per-channel INT4 路径，K/V 投影保留 INT8（不是 KV-cache INT8，也不是 Action NVFP4），权重为 `pi05-libero-finetuned-w4real-kvint8`，只允许 8 核、3 相机、T32。它的公开模板已于 2026-10-04 撤下，不在配置表、支持状态和本轮性能报告中；执行路径和注册权重仍然保留，说明见开发记录。
+T192（3 相机，只接受 FP16 / W8A16，没有 Prefill W8A8 与 Action NVFP4）在 8 核下用配对 prefill C480（P960 = 2 × 480，2026-11-10 起）：C480 的四块 slab 比 Gemma 的 SPM 预算多 196,608 B，所以入口在 8 核配对 T192 时打开 `RPU_PI05_VISION_LN_STREAM`：SigLIP 27 层的 LayerNorm 权重不再常驻 SPM，每层随输入广播一次，腾出 276,480 B。报告中 `execution_route = "paired_tp8"`，`prefill_chunk_size = 480`。8 核显式写入其他 Vision / Action chunk 或 prefill padding 时不走配对布局，prefill `auto` 为 320 行通用分块（P960 = 3 × 320）；4 核与 6 核按 SPM 预算自动选择通用分块（4 核 `4 × 240`，6 核 `3 × 320`）。见上文 T192 说明。
+
+`w8a16_vision_w4a16_action_nvfp4` 加载 Action NVFP4 的同一份产物，安装时把 SigLIP 各块的六个投影量化为 RTN G32；4/6/8 核都可用（模板写 8 核），T 的范围与 Action NVFP4 相同。Vision 在任何预算下都用 4 核、一次一个相机：补零后的 o（K1280）和 fc2（K4352）按行分到 8 核时每核 K 是 160 和 544，不是 64 的倍数，pgrp W4 不接受。8 核时 Prefill 与 Action 仍是 8 核配对布局，但没有 8 核合批 Vision 及其 TP8 Vision 优化。8 核实测（2026-11-06，3 相机、T32、10 步）Vision 为 66.9 ms，Vision W8A16 的 Action NVFP4 模板为 21.6 ms，整次请求 170.0 ms 对 123.5 ms。配方细节见[量化说明](../../../docs/quantization.zh.md)。
+
+`model.precision` 另接受登记配方 `w4a16_kvint8`：旧的 VLM＋expert per-channel INT4 路径，K/V 投影保留 INT8（不是 KV-cache INT8，也不是 Action NVFP4；Vision 与 AdaRMS 和其他量化配方一样加载时转 W8A16），权重为 `pi05-libero-finetuned-w4real-kvint8`（生成命令见[权重准备](../WEIGHTS.md#cmd-pi05)），只允许 8 核、3 相机、T32。它的公开模板已于 2026-10-04 撤下，不在配置表、支持状态和本轮性能报告中；执行路径和注册权重仍然保留，说明见开发记录。
 
 动作去噪固定 10 步。`input.action_horizon` 取 **50**（默认）或 **10**，它是权重的属性（checkpoint 的 `chunk_size`），配置值与权重不一致时报错；两档使用不同权重，见[权重准备](../WEIGHTS.md)。历史三槽测量使用两路真实相机和一个 `empty_camera_0` 占位槽，输入身份与三路真实相机不同。
 
@@ -25,8 +38,11 @@ T192（3 相机）用配对 prefill C480（P960 = 2 × 480，2026-11-10 起）�
 填写 `model.checkpoint` 和 `input.batch`。FP16、W8A16 和 NVFP4 配方各用对应权重，见[权重准备](../WEIGHTS.md)。从仓库根目录执行：
 
 ```bash
-python examples/run.py --config examples/configs/pi05/2cam/h50/fp16.toml --check-config
-python examples/run.py --config examples/configs/pi05/2cam/h50/fp16.toml
+python examples/run.py --config examples/configs/pi05/h50/fp16.toml --check-config
+python examples/run.py --config examples/configs/pi05/h50/fp16.toml
+# 2 个相机槽
+python examples/run.py --config examples/configs/pi05/h50/fp16.toml --input 2cam_t32 \
+  --set input.batch=/path/to/pi05_2cam_t32_batch.pt
 ```
 
 配置检查核对参数范围；运行时读取 batch 并校验张量形状、mask 和相机名称。
@@ -39,7 +55,7 @@ python examples/run.py --config examples/configs/pi05/2cam/h50/fp16.toml
 
 | 字段 | 内容要求 | 获取方式 |
 |---|---|---|
-| `input.batch` | `torch.save` 保存的扁平 tensor 字典（顶层直接是下列键）：`observation.images.<相机名>` 每路 `[1,3,256,256]`，相机名集合与 checkpoint 的 `image_features` 一致（2cam 只保留两路真实相机，3cam 含 `empty_camera_0` 占位槽）；`observation.language.tokens` `[1,T]`，T 等于 `input.text_tokens`；bool `observation.language.attention_mask` `[1,T]`，只允许右侧补齐；`observation.state` | 用测试 harness 从 LIBERO 数据集生成，见下方命令 |
+| `input.batch` | `torch.save` 保存的扁平 tensor 字典（顶层直接是下列键）：`observation.images.<相机名>` 每路 `[1,3,256,256]`，相机名集合与 checkpoint 的 `image_features` 一致（2 相机只保留两路真实相机，3 相机含 `empty_camera_0` 占位槽）；`observation.language.tokens` `[1,T]`，T 等于 `input.text_tokens`；bool `observation.language.attention_mask` `[1,T]`，只允许右侧补齐；`observation.state` | 用测试 harness 从 LIBERO 数据集生成，见下方命令 |
 | `input.noise`（可选） | 单个 tensor `[1,H,32]`，H 为 action horizon（`h50/` 为 50，`h10/` 为 10），有限实数 | 任意固定噪声即可，例如 H50 用 `torch.save(torch.randn(1,50,32), 'noise.pt')`；不填时按 `run.seed` 生成 |
 
 生成 batch（CPU 即可，不占用 RPU）。需要 `lerobot`、本地 LIBERO 数据集 `lerobot/libero_10_image`、tokenizer `unsloth/gemma-2-2b` 和 Pi0.5 checkpoint。离线环境下，`HF_LEROBOT_HOME` 指向包含 `lerobot/libero_10_image` 的目录，tokenizer 放在 `$RPU_MODEL_CACHE/.hf/hub` 下；数据集找不到时脚本会退回随机数据，此时输出中 `batch_source` 为 `dummy`，不能用于真实输入：
@@ -55,7 +71,7 @@ python python/rpu_backend/tests/library/test_pi05_e2e.py --prepare-only \
 python -c "import torch; torch.save(torch.load('cache.pt')['batch'], 'pi05_3cam_t32_batch.pt')"
 ```
 
-`--cameras 2` 生成 2cam batch；`--tokenizer-max-length` 设为所需的 T。2026-10-19 按此流程在板上生成 2cam、3cam 的 T32 batch，并用 `2cam/h50/fp16.toml`、`3cam/h50/fp16.toml`（当时位于相机目录根部）运行完成，输出 `[1,50,7]`。
+`--cameras 2` 生成 2 相机 batch；`--tokenizer-max-length` 设为所需的 T。2026-10-19 按此流程在板上生成 2 相机、3 相机的 T32 batch，并用当时的 2 相机、3 相机 FP16 模板（现为 `h50/fp16.toml` 加 `--input 2cam_t32` 与默认输入）运行完成，输出 `[1,50,7]`。
 
 <a id="kuavo"></a>
 
@@ -228,24 +244,17 @@ CPU：客户部署配置的 `image_size` 等于相机尺寸（真机 848×480，
 
 ### Pi0.5 相机输入
 
-| 配置 | 支持状态 | 精度 | 量化范围 | cameras 默认值 | action_horizon 默认值 | 4 核 | 6 核 | 8 核 | 权重 |
-|---|---|---|---|---|---|---|---|---|---|
-| [2cam/h10/fp16.toml](2cam/h10/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 2 | 10 | ● 已实测 | ● 已实测 | ● 已实测 | `pi05-libero-h10` |
-| [2cam/h10/w8a16.toml](2cam/h10/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill / Action 投影 W8 | 2 | 10 | ● 已实测 | ● 已实测 | ● 已实测 | `pi05-libero-h10-w8a16-vlm-expert` |
-| [2cam/h10/w8a16_action_nvfp4.toml](2cam/h10/w8a16_action_nvfp4.toml) | 支持（`SUPPORTED`） | w8a16_action_nvfp4 | Vision / Prefill W8；Action Q/O/Gate/Up/Down NVFP4，Action K/V W8 | 2 | 10 | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `/path/to/pi05_h10_action_nvfp4`；准备方法见[权重准备](../WEIGHTS.md) |
-| [2cam/h10/w8a16_prefill_w8a8_action_nvfp4.toml](2cam/h10/w8a16_prefill_w8a8_action_nvfp4.toml) | 支持（`SUPPORTED`） | w8a16_prefill_w8a8_action_nvfp4 | Vision / Prefill W8（17 个非尾层的 Prefill GateUp/GeGLU 为 W8A8）；Action Q/O/Gate/Up/Down NVFP4，Action K/V W8 | 2 | 10 | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `/path/to/pi05_h10_action_nvfp4`；准备方法见[权重准备](../WEIGHTS.md) |
-| [2cam/h50/fp16.toml](2cam/h50/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 2 | 50 | ● 已实测 | ● 已实测 | ● 已实测 | `pi05-libero-finetuned` |
-| [2cam/h50/w8a16.toml](2cam/h50/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill / Action 投影 W8 | 2 | 50 | ● 已实测 | ● 已实测 | ● 已实测 | `pi05-libero-finetuned-w8a16-vlm-expert` |
-| [2cam/h50/w8a16_action_nvfp4.toml](2cam/h50/w8a16_action_nvfp4.toml) | 支持（`SUPPORTED`） | w8a16_action_nvfp4 | Vision / Prefill W8；Action Q/O/Gate/Up/Down NVFP4，Action K/V W8 | 2 | 50 | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `/path/to/pi05_action_nvfp4`；准备方法见[权重准备](../WEIGHTS.md) |
-| [2cam/h50/w8a16_prefill_w8a8_action_nvfp4.toml](2cam/h50/w8a16_prefill_w8a8_action_nvfp4.toml) | 支持（`SUPPORTED`） | w8a16_prefill_w8a8_action_nvfp4 | Vision / Prefill W8（17 个非尾层的 Prefill GateUp/GeGLU 为 W8A8）；Action Q/O/Gate/Up/Down NVFP4，Action K/V W8 | 2 | 50 | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `/path/to/pi05_action_nvfp4`；准备方法见[权重准备](../WEIGHTS.md) |
-| [3cam/h10/fp16.toml](3cam/h10/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 3 | 10 | ● 已实测 | ● 已实测 | ● 已实测 | `pi05-libero-h10` |
-| [3cam/h10/w8a16.toml](3cam/h10/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill / Action 投影 W8 | 3 | 10 | ● 已实测 | ● 已实测 | ● 已实测 | `pi05-libero-h10-w8a16-vlm-expert` |
-| [3cam/h10/w8a16_action_nvfp4.toml](3cam/h10/w8a16_action_nvfp4.toml) | 支持（`SUPPORTED`） | w8a16_action_nvfp4 | Vision / Prefill W8；Action Q/O/Gate/Up/Down NVFP4，Action K/V W8 | 3 | 10 | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `/path/to/pi05_h10_action_nvfp4`；准备方法见[权重准备](../WEIGHTS.md) |
-| [3cam/h10/w8a16_prefill_w8a8_action_nvfp4.toml](3cam/h10/w8a16_prefill_w8a8_action_nvfp4.toml) | 支持（`SUPPORTED`） | w8a16_prefill_w8a8_action_nvfp4 | Vision / Prefill W8（17 个非尾层的 Prefill GateUp/GeGLU 为 W8A8）；Action Q/O/Gate/Up/Down NVFP4，Action K/V W8 | 3 | 10 | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `/path/to/pi05_h10_action_nvfp4`；准备方法见[权重准备](../WEIGHTS.md) |
-| [3cam/h50/fp16.toml](3cam/h50/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 3 | 50 | ● 已实测 | ● 已实测 | ● 已实测 | `pi05-libero-finetuned` |
-| [3cam/h50/w8a16.toml](3cam/h50/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill / Action 投影 W8 | 3 | 50 | ● 已实测 | ● 已实测 | ● 已实测 | `pi05-libero-finetuned-w8a16-vlm-expert` |
-| [3cam/h50/w8a16_action_nvfp4.toml](3cam/h50/w8a16_action_nvfp4.toml) | 支持（`SUPPORTED`） | w8a16_action_nvfp4 | Vision / Prefill W8；Action Q/O/Gate/Up/Down NVFP4，Action K/V W8 | 3 | 50 | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `/path/to/pi05_action_nvfp4`；准备方法见[权重准备](../WEIGHTS.md) |
-| [3cam/h50/w8a16_prefill_w8a8_action_nvfp4.toml](3cam/h50/w8a16_prefill_w8a8_action_nvfp4.toml) | 支持（`SUPPORTED`） | w8a16_prefill_w8a8_action_nvfp4 | Vision / Prefill W8（17 个非尾层的 Prefill GateUp/GeGLU 为 W8A8）；Action Q/O/Gate/Up/Down NVFP4，Action K/V W8 | 3 | 50 | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `/path/to/pi05_action_nvfp4`；准备方法见[权重准备](../WEIGHTS.md) |
+| 配置 | 支持状态 | 精度 | 量化范围 | action_horizon 默认值 | 4 核 | 6 核 | 8 核 | 权重 |
+|---|---|---|---|---|---|---|---|---|
+| [h10/fp16.toml](h10/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 10 | ● 已实测 | ● 已实测 | ● 已实测 | `pi05-libero-h10` |
+| [h10/w8a16.toml](h10/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill / Action W8A16 | 10 | ● 已实测 | ● 已实测 | ● 已实测 | `pi05-libero-h10-w8a16-vlm-expert` |
+| [h10/w8a16_action_nvfp4.toml](h10/w8a16_action_nvfp4.toml) | 支持（`SUPPORTED`） | w8a16_action_nvfp4 | Vision / Prefill W8A16；Action NVFP4（K/V/AdaRMS W8A16） | 10 | ● 已实测 | ● 已实测 | ● 已实测 | `/path/to/pi05_h10_action_nvfp4`；准备方法见[权重准备](../WEIGHTS.md) |
+| [h10/w8a16_prefill_w8a8_action_nvfp4.toml](h10/w8a16_prefill_w8a8_action_nvfp4.toml) | 支持（`SUPPORTED`） | w8a16_prefill_w8a8_action_nvfp4 | Vision / Prefill W8A16（Prefill 第 0–16 层 Gate/Up W8A8）；Action NVFP4（K/V/AdaRMS W8A16） | 10 | ● 已实测 | ● 已实测 | ● 已实测 | `/path/to/pi05_h10_action_nvfp4`；准备方法见[权重准备](../WEIGHTS.md) |
+| [h50/fp16.toml](h50/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 50 | ● 已实测 | ● 已实测 | ● 已实测 | `pi05-libero-finetuned` |
+| [h50/w8a16.toml](h50/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill / Action W8A16 | 50 | ● 已实测 | ● 已实测 | ● 已实测 | `pi05-libero-finetuned-w8a16-vlm-expert` |
+| [h50/w8a16_action_nvfp4.toml](h50/w8a16_action_nvfp4.toml) | 支持（`SUPPORTED`） | w8a16_action_nvfp4 | Vision / Prefill W8A16；Action NVFP4（K/V/AdaRMS W8A16） | 50 | ● 已实测 | ● 已实测 | ● 已实测 | `/path/to/pi05_action_nvfp4`；准备方法见[权重准备](../WEIGHTS.md) |
+| [h50/w8a16_prefill_w8a8_action_nvfp4.toml](h50/w8a16_prefill_w8a8_action_nvfp4.toml) | 支持（`SUPPORTED`） | w8a16_prefill_w8a8_action_nvfp4 | Vision / Prefill W8A16（Prefill 第 0–16 层 Gate/Up W8A8）；Action NVFP4（K/V/AdaRMS W8A16） | 50 | ● 已实测 | ● 已实测 | ● 已实测 | `/path/to/pi05_action_nvfp4`；准备方法见[权重准备](../WEIGHTS.md) |
+| [h50/w8a16_vision_w4a16_action_nvfp4.toml](h50/w8a16_vision_w4a16_action_nvfp4.toml) | 支持（`SUPPORTED`） | w8a16_vision_w4a16_action_nvfp4 | Vision W4A16 G32 RTN；Prefill W8A16；Action NVFP4（K/V/AdaRMS W8A16） | 50 | ● 已实测 | ● 已实测 | ● 已实测 | `/path/to/pi05_action_nvfp4`；准备方法见[权重准备](../WEIGHTS.md) |
 
 本组配置相同的项：
 
@@ -253,18 +262,16 @@ CPU：客户部署配置的 `image_size` 等于相机尺寸（真机 848×480，
 |---|---|
 | 输入类型 | 相机 tensor + 文本 tokens + state |
 | text_tokens 默认值 | 32 |
+| cameras 默认值 | 3 |
 | num_steps 默认值 | 10 |
 | 文本可调范围 | 32 / 64 / 96 / 128 / 160（存储宽度） |
-| 图像/音频可调范围 | 2或3相机；处理后每图[1,3,256,256] |
+| 图像/音频可调范围 | 2或3相机（单相机的 prefill 要 144–208 行一组的配对投影 payload，算子库只有 272–336 和 400–464 行）；处理后每图[1,3,256,256] |
 | 生成可调范围 | num_steps=10；action horizon=10或50（由权重决定） |
 | 其他输入形状 | tokens/mask [1,T]；相机名匹配checkpoint |
-| 联动限制 | 8核允许2/3相机；4/6核仅 FP16/W8、T32（2或3相机）。T≠32支持 FP16/W8/Action NVFP4（包括 Prefill W8A8 组合）；Action NVFP4 与 Prefill W8A8 要求 chunk=(256×cameras+T)/2（auto 即为此值），FP16/W8 显式写入其他 chunk 时改走通用路径。T192 为配对 prefill C480（P960=2×480）：仅 3 相机、FP16/W8、8 核，SigLIP LayerNorm 改为逐层流式以腾出 SPM；显式写入其他 chunk 时 prefill 用 320 行通用分块（P960=3×320）；板上实测只覆盖 Kuavo 原始观测模板。有效mask计数与物理T分开。 |
+| 联动限制 | 4/6/8核都允许2/3相机。T∈{32,64,96,128,160}支持 FP16/W8/Action NVFP4（包括 Prefill W8A8 与 Vision W4 组合），4/6/8核相同；8核的 Action NVFP4 与 Prefill W8A8 要求 chunk=(256×cameras+T)/2（auto 即为此值），FP16/W8 显式写入其他 chunk 时改走通用路径。T192 仅支持 3 相机 FP16/W8（4/6/8 核，不支持 Prefill W8A8 与 Action NVFP4）：8 核默认走配对 prefill C480（P960=2×480，SigLIP LayerNorm 改为逐层流式以腾出 SPM；显式写入其他 chunk 时用 320 行通用分块 P960=3×320），4/6 核走通用非配对分块（4 核 P960=4×240，6 核 P960=3×320，SigLIP LayerNorm 常驻 SPM）；板上实测覆盖 Kuavo 原始观测模板（4/6/8 核）。有效mask计数与物理T分开。 |
 | 默认核数 | 8 |
 | CPU线程数 | 8（入口默认） |
 | 入口 | [run.py](../../run.py) |
-
-- ✕ 4/6 核不支持（`2cam/h10/w8a16_action_nvfp4.toml`、`2cam/h50/w8a16_action_nvfp4.toml`、`3cam/h10/w8a16_action_nvfp4.toml`、`3cam/h50/w8a16_action_nvfp4.toml`）：原生实现只有 8 核：Action NVFP4 的 striped_v2 权重和张量缩放表只有 8 核布局，少核准入只接受 FP16/W8A16 权重。
-- ✕ 4/6 核不支持（`2cam/h10/w8a16_prefill_w8a8_action_nvfp4.toml`、`2cam/h50/w8a16_prefill_w8a8_action_nvfp4.toml`、`3cam/h10/w8a16_prefill_w8a8_action_nvfp4.toml`、`3cam/h50/w8a16_prefill_w8a8_action_nvfp4.toml`）：原生实现只有 8 核：Prefill W8A8 依赖只支持 8 核的配对 prefill 路径，Action 仍为 NVFP4。
 
 输入校验来源：[optimized.py](../../../examples/runners/pi05/optimized.py)。
 
@@ -272,26 +279,26 @@ CPU：客户部署配置的 `image_size` 等于相机尺寸（真机 848×480，
 
 | 配置 | 支持状态 | 精度 | 量化范围 | text_tokens 默认值 | action_dim 默认值 | frame_size 默认值 | 4 核 | 6 核 | 8 核 | 权重 |
 |---|---|---|---|---|---|---|---|---|---|---|
-| [kuavo/dual_arm/fp16.toml](kuavo/dual_arm/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 160 | 16 | [848,480] | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `/path/to/pi05_base_kuavo_a16`；准备方法见[权重准备](../WEIGHTS.md) |
-| [kuavo/dual_arm/t96/fp16.toml](kuavo/dual_arm/t96/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 96 | 16 | [848,480] | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `/path/to/pi05_base_kuavo_a16`；准备方法见[权重准备](../WEIGHTS.md) |
-| [kuavo/dual_arm/t96/w8a16.toml](kuavo/dual_arm/t96/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill / Action 投影 W8 | 96 | 16 | [848,480] | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `/path/to/pi05_base_kuavo_a16-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
-| [kuavo/dual_arm/w8a16.toml](kuavo/dual_arm/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill / Action 投影 W8 | 160 | 16 | [848,480] | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `/path/to/pi05_base_kuavo_a16-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
-| [kuavo/sim/dual_arm/fp16.toml](kuavo/sim/dual_arm/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 160 | 16 | [640,480] | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `/path/to/pi05_base_kuavo_a16`；准备方法见[权重准备](../WEIGHTS.md) |
-| [kuavo/sim/dual_arm/t96/fp16.toml](kuavo/sim/dual_arm/t96/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 96 | 16 | [640,480] | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `/path/to/pi05_base_kuavo_a16`；准备方法见[权重准备](../WEIGHTS.md) |
-| [kuavo/sim/dual_arm/t96/w8a16.toml](kuavo/sim/dual_arm/t96/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill / Action 投影 W8 | 96 | 16 | [640,480] | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `/path/to/pi05_base_kuavo_a16-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
-| [kuavo/sim/dual_arm/w8a16.toml](kuavo/sim/dual_arm/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill / Action 投影 W8 | 160 | 16 | [640,480] | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `/path/to/pi05_base_kuavo_a16-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
-| [kuavo/sim/single_arm/fp16.toml](kuavo/sim/single_arm/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 128 | 8 | [640,480] | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `/path/to/pi05_base_kuavo_a8`；准备方法见[权重准备](../WEIGHTS.md) |
-| [kuavo/sim/single_arm/t64/fp16.toml](kuavo/sim/single_arm/t64/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 64 | 8 | [640,480] | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `/path/to/pi05_base_kuavo_a8`；准备方法见[权重准备](../WEIGHTS.md) |
-| [kuavo/sim/single_arm/t64/w8a16.toml](kuavo/sim/single_arm/t64/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill / Action 投影 W8 | 64 | 8 | [640,480] | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `/path/to/pi05_base_kuavo_a8-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
-| [kuavo/sim/single_arm/w8a16.toml](kuavo/sim/single_arm/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill / Action 投影 W8 | 128 | 8 | [640,480] | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `/path/to/pi05_base_kuavo_a8-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
-| [kuavo/sim/wholebody/fp16.toml](kuavo/sim/wholebody/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 192 | 20 | [640,480] | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `/path/to/pi05_base_kuavo_a20`；准备方法见[权重准备](../WEIGHTS.md) |
-| [kuavo/sim/wholebody/w8a16.toml](kuavo/sim/wholebody/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill / Action 投影 W8 | 192 | 20 | [640,480] | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `/path/to/pi05_base_kuavo_a20-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
-| [kuavo/single_arm/fp16.toml](kuavo/single_arm/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 128 | 8 | [848,480] | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `/path/to/pi05_base_kuavo_a8`；准备方法见[权重准备](../WEIGHTS.md) |
-| [kuavo/single_arm/t64/fp16.toml](kuavo/single_arm/t64/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 64 | 8 | [848,480] | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `/path/to/pi05_base_kuavo_a8`；准备方法见[权重准备](../WEIGHTS.md) |
-| [kuavo/single_arm/t64/w8a16.toml](kuavo/single_arm/t64/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill / Action 投影 W8 | 64 | 8 | [848,480] | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `/path/to/pi05_base_kuavo_a8-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
-| [kuavo/single_arm/w8a16.toml](kuavo/single_arm/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill / Action 投影 W8 | 128 | 8 | [848,480] | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `/path/to/pi05_base_kuavo_a8-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
-| [kuavo/wholebody/fp16.toml](kuavo/wholebody/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 192 | 20 | [848,480] | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `/path/to/pi05_base_kuavo_a20`；准备方法见[权重准备](../WEIGHTS.md) |
-| [kuavo/wholebody/w8a16.toml](kuavo/wholebody/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill / Action 投影 W8 | 192 | 20 | [848,480] | ✕ 不支持 | ✕ 不支持 | ● 已实测 | `/path/to/pi05_base_kuavo_a20-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
+| [kuavo/dual_arm/fp16.toml](kuavo/dual_arm/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 160 | 16 | [848,480] | ● 已实测 | ● 已实测 | ● 已实测 | `/path/to/pi05_base_kuavo_a16`；准备方法见[权重准备](../WEIGHTS.md) |
+| [kuavo/dual_arm/t96/fp16.toml](kuavo/dual_arm/t96/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 96 | 16 | [848,480] | ● 已实测 | ● 已实测 | ● 已实测 | `/path/to/pi05_base_kuavo_a16`；准备方法见[权重准备](../WEIGHTS.md) |
+| [kuavo/dual_arm/t96/w8a16.toml](kuavo/dual_arm/t96/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill / Action W8A16 | 96 | 16 | [848,480] | ● 已实测 | ● 已实测 | ● 已实测 | `/path/to/pi05_base_kuavo_a16-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
+| [kuavo/dual_arm/w8a16.toml](kuavo/dual_arm/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill / Action W8A16 | 160 | 16 | [848,480] | ● 已实测 | ● 已实测 | ● 已实测 | `/path/to/pi05_base_kuavo_a16-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
+| [kuavo/sim/dual_arm/fp16.toml](kuavo/sim/dual_arm/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 160 | 16 | [640,480] | ● 已实测 | ● 已实测 | ● 已实测 | `/path/to/pi05_base_kuavo_a16`；准备方法见[权重准备](../WEIGHTS.md) |
+| [kuavo/sim/dual_arm/t96/fp16.toml](kuavo/sim/dual_arm/t96/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 96 | 16 | [640,480] | ● 已实测 | ● 已实测 | ● 已实测 | `/path/to/pi05_base_kuavo_a16`；准备方法见[权重准备](../WEIGHTS.md) |
+| [kuavo/sim/dual_arm/t96/w8a16.toml](kuavo/sim/dual_arm/t96/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill / Action W8A16 | 96 | 16 | [640,480] | ● 已实测 | ● 已实测 | ● 已实测 | `/path/to/pi05_base_kuavo_a16-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
+| [kuavo/sim/dual_arm/w8a16.toml](kuavo/sim/dual_arm/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill / Action W8A16 | 160 | 16 | [640,480] | ● 已实测 | ● 已实测 | ● 已实测 | `/path/to/pi05_base_kuavo_a16-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
+| [kuavo/sim/single_arm/fp16.toml](kuavo/sim/single_arm/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 128 | 8 | [640,480] | ● 已实测 | ● 已实测 | ● 已实测 | `/path/to/pi05_base_kuavo_a8`；准备方法见[权重准备](../WEIGHTS.md) |
+| [kuavo/sim/single_arm/t64/fp16.toml](kuavo/sim/single_arm/t64/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 64 | 8 | [640,480] | ● 已实测 | ● 已实测 | ● 已实测 | `/path/to/pi05_base_kuavo_a8`；准备方法见[权重准备](../WEIGHTS.md) |
+| [kuavo/sim/single_arm/t64/w8a16.toml](kuavo/sim/single_arm/t64/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill / Action W8A16 | 64 | 8 | [640,480] | ● 已实测 | ● 已实测 | ● 已实测 | `/path/to/pi05_base_kuavo_a8-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
+| [kuavo/sim/single_arm/w8a16.toml](kuavo/sim/single_arm/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill / Action W8A16 | 128 | 8 | [640,480] | ● 已实测 | ● 已实测 | ● 已实测 | `/path/to/pi05_base_kuavo_a8-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
+| [kuavo/sim/wholebody/fp16.toml](kuavo/sim/wholebody/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 192 | 20 | [640,480] | ● 已实测 | ● 已实测 | ● 已实测 | `/path/to/pi05_base_kuavo_a20`；准备方法见[权重准备](../WEIGHTS.md) |
+| [kuavo/sim/wholebody/w8a16.toml](kuavo/sim/wholebody/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill / Action W8A16 | 192 | 20 | [640,480] | ● 已实测 | ● 已实测 | ● 已实测 | `/path/to/pi05_base_kuavo_a20-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
+| [kuavo/single_arm/fp16.toml](kuavo/single_arm/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 128 | 8 | [848,480] | ● 已实测 | ● 已实测 | ● 已实测 | `/path/to/pi05_base_kuavo_a8`；准备方法见[权重准备](../WEIGHTS.md) |
+| [kuavo/single_arm/t64/fp16.toml](kuavo/single_arm/t64/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 64 | 8 | [848,480] | ● 已实测 | ● 已实测 | ● 已实测 | `/path/to/pi05_base_kuavo_a8`；准备方法见[权重准备](../WEIGHTS.md) |
+| [kuavo/single_arm/t64/w8a16.toml](kuavo/single_arm/t64/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill / Action W8A16 | 64 | 8 | [848,480] | ● 已实测 | ● 已实测 | ● 已实测 | `/path/to/pi05_base_kuavo_a8-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
+| [kuavo/single_arm/w8a16.toml](kuavo/single_arm/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill / Action W8A16 | 128 | 8 | [848,480] | ● 已实测 | ● 已实测 | ● 已实测 | `/path/to/pi05_base_kuavo_a8-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
+| [kuavo/wholebody/fp16.toml](kuavo/wholebody/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 192 | 20 | [848,480] | ● 已实测 | ● 已实测 | ● 已实测 | `/path/to/pi05_base_kuavo_a20`；准备方法见[权重准备](../WEIGHTS.md) |
+| [kuavo/wholebody/w8a16.toml](kuavo/wholebody/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / Prefill / Action W8A16 | 192 | 20 | [848,480] | ● 已实测 | ● 已实测 | ● 已实测 | `/path/to/pi05_base_kuavo_a20-w8a16`；准备方法见[权重准备](../WEIGHTS.md) |
 
 本组配置相同的项：
 
@@ -300,16 +307,14 @@ CPU：客户部署配置的 `image_size` 等于相机尺寸（真机 848×480，
 | 输入类型 | 3 路 RGB 帧 + 指令 + 物理 state |
 | cameras 默认值 | 3 |
 | num_steps 默认值 | 10 |
-| 文本可调范围 | text_tokens ∈ {32,64,96,128,160,192}（存储宽度；模板 128/160/192，短指令模板 t64/ 与 t96/ 为 64/96，192 仅 3 相机 FP16/W8，配对 prefill C480）；有效 token = BOS + 指令 + 离散 state + “Action:”，超过 T 时拒绝 |
+| 文本可调范围 | text_tokens ∈ {32,64,96,128,160,192}（存储宽度；模板 128/160/192，短指令模板 t64/ 与 t96/ 为 64/96，192 仅 3 相机 FP16/W8：8 核配对 prefill C480，4/6 核通用分块 4×240 / 3×320）；有效 token = BOS + 指令 + 离散 state + “Action:”，超过 T 时拒绝 |
 | 图像/音频可调范围 | 3 路 uint8 RGB 相机原尺寸帧（PNG/JPEG/.npy），尺寸须等于 frame_size [宽,高]：真机 [848,480]、仿真 [640,480]；每次推理在计时内按 openpi resize_with_pad 缩放并补黑边到 [1,3,224,224] |
 | 生成可调范围 | num_steps=10；action horizon=50；输出 [1,50,action_dim] |
 | 其他输入形状 | state 为 1..32 维物理值；openpi norm_stats.json（q01/q99）；PaliGemma sentencepiece tokenizer；delta_action_mask 可选（还原物理动作） |
-| 联动限制 | 相机顺序 base / left wrist / right wrist；frame_size 只接受 [848,480] 或 [640,480]，帧尺寸不符时拒绝；checkpoint 的三个 VISUAL 特征须声明 [3,224,224]；action_dim 与 checkpoint output_features.action 一致；不与 batch 同用；[run].reference 只能为 off；T≠32 仅 8 核。 |
+| 联动限制 | 相机顺序 base / left wrist / right wrist；frame_size 只接受 [848,480] 或 [640,480]，帧尺寸不符时拒绝；checkpoint 的三个 VISUAL 特征须声明 [3,224,224]；action_dim 与 checkpoint output_features.action 一致；不与 batch 同用；[run].reference 只能为 off；可选 4 / 6 / 8 核（默认 8 核走配对 prefill，4/6 核走通用非配对路由且 10 步 AdaRMS 表常驻 SPM）。 |
 | 默认核数 | 8 |
 | CPU线程数 | 8（入口默认） |
 | 入口 | [run.py](../../run.py) |
-
-- ✕ 4/6 核不支持：Pi0.5 的 4/6 核只接受 T32：T64–T160 只有 8 核的配对 prefill 布局，T192 的 P960 前缀也只按 8 核绑定。
 
 输入校验来源：[optimized.py](../../../examples/runners/pi05/optimized.py) · [openpi_inputs.py](../../../examples/runners/pi05/openpi_inputs.py)。
 

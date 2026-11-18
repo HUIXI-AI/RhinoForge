@@ -9,10 +9,15 @@ def prepare(config, runner):
     example, inputs, target, checkpoint, execution, decode_steps = text_context(config)
     from transformers import AutoConfig, AutoImageProcessor, DINOv3ViTModel
     from rpu_backend.adapters.dinov3 import DINOv3Adapter
+    from examples.common.config import install_quantization
 
     images = _image_inputs(inputs)
     hf_config = AutoConfig.from_pretrained(checkpoint, local_files_only=True)
     DINOv3Adapter.preflight(hf_config)
+    quantization = install_quantization(target, example["profile_id"])
+    if quantization is not None:
+        # Refuse the recipe before reading the checkpoint.
+        DINOv3Adapter.preflight_quantization(hf_config, execution, quantization)
     processor = AutoImageProcessor.from_pretrained(checkpoint, local_files_only=True)
     pixels = processor(images=images, return_tensors="pt").pixel_values
     runner.input_geometry = {"source_image_sizes_wh": [list(image.size) for image in images],
@@ -20,7 +25,7 @@ def prepare(config, runner):
     model = DINOv3ViTModel.from_pretrained(
         checkpoint, config=hf_config, dtype=torch.float16,
         local_files_only=True).eval()
-    model = DINOv3Adapter(model, rpu_execution=execution).to_rpu()
+    model = DINOv3Adapter(model, rpu_execution=execution, quantization=quantization).to_rpu()
     runner.owner = model
 
     def infer_vision():

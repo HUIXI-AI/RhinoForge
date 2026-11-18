@@ -154,18 +154,25 @@ generator 从首次迭代到完成、失败或关闭前一直持有模型请求�
 CPU 浮点 Tensor。
 函数签名和返回类型见[语音 API](api_reference.zh.md#语音-api)。
 
+与其他 CPU 应用共享 R1 时，可先对照测试 `torch.set_num_threads(4)`，而非照搬示例的
+16 线程。使用 GNU OpenMP 的 PyTorch 还可在启动进程前设置 `OMP_WAIT_POLICY=PASSIVE`，
+减少线程等待时的 CPU 消耗；不要在导入 Torch 后才设置，也不要将它当作 RPU 等待策略。
+同时比较整句墙钟、进程 CPU 核秒、生成 token 和波形：线程/等待配置可能影响延迟，
+线程数变化也可能改变采样输出。API 不会覆盖调用方配置；应在客户应用实际并行时验证。
+
 ## 执行与资源
 
 | 模型 | CPU | Rhino RPU |
 |---|---|---|
 | ASR | 音频读取、mel/分块、卷积与层间激活、单 token embedding、有限值检查、argmax、文本解码 | conv_out、位置和有效行处理、音频 encoder 与末尾投影、prefill 文本/音频组装、文本 decoder 和输出头 |
-| TTS | embedding、参考音频、speaker encoder、生成控制、码本、转置卷积/上采样、剩余 17 层 SnakeBeta、波形输出 | 默认卸载的 31 层解码 Conv1d，以及匹配 native 下的 12 层中间 SnakeBeta；Talker、Predictor 和输出头；具备对应 native 接口时还包括 codec 输入/输出投影和 Transformer 前段 |
+| TTS（匹配新版 native） | embedding、参考音频、speaker encoder、生成控制/采样、码本、边界布局/裁剪和波形输出 | Talker/Predictor 和输出头；codec 前段、31 层 Conv1d、含重叠/bias 的六层反卷积、全部 SnakeBeta/残差计算、两个 ConvNeXt 块 |
 
 ASR 卷积使用 FP16 舍入权重进行 CPU FP32 计算，再转回 FP16；卷积采用 channels-last。
 设备音频 Graph 使用 FP32 Linear 累加。TTS CPU 组件保持 FP32，设备组件使用 FP16、
 FP32 Linear 累加，Talker/Predictor 输出头仍使用 FP16 累加；codec 前段 LayerScale
 在 FP32 中折入投影后转 FP16，RoPE 保留 FP32 频率。
-设备 codec 前段接受 1–63 帧；64–255 帧使用原始 CPU FP32 前段及其 72 帧滑窗注意力。
+设备 codec 前段接受 1–255 帧；超过 64 帧时使用显式 72 帧因果滑窗和规划器选择的单块执行。
+RoPE/KV 容量为 256，仅保留当前长度的图及其独立持有的 mask。
 
 - ASR 需要重编译的 native 提供 `siglip_set_audio_mode`、`siglip_set_audio_projection`
   和 `assemble_inputs_embeds`，缺少接口时加载失败。
@@ -210,15 +217,15 @@ FP32 Linear 累加，Talker/Predictor 输出头仍使用 FP16 累加；codec 前
 ## 实验性 RPU 声码器卷积
 
 `Qwen3TTSModel.from_pretrained` 和示例运行器默认使用 `codec_backend="rpu"`，
-省略参数或配置字段时默认启用 RPU。`examples/configs/qwen3_tts/0_6b/fp16.toml` 默认选择该模式，`fp16_cpu_codec.toml` 或显式设置 `codec_backend="cpu"` 可恢复 CPU FP32 残差卷积。
+省略参数或配置字段时也启用 RPU。`examples/configs/qwen3_tts/0_6b/fp16.toml` 默认选择该模式，`fp16_cpu_codec.toml` 或显式设置 `codec_backend="cpu"` 可恢复 CPU FP32 Conv1d。
 RPU 模式将解码实际调用的全部 31 层 Conv1d 转换成显式八核 Linear，输入/权重 FP16、
 累加 FP32：12 层残差 kernel-7 卷积、14 层 kernel-1 投影、3 层输入/输出卷积，以及
 2 层逐通道卷积。后者在安装时展开为通道对角权重，保留分组语义；共享量化器中仅供
 编码使用的两个 input_proj 不转换。权重只转换一次，保留原 CPU FP32 权重；独立卷积的输出通道
 补齐到 128 对齐后裁回原大小，再加原 FP32 bias。
 
-CPU 仍执行补边、列展开、剩余 bias/残差相加、码本、17 层 SnakeBeta、6 层转置卷积、ConvNeXt 的
-Linear/归一化/GELU 及上采样整理，因此属于部分卸载。native 提供 `tts_codec_conv1d` 时，
+缺少下述较新 native 算子时，CPU 执行补边、列展开、剩余 bias/残差相加、码本、17 层 SnakeBeta、ConvNeXt 的
+归一化/GELU 及上采样整理；旧 native 还会把 6 层转置卷积留在 CPU。native 提供 `tts_codec_conv1d` 时，
 CPU 通过保留存储所有权的共享视图，将展开并舍入后的 FP16 输入直接写入新分配的设备 DDR。
 同步 ACC32 Linear 完成后，读取已同步的共享 DDR 输出，先裁剪有效通道，再一次性转换并
 写入独立的 NCT FP32 输出；独立卷积路径保留原 FP32 bias 运算。CPU 别名不向调用者暴露，输入发布与
@@ -233,13 +240,36 @@ native 提供 `tts_codec_conv_pair` 时，12 个残差单元各自将 kernel-7 �
 并非单个融合设备程序或单张 Graph，仍保留逐算子提交和边界 flush。旧 native 保留全部
 CPU SnakeBeta；`codec_backend="cpu"` 下卷积和激活均在 CPU。
 
+native 提供 `tts_codec_conv_transpose1d` 时，6 层固定转置卷积的投影使用 RPU FP16
+输入/权重和 ACC32 Linear；重叠相加、FP32 bias 与最终布局仍由 CPU 完成，不新增设备 Graph。
+两个 ConvNeXt 块的 4 层逐点 Linear 同样使用 RPU FP16 输入/权重和 ACC32；LayerNorm
+与精确 GELU 保留 CPU FP32，以避开 v1.2.0 的 core-0 SPM 容量边界。每层 Linear 返回
+独立的 CPU FP32 张量。
+
 复用同步 immediate Linear 和第六个共享 arena，不新增常驻 Graph。几何不匹配会拒绝
 安装，执行错误直接抛出，不静默退回 CPU。`execution_stats().codec_convolutions`
 记录 `backend`、安装的 `layers`（RPU 模式为 31）、累计 RPU `calls`，以及
 `transport`（`shared_ddr` 或旧路径 `staged`）、`residual_pairs`（匹配 native 时为 12，
-否则为 0）和 `paired_calls`（成功完成的成组调用次数，每次也使 `calls` 增加 2）。
-前段 Transformer 的 63 帧设备
-边界和更长序列的 CPU 滑窗注意力保持不变。
+否则为 0）、`paired_calls`（成功完成的成组调用次数，每次也使 `calls` 增加 2），以及
+`transposed_layers`（匹配 native 时为 6）、`transposed_calls`、
+`convnext_linears`（4）和 `convnext_linear_calls`。
+较新 native 的 `tts_codec_residual_unit_complete` 将全部残差单元的首个 SnakeBeta
+和末尾残差相加移到 RPU；`tts_codec_conv1d_spm_bias` 将普通卷积 bias 合入设备投影。
+具备 `tts_codec_transpose_overlap` 时，安装阶段按 kernel 位置重排六层反卷积权重，
+RPU 使用独立单核 SPM 缓冲和容量受限的分块完成末轴切片、重叠相加及 FP16 bias，
+不使用旧 DDR transpose 路径。CPU 仍处理 NCT 边界转换及最终裁剪；相对 CPU FP32
+后处理会有舍入差异。具备 `tts_codec_conv_transpose1d_device_post` 时，保持设备计算不变，
+通过共享 DDR 边界函数合并 CPU 布局及类型转换，减少主机中间复制；返回的 CPU FP32
+张量拥有独立存储，但不代表整条反卷积链设备驻留。
+具备 `tts_codec_residual_unit_rows` 时，768/384 通道阶段中的
+三个残差单元保持设备驻留，省去两次中间 CPU 往返。
+具备 `tts_codec_residual_unit_padded_rows` 时，192/96 通道阶段也通过补零至
+256/128 通道的 rows 将三个单元保持在设备上，仅在阶段入口补齐、出口裁剪；
+第一层卷积权重的每个 kernel 位置分别补齐输入通道。旧扩展保留原有 CPU 边界。
+上述路径需要重编译 RhinoForge 扩展，不修改 runtime 依赖包。
+匹配新版 native 还通过 `tts_codec_conv1d_spm`、`tts_codec_snake` 和
+`tts_codec_convnext_block` 在 RPU 上完成卷积准备、独立 SnakeBeta 及 ConvNeXt
+归一化/GELU/残差计算。CPU 仍负责 eager 调度和边界转换，并非整段 decoder 完全设备驻留。
 
 FP16 舍入会改变波形，应使用同一份 codec tokens 对照 CPU FP32 并核验语音内容。
 该路径虽已设为默认，仍属实验性实现，不继承此前 CPU 残差卷积配置的音质结论；运行成功不等于音质认证。

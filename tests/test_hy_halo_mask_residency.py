@@ -16,7 +16,7 @@ from test_fmb_standalone_layout_rebuild import _definition
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def _program():
+def _program(*, preamble_only=False):
     base = (ROOT / "src/fused/rpu_qwen3_model.h").read_text()
     hy = (ROOT / "src/fused/rpu_hyvla_expert_model.cpp").read_text()
     halo = (ROOT / "src/fused/rpu_halo_action_expert_model.cpp").read_text()
@@ -79,6 +79,8 @@ template<class T,class U> T Align(T a,U b) {return CeilDiv(a,static_cast<T>(b))*
     residency = (ROOT / "src/core/rpu_spm_residency.h").read_text()
     p += residency[residency.index("namespace v3::detail {"):]
     p += "\nnamespace v3 {\n"
+    if preamble_only:
+        return p
     tiling = (ROOT / "src/ops/rpu_hyvla_sdpa_tiling.h").read_text()
     p += "\n".join(re.findall(r"constexpr int64_t HYVLA_S51_\w+_SDPA_TMP_BYTES = \d+;", tiling))
     p += r'''
@@ -98,6 +100,8 @@ struct FmbPhysicalExecutionManifest {
 '''
     p += r'''
 class CausalDecoderModel {public:
+ const bool qwen3_prefill_w8a8_=false,qwen3_c256_=false;
+ int64_t qwen3_inplace_capacity()const{return 0;}
  int64_t h=1024,nq=16,nkv=8,hd=128,inter=2048,layers=32;
  bool wall_prefill_staged_mlp_=false,decode_gate_up_fusion_=false;
  bool prefill_packed_gate_up_strided_=false;
@@ -116,7 +120,16 @@ class CausalDecoderModel {public:
 '''
     decl = _definition(base, "std::vector<BufferDecl> causal_baseline_buffer_declarations(")
     cut = decl.index("        // Norm-weight preloads")
-    assert "StorageClass::Temp" not in decl[cut:]
+    # The independent Qwen3 A8/in-place selectors are const-off in this probe.
+    # No other post-preload Temp declaration may be silently omitted.
+    later = decl[cut:]
+    for marker in (
+        'if ((qwen3_prefill_w8a8_ || qwen_inplace) && comp_cs > 1)',
+        'if (qwen_inplace && qwen3_c512_)',
+        'if (qwen_inplace && (qwen3_c256_ || qwen3_c512_))',
+    ):
+        later = later.replace(_definition(later, marker), "", 1)
+    assert "StorageClass::Temp" not in later
     p += decl[:cut] + "return decls;\n}\nstd::vector<BufferDecl> declare_buffers(const LayoutContext& l){return causal_baseline_buffer_declarations(l); }\n};\n"
     # HY's baseline consists solely of its exact extra Temp declarations.
     for marker in ("static int64_t hyvla_grow_kv_slots(", "static bool hyvla_grow_slot(",

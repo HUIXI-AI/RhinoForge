@@ -146,6 +146,7 @@ struct Model {
   __PREDICATES__
   FmbPhysicalExecutionManifest selected_manifest(const Plan& plan,const Layout& layout,int64_t physical_len,bool partial_mrope){
     FmbPhysicalExecutionManifest manifest;manifest.state=FmbPhysicalManifestState::COMPLETE;
+    const bool qwen_c512=false;  // Plain 32B prefill is unbound for this 4B owner.
     const bool wall_action_fused_qkv_partial_mrope=false,tensor_rope=false,wall_base_nvfp4_qkv_rope=false;
     const int64_t logical_len=physical_len,position=ctx().position;
     const auto rope_site=CAUSAL_DECODER_MROPE_POINTER_SITE;
@@ -277,6 +278,7 @@ int main(){
                        "DISPATCH": dispatch_text}.items():
         program = program.replace(f"__{key}__", value)
     program = program.replace("__LINGBOT_UNBOUND__", unbound_lingbot_prefill_members(source))
+    program = program.replace("__INPLACE_CAPACITY__", definition(source, "int64_t qwen3_inplace_capacity("))
     cpp, exe = tmp_path / "qk_owner.cpp", tmp_path / "qk_owner"
     cpp.write_text(with_actual_linear_contracts(program))
     result = subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-Wno-misleading-indentation",
@@ -350,6 +352,9 @@ struct Model {
  int64_t N=36,hidden_size=2560,intermediate_size=9728,num_q_heads=32,num_kv_heads=8,head_dim=128;
  __WALL_FIELDS__
  __LINGBOT_UNBOUND__
+ bool qwen3_c192_=false,qwen3_c256_=false,qwen3_c512_=false,qwen3_prefill_w8a8_=false;
+ __INPLACE_CAPACITY__
+ std::vector<int64_t> qwen3_prefill_w8a8_identity()const{throw std::runtime_error("unbound Qwen32 A8 route");}
  bool rhinovla_high_precision_=false,rhinovla_high_precision_fusions_=false;
  bool tts_codec_mode_=false;std::vector<at::Tensor> tts_predictor_heads_;
  bool has_scale=true,has_nvfp4=false,use_silu=true,has_qk_norm_=true,has_qkv_bias_=false;
@@ -428,6 +433,11 @@ int main(){
                        "PROFILE": profile, "CAPACITY": capacity_binding, "PADDING": padding, "LAYOUT": layout, "WALL_FIELDS": wall_fields}.items():
         program = program.replace(f"__{key}__", value)
     program = program.replace("__LINGBOT_UNBOUND__", unbound_lingbot_prefill_members(source))
+    program = program.replace("__INPLACE_CAPACITY__", definition(source, "int64_t qwen3_inplace_capacity("))
+    program = (f'#include "{ROOT / "src/fused/rpu_qwen3_c192_contract.h"}"\n'
+               f'#include "{ROOT / "src/fused/rpu_qwen3_c512_contract.h"}"\n'
+               'namespace qwen3_c192=v3::qwen3_c192;\n'
+               'namespace qwen3_c512=v3::qwen3_c512;\n' + program)
     cpp, exe = tmp_path / "qk_cold.cpp", tmp_path / "qk_cold"
     cpp.write_text(with_actual_linear_contracts(program))
     result = subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-Wno-misleading-indentation",

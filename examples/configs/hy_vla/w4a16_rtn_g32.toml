@@ -1,0 +1,62 @@
+# 未写出的执行参数（省略即按以下值运行）：
+#   [cpu].threads 省略时本入口使用 12。
+#   分块（chunk_size）模板未写出，按 auto 由入口选择：prefill 和 action 与 W8A16 模板相同（3 相机 prefill 208、action 64；2 相机 prefill 160、action 64）；vision 的 auto 分块在任何核数下都由原生 planner 按 4 核 Vision 选择，尚无实测记录。可调范围见模型页。
+# HyVLA 模板（默认 8 核，可改 4/6 核），直接修改 cameras、text_tokens 和 rpu_execution.model.num_cores，或在命令行用 --input 2cam_t32 等预设（examples/inputs/vla.toml）。
+# 合成输入使用 checkpoint 自带的 tokenizer；任务质量未评估。
+# 冷启动装载时量化：Vision、VLM 两条孪生和动作专家都为对称 INT4/G32（RTN）。
+#   Vision 在任何核数预算下都用 4 核：补零后 o_proj 的 K 是 1280、fc2 的 K 是 4352，按行分到 8 核时每核 160 和 544，INT4 行切分不接受；分到 4 核时是 320 和 1088。
+#   按权重精度选择的融合 Linear 路由（Gate/Up+SwiGLU 等）和常驻核内存的 Gate/Up 布局只有 FP16/W8/NVFP4 版本，W4 投影走通用 auto-tile Linear；尚未上板实测。
+[model]
+target = "hy_vla"
+# 本文件的权重/计算配方；切换精度须同时使用对应权重。
+precision = "w4a16_rtn_g32"
+# 常驻核内存的 FP8 Gate/Up scale 层数：0（省略时）、4 或 8；非零只适用于 8 核 Action NVFP4，本配方写非零报错，保持 0。
+resident_fp8_scale_layers = 0
+# VLM RMSNorm：取 "auto"（省略时）或 "16"。8 核时 auto 在行数能被 32 整除时用 V32，否则 V16，本模板 3 相机 T32 的 prefix（208）为 V16，2 相机（160）为 V32；"16" 不用 V32。
+# 4/6 核时 auto 走 BASE RMSNorm（V16/V32 只有 8 核实现），写 "16" 报错。取值见 README「prefix_len 与 RMSNorm 的实际取值」。
+rmsnorm_vwarp = "auto"
+# 替换为匹配本模型与量化配方的本地资产路径或既有权重别名。
+checkpoint = "hy-embodied-0.5-vla-umi"
+
+[input]
+# batch 使用保存输入；synthetic 按真实 processor 构造，不共用两种输入字段。
+source = "synthetic"
+# 可选 2 / 3；synthetic 输入按相机数构造，batch 输入须与之一致。
+cameras = 3
+# 有效文本 token 数 1–64；修改后同步输入与 prefix bucket。
+text_tokens = 32
+# 多模态 prefix 行数：auto（省略时）取 ceil16(2 + 58×相机数 + text_tokens)，本模板 3 相机 T32 为 208，2 相机为 160；显式值须 16 对齐，从 auto 值到 ceil16(2 + 58×相机数 + 64)（3 相机 240，2 相机 192）。
+prefix_len = "auto"
+# 当前模型路径的固定去噪步数，不作为任意可调范围。
+num_steps = 10
+# instruction = "A prompt with at least text_tokens real checkpoint tokens ..."
+# reference = "/path/to/same_input_run/reference.pt"
+
+[rpu_execution.model]
+# RPU 核数预算：4、6 或 8（省略为 8），冷配置，修改后需重新加载模型。
+# 8 核：文本骨干和动作专家用 8 核（注意力 TP8），动作专家 Gate/Up 权重不常驻核内存；
+#   Vision（含 patch embed、merger）仍用 4 核，Vision KV 放 DDR，不启用 8 核 Vision 的 KV 常驻核内存。
+# 4/6 核：文本骨干 Attention 4 核（KV4）、MLP 用全部 4/6 核，Vision（含 patch embed、merger）和动作专家用 4 核；
+#   Vision KV 放 DDR，动作专家 Gate/Up 权重不常驻核内存，其余 8 核专用路由（Vision 逐图 SPM 注意力、RMSNorm V16/V32）不启用。
+num_cores = 8
+
+[run]
+# 预热次数；不计入正式测量。
+warmup = 3
+# 正式执行次数，正整数。
+runs = 5
+# 随机种子，非负整数。
+seed = 0
+# 结果输出目录；并发运行使用不同目录。
+output_dir = "./hyvla_results/w4a16_vision"
+
+# 使用当前 native 构建和仓库自带的两个算子库 REF。
+# 源码与构建来源见 release/runtime-dependencies.json。
+# 修改 cameras 或 text_tokens 不需要更换算子库。
+# 三项须一起填写，main/expansion 的内容须与 release/runtime-dependencies.json 发布的 SHA-256 一致。
+# 删除整个 [libraries] 表时，改用环境变量 RPU_BACKEND_SO / RPU_KERNEL_LIB_PATH / RPU_KERNEL_LIB_PATH_EXPANSION，
+# 未设置时使用仓库 src/（或已安装 wheel）中的两个 REF 和已安装的 backend。--check-config 接受占位路径，运行时检查文件。
+[libraries]
+native = "/path/to/current-build/rpu_backend.so"
+main = "/path/to/rpu_backend/src/rhinoOpLib_current.ref"
+expansion = "/path/to/rpu_backend/src/rhinoExpansionOpLib_current.ref"

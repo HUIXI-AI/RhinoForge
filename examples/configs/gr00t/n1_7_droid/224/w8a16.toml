@@ -1,6 +1,7 @@
 # 未写出的执行参数（省略即按以下值运行）：
-#   rpu_execution.model.num_cores 固定 8 核（可显式写 8；4/6 核不支持，原因见模型页配置表）。
-#   分块（chunk_size）模板未写出，按 auto 由入口选择；2026-10-19 模板默认输入实测：vision 592、prefill 208、action 48。可调范围见模型页。
+#   rpu_execution.model.num_cores 省略为 8；可写 4 / 6，修改后需重新加载模型：文本骨干为 Attention 4、MLP 4/6，Vision、VL 编码器和 DiT 用 4 核；
+#     只有 8 核实现的选项（融合 merger、多图批处理、AdaLN/时间表、交叉 KV 复用、常驻 FF1、KV 只放 SPM、Z1）在 4/6 核关闭，merger 改在 CPU FP32 上算。
+#   分块（chunk_size）模板未写出，按 auto 由入口选择；2026-10-19 实测：模板默认输入（3 相机）vision 592、prefill 208、action 48；2 相机（2cam_t128）vision 400、prefill 240、action 48。可调范围见模型页。
 # GR00T-N1.7 三路相机模板，按精度和输入选择已有优化。
 # 说明见 ../../README.md；text_tokens 与 observation 必须一起修改。
 # 实测耗时与验证范围见 docs/model_performance/gr00t/n1_7_droid.md。
@@ -42,7 +43,7 @@ profile = false
 # 随机种子，非负整数。
 seed = 0
 # 结果输出目录；并发运行使用不同目录。
-output_dir = "./gr00t_results/3cam/224/w8a16"
+output_dir = "./gr00t_results/224/w8a16"
 
 # 各组件按 auto 规划，并按实际 SPM/DDR 容量准入。
 [rpu_execution]

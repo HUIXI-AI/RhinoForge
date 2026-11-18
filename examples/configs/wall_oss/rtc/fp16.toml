@@ -1,6 +1,8 @@
 # 未写出的执行参数（省略即按以下值运行）：
 #   [cpu].threads 省略时不设置线程：PyTorch 使用环境变量 OMP_NUM_THREADS，未设置时使用全部 CPU 核（参考板 24）；2026-10-19 测量环境预设为 16。
-#   rpu_execution.model.num_cores 固定 8 核（可显式写 8；4/6 核不支持，原因见模型页配置表）。
+#   rpu_execution.model.num_cores 省略为 8；可写 4 / 6，修改后需重新加载模型：文本（专家 0）为 Attention 4、MLP 4/6，Vision 和动作专家用 4 核；
+#     4/6 核把 Vision 与专家 0 的残差流按 1/4 缩放留在 FP16 范围内（8 核用 BF16 混合精度边界），只有 8 核实现的选项
+#     （Attention 8、融合 merger、混合精度、Vision 权重外循环）在 4/6 核关闭；prefix 仍为 P640/P672，分块由原生 planner 选能放进 SPM 的最少块（上限 320；6 核 P640 为 2×320，4 核放不下 320 时为 256/256/128）。
 [model]
 profile_id = "wall-oss-0.5.fp16.rtc-controlled"
 registry_alias = "wall-oss-0.5"

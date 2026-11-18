@@ -50,6 +50,8 @@ and source remain authoritative; see [the schema](SCHEMA.md) and
   signature correctness, policy inheritance, and failure cleanup.
 - [DDR/SPM DMA wrappers](concepts/ddr-dma-wrappers.md): fixed, mutable, and
   immediate address ownership.
+- [R1 DDR bandwidth limits](concepts/ddr-bandwidth.md): SMMU/controller read
+  ceilings, 4/6/8-core physical core sets, and decode bandwidth floors.
 - [KV cache](concepts/kv-cache.md): sizing, position, transactional prefix
   replacement, and model state.
 - [Weight swizzle](concepts/weight-swizzle.md): exactly-once layout conversion.
@@ -113,4 +115,4 @@ and source remain authoritative; see [the schema](SCHEMA.md) and
 
 - [Qwen3 ASR/TTS](../docs/qwen3_audio.md): pinned assets, source preparation,
   input limits, CPU/device ownership, Predictor checked replay, one-shot output
-  heads, 31-layer Conv1d offload, frozen CPU codec activations and Python API calls.
+  heads, 1–255 frame device codec frontend, 31-layer Conv1d + 6 transposed convolutions + SnakeBeta/residual/ConvNeXt RPU offload, and Python API calls.

@@ -165,3 +165,37 @@ def test_full_w8_installs_actual_encoder_patch_and_all_merger_owners(transfers, 
         finalizer = getattr(model, "_rpu_vision_handle_finalizer", None)
         if finalizer is not None and finalizer.alive:
             finalizer()
+
+
+@pytest.mark.parametrize("cores", [4, 8])
+def test_four_core_mergers_run_batched_with_rpu_output_and_no_raw_copies(transfers, monkeypatch, cores):
+    from rpu_backend.api import _execution
+    from rpu_backend.graph import lazy_init_guard
+    monkeypatch.setattr(_execution, "_require_execution_process_safe", lambda: None)
+    monkeypatch.setattr(lazy_init_guard, "_verify_lazy_init", lambda _: None)
+    monkeypatch.setattr(vision, "build_vision_rope_tables", lambda *a, **kw: (torch.zeros(16, 16), torch.zeros(16, 16)))
+    monkeypatch.setattr(vision, "_make_dummy_vision_kv_caches", lambda *a, **kw: NS(max_seq_len=1024))
+    monkeypatch.setattr(rpu_backend.graph, "GraphCache", lambda **kw: NS(clear=lambda: None, cache_invariant_ok=lambda: True))
+    monkeypatch.setattr(torch.ops.rpu, "qwen3vl_vision_create", lambda *a: 77, raising=False)
+    monkeypatch.setattr(torch.ops.rpu, "qwen3vl_vision_destroy", lambda _: None, raising=False)
+    monkeypatch.setattr(torch.ops.rpu, "qwen3vl_vision_topology", lambda _: (4, 4, 4, 8), raising=False)
+    for method in ("set_weights", "set_chunk_envelope", "set_rope_route", "set_chunk_size"):
+        monkeypatch.setattr(torch.ops.rpu, "qwen3vl_vision_" + method, lambda *a: None, raising=False)
+    monkeypatch.setattr(torch.ops.rpu, "qwen3vl_vision_position_idx_keepalive", lambda _: torch.zeros(1024, 2), raising=False)
+    # Explicit opposite selections: only the eight-core install follows them.
+    monkeypatch.setenv("RPU_RHINOVLA_VISION_BATCH_MERGERS", "0")
+    monkeypatch.setenv("RPU_RHINOVLA_VISION_RPU_MERGER_OUTPUT_RPU", "0")
+    monkeypatch.setenv("RPU_RHINOVLA_VISION_SKIP_RAW_SNAPSHOTS", "0")
+    model = _Vision()
+    try:
+        assert vision.install_qwen3_vl_vision_for_rpu(
+            model, rpu_patch_embed=True, rpu_mergers=True, num_cores=cores) == 77
+        reduced = cores != 8
+        assert model._rpu_vision_batch_mergers is reduced
+        assert model._rpu_vision_merger_output_rpu is reduced
+        assert model._rpu_vision_collect_raw_snapshots is not reduced
+        assert not model._rpu_vision_merger_norm_on_rpu
+    finally:
+        finalizer = getattr(model, "_rpu_vision_handle_finalizer", None)
+        if finalizer is not None and finalizer.alive:
+            finalizer()

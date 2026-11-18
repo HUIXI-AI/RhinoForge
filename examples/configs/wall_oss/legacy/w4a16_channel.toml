@@ -6,7 +6,7 @@
 profile_id = "wall-oss-0.5-w4a16.w4a16.vla"
 registry_alias = "wall-oss-0.5-w4a16"
 target = "wall_oss"
-precision = "w4a16"
+precision = "w4a16_channel"
 fp16_registry_alias = "wall-oss-0.5"
 
 [model.opt_in]

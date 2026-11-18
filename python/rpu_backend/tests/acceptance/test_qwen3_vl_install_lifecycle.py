@@ -302,6 +302,12 @@ def install_runtime(monkeypatch):
         resolve_decode, raising=False,
     )
     monkeypatch.setattr(
+        torch.ops.rpu, "causal_decoder_prepare_persistent_spm",
+        lambda handle, length, position, causal: state["events"].append(
+            ("prepare_text_persistent", handle, length, position, causal)),
+        raising=False,
+    )
+    monkeypatch.setattr(
         torch.ops.rpu, "causal_decoder_planner_cache_identity",
         lambda handle: (handle, state["native_generation"]), raising=False,
     )
@@ -611,11 +617,14 @@ def test_success_is_published_last_and_reentry_is_a_noop(
     assert allocations and all(
         claim_index < allocator_index < index for index in allocations
     )
-    assert install_runtime["events"][-4:] == [
+    # Eight-core Vision without the fused merger sizes its AUTO chunk from
+    # live SPM, so Text Persistent is reserved cold after the last setter.
+    assert install_runtime["events"][-5:] == [
         ("set_vision_linear_acc32", 11, False),
         ("set_linear_acc32", 22, False),
         ("set_lm_head", 22),
         ("resolve_decode", False, True),
+        ("prepare_text_persistent", 22, 16, 0, True),
     ]
     text = model.model.language_model
     assert text._rpu_decode_stage_descriptor != install_runtime["initial_decode_descriptor"]
@@ -850,6 +859,9 @@ def test_explicit_vision_accumulation_respects_native_fp16_optimization_contract
     assert ("enable_vision_mergers", 11) in install_runtime["events"]
     assert calls == (list(names) if vision_acc32 else [])
     assert install_runtime["acc32"] is False  # Text defaults to ACC16 independently.
+    # The FP16 chunked merger falls back to eager AUTO off N1200, so both
+    # accumulations reserve Text Persistent once, before any forward.
+    assert install_runtime["events"].count(("prepare_text_persistent", 22, 16, 0, True)) == 1
 
 
 def test_public_vision_chunk_reaches_the_native_installer(install_runtime):

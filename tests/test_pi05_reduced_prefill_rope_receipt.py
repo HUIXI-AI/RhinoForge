@@ -67,9 +67,11 @@ def test_private_cpu_tp46_rope_receipt_runs_whole_setter_and_copy_protocol(tmp_p
     begin = weights.index("        pi05_reduced_prefill_rope_receipt_ =\n")
     admission = weights[begin:weights.index("        invalidate_model_state();", begin)]
     install_end = weights[weights.rindex("        invalidate_model_state();"):weights.rindex("    }")]
-    topology = "\n".join(_function(topology_source, marker) for marker in (
-        "inline int64_t pi05_mlp_physical_size(", "inline int64_t validate_pi05_reduced_geometry(",
-        "inline void validate_pi05_reduced_projection_shapes("))
+    topology = "\n".join([re.search(r"enum class Pi05ReducedPrecision \{[^}]*\};",
+                                     topology_source).group()] + [
+        _function(topology_source, marker) for marker in (
+            "inline int64_t pi05_mlp_physical_size(", "inline int64_t validate_pi05_reduced_geometry(",
+            "inline void validate_pi05_reduced_projection_shapes(")])
     wrapper = _function(source, "void rpu_gemma_set_prefill_rope(")
     schema = re.search(r'  m.def\("gemma_set_prefill_rope\(.*?;', dispatch).group()
     registrations = []
@@ -194,6 +196,9 @@ HostTensor tagged(const at::Tensor& value){
 }
 __TOPOLOGY__
 struct Model{
+ // Reduced TP4/6 RoPE transport never installs the TP8 A8 panel owner.
+ bool pi05_prefill_a8_panel512_=false;
+ void validate_pi05_a8_panel512_cold()const{assert(!pi05_prefill_a8_panel512_);}
  bool pi05_prefill_kv1_pair_direct_=false,prefill_rope_ready_=false,pi05_prefill_kv1_replica_proof_=false;
  std::vector<int> pi05_a8_scales_,chunk_mask_publications_;
  HostTensor cos_,sin_;int64_t prefix_rows=800;uint64_t generation=9;
@@ -212,7 +217,8 @@ struct Model{
   cores=selected_cores;attention_tp=cores==8?8:4;mlp=cores;
   const int64_t N=18,num_q_heads=8,num_kv_heads=cores==8?8:4,head_dim=256,hidden_size=2048,intermediate_size=16384;
   auto dtype=w8?at::kChar:at::kHalf;
-  auto physical=pi05_mlp_physical_size(intermediate_size,cores,w8);
+  auto physical=pi05_mlp_physical_size(intermediate_size,cores,
+   w8?Pi05ReducedPrecision::W8A16:Pi05ReducedPrecision::FP16);
   std::vector<at::Tensor> q_w_list,k_w_list,v_w_list,o_w_list,gate_list,up_list,down_list;
   auto meta=[&](int64_t rows,int64_t cols){return at::empty({rows,cols},at::TensorOptions().dtype(dtype).device(at::kMeta));};
   for(int i=0;i<N;++i){

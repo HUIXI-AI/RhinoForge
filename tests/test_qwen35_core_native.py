@@ -202,6 +202,11 @@ def test_actual_qwen35_weight_guards_distinguish_logical_and_prepared_mlp(tmp_pa
         nvfp4_header.index("struct G05Nvfp4Tables"):
         nvfp4_header.index("    void install(")
     ]
+    text_nvfp4_header = (ROOT / "src/fused/qwen35_text_nvfp4.h").read_text()
+    text_nvfp4_metadata = text_nvfp4_header[
+        text_nvfp4_header.index("struct Qwen35TextNvfp4Tables"):
+        text_nvfp4_header.index("    void install(")
+    ]
     kernel_header = (ROOT / "src/core/rpu_kernel_cache.h").read_text()
     start = kernel_header.index("enum class KernelId")
     kernel_ids = kernel_header[start:kernel_header.index("};", start) + 2]
@@ -244,6 +249,11 @@ struct Tensor {
     Device device() const {return {device_type};}
     Tensor cpu() const {assert(false);return *this;}
     template<class T> const T* data_ptr() const {assert(false);return nullptr;}
+    // Text NVFP4 FP8-NaN block-scale scan; unreachable for the dense inputs.
+    Tensor bitwise_and(int) const {assert(false);return *this;}
+    Tensor eq(int) const {assert(false);return *this;}
+    Tensor any() const {assert(false);return *this;}
+    template<class T> T item() const {assert(false);return T{};}
 };
 using TensorList=std::vector<Tensor>;
 }
@@ -251,6 +261,10 @@ at::Tensor rpu_retain_linear_quant_scale(const at::Tensor&,const at::Tensor& zer
 // These device preflights must stay unreachable for the ordinary dense inputs.
 __NVFP4_METADATA__
     void install(at::TensorList) {assert(false);}
+};
+// The dense-text NVFP4 owner stays uninstalled: no input supplies its thirteen tables.
+__TEXT_NVFP4_METADATA__
+    void install(at::TensorList,int64_t) {assert(false);}
 };
 __KERNEL_IDS__
 struct KernelCache {
@@ -283,6 +297,7 @@ struct Qwen3_5Model : FusedModelBase {
     int64_t gdn_conv_dim=6144,gdn_conv_kernel=4;
     bool use_silu=true,action_mode_=false,z2_bound_=false,linear_acc32_=false,validated=false;
     bool high_precision_=false,mlp_packed_w4_=false,mlp_awq_g128_=false;
+    Qwen35TextNvfp4Tables text_nvfp4_;
     int64_t resolve_model_mlp_intermediate_size(int64_t logical_size) const override __MODEL_MLP_WIDTH__
     double eps=1e-6;
     int gdn_tp() const {return num_cores()==8?8:4;}
@@ -670,6 +685,7 @@ int main() {
         ("__LIST_INIT__", "\n".join(f"{name}.resize(24);" for name in layer_lists)),
         ("__LEGACY_LIST_INIT__", "\n".join(f"{name}.assign(64,at::Tensor{{}});" for name in layer_lists)),
         ("__NVFP4_METADATA__", nvfp4_metadata), ("__KERNEL_IDS__", kernel_ids),
+        ("__TEXT_NVFP4_METADATA__", text_nvfp4_metadata),
         ("__VALIDATION__", validation), ("__PARAMETER_CALL__", parameter_call),
         ("__BASE_SET_PARAMS__", method_body(base, "void FusedModelBase::set_model_params(")),
         ("__BASE_RESOLVE__", method_body(base, "DecoderExecutionTopology FusedModelBase::resolve_model_execution_topology(")),

@@ -43,7 +43,7 @@ def test_actual_gdn_scalar_preparation_keeps_logical_n16_and_physical_n32(
                   for target in node.targets))]
     cores = 8 if root_cores == 8 else 4
     scope = dict(torch=torch, NUM_CORES=cores, _gnvh=heads, cpu_stage_weights=True,
-                 W4A16_AWQ="w4a16_awq", W4A16_PGRP="w4a16_pgrp")
+                 NVFP4="nvfp4", W4A16_AWQ="w4a16_awq", W4A16_PGRP="w4a16_pgrp")
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), scope)
     original_to = torch.Tensor.to
 
@@ -95,7 +95,7 @@ def test_dense_quantized_profiles_use_aligned_component_widths(size, method, cor
         config.quant_config["group_size"] = 32
     topology = validate_core_profile(config, {"model": {"num_cores": cores}})
     physical = text_mlp_intermediate_size(config, topology)
-    assert topology.attn_tp == topology.lm_head_tp == 4
+    assert topology.attn_tp == 4 and topology.lm_head_tp == cores
     assert topology.mlp_tp == cores
     stripe = 32 if method == "w4a16_pgrp" else 32
     assert physical % ((32 if method == "w4a16_pgrp" else stripe) * cores) == 0

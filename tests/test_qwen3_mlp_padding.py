@@ -26,7 +26,7 @@ def _forward(mlp, x):
                                       mlp.down_proj.weight.float())
 
 
-@pytest.mark.parametrize("logical, physical", [(3584, 3648), (8192, 8256), (9728, 9792), (17408, 17472), (25600, 25728)])
+@pytest.mark.parametrize("logical, physical", [(3584, 3648), (8192, 8256), (9728, 9792), (17408, 17472), (18944, 19008), (11008, 11136), (25600, 25728)])
 def test_static_padding_preserves_mlp_and_needs_no_activation_padding(monkeypatch, logical, physical):
     torch.manual_seed(91)
     model = _model(logical=logical)
@@ -50,7 +50,7 @@ def test_static_padding_preserves_mlp_and_needs_no_activation_padding(monkeypatc
         weights.pad_decoder_mlp_weights(model, logical_size=logical, physical_size=physical)
 
 
-@pytest.mark.parametrize("logical, physical", [(3584, 3648), (8192, 8256), (9728, 9792), (17408, 17472), (25600, 25728)])
+@pytest.mark.parametrize("logical, physical", [(3584, 3648), (8192, 8256), (9728, 9792), (17408, 17472), (18944, 19008), (11008, 11136), (25600, 25728)])
 def test_bad_last_projection_rejects_before_any_padding(logical, physical):
     model = _model(logical=logical)
     first = model.model.layers[0].mlp.gate_proj.weight
@@ -74,7 +74,7 @@ def test_physical_width_does_not_expand_logical_model_admission():
         resolve_decoder_topology(num_cores=6, **geometry)
 
 
-@pytest.mark.parametrize("logical, physical", [(9728, 9792), (17408, 17472), (25600, 25728)])
+@pytest.mark.parametrize("logical, physical", [(9728, 9792), (17408, 17472), (18944, 19008), (11008, 11136), (25600, 25728)])
 def test_int8_padding_preserves_dequantized_mlp_and_six_core_packing(logical, physical):
     torch.manual_seed(23)
     model = _model(logical=logical)

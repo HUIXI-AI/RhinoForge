@@ -27,6 +27,8 @@ from types import SimpleNamespace
 _CPU = vars(_cpu_helpers)
 
 _PRECISIONS = ("fp16", "w8a16", "w4a16", "int4_g128", "legacy_int4")
+_PREFILL_LAYERS = 18  # PaliGemma decoder; the last layer only writes K/V
+_ACTION_ROLES = ("Q", "K", "V", "O", "Gate", "Up", "Down", "AdaRMS")
 # The action horizon is a checkpoint property (LeRobot `chunk_size`), so the
 # configured value only states which checkpoint this example expects; the run
 # rejects a checkpoint that disagrees. The same finite set is
@@ -34,7 +36,43 @@ _PRECISIONS = ("fp16", "w8a16", "w4a16", "int4_g128", "legacy_int4")
 # `pi05_action_rows_admitted` in src/fused/rpu_pi05_denoise_step_model.cpp;
 # this module cannot import the backend before binding the cold environment.
 _ACTION_HORIZONS = (10, 50)
-_EXAMPLE_PRECISIONS = ("fp16", "w8a16", "w4a16_kvint8", "w8a16_action_nvfp4", "w8a16_prefill_w8a8_action_nvfp4")
+
+
+_ROUTE_PROBES = (("vision",), ("prefill",), *(("prefill", role) for role in ("K", "V", "Gate", "Up")),
+                 *(("prefill", role, layer) for role in ("Gate", "Up") for layer in range(_PREFILL_LAYERS)),
+                 ("action",), *(("action", role) for role in _ACTION_ROLES))
+
+
+def _route_specs(vision, prefill, prefill_kv, gateup_w8a8, action, kv_adarms):
+    """Spec keys of a route at _ROUTE_PROBES: Vision, Prefill (K/V, Gate/Up by layer), Action by role."""
+    gateup = tuple("w8a8" if layer in gateup_w8a8 else prefill
+                   for _ in ("Gate", "Up") for layer in range(_PREFILL_LAYERS))
+    roles = tuple(kv_adarms if role in ("K", "V", "AdaRMS") else action for role in _ACTION_ROLES)
+    return (vision, prefill, prefill_kv, prefill_kv, prefill, prefill, *gateup, action, *roles)
+
+
+# What each implemented route quantizes -> (diagnostic precision, Prefill W8A8, Vision W4).
+# On-load SIGLIP_W8A16 and ADARMS_DENSE_W8A16 follow the diagnostic precision (any but
+# fp16); Vision W4 replaces the SigLIP W8 at install with G32 RTN W4 on four lanes.
+_RECIPE_ROUTES = {
+    _route_specs("fp16", "fp16", "fp16", (), "fp16", "fp16"): ("fp16", False, False),
+    _route_specs("w8a16", "w8a16", "w8a16", (), "w8a16", "w8a16"): ("w8a16", False, False),
+    _route_specs("w8a16", "w8a16", "w8a16", (), "nvfp4", "w8a16"): ("w4a16", False, False),
+    _route_specs("w8a16", "w8a16", "w8a16", range(_PREFILL_LAYERS - 1), "nvfp4", "w8a16"): ("w4a16", True, False),
+    _route_specs("w4a16-g32-rtn", "w8a16", "w8a16", (), "nvfp4", "w8a16"): ("w4a16", False, True),
+    # The legacy whole-model per-channel INT4 checkpoint keeps K/V INT8 and runs
+    # the generic eight-core kernels only.
+    _route_specs("w8a16", "w4a16-channel", "w8a16", (), "w4a16-channel", "w8a16"): ("w4a16_kvint8", False, False),
+}
+
+
+def recipe_route(selector: str) -> tuple[str, bool, bool]:
+    """The diagnostic precision, Prefill W8A8 and Vision W4 switches that realize a registered Pi0.5 recipe."""
+    from examples.common.config import owner_route
+
+    return owner_route("Pi0.5", "pi05", _ROUTE_PROBES, _RECIPE_ROUTES, selector=selector)
+
+
 # Assets with a registered planner profile, keyed by (action horizon,
 # precision): a registered asset carries its own horizon, so the same precision
 # at another horizon is a different checkpoint. The H10 assets
@@ -57,6 +95,10 @@ DENOISE_KV1_PAIR_OWNER PREFILL_KV1_PAIR_DIRECT PREFILL_GATEUP_PAIR FUSED_DENOISE
 _GENERIC_ON = frozenset("""
 KVINSERT_PAD16 DENOISE_UNROLL PREFILL_MASK_FP16 FUSED_DENOISE SIGLIP_BATCH
 """.split())
+# TP8 Vision routes of the batched eight-lane FP16/W8 SigLIP. The native owner
+# refuses KV_SPM_ONLY and OWNER_LN on any other SigLIP; Vision W4 writes all off.
+_VISION_EIGHT_LANE_ON = ("VISION_MERGE_SEGMENT", "VISION_Q_RESIDENT", "VISION_KV_SPM_ONLY",
+                         "VISION_OWNER_LN", "SIGLIP_BATCH")
 _OFF = """
 GEGLU_PREFETCH SDPA_SINGLE_GROUP VISION_FC_WEIGHT_OUTER PREFILL_CARRY_A
 PREFILL_ROPE_CACHE DENOISE_GATEUP_RESIDENT DENOISE_ELIDE_UNUSED_DMA
@@ -79,12 +121,15 @@ RAW_PHASE_BOUNDARY = ("preprocess = openpi host transforms of the native frames 
 def profile_environment(
     precision: str, *, prefill_w8a8: bool | None = None,
     vision_owner_ln: bool | None = None, cameras: int = 3, text_tokens: int = 32,
+    vision_w4a16: bool = False,
     action_horizon: int = 50,
 ) -> dict[str, str]:
     """Return cold settings; explicit opt-ins default off in the CLI.
 
     None retains compatibility with existing one-argument experiment callers
     that bind these two flags separately. It never enables either flag.
+    VISION_W4A16 (Action NVFP4 only) keeps Prefill and Action on this TP8
+    profile and runs SigLIP W4 on four lanes, one camera at a time.
     """
     if precision not in _PRECISIONS:
         raise ValueError("precision must be fp16, w8a16, w4a16 (NVFP4), int4_g128, or legacy_int4")
@@ -96,8 +141,17 @@ def profile_environment(
                         ("vision_owner_ln", vision_owner_ln)):
         if value is not None and type(value) is not bool:
             raise TypeError(f"{name} must be bool or None")
-    if prefill_w8a8 and precision != "w4a16":
-        raise ValueError("Prefill W8A8 is admitted only with Action NVFP4 (--precision w4a16)")
+    # Prefill's A8 producer/paired GateUp owns only the VLM W8 weights.
+    # The Action precision is independent; neither path changes its recipe.
+    if prefill_w8a8 and precision not in ("w8a16", "w4a16"):
+        raise ValueError("Prefill W8A8 is admitted only with W8A16 or Action NVFP4")
+    if prefill_w8a8 and text_tokens == _C480_TEXT_TOKENS:
+        raise ValueError(f"T{text_tokens} has no Prefill W8A8 route")
+    if type(vision_w4a16) is not bool:
+        raise TypeError("vision_w4a16 must be bool")
+    if vision_w4a16 and (precision != "w4a16" or vision_owner_ln):
+        raise ValueError("Vision W4 is admitted only with Action NVFP4 (--precision w4a16) "
+                         "and without the eight-lane Vision owner-LN")
     # Every route below takes its row count from a launch register, so the
     # enabled set is the same at either horizon (examples/configs/pi05/README.md).
     result = {"RPU_PI05_" + name: str(int(cameras == 3 or precision in ("fp16", "w8a16", "w4a16") or name in _GENERIC_ON))
@@ -107,6 +161,8 @@ def profile_environment(
     for name in ("SIGLIP_W8A16", "ADARMS_DENSE_W8A16"):
         result["RPU_PI05_" + name] = str(int(precision != "fp16"))
     result["RPU_PI05_SIGLIP_W8A16_SCOPE"] = "all"
+    # Vision W4 replaces the W8 of all six SigLIP projections on four lanes.
+    result["RPU_PI05_SIGLIP_W4A16"] = str(int(vision_w4a16))
     result["RPU_PI05_DENOISE_GEGLU_M50"] = str(int(precision in ("fp16", "w8a16")))
     for name in ("DENOISE_W4_FASTPATH", "DENOISE_W4_GEGLU_M50", "DENOISE_W4_GEGLU_N64"):
         result["RPU_PI05_" + name] = str(int(precision in ("int4_g128", "legacy_int4") and cameras == 3))
@@ -120,6 +176,8 @@ def profile_environment(
                         ("VISION_OWNER_LN", vision_owner_ln)):
         if value is not None or precision == "fp16" or cameras == 2:
             result["RPU_PI05_" + name] = str(int(bool(value)))
+    if vision_w4a16:
+        result.update({"RPU_PI05_" + name: "0" for name in _VISION_EIGHT_LANE_ON})
     # C480 (T192) fits the SPM only with the SigLIP LayerNorm vectors streamed
     # per layer instead of held persistent (examples/configs/pi05/README.md).
     result["RPU_PI05_VISION_LN_STREAM"] = str(int(text_tokens == _C480_TEXT_TOKENS))
@@ -155,7 +213,7 @@ def _validate_text_profile(text_tokens: int, *, cameras: int, precision: str | N
 
 
 def resolve_prefill_chunk_size(*, cameras: int, prefill_w8a8: bool, requested: int | None,
-                               text_tokens: int = 32) -> int:
+                               text_tokens: int = 32, precision: str | None = None) -> int:
     """Bind the selected A8 ABI to its exact chunk before importing the backend."""
     if type(cameras) is not int or cameras not in (2, 3):
         raise ValueError("cameras must be 2 or 3")
@@ -168,6 +226,9 @@ def resolve_prefill_chunk_size(*, cameras: int, prefill_w8a8: bool, requested: i
     chunk = expected if requested is None else requested
     if type(chunk) is not int or chunk <= 0 or chunk % 16:
         raise ValueError("--prefill-chunk-size must be a positive multiple of 16")
+    if (prefill_w8a8 and precision == "w8a16" and text_tokens == 32
+            and chunk == 2 * expected):
+        return chunk
     if (prefill_w8a8 or text_tokens != 32) and chunk != expected:
         route = f"T{text_tokens}" if text_tokens != 32 else "Prefill W8A8"
         raise ValueError(f"{cameras}-camera {route} requires exactly --prefill-chunk-size {expected}")
@@ -374,61 +435,95 @@ def _execution_config(value):
 
 def resolve_execution(args):
     execution, vision, text, action = _execution_config(getattr(args, "rpu_execution", None))
+    pair = (256 * args.cameras + args.text_tokens) // 2
     if not hasattr(args, "public_precision"):
         chunk = resolve_prefill_chunk_size(
             cameras=args.cameras, prefill_w8a8=args.prefill_w8a8,
-            requested=args.prefill_chunk_size, text_tokens=args.text_tokens)
-        execution["model"] = {"num_cores": 8}
-        execution.setdefault("prefill", {})["chunk_size"] = chunk
-        return execution, True, chunk
+            requested=args.prefill_chunk_size, text_tokens=args.text_tokens,
+            precision=args.precision)
+        if chunk != 2 * pair:
+            execution["model"] = {"num_cores": 8}
+            execution.setdefault("prefill", {})["chunk_size"] = chunk
+            return execution, True, chunk
     cores = execution.get("model", {}).get("num_cores", 8)
     if cores not in (4, 6, 8):
         raise ValueError("Pi0.5 num_cores must be 4, 6 or 8")
-    # TP4/TP6 run serial one-image SigLIP4 and the generic Gemma/Action
-    # kernels; neither depends on the camera count. The adapter binds only T32
-    # pair rows for reduced cores, and NVFP4/A8 keep their TP8 fused ABIs.
-    if cores != 8 and (args.precision not in ("fp16", "w8a16") or args.text_tokens != 32):
-        raise ValueError("Pi0.5 TP4/TP6 requires FP16/W8A16 and T32 (two or three cameras)")
+    # TP4/TP6 run 4-lane raw-SPM packed Vision (or serial SigLIP4 for W4/ACC32),
+    # generic Gemma prefill (T32-T192), and fused reduced-core Denoise; Action
+    # NVFP4 uses per-projection kernels and Prefill W8A8 picks the generic W8A8
+    # Gate/Up tile per chunk.
+    if cores != 8 and args.precision not in ("fp16", "w8a16", "w4a16"):
+        raise ValueError("Pi0.5 TP4/TP6 requires FP16, W8A16 or Action NVFP4 (with or without "
+                         "Prefill W8A8)")
     if args.precision == "w4a16_kvint8" and (cores != 8 or args.cameras != 3 or args.text_tokens != 32):
         raise ValueError("legacy whole-model INT4 requires TP8, three cameras and T32")
-    pair = (256 * args.cameras + args.text_tokens) // 2
     if args.text_tokens == _C480_TEXT_TOKENS and args.precision not in ("fp16", "w8a16"):
         raise ValueError(f"T{args.text_tokens} requires FP16 or W8A16 precision (C480 has no A8 or Action NVFP4 route)")
+    if args.text_tokens == _C480_TEXT_TOKENS:
+        if args.prefill_w8a8:
+            raise ValueError(f"T{args.text_tokens} has no Prefill W8A8 route")
+        if any(vision.get("vision", {}).get(name, False) for name in ("qkv_w8a8", "mlp_w8a8")):
+            raise ValueError("T192 Vision LayerNorm streaming does not admit W8A8")
     vision_chunk = vision.get("vision", {}).get("chunk_size", "auto")
     action_chunk = action.get("action", {}).get("chunk_size", "auto")
-    allowed_vision = ("auto", 256, 256 * args.cameras) if cores == 8 else ("auto", 256)
+    vision_acc32 = bool(vision.get("vision", {}).get("linear_acc32", False))
+    # Vision W4 (and ACC32 reduced-core Vision) runs one camera at a time on four lanes.
+    serial_vision = getattr(args, "vision_w4a16", False) or (cores != 8 and vision_acc32)
+    allowed_vision = ("auto", 256) if serial_vision else ("auto", 256, 256 * args.cameras)
     if vision_chunk not in allowed_vision:
         raise ValueError(f"Pi0.5 Vision chunk must be one of {allowed_vision}")
     if action_chunk not in ("auto", 64):
         raise ValueError("Pi0.5 Action chunk must be auto or 64")
     prefill = text.get("prefill", {})
     requested = prefill.get("chunk_size", "auto")
+    child = execution.get("components", {}).get("language_model", {}).get("prefill")
+    scopes = (execution.get("prefill", {}), child or {})
+    # A full-prefix request must survive resolution into both root and child.
+    # AUTO is not a second explicit request; disagreeing integers are rejected.
+    if any(scope.get("chunk_size") == 2 * pair for scope in scopes):
+        if any(scope.get("chunk_size", "auto") not in ("auto", 2 * pair) for scope in scopes):
+            raise ValueError("conflicting root/component full-prefix prefill chunks")
+        requested = 2 * pair
     diagnostic_chunk = getattr(args, "prefill_chunk_size", None)
     if diagnostic_chunk is not None:
         if requested != "auto" and requested != diagnostic_chunk:
             raise ValueError("conflicting prefill chunk controls")
         requested = diagnostic_chunk
+    full_chunk = requested == 2 * pair
+    if full_chunk:
+        _validate_action_horizon(getattr(args, "action_horizon", 50))
+        if (args.precision != "w8a16" or not args.prefill_w8a8
+                or cores != 8 or args.text_tokens != 32):
+            raise ValueError("full-prefix Prefill requires explicit prefill_w8a8, W8A16 Action, TP8 and T32")
+        if (prefill.get("linear_acc32", False)
+                or any(scope.get(key, 0) not in (0, "auto")
+                       for scope in scopes for key in ("padding_rows", "padding_budget"))):
+            raise ValueError("full-prefix Prefill requires ACC16 and no added padding")
     paired = (cores == 8 and args.precision in ("fp16", "w8a16", "w4a16")
-              and requested in ("auto", pair)
-              and vision_chunk in ("auto", 256 * args.cameras)
+              and (requested in ("auto", pair) or full_chunk)
+              and vision_chunk in ("auto", 256 if serial_vision else 256 * args.cameras)
               and action_chunk in ("auto", 64)
               and not any(prefill.get(key, 0) not in (0, "auto")
                           for key in ("padding_rows", "padding_budget")))
-    if args.prefill_w8a8 and not paired:
+    if args.prefill_w8a8 and cores == 8 and not paired:
         raise ValueError("Prefill W8A8 requires TP8 and the camera/text paired prefill geometry")
-    if args.precision == "w4a16" and not paired:
+    if args.precision == "w4a16" and cores == 8 and not paired:
         raise ValueError("Action NVFP4 example requires its TP8 paired prefill geometry")
     execution.setdefault("model", {})["num_cores"] = cores
     if paired:
-        execution.setdefault("prefill", {})["chunk_size"] = pair
-        # A component's AUTO overrides its root; resolve it to the same pair.
-        child = execution.get("components", {}).get("language_model", {}).get("prefill")
+        requested = 2 * pair if full_chunk else pair
+        execution.setdefault("prefill", {})["chunk_size"] = requested
+        # Freeze root and component AUTO to the same admitted schedule.
         if child is not None:
-            child["chunk_size"] = pair
-        requested = pair
+            child["chunk_size"] = requested
+        if full_chunk:
+            for scope in (execution["prefill"], child):
+                if scope is not None:
+                    scope.pop("padding_budget", None)
+                    scope["padding_rows"] = 0
     elif diagnostic_chunk is not None:
         execution.setdefault("prefill", {})["chunk_size"] = diagnostic_chunk
-    elif args.text_tokens == _C480_TEXT_TOKENS and requested == "auto":
+    elif cores == 8 and args.text_tokens == _C480_TEXT_TOKENS and requested == "auto":
         requested = _C480_GENERIC_CHUNK
         execution.setdefault("prefill", {})["chunk_size"] = requested
         child = execution.get("components", {}).get("language_model", {}).get("prefill")
@@ -445,7 +540,7 @@ def validate_example_config(config: dict) -> None:
     from examples.common.config import validate_logging_config
     validate_logging_config(config)
     allowed = {
-        "pi05": {"precision", "instruction_residency"},
+        "pi05": {"precision", "instruction_residency", "prefill_w8a8"},
         "input": {"checkpoint", "batch", "noise", "cameras", "text_tokens", "num_steps",
                   "action_horizon", "action_dim", *_openpi.RAW_KEYS, "delta_action_mask"},
         "run": {"warmup", "runs", "seed", "output_dir", "profile", "hwperf", "cpu_threads", "torch_num_threads"},
@@ -455,12 +550,13 @@ def validate_example_config(config: dict) -> None:
             raise ValueError(f"[{name}] contains unsupported keys or is not a table")
     _CPU["resolve_cpu_threads"](config)
     profile, inputs, run = (config[key] for key in allowed)
-    if profile.get("precision") not in _EXAMPLE_PRECISIONS:
-        raise ValueError(f"[pi05].precision must be one of {_EXAMPLE_PRECISIONS}")
+    recipe_route(profile.get("precision"))
     if "instruction_residency" in profile and profile["instruction_residency"] not in ("auto", "off"):
         raise ValueError("[pi05].instruction_residency must be auto or off")
     if type(inputs.get("cameras")) is not int or inputs["cameras"] not in (2, 3):
-        raise ValueError("[input].cameras must be 2 or 3 actual computed images")
+        raise ValueError("[input].cameras must be 2 or 3 actual computed images: one camera needs "
+                         "paired-prefill projection payloads for 144-208-row chunks, and the operator "
+                         "library provides them only for 272-336 and 400-464 rows")
     _validate_text_profile(inputs.get("text_tokens", 32), cameras=inputs["cameras"])
     _validate_action_horizon(inputs.get("action_horizon", 50))
     if type(inputs.get("num_steps", 10)) is not int or inputs.get("num_steps", 10) != 10:
@@ -493,16 +589,21 @@ def validate_example_config(config: dict) -> None:
 def _example_arguments(config):
     profile, inputs, run = (config[key] for key in ("pi05", "input", "run"))
     precision = profile["precision"]
+    route, recipe_a8, vision_w4a16 = recipe_route(precision)
+    prefill_w8a8 = profile.get("prefill_w8a8", recipe_a8)
+    if type(prefill_w8a8) is not bool:
+        raise ValueError("[pi05].prefill_w8a8 must be boolean")
+    if route != "w8a16" and prefill_w8a8 != recipe_a8:
+        raise ValueError("[pi05].prefill_w8a8 conflicts with the selected precision recipe")
     return SimpleNamespace(
-        # The diagnostic CLI's historical w4a16 selector denotes Action NVFP4.
-        precision="w4a16" if "nvfp4" in precision else precision,
-        public_precision=precision,
+        precision=route,
+        public_precision=precision, vision_w4a16=vision_w4a16,
         instruction_residency=profile.get("instruction_residency"),
         profile=run.get("profile", False), hwperf=run.get("hwperf", False),
         cameras=inputs["cameras"], text_tokens=inputs.get("text_tokens", 32),
         action_horizon=inputs.get("action_horizon", 50),
-        prefill_chunk_size=None, prefill_w8a8=precision == "w8a16_prefill_w8a8_action_nvfp4",
-        vision_owner_ln=True, checkpoint=inputs["checkpoint"],
+        prefill_chunk_size=None, prefill_w8a8=prefill_w8a8,
+        vision_owner_ln=not vision_w4a16, checkpoint=inputs["checkpoint"],
         batch=Path(inputs["batch"]).expanduser() if "batch" in inputs else None,
         raw_inputs=None if "batch" in inputs else {
             key: inputs[key] for key in (*_openpi.RAW_KEYS, "delta_action_mask") if key in inputs},
@@ -530,7 +631,8 @@ def registered_example(config):
     """
     args = example_arguments(config)
     alias = _REGISTERED_ASSETS.get((args.action_horizon, args.public_precision))
-    if alias is None or args.checkpoint != alias or args.text_tokens != 32:
+    if (alias is None or args.checkpoint != alias or args.text_tokens != 32
+            or (args.public_precision == "w8a16" and args.prefill_w8a8)):
         return None
     execution, _, _ = resolve_execution(args)
     cores = execution["model"]["num_cores"]
@@ -637,8 +739,12 @@ def stage_timings(policy):
                 delattr(owner, name)
 
 
-def numerical_notes(*, cameras, text_tokens, valid_tokens, precision, prefill_w8a8):
-    notes = ["Performance measurement only; no CPU numerical or robot/task acceptance is run."]
+def numerical_notes(*, cameras, text_tokens, valid_tokens, precision, prefill_w8a8,
+                    cpu_reference_status=None):
+    comparison = ("CPU numerical comparison is record-only, without an acceptance threshold"
+                  if cpu_reference_status == "MEASURED" else
+                  "No CPU numerical comparison is recorded")
+    notes = [f"{comparison}; robot/task acceptance is not run."]
     if cameras == 3 and text_tokens == 128 and valid_tokens == 128 and precision == "w4a16" and not prefill_w8a8:
         notes.append("Known numerical NO-GO: three images, T128/full128, W8A16 + Action NVFP4 exceeded action MSE 0.0072.")
     if cameras == 2 and text_tokens in (96, 128) and valid_tokens == 65:
@@ -655,6 +761,7 @@ def cold_setup(args, *, bind_libraries=False) -> SimpleNamespace:
     Must run in a fresh process before rpu_backend is imported.
     """
     execution, paired, chunk_size = resolve_execution(args)
+    full_chunk = paired and args.prefill_w8a8 and chunk_size == 256 * args.cameras + args.text_tokens
     cores = execution["model"]["num_cores"]
     action_horizon = getattr(args, "action_horizon", 50)
     _validate_action_horizon(action_horizon)
@@ -662,23 +769,44 @@ def cold_setup(args, *, bind_libraries=False) -> SimpleNamespace:
         env = profile_environment(args.precision, prefill_w8a8=args.prefill_w8a8,
                                   vision_owner_ln=args.vision_owner_ln, cameras=args.cameras,
                                   text_tokens=args.text_tokens,
+                                  vision_w4a16=getattr(args, "vision_w4a16", False),
                                   action_horizon=action_horizon)
     elif hasattr(args, "public_precision"):
         # TP4/TP6, legacy whole-model INT4 and explicitly different chunk plans
-        # use the existing generic kernels. Never feed them TP8-only fusions.
+        # use generic kernels plus admitted 4-lane raw-SPM packed Vision / PAD16.
         env = {"RPU_PI05_" + name: "0" for name in (*_ON, *_OFF)}
         _, vision, _, _ = _execution_config(execution)
-        packed_vision = cores == 8 and vision.get("vision", {}).get("chunk_size", "auto") != 256
+        vision_acc32 = bool(vision.get("vision", {}).get("linear_acc32", False))
+        packed_vision = (
+            not getattr(args, "vision_w4a16", False)
+            and vision.get("vision", {}).get("chunk_size", "auto") != 256
+            and (cores == 8 or not vision_acc32)
+        )
+        packed_vision_raw_spm = packed_vision and cores in (4, 6)
         quantized = args.precision != "fp16"
-        env.update(RPU_PI05_FUSED_DENOISE="1", RPU_PI05_KVINSERT_PAD16=str(int(cores == 8)),
+        env.update(RPU_PI05_FUSED_DENOISE="1", RPU_PI05_KVINSERT_PAD16="1",
                    RPU_PI05_DENOISE_UNROLL="1",
                    RPU_PI05_SIGLIP_BATCH=str(int(packed_vision)),
+                   RPU_PI05_VISION_MERGE_SEGMENT=str(int(packed_vision_raw_spm)),
+                   RPU_PI05_VISION_KV_SPM_ONLY=str(int(packed_vision_raw_spm)),
+                   RPU_PI05_VISION_Q_RESIDENT=str(int(packed_vision_raw_spm)),
+                   RPU_PI05_PREFILL_MASK_FP16=str(int(cores in (4, 6))),
                    RPU_PI05_SIGLIP_W8A16=str(int(quantized)),
+                   RPU_PI05_SIGLIP_W4A16=str(int(args.vision_w4a16)),
                    RPU_PI05_ADARMS_DENSE_W8A16=str(int(quantized)),
                    RPU_PI05_DENOISE_GEGLU_M50="0", RPU_PI05_DENOISE_W4_FASTPATH="0",
                    RPU_PI05_DENOISE_W4_GEGLU_M50="0", RPU_PI05_DENOISE_W4_GEGLU_N64="0",
-                   RPU_PI05_DENOISE_NVFP4_GEGLU_M50="0", RPU_PI05_PREFILL_GATEUP_W8A8="0",
+                   RPU_PI05_DENOISE_NVFP4_GEGLU_M50="0",
+                   RPU_PI05_PREFILL_GATEUP_W8A8=str(int(args.prefill_w8a8)),
                    RPU_PI05_VISION_OWNER_LN="0")
+        if args.vision_w4a16:
+            # Vision W4 replaces the W8 of all six SigLIP projections.
+            env["RPU_PI05_SIGLIP_W8A16_SCOPE"] = "all"
+    # Public config owns the cold selector; a half-chunk invocation must not
+    # accidentally inherit a full-prefix native layout from the shell.
+    env["RPU_PI05_PREFILL_FULL_CHUNK_W8A8"] = str(int(full_chunk))
+    if full_chunk:
+        env["RPU_PI05_PREFILL_GATEUP_W8A8_PANEL512"] = str(int(args.cameras == 2))
     _, _, _, action = _execution_config(execution)
     # The uniform ACC16 fusion has a bounded M50-or-M10/T32-or-T160/ten-step ABI.
     # Component overrides take precedence over the root accumulation mode.
@@ -705,7 +833,7 @@ def cold_setup(args, *, bind_libraries=False) -> SimpleNamespace:
 
     actual_payloads = runtime_payloads(libraries)
     torch.set_num_interop_threads(24)
-    return SimpleNamespace(execution=execution, paired=paired,
+    return SimpleNamespace(execution=execution, paired=paired, full_chunk=full_chunk,
                            action_horizon=action_horizon, cores=cores, chunk_size=chunk_size, env=env, libraries=libraries,
                            effective_cpu=effective_cpu, actual_payloads=actual_payloads)
 
@@ -717,6 +845,9 @@ def resolve_checkpoint(args) -> tuple[Path, dict]:
     checkpoint = Path(args.checkpoint).expanduser()
     if not checkpoint.is_dir():
         checkpoint = model_path(args.checkpoint)
+    if hasattr(args, "public_precision"):
+        from examples.common.config import check_checkpoint_recipe
+        check_checkpoint_recipe("pi05", checkpoint, selector=args.public_precision)
     quant_path = checkpoint / "rpu_quant_config.json"
     quant = json.loads(quant_path.read_text()) if quant_path.is_file() else {}
     if args.precision == "w4a16_kvint8":
@@ -779,7 +910,7 @@ def install_policy(policy, args, batch: dict):
 
 def run_profile(args, *, bind_libraries=False) -> dict:
     setup = cold_setup(args, bind_libraries=bind_libraries)
-    execution, paired = setup.execution, setup.paired
+    execution, paired, full_chunk = setup.execution, setup.paired, setup.full_chunk
     cores, chunk_size, env, libraries = setup.cores, setup.chunk_size, setup.env, setup.libraries
     effective_cpu, actual_payloads = setup.effective_cpu, setup.actual_payloads
     action_horizon = setup.action_horizon
@@ -832,10 +963,13 @@ def run_profile(args, *, bind_libraries=False) -> dict:
                 camera_configuration, text_configuration = install_policy(policy, args, batch)
                 mask = batch.get("observation.language.attention_mask")
                 valid_tokens = int(mask.sum()) if torch.is_tensor(mask) else args.text_tokens
-                notes = numerical_notes(cameras=args.cameras, text_tokens=args.text_tokens,
-                                        valid_tokens=valid_tokens, precision=args.precision,
-                                        prefill_w8a8=args.prefill_w8a8)
-                prepared = policy.prepare_graphs(batch, num_steps=10, precompute_adarms=paired)
+                _, _, _, action_cfg = _execution_config(execution)
+                precompute_adarms = paired or (
+                    cores in (4, 6)
+                    and args.precision in ("fp16", "w8a16", "w4a16")
+                    and not action_cfg.get("action", {}).get("linear_acc32", False)
+                )
+                prepared = policy.prepare_graphs(batch, num_steps=10, precompute_adarms=precompute_adarms)
                 if args.precision == "fp16" and (prepared.get("adarms_table") or {}).get("dense_w8a16", False):
                     raise RuntimeError("FP16 profile unexpectedly installed quantized AdaRMS dense weights")
                 rows = []
@@ -881,7 +1015,7 @@ def run_profile(args, *, bind_libraries=False) -> dict:
                 timed = [key for key in rows[0] if all(key in row for row in rows)]
                 report.update({
                     "precision": getattr(args, "public_precision", args.precision), "num_steps": 10, "num_cores": cores,
-                    "execution_route": "paired_tp8" if paired else "generic",
+                    "execution_route": "full_prefix_w8a8_tp8" if full_chunk else "paired_tp8" if paired else "generic",
                     "timed_phases": timed,
                     "profile": getattr(args, "profile", False), "hwperf_enabled": getattr(args, "hwperf", False),
                     "rpu_execution": execution,
@@ -891,6 +1025,7 @@ def run_profile(args, *, bind_libraries=False) -> dict:
                     "prefix_rows": 256 * args.cameras + args.text_tokens,
                     "text_tokens": args.text_tokens, "valid_text_tokens": valid_tokens,
                     "prefill_chunk_size": chunk_size, "camera_configuration": camera_configuration,
+                    "prefill_full_chunk_w8a8": full_chunk,
                     "text_configuration": text_configuration, "prefill_w8a8": args.prefill_w8a8,
                     "vision_owner_ln": args.vision_owner_ln if paired else False, "adarms_table": prepared.get("adarms_table"),
                     "action_nvfp4_geglu_acc16": env["RPU_PI05_DENOISE_NVFP4_GEGLU_ACC16_M50"] == "1",
@@ -911,7 +1046,11 @@ def run_profile(args, *, bind_libraries=False) -> dict:
                     "samples_ms": rows, "output_shape": list(output.shape),
                     "registered_profile": getattr(args, "registered_profile", None),
                     "formal_certification": False, "correctness": "not_run",
-                    "numerical_notes": notes,
+                    "numerical_notes": numerical_notes(
+                        cameras=args.cameras, text_tokens=args.text_tokens,
+                        valid_tokens=valid_tokens, precision=args.precision,
+                        prefill_w8a8=args.prefill_w8a8,
+                        cpu_reference_status=report.get("cpu_reference", {}).get("status")),
                 })
                 if raw_inputs:
                     report["physical_actions"] = None if physical is None else {
@@ -959,9 +1098,9 @@ def main() -> int:
     parser.add_argument("--action-horizon", type=int, choices=_ACTION_HORIZONS, default=50,
                         help="action horizon the checkpoint was trained at; must equal its chunk_size")
     parser.add_argument("--prefill-chunk-size", type=int,
-                        help="cold prefill chunk; T32 defaults 400/272 for three/two cameras; T64 requires 416/288; T96 requires 432/304; T128 requires 448/320; T160 requires 464/336; T192 requires 480")
+                        help="cold prefill chunk; T32 defaults 400/272 for three/two cameras; W8A16 + --prefill-w8a8 also accepts 800/544; T64 requires 416/288; T96 requires 432/304; T128 requires 448/320; T160 requires 464/336; T192 requires 480")
     parser.add_argument("--prefill-w8a8", action="store_true",
-                        help="opt in to Prefill GateUp W8A8 with Action NVFP4 only")
+                        help="opt in to Prefill W8A8; full-prefix chunk requires W8A16 Action, TP8 and T32")
     parser.add_argument("--vision-owner-ln", action="store_true",
                         help="opt in to FP16/W8 Vision owner-reduce/LayerNorm for two or three cameras")
     parser.add_argument("--checkpoint", required=True, help="checkpoint directory or model_registry alias")

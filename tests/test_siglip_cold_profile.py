@@ -16,6 +16,49 @@ def _body(source, signature):
 FAMILIES = ("siglip", "qwenpi05", "rhino_vla", "pi05_denoise_step")
 
 
+def test_siglip_cold_constructor_keeps_a8_separate_from_ln_streaming(tmp_path):
+    """Execute the native constructor guard without a device or model weights."""
+    from test_siglip_attention_dry_live_contract import _function
+
+    native = (ROOT / "src/fused/rpu_siglip_model.cpp").read_text()
+    constructor = _function(native, "    explicit SigLIPModel(")
+    code = r'''
+#include <cassert>
+#include <optional>
+#include <stdexcept>
+#define TORCH_CHECK(ok, ...) do { if (!(ok)) throw std::runtime_error(#ok); } while (false)
+bool stream = false;
+struct SigLIPModel {
+    std::optional<bool> configured_linear_acc32_;
+    bool linear_acc32_, qkv_w8a8_, mlp_w8a8_;
+    bool pi05_vision_owner_ln_opt_in_ = true;
+    bool pi05_vision_kv_spm_only_opt_in_ = true;
+    bool pi05_ring_xor3_opt_in_ = true;
+    bool pi05_vision_fc_weight_outer_opt_in_ = false;
+    bool pi05_vision_ln_stream_opt_in_ = stream;
+''' + constructor + r'''
+};
+int main() {
+    for (bool streaming : {false, true}) {
+        stream = streaming;
+        for (bool qkv : {false, true}) for (bool mlp : {false, true}) {
+            bool rejected = false;
+            try { SigLIPModel model(false, qkv, mlp); }
+            catch (const std::runtime_error&) { rejected = true; }
+            assert(rejected == (streaming && (qkv || mlp)));
+        }
+    }
+}
+'''
+    source, binary = tmp_path / "siglip_cold.cpp", tmp_path / "siglip_cold"
+    source.write_text(code)
+    compiled = subprocess.run(["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror",
+        str(source), "-o", str(binary)], capture_output=True, text=True, timeout=30)
+    assert compiled.returncode == 0, compiled.stderr
+    result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=5)
+    assert result.returncode == 0, result.stderr
+
+
 @pytest.mark.parametrize("family", FAMILIES)
 def test_real_siglip_envelope_wrapper_publishes_actual_capacity(tmp_path, family):
     native = (ROOT / f"src/fused/rpu_{family}_model.cpp").read_text()

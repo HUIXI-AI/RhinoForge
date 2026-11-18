@@ -319,3 +319,48 @@ def test_raw_inputs_run_through_the_example_entry(monkeypatch, tmp_path):
     with pytest.raises(ValueError, match="action_dim=7"):
         runner.run_example_config(config)
     assert not seen
+
+
+def _dense_reference_resize_with_pad(image: np.ndarray, height: int = 224, width: int = 224) -> np.ndarray:
+    cur_h, cur_w = image.shape[:2]
+    if (cur_h, cur_w) == (height, width):
+        return image.copy()
+    ratio = max(cur_w / width, cur_h / height)
+    new_h, new_w = int(cur_h / ratio), int(cur_w / ratio)
+    x = np.matmul(openpi._resize_weights(cur_h, new_h).T, image.astype(np.float32).reshape(cur_h, -1))
+    x = x.reshape(new_h, cur_w, 3).transpose(0, 2, 1).reshape(new_h * 3, cur_w)
+    x = np.matmul(x, openpi._resize_weights(cur_w, new_w)).reshape(new_h, 3, new_w).transpose(0, 2, 1)
+    x = np.clip(np.round(x), 0, 255).astype(np.uint8)
+    pad_h, extra_h = divmod(height - new_h, 2)
+    pad_w, extra_w = divmod(width - new_w, 2)
+    return np.pad(x, ((pad_h, pad_h + extra_h), (pad_w, pad_w + extra_w), (0, 0)), constant_values=0)
+
+
+def test_resize_and_batch_are_bit_identical_to_dense_reference():
+    rng = np.random.default_rng(20261112)
+    stats = {"state": {"q01": [-1.0, -2.0, 0.0], "q99": [1.0, 2.0, 10.0]}}
+    prev_threads = torch.get_num_threads()
+    for width, height in ((848, 480), (640, 480), (224, 224), (212, 120)):
+        frames = [rng.integers(0, 256, size=(height, width, 3), dtype=np.uint8) for _ in range(3)]
+        frames[0].flags.writeable = False  # PIL read-only frame contract
+        frames[1] = frames[1][:, ::-1][:, ::-1]  # non-contiguous view contract
+        for frame in frames:
+            got = openpi.resize_with_pad(frame, 224, 224)
+            expected = _dense_reference_resize_with_pad(frame, 224, 224)
+            assert np.array_equal(got, expected)
+
+        if (width, height) in openpi.FRAME_SIZES:
+            batch, _ = openpi.batch_from_frames(
+                frames, [0.1, -0.4, 3.0], "flip parcel", stats, Tokenizer(),
+                text_tokens=128, frame_size=[width, height],
+            )
+            assert torch.get_num_threads() == prev_threads
+            for key, frame in zip(CAMERAS, frames):
+                ref_u8 = _dense_reference_resize_with_pad(frame, 224, 224)
+                ref_img = (
+                    torch.from_numpy(ref_u8).permute(2, 0, 1).unsqueeze(0).to(torch.float32) / 255.0
+                ).contiguous()
+                got_img = batch[f"observation.images.{key}"]
+                assert got_img.is_contiguous()
+                assert torch.equal(got_img.view(torch.uint8), ref_img.view(torch.uint8))
+

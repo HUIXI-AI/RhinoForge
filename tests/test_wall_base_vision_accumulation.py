@@ -198,6 +198,7 @@ def test_actual_builder_checks_cold_mode_before_checkpoint_access(monkeypatch, c
     node.body=node.body[:stop]+[ast.Return(value=ast.Name(id='linear_acc32',ctx=ast.Load()))]
     ast.fix_missing_locations(node)
     env=dict(Sequence=Sequence, WallOssVision=type('WallOssVision',(),{}),
+             _validate_residual_scale=lambda value, num_cores, owner: value,
              _claim_experimental_schedule=lambda: ((0,True) if control=='exact' else
                                                     (32,False) if control=='layer_group' else (0,False)),
              rpu_env_bool=lambda name,**kw: (control=='mixed' if name.endswith('MIXED_PRECISION')
@@ -259,10 +260,10 @@ def test_actual_device_patch_and_eager_merger_use_typed_acc32_only(mode):
                         rms_norm=lambda *a:value)
     env=dict(torch=SimpleNamespace(Tensor=Value,ops=SimpleNamespace(rpu=ops)),
              F=SimpleNamespace(linear=lambda *a:(calls.append(('legacy',a)) or value),gelu=lambda x:x),
-             _VISION_CORES=8,HID=1280,ln_q_w_rpu='norm',EPS=1e-6,merge_hidden=5120,
+             num_cores=8,HID=1280,ln_q_w_rpu='norm',EPS=1e-6,merge_hidden=5120,
              m0_w_rpu='w0',m0_b_rpu='b0',m2_w_rpu='w2',m2_b_rpu='b2',linear_acc32=mode)
     patch=_function('_consume_patch_embed_input',env)
-    patch(SimpleNamespace(_linear_acc32=mode),value,'patch',None,324,4)
+    patch(SimpleNamespace(_linear_acc32=mode,_num_cores=8),value,'patch',None,324,4)
     merger=_function('merger',env)
     assert merger(value,device_out=True) is value
     assert len(calls)==3 and {kind for kind,_ in calls}==({'typed'} if mode else {'legacy'})

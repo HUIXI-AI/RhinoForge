@@ -34,6 +34,7 @@ def _owner(*, fused=True):
         _handle=11,
         _prefill_chunk_size_cap=384,
         _graph_cache=_GraphCache(),
+        residual_scale=1,
     )
     owner.vision = SimpleNamespace(_handle=12, _graph_cache=_GraphCache())
     owner.action = SimpleNamespace(

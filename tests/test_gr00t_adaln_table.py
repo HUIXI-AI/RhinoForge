@@ -59,7 +59,7 @@ struct Context{
 };
 std::vector<int64_t>dma_offsets;int64_t table_steps=0;
 void rpu_launch_ddr_broadcast_spm_dma_mutable(uint64_t&,const at::Tensor&t,int64_t off,int64_t elements,uint32_t addr,int cores){
- assert(t.defined()&&off>=0&&off+elements*2<=table_steps*196608&&elements==98304&&addr==0x10040000&&cores==8);dma_offsets.push_back(off);
+ assert(t.defined()&&off>=0&&off+elements*2<=table_steps*196608&&elements==98304&&addr==0x10040000&&(cores==4||cores==8));dma_offsets.push_back(off);
 }
 struct Model{
  bool inference_started_=false,denoise_ready_=true,denoise_mode_=true,loop_mode_=true,z2_bound_=false;
@@ -76,7 +76,7 @@ struct Model{
  Context&ctx(){return context;}uint32_t addr(int,const char*n)const{return std::string(n)=="adaln_body_table"?0x10040000:0x10010000;}
  template<class...T>void dit_adaln_gemv(T...){++gemvs;}
  __METHODS__
- static constexpr int NUM_CORES=8;
+ int num_cores()const{return static_cast<int>(tp);}
  __DMA__
  void preload(){load_adaln_body_table();}
  void record(const ChunkInfo&c){context.args=adaln_table_arguments(c.len,context.batch_size);context.selector=adaln_table_profile(c.len,context.batch_size)?2:1;}
@@ -84,7 +84,8 @@ struct Model{
 int main(){
  for(int steps:{4,10})for(bool quantized:{false,true}){
  table_steps=steps;dma_offsets.clear();Model model(steps,quantized);ChunkInfo chunk;model.check_adaln_prepare_state();
- for(int bad=0;bad<10;++bad){Model x(steps,quantized);switch(bad){case 0:x.inference_started_=true;break;case 1:x.resolved=48;break;case 2:x.z2_bound_=true;break;case 3:x.z2_prepared_seq_len_=82;break;case 4:x.num_steps_=3;break;case 5:x.adaln_table_.live=true;break;case 6:x.tp=4;break;case 7:x.layer_weights_[0].adaln_w.p->v.valid=false;break;case 8:x.num_steps_=5;break;case 9:x.layer_weights_[0].adaln_ws.live=true;x.layer_weights_[0].adaln_ws.p->v.valid=false;break;}
+ {Model m4(steps,quantized);m4.tp=4;m4.check_adaln_prepare_state();}
+ for(int bad=0;bad<10;++bad){Model x(steps,quantized);switch(bad){case 0:x.inference_started_=true;break;case 1:x.resolved=48;break;case 2:x.z2_bound_=true;break;case 3:x.z2_prepared_seq_len_=82;break;case 4:x.num_steps_=3;break;case 5:x.adaln_table_.live=true;break;case 6:x.tp=2;break;case 7:x.layer_weights_[0].adaln_w.p->v.valid=false;break;case 8:x.num_steps_=5;break;case 9:x.layer_weights_[0].adaln_ws.live=true;x.layer_weights_[0].adaln_ws.p->v.valid=false;break;}
   try{x.check_adaln_prepare_state();assert(false);}catch(const std::runtime_error&){}
  }
  RpuKernelGraph::active=true;try{model.check_adaln_prepare_state();assert(false);}catch(const std::runtime_error&){}RpuKernelGraph::active=false;
@@ -182,21 +183,21 @@ enum class ValuOpType{ADD};
 std::map<uint32_t,std::vector<float>>spm;
 int step=-1,linear_calls=0,copy_calls=0,fail_at=-1;int64_t last_copy_end=0;
 void rpu_launch_ddr_scatter_spm_dma(const at::Tensor&t,int64_t off,int64_t elems,int64_t stride,uint32_t dst,int cores){
- assert(off>=0&&off%1536==0&&off+elems+(cores-1)*stride/2<=t.numel()&&elems==192&&stride==384&&cores==8);step=off/1536;spm[dst].assign(192,step);
+ assert((cores==4||cores==8)&&off>=0&&off%1536==0&&off+elems+(cores-1)*stride/2<=t.numel()&&elems==1536/cores&&stride==elems*2);step=off/1536;spm[dst].assign(elems,step);
 }
 void rpu_launch_ddr_broadcast_spm_dma(const at::Tensor&t,int64_t off,int64_t elems,uint32_t dst,int cores){
- assert(off==0&&elems==3072&&cores==8);spm[dst].assign(elems,t.tag);
+ assert(off==0&&elems==3072&&(cores==4||cores==8));spm[dst].assign(elems,t.tag);
 }
 void rpu_launch_linear_spm_to_spm_acc16_kernel(uint32_t input,const at::Tensor&w,uint32_t out,int64_t m,int64_t n,int64_t k,int partition,int cores,int bias,const at::Tensor&scale){
- assert(m==1&&n==3072&&k==1536&&partition==0&&cores==8&&bias==0&&spm[input].size()==192);
+ assert(m==1&&n==3072&&k==1536&&partition==0&&(cores==4||cores==8)&&bias==0&&static_cast<int64_t>(spm[input].size())==1536/cores);
  if(++linear_calls==fail_at)throw std::runtime_error("injected kernel failure");
  assert(w.dtype==at::kChar?scale.live:!scale.live);spm[out].assign(n,100*step+w.tag);
 }
 void rpu_launch_all_reduce_sum_residual_kernel(uint32_t partial,uint32_t bias,uint32_t out,int64_t m,int64_t n,int incores,int outcores){
- assert(partial!=bias&&partial!=out&&bias!=out&&m==1&&n==3072&&incores==8&&outcores==8);
+ assert(partial!=bias&&partial!=out&&bias!=out&&m==1&&n==3072&&(incores==4||incores==8)&&outcores==incores);
  spm[out].resize(n);for(int i=0;i<n;++i)spm[out][i]=spm[partial][i]+spm[bias][i];
 }
-void rpu_launch_eltwise_binary_scalar_spm_kernel(uint32_t in,float value,uint32_t out,int64_t n,ValuOpType){assert(in==out&&value==1&&n==1536);for(int i=0;i<n;++i)spm[out][i]+=value;}
+void rpu_launch_eltwise_binary_scalar_spm_kernel(uint32_t in,float value,uint32_t out,int64_t n,ValuOpType,int cores=8){assert(in==out&&value==1&&n==1536&&(cores==4||cores==8));for(int i=0;i<n;++i)spm[out][i]+=value;}
 void rpu_launch_spm_copy_ddr_dma(uint32_t in,const at::Tensor&out,int64_t off,int64_t n){
  assert(n==3072&&off==copy_calls*3072&&off+n<=out.numel());std::copy(spm[in].begin(),spm[in].end(),out.data->begin()+off);last_copy_end=off+n;++copy_calls;
 }
@@ -205,19 +206,19 @@ int main(){
  at::TensorList weights(32),biases(32),scales(32);
  for(int l=0;l<32;++l){weights[l].live=true;weights[l].shape={3072,1536};weights[l].tag=l;
   biases[l].live=true;biases[l].shape={3072};biases[l].tag=1000+l;}
- for(int steps:{4,10})for(bool quantized:{false,true}){
+ for(int cores:{4,8})for(int steps:{4,10})for(bool quantized:{false,true}){
   at::Tensor cond=at::empty({steps,1536},0);
   for(int l=0;l<32;++l){weights[l].dtype=quantized?at::kChar:at::kHalf;scales[l].live=quantized;scales[l].shape={3072};}
-  linear_calls=copy_calls=0;auto table=rpu_gr00t_precompute_adaln(cond,weights,biases,scales);
+  linear_calls=copy_calls=0;auto table=rpu_gr00t_precompute_adaln(cond,weights,biases,scales,cores);
   assert(SPM_ALLOC.used==102400&&linear_calls==steps*32&&copy_calls==steps*32&&table.numel()==steps*98304);
   assert(table.shape==std::vector<int64_t>({steps,32,3072})&&last_copy_end==table.numel());
   for(int s=0;s<steps;++s)for(int l=0;l<32;++l)for(int i=0;i<3072;++i)
    assert((*table.data)[(s*32+l)*3072+i]==100*s+1000+2*l+(i<1536?1:0));
- for(int failure:{17,steps*32}){linear_calls=copy_calls=0;fail_at=failure;try{rpu_gr00t_precompute_adaln(cond,weights,biases,scales);assert(false);}catch(const std::runtime_error&){}
+ for(int failure:{17,steps*32}){linear_calls=copy_calls=0;fail_at=failure;try{rpu_gr00t_precompute_adaln(cond,weights,biases,scales,cores);assert(false);}catch(const std::runtime_error&){}
   assert(SPM_ALLOC.used==102400&&linear_calls==failure&&copy_calls==failure-1);fail_at=-1;}
- for(int bad=0;bad<5;++bad){auto c=cond;const auto start=SPM_ALLOC.used;
-  if(bad==0)c.shape={3,1536};if(bad==1)c.shape={5,1536};if(bad==2)RpuExecutionCoordinator::token=0;if(bad==3)RpuKernelGraph::active=true;if(bad==4)SPM_ALLOC.used=Allocator::SPM_PLANNING_BUDGET-18943;
-  const auto before=SPM_ALLOC.used;try{rpu_gr00t_precompute_adaln(c,weights,biases,scales);assert(false);}catch(const std::runtime_error&){}
+ for(int bad=0;bad<6;++bad){auto c=cond;const auto start=SPM_ALLOC.used;int bad_cores=cores;
+  if(bad==0)c.shape={3,1536};if(bad==1)c.shape={5,1536};if(bad==2)RpuExecutionCoordinator::token=0;if(bad==3)RpuKernelGraph::active=true;if(bad==4)SPM_ALLOC.used=Allocator::SPM_PLANNING_BUDGET-(cores==4?19199:18943);if(bad==5)bad_cores=6;
+  const auto before=SPM_ALLOC.used;try{rpu_gr00t_precompute_adaln(c,weights,biases,scales,bad_cores);assert(false);}catch(const std::runtime_error&){}
   assert(SPM_ALLOC.used==before);SPM_ALLOC.used=start;RpuExecutionCoordinator::token=1;RpuKernelGraph::active=false;
  }
  }

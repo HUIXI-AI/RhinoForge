@@ -257,7 +257,7 @@ def test_row_reuse_override_maps_to_existing_cold_component(precision, size):
     ('input', 'batch', 1),
     ('input', 'image_size', [252, 252]),
     ('input', 'image_size', [224, 256]),
-    ('input', 'cameras', 1),
+    ('input', 'cameras', 0),
     ('input', 'cameras', 4),
     ('input', 'cameras', True),
     ('input', 'text_tokens', True),
@@ -291,7 +291,7 @@ def test_invalid_config_fails_before_engine_import(section, key, value, monkeypa
 
 
 @pytest.mark.parametrize('execution', [
-    {'model': {'num_cores': 8}},
+    {'model': {'num_cores': 5}},
     {'components': {'language_model': {'prefill': {'chunk_size': 384}}}},
     {'prefill': {'linear_acc32': 1}},
     {'vision': {'linear_acc32': 'true'}},

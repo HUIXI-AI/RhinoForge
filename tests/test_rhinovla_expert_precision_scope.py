@@ -78,7 +78,7 @@ def table_builder(monkeypatch):
 
     monkeypatch.setattr(torch.Tensor, "to", cpu_to)
     scope = _functions("python/rpu_backend/adapters/rhinovla/convert.py",
-                       ["_prepare_full_w8_adarms_tables", "_fold_final_norm_dense"],
+                       ["_prepare_full_w8_adarms_tables", "_fold_final_norm_dense", "_cold_lanes"],
                        {"torch": torch})
     return scope["_prepare_full_w8_adarms_tables"]
 

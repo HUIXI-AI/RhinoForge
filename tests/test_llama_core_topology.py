@@ -22,7 +22,7 @@ from rpu_backend.runtime.topology import (
     decoder_mlp_intermediate_size, resolve_decoder_topology, validate_decoder_cache_topology,
 )
 
-_TEMPLATES = {4: (2, 4, 4, 4, 4, 8), 6: (2, 6, 4, 6, 4, 8)}
+_TEMPLATES = {4: (2, 4, 4, 4, 4, 8), 6: (2, 6, 4, 6, 6, 8)}
 
 
 def _config(**overrides):
@@ -65,9 +65,9 @@ def test_exact_profile_binds_the_shared_template_and_eight_keeps_no_topology(cor
     # Attention TP4: 8 Q + 2 KV heads per core, as in the Qwen3 4/6 rows.
     assert config.num_attention_heads // topology.attn_tp == 8
     assert config.num_key_value_heads // topology.attn_tp == 2
-    # Eager vocabulary head on four cores: 32064 rows per core.
+    # Eager vocabulary head on 4 or 6 cores: 32064 or 21376 rows per core.
     assert config.vocab_size % (16 * topology.lm_head_tp) == 0
-    assert config.vocab_size // topology.lm_head_tp == 32064
+    assert config.vocab_size // topology.lm_head_tp == (21376 if cores == 6 else 32064)
     physical = decoder_mlp_intermediate_size(config.intermediate_size, topology.mlp_tp)
     assert physical == (8256 if cores == 6 else 8192)
     assert physical % (16 * topology.mlp_tp) == 0
@@ -207,7 +207,7 @@ def test_to_rpu_binds_padding_role_cores_and_installer_topology(installed, cores
         "logical_size": 8192, "physical_size": physical}
     assert installed["swizzle"] == {
         "skip_names": set(), "attn_num_cores": 4, "mlp_num_cores": cores,
-        "lm_head_num_cores": 4, "execution_core_count": cores}
+        "lm_head_num_cores": cores, "execution_core_count": cores}
 
 
 @pytest.mark.parametrize("cores", [4, 6])
@@ -228,14 +228,14 @@ def test_actual_reduced_model_is_rejected_before_claim_or_swizzle(installed, cor
     assert not getattr(model, "_rpu_swizzle_started", False) and installed == {}
 
 
-def test_installer_rejects_reduced_llama_scales_norms_or_layers_before_native(monkeypatch):
+def test_installer_rejects_reduced_llama_norms_or_layers_before_native(monkeypatch):
+    # Quantized scale payloads are checked in tests/test_llama_quant.py.
     from rpu_backend.runtime.decoder import _install_causal_decoder_forward
     monkeypatch.setattr(torch.ops.rpu, "causal_decoder_create",
                         lambda *_a, **_k: pytest.fail("native decoder created"), raising=False)
     topology = resolve_decoder_topology(num_cores=6, **llama_core_profile(_config(), 6).geometry())
     layers = [object()] * 16
-    for kwargs, layer_list in (({"scale_lists": ([],) * 7}, layers),
-                               ({"qk_norm_lists": ([], [])}, layers), ({}, layers[:15])):
+    for kwargs, layer_list in (({"qk_norm_lists": ([], [])}, layers), ({}, layers[:15])):
         model = SimpleNamespace(layers=layer_list, config=_config())
         with pytest.raises(ValueError, match="reduced-core Llama install"):
             _install_causal_decoder_forward(

@@ -97,7 +97,7 @@ def test_gptq_reduced_tp_preflight_and_cache_share_topology(cores):
     Qwen3_5MoeAdapter.preflight_execution(cfg, execution)
     with FakeTensorMode():
         cache = Qwen3_5MoeCache.from_config(cfg, 64, device="cpu", num_cores=cores)
-    assert cache.execution_topology == (cores, 4, cores, 4, 8)
+    assert cache.execution_topology == (cores, 4, cores, cores, 8)
 
 
 @pytest.mark.parametrize("profile", [RTN_PROFILE_ID, GPTQ_PROFILE_ID])

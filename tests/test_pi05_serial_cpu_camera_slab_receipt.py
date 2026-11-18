@@ -20,7 +20,8 @@ def test_whole_serial_cpu_camera_slab_receipt_dirty_aba_and_graph_lifetime(tmp_p
     core = _function(source, "    at::Tensor run_packed_patch_embed_core(")
     packer = _function(source, "    at::Tensor run_packed_patch_embed(")
     patch_only = _function(source, "    at::Tensor patch_embed(")
-    owner = _function(source, "    bool pi05_vision_supported_owner() const")
+    owner = "\n".join(_function(source, marker) for marker in (
+        "    bool pi05_vision_supported_owner() const", "    bool pi05_vision4_w4_owner() const"))
     span = _function(source, "static bool packed_image_acquire_span(")
     live = _function(source, "struct PatchEmbeddingLiveBases") + ";"
     patch = _function(source, "static void fused_patch_embedding(")
@@ -53,7 +54,9 @@ def test_whole_serial_cpu_camera_slab_receipt_dirty_aba_and_graph_lifetime(tmp_p
         "(!cpu_label(input) && input.device().type() == at::kCPU)")
     span = span.replace("at::kPrivateUse1", "at::kCPU")
     weights = _function(source, "    void set_weights(").replace("at::kPrivateUse1", "at::kCPU")
-    scale_check = _function(source, "static void check_siglip_w8a16_scale_lists(").replace("at::kPrivateUse1", "at::kCPU")
+    scale_check = "\n".join(_function(source, marker) for marker in (
+        "static void check_siglip_w8a16_scale_lists(", "static void check_siglip_w4a16_scale_lists(")
+    ).replace("at::kPrivateUse1", "at::kCPU")
     patch_setter = _function(source, "    void set_patch_emb_params(").replace("at::kPrivateUse1", "at::kCPU")
     chunk_setter = _function(source, "    void set_configured_chunk_size(")
     macros = "\n".join(profile[profile.index(f"#define {name}("):].split("\n\n", 1)[0]
@@ -134,6 +137,7 @@ void RpuDdrFlush(void* p,size_t bytes){size_t offset;auto& s=locate(p,bytes,offs
 void RpuDdrFlush(void* p){size_t offset;auto& s=locate(p,0,offset);RpuDdrFlush(p,s.ddr.size()-offset);}
 }
 __MACROS__
+using rhino_lkn::RpuGetDevAddr;
 struct GraphSignature{};
 struct RpuKernelGraph {
  enum class State {PASSTHROUGH,RECORDING,REPLAYING};
@@ -191,8 +195,11 @@ struct SpmAllocator {struct AllocRequest{int64_t bytes,begin,end;};
 struct Layer {at::Tensor q_w,k_w,v_w,o_w,fc1_w,fc2_w,q_ws,k_ws,v_ws,o_ws,fc1_ws,fc2_ws;};
 struct Planned {int physical_manifest=0,stage_plan=0;};
 struct Prepared {Planned plan;const Planned& candidate(){return plan;}};
+at::Tensor rpu_retain_linear_quant_scale(const at::Tensor&,const at::Tensor& scale,int64_t){return scale;}
 __SCALE_CHECK__
 struct Siglip {
+ // The serial slab receipt remains an FP16/W8A16 owner, with no A8 payloads.
+ const bool qkv_w8a8_=false,mlp_w8a8_=false;
  int cores=4,attention=4,mlp=4,layers=27;uint64_t generation=1;
  int64_t pe_kh_=14,pe_kw_=14,pe_strideh_=14,pe_stridew_=14,pe_cin_orig_=3,pe_cin_padded_=16,pe_cout_=1152;
  int64_t orig_head_dim_=72,projection_dim_=2048,image_batch_count_=1;
@@ -201,7 +208,7 @@ struct Siglip {
  // LayerNorm streaming stays off here: set_weights leaves ln_stream_ddr_ empty.
  bool pi05_vision_ln_stream_opt_in_=false;at::Tensor ln_stream_ddr_;
  int64_t ln_stream_elems() const{assert(false);return 0;}
- bool pi05_vision_kv_spm_only_opt_in_=false,pi05_ring_xor3_opt_in_=false;
+ bool pi05_vision_kv_spm_only_opt_in_=false,pi05_vision_q_resident_opt_in_=false,pi05_ring_xor3_opt_in_=false;
  int64_t logical_intermediate_size_=0,reduced_w8_projection_mask_=0,local_q_heads_=0;
  int64_t configured_chunk_size_=0,patch_kernel_size_=14,patch_stride_=14,last_resolved=0;
  double eps_=1e-6;at::Tensor post_ln_w_,post_ln_b_,proj_w_,proj_b_;
@@ -215,6 +222,8 @@ struct Siglip {
  void set_model_params(int64_t,int64_t,int64_t,int64_t,int64_t){}
  void set_num_layers(int64_t n){layers=n;}
  void require_pi05_vision_owner_ln_payloads(int64_t){}
+ void require_pi05_vision_qkv_w8a8_payloads(int64_t){assert(false);}
+ void require_pi05_vision_mlp_w8a8_payloads(int64_t){assert(false);}
  __WEIGHTS__
  __PATCH_SETTER__
  __CHUNK_SETTER__
@@ -236,6 +245,10 @@ struct Siglip {
  void validate_pi05_vision_kv_spm_only_policy(const Planned&,int64_t,int64_t){}
  void validate_pi05_vision_owner_ln_policy(const Planned&,int64_t,int64_t){}
  void require_pi05_vision_fc_profile(int64_t,int64_t){}
+ void require_pi05_vision_qkv_w8a8_profile(int64_t,int64_t){assert(!qkv_w8a8_);}
+ void require_pi05_vision_mlp_w8a8_profile(int64_t,int64_t){assert(!mlp_w8a8_);}
+ void validate_pi05_vision_qkv_w8a8_policy(const Planned&,int64_t,int64_t){assert(!qkv_w8a8_);}
+ void validate_pi05_vision_mlp_w8a8_policy(const Planned&,int64_t,int64_t){assert(!mlp_w8a8_);}
  void validate_pi05_vision_fc_manifest(int){}void require_pi05_vision_fc_schedule(int){}
  void begin_external_physical_manifest_prologue(int,int64_t,int){++prologues;}
  void cancel_external_physical_manifest_prologue(){}

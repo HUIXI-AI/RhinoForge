@@ -31,12 +31,14 @@ python examples/run.py --config examples/configs/qwen3/text/4b/fp16.toml
 
 `--check-config` 成功时显示 `configuration OK`，表示字段和登记关系通过检查；权重文件、输入张量与设备环境还需在实际运行时检查。输入、权重、核数或累加选项发生变化后，重新检查并启动新进程。
 
+换核数或改个别字段时可以不复制 TOML：`--recipe w8a16_text_head` 选同一模型目录下的另一个配方，`--cores 6` 覆盖核数，`--input p1024_d128`（图文如 `i896_p1024_d32`，VLA 如 `3cam_t64`，ASR 如 `6s`）套用一组[输入预设](configs/PARAMETERS.md#input-presets)，`--set <表>.<键>=<值>` 覆盖一个输入、运行或执行字段，`--emit-toml <路径>` 把覆盖后的配置保存成可直接运行的 TOML。可改范围见[命令行覆盖](configs/PARAMETERS.md#cli-overrides)。
+
 <a id="results"></a>
 <a id="logging-and-performance-output"></a>
 
 ## 查看结果
 
-终端默认显示模型与性能摘要，结果文件写入 `run.output_dir`。先核对实际输入、输出形状及运行次数，再比较耗时；日志设置和计时字段见[结果说明](RESULTS.md)，已保存的测量见性能报告。
+终端默认显示模型与性能摘要，结果文件写入 `run.output_dir`。先核对实际输入、输出形状及运行次数，再比较耗时；日志设置和计时字段见[结果说明](RESULTS.md)。
 
 <a id="已归档示例"></a>
 

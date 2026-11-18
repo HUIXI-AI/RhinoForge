@@ -54,5 +54,13 @@ def test_vision_w8_six_real_projection_scales_swizzle_and_fp16_default():
     with pytest.raises(ValueError,match='finite pristine'):
         vision._convert_vision_block_weights_for_rpu(bad,16,1024,_g05_w8a16=True)
     assert not hasattr(bad,'_rpu_qwen3_5_vision_conversion_started')
-    with pytest.raises(ValueError,match='exact TP8'):
-        vision._convert_vision_block_weights_for_rpu(deepcopy(original),16,1024,num_cores=4,_g05_w8a16=True)
+    # Four lanes keep the same per-channel codes, swizzled for the reduced Vision owner.
+    four = deepcopy(original)
+    vision._convert_vision_block_weights_for_rpu(four,16,1024,num_cores=4,_g05_w8a16=True)
+    for i,(source,actual) in enumerate(zip(raw,[four._rpu_q_w,four._rpu_k_w,four._rpu_v_w,
+            four.attn.proj.weight,four.mlp.linear_fc1.weight,four.mlp.linear_fc2.weight])):
+        q,_scale = quantize_linear_per_channel(source,bits=8)
+        swizzle = tp_row_swizzle_mc_weight if i in (3,5) else tp_col_swizzle_mc_weight
+        assert torch.equal(actual,swizzle(q,num_cores=4,dwidth=1))
+    with pytest.raises(ValueError,match='num_cores must be 4 or 8'):
+        vision._convert_vision_block_weights_for_rpu(deepcopy(original),16,1024,num_cores=6,_g05_w8a16=True)

@@ -51,7 +51,7 @@ def test_hyvla_auto_is_cold_and_every_geometry_has_manifest_authority():
         "native = _HyVlaNativeColdSnapshot.from_environment(effective)"
     )
     builder = HY_PY[HY_PY.index("def build_hy_vla("):]
-    assert builder.index("prepare_hy_vla_cold_plan()") < builder.index(
+    assert builder.index("prepare_hy_vla_cold_plan(num_cores=budget)") < builder.index(
         "_claim_live_instance(lifecycle_owner)"
     )
     assert "_native_cold=cold_plan.native" in builder
@@ -86,7 +86,8 @@ def test_wall_text_fixed32_is_profile_scoped_and_descriptor_consumed():
     )
     assert "rmsnorm_fixed32: bool = False" in WALL_LLM
     assert '{"rmsnorm_fixed32": True}' in WALL_RUNTIME
-    assert 'if w8a16 or (fp16_transfer_mask & 2) else {}' in WALL_RUNTIME
+    # FIXED32 is an eight-lane route; reduced RTC budgets keep BASE.
+    assert 'if budget == 8 and (w8a16 or (fp16_transfer_mask & 2)) else {}' in WALL_RUNTIME
 
 
 def test_wall_vision_fixed32_has_exact_pre_and_compute_receipts():

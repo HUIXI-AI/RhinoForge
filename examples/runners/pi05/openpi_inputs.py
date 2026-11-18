@@ -21,10 +21,15 @@ A few pixels can differ by one uint8 level from JAX's fused reduction order.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import functools
 import json
 import math
+import os
 from pathlib import Path
+import platform
+import threading
+import warnings
 
 # Kuavo cam_h / cam_l / cam_r in this order; pi05_base names its three slots so.
 CAMERA_KEYS = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
@@ -105,9 +110,142 @@ def resize_geometry(width: int, height: int, size: int = MODEL_IMAGE_SIZE) -> di
             "pad_top": (size - new_h) // 2, "pad_left": (size - new_w) // 2}
 
 
+_WORKER_TLS = threading.local()
+_POOL_LOCK = threading.Lock()
+_CAMERA_POOL: concurrent.futures.ThreadPoolExecutor | None = None
+_CAMERA_POOL_PID: int | None = None
+
+
+def _init_camera_worker() -> None:
+    import torch
+
+    # Prevent nested 3x8 OpenMP thread storms while preserving the main thread's torch thread count.
+    torch.set_num_threads(1)
+
+
+def _camera_pool() -> concurrent.futures.ThreadPoolExecutor:
+    global _CAMERA_POOL, _CAMERA_POOL_PID
+    pid = os.getpid()
+    if _CAMERA_POOL is not None and _CAMERA_POOL_PID == pid:
+        return _CAMERA_POOL
+    with _POOL_LOCK:
+        if _CAMERA_POOL is None or _CAMERA_POOL_PID != pid:
+            _CAMERA_POOL = concurrent.futures.ThreadPoolExecutor(
+                max_workers=len(CAMERA_KEYS),
+                thread_name_prefix="openpi-cam",
+                initializer=_init_camera_worker,
+            )
+            _CAMERA_POOL_PID = pid
+        return _CAMERA_POOL
+
+
+_IS_AARCH64 = platform.machine().lower() in ("aarch64", "arm64")
+
+
+@functools.lru_cache(maxsize=16)
+def _resize_sparse_plan(in_size: int, out_size: int):
+    """Cached sparse transpose of _resize_weights (>98.4% zeros on Kuavo 848x480 / 640x480).
+
+    Matches host OpenBLAS ``np.matmul`` IEEE-754 rounding bit-for-bit on each ISA:
+    - aarch64: OpenBLAS SGEMM uses unfused fmul+fadd -> matched 100% by CSR SpMM;
+    - x86_64: OpenBLAS SGEMM uses AVX2 FMA (vfmadd) -> matched 100% by embedding_bag gather-FMA.
+    """
+    import numpy as np
+    import torch
+
+    wt = np.array(_resize_weights(in_size, out_size).T, copy=True, order="C")
+    if _IS_AARCH64:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*Sparse CSR.*", category=UserWarning)
+            return ("csr", torch.from_numpy(wt).to_sparse_csr())
+    nz_r, nz_c = np.nonzero(wt)
+    offsets = np.zeros(out_size, dtype=np.int64)
+    counts = np.bincount(nz_r, minlength=out_size)
+    if out_size > 1:
+        offsets[1:] = np.cumsum(counts[:-1])
+    return (
+        "ebag",
+        torch.from_numpy(nz_c.astype(np.int64)),
+        torch.from_numpy(offsets),
+        torch.from_numpy(wt[nz_r, nz_c].astype(np.float32)),
+    )
+
+
+def _apply_sparse_plan(plan, mat):
+    import torch
+    import torch.nn.functional as F
+
+    if plan[0] == "csr":
+        return torch.matmul(plan[1], mat)
+    _, indices, offsets, weights = plan
+    return F.embedding_bag(indices, mat, offsets, per_sample_weights=weights, mode="sum")
+
+
+def _uint8_tensor_2d(image, cur_h: int, cur_w: int):
+    import numpy as np
+    import torch
+
+    contig = image if image.flags.c_contiguous else np.ascontiguousarray(image)
+    if contig.flags.writeable:
+        return torch.from_numpy(contig).view(cur_h, cur_w * 3)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="The given NumPy array is not writable.*", category=UserWarning)
+        return torch.from_numpy(contig).view(cur_h, cur_w * 3)
+
+
+def _resize_core_uint8_planar(image, cur_h: int, cur_w: int, new_h: int, new_w: int, *, use_tls: bool):
+    """Compute [new_w, 3, new_h] uint8 resized pixels via cached sparse row-gather."""
+    import torch
+
+    plan_h = _resize_sparse_plan(cur_h, new_h)
+    plan_w = _resize_sparse_plan(cur_w, new_w)
+    u8_2d = _uint8_tensor_2d(image, cur_h, cur_w)
+    if use_tls:
+        key = (cur_h, cur_w, new_h)
+        ws = getattr(_WORKER_TLS, "workspace", None)
+        if ws is None or ws[0] != key:
+            ws = (
+                key,
+                torch.empty((cur_h, cur_w * 3), dtype=torch.float32),
+                torch.empty((cur_w, 3 * new_h), dtype=torch.float32),
+            )
+            _WORKER_TLS.workspace = ws
+        _, f32, yw = ws
+        f32.copy_(u8_2d)
+        y = _apply_sparse_plan(plan_h, f32)
+        yw.view(cur_w, 3, new_h).copy_(y.view(new_h, cur_w, 3).permute(1, 2, 0))
+    else:
+        f32 = u8_2d.to(torch.float32)
+        y = _apply_sparse_plan(plan_h, f32)
+        yw = y.view(new_h, cur_w, 3).permute(1, 2, 0).contiguous().view(cur_w, 3 * new_h)
+    z = _apply_sparse_plan(plan_w, yw)
+    return torch.clamp_(torch.round_(z), 0.0, 255.0).to(torch.uint8).view(new_w, 3, new_h)
+
+
+def _resize_frame_to_model_tensor(frame, height: int = 224, width: int = 224):
+    """One uint8 [H,W,3] frame -> contiguous [1,3,height,width] float32 in [0,1] (worker entry)."""
+    import torch
+
+    cur_h, cur_w = frame.shape[:2]
+    if (cur_h, cur_w) == (height, width):
+        u8_2d = _uint8_tensor_2d(frame, cur_h, cur_w).view(cur_h, cur_w, 3)
+        return u8_2d.to(torch.float32).div_(255.0).permute(2, 0, 1).unsqueeze(0).contiguous()
+    ratio = max(cur_w / width, cur_h / height)
+    new_h, new_w = int(cur_h / ratio), int(cur_w / ratio)
+    u8_planar = _resize_core_uint8_planar(frame, cur_h, cur_w, new_h, new_w, use_tls=True)
+    # Cast & divide by 255.0 while contiguous BEFORE permuting into the padded [1, 3, H, W] destination.
+    unit_planar = u8_planar.to(torch.float32).div_(255.0)
+    pad_h = (height - new_h) // 2
+    pad_w = (width - new_w) // 2
+    out = torch.zeros((1, 3, height, width), dtype=torch.float32)
+    out[0, :, pad_h:pad_h + new_h, pad_w:pad_w + new_w] = unit_planar.permute(1, 2, 0)
+    return out
+
+
 def resize_with_pad(image, height: int = 224, width: int = 224):
     """openpi resize_with_pad for one uint8 [H,W,3] frame: keep aspect, linear+antialias, black pad."""
     import numpy as np
+    import torch
 
     if not isinstance(image, np.ndarray) or image.dtype != np.uint8 or image.ndim != 3 or image.shape[2] != 3:
         raise ValueError("resize_with_pad expects a uint8 [H,W,3] frame")
@@ -116,15 +254,12 @@ def resize_with_pad(image, height: int = 224, width: int = 224):
         return image.copy()
     ratio = max(cur_w / width, cur_h / height)
     new_h, new_w = int(cur_h / ratio), int(cur_w / ratio)
-    # Same order as jax.image.scale_and_translate: two float32 matmuls, height then width.
-    # BLAS matmul, not einsum: an einsum with dtype= runs unblocked (~1.2 s per 848x480 frame on aarch64).
-    x = np.matmul(_resize_weights(cur_h, new_h).T, image.astype(np.float32).reshape(cur_h, -1))
-    x = x.reshape(new_h, cur_w, 3).transpose(0, 2, 1).reshape(new_h * 3, cur_w)
-    x = np.matmul(x, _resize_weights(cur_w, new_w)).reshape(new_h, 3, new_w).transpose(0, 2, 1)
-    x = np.clip(np.round(x), 0, 255).astype(np.uint8)
-    pad_h, extra_h = divmod(height - new_h, 2)
-    pad_w, extra_w = divmod(width - new_w, 2)
-    return np.pad(x, ((pad_h, pad_h + extra_h), (pad_w, pad_w + extra_w), (0, 0)), constant_values=0)
+    u8_planar = _resize_core_uint8_planar(image, cur_h, cur_w, new_h, new_w, use_tls=False)
+    pad_h = (height - new_h) // 2
+    pad_w = (width - new_w) // 2
+    out = torch.zeros((height, width, 3), dtype=torch.uint8)
+    out[pad_h:pad_h + new_h, pad_w:pad_w + new_w] = u8_planar.permute(2, 0, 1)
+    return out.numpy()
 
 
 def load_frame(path):
@@ -138,7 +273,7 @@ def load_frame(path):
         from PIL import Image
 
         with Image.open(path) as image:
-            frame = np.asarray(image.convert("RGB"))
+            frame = np.array(image.convert("RGB"), dtype=np.uint8, copy=True)
     if frame.dtype != np.uint8 or frame.ndim != 3 or frame.shape[2] != 3:
         raise ValueError(f"{path} must hold one uint8 RGB frame [H,W,3]")
     return frame
@@ -298,15 +433,31 @@ def batch_from_frames(frames, state, instruction: str, stats: dict, processor, *
         check_frames(frames, frame_size)
     elif len(frames) != len(CAMERA_KEYS):
         raise ValueError(f"openpi pi05 inputs need {len(CAMERA_KEYS)} frames in base/left wrist/right wrist order")
-    state = np.asarray(state, dtype=np.float64)
-    normalized = normalize_quantile(state, stats["state"])
-    prompt = pi05_prompt(instruction, normalized)
-    tokens, mask = tokenize(processor, prompt, text_tokens)
-    batch = {}
     for key, frame in zip(CAMERA_KEYS, frames):
-        resized = resize_with_pad(frame, 224, 224)
-        image = torch.from_numpy(resized).permute(2, 0, 1).unsqueeze(0).to(torch.float32) / 255.0
-        batch[f"observation.images.{key}"] = image.contiguous()
+        if not isinstance(frame, np.ndarray) or frame.dtype != np.uint8 or frame.ndim != 3 or frame.shape[2] != 3:
+            raise ValueError(f"{key} frame must be a uint8 [H,W,3] array")
+    # Pre-warm sparse resize plan cache on main thread, then dispatch 3 cameras in parallel with tokenization.
+    for frame in frames:
+        fh, fw = frame.shape[:2]
+        if (fh, fw) != (MODEL_IMAGE_SIZE, MODEL_IMAGE_SIZE):
+            ratio = max(fw / MODEL_IMAGE_SIZE, fh / MODEL_IMAGE_SIZE)
+            _resize_sparse_plan(fh, int(fh / ratio))
+            _resize_sparse_plan(fw, int(fw / ratio))
+    pool = _camera_pool()
+    futures = [pool.submit(_resize_frame_to_model_tensor, frame, MODEL_IMAGE_SIZE, MODEL_IMAGE_SIZE) for frame in frames]
+    try:
+        state = np.asarray(state, dtype=np.float64)
+        normalized = normalize_quantile(state, stats["state"])
+        prompt = pi05_prompt(instruction, normalized)
+        tokens, mask = tokenize(processor, prompt, text_tokens)
+        images = [future.result() for future in futures]
+    except BaseException:
+        for future in futures:
+            future.cancel()
+        raise
+    batch = {}
+    for key, image in zip(CAMERA_KEYS, images):
+        batch[f"observation.images.{key}"] = image
         batch[f"observation.images.{key}_padding_mask"] = torch.ones(1, dtype=torch.bool)
     # The pi05 action path reads the state only through the prompt; keep the value for records.
     batch["observation.state"] = torch.from_numpy(normalized.astype(np.float32)).unsqueeze(0)

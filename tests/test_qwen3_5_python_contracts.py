@@ -328,6 +328,77 @@ def test_qwen3_5_physical_manifest_is_the_kv_attention_authority():
         # Definition + descriptor emission + production consume.
         assert vision.count(site) >= 3, site
 
+def test_qwen3_5_registry_matches_every_active_descriptor_route_site():
+    root = Path(__file__).resolve().parents[1]
+    owners_path = root / "manifests/planner_owners.v1.json"
+    if not owners_path.is_file():
+        pytest.skip("manifests/planner_owners.v1.json is internal-only")
+    registry = json.loads(owners_path.read_text())
+    sources = {
+        "fmb-qwen35-text": _MODEL_CPP.read_text() + "\n" + _MODEL_H.read_text(),
+        "fmb-qwen35-vision": _VISION_CPP.read_text(),
+    }
+    for owner, source in sources.items():
+        all_routes = [
+            site for site in registry["sites"]
+            if site["owner"] == owner
+            and site["control_kind"] == "descriptor_route"
+        ]
+        routes = [site for site in all_routes if site["state"] != "PARTIAL"]
+        # A typed launcher without a planner descriptor stays a PARTIAL gap;
+        # it must not claim a site id the source declares as bound.
+        unbound = [site for site in all_routes if site["state"] == "PARTIAL"]
+        for site in unbound:
+            assert site["reason_code"] == "STATIC_ROUTE_BINDING_UNPROVEN", site["id"]
+            assert site["hw_status"] == "NOT_RUN", site["id"]
+            assert [e["kind"] for e in site["evidence"]] == ["gap"], site["id"]
+        declarations = re.findall(
+            r"(?:static\s+)?constexpr\s+int64_t\s+(\w*[Ss][Ii][Tt][Ee])"
+            r"\s*=\s*(\d+)LL",
+            source,
+        )
+        assert len(declarations) == len({name for name, _ in declarations})
+        assert len(declarations) == len({site_id for _, site_id in declarations})
+        # The text NVFP4 table tag only salts the layout hash and cost identity;
+        # it is never a manifest route key, so it has no registry route.
+        identity_salts = {"kTextNvfp4TablesSite"} if owner == "fmb-qwen35-text" else set()
+        for name in identity_salts:
+            assert source.count(name) == 1 + source.count(f"layout_mix(hash, {name})") + \
+                source.count(f"identity.push_back({name})"), name
+        declared_by_id = {site_id: name for name, site_id in declarations
+                          if name not in identity_salts}
+        capability_routes = [
+            route for route in registry.get("capability_routes", ())
+            if route["owner"] == owner
+        ]
+        capability_ids = {
+            str(route["route_key"]["site_id"])
+            for route in capability_routes
+        }
+        route_ids = {str(route["route_key"]["site_id"]) for route in routes}
+        assert len(capability_routes) == len(capability_ids)
+        canonical_routes = {route["id"]: route for route in routes
+                            if "route_alias_of" not in route}
+        assert len(canonical_routes) == len(route_ids)
+        for route in routes:
+            if "route_alias_of" in route:
+                canonical = canonical_routes[route["route_alias_of"]]
+                assert route["route_key"] == canonical["route_key"]
+                assert route["source"] != canonical["source"]
+                assert all(route[field] == canonical[field] for field in
+                           ("owner", "component", "stage", "family", "state"))
+        assert capability_ids <= declared_by_id.keys()
+        assert route_ids == declared_by_id.keys() - capability_ids
+        assert not {
+            str(site["route_key"]["site_id"]) for site in unbound
+        } & declared_by_id.keys()
+        for route in routes:
+            site_id = str(route["route_key"]["site_id"])
+            site_name = declared_by_id[site_id]
+            # Stable declaration + conditional manifest + launcher-side receipt.
+            assert source.count(site_name) >= 3, route["id"]
+
+    assert "37266457839629843" not in json.dumps(registry)
 
 
 def test_qwen3_5_vision_and_kernel_fail_fast_contracts():

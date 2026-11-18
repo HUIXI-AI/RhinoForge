@@ -163,8 +163,8 @@ Start with the [Qwen3 speech guide](../docs/qwen3_audio.md) and retain these con
   its default-off state preserves other decoders' RoPE parameters and layout hash.
   Keep original CPU FP32 codec weights; fold LayerScale into new frontend copies
   before FP16 conversion and preserve FP32 rotary frequencies. Use the device
-  frontend for 1–63 codec frames and the original CPU FP32 sliding attention for
-  64–255 frames. Missing setter selects CPU; report the route and propagate errors.
+  frontend for 1–255 codec frames, switching above 64 frames to an explicit
+  72-frame causal sliding mask with a planner-selected single chunk. Missing setter selects CPU; report the route and propagate errors.
 - Reset logical KV position per sequence. Talker keeps EOS and repetition penalties;
   Predictor uses a fixed 15-step sampling loop and resets KV per frame. Both use
   top-k 50, temperature 0.9 and top-p 1.0. Require EOS before waveform decoding;
@@ -237,10 +237,11 @@ Start with the [Qwen3 speech guide](../docs/qwen3_audio.md) and retain these con
   two depthwise layers expanded to channel-diagonal weights at installation.
   Leave the shared quantizer's two encoder-only input projections untouched. Validate
   all geometries before conversion, preserve CPU weights, restore forwards on close
-  and report actual calls. CPU padding/im2col, remaining bias/residual arithmetic,
-  transposed convolutions, ConvNeXt Linear/normalization and 17 SnakeBeta layers
-  remain explicit with native pairs enabled; do not claim
-  full device execution or bitwise equality with the FP32 anchor.
+  and report actual calls. With matching native operators (`tts_codec_residual_unit_complete`, `tts_codec_transpose_overlap`,
+  `tts_codec_residual_unit_rows`, `tts_codec_residual_unit_padded_rows`, `tts_codec_convnext_block`),
+  transposed-convolution overlap/bias, SnakeBeta/residual stages (including zero-padded 192/96-channel rows)
+  and ConvNeXt blocks also run on RPU while CPU orchestrates eager launches and NCT boundaries;
+  do not claim bitwise equality with the FP32 anchor.
 - Native codec residual pairs keep two ACC32 Linear projections and their
   intermediate FP16 bias/SnakeBeta on device. Bind frozen parameters and padded
   second weights once; preserve FP32 final bias/residual on CPU without an extra

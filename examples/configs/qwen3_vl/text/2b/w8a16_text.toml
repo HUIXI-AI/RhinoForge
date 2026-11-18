@@ -7,7 +7,7 @@
 profile_id = "qwen3-vl-2b-text-w8a16.w8a16.text"
 registry_alias = "qwen3-vl-2b-text-w8a16"
 target = "qwen3_vl"
-precision = "w8a16"
+precision = "w8a16_text"
 architecture = "Qwen3VLForConditionalGeneration"
 
 [model.opt_in]
@@ -39,7 +39,7 @@ seed = 0
 
 [rpu_execution.model]
 # RPU 核数预算。可选 4 / 6 / 8，默认 8；修改后需重新加载模型。
-# 6 核时文本组件分配为 Attention 4、MLP 6、输出头 4。
+# 6 核时文本组件分配为 Attention 4、MLP 6、输出头 6。
 # Vision 在 4/6 核下用 4 核。实际分配见模型页配置表的“4 核 / 6 核”列。
 num_cores = 8
 
@@ -58,10 +58,8 @@ linear_acc32 = false
 fast_replay = true
 
 [rpu_execution.vision]
-# Vision 分块行数。可选 "auto"（默认）或 16 的倍数整数；不补齐行。
-# auto：由原生 planner 按图像 patch 数与本模型的核数选择。
-# 实际值记录在结果 report.json 的执行计划中（compute_chunk）。
+# 文本组件（input.component = "text"）不运行 Vision，不读取图片，本节两项不参与执行。
+# 加载时仍校验：chunk_size 取 "auto"（默认）或 16 的倍数整数，不超过 4096；
+# linear_acc32 取 false（默认，ACC16）或 true。图文配置在 vl/ 下，取值见其注释。
 chunk_size = "auto"
-# Linear 累加精度。false 为 ACC16，true 为 ACC32；不改变权重位宽。
-# 省略时默认 false（ACC16）。修改后需重新加载模型。
 linear_acc32 = false

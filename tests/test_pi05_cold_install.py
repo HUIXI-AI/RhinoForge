@@ -190,6 +190,109 @@ def test_pi_graph_policy_uses_generic_sync_default(monkeypatch):
     assert disabled.fmb_deep_fast_replay is False
 
 
+def _kv_policy(dtype):
+    policy = _policy()
+    pawe = policy.model.paligemma_with_expert = torch.nn.Module()
+    pawe.paligemma = torch.nn.Module()
+    paligemma = pawe.paligemma.model = torch.nn.Module()
+    paligemma.vision_tower = torch.nn.Module()
+    paligemma.multi_modal_projector = torch.nn.Module()
+    pawe.gemma_expert = torch.nn.Module()
+    decoders = []
+    for owner, name in ((paligemma, "language_model"), (pawe.gemma_expert, "model")):
+        decoder = torch.nn.Module()
+        setattr(owner, name, decoder)
+        decoder.config = SimpleNamespace(num_key_value_heads=1, num_attention_heads=8, head_dim=256)
+        layer = torch.nn.Module()
+        layer.self_attn = torch.nn.Module()
+        for projection, rows in (("q_proj", 2048), ("k_proj", 256), ("v_proj", 256)):
+            leaf = torch.nn.Linear(16, rows, bias=False, dtype=torch.float16)
+            leaf.weight = torch.nn.Parameter(torch.ones(rows, 16, dtype=dtype), requires_grad=False)
+            if dtype == torch.int8:
+                leaf.register_buffer("weight_scale", torch.full((rows,), .01, dtype=torch.float16))
+            setattr(layer.self_attn, projection, leaf)
+        decoder.layers = torch.nn.ModuleList([layer])
+        decoders.append(decoder)
+    return policy, decoders
+
+
+@pytest.mark.parametrize("cores", (4, 6, 8))
+@pytest.mark.parametrize("dtype", (torch.float16, torch.int8))
+def test_public_install_matches_real_cold_preflight_to_kv_replication(monkeypatch, cores, dtype):
+    from rpu_backend.adapters.pi05 import cores as core_profiles
+    from rpu_backend.runtime import weights
+
+    policy, decoders = _kv_policy(dtype)
+    policy.model._rpu_execution = {"model": {"num_cores": cores}}
+    adapter = pi05.Pi05Adapter(policy)
+    # Use small MQA projections to exercise the real preflight/replication
+    # transaction. Full checkpoint geometry and MLP packing have their own tests.
+    monkeypatch.setattr(core_profiles, "validate_reduced_policy", lambda *a: None)
+    monkeypatch.setattr(core_profiles, "pad_decoder_mlp_inplace", lambda *a: None)
+    monkeypatch.setattr(patches, "install_class_patches", lambda owner: None)
+    monkeypatch.setattr(torch.rpu, "set_caching_allocator", lambda enabled: None)
+    monkeypatch.setenv("RPU_PI05_DENOISE_UNROLL", "1")
+
+    def before_swizzle(*args, **kwargs):
+        raise _StopBeforeWeights()
+
+    monkeypatch.setattr(weights, "convert_linear_weights_inplace", before_swizzle)
+    with pytest.raises(_StopBeforeWeights):
+        adapter.to_rpu()
+    attention = 8 if cores == 8 else 4
+    for decoder in decoders:
+        assert decoder._rpu_effective_num_kv_heads == attention
+        for name in ("k_proj", "v_proj"):
+            leaf = getattr(decoder.layers[0].self_attn, name)
+            assert leaf.weight.shape == (attention * 256, 16)
+            assert leaf.out_features == attention * 256
+            if dtype == torch.int8:
+                assert leaf.weight_scale.shape == (attention * 256,)
+
+
+def test_cold_preflight_rejects_kv_geometry_outside_attention_budget():
+    policy, decoders = _kv_policy(torch.float16)
+    decoders[1].config.num_key_value_heads = 8
+    before = decoders[0].layers[0].self_attn.k_proj.weight
+    with pytest.raises(pi05.RPUBackendError, match="invalid KV replication"):
+        pi05._preflight_pi05_cold_model(policy, attn_tp=4)
+    assert decoders[0].layers[0].self_attn.k_proj.weight is before
+
+
+def test_cold_preflight_keeps_int4_groups_separate_from_text_buckets():
+    policy, decoders = _kv_policy(torch.int8)
+    before = decoders[0].layers[0].self_attn.k_proj.weight
+    policy._pi05_quant_config = {"method": "w4a16", "int4_components": ["expert"]}
+    for group_size in (32, 64, 128):
+        policy._pi05_quant_config["int4_group_size"] = group_size
+        pi05._preflight_pi05_cold_model(policy)
+
+    # T96 is a physical text bucket, not a supported INT4 packing group.
+    policy._pi05_quant_config["int4_group_size"] = 96
+    with pytest.raises(ValueError, match="int4_group_size must be 32, 64, or 128"):
+        pi05._preflight_pi05_cold_model(policy)
+    assert decoders[0].layers[0].self_attn.k_proj.weight is before
+
+
+def test_nvfp4_cold_preflight_allows_only_declared_fp32_tensor_scales():
+    policy, decoders = _kv_policy(torch.int8)
+    module = decoders[1].layers[0].self_attn.q_proj
+    module.register_buffer("tensor_scale", torch.tensor(.01, dtype=torch.float32))
+    module._pi05_nvfp4_abi = "striped_v2"
+    with pytest.raises(pi05.RPUUnsupportedDtypeError):
+        pi05._preflight_pi05_cold_model(policy)
+    policy._pi05_quant_config = {"method": "nvfp4a16", "nvfp4_abi": "striped_v2",
+        "int4_components": ["expert"], "mixed_int8_suffixes": ["k_proj.weight", "v_proj.weight"]}
+    pi05._preflight_pi05_cold_model(policy)
+    # Reduced cores keep attention on four lanes; nothing else is admitted.
+    pi05._preflight_pi05_cold_model(policy, attn_tp=4)
+    with pytest.raises(pi05.RPUBackendError, match="requires attention TP4 or TP8 before swizzle"):
+        pi05._preflight_pi05_cold_model(policy, attn_tp=2)
+    module.register_buffer("unexpected_fp32", torch.ones(1, dtype=torch.float32))
+    with pytest.raises(pi05.RPUUnsupportedDtypeError, match="unexpected_fp32"):
+        pi05._preflight_pi05_cold_model(policy)
+
+
 @pytest.mark.parametrize("mode", ["reject", "raise"])
 def test_pi_arena_failure_releases_claim_before_any_weight_mutation(monkeypatch, mode):
     from rpu_backend.graph import GraphRuntimePolicy

@@ -47,5 +47,5 @@ seed = 0
 output_dir = "./pi05_results/kuavo/dual_arm/w8a16"
 
 [rpu_execution.model]
-# RPU 核数预算；T≠32 仅支持 8 核。
+# RPU 核数预算。可选 4 / 6 / 8，默认 8；修改后需重新加载模型。
 num_cores = 8

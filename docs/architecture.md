@@ -212,8 +212,8 @@ Standard FP16 residual reduction uses the shared ring with the installed
 consumer core count; the default profile uses eight. Reduced profiles retain
 their admitted producer/consumer counts. A partial producer first clears every
 consumer shard, then writes its active prefix. Local-SPM, mixed-precision and
-fixed-layout collective routes retain their eight-core bounds. FP16, W8A16, and packed
-W4A16 Linear paths likewise use one generated tile planner. Neither mechanism
+fixed-layout collective routes retain their eight-core bounds. FP16, W8A16, W8A8, NVFP4, and packed
+W4A16 Linear paths likewise use one generated tile planner. Outside Graph capture, multi-tile column-partitioned DDR Linear projections also batch their tile launches into one synchronous `QueueCache` submission, and `linear_with_accumulation(..., gelu_erf=True)` fuses exact GELU-erf in SPM for device vision mergers. Neither mechanism
 has a model-level route or tile selector. See
 [automatic residual reduction](../knowledge/concepts/allreduce-routing.md) and
 [generated Linear auto-tiling](../knowledge/concepts/linear-autotiling.md).

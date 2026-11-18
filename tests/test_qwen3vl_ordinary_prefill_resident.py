@@ -176,11 +176,11 @@ std::vector<std::vector<int64_t>> run(CausalDecoderModel& model,int64_t length,b
  return hidden;
 }
 int main(){
- for(int size:{2,4})for(auto dtype:{at::kHalf,at::kChar,at::kByte})for(bool acc32:{false,true}){
-  CausalDecoderModel model;model.setup(size,dtype);model.linear_acc32_=acc32;model.cold();model.make_plan(272);
-  const bool admitted=!(size==4 && dtype==at::kChar);
+ for(int cores:{4,6,8})for(int size:{2,4})for(auto dtype:{at::kHalf,at::kChar,at::kByte})for(bool acc32:{false,true}){
+  CausalDecoderModel model;model.cores=cores;model.setup(size,dtype);model.linear_acc32_=acc32;model.cold();model.make_plan(272);
+  const bool admitted=(cores==8?!(size==4 && dtype==at::kChar):size==2);
   assert(model.qwen3vl_ordinary_resident_prefill_profile_==admitted);
-  const bool fp16_decode=dtype==at::kHalf;
+  const bool fp16_decode=(cores==8 && dtype==at::kHalf);
   assert(model.qwen3vl_fp16_decode_profile_==fp16_decode);
   assert(model.qwen3vl_decode_gemv(1)==(fp16_decode && !acc32));
   assert(!model.qwen3vl_decode_gemv(16));
@@ -188,7 +188,7 @@ int main(){
   model.manifest();assert(model.configure().chunk_outer_within_group==admitted);
   assert(model.configure().inter_layer_io==(admitted?InterLayerIO::SPM_RESIDENT:InterLayerIO::AUTO));
   if(!admitted){assert(model.ctx().descriptor.empty());continue;}
-  assert((model.ctx().descriptor==std::vector<int64_t>{272,128,3,model.N,model.H,model.I,model.Q,8,128,8,dtype,acc32}));
+  assert((model.ctx().descriptor==std::vector<int64_t>{272,128,3,model.N,model.H,model.I,model.Q,8,128,cores,dtype,acc32}));
   for(int64_t length:{128,256,272,560})assert(run(model,length,true)==run(model,length,false));
   model.make_plan(272);model.manifest();const auto args=model.ctx().descriptor;
   for(size_t i=0;i<args.size();++i){
@@ -200,7 +200,7 @@ int main(){
  for(int fault=0;fault<15;++fault){
   CausalDecoderModel b;b.setup(2,at::kChar);
   if(fault==0)b.N=27;if(fault==1)b.H=2560;if(fault==2)b.I=9728;if(fault==3)b.Q=32;
-  if(fault==4)b.KV=4;if(fault==5)b.D=64;if(fault==6)b.cores=4;if(fault==7)b.has_scale=false;
+  if(fault==4)b.KV=4;if(fault==5)b.D=64;if(fault==6)b.cores=2;if(fault==7)b.has_scale=false;
   if(fault==8)b.has_nvfp4=true;if(fault==9)b.use_silu=false;if(fault==10)b.has_qk_norm_=false;
   if(fault==11)b.has_qkv_bias_=true;if(fault==12)b.mrope_section={16,24,24};
   if(fault==13)b.deepstack_lang_layers={5,11,17};if(fault==14)b.deepstack_lang_layers={};

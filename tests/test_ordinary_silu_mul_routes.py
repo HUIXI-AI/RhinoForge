@@ -35,7 +35,7 @@ def ordinary_silu_executable(tmp_path_factory):
     ))
     # Wall prefill siblings share this admission block; ordinary profiles bind
     # those cold capabilities off while executing the actual ordinary predicate.
-    planner = _block(decoder, "        if (!shared_prefill_silu && (")
+    planner = _block(decoder, "        if (!qwen_c512 && !shared_prefill_silu && (")
     consumer = _block(plan_source, "const FmbRouteManifestEntry& FmbPhysicalManifestConsumer::consume_route(")
     consumer = consumer.replace("FmbPhysicalManifestConsumer::consume_route", "consume_physical_route")
     # This signature has a default `{}` argument before its body brace.
@@ -134,7 +134,7 @@ public:
 ''' + helpers + r'''
     Manifest plan_for_test(const Plan& plan, const LayoutContext& layout) const {
         Manifest manifest;
-        const bool shared_prefill_silu = false;
+        const bool qwen_c512 = false, shared_prefill_silu = false;
         const bool wall_small_prefill_fused = false, wall_fp16_long_prefill_fused = false;
         auto append = [&](FmbRouteFamily family, int64_t site, int64_t selector, int64_t flags,
                           std::vector<int64_t> arguments, int64_t invocation) {

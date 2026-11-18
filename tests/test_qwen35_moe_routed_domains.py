@@ -106,10 +106,10 @@ def test_component_identity_and_cache_are_bound_to_installed_quant_mode(monkeypa
     topology = cores.core_topology(execution, config=cfg)
     narrow = 8 if budget == 8 else 4
     routed = 4 if budget == 6 and mode == 6 else budget
-    expected = (2, budget, narrow, narrow, narrow, budget, routed, budget, narrow, 8)
+    expected = (2, budget, narrow, narrow, narrow, budget, routed, budget, budget, 8)
     assert topology.identity() == cores.full_topology_tuple(topology) == expected
     monkeypatch.setattr(torch.ops.rpu, "qwen3_5_moe_get_execution_topology",
-        lambda _: (budget, narrow, budget, narrow, 8), raising=False)
+        lambda _: (budget, narrow, budget, budget, 8), raising=False)
     monkeypatch.setattr(torch.ops.rpu, "qwen3_5_moe_get_execution_topology_v2",
         lambda _: expected, raising=False)
     state = SimpleNamespace(handle=17, execution_topology=topology,
@@ -301,10 +301,10 @@ int main(){
         assert(int4_cost.size()>=schedule_prefix.size());
         assert(std::equal(schedule_prefix.begin(),schedule_prefix.end(),int4_cost.begin()));
         assert(fp8_hash!=int4_hash && fp8_cost!=int4_cost);
-        assert(m.minimum_eager_spm_bytes()==(cores==6?129280:0));
+        assert(m.minimum_eager_spm_bytes()==(cores==6?87808:0));
         if(cores==6){
             assert(fp8_cold.size()==11 && int4_cold.size()==11);
-            assert(fp8_cold.back()==129280 && int4_cold.back()==129280);
+            assert(fp8_cold.back()==87808 && int4_cold.back()==87808);
             assert(fp8_cold[6]==6 && int4_cold[6]==4);
             assert(int4_cold[5]==6 && int4_cold[7]==6);
             assert(fp8_profile[9]==576 && int4_profile[9]==512);
@@ -359,7 +359,7 @@ def test_native_install_metadata_matches_routed4_not_shared6(tmp_path):
 #include <vector>
 #include "core/rpu_grouped_linear_tiling.h"
 #define TORCH_CHECK(ok, ...) do {if(!(ok))throw std::runtime_error(#ok);}while(false)
-constexpr int kRoutedUint4Mode=6,kRoutedUint4GroupSize=128,kRoutedUint4DownGroupSize=64;
+constexpr int kRoutedUint4Mode=6,kRoutedInt8Mode=1,kRoutedUint4GroupSize=128,kRoutedUint4DownGroupSize=64;
 struct Tensor {std::vector<int64_t> shape;int64_t bytes;};
 struct Model {
     int owner=6;
@@ -376,9 +376,9 @@ struct Model {
         for(int l=0;l<40;++l)layer_is_full[l]=l%4==3;
 __ADMISSION__
         assert(routed_nc==(owner==6 && mode==6?4:owner));
-        assert(physical_routed_intermediate==(owner==6 && mode==5?576:512));
+        assert(physical_routed_intermediate==(owner==6 && mode!=6?576:512));
         assert(physical_shared_intermediate==(owner==6?576:512));
-        if(mode==5)return;
+        if(mode!=6)return;
         for(size_t j=0;j<3;++j){
             const int64_t pack_cores=stale?6:(owner==6?4:owner);
             const int64_t pack_width=stale?768:512;
@@ -401,7 +401,7 @@ __METADATA__
     }
 };
 int main(){
-    for(int cores:{4,6,8})for(int mode:{5,6}){Model model;model.owner=cores;model.check(mode,false);}
+    for(int cores:{4,6,8})for(int mode:{1,5,6}){Model model;model.owner=cores;model.check(mode,false);}
     Model model;bool rejected=false;
     try{model.check(6,true);}catch(const std::runtime_error&){rejected=true;}
     assert(rejected);

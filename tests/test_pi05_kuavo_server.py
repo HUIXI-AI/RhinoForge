@@ -347,6 +347,28 @@ def test_server_refusals_at_startup(served, tmp_path):
         serving.OpenpiPi05Server(_config(tmp_path), nonfinite="ignore")
 
 
+@pytest.mark.parametrize("cores", [4, 6])
+@pytest.mark.parametrize("text_tokens", [128, 192])
+def test_server_reduced_cores_precompute_adarms_unless_linear_acc32(served, tmp_path, cores, text_tokens):
+    cfg = _config(tmp_path)
+    cfg["input"]["text_tokens"] = text_tokens
+    cfg["rpu_execution"] = {"model": {"num_cores": cores}}
+    server = serving.OpenpiPi05Server(cfg, instructions=["pick"])
+    _, kwargs = served["prepare"][-1]
+    assert server.execution_route == "generic"
+    assert kwargs["precompute_adarms"] is True
+    server.close()
+
+    cfg_acc32 = _config(tmp_path)
+    cfg_acc32["input"]["text_tokens"] = text_tokens
+    cfg_acc32["rpu_execution"] = {"model": {"num_cores": cores}, "action": {"linear_acc32": True}}
+    server_acc32 = serving.OpenpiPi05Server(cfg_acc32, instructions=["pick"])
+    _, kwargs_acc32 = served["prepare"][-1]
+    assert server_acc32.execution_route == "generic"
+    assert kwargs_acc32["precompute_adarms"] is False
+    server_acc32.close()
+
+
 # ---------------------------------------------------------------- the drop-in adapter file
 
 

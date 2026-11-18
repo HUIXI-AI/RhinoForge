@@ -28,12 +28,17 @@ P 为处理后的输入 token 数，D 为 decode 调用数；生成首 token 来
 
 ### Llama 文本
 
+| 配置 | 支持状态 | 精度 | 量化范围 | 4 核 | 6 核 | 8 核 |
+|---|---|---|---|---|---|---|
+| [3_2_1b/fp16.toml](3_2_1b/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 |
+| [3_2_1b/nvfp4_text.toml](3_2_1b/nvfp4_text.toml) | 已实现，未认证（`IMPLEMENTED_UNVERIFIED_HW`） | nvfp4 | 文本层 NVFP4 | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 6） | ● 已实测 |
+| [3_2_1b/w4a16_text_rtn_g32.toml](3_2_1b/w4a16_text_rtn_g32.toml) | 已实现，未认证（`IMPLEMENTED_UNVERIFIED_HW`） | w4a16 | 文本层 W4A16 G32 RTN | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 |
+| [3_2_1b/w8a16_text.toml](3_2_1b/w8a16_text.toml) | 已实现，未认证（`IMPLEMENTED_UNVERIFIED_HW`） | w8a16 | 文本层 W8A16 | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 |
+
+本组配置相同的项：
+
 | 项目 | 值 |
 |---|---|
-| 配置 | [3_2_1b/fp16.toml](3_2_1b/fp16.toml) |
-| 支持状态 | 支持（`SUPPORTED`） |
-| 精度 | fp16 |
-| 量化范围 | — |
 | 输入类型 | 文本 / token IDs |
 | prompt 默认示例 | Explain what a compiler does. |
 | decode_steps 默认值 | 4 |
@@ -42,9 +47,6 @@ P 为处理后的输入 token 数，D 为 decode 调用数；生成首 token 来
 | 其他输入形状 | B=1 |
 | 联动限制 | Llama3.2-1B 当前物理 prefill 位置+执行长度≤64，chunk≤64；P+D 另受逻辑 cache 与 checkpoint 位置范围约束。 |
 | 默认核数 | 8 |
-| 4 核 | ● 已实测（注意力 4 · MLP 4 · 输出头 4） |
-| 6 核 | ● 已实测（注意力 4 · MLP 6 · 输出头 4） |
-| 8 核 | ● 已实测 |
 | CPU线程数 | 未设置（沿用环境） |
 | 权重 | `llama-3.2-1b` |
 | 入口 | [run.py](../../run.py) |

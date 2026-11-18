@@ -114,7 +114,7 @@ void rpu_launch_pi05_adarms_norm_shift_spm_kernel(uint32_t, uint32_t, uint32_t, 
     ++fused_calls;
 }
 void rpu_launch_rmsnorm_spm_kernel(uint32_t input, uint32_t output, uint32_t weight,
-                                  int64_t rows, int64_t cols, double, RpuRmsNormSpmRoute route) {
+                                  int64_t rows, int64_t cols, double, RpuRmsNormSpmRoute route, int = 8) {
     ++norm_calls; last_norm = route;
     norms.push_back({input, output, weight, rows, cols, route});
     events.push_back(input == 0x1000 ? "q_norm" : input == 0x2000 ? "k_norm" : "norm");
@@ -130,7 +130,7 @@ void rpu_launch_memset_spm_multicore(uint32_t output, int64_t count, int cores) 
     if (output == 0x2000 + 31 * 128 * 2) { k_tail_zero = true; events.push_back("zero_k"); }
     else { assert(output == 0x4000 + 31 * 128 * 2); events.push_back("zero_v"); }
 }
-void rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(uint32_t, uint32_t, uint32_t, int64_t, int64_t, c10::Half, ValuOpType, bool) {
+void rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(uint32_t, uint32_t, uint32_t, int64_t, int64_t, c10::Half, ValuOpType, bool, int = 8) {
     ++add_calls;
 }
 struct Context {
@@ -156,6 +156,7 @@ struct Model {
     int64_t suffix_len_ = 31, num_steps_ = 10, layers = 18, h = 1024, is = 3072;
     int64_t nq = 16, nkv = 8, hd = 128, tp = 8, last_chunk = 0, generation = 5;
     int64_t local_q_heads_ = 2;
+    int num_cores() const { return 8; }
     double eps_ = 1e-6;
     Context context;
     int64_t num_layers() const { return layers; }

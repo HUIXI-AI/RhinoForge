@@ -67,8 +67,8 @@ def _provenance(config):
                                                          ("expansion", "rhino_ops_expansion"))}}
     else:
         dependencies = {"status": "UNAVAILABLE"}
-    config_bytes = json.dumps(config, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
-    return {"source": source, "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
+    from examples.common.overrides import config_sha256
+    return {"source": source, "config_sha256": config_sha256(config),
             "dependencies": dependencies}
 
 
@@ -242,7 +242,11 @@ def run(config):
             torch.manual_seed(seed)
             # Keep persistent weights and mutable Graph inputs versioned.
             with torch.inference_mode(False), torch.no_grad():
+                start = time.perf_counter()
                 infer, owner = _prepare(config)
+                # Model load and install through the runner's prepare(); a lazy
+                # Graph BUILD falls in the first warmup call instead.
+                report["load_seconds"] = time.perf_counter() - start
             input_geometry = vars(infer).get("input_geometry") if hasattr(infer, "__dict__") else None
             if isinstance(input_geometry, dict):
                 report["input_geometry"] = _materialize_geometry(input_geometry)

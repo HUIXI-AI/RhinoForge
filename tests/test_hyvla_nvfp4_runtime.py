@@ -50,7 +50,7 @@ def test_expert_binder_selects_native_setter_and_preserves_scale_order(monkeypat
             expert_nvfp4=HyVlaExpertNvfp4Metadata(resident_layers=12) if precision == "nvfp4" else None,
             kv_heads_rpu=8, action_mlp_cores=8, attn_tp=8, expert_o_resident_layers=0),
         prefix_len=240, _native_cold=_HyVlaNativeColdSnapshot.from_environment({}),
-        _unroll=True, _uw=unroll_weights, _sub=bind_sub,
+        _unroll=True, _uw=unroll_weights, _sub=bind_sub, _component_cores=lambda component: 8,
         _denoise_constants=lambda *args: constants)
 
     result, returned_constants = HyVlaRunner._prepare_expert(owner, 291, None, None, None)

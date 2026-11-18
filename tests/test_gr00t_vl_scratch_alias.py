@@ -60,7 +60,7 @@ class Gr00tVlEncoderModel{public:
  int64_t hidden_size()const{return h;}int64_t num_q_heads()const{return nq;}
  int64_t num_kv_heads()const{return nkv;}int64_t head_dim()const{return hd;}
  int64_t intermediate_size()const{return ff;}int64_t num_layers()const{return layers;}
- int attn_tp()const{return tp;}
+ int attn_tp()const{return tp;}int num_cores()const{return 8;}
  SdpaConfig make_sdpa_config(int mask)const{return {SdpaKernelType::FLASH_ATTN_SPM,hd,nq,nq,8,mask};}
  __FIELDS__
  struct LayerWeights{__LAYER_FIELDS__};std::vector<LayerWeights>layer_weights_=std::vector<LayerWeights>(4);

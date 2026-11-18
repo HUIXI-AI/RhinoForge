@@ -124,6 +124,8 @@ public:
     struct UnpreparedNvfp4 {
         void declare(std::vector<BufferDecl>&,int) const {}
     } action_nvfp4_;
+    // The dense-text NVFP4 owner is uninstalled too: it declares no scale tables.
+    UnpreparedNvfp4 text_nvfp4_;
     bool use_action_gateup_resident(int64_t) const {return false;}
     bool use_action_nvfp4_o_resident(int64_t) const {return false;}
     bool use_action_nvfp4_down_resident(int64_t,int64_t) const {return false;}

@@ -208,7 +208,7 @@ def test_gr00t_example_rejects_bad_prefix_capacity_before_builder(monkeypatch, r
     builder.assert_not_called()
 
 
-@pytest.mark.parametrize("dtype", [None, "w4a16", "unknown"])
+@pytest.mark.parametrize("dtype", [None, "nvfp4a16", "unknown"])
 def test_gr00t_rejects_unknown_example_precision_before_loading(monkeypatch, dtype):
     from examples.common import preparation
     from examples.runners.gr00t import runner
@@ -216,7 +216,7 @@ def test_gr00t_rejects_unknown_example_precision_before_loading(monkeypatch, dty
     builder, load = Mock(), Mock()
     module(monkeypatch, "rpu_backend.adapters.gr00t", build_gr00t_vla=builder)
     monkeypatch.setattr(runner, "_load_mapping", load)
-    with pytest.raises(ValueError, match="explicit fp16 or w8a16"):
+    with pytest.raises(ValueError, match="gr00t runner precision .* names 0 recipes"):
         preparation.prepare(config("gr00t", dtype))
     builder.assert_not_called()
     load.assert_not_called()

@@ -49,7 +49,7 @@ def safe_process(monkeypatch):
 def test_exact_w8_decoder_and_head_reach_claim_with_actual_cold_topology(monkeypatch, cores, shape):
     model = _model(cores, shape)
     adapter = qwen3.Qwen3Adapter(model)
-    assert adapter._topology.identity() == (2, cores, 4, cores, 4, 8)
+    assert adapter._topology.identity() == (2, cores, 4, cores, cores, 8)
     assert model.lm_head.weight.dtype == torch.int8
     assert model.model.embed_tokens.weight.dtype == torch.float16
     class ReachedClaim(Exception):
@@ -146,10 +146,12 @@ def test_int8_head_cpu_handoff_swizzles_for_its_actual_four_core_partition(monke
     monkeypatch.setattr(torch.Tensor, "to", host_to)
     monkeypatch.setattr(torch.ops.rpu, "causal_decoder_set_lm_head",
                         lambda *args: published.append(args), raising=False)
+    from rpu_backend.runtime.weights import pad_decoder_lm_head_weight
     with model.lm_head.weight.fake_mode:
+        pad_decoder_lm_head_weight(model, logical_size=151936, physical_size=151968)
         qwen3._push_lm_head_weight(model, 17)
-    assert converted == [{"partition": 1, "num_cores": 4}]
+    assert converted == [{"partition": 1, "num_cores": 6}]
     assert len(published) == 1 and published[0][0] == 17
-    assert published[0][1].dtype == torch.int8
-    assert published[0][2].dtype == torch.float16
+    assert published[0][1].dtype == torch.int8 and published[0][1].shape == (151968, 2048)
+    assert published[0][2].dtype == torch.float16 and published[0][2].shape == (151968,)
     assert model._rpu_lm_head_int8_cpu_ref.dtype == torch.int8

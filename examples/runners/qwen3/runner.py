@@ -13,10 +13,9 @@ def prepare(config, runner):
 
     load_kwargs = {}
     if target == "qwen3":
-        from examples.common.config import planner_profiles
+        from examples.common.config import install_quantization
 
-        profile = planner_profiles()[example["profile_id"]]
-        quantization = profile["input_envelope"]["limits"].get("on_install_quantization")
+        quantization = install_quantization(target, example["profile_id"])
         if quantization is not None:
             load_kwargs["quantization"] = quantization
     model = RPUModelForCausalLM.from_pretrained(

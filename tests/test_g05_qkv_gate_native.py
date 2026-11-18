@@ -154,6 +154,8 @@ struct Model{
  // This legacy fixture exercises FP16/W8; mixed NVFP4 has its own actual-body test.
  struct Nvfp4Stub {bool enabled()const{return false;}std::vector<int>values;};
  Nvfp4Stub action_nvfp4_;
+ // The dense-text NVFP4 owner is uninstalled in this probe (enabled() false, no tables).
+ Nvfp4Stub text_nvfp4_;static constexpr int64_t kTextNvfp4TablesSite=3184997657402357068LL;
  template<class...T>std::vector<int64_t>action_gateup_pair_arguments(T...)const{return {};}
  bool use_action_nvfp4(int64_t)const{return false;}
  std::vector<int64_t>action_nvfp4_arguments(int)const{assert(false);return {};}

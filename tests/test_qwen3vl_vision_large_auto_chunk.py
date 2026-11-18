@@ -21,7 +21,7 @@ def test_large_auto_cap_is_cold_bounded_and_preserves_exact_requests(tmp_path):
         line for line in source.splitlines()
         if line.startswith("constexpr int64_t QWEN3VL_VISION_")
         and any(name in line for name in (
-            "DEFAULT_CHUNK_SIZE", "LARGE_IMAGE_THRESHOLD", "LARGE_IMAGE_CHUNK_CAP"))
+            "LARGE_IMAGE_THRESHOLD", "LARGE_IMAGE_CHUNK_CAP"))
     )
     methods = "\n".join(
         _definition(source, marker).replace(" override", "")
@@ -83,10 +83,10 @@ int main(){
  rejected([&]{v.subclass_chunk_size_cap(32769,0);});
  rejected([&]{v.set_configured_chunk_size(65536);});
  // The shared Vision/VLA installer has not granted the root-only opt-in.
- assert(v.subclass_chunk_size_cap(1200,0)==144);
+ assert(v.subclass_chunk_size_cap(1200,0)==1200);
  v.set_large_image_auto_chunk(true);
  assert(v.large_image_auto_chunk_&&v.invalidations==1&&v.configured_chunk_size_==0);
- for(int n:{16,256,512,784,1024})assert(v.subclass_chunk_size_cap(n,0)==144);
+ for(int n:{16,200,256,512,784,1024})assert(v.subclass_chunk_size_cap(n,0)==((n+15)/16)*16);
  for(int n:{1040,1200,1536,4096,8192,16384,32768})assert(v.subclass_chunk_size_cap(n,0)==608);
  // It remains a cap: exact configuration is separate and wins both ways.
  v.set_configured_chunk_size(144);
@@ -96,7 +96,7 @@ int main(){
  v.set_configured_chunk_size(0);
  assert(v.subclass_chunk_size_cap(1200,0)==608);
  v.set_large_image_auto_chunk(false);
- assert(v.subclass_chunk_size_cap(1200,0)==144);
+ assert(v.subclass_chunk_size_cap(1200,0)==1200);
  v.last_resolved=144;auto count=v.invalidations;
  rejected([&]{v.set_large_image_auto_chunk(true);});
  assert(!v.large_image_auto_chunk_&&v.invalidations==count);
@@ -134,12 +134,21 @@ int main(){
  // Later private-composite preparation cannot reuse an enabled ordinary cap.
  Vision private_owner;private_owner.set_large_image_auto_chunk(true);
  private_owner.multiview_composite_prepared_=true;
- assert(private_owner.subclass_chunk_size_cap(1200,0)==144);
+ assert(private_owner.subclass_chunk_size_cap(1200,0)==1200);
  // The existing packed/fused and W8 routing rules are unchanged.
  Vision packed;packed.image_batch_count_=2;
  assert(packed.subclass_chunk_size_cap(1200,0)==1200);
  Vision fused;fused.merger=true;fused.linear_acc32_=false;
  assert(fused.subclass_chunk_size_cap(1200,0)==1200);
+ // Without a fused merger the owner encodes one image per forward: AUTO caps
+ // at the whole image on four and eight cores (the planner still fits SPM)
+ // and an exact request still wins.
+ for(int cores:{4,8}){
+  Vision one;one.cores=cores;one.linear_acc32_=false;
+  for(int n:{196,256,257,784,3136,4096})assert(one.subclass_chunk_size_cap(n,0)==((n+15)/16)*16);
+  one.set_configured_chunk_size(128);
+  assert(one.subclass_chunk_size_cap(256,0)==128);
+ }
  // Compact encoder is a separate cold capability. Enabling the merger or
  // large-image cap alone must not silently select the resident C1200 route.
  for(int64_t out:{2048,2560}){

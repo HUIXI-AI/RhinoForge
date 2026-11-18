@@ -644,6 +644,13 @@ def test_explicit_ddr_linear_threads_core_count_through_transport():
     assert "{0, 1, 2, 3, 4, 5, 6, 7}" not in body
     assert "cur_m, n, k, partition, num_cores" in body
     assert "validate_parallel_linear_geometry(" in body
+    # The GELU epilogue covers each core's whole column block and runs before
+    # the all-gather/scatter, never on the gathered row (wrong count/address).
+    epilogue = body.index("rpu_launch_eltwise_unary_spm_kernel(y_addr, y_addr, cur_m * local_n,")
+    assert "ValuOpType::ADD, epilogue_gelu,\n                                          num_cores);" in body
+    assert body.index("rpu_launch_linear_spm_to_spm_kernel(") < epilogue
+    assert epilogue < body.index("rpu_launch_all_gather_spm_kernel(")
+    assert epilogue < body.index("rpu_launch_spm_scatter_ddr_dma(y_addr, yp + row0 * n")
     legacy = _function("src/ops/rpu_linear.cpp", "Tensor rpu_linear_with_core_count(")
     assert "rpu_linear_with_accumulation(" in legacy
     assert "partition, num_cores, true, c10::nullopt" in legacy
@@ -916,16 +923,17 @@ int main() {
 def test_explicit_linear_public_caller_validates_before_allocating_and_returns_fresh(tmp_path):
     compiler = shutil.which("g++")
     assert compiler, "Linear public-entry checks require g++"
+    header = (ROOT / "src/core/rpu_kernel_decls.h").read_text()
+    begin = header.index("at::Tensor rpu_linear_with_accumulation(")
     functions = "\n".join((
         _function("src/ops/rpu_linear.cpp", "static void check_linear_shapes("),
         _function("src/ops/rpu_linear.cpp", "void validate_parallel_linear_geometry("),
         _function("src/ops/rpu_linear.cpp", "static void check_linear_w4a16_operands("),
+        # The public declaration carries the gelu_erf default the callers omit.
+        header[begin:header.index(";", begin) + 1],
         _function("src/ops/rpu_linear.cpp", "Tensor rpu_linear_with_accumulation("),
         _function("src/ops/rpu_linear.cpp", "Tensor rpu_linear_with_core_count("),
     ))
-    declarations = (ROOT / "src/core/rpu_kernel_decls.h").read_text()
-    begin = declarations.index("at::Tensor rpu_linear_with_accumulation(")
-    functions = declarations[begin:declarations.index(";", begin) + 1] + "\n" + functions
     # As in test_qwen3vl_transport_contract, use a small tensor double while
     # compiling the production body. The kernel recorder checks dispatch and
     # output ownership; it does not pretend to compute GEMM or swizzled weights.
@@ -949,6 +957,9 @@ int allocations = 0, copies = 0, launches = 0, last_cores = 0, last_partition = 
 int retained_scales = 0;
 bool last_acc32 = false;
 std::shared_ptr<int> last_scale;
+enum class GeluMode { NONE, TANH, ERF };
+struct LinearConv1dSlab;
+GeluMode last_epilogue = GeluMode::TANH;
 namespace at {
 enum ScalarType { kHalf, kFloat, kChar, kByte };
 constexpr int kPrivateUse1 = 1;
@@ -997,8 +1008,10 @@ Tensor rpu_retain_linear_quant_scale(const Tensor& weight, const Tensor& scale, 
 void rpu_launch_linear_ddr_kernel(const Tensor& input, const Tensor& weight,
         Tensor& output, const Tensor& bias, bool has_bias, int partition,
         const uint64_t* live_dst, int64_t offset, const uint64_t* live_bias, int cores,
-        const Tensor& scale, c10::optional<bool> linear_acc32) {
-    assert(!live_dst && !live_bias && offset == 0);
+        const Tensor& scale, c10::optional<bool> linear_acc32,
+        const LinearConv1dSlab* conv_slab, GeluMode epilogue) {
+    assert(!live_dst && !live_bias && offset == 0 && !conv_slab);
+    last_epilogue = epilogue;
     assert(input.dim() == 2 && output.dim() == 2 && input.dense);
     const bool packed = weight.scalar_type() == at::kByte;
     assert(input.size(0) == output.size(0));
@@ -1030,7 +1043,12 @@ int main() {
         // without changing core geometry or handing out shared output storage.
         for (bool acc32 : {false, true, false}) {
             auto explicit_first = rpu_linear_with_accumulation(input, weight, bias, 1, cores, acc32, {});
+            assert(last_epilogue == GeluMode::NONE);
             const int retained_value = *explicit_first.storage;
+            // The merger fc1 epilogue reaches the col launcher as exact ERF.
+            auto activated = rpu_linear_with_accumulation(input, weight, bias, 1, cores, acc32, {}, -1, true);
+            assert(activated.shape == first.shape && last_epilogue == GeluMode::ERF);
+            assert(last_cores == cores && last_partition == 1 && last_acc32 == acc32);
             auto explicit_second = rpu_linear_with_accumulation(input, weight, {}, 1, cores, acc32, {});
             assert(explicit_first.shape == first.shape && last_acc32 == acc32 && !last_scale);
             assert(explicit_first.storage != explicit_second.storage && *explicit_first.storage == retained_value);
@@ -1042,6 +1060,9 @@ int main() {
             quant_weight.opts.value = at::kChar;
             auto quant = rpu_linear_with_accumulation(input, quant_weight, bias, 1, cores, acc32, scale);
             assert(quant.shape == first.shape && last_scale == scale.storage);
+            assert(last_epilogue == GeluMode::NONE);
+            rpu_linear_with_accumulation(input, quant_weight, bias, 1, cores, acc32, scale, -1, true);
+            assert(last_scale == scale.storage && last_epilogue == GeluMode::ERF);
             assert(last_cores == cores && last_partition == 1 && last_acc32 == acc32);
         }
     }
@@ -1056,11 +1077,11 @@ int main() {
     }
     auto reject = [&](Tensor x, Tensor w, c10::optional<Tensor> b, int64_t part, int64_t cores) {
         const int before = allocations, before_copies = copies, before_launches = launches;
-        for (int mode : {-1, 0, 1}) {
+        for (int mode : {-1, 0, 1, 2}) {
             bool rejected = false;
             try {
                 if (mode < 0) rpu_linear_with_core_count(x, w, b, part, cores);
-                else rpu_linear_with_accumulation(x, w, b, part, cores, mode == 1, {});
+                else rpu_linear_with_accumulation(x, w, b, part, cores, mode == 1, {}, -1, mode == 2);
             } catch (const std::runtime_error&) { rejected = true; }
             assert(rejected && allocations == before && copies == before_copies && launches == before_launches);
         }
@@ -1080,6 +1101,16 @@ int main() {
     wrong_bias = bias; wrong_bias.opts.value = at::kFloat; reject(input,weight,wrong_bias,1,4);
     reject(input,weight,Tensor({}),1,4); reject(input,weight,Tensor({1}),1,4);
     reject(input,packed_weight,{},1,8); // Packed weights require an explicit scale before allocation.
+    // A row-partition core holds partial sums: the GELU epilogue is refused
+    // before any allocation, so it can never run on them.
+    {
+        Tensor row_input({16,3072}), row_weight({1024,3072});
+        const int before = allocations, before_launches = launches;
+        bool rejected = false;
+        try { rpu_linear_with_accumulation(row_input, row_weight, {}, 0, 4, true, {}, -1, true); }
+        catch (const std::runtime_error&) { rejected = true; }
+        assert(rejected && allocations == before && launches == before_launches);
+    }
     graph_dma::capturing = true; reject(input,weight,{},1,4);
 }
 '''.replace("__FUNCTIONS__", functions)

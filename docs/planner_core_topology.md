@@ -24,11 +24,11 @@ choices during installation; callers do not construct their own combinations.
 
 | Family | Reduced-core configuration |
 |---|---|
-| Qwen3 FP16 | Exact 0.6B, 1.7B, 4B and 8B geometries; standard causal positions and batch one. Quantized recipes have separate admission. |
-| Qwen3-VL FP16 | Exact 2B, 4B and 8B geometries, batch one. Vision uses four cores; text uses the dense table. |
-| Qwen3.5 dense | The 0.8B, 2B, 4B and 9B profiles select text, GDN and vision topology together. Reduced vision uses four cores. The 0.8B eight-core vision owner uses attention on four cores and MLP on eight. Quantized and official 27B profiles follow their own template limits. |
-| Qwen3.5 35B-A3B mixed E4M3 | Budgets 4/6/8. At six, attention, GDN, router projection, head and vision use four; routed/shared expert work uses six. RTN/GPTQ recipes are separate. |
-| Pi0.5 generic | Reduced vision, attention and conditioning use four cores; the MLP uses the selected four/six-core recipe. Optimized profiles retain their eight-core admission. |
+| Qwen3 / Llama / Gemma4 | Budgets 4/6/8 across Qwen3 0.6B–32B (FP16, W8A16, W4A16 G32, NVFP4 per recipe), Llama 3.2-1B (6-core MLP padded `8192 → 8256`), and Gemma4 E4B (2-core attention, 4/6-core MLP with `10240 → 10272` at 6 cores). |
+| Qwen3-VL / DINOv3 | Budgets 4/6/8 across Qwen3-VL 2B–32B (including Vision W8/W4/NVFP4 on four Vision lanes at reduced budgets) and DINOv3 ViT-B (FP16, W8A16, W4A16 G32). |
+| Qwen3.5 dense & 35B-A3B | Budgets 4/6/8 for dense 0.8B–27B (per template recipe; 27B W4 group32 stays 8-core) and 35B-A3B mixed-E4M3 / RTN-W8A16 (`(4,6,4)` expert split at budget 6). |
+| Qwen3 ASR / TTS | Budgets 4/6/8 for 0.6B and 1.7B across FP16, W8A16, W4A16 G32 and NVFP4; audio encoder and codec Transformer use four cores at budgets 4/6. |
+| Pi0.5 & VLA families | Budgets 4/6/8 for all 29 Pi0.5 LIBERO/Kuavo templates (except T32 full-prefix W8A8), G0.5 K1, GR00T-N1.7, HyVLA, HY-Embodied, InternVLA-N1, LingBot v2, RhinoVLA v3, and Wall-OSS Base/RTC/Sorting (except Sorting Action W4 G32). Legacy fixtures and HALO remain 8-core. |
 
 Use the [configuration catalog](../examples/configs/CONFIGURATIONS.md) for the
 checkpoint, precision and input limits of each entry. For official Qwen3.5-27B,

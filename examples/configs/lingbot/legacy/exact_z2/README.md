@@ -17,4 +17,11 @@ python examples/run.py --config examples/configs/lingbot/legacy/exact_z2/6b/w8a1
 
 配置检查只确认语法和 profile。此配置只覆盖上述固定输入，结论不能推广到普通 v2 输入。
 
-`input.observation` 是复现历史 exact-Z2 记录用的固定输入（三路 256×256 图像、真实前缀长度在 215–225 之间）。仓库内没有生成这种文件的脚本，也没有随仓库发布该文件；没有原始文件时请使用 [v2 配置](../../v2/README.md)。
+`input.observation` 是复现历史 exact-Z2 记录用的固定输入。仓库内没有生成这种文件的脚本，也没有随仓库发布该文件。
+
+- **文件契约**：`torch.save` 的 tensor 字典，以 `weights_only=True` 加载，键名不做改写。必需键 `images` float `[3,256,1536]`、`lang_tokens` int64 `[1,L]`、`state`、`noise`；可选 `img_masks` bool `[3]`（须全为 true）与 `lang_masks` bool `[1,L]`。
+- **长度**：真实前缀为 3×66+16+T 行，须在 215–225 之间，所以有效指令 token 数 T 只能是 1–11，相机必须是 3 路 256×256。
+- **原始输入**：也可以删除 `observation` 行，改填 `images`（3 张）、`instruction`、`proprioception`，noise 由 `input.seed` 生成；这种写法没有对应的 CPU golden。
+- **检查时机**：`--check-config` 不检查这些字段，不符合时在运行时报错。
+
+其他相机数或指令长度（如 2 路或 T64）超出此配置范围，请使用 [v2 配置](../../v2/README.md)。

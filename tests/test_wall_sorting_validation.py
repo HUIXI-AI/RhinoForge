@@ -27,10 +27,16 @@ def published_libraries(tmp_path):
 
 @pytest.fixture(params=['base', 'sorting'])
 def cold_caller(request):
-    if request.param == 'sorting':
-        return lambda root, paths: VALIDATION.configure_exact_all_on(root, SimpleNamespace(mode='fp16', so=paths['native'], main_ref=paths['main'], expansion=paths['expansion']))
-    engine = importlib.import_module('examples.runners.wall_oss.base_engine')
-    return lambda root, paths: engine.cold_environment(SimpleNamespace(mode='candidate', precision='fp16', components='action', vision_pair=False, action_residency=False, vision_window=False, so=paths['native'], main_ref=paths['main'], expansion_ref=paths['expansion']), root)
+    if request.param == "sorting":
+        return lambda root, paths: VALIDATION.configure_exact_all_on(root, SimpleNamespace(
+            mode="fp16", so=paths["native"], main_ref=paths["main"], expansion=paths["expansion"],
+            num_cores=8))
+    engine = importlib.import_module("examples.runners.wall_oss.base_engine")
+    return lambda root, paths: engine.cold_environment(SimpleNamespace(
+        mode="candidate", precision="fp16", components="action", vision_pair=False,
+        action_residency=False, vision_window=False, so=paths["native"],
+        main_ref=paths["main"], expansion_ref=paths["expansion"]), root)
+
 
 def test_runner_rejects_inherited_unsafe_override_before_profile_mutation(monkeypatch):
     monkeypatch.setenv('RPU_CHUNK_FORCE_UNSAFE', '1')

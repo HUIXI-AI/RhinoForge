@@ -182,7 +182,7 @@ struct KernelCache {
     static KernelCache& instance() {static KernelCache c;return c;}
     void* get(KernelId) {return this;}
 };
-constexpr int kRoutedUint4Mode=6, kResidentMaxRoutes=32767;
+constexpr int kRoutedUint4Mode=6, kRoutedInt8Mode=1, kResidentMaxRoutes=32767;
 int64_t Align(int64_t n,int64_t a) {return (n+a-1)/a*a;}
 void rpu_ddr_flush_force_sized(void*,int64_t) {}
 struct Qwen3_5MoeModel {
@@ -258,6 +258,13 @@ int main() {
            cold.resident_route_ordinals_.storage==uint4_owner);
     cold.resolved=64;
     rejects([&] {cold.set_linear_acc32(false);});
+    // Installed routed INT8 owners keep the same ACC16-only rule.
+    Qwen3_5MoeModel int8;int8.moe_layer_weights_.assign(40,{1});
+    const auto int8_generation=int8.invalidations;
+    rejects([&] {int8.set_linear_acc32(true);});
+    assert(!int8.linear_acc32_ && int8.invalidations==int8_generation);
+    int8.set_linear_acc32(false);
+    assert(!int8.linear_acc32_);
     // TP4/8's aligned owners support both modes without replacement.
     for(int cores:{4,8}) {
         Qwen3_5MoeModel aligned;aligned.cores=cores;

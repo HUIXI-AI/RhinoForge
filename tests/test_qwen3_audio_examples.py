@@ -151,6 +151,55 @@ def test_runner_records_results_and_closes_on_failure(tmp_path, monkeypatch, fai
             {"talker": float(call), "codec_decode": 1.0, "other": 0.5} for call in (3, 4, 5)]
 
 
+@pytest.mark.parametrize("seconds,extra,error", [
+    (2, {}, None), (None, {}, None), (4, {}, "not padded"),
+    (2, {"reference_text": "整段转写"}, "whole recording"), (3, {"reference_text": "整段转写"}, None),
+])
+def test_asr_audio_seconds_keeps_the_recording_start(tmp_path, monkeypatch, seconds, extra, error):
+    from dataclasses import dataclass
+    import numpy as np
+    import soundfile as sf
+    from rpu_backend import api
+    from examples.common import libraries
+
+    wave = np.random.default_rng(0).uniform(-0.5, 0.5, 48000).astype(np.float32)  # 3 s at 16 kHz
+    sf.write(tmp_path / "speech.wav", wave, 16000, subtype="FLOAT")
+    cfg = config.load_config(ROOT / "examples/configs" / TEMPLATES[0])
+    cfg["input"].update(audio=str(tmp_path / "speech.wav"), **extra)
+    if seconds is not None:
+        cfg["input"]["audio_seconds"] = seconds
+    cfg["run"].update(warmup=0, runs=2, output_dir=str(tmp_path / "out"))
+    monkeypatch.setattr(libraries, "current_libraries", lambda root: ({}, {}))
+    monkeypatch.setattr(runner, "configure_cpu_threads", lambda value: {})
+
+    @dataclass
+    class Transcript:
+        text: str
+
+    heard = []
+    class Model:
+        def transcribe(self, audio, *, sample_rate, max_new_tokens):
+            heard.append(audio.copy())
+            return Transcript("你好")
+        def execution_stats(self):
+            return {"graph_invariant_ok": True, "audio_graph_invariant_ok": True}
+        def close(self):
+            pass
+    monkeypatch.setattr(api, "Qwen3ASRModel", SimpleNamespace(from_pretrained=lambda *a, **kw: Model()))
+    runner.validate_example_config(cfg)
+    if error:
+        with pytest.raises(ValueError, match=error):
+            runner.run_example_config(cfg)
+        assert not heard
+        return
+    assert runner.run_example_config(cfg) == 0
+    kept = 48000 if seconds is None else seconds * 16000
+    assert len(heard) == 2 and all(np.array_equal(audio, wave[:kept]) for audio in heard)
+    report = json.loads((tmp_path / "out/report.json").read_text())
+    assert report["input_identity"]["frames"] == 48000 and report["input_identity"]["used_frames"] == kept
+    assert report["audio_seconds_runs"] == [kept / 16000] * 2
+
+
 def test_speech_summary_uses_rtf_not_token_rate():
     from examples.common.performance import summary
     lines = summary({"qwen3_tts": {}}, {"execution": {"status": "COMPLETED"}, "median_rtf": 0.9})

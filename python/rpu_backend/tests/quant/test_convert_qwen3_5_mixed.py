@@ -13,6 +13,7 @@ from safetensors.torch import load_file, save_file
 _QUANT = Path(__file__).resolve().parents[2] / "quant"
 sys.path.insert(0, str(_QUANT))
 import convert_qwen3_5 as convert  # noqa: E402
+import precision_recipes  # noqa: E402
 
 
 def _mini_checkpoint(path):
@@ -46,6 +47,8 @@ def test_mixed_converter_emits_declared_tensor_formats(tmp_path):
         src, dst, profile="w4_main_w8_gdn"
     )
     assert not (dst / "SHA256SUMS").exists()
+    # No registered recipe is this mix, so the output carries no record.
+    assert stats["recipe"] is None and precision_recipes.read_record(dst) is None
 
     with (dst / "config.json").open() as f:
         quant_config = json.load(f)["quant_config"]
@@ -151,6 +154,17 @@ def test_uniform_v1_converter_remains_supported(tmp_path):
             convert.W4A16_PGRP: 15 if method == convert.W4A16_PGRP else 0,
         }
         assert stats["n_quantized"] == 15
+        assert precision_recipes.read_record(dst) == ("qwen3_5", convert.produced_recipe(method=method))
+    assert precision_recipes.read_record(tmp_path / convert.W8A16) == ("qwen3_5", "w8a16_text")
+
+    # A requested recipe the arguments do not produce fails before any output exists.
+    with pytest.raises(ValueError, match="produce qwen3_5/w8a16_text, not qwen3_5/w4a16_mlp_rtn_g32"):
+        convert.convert_checkpoint(src, tmp_path / "wrong", method=convert.W8A16, recipe="w4a16_mlp_rtn_g32")
+    assert not (tmp_path / "wrong").exists()
+    # A record copied with the source sidecars never labels a different conversion.
+    precision_recipes.write_record(src, "qwen3_5", "fp16")
+    convert.convert_checkpoint(src, tmp_path / "again", profile="w8_main_w8_gdn")
+    assert precision_recipes.read_record(tmp_path / "again") is None
 
 
 def test_mlp_only_cli_preserves_uniform_mlp_codes_and_source_float_precision(tmp_path):
@@ -165,7 +179,11 @@ def test_mlp_only_cli_preserves_uniform_mlp_codes_and_source_float_precision(tmp
     assert not torch.equal(source[norm_key].half(), source[norm_key].bfloat16().half())
 
     assert convert.main(["--src", str(src), "--dst", str(dst),
-                         "--profile", "w4_mlp_only"]) == 0
+                         "--recipe", "w4a16_mlp_rtn_g32"]) == 0
+    assert precision_recipes.read_record(dst) == ("qwen3_5", "w4a16_mlp_rtn_g32")
+    with pytest.raises(SystemExit):
+        convert.main(["--src", str(src), "--dst", str(tmp_path / "x"),
+                      "--recipe", "w4a16_mlp_rtn_g32", "--group-size", "32"])
     convert.convert_checkpoint(src, uniform, method=convert.W4A16_PGRP)
     tensors = load_file(dst / "model.safetensors")
     uniform_tensors = load_file(uniform / "model.safetensors")

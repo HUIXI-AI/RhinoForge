@@ -93,15 +93,16 @@ def _exercise(monkeypatch, tmp_path, target, warmup=None):
 def test_runnable_catalog_templates_include_replay_warmup():
     from _example_toml import load_example_toml
 
-    checked = 0
+    checked = set()
     for path in (ROOT / "examples/configs").rglob("*.toml"):
         config = load_example_toml(path)
         if "example" in config or "pi05" in config:
-            checked += 1
+            checked.add("example" if "example" in config else "pi05")
             assert config["run"]["warmup"] >= 2, path
             assert config["run"].get("warmup_decode_steps", config["input"].get("decode_steps")) == config["input"].get("decode_steps"), path
-    # Guard against a layout change silently turning this into a no-op.
-    assert checked >= 140, checked
+    # Guard against a layout change silently turning this into a no-op,
+    # without pinning the template count, which changes as presets merge.
+    assert checked == {"example", "pi05"}, checked
 
 
 @pytest.mark.parametrize("template", [

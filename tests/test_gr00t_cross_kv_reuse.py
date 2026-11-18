@@ -66,7 +66,7 @@ struct LayoutContext { int64_t chunk_size=41,batch_size=1;
     AttentionExecutionPolicy attention_policy=AttentionExecutionPolicy::DDR_KV; };
 struct PadPlan { int64_t physical; int64_t physical_rows() const { return physical; } };
 std::vector<std::pair<uint32_t,int64_t>> memsets;
-void rpu_launch_memset_spm_multicore(uint32_t address,int64_t elements) { memsets.push_back({address,elements}); }
+void rpu_launch_memset_spm_multicore(uint32_t address,int64_t elements,int=8) { memsets.push_back({address,elements}); }
 __CONSTANTS__
 __ENV_READER__
 struct ChunkInfo { int64_t len=41, idx=0; };
@@ -111,6 +111,7 @@ struct Model {
     int64_t num_kv_heads() const { return kv; }
     int64_t head_dim() const { return hd; }
     int64_t attn_tp() const { return NUM_CORES; }
+    int num_cores() const { return NUM_CORES; }
     uint32_t addr(int, const char* name) const {
         const std::string slot(name);
         if (slot=="cross_k_bank") return 0x10200000;

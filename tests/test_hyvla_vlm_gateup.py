@@ -413,7 +413,7 @@ int main(){
 def test_actual_cold_binding_loads_private_marker_before_querying_availability(tmp_path):
     method = block(DECODER, "void HyVlaVlmModel::set_runtime_config(").replace("HyVlaVlmModel::", "")
     source = COMMON + r'''
-constexpr unsigned MOT_NOMERGE_QKV=1,MOT_NOMERGE_MLP=2,RPU_RMSNORM_CAP_ALL=7;
+constexpr unsigned MOT_NOMERGE_QKV=1,MOT_NOMERGE_MLP=2,RPU_RMSNORM_CAP_BASE=1,RPU_RMSNORM_CAP_ALL=7;
 struct RpuRmsNormSpmContract {uint32_t capability=0;};
 bool rpu_rmsnorm_capability_valid(uint32_t c){return c&1;}
 RpuRmsNormSpmContract rpu_snapshot_rmsnorm_spm_contract(uint32_t c){return {c};}
@@ -439,7 +439,8 @@ struct Model {
  bool cold_row_merge_available_=false,cold_paired_rmsnorm_available_=false;
  bool cold_paired_rmsnorm_v32_available_=false;
  bool cold_fast_replay_preload_=false,cold_mask_once_=false,cold_partial_rope_=false,cold_silu_mul_=false;
- unsigned cold_mot_norm_nomerge_=0;std::vector<int> text_layers_;
+ unsigned cold_mot_norm_nomerge_=0;std::vector<int> text_layers_;int cores=8;
+ int num_cores()const{return cores;}
  RpuRmsNormSpmContract cold_rmsnorm_spm_contract_;int invalidations=0;
  void invalidate_model_state(){++invalidations;}
  METHOD
@@ -465,6 +466,11 @@ int main(){
   assert(m.cold_vision_gu176_available_==w8_marker);
   assert(m.cold_w8_vlm_gateup_available_==(w8_marker&&payload));
  }
+ // A reduced-core child admits only the BASE RMSNorm and refuses before binding.
+ Model reduced;reduced.cores=4;bool refused=false;
+ try{reduced.set_runtime_config(true,true,true,true,3,false,3);}catch(const std::exception&){refused=true;}
+ assert(refused && !reduced.cold_config_bound_ && reduced.invalidations==0);
+ reduced.set_runtime_config(true,true,true,true,3,false,1);assert(reduced.cold_config_bound_);
 }
 '''
     compile_run(tmp_path, "vlm_gateup_cold", source.replace("METHOD", method))

@@ -385,6 +385,7 @@ struct Harness {
     bool has_patch_emb_=true;
     int64_t patch_embed_cores_=8,pe_cin_orig_=3,pe_cin_padded_=16,pe_cout_=1152;
     int64_t pe_kh_=16,pe_kw_=16,pe_strideh_=16,pe_stridew_=16,orig_head_dim_=72;
+    int num_cores()const{return 8;}
     int64_t layers=27,h=1152,inter=4352,q=16,kv=16,hd=80;
     std::vector<int>layer_weights_=std::vector<int>(27);
     const Context&ctx()const{return context;}

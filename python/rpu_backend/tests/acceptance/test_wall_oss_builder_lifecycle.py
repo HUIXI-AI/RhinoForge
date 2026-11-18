@@ -707,6 +707,8 @@ def test_rtc_w8a16_keeps_only_the_overflow_boundaries_fp16(
         "window": True,
         "w8a16": True,
         "fp16_ckpt_dir": "/models/v728-fp16",
+        "num_cores": 8,
+        "per_window_sdpa": False,
         "rmsnorm_fixed32": True,
     }
     assert calls[3][2]["execution_config"] == {
@@ -804,6 +806,8 @@ def test_rtc_w4a16_routes_exact_three_checkpoint_composition(monkeypatch):
         "w8a16": True,
         "fp16_ckpt_dir": "/models/v728-fp16",
         "execution_config": {"vision": {"chunk_size": "auto"}},
+        "num_cores": 8,
+        "per_window_sdpa": False,
     }
     assert built.execution_config == {}
     assert built.action is fake_action
@@ -1072,7 +1076,7 @@ def test_action_residency_failure_preserves_pending_resources(monkeypatch, failu
     store = SimpleNamespace(get_tensor=lambda _: weight)
     fused = {name: weight for name in ("w_comb", "w3", "proj_back", "w2_t", "w2_a")}
     fused.update(action_dim=26, k_comb_pad=16)
-    monkeypatch.setattr(action, "_eff_attn_tp", lambda _: 8)
+    monkeypatch.setattr(action, "_eff_attn_tp", lambda _, num_cores=8: 8)
     monkeypatch.setattr(action, "_split_qkv", lambda value, *_: (value, value, value))
     for name in ("_replicate_kv", "_to_rpu_half", "_to_rpu_int8", "_chan_first_scale",
                  "tp_col_swizzle_mc_weight", "tp_row_swizzle_mc_weight"):

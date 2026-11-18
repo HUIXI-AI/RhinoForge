@@ -1,6 +1,7 @@
 # 未写出的执行参数（省略即按以下值运行）：
 #   [cpu].threads 省略时不设置线程：PyTorch 使用环境变量 OMP_NUM_THREADS，未设置时使用全部 CPU 核（参考板 24）；2026-10-19 测量环境预设为 16。
-#   rpu_execution.model.num_cores 固定 8 核（可显式写 8；4/6 核不支持，原因见模型页配置表）。
+#   rpu_execution.model.num_cores 省略为 8；可写 4 / 6（[rpu_execution.model] 中的 num_cores），修改后需重新加载模型：文本为 Attention 4、MLP 4/6，Vision 和动作专家用 4 核；
+#     分拣调度（W16 复用、FP16 传输、SiLU 融合、权重驻留、混合精度等）只有 8 核实现，4/6 核走通用路径，Vision 与专家 0 残差流按 1/4 缩放。
 #   分块（chunk_size）模板未写出，按 auto 由入口选择；2026-10-19 模板默认输入实测：vision 576、prefill 320、action 32。可调范围见模型页。
 # 仅适用于快递分拣 WRC v728 模型；资产与输入格式见 README.md。
 # W8 checkpoint 必须与本文件的 FP16 源 checkpoint 配套。

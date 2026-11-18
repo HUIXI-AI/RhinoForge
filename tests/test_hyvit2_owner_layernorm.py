@@ -117,6 +117,7 @@ struct HostContext {FmbPhysicalManifestConsumer consumer;AttentionExecutionPolic
  const FmbRouteManifestEntry& consume_physical_route(FmbRouteFamily f,int64_t s,int64_t r,int64_t flags,at::IntArrayRef a,int64_t i)const{return consumer.consume_route(f,s,r,flags,a,i);}};
 struct Owner {
  bool cold_owner_layernorm_=true,cold_kv_spm_only_=true,cold_per_image_attention_=false;
+ int num_cores()const{return NUM_CORES;}
  struct {bool kvpad16=true;} cold_config_;
  int64_t image_batch_count_=2,orig_head_dim_=72;double eps_=1e-6;
  int layers=27,width=1152;HostContext state;
@@ -247,6 +248,7 @@ struct KernelCache {
 struct Owner {
  bool cold_kv_spm_only_=true,cold_per_image_attention_=false,cold_owner_layernorm_=false;
  bool cold_config_bound_=false,production_config_bound_=false;int invalidations=0;
+ int num_cores()const{return 8;}
  struct {bool fast_replay,fast_replay_preload,mask_once,kvpad16,q_inplace;}cold_config_;
  void invalidate_model_state(){++invalidations;}
 '''+method+r'''

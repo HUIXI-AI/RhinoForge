@@ -24,7 +24,7 @@ def test_actual_down_next_norm_complete_and_layer_boundaries(tmp_path):
     layer = DECODER[DECODER.index('    void build_layer_subgraph('):]
     start = layer.index('        TORCH_CHECK(!wall_base_nvfp4_down_ring_norm ||')
     input_guard = layer[start:layer.index(';', start)+1]
-    input_condition = layer.split('        if (layer_idx == 0 ||', 1)[1].split(') {', 1)[0]
+    input_condition = layer.split('(layer_idx == 0 ||', 1)[1].split(')) {', 1)[0]
     input_condition = 'layer_idx == 0 ||' + input_condition
     skip_down = layer.split('/*skip_down=*/', 1)[1].split(',', 1)[0]
     down_emit = block(layer, 'if (wall_base_nvfp4_down_ring_norm && !is_last_layer) {')

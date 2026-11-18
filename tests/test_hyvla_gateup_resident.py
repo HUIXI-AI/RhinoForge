@@ -1684,6 +1684,7 @@ struct Model {
  bool cold_fast_replay_=false,cold_fast_replay_preload_=false,cold_mask_once_=false;
  bool cold_silu_mul_=false,cold_kvpad16_=false,cold_partial_rope_=false,cold_rmsnorm_pad16_=false;
  bool cold_paired_kv_available_=false;RpuRmsNormSpmContract cold_rmsnorm_spm_contract_{};
+ int num_cores()const{return 8;}
  int invalidations=0;void invalidate_model_state(){++invalidations;}
  METHOD
 };

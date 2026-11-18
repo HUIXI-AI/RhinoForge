@@ -38,7 +38,7 @@ def test_ring_xor3_model_admission_descriptor_and_lifecycle(tmp_path):
 #define NUM_CORES 8
 template<class F>void rejects(F f){try{f();assert(false);}catch(const std::runtime_error&){}}
 namespace at {
-enum Type{kChar,kHalf};constexpr int kPrivateUse1=1;
+enum Type{kChar,kHalf,kByte};constexpr int kPrivateUse1=1;
 struct Device{int value=1;int type()const{return value;}};
 struct Tensor{int id=0;bool live=true,contiguous=true;Type dtype=kChar;Device dev;std::vector<int64_t>shape{1536,1536};
  bool defined()const{return live;}bool is_contiguous()const{return contiguous;}Type scalar_type()const{return dtype;}
@@ -66,7 +66,7 @@ struct Context{
   if(site==GR00T_DIT_FF_RING_XOR3_SITE)events.push_back("consume-ff");
  }
 };
-int64_t fmb_ring_all_reduce_route_selector(int64_t rows,int64_t cols){return ((rows*cols+7)/8+15)/16*16*2<11*1024?1:2;}
+int64_t fmb_ring_all_reduce_route_selector(int64_t rows,int64_t cols,int=8){return ((rows*cols+7)/8+15)/16*16*2<11*1024?1:2;}
 constexpr uint32_t O=0x10000000,R1=0x10020000,R2=0x10040000,NORM=0x10060000;
 constexpr uint32_t GAMMA=0x10080000,BETA=0x10081000,SDPA=0x10082000,MID=0x10090000;
 int fused=0,ordinary_ring=0,ordinary_ln=0,expected_layer=0,expected_rows=41,producer=0;
@@ -108,13 +108,14 @@ struct Model{
  }
  int64_t get_last_resolved_chunk_size()const{return resolved;}int64_t num_layers()const{return layers;}
  int64_t hidden_size()const{return h;}int64_t intermediate_size()const{return ff;}
- int64_t num_q_heads()const{return q;}int64_t num_kv_heads()const{return kv;}int64_t head_dim()const{return hd;}int64_t attn_tp()const{return tp;}
+ int64_t num_q_heads()const{return q;}int64_t num_kv_heads()const{return kv;}int64_t head_dim()const{return hd;}int64_t attn_tp()const{return tp;}int num_cores()const{return NUM_CORES;}
  Context&ctx(){return context;}
  uint32_t addr(int,const char*n){std::string s(n);if(s=="oproj")return O;if(s=="residual1")return R1;if(s=="residual2")return R2;if(s=="norm_hidden")return NORM;if(s=="ln_ones")return GAMMA;if(s=="ln_zeros")return BETA;if(s=="sdpa_out")return SDPA;assert(s=="ff_mid");return MID;}
  uint32_t layer_addr(int layer,int,const char*n){std::string s(n);int offset=s=="out_bias"?0:s=="ff1_bias"?512:1024;return 0x10600000+layer*1536+offset;}
  bool ff1_resident_selected()const{return false;}
  std::vector<int64_t>ff1_resident_arguments(int64_t,int64_t)const{return {};}
  void emit_layer_output_dma(int,const ChunkInfo&){assert(false);}
+ void add_row_bias_partial(uint32_t,int64_t,int64_t){assert(false);}
  __METHODS__
  void record(const ChunkInfo&chunk){LayoutContext layout{context.batch_size};context.routes.clear();
   auto append=[&](FmbRouteFamily family,int64_t site,int64_t selector,std::vector<int64_t>args=std::vector<int64_t>{}){
@@ -235,7 +236,7 @@ def test_ring_xor3_preserves_projection_norm_ffn_and_spm_contract():
     assert finish.index("lw.to_out_ws") < finish.index("emit_attn_ring_xor3(") < finish.index("ff1_resident_selected(")
     assert 'addr(0, "oproj"), addr(0, "residual2"), addr(0, "residual1")' in finish
     assert 'addr(0, "norm_hidden"), lw.ff1_w' in finish
-    assert 'seq_len, h, 1e-5, false, 0, NUM_CORES' in finish
+    assert 'seq_len, h, 1e-5, false, 0, num_cores()' in finish
     assert "ring_xor3" not in _definition(source, "std::vector<BufferDecl> baseline_buffer_declarations(")
     assert "ring_xor3" not in _definition(source, "std::vector<BufferDecl> declare_buffers(")
     layout = _definition(source, "int64_t subclass_layout_hash(")

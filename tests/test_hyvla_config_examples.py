@@ -14,11 +14,18 @@ ROOT = Path(__file__).resolve().parents[1]
 CONFIGS = ROOT / "examples/configs/hy_vla"
 CONFIG_FILENAMES = {
     "fp16": "fp16", "w8a16": "w8a16", "w8a16_nvfp4": "w8a16_action_nvfp4",
+    "w4a16": "w4a16_rtn_g32_vision_w8a16", "w4a16_vision": "w4a16_rtn_g32",
 }
 
 
 def load(relative):
     return importlib.import_module(relative[:-3].replace("/", "."))
+
+
+def template(name, cameras=3):
+    """A HyVLA template (3 cameras); cameras=1/2 apply preset 1cam_t32/2cam_t32 of examples/inputs/vla.toml."""
+    return load("examples/common/config.py").load_config(
+        CONFIGS / f"{name}.toml", input_preset=None if cameras == 3 else f"{cameras}cam_t32")
 
 
 def test_configs_route_through_shared_entry_without_inheriting_certification(monkeypatch, capsys):
@@ -29,25 +36,35 @@ def test_configs_route_through_shared_entry_without_inheriting_certification(mon
     monkeypatch.setattr(importlib.import_module("examples.common.cli"), "_hyvla_runner", lambda: runner)
     paths = sorted(CONFIGS.rglob("*.toml"))
     expected = {(cameras, precision) for cameras in (2, 3) for precision in runner.PRECISIONS}
-    for path in paths:
-        config = common.load_config(path)
+    assert len(paths) == len(runner.PRECISIONS)
+    for path, cameras in ((path, cameras) for path in paths for cameras in (2, 3)):
+        config = template(path.stem, cameras)
         args = runner.example_arguments(config)
-        assert args.cpu_threads == 12
-        assert path == CONFIGS / f"{args.cameras}cam/{CONFIG_FILENAMES[args.precision]}.toml"
-        assert args.output_dir == Path(f"./hyvla_results/{args.cameras}cam/{args.precision}")
+        assert args.cpu_threads == 12 and args.cameras == cameras
+        assert path == CONFIGS / f"{CONFIG_FILENAMES[args.precision]}.toml"
+        assert args.output_dir == Path(f"./hyvla_results/{args.precision}")
         assert args.prefix_len == runner.prefix_rows(args.cameras, args.text_tokens)
         assert args.source == "synthetic" and args.batch is None
         assert common.example_metadata(config) is None
         env = runner.profile_environment(args)
-        assert env["RPU_HY_VLA_W4A16"] == "0"
+        assert env["RPU_HY_VLA_W4A16"] == {"w4a16": "vlm,expert",
+                                           "w4a16_vision": "vit,vlm,expert"}.get(args.precision, "0")
         assert env["RPU_HY_VLA_EXPERT_RESIDENT_FP8_SCALE_LAYERS"] == "0"
         assert args.rmsnorm_vwarp == env["RPU_RMSNORM_VWARP"] == "auto"
         if args.precision == "w8a16_nvfp4":
             assert env["RPU_HY_VLA_W8A16"] == "vit,vlm"
             assert env["RPU_HY_VLA_EXPERT_NVFP4"] == "1"
+        elif args.precision == "w4a16":
+            assert env["RPU_HY_VLA_W8A16"] == "vit"
+            assert env["RPU_HY_VLA_EXPERT_GATEUP_RESIDENT"] == "0"
+            assert env["RPU_HY_VLA_EXPERT_NVFP4"] == "0"
+        elif args.precision == "w4a16_vision":
+            assert env["RPU_HY_VLA_W8A16"] == "0"
+            assert env["RPU_HY_VLA_EXPERT_GATEUP_RESIDENT"] == "0"
+            assert env["RPU_HY_VLA_VISION_KV_SPM_ONLY"] == "0"
         else:
             assert env["RPU_HY_VLA_EXPERT_NVFP4"] == "0"
-        monkeypatch.setattr(sys, "argv", ["hy_vla.py", "--config", str(path)])
+        monkeypatch.setattr(sys, "argv", ["hy_vla.py", "--config", str(path), "--input", f"{cameras}cam_t32"])
         assert importlib.import_module("examples.common.cli").main() == 0
     assert len(seen) == len(expected)
     assert {(item["input"]["cameras"], item["hy_vla"]["precision"]) for item in seen} == expected
@@ -67,7 +84,7 @@ def test_configs_route_through_shared_entry_without_inheriting_certification(mon
 def test_public_cpu_setting_changes_only_thread_choice(fields, threads):
     common = load('examples/common/config.py')
     runner = load('examples/runners/hy_vla/optimized.py')
-    config = common.load_config(CONFIGS / '3cam/w8a16_action_nvfp4.toml')
+    config = common.load_config(CONFIGS / 'w8a16_action_nvfp4.toml')
     for section, values in fields.items():
         config.setdefault(section, {}).update(values)
     before = deepcopy(config)
@@ -85,7 +102,7 @@ def test_public_cpu_setting_changes_only_thread_choice(fields, threads):
 def test_invalid_cpu_setting_fails_before_cold_binding(fields, monkeypatch):
     common = load('examples/common/config.py')
     runner = load('examples/runners/hy_vla/optimized.py')
-    config = common.load_config(CONFIGS / '2cam/fp16.toml')
+    config = common.load_config(CONFIGS / 'fp16.toml')
     for section, values in fields.items():
         config.setdefault(section, {}).update(values)
     monkeypatch.setattr(runner, 'bind_libraries', lambda args: pytest.fail('CPU admission reached cold binding'))
@@ -95,7 +112,7 @@ def test_invalid_cpu_setting_fails_before_cold_binding(fields, monkeypatch):
 
 @pytest.mark.parametrize("section,key,value", [
     ("input", "text_tokens", 96), ("input", "text_tokens", 0), ("input", "text_tokens", True),
-    ("input", "cameras", 1), ("input", "cameras", 4),
+    ("input", "cameras", 0), ("input", "cameras", 4),
     ("input", "prefix_len", 128), ("run", "warmup", 2),
     ("input", "num_steps", 5), ("hy_vla", "precision", "nvfp4"),
     ("run", "kernel_count", 42), ("libraries", "main", "/main.ref"),
@@ -103,7 +120,7 @@ def test_invalid_cpu_setting_fails_before_cold_binding(fields, monkeypatch):
 def test_invalid_geometry_and_incomplete_artifacts_fail_before_load(section, key, value):
     common = load("examples/common/config.py")
     runner = load("examples/runners/hy_vla/optimized.py")
-    config = common.load_config(CONFIGS / "3cam/w8a16_action_nvfp4.toml")
+    config = common.load_config(CONFIGS / "w8a16_action_nvfp4.toml")
     if section == "libraries":
         # Artifact paths are caller-filled; the three roles remain atomic.
         config.pop("libraries", None)
@@ -113,16 +130,17 @@ def test_invalid_geometry_and_incomplete_artifacts_fail_before_load(section, key
 
 
 @pytest.mark.parametrize("precision", ["fp16", "w8a16", "w8a16_nvfp4", "w8a16_action_nvfp4"])
-@pytest.mark.parametrize("cameras", [2, 3])
+@pytest.mark.parametrize("cameras", [1, 2, 3])
 def test_prefix_admission_matches_resident_action_precision(precision, cameras):
     common = load("examples/common/config.py")
     runner = load("examples/runners/hy_vla/optimized.py")
-    config = common.load_config(CONFIGS / f"{cameras}cam/w8a16_action_nvfp4.toml")
+    config = template("w8a16_action_nvfp4", cameras)
     config["hy_vla"]["precision"] = precision
-    maximum = 192 if cameras == 2 else 240
+    maximum = {1: 128, 2: 192, 3: 240}[cameras]
     for text in (1, 7, 16, 32, 48, 64):
         config["input"]["text_tokens"] = text
-        minimum = ((2 + cameras * 58 + text + 15) // 16) * 16
+        # The action expert's admitted floor is 128 rows; one camera runs at it.
+        minimum = max(128, ((2 + cameras * 58 + text + 15) // 16) * 16)
         for prefix in ("auto", minimum, maximum):
             config["input"]["prefix_len"] = prefix
             args = runner.example_arguments(config)
@@ -167,16 +185,21 @@ def test_shared_core_table_maps_to_real_public_hyvla_execution_scopes():
                 prefix_len=args.prefix_len, packed_vision=True, entry_point="config runner")
             env = runner.profile_environment(args)
             assert env["RPU_HY_VLA_ATTN_TP8"] == env["RPU_HY_VLA_ACTION_MLP_MC"] == "1"
-            config["rpu_execution"] = {"model": {"num_cores": 4}}
-            with pytest.raises(ValueError, match="num_cores=8"):
-                runner.example_arguments(config)
+            # 4/6 cores: the VLM takes the budget, the other children four lanes.
+            for cores in (4, 6):
+                config["rpu_execution"] = {"model": {"num_cores": cores}}
+                args = runner.example_arguments(config)
+                _root, children = resolve_hy_vla_execution(args.rpu_execution, entry_point="config runner")
+                assert {component: child["model"]["num_cores"] for component, child in children.items()} == {
+                    "vision_encoder": 4, "language_model": cores, "action_expert": 4}
+                assert runner.profile_environment(args)["RPU_HY_VLA_ATTN_TP8"] == "0"
 
 
 @pytest.mark.parametrize("layers",[4,8])
 def test_resident_fp8_scale_config_binds_exact_cold_envelope(layers):
     common = load("examples/common/config.py")
     runner = load("examples/runners/hy_vla/optimized.py")
-    config = common.load_config(CONFIGS / "3cam/w8a16_action_nvfp4.toml")
+    config = common.load_config(CONFIGS / "w8a16_action_nvfp4.toml")
     config["hy_vla"]["resident_fp8_scale_layers"] = layers
     args = runner.example_arguments(config)
     env = runner.profile_environment(args)
@@ -217,7 +240,7 @@ def test_rmsnorm_config_routes_to_real_cold_plan_and_rejects_process_conflicts(m
     monkeypatch.setattr(importlib.import_module("examples.common.cli"), "_hyvla_runner", lambda: runner)
     expert = None
     for text in (16, 48):
-        path = CONFIGS / "3cam/w8a16_action_nvfp4.toml"
+        path = CONFIGS / "w8a16_action_nvfp4.toml"
         for mode, capability in (("auto", 7), ("16", 3)):
             config = common.load_config(path)
             config["input"]["text_tokens"] = text
@@ -241,7 +264,7 @@ def test_rmsnorm_config_routes_to_real_cold_plan_and_rejects_process_conflicts(m
             assert plan.native.expert == expert
             # The common entry passes this config to the same model runner.
             with monkeypatch.context() as routed:
-                routed.setattr(importlib.import_module("examples.common.cli"), "load_config", lambda _: config)
+                routed.setattr(importlib.import_module("examples.common.cli"), "load_config", lambda _, **__: config)
                 routed.setattr(sys, "argv", ["hy_vla.py", "--config", str(path)])
                 assert importlib.import_module("examples.common.cli").main() == 0
             assert seen[-1]["hy_vla"]["rmsnorm_vwarp"] == mode
@@ -267,7 +290,7 @@ def test_synthetic_input_uses_real_tokenizer_masks_and_config_geometry(cameras, 
     from rpu_backend.adapters.hy_vla.preprocess import prepare_language
     common = load("examples/common/config.py")
     runner = load("examples/runners/hy_vla/optimized.py")
-    config = common.load_config(CONFIGS / f"{cameras}cam/w8a16_action_nvfp4.toml")
+    config = template("w8a16_action_nvfp4", cameras)
     config["input"]["text_tokens"] = text
     args = runner.example_arguments(config)
     tokenizer = TinyTokenizer()
@@ -300,7 +323,7 @@ def test_synthetic_input_uses_real_tokenizer_masks_and_config_geometry(cameras, 
 def test_synthetic_seed_preserves_common_sensors_and_content_identity(tmp_path):
     common = load("examples/common/config.py")
     runner = load("examples/runners/hy_vla/optimized.py")
-    config = common.load_config(CONFIGS / "3cam/fp16.toml")
+    config = common.load_config(CONFIGS / "fp16.toml")
     args = runner.example_arguments(config)
     tokenizer = TinyTokenizer()
     original = runner.make_synthetic_batch(args, tokenizer)
@@ -328,7 +351,7 @@ def test_synthetic_seed_preserves_common_sensors_and_content_identity(tmp_path):
 def test_input_sources_reject_ambiguous_or_missing_input(updates):
     common = load("examples/common/config.py")
     runner = load("examples/runners/hy_vla/optimized.py")
-    config = common.load_config(CONFIGS / "3cam/fp16.toml")
+    config = common.load_config(CONFIGS / "fp16.toml")
     config["input"].update(updates)
     with pytest.raises(ValueError):
         runner.example_arguments(config)
@@ -337,7 +360,7 @@ def test_input_sources_reject_ambiguous_or_missing_input(updates):
 def test_legacy_batch_source_and_precision_alias_remain_accepted():
     common = load("examples/common/config.py")
     runner = load("examples/runners/hy_vla/optimized.py")
-    config = common.load_config(CONFIGS / "3cam/w8a16_action_nvfp4.toml")
+    config = common.load_config(CONFIGS / "w8a16_action_nvfp4.toml")
     config["input"].pop("source")
     config["input"]["batch"] = "/historical/3cam_t32.pt"
     config["hy_vla"]["precision"] = "w8a16_action_nvfp4"
@@ -418,7 +441,7 @@ def test_config_run_generates_and_replays_identical_input(monkeypatch, tmp_path,
     import rpu_backend.api
     common = load("examples/common/config.py")
     runner = load("examples/runners/hy_vla/optimized.py")
-    config = common.load_config(CONFIGS / f"{cameras}cam/{CONFIG_FILENAMES[precision]}.toml")
+    config = template(CONFIG_FILENAMES[precision], cameras)
     previous_threads = torch.get_num_threads()
     request.addfinalizer(lambda: torch.set_num_threads(previous_threads))
     monkeypatch.setenv('OMP_NUM_THREADS', '8')
@@ -561,7 +584,7 @@ def test_cold_config_rejects_conflict_and_unsafe_override(monkeypatch):
 def test_execution_and_cleanup_failure_preserve_primary_error_and_report(monkeypatch, tmp_path, failure):
     runner = load("examples/runners/hy_vla/optimized.py")
     common = load("examples/common/config.py")
-    config = common.load_config(CONFIGS / "2cam/fp16.toml")
+    config = common.load_config(CONFIGS / "fp16.toml")
     config["input"].update(checkpoint=str(tmp_path), text_tokens=7)
     config["run"].update(output_dir=str(tmp_path / "failed"), runs=3)
     primary = RuntimeError(f"{failure} failed")

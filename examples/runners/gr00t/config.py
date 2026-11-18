@@ -7,6 +7,33 @@ from __future__ import annotations
 
 import os
 
+# The GR00T mode by the resolved per-module specs of the profile's precision recipe.
+# W4 keeps Vision, the per-step glue and AdaLN in W8; W4 Vision packs Vision too.
+# The merger stays FP16 in every mode.
+ROUTE_PROBES = tuple((component,) for component in ("vision", "text", "vl_encoder", "dit", "glue", "merger", "adaln"))
+_W4 = "w4a16-g32-rtn"
+ROUTES = {
+    ("fp16",) * 7: "fp16",
+    ("w8a16",) * 5 + ("fp16", "w8a16"): "w8a16",
+    ("w8a16", _W4, _W4, _W4, "w8a16", "fp16", "w8a16"): "w4a16",
+    (_W4, _W4, _W4, _W4, "w8a16", "fp16", "w8a16"): "w4a16-vision",
+}
+W4_MODES = ("w4a16", "w4a16-vision")
+
+
+def precision_mode(example) -> str:
+    from examples.common.config import owner_route
+    # Both W4 recipes carry selector w4a16; the bound profile names the one.
+    return owner_route("GR00T", "gr00t", ROUTE_PROBES, ROUTES, selector=example.get("dtype"),
+                       profile_id=example.get("profile_id"))
+
+
+def precision_environment(mode) -> dict:
+    """The three build selectors of MODE; W4 needs the W8 switch for glue and AdaLN, W4 Vision needs W4."""
+    return {"RPU_GR00T_W8A16": "0" if mode == "fp16" else "1",
+            "RPU_GR00T_W4A16": "1" if mode in W4_MODES else "0",
+            "RPU_GR00T_VISION_W4A16": "1" if mode == "w4a16-vision" else "0"}
+
 
 def validate_config(config):
     inputs, example = config["input"], config["example"]
@@ -20,19 +47,19 @@ def validate_config(config):
         value = inputs.get(name)
         if type(value) is not int or value not in choices:
             raise ValueError(f"GR00T input.{name} must be one of {choices}")
-    # Both image sizes admit two/three cameras and the same instruction lengths;
-    # keep the existing single-camera 256 compatibility. Actual native capacity
-    # admission remains authoritative for every shape and precision.
+    # Both image sizes admit one to three cameras and the same instruction lengths.
+    # At 224 one camera is P=T+59 rows, inside the capacity bucket the two-camera
+    # shapes already use. Actual native capacity admission remains authoritative
+    # for every shape and precision.
     choices_by_field = {
-        "cameras": (1, 2, 3) if inputs["image_size"] == 256 else (2, 3),
+        "cameras": (1, 2, 3),
         "text_tokens": (32, 64, 128, 160, 192, 224, 256),
     }
     for name, choices in choices_by_field.items():
         value = inputs.get(name)
         if type(value) is not int or value not in choices:
             raise ValueError(f"GR00T input.{name} must be one of {choices} at image_size={inputs['image_size']}")
-    if example.get("dtype") not in ("fp16", "w8a16"):
-        raise ValueError("GR00T example requires explicit fp16 or w8a16 dtype")
+    precision_mode(example)
     observation = inputs.get("observation")
     if not isinstance(observation, str) or not observation:
         raise ValueError("GR00T input.observation must name a file")
@@ -42,20 +69,29 @@ def validate_config(config):
 def runtime_environment(config):
     if not validate_config(config):
         return {}
-    w8 = str(int(config["example"]["dtype"] == "w8a16"))
+    mode = precision_mode(config["example"])
+    # Fused merger, packed Vision batches and the four/eight-core DiT/VL fast
+    # paths run on both four-lane (model.num_cores=4/6) and eight-core budgets.
+    # Resident FF1, self-QKV multibase and XOR3 ring retain their eight-core
+    # FP16/W8 owners, so reduced budgets and W4 bind them off explicitly.
+    eight = config.get("rpu_execution", {}).get("model", {}).get("num_cores", 8) == 8
+    tp8 = "1" if eight else "0"
+    w8_only = "1" if eight and mode == "w8a16" else "0"
     return {
-        "RPU_GR00T_W8A16": w8,
+        **precision_environment(mode),
         "RPU_QWEN3VL_VISION_FUSED_MERGER": "1",
-        "RPU_QWEN3VL_VISION_BATCH": "1",
+        # W4 Vision does not use the raw-SPM resident layout, so 4-lane cs=768
+        # exceeds SPM; keep per-image execution on reduced-core W4 Vision.
+        "RPU_QWEN3VL_VISION_BATCH": tp8 if mode == "w4a16-vision" else "1",
         "RPU_WALL_OSS_FAST_REPLAY": "1",
         "RPU_GR00T_CROSS_KV_REUSE": "1",
         "RPU_GR00T_PRECOMPUTE_ADALN": "1",
         "RPU_GR00T_PRECOMPUTE_TIME_GLUE": "1",
         "RPU_GR00T_KV_SPM_ONLY": "1",
         "RPU_GR00T_CROSS_V_TRANSPOSE_REUSE": "1",
-        "RPU_GR00T_FF1_RESIDENT_W8": w8,
-        "RPU_GR00T_SELF_QKV_MULTIBASE": w8,
-        "RPU_GR00T_RING_XOR3": "1",
+        "RPU_GR00T_FF1_RESIDENT_W8": w8_only,
+        "RPU_GR00T_SELF_QKV_MULTIBASE": w8_only,
+        "RPU_GR00T_RING_XOR3": tp8 if mode not in W4_MODES else "0",
         "RPU_GR00T_VL_KV_SPM_ONLY": "1",
         "RPU_GR00T_NATIVE_POSITION_CACHE": "1",
         "RPU_GR00T_QWEN3VL_SPM_Z1": "0",

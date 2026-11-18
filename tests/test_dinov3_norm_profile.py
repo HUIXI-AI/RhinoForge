@@ -73,7 +73,7 @@ def test_native_standalone_norm_profile_is_cold_and_descriptor_owned(tmp_path):
 #include <vector>
 #define TORCH_CHECK(ok, ...) do { if (!(ok)) throw std::runtime_error(#ok); } while(false)
 enum class FmbRouteFamily { NORMALIZATION };
-namespace at { using IntArrayRef = std::vector<int64_t>; }
+namespace at { using IntArrayRef = std::vector<int64_t>; enum ScalarType { kHalf, kByte }; }
 struct FmbRouteManifestEntry {};
 struct Context {
     mutable std::vector<int64_t> consumed;
@@ -93,6 +93,7 @@ struct Model {
     int layers=12, hidden=384, intermediate=1536, heads=8, hd=64, resolved=0, generation=0;
     bool standalone_compatibility_=false, identity_rope_=true, use_acc32_=true, use_16b_sdpa_=true;
     bool has_final_norm_=true;
+    at::ScalarType projection_type() const { return at::kHalf; }
     int get_last_resolved_chunk_size() const { return resolved; }
     int num_layers() const { return layers; }
     int hidden_size() const { return hidden; }

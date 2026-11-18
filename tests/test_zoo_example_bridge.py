@@ -41,6 +41,17 @@ def test_catalog_rejects_runtime_release_identity_drift(catalog, monkeypatch):
                         lambda path: '0' * 64 if path == release_file else original_sha(path))
     with pytest.raises(ValueError, match='source changed: release/runtime-dependencies.json'):
         export_examples.verify_source(catalog)
+def test_export_keeps_default_profile_when_one_template_has_multiple_recipes(catalog):
+    rows = {row['id']: row for row in catalog['entries']}
+    # Long-input and reduced-core recipes share these files, but the exported
+    # default must retain its own profile, rather than the last catalog recipe.
+    dense = rows['qwen3_5/text/4b/fp16']
+    assert dense['profile_id'] == dense['config']['example']['profile_id']
+    assert 'prefill' not in dense['profile_id']
+    pi = rows['pi05/h50/fp16']
+    assert pi['cores'] == 8
+    assert pi['profile_id'] is not None
+    assert 'tp4' not in pi['profile_id'] and 'tp6' not in pi['profile_id']
 
 
 

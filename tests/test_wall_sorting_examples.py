@@ -318,7 +318,7 @@ def test_full_run_excludes_warmup_and_closes_before_reporting(runner, failure, w
     monkeypatch.setitem(sys.modules, 'rpu_backend.adapters.wall_oss', wall)
     monkeypatch.setitem(sys.modules, 'rpu_backend.graph', graph)
     monkeypatch.setattr(torch, 'rpu', SimpleNamespace(set_caching_allocator=lambda value: None, set_ddr_flush=lambda value: None, set_ddr_flush_force=lambda value: None), raising=False)
-    monkeypatch.setattr(runner, 'cold_environment', lambda precision: ({}, {'RPU_KERNEL_LIB_PATH': {'path': '/main.ref', 'sha256': 'main'}, 'RPU_KERNEL_LIB_PATH_EXPANSION': {'path': '/sorting.ref', 'sha256': 'sorting'}}))
+    monkeypatch.setattr(runner, 'cold_environment', lambda precision, cores: ({}, {'RPU_KERNEL_LIB_PATH': {'path': '/main.ref', 'sha256': 'main'}, 'RPU_KERNEL_LIB_PATH_EXPANSION': {'path': '/sorting.ref', 'sha256': 'sorting'}}))
     monkeypatch.setattr(runner, 'bind_cold_environment', lambda env: calls.append('environment'))
     monkeypatch.setattr(sys, 'path', list(sys.path))
     monkeypatch.setattr(sys, 'meta_path', list(sys.meta_path))

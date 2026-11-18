@@ -6,6 +6,11 @@ from pathlib import Path
 from examples.common.inputs import _controlled_images as _images, _controlled_checkpoint as _checkpoint
 from examples.runners.wall_oss.runner import wall_stage_boundaries
 
+# The policy's W8A16 flag by the resolved per-module specs of the profile's recipe.
+_ROUTE_PROBES = (("vision",), ("prefill",), ("action",))
+_ROUTES = {("fp16",) * 3: False, ("w8a16",) * 3: True}
+
+
 def _wall_rtc(runner):
     from rpu_backend.api import WallOssPolicy
     from rpu_backend.graph import GraphRuntimePolicy
@@ -18,7 +23,8 @@ def _wall_rtc(runner):
     for name in ("state_mask", "dof_mask"):
         if name in inputs:
             request[name] = inputs[name]
-    w8 = config["example"].get("dtype", "fp16") == "w8a16"
+    from examples.common.config import owner_route
+    w8 = owner_route("Wall-OSS RTC", "wall_oss_rtc", _ROUTE_PROBES, _ROUTES, selector=config["example"].get("dtype", "fp16"))
     fp16_alias = inputs.get("fp16_registry_alias")
     fp16_checkpoint = inputs.get("fp16_checkpoint")
     if w8 and not (fp16_alias or fp16_checkpoint):

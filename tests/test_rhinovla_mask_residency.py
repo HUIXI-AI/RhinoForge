@@ -96,22 +96,24 @@ def _declaration_program():
     from test_hy_halo_mask_residency import _program
     text = SOURCE.read_text()
     # Reuse only the actual common SDPA sizing/allocator/BufferDecl preamble.
-    program = _program().split('class CausalDecoderModel {public:', 1)[0]
+    program = _program(preamble_only=True)
     program += r'''
 namespace c10 {using Half=uint16_t;}
 namespace at {struct Tensor {template<class T>T* data_ptr()const{return nullptr;}};}
 void rpu_launch_ddr_broadcast_spm_dma(const uint16_t*,int64_t,uint32_t,int=8){}
-void rpu_launch_memset_spm_multicore(uint32_t,int64_t){}
+void rpu_launch_memset_spm_multicore(uint32_t,int64_t,int=8){}
 class RhinoVLAModel {public:
  struct {bool gated_no_sub=false,adarms_resident=false,packed_qkv=false,aligned_kv=false;}cold_config_;
  int64_t num_steps_=10;
- bool denoise_loop_weights_ready_=false,direct_action_input_=false,vector_q_norm_=false,rtc_mode_=false;
+ bool denoise_loop_weights_ready_=false,direct_action_input_=false,vector_q_norm_=false,vector_k_norm_=false,rtc_mode_=false;
  int64_t action_horizon_=30,action_dim_pad_=80,state_dim_pad_=80;
  at::Tensor action_in_b_,action_time_in_b_,time_in_b_,time_out_b_,state_b_,state_mask_b_,action_mask_b_,action_out_b_;
  struct Layer {at::Tensor q_norm_w,k_norm_w;};std::vector<Layer>layer_weights_{18};
  int64_t hidden_size()const{return 1024;}int64_t intermediate_size()const{return 3072;}
  int64_t num_q_heads()const{return 16;}int64_t num_kv_heads()const{return 8;}
- int64_t head_dim()const{return 128;}int64_t num_layers()const{return 18;}int attn_tp()const{return 8;}
+ int lanes=8,cores=8;
+ int64_t head_dim()const{return 128;}int64_t num_layers()const{return 18;}int attn_tp()const{return lanes;}
+ int num_cores()const{return cores;}int mlp_tp()const{return cores;}
 '''
     for marker in ('SdpaConfig make_sdpa_config(', 'std::vector<BufferDecl> baseline_buffer_declarations(', 'std::vector<BufferDecl> declare_buffers('):
         program += _definition(text, marker).replace(' override', '') + '\n'
@@ -241,68 +243,37 @@ int main(){return v3::main();}
     _run_cpp(tmp_path, program)
 
 
-def test_rtc_actual_declarations_add_36kib_and_retain_mask(tmp_path):
+def test_reduced_vector_k_norm_pads_only_kv_without_aligned_storage(tmp_path):
     program = _declaration_program() + r'''
 int main(){
  RhinoVLAModel m;
+ m.lanes=4;m.cores=6;
+ m.cold_config_.gated_no_sub=true;
  m.denoise_loop_weights_ready_=m.direct_action_input_=true;
- m.cold_config_.gated_no_sub=m.cold_config_.aligned_kv=true;
  m.action_dim_pad_=m.state_dim_pad_=96;
- // Full H30/M31 v3 geometry. K304 is the fixed P230 fixture's complete
- // reserved cache envelope (P256 + 31 suffix + 16 spare, rounded to 16).
- // All delays 0..6 share these maximum three-group buffer declarations.
- LayoutContext l;l.chunk_size=31;l.max_kv_seq_len=304;l.use_attn_mask=true;l.is_causal=false;
- const auto scalar=m.declare_buffers(l);
- m.rtc_mode_=true;
- const auto rtc=m.declare_buffers(l);
- assert(scalar.size()==rtc.size());
- int expanded=0;int64_t growth=0,persistent=0;
- std::vector<SpmAllocator::AllocRequest> scalar_requests,rtc_requests;
- size_t mask=0;
- for(size_t i=0;i<scalar.size();++i){
-  const auto& a=scalar[i];const auto& b=rtc[i];
-  assert(std::string(a.name)==b.name&&a.storage==b.storage&&a.scope==b.scope);
-  assert(a.phase_start==b.phase_start&&a.phase_end==b.phase_end);
-  assert(a.alias_of==b.alias_of&&a.per_layer==b.per_layer);
+ LayoutContext l;l.chunk_size=31;l.max_kv_seq_len=272;l.use_attn_mask=true;l.is_causal=false;
+ const auto original=m.declare_buffers(l);
+ m.vector_k_norm_=true;
+ const auto padded=m.declare_buffers(l);
+ assert(original.size()==padded.size());
+ int expanded=0;
+ for(size_t i=0;i<original.size();++i){
+  const auto& a=original[i];const auto& b=padded[i];
+  assert(std::string(a.name)==b.name&&a.storage==b.storage&&a.scope==b.scope&&a.alias_of==b.alias_of);
   const std::string name=a.name;
-  if(name=="adarms_pair_gemv"){
-   assert(a.size==6*1024*2&&b.size==3*a.size);++expanded;
-  }else if(name=="final_gemv"){
-   assert(a.size==3*1024*2&&b.size==3*a.size);++expanded;
+  // Four lanes hold two K/V heads each: 31 -> 32 rows of 256 halves. The
+  // debug K copies share that extent, as with eight-core aligned KV.
+  if(name=="k"||name=="v"||name=="dbg_k_prenorm"||name=="dbg_k_norm"){
+   assert(a.size==Align(int64_t{31*256*2},int64_t{256})&&b.size==32*256*2);++expanded;
   }else assert(a.size==b.size);
-  growth+=b.size-a.size;
-  if(b.storage==StorageClass::Persistent||b.storage==StorageClass::PersistentPerLayer)
-   persistent+=Align(b.size,int64_t{256})*(b.storage==StorageClass::PersistentPerLayer?b.per_layer:1);
-  if(b.storage!=StorageClass::Temp||b.alias_of)continue;
-  if(name=="sdpa_mask")mask=rtc_requests.size();
-  scalar_requests.push_back({a.size,a.phase_start,a.phase_end,static_cast<int>(a.scope)});
-  rtc_requests.push_back({b.size,b.phase_start,b.phase_end,static_cast<int>(b.scope)});
  }
- assert(expanded==2&&growth==36*1024);
- const auto before=SpmAllocator::plan_temporary_aliased(scalar_requests);
- const auto after=SpmAllocator::plan_temporary_aliased(rtc_requests);
- assert(after.peak_bytes-before.peak_bytes==36*1024);
- auto declarations=m.baseline_buffer_declarations(l);
- const auto retention=detail::plan_forward_spm_residency(declarations,{"sdpa_mask"});
- assert(retention.retained&&retention.original_peak_bytes==retention.retained_peak_bytes);
- assert(after.peak_bytes+persistent<8303616);
- const size_t mask_begin=after.offsets[mask],mask_end=mask_begin+rtc_requests[mask].bytes;
- std::vector<unsigned char>spm(after.peak_bytes,0);
- std::fill(spm.begin()+mask_begin,spm.begin()+mask_end,0x5a);
- for(int step=0;step<10;++step)for(size_t i=0;i<rtc_requests.size();++i)if(i!=mask){
-  const size_t begin=after.offsets[i],end=begin+rtc_requests[i].bytes;
-  assert(end<=after.peak_bytes&&(end<=mask_begin||mask_end<=begin));
-  std::fill(spm.begin()+begin,spm.begin()+end,step+1);
- }
- assert(std::all_of(spm.begin()+mask_begin,spm.begin()+mask_end,[](auto c){return c==0x5a;}));
- std::cout<<before.peak_bytes<<","<<after.peak_bytes<<","<<persistent<<","<<after.peak_bytes+persistent<<"\n";
+ assert(expanded==4);
  return 0;
 }
 }
 int main(){return v3::main();}
 '''
-    output = _run_cpp(tmp_path, program)
-    print("scalar_temp,rtc_temp,persistent,total_bytes\n" + output)
+    _run_cpp(tmp_path, program)
 
 
 def test_expert_payload_lookup_is_cold_and_planning_only_reads_values(tmp_path):
@@ -329,6 +300,7 @@ class RhinoVLAModel {public:
  int num_layers()const{return layers;}int hidden_size()const{return 1024;}
  int intermediate_size()const{return 3072;}int num_q_heads()const{return 16;}
  int num_kv_heads()const{return 8;}int head_dim()const{return 128;}int attn_tp()const{return 8;}
+ int num_cores()const{return 8;}
  void invalidate_model_state(){++invalidations;}
 '''
     program += _definition(source, 'void set_runtime_config(') + '\n'
@@ -371,6 +343,7 @@ def test_packed_qkv_split_registers_address_every_core_and_row(tmp_path):
 #include <vector>
 #define NUM_CORES 8
 #define TORCH_CHECK(condition, ...) do {if(!(condition))throw std::runtime_error("rejected");} while(false)
+constexpr int RHINO_TP8 = 8;
 namespace c10 {using Half=uint16_t;}
 struct SpmAllocator {
  static constexpr uint32_t SPM_USABLE=8387584;
@@ -516,7 +489,7 @@ struct Context{
 int dmas=0;void sdpa_dma_mask_to_spm(PreparedMask,uint32_t,int64_t,int64_t,int){++dmas;}
 '''+_definition(text, 'enum class RhinoMaskSpmSchedule')+';\n'+r'''
 struct Model{Context state;bool loop_mode_=false;int64_t num_steps_=2;PreparedMask prepared_mask_;
- Context&ctx(){return state;}int64_t num_layers()const{return 2;}
+ Context&ctx(){return state;}int64_t num_layers()const{return 2;}int num_cores()const{return 8;}
 '''+_definition(text, 'int emit_sdpa_mask(')+r'''
  void forward(){for(int b=0;b<(loop_mode_?num_steps_:1);++b){state.body_iter=b;
   for(int layer=0;layer<2;++layer)assert(emit_sdpa_mask(layer,ChunkInfo{},31,79,80,8,0)==4);
@@ -538,3 +511,67 @@ int main(){
 }
 '''
     _run_cpp(tmp_path, program)
+
+
+def test_rtc_actual_declarations_add_36kib_and_retain_mask(tmp_path):
+    program = _declaration_program() + r'''
+int main(){
+ RhinoVLAModel m;
+ m.denoise_loop_weights_ready_=m.direct_action_input_=true;
+ m.cold_config_.gated_no_sub=m.cold_config_.aligned_kv=true;
+ m.action_dim_pad_=m.state_dim_pad_=96;
+ // Full H30/M31 v3 geometry. K304 is the fixed P230 fixture's complete
+ // reserved cache envelope (P256 + 31 suffix + 16 spare, rounded to 16).
+ // All delays 0..6 share these maximum three-group buffer declarations.
+ LayoutContext l;l.chunk_size=31;l.max_kv_seq_len=304;l.use_attn_mask=true;l.is_causal=false;
+ const auto scalar=m.declare_buffers(l);
+ m.rtc_mode_=true;
+ const auto rtc=m.declare_buffers(l);
+ assert(scalar.size()==rtc.size());
+ int expanded=0;int64_t growth=0,persistent=0;
+ std::vector<SpmAllocator::AllocRequest> scalar_requests,rtc_requests;
+ size_t mask=0;
+ for(size_t i=0;i<scalar.size();++i){
+  const auto& a=scalar[i];const auto& b=rtc[i];
+  assert(std::string(a.name)==b.name&&a.storage==b.storage&&a.scope==b.scope);
+  assert(a.phase_start==b.phase_start&&a.phase_end==b.phase_end);
+  assert(a.alias_of==b.alias_of&&a.per_layer==b.per_layer);
+  const std::string name=a.name;
+  if(name=="adarms_pair_gemv"){
+   assert(a.size==6*1024*2&&b.size==3*a.size);++expanded;
+  }else if(name=="final_gemv"){
+   assert(a.size==3*1024*2&&b.size==3*a.size);++expanded;
+  }else assert(a.size==b.size);
+  growth+=b.size-a.size;
+  if(b.storage==StorageClass::Persistent||b.storage==StorageClass::PersistentPerLayer)
+   persistent+=Align(b.size,int64_t{256})*(b.storage==StorageClass::PersistentPerLayer?b.per_layer:1);
+  if(b.storage!=StorageClass::Temp||b.alias_of)continue;
+  if(name=="sdpa_mask")mask=rtc_requests.size();
+  scalar_requests.push_back({a.size,a.phase_start,a.phase_end,static_cast<int>(a.scope)});
+  rtc_requests.push_back({b.size,b.phase_start,b.phase_end,static_cast<int>(b.scope)});
+ }
+ assert(expanded==2&&growth==36*1024);
+ const auto before=SpmAllocator::plan_temporary_aliased(scalar_requests);
+ const auto after=SpmAllocator::plan_temporary_aliased(rtc_requests);
+ assert(after.peak_bytes-before.peak_bytes==36*1024);
+ auto declarations=m.baseline_buffer_declarations(l);
+ const auto retention=detail::plan_forward_spm_residency(declarations,{"sdpa_mask"});
+ assert(retention.retained&&retention.original_peak_bytes==retention.retained_peak_bytes);
+ assert(after.peak_bytes+persistent<8303616);
+ const size_t mask_begin=after.offsets[mask],mask_end=mask_begin+rtc_requests[mask].bytes;
+ std::vector<unsigned char>spm(after.peak_bytes,0);
+ std::fill(spm.begin()+mask_begin,spm.begin()+mask_end,0x5a);
+ for(int step=0;step<10;++step)for(size_t i=0;i<rtc_requests.size();++i)if(i!=mask){
+  const size_t begin=after.offsets[i],end=begin+rtc_requests[i].bytes;
+  assert(end<=after.peak_bytes&&(end<=mask_begin||mask_end<=begin));
+  std::fill(spm.begin()+begin,spm.begin()+end,step+1);
+ }
+ assert(std::all_of(spm.begin()+mask_begin,spm.begin()+mask_end,[](auto c){return c==0x5a;}));
+ std::cout<<before.peak_bytes<<","<<after.peak_bytes<<","<<persistent<<","<<after.peak_bytes+persistent<<"\n";
+ return 0;
+}
+}
+int main(){return v3::main();}
+'''
+    output = _run_cpp(tmp_path, program)
+    print("scalar_temp,rtc_temp,persistent,total_bytes\n" + output)

@@ -22,7 +22,12 @@ def test_both_native_entries_reach_shared_cold_prepare_without_resolving_a_plan(
         name = f"rpu_{family}_prepare_persistent_spm"
         source = _source(path)
         entry = _section(source, f"void {name}(", "\n}\n")
-        assert "->prepare_persistent_spm(" in entry
+        if family == "siglip":
+            assert "->prepare_siglip_persistent_spm(" in entry
+            helper = _section(source, "    void prepare_siglip_persistent_spm(", "\n    }\n")
+            assert "prepare_persistent_spm(" in helper
+        else:
+            assert "->prepare_persistent_spm(" in entry
         assert "resolve_" not in entry and "forward(" not in entry
         assert name in _source("src/core/rpu_kernel_decls.h")
         assert f"TORCH_FN({name})" in _source("src/core/rpu_dispatch_registrations.inc")
@@ -491,6 +496,7 @@ public:
     }
     bool resident_preloads_enabled()const{return !state.resident_preload_names_.empty();}
     void prepare_persistent_spm(int64_t,int64_t,bool,int64_t=0);
+    void prepare_siglip_persistent_spm(int64_t n,int64_t){prepare_persistent_spm(n,0,false);}
 };
 struct SigLIPRegistry {
     static inline FusedModelBase* owner=nullptr;
@@ -721,7 +727,7 @@ void rpu_launch_ddr_broadcast_spm_dma(const at::Tensor& source,int64_t offset,in
 void rpu_launch_ddr_scatter_spm_dma(const at::Tensor& source,int64_t offset,int64_t count,int64_t stride,uint32_t addr,int64_t cores){
     dma_calls.push_back({&source,{1,offset,count,stride,addr,cores}});
 }
-void rpu_launch_memset_spm_multicore(uint32_t addr,int64_t count){
+void rpu_launch_memset_spm_multicore(uint32_t addr,int64_t count,int=8){
     dma_calls.push_back({nullptr,{2,addr,count}});
 }
 struct Gr00tDiTModel : FusedModelBase {
@@ -731,6 +737,7 @@ struct Gr00tDiTModel : FusedModelBase {
     bool denoise_ready_=true, denoise_mode_=true, loop_mode_=true;
     int64_t vl_seq_=82,cross_dim_=2048,action_horizon_=40,action_dim_pad_=144,num_steps_=4,enc_mid_=1024,dec_mid_=1024,model_out_dim_=1024;
     int64_t hidden_size(){return 1536;} int64_t num_q_heads(){return 32;}
+    int num_cores(){return NUM_CORES;}
     int64_t head_dim(){return 48;} int64_t intermediate_size(){return 6144;}
     int64_t num_layers(){return 32;} int make_sdpa_config(int n){return n;}
     Context context; Context& ctx(){return context;}

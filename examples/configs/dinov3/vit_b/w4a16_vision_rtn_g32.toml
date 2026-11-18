@@ -1,0 +1,44 @@
+# 未写出的执行参数（省略即按以下值运行）：
+#   [cpu].threads 省略时不设置线程：PyTorch 使用环境变量 OMP_NUM_THREADS，未设置时使用全部 CPU 核（参考板 24）；2026-10-19 测量环境预设为 16。
+# 使用官方 DINOv3 ViT-B/16 浮点权重，冷启动安装时转换一次。
+# 编码器每层六个投影（q / k / v / o / up / down）对称 INT4/G32（RTN）；patch embedding、norm、LayerScale 和 bias 为 FP16。
+# Linear 固定 ACC16（DINOv3 没有 linear_acc32 选项）；尚未上板实测，任务质量未评估。
+[model]
+profile_id = "dinov3-vit-b.w4a16-g32.vision"
+registry_alias = "dinov3-vit-b"
+target = "dinov3"
+precision = "w4a16_vision_rtn_g32"
+architecture = "DINOv3ViTModel"
+
+[model.opt_in]
+
+[input]
+# 替换图像路径；相机数量、处理后尺寸和文本长度需满足本模型输入范围。
+images = ["/path/to/image.png"]
+
+[run]
+# 预热次数；不计入正式测量。
+warmup = 2
+# 正式执行次数，正整数。
+runs = 5
+# 按需开启硬件采样；保持 false 可减少测量干扰。
+hwperf = false
+# 按需开启 profiler；正式计时建议保持 false。
+profile = false
+# 随机种子，非负整数。
+seed = 0
+
+[rpu_execution]
+
+[rpu_execution.model]
+# RPU 核数预算。可选 4 / 6 / 8，默认 8；修改后需重新加载模型。
+# 8 核：12 个注意力头补零到 16 个后再量化，每核 2 个头、MLP 384 通道。
+# 4 / 6 核：不补头，注意力和 MLP 用同一核数，每核 3 / 2 个头、MLP 768 / 512 通道；KV 缓存仍按 8 路存储。
+# 各核数的支持状态与板上实测见核数支持矩阵（examples/configs/CONFIGURATIONS.md）。
+num_cores = 8
+
+[rpu_execution.vision]
+# Vision 分块行数。可选 "auto"（默认）或整数 208：224×224 输入共 201 行（CLS + 4 个寄存器 + 196 个 patch），按 16 对齐为 208；其他整数在加载前拒绝。
+# auto：由原生 planner 按图像 patch 数与本模型的核数选择。
+# 实际值记录在结果 report.json 的执行计划中（compute_chunk）。
+chunk_size = "auto"

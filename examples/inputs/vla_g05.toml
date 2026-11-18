@@ -1,0 +1,43 @@
+# G0.5 的输入预设：python examples/run.py --config <TOML> --input <预设名>
+# --input canonical 取本文件的 canonical；--set input.<键> 的同名字段优先于预设。
+#
+# 预设名与 vla.toml 相同。G0.5 用 camera_names 指定相机，所以预设同时写 cameras 和
+# camera_names。source = "synthetic" 时，在保存的 K1 传感器和 RTC 输入上用真实 processor
+# 构造恰好 T 个 token 的指令，实际 prefix 为 T + 64 × cameras + 1 行。
+#
+# 范围：cameras 2 / 3，camera_names 依次为 head_rgb、left_wrist_rgb、right_wrist_rgb 的前
+#   cameras 个；text_tokens 为 32–256 的整数。
+# requires：模板 [input] 须已写这些字段。legacy 模板读取固定的 batch，配置检查会拒绝预设。
+applies_to = ["g05"]
+canonical = "2cam_t32"
+requires = ["cameras", "camera_names", "text_tokens"]
+
+[preset.2cam_t32]
+cameras = 2
+camera_names = ["head_rgb", "left_wrist_rgb"]
+text_tokens = 32
+
+[preset.2cam_t64]
+cameras = 2
+camera_names = ["head_rgb", "left_wrist_rgb"]
+text_tokens = 64
+
+[preset.2cam_t128]
+cameras = 2
+camera_names = ["head_rgb", "left_wrist_rgb"]
+text_tokens = 128
+
+[preset.3cam_t32]
+cameras = 3
+camera_names = ["head_rgb", "left_wrist_rgb", "right_wrist_rgb"]
+text_tokens = 32
+
+[preset.3cam_t64]
+cameras = 3
+camera_names = ["head_rgb", "left_wrist_rgb", "right_wrist_rgb"]
+text_tokens = 64
+
+[preset.3cam_t128]
+cameras = 3
+camera_names = ["head_rgb", "left_wrist_rgb", "right_wrist_rgb"]
+text_tokens = 128

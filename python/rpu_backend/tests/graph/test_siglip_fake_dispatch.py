@@ -1,5 +1,6 @@
 import importlib.util
 from pathlib import Path
+import re
 import sys
 import pytest
 import torch
@@ -76,26 +77,51 @@ def test_linear_w4a16_fake_dispatch_preserves_rows_and_scale_contract():
             torch.ops.rpu.linear_w4a16(hidden,packed,scale[:,:-1].contiguous(),logical_out_features=128)
 
 
-def test_siglip_fake_dispatch_for_split_and_packed_paths():
-    with FakeTensorMode():
-        image_batch = torch.empty((3, 3, 224, 224), dtype=torch.float16)
-        hidden = torch.ops.rpu.siglip_patch_embed(1, image_batch)
-        _assert_fake_shape(hidden, (1, 3 * 256, 1152))
-        packed = torch.ops.rpu.siglip_forward_packed(1, hidden, 3, [], [])
-        _assert_fake_shape(packed, (1, 3 * 256, 2048))
-        direct = torch.ops.rpu.siglip_forward(1, image_batch, [], [])
-        _assert_fake_shape(direct, (1, 3 * 256, 2048))
-        hidden_direct = torch.empty((1, 3 * 256, 1152), dtype=torch.float16)
-        direct_3d = torch.ops.rpu.siglip_forward(1, hidden_direct, [], [])
-        _assert_fake_shape(direct_3d, (1, 3 * 256, 2048))
+def test_siglip_create_schema_keeps_default_off_and_explicit_cold_w8a8():
+    root = Path(__file__).resolve().parents[4]
+    registrations = (root / "src/core/rpu_dispatch_registrations.inc").read_text()
+    schema = torch._C.parse_schema(re.search(
+        r'm\.def\("(siglip_create\([^"\n]+)"', registrations).group(1))
+    assert [(argument.name, str(argument.type), argument.default_value)
+            for argument in schema.arguments] == [
+                ("linear_acc32", "Optional[bool]", None),
+                ("qkv_w8a8", "bool", False),
+                ("mlp_w8a8", "bool", False),
+            ]
+    assert all(argument.has_default_value() for argument in schema.arguments)
+    assert [str(result.type) for result in schema.returns] == ["int"]
 
-def test_siglip_fake_dispatch_for_multi_image_path():
+
+@pytest.mark.parametrize("num_images", (2, 3))
+def test_siglip_fake_dispatch_for_split_and_packed_paths(num_images):
     with FakeTensorMode():
-        images = [torch.empty((1, 3, 224, 224), dtype=torch.float16) for _ in range(3)]
+        image_batch = torch.empty((num_images, 3, 224, 224), dtype=torch.float16)
+        hidden = torch.ops.rpu.siglip_patch_embed(1, image_batch)
+        _assert_fake_shape(hidden, (1, num_images * 256, 1152))
+
+        packed = torch.ops.rpu.siglip_forward_packed(1, hidden, num_images, [], [])
+        _assert_fake_shape(packed, (1, num_images * 256, 2048))
+
+        direct = torch.ops.rpu.siglip_forward(1, image_batch, [], [])
+        _assert_fake_shape(direct, (1, num_images * 256, 2048))
+
+        hidden_direct = torch.empty((1, num_images * 256, 1152), dtype=torch.float16)
+        direct_3d = torch.ops.rpu.siglip_forward(1, hidden_direct, [], [])
+        _assert_fake_shape(direct_3d, (1, num_images * 256, 2048))
+
+
+@pytest.mark.parametrize("num_images", (2, 3))
+def test_siglip_fake_dispatch_for_multi_image_path(num_images):
+    with FakeTensorMode():
+        images = [
+            torch.empty((1, 3, 224, 224), dtype=torch.float16)
+            for _ in range(num_images)
+        ]
         hidden = torch.ops.rpu.siglip_patch_embed_multi(1, images)
-        _assert_fake_shape(hidden, (1, 3 * 256, 1152))
+        _assert_fake_shape(hidden, (1, num_images * 256, 1152))
+
         output = torch.ops.rpu.siglip_forward_multi(1, images, [], [])
-        _assert_fake_shape(output, (1, 3 * 256, 2048))
+        _assert_fake_shape(output, (1, num_images * 256, 2048))
 
 def test_causal_decoder_fake_dispatch_accepts_current_tail_args():
     with FakeTensorMode():

@@ -53,23 +53,25 @@ def test_wall_action_embedding_stays_in_spm_through_layer0_ingress() -> None:
     prehook = prehook.split("void WallOssActionStepModel::emit_post_layers_body()", 1)[0]
 
     assert "pre_layers_residual1_ready_ = true;" in action
-    assert 'd.push_back({"emb_core0_spm", A(cs * (h / NUM_CORES) * DW), 0, 1,' in action
-    assert prehook.count("rpu_launch_spm_scatter_spm_dma(") == 1
+    assert 'd.push_back({"emb_core0_spm", A(cs * (h / num_cores()) * DW), 0, 1,' in action
+    assert "d.back().size = A(cs * h * DW);" in action
+    assert prehook.count("rpu_launch_spm_scatter_spm_dma(") == 2
     assert "/*core_stride_bytes=*/0" in prehook
-    assert 'addr(0, "b_step_spm"), NUM_CORES' in prehook
-    assert "/*num_cores=*/NUM_CORES" in prehook
+    assert 'addr(0, "b_step_spm"), num_cores()' in prehook
+    assert "/*num_cores=*/eight_cores ? num_cores() : 1" in prehook
     assert "rpu_launch_all_gather_spm_kernel(" in prehook
     assert 'addr(0, "emb_core0_spm"), addr(0, "residual1")' in prehook
-    assert "/*chunk_elems=*/h / NUM_CORES" in prehook
+    assert "/*chunk_elems=*/h / num_cores()" in prehook
     assert prehook.index('addr(0, "ce_spm"), cs * h') < prehook.index(
-        'addr(0, "b_step_spm"), w3_'
+        'w3_, addr(0, "emb_core0_spm")'
     ) < prehook.index("rpu_launch_all_gather_spm_kernel(")
     assert "emb_stage_.data_ptr" not in prehook
     assert '"w3":        _to_rpu_half(tp_col_swizzle_mc_weight(' in adapter
     w3_pack = adapter.split(
         '"w3":        _to_rpu_half(tp_col_swizzle_mc_weight(', 1
     )[1].split(")),", 1)[0]
-    assert w3_pack.endswith("_MLP_CORES")
+    # Eight cores col-swizzle W3 over 8 lanes; reduced budgets run W3 on core 0 and broadcast.
+    assert w3_pack.endswith("1 if num_cores != 8 else num_cores")
 
     assert "bool pre_layers_residual1_ready_ = false;" in decoder
     assert decoder.count(

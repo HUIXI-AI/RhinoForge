@@ -4,6 +4,14 @@ from __future__ import annotations
 
 from examples.common.inputs import _images, _policy_checkpoint as _checkpoint, _model_path
 
+# WallOssPolicy (w8a16, w4a16) flags by the resolved per-module specs of the profile's
+# recipe. Both W4 recipes take the W4 route; the loader reads the group layout from the weights.
+_ROUTE_PROBES = (("vision",), ("prefill",), ("prefill", "Down"), ("action",), ("action_preprocessor",))
+_ROUTES = {("fp16",) * 5: (False, False), ("w8a16",) * 5: (True, False),
+           ("w8a16", "w4a16-channel", "w4a16-channel", "w4a16-channel", "fp16"): (False, True),
+           ("w8a16", "w4a16-g32", "w8a16", "w4a16-g32", "fp16"): (False, True)}
+
+
 def wall_stage_boundaries(vla):
     """Vision, Prefill and Denoise calls of WallOssVLA.predict (both Vision entries)."""
     return tuple((stage, getattr(vla, part, None), name) for stage, part, name in (
@@ -16,10 +24,10 @@ def _wall_oss(runner):
 
     config, inputs = runner.source_config, runner.source_config["input"]
     images = _images(inputs)
-    dtype = config["example"].get("dtype", "fp16")
-    if dtype not in {"fp16", "w8a16", "w4a16", "w4a16-pgrp"}:
-        raise ValueError(f"unsupported Wall-OSS example dtype: {dtype!r}")
-    quantized = dtype != "fp16"
+    from examples.common.config import owner_route
+    w8, w4 = owner_route("WallOssPolicy", "wall_oss", _ROUTE_PROBES, _ROUTES,
+                         selector=config["example"].get("dtype", "fp16"))
+    quantized = w8 or w4
     fp16_checkpoint = None
     if quantized:
         fp16_checkpoint = _model_path(
@@ -40,8 +48,8 @@ def _wall_oss(runner):
         action_horizon=inputs.get("action_horizon", 32),
         num_steps=inputs.get("num_steps", 10),
         max_seq_len=inputs.get("max_seq_len", 2048),
-        w8a16=dtype == "w8a16",
-        w4a16=dtype in {"w4a16", "w4a16-pgrp"},
+        w8a16=w8,
+        w4a16=w4,
         fp16_ckpt_dir=str(fp16_checkpoint) if fp16_checkpoint else None,
         active_slots=inputs.get("active_slots"),
         runtime_env=config["example"].get("opt_in"),

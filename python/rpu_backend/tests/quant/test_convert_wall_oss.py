@@ -7,7 +7,9 @@ from safetensors.torch import load_file, save_file
 from rpu_backend.quant.convert_wall_oss import (
     WALL_OSS_QUANT_SUFFIXES,
     convert_checkpoint,
+    main,
 )
+from rpu_backend.quant.precision_recipes import read_record
 from rpu_backend.adapters.wall_oss.checkpoint_validation import (
     validate_rtc_w4_checkpoint_pair,
 )
@@ -34,6 +36,8 @@ def test_convert_wall_oss_mixed(tmp_path):
     src, dst = tmp_path / "fp16", tmp_path / "w4a16"
     _mini_ckpt(src)
     convert_checkpoint(src, dst)
+    # All-INT4 G32 is not a registered recipe: no record.
+    assert read_record(dst) is None
 
     cfg = json.load((dst / "rpu_quant_config.json").open())
     assert cfg["method"] == "w4a16"
@@ -62,6 +66,17 @@ def test_convert_wall_oss_mixed(tmp_path):
     assert q0_scale.dim() == 2
     assert out["model.norms.0.weight"].dtype == torch.float16
     assert out["model.layers.0.self_attn.qkv_proj_experts.0.bias"].dtype == torch.float16
+
+
+def test_recipe_cli_produces_the_sorting_action_w4_composition(tmp_path):
+    src, dst = tmp_path / "fp16", tmp_path / "w4a16-pgrp"
+    _mini_ckpt(src)
+    assert main(["--src", str(src), "--dst", str(dst), "--recipe", "w4a16_g32"]) == 0
+    cfg = json.load((dst / "rpu_quant_config.json").open())
+    assert cfg["group_size"] == 32 and cfg["int8_suffixes"] == ["moe.experts.0.down_proj.weight"]
+    assert read_record(dst) == ("wall_oss", "w4a16_g32")
+    with pytest.raises(SystemExit):
+        main(["--src", str(src), "--dst", str(tmp_path / "x"), "--recipe", "w4a16_g32", "--group-size", "0"])
 
 
 def test_w8a16_quant_config_has_no_abs_path():

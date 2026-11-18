@@ -371,7 +371,7 @@ def test_actual_callers_use_assignment_rows_and_keep_gp9_reserved():
     assert cold.count("qwen35_grouped_route_arguments(") == 2
     assert "total_m, local_n, local_k, static_cast<int>(mode), linear_acc32,\n        2, 0, 0, group" in native
     assert "r = seq_len * k" in lingbot
-    assert "NUM_CORES, r, sparse_weight_mode_, false" in lingbot
+    assert "num_cores(), r, sparse_weight_mode_, false" in lingbot
     assert "logical_len * top_k_, col ? 2 * local_i : hidden_size()" in lingbot
     assert "r, 2 * local_i, h, sparse_weight_mode_, false" in lingbot
     assert "r, h, local_i, sparse_weight_mode_, false" in lingbot
@@ -387,9 +387,9 @@ def test_lingbot_actual_argument_blocks_match_cold_manifest(tmp_path):
     def block(start, stop):
         begin=source.index(start)
         return source[begin:source.index(stop,begin)]
-    gate=block('std::vector<int64_t> arguments{2 * local_i, h, e, 1, NUM_CORES, sparse_weight_mode_};',
+    gate=block('std::vector<int64_t> arguments{2 * local_i, h, e, 1, num_cores(), sparse_weight_mode_};',
                'ctx().consume_physical_route')
-    down=block('std::vector<int64_t> arguments{h, local_i, e, 0, NUM_CORES, sparse_weight_mode_};',
+    down=block('std::vector<int64_t> arguments{h, local_i, e, 0, num_cores(), sparse_weight_mode_};',
                'ctx().consume_physical_route')
     planner=block('std::vector<int64_t> arguments{\n                col ? 2 * local_i : hidden_size()',
                   'append(FmbRouteFamily::LINEAR, down_scale_shuffle ?')
@@ -400,6 +400,7 @@ def test_lingbot_actual_argument_blocks_match_cold_manifest(tmp_path):
 #include <vector>
 int64_t h=512,local_i=128,e=32,num_experts_=32,top_k_=4,tp_rows_=64;
 constexpr int NUM_CORES=8;
+constexpr int num_cores(){return NUM_CORES;}
 int sparse_weight_mode_=2;
 bool sparse_gate_up_expert_y4_=false;
 int64_t hidden_size(){return h;}

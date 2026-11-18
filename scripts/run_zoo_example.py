@@ -17,6 +17,9 @@ import sys
 import tempfile
 
 import export_examples
+# export_examples puts the repository root on sys.path; the command line
+# (examples/run.py --cores/--set) applies the same override rules.
+from examples.common.overrides import execution_overrides, g05_overrides, toml_text
 
 ROOT = export_examples.ROOT
 SHA256 = re.compile(r'[0-9a-f]{64}')
@@ -489,66 +492,6 @@ def performance_records(output, row, request, *, allow_partial=False):
     return records
 
 
-def toml_text(config):
-    def atom(value):
-        if isinstance(value, str):
-            return json.dumps(value, ensure_ascii=False)
-        if isinstance(value, bool):
-            return 'true' if value else 'false'
-        if type(value) is int:
-            return str(value)
-        if isinstance(value, float) and math.isfinite(value):
-            return repr(value)
-        if isinstance(value, list):
-            return '[' + ', '.join(atom(x) for x in value) + ']'
-        raise ValueError('config contains an unsupported TOML value')
-    lines = []
-    def table(value, prefix=()):
-        if prefix:
-            lines.append('[' + '.'.join(json.dumps(k) for k in prefix) + ']')
-        for key, item in value.items():
-            if not isinstance(item, dict):
-                lines.append(json.dumps(key) + ' = ' + atom(item))
-        lines.append('')
-        for key, item in value.items():
-            if isinstance(item, dict):
-                table(item, (*prefix, key))
-    table(config)
-    return '\n'.join(lines)
-
-
-def execution_overrides(config, overrides):
-    """Record public cold choices; the actual config loader validates the profile."""
-    def apply(original, changed, prefix=()):
-        if not isinstance(changed, dict):
-            raise ValueError('execution overrides must be tables')
-        for key, value in changed.items():
-            if isinstance(value, dict):
-                if not prefix and key == 'model' and key not in original:
-                    original[key] = {}
-                if key not in original or not isinstance(original[key], dict):
-                    raise ValueError('execution override must use an existing stage scope')
-                apply(original[key], value, (*prefix, key))
-            elif key == 'padding_rows' and value is None and prefix and prefix[-1] == 'prefill':
-                if key not in original:
-                    raise ValueError('prefill padding_rows deletion requires an existing template pin')
-                del original[key]
-            elif key == 'num_cores' and prefix == ('model',):
-                if type(value) is not int or value not in (4, 6, 8):
-                    raise ValueError('model.num_cores override must be 4, 6 or 8')
-                original[key] = value
-            elif key == 'chunk_size' and prefix == ('prefill',):
-                if key not in original or not (value == 'auto' or
-                        type(value) is int and value > 0 and value % 16 == 0):
-                    raise ValueError('prefill chunk_size override requires an existing field and auto or a positive multiple of 16')
-                original[key] = value
-            elif key != 'linear_acc32' or type(value) is not bool:
-                raise ValueError('only public core, prefill chunk and accumulation choices may be overridden')
-            else:
-                original[key] = value
-    apply(config.setdefault('rpu_execution', {}), overrides)
-
-
 def verify_bound_libraries(config):
     table = config.get('libraries')
     if table is None:
@@ -594,10 +537,7 @@ def resolve(bundle, config_id):
             execution_overrides(config, value)
             continue
         if key == 'g05':
-            if ('g05' not in config or set(value) - {'linear_accumulation', 'math_precision'}
-                    or value.get('linear_accumulation', 'acc16') not in {'acc16', 'acc32'}
-                    or value.get('math_precision', 'base') not in {'base', 'high'}):
-                raise ValueError('G05 override only accepts supported accumulation and math precision')
+            g05_overrides(config, value)
         if key == 'libraries' and (key not in config or set(value) != {'native', 'main', 'expansion'}):
             raise ValueError('libraries override must bind the native and both formal REF roles together')
         if key == 'input':

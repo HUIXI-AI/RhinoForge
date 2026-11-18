@@ -80,3 +80,12 @@ int main() {
                            capture_output=True, text=True)
     assert built.returncode == 0, built.stderr
     subprocess.run([str(binary)], check=True)
+
+
+def test_packed_w4_owners_publish_retained_scales():
+    """An unretained scale fails the first reduced-lane pgrp launch on the board."""
+    root = Path(__file__).resolve().parents[1]
+    for owner in ("qwen3vl_vision", "siglip", "hyvit2_vision", "dinov3_vision",
+                  "gr00t_vl_encoder", "gemma4"):
+        source = (root / f"src/fused/rpu_{owner}_model.cpp").read_text()
+        assert "rpu_retain_linear_quant_scale(" in source, owner

@@ -62,7 +62,7 @@ def test_actual_prefill_owner_norm_cold_complete_and_fallback(tmp_path, fp16):
     pre_start = decoder.index(pre_marker, decoder.index('if (wall_prefill_owner_norm) {'))
     pre_producer = block(decoder[pre_start:], pre_marker).split('{', 1)[1].rsplit('}', 1)[0]
     o_body = block(decoder, '        } else {\n            // O-proj row-partition').split('{', 1)[1].rsplit('}', 1)[0]
-    shared_producer = block(decoder, '            if (wall_base_fp16_shared_gateup_enabled(')
+    shared_producer = block(decoder, 'else if (wall_base_fp16_shared_gateup_enabled(')[5:]
     shared_producer += ' ' + block(decoder, 'else if (wall_base_prefill_shared_input_enabled(')
     consumer = '\n'.join(block(planner, marker).replace('FmbPhysicalManifestConsumer::', '') for marker in (
         'const FmbRouteManifestEntry& FmbPhysicalManifestConsumer::find_route(',
@@ -84,6 +84,11 @@ def test_actual_prefill_owner_norm_cold_complete_and_fallback(tmp_path, fp16):
 #include <cmath>
 #include <memory>
 #include <tuple>
+#include "fused/rpu_qwen3_w8a8_contract.h"
+#include "fused/rpu_qwen3_c192_contract.h"
+namespace qwen3_w8a8 = v3::qwen3_w8a8;
+namespace qwen3_c192 = v3::qwen3_c192;
+namespace qwen3_c512 = v3::qwen3_c512;
 #undef TORCH_INTERNAL_ASSERT
 #define TORCH_INTERNAL_ASSERT(x) TORCH_CHECK(x)
 KERNEL_IDS
@@ -217,6 +222,12 @@ struct Model {
  uint32_t layer_addr(int layer,int core,const char*)const{return norm_post_addr(layer,core);}
  uint32_t nvfp4_scale_addr(const char*)const{return 0;}
  bool qwen3vl_decode_gemv(int64_t)const{return false;}
+ bool qwen3_c192_manifest_valid(const FmbPhysicalExecutionManifest&)const{return true;}
+ bool qwen3_prefill_w8a8_manifest_valid(const FmbPhysicalExecutionManifest&)const{return true;}
+ void emit_qwen3_prefill_w8a8_quant(const ChunkInfo&,int64_t,uint32_t){}
+ void emit_qwen3_prefill_w8a8_linear(const ChunkInfo&,qwen3_w8a8::Projection,const at::Tensor&,const at::Tensor&,const char*){}
+ void emit_qwen3_c512_reduce(int,const ChunkInfo&,bool){}
+ void emit_qwen3_prefill_w8a8_rms_quant(const ChunkInfo&,int64_t,uint32_t,uint32_t){}
  void emit_adarms_mut_refresh_post(int)const{assert(!adarms_);}
  RpuRmsNormSpmRoute consume_delivery_rmsnorm_route(int64_t,int64_t,int64_t,int)const{assert(false);return RpuRmsNormSpmRoute::BASE;}
  int consume_wall_mixed_rmsnorm_route(int64_t,int64_t,int64_t,int64_t)const{assert(false);return 0;}
@@ -246,6 +257,10 @@ struct Model {
  void build(int64_t logical=402){auto& plan=context.stage_plan;auto physical_len=seq_len_,position=context.position;
   struct{bool is_causal,use_attn_mask;int64_t batch_size;}layout{context.is_causal,context.attention_mask.has_value(),context.batch_size};
   const bool wall_prefill_owner_norm=enabled(),wall_action_linear_ring=false,qwen3vl4b_fused_o=false,wall_base_nvfp4_o_ring_norm=false,qwen3vl4b_fused_qk=false;
+  const bool qwen_a8=false,qwen_inplace=false,qwen_c512=false;
+  (void)qwen_inplace;
+  auto append_a8_quant=[&](const ChunkInfo&,int64_t){};
+  auto append_a8_linear=[&](const ChunkInfo&,qwen3_w8a8::Projection){};
   context.value={};auto& manifest=context.value;manifest.physical_length=physical_len;manifest.logical_length=logical;manifest.execution_padding_rows=physical_len-logical;
   auto append=[&](FmbRouteFamily f,int64_t site,int64_t selector,int64_t flags=0,std::vector<int64_t> args={},int64_t invocation=0){manifest.routes.push_back({site,f,selector,flags,args,invocation});};
   auto append_ring=[&](int64_t site,int64_t rows,int64_t i){append(FmbRouteFamily::ALL_REDUCE,site,causal_ring_route(rows,2048),0,{},i);};
@@ -261,6 +276,9 @@ struct Model {
  void emit_o(int layer,int chunk_index){const auto& chunk=context.stage_plan.compute.chunks.at(chunk_index);const auto& lw=layer_weights_.at(layer);
   int64_t rows=chunk.len,h=hidden,nq=this->nq,hd=this->hd,bs=context.batch_size;int tp=this->tp;int layer_idx=layer;
   uint32_t input_residual=addr(0,"residual1");bool residual_is_bf16=false;
+  const bool qwen_a8=false,qwen_inplace=false,qwen_c512=false,qwen_a8_rms_quant=false;
+  bool qwen_a8_postnorm_ready=false;(void)qwen_a8_postnorm_ready;
+  auto rpu_launch_qwen3_c192_all_reduce_residual_inplace_kernel=[&](uint32_t,uint32_t,int64_t){};
   O_BODY
  }
  void emit_mlp(int layer,int i){

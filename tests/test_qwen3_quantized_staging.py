@@ -34,7 +34,7 @@ class TinyStorage(nn.Module):
                 getattr(layer, owner).add_module(name, nn.Linear(512, 128, bias=False))
             layer.input_layernorm = nn.LayerNorm(128, bias=False)
             self.model.layers.append(layer)
-        self.lm_head = nn.Linear(512, 128, bias=False)
+        self.lm_head = nn.Linear(512, 384, bias=False)
 
 
 def config():
@@ -184,11 +184,11 @@ def test_bad_source_metadata_rejects_without_loading_payload(source, tmp_path, f
         (tmp_path / "model.safetensors").symlink_to(source[0] / "model.safetensors")
         (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {}}))
     else:
-        shape, dtype = (128, 512), torch.bfloat16
+        shape, dtype = (384, 512), torch.bfloat16
         if fault == "dtype":
             dtype = torch.uint8
         elif fault == "shape":
-            shape = (128, 256)
+            shape = (384, 256)
         elif fault == "unexpected":
             name = "unknown.weight"
         save_file({name: torch.zeros(shape, dtype=dtype)}, tmp_path / "model.safetensors")

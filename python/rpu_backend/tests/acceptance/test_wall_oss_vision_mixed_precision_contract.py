@@ -184,7 +184,7 @@ def test_block17_transition_and_bf16_residual_state_are_explicit():
     preload_end = source.index('void emit_exact_mimc_layer_params(', preload_start)
     preload = source[preload_start:preload_end]
     assert 'exact_mimc_fused_w8_gate_up_enabled()' in preload
-    assert preload.count('sdpa_dma_mask_to_spm(') == 3
+    assert preload.count('sdpa_dma_mask_to_spm(') == 4
     assert '!exact_mimc_native_window_sdpa_enabled()' in preload
     assert 'exact_mimc_native_window_sdpa_enabled() ? 1 : 0' in source
     assert 'ExactMimcPlan::kAttentionRows' in preload
@@ -216,13 +216,14 @@ def test_block17_transition_and_bf16_residual_state_are_explicit():
     assert 'graph_dma::' not in local_copy
 
 def test_python_signature_and_shape_gate_include_mixed_mode():
-    source = VISION_PY.read_text(encoding='utf-8')
-    assert source.count('"RPU_WALL_OSS_VISION_MIXED_PRECISION"') == 1
-    assert 'qwen25vl_vision_set_execution_routes' in source
-    assert source.count('int(self._mixed_precision)') == 2
-    assert 'any(n != 576 for n in counts)' in source
-    assert 'max_seq = min(max_seq, 576)' in source
-    assert 'mixed_w8a16 and L == 17' in source
+    source = VISION_PY.read_text(encoding="utf-8")
+    # Read once; the reduced-core refusal list may name it again.
+    assert source.count('rpu_env_bool(\n        "RPU_WALL_OSS_VISION_MIXED_PRECISION"') == 1
+    assert "qwen25vl_vision_set_execution_routes" in source
+    assert source.count("int(self._mixed_precision)") == 2
+    assert "any(n != 576 for n in counts)" in source
+    assert "max_seq = min(max_seq, 576)" in source
+    assert "mixed_w8a16 and L == 17" in source
     assert 'down_key = f"{p}.mlp.down_proj.weight"' in source
     assert 'cpu_st.get_tensor(down_key)' in source
     assert 'check_padding=False' in source
@@ -324,7 +325,7 @@ def test_decoder_layer2_transition_and_bf16_residual_state_are_explicit():
 def test_python_prefill_admission_and_signature_include_mixed_mode():
     source = LLM_PY.read_text(encoding='utf-8')
     assert '"RPU_WALL_OSS_PREFILL_MIXED_PRECISION"' in source
-    assert source.count('_prefill_mixed_precision_enabled()') == 3
+    assert source.count('_prefill_mixed_precision_enabled()') == 4
     assert 'int(mixed_precision)' in source
     assert 'layer_indices == list(range(36))' in source
     assert 'H == 2048 and NQ == 16 and NKV == 2 and HD == 128' in source

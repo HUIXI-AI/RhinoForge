@@ -164,9 +164,10 @@ class Pi05DenoiseStepModel {public:
   int64_t num_q_heads()const{return 8;}
   int64_t num_kv_heads()const{return 8;}
   int64_t head_dim()const{return 256;}
-  int attn_tp()const{return 8;}
-  int num_cores()const{return 8;}
-  int mlp_tp()const{return 8;}
+  int cores_=8,attn_tp_=8,mlp_tp_=8;
+  int attn_tp()const{return attn_tp_;}
+  int num_cores()const{return cores_;}
+  int mlp_tp()const{return mlp_tp_;}
   int num_layers()const{return 18;}
   int64_t intermediate_size()const{return 4096;}
   std::optional<Pi05SplitKvPlan> split_kv_plan(int64_t,int64_t)const;
@@ -348,7 +349,21 @@ int main(){
   model.nvfp4_spm_scale_.present=false;
   model.planned_loop_mode_=false;none("per-step graphs");model.planned_loop_mode_=true;
   model.planned_num_steps_=1;none("one step");model.planned_num_steps_=10;
-  model.planned_route_profile_valid_=false;none("no planned profile");
+  model.planned_route_profile_valid_=false;none("no planned profile");model.planned_route_profile_valid_=true;
+  // Reduced-core (4/6-core, attn_tp=4) loops have no split-KV share and must keep the ten-body
+  // AdaRMS table resident rather than opening the seven-channel step_boundary_dma_ rotation.
+  for(int cores:{4,6}) for(int64_t prefix:{544,800,928,960}) {
+    ++model.gen;
+    model.cores_=cores;model.attn_tp_=4;model.mlp_tp_=4;
+    model.chunk_size_=50;model.planned_prefix_len_=prefix;
+    assert(!model.split_kv_share_admitted()&&!model.use_pi05_adarms_body_stream());
+    assert(model.split_kv_share_layers(prefix+50,64)==std::make_pair(int64_t(0),int64_t(0)));
+    const auto decls=model.declare_buffers({64,prefix+50,true});
+    assert(!find(decls,"skv_q")&&!find(decls,"skv_share"));
+    assert(find(decls,"adarms_table")->size==10*37*3072*2);
+    assert(fixed(decls)+detail::estimate_temporary_total(decls)<=
+           (int64_t)SpmAllocator::SPM_PLANNING_BUDGET-PI05_DENOISE_SPLIT_KV_SHARE_HEADROOM);
+  }
 }
 """
     return program.replace("__NVFP4_DECLARE__", _definition(

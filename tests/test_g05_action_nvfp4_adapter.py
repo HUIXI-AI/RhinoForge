@@ -131,7 +131,7 @@ def test_action_mixed_failure_keeps_retry_prohibited_and_does_not_publish_precis
     payload = object()
     monkeypatch.setattr(action, '_check_g05_action_profile', lambda _: None)
     monkeypatch.setattr(quant, 'require_g05_action_nvfp4_native', lambda: None)
-    monkeypatch.setattr(quant, 'prepare_g05_action_nvfp4', lambda owner: payload)
+    monkeypatch.setattr(quant, 'prepare_g05_action_nvfp4', lambda owner, lanes=8: payload)
     monkeypatch.setattr(quant, 'quantize_g05_text_weights', lambda *a, **kw: None)
     calls = []
     def fail(owner, config, **kwargs):

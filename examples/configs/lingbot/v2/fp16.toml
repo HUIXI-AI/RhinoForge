@@ -1,0 +1,64 @@
+# 未写出的执行参数（省略即按以下值运行）：
+#   分块（chunk_size）模板未写出，按 auto 由入口选择；2026-10-19 在 8 核实测：模板默认输入（3 相机）vision 768、prefill 240、action 64；2 相机（2cam_t32）vision 512、prefill 176、action 64。可调范围见模型页。
+#   4/6 核时三段的 auto 分块由原生 planner 按各自核数选择，尚无实测记录；下方 prefill 可行长度是 8 核板测结果。
+# T 为完整、未截断指令的有效 token 数。
+[model]
+target = "lingbot2"
+# 本文件的权重/计算配方；切换精度须同时使用对应权重。
+precision = "fp16"
+# Graph 指令常驻（batch snapshot replay）："auto"（省略时与模板）或 "off"。auto 在 Launch SDK 支持且该 Graph 全部程序
+# 有审核契约时启用，否则退回普通 Graph replay，计算内容不变；"off" 始终用普通 replay。实际结果见 report.json 各 Graph 的
+# instruction_residency。只能改本文件，--set 不接受 model.*。
+instruction_residency = "auto"
+# 替换为匹配本模型与量化配方的本地资产路径或既有权重别名。
+checkpoint = "${RPU_MODEL_CACHE}/lingbot-vla-v2-6b"
+# 上游训练 YAML，须有顶层 train: 段，不随 checkpoint 提供；有无 align_params 决定 prefix 行数，见 README「训练配置」。
+training_config = "${LINGBOT2_TRAINING_CONFIG}"
+
+[input]
+# 替换为匹配下列输入形状的文件；固定 fixture 须保留其身份与格式。
+observation = "${LINGBOT2_3CAM_T32_OBSERVATION}"
+# 可选 2 / 3，须与 observation 一致。2 相机用 --input 2cam_t32 --set input.observation=<2 相机 T32 observation>。
+cameras = 3
+# 实际有效 token 数必须等于此值；可改为 1–160，并同步输入与 max_language_tokens。
+expected_language_tokens = 32
+# 语言 token 上限：1–160，省略时为 72，须不小于 expected_language_tokens；有效 token 超过 72 时取消注释。
+# max_language_tokens = 160
+
+[run]
+# 预热次数；不计入正式测量。
+warmup = 2
+# 正式执行次数，正整数。
+runs = 5
+# 随机种子，非负整数。
+seed = 0
+# 结果输出目录；并发运行使用不同目录。
+output_dir = "results/lingbot2/fp16"
+# 按需开启硬件采样；保持 false 可减少测量干扰。
+hwperf = false
+# 按需开启 profiler；正式计时建议保持 false。
+profile = false
+
+[cpu]
+# CPU intra-op 线程数，正整数；写出时按写的值。省略时按 rpu_execution.model.num_cores：8 核为 1，4/6 核为 12。
+# 4/6 核时 Vision 的 patch embed 和 4 个 merger 的 GEMM 在 RPU 的 4 路上算（FP16，与 8 核相同），merger 的 LayerNorm 和 GELU 仍在 CPU。
+# 这两部分以前在 CPU 上，2026-11-07 在参考板 CPU（24 核）上单测：1 相机 1 线程约 806 ms、12 线程约 85 ms，3 相机约 2295 / 230 ms；默认值沿用 12。
+# threads = 12
+
+[rpu_execution.model]
+# RPU 核数预算：4、6 或 8（省略为 8），冷配置，修改后需重新加载模型。
+# 8 核：Vision、文本骨干和动作专家都用 8 核（注意力 TP8）。
+# 4/6 核：文本骨干 Attention 4 核、MLP 用全部 4/6 核（6 核时 MLP 中间维 9728 补零到 9792），Vision 和动作专家用 4 核；
+#   Vision 逐图执行，patch embed 和 merger 的 GEMM 在 Vision 的 4 路上算（见 [cpu]），动作专家只走稀疏专家路由；其余 8 核专用路由（runtime Graph、
+#   Vision 批处理、融合 merger、direct prefix、AdaRMS 融合广播）不启用，入口在加载权重前关闭这些开关。
+num_cores = 8
+
+# auto 选择可准入的物理布局；补齐行不会增加有效 token。
+[rpu_execution.prefill]
+# 允许的物理补齐行上限，非负整数；省略时为 15，模板为 64。补齐行不增加有效 token。
+# prefix 为 2cam 132+T、3cam 198+T 行（training_config 不含 align_params 时；含时各加 16 行，即 148+T、214+T），先对齐到 16 的倍数，再最多补 padding_budget 行。2026-10-23 板测：对齐后 144、160、176、
+# 192、208、224、240、256、288、320、400 行有可行 prefill 布局，272、304、336、352、368、384 行没有（NO_FEASIBLE）。
+# 取 64 时 T1–160 都能补到上述可行长度（最多 3cam 336→400）；取 15 时只用对齐长度本身，取 63 时 3cam T123–138（对齐 336 行；对齐开启时为 T107–122）不可运行。2026-10-23 板测的 training_config 不含 align_params。
+# 2026-10-30 在 native 997a369c（运行库 main 4b7e723d / expansion 9f7a2081）上复验 3cam T128（对齐 336 行）/ padding_budget=63：
+# fp16 与 w8a16 仍以 NO_FEASIBLE（seq_len=336）被拒，上面的可行与不可行长度未变。
+padding_budget = 64

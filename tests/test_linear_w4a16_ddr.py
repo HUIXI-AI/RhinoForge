@@ -75,6 +75,7 @@ Tensor rpu_retain_linear_quant_scale(const Tensor&,const Tensor& scale,int64_t c
     # caller never passes one, but the struct is taken from the header rather
     # than restated here, so a changed layout reaches this contract.
     program += _definition(header, "struct LinearConv1dSlab") + ";\n"
+    program += _definition(header, "enum class GeluMode") + ";\n"
     begin = header.index("void rpu_launch_linear_ddr_kernel(")
     program += header[begin:header.index(";", begin) + 1]
     for declaration in ("at::Tensor rpu_linear_w4a16(", "at::Tensor rpu_linear_with_accumulation("):
@@ -118,6 +119,8 @@ void rpu_launch_linear_spm_to_spm_kernel(
   last_k=input.size(1); ++launches;*output.storage=launches;
 }
 '''
+    # As for the launcher, the public declaration carries the gelu_erf default.
+    program += "\n"
     program += _definition(source, "Tensor rpu_linear_with_accumulation(")
     program += _definition(source, "Tensor rpu_linear_with_core_count(")
     program += _definition(source, "Tensor rpu_linear_w4a16(")

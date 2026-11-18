@@ -13,6 +13,22 @@ from _native_runtime_identity import runtime_identity_include
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.mark.parametrize("qkv,mlp", [(True, False), (False, True), (True, True)])
+def test_siglip_w4_rejects_a8_before_weight_validation_or_conversion(monkeypatch, qkv, mlp):
+    from rpu_backend.adapters import siglip
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("unsupported W4/A8 install reached weight validation or conversion")
+
+    monkeypatch.setattr(siglip, "_validate_siglip_w8a8", unexpected)
+    monkeypatch.setattr(siglip, "_convert_siglip_weights_for_rpu", unexpected)
+    with pytest.raises(ValueError, match="W8A8 requires W8A16 weights"):
+        siglip.patch_siglip_model_for_rpu_all_layers_once(
+            object(), object(), num_images=2, num_cores=8,
+            w8a16_default=True, linear_acc32=False, w4a16=True,
+            qkv_w8a8=qkv, mlp_w8a8=mlp)
+
+
 def _function(source, marker):
     start = source.index(marker)
     masked = re.sub(r'//[^\n]*|/\*[\s\S]*?\*/|"(?:\\.|[^"\\])*"',
@@ -42,6 +58,381 @@ def _run_native(tmp_path, source, torch, *, extra_sources=()):
     result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
     return result.stdout
+
+
+def test_siglip_qkv_w8a8_actual_manifest_and_layout_identity(tmp_path, monkeypatch):
+    """Run native admission/identity code; only installed-payload lookup is a double."""
+    monkeypatch.setenv("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
+    import torch
+
+    owner = (ROOT / "src/fused/rpu_siglip_model.cpp").read_text()
+    constants = "\n".join(line for line in owner.splitlines()
+                          if line.startswith("constexpr int64_t SIGLIP_"))
+    functions = "\n".join(_function(owner, marker).replace(" const override", " const") for marker in (
+        "    std::vector<int64_t> pi05_vision_qkv_w8a8_identity(",
+        "    void require_pi05_vision_qkv_w8a8_profile(",
+        "    void validate_pi05_vision_qkv_w8a8_manifest(",
+        "    int64_t subclass_layout_hash(",
+        "    int64_t subclass_layout_hash_without_ln_stream(",
+        "    int64_t ln_stream_elems(",
+    ))
+    source = r'''
+#include "core/fused_model_base.h"
+#include "fused/rpu_siglip_w8a8_contract.h"
+#include <cassert>
+#include <iostream>
+using namespace v3;
+enum class KernelId : uint16_t { LAYER_NORM_QUANTIZE_W8A8_H1152, LINEAR };
+struct KernelCache {
+    bool norm=true, linear=true;
+    static KernelCache& instance() { static KernelCache cache; return cache; }
+    bool has_loaded(KernelId id) const {
+        return id==KernelId::LAYER_NORM_QUANTIZE_W8A8_H1152 ? norm : linear;
+    }
+};
+''' + constants + r'''
+namespace v3 {
+struct Owner {
+    bool qkv_w8a8_=true,mlp_w8a8_=false,linear_acc32_=false,audio_mode_=false;
+    int cores=8;
+    int64_t image_batch_count_=2,orig_head_dim_=72,projection_dim_=2048;
+    double eps_=1e-6;
+    std::optional<bool> configured_linear_acc32_=false;
+    std::vector<int> layer_weights_=std::vector<int>(27),layer_bias_norm_=std::vector<int>(27);
+    bool pi05_vision_fc_weight_outer_opt_in_=false,pi05_vision_kv_spm_only_opt_in_=false;
+    bool pi05_vision_owner_ln_opt_in_=false,pi05_ring_xor3_opt_in_=false;
+    bool pi05_vision_merge_segment_opt_in_=false,pi05_vision_q_resident_opt_in_=false;
+    bool pi05_vision_ln_stream_opt_in_=false;
+    at::Tensor audio_proj2_w_;
+    int num_cores() const {return cores;}
+    int attn_tp() const {return cores;}
+    int mlp_tp() const {return cores;}
+    int64_t num_layers() const {return layer_weights_.size();}
+    int64_t hidden_size() const {return 1152;}
+    int64_t intermediate_size() const {return 4352;}
+    int64_t num_q_heads() const {return 16;}
+    int64_t num_kv_heads() const {return 16;}
+    int64_t head_dim() const {return 80;}
+    std::vector<int64_t> core_profile_arguments() const {return {cores};}
+    std::vector<int64_t> pi05_vision_fc_arguments(bool) const {return {};}
+    std::vector<int64_t> pi05_vision_owner_ln_arguments(bool,int64_t) const {return {};}
+    std::vector<int64_t> pi05_vision_mlp_w8a8_identity() const {return {};}
+    KernelId pi05_vision_qkv_w8a8_linear_id(int64_t) const {return KernelId::LINEAR;}
+    void require_pi05_vision_qkv_w8a8_payloads(int64_t) const {
+        TORCH_CHECK(KernelCache::instance().norm && KernelCache::instance().linear,"missing payload");
+    }
+''' + functions + r'''
+};
+} // Native owner methods retain their production namespace.
+template<class F> void rejects(F run) {
+    bool rejected=false;
+    try {run();} catch(const c10::Error&) {rejected=true;}
+    catch(const std::invalid_argument&) {rejected=true;}
+    assert(rejected);
+}
+FmbPhysicalExecutionManifest manifest(int64_t rows,bool enabled) {
+    FmbPhysicalExecutionManifest m;
+    m.state=FmbPhysicalManifestState::COMPLETE;
+    m.logical_length=m.physical_length=m.kv_logical_length=m.kv_insert_physical_rows=rows;
+    m.graph_lifecycle=FmbGraphLifecycle::COMPOSITE_CHILD;
+    m.linear_accumulation=FmbLinearAccumulationPolicy::ACC16;
+    if(enabled)m.routes.push_back({SIGLIP_LN1_QUANT_W8A8_SITE,FmbRouteFamily::NORMALIZATION,
+        SIGLIP_LN1_QUANT_W8A8_ROUTE,0,siglip_qkv_w8a8::norm_arguments(rows),0});
+    for(auto site:{SIGLIP_Q_LINEAR_SITE,SIGLIP_K_LINEAR_SITE,SIGLIP_V_LINEAR_SITE})
+        m.routes.push_back({site,FmbRouteFamily::LINEAR,
+            enabled?SIGLIP_QKV_W8A8_LINEAR_ROUTE:static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),
+            0,enabled?siglip_qkv_w8a8::linear_arguments(rows):std::vector<int64_t>{},0});
+    return m;
+}
+int main() {
+    for(int64_t rows:{512,768}) {
+        Owner on,off;on.image_batch_count_=off.image_batch_count_=rows/256;off.qkv_w8a8_=false;
+        auto correct=manifest(rows,true),legacy=manifest(rows,false);
+        on.validate_pi05_vision_qkv_w8a8_manifest(correct);
+        off.validate_pi05_vision_qkv_w8a8_manifest(legacy);
+        rejects([&]{on.validate_pi05_vision_qkv_w8a8_manifest(legacy);});
+        rejects([&]{off.validate_pi05_vision_qkv_w8a8_manifest(correct);});
+        assert(on.subclass_layout_hash()!=off.subclass_layout_hash());
+        const auto loaded_identity=on.subclass_layout_hash();
+        KernelCache::instance().norm=false;
+        assert(on.subclass_layout_hash()!=loaded_identity);
+        rejects([&]{on.validate_pi05_vision_qkv_w8a8_manifest(correct);});
+        KernelCache::instance().norm=true;
+        // Every fused-LN/quant ABI field and every selected PL tile/flag is bound.
+        for(int route:{0,1})for(size_t field=0;field<correct.routes[route].arguments.size();++field) {
+            auto wrong=correct;++wrong.routes[route].arguments[field];
+            rejects([&]{on.validate_pi05_vision_qkv_w8a8_manifest(wrong);});
+        }
+        for(int route=0;route<4;++route)for(int field=0;field<3;++field) {
+            auto wrong=correct;
+            if(field==0)++wrong.routes[route].selector;
+            if(field==1)++wrong.routes[route].flags;
+            if(field==2)++wrong.routes[route].invocation;
+            rejects([&]{on.validate_pi05_vision_qkv_w8a8_manifest(wrong);});
+        }
+        auto missing=correct;missing.routes.pop_back();
+        rejects([&]{on.validate_pi05_vision_qkv_w8a8_manifest(missing);});
+        auto duplicate=correct;duplicate.routes.push_back(correct.routes.back());
+        rejects([&]{on.validate_pi05_vision_qkv_w8a8_manifest(duplicate);});
+        auto foreign=correct;foreign.routes.back().site_id=SIGLIP_O_LINEAR_SITE;
+        rejects([&]{on.validate_pi05_vision_qkv_w8a8_manifest(foreign);});
+        auto padded=correct;padded.logical_length-=16;padded.execution_padding_rows=16;
+        rejects([&]{on.validate_pi05_vision_qkv_w8a8_manifest(padded);});
+        auto acc32=correct;acc32.linear_accumulation=FmbLinearAccumulationPolicy::ACC32;
+        rejects([&]{on.validate_pi05_vision_qkv_w8a8_manifest(acc32);});
+        on.cores=4;rejects([&]{on.require_pi05_vision_qkv_w8a8_profile(rows,rows/256);});on.cores=8;
+        on.eps_=1e-5;rejects([&]{on.require_pi05_vision_qkv_w8a8_profile(rows,rows/256);});on.eps_=1e-6;
+        rejects([&]{on.require_pi05_vision_qkv_w8a8_profile(rows,1);});
+        rejects([&]{on.require_pi05_vision_qkv_w8a8_profile(rows-16,rows/256);});
+    }
+    std::cout<<"SigLIP actual W8A8 manifest and identity: PASS\n";
+}
+'''
+    assert "SigLIP actual W8A8 manifest and identity: PASS" in _run_native(tmp_path, source, torch)
+
+
+def test_siglip_mlp_w8a8_workspace_preserves_complete_live_roots(tmp_path, monkeypatch):
+    """Use the real byte layout/range validators, including dead-tail reuse."""
+    monkeypatch.setenv("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
+    import torch
+
+    source = r'''
+#include "fused/rpu_siglip_w8a8_contract.h"
+#include <cassert>
+#include <iostream>
+template<class F> void rejects(F run) {
+    bool rejected=false;
+    try {run();} catch(const std::invalid_argument&) {rejected=true;}
+    assert(rejected);
+}
+int main() {
+    for(int64_t rows:{512,768}) {
+        const auto w=siglip_mlp_w8a8::workspace(rows);
+        const uint64_t expected_raw=rows==512?147456:221184;
+        const uint64_t expected_q_end=rows==512?425984:638976;
+        const uint64_t expected_sx_end=rows==512?427008:640512;
+        assert(w.raw_bytes==expected_raw && w.fc2_q_offset==expected_raw);
+        assert(w.fc2_q_offset+w.fc2_q_bytes==expected_q_end);
+        assert(w.sx_offset==expected_q_end && w.sx_offset+w.sx_bytes==expected_sx_end);
+        assert(w.full_bytes==uint64_t(rows)*1152*2);
+        assert(w.fc1_q_bytes==uint64_t(rows)*1152 && w.fc1_bytes==uint64_t(rows)*544*2);
+        assert(w.sx_offset+w.sx_bytes<w.full_bytes);
+        siglip_mlp_w8a8::validate_root_extents(rows,w.full_bytes,w.full_bytes,w.fc1_bytes,w.full_bytes);
+        for(int bad=0;bad<4;++bad) {
+            std::array<uint64_t,4> sizes{w.full_bytes,w.full_bytes,w.fc1_bytes,w.full_bytes};
+            --sizes[bad];
+            rejects([&]{siglip_mlp_w8a8::validate_root_extents(rows,sizes[0],sizes[1],sizes[2],sizes[3]);});
+        }
+        const uint64_t base=0x40000000,capacity=8387584;
+        const std::array<uint64_t,4> roots{base+256,base+256+w.full_bytes,
+            base+256+2*w.full_bytes,base+256+2*w.full_bytes+w.fc1_bytes};
+        const auto validate=[&](const auto& r){siglip_mlp_w8a8::validate_roots(rows,base,capacity,r[0],r[1],r[2],r[3]);};
+        validate(roots);
+        for(int bad=0;bad<4;++bad) {
+            auto wrong=roots;wrong[bad]+=1;rejects([&]{validate(wrong);});
+            wrong=roots;wrong[bad]=base-256;rejects([&]{validate(wrong);});
+            wrong=roots;wrong[bad]=base+capacity;rejects([&]{validate(wrong);});
+            wrong=roots;wrong[bad]=roots[(bad+1)%4];rejects([&]{validate(wrong);});
+        }
+        // A8 uses only half the O root, but its full FP16 partial input remains
+        // live through owner reduction. A second root cannot occupy that tail.
+        auto partial_tail=roots;partial_tail[1]=roots[0]+w.fc1_q_bytes;
+        rejects([&]{validate(partial_tail);});
+        for(bool second:{false,true}) {
+            const auto c=siglip_mlp_w8a8::candidate(rows,second);
+            assert(c.compiled_local_k==(second?544:1152));
+            const auto args=siglip_mlp_w8a8::linear_arguments(rows,second);
+            assert(args[1]==rows && args[5]==(second?0:1) && args[8]==16);
+        }
+    }
+    for(int64_t rows:{-1,0,256,511,513,769,1024})
+        rejects([&]{(void)siglip_mlp_w8a8::workspace(rows);});
+    std::cout<<"SigLIP MLP W8A8 bounded live workspace: PASS\n";
+}
+'''
+    assert "SigLIP MLP W8A8 bounded live workspace: PASS" in _run_native(tmp_path, source, torch)
+
+
+def test_siglip_mlp_w8a8_actual_manifest_profile_and_cold_identity(tmp_path, monkeypatch):
+    """Real owner/QKV/MLP validators compose without selector collisions."""
+    monkeypatch.setenv("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
+    import torch
+
+    owner = (ROOT / "src/fused/rpu_siglip_model.cpp").read_text()
+    constants = "\n".join(line for line in owner.splitlines()
+                          if line.startswith("constexpr int64_t SIGLIP_"))
+    functions = "\n".join(_function(owner, marker).replace(" const override", " const") for marker in (
+        "    KernelId pi05_vision_mlp_w8a8_owner_id(",
+        "    void require_pi05_vision_mlp_w8a8_payloads(",
+        "    std::vector<int64_t> pi05_vision_mlp_w8a8_identity(",
+        "    void require_pi05_vision_mlp_w8a8_profile(",
+        "    void validate_pi05_vision_mlp_w8a8_manifest(",
+        "    std::vector<int64_t> pi05_vision_qkv_w8a8_identity(",
+        "    void require_pi05_vision_qkv_w8a8_profile(",
+        "    void validate_pi05_vision_qkv_w8a8_manifest(",
+        "    std::vector<int64_t> pi05_vision_owner_ln_arguments(",
+        "    void require_pi05_vision_owner_ln_profile(",
+        "    void validate_pi05_vision_owner_ln_manifest(",
+        "    int64_t subclass_layout_hash(",
+        "    int64_t subclass_layout_hash_without_ln_stream(",
+        "    int64_t ln_stream_elems(",
+    ))
+    source = r'''
+#include "core/fused_model_base.h"
+#include "fused/rpu_siglip_w8a8_contract.h"
+#include <cassert>
+#include <iostream>
+#include <set>
+using namespace v3;
+enum class KernelId : uint16_t { LAYER_NORM_QUANTIZE_W8A8_H1152, GELU_TANH_QUANTIZE_W8A8_H544,
+    PI05_VISION_OWNER_LAYERNORM_QUANTIZE_W8A8_M512N1152,
+    PI05_VISION_OWNER_LAYERNORM_QUANTIZE_W8A8_M768N1152, FC1, FC2, QKV };
+struct KernelCache {
+    std::set<KernelId> missing;
+    static KernelCache& instance() {static KernelCache cache;return cache;}
+    bool has_loaded(KernelId id) const {return !missing.count(id);}
+};
+''' + constants + r'''
+namespace v3 {
+struct Owner {
+    bool qkv_w8a8_=false,mlp_w8a8_=true,linear_acc32_=false,audio_mode_=false;
+    int cores=8;
+    int64_t image_batch_count_=2,orig_head_dim_=72,projection_dim_=2048;
+    double eps_=1e-6;
+    std::optional<bool> configured_linear_acc32_=false;
+    std::vector<int> layer_weights_=std::vector<int>(27),layer_bias_norm_=std::vector<int>(27);
+    bool pi05_vision_fc_weight_outer_opt_in_=false,pi05_vision_kv_spm_only_opt_in_=true;
+    bool pi05_vision_owner_ln_opt_in_=true,pi05_ring_xor3_opt_in_=true;
+    bool pi05_vision_merge_segment_opt_in_=false,pi05_vision_q_resident_opt_in_=false;
+    bool pi05_vision_ln_stream_opt_in_=false;
+    at::Tensor audio_proj2_w_;
+    int num_cores() const {return cores;}
+    int attn_tp() const {return cores;}
+    int mlp_tp() const {return cores;}
+    int64_t num_layers() const {return layer_weights_.size();}
+    int64_t hidden_size() const {return 1152;}
+    int64_t intermediate_size() const {return 4352;}
+    int64_t num_q_heads() const {return 16;}
+    int64_t num_kv_heads() const {return 16;}
+    int64_t head_dim() const {return 80;}
+    bool pi05_vision_supported_owner() const {return true;}
+    void require_pi05_vision_owner_ln_payloads(int64_t) const {}
+    FmbLinearAccumulationPolicy linear_accumulation_policy() const {
+        return linear_acc32_?FmbLinearAccumulationPolicy::ACC32:FmbLinearAccumulationPolicy::ACC16;
+    }
+    std::vector<int64_t> core_profile_arguments() const {return {cores};}
+    std::vector<int64_t> pi05_vision_fc_arguments(bool) const {return {};}
+    KernelId pi05_vision_mlp_w8a8_linear_id(int64_t,bool second) const {return second?KernelId::FC2:KernelId::FC1;}
+    KernelId pi05_vision_qkv_w8a8_linear_id(int64_t) const {return KernelId::QKV;}
+    void require_pi05_vision_qkv_w8a8_payloads(int64_t) const {
+        TORCH_CHECK(KernelCache::instance().has_loaded(KernelId::LAYER_NORM_QUANTIZE_W8A8_H1152) &&
+                    KernelCache::instance().has_loaded(KernelId::QKV),"missing QKV payload");
+    }
+''' + functions + r'''
+};
+}
+template<class F> void rejects(F run) {
+    bool rejected=false;
+    try {run();} catch(const c10::Error&) {rejected=true;}
+    catch(const std::invalid_argument&) {rejected=true;}
+    assert(rejected);
+}
+FmbPhysicalExecutionManifest manifest(int64_t rows,bool mlp,bool qkv) {
+    FmbPhysicalExecutionManifest m;
+    m.state=FmbPhysicalManifestState::COMPLETE;
+    m.logical_length=m.physical_length=m.kv_logical_length=m.kv_insert_physical_rows=rows;
+    m.graph_lifecycle=FmbGraphLifecycle::COMPOSITE_CHILD;
+    m.linear_accumulation=FmbLinearAccumulationPolicy::ACC16;
+    Owner owner;
+    m.routes.push_back({SIGLIP_ATTN_ALL_REDUCE_SITE,FmbRouteFamily::ALL_REDUCE,
+        mlp?SIGLIP_OWNER_LN_QUANT_W8A8_ROUTE:SIGLIP_OWNER_LN_ROUTE,0,
+        mlp?siglip_mlp_w8a8::owner_arguments(rows):owner.pi05_vision_owner_ln_arguments(false,rows),0});
+    for(bool second:{false,true}) {
+        m.routes.push_back({second?SIGLIP_FC2_LINEAR_SITE:SIGLIP_FC1_LINEAR_SITE,FmbRouteFamily::LINEAR,
+            mlp?SIGLIP_MLP_W8A8_LINEAR_ROUTE:static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),0,
+            mlp?siglip_mlp_w8a8::linear_arguments(rows,second):std::vector<int64_t>{},0});
+    }
+    if(mlp)m.routes.push_back({SIGLIP_GELU_QUANT_W8A8_SITE,FmbRouteFamily::ACTIVATION,
+        SIGLIP_GELU_QUANT_W8A8_ROUTE,0,siglip_mlp_w8a8::gelu_arguments(rows),0});
+    m.routes.push_back({SIGLIP_MLP_ALL_REDUCE_SITE,FmbRouteFamily::ALL_REDUCE,
+        SIGLIP_OWNER_LN_COMPACT_ROUTE,0,owner.pi05_vision_owner_ln_arguments(true,rows),0});
+    m.routes.push_back({SIGLIP_RAW_SPM_ATTN_SITE,FmbRouteFamily::ATTENTION,
+        static_cast<int64_t>(AttentionExecutionPolicy::SPM_KV_BY_MHA),0,{rows/256,256,rows,rows,16,80},0});
+    if(qkv)m.routes.push_back({SIGLIP_LN1_QUANT_W8A8_SITE,FmbRouteFamily::NORMALIZATION,
+        SIGLIP_LN1_QUANT_W8A8_ROUTE,0,siglip_qkv_w8a8::norm_arguments(rows),0});
+    for(auto site:{SIGLIP_Q_LINEAR_SITE,SIGLIP_K_LINEAR_SITE,SIGLIP_V_LINEAR_SITE})
+        m.routes.push_back({site,FmbRouteFamily::LINEAR,
+            qkv?SIGLIP_QKV_W8A8_LINEAR_ROUTE:static_cast<int64_t>(FmbLinearRouteSelector::AUTO_TILE),0,
+            qkv?siglip_qkv_w8a8::linear_arguments(rows):std::vector<int64_t>{},0});
+    return m;
+}
+int main() {
+    for(int64_t rows:{512,768})for(bool qkv:{false,true}) {
+        Owner on,off;on.image_batch_count_=off.image_batch_count_=rows/256;
+        on.qkv_w8a8_=off.qkv_w8a8_=qkv;off.mlp_w8a8_=false;
+        auto correct=manifest(rows,true,qkv),legacy=manifest(rows,false,qkv);
+        const auto validate=[&](const auto& m){
+            on.validate_pi05_vision_mlp_w8a8_manifest(m);
+            on.validate_pi05_vision_owner_ln_manifest(m);
+            on.validate_pi05_vision_qkv_w8a8_manifest(m);
+        };
+        validate(correct);
+        off.validate_pi05_vision_mlp_w8a8_manifest(legacy);
+        off.validate_pi05_vision_owner_ln_manifest(legacy);
+        off.validate_pi05_vision_qkv_w8a8_manifest(legacy);
+        rejects([&]{validate(legacy);});
+        rejects([&]{off.validate_pi05_vision_mlp_w8a8_manifest(correct);});
+        assert(on.subclass_layout_hash()!=off.subclass_layout_hash());
+        const auto original_hash=on.subclass_layout_hash();
+        for(auto missing:{KernelId::GELU_TANH_QUANTIZE_W8A8_H544,
+                          on.pi05_vision_mlp_w8a8_owner_id(rows),KernelId::FC1,KernelId::FC2}) {
+            KernelCache::instance().missing.insert(missing);
+            assert(on.subclass_layout_hash()!=original_hash);
+            rejects([&]{validate(correct);});
+            KernelCache::instance().missing.clear();
+        }
+        // Each owner/FC1/FC2/GELU ABI and tail-offset field binds the descriptor.
+        for(int route=0;route<4;++route) {
+            for(size_t field=0;field<correct.routes[route].arguments.size();++field) {
+                auto wrong=correct;++wrong.routes[route].arguments[field];
+                rejects([&]{validate(wrong);});
+            }
+            for(int field=0;field<4;++field) {
+                auto wrong=correct;
+                if(field==0)++wrong.routes[route].selector;
+                if(field==1)++wrong.routes[route].flags;
+                if(field==2)++wrong.routes[route].invocation;
+                if(field==3)wrong.routes[route].family=FmbRouteFamily::GRAPH_SCHEDULE;
+                rejects([&]{validate(wrong);});
+            }
+            auto missing=correct;missing.routes.erase(missing.routes.begin()+route);
+            rejects([&]{validate(missing);});
+            auto duplicate=correct;duplicate.routes.push_back(correct.routes[route]);
+            rejects([&]{validate(duplicate);});
+            auto foreign=correct;foreign.routes[route].site_id=SIGLIP_O_LINEAR_SITE;
+            rejects([&]{validate(foreign);});
+        }
+        auto wrong_compact=correct;++wrong_compact.routes[4].arguments[0];
+        rejects([&]{validate(wrong_compact);});
+        auto padded=correct;padded.logical_length-=16;padded.execution_padding_rows=16;
+        rejects([&]{validate(padded);});
+        auto acc32=correct;acc32.linear_accumulation=FmbLinearAccumulationPolicy::ACC32;
+        rejects([&]{validate(acc32);});
+        for(int cores:{4,6}) {on.cores=cores;rejects([&]{validate(correct);});}on.cores=8;
+        for(auto flag:{&on.linear_acc32_,&on.audio_mode_,&on.pi05_vision_fc_weight_outer_opt_in_}) {
+            *flag=true;rejects([&]{validate(correct);});*flag=false;
+        }
+        for(auto flag:{&on.pi05_vision_owner_ln_opt_in_,&on.pi05_vision_kv_spm_only_opt_in_,&on.pi05_ring_xor3_opt_in_}) {
+            *flag=false;rejects([&]{validate(correct);});*flag=true;
+        }
+        on.eps_=1e-5;rejects([&]{validate(correct);});on.eps_=1e-6;
+        rejects([&]{on.require_pi05_vision_mlp_w8a8_profile(rows,1);});
+        rejects([&]{on.require_pi05_vision_mlp_w8a8_profile(rows-16,rows/256);});
+    }
+    std::cout<<"SigLIP actual MLP/QKV composed manifest and identity: PASS\n";
+}
+'''
+    assert "SigLIP actual MLP/QKV composed manifest and identity: PASS" in _run_native(tmp_path, source, torch)
 
 
 def test_actual_image_and_pi_loop_publication_preserves_dirty_live_ranges(tmp_path, monkeypatch):
@@ -234,11 +625,15 @@ struct Siglip{
  // This existing packed/public test never admits private reduced-core N1.
  // The new receipt is tested whole in test_pi05_serial_cpu_camera_slab_receipt.
  bool private_serial_cpu_slab_published_=false;
+ bool qkv_w8a8_=false,mlp_w8a8_=false;
+ void require_pi05_vision_qkv_w8a8_profile(int64_t,int64_t) const {}
+ void require_pi05_vision_mlp_w8a8_profile(int64_t,int64_t) const {}
  bool prepare_private_serial_cpu_slab(const at::Tensor&,at::Tensor&){assert(false);return false;}
  at::Tensor patch_emb_weight_,patch_emb_pos_emb_;PatchEmbeddingLiveBases patch_embedding_live_bases_;
  int64_t pe_kh_=14,pe_kw_=14,pe_cin_orig_=3,pe_cin_padded_=16,pe_cout_=1152,pe_strideh_=14,pe_stridew_=14;
  bool linear_acc32_=false;v3::InferenceContext context;const v3::InferenceContext& ctx(){return context;}
  bool has_patch_emb_=true,owner_supported=true;int cores=8;
+ bool pi05_vision_kv_spm_only_opt_in_=false,pi05_vision_q_resident_opt_in_=false;
  int64_t num_layers(){return 27;}int num_cores(){return cores;}
  int64_t hidden_size(){return 1152;}int64_t intermediate_size(){return 4352;}
  int64_t num_q_heads(){return 16;}int64_t num_kv_heads(){return 16;}
@@ -823,16 +1218,19 @@ using namespace v3;
 struct Owner {
     int cores=8;
     int64_t image_batch_count_=1,configured_chunk_size_=0;
-    bool audio_mode_=false,has_patch_emb_=true;
-    bool pi05_vision_fc_weight_outer_opt_in_=false,pi05_vision_kv_spm_only_opt_in_=false;
+    bool audio_mode_=false,has_patch_emb_=true,qkv_w8a8_=false,mlp_w8a8_=false;
+    bool pi05_vision_fc_weight_outer_opt_in_=false,pi05_vision_kv_spm_only_opt_in_=false,pi05_vision_q_resident_opt_in_=false;
+    bool supported_owner=false;
     int64_t orig_head_dim_=72,projection_dim_=2048;
     struct Weight { at::Tensor q_w; };
     std::vector<Weight> layer_weights_;
     std::vector<int> layer_bias_norm_;
     int64_t num_layers() const { return 27; }
     int64_t num_kv_heads() const { return 16; }
-    bool pi05_vision_supported_owner() const { return false; }
+    bool pi05_vision_supported_owner() const { return supported_owner; }
     void require_pi05_vision_owner_ln_profile(int64_t,int64_t) const {}
+    void require_pi05_vision_qkv_w8a8_profile(int64_t,int64_t) const {}
+ void require_pi05_vision_mlp_w8a8_profile(int64_t,int64_t) const {}
     struct State { int64_t chunk_size_override_=0; } state;
     State* pimpl_=&state;
     int num_cores() const { return cores; }
@@ -889,6 +1287,12 @@ int main() {
     for(int images:{2,3}) {
         Owner m; m.cores=4;
         assert(rejects([&]{m.configure_chunk_for_shape(images*256,images);},"serial image or bounded audio"));
+        Owner p; p.cores=4; p.supported_owner=true;
+        p.pi05_vision_kv_spm_only_opt_in_=true; p.pi05_vision_q_resident_opt_in_=true;
+        p.configure_chunk_for_shape(images*256,images);
+        assert(p.state.chunk_size_override_==images*256);
+        assert(p.subclass_chunk_size_valid(images*256,images*256,0));
+        assert(!p.subclass_chunk_size_valid(256,images*256,0));
     }
     Owner too_small; too_small.configured_chunk_size_=256;
     assert(rejects([&]{too_small.configure_chunk_for_shape(768,3);},"full sequence"));
@@ -1136,6 +1540,8 @@ def _serial_siglip_forward(monkeypatch, *, captured, legacy_alias=False):
             GraphSignature=lambda **fields: fields)),
         _num_images=1, _seq_len=256, _num_layers=1, _num_heads=16,
         _padded_head_dim=80, _attn_tp=8, _siglip_sig_w8a16=0,
+        qkv_w8a8=False, mlp_w8a8=False,
+        _siglip_sig_qkv_w8a8=0, _siglip_sig_mlp_w8a8=0,
         _split_siglip_graph=captured, _SIGLIP_BRANCH_PATCH_EMBED=1,
         _SIGLIP_BRANCH_PRE_EMBEDDED=2,
         _siglip_component_execution_plan=lambda *args, **kwargs: plan,
@@ -1294,7 +1700,7 @@ void rpu_launch_linear_ddr_kernel(const Tensor& input,const Tensor&,const Tensor
 struct Owner {
  int cores=4;
  int64_t image_batch_count_=1,seq_len_=256,projection_dim_=2048,local_q_heads_=4;
- bool pi05_vision_kv_spm_only_opt_in_=false;
+ bool pi05_vision_kv_spm_only_opt_in_=false,qkv_w8a8_=false,mlp_w8a8_=false;
  std::map<std::pair<int64_t,int64_t>,at::Tensor> q_ddr_slots_;
  at::Tensor projector_output_,proj_w_,proj_b_=at::zeros({2048},at::kHalf);
  at::Tensor audio_proj2_w_; // Vision profiles have no audio tail.
@@ -1309,6 +1715,8 @@ struct Owner {
  int num_cores() const {return cores;}
  void configure_chunk_for_shape(int64_t,int64_t) {}
  void validate_pi05_vision_owner_ln_policy(int,int64_t,int64_t) {}
+ void validate_pi05_vision_qkv_w8a8_policy(int,int64_t,int64_t) {}
+ void validate_pi05_vision_mlp_w8a8_policy(int,int64_t,int64_t) {}
  void validate_pi05_vision_kv_spm_only_policy(int,int64_t,int64_t) {}
  std::vector<BufferDecl> declare_buffers(const LayoutContext&) {return {};}
  void consume_manifest_route(FmbRouteFamily,int,int64_t,int64_t) {}

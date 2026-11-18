@@ -67,9 +67,12 @@ def test_per_head_key_rope_is_bound_to_codec_or_reduced_llama_only():
     assert "bool reduced_llama_profile_ = false;" in SOURCE
     assert "reduced_llama_profile_ = llama_text_profile;" in SOURCE
     profile = SOURCE.split("const bool llama_text_profile =", 1)[1].split(";", 1)[0]
+    # The profile is the exact geometry; its FP16 and on-install W8/W4/NVFP4
+    # payloads are admitted separately, so it carries no precision clause.
     for clause in ("num_cores() != 8", "configured_vocab_size_ == 128256",
-                   "!qk_norm_present", "!has_scale", "llama_fp16_profile_num_layers("):
+                   "!qk_norm_present", "llama_fp16_profile_num_layers("):
         assert clause in profile
+    assert "has_scale" not in profile and "has_nvfp4" not in profile
 
 
 def test_codec_mode_is_explicit_and_default_off():

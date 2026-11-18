@@ -254,7 +254,7 @@ struct SpmAllocator { static constexpr uint64_t ALIGN=256; };
 constexpr int kRingCoreNum=8;
 struct GraphRuntimePolicy { int execution_core_count=8; } policy;
 uint8_t validated_kernel_core_extent(const GraphRuntimePolicy& policy,
-    const std::vector<uint8_t>& core_ids) __CORE_GUARD__
+    const std::vector<uint8_t>& core_ids, const char* kernel_name = nullptr) __CORE_GUARD__
 int fills=0, fill_cores=0;
 void rpu_launch_fill_spm_kernel(uint32_t, int64_t, c10::Half, int cores) {
     std::vector<uint8_t> ids;

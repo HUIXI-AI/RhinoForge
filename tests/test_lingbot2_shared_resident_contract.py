@@ -61,7 +61,7 @@ struct Model {
  bool sparse_shared_gate_up_resident_silu_w8_=false,sparse_shared_gate_up_resident_silu_fp16_=false;
  std::vector<int> shared_gate_up_{11},shared_gate_up_scales_{22};
  Context context;Context&ctx(){return context;}
- int64_t intermediate_size()const{return 768;}int64_t hidden_size()const{return 768;}
+ int64_t intermediate_size()const{return 768;}int64_t hidden_size()const{return 768;}int num_cores()const{return 8;}
  uint32_t addr(int,const char*name){return std::string(name)=="residual1"?0x1000:0x2000;}
  FmbPhysicalExecutionManifest plan()const {
   FmbPhysicalExecutionManifest manifest;manifest.state=FmbPhysicalManifestState::COMPLETE;

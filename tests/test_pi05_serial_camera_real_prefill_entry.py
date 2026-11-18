@@ -164,7 +164,9 @@ def boundary(monkeypatch):
             _attn_tp=8 if cores==8 else 4,_num_layers=27,_num_heads=16,
             _padded_head_dim=80,
             _seq_len=256,_siglip_sig_w8a16=int(w8),_split_siglip_graph=True,
-            num_cores=8 if cores==8 else 4,siglip_w8a16=w8,
+            qkv_w8a8=False,mlp_w8a8=False,
+            _siglip_sig_qkv_w8a8=0,_siglip_sig_mlp_w8a8=0,
+            num_cores=8 if cores==8 else 4,siglip_w8a16=w8,siglip_w4a16=False,
             rpu_backend=SimpleNamespace(graph=SimpleNamespace(GraphSignature=lambda **kwargs:kwargs)))
         names=('q_w_list','k_w_list','v_w_list','o_w_list','fc1_w_list','fc2_w_list')
         for name in names:scope[name]=[torch.ones(1,dtype=torch.int8 if w8 else torch.float16) for _ in range(27)]

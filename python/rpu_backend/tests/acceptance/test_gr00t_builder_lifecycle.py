@@ -394,19 +394,18 @@ def cold_builder(monkeypatch, native_ops):
     monkeypatch.setattr(runtime.Gr00tN1d7VLA, '__init__', construct)
 
     def first_plan(*args, **kwargs):
-        state['events'].append(('plan', kwargs['execution_component']))
-        raise RuntimeError('first native plan boundary')
-    monkeypatch.setattr(runtime, 'plan_bounded_prefill_execution', first_plan)
-
-    def build_vl(*args):
-        return (runtime._configure_gr00t_vl_encoder_handle(weight_args=(), scale_args=(), w8a16=state['w8']), ())
-
-    def build_dit(*args, num_steps=runtime._NSTEPS):
-        state['denoise_steps'].append(num_steps)
-        return (runtime._configure_gr00t_denoise_handle(dit_args=(), dit_scale_args=(), denoise_args=(), w8a16=state['w8']), ())
-    monkeypatch.setattr(runtime, '_build_vl_encoder', build_vl)
-    monkeypatch.setattr(runtime, '_build_denoise', build_dit)
-
+        state["events"].append(("plan", kwargs["execution_component"]))
+        raise RuntimeError("first native plan boundary")
+    monkeypatch.setattr(runtime, "plan_bounded_prefill_execution", first_plan)
+    def build_vl(*args, cores=8):
+        return runtime._configure_gr00t_vl_encoder_handle(
+            weight_args=(), scale_args=(), w8a16=state["w8"], cores=cores), ()
+    def build_dit(*args, num_steps=runtime._NSTEPS, cores=8):
+        state["denoise_steps"].append(num_steps)
+        return runtime._configure_gr00t_denoise_handle(
+            dit_args=(), dit_scale_args=(), denoise_args=(), w8a16=state["w8"], cores=cores), ()
+    monkeypatch.setattr(runtime, "_build_vl_encoder", build_vl)
+    monkeypatch.setattr(runtime, "_build_denoise", build_dit)
     def persistent(kind):
 
         def reserve(*args):

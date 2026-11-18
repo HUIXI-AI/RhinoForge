@@ -33,12 +33,19 @@ struct Model : FusedModelBase {
     int cores=4,layers=18,h=896,i=3584,q=16,d=64,projection_dim_=896,orig_head_dim_=0;
     double eps_=1e-5;
     bool has_patch_emb_=false,audio_mode_=false;
+    bool qkv_w8a8_=false,mlp_w8a8_=false;
+    int configured_chunk_size_=0;
+    bool pi05_vision_kv_spm_only_opt_in_=false,pi05_vision_q_resident_opt_in_=false;
+    bool pi05_vision_supported_owner() const {return false;}
     int epochs=0;
     std::vector<Layer> layer_weights_{18};
     int num_layers() const {return layers;} int hidden_size() const {return h;}
     int intermediate_size() const {return i;} int num_q_heads() const {return q;}
     int head_dim() const {return d;} int num_cores() const {return cores;}
     void invalidate_model_state(){++epochs;}
+    // Audio and this serial-image owner keep Pi W8A8 capabilities unbound.
+    void require_pi05_vision_qkv_w8a8_profile(int64_t,int64_t)const{assert(!qkv_w8a8_);}
+    void require_pi05_vision_mlp_w8a8_profile(int64_t,int64_t)const{assert(!mlp_w8a8_);}
     __MODE__
     __TOPOLOGY__
     __SHAPE__
@@ -81,7 +88,7 @@ def test_audio_four_core_weight_boundary_keeps_vision_precision_contract(tmp_pat
 #include <stdexcept>
 #include <vector>
 #define TORCH_CHECK(ok, ...) do { if (!(ok)) throw std::runtime_error("rejected"); } while (false)
-namespace at {constexpr int kHalf=1,kChar=2;using IntArrayRef=std::vector<int64_t>;}
+namespace at {constexpr int kHalf=1,kChar=2,kByte=3;using IntArrayRef=std::vector<int64_t>;}
 struct Tensor {
     std::vector<int64_t> dims;int type=at::kHalf;
     int scalar_type() const{return type;} int64_t size(int x)const{return dims.at(x);}
@@ -108,6 +115,7 @@ struct Model {
         if(fault==4)post_ln_b.dims[0]-=16;
         if(fault==5)eps=1e-6;
         if(fault==6)v_w_list.back().type=at::kChar;
+        const bool packed_w4=false;  // the Pi Vision W4 install; not an audio recipe
         __WEIGHTS__
         if(vision && fault==2)assert(precision_mask==1);
     }

@@ -55,7 +55,7 @@ def test_qwen3_vl_packed_topology_is_the_shared_template(size, cores):
     topology = qwen3_vl_text_topology(text, cores, packed_w4=True)
     assert topology == qwen3_vl_text_topology(text, cores)
     assert (topology.attn_tp, topology.mlp_tp, topology.lm_head_tp) == (
-        (8, 8, 8) if cores == 8 else (4, cores, 4))
+        (8, 8, 8) if cores == 8 else (4, cores, cores))
 
 
 @pytest.mark.parametrize("group_size", [32, None])
@@ -200,7 +200,7 @@ def test_tiny_awq_loader_pads_six_lane_mlp_and_records_physical_width(tmp_path, 
         cfg, values = write_tiny_awq_source(tmp_path / "awq", size=4)
         monkeypatch.setattr(awq.AutoModelForImageTextToText, "from_config", TinyStorage)
         topology = qwen3_vl_text_topology(cfg.text_config, 6, packed_w4=True)
-        assert (topology.attn_tp, topology.mlp_tp, topology.lm_head_tp) == (4, 6, 4)
+        assert (topology.attn_tp, topology.mlp_tp, topology.lm_head_tp) == (4, 6, 6)
         model = awq.load_qwen3_vl_awq_imagetext(
             cfg, str(tmp_path / "awq"), local_files_only=True, topology=topology)
     finally:

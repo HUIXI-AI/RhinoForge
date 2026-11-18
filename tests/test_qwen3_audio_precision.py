@@ -118,7 +118,7 @@ def _validate(precision, model, scales, tables, topology):
     elif precision == "w4a16_g32":
         decoder._validate_decoder_w4_scale_lists(model, scales, topology, audio_component="asr")
     else:
-        decoder._validate_asr_nvfp4_payload(model, scales, tables, topology)
+        decoder._validate_nvfp4_payload(model, scales, tables, topology, audio_component="asr")
 
 
 @pytest.mark.parametrize("precision", ["w8a16", "w4a16_g32", "nvfp4"])
@@ -155,11 +155,11 @@ def test_w4_and_nvfp4_are_not_interchangeable_routes():
         decoder._validate_decoder_w4_scale_lists(model, scales, topology, audio_component="asr")
     model, scales, tables, topology = _decoder_payload("w4a16_g32")
     with pytest.raises(ValueError):
-        decoder._validate_asr_nvfp4_payload(model, scales, tables, topology)
+        decoder._validate_nvfp4_payload(model, scales, tables, topology, audio_component="asr")
     model, scales, tables, topology = _decoder_payload("nvfp4")
     tables[0] = tables[0][:28]
     with pytest.raises(ValueError, match="padded FP32"):
-        decoder._validate_asr_nvfp4_payload(model, scales, tables, topology)
+        decoder._validate_nvfp4_payload(model, scales, tables, topology, audio_component="asr")
 
 
 def test_asr_installer_rejects_w8_weights_without_scales_before_native_create(monkeypatch):
@@ -183,19 +183,22 @@ def test_asr_installer_rejects_w8_weights_without_scales_before_native_create(mo
 
 
 def _head_owner(precision, cores=8):
+    from rpu_backend.runtime.topology import decoder_lm_head_vocab_size
+
     mode = FakeTensorMode()
     config = _config()
     topology = resolve_decoder_topology(num_cores=cores, **audio.asr_decoder_profile(config).geometry())
+    padded_vocab = decoder_lm_head_vocab_size(151936, topology.lm_head_tp)
     def device_tensor(shape, dtype):
         return FakeTensor(mode, torch.empty(shape, device="meta", dtype=dtype), torch.device("rpu"))
     with torch.device("meta"):
         head = torch.nn.Linear(1024, 151936, bias=False)
     dtype = {"fp16": torch.float16, "w8a16": torch.int8, "w4a16_g32": torch.uint8}[precision]
-    storage = w4_storage_shape(151936, 1024, 1, topology.lm_head_tp) if precision == "w4a16_g32" else (151936, 1024)
+    storage = w4_storage_shape(padded_vocab, 1024, 1, topology.lm_head_tp) if precision == "w4a16_g32" else (padded_vocab, 1024)
     head.weight = torch.nn.Parameter(device_tensor(storage, dtype), requires_grad=False)
     if precision != "fp16":
-        rows = (151936 // topology.lm_head_tp + 63) // 64 * 64
-        shape = (151936,) if precision == "w8a16" else (32, topology.lm_head_tp * rows)
+        rows = (padded_vocab // topology.lm_head_tp + 63) // 64 * 64
+        shape = (padded_vocab,) if precision == "w8a16" else (32, topology.lm_head_tp * rows)
         head.register_buffer("weight_scale", device_tensor(shape, torch.float16))
     head._rpu_linear_num_cores, head._rpu_linear_partition = topology.lm_head_tp, 1
     execution = {"model": {"num_cores": cores}, "prefill": {"linear_acc32": True}}

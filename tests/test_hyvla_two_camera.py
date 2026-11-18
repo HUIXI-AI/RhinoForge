@@ -72,6 +72,68 @@ def test_public_camera_order_and_count_boundary(tmp_path):
         assert default._prefix_len == (192 if cameras == 2 else 240)
     with pytest.raises(ValueError, match="prefix_len"):
         HyEmbodiedPolicy.from_checkpoint(tmp_path, n_cameras=2, prefix_len=208)
-    for cameras in (0, 1, 4, True, 2.0):
+    for cameras in (0, 4, True, 2.0):
         with pytest.raises(ValueError, match="2 或 3 相机"):
             HyEmbodiedPolicy.from_checkpoint(tmp_path, n_cameras=cameras)
+
+
+@pytest.mark.parametrize("text", [1, 32, 64])
+def test_one_camera_pads_to_the_action_expert_floor(text, tmp_path):
+    class Tokenizer:
+        def __call__(self, *_args, max_length, **_kwargs):
+            mask = torch.arange(max_length)[None] < text
+            return {"input_ids": mask.long() * 5, "attention_mask": mask}
+
+    obs = preprocess.build_observation(
+        [torch.full((1, 3, 8, 8), .25)], "fixed instruction", Tokenizer(),
+        state=torch.zeros(1, 32), noise_seed=3)
+    _validate_runner_observation(obs, n_cameras=1, prefix_len=128)
+    assert obs["n_valid"] == 60 + text
+    assert obs["prefill_mask"].shape == (128, 128)
+    assert obs["denoise_mask"].shape == (51, 179)
+    assert obs["modality_mask"].sum() == 49
+    assert not obs["prefill_mask"][obs["n_valid"]:].any()
+    assert not obs["denoise_mask"][:, obs["n_valid"]:128].any()
+    assert torch.equal(obs["suffix_pos"], torch.arange(51) + obs["n_valid"])
+    policy = HyEmbodiedPolicy.from_checkpoint(tmp_path, n_cameras=1)
+    assert policy._prefix_len == 128 and policy.camera_names == list(preprocess.CAMERA_ORDER[:1])
+    with pytest.raises(ValueError, match="prefix_len"):
+        HyEmbodiedPolicy.from_checkpoint(tmp_path, n_cameras=1, prefix_len=112)
+
+
+@pytest.mark.parametrize("cameras, prefix, expected", [(1, "auto", None), (2, None, None), (3, 240, 240), (4, "auto", None)])
+def test_public_runner_installs_the_image_count(monkeypatch, tmp_path, cameras, prefix, expected):
+    from PIL import Image
+    import rpu_backend.api as api
+    from examples.runners.hy_vla import runner as hy_runner
+
+    seen = {}
+
+    class Policy:
+        @classmethod
+        def from_checkpoint(cls, path, **kwargs):
+            seen.update(kwargs)
+            return cls()
+
+        def to(self, device):
+            return self
+
+    monkeypatch.setattr(api, "HyEmbodiedPolicy", Policy, raising=False)
+    monkeypatch.setattr(hy_runner, "_checkpoint", lambda config: tmp_path)
+    monkeypatch.setattr(hy_runner, "policy_dtype", lambda example: "fp16")
+    paths = []
+    for index in range(cameras):
+        Image.new("RGB", (6, 4), (index, 0, 0)).save(tmp_path / f"{index}.png")
+        paths.append(str(tmp_path / f"{index}.png"))
+    inputs = {"images": paths, "instruction": "move"}
+    if prefix is not None:
+        inputs["prefix_len"] = prefix
+    runner = NS(source_config={"example": {}, "input": inputs})
+    if cameras == 4:
+        with pytest.raises(ValueError, match="one to three camera images"):
+            hy_runner.prepare(runner)
+        assert not seen
+        return
+    hy_runner.prepare(runner)
+    # auto/omitted leaves the bucket to the policy: ceil16(2 + 58C + 64) for C cameras.
+    assert seen["n_cameras"] == cameras and seen["prefix_len"] == expected

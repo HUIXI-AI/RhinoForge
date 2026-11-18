@@ -13,13 +13,27 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[3]
 _CPU = vars(_cpu_helpers)
-PRECISIONS = ('fp16', 'w8a16', 'w8a16_action_nvfp4')
+# The modules the Wall-OSS owners tell apart, and the base engine's (--precision,
+# Action NVFP4) for each mix it implements. Hybrid quantizes Action from the FP16 source.
+ROUTE_PROBES = (('vision',), ('prefill',), ('prefill', 'Down'), ('action',), ('action_preprocessor',))
+ROUTES = {
+    ('fp16',) * 5: ('fp16', False),
+    ('w8a16',) * 5: ('w8', False),
+    ('w8a16', 'w8a16', 'w8a16', 'nvfp4', 'fp16'): ('w8', True),
+}
 CPU_THREADS = (1, 2, 4, 8, 12, 16, 24)
 EXECUTION_FIELDS = {
     'prefill': ('chunk_size', 'padding_rows', 'padding_budget', 'linear_acc32'),
     'vision': ('chunk_size', 'linear_acc32'),
     'action': ('chunk_size', 'linear_acc32'),
+    'model': ('num_cores',),
 }
+
+
+def precision_route(precision):
+    """The engine precision and Action NVFP4 switch that realize a registered Wall-OSS base recipe."""
+    from examples.common.config import owner_route
+    return owner_route('Wall-OSS base', 'wall_oss', ROUTE_PROBES, ROUTES, selector=precision)
 
 
 def execution_config(value):
@@ -30,6 +44,10 @@ def execution_config(value):
     if normalized.get('action', {}).get('chunk_size', 'auto') not in ('auto', 32):
         raise ValueError('Wall-OSS base action.chunk_size must be auto or 32 for H32')
     return {stage: dict(fields) for stage, fields in normalized.items()}
+
+
+def core_count(config):
+    return execution_config(config.get('rpu_execution')).get('model', {}).get('num_cores', 8)
 
 
 def _path(value, field):
@@ -86,24 +104,26 @@ def validate_example_config(config: dict) -> None:
         if not isinstance(values, dict) or (allowed[name] is not None and set(values) - allowed[name]):
             raise ValueError(f'[{name}] contains unsupported keys or is not a table')
     precision = config['wall_oss'].get('precision')
-    if precision not in PRECISIONS:
-        raise ValueError(f'[wall_oss].precision must be one of {PRECISIONS}')
+    engine, _ = precision_route(precision)
     mode = config['wall_oss'].get('instruction_residency', 'auto')
     if mode not in ('auto', 'off'):
         raise ValueError('[wall_oss].instruction_residency must be auto or off')
     inputs, run = config['input'], config['run']
     for key in ('fp16_checkpoint',):
         _path(inputs.get(key), f'[input].{key}')
-    if precision != 'fp16' or 'w8_checkpoint' in inputs:
+    if engine != 'fp16' or 'w8_checkpoint' in inputs:
         _path(inputs.get('w8_checkpoint'), '[input].w8_checkpoint')
+        from examples.common.config import check_checkpoint_recipe
+        check_checkpoint_recipe('wall_oss', Path(inputs['w8_checkpoint']).expanduser(),
+                                slot='w8_checkpoint', selector=precision)
     shape = inputs.get('image_size')
     if (not isinstance(shape, list) or len(shape) != 2
             or any(type(size) is not int for size in shape)
             or tuple(shape) not in ((224, 224), (256, 256))):
         raise ValueError('[input].image_size must be [224, 224] or [256, 256]')
     cameras = inputs.get('cameras', 3)
-    if type(cameras) is not int or cameras not in (2, 3):
-        raise ValueError('[input].cameras must be 2 or 3')
+    if type(cameras) is not int or cameras not in (1, 2, 3):
+        raise ValueError('[input].cameras must be 1, 2 or 3')
     row_reuse = config['wall_oss'].get('vision_row_reuse', True)
     if type(row_reuse) is not bool:
         raise ValueError('[wall_oss].vision_row_reuse must be boolean')
@@ -144,6 +164,13 @@ def validate_example_config(config: dict) -> None:
     for key, value in config.get('runtime', {}).items():
         _path(value, f'[runtime].{key}')
     execution_config(config.get('rpu_execution'))
+    cores = core_count(config)
+    if cores != 8 and 'instruction_residency' in config['wall_oss']:
+        raise ValueError(f'[wall_oss].instruction_residency is eight-core only, got model.num_cores={cores}')
+    linear_acc32 = [stage for stage in ('prefill', 'vision', 'action')
+                    if config.get('rpu_execution', {}).get(stage, {}).get('linear_acc32')]
+    if cores != 8 and linear_acc32:
+        raise ValueError(f"linear_acc32 is eight-core only, got model.num_cores={cores} with {', '.join(linear_acc32)}")
 
 
 def example_argv(config: dict) -> list[str]:
@@ -154,8 +181,9 @@ def example_argv(config: dict) -> list[str]:
     size = inputs['image_size'][0]
     cameras = inputs.get('cameras', 3)
     row_reuse = config['wall_oss'].get('vision_row_reuse', True)
-    hybrid = precision == 'w8a16_action_nvfp4'
-    argv = ['--mode', 'candidate', '--precision', 'fp16' if precision == 'fp16' else 'w8',
+    engine, hybrid = precision_route(precision)
+    reduced = core_count(config) != 8
+    argv = ['--mode', 'candidate', '--precision', engine,
             '--components', 'small' if row_reuse else 'small-prefill',
             '--fp16', str(Path(inputs['fp16_checkpoint']).expanduser()),
             '--batch', str(Path(batch_path(inputs)).expanduser()), '--image-size', str(size), str(size),
@@ -170,16 +198,18 @@ def example_argv(config: dict) -> list[str]:
         argv += ['--instruction-residency', config['wall_oss']['instruction_residency']]
     if run.get('cpu_thread_sweep'):
         argv += ['--cpu-thread-sweep', *(str(n) for n in run['cpu_thread_sweep'])]
-    if precision != 'fp16':
+    if engine != 'fp16':
         argv += ['--w8', str(Path(inputs['w8_checkpoint']).expanduser())]
-    if config['wall_oss'].get('vision_pair', size == 256):
+    # Pair and residency have eight-core owners only; a reduced budget runs one
+    # camera per forward with the ordinary Action.
+    if not reduced and config['wall_oss'].get('vision_pair', size == 256):
         argv.append('--vision-pair')
     if hybrid:
         # R39/R43 Action NVFP4 measurements used neither residency nor the
         # 224 native-window opt-in. Keep those defaults; resolve an explicit
         # window override below without changing Action residency.
         argv.append('--action-nvfp4')
-    elif not execution_config(config.get('rpu_execution')).get('action', {}).get('linear_acc32', False):
+    elif not reduced and not execution_config(config.get('rpu_execution')).get('action', {}).get('linear_acc32', False):
         argv.append('--action-residency')
     window = config['wall_oss'].get('vision_window', size == 224 and not hybrid and row_reuse)
     if window:

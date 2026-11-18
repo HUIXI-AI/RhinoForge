@@ -1,0 +1,25 @@
+# Qwen3-ASR 的输入预设：python examples/run.py --config <TOML> --input <预设名>
+# --input canonical 取本文件的 canonical；--set input.<键> 的同名字段优先于预设。
+#
+# 预设写音频时长和生成上限，录音仍取所选 TOML 的 audio：audio_seconds 取录音开头的
+# N 秒，不补静音，所以录音须至少 N 秒（可以长于 8 秒）；最长的 8s 预设用一段 ≥ 8 秒的
+# 录音即可套用全部预设。截取后的波形就是 CPU 参考与 report.json 记录的输入。
+# input.reference_text 是整段录音的转写，录音被截短时运行器拒绝同时使用它。
+# 2026-10-21 板测分别用 2、6、8 秒的独立录音，未用截取。
+#
+# 范围：audio 为单声道 16 kHz；audio_seconds 0.5–8；max_new_tokens 1–64，转写在 EOS
+#   或达到上限时结束。
+applies_to = ["qwen3_asr"]
+canonical = "6s"
+
+[preset.2s]
+audio_seconds = 2
+max_new_tokens = 64
+
+[preset.6s]
+audio_seconds = 6
+max_new_tokens = 64
+
+[preset.8s]
+audio_seconds = 8
+max_new_tokens = 64

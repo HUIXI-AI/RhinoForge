@@ -1,0 +1,21 @@
+# Vision 编码器的输入预设：python examples/run.py --config <TOML> --input <预设名>
+# --input canonical 取本文件的 canonical；--set input.<键> 的同名字段优先于预设。
+#
+# 预设只写图像边长：image_size 先把每张图缩放成 image_size × image_size 再交给 processor，
+# 图片仍取所选 TOML。Vision 组件不生成文本，不使用 P 和 D。
+#
+# 范围：Qwen3-VL 每张图 ≤ 4096 patch（patch 16 px，即 ≤ 1024×1024），由运行时检查。
+#   板上实测 448 / 896 为 4/6/8 核，1024 只有 8 核。
+# DINOv3 的 processor 固定缩放到 224×224，没有尺寸预设。
+applies_to = ["qwen3_vl_vision"]
+canonical = "i896"
+requires = ["images"]
+
+[preset.i448]
+image_size = 448
+
+[preset.i896]
+image_size = 896
+
+[preset.i1024]
+image_size = 1024

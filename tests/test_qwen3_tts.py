@@ -912,6 +912,7 @@ def test_decoder_and_heads_bind_the_selected_precision_and_keep_scale_owners(
     monkeypatch.setattr(graph, "GraphSignature", lambda **kwargs: kwargs)
     monkeypatch.setattr(qwen3, "lookup_causal_decoder", lambda *args: SimpleNamespace(max_kv_len=512, chunk=64))
     monkeypatch.setattr(codec, "install_codec_convolutions", lambda *args: None)
+    monkeypatch.setattr(codec, "install_codec_activations", lambda *args: None)
     monkeypatch.setattr(codec_transformer, "install_codec_transformer", lambda *args: None)
     monkeypatch.setattr(causal_lm, "_release_live_instance", lambda owner: None)
     events, bound = [], {}

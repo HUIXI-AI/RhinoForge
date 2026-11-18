@@ -42,7 +42,7 @@ struct KvInsertSegmentPlan{
  int64_t logical_rows()const{return logical;}int64_t physical_rows()const{return physical;}
  int64_t route()const{return 16;}Segment segment(int)const{return {position};}
 };
-KvInsertSegmentPlan restore_kvinsert_plan(int64_t,const std::vector<int64_t>&a,int64_t tp,int64_t nq,int64_t hd){assert(tp==8&&nq==32&&hd==48);return {a[0],a[1],a[2]};}
+KvInsertSegmentPlan restore_kvinsert_plan(int64_t,const std::vector<int64_t>&a,int64_t tp,int64_t nq,int64_t hd){assert((tp==4||tp==8)&&nq==32&&hd==48);return {a[0],a[1],a[2]};}
 struct Route{FmbRouteFamily family;int64_t site_id,invocation,flags,selector;std::vector<int64_t>arguments;};
 struct Context{
  bool complete=true;int64_t seq_len=41,batch_size=1,body_iter=0;std::vector<Route>routes;int consumed=0;
@@ -58,7 +58,7 @@ struct Context{
  }
 };
 std::vector<std::pair<uint32_t,int64_t>>zeros;int writes=0;
-void rpu_launch_memset_spm_multicore(uint32_t address,int64_t elements){zeros.push_back({address,elements});}
+void rpu_launch_memset_spm_multicore(uint32_t address,int64_t elements,int=8){zeros.push_back({address,elements});}
 void rpu_launch_insert_kvcache_spm_unified_with_plan(int&k,int&v,uint32_t ka,uint32_t va,int64_t nq,int64_t hd,int cores,int64_t ko,int64_t vo,int64_t rows,const KvInsertSegmentPlan&plan){
  assert(nq==32&&hd==48&&cores==8&&ko==0&&vo==0&&rows==plan.physical_rows()&&zeros.size()>=2);assert(ka!=va);++writes;++k;++v;
 }
@@ -69,7 +69,7 @@ struct Model{
  int64_t layers=32,h=1536,ff=6144,q=32,kv=32,hd=48,tp=8;
  Context context;int self_k=0,self_v=0,cross_k=0,cross_v=0;
  int64_t num_layers()const{return layers;}int64_t hidden_size()const{return h;}int64_t intermediate_size()const{return ff;}
- int64_t num_q_heads()const{return q;}int64_t num_kv_heads()const{return kv;}int64_t head_dim()const{return hd;}int64_t attn_tp()const{return tp;}
+ int64_t num_q_heads()const{return q;}int64_t num_kv_heads()const{return kv;}int64_t head_dim()const{return hd;}int64_t attn_tp()const{return tp;}int num_cores()const{return NUM_CORES;}
  Context&ctx(){return context;}uint32_t addr(int,const char*n)const{return std::string(n)=="k"?0x10020000:0x10040000;}
  struct Offset{uint32_t value;};Offset addr_offset(const char*n)const{return {std::string(n)=="k"?0x20000:std::string(n)=="v"?0x40000:std::string(n)=="cross_k_bank"?0x60000u:0x80000u};}
  __METHODS__
@@ -113,7 +113,8 @@ int main(){
  model.num_steps_=4;model.vl_seq_=82;
  model.record(true,true);const int old=model.self_k;model.self();assert(model.self_k==old);
  model.record(false,false);model.self();model.cross();assert(model.self_k==old+1&&model.self_k==model.self_v&&model.cross_k==model.cross_v);
- for(int bad=0;bad<10;++bad){Model x=model;switch(bad){case 0:x.loop_mode_=false;break;case 1:x.denoise_mode_=false;break;case 2:x.z2_bound_=true;break;case 3:x.z2_prepared_seq_len_=82;break;case 4:x.context.seq_len=48;break;case 5:x.context.complete=false;break;case 6:x.action_horizon_=39;break;case 7:x.context.batch_size=2;break;case 8:x.tp=4;break;case 9:x.num_steps_=3;break;}x.record(true,true);assert(x.kv_insert_flags(GR00T_DIT_SELF_KV_INSERT_SITE,0)==1&&x.kv_insert_flags(GR00T_DIT_CROSS_KV_INSERT_SITE,0)==1);}
+ for(int bad=0;bad<10;++bad){Model x=model;switch(bad){case 0:x.loop_mode_=false;break;case 1:x.denoise_mode_=false;break;case 2:x.z2_bound_=true;break;case 3:x.z2_prepared_seq_len_=82;break;case 4:x.context.seq_len=48;break;case 5:x.context.complete=false;break;case 6:x.action_horizon_=39;break;case 7:x.context.batch_size=2;break;case 8:x.tp=2;break;case 9:x.num_steps_=3;break;}x.record(true,true);assert(x.kv_insert_flags(GR00T_DIT_SELF_KV_INSERT_SITE,0)==1&&x.kv_insert_flags(GR00T_DIT_CROSS_KV_INSERT_SITE,0)==1);}
+ {Model m4=model;m4.tp=4;m4.record(true,true);assert(m4.kv_insert_flags(GR00T_DIT_SELF_KV_INSERT_SITE,0)==2&&m4.kv_insert_flags(GR00T_DIT_CROSS_KV_INSERT_SITE,0)==2);}
  for(int bad=0;bad<6;++bad){Model x=model;x.record(true,true);auto&route=x.context.routes[1];switch(bad){case 0:route.flags=1;break;case 1:route.arguments[0]=40;break;case 2:route.arguments[1]=64;break;case 3:route.arguments[2]=1;break;case 4:x.context.routes[0].selector=1;break;case 5:route.invocation=1;break;}
   const int before=writes;zeros.clear();try{x.self();assert(false);}catch(const std::runtime_error&){}assert(writes==before&&zeros.empty());
  }

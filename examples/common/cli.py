@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 from pathlib import Path
 import tomllib
 
@@ -9,11 +11,29 @@ from examples.common.config import (
     ConfigError, load_config, example_profiles, _g05_runner, _pi05_runner,
     _hyvla_runner, _lingbot2_runner, _wall_base_runner, _wall_sorting_runner,
 )
+from examples.common.config import _CORE_BUDGETS as CORE_BUDGETS
+from examples.common.overrides import CALLER_TABLES, caller_overrides, recipe_path, toml_text
+
+
+def check_cell(source, cores=None, input_preset=None, assignments=()):
+    """The `--check-config` decision of one grid cell: None when accepted, else the reason it reports."""
+    args = argparse.Namespace(config=source, check_config=True, hwperf=False, profile=False)
+    try:
+        config = load_config(source, overrides=caller_overrides(assignments, cores), input_preset=input_preset)
+        with contextlib.redirect_stdout(io.StringIO()):
+            _dispatch(config, args)
+    except (ConfigError, OSError, tomllib.TOMLDecodeError) as exc:
+        return str(exc)
+    return None
 
 
 def main(argv=None, *, keep_logging_until_exit=False) -> int:
     parser = argparse.ArgumentParser(description="Run one RhinoForge model configuration.")
-    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--config", type=Path, required=True,
+                        help="A template, or with --recipe the model directory that holds it.")
+    parser.add_argument("--recipe", metavar="NAME",
+                        help="Select the template NAME.toml of the same model directory; "
+                             "the error lists the directory's templates.")
     parser.add_argument("--check-config", action="store_true",
                         help="Check syntax/profile without importing Torch or the device backend.")
     parser.add_argument("--hwperf", "--hw-perf", dest="hwperf", action="store_true",
@@ -22,9 +42,23 @@ def main(argv=None, *, keep_logging_until_exit=False) -> int:
                         help="Collect an additional diagnostic profile when supported.")
     parser.add_argument("--model", type=Path,
                         help="Override a Qwen3.5 MoE checkpoint path; its profile remains validated.")
+    parser.add_argument("--cores", type=int, choices=CORE_BUDGETS,
+                        help="Override rpu_execution.model.num_cores; a refused budget reports its reason.")
+    parser.add_argument("--input", dest="input_preset", metavar="PRESET",
+                        help="Apply a named [input] preset of this model family from examples/inputs/; "
+                             "'canonical' names the family's reference input. --set input.* fields win.")
+    parser.add_argument("--set", dest="assignments", action="append", default=[],
+                        metavar="SECTION.KEY=VALUE",
+                        help=f"Override one field of {', '.join(CALLER_TABLES)}; repeatable. "
+                             "VALUE is a TOML literal; bare words are strings.")
+    parser.add_argument("--emit-toml", type=Path, metavar="PATH",
+                        help="Write the resolved configuration; running it reproduces this configuration.")
     args = parser.parse_args(argv)
     try:
-        config = load_config(args.config.expanduser().resolve())
+        args.config = recipe_path(args.config.expanduser().resolve(), args.recipe)
+        config = load_config(args.config,
+                             overrides=caller_overrides(args.assignments, args.cores),
+                             input_preset=args.input_preset)
         if args.model is not None:
             profile = example_profiles().get(config.get("example", {}).get("profile_id"), {})
             if (config.get("example", {}).get("target") not in {"qwen3_5", "qwen3_5_vision"}
@@ -38,6 +72,14 @@ def main(argv=None, *, keep_logging_until_exit=False) -> int:
         if "wall_oss" not in config and "wall_oss_sorting" not in config:
             for flag in ("hwperf", "profile"):
                 config["run"][flag] = bool(getattr(args, flag) or config["run"].get(flag, False))
+        if args.emit_toml is not None:
+            if "_model_override" in config:
+                raise ConfigError("--emit-toml cannot record --model; write the checkpoint into the TOML")
+            try:
+                text = toml_text(config)
+            except ValueError as exc:
+                raise ConfigError(f"--emit-toml: {exc}") from exc
+            args.emit_toml.expanduser().write_text(text, encoding="utf-8")
         if args.check_config:
             return _dispatch(config, args)
         from examples.common.logging import logging_session

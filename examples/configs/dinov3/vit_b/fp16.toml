@@ -3,7 +3,7 @@
 #   rpu_execution.model.num_cores 省略时为 8 核；可选 4 / 6 / 8，修改后需重新加载模型。
 #     8 核：12 个注意力头补零到 16 个，每核 2 个头、MLP 384 通道。
 #     4 / 6 核：不补头，注意力和 MLP 用同一核数，每核 3 / 2 个头、MLP 768 / 512 通道；KV 缓存仍按 8 路存储。
-#     各核数的支持状态与板上实测见核数支持矩阵（examples/configs/CORE_COVERAGE.md）。
+#     各核数的支持状态与板上实测见核数支持矩阵（examples/configs/CONFIGURATIONS.md）。
 [model]
 profile_id = "dinov3-vit-b.fp16.vision"
 registry_alias = "dinov3-vit-b"

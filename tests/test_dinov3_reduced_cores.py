@@ -1,4 +1,4 @@
-"""DINOv3 ViT-B at a cold 4/6/8-core budget: host contracts only.
+"""DINOv3 ViT-B (and the InternVLA DINOv2-S towers) at a cold 4/6/8-core budget: host contracts only.
 
 The native topology methods are compiled from production source with small
 FMB doubles; the adapter install uses explicit native-op doubles; the weight
@@ -57,7 +57,7 @@ def _vit_b(**overrides):
 # --------------------------------------------------------------------------- native
 
 
-def test_native_topology_admits_only_unpadded_vit_b_at_reduced_budgets(tmp_path):
+def test_native_topology_admits_only_vit_b_and_dinov2_s_at_reduced_budgets(tmp_path):
     compiler = shutil.which("g++")
     if compiler is None:
         pytest.skip("g++ is required to compile the production topology methods")
@@ -137,8 +137,12 @@ int main() {
         m.set_execution_cores(cores);
         assert(m.num_cores() == cores);
         reject([&] { m.execution_topology(); });                         // no weights yet
+        // DINOv2-S is admitted only in its per-budget head layout: 6 unpadded
+        // heads on six cores, 8 padded heads on four.
+        const int64_t other_small_heads = cores == 6 ? 8 : 6;
         for (auto bad : std::vector<std::vector<int64_t>>{
-                 {16, 64, 1024, 3072}, {12, 64, 768, 1536}, {6, 64, 384, 1536},
+                 {16, 64, 1024, 3072}, {12, 64, 768, 1536}, {6, 64, 384, 3072},
+                 {other_small_heads, 64, 384, 1536}, {12, 64, 384, 1536},
                  {16, 64, 1024, 4096}, {12, 80, 960, 3072}}) {
             reject([&] { m.install(bad[0], bad[1], bad[2], bad[3]); });
         }
@@ -147,6 +151,12 @@ int main() {
         assert((m.execution_topology() ==
                 std::vector<int64_t>{cores, cores, cores, 8, 12, 3072}));
         reject([&] { m.set_execution_cores(8); });
+        DINOv3VisionModel small;
+        small.set_execution_cores(cores);
+        const int64_t small_heads = cores == 6 ? 6 : 8;
+        small.install(small_heads, 64, 384, 1536);
+        assert((small.execution_topology() ==
+                std::vector<int64_t>{cores, cores, cores, 8, small_heads, 1536}));
     }
     for (int bad : {0, 1, 2, 3, 5, 7, 9}) {
         reject([bad] { DINOv3VisionModel m; m.set_execution_cores(bad); });
@@ -209,8 +219,9 @@ def test_every_multicore_launch_uses_the_owner_budget():
     owner = "num_cores()"
     last_arg = {
         "rpu_launch_memset_spm_multicore": {owner},
-        # o/down biases go to core 0 only so the AllReduce adds them once.
-        "rpu_launch_ddr_broadcast_spm_dma": {owner, "1"},
+        # o/down biases go to core 0 only so the AllReduce adds them once;
+        # packed W4 sends them to every core and adds them after the AllReduce.
+        "rpu_launch_ddr_broadcast_spm_dma": {owner, "1", "row_bias_cores"},
         "rpu_launch_ddr_scatter_spm_dma": {owner},
         "rpu_launch_spm_scatter_ddr_dma": {owner},
         "rpu_launch_eltwise_binary_1xC_NxC_spm_kernel": {owner},
@@ -231,7 +242,7 @@ def test_every_multicore_launch_uses_the_owner_budget():
         assert args[-2:] == [owner, owner], args
     for name in ("rpu_launch_linear_spm_to_spm_kernel", "rpu_launch_linear_spm_to_spm_acc16_kernel"):
         for args in _calls(source, name):
-            assert args[-2] == owner, args
+            assert args[7] == owner, args
     for args in _calls(source, "rpu_launch_insert_kvcache_spm_unified_with_plan"):
         assert args[6] == owner, args
     sdpa = _calls(source, "rpu_launch_sdpa_spm_unified_kernel_v2")
@@ -558,7 +569,7 @@ def test_example_reduced_budget_requires_profile_admission(cores):
     assert profile["hw_status"] == "IMPLEMENTED_UNVERIFIED_HW"
     COMMON._validate_execution({"model": {"num_cores": cores}}, profile=profile)
     profile["input_envelope"]["limits"].pop("allowed_num_cores")
-    with pytest.raises(COMMON.ConfigError, match="registered FP16 ViT-B"):
+    with pytest.raises(COMMON.ConfigError, match="registered ViT-B vision profile"):
         COMMON._validate_execution({"model": {"num_cores": cores}}, profile=profile)
 
 

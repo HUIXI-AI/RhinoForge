@@ -4,6 +4,11 @@ from __future__ import annotations
 
 from examples.common.inputs import _load_mapping, _controlled_images as _images, _controlled_checkpoint as _checkpoint
 
+# Lingbot2Policy runs W8A16 only; the profile's recipe must resolve to it.
+_ROUTE_PROBES = (("vision",), ("vlm_prefill",), ("action",), ("action", "router"))
+_ROUTES = {("w8a16", "w8a16", "w8a16", "fp16"): "w8a16"}
+
+
 def _lingbot2(runner):
     from rpu_backend.api import Lingbot2Policy
 
@@ -14,8 +19,11 @@ def _lingbot2(runner):
         request = {"images": _images(inputs), "instruction": inputs["instruction"],
                    "proprioception": inputs["proprioception"],
                    "noise_seed": inputs.get("seed", 0)}
+    from examples.common.config import owner_route
+    dtype = owner_route("Lingbot2Policy", "lingbot2", _ROUTE_PROBES, _ROUTES, selector=config["example"].get("dtype"))
+    checkpoint = _checkpoint(config)
     policy = Lingbot2Policy.from_checkpoint(
-        _checkpoint(config), dtype="w8a16",
+        checkpoint, dtype=dtype,
         runtime_env=config["example"].get("opt_in"),
         rpu_execution=config.get("rpu_execution"),
     ).to("rpu")

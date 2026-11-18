@@ -118,8 +118,14 @@ class OpenpiPi05Server:
         try:
             _optimized.install_policy(self.policy, args, batch)
             loaded = time.perf_counter()
+            _, _, _, action_cfg = _optimized._execution_config(setup.execution)
+            precompute_adarms = setup.paired or (
+                setup.cores in (4, 6)
+                and args.precision in ("fp16", "w8a16", "w4a16")
+                and not action_cfg.get("action", {}).get("linear_acc32", False)
+            )
             prepared = self.policy.prepare_graphs(
-                batch, num_steps=NUM_STEPS, precompute_adarms=setup.paired,
+                batch, num_steps=NUM_STEPS, precompute_adarms=precompute_adarms,
                 noise=self._noise(), language_token_counts=self.language_token_counts)
         except BaseException:
             self.policy.close()

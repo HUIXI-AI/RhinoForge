@@ -57,7 +57,7 @@ def arguments(argv=None):
                         help="experimental W8 Vision/Prefill with only Action NVFP4A16")
     parser.add_argument("--vision-window", action="store_true")
     parser.add_argument("--vision-pair", action="store_true")
-    parser.add_argument("--cameras", type=int, choices=(2, 3), default=3,
+    parser.add_argument("--cameras", type=int, choices=(1, 2, 3), default=3,
                         help="ordered cameras: face_view, left_wrist_view, then right_wrist_view")
     parser.add_argument("--image-size", type=int, nargs=2, default=(448, 252), metavar=("WIDTH", "HEIGHT"))
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -187,6 +187,18 @@ def cold_environment(args, root=ROOT):
         env["RPU_WALL_OSS_ACTION_WEIGHT_RESIDENCY"] = "1"
     if args.vision_window:
         env["RPU_WALL_OSS_VISION_NATIVE_WINDOW_SDPA"] = "1"
+    if (getattr(args, "rpu_execution", None) or {}).get("model", {}).get("num_cores", 8) != 8:
+        # The candidate selectors above have eight-core owners only. Both reduced
+        # budgets run the ordinary routes with fused Action, SPM RoPE and the
+        # four-lane fused merger; --vision-window selects per-window SDPA.
+        env.update({
+            "RPU_WALL_OSS_ATTN_TP8": "0",
+            "RPU_WALL_OSS_BATCH_VISION": "0",
+            "RPU_WALL_OSS_VISION_ROW_WEIGHT_OUTER": "0",
+            "RPU_WALL_OSS_FUSED_ASSEMBLE": "0",
+            "RPU_WALL_OSS_FP16_TRANSFER_MASK": "0",
+            "RPU_WALL_OSS_SORTING_SILU_MUL": "0",
+        })
     selected = {}
     for argument, key in (
         (args.main_ref, "RPU_KERNEL_LIB_PATH"),
@@ -222,8 +234,8 @@ def load_observation_batch(path, image_size, cameras=3):
     import torch
     from PIL import Image
 
-    if type(cameras) is not int or cameras not in (2, 3):
-        raise ValueError("cameras must be 2 or 3")
+    if type(cameras) is not int or cameras not in (1, 2, 3):
+        raise ValueError("cameras must be 1, 2 or 3")
     batch = torch.load(path, map_location="cpu", weights_only=True)
     required = {"images", "instruction", "proprioception", "state_mask", "noise", "dof_mask"}
     if not isinstance(batch, dict) or set(batch) != required:
@@ -251,9 +263,9 @@ def load_observation_batch(path, image_size, cameras=3):
             batch["noise"].float(), batch["dof_mask"].float())
 
 
-def validate_golden_metadata(golden, image_size, cameras=3):
-    if (type(cameras) is not int or cameras not in (2, 3)
-            or golden["instruction"] != INSTRUCTION or int(golden["horizon"]) != 32
+def validate_golden_metadata(golden, image_size, cameras=3, instruction=INSTRUCTION):
+    if (type(cameras) is not int or cameras not in (1, 2, 3)
+            or golden["instruction"] != instruction or int(golden["horizon"]) != 32
             or int(golden["num_steps"]) != 10 or int(golden["num_images"]) != cameras
             or tuple(golden["image_size"]) != tuple(image_size)
             or list(golden["camera_names"]) != CAMERAS[:cameras]

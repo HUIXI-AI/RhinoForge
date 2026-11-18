@@ -23,8 +23,8 @@ def validate_input_config(inputs):
             raise ValueError("case/observation owns its instruction, state and noise")
     else:
         paths = inputs[mode]
-        if not isinstance(paths, list) or len(paths) not in (2, 3) or any(not isinstance(p, str) or not p.strip() for p in paths):
-            raise ValueError("[input].images requires two or three image paths")
+        if not isinstance(paths, list) or len(paths) not in (1, 2, 3) or any(not isinstance(p, str) or not p.strip() for p in paths):
+            raise ValueError("[input].images requires one to three image paths")
         if not isinstance(inputs.get("instruction"), str) or not inputs["instruction"].strip():
             raise ValueError("raw images require a nonempty instruction")
         state = inputs.get("state")
@@ -33,15 +33,16 @@ def validate_input_config(inputs):
             raise ValueError("raw images require 1..55 finite [input].state values")
         if "noise" in inputs and (not isinstance(inputs["noise"], str) or not inputs["noise"].strip()):
             raise ValueError("[input].noise must be a tensor file path")
-    if "cameras" in inputs and (type(inputs["cameras"]) is not int or inputs["cameras"] not in (2, 3)):
-        raise ValueError("[input].cameras must be 2 or 3")
+    if "cameras" in inputs and (type(inputs["cameras"]) is not int or inputs["cameras"] not in (1, 2, 3)):
+        raise ValueError("[input].cameras must be 1, 2 or 3")
     cap = inputs.get("max_language_tokens", 72)
     if type(cap) is not int or not 1 <= cap <= 160:
         raise ValueError("[input].max_language_tokens must be in 1..160 (default 72)")
     if "expected_language_tokens" in inputs:
         count = inputs["expected_language_tokens"]
         if type(count) is not int or not 1 <= count <= cap:
-            raise ValueError("[input].expected_language_tokens must be within the language cap")
+            raise ValueError(f"[input].expected_language_tokens must be 1..{cap}, the language cap "
+                             "[input].max_language_tokens (default 72, at most 160)")
 
 
 def training_alignment(train, checkpoint_config):
@@ -108,8 +109,8 @@ def validate_observation(obs, inputs):
             raise ValueError(f"observation {name} must be a finite CPU tensor")
     images = obs["images"]
     cameras = images.shape[0] if images.ndim == 3 else 0
-    if cameras not in (2, 3) or tuple(images.shape[1:]) != (256, 1536) or images.dtype != torch.float32:
-        raise ValueError("images must be Float32 [2|3,256,1536] (256x256 input images)")
+    if cameras not in (1, 2, 3) or tuple(images.shape[1:]) != (256, 1536) or images.dtype != torch.float32:
+        raise ValueError("images must be Float32 [1|2|3,256,1536] (256x256 input images)")
     if obs["img_masks"].dtype != torch.bool or tuple(obs["img_masks"].shape) != (cameras,) or not obs["img_masks"].all():
         raise ValueError("all configured cameras must have true Boolean image masks")
     grid = obs["image_grid_thw"]

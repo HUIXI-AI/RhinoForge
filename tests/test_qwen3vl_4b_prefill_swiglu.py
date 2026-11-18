@@ -30,7 +30,8 @@ def test_prefill_manifest_and_dispatch(tmp_path):
                                        "LINGBOT2_PREFILL_GATEUP_SHARED_A_SITE",
                                        "WALL_BASE_FP16_PREFILL_SHARED_GATEUP_SITE",
                                        "WALL_BASE_PREFILL_SHARED_DOWN_SITE",
-                                       "WALL_BASE_PREFILL_SHARED_REDUCE_SITE"))
+                                       "WALL_BASE_PREFILL_SHARED_REDUCE_SITE",
+                                       "CAUSAL_DECODER_REDUCE_SITE"))
     enums = "\n".join(definition(text,f"enum class {name}")+";" for text,name in (
         (base,"AttentionExecutionPolicy"),(base,"ChunkMode"),(base,"FmbPhysicalManifestState"),(base,"FmbGraphLifecycle"),
         (base,"FmbLinearAccumulationPolicy"),(base,"FmbRouteFamily"),(base,"FmbLinearRouteSelector"),
@@ -51,7 +52,7 @@ def test_prefill_manifest_and_dispatch(tmp_path):
     ring_start = source.index("        auto append_ring =",manifest_start)
     append_ring = source[ring_start:source.index("        auto append_kv =",ring_start)]
     selected_start = source.index("        bool needs_shared_mlp = false;",manifest_start)
-    selected = source[selected_start:source.index("        uint32_t shared_routes = 0;",selected_start)]
+    selected = source[selected_start:source.index("        uint32_t shared_routes =",selected_start)]
     dispatch = definition(source, "if (ctx().stage_plan.chunk_mode == ChunkMode::SEQUENTIAL &&\n            qwen3vl_4b_prefill_swiglu(")
     consumer = "\n".join(definition(planner,signature).replace("FmbPhysicalManifestConsumer::", "")
                           for signature in ("bool FmbPhysicalManifestConsumer::complete() const",
@@ -69,6 +70,11 @@ def test_prefill_manifest_and_dispatch(tmp_path):
 #include <string>
 #include <tuple>
 #include <vector>
+#include "src/fused/rpu_qwen3_w8a8_contract.h"
+#include "src/fused/rpu_qwen3_c192_contract.h"
+namespace qwen3_w8a8 = v3::qwen3_w8a8;
+namespace qwen3_c192 = v3::qwen3_c192;
+namespace qwen3_c512 = v3::qwen3_c512;
 #define TORCH_CHECK(condition,...) do {if(!(condition))throw std::runtime_error(#condition);}while(false)
 #define TORCH_INTERNAL_ASSERT(condition) assert(condition)
 namespace c10 {using Half=uint16_t;}
@@ -151,8 +157,12 @@ struct Model {
   // real predicate/manifest/emitter in test_qwen3vl_4b_decode_mlp.py.
   bool qwen3vl_decode_mlp(int64_t,int64_t,bool,bool,int64_t) const {return false;}
   __MEMBER_RING__
+  bool qwen3_c256_=false;
   FmbPhysicalExecutionManifest mlp_manifest(const Plan& plan,const Layout& layout,int64_t physical_len,int64_t position) {
     FmbPhysicalExecutionManifest manifest;manifest.state=FmbPhysicalManifestState::COMPLETE;
+    const bool qwen_inplace=false,qwen_c512=false,qwen_a8=false;
+    auto append_a8_quant=[&](const ChunkInfo&,int64_t){};
+    auto append_a8_linear=[&](const ChunkInfo&,qwen3_w8a8::Projection){};
     __APPEND__
     __APPEND_RING__
     __SELECTED__
@@ -249,6 +259,6 @@ int main() {
         program=program.replace(f"__{token}__",text)
     cpp,exe=tmp_path/"prefill_manifest.cpp",tmp_path/"prefill_manifest"
     cpp.write_text(with_actual_linear_contracts(program))
-    subprocess.run([compiler,"-std=c++17","-Wall","-Wextra","-Werror",str(cpp),"-o",str(exe)],
+    subprocess.run([compiler,"-std=c++17","-Wall","-Wextra","-Werror","-I",str(ROOT),str(cpp),"-o",str(exe)],
                    check=True,capture_output=True,text=True)
     subprocess.run([str(exe)],check=True,capture_output=True,text=True)

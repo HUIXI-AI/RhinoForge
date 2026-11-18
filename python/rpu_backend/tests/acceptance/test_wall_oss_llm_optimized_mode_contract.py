@@ -50,8 +50,8 @@ def test_direct_forward_pads_once_then_restores_logical_output_and_cache():
     model.prefill_execution_plan = lambda logical_len, *, reserve_rows=0: (4, 4)
     seen = {}
 
-    def run_prefill(inputs_embeds, position_ids, op_id, *, logical_len=None, reserve_rows=0):
-        seen.update(inputs_embeds=inputs_embeds, position_ids=position_ids, op_id=op_id, logical_len=logical_len, reserve_rows=reserve_rows)
+    def run_prefill(inputs_embeds, position_ids, op_id, *, logical_len=None, reserve_rows=0, fixed_bucket=False):
+        seen.update(inputs_embeds=inputs_embeds, position_ids=position_ids, op_id=op_id, logical_len=logical_len, reserve_rows=reserve_rows, fixed_bucket=fixed_bucket)
         model.cache.position = inputs_embeds.size(1)
         return torch.arange(16, dtype=torch.float32).reshape(1, 4, 4)
     model._run_prefill = run_prefill
@@ -63,6 +63,9 @@ def test_direct_forward_pads_once_then_restores_logical_output_and_cache():
     assert seen['position_ids'].tolist() == [[0, 0, 0], [1, 1, 1], [2, 2, 2], [2, 2, 2]]
     assert seen['logical_len'] == 3
     assert seen['reserve_rows'] == 2
+    assert seen['fixed_bucket'] is False
+    # The VLA owns its padded embeddings and needs the physical cache tail for
+    # its 2D action mask, so forward_embeds deliberately does not rewind it.
     physical = model.forward_embeds(torch.zeros(1, 4, 4), torch.zeros(4, 3, dtype=torch.int32), logical_len=3)
     assert physical.shape == (1, 4, 4)
     assert model.cache.position == 4

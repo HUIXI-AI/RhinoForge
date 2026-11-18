@@ -6,7 +6,9 @@
 
 [E4B FP16](e4b/fp16.toml) 提供文本生成入口。支持状态与 4/6/8 核见[配置表](#configurations)；“支持”表示该配置在板上通过运行时检查，数值误差见性能报告。
 
-只有解码层在 RPU 上运行；词嵌入、PLE 表和与词嵌入共享的输出头留在 CPU。核数只改变解码层的切分（注意力固定 2 核，MLP 用 4/6/8 核），2026-10-21 实测 4/6/8 核的 TPOT 都约 1.7 s，完整请求耗时相差约 2%。
+[W8A16](e4b/w8a16_text.toml) 和 [W4A16 G32](e4b/w4a16_text_rtn_g32.toml) 读取同一个浮点权重目录，在加载时量化 decoder 每层的七个投影，其余保持原精度；两者 2026-11-06 首次上板并通过运行时检查（8 核；W4A16 另跑 6 核，耗时见下段），细节见[量化指南](../../../docs/quantization.zh.md)。
+
+解码层和与词嵌入共享的输出头在 RPU 上运行（输出头 FP16 权重、FP32 累加，8 核时用 8 核，4/6 核时用 4 核），logits 回到 CPU 做最后的 softcap；词嵌入和 PLE 侧输入在 CPU 上计算。核数改变解码层的切分（注意力固定 2 核，MLP 用 4/6/8 核）和输出头的核数。2026-10-21 输出头还在 CPU 上时，实测 4/6/8 核的 TPOT 都约 1.7 s。2026-11-06 输出头移到 RPU 后，同一输入（P6 / D4，预热 2 次、正式 5 次）实测 TPOT：FP16 8 核约 106 ms，W8A16 8 核约 73 ms，W4A16 6 核约 73 ms。
 
 <a id="运行"></a>
 
@@ -34,12 +36,16 @@ P 为处理后的输入 token 数，D 为 decode 调用数；生成首 token 来
 
 ### E4B 文本
 
+| 配置 | 支持状态 | 精度 | 量化范围 | 4 核 | 6 核 | 8 核 |
+|---|---|---|---|---|---|---|
+| [e4b/fp16.toml](e4b/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | ● 已实测（注意力 2 · MLP 4） | ● 已实测（注意力 2 · MLP 6） | ● 已实测 |
+| [e4b/w4a16_text_rtn_g32.toml](e4b/w4a16_text_rtn_g32.toml) | 已实现，未认证（`IMPLEMENTED_UNVERIFIED_HW`） | w4a16 | 文本层 W4A16 G32 RTN | ● 已实测（注意力 2 · MLP 4） | ● 已实测（注意力 2 · MLP 6） | ● 已实测 |
+| [e4b/w8a16_text.toml](e4b/w8a16_text.toml) | 已实现，未认证（`IMPLEMENTED_UNVERIFIED_HW`） | w8a16 | 文本层 W8A16 | ● 已实测（注意力 2 · MLP 4） | ● 已实测（注意力 2 · MLP 6） | ● 已实测 |
+
+本组配置相同的项：
+
 | 项目 | 值 |
 |---|---|
-| 配置 | [e4b/fp16.toml](e4b/fp16.toml) |
-| 支持状态 | 支持（`SUPPORTED`） |
-| 精度 | fp16 |
-| 量化范围 | — |
 | 输入类型 | 文本 / token IDs |
 | prompt 默认示例 | Explain what a compiler does. |
 | decode_steps 默认值 | 4 |
@@ -48,9 +54,6 @@ P 为处理后的输入 token 数，D 为 decode 调用数；生成首 token 来
 | 其他输入形状 | B=1 |
 | 联动限制 | 安装和分配max(512,P+D)，不得超过checkpoint max_position_embeddings；cache与RoPE horizon共同校验。 |
 | 默认核数 | 8 |
-| 4 核 | ● 已实测（注意力 2 · MLP 4） |
-| 6 核 | ● 已实测（注意力 2 · MLP 6） |
-| 8 核 | ● 已实测 |
 | CPU线程数 | 未设置（沿用环境） |
 | 权重 | `gemma4-e4b` |
 | 入口 | [run.py](../../run.py) |

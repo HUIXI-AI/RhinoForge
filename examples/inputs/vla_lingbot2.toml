@@ -1,0 +1,53 @@
+# LingBot v2 的输入预设：python examples/run.py --config <TOML> --input <预设名>
+# --input canonical 取本文件的 canonical；--set input.<键> 的同名字段优先于预设。
+#
+# 预设名与 vla.toml 相同，文本长度写在 expected_language_tokens（完整、未截断指令的有效
+# token 数）。
+#
+# 范围：cameras 1 / 2 / 3（1 相机未上板）；expected_language_tokens 为 1 到 max_language_tokens（省略时 72，
+#   最大 160）。t128 预设超出默认上限，需同时写 --set input.max_language_tokens=128。
+# requires：模板 [input] 须已写这些字段。legacy exact_z2 模板读取固定的 observation，
+#   配置检查会拒绝预设。
+# fixtures：observation 文件已经固定了相机数和文本长度。预设改变了形状时，须同时用
+#   --set input.observation=<路径> 给出该形状的文件，否则配置检查拒绝；加载时还会核对文件
+#   内容与 cameras、expected_language_tokens 是否一致。
+applies_to = ["lingbot2"]
+canonical = "2cam_t32"
+requires = ["cameras", "expected_language_tokens"]
+fixtures = { lingbot2 = "observation" }
+
+[preset.1cam_t32]
+cameras = 1
+expected_language_tokens = 32
+
+[preset.1cam_t64]
+cameras = 1
+expected_language_tokens = 64
+
+[preset.1cam_t128]
+cameras = 1
+expected_language_tokens = 128
+
+[preset.2cam_t32]
+cameras = 2
+expected_language_tokens = 32
+
+[preset.2cam_t64]
+cameras = 2
+expected_language_tokens = 64
+
+[preset.2cam_t128]
+cameras = 2
+expected_language_tokens = 128
+
+[preset.3cam_t32]
+cameras = 3
+expected_language_tokens = 32
+
+[preset.3cam_t64]
+cameras = 3
+expected_language_tokens = 64
+
+[preset.3cam_t128]
+cameras = 3
+expected_language_tokens = 128

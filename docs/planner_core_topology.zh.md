@@ -19,11 +19,11 @@
 
 | 模型 | 缩核范围 |
 |---|---|
-| Qwen3 FP16 | 精确的 0.6B、1.7B、4B、8B 结构；标准因果位置、batch 为一。量化配置单独准入。 |
-| Qwen3-VL FP16 | 精确的 2B、4B、8B 结构、batch 为一；Vision 使用四核，Text 按上表分配。 |
-| Qwen3.5 Dense | 0.8B、2B、4B、9B 联合确定 Text、GDN、Vision 拓扑；缩核 Vision 使用四核；0.8B 的八核 Vision owner 仍以四核 attention、八核 MLP 执行。量化及官方 27B 按各自模板准入。 |
-| Qwen3.5 35B-A3B mixed E4M3 | 接受 4/6/8；六核时 attention、GDN、router projection、head、Vision 使用四核，routed/shared expert 使用六核。RTN/GPTQ 配置单独处理。 |
-| Pi0.5 generic | 缩核 Vision、attention、conditioning 使用四核，MLP 使用对应四核或六核配置；optimized 配置仍要求八核。 |
+| Qwen3 / Llama / Gemma4 | Qwen3 0.6B–32B（按配方支持 FP16、W8A16、W4A16 G32、NVFP4）、Llama 3.2-1B（6 核 MLP 补齐 `8192 → 8256`）及 Gemma4 E4B（2 核 attention，6 核 MLP 补齐 `10240 → 10272`）支持 4/6/8 核。 |
+| Qwen3-VL / DINOv3 | Qwen3-VL 2B–32B（含缩核下四核 Vision W8/W4/NVFP4）及 DINOv3 ViT-B（FP16、W8A16、W4A16 G32）支持 4/6/8 核。 |
+| Qwen3.5 Dense & 35B-A3B | Dense 0.8B–27B（按模板配方准入；27B W4 group32 固定 8 核）以及 35B-A3B mixed-E4M3、RTN-W8A16 支持 4/6/8 核。 |
+| Qwen3 ASR / TTS | 0.6B 与 1.7B 的 FP16、W8A16、W4A16 G32、NVFP4 支持 4/6/8 核；4/6 核时音频编码器和 codec Transformer 使用四核。 |
+| Pi0.5 与 VLA 族 | Pi0.5 全部 29 份 LIBERO/Kuavo 模板（完整前缀 W8A8 除外）、G0.5 K1、GR00T-N1.7、HyVLA、HY-Embodied、InternVLA-N1、LingBot v2、RhinoVLA v3 及 Wall-OSS Base/RTC/Sorting（Sorting Action W4 G32 除外）支持 4/6/8 核；各族 Legacy 入口与 HALO 保持 8 核。 |
 
 各入口的 checkpoint、精度和输入限制见[配置索引](../examples/configs/CONFIGURATIONS.md)。
 官方 Qwen3.5-27B 的 W8 接受 4/6/8，W4 group32 接受 8；相同架构名不能替代 checkpoint 元数据检查。

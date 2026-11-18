@@ -18,9 +18,9 @@ def source_probe():
      code=code.replace(definition(code,marker), definition(core,marker))
     code=code.replace('class FusedModelBase {};','class FusedModelBase {public: struct Impl {bool persistent_allocated_=false;};};')
     code=code.replace('int64_t temporary_used() const {return temporary;}', 'int64_t temporary_used() const {return temporary;}\n    int64_t total_used() const {return SpmAllocator::SPM_USABLE-free;}')
-    # Both reduced models have the original attention/head4 domain in the facade.
+    # Reduced models run the padded untied head across six cores at budget 6.
     start=code.index('class Qwen3_5MoeModel :')
-    code=code[:start]+code[start:].replace('public:\n','public:\n    int64_t minimum_eager_spm_bytes() const;\n    int lm_head_tp() const {return num_cores()==6 ? 4 : num_cores();}\n',1)
+    code=code[:start]+code[start:].replace('public:\n','public:\n    int64_t minimum_eager_spm_bytes() const;\n    int lm_head_tp() const {return num_cores();}\n',1)
     # Use actual current routed/shared domains, including UINT4 root6/routed4.
     moe_header=(ROOT/'src/fused/rpu_qwen3_5_moe_model.h').read_text()
     moe_shim=definition(code,'class Qwen3_5MoeModel :')
@@ -37,7 +37,7 @@ def source_probe():
     fragment=linear[linear.index('  // Per core, per row: x +'):linear.index('  size_t m_chunk = col_scatter ?')]
     code+='''\nbool eager_head_accepts(int64_t bytes) {
         watermarks.free=bytes; watermarks.temporary=0;
-        const size_t a_dwidth=2,m=1,k=2048,n=248320,local_n=n/4,local_k=k;
+        const size_t a_dwidth=2,m=1,k=2048,n=248352,local_n=n/6,local_k=k;
         // The eager head is a plain GEMM: its A row spans the whole local K and
         // it stages no halo. Only the conv-slab route narrows the pitch.
         const size_t in_pitch=local_k;
@@ -61,9 +61,10 @@ def source_probe():
         for(int i=0;i<40;++i)model.layer_is_full_[i]=(i%4==3);
         model.cores=6;model.nkv=4;model.moe_.tensor_parallel=6;
         const int64_t reserve=model.minimum_eager_spm_bytes();
-        assert(reserve==129280);
-        assert(!eager_head_accepts(109568));
-        assert(!eager_head_accepts(129024));
+        assert(reserve==87808);
+        assert(!eager_head_accepts(65536));
+        assert(!eager_head_accepts(87552));
+        assert(!eager_head_accepts(87648));
         assert(eager_head_accepts(reserve));
         assert(eager_head_accepts(reserve+256));
         for(int cores:{4,8}) {model.cores=cores;assert(model.minimum_eager_spm_bytes()==0);}
@@ -71,7 +72,7 @@ def source_probe():
         // The old failing geometry can fit the fused layout while leaving too
         // little for eager. Check the actual generic helpers at the exact boundary.
         std::vector<BufferDecl> artificial={{"body",1048576,0,1,StorageClass::Temp}};
-        watermarks.temporary=0;watermarks.free=1048576+109568;
+        watermarks.temporary=0;watermarks.free=1048576+65536;
         assert(final_chunk_layout_fits(artificial,false));
         assert(!final_chunk_layout_fits(artificial,false,reserve));
         watermarks.free=1048576+reserve;
@@ -87,7 +88,7 @@ def source_probe():
         assert(saved.fits(1048576+2048+reserve,true,SpmAllocator::SPM_PLANNING_BUDGET,reserve));
         assert(!saved.fits(1048576+2048+reserve-256,true,SpmAllocator::SPM_PLANNING_BUDGET,reserve));
         rejects([&]{saved.available(8000000,false,SpmAllocator::SPM_PLANNING_BUDGET,-256);});
-        rejects([&]{saved.available(8000000,false,SpmAllocator::SPM_PLANNING_BUDGET,129025);});
+        rejects([&]{saved.available(8000000,false,SpmAllocator::SPM_PLANNING_BUDGET,87553);});
         rejects([&]{saved.available(8000000,false,SpmAllocator::SPM_PLANNING_BUDGET,SpmAllocator::SPM_TOTAL);});
 
         int observations=0,admitted=0,rejected=0,default_zero=0;

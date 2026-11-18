@@ -101,7 +101,7 @@ namespace v3 {
 struct Owner {
  const bool kv_spm_only_opt_in_;
  bool z2_bound_=false;int64_t z2_prepared_seq_len_=0;
- int64_t layers=4,h=2048,ff=8192,q=32,kv=32,hd=64,tp=8;
+ int64_t layers=4,h=2048,ff=8192,q=32,kv=32,hd=64,tp=8,cores=NUM_CORES;
  std::vector<int> layer_weights_=std::vector<int>(4);
  std::vector<int> k_cache=std::vector<int>(4),v_cache=std::vector<int>(4);
  HostContext context;
@@ -109,7 +109,7 @@ struct Owner {
  HostContext&ctx(){return context;}
  int64_t num_layers()const{return layers;}int64_t hidden_size()const{return h;}
  int64_t intermediate_size()const{return ff;}int64_t num_q_heads()const{return q;}
- int64_t num_kv_heads()const{return kv;}int64_t head_dim()const{return hd;}int attn_tp()const{return tp;}
+ int64_t num_kv_heads()const{return kv;}int64_t head_dim()const{return hd;}int attn_tp()const{return tp;}int num_cores()const{return cores;}int mlp_tp()const{return cores;}
  KvInsertSegmentPlan resolve_kvinsert_plan_auto(int64_t,FmbGraphLifecycle,int64_t p,int64_t l,
      int64_t physical,int cores,int64_t heads,int64_t dim,uint32_t caps)const{
   return rpu_resolve_kvinsert_segment_plan_auto(p,l,physical,cores,heads,dim,caps);
@@ -183,6 +183,7 @@ int main(){
  for(auto lengths:{std::pair{82,214},std::pair{214,82},std::pair{169,214},std::pair{214,169}}){on.plan(lengths.first);on.record(true);
   const auto stale=on.context.consumer.manifest();on.plan(lengths.second);on.context.consumer.reset(stale);rejected([&]{on.run();});}
  on.plan();
+ {Owner m4=on;m4.cores=4;m4.tp=4;assert(m4.kv_spm_only_profile(m4.context.stage_plan,m4.layout(true),0));}
  for(int bad=0;bad<14;++bad){Owner x=on;switch(bad){case 0:x.z2_bound_=true;break;case 1:x.z2_prepared_seq_len_=82;break;
   case 2:x.tp=4;break;case 3:x.layers=3;break;case 4:x.layer_weights_.resize(3);break;case 5:x.h=1536;break;
   case 6:x.ff=6144;break;case 7:x.q=16;break;case 8:x.kv=16;break;case 9:x.hd=48;break;
@@ -236,7 +237,7 @@ def test_vl_kv_spm_only_cold_identity_and_original_spm_contract():
     declarations = _function(source, "    std::vector<BufferDecl> declare_buffers(")
     assert "raw_spm ? Align(cs, int64_t{16}) : cs" in declarations
     assert 'row_bias("out_bias"' in declarations and 'row_bias("ff2_bias"' in declarations
-    assert "rpu_launch_memset_spm_multicore(core0_addr, hidden_size())" in declarations
+    assert "rpu_launch_memset_spm_multicore(core0_addr, hidden_size(), num_cores())" in declarations
     # Omitting DDR-only writers cannot remove an SPM tail clear. The preserved
     # preload memset calls initialize row biases and are unrelated to K/V tails.
     assert "rpu_launch_memset_spm_multicore(" not in block

@@ -31,14 +31,14 @@ def test_fixed_profile_reaches_real_cache_geometry_and_reset(monkeypatch, cores)
     calls = []
     def native(handle):
         calls.append(handle)
-        return (cores, attention, cores, attention, 8)
+        return (cores, attention, cores, cores, 8)
     monkeypatch.setattr(torch.ops.rpu, "qwen3_5_moe_get_execution_topology", native, raising=False)
     monkeypatch.setattr(torch.ops.rpu, "qwen3_5_moe_get_execution_topology_v2",
-        lambda _: (2, cores, attention, attention, attention, cores, cores, cores, attention, 8),
+        lambda _: (2, cores, attention, attention, attention, cores, cores, cores, cores, 8),
         raising=False)
     cache = Qwen3_5MoeCache.from_model(model, max_seq_len=64, device="cpu")
     assert calls == [17]
-    assert cache.execution_topology == (cores, attention, cores, attention, 8)
+    assert cache.execution_topology == (cores, attention, cores, cores, 8)
     assert cache.num_kv_heads == cache.attn_tp == cache.gdn_num_cores == attention
     assert cache.physical_kv_cores == cache.nKVHeadChunk == 8
     assert cache.k_caches[3].shape[4] == 8
@@ -113,8 +113,8 @@ def test_tp6_full_native_owner_drift_fails_before_cache_allocation(monkeypatch, 
     model = SimpleNamespace(config=config(), _rpu_qwen3_5_moe=state,
                             _rpu_execution={"model": {"num_cores": 6}})
     monkeypatch.setattr(torch.ops.rpu, "qwen3_5_moe_get_execution_topology",
-                        lambda _: (6, 4, 6, 4, 8), raising=False)
-    full = [2, 6, 4, 4, 4, 6, 6, 6, 4, 8]
+                        lambda _: (6, 4, 6, 6, 8), raising=False)
+    full = [2, 6, 4, 4, 4, 6, 6, 6, 6, 8]
     full[axis] = 1 if axis == 0 else (6 if full[axis] == 4 else 4)
     monkeypatch.setattr(torch.ops.rpu, "qwen3_5_moe_get_execution_topology_v2",
                         lambda _: full, raising=False)
@@ -187,7 +187,7 @@ def test_public_forward_uses_installed_head_core_layout(monkeypatch, cores, keep
     expected_input = output[:, -keep:] if keep else output
     torch.testing.assert_close(result.logits, linear(expected_input, weight).float(), rtol=0, atol=0)
     assert result.past_key_values is cache
-    assert calls == [(1, 4 if cores != 8 else 8, (1 if keep else 3, 16), acc32)]
+    assert calls == [(1, cores, (1 if keep else 3, 16), acc32)]
 
 
 @pytest.mark.parametrize("cores", [4, 6, 8])

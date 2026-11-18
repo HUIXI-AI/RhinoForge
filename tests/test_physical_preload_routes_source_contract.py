@@ -17,6 +17,7 @@ def test_conditional_preload_routes_publish_manifest_and_consumer_receipts():
             ("QWEN3VL_ROPE_SIN_PRELOAD_PIPELINE_SITE", "7646375323102352740LL"),
             ("QWEN3VL_ROPE_COS_PRELOAD_DIRECT_SITE", "1089927205617401262LL"),
             ("QWEN3VL_ROPE_SIN_PRELOAD_DIRECT_SITE", "9144463814971908982LL"),
+            ("QWEN3VL_NVFP4_SCALE_PRELOAD_SITE", "2325782528529170216LL"),
         ),
         "rpu_qwen25vl_vision_model.cpp": (
             ("QWEN25_ROPE_COS_PRELOAD_SITE", "6623618708631996252LL"),
@@ -57,6 +58,8 @@ def test_conditional_preload_routes_publish_manifest_and_consumer_receipts():
     assert "StorageClass::Persistent" in qwen3vl
     assert "pipeline ? QWEN3VL_ROPE_COS_PRELOAD_PIPELINE_SITE" in qwen3vl
     assert "pipeline ? QWEN3VL_ROPE_SIN_PRELOAD_PIPELINE_SITE" in qwen3vl
+    # NVFP4 tables: one record and one callback receipt per projection role.
+    assert qwen3vl.count("{static_cast<int64_t>(role), elements, 2 * elements}") == 2
 
     qwen25vl = _read("rpu_qwen25vl_vision_model.cpp")
     assert qwen25vl.count(

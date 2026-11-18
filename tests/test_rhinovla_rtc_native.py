@@ -353,7 +353,7 @@ void rpu_launch_pi05_gated_residual_spm_kernel(uint32_t a,uint32_t b,uint32_t ga
  for(int64_t row=0;row<rows;++row)for(int64_t h=0;h<1024;++h)
   spm[out/2+row*1024+h]=spm[a/2+row*1024+h]*spm[gate/2+h]+spm[b/2+row*1024+h];
 }
-void rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(uint32_t gate,uint32_t a,uint32_t out,int64_t rows,int64_t h,float alpha,ValuOpType op,bool) {
+void rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(uint32_t gate,uint32_t a,uint32_t out,int64_t rows,int64_t h,float alpha,ValuOpType op,bool,int=8) {
  assert(h==1024 && alpha==1 && op==ValuOpType::MUL);mul_rows.push_back(rows);
  for(int64_t row=0;row<rows;++row)for(int64_t col=0;col<h;++col)
   spm[out/2+row*h+col]=spm[a/2+row*h+col]*spm[gate/2+col];
@@ -369,7 +369,7 @@ struct Model {
  uint64_t adarms_pair_table_src_base_=100,adarms_final_table_src_base_=200;
  Context context;
  Context& ctx(){return context;}
- int64_t hidden_size()const{return 1024;}int64_t num_layers()const{return 18;}
+ int64_t hidden_size()const{return 1024;}int64_t num_layers()const{return 18;}int num_cores()const{return 8;}
  int unary_precision()const{return 1;}
  uint32_t addr(int core,const char* name) {
   assert(core==0);return std::strcmp(name,"adarms_pair_resident")==0?4096:8000000;

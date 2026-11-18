@@ -153,8 +153,8 @@ def test_prefill_rope_preparation_preserves_cpu_and_rpu_routes(
     if route != "cached":
         engine = runpy.run_path(str(_ROOT / "examples/runners/pi05/optimized.py"))
         for cameras in (2, 3):
-            config = load_example_toml(_ROOT / "examples/configs/pi05" /
-                                       f"{cameras}cam/h50/{route}.toml")
+            config = load_example_toml(_ROOT / f"examples/configs/pi05/h50/{route}.toml")
+            config["input"]["cameras"] = cameras
             for text_tokens in (32, 64, 128, 160):
                 config["input"]["text_tokens"] = text_tokens
                 args = engine["_example_arguments"](config)
@@ -394,6 +394,9 @@ HostTensor tagged(const at::Tensor& value){
  }return {value,{},value.device()};
 }
 struct Model{
+ // This RoPE transport fixture does not install an A8 panel owner.
+ bool pi05_prefill_a8_panel512_=false;
+ void validate_pi05_a8_panel512_cold()const{assert(!pi05_prefill_a8_panel512_);}
  bool pi05_prefill_kv1_pair_direct_=true,prefill_rope_ready_=false,pi05_prefill_kv1_replica_proof_=false;
  std::vector<int> pi05_a8_scales_,chunk_mask_publications_;
  HostTensor cos_,sin_;int64_t prefix_rows=4;uint64_t generation=9;

@@ -1,4 +1,4 @@
-"""Execute the actual typed NVFP4 wrappers and registers, including Pi limits."""
+"""Execute the actual typed NVFP4 wrappers and registers, including Pi limits and lanes."""
 from pathlib import Path
 from test_siglip_cold_profile import _body
 from test_g05_q_gate_native import _compile_run
@@ -37,6 +37,7 @@ def test_nvfp4_typed_launch_preserves_precision_owners_and_model_boundaries(tmp_
 #include <stdexcept>
 #include <vector>
 #include "rpu_linear_tiling.h"
+#include "pi05_execution_topology.h"
 #define TORCH_CHECK(ok,...) do{if(!(ok))throw std::runtime_error("rejected");}while(0)
 namespace c10 {using Half=uint16_t;}
 namespace at {
@@ -78,10 +79,10 @@ struct RpuKernelGraph{std::vector<GraphDdrRegisterOperandSpec> owners;Kernel ker
  Kernel*get(KernelId k){assert(k==id&&!pending);pending=true;return &kernel;}};
 void Writer::write(Kernel&k){auto&g=RpuKernelGraph::active();assert(g.pending&&!g.written);for(auto&o:g.owners){auto value=o.owner.address>>8;k.set_regs(o.abi.lo,uint16_t(value));k.set_regs(o.abi.hi,uint16_t(value>>16));}g.written=true;}
 #define GET_KERNEL(id) RpuKernelGraph::active().get(id)
-struct Queue{bool broadcast=false;int launches=0;std::vector<uint16_t> grid;
+struct Queue{bool broadcast=false;int launches=0,lanes=8;std::vector<uint16_t> grid;
  void set_broadcast_mode(bool b){broadcast=b;}
- void enqueu_kernel(Kernel&,std::vector<uint16_t> gr,std::vector<uint8_t> cores){auto&g=RpuKernelGraph::active();assert(g.pending&&g.written&&broadcast&&cores==std::vector<uint8_t>({0,1,2,3,4,5,6,7}));grid=gr;++launches;g.pending=g.written=false;}}queue;
-Queue*get_queue(int n){assert(n==8);return &queue;}
+ void enqueu_kernel(Kernel&,std::vector<uint16_t> gr,std::vector<uint8_t> cores){auto&g=RpuKernelGraph::active();std::vector<uint8_t> all;for(int c=0;c<lanes;++c)all.push_back(c);assert(g.pending&&g.written&&broadcast&&cores==all);grid=gr;++launches;g.pending=g.written=false;}}queue;
+Queue*get_queue(int n){assert(n==4||n==6||n==8);queue.lanes=n;return &queue;}
 #define GET_QUEUE(n) get_queue(n)
 struct Pi05SplitKvMerge;
 // A deferred merge launched alone records the O launch count before it.
@@ -115,7 +116,7 @@ int main(){
   }
   reject([&]{rpu_launch_g05_nvfp4_v2_kernel(x,w,y,50,n,k,part,8,s,ts,0,false);});
   reject([&]{rpu_launch_g05_nvfp4_v2_kernel(x,w,y,32,n,k,part,8,s,ts,24,false);});
-  reject([&]{rpu_launch_g05_nvfp4_v2_kernel(x,w,y,32,n,k,part,4,s,ts,0,false);});
+  reject([&]{rpu_launch_g05_nvfp4_v2_kernel(x,w,y,32,n,k,part,6,s,ts,0,false);});
   reject([&]{rpu_launch_g05_nvfp4_v2_kernel(x,w,x,32,n,k,part,8,s,ts,0,false);});
   reject([&]{rpu_launch_g05_nvfp4_v2_kernel(x,w,y,32,n,k,part,8,s,x,0,false);});
   reject([&]{rpu_launch_g05_nvfp4_v2_kernel(x+1,w,y,32,n,k,part,8,s,ts,0,false);});
@@ -197,6 +198,38 @@ int main(){
   }
  }
  assert(tscale_launches==7&&merge_o_launches>=12);
+ // Pi reduced lanes: attention TP4, MLP 4 or the six-lane width 4224.
+ for(int cores:{4,6}){
+  const int mlp=cores==6?4224:4096;
+  for(auto geometry:{std::array<int,4>{2048,1024,1,4},{mlp,1024,1,cores},{1024,2048,0,4},{1024,mlp,0,cores}}){
+   auto n=geometry[0],k=geometry[1],part=geometry[2],lanes=geometry[3];at::Tensor w,s;
+   w.shape={n,k/2};s.shape={k/16,n};int ln=part?n/lanes:n,lk=part?k:k/lanes;
+   for(bool acc32:{false,true}){
+    rpu_launch_pi05_nvfp4_v2_kernel(x,w,y,50,n,k,part,lanes,s,ts,17,acc32);
+    const bool gate_up=part==1&&n==mlp;const int nt=acc32?(gate_up?48:64):rpu_pl_tiling::select_tile_nvfp4_acc16(50,ln,lk).n_tile;
+    assert(!acc32||g.id==(gate_up?KernelId::PARALLEL_LINEAR_NVFP4_V2_M384N48:KernelId::PARALLEL_LINEAR_NVFP4_V2_M320N64));
+    assert(pair(10)==unsigned(ln)&&g.kernel.regs.at(12)==lk&&g.kernel.regs.at(13)==lk/64&&g.kernel.regs.at(15)==lanes);
+    assert(pair(22)==unsigned(lanes*ln*2)&&queue.lanes==lanes&&queue.grid[0]==uint16_t((ln+nt-1)/nt));
+   }
+  }
+  // G05 splits its exact action families over four lanes; six lanes (and the
+  // padded MLP width) stay refused. Pi rejects other lane counts and unpadded six-lane MLP.
+  if(cores==4)for(auto geometry:{std::array<int,3>{2048,1024,1},{4096,1024,1},{1024,2048,0},{1024,4096,0}}){
+   auto n=geometry[0],k=geometry[1],part=geometry[2];at::Tensor gw,gs;gw.shape={n,k/2};gs.shape={k/16,n};int ln=part?n/4:n,lk=part?k:k/4;
+   rpu_launch_g05_nvfp4_v2_kernel(x,gw,y,32,n,k,part,4,gs,ts,23,false);
+   assert(pair(10)==unsigned(ln)&&g.kernel.regs.at(12)==lk&&g.kernel.regs.at(15)==4&&g.kernel.regs.at(27)==23&&queue.lanes==4);
+  }
+  at::Tensor w,s;w.shape={mlp,512};s.shape={64,mlp};
+  reject([&]{rpu_launch_g05_nvfp4_v2_kernel(x,w,y,32,mlp,1024,1,6,s,ts,0,false);});
+  reject([&]{rpu_launch_pi05_nvfp4_v2_kernel(x,w,y,50,mlp,1024,1,5,s,ts,0,false);});
+  reject([&]{rpu_launch_pi05_nvfp4_v2_kernel(x,w,y,50,mlp,1024,1,cores==6?4:6,s,ts,0,false);});
+ }
+ {at::Tensor w,s;w.shape={4096,512};s.shape={64,4096};
+  reject([&]{rpu_launch_pi05_nvfp4_v2_kernel(x,w,y,50,4096,1024,1,6,s,ts,0,false);});
+  w.shape={1024,2048};s.shape={256,1024};
+  reject([&]{rpu_launch_pi05_nvfp4_v2_kernel(x,w,y,50,1024,4096,0,6,s,ts,0,false);});
+  w.shape={2048,512};s.shape={64,2048};
+  reject([&]{rpu_launch_pi05_nvfp4_v2_kernel(x,w,y,50,2048,1024,1,6,s,ts,0,false);});}
  at::Tensor w,s;s.shape={64,2048};reject([&]{rpu_launch_g05_nvfp4_v2_kernel(x,w,y,32,1024,1024,1,8,s,ts,0,false);});
  allocator.initialized=false;reject([&]{rpu_launch_g05_nvfp4_v2_kernel(x,w,y,32,2048,1024,1,8,s,ts,0,false);});
 }

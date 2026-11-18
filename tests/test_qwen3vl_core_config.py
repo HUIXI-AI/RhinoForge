@@ -67,7 +67,7 @@ def test_exact_profiles_derive_text_budget_and_four_core_vision_without_mutation
     original = _weights(model)
     adapter = vl.Qwen3VLAdapter(model)
     topology = vl._qwen3_vl_core_topology(model.config, model._rpu_execution)
-    assert topology.identity()[1:] == (cores, 4, cores, 4, 8)
+    assert topology.identity()[1:] == (cores, 4, cores, cores, 8)
     assert adapter._topology == topology
     assert execution_core_count(adapter._text_execution) == cores
     assert execution_core_count(adapter._vision_execution) == 4
@@ -184,7 +184,7 @@ def test_full_to_rpu_revalidates_both_towers_before_claim(monkeypatch, fault):
     monkeypatch.setattr(vl, "_claim_live_instance", claim)
     monkeypatch.setattr(vl, "convert_linear_weights_inplace",
                         lambda *a, **kw: pytest.fail("preclaim failure converted weights"))
-    if fault is None:
+    if fault in (None, "vision_batch"):
         with pytest.raises(_ReachedClaim):
             adapter.to_rpu()
         assert claimed == [model]
@@ -276,7 +276,7 @@ def test_w8_text_profile_preserves_fp16_vision_tied_head_and_core_topology(cores
     assert all(p.dtype == torch.float16 for p in model.model.visual.parameters())
     topology = adapter._topology
     if cores != 8:
-        assert topology.identity() == (2, cores, 4, cores, 4, 8)
+        assert topology.identity() == (2, cores, 4, cores, cores, 8)
         text = model.model.language_model
         _validate_mrope_decoder_topology(text, config=text.config,
             arch="qwen3_vl_text", execution_config=adapter._text_execution,

@@ -1,6 +1,9 @@
 # 未写出的执行参数（省略即按以下值运行）：
-#   CPU 线程：用 run.py 运行时，[cpu].threads 省略则不设置线程（PyTorch 使用 OMP_NUM_THREADS，未设置时使用全部 CPU 核，参考板 24；2026-10-20 run.py 实测环境为 16）；validate_v3.py 不读取 [cpu]，线程数用其 --threads 参数设置，默认 12。
-# 对应 v3 steps_150000 non-RTC 配方，由 examples/run.py 运行；validate_v3.py 也读取本文件做运行时校验。
+#   rpu_execution.model.num_cores 省略为 8；可写 4 / 6，修改后需重新加载模型：动作专家与文本为 Attention 4、MLP 4/6，Vision 用 4 核；
+#     只有 8 核实现的选项（专家融合、常驻 AdaRMS 表、对齐 KV、融合/烘焙 merger、merger scatter、多视角批处理、视觉输入缓存）在 4/6 核自动关闭。
+#     gate tanh 预计算在 4/6 核同样生效，每层从 DDR 表读取。
+#   CPU 线程：用 run.py 运行时，[cpu].threads 省略则不设置线程（PyTorch 使用 OMP_NUM_THREADS，未设置时使用全部 CPU 核，参考板 24；2026-10-20 run.py 实测环境为 16）；validate_rhinovla_v3.py 不读取 [cpu]，线程数用其 --threads 参数设置，默认 12。
+# 对应 v3 steps_150000 non-RTC 配方，由 examples/run.py 运行；validate_rhinovla_v3.py 也读取本文件做运行时校验。
 # 所有执行的 Linear 权重为 INT8，scale 与激活为 FP16，包括
 # patch、merger、prefix、expert、动作 IO 以及冷启动时的 AdaRMS 表生成。
 # Norm、bias、embedding 和位置张量保持浮点。
@@ -8,8 +11,8 @@
 profile_id = "rhinovla.v3.w8a16-pipeline-input-cache.source"
 registry_alias = "rhinovla-controlled"
 target = "rhinovla"
-# 与下方 [model.opt_in] 的 W8A16 开关一致：任一为 "1" 时为 w8a16，否则为 fp16。
-precision = "w8a16"
+# 登记的精度配方（manifests/precision_recipes.v1.json）；RPU_RHINOVLA_FULL_W8A16 / EXPERT_W8A16 与 factory 的 expert_w8a16 / full_w8a16 由配方设置，TOML 中写出会被拒绝。
+precision = "w8a16_pipeline"
 # v3 steps_150000 non-RTC 源码目录（含模型代码与 qwen3_vl_processor 资产）。
 source_dir = "/path/to/rhinovla-v3/source"
 # 与源码配套的 checkpoint 文件；加载时核对 SHA256。
@@ -27,8 +30,6 @@ RPU_RHINOVLA_FUSED_SILU_MUL = "1"
 RPU_RHINOVLA_EXPERT_FUSIONS = "1"
 RPU_RHINOVLA_ADARMS_RESIDENT = "1"
 RPU_RHINOVLA_ALIGNED_KV = "1"
-RPU_RHINOVLA_FULL_W8A16 = "1"
-RPU_RHINOVLA_EXPERT_W8A16 = "1"
 RPU_RHINOVLA_PACKED_QKV = "0"
 RPU_RHINOVLA_SKIP_ADARMS_GEMV = "0"
 RPU_RHINOVLA_PRECOMPUTE_GATE_TANH = "1"
@@ -40,6 +41,8 @@ RPU_RHINOVLA_VECTOR_Q_NORM = "0"
 RPU_RHINOVLA_PARTIAL_ROPE = "0"
 
 [input]
+# validate_rhinovla_v3.py prepare 阶段生成的输入 fixture；运行时使用其中第 1 组输入。
+# 也可删去 fixture，改写原始输入 images、instruction、state（可选 view_roles、action_dims），二者只能写一种，见 README。
 fixture = "/path/to/rhinovla-v3/cpu_fixture.pt"
 # 加载上游模型代码须显式确认。
 trust_model_code = true

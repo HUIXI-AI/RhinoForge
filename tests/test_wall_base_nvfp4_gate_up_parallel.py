@@ -79,7 +79,7 @@ def test_actual_parallel_gate_up_complete_profile_and_layers(tmp_path):
     helpers='\n'.join(block(DECODER,m) for m in markers)
     start=DECODER.index('        wall_base_nvfp4_gate_up_ =');end=DECODER.index('        wall_base_nvfp4_gate_up_shared_silu_ =',start);cold=DECODER[start:DECODER.index(';',end)+1]
     producer=block(DECODER,'        if (wall_base_nvfp4_gate_up_enabled(plan, physical_len, logical_len,')
-    emission=block(DECODER,'        if (wall_base_nvfp4_gate_up && !is_last_layer) {')
+    emission=block(DECODER,'else if (wall_base_nvfp4_gate_up && !is_last_layer) {')[5:]
     planner=(ROOT/'src/core/fmb_three_stage_chunk_plan.cpp').read_text()
     consume=block(planner,'const FmbRouteManifestEntry& FmbPhysicalManifestConsumer::consume_route(').replace('FmbPhysicalManifestConsumer::consume_route','consume_physical_route').replace('int64_t invocation) const','int64_t invocation = 0) const')
     find=block(planner,'const FmbRouteManifestEntry& FmbPhysicalManifestConsumer::find_route(').replace('FmbPhysicalManifestConsumer::find_route','find_route')

@@ -89,6 +89,7 @@ struct Model {
     int64_t num_kv_heads() const { return 8; }
     int64_t head_dim() const { return 128; }
     int64_t attn_tp() const { return 8; }
+    int64_t num_cores() const { return 8; }
     int64_t get_last_resolved_chunk_size() const { return last_chunk; }
     void check_io(const at::TensorList& tensors, const at::TensorList& io_scales) {
         int64_t action_dim=96,action_dim_pad=96,state_dim=96,state_dim_pad=96,action_horizon=30,suffix_len=31;

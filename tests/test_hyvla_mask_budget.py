@@ -37,6 +37,7 @@ def _program():
 #include <utility>
 #include <vector>
 #include "core/rpu_spm_allocator.h"
+#include "fused/rpu_qwen3_w8a8_contract.h"
 #define TORCH_CHECK(x, ...) do {if(!(x))throw std::runtime_error(#x);}while(0)
 #define TORCH_INTERNAL_ASSERT(x) assert(x)
 #define DWIDTH 2
@@ -92,6 +93,8 @@ class FusedModelBase {public:
     code += "\nnamespace v3 {\n"
     code += r'''
 class CausalDecoderModel:public FusedModelBase {public:
+ const bool qwen3_prefill_w8a8_=false,qwen3_c256_=false,qwen3_c512_=false;
+ int64_t qwen3_inplace_capacity()const{return 0;}
  int64_t h=1024,nq=16,nkv=8,hd=128,inter=2048,layers=32;
  bool wall_prefill_staged_mlp_=false,decode_gate_up_fusion_=false,prefill_packed_gate_up_strided_=false;
  bool qwen3vl_multiview_text_dry_prepared_=false,qwen3vl_multiview_text_composite_prepared_=false;

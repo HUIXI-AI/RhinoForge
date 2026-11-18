@@ -65,7 +65,7 @@ enum class FmbLinearAccumulationPolicy { ACC16 };
 enum class FmbLinearRouteSelector { AUTO_TILE };
 enum class GemmaRopeRoute { ROPE_SPM, FULL_ROPE_TILED };
 enum class GemmaAllReduceRoute { PREPARE_RING_INPUT };
-enum class FmbRouteFamily { ATTENTION, LINEAR, ROPE, KV_INSERT, ALL_REDUCE, NORMALIZATION, GRAPH_SCHEDULE, COLLECTIVE };
+enum class FmbRouteFamily { ATTENTION, LINEAR, ROPE, KV_INSERT, ALL_REDUCE, NORMALIZATION, GRAPH_SCHEDULE, COLLECTIVE, ACTIVATION };
 struct ChunkInfo { int64_t idx, offset, len, kv_seq_len; };
 struct Stage { std::vector<ChunkInfo> chunks; };
 struct FmbThreeStageChunkPlan { ChunkMode chunk_mode = ChunkMode::KV_FIRST; Stage qkv, compute; };
@@ -115,7 +115,9 @@ public:
     bool pi05_prefill_kv1_pair_direct_ = false;
     bool pi05_prefill_o_pair_ = false, pi05_prefill_gateup_pair_ = false;
     bool pi05_prefill_kv_only_ = false, pi05_prefill_qkv_pair_ = false;
-    bool pi05_prefill_owner_norm_ = false, pi05_prefill_down_pair_ = false;
+    bool pi05_prefill_owner_norm_ = false, pi05_prefill_down_pair_ = false, pi05_full_chunk_ = false;
+    bool pi05_full_chunk_domain(const FmbThreeStageChunkPlan&, const LayoutContext&, int64_t, int64_t, int64_t) const { return false; }
+    FmbPhysicalExecutionManifest pi05_full_chunk_manifest(const FmbThreeStageChunkPlan&, const LayoutContext&, int64_t, int64_t, int64_t) const { return {}; }
     FmbLinearAccumulationPolicy pi05_prefill_linear_accumulation() const { return FmbLinearAccumulationPolicy::ACC16; }
     int pi05_prefill_dma_policy() const { return 0; }
     int64_t pair_rows = 400;
@@ -128,6 +130,8 @@ public:
     std::vector<Entry> pi05_o_pair_routes() const { return {}; }
     template<class... T> bool pi05_prefill_a8_short(T...) const { return false; }
     template<class... T> bool pi05_prefill_a8_short_domain(T...) const { return false; }
+    bool pi05_prefill_a8_reduced() const { return false; }
+    bool pi05_prefill_a8_reduced_owner() const { return false; }
     template<class... T> bool pi05_prefill_kv1_pair_direct_domain(T...) const { return false; }
     template<class... T> bool pi05_prefill_gateup_pair_domain(T...) const { return false; }
     template<class... T> bool pi05_prefill_kv_only_owner(T...) const { return false; }
@@ -140,10 +144,14 @@ public:
     std::vector<int64_t> pi05_o_pair_arguments() const { return {}; }
     std::vector<int64_t> pi05_prefill_gateup_pair_arguments() const { return {}; }
     std::vector<int64_t> pi05_prefill_a8_short_arguments() const { return {}; }
+    std::vector<int64_t> pi05_prefill_a8_reduced_arguments(int64_t) const { return {}; }
     std::vector<int64_t> pi05_prefill_kv_only_arguments() const { return {}; }
 ''' + qkv_arguments + r'''
     std::vector<int64_t> pi05_owner_norm_arguments() const { return {}; }
     std::vector<int64_t> pi05_down_pair_arguments() const { return {}; }
+    bool pi05_down_a8_enabled() const { return false; }
+    int64_t pi05_down_pair_linear_selector() const { return 1; }
+    std::vector<int64_t> pi05_down_a8_quant_arguments(int) const { return {}; }
     std::vector<int64_t> pi05_prefill_kv1_pair_owner_linear_arguments() const { return {}; }
     template<class... T> int64_t pi05_pair_mask_selector(T...) const { throw std::runtime_error("unexpected Pi paired route"); }
     template<class... T> int64_t pi05_pair_mask_bytes(T...) const { throw std::runtime_error("unexpected Pi paired route"); }

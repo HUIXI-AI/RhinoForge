@@ -2,11 +2,11 @@
 
 [配置总览](../README.md) · [全部配置](#configurations) · [核数支持矩阵](../../../docs/planner_core_topology.zh.md) · [权重准备](../WEIGHTS.md) · [参数说明](../PARAMETERS.md)
 
-先按相机数量选择模板。`2cam/` 和 `3cam/` 默认从配套 golden 取图像和状态，并合成目标长度的指令；已有 K1 RTC batch 则使用 [Legacy 入口](legacy/README.md)。
+按精度选择模板。模板默认 3 路相机；2 路相机在命令行加 `--input 2cam_t32`，同时设置 `cameras` 和 `camera_names`（预设见 [vla_g05.toml](../../inputs/vla_g05.toml)）。模板默认从配套 golden 取图像和状态，并合成目标长度的指令；已有 K1 RTC batch 则使用 [Legacy 入口](legacy/README.md)。
 
 <a id="配置矩阵"></a>
 
-2 路相机为 head、left wrist；3 路另加 right wrist。两组均提供 FP16、W8A16 和 W8A16 + Action NVFP4，Legacy K1 RTC batch 使用 FP16。
+2 路相机为 head、left wrist；3 路另加 right wrist。FP16、W8A16 和 W8A16 + Action NVFP4 三个模板都可用 2 路或 3 路相机，Legacy K1 RTC batch 使用 FP16。
 
 <a id="运行"></a>
 
@@ -19,8 +19,10 @@
 从仓库根目录执行：
 
 ```bash
-python examples/run.py --config examples/configs/g05/2cam/fp16.toml --check-config
-python examples/run.py --config examples/configs/g05/2cam/fp16.toml
+python examples/run.py --config examples/configs/g05/fp16.toml --check-config
+python examples/run.py --config examples/configs/g05/fp16.toml
+# 2 路相机
+python examples/run.py --config examples/configs/g05/fp16.toml --input 2cam_t32
 ```
 
 `--check-config` 只检查配置和输入参数范围，允许路径占位符。实际图像尺寸、动作输出与核心范围见[全部配置](#configurations)；运行前需替换占位路径。
@@ -37,6 +39,31 @@ python examples/run.py --config examples/configs/g05/2cam/fp16.toml
 
 `--check-config` 不读取上述文件；摘要不一致时运行时报 `source_golden does not match the verified release checkpoint`。
 
+<a id="auto-values"></a>
+
+## auto 的实际取值
+
+8 核（默认）时，`vision_camera_batch` 和 prefill `chunk_size` 写 `"auto"`，入口按相机数、精度、`linear_acc32` 和 `text_tokens` 查 [selected_profiles.json](selected_profiles.json)（2026-10-02 板上选定），命中时用该行的值；`math_precision = "high"` 沿用同一行 BASE 的值。
+
+`rpu_execution.model.num_cores` 写 4 或 6 时不查该文件（其中均为 8 核实测）：`vision_camera_batch` 的 auto 取 1（每路相机单独过一次 Vision），prefill `chunk_size` 的 auto 由原生 planner 选择；`vision_camera_batch = 2/3` 和 `math_precision = "high"` 报错。核数划分见[核数拓扑](../../../docs/planner_core_topology.zh.md)。下表只适用于 8 核。
+
+模板默认累加下的取值（B 为 Vision 相机批，后一个数为 prefill 分块行数）：
+
+| 模板（相机数） | T32 | T52 | T64 | T128 | T192 | T256 |
+|---|---|---|---|---|---|---|
+| fp16（2 路，ACC32） | B1 / 192 | B1 / 192 | B1 / 256 | B1 / 256 | B1 / 192 | B1 / 256 |
+| w8a16（2 路，ACC16） | B1 / 192 | B1 / 192 | B2 / 256 | B2 / 256 | B1 / 192 | B2 / 256 |
+| w8a16_action_nvfp4（2 路，ACC16） | B1 / 192 | B2 / 192 | B2 / 256 | B2 / 256 | B1 / 192 | B1 / 256 |
+| fp16（3 路，ACC32） | B1 / 256 | B1 / 256 | B1 / 256 | B1 / 256 | B1 / 256 | B1 / 256 |
+| w8a16（3 路，ACC16） | B3 / 256 | B3 / 256 | B1 / 256 | B3 / 192 | B3 / 256 | B3 / 256 |
+| w8a16_action_nvfp4（3 路，ACC16） | B3 / 256 | B3 / 256 | B3 / 256 | B3 / 192 | B3 / 256 | B3 / 256 |
+
+- **改了 `linear_acc32`**：按 selected_profiles.json 中对应累加的行取值。
+- **`text_tokens` 不在表中**（如 T40）：Vision 取 B1；chunk 由原生 planner 在 64 对齐、不超过 256、补齐不超过 64 行的候选中选择。
+- **显式取值**：`vision_camera_batch` 取 1 或相机数（2 路为 2，3 路为 3），省略时为 1，大于 1 只适用于 W8 Vision；`chunk_size` 取 64、128、192 或 256。
+- **检查时机**：`--check-config` 不检查 `chunk_size`，非 64 倍数在加载时报错；该字段在 `components.language_model.prefill` 下，不能用 `--set` 修改。
+- **实际取值**：写在 `report.json` 的 `selection.applied_parameters`。
+
 <!-- model-configurations-start -->
 
 <a id="configurations"></a>
@@ -46,14 +73,11 @@ python examples/run.py --config examples/configs/g05/2cam/fp16.toml
 
 ### K1 RTC/FM
 
-| 配置 | 支持状态 | 精度 | 量化范围 | cameras 默认值 | 4 核 | 6 核 | 8 核 |
-|---|---|---|---|---|---|---|---|
-| [2cam/fp16.toml](2cam/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 2 | ✕ 不支持 | ✕ 不支持 | ● 已实测 |
-| [2cam/w8a16.toml](2cam/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision 与文本投影 W8（GDN in_proj_a/b 保持 FP16）；Action 投影 W8 | 2 | ✕ 不支持 | ✕ 不支持 | ● 已实测 |
-| [2cam/w8a16_action_nvfp4.toml](2cam/w8a16_action_nvfp4.toml) | 支持（`SUPPORTED`） | w8a16_nvfp4 | Vision 与文本投影 W8（GDN in_proj_a/b 保持 FP16）；Action NVFP4 | 2 | ✕ 不支持 | ✕ 不支持 | ● 已实测 |
-| [3cam/fp16.toml](3cam/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 3 | ✕ 不支持 | ✕ 不支持 | ● 已实测 |
-| [3cam/w8a16.toml](3cam/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision 与文本投影 W8（GDN in_proj_a/b 保持 FP16）；Action 投影 W8 | 3 | ✕ 不支持 | ✕ 不支持 | ● 已实测 |
-| [3cam/w8a16_action_nvfp4.toml](3cam/w8a16_action_nvfp4.toml) | 支持（`SUPPORTED`） | w8a16_nvfp4 | Vision 与文本投影 W8（GDN in_proj_a/b 保持 FP16）；Action NVFP4 | 3 | ✕ 不支持 | ✕ 不支持 | ● 已实测 |
+| 配置 | 支持状态 | 精度 | 量化范围 | 4 核 | 6 核 | 8 核 |
+|---|---|---|---|---|---|---|
+| [fp16.toml](fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | ● 已实测 | ● 已实测 | ● 已实测 |
+| [w8a16.toml](w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / 文本层 / Action W8A16（文本层 in_proj_a/in_proj_b FP16） | ● 已实测 | ● 已实测 | ● 已实测 |
+| [w8a16_action_nvfp4.toml](w8a16_action_nvfp4.toml) | 支持（`SUPPORTED`） | w8a16_action_nvfp4 | Vision / 文本层 W8A16（文本层 in_proj_a/in_proj_b FP16）；Action NVFP4 | ● 已实测 | ● 已实测 | ● 已实测 |
 
 本组配置相同的项：
 
@@ -61,6 +85,7 @@ python examples/run.py --config examples/configs/g05/2cam/fp16.toml
 |---|---|
 | 输入类型 | 相机 + 文本 + state |
 | text_tokens 默认值 | 32 |
+| cameras 默认值 | 3 |
 | num_steps 默认值 | 10 |
 | 文本可调范围 | 有效 text_tokens=32–256整数；或不重复 text_lengths |
 | 图像/音频可调范围 | 2/3相机；head、left wrist、可加right wrist |
@@ -71,9 +96,6 @@ python examples/run.py --config examples/configs/g05/2cam/fp16.toml
 | CPU线程数 | 8 |
 | 权重 | `/path/to/vla_rtc_release/checkpoint`；准备方法见[权重准备](../WEIGHTS.md) |
 | 入口 | [run.py](../../run.py) |
-
-- ✕ 4/6 核不支持（`2cam/fp16.toml`、`2cam/w8a16.toml`、`3cam/fp16.toml`、`3cam/w8a16.toml`）：原生实现只有 8 核：动作专家只支持 8 核，W8 视觉和多相机批处理也只实现了 8 核。
-- ✕ 4/6 核不支持（`2cam/w8a16_action_nvfp4.toml`、`3cam/w8a16_action_nvfp4.toml`）：原生实现只有 8 核：NVFP4 动作 GEMM 按 8 核切分，动作专家只支持 8 核。
 
 输入校验来源：[optimized.py](../../../examples/runners/g05/optimized.py) · [inputs.py](../../../examples/runners/g05/inputs.py)。
 
@@ -99,7 +121,7 @@ python examples/run.py --config examples/configs/g05/2cam/fp16.toml
 | 权重 | `/path/to/vla_rtc_release/checkpoint`（profile 登记名 `g05-base`）；准备方法见[权重准备](../WEIGHTS.md) |
 | 入口 | [run.py](../../run.py) |
 
-- ✕ 4/6 核不支持：原生实现只有 8 核：动作专家只支持 8 核，W8 视觉和多相机批处理也只实现了 8 核。
+- ✕ 4/6 核不支持：旧版档案绑定只按 8 核登记的 profile g05-base.fp16.k1-rtc-fm（保存 batch 的固定包络）；4/6 核请用上一级的 fp16 / w8a16 / w8a16_action_nvfp4 相机模板。
 
 输入校验来源：[runner.py](../../../examples/runners/g05/runner.py) · [runtime.py](../../../python/rpu_backend/adapters/g05/runtime.py)。
 

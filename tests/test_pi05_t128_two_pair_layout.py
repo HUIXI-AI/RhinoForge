@@ -12,10 +12,8 @@ from test_siglip_attention_dry_live_contract import _function, _run_native
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_c320_real_declaration_plan_and_resident_mask_contract(tmp_path, monkeypatch):
-    monkeypatch.setenv("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
-    import torch
-
+def _declaration_fixture_code():
+    """Shared real Gemma declarations/allocator with hardware-only callbacks stubbed."""
     source = (ROOT / "src/fused/rpu_gemma_model.cpp").read_text()
     base = (ROOT / "src/core/fused_model_base.cpp").read_text()
     allocator = (ROOT / "src/core/rpu_spm_allocator.cpp").read_text()
@@ -31,7 +29,7 @@ def test_c320_real_declaration_plan_and_resident_mask_contract(tmp_path, monkeyp
         "std::vector<int64_t> pi05_pair_input_compact_arguments(",
         "uint32_t pi05_pair_input_compact_address(",
         "std::vector<int64_t> pi05_pair_spill_arguments(",
-        "int64_t pi05_a8_bytes(", "int64_t pi05_a8_root_bytes(",
+        "int64_t pi05_a8_bytes(", "int64_t pi05_a8_root_bytes(", "int64_t pi05_a8_s0_bytes(",
         "bool pi05_prefill_a8_short(",
         "std::vector<int64_t> pi05_prefill_gateup_pair_arguments(",
         "std::vector<int64_t> pi05_o_pair_arguments(",
@@ -39,6 +37,7 @@ def test_c320_real_declaration_plan_and_resident_mask_contract(tmp_path, monkeyp
         "std::vector<int64_t> pi05_o_pair_companion_arguments(",
         "std::vector<FmbRouteManifestEntry> pi05_o_pair_routes(",
         "std::vector<int64_t> pi05_owner_norm_arguments(",
+        "bool pi05_down_a8_enabled(", "std::vector<int64_t> pi05_down_a8_arguments(",
         "std::vector<int64_t> pi05_down_pair_arguments(",
     )).replace(" override", "")
     sites = set(re.findall(r"\bPI05_\w+_SITE\b", methods))
@@ -69,6 +68,9 @@ struct SdpaConfig {};
 int64_t sdpa_compute_tmp_v16_size(SdpaConfig,int64_t){return 0;}
 struct Owner {
     int64_t pi05_pair_rows_=320;
+    bool pi05_prefill_a8_panel512_=false;
+    bool pi05_full_chunk_=false;
+    std::vector<BufferDecl> pi05_full_chunk_decls(const LayoutContext&, std::vector<BufferDecl>) { assert(false); return {}; }
     bool pi05_prefill_a8_=false,fp16=false;
     bool pi05_prefill_o_pair_=true,pi05_prefill_gateup_pair_=true;
     bool pi05_prefill_mask_resident_=true,pi05_prefill_owner_norm_=true;
@@ -93,11 +95,19 @@ struct Owner {
     bool pi05_pair_fp16()const{return fp16;}
     SdpaConfig make_sdpa_config(int)const{return {};}
     uint32_t addr(int,const char* name)const{return 0x100+offsets.at(name);}
-''' + methods + r'''
-};
-void verify(int64_t rows,bool a8,bool fp16=false) {
+''' + methods + "\n};\n"
+    return code
+
+
+def test_c320_real_declaration_plan_and_resident_mask_contract(tmp_path, monkeypatch):
+    monkeypatch.setenv("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
+    import torch
+
+    code = _declaration_fixture_code() + r'''
+void verify(int64_t rows,bool a8,bool fp16=false,bool panel512=false) {
     Owner owner;owner.pi05_pair_rows_=rows;owner.pi05_prefill_a8_=a8;owner.fp16=fp16;
-    const auto gate_tile=rpu_pi_wall::select(a8?rpu_pi_wall::Operation::A8PairedGelu:rpu_pi_wall::Operation::PairedGelu,fp16?rpu_pl_tiling::WeightType::Fp16:rpu_pl_tiling::WeightType::Int8,a8,rows,2048,2048);
+    owner.pi05_prefill_a8_panel512_=panel512;
+    const auto gate_tile=rpu_pi_wall::select(panel512?rpu_pi_wall::Operation::A8PairedGeluPanel512:a8?rpu_pi_wall::Operation::A8PairedGelu:rpu_pi_wall::Operation::PairedGelu,fp16?rpu_pl_tiling::WeightType::Fp16:rpu_pl_tiling::WeightType::Int8,a8,rows,2048,2048);
     const auto tile=rpu_pi_wall::select(rpu_pi_wall::Operation::PairedLinear,fp16?rpu_pl_tiling::WeightType::Fp16:rpu_pl_tiling::WeightType::Int8,false,rows,2048,2048);
     LayoutContext ctx;ctx.chunk_size=ctx.kv_insert_chunk_size=rows;
     ctx.max_kv_seq_len=2*rows;ctx.num_layers=18;ctx.use_attn_mask=true;ctx.is_causal=false;
@@ -117,7 +127,7 @@ void verify(int64_t rows,bool a8,bool fp16=false) {
         }
     }
     assert(roots==(scratch?5:6) && persistent==151552);
-    assert(sizes.at("residual1")==f && sizes.at("pi05_pair_s2")==f && sizes.at("pi05_pair_s3")==f);
+    assert(sizes.at("residual1")== (panel512?2097152:f) && sizes.at("pi05_pair_s2")==f && sizes.at("pi05_pair_s3")==f);
     assert(sizes.at("pi05_pair_residual")==(single?d:2*d));
     const int64_t packed=Align(2*rows*2080+4*rows+30,int64_t(256));
     assert(sizes.at("pi05_pair_s1")== (a8?packed:f));
@@ -149,6 +159,20 @@ void verify(int64_t rows,bool a8,bool fp16=false) {
     const auto routes=owner.pi05_o_pair_routes();
     const auto spill=std::count_if(routes.begin(),routes.end(),[](const auto& route){return route.site_id==PI05_O_PAIR_SPILL_SITE;});
     assert(spill==(single?2:0));
+    if(panel512) {
+        assert(rows==272 && a8 && !fp16);
+        assert(plan.required_extent==6032640);
+        // Use the same complete Pi persistent reservation as the other
+        // profiles, not just the Gemma-local norm tensors.
+        const size_t total=plan.required_extent+656640;
+        assert(total==6689280 && total<=SpmAllocator::SPM_PLANNING_BUDGET);
+        const auto gate=owner.pi05_prefill_gateup_pair_arguments();
+        assert(gate.at(0)==8 && gate.at(20)==512 && gate.back()==2097152);
+        assert(sizes.at("residual1")>=gate.back());
+        assert(owner.pi05_a8_root_bytes()==1132800);
+        std::cout<<"C272 P512 total="<<total<<" headroom="
+                 <<(SpmAllocator::SPM_PLANNING_BUDGET/256*256-total)<<"\n";
+    }
     if(rows==304) {
         assert(plan.required_extent==(a8?5682432:5661696));
         const size_t total=plan.required_extent+656640;
@@ -236,7 +260,7 @@ void verify(int64_t rows,bool a8,bool fp16=false) {
                  <<" composite_persistent=656640 total="<<total<<" headroom="<<(SpmAllocator::SPM_PLANNING_BUDGET/256*256-total)<<"\n";
     }
 }
-int main(){for(int64_t rows:{272,288,304,320,400,416,432,448})for(bool a8:{false,true})verify(rows,a8);for(int64_t rows:{304,432})verify(rows,false,true);}
+int main(){for(int64_t rows:{272,288,304,320,400,416,432,448})for(bool a8:{false,true})verify(rows,a8);for(int64_t rows:{304,432})verify(rows,false,true);verify(272,true,false,true);}
 '''
     output = _run_native(tmp_path, code, torch)
     assert "total=6636800 headroom=1666816" in output
@@ -245,4 +269,5 @@ int main(){for(int64_t rows:{272,288,304,320,400,416,432,448})for(bool a8:{false
     assert "total=8206336 headroom=97280" in output
     assert "total=6318336 headroom=1985280" in output
     assert "total=6339072 headroom=1964544" in output
+    assert "C272 P512 total=6689280 headroom=1614336" in output
     print(output, end="")

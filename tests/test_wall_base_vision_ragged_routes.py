@@ -75,6 +75,8 @@ def _source():
 #include <c10/core/Layout.h>
 #include <c10/util/Exception.h>
 #undef TORCH_CHECK
+inline int64_t CeilDiv(int64_t a, int64_t b) { return (a + b - 1) / b; }
+inline int64_t Align(int64_t a, int64_t b) { return CeilDiv(a, b) * b; }
 #define TORCH_CHECK(ok, ...) do {if(!(ok))throw std::runtime_error(#ok);}while(false)
 #undef TORCH_INTERNAL_ASSERT
 #define TORCH_INTERNAL_ASSERT(ok) TORCH_CHECK(ok)

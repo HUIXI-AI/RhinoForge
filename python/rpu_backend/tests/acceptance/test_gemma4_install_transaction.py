@@ -285,6 +285,9 @@ def install_runtime(monkeypatch):
         lambda raw, geom, **kwargs: ({"q": []}, {}),
     )
     monkeypatch.setattr(runtime, "compute_side_input", lambda *a, **k: _FakeTensor())
+    monkeypatch.setattr(runtime, "upload_model_projection", lambda weight, lanes: _FakeTensor())
+    monkeypatch.setattr(runtime, "upload_lm_head", lambda weight, lanes: _FakeTensor())
+    monkeypatch.setattr(runtime, "device_lm_logits", lambda hidden, *args: torch.zeros(*hidden.shape[:-1], 8))
     monkeypatch.setattr(
         weights,
         "make_rope_tables",
@@ -581,7 +584,7 @@ def test_prefill_chunk_config_reaches_native_descriptor_and_graph_signature(
     )
     monkeypatch.setattr(
         runtime,
-        "softcap_lm_logits",
+        "device_lm_logits",
         lambda hidden, *_args: torch.zeros(
             hidden.shape[0], hidden.shape[1], 8
         ),
@@ -683,7 +686,7 @@ def test_hot_import_after_ready_retires_receipt_and_can_build(install_runtime, m
     cache, session = model.build_rpu_cache(), model._execution_session
     graph = model._rpu_gemma4_graph_cache
     monkeypatch.setattr(torch.nn.functional, "embedding", lambda *a, **k: _FakeActivation())
-    monkeypatch.setattr(runtime, "softcap_lm_logits", lambda *a, **k: torch.ones(1, 1, 8))
+    monkeypatch.setattr(runtime, "device_lm_logits", lambda *a, **k: torch.ones(1, 1, 8))
     ids = torch.tensor([[1]], dtype=torch.long)
     model.forward(input_ids=ids, past_key_values=cache)
     old_receipt = model._rpu_last_execution_plan
@@ -727,7 +730,7 @@ def test_cache_position_advances_only_after_logits_succeed(
     def fail_logits(*args, **kwargs):
         raise RuntimeError("synthetic logits failure")
 
-    monkeypatch.setattr(runtime, "softcap_lm_logits", fail_logits)
+    monkeypatch.setattr(runtime, "device_lm_logits", fail_logits)
     with pytest.raises(RuntimeError, match="logits failure"):
         model.forward(
             input_ids=torch.tensor([[1]], dtype=torch.long),

@@ -13,7 +13,7 @@ HEADER = ROOT / "src/fused/rpu_qwen3_model.h"
 def test_actual_gr00t_text_layout_and_layer_lifetimes(tmp_path):
     source = HEADER.read_text()
     helpers = (ROOT / "src/core/rpu_helpers.h").read_text()
-    program = _layout_program().split("class CausalDecoderModel {public:", 1)[0]
+    program = _layout_program(preamble_only=True)
     program = program.replace("#include <algorithm>", "#include <algorithm>\n#include <array>\n#include <map>")
     program += "\n#define TORCH_INTERNAL_ASSERT TORCH_CHECK\n"
     for marker in ("static inline bool sdpa_call_valid(", "inline bool sdpa_is_valid_chunk_size("):
@@ -21,6 +21,8 @@ def test_actual_gr00t_text_layout_and_layer_lifetimes(tmp_path):
     program += r'''
 enum class CausalDecoderPlanningMode {ORDINARY,Z1};
 class CausalDecoderModel {public:
+ const bool qwen3_prefill_w8a8_=false,qwen3_c256_=false;
+ int64_t qwen3_inplace_capacity()const{return 0;}
  int64_t h=2048,inter=6144,nq=16,nkv=8,hd=128,layers=16,cores=8;
  int64_t hidden_size()const{return h;}int64_t intermediate_size()const{return inter;}
  int64_t num_q_heads()const{return nq;}int64_t num_kv_heads()const{return nkv;}
@@ -44,9 +46,18 @@ class CausalDecoderModel {public:
 '''
     declaration = _definition(source, "std::vector<BufferDecl> causal_baseline_buffer_declarations(")
     boundary = declaration.index("        // Norm-weight preloads")
-    # All production Temp slots are retained; device-only Persistent callbacks
-    # cannot affect this allocator proof. The optimizer only edits these slots.
-    assert "StorageClass::Temp" not in declaration[boundary:]
+    # Keep all ordinary-owner Temp slots; device-only Persistent callbacks
+    # cannot affect this allocator proof.
+    # The independent Qwen3 A8/in-place selectors are const-off in this probe.
+    # No other post-preload Temp declaration may be silently omitted.
+    later = declaration[boundary:]
+    for marker in (
+        'if ((qwen3_prefill_w8a8_ || qwen_inplace) && comp_cs > 1)',
+        'if (qwen_inplace && qwen3_c512_)',
+        'if (qwen_inplace && (qwen3_c256_ || qwen3_c512_))',
+    ):
+        later = later.replace(_definition(later, marker), "", 1)
+    assert "StorageClass::Temp" not in later
     program += declaration[:boundary] + "return decls;\n}\n"
     for marker in ("bool gr00t_long_prefill_scratch_profile(",
                    "void apply_gr00t_long_prefill_scratch_alias(",

@@ -97,7 +97,12 @@ namespace at {using Tensor=::Tensor;}
         out += _definition(model, prefix) + ';\n'
     # DDR KV route payload resolution is unrelated to the new raw capability;
     # keep only its shape and selector in the double. RAW must never call it.
-    out = out.replace('KV_INSERT_CAP_V2 | KV_INSERT_CAP_V16 |\n    KV_INSERT_CAP_HYBRID2 | KV_INSERT_CAP_HYBRID3', '15')
+    out = out.replace(
+        'KV_INSERT_CAP_V2 | KV_INSERT_CAP_V16 |\n'
+        '    KV_INSERT_CAP_HYBRID2 | KV_INSERT_CAP_HYBRID3 |\n'
+        '    KV_INSERT_CAP_NON8_TP_V16',
+        '79',
+    )
     out += r'''
 constexpr int64_t FMB_ROUTE_FLAG_ROPE_TABLE_DDR=1LL<<56,FMB_ROUTE_FLAG_ROPE_TABLE_SPM=1LL<<57;
 constexpr int FMB_SHARED_LAYER_INPUT_DMA=1;
@@ -198,7 +203,12 @@ public:
  // Ordinary raw owner leaves resident weight priming unbound.
  bool resident_preloads_enabled()const{return false;}
  void preload_resident_merger(int){throw std::runtime_error("unexpected resident preload");}
+ // Ordinary FP16/W8 owners carry no NVFP4 tensor-scale tables.
+ std::vector<Tensor> nvfp4_tensor_scales_;
+ void preload_nvfp4_table(size_t,uint32_t){throw std::runtime_error("unexpected NVFP4 preload");}
 '''
+    out += re.search(r'inline static constexpr std::array<const char\*, 6> kNvfp4TableNames\{[^}]*\};',
+                     model).group(0) + '\n'
     for prefix in (
         'bool ordinary_fp16_chunked_merger_profile(',
         'bool fp16_chunked_merger_active(', 'bool fp16_chunked_merger_plan(',
@@ -292,7 +302,7 @@ void reject_faults(){
   Qwen3VLVisionModel m;auto p=plan_for(256);auto c=layout_for(256);int64_t pos=0;
   switch(fault){
    case 0:m.merger_out_hidden_=4096;break;case 1:m.layer_weights_[23].fc2_w.dtype=at::kHalf;break;
-   case 2:m.linear_acc32_=true;break;case 3:m.cores=4;break;case 4:m.hd=80;break;
+   case 2:m.linear_acc32_=true;break;case 3:m.cores=6;break;case 4:m.hd=80;break;
    case 5:m.layers=27;break;case 6:m.pipeline=true;break;case 7:m.delivery=true;break;
    case 8:m.image_batch_count_=2;break;case 9:c.is_causal=true;break;case 10:c.use_attn_mask=true;break;
    case 11:c.batch_size=2;break;case 12:pos=1;break;case 13:p.chunk_mode=ChunkMode::KV_FIRST;break;
@@ -319,6 +329,12 @@ void reject_faults(){
   if(fault==6)pair.image_batch_count_=3;
   if(fault==7)pair.linear_acc32_=true;
   assert(!pair.subclass_spm_kv_by_mha_eligible(p,c,0));
+ }
+ {
+  Qwen3VLVisionModel m4;m4.cores=4;m4.current_num_patches_=768;m4.image_batch_count_=3;
+  assert(m4.subclass_spm_kv_by_mha_eligible(plan_for(768,0,3),layout_for(768),0));
+  m4.current_num_patches_=1024;m4.image_batch_count_=2;
+  assert(!m4.subclass_spm_kv_by_mha_eligible(plan_for(1024,0,2),layout_for(1024),0));
  }
 }
 int main(){

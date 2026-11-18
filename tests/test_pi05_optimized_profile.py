@@ -123,8 +123,8 @@ def test_research_routes_are_explicit_and_precision_scoped():
     for flag in ("PREFILL_GATEUP_W8A8", "VISION_OWNER_LN"):
         assert off["RPU_PI05_" + flag] == "0"
         assert on["RPU_PI05_" + flag] == "1"
-    for precision in ("fp16", "w8a16", "int4_g128", "legacy_int4"):
-        with pytest.raises(ValueError, match="only with Action NVFP4"):
+    for precision in ("fp16", "int4_g128", "legacy_int4"):
+        with pytest.raises(ValueError, match="only with W8A16 or Action NVFP4"):
             profile(precision, prefill_w8a8=True)
     assert profile("fp16", vision_owner_ln=True)["RPU_PI05_VISION_OWNER_LN"] == "1"
     with pytest.raises(TypeError, match="must be bool"):
@@ -166,13 +166,37 @@ def test_two_camera_profile_transfers_optimizations_without_changing_precision(p
     assert env["RPU_PI05_DENOISE_NVFP4_GEGLU_M50"] == "0"
     for flag in ("SIGLIP_W8A16", "ADARMS_DENSE_W8A16"):
         assert env["RPU_PI05_" + flag] == str(int(precision != "fp16"))
-    if precision == "w4a16":
+    if precision in ("w8a16", "w4a16"):
         on = profile(precision, cameras=2, prefill_w8a8=True)
         assert on == {**env, "RPU_PI05_PREFILL_GATEUP_W8A8": "1"}
     else:
-        with pytest.raises(ValueError, match="only with Action NVFP4"):
+        with pytest.raises(ValueError, match="only with W8A16 or Action NVFP4"):
             profile(precision, cameras=2, prefill_w8a8=True)
     assert profile(precision, cameras=2, vision_owner_ln=True)["RPU_PI05_VISION_OWNER_LN"] == "1"
+
+
+@pytest.mark.parametrize("precision", ("w8a16", "w4a16"))
+@pytest.mark.parametrize("cameras", (2, 3))
+@pytest.mark.parametrize("horizon", (10, 50))
+def test_prefill_a8_opt_in_preserves_action_recipe_and_paired_geometry(precision, cameras, horizon):
+    profile = RUNNER["profile_environment"]
+    options = dict(cameras=cameras, action_horizon=horizon, vision_owner_ln=True)
+    off = profile(precision, prefill_w8a8=False, **options)
+    on = profile(precision, prefill_w8a8=True, **options)
+    assert on == {**off, "RPU_PI05_PREFILL_GATEUP_W8A8": "1"}
+    assert on["RPU_PI05_DENOISE_W4_FASTPATH"] == str(int(precision == "w4a16"))
+    assert on["RPU_PI05_DENOISE_GEGLU_M50"] == str(int(precision == "w8a16"))
+    args = SimpleNamespace(precision=precision, prefill_w8a8=True, cameras=cameras,
+                           action_horizon=horizon, text_tokens=32, prefill_chunk_size=None,
+                           rpu_execution={"components": {"vision_encoder": {
+                               "vision": {"qkv_w8a8": True, "mlp_w8a8": True}}}})
+    execution, paired, chunk = RUNNER["resolve_execution"](args)
+    assert paired and execution["model"]["num_cores"] == 8
+    assert chunk == (cameras * 256 + 32) // 2
+    assert execution["prefill"]["chunk_size"] == chunk
+    assert execution["components"]["vision_encoder"]["vision"] == {
+        "qkv_w8a8": True, "mlp_w8a8": True}
+    assert args.precision == precision
 
 
 def test_prefill_a8_chunk_is_exact_and_other_profiles_keep_explicit_chunks():
@@ -189,6 +213,35 @@ def test_prefill_a8_chunk_is_exact_and_other_profiles_keep_explicit_chunks():
             resolve(cameras=2, prefill_w8a8=True, requested=requested)
     with pytest.raises(ValueError, match="cameras must be 2 or 3"):
         resolve(cameras=1, prefill_w8a8=True, requested=None)
+
+
+@pytest.mark.parametrize("cameras,horizon", [(2, 10), (2, 50), (3, 10), (3, 50)])
+def test_diagnostic_full_chunk_uses_the_public_resolver_and_cold_profile(cameras, horizon, monkeypatch):
+    runner = importlib.import_module("examples.runners.pi05.optimized")
+    full = cameras * 256 + 32
+    args = SimpleNamespace(precision="w8a16", prefill_w8a8=True, cameras=cameras,
+                           action_horizon=horizon, text_tokens=32, prefill_chunk_size=full,
+                           rpu_execution={"model": {"num_cores": 8}},
+                           vision_owner_ln=True, noise=None)
+    resolved, paired, chunk = runner.resolve_execution(args)
+    assert paired and chunk == full
+    assert resolved["prefill"] == {"chunk_size": full, "padding_rows": 0}
+
+    class BeforeBackendImport(Exception):
+        pass
+
+    def capture(env):
+        assert env["RPU_PI05_PREFILL_FULL_CHUNK_W8A8"] == "1"
+        assert env["RPU_PI05_PREFILL_GATEUP_W8A8_PANEL512"] == str(int(cameras == 2))
+        raise BeforeBackendImport
+
+    monkeypatch.setattr(runner, "bind_cold_environment", capture)
+    with pytest.raises(BeforeBackendImport):
+        runner.run_profile(args)
+
+    args.rpu_execution["model"]["num_cores"] = 4
+    with pytest.raises(ValueError, match="full-prefix Prefill"):
+        runner.resolve_execution(args)
 
 
 def test_cli_rejects_wrong_short_a8_chunk_before_loading_checkpoint(monkeypatch, capsys):
@@ -356,7 +409,7 @@ def test_text_bucket_rejects_invalid_selection_without_mutation(invalid):
     assert not hasattr(policy._adapter, "_rpu_prefill_text_tokens")
 
 
-def test_t64_selection_rejects_unadmitted_cameras_precision_and_cores():
+def test_t64_selection_rejects_unadmitted_cameras_and_precision():
     from rpu_backend.adapters.pi05 import _selected_prefill_pair_rows
     policy, batch = _two_camera_policy_and_batch()
     RUNNER["configure_two_camera_policy"](policy, batch)
@@ -369,11 +422,11 @@ def test_t64_selection_rejects_unadmitted_cameras_precision_and_cores():
     for precision in ("int4_g128", "legacy_int4"):
         with pytest.raises(ValueError, match="FP16, W8A16, or Action NVFP4"):
             RUNNER["profile_environment"](precision, text_tokens=64)
+    # Reduced cores bind the same pair rows; the generic Gemma path consumes them.
     policy, _ = _two_camera_policy_and_batch()
     policy._adapter._rpu_prefill_text_tokens = 64
     policy._adapter._rpu_execution = {"model": {"num_cores": 6}}
-    with pytest.raises(ValueError, match="eight cores"):
-        _selected_prefill_pair_rows(policy._adapter)
+    assert _selected_prefill_pair_rows(policy._adapter) == 416
 
 
 @pytest.mark.parametrize("text_tokens,pair_rows", [(64, 416), (96, 432), (128, 448), (160, 464)])
@@ -463,7 +516,7 @@ def test_extended_text_one_camera_selection_fails_before_partial_mutation(text_t
 
 
 @pytest.mark.parametrize("text_tokens", [96, 128, 160])
-def test_extended_text_rejects_legacy_precision_and_non_eight_core_install(text_tokens):
+def test_extended_text_rejects_legacy_precision_and_binds_reduced_core_pairs(text_tokens):
     from rpu_backend.adapters.pi05 import _selected_prefill_pair_rows
     for precision in ("int4_g128", "legacy_int4"):
         with pytest.raises(ValueError, match="FP16, W8A16, or Action NVFP4"):
@@ -476,8 +529,7 @@ def test_extended_text_rejects_legacy_precision_and_non_eight_core_install(text_
     policy._adapter._rpu_prefill_text_tokens = text_tokens
     for cores in (4, 6):
         policy._adapter._rpu_execution = {"model": {"num_cores": cores}}
-        with pytest.raises(ValueError, match="eight cores"):
-            _selected_prefill_pair_rows(policy._adapter)
+        assert _selected_prefill_pair_rows(policy._adapter) == (768 + text_tokens) // 2
 
 
 @pytest.mark.parametrize("text_tokens,cameras,chunk,message", [(160, 3, 448, "requires exactly --prefill-chunk-size 464"),

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -26,11 +27,18 @@ COMMON = _common()
 
 @pytest.mark.parametrize("legacy, unified", [
     pytest.param(
-        '[example]\nprofile_id = "p"\nregistry_alias = "a"\ntarget = "rhinovla"\ndtype = "fp16"\n'
-        '[example.opt_in]\n[input]\ncheckpoint = "/ckpt"\nnum_steps = 10\n',
-        '[model]\nprofile_id = "p"\nregistry_alias = "a"\ntarget = "rhinovla"\nprecision = "fp16"\n'
-        'checkpoint = "/ckpt"\n[model.opt_in]\n[input]\nnum_steps = 10\n',
+        '[example]\nprofile_id = "rhinovla.fp16.official-nonrtc"\nregistry_alias = "a"\ntarget = "rhinovla"\n'
+        'dtype = "fp16"\n[example.opt_in]\n[input]\ncheckpoint = "/ckpt"\nnum_steps = 10\n',
+        '[model]\nprofile_id = "rhinovla.fp16.official-nonrtc"\nregistry_alias = "a"\ntarget = "rhinovla"\n'
+        'precision = "fp16"\ncheckpoint = "/ckpt"\n[model.opt_in]\n[input]\nnum_steps = 10\n',
         id="profile-bound"),
+    pytest.param(
+        '[example]\nprofile_id = "rhinovla.v3.w8a16.expert.trusted-factory"\ntarget = "rhinovla"\n'
+        'dtype = "w8a16"\n[example.opt_in]\nRPU_RHINOVLA_FULL_W8A16 = "0"\nRPU_RHINOVLA_EXPERT_W8A16 = "0"\n'
+        '[input]\nexpert_w8a16 = true\nfull_w8a16 = false\n',
+        '[model]\nprofile_id = "rhinovla.v3.w8a16.expert.trusted-factory"\ntarget = "rhinovla"\n'
+        'precision = "w8a16_action"\n',
+        id="recipe-sets-switches"),
     pytest.param(
         '[pi05]\nprecision = "fp16"\n[input]\ncheckpoint = "pi05-libero-finetuned"\ncameras = 3\n',
         '[model]\ntarget = "pi05"\nprecision = "fp16"\ncheckpoint = "pi05-libero-finetuned"\n'
@@ -40,6 +48,10 @@ COMMON = _common()
         '[g05]\nprecision = "w8a16"\nlinear_accumulation = "acc16"\n[input]\nrelease_root = "/r"\n',
         '[model]\ntarget = "g05"\nprecision = "w8a16"\nlinear_acc32 = false\nrelease_root = "/r"\n',
         id="g05-accumulation"),
+    pytest.param(
+        '[g05]\nprecision = "w8a16_nvfp4"\n[input]\nrelease_root = "/r"\n',
+        '[model]\ntarget = "g05"\nprecision = "w8a16_action_nvfp4"\nrelease_root = "/r"\n',
+        id="recipe-name-to-selector"),
     pytest.param(
         '[wall_oss]\nprecision = "w8a16"\n[input]\nfp16_checkpoint = "/f"\nw8_checkpoint = "/w"\n',
         '[model]\ntarget = "wall_oss"\nprecision = "w8a16"\nfp16_checkpoint = "/f"\nw8_checkpoint = "/w"\n',
@@ -61,8 +73,19 @@ def test_unified_layout_normalizes_to_the_legacy_runner_layout(legacy, unified):
     ('[model]\ntarget = "qwen3"\nprecision = "fp16"\n', "requires \\[model\\].profile_id"),
     ('[model]\ntarget = "pi05"\ncheckpoint = "a"\n[input]\ncheckpoint = "b"\n', "belongs in \\[model\\]"),
     ('[model]\nprofile_id = "p"\ntarget = "qwen3"\ndtype = "fp16"\n', "uses precision"),
-    ('[model]\ntarget = "g05"\nlinear_acc32 = true\nlinear_accumulation = "acc32"\n', "legacy G0.5 name"),
-    ('[model]\ntarget = "g05"\nlinear_acc32 = "acc32"\n', "must be boolean"),
+    ('[model]\ntarget = "g05"\nprecision = "fp16"\nlinear_acc32 = true\nlinear_accumulation = "acc32"\n',
+     "legacy G0.5 name"),
+    ('[model]\ntarget = "g05"\nprecision = "fp16"\nlinear_acc32 = "acc32"\n', "must be boolean"),
+    ('[model]\ntarget = "pi05"\n', "must name a registered precision recipe"),
+    ('[model]\ntarget = "pi05"\nprecision = "w3a16"\n', "registered pi05 recipe"),
+    # The runner selector is not a recipe name.
+    ('[model]\ntarget = "g05"\nprecision = "w8a16_nvfp4"\n', "registered g05 recipe"),
+    ('[model]\nprofile_id = "rhinovla.fp16.official-nonrtc"\ntarget = "rhinovla"\nprecision = "w8a16_pipeline"\n',
+     "not registered for profile"),
+    ('[model]\nprofile_id = "rhinovla.v3.fp16.trusted-factory"\ntarget = "rhinovla"\nprecision = "fp16"\n'
+     '[model.opt_in]\nRPU_RHINOVLA_FULL_W8A16 = "0"\n', "set by precision recipe"),
+    ('[model]\nprofile_id = "rhinovla.v3.w8a16.expert.trusted-factory"\ntarget = "rhinovla"\n'
+     'precision = "w8a16_action"\n[input]\nexpert_w8a16 = true\n', "set by precision recipe"),
 ])
 def test_unified_layout_rejects_ambiguous_tables(text, message):
     with pytest.raises(COMMON.ConfigError, match=message):
@@ -71,12 +94,19 @@ def test_unified_layout_rejects_ambiguous_tables(text, message):
 
 @pytest.mark.parametrize("legacy", sorted(LEGACY.glob("*.toml")), ids=lambda path: path.stem)
 def test_legacy_files_still_load_as_the_same_entry(legacy):
-    # Each fixture is the pre-[model] copy of the template with the same flattened path.
-    template = next(path for path in (ROOT / "examples/configs").rglob("*.toml")
-                    if path.relative_to(ROOT / "examples/configs").as_posix().replace("/", "_")
-                    == legacy.name)
+    # Each fixture is the pre-[model] copy of the template with the same flattened path;
+    # a template merged into another TOML is that TOML with the preset of its old input.
+    configs = ROOT / "examples/configs"
+    templates = {path.relative_to(configs).as_posix(): (path, None) for path in configs.rglob("*.toml")}
+    merged = json.loads((configs / "config_names.json").read_text(encoding="utf-8"))["merged"]
+    templates.update({old.removeprefix("examples/configs/"): (ROOT / target["config"], target["input"])
+                      for old, target in merged.items()})
+    template, preset = next(value for name, value in templates.items() if name.replace("/", "_") == legacy.name)
     assert "model" in tomllib.loads(template.read_text())
-    old, new = COMMON.load_config(legacy), COMMON.load_config(template)
+    old = COMMON.load_config(legacy)
+    # The legacy file names its own input file, of the preset's shape.
+    files = {key: old["input"][key] for key in ("batch", "observation") if preset and key in old["input"]}
+    new = COMMON.load_config(template, overrides={"input": files} if files else None, input_preset=preset)
     assert COMMON.config_target(old) == COMMON.config_target(new)
     old_meta, new_meta = COMMON.example_metadata(old), COMMON.example_metadata(new)
     assert (old_meta or {}).get("profile_id") == (new_meta or {}).get("profile_id")
@@ -103,7 +133,7 @@ def test_rhinovla_v3_source_entry_runs_through_run_py_with_exact_switches(tmp_pa
     with pytest.raises(COMMON.ConfigError, match="exact opt_in"):
         COMMON.load_config(changed)
     fp16 = tmp_path / "fp16.toml"
-    fp16.write_text(path.read_text().replace('precision = "w8a16"', 'precision = "fp16"'))
+    fp16.write_text(path.read_text().replace('precision = "w8a16_pipeline"', 'precision = "fp16"'))
     with pytest.raises(COMMON.ConfigError):
         COMMON.load_config(fp16)
 
@@ -119,7 +149,7 @@ def test_rhinovla_v3_source_profiles_pin_every_trusted_factory_switch():
              profiles["rhinovla.v3.w8a16.full-pipeline.trusted-factory"]["controlled_gates"]]
     for path in sorted(SOURCE_DIR.glob("*.toml")):
         config = COMMON.load_config(path)
-        assert list(config["example"]["opt_in"]) == names, path
+        assert sorted(config["example"]["opt_in"]) == sorted(names), path
 
 
 def test_rhinovla_v3_source_rejects_an_inherited_conflicting_switch(monkeypatch):

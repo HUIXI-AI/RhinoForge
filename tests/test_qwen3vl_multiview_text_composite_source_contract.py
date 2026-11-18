@@ -71,7 +71,7 @@ def test_composite_down_output_reuses_dead_up_slot_only_in_exact_lifecycle():
     assert ("const int down_phase_start = (exact_multiview_text_layout || "
             "lingbot_c400_full_layout) ? 8 : 7;") in " ".join(declarations.split())
     assert "lingbot_prefill_deepstack_reuses_down(ctx) && ctx.chunk_size == 400" in declarations
-    assert "if (!wall_p640_staged_layout)" in declarations
+    assert "if (!wall_p640_staged_layout && !(qwen_inplace && qwen3_c256_))" in declarations
     assert '{"up",     mlp,      7, 7' in declarations
     assert '{"down",       down_sz, down_phase_start, 8' in declarations
     assert "aliases full `up` [7,7] with `down` [8,8]" in declarations

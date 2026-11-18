@@ -1,0 +1,45 @@
+# 使用官方 Gemma4 E4B 浮点权重，冷启动安装时转换一次。
+# Decoder 每层七个投影（q / k / v / o / gate / up / down）对称 INT4/G32（RTN），每 32 个输入通道一个 FP16 scale；逐层嵌入(PLE)、norm、embedding 和输出头（与 embedding 绑定）为 FP16；输出头在 RPU 上以 FP32 累加计算，最后的 softcap 在 CPU。
+# Linear 固定 ACC16（Gemma4 没有 linear_acc32 选项）；2026-11-06 上板 8 核、6 核通过运行时检查，任务质量未评估。
+[model]
+profile_id = "gemma4-e4b.w4a16-g32.text"
+registry_alias = "gemma4-e4b"
+target = "gemma4"
+precision = "w4a16_text_rtn_g32"
+architecture = "Gemma4ForConditionalGeneration"
+
+[model.opt_in]
+
+[input]
+# 不填时使用自然输入长度；固定 P 可设置正整数，P/D 联动范围见模型说明。
+# prefill_tokens = 128
+# 可替换文本；自然输入长度由 tokenizer 决定。
+prompt = "Explain what a compiler does."
+# 首 token 之后的 decode 调用数，整数 ≥0；P 与 D 受 cache 和模型输入范围共同约束。
+decode_steps = 4
+
+[run]
+# 预热次数；不计入正式测量。
+warmup = 2
+# 正式执行次数，正整数。
+runs = 5
+# 按需开启硬件采样；保持 false 可减少测量干扰。
+hwperf = false
+# 按需开启 profiler；正式计时建议保持 false。
+profile = false
+# 随机种子，非负整数。
+seed = 0
+
+[rpu_execution]
+
+[rpu_execution.model]
+# RPU 核数预算。可选 4 / 6 / 8，默认 8；冷启动设定，修改后需重新加载模型。
+# 组件分配固定：8 核 = 注意力 2、MLP 8、PLE 8、输出头 8；6 核 = 注意力 2、MLP 6（宽度 10240 在量化后、swizzle 前补零到 10368）、PLE 4、输出头 6（词表 262144 补零到 262176）；4 核 = 注意力 2、MLP 4、PLE 4、输出头 4。
+# 各核数的支持状态与板上实测见核数支持矩阵（examples/configs/CONFIGURATIONS.md）。
+num_cores = 8
+
+[rpu_execution.prefill]
+# prefill 分块行数。可选 "auto"（默认）或满足本组件形状限制的 16 的倍数整数。
+# auto：由原生 planner 按实际输入行数选择。
+# 实际值记录在结果 report.json 的执行计划中（compute_chunk）。
+chunk_size = "auto"

@@ -12,9 +12,12 @@ CONFIGS = sorted((ROOT / "examples/configs/qwen3_vl").rglob("*.toml"))
 
 
 @pytest.mark.parametrize("path", CONFIGS, ids=lambda path: str(path.relative_to(ROOT)))
-def test_vl_config_accepts_four_six_and_eight_core_budgets(path):
+def test_vl_config_accepts_its_declared_core_budgets(path):
     config = common.load_config(path)
     profile = common.planner_profiles()[config["example"]["profile_id"]]
+    allowed = profile["input_envelope"]["limits"]["allowed_num_cores"]
+    # Every public VL recipe, text NVFP4 included, accepts all three budgets.
+    assert allowed == [4, 6, 8]
     for cores in (4, 6, 8):
         execution = copy.deepcopy(config["rpu_execution"])
         execution["model"]["num_cores"] = cores

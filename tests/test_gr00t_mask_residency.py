@@ -81,7 +81,7 @@ class Gr00tDiTModel{public:
  int64_t num_layers()const{return layer_weights_.size();}
  int64_t hidden_size()const{return h;}int64_t num_q_heads()const{return nq;}
  int64_t head_dim()const{return hd;}int64_t intermediate_size()const{return ff;}
- int attn_tp()const{return 8;}
+ int attn_tp()const{return 8;}int num_cores()const{return 8;}
  void append_cross_kv_buffers(std::vector<BufferDecl>&,const LayoutContext&)const{}
  bool ff1_resident_profile(int64_t,int64_t)const{return false;}
  static constexpr int64_t GR00T_DIT_FF1_RESIDENT_BYTES=1179648;

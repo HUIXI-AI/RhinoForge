@@ -19,7 +19,7 @@ def _program():
     base = (ROOT / "src/fused/rpu_qwen3_model.h").read_text()
     source = SOURCE.read_text()
     residency = (ROOT / "src/core/rpu_spm_residency.h").read_text()
-    program = r'''
+    program = f'#include "{ROOT / "src/fused/rpu_qwen3_w8a8_contract.h"}"\n' + r'''
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
@@ -60,6 +60,8 @@ template<class T,class U> T Align(T a,U b) {return CeilDiv(a,static_cast<T>(b))*
         program += _definition(helpers, marker) + "\n"
     program += '''class SpmAllocator {public:
 static constexpr size_t ALIGN=256;
+static constexpr size_t SPM_USABLE=8387584;
+static constexpr size_t SPM_PLANNING_BUDGET=SPM_USABLE*99/100;
 static size_t align_up(size_t n) {return (n+ALIGN-1)&~(ALIGN-1);}
 '''
     for marker in ("struct AllocRequest", "struct AliasedPlan"):
@@ -97,6 +99,8 @@ struct LayoutContext {
 };
 class CausalDecoderModel {public:
  bool v1=false;
+ bool qwen3_c192_=false,qwen3_c256_=false,qwen3_c512_=false,qwen3_prefill_w8a8_=false;
+ int64_t qwen3_inplace_capacity()const{return 0;}
  bool qwen3vl_4b_packed_decode_qkv(int64_t,bool,bool,int64_t)const{return false;}
  bool lingbot_folded_rmsnorm_=false,lingbot_prefill_kv_only_=false,lingbot_prefill_mode_bound_=false;
  CausalDecoderPlanningMode planning_mode_=CausalDecoderPlanningMode::ORDINARY;
@@ -110,6 +114,7 @@ class CausalDecoderModel {public:
  int64_t num_q_heads()const{return v1?16:32;} int64_t num_kv_heads()const{return v1?2:8;}
  int64_t head_dim()const{return 128;} int64_t num_layers()const{return 36;}
  int attn_tp()const{return v1?2:8;} int mlp_tp()const{return 8;} int lm_head_tp()const{return 8;}
+ int num_cores()const{return 8;}
  std::vector<BufferDecl> causal_baseline_buffer_declarations(const LayoutContext& ctx);
  bool explicit_mask_residency_requested_=false;
  virtual std::vector<BufferDecl> explicit_mask_baseline_buffer_declarations(const LayoutContext& ctx){return causal_baseline_buffer_declarations(ctx);}
@@ -120,16 +125,17 @@ class CausalDecoderModel {public:
     program += _definition(base, "std::vector<BufferDecl> declare_buffers(").replace(
         "std::vector<BufferDecl> declare_buffers(",
         "std::vector<BufferDecl> CausalDecoderModel::declare_buffers(", 1).replace(" override", "") + "\n"
-    # All base Temp declarations precede persistent norm preloads. Assert that
-    # boundary instead of maintaining a second handwritten model layout.
+    # Keep both the initial Temp declarations and the final profile-specific
+    # layout transforms; only the persistent preload declarations are omitted.
     marker = "std::vector<BufferDecl> causal_baseline_buffer_declarations("
     declaration = _definition(base, marker)
     boundary = declaration.index("// Norm-weight preloads")
-    prefix, persistent = declaration[:boundary], declaration[boundary:]
+    transforms = declaration.index("        if ((qwen3_prefill_w8a8_ || qwen_inplace)")
+    prefix, persistent = declaration[:boundary], declaration[boundary:transforms]
     assert "StorageClass::Temp" not in persistent
     prefix = prefix[:prefix.rfind("// ─")]
     prefix = prefix.replace(marker, "std::vector<BufferDecl> CausalDecoderModel::causal_baseline_buffer_declarations(", 1)
-    program += prefix + "return decls;\n}\n"
+    program += prefix + declaration[transforms:] + "\n"
     program += r'''
 struct FixtureTensor {int64_t elements=0;int64_t numel()const{return elements;}};
 class LingbotV2MoeExpertModel:public CausalDecoderModel {public:

@@ -327,9 +327,14 @@ def test_plain_text_native_guard_rejects_only_causal_sub16_physical_tails(tmp_pa
 #include <cassert>
 #include <cstdint>
 #include <optional>
+#include "rpu_qwen3_w8a8_contract.h"
+namespace qwen3_w8a8 = v3::qwen3_w8a8;
+// This plain-text probe keeps the independent W8A8 cold capabilities off.
+constexpr bool qwen3_prefill_w8a8_ = false;
+constexpr bool qwen3_c192_ = false, qwen3_c256_ = false, qwen3_c512_ = false;
 struct Context { bool is_causal; std::optional<int> attention_mask; } context;
 const Context& ctx() { return context; }
-bool reaches_remaining_checks(int64_t cs, int64_t seq_len) {
+bool reaches_remaining_checks(int64_t cs, int64_t seq_len, int64_t position = 0) {
 """ + guards + r"""
     return true;
 }
@@ -352,7 +357,8 @@ int main() {
 }
 """
     executable = tmp_path / "causal_tail_guard"
-    subprocess.run(["g++", "-std=c++17", "-x", "c++", "-", "-o", str(executable)],
+    subprocess.run(["g++", "-std=c++17", "-I", str(ROOT / "src/fused"),
+                    "-x", "c++", "-", "-o", str(executable)],
                    input=source, text=True, capture_output=True, check=True)
     subprocess.run([str(executable)], capture_output=True, check=True)
 

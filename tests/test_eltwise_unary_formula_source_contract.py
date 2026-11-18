@@ -174,7 +174,7 @@ def test_shared_qwen3vl_vision_uses_tanh_blocks_and_erf_mergers():
     qwen25 = _read("src/fused/rpu_qwen25vl_vision_model.cpp")
     assert re.search(
         r'addr\(0, "merger_mid"\), addr\(0, "merger_mid"\).*?'
-        r'GeluMode::ERF, NUM_CORES',
+        r'GeluMode::ERF, num_cores\(\)',
         qwen25,
         re.DOTALL,
     )
@@ -190,6 +190,8 @@ def test_shared_models_keep_their_declared_gelu_formula():
         "src/fused/rpu_navdp_model.cpp": "GeluMode::ERF",
         "src/fused/rpu_qwen25vl_vision_model.cpp": "GeluMode::ERF",
         "src/fused/rpu_siglip_model.cpp": "GeluMode::TANH",
+        # Eager Qwen3-VL merger fc1 epilogue (linear_with_accumulation gelu_erf).
+        "src/ops/rpu_linear.cpp": "gelu_erf ? GeluMode::ERF : GeluMode::NONE",
     }
     for relative, mode in expected.items():
         assert mode in _read(relative), f"{relative} must select {mode}"

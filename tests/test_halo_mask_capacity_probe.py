@@ -29,7 +29,7 @@ def _program():
     halo = (ROOT / "src/fused/rpu_halo_action_expert_model.cpp").read_text()
     fmb = (ROOT / "src/core/fused_model_base.cpp").read_text()
     allocator_h = (ROOT / "src/core/rpu_spm_allocator.h").read_text()
-    p = _temporary_program()
+    p = '#include "src/fused/rpu_qwen3_w8a8_contract.h"\n#include "src/fused/rpu_qwen3_c192_contract.h"\n' + _temporary_program()
     constants = allocator_h[allocator_h.index("    static constexpr size_t SPM_TOTAL"):
                             allocator_h.index("    static constexpr size_t ALIGN")]
     p = p.replace("class SpmAllocator {public:", "class SpmAllocator {public:\n" + constants)
@@ -54,6 +54,8 @@ class CausalDecoderModel {public:
  std::vector<int> deepstack_lang_layers_;
  bool adarms_mutable_=false,adarms_fused_bcast_enabled_=false,adarms_=false;
  bool has_qk_norm_=true,has_qkv_bias_=true,nvfp4_=false;
+ bool qwen3_prefill_w8a8_=false,qwen3_c192_=false,qwen3_c256_=false,qwen3_c512_=false;
+ int64_t qwen3_inplace_capacity()const{return 0;}
  struct LayerWeights {at::Tensor q_bias_w,k_bias_w,v_bias_w;};
  at::Tensor q_nvfp4_tensor_scales_,k_nvfp4_tensor_scales_,v_nvfp4_tensor_scales_,
  o_nvfp4_tensor_scales_,gate_nvfp4_tensor_scales_,up_nvfp4_tensor_scales_,down_nvfp4_tensor_scales_;
@@ -189,7 +191,7 @@ def test_halo_complete_declarations_and_physical_capacity_boundary(tmp_path):
         pytest.skip("host C++ compiler unavailable")
     cpp, binary = tmp_path / "halo.cpp", tmp_path / "halo"
     cpp.write_text(_program())
-    build = subprocess.run([compiler, "-std=c++17", "-O0", str(cpp), "-o", str(binary)], text=True, capture_output=True)
+    build = subprocess.run([compiler, "-std=c++17", "-O0", "-I", str(ROOT), str(cpp), "-o", str(binary)], text=True, capture_output=True)
     assert build.returncode == 0, build.stderr
     result = subprocess.run([str(binary)], text=True, capture_output=True)
     assert result.returncode == 0, result.stderr

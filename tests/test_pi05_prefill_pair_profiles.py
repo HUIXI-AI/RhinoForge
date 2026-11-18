@@ -22,14 +22,16 @@ def test_exact_pair_profiles_keep_fp16_unquantized_and_require_payloads(tmp_path
         "int64_t pi05_pair_spill_elements(", "bool pi05_pair_scratch_mask(", "int64_t pi05_pair_mask_selector(",
         "bool pi05_pair_mask_upload(", "bool pi05_pair_fp16(",
         "bool pi05_pair_weight(", "KernelId pi05_prefill_kv1_pair_kernel(",
+        "void validate_pi05_a8_panel512_cold(",
         "KernelId pi05_prefill_gateup_pair_kernel(",
-        "int64_t pi05_a8_bytes(", "int64_t pi05_a8_root_bytes(",
+        "int64_t pi05_a8_bytes(", "int64_t pi05_a8_root_bytes(", "int64_t pi05_a8_s0_bytes(",
         "std::vector<int64_t> pi05_prefill_gateup_pair_arguments(",
         "std::vector<int64_t> pi05_prefill_kv1_pair_direct_policy_arguments(",
         "bool pi05_prefill_extended_payloads_loaded(",
         "bool pi05_prefill_dma_geometry(", "bool pi05_prefill_dma_layout(",
         "bool pi05_prefill_mask_domain_eligible(",
         "std::vector<int64_t> pi05_owner_norm_arguments(",
+        "bool pi05_down_a8_enabled(", "std::vector<int64_t> pi05_down_a8_arguments(",
         "std::vector<int64_t> pi05_down_pair_arguments(",
     )
     methods = "\n".join(_function(source, "    " + signature) for signature in signatures)
@@ -44,6 +46,8 @@ def test_exact_pair_profiles_keep_fp16_unquantized_and_require_payloads(tmp_path
 #include <iostream>
 #include <set>
 using namespace v3;
+bool panel512_environment=false;
+bool pi05_kernel_opt_in(const char*) { return panel512_environment; }
 enum class KernelId : uint16_t {
 ''' + ",\n".join(ids) + r'''};
 KernelId pi_wall_kernel_id(std::size_t ordinal) { return static_cast<KernelId>(1000+ordinal); }
@@ -57,6 +61,7 @@ struct Owner {
     int64_t pi05_pair_rows_=400;
     bool pi05_pair_rows_bound_=false;
     bool pi05_prefill_carry_ab_=true,pi05_prefill_mask_resident_=true,pi05_prefill_kv_only_=true;
+    bool pi05_prefill_a8_panel512_=false;
     bool pi05_prefill_a8_=false,pi05_prefill_o_pair_=true,pi05_prefill_gateup_pair_=true;
     bool pi05_prefill_down_pair_=true,pi05_prefill_owner_norm_=true,pi05_prefill_kv1_pair_direct_=true;
     bool pi05_prefill_qkv_pair_=false;
@@ -88,6 +93,36 @@ struct Owner {
 template<class F> void rejects(F f) { bool bad=false;try{f();}catch(const c10::Error&){bad=true;}assert(bad); }
 int main() {
     at::set_num_threads(1);
+    {
+        Owner owner;
+        owner.validate_pi05_a8_panel512_cold();
+        panel512_environment=true;
+        rejects([&]{owner.validate_pi05_a8_panel512_cold();});
+        owner.pi05_prefill_a8_panel512_=true;
+        rejects([&]{owner.set_prefill_pair_rows(400);});
+        owner.set_prefill_pair_rows(272);
+        rejects([&]{owner.validate_pi05_a8_panel512_cold();});
+        owner.pi05_prefill_a8_=true;
+        owner.install(false);
+        owner.validate_pi05_a8_panel512_cold();
+        assert(owner.pi05_prefill_dma_geometry());
+        const auto selected=rpu_pi_wall::select(rpu_pi_wall::Operation::A8PairedGeluPanel512,
+            rpu_pl_tiling::WeightType::Int8,true,272,2048,2048);
+        assert(owner.pi05_prefill_gateup_pair_kernel()==pi_wall_kernel_id(selected.ordinal));
+        assert(std::string(rpu_pi_wall::candidate_names[selected.ordinal])==
+               "pi_geglu_a8_paired_i32_c272_m48n32k2048_p512");
+        const auto args=owner.pi05_prefill_gateup_pair_arguments();
+        assert(args.at(0)==8 && args.at(20)==512 && args.back()==2097152);
+        auto& cache=KernelCache::instance();
+        cache.missing.insert(owner.pi05_prefill_gateup_pair_kernel());
+        assert(!owner.pi05_prefill_dma_geometry());cache.missing.clear();
+        for(int cores:{4,6}) { owner.cores=cores;rejects([&]{owner.validate_pi05_a8_panel512_cold();}); }
+        owner.cores=8;owner.pi05_prefill_gateup_pair_=false;
+        rejects([&]{owner.validate_pi05_a8_panel512_cold();});
+        owner.pi05_prefill_gateup_pair_=true;
+        panel512_environment=false;
+        rejects([&]{owner.validate_pi05_a8_panel512_cold();});
+    }
     // Link and execute the real shared manifest selector. Every admitted
     // payload must agree with the launcher's exact ring family; nearby
     // unsupported rows retain their ordinary shared route.
@@ -364,6 +399,17 @@ int main() {
             assert(!owner.pi05_prefill_dma_geometry());owner.pi05_prefill_a8_=false;
         } else {
             owner.pi05_prefill_a8_=true;
+            // Only the newly bound C272/C400 Down route adds these two
+            // payload dependencies. Existing A16 and other A8 rows keep
+            // their prior cold admission when either payload is absent.
+            for(const auto id:{KernelId::DYNAMIC_QUANTIZE_W8A8,
+                    KernelId::PARALLEL_LINEAR_W8A8_ACC32_RESIDENT_M64N80K256_LK2048_SW_SXFUSED_HOIST}) {
+                auto& cache=KernelCache::instance();cache.missing.insert(id);
+                assert(owner.pi05_prefill_dma_geometry()==(rows!=272&&rows!=400));
+                owner.pi05_prefill_a8_=false;
+                assert(owner.pi05_prefill_dma_geometry());
+                owner.pi05_prefill_a8_=true;cache.missing.clear();
+            }
             const auto a8=owner.pi05_prefill_gateup_pair_arguments();
             assert(a8.size()==32 && a8[0]==7 && a8[1]==rows && a8[6]==48);
             assert(a8[19]==2080 && a8[20]==(rows<400?256:384));

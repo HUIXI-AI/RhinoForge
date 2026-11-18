@@ -48,7 +48,9 @@ def test_validation_stays_cpu_safe_and_does_not_relabel_z2(tmp_path, monkeypatch
     runner.validate_example_config(value)
     assert runner.registered_example(value) is None
     value["rpu_execution"] = {"model": {"num_cores": 4}}
-    with pytest.raises(ValueError, match="TP8"): runner.validate_example_config(value)
+    runner.validate_example_config(value)
+    value["rpu_execution"] = {"model": {"num_cores": 5}}
+    with pytest.raises(ValueError, match="4, 6 or 8"): runner.validate_example_config(value)
 
 
 def test_precision_cold_flags_preserve_fp16_and_keep_experiments_off():
@@ -164,6 +166,19 @@ def test_real_flow_counts_clean_calls_and_separates_diagnostics(tmp_path, monkey
 
 
 
+@pytest.mark.parametrize(("cores", "cpu", "threads"), [
+    (8, None, 1), (6, None, 12), (4, None, 12), (6, 3, 3), (8, 12, 12)])
+def test_omitted_cpu_threads_follow_the_core_budget(tmp_path, monkeypatch, cores, cpu, threads):
+    # Below eight cores the Vision patch embed and mergers run on the CPU, so the
+    # omitted default is 12 there; an explicit [cpu].threads always wins.
+    runner = load(); policy = FakePolicy(); mock_runtime(monkeypatch, runner, policy)
+    value = config(tmp_path); value["rpu_execution"] = {"model": {"num_cores": cores}}
+    value["cpu"] = {} if cpu is None else {"threads": cpu}
+    runner.validate_example_config(value)
+    assert runner.run_example_config(value) == 0
+    assert json.loads((tmp_path / "report.json").read_text())["cpu_runtime"] == {"torch_num_threads": threads}
+
+
 def test_failure_closes_owner_restores_stage_methods_and_records_error(tmp_path, monkeypatch):
     runner = load(); policy = FakePolicy(fail=True); mock_runtime(monkeypatch, runner, policy)
     original = policy._build_prefix
@@ -228,24 +243,25 @@ def test_source_identity_without_git_keeps_actual_source_hashes(monkeypatch):
 def test_text_matrix_templates_cpu_validation_and_unified_entry(monkeypatch, capsys):
     import subprocess
     from examples.common import config as common, cli
-    paths = sorted((ROOT / "examples/configs/lingbot/v2").glob("*cam/*.toml"))
-    assert len(paths) == 4
+    paths = sorted((ROOT / "examples/configs/lingbot/v2").glob("*.toml"))
+    assert [path.name for path in paths] == ["fp16.toml", "w8a16.toml"]
+    # The templates hold 3 cameras; 2 cameras is preset 2cam_t32 with a 2-camera observation.
+    two_cameras = ["--input", "2cam_t32", "--set", "input.observation=/path/to/2cam_t32.pt"]
     targets = {(cameras, tokens, precision) for cameras in (2, 3)
                for tokens in (32,) for precision in ("fp16", "w8a16")}
-    observed = set()
     seen = []
     configs = {}
     monkeypatch.setattr(load(), "run_example_config", lambda value: seen.append(value) or 0)
     for path in paths:
-        value = common.load_config(path)
-        configs[path] = value
-        observed.add((value["input"]["cameras"], value["input"]["expected_language_tokens"],
-                      value["lingbot2"]["precision"]))
+        configs[path] = common.load_config(path)
+        for extra in ([], two_cameras):
+            assert cli.main(["--config", str(path), *extra, "--check-config"]) == 0
+            assert cli.main(["--config", str(path), *extra]) == 0
+    assert {(value["input"]["cameras"], value["input"]["expected_language_tokens"],
+             value["lingbot2"]["precision"]) for value in seen} == targets
+    assert len(seen) == 4
+    for value in seen:
         assert common.config_target(value) == "lingbot2" and common.example_metadata(value) is None
-        assert cli.main(["--config", str(path), "--check-config"]) == 0
-        assert cli.main(["--config", str(path)]) == 0
-    assert observed == targets
-    assert len(seen) == 4 and {v["lingbot2"]["precision"] for v in seen} == {"fp16", "w8a16"}
     from scripts import check_examples
     index = (ROOT / "examples/configs/lingbot/README.md").read_text(encoding="utf-8")
     for path, value in configs.items():

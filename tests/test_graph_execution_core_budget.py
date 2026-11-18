@@ -299,7 +299,6 @@ bool siglip_should_isolate_patch_embed_kernel(const std::string&, const GraphNod
 std::string kernel_label_for_segment_split(const GraphNode&) { return "test"; }
 bool log_at(int) { return false; }
 inline void validate_graph_dma_channel(int, size_t, const char*);
-uint8_t validated_kernel_core_extent(const GraphRuntimePolicy&, const std::vector<uint8_t>&);
 struct RpuKernelGraph {
     enum class State { PASSTHROUGH, RECORDING, BUILT, REPLAYING };
     State state_ = State::RECORDING;
@@ -848,7 +847,7 @@ def test_enqueue_rejects_outside_budget_before_dispatch_and_fixture_binds_owner(
     execute = (ROOT / "src/graph/graph_runtime_execute.cpp").read_text()
     start = execute.index("const QueueLaunchState& queue_state) {")
     body = execute[start:execute.index("case State::RECORDING:", start)]
-    assert body.index("validated_kernel_core_extent(runtime_policy_, core_ids)") < body.index("switch (state_)")
+    assert body.index("validated_kernel_core_extent(runtime_policy_, core_ids, kernel.get_name())") < body.index("switch (state_)")
     assert "passthrough_kernel_queue(core_extent)" in body
     binding = (ROOT / "src/graph/graph_pybind.cpp").read_text()
     assert 'py::arg("execution_core_count") = 8' in binding

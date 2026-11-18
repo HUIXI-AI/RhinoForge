@@ -62,7 +62,7 @@ def test_actual_input_geometry_and_instruction_length(size, text):
 
 @pytest.mark.parametrize("precision", ["fp16", "w8a16"])
 @pytest.mark.parametrize("size", [224, 256])
-@pytest.mark.parametrize("cameras", [2, 3])
+@pytest.mark.parametrize("cameras", [1, 2, 3])
 @pytest.mark.parametrize("text", [32, 64, 128, 160, 192, 224, 256])
 def test_camera_and_long_instruction_profiles(precision, size, cameras, text):
     cfg = config(precision, size=size, text=text, cameras=cameras)
@@ -74,15 +74,9 @@ def test_camera_and_long_instruction_profiles(precision, size, cameras, text):
     assert CFG.runtime_environment(cfg) == CFG.runtime_environment(config(precision, size=256))
 
 
-def test_single_camera_256_compatibility():
-    cfg = config(size=256, text=32, cameras=1)
-    assert CFG.validate_config(cfg)
-    CFG.validate_observation(cfg, observation(256, 32, 1), Tokenizer())
-
-
 @pytest.mark.parametrize("size,cameras,text", [
     (256, 2, 129), (256, 2, 288), (256, 2, True),
-    (256, 4, 128), (256, True, 128), (224, 1, 128), (224, 1, 256),
+    (256, 4, 128), (256, True, 128), (224, 0, 128), (224, 4, 256),
     (224, 2, 129), (224, 3, 288), (224, True, 128),
 ])
 def test_geometry_outside_requested_profiles_is_rejected(size, cameras, text):

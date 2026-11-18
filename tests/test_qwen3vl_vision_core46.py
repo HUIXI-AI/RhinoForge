@@ -6,6 +6,7 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from rpu_backend.adapters.qwen3_vl import vision
+from test_qwen3_vl_merger_lifecycle import cpu_transfers  # noqa: F401
 
 
 def _model(size):
@@ -108,11 +109,18 @@ def test_four_core_cache_keeps_eight_physical_stripes(monkeypatch):
     assert cache.nKVHeadChunk * cache.nKVHeadVx == 8 * 16 // 4
 
 
-@pytest.mark.parametrize("enable", (vision.enable_qwen3_vl_vision_merger_on_device,
-                                   vision.register_qwen3vl_vision_fused_merger))
-def test_reduced_core_native_merger_is_rejected_before_weights(enable):
-    with pytest.raises(ValueError, match="on CPU"):
-        enable(SimpleNamespace(_rpu_vision_num_cores=4))
+@pytest.mark.parametrize("installed, requested", ((4, 8), (8, 4), (4, 6), (4, 2)))
+def test_fused_merger_lanes_must_equal_the_installed_vision_owner(installed, requested):
+    with pytest.raises(ValueError, match="four- or eight-core"):
+        vision.register_qwen3vl_vision_fused_merger(
+            SimpleNamespace(_rpu_vision_num_cores=installed), cores=requested)
+
+
+@pytest.mark.parametrize("installed, requested", ((4, 8), (8, 4), (4, 6), (4, 2)))
+def test_eager_auxiliary_lanes_must_equal_the_installed_vision_owner(installed, requested):
+    with pytest.raises(ValueError, match="four- or eight-core"):
+        vision.enable_qwen3_vl_vision_merger_on_device(
+            SimpleNamespace(_rpu_vision_num_cores=installed), cores=requested)
 
 
 @pytest.mark.parametrize("size", (2, 8))
@@ -192,3 +200,76 @@ def test_installer_rejects_graph_policy_core_mismatch_before_assets():
     requested = vision.rpu_backend.graph.GraphRuntimePolicy(execution_core_count=4)
     with pytest.raises(ValueError, match="core count"):
         vision.install_qwen3_vl_vision_for_rpu(object(), graph_runtime_policy=requested)
+
+
+@pytest.mark.parametrize("cores", (4, 8))
+def test_reduced_vision_releases_its_layout_before_eager_mergers(cpu_transfers, monkeypatch, cores):
+    """Actual forward with CPU doubles: the eager merger row pass is sized from
+    free SPM, so the Vision layout is released after the last image on four
+    and eight cores."""
+    from contextlib import contextmanager
+
+    events = []
+
+    class Merger:
+        _rpu_merger_num_cores = cores
+
+        def __call__(self, values):
+            raise AssertionError("CPU merger used")
+
+    class Visual(SimpleNamespace):
+        def fast_pos_embed_interpolate(self, grid):
+            return torch.zeros(int(grid.prod(-1).sum()), 2, dtype=torch.float16)
+
+    @contextmanager
+    def capture(signature):
+        yield
+        events.append("native")
+
+    visual = Visual(
+        _rpu_vision_handle=11, _rpu_vision_spatial_merge_size=2,
+        _rpu_vision_num_layers=1, _rpu_vision_hidden_size=2, _rpu_vision_num_cores=cores,
+        _rpu_vision_kv_cache=SimpleNamespace(k_caches=[None], v_caches=[None],
+            max_seq_len=2048, reset_to_position=lambda position: None),
+        _rpu_vision_graph_cache=SimpleNamespace(capture=capture),
+        _rpu_vision_deepstack_hash=1, _rpu_vision_max_hw=40,
+        _rpu_vision_host_fp32_patch=False, _rpu_vision_patch_embed_w=torch.eye(2).half(),
+        _rpu_vision_patch_embed_b=None,
+        _rpu_vision_position_idx_keepalive=torch.zeros(2048, 2).short(),
+        _rpu_vision_deepstack_indexes=[0, 1], _rpu_vision_fused_merger=False,
+        _rpu_vision_merger_on_device=True, _rpu_vision_aux_num_cores=cores,
+        _rpu_vision_batch_enabled=False, _rpu_vision_batch_cap=1,
+        merger=Merger(), deepstack_merger_list=[Merger(), Merger()],
+    )
+    def plan(handle, patches, batch, *args, **kwargs):
+        return SimpleNamespace(selected=SimpleNamespace(execution_len=patches,
+            stage_tuple=SimpleNamespace(compute_chunk=patches, physical_descriptor=(patches, batch),
+                physical_metadata=(("manifest_state", 1), ("raw_attention_site_count", 1),
+                                   ("capability_attention_ddr_site_count", 0)))),
+            graph_key_words=lambda: (patches, batch), graph_mode="GRAPH_COMPOSITE_CHILD",
+            selection_scope="TEST", physical_plan_digest="test", plan_digest="test")
+    monkeypatch.setattr(vision, "_plan_qwen3_vl_vision_execution", plan)
+    monkeypatch.setattr(vision, "_deepstack_output_cls", lambda: SimpleNamespace)
+    monkeypatch.setattr(vision.rpu_backend.graph, "GraphSignature", lambda **kw: tuple(kw))
+    current = [None]
+    def forward(handle, values, keys, vals, patches, batch, descriptor):
+        current[0] = patches
+        return values.clone()
+    monkeypatch.setattr(torch.ops.rpu, "qwen3vl_vision_forward", forward, raising=False)
+    monkeypatch.setattr(torch.ops.rpu, "qwen3vl_vision_get_resolved_chunk_size",
+                        lambda h: current[0], raising=False)
+    monkeypatch.setattr(torch.ops.rpu, "qwen3vl_vision_pop_deepstack_snapshots",
+                        lambda h: [torch.ones(current[0], 2).half() for _ in range(2)], raising=False)
+    monkeypatch.setattr(torch.ops.rpu, "spm_alloc_reset_temporary",
+                        lambda: events.append("reset"), raising=False)
+    def merger(module, values, **kwargs):
+        events.append("merger")
+        return values[::4] + 10
+    monkeypatch.setattr(vision, "_merger_forward_on_device", merger)
+
+    grid = torch.tensor([[1, 14, 14], [1, 16, 16]])
+    pixels = torch.ones(int(grid.prod(-1).sum()), 2).half()
+    result = vision._rpu_vision_forward(visual, pixels, grid)
+
+    assert len(result.deepstack_features) == 2
+    assert events == ["native", "native", "reset", "merger", "merger", "merger", "reset"]

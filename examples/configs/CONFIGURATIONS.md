@@ -13,6 +13,8 @@ CPU 列为请求值，`继承` 表示按运行器或环境设置。固定 P/D �
 | 配置 | 入口 / 用途 | 精度 / 输入默认 | CPU 请求 | 登记支持 |
 |---|---|---|---|---|
 | [dinov3/vit_b/fp16.toml](dinov3/vit_b/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16` | 继承 | `SUPPORTED`<br>`DINOV3_VIT_B_SUPPORTED` |
+| [dinov3/vit_b/w4a16_vision_rtn_g32.toml](dinov3/vit_b/w4a16_vision_rtn_g32.toml) | [run.py](../run.py)<br>运行模板 | `w4a16`；TP=8 | 继承 | `IMPLEMENTED_UNVERIFIED_HW`<br>`DINOV3_VIT_B_QUANT_BOARD_RUN_PENDING` |
+| [dinov3/vit_b/w8a16_vision.toml](dinov3/vit_b/w8a16_vision.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；TP=8 | 继承 | `IMPLEMENTED_UNVERIFIED_HW`<br>`DINOV3_VIT_B_QUANT_BOARD_RUN_PENDING` |
 
 ## gemma4
 
@@ -21,6 +23,8 @@ CPU 列为请求值，`继承` 表示按运行器或环境设置。固定 P/D �
 | 配置 | 入口 / 用途 | 精度 / 输入默认 | CPU 请求 | 登记支持 |
 |---|---|---|---|---|
 | [gemma4/e4b/fp16.toml](gemma4/e4b/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；D=4 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
+| [gemma4/e4b/w4a16_text_rtn_g32.toml](gemma4/e4b/w4a16_text_rtn_g32.toml) | [run.py](../run.py)<br>运行模板 | `w4a16`；D=4；TP=8 | 继承 | `IMPLEMENTED_UNVERIFIED_HW`<br>`GEMMA4_E4B_QUANT_BOARD_RUN_PENDING` |
+| [gemma4/e4b/w8a16_text.toml](gemma4/e4b/w8a16_text.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；D=4；TP=8 | 继承 | `IMPLEMENTED_UNVERIFIED_HW`<br>`GEMMA4_E4B_QUANT_BOARD_RUN_PENDING` |
 
 ## gr00t
 
@@ -28,13 +32,13 @@ CPU 列为请求值，`继承` 表示按运行器或环境设置。固定 P/D �
 
 | 配置 | 入口 / 用途 | 精度 / 输入默认 | CPU 请求 | 登记支持 |
 |---|---|---|---|---|
-| [gr00t/n1_7_droid/224/2cam/fp16.toml](gr00t/n1_7_droid/224/2cam/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；相机=2；图像=224；T=128 | 8 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
-| [gr00t/n1_7_droid/224/2cam/w8a16.toml](gr00t/n1_7_droid/224/2cam/w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；相机=2；图像=224；T=128 | 8 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [gr00t/n1_7_droid/224/fp16.toml](gr00t/n1_7_droid/224/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；相机=3；图像=224；T=32 | 8 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
+| [gr00t/n1_7_droid/224/w4a16_rtn_g32_glue_adaln_w8a16.toml](gr00t/n1_7_droid/224/w4a16_rtn_g32_glue_adaln_w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w4a16`；相机=3；图像=224；T=32 | 8 | `IMPLEMENTED_UNVERIFIED_HW`<br>`GR00T_VISION_W4_BOARD_RUN_PENDING` |
+| [gr00t/n1_7_droid/224/w4a16_rtn_g32_vision_glue_adaln_w8a16.toml](gr00t/n1_7_droid/224/w4a16_rtn_g32_vision_glue_adaln_w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w4a16`；相机=3；图像=224；T=32 | 8 | `IMPLEMENTED_UNVERIFIED_HW`<br>`GR00T_W4_BOARD_RUN_PENDING` |
 | [gr00t/n1_7_droid/224/w8a16.toml](gr00t/n1_7_droid/224/w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；相机=3；图像=224；T=32 | 8 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
-| [gr00t/n1_7_droid/256/2cam/fp16.toml](gr00t/n1_7_droid/256/2cam/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；相机=2；图像=256；T=128 | 8 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
-| [gr00t/n1_7_droid/256/2cam/w8a16.toml](gr00t/n1_7_droid/256/2cam/w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；相机=2；图像=256；T=128 | 8 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [gr00t/n1_7_droid/256/fp16.toml](gr00t/n1_7_droid/256/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；相机=3；图像=256；T=32 | 8 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
+| [gr00t/n1_7_droid/256/w4a16_rtn_g32_glue_adaln_w8a16.toml](gr00t/n1_7_droid/256/w4a16_rtn_g32_glue_adaln_w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w4a16`；相机=3；图像=256；T=32 | 8 | `IMPLEMENTED_UNVERIFIED_HW`<br>`GR00T_VISION_W4_BOARD_RUN_PENDING` |
+| [gr00t/n1_7_droid/256/w4a16_rtn_g32_vision_glue_adaln_w8a16.toml](gr00t/n1_7_droid/256/w4a16_rtn_g32_vision_glue_adaln_w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w4a16`；相机=3；图像=256；T=32 | 8 | `IMPLEMENTED_UNVERIFIED_HW`<br>`GR00T_W4_BOARD_RUN_PENDING` |
 | [gr00t/n1_7_droid/256/w8a16.toml](gr00t/n1_7_droid/256/w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；相机=3；图像=256；T=32 | 8 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 
 ## halo
@@ -52,6 +56,8 @@ CPU 列为请求值，`继承` 表示按运行器或环境设置。固定 P/D �
 | 配置 | 入口 / 用途 | 精度 / 输入默认 | CPU 请求 | 登记支持 |
 |---|---|---|---|---|
 | [hy_embodied/umi/fp16.toml](hy_embodied/umi/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16` | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
+| [hy_embodied/umi/w4a16_rtn_g32_vision_w8a16.toml](hy_embodied/umi/w4a16_rtn_g32_vision_w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w4a16` | 继承 | `IMPLEMENTED_UNVERIFIED_HW`<br>`HY_VLA_UMI_QUANT_BOARD_RUN_PENDING` |
+| [hy_embodied/umi/w8a16.toml](hy_embodied/umi/w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w8a16` | 继承 | `IMPLEMENTED_UNVERIFIED_HW`<br>`HY_VLA_UMI_QUANT_BOARD_RUN_PENDING` |
 
 ## hy_vla
 
@@ -59,12 +65,11 @@ CPU 列为请求值，`继承` 表示按运行器或环境设置。固定 P/D �
 
 | 配置 | 入口 / 用途 | 精度 / 输入默认 | CPU 请求 | 登记支持 |
 |---|---|---|---|---|
-| [hy_vla/2cam/fp16.toml](hy_vla/2cam/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；相机=2；T=32；TP=8 | 12（运行器默认） | 未登记；模型专用模板 |
-| [hy_vla/2cam/w8a16.toml](hy_vla/2cam/w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；相机=2；T=32；TP=8 | 12（运行器默认） | 未登记；模型专用模板 |
-| [hy_vla/2cam/w8a16_action_nvfp4.toml](hy_vla/2cam/w8a16_action_nvfp4.toml) | [run.py](../run.py)<br>运行模板 | `w8a16_nvfp4`；相机=2；T=32；TP=8 | 12（运行器默认） | 未登记；模型专用模板 |
-| [hy_vla/3cam/fp16.toml](hy_vla/3cam/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；相机=3；T=32；TP=8 | 12（运行器默认） | 未登记；模型专用模板 |
-| [hy_vla/3cam/w8a16.toml](hy_vla/3cam/w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；相机=3；T=32；TP=8 | 12（运行器默认） | 未登记；模型专用模板 |
-| [hy_vla/3cam/w8a16_action_nvfp4.toml](hy_vla/3cam/w8a16_action_nvfp4.toml) | [run.py](../run.py)<br>运行模板 | `w8a16_nvfp4`；相机=3；T=32；TP=8 | 12（运行器默认） | 未登记；模型专用模板 |
+| [hy_vla/fp16.toml](hy_vla/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；相机=3；T=32；TP=8 | 12（运行器默认） | 未登记；模型专用模板 |
+| [hy_vla/w4a16_rtn_g32.toml](hy_vla/w4a16_rtn_g32.toml) | [run.py](../run.py)<br>运行模板 | `w4a16_vision`；相机=3；T=32；TP=8 | 12（运行器默认） | 未登记；模型专用模板 |
+| [hy_vla/w4a16_rtn_g32_vision_w8a16.toml](hy_vla/w4a16_rtn_g32_vision_w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w4a16`；相机=3；T=32；TP=8 | 12（运行器默认） | 未登记；模型专用模板 |
+| [hy_vla/w8a16.toml](hy_vla/w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；相机=3；T=32；TP=8 | 12（运行器默认） | 未登记；模型专用模板 |
+| [hy_vla/w8a16_action_nvfp4.toml](hy_vla/w8a16_action_nvfp4.toml) | [run.py](../run.py)<br>运行模板 | `w8a16_nvfp4`；相机=3；T=32；TP=8 | 12（运行器默认） | 未登记；模型专用模板 |
 
 ## internvla
 
@@ -82,10 +87,8 @@ CPU 列为请求值，`继承` 表示按运行器或环境设置。固定 P/D �
 |---|---|---|---|---|
 | [lingbot/legacy/exact_z2/6b/w8a16.toml](lingbot/legacy/exact_z2/6b/w8a16.toml) | [run.py](../run.py)<br>历史复现 | `w8a16` | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [lingbot/v1/4b/fp16_cpu_vision.toml](lingbot/v1/4b/fp16_cpu_vision.toml) | [run.py](../run.py)<br>运行模板 | `cpu-fp32+rpu-fp16` | 继承 | `SUPPORTED_LIMITED`<br>`LINGBOT_V1_SHIPPED_MIXED_VISION_PATH` |
-| [lingbot/v2/2cam/fp16.toml](lingbot/v2/2cam/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；相机=2；有效T=32；TP=8 | 1 | 未登记；模型专用模板 |
-| [lingbot/v2/2cam/w8a16.toml](lingbot/v2/2cam/w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；相机=2；有效T=32；TP=8 | 1 | 未登记；模型专用模板 |
-| [lingbot/v2/3cam/fp16.toml](lingbot/v2/3cam/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；相机=3；有效T=32；TP=8 | 1 | 未登记；模型专用模板 |
-| [lingbot/v2/3cam/w8a16.toml](lingbot/v2/3cam/w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；相机=3；有效T=32；TP=8 | 1 | 未登记；模型专用模板 |
+| [lingbot/v2/fp16.toml](lingbot/v2/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；相机=3；有效T=32；TP=8 | 8 核 1，4/6 核 12（运行器默认） | 未登记；模型专用模板 |
+| [lingbot/v2/w8a16.toml](lingbot/v2/w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；相机=3；有效T=32；TP=8 | 8 核 1，4/6 核 12（运行器默认） | 未登记；模型专用模板 |
 
 ## llama
 
@@ -94,6 +97,9 @@ CPU 列为请求值，`继承` 表示按运行器或环境设置。固定 P/D �
 | 配置 | 入口 / 用途 | 精度 / 输入默认 | CPU 请求 | 登记支持 |
 |---|---|---|---|---|
 | [llama/3_2_1b/fp16.toml](llama/3_2_1b/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；D=4 | 继承 | `SUPPORTED`<br>`LLAMA_3_2_1B_SUPPORTED` |
+| [llama/3_2_1b/nvfp4_text.toml](llama/3_2_1b/nvfp4_text.toml) | [run.py](../run.py)<br>运行模板 | `nvfp4`；D=4；TP=8 | 继承 | `IMPLEMENTED_UNVERIFIED_HW`<br>`LLAMA_1B_QUANT_BOARD_RUN_PENDING` |
+| [llama/3_2_1b/w4a16_text_rtn_g32.toml](llama/3_2_1b/w4a16_text_rtn_g32.toml) | [run.py](../run.py)<br>运行模板 | `w4a16`；D=4；TP=8 | 继承 | `IMPLEMENTED_UNVERIFIED_HW`<br>`LLAMA_1B_QUANT_BOARD_RUN_PENDING` |
+| [llama/3_2_1b/w8a16_text.toml](llama/3_2_1b/w8a16_text.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；D=4；TP=8 | 继承 | `IMPLEMENTED_UNVERIFIED_HW`<br>`LLAMA_1B_QUANT_BOARD_RUN_PENDING` |
 
 ## pi05
 
@@ -101,22 +107,15 @@ CPU 列为请求值，`继承` 表示按运行器或环境设置。固定 P/D �
 
 | 配置 | 入口 / 用途 | 精度 / 输入默认 | CPU 请求 | 登记支持 |
 |---|---|---|---|---|
-| [pi05/2cam/h10/fp16.toml](pi05/2cam/h10/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；相机=2；T=32；TP=8 | 8（运行器默认） | 未登记；模型专用模板 |
-| [pi05/2cam/h10/w8a16.toml](pi05/2cam/h10/w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；相机=2；T=32；TP=8 | 8（运行器默认） | 未登记；模型专用模板 |
-| [pi05/2cam/h10/w8a16_action_nvfp4.toml](pi05/2cam/h10/w8a16_action_nvfp4.toml) | [run.py](../run.py)<br>运行模板 | `w8a16_action_nvfp4`；相机=2；T=32 | 8（运行器默认） | 未登记；模型专用模板 |
-| [pi05/2cam/h10/w8a16_prefill_w8a8_action_nvfp4.toml](pi05/2cam/h10/w8a16_prefill_w8a8_action_nvfp4.toml) | [run.py](../run.py)<br>运行模板 | `w8a16_prefill_w8a8_action_nvfp4`；相机=2；T=32 | 8（运行器默认） | 未登记；模型专用模板 |
-| [pi05/2cam/h50/fp16.toml](pi05/2cam/h50/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；相机=2；T=32；TP=8 | 8（运行器默认） | 未登记；模型专用模板 |
-| [pi05/2cam/h50/w8a16.toml](pi05/2cam/h50/w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；相机=2；T=32；TP=8 | 8（运行器默认） | 未登记；模型专用模板 |
-| [pi05/2cam/h50/w8a16_action_nvfp4.toml](pi05/2cam/h50/w8a16_action_nvfp4.toml) | [run.py](../run.py)<br>运行模板 | `w8a16_action_nvfp4`；相机=2；T=32 | 8（运行器默认） | 未登记；模型专用模板 |
-| [pi05/2cam/h50/w8a16_prefill_w8a8_action_nvfp4.toml](pi05/2cam/h50/w8a16_prefill_w8a8_action_nvfp4.toml) | [run.py](../run.py)<br>运行模板 | `w8a16_prefill_w8a8_action_nvfp4`；相机=2；T=32 | 8（运行器默认） | 未登记；模型专用模板 |
-| [pi05/3cam/h10/fp16.toml](pi05/3cam/h10/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；相机=3；T=32；TP=8 | 8（运行器默认） | 未登记；模型专用模板 |
-| [pi05/3cam/h10/w8a16.toml](pi05/3cam/h10/w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；相机=3；T=32；TP=8 | 8（运行器默认） | 未登记；模型专用模板 |
-| [pi05/3cam/h10/w8a16_action_nvfp4.toml](pi05/3cam/h10/w8a16_action_nvfp4.toml) | [run.py](../run.py)<br>运行模板 | `w8a16_action_nvfp4`；相机=3；T=32 | 8（运行器默认） | 未登记；模型专用模板 |
-| [pi05/3cam/h10/w8a16_prefill_w8a8_action_nvfp4.toml](pi05/3cam/h10/w8a16_prefill_w8a8_action_nvfp4.toml) | [run.py](../run.py)<br>运行模板 | `w8a16_prefill_w8a8_action_nvfp4`；相机=3；T=32 | 8（运行器默认） | 未登记；模型专用模板 |
-| [pi05/3cam/h50/fp16.toml](pi05/3cam/h50/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；相机=3；T=32；TP=8 | 8（运行器默认） | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
-| [pi05/3cam/h50/w8a16.toml](pi05/3cam/h50/w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；相机=3；T=32；TP=8 | 8（运行器默认） | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
-| [pi05/3cam/h50/w8a16_action_nvfp4.toml](pi05/3cam/h50/w8a16_action_nvfp4.toml) | [run.py](../run.py)<br>运行模板 | `w8a16_action_nvfp4`；相机=3；T=32 | 8（运行器默认） | 未登记；模型专用模板 |
-| [pi05/3cam/h50/w8a16_prefill_w8a8_action_nvfp4.toml](pi05/3cam/h50/w8a16_prefill_w8a8_action_nvfp4.toml) | [run.py](../run.py)<br>运行模板 | `w8a16_prefill_w8a8_action_nvfp4`；相机=3；T=32 | 8（运行器默认） | 未登记；模型专用模板 |
+| [pi05/h10/fp16.toml](pi05/h10/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；相机=3；T=32；TP=8 | 8（运行器默认） | 未登记；模型专用模板 |
+| [pi05/h10/w8a16.toml](pi05/h10/w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；相机=3；T=32；TP=8 | 8（运行器默认） | 未登记；模型专用模板 |
+| [pi05/h10/w8a16_action_nvfp4.toml](pi05/h10/w8a16_action_nvfp4.toml) | [run.py](../run.py)<br>运行模板 | `w8a16_action_nvfp4`；相机=3；T=32；TP=8 | 8（运行器默认） | 未登记；模型专用模板 |
+| [pi05/h10/w8a16_prefill_w8a8_action_nvfp4.toml](pi05/h10/w8a16_prefill_w8a8_action_nvfp4.toml) | [run.py](../run.py)<br>运行模板 | `w8a16_prefill_w8a8_action_nvfp4`；相机=3；T=32 | 8（运行器默认） | 未登记；模型专用模板 |
+| [pi05/h50/fp16.toml](pi05/h50/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；相机=3；T=32；TP=8 | 8（运行器默认） | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
+| [pi05/h50/w8a16.toml](pi05/h50/w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；相机=3；T=32；TP=8 | 8（运行器默认） | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
+| [pi05/h50/w8a16_action_nvfp4.toml](pi05/h50/w8a16_action_nvfp4.toml) | [run.py](../run.py)<br>运行模板 | `w8a16_action_nvfp4`；相机=3；T=32；TP=8 | 8（运行器默认） | 未登记；模型专用模板 |
+| [pi05/h50/w8a16_prefill_w8a8_action_nvfp4.toml](pi05/h50/w8a16_prefill_w8a8_action_nvfp4.toml) | [run.py](../run.py)<br>运行模板 | `w8a16_prefill_w8a8_action_nvfp4`；相机=3；T=32 | 8（运行器默认） | 未登记；模型专用模板 |
+| [pi05/h50/w8a16_vision_w4a16_action_nvfp4.toml](pi05/h50/w8a16_vision_w4a16_action_nvfp4.toml) | [run.py](../run.py)<br>运行模板 | `w8a16_vision_w4a16_action_nvfp4`；相机=3；T=32；TP=8 | 8（运行器默认） | 未登记；模型专用模板 |
 | [pi05/kuavo/dual_arm/fp16.toml](pi05/kuavo/dual_arm/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；相机=3；原帧=[848, 480]；T=160；动作维=16；TP=8 | 8（运行器默认） | 未登记；模型专用模板 |
 | [pi05/kuavo/dual_arm/t96/fp16.toml](pi05/kuavo/dual_arm/t96/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；相机=3；原帧=[848, 480]；T=96；动作维=16；TP=8 | 8（运行器默认） | 未登记；模型专用模板 |
 | [pi05/kuavo/dual_arm/t96/w8a16.toml](pi05/kuavo/dual_arm/t96/w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；相机=3；原帧=[848, 480]；T=96；动作维=16；TP=8 | 8（运行器默认） | 未登记；模型专用模板 |
@@ -146,14 +145,17 @@ CPU 列为请求值，`继承` 表示按运行器或环境设置。固定 P/D �
 |---|---|---|---|---|
 | [qwen3/text/0_6b/fp16.toml](qwen3/text/0_6b/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`QWEN3_DENSE_FP16_SUPPORTED` |
 | [qwen3/text/0_6b/fp16_instruct.toml](qwen3/text/0_6b/fp16_instruct.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`QWEN3_DENSE_FP16_SUPPORTED` |
+| [qwen3/text/0_6b/nvfp4_text.toml](qwen3/text/0_6b/nvfp4_text.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `nvfp4`；P=128；D=7；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3/text/0_6b/w4a16_text_head_rtn_g32.toml](qwen3/text/0_6b/w4a16_text_head_rtn_g32.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w4a16`；P=128；D=7；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3/text/0_6b/w4a16_text_rtn_g32.toml](qwen3/text/0_6b/w4a16_text_rtn_g32.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w4a16`；P=128；D=7；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3/text/0_6b/w8a16_text_head.toml](qwen3/text/0_6b/w8a16_text_head.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3/text/14b/fp16.toml](qwen3/text/14b/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
+| [qwen3/text/14b/nvfp4_text.toml](qwen3/text/14b/nvfp4_text.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `nvfp4`；P=128；D=7；TP=8 | 继承 | `IMPLEMENTED_UNVERIFIED_HW`<br>`QWEN3_TEXT_NVFP4_BOARD_RUN_PENDING` |
 | [qwen3/text/14b/w4a16_text_head_rtn_g32.toml](qwen3/text/14b/w4a16_text_head_rtn_g32.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w4a16`；P=128；D=7；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3/text/14b/w4a16_text_rtn_g32.toml](qwen3/text/14b/w4a16_text_rtn_g32.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w4a16`；P=128；D=7；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3/text/14b/w8a16_text_head.toml](qwen3/text/14b/w8a16_text_head.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3/text/1_7b/fp16.toml](qwen3/text/1_7b/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`QWEN3_DENSE_FP16_SUPPORTED` |
+| [qwen3/text/1_7b/nvfp4_text.toml](qwen3/text/1_7b/nvfp4_text.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `nvfp4`；P=128；D=7；TP=8 | 继承 | `IMPLEMENTED_UNVERIFIED_HW`<br>`QWEN3_TEXT_NVFP4_BOARD_RUN_PENDING` |
 | [qwen3/text/1_7b/w4a16_text_head_rtn_g32.toml](qwen3/text/1_7b/w4a16_text_head_rtn_g32.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w4a16`；P=128；D=7；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3/text/1_7b/w4a16_text_rtn_g32.toml](qwen3/text/1_7b/w4a16_text_rtn_g32.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w4a16`；P=128；D=7；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3/text/1_7b/w8a16_text_head.toml](qwen3/text/1_7b/w8a16_text_head.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
@@ -162,10 +164,12 @@ CPU 列为请求值，`继承` 表示按运行器或环境设置。固定 P/D �
 | [qwen3/text/32b/w8a16_text_head.toml](qwen3/text/32b/w8a16_text_head.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w8a16`；P=128；D=7；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3/text/4b/fp16.toml](qwen3/text/4b/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`QWEN3_DENSE_FP16_SUPPORTED` |
 | [qwen3/text/4b/fp16_instruct.toml](qwen3/text/4b/fp16_instruct.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`QWEN3_DENSE_FP16_SUPPORTED` |
+| [qwen3/text/4b/nvfp4_text.toml](qwen3/text/4b/nvfp4_text.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `nvfp4`；P=128；D=7；TP=8 | 继承 | `IMPLEMENTED_UNVERIFIED_HW`<br>`QWEN3_TEXT_NVFP4_BOARD_RUN_PENDING` |
 | [qwen3/text/4b/w4a16_text_head_rtn_g32.toml](qwen3/text/4b/w4a16_text_head_rtn_g32.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w4a16`；P=128；D=7；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3/text/4b/w4a16_text_rtn_g32.toml](qwen3/text/4b/w4a16_text_rtn_g32.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w4a16`；P=128；D=7；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3/text/4b/w8a16_text_head.toml](qwen3/text/4b/w8a16_text_head.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3/text/8b/fp16.toml](qwen3/text/8b/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`QWEN3_DENSE_FP16_SUPPORTED` |
+| [qwen3/text/8b/nvfp4_text.toml](qwen3/text/8b/nvfp4_text.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `nvfp4`；P=128；D=7；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3/text/8b/w4a16_text_head_rtn_g32.toml](qwen3/text/8b/w4a16_text_head_rtn_g32.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w4a16`；P=128；D=7；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3/text/8b/w4a16_text_rtn_g32.toml](qwen3/text/8b/w4a16_text_rtn_g32.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w4a16`；P=128；D=7；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3/text/8b/w8a16_text_head.toml](qwen3/text/8b/w8a16_text_head.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
@@ -177,15 +181,18 @@ CPU 列为请求值，`继承` 表示按运行器或环境设置。固定 P/D �
 | 配置 | 入口 / 用途 | 精度 / 输入默认 | CPU 请求 | 登记支持 |
 |---|---|---|---|---|
 | [qwen3_5/text/0_8b/fp16.toml](qwen3_5/text/0_8b/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`QWEN35_DENSE_FP16_TEXT_SUPPORTED` |
+| [qwen3_5/text/0_8b/nvfp4_text.toml](qwen3_5/text/0_8b/nvfp4_text.toml) | [run.py](../run.py)<br>运行模板 | `nvfp4`；D=4；TP=8 | 继承 | `IMPLEMENTED_UNVERIFIED_HW`<br>`QWEN35_TEXT_NVFP4_BOARD_RUN_PENDING` |
 | [qwen3_5/text/0_8b/w4a16_text_rtn_g32.toml](qwen3_5/text/0_8b/w4a16_text_rtn_g32.toml) | [run.py](../run.py)<br>运行模板 | `w4a16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_5/text/0_8b/w8a16_text.toml](qwen3_5/text/0_8b/w8a16_text.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_5/text/27b/fp16.toml](qwen3_5/text/27b/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
+| [qwen3_5/text/27b/nvfp4_text.toml](qwen3_5/text/27b/nvfp4_text.toml) | [run.py](../run.py)<br>运行模板 | `nvfp4`；D=4；TP=8 | 继承 | `IMPLEMENTED_UNVERIFIED_HW`<br>`QWEN35_TEXT_NVFP4_BOARD_RUN_PENDING` |
 | [qwen3_5/text/27b/w4a16_mlp_activation_awq_g128.toml](qwen3_5/text/27b/w4a16_mlp_activation_awq_g128.toml) | [run.py](../run.py)<br>运行模板 | `w4a16`；D=4；TP=8 | 4 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_5/text/27b/w4a16_mlp_rtn_g32.toml](qwen3_5/text/27b/w4a16_mlp_rtn_g32.toml) | [run.py](../run.py)<br>运行模板 | `w4a16`；D=4；TP=8 | 4 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_5/text/27b/w4a16_mlp_rtn_g32_attn_gdn_w8a16.toml](qwen3_5/text/27b/w4a16_mlp_rtn_g32_attn_gdn_w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w4a16`；D=4；TP=8 | 4 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_5/text/27b/w4a16_text_rtn_g32.toml](qwen3_5/text/27b/w4a16_text_rtn_g32.toml) | [run.py](../run.py)<br>运行模板 | `w4a16`；D=4；TP=8 | 8 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_5/text/27b/w8a16_text.toml](qwen3_5/text/27b/w8a16_text.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；D=4；TP=8 | 8 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_5/text/2b/fp16.toml](qwen3_5/text/2b/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`QWEN35_DENSE_FP16_TEXT_SUPPORTED` |
+| [qwen3_5/text/2b/nvfp4_text.toml](qwen3_5/text/2b/nvfp4_text.toml) | [run.py](../run.py)<br>运行模板 | `nvfp4`；D=4；TP=8 | 继承 | `IMPLEMENTED_UNVERIFIED_HW`<br>`QWEN35_TEXT_NVFP4_BOARD_RUN_PENDING` |
 | [qwen3_5/text/2b/w4a16_mlp_awq_g128.toml](qwen3_5/text/2b/w4a16_mlp_awq_g128.toml) | [run.py](../run.py)<br>运行模板 | `w4a16`；D=4；TP=8 | 4 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_5/text/2b/w4a16_mlp_rtn_g32.toml](qwen3_5/text/2b/w4a16_mlp_rtn_g32.toml) | [run.py](../run.py)<br>运行模板 | `w4a16`；D=4；TP=8 | 4 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_5/text/2b/w4a16_mlp_rtn_g32_attn_gdn_w8a16.toml](qwen3_5/text/2b/w4a16_mlp_rtn_g32_attn_gdn_w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w4a16`；D=4；TP=8 | 4 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
@@ -194,11 +201,14 @@ CPU 列为请求值，`继承` 表示按运行器或环境设置。固定 P/D �
 | [qwen3_5/text/35b_a3b/fp8_e4m3_experts_attn_gdn.toml](qwen3_5/text/35b_a3b/fp8_e4m3_experts_attn_gdn.toml) | [run.py](../run.py)<br>运行模板 | `mixed-e4m3`；D=31；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_5/text/35b_a3b/w4a16_experts_gptq_g128.toml](qwen3_5/text/35b_a3b/w4a16_experts_gptq_g128.toml) | [run.py](../run.py)<br>运行模板 | `w4a16`；D=31；TP=8 | 24 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_5/text/35b_a3b/w4a16_experts_rtn_g128.toml](qwen3_5/text/35b_a3b/w4a16_experts_rtn_g128.toml) | [run.py](../run.py)<br>运行模板 | `w4a16`；D=31；TP=8 | 24 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
+| [qwen3_5/text/35b_a3b/w8a16_experts.toml](qwen3_5/text/35b_a3b/w8a16_experts.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；D=31；TP=8 | 24 | `IMPLEMENTED_UNVERIFIED_HW`<br>`QWEN35_MOE_INT8_BOARD_RUN_PENDING` |
 | [qwen3_5/text/4b/fp16.toml](qwen3_5/text/4b/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`QWEN35_DENSE_FP16_TEXT_SUPPORTED` |
+| [qwen3_5/text/4b/nvfp4_text.toml](qwen3_5/text/4b/nvfp4_text.toml) | [run.py](../run.py)<br>运行模板 | `nvfp4`；D=4；TP=8 | 继承 | `IMPLEMENTED_UNVERIFIED_HW`<br>`QWEN35_TEXT_NVFP4_BOARD_RUN_PENDING` |
 | [qwen3_5/text/4b/w4a16_mlp_awq_g128.toml](qwen3_5/text/4b/w4a16_mlp_awq_g128.toml) | [run.py](../run.py)<br>运行模板 | `w4a16`；D=4；TP=8 | 4 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_5/text/4b/w4a16_text_rtn_g32.toml](qwen3_5/text/4b/w4a16_text_rtn_g32.toml) | [run.py](../run.py)<br>运行模板 | `w4a16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_5/text/4b/w8a16_text.toml](qwen3_5/text/4b/w8a16_text.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_5/text/9b/fp16.toml](qwen3_5/text/9b/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`QWEN35_DENSE_FP16_TEXT_SUPPORTED` |
+| [qwen3_5/text/9b/nvfp4_text.toml](qwen3_5/text/9b/nvfp4_text.toml) | [run.py](../run.py)<br>运行模板 | `nvfp4`；D=4；TP=8 | 继承 | `IMPLEMENTED_UNVERIFIED_HW`<br>`QWEN35_TEXT_NVFP4_BOARD_RUN_PENDING` |
 | [qwen3_5/text/9b/w4a16_mlp_awq_g128.toml](qwen3_5/text/9b/w4a16_mlp_awq_g128.toml) | [run.py](../run.py)<br>运行模板 | `w4a16`；D=4；TP=8 | 4 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_5/text/9b/w4a16_text_rtn_g32.toml](qwen3_5/text/9b/w4a16_text_rtn_g32.toml) | [run.py](../run.py)<br>运行模板 | `w4a16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_5/text/9b/w8a16_text.toml](qwen3_5/text/9b/w8a16_text.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
@@ -214,6 +224,7 @@ CPU 列为请求值，`继承` 表示按运行器或环境设置。固定 P/D �
 | [qwen3_5/vl/35b_a3b/fp8_e4m3_experts_attn_gdn.toml](qwen3_5/vl/35b_a3b/fp8_e4m3_experts_attn_gdn.toml) | [run.py](../run.py)<br>运行模板 | `mixed-e4m3`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_5/vl/35b_a3b/w4a16_experts_gptq_g128.toml](qwen3_5/vl/35b_a3b/w4a16_experts_gptq_g128.toml) | [run.py](../run.py)<br>运行模板 | `w4a16`；D=4；TP=8 | 24 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_5/vl/35b_a3b/w4a16_experts_rtn_g128.toml](qwen3_5/vl/35b_a3b/w4a16_experts_rtn_g128.toml) | [run.py](../run.py)<br>运行模板 | `w4a16`；D=4；TP=8 | 24 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
+| [qwen3_5/vl/35b_a3b/w8a16_experts.toml](qwen3_5/vl/35b_a3b/w8a16_experts.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；D=4；TP=8 | 24 | `IMPLEMENTED_UNVERIFIED_HW`<br>`QWEN35_MOE_INT8_BOARD_RUN_PENDING` |
 | [qwen3_5/vl/4b/fp16.toml](qwen3_5/vl/4b/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_5/vl/4b/w4a16_text_rtn_g32.toml](qwen3_5/vl/4b/w4a16_text_rtn_g32.toml) | [run.py](../run.py)<br>运行模板 | `w4a16`；D=32；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_5/vl/4b/w8a16_text.toml](qwen3_5/vl/4b/w8a16_text.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；D=32；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
@@ -242,7 +253,7 @@ CPU 列为请求值，`继承` 表示按运行器或环境设置。固定 P/D �
 | 配置 | 入口 / 用途 | 精度 / 输入默认 | CPU 请求 | 登记支持 |
 |---|---|---|---|---|
 | [qwen3_tts/0_6b/fp16.toml](qwen3_tts/0_6b/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；TP=8 | 16 | 未登记；模型专用模板 |
-| [qwen3_tts/0_6b/fp16_cpu_codec.toml](qwen3_tts/0_6b/fp16_cpu_codec.toml) | [run.py](../run.py)<br>运行模板 | `—`；TP=8 | 16 | 未登记；模型专用模板 |
+| [qwen3_tts/0_6b/fp16_cpu_codec.toml](qwen3_tts/0_6b/fp16_cpu_codec.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；TP=8 | 16 | 未登记；模型专用模板 |
 | [qwen3_tts/0_6b/nvfp4.toml](qwen3_tts/0_6b/nvfp4.toml) | [run.py](../run.py)<br>运行模板 | `nvfp4`；TP=8 | 16 | 未登记；模型专用模板 |
 | [qwen3_tts/0_6b/w4a16_g32.toml](qwen3_tts/0_6b/w4a16_g32.toml) | [run.py](../run.py)<br>运行模板 | `w4a16_g32`；TP=8 | 16 | 未登记；模型专用模板 |
 | [qwen3_tts/0_6b/w8a16.toml](qwen3_tts/0_6b/w8a16.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；TP=8 | 16 | 未登记；模型专用模板 |
@@ -258,6 +269,7 @@ CPU 列为请求值，`继承` 表示按运行器或环境设置。固定 P/D �
 | 配置 | 入口 / 用途 | 精度 / 输入默认 | CPU 请求 | 登记支持 |
 |---|---|---|---|---|
 | [qwen3_vl/text/2b/fp16.toml](qwen3_vl/text/2b/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
+| [qwen3_vl/text/2b/nvfp4_text.toml](qwen3_vl/text/2b/nvfp4_text.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `nvfp4`；P=512；D=31；TP=8 | 继承 | `IMPLEMENTED_UNVERIFIED_HW`<br>`QWEN3_VL_TEXT_NVFP4_BOARD_RUN_PENDING` |
 | [qwen3_vl/text/2b/w4a16_text_awq_g32.toml](qwen3_vl/text/2b/w4a16_text_awq_g32.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w4a16`；P=512；D=31；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_vl/text/2b/w4a16_text_awq_head_rtn_g32_vision_w8a16.toml](qwen3_vl/text/2b/w4a16_text_awq_head_rtn_g32_vision_w8a16.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w4a16`；P=512；D=31；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_vl/text/2b/w8a16_text.toml](qwen3_vl/text/2b/w8a16_text.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w8a16`；P=512；D=31；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
@@ -265,29 +277,37 @@ CPU 列为请求值，`继承` 表示按运行器或环境设置。固定 P/D �
 | [qwen3_vl/text/32b/w4a16_text_head_rtn_g32_vision_w8a16.toml](qwen3_vl/text/32b/w4a16_text_head_rtn_g32_vision_w8a16.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w4a16`；P=512；D=31；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_vl/text/32b/w8a16_text_head_vision.toml](qwen3_vl/text/32b/w8a16_text_head_vision.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w8a16`；P=512；D=31；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_vl/text/4b/fp16.toml](qwen3_vl/text/4b/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
+| [qwen3_vl/text/4b/nvfp4_text.toml](qwen3_vl/text/4b/nvfp4_text.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `nvfp4`；P=512；D=31；TP=8 | 继承 | `IMPLEMENTED_UNVERIFIED_HW`<br>`QWEN3_VL_TEXT_NVFP4_BOARD_RUN_PENDING` |
 | [qwen3_vl/text/4b/w4a16_text_awq_g32.toml](qwen3_vl/text/4b/w4a16_text_awq_g32.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w4a16`；P=512；D=31；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_vl/text/4b/w4a16_text_awq_head_rtn_g32_vision_w8a16.toml](qwen3_vl/text/4b/w4a16_text_awq_head_rtn_g32_vision_w8a16.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w4a16`；P=512；D=31；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_vl/text/4b/w8a16_text_head_vision.toml](qwen3_vl/text/4b/w8a16_text_head_vision.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w8a16`；P=512；D=31；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_vl/text/8b/fp16.toml](qwen3_vl/text/8b/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
+| [qwen3_vl/text/8b/nvfp4_text.toml](qwen3_vl/text/8b/nvfp4_text.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `nvfp4`；P=512；D=31；TP=8 | 继承 | `IMPLEMENTED_UNVERIFIED_HW`<br>`QWEN3_VL_TEXT_NVFP4_BOARD_RUN_PENDING` |
 | [qwen3_vl/text/8b/w4a16_text_awq_head_rtn_g32_vision_w8a16.toml](qwen3_vl/text/8b/w4a16_text_awq_head_rtn_g32_vision_w8a16.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w4a16`；P=512；D=31；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_vl/text/8b/w8a16_text_head_vision.toml](qwen3_vl/text/8b/w8a16_text_head_vision.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w8a16`；P=512；D=31；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_vl/vision/2b/fp16.toml](qwen3_vl/vision/2b/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_vl/vision/4b/fp16.toml](qwen3_vl/vision/4b/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_vl/vision/8b/fp16.toml](qwen3_vl/vision/8b/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_vl/vl/2b/fp16.toml](qwen3_vl/vl/2b/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
+| [qwen3_vl/vl/2b/nvfp4_text_vision.toml](qwen3_vl/vl/2b/nvfp4_text_vision.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `nvfp4`；P=430；D=31；TP=8 | 继承 | `IMPLEMENTED_UNVERIFIED_HW`<br>`QWEN3_VL_VISION_NVFP4_BOARD_RUN_PENDING` |
 | [qwen3_vl/vl/2b/w4a16_text_awq_g32.toml](qwen3_vl/vl/2b/w4a16_text_awq_g32.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w4a16`；P=430；D=31；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_vl/vl/2b/w4a16_text_awq_head_rtn_g32_vision_w8a16.toml](qwen3_vl/vl/2b/w4a16_text_awq_head_rtn_g32_vision_w8a16.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w4a16`；P=430；D=31；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
+| [qwen3_vl/vl/2b/w4a16_text_awq_head_vision_rtn_g32.toml](qwen3_vl/vl/2b/w4a16_text_awq_head_vision_rtn_g32.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w4a16`；P=430；D=31；TP=8 | 继承 | `IMPLEMENTED_UNVERIFIED_HW`<br>`QWEN3_VL_VISION_W4_BOARD_RUN_PENDING` |
 | [qwen3_vl/vl/2b/w8a16_text.toml](qwen3_vl/vl/2b/w8a16_text.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w8a16`；P=430；D=31；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_vl/vl/2b/w8a16_text_head_vision.toml](qwen3_vl/vl/2b/w8a16_text_head_vision.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w8a16`；P=430；D=31；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_vl/vl/32b/w4a16_text_head_rtn_g32_vision_w8a16.toml](qwen3_vl/vl/32b/w4a16_text_head_rtn_g32_vision_w8a16.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w4a16`；P=430；D=31；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
+| [qwen3_vl/vl/32b/w4a16_text_head_vision_rtn_g32.toml](qwen3_vl/vl/32b/w4a16_text_head_vision_rtn_g32.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w4a16`；P=430；D=31；TP=8 | 继承 | `IMPLEMENTED_UNVERIFIED_HW`<br>`QWEN3_VL_VISION_W4_BOARD_RUN_PENDING` |
 | [qwen3_vl/vl/32b/w8a16_text.toml](qwen3_vl/vl/32b/w8a16_text.toml) | [run.py](../run.py)<br>运行模板 | `w8a16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_vl/vl/32b/w8a16_text_head_vision.toml](qwen3_vl/vl/32b/w8a16_text_head_vision.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w8a16`；P=430；D=31；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_vl/vl/4b/fp16.toml](qwen3_vl/vl/4b/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
+| [qwen3_vl/vl/4b/nvfp4_text_vision.toml](qwen3_vl/vl/4b/nvfp4_text_vision.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `nvfp4`；P=430；D=31；TP=8 | 继承 | `IMPLEMENTED_UNVERIFIED_HW`<br>`QWEN3_VL_VISION_NVFP4_BOARD_RUN_PENDING` |
 | [qwen3_vl/vl/4b/w4a16_text_awq_g32.toml](qwen3_vl/vl/4b/w4a16_text_awq_g32.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w4a16`；P=430；D=31；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_vl/vl/4b/w4a16_text_awq_head_rtn_g32_vision_w8a16.toml](qwen3_vl/vl/4b/w4a16_text_awq_head_rtn_g32_vision_w8a16.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w4a16`；P=430；D=31；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
+| [qwen3_vl/vl/4b/w4a16_text_awq_head_vision_rtn_g32.toml](qwen3_vl/vl/4b/w4a16_text_awq_head_vision_rtn_g32.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w4a16`；P=430；D=31；TP=8 | 继承 | `IMPLEMENTED_UNVERIFIED_HW`<br>`QWEN3_VL_VISION_W4_BOARD_RUN_PENDING` |
 | [qwen3_vl/vl/4b/w8a16_text_head_vision.toml](qwen3_vl/vl/4b/w8a16_text_head_vision.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w8a16`；P=430；D=31；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_vl/vl/8b/fp16.toml](qwen3_vl/vl/8b/fp16.toml) | [run.py](../run.py)<br>运行模板 | `fp16`；D=4；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [qwen3_vl/vl/8b/w4a16_text_awq_head_rtn_g32_vision_w8a16.toml](qwen3_vl/vl/8b/w4a16_text_awq_head_rtn_g32_vision_w8a16.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w4a16`；P=430；D=31；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
+| [qwen3_vl/vl/8b/w4a16_text_awq_head_vision_rtn_g32.toml](qwen3_vl/vl/8b/w4a16_text_awq_head_vision_rtn_g32.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w4a16`；P=430；D=31；TP=8 | 继承 | `IMPLEMENTED_UNVERIFIED_HW`<br>`QWEN3_VL_VISION_W4_BOARD_RUN_PENDING` |
 | [qwen3_vl/vl/8b/w8a16_text_head_vision.toml](qwen3_vl/vl/8b/w8a16_text_head_vision.toml) | [run.py](../run.py)<br>固定 P/D 复现 | `w8a16`；P=430；D=31；TP=8 | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 
 ## rhinovla
@@ -340,4 +360,4 @@ CPU 列为请求值，`继承` 表示按运行器或环境设置。固定 P/D �
 | [wall_oss/legacy/w4a16_g32.toml](wall_oss/legacy/w4a16_g32.toml) | [run.py](../run.py)<br>历史复现 | `w4a16-pgrp` | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 | [wall_oss/legacy/w8a16.toml](wall_oss/legacy/w8a16.toml) | [run.py](../run.py)<br>历史复现 | `w8a16` | 继承 | `SUPPORTED`<br>`BOARD_MEASURED_CURRENT_CONFIG_SUPPORTED` |
 
-合计 **215** 份配置。
+合计 **235** 份配置。

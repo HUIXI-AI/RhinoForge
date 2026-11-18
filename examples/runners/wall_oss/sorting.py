@@ -20,8 +20,16 @@ _LOG = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parents[3]
 _CPU = vars(_cpu_helpers)
-PRECISIONS = {"fp16": "fp16", "w8a16": "w8", "w8a16_action_w4a16": "action-w4"}
+# Vision / Prefill / Action specs -> the sorting engine mode that implements them.
+ROUTE_PROBES = (("vision",), ("prefill",), ("action",))
+ROUTES = {("fp16",) * 3: "fp16", ("w8a16",) * 3: "w8", ("w8a16", "w8a16", "w4a16-g32"): "action-w4"}
 CAMERAS = ("face_view", "left_wrist_view", "right_wrist_view")
+
+def precision_mode(precision) -> str:
+    """The engine mode that realizes a registered sorting recipe."""
+    from examples.common.config import owner_route
+    return owner_route("Wall-OSS sorting", "wall_oss_sorting", ROUTE_PROBES, ROUTES, selector=precision)
+
 
 def validation_runner():
     from importlib import import_module
@@ -34,8 +42,9 @@ def validate_example_config(config: dict) -> None:
         "input": {"fp16_checkpoint", "w8_checkpoint", "action_w4_checkpoint", "batch", "inference_delay"},
         "run": {"warmup", "runs", "output_dir", "cpu_threads", "torch_num_threads"},
     }
-    if not set(allowed) <= set(config) or set(config) - (set(allowed) | {"cpu", "logging"}):
-        raise ValueError("sorting examples require [wall_oss_sorting], [input], [run], optional [cpu]/[logging]")
+    if not set(allowed) <= set(config) or set(config) - (set(allowed) | {"cpu", "logging", "rpu_execution"}):
+        raise ValueError("sorting examples require [wall_oss_sorting], [input], [run], "
+                         "optional [cpu]/[logging]/[rpu_execution]")
     from examples.common.config import validate_logging_config
     validate_logging_config(config)
     for name, keys in allowed.items():
@@ -43,13 +52,15 @@ def validate_example_config(config: dict) -> None:
             raise ValueError(f"[{name}] contains unsupported keys or is not a table")
     _CPU["resolve_cpu_threads"](config)
     profile, inputs, run = (config[key] for key in allowed)
-    precision = profile.get("precision")
-    if not isinstance(precision, str) or precision not in PRECISIONS:
-        raise ValueError(f"precision must be one of {tuple(PRECISIONS)}")
+    mode = precision_mode(profile.get("precision"))
+    cores = num_cores(config)
+    if mode == "action-w4" and cores != 8:
+        raise ValueError("w8a16_action_w4a16 has an eight-core Action W4 owner only; "
+                         f"model.num_cores={cores} accepts fp16 or w8a16")
     required = {"fp16_checkpoint", "batch"}
-    if precision != "fp16":
+    if mode != "fp16":
         required.add("w8_checkpoint")
-    if precision == "w8a16_action_w4a16":
+    if mode == "action-w4":
         required.add("action_w4_checkpoint")
     for key in required:
         if not isinstance(inputs.get(key), str) or not inputs[key].strip():
@@ -67,8 +78,22 @@ def validate_example_config(config: dict) -> None:
         raise ValueError("[run].output_dir must be a nonempty path")
 
 
-def cold_environment(precision: str) -> tuple[dict, dict]:
-    env = validation_runner().exact_environment(ROOT, PRECISIONS[precision])
+def num_cores(config: dict) -> int:
+    """The only [rpu_execution] field: model.num_cores 4, 6 or 8 (default 8)."""
+    execution = config.get("rpu_execution", {})
+    if not isinstance(execution, dict) or set(execution) - {"model"}:
+        raise ValueError("[rpu_execution] accepts only model.num_cores for sorting")
+    model = execution.get("model", {})
+    if not isinstance(model, dict) or set(model) - {"num_cores"}:
+        raise ValueError("[rpu_execution.model] accepts only num_cores for sorting")
+    cores = model.get("num_cores", 8)
+    if type(cores) is not int or cores not in (4, 6, 8):
+        raise ValueError("rpu_execution.model.num_cores must be 4, 6 or 8")
+    return cores
+
+
+def cold_environment(precision: str, cores: int = 8) -> tuple[dict, dict]:
+    env = validation_runner().exact_environment(ROOT, precision_mode(precision), cores)
     # A wheel owns its native extension. Only override it for an explicitly
     # selected library or a build actually present in this source checkout.
     checkout_native = Path(env.pop("RPU_BACKEND_SO"))
@@ -142,7 +167,7 @@ def observation(batch: dict, delay: int) -> dict:
     }
 
 
-def checkpoint_arguments(inputs: dict, precision: str) -> tuple[str, dict]:
+def checkpoint_arguments(inputs: dict, precision: str, cores: int = 8) -> tuple[str, dict]:
     fp16 = Path(inputs["fp16_checkpoint"]).expanduser().resolve(strict=True)
     from rpu_backend.adapters.wall_oss.checkpoint_validation import (
         _load_json, _quant_metadata,
@@ -150,9 +175,13 @@ def checkpoint_arguments(inputs: dict, precision: str) -> tuple[str, dict]:
 
     if _quant_metadata(fp16, _load_json(fp16 / "config.json")) is not None:
         raise ValueError("fp16_checkpoint must be the unquantized WRC v728 source")
-    w8 = Path(inputs["w8_checkpoint"]).expanduser().resolve(strict=True) if precision != "fp16" else None
-    w4 = (Path(inputs["action_w4_checkpoint"]).expanduser().resolve(strict=True)
-          if precision == "w8a16_action_w4a16" else None)
+    mode = precision_mode(precision)
+    w8 = Path(inputs["w8_checkpoint"]).expanduser().resolve(strict=True) if mode != "fp16" else None
+    w4 = Path(inputs["action_w4_checkpoint"]).expanduser().resolve(strict=True) if mode == "action-w4" else None
+    from examples.common.config import check_checkpoint_recipe
+    for slot, path in (("w8_checkpoint", w8), ("action_w4_checkpoint", w4)):
+        if path is not None:
+            check_checkpoint_recipe("wall_oss_sorting", path, slot=slot, selector=precision)
     if w8 is not None:
         validate_w8_nvfp4_checkpoint_pair(w8, fp16)
     if w4 is not None:
@@ -162,8 +191,8 @@ def checkpoint_arguments(inputs: dict, precision: str) -> tuple[str, dict]:
         "action_w4a16_ckpt_dir": str(w4) if w4 else None,
         "rtc": True, "dataset_key": "ex_normal", "camera_names": CAMERAS,
         "delta_action": True, "state_bins": 512, "max_seq_len": 2048,
-        # Wall's builders are TP8; unlike Pi0.5 they do not accept model.num_cores.
-        "rpu_execution": {},
+        # Four/six cores select the ordinary residual-scaled RTC routes.
+        "rpu_execution": {"model": {"num_cores": cores}} if cores != 8 else {},
     }
 
 
@@ -173,9 +202,10 @@ _RESULTS = vars(_result_helpers)
 def run_example_config(config: dict) -> int:
     validate_example_config(config)
     precision = config["wall_oss_sorting"]["precision"]
+    cores = num_cores(config)
     inputs, run = config["input"], config["run"]
     output_dir = prepare_output_directory(run["output_dir"])
-    env, libraries = cold_environment(precision)
+    env, libraries = cold_environment(precision, cores)
     bind_cold_environment(env)
     # Use the activated environment's wheel/editable installation. Validate its
     # identity below without redirecting a wheel to the source snapshot.
@@ -193,8 +223,9 @@ def run_example_config(config: dict) -> int:
         if path != libraries[key]["path"] or actual.get("oplib_payloads", {}).get(path, {}).get("sha256") != libraries[key]["sha256"]:
             raise RuntimeError(f"loaded {role} library does not match the sorting profile")
     batch_path = Path(inputs["batch"]).expanduser().resolve(strict=True)
-    common = observation(torch.load(batch_path, map_location="cpu", weights_only=True), inputs.get("inference_delay", 0))
-    checkpoint, kwargs = checkpoint_arguments(inputs, precision)
+    raw_batch = torch.load(batch_path, map_location="cpu", weights_only=True)
+    common = observation(raw_batch, inputs.get("inference_delay", 0))
+    checkpoint, kwargs = checkpoint_arguments(inputs, precision, cores)
     torch.rpu.set_caching_allocator(True)
     torch.rpu.set_ddr_flush(False)
     torch.rpu.set_ddr_flush_force(True)
@@ -222,7 +253,7 @@ def run_example_config(config: dict) -> int:
             if not GraphRuntimePolicy.from_environment(graph_arena_count=15).prepare_arenas():
                 raise RuntimeError("sorting could not prepare fifteen Graph arenas")
             vla = build_wall_oss_vla(checkpoint, **kwargs)
-            if precision == "w8a16_action_w4a16" and not (
+            if precision_mode(precision) == "action-w4" and not (
                 vla.action.llm is vla.llm and not vla.action._owns_llm
                 and vla.action._precision_mode == 2 and vla._runtime_complete()
             ):
@@ -268,7 +299,7 @@ def run_example_config(config: dict) -> int:
             report.update({
                 "model": "wall_oss_parcel_sorting_wrc_v728", "precision": precision,
                 "evaluation_only": True, "formal_certification": False,
-                "num_cores": 8, "camera_names": CAMERAS,
+                "num_cores": cores, "camera_names": CAMERAS,
                 "num_steps": 6, "action_horizon": 20, "inference_delay": common["inference_delay"],
                 "real_prefix_len": int(output["real_prefix_len"]), "prefix_len": int(output["prefix_len"]),
                 "checkpoint": checkpoint, "checkpoint_arguments": kwargs, "batch": str(batch_path),

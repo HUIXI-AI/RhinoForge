@@ -136,7 +136,7 @@ struct Qwen3_5MoeModel : FusedModelBase {
     int routing_tp() const { return num_cores(); }
     __ROUTED_HELPER__
     int shared_expert_tp() const { return num_cores(); }
-    int lm_head_tp() const { return num_cores() == 6 ? 4 : num_cores(); }
+    int lm_head_tp() const { return num_cores(); }
     void set_execution_cores(int64_t);
     std::vector<int64_t> execution_topology() const;
     std::vector<int64_t> execution_topology_v2() const;
@@ -177,15 +177,15 @@ int run_probe() {
         for(auto& weight:model.moe_layer_weights_)weight.routed_weight_mode=mode;
         const int routed=owner==6 && mode==6?4:owner;
         const auto topology=model.execution_topology();
-        assert((topology == std::vector<int64_t>{owner,narrow,owner,narrow,8}));
+        assert((topology == std::vector<int64_t>{owner,narrow,owner,owner,8}));
         const auto topology_v2=model.execution_topology_v2();
         assert((topology_v2 == std::vector<int64_t>{
-            2,owner,narrow,narrow,narrow,owner,routed,owner,narrow,8}));
+            2,owner,narrow,narrow,narrow,owner,routed,owner,owner,8}));
         const auto cold=model.cold_topology_arguments();
-        assert(model.minimum_eager_spm_bytes() == (owner == 6 ? 129280 : 0));
+        assert(model.minimum_eager_spm_bytes() == (owner == 6 ? 87808 : 0));
         if (owner == 6) {
             auto expected = topology_v2;
-            expected.push_back(129280);
+            expected.push_back(87808);
             assert(cold == expected);
             assert(topology_v2.size() == 10);
         }
@@ -230,7 +230,7 @@ def test_exact_install_binds_logical_and_physical_dimensions_to_cold_owner():
     assert "num_cores() == 6 ? 576 : shared_intermediate" in admission
     assert "tensor_parallel == num_cores()" in admission
     assert "routed_weight_mode == 5" in admission
-    assert "(routed_weight_mode == 5 || routed_uint4)" in admission
+    assert "(routed_weight_mode == 5 || routed_uint4 || routed_int8)" in admission
     assert re.search(
         r"\{num_experts, hidden_size \* physical_routed_intermediate\s*/\s*"
         r"\(routed_uint4 \? 2 : 1\)\}", install

@@ -63,6 +63,7 @@ struct SdpaTiling { int tile_m_v16=0, tile_m=0, tile_k_v16=0, tile_k=0, tile_n_v
 void check_linear_w4a16_operands(const Tensor&, const Tensor&, const Tensor&, c10::optional<Tensor>, int = 8, int64_t = 0) {
     throw std::runtime_error("FP16 admission fixture must not enter W4");
 }
+enum class GeluMode { NONE, TANH, ERF };
 enum class RpuRmsNormSpmRoute { BASE, V16, V32, QWEN3VL_V64 };
 enum class KernelId { SDPA_FLASH_ATTN_SPM_16B, SDPA_FLASH_ATTN_SPM, HYVLA_EXPERT_SDPA_M16_S51, HYVLA_EXPERT_SDPA_K128_S51, LINGBOT2_SDPA_T51_K275_TAIL };
 int64_t CeilDiv(int64_t n, int64_t d) { assert(d>0); return (n+d-1)/d; }
@@ -117,7 +118,7 @@ int main() {
     rejects([] { validate_parallel_linear_grid(65536,128,1,16); });
     rejects([] { validate_parallel_linear_grid(128,128,0,16); });
     auto linear = [](at::Tensor x, at::Tensor w, at::Tensor y) {
-        rpu_launch_linear_ddr_kernel(x,w,y,{},false,1,nullptr,0,nullptr,8,{},{},nullptr);
+        rpu_launch_linear_ddr_kernel(x,w,y,{},false,1,nullptr,0,nullptr,8,{},{},nullptr,GeluMode::NONE);
     };
     linear({{16,1024}},{{2048,1024}},{{16,2048}});
     rejects([&] { linear({{16,1024}},{{2048,1024}},{{16,1024}}); });

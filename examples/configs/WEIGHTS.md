@@ -24,7 +24,9 @@ hf download Qwen/Qwen3-0.6B --revision c1899de289a04d12100db370d81485cdf75e47ca 
 modelscope download --model QuantTrio/Qwen3.5-2B-AWQ --local_dir "$RPU_MODEL_CACHE/Qwen3.5-2B-AWQ"
 ```
 
-转换命令在安装了本仓库的环境中运行（`python -m pip install -e . --no-build-isolation`），只用 CPU，不需要 RPU；输出目录须不存在。按命令从上游重新生成的是同一配方。资产库中 Qwen3 W8（14B 为直接交付，无转换记录）、Qwen3-VL-32B W8、Wall-OSS W8 与 W4 G32 副本所记录的转换器，与当前仓库的文件完全相同；其余转换器在生成后有修改或没有记录，重新生成的文件字节可能与现有副本不同。TOML 文件名不决定权重目录，设置登记名也不会自动下载。
+资产库没有记录 QuantTrio 仓库的 revision，上面的 ModelScope 命令下载的是当前版本；上游更新后内容可能与板测用的副本不同，下载后按资产库的文件清单哈希核对。
+
+转换命令在安装了本仓库的环境中运行（`python -m pip install -e . --no-build-isolation`），只用 CPU，不需要 RPU；输出目录须不存在。按命令从上游重新生成的是同一配方。资产库中 Qwen3 W8（14B 为直接交付，无转换记录）、Qwen3-VL-32B W8、Wall-OSS W8 与 W4 G32 副本所记录的转换器，与本仓库加入[配方记录](#recipe-record)之前的文件完全相同，此后这几个转换器只在输出目录多写一个记录文件，权重和其余文件不变；其余转换器在生成后有修改或没有记录，重新生成的文件字节可能与现有副本不同。TOML 文件名不决定权重目录，设置登记名也不会自动下载。
 
 <a id="quantization"></a>
 <a id="sources"></a>
@@ -40,6 +42,24 @@ modelscope download --model QuantTrio/Qwen3.5-2B-AWQ --local_dir "$RPU_MODEL_CAC
 | 配套交付 | 没有公开来源的客户或内部资产（checkpoint、源码、fixture），需向资产提供方获取；格式要求见模型页 |
 
 精度、量化和累加的含义见[量化说明](../../docs/quantization.zh.md)与[累加模式](../../docs/runtime_config.zh.md)。`W8A16` 表示所选投影的权重为 8 位、激活为 16 位；`G32/G128` 是量化分组大小。
+
+<a id="recipe-record"></a>
+
+### 配方记录
+
+转换器把生成的精度配方（模型族和配方名，登记在 [precision_recipes.v1.json](../../manifests/precision_recipes.v1.json)）写进输出目录的 `rpu_precision_recipe.json`。加载时，TOML 指向的权重目录若有这个文件，记录的配方必须是 TOML `precision` 所选配方在该字段要加载的那份产物，否则报错；没有这个文件的权重（包括资产库中现有的副本）照常加载，只做原有的结构检查。几个配方可以共用一份产物：Pi0.5 `w8a16_prefill_w8a8_action_nvfp4` 和 `w8a16_vision_w4a16_action_nvfp4` 加载 `w8a16_action_nvfp4` 的产物；Wall-OSS Base 的 `w8_checkpoint`、RTC 的 `checkpoint` 和分拣的 `w8_checkpoint` 都加载 Wall-OSS `w8a16` 产物，分拣的 `action_w4_checkpoint` 加载 `w4a16_g32` 产物。安装时量化的配方（如 Qwen3 W4A16、NVFP4）指向浮点目录，指向带其他记录的转换产物时报错。参数组合不是登记配方时不写记录，例如 Wall-OSS 默认的全部专家投影 W4 G32、Pi0.5 `--fake-w4`。
+
+下列转换器接受 `--recipe <配方名>`，由配方设定精度参数；它与表中列出的原有精度参数互斥，同时给出时报错。原有参数仍然可用，组合恰好是登记配方时同样写记录。
+
+| 转换器 | `--recipe` 取值（等价的原有参数） | 不写 `--recipe` 时 |
+|---|---|---|
+| `convert_qwen3` | `w8a16_text_head`：Qwen3 源（`--quant-lm-head`）；`w8a16_text`：Qwen3-VL 源（默认参数） | `--skip-modules` 默认 `lm_head`，输出头保持浮点 |
+| `convert_qwen3_vl` | `w8a16_text_head_vision`（`--bits 8`）；`w4a16_text_head_rtn_g32_vision_w8a16`（浮点源 `--bits 4`）；`w4a16_text_awq_head_rtn_g32_vision_w8a16`（AWQ 源 `--bits 4`） | `--bits` 默认 8 |
+| `convert_qwen3_5` | `fp16`、`w8a16_text`、`w4a16_text_rtn_g32`（`--method fp16`、`--method w8a16`、`--method w4a16_pgrp --group-size 32`）；`w4a16_mlp_rtn_g32`、`w4a16_mlp_rtn_g32_attn_gdn_w8a16`（`--profile w4_mlp_only`、`--profile w4_mlp_w8_attn_gdn`） | `--method` 默认 `w8a16`；`--group-size` 默认 32 |
+| `convert_pi05` | `w8a16`（默认参数）；`w8a16_action_nvfp4`（`--action-w4`）；`w4a16_kvint8`（`--fake-w4 --real-w4`） | VLM 与动作专家投影 W8A16 |
+| `convert_wall_oss` | `w4a16_g32`（G32，expert-0 down 保持 INT8）；`w4a16_channel`（`--group-size 0`） | `--group-size` 默认 32，expert-0 down 也是 W4，不写记录 |
+
+配方还须与源目录相符：Qwen3 的配方用在 Qwen3-VL 源上，或 Qwen3-VL 浮点源的 W4 配方用在 AWQ 包上，都在写任何文件之前报错。Qwen3.5 激活感知 AWQ、MoE RTN、FP8 与 INT8、Wall-OSS W8 各只生成一种配方，没有 `--recipe`，按默认参数运行即写记录（Wall-OSS W8 改了 `--skip-modules` 时不写）。
 
 <a id="cmd-qwen3"></a>
 
@@ -66,7 +86,7 @@ W8A16 配置使用 `*-w8a16-lmhead-int8` 产物（七个 decoder 投影和输出
 
 ```bash
 python -m rpu_backend.quant.convert_qwen3 --src "$RPU_MODEL_CACHE/Qwen3-0.6B" \
-  --dst "$RPU_MODEL_CACHE/qwen3_lmhead_int8_ckpts/qwen3-0.6b-w8a16-lmhead-int8" --quant-lm-head
+  --dst "$RPU_MODEL_CACHE/qwen3_lmhead_int8_ckpts/qwen3-0.6b-w8a16-lmhead-int8" --recipe w8a16_text_head
 # 其他尺寸同理；32B 的输出目录为 $RPU_MODEL_CACHE/Qwen3-32B-w8a16
 ```
 
@@ -81,39 +101,39 @@ python -m rpu_backend.quant.convert_qwen3 --src "$RPU_MODEL_CACHE/Qwen3-0.6B" \
 | `qwen3-vl-8b` | `Qwen3-VL-8B-Instruct` | 下载 | [Qwen/Qwen3-VL-8B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct) `0c351dd01ed87e9c1b53cbc748cba10e6187ff3b`；许可 Apache-2.0 |
 | `qwen3-vl-2b-text-awq-w4a16` | `Qwen3-VL-2B-Instruct-AWQ` | 下载 | [cyankiwi/Qwen3-VL-2B-Instruct-AWQ-4bit](https://huggingface.co/cyankiwi/Qwen3-VL-2B-Instruct-AWQ-4bit) `db40a251bdba88fafabf8f3176e7488ed523ab51`；许可 Apache-2.0（模型卡声明） |
 | `qwen3-vl-4b-text-awq-w4a16` | `Qwen3-VL-4B-Instruct-AWQ` | 下载 | [cyankiwi/Qwen3-VL-4B-Instruct-AWQ-4bit](https://huggingface.co/cyankiwi/Qwen3-VL-4B-Instruct-AWQ-4bit) `b6a6f1cc360d21feee7465f8656b3855d61e767a`；许可 Apache-2.0（模型卡声明） |
-| `qwen3-vl-2b-runtime-w8a16` | `Qwen3-VL-2B-Instruct-runtime-w8` | 转换 | 由同尺寸上游浮点权重生成（`--bits 8`） |
-| `qwen3-vl-4b-runtime-w8a16` | `Qwen3-VL-4B-Instruct-runtime-w8` | 转换 | 由同尺寸上游浮点权重生成（`--bits 8`） |
-| `qwen3-vl-8b-runtime-w8a16` | `Qwen3-VL-8B-Instruct-runtime-w8` | 转换 | 由同尺寸上游浮点权重生成（`--bits 8`） |
-| `qwen3-vl-32b-runtime-w8a16` | `Qwen3-VL-32B-Instruct-runtime-w8` | 转换 | 由同尺寸上游浮点权重生成（`--bits 8`） |
-| `qwen3-vl-2b-runtime-w4a16` | `Qwen3-VL-2B-Instruct-runtime-w4-awq` | 转换 | 由同尺寸 cyankiwi AWQ 包生成（`--bits 4`，保留 AWQ 文本投影） |
-| `qwen3-vl-4b-runtime-w4a16` | `Qwen3-VL-4B-Instruct-runtime-w4-awq` | 转换 | 由同尺寸 cyankiwi AWQ 包生成（`--bits 4`，保留 AWQ 文本投影） |
-| `qwen3-vl-8b-runtime-w4a16` | `Qwen3-VL-8B-Instruct-runtime-w4-awq` | 转换 | 由同尺寸 cyankiwi AWQ 包生成（`--bits 4`，保留 AWQ 文本投影） |
-| `qwen3-vl-32b-runtime-w4a16` | `Qwen3-VL-32B-Instruct-runtime-w4` | 转换 | 由 32B 上游浮点权重生成（`--bits 4`，RTN G32） |
-| `qwen3-vl-2b-text-w8a16` | `Qwen3-VL-2B-Instruct-w8a16-text` | 转换 | 由 `qwen3-vl-2b` 生成，只量化文本投影 |
-| `qwen3-vl-32b-w8a16` | `Qwen3-VL-32B-Instruct-w8a16-full-20260816` | 转换 | 由 32B 上游浮点权重生成 |
+| `qwen3-vl-2b-runtime-w8a16` | `Qwen3-VL-2B-Instruct-runtime-w8` | 转换 | 由同尺寸上游浮点权重生成（`--recipe w8a16_text_head_vision`） |
+| `qwen3-vl-4b-runtime-w8a16` | `Qwen3-VL-4B-Instruct-runtime-w8` | 转换 | 由同尺寸上游浮点权重生成（`--recipe w8a16_text_head_vision`） |
+| `qwen3-vl-8b-runtime-w8a16` | `Qwen3-VL-8B-Instruct-runtime-w8` | 转换 | 由同尺寸上游浮点权重生成（`--recipe w8a16_text_head_vision`） |
+| `qwen3-vl-32b-runtime-w8a16` | `Qwen3-VL-32B-Instruct-runtime-w8` | 转换 | 由同尺寸上游浮点权重生成（`--recipe w8a16_text_head_vision`） |
+| `qwen3-vl-2b-runtime-w4a16` | `Qwen3-VL-2B-Instruct-runtime-w4-awq` | 转换 | 由同尺寸 cyankiwi AWQ 包生成（`--recipe w4a16_text_awq_head_rtn_g32_vision_w8a16`，保留 AWQ 文本投影） |
+| `qwen3-vl-4b-runtime-w4a16` | `Qwen3-VL-4B-Instruct-runtime-w4-awq` | 转换 | 由同尺寸 cyankiwi AWQ 包生成（`--recipe w4a16_text_awq_head_rtn_g32_vision_w8a16`，保留 AWQ 文本投影） |
+| `qwen3-vl-8b-runtime-w4a16` | `Qwen3-VL-8B-Instruct-runtime-w4-awq` | 转换 | 由同尺寸 cyankiwi AWQ 包生成（`--recipe w4a16_text_awq_head_rtn_g32_vision_w8a16`，保留 AWQ 文本投影） |
+| `qwen3-vl-32b-runtime-w4a16` | `Qwen3-VL-32B-Instruct-runtime-w4` | 转换 | 由 32B 上游浮点权重生成（`--recipe w4a16_text_head_rtn_g32_vision_w8a16`，RTN G32） |
+| `qwen3-vl-2b-text-w8a16` | `Qwen3-VL-2B-Instruct-w8a16-text` | 转换 | 由 `qwen3-vl-2b` 生成，只量化文本投影（`--recipe w8a16_text`） |
+| `qwen3-vl-32b-w8a16` | `Qwen3-VL-32B-Instruct-w8a16-full-20260816` | 转换 | 由 32B 上游浮点权重生成（`--recipe w8a16_text`） |
 
 32B 没有直接使用的浮点登记名，先把 [Qwen/Qwen3-VL-32B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-32B-Instruct) `0cfaf48183f594c314753d30a4c4974bc75f3ccb` 下载到任意工作目录（下称 `$QWEN3_VL_32B`）。8B 的 W4 源包为 [cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit](https://huggingface.co/cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit) `87196f7771efdd7022a8d8f094ac6e063bf87f5c`，同样下载到工作目录（下称 `$QWEN3_VL_8B_AWQ`）。
 
 ```bash
 # runtime W8：文本投影与输出头 INT8，Vision 在安装时量化
 python -m rpu_backend.quant.convert_qwen3_vl --src "$RPU_MODEL_CACHE/Qwen3-VL-2B-Instruct" \
-  --dst "$RPU_MODEL_CACHE/Qwen3-VL-2B-Instruct-runtime-w8" --bits 8
+  --dst "$RPU_MODEL_CACHE/Qwen3-VL-2B-Instruct-runtime-w8" --recipe w8a16_text_head_vision
 # runtime W4（2B/4B/8B）：输入为同尺寸 AWQ 包，保留 AWQ 文本投影，输出头 RTN W4
 python -m rpu_backend.quant.convert_qwen3_vl --src "$RPU_MODEL_CACHE/Qwen3-VL-2B-Instruct-AWQ" \
-  --dst "$RPU_MODEL_CACHE/Qwen3-VL-2B-Instruct-runtime-w4-awq" --bits 4
+  --dst "$RPU_MODEL_CACHE/Qwen3-VL-2B-Instruct-runtime-w4-awq" --recipe w4a16_text_awq_head_rtn_g32_vision_w8a16
 python -m rpu_backend.quant.convert_qwen3_vl --src "$QWEN3_VL_8B_AWQ" \
-  --dst "$RPU_MODEL_CACHE/Qwen3-VL-8B-Instruct-runtime-w4-awq" --bits 4
+  --dst "$RPU_MODEL_CACHE/Qwen3-VL-8B-Instruct-runtime-w4-awq" --recipe w4a16_text_awq_head_rtn_g32_vision_w8a16
 # runtime W8/W4（32B）：输入为浮点权重，W4 为 RTN G32
 python -m rpu_backend.quant.convert_qwen3_vl --src "$QWEN3_VL_32B" \
-  --dst "$RPU_MODEL_CACHE/Qwen3-VL-32B-Instruct-runtime-w8" --bits 8
+  --dst "$RPU_MODEL_CACHE/Qwen3-VL-32B-Instruct-runtime-w8" --recipe w8a16_text_head_vision
 python -m rpu_backend.quant.convert_qwen3_vl --src "$QWEN3_VL_32B" \
-  --dst "$RPU_MODEL_CACHE/Qwen3-VL-32B-Instruct-runtime-w4" --bits 4
+  --dst "$RPU_MODEL_CACHE/Qwen3-VL-32B-Instruct-runtime-w4" --recipe w4a16_text_head_rtn_g32_vision_w8a16
 # 2B 仅文本 W8：Vision 和输出头保持浮点
 python -m rpu_backend.quant.convert_qwen3 --src "$RPU_MODEL_CACHE/Qwen3-VL-2B-Instruct" \
-  --dst "$RPU_MODEL_CACHE/Qwen3-VL-2B-Instruct-w8a16-text" --skip-modules model.visual lm_head
+  --dst "$RPU_MODEL_CACHE/Qwen3-VL-2B-Instruct-w8a16-text" --recipe w8a16_text
 # 32B W8：输出头保持浮点
 python -m rpu_backend.quant.convert_qwen3 --src "$QWEN3_VL_32B" \
-  --dst "$RPU_MODEL_CACHE/Qwen3-VL-32B-Instruct-w8a16-full-20260816"
+  --dst "$RPU_MODEL_CACHE/Qwen3-VL-32B-Instruct-w8a16-full-20260816" --recipe w8a16_text
 ```
 
 4B 的 runtime 产物把上面命令中的 `2B` 换成 `4B`；8B 的 runtime W8 用 `$RPU_MODEL_CACHE/Qwen3-VL-8B-Instruct` 作输入。
@@ -133,31 +153,31 @@ python -m rpu_backend.quant.convert_qwen3 --src "$QWEN3_VL_32B" \
 | `qwen3_5-2b-quanttrio-awq-g128` | `Qwen3.5-2B-AWQ` | 下载 | [QuantTrio/Qwen3.5-2B-AWQ](https://modelscope.cn/models/QuantTrio/Qwen3.5-2B-AWQ)（ModelScope）；资产库只记录了文件清单哈希，没有 revision |
 | `qwen3_5-4b-quanttrio-awq-g128` | `Qwen3.5-4B-AWQ` | 下载 | [QuantTrio/Qwen3.5-4B-AWQ](https://modelscope.cn/models/QuantTrio/Qwen3.5-4B-AWQ)（ModelScope）；资产库只记录了文件清单哈希，没有 revision |
 | `qwen3_5-9b-quanttrio-awq-g128` | `Qwen3.5-9B-AWQ` | 下载 | [QuantTrio/Qwen3.5-9B-AWQ](https://modelscope.cn/models/QuantTrio/Qwen3.5-9B-AWQ)（ModelScope）；资产库只记录了文件清单哈希，没有 revision |
-| `qwen3_5-0.8b-w8a16` | `qwen3_5_quant_ckpts/qwen3_5-0.8b-w8a16` | 转换 | `--method w8a16`，由 `qwen3_5-0.8b` 生成 |
-| `qwen3_5-2b-w8a16` | `qwen3_5_quant_ckpts/qwen3_5-2b-w8a16` | 转换 | `--method w8a16`，由 `qwen3_5-2b` 生成 |
-| `qwen3_5-4b-w8a16` | `qwen3_5_quant_ckpts/qwen3_5-4b-w8a16` | 转换 | `--method w8a16`，由 `qwen3_5-4b` 生成 |
-| `qwen3_5-9b-w8a16` | `qwen3_5_quant_ckpts/qwen3_5-9b-w8a16` | 转换 | `--method w8a16`，由 `qwen3_5-9b` 生成 |
-| `qwen3_5-27b-w8a16` | `qwen3_5_quant_ckpts/qwen3_5-27b-w8a16` | 转换 | `--method w8a16`，由 `qwen3_5-27b` 生成 |
-| `qwen3_5-0.8b-w4a16` | `qwen3_5_quant_ckpts/qwen3_5-0.8b-w4a16` | 转换 | `--method w4a16_pgrp --group-size 32`，由 `qwen3_5-0.8b` 生成 |
-| `qwen3_5-2b-w4a16` | `qwen3_5_quant_ckpts/qwen3_5-2b-w4a16` | 转换 | `--method w4a16_pgrp --group-size 32`，由 `qwen3_5-2b` 生成 |
-| `qwen3_5-4b-w4a16` | `qwen3_5_quant_ckpts/qwen3_5-4b-w4a16` | 转换 | `--method w4a16_pgrp --group-size 32`，由 `qwen3_5-4b` 生成 |
-| `qwen3_5-9b-w4a16` | `qwen3_5_quant_ckpts/qwen3_5-9b-w4a16` | 转换 | `--method w4a16_pgrp --group-size 32`，由 `qwen3_5-9b` 生成 |
-| `qwen3_5-27b-w4a16` | `qwen3_5_quant_ckpts/qwen3_5-27b-w4a16` | 转换 | `--method w4a16_pgrp --group-size 32`，由 `qwen3_5-27b` 生成 |
-| `qwen3_5-27b-fp16` | `Qwen3.5-27B-FP16` | 转换 | `--method fp16`，由 `qwen3_5-27b` 导出，减少加载时的转换内存 |
-| `qwen3_5-2b-w4-mlp-only-g32` | `qwen3_5-2b-w4a16-g32-mlp-only` | 转换 | `--profile w4_mlp_only` |
-| `qwen3_5-27b-w4-mlp-only-g32` | `qwen3_5_quant_ckpts/qwen3_5-27b-w4a16-g32-mlp-only` | 转换 | `--profile w4_mlp_only` |
-| `qwen3_5-2b-w4-mlp-w8-attn-gdn-g32` | `qwen3_5-2b-w4a16-g32-mlp-w8-attn-gdn` | 转换 | `--profile w4_mlp_w8_attn_gdn` |
-| `qwen3_5-27b-w4-mlp-w8-attn-gdn-g32` | `qwen3_5_quant_ckpts/qwen3_5-27b-w4a16-g32-mlp-w8-attn-gdn` | 转换 | `--profile w4_mlp_w8_attn_gdn` |
+| `qwen3_5-0.8b-w8a16` | `qwen3_5_quant_ckpts/qwen3_5-0.8b-w8a16` | 转换 | `--recipe w8a16_text`，由 `qwen3_5-0.8b` 生成 |
+| `qwen3_5-2b-w8a16` | `qwen3_5_quant_ckpts/qwen3_5-2b-w8a16` | 转换 | `--recipe w8a16_text`，由 `qwen3_5-2b` 生成 |
+| `qwen3_5-4b-w8a16` | `qwen3_5_quant_ckpts/qwen3_5-4b-w8a16` | 转换 | `--recipe w8a16_text`，由 `qwen3_5-4b` 生成 |
+| `qwen3_5-9b-w8a16` | `qwen3_5_quant_ckpts/qwen3_5-9b-w8a16` | 转换 | `--recipe w8a16_text`，由 `qwen3_5-9b` 生成 |
+| `qwen3_5-27b-w8a16` | `qwen3_5_quant_ckpts/qwen3_5-27b-w8a16` | 转换 | `--recipe w8a16_text`，由 `qwen3_5-27b` 生成 |
+| `qwen3_5-0.8b-w4a16` | `qwen3_5_quant_ckpts/qwen3_5-0.8b-w4a16` | 转换 | `--recipe w4a16_text_rtn_g32`，由 `qwen3_5-0.8b` 生成 |
+| `qwen3_5-2b-w4a16` | `qwen3_5_quant_ckpts/qwen3_5-2b-w4a16` | 转换 | `--recipe w4a16_text_rtn_g32`，由 `qwen3_5-2b` 生成 |
+| `qwen3_5-4b-w4a16` | `qwen3_5_quant_ckpts/qwen3_5-4b-w4a16` | 转换 | `--recipe w4a16_text_rtn_g32`，由 `qwen3_5-4b` 生成 |
+| `qwen3_5-9b-w4a16` | `qwen3_5_quant_ckpts/qwen3_5-9b-w4a16` | 转换 | `--recipe w4a16_text_rtn_g32`，由 `qwen3_5-9b` 生成 |
+| `qwen3_5-27b-w4a16` | `qwen3_5_quant_ckpts/qwen3_5-27b-w4a16` | 转换 | `--recipe w4a16_text_rtn_g32`，由 `qwen3_5-27b` 生成 |
+| `qwen3_5-27b-fp16` | `Qwen3.5-27B-FP16` | 转换 | `--recipe fp16`，由 `qwen3_5-27b` 导出，减少加载时的转换内存 |
+| `qwen3_5-2b-w4-mlp-only-g32` | `qwen3_5-2b-w4a16-g32-mlp-only` | 转换 | `--recipe w4a16_mlp_rtn_g32` |
+| `qwen3_5-27b-w4-mlp-only-g32` | `qwen3_5_quant_ckpts/qwen3_5-27b-w4a16-g32-mlp-only` | 转换 | `--recipe w4a16_mlp_rtn_g32` |
+| `qwen3_5-2b-w4-mlp-w8-attn-gdn-g32` | `qwen3_5-2b-w4a16-g32-mlp-w8-attn-gdn` | 转换 | `--recipe w4a16_mlp_rtn_g32_attn_gdn_w8a16` |
+| `qwen3_5-27b-w4-mlp-w8-attn-gdn-g32` | `qwen3_5_quant_ckpts/qwen3_5-27b-w4a16-g32-mlp-w8-attn-gdn` | 转换 | `--recipe w4a16_mlp_rtn_g32_attn_gdn_w8a16` |
 | `qwen3_5-27b-activation-awq-g128` | `qwen3_5_quant_ckpts/qwen3_5-27b-activation-awq-g128` | 转换 | 激活感知 AWQ G128，需要校准提示词，见下方命令 |
 
 ```bash
 SRC="$RPU_MODEL_CACHE/Qwen3.5-2B"; OUT="$RPU_MODEL_CACHE/qwen3_5_quant_ckpts"
-python -m rpu_backend.quant.convert_qwen3_5 --src "$SRC" --dst "$OUT/qwen3_5-2b-w8a16" --method w8a16
-python -m rpu_backend.quant.convert_qwen3_5 --src "$SRC" --dst "$OUT/qwen3_5-2b-w4a16" --method w4a16_pgrp --group-size 32
-python -m rpu_backend.quant.convert_qwen3_5 --src "$SRC" --dst "$RPU_MODEL_CACHE/qwen3_5-2b-w4a16-g32-mlp-only" --profile w4_mlp_only
-python -m rpu_backend.quant.convert_qwen3_5 --src "$SRC" --dst "$RPU_MODEL_CACHE/qwen3_5-2b-w4a16-g32-mlp-w8-attn-gdn" --profile w4_mlp_w8_attn_gdn
+python -m rpu_backend.quant.convert_qwen3_5 --src "$SRC" --dst "$OUT/qwen3_5-2b-w8a16" --recipe w8a16_text
+python -m rpu_backend.quant.convert_qwen3_5 --src "$SRC" --dst "$OUT/qwen3_5-2b-w4a16" --recipe w4a16_text_rtn_g32
+python -m rpu_backend.quant.convert_qwen3_5 --src "$SRC" --dst "$RPU_MODEL_CACHE/qwen3_5-2b-w4a16-g32-mlp-only" --recipe w4a16_mlp_rtn_g32
+python -m rpu_backend.quant.convert_qwen3_5 --src "$SRC" --dst "$RPU_MODEL_CACHE/qwen3_5-2b-w4a16-g32-mlp-w8-attn-gdn" --recipe w4a16_mlp_rtn_g32_attn_gdn_w8a16
 # 27B：先导出 FP16，再按需要生成各量化配方（输出目录见上表）
-python -m rpu_backend.quant.convert_qwen3_5 --src "$RPU_MODEL_CACHE/Qwen3.5-27B" --dst "$RPU_MODEL_CACHE/Qwen3.5-27B-FP16" --method fp16
+python -m rpu_backend.quant.convert_qwen3_5 --src "$RPU_MODEL_CACHE/Qwen3.5-27B" --dst "$RPU_MODEL_CACHE/Qwen3.5-27B-FP16" --recipe fp16
 # 27B 激活感知 AWQ：先用校准提示词收集激活（每行一条纯文本、JSON 字符串或 {"text": "..."}），再转换
 python -m rpu_backend.quant.convert_qwen3_5_awq calibrate --src "$RPU_MODEL_CACHE/Qwen3.5-27B" \
   --prompts calibration_prompts.txt --output 27b_awq_calibration.safetensors
@@ -165,7 +185,20 @@ python -m rpu_backend.quant.convert_qwen3_5_awq convert --src "$RPU_MODEL_CACHE/
   --dst "$RPU_MODEL_CACHE/qwen3_5_quant_ckpts/qwen3_5-27b-activation-awq-g128" --calibration 27b_awq_calibration.safetensors
 ```
 
-0.8B/4B/9B 的命令把尺寸和目录换掉即可。`--method` 和 `--profile` 二选一；量化范围（哪些投影是 W4、哪些是 W8）见 [Qwen3.5 配置页](qwen3_5/README.md#quantization)。
+27B 激活感知 AWQ 的可选参数（省略时取默认值）：
+
+| 子命令 | 参数 | 默认值 | 作用 |
+|---|---|---|---|
+| `calibrate` | `--device` | `cpu` | 跑校准前向的设备 |
+| `calibrate` | `--max-tokens` | 128 | 每条提示词截断到的 token 数，正整数 |
+| `calibrate` | `--sample-rows` | 64 | 每条提示词在每层 MLP 输入和 Down 输入处采样的激活行数，正整数 |
+| `convert` | `--grid` | 9 | 缩放搜索的候选比例数，至少 2 |
+| `convert` | `--row-block` | 256 | 量化时每次处理的输出行数，只影响内存，正整数 |
+| `convert` | `--shard-mb` | 512 | 输出 safetensors 分片大小（MB），正整数 |
+
+仓库和资产库都没有保存现有 27B 产物用的校准提示词，所以不能按原样复现，只能用自己的提示词生成同一配方。产物 `config.json` 的 `quantization_provenance` 记录提示词、token 和校准文件的 sha256，以及 `scale_search_grid`，可用来判断两份产物是否用了同一份校准数据。
+
+0.8B/4B/9B 的命令把尺寸和目录换掉即可。`--recipe`、`--method` 和 `--profile` 三选一（等价关系见[配方记录](#recipe-record)）；量化范围（哪些投影是 W4、哪些是 W8）见 [Qwen3.5 配置页](qwen3_5/README.md#quantization)。
 
 <a id="cmd-qwen35-moe"></a>
 
@@ -176,8 +209,9 @@ python -m rpu_backend.quant.convert_qwen3_5_awq convert --src "$RPU_MODEL_CACHE/
 | `qwen3_5-35b-a3b-gptq-w4a16` | `Qwen3.5-35B-A3B-GPTQ-Int4` | 下载 | [Qwen/Qwen3.5-35B-A3B-GPTQ-Int4](https://modelscope.cn/models/Qwen/Qwen3.5-35B-A3B-GPTQ-Int4)（ModelScope） 文件 revision `7baa396cda1da0d759cfdaadd1b7fbd6003738f9`；许可 Apache-2.0 |
 | `qwen3_5-35b-a3b-rtn-w4a16` | `Qwen3.5-35B-A3B-RTN-W4A16-G128` | 转换 | 路由专家 RTN W4 G128，由上游浮点权重生成 |
 | `qwen3_5-35b-a3b-mixed` | `Qwen3.5-35B-A3B-rpu-fp8-mixed` | 转换 | 路由专家与文本混合层为逐行 FP8 E4M3，由上游浮点权重生成 |
+| `qwen3_5-35b-a3b-rtn-w8a16` | `Qwen3.5-35B-A3B-RTN-W8A16` | 转换 | 路由专家逐输出通道对称 INT8（FP16 scale），其余保持 FP16，由上游浮点权重生成 |
 
-上游浮点权重为 [Qwen/Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.5-35B-A3B) `59d61f3ce65a6d9863b86d2e96597125219dc754`（许可 Apache-2.0），下载到任意工作目录（下称 `$QWEN35_MOE`）。两个转换器都需要大量内存，请在 CPU 主机上运行，并设置 `TORCH_DEVICE_BACKEND_AUTOLOAD=0`：
+上游浮点权重为 [Qwen/Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.5-35B-A3B) `59d61f3ce65a6d9863b86d2e96597125219dc754`（许可 Apache-2.0），下载到任意工作目录（下称 `$QWEN35_MOE`）。三个转换器都需要大量内存，请在 CPU 主机上运行，并设置 `TORCH_DEVICE_BACKEND_AUTOLOAD=0`：
 
 ```bash
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0
@@ -185,6 +219,8 @@ python -m rpu_backend.quant.convert_qwen3_5_moe_rtn --src "$QWEN35_MOE" \
   --dst "$RPU_MODEL_CACHE/Qwen3.5-35B-A3B-RTN-W4A16-G128" --threads 8
 python -m rpu_backend.quant.convert_qwen3_5_moe_fp8 --src "$QWEN35_MOE" \
   --dst "$RPU_MODEL_CACHE/Qwen3.5-35B-A3B-rpu-fp8-mixed" --threads 8
+python -m rpu_backend.quant.convert_qwen3_5_moe_int8 --src "$QWEN35_MOE" \
+  --dst "$RPU_MODEL_CACHE/Qwen3.5-35B-A3B-RTN-W8A16" --threads 8
 ```
 
 MoE 配置也可以用 `examples/run.py --model <目录>` 指定权重目录，profile 校验不变。配方细节见[量化说明](../../docs/quantization.zh.md)。
@@ -215,6 +251,7 @@ VLA 除了权重，通常还需要配套源码、processor 和预处理过的输
 |---|---|---|---|
 | `pi05-libero-finetuned` | `pi05_libero_finetuned` | 下载 | [lerobot/pi05_libero_finetuned_v044](https://huggingface.co/lerobot/pi05_libero_finetuned_v044) `dbf8a3f794a9c4297b44f40b752712f50073d945`；许可 Gemma 使用条款 |
 | `pi05-libero-finetuned-w8a16-vlm-expert` | `pi05_libero_finetuned-w8a16-vlm-expert` | 转换 | VLM 与动作专家投影 INT8，由 `pi05-libero-finetuned` 生成 |
+| `pi05-libero-finetuned-w4real-kvint8` | `pi05_libero_finetuned-w4real-kvint8` | 转换 | 全部投影 INT4、K/V 保持 INT8（`w4a16_kvint8`，模板已撤下，见 [Pi0.5](pi05/README.md)），`--recipe w4a16_kvint8`，由 `pi05-libero-finetuned` 生成 |
 | `pi05-libero-h10` | `pi05_libero_h10` | 下载后改 `config.json` | [lerobot/pi05_libero_base](https://huggingface.co/lerobot/pi05_libero_base) `5fcf06fc42b6717e22ab885fd381a096574b12c7`，权重原样（FP32，`model.safetensors` sha256 `21b8711787c4a75861b02cff6aa81675a3a943d32b435a68262ac4461e476ba4`）；`chunk_size` / `n_action_steps` 由 50 / 10 改为 10 / 10；许可 Gemma 使用条款 |
 | `pi05-libero-h10-w8a16-vlm-expert` | `pi05_libero_h10-w8a16-vlm-expert` | 转换 | VLM 与动作专家投影 INT8，由 `pi05-libero-h10` 生成 |
 
@@ -227,18 +264,20 @@ c.update(chunk_size=10, n_action_steps=10); json.dump(c, open(p, "w"), indent=4)
   "$RPU_MODEL_CACHE/pi05_libero_h10/config.json"
 ```
 
-动作 NVFP4 配置（`w8a16_action_nvfp4`、`w8a16_prefill_w8a8_action_nvfp4`）用 `[model].checkpoint` 填写转换产物的路径，同一 horizon 的两者共用同一份产物：
+动作 NVFP4 配置（`w8a16_action_nvfp4`、`w8a16_prefill_w8a8_action_nvfp4`，以及 H50 的 `w8a16_vision_w4a16_action_nvfp4`）用 `[model].checkpoint` 填写转换产物的路径，同一 horizon 的各配方共用同一份产物（Vision W4 在加载时量化）：
 
 ```bash
 python -m rpu_backend.quant.convert_pi05 --src "$RPU_MODEL_CACHE/pi05_libero_finetuned" \
   --dst "$RPU_MODEL_CACHE/pi05_libero_finetuned-w8a16-vlm-expert"
 python -m rpu_backend.quant.convert_pi05 --src "$RPU_MODEL_CACHE/pi05_libero_finetuned" \
-  --dst /path/to/pi05_action_nvfp4 --action-w4
+  --dst /path/to/pi05_action_nvfp4 --recipe w8a16_action_nvfp4
+python -m rpu_backend.quant.convert_pi05 --src "$RPU_MODEL_CACHE/pi05_libero_finetuned" \
+  --dst "$RPU_MODEL_CACHE/pi05_libero_finetuned-w4real-kvint8" --recipe w4a16_kvint8
 # H10：源换成 pi05_libero_h10
 python -m rpu_backend.quant.convert_pi05 --src "$RPU_MODEL_CACHE/pi05_libero_h10" \
   --dst "$RPU_MODEL_CACHE/pi05_libero_h10-w8a16-vlm-expert"
 python -m rpu_backend.quant.convert_pi05 --src "$RPU_MODEL_CACHE/pi05_libero_h10" \
-  --dst /path/to/pi05_h10_action_nvfp4 --action-w4
+  --dst /path/to/pi05_h10_action_nvfp4 --recipe w8a16_action_nvfp4
 ```
 
 生成 batch 还需要 tokenizer `unsloth/gemma-2-2b` 和 LIBERO 数据集，见 [Pi0.5 输入文件准备](pi05/README.md#input-files)。转换选项见 Pi0.5 权重准备。
@@ -278,18 +317,30 @@ done
 ```bash
 W="$RPU_MODEL_CACHE/wall-oss-0.5"
 python -m rpu_backend.quant.convert_wall_oss_w8a16 --src "$W" --dst "$RPU_MODEL_CACHE/wall-oss-0.5-w8a16"
-# W4 G32 且 expert-0 down 保持 INT8：命令行不接受 --keep-int8，用 Python 接口生成
-python - "$W" "$RPU_MODEL_CACHE/wall-oss-0.5-w4a16-pgrp" <<'PY'
-import sys
-from rpu_backend.quant.convert_wall_oss import convert_checkpoint
-convert_checkpoint(sys.argv[1], sys.argv[2], group_size=32,
-                   extra_int8_suffixes=("moe.experts.0.down_proj.weight",))
-PY
-python -m rpu_backend.quant.convert_wall_oss --src "$W" --dst "$RPU_MODEL_CACHE/wall-oss-0.5-w4a16" --group-size 0
+# W4 G32 且 expert-0 down 保持 INT8
+python -m rpu_backend.quant.convert_wall_oss --src "$W" --dst "$RPU_MODEL_CACHE/wall-oss-0.5-w4a16-pgrp" --recipe w4a16_g32
+python -m rpu_backend.quant.convert_wall_oss --src "$W" --dst "$RPU_MODEL_CACHE/wall-oss-0.5-w4a16" --recipe w4a16_channel
 ```
 
 Base 配置用 `[model].fp16_checkpoint` 和 `w8_checkpoint` 填写上面两个目录的路径，不使用登记名。RTC 与分拣配置使用客户的 `wrc_sf_v728` 系列权重（配套交付），见 [RTC](wall_oss/rtc/README.md) 和[分拣](wall_oss/sorting/README.md)。
 
+<a id="wall-customer"></a>
+
+#### 客户 v728 权重的量化产物
+
+RTC 与分拣的 FP16 checkpoint 直接用客户 v728 目录，其中 `config.yml` 的 RTC 训练字段须与 v728 一致，否则加载时报错，所以其他微调版本不能直接使用。W8 与 Action W4 产物从这个目录用上面的转换器生成，并且必须放在 FP16 目录的同级：产物只记录源目录名，加载时在量化目录的上一级查找同名 FP16 目录，并核对两边 `config.json` 除量化字段外一致。
+
+```bash
+F=/path/to/wrc_sf_v728
+python -m rpu_backend.quant.convert_wall_oss_w8a16 --src "$F" --dst "$(dirname "$F")/wrc_sf_v728-w8a16"
+python -m rpu_backend.quant.convert_wall_oss --src "$F" --dst "$(dirname "$F")/wrc_v728_action_w4a16_pgrp" --recipe w4a16_g32
+```
+
+| 字段 | 填写 |
+|---|---|
+| RTC FP16 的 `checkpoint`；RTC W8A16 与分拣的 `fp16_checkpoint` | 客户 FP16 目录 |
+| RTC W8A16 的 `checkpoint`；分拣的 `w8_checkpoint` | W8 产物 |
+| 分拣的 `action_w4_checkpoint` | W4 产物 |
 
 ### 其他 VLA
 
@@ -299,19 +350,19 @@ Base 配置用 `[model].fp16_checkpoint` 和 `w8_checkpoint` 填写上面两个�
 | `hy-embodied-0.5-vla-umi` | `Hy-Embodied-0.5-VLA-UMI` | 下载 | [tencent/Hy-Embodied-0.5-VLA-UMI](https://huggingface.co/tencent/Hy-Embodied-0.5-VLA-UMI) `3f53d1f8d2bc587c523cfdc9f1041ceee42c2524`；许可 Apache-2.0；HyVLA 与 Hy-Embodied 共用 |
 | `lingbot-vla-v2-6b` | `hf/robbyant/lingbot-vla-v2-6b` | 下载 | [robbyant/lingbot-vla-v2-6b](https://huggingface.co/robbyant/lingbot-vla-v2-6b) `11c703bf6a5c1f45b3b69168482da11fdbba53d7`；许可 Apache-2.0（模型卡声明）；模板用 `${RPU_MODEL_CACHE}/lingbot-vla-v2-6b` 作为 checkpoint，按实际下载位置填写 |
 | `g05-base` | `G05/g05-base` | 下载 | [OpenGalaxea/G05](https://huggingface.co/OpenGalaxea/G05) `e312be81e90c56a55bcb26b57429bd39a335b449`；许可 G0.5 社区许可（非商用），子目录 `g05-base`；需先申请访问 |
-| `internvla-n1-controlled` | `internvla_n1-controlled` | 配套交付 | 本地组装的资产：上游 [InternRobotics/InternVLA-N1-w-NavDP](https://huggingface.co/InternRobotics/InternVLA-N1-w-NavDP) `6d48df24da45e8b31fdcef9572bbcbf68c0baf64`；许可 CC-BY-NC-SA-4.0（模型卡声明，非商用），加上 System2 W8 产物；`asset_manifest` 固定各文件哈希，见 [InternVLA](internvla/README.md#input-files) |
+| `internvla-n1-controlled` | `internvla_n1-controlled` | 转换 | 上游 [InternRobotics/InternVLA-N1-w-NavDP](https://huggingface.co/InternRobotics/InternVLA-N1-w-NavDP) `6d48df24da45e8b31fdcef9572bbcbf68c0baf64`；许可 CC-BY-NC-SA-4.0（模型卡声明，非商用）。NavDP 头、System2 W8、fixture 和固定各文件哈希的 `asset_manifest` 由 `scripts/ci/prepare_internvla_full_chain_assets.py` 一次生成，见 [InternVLA](internvla/README.md#input-files) |
 | `rhinovla-controlled` | `rhinovla-controlled` | 配套交付 | 固定版本的源码、checkpoint 与 CPU fixture 组成的资产包；上游 [HuixiAI/RhinoVLA](https://huggingface.co/HuixiAI/RhinoVLA) `7f3708650e302f395e7c63607b48b56fb96b8076`；许可 Apache-2.0，组成见 [RhinoVLA v1](rhinovla/v1/README.md) |
 | `lingbot-vla-4b` | `lingbot-vla-4b` | 下载 | [robbyant/lingbot-vla-4b](https://huggingface.co/robbyant/lingbot-vla-4b) `87712223fb463f0f6a6565f8feba64c35418e393`；许可 Apache-2.0（模型卡声明）（LingBot v1：延期，受限支持，尚未在板上运行） |
 | `halo_action_expert` | `HALO/pytorch_weights_current` | 配套交付 | HALO CoT EMA 权重（延期：受限支持，尚未在板上运行），见 [HALO](halo/README.md) |
 
-GR00T、HyVLA、LingBot v2 和 G0.5 的 W8 及 NVFP4 配置指向同一份浮点权重，在加载时量化，不需要离线转换；InternVLA 的 System2 W8 已包含在资产包中。下列入口用路径字段而不是登记名：
+GR00T、HyVLA、LingBot v2 和 G0.5 的 W8 及 NVFP4 配置指向同一份浮点权重，在加载时量化，不需要离线转换；InternVLA 的 System2 W8 由上述资产脚本一并生成。下列入口用路径字段而不是登记名：
 
 | 配置 | 字段 | 资产 |
 |---|---|---|
-| G0.5 K1（`g05/2cam`、`g05/3cam`） | `checkpoint`、`release_root` | 客户 RTC release（配套交付），见 [G0.5](g05/README.md#input-files) |
-| LingBot v2 | `checkpoint`、`training_config` | 上表的 `lingbot-vla-v2-6b` 与训练配置文件，见 [LingBot v2](lingbot/v2/README.md#input-files) |
+| G0.5 K1（`g05/` 下的相机模板） | `checkpoint`、`release_root` | 客户 RTC release（配套交付），见 [G0.5](g05/README.md#input-files) |
+| LingBot v2 | `checkpoint`、`training_config` | 上表的 `lingbot-vla-v2-6b`；`training_config` 是上游训练 YAML，不随 checkpoint 提供，见 [LingBot v2 训练配置](lingbot/v2/README.md#training-config) |
 | RhinoVLA v3 | `source_dir`、`checkpoint`（`controlled/`）或 `runtime_factory`、`factory_config`（工厂模板） | 客户 v3 源码与 checkpoint（配套交付），见 [RhinoVLA v3](rhinovla/v3/README.md) |
-| Wall-OSS RTC / 分拣 | `checkpoint`、`fp16_checkpoint`、`w8_checkpoint`、`action_w4_checkpoint` | 客户 `wrc_sf_v728` 系列权重（配套交付） |
+| Wall-OSS RTC / 分拣 | `checkpoint`、`fp16_checkpoint`、`w8_checkpoint`、`action_w4_checkpoint` | 客户 `wrc_sf_v728` FP16 权重（配套交付），W8/W4 产物见[上文](#wall-customer) |
 
 <a id="no-local-converter"></a>
 

@@ -1,0 +1,36 @@
+# Qwen3-TTS 的输入预设：python examples/run.py --config <TOML> --input <预设名>
+# --input canonical 取本文件的 canonical；--set input.<键> 的同名字段优先于预设。
+#
+# 预设写合成文本、语言和每段生成上限，参考音频仍取所选 TOML。三段中文与 2026-10-21
+# 板测所用文本相同（12、25、228 字符）；英文句未上板。
+#
+# 范围：text 1–1024 字符，language 为 Chinese / English，max_new_tokens 每段 2–256；
+#   不超过 128 字符且不超过 32 个 token 的文本一次合成，更长的按 tokenizer 分段，每段须在
+#   max_new_tokens 内得到 EOS，否则运行时报错。zh_long 走分段路径。
+applies_to = ["qwen3_tts"]
+canonical = "zh_sentence"
+
+[preset.zh_short]
+text = "你好，欢迎使用语音助手。"
+language = "Chinese"
+max_new_tokens = 256
+
+[preset.zh_sentence]
+text = "请用一句话介绍今天的天气情况，并提醒大家出门带伞。"
+language = "Chinese"
+max_new_tokens = 256
+
+[preset.zh_long]
+text = """\
+人工智能芯片正在改变计算的方式。与通用处理器不同，专用加速器把矩阵乘法、注意力和归一化等算子放在\
+片上存储附近执行，减少数据搬运带来的延迟和功耗。在机器人和自动驾驶场景中，模型需要在几十毫秒内完成\
+感知、理解和动作生成，因此推理框架必须同时考虑算子融合、内存复用和多核并行。本段文字用于测试较长文本\
+的语音合成，覆盖分段、停顿和数字读法，例如二零二六年十月二十一日，温度十八度，湿度百分之六十五。\
+合成结果会记录每段的耗时和实时率，便于比较不同精度和核数下的表现。"""
+language = "Chinese"
+max_new_tokens = 256
+
+[preset.en_sentence]
+text = "Please describe today's weather in one sentence and remind everyone to bring an umbrella."
+language = "English"
+max_new_tokens = 256

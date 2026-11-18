@@ -227,9 +227,17 @@ def _load_fixture(path, factory):
 def run(args):
     import torch
     config = tomllib.loads(args.config.read_text()) if args.config else {}
-    if set(config) - {"env", "rpu_execution"}:
-        raise ValueError("Controlled configuration accepts only env and rpu_execution")
-    for key, value in config.get("env", {}).items():
+    if "model" in config:
+        if "env" in config:
+            raise ValueError("Controlled configuration cannot combine [env] and [model]")
+        common = _module(Path(__file__).resolve().parents[1] / "examples/common/config.py", "_v3_common")
+        config = common.normalize_config(config)
+        switches = config.get("example", {}).get("opt_in", {})
+    else:
+        if set(config) - {"env", "rpu_execution"}:
+            raise ValueError("Controlled configuration accepts only env and rpu_execution")
+        switches = config.get("env", {})
+    for key, value in switches.items():
         os.environ[key] = str(value)
     from rpu_backend.api import RhinoVLAPolicy
 

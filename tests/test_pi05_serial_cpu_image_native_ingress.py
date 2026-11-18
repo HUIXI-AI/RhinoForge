@@ -23,7 +23,8 @@ def test_whole_serial_cpu_image_forward_copies_publishes_and_keeps_graph_owners(
     core = _function(source, "    at::Tensor run_packed_patch_embed_core(")
     packer = _function(source, "    at::Tensor run_packed_patch_embed(")
     patch_only = _function(source, "    at::Tensor patch_embed(")
-    owner = _function(source, "    bool pi05_vision_supported_owner() const")
+    owner = "\n".join(_function(source, marker) for marker in (
+        "    bool pi05_vision_supported_owner() const", "    bool pi05_vision4_w4_owner() const"))
     span = _function(source, "static bool packed_image_acquire_span(")
     live = _function(source, "struct PatchEmbeddingLiveBases") + ";"
     receipt = _function(source, "    struct PrivateSerialCpuSlabSpan") + ";\n" + "\n".join(
@@ -184,11 +185,13 @@ struct Layer {at::Tensor q_w,k_w,v_w,o_w,fc1_w,fc2_w,q_ws,k_ws,v_ws,o_ws,fc1_ws,
 struct Planned {int physical_manifest=0,stage_plan=0;};
 struct Prepared {Planned plan;const Planned& candidate(){return plan;}};
 struct Siglip {
+ // These serial-image ingress cases retain their FP16/W8A16 owner.
+ const bool qkv_w8a8_=false,mlp_w8a8_=false;
  int cores=4,attention=4,mlp=4,layers=27;uint64_t generation=1;
  int64_t pe_kh_=14,pe_kw_=14,pe_strideh_=14,pe_stridew_=14,pe_cin_orig_=3,pe_cin_padded_=16,pe_cout_=1152;
  int64_t orig_head_dim_=72,projection_dim_=2048,image_batch_count_=1;
  bool has_patch_emb_=true,linear_acc32_=false,pi05_vision_fc_weight_outer_opt_in_=false;
- bool pi05_vision_merge_segment_opt_in_=false;
+ bool pi05_vision_merge_segment_opt_in_=false,pi05_vision_kv_spm_only_opt_in_=false,pi05_vision_q_resident_opt_in_=false;
  int prologues=0;at::Tensor patch_emb_weight_,patch_emb_pos_emb_;
  std::vector<Layer> layer_weights_;
  __RECEIPT__
@@ -211,6 +214,10 @@ struct Siglip {
  void validate_pi05_vision_kv_spm_only_policy(const Planned&,int64_t,int64_t){}
  void validate_pi05_vision_owner_ln_policy(const Planned&,int64_t,int64_t){}
  void require_pi05_vision_fc_profile(int64_t,int64_t){}
+ void require_pi05_vision_qkv_w8a8_profile(int64_t,int64_t){assert(!qkv_w8a8_);}
+ void require_pi05_vision_mlp_w8a8_profile(int64_t,int64_t){assert(!mlp_w8a8_);}
+ void validate_pi05_vision_qkv_w8a8_policy(const Planned&,int64_t,int64_t){assert(!qkv_w8a8_);}
+ void validate_pi05_vision_mlp_w8a8_policy(const Planned&,int64_t,int64_t){assert(!mlp_w8a8_);}
  void validate_pi05_vision_fc_manifest(int){}void require_pi05_vision_fc_schedule(int){}
  void begin_external_physical_manifest_prologue(int,int64_t,int){++prologues;}
  void cancel_external_physical_manifest_prologue(){}

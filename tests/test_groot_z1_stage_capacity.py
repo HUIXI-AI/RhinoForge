@@ -30,6 +30,11 @@ def test_z1_prepare_preserves_auto_and_explicit_override_authority(tmp_path):
 #include <stdexcept>
 #include <vector>
 #include <utility>
+#include "src/fused/rpu_qwen3_w8a8_contract.h"
+#include "src/fused/rpu_qwen3_c192_contract.h"
+namespace qwen3_w8a8 = v3::qwen3_w8a8;
+namespace qwen3_c192 = v3::qwen3_c192;
+namespace qwen3_c512 = v3::qwen3_c512;
 namespace c10 {
 template<class F> struct ScopeExit { F fn; ~ScopeExit(){fn();} };
 template<class F> ScopeExit<F> make_scope_exit(F fn){return {std::move(fn)};}
@@ -74,7 +79,9 @@ class CausalDecoderModel {public:
  int64_t legacy_override=0,configured_chunk_size_cap_=0;
  bool equal_two_prefill_=false,decoder_mixed_precision_=false;
  bool has_qk_norm_=true,has_qkv_bias_=false;
- struct Context{std::optional<int> attention_mask;bool is_causal=true;} context;
+ bool qwen3_prefill_w8a8_=false,qwen3_c192_=false,qwen3_c256_=false,qwen3_c512_=false;
+ int64_t qwen3_inplace_capacity()const{return 0;}
+ struct Context{std::optional<int> attention_mask;bool is_causal=true;int64_t batch_size=1;} context;
  const Context&ctx()const{return context;}
  ChunkEnvelope envelope;
  const ChunkEnvelope&chunk_envelope()const{return envelope;}
@@ -169,7 +176,7 @@ int main(){
 '''
     code, exe = tmp_path / "z1_capacity.cpp", tmp_path / "z1_capacity"
     code.write_text(cpp)
-    subprocess.run([shutil.which("g++") or "g++", "-std=c++17", "-O0", str(code), "-o", str(exe)], check=True, capture_output=True, text=True)
+    subprocess.run([shutil.which("g++") or "g++", "-std=c++17", "-O0", "-I", str(ROOT), str(code), "-o", str(exe)], check=True, capture_output=True, text=True)
     subprocess.run([str(exe)], check=True, capture_output=True, text=True)
 
 

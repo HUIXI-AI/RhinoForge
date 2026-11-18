@@ -53,8 +53,6 @@ def _full_program():
     text = text.replace("BufferScope scope=BufferScope::LayerWide;", "BufferScope scope=BufferScope::LayerWide; bool reverse_layer_alloc=false;", 1)
     text = text.replace("static constexpr size_t ALIGN=256;", r'''
 static constexpr size_t ALIGN=256;
-static constexpr size_t SPM_USABLE=8387584;
-static constexpr size_t SPM_PLANNING_BUDGET=SPM_USABLE*99/100;
 size_t held=0,temporary=0;
 size_t free_space()const{return SPM_USABLE-held-temporary;}
 size_t temporary_used()const{return temporary;}

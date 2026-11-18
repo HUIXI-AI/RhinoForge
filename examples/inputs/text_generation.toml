@@ -1,0 +1,50 @@
+# 文本生成的输入预设：python examples/run.py --config <TOML> --input <预设名>
+# --input canonical 取本文件的 canonical；--set input.<键> 的同名字段优先于预设。
+#
+# 预设只写长度字段，prompt 仍取所选 TOML 的值：prefill_tokens 把 prompt 的 token
+# 截取或重复到 P 个；stop_on_eos = false 时 decode 固定调用 D 次，不因 EOS 提前结束。
+#
+# p128_d128、p2048_d32 与 2026-10-21 板测的固定 P 输入相同，已有记录见 configs/INPUT_GRID.md。
+#
+# applies_to 写运行器 target（Qwen3-VL 另加 component）。当前长度上限由运行时检查，
+# --check-config 不检查 --set 写的长度：
+#   Qwen3 0.6B/1.7B/4B/8B/32B：多 token prefill ≤ 4096；Qwen3-14B ≤ 192，见下面的 [[limit]]。
+#   Qwen3.5 dense 文本 ≤ 8192；Qwen3-VL 文本 ≤ 4176；Gemma4 的 P + D 不超过 checkpoint
+#   的 max_position_embeddings。
+#   Qwen3.5 MoE 文本的性能输入用 prompt_file 绑定原文和 token SHA，配置检查会拒绝这些预设。
+#   Llama 3.2 1B 当前 prefill ≤ 64，预设见 llama.toml。
+#
+# [[limit]]：registry_alias 以 alias_prefix 开头的配置，预设的 prefill_tokens 超过上限时，
+#   配置检查直接报 reason，不用等到加载模型。
+applies_to = ["qwen3", "qwen3_5", "qwen3_vl_text", "gemma4"]
+canonical = "p1024_d128"
+
+[[limit]]
+alias_prefix = "qwen3-14b"
+max_prefill_tokens = 192
+reason = "Qwen3-14B 的多 token prefill 上限是 192（python/rpu_backend/adapters/qwen3.py 的 _CHUNK_ENVELOPE）"
+
+[preset.p128_d32]
+prefill_tokens = 128
+decode_steps = 32
+stop_on_eos = false
+
+[preset.p128_d128]
+prefill_tokens = 128
+decode_steps = 128
+stop_on_eos = false
+
+[preset.p1024_d128]
+prefill_tokens = 1024
+decode_steps = 128
+stop_on_eos = false
+
+[preset.p2048_d32]
+prefill_tokens = 2048
+decode_steps = 32
+stop_on_eos = false
+
+[preset.p4096_d32]
+prefill_tokens = 4096
+decode_steps = 32
+stop_on_eos = false

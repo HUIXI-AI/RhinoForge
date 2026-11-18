@@ -17,7 +17,11 @@ def _image_inputs(inputs):
     images = []
     for path in paths:
         with Image.open(path) as image:
-            images.append(image.convert("RGB"))
+            image = image.convert("RGB")
+            # Same square resize as the Qwen3.5 image path (examples.common.inputs).
+            if "image_size" in inputs:
+                image = image.resize((inputs["image_size"], inputs["image_size"]))
+            images.append(image)
     return images
 
 
@@ -157,7 +161,11 @@ def qwen3_5_vision_messages(images, inputs):
 
 
 def qwen3_5_vision_encode(processor, images, inputs, *, require_mm_token_type_ids=True):
-    """Qwen3.5 image-text processor input on CPU."""
+    """Qwen3.5 image-text processor input on CPU.
+
+    Device inference requires mm_token_type_ids when require_mm_token_type_ids=True;
+    when False, callers on older processor versions may derive modality from input_ids.
+    """
     text = processor.apply_chat_template(qwen3_5_vision_messages(images, inputs), tokenize=False,
                                          add_generation_prompt=True)
     encoded = processor(text=[text], images=images, return_tensors="pt")
@@ -275,7 +283,7 @@ def _generate(model, cache, input_ids, decode_steps, prefill=None, tokenizer=Non
     generated = [token.cpu().clone()]
     first_logits = first_logits.clone()
     eos_ids = _eos_token_ids(model, tokenizer) if stop_on_eos else frozenset()
-    decode_ms = 0.0
+    decode_step_ms = []
     for _ in range(decode_steps):
         if eos_ids and all(value in eos_ids for value in generated[-1].reshape(-1).tolist()):
             break
@@ -286,10 +294,11 @@ def _generate(model, cache, input_ids, decode_steps, prefill=None, tokenizer=Non
                        use_cache=True, return_dict=True,
                        **({"logits_to_keep": 1} if forward_argmax else {}))
         token, cpu_logits = select_output(output.logits)
-        decode_ms += (time.perf_counter() - start) * 1000
+        decode_step_ms.append((time.perf_counter() - start) * 1000)
         generated.append(token.cpu().clone())
     tokens = torch.cat(generated, dim=1)
     calls = len(generated) - 1
+    decode_ms = sum(decode_step_ms)
     prefill_tokens = int(input_ids.shape[1])
     result = {"token_ids": tokens,
               "logits": (output.logits.cpu() if cpu_logits is None else cpu_logits).clone(),
@@ -297,7 +306,7 @@ def _generate(model, cache, input_ids, decode_steps, prefill=None, tokenizer=Non
               "generation": {
                   "prefill_tokens": prefill_tokens, "decode_calls": calls,
                   "output_tokens": calls + 1, "prefill_ms": prefill_ms,
-                  "decode_ms": decode_ms,
+                  "decode_ms": decode_ms, "decode_step_ms": decode_step_ms,
                   "prefill_tokens_per_second": prefill_tokens * 1000 / prefill_ms,
                   "decode_tokens_per_second": calls * 1000 / decode_ms if calls else None,
                   "timing_scope": "input transfer + forward + argmax; prefill includes FP32 CPU last logits; decode sums calls",

@@ -154,13 +154,18 @@ def _model_summary(config):
     geometry = {key: value for key, value in inputs.items() if key in {
         "component", "cameras", "expected_language_tokens", "text_tokens",
         "prefill_tokens", "decode_steps", "image_size", "resolution", "batch_size",
-        "horizon", "num_steps", "stop_on_eos", "source"}}
+        "horizon", "num_steps", "stop_on_eos", "source", "audio_seconds", "max_new_tokens"}}
     if "images" in inputs:
         geometry["images"] = len(inputs["images"])
     selected = {"input": geometry, "model_options": profile,
                 "rpu_execution": config.get("rpu_execution", {}),
                 "cpu": config.get("cpu", {}), "run": config.get("run", {})}
     _summary_line("MODEL", json.dumps(selected, ensure_ascii=False, sort_keys=True, default=str))
+    try:
+        from examples.common.overrides import config_sha256
+        _summary_line("MODEL", f"config_sha256={config_sha256(config)}")
+    except (TypeError, ValueError):
+        pass  # A non-JSON value skips only this line; report.json keeps the full config.
     checkpoint = config.get("_model_override") or inputs.get("checkpoint", example.get("registry_alias"))
     if checkpoint:
         _summary_line("MODEL", f"checkpoint={checkpoint}")

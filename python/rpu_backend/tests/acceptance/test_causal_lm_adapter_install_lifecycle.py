@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+import contextlib
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 import pytest
@@ -210,7 +212,9 @@ def test_model_topology_changes_fail_before_native_or_graph_mutation(monkeypatch
     model = _Outer(config)
     from transformers import Qwen3Config, Qwen3ForCausalLM
     from torch._subclasses.fake_tensor import FakeTensorMode
-    with FakeTensorMode() if hidden == 4096 or (hidden == 2560 and cores == 6) else torch.device('meta'):
+    # Exact8B and 6-core lm_head/MLP padding validate CPU residency before claiming the model.
+    # Keep that validation real without allocating the checkpoint in this test.
+    with (FakeTensorMode() if hidden == 4096 or cores == 6 else torch.device("meta")):
         actual = Qwen3ForCausalLM._from_config(Qwen3Config(**vars(config)), dtype=torch.float16)
     model.model = actual.model
     model.lm_head = actual.lm_head
@@ -223,7 +227,8 @@ def test_model_topology_changes_fail_before_native_or_graph_mutation(monkeypatch
     monkeypatch.setattr(hw_attrs, 'validate_postinstall', postinstall)
     monkeypatch.setattr(hw_attrs, 'install_hw_attr_validator', stamp)
     adapter = qwen3.Qwen3Adapter(model)
-    adapter.to_rpu()
+    with (model.lm_head.weight.fake_mode if hidden == 4096 or cores == 6 else contextlib.nullcontext()):
+        adapter.to_rpu()
     session = model._execution_session
     ops = _NativeReconfigureOps([])
     monkeypatch.setattr(decoder, 'torch', SimpleNamespace(ops=SimpleNamespace(rpu=ops)))
@@ -233,8 +238,8 @@ def test_model_topology_changes_fail_before_native_or_graph_mutation(monkeypatch
         from rpu_backend.runtime import RPUConfigError
         patches.append({'model': {}})
         mlp_cores = cores
-        assert model._rpu_decoder_topology.identity() == (2, cores, 4, mlp_cores, 4, 8)
-        with pytest.raises(RPUConfigError, match='monotonic'):
+        assert model._rpu_decoder_topology.identity() == (2, cores, 4, mlp_cores, cores, 8)
+        with pytest.raises(RPUConfigError, match="monotonic"):
             model._rpu_decoder_topology = model._rpu_decoder_topology
     for patch in patches:
         with pytest.raises(ValueError, match='cold-only'):

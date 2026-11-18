@@ -34,7 +34,7 @@ seed = 0
 
 [rpu_execution.model]
 # RPU 核数预算。可选 4 / 6 / 8，默认 8；修改后需重新加载模型。
-# 6 核时文本组件分配为 Attention 4、MLP 6、输出头 4。
+# 6 核时文本组件分配为 Attention 4、MLP 6、输出头 6。
 # Vision 在 4/6 核下用 4 核。实际分配见模型页配置表的“4 核 / 6 核”列。
 num_cores = 8
 

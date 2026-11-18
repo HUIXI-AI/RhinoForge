@@ -183,6 +183,8 @@ struct Model {
  // This legacy fixture exercises FP16/W8; mixed NVFP4 has its own actual-body test.
  struct Nvfp4Stub {bool enabled()const{return false;}std::vector<int>values;};
  Nvfp4Stub action_nvfp4_;
+ // The dense-text NVFP4 owner is uninstalled in this probe (enabled() false, no tables).
+ Nvfp4Stub text_nvfp4_;static constexpr int64_t kTextNvfp4TablesSite=3184997657402357068LL;
  template<class...T>std::vector<int64_t>action_gateup_pair_arguments(T...)const{return {};}
  bool use_action_nvfp4(int64_t)const{return false;}
  std::vector<int64_t>action_nvfp4_arguments(int)const{assert(false);return {};}
@@ -584,6 +586,8 @@ struct Model {
  // This legacy fixture exercises FP16/W8; mixed NVFP4 has its own actual-body test.
  struct Nvfp4Stub {bool enabled()const{return false;}std::vector<int>values;};
  Nvfp4Stub action_nvfp4_;
+ // The dense-text NVFP4 owner is uninstalled in this probe (enabled() false, no tables).
+ Nvfp4Stub text_nvfp4_;static constexpr int64_t kTextNvfp4TablesSite=3184997657402357068LL;
  template<class...T>std::vector<int64_t>action_gateup_pair_arguments(T...)const{return {};}
  bool use_action_nvfp4(int64_t)const{return false;}
  std::vector<int64_t>action_nvfp4_arguments(int)const{assert(false);return {};}
@@ -960,6 +964,10 @@ def test_actual_action_norm_shift_cold_route_and_rtc_segments(tmp_path):
         cache_header, "class KernelPayloadAvailability final") + ";"
     publication = re.search(r"payload_availability_\.publish\(.*?;", cache_source, re.S)[0]
     enable = _body(source, "void Qwen3_5Model::enable_action_mode()")
+    topology = (root / "src/fused/qwen3_5_execution_topology.h").read_text()
+    action_row = ("inline int g05_action_profile_num_layers(int64_t q_heads, int64_t effective_kv_heads,"
+                  " int64_t head_dim, int64_t hidden, int64_t intermediate)" +
+                  _body(topology, "inline int g05_action_profile_num_layers("))
     route = _body(source, "int64_t Qwen3_5Model::action_norm_route(")
     apply = _body(source, "void Qwen3_5Model::apply_adaptive_norm(")
     norm_args = _body(source, "std::vector<int64_t> Qwen3_5Model::action_norm_arguments(")
@@ -1024,8 +1032,9 @@ void rpu_launch_rmsnorm_spm_kernel(uint32_t input, uint32_t output,
     calls.push_back({1,input,output,scale,0,rows,hidden,8});
 }
 void rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(uint32_t shift, uint32_t input,
-        uint32_t output, int64_t rows, int64_t hidden, c10::Half, ValuOpType op, bool) {
-    calls.push_back({op==ValuOpType::MUL ? 4 : 0,input,output,0,shift,rows,hidden,8});
+        uint32_t output, int64_t rows, int64_t hidden, c10::Half, ValuOpType op, bool,
+        int cores) {
+    calls.push_back({op==ValuOpType::MUL ? 4 : 0,input,output,0,shift,rows,hidden,cores});
 }
 void rpu_launch_eltwise_binary_spm_kernel(uint32_t input, uint32_t residual,
         uint32_t output, int64_t elems, ValuOpType op, c10::Half, int cores) {
@@ -1049,6 +1058,7 @@ void rpu_launch_g05_rtc_sub_gated_residual_spm_kernel(uint32_t input,uint32_t re
     calls.push_back({9,input,output,clean,residual,32,1024,cores,noisy,0,clean_rows});
 }
 void append_kvinsert_cost_tensor_identity(std::vector<int64_t>&v,int owner){v.push_back(owner);}
+__ACTION_ROW__
 struct Model {
  static constexpr int64_t QWEN35_TEXT_SILU_ROUND_MUL_SITE=7739768473980724746LL;
  bool text_silu_round_mul_available_=false;
@@ -1164,6 +1174,12 @@ struct Model {
     int64_t hidden_size() const { return h; }
     int64_t num_cores() const { return cores; }
     int64_t num_layers() const { return layers; }
+    int64_t attn_tp() const { return cores; }
+    int64_t mlp_tp() const { return cores; }
+    int64_t num_q_heads() const { return 8; }
+    int64_t num_kv_heads() const { return cores == 8 ? 8 : 4; }
+    int64_t head_dim() const { return 256; }
+    int64_t intermediate_size() const { return 4096; }
     int64_t get_last_resolved_chunk_size() const { return resolved; }
     void set_chunk_size_override(int64_t) {}
     void invalidate_model_state() { ++invalidations; }
@@ -1218,6 +1234,10 @@ int main() {
     // The payload is sampled at installation, never reconsidered during planning or REPLAY.
     payload.publish(false); assert(m.action_norm_route(32)==2);
     Model absent; absent.enable_action_mode();
+    // Reduced action mode admits only the exact four-lane G05 expert.
+    {Model four; four.cores=4; four.enable_action_mode(); assert(four.action_mode_);
+     Model six; six.cores=6; reject([&]{six.enable_action_mode();}); assert(!six.action_mode_);
+     Model wide; wide.cores=4; wide.h=2048; reject([&]{wide.enable_action_mode();}); assert(!wide.action_mode_);}
     payload.publish(true); absent.run(chunk);
     assert(absent.expected.site==QWEN35_ACTION_RMS_NORM_SHIFT_SITE && absent.receipts==1);
     assert(calls.size()==2 && calls[0].kind==1 && calls[1].kind==0);
@@ -1376,7 +1396,7 @@ int main() {
                        ("APPLY", apply), ("NORM_ARGS", norm_args), ("MANIFEST", manifest), ("KERNEL_IDS", kernel_ids),
                        ("AVAILABILITY", availability), ("PUBLICATION", publication),
                        ("RESIDUAL_ROUTE", residual_route), ("RESIDUAL_APPLY", residual_apply),
-                       ("RAW_RESIDUAL", raw_residual)):
+                       ("RAW_RESIDUAL", raw_residual), ("ACTION_ROW", action_row)):
         cpp = cpp.replace(f"__{key}__", value)
     path, binary = tmp_path / "g05-norm-shift.cpp", tmp_path / "g05-norm-shift"
     cpp = with_actual_linear_contracts(_with_actual_g05_site_helpers(cpp))

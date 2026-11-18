@@ -121,6 +121,11 @@ def add_result_fields(report, output_dir, *, completed, timing=(),
     """
     report["result_schema_version"] = 1
     report["execution"] = {"status": "COMPLETED" if completed else "FAILED"}
+    # Every runner's report passes here once per report dict: chip, driver
+    # allocation settings and the per-task physical core sets they imply.
+    if "hardware" not in report:
+        from examples.common.hardware import snapshot
+        report["hardware"] = snapshot()
     for key in ("error", "cleanup_error"):
         if report.get(key):
             report["execution"][key] = report[key]

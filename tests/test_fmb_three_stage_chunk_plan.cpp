@@ -117,6 +117,10 @@ int main() {
                        shape[2], 8, 64, shape[0], shape[1]) == 0,
                "aligned nearby dimensions do not manufacture a Qwen3 profile");
     }
+    EXPECT(v3::qwen3_vl_text_prefix_num_layers(16, 8, 128, 2048, 6144) == 16 &&
+               v3::qwen3_vl_text_prefix_num_layers(16, 8, 128, 1024, 3072) == 0 &&
+               v3::qwen3_vl_text_prefix_num_layers(32, 8, 128, 2560, 9728) == 0,
+           "only the GR00T 2B text prefix admits a truncated layer count");
     for (const int budget : {4, 5, 6}) {
         bool rejected = false;
         try {
@@ -839,6 +843,7 @@ int main() {
     constexpr uint32_t shared_route_mask =
         v3::FMB_SHARED_LAYER_INPUT_DMA |
         v3::FMB_SHARED_LAYER_INPUT_ROW_RUN_DMA |
+        v3::FMB_SHARED_LAYER_INPUT_SCATTER_DMA |
         v3::FMB_SHARED_PIPELINE_INGRESS_DMA |
         v3::FMB_SHARED_MLP_AUTO_TILE |
         v3::FMB_SHARED_MLP_ACC32_OUT_BF16 |
@@ -848,7 +853,7 @@ int main() {
     v3::append_fmb_shared_runtime_routes(
         shared_manifest, shared_plan, /*hidden_size=*/1024,
         shared_route_mask);
-    EXPECT(shared_manifest.routes.size() == 9 &&
+    EXPECT(shared_manifest.routes.size() == 10 &&
                v3::fmb_ring_all_reduce_route_selector(64, 1024) ==
                    static_cast<int64_t>(v3::FmbSharedAllReduceRouteSelector::
                        RING_PACED) &&
@@ -883,6 +888,17 @@ int main() {
                "shared physical route rejects an eight-core descriptor under a reduced budget");
     }
     v3::FmbPhysicalManifestConsumer shared_consumer(shared_manifest);
+    EXPECT(throws_c10([&] {
+               shared_consumer.consume_route(
+                   v3::FmbRouteFamily::MUTABLE_DMA,
+                   v3::FMB_SHARED_LAYER_INPUT_SCATTER_DMA_SITE,
+                   static_cast<int64_t>(v3::FmbSharedMutableDmaRouteSelector::DDR_BROADCAST_TO_SPM), 0);
+           }) && !throws_c10([&] {
+               shared_consumer.consume_route(
+                   v3::FmbRouteFamily::MUTABLE_DMA,
+                   v3::FMB_SHARED_LAYER_INPUT_SCATTER_DMA_SITE,
+                   static_cast<int64_t>(v3::FmbSharedMutableDmaRouteSelector::DDR_SCATTER_TO_SPM), 0);
+           }), "residual shard mutable DMA has a distinct scatter authority");
     auto partial_mlp_manifest = shared_manifest;
     v3::append_fmb_shared_runtime_routes(
         partial_mlp_manifest, shared_plan, 1024,

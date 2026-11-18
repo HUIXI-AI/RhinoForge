@@ -356,3 +356,22 @@ int main() {
     for method in ("step_forward", "denoise_loop_forward"):
         body = _body(source, "void Pi05DenoiseStepModel::" + method + "(")
         assert body.index("restore_planned_route_profile(") < body.index("invalidate_model_state(")
+
+
+def test_pi05_denoise_cond_prepare_route_is_elided_on_reduced_cores_when_adarms_table_active():
+    """6-core table-driven denoise skips on-device condition GEMV and must not emit PI05_DENOISE_COND_PREPARE_SITE."""
+    from test_siglip_cold_profile import _body
+
+    source = (ROOT / "src/fused/rpu_pi05_denoise_step_model.cpp").read_text(encoding="utf-8")
+    manifest = _body(source, "Pi05DenoiseStepModel::physical_manifest_for_candidate(")
+    adarms = _body(source, "uint32_t Pi05DenoiseStepModel::adarms_gemv_to_spm(")
+
+    table_idx = manifest.index("else if (table_route)")
+    fallback_idx = manifest.index("} else {", table_idx)
+    cond_prepare_idx = manifest.index("PI05_DENOISE_COND_PREPARE_SITE")
+    gemv_linear_idx = manifest.index("PI05_DENOISE_GEMV_LINEAR_SITE")
+    assert fallback_idx < cond_prepare_idx < gemv_linear_idx
+    assert adarms.index("if (loop_mode_ && adarms_table_.defined())") < adarms.index(
+        "PI05_DENOISE_COND_PREPARE_SITE"
+    )
+

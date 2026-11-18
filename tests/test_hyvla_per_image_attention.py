@@ -46,6 +46,7 @@ template<class T>T Align(T x,T y){return (x+y-1)/y*y;}
 struct Model{
  bool cold_per_image_attention_=true,cold_kv_spm_only_=true;
  int64_t image_batch_count_=3,seq_len_=588,orig_head_dim_=72;
+ int num_cores()const{return 8;}
  Context context;Context& ctx(){return context;}
  void emit(Chunk chunk={}){
   const int64_t seq_len=chunk.len,nq=16,hd=80,DWIDTH=2;const double attn_scale=0.125;

@@ -160,7 +160,7 @@ struct Model{
  std::vector<LayerWeights>layer_weights_=std::vector<LayerWeights>(1);Context context;
  int64_t get_last_resolved_chunk_size()const{return resolved;}int64_t num_layers()const{return layers;}
  int64_t hidden_size()const{return h;}int64_t intermediate_size()const{return ff;}
- int64_t num_q_heads()const{return q;}int64_t num_kv_heads()const{return kv;}int64_t head_dim()const{return hd;}int64_t attn_tp()const{return tp;}
+ int64_t num_q_heads()const{return q;}int64_t num_kv_heads()const{return kv;}int64_t head_dim()const{return hd;}int64_t attn_tp()const{return tp;}int num_cores()const{return NUM_CORES;}
  Context&ctx(){return context;}const Context&ctx()const{return context;}
  uint32_t addr(int,const char*n){std::string s(n);return s=="ff1_resident_w8"?0x10200000:s=="norm_hidden"?0x10000000:0x10020000;}
  uint32_t layer_addr(int layer,int,const char*n){assert(layer>=0&&layer<32&&std::string(n)=="ff1_bias");return 0x10700000+layer*1536;}

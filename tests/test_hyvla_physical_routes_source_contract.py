@@ -93,8 +93,8 @@ def test_hyvit2_encoder_routes_cover_q_staging_linears_ring_and_tail():
     ):
         _assert_manifest_and_consumer(source, name, site_id)
 
-    assert "fmb_ring_all_reduce_route_selector(chunk.len, h)" in source
-    assert "fmb_ring_all_reduce_route_selector(seq_len, h)" in source
+    assert "fmb_ring_all_reduce_route_selector(chunk.len, h, num_cores())" in source
+    assert "fmb_ring_all_reduce_route_selector(seq_len, h, num_cores())" in source
     assert "cold_config_.q_inplace ? 1 : 0" in source
     assert "image_batch_count_, seq_len, seq_len_" in source
     assert "merger_member_major_ ? 1 : 0" in source
@@ -199,3 +199,17 @@ def test_native_kv_launches_fail_before_side_effects_without_a_descriptor():
         assert body.index("find_physical_route(") < body.index(
             "restore_kvinsert_plan("
         ) < body.index("consume_physical_route(", body.index("find_physical_route("))
+
+
+def test_hyvla_shadow_w4_scales_retain_with_projection_tp_domains():
+    vlm = _read("rpu_hyvla_vlm_model.cpp")
+    expert = _read("rpu_hyvla_expert_model.cpp")
+    for proj, ws in (("q_w_list", "q_ws_list"), ("k_w_list", "k_ws_list"),
+                     ("v_w_list", "v_ws_list"), ("o_w_list", "o_ws_list")):
+        assert vlm.count(f"rpu_retain_linear_quant_scale({proj}[i], {ws}[i], attn_tp())") == 2
+        assert expert.count(f"rpu_retain_linear_quant_scale({proj}[i], {ws}[i], attn_tp())") == 1
+    for proj, ws in (("gate_list", "gate_ws_list"), ("up_list", "up_ws_list"),
+                     ("down_list", "down_ws_list")):
+        assert vlm.count(f"rpu_retain_linear_quant_scale({proj}[i], {ws}[i], mlp_tp())") == 2
+        assert expert.count(f"rpu_retain_linear_quant_scale({proj}[i], {ws}[i], action_mlp_cores)") == 1
+

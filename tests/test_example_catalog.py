@@ -61,6 +61,7 @@ def example_catalog(tmp_path, monkeypatch):
     for entry in EXAMPLES.glob("*.py"):
         if not entry.name.startswith("_"):
             shutil.copy2(entry, examples / entry.name)
+    shutil.copytree(ROOT / "manifests", tmp_path / "manifests")
     (tmp_path / "docs").mkdir()
     for name in ("api_reference.md", "api_reference.zh.md"):
         shutil.copy2(ROOT / "docs" / name, tmp_path / "docs" / name)
@@ -73,7 +74,7 @@ def example_catalog(tmp_path, monkeypatch):
 def test_catalog_groups_nested_input_variants_without_executing_entries(example_catalog):
     checker = example_catalog
     original = checker.CONFIGS / "qwen3/text/0_6b/fp16.toml"
-    variant = checker.CONFIGS / "qwen3/inputs/another_prompt.toml"
+    variant = checker.CONFIGS / "qwen3/inputs/fp16_another_prompt.toml"
     variant.parent.mkdir()
     variant.write_text(original.read_text().replace(
         'prompt = "Explain what a compiler does."', 'prompt = "Explain DMA."'))
@@ -85,8 +86,8 @@ def test_catalog_groups_nested_input_variants_without_executing_entries(example_
     assert {item[1] for item in catalog["api"][profile_id]} == {original, variant}
     public_paths = {item[1] for section in catalog.values()
                     for group in section.values() for item in group}
-    assert checker.CONFIGS / "pi05/2cam/h50/fp16.toml" in public_paths
-    assert checker.CONFIGS / "pi05/2cam/h50/w8a16_action_nvfp4.toml" not in public_paths
+    assert checker.CONFIGS / "pi05/h50/fp16.toml" in public_paths
+    assert checker.CONFIGS / "wall_oss/base/3cam/224/fp16.toml" not in public_paths
     assert checker.CONFIGS / "wall_oss/sorting/fp16.toml" not in public_paths
     assert checker.CONFIGS / "rhinovla/v3/controlled/fp16.toml" in public_paths
     for language in ("en", "zh"):
@@ -103,7 +104,7 @@ def test_catalog_discovers_renamed_configs_even_when_stems_repeat(example_catalo
     duplicate = checker.CONFIGS / "qwen3/another/fp16.toml"
     duplicate.parent.mkdir()
     shutil.copy2(original, duplicate)
-    renamed = original.with_name("renamed.toml")
+    renamed = original.with_name("fp16_renamed.toml")
     original.rename(renamed)
     assert {item[1] for item in checker.catalog()["api"]["qwen3-0.6b.fp16.text"]} == {
         renamed, duplicate}
@@ -129,8 +130,8 @@ def test_config_index_includes_unregistered_templates_without_support_inheritanc
     def row(relative):
         return next(line for line in rows if line.startswith(f"| [{relative}]"))
     assert "未登记；模型专用模板" in row("wall_oss/base/3cam/224/fp16.toml")
-    assert "run.py" in row("hy_vla/3cam/fp16.toml")
-    assert "12（运行器默认）" in row("hy_vla/3cam/fp16.toml")
+    assert "run.py" in row("hy_vla/fp16.toml")
+    assert "12（运行器默认）" in row("hy_vla/fp16.toml")
     controlled = row("rhinovla/v3/controlled/fp16.toml")
     assert "受控验证" in controlled and "run.py" in controlled
     assert "SUPPORTED" not in controlled
@@ -139,7 +140,7 @@ def test_config_index_includes_unregistered_templates_without_support_inheritanc
 
 
 @pytest.mark.parametrize("relative", [
-    "qwen3/text/4b/fp16.toml", "pi05/2cam/h50/fp16.toml",
+    "qwen3/text/4b/fp16.toml", "pi05/h50/fp16.toml",
     "wall_oss/sorting/fp16.toml", "wall_oss/base/3cam/224/fp16.toml", "rhinovla/v3/controlled/fp16.toml",
 ])
 def test_catalog_validates_deep_public_and_custom_configs(example_catalog, relative):

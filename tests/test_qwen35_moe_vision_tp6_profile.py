@@ -87,7 +87,7 @@ def _owner(vision, *, profile=None, topology=None, root_policy=None,
         pass
 
     profile = profile or vision.QWEN3_5_MOE_35B_TP6_VISION_PROFILE
-    topology = topology or (6, 4, 6, 4, 8)
+    topology = topology or (6, 4, 6, 6, 8)
     root_policy = root_policy or GraphRuntimePolicy(
         execution_core_count=topology[0], graph_arena_count=4
     )
@@ -218,7 +218,7 @@ def test_profile_layouts_keep_root_and_vision_axes_distinct(vision):
     ) == ((4, 4, 4, 4, 8), 4)
     assert vision._qwen3_5_moe_vision_profile_layout(
         vision.QWEN3_5_MOE_35B_TP6_VISION_PROFILE
-    ) == ((6, 4, 6, 4, 8), 4)
+    ) == ((6, 4, 6, 6, 8), 4)
     assert vision._qwen3_5_moe_vision_profile_root_cores(
         vision.QWEN3_5_MOE_35B_TP6_VISION_PROFILE
     ) == 6
@@ -232,7 +232,7 @@ def test_profile_layouts_keep_root_and_vision_axes_distinct(vision):
 def test_tp6_bridge_attests_text6_vision4_and_policy_pair(
     monkeypatch, vision
 ):
-    calls = _install_native_topology(monkeypatch, (6, 4, 6, 4, 8))
+    calls = _install_native_topology(monkeypatch, (6, 4, 6, 6, 8))
     model, _visual_model, state, _close = _owner(vision)
 
     bridge = vision.make_qwen3_5_moe_vision_text_bridge(model)
@@ -265,14 +265,14 @@ def test_tp6_bridge_attests_text6_vision4_and_policy_pair(
         (6, 6, 6, 6, 8),
         (4, 4, 4, 4, 8),
         (6, 4, 4, 4, 8),
-        (6, 4, 6, 6, 8),
-        (6, 4, 6, 4, 6),
+        (6, 4, 6, 4, 8),
+        (6, 4, 6, 6, 6),
     ],
 )
 def test_tp6_bridge_rejects_uniform_or_partial_python_topology(
     monkeypatch, vision, topology
 ):
-    _install_native_topology(monkeypatch, (6, 4, 6, 4, 8))
+    _install_native_topology(monkeypatch, (6, 4, 6, 6, 8))
     model, _visual_model, _state, _close = _owner(
         vision, topology=topology,
         root_policy=GraphRuntimePolicy(
@@ -293,11 +293,12 @@ def test_tp6_bridge_rejects_uniform_native_topology(monkeypatch, vision):
 @pytest.mark.parametrize(
     "full_topology",
     [
-        (2, 6, 4, 6, 4, 6, 6, 6, 4, 8),  # GDN follows root incorrectly.
-        (2, 6, 4, 4, 6, 6, 6, 6, 4, 8),  # Router follows root incorrectly.
-        (2, 6, 4, 4, 4, 4, 6, 6, 4, 8),  # Routing owner is not route6.
-        (2, 6, 4, 4, 4, 6, 4, 6, 4, 8),  # Routed experts are not route6.
-        (2, 6, 4, 4, 4, 6, 6, 4, 4, 8),  # Shared expert is not route6.
+        (2, 6, 4, 6, 4, 6, 6, 6, 6, 8),  # GDN follows root incorrectly.
+        (2, 6, 4, 4, 6, 6, 6, 6, 6, 8),  # Router follows root incorrectly.
+        (2, 6, 4, 4, 4, 4, 6, 6, 6, 8),  # Routing owner is not route6.
+        (2, 6, 4, 4, 4, 6, 4, 6, 6, 8),  # Routed experts are not route6.
+        (2, 6, 4, 4, 4, 6, 6, 4, 6, 8),  # Shared expert is not route6.
+        (2, 6, 4, 4, 4, 6, 6, 6, 4, 8),  # Head is not head6.
     ],
 )
 def test_tp6_bridge_rejects_component_owner_mismatch(
@@ -305,7 +306,7 @@ def test_tp6_bridge_rejects_component_owner_mismatch(
 ):
     _install_native_topology(
         monkeypatch,
-        (6, 4, 6, 4, 8),
+        (6, 4, 6, 6, 8),
         full_topology=full_topology,
     )
     model, _visual_model, _state, _close = _owner(vision)
@@ -324,7 +325,7 @@ def test_tp6_bridge_rejects_component_owner_mismatch(
 def test_tp6_policy_pair_is_exact(
     monkeypatch, vision, root_cores, vision_cores, arenas, error
 ):
-    _install_native_topology(monkeypatch, (6, 4, 6, 4, 8))
+    _install_native_topology(monkeypatch, (6, 4, 6, 6, 8))
     root_policy = GraphRuntimePolicy(
         execution_core_count=root_cores, graph_arena_count=arenas
     )
@@ -343,7 +344,7 @@ def test_tp6_policy_pair_is_exact(
 def test_tp6_bridge_rejects_vision_policy_used_as_text_policy(
     monkeypatch, vision
 ):
-    _install_native_topology(monkeypatch, (6, 4, 6, 4, 8))
+    _install_native_topology(monkeypatch, (6, 4, 6, 6, 8))
     model, _visual_model, state, _close = _owner(vision)
     state.prefill_graph.runtime_policy = state.vision_graph_policy
     with pytest.raises(RuntimeError, match="root6 four-arena text policy"):
@@ -374,7 +375,7 @@ def test_shared_installer_routes_root6_config_to_vision4(
 ):
     from rpu_backend.adapters.qwen3_5 import cores, text
 
-    _install_native_topology(monkeypatch, (6, 4, 6, 4, 8))
+    _install_native_topology(monkeypatch, (6, 4, 6, 6, 8))
     vision_topology_calls = _install_native_vision_topology(monkeypatch)
     model, visual, state, close = _owner(vision)
     bridge = vision.make_qwen3_5_moe_vision_text_bridge(model)
@@ -433,7 +434,7 @@ def test_shared_installer_routes_root6_config_to_vision4(
 def test_shared_installer_rejects_root_config_drift_before_delegate(
     monkeypatch, vision
 ):
-    _install_native_topology(monkeypatch, (6, 4, 6, 4, 8))
+    _install_native_topology(monkeypatch, (6, 4, 6, 6, 8))
     model, _visual_model, state, _close = _owner(vision)
     bridge = vision.make_qwen3_5_moe_vision_text_bridge(model)
     delegated = []
@@ -484,7 +485,7 @@ def test_tp4_and_tp8_keep_one_policy_identity(
 def test_moe_wrapper_forwards_root6_and_vision4_controls(
     monkeypatch, vision
 ):
-    _install_native_topology(monkeypatch, (6, 4, 6, 4, 8))
+    _install_native_topology(monkeypatch, (6, 4, 6, 6, 8))
     model, _visual_model, state, _close = _owner(vision)
     key = "rpu_backend.adapters.qwen3_5.vision"
     original = sys.modules.get(key)

@@ -67,7 +67,7 @@ def test_4b_mixed_profile_resolves_128_w4_72_w8_48_fp16():
         counts[spec.method] += 1
 
     assert len(specs) == 248
-    assert counts == {qs.FP16: 48, qs.W8A16: 72, qs.W4A16_PGRP: 128, qs.W4A16_AWQ: 0}
+    assert counts == {qs.FP16: 48, qs.W8A16: 72, qs.W4A16_PGRP: 128, qs.W4A16_AWQ: 0, qs.NVFP4: 0}
     assert specs["layers.0.linear_attn.in_proj_qkv"] == qs.QuantSpec(qs.W8A16)
     assert specs["layers.0.linear_attn.in_proj_b"] == qs.QuantSpec(qs.FP16)
     assert specs["layers.3.self_attn.q_proj"] == qs.QuantSpec(

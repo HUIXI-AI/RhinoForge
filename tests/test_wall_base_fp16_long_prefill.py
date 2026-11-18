@@ -34,7 +34,7 @@ def test_actual_fp16_long_cold_plan_complete_and_activation(tmp_path):
     activation_producer = decoder[start:decoder.index('        std::sort(manifest.routes', start)]
     mlp_start = decoder.index('        bool needs_shared_mlp = false;')
     mlp_producer = decoder[mlp_start:start]
-    mlp_dispatch = block(decoder, 'else if (wall_base_fp16_shared_gateup_enabled(')[5:]
+    mlp_dispatch = block(decoder[decoder.index('void build_layer_subgraph('):], 'else if (wall_base_fp16_shared_gateup_enabled(')[5:]
     mlp_constants = '\n'.join(re.search(r'inline constexpr int64_t ' + name + r'\s*=.*?;', decoder, re.S).group()
                               for name in sorted(set(re.findall(r'\b(?:WALL_BASE|QWEN3VL|LINGBOT2)_\w+_SITE\b', mlp_producer))))
     mlp_call = decoder[decoder.index('            if (rhinovla_high_precision_) consume_rhinovla_high_activation(rows, chunk.idx);'):]
@@ -60,6 +60,11 @@ def test_actual_fp16_long_cold_plan_complete_and_activation(tmp_path):
 #include <bitset>
 #include <memory>
 #include <tuple>
+#include "fused/rpu_qwen3_w8a8_contract.h"
+#include "fused/rpu_qwen3_c192_contract.h"
+namespace qwen3_w8a8 = v3::qwen3_w8a8;
+namespace qwen3_c192 = v3::qwen3_c192;
+namespace qwen3_c512 = v3::qwen3_c512;
 #undef TORCH_INTERNAL_ASSERT
 #define TORCH_INTERNAL_ASSERT(x) TORCH_CHECK(x)
 KERNEL_IDS
@@ -152,6 +157,7 @@ struct Model {
  HELPERS
  template<class...T>bool lingbot_prefill_gateup_for_plan(T...)const{return false;}
  std::vector<int64_t>lingbot_prefill_gateup_arguments()const{TORCH_CHECK(false,"unbound Lingbot GateUp");return {};}
+ bool qwen3_c256_=false,rhinovla_high_precision_=false;
  bool ordinary_silu_mul_route_enabled()const{return false;}bool use_planned_silu_mul()const{return false;}
  bool wall_base_prefill_shared_input_enabled(const FmbThreeStageChunkPlan&,int64_t,int64_t,bool,bool,int64_t)const{return false;}
  int64_t wall_base_prefill_shared_gateup_site()const{return 0;}
@@ -181,6 +187,9 @@ struct Model {
   PRODUCER_ADMISSION
   context.value.routes.clear();
   auto&manifest=context.value;const bool multiview_mode=false,pooler_z1_mode=false,p640_staged=false,wall_action_linear_ring=false;
+  const bool qwen_a8=false,qwen_inplace=false,qwen_c512=false;
+  auto append_a8_quant=[&](const ChunkInfo&,int64_t){};
+  auto append_a8_linear=[&](const ChunkInfo&,qwen3_w8a8::Projection){};
   auto append=[&](FmbRouteFamily family,int64_t site,int64_t selector,int64_t flags,std::vector<int64_t> args,int64_t i){context.value.routes.push_back({site,family,selector,flags,args,i});};
   auto append_ring=[&](int64_t site,int64_t rows,int64_t i){append(FmbRouteFamily::ALL_REDUCE,site,causal_ring_route(rows,2048),0,{},i);};
   PRODUCER
@@ -212,7 +221,7 @@ struct Model {
 };
 template<class F>void rejects(F f){bool failed=false;try{f();}catch(const std::exception&){failed=true;}assert(failed);}
 void fallback(Model&m){assert(!m.enabled());assert(!m.wall_base_fp16_shared_gateup_enabled(m.context.stage_plan,m.seq_len_,m.context.position,m.context.is_causal,m.context.attention_mask.has_value(),m.context.batch_size));m.build();assert(m.context.value.routes.empty());
- const auto q=launches.size(),a=activations.size();m.emit_qkv();m.emit_activation();assert(q==launches.size()&&a==activations.size());}
+ const auto q=launches.size(),a=activations.size();m.emit_qkv();m.emit_activation();assert(q==launches.size()&&(m.cores!=8||a==activations.size()));}
 int main(){
  publish();
  for(int64_t p:{448,512,640}){Model m;m.set_rows(p);assert(m.enabled());m.build();const auto valid=m.context.value.routes;const int64_t rows=p/2;

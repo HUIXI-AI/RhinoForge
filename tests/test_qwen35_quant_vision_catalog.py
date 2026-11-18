@@ -49,6 +49,6 @@ def test_quant_vision_example_binds_both_existing_contracts(common, size, bits, 
     with pytest.raises(common.ConfigError, match="exact opt_in"):
         common.load_config(bad)
     bad = tmp_path / "mismatched_precision.toml"
-    bad.write_text(path.read_text().replace(f'precision = "w{bits}a16"', 'precision = "fp16"'))
-    with pytest.raises(common.ConfigError, match="requires dtype"):
+    bad.write_text(path.read_text().replace(f'precision = "{stem}"', 'precision = "fp16"'))
+    with pytest.raises(common.ConfigError, match="not registered for profile"):
         common.load_config(bad)

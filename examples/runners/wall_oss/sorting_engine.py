@@ -25,6 +25,23 @@ import traceback
 _LOG = logging.getLogger(__name__)
 
 DELAYS = (0, 1, 3, 10)
+CORE_COUNTS = (4, 6, 8)
+# The parcel-sorting schedules above have eight-lane owners only. Four/six
+# cores run the ordinary routes with the fused denoiser, SPM Vision RoPE,
+# four-lane fused Vision merger and residual-scaled FP16 expert 0 / Vision
+# (build_wall_oss_vla(rtc=True) selects the scale).
+_REDUCED_OFF = (
+    "RPU_WALL_OSS_ATTN_TP8", "RPU_WALL_OSS_BATCH_VISION",
+    "RPU_WALL_OSS_VISION_WEIGHT_OUTER",
+    "RPU_WALL_OSS_VISION_ROW_WEIGHT_OUTER", "RPU_WALL_OSS_VISION_MIXED_PRECISION",
+    "RPU_WALL_OSS_VISION_NATIVE_WINDOW_SDPA", "RPU_WALL_OSS_PREFILL_MIXED_PRECISION",
+    "RPU_WALL_OSS_PREFILL_STAGED_MLP", "RPU_WALL_OSS_PREFILL_OWNER_DIRECT_KV",
+    "RPU_WALL_OSS_ACTION_WEIGHT_RESIDENCY", "RPU_WALL_OSS_ACTION_KV_OWNER_FANOUT",
+    "RPU_WALL_OSS_W16_REUSE_MASK", "RPU_WALL_OSS_W16_NEXT3_MASK",
+    "RPU_WALL_OSS_W16_NEXT4_MASK", "RPU_WALL_OSS_FP16_TRANSFER_MASK",
+    "RPU_WALL_OSS_FP16_MLP_M224", "RPU_WALL_OSS_SORTING_SILU_MUL",
+    "RPU_WALL_OSS_FUSED_ASSEMBLE",
+)
 DEFAULT_BACKEND = Path(__file__).resolve().parents[3]
 _LIBRARIES = vars(_library_helpers)
 
@@ -32,6 +49,8 @@ _LIBRARIES = vars(_library_helpers)
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("fp16", "w8", "action-w4"), required=True)
+    parser.add_argument("--num-cores", type=int, choices=CORE_COUNTS, default=8,
+                        help="Wall model.num_cores; 4/6 run the ordinary residual-scaled routes")
     parser.add_argument("--backend-root", type=Path, default=DEFAULT_BACKEND)
     parser.add_argument("--site-packages", type=Path,
                         help="Optional explicit Python dependency directory")
@@ -56,6 +75,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         parser.error("--w4 is required for Action-only W4")
     if args.warmup < 0 or args.repeat < 1:
         parser.error("--warmup must be nonnegative and --repeat must be positive")
+    if args.mode == "action-w4" and args.num_cores != 8:
+        parser.error("Action-only W4 has an eight-core owner only")
     args.main_ref = args.main_ref or args.backend_root / "src/rhinoOpLib_current.ref"
     args.expansion = args.expansion or args.backend_root / "src/rhinoExpansionOpLib_current.ref"
     return args
@@ -71,10 +92,14 @@ def required_artifact(explicit: Path | None, env_name: str) -> Path:
     return path
 
 
-def exact_environment(root: Path, mode: str) -> dict[str, str]:
+def exact_environment(root: Path, mode: str, num_cores: int = 8) -> dict[str, str]:
     """Pure cold defaults shared by the example and the validation CLI."""
     if mode not in ("fp16", "w8", "action-w4"):
         raise ValueError(f"unknown parcel-sorting mode: {mode}")
+    if num_cores not in CORE_COUNTS:
+        raise ValueError(f"parcel sorting accepts model.num_cores {CORE_COUNTS}, got {num_cores!r}")
+    if mode == "action-w4" and num_cores != 8:
+        raise ValueError("Action-only W4 parcel sorting has an eight-core owner only")
     values = {
         "HF_HUB_OFFLINE": "1",
         "TRANSFORMERS_OFFLINE": "1",
@@ -133,6 +158,8 @@ def exact_environment(root: Path, mode: str) -> dict[str, str]:
             RPU_WALL_OSS_ACTION_KV_OWNER_FANOUT="0",
             RPU_WALL_OSS_EXPERT0_DOWN_INT4="0",
         )
+    if num_cores != 8:
+        values.update(dict.fromkeys(_REDUCED_OFF, "0"))
     return values
 
 
@@ -143,7 +170,7 @@ def configure_exact_all_on(root: Path, args) -> dict[str, str]:
             "parcel-sorting validation rejects RPU_CHUNK_FORCE_UNSAFE; "
             "unset it before running this entrypoint"
         )
-    values = exact_environment(root, args.mode)
+    values = exact_environment(root, args.mode, args.num_cores)
     libraries, _ = _LIBRARIES["verify_libraries"](root, {
         "RPU_BACKEND_SO": args.so,
         "RPU_KERNEL_LIB_PATH": args.main_ref,
@@ -327,6 +354,8 @@ def run(args: argparse.Namespace, fp16: Path, w8: Path, w4: Path, golden_path: P
         "w8a16": args.mode != "fp16",
         "fp16_ckpt_dir": str(fp16),
         "action_w4a16_ckpt_dir": str(w4) if args.mode == "action-w4" else None,
+        **({"rpu_execution": {"model": {"num_cores": args.num_cores}}}
+           if args.num_cores != 8 else {}),
     }
 
     _LOG.info("building mode=%s", args.mode)
@@ -339,7 +368,11 @@ def run(args: argparse.Namespace, fp16: Path, w8: Path, w4: Path, golden_path: P
         ):
             raise AssertionError("Action-only W4 cold composition/shared-KV contract failed")
 
-        if not (
+        if args.num_cores != 8:
+            if (vla.vision._weight_outer or vla.vision._mixed_precision
+                    or vla.llm._prefill_mixed_precision or vla.llm.residual_scale != 4):
+                raise AssertionError("reduced-core ordinary residual-scaled RTC was not built")
+        elif not (
             (bool(vla.vision._weight_outer) == (args.mode != "fp16" or bool(int(os.environ.get("RPU_WALL_OSS_FP16_TRANSFER_MASK", "0")) & 1)))
             and bool(vla.vision._mixed_precision)
             and bool(vla.llm._prefill_mixed_precision)
@@ -491,6 +524,7 @@ def run(args: argparse.Namespace, fp16: Path, w8: Path, w4: Path, golden_path: P
 
         report = {
             "mode": args.mode,
+            "num_cores": args.num_cores,
             "formal_certification": False,
             "profile_enabled": False,
             "warmup": args.warmup,

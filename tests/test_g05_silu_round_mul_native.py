@@ -158,6 +158,8 @@ struct Model{
  // NVFP4 is disabled in this FP16/W8 caller fixture.
  struct Nvfp4Stub {bool enabled()const{return false;}std::vector<int>values;};
  Nvfp4Stub action_nvfp4_;
+ // The dense-text NVFP4 owner is uninstalled in this probe (enabled() false, no tables).
+ Nvfp4Stub text_nvfp4_;static constexpr int64_t kTextNvfp4TablesSite=3184997657402357068LL;
  bool use_action_nvfp4(int64_t)const{return false;}
  std::vector<int64_t>action_nvfp4_arguments(int)const{assert(false);return {};}
  static constexpr int64_t QWEN35_ACTION_NVFP4_LINEAR_SITE=1171762392203719440LL;

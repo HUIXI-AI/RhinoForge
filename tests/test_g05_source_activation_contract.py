@@ -92,8 +92,8 @@ void rpu_launch_eltwise_unary_spm_kernel(uint32_t x,uint32_t y,int64_t elements,
 void rpu_launch_eltwise_binary_spm_kernel(uint32_t x,uint32_t y,uint32_t out,int64_t elements,ValuOpType op,c10::Half,int cores){
  assert(op==ValuOpType::MUL&&cores==8);math.push_back({"mul",x,out,y,elements,0,0});
 }
-void rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(uint32_t shift,uint32_t x,uint32_t y,int64_t rows,int64_t cols,c10::Half,ValuOpType op,bool){
- assert(op==ValuOpType::ADD);math.push_back({"shift",x,y,shift,rows,cols,0});
+void rpu_launch_eltwise_binary_1xC_NxC_spm_kernel(uint32_t shift,uint32_t x,uint32_t y,int64_t rows,int64_t cols,c10::Half,ValuOpType op,bool,int cores=8){
+ assert(op==ValuOpType::ADD&&cores==8);math.push_back({"shift",x,y,shift,rows,cols,0});
 }
 void rpu_launch_rhinovla_newton_norm_shift_spm_kernel(uint32_t x,uint32_t y,uint32_t scale,uint32_t shift,int64_t rows,double eps,int cores){
  assert(rows>0&&rows!=16&&rows!=32&&eps==1e-6&&cores==8&&shift==scale+2048);

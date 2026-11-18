@@ -4,7 +4,7 @@
 profile_id = "qwen3_5-0.8b.w4a16.text-controlled"
 registry_alias = "qwen3_5-0.8b-w4a16"
 target = "qwen3_5"
-precision = "w4a16"
+precision = "w4a16_text_rtn_g32"
 architecture = "Qwen3_5ForConditionalGeneration"
 
 [model.opt_in]
@@ -41,6 +41,6 @@ chunk_size = "auto"
 
 [rpu_execution.model]
 # RPU 核数预算。可选 4 / 6 / 8，默认 8；修改后需重新加载模型。
-# 6 核时文本组件分配为 Attention 4、MLP 6、输出头 4。
+# 6 核时文本组件分配为 Attention 4、MLP 6、输出头 6。
 # Vision 在 4/6 核下用 4 核。实际分配见模型页配置表的“4 核 / 6 核”列。
 num_cores = 8

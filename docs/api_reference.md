@@ -75,7 +75,7 @@ RPUModelForCausalLM.from_pretrained(
     dtype=torch.float16,
     device=None,
     rpu_execution=None,
-    quantization=None,  # CausalLM: explicit dense Qwen3 W4/G32 installation recipe
+    quantization=None,  # CausalLM: explicit installation recipe (e.g. w8a16, w4a16, nvfp4)
     max_seq_len=None,
     **hf_kwargs,
 )
@@ -262,7 +262,7 @@ Official 27B uses uniform W8 Text/VL at 4/6/8 cores or W4 group32 at 8 cores. Ro
 
 ### Qwen3.5 MoE
 
-The 35B-A3B RTN/GPTQ paths use the conditional loader, MoE adapter and hybrid cache. Select the checkpoint matching the [configuration](../examples/configs/qwen3_5/README.md); RTN and GPTQ metadata are not interchangeable.
+The 35B-A3B RTN W4/W8 and GPTQ paths use the conditional loader, MoE adapter and hybrid cache. Select the checkpoint matching the [configuration](../examples/configs/qwen3_5/README.md); RTN and GPTQ metadata are not interchangeable.
 
 ```python
 import torch

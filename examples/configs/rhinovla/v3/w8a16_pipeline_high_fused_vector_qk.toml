@@ -1,5 +1,9 @@
 # 未写出的执行参数（省略即按以下值运行）：
-#   rpu_execution.model.num_cores 固定 8 核（可显式写 8；4/6 核不支持，原因见模型页配置表）。
+#   rpu_execution.model.num_cores 省略为 8；可写 4 / 6，修改后需重新加载模型：动作专家与文本为 Attention 4、MLP 4/6，Vision 用 4 核；
+#     只有 8 核实现的选项（专家融合、常驻 AdaRMS 表、对齐 KV、融合/烘焙 merger、merger scatter、多视角批处理、视觉输入缓存）在 4/6 核自动关闭。
+#     HIGH 系列在 4/6 核同样生效：Vision merger 不融合，其 GELU 为分离 merger 的精确 ERF（在 CPU 上计算）；AdaRMS 表与 gate tanh 每层从 DDR 读取。
+#     4/6 核没有对齐 KV：向量 K norm 把自己的 K 缓冲区补到 32 行（每核 2 个 K 头，共 64 行）。
+#     4/6 核每核 4 个 Q 头：Newton V32 下 Q 由 124 行补零到 128 行。
 # 全流程 W8A16：expert、prefix、vision 投影、动作 IO 和冷启动 AdaRMS。
 # HIGH 只影响非线性与 norm 的计算；Linear 累加默认 ACC16。
 # 运行检查、数值诊断与任务质量评估相互独立。
@@ -7,7 +11,8 @@
 profile_id = "rhinovla.v3.w8a16.full-pipeline-high.trusted-factory"
 registry_alias = "rhinovla-controlled"
 target = "rhinovla"
-precision = "w8a16"
+# 登记的精度配方（manifests/precision_recipes.v1.json）；RPU_RHINOVLA_FULL_W8A16 / EXPERT_W8A16 与 factory 的 expert_w8a16 / full_w8a16 由配方设置，TOML 中写出会被拒绝。
+precision = "w8a16_pipeline"
 # 替换为匹配本模型与量化配方的本地资产路径或既有权重别名。
 checkpoint = "/path/to/rhinovla-v3/checkpoint"
 # 调用者可信 module:callable；实际 request 格式由该 factory 定义。
@@ -24,8 +29,6 @@ RPU_RHINOVLA_FUSED_SILU_MUL = "1"
 RPU_RHINOVLA_EXPERT_FUSIONS = "1"
 RPU_RHINOVLA_ADARMS_RESIDENT = "1"
 RPU_RHINOVLA_ALIGNED_KV = "1"
-RPU_RHINOVLA_FULL_W8A16 = "1"
-RPU_RHINOVLA_EXPERT_W8A16 = "1"
 RPU_RHINOVLA_PACKED_QKV = "0"
 RPU_RHINOVLA_SKIP_ADARMS_GEMV = "0"
 
@@ -44,8 +47,6 @@ request = "/path/to/rhinovla-v3/request.pt"
 trust_model_code = true
 # 当前模型路径的固定去噪步数，不作为任意可调范围。
 num_steps = 10
-expert_w8a16 = true
-full_w8a16 = true
 
 [run]
 # 是否启用 inference_mode；复现已有测量时保持原值。

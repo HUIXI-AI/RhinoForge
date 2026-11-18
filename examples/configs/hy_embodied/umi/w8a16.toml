@@ -1,0 +1,45 @@
+# 未写出的执行参数（省略即按以下值运行）：
+#   [cpu].threads 省略时本入口使用 12。
+#   rpu_execution.model.num_cores 省略为 8；可写 4 / 6，修改后需重新加载模型：文本骨干为 Attention 4、MLP 4/6，Vision 和动作专家用 4 核；
+#     4/6 核时 RMSNorm 走 BASE，注意力 TP8 等只有 8 核实现的融合路由不启用。
+#   分块（chunk_size）模板未写出，按 auto 由入口选择，取值与 FP16 模板相同（8 核 vision 592、prefill 240、action 64）；本精度尚无实测记录。
+#     4/6 核时 prefill 和 action 仍各为一块，vision 的 auto 分块由原生 planner 按 4 核 Vision 选择。可调范围见模型页。
+# 使用同一份浮点 checkpoint，冷启动装载时量化一次：Vision、VLM 和动作专家的 Linear 都是逐输出通道对称 INT8（W8A16），
+#   norm、embedding 和 boundary 权重为 FP16。
+#   8 核默认不让动作专家 Gate/Up 权重常驻核内存（runner 模板 hy_vla/w8a16.toml 的 8 核测量打开了它）。
+# 尚未上板实测，任务质量未评估。
+[model]
+profile_id = "hy-embodied-0.5-vla-umi.w8a16.vla"
+registry_alias = "hy-embodied-0.5-vla-umi"
+target = "hy_vla"
+precision = "w8a16"
+
+[model.opt_in]
+
+[input]
+# 替换图像路径；1–3 张，按 face、left_wrist、right_wrist 的顺序取前 C 张（两相机省略 right_wrist）。
+#   任意尺寸，由 processor 等比缩放并补边到 224×224。
+images = ["/path/to/face.png", "/path/to/left_wrist.png", "/path/to/right_wrist.png"]
+# 指令文本；分词后超过 64 个 token 的部分按 checkpoint 的 tokenizer_max_length=64 截断。
+instruction = "Move the object to the target."
+# 有限数值；维度须匹配模型与本体状态布局。
+state = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+# 固定随机种子；更改会改变输入噪声。
+noise_seed = 0
+# "auto"（省略同 auto）或 16 的倍数，范围 [128, ceil16(2+58C+64)]：3 图 240、2 图 192、1 图 128。
+#   auto 取上限，覆盖全部 64 个语言槽位；显式调小须 ≥ ceil16(2+58C+指令 token 数)，否则运行时报错。
+prefix_len = "auto"
+
+[run]
+# 预热次数；不计入正式测量。
+warmup = 3
+# 正式执行次数，正整数。
+runs = 5
+# 按需开启硬件采样；保持 false 可减少测量干扰。
+hwperf = false
+# 按需开启 profiler；正式计时建议保持 false。
+profile = false
+# 随机种子，非负整数。
+seed = 0
+
+[rpu_execution]

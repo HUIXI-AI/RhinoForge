@@ -96,6 +96,7 @@ struct Model {
     int64_t num_kv_heads() const { return heads; }
     int64_t head_dim() const { return dim; }
     int64_t intermediate_size() const { return intermediate; }
+    int num_cores() const { return 8; }
 """
         + _body("    struct LayerWeights {") + ";\n"
         + _body("    struct LayerBiasNorm {") + ";\n"
@@ -680,7 +681,7 @@ def test_small_gate_up_route_has_matching_plan_and_emission():
     assert "chunk.idx, small_image_gate_up_arguments(seq_len)" in consumer
     for body in (producer, consumer):
         assert "Qwen25VisionLinearRoute::WALL_SINGLE_BASE_GATE_UP_SWIGLU" in body
-    assert "0, 0, 0, 0, wall_sorting_, seq_len" in consumer
+    assert "0, 0, 0, 0, wall_sorting_, mlp_len" in consumer
 
 
 def test_owner_ring_norm_complete_consumer_rejects_stale_descriptor(tmp_path):

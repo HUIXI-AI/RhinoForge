@@ -8,7 +8,19 @@
 
 Dense 包括 **0.8B、2B、4B、9B、27B**，MoE 为 **35B-A3B**；每个尺寸按 `text/` 文本或 `vl/` 图文入口选择。全部配方、默认输入和可调范围列在[本页配置表](#configurations)。
 
-Dense 提供 FP16、W8、RTN W4 G32；部分尺寸另有 MLP-only、混合 W4/W8 和 AWQ。2B/4B/9B 的 AWQ 使用原始 AWQ 包，27B 使用本仓转换的激活感知 AWQ G128。MoE 提供 mixed E4M3、RTN W4 G128 和 GPTQ W4 G128。权重须匹配量化范围和转换方法。
+Dense 提供 FP16、W8、RTN W4 G32；部分尺寸另有 MLP-only、混合 W4/W8 和 AWQ。五个尺寸的文本入口另有 NVFP4（`nvfp4_text`）：加载时由官方浮点权重转换一次，GDN `in_proj_a`/`in_proj_b`、输出头、嵌入和归一化保持 FP16，尚未上板实测。2B/4B/9B 的 AWQ 使用原始 AWQ 包，27B 使用本仓转换的激活感知 AWQ G128。MoE 提供 mixed E4M3、RTN W4 G128、GPTQ W4 G128 和路由专家 W8A16（`w8a16_experts`：离线转换上游浮点权重，只量化路由专家，ACC16，不接受常驻 prefill，尚未上板实测）。权重须匹配量化范围和转换方法。
+
+文本入口在 8 核下的实测如下（性能页，默认输入 P7 / D4）。每格为 TPOT（ms，每个输出 token 的 decode 时间）/ 末 token logits 相对浮点权重的 rel L2；误差只作记录，不是质量结论。全部配方的输出头保持 FP16。
+
+| 尺寸 | FP16 | W8 `w8a16_text` | W4 `w4a16_text_rtn_g32` | 其他 W4 |
+|---|---|---|---|---|
+| 0.8B | 17.2 / 0.63% | 14.0 / 4.6% | 12.7 / 31% | — |
+| 2B | 32.4 / 0.86% | 24.4 / 4.9% | 20.3 / 37% | MLP W4 + Attention/GDN W8 21.5 / 33%；MLP RTN 24.9 / 34%；MLP AWQ 25.8 / 37% |
+| 4B | 67.8 / 0.56% | 44.3 / 3.4% | 35.3 / 29% | MLP AWQ 47.4 / 25% |
+| 9B | 117.4 / 0.48% | 73.5 / 2.5% | 55.5 / 26% | MLP AWQ 75.3 / 16% |
+| 27B | 387.9 / 0.52% | 220.2 / 2.0% | 155.0 / 17% | MLP W4 + Attention/GDN W8 175.7 / 16%；MLP RTN 228.4 / 16%；激活感知 AWQ 228.9 / 10% |
+
+W8 的 TPOT 约为 FP16 的 57%–81%，误差 2%–5%；整体 W4 再快 9%–30%，误差升到 17%–37%。MLP-only 与 AWQ 配方的误差低于整体 W4：MLP RTN 与 AWQ 的速度接近 W8，MLP W4 + Attention/GDN W8 介于 W8 与整体 W4 之间。35B-A3B MoE（P13 / D31）：FP8 54.8 / 4.5%，RTN W4 G128 59.2 / 8.4%，GPTQ W4 G128 60.4 / 9.1%。图文入口的 TPOT 与同配方文本入口相近，见性能页。
 
 ## 调整输入与核心
 
@@ -37,7 +49,7 @@ python examples/run.py --config examples/configs/qwen3_5/text/4b/fp16.toml
 
 ## 27B 权重配方
 
-27B 的量化范围分别为全部文本投影、MLP-only、MLP W4 + Attention/GDN W8，以及首层之外 MLP 的激活感知 AWQ。各范围对应独立转换产物；具体 TOML 见[全部配置](#configurations)。
+27B 的量化范围分别为全部文本投影、MLP-only、MLP W4 + Attention/GDN W8，以及首层之外 MLP 的激活感知 AWQ。各范围对应独立转换产物；NVFP4 没有转换产物，加载 `qwen3_5-27b-fp16` 时转换。具体 TOML 见[全部配置](#configurations)。
 
 各配方的短输入、固定前缀和长输入通过同一 TOML 调参。8 核为默认，可选择 4/6/8 核；27B FP16 的既有验证覆盖短输入，长输入优先使用量化权重。
 
@@ -72,9 +84,10 @@ P 为处理后的输入 token 数，D 为 decode 调用数；生成首 token 来
 
 | 配置 | 支持状态 | 精度 | 量化范围 | 4 核 | 6 核 | 8 核 | CPU线程数 | 权重 |
 |---|---|---|---|---|---|---|---|---|
-| [text/35b_a3b/fp8_e4m3_experts_attn_gdn.toml](text/35b_a3b/fp8_e4m3_experts_attn_gdn.toml) | 支持（`SUPPORTED`） | mixed-e4m3 | Experts / Attention / GDN E4M3 | ● 已实测（注意力 4 · 输出头 4） | ● 已实测（注意力 4 · 输出头 4） | ● 已实测 | 未设置（沿用环境） | `qwen3_5-35b-a3b-mixed` |
-| [text/35b_a3b/w4a16_experts_gptq_g128.toml](text/35b_a3b/w4a16_experts_gptq_g128.toml) | 支持（`SUPPORTED`） | w4a16 | experts | ● 已实测（注意力 4 · 输出头 4） | ● 已实测（注意力 4 · 输出头 4） | ● 已实测 | 24 | `qwen3_5-35b-a3b-gptq-w4a16` |
-| [text/35b_a3b/w4a16_experts_rtn_g128.toml](text/35b_a3b/w4a16_experts_rtn_g128.toml) | 支持（`SUPPORTED`） | w4a16 | experts | ● 已实测（注意力 4 · 输出头 4） | ● 已实测（注意力 4 · 输出头 4） | ● 已实测 | 24 | `qwen3_5-35b-a3b-rtn-w4a16` |
+| [text/35b_a3b/fp8_e4m3_experts_attn_gdn.toml](text/35b_a3b/fp8_e4m3_experts_attn_gdn.toml) | 支持（`SUPPORTED`） | fp8_e4m3 | 路由专家 / Attention / GDN FP8 E4M3 | ● 已实测（注意力 4 · 输出头 4） | ● 已实测（注意力 4 · 输出头 6） | ● 已实测 | 未设置（沿用环境） | `qwen3_5-35b-a3b-mixed` |
+| [text/35b_a3b/w4a16_experts_gptq_g128.toml](text/35b_a3b/w4a16_experts_gptq_g128.toml) | 支持（`SUPPORTED`） | w4a16 | 路由专家 W4A16 G128 GPTQ | ● 已实测（注意力 4 · 输出头 4） | ● 已实测（注意力 4 · 输出头 4） | ● 已实测 | 24 | `qwen3_5-35b-a3b-gptq-w4a16` |
+| [text/35b_a3b/w4a16_experts_rtn_g128.toml](text/35b_a3b/w4a16_experts_rtn_g128.toml) | 支持（`SUPPORTED`） | w4a16 | 路由专家 W4A16 G128 RTN | ● 已实测（注意力 4 · 输出头 4） | ● 已实测（注意力 4 · 输出头 4） | ● 已实测 | 24 | `qwen3_5-35b-a3b-rtn-w4a16` |
+| [text/35b_a3b/w8a16_experts.toml](text/35b_a3b/w8a16_experts.toml) | 已实现，未认证（`IMPLEMENTED_UNVERIFIED_HW`） | w8a16 | 路由专家 W8A16 | ○ 未实测 | ○ 未实测 | ○ 未实测 | 24 | `qwen3_5-35b-a3b-rtn-w8a16` |
 
 本组配置相同的项：
 
@@ -96,9 +109,10 @@ P 为处理后的输入 token 数，D 为 decode 调用数；生成首 token 来
 
 | 配置 | 支持状态 | 精度 | 量化范围 | 4 核 | 6 核 | 8 核 | CPU线程数 | 权重 |
 |---|---|---|---|---|---|---|---|---|
-| [vl/35b_a3b/fp8_e4m3_experts_attn_gdn.toml](vl/35b_a3b/fp8_e4m3_experts_attn_gdn.toml) | 支持（`SUPPORTED`） | mixed-e4m3 | Experts / Attention / GDN E4M3 | ● 已实测（注意力 4 · 输出头 4 · 视觉 4） | ● 已实测（注意力 4 · 输出头 4 · 视觉 4） | ● 已实测 | 未设置（沿用环境） | `qwen3_5-35b-a3b-mixed` |
-| [vl/35b_a3b/w4a16_experts_gptq_g128.toml](vl/35b_a3b/w4a16_experts_gptq_g128.toml) | 支持（`SUPPORTED`） | w4a16 | experts | ● 已实测（注意力 4 · 输出头 4 · 视觉 4） | ● 已实测（注意力 4 · 输出头 4 · 视觉 4） | ● 已实测 | 24 | `qwen3_5-35b-a3b-gptq-w4a16` |
-| [vl/35b_a3b/w4a16_experts_rtn_g128.toml](vl/35b_a3b/w4a16_experts_rtn_g128.toml) | 支持（`SUPPORTED`） | w4a16 | experts | ● 已实测（注意力 4 · 输出头 4 · 视觉 4） | ● 已实测（注意力 4 · 输出头 4 · 视觉 4） | ● 已实测 | 24 | `qwen3_5-35b-a3b-rtn-w4a16` |
+| [vl/35b_a3b/fp8_e4m3_experts_attn_gdn.toml](vl/35b_a3b/fp8_e4m3_experts_attn_gdn.toml) | 支持（`SUPPORTED`） | fp8_e4m3 | 路由专家 / Attention / GDN FP8 E4M3 | ● 已实测（注意力 4 · 输出头 4 · 视觉 4） | ● 已实测（注意力 4 · 输出头 4 · 视觉 4） | ● 已实测 | 未设置（沿用环境） | `qwen3_5-35b-a3b-mixed` |
+| [vl/35b_a3b/w4a16_experts_gptq_g128.toml](vl/35b_a3b/w4a16_experts_gptq_g128.toml) | 支持（`SUPPORTED`） | w4a16 | 路由专家 W4A16 G128 GPTQ | ● 已实测（注意力 4 · 输出头 4 · 视觉 4） | ● 已实测（注意力 4 · 输出头 4 · 视觉 4） | ● 已实测 | 24 | `qwen3_5-35b-a3b-gptq-w4a16` |
+| [vl/35b_a3b/w4a16_experts_rtn_g128.toml](vl/35b_a3b/w4a16_experts_rtn_g128.toml) | 支持（`SUPPORTED`） | w4a16 | 路由专家 W4A16 G128 RTN | ● 已实测（注意力 4 · 输出头 4 · 视觉 4） | ● 已实测（注意力 4 · 输出头 4 · 视觉 4） | ● 已实测 | 24 | `qwen3_5-35b-a3b-rtn-w4a16` |
+| [vl/35b_a3b/w8a16_experts.toml](vl/35b_a3b/w8a16_experts.toml) | 已实现，未认证（`IMPLEMENTED_UNVERIFIED_HW`） | w8a16 | 路由专家 W8A16 | ○ 未实测 | ○ 未实测 | ○ 未实测 | 24 | `qwen3_5-35b-a3b-rtn-w8a16` |
 
 本组配置相同的项：
 
@@ -122,8 +136,9 @@ P 为处理后的输入 token 数，D 为 decode 调用数；生成首 token 来
 | 配置 | 支持状态 | 精度 | 量化范围 | 4 核 | 6 核 | 8 核 | 权重 |
 |---|---|---|---|---|---|---|---|
 | [text/0_8b/fp16.toml](text/0_8b/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | `qwen3_5-0.8b` |
-| [text/0_8b/w4a16_text_rtn_g32.toml](text/0_8b/w4a16_text_rtn_g32.toml) | 支持（`SUPPORTED`） | w4a16 | text | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | `qwen3_5-0.8b-w4a16` |
-| [text/0_8b/w8a16_text.toml](text/0_8b/w8a16_text.toml) | 支持（`SUPPORTED`） | w8a16 | text | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | `qwen3_5-0.8b-w8a16` |
+| [text/0_8b/nvfp4_text.toml](text/0_8b/nvfp4_text.toml) | 已实现，未认证（`IMPLEMENTED_UNVERIFIED_HW`） | nvfp4 | Attention / GDN / MLP NVFP4（GDN in_proj_a/in_proj_b FP16） | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | `qwen3_5-0.8b` |
+| [text/0_8b/w4a16_text_rtn_g32.toml](text/0_8b/w4a16_text_rtn_g32.toml) | 支持（`SUPPORTED`） | w4a16 | Attention / GDN / MLP W4A16 G32 RTN | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | `qwen3_5-0.8b-w4a16` |
+| [text/0_8b/w8a16_text.toml](text/0_8b/w8a16_text.toml) | 支持（`SUPPORTED`） | w8a16 | Attention / GDN / MLP W8A16 | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | `qwen3_5-0.8b-w8a16` |
 
 本组配置相同的项：
 
@@ -147,11 +162,12 @@ P 为处理后的输入 token 数，D 为 decode 调用数；生成首 token 来
 | 配置 | 支持状态 | 精度 | 量化范围 | 4 核 | 6 核 | 8 核 | CPU线程数 | 权重 |
 |---|---|---|---|---|---|---|---|---|
 | [text/2b/fp16.toml](text/2b/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 未设置（沿用环境） | `qwen3_5-2b` |
-| [text/2b/w4a16_mlp_awq_g128.toml](text/2b/w4a16_mlp_awq_g128.toml) | 支持（`SUPPORTED`） | w4a16 | MLP AWQ G128 (first layer FP16) | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 4 | `qwen3_5-2b-quanttrio-awq-g128` |
-| [text/2b/w4a16_mlp_rtn_g32.toml](text/2b/w4a16_mlp_rtn_g32.toml) | 支持（`SUPPORTED`） | w4a16 | MLP RTN G32 | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 4 | `qwen3_5-2b-w4-mlp-only-g32` |
-| [text/2b/w4a16_mlp_rtn_g32_attn_gdn_w8a16.toml](text/2b/w4a16_mlp_rtn_g32_attn_gdn_w8a16.toml) | 支持（`SUPPORTED`） | w4a16 | MLP RTN G32 + Attention/GDN W8 | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 4 | `qwen3_5-2b-w4-mlp-w8-attn-gdn-g32` |
-| [text/2b/w4a16_text_rtn_g32.toml](text/2b/w4a16_text_rtn_g32.toml) | 支持（`SUPPORTED`） | w4a16 | text | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 未设置（沿用环境） | `qwen3_5-2b-w4a16` |
-| [text/2b/w8a16_text.toml](text/2b/w8a16_text.toml) | 支持（`SUPPORTED`） | w8a16 | text | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 未设置（沿用环境） | `qwen3_5-2b-w8a16` |
+| [text/2b/nvfp4_text.toml](text/2b/nvfp4_text.toml) | 已实现，未认证（`IMPLEMENTED_UNVERIFIED_HW`） | nvfp4 | Attention / GDN / MLP NVFP4（GDN in_proj_a/in_proj_b FP16） | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 6） | ● 已实测 | 未设置（沿用环境） | `qwen3_5-2b` |
+| [text/2b/w4a16_mlp_awq_g128.toml](text/2b/w4a16_mlp_awq_g128.toml) | 支持（`SUPPORTED`） | w4a16 | MLP W4A16 G128 AWQ（第 0 层 FP16） | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 4 | `qwen3_5-2b-quanttrio-awq-g128` |
+| [text/2b/w4a16_mlp_rtn_g32.toml](text/2b/w4a16_mlp_rtn_g32.toml) | 支持（`SUPPORTED`） | w4a16 | MLP W4A16 G32 RTN | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 4 | `qwen3_5-2b-w4-mlp-only-g32` |
+| [text/2b/w4a16_mlp_rtn_g32_attn_gdn_w8a16.toml](text/2b/w4a16_mlp_rtn_g32_attn_gdn_w8a16.toml) | 支持（`SUPPORTED`） | w4a16 | MLP W4A16 G32 RTN；Attention / GDN W8A16 | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 4 | `qwen3_5-2b-w4-mlp-w8-attn-gdn-g32` |
+| [text/2b/w4a16_text_rtn_g32.toml](text/2b/w4a16_text_rtn_g32.toml) | 支持（`SUPPORTED`） | w4a16 | Attention / GDN / MLP W4A16 G32 RTN | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 未设置（沿用环境） | `qwen3_5-2b-w4a16` |
+| [text/2b/w8a16_text.toml](text/2b/w8a16_text.toml) | 支持（`SUPPORTED`） | w8a16 | Attention / GDN / MLP W8A16 | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 未设置（沿用环境） | `qwen3_5-2b-w8a16` |
 
 本组配置相同的项：
 
@@ -174,9 +190,10 @@ P 为处理后的输入 token 数，D 为 decode 调用数；生成首 token 来
 | 配置 | 支持状态 | 精度 | 量化范围 | 4 核 | 6 核 | 8 核 | CPU线程数 | 权重 |
 |---|---|---|---|---|---|---|---|---|
 | [text/4b/fp16.toml](text/4b/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 未设置（沿用环境） | `qwen3_5-4b` |
-| [text/4b/w4a16_mlp_awq_g128.toml](text/4b/w4a16_mlp_awq_g128.toml) | 支持（`SUPPORTED`） | w4a16 | MLP AWQ G128 (first layer FP16) | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 4 | `qwen3_5-4b-quanttrio-awq-g128` |
-| [text/4b/w4a16_text_rtn_g32.toml](text/4b/w4a16_text_rtn_g32.toml) | 支持（`SUPPORTED`） | w4a16 | text | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 未设置（沿用环境） | `qwen3_5-4b-w4a16` |
-| [text/4b/w8a16_text.toml](text/4b/w8a16_text.toml) | 支持（`SUPPORTED`） | w8a16 | text | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 未设置（沿用环境） | `qwen3_5-4b-w8a16` |
+| [text/4b/nvfp4_text.toml](text/4b/nvfp4_text.toml) | 已实现，未认证（`IMPLEMENTED_UNVERIFIED_HW`） | nvfp4 | Attention / GDN / MLP NVFP4（GDN in_proj_a/in_proj_b FP16） | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 未设置（沿用环境） | `qwen3_5-4b` |
+| [text/4b/w4a16_mlp_awq_g128.toml](text/4b/w4a16_mlp_awq_g128.toml) | 支持（`SUPPORTED`） | w4a16 | MLP W4A16 G128 AWQ（第 0 层 FP16） | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 4 | `qwen3_5-4b-quanttrio-awq-g128` |
+| [text/4b/w4a16_text_rtn_g32.toml](text/4b/w4a16_text_rtn_g32.toml) | 支持（`SUPPORTED`） | w4a16 | Attention / GDN / MLP W4A16 G32 RTN | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 未设置（沿用环境） | `qwen3_5-4b-w4a16` |
+| [text/4b/w8a16_text.toml](text/4b/w8a16_text.toml) | 支持（`SUPPORTED`） | w8a16 | Attention / GDN / MLP W8A16 | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 未设置（沿用环境） | `qwen3_5-4b-w8a16` |
 
 本组配置相同的项：
 
@@ -199,9 +216,10 @@ P 为处理后的输入 token 数，D 为 decode 调用数；生成首 token 来
 | 配置 | 支持状态 | 精度 | 量化范围 | 4 核 | 6 核 | 8 核 | CPU线程数 | 权重 |
 |---|---|---|---|---|---|---|---|---|
 | [text/9b/fp16.toml](text/9b/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 未设置（沿用环境） | `qwen3_5-9b` |
-| [text/9b/w4a16_mlp_awq_g128.toml](text/9b/w4a16_mlp_awq_g128.toml) | 支持（`SUPPORTED`） | w4a16 | MLP AWQ G128 (first layer FP16) | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 4 | `qwen3_5-9b-quanttrio-awq-g128` |
-| [text/9b/w4a16_text_rtn_g32.toml](text/9b/w4a16_text_rtn_g32.toml) | 支持（`SUPPORTED`） | w4a16 | text | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 未设置（沿用环境） | `qwen3_5-9b-w4a16` |
-| [text/9b/w8a16_text.toml](text/9b/w8a16_text.toml) | 支持（`SUPPORTED`） | w8a16 | text | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 未设置（沿用环境） | `qwen3_5-9b-w8a16` |
+| [text/9b/nvfp4_text.toml](text/9b/nvfp4_text.toml) | 已实现，未认证（`IMPLEMENTED_UNVERIFIED_HW`） | nvfp4 | Attention / GDN / MLP NVFP4（GDN in_proj_a/in_proj_b FP16） | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 6） | ● 已实测 | 未设置（沿用环境） | `qwen3_5-9b` |
+| [text/9b/w4a16_mlp_awq_g128.toml](text/9b/w4a16_mlp_awq_g128.toml) | 支持（`SUPPORTED`） | w4a16 | MLP W4A16 G128 AWQ（第 0 层 FP16） | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 4 | `qwen3_5-9b-quanttrio-awq-g128` |
+| [text/9b/w4a16_text_rtn_g32.toml](text/9b/w4a16_text_rtn_g32.toml) | 支持（`SUPPORTED`） | w4a16 | Attention / GDN / MLP W4A16 G32 RTN | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 未设置（沿用环境） | `qwen3_5-9b-w4a16` |
+| [text/9b/w8a16_text.toml](text/9b/w8a16_text.toml) | 支持（`SUPPORTED`） | w8a16 | Attention / GDN / MLP W8A16 | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 未设置（沿用环境） | `qwen3_5-9b-w8a16` |
 
 本组配置相同的项：
 
@@ -224,11 +242,12 @@ P 为处理后的输入 token 数，D 为 decode 调用数；生成首 token 来
 | 配置 | 支持状态 | 精度 | 量化范围 | 4 核 | 6 核 | 8 核 | CPU线程数 | 权重 |
 |---|---|---|---|---|---|---|---|---|
 | [text/27b/fp16.toml](text/27b/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 未设置（沿用环境） | `qwen3_5-27b-fp16` |
-| [text/27b/w4a16_mlp_activation_awq_g128.toml](text/27b/w4a16_mlp_activation_awq_g128.toml) | 支持（`SUPPORTED`） | w4a16 | MLP activation AWQ G128 (first layer FP16) | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 4 | `qwen3_5-27b-activation-awq-g128` |
-| [text/27b/w4a16_mlp_rtn_g32.toml](text/27b/w4a16_mlp_rtn_g32.toml) | 支持（`SUPPORTED`） | w4a16 | MLP RTN G32 | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 4 | `qwen3_5-27b-w4-mlp-only-g32` |
-| [text/27b/w4a16_mlp_rtn_g32_attn_gdn_w8a16.toml](text/27b/w4a16_mlp_rtn_g32_attn_gdn_w8a16.toml) | 支持（`SUPPORTED`） | w4a16 | MLP RTN G32 + Attention/GDN W8 | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 4 | `qwen3_5-27b-w4-mlp-w8-attn-gdn-g32` |
-| [text/27b/w4a16_text_rtn_g32.toml](text/27b/w4a16_text_rtn_g32.toml) | 支持（`SUPPORTED`） | w4a16 | text | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 8 | `qwen3_5-27b-w4a16` |
-| [text/27b/w8a16_text.toml](text/27b/w8a16_text.toml) | 支持（`SUPPORTED`） | w8a16 | text | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 8 | `qwen3_5-27b-w8a16` |
+| [text/27b/nvfp4_text.toml](text/27b/nvfp4_text.toml) | 已实现，未认证（`IMPLEMENTED_UNVERIFIED_HW`） | nvfp4 | Attention / GDN / MLP NVFP4（GDN in_proj_a/in_proj_b FP16） | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 未设置（沿用环境） | `qwen3_5-27b-fp16` |
+| [text/27b/w4a16_mlp_activation_awq_g128.toml](text/27b/w4a16_mlp_activation_awq_g128.toml) | 支持（`SUPPORTED`） | w4a16 | MLP W4A16 G128 activation AWQ（第 0 层 FP16） | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 4 | `qwen3_5-27b-activation-awq-g128` |
+| [text/27b/w4a16_mlp_rtn_g32.toml](text/27b/w4a16_mlp_rtn_g32.toml) | 支持（`SUPPORTED`） | w4a16 | MLP W4A16 G32 RTN | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 4 | `qwen3_5-27b-w4-mlp-only-g32` |
+| [text/27b/w4a16_mlp_rtn_g32_attn_gdn_w8a16.toml](text/27b/w4a16_mlp_rtn_g32_attn_gdn_w8a16.toml) | 支持（`SUPPORTED`） | w4a16 | MLP W4A16 G32 RTN；Attention / GDN W8A16 | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 4 | `qwen3_5-27b-w4-mlp-w8-attn-gdn-g32` |
+| [text/27b/w4a16_text_rtn_g32.toml](text/27b/w4a16_text_rtn_g32.toml) | 支持（`SUPPORTED`） | w4a16 | Attention / GDN / MLP W4A16 G32 RTN | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 8 | `qwen3_5-27b-w4a16` |
+| [text/27b/w8a16_text.toml](text/27b/w8a16_text.toml) | 支持（`SUPPORTED`） | w8a16 | Attention / GDN / MLP W8A16 | ● 已实测（注意力 4 · MLP 4 · 输出头 4） | ● 已实测（注意力 4 · MLP 6 · 输出头 4） | ● 已实测 | 8 | `qwen3_5-27b-w8a16` |
 
 本组配置相同的项：
 
@@ -251,8 +270,8 @@ P 为处理后的输入 token 数，D 为 decode 调用数；生成首 token 来
 | 配置 | 支持状态 | 精度 | 量化范围 | decode_steps 默认值 | 4 核 | 6 核 | 8 核 | 权重 |
 |---|---|---|---|---|---|---|---|---|
 | [vl/0_8b/fp16.toml](vl/0_8b/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 4 | ● 已实测（视觉 4） | ● 已实测（视觉 4） | ● 已实测 | `qwen3_5-0.8b` |
-| [vl/0_8b/w4a16_text_rtn_g32.toml](vl/0_8b/w4a16_text_rtn_g32.toml) | 支持（`SUPPORTED`） | w4a16 | text | 32 | ● 已实测（视觉 4） | ● 已实测（视觉 4） | ● 已实测 | `qwen3_5-0.8b-w4a16` |
-| [vl/0_8b/w8a16_text.toml](vl/0_8b/w8a16_text.toml) | 支持（`SUPPORTED`） | w8a16 | text | 32 | ● 已实测（视觉 4） | ● 已实测（视觉 4） | ● 已实测 | `qwen3_5-0.8b-w8a16` |
+| [vl/0_8b/w4a16_text_rtn_g32.toml](vl/0_8b/w4a16_text_rtn_g32.toml) | 支持（`SUPPORTED`） | w4a16 | Attention / GDN / MLP W4A16 G32 RTN | 32 | ● 已实测（视觉 4） | ● 已实测（视觉 4） | ● 已实测 | `qwen3_5-0.8b-w4a16` |
+| [vl/0_8b/w8a16_text.toml](vl/0_8b/w8a16_text.toml) | 支持（`SUPPORTED`） | w8a16 | Attention / GDN / MLP W8A16 | 32 | ● 已实测（视觉 4） | ● 已实测（视觉 4） | ● 已实测 | `qwen3_5-0.8b-w8a16` |
 
 本组配置相同的项：
 
@@ -276,8 +295,8 @@ P 为处理后的输入 token 数，D 为 decode 调用数；生成首 token 来
 | 配置 | 支持状态 | 精度 | 量化范围 | decode_steps 默认值 | 4 核 | 6 核 | 8 核 | 权重 |
 |---|---|---|---|---|---|---|---|---|
 | [vl/2b/fp16.toml](vl/2b/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 4 | ● 已实测（视觉 4） | ● 已实测（视觉 4） | ● 已实测 | `qwen3_5-2b` |
-| [vl/2b/w4a16_text_rtn_g32.toml](vl/2b/w4a16_text_rtn_g32.toml) | 支持（`SUPPORTED`） | w4a16 | text | 32 | ● 已实测（视觉 4） | ● 已实测（视觉 4） | ● 已实测 | `qwen3_5-2b-w4a16` |
-| [vl/2b/w8a16_text.toml](vl/2b/w8a16_text.toml) | 支持（`SUPPORTED`） | w8a16 | text | 32 | ● 已实测（视觉 4） | ● 已实测（视觉 4） | ● 已实测 | `qwen3_5-2b-w8a16` |
+| [vl/2b/w4a16_text_rtn_g32.toml](vl/2b/w4a16_text_rtn_g32.toml) | 支持（`SUPPORTED`） | w4a16 | Attention / GDN / MLP W4A16 G32 RTN | 32 | ● 已实测（视觉 4） | ● 已实测（视觉 4） | ● 已实测 | `qwen3_5-2b-w4a16` |
+| [vl/2b/w8a16_text.toml](vl/2b/w8a16_text.toml) | 支持（`SUPPORTED`） | w8a16 | Attention / GDN / MLP W8A16 | 32 | ● 已实测（视觉 4） | ● 已实测（视觉 4） | ● 已实测 | `qwen3_5-2b-w8a16` |
 
 本组配置相同的项：
 
@@ -301,8 +320,8 @@ P 为处理后的输入 token 数，D 为 decode 调用数；生成首 token 来
 | 配置 | 支持状态 | 精度 | 量化范围 | decode_steps 默认值 | 4 核 | 6 核 | 8 核 | 权重 |
 |---|---|---|---|---|---|---|---|---|
 | [vl/4b/fp16.toml](vl/4b/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 4 | ● 已实测（视觉 4） | ● 已实测（视觉 4） | ● 已实测 | `qwen3_5-4b` |
-| [vl/4b/w4a16_text_rtn_g32.toml](vl/4b/w4a16_text_rtn_g32.toml) | 支持（`SUPPORTED`） | w4a16 | text | 32 | ● 已实测（视觉 4） | ● 已实测（视觉 4） | ● 已实测 | `qwen3_5-4b-w4a16` |
-| [vl/4b/w8a16_text.toml](vl/4b/w8a16_text.toml) | 支持（`SUPPORTED`） | w8a16 | text | 32 | ● 已实测（视觉 4） | ● 已实测（视觉 4） | ● 已实测 | `qwen3_5-4b-w8a16` |
+| [vl/4b/w4a16_text_rtn_g32.toml](vl/4b/w4a16_text_rtn_g32.toml) | 支持（`SUPPORTED`） | w4a16 | Attention / GDN / MLP W4A16 G32 RTN | 32 | ● 已实测（视觉 4） | ● 已实测（视觉 4） | ● 已实测 | `qwen3_5-4b-w4a16` |
+| [vl/4b/w8a16_text.toml](vl/4b/w8a16_text.toml) | 支持（`SUPPORTED`） | w8a16 | Attention / GDN / MLP W8A16 | 32 | ● 已实测（视觉 4） | ● 已实测（视觉 4） | ● 已实测 | `qwen3_5-4b-w8a16` |
 
 本组配置相同的项：
 
@@ -326,7 +345,7 @@ P 为处理后的输入 token 数，D 为 decode 调用数；生成首 token 来
 | 配置 | 支持状态 | 精度 | 量化范围 | decode_steps 默认值 | 4 核 | 6 核 | 8 核 | 权重 |
 |---|---|---|---|---|---|---|---|---|
 | [vl/9b/fp16.toml](vl/9b/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 4 | ● 已实测（视觉 4） | ● 已实测（视觉 4） | ● 已实测 | `qwen3_5-9b` |
-| [vl/9b/w8a16_text.toml](vl/9b/w8a16_text.toml) | 支持（`SUPPORTED`） | w8a16 | text | 32 | ● 已实测（视觉 4） | ● 已实测（视觉 4） | ● 已实测 | `qwen3_5-9b-w8a16` |
+| [vl/9b/w8a16_text.toml](vl/9b/w8a16_text.toml) | 支持（`SUPPORTED`） | w8a16 | Attention / GDN / MLP W8A16 | 32 | ● 已实测（视觉 4） | ● 已实测（视觉 4） | ● 已实测 | `qwen3_5-9b-w8a16` |
 
 本组配置相同的项：
 
@@ -350,8 +369,8 @@ P 为处理后的输入 token 数，D 为 decode 调用数；生成首 token 来
 | 配置 | 支持状态 | 精度 | 量化范围 | decode_steps 默认值 | 4 核 | 6 核 | 8 核 | CPU线程数 | 权重 |
 |---|---|---|---|---|---|---|---|---|---|
 | [vl/27b/fp16.toml](vl/27b/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 4 | ● 已实测（视觉 4） | ● 已实测（视觉 4） | ● 已实测 | 未设置（沿用环境） | `qwen3_5-27b-fp16` |
-| [vl/27b/w4a16_text_rtn_g32.toml](vl/27b/w4a16_text_rtn_g32.toml) | 支持（`SUPPORTED`） | w4a16 | text | 32 | ● 已实测（视觉 4） | ● 已实测（视觉 4） | ● 已实测 | 8 | `qwen3_5-27b-w4a16` |
-| [vl/27b/w8a16_text.toml](vl/27b/w8a16_text.toml) | 支持（`SUPPORTED`） | w8a16 | text | 32 | ● 已实测（视觉 4） | ● 已实测（视觉 4） | ● 已实测 | 8 | `qwen3_5-27b-w8a16` |
+| [vl/27b/w4a16_text_rtn_g32.toml](vl/27b/w4a16_text_rtn_g32.toml) | 支持（`SUPPORTED`） | w4a16 | Attention / GDN / MLP W4A16 G32 RTN | 32 | ● 已实测（视觉 4） | ● 已实测（视觉 4） | ● 已实测 | 8 | `qwen3_5-27b-w4a16` |
+| [vl/27b/w8a16_text.toml](vl/27b/w8a16_text.toml) | 支持（`SUPPORTED`） | w8a16 | Attention / GDN / MLP W8A16 | 32 | ● 已实测（视觉 4） | ● 已实测（视觉 4） | ● 已实测 | 8 | `qwen3_5-27b-w8a16` |
 
 本组配置相同的项：
 

@@ -132,7 +132,7 @@ def test_w8_scale_inventory_is_all_or_none_before_tensorlist_indexing():
 
     any_scale = setter.index("const bool any_scale")
     all_or_none_gate = setter.index("if (any_scale)", any_scale)
-    attach = setter.index("layer_weights_[i].q_ws")
+    attach = setter.index("lw.q_ws")
     assert any_scale < attach
     for scale in (
         "q_scale_list",

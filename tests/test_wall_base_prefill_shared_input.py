@@ -175,7 +175,7 @@ struct Model{
   auto append_ring=[&](int64_t site,int64_t rows,int64_t idx){append(FmbRouteFamily::ALL_REDUCE,site,causal_ring_route(rows,2048),0,{},idx);};
   for(auto& chunk:plan.compute.chunks){PRODUCER}
   bool wall_small_prefill_fused=wall_small_prefill_fusion(plan,physical_len,position,layout.is_causal,layout.use_attn_mask,layout.batch_size);
-  const bool wall_fp16_long_prefill_fused=false;
+  const bool wall_fp16_long_prefill_fused=false,qwen_c512=false;
   ACTIVATION_PRODUCER
   std::sort(context.manifest_.routes.begin(),context.manifest_.routes.end(),[](auto& a,auto& b){return std::make_tuple(a.family,a.site_id,a.invocation)<std::make_tuple(b.family,b.site_id,b.invocation);});
   context.consumed_.assign(context.manifest_.routes.size(),0);

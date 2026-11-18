@@ -211,7 +211,7 @@ def test_pi05_top_level_is_serialized_and_child_graphs_key_physical_plan():
     assert '_component_plan.graph_key_words()' in adarms_source
     siglip_cpp = (root / 'src/fused/rpu_siglip_model.cpp').read_text(encoding='utf-8')
     assert 'image_batch_count_ = packed_image_count;' in siglip_cpp
-    assert siglip_cpp.count('configure_chunk_for_shape(') == 4
+    assert siglip_cpp.count('configure_chunk_for_shape(') == 5
 
 
 def test_pi05_denoise_graph_keeps_only_the_current_signature():

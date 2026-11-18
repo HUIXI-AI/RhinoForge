@@ -124,8 +124,8 @@ int main() {
     assert f"void rpu_{family}_set_chunk_envelope(" in (ROOT / "src/core/rpu_kernel_decls.h").read_text()
 
 
-@pytest.mark.parametrize("packed,w8", [(False, False), (True, False), (True, True)])
-def test_real_hyvit_bind_uses_installed_packed_cache_and_cleans_failure(monkeypatch, packed, w8):
+@pytest.mark.parametrize("packed,quant", [(False, "fp16"), (True, "fp16"), (True, "w8"), (True, "w4")])
+def test_real_hyvit_bind_uses_installed_packed_cache_and_cleans_failure(monkeypatch, packed, quant):
     from rpu_backend.adapters.hy_vla import runtime
     tree = ast.parse((ROOT / "python/rpu_backend/adapters/hy_vla/runtime.py").read_text())
     owner = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "HyVlaRunner")
@@ -137,12 +137,14 @@ def test_real_hyvit_bind_uses_installed_packed_cache_and_cleans_failure(monkeypa
     weights = SimpleNamespace(vit={name: [value] for name in (
         "qw kw vw ow f1w f2w n1w n1b n2w n2b qb kb vb ob f1b f2b qws kws vws ows f1ws f2ws").split()},
         vit_proj1_w=value, vit_proj1_b=value, patch_embed_cores=8, vit_patch_gemm_w=value, vit_pos_fused=value)
-    weights.vit["qws"] = [value] if w8 else []
+    weights.vit["qws"] = [] if quant == "fp16" else [value]
+    weights.vit["qw"] = [SimpleNamespace(dtype={
+        "fp16": torch.float16, "w8": torch.int8, "w4": torch.uint8}[quant])]
     cache = SimpleNamespace(max_seq_len=196 * (3 if packed else 1))
     runner = SimpleNamespace(_native_cold=SimpleNamespace(vit=SimpleNamespace(
         fast_replay=False, fast_replay_preload=False, mask_once=False, kvpad16=False, q_inplace=False)),
         _fused_merger=False, _proj1_in_merger=False)
-    namespace = dict(torch=torch, c=cfg, w=weights, cache=cache, self=runner)
+    namespace = dict(torch=torch, c=cfg, w=weights, cache=cache, self=runner, lanes=8)
     exec(compile(ast.Module(body=[bind], type_ignores=[]), "<actual-hyvit-bind>", "exec"), namespace)
     events = []
     def weights_op(label):
@@ -150,13 +152,14 @@ def test_real_hyvit_bind_uses_installed_packed_cache_and_cleans_failure(monkeypa
     monkeypatch.setattr(torch.ops.rpu, "hyvit2_set_runtime_config", weights_op("config"), raising=False)
     monkeypatch.setattr(torch.ops.rpu, "hyvit2_set_weights", weights_op("fp16"), raising=False)
     monkeypatch.setattr(torch.ops.rpu, "hyvit2_set_weights_w8a16", weights_op("w8"), raising=False)
+    monkeypatch.setattr(torch.ops.rpu, "hyvit2_set_weights_w4a16", weights_op("w4"), raising=False)
     monkeypatch.setattr(torch.ops.rpu, "hyvit2_model_set_patch_emb", weights_op("patch"), raising=False)
     def envelope(handle, capacity, chunk):
-        assert events[-1] == ("w8" if w8 else "fp16")
+        assert events[-1] == quant
         events.append((handle, capacity, chunk))
     monkeypatch.setattr(torch.ops.rpu, "hyvit2_set_chunk_envelope", envelope, raising=False)
     namespace["bind"](42)
-    assert events == ["config", "w8" if w8 else "fp16", (42, cache.max_seq_len, 0), "patch"]
+    assert events == ["config", quant, (42, cache.max_seq_len, 0), "patch"]
     def fail(*args):
         raise RuntimeError("HY envelope refused")
     monkeypatch.setattr(torch.ops.rpu, "hyvit2_set_chunk_envelope", fail, raising=False)

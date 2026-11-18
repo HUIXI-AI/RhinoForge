@@ -1,6 +1,8 @@
-"""Execute native T160 address/declaration code without an device or model weights."""
+"""Execute native T160/T192 address/declaration code without an RPU or model weights."""
 from pathlib import Path
 import subprocess
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,7 +18,20 @@ def _block(source, start):
     return source[begin:end]
 
 
-def test_native_t160_residuals_fit_four_roots_and_preserve_live_attention(tmp_path):
+# Available per-core temporary space after the retained Vision buffers, native
+# fixed allocations and the 64 KiB reserve, measured with persistent SigLIP
+# LayerNorm vectors; streaming them (T192) returns 27 x 4 x 2,560 bytes.
+_BUDGET = 7667712
+_SIGLIP_LN_PERSISTENT = 27 * 4 * 2560
+
+
+@pytest.mark.parametrize("rows,budget,expected", [
+    (464, _BUDGET, {False: 7602176, True: 7633920}),
+    # C480 is the C464 layout at 480 rows (no A8 route): four 1,966,080-byte
+    # roots, 196,608 bytes over the persistent-LN budget.
+    (480, _BUDGET + _SIGLIP_LN_PERSISTENT, {False: 7864320}),
+])
+def test_native_pair_residuals_fit_four_roots_and_preserve_live_attention(tmp_path, rows, budget, expected):
     source = (ROOT / "src/fused/rpu_gemma_model.cpp").read_text()
     names = (
         "pi05_pair_rows", "pi05_prefix_rows", "pi05_pair_slab_bytes",
@@ -24,7 +39,7 @@ def test_native_t160_residuals_fit_four_roots_and_preserve_live_attention(tmp_pa
         "pi05_pair_single_compact", "pi05_pair_slab_compact",
         "pi05_pair_spill_elements", "pi05_pair_compact_root_bytes",
         "pi05_pair_scratch_mask", "pi05_pair_mask_bytes",
-        "pi05_pair_input_compact_address", "pi05_a8_bytes", "pi05_a8_root_bytes",
+        "pi05_pair_input_compact_address", "pi05_a8_bytes", "pi05_a8_root_bytes", "pi05_a8_s0_bytes",
     )
     methods = []
     for name in names:
@@ -49,7 +64,8 @@ struct BufferDecl {
  int per_layer; const char* alias; int scope;
 };
 struct Model {
- int64_t pi05_pair_rows_ = 464;
+ int64_t pi05_pair_rows_ = ROWS;
+ bool pi05_prefill_a8_panel512_ = false;
  bool pi05_prefill_o_pair_ = true, pi05_prefill_owner_norm_ = true, pi05_prefill_a8_ = false;
  uint32_t addr(int, const char* name) const {
   assert(std::string(name) == "pi05_pair_s3"); return 0x40700000;
@@ -74,19 +90,20 @@ int main() {
  // Norm0 writes raw0 in [0,D), Norm1 writes raw1 in [D,2D).
  assert(2*d <= std::min(c0,c1));
  for (bool a8 : {false,true}) {
+  if (a8 ? A8_EXPECTED < 0 : FP_EXPECTED < 0) continue;
   m.pi05_prefill_a8_=a8;
   auto decls=m.declare(); int roots=0; int64_t temporary=0;
   for (const auto& b:decls) if (!b.alias) { ++roots; temporary+=Align(b.size,256); }
   assert(roots==4);
-  // Measured available temporary space after the retained Vision buffers,
-  // native fixed allocations and the existing 64 KiB reserve.
-  assert(temporary <= 7667712);
-  assert(temporary == (a8 ? 7633920 : 7602176));
+  assert(temporary <= BUDGET);
+  assert(temporary == (a8 ? A8_EXPECTED : FP_EXPECTED));
  }
 }
 '''
+    defines = (f"#define ROWS {rows}\n#define BUDGET {budget}\n"
+               f"#define FP_EXPECTED {expected.get(False, -1)}\n#define A8_EXPECTED {expected.get(True, -1)}\n")
     path = tmp_path / "layout.cpp"
-    path.write_text(code)
+    path.write_text(defines + code)
     binary = tmp_path / "layout"
     subprocess.run(["c++", "-std=c++17", str(path), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True)

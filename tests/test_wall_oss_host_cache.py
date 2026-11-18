@@ -103,6 +103,7 @@ def _make_vision(window=True, host_cache=True, per_window_sdpa=False):
     v._position_keepalive_snapshot = None
     v._device_patch_embed = False
     v._linear_acc32 = False
+    v._num_cores = 8
     v._patch_w_rpu = v._patch_w_fold_rpu = None
     v._pe_buf_cache = {}
     v._host_cache = host_cache
@@ -319,6 +320,15 @@ def test_prefill_chunk_cap_tp2_stays_256():
         assert llm._prefill_chunk_size_cap(2) == 256
 
 
+def test_prefill_chunk_cap_reduced_four_lane_pad16_is_320():
+    # 320 is a ceiling only: the native domain still drops a chunk that misses
+    # SPM, so P640 resolves to 2x320 only where C320 fits.
+    with patch.dict(os.environ, {"RPU_WALL_OSS_KVINSERT_PAD16": "1"}):
+        assert llm._prefill_chunk_size_cap(4) == 320
+    with patch.dict(os.environ, {"RPU_WALL_OSS_KVINSERT_PAD16": "0"}):
+        assert llm._prefill_chunk_size_cap(4) == 256
+
+
 # ───────────────────── equal-two prefill execution plan ────────────────────
 # WHICH chunk sizes are admissible is NOT decided here. `rpu_backend` is stubbed
 # in this module, so `_equal_two_chunk_supported`'s C++ predicate would come back
@@ -375,6 +385,7 @@ def test_prefill_execution_plan_refuses_a_plan_the_kernel_rejects():
 def test_rtc_prefill_execution_plan_splits_graph_profiles_at_640():
     o = _make_vla()
     o.rtc_enabled = True
+    o.llm = types.SimpleNamespace(residual_scale=1)
     profiles = o._prefix_execution_profiles((599, 671), horizon=20)
     assert [
         (p["real_min"], p["real_max"], p["execution_len"], p["chunk_size"])
@@ -1541,6 +1552,14 @@ def test_vision_single_resets_after_patch_embed_before_capture():
 
 def test_vision_group_resets_after_patch_embed_before_capture():
     _assert_patch_embed_reset_before_capture(vis.WallOssVision._forward_group)
+
+
+def test_vision_single_releases_graph_layout_before_the_next_camera():
+    # A four-core RTC camera graph left 6.7 MB of temporaries; the next
+    # camera's patch-embedding gather then ran out of SPM.
+    source = inspect.getsource(vis.WallOssVision._forward_one)
+    record_pos = source.index("self._record_native_execution(")
+    assert "torch.ops.rpu.spm_alloc_reset_temporary()" in source[record_pos:]
 
 
 @pytest.mark.parametrize("host_cache", [False, True])

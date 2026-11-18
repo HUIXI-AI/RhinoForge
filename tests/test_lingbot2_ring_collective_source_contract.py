@@ -134,7 +134,6 @@ def test_actual_attn_ring_adarms_cold_admission_covers_both_expert_precisions(tm
 #include <array>
 #include <cassert>
 #include <functional>
-int NUM_CORES = 8;
 enum class KernelId {
     LINGBOT2_ADARMS_NORM_SHIFT_H768_DIAGONAL,
     PI05_ADARMS_NORM_SHIFT_H1024,
@@ -149,8 +148,9 @@ struct Selection { bool capable, diagonal, ring; };
 struct Model {
     bool sparse_experts_ = true;
     int sparse_weight_mode_ = 2;
-    int layers = 36, hidden = 768, chunk_size_ = 51, tp_rows_ = 64, tp = 8;
+    int layers = 36, hidden = 768, chunk_size_ = 51, tp_rows_ = 64, tp = 8, cores = 8;
     double eps_ = 1e-6;
+    int num_cores() const { return cores; }
     int num_layers() const { return layers; }
     int hidden_size() const { return hidden; }
     int attn_tp() const { return tp; }
@@ -184,11 +184,10 @@ int main() {
             [](Model& m) { m.tp_rows_ = 63; },
             [](Model& m) { m.tp = 4; },
             [](Model& m) { m.eps_ = 1e-5; },
-            [](Model&) { NUM_CORES = 4; },
+            [](Model& m) { m.cores = 4; },
         }}) {
             Model bad = model; corrupt(bad);
             assert(!bad.configure().ring);
-            NUM_CORES = 8;
         }
     }
     for (int mode : {0, 3, -1}) {

@@ -19,7 +19,7 @@ def test_c448_single_compact_schedule_preserves_both_residuals(tmp_path, monkeyp
         "bool pi05_pair_single_compact(", "bool pi05_pair_slab_compact(",
         "int64_t pi05_pair_spill_elements(", "int64_t pi05_pair_compact_root_bytes(",
         "const char* pi05_pair_kv_norm_name(", "int64_t pi05_a8_bytes(",
-        "int64_t pi05_a8_root_bytes(", "bool pi05_pair_scratch_mask(",
+        "int64_t pi05_a8_root_bytes(", "int64_t pi05_a8_s0_bytes(", "bool pi05_pair_scratch_mask(",
         "std::vector<int64_t> pi05_pair_input_compact_arguments(",
         "uint32_t pi05_pair_input_compact_address(",
         "std::vector<int64_t> pi05_pair_spill_arguments(", "int64_t pi05_pair_spill_stride(",
@@ -27,6 +27,7 @@ def test_c448_single_compact_schedule_preserves_both_residuals(tmp_path, monkeyp
         "std::vector<int64_t> pi05_o_pair_norm_arguments(",
         "std::vector<int64_t> pi05_o_pair_companion_arguments(",
         "std::vector<int64_t> pi05_prefill_gateup_pair_arguments(",
+        "bool pi05_down_a8_enabled(", "std::vector<int64_t> pi05_down_a8_arguments(",
         "std::vector<int64_t> pi05_down_pair_arguments(",
         "std::vector<FmbRouteManifestEntry> pi05_o_pair_routes(",
         "void emit_pi05_o_pair_finish(",
@@ -91,7 +92,8 @@ void rpu_launch_pi05_prefill_gate_up_geglu_weight_outer_w8a16_c400x2_kernel(
     uint32_t x0,uint32_t x1,const at::Tensor&,const at::Tensor&,uint32_t y0,uint32_t y1,
     const at::Tensor&,const at::Tensor&,int64_t rows){assert(rows==C);has(x0,F,4);has(x1,F,6);gate(y0,y1);}
 void rpu_launch_pi05_prefill_gate_up_geglu_w8a8_split_kernel(uint32_t x,uint32_t,uint32_t stage,
-    const at::Tensor&,const at::Tensor&,uint32_t y0,uint32_t y1,const at::Tensor&,const at::Tensor&,int64_t rows){
+    const at::Tensor&,const at::Tensor&,uint32_t y0,uint32_t y1,const at::Tensor&,const at::Tensor&,int64_t rows,bool panel512){
+    assert(!panel512);
     assert(rows==C && x==S1 && stage==S0);has(x,C*2080,4);has(x+C*2080,C*2080,6);
     put(stage,384*2048*2,40);gate(y0,y1);
 }
@@ -120,6 +122,7 @@ struct Context {
 };
 struct Owner {
     int64_t pi05_pair_rows_=C;
+    bool pi05_prefill_a8_panel512_=false;
     bool pi05_prefill_a8_=false,pi05_prefill_o_pair_=true,pi05_prefill_gateup_pair_=true,carried_=false;
     DeferredDmaChannels pi05_o_pair_output_dma_;
     int pi05_o_pair_carried_layer_=-1;
@@ -132,8 +135,11 @@ struct Owner {
     Context& ctx(){return context;}
     int num_layers() const{return 18;} int num_cores() const{return 8;}
     bool pi05_o_pair_owner() const{return true;}
+    bool down_pair=true;
+    bool use_pi05_down_pair() const{return down_pair;}
     bool pi05_pair_fp16() const{return false;}
     void pi05_down_pair_require_graph() const{}
+    void emit_pi05_down_a8_linear(int){assert(false);}
     bool use_pi05_prefill_gateup_pair() const{return true;}
     uint32_t addr(int,const char* name) const{
         if(std::string(name)=="residual1")return S0;
@@ -203,6 +209,15 @@ int main(){
         o.q_ddr_buf_=at::empty({7,capacity,256},at::TensorOptions().dtype(at::kHalf));rejects([&]{o.pi05_pair_spill_stride();});
         o.q_ddr_buf_=at::empty({8,880,256},at::TensorOptions().dtype(at::kHalf));rejects([&]{o.pi05_pair_spill_stride();});
     }
+    // 4/6-core C448/C464 binds the rows without the paired-Down layout, which
+    // alone declares input_norm_kv; the ordinary layout normalizes into input_norm.
+    for(int rows:{448,464}){
+        Owner o;o.pi05_pair_rows_=rows;o.down_pair=false;
+        for(bool paired:{false,true}){
+            assert(std::string(o.pi05_pair_kv_norm_name(false,paired))=="input_norm");
+            assert(std::string(o.pi05_pair_kv_norm_name(true,paired))=="input_norm_kv");
+        }
+    }
     for(int rows:{272,288,304,320,400,416,432}){
         Owner o;o.pi05_pair_rows_=rows;assert(!o.pi05_pair_single_compact());
         assert(o.pi05_pair_compact_root_bytes()==rows*1024);
@@ -245,7 +260,10 @@ def test_replicated_lane_source_is_opt_in_and_reads_cores_1_to_7():
     owned = memcpy[start:memcpy.index("\n}\n", start)]
     assert "TORCH_CHECK(!source_replicated || deferred != nullptr," in owned
     assert owned.count("source_replicated ? lane + 1 : 0") == 1
-    assert owned.index("if (deferred != nullptr)") < owned.index("source_replicated ? lane + 1 : 0")
+    deferred_guard = owned.index("if (deferred != nullptr && deferred_lane_count() > 0)")
+    lane_count = owned.index("const int lanes = deferred_lane_count();")
+    lane_loop = owned.index("for (int lane = 0; lane < lanes; ++lane)")
+    assert deferred_guard < lane_count < lane_loop < owned.index("source_replicated ? lane + 1 : 0")
     users = [path for path in (ROOT / "src").rglob("*.cpp")
              if "/*source_replicated=*/true" in path.read_text()]
     assert [path.relative_to(ROOT).as_posix() for path in users] == ["src/fused/rpu_gemma_model.cpp"]

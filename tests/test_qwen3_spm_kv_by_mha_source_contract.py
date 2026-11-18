@@ -386,7 +386,9 @@ struct Model {
     bool is_causal = true, allow_batch_decode = true;
     bool has_mrope_ = false, adarms_ = false, decoder_mixed_precision_ = false;
     bool nvfp4_ = false, linear_acc32_ = false;
-    bool reduced_qwen3vl_profile_ = false;
+    bool reduced_qwen3vl_profile_ = false, reduced_internvla_profile_ = false;
+    bool reduced_wall_text_profile_ = false, reduced_wall_action_profile_ = false;
+    bool reduced_hyvla_profile_ = false, reduced_lingbot2_expert_profile_ = false;
     bool fast_replay_skip_layer_loop_ = false, preload_replay_skip_ = false;
     std::optional<at::Tensor> attention_mask;
     at::Tensor hidden_states{1,16,1024};
@@ -510,6 +512,19 @@ int main() {
     legacy.k_caches.assign(28, at::Tensor{__OLD_K_SHAPE__});
     legacy.v_caches.assign(28, at::Tensor{__OLD_V_SHAPE__});
     legacy.forward_admission(); assert(legacy.admitted == 1);
+    // Exact InternVLA text carries M-RoPE but no VL mask domain.
+    for (int cores : {4,6}) {
+        Model text; text.configure(2048, 28, cores);
+        text.reduced_internvla_profile_ = text.has_mrope_ = true;
+        text.forward_admission(); assert(text.admitted == 1);
+        Model masked; masked.configure(2048, 28, cores);
+        masked.reduced_internvla_profile_ = masked.has_mrope_ = true;
+        masked.attention_mask = at::Tensor{1,16};
+        masked.attention_mask->dtype = c10::ScalarType::Long;
+        bool rejected = false;
+        try { masked.forward_admission(); } catch (const std::runtime_error&) { rejected = true; }
+        assert(rejected && masked.admitted == 0);
+    }
     // Exact VL install permits M-RoPE/ACC32 without weakening physical caches.
     for (int cores : {4,6}) for (int width : {2048,2560,4096}) {
         Model vl; vl.configure(width, width == 2048 ? 28 : 36, cores);
@@ -607,7 +622,8 @@ def test_reduced_family_weights_admit_only_exact_profiles_before_commit(tmp_path
     end = header.index("        set_model_params(", begin)
     gate = header[begin:end]
     from test_fmb_standalone_layout_rebuild import _definition
-    acc32_setter = _definition(header, "void set_linear_acc32(bool enabled)")
+    acc32_setter = (_definition(header, "int64_t qwen3_inplace_capacity(") +
+                    _definition(header, "void set_linear_acc32(bool enabled)"))
     topology_override = _definition(header, "DecoderExecutionTopology resolve_model_execution_topology(")
     width_override = _definition(header, "int64_t resolve_model_mlp_intermediate_size(int64_t logical_size) const override")
     cpp = r'''
@@ -618,6 +634,7 @@ def test_reduced_family_weights_admit_only_exact_profiles_before_commit(tmp_path
 #include <typeinfo>
 #include <vector>
 #include "src/core/execution_topology.h"
+#include "src/core/rpu_wall_sorting_config.h"
 #define TORCH_CHECK(condition, ...) do { if (!(condition)) throw std::runtime_error("rejected"); } while (0)
 namespace at {
 enum ScalarType { kHalf, kChar, kByte, kFloat };
@@ -633,9 +650,17 @@ using TensorList = std::vector<Tensor>;
 }
 using v3::qwen3_fp16_profile_num_layers;
 using v3::llama_fp16_profile_num_layers;
+using v3::internvla_text_profile_num_layers;
+using v3::qwen3_vl_text_prefix_num_layers;
+using v3::wall_oss_text_profile_num_layers;
+using v3::wall_oss_action_profile_num_layers;
+using v3::hyvla_vlm_profile_num_layers;
+using v3::hyvla_expert_profile_num_layers;
+using v3::lingbot2_expert_profile_num_layers;
 using v3::resolve_decoder_execution_topology;
 using v3::decoder_mlp_intermediate_size;
 using v3::decoder_packed_w4_mlp_intermediate_size;
+using v3::decoder_nvfp4_mlp_intermediate_size;
 using v3::DecoderExecutionTopology;
 struct FusedModelBase {
     int budget = 6, bound_mlp_tp = 0;
@@ -657,9 +682,15 @@ struct CausalDecoderModel : FusedModelBase {
     int64_t num_q_heads = 16, num_kv_heads = 8, head_dim = 128;
     int64_t configured_vocab_size_ = 151936;
     bool linear_acc32_ = false, has_scale = false, has_nvfp4 = false;
+    bool qwen3_prefill_w8a8_ = false, qwen3_c192_ = false, qwen3_c256_ = false, qwen3_c512_ = false;
     bool reduced_qwen3vl_profile_ = false;
-    bool reduced_qwen3_w4_profile_ = false;
+    bool reduced_qwen3_w4_profile_ = false, reduced_qwen3_nvfp4_profile_ = false;
     bool reduced_llama_profile_ = false;
+    bool reduced_internvla_profile_ = false;
+    bool reduced_wall_text_profile_ = false, reduced_wall_action_profile_ = false;
+    bool reduced_hyvla_profile_ = false, reduced_lingbot2_expert_profile_ = false;
+    static constexpr int REDUCED_HYVLA_VLM_OWNER = 1, REDUCED_HYVLA_EXPERT_OWNER = 2;
+    WallSortingConfig wall_sorting_;
     int64_t logical_intermediate_size_ = 0, physical_intermediate_ = 0;
     bool wall_prefill_mixed_requested_ = false, wall_prefill_staged_requested_ = false;
     bool cold_routes_configured_ = true, use_silu = true;
@@ -671,6 +702,9 @@ struct CausalDecoderModel : FusedModelBase {
         gate_scale_list, up_scale_list, down_scale_list;
     int num_cores() const { return budget; }
     int lm_head_tp() const { return head_tp; }
+    virtual bool reduced_wall_action_owner() const { return false; }
+    virtual int reduced_hyvla_owner() const { return 0; }
+    virtual bool reduced_lingbot2_expert_owner() const { return false; }
     int num_layers() const { return commits ? q_w_list.size() : 0; }
     int get_last_resolved_chunk_size() const { return 0; }
     void invalidate_model_state() {}
@@ -680,6 +714,9 @@ struct CausalDecoderModel : FusedModelBase {
     void configure(const std::vector<int64_t>& dims, int cores) {
         hidden_size = dims[0]; intermediate_size = dims[1];
         num_q_heads = dims[2]; budget = cores;
+        head_tp = (cores == 8 ? 8 :
+                   ((cores == 6 && (configured_vocab_size_ == 151936 || configured_vocab_size_ == 128256))
+                    ? 6 : 4));
         for (auto* list : {&q_w_list, &k_w_list, &v_w_list, &o_w_list,
                            &gate_list, &up_list, &down_list})
             list->assign(dims[3], at::Tensor{});
@@ -728,6 +765,13 @@ struct CausalDecoderModel : FusedModelBase {
             }
         }
     }
+    void pack_nvfp4_physical() {
+        // Dense NVFP4 stores the 384-aligned MLP width at six lanes.
+        const auto physical = v3::decoder_nvfp4_mlp_intermediate_size(intermediate_size, budget);
+        for (auto* list : {&gate_list, &up_list}) for (auto& w : *list) w.rows = physical;
+        for (auto& w : down_list) w.cols = physical;
+        pack_nvfp4();
+    }
     void pack_w8() {
         has_scale = true;
         for (auto* list : {&q_w_list,&k_w_list,&v_w_list,&o_w_list,
@@ -775,7 +819,7 @@ int main() {
                     l->resize(l->size() == 28 ? 36 : 28);
             },
             [](auto& m) { m.configured_vocab_size_ += 16; },
-            [](auto& m) { m.head_tp = 6; },
+            [](auto& m) { m.head_tp = (m.budget == 6 ? 4 : 6); },
             [](auto& m) { m.cold_routes_configured_ = false; },
             [](auto& m) { m.has_scale = true; },
             [](auto& m) { m.has_nvfp4 = true; },
@@ -851,6 +895,32 @@ int main() {
             try { bad.set_weights_gate(); } catch (const std::runtime_error&) { rejected = true; }
             assert(rejected && bad.commits == 0);
         }
+        // Dense 4B/8B/14B NVFP4 mirrors the packed-W4 width; 32B has no recipe,
+        // and 0.6B/1.7B keep their speech-shared admission (checked below).
+        if (profile[0] >= 2560) {
+            CausalDecoderModel nvfp4; nvfp4.configure(profile,budget); nvfp4.pack_nvfp4_physical();
+            bool rejected = false;
+            try { nvfp4.set_weights_gate(); } catch (const std::runtime_error&) { rejected = true; }
+            assert(rejected == (profile[3] == 64));
+            if (!rejected) {
+                assert(nvfp4.commits == 1 && nvfp4.reduced_qwen3_nvfp4_profile_ &&
+                       !nvfp4.reduced_qwen3_w4_profile_);
+                assert(nvfp4.physical_intermediate_ ==
+                       v3::decoder_nvfp4_mlp_intermediate_size(profile[1], budget));
+                // A later install cannot drop the bound packed width.
+                nvfp4.has_nvfp4 = nvfp4.has_scale = false; nvfp4.configure(profile,budget);
+                rejected = false;
+                try { nvfp4.set_weights_gate(); } catch (const std::runtime_error&) { rejected = true; }
+                assert(rejected && nvfp4.commits == 1);
+            }
+            if (profile[3] != 64 && dense != v3::decoder_nvfp4_mlp_intermediate_size(profile[1], budget)) {
+                // The FP16/W8 six-lane width (9792/17472) is not the NVFP4 stripe.
+                CausalDecoderModel bad; bad.configure(profile,budget); bad.pack_nvfp4();
+                rejected = false;
+                try { bad.set_weights_gate(); } catch (const std::runtime_error&) { rejected = true; }
+                assert(rejected && bad.commits == 0);
+            }
+        }
     }
     // Speech cold identities distinguish full talkers, five-layer predictors,
     // and the headless codec. Exercise the real resolver after admission too.
@@ -917,12 +987,15 @@ int main() {
         try{bad.set_weights_gate();}catch(const std::runtime_error&){rejected=true;}
         assert(rejected && bad.commits==0);
     }
-    // Exact FP16 Llama-3.2-1B reuses the template: D64, no QK-norm, vocab 128256,
-    // MLP6 on the padded 8256 physical width; every other variant is refused.
+    // Exact Llama-3.2-1B reuses the template: D64, no QK-norm, vocab 128256,
+    // MLP6 on the padded 8256 physical width (W4: 8448); every other variant is
+    // refused.
     auto llama = [](int budget) {
         CausalDecoderModel m;m.configured_vocab_size_=128256;m.head_dim=64;
         m.eps=1e-5;m.qk_norm_present=false;
-        m.configure({2048,8192,32,16},budget);return m;
+        m.configure({2048,8192,32,16},budget);
+        if (budget == 6) m.head_tp = 6;
+        return m;
     };
     for (int budget : {4,6}) {
         auto l=llama(budget);l.set_weights_gate();
@@ -931,13 +1004,18 @@ int main() {
         assert(lt.num_cores==budget && lt.attention_tp==4 && lt.mlp_tp==budget);
         assert(l.physical_intermediate_==(budget==6 ? 8256 : 8192));
         assert(l.gate_list.back().rows==l.physical_intermediate_);
+        // W8A16 and G32 packed W4 share the same bounded Llama admission.
+        for (bool packed : {false,true}) {
+            auto q=llama(budget);if(packed)q.pack_w4();else q.pack_w8();
+            q.set_weights_gate();assert(q.commits==1 && q.reduced_llama_profile_);
+            assert(q.physical_intermediate_==(budget==4 ? 8192 : 8256));
+        }
         for (const auto& fault : std::vector<std::function<void(CausalDecoderModel&)>>{
             [](auto& m){m.qk_norm_present=true;},[](auto& m){m.configured_vocab_size_=151936;},
-            [](auto& m){m.pack_w8();},[](auto& m){m.pack_w4();},
             [](auto& m){m.mrope_section={24,20,20};},[](auto& m){m.deepstack_lang_layers={0,1,2};},
             [](auto& m){m.qkv_bias_present=true;},[](auto& m){m.use_silu=false;},
             [](auto& m){m.gate_list.back().rows-=16;},[](auto& m){m.down_list.back().cols-=16;},
-            [](auto& m){m.head_tp=6;},[](auto& m){m.budget=5;},
+            [](auto& m){m.head_tp=(m.budget==6?4:6);},[](auto& m){m.budget=5;},
             [](auto& m){
                 for (auto* l : {&m.q_w_list,&m.k_w_list,&m.v_w_list,&m.o_w_list,
                                 &m.gate_list,&m.up_list,&m.down_list}) l->resize(15);
@@ -965,6 +1043,64 @@ int main() {
     {
         auto l=llama(8);l.set_weights_gate();
         assert(l.commits==1 && !l.reduced_llama_profile_);
+    }
+    // Exact headless InternVLA System-2 text (Qwen2.5-VL-7B W8A16): QKV bias,
+    // no QK-norm, M-RoPE [16,24,24]; attention 4, MLP6 on the padded 19008.
+    auto internvla = [](int budget) {
+        CausalDecoderModel m;m.configured_vocab_size_=0;m.num_kv_heads=4;
+        m.qk_norm_present=false;m.qkv_bias_present=true;m.mrope_section={16,24,24};
+        m.configure({3584,18944,28,28},budget);m.pack_w8();return m;
+    };
+    for (int budget : {4,6}) {
+        auto v=internvla(budget);v.set_weights_gate();
+        assert(v.commits==1 && v.reduced_internvla_profile_ && !v.reduced_qwen3vl_profile_);
+        const auto vt=v.resolve_model_execution_topology(28,4,128,3584,18944);
+        assert(vt.num_cores==budget && vt.attention_tp==4 && vt.mlp_tp==budget);
+        assert(v.physical_intermediate_==(budget==6 ? 19008 : 18944));
+        for (const auto& fault : std::vector<std::function<void(CausalDecoderModel&)>>{
+            [](auto& m){m.qk_norm_present=true;},[](auto& m){m.qkv_bias_present=false;},
+            [](auto& m){m.configured_vocab_size_=151936;},
+            [](auto& m){m.mrope_section={24,20,20};},[](auto& m){m.mrope_section.clear();},
+            [](auto& m){m.deepstack_lang_layers={0,1,2};},
+            [](auto& m){
+                m.has_scale=false;
+                for (auto* l : {&m.q_w_list,&m.k_w_list,&m.v_w_list,&m.o_w_list,
+                                &m.gate_list,&m.up_list,&m.down_list})
+                    for (auto& w : *l) w.dtype=at::kHalf;
+            },
+            [](auto& m){m.pack_w4();},[](auto& m){m.pack_nvfp4();},
+            [](auto& m){m.eps=1e-5;},[](auto& m){m.use_silu=false;},
+            [](auto& m){m.gate_list.back().rows-=16;},[](auto& m){m.head_tp=6;},
+            [](auto& m){
+                for (auto* l : {&m.q_w_list,&m.k_w_list,&m.v_w_list,&m.o_w_list,
+                                &m.gate_list,&m.up_list,&m.down_list}) l->resize(27);
+            }}) {
+            auto bad=internvla(budget);fault(bad);bool rejected=false;
+            try{bad.set_weights_gate();}catch(const std::runtime_error&){rejected=true;}
+            assert(rejected && bad.commits==0);
+        }
+        OtherDecoder other; other.configured_vocab_size_=0; other.num_kv_heads=4;
+        other.qk_norm_present=false; other.qkv_bias_present=true;
+        other.mrope_section={16,24,24}; other.configure({3584,18944,28,28},budget);
+        other.pack_w8();
+        bool rejected=false;
+        try{other.set_weights_gate();}catch(const std::runtime_error&){rejected=true;}
+        assert(rejected && other.commits==0);
+    }
+    // GR00T's headless 16-layer 2B prefix: FP16, W8A16 and G32 packed W4 at
+    // four and six lanes (I6144 is 384-aligned, never padded); NVFP4 stays
+    // with the full models.
+    for(int budget:{4,6})for(int precision:{0,1,2,3}) {
+        CausalDecoderModel prefix;  // the 2B cold vocabulary topology
+        prefix.configure({2048,6144,16,16},budget);
+        prefix.mrope_section={24,20,20};prefix.deepstack_lang_layers={0,1,2};
+        if(precision==1)prefix.pack_w8();
+        if(precision==2)prefix.pack_w4();
+        if(precision==3)prefix.pack_nvfp4();
+        bool rejected=false;
+        try{prefix.set_weights_gate();}catch(const std::runtime_error&){rejected=true;}
+        assert(rejected==(precision==3) && prefix.commits==(precision==3 ? 0 : 1));
+        if(precision==2)assert(prefix.gate_list.back().rows==6144);
     }
     // VL quantization retains exact M-RoPE/DeepStack and cold component domains.
     for(const auto& profile:profiles)for(int budget:{4,6})for(bool packed:{false,true}) {

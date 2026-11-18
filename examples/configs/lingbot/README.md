@@ -21,8 +21,8 @@ v1 的后续测试目前暂缓，已有实现和登记记录保留；这项安�
 按 [v2 指南](v2/README.md)准备 checkpoint、training config 和 observation，从仓库根目录执行：
 
 ```bash
-python examples/run.py --config examples/configs/lingbot/v2/2cam/fp16.toml --check-config
-python examples/run.py --config examples/configs/lingbot/v2/2cam/fp16.toml
+python examples/run.py --config examples/configs/lingbot/v2/fp16.toml --check-config
+python examples/run.py --config examples/configs/lingbot/v2/fp16.toml
 ```
 
 `--check-config` 只检查配置和输入参数范围；实际 observation 的 token 数与相机数量在运行时核对。
@@ -40,8 +40,8 @@ python examples/run.py --config examples/configs/lingbot/v2/2cam/fp16.toml
 |---|---|
 | 配置 | [v1/4b/fp16_cpu_vision.toml](v1/4b/fp16_cpu_vision.toml) |
 | 支持状态 | 受限支持（`SUPPORTED_LIMITED`）；未实测：缺少 observation 输入（CPU FP32 golden 需用 internal validation notes 的 lingbotvla 环境生成），不是硬件限制 |
-| 精度 | cpu-fp32+device-fp16 |
-| 量化范围 | 无量化；CPU FP32 Vision |
+| 精度 | fp16 |
+| 量化范围 | Vision CPU FP32 |
 | 输入类型 | tensor observation |
 | num_steps 默认值 | 10 |
 | 文本可调范围 | 登记logical prefix≤178；max_seq默认256 |
@@ -63,12 +63,10 @@ python examples/run.py --config examples/configs/lingbot/v2/2cam/fp16.toml
 
 ### v2 图文动作
 
-| 配置 | 支持状态 | 精度 | 量化范围 | cameras 默认值 | 4 核 | 6 核 | 8 核 |
-|---|---|---|---|---|---|---|---|
-| [v2/2cam/fp16.toml](v2/2cam/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 2 | ✕ 不支持 | ✕ 不支持 | ● 已实测 |
-| [v2/2cam/w8a16.toml](v2/2cam/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision、VLM prefill 与动作专家（注意力、共享与路由专家）投影 W8；router 保持 FP16 | 2 | ✕ 不支持 | ✕ 不支持 | ● 已实测 |
-| [v2/3cam/fp16.toml](v2/3cam/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | 3 | ✕ 不支持 | ✕ 不支持 | ● 已实测 |
-| [v2/3cam/w8a16.toml](v2/3cam/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision、VLM prefill 与动作专家（注意力、共享与路由专家）投影 W8；router 保持 FP16 | 3 | ✕ 不支持 | ✕ 不支持 | ● 已实测 |
+| 配置 | 支持状态 | 精度 | 量化范围 | 4 核 | 6 核 | 8 核 |
+|---|---|---|---|---|---|---|
+| [v2/fp16.toml](v2/fp16.toml) | 支持（`SUPPORTED`） | fp16 | — | ● 已实测 | ● 已实测 | ● 已实测 |
+| [v2/w8a16.toml](v2/w8a16.toml) | 支持（`SUPPORTED`） | w8a16 | Vision / VLM prefill / 动作专家 W8A16（动作专家 router FP16） | ● 已实测 | ● 已实测 | ● 已实测 |
 
 本组配置相同的项：
 
@@ -77,19 +75,18 @@ python examples/run.py --config examples/configs/lingbot/v2/2cam/fp16.toml
 | 输入类型 | case / observation / 原始图文+state |
 | expected_language_tokens 默认值 | 32 |
 | max_language_tokens 默认值 | 72 |
+| cameras 默认值 | 3 |
 | 文本可调范围 | 1≤L≤max_language_tokens≤160；默认cap72；expected_language_tokens可选 |
-| 图像/音频可调范围 | 2/3相机；处理后Float32[C,256,1536]，grid每行[1,16,16] |
+| 图像/音频可调范围 | 1/2/3相机（1相机 FP16 6/8 核、W8A16 6 核已在板上通过）；处理后Float32[C,256,1536]，grid每行[1,16,16] |
 | 生成可调范围 | 固定动作生成流程 |
 | 其他输入形状 | language/mask [1,L]；原始state=1..55个有限数→[1,55]；noise文件可选→[1,50,55] |
-| 联动限制 | 三种输入互斥。expected_language_tokens设定时有效mask计数须严格相等；改T需同步cap和真实输入；原始指令不静默截断。case/observation自带state/noise/instruction。prefix为2cam 132+T、3cam 198+T行，对齐到16行后最多再补prefill.padding_budget行；模板为64，T1–160都能补到可行长度；改小时对齐后272/304/336/352/368/384行没有可行布局（2026-10-23板测）。 |
+| 联动限制 | 三种输入互斥。expected_language_tokens设定时有效mask计数须严格相等；改T需同步cap和真实输入；原始指令不静默截断。case/observation自带state/noise/instruction。prefix为1cam 66+T、2cam 132+T、3cam 198+T行（training_config含align_params时各加16行），对齐到16行后最多再补prefill.padding_budget行；模板为64，T1–160都能补到可行长度；改小时对齐后272/304/336/352/368/384行没有可行布局（2026-10-23 8核板测）。model.num_cores为4/6/8（省略为8）；4/6核时Vision和动作专家用4核、文本骨干Attention 4/MLP全部核（6核时MLP补到9792），Vision逐图、动作专家只走稀疏专家路由；4/6核的prefill可行长度尚无板测。 |
 | 默认核数 | 8 |
-| CPU线程数 | 1 |
+| CPU线程数 | 8 核 1，4/6 核 12（入口默认） |
 | 权重 | `${RPU_MODEL_CACHE}/lingbot-vla-v2-6b`；准备方法见[权重准备](../WEIGHTS.md) |
 | 入口 | [run.py](../../run.py) |
 
-- ✕ 4/6 核不支持：原生实现只有 8 核：运行器、权重转换和多视角 KV 语言路径都要求 8 核。
-
-输入校验来源：[inputs.py](../../../examples/runners/lingbot2/inputs.py)。
+输入校验来源：[inputs.py](../../../examples/runners/lingbot2/inputs.py) · [optimized.py](../../../examples/runners/lingbot2/optimized.py)。
 
 ### 历史 exact-Z2 · 6B
 
@@ -98,7 +95,7 @@ python examples/run.py --config examples/configs/lingbot/v2/2cam/fp16.toml
 | 配置 | [legacy/exact_z2/6b/w8a16.toml](legacy/exact_z2/6b/w8a16.toml) |
 | 支持状态 | 支持（`SUPPORTED`） |
 | 精度 | w8a16 |
-| 量化范围 | Vision、VLM prefill 与动作专家（注意力、共享与路由专家）投影 W8；router 保持 FP16 |
+| 量化范围 | Vision / VLM prefill / 动作专家 W8A16（动作专家 router FP16） |
 | 输入类型 | 专用 observation |
 | 文本可调范围 | 由 exact-Z2 fixture 给定 |
 | 图像/音频可调范围 | 专用W8视觉布局 |

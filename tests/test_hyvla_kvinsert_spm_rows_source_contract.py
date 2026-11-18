@@ -25,7 +25,7 @@ def test_kvinsert_optional_abi_keeps_spm_rows_after_batch_and_flags() -> None:
 
 def test_hyvla_kvinsert_passes_spm_rows_in_its_own_abi_slot() -> None:
     suffixes = {
-        "src/fused/rpu_hyvit2_vision_model.cpp": ("HYVIT2_KV_SITE", "NUM_CORES", "nq"),
+        "src/fused/rpu_hyvit2_vision_model.cpp": ("HYVIT2_KV_SITE", r"num_cores\(\)", "nq"),
         "src/fused/rpu_hyvla_expert_model.cpp": ("HYVLA_EXPERT_KV_SITE", "tp", "nkv"),
     }
     for path, (site, cores, heads) in suffixes.items():

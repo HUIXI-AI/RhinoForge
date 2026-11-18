@@ -178,6 +178,8 @@ struct Model {
  bool qwen3vl_multiview_text_dry_prepared_=false,qwen3vl_multiview_text_composite_prepared_=false;
  int64_t qwen3vl_pooler_z1_retained_deepstack_count_=0;
  bool qwen3vl_2b_w8_profile_=false;
+ bool qwen3_c256_=false,qwen3_prefill_w8a8_=false;
+ int64_t qwen3_inplace_capacity()const{return 0;}
  std::vector<int64_t>deepstack_lang_layers_{0,1,2};
  CausalDecoderPlanningMode planning_mode_=CausalDecoderPlanningMode::ORDINARY;
  PipelineState state;PipelineState*pimpl_=&state;
@@ -514,6 +516,8 @@ def test_actual_kv_only_long_prefix_uses_native_single_chunk_domain(tmp_path):
         'inline RpuRmsNormSpmRoute rpu_resolve_rmsnorm_spm_route('))
     methods = '\n'.join(_function(source, marker) for marker in (
         'bool lingbot_prefill_kv_only_shape(', 'bool lingbot_prefill_kv_only_for_plan(',
+        'int64_t qwen3_inplace_capacity(', 'bool qwen3_c192_plan_valid(',
+        'bool qwen3_prefill_w8a8_plan_valid(',
         'std::vector<FmbPhysicalExecutionManifest> physical_manifest_domain_for_candidate('))
     methods = methods.replace(' const override {', ' const {')
     # Execute the real launcher tiling and legality predicates rather than
@@ -556,6 +560,7 @@ __SDPA_TYPES__
 __SDPA__
 __NORM__
 __CONSTANTS__
+#include "fused/rpu_qwen3_w8a8_contract.h"
 enum class CausalDecoderPlanningMode {ORDINARY, OTHER};
 struct Context {
  FmbThreeStageChunkPlan stage_plan;FmbPhysicalManifestConsumer consumer;
@@ -565,6 +570,7 @@ struct Context {
 };
 struct Model {
  bool lingbot_prefill_kv_only_=true;
+ bool qwen3_c192_=false,qwen3_c256_=false,qwen3_c512_=false,qwen3_prefill_w8a8_=false;
  CausalDecoderPlanningMode planning_mode_=CausalDecoderPlanningMode::ORDINARY;
  SdpaConfig config{SdpaKernelType::FLASH_ATTN_SPM,128,32,8,8,1,0};
  Context context;std::vector<int>layer_weights_=std::vector<int>(36);

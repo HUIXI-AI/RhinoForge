@@ -45,9 +45,36 @@ def execution_config(value):
         from collections.abc import Mapping
         return {str(k): plain(v) for k, v in value.items()} if isinstance(value, Mapping) else value
     result = plain(normalized)
-    if result.get("model", {}).get("num_cores", 8) != 8:
-        raise ValueError("LingBot v2 public example requires TP8")
+    cores = result.get("model", {}).get("num_cores", 8)
+    if type(cores) is not int or cores not in (4, 6, 8):
+        raise ValueError("[rpu_execution.model] accepts only num_cores = 4, 6 or 8")
     return result
+
+
+# The W8A16 cold switches by the resolved per-module specs of the entry's precision recipe.
+ROUTE_PROBES = (("vision",), ("vlm_prefill",), ("action",), ("action", "router"))
+ROUTES = {("fp16",) * 4: False, ("w8a16", "w8a16", "w8a16", "fp16"): True}
+
+
+def precision_w8(precision) -> bool:
+    from examples.common.config import owner_route
+    return owner_route("LingBot v2", "lingbot2", ROUTE_PROBES, ROUTES, selector=precision)
+
+
+def core_budget(execution):
+    """The cold rpu_execution.model.num_cores (8 when omitted)."""
+    return execution.get("model", {}).get("num_cores", 8)
+
+
+def default_cpu_threads(execution):
+    """[cpu].threads when omitted: 1 at eight cores, 12 at 4/6 cores.
+
+    Below eight cores the Vision merger LayerNorm and GELU stay on the host
+    CPU. While the patch embed and merger GEMMs also ran there, one thread
+    cost about 0.8 s per camera; the default is kept. An explicit
+    [cpu].threads always wins.
+    """
+    return 1 if core_budget(execution) == 8 else 12
 
 
 def validate_example_config(config):
@@ -63,8 +90,7 @@ def validate_example_config(config):
         if not isinstance(config[section], dict) or set(config[section]) - keys:
             raise ValueError(f"[{section}] contains unsupported keys or is not a table")
     profile, inputs, run = (config[k] for k in ("lingbot2", "input", "run"))
-    if profile.get("precision") not in ("fp16", "w8a16"):
-        raise ValueError("[lingbot2].precision must be fp16 or w8a16")
+    precision_w8(profile.get("precision"))
     if profile.get("instruction_residency", "auto") not in ("auto", "off"):
         raise ValueError("[lingbot2].instruction_residency must be auto or off")
     from .inputs import validate_input_config
@@ -78,8 +104,7 @@ def validate_example_config(config):
     for key in ("profile", "hwperf"):
         if type(run.get(key, False)) is not bool:
             raise ValueError(f"[run].{key} must be boolean")
-    cpu.resolve_cpu_threads(config, default=1)
-    execution_config(config.get("rpu_execution"))
+    cpu.resolve_cpu_threads(config, default=default_cpu_threads(execution_config(config.get("rpu_execution"))))
 
 
 def registered_example(config):
@@ -88,7 +113,17 @@ def registered_example(config):
     return None
 
 
-def profile_environment(precision):
+# Template selectors with eight-core owners only (runtime Graph, Vision batch,
+# fused merger, device patch embed, direct prefix, fused AdaRMS broadcast). The
+# adapter refuses them below eight cores; the remaining template selectors fall
+# back or are core-agnostic, and the sparse expert route is required there.
+EIGHT_CORE_SELECTORS = (
+    "RPU_ADARMS_FUSED_BCAST", "RPU_QWEN3VL_VISION_BATCH", "RPU_QWEN3VL_VISION_FUSED_MERGER",
+    "RPU_QWEN3VL_VISION_PATCH_EMBED_DEVICE", "RPU_LINGBOT2_RUNTIME_GRAPH",
+    "RPU_LINGBOT2_VISION_DIRECT_PREFIX", "RPU_LINGBOT2_VISION_DIRECT_PREFIX_NO_OUTPUT")
+
+
+def profile_environment(precision, cores=8):
     on = """RPU_FASTREPLAY_SKIP_SYNC RPU_KVINSERT_HYBRID_V16 RPU_ADARMS_FUSED_BCAST
 RPU_QWEN3VL_VISION_ROPE_SPM RPU_QWEN3VL_VISION_BATCH RPU_QWEN3VL_VISION_FUSED_MERGER
 RPU_QWEN3VL_VISION_PATCH_EMBED_DEVICE RPU_LINGBOT2_PREFILL_FAST_REPLAY
@@ -106,9 +141,12 @@ RPU_DEEP_FAST_REPLAY RPU_KVINSERT_HYBRID3_V16 RPU_QWEN3VL_VISION_HOST_FP32_PATCH
 RPU_LINGBOT2_PREFILL_KV_PAIR RPU_LINGBOT2_PREFILL_QK_NORM_ROPE
 LKN_BATCH_INSTR_REUSE LKN_SKIP RPU_CHUNK_FORCE_UNSAFE""".split()
     env = dict.fromkeys(off, "0") | dict.fromkeys(on, "1")
+    if cores != 8:
+        env.update(dict.fromkeys(EIGHT_CORE_SELECTORS, "0"))
+    w8 = precision_w8(precision)
     for name in ("EXPERT", "PREFILL", "BASE", "VISION"):
-        env["RPU_LINGBOT2_" + name + "_W8A16"] = str(int(precision == "w8a16"))
-    env["RPU_WALL_OSS_FAST_REPLAY"] = str(int(precision == "fp16"))
+        env["RPU_LINGBOT2_" + name + "_W8A16"] = str(int(w8))
+    env["RPU_WALL_OSS_FAST_REPLAY"] = str(int(not w8))
     env.update(LKN_MAX_BATCH_ENTRIES="131072", LKN_KD_BUF_MB="32", LKN_INSTR_BUF_MB="128",
                TORCH_DEVICE_BACKEND_AUTOLOAD="0")
     return env
@@ -407,7 +445,7 @@ def run_example_config(config):
         "entry_point": "rpu_backend.adapters.lingbot_vla_v2.runtime.build_lingbot_vla_v2",
         "registered_profile": None, "support_scope": "public generic controlled evaluation; not the exact-Z2 catalog profile",
         "formal_certification": False, "correctness": "not_run", "num_steps": 10,
-        "top_k": 4, "routed_experts": 32, "action_layers": 36, "num_cores": 8,
+        "top_k": 4, "routed_experts": 32, "action_layers": 36, "num_cores": core_budget(execution),
         "rpu_execution": execution, "warmup": run.get("warmup", 2), "runs": run.get("runs", 5),
         "seed": run.get("seed", 0), "samples_ms": [], "profile": run.get("profile", False),
         "hwperf_enabled": run.get("hwperf", False), "cpu_reference": {},
@@ -425,14 +463,14 @@ def run_example_config(config):
             hwperf_dir = output_dir / "hwperf"
             if run.get("hwperf", False) and hwperf_dir.exists() and any(hwperf_dir.iterdir()):
                 raise ValueError("requested HWPerf directory is nonempty; choose a fresh output_dir")
-            env = profile_environment(profile["precision"])
+            env = profile_environment(profile["precision"], core_budget(execution))
             lib_env, bound = profile_libraries(); env.update(lib_env)
             bind_cold_environment(env)
             report.update(effective_env=dict(env), libraries=bound,
                 library_binding="current_libraries: exactly two manifest-published REF roles",
                 instruction_residency=profile.get("instruction_residency", "auto"))
             report["source_identity"] = source_identity()
-            report["cpu_runtime"] = cpu.configure_cpu_threads(cpu.resolve_cpu_threads(config, default=1))
+            report["cpu_runtime"] = cpu.configure_cpu_threads(cpu.resolve_cpu_threads(config, default=default_cpu_threads(execution)))
             import torch
             torch.manual_seed(report["seed"])
             from .inputs import load_inputs
@@ -446,10 +484,10 @@ def run_example_config(config):
             from rpu_backend.graph import GraphRuntimePolicy
             graph_policy = GraphRuntimePolicy.from_environment(batch_snapshot_mode=profile.get("instruction_residency", "auto"))
             started = time.perf_counter()
-            # The existing adapter is fixed TP8 and has no model-stage API.
-            # Consume this runner's explicit TP8 assertion, preserving every
-            # supported component/stage override unchanged.
-            adapter_execution = {k: v for k, v in execution.items() if k != "model"}
+            # The adapter reads the cold model.num_cores itself; an explicit
+            # 8 is the default and is dropped so the eight-core request is unchanged.
+            adapter_execution = ({k: v for k, v in execution.items() if k != "model"}
+                                 if core_budget(execution) == 8 else execution)
             report["adapter_rpu_execution"] = adapter_execution
             owner = runtime.build_lingbot_vla_v2(assets["checkpoint"],
                 training_config_path=assets["training_config"],

@@ -1,0 +1,41 @@
+# 图文生成的输入预设：python examples/run.py --config <TOML> --input <预设名>
+# --input canonical 取本文件的 canonical；--set input.<键> 的同名字段优先于预设。
+#
+# 预设写图像边长、P 和 D，图片和 prompt 仍取所选 TOML：image_size 先把每张图缩放成
+# image_size × image_size 再交给 processor；prefill_tokens 在最后一条用户消息末尾重复
+# prompt 的 token，把图文输入补到 P 个（不能短于 processor 的完整输出，也不截断）；
+# stop_on_eos = false 时 decode 固定调用 D 次。
+#
+# 单张图、prompt 为模板的一句描述时，processor 输出约为：448 → 210–215、896 → 800–805、
+# 1024 → 1040–1045 个 token（patch 16 px，2×2 合并）。多张图或更长的 prompt 会超过预设的 P，
+# 运行时报出 "prefill_tokens cannot truncate"；这时用 --set input.prefill_tokens 改大 P。
+#
+# 范围由运行时检查，--check-config 不检查：
+#   Qwen3-VL：每张图 ≤ 4096 patch（即 ≤ 1024×1024），2/4/8B 与 32B 的物理 prefill ≤ 4176。
+#     板上实测 896×896 为 4/6/8 核，1024×1024 只有 8 核。
+#   Qwen3.5 VL：图数、像素和 P 受视觉 plan、cache 与内存共同限制，没有统一上限；
+#     板上实测 image_size 448 / 896（4/6/8 核），1024 未上板。
+#
+# requires：模板 [input] 须已写 images。读取预处理输入（prepared_input_safetensors）的模板
+#   没有 images，配置检查会拒绝预设。
+applies_to = ["qwen3_vl_multimodal", "qwen3_5_vision"]
+canonical = "i896_p1024_d32"
+requires = ["images"]
+
+[preset.i448_p256_d32]
+image_size = 448
+prefill_tokens = 256
+decode_steps = 32
+stop_on_eos = false
+
+[preset.i896_p1024_d32]
+image_size = 896
+prefill_tokens = 1024
+decode_steps = 32
+stop_on_eos = false
+
+[preset.i1024_p1280_d32]
+image_size = 1024
+prefill_tokens = 1280
+decode_steps = 32
+stop_on_eos = false

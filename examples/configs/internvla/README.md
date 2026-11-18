@@ -36,6 +36,17 @@ python scripts/ci/prepare_internvla_full_chain_assets.py --root <新目录> \
 
 脚本在 `<新目录>/internvla_n1-controlled/` 下写出 `full_chain_fixture.pt` 和 `asset_manifest.json`，把这两个路径填入 TOML。`sample_num` 必须等于 fixture 中 `init_noise` 的第一维（脚本生成的是 4）。
 
+| 参数 | 取值与默认 | 说明 |
+|---|---|---|
+| `--root` | 必填 | 输出根目录。资产写到 `<root>/internvla_n1-controlled/`（NavDP 头、System2 前端与 FP16 ViT、System2 W8 decoder、fixture、`provenance.json`、`asset_manifest.json`）；`extracted.json`、`system2_fixture.pt` 写在 `<root>` |
+| `--hf-cache` | 必填 | Hugging Face 缓存目录；下载固定 revision `6d48df24da45e8b31fdcef9572bbcbf68c0baf64` |
+| `--internnav-root` | 必填 | InternNav 源码的 git 目录；HEAD 须为 `7a5c62400ac45b313d9b709c740b64191556a242`，工作区不能有改动 |
+| `--prepare-only` | 开关，默认关 | 只抽取权重并写清单，不生成 fixture，也不检查 transformers / diffusers 版本；产物不能直接运行 |
+| `--modelscope-weights` | 开关，默认关 | safetensors 改从 ModelScope revision `f0458b17d5cf475728c73d3dea8fc5da5a66c9ea` 获取，其余文件仍取自 Hugging Face |
+
+- **放到哪里**：权重按登记名 `internvla-n1-controlled` 从 `$RPU_MODEL_CACHE/internvla_n1-controlled` 读取，入口不接受 `checkpoint` 字段。生成后把整个 `internvla_n1-controlled/` 目录移到 `$RPU_MODEL_CACHE/` 下；清单里的相对路径按清单所在目录解析，整体移动后仍有效。
+- **重跑**：同一 `<root>` 重跑时复用已抽取的文件，文件或脚本有变化会报错，此时换新目录；fixture 每次重新生成。
+
 <!-- model-configurations-start -->
 
 <a id="configurations"></a>
@@ -49,8 +60,8 @@ python scripts/ci/prepare_internvla_full_chain_assets.py --root <新目录> \
 |---|---|
 | 配置 | [navdp/w8a16_system2.toml](navdp/w8a16_system2.toml) |
 | 支持状态 | 支持（`SUPPORTED`） |
-| 精度 | fp16 |
-| 量化范围 | System2 backbone W8A16；其余 FP16 |
+| 精度 | w8a16 |
+| 量化范围 | System2 backbone W8A16 |
 | 输入类型 | System2 + RGBD + NavDP tensor |
 | 文本可调范围 | output_ids[1,S]；图像token恰196个 |
 | 图像/音频可调范围 | grid[[1,28,28]]；pixels首维784；RGB[1,2,224,224,3]；depth[1,2,224,224,1] |
@@ -58,14 +69,12 @@ python scripts/ci/prepare_internvla_full_chain_assets.py --root <新目录> \
 | 其他输入形状 | noise[4,32,3]；position_ids[S+4,3]或[3,1,S+4] |
 | 联动限制 | 资产清单绑定；token ID在词表内；4个latent rows位置完整。属于固定系统链fixture，不接受任意原始图文。 |
 | 默认核数 | 8 |
-| 4 核 | ✕ 不支持 |
-| 6 核 | ✕ 不支持 |
+| 4 核 | ● 已实测 |
+| 6 核 | ● 已实测 |
 | 8 核 | ● 已实测 |
 | CPU线程数 | 未设置（沿用环境） |
 | 权重 | `internvla-n1-controlled` |
 | 入口 | [run.py](../../run.py) |
-
-- ✕ 4/6 核不支持：原生实现只有 8 核：视觉、DINOv2 和 NavDP owner 按 8 核编写，骨干的 QKV 偏置和 RoPE 布局不满足少核解码器的准入。
 
 输入校验来源：[runner.py](../../../examples/runners/internvla/runner.py) · [backbone.py](../../../python/rpu_backend/adapters/internvla_n1/backbone.py)。
 

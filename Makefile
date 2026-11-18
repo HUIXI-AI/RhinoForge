@@ -35,7 +35,7 @@ ci-local-core:
 
 ci-local-quickstart:
 	$(PYTHON) -m examples.run --config examples/configs/qwen3/text/0_6b/fp16.toml --check-config
-	$(PYTHON) -m examples.run --config examples/configs/pi05/3cam/w8a16.toml --check-config
+	$(PYTHON) -m examples.run --config examples/configs/pi05/h50/w8a16.toml --check-config
 	$(PYTHON) scripts/check_examples.py
 	$(PYTHON) scripts/check_supported_models_table.py
 

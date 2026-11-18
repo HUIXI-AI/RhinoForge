@@ -10,10 +10,16 @@ def prepare(config, runner):
     tokenizer, input_ids, input_metadata, capacity = text_inputs(config, checkpoint, decode_steps)
     token_selector = None
     from rpu_backend.api import RPUModelForConditionalGeneration
+    from examples.common.config import install_quantization
 
+    load_kwargs = {}
+    # A dense on-install recipe (NVFP4) binds to the raw model before install.
+    quantization = install_quantization(target, example["profile_id"])
+    if quantization is not None:
+        load_kwargs["quantization"] = quantization
     raw = RPUModelForConditionalGeneration.from_pretrained(
         checkpoint, dtype=torch.float16, local_files_only=True,
-        rpu_execution=execution)
+        rpu_execution=execution, **load_kwargs)
     runner.owner = raw
     if getattr(raw.config, "architectures", None) == ["Qwen3_5MoeForConditionalGeneration"]:
         from rpu_backend.adapters.qwen3_5_moe import Qwen3_5MoeAdapter

@@ -69,7 +69,8 @@ def native(monkeypatch):
     monkeypatch.setattr(decoder, "build_mrope_cos_sin_tables", tables)
     monkeypatch.setattr(torch.ops.rpu, "causal_decoder_topology",
         lambda _handle: (state["create_topologies"][-1]["num_cores"], 4,
-                        state["create_topologies"][-1]["num_cores"], 4, 8), raising=False)
+                        state["create_topologies"][-1]["num_cores"],
+                        state["create_topologies"][-1]["num_cores"], 8), raising=False)
     return state
 
 
@@ -308,7 +309,7 @@ def test_quantized_mrope_installer_binds_weight_cache_graph_and_native_topology(
     monkeypatch.setattr(torch.ops.rpu,"causal_decoder_set_weights_w8a16",
         torch.ops.rpu.causal_decoder_set_weights,raising=False)
     monkeypatch.setattr(torch.ops.rpu,"causal_decoder_topology",lambda handle:
-        (cores,4,topology.mlp_tp,4,8),raising=False)
+        (cores,4,topology.mlp_tp,topology.lm_head_tp,8),raising=False)
     options={"scale_lists":scales}
     if size=="32b":options["_runtime_quantized_32b"]=True
     assert _install(model,topology,**options)==1
@@ -336,8 +337,8 @@ def test_quantized_mrope_rejects_last_layer_or_wrong_cold_layout_before_creation
     if fault=="scale":projection.weight_scale=projection.weight_scale.clone()
     if fault=="dtype":projection.weight=projection.weight.to(torch.int8)
     if fault=="shape":projection.weight=projection.weight[:,:-16]
-    # The retired packed MLP4 layout is now a wrong cold layout/template.
+    # The retired six-core lm_head_tp=4 layout is now a wrong cold layout/template.
     if fault=="layout":projection._rpu_linear_num_cores=4
-    if fault=="topology":topology=replace(topology,mlp_tp=4)
+    if fault=="topology":topology=replace(topology,lm_head_tp=4)
     with pytest.raises(ValueError):_install(model,topology,scale_lists=scales)
     assert native["events"]==[]

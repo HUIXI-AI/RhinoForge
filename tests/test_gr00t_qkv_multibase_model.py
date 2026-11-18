@@ -92,7 +92,7 @@ struct Model{
  }
  int64_t get_last_resolved_chunk_size()const{return resolved;}int64_t num_layers()const{return layers;}
  int64_t hidden_size()const{return h;}int64_t intermediate_size()const{return ff;}
- int64_t num_q_heads()const{return q;}int64_t num_kv_heads()const{return kv;}int64_t head_dim()const{return hd;}int64_t attn_tp()const{return tp;}
+ int64_t num_q_heads()const{return q;}int64_t num_kv_heads()const{return kv;}int64_t head_dim()const{return hd;}int64_t attn_tp()const{return tp;}int num_cores()const{return NUM_CORES;}
  Context&ctx(){return context;}
  uint32_t addr(int,const char*n){std::string s(n);if(s=="norm_hidden")return 0x10000000;if(s=="q")return 0x10020000;if(s=="k")return 0x10030000;assert(s=="v");return 0x10040000;}
  uint32_t layer_addr(int layer,int,const char*n){std::string s(n);int offset=s=="q_bias"?0:s=="k_bias"?512:1024;return 0x10600000+layer*1536+offset;}

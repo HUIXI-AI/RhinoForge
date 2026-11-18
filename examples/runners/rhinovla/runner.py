@@ -1,7 +1,11 @@
 """Official and caller-factory RhinoVLA policy construction."""
 from __future__ import annotations
 
+import hashlib
 import json
+import math
+from pathlib import Path
+import sys
 
 from examples.common.inputs import _required_file, _load_mapping, _policy_checkpoint as _checkpoint
 
@@ -66,18 +70,31 @@ def _rhinovla_quantization(config):
         raise ValueError("RhinoVLA full-pipeline profile requires both explicit W8 opt-ins")
     return {"expert_w8a16": expert, "full_w8a16": full}
 
-_V3_SOURCE_KEYS = frozenset({"source_dir", "checkpoint", "fixture", "trust_model_code", "num_steps"})
+_V3_RAW_KEYS = frozenset({"images", "instruction", "view_roles", "state", "action_dims"})
+_V3_SOURCE_KEYS = frozenset({"source_dir", "checkpoint", "fixture", "trust_model_code", "num_steps"}) | _V3_RAW_KEYS
 _W8_SWITCHES = ("RPU_RHINOVLA_EXPERT_W8A16", "RPU_RHINOVLA_FULL_W8A16")
+# The source training config's datasets.vla_data.view_roles, in camera order.
+_V3_VIEW_ROLES = ("top_head", "hand_left", "hand_right")
+_V3_DIMS = 96
 
 
 def validate_v3_source_config(config):
-    """Check a v3 source entry (pinned source, checkpoint and CPU fixture)."""
+    """Check a v3 source entry (pinned source, checkpoint, and a CPU fixture or raw images)."""
     inputs = config["input"]
     if set(inputs) - _V3_SOURCE_KEYS:
         raise ValueError(f"unsupported RhinoVLA v3 source fields: {sorted(set(inputs) - _V3_SOURCE_KEYS)}")
-    for key in ("source_dir", "checkpoint", "fixture"):
+    for key in ("source_dir", "checkpoint"):
         if not isinstance(inputs.get(key), str) or not inputs[key].strip():
             raise ValueError(f"RhinoVLA v3 source requires a nonempty {key} path")
+    if ("fixture" in inputs) == ("images" in inputs):
+        raise ValueError("RhinoVLA v3 source requires exactly one of [input].fixture or [input].images")
+    if "fixture" in inputs:
+        if not isinstance(inputs["fixture"], str) or not inputs["fixture"].strip():
+            raise ValueError("RhinoVLA v3 source requires a nonempty fixture path")
+        if set(inputs) & _V3_RAW_KEYS:
+            raise ValueError(f"the v3 fixture owns its input; drop {sorted(set(inputs) & _V3_RAW_KEYS)}")
+    else:
+        _validate_v3_raw_inputs(inputs)
     if inputs.get("trust_model_code") is not True:
         raise ValueError("RhinoVLA v3 source requires explicit trust_model_code=true")
     if type(inputs.get("num_steps", 10)) is not int or inputs.get("num_steps", 10) != 10:
@@ -85,6 +102,48 @@ def validate_v3_source_config(config):
     expected = _v3_source_quantization(config)
     if config["example"].get("dtype") != ("w8a16" if expected["expert_w8a16"] else "fp16"):
         raise ValueError("RhinoVLA v3 source precision must match its W8A16 switches")
+
+
+def _validate_v3_raw_inputs(inputs):
+    images = inputs["images"]
+    if (not isinstance(images, list) or len(images) not in (1, 2, 3)
+            or any(not isinstance(path, str) or not path.strip() for path in images)):
+        raise ValueError("RhinoVLA v3 [input].images requires one to three image paths")
+    if not isinstance(inputs.get("instruction"), str) or not inputs["instruction"].strip():
+        raise ValueError("RhinoVLA v3 raw images require a nonempty [input].instruction")
+    roles = inputs.get("view_roles", list(_V3_VIEW_ROLES[:len(images)]))
+    if (not isinstance(roles, list) or len(roles) != len(images)
+            or any(not isinstance(role, str) or not role.strip() for role in roles)):
+        raise ValueError("RhinoVLA v3 [input].view_roles must name one source view role per image")
+    state = inputs.get("state")
+    if (not isinstance(state, list) or not 1 <= len(state) <= _V3_DIMS
+            or any(type(v) not in (int, float) or not math.isfinite(v) for v in state)):
+        raise ValueError(f"RhinoVLA v3 raw images require 1..{_V3_DIMS} finite [input].state values")
+    dims = inputs.get("action_dims", len(state))
+    if type(dims) is not int or not 1 <= dims <= _V3_DIMS:
+        raise ValueError(f"RhinoVLA v3 [input].action_dims must be in 1..{_V3_DIMS} (default: len(state))")
+
+
+def _v3_raw_request(inputs, seed):
+    """validate_v3.py's request recipe with the caller's state: x0 from a seeded CPU generator."""
+    import torch
+    from PIL import Image
+
+    images = []
+    for path in inputs["images"]:
+        with Image.open(Path(path).expanduser()) as image:
+            images.append(image.convert("RGB").resize((256, 256)))
+    roles = inputs.get("view_roles", list(_V3_VIEW_ROLES[:len(images)]))
+    state = torch.zeros(1, _V3_DIMS)
+    state[0, :len(inputs["state"])] = torch.tensor(inputs["state"], dtype=torch.float32)
+    state_mask, action_mask = torch.zeros(1, _V3_DIMS), torch.zeros(1, _V3_DIMS)
+    state_mask[:, :len(inputs["state"])] = 1
+    action_mask[:, :inputs.get("action_dims", len(inputs["state"]))] = 1
+    x0 = torch.randn(1, 30, _V3_DIMS, generator=torch.Generator().manual_seed(seed))
+    request = {"x0": x0 * action_mask[:, None], "state": state,
+               "state_mask": state_mask, "action_mask": action_mask}
+    raw = {"images": images, "instruction": inputs["instruction"], "view_roles": roles}
+    return raw, request
 
 
 def _v3_source_quantization(config):
@@ -268,14 +327,15 @@ def _official(runner):
 
 
 def _v3_source(runner):
-    """Build the pinned v3 runtime as validate_v3.py does; time fixture case 0."""
-    from pathlib import Path
+    """Build the pinned v3 runtime as validate_v3.py does; time fixture case 0 or the raw images."""
     from rpu_backend.api import RhinoVLAPolicy
     from rpu_backend.adapters.rhinovla.factory import V3_CHECKPOINT_SHA256, V3_SOURCE_SHA
 
     config, inputs = runner.source_config, runner.source_config["input"]
     validate_v3_source_config(config)
     quantization = _v3_source_quantization(config)
+    if "images" in inputs:
+        return _v3_source_images(runner, quantization)
     fixture = _load_mapping(inputs, "fixture")
     if fixture.get("metadata") != {
         "source_commit": V3_SOURCE_SHA, "checkpoint_sha256": V3_CHECKPOINT_SHA256,
@@ -298,6 +358,37 @@ def _v3_source(runner):
     return lambda: policy.predict(**case["request"])
 
 
+def _v3_source_images(runner, quantization):
+    """Raw images: the loaded source's own processor builds qin; no saved CPU reference matches."""
+    from rpu_backend.api import RhinoVLAPolicy
+
+    config, inputs = runner.source_config, runner.source_config["input"]
+    raw, request = _v3_raw_request(inputs, config.get("run", {}).get("seed", 0))
+    policy = RhinoVLAPolicy.from_factory(
+        "rpu_backend.adapters.rhinovla.factory:v3_runtime_factory",
+        {"model_root": Path(inputs["source_dir"]).expanduser(),
+         "checkpoint": Path(inputs["checkpoint"]).expanduser(),
+         "raw_inputs": raw, "steps": inputs.get("num_steps", 10),
+         "trust_model_code": True, **quantization},
+        rpu_execution=config.get("rpu_execution"),
+    )
+    runner.owner = policy
+    runner.stage_boundaries = _stage_boundaries(policy)
+    _confirm_v3_source_quantization(policy.runtime, quantization)
+    qin = policy.runtime.qin
+    runner.input_geometry = {
+        "input_mode": "raw_images", "cameras": len(raw["images"]), "view_roles": raw["view_roles"],
+        "prefix_tokens": int(qin["input_ids"].shape[1]),
+        # A tensor, as generation_inputs() keeps it: materialize_geometry() lists it after prepare.
+        "image_grid_thw": qin["image_grid_thw"],
+        "state_dims": len(inputs["state"]), "action_dims": inputs.get("action_dims", len(inputs["state"])),
+        # Same digest as a fixture case's qwen_inputs, so equal images can be matched to it.
+        "qin_sha256": _input_digest({key: qin[key] for key in ("input_ids", "attention_mask",
+                                                               "pixel_values", "image_grid_thw")}),
+    }
+    return lambda: policy.predict(**request)
+
+
 def _confirm_v3_source_quantization(runtime, expected):
     """Inspect the installed expert as validate_v3.py does, not the requested label."""
     from rpu_backend.adapters.rhinovla.convert import _gather_expert_scales
@@ -316,3 +407,16 @@ def prepare(runner):
         validate_rhinovla_config(runner.source_config)
         return _factory(runner)
     return _official(runner)
+
+
+def _input_digest(obj) -> str:
+    checksum = hashlib.sha256()
+    torch = sys.modules.get("torch")
+    for key, value in sorted(obj.items()):
+        checksum.update(json.dumps(key).encode())
+        if torch is not None and torch.is_tensor(value):
+            checksum.update(json.dumps([str(value.dtype), list(value.shape)]).encode())
+            checksum.update(value.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes())
+        else:
+            checksum.update(json.dumps(value, sort_keys=True).encode())
+    return checksum.hexdigest()

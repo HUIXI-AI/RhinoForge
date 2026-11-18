@@ -227,3 +227,32 @@ def test_program_lifetime_and_symbol_preflight_uses_public_manifest():
     load = source[source.index("CachedKernel KernelCache::load_kernel_from_oplib"):source.index("void KernelCache::initialize()")]
     assert load.index("kernel_manifest_names(path)") < load.index("oplib_snapshot(path)")
     assert "std::ifstream" not in symbols
+
+
+def test_w8a8_replay_programs_keep_reviewed_contracts_for_published_digests():
+    import json
+    import re
+    deps = json.loads((ROOT / "release/runtime-dependencies.json").read_text())["artifacts"]
+    digests = {deps["rhino_ops_main"]["sha256"], deps["rhino_ops_expansion"]["sha256"]}
+    metadata = (ROOT / "src/core/rpu_graph_program_contracts.h").read_text()
+    bindings = {
+        (digest, name): int(contracts)
+        for digest, name, contracts in re.findall(
+            r'\{"([a-f0-9]{64})", "([A-Za-z0-9_]+)", (\d+)\}', metadata
+        )
+        if digest in digests
+    }
+    linear_catalog = (ROOT / "src/ops/rpu_linear_w8a8_candidates.inc").read_text()
+    expected = set(re.findall(r'"(parallel_linear_w8a8_[A-Za-z0-9_]+)"', linear_catalog))
+    expected.update({
+        "dynamic_quantize_w8a8", "layer_norm_quantize_w8a8_h1152",
+        "gelu_tanh_quantize_w8a8_h544",
+        "pi_geglu_a8_paired_i32_c272_m48n32k2048_p512",
+        "qwen3_up_mul_w8a16_m320n112k128",
+        "qwen3_up_mul_w8a8_m272n64k384", "qwen3_up_mul_w8a8_m512n64k128",
+    })
+    expected.update(f"pi05_vision_owner_layernorm_quantize_w8a8_m{m}n1152" for m in (512, 768))
+    expected.update(f"rms_norm_quantize_w8a8_h5120_m{m}" for m in (128, 192, 256))
+    expected.update(f"mul_quantize_w8a8_h3200_m{m}" for m in (128, 192))
+    admitted = {name for (_digest, name), contracts in bindings.items() if contracts == 3}
+    assert expected <= admitted

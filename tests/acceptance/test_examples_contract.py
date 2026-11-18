@@ -37,6 +37,46 @@ def example_catalog(tmp_path, monkeypatch):
     monkeypatch.setattr(checker, 'CONFIGS', examples / 'configs')
     return checker
 
+def test_catalog_precision_and_scope_come_from_the_recipe_the_file_names(example_catalog):
+    def entry(relative):
+        item, scope = example_catalog._catalog_recipe(example_catalog.CONFIGS / relative, Path(relative))
+        return item.name, item.label, item.selector, scope
+
+    assert entry("g05/w8a16_action_nvfp4.toml")[:3] == ("w8a16_action_nvfp4", "w8a16_action_nvfp4", "w8a16_nvfp4")
+    assert entry("wall_oss/legacy/w4a16_g32.toml")[1:3] == ("w4a16", "w4a16-pgrp")
+    assert entry("qwen3_5/text/35b_a3b/fp8_e4m3_experts_attn_gdn.toml")[1:] == (
+        "fp8_e4m3", "mixed-e4m3", "路由专家 / Attention / GDN FP8 E4M3")
+    assert entry("internvla/navdp/w8a16_system2.toml")[1:] == ("w8a16", "fp16", "System2 backbone W8A16")
+    assert entry("qwen3/text/0_6b/fp16_instruct.toml")[::3] == ("fp16", "—")
+    assert entry("rhinovla/v3/controlled/w8a16_pipeline_high_fused.toml")[0] == "w8a16_pipeline"
+    assert entry("rhinovla/v3/rtc_w8a16_pipeline.toml")[0] == "w8a16_pipeline"
+    assert entry("qwen3/text/8b/w4a16_text_head_rtn_g32.toml")[3] == "文本层 / 输出头 W4A16 G32 RTN"
+
+
+@pytest.mark.parametrize("relative, old, new, message", [
+    ("qwen3/text/8b/w8a16_text_head.toml", None, "qwen3/text/8b/w4a16_text_rtn_g32.toml", "file name must be"),
+    ("qwen3/text/0_6b/fp16.toml", None, "qwen3/text/0_6b/fp16x.toml", "file name must be"),
+    ("pi05/h50/w8a16.toml", 'precision = "w8a16"', 'precision = "int8"', "registered pi05 recipe"),
+])
+def test_catalog_rejects_a_file_name_or_precision_off_the_registry(example_catalog, relative, old, new, message):
+    source = example_catalog.CONFIGS / relative
+    if old is None:
+        path = example_catalog.CONFIGS / new
+        shutil.copy2(source, path)
+    else:
+        path = source
+        path.write_text(source.read_text(encoding="utf-8").replace(old, new), encoding="utf-8")
+    with pytest.raises((RuntimeError, example_catalog.COMMON.ConfigError), match=message):
+        example_catalog._catalog_recipe(path, path.relative_to(example_catalog.CONFIGS))
+
+
+def test_catalog_requires_the_unified_runtime_entry(example_catalog):
+    checker = example_catalog
+    (checker.EXAMPLES / "run.py").unlink()
+    with pytest.raises(RuntimeError, match="missing unified example entry"):
+        checker.catalog()
+
+
 def test_wall_base_default_keeps_legacy_profiles_separate(example_catalog):
     checker = example_catalog
     default = checker.CONFIGS / 'wall_oss/base/3cam/224/fp16.toml'
@@ -49,8 +89,8 @@ def test_wall_base_default_keeps_legacy_profiles_separate(example_catalog):
 
 def test_g05_custom_default_keeps_registered_legacy_profile_separate(example_catalog):
     checker = example_catalog
-    default = checker.CONFIGS / 'g05/3cam/fp16.toml'
-    assert default == checker.CONFIGS / 'g05/3cam/fp16.toml'
+    default = checker.CONFIGS / 'g05/fp16.toml'
+    assert default == checker.CONFIGS / 'g05/fp16.toml'
     config = checker.COMMON.load_config(default)
     assert checker.COMMON.example_metadata(config) is None
     rows = checker.catalog()['vla']['g05-base.fp16.k1-rtc-fm']
@@ -64,7 +104,7 @@ def test_integration_configs_remain_runnable_without_public_documentation(exampl
     configs = checker.load_configs()
     catalog = checker.catalog(configs)
     private_paths = [path for path in configs if not checker.documented_config(path)]
-    assert len(private_paths) == 12
+    assert len(private_paths) == 9
     assert len(configs) > len(private_paths)
     rendered = checker.render_config_index(configs)
     for language in ('en', 'zh'):
@@ -81,8 +121,8 @@ def test_integration_configs_remain_runnable_without_public_documentation(exampl
 
 def test_hyvla_optimized_default_keeps_registered_fixture_separate(example_catalog):
     checker = example_catalog
-    default = checker.CONFIGS / 'hy_vla/3cam/fp16.toml'
-    assert default == checker.CONFIGS / 'hy_vla/3cam/fp16.toml'
+    default = checker.CONFIGS / 'hy_vla/fp16.toml'
+    assert default == checker.CONFIGS / 'hy_vla/fp16.toml'
     assert checker.COMMON.example_metadata(checker.COMMON.load_config(default)) is None
     rows = checker.catalog()['vla']['hy-embodied-0.5-vla-umi.fp16.vla']
     assert {row[1] for row in rows} == {checker.CONFIGS / 'hy_embodied/umi/fp16.toml'}
@@ -174,10 +214,13 @@ def test_release_example_config_uses_installed_leaf_not_protected_source(monkeyp
     (bundle / 'examples').mkdir()
     (bundle / 'examples/common').mkdir()
     shutil.copy2(EXAMPLES / 'common/cpu.py', bundle / 'examples/common/cpu.py')
+    (bundle / 'manifests').mkdir()
+    shutil.copy2(ROOT / 'manifests/precision_recipes.v1.json', bundle / 'manifests/precision_recipes.v1.json')
     monkeypatch.setattr(common, 'ROOT', bundle)
+    monkeypatch.setattr(common, 'PRECISION_RECIPES', bundle / 'manifests/precision_recipes.v1.json')
     monkeypatch.setattr(common, 'MODEL_REGISTRY', bundle / 'python/rpu_backend/model_registry.py')
     common.registry_aliases.cache_clear()
-    files = ['rpu_backend/model_registry.py', 'rpu_backend/api/_execution.py']
+    files = ['rpu_backend/model_registry.py', 'rpu_backend/api/_execution.py', 'rpu_backend/quant/precision_recipes.py']
     for relative in files:
         path = installed / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -205,7 +248,11 @@ def released_model_examples(tmp_path):
     package = installed / 'rpu_backend'
     (package / 'api').mkdir(parents=True)
     (package / '__init__.py').write_text("raise AssertionError('backend was imported')\n")
+    (bundle / 'manifests').mkdir()
+    shutil.copy2(ROOT / 'manifests/precision_recipes.v1.json', bundle / 'manifests/precision_recipes.v1.json')
     shutil.copy2(ROOT / 'python/rpu_backend/api/_execution.py', package / 'api/_execution.py')
+    (package / 'quant').mkdir()
+    shutil.copy2(ROOT / 'python/rpu_backend/quant/precision_recipes.py', package / 'quant/precision_recipes.py')
     adapter = package / 'adapters/lingbot_vla_v2'
     adapter.mkdir(parents=True)
     (adapter / ('runtime' + EXTENSION_SUFFIXES[0])).write_bytes(b'compiled-runtime-identity')
@@ -225,7 +272,7 @@ def released_model_examples(tmp_path):
     assert not (bundle / 'python').exists() and (not (bundle / 'src').exists())
     return (bundle, installed, env)
 
-@pytest.mark.parametrize('relative', ('lingbot/v2/3cam/w8a16.toml', 'pi05/2cam/h50/w8a16.toml', 'wall_oss/base/2cam/256/w8a16.toml'))
+@pytest.mark.parametrize('relative', ('lingbot/v2/w8a16.toml', 'pi05/h50/w8a16.toml', 'wall_oss/base/2cam/256/w8a16.toml'))
 def test_release_model_check_config_without_backend_sources(released_model_examples, relative):
     (bundle, _, env) = released_model_examples
     path = bundle / 'examples/configs' / relative

@@ -94,6 +94,7 @@ def export_catalog(*, commit=None):
     files.update(ROOT.glob("scripts/run_wall_oss*.py"))
     files.update(ROOT.glob("scripts/run_zoo_example.py"))
     files.update(ROOT.glob("examples/configs/**/*.json"))
+    files.update(ROOT.glob("examples/inputs/*.toml"))  # --input presets read by examples/common/overrides.py
     files.add(ROOT / "scripts/validation/wall_base.py")
     files.update({ROOT / "scripts/runtime_libraries.py", ROOT / "scripts/g05_libraries.py"})
     files.update(ROOT.glob("python/rpu_backend/api/_execution.py"))

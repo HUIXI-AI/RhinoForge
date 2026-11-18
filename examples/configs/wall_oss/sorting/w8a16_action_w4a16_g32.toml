@@ -7,7 +7,7 @@
 [model]
 target = "wall_oss_sorting"
 # 本文件的权重/计算配方；切换精度须同时使用对应权重。
-precision = "w8a16_action_w4a16"
+precision = "w8a16_action_w4a16_g32"
 # 替换为匹配本模型与量化配方的本地资产路径或既有权重别名。
 fp16_checkpoint = "/path/to/wrc_sf_v728_0_15000"
 # 替换为匹配本模型与量化配方的本地资产路径或既有权重别名。

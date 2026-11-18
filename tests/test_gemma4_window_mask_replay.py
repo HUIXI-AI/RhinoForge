@@ -113,6 +113,10 @@ def test_real_public_gemma4_forward_keeps_both_cpu_producers_current(
 
     source = Model()
     monkeypatch.setattr(runtime, "compute_side_input", _compute_side_cpu)
+    # The RPU tied head is replaced by its CPU reference so the logits follow the native output.
+    monkeypatch.setattr(runtime, "upload_lm_head", lambda weight, lanes: weight)
+    monkeypatch.setattr(runtime, "device_lm_logits",
+                        lambda hidden, weight, lanes, cap: runtime.softcap_lm_logits(hidden.float(), weight, cap))
     observed = []
 
     def native(handle, hidden, k, v, mask, position, causal, chunk, side, descriptor):
@@ -284,6 +288,9 @@ struct Model {
  HostTensor hidden_input_;int64_t chunk_override=99;
  at::Tensor cos_sliding_=at::zeros({64,1},at::kHalf),cos_global_=at::zeros({64,1},at::kHalf);
  uint64_t side_live_base_=0;int64_t num_layers()const{return 2;}
+ // FP16 owner: the preflight's quantized-scale check short-circuits.
+ struct Layer{at::Tensor q_s;};std::vector<Layer> layer_weights_{2};
+ at::ScalarType projection_type()const{return at::kHalf;}
  int64_t hidden_size()const{return 8;}
  void set_chunk_size_override(int64_t value){chunk_override=value;}
  void prepare(const std::optional<HostTensor>& side_input,

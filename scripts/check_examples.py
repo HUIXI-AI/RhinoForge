@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import tomllib
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -82,57 +83,65 @@ def load_configs() -> dict[Path, dict]:
 
 DEFAULT_PROFILE_VARIANTS: dict[str, dict] = {
     "pi05-libero-finetuned.fp16.vla-tp4": {
-        "config": "pi05/3cam/h50/fp16.toml",
+        "config": "pi05/h50/fp16.toml",
         "set": {
             "rpu_execution.model.num_cores": 4
         },
         "remove": []
     },
     "pi05-libero-finetuned.fp16.vla-tp6": {
-        "config": "pi05/3cam/h50/fp16.toml",
+        "config": "pi05/h50/fp16.toml",
         "set": {
             "rpu_execution.model.num_cores": 6
         },
         "remove": []
     },
     "pi05-libero-finetuned-w8a16-vlm-expert.w8a16.vla-tp4": {
-        "config": "pi05/3cam/h50/w8a16.toml",
+        "config": "pi05/h50/w8a16.toml",
         "set": {
             "rpu_execution.model.num_cores": 4
         },
         "remove": []
     },
     "pi05-libero-finetuned-w8a16-vlm-expert.w8a16.vla-tp6": {
-        "config": "pi05/3cam/h50/w8a16.toml",
+        "config": "pi05/h50/w8a16.toml",
         "set": {
             "rpu_execution.model.num_cores": 6
         },
         "remove": []
     },
     "pi05-libero-finetuned.fp16.vla-2cam-tp4": {
-        "config": "pi05/2cam/h50/fp16.toml",
+        "config": "pi05/h50/fp16.toml",
         "set": {
+            "input.cameras": 2,
+            "input.batch": "/path/to/pi05_2cam_t32_batch.pt",
             "rpu_execution.model.num_cores": 4
         },
         "remove": []
     },
     "pi05-libero-finetuned.fp16.vla-2cam-tp6": {
-        "config": "pi05/2cam/h50/fp16.toml",
+        "config": "pi05/h50/fp16.toml",
         "set": {
+            "input.cameras": 2,
+            "input.batch": "/path/to/pi05_2cam_t32_batch.pt",
             "rpu_execution.model.num_cores": 6
         },
         "remove": []
     },
     "pi05-libero-finetuned-w8a16-vlm-expert.w8a16.vla-2cam-tp4": {
-        "config": "pi05/2cam/h50/w8a16.toml",
+        "config": "pi05/h50/w8a16.toml",
         "set": {
+            "input.cameras": 2,
+            "input.batch": "/path/to/pi05_2cam_t32_batch.pt",
             "rpu_execution.model.num_cores": 4
         },
         "remove": []
     },
     "pi05-libero-finetuned-w8a16-vlm-expert.w8a16.vla-2cam-tp6": {
-        "config": "pi05/2cam/h50/w8a16.toml",
+        "config": "pi05/h50/w8a16.toml",
         "set": {
+            "input.cameras": 2,
+            "input.batch": "/path/to/pi05_2cam_t32_batch.pt",
             "rpu_execution.model.num_cores": 6
         },
         "remove": []
@@ -219,6 +228,37 @@ def profile_variant_configs(configs: dict[Path, dict]) -> dict[str, tuple[Path, 
     return result
 
 
+
+def _catalog_recipe(path: Path, relative: Path):
+    """The registered precision recipe the TOML names; its file stem is that name or starts with it."""
+    item = COMMON.toml_recipe(tomllib.loads(path.read_text(encoding="utf-8")))
+    if item is None:
+        raise RuntimeError(f"{relative}: published examples use the [model] layout")
+    recipes = COMMON._backend_leaf("quant/precision_recipes.py")
+    family = recipes.load(COMMON.PRECISION_RECIPES)[item.family]
+    stem = relative.stem.removeprefix("rtc_") if relative.parts[:2] == ("rhinovla", "v3") else relative.stem
+    if recipes.stem_recipe(family, stem) != item.name:
+        raise RuntimeError(f"{relative}: the file name must be precision recipe {item.name!r} "
+                           f"or start with {item.name}_")
+    return item, recipes.describe(item, family.components)
+
+
+def _check_recipe_bindings() -> None:
+    """Every example profile is realized by at most one recipe of its runner target's family."""
+    recipes = COMMON._backend_leaf("quant/precision_recipes.py")
+    families = recipes.load(COMMON.PRECISION_RECIPES)
+    for profile_id, profile in COMMON.example_profiles().items():
+        try:
+            target = COMMON.profile_runner_target(profile)
+        except COMMON.ConfigError:
+            continue
+        family = next((item for item in families.values() if target in item.targets), None)
+        hits = [name for name, item in (family.recipes.items() if family else ())
+                if item.profiles and recipes.binds(item, profile_id)]
+        if len(hits) > 1:
+            raise RuntimeError(f"profile {profile_id} is bound by several precision recipes {hits}")
+
+
 def catalog(configs: dict[Path, dict] | None = None) -> Catalog:
     profiles = COMMON.example_profiles()
     api_entries: dict[str, list[CatalogEntry]] = {}
@@ -233,6 +273,10 @@ def catalog(configs: dict[Path, dict] | None = None) -> Catalog:
                   for config in sorting_configs}
     if len(sorting_configs) != 3 or precisions != {"fp16", "w8a16", "w8a16_action_w4a16"}:
         raise RuntimeError("parcel-sorting precision example drift")
+    _check_recipe_bindings()
+    for config_path, config in configs.items():
+        if "env" not in config:
+            _catalog_recipe(config_path, config_path.relative_to(CONFIGS))
     for config_path, config in configs.items():
         example = COMMON.example_metadata(config)
         if example is None:
@@ -474,7 +518,7 @@ def render_config_index(configs: dict[Path, dict]) -> str:
         if cpu is None and (custom in {"g05", "pi05", "wall_oss"} or target == "g05"):
             cpu = "8（运行器默认）"
         if cpu is None and custom == "lingbot2":
-            cpu = "1（运行器默认）"
+            cpu = "8 核 1，4/6 核 12（运行器默认）"
         if cpu is None and custom == "hy_vla":
             cpu = "12（运行器默认）"
         if cpu is None and fragment:

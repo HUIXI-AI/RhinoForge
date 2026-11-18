@@ -127,7 +127,7 @@ def native_install(monkeypatch):
         state['rhino']['precompute_calls'].append(args[1:])
         return (_FakeTensor(31, 8), _FakeTensor(31, 8))
     monkeypatch.setattr(rhino_convert, '_precompute_mrope_cos_sin', precompute_rhino)
-    monkeypatch.setattr(rhino_convert, '_create_kv_cache', lambda config, capacity: SimpleNamespace(max_seq_len=capacity))
+    monkeypatch.setattr(rhino_convert, '_create_kv_cache', lambda config, capacity, attn_tp=None: SimpleNamespace(max_seq_len=capacity))
     monkeypatch.setattr(qwen_fused, '_gather_qwenpi05_weights', lambda expert: tuple(['weights'] * 13))
     monkeypatch.setattr(qwen_fused, '_precompute_mrope_cos_sin', lambda *args: (_FakeTensor(31, 8), _FakeTensor(31, 8)))
     monkeypatch.setattr(qwen_fused, '_create_kv_cache', lambda config, capacity: SimpleNamespace(max_seq_len=capacity))

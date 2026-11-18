@@ -33,7 +33,7 @@ def test_actual_action_hooks_manifest_and_cold_setter(tmp_path):
         'const FmbRouteManifestEntry& FmbPhysicalManifestConsumer::consume_route(',
     ))
     constants = '\n'.join(re.findall(r'constexpr int64_t WALL_ACTION_\w+\s*=\s*\d+LL;', action))
-    accumulation = _statement(decoder, 'manifest.linear_accumulation = decoder_mixed_precision_')
+    accumulation = _statement(decoder, 'manifest.linear_accumulation = ')
     stubs = '\n'.join(f'#define {name}(...) ((void)0)' for name in sorted(
         set(re.findall(r'\b(rpu_launch_\w+)\(', hooks)) - {'rpu_launch_linear_spm_to_spm_acc16_kernel'}))
     source = META + r'''
@@ -76,13 +76,16 @@ void rpu_launch_linear_spm_to_spm_acc16_kernel(uint32_t in,const at::Tensor& w,u
  assert(w.scalar_type()==at::kHalf&&scale.scalar_type()==at::kHalf&&!ts&&!layer);
  calls.push_back({w.address,in,out,bias,m,n,k,partition,cores,acc32});}
 struct CausalDecoderModel {
- bool linear_acc32_=false,decoder_mixed_precision_=false;
+ bool linear_acc32_=false,decoder_mixed_precision_=false;int resolved=0,invalidations=0;
  std::vector<at::Tensor> tts_predictor_heads_;
- int resolved=0,invalidations=0;
+ const bool qwen3_prefill_w8a8_=false;
+ int64_t qwen3_inplace_capacity()const{return 0;}
+ int num_cores()const{return 8;}
  int get_last_resolved_chunk_size()const{return resolved;}
  void invalidate_model_state(){++invalidations;}
  SETTER
  FmbPhysicalExecutionManifest physical_manifest_for_candidate(const FmbThreeStageChunkPlan&,const LayoutContext&,int64_t,int64_t,int64_t)const{
+  constexpr bool qwen_a8=false;
   FmbPhysicalExecutionManifest manifest;MANIFEST_ACC
   return manifest;}
 };

@@ -292,6 +292,8 @@ public:
         + qwen25_setter
         + r'''
     int64_t num_layers() const { return 0; }
+    int cores_ = 8;
+    int num_cores() const { return cores_; }
     bool linear_acc32_ = false;
     bool has_rope_ = false;
     bool rope_spm_enabled_ = false;
@@ -342,6 +344,26 @@ int main() {
            vision.mixed_precision_enabled_ && !vision.layer_group_enabled_ &&
            vision.exact_mimc_enabled_ &&
            vision.rmsnorm_capability_ == fixed32);
+
+    // The four-lane owner admits DDR or SPM RoPE, the unfused or fused merger
+    // and BASE RMSNorm; a refused request publishes nothing.
+    VisionModel four;
+    four.cores_ = 4;
+    rejected = false;
+    try { four.set_execution_routes(true, true, true, false, false,
+                                    RPU_RMSNORM_CAP_BASE); }
+    catch (const std::runtime_error&) { rejected = true; }
+    assert(rejected && !four.rope_spm_enabled_ && !four.fused_merger_enabled_ &&
+           !four.mixed_precision_enabled_);
+    rejected = false;
+    try { four.set_execution_routes(true, false, false, false, false, fixed32); }
+    catch (const std::runtime_error&) { rejected = true; }
+    assert(rejected && !four.rope_spm_enabled_ &&
+           four.rmsnorm_capability_ == RPU_RMSNORM_CAP_BASE);
+    four.set_execution_routes(true, true, false, false, false,
+                              RPU_RMSNORM_CAP_BASE);
+    assert(four.rope_spm_enabled_ && four.fused_merger_enabled_ &&
+           four.rmsnorm_capability_ == RPU_RMSNORM_CAP_BASE);
 
     loaded_capability = RPU_RMSNORM_CAP_BASE;
     WallModel wall;

@@ -132,7 +132,7 @@ public:
 ''' + helpers + r'''
     Manifest plan_for_test(const FmbThreeStageChunkPlan& plan, const LayoutContext& layout) const {
         Manifest result;
-        const bool qwen3vl4b_fused_qk = false;
+        const bool qwen3vl4b_fused_qk = false, qwen_c512 = false;
         auto append = [&](FmbRouteFamily family, int64_t site, int64_t selector, int64_t flags,
                           std::vector<int64_t> args, int64_t invocation) {
             result.routes.push_back({family, site, selector, flags, std::move(args), invocation});
@@ -152,6 +152,7 @@ public:
         const int layer_idx = 0;
         const int64_t rows = chunk.len, local_q_heads = q / tp, local_kv_heads = kv / tp;
         const uint32_t input_residual = 1;
+        const bool qwen_c512 = false, qwen_inplace = false;
 ''' + dispatch + r'''
         throw std::runtime_error("unknown launch site");
     }

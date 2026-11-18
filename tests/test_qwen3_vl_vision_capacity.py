@@ -62,7 +62,8 @@ def test_configured_images_size_the_cold_vision_install(
                         lambda _: [SimpleNamespace(size=size) for size in sizes_wh])
     monkeypatch.setattr(generation, "qwen3_vl_encode", _encode)
     model, _loads = _public_loader(monkeypatch)
-    config = {"example": {"target": "qwen3_vl", "registry_alias": "qwen3-vl-2b"},
+    config = {"example": {"target": "qwen3_vl", "registry_alias": "qwen3-vl-2b",
+                          "profile_id": "qwen3-vl-2b.fp16.vision"},
               "input": {"component": "vision", "images": ["configured.png"] * len(sizes_wh)}}
 
     state = SimpleNamespace(owner=None)

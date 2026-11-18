@@ -1,0 +1,47 @@
+# 未写出的执行参数（省略即按以下值运行）：
+#   [cpu].threads 省略时不设置线程：PyTorch 使用环境变量 OMP_NUM_THREADS，未设置时使用全部 CPU 核（参考板 24）；2026-10-19 测量环境预设为 16。
+# 使用官方 Llama-3.2-1B 浮点权重，冷启动安装时转换一次。
+# Decoder 七投影对称 INT8，每输出通道一个 FP16 缩放；输出头（与 embedding 绑定）、embedding、norm 为 FP16。
+# Linear 固定 ACC16（Llama 没有 linear_acc32 选项）；尚未上板实测，任务质量未评估。
+[model]
+profile_id = "llama-3.2-1b.w8a16.text"
+registry_alias = "llama-3.2-1b"
+target = "llama"
+precision = "w8a16_text"
+architecture = "LlamaForCausalLM"
+
+[model.opt_in]
+
+[input]
+# 不填时使用自然输入长度；当前物理 prefill 位置+执行长度上限为 64。
+# prefill_tokens = 64
+# 可替换文本；自然输入长度由 tokenizer 决定。
+prompt = "Explain what a compiler does."
+# 首 token 之后的 decode 调用数，整数 ≥0；P 与 D 受 cache 和模型输入范围共同约束。
+decode_steps = 4
+
+[run]
+# 预热次数；不计入正式测量。
+warmup = 2
+# 正式执行次数，正整数。
+runs = 5
+# 按需开启硬件采样；保持 false 可减少测量干扰。
+hwperf = false
+# 按需开启 profiler；正式计时建议保持 false。
+profile = false
+# 随机种子，非负整数。
+seed = 0
+
+[rpu_execution]
+
+[rpu_execution.model]
+# RPU 核数预算。可选 4 / 6 / 8，默认 8；修改后需重新加载模型。
+# 4 核：Attention 4、MLP 4、输出头 4；6 核：Attention 4、MLP 6（MLP 宽度 8192 在量化后、swizzle 前一次性补零到 8256）、输出头 6。
+# 实际分配见模型页配置表的“4 核 / 6 核”列。
+num_cores = 8
+
+[rpu_execution.prefill]
+# prefill 分块行数。可选 "auto"（默认）或满足本组件形状限制的 16 的倍数整数（不超过 64）。
+# auto：由原生 planner 按实际输入行数选择。
+# 实际值记录在结果 report.json 的执行计划中（compute_chunk）。
+chunk_size = "auto"

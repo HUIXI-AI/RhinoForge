@@ -3,6 +3,23 @@ from __future__ import annotations
 
 from examples.common.text import text_context
 
+
+def install_quantization(profile_id):
+    """The `from_pretrained(quantization=...)` the profile's recipe applies at the cold install.
+
+    Text NVFP4 quantizes the FP16 source, with its Vision blocks too when the
+    recipe says so; packed W4 Vision quantizes the Vision blocks of the runtime W4
+    checkpoint. None: the weights install as converted.
+    """
+    from examples.common.config import install_quantization as recipe_quantization, runner_recipe
+
+    vision = runner_recipe("qwen3_vl", profile_id=profile_id).limits.get(
+        "vision_on_install_quantization")
+    if recipe_quantization("qwen3_vl", profile_id) == "nvfp4":
+        return "vision_nvfp4" if vision == "nvfp4" else "nvfp4"
+    return "vision_w4a16" if vision == "w4a16" else None
+
+
 def prepare(config, runner):
     import torch
     from examples.common.generation import _image_inputs, _text_input_ids, _generate, qwen3_vl_encode
@@ -35,6 +52,8 @@ def prepare(config, runner):
     elif prepared is None:
         encoded = {"input_ids": _text_input_ids(processor.tokenizer, inputs)}
     from rpu_backend.api import RPUCache, RPUModelForConditionalGeneration
+    quantization = install_quantization(example["profile_id"])
+    load_kwargs = {} if quantization is None else {"quantization": quantization}
 
     # The configured images are known before the cold install: size the
     # Vision RoPE table and KV cache from their grids (defaults when they fit).
@@ -42,7 +61,7 @@ def prepare(config, runner):
                     if "image_grid_thw" in encoded else {})
     model = RPUModelForConditionalGeneration.from_pretrained(
         checkpoint, dtype=torch.float16, device="rpu", rpu_execution=execution,
-        local_files_only=True, trust_remote_code=False, **vision_grids)
+        local_files_only=True, trust_remote_code=False, **vision_grids, **load_kwargs)
     runner.owner = model
     runner.input_geometry = {"input_ids_shape": list(encoded["input_ids"].shape)}
     for _k in ("pixel_values", "pixel_values_videos", "attention_mask", "mm_token_type_ids"):

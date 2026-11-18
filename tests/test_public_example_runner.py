@@ -61,9 +61,11 @@ def _prepare_public_llama_infer(monkeypatch, runner, model, cache, input_ids,
     monkeypatch.setattr(backend, "RPUCache", SimpleNamespace(
         from_model=lambda *_a, **_kw: cache), raising=False)
     state = SimpleNamespace(owner=None)
+    from examples.common import config as _common
+    monkeypatch.setattr(_common, "install_quantization", lambda *_: None)
     from examples.runners.llama import runner as llama_runner
     infer, owner = llama_runner.prepare({
-        "example": {"target": "llama", "registry_alias": "llama-test"},
+        "example": {"target": "llama", "registry_alias": "llama-test", "profile_id": "llama-test"},
         "input": {"prompt": "unchanged request", "decode_steps": decode_steps,
                   "stop_on_eos": stop_on_eos}}, state)
     assert owner is state.owner is model
@@ -207,8 +209,7 @@ def test_plain_text_prepare_keeps_cpu_prompt_and_generated_ids(
     monkeypatch.syspath_prepend(str(ROOT / "examples"))
     from examples.common import config as _common
     monkeypatch.setattr(_common, "validate_checkpoint_profile", lambda *_: None)
-    monkeypatch.setattr(_common, "planner_profiles", lambda: {
-        "plain-test": {"input_envelope": {"limits": {}}}})
+    monkeypatch.setattr(_common, "install_quantization", lambda *_: None)
     runner = load("example_plain_cpu_ids", "examples/common/generation.py")
     ids = torch.tensor([[1, 2, 3]])
     cache = Mock()
@@ -309,15 +310,18 @@ def test_dinov3_public_vision_reuses_hidden_readback_with_owned_cls(monkeypatch,
     factory.preflight = Mock()
     adapter.DINOv3Adapter = factory
     monkeypatch.setitem(sys.modules, adapter.__name__, adapter)
+    from examples.common import config as _common
+    monkeypatch.setattr(_common, "install_quantization", lambda *_: None)
     execution = {"tensor_parallel_size": 8}
     state = SimpleNamespace(owner=None)
     infer, owner = runner.prepare({
-        "example": {"target": "dinov3", "registry_alias": "dino-test"},
+        "example": {"target": "dinov3", "registry_alias": "dino-test", "profile_id": "dino-test"},
         "input": {}, "rpu_execution": execution}, state)
     outputs = [infer() for _ in hidden_values]
     assert owner is state.owner is model
     factory.preflight.assert_called_once_with(hf_config)
-    factory.assert_called_once_with(model, rpu_execution=execution)
+    factory.preflight_quantization.assert_not_called()
+    factory.assert_called_once_with(model, rpu_execution=execution, quantization=None)
     loader.assert_called_once_with("/cache/dinov3", config=hf_config,
                                   dtype=torch.float16, local_files_only=True)
     assert all(call.args == (pixels,) and
@@ -343,6 +347,7 @@ def test_qwen3vl_prepare_reads_current_cpu_ids_and_preserves_cold_geometry(
     validate = Mock()
     monkeypatch.setattr(_common, "validate_checkpoint_profile", validate)
     runner = load("example_qwen3vl_cpu_ids", "examples/runners/qwen3_vl/runner.py")
+    monkeypatch.setattr(runner, "install_quantization", lambda *_: None)
     ids = torch.tensor([[1, 3 if component != "text" else 2, 0]])
     pixels, grid = torch.ones(4, 6), torch.tensor([[1, 2, 2]])
     mask, types = torch.ones_like(ids), torch.tensor([[0, 1, 0]])
@@ -398,7 +403,7 @@ def test_qwen3vl_prepare_reads_current_cpu_ids_and_preserves_cold_geometry(
         return original_to(tensor, *args, **kwargs)
     monkeypatch.setattr(torch.Tensor, "to", no_ids_upload)
     execution = {"tensor_parallel_size": 8}
-    config = {"example": {"target": "qwen3_vl", "registry_alias": "qwen3vl-test"},
+    config = {"example": {"target": "qwen3_vl", "registry_alias": "qwen3vl-test", "profile_id": "qwen3vl-test"},
               "input": {"component": component, "prompt": "hello", "decode_steps": 2,
                         "stop_on_eos": False}, "rpu_execution": execution}
     state = SimpleNamespace(owner=None)
@@ -503,6 +508,7 @@ def test_fixed_decode_ignores_eos_and_keeps_owned_tokens_and_phase_timings(
     assert stats["prefill_tokens"] == 3 and stats["decode_calls"] == 2
     assert stats["prefill_ms"] == 500.
     assert stats["decode_ms"] == pytest.approx(300.)
+    assert stats["decode_step_ms"] == pytest.approx([100., 200.])
     assert stats["prefill_tokens_per_second"] == 6.
     assert stats["decode_tokens_per_second"] == pytest.approx(2 / .3)
 

@@ -57,4 +57,27 @@ planner 按真实 prefix 选择执行行数：≤384 行补到下一个 16 的�
 | `noise` | fp16 / fp32 `[1,32,26]` | 去噪初始噪声 |
 | `dof_mask` | fp16 / fp32 `[1,32,26]` | 前 7 维为 1.0，其余为 0 |
 
-仓库内没有生成脚本；可参考测试夹具 `tests/test_wall_base_benchmark_inputs.py` 中的 `observation()` 构造。格式不符时错误写入 `report.json` 的 `error`，进程返回 1。
+仓库内没有生成脚本。以下代码生成一个 2cam、224、T32 的文件（3cam 再加 right_wrist 图），也可参考测试夹具 `tests/test_wall_base_benchmark_inputs.py` 中的 `observation()`：
+
+```python
+import numpy as np, torch
+from PIL import Image
+from transformers import AutoProcessor
+
+side, T = 224, 32
+paths = ["/path/to/face.png", "/path/to/left_wrist.png"]
+images = torch.stack([torch.from_numpy(np.array(Image.open(p).convert("RGB").resize((side, side)), copy=True))
+                      for p in paths])
+instruction = "Pick up the object and place it in the bin."
+tok = AutoProcessor.from_pretrained("/path/to/wall-oss-0.5", local_files_only=True).tokenizer
+assert len(tok.encode(instruction, add_special_tokens=False)) == T  # 入口不截断也不补齐
+active = torch.arange(26) < 7
+batch = {"images": images, "instruction": instruction,
+         "proprioception": torch.zeros(26),  # 换成实际机器人状态
+         "state_mask": active,
+         "noise": torch.randn(1, 32, 26, generator=torch.Generator().manual_seed(0)),
+         "dof_mask": active.float().reshape(1, 1, 26).expand(1, 32, 26).contiguous()}
+torch.save(batch, f"/path/to/{len(paths)}cam{side}_t{T}.pt")
+```
+
+tokenizer 取自 `fp16_checkpoint` 目录。文件名须与 `batch_template` 展开结果一致。格式不符时错误写入 `report.json` 的 `error`，进程返回 1。

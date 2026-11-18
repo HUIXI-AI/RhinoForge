@@ -1,0 +1,44 @@
+# 未写出的执行参数（省略即按以下值运行）：
+#   [cpu].threads 省略时本入口使用 8。
+#   分块（chunk_size）模板未写出，按 auto 由入口选择：本配置的 vision 在任何核数下都按单图 256 串行；prefill 在 8 核为相机与文本的配对行数（3 相机 T32 为 400，2 相机为 272），4/6 核由 auto 规划器选择；action 64。可调范围见模型页。
+# Pi0.5 统一入口：按精度、输入和核数自动选择执行路径。
+[model]
+target = "pi05"
+# 本文件的权重/计算配方；切换精度须同时使用对应权重。
+precision = "w8a16_vision_w4a16_action_nvfp4"
+# Vision（SigLIP 27 层的 q/k/v/o/fc1/fc2）在安装时从 FP16 量化为 G32 RTN W4；
+# 其余与 w8a16_action_nvfp4 相同，读同一份 Action NVFP4 权重。
+# 替换为匹配本模型与量化配方的本地资产路径或既有权重别名。
+checkpoint = "/path/to/pi05_action_nvfp4"
+
+[input]
+# 替换为匹配下列输入形状的文件；固定 fixture 须保留其身份与格式。
+batch = "/path/to/pi05_3cam_t32_batch.pt"
+# 可选 2 / 3，须与 batch 一致。2 相机用 --input 2cam_t32 --set input.batch=<2 相机 T32 batch>。
+cameras = 3
+# 语言存储宽度可选 32 / 64 / 96 / 128 / 160；4/6 核只接受 32（2 或 3 相机）。
+text_tokens = 32
+# 当前模型路径的固定去噪步数，不作为任意可调范围。
+num_steps = 10
+# 动作序列长度（action horizon）可选 10 / 50；由权重决定，须与 checkpoint 的 chunk_size 一致。
+action_horizon = 50
+# noise = "/path/to/fixed_cpu_noise.pt"
+
+[run]
+# 预热次数；不计入正式测量。
+warmup = 2
+# 正式执行次数，正整数。
+runs = 5
+# 随机种子，非负整数。
+seed = 0
+# 结果输出目录；并发运行使用不同目录。
+output_dir = "./pi05_results/h50/w8a16_vision_w4a16_action_nvfp4"
+
+[rpu_execution.model]
+# RPU 核数预算。可选 4 / 6 / 8，默认 8；修改后需重新加载模型。
+# Vision 在任何预算下都用 4 核、一次一个相机：SigLIP 补零后 o 的 K 是 1280、fc2 的 K
+# 是 4352，按行分到 8 核时每核 K 是 160 和 544，不是 64 的倍数，pgrp W4 不接受。
+# 8 核时 Prefill 与 Action 仍是 8 核配对布局，但没有 8 核合批 Vision 和它的 TP8 Vision 优化。
+# 4/6 核时 Attention 4 核，MLP 与预算相同；6 核 Action MLP 中间维 4096 补零到 4224。
+# 实际分配见模型页配置表的“4 核 / 6 核”列。
+num_cores = 8

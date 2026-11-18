@@ -66,7 +66,7 @@ def test_staged_p640_gate_up_kernel_uses_current_shared_a_without_scratch_writes
 
     layout_start = decoder.index("const bool wall_p640_staged_layout")
     layout = decoder[layout_start : decoder.index("// \u2605 Phase 2.5", layout_start)]
-    assert 'if (!wall_p640_staged_layout) {' in layout
+    assert 'if (!wall_p640_staged_layout && !(qwen_inplace && qwen3_c256_)) {' in layout
     assert 'decls.push_back({"up"' in layout
     assert ("const int down_phase_start = (exact_multiview_text_layout || "
             "lingbot_c400_full_layout) ? 8 : 7;") in " ".join(layout.split())

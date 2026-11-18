@@ -1,11 +1,14 @@
 # 未写出的执行参数（省略即按以下值运行）：
-#   rpu_execution.model.num_cores 固定 8 核（可显式写 8；4/6 核不支持，原因见模型页配置表）。
+#   rpu_execution.model.num_cores 省略为 8；可写 4 / 6，修改后需重新加载模型：文本骨干为 Attention 4、MLP 4/6，Vision 和动作专家用 4 核；
+#     只有 8 核实现的选项（Attention 8、多图批处理、vision_pair、融合 merger、行权重外循环、融合拼装、sorting SiLU、FP16 传输、动作权重驻留）在 4/6 核关闭，
+#     linear_acc32 = true 和 instruction_residency 在 4/6 核报错；每路相机单独过一次 Vision，224 且 vision_window 开启时走逐窗口 SDPA，其余走稠密窗口 mask。
 #   分块（chunk_size）模板未写出，按 auto 由入口选择；2026-10-19 模板默认输入实测：vision 336/672、action 32。可调范围见模型页。
-# Wall-OSS base：真实相机输入，动作长度 32，10 步去噪，8 核。
+# Wall-OSS base：真实相机输入，动作长度 32，10 步去噪，默认 8 核。
 # 直接在本文件修改 text_tokens 和 linear_acc32，不另建 ACC 或文本长度配置。
 # 下方 CPU 线程为 T32、ACC16 下选定的值；换输入或文本长度时可保留。
 # prefill 执行行数由 planner 按真实 prefix 行数选择，不需要手动设置：≤384 行补到下一个 16 的倍数（单 chunk）；
 #   385–448、449–512、513–640 行分别执行 448、512、640 行（等分两 chunk），超过 640 行报错（2026-10-23 板测，见性能报告）。
+#   以上为 8 核规则；4/6 核 Attention 为 4 核，prefill 单块上限 320 行，由 planner 选能放进 SPM 的最少块数执行，不做等分两块（4/6 核已在板上通过运行时检查）。
 # 相对路径按执行目录解析，请在仓库根目录运行。
 
 [model]

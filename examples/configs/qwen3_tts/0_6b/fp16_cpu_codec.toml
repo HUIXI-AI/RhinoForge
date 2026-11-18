@@ -1,5 +1,7 @@
 [model]
 target = "qwen3_tts"
+# 本文件的权重/计算配方；切换精度须同时使用对应权重。
+precision = "fp16"
 checkpoint = "/path/to/Qwen3-TTS-12Hz-0.6B-Base"
 source = "/path/to/qwen3-tts-prepared/qwen_tts"
 # 可选 rpu / cpu；保持与所选 codec 执行路径一致。

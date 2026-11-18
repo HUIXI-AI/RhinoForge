@@ -73,7 +73,8 @@ struct Model{
 int main(){
  for(int steps:{4,10})for(bool quantized:{false,true}){
  table_steps=steps;dmas.clear();Model model(steps,quantized);model.check_time_prepare_state();model.adaln_table_.live=true;model.check_time_prepare_state();
- for(int bad=0;bad<12;++bad){Model x(steps,quantized);switch(bad){case 0:x.inference_started_=true;break;case 1:x.resolved=48;break;case 2:x.z2_bound_=true;break;case 3:x.z2_prepared_seq_len_=82;break;case 4:x.num_steps_=3;break;case 5:x.time_tau_table_.live=true;break;case 6:x.tp=4;break;case 7:x.ae2t_w_.p->v.valid=false;break;case 8:x.po1_b_.p->v.valid=false;break;case 9:x.action_horizon_=39;break;case 10:x.num_steps_=5;break;case 11:x.po1_ws_.live=true;x.po1_ws_.p->v.valid=false;break;}
+ {Model m4(steps,quantized);m4.tp=4;m4.check_time_prepare_state();}
+ for(int bad=0;bad<12;++bad){Model x(steps,quantized);switch(bad){case 0:x.inference_started_=true;break;case 1:x.resolved=48;break;case 2:x.z2_bound_=true;break;case 3:x.z2_prepared_seq_len_=82;break;case 4:x.num_steps_=3;break;case 5:x.time_tau_table_.live=true;break;case 6:x.tp=2;break;case 7:x.ae2t_w_.p->v.valid=false;break;case 8:x.po1_b_.p->v.valid=false;break;case 9:x.action_horizon_=39;break;case 10:x.num_steps_=5;break;case 11:x.po1_ws_.live=true;x.po1_ws_.p->v.valid=false;break;}
   try{x.check_time_prepare_state();assert(false);}catch(const std::runtime_error&){}
  }
  RpuKernelGraph::active=true;try{model.check_time_prepare_state();assert(false);}catch(const std::runtime_error&){}RpuKernelGraph::active=false;

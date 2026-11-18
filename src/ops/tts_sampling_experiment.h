@@ -18,6 +18,21 @@ static at::Tensor tts_sampling_checked_result(const at::Tensor& valid, const at:
     return result;
 }
 
+static at::Tensor tts_sampling_checked_packed_result(const at::Tensor& packed) {
+    TORCH_CHECK(packed.device().is_cpu() && packed.scalar_type() == at::kHalf &&
+                    packed.sizes().equals({15, 2064}), "invalid packed TTS sampling result");
+    TORCH_CHECK(packed.narrow(1, 0, 2048).eq(1).all().item<bool>(),
+                "TTS sampling logits outside validated envelope");
+    auto result = at::empty({1, 15}, at::TensorOptions().dtype(at::kLong));
+    const auto* bytes = reinterpret_cast<const uint8_t*>(packed.data_ptr<c10::Half>());
+    auto* tokens = result.data_ptr<int64_t>();
+    for (int index = 0; index < 15; ++index)
+        tokens[index] = *reinterpret_cast<const int32_t*>(bytes + index * 4128 + 4096);
+    TORCH_CHECK(result.ge(0).all().item<bool>() && result.lt(2048).all().item<bool>(),
+                "TTS sampled index outside vocabulary");
+    return result;
+}
+
 // Experimental host wrapper; operator assets remain outside the repository.
 class TtsSamplingExperiment {
     using Kernel = rhino_lkn::Kernel_t;
@@ -25,10 +40,13 @@ class TtsSamplingExperiment {
     std::vector<std::unique_ptr<Kernel>> kernels_;
     rhino_lkn::HostDDR_t init_{16384, rhino_lkn::read_write, rhino_lkn::kStride32B, 256};
     rhino_lkn::HostDDR_t noise_{15 * 4096, rhino_lkn::read_write, rhino_lkn::kStride32B, 256};
-    at::Tensor validity_;
-    at::Tensor graph_init_, graph_noise_;
+    at::Tensor packed_result_;
+    at::Tensor graph_init_, graph_noise_, reserved_noise_;
+    bool reserved_mode_ = false;
+    int reserved_frames_ = 0, reserved_index_ = 0;
     int next_index_ = 0;
     std::array<uint64_t, 15 * 4> dma_bases_{};
+    std::array<uint64_t, 15> reserved_noise_bases_{};
     uint16_t params_[14][68], scm_[14][256];
     const char* names_[14] = {"binary_scalar", "binary_scalar", "binary_sameshape", "where_sameshape",
         "topk_by_kvsort_fp16", "binary_Nx1_NxC_v16_batch_bopa",
@@ -60,8 +78,10 @@ public:
         auto noise = at::from_blob(noise_.get_cpu_ptr(), {15 * 2048}, at::TensorOptions().dtype(at::kShort));
         if (!graph_init_.defined()) {
             graph_init_ = init.to(options.dtype(at::kShort));
+        }
+        if (!reserved_mode_ && !graph_noise_.defined()) {
             graph_noise_ = noise.to(options.dtype(at::kShort));
-        } else {
+        } else if (!reserved_mode_) {
             graph_noise_.copy_(noise);
         }
     }
@@ -79,10 +99,13 @@ public:
         auto* init = static_cast<uint16_t*>(init_.get_cpu_ptr());
         for (int i = 0; i < 4096; ++i) { init[i] = 0xfc00; init[4096 + i] = i; }
         check(init_.flush());
-        reset();
     }
     void reset() {
         next_index_ = 0;
+        if (reserved_mode_) {
+            TORCH_CHECK(reserved_index_ < reserved_frames_, "TTS sampling reservation exhausted");
+            return;
+        }
         // shortcut: bounded FP16 noise changes sampling; not a default production path.
         auto noise = at::empty({15, 2048}, at::TensorOptions().dtype(at::kFloat)).exponential_(1);
         noise = noise.clamp_min(0x1p-14).to(at::kHalf).contiguous();
@@ -90,18 +113,40 @@ public:
         std::memcpy(noise_.get_cpu_ptr(), noise.data_ptr(), 15 * 4096);
         check(noise_.flush());
     }
-    at::Tensor run(const at::Tensor& logits, const at::Tensor& table, const at::Tensor& ids, int index) {
+    void reserve(int frames, const at::Tensor& reference) {
+        auto noise = at::empty({frames, 15, 2048}, at::TensorOptions().dtype(at::kFloat))
+                         .exponential_(1);
+        reserve_noise(frames, reference, noise);
+    }
+    void reserve_noise(int frames, const at::Tensor& reference, const at::Tensor& source) {
+        TORCH_CHECK(!RpuKernelGraph::has_active() && frames >= 2 && frames <= 256 &&
+                        reference.device().is_privateuseone(),
+                    "invalid TTS sampling reservation profile");
+        TORCH_CHECK(source.device().is_cpu() && source.scalar_type() == at::kFloat &&
+                        source.is_contiguous() && source.sizes().equals({frames, 15, 2048}) &&
+                        at::isfinite(source).all().item<bool>() && source.gt(0).all().item<bool>(),
+                    "invalid reserved TTS sampling noise");
+        auto noise = source.clamp_min(0x1p-14).to(at::kHalf).contiguous();
+        TORCH_CHECK(at::isfinite(noise).all().item<bool>(), "invalid reserved TTS sampling noise");
+        if (!reserved_noise_.defined())
+            reserved_noise_ = at::empty({256, 15, 2048}, reference.options().dtype(at::kHalf));
+        reserved_noise_.narrow(0, 0, frames).copy_(noise);
+        reserved_mode_ = true;
+        reserved_frames_ = frames;
+        reserved_index_ = next_index_ = 0;
+    }
+    at::Tensor run(const at::Tensor& logits, const at::Tensor& table, int index) {
         using namespace rhino_lkn;
         TORCH_CHECK(index == next_index_ && index >= 0 && index < 15 && logits.sizes().equals({1,1,2048}) &&
-                    table.sizes().equals({2048,1024}) && ids.sizes().equals({15,8}) &&
+                    table.sizes().equals({2048,1024}) &&
                     logits.scalar_type() == at::kHalf && table.scalar_type() == at::kHalf &&
-                    ids.scalar_type() == at::kInt && logits.device().is_privateuseone() &&
-                    table.device() == logits.device() && ids.device() == logits.device(),
+                    logits.device().is_privateuseone() && table.device() == logits.device(),
                     "invalid TTS sampler tensor profile");
         const auto logits_buffer = buffer(logits);
-        const auto table_buffer = buffer(table), ids_buffer = buffer(ids);
-        if (!validity_.defined()) validity_ = at::empty({15, 2048}, logits.options());
-        const auto validity_buffer = buffer(validity_);
+        const auto table_buffer = buffer(table);
+        if (!packed_result_.defined())
+            packed_result_ = at::empty({15, 2064}, logits.options());
+        const auto packed_buffer = buffer(packed_result_);
         auto& alloc = SpmAllocator::instance();
         TORCH_CHECK(alloc.is_initialized() && alloc.addr(0, 0) == 0x40000000,
                     "TTS sampling requires the core-0 shared SPM root");
@@ -144,12 +189,24 @@ public:
         };
         dma(*logits_buffer.root, logits_buffer.offset, spm, base + 0x120000, 4096, 0);
         if (graph) {
-            TORCH_CHECK(graph_init_.defined() && graph_noise_.defined(), "TTS group buffers not prepared");
-            auto init = buffer(graph_init_), noise = buffer(graph_noise_);
+            TORCH_CHECK(graph_init_.defined() &&
+                            (reserved_mode_ || graph_noise_.defined()),
+                        "TTS group buffers not prepared");
+            auto init = buffer(graph_init_);
             dma(*init.root, init.offset, spm, base + 0x12a000, 4096);
             dma(*init.root, init.offset, spm, base + 0x12c000, 4096);
             dma(*init.root, init.offset + 8192, spm, base + 0x124000, 8192);
-            dma(*noise.root, noise.offset + index * 4096, spm, base + 4096, 4096);
+            if (reserved_mode_) {
+                auto noise = buffer(reserved_noise_);
+                auto& base_slot = reserved_noise_bases_[index];
+                base_slot = noise.root->get_rpu_addr() + noise.offset +
+                            (reserved_index_ * 15 + index) * 4096;
+                graph->record_dma_mutable_src(&base_slot, 0,
+                                              spm.get_rpu_addr() + base + 4096, 4096, 0);
+            } else {
+                auto noise = buffer(graph_noise_);
+                dma(*noise.root, noise.offset + index * 4096, spm, base + 4096, 4096);
+            }
         } else {
             dma(init_, 0, spm, base + 0x12a000, 4096);
             dma(init_, 0, spm, base + 0x12c000, 4096);
@@ -170,14 +227,16 @@ public:
             else check(queue->add_kernel(*k, {1,1,1}, {0}));
         }
         dma(spm, base + 0x110000, *output_buffer.root, output_buffer.offset, 2048, 1, true);
-        dma(spm, base + 12288, *ids_buffer.root, ids_buffer.offset + index * 32, 32, 2, true);
-        dma(spm, base + 0x12f000, *validity_buffer.root, validity_buffer.offset + index * 4096, 4096, 3, true);
+        dma(spm, base + 12288, *packed_buffer.root,
+            packed_buffer.offset + index * 4128 + 4096, 32);
+        dma(spm, base + 0x12f000, *packed_buffer.root,
+            packed_buffer.offset + index * 4128, 4096);
         if (graph) {
             graph->keep_alive(logits);
             graph->keep_alive(output);
-            graph->keep_alive(ids);
-            graph->keep_alive(validity_);
+            graph->keep_alive(packed_result_);
             graph->keep_alive(table);
+            if (reserved_mode_) graph->keep_alive(reserved_noise_);
         } else {
             check(queue->build_batch());
             check(queue->enqueue_batch(true));
@@ -186,9 +245,11 @@ public:
         ++next_index_;
         return output;
     }
-    at::Tensor finish(const at::Tensor& ids) {
+    at::Tensor finish() {
         TORCH_CHECK(next_index_ == 15, "incomplete TTS sampling group");
         // Invalid logits are replaced with zero on-device; never return their generated tokens.
-        return tts_sampling_checked_result(validity_.cpu(), ids.cpu());
+        auto result = tts_sampling_checked_packed_result(packed_result_.cpu());
+        if (reserved_mode_) ++reserved_index_;
+        return result;
     }
 };

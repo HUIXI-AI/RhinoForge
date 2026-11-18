@@ -15,6 +15,8 @@ class TtsPredictorGroup {
 public:
     explicit TtsPredictorGroup(std::string path);
     ~TtsPredictorGroup();
+    void reserve(int64_t frames, const at::Tensor& reference);
+    void reserve_noise(int64_t frames, const at::Tensor& reference, const at::Tensor& noise);
     void retire(RpuGraphCache& cache);
     at::Tensor generate(int64_t handle, const at::Tensor& input,
         const std::vector<at::Tensor>& embeddings, const std::vector<at::Tensor>& keys,

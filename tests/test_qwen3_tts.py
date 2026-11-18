@@ -432,6 +432,65 @@ def test_generation_requires_eos_before_codec(ids, finished):
     assert model._last_generation == {"steps": len(ids), "eos": finished}
 
 
+def test_generation_reserves_lazy_predictor_group_before_first_build(monkeypatch):
+    from rpu_backend.graph import _runtime
+
+    calls = []
+    class Group:
+        def __init__(self, path):
+            calls.append(("create", path))
+        def reserve(self, frames, reference):
+            calls.append(("reserve", frames, reference))
+
+    monkeypatch.setenv("RPU_TTS_SAMPLING_EXPERIMENT", "test-assets")
+    monkeypatch.setattr(_runtime, "_cpp_ext", SimpleNamespace(TtsPredictorGroup=Group))
+    model = Qwen3TTSModel()
+    reference = torch.ones(1)
+    model._head_weights = [None, reference]
+    model._components = {
+        "talker": {"generation_limit": 64},
+        "predictor": {"experimental_group_enabled": True},
+    }
+    model._restore_talker_generate = (None, lambda: SimpleNamespace(
+        sequences=torch.tensor([[2150]], dtype=torch.long)))
+    model._wrapper = SimpleNamespace(model=SimpleNamespace(config=SimpleNamespace(
+        talker_config=SimpleNamespace(codec_eos_token_id=2150))))
+
+    model._generate_talker()
+
+    assert calls == [("create", "test-assets"), ("reserve", 64, reference)]
+
+
+def test_generation_interleaves_talker_and_predictor_noise(monkeypatch):
+    calls = []
+    noise = torch.ones(64, 15, 2048)
+    class Sampler:
+        def reset_interleaved(self, frames, reference):
+            calls.append(("talker", frames, reference))
+            return noise
+    class Group:
+        def reserve_noise(self, frames, reference, supplied):
+            calls.append(("predictor", frames, reference, supplied))
+
+    monkeypatch.setenv("RPU_TTS_TALKER_SAMPLING_EXPERIMENT", "talker-assets")
+    model = Qwen3TTSModel()
+    reference = torch.ones(1)
+    model._head_weights = [None, reference]
+    model._components = {
+        "talker": {"generation_limit": 64, "talker_sampler": Sampler(),
+                   "talker_sampler_asset": "talker-assets", "talker_sampler_reference": reference},
+        "predictor": {"experimental_group": Group()},
+    }
+    model._restore_talker_generate = (None, lambda: SimpleNamespace(
+        sequences=torch.tensor([[2150]], dtype=torch.long)))
+    model._wrapper = SimpleNamespace(model=SimpleNamespace(config=SimpleNamespace(
+        talker_config=SimpleNamespace(codec_eos_token_id=2150))))
+
+    model._generate_talker()
+
+    assert calls == [("talker", 64, reference), ("predictor", 64, reference, noise)]
+
+
 def test_dtype_rejected_before_loading(monkeypatch):
     from rpu_backend.adapters import qwen3_tts
 
@@ -866,6 +925,139 @@ def test_talker_prefill_padding_positions_shape_switch_and_owned_outputs(monkeyp
         assert third.past_key_values is cache and cache.position == 5
     assert evicted == [captures[0]] and calls[2][0] == calls[3][0] == 0
     assert captures[0] != captures[2] and captures[2] == captures[3]
+
+
+def test_talker_decode_captures_head_in_decoder_graph(monkeypatch):
+    from contextlib import nullcontext
+    from rpu_backend.api import cache as cache_module
+
+    class Cache:
+        def __init__(self, *args):
+            self.position = 0
+            self.k_caches = self.v_caches = []
+        def reset_to_position(self, position):
+            self.position = position
+        def update_position(self, count):
+            self.position += count
+
+    monkeypatch.setattr(cache_module, "RPUCache", Cache)
+    original_to = torch.Tensor.to
+    monkeypatch.setattr(torch.Tensor, "to", lambda tensor, *args, **kwargs:
+        tensor if args == ("rpu",) else original_to(tensor, *args, **kwargs))
+    graph = SimpleNamespace(capture=lambda _: nullcontext())
+    raw = torch.ones(1, 1, 1024, dtype=torch.float16)
+    logits = torch.ones(1, 1, 3072, dtype=torch.float16)
+    monkeypatch.setattr(torch.ops.rpu, "causal_decoder_forward", lambda *a, **kw: raw,
+                        raising=False)
+    monkeypatch.setattr(torch.ops.rpu, "causal_decoder_tts_talker_logits",
+                        lambda handle: logits, raising=False)
+    part = dict(layers=28, capacity=128, generation_limit=64, name="talker", handle=1,
+                descriptor=(), signature=None, graph=graph, planner=object(), calls=0, tokens=0,
+                fused_talker_head=True, fused_head_calls=0)
+    output = tts._decoder_forward(part, torch.ones(1, 1, 1024), None,
+                                  None, None, None, False)
+    assert part["head_logits"].shape == (1, 1, 3072) and part["head_index"] == 0
+    expected = part["head_logits"]
+    assert tts._take_predictor_logits(part, output.last_hidden_state, 0) is expected
+
+
+def test_talker_decode_captures_device_sampler_and_publishes_token(monkeypatch):
+    from contextlib import contextmanager
+    from rpu_backend.api import cache as cache_module
+
+    active = False
+
+    class Cache:
+        def __init__(self, *args):
+            self.position = 0
+            self.k_caches = self.v_caches = []
+        def reset_to_position(self, position):
+            self.position = position
+        def update_position(self, count):
+            self.position += count
+
+    class Graph:
+        @contextmanager
+        def capture(self, _):
+            nonlocal active
+            active = True
+            yield
+            active = False
+
+    class Sampler:
+        def sample(self, logits):
+            assert active and logits.shape == (1, 1, 3072)
+        def result(self):
+            assert not active
+            return torch.tensor([[123]])
+
+    monkeypatch.setattr(cache_module, "RPUCache", Cache)
+    original_to = torch.Tensor.to
+    monkeypatch.setattr(torch.Tensor, "to", lambda tensor, *args, **kwargs:
+        tensor if args == ("rpu",) else original_to(tensor, *args, **kwargs))
+    monkeypatch.setattr(torch.ops.rpu, "causal_decoder_forward",
+                        lambda *args, **kwargs: torch.ones(1, 1, 1024, dtype=torch.float16),
+                        raising=False)
+    monkeypatch.setattr(torch.ops.rpu, "causal_decoder_tts_talker_logits",
+                        lambda handle: torch.ones(1, 1, 3072, dtype=torch.float16), raising=False)
+    part = dict(layers=28, capacity=128, generation_limit=64, name="talker", handle=1,
+                descriptor=(), signature=None, graph=Graph(), planner=object(), calls=0, tokens=0,
+                fused_talker_head=True, talker_sampler=Sampler())
+    tts._decoder_forward(part, torch.ones(1, 1, 1024), None, None, None, None, False)
+    assert part["head_token"].item() == 123 and "head_logits" not in part
+
+
+def test_talker_prefill_captures_device_sampler_and_publishes_token(monkeypatch):
+    from contextlib import nullcontext
+    import rpu_backend.graph as graph_module
+    from rpu_backend.api import cache as cache_module
+    from rpu_backend.runtime import decoder
+
+    class Cache:
+        def __init__(self, *args):
+            self.position = 0
+            self.k_caches = self.v_caches = []
+        def reset_to_position(self, position):
+            self.position = position
+        def update_position(self, count):
+            self.position += count
+
+    class Sampler:
+        def sample(self, logits):
+            assert logits.shape == (1, 1, 3072)
+        def result(self):
+            return torch.tensor([[123]])
+
+    monkeypatch.setattr(cache_module, "RPUCache", Cache)
+    monkeypatch.setattr(graph_module, "GraphSignature", lambda **kwargs: kwargs)
+    plan = SimpleNamespace(selected=SimpleNamespace(stage_tuple=SimpleNamespace(
+        physical_descriptor=())), graph_key_words=lambda: ())
+    monkeypatch.setattr(decoder, "_text_prefill_execution_plan", lambda *args: (4, 4, plan))
+    original_to = torch.Tensor.to
+    monkeypatch.setattr(torch.Tensor, "to", lambda tensor, *args, **kwargs:
+        tensor if args == ("rpu",) else original_to(tensor, *args, **kwargs))
+    monkeypatch.setattr(torch.ops.rpu, "causal_decoder_forward",
+                        lambda *args, **kwargs: torch.ones(1, 4, 1024, dtype=torch.float16),
+                        raising=False)
+    monkeypatch.setattr(torch.ops.rpu, "causal_decoder_tts_talker_logits",
+                        lambda handle: torch.ones(1, 1, 3072, dtype=torch.float16), raising=False)
+    part = dict(layers=28, capacity=128, generation_limit=64, name="talker", handle=1,
+                descriptor=(), signature=None,
+                graph=SimpleNamespace(capture=lambda _: nullcontext(), evict=lambda _: None),
+                planner=object(), calls=0, tokens=0, fused_talker_head=True,
+                talker_sampler=Sampler())
+    tts._decoder_forward(part, torch.ones(1, 3, 1024), None, None, None, None, False)
+    assert part["head_token"].item() == 123 and "head_logits" not in part
+
+
+def test_sampled_talker_logits_publish_only_selected_token():
+    hidden = torch.zeros(1, 1, 1024)
+    logits = tts._sampled_talker_logits(hidden, torch.tensor([[2150]]))
+    assert logits.shape == (1, 1, 3072) and logits.dtype == torch.float32
+    assert logits[0, 0, 2150] == 0 and torch.isneginf(logits).sum() == 3071
+    for token in (-1, 3072):
+        with pytest.raises(RuntimeError, match="sampled token"):
+            tts._sampled_talker_logits(hidden, torch.tensor([[token]]))
 
 
 @pytest.mark.parametrize("kernel,stride", [(2, 2), (16, 8)])

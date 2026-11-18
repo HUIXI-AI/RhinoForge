@@ -329,6 +329,61 @@ def test_resident_stage_keeps_three_units_on_device_and_restores(monkeypatch, pa
     assert all(module.forward == forward for module, forward in original.items())
 
 
+def test_decoder_stage_keeps_snake_transpose_and_residuals_on_device(monkeypatch):
+    from rpu_backend.runtime import weights
+    decoder = _paired_decoder()
+    for index, in_channels in enumerate((1536, 768, 384, 192), start=1):
+        snake = SnakeBeta()
+        snake.alpha = torch.nn.Parameter(torch.zeros(in_channels))
+        snake.beta = torch.nn.Parameter(torch.zeros(in_channels))
+        decoder.decoder[index].block[0] = snake
+        transpose = torch.nn.Module()
+        transpose.conv = decoder.transposes[index + 1]
+        decoder.decoder[index].block[1] = transpose
+        for unit in decoder.decoder[index].block[2:]:
+            channels = unit.conv1.conv.in_channels
+            unit.act1 = SnakeBeta()
+            unit.act1.alpha = torch.nn.Parameter(torch.zeros(channels))
+            unit.act1.beta = torch.nn.Parameter(torch.zeros(channels))
+    final_snake = SnakeBeta()
+    final_snake.alpha = torch.nn.Parameter(torch.zeros(96))
+    final_snake.beta = torch.nn.Parameter(torch.zeros(96))
+    decoder.decoder.append(final_snake)
+    original_to = torch.Tensor.to
+    monkeypatch.setattr(torch.Tensor, "to", lambda self, *a, **kw:
+                        self if a == ("rpu",) else original_to(self, *a, **kw))
+    monkeypatch.setattr(weights, "transform_linear_weight", lambda value, *args: value)
+    for name in ("tts_codec_snake", "tts_codec_conv_transpose1d_device_post",
+                 "tts_codec_residual_unit_rows", "tts_codec_residual_unit_padded_rows"):
+        monkeypatch.setattr(torch.ops.rpu, name,
+                            lambda *args: pytest.fail("intermediate CPU boundary used"),
+                            raising=False)
+    monkeypatch.setattr(torch.ops.rpu, "tts_codec_residual_unit", lambda *args: None, raising=False)
+    monkeypatch.setattr(torch.ops.rpu, "tts_codec_residual_unit_complete", lambda *args: None, raising=False)
+    monkeypatch.setattr(torch.ops.rpu, "tts_codec_conv1d_spm", lambda *args: args[0], raising=False)
+    monkeypatch.setattr(torch.ops.rpu, "tts_codec_transpose_overlap", lambda *args: None, raising=False)
+    calls = []
+    def stage(hidden, snake, transpose, bias, first, affine, second,
+              channels, kernel, stride):
+        assert snake.shape == (2, (hidden.shape[1] + 127) // 128 * 128)
+        assert len(first) == len(affine) == len(second) == 3
+        calls.append((hidden.shape[1], channels, kernel, stride))
+        return hidden.new_zeros(1, channels, (hidden.shape[-1] + 1) * stride)
+    monkeypatch.setattr(torch.ops.rpu, "tts_codec_decoder_stage", stage, raising=False)
+    restore, stats = [], {"calls": 0}
+    install_rpu_convolutions(decoder, restore, stats)
+    for index, (in_channels, channels, kernel, stride) in enumerate((
+            (1536, 768, 16, 8), (768, 384, 10, 5),
+            (384, 192, 8, 4), (192, 96, 6, 3)), start=1):
+        output = decoder.decoder[index](torch.randn(1, in_channels, 3))
+        assert output.shape == (1, channels, 4 * stride)
+    assert calls == [(1536, 768, 16, 8), (768, 384, 10, 5),
+                     (384, 192, 8, 4), (192, 96, 6, 3)]
+    assert stats["decoder_stage_calls"] == 4
+    assert stats["standalone_snake_calls"] == stats["transposed_calls"] == 4
+    assert stats["paired_calls"] == 12 and stats["calls"] == 24
+
+
 @pytest.mark.parametrize("index", [3, 4])
 def test_padded_resident_stage_rejects_extra_blocks_before_transform(monkeypatch, index):
     from rpu_backend.adapters.qwen3_tts import codec

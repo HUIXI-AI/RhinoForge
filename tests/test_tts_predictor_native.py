@@ -24,8 +24,9 @@ def test_native_predictor_sampling_lifetime_and_failures(tmp_path, monkeypatch):
 #include <cstdlib>
 struct TtsSamplingExperiment {
  explicit TtsSamplingExperiment(const std::string&) { TORCH_CHECK(false, "unexpected experimental path"); }
- at::Tensor run(const at::Tensor&,const at::Tensor&,const at::Tensor&,int) { return {}; }
- at::Tensor finish(const at::Tensor&) { return {}; }
+ void reset() {}
+ at::Tensor run(const at::Tensor&,const at::Tensor&,int) { return {}; }
+ at::Tensor finish() { return {}; }
 };
 int fail=0, forwards=0, touches=0;
 bool ties=false;
@@ -71,6 +72,13 @@ int main(){
  ids.select(1,0).copy_(at::arange(15,at::kInt));
  auto result=tts_sampling_checked_result(valid,ids);
  assert(result.scalar_type()==at::kLong&&result.sizes().equals({1,15}));
+ auto packed=at::ones({15,2064},at::kHalf);
+ auto* packed_bytes=reinterpret_cast<uint8_t*>(packed.data_ptr<c10::Half>());
+ for(int i=0;i<15;++i)*reinterpret_cast<int32_t*>(packed_bytes+i*4128+4096)=i;
+ assert(at::equal(tts_sampling_checked_packed_result(packed),result));
+ packed[14][0]=0;
+ bool packed_rejected=false;try{tts_sampling_checked_packed_result(packed);}catch(const c10::Error&){packed_rejected=true;}
+ assert(packed_rejected);packed[14][0]=1;
  ids.fill_(2047);assert(result[0][14].item<int>()==14);
  assert(tts_sampling_checked_result(valid,ids).eq(2047).all().item<bool>());
  for(float value:{0.f,-1.f,2.f,float(NAN),float(INFINITY)}){

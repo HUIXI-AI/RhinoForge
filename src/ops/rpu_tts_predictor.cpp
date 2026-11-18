@@ -43,10 +43,9 @@ at::Tensor rpu_tts_predictor_generate(
     auto* completed = progress.data_ptr<int64_t>();
     std::vector<at::Tensor> tokens;
     std::unique_ptr<TtsSamplingExperiment> sampler;
-    at::Tensor device_ids;
     if (experiment) {
         sampler = std::make_unique<TtsSamplingExperiment>(experiment_path);
-        device_ids = at::empty({15, 8}, keys[0].options().dtype(at::kInt));
+        sampler->reset();
     }
     auto hidden = input;
     for (int64_t index = 0; index < 15; ++index) {
@@ -91,7 +90,7 @@ at::Tensor rpu_tts_predictor_generate(
                     "invalid fused TTS Predictor logits");
         ++completed[2];
         if (sampler) {
-            hidden = sampler->run(logits, embeddings[std::min<int64_t>(index, 13)], device_ids, index);
+            hidden = sampler->run(logits, embeddings[std::min<int64_t>(index, 13)], index);
             ++completed[3];
             if (index == 1 && std::getenv("RPU_TTS_SAMPLING_TWO_STEP"))
                 TORCH_CHECK(false, "TTS_SAMPLING_TWO_STEP_COMPLETE");
@@ -109,7 +108,7 @@ at::Tensor rpu_tts_predictor_generate(
             hidden = at::embedding(embeddings[index], ids, -1, false, false);
     }
     if (sampler) {
-        return sampler->finish(device_ids);
+        return sampler->finish();
     }
     return at::cat(tokens, 1);
 }

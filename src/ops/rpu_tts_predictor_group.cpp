@@ -5,8 +5,20 @@
 
 TtsPredictorGroup::TtsPredictorGroup(std::string path) : asset_path_(std::move(path)) {
     TORCH_CHECK(!asset_path_.empty(), "TTS group requires explicit experimental assets");
+    sampler_ = std::make_unique<TtsSamplingExperiment>(asset_path_);
 }
 TtsPredictorGroup::~TtsPredictorGroup() = default;
+
+void TtsPredictorGroup::reserve(int64_t frames, const at::Tensor& reference) {
+    TORCH_CHECK(!failed_ && !RpuKernelGraph::has_active(), "TTS group reservation requires an idle owner");
+    sampler_->reserve(int(frames), reference);
+}
+
+void TtsPredictorGroup::reserve_noise(
+        int64_t frames, const at::Tensor& reference, const at::Tensor& noise) {
+    TORCH_CHECK(!failed_ && !RpuKernelGraph::has_active(), "TTS group reservation requires an idle owner");
+    sampler_->reserve_noise(int(frames), reference, noise);
+}
 
 void TtsPredictorGroup::retire(RpuGraphCache& cache) {
     TORCH_CHECK(!RpuKernelGraph::has_active() && (!signature_ || cache_ == &cache),
@@ -58,7 +70,6 @@ at::Tensor TtsPredictorGroup::generate(int64_t handle, const at::Tensor& input,
     owners.insert(owners.end(), keys.begin(), keys.end());
     owners.insert(owners.end(), values.begin(), values.end());
     if (!signature_) {
-        sampler_ = std::make_unique<TtsSamplingExperiment>(asset_path_);
         // Retire the two step graphs before consuming another arena.
         cache.evict(prefill);
         cache.evict(decode);
@@ -77,10 +88,9 @@ at::Tensor TtsPredictorGroup::generate(int64_t handle, const at::Tensor& input,
                         "TTS group cache was retired; reload the model");
         for (size_t i = 0; i < owners.size(); ++i)
             TORCH_CHECK(owners_[i].is_same(owners[i]), "TTS group weight/KV owner changed");
-        sampler_->reset();
     }
+    sampler_->reset();
     sampler_->prepare_graph(keys[0].options());
-    auto ids = at::empty({15,8}, keys[0].options().dtype(at::kInt));
     // Keep both prepared queues below the framework's conservative entry budget.
     for (int start = 0; start < steps; start += 8) {
         const auto& group = groups_[start / 8];
@@ -102,7 +112,7 @@ at::Tensor TtsPredictorGroup::generate(int64_t handle, const at::Tensor& input,
                 graph.keep_alive(raw);
                 auto logits = rpu_causal_decoder_tts_predictor_logits(handle);
                 graph.record_barrier(0, 0);
-                hidden = sampler_->run(logits, embeddings[std::min(index, 13)], ids, index);
+                hidden = sampler_->run(logits, embeddings[std::min(index, 13)], index);
                 graph.record_barrier(0, 0);
             }
             graph.end();
@@ -122,5 +132,5 @@ at::Tensor TtsPredictorGroup::generate(int64_t handle, const at::Tensor& input,
     completed[0] = completed[2] = completed[3] = steps;
     completed[1] = steps + 1;
     TORCH_CHECK(steps == 15, "TTS_SAMPLING_TWO_STEP_COMPLETE");
-    return sampler_->finish(ids);
+    return sampler_->finish();
 }

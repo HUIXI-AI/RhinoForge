@@ -30,6 +30,7 @@
 #include "graph/graph_runtime.h"
 #include "core/rpu_kernel_decls.h"
 #include "ops/tts_predictor_group.h"
+#include "ops/tts_talker_sampler.h"
 
 #include <pybind11/stl.h>
 #include <pybind11/pybind11.h>
@@ -40,8 +41,16 @@ namespace py = pybind11;
 namespace graph_pybind {
 
 void add_bindings(py::module_& m) {
+    py::class_<TtsTalkerSampler>(m, "TtsTalkerSampler")
+        .def(py::init<std::string>())
+        .def("reset", &TtsTalkerSampler::reset)
+        .def("reset_interleaved", &TtsTalkerSampler::reset_interleaved)
+        .def("sample", &TtsTalkerSampler::sample)
+        .def("result", &TtsTalkerSampler::result);
     py::class_<TtsPredictorGroup>(m, "TtsPredictorGroup")
         .def(py::init<std::string>())
+        .def("reserve", &TtsPredictorGroup::reserve)
+        .def("reserve_noise", &TtsPredictorGroup::reserve_noise)
         .def("generate", &TtsPredictorGroup::generate, py::keep_alive<7, 1>())
         .def("retire", &TtsPredictorGroup::retire);
     m.def("tts_predictor_generate", [](int64_t handle, const at::Tensor& input,

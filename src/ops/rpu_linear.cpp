@@ -4583,6 +4583,57 @@ Tensor rpu_tts_codec_conv_transpose1d_device_post(
   return tts_codec_device_rows_to_cpu_nct(output.narrow(1, 0, channels));
 }
 
+Tensor rpu_tts_codec_decoder_stage(
+    const Tensor& input, const Tensor& snake_affine,
+    const Tensor& transpose_weight, const c10::optional<Tensor>& transpose_bias,
+    at::TensorList first_weights, at::TensorList affines,
+    at::TensorList second_weights, int64_t channels, int64_t kernel, int64_t stride) {
+  TORCH_CHECK(!RpuKernelGraph::has_active(),
+              "tts_codec_decoder_stage requires eager execution");
+  TORCH_CHECK(input.device().is_cpu() && input.scalar_type() == at::kFloat &&
+                  input.dim() == 3 && input.size(0) == 1 && input.size(2) > 0 &&
+                  input.size(2) <= 255 * 640,
+              "tts_codec_decoder_stage expects bounded CPU FP32 NCT");
+  const int64_t in = input.size(1);
+  TORCH_CHECK((in == 1536 && channels == 768 && kernel == 16 && stride == 8) ||
+                  (in == 768 && channels == 384 && kernel == 10 && stride == 5) ||
+                  (in == 384 && channels == 192 && kernel == 8 && stride == 4) ||
+                  (in == 192 && channels == 96 && kernel == 6 && stride == 3),
+              "tts_codec_decoder_stage: unsupported geometry");
+  const int64_t padded_in = CeilDiv(in, int64_t{128}) * 128;
+  const int64_t padded_out = CeilDiv(channels, int64_t{128}) * 128;
+  check_tts_codec_device_half(
+      snake_affine, {2, padded_in}, "TTS decoder-stage SnakeBeta affine");
+  check_tts_codec_device_half(
+      transpose_weight, {kernel * padded_out, in},
+      "TTS decoder-stage transpose weight");
+  TORCH_CHECK(!transpose_bias.has_value() ||
+                  (transpose_bias->device() == transpose_weight.device() &&
+                   transpose_bias->scalar_type() == at::kHalf &&
+                   transpose_bias->is_contiguous() &&
+                   transpose_bias->sizes().equals({padded_out})),
+              "tts_codec_decoder_stage: invalid transpose bias");
+  TORCH_CHECK(first_weights.size() == 3 && affines.size() == 3 &&
+                  second_weights.size() == 3,
+              "tts_codec_decoder_stage requires three residual units");
+
+  auto rows = tts_codec_cpu_nct_to_device_rows(input, transpose_weight);
+  rows = tts_codec_snake_rows(
+      rows, snake_affine.select(0, 0).narrow(0, 0, in),
+      snake_affine.select(0, 1).narrow(0, 0, in));
+  rows = tts_codec_linear_rows(rows, transpose_weight, c10::nullopt);
+  rows = rpu_tts_codec_transpose_overlap(
+      rows, transpose_bias, channels, kernel, stride);
+  const bool padded_rows = channels == 96 || channels == 192;
+  for (int64_t index = 0; index < 3; ++index) {
+    rows = tts_codec_residual_unit_impl(
+        rows, first_weights[index], affines[index], second_weights[index],
+        index == 0 ? 1 : index == 1 ? 3 : 9, channels, true, true,
+        padded_rows);
+  }
+  return tts_codec_device_rows_to_cpu_nct(rows.narrow(1, 0, channels));
+}
+
 Tensor rpu_tts_codec_transpose_overlap(
     const Tensor& projected, const c10::optional<Tensor>& bias,
     int64_t channels, int64_t kernel, int64_t stride) {

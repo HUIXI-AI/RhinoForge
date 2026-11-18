@@ -37,6 +37,41 @@ if (( $# == 0 )); then
         test -f "${rf_device_node%%::*}"
         set -- "$@" "--deselect=$rf_device_node"
     done < scripts/ci/device_test_nodes.txt
+    if (( ${CI_NODE_TOTAL:-1} > 1 )); then
+        rf_sharded_out=$("$rf_job_venv/bin/python" - "$@" <<'PY'
+import os, pathlib, sys
+total = int(os.environ["CI_NODE_TOTAL"])
+index = int(os.environ["CI_NODE_INDEX"])
+if not (1 <= index <= total):
+    raise SystemExit(f"invalid CI_NODE_INDEX={index} for CI_NODE_TOTAL={total}")
+roots, ignores, deselects = [], set(), []
+for arg in sys.argv[1:]:
+    if arg.startswith("--ignore="):
+        ignores.add(str(pathlib.Path(arg.split("=", 1)[1]).resolve()))
+    elif arg.startswith("--deselect="):
+        deselects.append(arg)
+    else:
+        roots.append(arg)
+files = []
+for root in roots:
+    path = pathlib.Path(root)
+    if path.is_file():
+        if str(path.resolve()) not in ignores:
+            files.append(root)
+    else:
+        for item in sorted(path.rglob("*.py")):
+            if str(item.resolve()) not in ignores and (item.name.startswith("test_") or item.name.endswith("_test.py")):
+                files.append(item.as_posix())
+selected = files[index - 1::total]
+if not selected:
+    raise SystemExit(f"empty host-runtime shard {index}/{total}")
+for item in (*selected, *deselects):
+    print(item)
+PY
+        )
+        mapfile -t rf_sharded_args <<< "$rf_sharded_out"
+        set -- "${rf_sharded_args[@]}"
+    fi
 fi
 exec "$rf_job_venv/bin/python" -m pytest -q -ra --durations=20 \
     --junitxml=test-results/host-runtime.xml "$@"

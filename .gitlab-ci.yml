@@ -9,6 +9,7 @@ variables:
 
 host-runtime:
   tags: [rhinoforge-host]
+  parallel: 2
   script:
     # NavDP RNG contracts import diffusers directly; device-only checks report skips.
     - bash scripts/ci/run_host_tests.sh

@@ -462,6 +462,29 @@ def _lightnav_position_token_ids() -> tuple[tuple[int, ...], ...]:
     )
 
 
+def _lightnav_position_logit_biases(config):
+    quant_config = getattr(config, "quant_config", None)
+    values = quant_config.get("constrained_logit_bias") if isinstance(quant_config, dict) else None
+    if values is None:
+        return None
+    if not isinstance(values, dict) or any(
+        not isinstance(token_id, str) or not token_id.isdigit()
+        or type(value) not in (int, float)
+        for token_id, value in values.items()
+    ):
+        raise ValueError("LightNav constrained_logit_bias must map token-id strings to numbers")
+    biases = []
+    for ids in _lightnav_position_token_ids():
+        bias = torch.zeros(len(ids), dtype=torch.float16)
+        index = {token_id: offset for offset, token_id in enumerate(ids)}
+        for token_id, value in values.items():
+            offset = index.get(int(token_id))
+            if offset is not None:
+                bias[offset] = float(value)
+        biases.append(bias)
+    return tuple(biases)
+
+
 def set_lightnav_constrained_lm_head(model, enabled: bool = True):
     """Select the five position-specific LightNav grammar heads."""
     if not _is_lightnav_profile(model.config):
@@ -1301,6 +1324,7 @@ def uninstall_qwen3_vl_runtime(
     model_state.pop("_rpu_lightnav_candidate_token_ids", None)
     model_state.pop("_rpu_lightnav_position_lm_heads", None)
     model_state.pop("_rpu_lightnav_position_token_ids", None)
+    model_state.pop("_rpu_lightnav_position_logit_biases", None)
     model_state.pop("_rpu_lightnav_constrained_head_enabled", None)
     model_state.pop("_rpu_last_decode_hidden", None)
     model_state.pop("_rpu_visual_cached_prefix", None)
@@ -2165,6 +2189,7 @@ class Qwen3VLAdapter:
             lightnav_candidate_weight = None
             lightnav_position_ids = None
             lightnav_position_weights = None
+            lightnav_position_biases = None
             if is_lightnav and rpu_env_bool(_LIGHTNAV_CONSTRAINED_HEAD_ENV):
                 lightnav_position_ids = tuple(
                     torch.tensor(ids, dtype=torch.long)
@@ -2185,6 +2210,7 @@ class Qwen3VLAdapter:
                     ))
                 lightnav_candidate_ids = lightnav_position_ids[0]
                 lightnav_candidate_weight = lightnav_position_weights[0]
+                lightnav_position_biases = _lightnav_position_logit_biases(self.model.config)
                 del candidate_rows
             lm_head_w4_packed = None
             lm_head_w4_scale = None
@@ -2238,13 +2264,17 @@ class Qwen3VLAdapter:
                     weight.to("rpu").contiguous()
                     for weight in lightnav_position_weights[1:]
                 ]
+                if lightnav_position_biases is not None:
+                    self.model._rpu_lightnav_position_logit_biases = [
+                        bias.to("rpu").contiguous() for bias in lightnav_position_biases
+                    ]
                 self.model._rpu_lightnav_constrained_head_enabled = False
             # These locals still own the old CPU storages after Module.to()
             # replaces its Parameter data. Keep only explicitly requested raw
             # candidate weights; release ordinary lm-head staging before the
             # vision tower and decoder handle allocate their own resources.
             del lm_head_w, lm_head_cpu, swizzled, lightnav_candidate_weight
-            del lightnav_position_weights
+            del lightnav_position_weights, lightnav_position_biases
             gc.collect()
 
             # ---------- Step D: install vision encoder -----------------------
@@ -2260,7 +2290,9 @@ class Qwen3VLAdapter:
                 _allow_padded_8b=is_padded_8b and not runtime_quant_large,
                 **({"_allow_runtime_quantized_large": True} if runtime_quant_large else {}),
                 **({"w8a16": True} if quantized_vision else {}),
-                **({"_encoder_w8_range_scale": 1.04}
+                **({"_encoder_w8_range_scale": self.model.config.quant_config.get(
+                    "vision_encoder_range_scale", 1.04,
+                )}
                    if quantized_vision and is_lightnav else {}),
                 **({"_pack_fp16_block_weights": True}
                    if use_fp16_vision_weight_banks or use_8b_fp16_weight_banks or is_graph_blocked_32b_w8a16 else {}),

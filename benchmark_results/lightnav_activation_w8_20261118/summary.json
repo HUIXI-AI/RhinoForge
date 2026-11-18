@@ -1,0 +1,44 @@
+{
+  "date": "2026-11-18",
+  "model_revision": "826dc5fbfa37afa8293d2e336d329b6ffc0bfb64",
+  "lightnav_source_commit": "3015508b70fb6e30bbd66701e94c9b916dcb8df8",
+  "runtime": "v1.2.0",
+  "profile": "lightnav_0_4b_w8a16_text_vision_activation_v1",
+  "conditions": {
+    "frames": 35,
+    "history_frames": 9,
+    "current_frames": 1,
+    "steady_frame_indices": "10..34",
+    "vision_cache_hits_misses": "4/1",
+    "output_tokens": 5,
+    "constrained_head": true,
+    "history_draft": false,
+    "text_quantization": "252 projection weights W8A16, activation-second-moment calibration",
+    "vision_quantization": "encoder W8A16, range scale 1.0",
+    "calibration_frame_indices": [9, 14, 19, 24, 29, 34]
+  },
+  "cold_runs": [
+    {
+      "prepare_ms": 16.757,
+      "vision_ms": 29.608,
+      "prefill_ms": 91.199,
+      "decode_5_ms": 115.749,
+      "decode_select_ms": 1.758,
+      "total_ms": 254.346,
+      "frame_total_ms": 255.810,
+      "matching_frames": "35/35",
+      "matching_tokens": "175/175"
+    },
+    {
+      "prepare_ms": 16.671,
+      "vision_ms": 30.099,
+      "prefill_ms": 91.299,
+      "decode_5_ms": 115.850,
+      "decode_select_ms": 1.779,
+      "total_ms": 254.227,
+      "frame_total_ms": 256.213,
+      "matching_frames": "35/35",
+      "matching_tokens": "175/175"
+    }
+  ]
+}

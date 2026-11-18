@@ -77,6 +77,14 @@ def test_lightnav_w8_quantizes_text_only_and_keeps_exact_admission():
     vision_w8.quant_config = convert.lightnav_w8_quant_config(vision=True)
     assert runtime.is_qwen3_vl_runtime_quant_config(vision_w8)
 
+    activation_w8 = copy.deepcopy(quantized)
+    activation_w8.quant_config = convert.lightnav_activation_quant_config()
+    assert runtime.is_qwen3_vl_runtime_quant_config(activation_w8)
+
+    activation_vision_w8 = copy.deepcopy(quantized)
+    activation_vision_w8.quant_config = convert.lightnav_activation_quant_config(vision=True)
+    assert runtime.is_qwen3_vl_runtime_quant_config(activation_vision_w8)
+
 
 def test_lightnav_conversion_copies_action_tokenizer_bundle(tmp_path):
     source, destination = tmp_path / "source", tmp_path / "destination"

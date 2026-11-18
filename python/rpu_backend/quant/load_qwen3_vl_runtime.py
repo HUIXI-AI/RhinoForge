@@ -20,9 +20,11 @@ from safetensors import safe_open
 from transformers import AutoModelForImageTextToText
 
 from .convert_qwen3_vl import (
-    LIGHTNAV_PARITY_PROFILE, _get, is_lightnav_parity_weight,
-    lightnav_parity_quant_config, lightnav_w8_quant_config, matches_lightnav_geometry,
-    matches_runtime_geometry, runtime_quant_config,
+    LIGHTNAV_ACTIVATION_PROFILE, LIGHTNAV_ACTIVATION_VISION_PROFILE,
+    LIGHTNAV_PARITY_PROFILE, _get,
+    is_lightnav_parity_weight, lightnav_activation_quant_config,
+    lightnav_parity_quant_config, lightnav_w8_quant_config,
+    matches_lightnav_geometry, matches_runtime_geometry, runtime_quant_config,
 )
 from .int4_pgrp_pack import swizzle_int4_pgrp_scale, swizzle_pack_int4_pgrp
 from .load_qwen3_vl_awq import (
@@ -50,6 +52,10 @@ def is_qwen3_vl_runtime_quant_config(config) -> bool:
         expected = (
             lightnav_parity_quant_config()
             if lightnav and qc.get("profile") == LIGHTNAV_PARITY_PROFILE else
+            lightnav_activation_quant_config()
+            if lightnav and qc.get("profile") == LIGHTNAV_ACTIVATION_PROFILE else
+            lightnav_activation_quant_config(vision=True)
+            if lightnav and qc.get("profile") == LIGHTNAV_ACTIVATION_VISION_PROFILE else
             lightnav_w8_quant_config(
                 vision=qc.get("vision_quantization") != "fp16",
             ) if lightnav else

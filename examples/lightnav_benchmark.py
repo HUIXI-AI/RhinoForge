@@ -338,7 +338,11 @@ def _generate_five(
 
         if getattr(model, "_rpu_lightnav_constrained_head_enabled", False):
             candidates = model._rpu_lightnav_position_token_ids[step]
-            token = greedy_token_ids(logits[..., : candidates.numel()])
+            scores = logits[..., : candidates.numel()]
+            biases = getattr(model, "_rpu_lightnav_position_logit_biases", None)
+            if biases is not None:
+                scores = scores + biases[step]
+            token = greedy_token_ids(scores)
             return candidates.index_select(0, token.reshape(-1)).reshape(token.shape)
         return greedy_token_ids(logits)
 

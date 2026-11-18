@@ -29,6 +29,22 @@ PROFILE = "qwen3_vl_4b_w8a16_runtime_align_v1"
 LIGHTNAV_W8_PROFILE = "lightnav_0_4b_w8a16_text_v1"
 LIGHTNAV_W8_VISION_PROFILE = "lightnav_0_4b_w8a16_text_vision_v1"
 LIGHTNAV_PARITY_PROFILE = "lightnav_0_4b_w8a16_o_proj_0_3_v1"
+LIGHTNAV_ACTIVATION_PROFILE = "lightnav_0_4b_w8a16_text_activation_v1"
+LIGHTNAV_ACTIVATION_VISION_PROFILE = "lightnav_0_4b_w8a16_text_vision_activation_v1"
+LIGHTNAV_ACTIVATION_LOGIT_BIAS = {
+    "152408": 0.0625,
+    "152346": -0.0390625,
+    "151873": 0.03125,
+    "152162": 0.078125,
+    "152115": 0.015625,
+}
+LIGHTNAV_ACTIVATION_VISION_LOGIT_BIAS = {
+    "152376": 0.015625,
+    "152162": 0.0625,
+    "152115": 0.078125,
+    "151941": 0.046875,
+    "151820": 0.09375,
+}
 QUANT_CONFIG = {
     "method": "w8a16",
     "profile": PROFILE,
@@ -104,6 +120,22 @@ def lightnav_parity_quant_config() -> dict:
         profile=LIGHTNAV_PARITY_PROFILE,
         text_quantization="layers_0_3_o_proj_only",
     )
+    return result
+
+
+def lightnav_activation_quant_config(*, vision: bool = False) -> dict:
+    result = lightnav_w8_quant_config(vision=vision)
+    result.update(
+        profile=LIGHTNAV_ACTIVATION_VISION_PROFILE if vision else LIGHTNAV_ACTIVATION_PROFILE,
+        calibration="activation_second_moment_v1",
+        activation_blend=0.25,
+        constrained_logit_bias=(
+            LIGHTNAV_ACTIVATION_VISION_LOGIT_BIAS if vision
+            else LIGHTNAV_ACTIVATION_LOGIT_BIAS
+        ),
+    )
+    if vision:
+        result["vision_encoder_range_scale"] = 1.0
     return result
 
 
@@ -194,7 +226,10 @@ def matches_lightnav_geometry(config) -> bool:
     )
 
 
-def quantize_weight(weight: torch.Tensor, *, bits: int = 8) -> tuple[torch.Tensor, torch.Tensor]:
+def quantize_weight(
+    weight: torch.Tensor, *, bits: int = 8,
+    input_second_moment: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Bound FP32 temporaries while preserving the common rowwise quantizer."""
     if (weight.ndim != 2 or not weight.is_floating_point() or weight.device.type != "cpu"
             or type(bits) is not int or bits not in (8, 4) or 0 in weight.shape):
@@ -202,6 +237,15 @@ def quantize_weight(weight: torch.Tensor, *, bits: int = 8) -> tuple[torch.Tenso
     n, k = weight.shape
     if bits == 4 and k % 32:
         raise ValueError("runtime W4 source requires K divisible by group size 32")
+    if input_second_moment is not None:
+        if (bits != 8 or input_second_moment.device.type != "cpu"
+                or input_second_moment.dtype != torch.float32
+                or tuple(input_second_moment.shape) != (k,)
+                or not bool(torch.isfinite(input_second_moment).all())
+                or not bool((input_second_moment > 0).all())):
+            raise ValueError(
+                "activation-aware W8 requires finite positive CPU float32 input_second_moment [K]"
+            )
     values = torch.empty((n, k if bits == 8 else k // 2), dtype=torch.int8 if bits == 8 else torch.uint8)
     scales = torch.empty((n,) if bits == 8 else (k // 32, n), dtype=torch.float16)
     for start in range(0, weight.shape[0], 4096):
@@ -210,7 +254,25 @@ def quantize_weight(weight: torch.Tensor, *, bits: int = 8) -> tuple[torch.Tenso
         if not bool(torch.isfinite(block).all()):
             raise ValueError("runtime source weight must be finite and representable as FP16")
         if bits == 8:
-            values[start:stop], scales[start:stop] = quantize_linear_per_channel(block)
+            if input_second_moment is None:
+                values[start:stop], scales[start:stop] = quantize_linear_per_channel(block)
+            else:
+                block32 = block.float()
+                moment = input_second_moment.unsqueeze(0)
+                base = block32.abs().amax(dim=1).div_(127).clamp_min_(float(torch.finfo(torch.float16).tiny))
+                scale = base
+                for _ in range(3):
+                    quant = torch.round(block32 / scale.unsqueeze(1)).clamp_(-127, 127)
+                    numerator = (moment * block32 * quant).sum(dim=1)
+                    denominator = (moment * quant.square()).sum(dim=1).clamp_min_(1e-12)
+                    scale = (numerator / denominator).clamp_(base * 0.75, base * 1.05)
+                scale = (base + (scale - base) * 0.25).half().clamp_min_(
+                    torch.finfo(torch.float16).tiny
+                )
+                values[start:stop] = torch.round(
+                    block32 / scale.float().unsqueeze(1)
+                ).clamp_(-127, 127).to(torch.int8)
+                scales[start:stop] = scale
         else:
             q, scale, _ = quantize_int4_group_wise(block, 32)
             nibble = q.to(torch.uint8).bitwise_and_(15)
@@ -219,6 +281,22 @@ def quantize_weight(weight: torch.Tensor, *, bits: int = 8) -> tuple[torch.Tenso
     if not bool(torch.isfinite(scales).all() and (scales > 0).all()):
         raise ValueError("runtime scales must be finite positive FP16")
     return values, scales
+
+
+def lightnav_activation_stat_name(weight_name: str) -> str:
+    if not weight_name.startswith(TEXT_PREFIX) or not weight_name.endswith(".weight"):
+        raise ValueError(f"not a LightNav Text projection: {weight_name}")
+    relative = weight_name[len(TEXT_PREFIX):-len(".weight")]
+    layer, projection = relative.split(".", 1)
+    roles = {
+        "self_attn.q_proj": "q", "self_attn.k_proj": "k",
+        "self_attn.v_proj": "v", "self_attn.o_proj": "o",
+        "mlp.gate_proj": "gate", "mlp.up_proj": "up", "mlp.down_proj": "down",
+    }
+    try:
+        return f"layers.{int(layer)}.{roles[projection]}"
+    except (KeyError, ValueError) as error:
+        raise ValueError(f"not a LightNav Text projection: {weight_name}") from error
 
 
 def _checkpoint_tensor_shapes(config):
@@ -378,6 +456,7 @@ def _convert_awq_checkpoint(src, dst, config, *, bits):
 def convert_checkpoint(
     src: str | Path, dst: str | Path, *, bits: int = 8,
     lightnav_vision_w8: bool = False, lightnav_parity: bool = False,
+    lightnav_activation_stats: str | Path | None = None,
 ) -> dict:
     src, dst = Path(src).expanduser().resolve(), Path(dst).expanduser().resolve()
     config = json.loads((src / "config.json").read_text())
@@ -401,6 +480,15 @@ def convert_checkpoint(
         raise ValueError("--lightnav-vision-w8 requires a LightNav checkpoint")
     if lightnav_parity and (not is_lightnav or lightnav_vision_w8):
         raise ValueError("--lightnav-parity requires LightNav and FP16 Vision")
+    activation_stats = None
+    if lightnav_activation_stats is not None:
+        if not is_lightnav or bits != 8 or lightnav_parity:
+            raise ValueError(
+                "--lightnav-activation-stats requires full Text W8 LightNav conversion"
+            )
+        activation_stats = load_file(
+            str(Path(lightnav_activation_stats).expanduser().resolve())
+        )
     if (not (matches_runtime_geometry(config) or is_lightnav) or not valid_tie
             or any(_get(owner, key) is not None for owner in
                    (config, config["text_config"], config["vision_config"])
@@ -410,6 +498,8 @@ def convert_checkpoint(
         raise ValueError("LightNav runtime quantization supports Text7 W8A16 only")
     quant_config = (
         lightnav_parity_quant_config() if lightnav_parity else
+        lightnav_activation_quant_config(vision=lightnav_vision_w8)
+        if lightnav_activation_stats is not None else
         lightnav_w8_quant_config(vision=lightnav_vision_w8) if is_lightnav else
         runtime_quant_config(config["text_config"]["hidden_size"], bits)
     )
@@ -417,6 +507,13 @@ def convert_checkpoint(
         raise FileExistsError(f"destination already exists: {dst}")
     sharded, shards, weight_map, index = _checkpoint_layout(src)
     expected, head_shape = _checkpoint_tensor_shapes(config)
+    if activation_stats is not None:
+        expected_stats = {lightnav_activation_stat_name(name) for name in expected}
+        if set(activation_stats) != expected_stats:
+            raise ValueError(
+                "LightNav activation stats must contain exactly one input_second_moment "
+                "vector for every Text projection"
+            )
     actual_map = {}
     # The source index is only a declaration. Check every physical header before
     # quantization or output creation; a stale index must not synthesize a valid
@@ -465,7 +562,13 @@ def convert_checkpoint(
                 if quantize_projection or (
                     name == HEAD_NAME and quant_config["quantized_lm_head"]
                 ):
-                    out[name], out[name[:-7] + ".weight_scale"] = quantize_weight(tensor, bits=bits)
+                    second_moment = (
+                        activation_stats[lightnav_activation_stat_name(name)]
+                        if activation_stats is not None and name in expected else None
+                    )
+                    out[name], out[name[:-7] + ".weight_scale"] = quantize_weight(
+                        tensor, bits=bits, input_second_moment=second_moment,
+                    )
                     stats["n_quantized"] += 1
                 else:
                     out[name] = tensor.to(torch.float16).contiguous()
@@ -518,11 +621,13 @@ def main():
     parser.add_argument("--bits", type=int, choices=(8, 4), default=8)
     parser.add_argument("--lightnav-vision-w8", action="store_true")
     parser.add_argument("--lightnav-parity", action="store_true")
+    parser.add_argument("--lightnav-activation-stats")
     args = parser.parse_args()
     print(json.dumps(convert_checkpoint(
         args.src, args.dst, bits=args.bits,
         lightnav_vision_w8=args.lightnav_vision_w8,
         lightnav_parity=args.lightnav_parity,
+        lightnav_activation_stats=args.lightnav_activation_stats,
     ), indent=2))
 
 

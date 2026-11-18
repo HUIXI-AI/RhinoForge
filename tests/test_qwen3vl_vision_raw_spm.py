@@ -182,12 +182,20 @@ public:
  int64_t num_cores()const{return cores;}int64_t num_layers()const{return layers;}
  int64_t hidden_size()const{return hidden;}int64_t intermediate_size()const{return intermediate;}
  int64_t num_q_heads()const{return heads;}int64_t head_dim()const{return hd;}
+ int64_t max_keepalive_seq()const{return 4096;}
  int attn_tp()const{return cores;}int mlp_tp()const{return cores;}
  bool pipeline_dispatch_active()const{return pipeline;}
  bool qwen3vl_2b_delivery_profile_active()const{return delivery;}
  int64_t get_last_resolved_chunk_size()const{return last_resolved;}
  void invalidate_model_state(){++invalidations;}
- bool rope_tables_use_persistent_storage()const{return pipeline;}
+ bool ordinary_rope_persistent_rebalance()const{
+  return rope_route_request_!=Qwen3VLVisionRopeRouteRequest::DDR&&
+   !pipeline_dispatch_active()&&!native_composite_prepare_active_&&
+   z1_prepared_num_patches_==0&&!multiview_dry_prepared_&&!multiview_composite_prepared_&&
+   num_cores()==8&&num_layers()==24&&hidden_size()==1024&&intermediate_size()==4096&&
+   num_q_heads()==16&&head_dim()==64;
+ }
+ bool rope_tables_use_persistent_storage()const{return ordinary_rope_persistent_rebalance()||pipeline;}
  void emit_preload_weights(){}
  // Ordinary raw owner leaves resident weight priming unbound.
  bool resident_preloads_enabled()const{return false;}
@@ -276,7 +284,7 @@ void check_ledger(Qwen3VLVisionModel& m,int64_t n){
   if(std::string(a)==b)continue;
   assert(offsets[a]+bytes[a]<=offsets[b]||offsets[b]+bytes[b]<=offsets[a]);
  }
- assert(persistent==378880);assert(p.peak_bytes==(n==256?1838080u:n==512?3673088u:n==768?5508096u:7343104u));
+ assert(persistent==369664);assert(p.peak_bytes==(n==256?1835008u:n==512?3670016u:n==768?5505024u:7340032u));
  assert(p.peak_bytes+persistent+392192<=8303616); // co-resident Text norms
  std::cerr<<"N"<<n<<" temp="<<p.peak_bytes<<" persistent="<<persistent<<" Vt="<<bytes["sdpa_tmp"]<<"\n";
 }
@@ -518,8 +526,8 @@ int main(){
   }
   assert(post_temp==(w8?5u:9u)&&post_persistent==(w8?4u:0u));
   const auto fixed=estimate_fixed_overhead(decls);
-  assert(fixed.persistent==(w8?(output==2048?377856:378880):356352)&&fixed.temp_per_layer==0);
-  assert(allocation.peak_bytes==6761472&&detail::estimate_temporary_total(decls)==6761472);
+  assert(fixed.persistent==(w8?(output==2048?368640:369664):347136)&&fixed.temp_per_layer==0);
+  assert(allocation.peak_bytes==6758400&&detail::estimate_temporary_total(decls)==6758400);
   const auto text_decls=text_norm_declarations(output,output==2048?28:36);
   const auto text_fixed=estimate_fixed_overhead(text_decls);
   assert(text_fixed.persistent==(output==2048?247808:392192)&&text_fixed.temp_per_layer==0);
@@ -691,6 +699,7 @@ int main(){
     assert(attention==batch&&merged_copies==4);
    }
   }
+  m.rope_route_request_=Qwen3VLVisionRopeRouteRequest::AUTO;
   auto ddr=layout;ddr.attention_policy=AttentionExecutionPolicy::DDR_KV;
   rejects([&]{m.make_physical_manifest_for_candidate(plan,ddr,n,n,0,true);});
   for(int fault=0;fault<8;++fault){
@@ -722,7 +731,7 @@ int main(){
     assert((image*image_rows*256)%256==0);
    }
    assert(n/4*2048*2<=by.at("merger_out").size);
-   const auto fixed=estimate_fixed_overhead(decls);assert(fixed.persistent==377856);
+   const auto fixed=estimate_fixed_overhead(decls);assert(fixed.persistent==368640);
    for(bool installed:{false,true}){
     watermarks.temporary=8192;
     const int64_t other_persistent=1586688-fixed.persistent;
@@ -733,7 +742,7 @@ int main(){
     --watermarks.free;assert(!final_chunk_layout_fits(decls,installed));
    }
    if(image_rows==196){
-    assert(allocation.peak_bytes==(batch==2?(c==n?2819072u:2872320u):(c==n?4224000u:4250624u)));
+    assert(allocation.peak_bytes==(batch==2?(c==n?2816000u:2869248u):(c==n?4220928u:4247552u)));
     std::cerr<<"B"<<batch<<" S196 C"<<c<<" temp="<<allocation.peak_bytes<<" persistent="<<fixed.persistent<<" K/V="<<by.at("k").size<<" Vt="<<by.at("sdpa_tmp").size<<"\n";
    }
   }
@@ -749,7 +758,7 @@ int main(){
   assert(m.subclass_spm_kv_by_mha_eligible(plan,layout,0));
   assert(m.physical_manifest_domain_for_candidate(plan,layout,768,768,0).size()==4);
   const auto decls=m.declare_buffers(layout);const auto fixed=estimate_fixed_overhead(decls);
-  assert(fixed.persistent==377856&&detail::estimate_temporary_total(decls)==5508096);
+  assert(fixed.persistent==368640&&detail::estimate_temporary_total(decls)==5505024);
   for(bool installed:{false,true}){
    watermarks.temporary=8192;
    watermarks.free=SpmAllocator::SPM_USABLE-(1586688-fixed.persistent)-(installed?fixed.persistent:0)-watermarks.temporary;

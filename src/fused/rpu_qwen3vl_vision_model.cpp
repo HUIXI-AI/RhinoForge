@@ -3087,7 +3087,10 @@ protected:
             {"ln1_beta",     norm_w_sz,    0, 0, StorageClass::PersistentPerLayer, nl, nullptr, ALL},
             {"ln2_gamma",    norm_w_sz,    0, 0, StorageClass::PersistentPerLayer, nl, nullptr, ALL},
             {"ln2_beta",     norm_w_sz,    0, 0, StorageClass::PersistentPerLayer, nl, nullptr, ALL},
-            {"q_bias",       q_bias_sz,    0, 0, StorageClass::PersistentPerLayer, nl, nullptr, ALL},
+            {"q_bias",       q_bias_sz,    2, 2,
+             ordinary_rope_persistent_rebalance()
+                 ? StorageClass::Temp : StorageClass::PersistentPerLayer,
+             ordinary_rope_persistent_rebalance() ? 0 : nl, nullptr, qkv_scope},
             {"k_bias",       q_bias_sz,    0, 0, StorageClass::PersistentPerLayer, nl, nullptr, ALL},
             {"v_bias",       q_bias_sz,    0, 0, StorageClass::PersistentPerLayer, nl, nullptr, ALL},
             {"fc1_bias",     fc1_bias_sz,  0, 0, StorageClass::PersistentPerLayer, nl, nullptr, ALL},
@@ -3284,11 +3287,13 @@ protected:
                     bn.ln2_b, /*src_offset_elements=*/0, h,
                     layer_addr(L, 0, "ln2_beta"), num_cores());
 
-                rpu_launch_ddr_scatter_spm_dma(
-                    bn.q_b, /*src_offset_elements=*/0,
-                    local_q_dim, local_q_dim * DWIDTH,
-                    layer_addr(L, 0, "q_bias"),
-                    /*num_cores=*/num_cores());
+                if (!ordinary_rope_persistent_rebalance()) {
+                    rpu_launch_ddr_scatter_spm_dma(
+                        bn.q_b, /*src_offset_elements=*/0,
+                        local_q_dim, local_q_dim * DWIDTH,
+                        layer_addr(L, 0, "q_bias"),
+                        /*num_cores=*/num_cores());
+                }
                 rpu_launch_ddr_scatter_spm_dma(
                     bn.k_b, /*src_offset_elements=*/0,
                     local_q_dim, local_q_dim * DWIDTH,
@@ -3318,10 +3323,12 @@ protected:
                     bn.ln2_b.data_ptr<c10::Half>(), h,
                     layer_addr(L, 0, "ln2_beta"), num_cores());
 
-                rpu_launch_ddr_scatter_spm_dma(
-                    bn.q_b.data_ptr<c10::Half>(), local_q_dim,
-                    local_q_dim * DWIDTH, layer_addr(L, 0, "q_bias"),
-                    /*num_cores=*/num_cores());
+                if (!ordinary_rope_persistent_rebalance()) {
+                    rpu_launch_ddr_scatter_spm_dma(
+                        bn.q_b.data_ptr<c10::Half>(), local_q_dim,
+                        local_q_dim * DWIDTH, layer_addr(L, 0, "q_bias"),
+                        /*num_cores=*/num_cores());
+                }
                 rpu_launch_ddr_scatter_spm_dma(
                     bn.k_b.data_ptr<c10::Half>(), local_q_dim,
                     local_q_dim * DWIDTH, layer_addr(L, 0, "k_bias"),
@@ -3425,6 +3432,13 @@ protected:
         int64_t h = hidden_size();
         int64_t nq = num_q_heads();
         int64_t hd = head_dim();
+        if (ordinary_rope_persistent_rebalance()) {
+            auto& bn = layer_bias_norm_[layer_idx];
+            const int64_t local_q_dim = (nq / num_cores()) * hd;
+            rpu_launch_ddr_scatter_spm_dma(
+                bn.q_b.data_ptr<c10::Half>(), local_q_dim,
+                local_q_dim * DWIDTH, addr(0, "q_bias"), num_cores());
+        }
         // Phase 1: DDR→SPM input DMA + LayerNorm1
         if (!ctx().input_in_spm) {
             emit_layer_input_dma(layer_idx, chunk);
@@ -3444,7 +3458,7 @@ protected:
             rpu_launch_lingbot2_vision_qkv_joint_spm_kernel(
                 addr(0, "input_norm"), lw.q_w, lw.k_w, lw.v_w,
                 addr(0, "q"), addr(0, "k"), addr(0, "v"),
-                layer_addr(layer_idx, 0, "q_bias"),
+                q_bias_addr(layer_idx),
                 layer_addr(layer_idx, 0, "k_bias"),
                 layer_addr(layer_idx, 0, "v_bias"),
                 lw.q_ws, lw.k_ws, lw.v_ws);
@@ -3456,7 +3470,7 @@ protected:
             rpu_launch_linear_spm_to_spm_acc16_kernel(
                 addr(0, "input_norm"), lw.q_w, addr(0, "q"),
                 seq_len, nq * hd, h, 1, num_cores(),
-                layer_addr(layer_idx, 0, "q_bias"), lw.q_ws,
+                q_bias_addr(layer_idx), lw.q_ws,
                 /*nvfp4_tensor_scale_spm_addr=*/0, /*nvfp4_layer_id=*/0,
                 /*force_acc32=*/linear_acc32_);
             consume_manifest_route(
@@ -4286,8 +4300,24 @@ protected:
     bool pipeline_dispatch_active() const {
         return z1_dispatch_ || multiview_composite_dispatch_;
     }
+    bool ordinary_rope_persistent_rebalance() const {
+        // The cold request stays stable while descriptor selection temporarily
+        // changes rope_spm_enabled_; planning and emission must use one layout.
+        return rope_route_request_ != Qwen3VLVisionRopeRouteRequest::DDR &&
+            !pipeline_dispatch_active() && !native_composite_prepare_active_ &&
+            z1_prepared_num_patches_ == 0 && !multiview_dry_prepared_ &&
+            !multiview_composite_prepared_ && num_cores() == 8 &&
+            num_layers() == 24 && hidden_size() == 1024 &&
+            intermediate_size() == 4096 && num_q_heads() == 16 &&
+            head_dim() == 64;
+    }
+    uint32_t q_bias_addr(int64_t layer_idx) const {
+        return ordinary_rope_persistent_rebalance()
+            ? addr(0, "q_bias") : layer_addr(layer_idx, 0, "q_bias");
+    }
     bool rope_tables_use_persistent_storage() const {
-        return pipeline_dispatch_active() ||
+        return ordinary_rope_persistent_rebalance() ||
+            pipeline_dispatch_active() ||
             native_composite_prepare_active_ ||
             z1_prepared_num_patches_ != 0 ||
             multiview_dry_prepared_ ||

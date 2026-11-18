@@ -19,9 +19,9 @@ tokens.
 | Input window | Up to nine history frames plus one current frame |
 | Vision cache | Two frames per tubelet; steady full-window result is 4 hits and 1 miss |
 | Prefetch | `prefetch_latest=False` to avoid recomputing a duplicate tubelet |
-| Text precision | W8A16 |
-| Vision precision | LightNav-calibrated W8A16 |
-| Retained at FP16 | Action output head, embedding, and norms |
+| Text precision | W8A16 for layers 0–3 Attention O projections; FP16 otherwise |
+| Vision precision | FP16 |
+| Retained at FP16 | Remaining Text, Vision, action output head, embedding, and norms |
 | Output head | Five-position action grammar, physically padded to 1,408 rows per position |
 | Decode | Standard autoregressive generation of five tokens |
 | Previous-request token draft | Disabled |
@@ -59,22 +59,20 @@ processor/tokenizer files, and `action_tokenizer/`.
 
 ## W8A16 conversion
 
-Create the current Text + Vision W8A16 checkpoint from the original FP16
-checkpoint:
+Create the output-parity checkpoint from the original FP16 checkpoint:
 
 ```bash
 PYTHONPATH=python python -m rpu_backend.quant.convert_qwen3_vl \
   --bits 8 \
-  --lightnav-vision-w8 \
+  --lightnav-parity \
   --src /path/to/LightNav-0 \
-  --dst /path/to/LightNav-0-text-vision-w8a16
+  --dst /path/to/LightNav-0-parity-w8a16
 ```
 
-This profile uses W8A16 for Text7 projections and installs per-channel Vision
-quantization. The LightNav Vision encoder uses a calibrated 1.04 range scale;
-patch embedding and merger use the standard 1.0 scale. The action output head,
-embedding, and norms remain FP16. The converter accepts only the exact
-LightNav-0 configuration.
+This profile quantizes only the Attention O projections in Text layers 0–3.
+The remaining Text weights, Vision, action output head, embedding, and norms
+stay FP16. This scope matches full FP16 for all 175 tokens in the 35-frame set
+below. Full-Text W8 and Vision W8 change outputs and are not parity profiles.
 
 ## Run an ordered image sequence
 
@@ -88,7 +86,7 @@ Validate paths and input first:
 python examples/lightnav_inference.py \
   --input /path/to/dataset.json \
   --images-dir /path/to/images \
-  --checkpoint /path/to/LightNav-0-text-vision-w8a16 \
+  --checkpoint /path/to/LightNav-0-parity-w8a16 \
   --lightnav-source /path/to/LightNav-0-source \
   --history-frames 9 \
   --constrained-head \
@@ -119,28 +117,27 @@ Test conditions:
   tokens at the full window;
 - a steady 4/1 Vision cache result, with tubelet prefetch and previous-request
   token drafts disabled;
-- Text W8A16, calibrated Vision W8A16, and the five-position grammar head;
+- W8A16 Attention O projections in Text layers 0–3, with the rest of the model
+  in FP16, and the five-position grammar head;
 - medians over the 25 steady requests where `frame_index >= 10`;
 - model loading, initial image processing, and window filling excluded from the
   steady result.
 
 | Run | Prepare | Vision | Prefill | Decode 5 | Total | Frame total | Output equality |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Initial production run | 17.310 ms | 26.879 ms | 89.169 ms | 114.535 ms | **248.388 ms** | **252.037 ms** | 35/35 frames, 175/175 tokens |
-| Independent cold reload | — | 26.828 ms | 88.980 ms | 114.494 ms | **247.856 ms** | **251.554 ms** | 35/35 frames, 175/175 tokens |
+| Full FP16 | 17.736 ms | 75.981 ms | 139.914 ms | 210.631 ms | **444.629 ms** | **447.406 ms** | Reference |
+| Parity W8/FP16 mix, cold run 1 | 17.977 ms | 74.080 ms | 146.035 ms | 220.407 ms | **459.340 ms** | **461.777 ms** | 35/35 frames, 175/175 tokens |
+| Parity W8/FP16 mix, cold run 2 | 18.120 ms | 74.464 ms | 146.212 ms | 220.383 ms | **459.264 ms** | **462.291 ms** | 35/35 frames, 175/175 tokens |
 
 Stage medians are computed independently and may not add up exactly to the
-median Total. The current delivery result is approximately 248 ms of steady
-request latency on this offline customer sequence, including about 114.5 ms of
-normal Decode, with all 175 tokens matching the FP16 reference.
+median Total. The parity profile cannot use the all-W8 specialized schedule and
+is not faster than FP16; it exists to preserve outputs. Do not quote the old
+approximately 248 ms all-W8 result as a parity result. That comparison used a
+Text-W8 + Vision-FP16 baseline rather than full FP16. Full W8 matches only
+165/175 tokens against full FP16 on this set.
 
-The fastest mixed W4/W8 experiment reached 220.200 ms but matched only 130/175
-tokens. The more conservative Gate/Up W4 profile reached 236.765 ms and matched
-only 144/175 tokens. Neither is a delivery result and neither should be quoted
-as current supported performance.
-
-The complete raw data is in
-[`benchmark_results/lightnav_9_history_20261112/summary.json`](../benchmark_results/lightnav_9_history_20261112/summary.json).
+The complete summary is in
+[`benchmark_results/lightnav_quant_parity_20261118/summary.json`](../benchmark_results/lightnav_quant_parity_20261118/summary.json).
 
 ## Correctness and limits
 

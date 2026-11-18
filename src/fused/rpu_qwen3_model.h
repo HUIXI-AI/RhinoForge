@@ -1451,6 +1451,26 @@ public:
                 up_list[i].scalar_type() == at::kChar &&
                 down_list[i].scalar_type() == at::kChar;
         }
+        qwen3vl_4b_mixed_profile_ = N == 36 && num_cores() == 8 && has_scale &&
+            !has_nvfp4 && hidden_size == 2560 && intermediate_size == 9728 &&
+            num_q_heads == 32 && num_kv_heads == 8 && head_dim == 128 &&
+            mrope_section == std::vector<int64_t>{24, 20, 20} &&
+            deepstack_lang_layers == std::vector<int64_t>{0, 1, 2} &&
+            use_silu && has_qk_norm_ && !has_qkv_bias_;
+        bool mixed_has_w8 = false;
+        bool mixed_has_fp16 = false;
+        for (int64_t i = 0; qwen3vl_4b_mixed_profile_ && i < N; ++i) {
+            for (const auto* weight : {&q_w_list[i], &k_w_list[i], &v_w_list[i],
+                    &o_w_list[i], &gate_list[i], &up_list[i], &down_list[i]}) {
+                const auto dtype = weight->scalar_type();
+                mixed_has_w8 |= dtype == at::kChar;
+                mixed_has_fp16 |= dtype == at::kHalf;
+                qwen3vl_4b_mixed_profile_ =
+                    qwen3vl_4b_mixed_profile_ && (dtype == at::kChar || dtype == at::kHalf);
+            }
+        }
+        qwen3vl_4b_mixed_profile_ =
+            qwen3vl_4b_mixed_profile_ && mixed_has_w8 && mixed_has_fp16;
         // QK postprocessing consumes FP16 activations and BASE RMSNorm, not
         // projection weights. Its exact 4B geometry also applies to FP16
         // ACC32 and packed W4 without changing either Linear route.
@@ -3112,7 +3132,8 @@ public:
     }
 
     void set_lightnav_heads(at::TensorList heads) {
-        TORCH_CHECK((qwen3vl_fp16_decode_profile_ || qwen3vl_4b_w8_profile_) &&
+        TORCH_CHECK((qwen3vl_fp16_decode_profile_ || qwen3vl_4b_w8_profile_ ||
+                        qwen3vl_4b_mixed_profile_) &&
                         num_layers() == 36 && hidden_size() == 2560 &&
                         intermediate_size() == 9728 && num_q_heads() == 32 &&
                         num_kv_heads() == 8 && head_dim() == 128 && has_mrope_ &&
@@ -10459,6 +10480,7 @@ protected:  // LingBot2 sparse-MoE subclass reuses the decoder's layer state.
     bool qwen3vl_2b_w8_profile_ = false;
     bool qwen3vl_ordinary_resident_prefill_profile_ = false;
     bool qwen3vl_4b_w8_profile_ = false;
+    bool qwen3vl_4b_mixed_profile_ = false;
     bool qwen3vl_fp16_decode_profile_ = false;
     bool qwen3vl_4b_decode_gateup_fused_ = false;
     bool wall_base_prefill_shared_input_ = false;

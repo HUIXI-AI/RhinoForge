@@ -1,0 +1,49 @@
+{
+  "setup": {
+    "device": "R1",
+    "runtime": "v1.2.0",
+    "rhino_forge_base_commit": "cbaf88d",
+    "data": "customer ordered 35-frame sequence",
+    "steady_samples": "frame_index >= 10, 25 requests",
+    "input": "9 history frames + 1 current frame",
+    "vision_cache_hit_miss": "4/1",
+    "output_tokens": 5,
+    "previous_request_token_draft": false,
+    "vision_precision": "FP16",
+    "text_quantization": "W8A16 only for layers 0-3 self_attn.o_proj"
+  },
+  "root_cause": {
+    "summary": "Per-output-channel symmetric RTN INT8 changes marginal action-token rankings when applied broadly.",
+    "reference_scope_error": "The retired 175/175 claim compared Vision W8 against a Text-W8 baseline, not against full FP16.",
+    "full_w8_vs_full_fp16": "29/35 frames, 165/175 tokens"
+  },
+  "results_ms": {
+    "full_fp16": {
+      "prepare": 17.736,
+      "vision": 75.981,
+      "prefill": 139.914,
+      "decode_5": 210.631,
+      "total": 444.629,
+      "frame_total": 447.406
+    },
+    "parity_cold_run_1": {
+      "prepare": 17.977,
+      "vision": 74.080,
+      "prefill": 146.035,
+      "decode_5": 220.407,
+      "total": 459.340,
+      "frame_total": 461.777,
+      "equality": "35/35 frames, 175/175 tokens"
+    },
+    "parity_cold_run_2": {
+      "prepare": 18.120,
+      "vision": 74.464,
+      "prefill": 146.212,
+      "decode_5": 220.383,
+      "total": 459.264,
+      "frame_total": 462.291,
+      "equality": "35/35 frames, 175/175 tokens"
+    }
+  },
+  "decision": "Use the parity profile for strict token equality. It is not a latency optimization because the mixed inventory cannot use the all-W8 specialized schedule."
+}

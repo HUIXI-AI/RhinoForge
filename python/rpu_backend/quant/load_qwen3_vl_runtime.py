@@ -20,7 +20,8 @@ from safetensors import safe_open
 from transformers import AutoModelForImageTextToText
 
 from .convert_qwen3_vl import (
-    _get, lightnav_w8_quant_config, matches_lightnav_geometry,
+    LIGHTNAV_PARITY_PROFILE, _get, is_lightnav_parity_weight,
+    lightnav_parity_quant_config, lightnav_w8_quant_config, matches_lightnav_geometry,
     matches_runtime_geometry, runtime_quant_config,
 )
 from .int4_pgrp_pack import swizzle_int4_pgrp_scale, swizzle_pack_int4_pgrp
@@ -47,6 +48,8 @@ def is_qwen3_vl_runtime_quant_config(config) -> bool:
         if bits is None or (h == 2560 and bits == 8 and not lightnav):
             return False
         expected = (
+            lightnav_parity_quant_config()
+            if lightnav and qc.get("profile") == LIGHTNAV_PARITY_PROFILE else
             lightnav_w8_quant_config(
                 vision=qc.get("vision_quantization") != "fp16",
             ) if lightnav else
@@ -191,13 +194,19 @@ def load_qwen3_vl_runtime_imagetext(
     bits = 4 if config.quant_config["method"] == "w4a16" else 8
     shapes = {name: tuple(t.shape) for name, t in model.named_parameters(remove_duplicate=False)}
     expected = {name: (shape, "F16") for name, shape in shapes.items()}
+    lightnav_parity = config.quant_config.get("profile") == LIGHTNAV_PARITY_PROFILE
     for name, module, partition in projections:
         n, k = module.out_features, module.in_features
         if bits == 4 and ((partition == 1 and (n % 128 or k % 64))
                          or (partition == 0 and (n % 16 or k % 512))):
             raise ValueError(f"runtime W4 projection is outside TP8 pgrp geometry: {name}")
-        expected[name + ".weight"] = ((n, k if bits == 8 else k // 2), "I8" if bits == 8 else "U8")
-        expected[name + ".weight_scale"] = ((n,) if bits == 8 else (k // 32, n), "F16")
+        parity_fp16 = lightnav_parity and not is_lightnav_parity_weight(name + ".weight")
+        expected[name + ".weight"] = (
+            ((n, k), "F16") if parity_fp16 else
+            ((n, k if bits == 8 else k // 2), "I8" if bits == 8 else "U8")
+        )
+        if not parity_fp16:
+            expected[name + ".weight_scale"] = ((n,) if bits == 8 else (k // 32, n), "F16")
     tensor_shards = {}
     for shard in _safetensor_shards(directory):
         with safe_open(shard, framework="pt") as handle:
@@ -221,7 +230,14 @@ def load_qwen3_vl_runtime_imagetext(
         def tensor(name):
             return handles[tensor_shards[name]].get_tensor(name)
         for name, module, partition in projections:
-            weight, scale = tensor(name + ".weight"), tensor(name + ".weight_scale")
+            weight = tensor(name + ".weight")
+            parity_fp16 = lightnav_parity and not is_lightnav_parity_weight(name + ".weight")
+            scale = (torch.ones(module.out_features, dtype=torch.float16)
+                     if parity_fp16 else tensor(name + ".weight_scale"))
+            if parity_fp16:
+                module.weight = nn.Parameter(weight.clone().contiguous(), requires_grad=False)
+                module.register_buffer("weight_scale", scale.clone(), persistent=False)
+                continue
             if bits == 4:
                 weight, scale = _pack_w4_projection(weight, scale,
                     n=module.out_features, k=module.in_features, partition=partition)
@@ -258,6 +274,32 @@ def _move_materialized_runtime_decoder_for_rpu(model) -> None:
         raise ValueError("runtime decoder migration requires the exact loaded model")
     per_layer = model.config.text_config.hidden_size in (4096, 5120)
     if model.config.quant_config["method"] == "w8a16":
+        if model.config.quant_config.get("profile") == LIGHTNAV_PARITY_PROFILE:
+            from rpu_backend.quant.load import (
+                _allocate_decoder_projection_views, _swizzle_and_move_decoder_layer,
+            )
+            from rpu_backend.runtime.weights import _release_cpu_weight_pages
+            for layer in model.model.language_model.layers:
+                dtypes = {parameter.dtype for name, parameter in layer.named_parameters()
+                          if name.endswith(".weight") and parameter.ndim == 2}
+                names = tuple(name for name, parameter in sorted(layer.named_parameters())
+                              if name.endswith(".weight") and parameter.ndim == 2)
+                if len(dtypes) != 1:
+                    _swizzle_and_move_decoder_layer(
+                        layer, dtype=torch.int8, projection_views=None,
+                    )
+                    _release_cpu_weight_pages()
+                    continue
+                dtype = dtypes.pop()
+                views = _allocate_decoder_projection_views(
+                    layer, (names,), dtype=dtype,
+                )
+                _swizzle_and_move_decoder_layer(
+                    layer, dtype=dtype,
+                    projection_views={name[:-len(".weight")]: views[name] for name in names},
+                )
+                _release_cpu_weight_pages()
+            return
         if per_layer:
             _move_materialized_decoder_for_rpu(model, dtype=torch.int8, per_layer=True)
         else:

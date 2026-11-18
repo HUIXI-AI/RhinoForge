@@ -64,10 +64,11 @@ Use `python -m rpu_backend.quant.convert_qwen3_vl` for offline 2B/4B/8B and
 exact LightNav-0 conversion. For LightNav-0, `--bits 8` quantizes only the
 Text7 projections and keeps the action head and Vision in FP16. Other public
 models retain their existing W8A16 recipes. The `--lightnav-vision-w8` option
-also quantizes Vision per channel. Its encoder uses a calibrated 1.04 dynamic
-range while patch/merger weights keep the standard range; all 175 output tokens
-matched Vision FP16 on the customer 35-frame set. Deployment still requires
-task-accuracy validation. For the `awq_w4.toml`
+also quantizes Vision per channel, but neither full Text W8 nor Vision W8 is an
+FP16-parity profile. Use `--lightnav-parity` to quantize only layers 0–3
+Attention O projections and keep the remaining model FP16. That scope matched
+175/175 full-FP16 tokens on the customer 35-frame set; broader deployment still
+requires task-accuracy validation. For the `awq_w4.toml`
 examples, use `--bits 4` with symmetric G32 compressed-tensors AWQ input:
 Text AWQ is preserved, the LM head uses RTN W4, and Vision uses W8.
 The converter also accepts the exact unquantized public 2B/4B/8B FP16 profile
